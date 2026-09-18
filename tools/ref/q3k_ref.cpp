@@ -2,7 +2,7 @@
 //
 // Opens the DeepSeek-V2-Lite-Chat Q3_K_M GGUF, extracts
 // blk.1.ffn_gate_exps.weight, writes raw bytes + f32 activations to
-// /root/mulle-data-muse/, computes CPU reference outputs by dequantizing
+// $MULLE_DATA/ (default /root/mulle-data), computes CPU reference outputs by dequantizing
 // with ggml_internal_get_type_traits(GGML_TYPE_Q3_K)->to_float and plain f32
 // dots, then times ggml's CUDA mul_mat on four shapes and compares.
 //
@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -30,7 +31,7 @@
 
 static const char * kTensorName = "blk.1.ffn_gate_exps.weight";
 static const char * kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
-static const char * kDataDir = "/root/mulle-data-muse";
+static const char * kDataDir = getenv("MULLE_DATA") ? getenv("MULLE_DATA") : "/root/mulle-data";
 
 static void fail(const std::string & msg) {
     std::fprintf(stderr, "q3k_ref FATAL: %s\n", msg.c_str());

@@ -2,10 +2,11 @@
 # Build the stage-0 reference harness on the box.
 # Runs under tools/box.sh (toolchain env already sourced).
 # NOTE: the runner rsyncs this tree with --delete before every command, so
-# the binary must live OUTSIDE the tree; it goes to /root/mulle-data-muse/bin.
+# the binary must live OUTSIDE the tree; it goes to $MULLE_DATA/bin (default /root/mulle-data).
 set -euo pipefail
 : "${IK:=/home/user/ik_llama.cpp}"
-OUT=${Q3K_OUT:-/root/mulle-data-muse/bin}
+MULLE_DATA=${MULLE_DATA:-/root/mulle-data}
+OUT=${Q3K_OUT:-$MULLE_DATA/bin}
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 mkdir -p "$OUT"
 g++ -std=c++17 -O2 -o "$OUT/q3k_ref" "$HERE/tools/ref/q3k_ref.cpp" \
