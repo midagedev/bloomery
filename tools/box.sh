@@ -7,9 +7,9 @@
 #   tools/box.sh cargo oxide run q3k_gemv --arch sm_86
 set -euo pipefail
 HOST=${MULLE_BOX:-ws}
-REMOTE=${MULLE_REMOTE:-'~/repo/mulle'}
+REMOTE=${MULLE_REMOTE:-'~/repo/mulle-m8-glm'}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 ssh "$HOST" "mkdir -p $REMOTE"
 rsync -az --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
-DATA=${MULLE_DATA:-/root/mulle-data}
+DATA=${MULLE_DATA:-/root/mulle-data-m8-glm}
 ssh "$HOST" "source ~/mulle-env.sh && export MULLE_DATA=$DATA && cd $REMOTE && $*"
