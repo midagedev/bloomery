@@ -8,5 +8,6 @@ set -euo pipefail
 HOST=${MULLE_BOX:-ws}
 REMOTE=${MULLE_REMOTE:-'~/repo/mulle'}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
+ssh "$HOST" "mkdir -p $REMOTE"
 rsync -az --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
 ssh "$HOST" "source ~/mulle-env.sh && cd $REMOTE && $*"
