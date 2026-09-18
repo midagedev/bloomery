@@ -1,0 +1,14 @@
+/target/
+**/*.bc
+.DS_Store
+**/*.cubin
+**/*.cubin.identity
+**/*.cubin.target
+**/*.cubin.tmp
+**/*.ll
+**/*.ltoir
+**/*.opt.ll
+**/*.options
+**/*.ptx
+**/*.ptx.identity
+**/*.target
