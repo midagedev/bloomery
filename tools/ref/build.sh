@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
-# Builds tools/ref/q3k_ref.cpp on the box against ik_llama.cpp's libggml
-# (CUDA backend compiled in). Override the ik checkout with IK=<path>.
+# Build the stage-0 reference harness on the box.
+# Runs under tools/box.sh (toolchain env already sourced).
+# NOTE: the runner rsyncs this tree with --delete before every command, so
+# the binary must live OUTSIDE the tree; it goes to /root/mulle-data-muse/bin.
 set -euo pipefail
-IK=${IK:-/home/user/ik_llama.cpp}
-CUDA=${CUDA_HOME:-/usr/local/cuda}
-OUT=${OUT:-/root/mulle-data/q3k_ref}
-HERE=$(cd "$(dirname "$0")" && pwd)
-
-mkdir -p "$(dirname "$OUT")"
-g++ -O3 -std=c++17 \
-    -I"$IK/ggml/include" \
-    -I"$CUDA/include" \
-    "$HERE/q3k_ref.cpp" \
-    -L"$IK/build/ggml/src" -lggml \
-    -L"$CUDA/lib64" -lcudart \
-    -Wl,-rpath,"$IK/build/ggml/src" \
-    -Wl,-rpath,"$CUDA/lib64" \
-    -o "$OUT"
-echo "built $OUT"
+: "${IK:=/home/user/ik_llama.cpp}"
+OUT=${Q3K_OUT:-/root/mulle-data-muse/bin}
+HERE=$(cd "$(dirname "$0")/../.." && pwd)
+mkdir -p "$OUT"
+g++ -std=c++17 -O2 -o "$OUT/q3k_ref" "$HERE/tools/ref/q3k_ref.cpp" \
+  -I"$IK/ggml/include" \
+  -L"$IK/build/ggml/src" -lggml \
+  -Wl,-rpath,"$IK/build/ggml/src"
+echo "built $OUT/q3k_ref"

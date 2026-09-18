@@ -1,311 +1,206 @@
-// mulle stage 0 — Q3_K gate-tensor reference harness (runs on the box).
+// q3k_ref.cpp — reference harness for mulle stage 0.
 //
-// Extracts blk.1.ffn_gate_exps.weight (Q3_K, [2048 x 1408 x 64]) from the
-// DeepSeek-V2-Lite GGUF through the gguf API, writes the raw tensor plus
-// deterministic f32 activations to /root/mulle-data/, computes the CPU f32
-// reference outputs with ggml's own dequantize (type_traits.to_float) and
-// plain f32 dot products, and then times ggml's CUDA mul_mat (the mmvq path
-// taken for M<=8) for the four stage-0 shapes:
+// Opens the DeepSeek-V2-Lite-Chat Q3_K_M GGUF, extracts
+// blk.1.ffn_gate_exps.weight, writes raw bytes + f32 activations to
+// /root/mulle-data-muse/, computes CPU reference outputs by dequantizing
+// with ggml_internal_get_type_traits(GGML_TYPE_Q3_K)->to_float and plain f32
+// dots, then times ggml's CUDA mul_mat on four shapes and compares.
 //
-//   expert0 : one expert  [2048 x 1408]
-//   stack   : all experts [2048 x 90112]
-//   M = 1 and M = 8 activation columns
+// Shapes (K=2048 fixed):
+//   expert0 : one expert,  N=1408 rows,  1,239,040 weight bytes
+//   stack   : all experts, N=90112 rows, 79,298,560 weight bytes
+//   M = 1 and 8 activation columns each.
 //
-// Per shape it prints µs/launch, GB/s (weight bytes / time) and the max
-// relative error against the CPU reference. ggml's error is ~1e-2 by
-// construction (it quantizes the activation to q8_1); that is recorded, not
-// treated as failure.
-//
-// build: tools/ref/build.sh    run: /root/mulle-data/q3k_ref
-
-#include "ggml.h"
-#include "ggml-alloc.h"
-#include "ggml-backend.h"
-#include "ggml-cuda.h"
-
-#include <cuda_runtime.h>
+// Build: bash tools/ref/build.sh   (on the box, IK=/home/user/ik_llama.cpp)
+// Run:   LD_LIBRARY_PATH=$IK/build/ggml/src ./tools/ref/q3k_ref
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
-#include <sys/stat.h>
-#include <thread>
 #include <vector>
 
-namespace {
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
 
-constexpr int64_t K       = 2048;               // k dimension of the tensor
-constexpr int64_t N_EXP   = 1408;               // rows per expert
-constexpr int64_t NEXP    = 64;                 // experts
-constexpr int64_t N_STACK = N_EXP * NEXP;       // 90112 rows
-constexpr size_t  ROW_B   = 110 * (K / 256);    // 880 bytes per row
+static const char * kTensorName = "blk.1.ffn_gate_exps.weight";
+static const char * kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
+static const char * kDataDir = "/root/mulle-data-muse";
 
-const char * kTensorName = "blk.1.ffn_gate_exps.weight";
-const char * kDataDir    = "/root/mulle-data";
-
-// ---------------------------------------------------------------------------
-// small utilities
-
-[[noreturn]] void die(const std::string & msg) {
-    fprintf(stderr, "q3k_ref: %s\n", msg.c_str());
-    exit(1);
+static void fail(const std::string & msg) {
+    std::fprintf(stderr, "q3k_ref FATAL: %s\n", msg.c_str());
+    std::exit(1);
 }
 
-// deterministic uniform [-1, 1) floats from an explicit LCG (seed 1), so the
-// exact activation bytes are reproducible from this file alone
-struct Lcg {
-    uint64_t s = 1;
-    float next() {
-        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-        double u = (double)(s >> 11) * (1.0 / 9007199254740992.0); // 53 bits
-        return (float)(2.0 * u - 1.0);
-    }
+static void write_file(const std::string & path, const void * data, size_t n) {
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) fail("cannot open for write: " + path);
+    if (std::fwrite(data, 1, n, f) != n) fail("short write: " + path);
+    std::fclose(f);
+}
+
+static std::vector<uint8_t> read_range(const char * path, int64_t off, size_t n) {
+    FILE * f = std::fopen(path, "rb");
+    if (!f) fail(std::string("cannot open: ") + path);
+    if (::fseeko(f, off, SEEK_SET) != 0) fail("seek failed");
+    std::vector<uint8_t> out(n);
+    if (std::fread(out.data(), 1, n, f) != n) fail("short read");
+    std::fclose(f);
+    return out;
+}
+
+struct Shape {
+    const char * name;
+    int64_t n; // rows
 };
 
-void write_file(const std::string & path, const void * data, size_t nbytes) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) die("cannot open " + path + " for writing");
-    if (fwrite(data, 1, nbytes, f) != nbytes) die("short write to " + path);
-    fclose(f);
-    printf("wrote %s (%zu bytes)\n", path.c_str(), nbytes);
-}
-
-void run_cmd(const char * cmd) {
-    FILE * p = popen(cmd, "r");
-    if (!p) return;
-    std::string out;
-    char buf[512];
-    while (fgets(buf, sizeof buf, p)) out += buf;
-    pclose(p);
-    fputs(out.c_str(), stdout);
-}
-
-// quiet-machine witness: both cards, load average, io pressure (avg10)
-void witnesses(const char * when) {
-    printf("[witness %s]\n", when);
-    run_cmd("nvidia-smi --query-gpu=name,memory.used,utilization.gpu,power.draw --format=csv");
-    run_cmd("cat /proc/loadavg");
-    run_cmd("grep -E '^(some|full)' /proc/pressure/io");
-    fflush(stdout);
-}
-
-// ---------------------------------------------------------------------------
-// CPU reference: y[n][m] = sum_k deq(w)[n][k] * x[m][k], plain f32
-
-// rows are split across threads; each output element is computed exactly as
-// in the single-threaded form (dequantize row, sequential f32 dot)
-void ref_dots(const uint8_t * w, int64_t n_rows, const float * x, int m,
-              float * y /* [n_rows][m] */, const ggml_to_float_t to_float,
-              int64_t row_begin, int64_t row_end) {
-    std::vector<float> row(K);
-    for (int64_t n = row_begin; n < row_end; ++n) {
-        to_float(w + n * ROW_B, row.data(), K);
-        for (int mi = 0; mi < m; ++mi) {
-            const float * xr = x + (size_t)mi * K;
-            float acc = 0.0f;
-            for (int64_t k = 0; k < K; ++k) acc += row[k] * xr[k];
-            y[n * m + mi] = acc;
-        }
-    }
-}
-
-std::vector<float> cpu_reference(const uint8_t * w, int64_t n_rows,
-                                 const float * x, int m,
-                                 const ggml_to_float_t to_float) {
-    std::vector<float> y((size_t)n_rows * m);
-    unsigned nthreads = std::min<unsigned>(8, std::thread::hardware_concurrency());
-    std::vector<std::thread> ts;
-    int64_t chunk = (n_rows + nthreads - 1) / nthreads;
-    for (unsigned t = 0; t < nthreads; ++t) {
-        int64_t b = (int64_t)t * chunk, e = std::min<int64_t>(n_rows, b + chunk);
-        if (b >= e) break;
-        ts.emplace_back(ref_dots, w, n_rows, x, m, y.data(), to_float, b, e);
-    }
-    for (auto & th : ts) th.join();
-    return y;
-}
-
-// ---------------------------------------------------------------------------
-// ggml CUDA mul_mat timing for one shape
-
-struct Timing { double us_per_launch; double gbps; double max_rel_err; };
-
-Timing time_ggml(const uint8_t * w_bytes, size_t w_nbytes, int64_t n_rows,
-                 const float * x, int m, const std::vector<float> & y_ref) {
-    const size_t mem_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead() + 1024 * 1024;
-    std::vector<uint8_t> mem(mem_size);
-    struct ggml_init_params ip = { mem_size, mem.data(), /*no_alloc*/ true };
-    struct ggml_context * ctx = ggml_init(ip);
-    if (!ctx) die("ggml_init failed");
-
-    const int64_t ne_a[2] = { K, n_rows };
-    const int64_t ne_b[2] = { K, m };
-    struct ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_Q3_K, 2, ne_a);
-    struct ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32,   2, ne_b);
-    struct ggml_tensor * d = ggml_mul_mat(ctx, a, b);
-
-    struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, d);
-
-    ggml_backend_t backend = ggml_backend_cuda_init(0, nullptr, nullptr);
-    if (!backend) die("ggml_backend_cuda_init failed");
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) die("gallocr alloc failed");
-
-    ggml_backend_tensor_set(a, w_bytes, 0, w_nbytes);
-    ggml_backend_tensor_set(b, x, 0, (size_t)K * m * sizeof(float));
-
-    // warm-up
-    for (int i = 0; i < 20; ++i) {
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            die("ggml_backend_graph_compute failed (warm-up)");
-    }
-    ggml_backend_synchronize(backend);
-
-    // 200 launches back-to-back, one synchronize at the end. ggml computes
-    // on its own non-blocking stream, so CUDA events on the default stream
-    // do not order against it; wall clock across the batch + full device
-    // synchronize is the honest equivalent (first measured 2026-09-19:
-    // events gave 0.000 us and a zeroed readback).
-    auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < 200; ++i) {
-        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS)
-            die("ggml_backend_graph_compute failed");
-    }
-    ggml_backend_synchronize(backend);
-    auto t1 = std::chrono::steady_clock::now();
-
-    std::vector<float> y((size_t)n_rows * m);
-    // ggml mul_mat result is [m, n_rows]; our reference is [n_rows][m]
-    ggml_backend_tensor_get(d, y.data(), 0, y.size() * sizeof(float));
-
-    double max_abs_ref = 0.0, max_abs_err = 0.0;
-    for (int64_t n = 0; n < n_rows; ++n) {
-        for (int mi = 0; mi < m; ++mi) {
-            double ref = y_ref[n * m + mi];
-            double got = y[(size_t)mi * n_rows + n];
-            max_abs_ref = std::max(max_abs_ref, std::fabs(ref));
-            max_abs_err = std::max(max_abs_err, std::fabs(got - ref));
-        }
-    }
-    // first-eight sample for eyeballing layout/garbage problems
-    printf("  sample n=0..3 m=0: gpu");
-    for (int n = 0; n < 4; ++n) printf(" %.6e", y[n]);
-    printf("\n  sample n=0..3 m=0: ref");
-    for (int n = 0; n < 4; ++n) printf(" %.6e", y_ref[n * m]);
-    printf("\n");
-
-    double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / 200.0;
-    Timing t;
-    t.us_per_launch = us;
-    t.gbps = (double)w_nbytes / (us * 1e-6) / 1e9;
-    t.max_rel_err = max_abs_err / max_abs_ref;
-
-    ggml_gallocr_free(galloc);
-    ggml_backend_free(backend);
-    ggml_free(ctx);
-    return t;
-}
-
-} // namespace
-
 int main() {
-    const char * model = std::getenv("MODEL");
-    if (!model) model = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
+    // ---- open GGUF, locate tensor metadata (no_alloc: metadata only) ----
+    struct ggml_context * gctx = nullptr;
+    struct gguf_init_params gp = {true, &gctx};
+    struct gguf_context * gguf = gguf_init_from_file(kGgufPath, gp);
+    if (!gguf || !gctx) fail("gguf_init_from_file failed");
+    int tidx = gguf_find_tensor(gguf, kTensorName);
+    if (tidx < 0) fail("tensor not found");
+    struct ggml_tensor * info = ggml_get_tensor(gctx, kTensorName);
+    if (!info) fail("ggml_get_tensor failed");
+    if (info->type != GGML_TYPE_Q3_K) fail("tensor is not Q3_K");
+    const int64_t K = info->ne[0];
+    const int64_t N1 = info->ne[1];
+    const int64_t NE = info->ne[2];
+    std::printf("tensor %s type=Q3_K ne=[%lld,%lld,%lld]\n",
+                kTensorName, (long long)K, (long long)N1, (long long)NE);
+    if (K != 2048 || N1 != 1408 || NE != 64) fail("unexpected tensor dims");
+    const size_t row_bytes = (size_t)(K / 256) * 110; // 8*110 = 880
+    const size_t expert_bytes = (size_t)N1 * row_bytes; // 1,239,040
+    const size_t total_bytes = expert_bytes * (size_t)NE; // 79,298,560
+    if (ggml_nbytes(info) != total_bytes) fail("nbytes mismatch");
 
-    // ggml's fp16->f32 lookup table (used by Q3_K dequantization) is only
-    // populated by ggml_init(); without this the CPU reference comes out as
-    // signed zeros (first measured 2026-09-19: probe dequant sum=0.0).
-    {
-        const size_t probe_mem = ggml_tensor_overhead() * 2 + 1024 * 1024;
-        std::vector<uint8_t> mem(probe_mem);
-        struct ggml_init_params ip = { probe_mem, mem.data(), /*no_alloc*/ true };
-        if (!ggml_init(ip)) die("ggml_init failed");
-    }
+    // ---- read raw weight bytes through the GGUF API offsets ----
+    const size_t data_off = gguf_get_data_offset(gguf);
+    const size_t tensor_off = gguf_get_tensor_offset(gguf, tidx);
+    std::vector<uint8_t> wAll =
+        read_range(kGgufPath, (int64_t)(data_off + tensor_off), total_bytes);
+    gguf_free(gguf);
+    ggml_free(gctx);
 
-    mkdir(kDataDir, 0755); // ok if it exists
+    // ---- deterministic activations: mt19937 seed 1, uniform [-1,1] ----
+    std::mt19937 rng(1);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    std::vector<float> x_m1((size_t)K);
+    for (auto & v : x_m1) v = uni(rng);
+    std::vector<float> x_m8((size_t)K * 8);
+    for (auto & v : x_m8) v = uni(rng); // column c at offset c*K (column-major)
 
-    // ---- extract the tensor through the gguf API --------------------------
-    struct gguf_init_params gp = { /*no_alloc*/ true, /*ctx*/ nullptr };
-    struct gguf_context * gctx = gguf_init_from_file(model, gp);
-    if (!gctx) die(std::string("gguf_init_from_file failed for ") + model);
+    // ---- CPU reference via ggml dequant traits + f32 dots ----
+    ggml_type_traits_t traits = ggml_internal_get_type_traits(GGML_TYPE_Q3_K);
+    std::vector<float> wrow((size_t)K);
+    auto cpu_gemv = [&](const uint8_t * w, int64_t nrows, const float * x,
+                        int m, std::vector<float> & y /* [nrows*m] row-major */) {
+        y.assign((size_t)nrows * m, 0.0f);
+        for (int64_t r = 0; r < nrows; r++) {
+            traits.to_float(w + (size_t)r * row_bytes, wrow.data(), K);
+            for (int c = 0; c < m; c++) {
+                const float * xc = x + (size_t)c * (size_t)K;
+                double acc = 0.0;
+                for (int64_t k = 0; k < K; k++) acc += (double)wrow[(size_t)k] * xc[k];
+                y[(size_t)r * m + c] = (float)acc;
+            }
+        }
+    };
+    std::vector<float> y_e0_m1, y_e0_m8, y_st_m1, y_st_m8;
+    cpu_gemv(wAll.data(), N1, x_m1.data(), 1, y_e0_m1);
+    cpu_gemv(wAll.data(), N1, x_m8.data(), 8, y_e0_m8);
+    cpu_gemv(wAll.data(), N1 * NE, x_m1.data(), 1, y_st_m1);
+    cpu_gemv(wAll.data(), N1 * NE, x_m8.data(), 8, y_st_m8);
 
-    int ti = gguf_find_tensor(gctx, kTensorName);
-    if (ti < 0) die(std::string("tensor not found: ") + kTensorName);
-    if (gguf_get_tensor_type(gctx, ti) != GGML_TYPE_Q3_K) die("tensor is not Q3_K");
+    // ---- write data files ----
+    write_file(std::string(kDataDir) + "/gate.q3k", wAll.data(), total_bytes);
+    write_file(std::string(kDataDir) + "/x_m1.f32", x_m1.data(),
+               x_m1.size() * sizeof(float));
+    write_file(std::string(kDataDir) + "/x_m8.f32", x_m8.data(),
+               x_m8.size() * sizeof(float));
+    write_file(std::string(kDataDir) + "/y_ref_expert0_m1.f32", y_e0_m1.data(),
+               y_e0_m1.size() * sizeof(float));
+    write_file(std::string(kDataDir) + "/y_ref_expert0_m8.f32", y_e0_m8.data(),
+               y_e0_m8.size() * sizeof(float));
+    write_file(std::string(kDataDir) + "/y_ref_stack_m1.f32", y_st_m1.data(),
+               y_st_m1.size() * sizeof(float));
+    write_file(std::string(kDataDir) + "/y_ref_stack_m8.f32", y_st_m8.data(),
+               y_st_m8.size() * sizeof(float));
+    std::printf("wrote data files to %s\n", kDataDir);
 
-    const size_t nbytes = (size_t)N_STACK * ROW_B; // 79,298,560
-    const size_t data_off = gguf_get_data_offset(gctx);
-    const size_t tensor_off = gguf_get_tensor_offset(gctx, ti);
-
-    FILE * f = fopen(model, "rb");
-    if (!f) die("cannot reopen model file");
-    fseeko(f, (off_t)(data_off + tensor_off), SEEK_SET);
-    std::vector<uint8_t> w(nbytes);
-    if (fread(w.data(), 1, nbytes, f) != nbytes) die("short read on tensor data");
-    fclose(f);
-    gguf_free(gctx);
-
-    printf("extracted %s: %zu bytes (%lld rows x %zu bytes)\n", kTensorName,
-           nbytes, (long long)N_STACK, ROW_B);
-    write_file(std::string(kDataDir) + "/gate.q3k", w.data(), nbytes);
-
-    // ---- deterministic activations ----------------------------------------
-    Lcg lcg;
-    std::vector<float> x1(K);
-    for (auto & v : x1) v = lcg.next();
-    std::vector<float> x8((size_t)K * 8);
-    for (auto & v : x8) v = lcg.next();
-    write_file(std::string(kDataDir) + "/x_m1.f32", x1.data(), x1.size() * 4);
-    write_file(std::string(kDataDir) + "/x_m8.f32", x8.data(), x8.size() * 4);
-
-    // ---- CPU reference (the truth both GPU paths are compared to) ---------
-    const ggml_type_traits_t tt = ggml_internal_get_type_traits(GGML_TYPE_Q3_K);
-    if (!tt.to_float) die("Q3_K to_float unavailable");
-    {
-        std::vector<float> probe(K);
-        tt.to_float(w.data(), probe.data(), K);
-        double sum = 0.0;
-        for (auto v : probe) sum += v;
-        printf("probe dequant row0[0..3]: %.6e %.6e %.6e %.6e sum=%.6e | x1[0..3]: %.6f %.6f %.6f %.6f\n",
-               probe[0], probe[1], probe[2], probe[3], sum, x1[0], x1[1], x1[2], x1[3]);
-    }
-    printf("computing CPU references with ggml to_float=%s dequantization...\n",
-           ggml_type_name(GGML_TYPE_Q3_K));
-
-    struct Shape { const char * name; const uint8_t * w; size_t nbytes; int64_t rows; };
-    const Shape shapes[2] = {
-        { "expert0", w.data(), (size_t)N_EXP * ROW_B, N_EXP },
-        { "stack",   w.data(), nbytes,                 N_STACK },
+    auto max_abs = [](const std::vector<float> & v) {
+        double m = 0;
+        for (float f : v) m = std::max(m, (double)std::fabs(f));
+        return m;
     };
 
-    std::vector<float> y_ref[2][2]; // [shape][m_idx]
-    for (int s = 0; s < 2; ++s) {
-        y_ref[s][0] = cpu_reference(shapes[s].w, shapes[s].rows, x1.data(), 1, tt.to_float);
-        y_ref[s][1] = cpu_reference(shapes[s].w, shapes[s].rows, x8.data(), 8, tt.to_float);
-        std::string base = std::string(kDataDir) + "/y_ref_" + shapes[s].name;
-        write_file(base + "_m1.f32", y_ref[s][0].data(), y_ref[s][0].size() * 4);
-        write_file(base + "_m8.f32", y_ref[s][1].data(), y_ref[s][1].size() * 4);
-    }
+    // ---- CUDA backend timing ----
+    ggml_backend_t backend = ggml_backend_cuda_init(0, nullptr, nullptr);
+    if (!backend) fail("ggml_backend_cuda_init failed");
 
-    // ---- ggml CUDA timing, all four shapes back-to-back --------------------
-    witnesses("before ggml timing");
-    for (int s = 0; s < 2; ++s) {
-        for (int mi = 0; mi < 2; ++mi) {
-            int m = mi == 0 ? 1 : 8;
-            Timing t = time_ggml(shapes[s].w, shapes[s].nbytes, shapes[s].rows,
-                                 mi == 0 ? x1.data() : x8.data(), m, y_ref[s][mi]);
-            printf("RESULT engine=ggml shape=%s m=%d us_per_launch=%.3f gbps=%.1f max_rel_err=%.3e\n",
-                   shapes[s].name, m, t.us_per_launch, t.gbps, t.max_rel_err);
-        }
-    }
-    witnesses("after ggml timing");
+    struct Case {
+        const char * name;
+        const uint8_t * w;
+        int64_t nrows;
+        const float * x;
+        int m;
+        const std::vector<float> & yref;
+    };
+    const Case cases[4] = {
+        {"expert0_m1", wAll.data(), N1, x_m1.data(), 1, y_e0_m1},
+        {"expert0_m8", wAll.data(), N1, x_m8.data(), 8, y_e0_m8},
+        {"stack_m1", wAll.data(), N1 * NE, x_m1.data(), 1, y_st_m1},
+        {"stack_m8", wAll.data(), N1 * NE, x_m8.data(), 8, y_st_m8},
+    };
+    for (const Case & cs : cases) {
+        // no_alloc: tensor storage comes from ggml_backend_alloc_ctx_tensors
+        struct ggml_init_params mp = {256u << 20, nullptr, true};
+        struct ggml_context * ctx = ggml_init(mp);
+        struct ggml_tensor * w =
+            ggml_new_tensor_2d(ctx, GGML_TYPE_Q3_K, K, cs.nrows);
+        struct ggml_tensor * x =
+            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, cs.m);
+        struct ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buf) fail("alloc_ctx_tensors failed");
+        const size_t wn = (size_t)cs.nrows * row_bytes;
+        ggml_backend_tensor_set(w, cs.w, 0, wn);
+        ggml_backend_tensor_set(x, cs.x, 0, (size_t)K * cs.m * sizeof(float));
 
-    printf("done\n");
+        for (int i = 0; i < 20; i++) ggml_backend_graph_compute(backend, gf);
+        ggml_backend_synchronize(backend);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 200; i++) ggml_backend_graph_compute(backend, gf);
+        ggml_backend_synchronize(backend);
+        auto t1 = std::chrono::steady_clock::now();
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / 200.0;
+
+        // ggml y layout is [N x M]: element (r,c) at c*N + r
+        std::vector<float> yg((size_t)cs.nrows * cs.m);
+        ggml_backend_tensor_get(y, yg.data(), 0, yg.size() * sizeof(float));
+        double denom = max_abs(cs.yref);
+        double maxerr = 0;
+        for (int64_t r = 0; r < cs.nrows; r++)
+            for (int c = 0; c < cs.m; c++) {
+                double d = std::fabs((double)yg[(size_t)c * cs.nrows + r] -
+                                     cs.yref[(size_t)r * cs.m + c]);
+                maxerr = std::max(maxerr, d);
+            }
+        double gbs = (double)wn / (us * 1e-6) / 1e9;
+        std::printf("shape %-10s N=%6lld M=%d weight_bytes=%9zu us=%9.2f GB/s=%7.2f max_rel_err=%.3e\n",
+                    cs.name, (long long)cs.nrows, cs.m, wn, us, gbs, maxerr / denom);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(backend);
     return 0;
 }
