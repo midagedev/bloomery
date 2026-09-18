@@ -235,7 +235,7 @@ fn read_f32(path: &str) -> Vec<f32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let data = "/root/mulle-data-muse";
+    let data = "/root/mulle-data-s0r-glm";
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
