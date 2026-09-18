@@ -33,11 +33,11 @@ witness() {
 }
 
 bash tools/ref/build.sh
-mkdir -p /root/mulle-data-muse
+mkdir -p /root/mulle-data-s0r-muse
 
 wait_gpu
 witness pre-ref
-/root/mulle-data-muse/bin/q3k_ref
+/root/mulle-data-s0r-muse/bin/q3k_ref
 witness post-ref
 
 wait_gpu
