@@ -17,17 +17,21 @@
 //! them as integer-valued f32); numerics come second at 1e-4, which the activation
 //! quantization below makes honest rather than optimistic.
 //!
-//! Two activation paths, because the reference has two: a plain `MUL_MAT` quantizes f32
-//! activations on its way into the dot and [`crate::ops::matmul_q`] models that path
-//! exactly (gate-ops, 1.5e-5), while the MoE dot path (`MUL_MAT_ID` and the fused
-//! up/gate ops) pre-quantizes activations through `type_traits[ty].vec_dot_type`, which
-//! on the AVX2 reference build is the 32-block q8 for every quant this crate can read
-//! except Q3_K. [`moe_dot`] owns that split.
+//! One activation path, not two. Every op here — the fused up/gate, `MUL_MAT_ID` and
+//! the plain `MUL_MAT` — fills its src1 scratch with `type_traits[vec_dot_type].from_float`
+//! (ggml.c:18564 for the fused op, the same call for `MUL_MAT_ID`), so the quantizer is
+//! the weight type's and nothing else. `crate::ops::matmul_q` is that single owner.
+//!
+//! This round shipped a second implementation with an f16-scale variant for the fused
+//! op; the lead read ggml.c on adoption (2026-09-19) and it is source-false — the fused
+//! op takes the same `from_float` as `MUL_MAT_ID`. The round's own probe had already
+//! said so without being believed: `gate_par` came out at 4.5776367e-5 under both
+//! spellings, to the last digit. The duplicate is gone; the gate numbers are the
+//! round's measured v1 column.
 
 use std::cell::{Cell, RefCell};
 
-use gguf::quant::half_to_f32;
-use gguf::{GgmlType, Gguf, TensorInfo, dequant_row};
+use gguf::{Gguf, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{Tensor2, matmul_q};
@@ -283,188 +287,6 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// IEEE-754 binary16 with round-to-nearest-even, matching `GGML_FP32_TO_FP16`.
-/// Only scales go through it; the tail cases matter because a quiet 32-block can sit
-/// anywhere in the half subnormal range.
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let exp = ((b >> 23) & 0xff) as i32;
-    let frac = b & 0x007f_ffff;
-
-    if exp == 0xff {
-        // Inf/NaN; keep NaN payload bits that fit, like GGML_FP32_TO_FP16.
-        let nan = if frac & 0x1fff != 0 { 0x0200 } else { 0 };
-        return sign | 0x7c00 | nan | (frac >> 13) as u16;
-    }
-    // f32 exponent field (bias 127) rebased to f16 (bias 15).
-    let e = exp - 127 + 15;
-    if e >= 31 {
-        return sign | 0x7c00; // overflow rounds to infinity
-    }
-    if e > 0 {
-        // Normal half: 23 fraction bits -> 10, round to nearest even.
-        let t = frac >> 13;
-        let r = frac & 0x1fff;
-        let mut h = (e as u32) << 10 | t;
-        if r > 0x1000 || (r == 0x1000 && t & 1 == 1) {
-            h += 1; // carries into the exponent field when it must
-        }
-        return sign | h as u16;
-    }
-    // Subnormal half: m = 1.frac scaled to units of 2^-24, shifted right by (1 - e).
-    let s = (1 - e) as u32;
-    if s >= 25 {
-        return sign; // below half of the smallest subnormal step
-    }
-    let m24 = 0x0080_0000 | frac;
-    let t = m24 >> s;
-    let rem = m24 & ((1u32 << s) - 1);
-    let half = 1u32 << (s - 1);
-    let mut m = t;
-    if rem > half || (rem == half && t & 1 == 1) {
-        m += 1;
-    }
-    if m >= 0x400 {
-        // Rounding overflowed the subnormal range into the smallest normal.
-        return sign | 0x0400;
-    }
-    sign | m as u16
-}
-
-/// Which 16-bit format the reference's block scale `d` was rounded through before the
-/// codes were scaled by it. The two MoE ops differ here, on the same build, because
-/// they resolve different quantizers:
-///
-/// * `Half` — the fused up/gate op's activations: f16 scale (empirical, gate-confirmed
-///   at 4.6e-5; the f16 shape is `quantize_row_q8_1_x4`'s, iqk_quantize.cpp:1170).
-/// * `Bf16` — `MUL_MAT_ID`'s activations: `type_traits[Q8_2_X4].from_float` =
-///   `quantize_row_q8_2_x4`, whose AVX2 branch rounds `d` through **bf16** and computes
-///   `id = 1/bf16(d)` (iqk_quantize.cpp:1095-1103). An f16 scale here leaves the down
-///   projection 0.2 % away from the oracle — measured 2.8e-2 on values up to 14.
-#[derive(Clone, Copy, PartialEq)]
-enum ActScale {
-    Half,
-    Bf16,
-}
-
-/// bf16 with round-to-nearest-even, as `GGML_FP32_TO_BF16`'s software path: add a
-/// rounding bias to the lower 16 bits, then truncate. NaN stays a NaN (payload shifted).
-fn f32_to_bf16_bits(v: f32) -> u16 {
-    let b = v.to_bits();
-    let bias = 0x7fff + ((b >> 16) & 1);
-    let mut r = b.wrapping_add(bias) >> 16;
-    if b & 0x7fff_ffff > 0x7f80_0000 {
-        r |= 0x0040; // keep NaN-ness when truncation would quiet it away
-    }
-    r as u16
-}
-
-/// Round-trip f32 activations through the 32-block q8 quantization that ggml's MoE dot
-/// path applies before an expert matmul on the reference build (AVX2:
-/// `type_traits[Q4_K/Q5_K/Q5_0/Q5_1/Q6_K].vec_dot_type == Q8_2_X4`, ggml.c:756-771).
-///
-/// Per 32 values: `d = amax/127` in f32, rounded to `scale`'s 16-bit format for
-/// storage; codes are `round_ties_even(x * id)` saturated at +127 (the pack
-/// instructions saturate, and |x * id| cannot exceed 127.5); the effective value is
-/// `d16 * q`. Where `id` comes from differs by [`ActScale`] — see its doc.
-///
-/// `x.len()` must be a multiple of 32; every row this multiplies is.
-fn quantize_row_q8_x4_roundtrip(x: &mut [f32], scale: ActScale) {
-    assert!(x.len().is_multiple_of(32), "q8 x4 blocks are 32 values");
-    for blk in x.chunks_exact_mut(32) {
-        let mut amax = 0.0f32;
-        for v in blk.iter() {
-            amax = amax.max(v.abs());
-        }
-        if amax == 0.0 {
-            blk.fill(0.0);
-            continue;
-        }
-        let d = amax / 127.0;
-        let d16 = match scale {
-            ActScale::Half => half_to_f32(f32_to_f16_bits(d)),
-            ActScale::Bf16 => f32::from_bits((f32_to_bf16_bits(d) as u32) << 16),
-        };
-        // Half computes id from the unrounded f32 d; Bf16 overwrote d with bf16(d)
-        // before computing id, in the reference's template.
-        let id = match scale {
-            ActScale::Half => 1.0 / d,
-            ActScale::Bf16 => 1.0 / d16,
-        };
-        for v in blk.iter_mut() {
-            let q = (*v * id).round_ties_even().min(127.0);
-            *v = d16 * q;
-        }
-    }
-}
-
-/// A bucket matmul: weight rows dequantized through `dequant_row`, activations
-/// pre-quantized by [`quantize_row_q8_x4_roundtrip`] with `scale`, dot in f32. Same
-/// shape contract as `ops::matmul_q` (`W.dims == [k, n]`, `x` is `[k, n_tokens]`).
-fn matmul_q8_x4(
-    gguf: &Gguf,
-    w: &TensorInfo,
-    x: &Tensor2,
-    scale: ActScale,
-) -> Result<Tensor2, ModelError> {
-    let k = w.dims[0] as usize;
-    let n = w.dims[1] as usize;
-    if x.ne0 != k {
-        return Err(ModelError::Shape {
-            what: "matmul_q8_x4 input",
-            want_ne0: k,
-            want_ne1: x.ne1,
-            got_ne0: x.ne0,
-            got_ne1: x.ne1,
-        });
-    }
-    let bytes = gguf.data(w)?;
-    let row_bytes = bytes.len() / n;
-    let mut act = x.data.clone();
-    for t in 0..x.ne1 {
-        quantize_row_q8_x4_roundtrip(&mut act[t * k..(t + 1) * k], scale);
-    }
-    let mut row = vec![0.0f32; k];
-    let mut out = Tensor2::zeros(n, x.ne1);
-    for r in 0..n {
-        dequant_row(w.ty, &bytes[r * row_bytes..(r + 1) * row_bytes], &mut row)?;
-        for t in 0..x.ne1 {
-            let xc = &act[t * k..(t + 1) * k];
-            // f64 accumulation: both operands are exactly representable (weight =
-            // f16 scale x small int, activation = bf16/f16 scale x small int), so the
-            // products are exact in f64 and the only error left is the reference's own
-            // block-scaled f32 accumulation. An f32 loop over k=1408 rounds every add
-            // and lands ~3e-4 away from the oracle's exact-integer block dots.
-            let mut acc = 0.0f64;
-            for (a, &v) in row.iter().zip(xc) {
-                acc += *a as f64 * v as f64;
-            }
-            out.data[t * n + r] = acc as f32;
-        }
-    }
-    Ok(out)
-}
-
-/// Matmul with the activation quantization the reference's MoE dot path used. The
-/// `scale` argument is the op's, not the type's — fused up/gate and `MUL_MAT_ID`
-/// quantized through different 16-bit scale formats (see [`ActScale`]). Q3_K pairs
-/// with Q8_K on every build and F32/F16 never quantize — `ops::matmul_q` already
-/// models both exactly, so those types go there instead of a second implementation.
-fn moe_dot(
-    gguf: &Gguf,
-    w: &TensorInfo,
-    x: &Tensor2,
-    scale: ActScale,
-) -> Result<Tensor2, ModelError> {
-    match w.ty {
-        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
-            matmul_q8_x4(gguf, w, x, scale)
-        }
-        _ => matmul_q(gguf, w, x),
-    }
-}
-
 /// The `e`-th matrix of a stacked expert tensor `{k, n, n_expert}` as a 2-D
 /// `TensorInfo` into the same mapping. `gguf.data` bounds-checks the view again, so a
 /// miscomputed slice errors instead of reading a neighbor expert.
@@ -546,29 +368,14 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
             xb.col_mut(i).copy_from_slice(x.col(t as usize));
         }
 
-        let g = moe_dot(
-            gguf,
-            &expert_view(gate_exps, e, n_expert)?,
-            &xb,
-            ActScale::Half,
-        )?;
-        let u = moe_dot(
-            gguf,
-            &expert_view(up_exps, e, n_expert)?,
-            &xb,
-            ActScale::Half,
-        )?;
+        let g = matmul_q(gguf, &expert_view(gate_exps, e, n_expert)?, &xb)?;
+        let u = matmul_q(gguf, &expert_view(up_exps, e, n_expert)?, &xb)?;
         let mut par = Tensor2::zeros(ff, m);
         for (p, (&gv, &uv)) in par.data.iter_mut().zip(g.data.iter().zip(&u.data)) {
             *p = silu(gv) * uv;
         }
 
-        let d = moe_dot(
-            gguf,
-            &expert_view(down_exps, e, n_expert)?,
-            &par,
-            ActScale::Bf16,
-        )?;
+        let d = matmul_q(gguf, &expert_view(down_exps, e, n_expert)?, &par)?;
 
         let weights = buckets.bucket_weights(e);
         for i in 0..m {
@@ -590,14 +397,14 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
     }
     TOUCHED.with(|c| c.set(touched));
 
-    // Shared experts: same dense FFN shape as block 0 with `_shexp` names. The
-    // reference computes gate/up through the fused up/gate op (32-block q8 activations,
-    // hence `moe_dot`) and the down projection through a plain MUL_MAT (`matmul_q`).
+    // Shared experts: same dense FFN shape as block 0 with `_shexp` names, and the
+    // same three ops `ffn::dense_ffn` runs. Kept inline here only until round 1-4 wires
+    // `forward` and the two can share one implementation.
     let shexp_gate = tensor(gguf, &format!("blk.{block}.ffn_gate_shexp.weight"))?;
     let shexp_up = tensor(gguf, &format!("blk.{block}.ffn_up_shexp.weight"))?;
     let shexp_down = tensor(gguf, &format!("blk.{block}.ffn_down_shexp.weight"))?;
-    let g = moe_dot(gguf, shexp_gate, x, ActScale::Half)?;
-    let u = moe_dot(gguf, shexp_up, x, ActScale::Half)?;
+    let g = matmul_q(gguf, shexp_gate, x)?;
+    let u = matmul_q(gguf, shexp_up, x)?;
     let mut par = Tensor2::zeros(g.ne0, g.ne1);
     for (p, (&gv, &uv)) in par.data.iter_mut().zip(g.data.iter().zip(&u.data)) {
         *p = silu(gv) * uv;
