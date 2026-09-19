@@ -195,3 +195,95 @@ fn hw_matmul_q_q3k_fused_dispatch() {
     }
     eprintln!("leak watch: Q5_1 all-ones x ffn_down bit-identical over {nf} rows");
 }
+
+#[test]
+#[ignore = "hw: needs the box and the model file"]
+fn hw_matmul_q_batch_matches_sequential() {
+    // MUL-24's dispatch proof: the batched primitive is the per-pair matmul_q
+    // to the last bit, on the tensors it actually serves (the routed-expert
+    // stacks) with the shapes that actually differ between pairs (bucket
+    // sizes — here 2 and 5 columns, mixed on purpose so a pair that read its
+    // neighbor's activations fails on length alone).
+    let g = gguf::Gguf::open(model_path()).unwrap();
+
+    // Slice the expert stack exactly the way moe.rs's expert_view does; the
+    // test rebuilds it because the batch must equal the sequential view, not
+    // because the slicing itself is under test.
+    let stack = g.find("blk.1.ffn_gate_exps.weight").unwrap();
+    assert_eq!(
+        stack.ty,
+        GgmlType::Q3_K,
+        "the fused path must be the one exercised"
+    );
+    assert_eq!(
+        stack.dims.len(),
+        3,
+        "expert stacks are dims len 3: k, n, n_expert"
+    );
+    let k = stack.dims[0] as usize;
+    let n = stack.dims[1] as usize;
+    let n_expert = stack.dims[2] as usize;
+    assert!(
+        k.is_multiple_of(256),
+        "fused dispatch requires k % 256 == 0"
+    );
+    let per = stack.nbytes / n_expert as u64;
+    let view = |e: u64| gguf::TensorInfo {
+        name: stack.name.clone(),
+        dims: vec![stack.dims[0], stack.dims[1]],
+        ty: stack.ty,
+        offset: stack.offset + e * per,
+        nbytes: per,
+    };
+
+    // Activations: reuse the oracle's first-block input so the values are
+    // real model activations, then split into per-expert buckets of 2 and 5
+    // columns (subsets, like routing produces).
+    let o = oracle::Oracle::open();
+    let (xs, xinf) = o.load("attn_norm-0", 0);
+    let x = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
+    let colset = |idx: &[usize]| {
+        let mut xb = Tensor2::zeros(x.ne0, idx.len());
+        for (i, &t) in idx.iter().enumerate() {
+            xb.col_mut(i).copy_from_slice(x.col(t));
+        }
+        xb
+    };
+    let experts = [0usize, 1, 2, 3];
+    let cols = [vec![0, 1], vec![2, 3, 4], vec![0, 2, 4, 5, 1], vec![3]];
+
+    let xbs: Vec<Tensor2> = cols.iter().map(|c| colset(c)).collect();
+    let views: Vec<gguf::TensorInfo> = experts.iter().map(|&e| view(e as u64)).collect();
+
+    // Reference: one dispatch per pair, exactly what the expert loop did
+    // before batching.
+    let seq: Vec<Tensor2> = views
+        .iter()
+        .zip(&xbs)
+        .map(|(w, xb)| matmul_q(&g, w, xb).unwrap())
+        .collect();
+
+    // The batch: one dispatch for all four.
+    let ws: Vec<&gguf::TensorInfo> = views.iter().collect();
+    let xref: Vec<&Tensor2> = xbs.iter().collect();
+    let got = model::ops::matmul_q_batch(&g, &ws, &xref).unwrap();
+
+    assert_eq!(got.len(), seq.len(), "one output per pair");
+    for (p, (want, got)) in seq.iter().zip(&got).enumerate() {
+        assert_eq!([got.ne0, got.ne1], [want.ne0, want.ne1], "pair {p} shape");
+        let diffs = want
+            .data
+            .iter()
+            .zip(&got.data)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "pair {p}: batched must be bit-identical to sequential"
+        );
+    }
+    eprintln!(
+        "batch of {} pairs x {n} rows (2/3/5/1 columns) bit-identical to sequential",
+        experts.len()
+    );
+}

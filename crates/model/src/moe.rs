@@ -35,7 +35,7 @@ use std::time::Instant;
 use gguf::{Gguf, TensorInfo};
 
 use crate::ModelError;
-use crate::ops::{Tensor2, matmul_q};
+use crate::ops::{Tensor2, matmul_q, matmul_q_batch};
 use crate::profile;
 
 /// Tokens grouped by the expert they were routed to.
@@ -397,47 +397,108 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
     let mut routed = Tensor2::zeros(embd, n_tokens);
     let mut gate_par = vec![0.0f32; ff * n_used * n_tokens];
     let mut down_all = vec![0.0f32; embd * n_used * n_tokens];
-    let mut touched = 0u64;
     if let Some(t_trace1) = t_trace1 {
         trace_ns += t_trace1.elapsed().as_nanos() as u64;
     }
 
+    // MUL-24: the expert loop used to pay three pool dispatches per routed
+    // expert (gate, up, down) — at ~850 Q3_K dispatches per decode step MUL-23
+    // measured the orchestration, not the arithmetic, at ~41 ms. The same work
+    // now runs as TWO dispatches per layer: every expert's gate+up in one, every
+    // down in one. Bit identity survives by construction — batching changes
+    // which worker computes which (expert, row), never a row's k-ascending
+    // accumulation, and the scatter below accumulates `routed` in the same
+    // expert-ascending order the sequential loop did.
+    let t_gather = if lvl > 0 { Some(Instant::now()) } else { None };
+    let mut experts: Vec<usize> = Vec::new();
+    let mut xbs: Vec<Tensor2> = Vec::new();
+    let mut touched = 0u64;
     for e in 0..n_expert {
-        let bucket = buckets.bucket(e);
-        if bucket.is_empty() {
+        if buckets.bucket(e).is_empty() {
             continue; // the whole point: an unrouted expert's bytes are never read
         }
         // Set where the weights are fetched, so this mask counts dequantized reality.
         touched |= 1 << e;
-
-        let t_gather = if lvl > 0 { Some(Instant::now()) } else { None };
-        let m = bucket.len();
+        let m = buckets.bucket(e).len();
         let mut xb = Tensor2::zeros(embd, m);
-        for (i, &t) in bucket.iter().enumerate() {
+        for (i, &t) in buckets.bucket(e).iter().enumerate() {
             xb.col_mut(i).copy_from_slice(x.col(t as usize));
         }
-        let mut io_ns = if let Some(t_gather) = t_gather {
-            t_gather.elapsed().as_nanos() as u64
-        } else {
-            0
-        };
+        experts.push(e);
+        xbs.push(xb);
+    }
+    let mut io_ns = if let Some(t_gather) = t_gather {
+        t_gather.elapsed().as_nanos() as u64
+    } else {
+        0
+    };
+    TOUCHED.with(|c| c.set(touched));
 
-        let g = matmul_q(gguf, &expert_view(gate_exps, e, n_expert)?, &xb)?;
-        let u = matmul_q(gguf, &expert_view(up_exps, e, n_expert)?, &xb)?;
+    let mut gate_views = Vec::with_capacity(experts.len());
+    let mut up_views = Vec::with_capacity(experts.len());
+    let mut down_views = Vec::with_capacity(experts.len());
+    for &e in &experts {
+        gate_views.push(expert_view(gate_exps, e, n_expert)?);
+        up_views.push(expert_view(up_exps, e, n_expert)?);
+        down_views.push(expert_view(down_exps, e, n_expert)?);
+    }
+
+    // Phase 1 — gate and up for every routed expert, one dispatch. The views
+    // interleave [gate_e0, up_e0, gate_e1, up_e1, ..] so pair `2*s` is expert
+    // s's gate and `2*s + 1` its up; both read the same `xb` columns the
+    // sequential loop gathered per expert.
+    let mut gu_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(experts.len() * 2);
+    let mut gu_xs: Vec<&Tensor2> = Vec::with_capacity(experts.len() * 2);
+    for (gate, up) in gate_views.iter().zip(&up_views) {
+        gu_ws.push(gate);
+        gu_ws.push(up);
+    }
+    for xb in &xbs {
+        gu_xs.push(xb);
+        gu_xs.push(xb);
+    }
+    let gu = if experts.is_empty() {
+        Vec::new()
+    } else {
+        matmul_q_batch(gguf, &gu_ws, &gu_xs)?
+    };
+
+    // The same swiglu the loop ran per expert, in the same expert order —
+    // elementwise, so the phase boundary it sits between is its only change.
+    let mut pars: Vec<Tensor2> = Vec::with_capacity(experts.len());
+    for slot in 0..experts.len() {
         let t_silu = if lvl > 0 { Some(Instant::now()) } else { None };
-        let mut par = Tensor2::zeros(ff, m);
+        let g = &gu[2 * slot];
+        let u = &gu[2 * slot + 1];
+        let mut par = Tensor2::zeros(g.ne0, g.ne1);
         for (p, (&gv, &uv)) in par.data.iter_mut().zip(g.data.iter().zip(&u.data)) {
             *p = silu(gv) * uv;
         }
         if let Some(t_silu) = t_silu {
             profile::record_time("swiglu", t_silu.elapsed().as_nanos() as u64);
         }
+        pars.push(par);
+    }
 
-        let d = matmul_q(gguf, &expert_view(down_exps, e, n_expert)?, &par)?;
+    // Phase 2 — every expert's down projection, one dispatch.
+    let down_ws: Vec<&gguf::TensorInfo> = down_views.iter().collect();
+    let down_xs: Vec<&Tensor2> = pars.iter().collect();
+    let downs = if experts.is_empty() {
+        Vec::new()
+    } else {
+        matmul_q_batch(gguf, &down_ws, &down_xs)?
+    };
 
-        let t_scatter = if lvl > 0 { Some(Instant::now()) } else { None };
+    // Scatter, expert-ascending — the accumulation order the sequential loop
+    // used, so `routed` gathers its per-token sums in the same sequence of
+    // adds it always did.
+    let t_scatter = if lvl > 0 { Some(Instant::now()) } else { None };
+    for (slot, &e) in experts.iter().enumerate() {
+        let bucket = buckets.bucket(e);
         let weights = buckets.bucket_weights(e);
-        for i in 0..m {
+        let par = &pars[slot];
+        let d = &downs[slot];
+        for i in 0..bucket.len() {
             let t = bucket[i] as usize;
             let w = weights[i] * meta.scale;
             // Rank of `e` in token `t`'s selection — only the trace layout needs it.
@@ -453,14 +514,13 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
                 *a += w * dv;
             }
         }
-        if let Some(t_scatter) = t_scatter {
-            io_ns += t_scatter.elapsed().as_nanos() as u64;
-        }
-        if lvl > 0 {
-            profile::record_time("moe_expert_io", io_ns);
-        }
     }
-    TOUCHED.with(|c| c.set(touched));
+    if let Some(t_scatter) = t_scatter {
+        io_ns += t_scatter.elapsed().as_nanos() as u64;
+    }
+    if lvl > 0 {
+        profile::record_time("moe_expert_io", io_ns);
+    }
 
     // Shared experts: same dense FFN shape as block 0 with `_shexp` names, and the
     // same three ops `ffn::dense_ffn` runs. Kept inline here only until round 1-4 wires
