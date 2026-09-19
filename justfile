@@ -49,6 +49,11 @@ build-decode:
 measure-decode: build-decode
     ./tools/box.sh 'bash tools/ref/decode-measure.sh'
 
+# 스레드 스윕. 같은 임대 안에서 1/8/16/32를 연달아 돌린다 — plan.md의 "스레드 수는
+# 재서 정한다"가 이것이고, 답은 이 티어가 대역폭에 닿는 지점이다.
+measure-sweep: build-decode
+    ./tools/box.sh 'NOCACHE=0 SWEEP="1 8 16 32 64" bash tools/ref/decode-measure.sh'
+
 # 시간 귀속. 러너가 임대와 증인을 소유한다 — 프로파일 표도 측정이고, 옆에서 빌드
 # 하나만 돌아도 site 간 비율이 흔들린다. 레벨 1(배분)과 2(단계)를 연달아 찍는다.
 measure-profile: build-decode

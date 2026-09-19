@@ -23,6 +23,9 @@ witness() {
   echo "loadavg: $(cat /proc/loadavg)"
   echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
   echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
+  # 스레드 수는 이제 결과를 바꾸는 변수다. 증인 줄에 없으면 다른 날의 행과 비교할 때
+  # 무엇이 달랐는지 알 방법이 없다 — 빈 값은 "기본값(물리 코어 수)"을 뜻한다.
+  echo "threads: BLOOMERY_THREADS=${BLOOMERY_THREADS:-<default>}"
   nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
   echo "lock-holder-pid: $$"
 }
@@ -46,6 +49,21 @@ if [ "${NOCACHE:-1}" != 0 ]; then
   witness pre-nocache
   "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" --no-cache
   witness post-nocache
+fi
+
+# 스레드 스윕. plan.md가 "스레드 수는 재서 정한다"고 쓴 그 측정이고, 이 티어가
+# 대역폭 바운드가 되는 지점이 어디인지가 답이다 — SMT 64가 32보다 나을 이유는
+# 미리 없고 ik는 26.7코어를 썼다. 한 임대 안에서 연달아 돌려야 비교가 된다.
+# tests/mt.rs가 스레드 수와 로짓이 무관함을 비트로 못박고 있으므로 갈리는 것은 시간뿐이다.
+if [ -n "${SWEEP:-}" ]; then
+  echo
+  echo "=== 스레드 스윕 ==="
+  for th in $SWEEP; do
+    witness "pre-threads$th"
+    BLOOMERY_THREADS=$th "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
+      | grep -E "^derived|decode steps in|per step"
+    witness "post-threads$th"
+  done
 fi
 
 echo
