@@ -276,8 +276,14 @@ fn hw_attn_exact_input_stages() {
                     .collect()
             })
             .collect();
-        let kqv =
-            model::attn::flash_attn_latent(&q_rope_exact, &q_nope2_exact, &cache16, &slots, &p);
+        let kqv = model::attn::flash_attn_latent(
+            &q_rope_exact,
+            &q_nope2_exact,
+            &cache16,
+            &slots,
+            &slots,
+            &p,
+        );
         let want = load2(&format!("kqv_compressed-{blk}"), 0);
         assert_eq!([kqv.ne0, kqv.ne1], [want.ne0, want.ne1], "stage B shape");
         oracle::assert_close(&kqv.data, &want.data, 0.0, "stage B: attention bit-exact");

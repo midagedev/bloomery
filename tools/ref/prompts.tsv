@@ -11,6 +11,12 @@
 #
 # id 0은 오라클의 토큰 수열과 같다 — 이 파일과 $BLOOMERY_DATA/ref가 같은 모델·같은
 # 토크나이저를 보고 있다는 대조군이다.
+#
+# id 32는 56토큰으로 혼자 길다(2026-09-19, KV 캐시 라운드에서 추가). 플래시 어텐션이
+# 키를 32개 블록으로 도는데, 한 행이 32개를 넘는 키를 보면 러닝 맥시멈이 갱신되고
+# 부분합이 재스케일된다. 그 재스케일만 ik는 glibc expf, 우리는 f32::exp를 쓴다
+# (crates/model/src/attn.rs의 flash_attn_latent 주석). 32토큰 이하 프롬프트로는
+# 그 분기에 닿을 수 없어서, 닿는 줄을 하나 넣었다.
 0	The capital of France is	100000,549,6077,280,7239,317
 1	Water boils at	100000,29889,70092,430
 2	2 + 2 =	100000,17,919,207,17,403
@@ -43,3 +49,4 @@
 29	A byte consists of	100000,32,12457,10663,280
 30	The author of Romeo and Juliet is	100000,549,3855,280,61892,285,52104,317
 31	If it rains tomorrow, I will	100000,1847,359,47098,15593,11,304,543
+32	A flash-attention kernel walks the keys in blocks of thirty-two. When a row sees more keys than fit in one block, the running maximum is bumped and every partial sum has to be rescaled before the next block can be added. The name of that rescaling step is	100000,32,11018,12,29733,6263,20391,254,8726,279,9410,280,13888,12,9498,13,2473,245,5451,14338,691,8726,853,4357,279,634,3850,11,254,3268,6059,317,84762,285,1131,12141,2555,643,276,330,82601,1323,254,2112,3850,481,330,3746,13,429,1210,280,344,81116,3458,317

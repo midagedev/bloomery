@@ -24,6 +24,7 @@
 //! end. Every stage after attention is column-independent, so the two agree on the
 //! column that survives; ik's version is cheaper, ours is simpler, and 1-5 is where
 //! that trade starts to matter.
+use crate::kv::KvCache;
 use crate::ops::{Tensor2, f32_tensor, rms_norm};
 use crate::{ModelError, Slot};
 use gguf::{Gguf, TensorInfo, dequant_row};
@@ -94,6 +95,36 @@ fn gain(gguf: &Gguf, name: &str) -> Result<Vec<f32>, ModelError> {
         .find(name)
         .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
     f32_tensor(gguf, t)
+}
+
+/// One transformer block against a KV cache: `l_out-(b-1)` in, `l_out-b` out.
+///
+/// Identical to [`block`] except that attention reads the cache instead of only the
+/// batch. `block` is the shim now — it builds a cache holding exactly its batch.
+#[allow(clippy::too_many_arguments)]
+pub fn block_cached(
+    gguf: &Gguf,
+    b: usize,
+    x: &Tensor2,
+    q_slots: &[Slot],
+    eps: f32,
+    cache: &mut KvCache,
+    range: &std::ops::Range<usize>,
+) -> Result<Tensor2, ModelError> {
+    let attn_gain = gain(gguf, &format!("blk.{b}.attn_norm.weight"))?;
+    let normed = rms_norm(x, &attn_gain, eps);
+    let kqv_out =
+        crate::attn::block_attn_cached(gguf, b, &normed, q_slots, cache, b, range)?.kqv_out;
+    let ffn_inp = add(x, &kqv_out);
+
+    let ffn_gain = gain(gguf, &format!("blk.{b}.ffn_norm.weight"))?;
+    let ffn_normed = rms_norm(&ffn_inp, &ffn_gain, eps);
+    let ffn_out = if is_moe(gguf, b) {
+        crate::moe::moe_ffn(gguf, b, &ffn_normed)?
+    } else {
+        crate::ffn::dense_ffn(gguf, b, &ffn_normed)?
+    };
+    Ok(add(&ffn_inp, &ffn_out))
 }
 
 /// One transformer block: `l_out-(b-1)` in, `l_out-b` out.
@@ -188,4 +219,49 @@ pub fn argmax(logits: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+/// The cache this model's blocks need, sized from the file.
+///
+/// The row width is `MlaParams`' `latent + rope_dims` for block 0 — 576 here — read
+/// from the file rather than written down, because a differently shaped MLA file must
+/// fail on the first push instead of caching truncated rows.
+pub fn new_cache(gguf: &Gguf) -> Result<KvCache, ModelError> {
+    let n_block = gguf
+        .block_count()
+        .ok_or_else(|| ModelError::MissingTensor("metadata key block_count".into()))?
+        as usize;
+    let p = crate::attn::MlaParams::read(gguf, 0)?;
+    Ok(KvCache::new(n_block, p.latent + p.rope_dims))
+}
+
+/// Push `tokens` through the model against `cache`, and return the last position's logits.
+///
+/// **Only `tokens` flows.** Everything before them is in the cache and is not re-embedded,
+/// re-normed or re-projected — that is the entire point, and passing the whole context
+/// here on every step is exactly the bug this function exists to remove. The positions
+/// continue from what the cache already holds, so a decode step is
+/// `step(gguf, &[next], &mut cache)` and nothing else.
+///
+/// The first call on an empty cache is the prefill; there is no separate entry point,
+/// because a prefill is a step whose batch happens to be longer than one.
+pub fn step(gguf: &Gguf, tokens: &[u32], cache: &mut KvCache) -> Result<Tensor2, ModelError> {
+    let n_block = cache.n_block();
+    let eps = rms_eps(gguf);
+    let base = cache.next_pos(0);
+    let slots: Vec<Slot> = (0..tokens.len() as u32)
+        .map(|i| Slot {
+            seq: 0,
+            pos: base + i,
+        })
+        .collect();
+    let range = cache.begin(&slots);
+
+    let mut x = embed(gguf, tokens)?;
+    for b in 0..n_block {
+        x = block_cached(gguf, b, &x, &slots, eps, cache, &range)?;
+    }
+    let last = tokens.len() - 1;
+    let tail = Tensor2::from_vec(x.ne0, 1, x.col(last).to_vec());
+    crate::head::head(gguf, &tail)
 }

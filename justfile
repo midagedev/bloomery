@@ -86,6 +86,10 @@ gate-head:
 gate-forward:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test forward -- --ignored --nocapture'
 
+# 1-5 KV 캐시 게이트: 캐시가 있는 경로와 없는 경로의 로짓이 비트 동일한가.
+gate-kv:
+    ./tools/box.sh 'cargo test --release -p bloomery-model --test kv -- --ignored --nocapture'
+
 # 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
 gate-prompts:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test prompts -- --ignored --nocapture'

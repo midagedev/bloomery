@@ -40,6 +40,7 @@
 //! tokens are the KV entries (prefill semantics). Token `t` attends to every batch
 //! entry `u` with `slots[u].seq == slots[t].seq && slots[u].pos <= slots[t].pos`.
 
+use crate::kv::KvCache;
 use crate::ops::{f32_tensor, matmul_q, rms_norm};
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
@@ -80,6 +81,11 @@ pub fn block_attn(
 }
 
 /// The same computation, keeping every intermediate the gate asserts.
+///
+/// Prefill semantics: the batch is the whole history. Implemented by running the cached
+/// path against a cache that holds exactly this batch and nothing else — the two are one
+/// code path, so "caching changes nothing" is a property of the structure and not only
+/// of the measurement in `tests/kv.rs`.
 pub fn block_attn_trace(
     gguf: &Gguf,
     block: usize,
@@ -87,6 +93,30 @@ pub fn block_attn_trace(
     slots: &[Slot],
 ) -> Result<AttnTrace, ModelError> {
     let p = MlaParams::read(gguf, block)?;
+    let mut scratch = KvCache::new(1, p.latent + p.rope_dims);
+    let range = scratch.begin(slots);
+    block_attn_cached(gguf, block, x, slots, &mut scratch, 0, &range)
+}
+
+/// One block's attention against a KV cache: `q_slots` are the queries this call carries,
+/// the cache holds every key. The new rows are appended to `cache_block` first, so a
+/// decode step attends against its own token as well as the prefix.
+///
+/// `cache_block` is the cache's block index, which is the model's `block` in a real
+/// forward pass and 0 in the scratch cache `block_attn_trace` builds. They are separate
+/// parameters because they are separate things, and conflating them would make the
+/// scratch path allocate 27 empty blocks to use one.
+pub fn block_attn_cached(
+    gguf: &Gguf,
+    block: usize,
+    x: &Tensor2,
+    q_slots: &[Slot],
+    cache: &mut KvCache,
+    cache_block: usize,
+    range: &std::ops::Range<usize>,
+) -> Result<AttnTrace, ModelError> {
+    let p = MlaParams::read(gguf, block)?;
+    let slots = q_slots;
     if slots.len() != x.ne1 {
         return Err(ModelError::Shape {
             what: "attn slots vs tokens",
@@ -138,8 +168,10 @@ pub fn block_attn_trace(
         dst[p.rope_dims..].copy_from_slice(kv_compressed.col(t));
     }
 
-    // 5. The F16 cache the reference attends over: K = f16(kvr), V = its latent tail.
-    let cache16: Vec<Vec<u16>> = (0..x.ne1)
+    // 5. The F16 rows the reference attends over: K = f16(kvr), V = its latent tail.
+    //    They go into the cache before attention, not after, because this batch's own
+    //    tokens are keys for this batch's own queries (a prefill attends to itself).
+    let new_rows: Vec<Vec<u16>> = (0..x.ne1)
         .map(|t| {
             kvr.col(t)
                 .iter()
@@ -147,13 +179,21 @@ pub fn block_attn_trace(
                 .collect::<Vec<u16>>()
         })
         .collect();
+    cache.push(cache_block, range, new_rows);
 
     // 6. q_nope2 = wk_b(Q8_0)ᵀ q_nope per head — the weight absorption.
     let wkb = find(gguf, &format!("blk.{block}.attn_kv_b.weight"))?;
     let q_nope2 = q_nope2_absorbed(gguf, wkb, &q, &p)?;
 
     // 7. Attention over the latent.
-    let kqv_compressed = flash_attn_latent(&q_rope, &q_nope2, &cache16, slots, &p);
+    let kqv_compressed = flash_attn_latent(
+        &q_rope,
+        &q_nope2,
+        cache.keys(cache_block),
+        cache.slots(),
+        slots,
+        &p,
+    );
 
     // 8. wv_b (still Q3_K) per head, then the output projection.
     let kqv_2d = wv_b_heads(gguf, wkb, &kqv_compressed, &p)?;
@@ -673,11 +713,21 @@ fn lane_tree_sum(w: &[f32; 32]) -> f32 {
 pub fn flash_attn_latent(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
-    cache16: &[Vec<u16>],
-    slots: &[Slot],
+    keys16: &[Vec<u16>],
+    key_slots: &[Slot],
+    q_slots: &[Slot],
     p: &MlaParams,
 ) -> Tensor2 {
-    let n_tokens = slots.len();
+    // Queries and keys are two different counts the moment a KV cache exists: one
+    // decode step is a single query against a whole prefix. They were one array while
+    // the batch WAS the cache, and every index below that reads `n_tokens` is a query
+    // index -- `q_rope` and `q_nope2` are laid out by the batch, never by the cache.
+    assert_eq!(
+        keys16.len(),
+        key_slots.len(),
+        "every cached key row needs its slot"
+    );
+    let n_tokens = q_slots.len();
     let d_head = p.rope_dims + p.latent;
     let mut out = Tensor2::zeros(p.latent, n_tokens * p.n_head);
 
@@ -693,19 +743,19 @@ pub fn flash_attn_latent(
             let mut m = f32::NEG_INFINITY;
             let mut s_sum = 0.0f32;
             r.fill(0.0);
-            for blk in (0..n_tokens).step_by(32) {
+            for blk in (0..key_slots.len()).step_by(32) {
                 let mut s = [f32::NEG_INFINITY; 32];
                 let mut smax = f32::NEG_INFINITY;
                 for (l, sl) in s.iter_mut().enumerate() {
                     let u = blk + l;
-                    let su = match slots.get(u) {
+                    let su = match key_slots.get(u) {
                         Some(su) => su,
-                        None => break, // past the batch: cache padding, weight exactly 0
+                        None => break, // past the cache: padding, weight exactly 0
                     };
-                    if su.seq != slots[t].seq || su.pos > slots[t].pos {
+                    if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
                         continue; // the -inf half of the causal mask
                     }
-                    let kq = kq_dot_fa4(&qrow, &cache16[u]);
+                    let kq = kq_dot_fa4(&qrow, &keys16[u]);
                     *sl = p.kq_scale * kq;
                     smax = smax.max(*sl);
                 }
@@ -746,7 +796,7 @@ pub fn flash_attn_latent(
                     if w[l] == 0.0 {
                         continue; // masked lane: fma(V, 0, R) == R exactly
                     }
-                    let krow = &cache16[blk + l];
+                    let krow = &keys16[blk + l];
                     for d in 0..p.latent {
                         r[d] = half_to_f32(krow[p.rope_dims + d]).mul_add(w[l], r[d]);
                     }

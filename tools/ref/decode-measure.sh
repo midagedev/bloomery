@@ -36,6 +36,18 @@ witness pre-bloomery
 "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N"
 witness post-bloomery
 
+# 캐시 없는 옛 경로를 같은 임대 안에서 한 번 더 잰다. 다른 날 다른 조건의 숫자와
+# 비교하면 그건 비교가 아니다 — 캐시가 얼마를 가져갔는지는 같은 분에 재야 말이 된다.
+# tests/kv.rs 가 두 경로의 로짓이 모든 분할에서 비트 동일함을 못박고 있으므로,
+# 여기서 갈리는 것은 시간뿐이다.
+if [ "${NOCACHE:-1}" != 0 ]; then
+  echo
+  echo "=== 같은 프롬프트, 캐시 없는 경로 ==="
+  witness pre-nocache
+  "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" --no-cache
+  witness post-nocache
+fi
+
 echo
 echo "=== ik_llama.cpp, same file, same lease, CPU only ==="
 witness pre-ik

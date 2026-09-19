@@ -37,8 +37,9 @@ V4.1 Flash는 engram 테이블 NVMe 지연 읽기, 공유 압축 KV, 지연 하�
 | 1-2 attn | MLA 어텐션(블록 0) | **통과 2026-09-19**: `q_nope2-0` 2.5e-3(한 컬럼 한정, 활성 코드 동점 뒤집힘 — 정확입력 짝은 3.8e-6), `kqv_compressed-0` 1.2e-4, `kqv_out-0` 8.9e-4. `just gate-attn` | ops |
 | 1-3 | MoE 블록: 라우터, top-6, expert 디스패치 | **통과 2026-09-19**: 라우팅 id 36/36 정확, `ffn_moe_out-1` 2.0e-5, `ffn_out-1` 2.0e-5 (게이트 1e-4), `down` 2.8e-4 (게이트 4e-4, 유도는 호출부 주석). 구조 게이트: 라우팅된 25개만 디퀀트. `just gate-moe` | 1-2 |
 | 1-4 head | 출력 헤드 | **통과 2026-09-19**: `result_norm` 9.5e-7, `result_output` 4.0e-5, argmax·top-5 정확 일치. `just gate-head` | 1-3 |
-| 1-4 | 토큰 하나의 전체 순전파, CPU, M=1 | **통과 2026-09-19, 한 군데 정정**: `inp_embd` 비트 정확, `l_out-0`~`l_out-26` 상대 드리프트 7.0e-4 → 9.1e-3, `result_output` 2.2e-2(절대 6.1e-1). argmax는 ~~32/32~~ **31/32** — 5번(`def add(a, b):`)이 ik의 0.262 마진 안에서 뒤집혔다. 첫 tok/s **0.0521**. `just gate-forward`, `just gate-prompts`, `just measure-decode` | 1-3 |
-| 1-5 | dense 경로 GPU 오프로드 + 라우팅 expert에 `q3k-gemv`, KV 캐시 | 같은 logits, 3090에서 ik 대비 tok/s | 1-4 |
+| 1-4 | 토큰 하나의 전체 순전파, CPU, M=1 | **통과 2026-09-19, 한 군데 정정**: `inp_embd` 비트 정확, `l_out-0`~`l_out-26` 상대 드리프트 7.0e-4 → 9.1e-3, `result_output` 2.2e-2(절대 6.1e-1). argmax는 ~~32/32~~ **32/33**(프롬프트 32번은 KV 캐시 라운드에서 추가) — 5번(`def add(a, b):`)이 ik의 0.262 마진 안에서 뒤집혔다. 첫 tok/s **0.0521**. `just gate-forward`, `just gate-prompts`, `just measure-decode` | 1-3 |
+| 1-5 KV | KV 캐시 | **통과 2026-09-19**: 캐시·무캐시 로짓이 모든 분할에서 **비트 동일**(0e0). 디코드 0.0519 → **0.2730 tok/s**(5.26배), 스텝 폭 84.5% → 0.5%. `just gate-kv`, `just measure-decode` | 1-4 |
+| 1-5 | dense 경로 GPU 오프로드 + 라우팅 expert에 `q3k-gemv` | 같은 logits, 3090에서 ik 대비 tok/s | 1-5 KV |
 
 ~~1-1과 1-2는 파일이 겹치지 않으므로 병렬로 돌린다. 나머지는 직렬이다.~~ 2026-09-19 선 그음:
 **오라클이 직렬 사슬을 팬아웃으로 바꾼다.** 1-2 → 1-3 → 1-4가 직렬이었던 이유는 각 라운드의

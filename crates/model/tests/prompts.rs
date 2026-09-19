@@ -4,7 +4,10 @@
 //! enough to prove the decision — a chain whose logits drift by 6e-1 (measured in
 //! `tests/forward.rs`) keeps the argmax on a confident prompt and can lose it on a
 //! near-tie. So this runs thirty-two, at 2 to 11 tokens, and reports the tie margin
-//! next to every verdict instead of only the verdict.
+//! next to every verdict instead of only the verdict. Prompt 32 is 56 tokens on its own:
+//! flash attention walks keys in blocks of 32, and only a row that sees more than 32
+//! allowed keys reaches the M-bump rescale where ik uses glibc `expf` and we use
+//! `f32::exp`. Nothing shorter can touch that branch.
 //!
 //! Both sides read the same token ids from `tools/ref/prompts.tsv`; neither tokenizes.
 //! ik's answers come from `$BLOOMERY_DATA/argmax-ik.tsv`, written by
@@ -94,10 +97,10 @@ fn top5(logits: &[f32]) -> Vec<u32> {
 /// logit error is 6e-1 and could have moved it. Both appear in this set by construction.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/argmax-ik.tsv"]
-fn hw_argmax_matches_ik_on_32_prompts() {
+fn hw_argmax_matches_ik_on_the_prompt_set() {
     let rows = read_prompts();
     let ik = read_ik();
-    assert_eq!(rows.len(), 32, "the prompt set is 32 rows");
+    assert_eq!(rows.len(), 33, "the prompt set is 33 rows");
     assert_eq!(
         ik.len(),
         rows.len(),
@@ -106,8 +109,8 @@ fn hw_argmax_matches_ik_on_32_prompts() {
     let g = gguf::Gguf::open(model_path()).unwrap();
 
     eprintln!(
-        "{:>3} {:>3} {:>8} {:>8} {:>7} {:>10} {:>6}  {}",
-        "id", "n", "ik", "ours", "margin", "max|dlogit|", "top5", "prompt"
+        "{:>3} {:>3} {:>8} {:>8} {:>7} {:>10} {:>6}  prompt",
+        "id", "n", "ik", "ours", "margin", "max|dlogit|", "top5"
     );
     let mut mismatched = Vec::new();
     let mut top5_differs = Vec::new();
@@ -161,16 +164,17 @@ fn hw_argmax_matches_ik_on_32_prompts() {
         }
     }
 
+    let n = rows.len() as u32;
     eprintln!(
-        "\n32 prompts in {:?} ({:?} each); worst |logit - ik| over ik's top-5 = {:.4}",
+        "\n{n} prompts in {:?} ({:?} each); worst |logit - ik| over ik's top-5 = {:.4}",
         total,
-        total / 32,
+        total / n,
         worst_dlogit
     );
     eprintln!(
-        "argmax: {}/32 match; top-5 order: {}/32 identical",
-        32 - mismatched.len(),
-        32 - top5_differs.len()
+        "argmax: {}/{n} match; top-5 order: {}/{n} identical",
+        n as usize - mismatched.len(),
+        n as usize - top5_differs.len()
     );
     for (id, want, got, margin) in &mismatched {
         eprintln!("  prompt {id}: ik {want}, ours {got}, ik's margin was {margin:.3}");
