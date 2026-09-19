@@ -19,6 +19,7 @@
 //!      multiplies a verification pass by k. Bucket → per-bucket matmul → inverse permutation.
 
 pub mod attn;
+pub mod derived;
 pub mod ffn;
 pub mod forward;
 pub mod head;

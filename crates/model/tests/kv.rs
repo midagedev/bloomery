@@ -51,7 +51,8 @@ fn hw_kv_one_shot_equals_uncached() {
 
     let plain = forward(&g, &tokens).unwrap();
     let mut cache = new_cache(&g).unwrap();
-    let cached = step(&g, &tokens, &mut cache).unwrap();
+    let derived = model::derived::Derived::new(&g).unwrap();
+    let cached = step(&g, &tokens, &mut cache, &derived).unwrap();
 
     assert_eq!(cache.len(), tokens.len(), "the cache holds the whole batch");
     let worst = max_abs_diff(&cached.data, &plain.data);
@@ -76,14 +77,15 @@ fn hw_kv_incremental_is_bit_exact() {
     let one_shot = forward(&g, &tokens).unwrap();
 
     let mut cache = new_cache(&g).unwrap();
-    step(&g, &tokens[..split], &mut cache).unwrap();
+    let derived = model::derived::Derived::new(&g).unwrap();
+    step(&g, &tokens[..split], &mut cache, &derived).unwrap();
     assert_eq!(cache.len(), split, "prefill cached {split} positions");
     assert_eq!(
         cache.next_pos(0),
         split as u32,
         "next position follows the table"
     );
-    let incremental = step(&g, &tokens[split..], &mut cache).unwrap();
+    let incremental = step(&g, &tokens[split..], &mut cache, &derived).unwrap();
     assert_eq!(cache.len(), tokens.len(), "the step appended its own token");
 
     let worst = max_abs_diff(&incremental.data, &one_shot.data);
@@ -115,8 +117,9 @@ fn hw_kv_every_split_is_bit_exact() {
         .collect();
 
     let mut cache = new_cache(&g).unwrap();
+    let derived = model::derived::Derived::new(&g).unwrap();
     for (i, t) in tokens.iter().enumerate() {
-        let got = step(&g, &[*t], &mut cache).unwrap();
+        let got = step(&g, &[*t], &mut cache, &derived).unwrap();
         let worst = max_abs_diff(&got.data, &refs[i]);
         eprintln!(
             "token {i} (ctx {})                        max|diff| = {worst:e}",
