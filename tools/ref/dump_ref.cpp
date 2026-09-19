@@ -149,19 +149,51 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
+    // This binary's side effect IS the oracle. Running it for any other reason -- under a
+    // debugger to breakpoint into an ik kernel, say -- overwrites 1155 files that every
+    // gate in this repo reads. That happened on 2026-09-19: a round ran it about ten times
+    // under gdb to inspect the flash-attention path, each run was killed at a breakpoint,
+    // and what survived was a half-written set with a zero-byte manifest. The spec said
+    // "never run dump_ref yourself" and the spec was not the right place for that rule --
+    // the round was not reaching for the dumper, it was reaching for the one binary that
+    // links ik and takes --tokens. So the rule lives here instead, where it cannot be
+    // missed: without MULLE_REF_WRITE=1 this tool refuses to write anything.
+    if (!getenv("MULLE_REF_WRITE")) {
+        fprintf(stderr,
+                "dump_ref: refusing to run -- this tool OVERWRITES the oracle reference set,\n"
+                "          which every gate in this repo reads. It is not a general ik harness.\n"
+                "          The lead regenerates the set with `just dump-ref`, which sets\n"
+                "          MULLE_REF_WRITE=1 and stages the output so a failed run keeps the\n"
+                "          old set. If you want to inspect ik's kernels under a debugger, use\n"
+                "          llama-cli or llama-eval-callback -- not this.\n");
+        return 3;
+    }
+
     const char * data_dir = getenv("MULLE_DATA");
+    const char * ref_dir  = getenv("MULLE_REF_DIR");
     dump_ctx d;
-    d.dir = std::string(data_dir ? data_dir : "/root/mulle-data") + "/ref";
+    d.dir = ref_dir ? std::string(ref_dir)
+                    : std::string(data_dir ? data_dir : "/root/mulle-data") + "/ref";
     mkdir(d.dir.c_str(), 0755);
 
-    const std::string manifest_path = d.dir + "/MANIFEST.tsv";
-    d.manifest = fopen(manifest_path.c_str(), "w");
+    // The manifest is written to a .partial name and renamed only after the decode
+    // returns. An interrupted run therefore leaves the previous MANIFEST.tsv alone
+    // instead of truncating it to zero bytes, which is what turned a redundant re-run
+    // into "the oracle is gone".
+    const std::string manifest_final   = d.dir + "/MANIFEST.tsv";
+    const std::string manifest_partial = manifest_final + ".partial";
+    d.manifest = fopen(manifest_partial.c_str(), "w");
     if (!d.manifest) {
-        fprintf(stderr, "dump_ref: cannot write %s\n", manifest_path.c_str());
+        fprintf(stderr, "dump_ref: cannot write %s\n", manifest_partial.c_str());
         return 1;
     }
     fprintf(d.manifest, "# dump_ref — ik_llama.cpp intermediate tensors, raw f32, little-endian\n");
     fprintf(d.manifest, "# model\t%s\n", params.model.c_str());
+    if (const char * b = getenv("MULLE_REF_BUILD")) {
+        // Which ik build produced this set. The reference IS that build's output, so a
+        // set whose build is unknown cannot be reasoned about after the fact.
+        fprintf(d.manifest, "# build\t%s\n", b);
+    }
     fprintf(d.manifest, "# tokens\t");
     for (size_t i = 0; i < tokens.size(); ++i) fprintf(d.manifest, "%s%d", i ? "," : "", tokens[i]);
     fprintf(d.manifest, "\n# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\n");
@@ -184,7 +216,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // The trailer is the completion proof: a reader that does not find it is looking at a
+    // set from a run that died, whatever the file count says.
+    fprintf(d.manifest, "# complete\t%d\t%d\n", d.written, d.skipped);
     fclose(d.manifest);
+    d.manifest = nullptr;
+    if (rename(manifest_partial.c_str(), manifest_final.c_str()) != 0) {
+        fprintf(stderr, "dump_ref: cannot install %s\n", manifest_final.c_str());
+        return 1;
+    }
     printf("dump_ref: wrote %d tensors, skipped %d, into %s\n", d.written, d.skipped, d.dir.c_str());
     llama_free(init.context);
     llama_free_model(init.model);

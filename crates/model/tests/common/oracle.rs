@@ -40,6 +40,20 @@ impl Oracle {
                 manifest.display()
             )
         });
+        // The dumper's last line is its completion proof. A manifest without it is from a
+        // run that died, and the .f32 files beside it are then a mixture of two runs --
+        // which is what 2026-09-19 produced (27 tensors from an aborted dump, a zero-byte
+        // manifest, and gates that would have compared against whichever half survived).
+        // File count cannot detect that; the trailer can.
+        if !text.lines().any(|l| l.starts_with("# complete\t")) {
+            panic!(
+                "the oracle at {} has no completion trailer — the dump that wrote it did \
+                 not finish, so the tensors beside it may be from two different runs. \
+                 The lead regenerates it: `just dump-ref`. Do not run dump_ref yourself \
+                 and do not skip this test.",
+                manifest.display()
+            );
+        }
         let mut by_key = HashMap::new();
         let mut tokens = Vec::new();
         let mut model = String::new();

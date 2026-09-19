@@ -20,6 +20,33 @@ MODEL=${MULLE_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${MULLE_REF_TOKENS:-100000,549,6077,280,7239,317}
 BIN="$MULLE_DATA/bin/dump_ref"
 [ -x "$BIN" ] || { echo "no dump_ref at $BIN — run: just build-ref-dump" >&2; exit 2; }
-rm -f "$MULLE_DATA/ref"/*.f32 "$MULLE_DATA/ref"/MANIFEST.tsv
-CUDA_VISIBLE_DEVICES="" "$BIN" -m "$MODEL" --tokens "$TOKENS" -ngl 0 -c 512 -t 32
-grep -c '^tensor' "$MULLE_DATA/ref/MANIFEST.tsv" | xargs echo "reference tensors:"
+
+# Stage, then swap. The old set survives a failed run: `rm -f *.f32` up front used to mean
+# that a dumper killed halfway left a half-set with nothing to compare it against, and on
+# 2026-09-19 that is exactly what happened (a round ran the binary under gdb; every
+# breakpoint killed it mid-write). A dump that does not finish must cost nothing.
+REF="$MULLE_DATA/ref"
+STAGE="$MULLE_DATA/ref.staging"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+
+# Which ik build this set is the output of — recorded in the manifest, because the
+# reference is that build's answer and nothing else's.
+# Same default as tools/ref/build-dump.sh's $IK — the tree this binary was linked against.
+# Not $HOME/ik_llama.cpp: the dump runs as root and the tree is the serving user's.
+BUILD=$(git -C "${IK:-/home/user/ik_llama.cpp}" rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+MULLE_REF_WRITE=1 MULLE_REF_DIR="$STAGE" MULLE_REF_BUILD="$BUILD" \
+  CUDA_VISIBLE_DEVICES="" "$BIN" -m "$MODEL" --tokens "$TOKENS" -ngl 0 -c 512 -t 32
+
+# The trailer is the dumper's completion proof; without it the staged set is not installed.
+grep -q '^# complete' "$STAGE/MANIFEST.tsv" || {
+    echo "dump.sh: the staged set has no completion trailer — not installing it" >&2
+    exit 1
+}
+rm -rf "$MULLE_DATA/ref.old"
+if [ -d "$REF" ]; then mv "$REF" "$MULLE_DATA/ref.old"; fi
+mv "$STAGE" "$REF"
+rm -rf "$MULLE_DATA/ref.old"
+grep -c '^tensor' "$REF/MANIFEST.tsv" | xargs echo "reference tensors:"
+echo "build: $BUILD"
