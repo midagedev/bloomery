@@ -172,8 +172,9 @@ fn hw_profile_gate() {
     // a site the size of `flash_attn_latent` (9.6 ms, 4.1%) going dark lands
     // near 94% and fails loud, not marginal.
     //
-    // Lead re-ran it five times on the merged tree before committing: 98.04,
-    // 98.06, 98.08, 98.09, 98.11 % over walls of 189 to 237 ms. The ratio does
+    // Six runs stand behind that: four by the lead on the merged tree before
+    // committing (98.04, 98.08, 98.09, 98.11 %) and two by the round on its own
+    // tree (98.06, 98.10), over walls of 189 to 237 ms. The ratio does
     // not move with the wall — the unhooked remainder is step glue that scales
     // with the step, not a fixed overhead — so the 0.04 points of headroom at
     // the worst run are not a noise band waiting to flip. Anything that does
