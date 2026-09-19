@@ -67,7 +67,9 @@ mod kernels {
         let b = blk % 64;
         let lane = warp::lane_id() as usize;
 
-        let v = x[col * 2048 + 32 * b + lane];
+        // SAFETY: col < m_cols, b < 64, lane < 32, so the index is
+        // below m_cols*2048 <= x.len() by the launch contract.
+        let v = unsafe { *x.get_unchecked(col * 2048 + 32 * b + lane) };
         let amax = warp::reduce_max_f32(v.abs());
         let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
         let qv = (v / d).round().clamp(-127.0, 127.0);
@@ -164,16 +166,19 @@ mod kernels {
             // for even sbp and 2 mod 4 for odd, so the same floor division
             // addresses both; odd lanes reassemble with a 16-bit funnel.
             let qk = (base + 32 + 4 * w16) >> 2;
-            let lo = w[qk];
-            let hi = w[qk + 1];
+            // SAFETY: row < n_rows, sbp < 8, w16 < 16, so qk+1 < (row+1)*220
+            // <= w.len() by the launch contract (word indices stay inside the
+            // row's 220 words; odd super-blocks only shift the window by 2).
+            let (lo, hi) = unsafe { (*w.get_unchecked(qk), *w.get_unchecked(qk + 1)) };
             let vl = if par == 0 { lo } else { (lo >> 16) | (hi << 16) };
 
             // hmask word (bytes base+4*(w16%8) .. +3), one bit per weight:
             // bit 4*(w16/8)+field. Invert so a clear hmask bit (subtract 4)
             // becomes a set bit, pre-shifted to bit 0 of each byte.
             let hk = (base + 4 * (w16 & 7)) >> 2;
-            let hlo = w[hk];
-            let hhi = w[hk + 1];
+            // SAFETY: same row/sbp/w16 bounds as the qs window above; hk+1 <
+            // (row+1)*220 <= w.len().
+            let (hlo, hhi) = unsafe { (*w.get_unchecked(hk), *w.get_unchecked(hk + 1)) };
             let hm = if par == 0 { hlo } else { (hlo >> 16) | (hhi << 16) };
             let vh1 = (!hm) >> (4 * (w16 >> 3)) as u32;
 
@@ -182,10 +187,17 @@ mod kernels {
             // 16-byte window base+96..112 (even) / base+94..110 (odd) is
             // covered by four aligned words.
             let ak = (base + 96) >> 2;
-            let aw0 = w[ak];
-            let aw1 = w[ak + 1];
-            let aw2 = w[ak + 2];
-            let aw3 = w[ak + 3];
+            // SAFETY: ak+3 < (row+1)*220 <= w.len(): the 16-byte window ends
+            // at most 2 bytes past the row end for the last super-block, but
+            // the floored word index stays inside the row's 220 words.
+            let (aw0, aw1, aw2, aw3) = unsafe {
+                (
+                    *w.get_unchecked(ak),
+                    *w.get_unchecked(ak + 1),
+                    *w.get_unchecked(ak + 2),
+                    *w.get_unchecked(ak + 3),
+                )
+            };
             let (a0w, a1w, a2w) = if par == 0 {
                 (aw0, aw1, aw2)
             } else {
@@ -244,96 +256,214 @@ mod kernels {
             let d8b = 8 * sbp + d8_base;
 
             // Column 0 (always active). Each field j has its own q8_1 block
-            // (u-words step by 8 = one block), so its d8 scale too.
+            // (u-words step by 8 = one block), so its d8 scale too. The
+            // super-block scale drow is hoisted: sum the four d8-scaled
+            // fields first, multiply by drow once (ggml's shape).
             {
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f0 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f0 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f0 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f0 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: sbp < 8 and u_base < 40, so uw+24 < 512 and
+                // d8b+3 < 64; column 0 is inside q (m*512 words) and d8
+                // (m*64) for any m >= 1 by the launch contract.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p0 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f0 += p0 * drow;
             }
             if m > 1 {
                 // Columns 1..7 (launch-uniform guard, no divergence). Same
                 // shape as column 0 with the per-column q/d8 offsets.
                 let mut uw = uw + 512;
                 let mut d8b = d8b + 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f1 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f1 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f1 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f1 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: this branch runs only for m == 8 (host launches 1
+                // or 8); column 1 sits at 512..1024 < 8*512 in q and 64..128
+                // < 8*64 in d8, inside the launch-contract bounds.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p1 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f1 += p1 * drow;
 
                 uw += 512;
                 d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f2 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f2 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f2 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f2 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: column 2 of m == 8; same bounds argument as column 1.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p2 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f2 += p2 * drow;
 
                 uw += 512;
                 d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f3 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f3 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f3 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f3 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: column 3 of m == 8; same bounds argument as column 1.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p3 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f3 += p3 * drow;
 
                 uw += 512;
                 d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f4 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f4 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f4 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f4 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: column 4 of m == 8; same bounds argument as column 1.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p4 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f4 += p4 * drow;
 
                 uw += 512;
                 d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f5 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f5 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f5 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f5 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: column 5 of m == 8; same bounds argument as column 1.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p5 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f5 += p5 * drow;
 
                 uw += 512;
                 d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f6 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f6 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f6 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f6 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: column 6 of m == 8; same bounds argument as column 1.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p6 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f6 += p6 * drow;
 
                 uw += 512;
                 d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f7 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f7 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f7 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f7 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                // SAFETY: column 7 of m == 8; same bounds argument as column 1.
+                let (u0, u1, u2, u3) = unsafe {
+                    (
+                        *q.get_unchecked(uw),
+                        *q.get_unchecked(uw + 8),
+                        *q.get_unchecked(uw + 16),
+                        *q.get_unchecked(uw + 24),
+                    )
+                };
+                let (e0, e1, e2, e3) = unsafe {
+                    (
+                        *d8.get_unchecked(d8b),
+                        *d8.get_unchecked(d8b + 1),
+                        *d8.get_unchecked(d8b + 2),
+                        *d8.get_unchecked(d8b + 3),
+                    )
+                };
+                let p7 = (dp4a_s32(vi0, u0, 0) * sc0) as f32 * e0
+                    + (dp4a_s32(vi1, u1, 0) * sc1) as f32 * e1
+                    + (dp4a_s32(vi2, u2, 0) * sc2) as f32 * e2
+                    + (dp4a_s32(vi3, u3, 0) * sc3) as f32 * e3;
+                f7 += p7 * drow;
             }
 
             it += 1;
