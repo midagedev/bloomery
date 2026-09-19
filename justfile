@@ -95,6 +95,12 @@ gate-forward:
 gate-kv:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test kv -- --ignored --nocapture'
 
+# 행 병렬 게이트: 스레드 수(1/3/32)가 로짓을 한 비트도 안 바꾸는가. BLOOMERY_THREADS는
+# 프로세스당 한 번 읽히므로 자식 프로세스 재실행으로 덤프를 뽑아 바이트 비교한다
+# (tests/mt.rs의 패턴 설명 참조).
+gate-mt:
+    ./tools/box.sh 'cargo test --release -p bloomery-model --test mt -- --ignored --nocapture'
+
 # 1-5 프로파일러 게이트: 계측이 로짓을 한 비트도 안 바꾸고, 스텝 시간의 80% 이상을 커버하며,
 # 세 site가 전부 살아 있는가. --test-threads=1은 게이트 본체의 set_var이 자식 헬퍼 테스트와
 # 경쟁하지 않게 하는 장치다(테스트 파일의 SAFETY 주석 참조).

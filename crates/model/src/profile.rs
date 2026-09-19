@@ -96,6 +96,16 @@ impl CallAcc {
     pub fn add_dot(&mut self, ns: u64) {
         self.ns_dot += ns;
     }
+
+    /// Fold a finished worker accumulator into this one. The row-parallel sites
+    /// build one `CallAcc` per pool chunk and merge them after the join, so
+    /// [`record`] still fires exactly once per call and the accumulator mutex
+    /// stays out of the workers.
+    pub fn add_acc(&mut self, other: &CallAcc) {
+        self.ns_quant_act += other.ns_quant_act;
+        self.ns_dequant_w += other.ns_dequant_w;
+        self.ns_dot += other.ns_dot;
+    }
 }
 
 /// Merge one finished call into the accumulators. Call this exactly once per hooked
@@ -247,7 +257,9 @@ pub fn report(wall_ns: u64, label: &str) -> String {
         out.push_str(
             "level 2: the stage split calls Instant::now() twice per row — timer tax \
              inflates absolute stage times. The RATIOS are the finding; the absolute \
-             numbers are not.\n",
+             numbers are not. Sites that run their rows on the thread pool sum \
+             per-worker timers, so their stage columns are CPU-time totals across \
+             workers, not wall time.\n",
         );
     }
     out
