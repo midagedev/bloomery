@@ -1,0 +1,12 @@
+[package]
+name = "oxide-ice-unroll"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+# Shared host-side runtime, published from NVlabs/cutile-rs.
+cuda-core = "0.3.1"
