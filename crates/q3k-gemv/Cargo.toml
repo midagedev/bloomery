@@ -2,7 +2,8 @@
 name = "q3k-gemv"
 version = "0.1.0"
 edition = "2024"
-publish = false   # 발행하지 않는다. cargo deny의 licenses.private가 이걸 본다.
+publish = false
+license = "MIT"
 
 [lints]
 workspace = true
