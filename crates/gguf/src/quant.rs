@@ -441,3 +441,48 @@ fn dequant_q6_k(src: &[u8], dst: &mut [f32]) {
         }
     }
 }
+
+/// Round-trip f32 activations through ggml's Q8_K activation quantization.
+///
+/// ggml does not multiply K-quant weights by f32 activations. Before a
+/// `ggml_vec_dot_q*_K_q8_K` it quantizes the activation row to Q8_K — 256 values per block,
+/// one f16-ish scale, int8 codes — and does the dot in integers. An f32 reference therefore
+/// does NOT reproduce ggml's output: measured 2026-09-19 against the oracle's `q-0`, an
+/// exact f32 matmul was off by 0.6 % relative (max |diff| 0.12 where the row's largest value
+/// was 16), uniformly across tokens. That is the quantization, not an error.
+///
+/// So the stage-1 reference quantizes activations too, and the gates stay tight instead of
+/// being opened to 1e-1 to make room for a difference we understand.
+///
+/// Port of `quantize_row_q8_K_ref` (ggml-quants.c:3974): the scale comes from the SIGNED
+/// value with the largest magnitude, `iscale = -127 / max`, and `d = 1 / iscale`. Using
+/// `amax` instead of `max` flips the sign of every code when the extreme value is positive.
+///
+/// `x.len()` must be a multiple of 256; ggml's K-quant rows always are.
+pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
+    assert_eq!(x.len(), out.len(), "q8_K round-trip needs matching lengths");
+    assert!(x.len().is_multiple_of(256), "q8_K blocks are 256 values");
+    for (xb, ob) in x.chunks_exact(256).zip(out.chunks_exact_mut(256)) {
+        let mut amax = 0.0f32;
+        let mut max = 0.0f32;
+        for &v in xb {
+            let ax = v.abs();
+            if ax > amax {
+                amax = ax;
+                max = v;
+            }
+        }
+        if amax == 0.0 {
+            ob.fill(0.0);
+            continue;
+        }
+        let iscale = -127.0f32 / max;
+        let d = 1.0f32 / iscale;
+        for (o, &v) in ob.iter_mut().zip(xb) {
+            // ggml's nearest_int, then the same clamp at +127 (and only at +127: the
+            // negative side reaches -127 exactly by construction of iscale).
+            let q = (iscale * v).round_ties_even().min(127.0);
+            *o = d * q;
+        }
+    }
+}

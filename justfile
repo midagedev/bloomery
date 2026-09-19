@@ -49,6 +49,22 @@ build-ref-dump:
 dump-ref:
     ./tools/box.sh 'cd ~/repo/mulle && bash tools/ref/dump.sh'
 
+# 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다.
+gate-ops:
+    ./tools/box.sh 'cd ~/repo/mulle && cargo test -p model --test ops -- --ignored --nocapture'
+
+gate-attn:
+    ./tools/box.sh 'cd ~/repo/mulle && cargo test -p model --test attn -- --ignored --nocapture'
+
+gate-ffn:
+    ./tools/box.sh 'cd ~/repo/mulle && cargo test -p model --test ffn -- --ignored --nocapture'
+
+gate-moe:
+    ./tools/box.sh 'cd ~/repo/mulle && cargo test -p model --test moe -- --ignored --nocapture'
+
+gate-head:
+    ./tools/box.sh 'cd ~/repo/mulle && cargo test -p model --test head -- --ignored --nocapture'
+
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
 gate-1-1:

@@ -22,7 +22,7 @@
 
 pub mod quant;
 
-pub use quant::{GgmlType, QuantError, dequant_row};
+pub use quant::{GgmlType, QuantError, dequant_row, quantize_row_q8_k_roundtrip};
 
 use std::fs::File;
 use std::path::Path;

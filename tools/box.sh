@@ -7,7 +7,7 @@
 #   tools/box.sh cargo oxide run q3k_gemv --arch sm_86
 set -euo pipefail
 HOST=${MULLE_BOX:-ws}
-REMOTE=${MULLE_REMOTE:-'~/repo/mulle'}
+REMOTE=${MULLE_REMOTE:-"~/repo/$(basename "$(cd "$(dirname "$0")/.." && pwd)")"}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 ssh "$HOST" "mkdir -p $REMOTE"
 rsync -az --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
