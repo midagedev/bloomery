@@ -41,6 +41,14 @@ build-ref:
 deny:
     ./tools/box.sh 'cd ~/repo/mulle && cargo deny check'
 
+# 오라클 계측기. 1-2부터의 게이트가 읽는 참조 텐서를 $MULLE_DATA/ref/에 만든다.
+# ik 빌드가 바뀌면 다시 돌린다 — 참조는 그 빌드의 출력이다.
+build-ref-dump:
+    ./tools/box.sh 'cd ~/repo/mulle && bash tools/ref/build-dump.sh'
+
+dump-ref:
+    ./tools/box.sh 'cd ~/repo/mulle && bash tools/ref/dump.sh'
+
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
 gate-1-1:
