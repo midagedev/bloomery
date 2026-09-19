@@ -13,6 +13,16 @@
 //                        tensor alone (N=2048), attnstk = all 27 (N=55296)
 //   Q6_K head          : output.weight [2048,102400], N=102400
 //
+// MUL-8 amortization family (2026-09-19): additionally stack_k{1,2,3,4,6,8},
+// attnstk_k{...}, head_k{...} — the FIRST k columns of the SAME x_m8 draw, so
+// the family is nested (M=1 ⊂ M=2 ⊂ ... ⊂ M=8) and the curve is a statement
+// about M alone. The existing rows and their names are untouched; k1 is a new
+// row (x_m8's first column), NOT the existing *_m1 (a different draw).
+//
+// The timing loop also dumps every case's µs to $MULLE_DATA/ggml_timings.txt
+// (truncated each run) so the rust binary can anchor its ratio gate to ggml's
+// own ratio from the SAME measure.sh invocation.
+//
 // The 26 ffn_down_shexp tensors are also Q4_K but K=2816; out of scope here
 // (the kernels are K=2048).
 //
@@ -177,6 +187,17 @@ int main() {
     cpu_gemv(tr6, rb6, wHead.data(), N_HEAD, x_m1.data(), 1, y_h_m1);
     cpu_gemv(tr6, rb6, wHead.data(), N_HEAD, x_m8.data(), 8, y_h_m8);
 
+    // ---- MUL-8 amortization family: k columns of x_m8 (nested prefix), the
+    // same cpu_gemv body. k8 recomputes the m8 dots under its own name so the
+    // family is complete; the y_ref_*_m8 files above stay the gated rows. ----
+    static const int kKs[6] = {1, 2, 3, 4, 6, 8};
+    std::vector<float> y_st_k[6], y_ast_k[6], y_h_k[6];
+    for (int i = 0; i < 6; i++) {
+        cpu_gemv(tr3, row_bytes, wAll.data(), N1 * NE, x_m8.data(), kKs[i], y_st_k[i]);
+        cpu_gemv(tr4, rb4, wAttn.data(), N_STK, x_m8.data(), kKs[i], y_ast_k[i]);
+        cpu_gemv(tr6, rb6, wHead.data(), N_HEAD, x_m8.data(), kKs[i], y_h_k[i]);
+    }
+
     // ---- write data files ----
     write_file(std::string(kDataDir) + "/gate.q3k", wAll.data(), total_bytes);
     write_file(std::string(kDataDir) + "/attn.q4k", wAttn.data(), wAttn.size());
@@ -205,6 +226,18 @@ int main() {
                y_h_m1.size() * sizeof(float));
     write_file(std::string(kDataDir) + "/y_ref_head_m8.f32", y_h_m8.data(),
                y_h_m8.size() * sizeof(float));
+    for (int i = 0; i < 6; i++) {
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "y_ref_stack_k%d.f32", kKs[i]);
+        write_file(std::string(kDataDir) + "/" + nm, y_st_k[i].data(),
+                   y_st_k[i].size() * sizeof(float));
+        std::snprintf(nm, sizeof nm, "y_ref_attnstk_k%d.f32", kKs[i]);
+        write_file(std::string(kDataDir) + "/" + nm, y_ast_k[i].data(),
+                   y_ast_k[i].size() * sizeof(float));
+        std::snprintf(nm, sizeof nm, "y_ref_head_k%d.f32", kKs[i]);
+        write_file(std::string(kDataDir) + "/" + nm, y_h_k[i].data(),
+                   y_h_k[i].size() * sizeof(float));
+    }
     std::printf("wrote data files to %s\n", kDataDir);
 
     auto max_abs = [](const std::vector<float> & v) {
@@ -227,7 +260,7 @@ int main() {
         int m;
         const std::vector<float> & yref;
     };
-    const Case cases[10] = {
+    const Case cases[28] = {
         {"expert0_m1", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1, x_m1.data(), 1, y_e0_m1},
         {"expert0_m8", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1, x_m8.data(), 8, y_e0_m8},
         {"stack_m1", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1 * NE, x_m1.data(), 1, y_st_m1},
@@ -238,7 +271,30 @@ int main() {
         {"attnstk_m8", GGML_TYPE_Q4_K, rb4, wAttn.data(), N_STK, x_m8.data(), 8, y_ast_m8},
         {"head_m1", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m1.data(), 1, y_h_m1},
         {"head_m8", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m8.data(), 8, y_h_m8},
+        // Amortization family: first k columns of the same x_m8 draw.
+        {"stack_k1", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1 * NE, x_m8.data(), 1, y_st_k[0]},
+        {"stack_k2", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1 * NE, x_m8.data(), 2, y_st_k[1]},
+        {"stack_k3", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1 * NE, x_m8.data(), 3, y_st_k[2]},
+        {"stack_k4", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1 * NE, x_m8.data(), 4, y_st_k[3]},
+        {"stack_k6", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1 * NE, x_m8.data(), 6, y_st_k[4]},
+        {"stack_k8", GGML_TYPE_Q3_K, row_bytes, wAll.data(), N1 * NE, x_m8.data(), 8, y_st_k[5]},
+        {"attnstk_k1", GGML_TYPE_Q4_K, rb4, wAttn.data(), N_STK, x_m8.data(), 1, y_ast_k[0]},
+        {"attnstk_k2", GGML_TYPE_Q4_K, rb4, wAttn.data(), N_STK, x_m8.data(), 2, y_ast_k[1]},
+        {"attnstk_k3", GGML_TYPE_Q4_K, rb4, wAttn.data(), N_STK, x_m8.data(), 3, y_ast_k[2]},
+        {"attnstk_k4", GGML_TYPE_Q4_K, rb4, wAttn.data(), N_STK, x_m8.data(), 4, y_ast_k[3]},
+        {"attnstk_k6", GGML_TYPE_Q4_K, rb4, wAttn.data(), N_STK, x_m8.data(), 6, y_ast_k[4]},
+        {"attnstk_k8", GGML_TYPE_Q4_K, rb4, wAttn.data(), N_STK, x_m8.data(), 8, y_ast_k[5]},
+        {"head_k1", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m8.data(), 1, y_h_k[0]},
+        {"head_k2", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m8.data(), 2, y_h_k[1]},
+        {"head_k3", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m8.data(), 3, y_h_k[2]},
+        {"head_k4", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m8.data(), 4, y_h_k[3]},
+        {"head_k6", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m8.data(), 6, y_h_k[4]},
+        {"head_k8", GGML_TYPE_Q6_K, rb6, wHead.data(), N_HEAD, x_m8.data(), 8, y_h_k[5]},
     };
+    // Per-case µs dump for the rust binary's same-invocation ratio gate
+    // (truncated every run, so a stale file can never pass for fresh numbers).
+    FILE * tdump = std::fopen((std::string(kDataDir) + "/ggml_timings.txt").c_str(), "w");
+    if (!tdump) fail("cannot open ggml_timings.txt for write");
     for (const Case & cs : cases) {
         // no_alloc: tensor storage comes from ggml_backend_alloc_ctx_tensors
         struct ggml_init_params mp = {256u << 20, nullptr, true};
@@ -278,9 +334,11 @@ int main() {
         double gbs = (double)wn / (us * 1e-6) / 1e9;
         std::printf("shape %-10s N=%6lld M=%d weight_bytes=%9zu us=%9.2f GB/s=%7.2f max_rel_err=%.3e\n",
                     cs.name, (long long)cs.nrows, cs.m, wn, us, gbs, maxerr / denom);
+        std::fprintf(tdump, "%s %.3f\n", cs.name, us);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
     }
+    std::fclose(tdump);
     ggml_backend_free(backend);
     return 0;
 }
