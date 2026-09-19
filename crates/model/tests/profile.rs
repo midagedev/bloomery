@@ -180,11 +180,28 @@ fn hw_profile_gate() {
     // the worst run are not a noise band waiting to flip. Anything that does
     // push this below 98 is new unhooked work, which is the thing the gate is
     // for. Do not lower the threshold to make such a run pass; hook the work.
+    //
+    // Re-baselined 98 -> 97 by the LEAD on 2026-09-20, on the MUL-21 fused wiring —
+    // the first event the paragraph above did not predict, measured before the pin
+    // moved: the wiring removed ~14 ms of HOOKED work per step (Q3_K dequant; step
+    // wall 233 -> ~205-219 ms) while the step glue stayed fixed, so the ratio landed
+    // at 97.9-98.3% and the 98 floor flickered run to run. The "glue scales with the
+    // step" premise above is falsified by exactly this: glue is fixed per step, and a
+    // round that shrinks HOOKED work moves the ratio down without any new dark region.
+    // Controls run on the box, same tree: fused -> 97.9% three times and 98.3% once;
+    // `fused = false` restore -> 98.0% twice; all 21 sites live; the level-2 stage
+    // table names no new unaccounted stage. This is a frontier re-pin, not an
+    // admission of unhooked work — the catch-power argument survives: a site the size
+    // of `flash_attn_latent` (~9.6 ms, ~4.7% of a 205 ms step) going dark lands near
+    // 93.3% and still fails loud, and new unhooked work up to ~2 ms/step still falls
+    // short of the floor. When the dispatch/sync round attacks the ~28 ms/step now
+    // visible inside the Q3_K site wall (stage table, worker-sum vs site wall), the
+    // frontier moves back up and this floor should follow it.
     let instrumented = profile::instrumented_ns();
     let pct = instrumented as f64 / wall_ns as f64 * 100.0;
     assert!(
-        instrumented * 100 >= wall_ns * 98,
-        "coverage {pct:.1}% < 98%: an unhooked hot loop is eating the step \
+        instrumented * 100 >= wall_ns * 97,
+        "coverage {pct:.1}% < 97%: an unhooked hot loop is eating the step \
          ({:.1} ms instrumented of {:.1} ms wall)",
         instrumented as f64 / 1e6,
         wall_ns as f64 / 1e6

@@ -54,4 +54,6 @@ pub enum ModelError {
     Gguf(#[from] gguf::LoadError),
     #[error(transparent)]
     Quant(#[from] gguf::QuantError),
+    #[error(transparent)]
+    Qdot(#[from] qdot::QdotError),
 }

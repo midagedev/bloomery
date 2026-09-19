@@ -139,15 +139,27 @@ thread_local! {
 
 /// One pool chunk's finished work: its output rows in a private contiguous buffer
 /// laid out `[r_local][t]`, its share of the level-2 stage timers, and the first
-/// quant error it hit (if any). Workers hand these over through one mutex take per
-/// chunk — the only shared mutable state on the parallel path, and it is never
-/// touched from inside the row loop.
+/// error it hit (if any — a quant error on the scalar path, a `qdot` error on the
+/// fused one). Workers hand these over through one mutex take per chunk — the only
+/// shared mutable state on the parallel path, and it is never touched from inside
+/// the row loop.
 struct RowChunk {
     start: usize,
     nrows: usize,
     buf: Vec<f32>,
     acc: profile::CallAcc,
-    err: Option<gguf::QuantError>,
+    err: Option<crate::ModelError>,
+}
+
+/// `matmul_q`'s activation columns in whichever representation the row loop will
+/// consume: the scalar path dots the f32 round trip, the fused qdot path dots the
+/// bytes `qdot::quantize_col` produced (`cb` per column). One enum, not a flag
+/// plus two buffers, so the two paths cannot be handed each other's input.
+enum QuantCols {
+    /// `quantize_activations(w.ty, ..)` — f32 round-trip representation.
+    F32(Vec<f32>),
+    /// `qdot::quantize_col(w.ty, ..)` — one `cb`-byte column per token.
+    Bytes { cb: usize, buf: Vec<u8> },
 }
 
 /// `y = W · x` where `W` is a quantized 2-D tensor straight out of the file.
@@ -163,6 +175,14 @@ struct RowChunk {
 /// a quantized dot, and the oracle is ggml's output. An f32 reference is 0.6 % away
 /// (measured), and the *wrong* quantized format is still 0.1 % away — both would force
 /// every gate below to open. `gguf::activation_format` owns the table.
+///
+/// **Q3_K with k a multiple of 256 takes the fused path** (`crates/qdot`): the dot runs
+/// straight off the quantized codes and no f32 weight row is ever materialized. That
+/// kernel is *more* accurate than this crate's dequant-then-round-trip f32 dot (measured
+/// against an f64 exact answer in the qdot round, 2026-09-20), so its output is
+/// deliberately NOT bit-identical to the scalar path — gates that cross a Q3_K matmul
+/// assert closeness to the oracle, never bit equality with the scalar path. Every other
+/// type, and Q3_K rows whose k is not a multiple of 256, keep the scalar path unchanged.
 pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, crate::ModelError> {
     // Profiler hook (crate::profile): level 0 is one compare per call, level 1 one
     // `Instant` pair for the whole call, level 2 two more per row. None of it touches
@@ -197,12 +217,29 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
     // (found 2026-09-19 by the ffn round, proven against libggml's own quantizer).
     // Single-threaded on purpose: a measured 0.2 % of one decode step (level 2,
     // 12.8 of 7588 ms) — parallelizing it would cost more than it could return.
+    //
+    // The fused qdot kernel (crates/qdot) dots the quantized codes directly, so its
+    // activation input is `qdot::quantize_col`'s byte layout, not the f32 round trip
+    // above. `supports(w.ty)` implies Q3_K — the only type the qdot API is built for —
+    // and the k check mirrors the kernel's whole-super-block contract (256 values per
+    // block). Decided once per call here; the row loop branches on the same fact.
+    let fused = qdot::supports(w.ty) && k.is_multiple_of(256);
     let quantized = {
-        let mut q = vec![0.0f32; x.data.len()];
         let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
-        for t in 0..x.ne1 {
-            quantize_activations(w.ty, x.col(t), &mut q[t * k..(t + 1) * k]);
-        }
+        let q = if fused {
+            let cb = qdot::col_bytes(w.ty, k);
+            let mut buf = vec![0u8; x.ne1 * cb];
+            for t in 0..x.ne1 {
+                qdot::quantize_col(w.ty, x.col(t), &mut buf[t * cb..(t + 1) * cb]);
+            }
+            QuantCols::Bytes { cb, buf }
+        } else {
+            let mut q = vec![0.0f32; x.data.len()];
+            for t in 0..x.ne1 {
+                quantize_activations(w.ty, x.col(t), &mut q[t * k..(t + 1) * k]);
+            }
+            QuantCols::F32(q)
+        };
         if let Some(t_q) = t_q {
             pacc.add_quant_act(t_q.elapsed().as_nanos() as u64);
         }
@@ -214,7 +251,9 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
     // its k products ascending, in the same order it always did, so which thread
     // computes which row cannot change a bit — `tests/mt.rs` holds that as a byte
     // compare across thread counts. Splitting k (or the token axis) would reorder
-    // the accumulation and is forbidden.
+    // the accumulation and is forbidden. The fused path rides the same argument:
+    // `qdot::dot_row` computes one row's whole k in a single call, so a row is
+    // still the only unit that moves between threads and k is never split.
     //
     // Workers write into a private contiguous buffer laid out [r_local][t]; the
     // gather below moves them into `out` single-threaded. Direct `out.data[t*n + r]`
@@ -222,6 +261,21 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
     // adds none.
     let ne1 = x.ne1;
     let ty = w.ty;
+    // The fused branch's column stride and buffer, hoisted so the worker closure
+    // captures plain data and the scalar branch stays literally the code it was.
+    let fused_cols: Option<(usize, &[u8])> = match &quantized {
+        QuantCols::Bytes { cb, buf } => Some((*cb, buf.as_slice())),
+        QuantCols::F32(_) => None,
+    };
+    // The scalar path's f32 round trip, shadowed under the name its row loop has
+    // always used. On the fused path the binding is dead — that row loop reads
+    // `fused_cols` instead — so an empty slice stands in for it rather than an
+    // `Option` unwrap inside the loop. The two row loops run one per call, never
+    // both: the same `fused` fact chose what `quantized` holds.
+    let quantized: &[f32] = match &quantized {
+        QuantCols::F32(q) => q,
+        QuantCols::Bytes { .. } => &[],
+    };
     let collected: Mutex<Vec<RowChunk>> = Mutex::new(Vec::new());
     threads::pool().for_each_chunk(n, |rows| {
         let mut chunk = RowChunk {
@@ -231,41 +285,70 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
             acc: profile::CallAcc::new(),
             err: None,
         };
-        ROW_BUF.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            if scratch.len() < k {
-                scratch.resize(k, 0.0);
-            }
-            let row = &mut scratch[..k];
+        if let Some((cb, acol)) = fused_cols {
+            // Fused rows: `qdot::dot_row` consumes the weight bytes and the
+            // quantized column directly, so no f32 row is materialized and
+            // ROW_BUF stays untouched. `add_dequant_w` staying 0 here is by
+            // design — Q3_K's dequant stage dropping to 0.00 in the profile
+            // table is this wiring's signature, not missing instrumentation.
+            // The dequant is fused into the dot, so the dot timer covers the
+            // whole row, tokens included.
             for (rl, r) in rows.enumerate() {
                 let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
-                // Weight side: dequant_row, or the byte walk in its place for F32 rows.
-                let t_d = if lvl >= 2 { Some(Instant::now()) } else { None };
-                if ty == GgmlType::F32 {
-                    for (i, v) in row.iter_mut().enumerate() {
-                        *v = f32::from_le_bytes(src[i * 4..i * 4 + 4].try_into().unwrap());
-                    }
-                } else if let Err(e) = dequant_row(ty, src, row) {
-                    chunk.err = Some(e);
-                    break;
-                }
-                if let Some(t_d) = t_d {
-                    chunk.acc.add_dequant_w(t_d.elapsed().as_nanos() as u64);
-                }
                 let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                 for t in 0..ne1 {
-                    let xc = &quantized[t * k..(t + 1) * k];
-                    let mut acc = 0.0f32;
-                    for i in 0..k {
-                        acc += row[i] * xc[i];
+                    match qdot::dot_row(ty, src, &acol[t * cb..(t + 1) * cb], k) {
+                        Ok(v) => chunk.buf[rl * ne1 + t] = v,
+                        Err(e) => {
+                            chunk.err = Some(e.into());
+                            break;
+                        }
                     }
-                    chunk.buf[rl * ne1 + t] = acc;
                 }
                 if let Some(t_dot) = t_dot {
                     chunk.acc.add_dot(t_dot.elapsed().as_nanos() as u64);
                 }
+                if chunk.err.is_some() {
+                    break;
+                }
             }
-        });
+        } else {
+            ROW_BUF.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                if scratch.len() < k {
+                    scratch.resize(k, 0.0);
+                }
+                let row = &mut scratch[..k];
+                for (rl, r) in rows.enumerate() {
+                    let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+                    // Weight side: dequant_row, or the byte walk in its place for F32 rows.
+                    let t_d = if lvl >= 2 { Some(Instant::now()) } else { None };
+                    if ty == GgmlType::F32 {
+                        for (i, v) in row.iter_mut().enumerate() {
+                            *v = f32::from_le_bytes(src[i * 4..i * 4 + 4].try_into().unwrap());
+                        }
+                    } else if let Err(e) = dequant_row(ty, src, row) {
+                        chunk.err = Some(e.into());
+                        break;
+                    }
+                    if let Some(t_d) = t_d {
+                        chunk.acc.add_dequant_w(t_d.elapsed().as_nanos() as u64);
+                    }
+                    let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
+                    for t in 0..ne1 {
+                        let xc = &quantized[t * k..(t + 1) * k];
+                        let mut acc = 0.0f32;
+                        for i in 0..k {
+                            acc += row[i] * xc[i];
+                        }
+                        chunk.buf[rl * ne1 + t] = acc;
+                    }
+                    if let Some(t_dot) = t_dot {
+                        chunk.acc.add_dot(t_dot.elapsed().as_nanos() as u64);
+                    }
+                }
+            });
+        }
         // The one lock of the chunk — never per row: a mutex inside the row loop
         // would profile the mutex.
         collected
@@ -275,15 +358,16 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
     });
 
     // Arrival order is nondeterministic; row order is not. Sorting by `start` makes
-    // the gather sequential and the first quant error the lowest failing row's —
-    // the same error the sequential `?` this replaced would have returned, and the
-    // record call below is skipped on that path exactly as it was before.
+    // the gather sequential and the first error the lowest failing row's — the same
+    // error the sequential `?` this replaced would have returned (a quant error on
+    // the scalar path, a `qdot` error on the fused one), and the record call below
+    // is skipped on that path exactly as it was before.
     let mut chunks = collected
         .into_inner()
         .expect("matmul_q row-chunk collector");
     chunks.sort_by_key(|c| c.start);
     if let Some(e) = chunks.iter_mut().find_map(|c| c.err.take()) {
-        return Err(e.into());
+        return Err(e);
     }
     for c in &chunks {
         for rl in 0..c.nrows {

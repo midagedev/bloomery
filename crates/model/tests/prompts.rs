@@ -183,25 +183,33 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
         eprintln!("  prompt {id} top-5: ik {want:?}, ours {got:?}");
     }
 
-    // The contract: 31 of 32, and the one that differs is named, not tolerated in bulk.
+    // The contract: 31 of 33, and the ones that differ are named, not tolerated in bulk.
     //
-    // Measured 2026-09-19. Prompt 5 (`def add(a, b):`) is the single divergence: ik picks
-    // 185, we pick 188, and ik's own margin between them is 0.262 -- inside the 1.06 of
-    // logit drift this same run measured. It is a near-tie our inherited error can move,
-    // not a different computation: every prompt whose margin clears the drift matched,
-    // and so did seven of the eight that did not.
+    // Measured 2026-09-20, after the Q3_K fused wiring (MUL-21): `ops::matmul_q` routes
+    // Q3_K through `crates/qdot`, which is MORE accurate than the f32 round trip it
+    // replaced, so every Q3_K logit moves and the near-ties move with them. The
+    // divergence set moved from {5} to {14, 24}:
+    //   * prompt 5 (`def add(a, b):`) matches again (ik 185, ours 185). It was the
+    //     2026-09-19 divergence, ik margin 0.262; the fused path moved our logit onto
+    //     ik's pick.
+    //   * prompt 14 (`A right triangle has`): ik 245, ours 9226, margin 0.108,
+    //     |dlogit| 0.285 -- a straight 1st/2nd swap.
+    //   * prompt 24 (`Machine learning models are trained on`): ik 245, ours 1191,
+    //     margin 0.151, |dlogit| 0.339 -- same 1st/2nd swap.
+    // Both flips sit far inside the drift this same run measured (worst |dlogit| 0.994),
+    // the same class as the old prompt 5: near-ties the inherited error can move, not
+    // different computations. The round spec's repin rule is met (≤ 2 mismatches, every
+    // flipped prompt at ik margin < 1.0): two flips, margins 0.108 and 0.151.
     //
-    // Where the drift is from is already documented and is not new here: `q_nope2`'s
-    // activation-code tie flips in `attn.rs`'s `quantize_act` (its own gate measures
-    // 2.5e-3 with a 3.8e-6 exact-input companion -- so the flips come from the input, not
-    // from that stage's arithmetic). It does NOT come from the M > 7 kernel boundary the
-    // set was built to probe: the worst |dlogit| lands on a 9-token prompt (1.06) and a
-    // 5-token one (0.92) alike, with an 11-token prompt at 0.16.
+    // Where the drift is from was already documented and is unchanged in kind: `q_nope2`'s
+    // activation-code tie flips in `attn.rs`'s `quantize_act` (its own gate measures with
+    // a 3.8e-6 exact-input companion -- the flips come from the input, not from that
+    // stage's arithmetic). The wiring relocated the flips, it did not remove them.
     //
-    // The set is pinned rather than counted. A second prompt flipping fails; prompt 5
+    // The set is pinned rather than counted. A third prompt flipping fails; one of these
     // starting to match also fails, because that means something moved and the round that
-    // moved it should say what. Do not widen this to `len() <= 1`.
-    const KNOWN_DIVERGENCE: &[usize] = &[5];
+    // moved it should say what. Do not widen this to `len() <= 2`.
+    const KNOWN_DIVERGENCE: &[usize] = &[14, 24];
     let ids: Vec<usize> = mismatched.iter().map(|(id, ..)| *id).collect();
     assert_eq!(
         ids,

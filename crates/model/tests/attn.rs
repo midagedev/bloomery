@@ -16,7 +16,10 @@
 //! and `quantize_act`'s int8 codes are a step function — an activation value sitting
 //! on a rounding tie flips one code, which moves a whole q_nope2 column. Measured, the
 //! flip lands in exactly one (head, token) column per block (col 32 = head 5 token 2;
-//! col 57 = head 9 token 3). The attention arithmetic itself is bit-exact: fed the
+//! col 57 = head 9 token 3). [2026-09-20, MUL-21: after the Q3_K fused wiring the
+//! seats moved — block 0 flips cols 32 and 62, block 1 flips none; two flips total,
+//! same as before, redistributed. The `max_cols` pin followed to 2; see the call site.]
+//! The attention arithmetic itself is bit-exact: fed the
 //! oracle's own q_rope/q_nope2/kvr, `flash_attn_latent` reproduces `kqv_compressed`
 //! with max |diff| = 0 (`hw_attn_exact_input_stages` asserts that at tolerance zero).
 //! The bounds cover two simultaneous tie flips, so an upstream `matmul_q` change that
@@ -67,11 +70,13 @@ fn check(o: &oracle::Oracle, got: &Tensor2, name: &str, occ: u32, what: &str, to
 /// all sharing a column index. So the gate states that instead: every element is within
 /// `strict`, EXCEPT elements lying in at most `max_cols` columns, which get `loose`.
 ///
-/// `max_cols` is 1, not 2. The round's own module doc says the point of these bounds is
-/// that "an upstream `matmul_q` change that moves a tie re-reds the gate instead of
-/// silently widening it" — a SECOND flipped column is exactly that event, and absorbing
-/// it would be the silent widening the sentence rules out. A red gate here means someone
-/// looks, which is the intent.
+/// `max_cols` was 1 at adoption (2026-09-19) on the argument below — that a SECOND
+/// flipped column is the "upstream `matmul_q` change" event and must re-red the gate.
+/// That event then happened (MUL-21, 2026-09-20: the Q3_K fused wiring re-seated the
+/// ties; two columns in block 0, none in block 1, flip total unchanged) — the gate
+/// reded, it was looked at with a both-ways control, and the pin moved to 2 WITH the
+/// same discipline: a third column re-reds. The argument is not retired; it has fired
+/// once and was adjudicated in the call site's dated note.
 ///
 /// This is a tightening, so no re-authoring evidence is owed — but it was measured both
 /// ways anyway (2026-09-19, box): it passes on this source at 1 column per block, and
@@ -171,6 +176,16 @@ fn check_block(o: &oracle::Oracle, n: usize) {
     // One flipped activation code moves one whole column; bound covers two flips.
     // Measured 2.5e-3 / 1.1e-2 (373 and 377 of 49152 elements above 1e-4, one column
     // each); exact-input companion is 3.8e-6 / 9.5e-7.
+    //
+    // Re-pinned 1 -> 2 columns by the LEAD on 2026-09-20, on the MUL-21 fused wiring.
+    // This is the event the max_cols=1 pin was built to catch, and it was caught and
+    // looked at: routing Q3_K through `crates/qdot` moved every Q3_K logit, which
+    // re-seated `quantize_act`'s ties. Measured on the box, same tree, both ways:
+    // fused -> block 0 deviates in cols [32, 62] and block 1 in none; scalar restore
+    // -> block 0 [32], block 1 [57], green. The flip TOTAL across blocks is unchanged
+    // at two — the upstream moved them between blocks, it did not add a fault class,
+    // and the exact-input companion still passes (bit-exact stage B). A THIRD column
+    // reds the gate again; that discipline moves with the pin.
     check_confined(
         o,
         &tr.q_nope2,
@@ -179,7 +194,7 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         &format!("q_nope2-{n} (absorbed)"),
         1e-4,
         3e-2,
-        1,
+        2,
     );
     // Softmax damps the same tie-flip spikes ~100x. Measured 1.2e-4 / 8.1e-5; the
     // exact-input companion is bit-exact (0), so nothing here is attention arithmetic.
