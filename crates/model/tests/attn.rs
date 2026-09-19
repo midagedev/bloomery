@@ -44,7 +44,8 @@ fn run_block(o: &oracle::Oracle, g: &gguf::Gguf, n: usize) -> model::attn::AttnT
     let x = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
     // The dump is one prefill batch: tokens at positions 0..5, sequence 0.
     let slots: Vec<Slot> = (0..x.ne1 as u32).map(|t| Slot { seq: 0, pos: t }).collect();
-    block_attn_trace(g, n, &x, &slots).expect("block_attn_trace")
+    let derived = model::derived::Derived::new(g).unwrap();
+    block_attn_trace(g, n, &x, &slots, &derived).expect("block_attn_trace")
 }
 
 fn check(o: &oracle::Oracle, got: &Tensor2, name: &str, occ: u32, what: &str, tol: f32) {
@@ -249,9 +250,12 @@ fn hw_attn_exact_input_stages() {
 
         // A: the absorption (Q8_0 requant + block_q8_2 activation + f64 block dot).
         // Measured 3.8e-6 / 9.5e-7 — quantizer and dot conventions, no order slack
-        // beyond the f64-accumulated block sum.
+        // beyond the f64-accumulated block sum. The Q8_0 weights come from `Derived`
+        // now (byte-identical to the in-place build by `tests/derived.rs`).
         let q_exact = load2(&format!("q-{blk}"), 0);
-        let out = model::attn::q_nope2_absorbed(&g, wkb, &q_exact, &p).unwrap();
+        let derived = model::derived::Derived::new(&g).unwrap();
+        let out = model::attn::q_nope2_absorbed(derived.wk_b_all_heads(blk).unwrap(), &q_exact, &p)
+            .unwrap();
         let want = load2(&format!("q_nope2-{blk}"), 0);
         assert_eq!([out.ne0, out.ne1], [want.ne0, want.ne1], "stage A shape");
         assert!(

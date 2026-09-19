@@ -24,6 +24,7 @@
 //! end. Every stage after attention is column-independent, so the two agree on the
 //! column that survives; ik's version is cheaper, ours is simpler, and 1-5 is where
 //! that trade starts to matter.
+use crate::derived::Derived;
 use crate::kv::KvCache;
 use crate::ops::{Tensor2, f32_tensor, rms_norm};
 use crate::profile;
@@ -132,11 +133,13 @@ pub fn block_cached(
     eps: f32,
     cache: &mut KvCache,
     range: &std::ops::Range<usize>,
+    derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
     let attn_gain = gain(gguf, &format!("blk.{b}.attn_norm.weight"))?;
     let normed = rms_norm(x, &attn_gain, eps);
     let kqv_out =
-        crate::attn::block_attn_cached(gguf, b, &normed, q_slots, cache, b, range)?.kqv_out;
+        crate::attn::block_attn_cached(gguf, b, &normed, q_slots, cache, b, range, derived)?
+            .kqv_out;
     let ffn_inp = add(x, &kqv_out);
 
     let ffn_gain = gain(gguf, &format!("blk.{b}.ffn_norm.weight"))?;
@@ -160,10 +163,11 @@ pub fn block(
     x: &Tensor2,
     slots: &[Slot],
     eps: f32,
+    derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
     let attn_gain = gain(gguf, &format!("blk.{b}.attn_norm.weight"))?;
     let normed = rms_norm(x, &attn_gain, eps);
-    let kqv_out = crate::attn::block_attn(gguf, b, &normed, slots)?;
+    let kqv_out = crate::attn::block_attn(gguf, b, &normed, slots, derived)?;
     let ffn_inp = add(x, &kqv_out);
 
     let ffn_gain = gain(gguf, &format!("blk.{b}.ffn_norm.weight"))?;
@@ -195,11 +199,21 @@ fn add(a: &Tensor2, b: &Tensor2) -> Tensor2 {
 ///
 /// Positions are `0..tokens.len()` in sequence 0: this is a prefill, and it is the only
 /// shape there is until the KV cache lands.
+///
+/// A convenience wrapper: it builds the [`Derived`] weights itself, every call.
+/// Callers that run more than one pass — a decode loop, a gate over prompts —
+/// should build once and drive [`step`], so the weight derivation is paid per
+/// model and not per call. The signature stays token-in/logits-out because
+/// `tests/forward.rs` and `tests/prompts.rs` call it as the one-shot oracle
+/// path, and this round does not move those gates.
 pub fn forward(gguf: &Gguf, tokens: &[u32]) -> Result<Tensor2, ModelError> {
     Ok(forward_trace(gguf, tokens)?.logits)
 }
 
 /// The same pass, keeping every block's residual output for the gate.
+///
+/// Builds its own [`Derived`] once per call (see [`forward`]'s note on when that
+/// is the wrong trade).
 pub fn forward_trace(gguf: &Gguf, tokens: &[u32]) -> Result<ForwardTrace, ModelError> {
     let n_block = gguf
         .block_count()
@@ -209,12 +223,13 @@ pub fn forward_trace(gguf: &Gguf, tokens: &[u32]) -> Result<ForwardTrace, ModelE
     let slots: Vec<Slot> = (0..tokens.len() as u32)
         .map(|pos| Slot { seq: 0, pos })
         .collect();
+    let derived = Derived::new(gguf)?;
 
     let inp_embd = embed(gguf, tokens)?;
     let mut x = inp_embd.clone();
     let mut l_out = Vec::with_capacity(n_block);
     for b in 0..n_block {
-        x = block(gguf, b, &x, &slots, eps)?;
+        x = block(gguf, b, &x, &slots, eps, &derived)?;
         l_out.push(x.clone());
     }
 
@@ -267,7 +282,17 @@ pub fn new_cache(gguf: &Gguf) -> Result<KvCache, ModelError> {
 ///
 /// The first call on an empty cache is the prefill; there is no separate entry point,
 /// because a prefill is a step whose batch happens to be longer than one.
-pub fn step(gguf: &Gguf, tokens: &[u32], cache: &mut KvCache) -> Result<Tensor2, ModelError> {
+///
+/// `derived` is the weight side of the step — built once per model (by the caller,
+/// right after open) and shared by every step against this `gguf`. The cache is the
+/// sequence side; the two are passed separately because they are cleared for
+/// different reasons (see `derived`'s module doc).
+pub fn step(
+    gguf: &Gguf,
+    tokens: &[u32],
+    cache: &mut KvCache,
+    derived: &Derived,
+) -> Result<Tensor2, ModelError> {
     let n_block = cache.n_block();
     let eps = rms_eps(gguf);
     let base = cache.next_pos(0);
@@ -281,7 +306,7 @@ pub fn step(gguf: &Gguf, tokens: &[u32], cache: &mut KvCache) -> Result<Tensor2,
 
     let mut x = embed(gguf, tokens)?;
     for b in 0..n_block {
-        x = block_cached(gguf, b, &x, &slots, eps, cache, &range)?;
+        x = block_cached(gguf, b, &x, &slots, eps, cache, &range, derived)?;
     }
     let last = tokens.len() - 1;
     let tail = Tensor2::from_vec(x.ne0, 1, x.col(last).to_vec());

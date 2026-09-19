@@ -40,12 +40,13 @@
 //! tokens are the KV entries (prefill semantics). Token `t` attends to every batch
 //! entry `u` with `slots[u].seq == slots[t].seq && slots[u].pos <= slots[t].pos`.
 
+use crate::derived::Derived;
 use crate::kv::KvCache;
 use crate::ops::{f32_tensor, matmul_q, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
-use gguf::{Gguf, TensorInfo, dequant_row};
+use gguf::{Gguf, TensorInfo};
 use std::time::Instant;
 
 /// All intermediates, for the gate. `Tensor2` holds `ne0` contiguous with trailing
@@ -78,8 +79,9 @@ pub fn block_attn(
     block: usize,
     x: &Tensor2,
     slots: &[Slot],
+    derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
-    Ok(block_attn_trace(gguf, block, x, slots)?.kqv_out)
+    Ok(block_attn_trace(gguf, block, x, slots, derived)?.kqv_out)
 }
 
 /// The same computation, keeping every intermediate the gate asserts.
@@ -93,11 +95,12 @@ pub fn block_attn_trace(
     block: usize,
     x: &Tensor2,
     slots: &[Slot],
+    derived: &Derived,
 ) -> Result<AttnTrace, ModelError> {
     let p = MlaParams::read(gguf, block)?;
     let mut scratch = KvCache::new(1, p.latent + p.rope_dims);
     let range = scratch.begin(slots);
-    block_attn_cached(gguf, block, x, slots, &mut scratch, 0, &range)
+    block_attn_cached(gguf, block, x, slots, &mut scratch, 0, &range, derived)
 }
 
 /// One block's attention against a KV cache: `q_slots` are the queries this call carries,
@@ -108,6 +111,7 @@ pub fn block_attn_trace(
 /// forward pass and 0 in the scratch cache `block_attn_trace` builds. They are separate
 /// parameters because they are separate things, and conflating them would make the
 /// scratch path allocate 27 empty blocks to use one.
+#[allow(clippy::too_many_arguments)]
 pub fn block_attn_cached(
     gguf: &Gguf,
     block: usize,
@@ -116,6 +120,7 @@ pub fn block_attn_cached(
     cache: &mut KvCache,
     cache_block: usize,
     range: &std::ops::Range<usize>,
+    derived: &Derived,
 ) -> Result<AttnTrace, ModelError> {
     let p = MlaParams::read(gguf, block)?;
     let slots = q_slots;
@@ -183,9 +188,12 @@ pub fn block_attn_cached(
         .collect();
     cache.push(cache_block, range, new_rows);
 
-    // 6. q_nope2 = wk_b(Q8_0)ᵀ q_nope per head — the weight absorption.
+    // 6. q_nope2 = wk_b(Q8_0)ᵀ q_nope per head — the weight absorption. The wk_b
+    //    requant is weight work and lives in `Derived`; only the per-token half
+    //    runs here. `block` (the model's) selects the derived weights — never
+    //    `cache_block`, which is 0 on the scratch path.
     let wkb = find(gguf, &format!("blk.{block}.attn_kv_b.weight"))?;
-    let q_nope2 = q_nope2_absorbed(gguf, wkb, &q, &p)?;
+    let q_nope2 = q_nope2_absorbed(derived.wk_b_all_heads(block)?, &q, &p)?;
 
     // 7. Attention over the latent.
     let kqv_compressed = flash_attn_latent(
@@ -474,9 +482,11 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
 
 // --------------------------------------------------------------- q_nope2
 
-/// One Q8_0 block over 32 values: f16-stored scale, int8 codes.
-#[derive(Clone, Copy)]
-struct Q8Block {
+/// One Q8_0 block over 32 values: f16-stored scale, int8 codes. `pub` because
+/// [`Derived`](crate::derived::Derived) stores these and the gate byte-compares
+/// them; equality on this type is equality of every byte it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Q8Block {
     d: u16,
     q: [i8; 32],
 }
@@ -488,7 +498,7 @@ struct Q8Block {
 /// NOT what runs here: switching to it flips codes on 10 of 16 heads and opens ~1e-2
 /// on the gate (measured 2026-09-19). Verified byte-identical to the reference's
 /// derived `attn_k_b.weight` for block 0 (0 of 69632 bytes differ).
-fn quantize_q8_0(x: &[f32]) -> Q8Block {
+pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
     let mut amax = 0.0f32;
     for &v in x {
         amax = amax.max(v.abs());
@@ -549,60 +559,46 @@ fn quantize_act(x: &[f32]) -> ActBlock {
 ///
 /// `wk_b` is not in the file — the reference derives it at load (`llm_prepare_mla`,
 /// llama.cpp:3229): the k-up rows of `attn_kv_b` are dequantized, transposed, and
-/// cast to Q8_0 whose 32-value blocks run along the 128-wide q_nope axis. At M ≤ 7
-/// rows ik's `iqk_mul_mat_4d` claims the node and quantizes the F32 activation itself,
-/// into its small-M `block_q8_2` format (see [`quantize_act`]) — the dot is then a sum
-/// over blocks of `f32(f16(dw)) · dq · Σ qw·qq` with an exact i32 inner sum. The block
-/// sum accumulates in f64: ggml's f32 SIMD lane order differs in its last ulp; ours is
-/// the exact sum.
+/// cast to Q8_0 whose 32-value blocks run along the 128-wide q_nope axis. That
+/// derivation is a pure function of the weights, so it now runs once in
+/// [`Derived`](crate::derived::Derived) at load; this function receives the blocks
+/// (`wblocks`, one block's heads concatenated head-major) and does the per-token
+/// half. At M ≤ 7 rows ik's `iqk_mul_mat_4d` claims the node and quantizes the F32
+/// activation itself, into its small-M `block_q8_2` format (see [`quantize_act`]) —
+/// the dot is then a sum over blocks of `f32(f16(dw)) · dq · Σ qw·qq` with an exact
+/// i32 inner sum. The block sum accumulates in f64: ggml's f32 SIMD lane order
+/// differs in its last ulp; ours is the exact sum.
 pub fn q_nope2_absorbed(
-    gguf: &Gguf,
-    wkb: &TensorInfo,
+    wblocks: &[Q8Block],
     q: &Tensor2,
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
-    // Profiler hook (crate::profile). This function is hypothesis 3 — the per-step
-    // wk_b requant — so its stage split is the one the level-2 table exists for:
-    // dequant_row and the wk_b Q8_0 requant both count as weight preparation
-    // (`dequant_w`), the activation quant as `quant_act`, the t/j/b loops as `dot`.
+    // Profiler hook (crate::profile). This site was hypothesis 3 — the per-step
+    // wk_b requant — and `Derived` closed it: what is left is the per-token half.
+    // The stage split keeps its axes (activation quant as `quant_act`, the t/j/b
+    // loops as `dot`); `dequant_w` can no longer fire from this site, so a nonzero
+    // `dequant_w` row here would mean someone reintroduced a per-step requant.
     let lvl = profile::level();
     let mut pacc = profile::CallAcc::new();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let bytes = gguf.data(wkb)?;
-    let row_bytes =
-        wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
     let nblocks = p.nope / 32;
+    let span = p.latent * nblocks;
+    // A wrong-length slice is the failure this check exists for: the indexing
+    // below would otherwise read another head's weights silently and keep
+    // producing plausible numbers.
+    if wblocks.len() != p.n_head * span {
+        return Err(ModelError::Shape {
+            what: "q_nope2_absorbed wblocks (n_head·latent·nope/32)",
+            want_ne0: p.n_head * span,
+            want_ne1: 0,
+            got_ne0: wblocks.len(),
+            got_ne1: 0,
+        });
+    }
     let mut out = Tensor2::zeros(p.latent, p.n_head * q.ne1);
-    let mut wk_row = vec![0.0f32; p.latent];
 
     for h in 0..p.n_head {
-        // The head's k-up rows, dequantized once: rows[d][j] = kv_b row h·span+d, elem j.
-        let mut rows = vec![0.0f32; p.nope * p.latent];
-        let t_dq = if lvl >= 2 { Some(Instant::now()) } else { None };
-        for d in 0..p.nope {
-            let off = (h * (p.nope + p.v_head) + d) * row_bytes;
-            dequant_row(wkb.ty, &bytes[off..off + row_bytes], wk_row.as_mut_slice())?;
-            rows[d * p.latent..(d + 1) * p.latent].copy_from_slice(&wk_row);
-        }
-        if let Some(t_dq) = t_dq {
-            pacc.add_dequant_w(t_dq.elapsed().as_nanos() as u64);
-        }
-        // Q8_0 blocks run along the q_nope axis: block (j, b) = 32 d-values of column j.
-        let mut wblocks = Vec::with_capacity(p.latent * nblocks);
-        let mut vals = [0.0f32; 32];
-        let t_wb = if lvl >= 2 { Some(Instant::now()) } else { None };
-        for j in 0..p.latent {
-            for b in 0..nblocks {
-                for (l, v) in vals.iter_mut().enumerate() {
-                    *v = rows[(32 * b + l) * p.latent + j];
-                }
-                wblocks.push(quantize_q8_0(&vals));
-            }
-        }
-        if let Some(t_wb) = t_wb {
-            pacc.add_dequant_w(t_wb.elapsed().as_nanos() as u64);
-        }
-
+        let whead = &wblocks[h * span..(h + 1) * span];
         for t in 0..q.ne1 {
             let qbase = t * q.ne0 + h * p.kq_head;
             let qrow = &q.data[qbase..qbase + p.nope];
@@ -616,7 +612,7 @@ pub fn q_nope2_absorbed(
             for j in 0..p.latent {
                 let mut acc = 0.0f64;
                 for (b, qb) in qblocks.iter().enumerate() {
-                    let wb = &wblocks[j * nblocks + b];
+                    let wb = &whead[j * nblocks + b];
                     let mut isum = 0i32;
                     for l in 0..32 {
                         isum += wb.q[l] as i32 * qb.q[l] as i32;
@@ -631,16 +627,18 @@ pub fn q_nope2_absorbed(
         }
     }
     if let Some(t_call) = t_call {
-        // Weight-side shape statement: `n_head · nope` rows of `latent` values each,
-        // read from `row_bytes`-long k-up spans. The v-up rows this function never
-        // touches are not counted.
-        let w_rows = (p.n_head * p.nope) as u64;
+        // Shape statement for the derived weights this call consumed:
+        // `n_head · latent` output rows contracted over `nope`. The bytes are the
+        // Q8_0 blocks' — tag 8 is ggml's Q8_0; the gguf crate has no variant for
+        // it because nothing in the file is Q8_0 (these blocks are derived), and
+        // the row should name what the step reads, not what the file holds.
+        let w_rows = (p.n_head * p.latent) as u64;
         profile::record(
             "q_nope2_absorbed",
-            wkb.ty,
+            gguf::GgmlType::Unknown(8),
             w_rows,
-            w_rows * p.latent as u64,
-            w_rows * row_bytes as u64,
+            w_rows * p.nope as u64,
+            std::mem::size_of_val(wblocks) as u64,
             t_call.elapsed().as_nanos() as u64,
             &pacc,
         );

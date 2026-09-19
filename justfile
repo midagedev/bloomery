@@ -100,6 +100,12 @@ gate-forward:
 gate-kv:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test kv -- --ignored --nocapture'
 
+# Derived 게이트: 토큰과 무관한 wk_b Q8_0 재양자화를 로드시 한 번으로 옮겼다 —
+# 사전 계산이 값을 바꾸지 않는다. 블록은 참조 구현(테스트 안의 예전 두 루프)과
+# 바이트 동일, step(명시적 Derived)과 forward(래퍼)의 로짓은 비트 동일.
+gate-derived:
+    ./tools/box.sh 'cargo test --release -p bloomery-model --test derived -- --ignored --nocapture'
+
 # 1-5 프로파일러 게이트: 계측이 로짓을 한 비트도 안 바꾸고, 스텝 시간의 80% 이상을 커버하며,
 # 세 site가 전부 살아 있는가. --test-threads=1은 게이트 본체의 set_var이 자식 헬퍼 테스트와
 # 경쟁하지 않게 하는 장치다(테스트 파일의 SAFETY 주석 참조).

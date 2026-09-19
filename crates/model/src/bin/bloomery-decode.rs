@@ -23,6 +23,7 @@
 //!
 //! Run it through `tools/ref/decode-measure.sh`, which holds the box lease and records
 //! witnesses — a tok/s taken while something else has the machine is not a measurement.
+use model::derived::Derived;
 use model::forward::{argmax, forward, new_cache, step};
 use std::time::Instant;
 
@@ -80,6 +81,17 @@ fn main() {
     let g = gguf::Gguf::open(&model).expect("model file");
     println!("model  {model}");
     println!("open   {:?} (mmap, no dequant)", t_open.elapsed());
+    // The wk_b Q8_0 requant, once per model instead of once per step. Its own
+    // line for the same reason `open` gets one: it is load-time work, and mixing
+    // it into the prefill or decode timings below would misattribute it.
+    let t_derived = Instant::now();
+    let derived = Derived::new(&g).expect("derived weights");
+    println!(
+        "derived {:?} ({} blocks, {:.1} MB)",
+        t_derived.elapsed(),
+        derived.filled_blocks(),
+        derived.size_bytes() as f64 / 1e6
+    );
     println!("prompt {} tokens: {:?}", tokens.len(), tokens);
     println!(
         "path   {}",
@@ -100,7 +112,7 @@ fn main() {
     let mut cache = new_cache(&g).expect("cache");
     let mut next = if use_cache {
         let t0 = Instant::now();
-        let logits = step(&g, &tokens, &mut cache).expect("prefill");
+        let logits = step(&g, &tokens, &mut cache, &derived).expect("prefill");
         let dt = t0.elapsed();
         println!(
             "\nprefill {} tokens in {:.1} ms = {:.2} tok/s",
@@ -132,7 +144,7 @@ fn main() {
             Some(t) => {
                 ctx.push(t);
                 out.push(t);
-                let logits = step(&g, &[t], &mut cache).expect("step");
+                let logits = step(&g, &[t], &mut cache, &derived).expect("step");
                 argmax(&logits.data)
             }
             None => {

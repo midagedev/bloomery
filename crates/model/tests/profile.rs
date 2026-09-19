@@ -146,14 +146,16 @@ fn hw_profile_gate() {
 
     // The prefill fills the cache; its profile lands in the accumulators too, so it
     // is dropped — the coverage claim is about one decode step, not a mixture.
+    // `Derived::new` runs unprofiled (it has no hooks), before the first step.
     let mut cache = new_cache(&g).unwrap();
-    let logits = step(&g, &tokens, &mut cache).unwrap();
+    let derived = model::derived::Derived::new(&g).unwrap();
+    let logits = step(&g, &tokens, &mut cache, &derived).unwrap();
     profile::reset();
 
     // One decode step: one token in, wall-clock around the whole `step`.
     let next = argmax(&logits.data);
     let t0 = Instant::now();
-    step(&g, &[next], &mut cache).unwrap();
+    step(&g, &[next], &mut cache, &derived).unwrap();
     let wall_ns = t0.elapsed().as_nanos() as u64;
 
     // 2. Coverage. Integer arithmetic on purpose — no float equality near a gate.
