@@ -4,7 +4,7 @@ Device-codegen panic in cuda-oxide when a `#[unroll]`-annotated `while` loop
 has a 64-bit (`usize`) counter and the loop body contains a shift whose
 counter-side operand and other operand have different widths.
 
-All builds below ran on the box (`ws`) through `tools/box.sh`, one command per
+All builds below ran on the workstation through `tools/box.sh`, one command per
 row, on 2026-09-19. Nothing else was building on the 3090 (this round is
 compile-time work; the GPU was touched only by the single workaround run in
 §Run). Machine: RTX 3090 (sm_86), driver 615.71.09, CUDA 13.0 (V13.0.88),
