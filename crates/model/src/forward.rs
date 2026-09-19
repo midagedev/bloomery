@@ -26,8 +26,10 @@
 //! that trade starts to matter.
 use crate::kv::KvCache;
 use crate::ops::{Tensor2, f32_tensor, rms_norm};
+use crate::profile;
 use crate::{ModelError, Slot};
 use gguf::{Gguf, TensorInfo, dequant_row};
+use std::time::Instant;
 
 /// Every block's residual output, kept for the gate. `l_out[b]` is the oracle's
 /// `l_out-<b>`; `logits` is `result_output`, one column for the sampled position.
@@ -48,6 +50,11 @@ pub struct ForwardTrace {
 /// the 1-1 gate proved our Q3_K dequant is bit-identical to ggml's `to_float`, so this
 /// lookup is expected to match the oracle **exactly**, not within a tolerance.
 pub fn embed(gguf: &Gguf, tokens: &[u32]) -> Result<Tensor2, ModelError> {
+    // Profiler hook (crate::profile): the whole lookup is weight dequant, so the
+    // level-2 split has one stage and it is `dequant_w`.
+    let lvl = profile::level();
+    let mut pacc = profile::CallAcc::new();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let w = gguf
         .find("token_embd.weight")
         .ok_or_else(|| ModelError::MissingTensor("token_embd.weight".into()))?;
@@ -69,7 +76,22 @@ pub fn embed(gguf: &Gguf, tokens: &[u32]) -> Result<Tensor2, ModelError> {
             });
         }
         let src = &bytes[id * row_bytes..(id + 1) * row_bytes];
+        let t_d = if lvl >= 2 { Some(Instant::now()) } else { None };
         dequant_row(w.ty, src, out.col_mut(t))?;
+        if let Some(t_d) = t_d {
+            pacc.add_dequant_w(t_d.elapsed().as_nanos() as u64);
+        }
+    }
+    if let Some(t_call) = t_call {
+        profile::record(
+            "embed",
+            w.ty,
+            tokens.len() as u64,
+            tokens.len() as u64 * embd as u64,
+            (tokens.len() * row_bytes) as u64,
+            t_call.elapsed().as_nanos() as u64,
+            &pacc,
+        );
     }
     Ok(out)
 }

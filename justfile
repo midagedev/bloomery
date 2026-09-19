@@ -90,6 +90,12 @@ gate-forward:
 gate-kv:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test kv -- --ignored --nocapture'
 
+# 1-5 프로파일러 게이트: 계측이 로짓을 한 비트도 안 바꾸고, 스텝 시간의 80% 이상을 커버하며,
+# 세 site가 전부 살아 있는가. --test-threads=1은 게이트 본체의 set_var이 자식 헬퍼 테스트와
+# 경쟁하지 않게 하는 장치다(테스트 파일의 SAFETY 주석 참조).
+gate-profile:
+    ./tools/box.sh 'cargo test --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1'
+
 # 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
 gate-prompts:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test prompts -- --ignored --nocapture'

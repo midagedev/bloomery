@@ -37,6 +37,22 @@ fn main() {
             "-m" => model = args.next().expect("-m needs a path"),
             "-n" => n_predict = args.next().expect("-n needs a count").parse().unwrap(),
             "--no-cache" => use_cache = false,
+            "--profile" => {
+                // The profiler reads BLOOMERY_PROFILE exactly once (OnceLock in
+                // `model::profile`), so this must land before any model code runs —
+                // which it does: parsing happens before the first `step`. An existing
+                // value wins, so `BLOOMERY_PROFILE=2 ... --profile` gets the stage
+                // split rather than being clamped back to 1.
+                if std::env::var("BLOOMERY_PROFILE")
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    // SAFETY: no other threads exist yet — the process is single
+                    // threaded until the model runs, so nothing can read the
+                    // environment concurrently while this writes it.
+                    unsafe { std::env::set_var("BLOOMERY_PROFILE", "1") };
+                }
+            }
             "--tokens" => {
                 tokens = args
                     .next()
@@ -48,7 +64,8 @@ fn main() {
             other => {
                 eprintln!("bloomery-decode: unknown argument {other}");
                 eprintln!(
-                    "usage: bloomery-decode -m <gguf> --tokens <id,id,...> -n <count> [--no-cache]"
+                    "usage: bloomery-decode -m <gguf> --tokens <id,id,...> -n <count> \
+                     [--no-cache] [--profile]"
                 );
                 std::process::exit(2);
             }
@@ -91,6 +108,15 @@ fn main() {
             dt.as_secs_f64() * 1e3,
             tokens.len() as f64 / dt.as_secs_f64()
         );
+        // Prefill and decode are different work; the profile tables stay separate too.
+        // The reset drops the prefill's accumulators so the decode table is decode only.
+        if model::profile::enabled() {
+            print!(
+                "{}",
+                model::profile::report(dt.as_nanos() as u64, "prefill")
+            );
+            model::profile::reset();
+        }
         Some(argmax(&logits.data))
     } else {
         None
@@ -154,4 +180,10 @@ fn main() {
         ctx.len() - 1,
         (hi - lo) / lo * 100.0
     );
+    if model::profile::enabled() {
+        print!(
+            "{}",
+            model::profile::report(decode_total.as_nanos() as u64, "decode")
+        );
+    }
 }

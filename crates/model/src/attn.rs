@@ -42,9 +42,11 @@
 
 use crate::kv::KvCache;
 use crate::ops::{f32_tensor, matmul_q, rms_norm};
+use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo, dequant_row};
+use std::time::Instant;
 
 /// All intermediates, for the gate. `Tensor2` holds `ne0` contiguous with trailing
 /// dims folded into `ne1`, laid out exactly as the oracle dumps flatten them.
@@ -559,6 +561,13 @@ pub fn q_nope2_absorbed(
     q: &Tensor2,
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
+    // Profiler hook (crate::profile). This function is hypothesis 3 — the per-step
+    // wk_b requant — so its stage split is the one the level-2 table exists for:
+    // dequant_row and the wk_b Q8_0 requant both count as weight preparation
+    // (`dequant_w`), the activation quant as `quant_act`, the t/j/b loops as `dot`.
+    let lvl = profile::level();
+    let mut pacc = profile::CallAcc::new();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let bytes = gguf.data(wkb)?;
     let row_bytes =
         wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
@@ -569,14 +578,19 @@ pub fn q_nope2_absorbed(
     for h in 0..p.n_head {
         // The head's k-up rows, dequantized once: rows[d][j] = kv_b row h·span+d, elem j.
         let mut rows = vec![0.0f32; p.nope * p.latent];
+        let t_dq = if lvl >= 2 { Some(Instant::now()) } else { None };
         for d in 0..p.nope {
             let off = (h * (p.nope + p.v_head) + d) * row_bytes;
             dequant_row(wkb.ty, &bytes[off..off + row_bytes], wk_row.as_mut_slice())?;
             rows[d * p.latent..(d + 1) * p.latent].copy_from_slice(&wk_row);
         }
+        if let Some(t_dq) = t_dq {
+            pacc.add_dequant_w(t_dq.elapsed().as_nanos() as u64);
+        }
         // Q8_0 blocks run along the q_nope axis: block (j, b) = 32 d-values of column j.
         let mut wblocks = Vec::with_capacity(p.latent * nblocks);
         let mut vals = [0.0f32; 32];
+        let t_wb = if lvl >= 2 { Some(Instant::now()) } else { None };
         for j in 0..p.latent {
             for b in 0..nblocks {
                 for (l, v) in vals.iter_mut().enumerate() {
@@ -585,11 +599,19 @@ pub fn q_nope2_absorbed(
                 wblocks.push(quantize_q8_0(&vals));
             }
         }
+        if let Some(t_wb) = t_wb {
+            pacc.add_dequant_w(t_wb.elapsed().as_nanos() as u64);
+        }
 
         for t in 0..q.ne1 {
             let qbase = t * q.ne0 + h * p.kq_head;
             let qrow = &q.data[qbase..qbase + p.nope];
+            let t_qa = if lvl >= 2 { Some(Instant::now()) } else { None };
             let qblocks: Vec<ActBlock> = qrow.chunks_exact(32).map(quantize_act).collect();
+            if let Some(t_qa) = t_qa {
+                pacc.add_quant_act(t_qa.elapsed().as_nanos() as u64);
+            }
+            let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
             let dst = out.col_mut(h * q.ne1 + t);
             for j in 0..p.latent {
                 let mut acc = 0.0f64;
@@ -603,7 +625,25 @@ pub fn q_nope2_absorbed(
                 }
                 dst[j] = acc as f32;
             }
+            if let Some(t_dot) = t_dot {
+                pacc.add_dot(t_dot.elapsed().as_nanos() as u64);
+            }
         }
+    }
+    if let Some(t_call) = t_call {
+        // Weight-side shape statement: `n_head · nope` rows of `latent` values each,
+        // read from `row_bytes`-long k-up spans. The v-up rows this function never
+        // touches are not counted.
+        let w_rows = (p.n_head * p.nope) as u64;
+        profile::record(
+            "q_nope2_absorbed",
+            wkb.ty,
+            w_rows,
+            w_rows * p.latent as u64,
+            w_rows * row_bytes as u64,
+            t_call.elapsed().as_nanos() as u64,
+            &pacc,
+        );
     }
     Ok(out)
 }

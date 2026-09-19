@@ -6,7 +6,9 @@
 //! the reason the gates can be tight: a different order gives a different last bit, and a
 //! gate at 1e-3 would hide a real error to leave room for it.
 
+use crate::profile;
 use gguf::{GgmlType, Gguf, TensorInfo, dequant_row, quantize_activations};
+use std::time::Instant;
 
 /// A 2-D activation block in ggml's layout: `ne0` is contiguous, `ne1` strides by `ne0`.
 ///
@@ -100,6 +102,12 @@ pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
 /// (measured), and the *wrong* quantized format is still 0.1 % away — both would force
 /// every gate below to open. `gguf::activation_format` owns the table.
 pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, crate::ModelError> {
+    // Profiler hook (crate::profile): level 0 is one compare per call, level 1 one
+    // `Instant` pair for the whole call, level 2 two more per row. None of it touches
+    // the arithmetic — the gate proves that bit for bit.
+    let lvl = profile::level();
+    let mut pacc = profile::CallAcc::new();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let k = w.dims[0] as usize;
     let n = if w.dims.len() > 1 {
         w.dims[1] as usize
@@ -126,13 +134,19 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
     // (found 2026-09-19 by the ffn round, proven against libggml's own quantizer).
     let quantized = {
         let mut q = vec![0.0f32; x.data.len()];
+        let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
         for t in 0..x.ne1 {
             quantize_activations(w.ty, x.col(t), &mut q[t * k..(t + 1) * k]);
+        }
+        if let Some(t_q) = t_q {
+            pacc.add_quant_act(t_q.elapsed().as_nanos() as u64);
         }
         q
     };
     for r in 0..n {
         let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        // Weight side: dequant_row, or the byte walk in its place for F32 rows.
+        let t_d = if lvl >= 2 { Some(Instant::now()) } else { None };
         if w.ty == GgmlType::F32 {
             for (i, v) in row.iter_mut().enumerate() {
                 *v = f32::from_le_bytes(src[i * 4..i * 4 + 4].try_into().unwrap());
@@ -140,6 +154,10 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
         } else {
             dequant_row(w.ty, src, &mut row)?;
         }
+        if let Some(t_d) = t_d {
+            pacc.add_dequant_w(t_d.elapsed().as_nanos() as u64);
+        }
+        let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
         for t in 0..x.ne1 {
             let xc = &quantized[t * k..(t + 1) * k];
             let mut acc = 0.0f32;
@@ -148,6 +166,20 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
             }
             out.data[t * n + r] = acc;
         }
+        if let Some(t_dot) = t_dot {
+            pacc.add_dot(t_dot.elapsed().as_nanos() as u64);
+        }
+    }
+    if let Some(t_call) = t_call {
+        profile::record(
+            "matmul_q",
+            w.ty,
+            n as u64,
+            k as u64 * n as u64,
+            bytes.len() as u64,
+            t_call.elapsed().as_nanos() as u64,
+            &pacc,
+        );
     }
     Ok(out)
 }
