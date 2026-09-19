@@ -2,9 +2,11 @@
 //!
 //! Two qualifiers left, both structural and both still round 1-5's to remove:
 //!
-//!   1. **`ops::matmul_q` is the reference implementation** — one thread, dequantizing a
-//!      weight row at a time into a scalar dot. `crates/q3k-cpu` holds the fast path and
-//!      stage 1 does not call it.
+//!   1. **`ops::matmul_q` still materializes f32.** It runs its output rows on the
+//!      thread pool as of 2026-09-19, but each row is dequantized to f32 and dotted
+//!      in scalar f32. The profiler put dequant at 56 % of the step against the dot's
+//!      44 %, so the remaining factor is the fused AVX2 int8 kernel (`crates/q3k-cpu`
+//!      holds it; stage 1 does not call it), not more threads.
 //!   2. **CPU only.** Not one byte of this runs on either card.
 //!
 //! The third one is gone. Until 2026-09-19 this binary re-ran the whole prefix every

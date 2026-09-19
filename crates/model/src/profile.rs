@@ -1,9 +1,17 @@
 //! Where one decode step's nanoseconds go — the single owner of the stage-1 profiler.
 //!
-//! The 37x gap to ik_llama.cpp has three candidate causes (scalar f32 dot, per-call
+//! The 37x gap to ik_llama.cpp had three candidate causes (scalar f32 dot, per-call
 //! weight dequant, per-step `wk_b` requant in `q_nope2_absorbed`) and no measurement
-//! saying which one is big. Fixing blind would spend a round on the small one, so this
-//! module only *attributes time*; the fixes are later rounds fed by its table.
+//! saying which one was big. Fixing blind would have spent a round on the small one,
+//! so this module only *attributes time*; the fixes are separate rounds fed by its
+//! table.
+//!
+//! What it answered, 2026-09-19, in one lease (decode, 2 steps, 7350.6 ms wall):
+//! `matmul_q` 91.4 % and `q_nope2_absorbed` 8.4 %; by stage, dequant 4128.5 ms against
+//! the dot's 3286.2 — so the first two causes are one cause (a fused int8 kernel, not
+//! a faster f32 dot), and the third was 592.1 of its 614.6 ms, all of it independent
+//! of the token. `Derived` closed the third and the thread pool the arithmetic's
+//! parallelism; the fused kernel is still open. The table is `just measure-profile`.
 //!
 //! Design constraints, each load-bearing:
 //!
@@ -95,6 +103,16 @@ impl CallAcc {
 
     pub fn add_dot(&mut self, ns: u64) {
         self.ns_dot += ns;
+    }
+
+    /// Fold a finished worker accumulator into this one. The row-parallel sites
+    /// build one `CallAcc` per pool chunk and merge them after the join, so
+    /// [`record`] still fires exactly once per call and the accumulator mutex
+    /// stays out of the workers.
+    pub fn add_acc(&mut self, other: &CallAcc) {
+        self.ns_quant_act += other.ns_quant_act;
+        self.ns_dequant_w += other.ns_dequant_w;
+        self.ns_dot += other.ns_dot;
     }
 }
 
@@ -247,7 +265,9 @@ pub fn report(wall_ns: u64, label: &str) -> String {
         out.push_str(
             "level 2: the stage split calls Instant::now() twice per row — timer tax \
              inflates absolute stage times. The RATIOS are the finding; the absolute \
-             numbers are not.\n",
+             numbers are not. Sites that run their rows on the thread pool sum \
+             per-worker timers, so their stage columns are CPU-time totals across \
+             workers, not wall time.\n",
         );
     }
     out
