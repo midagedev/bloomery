@@ -1,0 +1,9 @@
+[package]
+name = "q3k-cpu"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+libc = "0.2"
