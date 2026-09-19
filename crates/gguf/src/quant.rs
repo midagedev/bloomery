@@ -486,3 +486,84 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
         }
     }
 }
+
+/// Round-trip f32 activations through ik's **Q8_2_X4** activation quantization.
+///
+/// ggml does not use one activation format for all weights. `ggml.c`'s type-traits table
+/// gives each weight type its own `vec_dot_type`, and on this build (ik_llama.cpp with
+/// `GGML_USE_IQK_MULMAT=ON`) they are:
+///
+/// | weight | activation |
+/// |---|---|
+/// | Q3_K | `Q8_K` |
+/// | Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q8_0 | `Q8_2_X4` |
+/// | F32, F16 | none |
+///
+/// Using Q8_K for all of them is wrong by ~1e-3 — measured 2026-09-19 on `ffn_out-0`
+/// (Q5_1 down projection): 2.0e-3 with the wrong activation, **1.4e-7** with this one. The
+/// error ratio between two tensors of different row length was √(10944/2816) = 1.97, the
+/// signature of activation-quantization noise rather than a logic error.
+///
+/// Block geometry (`ggml-common.h`, `block_q8_2`): 32 values, `d` as **bf16** (not f16),
+/// `s` a sum this reference does not need, then 32 int8 codes. `_x4` interleaves four such
+/// blocks; interleaving changes only the byte layout, so a value-level round trip does not
+/// see it.
+///
+/// Three details that each change the last bits (`iqk_quantize.cpp:1005`):
+///   * the scale is `amax / 127` from the **unsigned** max — unlike Q8_K, whose scale comes
+///     from the signed extreme;
+///   * `d` is converted to bf16 **and read back** before it is used to code, so the codes
+///     are computed against the stored scale, not the exact one;
+///   * rounding is round-half-to-even.
+pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
+    assert_eq!(x.len(), out.len(), "q8_2 round-trip needs matching lengths");
+    assert!(x.len().is_multiple_of(32), "q8_2 blocks are 32 values");
+    for (xb, ob) in x.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+        let mut amax = 0.0f32;
+        for &v in xb {
+            amax = amax.max(v.abs());
+        }
+        // ggml_compute_fp32_to_bf16 (ggml-impl.h:106), then straight back: bf16 -> f32 is
+        // the bits in the high half. NaN cannot occur here (amax is finite and non-negative).
+        let d_exact = amax / 127.0f32;
+        let bits = d_exact.to_bits();
+        let bf16 = ((bits + (0x7fff + ((bits >> 16) & 1))) >> 16) as u16;
+        let d = f32::from_bits((bf16 as u32) << 16);
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for (o, &v) in ob.iter_mut().zip(xb) {
+            *o = d * (v * id).round_ties_even();
+        }
+    }
+}
+
+/// The activation format ggml quantizes to before a dot with this weight type, as the
+/// type-traits table defines it. `None` means the activations stay f32.
+///
+/// This lives beside the two round-trip functions so the mapping has one owner: a caller
+/// that picks the activation format itself will pick it differently somewhere else, and the
+/// difference shows up as a 1e-3 numeric drift nobody can place.
+pub fn activation_format(weight: GgmlType) -> Option<ActivationFormat> {
+    match weight {
+        GgmlType::Q3_K => Some(ActivationFormat::Q8K),
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q5_0 | GgmlType::Q5_1 => {
+            Some(ActivationFormat::Q8_2X4)
+        }
+        GgmlType::F32 | GgmlType::F16 => None,
+        GgmlType::Unknown(_) => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActivationFormat {
+    Q8K,
+    Q8_2X4,
+}
+
+/// Apply whichever activation quantization `weight` implies, in place of a copy.
+pub fn quantize_activations(weight: GgmlType, x: &[f32], out: &mut [f32]) {
+    match activation_format(weight) {
+        Some(ActivationFormat::Q8K) => quantize_row_q8_k_roundtrip(x, out),
+        Some(ActivationFormat::Q8_2X4) => quantize_row_q8_2_x4_roundtrip(x, out),
+        None => out.copy_from_slice(x),
+    }
+}

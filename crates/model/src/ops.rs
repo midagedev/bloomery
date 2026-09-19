@@ -6,7 +6,7 @@
 //! the reason the gates can be tight: a different order gives a different last bit, and a
 //! gate at 1e-3 would hide a real error to leave room for it.
 
-use gguf::{GgmlType, Gguf, TensorInfo, dequant_row, quantize_row_q8_k_roundtrip};
+use gguf::{GgmlType, Gguf, TensorInfo, dequant_row, quantize_activations};
 
 /// A 2-D activation block in ggml's layout: `ne0` is contiguous, `ne1` strides by `ne0`.
 ///
@@ -79,9 +79,11 @@ pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
 /// This dequantizes a row at a time and drops it — stage 1 is about being right, and the
 /// row buffer keeps the working set in L1 rather than materializing the whole matrix.
 ///
-/// **Activations go through Q8_K first**, because that is what ggml does before a K-quant
-/// dot and the oracle is ggml's output. An f32 reference is 0.6 % away from it (measured;
-/// see `quantize_row_q8_k_roundtrip`) and would force every gate below to open to 1e-1.
+/// **Activations are quantized first, in the format this weight type implies** — Q8_K for
+/// Q3_K, Q8_2_X4 for Q4_K/Q5_K/Q6_K/Q5_0/Q5_1, none for F32. That is what ggml does before
+/// a quantized dot, and the oracle is ggml's output. An f32 reference is 0.6 % away
+/// (measured), and the *wrong* quantized format is still 0.1 % away — both would force
+/// every gate below to open. `gguf::activation_format` owns the table.
 pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, crate::ModelError> {
     let k = w.dims[0] as usize;
     let n = if w.dims.len() > 1 {
@@ -103,13 +105,14 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
     let mut row = vec![0.0f32; k];
     let mut out = Tensor2::zeros(n, x.ne1);
 
-    // Quantize every activation column once, not once per weight row.
-    let quantized = if w.ty == GgmlType::F32 || !k.is_multiple_of(256) {
-        x.data.clone()
-    } else {
+    // Quantize every activation column once, not once per weight row. WHICH format is a
+    // property of the WEIGHT type, not a global choice — `gguf::activation_format` owns the
+    // table. Using Q8_K for everything was wrong by 2e-3 on the Q5_1 down projection
+    // (found 2026-09-19 by the ffn round, proven against libggml's own quantizer).
+    let quantized = {
         let mut q = vec![0.0f32; x.data.len()];
         for t in 0..x.ne1 {
-            quantize_row_q8_k_roundtrip(x.col(t), &mut q[t * k..(t + 1) * k]);
+            quantize_activations(w.ty, x.col(t), &mut q[t * k..(t + 1) * k]);
         }
         q
     };
