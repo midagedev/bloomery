@@ -57,6 +57,73 @@ fn check(o: &oracle::Oracle, got: &Tensor2, name: &str, occ: u32, what: &str, to
     oracle::assert_close(&got.data, &want, tol, what);
 }
 
+/// The same check, plus the shape of the deviation — for a tensor whose bound exists only
+/// to admit a tie flip. Lead-added 2026-09-19 on adoption.
+///
+/// A blanket `3e-2` on `q_nope2` says "anything in these 49152 values may be 0.5 % wrong",
+/// which is not what the round measured and not what we want to allow. What it measured is
+/// that the flip is confined to ONE (head, token) column per block — 373 and 377 elements,
+/// all sharing a column index. So the gate states that instead: every element is within
+/// `strict`, EXCEPT elements lying in at most `max_cols` columns, which get `loose`.
+///
+/// `max_cols` is 1, not 2. The round's own module doc says the point of these bounds is
+/// that "an upstream `matmul_q` change that moves a tie re-reds the gate instead of
+/// silently widening it" — a SECOND flipped column is exactly that event, and absorbing
+/// it would be the silent widening the sentence rules out. A red gate here means someone
+/// looks, which is the intent.
+///
+/// This is a tightening, so no re-authoring evidence is owed — but it was measured both
+/// ways anyway (2026-09-19, box): it passes on this source at 1 column per block, and
+/// adding 5e-4 to a single element in column 7 reds it with
+/// `2 columns deviate past 1e-4 ... Columns: [7, 32]`, while the blanket 3e-2 it replaces
+/// stayed green through that same perturbation.
+fn check_confined(
+    o: &oracle::Oracle,
+    got: &Tensor2,
+    name: &str,
+    occ: u32,
+    what: &str,
+    strict: f32,
+    loose: f32,
+    max_cols: usize,
+) {
+    let (want, winf) = o.load(name, occ);
+    assert_eq!(
+        [got.ne0 as i64, got.ne1 as i64],
+        folded(&winf.ne),
+        "{what}: shape must match the reference before the values can mean anything"
+    );
+    assert_eq!(got.data.len(), want.len(), "{what}: length");
+    let mut worst = 0.0f32;
+    let mut over: std::collections::BTreeSet<usize> = Default::default();
+    let mut n_over = 0usize;
+    for (i, (&g, &w)) in got.data.iter().zip(&want).enumerate() {
+        let d = (g - w).abs();
+        worst = worst.max(d);
+        assert!(
+            d <= loose,
+            "{what}: {d:e} at index {i} (col {}) exceeds even the tie-flip bound {loose:e}",
+            i / got.ne0
+        );
+        if d > strict {
+            over.insert(i / got.ne0);
+            n_over += 1;
+        }
+    }
+    assert!(
+        over.len() <= max_cols,
+        "{what}: {} columns deviate past {strict:e} ({n_over} elements) — a tie flip moves \
+         ONE column, so this is a different fault. Columns: {:?}",
+        over.len(),
+        over.iter().take(8).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "{what:38} max|diff| = {worst:e}   ok (≤{strict:e} outside {} column(s) {:?}, ≤{loose:e} inside)",
+        over.len(),
+        over.iter().collect::<Vec<_>>()
+    );
+}
+
 fn check_block(o: &oracle::Oracle, n: usize) {
     let g = gguf::Gguf::open(model_path()).unwrap();
     let tr = run_block(o, &g, n);
@@ -103,13 +170,15 @@ fn check_block(o: &oracle::Oracle, n: usize) {
     // One flipped activation code moves one whole column; bound covers two flips.
     // Measured 2.5e-3 / 1.1e-2 (373 and 377 of 49152 elements above 1e-4, one column
     // each); exact-input companion is 3.8e-6 / 9.5e-7.
-    check(
+    check_confined(
         o,
         &tr.q_nope2,
         &format!("q_nope2-{n}"),
         0,
         &format!("q_nope2-{n} (absorbed)"),
+        1e-4,
         3e-2,
+        1,
     );
     // Softmax damps the same tie-flip spikes ~100x. Measured 1.2e-4 / 8.1e-5; the
     // exact-input companion is bit-exact (0), so nothing here is attention arithmetic.
