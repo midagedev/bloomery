@@ -89,6 +89,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-qdot"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+]
+
+[[package]]
 name = "bloomery-threads"
 version = "0.1.0"
 dependencies = [
