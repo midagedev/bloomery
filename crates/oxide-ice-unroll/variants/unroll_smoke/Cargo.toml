@@ -1,0 +1,15 @@
+[package]
+name = "unroll_smoke"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+# Smoke test for the `#[unroll]` / `#[unroll(N)]` loop-unroll transform.
+#   cargo oxide run unroll_smoke
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-core = "0.3.1"
