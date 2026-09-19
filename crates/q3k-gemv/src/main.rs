@@ -76,10 +76,10 @@ mod kernels {
         // amax (no cross-lane byte packing needed, unlike the 32-value
         // geometry where one value per lane forced two shuffle_downs).
         let base = col * 2048 + 128 * b + 4 * lane;
-        let v0 = x[base];
-        let v1 = x[base + 1];
-        let v2 = x[base + 2];
-        let v3 = x[base + 3];
+        let v0 = unsafe { *x.get_unchecked(base) };
+        let v1 = unsafe { *x.get_unchecked(base + 1) };
+        let v2 = unsafe { *x.get_unchecked(base + 2) };
+        let v3 = unsafe { *x.get_unchecked(base + 3) };
         let amax = warp::reduce_max_f32(
             v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()),
         );
@@ -177,16 +177,19 @@ mod kernels {
             // for even sbp and 2 mod 4 for odd, so the same floor division
             // addresses both; odd lanes reassemble with a 16-bit funnel.
             let qk = (base + 32 + 4 * w16) >> 2;
-            let lo = w[qk];
-            let hi = w[qk + 1];
+            // SAFETY: row < n_rows, sbp < 8, w16 < 16, so qk+1 < (row+1)*220
+            // <= w.len() by the launch contract (word indices stay inside the
+            // row's 220 words; odd super-blocks only shift the window by 2).
+            let (lo, hi) = unsafe { (*w.get_unchecked(qk), *w.get_unchecked(qk + 1)) };
             let vl = if par == 0 { lo } else { (lo >> 16) | (hi << 16) };
 
             // hmask word (bytes base+4*(w16%8) .. +3), one bit per weight:
             // bit 4*(w16/8)+field. Invert so a clear hmask bit (subtract 4)
             // becomes a set bit, pre-shifted to bit 0 of each byte.
             let hk = (base + 4 * (w16 & 7)) >> 2;
-            let hlo = w[hk];
-            let hhi = w[hk + 1];
+            // SAFETY: same row/sbp/w16 bounds as the qs window above; hk+1 <
+            // (row+1)*220 <= w.len().
+            let (hlo, hhi) = unsafe { (*w.get_unchecked(hk), *w.get_unchecked(hk + 1)) };
             let hm = if par == 0 { hlo } else { (hlo >> 16) | (hhi << 16) };
             let vh1 = (!hm) >> (4 * (w16 >> 3)) as u32;
 
@@ -195,10 +198,17 @@ mod kernels {
             // 16-byte window base+96..112 (even) / base+94..110 (odd) is
             // covered by four aligned words.
             let ak = (base + 96) >> 2;
-            let aw0 = w[ak];
-            let aw1 = w[ak + 1];
-            let aw2 = w[ak + 2];
-            let aw3 = w[ak + 3];
+            // SAFETY: ak+3 < (row+1)*220 <= w.len(): the 16-byte window ends
+            // at most 2 bytes past the row end for the last super-block, but
+            // the floored word index stays inside the row's 220 words.
+            let (aw0, aw1, aw2, aw3) = unsafe {
+                (
+                    *w.get_unchecked(ak),
+                    *w.get_unchecked(ak + 1),
+                    *w.get_unchecked(ak + 2),
+                    *w.get_unchecked(ak + 3),
+                )
+            };
             let (a0w, a1w, a2w) = if par == 0 {
                 (aw0, aw1, aw2)
             } else {
@@ -263,70 +273,70 @@ mod kernels {
             // q8_1 block: int chain (dp4a x sub-block scale), one FMA with
             // the shared block scale and the super-block scale.
             {
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f0 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f0 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
             }
             if m > 1 {
                 // Columns 1..7 (launch-uniform guard, no divergence). Same
                 // shape as column 0 with the per-column q/d8 offsets.
                 let mut uw = uw + 512;
                 let mut d8b = d8b + 16;
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f1 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f1 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
 
                 uw += 512;
                 d8b += 16;
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f2 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f2 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
 
                 uw += 512;
                 d8b += 16;
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f3 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f3 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
 
                 uw += 512;
                 d8b += 16;
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f4 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f4 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
 
                 uw += 512;
                 d8b += 16;
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f5 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f5 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
 
                 uw += 512;
                 d8b += 16;
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f6 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f6 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
 
                 uw += 512;
                 d8b += 16;
-                let a = dp4a_s32(vi0, q[uw], 0) * sc0
-                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
-                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
-                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
-                f7 += (a as f32) * (d8[d8b] * drow);
+                let a = dp4a_s32(vi0, unsafe { *q.get_unchecked(uw) }, 0) * sc0
+                    + dp4a_s32(vi1, unsafe { *q.get_unchecked(uw + 8) }, 0) * sc1
+                    + dp4a_s32(vi2, unsafe { *q.get_unchecked(uw + 16) }, 0) * sc2
+                    + dp4a_s32(vi3, unsafe { *q.get_unchecked(uw + 24) }, 0) * sc3;
+                f7 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
             }
 
             it += 1;
