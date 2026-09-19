@@ -42,7 +42,7 @@
 
 use crate::derived::Derived;
 use crate::kv::KvCache;
-use crate::ops::{f32_tensor, matmul_q, rms_norm};
+use crate::ops::{f32_tensor, matmul_q, matmul_q_batch, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
@@ -916,11 +916,18 @@ pub fn flash_attn_latent(
 
 // ----------------------------------------------------------------- wv_b
 
-/// `wv_b` stays Q3_K in the reference (only `wk_b` is requantized), so this is a plain
-/// `matmul_q` per head over a synthetic view of `attn_kv_b`'s v-up rows — the same view
-/// `ggml_view_3d` takes, expressed as a file offset. Activation gathering is needed
+/// `wv_b` stays Q3_K in the reference (only `wk_b` is requantized), so this is a
+/// `matmul_q_batch` over synthetic views of `attn_kv_b`'s v-up rows — the same views
+/// `ggml_view_3d` takes, expressed as file offsets. Activation gathering is needed
 /// because `kqv_compressed` interleaves heads (`t·n_head+h`) while each head's matmul
 /// wants six consecutive 512-wide rows.
+///
+/// MUL-25: this used to be one `matmul_q` per head — sixteen pool dispatches per
+/// layer, 432 per decode step, and MUL-24 had just measured small dispatches as
+/// where the orchestration residual lives (26 µs each here). All heads share the
+/// view shape, so the whole layer is one `matmul_q_batch` call now. Values are
+/// bit-identical by the batch primitive's argument: per-pair rows and activations
+/// are exactly what the per-head calls saw.
 pub fn wv_b_heads(
     gguf: &Gguf,
     wkb: &TensorInfo,
@@ -928,7 +935,7 @@ pub fn wv_b_heads(
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
     // Profiler hook (crate::profile): SELF time — the whole call minus what its
-    // sixteen hooked `matmul_q` children recorded (see `profile::site_ns_total`).
+    // one hooked `matmul_q_batch` child recorded (see `profile::site_ns_total`).
     // What is left is the per-head activation gather, the view builds and the
     // scatter into `kqv_2d`. Per-piece timers were rejected on the overhead
     // rule: a piece here is a 512-float copy, the same order as an Instant
@@ -937,7 +944,7 @@ pub fn wv_b_heads(
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let mm_before = if lvl > 0 {
-        profile::site_ns_total("matmul_q")
+        profile::site_ns_total("matmul_q_batch")
     } else {
         0
     };
@@ -945,14 +952,17 @@ pub fn wv_b_heads(
         wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
     let n_tokens = kqv_compressed.ne1 / p.n_head;
     let mut kqv_2d = Tensor2::zeros(p.n_head * p.v_head, n_tokens);
-    let mut x_h = Tensor2::zeros(p.latent, n_tokens);
 
+    let mut xhs: Vec<Tensor2> = (0..p.n_head)
+        .map(|_| Tensor2::zeros(p.latent, n_tokens))
+        .collect();
+    let mut views: Vec<TensorInfo> = Vec::with_capacity(p.n_head);
     for h in 0..p.n_head {
         for t in 0..n_tokens {
             let src = kqv_compressed.col(t * p.n_head + h);
-            x_h.col_mut(t).copy_from_slice(src);
+            xhs[h].col_mut(t).copy_from_slice(src);
         }
-        let view = TensorInfo {
+        views.push(TensorInfo {
             name: format!("{}.v_up.head{h}", wkb.name),
             dims: vec![p.latent as u64, p.v_head as u64],
             ty: wkb.ty,
@@ -960,15 +970,19 @@ pub fn wv_b_heads(
             nbytes: wkb.ty.type_size().unwrap()
                 * (p.latent / wkb.ty.blck_size().unwrap() as usize) as u64
                 * p.v_head as u64,
-        };
-        let out_h = matmul_q(gguf, &view, &x_h)?;
+        });
+    }
+    let ws: Vec<&TensorInfo> = views.iter().collect();
+    let xs: Vec<&Tensor2> = xhs.iter().collect();
+    let outs = matmul_q_batch(gguf, &ws, &xs)?;
+    for (h, out_h) in outs.iter().enumerate() {
         for t in 0..n_tokens {
             let dst = kqv_2d.col_mut(t);
             dst[h * p.v_head..(h + 1) * p.v_head].copy_from_slice(out_h.col(t));
         }
     }
     if let Some(t_call) = t_call {
-        let child = profile::site_ns_total("matmul_q") - mm_before;
+        let child = profile::site_ns_total("matmul_q_batch") - mm_before;
         let self_ns = (t_call.elapsed().as_nanos() as u64).saturating_sub(child);
         profile::record_time("wv_b_heads", self_ns);
     }
