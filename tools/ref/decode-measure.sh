@@ -25,7 +25,7 @@ witness() {
   echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
   # 스레드 수는 이제 결과를 바꾸는 변수다. 증인 줄에 없으면 다른 날의 행과 비교할 때
   # 무엇이 달랐는지 알 방법이 없다 — 빈 값은 "기본값(물리 코어 수)"을 뜻한다.
-  echo "threads: BLOOMERY_THREADS=${BLOOMERY_THREADS:-<default>}"
+  echo "threads: BLOOMERY_THREADS=${BLOOMERY_THREADS:-<default>} spin=${BLOOMERY_SPIN:-<default>}"
   nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
   echo "lock-holder-pid: $$"
 }
@@ -58,11 +58,17 @@ fi
 if [ -n "${SWEEP:-}" ]; then
   echo
   echo "=== 스레드 스윕 ==="
+  # export, not a command prefix. 2026-09-19 첫 스윕이 접두 할당으로 넘겼는데
+  # witness 는 별도 호출이라 바깥의 (비어 있는) 값을 읽어, 다섯 행 전부가
+  # `BLOOMERY_THREADS=<default>` 증인을 달고 나왔다 — 숫자는 맞았고 증인만 거짓이었다.
+  # 증인이 재현의 전부인 행에서는 그게 숫자가 틀린 것과 같다.
   for th in $SWEEP; do
+    export BLOOMERY_THREADS=$th
     witness "pre-threads$th"
-    BLOOMERY_THREADS=$th "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
+    "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
       | grep -E "^derived|decode steps in|per step"
     witness "post-threads$th"
+    unset BLOOMERY_THREADS
   done
 fi
 
