@@ -39,9 +39,9 @@ V4.1 Flash는 engram 테이블 NVMe 지연 읽기, 공유 압축 KV, 지연 하�
 | 1-4 head | 출력 헤드 | **통과 2026-09-19**: `result_norm` 9.5e-7, `result_output` 4.0e-5, argmax·top-5 정확 일치. `just gate-head` | 1-3 |
 | 1-4 | 토큰 하나의 전체 순전파, CPU, M=1 | **통과 2026-09-19, 한 군데 정정**: `inp_embd` 비트 정확, `l_out-0`~`l_out-26` 상대 드리프트 7.0e-4 → 9.1e-3, `result_output` 2.2e-2(절대 6.1e-1). argmax는 ~~32/32~~ **32/33**(프롬프트 32번은 KV 캐시 라운드에서 추가) — 5번(`def add(a, b):`)이 ik의 0.262 마진 안에서 뒤집혔다. 첫 tok/s **0.0521**. `just gate-forward`, `just gate-prompts`, `just measure-decode` | 1-3 |
 | 1-5 KV | KV 캐시 | **통과 2026-09-19**: 캐시·무캐시 로짓이 모든 분할에서 **비트 동일**(0e0). 디코드 0.0519 → **0.2730 tok/s**(5.26배), 스텝 폭 84.5% → 0.5%. `just gate-kv`, `just measure-decode` | 1-4 |
-| 1-5 프로파일 | 디코드 스텝의 시간 귀속(`crate::profile`) | **통과 2026-09-19**: 커버리지 99.7%, 계측이 로짓을 비트 하나도 안 바꿈. `just gate-profile`, `just measure-profile` | 1-5 KV |
+| 1-5 프로파일 | 디코드 스텝의 시간 귀속(`crate::profile`) | **통과 2026-09-19, 재통과 2026-09-20**: 커버리지 99.7% → (스레드 뒤) 91.6% → 훅 21개로 **98.1%**, 임계 80 → 98. 계측이 로짓을 비트 하나도 안 바꿈. `just gate-profile`, `just measure-profile` | 1-5 KV |
 | 1-5 스레드 | `matmul_q` 행 병렬(`crates/threads` 상주 풀) + 토큰 무관 가중치 준비 캐시(`Derived`) | **통과 2026-09-19**: 스레드 1/3/32의 로짓이 **바이트 동일**, 0.2730 → **4.1639 tok/s**(15.3배), 생성 토큰 동일. 스레드 수는 **32(물리 코어)**로 확정 — SMT 64는 3.7배 느리다. `just gate-mt`, `just gate-derived`, `just measure-sweep` | 1-5 프로파일 |
-| 1-5 커널 | AVX2 int8 융합 — 디퀀트와 내적을 한 번에(ik `iqk_mul_mat`의 AVX2 분기 형태) | 같은 argmax, `gate-forward` 밴드 안, 토큰당 ms | 1-5 스레드 |
+| 1-5 커널 | AVX2 int8 융합 — 디퀀트와 내적을 한 번에(ik `iqk_mul_mat`의 AVX2 분기 형태) | **크레이트 착륙 2026-09-20, 미배선**: `crates/qdot`이 Q3_K × Q8_K를 f32 없이 계산하고 f64 정확해에 현재 경로보다 가깝다(932/1024 · 903/1024 행, worst rel 3.2배 · 20.7배). `just gate-qdot`. **남은 것**: `ops::matmul_q` 배선(Q3_K 융합 + 나머지 스칼라 폴백) → 임대 안 측정 → Q4_K·Q5_0·Q6_K·Q5_1 확장. 배선 라운드는 **로짓 비트 동일을 요구할 수 없다** — 더 정확한 경로라 로짓이 바뀐다. 게이트는 `gate-forward` 밴드 유지 + 오라클 재기준이다 | 1-5 스레드 |
 | 1-5 GPU | dense 경로 GPU 오프로드 + 라우팅 expert에 `q3k-gemv` | 같은 logits, 3090에서 ik 대비 tok/s | 1-5 커널 |
 
 ### 1-5를 넷으로 쪼갠 근거 (2026-09-19 실측)
