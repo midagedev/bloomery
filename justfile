@@ -41,5 +41,10 @@ build-ref:
 deny:
     ./tools/box.sh 'cd ~/repo/mulle && cargo deny check'
 
+# 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
+# hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
+gate-1-1:
+    ./tools/box.sh 'cd ~/repo/mulle && bash tools/ref/build-dequant.sh && "$MULLE_DATA/bin/dequant_ref" && cargo test -p gguf -- --ignored --nocapture'
+
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: fmt-check lint build-gpu build-cpu
+gate: fmt-check lint build-gpu build-cpu gate-1-1

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/q3k-gemv", "crates/q3k-cpu"]
+members = ["crates/q3k-gemv", "crates/q3k-cpu", "crates/gguf"]
 # 의도적으로 컴파일되지 않는 재현기다(MUL-7). 워크스페이스에 넣으면 --workspace가 영구히 빨갛다.
 exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_smoke"]
 
@@ -10,6 +10,8 @@ cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.g
 cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
 cuda-core = "0.3.1"
 libc = "0.2"
+memmap2 = "0.9"
+thiserror = "2"
 
 # 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
 [workspace.lints.rust]
