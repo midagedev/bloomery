@@ -45,7 +45,10 @@ impl Oracle {
         let mut model = String::new();
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("# tokens\t") {
-                tokens = rest.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                tokens = rest
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
                 continue;
             }
             if let Some(rest) = line.strip_prefix("# model\t") {
@@ -72,16 +75,23 @@ impl Oracle {
             by_key.insert((t.name.clone(), t.occurrence), t);
         }
         assert!(!by_key.is_empty(), "oracle manifest has no tensor rows");
-        Oracle { dir, tokens, model, by_key }
+        Oracle {
+            dir,
+            tokens,
+            model,
+            by_key,
+        }
     }
 
     pub fn info(&self, name: &str, occurrence: u32) -> &RefTensor {
-        self.by_key.get(&(name.to_string(), occurrence)).unwrap_or_else(|| {
-            panic!(
-                "oracle has no tensor {name}#{occurrence}. Names come from the manifest, \
+        self.by_key
+            .get(&(name.to_string(), occurrence))
+            .unwrap_or_else(|| {
+                panic!(
+                    "oracle has no tensor {name}#{occurrence}. Names come from the manifest, \
                  and a name can occur more than once in one graph — pass the occurrence."
-            )
-        })
+                )
+            })
     }
 
     /// The reference values, flattened in ggml order (ne0 contiguous).
@@ -89,7 +99,13 @@ impl Oracle {
         let info = self.info(name, occurrence);
         let safe: String = name
             .chars()
-            .map(|c| if c == '/' || c == '\\' || c == ' ' { '_' } else { c })
+            .map(|c| {
+                if c == '/' || c == '\\' || c == ' ' {
+                    '_'
+                } else {
+                    c
+                }
+            })
             .collect();
         let path = self.dir.join(format!("{safe}.{occurrence}.f32"));
         let bytes = std::fs::read(&path)
@@ -105,7 +121,13 @@ impl Oracle {
 /// Elementwise comparison that reports WHERE it failed, not just that it did. A gate that
 /// prints only a max is a gate you cannot act on.
 pub fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: length {} vs reference {}", got.len(), want.len());
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{what}: length {} vs reference {}",
+        got.len(),
+        want.len()
+    );
     let mut worst = 0.0f32;
     let mut at = 0usize;
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
@@ -118,7 +140,8 @@ pub fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
     assert!(
         worst <= tol,
         "{what}: max |diff| = {worst:e} at index {at} (got {}, reference {}); gate is {tol:e}",
-        got[at], want[at]
+        got[at],
+        want[at]
     );
     eprintln!("{what:38} max|diff| = {worst:e}   ok (gate {tol:e})");
 }
@@ -126,7 +149,13 @@ pub fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) {
 /// Routing decisions are integers and get no tolerance. A wrong expert choice inside a 1e-3
 /// numeric gate is invisible, and it is the failure that matters most in the MoE block.
 pub fn assert_exact_i32(got: &[i32], want_f32: &[f32], what: &str) {
-    assert_eq!(got.len(), want_f32.len(), "{what}: length {} vs reference {}", got.len(), want_f32.len());
+    assert_eq!(
+        got.len(),
+        want_f32.len(),
+        "{what}: length {} vs reference {}",
+        got.len(),
+        want_f32.len()
+    );
     for (i, (&g, &w)) in got.iter().zip(want_f32).enumerate() {
         let w = w as i32;
         assert_eq!(g, w, "{what}: index {i} chose {g}, reference chose {w}");

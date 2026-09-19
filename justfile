@@ -12,8 +12,12 @@ check:
 lint:
     ./tools/box.sh 'cd ~/repo/mulle && cargo clippy --workspace --all-targets'
 
+# fmt는 맥에서 돈다. box.sh의 rsync가 단방향이라 박스에서 포맷하면 결과가 돌아오지
+# 않고 다음 명령에 덮여 사라진다(2026-09-19에 그렇게 한 번 날렸다). cargo fmt는 컴파일을
+# 하지 않고 파싱만 하므로 arm64 맥에서 정상 동작한다 — AGENTS.md의 "맥에서 게이트 금지"는
+# 빌드가 필요한 것에 대한 규칙이고, 판정은 박스의 fmt-check가 한다.
 fmt:
-    ./tools/box.sh 'cd ~/repo/mulle && cargo fmt --all'
+    cargo fmt --all
 
 fmt-check:
     ./tools/box.sh 'cd ~/repo/mulle && cargo fmt --all -- --check'

@@ -6,7 +6,7 @@
 //! the reason the gates can be tight: a different order gives a different last bit, and a
 //! gate at 1e-3 would hide a real error to leave room for it.
 
-use gguf::{Gguf, GgmlType, TensorInfo, dequant_row, quantize_row_q8_k_roundtrip};
+use gguf::{GgmlType, Gguf, TensorInfo, dequant_row, quantize_row_q8_k_roundtrip};
 
 /// A 2-D activation block in ggml's layout: `ne0` is contiguous, `ne1` strides by `ne0`.
 ///
@@ -22,11 +22,19 @@ pub struct Tensor2 {
 
 impl Tensor2 {
     pub fn zeros(ne0: usize, ne1: usize) -> Self {
-        Self { ne0, ne1, data: vec![0.0; ne0 * ne1] }
+        Self {
+            ne0,
+            ne1,
+            data: vec![0.0; ne0 * ne1],
+        }
     }
 
     pub fn from_vec(ne0: usize, ne1: usize, data: Vec<f32>) -> Self {
-        assert_eq!(data.len(), ne0 * ne1, "Tensor2 data length must be ne0 * ne1");
+        assert_eq!(
+            data.len(),
+            ne0 * ne1,
+            "Tensor2 data length must be ne0 * ne1"
+        );
         Self { ne0, ne1, data }
     }
 
@@ -74,13 +82,13 @@ pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
 /// **Activations go through Q8_K first**, because that is what ggml does before a K-quant
 /// dot and the oracle is ggml's output. An f32 reference is 0.6 % away from it (measured;
 /// see `quantize_row_q8_k_roundtrip`) and would force every gate below to open to 1e-1.
-pub fn matmul_q(
-    gguf: &Gguf,
-    w: &TensorInfo,
-    x: &Tensor2,
-) -> Result<Tensor2, crate::ModelError> {
+pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, crate::ModelError> {
     let k = w.dims[0] as usize;
-    let n = if w.dims.len() > 1 { w.dims[1] as usize } else { 1 };
+    let n = if w.dims.len() > 1 {
+        w.dims[1] as usize
+    } else {
+        1
+    };
     if x.ne0 != k {
         return Err(crate::ModelError::Shape {
             what: "matmul_q input",

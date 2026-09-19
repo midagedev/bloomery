@@ -59,7 +59,10 @@ fn hw_matmul_q_matches_ggml() {
     // Occurrence 0 is the one this produces; asking by name alone would compare the wrong one.
     let (want, winf) = o.load("q-0", 0);
     assert_eq!([got.ne0 as i64, got.ne1 as i64], [winf.ne[0], winf.ne[1]]);
-    assert_eq!(winf.op, "MUL_MAT", "occurrence 0 of q-0 must be the matmul, not the concat");
+    assert_eq!(
+        winf.op, "MUL_MAT",
+        "occurrence 0 of q-0 must be the matmul, not the concat"
+    );
     // 1e-4 on values that reach 18: the residual is f32 accumulation order against ggml's
     // integer sum, measured at 1.5e-5. Before activations went through Q8_K it was 1.2e-1.
     oracle::assert_close(&got.data, &want, 1e-4, "matmul_q -> q-0");
