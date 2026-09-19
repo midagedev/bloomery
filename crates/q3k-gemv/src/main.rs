@@ -45,50 +45,59 @@ mod kernels {
     /// against u32 word (k/4) of the q8_1 activation, with the sub-block
     /// scale (16 weights = one field-group of the word) applied per dp4a.
 
-    /// Quantize f32 activations to q8_1: per 32-value block, d = amax/127 and
-    /// int8 q = round(x/d). One warp per block; the 32 lanes pack their bytes
-    /// into 8 u32 words with two shuffle_downs so the gemv reads whole words.
+    /// Quantize f32 activations to q8_1: per 128-value block, d = amax/127 and
+    /// int8 q = round(x/d). One warp per block; each lane quantizes its four
+    /// consecutive values and writes them as one packed u32 word, so the gemv
+    /// reads whole words. A 128-value block is one Q3_K half super-block, the
+    /// exact span a gemv lane's four fields cover in one step: all four dp4a
+    /// share this block's scale, so they chain in int behind ONE f32 FMA
+    /// instead of one scale load + FMA per field.
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(
         domain = 1,
         block = (32, 1, 1),
-        requires = (x.len() >= m_cols * 2048, q.len() >= m_cols * 512, d8.len() >= m_cols * 64)
+        requires = (x.len() >= m_cols * 2048, q.len() >= m_cols * 512, d8.len() >= m_cols * 16)
     )]
     pub fn q3k_quantize_q8_1(x: &[f32], m_cols: u32, mut q: DisjointSlice<u32>, mut d8: DisjointSlice<f32>) {
-        // One 32-thread block per 32-value quant block: blk is the BLOCK
+        // One 32-thread block per 128-value quant block: blk is the BLOCK
         // index (global tid / 32), not the thread id.
         let blk = thread::index_1d().get() / 32;
-        let total = m_cols as usize * 64;
+        let total = m_cols as usize * 16;
         if blk >= total {
             return;
         }
-        let col = blk / 64;
-        let b = blk % 64;
+        let col = blk / 16;
+        let b = blk % 16;
         let lane = warp::lane_id() as usize;
 
-        let v = x[col * 2048 + 32 * b + lane];
-        let amax = warp::reduce_max_f32(v.abs());
+        // Lane covers the four consecutive values 4*lane .. 4*lane+3 of the
+        // block; the warp max over the four per-lane maxima is the block
+        // amax (no cross-lane byte packing needed, unlike the 32-value
+        // geometry where one value per lane forced two shuffle_downs).
+        let base = col * 2048 + 128 * b + 4 * lane;
+        let v0 = x[base];
+        let v1 = x[base + 1];
+        let v2 = x[base + 2];
+        let v3 = x[base + 3];
+        let amax = warp::reduce_max_f32(
+            v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()),
+        );
         let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let qv = (v / d).round().clamp(-127.0, 127.0);
-        let byte = (qv as i32 as u32) & 0xff;
-
-        // Pack lane bytes into u32 words: lane 4g ends up holding bytes
-        // 4g..4g+3 of the block. Out-of-range shuffle lanes keep their own
-        // value; only lanes with lane%4==0 store.
-        let pair = byte | (warp::shuffle_down(byte, 1) << 8);
-        let quad = pair | (warp::shuffle_down(pair, 2) << 16);
-        if lane % 4 == 0 {
-            // SAFETY: lanes with lane%4==0 write disjoint words
-            // col*512 + 8*b + lane/4; q holds m_cols*512 words.
-            unsafe {
-                *q.get_unchecked_mut(col * 512 + 8 * b + lane / 4) = quad;
-            }
+        let q0 = ((v0 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+        let q1 = ((v1 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+        let q2 = ((v2 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+        let q3 = ((v3 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+        let word = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+        // SAFETY: lane L writes word col*512 + 32*b + L; q holds
+        // m_cols*512 words and a block's lanes write disjoint words.
+        unsafe {
+            *q.get_unchecked_mut(col * 512 + 32 * b + lane) = word;
         }
         if lane == 0 {
             // SAFETY: lane 0 of each warp writes its own d8 slot.
             unsafe {
-                *d8.get_unchecked_mut(col * 64 + b) = d;
+                *d8.get_unchecked_mut(col * 16 + b) = d;
             }
         }
     }
@@ -104,9 +113,13 @@ mod kernels {
     /// are contiguous runs. Odd super-blocks sit 2 mod 4, so every word is
     /// assembled from two aligned u32 loads with a 16-bit funnel select.
     /// Each (word, field) quad is dequantized in registers with SWAR byte
-    /// arithmetic (vi = vil - 4*(1-hbit) as signed bytes), dotted with one
-    /// u32 of q8_1 x via dp4a, scaled by the 6-bit sub-block scale and the
-    /// q8_1 block scale in f32, and reduced with a warp shuffle sum.
+    /// arithmetic (vi = vil - 4*(1-hbit) as signed bytes) and dotted with one
+    /// u32 of q8_1 x via dp4a. The q8_1 block is the 128-value half
+    /// super-block, the exact span of a lane's four fields (round 3): per
+    /// column the four dp4a results are multiplied by their 6-bit sub-block
+    /// scales and summed in int, then ONE f32 FMA applies the shared q8_1
+    /// scale and the super-block scale (round 2 loaded d8 and multiplied
+    /// per field: the structural M=8 cost). Reduced with a warp shuffle sum.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -115,7 +128,7 @@ mod kernels {
         requires = (
             w.len() >= n_rows * 220,
             q.len() >= m_cols * 512,
-            d8.len() >= m_cols * 64,
+            d8.len() >= m_cols * 16,
             y.len() >= n_rows * m_cols
         )
     )]
@@ -141,7 +154,7 @@ mod kernels {
         let half = lane >> 4; // 0: even super-block, 1: odd
         let s0 = 8 * (w16 >> 3) + ((w16 & 7) >> 2); // first sub-block index
         let u_base = 32 * (w16 >> 3) + (w16 & 7); // u-word base, +8 per field
-        let d8_base = 4 * (w16 >> 3); // d8 block base, +1 per field
+        let d8_base = w16 >> 3; // half super-block = one 128-value q8_1 block
 
         // Scalar accumulators: a runtime c would put an array in local
         // memory; m is launch-uniform so guarded scalars stay in registers.
@@ -241,99 +254,79 @@ mod kernels {
 
             // u-word base for this word (column 0): 64 words per super-block.
             let uw = 64 * sbp + u_base;
-            let d8b = 8 * sbp + d8_base;
+            // d8 base for this lane (column 0): two 128-value q8_1 blocks
+            // per super-block, this lane's fields all sit in block
+            // 2*sbp + d8_base of the column.
+            let d8b = 2 * sbp + d8_base;
 
-            // Column 0 (always active). Each field j has its own q8_1 block
-            // (u-words step by 8 = one block), so its d8 scale too.
+            // Column 0 (always active). The lane's four fields share one
+            // q8_1 block: int chain (dp4a x sub-block scale), one FMA with
+            // the shared block scale and the super-block scale.
             {
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f0 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f0 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f0 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f0 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f0 += (a as f32) * (d8[d8b] * drow);
             }
             if m > 1 {
                 // Columns 1..7 (launch-uniform guard, no divergence). Same
                 // shape as column 0 with the per-column q/d8 offsets.
                 let mut uw = uw + 512;
-                let mut d8b = d8b + 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f1 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f1 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f1 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f1 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                let mut d8b = d8b + 16;
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f1 += (a as f32) * (d8[d8b] * drow);
 
                 uw += 512;
-                d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f2 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f2 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f2 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f2 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                d8b += 16;
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f2 += (a as f32) * (d8[d8b] * drow);
 
                 uw += 512;
-                d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f3 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f3 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f3 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f3 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                d8b += 16;
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f3 += (a as f32) * (d8[d8b] * drow);
 
                 uw += 512;
-                d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f4 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f4 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f4 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f4 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                d8b += 16;
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f4 += (a as f32) * (d8[d8b] * drow);
 
                 uw += 512;
-                d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f5 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f5 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f5 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f5 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                d8b += 16;
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f5 += (a as f32) * (d8[d8b] * drow);
 
                 uw += 512;
-                d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f6 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f6 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f6 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f6 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                d8b += 16;
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f6 += (a as f32) * (d8[d8b] * drow);
 
                 uw += 512;
-                d8b += 64;
-                let u0 = q[uw];
-                let u1 = q[uw + 8];
-                let u2 = q[uw + 16];
-                let u3 = q[uw + 24];
-                f7 += (dp4a_s32(vi0, u0, 0) * sc0) as f32 * (d8[d8b] * drow);
-                f7 += (dp4a_s32(vi1, u1, 0) * sc1) as f32 * (d8[d8b + 1] * drow);
-                f7 += (dp4a_s32(vi2, u2, 0) * sc2) as f32 * (d8[d8b + 2] * drow);
-                f7 += (dp4a_s32(vi3, u3, 0) * sc3) as f32 * (d8[d8b + 3] * drow);
+                d8b += 16;
+                let a = dp4a_s32(vi0, q[uw], 0) * sc0
+                    + dp4a_s32(vi1, q[uw + 8], 0) * sc1
+                    + dp4a_s32(vi2, q[uw + 16], 0) * sc2
+                    + dp4a_s32(vi3, q[uw + 24], 0) * sc3;
+                f7 += (a as f32) * (d8[d8b] * drow);
             }
 
             it += 1;
@@ -425,10 +418,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for sh in &shapes {
         let x_dev = if sh.m == 1 { &x1_dev } else { &x8_dev };
         let mut q_dev = DeviceBuffer::<u32>::zeroed(&stream, sh.m * 512)?;
-        let mut d8_dev = DeviceBuffer::<f32>::zeroed(&stream, sh.m * 64)?;
+        let mut d8_dev = DeviceBuffer::<f32>::zeroed(&stream, sh.m * 16)?;
         let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, sh.n * sh.m)?;
         let prep_q = module.prepare_q3k_quantize_q8_1(LaunchConfig1D::new(
-            64 * sh.m as u32,
+            16 * sh.m as u32,
             32,
             0,
         ))?;
