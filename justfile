@@ -96,6 +96,11 @@ gate-kv:
 gate-profile:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1'
 
+# 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
+# hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다.
+gate-threads:
+    ./tools/box.sh 'cargo test --release -p bloomery-threads --test pool -- --include-ignored --nocapture'
+
 # 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
 gate-prompts:
     ./tools/box.sh 'cargo test --release -p bloomery-model --test prompts -- --ignored --nocapture'
