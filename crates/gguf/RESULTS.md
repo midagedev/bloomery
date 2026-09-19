@@ -3,7 +3,7 @@
 GGUF v3 loader + scalar reference dequantizer for the six ggml types the
 model actually carries, gated against ggml itself (`to_float` from the
 vendored ik_llama.cpp build). Everything below was produced on the box
-through `tools/box.sh`; `MULLE_DATA=/root/mulle-data-s1-loader`.
+through `tools/box.sh`; `BLOOMERY_DATA=/root/bloomery-data-s1-loader`.
 
 ## Gate: how to run
 
@@ -13,12 +13,12 @@ therefore `#[ignore]`d and run with plain cargo. From the repo root on the
 Mac:
 
     ./tools/box.sh 'bash tools/ref/build-dequant.sh'
-    ./tools/box.sh '"$MULLE_DATA/bin/dequant_ref"'
+    ./tools/box.sh '"$BLOOMERY_DATA/bin/dequant_ref"'
     ./tools/box.sh 'cargo test -p gguf -- --ignored --nocapture'
 
 The first command builds `tools/ref/dequant_ref.cpp` against
-`$IK/ggml` and installs it to `$MULLE_DATA/bin/dequant_ref`; the second
-dumps `$MULLE_DATA/ref/{manifest.txt,<type>.raw,<type>.meta}`; the third
+`$IK/ggml` and installs it to `$BLOOMERY_DATA/bin/dequant_ref`; the second
+dumps `$BLOOMERY_DATA/ref/{manifest.txt,<type>.raw,<type>.meta}`; the third
 runs `hw_coverage` and `hw_dequant_matches_ggml`. If nextest lands on the
 box later, the names already carry the `hw_` prefix the `hw` profile
 expects (`cargo nextest run -p gguf --profile hw`).

@@ -11,7 +11,7 @@
 //! fork trait) — identified and matched inside `matmul_q` during this round; the
 //! gate constants below carry the measured derivation and the FAIL-first history.
 //!
-//! `hw_` prefix: needs the box, the model file and `$MULLE_DATA/ref`.
+//! `hw_` prefix: needs the box, the model file and `$BLOOMERY_DATA/ref`.
 #[path = "common/oracle.rs"]
 mod oracle;
 
@@ -19,7 +19,7 @@ use model::head::head;
 use model::ops::{Tensor2, rms_norm};
 
 fn model_path() -> String {
-    std::env::var("MULLE_MODEL")
+    std::env::var("BLOOMERY_MODEL")
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
 }
 
@@ -108,7 +108,7 @@ fn top5(v: &[f32]) -> Vec<(usize, f32)> {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_head_matches_oracle() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();
@@ -190,7 +190,7 @@ fn hw_head_matches_oracle() {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_head_batch_is_column_independent() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();

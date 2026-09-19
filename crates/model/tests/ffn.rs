@@ -9,7 +9,7 @@ use model::ffn::{dense_ffn, dense_ffn_up_gate};
 use model::ops::Tensor2;
 
 fn model_path() -> String {
-    std::env::var("MULLE_MODEL")
+    std::env::var("BLOOMERY_MODEL")
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
 }
 // NOTE: `model_path` duplicates `tests/ops.rs` on purpose — integration tests are
@@ -34,7 +34,7 @@ fn check_tokens(o: &oracle::Oracle) {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_dense_ffn_block0_matches_ggml() {
     let o = oracle::Oracle::open();
     check_tokens(&o);
@@ -83,7 +83,7 @@ fn hw_dense_ffn_block0_matches_ggml() {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_dense_ffn_shexp_block1_matches_ggml() {
     let o = oracle::Oracle::open();
     check_tokens(&o);

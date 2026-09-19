@@ -1,8 +1,8 @@
-// q3k_ref.cpp — reference harness for mulle stage 0 (MUL-9 adds Q4_K/Q6_K).
+// q3k_ref.cpp — reference harness for bloomery stage 0 (MUL-9 adds Q4_K/Q6_K).
 //
 // Opens the DeepSeek-V2-Lite-Chat Q3_K_M GGUF, extracts the tensors below,
-// writes raw bytes + f32 activations to $MULLE_DATA/ (default
-// /root/mulle-data), computes CPU reference outputs by dequantizing with
+// writes raw bytes + f32 activations to $BLOOMERY_DATA/ (default
+// /root/bloomery-data), computes CPU reference outputs by dequantizing with
 // ggml_internal_get_type_traits(<type>)->to_float and plain f32 dots, then
 // times ggml's CUDA mul_mat on every shape and compares.
 //
@@ -19,7 +19,7 @@
 // about M alone. The existing rows and their names are untouched; k1 is a new
 // row (x_m8's first column), NOT the existing *_m1 (a different draw).
 //
-// The timing loop also dumps every case's µs to $MULLE_DATA/ggml_timings.txt
+// The timing loop also dumps every case's µs to $BLOOMERY_DATA/ggml_timings.txt
 // (truncated each run) so the rust binary can anchor its ratio gate to ggml's
 // own ratio from the SAME measure.sh invocation.
 //
@@ -46,7 +46,7 @@
 
 static const char * kTensorName = "blk.1.ffn_gate_exps.weight";
 static const char * kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
-static const char * kDataDir = getenv("MULLE_DATA") ? getenv("MULLE_DATA") : "/root/mulle-data";
+static const char * kDataDir = getenv("BLOOMERY_DATA") ? getenv("BLOOMERY_DATA") : "/root/bloomery-data";
 
 static void fail(const std::string & msg) {
     std::fprintf(stderr, "q3k_ref FATAL: %s\n", msg.c_str());

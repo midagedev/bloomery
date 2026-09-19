@@ -1,4 +1,4 @@
-# mulle stage 0 — Q3_K gemv: mulle (cuda-oxide Rust) vs ggml mmvq
+# bloomery stage 0 — Q3_K gemv: bloomery (cuda-oxide Rust) vs ggml mmvq
 
 One `tools/box.sh` invocation, 2026-09-19: `tools/ref` harness (ggml) then the
 rust kernel back-to-back, same card (RTX 3090), same minute. Tensor
@@ -11,13 +11,13 @@ truth = CPU f32 dots of ggml's own `dequantize_row_q3_K`.
 | engine | shape | M | µs/launch | GB/s | max rel err | GB/s ratio rust/ggml |
 |---|---|---|---|---|---|---|
 | ggml mmvq  | expert0 | 1 | 10.428  | 118.8 | 4.155e-3 | — |
-| mulle rust | expert0 | 1 | 30.626  | 40.5  | 1.385e-6 | 0.34 |
+| bloomery rust | expert0 | 1 | 30.626  | 40.5  | 1.385e-6 | 0.34 |
 | ggml mmvq  | expert0 | 8 | 16.141  | 76.8  | 3.698e-3 | — |
-| mulle rust | expert0 | 8 | 218.280 | 5.7   | 1.295e-6 | 0.07 |
+| bloomery rust | expert0 | 8 | 218.280 | 5.7   | 1.295e-6 | 0.07 |
 | ggml mmvq  | stack   | 1 | 238.293 | 332.8 | 4.341e-3 | — |
-| mulle rust | stack   | 1 | 1218.965| 65.1  | 1.491e-6 | **0.20** |
+| bloomery rust | stack   | 1 | 1218.965| 65.1  | 1.491e-6 | **0.20** |
 | ggml mmvq  | stack   | 8 | 474.368 | 167.2 | 5.206e-3 | — |
-| mulle rust | stack   | 8 | 9208.457| 8.6   | 1.616e-6 | **0.05** |
+| bloomery rust | stack   | 8 | 9208.457| 8.6   | 1.616e-6 | **0.05** |
 
 - **Accuracy gate (max rel err ≤ 1e-4): PASS** on all four shapes — rust lands
   at 1.3–1.6e-6 (the decode is the exact ggml port in f32). ggml's 3.7–5.2e-3
@@ -83,7 +83,7 @@ NVIDIA RTX A6000, 38742 MiB, 100 %, 297.09 W
 some avg10=0.00 avg60=0.00 avg300=0.25 total=1040666662
 full avg10=0.00 avg60=0.00 avg300=0.25 total=1038041871
 
-[witness before mulle timing]
+[witness before bloomery timing]
 name, memory.used [MiB], utilization.gpu [%], power.draw [W]
 NVIDIA GeForce RTX 3090, 344 MiB, 3 %, 36.98 W
 NVIDIA RTX A6000, 38742 MiB, 100 %, 297.80 W
@@ -91,7 +91,7 @@ NVIDIA RTX A6000, 38742 MiB, 100 %, 297.80 W
 some avg10=0.00 avg60=0.00 avg300=0.24 total=1040669465
 full avg10=0.00 avg60=0.00 avg300=0.24 total=1038044674
 
-[witness after mulle timing]
+[witness after bloomery timing]
 name, memory.used [MiB], utilization.gpu [%], power.draw [W]
 NVIDIA GeForce RTX 3090, 344 MiB, 100 %, 219.15 W
 NVIDIA RTX A6000, 38742 MiB, 100 %, 296.13 W
@@ -104,7 +104,7 @@ full avg10=0.00 avg60=0.00 avg300=0.24 total=1038045014
 
 ```
 tools/ref/build.sh                       # g++ -O3 -std=c++17 vs ik libggml (CUDA baked in)
-/root/mulle-data/q3k_ref                 # writes /root/mulle-data + times ggml
+/root/bloomery-data/q3k_ref                 # writes /root/bloomery-data + times ggml
 cd crates/q3k-gemv && cargo oxide run q3k_gemv --arch sm_86 --unchecked-indexing
 cd crates/q3k-gemv && cargo oxide inspect q3k_gemv --arch sm_86 | grep -E "^\.(target|version)"
   → .version 7.1

@@ -1,4 +1,4 @@
-# mistral.rs prior art — what it does, and what mulle should take from it
+# mistral.rs prior art — what it does, and what bloomery should take from it
 
 Date: 2026-09-19. Upstream: `EricLBuehler/mistral.rs`, branch `master` at
 `d5ae0f18` (last push 2026-09-08, i.e. the tree has been still for 11 days).
@@ -11,7 +11,7 @@ built, nothing run. Every code claim carries a path and a line; the few
 unsourced judgements are marked `[impression]`.
 
 One-line verdict: mistral.rs is a serving product with an engine inside it,
-while mulle is an engine with serving attached later. Its GGUF/CUDA stack is
+while bloomery is an engine with serving attached later. Its GGUF/CUDA stack is
 serious prior art (llama.cpp-adapted fused kernels, per-arch GGUF bindings);
 its CPU-offload MoE path is structurally broken on x86_64 in exactly the way
 our measurements show. Copy the kernel strategy and the binding-table idea;
@@ -491,16 +491,16 @@ on `Sequence`s, compute wants them batched on the pipeline. (The older
 and is still live in 12 files: all of `xlora_models/*` and the llava
 `vision_models`, per repo code search.)
 
-## 7. What mulle should copy, and what it should refuse
+## 7. What bloomery should copy, and what it should refuse
 
 Licenses first, as specified. mistral.rs: **MIT**, `Copyright (c) 2024 Eric
 Buehler` (root `LICENSE`, 1068 bytes: "MIT License … Permission is hereby
-granted …"). mulle: **MIT**, `Copyright (c) 2026 midagedev` (root `LICENSE`).
+granted …"). bloomery: **MIT**, `Copyright (c) 2026 midagedev` (root `LICENSE`).
 MIT-to-MIT copying requires preserving the upstream copyright + permission
 notice in the copies — that is the whole attribution burden. (Their CUDA
 kernels adapted from llama.cpp inherit llama.cpp's MIT the same way.)
 
-### Copy (idea only — mulle's kernels are hand-written and faster; do not paste)
+### Copy (idea only — bloomery's kernels are hand-written and faster; do not paste)
 
 1. Resolve the GGUF/HF duality once at the weight-source boundary so model code never branches on container (`pipeline/gguf.rs:672-729`: `GgufWeightSource` → shared `NormalLoader`).
 2. Express composite weight layouts (stacked experts, split MLA `kv_b`, fused QKV) as a small lazy binding algebra rather than load-time special cases (`weight_source.rs:392-462`).
@@ -510,7 +510,7 @@ kernels adapted from llama.cpp inherit llama.cpp's MIT the same way.)
 
 ### Refuse
 
-1. Refuse layer-granular placement as the only address space — mulle's stage 2 needs per-tensor (expert) placement, which their `DeviceMapper` trait cannot express (`mappers.rs:9-26`).
+1. Refuse layer-granular placement as the only address space — bloomery's stage 2 needs per-tensor (expert) placement, which their `DeviceMapper` trait cannot express (`mappers.rs:9-26`).
 2. Refuse a single global dtype for mixed-device execution — per-(device, path) kernel dtype requirements must be decided where the kernel is chosen, not probed once at startup (`utils/normal.rs:121-169` vs `gguf/cpu.rs:75`).
 3. Refuse `Mutex<dyn Trait>` + `Box<dyn Any>` on the token path — one engine, one model, monomorphized dispatch (`engine/mod.rs:200-207`, `pipeline/mod.rs:1782`).
 4. Refuse per-step cache clone-in/clone-out — caches should live where compute consumes them, appended in place (`kv_cache/mod.rs:486-560`, `:634+`).
@@ -532,7 +532,7 @@ kernels adapted from llama.cpp inherit llama.cpp's MIT the same way.)
   `master` HEAD (compare: `identical`, 0 commits ahead/behind), and the
   touched file was last changed 2026-07-07 (#2311). It still applies cleanly.
 
-## What I would put in mulle's stage-1 spec because of this
+## What I would put in bloomery's stage-1 spec because of this
 
 1. Give every tensor a (device, dtype) address at load time — never a per-layer device plus a global dtype.
 2. Put each model's tensor-name table and forward in one file, with shared tables for names, not per-arch match arms across registry files.

@@ -17,13 +17,13 @@ impossible and would be a red flag; the ~4e-3 below is expected.
 | engine | shape | M | us/launch | GB/s | max rel err | rust/ggml (GB/s) |
 |---|---|---|---|---|---|---|
 | ggml mmvq | expert0 | 1 | 10.43 | 118.81 | 4.361e-03 | — |
-| mulle rust | expert0 | 1 | 8.36 | 148.21 | 4.316e-03 | 1.25 |
+| bloomery rust | expert0 | 1 | 8.36 | 148.21 | 4.316e-03 | 1.25 |
 | ggml mmvq | expert0 | 8 | 16.13 | 76.83 | 4.429e-03 | — |
-| mulle rust | expert0 | 8 | 19.47 | 63.65 | 4.432e-03 | 0.83 |
+| bloomery rust | expert0 | 8 | 19.47 | 63.65 | 4.432e-03 | 0.83 |
 | ggml mmvq | stack | 1 | 238.36 | 332.68 | 4.119e-03 | — |
-| mulle rust | stack | 1 | 261.00 | 303.83 | 4.158e-03 | **0.91** |
+| bloomery rust | stack | 1 | 261.00 | 303.83 | 4.158e-03 | **0.91** |
 | ggml mmvq | stack | 8 | 473.28 | 167.55 | 3.928e-03 | — |
-| mulle rust | stack | 8 | 609.82 | 130.04 | 3.868e-03 | **0.78** |
+| bloomery rust | stack | 8 | 609.82 | 130.04 | 3.868e-03 | **0.78** |
 
 - Performance gate (`stack` M=1 >= 0.9x ggml in the same run): **PASS** at
   0.91x (303.83 / 332.68). Gate cleared at optimisation step 1, so tuning

@@ -12,13 +12,13 @@ round-2 winner on `main` (q8_1 + dp4a, warp-per-row, funnel loads).
 | engine | shape | N | M | us | GB/s | max rel err | rust/ggml (GB/s) |
 |---|---|---|---|---|---|---|---|
 | ggml mmvq | expert0 | 1408 | 1 | 10.45 | 118.61 | 4.361e-03 | — |
-| mulle rust | expert0 | 1408 | 1 | 7.48 | 165.59 | 4.316e-3 | 1.396 |
+| bloomery rust | expert0 | 1408 | 1 | 7.48 | 165.59 | 4.316e-3 | 1.396 |
 | ggml mmvq | expert0 | 1408 | 8 | 16.13 | 76.80 | 4.429e-03 | — |
-| mulle rust | expert0 | 1408 | 8 | 18.16 | 68.24 | 4.432e-3 | 0.889 |
+| bloomery rust | expert0 | 1408 | 8 | 18.16 | 68.24 | 4.432e-3 | 0.889 |
 | ggml mmvq | stack | 90112 | 1 | 238.93 | 331.89 | 4.119e-03 | — |
-| mulle rust | stack | 90112 | 1 | 151.78 | 522.47 | 4.158e-3 | 1.574 |
+| bloomery rust | stack | 90112 | 1 | 151.78 | 522.47 | 4.158e-3 | 1.574 |
 | ggml mmvq | stack | 90112 | 8 | 474.05 | 167.28 | 3.928e-03 | — |
-| mulle rust | stack | 90112 | 8 | 480.39 | 165.07 | 3.868e-3 | 0.987 |
+| bloomery rust | stack | 90112 | 8 | 480.39 | 165.07 | 3.868e-3 | 0.987 |
 
 **Gates, same run: stack M=8 0.987x (>= 0.9x) PASS, stack M=1 1.574x (>= 1.0x)
 PASS.** Accuracy gate (<= 1e-2, q8_1 design): PASS on all four shapes, same

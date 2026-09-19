@@ -1,7 +1,7 @@
 // dump_ref — write ik_llama.cpp's intermediate forward-pass tensors to disk as raw f32.
 //
 // This is the oracle boundary for stage 1. Every round from 1-2 on compares its own
-// forward pass against files this tool writes; the gate reads $MULLE_DATA/ref/.
+// forward pass against files this tool writes; the gate reads $BLOOMERY_DATA/ref/.
 //
 // Why this exists when llama-eval-callback already prints tensors: it prints a TEXT
 // SUMMARY — three values, an ellipsis, three values, and a sum (measured on the box
@@ -20,7 +20,7 @@
 // Quantized tensors are skipped (there is no f32 to write); the manifest records the skip
 // so a missing file is never mistaken for a tensor that did not run.
 //
-// Build: tools/ref/build-dump.sh   Run: $MULLE_DATA/bin/dump_ref -m <gguf> --tokens 1,2,3
+// Build: tools/ref/build-dump.sh   Run: $BLOOMERY_DATA/bin/dump_ref -m <gguf> --tokens 1,2,3
 
 #include "common.h"
 #include "llama.h"
@@ -113,7 +113,7 @@ static int on_tensor(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     fclose(f);
 
-    // ne[] in ggml order, verbatim — mulle's tensors carry the same order by decision
+    // ne[] in ggml order, verbatim — bloomery's tensors carry the same order by decision
     // (docs/plan.md), so a shape mismatch in the gate is a real mismatch, not a convention.
     fprintf(d->manifest, "tensor\t%s\t%d\t%s\t%lld\t%lld\t%lld\t%lld\t%zu\t%.6f\t%s\n",
             t->name, occurrence, ggml_type_name(t->type),
@@ -157,23 +157,23 @@ int main(int argc, char ** argv) {
     // "never run dump_ref yourself" and the spec was not the right place for that rule --
     // the round was not reaching for the dumper, it was reaching for the one binary that
     // links ik and takes --tokens. So the rule lives here instead, where it cannot be
-    // missed: without MULLE_REF_WRITE=1 this tool refuses to write anything.
-    if (!getenv("MULLE_REF_WRITE")) {
+    // missed: without BLOOMERY_REF_WRITE=1 this tool refuses to write anything.
+    if (!getenv("BLOOMERY_REF_WRITE")) {
         fprintf(stderr,
                 "dump_ref: refusing to run -- this tool OVERWRITES the oracle reference set,\n"
                 "          which every gate in this repo reads. It is not a general ik harness.\n"
                 "          The lead regenerates the set with `just dump-ref`, which sets\n"
-                "          MULLE_REF_WRITE=1 and stages the output so a failed run keeps the\n"
+                "          BLOOMERY_REF_WRITE=1 and stages the output so a failed run keeps the\n"
                 "          old set. If you want to inspect ik's kernels under a debugger, use\n"
                 "          llama-cli or llama-eval-callback -- not this.\n");
         return 3;
     }
 
-    const char * data_dir = getenv("MULLE_DATA");
-    const char * ref_dir  = getenv("MULLE_REF_DIR");
+    const char * data_dir = getenv("BLOOMERY_DATA");
+    const char * ref_dir  = getenv("BLOOMERY_REF_DIR");
     dump_ctx d;
     d.dir = ref_dir ? std::string(ref_dir)
-                    : std::string(data_dir ? data_dir : "/root/mulle-data") + "/ref";
+                    : std::string(data_dir ? data_dir : "/root/bloomery-data") + "/ref";
     mkdir(d.dir.c_str(), 0755);
 
     // The manifest is written to a .partial name and renamed only after the decode
@@ -189,7 +189,7 @@ int main(int argc, char ** argv) {
     }
     fprintf(d.manifest, "# dump_ref — ik_llama.cpp intermediate tensors, raw f32, little-endian\n");
     fprintf(d.manifest, "# model\t%s\n", params.model.c_str());
-    if (const char * b = getenv("MULLE_REF_BUILD")) {
+    if (const char * b = getenv("BLOOMERY_REF_BUILD")) {
         // Which ik build produced this set. The reference IS that build's output, so a
         // set whose build is unknown cannot be reasoned about after the fact.
         fprintf(d.manifest, "# build\t%s\n", b);

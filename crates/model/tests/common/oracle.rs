@@ -28,9 +28,9 @@ pub struct Oracle {
 }
 
 impl Oracle {
-    /// Loads `$MULLE_DATA/ref/MANIFEST.tsv`.
+    /// Loads `$BLOOMERY_DATA/ref/MANIFEST.tsv`.
     pub fn open() -> Oracle {
-        let base = std::env::var("MULLE_DATA").unwrap_or_else(|_| "/root/mulle-data".into());
+        let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
         let dir = PathBuf::from(base).join("ref");
         let manifest = dir.join("MANIFEST.tsv");
         let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {

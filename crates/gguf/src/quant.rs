@@ -70,7 +70,7 @@ impl GgmlType {
 
     /// `ggml_type_name` string (type_traits table, ggml.c:620 — entries at
     /// ggml.c:657/667/756/777/912/938/998). Used to name the oracle dumps
-    /// `$MULLE_DATA/ref/<name>.raw`.
+    /// `$BLOOMERY_DATA/ref/<name>.raw`.
     pub fn name(self) -> Option<&'static str> {
         match self {
             GgmlType::F32 => Some("f32"),

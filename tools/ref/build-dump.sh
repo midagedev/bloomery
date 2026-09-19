@@ -3,8 +3,8 @@
 # The runner rsyncs this tree with --delete, so the binary lives outside it.
 set -euo pipefail
 : "${IK:=/home/user/ik_llama.cpp}"
-MULLE_DATA=${MULLE_DATA:-/root/mulle-data}
-OUT=${DUMP_OUT:-$MULLE_DATA/bin}
+BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+OUT=${DUMP_OUT:-$BLOOMERY_DATA/bin}
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 mkdir -p "$OUT"
 g++ -std=c++17 -O2 -o "$OUT/dump_ref" "$HERE/tools/ref/dump_ref.cpp" \

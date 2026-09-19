@@ -33,12 +33,12 @@ witness() {
 }
 
 bash tools/ref/build.sh
-export MULLE_DATA=${MULLE_DATA:-/root/mulle-data}
-mkdir -p "$MULLE_DATA"
+export BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+mkdir -p "$BLOOMERY_DATA"
 
 wait_gpu
 witness pre-ref
-"$MULLE_DATA/bin/q3k_ref"
+"$BLOOMERY_DATA/bin/q3k_ref"
 witness post-ref
 
 wait_gpu

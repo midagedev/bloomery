@@ -1,4 +1,4 @@
-# mulle — agent context
+# bloomery — agent context
 
 @AGENTS.md
 

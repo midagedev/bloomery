@@ -1,7 +1,7 @@
 //! DeepSeek-V2-Lite forward pass — the stage-1 model crate.
 //!
 //! The module boundaries here are the parallel work boundaries: each of `attn`, `ffn`,
-//! `moe` and `head` is written and gated against `$MULLE_DATA/ref/` independently, and
+//! `moe` and `head` is written and gated against `$BLOOMERY_DATA/ref/` independently, and
 //! `forward` in this file only wires them. Nothing reads another module's output during
 //! development, because the oracle already holds every intermediate (see `docs/oracle.md`).
 //!

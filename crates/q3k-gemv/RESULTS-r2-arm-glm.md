@@ -38,13 +38,13 @@ Kernel shape (both kernels in `src/main.rs`):
 | engine | shape | N | M | µs | GB/s | max rel err | rust/ggml (GB/s) |
 |---|---|---|---|---|---|---|---|
 | ggml mmvq | expert0 | 1408 | 1 | 10.43 | 118.82 | 4.361e-03 | — |
-| mulle rust | expert0 | 1408 | 1 | 9.00 | **137.70** | 4.316e-3 | **1.159** |
+| bloomery rust | expert0 | 1408 | 1 | 9.00 | **137.70** | 4.316e-3 | **1.159** |
 | ggml mmvq | expert0 | 1408 | 8 | 16.11 | 76.93 | 4.429e-03 | — |
-| mulle rust | expert0 | 1408 | 8 | 21.76 | 56.95 | 4.432e-3 | 0.740 |
+| bloomery rust | expert0 | 1408 | 8 | 21.76 | 56.95 | 4.432e-3 | 0.740 |
 | ggml mmvq | stack | 90112 | 1 | 238.64 | 332.30 | 4.119e-03 | — |
-| mulle rust | stack | 90112 | 1 | 227.68 | **348.29** | 4.158e-3 | **1.048** |
+| bloomery rust | stack | 90112 | 1 | 227.68 | **348.29** | 4.158e-3 | **1.048** |
 | ggml mmvq | stack | 90112 | 8 | 473.33 | 167.53 | 3.928e-03 | — |
-| mulle rust | stack | 90112 | 8 | 569.96 | 139.13 | 3.868e-3 | 0.830 |
+| bloomery rust | stack | 90112 | 8 | 569.96 | 139.13 | 3.868e-3 | 0.830 |
 
 **Gate: stack M=1 ≥ 0.9× ggml → 1.048×, PASS** (reproduced twice; an earlier
 run the same minute measured 348.27 vs 332.89 = 1.046×). M=8 is 0.83× — above

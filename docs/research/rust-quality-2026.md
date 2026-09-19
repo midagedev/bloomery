@@ -1,6 +1,6 @@
 # What a high-quality, agent-friendly Rust repo looks like in 2026
 
-Research survey for `mulle` — read before writing `AGENTS.md` and setting up tooling.
+Research survey for `bloomery` — read before writing `AGENTS.md` and setting up tooling.
 Scope: a Rust + CUDA-Rust (NVlabs/cuda-oxide) LLM inference engine; hand-written AVX2
 intrinsics on the host, `#[kernel]`/`#[cuda_module]` device code, ggml as numeric oracle,
 benchmarks that need a quiet machine.
@@ -317,7 +317,7 @@ plus "Use `cargo check` instead of `cargo build` unless artifacts are needed."
 Evidence synthesis for a repo like this one: **short (20–55 lines), prohibitions first,
 commands included or pointed at, never a README duplicate.** The highest-value lines in
 all three are the ones that prevent *irreversible or project-specific* mistakes
-(GPL contamination, unwrap policy, nightly policy) — for mulle the analogues are: build
+(GPL contamination, unwrap policy, nightly policy) — for bloomery the analogues are: build
 only via `cargo oxide` on the box through `tools/box.sh`, never plain `cargo build` for
 device crates; numbers measured-only with witness rows; Korean prose / English code
 comments (CLAUDE.md convention).

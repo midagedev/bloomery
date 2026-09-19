@@ -1,4 +1,4 @@
-// q3k_cpu_ref.cpp — CPU reference harness for mulle stage 2 pre-study (MUL-3).
+// q3k_cpu_ref.cpp — CPU reference harness for bloomery stage 2 pre-study (MUL-3).
 //
 // Stage 0's q3k_ref.cpp wrote gate.q3k (blk.1.ffn_gate_exps, Q3_K, 79.3 MB),
 // the f32 activations x_m1/x_m8 and the CPU f32 references for expert0 and
@@ -12,7 +12,7 @@
 // 50 timed iterations.
 //
 // Build: bash tools/ref/build-cpu.sh   (on the box, IK=/home/user/ik_llama.cpp)
-// Run:   $MULLE_DATA/bin/q3k_cpu_ref   (normally via tools/ref/cpu-measure.sh,
+// Run:   $BLOOMERY_DATA/bin/q3k_cpu_ref   (normally via tools/ref/cpu-measure.sh,
 //        under the machine-wide CPU lease)
 
 #include <algorithm>
@@ -29,7 +29,7 @@
 #include "ggml-backend.h"
 
 static const char * kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
-static const char * kDataDir = getenv("MULLE_DATA") ? getenv("MULLE_DATA") : "/root/mulle-data";
+static const char * kDataDir = getenv("BLOOMERY_DATA") ? getenv("BLOOMERY_DATA") : "/root/bloomery-data";
 
 static const int64_t K = 2048;
 static const int64_t N1 = 1408; // rows per expert

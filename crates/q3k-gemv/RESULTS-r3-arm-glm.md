@@ -54,13 +54,13 @@ the M=1 path only shed work — no trade-off between the two gates.
 | engine | shape | N | M | us | GB/s | max rel err | rust/ggml (GB/s) |
 |---|---|---|---|---|---|---|---|
 | ggml mmvq | expert0 | 1408 | 1 | 10.44 | 118.69 | 4.361e-03 | — |
-| mulle rust | expert0 | 1408 | 1 | 8.76 | **141.38** | 4.821e-3 | **1.191** |
+| bloomery rust | expert0 | 1408 | 1 | 8.76 | **141.38** | 4.821e-3 | **1.191** |
 | ggml mmvq | expert0 | 1408 | 8 | 16.23 | 76.32 | 4.429e-03 | — |
-| mulle rust | expert0 | 1408 | 8 | 17.39 | 71.26 | 3.844e-3 | 0.934 |
+| bloomery rust | expert0 | 1408 | 8 | 17.39 | 71.26 | 3.844e-3 | 0.934 |
 | ggml mmvq | stack | 90112 | 1 | 238.89 | 331.94 | 4.119e-03 | — |
-| mulle rust | stack | 90112 | 1 | 208.75 | **379.88** | 3.495e-3 | **1.144** |
+| bloomery rust | stack | 90112 | 1 | 208.75 | **379.88** | 3.495e-3 | **1.144** |
 | ggml mmvq | stack | 90112 | 8 | 472.65 | 167.78 | 3.928e-03 | — |
-| mulle rust | stack | 90112 | 8 | 445.55 | **177.98** | 4.558e-3 | **1.061** |
+| bloomery rust | stack | 90112 | 8 | 445.55 | **177.98** | 4.558e-3 | **1.061** |
 
 **Gates: `stack` M=8 = 1.061x ggml (>= 0.9x, PASS with 18% margin) and
 `stack` M=1 = 1.144x ggml (>= 1.0x, PASS with 14% margin), same run,

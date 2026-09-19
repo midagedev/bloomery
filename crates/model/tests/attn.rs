@@ -28,7 +28,7 @@ use model::attn::block_attn_trace;
 use model::{Slot, Tensor2};
 
 fn model_path() -> String {
-    std::env::var("MULLE_MODEL")
+    std::env::var("BLOOMERY_MODEL")
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
 }
 
@@ -203,14 +203,14 @@ fn check_block(o: &oracle::Oracle, n: usize) {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_block0_matches_ggml() {
     let o = oracle::Oracle::open();
     check_block(&o, 0);
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_block1_matches_ggml() {
     let o = oracle::Oracle::open();
     check_block(&o, 1);
@@ -221,7 +221,7 @@ fn hw_attn_block1_matches_ggml() {
 /// above honest — they are inherited from upstream `matmul_q` slack, not from anything
 /// in this crate's attention path.
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_exact_input_stages() {
     let o = oracle::Oracle::open();
     let load2 = |name: &str, occ: u32| -> Tensor2 {

@@ -3,7 +3,7 @@
 //! which experts were actually dequantized.
 //!
 //! `hw_` prefix: needs the box (the model file and the oracle set), excluded by default.
-//! Run on the box: `cd ~/repo/mulle-moe && cargo test -p model --test moe -- --ignored`.
+//! Run on the box: `cd ~/repo/bloomery-moe && cargo test -p model --test moe -- --ignored`.
 //!
 //! Two oracle quirks the router test has to live with (both verified against the files,
 //! see the module report):
@@ -22,7 +22,7 @@ use model::Tensor2;
 use model::moe;
 
 fn model_path() -> String {
-    std::env::var("MULLE_MODEL")
+    std::env::var("BLOOMERY_MODEL")
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
 }
 
@@ -33,7 +33,7 @@ fn moe_input(o: &oracle::Oracle) -> Tensor2 {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_router_exact() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();
@@ -115,7 +115,7 @@ fn hw_moe_router_exact() {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_forward_matches_ggml() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();
@@ -188,7 +188,7 @@ fn hw_moe_forward_matches_ggml() {
 /// naive version then dequantizes all 64 stacks): it fails with `distinct experts
 /// dequantized must equal distinct experts routed to (25), got 64`.
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_touches_only_routed_experts() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();

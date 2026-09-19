@@ -1,4 +1,4 @@
-//! gguf — GGUF v3 reader for mulle stage 1 (round 1-1).
+//! gguf — GGUF v3 reader for bloomery stage 1 (round 1-1).
 //!
 //! Turns a GGUF file into named, shaped, typed tensors backed by an mmap,
 //! plus the scalar reference dequantizer (`quant`) the oracle gate compares

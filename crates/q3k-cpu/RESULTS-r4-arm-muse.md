@@ -12,7 +12,7 @@ GB/s = weight bytes / time, error vs f32 dequant+dot reference.
 Shapes: `expert0` = 1408 rows / 1.24 MB, `stack` = 90112 rows / 79.3 MB,
 `big` = 360448 rows / 317.2 MB (4 tensors: blk.1/2 gate+up exps), K = 2048.
 `big.q3k` md5: extract fresh per run; `gate.q3k`/`x_m1.f32` verified
-md5-identical to the GPU harness outputs in `/root/mulle-data`
+md5-identical to the GPU harness outputs in `/root/bloomery-data`
 (1364a8ce…/8fa914ca…), i.e. the CPU harness reproduces those bytes without
 touching the 3090.
 
@@ -111,7 +111,7 @@ ablation; the final run above is the base binary.
 ## Witnesses, final run (`tools/box.sh 'bash tools/ref/cpu-measure.sh'`)
 
 ```
-[lease] waiting for /root/mulle-cpu.lock ...
+[lease] waiting for /root/bloomery-cpu.lock ...
 [lease] acquired 00:27:26Z
 --- witness pre-ref 2026-09-19T00:27:26Z ---
 loadavg: 5.07 2.95 1.85 1/1270 2659089

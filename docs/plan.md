@@ -1,4 +1,4 @@
-# mulle — 단계와 게이트
+# bloomery — 단계와 게이트
 
 이 문서는 계획이고, 숫자는 [rig-log](https://github.com/midagedev/rig-log)에 측정된 뒤에만 여기 옮겨 적는다. 통과 기준은 전부 측정으로 쓴다.
 
@@ -53,7 +53,7 @@ attn·ffn·moe·head·gemv 다섯을 한 번에 띄웠고 넷이 같은 오후�
 
 라운드 전에 리드가 정해 두는 것(정하지 않으면 세 군데서 따로 발명된다): 텐서 레이아웃은 ggml의 `ne[]`
 순서 그대로 — 비교가 전부 같은 모양이 된다. 양자 타입은 `quant` 크레이트 하나가 소유하고 CPU·GPU 커널이
-같이 쓴다. 오라클 경계는 `$MULLE_DATA/ref/`에 ik가 떨군 중간 텐서이고 게이트는 거기서 읽는다.
+같이 쓴다. 오라클 경계는 `$BLOOMERY_DATA/ref/`에 ik가 떨군 중간 텐서이고 게이트는 거기서 읽는다.
 오류 타입은 라이브러리 `thiserror`, 바이너리 경계 `anyhow`.
 
 **mistral.rs를 읽고 추가된 것** (2026-09-19, `docs/research/mistralrs-prior-art.md`). 이것들은

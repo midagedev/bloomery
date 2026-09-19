@@ -1,4 +1,4 @@
-# AGENTS.md — mulle
+# AGENTS.md — bloomery
 
 An LLM inference engine for one workstation: Rust host, CUDA-Rust kernels
 (cuda-oxide today, cutile-rs later), AVX2 kernels for the CPU expert tier.

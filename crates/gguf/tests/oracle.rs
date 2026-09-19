@@ -2,7 +2,7 @@
 //! box) and `#[ignore]`d: `cargo nextest` is not installed on the box
 //! (checked 2026-09-19), so run them with
 //! `cargo test -p gguf -- --ignored --nocapture` via `tools/box.sh`, after
-//! `bash tools/ref/build-dequant.sh && $MULLE_DATA/bin/dequant_ref`.
+//! `bash tools/ref/build-dequant.sh && $BLOOMERY_DATA/bin/dequant_ref`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -14,7 +14,7 @@ const MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
 
 fn data_dir() -> PathBuf {
     PathBuf::from(
-        std::env::var("MULLE_DATA").expect("MULLE_DATA must be set (run via tools/box.sh)"),
+        std::env::var("BLOOMERY_DATA").expect("BLOOMERY_DATA must be set (run via tools/box.sh)"),
     )
 }
 
@@ -22,7 +22,7 @@ fn data_dir() -> PathBuf {
 /// in-bounds slice; the type set and per-type counts equal the oracle's
 /// manifest; names are unique; the stage-1 hyperparameter keys are present.
 #[test]
-#[ignore = "hw: needs the model on the box plus the oracle dump in $MULLE_DATA"]
+#[ignore = "hw: needs the model on the box plus the oracle dump in $BLOOMERY_DATA"]
 fn hw_coverage() {
     let g = Gguf::open(MODEL).expect("open model");
 
@@ -127,7 +127,7 @@ fn hw_coverage() {
 /// Per type: re-dequantize the oracle's rows from our own mmap slice and
 /// compare against ggml's to_float. Gate: max |diff| <= 1e-6 for every type.
 #[test]
-#[ignore = "hw: needs the model on the box plus the oracle dump in $MULLE_DATA"]
+#[ignore = "hw: needs the model on the box plus the oracle dump in $BLOOMERY_DATA"]
 fn hw_dequant_matches_ggml() {
     let g = Gguf::open(MODEL).expect("open model");
     let dir = data_dir().join("ref");

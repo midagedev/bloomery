@@ -1,13 +1,16 @@
 [package]
-name = "model"
+name = "bloomery-model"
 version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
 
+[lib]
+name = "model"
+
 [lints]
 workspace = true
 
 [dependencies]
-gguf = { path = "../gguf" }
+bloomery-gguf = { path = "../gguf" }
 thiserror = { workspace = true }

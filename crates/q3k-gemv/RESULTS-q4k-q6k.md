@@ -49,17 +49,17 @@ blocks in the run log (`/tmp/mul9-measure.log` on the box).
 | engine | shape | M | µs | GB/s | max rel err | rust/ggml |
 |---|---|---:|---:|---:|---:|---:|
 | ggml mmvq | attn0 | 1 | 9.96 | 236.9 | 3.1e-3 | — |
-| mulle rust | attn0 | 1 | 7.88 | **299.4** | 3.0e-3 | **1.26** |
+| bloomery rust | attn0 | 1 | 7.88 | **299.4** | 3.0e-3 | **1.26** |
 | ggml mmvq | attn0 | 8 | 19.24 | 122.6 | 3.3e-3 | — |
-| mulle rust | attn0 | 8 | 24.07 | 98.0 | 3.1e-3 | 0.80 |
+| bloomery rust | attn0 | 8 | 24.07 | 98.0 | 3.1e-3 | 0.80 |
 | ggml mmvq | attnstk | 1 | 83.29 | 764.8 | 3.0e-3 | — |
-| mulle rust | attnstk | 1 | 78.66 | **809.8** | 3.8e-3 | **1.06** |
+| bloomery rust | attnstk | 1 | 78.66 | **809.8** | 3.8e-3 | **1.06** |
 | ggml mmvq | attnstk | 8 | 272.19 | 234.0 | 4.6e-3 | — |
-| mulle rust | attnstk | 8 | 407.56 | 156.3 | 6.6e-3 | 0.67 |
+| bloomery rust | attnstk | 8 | 407.56 | 156.3 | 6.6e-3 | 0.67 |
 | ggml mmvq | head | 1 | 229.55 | 749.4 | 4.0e-3 | — |
-| mulle rust | head | 1 | 205.60 | **836.7** | 3.8e-3 | **1.12** |
+| bloomery rust | head | 1 | 205.60 | **836.7** | 3.8e-3 | **1.12** |
 | ggml mmvq | head | 8 | 502.46 | 342.4 | 4.5e-3 | — |
-| mulle rust | head | 8 | 529.14 | 325.1 | 3.8e-3 | 0.95 |
+| bloomery rust | head | 8 | 529.14 | 325.1 | 3.8e-3 | 0.95 |
 
 Gate: per type, the stack-shape M=1 ratio vs ggml mmvq on the same tensor,
 bar ≥ 0.9 — **Q4_K attnstk M=1: 1.06, Q6_K head M=1: 1.12. PASS.**
@@ -78,9 +78,9 @@ this round's gate.
 
 ## Reproduce
 
-    ./tools/box.sh 'cd ~/repo/mulle-gemv && bash tools/ref/measure.sh'
+    ./tools/box.sh 'cd ~/repo/bloomery-gemv && bash tools/ref/measure.sh'
 
-Builds the harness, regenerates `$MULLE_DATA/{attn.q4k,output.q6k,
+Builds the harness, regenerates `$BLOOMERY_DATA/{attn.q4k,output.q6k,
 y_ref_attn0_*,y_ref_attnstk_*,y_ref_head_*}` and the round-1 files, times
 ggml then the rust binary (correctness gate exits nonzero on any rel err
 > 1e-2).

@@ -1,9 +1,13 @@
 [package]
-name = "q3k-gemv"
+name = "bloomery-q3k-gemv"
 version = "0.1.0"
 edition = "2024"
 publish = false
 license = "MIT"
+
+[[bin]]
+name = "q3k-gemv"
+path = "src/main.rs"
 
 [lints]
 workspace = true

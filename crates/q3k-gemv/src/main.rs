@@ -1279,7 +1279,7 @@ fn read_f32(path: &str) -> Vec<f32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let data = std::env::var("MULLE_DATA").unwrap_or_else(|_| "/root/mulle-data".to_string());
+    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
@@ -1846,7 +1846,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let gus = |nm: &str| ggml_us.get(nm).copied();
 
-            // Gate 2: mulle's t(M=8)/t(M=1) must not exceed ggml's, per
+            // Gate 2: bloomery's t(M=8)/t(M=1) must not exceed ggml's, per
             // family, on two anchorings — the existing m1/m8 rows (the
             // FAIL-first quote's anchoring) and the nested k family. head is
             // report-only this round (the spec gates stack and attnstk).
@@ -1869,7 +1869,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         "info"
                     };
-                    println!("gate2 {hi}/{lo}: mulle {rm:.3} vs ggml {rg:.3} -> {tag}");
+                    println!("gate2 {hi}/{lo}: bloomery {rm:.3} vs ggml {rg:.3} -> {tag}");
                     if gated && !pass {
                         gates_ok = false;
                     }
@@ -1889,7 +1889,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let gg = wbytes as f64 / (gu * 1e-6) / 1e9;
                 let pass = mg >= 0.9 * gg;
                 println!(
-                    "gate3 {row}: mulle {mg:.2} GB/s vs floor {:.2} (0.9 x ggml {gg:.2}) -> {}",
+                    "gate3 {row}: bloomery {mg:.2} GB/s vs floor {:.2} (0.9 x ggml {gg:.2}) -> {}",
                     0.9 * gg,
                     if pass { "PASS" } else { "FAIL" }
                 );

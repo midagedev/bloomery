@@ -1,16 +1,16 @@
-// dequant_ref.cpp — ggml dequantization oracle for mulle stage 1, round 1-1.
+// dequant_ref.cpp — ggml dequantization oracle for bloomery stage 1, round 1-1.
 //
 // Opens a GGUF file, finds every distinct ggml type among its tensors, and
 // for each type dumps the dequantization of the first rows of one tensor of
 // that type, using ggml's own to_float (ggml_internal_get_type_traits):
-//   $MULLE_DATA/ref/<type_name>.raw   — f32 reference rows, row-major
-//   $MULLE_DATA/ref/<type_name>.meta  — tensor name, type, dims, rows, rowlen
-//   $MULLE_DATA/ref/manifest.txt      — "<type_num> <type_name> <count>" per type
+//   $BLOOMERY_DATA/ref/<type_name>.raw   — f32 reference rows, row-major
+//   $BLOOMERY_DATA/ref/<type_name>.meta  — tensor name, type, dims, rows, rowlen
+//   $BLOOMERY_DATA/ref/manifest.txt      — "<type_num> <type_name> <count>" per type
 // The Rust gate (crates/gguf/tests/oracle.rs) re-derives the same rows from
 // its own loader and demands max |diff| <= 1e-6 per type.
 //
 // Build: bash tools/ref/build-dequant.sh   (on the box, IK=/home/user/ik_llama.cpp)
-// Run:   $MULLE_DATA/bin/dequant_ref [model.gguf]
+// Run:   $BLOOMERY_DATA/bin/dequant_ref [model.gguf]
 
 #include <algorithm>
 #include <cstdint>
@@ -24,7 +24,7 @@
 #include "ggml.h"
 
 static const char * kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
-static const char * kDataDir = getenv("MULLE_DATA") ? getenv("MULLE_DATA") : "/root/mulle-data";
+static const char * kDataDir = getenv("BLOOMERY_DATA") ? getenv("BLOOMERY_DATA") : "/root/bloomery-data";
 static const int64_t kRows = 4; // first N rows of the chosen tensor, per type
 
 static void fail(const std::string & msg) {

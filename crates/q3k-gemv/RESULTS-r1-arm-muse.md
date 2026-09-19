@@ -10,13 +10,13 @@
 | engine | shape | M | µs | GB/s | max rel err | rust/ggml (GB/s) |
 |---|---|---|---|---|---|---|
 | ggml mmvq | expert0 | 1 | 10.48 | 118.26 | 4.361e-03 | — |
-| mulle rust | expert0 | 1 | 16.96 | 73.07 | 1.879e-07 | 0.62 |
+| bloomery rust | expert0 | 1 | 16.96 | 73.07 | 1.879e-07 | 0.62 |
 | ggml mmvq | expert0 | 8 | 16.13 | 76.83 | 4.429e-03 | — |
-| mulle rust | expert0 | 8 | 71.27 | 17.39 | 1.786e-07 | 0.23 |
+| bloomery rust | expert0 | 8 | 71.27 | 17.39 | 1.786e-07 | 0.23 |
 | ggml mmvq | stack | 1 | 238.18 | 332.93 | 4.119e-03 | — |
-| mulle rust | stack | 1 | 565.74 | 140.17 | 1.315e-07 | 0.42 |
+| bloomery rust | stack | 1 | 565.74 | 140.17 | 1.315e-07 | 0.42 |
 | ggml mmvq | stack | 8 | 473.05 | 167.63 | 3.928e-03 | — |
-| mulle rust | stack | 8 | 2426.80 | 32.68 | 1.297e-07 | 0.19 |
+| bloomery rust | stack | 8 | 2426.80 | 32.68 | 1.297e-07 | 0.19 |
 
 - 정확도 게이트(≤ 1e-4) 통과: rust 전 shape ~1e-7. ggml 오차 ~4e-3은
   q8_1 activation 양자화 탓으로 예상 범위이며 실패가 아니다.

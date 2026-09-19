@@ -1,4 +1,4 @@
-// q3k-cpu — mulle stage 2 pre-study (MUL-3): a Q3_K × Q8_K gemv on the host
+// q3k-cpu — bloomery stage 2 pre-study (MUL-3): a Q3_K × Q8_K gemv on the host
 // CPU (Zen 3, AVX2+FMA3, 32 cores / 4 CCDs) against ik_llama.cpp's CPU
 // backend (timed by tools/ref/q3k_cpu_ref.cpp).
 //
@@ -659,7 +659,7 @@ fn main() {
         eprintln!("FATAL: AVX2 not detected");
         std::process::exit(1);
     }
-    let data = std::env::var("MULLE_DATA").unwrap_or_else(|_| "/root/mulle-data".to_string());
+    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
 
     const GATE_BYTES: usize = 90_112 * ROW_BYTES; // 79,298,560
     const BIG_BYTES: usize = 360_448 * ROW_BYTES; // 317,194,240

@@ -38,7 +38,7 @@ pub fn ice(mut out: DisjointSlice<u32>) {
 Output (verbatim, `s5-trip1-no-acc.log`):
 
 ```text
-   Compiling oxide-ice-unroll v0.1.0 (/root/repo/mulle-ice-glm/crates/oxide-ice-unroll)
+   Compiling oxide-ice-unroll v0.1.0 (/root/repo/bloomery-ice-glm/crates/oxide-ice-unroll)
 [rustc_codegen_cuda] note: run with `RUST_BACKTRACE=1` to display a backtrace
 error: [rustc_codegen_cuda] Internal compiler error in device codegen: assertion `left == right` failed: APInt::shl: bitwidth mismatch (32 vs 64)
          left: 32
@@ -138,7 +138,7 @@ and ran on the 3090:
 
 ```text
 $ cargo oxide run --arch sm_86
-   Compiling oxide-ice-unroll v0.1.0 (/root/repo/mulle-ice-glm/crates/oxide-ice-unroll)
+   Compiling oxide-ice-unroll v0.1.0 (/root/repo/bloomery-ice-glm/crates/oxide-ice-unroll)
     Finished `release` profile [optimized] target(s) in 0.43s
      Running `target/release/oxide-ice-unroll`
 PASSED: all 32 elements == 1

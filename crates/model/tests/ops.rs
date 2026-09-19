@@ -8,12 +8,12 @@ mod oracle;
 use model::ops::{Tensor2, matmul_q, rms_norm};
 
 fn model_path() -> String {
-    std::env::var("MULLE_MODEL")
+    std::env::var("BLOOMERY_MODEL")
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_rms_norm_matches_ggml() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();
@@ -44,7 +44,7 @@ fn hw_rms_norm_matches_ggml() {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the model file and $MULLE_DATA/ref"]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_matches_ggml() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();

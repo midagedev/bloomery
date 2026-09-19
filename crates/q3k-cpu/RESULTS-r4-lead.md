@@ -3,7 +3,7 @@
 두 팔(`RESULTS-r4-arm-glm.md`, `RESULTS-r4-arm-muse.md`)의 게이트를 리드가 각 워크트리에서
 `tools/ref/cpu-measure.sh`로 다시 돌렸다(2026-09-19 00:48Z, 증인: loadavg ≤ 2.1, io 압력 0,
 양 카드 0 %). 그 뒤 GLM 팔을 main에 경로 체크아웃으로 채택하고 main 트리에서 기본 데이터
-경로(`/root/mulle-data`, `big` 추출부터)로 한 번 더 돌렸다(00:54Z).
+경로(`/root/bloomery-data`, `big` 추출부터)로 한 번 더 돌렸다(00:54Z).
 
 ## 리드 재측정, GB/s (big = blk.1–2 gate+up, 317 MB, DRAM을 넘는 형상)
 
@@ -28,7 +28,7 @@ SMT 64스레드에서도 유지된다. muse 팔에서 가져온 것은 레버 �
 
 ## main 트리 실측 (기본 경로, 00:54Z)
 
-| 형상 | M | ggml @32t | mulle @32t | 비율 |
+| 형상 | M | ggml @32t | bloomery @32t | 비율 |
 |---|---:|---:|---:|---:|
 | big | 1 | 152.7 | **213.2** | 1.40 |
 | big | 8 | 92.8 | 83.0 | 0.89 |

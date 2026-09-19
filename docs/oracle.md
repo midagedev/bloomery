@@ -1,7 +1,7 @@
 # 오라클 경계 — 1단계의 게이트가 무엇을 진실로 삼는가
 
 날짜 2026-09-19. 계측기는 `tools/ref/dump_ref.cpp`, 러너는 `tools/ref/dump.sh`,
-`just build-ref-dump` 한 번과 `just dump-ref`로 만든다. 산출물은 `$MULLE_DATA/ref/`.
+`just build-ref-dump` 한 번과 `just dump-ref`로 만든다. 산출물은 `$BLOOMERY_DATA/ref/`.
 
 1-2부터 1-5까지 모든 라운드의 게이트가 여기서 읽는다. 라운드마다 자기 진실을 따로
 만들면 세 개의 다른 진실이 생긴다.
@@ -20,8 +20,8 @@ f32 파일 27개(`ffn_moe_gate_par` 26개와 `ffn_up_gate` 하나)가 두 실행
 
 | 층 | 어디 | 무엇 |
 |---|---|---|
-| 구조적 봉쇄 | `dump_ref` main | `MULLE_REF_WRITE=1` 없이는 **아무것도 쓰지 않고 exit 3**. 실측: 라운드가 쓴 그 호출이 그대로 거부된다 |
-| 구조적 봉쇄 | `dump.sh` | `$MULLE_DATA/ref.staging`에 쓰고 **성공했을 때만 교체**. 실패한 덤프는 값이 0이다 — 옛 `rm -f *.f32`가 사고를 "중복 실행"에서 "오라클 소실"로 키웠다 |
+| 구조적 봉쇄 | `dump_ref` main | `BLOOMERY_REF_WRITE=1` 없이는 **아무것도 쓰지 않고 exit 3**. 실측: 라운드가 쓴 그 호출이 그대로 거부된다 |
+| 구조적 봉쇄 | `dump.sh` | `$BLOOMERY_DATA/ref.staging`에 쓰고 **성공했을 때만 교체**. 실패한 덤프는 값이 0이다 — 옛 `rm -f *.f32`가 사고를 "중복 실행"에서 "오라클 소실"로 키웠다 |
 | 구조적 봉쇄 | `dump_ref` | 매니페스트를 `.partial`에 쓰고 디코드가 반환한 뒤에만 rename. 중단된 실행이 이전 매니페스트를 0바이트로 자르지 못한다 |
 | 재발 방지 | `tests/common/oracle.rs` | 매니페스트에 `# complete` 트레일러가 없으면 **패닉**하고 `just dump-ref`를 이름한다. 파일 개수로는 못 잡는 것을 트레일러가 잡는다. FAIL-first 확인함 |
 | 디버깅 용이성 | 매니페스트 헤더 | `# build <sha>` — 이 세트가 **어느 ik 빌드의 출력인지**. 레퍼런스는 그 빌드의 답이지 다른 무엇도 아니다 |

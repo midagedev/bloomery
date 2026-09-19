@@ -12,13 +12,13 @@ Lead run, `tools/ref/measure.sh`, RTX 3090, 2026-09-19 ~00:20 UTC, 3090 compute-
 | engine | shape | M | µs | GB/s | max rel err | rust/ggml |
 |---|---|---:|---:|---:|---:|---:|
 | ggml mmvq | expert0 | 1 | 10.44 | 118.7 | 4.4e-3 | — |
-| mulle rust (combo) | expert0 | 1 | 7.14 | **173.5** | 4.8e-3 | **1.46** |
+| bloomery rust (combo) | expert0 | 1 | 7.14 | **173.5** | 4.8e-3 | **1.46** |
 | ggml mmvq | expert0 | 8 | 16.11 | 76.9 | 4.4e-3 | — |
-| mulle rust (combo) | expert0 | 8 | 14.64 | **84.6** | 3.8e-3 | **1.10** |
+| bloomery rust (combo) | expert0 | 8 | 14.64 | **84.6** | 3.8e-3 | **1.10** |
 | ggml mmvq | stack | 1 | 238.4 | 332.7 | 4.1e-3 | — |
-| mulle rust (combo) | stack | 1 | 127.9 | **620.3** | 3.5e-3 | **1.86** |
+| bloomery rust (combo) | stack | 1 | 127.9 | **620.3** | 3.5e-3 | **1.86** |
 | ggml mmvq | stack | 8 | 473.6 | 167.5 | 3.9e-3 | — |
-| mulle rust (combo) | stack | 8 | 396.2 | **200.2** | 4.6e-3 | **1.20** |
+| bloomery rust (combo) | stack | 8 | 396.2 | **200.2** | 4.6e-3 | **1.20** |
 
 For reference, the arms alone (lead re-runs, same card, same hour): GLM 379.8 / 178.0 GB/s (1.14× / 1.06×),
 muse 522.4 / 166.4 (1.57× / 0.99×). 620 GB/s is 66 % of the 3090's 936 GB/s theoretical; ggml's 333 is 36 %.
