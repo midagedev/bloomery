@@ -80,6 +80,7 @@ struct Acc {
     ns_quant_act: u64,
     ns_dequant_w: u64,
     ns_dot: u64,
+    ns_gather: u64,
 }
 
 static LEVEL: OnceLock<u8> = OnceLock::new();
@@ -108,6 +109,12 @@ pub struct CallAcc {
     ns_quant_act: u64,
     ns_dequant_w: u64,
     ns_dot: u64,
+    /// Caller-side join aftermath: chunk sort, error scan, the transpose copy
+    /// into `out`, accumulator merge. Level 2 only, and it is the number the
+    /// dispatch round (MUL-23) asked for — the site's wall minus
+    /// quant/dequant/dot/gather is what the pool protocol and chunk-arrival
+    /// skew cost.
+    ns_gather: u64,
 }
 
 impl CallAcc {
@@ -127,6 +134,10 @@ impl CallAcc {
         self.ns_dot += ns;
     }
 
+    pub fn add_gather(&mut self, ns: u64) {
+        self.ns_gather += ns;
+    }
+
     /// Fold a finished worker accumulator into this one. The row-parallel sites
     /// build one `CallAcc` per pool chunk and merge them after the join, so
     /// [`record`] still fires exactly once per call and the accumulator mutex
@@ -135,6 +146,7 @@ impl CallAcc {
         self.ns_quant_act += other.ns_quant_act;
         self.ns_dequant_w += other.ns_dequant_w;
         self.ns_dot += other.ns_dot;
+        self.ns_gather += other.ns_gather;
     }
 }
 
@@ -163,6 +175,7 @@ pub fn record(
     e.ns_quant_act += acc.ns_quant_act;
     e.ns_dequant_w += acc.ns_dequant_w;
     e.ns_dot += acc.ns_dot;
+    e.ns_gather += acc.ns_gather;
 }
 
 /// The typeless sibling of [`record`]: a site that reads no weight matrix of its
@@ -256,7 +269,7 @@ pub fn report(wall_ns: u64, label: &str) -> String {
     );
     if lvl >= 2 {
         out.push_str(&format!(
-            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10} {:>10}\n",
+            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10} {:>10} {:>10}\n",
             "site",
             "ty",
             "calls",
@@ -266,7 +279,8 @@ pub fn report(wall_ns: u64, label: &str) -> String {
             "% wall",
             "quant ms",
             "dequant ms",
-            "dot ms"
+            "dot ms",
+            "gather ms"
         ));
     } else {
         out.push_str(&format!(
@@ -299,11 +313,12 @@ pub fn report(wall_ns: u64, label: &str) -> String {
         );
         if lvl >= 2 {
             out.push_str(&format!(
-                "{} {} {} {}\n",
+                "{} {} {} {} {}\n",
                 base,
                 ms(a.ns_quant_act),
                 ms(a.ns_dequant_w),
-                ms(a.ns_dot)
+                ms(a.ns_dot),
+                ms(a.ns_gather)
             ));
         } else {
             out.push_str(&base);

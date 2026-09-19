@@ -117,6 +117,33 @@ pub struct Pool {
     /// (field-caught 2026-09-19 on the box: 3-4 slow-to-start workers per
     /// run, different ones each time).
     ready: AtomicUsize,
+
+    // --- observability (MUL-23) -----------------------------------------
+    // Relaxed counting of the protocol itself, so a round that attacks
+    // dispatch overhead can tell "workers park between matmul_q calls" from
+    // "workers stay hot and the time goes elsewhere". One fetch_add per
+    // dispatch and one per actual condvar wait — never inside a row loop —
+    // so the counters cannot reorder or delay anything the seq/remaining
+    // protocol publishes.
+    dispatches: AtomicUsize,
+    /// Times the dispatcher actually parked on `cv_done` (spin exhausted
+    /// first). Zero on every call means the workers finish within the spin
+    /// budget.
+    dispatcher_parks: AtomicUsize,
+    /// Times any worker actually parked on `cv_work`. At ~850 pool calls per
+    /// decode step this is the number that separates a futex-wake dispatch
+    /// from a spin-only one.
+    worker_parks: AtomicUsize,
+}
+
+/// Snapshot of the pool's protocol counters, cumulative since process start.
+/// See the `dispatches` field group on [`Pool`] for what each one rules in
+/// or out.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolStats {
+    pub dispatches: u64,
+    pub dispatcher_parks: u64,
+    pub worker_parks: u64,
 }
 
 /// What one dispatched job consists of: the closure, lifetime-erased as a
@@ -169,6 +196,16 @@ impl Pool {
         self.pin_failed.load(Ordering::Relaxed)
     }
 
+    /// Protocol counters since process start. Diagnostic only — nothing in
+    /// the dispatch path branches on them.
+    pub fn stats(&self) -> PoolStats {
+        PoolStats {
+            dispatches: self.dispatches.load(Ordering::Relaxed) as u64,
+            dispatcher_parks: self.dispatcher_parks.load(Ordering::Relaxed) as u64,
+            worker_parks: self.worker_parks.load(Ordering::Relaxed) as u64,
+        }
+    }
+
     /// Split `n` into `threads()` contiguous chunks and run `f` on each, in
     /// parallel, returning when every chunk is done.
     ///
@@ -209,6 +246,7 @@ impl Pool {
             };
         }
         self.remaining.store(nworkers, Ordering::Release);
+        self.dispatches.fetch_add(1, Ordering::Relaxed);
         {
             // Bumping `seq` under the lock guarantees no worker can be about
             // to park past the bump (a parked worker rechecks under this same
@@ -237,6 +275,7 @@ impl Pool {
             }
             let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             if self.remaining.load(Ordering::Acquire) != 0 {
+                self.dispatcher_parks.fetch_add(1, Ordering::Relaxed);
                 drop(self.cv_done.wait(guard).unwrap_or_else(|e| e.into_inner()));
             }
         }
@@ -298,6 +337,9 @@ impl Pool {
             cv_done: Condvar::new(),
             panic: Mutex::new(None),
             ready: AtomicUsize::new(0),
+            dispatches: AtomicUsize::new(0),
+            dispatcher_parks: AtomicUsize::new(0),
+            worker_parks: AtomicUsize::new(0),
         }
     }
 
@@ -353,6 +395,7 @@ impl Pool {
                 }
                 let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
                 if self.seq.load(Ordering::Acquire) == seen {
+                    self.worker_parks.fetch_add(1, Ordering::Relaxed);
                     drop(self.cv_work.wait(guard).unwrap_or_else(|e| e.into_inner()));
                 }
             }

@@ -137,6 +137,12 @@ fn main() {
     };
 
     println!("\n{:>4} {:>6} {:>12} {:>9}", "step", "ctx", "ms", "tok/s");
+    // Pool protocol counters, snapshotted around the decode loop so the
+    // prefill's dispatches stay out of the per-step arithmetic (MUL-23). A
+    // decode step makes ~850 pool calls; whether the workers park between
+    // them (futex wake per call) or stay hot on the spin budget is the first
+    // fork in attributing the step's orchestration share.
+    let pool0 = threads::pool().stats();
     for s in 0..n_predict {
         let ctx_at_start = ctx.len();
         let t0 = Instant::now();
@@ -198,6 +204,13 @@ fn main() {
         print!(
             "{}",
             model::profile::report(decode_total.as_nanos() as u64, "decode")
+        );
+        let p1 = threads::pool().stats();
+        println!(
+            "pool over {n_predict} decode steps: {} dispatches, dispatcher parked {}x, workers parked {}x",
+            p1.dispatches - pool0.dispatches,
+            p1.dispatcher_parks - pool0.dispatcher_parks,
+            p1.worker_parks - pool0.worker_parks,
         );
     }
 }

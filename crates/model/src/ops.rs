@@ -137,16 +137,19 @@ thread_local! {
     static ROW_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// One pool chunk's finished work: its output rows in a private contiguous buffer
-/// laid out `[r_local][t]`, its share of the level-2 stage timers, and the first
-/// error it hit (if any — a quant error on the scalar path, a `qdot` error on the
-/// fused one). Workers hand these over through one mutex take per chunk — the only
-/// shared mutable state on the parallel path, and it is never touched from inside
-/// the row loop.
+/// One pool chunk's finished bookkeeping: its row-range start (for the
+/// lowest-row-first error precedence), its share of the level-2 stage timers,
+/// and the first error it hit (if any — a quant error on the scalar path, a
+/// `qdot` error on the fused one). The output values themselves go straight
+/// into `out` through `out_ptr` — the MUL-23 measurement (2026-09-20, level 2)
+/// put the old staged handover at ~7 ms per decode step: a private buffer per
+/// chunk (32 allocations per call at ~850 calls per step), a collector push,
+/// a sort, and a transpose copy, none of which computes anything. Workers
+/// hand these small structs over through one mutex take per chunk — the only
+/// shared mutable state on the parallel path, and it is never touched from
+/// inside the row loop.
 struct RowChunk {
     start: usize,
-    nrows: usize,
-    buf: Vec<f32>,
     acc: profile::CallAcc,
     err: Option<crate::ModelError>,
 }
@@ -160,6 +163,35 @@ enum QuantCols {
     F32(Vec<f32>),
     /// `qdot::quantize_col(w.ty, ..)` — one `cb`-byte column per token.
     Bytes { cb: usize, buf: Vec<u8> },
+}
+
+/// `matmul_q`'s output pointer, in the one form the pool closure can capture:
+/// raw pointers are neither `Send` nor `Sync`, and the closure must be `Sync`.
+/// The impls carry no new safety — they point at the argument documented at
+/// the construction site (disjoint cells by the row split, published by the
+/// pool's completion protocol), which is what makes sharing the pointer sound.
+struct SharedOut(*mut f32);
+// SAFETY: see the struct doc — the pointer is only dereferenced under the
+// disjoint-cell and join-ordering argument at its construction site.
+unsafe impl Send for SharedOut {}
+// SAFETY: same argument; workers only write cells their own row range owns.
+unsafe impl Sync for SharedOut {}
+
+impl SharedOut {
+    /// Write one output cell. A method on purpose: a bare `out_ptr.0` inside
+    /// the pool closure would capture the *field* — a raw pointer, which is
+    /// not `Sync` — while the call captures `&SharedOut`, whose `Sync` is the
+    /// argument above.
+    ///
+    /// # Safety
+    ///
+    /// `idx` must name a cell inside the caller's own row range of the split
+    /// `threads::chunks` produced — the construction-site comment owns the
+    /// full argument.
+    unsafe fn write(&self, idx: usize, v: f32) {
+        // SAFETY: the caller guarantees the disjointness contract above.
+        unsafe { *self.0.add(idx) = v };
+    }
 }
 
 /// `y = W · x` where `W` is a quantized 2-D tensor straight out of the file.
@@ -255,10 +287,13 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
     // `qdot::dot_row` computes one row's whole k in a single call, so a row is
     // still the only unit that moves between threads and k is never split.
     //
-    // Workers write into a private contiguous buffer laid out [r_local][t]; the
-    // gather below moves them into `out` single-threaded. Direct `out.data[t*n + r]`
-    // writes from several threads would alias without new `unsafe`, and this round
-    // adds none.
+    // Workers write their results straight into `out` (token-major `t*n + r`):
+    // the row split partitions the cells, so no two participants alias, and the
+    // pool's completion protocol orders the writes before this function reads
+    // `out` again — the same ordering argument that publishes the job slot.
+    // The staged handover this replaced (private chunk buffer, collector push,
+    // sort, transpose copy) was measured at ~7 ms per decode step (MUL-23,
+    // level 2, 2026-09-20) without computing anything.
     let ne1 = x.ne1;
     let ty = w.ty;
     // The fused branch's column stride and buffer, hoisted so the worker closure
@@ -276,12 +311,25 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
         QuantCols::F32(q) => q,
         QuantCols::Bytes { .. } => &[],
     };
-    let collected: Mutex<Vec<RowChunk>> = Mutex::new(Vec::new());
+    // SAFETY (taken once, before the closure, so the &mut borrow ends here and
+    // only the raw pointer crosses into the pool): `out_ptr` aliases `out.data`,
+    // which this function owns for the whole call. Every participant — workers
+    // and the calling thread's own chunk — writes only cells `t * n + r` with
+    // `r` inside its own contiguous range of the row split, and
+    // `threads::chunks(n, T)` partitions `0..n`, so no two participants ever
+    // write the same cell. The writes are published to this thread by the
+    // pool's completion protocol (each worker's `remaining` fetch-sub release
+    // happens-after its writes; the dispatcher's acquire load of `remaining ==
+    // 0` happens before `for_each_chunk` returns), the same argument that
+    // already publishes the job slot. `out` is not read until after the join,
+    // and a chunk that errors early simply leaves its unwritten cells at the
+    // zeros `Tensor2::zeros` gave them — the error discards the output either
+    // way, exactly as the staged handover's partially-filled buffers did.
+    let out_ptr = SharedOut(out.data.as_mut_ptr());
+    let collected: Mutex<Vec<RowChunk>> = Mutex::new(Vec::with_capacity(threads::pool().threads()));
     threads::pool().for_each_chunk(n, |rows| {
         let mut chunk = RowChunk {
             start: rows.start,
-            nrows: rows.len(),
-            buf: vec![0.0f32; rows.len() * ne1],
             acc: profile::CallAcc::new(),
             err: None,
         };
@@ -293,12 +341,16 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
             // table is this wiring's signature, not missing instrumentation.
             // The dequant is fused into the dot, so the dot timer covers the
             // whole row, tokens included.
-            for (rl, r) in rows.enumerate() {
+            for r in rows {
                 let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
                 let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                 for t in 0..ne1 {
                     match qdot::dot_row(ty, src, &acol[t * cb..(t + 1) * cb], k) {
-                        Ok(v) => chunk.buf[rl * ne1 + t] = v,
+                        Ok(v) => {
+                            // SAFETY: cell `t * n + r` belongs to this chunk's
+                            // row range alone — see the comment on `out_ptr`.
+                            unsafe { out_ptr.write(t * n + r, v) };
+                        }
                         Err(e) => {
                             chunk.err = Some(e.into());
                             break;
@@ -319,7 +371,7 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
                     scratch.resize(k, 0.0);
                 }
                 let row = &mut scratch[..k];
-                for (rl, r) in rows.enumerate() {
+                for r in rows {
                     let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
                     // Weight side: dequant_row, or the byte walk in its place for F32 rows.
                     let t_d = if lvl >= 2 { Some(Instant::now()) } else { None };
@@ -341,7 +393,9 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
                         for i in 0..k {
                             acc += row[i] * xc[i];
                         }
-                        chunk.buf[rl * ne1 + t] = acc;
+                        // SAFETY: cell `t * n + r` belongs to this chunk's row
+                        // range alone — see the comment on `out_ptr`.
+                        unsafe { out_ptr.write(t * n + r, acc) };
                     }
                     if let Some(t_dot) = t_dot {
                         chunk.acc.add_dot(t_dot.elapsed().as_nanos() as u64);
@@ -357,11 +411,14 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
             .push(chunk);
     });
 
-    // Arrival order is nondeterministic; row order is not. Sorting by `start` makes
-    // the gather sequential and the first error the lowest failing row's — the same
-    // error the sequential `?` this replaced would have returned (a quant error on
-    // the scalar path, a `qdot` error on the fused one), and the record call below
-    // is skipped on that path exactly as it was before.
+    // Arrival order is nondeterministic; row order is not. Sorting by `start`
+    // keeps the first error the lowest failing row's — the same error the
+    // sequential `?` this replaced would have returned (a quant error on the
+    // scalar path, a `qdot` error on the fused one), and the record call below
+    // is skipped on that path exactly as it was before. The values themselves
+    // are already in `out`; since MUL-23 this section is bookkeeping only, and
+    // level 2 times it as the `gather` stage to keep that honest.
+    let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
     let mut chunks = collected
         .into_inner()
         .expect("matmul_q row-chunk collector");
@@ -370,13 +427,10 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
         return Err(e);
     }
     for c in &chunks {
-        for rl in 0..c.nrows {
-            let r = c.start + rl;
-            for t in 0..ne1 {
-                out.data[t * n + r] = c.buf[rl * ne1 + t];
-            }
-        }
         pacc.add_acc(&c.acc);
+    }
+    if let Some(t_gather) = t_gather {
+        pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
     }
     if let Some(t_call) = t_call {
         profile::record(

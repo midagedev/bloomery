@@ -72,6 +72,23 @@ if [ -n "${SWEEP:-}" ]; then
   done
 fi
 
+# 스핀 스윕(MUL-23). 스레드 수는 고정(기본 32)이고 BLOOMERY_SPIN만 바꾼다 —
+# 워커가 matmul_q 호출 사이에 파킹하는지(디스패치마다 futex 웨이크) 아니면
+# 스핀 예산 안에 머무는지가 오케스트레이션 비용의 첫 갈림길이다. 스레드 스윕과
+# 같은 임대·같은 증인 규약, export로 넘기는 것도 같은 이유다(위 주석 참조).
+if [ -n "${SPINS:-}" ]; then
+  echo
+  echo "=== 스핀 스윕 (스레드 고정: ${BLOOMERY_THREADS:-<default>}) ==="
+  for sp in $SPINS; do
+    export BLOOMERY_SPIN=$sp
+    witness "pre-spin$sp"
+    "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
+      | grep -E "^derived|decode steps in|per step"
+    witness "post-spin$sp"
+    unset BLOOMERY_SPIN
+  done
+fi
+
 echo
 echo "=== ik_llama.cpp, same file, same lease, CPU only ==="
 witness pre-ik
