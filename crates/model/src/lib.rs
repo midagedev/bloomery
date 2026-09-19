@@ -20,6 +20,7 @@
 
 pub mod attn;
 pub mod ffn;
+pub mod forward;
 pub mod head;
 pub mod moe;
 pub mod ops;

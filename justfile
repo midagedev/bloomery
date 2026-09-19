@@ -42,6 +42,13 @@ measure-gpu:
 measure-cpu:
     ./tools/box.sh 'bash tools/ref/cpu-measure.sh'
 
+# 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
+build-decode:
+    ./tools/box.sh 'cargo build --release -p bloomery-model --bin bloomery-decode'
+
+measure-decode: build-decode
+    ./tools/box.sh 'bash tools/ref/decode-measure.sh'
+
 # 참조 하네스(ggml에 링크하는 C++). 진실값과 기준 속도의 출처다.
 build-ref:
     ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh'
@@ -73,6 +80,23 @@ gate-moe:
 
 gate-head:
     ./tools/box.sh 'cargo test -p bloomery-model --test head -- --ignored --nocapture'
+
+# 1-4 조립 게이트. --release로 도는 유일한 게이트다 — 27블록 전체를 디버그 빌드로 돌리면
+# 분 단위로 늘어나고, Rust는 f32를 재결합하지 않으므로 수치는 프로파일과 무관하게 같다.
+gate-forward:
+    ./tools/box.sh 'cargo test --release -p bloomery-model --test forward -- --ignored --nocapture'
+
+# 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
+gate-prompts:
+    ./tools/box.sh 'cargo test --release -p bloomery-model --test prompts -- --ignored --nocapture'
+
+# ik의 답(프롬프트 32개의 greedy 다음 토큰). 오라클과 달리 파일 하나만 쓰고
+# $BLOOMERY_DATA/ref는 건드리지 않는다 — argmax.sh가 끝에서 매니페스트 해시로 확인한다.
+build-argmax:
+    ./tools/box.sh 'bash tools/ref/build-argmax.sh'
+
+argmax-ref:
+    ./tools/box.sh 'bash tools/ref/argmax.sh'
 
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.

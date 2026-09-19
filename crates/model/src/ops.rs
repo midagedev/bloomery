@@ -48,6 +48,21 @@ impl Tensor2 {
     }
 }
 
+/// An f32 tensor read straight out of the file — norm gains, router biases, anything
+/// the quantizer left alone.
+///
+/// One owner for the byte walk: this was written out three times (attn, head, and the
+/// ops gate inline) before `forward` needed a fourth, and three copies of a loop that
+/// reads f32 little-endian is three places for an endianness or stride assumption to
+/// drift apart.
+pub fn f32_tensor(gguf: &Gguf, t: &TensorInfo) -> Result<Vec<f32>, crate::ModelError> {
+    let bytes = gguf.data(t)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// RMS norm with a learned gain, per column.
 ///
 /// ggml computes the mean of squares over the whole row, adds eps, and multiplies by the

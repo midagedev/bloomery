@@ -34,10 +34,10 @@ V4.1 Flash는 engram 테이블 NVMe 지연 읽기, 공유 압축 KV, 지연 하�
 | 1-1 | GGUF 로더와 텐서 맵, 양자 타입별 디퀀트 | ~~≤ 1e-6~~ **통과 2026-09-19: 여섯 타입 전부 차이 0(비트 정확)**, 텐서 377개 전부 해석. `just gate-1-1` | 없음. GPU 불필요 |
 | 1-2 | 임베딩 + 블록 0(MLA 어텐션 + dense FFN), CPU, f32, M=1 | 블록 0 출력이 ik의 중간 텐서와 ≤ 1e-3 | 1-1 |
 | 1-2 ffn | dense FFN(블록 0)과 shared expert | **통과 2026-09-19**: `ffn_up_gate-0` 3.6e-7, `ffn_out-0` 2.2e-5, `ffn_shexp-1` 5.4e-7 (게이트 1e-4). `just gate-ffn` | ops |
-| 1-2 attn | MLA 어텐션(블록 0) | 진행 중 | ops |
+| 1-2 attn | MLA 어텐션(블록 0) | **통과 2026-09-19**: `q_nope2-0` 2.5e-3(한 컬럼 한정, 활성 코드 동점 뒤집힘 — 정확입력 짝은 3.8e-6), `kqv_compressed-0` 1.2e-4, `kqv_out-0` 8.9e-4. `just gate-attn` | ops |
 | 1-3 | MoE 블록: 라우터, top-6, expert 디스패치 | **통과 2026-09-19**: 라우팅 id 36/36 정확, `ffn_moe_out-1` 2.0e-5, `ffn_out-1` 2.0e-5 (게이트 1e-4), `down` 2.8e-4 (게이트 4e-4, 유도는 호출부 주석). 구조 게이트: 라우팅된 25개만 디퀀트. `just gate-moe` | 1-2 |
 | 1-4 head | 출력 헤드 | **통과 2026-09-19**: `result_norm` 9.5e-7, `result_output` 4.0e-5, argmax·top-5 정확 일치. `just gate-head` | 1-3 |
-| 1-4 | 토큰 하나의 전체 순전파, CPU, M=1 | 프롬프트 32개에서 logits argmax가 ik와 일치. 첫 tok/s(느릴 것이다) | 1-3 |
+| 1-4 | 토큰 하나의 전체 순전파, CPU, M=1 | **통과 2026-09-19, 한 군데 정정**: `inp_embd` 비트 정확, `l_out-0`~`l_out-26` 상대 드리프트 7.0e-4 → 9.1e-3, `result_output` 2.2e-2(절대 6.1e-1). argmax는 ~~32/32~~ **31/32** — 5번(`def add(a, b):`)이 ik의 0.262 마진 안에서 뒤집혔다. 첫 tok/s **0.0521**. `just gate-forward`, `just gate-prompts`, `just measure-decode` | 1-3 |
 | 1-5 | dense 경로 GPU 오프로드 + 라우팅 expert에 `q3k-gemv`, KV 캐시 | 같은 logits, 3090에서 ik 대비 tok/s | 1-4 |
 
 ~~1-1과 1-2는 파일이 겹치지 않으므로 병렬로 돌린다. 나머지는 직렬이다.~~ 2026-09-19 선 그음:

@@ -1,0 +1,45 @@
+# 1-4 게이트의 프롬프트 32개. id<TAB>텍스트<TAB>토큰 id
+#
+# 토큰은 박스에서 한 번 읽어 여기 박아 둔 것이다(2026-09-19, ik c10fbbcc의
+# llama-tokenize --ids, /models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf, BOS 포함).
+# ik도 bloomery도 실행 시점에 토큰화하지 않는다 — dump_ref가 토큰화하지 않는 이유와
+# 같다(docs/oracle.md): 토크나이저 차이가 하류 수치 차이로 나타나면 커널 버그로 읽힌다.
+#
+# 길이는 4~11 토큰으로 일부러 벌려 놨다. ik는 M ≤ 7에서 iqk_mul_mat_4d의 small-M
+# 활성 포맷을 쓰고(crates/model/src/attn.rs의 quantize_act), 8 이상에서 다른 커널로
+# 간다. 오라클은 6토큰 하나뿐이라 그 경계를 볼 수 없다.
+#
+# id 0은 오라클의 토큰 수열과 같다 — 이 파일과 $BLOOMERY_DATA/ref가 같은 모델·같은
+# 토크나이저를 보고 있다는 대조군이다.
+0	The capital of France is	100000,549,6077,280,7239,317
+1	Water boils at	100000,29889,70092,430
+2	2 + 2 =	100000,17,919,207,17,403
+3	Hello	100000,17464
+4	The largest planet in our solar system is	100000,549,8397,12438,279,769,10735,1317,317
+5	def add(a, b):	100000,1558,962,7,64,11,270,1780
+6	The opposite of hot is	100000,549,9541,280,3550,317
+7	Once upon a time	100000,10492,2065,245,766
+8	In Python, a list is written with	100000,774,12974,11,245,1525,317,4473,366
+9	The speed of light is approximately	100000,549,4583,280,2156,317,10750
+10	Monday, Tuesday,	100000,32511,11,10985,11
+11	SELECT * FROM users WHERE	100000,7504,575,7431,4741,11267
+12	The chemical symbol for gold is	100000,549,11471,7194,327,5299,317
+13	She opened the door and	100000,4622,6899,254,4167,285
+14	A right triangle has	100000,32,1329,22320,643
+15	The first president of the United States was	100000,549,1022,6847,280,254,4794,5110,438
+16	To be or not to be, that is the	100000,1898,330,410,441,276,330,11,344,317,254
+17	import numpy as	100000,1901,42234,372
+18	The Pacific Ocean is the	100000,549,17005,20914,317,254
+19	Roses are red, violets are	100000,49,9559,418,3074,11,80615,9389,418
+20	The mitochondrion is the powerhouse of the	100000,549,84732,81,277,317,254,92583,280,254
+21	git commit -m	100000,12207,6673,570,76
+22	One, two, three, four,	100000,4711,11,984,11,1853,11,2685,11
+23	The currency of Japan is	100000,549,19305,280,12693,317
+24	Machine learning models are trained on	100000,27581,4526,4096,418,10986,331
+25	He walked into the room and saw	100000,2450,10408,881,254,2563,285,3505
+26	The square root of sixteen is	100000,549,7742,4343,280,34550,317
+27	In C, printf is declared in	100000,774,339,11,19423,317,12487,279
+28	The Great Wall of China was built to	100000,549,6982,11476,280,7812,438,4930,276
+29	A byte consists of	100000,32,12457,10663,280
+30	The author of Romeo and Juliet is	100000,549,3855,280,61892,285,52104,317
+31	If it rains tomorrow, I will	100000,1847,359,47098,15593,11,304,543

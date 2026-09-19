@@ -40,7 +40,7 @@
 //! tokens are the KV entries (prefill semantics). Token `t` attends to every batch
 //! entry `u` with `slots[u].seq == slots[t].seq && slots[u].pos <= slots[t].pos`.
 
-use crate::ops::{matmul_q, rms_norm};
+use crate::ops::{f32_tensor, matmul_q, rms_norm};
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo, dequant_row};
@@ -106,7 +106,7 @@ pub fn block_attn_trace(
 
     // 2. Latent norm. The gain is F32 in the file.
     let gain_t = find(gguf, &format!("blk.{block}.attn_kv_a_norm.weight"))?;
-    let gain = f32_row(gguf, gain_t)?;
+    let gain = f32_tensor(gguf, gain_t)?;
     let mut latent = Tensor2::zeros(p.latent, x.ne1);
     for t in 0..x.ne1 {
         let src = &kv_rope_compressed.col(t)[..p.latent];
@@ -175,14 +175,6 @@ pub fn block_attn_trace(
 fn find<'a>(gguf: &'a Gguf, name: &str) -> Result<&'a TensorInfo, ModelError> {
     gguf.find(name)
         .ok_or_else(|| ModelError::MissingTensor(name.into()))
-}
-
-fn f32_row(gguf: &Gguf, t: &TensorInfo) -> Result<Vec<f32>, ModelError> {
-    let bytes = gguf.data(t)?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
 }
 
 // --------------------------------------------------------------------- rope
