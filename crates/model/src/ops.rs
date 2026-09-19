@@ -60,11 +60,29 @@ impl Tensor2 {
 /// reads f32 little-endian is three places for an endianness or stride assumption to
 /// drift apart.
 pub fn f32_tensor(gguf: &Gguf, t: &TensorInfo) -> Result<Vec<f32>, crate::ModelError> {
+    // Profiler hook (crate::profile): the byte walk itself. `rows` and `k` are 0
+    // on purpose — a flat read has no contraction and no row structure; the
+    // weight MB column is the work. Level 1 only.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let bytes = gguf.data(t)?;
-    Ok(bytes
+    let out = bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+        .collect();
+    if let Some(t_call) = t_call {
+        let acc = profile::CallAcc::new();
+        profile::record(
+            "f32_tensor",
+            GgmlType::F32,
+            0,
+            0,
+            bytes.len() as u64,
+            t_call.elapsed().as_nanos() as u64,
+            &acc,
+        );
+    }
+    Ok(out)
 }
 
 /// RMS norm with a learned gain, per column.
@@ -73,6 +91,13 @@ pub fn f32_tensor(gguf: &Gguf, t: &TensorInfo) -> Result<Vec<f32>, crate::ModelE
 /// reciprocal square root — `eps` is inside the sqrt, not added to it. Getting that wrong
 /// is a ~1e-4 error that a loose gate would absorb.
 pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
+    // Profiler hook (crate::profile): level-1 call timer. This fires twice per
+    // block plus once in the head (~55 times per decode step), so one Instant
+    // pair is the whole instrumentation. The shape statement is not a
+    // contraction because there is none: `rows` counts the columns normed, `k`
+    // the elements each column walks, and the only weight read is the F32 gain.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     assert_eq!(gain.len(), x.ne0, "rms_norm gain must be ne0 long");
     let mut out = Tensor2::zeros(x.ne0, x.ne1);
     for t in 0..x.ne1 {
@@ -86,6 +111,18 @@ pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
         for i in 0..x.ne0 {
             dst[i] = src[i] * scale * gain[i];
         }
+    }
+    if let Some(t_call) = t_call {
+        let acc = profile::CallAcc::new();
+        profile::record(
+            "rms_norm",
+            GgmlType::F32,
+            x.ne1 as u64,
+            (x.ne0 * x.ne1) as u64,
+            gain.len() as u64 * 4,
+            t_call.elapsed().as_nanos() as u64,
+            &acc,
+        );
     }
     out
 }

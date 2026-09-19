@@ -6,12 +6,12 @@
 //!      and once at level 2 — the level that adds the most code to the hot loops —
 //!      must produce identical logits, `max|diff| == 0.0`. No tolerance: a tolerance
 //!      here would let every future hook edit hide a rounding it caused.
-//!   2. **Coverage.** The instrumented sites must account for ≥ 80 % of one decode
+//!   2. **Coverage.** The instrumented sites must account for ≥ 98 % of one decode
 //!      step's wall time. This is the gate's body — an unhooked hot loop shows up
 //!      here as a hole, not as a wrong number.
-//!   3. **Every site recorded.** `matmul_q`, `q_nope2_absorbed` and `embed` all have
-//!      `calls > 0` after a step, so a hook that silently stopped firing cannot pass
-//!      on the other two.
+//!   3. **Every site recorded.** Every hooked site — the three matmul-shaped ones
+//!      and the coverage round's typeless sites — has `calls > 0` after a step, so
+//!      a hook that silently stopped firing cannot pass on the other two.
 //!
 //! The level comes from `BLOOMERY_PROFILE`, read once per process into a `OnceLock` —
 //! a process cannot be both profiled and unprofiled. Assertion 1 therefore runs the
@@ -159,11 +159,31 @@ fn hw_profile_gate() {
     let wall_ns = t0.elapsed().as_nanos() as u64;
 
     // 2. Coverage. Integer arithmetic on purpose — no float equality near a gate.
+    //
+    // Raised 80 -> 98 on 2026-09-20 by the coverage round: after the thread pool
+    // and `Derived`, measured coverage fell to 91.6% (level-1 table, decode, 2
+    // steps, wall 475.0 ms) — the ~20 ms/step the table could not name was
+    // already larger than ik's whole 12.9 ms step, so the gate was told to
+    // demand that the round hook it. With the typeless sites in place the same
+    // gate measures 98.1% on this tree (the first green run's output, not a
+    // target chosen in advance). 98 leaves 0.1 points of headroom — thin on
+    // purpose: the unhooked remainder this round leaves behind is ~4.4 ms of
+    // step glue per 233 ms step, so a healthy tree cannot drift far below, and
+    // a site the size of `flash_attn_latent` (9.6 ms, 4.1%) going dark lands
+    // near 94% and fails loud, not marginal.
+    //
+    // Lead re-ran it five times on the merged tree before committing: 98.04,
+    // 98.06, 98.08, 98.09, 98.11 % over walls of 189 to 237 ms. The ratio does
+    // not move with the wall — the unhooked remainder is step glue that scales
+    // with the step, not a fixed overhead — so the 0.04 points of headroom at
+    // the worst run are not a noise band waiting to flip. Anything that does
+    // push this below 98 is new unhooked work, which is the thing the gate is
+    // for. Do not lower the threshold to make such a run pass; hook the work.
     let instrumented = profile::instrumented_ns();
     let pct = instrumented as f64 / wall_ns as f64 * 100.0;
     assert!(
-        instrumented * 100 >= wall_ns * 80,
-        "coverage {pct:.1}% < 80%: an unhooked hot loop is eating the step \
+        instrumented * 100 >= wall_ns * 98,
+        "coverage {pct:.1}% < 98%: an unhooked hot loop is eating the step \
          ({:.1} ms instrumented of {:.1} ms wall)",
         instrumented as f64 / 1e6,
         wall_ns as f64 / 1e6
@@ -174,8 +194,31 @@ fn hw_profile_gate() {
         wall_ns as f64 / 1e6
     );
 
-    // 3. Every hooked site did something.
-    for site in ["matmul_q", "q_nope2_absorbed", "embed"] {
+    // 3. Every hooked site did something. The list is every site the crate
+    // records; a new hook that forgets to fire shows up here by name.
+    for site in [
+        "matmul_q",
+        "q_nope2_absorbed",
+        "embed",
+        "rms_norm",
+        "f32_tensor",
+        "residual_add",
+        "gain",
+        "is_moe",
+        "ffn_weights",
+        "attn_params",
+        "attn_latent",
+        "attn_rope",
+        "attn_kvr",
+        "flash_attn_latent",
+        "wv_b_heads",
+        "moe_setup",
+        "moe_route",
+        "swiglu",
+        "moe_expert_io",
+        "moe_trace",
+        "head_params",
+    ] {
         let calls: u64 = profile::entries()
             .iter()
             .filter(|e| e.site == site)
@@ -183,7 +226,7 @@ fn hw_profile_gate() {
             .sum();
         assert!(calls > 0, "site {site} recorded nothing — its hook is dead");
     }
-    eprintln!("sites                                matmul_q / q_nope2_absorbed / embed all live");
+    eprintln!("sites                                all 21 hooked sites live");
 
     // The table itself, printed whatever the verdict — a coverage number without the
     // rows behind it cannot be acted on.

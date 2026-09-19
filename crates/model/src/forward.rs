@@ -104,7 +104,16 @@ pub fn embed(gguf: &Gguf, tokens: &[u32]) -> Result<Tensor2, ModelError> {
 /// decides between the dense and the shared-expert trio: presence, never a block
 /// number. A V2-Lite file has one dense block and the V4.1 files ahead have three.
 fn is_moe(gguf: &Gguf, b: usize) -> bool {
-    gguf.find(&format!("blk.{b}.ffn_gate_inp.weight")).is_some()
+    // Profiler hook (crate::profile): the deciding `find` is a linear scan of
+    // the tensor table (377 tensors in this file), paid per block per step.
+    // Level-1 only, typeless: no weight is read, only looked for.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
+    let routed = gguf.find(&format!("blk.{b}.ffn_gate_inp.weight")).is_some();
+    if let Some(t_call) = t_call {
+        profile::record_time("is_moe", t_call.elapsed().as_nanos() as u64);
+    }
+    routed
 }
 
 /// The architecture-wide rms epsilon, from the file. The same key `head.rs` reads; the
@@ -117,10 +126,27 @@ fn rms_eps(gguf: &Gguf) -> f32 {
 }
 
 fn gain(gguf: &Gguf, name: &str) -> Result<Vec<f32>, ModelError> {
+    // Profiler hook (crate::profile): SELF time — the whole call minus what the
+    // hooked `f32_tensor` child recorded (see `profile::site_ns_total`), which
+    // leaves the `find`: a linear scan over the file's tensor table, paid twice
+    // per block per step for the two norm gains.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
+    let f32_before = if lvl > 0 {
+        profile::site_ns_total("f32_tensor")
+    } else {
+        0
+    };
     let t: &TensorInfo = gguf
         .find(name)
         .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
-    f32_tensor(gguf, t)
+    let v = f32_tensor(gguf, t);
+    if let Some(t_call) = t_call {
+        let child = profile::site_ns_total("f32_tensor") - f32_before;
+        let self_ns = (t_call.elapsed().as_nanos() as u64).saturating_sub(child);
+        profile::record_time("gain", self_ns);
+    }
+    v
 }
 
 /// One transformer block against a KV cache: `l_out-(b-1)` in, `l_out-b` out.
@@ -186,16 +212,25 @@ pub fn block(
 /// ggml's `ADD` over two same-shaped blocks. f32, elementwise, no accumulation order
 /// to get wrong.
 fn add(a: &Tensor2, b: &Tensor2) -> Tensor2 {
+    // Profiler hook (crate::profile): the two residual adds per block are the
+    // only math this module owns. Level-1 only, typeless — activation work, no
+    // weight read.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     assert_eq!(
         (a.ne0, a.ne1),
         (b.ne0, b.ne1),
         "residual add needs both sides at the same shape"
     );
-    Tensor2::from_vec(
+    let out = Tensor2::from_vec(
         a.ne0,
         a.ne1,
         a.data.iter().zip(&b.data).map(|(&x, &y)| x + y).collect(),
-    )
+    );
+    if let Some(t_call) = t_call {
+        profile::record_time("residual_add", t_call.elapsed().as_nanos() as u64);
+    }
+    out
 }
 
 /// The logits for the **last** token of `tokens`, which is the one a sampler reads.

@@ -7,8 +7,10 @@
 //! the position is the caller's job. That is the batch-first decision in `lib.rs`
 //! applied to the last op pair in the graph.
 use crate::ops::{f32_tensor, matmul_q, rms_norm};
+use crate::profile;
 use crate::{ModelError, Tensor2};
 use gguf::Gguf;
+use std::time::Instant;
 
 /// Returns the logits for every token position; the oracle only holds the last one.
 ///
@@ -16,6 +18,13 @@ use gguf::Gguf;
 /// `[vocab, n_tokens]`, where the vocab axis is `output.weight`'s own width — the
 /// gate checks it against `deepseek2.vocab_size` from the file, never a literal.
 pub fn head(gguf: &Gguf, x: &Tensor2) -> Result<Tensor2, ModelError> {
+    // Profiler hook (crate::profile), coverage round: `head_params` covers the
+    // eps lookup and the two tensor finds — linear metadata/tensor-table scans
+    // rerun every step. The norm itself records under `rms_norm`, the gain read
+    // under `f32_tensor`, the projection under `matmul_q`.
+    let lvl = profile::level();
+    let mut params_ns = 0u64;
+    let t_p1 = if lvl > 0 { Some(Instant::now()) } else { None };
     // deepseek2 carries one architecture-wide rms eps; the file has no separate
     // final-norm key. The 1e-4 gate on `result_norm` is the numeric proof that
     // this key is the one the final norm runs with.
@@ -28,6 +37,9 @@ pub fn head(gguf: &Gguf, x: &Tensor2) -> Result<Tensor2, ModelError> {
     let norm_t = gguf
         .find("output_norm.weight")
         .ok_or_else(|| ModelError::MissingTensor("output_norm.weight".into()))?;
+    if let Some(t_p1) = t_p1 {
+        params_ns += t_p1.elapsed().as_nanos() as u64;
+    }
     let gain = f32_tensor(gguf, norm_t)?;
 
     if x.ne0 != gain.len() {
@@ -42,8 +54,15 @@ pub fn head(gguf: &Gguf, x: &Tensor2) -> Result<Tensor2, ModelError> {
 
     let normed = rms_norm(x, &gain, eps);
 
+    let t_p2 = if lvl > 0 { Some(Instant::now()) } else { None };
     let out_t = gguf
         .find("output.weight")
         .ok_or_else(|| ModelError::MissingTensor("output.weight".into()))?;
+    if let Some(t_p2) = t_p2 {
+        params_ns += t_p2.elapsed().as_nanos() as u64;
+    }
+    if lvl > 0 {
+        profile::record_time("head_params", params_ns);
+    }
     matmul_q(gguf, out_t, &normed)
 }

@@ -34,9 +34,31 @@
 //! first hooked call does nothing, which is what the decode binary's `--profile` flag
 //! relies on when it sets the variable before any model code runs.
 //!
+//! The coverage round (2026-09-20) added the sites that are not matmuls, after the
+//! thread pool shrank `matmul_q`'s share to 91.6 % and left ~20 ms per token that the
+//! table could not name — larger than ik's whole step. Three rules for reading their
+//! rows:
+//!
+//!   * **Typeless sites record through [`record_time`]** under the sentinel type
+//!     `GgmlType::Unknown(0)` (tag 0 is F32, so no tensor in any file can produce
+//!     it) and print `-` in the `ty` column. Their `rows`/`k`/`weight MB` are 0
+//!     because there is no contraction and no weight walk to count — that is the
+//!     reason the row exists, not missing data. `rms_norm` (F32 gain bytes),
+//!     `flash_attn_latent` (F16 KV bytes) and `f32_tensor` (the F32 byte walk
+//!     itself) do read weight-shaped bytes and fill their columns honestly.
+//!   * **They are level 1 only**: their stage columns print 0.00 because the
+//!     quant/dequant/dot split is a matmul statement. Splitting one of them is a
+//!     later round's tool, chosen once this table says which site is worth it.
+//!   * **A site that wraps already-hooked calls records self time.** `wv_b_heads`
+//!     times its whole call and subtracts what its sixteen `matmul_q` children
+//!     recorded in the interval ([`site_ns_total`]); `gain` does the same around
+//!     its `f32_tensor` child. The coverage numerator never counts the same
+//!     nanoseconds twice — an outer timer that included its children would let
+//!     coverage drift past 100 % and stop meaning anything.
+//!
 //! The gate for this module is `tests/profile.rs` (`just gate-profile`): profiling must
 //! not change the logits by one bit, every hooked site must record, and the instrumented
-//! sites must cover ≥ 80 % of one decode step's wall time — that last one is how an
+//! sites must cover ≥ 98 % of one decode step's wall time — that last one is how an
 //! unhooked hot loop gets caught.
 
 use gguf::GgmlType;
@@ -143,6 +165,38 @@ pub fn record(
     e.ns_dot += acc.ns_dot;
 }
 
+/// The typeless sibling of [`record`]: a site that reads no weight matrix of its
+/// own — residual adds, rope, softmax, activation shuffling — still owes the
+/// coverage table its wall time, but has no `rows`/`k`/`weight_bytes` worth
+/// printing, so those land as 0 (see the module doc: that is the reason the row
+/// exists, not missing data). The row keys under the sentinel
+/// `GgmlType::Unknown(0)`, which `report` prints as `-`; tag 0 is F32, so no
+/// tensor in any file can collide with it. Level-1 only by construction: there
+/// are no matmul stages to split, and the stage columns stay 0.00.
+pub fn record_time(site: &'static str, total_ns: u64) {
+    let mut map = ACCS.lock().expect("profiler accumulator mutex");
+    let e = map.entry((site, GgmlType::Unknown(0))).or_default();
+    e.calls += 1;
+    e.ns_total += total_ns;
+}
+
+/// Whole-call time already recorded under `site`, summed over weight types.
+/// A site that wraps already-hooked children (`wv_b_heads` spins sixteen
+/// `matmul_q` calls; `gain` wraps one `f32_tensor`) times itself whole-call and
+/// subtracts what the children recorded in the interval, so the coverage
+/// numerator never counts the same nanoseconds twice. Sound on one thread:
+/// `record` fires on the calling thread, so a before/after diff around a call is
+/// exactly that call's children and nothing else's.
+#[doc(hidden)]
+pub fn site_ns_total(site: &str) -> u64 {
+    ACCS.lock()
+        .expect("profiler accumulator mutex")
+        .iter()
+        .filter(|((s, _), _)| *s == site)
+        .map(|(_, a)| a.ns_total)
+        .sum()
+}
+
 /// Drop everything recorded so far. The decode binary calls this between the prefill
 /// report and the decode loop so the two tables do not mix work.
 pub fn reset() {
@@ -226,10 +280,17 @@ pub fn report(wall_ns: u64, label: &str) -> String {
         } else {
             0.0
         };
+        // `Unknown(0)` is the typeless sentinel (see `record_time`), not a type
+        // a file ever produced — the row says "-" instead of pretending one.
+        let ty_str = if *ty == GgmlType::Unknown(0) {
+            "-".to_string()
+        } else {
+            format!("{ty:?}")
+        };
         let base = format!(
             "{:<20} {:<6} {:>8} {:>10} {:>10.2} {} {:>6.1}%",
             site,
-            format!("{ty:?}"),
+            ty_str,
             a.calls,
             a.rows,
             a.weight_bytes as f64 / 1e6,

@@ -122,6 +122,18 @@ pub fn block_attn_cached(
     range: &std::ops::Range<usize>,
     derived: &Derived,
 ) -> Result<AttnTrace, ModelError> {
+    // Profiler hook (crate::profile), coverage round: the attention prep that is
+    // not a matmul, as piece timers around the un-hooked regions only — the
+    // matmuls keep their own rows and coverage never counts a nanosecond twice:
+    //   * `attn_params` — `MlaParams::read` and the five tensor finds, every one
+    //     a linear scan of the tensor table (four pieces, they interleave with
+    //     the hooked calls).
+    //   * `attn_latent` — the latent copy out of `kv_rope_compressed`.
+    //   * `attn_rope`   — the cos/sin caches and the k/q rope applications.
+    //   * `attn_kvr`    — the kvr concat, the f32→f16 rounding and the cache push.
+    let lvl = profile::level();
+    let mut params_ns = 0u64;
+    let t_p1 = if lvl > 0 { Some(Instant::now()) } else { None };
     let p = MlaParams::read(gguf, block)?;
     let slots = q_slots;
     if slots.len() != x.ne1 {
@@ -138,21 +150,33 @@ pub fn block_attn_cached(
     // 1. The two projections out of the normed activations.
     let wq = find(gguf, &format!("blk.{block}.attn_q.weight"))?;
     let wa = find(gguf, &format!("blk.{block}.attn_kv_a_mqa.weight"))?;
+    if let Some(t_p1) = t_p1 {
+        params_ns += t_p1.elapsed().as_nanos() as u64;
+    }
     let q = matmul_q(gguf, wq, x)?;
     let kv_rope_compressed = matmul_q(gguf, wa, x)?;
 
     // 2. Latent norm. The gain is F32 in the file.
+    let t_p2 = if lvl > 0 { Some(Instant::now()) } else { None };
     let gain_t = find(gguf, &format!("blk.{block}.attn_kv_a_norm.weight"))?;
+    if let Some(t_p2) = t_p2 {
+        params_ns += t_p2.elapsed().as_nanos() as u64;
+    }
     let gain = f32_tensor(gguf, gain_t)?;
+    let t_lat = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut latent = Tensor2::zeros(p.latent, x.ne1);
     for t in 0..x.ne1 {
         let src = &kv_rope_compressed.col(t)[..p.latent];
         latent.col_mut(t).copy_from_slice(src);
     }
+    if let Some(t_lat) = t_lat {
+        profile::record_time("attn_latent", t_lat.elapsed().as_nanos() as u64);
+    }
     let kv_compressed = rms_norm(&latent, &gain, p.eps);
 
     // 3. Rope: one cos/sin cache per position, shared by every head. k_rope comes from
     //    the kv_a tail, q_rope from each q head's rope slice.
+    let t_rope = if lvl > 0 { Some(Instant::now()) } else { None };
     let caches: Vec<Vec<f32>> = slots.iter().map(|s| p.rope.cache(s.pos)).collect();
     let mut k_rope = Tensor2::zeros(p.rope_dims, x.ne1);
     let mut q_rope = Tensor2::zeros(p.rope_dims, p.n_head * x.ne1);
@@ -166,8 +190,12 @@ pub fn block_attn_cached(
             rope_pair(qsrc, q_rope.col_mut(t * p.n_head + h), cache);
         }
     }
+    if let Some(t_rope) = t_rope {
+        profile::record_time("attn_rope", t_rope.elapsed().as_nanos() as u64);
+    }
 
     // 4. kvr = [k_rope ; kv_compressed] (order verified against the oracle dump).
+    let t_kvr = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut kvr = Tensor2::zeros(kv_width, x.ne1);
     for t in 0..x.ne1 {
         let dst = kvr.col_mut(t);
@@ -187,12 +215,19 @@ pub fn block_attn_cached(
         })
         .collect();
     cache.push(cache_block, range, new_rows);
+    if let Some(t_kvr) = t_kvr {
+        profile::record_time("attn_kvr", t_kvr.elapsed().as_nanos() as u64);
+    }
 
     // 6. q_nope2 = wk_b(Q8_0)ᵀ q_nope per head — the weight absorption. The wk_b
     //    requant is weight work and lives in `Derived`; only the per-token half
     //    runs here. `block` (the model's) selects the derived weights — never
     //    `cache_block`, which is 0 on the scratch path.
+    let t_p3 = if lvl > 0 { Some(Instant::now()) } else { None };
     let wkb = find(gguf, &format!("blk.{block}.attn_kv_b.weight"))?;
+    if let Some(t_p3) = t_p3 {
+        params_ns += t_p3.elapsed().as_nanos() as u64;
+    }
     let q_nope2 = q_nope2_absorbed(derived.wk_b_all_heads(block)?, &q, &p)?;
 
     // 7. Attention over the latent.
@@ -207,7 +242,14 @@ pub fn block_attn_cached(
 
     // 8. wv_b (still Q3_K) per head, then the output projection.
     let kqv_2d = wv_b_heads(gguf, wkb, &kqv_compressed, &p)?;
+    let t_p4 = if lvl > 0 { Some(Instant::now()) } else { None };
     let wo = find(gguf, &format!("blk.{block}.attn_output.weight"))?;
+    if let Some(t_p4) = t_p4 {
+        params_ns += t_p4.elapsed().as_nanos() as u64;
+    }
+    if lvl > 0 {
+        profile::record_time("attn_params", params_ns);
+    }
     let kqv_out = matmul_q(gguf, wo, &kqv_2d)?;
 
     Ok(AttnTrace {
@@ -756,6 +798,15 @@ pub fn flash_attn_latent(
     q_slots: &[Slot],
     p: &MlaParams,
 ) -> Tensor2 {
+    // Profiler hook (crate::profile): level-1 timer over the whole kernel. The
+    // shape statement: `rows` is the (token, head) query rows produced, `k` the
+    // keys·d_head dot work each row walks, and `weight_bytes` the f16 KV rows
+    // read at least once — V is the latent tail of the same rows, so the bytes
+    // are counted once. Level 1 only: a kq-dot / softmax / V-accumulate stage
+    // split is a later round's tool, worth building once this row says whether
+    // the site is big enough to care.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     // Queries and keys are two different counts the moment a KV cache exists: one
     // decode step is a single query against a whole prefix. They were one array while
     // the batch WAS the cache, and every index below that reads `n_tokens` is a query
@@ -848,6 +899,18 @@ pub fn flash_attn_latent(
             }
         }
     }
+    if let Some(t_call) = t_call {
+        let acc = profile::CallAcc::new();
+        profile::record(
+            "flash_attn_latent",
+            gguf::GgmlType::F16,
+            (n_tokens * p.n_head) as u64,
+            (key_slots.len() * d_head) as u64,
+            (key_slots.len() * d_head * 2) as u64,
+            t_call.elapsed().as_nanos() as u64,
+            &acc,
+        );
+    }
     out
 }
 
@@ -864,6 +927,20 @@ pub fn wv_b_heads(
     kqv_compressed: &Tensor2,
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
+    // Profiler hook (crate::profile): SELF time — the whole call minus what its
+    // sixteen hooked `matmul_q` children recorded (see `profile::site_ns_total`).
+    // What is left is the per-head activation gather, the view builds and the
+    // scatter into `kqv_2d`. Per-piece timers were rejected on the overhead
+    // rule: a piece here is a 512-float copy, the same order as an Instant
+    // pair, so pieces would measure the timer. The subtraction form measures
+    // the shuffling once, honestly.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
+    let mm_before = if lvl > 0 {
+        profile::site_ns_total("matmul_q")
+    } else {
+        0
+    };
     let row_bytes =
         wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
     let n_tokens = kqv_compressed.ne1 / p.n_head;
@@ -889,6 +966,11 @@ pub fn wv_b_heads(
             let dst = kqv_2d.col_mut(t);
             dst[h * p.v_head..(h + 1) * p.v_head].copy_from_slice(out_h.col(t));
         }
+    }
+    if let Some(t_call) = t_call {
+        let child = profile::site_ns_total("matmul_q") - mm_before;
+        let self_ns = (t_call.elapsed().as_nanos() as u64).saturating_sub(child);
+        profile::record_time("wv_b_heads", self_ns);
     }
     Ok(kqv_2d)
 }

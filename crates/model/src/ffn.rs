@@ -9,7 +9,9 @@
 //! Gate: `crates/model/tests/ffn.rs` against the oracle. Owned by the ffn round.
 use crate::ModelError;
 use crate::ops::{Tensor2, matmul_q};
+use crate::profile;
 use gguf::{Gguf, TensorInfo};
+use std::time::Instant;
 
 /// The (gate, up, down) weight trio for `block`'s dense-shaped FFN.
 ///
@@ -22,6 +24,11 @@ fn ffn_weights(
     gguf: &Gguf,
     block: usize,
 ) -> Result<(&TensorInfo, &TensorInfo, &TensorInfo), ModelError> {
+    // Profiler hook (crate::profile): resolving the trio costs up to six
+    // `find`s, each a linear scan of the tensor table — paid once per step for
+    // block 0's dense FFN. Level-1 only, typeless: nothing is read, only found.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let gate = format!("blk.{block}.ffn_gate.weight");
     let up = format!("blk.{block}.ffn_up.weight");
     let down = format!("blk.{block}.ffn_down.weight");
@@ -46,6 +53,9 @@ fn ffn_weights(
     let down_w = gguf
         .find(&down)
         .ok_or_else(|| ModelError::MissingTensor(down.clone()))?;
+    if let Some(t_call) = t_call {
+        profile::record_time("ffn_weights", t_call.elapsed().as_nanos() as u64);
+    }
     Ok((gate_w, up_w, down_w))
 }
 
@@ -54,6 +64,12 @@ fn ffn_weights(
 /// produces numbers and only the oracle tells them apart. ggml fuses this with
 /// the two matmuls as FUSED_UP_GATE; the gate pins the product, not the fusion.
 fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
+    // Profiler hook (crate::profile): the SiLU·up combine, level-1 typeless —
+    // activation work, no weight read. `moe.rs` runs two inline copies of this
+    // loop that record the SAME site, so one row answers "what does SwiGLU
+    // cost" across dense, shexp and routed experts.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     assert_eq!(
         (gate.ne0, gate.ne1),
         (up.ne0, up.ne1),
@@ -68,7 +84,11 @@ fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
             s * u
         })
         .collect();
-    Tensor2::from_vec(gate.ne0, gate.ne1, data)
+    let out = Tensor2::from_vec(gate.ne0, gate.ne1, data);
+    if let Some(t_call) = t_call {
+        profile::record_time("swiglu", t_call.elapsed().as_nanos() as u64);
+    }
+    out
 }
 
 /// The FUSED_UP_GATE stage over an already-resolved trio: two matmuls and the
