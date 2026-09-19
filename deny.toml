@@ -1,0 +1,22 @@
+# cargo deny — 의존성 감사. `just deny`.
+# 이 레포에서 제일 중요한 항목은 [sources]다. cuda-oxide가 git 의존이고,
+# rev 없이 떠 있으면 어제 잰 수치와 오늘 잰 수치가 다른 컴파일러에서 나온다.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "Unicode-3.0", "ISC"]
+# 우리 크레이트는 publish = false다. 라이선스 선택은 레포에 LICENSE를 둘 때 한다.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/NVlabs/cuda-oxide.git"]

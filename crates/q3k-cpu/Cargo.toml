@@ -2,8 +2,10 @@
 name = "q3k-cpu"
 version = "0.1.0"
 edition = "2024"
+publish = false   # 발행하지 않는다. cargo deny의 licenses.private가 이걸 본다.
 
-[workspace]
+[lints]
+workspace = true
 
 [dependencies]
-libc = "0.2"
+libc.workspace = true

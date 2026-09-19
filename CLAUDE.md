@@ -1,18 +1,26 @@
 # mulle — agent context
 
-한 워크스테이션을 위한 LLM 추론 엔진. Rust 호스트, CUDA Rust 커널(cuda-oxide, 뒤에 cutile-rs). 목표는 DeepSeek-V4.1-Flash, 디딤돌은 DeepSeek-V2-Lite-Chat Q3_K_M. 단계와 게이트는 [`docs/plan.md`](docs/plan.md).
+@AGENTS.md
+
+위 파일이 이 레포의 작업 계약이고 정본이다. 여기에는 Claude 세션에만 해당하는 것만 적는다.
+같은 사실을 두 곳에 적지 않는다.
 
 ## 추적
 
-이슈는 셀프호스트 트래커 **MUL** 프로젝트(`gadak --workspace gdk`, Mac에서는 `GADAK_HOME=$HOME/.gadak`, 빌드는 `/opt/homebrew/bin/gadak` — PATH의 dev 빌드는 미러 스키마를 못 읽는다). 단계마다 이슈 하나(MUL-1 ~ MUL-5), 기계 변경은 별도(MUL-6). 측정 수치는 [rig-log](https://github.com/midagedev/rig-log)의 `log/`에 먼저 기록하고 이슈에서 링크한다. `TODO.md`를 열지 않는다.
+이슈는 셀프호스트 트래커 **MUL** 프로젝트. `GADAK_HOME=$HOME/.gadak gadak --workspace gdk`이고
+Mac에서는 `/opt/homebrew/bin/gadak`을 쓴다(PATH의 dev 빌드는 미러 스키마를 못 읽는다).
+댓글은 `gadak --workspace gdk comment <KEY> "<본문>"`이다 — `issue comment`가 아니다.
+단계마다 이슈 하나(MUL-1 ~ MUL-5), 기계 변경은 MUL-6, 업스트림은 MUL-7.
+측정 수치는 [rig-log](https://github.com/midagedev/rig-log)의 `log/`에 먼저 쓰고 이슈에서 링크한다.
+`TODO.md`를 열지 않는다.
 
-## 빌드·실행
+## 위임
 
-개발은 박스의 RTX 3090에서. Mac에서 편집하고 `tools/box.sh <명령>`으로 트리를 rsync한 뒤 박스에서 돈다(환경은 박스의 `~/mulle-env.sh`: nightly-2026-08-28, LLVM 21.1.8 타르볼, CUDA 13.0, 3090 핀). 박스에서 직접 편집하지 않는다 — rsync가 `--delete`다. A6000은 서빙·야간 학습이 쥐고 있으니 건드리지 않는다.
+구현 라운드는 `outsource` 스킬로 내보낸다. 워크트리를 트랙마다 따로 주고, 스펙에는
+`AGENTS.md`의 해당 조항을 복사해 넣는다 — 위임받는 모델이 그 파일을 읽는다고 가정하지 않는다.
+게이트는 위임 결과를 받은 뒤 리드가 자기 소유로 다시 돌린다. 커밋·푸시는 리드 전용이다.
 
-## 관례
+## 이 레포의 한국어
 
-- 숫자는 측정한 것만, 도출이면 도출이라 밝힌다. 틀리면 선을 그어 정정한다(rig-log와 같다).
-- 커널은 Rust만. 참조 하네스(`tools/ref/`)는 ggml에 링크하는 C++이고 그 목적은 진실값과 기준 속도다.
-- 각 crate의 `rust-toolchain.toml`이 nightly를 고정한다. 바꾸는 것은 cuda-oxide 핀이 움직일 때만.
-- 이 리포 안 산문은 한국어, 코드 주석과 업스트림으로 나가는 글은 영어.
+산문은 한국어로 쓴다. `AGENTS.md`와 코드 주석, 업스트림으로 나가는 문서는 영어다.
+한국어 산문은 위임하지 않고 리드가 직접 쓴다.

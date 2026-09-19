@@ -2,11 +2,13 @@
 name = "q3k-gemv"
 version = "0.1.0"
 edition = "2024"
+publish = false   # 발행하지 않는다. cargo deny의 licenses.private가 이걸 본다.
 
-[workspace]
+[lints]
+workspace = true
 
 [dependencies]
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-device.workspace = true
+cuda-host.workspace = true
 # Shared host-side runtime, published from NVlabs/cutile-rs.
-cuda-core = "0.3.1"
+cuda-core.workspace = true

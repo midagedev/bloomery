@@ -1,0 +1,14 @@
+# 테스트 러너 설정. 아직 테스트가 없다(MUL-12에서 오라클 대조 테스트가 들어온다).
+# 이 파일이 먼저 있는 이유는, 기계를 요구하는 테스트가 빠른 루프에 섞이지 않게 하는
+# 경계를 테스트보다 먼저 정해 두기 위해서다.
+
+[profile.default]
+# GPU·조용한 기계를 요구하는 테스트는 기본 실행에서 뺀다. 이름에 hw_를 붙인다.
+default-filter = "not test(/^hw_/)"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[profile.hw]
+# `cargo nextest run --profile hw` — 박스에서, 측정 러너가 임대를 쥔 뒤에만.
+default-filter = "all()"
+test-threads = 1
+slow-timeout = { period = "600s" }

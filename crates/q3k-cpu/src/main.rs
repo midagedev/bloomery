@@ -175,9 +175,10 @@ unsafe fn field_dot<const SHIFT: i32, const BIT: i32, const M: usize>(
 ) {
     unsafe {
         let q3l = _mm256_and_si256(_mm256_srli_epi16::<SHIFT>(q3bits), m3);
-        let q3h = _mm256_slli_epi16::<2>(
-            _mm256_srli_epi16::<BIT>(_mm256_andnot_si256(hbits, _mm256_slli_epi16::<BIT>(mone))),
-        );
+        let q3h = _mm256_slli_epi16::<2>(_mm256_srli_epi16::<BIT>(_mm256_andnot_si256(
+            hbits,
+            _mm256_slli_epi16::<BIT>(mone),
+        )));
         let sc = _mm256_shuffle_epi8(scales_j, shuf_f);
         for c in 0..M {
             // qs of Q8_K block `sb` of column c: block at
@@ -255,22 +256,38 @@ unsafe fn dot_row<const M: usize>(w: *const u8, cols: *const u8, y: *mut f32) {
                 // j=0: fields 0..3 → (SHIFT, BIT, q8off) = (2f, f, 32f)
                 // j=1: fields 0..3 → (2f, 4+f, 128+32f)
                 if j == 0 {
-                    field_dot::<0, 0, M>(sb, cols, 0, hbits, q3bits, scj, shuf[0], m3, mone, &mut sumi);
-                    field_dot::<2, 1, M>(sb, cols, 32, hbits, q3bits, scj, shuf[1], m3, mone, &mut sumi);
-                    field_dot::<4, 2, M>(sb, cols, 64, hbits, q3bits, scj, shuf[2], m3, mone, &mut sumi);
-                    field_dot::<6, 3, M>(sb, cols, 96, hbits, q3bits, scj, shuf[3], m3, mone, &mut sumi);
+                    field_dot::<0, 0, M>(
+                        sb, cols, 0, hbits, q3bits, scj, shuf[0], m3, mone, &mut sumi,
+                    );
+                    field_dot::<2, 1, M>(
+                        sb, cols, 32, hbits, q3bits, scj, shuf[1], m3, mone, &mut sumi,
+                    );
+                    field_dot::<4, 2, M>(
+                        sb, cols, 64, hbits, q3bits, scj, shuf[2], m3, mone, &mut sumi,
+                    );
+                    field_dot::<6, 3, M>(
+                        sb, cols, 96, hbits, q3bits, scj, shuf[3], m3, mone, &mut sumi,
+                    );
                 } else {
-                    field_dot::<0, 4, M>(sb, cols, 128, hbits, q3bits, scj, shuf[0], m3, mone, &mut sumi);
-                    field_dot::<2, 5, M>(sb, cols, 160, hbits, q3bits, scj, shuf[1], m3, mone, &mut sumi);
-                    field_dot::<4, 6, M>(sb, cols, 192, hbits, q3bits, scj, shuf[2], m3, mone, &mut sumi);
-                    field_dot::<6, 7, M>(sb, cols, 224, hbits, q3bits, scj, shuf[3], m3, mone, &mut sumi);
+                    field_dot::<0, 4, M>(
+                        sb, cols, 128, hbits, q3bits, scj, shuf[0], m3, mone, &mut sumi,
+                    );
+                    field_dot::<2, 5, M>(
+                        sb, cols, 160, hbits, q3bits, scj, shuf[1], m3, mone, &mut sumi,
+                    );
+                    field_dot::<4, 6, M>(
+                        sb, cols, 192, hbits, q3bits, scj, shuf[2], m3, mone, &mut sumi,
+                    );
+                    field_dot::<6, 7, M>(
+                        sb, cols, 224, hbits, q3bits, scj, shuf[3], m3, mone, &mut sumi,
+                    );
                 }
             }
             for c in 0..M {
                 // d of Q8_K block sb of column c sits at the block start.
                 // SAFETY: unaligned f32 read inside the column buffer.
-                let dcol =
-                    (cols.add(c * NB * Q8K_STRIDE + sb * Q8K_STRIDE) as *const f32).read_unaligned();
+                let dcol = (cols.add(c * NB * Q8K_STRIDE + sb * Q8K_STRIDE) as *const f32)
+                    .read_unaligned();
                 acc[c] += dcol * d * hsum_i32(sumi[c]) as f32;
             }
         }
@@ -364,7 +381,11 @@ struct Barrier {
 
 impl Barrier {
     fn new(n: usize) -> Self {
-        Self { n, count: std::sync::atomic::AtomicUsize::new(0), sense: AtomicBool::new(false) }
+        Self {
+            n,
+            count: std::sync::atomic::AtomicUsize::new(0),
+            sense: AtomicBool::new(false),
+        }
     }
 
     fn wait(&self, local: &mut bool) {
@@ -433,6 +454,10 @@ unsafe fn phase_a(job: &Job) {
 unsafe fn phase_b(job: &Job) {
     unsafe {
         for r in job.rows.clone() {
+            // Documented exception, not a relaxation: the lever is off, so clippy is right
+            // that this branch is dead. Levers belong behind #[cfg(feature)] so the on-side
+            // also compiles and gets tested — MUL-11. Until then the branch stays readable.
+            #[allow(clippy::absurd_extreme_comparisons)]
             if PREFETCH_ROWS > 0 {
                 let ahead = (r + PREFETCH_ROWS).min(job.rows.end - 1);
                 let wp = job.w.add(ahead * ROW_BYTES);
@@ -474,10 +499,18 @@ fn assignments(
         let cpu = topo[ccd][slot];
         let per_ccd = n_rows / nccd;
         let start = ccd * per_ccd;
-        let ccd_rows = if ccd == nccd - 1 { n_rows - start } else { per_ccd };
+        let ccd_rows = if ccd == nccd - 1 {
+            n_rows - start
+        } else {
+            per_ccd
+        };
         let sub = ccd_rows / tpc;
         let r0 = start + slot * sub;
-        let r1 = if slot == tpc - 1 { start + ccd_rows } else { r0 + sub };
+        let r1 = if slot == tpc - 1 {
+            start + ccd_rows
+        } else {
+            r0 + sub
+        };
         let tot = m * NB;
         let qb = tot / threads;
         let b0 = t * qb;
@@ -510,7 +543,15 @@ fn run_config(
     let us = std::thread::scope(|s| {
         for t in 0..main_t {
             let (rows, qblocks, cpu) = assign[t].clone();
-            let job = Job { w, x, cols: cols_p, y: y_p, rows, qblocks, m };
+            let job = Job {
+                w,
+                x,
+                cols: cols_p,
+                y: y_p,
+                rows,
+                qblocks,
+                m,
+            };
             let bar = &bar;
             let done = &done;
             s.spawn(move || {
@@ -534,7 +575,15 @@ fn run_config(
         // SAFETY: main takes the last slot's assignment.
         unsafe { pin(assign[main_t].2) };
         let (rows, qblocks, _) = assign[main_t].clone();
-        let job = Job { w, x, cols: cols_p, y: y_p, rows, qblocks, m };
+        let job = Job {
+            w,
+            x,
+            cols: cols_p,
+            y: y_p,
+            rows,
+            qblocks,
+            m,
+        };
         let it = |local: &mut bool| {
             bar.wait(local);
             unsafe { phase_a(&job) };
@@ -583,8 +632,7 @@ fn load_weights(path: &str, n: usize) -> (*const u8, Vec<u8>) {
                 0,
                 "madvise(MADV_HUGEPAGE) failed"
             );
-            let mut f = std::fs::File::open(path)
-                .unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let mut f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
             let mut dst = std::slice::from_raw_parts_mut(aligned as *mut u8, n);
             f.read_exact(&mut dst)
                 .unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -632,9 +680,24 @@ fn main() {
         wbytes: usize,
     }
     let shapes = [
-        Shape { name: "expert0", w: gate, n: 1408, wbytes: 1408 * ROW_BYTES },
-        Shape { name: "stack", w: gate, n: 90_112, wbytes: GATE_BYTES },
-        Shape { name: "big", w: big, n: 360_448, wbytes: BIG_BYTES },
+        Shape {
+            name: "expert0",
+            w: gate,
+            n: 1408,
+            wbytes: 1408 * ROW_BYTES,
+        },
+        Shape {
+            name: "stack",
+            w: gate,
+            n: 90_112,
+            wbytes: GATE_BYTES,
+        },
+        Shape {
+            name: "big",
+            w: big,
+            n: 360_448,
+            wbytes: BIG_BYTES,
+        },
     ];
 
     let mut all_ok = true;

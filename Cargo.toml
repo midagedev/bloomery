@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/q3k-gemv", "crates/q3k-cpu"]
+# 의도적으로 컴파일되지 않는 재현기다(MUL-7). 워크스페이스에 넣으면 --workspace가 영구히 빨갛다.
+exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_smoke"]
+
+[workspace.dependencies]
+# cuda-oxide는 rev로 고정한다. 떠 있으면 어제의 수치와 오늘의 수치가 다른 컴파일러에서 나온다.
+cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+cuda-core = "0.3.1"
+libc = "0.2"
+
+# 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"     # 적중 0
+
+[workspace.lints.clippy]
+missing_safety_doc = "deny"         # 적중 0
+undocumented_unsafe_blocks = "warn" # 적중 54 — deny로 올리는 것은 MUL-10

@@ -1,6 +1,6 @@
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
-    dotprod::dp4a_s32, DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp,
+    DisjointSlice, dotprod::dp4a_s32, kernel, launch_bounds, launch_contract, thread, warp,
 };
 use cuda_host::cuda_module;
 
@@ -59,7 +59,12 @@ mod kernels {
         block = (32, 1, 1),
         requires = (x.len() >= m_cols * 2048, q.len() >= m_cols * 512, d8.len() >= m_cols * 16)
     )]
-    pub fn q3k_quantize_q8_1(x: &[f32], m_cols: u32, mut q: DisjointSlice<u32>, mut d8: DisjointSlice<f32>) {
+    pub fn q3k_quantize_q8_1(
+        x: &[f32],
+        m_cols: u32,
+        mut q: DisjointSlice<u32>,
+        mut d8: DisjointSlice<f32>,
+    ) {
         // One 32-thread block per 128-value quant block: blk is the BLOCK
         // index (global tid / 32), not the thread id.
         let blk = thread::index_1d().get() / 32;
@@ -80,9 +85,7 @@ mod kernels {
         let v1 = unsafe { *x.get_unchecked(base + 1) };
         let v2 = unsafe { *x.get_unchecked(base + 2) };
         let v3 = unsafe { *x.get_unchecked(base + 3) };
-        let amax = warp::reduce_max_f32(
-            v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()),
-        );
+        let amax = warp::reduce_max_f32(v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()));
         let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
         let q0 = ((v0 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
         let q1 = ((v1 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
@@ -181,7 +184,11 @@ mod kernels {
             // <= w.len() by the launch contract (word indices stay inside the
             // row's 220 words; odd super-blocks only shift the window by 2).
             let (lo, hi) = unsafe { (*w.get_unchecked(qk), *w.get_unchecked(qk + 1)) };
-            let vl = if par == 0 { lo } else { (lo >> 16) | (hi << 16) };
+            let vl = if par == 0 {
+                lo
+            } else {
+                (lo >> 16) | (hi << 16)
+            };
 
             // hmask word (bytes base+4*(w16%8) .. +3), one bit per weight:
             // bit 4*(w16/8)+field. Invert so a clear hmask bit (subtract 4)
@@ -190,7 +197,11 @@ mod kernels {
             // SAFETY: same row/sbp/w16 bounds as the qs window above; hk+1 <
             // (row+1)*220 <= w.len().
             let (hlo, hhi) = unsafe { (*w.get_unchecked(hk), *w.get_unchecked(hk + 1)) };
-            let hm = if par == 0 { hlo } else { (hlo >> 16) | (hhi << 16) };
+            let hm = if par == 0 {
+                hlo
+            } else {
+                (hlo >> 16) | (hhi << 16)
+            };
             let vh1 = (!hm) >> (4 * (w16 >> 3)) as u32;
 
             // scales: 12 bytes at base+96..108, decoded with the aux[]
@@ -228,23 +239,59 @@ mod kernels {
             // Super-block scale d (f16 at bytes base+108..109): low half of
             // aw3 for even sbp (word covers 108..111), high half for odd
             // (word covers 106..109).
-            let d_bits = if par == 0 { (aw3 & 0xffff) as u16 } else { (aw3 >> 16) as u16 };
+            let d_bits = if par == 0 {
+                (aw3 & 0xffff) as u16
+            } else {
+                (aw3 >> 16) as u16
+            };
             let drow = half_to_f32(d_bits);
 
             // Sub-block scales for fields 0..3: sub-block s0+2j, byte s&3 of
             // the t-word the if-chain picks (round-1 pattern, keeps constant
             // shifts out of local memory).
             let sx = s0;
-            let wx = if sx < 4 { t2 } else if sx < 8 { t3 } else if sx < 12 { t0 } else { t1 };
+            let wx = if sx < 4 {
+                t2
+            } else if sx < 8 {
+                t3
+            } else if sx < 12 {
+                t0
+            } else {
+                t1
+            };
             let sc0 = (((wx >> (8 * (sx & 3))) & 0xff) as u8 as i8 as i32) - 32;
             let sx = s0 + 2;
-            let wx = if sx < 4 { t2 } else if sx < 8 { t3 } else if sx < 12 { t0 } else { t1 };
+            let wx = if sx < 4 {
+                t2
+            } else if sx < 8 {
+                t3
+            } else if sx < 12 {
+                t0
+            } else {
+                t1
+            };
             let sc1 = (((wx >> (8 * (sx & 3))) & 0xff) as u8 as i8 as i32) - 32;
             let sx = s0 + 4;
-            let wx = if sx < 4 { t2 } else if sx < 8 { t3 } else if sx < 12 { t0 } else { t1 };
+            let wx = if sx < 4 {
+                t2
+            } else if sx < 8 {
+                t3
+            } else if sx < 12 {
+                t0
+            } else {
+                t1
+            };
             let sc2 = (((wx >> (8 * (sx & 3))) & 0xff) as u8 as i8 as i32) - 32;
             let sx = s0 + 6;
-            let wx = if sx < 4 { t2 } else if sx < 8 { t3 } else if sx < 12 { t0 } else { t1 };
+            let wx = if sx < 4 {
+                t2
+            } else if sx < 8 {
+                t3
+            } else if sx < 12 {
+                t0
+            } else {
+                t1
+            };
             let sc3 = (((wx >> (8 * (sx & 3))) & 0xff) as u8 as i8 as i32) - 32;
 
             // Dequantize the four quads to signed bytes (SWAR): vi byte b =
@@ -418,10 +465,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wbytes: usize,
     }
     let shapes = [
-        Shape { name: "expert0_m1", n: 1408, m: 1, wbytes: 1239040 },
-        Shape { name: "expert0_m8", n: 1408, m: 8, wbytes: 1239040 },
-        Shape { name: "stack_m1", n: 90112, m: 1, wbytes: 79298560 },
-        Shape { name: "stack_m8", n: 90112, m: 8, wbytes: 79298560 },
+        Shape {
+            name: "expert0_m1",
+            n: 1408,
+            m: 1,
+            wbytes: 1239040,
+        },
+        Shape {
+            name: "expert0_m8",
+            n: 1408,
+            m: 8,
+            wbytes: 1239040,
+        },
+        Shape {
+            name: "stack_m1",
+            n: 90112,
+            m: 1,
+            wbytes: 79298560,
+        },
+        Shape {
+            name: "stack_m8",
+            n: 90112,
+            m: 8,
+            wbytes: 79298560,
+        },
     ];
 
     let mut all_ok = true;
@@ -430,21 +497,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut q_dev = DeviceBuffer::<u32>::zeroed(&stream, sh.m * 512)?;
         let mut d8_dev = DeviceBuffer::<f32>::zeroed(&stream, sh.m * 16)?;
         let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, sh.n * sh.m)?;
-        let prep_q = module.prepare_q3k_quantize_q8_1(LaunchConfig1D::new(
-            16 * sh.m as u32,
-            32,
-            0,
-        ))?;
-        let prep_g = module.prepare_q3k_gemv(LaunchConfig1D::new(
-            sh.n.div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let prep_q =
+            module.prepare_q3k_quantize_q8_1(LaunchConfig1D::new(16 * sh.m as u32, 32, 0))?;
+        let prep_g =
+            module.prepare_q3k_gemv(LaunchConfig1D::new(sh.n.div_ceil(8) as u32, 256, 0))?;
         // One timed iteration = quantize x + gemv, matching what ggml's
         // mul_mat graph does per call.
-        let mut launch = |q_dev: &mut DeviceBuffer<u32>, d8_dev: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn std::error::Error>> {
+        let mut launch = |q_dev: &mut DeviceBuffer<u32>,
+                          d8_dev: &mut DeviceBuffer<f32>|
+         -> Result<(), Box<dyn std::error::Error>> {
             module.q3k_quantize_q8_1(&stream, &prep_q, x_dev, sh.m as u32, q_dev, d8_dev)?;
-            module.q3k_gemv(&stream, &prep_g, &w_dev, q_dev, d8_dev, sh.n as u32, sh.m as u32, &mut y_dev)?;
+            module.q3k_gemv(
+                &stream,
+                &prep_g,
+                &w_dev,
+                q_dev,
+                d8_dev,
+                sh.n as u32,
+                sh.m as u32,
+                &mut y_dev,
+            )?;
             Ok(())
         };
         for _ in 0..20 {
