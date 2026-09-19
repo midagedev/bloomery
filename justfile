@@ -49,6 +49,11 @@ build-decode:
 measure-decode: build-decode
     ./tools/box.sh 'bash tools/ref/decode-measure.sh'
 
+# 시간 귀속. 러너가 임대와 증인을 소유한다 — 프로파일 표도 측정이고, 옆에서 빌드
+# 하나만 돌아도 site 간 비율이 흔들린다. 레벨 1(배분)과 2(단계)를 연달아 찍는다.
+measure-profile: build-decode
+    ./tools/box.sh 'bash tools/ref/profile-measure.sh'
+
 # 참조 하네스(ggml에 링크하는 C++). 진실값과 기준 속도의 출처다.
 build-ref:
     ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh'
