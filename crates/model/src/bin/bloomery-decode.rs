@@ -87,7 +87,9 @@ fn main() {
         "main   pinned={pinned} threads={}",
         threads::pool().threads()
     );
-    let g = gguf::Gguf::open(&model).expect("model file");
+    // `BLOOMERY_POPULATE=0` keeps the lazy mapping, for the A/B.
+    let populate = std::env::var("BLOOMERY_POPULATE").map_or(true, |v| v != "0");
+    let g = gguf::Gguf::open_with(&model, populate).expect("model file");
     println!("model  {model}");
     println!("open   {:?} (mmap, no dequant)", t_open.elapsed());
     // The wk_b Q8_0 requant, once per model instead of once per step. Its own

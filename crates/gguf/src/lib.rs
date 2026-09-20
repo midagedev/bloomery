@@ -112,12 +112,24 @@ impl Gguf {
     /// Parse `path` and validate every tensor's placement. The mmap is
     /// created read-only; nothing is copied.
     pub fn open(path: impl AsRef<Path>) -> Result<Gguf, LoadError> {
+        Self::open_with(path, false)
+    }
+
+    /// `open`, optionally prefaulting the whole mapping (`MAP_POPULATE`). A lazy
+    /// mapping takes a page fault on the first touch of every weight page, and
+    /// a MoE keeps meeting untouched experts for hundreds of steps; a process
+    /// that will decode pays that once here instead. Tests open lazily.
+    pub fn open_with(path: impl AsRef<Path>, populate: bool) -> Result<Gguf, LoadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
+        let mut opts = memmap2::MmapOptions::new();
+        if populate {
+            opts.populate();
+        }
         // SAFETY: the file is opened read-only and nothing maps it writable;
         // a concurrent truncation would surface as SIGBUS, the same contract
         // ik_llama.cpp's own mmap loader accepts.
-        let map = unsafe { Mmap::map(&file)? };
+        let map = unsafe { opts.map(&file)? };
 
         let mut rd = Reader {
             b: &map,
