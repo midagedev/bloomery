@@ -1220,16 +1220,21 @@ unsafe fn flash_row_avx2(
                 // only the sum order may differ from the scalar oracle.)
                 // Each key row is its own heap Vec, so the hardware
                 // prefetcher restarts at every row boundary; pull the next
-                // row's lines while this one is dotted. A prefetch is a
-                // cache hint, never a value — no scalar twin of this.
-                if let Some(next) = keys16.get(u + 1) {
-                    let base = next.as_ptr().cast::<u8>();
-                    let mut off = 0usize;
-                    while off < next.len() * 2 {
-                        // SAFETY: prefetch reads nothing; `off` stays inside
-                        // the row's own `len() * 2` bytes.
-                        _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
-                        off += 64;
+                // row's lines while this one is dotted. Decode rows only
+                // (`n_tokens == 1`): a prefill row meets every key in cache
+                // already, and the hint there cost prefill 2 % at depth 4096
+                // (rig-log 09-21-e). A prefetch is a cache hint, never a
+                // value — no scalar twin of this.
+                if n_tokens == 1 {
+                    if let Some(next) = keys16.get(u + 1) {
+                        let base = next.as_ptr().cast::<u8>();
+                        let mut off = 0usize;
+                        while off < next.len() * 2 {
+                            // SAFETY: prefetch reads nothing; `off` stays inside
+                            // the row's own `len() * 2` bytes.
+                            _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
+                            off += 64;
+                        }
                     }
                 }
                 // SAFETY: plus the fn contract: `u` indexes keys16 in bounds
