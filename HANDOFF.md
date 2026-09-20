@@ -36,6 +36,7 @@
 - **게이트**: 14개 just 레시피(gate-ops/attn/ffn/moe/head/forward/kv/derived/mt/profile/threads/qdot/prompts/1-1). 머지 후에는 영향 게이트 + mt/forward/prompts 재실행이 관례.
 - **핀 상태**: prompts KNOWN_DIVERGENCE = **{24}**(MUL-36 재핀, A/B 입증됨 — 이전 {14}). forward L_OUT_BANDS = (0,3e-3)(3,2e-3)(24,7e-2) + 날짜 주석. gate-mt는 재핀 불허 항목(스레드 무관 비트 동일).
 - **스코어보드(2026-09-20 저녁, 같은 임대)**: N=96 **61.48 tok/s** 대 ik 82.88 → **잔여 1.35배**(아침 39.71/2.10배). 경위는 rig-log -j: 청크 끝의 무조건 수집 Mutex 제거(+44%) → 메인 스레드 고정 → mmap 프리폴트(+3.5%; 프리필 +18%는 6토큰 프롬프트 기준). → rintf libm 호출 제거(+8.3%, 2b2fdb6).
+- **밤(rig-log -k)**: 같은 임대 A/B 상대값으로 61.5 → 64.8(SwiGLU 8레인 `qdot::swiglu`, 발산 집합 {24} → {}) → **67.8 tok/s**(`.cargo/config.toml` `target-cpu=znver3`). 조용하지 않은 박스에서의 헤드라인 1회는 65.40 대 ik tg32 82.63(1.26배) — 위임 라운드가 끝나면 다시 잰다. 산수가 바뀌었다: ik와 커널 스레드시간은 같은 선이고 차이는 워커 이용률(75% 대 51%), 즉 메인 스레드의 직렬 구간이다(`docs/cpu-dispatch-plan.md`). 스텝당 할당자 호출을 세는 래칫 게이트 `just gate-alloc`(14454 → 11463, LIMIT 11600). 진행 중: 워크트리 `bloomery-plan`(브랜치 `plan-derived`)에서 스텝 안의 로드 시점 일을 `Derived`로 옮기는 GLM 라운드 — 돌아오면 diff 리뷰, 게이트 재실행, `gate-profile` 바닥 96 → 재상향 검토, A/B.
 - **남은 산수**: 레벨2 dot 합/32 = 8.5 ms/step(완전 병렬 내적), ik 스텝 전체 12.1 ms, 우리 16.3 ms → 비내적 7.8 ms를 3.6 아래로. perf상 임계 경로는 메인 스레드 하나(워커는 표본의 51%를 스핀으로 대기): rintf 10% · memset 6.6% · expf 3.2% · 자기 청크+장벽 18%.
 - ~~**스테이지 표(N=96, 레벨1, 24.18 ms/step)**~~ (락 아래서 잰 표 — 새 표는 rig-log -j): batch Q3_K 24.1% · Q3_K 단일 18.4% · batch Q5_0 14.9% · Q4_K 13.5% · Q6_K(lm_head) 5.3% · q_nope2 5.1% · swiglu+F32+접착부 ~10% · **flash 0.40ms(1.6%)**. 전체 54.8 GB/s = STREAM의 37%.
 - 주의: 레벨2 quant 열은 MUL-37 이후 워커 CPU합(벽시간 아님).
@@ -79,6 +80,7 @@
 
 ```
 just measure-decode                    # N=8 창 + 같은 임대 ik (헤드라인)
+just gate-alloc                        # 정상 상태 스텝의 할당자 호출 수 (내려가기만 하는 래칫)
 just ab-decode bloomery-<track>        # 같은 임대 A/B — 디스패치 경로를 만진 라운드의 완료 조건 (절대값은 창마다 ~5% 움직인다)
 ./tools/box.sh 'BLOOMERY_DECODE_N=96 bash tools/ref/decode-measure.sh'   # N=96 창
 ./tools/box.sh 'BLOOMERY_DECODE_N=96 bash tools/ref/profile-measure.sh' # 스테이지 표 L1+L2

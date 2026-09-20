@@ -143,6 +143,18 @@ first suspect is a hung gate on the box, not the agent.
   by the interleaved relative numbers only — the same commit moves ~5 % between
   windows. Bit-identical is not speed-identical: an expression moved from a
   write-into-zeros loop to `map().collect()` doubled its site.
+- **The step does no load-time work.** Anything that does not depend on the
+  tokens — tensor lookups, names, metadata keys, views, decoded gains — is
+  resolved once into `Derived`; the calling thread's serial time is the step's
+  length because every worker waits on it. `just gate-alloc` counts allocator
+  calls per steady step and only ratchets down. Activation blocks come from
+  `Tensor2::scratch` (no zero fill) when every cell is written;
+  `BLOOMERY_POISON=1` turns a missed cell into a NaN the gates catch.
+- **Profile the binary you think you are profiling.** `tools/box.sh` syncs
+  source and builds nothing; run `just build-decode` first. `perf record -D`
+  skips startup, not teardown — cut the report with `--time`, or the
+  `munmap` of the populated mapping reads as step cost. Use `-e cpu-clock`
+  (the default IBS event misattributes symbols on this CPU).
 - `rust-toolchain.toml` at the root pins the nightly; it moves only when the
   cuda-oxide pin moves. `cuda-oxide` itself is pinned by `rev` in
   `[workspace.dependencies]`; `just deny` fails if that ever floats.
