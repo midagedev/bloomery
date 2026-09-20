@@ -607,27 +607,7 @@ fn hw_q4k_dot_row_matches_scalar_and_predicts() {
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q4k-x4-ik-dot.txt"))
         .expect("run tools/ref/q4k_x4_ref.cpp first (just build-ref does not build it)");
-    let mut dump_k = 0usize;
-    let mut want = Vec::new();
-    let mut ik_acol: Vec<u8> = Vec::new();
-    for line in dump.lines() {
-        let mut it = line.split_whitespace();
-        match (it.next(), it.next(), it.next(), it.next()) {
-            (Some("tensor"), Some(_), Some("k"), Some(kk)) => dump_k = kk.parse().unwrap(),
-            (Some("row"), Some(_), Some(hex), None) => {
-                want.push(u32::from_str_radix(hex, 16).expect("ik dumps raw f32 bits"));
-            }
-            // the one long hex line: ik's quantized activation bytes
-            (Some(hex), None, None, None) if hex.len() > 64 => {
-                let b = hex.as_bytes();
-                ik_acol.extend(
-                    b.chunks_exact(2)
-                        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap()),
-                );
-            }
-            _ => {}
-        }
-    }
+    let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
     assert_eq!(
         dump_k, k,
         "the dump and this scan must land on the same tensor"
@@ -723,27 +703,7 @@ fn hw_q6k_dot_row_matches_scalar_and_predicts() {
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q6k-x4-ik-dot.txt"))
         .expect("run tools/ref/q6k_x4_ref.cpp first (just build-ref does not build it)");
-    let mut dump_k = 0usize;
-    let mut want = Vec::new();
-    let mut ik_acol: Vec<u8> = Vec::new();
-    for line in dump.lines() {
-        let mut it = line.split_whitespace();
-        match (it.next(), it.next(), it.next(), it.next()) {
-            (Some("tensor"), Some(_), Some("k"), Some(kk)) => dump_k = kk.parse().unwrap(),
-            (Some("row"), Some(_), Some(hex), None) => {
-                want.push(u32::from_str_radix(hex, 16).expect("ik dumps raw f32 bits"));
-            }
-            // the one long hex line: ik's quantized activation bytes
-            (Some(hex), None, None, None) if hex.len() > 64 => {
-                let b = hex.as_bytes();
-                ik_acol.extend(
-                    b.chunks_exact(2)
-                        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap()),
-                );
-            }
-            _ => {}
-        }
-    }
+    let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
     assert_eq!(
         dump_k, k,
         "the dump and this scan must land on the same tensor"

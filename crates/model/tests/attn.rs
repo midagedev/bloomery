@@ -560,3 +560,204 @@ fn kq_reassoc_band(q: &[f32], k: &[u16]) -> f32 {
         .sum();
     2.0 * q.len() as f32 * 2.0f32.powi(-24) * sum_abs
 }
+
+/// The synthetic deterministic batch the flash-SIMD lever test runs on: the
+/// real MLA's shapes (576-wide row, 512 latent — a shape the SIMD path WOULD
+/// take: row width % 32 == 0, latent % 8 == 0) at a small head/token count.
+/// No model file, no oracle — only the box's ISA. One struct so the re-exec
+/// child and its parent test consume the same bytes.
+struct FlashLeverFixture {
+    p: model::attn::MlaParams,
+    q_rope: Tensor2,
+    q_nope2: Tensor2,
+    keys16: Vec<Vec<u16>>,
+    key_slots: Vec<Slot>,
+    q_slots: Vec<Slot>,
+}
+
+fn flash_lever_fixture() -> FlashLeverFixture {
+    let p = model::attn::MlaParams {
+        n_head: 2,
+        kq_head: 576,
+        nope: 512,
+        rope_dims: 64,
+        v_head: 128,
+        latent: 512,
+        eps: 1e-6,
+        // The rope fields are dead here — flash reads only the dims.
+        rope: model::attn::RopeParams {
+            n_dims: 64,
+            freq_base: 1e4,
+            freq_scale: 0.025,
+            ext_factor: 1.0,
+            mscale_param: 0.7,
+            corr_dims: [10.0, 23.0],
+            theta_scale: 0.8,
+        },
+        kq_scale: 0.078,
+    };
+    let mut rng = Lcg(0x1eed_0000_beef_cafe);
+    let n_tok = 3usize;
+    let n_keys = 100usize;
+
+    let mut q_rope = Tensor2::zeros(p.rope_dims, p.n_head * n_tok);
+    let mut q_nope2 = Tensor2::zeros(p.latent, p.n_head * n_tok);
+    for t in 0..n_tok {
+        for h in 0..p.n_head {
+            for v in q_rope.col_mut(t * p.n_head + h).iter_mut() {
+                *v = rng.range(-3.0, 3.0);
+            }
+            for v in q_nope2.col_mut(h * n_tok + t).iter_mut() {
+                *v = rng.range(-3.0, 3.0);
+            }
+        }
+    }
+    let mut keys16: Vec<Vec<u16>> = Vec::with_capacity(n_keys);
+    for _ in 0..n_keys {
+        let row: Vec<u16> = (0..p.rope_dims + p.latent)
+            .map(|_| model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)))
+            .collect();
+        keys16.push(row);
+    }
+    // Every query keeps at least one allowed key; the key count crosses
+    // three whole 32-key blocks plus a partial fourth.
+    let key_slots: Vec<Slot> = (0..n_keys)
+        .map(|u| Slot {
+            seq: if u < 50 { 0 } else { 1 },
+            pos: (u % 25) as u32,
+        })
+        .collect();
+    let q_slots: Vec<Slot> = [24u32, 0, 5]
+        .iter()
+        .map(|&pos| Slot { seq: 0, pos })
+        .collect();
+    FlashLeverFixture {
+        p,
+        q_rope,
+        q_nope2,
+        keys16,
+        key_slots,
+        q_slots,
+    }
+}
+
+/// The re-exec entry point of [`hw_flash_simd_lever_forces_scalar`]. Not a
+/// test of its own: when `BLOOMERY_FLASH_SIMD_CHILD_DUMP` is absent (i.e.
+/// someone ran the file directly) it returns without doing anything — the
+/// pattern `tests/mt.rs`'s child helper set (2026-09-20 hardening round).
+#[test]
+#[ignore = "hw: re-exec child of hw_flash_simd_lever_forces_scalar; standalone it is a no-op"]
+fn hw_flash_simd_lever_child_dump() {
+    let Ok(dump) = std::env::var("BLOOMERY_FLASH_SIMD_CHILD_DUMP") else {
+        eprintln!("lever child: no BLOOMERY_FLASH_SIMD_CHILD_DUMP, nothing to do");
+        return;
+    };
+    let f = flash_lever_fixture();
+    // The public dispatch: with BLOOMERY_FLASH_SIMD=0 the OnceLock in
+    // `flash_simd` must force the scalar row twin for the whole process.
+    let out = model::attn::flash_attn_latent(
+        &f.q_rope,
+        &f.q_nope2,
+        &f.keys16,
+        &f.key_slots,
+        &f.q_slots,
+        &f.p,
+    );
+    let bytes: Vec<u8> = out.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(&dump, &bytes).unwrap();
+    eprintln!(
+        "lever child: {} f32 ({} bytes) dumped to {dump}",
+        out.data.len(),
+        bytes.len()
+    );
+}
+
+/// HANDOFF names `BLOOMERY_FLASH_SIMD=0` the A/B instrument of record for
+/// re-pins, and nothing exercised the env branch (`flash_simd`'s OnceLock)
+/// before this test (2026-09-20 hardening round). The lever is proven the
+/// only way a process-wide flag can be: a re-exec'd child of this binary —
+/// same code, same fixture, the env var set — runs the PUBLIC
+/// `flash_attn_latent` and dumps its output bytes; the parent requires those
+/// bytes to equal its own in-process `flash_attn_latent_scalar` run on the
+/// same fixture. A broken lever (the child silently running the SIMD twin)
+/// moves the output by the kq sum-order ULPs and reds the byte compare.
+#[test]
+#[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
+fn hw_flash_simd_lever_forces_scalar() {
+    let f = flash_lever_fixture();
+
+    // The scalar oracle, in-process: the bit-exact twin the SIMD path is
+    // banded against by `hw_flash_simd_bands_against_scalar`.
+    let want = model::attn::flash_attn_latent_scalar(
+        &f.q_rope,
+        &f.q_nope2,
+        &f.keys16,
+        &f.key_slots,
+        &f.q_slots,
+        &f.p,
+    );
+    let want_bytes: Vec<u8> = want.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    // The child: fresh process, BLOOMERY_FLASH_SIMD=0, public entry point.
+    let exe = std::env::current_exe().unwrap();
+    let dump =
+        std::env::temp_dir().join(format!("bloomery-flash-lever-{}.f32", std::process::id()));
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "hw_flash_simd_lever_child_dump",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BLOOMERY_FLASH_SIMD", "0")
+        .env("BLOOMERY_FLASH_SIMD_CHILD_DUMP", &dump)
+        .output()
+        .expect("re-exec of this test binary");
+    assert!(
+        out.status.success(),
+        "lever child failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = std::fs::read(&dump).unwrap();
+    let at = got.iter().zip(&want_bytes).position(|(x, y)| x != y);
+    assert_eq!(
+        got,
+        want_bytes,
+        "BLOOMERY_FLASH_SIMD=0 did not force the scalar path: the child's \
+         flash_attn_latent output differs from flash_attn_latent_scalar \
+         (first differing byte at {at:?} of {})",
+        got.len()
+    );
+    eprintln!(
+        "lever child (env-forced) vs in-process scalar: byte-identical ({} bytes)",
+        got.len()
+    );
+
+    // Evidence only, deliberately NOT asserted: the parent's own dispatch
+    // leg (env unset, SIMD on this box) against the same scalar twin. It
+    // differing is expected — the documented kq reassociation band; it
+    // being byte-identical would mean this fixture cannot tell the two row
+    // twins apart, in which case the compare above proves nothing.
+    let simd = model::attn::flash_attn_latent(
+        &f.q_rope,
+        &f.q_nope2,
+        &f.keys16,
+        &f.key_slots,
+        &f.q_slots,
+        &f.p,
+    );
+    let same = simd
+        .data
+        .iter()
+        .zip(&want.data)
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    eprintln!(
+        "parent in-process flash_attn_latent (SIMD, env unset): {} the scalar twin on this fixture",
+        if same {
+            "byte-identical to"
+        } else {
+            "differs from"
+        }
+    );
+}

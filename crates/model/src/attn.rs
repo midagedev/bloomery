@@ -428,7 +428,18 @@ impl MlaParams {
         let latent = wkb.dims[0] as usize;
 
         // Derived geometry must close, or the file is not shaped like this MLA.
-        let nope = kq_head - rope_dims;
+        // checked_sub: key_length not covering the rope dims would underflow
+        // here (a debug panic today, a wrapped usize in release) — it is a
+        // malformed-file error, not an arithmetic one.
+        let Some(nope) = kq_head.checked_sub(rope_dims) else {
+            return Err(ModelError::Shape {
+                what: "kq_head - rope_dims (key_length must cover the rope dims)",
+                want_ne0: kq_head,
+                want_ne1: 0,
+                got_ne0: rope_dims,
+                got_ne1: 0,
+            });
+        };
         let check = |what: &'static str, want: usize, got: usize| -> Result<(), ModelError> {
             if want == got {
                 Ok(())
@@ -452,6 +463,28 @@ impl MlaParams {
             wa.dims[1] as usize,
             latent + rope_dims,
         )?;
+        // Geometry the kernels below would truncate SILENTLY or panic on —
+        // the same fail-loudly policy the two span checks above apply
+        // (2026-09-20 hardening round). The exact contracts encoded:
+        //   * nope % 32: `q_nope2_absorbed` works in 32-value blocks
+        //     (`nope / 32` at its head and `chunks_exact(32)` over the q row
+        //     would both drop a tail without a sound);
+        //   * (rope_dims + latent) % 8: EVERY kq dot leg steps the
+        //     d_head-wide row 8 values at a time — the scalar `kq_dot_fa4`'s
+        //     `step_by(8)` drops a tail silently, the SIMD leg's stricter
+        //     % 32 panel contract is `flash_simd`'s own gate and a legal
+        //     scalar fallback, NOT an error. `latent % 8` alone is likewise
+        //     SIMD-only (the scalar V loop is per-element), so it is not
+        //     encoded here;
+        //   * rope_dims % 2: rope rotates adjacent pairs — an odd width
+        //     would panic in `rope_pair`'s `src[i + 1]`.
+        check("nope axis (32-value blocks)", 0, nope % 32)?;
+        check(
+            "kq row width rope+latent (8-value chunks)",
+            0,
+            (rope_dims + latent) % 8,
+        )?;
+        check("rope dims (adjacent pairs)", 0, rope_dims % 2)?;
 
         // YaRN scalars in the graph's own f32 order (build_deepseek2.cpp:1250-1254).
         let freq_scale = 1.0 / scaling;
@@ -546,6 +579,9 @@ pub use qdot::Q8Block;
 /// on the gate (measured 2026-09-19). Verified byte-identical to the reference's
 /// derived `attn_k_b.weight` for block 0 (0 of 69632 bytes differ).
 pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
+    // One 32-value block at a time: a shorter slice would leave trailing
+    // codes at their 0 init silently (2026-09-20 hardening round).
+    assert_eq!(x.len(), 32, "quantize_q8_0: one 32-value block at a time");
     let mut amax = 0.0f32;
     for &v in x {
         amax = amax.max(v.abs());
@@ -582,8 +618,16 @@ fn bf16_round(x: f32) -> f32 {
 /// and the codes use `id = 1/d` on that rounded scale, RNE (the `_mm256_round_ps`
 /// there). Each difference alone moves gated values by up to 2⁻⁹ relative — far
 /// outside the 1e-4 gate. Found by bisection against the oracle (2026-09-19): with
-/// Q8_0 codes the q_nope2 residual is 4.6e-2; with this it is 1e-6. Codes past ±127
-/// saturate, as the reference's `packs_epi8` does.
+/// Q8_0 codes the q_nope2 residual is 4.6e-2; with this it is 1e-6.
+///
+/// Codes are clamped to ±127, and that bound is ENFORCED here (2026-09-20
+/// hardening round), not defensive: a -128 activation code under a negative
+/// weight code is the one input pair outside the sign-fold kernel's
+/// bit-identity contract (`qdot::q_nope2_cells_avx2_inner`; the derived
+/// producer bound — |code| < 127.25 before RNE — means the clamp never
+/// engages on legal inputs, so tightening -128 to -127 is bit-identical by
+/// derivation; gate-attn/forward/prompts prove it). `quantize_q8_0`'s clamp
+/// stays -128: a WEIGHT code of -128 is a legal magnitude for the fold.
 fn quantize_act(x: &[f32]) -> ActBlock {
     let mut amax = 0.0f32;
     for &v in x {
@@ -593,7 +637,7 @@ fn quantize_act(x: &[f32]) -> ActBlock {
     let id = if d > 0.0 { 1.0 / d } else { 0.0 };
     let mut q = [0i8; 32];
     for (j, &v) in x.iter().enumerate() {
-        q[j] = (v * id).round_ties_even().clamp(-128.0, 127.0) as i8;
+        q[j] = (v * id).round_ties_even().clamp(-127.0, 127.0) as i8;
     }
     ActBlock { d, q }
 }
@@ -1207,6 +1251,9 @@ fn flash_row_scalar(
             if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
                 continue; // the -inf half of the causal mask
             }
+            // TWIN: flash_row_avx2 — every edit outside the two marked
+            // regions must be made in both. (This is the kq dot region; the
+            // scalar form is the bit-exact oracle.)
             let kq = kq_dot_fa4(qrow, &keys16[u]);
             *sl = p.kq_scale * kq;
             smax = smax.max(*sl);
@@ -1248,6 +1295,9 @@ fn flash_row_scalar(
             if w[l] == 0.0 {
                 continue; // masked lane: fma(V, 0, R) == R exactly
             }
+            // TWIN: flash_row_avx2 — every edit outside the two marked
+            // regions must be made in both. (This is the V accumulation
+            // region.)
             let krow = &keys16[blk + l];
             for d in 0..latent {
                 r[d] = half_to_f32(krow[p.rope_dims + d]).mul_add(w[l], r[d]);
@@ -1340,6 +1390,9 @@ unsafe fn flash_row_avx2(
                 if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
                     continue; // the -inf half of the causal mask
                 }
+                // TWIN: flash_row_scalar — every edit outside the two marked
+                // regions must be made in both. (This is the kq dot region;
+                // only the sum order may differ from the scalar oracle.)
                 // SAFETY: in addition to the fn contract, `u` indexes
                 // keys16 in bounds (len == key_slots.len(), asserted at the
                 // dispatch) and its row is d_head wide.
@@ -1384,6 +1437,10 @@ unsafe fn flash_row_avx2(
                 if w[l] == 0.0 {
                     continue; // masked lane: fma(V, 0, R) == R exactly
                 }
+                // TWIN: flash_row_scalar — every edit outside the two marked
+                // regions must be made in both. (This is the V accumulation
+                // region; given the same weights it is bit-identical to the
+                // scalar form — only the kq region may differ.)
                 let krow = &keys16[blk + l];
                 let wl = _mm256_set1_ps(w[l]);
                 // The latent tail of the KV row: eight f16 per cvtph, the
@@ -1447,6 +1504,16 @@ pub fn wv_b_heads(
     };
     let row_bytes =
         wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
+    // kqv_compressed interleaves heads as t·n_head+h; a column count that is
+    // not a multiple of n_head would divide to a truncated n_tokens and the
+    // gather below would read another head's tokens silently (2026-09-20
+    // hardening round).
+    assert!(
+        kqv_compressed.ne1.is_multiple_of(p.n_head),
+        "wv_b_heads: kqv_compressed has {} columns, not a multiple of n_head {}",
+        kqv_compressed.ne1,
+        p.n_head
+    );
     let n_tokens = kqv_compressed.ne1 / p.n_head;
     let mut kqv_2d = Tensor2::zeros(p.n_head * p.v_head, n_tokens);
 
