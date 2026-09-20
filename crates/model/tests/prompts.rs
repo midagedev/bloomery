@@ -231,18 +231,35 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
     // A/B was needed to attribute anything: nothing flipped, so the pin's
     // "say what moved it" has nothing to say.
     //
+    // 2026-09-20, flash SIMD wiring (MUL-36): the set moved {14} -> {24}.
+    // A/B proof the SIMD path caused it: BLOOMERY_FLASH_SIMD=0 for one run
+    // (same binary, same oracle — the env override `flash_simd` reads once)
+    // -> divergence set {14} again, 32/33, prompt 14 back to its 1st/2nd
+    // swap at ik margin 0.108; default dispatch -> prompt 14 now matches
+    // and prompt 24 flipped instead (`Machine learning models are trained
+    // on`, ik margin 0.151, |dlogit| 0.3509, straight 1st/2nd swap —
+    // worst |dlogit| 1.0048). The flip class is unchanged: a near-tie
+    // re-lottery, not a new fault. What moved is one arithmetic bit — the
+    // kq dot's sum order (fa4 two-partial chain -> 8-lane groups;
+    // `attn.rs`'s `kq_dot_fa4_avx2`), banded at ULP scale against the
+    // scalar path in `attn.rs`'s exact-input gate (scalar leg bit-exact at
+    // 0, SIMD leg 1.31e-6 against a 2.13e-4 band, same run); the V stage
+    // is bit-identical by construction (j-axis lanes reorder nothing).
+    // `gate-mt` still byte-identical across thread counts — MUL-29's row
+    // split is intact.
+    //
     // Where the remaining drift is from: with Q5_1 fused every quant site
     // runs ik's own kernel arithmetic, so what is left is `q_nope2`'s
-    // activation-code tie flips (`attn.rs`'s `quantize_act`) — near-tie
-    // ordering and raw drift are different quantities, and the logits band
-    // gate (forward.rs, 5e-2) holds the raw side (result_output rel 2.64e-2
-    // this run).
+    // activation-code tie flips (`attn.rs`'s `quantize_act`) plus, since
+    // MUL-36, the flash kq lane order — near-tie ordering and raw drift are
+    // different quantities, and the logits band gate (forward.rs, 5e-2)
+    // holds the raw side (result_output rel 2.91e-2 this run).
     //
     // The set is pinned rather than counted. Any prompt flipping fails; one
     // starting to match also fails, because that means something moved and
     // the round that moved it should say what. Do not widen this to
     // `len() <= N`.
-    const KNOWN_DIVERGENCE: &[usize] = &[14];
+    const KNOWN_DIVERGENCE: &[usize] = &[24];
     let ids: Vec<usize> = mismatched.iter().map(|(id, ..)| *id).collect();
     assert_eq!(
         ids,

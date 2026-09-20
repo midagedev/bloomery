@@ -19,10 +19,14 @@
 //! col 57 = head 9 token 3). [2026-09-20, MUL-21: after the Q3_K fused wiring the
 //! seats moved — block 0 flips cols 32 and 62, block 1 flips none; two flips total,
 //! same as before, redistributed. The `max_cols` pin followed to 2; see the call site.]
-//! The attention arithmetic itself is bit-exact: fed the
-//! oracle's own q_rope/q_nope2/kvr, `flash_attn_latent` reproduces `kqv_compressed`
-//! with max |diff| = 0 (`hw_attn_exact_input_stages` asserts that at tolerance zero).
-//! The bounds cover two simultaneous tie flips, so an upstream `matmul_q` change that
+//! The attention arithmetic itself is a transcription: fed the
+//! oracle's own q_rope/q_nope2/kvr, the scalar path reproduces `kqv_compressed`
+//! with max |diff| = 0 (`hw_attn_exact_input_stages` asserts that at tolerance
+//! zero, on the `flash_attn_latent_scalar` leg). Since MUL-36 the default
+//! dispatch runs the AVX2+FMA+F16C twin, whose kq dot sums in 8-lane groups
+//! instead of the fa4 two-partial chain — ULP-scale off ik's bits, banded
+//! against the scalar path by `hw_flash_simd_bands_against_scalar` and by the
+//! dispatch leg of the exact-input test. The bounds cover two simultaneous tie flips, so an upstream `matmul_q` change that
 //! moves a tie re-reds the gate instead of silently widening it.
 #[path = "common/oracle.rs"]
 mod oracle;
@@ -278,11 +282,33 @@ fn hw_attn_exact_input_stages() {
             "stage A: absorption arithmetic"
         );
 
-        // B: the attention proper — tolerance ZERO. `flash_attn_latent` is a
-        // transcription of ik's FA kernel op for op (dot lane order, v_expf, online
-        // M/S, FMA chains, final 1/S multiply), so with the kernel's exact inputs it
-        // must reproduce the kernel's exact outputs, bit for bit. Any nonzero diff
-        // here is a real divergence from the reference, not noise.
+        // B: the attention proper — two legs since MUL-36 (2026-09-20).
+        //
+        // The scalar leg (`flash_attn_latent_scalar`, the no-AVX2 fallback)
+        // keeps tolerance ZERO, the property this gate has always proven:
+        // fed the kernel's exact inputs, the scalar transcription reproduces
+        // the kernel's exact outputs bit for bit. It is also the A/B control
+        // for the dispatch leg in the same run — the wiring around the
+        // kernel changed nothing else.
+        //
+        // The dispatch leg (AVX2+FMA+F16C on this box) re-pins the former
+        // 0.0. Its kq dot sums in 8-lane groups (four FMA partials + a
+        // fixed lane tree, `kq_dot_fa4_avx2`) instead of the fa4 two-partial
+        // chain, so the outputs leave ik's bits by ULP-scale amounts. The
+        // band is derived, not measured-in-advance: this test computes δ =
+        // max |kq_simd − kq_scalar| over the oracle's own (row, key) pairs,
+        // then |Δout| ≤ 2·kq_scale·δ·n_keys·spread(V) — each key's weight
+        // moves by at most its s moved (kq_scale·δ, and the same again for
+        // the max scan's m, the factor 2), the softmax output is a convex
+        // combination with S ≥ 1 (the argmax key's weight is exactly
+        // `v_expf(0)` = 1), and a convex combination moves by at most
+        // max|Δw| times the spread of the values it mixes. Attribution: the
+        // V stage cannot contribute — its j-axis lanes preserve every output
+        // element's key-order FMA chain, bit-identical by construction — so
+        // the whole leg-B difference is the kq sum order. Measured 2026-09-20
+        // on this tree (both blocks, joint worst): δ-band 2.13e-4, realized
+        // max|diff| 1.31e-6 — ~160x headroom, and the scalar leg at 0 in the
+        // same run is the wiring control.
         let q_rope_exact = load2(&format!("q_rope-{blk}"), 1);
         let q_nope2_exact = load2(&format!("q_nope2-{blk}"), 0);
         let kvr_exact = load2(&format!("kvr-{blk}"), 0);
@@ -295,6 +321,28 @@ fn hw_attn_exact_input_stages() {
                     .collect()
             })
             .collect();
+        let want = load2(&format!("kqv_compressed-{blk}"), 0);
+
+        let kqv_scalar = model::attn::flash_attn_latent_scalar(
+            &q_rope_exact,
+            &q_nope2_exact,
+            &cache16,
+            &slots,
+            &slots,
+            &p,
+        );
+        assert_eq!(
+            [kqv_scalar.ne0, kqv_scalar.ne1],
+            [want.ne0, want.ne1],
+            "stage B shape"
+        );
+        oracle::assert_close(
+            &kqv_scalar.data,
+            &want.data,
+            0.0,
+            "stage B scalar: attention bit-exact",
+        );
+
         let kqv = model::attn::flash_attn_latent(
             &q_rope_exact,
             &q_nope2_exact,
@@ -303,9 +351,36 @@ fn hw_attn_exact_input_stages() {
             &slots,
             &p,
         );
-        let want = load2(&format!("kqv_compressed-{blk}"), 0);
         assert_eq!([kqv.ne0, kqv.ne1], [want.ne0, want.ne1], "stage B shape");
-        oracle::assert_close(&kqv.data, &want.data, 0.0, "stage B: attention bit-exact");
+        // δ over the oracle's own (row, key) pairs, and the V spread of the
+        // same rows — both from the data the legs just consumed. The FA row
+        // is rope + ABSORBED nope (576), not kq_head (192): q_nope2 already
+        // carries the wk_b absorption.
+        let mut delta = 0.0f32;
+        for t in 0..n_tok {
+            for h in 0..p.n_head {
+                let mut qrow = vec![0.0f32; p.rope_dims + p.latent];
+                qrow[..p.rope_dims].copy_from_slice(q_rope_exact.col(t * p.n_head + h));
+                qrow[p.rope_dims..].copy_from_slice(q_nope2_exact.col(h * n_tok + t));
+                for k in &cache16 {
+                    delta = delta.max(
+                        (model::attn::kq_dot_simd(&qrow, k) - model::attn::kq_dot_fa4(&qrow, k))
+                            .abs(),
+                    );
+                }
+            }
+        }
+        let mut v_lo = f32::INFINITY;
+        let mut v_hi = f32::NEG_INFINITY;
+        for row in &cache16 {
+            for &b in &row[p.rope_dims..] {
+                let v = gguf::quant::half_to_f32(b);
+                v_lo = v_lo.min(v);
+                v_hi = v_hi.max(v);
+            }
+        }
+        let band = 2.0 * p.kq_scale * delta * n_tok as f32 * (v_hi - v_lo);
+        oracle::assert_close(&kqv.data, &want.data, band, "stage B simd: banded");
 
         // C: wv_b (Q3_K view) + output projection — generic `matmul_q` order slack.
         // Measured 1.4e-5 / 3.3e-7.
@@ -320,4 +395,168 @@ fn hw_attn_exact_input_stages() {
             "stage C: wv_b + output projection"
         );
     }
+}
+
+/// Deterministic uniform noise for the synthetic band test — no model file,
+/// no oracle, only the box's ISA.
+struct Lcg(u64);
+
+impl Lcg {
+    fn unit(&mut self) -> f32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 11) as f64 / (1u64 << 53) as f64) as f32
+    }
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * self.unit()
+    }
+}
+
+/// MUL-36: the AVX2 flash kernel against its scalar twin on synthetic data —
+/// the scalar path IS the oracle here (same values, ik's own sum order), so
+/// this needs no model file and no dump, only AVX2+FMA+F16C.
+///
+/// The kq band is the textbook reassociation bound: both sum orders round at
+/// most `d_head` times, each rounding at most one unit-in-the-last-place
+/// (2⁻²⁴) of a running partial no larger than Σ|q·k|. The flash band then
+/// propagates the REALIZED dot deviation δ (measured by the kq leg in this
+/// same run, not the loose bound): each key's weight moves by at most its s
+/// moved (kq_scale·δ, and the same again for the max scan's m — the factor
+/// 2), the softmax output is a convex combination with S ≥ 1 (the argmax
+/// key's weight is exactly `v_expf(0)` = 1), so the output moves by at most
+/// 2·kq_scale·δ·n_keys·spread(V). Prints the realized worst against both so
+/// a run says how much headroom each leaves. Measured 2026-09-20 on this
+/// tree: kq realized 1.30e-4 against the bound 1.34e-1 (~1000x — the
+/// textbook bound assumes every rounding aligns, which random data never
+/// does), flash realized 1.17e-5 against its band 1.62e-2.
+#[test]
+#[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
+fn hw_flash_simd_bands_against_scalar() {
+    // The real MLA's shapes (576-wide row, 512 latent) at a small head/token
+    // count. The key count (100) crosses three whole 32-key blocks plus a
+    // partial fourth (the padding break), and the first query's position
+    // admits 50 keys — past the block boundary, into the M-bump rescale.
+    let p = model::attn::MlaParams {
+        n_head: 3,
+        kq_head: 576,
+        nope: 512,
+        rope_dims: 64,
+        v_head: 128,
+        latent: 512,
+        eps: 1e-6,
+        // The rope fields are dead here — flash reads only the dims.
+        rope: model::attn::RopeParams {
+            n_dims: 64,
+            freq_base: 1e4,
+            freq_scale: 0.025,
+            ext_factor: 1.0,
+            mscale_param: 0.7,
+            corr_dims: [10.0, 23.0],
+            theta_scale: 0.8,
+        },
+        kq_scale: 0.078,
+    };
+    let mut rng = Lcg(0x5eed_1234_5678_9abc);
+    let n_tok = 5usize;
+    let n_keys = 100usize;
+
+    let mut q_rope = Tensor2::zeros(p.rope_dims, p.n_head * n_tok);
+    let mut q_nope2 = Tensor2::zeros(p.latent, p.n_head * n_tok);
+    for t in 0..n_tok {
+        for h in 0..p.n_head {
+            for v in q_rope.col_mut(t * p.n_head + h).iter_mut() {
+                *v = rng.range(-3.0, 3.0);
+            }
+            for v in q_nope2.col_mut(h * n_tok + t).iter_mut() {
+                *v = rng.range(-3.0, 3.0);
+            }
+        }
+    }
+    let mut keys16: Vec<Vec<u16>> = Vec::with_capacity(n_keys);
+    let mut v_lo = f32::INFINITY;
+    let mut v_hi = f32::NEG_INFINITY;
+    for _ in 0..n_keys {
+        let row: Vec<u16> = (0..p.rope_dims + p.latent)
+            .map(|_| model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)))
+            .collect();
+        for &b in &row[p.rope_dims..] {
+            let v = gguf::quant::half_to_f32(b);
+            v_lo = v_lo.min(v);
+            v_hi = v_hi.max(v);
+        }
+        keys16.push(row);
+    }
+    // Sequences and positions chosen so every mask path fires: half the keys
+    // are another sequence, positions wrap past the queries (future
+    // masking), and every query keeps at least one allowed key.
+    let key_slots: Vec<Slot> = (0..n_keys)
+        .map(|u| Slot {
+            seq: if u < 50 { 0 } else { 1 },
+            pos: (u % 25) as u32,
+        })
+        .collect();
+    let q_slots: Vec<Slot> = [24u32, 0, 3, 5, 24]
+        .iter()
+        .map(|&pos| Slot { seq: 0, pos })
+        .collect();
+
+    // Leg 1 — the kq dot itself, against the reassociation bound.
+    let mut worst_kq = 0.0f32;
+    let mut worst_band = 0.0f32;
+    for t in 0..n_tok {
+        for h in 0..p.n_head {
+            let mut qrow = vec![0.0f32; p.rope_dims + p.latent];
+            qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
+            qrow[p.rope_dims..].copy_from_slice(q_nope2.col(h * n_tok + t));
+            for (u, k) in keys16.iter().enumerate() {
+                let d =
+                    (model::attn::kq_dot_simd(&qrow, k) - model::attn::kq_dot_fa4(&qrow, k)).abs();
+                let band = kq_reassoc_band(&qrow, k);
+                worst_kq = worst_kq.max(d);
+                worst_band = worst_band.max(band);
+                assert!(
+                    d <= band,
+                    "kq dot: |simd - scalar| = {d:e} exceeds the reassociation band \
+                     {band:e} (t {t}, h {h}, key {u})"
+                );
+            }
+        }
+    }
+    eprintln!(
+        "kq dot, simd vs scalar ({} pairs)   max|diff| = {worst_kq:e}   band {worst_band:e}",
+        n_tok * p.n_head * n_keys
+    );
+
+    // Leg 2 — the whole kernel, propagating the realized δ of leg 1.
+    let a = model::attn::flash_attn_latent(&q_rope, &q_nope2, &keys16, &key_slots, &q_slots, &p);
+    let b =
+        model::attn::flash_attn_latent_scalar(&q_rope, &q_nope2, &keys16, &key_slots, &q_slots, &p);
+    let flash_band = 2.0 * p.kq_scale * worst_kq * n_keys as f32 * (v_hi - v_lo);
+    let mut worst_flash = 0.0f32;
+    for (i, (&x, &y)) in a.data.iter().zip(&b.data).enumerate() {
+        let d = (x - y).abs();
+        worst_flash = worst_flash.max(d);
+        assert!(
+            d <= flash_band,
+            "flash: |simd - scalar| = {d:e} at index {i} exceeds the band {flash_band:e}"
+        );
+    }
+    eprintln!(
+        "flash, simd vs scalar ({} values)  max|diff| = {worst_flash:e}   band {flash_band:e}",
+        a.data.len()
+    );
+}
+
+/// The reassociation band for one (q row, f16 key row) pair: both sum orders
+/// round at most `d_head` times, each rounding at most one ulp (2⁻²⁴) of a
+/// running partial no larger than Σ|q·k|.
+fn kq_reassoc_band(q: &[f32], k: &[u16]) -> f32 {
+    let sum_abs: f32 = q
+        .iter()
+        .zip(k)
+        .map(|(&qi, &ki)| qi.abs() * gguf::quant::half_to_f32(ki).abs())
+        .sum();
+    2.0 * q.len() as f32 * 2.0f32.powi(-24) * sum_abs
 }
