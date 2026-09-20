@@ -32,6 +32,13 @@
 //!     f32 FMAs in the gemm's two-partial lane order; softmax weights come from ik's
 //!     vector `v_expf` polynomial (not libm `expf`); V accumulates in an f32 FMA chain
 //!     and the row is normalized by a plain `1/S` multiply (see [`flash_attn_latent`]).
+//!   * **The flash kernel's inner loops are AVX2+FMA+F16C (MUL-36).** The kq dot sums
+//!     in 8-lane groups and V accumulates eight latent lanes per FMA; the scalar
+//!     transcription of the bullets above stays as the no-AVX2 fallback
+//!     ([`flash_attn_latent_scalar`]) and the gates' oracle — bit-identical to ik on
+//!     exact inputs. The SIMD twin's one numerical difference is the kq sum order,
+//!     which moves outputs off ik's bits by ULP-scale amounts; `tests/attn.rs` bands
+//!     it explicitly against the scalar twin.
 //!
 //! Everything here mirrors those choices in the same operation order — there is no
 //! place where we are deliberately more exact than the reference.
@@ -47,7 +54,7 @@ use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 /// All intermediates, for the gate. `Tensor2` holds `ne0` contiguous with trailing
@@ -846,7 +853,11 @@ fn v_expf(x: f32) -> f32 {
 /// a high partial (`8i+4..7`); the dot is the single plain add of the two. `q` stays
 /// F32 — the FA node's q is never rounded to f16 — and every K element is the exact
 /// f32 of its f16 cache bits (`F16::load(const char*)`).
-fn kq_dot_fa4(q: &[f32], k: &[u16]) -> f32 {
+///
+/// `pub` since MUL-36: this is the scalar leg of the gate's path comparison and the
+/// no-AVX2 fallback of [`flash_attn_latent`] — the same contraction the AVX2 twin
+/// ([`kq_dot_simd`]) computes in a different sum order.
+pub fn kq_dot_fa4(q: &[f32], k: &[u16]) -> f32 {
     let mut plo = 0.0f32;
     let mut phi = 0.0f32;
     for base in (0..q.len()).step_by(8) {
@@ -860,6 +871,91 @@ fn kq_dot_fa4(q: &[f32], k: &[u16]) -> f32 {
         phi = half_to_f32(k[base + 7]).mul_add(q[base + 7], phi);
     }
     plo + phi
+}
+
+/// The AVX2+FMA+F16C twin of [`kq_dot_fa4`] (MUL-36): the same contraction over
+/// the same operands — every K element still the exact f32 of its f16 bits
+/// (`_mm256_cvtph_ps` converts f16→f32 without rounding, exactly what
+/// [`half_to_f32`] returns) and every product still one fused multiply-add —
+/// with the sum order the lanes define. Per 32-element panel `i` (ascending),
+/// four 8-lane partials `P0..P3` accumulate the elements `32i+0..8`, `+8..16`,
+/// `+16..24`, `+24..32`; the dot is `hsum((P0+P1)+(P2+P3))`, where the
+/// elementwise adds pair the partials in that order and `hsum` is the fixed
+/// lane tree `c[j] = lane j + lane j+4` then `(c0+c1)+(c2+c3)`. The scalar
+/// twin's two-partial chain is a different ordering of the same additions, so
+/// the two dots differ by last-ulps only; `tests/attn.rs` bounds that
+/// difference with the explicit reassociation band.
+///
+/// `#[target_feature]` is not optional (the MUL-26 lesson, 21x on this box):
+/// without it the intrinsics lower to scalar emulation with no error. The
+/// split from [`flash_row_avx2`] is at the per-key granularity the scalar
+/// path has always called its own dot at — nothing inside the 576-contraction
+/// is split (the MUL-27 lesson: finer splits round values through memory,
+/// 10–13 %).
+///
+/// # Safety
+/// The CPU must support AVX2+FMA+F16C, and `q.len() == k.len()` must be a
+/// multiple of 32 — `flash_simd` checks both at the flash call site,
+/// [`kq_dot_simd`] for direct calls.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn kq_dot_fa4_avx2(q: &[f32], k: &[u16]) -> f32 {
+    // SAFETY: the fn contract above — the ISA comes from the caller's
+    // detection, the lengths were validated one step up, and every pointer
+    // offset below stays inside the two slices by the `% 32 == 0` walk.
+    unsafe {
+        use std::arch::x86_64::*;
+        let qp = q.as_ptr();
+        let kp = k.as_ptr();
+        let mut p0 = _mm256_setzero_ps();
+        let mut p1 = _mm256_setzero_ps();
+        let mut p2 = _mm256_setzero_ps();
+        let mut p3 = _mm256_setzero_ps();
+        for base in (0..q.len()).step_by(32) {
+            // Four f16 octets convert in one op each — the F16C instruction
+            // is the exact conversion the scalar loop pays a branchy soft
+            // function per element for (the scalar wall MUL-36 exists to
+            // remove).
+            let k0 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(base) as *const __m128i));
+            let k1 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(base + 8) as *const __m128i));
+            let k2 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(base + 16) as *const __m128i));
+            let k3 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(base + 24) as *const __m128i));
+            p0 = _mm256_fmadd_ps(_mm256_loadu_ps(qp.add(base)), k0, p0);
+            p1 = _mm256_fmadd_ps(_mm256_loadu_ps(qp.add(base + 8)), k1, p1);
+            p2 = _mm256_fmadd_ps(_mm256_loadu_ps(qp.add(base + 16)), k2, p2);
+            p3 = _mm256_fmadd_ps(_mm256_loadu_ps(qp.add(base + 24)), k3, p3);
+        }
+        let s = _mm256_add_ps(_mm256_add_ps(p0, p1), _mm256_add_ps(p2, p3));
+        // The documented lane tree: 128-bit halves first, then lane pairs.
+        let c = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        let t = _mm_add_ps(c, _mm_movehdup_ps(c));
+        _mm_cvtss_f32(_mm_add_ps(t, _mm_movehl_ps(t, t)))
+    }
+}
+
+/// [`kq_dot_fa4_avx2`] behind the loud-failure wrapper the gate's path
+/// comparison calls (the `dot_row_avx2` pattern from `crates/qdot`): on a CPU
+/// without the kernel's ISA there is nothing to compare and the caller wants
+/// the panic, not a quiet fall back.
+pub fn kq_dot_simd(q: &[f32], k: &[u16]) -> f32 {
+    assert!(
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c"),
+        "kq_dot_simd called on a CPU without AVX2+FMA+F16C"
+    );
+    assert_eq!(
+        q.len(),
+        k.len(),
+        "kq_dot_simd: q and k must be the same row"
+    );
+    assert!(
+        q.len().is_multiple_of(32),
+        "kq_dot_simd: the 32-element panel kernel needs len % 32 == 0, got {}",
+        q.len()
+    );
+    // SAFETY: the ISA was asserted just above and the lengths meet the panel
+    // contract — the kernel's whole safety argument (see its doc).
+    unsafe { kq_dot_fa4_avx2(q, k) }
 }
 
 /// `F16::reduce_add<32>` (iqk_fa_templates.h:54-206): `((v0+v1)+v2)+v3` elementwise
@@ -879,14 +975,27 @@ fn lane_tree_sum(w: &[f32; 32]) -> f32 {
 ///
 /// Per (token, head) row, in the kernel's own op order:
 ///
-///   * KQ dot per key by [`kq_dot_fa4`] over `[q_rope(64) ; q_nope2(512)]` — the
-///     graph's concat order (build_deepseek2.cpp) — against the f16 cache row;
+///   * KQ dot per key over `[q_rope(64) ; q_nope2(512)]` — the graph's concat
+///     order (build_deepseek2.cpp) — against the f16 cache row;
 ///   * `s = kq_scale·(kq + mask)` — the mask addend is exactly `+0.0` for allowed keys
 ///     and `−inf` otherwise, so allowed keys get one plain multiply;
 ///   * online M/S in 32-key blocks (`FlashMS`): block max, rescale-or-zero on M bump,
 ///     weights = [`v_expf`]`(s − M)`, S += [`lane_tree_sum`];
 ///   * V accumulation in an f32 FMA chain (`accumulate_qkv`), keys ascending;
 ///   * final row = `R · (1/S)`, one plain multiply per element.
+///
+/// MUL-36: the two inner loops the site's scalar wall lived in (MUL-35 §6-H2:
+/// 0.28 GB/s, 259 ns per row-key ≈ 1,100 scalar FMAs) run the AVX2+FMA+F16C
+/// twin [`flash_row_avx2`] when the CPU and shapes allow ([`flash_simd`]):
+/// the kq dot in 8-lane groups ([`kq_dot_fa4_avx2`]) and the V accumulation
+/// eight latent lanes per FMA. Softmax, `v_expf`, the online M/S scan and
+/// MUL-29's row split are untouched, the per-key exp stays scalar, and the V
+/// stage is bit-identical to the scalar twin (vectorizing the j axis
+/// reorders nothing — every output element's key-order FMA chain descends
+/// exactly as the scalar wrote it). The one numerical difference is the kq
+/// sum order, which moves outputs off ik's bits by ULP-scale amounts;
+/// `tests/attn.rs` bands it against [`flash_attn_latent_scalar`], the scalar
+/// transcription that keeps the bit-exactness property on exact inputs.
 ///
 /// Blocks with no allowed key are skipped outright: their weights are all exactly `0.0`
 /// (see [`v_expf`]), `S += 0` and `fma(V, 0, R) = R` are exact no-ops, so skipping is
@@ -901,6 +1010,73 @@ pub fn flash_attn_latent(
     key_slots: &[Slot],
     q_slots: &[Slot],
     p: &MlaParams,
+) -> Tensor2 {
+    flash_attn_latent_impl(
+        q_rope,
+        q_nope2,
+        keys16,
+        key_slots,
+        q_slots,
+        p,
+        flash_simd(p),
+    )
+}
+
+/// The forced-scalar twin of [`flash_attn_latent`], `pub` for the gates (the
+/// `dot_row_scalar` pattern from `crates/qdot`): the no-AVX2 fallback AND the
+/// oracle the AVX2 twin is banded against — same values, ik's own (fa4)
+/// sum order, so on the oracle's exact inputs this one stays bit-identical
+/// while the SIMD twin moves by the documented band (`tests/attn.rs`).
+pub fn flash_attn_latent_scalar(
+    q_rope: &Tensor2,
+    q_nope2: &Tensor2,
+    keys16: &[Vec<u16>],
+    key_slots: &[Slot],
+    q_slots: &[Slot],
+    p: &MlaParams,
+) -> Tensor2 {
+    flash_attn_latent_impl(q_rope, q_nope2, keys16, key_slots, q_slots, p, false)
+}
+
+/// Whether [`flash_attn_latent`]'s row kernel takes the AVX2+FMA+F16C twin:
+/// the CPU must carry all three (the kernel's `_mm256_cvtph_ps` loads and
+/// FMAs are native only under the attributes — the MUL-26 lesson), and the
+/// shapes must meet the vector panels' contract — the `d_head`-wide row a
+/// multiple of 32 (four 8-lane partials), the latent tail a multiple of 8.
+/// A differently-shaped MLA keeps the scalar transcription rather than
+/// quietly truncating a row: the same fail-loudly policy
+/// [`MlaParams::read`] applies one level up.
+///
+/// `BLOOMERY_FLASH_SIMD=0` forces the scalar path for a whole process, read
+/// once (a [`OnceLock`], the `BLOOMERY_PROFILE` pattern). It is the gates'
+/// A/B lever: same binary, same oracle, the only bit that changes is the
+/// kernel choice — the run pair that attributes a moved divergence set to
+/// this round (`tests/prompts.rs`'s history records such pairs).
+fn flash_simd(p: &MlaParams) -> bool {
+    static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
+    if *FORCE_SCALAR.get_or_init(|| std::env::var("BLOOMERY_FLASH_SIMD").is_ok_and(|v| v == "0")) {
+        return false;
+    }
+    (p.rope_dims + p.latent).is_multiple_of(32)
+        && p.latent.is_multiple_of(8)
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c")
+}
+
+/// The single owner of the MUL-29 row split both dispatch legs ride; `simd`
+/// is decided once per call (never per row — `flash_simd` reads a `OnceLock`
+/// and three cached feature flags). The row twins it picks between share the
+/// whole skeleton and differ only in the two inner loops MUL-36 vectorized
+/// (the kq dot and the V accumulation) — keep them in lockstep.
+fn flash_attn_latent_impl(
+    q_rope: &Tensor2,
+    q_nope2: &Tensor2,
+    keys16: &[Vec<u16>],
+    key_slots: &[Slot],
+    q_slots: &[Slot],
+    p: &MlaParams,
+    simd: bool,
 ) -> Tensor2 {
     // Profiler hook (crate::profile): level-1 timer over the whole kernel. The
     // shape statement: `rows` is the (token, head) query rows produced, `k` the
@@ -923,6 +1099,13 @@ pub fn flash_attn_latent(
     let n_tokens = q_slots.len();
     let d_head = p.rope_dims + p.latent;
     let mut out = Tensor2::zeros(p.latent, n_tokens * p.n_head);
+    // The invariant the scalar twins only get from indexing and the AVX2 twin's
+    // unchecked loads need up front: every cached row is `d_head` wide. A short
+    // row is a caller bug to catch before any pointer math, not after.
+    assert!(
+        keys16.iter().all(|k| k.len() == d_head),
+        "flash_attn_latent: KV rows must be rope+latent = {d_head} wide"
+    );
 
     // MUL-29: the (token, head) query rows are fully independent — each one
     // walks the KV cache and writes its own contiguous `latent`-wide slice of
@@ -937,9 +1120,10 @@ pub fn flash_attn_latent(
     // `row * latent .. (row + 1) * latent` of `out.data` — one contiguous
     // disjoint slice per row, so no two participants alias. The pool's
     // completion protocol publishes the writes before this function reads
-    // `out`, the same ordering that publishes the matmul job slot. The
-    // per-row arithmetic is untouched: `tests/mt.rs` holds the whole claim as
-    // a byte compare across thread counts.
+    // `out`, the same ordering that publishes the matmul job slot. Which row
+    // twin computes a row is invisible to that argument — both write the
+    // same cells — and `tests/mt.rs` holds the whole claim as a byte compare
+    // across thread counts.
     let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
     let latent = p.latent;
     threads::pool().for_each_chunk(n_tokens * p.n_head, |rows| {
@@ -949,80 +1133,21 @@ pub fn flash_attn_latent(
         let mut r = vec![0.0f32; latent];
         let mut w = [0.0f32; 32];
         for row in rows {
-            let t = row / p.n_head;
-            let h = row % p.n_head;
-            // The FA row: [q_rope ; q_nope2], F32, never rounded.
-            qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
-            qrow[p.rope_dims..].copy_from_slice(q_nope2.col(h * n_tokens + t));
-
-            let mut m = f32::NEG_INFINITY;
-            let mut s_sum = 0.0f32;
-            r.fill(0.0);
-            for blk in (0..key_slots.len()).step_by(32) {
-                let mut s = [f32::NEG_INFINITY; 32];
-                let mut smax = f32::NEG_INFINITY;
-                for (l, sl) in s.iter_mut().enumerate() {
-                    let u = blk + l;
-                    let su = match key_slots.get(u) {
-                        Some(su) => su,
-                        None => break, // past the cache: padding, weight exactly 0
-                    };
-                    if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
-                        continue; // the -inf half of the causal mask
-                    }
-                    let kq = kq_dot_fa4(&qrow, &keys16[u]);
-                    *sl = p.kq_scale * kq;
-                    smax = smax.max(*sl);
-                }
-                if smax == f32::NEG_INFINITY {
-                    continue; // fully masked block: exact no-op (see the doc above)
-                }
-                // FlashMS::update_M — S scaled here, R at accumulate time.
-                let mut vms = 1.0f32;
-                let mut need: u8 = 0;
-                if smax > m {
-                    if m > f32::NEG_INFINITY {
-                        vms = (m - smax).exp();
-                        need = 1;
-                    } else {
-                        need = 2;
-                    }
-                    m = smax;
-                }
-                match need {
-                    1 => s_sum *= vms,
-                    2 => s_sum = 0.0,
-                    _ => {}
-                }
-                for l in 0..32 {
-                    w[l] = if s[l] == f32::NEG_INFINITY {
-                        0.0
-                    } else {
-                        v_expf(s[l] - m)
-                    };
-                }
-                s_sum += lane_tree_sum(&w);
-                match need {
-                    1 => r.iter_mut().for_each(|v| *v *= vms),
-                    2 => r.fill(0.0),
-                    _ => {}
-                }
-                for l in 0..32 {
-                    if w[l] == 0.0 {
-                        continue; // masked lane: fma(V, 0, R) == R exactly
-                    }
-                    let krow = &keys16[blk + l];
-                    for d in 0..latent {
-                        r[d] = half_to_f32(krow[p.rope_dims + d]).mul_add(w[l], r[d]);
-                    }
-                }
-            }
-
-            let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
-            for (d, &v) in r.iter().enumerate() {
-                // SAFETY: cell `row * latent + d` belongs to this row alone —
-                // see the construction-site comment above.
-                unsafe { out_ptr.write(row * latent + d, s_inv * v) };
+            if simd {
+                // SAFETY: `flash_simd` checked AVX2+FMA+F16C and the panel
+                // shapes; the row-width assert above and the scratch sizing
+                // right here complete the kernel's contract.
+                unsafe {
+                    flash_row_avx2(
+                        q_rope, q_nope2, keys16, key_slots, q_slots, p, n_tokens, row, &mut qrow,
+                        &mut r, &mut w, &out_ptr,
+                    )
+                };
+            } else {
+                flash_row_scalar(
+                    q_rope, q_nope2, keys16, key_slots, q_slots, p, n_tokens, row, &mut qrow,
+                    &mut r, &mut w, &out_ptr,
+                );
             }
         }
     });
@@ -1039,6 +1164,251 @@ pub fn flash_attn_latent(
         );
     }
     out
+}
+
+/// The per-row body of the flash kernel, scalar transcription — the no-AVX2
+/// fallback and the gates' oracle (see [`flash_attn_latent_scalar`]).
+/// Extracted verbatim from the MUL-29 row split; the AVX2 twin below differs
+/// ONLY in the two inner loops MUL-36 vectorized.
+#[allow(clippy::too_many_arguments)]
+fn flash_row_scalar(
+    q_rope: &Tensor2,
+    q_nope2: &Tensor2,
+    keys16: &[Vec<u16>],
+    key_slots: &[Slot],
+    q_slots: &[Slot],
+    p: &MlaParams,
+    n_tokens: usize,
+    row: usize,
+    qrow: &mut [f32],
+    r: &mut [f32],
+    w: &mut [f32; 32],
+    out: &crate::ops::SharedOut,
+) {
+    let latent = p.latent;
+    let t = row / p.n_head;
+    let h = row % p.n_head;
+    // The FA row: [q_rope ; q_nope2], F32, never rounded.
+    qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
+    qrow[p.rope_dims..].copy_from_slice(q_nope2.col(h * n_tokens + t));
+
+    let mut m = f32::NEG_INFINITY;
+    let mut s_sum = 0.0f32;
+    r.fill(0.0);
+    for blk in (0..key_slots.len()).step_by(32) {
+        let mut s = [f32::NEG_INFINITY; 32];
+        let mut smax = f32::NEG_INFINITY;
+        for (l, sl) in s.iter_mut().enumerate() {
+            let u = blk + l;
+            let su = match key_slots.get(u) {
+                Some(su) => su,
+                None => break, // past the cache: padding, weight exactly 0
+            };
+            if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
+                continue; // the -inf half of the causal mask
+            }
+            let kq = kq_dot_fa4(qrow, &keys16[u]);
+            *sl = p.kq_scale * kq;
+            smax = smax.max(*sl);
+        }
+        if smax == f32::NEG_INFINITY {
+            continue; // fully masked block: exact no-op (see the doc above)
+        }
+        // FlashMS::update_M — S scaled here, R at accumulate time.
+        let mut vms = 1.0f32;
+        let mut need: u8 = 0;
+        if smax > m {
+            if m > f32::NEG_INFINITY {
+                vms = (m - smax).exp();
+                need = 1;
+            } else {
+                need = 2;
+            }
+            m = smax;
+        }
+        match need {
+            1 => s_sum *= vms,
+            2 => s_sum = 0.0,
+            _ => {}
+        }
+        for l in 0..32 {
+            w[l] = if s[l] == f32::NEG_INFINITY {
+                0.0
+            } else {
+                v_expf(s[l] - m)
+            };
+        }
+        s_sum += lane_tree_sum(w);
+        match need {
+            1 => r.iter_mut().for_each(|v| *v *= vms),
+            2 => r.fill(0.0),
+            _ => {}
+        }
+        for l in 0..32 {
+            if w[l] == 0.0 {
+                continue; // masked lane: fma(V, 0, R) == R exactly
+            }
+            let krow = &keys16[blk + l];
+            for d in 0..latent {
+                r[d] = half_to_f32(krow[p.rope_dims + d]).mul_add(w[l], r[d]);
+            }
+        }
+    }
+
+    let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
+    for (d, &v) in r.iter().enumerate() {
+        // SAFETY: cell `row * latent + d` belongs to this row alone —
+        // see the construction-site comment at the dispatch.
+        unsafe { out.write(row * latent + d, s_inv * v) };
+    }
+}
+
+/// The AVX2+FMA+F16C twin of [`flash_row_scalar`] (MUL-36). Same skeleton,
+/// same softmax / `v_expf` / online M/S scan / MUL-29 row-split structure;
+/// the two inner loops the scalar wall lived in are vectorized:
+///
+///   * the kq dot — [`kq_dot_fa4_avx2`]: the f16 row converts through
+///     `_mm256_cvtph_ps` (the exact f32 of the same bits `half_to_f32`
+///     returns; the f16→f32 direction cannot round) and the contraction
+///     runs as four 8-lane FMA partials, so the SUM ORDER changes from the
+///     fa4 two-partial chain to lane groups. That order change is the twins'
+///     one numerical difference; `tests/attn.rs` gates it by an explicit
+///     reassociation band against the scalar dot.
+///   * the V accumulation — `r[d] = fma(v_d, w, r[d])`, eight `d` per
+///     instruction. **Vectorizing the j (=d) axis reorders nothing**: each
+///     output element's FMA chain still descends key order exactly as the
+///     scalar wrote it — lane `d%8` of the instruction is element `d`'s own
+///     FMA with its own operands, and the per-key loop (the axis that must
+///     stay sequential) is untouched. Given the same weights this stage is
+///     therefore bit-identical to the scalar twin; the key-direction (l
+///     axis) is the one a regroup would have to reorder and it is not
+///     vectorized.
+///
+/// `#[target_feature]` is not optional (the MUL-26 lesson): without it the
+/// intrinsics lower to scalar emulation, 21x slower, with no error. The one
+/// split-out helper is the kq dot, at the per-key granularity the scalar
+/// path has always called its own dot at — nothing inside the contraction
+/// or the V loop is split (the MUL-27 lesson: finer splits round values
+/// through memory and cost 10–13 %).
+///
+/// # Safety
+/// The CPU must support AVX2+FMA+F16C, and the caller must hold the contract
+/// `flash_simd` gated on: `d_head = rope_dims + latent` a multiple of 32,
+/// `latent` a multiple of 8, every KV row `d_head` wide (asserted at the
+/// dispatch), and the scratch slices sized `d_head` / `latent` / `32`.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn flash_row_avx2(
+    q_rope: &Tensor2,
+    q_nope2: &Tensor2,
+    keys16: &[Vec<u16>],
+    key_slots: &[Slot],
+    q_slots: &[Slot],
+    p: &MlaParams,
+    n_tokens: usize,
+    row: usize,
+    qrow: &mut [f32],
+    r: &mut [f32],
+    w: &mut [f32; 32],
+    out: &crate::ops::SharedOut,
+) {
+    // SAFETY: the fn contract above — the ISA from the dispatch's
+    // `flash_simd`, the row width from the dispatch's assert, the scratch
+    // lengths from the dispatch's sizing; every pointer offset below stays
+    // inside those bounds.
+    unsafe {
+        use std::arch::x86_64::*;
+        let latent = p.latent;
+        let t = row / p.n_head;
+        let h = row % p.n_head;
+        // The FA row: [q_rope ; q_nope2], F32, never rounded.
+        qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
+        qrow[p.rope_dims..].copy_from_slice(q_nope2.col(h * n_tokens + t));
+
+        let mut m = f32::NEG_INFINITY;
+        let mut s_sum = 0.0f32;
+        r.fill(0.0);
+        for blk in (0..key_slots.len()).step_by(32) {
+            let mut s = [f32::NEG_INFINITY; 32];
+            let mut smax = f32::NEG_INFINITY;
+            for (l, sl) in s.iter_mut().enumerate() {
+                let u = blk + l;
+                let su = match key_slots.get(u) {
+                    Some(su) => su,
+                    None => break, // past the cache: padding, weight exactly 0
+                };
+                if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
+                    continue; // the -inf half of the causal mask
+                }
+                // SAFETY: in addition to the fn contract, `u` indexes
+                // keys16 in bounds (len == key_slots.len(), asserted at the
+                // dispatch) and its row is d_head wide.
+                let kq = kq_dot_fa4_avx2(qrow, &keys16[u]);
+                *sl = p.kq_scale * kq;
+                smax = smax.max(*sl);
+            }
+            if smax == f32::NEG_INFINITY {
+                continue; // fully masked block: exact no-op (see the doc above)
+            }
+            // FlashMS::update_M — S scaled here, R at accumulate time.
+            let mut vms = 1.0f32;
+            let mut need: u8 = 0;
+            if smax > m {
+                if m > f32::NEG_INFINITY {
+                    vms = (m - smax).exp();
+                    need = 1;
+                } else {
+                    need = 2;
+                }
+                m = smax;
+            }
+            match need {
+                1 => s_sum *= vms,
+                2 => s_sum = 0.0,
+                _ => {}
+            }
+            for l in 0..32 {
+                w[l] = if s[l] == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    v_expf(s[l] - m)
+                };
+            }
+            s_sum += lane_tree_sum(w);
+            match need {
+                1 => r.iter_mut().for_each(|v| *v *= vms),
+                2 => r.fill(0.0),
+                _ => {}
+            }
+            for l in 0..32 {
+                if w[l] == 0.0 {
+                    continue; // masked lane: fma(V, 0, R) == R exactly
+                }
+                let krow = &keys16[blk + l];
+                let wl = _mm256_set1_ps(w[l]);
+                // The latent tail of the KV row: eight f16 per cvtph, the
+                // j-axis FMA `r[d..d+8] = fma(v, w, r[d..d+8])`. See the fn
+                // doc for why this reorders nothing.
+                let vp = krow.as_ptr().add(p.rope_dims);
+                let rp = r.as_mut_ptr();
+                for d in (0..latent).step_by(8) {
+                    // SAFETY: latent % 8 == 0 and r.len() == latent (the fn
+                    // contract), so d+8 <= latent in both the key row
+                    // (rope_dims + latent = d_head wide) and r.
+                    let v = _mm256_cvtph_ps(_mm_loadu_si128(vp.add(d) as *const __m128i));
+                    let acc = _mm256_loadu_ps(rp.add(d));
+                    _mm256_storeu_ps(rp.add(d), _mm256_fmadd_ps(v, wl, acc));
+                }
+            }
+        }
+
+        let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
+        for (d, &v) in r.iter().enumerate() {
+            // SAFETY: cell `row * latent + d` belongs to this row alone —
+            // see the construction-site comment at the dispatch.
+            out.write(row * latent + d, s_inv * v);
+        }
+    }
 }
 
 // ----------------------------------------------------------------- wv_b

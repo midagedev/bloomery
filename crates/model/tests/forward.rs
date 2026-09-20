@@ -107,6 +107,18 @@ fn hw_forward_embed_is_exact() {
 /// flips. No repin. The argmax set did not move this time (`prompts.rs`,
 /// still {14}, worst |dlogit| 1.3984 -> 0.9458).
 ///
+/// 2026-09-20 (MUL-36): the flash SIMD wiring (every attention site's kq
+/// dot in 8-lane groups, V accumulation eight latent lanes per FMA) moved
+/// the bands only at the ULP-noise scale: 0–2 worst 1.17e-3 (`l_out-2`),
+/// 3–23 worst 7.91e-4 (`l_out-23`), 24–26 worst 1.08e-2 (`l_out-25`;
+/// `l_out-26` 3.49e-3), `result_output` 2.91e-2 against the 5e-2 logit
+/// gate. No repin: every band held with ≥2.5x headroom. The attention
+/// arithmetic itself is banded against its own scalar twin in
+/// `attn.rs`'s gate (1.31e-6 realized); what lands here is that noise
+/// compounding through 27 blocks on top of the inherited drift. The argmax
+/// re-lottery this caused is recorded in `prompts.rs` (set {24}, A/B proof
+/// there).
+///
 /// **Where the drift comes from is already known and is not this round's.** Block 0's
 /// 1.8e-3 is the attention round's documented `q_nope2` slack (its own gate measures
 /// `kqv_out-0` at 8.9e-4 fed the oracle's input, from activation-code tie flips in ik's
