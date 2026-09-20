@@ -160,6 +160,13 @@ fn hw_moe_forward_matches_ggml() {
     //   with the f16 scale format instead of bf16 fails at max |diff| = 2.8e-2,
     //   70x over the gate.
     // 4e-4 is 1.4x the observed maximum and 1/25th of the "1e-2 is a bug" line.
+    //
+    // 2026-09-20 (MUL-32): the Q5_0 x Q8_2_X4 fused wiring measures this
+    // comparison at max|diff| = 0e0 — bit-exact against the oracle's own
+    // MUL_MAT_ID output, over all 6*2048 entries. A/B on the same run pair
+    // (supports() with Q5_0 removed): 4.77e-6. The gate stays at 4e-4 —
+    // it is the reference-noise bound, not ours, and it is what still
+    // catches the f16-scale bug class above.
     oracle::assert_close(&tr.down, &down, 4e-4, "moe_ffn -> ffn_moe_down-1");
 
     // The weighted sum and the shared-expert sum are gated separately: they are two

@@ -185,10 +185,11 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
 
     // The contract: 33 of 33, and any divergence is named, not tolerated in bulk.
     //
-    // Repinned 2026-09-20, after the Q4_K x Q8_2_X4 fused wiring (MUL-27):
-    // the divergence set moved from {14, 24} to {} — both near-ties now pick
-    // ik's token, argmax 33/33 for the first time since the oracle gates
-    // existed.
+    // Repinned 2026-09-20, after the Q5_0 x Q8_2_X4 fused wiring (MUL-32):
+    // the divergence set moved from {} to {14} — prompt 14 is back, the
+    // same near-tie MUL-21 flipped and MUL-27 had landed (ik margin 0.108,
+    // a straight 1st/2nd swap: ik [245, 9226, ...], ours [9226, 245, ...];
+    // worst |dlogit| 1.3984, 1.298 at MUL-27).
     //
     // History of the set, because the pin's job is to make every move say
     // what moved it:
@@ -208,20 +209,31 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
     //     caused it: supports() reverted to Q3_K-only for one run moved the
     //     divergence set straight back to {14, 24} (same binary, same
     //     oracle).
+    //   * 2026-09-20, Q5_0 x8_2_x4 fused wiring (MUL-32): {14}. A/B proof:
+    //     supports() with Q5_0 removed for one run (same binary, same
+    //     oracle) → {} again, 33/33. The Q5_0 site itself moved decisively
+    //     TOWARD ik — moe.rs's `ffn_moe_down-1` comparison against the
+    //     oracle's own MUL_MAT_ID output is now bit-exact (max|diff| = 0e0;
+    //     4.77e-6 unwired, same run pair), and the kernel is within 1 ULP
+    //     of ik's own on the site's real rows (qdot gate B) fed ik's coder
+    //     byte for byte (gate 0). The flip is the chain re-lottery, not the
+    //     site: exact Q5_0 bits propagate into a 0.108-margin tie that the
+    //     remaining scalar sites (Q5_1/Q6_K) and `q_nope2`'s activation-code
+    //     tie flips still carry ~1.4 logits of drift across.
     //
-    // Where the remaining drift is from is unchanged in kind and now smaller:
-    // `q_nope2`'s activation-code tie flips (`attn.rs`'s `quantize_act`) and
-    // the not-yet-fused Q5_0/Q5_1/Q6_K sites. worst |dlogit| over ik's top-5
-    // measured 1.298 this round (0.994 at MUL-21) — the raw worst got worse
-    // while both argmax flips fixed; near-tie ordering and raw drift are
-    // different quantities, and the logits band gate (forward.rs, 5e-2)
-    // holds the raw side at 3.2e-2.
+    // Where the remaining drift is from is unchanged in kind: `q_nope2`'s
+    // activation-code tie flips (`attn.rs`'s `quantize_act`) and the
+    // not-yet-fused Q5_1/Q6_K sites. worst |dlogit| over ik's top-5
+    // measured 1.3984 this round (1.298 at MUL-27) — near-tie ordering and
+    // raw drift are different quantities, and the logits band gate
+    // (forward.rs, 5e-2) holds the raw side (result_output rel 2.35e-2 this
+    // run).
     //
     // The set is pinned rather than counted. Any prompt flipping fails; one
     // starting to match also fails, because that means something moved and
     // the round that moved it should say what. Do not widen this to
     // `len() <= N`.
-    const KNOWN_DIVERGENCE: &[usize] = &[];
+    const KNOWN_DIVERGENCE: &[usize] = &[14];
     let ids: Vec<usize> = mismatched.iter().map(|(id, ..)| *id).collect();
     assert_eq!(
         ids,

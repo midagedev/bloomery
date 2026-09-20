@@ -85,8 +85,16 @@ fn hw_forward_embed_is_exact() {
 /// 33/33 for the first time (`prompts.rs`, divergence set {} — both former
 /// flips were 1st/2nd swaps at ik margins 0.108/0.151). The tail blocks
 /// amplify whatever the chain carries into them (DeepSeek's massive
-/// activations make block 26 a sensitive spot); the not-yet-fused Q5_0/
+/// activations make block 26 a sensitive spot); the not-yet-fused
 /// Q5_1/Q6_K sites and `q_nope2`'s tie flips are what is still carried.
+///
+/// 2026-09-20 (MUL-32): the Q5_0 fused wiring (every ffn_down_exps site,
+/// k = 1408, now ik's own kernel arithmetic — moe.rs's `ffn_moe_down-1`
+/// is bit-exact, 0e0) brought the band's worst DOWN to 4.99e-3 (`l_out-25`;
+/// `l_out-24` 2.03e-3, `l_out-26` 3.58e-3, `result_output` 2.35e-2 against
+/// the 5e-2 logit gate). No repin: 7e-2 held. The argmax near-tie
+/// re-lottery this caused is recorded in `prompts.rs` (set {14}, A/B
+/// proof there).
 ///
 /// **Where the drift comes from is already known and is not this round's.** Block 0's
 /// 1.8e-3 is the attention round's documented `q_nope2` slack (its own gate measures

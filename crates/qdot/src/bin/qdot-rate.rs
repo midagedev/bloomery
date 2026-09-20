@@ -24,9 +24,7 @@ use std::time::Instant;
 
 use gguf::GgmlType;
 
-fn bench(ty: GgmlType, row_bytes: usize, rows: usize) {
-    let k = 2048usize;
-
+fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
     // xorshift64* filler: any bytes are valid quantized codes, and the
     // kernel's time is data-independent. The activation column goes through
     // the real `quantize_col` so its bytes are what the kernel really
@@ -65,7 +63,7 @@ fn bench(ty: GgmlType, row_bytes: usize, rows: usize) {
     let dt = t0.elapsed();
     let bytes = rows as f64 * row_bytes as f64 * passes as f64;
     println!(
-        "{ty:?}  rows {rows} x {row_bytes} B x {passes} passes in {:.3?} = {:.1} GB/s (sum {acc:.3})",
+        "{ty:?}  k={k} rows {rows} x {row_bytes} B x {passes} passes in {:.3?} = {:.1} GB/s (sum {acc:.3})",
         dt,
         bytes / dt.as_secs_f64() / 1e9
     );
@@ -73,8 +71,12 @@ fn bench(ty: GgmlType, row_bytes: usize, rows: usize) {
 
 fn main() {
     let rows: usize = 360_448;
-    // Q3_K: 110 B per 256 values; Q4_K: 144 B; Q6_K: 210 B (MUL-31).
-    bench(GgmlType::Q3_K, (2048 / 256) * 110, rows);
-    bench(GgmlType::Q4_K, (2048 / 256) * 144, rows);
-    bench(GgmlType::Q6_K, (2048 / 256) * 210, rows);
+    // Q3_K: 110 B per 256 values; Q4_K: 144 B; Q6_K: 210 B (MUL-31). Q5_0
+    // (MUL-32) runs at the REAL site's shape: ffn_down_exps rows are
+    // k = 1408 (44 x 22 B = 968 B/row) — the stage table's largest site,
+    // and the shape the engine will actually feed this kernel.
+    bench(GgmlType::Q3_K, 2048, (2048 / 256) * 110, rows);
+    bench(GgmlType::Q4_K, 2048, (2048 / 256) * 144, rows);
+    bench(GgmlType::Q6_K, 2048, (2048 / 256) * 210, rows);
+    bench(GgmlType::Q5_0, 1408, (1408 / 32) * 22, rows);
 }

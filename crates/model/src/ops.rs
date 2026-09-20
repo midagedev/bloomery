@@ -209,13 +209,17 @@ impl SharedOut {
 /// (measured), and the *wrong* quantized format is still 0.1 % away — both would force
 /// every gate below to open. `gguf::activation_format` owns the table.
 ///
-/// **Q3_K with k a multiple of 256 takes the fused path** (`crates/qdot`): the dot runs
+/// **A quantized type with a fused kernel takes the fused path** (`crates/qdot`):
+/// Q3_K and Q4_K for k a multiple of 256, Q5_0 for k a multiple of 32
+/// (`qdot::k_granularity` owns the per-type contract; MUL-32, 2026-09-20,
+/// added Q5_0 so the k = 1408 ffn_down_exps rows can fire at all). The dot runs
 /// straight off the quantized codes and no f32 weight row is ever materialized. That
 /// kernel is *more* accurate than this crate's dequant-then-round-trip f32 dot (measured
 /// against an f64 exact answer in the qdot round, 2026-09-20), so its output is
-/// deliberately NOT bit-identical to the scalar path — gates that cross a Q3_K matmul
+/// deliberately NOT bit-identical to the scalar path — gates that cross such a matmul
 /// assert closeness to the oracle, never bit equality with the scalar path. Every other
-/// type, and Q3_K rows whose k is not a multiple of 256, keep the scalar path unchanged.
+/// type, and rows whose k breaks the type's block contract, keep the scalar path
+/// unchanged.
 pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, crate::ModelError> {
     let mut outs = matmul_q_multi("matmul_q", gguf, &[w], &[x])?;
     Ok(outs.pop().expect("one pair in, one tensor out"))
@@ -412,11 +416,18 @@ fn matmul_q_multi(
     // The fused qdot kernel (crates/qdot) dots the quantized codes directly,
     // so its activation input is `qdot::quantize_col`'s byte layout, not the
     // f32 round trip. `supports(ty)` is qdot's type table — Q3_K x q8_K,
-    // Q4_K and Q6_K x q8_2_x4 (MUL-27/MUL-31) — and the k check mirrors the
-    // kernel's whole-super-block contract (256 values per block). Decided
-    // once for the whole batch; every pair shares the type, so no pair can
-    // disagree with its own row loop.
-    let fused = qdot::supports(ty) && k.is_multiple_of(256);
+    // Q4_K/Q6_K x q8_2_x4 (MUL-27/MUL-31) — and the k check is the WEIGHT
+    // TYPE'S block contract, owned by `qdot::k_granularity` so this call
+    // site and the kernel's own shape validation cannot drift apart:
+    // 256-value super-blocks for Q3_K/Q4_K/Q6_K, 32-value blocks for Q5_0
+    // (MUL-32, 2026-09-20: Q5_0's rows in this model are ffn_down_exps
+    // k = 1408 = 44 x 32 — NOT a multiple of 256 — so the single 256-value
+    // check this line carried until then would never fire on the stage
+    // table's largest site. The per-type number ADDS Q5_0's contract;
+    // the other types keep theirs exactly). Decided once for the whole
+    // batch; every pair shares the type, so no pair can disagree with its
+    // own row loop.
+    let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
     let mut quantized: Vec<QuantCols> = Vec::with_capacity(xs.len());
     for x in xs {
         let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
