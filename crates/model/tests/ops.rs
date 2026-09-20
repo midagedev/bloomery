@@ -32,7 +32,10 @@ fn hw_rms_norm_matches_ggml() {
         [winf.ne[0], winf.ne[1]],
         "shape must match the reference before the values can mean anything"
     );
-    oracle::assert_close(&got.data, &want, 1e-4, "rms_norm -> attn_norm-0");
+    // PIN(2026-09-21): 1e-4 -> exact. The norm now sums f32 squares in f64 and
+    // multiplies `(scale · gain) · x`, the reference's fused norm; the f32 sum
+    // with `(x · scale) · gain` it replaced sat 3.4e-5 away and fails this line.
+    oracle::assert_close(&got.data, &want, 0.0, "rms_norm -> attn_norm-0");
 }
 
 #[test]

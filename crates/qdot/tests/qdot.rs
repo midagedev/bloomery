@@ -1060,6 +1060,20 @@ fn swiglu_matches_scalar_and_is_position_independent() {
     assert_eq!(ends, [-0.0, 200.0]);
 }
 
+// --------------------------------------------------------- sum_sq_f64
+// The laned f64 sum against the left-to-right one: equal to f64 rounding, and
+// equal exactly once narrowed to f32 — the only form the norm consumes.
+#[test]
+fn sum_sq_f64_narrows_to_the_sequential_sum() {
+    for n in [8usize, 512, 2048, 2048 + 5] {
+        let x: Vec<f32> = (0..n).map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.0137).collect();
+        let seq: f64 = x.iter().fold(0.0f64, |a, &v| a + (v * v) as f64);
+        let got = qdot::sum_sq_f64(&x);
+        assert!(((got - seq) / seq).abs() < 1e-14, "n={n} got {got} seq {seq}");
+        assert_eq!(((got / n as f64) as f32).to_bits(), ((seq / n as f64) as f32).to_bits());
+    }
+}
+
 // ------------------------------------------------------------ dot_f32
 // The reference order by hand: eight lane sums (first block a multiply, the
 // rest fused multiply-adds), then (l0+l4 + l2+l6) + (l1+l5 + l3+l7).

@@ -2282,6 +2282,49 @@ unsafe fn dot_f32_avx2(wrow: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+// ------------------------------------------------------- sum of squares
+
+/// `Σ (x[i]·x[i]) as f64` — f32 squares accumulated in f64, the reference
+/// norm's sum. With AVX2 the f64 accumulation runs in eight lanes (two
+/// four-lane registers) instead of left to right: the two orders differ by
+/// f64 rounding only (~1e-16 relative), which the caller's narrowing of the
+/// mean to f32 absorbs except on an exact rounding tie.
+pub fn sum_sq_f64(x: &[f32]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature was just detected.
+        return unsafe { sum_sq_f64_avx2(x) };
+    }
+    x.iter().map(|&v| (v * v) as f64).sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_sq_f64_avx2(x: &[f32]) -> f64 {
+    use std::arch::x86_64::*;
+    let full = x.len() / 8 * 8;
+    // SAFETY: `i + 8 <= full <= x.len()`; unaligned loads.
+    let mut total = unsafe {
+        let mut a0 = _mm256_setzero_pd();
+        let mut a1 = _mm256_setzero_pd();
+        let mut i = 0;
+        while i < full {
+            let v = _mm256_loadu_ps(x.as_ptr().add(i));
+            let sq = _mm256_mul_ps(v, v);
+            a0 = _mm256_add_pd(a0, _mm256_cvtps_pd(_mm256_castps256_ps128(sq)));
+            a1 = _mm256_add_pd(a1, _mm256_cvtps_pd(_mm256_extractf128_ps(sq, 1)));
+            i += 8;
+        }
+        let a = _mm256_add_pd(a0, a1);
+        let lo = _mm_add_pd(_mm256_castpd256_pd128(a), _mm256_extractf128_pd(a, 1));
+        _mm_cvtsd_f64(_mm_add_sd(lo, _mm_unpackhi_pd(lo, lo)))
+    };
+    for &v in &x[full..] {
+        total += (v * v) as f64;
+    }
+    total
+}
+
 // ------------------------------------------------------------ SwiGLU combine
 
 /// `out[i] = silu(gate[i]) * up[i]`, the reference's AVX2 form: `ggml_v_expf` and

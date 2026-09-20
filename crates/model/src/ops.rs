@@ -248,14 +248,14 @@ pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
     let mut out = Tensor2::scratch(x.ne0, x.ne1);
     for t in 0..x.ne1 {
         let src = x.col(t);
-        let mut sum = 0.0f32;
-        for &v in src {
-            sum += v * v;
-        }
-        let scale = 1.0f32 / (sum / x.ne0 as f32 + eps).sqrt();
+        // The reference's fused norm: f32 squares summed in f64, the mean
+        // narrowed to f32, then `(scale · gain) · x` in that order.
+        let sum = qdot::sum_sq_f64(src);
+        let mean = (sum / x.ne0 as f64) as f32;
+        let scale = 1.0f32 / (mean + eps).sqrt();
         let dst = out.col_mut(t);
         for i in 0..x.ne0 {
-            dst[i] = src[i] * scale * gain[i];
+            dst[i] = scale * gain[i] * src[i];
         }
     }
     if let Some(t_call) = t_call {
