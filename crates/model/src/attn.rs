@@ -47,6 +47,7 @@ use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo};
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// All intermediates, for the gate. `Tensor2` holds `ne0` contiguous with trailing
@@ -610,6 +611,14 @@ fn quantize_act(x: &[f32]) -> ActBlock {
 /// the dot is then a sum over blocks of `f32(f16(dw)) · dq · Σ qw·qq` with an exact
 /// i32 inner sum. The block sum accumulates in f64: ggml's f32 SIMD lane order
 /// differs in its last ulp; ours is the exact sum.
+///
+/// The (column, row) cell space runs on the resident pool (MUL-33). Each output
+/// cell depends only on its own weight blocks and its column's quantized
+/// activation, and the only accumulation — the f64 block sum — stays inside the
+/// cell, so splitting cells cannot reorder anything and the output is
+/// bit-identical to the serial loop; `tests/mt.rs` holds that as a byte compare
+/// across thread counts. The activation quantization stays on the caller thread,
+/// once per (h, t), before the split.
 pub fn q_nope2_absorbed(
     wblocks: &[Q8Block],
     q: &Tensor2,
@@ -617,9 +626,10 @@ pub fn q_nope2_absorbed(
 ) -> Result<Tensor2, ModelError> {
     // Profiler hook (crate::profile). This site was hypothesis 3 — the per-step
     // wk_b requant — and `Derived` closed it: what is left is the per-token half.
-    // The stage split keeps its axes (activation quant as `quant_act`, the t/j/b
-    // loops as `dot`); `dequant_w` can no longer fire from this site, so a nonzero
-    // `dequant_w` row here would mean someone reintroduced a per-step requant.
+    // The stage split keeps its axes (the caller-side quant pre-pass as
+    // `quant_act`, the pool cell loops as `dot`); `dequant_w` can no longer fire
+    // from this site, so a nonzero `dequant_w` row here would mean someone
+    // reintroduced a per-step requant.
     let lvl = profile::level();
     let mut pacc = profile::CallAcc::new();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
@@ -639,34 +649,123 @@ pub fn q_nope2_absorbed(
     }
     let mut out = Tensor2::zeros(p.latent, p.n_head * q.ne1);
 
+    // Quantize each (h, t) activation slice once, on the caller thread, before
+    // the cell split — the same "quantize once per pair" argument
+    // `matmul_q_multi` rides at its own quantization site. One 128-wide slice
+    // feeds all `latent` output rows of its column, and once the columns live
+    // on the pool a column straddling a chunk boundary must not be quantized
+    // twice. Serial on purpose, as there: the quant stage is 0.4 of the site's
+    // 11.0 ms (level 2, 2026-09-20, timer tax included), and `quantize_act`
+    // is deterministic — a shared read-only `qall`, laid out column-major so
+    // chunk `col` reads a contiguous run, is byte-identical to the per-(h, t)
+    // Vec the serial loop used to build inside the t loop.
+    let t_qa = if lvl >= 2 { Some(Instant::now()) } else { None };
+    let mut qall: Vec<ActBlock> = Vec::with_capacity(p.n_head * q.ne1 * nblocks);
     for h in 0..p.n_head {
-        let whead = &wblocks[h * span..(h + 1) * span];
         for t in 0..q.ne1 {
             let qbase = t * q.ne0 + h * p.kq_head;
             let qrow = &q.data[qbase..qbase + p.nope];
-            let t_qa = if lvl >= 2 { Some(Instant::now()) } else { None };
-            let qblocks: Vec<ActBlock> = qrow.chunks_exact(32).map(quantize_act).collect();
-            if let Some(t_qa) = t_qa {
-                pacc.add_quant_act(t_qa.elapsed().as_nanos() as u64);
-            }
+            qall.extend(qrow.chunks_exact(32).map(quantize_act));
+        }
+    }
+    if let Some(t_qa) = t_qa {
+        pacc.add_quant_act(t_qa.elapsed().as_nanos() as u64);
+    }
+
+    // MUL-33: the output cell space — column `col = h·ne1 + t`, row `j` — runs
+    // on the resident pool. This was the last big serial site of the decode
+    // step (11.0 ms of a 41.2 ms wall, level 2, N=96, 2026-09-20; 27 calls per
+    // step, one per layer), all of it on the caller thread while the pool
+    // idled through the attention section. The independence argument is the
+    // cell form of the row split `matmul_q` rides (MUL-23): cell (col, j)
+    // reads only `wblocks[h·span + j·nblocks + b]` and its own column's
+    // quantized blocks, and its only accumulation — the b = 0..4 f64 sum — is
+    // confined inside the cell, so which thread computes which cell cannot
+    // change a bit. Splitting the b axis would reorder that f64 accumulation
+    // and is forbidden. ik dispatches this same node over (heads × row
+    // chunks) on its own pool (iqk_mul_mat.cpp:637-676); the cell split is
+    // this engine's spelling of that axis. `t` is the column axis, so prefill
+    // (ne1 > 1) is the same space with more columns — nothing below branches
+    // on which case it is.
+    //
+    // SAFETY (construction site): every participant computes cells of the
+    // (col, j) space inside its own contiguous chunk and writes only cell
+    // `col * latent + j` of `out.data` — the chunks partition the cell
+    // space, so no two participants alias. The pool's completion protocol
+    // publishes the writes before this function reads `out`, the same
+    // ordering that publishes the matmul job slot. The per-cell arithmetic
+    // is untouched from the serial loop this replaced; `tests/mt.rs` holds
+    // the whole claim as a byte compare across thread counts.
+    let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
+    let latent = p.latent;
+    let ne1 = q.ne1;
+    let collected: Mutex<Vec<profile::CallAcc>> =
+        Mutex::new(Vec::with_capacity(threads::pool().threads()));
+    threads::pool().for_each_chunk(p.n_head * ne1 * latent, |cells| {
+        let mut acc = profile::CallAcc::new();
+        // Walk the chunk column-segment-wise: a chunk may start mid-column
+        // and end mid-column, so each iteration takes the intersection of the
+        // remaining chunk and one column — `whead`/`qcol` are then fetched
+        // once per segment, not once per cell.
+        let mut c = cells.start;
+        while c < cells.end {
+            let col = c / latent;
+            let j0 = c - col * latent;
+            let j_end = j0 + (cells.end - c).min(latent - j0);
+            let h = col / ne1;
+            let whead = &wblocks[h * span..(h + 1) * span];
+            let qcol = &qall[col * nblocks..(col + 1) * nblocks];
             let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
-            let dst = out.col_mut(h * q.ne1 + t);
-            for j in 0..p.latent {
-                let mut acc = 0.0f64;
-                for (b, qb) in qblocks.iter().enumerate() {
+            for j in j0..j_end {
+                let mut cell = 0.0f64;
+                for (b, qb) in qcol.iter().enumerate() {
                     let wb = &whead[j * nblocks + b];
                     let mut isum = 0i32;
                     for l in 0..32 {
                         isum += wb.q[l] as i32 * qb.q[l] as i32;
                     }
-                    acc += (half_to_f32(wb.d) * qb.d) as f64 * f64::from(isum);
+                    cell += (half_to_f32(wb.d) * qb.d) as f64 * f64::from(isum);
                 }
-                dst[j] = acc as f32;
+                // SAFETY: cell `col * latent + j` belongs to this chunk's
+                // range of the cell split alone — see the construction-site
+                // comment above.
+                unsafe { out_ptr.write(col * latent + j, cell as f32) };
             }
             if let Some(t_dot) = t_dot {
-                pacc.add_dot(t_dot.elapsed().as_nanos() as u64);
+                acc.add_dot(t_dot.elapsed().as_nanos() as u64);
             }
+            // j_end is a row index INSIDE the column (0..latent); the walk
+            // variable is absolute, so the next segment starts at the
+            // column's base plus j_end. Writing `c = j_end` here kept c at
+            // latent forever once the first column ended — the first
+            // segment only looked right because its base was zero.
+            c = col * latent + j_end;
         }
+        // The one lock of the chunk — never per cell: a mutex inside the cell
+        // loop would profile the mutex. The accumulator mutex stays out of the
+        // measured region the same way `record`'s does.
+        collected
+            .lock()
+            .expect("q_nope2_absorbed chunk accumulator")
+            .push(acc);
+    });
+
+    // Post-join bookkeeping: fold the chunk accumulators so `record` still
+    // fires exactly once per call, after its `Instant` pair closed. Arrival
+    // order is nondeterministic and nothing depends on it — the fold is
+    // addition, and there is no error precedence to keep because the shape
+    // check fired before the dispatch and the cell loop cannot fail. Since
+    // MUL-23 this section is bookkeeping only; level 2 times it as the
+    // `gather` stage to keep that honest, mirroring `matmul_q_multi`'s tail.
+    let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
+    for acc in collected
+        .into_inner()
+        .expect("q_nope2_absorbed chunk accumulator")
+    {
+        pacc.add_acc(&acc);
+    }
+    if let Some(t_gather) = t_gather {
+        pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
     }
     if let Some(t_call) = t_call {
         // Shape statement for the derived weights this call consumed:
