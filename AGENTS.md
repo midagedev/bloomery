@@ -150,6 +150,12 @@ first suspect is a hung gate on the box, not the agent.
   calls per steady step and only ratchets down. Activation blocks come from
   `Tensor2::scratch` (no zero fill) when every cell is written;
   `BLOOMERY_POISON=1` turns a missed cell into a NaN the gates catch.
+- **Read chunk skew at profile level 1, never level 2.** Level 2 times every
+  row, and the timer tax scales with row count — it inflated "slowest chunk vs
+  mean" from 11 % to 20–40 % and a whole round was aimed at the difference.
+  `span ms` / `slowest ms` and the per-chunk line print at level 1 for this. A
+  microbench µs is not a step µs either: the pool bench went 4.56 → 1.61 µs
+  per dispatch and decode did not move.
 - **Profile the binary you think you are profiling.** `tools/box.sh` syncs
   source and builds nothing; run `just build-decode` first. `perf record -D`
   skips startup, not teardown — cut the report with `--time`, or the
