@@ -1060,6 +1060,34 @@ fn swiglu_matches_scalar_and_is_position_independent() {
     assert_eq!(ends, [-0.0, 200.0]);
 }
 
+// ------------------------------------------------------------ dot_f32
+// The reference order by hand: eight lane sums (first block a multiply, the
+// rest fused multiply-adds), then (l0+l4 + l2+l6) + (l1+l5 + l3+l7).
+#[test]
+fn dot_f32_is_the_reference_lane_order() {
+    let k = 2048;
+    let w: Vec<f32> = (0..k).map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.0013).collect();
+    let x: Vec<f32> = (0..k).map(|i| ((i * 91 % 1777) as f32 - 888.0) * 0.0071).collect();
+    let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let Some(got) = qdot::dot_f32(&bytes, &x) else {
+        return; // no AVX2+FMA: the caller's scalar loop owns the value
+    };
+    let mut lane = [0.0f32; 8];
+    for (l, a) in lane.iter_mut().enumerate() {
+        *a = x[l] * w[l];
+    }
+    for i in 1..k / 8 {
+        for (l, a) in lane.iter_mut().enumerate() {
+            *a = x[i * 8 + l].mul_add(w[i * 8 + l], *a);
+        }
+    }
+    let s: [f32; 4] = std::array::from_fn(|l| lane[l] + lane[l + 4]);
+    let want = (s[0] + s[2]) + (s[1] + s[3]);
+    assert_eq!(got.to_bits(), want.to_bits());
+    // A width the lanes cannot take is the caller's, not a truncated sum.
+    assert!(qdot::dot_f32(&bytes[..4 * 12], &x[..12]).is_none());
+}
+
 // ------------------------------------------- quantize_col AVX2 encoders
 // The activation encoders behind `quantize_col` run AVX2 when the CPU has it;
 // the scalar loops stay as the fallback and as this section's oracle. Every

@@ -69,7 +69,10 @@ fn hw_moe_router_exact() {
     // Numerics, in graph order.
     let (logits, linf) = o.load("ffn_moe_logits-1", 0);
     assert_eq!(linf.op, "MUL_MAT");
-    oracle::assert_close(&tr.logits, &logits, 1e-4, "route -> ffn_moe_logits-1");
+    // PIN(2026-09-21): 1e-4 -> exact. The router is F32 x F32 and `qdot::dot_f32`
+    // sums in the reference's lane order, so the logits are the reference's bits;
+    // the scalar left-to-right sum it replaced sat 3.8e-6 away and fails this line.
+    oracle::assert_close(&tr.logits, &logits, 0.0, "route -> ffn_moe_logits-1");
 
     let (probs, pinf) = o.load("ffn_moe_probs-1", 0);
     assert_eq!(pinf.op, "SOFT_MAX");

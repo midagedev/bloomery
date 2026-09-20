@@ -2238,6 +2238,50 @@ unsafe fn q_nope2_cells_avx2_inner(
     }
 }
 
+// --------------------------------------------------------- F32 row · column
+
+/// One F32 weight row (little-endian bytes, as the file holds it) dotted with
+/// an F32 column, in the reference's float-kernel order (`mul_mat_Qx_Qy_MxN`,
+/// iqk_gemm_floats.cpp): one eight-lane accumulator — the first block a plain
+/// multiply, every later block `fmadd(y, x, acc)` — then `hsum_float_8` (upper
+/// half onto lower, `movehl`, `movehdup`). `None` when the CPU lacks AVX2+FMA or
+/// `k` is not a multiple of 8; the caller keeps its scalar loop for that.
+pub fn dot_f32(wrow: &[u8], x: &[f32]) -> Option<f32> {
+    assert_eq!(wrow.len(), x.len() * 4, "dot_f32: row bytes vs column length");
+    #[cfg(target_arch = "x86_64")]
+    if !x.is_empty()
+        && x.len().is_multiple_of(8)
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        // SAFETY: the features were just detected; lengths checked above.
+        return Some(unsafe { dot_f32_avx2(wrow, x) });
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_f32_avx2(wrow: &[u8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let w = wrow.as_ptr() as *const f32;
+    let nb = x.len() / 8;
+    // SAFETY: `i * 8 + 8 <= x.len()` and `wrow` is four bytes per element; the
+    // loads are unaligned, and x86 is little-endian, so the bytes are the f32s.
+    unsafe {
+        let mut acc = _mm256_mul_ps(_mm256_loadu_ps(x.as_ptr()), _mm256_loadu_ps(w));
+        for i in 1..nb {
+            let yv = _mm256_loadu_ps(x.as_ptr().add(i * 8));
+            let xv = _mm256_loadu_ps(w.add(i * 8));
+            acc = _mm256_fmadd_ps(yv, xv, acc);
+        }
+        let mut s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_movehdup_ps(s));
+        _mm_cvtss_f32(s)
+    }
+}
+
 // ------------------------------------------------------------ SwiGLU combine
 
 /// `out[i] = silu(gate[i]) * up[i]`, the reference's AVX2 form: `ggml_v_expf` and

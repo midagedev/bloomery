@@ -631,6 +631,21 @@ impl<'a> PairWork<'a> {
                 let row = &mut scratch[..k];
                 for r in rows {
                     let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
+                    // An F32 row against F32 columns: the reference's float
+                    // kernel order, straight off the file bytes.
+                    if ty == GgmlType::F32 && qdot::dot_f32(src, &self.q_f32[..k]).is_some() {
+                        let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
+                        for t in 0..self.ne1 {
+                            let xc = &self.q_f32[t * k..(t + 1) * k];
+                            let v = qdot::dot_f32(src, xc).expect("support is per (cpu, k)");
+                            // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
+                            unsafe { self.out.write(t * n + r, v) };
+                        }
+                        if let Some(t_dot) = t_dot {
+                            acc.add_dot(t_dot.elapsed().as_nanos() as u64);
+                        }
+                        continue;
+                    }
                     // Weight side: dequant_row, or the byte walk in its place for F32 rows.
                     let t_d = if lvl >= 2 { Some(Instant::now()) } else { None };
                     if ty == GgmlType::F32 {
@@ -1262,6 +1277,12 @@ pub(crate) fn matvec_q_local(
             let row = &mut scratch[..k];
             for r in 0..n {
                 let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+                if ty == GgmlType::F32 {
+                    if let Some(v) = qdot::dot_f32(src, &qbuf[..k]) {
+                        out[r] = v;
+                        continue;
+                    }
+                }
                 // Weight side: dequant_row, or the byte walk in its place for F32 rows.
                 if ty == GgmlType::F32 {
                     for (i, v) in row.iter_mut().enumerate() {
