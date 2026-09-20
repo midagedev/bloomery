@@ -1,0 +1,15 @@
+[package]
+name = "bloomery-gpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+cuda-device.workspace = true
+cuda-host.workspace = true
+# Shared host-side runtime, published from NVlabs/cutile-rs.
+cuda-core.workspace = true

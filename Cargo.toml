@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/q3k-gemv", "crates/q3k-cpu", "crates/qdot", "crates/gguf", "crates/model", "crates/threads"]
+members = ["crates/q3k-gemv", "crates/q3k-cpu", "crates/qdot", "crates/gguf", "crates/model", "crates/threads", "crates/gpu", "crates/gpu-spike"]
 # 의도적으로 컴파일되지 않는 재현기다(MUL-7). 워크스페이스에 넣으면 --workspace가 영구히 빨갛다.
 exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_smoke"]
 

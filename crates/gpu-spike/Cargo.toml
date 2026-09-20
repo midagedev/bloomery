@@ -1,0 +1,22 @@
+[package]
+name = "bloomery-gpu-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[[bin]]
+name = "gpu-spike"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Optional on purpose: with the feature off this package has no edge to the
+# device crate at all, so plain `cargo build`/`cargo test` never resolve the
+# embedded-bundle anchor symbol (which only the cargo-oxide backend defines).
+bloomery-gpu = { path = "../gpu", optional = true }
+
+[features]
+gpu = ["dep:bloomery-gpu"]
