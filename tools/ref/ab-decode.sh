@@ -30,23 +30,28 @@ witness() {
 exec 9>/root/bloomery-cpu.lock
 flock -w 1800 9 || { echo "[lease] timed out" >&2; exit 75; }
 witness pre
+# 팔 목록: 트리 팔("tree:<dir>")과 env 팔("env:<K=V ...>")을 한 줄로 세우고 바퀴마다 한 칸씩
+# 돌린다. 막는 실패: 위치 편향 — 고정 순서에서는 바퀴의 첫 팔이 0.3–0.8% 느리게 나왔고
+# (같은 바이너리의 A/A로 확인), 그만큼의 차이를 가진 변경의 판정이 순서에 따라 뒤집힌다.
+arms=()
+sums=()
+for d in "${bins[@]}"; do arms+=("tree:$d"); done
+for e in "${envs[@]}"; do [ -n "$e" ] && arms+=("env:$e"); done
+here=$(basename "$PWD")
 for r in $(seq "$ROUNDS"); do
-  for d in "${bins[@]}"; do
-    out=$("$HOME/repo/$d/target/release/bloomery-decode" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $d FAILED" >&2; exit 1; }
+  for i in $(seq 0 $((${#arms[@]} - 1))); do
+    a=${arms[$(((i + r - 1) % ${#arms[@]}))]}
+    case $a in
+      tree:*) d=${a#tree:}; label=$d; e="" ;;
+      env:*) d=$here; e=${a#env:}; label="[$e]" ;;
+    esac
+    out=$(env $e "$HOME/repo/$d/target/release/bloomery-decode" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
     toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
     pre=$(echo "$out" | grep -E '^prefill' | sed 's/.*= //')
     med=$(echo "$out" | awk '/^ +[0-9]+ +[0-9]+ +[0-9.]+ /{print $3}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
-    [ -n "$toks" ] || { echo "r$r $d produced no decode line" >&2; exit 1; }
-    echo "r$r $d | prefill $pre | decode $toks | median ${med} ms"
-  done
-  for e in "${envs[@]}"; do
-    [ -n "$e" ] || continue
-    d=$(basename "$PWD")
-    out=$(env $e "$HOME/repo/$d/target/release/bloomery-decode" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r [$e] FAILED" >&2; exit 1; }
-    toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
-    huge=$(echo "$out" | awk '/^mem +AnonHugePages/{print $3 $4}')
-    [ -n "$toks" ] || { echo "r$r [$e] produced no decode line" >&2; exit 1; }
-    echo "r$r [$e] | decode $toks | AnonHuge ${huge:-?}"
+    [ -n "$toks" ] || { echo "r$r $label produced no decode line" >&2; exit 1; }
+    echo "r$r $label | prefill $pre | decode $toks | median ${med} ms"
+    sums+=("$label|${toks%% *}")
   done
   # ik 팔(BLOOMERY_AB_IK=1): 가장 빠르게 잰 플래그 조합의 llama-bench를 같은 바퀴 안에 끼운다.
   # 막는 실패: 단발 헤드라인 하나를 ik의 다른 임대 숫자와 비교해 "넘었다"고 쓰는 것 —
@@ -57,4 +62,6 @@ for r in $(seq "$ROUNDS"); do
     echo "r$r ik[$IK_BEST_FLAGS] | decode $ik tok/s"
   fi
 done
+# 팔별 평균 — 바퀴 표를 눈으로 더하다 틀리지 않게.
+printf '%s\n' "${sums[@]}" | awk -F'|' '{s[$1]+=$2; n[$1]++} END{for(k in s) printf "mean %-40s %.2f tok/s (n=%d)\n", k, s[k]/n[k], n[k]}' | sort
 witness post

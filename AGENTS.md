@@ -142,7 +142,11 @@ first suspect is a hung gate on the box, not the agent.
   there), then `just ab-decode bloomery-<track>` from the changed tree; judge
   by the interleaved relative numbers only — the same commit moves ~5 % between
   windows. Bit-identical is not speed-identical: an expression moved from a
-  write-into-zeros loop to `map().collect()` doubled its site.
+  write-into-zeros loop to `map().collect()` doubled its site. The runner
+  rotates arm order every round and prints per-arm means: in a fixed order the
+  round's first arm read 0.3–0.8 % slow (same-binary A/A), enough to flip a
+  small verdict. `BLOOMERY_AB_ENVS="K=V;K=V"` adds same-binary arms that differ
+  only by a lever — put an A/A arm in whenever the claim is under 1 %.
 - **The step does no load-time work.** Anything that does not depend on the
   tokens — tensor lookups, names, metadata keys, views, decoded gains — is
   resolved once into `Derived`; the calling thread's serial time is the step's
