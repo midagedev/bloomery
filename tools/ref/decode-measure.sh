@@ -94,5 +94,5 @@ fi
 echo
 echo "=== ik_llama.cpp, same file, same lease, CPU only ==="
 witness pre-ik
-CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n 32 -r 2
+CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2
 witness post-ik
