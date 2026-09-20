@@ -19,6 +19,8 @@ for d in "$@" "$(basename "$PWD")"; do
 done
 witness() {
   echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
+  # 임대를 모르는 남의 프로세스는 이 줄에서만 보인다(다른 세션의 llama-server가 A/B를 오염시킨 적 있다).
+  echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
 }
 exec 9>/root/bloomery-cpu.lock
 flock -w 1800 9 || { echo "[lease] timed out" >&2; exit 75; }

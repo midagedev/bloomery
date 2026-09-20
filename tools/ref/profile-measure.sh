@@ -28,6 +28,8 @@ witness() {
   echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
   nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
   echo "lock-holder-pid: $$"
+  # 임대를 모르는 남의 프로세스는 이 줄에서만 보인다.
+  echo "busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
 }
 
 exec 9>"$LOCK"
