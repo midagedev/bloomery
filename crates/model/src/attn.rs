@@ -23,7 +23,7 @@
 
 use crate::derived::Derived;
 use crate::kv::KvCache;
-use crate::ops::{matmul_q, matmul_q_batch, rms_norm};
+use crate::ops::{matmul_q, matmul_q_batch, matmul_q_group, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
@@ -111,14 +111,17 @@ pub fn block_attn_cached(
     }
     let kv_width = p.latent + p.rope_dims;
 
-    // 1. The two projections out of the normed activations.
+    // 1. The two projections out of the normed activations — one group
+    //    dispatch over the same `x`: the pair mixes types and row counts,
+    //    which is the heterogeneous shape.
     let wq = &ap.wq;
     let wa = &ap.wa;
     if let Some(t_p1) = t_p1 {
         params_ns += t_p1.elapsed().as_nanos() as u64;
     }
-    let q = matmul_q(gguf, wq, x)?;
-    let kv_rope_compressed = matmul_q(gguf, wa, x)?;
+    let mut proj = matmul_q_group(gguf, &[wq, wa], &[x, x])?;
+    let kv_rope_compressed = proj.pop().expect("one output per pair");
+    let q = proj.pop().expect("one output per pair");
 
     // 2. Latent norm. The gain is F32 in the file, decoded once at load.
     let t_p2 = if lvl > 0 { Some(Instant::now()) } else { None };

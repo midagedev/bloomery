@@ -201,6 +201,7 @@ fn hw_profile_gate() {
     // doing. It still records at load (`Derived::new` decodes the gains).
     for site in [
         "matmul_q",
+        "matmul_q_group",
         "q_nope2_absorbed",
         "embed",
         "rms_norm",
@@ -228,7 +229,7 @@ fn hw_profile_gate() {
             .sum();
         assert!(calls > 0, "site {site} recorded nothing — its hook is dead");
     }
-    eprintln!("sites                                all 20 hooked sites live");
+    eprintln!("sites                                all 21 hooked sites live");
 
     // The table itself, printed whatever the verdict — a coverage number without the
     // rows behind it cannot be acted on.

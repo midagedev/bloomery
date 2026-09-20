@@ -433,18 +433,128 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
 /// only on the output row of one pair, so bit identity is unchanged
 /// (`tests/ops.rs`: batched ≡ sequential). Pairs may share an activation
 /// block — each DISTINCT block is quantized once (deterministic encoders);
-/// `W_i` all agree on dims and type, `x_i` may differ in token count.
+/// `W_i` all agree on dims and type, `x_i` may differ in token count. The
+/// homogeneity contract is [`batch_shape`]'s, checked here before the group
+/// engine runs — a mixed list is [`matmul_q_group`]'s job, not this one's.
 pub fn matmul_q_batch(
     gguf: &Gguf,
     ws: &[&TensorInfo],
     xs: &[&Tensor2],
 ) -> Result<Vec<Tensor2>, crate::ModelError> {
+    batch_shape(ws, xs)?;
     matmul_q_multi("matmul_q_batch", gguf, ws, xs)
+}
+
+/// The heterogeneous sibling of [`matmul_q_batch`]: `y_i = W_i · x_i` where
+/// every pair carries its own type, `k` and `n` — output `i` is
+/// `{n_i, xs[i].ne1}`. One row dispatch over all pairs (lanes balanced by
+/// weight bytes) and one quantization per DISTINCT (input, encoding). The
+/// per-pair shape contract is `matmul_q`'s own input-width check, so a
+/// mismatched pair errors exactly as the single-pair call would, and the
+/// result is bit-identical to the per-pair `matmul_q` sequence
+/// (`tests/ops.rs`).
+pub fn matmul_q_group(
+    gguf: &Gguf,
+    ws: &[&TensorInfo],
+    xs: &[&Tensor2],
+) -> Result<Vec<Tensor2>, crate::ModelError> {
+    matmul_q_multi("matmul_q_group", gguf, ws, xs)
+}
+
+/// Pairs a group carries before its bookkeeping spills to the heap. The
+/// step's widest group is MoE gate/up — `2·n_used + 2 = 14` at `n_used = 6` —
+/// and `wv_b`'s per-head batch is 16; both stay inline, so a decode step's
+/// groups allocate nothing but their outputs.
+const GROUP_INLINE: usize = 16;
+
+/// Per-call group bookkeeping: a fixed stack block for the first
+/// [`GROUP_INLINE`] entries, the heap past that. Indexed access only — the
+/// walkers advance monotonically and never need a contiguous slice.
+struct Flex<T> {
+    inline: [Option<T>; GROUP_INLINE],
+    heap: Vec<T>,
+    len: usize,
+}
+
+impl<T> Flex<T> {
+    fn new() -> Self {
+        Flex {
+            inline: std::array::from_fn(|_| None),
+            heap: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, v: T) {
+        if self.len < GROUP_INLINE {
+            self.inline[self.len] = Some(v);
+        } else {
+            self.heap.push(v);
+        }
+        self.len += 1;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// An index below `len`; the inline tail above it is never read.
+    fn get(&self, i: usize) -> &T {
+        if i < GROUP_INLINE {
+            self.inline[i].as_ref().expect("index below len is filled")
+        } else {
+            &self.heap[i - GROUP_INLINE]
+        }
+    }
+
+    fn get_mut(&mut self, i: usize) -> &mut T {
+        if i < GROUP_INLINE {
+            self.inline[i].as_mut().expect("index below len is filled")
+        } else {
+            &mut self.heap[i - GROUP_INLINE]
+        }
+    }
+
+    /// Move entry `i` out — the single-entry handoff in `quantize_one`.
+    fn take(&mut self, i: usize) -> T {
+        self.len -= 1;
+        if i < GROUP_INLINE {
+            self.inline[i].take().expect("index below len is filled")
+        } else {
+            self.heap.swap_remove(i - GROUP_INLINE)
+        }
+    }
+}
+
+impl Flex<QuantCols> {
+    /// Hand every buffer back to its pool — the heap arm drains from the
+    /// end because `swap_remove` shortens it.
+    fn release_all(&mut self) {
+        while let Some(q) = self.heap.pop() {
+            q.release();
+        }
+        for slot in &mut self.inline {
+            if let Some(q) = slot.take() {
+                q.release();
+            }
+        }
+        self.len = 0;
+    }
+}
+
+impl<T> Default for Flex<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// One (weight view, activation block) pair plus everything a row needs; the
 /// row loop exists once, here — a duplicate is how the shapes would drift bit for bit.
+/// A group is heterogeneous: `ty`/`k`/`n` are this pair's own, not the call's.
 struct PairWork<'a> {
+    ty: GgmlType,
+    k: usize,
+    n: usize,
     bytes: &'a [u8],
     row_bytes: usize,
     /// Fused qdot columns: (stride `cb`, quantized byte buffer).
@@ -455,19 +565,31 @@ struct PairWork<'a> {
     out: SharedOut,
 }
 
+/// The per-pair facts resolved before any output block exists.
+#[derive(Clone, Copy)]
+struct PairMeta {
+    ty: GgmlType,
+    k: usize,
+    n: usize,
+    row_bytes: usize,
+}
+
 impl<'a> PairWork<'a> {
     /// The one construction path both dispatch shapes ride; the SAFETY
     /// argument for the output pointer lives at the callers, where the split
     /// is decided.
-    fn new(out: &mut Tensor2, bytes: &'a [u8], q: &'a QuantCols, row_bytes: usize) -> PairWork<'a> {
+    fn new(out: &mut Tensor2, bytes: &'a [u8], q: &'a QuantCols, m: PairMeta) -> PairWork<'a> {
         let out_ptr = SharedOut(out.data.as_mut_ptr());
         let (fused_cols, q_f32) = match q {
             QuantCols::Bytes { cb, buf } => (Some((*cb, buf.as_slice())), &[][..]),
             QuantCols::F32(q) => (None, q.as_slice()),
         };
         PairWork {
+            ty: m.ty,
+            k: m.k,
+            n: m.n,
             bytes,
-            row_bytes,
+            row_bytes: m.row_bytes,
             fused_cols,
             q_f32,
             ne1: out.ne1,
@@ -478,13 +600,11 @@ impl<'a> PairWork<'a> {
     /// Rows `rows` of this pair across every token column → cells `t * n + r`; ROW_BUF is borrowed once per call.
     fn compute_rows(
         &self,
-        ty: GgmlType,
-        k: usize,
-        n: usize,
         rows: Range<usize>,
         lvl: u8,
         acc: &mut profile::CallAcc,
     ) -> Result<(), crate::ModelError> {
+        let (ty, k, n) = (self.ty, self.k, self.n);
         if let Some((cb, acol)) = self.fused_cols {
             // Fused rows: `qdot::dot_row` dots the weight bytes and the
             // quantized column directly — no f32 row, ROW_BUF untouched;
@@ -598,67 +718,59 @@ fn batch_shape(
     Ok(Some((k, n, ty)))
 }
 
-/// Each pair's input → its slot in the distinct-input table, by reference
-/// identity (`std::ptr::eq`) — distinct blocks cannot collide. Quantizers are
-/// pure functions of the column, so one shared quantization is byte-identical
-/// to two; a miss only loses the optimization.
-fn dedupe_inputs<'a>(xs: &'a [&'a Tensor2]) -> (Vec<usize>, Vec<&'a Tensor2>) {
-    let mut slot_of: Vec<usize> = Vec::with_capacity(xs.len());
-    let mut distinct: Vec<&Tensor2> = Vec::with_capacity(xs.len());
-    for x in xs {
-        match distinct.iter().position(|d| std::ptr::eq(*d, *x)) {
-            Some(s) => slot_of.push(s),
-            None => {
-                slot_of.push(distinct.len());
-                distinct.push(x);
-            }
-        }
-    }
-    (slot_of, distinct)
+/// One distinct quantization job: an input block plus the single encoding
+/// every pair that lands on this slot reads. The dedupe key at the
+/// construction site is (input identity, fused, activation format); `k` is
+/// pinned to the input's `ne0` by the per-pair shape check, so key equality
+/// implies equal columns.
+struct QuantSlot<'a> {
+    x: &'a Tensor2,
+    ty: GgmlType,
+    k: usize,
+    /// `qdot::col_bytes(ty, k)` on the fused path, `None` on the scalar one.
+    cb: Option<usize>,
 }
 
 /// The column walker both dispatch shapes ride: quantize columns `cols` of the
-/// concatenated distinct-input space, one `quantize_into` call per column,
-/// chunk-straddling inputs handled segment-wise.
-///
-/// SAFETY (construction site, referenced by every write): the pointers alias
-/// buffers owned for the whole call; each participant writes only its own
-/// sub-range's columns, the join publishes the writes, and a
-/// boundary-straddling column is two segments, never quantized twice.
-#[allow(clippy::too_many_arguments)]
+/// concatenated slot space, one `quantize_into` call per column,
+/// chunk-straddling slots handled segment-wise.
 fn quant_range(
-    ty: GgmlType,
-    k: usize,
-    distinct: &[&Tensor2],
-    col_starts: &[usize],
-    shared: &[SharedQuantCols],
+    slots: &Flex<QuantSlot<'_>>,
+    col_starts: &Flex<usize>,
+    shared: &Flex<SharedQuantCols>,
     cols: Range<usize>,
     lvl: u8,
     acc: &mut profile::CallAcc,
 ) {
+    let n = slots.len();
     let mut c = cols.start;
+    // The slot whose column range contains `c`: `col_starts` is sorted and
+    // `c` only advances within a call, so a forward scan never rewinds and
+    // skips zero-width slots instead of landing inside one. Progress holds —
+    // `c < cols.end` sits strictly inside slot `d`'s range, so every pass
+    // writes at least one column.
+    let mut d = 0usize;
     while c < cols.end {
-        // The input whose column range contains `c` — `col_starts` is
-        // sorted, so a partition point landing on the LAST start `<= c`;
-        // never a zero-width input, always advances.
-        let d = col_starts.partition_point(|&s| s <= c) - 1;
-        let t0 = c - col_starts[d];
-        let t_end = t0 + (cols.end - c).min(distinct[d].ne1 - t0);
+        while d + 1 < n && *col_starts.get(d + 1) <= c {
+            d += 1;
+        }
+        let t0 = c - *col_starts.get(d);
+        let t_end = t0 + (cols.end - c).min(slots.get(d).x.ne1 - t0);
         let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
+        let s = slots.get(d);
         for t in t0..t_end {
-            // SAFETY: column `t` of input `d` is inside this chunk's sub-range — see the construction site above.
-            unsafe { shared[d].quantize_into(ty, k, distinct[d].col(t), t) };
+            // SAFETY: column `t` of slot `d` is inside this chunk's sub-range — see the construction site in `quantize_slots`.
+            unsafe { shared.get(d).quantize_into(s.ty, s.k, s.x.col(t), t) };
         }
         if let Some(t_q) = t_q {
             acc.add_quant_act(t_q.elapsed().as_nanos() as u64);
         }
-        c = col_starts[d] + t_end;
+        c = *col_starts.get(d) + t_end;
     }
 }
 
-/// Quantize one input's columns — the single-pair shape: no `Vec` of buffers,
-/// the collector only when profiling. Bit-identity argument as
-/// [`quantize_distinct`].
+/// Quantize one input's columns — the single-pair shape: one slot, no
+/// per-call lists. Bit-identity argument as [`quantize_slots`].
 fn quantize_one(
     ty: GgmlType,
     k: usize,
@@ -672,97 +784,53 @@ fn quantize_one(
     } else {
         None
     };
-    let mut qc = QuantCols::new(cb, x);
-    let shared = [qc.shared()];
-    let distinct = [x];
-    let starts = [0usize];
-    let total_cols = x.ne1;
-    // Only a profiled dispatch pays for the chunk collector; the quantizer
-    // cannot fail, so an unprofiled one needs no error channel either.
-    let collected = if lvl > 0 {
-        Some(profile::ChunkSlots::<profile::CallAcc>::new())
-    } else {
-        None
-    };
-    if total_cols > 1 {
-        threads::pool().for_each_chunk(total_cols, |cols| {
-            let mut acc = profile::CallAcc::new();
-            quant_range(ty, k, &distinct, &starts, &shared, cols, lvl, &mut acc);
-            if let Some(collected) = &collected {
-                collected.push(acc);
-            }
-        });
-    } else if total_cols == 1 {
-        // One column: no split — the walker runs inline on the caller;
-        // deterministic, `tests/mt.rs` covers this branch too.
-        let mut acc = profile::CallAcc::new();
-        quant_range(ty, k, &distinct, &starts, &shared, 0..1, lvl, &mut acc);
-        if let Some(collected) = &collected {
-            collected.push(acc);
-        }
-    }
-    if let Some(collected) = collected {
-        for acc in collected.into_vec() {
-            pacc.add_acc(&acc);
-        }
-    }
-    qc
+    let mut slots: Flex<QuantSlot> = Flex::new();
+    slots.push(QuantSlot { x, ty, k, cb });
+    let mut out: Flex<QuantCols> = Flex::new();
+    quantize_slots(&slots, &mut out, lvl, pacc);
+    out.take(0)
 }
 
-/// Quantize every activation column once per DISTINCT input on the pool,
-/// split over the concatenated column space; the format is a property of the
-/// WEIGHT type (`gguf::activation_format`): fused → `qdot::quantize_col`
-/// bytes, scalar → the f32 round trip.
+/// Column count under which the pre-pass runs inline on the caller. A pool
+/// dispatch has a fixed floor — the pool bench's empty-closure dispatch —
+/// that a handful of columns cannot repay, and a decode group carries one
+/// column per slot. Either way the encoder runs once per column, so the
+/// bytes are identical; only WHO calls it changes.
+const QUANT_INLINE_COLS: usize = 8;
+
+/// Quantize every slot's activation columns once: one pool dispatch over the
+/// concatenated column space (inline for the small counts above),
+/// chunk-straddling slots handled segment-wise. Each slot's `(ty, k)` pick
+/// its encoder — every pair on the slot is format-equal by the dedupe key,
+/// and both encoders are pure functions of (activation format, k).
 ///
 /// Bit identity: each column is a pure function of its own input, and the
 /// split partitions the output cells; splitting WITHIN a column would need
 /// its own argument (block-local scales).
-fn quantize_distinct(
-    ty: GgmlType,
-    k: usize,
-    distinct: &[&Tensor2],
-    fused: bool,
+fn quantize_slots(
+    slots: &Flex<QuantSlot<'_>>,
+    out: &mut Flex<QuantCols>,
     lvl: u8,
     pacc: &mut profile::CallAcc,
-) -> Vec<QuantCols> {
-    let cb = if fused {
-        Some(qdot::col_bytes(ty, k))
-    } else {
-        None
-    };
-    let mut quantized: Vec<QuantCols> = distinct.iter().map(|x| QuantCols::new(cb, x)).collect();
-    let n = distinct.len();
-    // Column starts and shared views: on the stack for the small batches a
-    // decode step builds (one distinct input per routed expert), on the heap
-    // past that.
-    let mut starts_small = [0usize; 8];
-    let mut starts_big: Vec<usize> = Vec::new();
+) {
+    let n = slots.len();
+    for s in 0..n {
+        out.push(QuantCols::new(slots.get(s).cb, slots.get(s).x));
+    }
+    let mut col_starts: Flex<usize> = Flex::new();
     let mut total_cols = 0usize;
-    let col_starts: &[usize] = if n <= 8 {
-        for (i, x) in distinct.iter().enumerate() {
-            starts_small[i] = total_cols;
-            total_cols += x.ne1;
-        }
-        &starts_small[..n]
-    } else {
-        starts_big.reserve(n);
-        for x in distinct {
-            starts_big.push(total_cols);
-            total_cols += x.ne1;
-        }
-        &starts_big
-    };
-    let mut shared_small = [SharedQuantCols::F32(std::ptr::null_mut()); 8];
-    let shared_big: Vec<SharedQuantCols>;
-    let shared: &[SharedQuantCols] = if n <= 8 {
-        for i in 0..n {
-            shared_small[i] = quantized[i].shared();
-        }
-        &shared_small[..n]
-    } else {
-        shared_big = quantized.iter_mut().map(|q| q.shared()).collect();
-        &shared_big
-    };
+    for s in 0..n {
+        col_starts.push(total_cols);
+        total_cols += slots.get(s).x.ne1;
+    }
+    let mut shared: Flex<SharedQuantCols> = Flex::new();
+    for s in 0..n {
+        shared.push(out.get_mut(s).shared());
+    }
+    // SAFETY (construction site, referenced by every write): the pointers
+    // alias buffers owned for the whole call; each participant writes only
+    // its own sub-range's columns, the join publishes the writes, and a
+    // boundary-straddling column is two segments, never quantized twice.
     // Only a profiled dispatch pays for the chunk collector; the quantizer
     // cannot fail, so an unprofiled one needs no error channel either.
     let collected = if lvl > 0 {
@@ -770,19 +838,21 @@ fn quantize_distinct(
     } else {
         None
     };
-    if total_cols > 1 {
+    // Inline only the decode shape — one column per slot. A multi-column input
+    // (prefill) is real work and goes to the pool whatever the count.
+    if total_cols > QUANT_INLINE_COLS || total_cols > n {
         threads::pool().for_each_chunk(total_cols, |cols| {
             let mut acc = profile::CallAcc::new();
-            quant_range(ty, k, distinct, col_starts, shared, cols, lvl, &mut acc);
+            quant_range(slots, &col_starts, &shared, cols, lvl, &mut acc);
             if let Some(collected) = &collected {
                 collected.push(acc);
             }
         });
-    } else if total_cols == 1 {
-        // One column: no split — the walker runs inline on the caller;
+    } else if total_cols > 0 {
+        // The inline shape: the walker runs on the caller, no split —
         // deterministic, `tests/mt.rs` covers this branch too.
         let mut acc = profile::CallAcc::new();
-        quant_range(ty, k, distinct, col_starts, shared, 0..1, lvl, &mut acc);
+        quant_range(slots, &col_starts, &shared, 0..total_cols, lvl, &mut acc);
         if let Some(collected) = &collected {
             collected.push(acc);
         }
@@ -792,31 +862,13 @@ fn quantize_distinct(
             pacc.add_acc(&acc);
         }
     }
-    quantized
 }
 
-/// One `PairWork` per pair: weight bytes, (possibly shared) quantized
-/// columns, and a shared output pointer; the sharing is read-only from here —
-/// the quant pre-pass was the only writer.
-///
-/// SAFETY (construction site, referenced by every write): each `PairWork`'s
-/// output pointer aliases that pair's `out.data`, caller-owned for the whole
-/// call. Each participant writes only cells `t * n + r` with `r` inside its
-/// own sub-range of the row split, which partitions the rows; the join
-/// publishes the writes; an early error leaves zeros and discards the output
-/// either way.
-fn build_pair_work<'a>(
-    outs: &'a mut [Tensor2],
-    bytes: &'a [&'a [u8]],
-    quantized: &'a [QuantCols],
-    slot_of: &[usize],
-    row_bytes: usize,
-) -> Vec<PairWork<'a>> {
-    outs.iter_mut()
-        .zip(bytes)
-        .zip(slot_of.iter().map(|s| &quantized[*s]))
-        .map(|((out, bytes), q)| PairWork::new(out, bytes, q, row_bytes))
-        .collect()
+/// What one row of a pair costs a lane: its weight bytes once per input column
+/// — a row is dotted against every column, and a prefill group mixes pairs of
+/// one column with pairs of many.
+fn row_cost(p: &PairWork<'_>) -> u64 {
+    p.row_bytes as u64 * p.ne1.max(1) as u64
 }
 
 /// One lane of a row dispatch: the next unclaimed row and the lane's end, on
@@ -825,15 +877,18 @@ fn build_pair_work<'a>(
 struct Lane {
     next: std::sync::atomic::AtomicUsize,
     end: usize,
+    /// Rows per claim. Per lane, not per dispatch: cost-cut lanes differ in row
+    /// count, and a lane of few expensive rows claimed as one block leaves its
+    /// tail nothing to share.
+    block: usize,
 }
 const MAX_LANES: usize = 64;
 fn steal_enabled() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| std::env::var("BLOOMERY_STEAL").map_or(true, |v| v != "0"))
 }
-/// Blocks a lane is cut into, and the smallest block worth a claim.
+/// Blocks a lane is cut into.
 const STEAL_BLOCKS: usize = 4;
-const STEAL_MIN_ROWS: usize = 8;
 
 /// The unprofiled dispatch's error channel: no chunk collector, no
 /// allocation — a clean chunk touches nothing, and the mutex only locks when
@@ -871,25 +926,36 @@ impl ErrGate {
     }
 }
 
-/// The row dispatch and its gather: one pool job over `Σ_i n` rows (a chunk
-/// may straddle pair boundaries; the walker hands each pair its own
-/// sub-range), then the sort, error scan and accumulator fold. The split
-/// axis is the output row `r` and only that — each element still accumulates
-/// its k products ascending, so the worker split cannot change a bit
-/// (`tests/mt.rs`, `tests/ops.rs`); splitting k or the token axis is forbidden.
+/// The row dispatch and its gather: one pool job over the concatenated rows
+/// of every pair (a chunk may straddle pair boundaries; the walker hands each
+/// pair its own sub-range), then the sort, error scan and accumulator fold.
+/// The split axis is the output row `r` and only that — each element still
+/// accumulates its k products ascending, so the worker split cannot change a
+/// bit (`tests/mt.rs`, `tests/ops.rs`); splitting k or the token axis is
+/// forbidden.
+///
+/// Lanes are cut by cumulative COST (`row_cost`: weight bytes × input columns), not row count: a group's pairs
+/// differ in per-row cost, so a row-count cut would stack the cheap pairs on
+/// some lanes and the expensive ones on others. Lane `t` is the rows where
+/// the running byte cost crosses `t/nlanes` of the total — deterministic,
+/// row-granular; a uniform group degenerates to a row-count cut.
 ///
 /// A profiled dispatch pays the chunk collector (one `Vec` of pool-width
 /// slots); an unprofiled one runs the error channel above and allocates
 /// nothing unless a chunk fails.
 fn run_row_pool(
-    pairs: &[PairWork<'_>],
-    ty: GgmlType,
-    k: usize,
-    n: usize,
+    pairs: &Flex<PairWork<'_>>,
     lvl: u8,
     pacc: &mut profile::CallAcc,
 ) -> Result<(), crate::ModelError> {
-    let total_rows = n * pairs.len();
+    let npairs = pairs.len();
+    let mut pair_starts: Flex<usize> = Flex::new();
+    let mut total_rows = 0usize;
+    pair_starts.push(0);
+    for p in 0..npairs {
+        total_rows += pairs.get(p).n;
+        pair_starts.push(total_rows);
+    }
     let collected = if lvl > 0 {
         Some(profile::ChunkSlots::<RowChunk>::new())
     } else {
@@ -898,32 +964,67 @@ fn run_row_pool(
     let gate = ErrGate::new();
     let t_span = if lvl >= 1 { Some(Instant::now()) } else { None };
     // Lanes: the pool's own static split, one cursor each. A participant walks
-    // its home lane front to back in blocks, then takes blocks off the front of
+    // its home lanes front to back in blocks, then takes blocks off the front of
     // whatever lanes are still unfinished. The slowest chunk of a dispatch runs
     // 20–40 % over the mean and which chunk that is changes every dispatch, so
     // the barrier waits on noise; the tail is the only part worth sharing, and
     // the owner still streams its rows contiguously. A row's value does not
     // depend on who computes it.
     let nlanes = threads::pool().threads();
+    let mut lane_bounds = [0usize; MAX_LANES + 1];
+    {
+        let total_cost: u64 = (0..npairs)
+            .map(|p| pairs.get(p).n as u64 * row_cost(pairs.get(p)))
+            .sum();
+        // Closed form per pair — a pair's rows cost the same, so the first row
+        // where `nlanes·cost` reaches `t·total_cost` is a division, not a walk
+        // over the rows (a walk is O(rows) on the calling thread, per dispatch).
+        let nl = nlanes as u64;
+        let mut p = 0usize;
+        let mut before = 0u64; // cost of every pair ahead of `p`
+        for (t, bound) in lane_bounds.iter_mut().enumerate().take(nlanes).skip(1) {
+            let target = t as u64 * total_cost;
+            loop {
+                if p >= npairs {
+                    *bound = total_rows;
+                    break;
+                }
+                let c = row_cost(pairs.get(p));
+                let n_p = pairs.get(p).n as u64;
+                if c == 0 || (before + n_p * c) * nl < target {
+                    before += n_p * c;
+                    p += 1;
+                    continue;
+                }
+                // Smallest j with (before + j·c)·nl >= target.
+                let need = target.saturating_sub(before * nl);
+                let j = need.div_ceil(c * nl).min(n_p);
+                *bound = *pair_starts.get(p) + j as usize;
+                break;
+            }
+        }
+        lane_bounds[nlanes] = total_rows;
+    }
+    assert!(nlanes <= MAX_LANES, "row pool lanes: {nlanes} threads");
+    // `BLOOMERY_STEAL=0` is the A/B lever: whole-lane blocks, home lanes only.
+    let steal = steal_enabled();
     let lanes: [Lane; MAX_LANES] = std::array::from_fn(|t| {
         let (start, end) = if t < nlanes {
-            threads::chunk_bounds(total_rows, nlanes, t)
+            (lane_bounds[t], lane_bounds[t + 1])
         } else {
             (0, 0)
+        };
+        let block = if steal {
+            ((end - start) / STEAL_BLOCKS).max(1)
+        } else {
+            total_rows.max(1)
         };
         Lane {
             next: std::sync::atomic::AtomicUsize::new(start),
             end,
+            block,
         }
     });
-    assert!(nlanes <= MAX_LANES, "row pool lanes: {nlanes} threads");
-    // `BLOOMERY_STEAL=0` is the A/B lever: whole-lane blocks, home lane only.
-    let steal = steal_enabled();
-    let block = if steal {
-        (total_rows / nlanes / STEAL_BLOCKS).max(STEAL_MIN_ROWS)
-    } else {
-        total_rows.max(1)
-    };
     threads::pool().for_each_chunk(total_rows, |rows| {
         let t_busy = if lvl >= 1 { Some(Instant::now()) } else { None };
         let mut chunk = RowChunk {
@@ -932,38 +1033,62 @@ fn run_row_pool(
             acc: profile::CallAcc::new(),
             err: None,
         };
-        let home = (0..nlanes)
-            .find(|&t| !rows.is_empty() && threads::chunk_bounds(total_rows, nlanes, t).0 == rows.start)
-            .unwrap_or(0);
-        'lanes: for off in 0..if steal { nlanes } else { 1 } {
-            let lane = &lanes[(home + off) % nlanes];
+        // Home lanes: the lane containing this chunk's start, plus every lane
+        // that starts inside the chunk. Byte-cut boundaries need not align
+        // with the pool's row-count chunks, and a start-match lookup would
+        // leave an interior-starting lane ownerless when stealing is off —
+        // the chunk that contains a lane's start owns it, so every lane has
+        // exactly one. An empty chunk owns none. The aligned (uniform) case
+        // reduces to one home lane per chunk.
+        let mut first = 0usize;
+        while first + 1 < nlanes && lane_bounds[first + 1] <= rows.start {
+            first += 1;
+        }
+        let mut last = first + 1;
+        while last < nlanes && lane_bounds[last] < rows.end {
+            last += 1;
+        }
+        let (origin, span) = if rows.is_empty() {
+            (first, 0)
+        } else if steal {
+            (first, nlanes)
+        } else {
+            (first, last - first)
+        };
+        'lanes: for off in 0..span {
+            let lane = &lanes[(origin + off) % nlanes];
             loop {
                 // A cheap look first: a finished lane costs a read, not a write.
                 if lane.next.load(std::sync::atomic::Ordering::Relaxed) >= lane.end {
                     break;
                 }
-                let from = lane.next.fetch_add(block, std::sync::atomic::Ordering::Relaxed);
+                let from = lane
+                    .next
+                    .fetch_add(lane.block, std::sync::atomic::Ordering::Relaxed);
                 if from >= lane.end {
                     break;
                 }
-                let to = lane.end.min(from + block);
+                let to = lane.end.min(from + lane.block);
                 let mut gr = from;
+                let mut p = 0usize;
+                while p + 1 < npairs && gr >= *pair_starts.get(p + 1) {
+                    p += 1;
+                }
                 while gr < to {
-                    let p = gr / n;
-                    let sub_end = to.min((p + 1) * n);
-                    let r0 = gr - p * n;
-                    if let Err(e) = pairs[p].compute_rows(
-                        ty,
-                        k,
-                        n,
-                        r0..r0 + (sub_end - gr),
-                        lvl,
-                        &mut chunk.acc,
-                    ) {
+                    let sub_end = to.min(*pair_starts.get(p + 1));
+                    let r0 = gr - *pair_starts.get(p);
+                    if let Err(e) =
+                        pairs
+                            .get(p)
+                            .compute_rows(r0..r0 + (sub_end - gr), lvl, &mut chunk.acc)
+                    {
                         chunk.err = Some(e);
                         break 'lanes;
                     }
                     gr = sub_end;
+                    while p + 1 < npairs && gr >= *pair_starts.get(p + 1) {
+                        p += 1;
+                    }
                 }
             }
         }
@@ -1010,7 +1135,7 @@ fn run_row_pool(
 
 /// The single-pair dispatch `matmul_q` rides: one weight, one input, no
 /// per-call `Vec`s — the quantization buffer off the thread pool, the one
-/// `PairWork` on the stack. Same row loop, same `batch_shape` contract, same
+/// `PairWork` inline. Same row loop, same `batch_shape` contract, same
 /// profiler row as the batch shape; only the bookkeeping is narrower.
 fn matmul_q_one(
     site: &'static str,
@@ -1033,10 +1158,21 @@ fn matmul_q_one(
 
     let qc = quantize_one(ty, k, x, fused, lvl, &mut pacc);
     let mut out = Tensor2::scratch(n, x.ne1);
-    // SAFETY: the construction-site argument in `build_pair_work`'s doc — one
-    // pair, the whole row split, the join publishes.
-    let pw = PairWork::new(&mut out, bytes, &qc, row_bytes);
-    run_row_pool(std::slice::from_ref(&pw), ty, k, n, lvl, &mut pacc)?;
+    let mut pairs: Flex<PairWork> = Flex::new();
+    // SAFETY: the construction-site argument in `matmul_q_multi`'s pair build —
+    // one pair, the whole row split, the join publishes the writes.
+    pairs.push(PairWork::new(
+        &mut out,
+        bytes,
+        &qc,
+        PairMeta {
+            ty,
+            k,
+            n,
+            row_bytes,
+        },
+    ));
+    run_row_pool(&pairs, lvl, &mut pacc)?;
     qc.release();
 
     if let Some(t_call) = t_call {
@@ -1053,54 +1189,176 @@ fn matmul_q_one(
     Ok(out)
 }
 
-/// One pool dispatch over `Σ_i n` rows for all `(W_i, x_i)` pairs; `site`
-/// names the profiler row so the two shapes stay separable in the stage table.
+/// Quantization slots the most recent `matmul_q_multi` call built — the
+/// sharing rule's observable for `tests/ops.rs`: pairs over one input with
+/// one encoding must collapse to a single slot, pairs whose encodings differ
+/// must not.
+static LAST_QUANT_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The reading side of [`LAST_QUANT_SLOTS`].
+#[doc(hidden)]
+pub fn last_quant_slots() -> usize {
+    LAST_QUANT_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One pool dispatch over the concatenated rows of every `(W_i, x_i)` pair —
+/// heterogeneous: each pair carries its own type, `k`, `n` and row bytes, and
+/// the lanes balance weight bytes. `site` names the profiler row;
+/// [`matmul_q_batch`] is the homogeneous front (`batch_shape` checked first)
+/// and [`matmul_q_group`] the heterogeneous one.
 fn matmul_q_multi(
     site: &'static str,
     gguf: &Gguf,
     ws: &[&TensorInfo],
     xs: &[&Tensor2],
 ) -> Result<Vec<Tensor2>, crate::ModelError> {
-    let Some((k, n, ty)) = batch_shape(ws, xs)? else {
+    if ws.len() != xs.len() {
+        return Err(crate::ModelError::Shape {
+            what: "matmul_q batch",
+            want_ne0: ws.len(),
+            want_ne1: ws.len(),
+            got_ne0: xs.len(),
+            got_ne1: xs.len(),
+        });
+    }
+    if ws.is_empty() {
         return Ok(Vec::new());
-    };
+    }
     // Profiler hook: level 0 one compare, level 1 one `Instant` pair, level 2
     // two more per row, none touching the arithmetic; chunks merge into one
-    // `CallAcc`, so `record` fires once per call.
+    // `CallAcc` per weight type, so `record` fires once per (call, type).
     let lvl = profile::level();
     let mut pacc = profile::CallAcc::new();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let bytes: Vec<&[u8]> = ws.iter().map(|w| gguf.data(w)).collect::<Result<_, _>>()?;
-    let row_bytes = bytes[0].len() / n;
-    // Fused path: qdot dots the quantized codes directly, so activations are
-    // quantized into `qdot::quantize_col`'s layout. `k_granularity` owns the
-    // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1).
-    // Decided once per batch: every pair shares `ty`, so no pair can disagree
-    // with its own row loop.
-    let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
-
-    let (slot_of, distinct) = dedupe_inputs(xs);
-    let quantized = quantize_distinct(ty, k, &distinct, fused, lvl, &mut pacc);
-
-    let mut outs: Vec<Tensor2> = xs.iter().map(|x| Tensor2::scratch(n, x.ne1)).collect();
-    let pairs = build_pair_work(&mut outs, &bytes, &quantized, &slot_of, row_bytes);
-    run_row_pool(&pairs, ty, k, n, lvl, &mut pacc)?;
-
-    let total_rows = n * pairs.len();
-    let weight_bytes: u64 = bytes.iter().map(|b| b.len() as u64).sum();
-    if let Some(t_call) = t_call {
-        profile::record(
-            site,
+    let mut bytes: Flex<&[u8]> = Flex::new();
+    let mut meta: Flex<PairMeta> = Flex::new();
+    let mut slot_of: Flex<usize> = Flex::new();
+    let mut slots: Flex<QuantSlot> = Flex::new();
+    let mut outs: Vec<Tensor2> = Vec::with_capacity(ws.len());
+    for (w, x) in ws.iter().zip(xs) {
+        let k = w.dims.first().copied().unwrap_or(0) as usize;
+        let n = if w.dims.len() > 1 {
+            w.dims[1] as usize
+        } else {
+            1
+        };
+        let ty = w.ty;
+        if x.ne0 != k {
+            return Err(crate::ModelError::Shape {
+                what: "matmul_q input",
+                want_ne0: k,
+                want_ne1: x.ne1,
+                got_ne0: x.ne0,
+                got_ne1: x.ne1,
+            });
+        }
+        let b = gguf.data(w)?;
+        // Fused path decided per pair, exactly the single-pair rule: qdot
+        // dots the quantized codes directly, so activations are quantized
+        // into `qdot::quantize_col`'s layout, and `k_granularity` owns the
+        // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1).
+        let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
+        let cb = if fused {
+            Some(qdot::col_bytes(ty, k))
+        } else {
+            None
+        };
+        // The sharing rule — one quantized buffer per DISTINCT (input,
+        // encoding): same input block AND same fused-ness AND same activation
+        // format. Sound both ways. Sharers write identical bytes: `k` is
+        // pinned to the input's `ne0` by the check above, the encoders are
+        // pure functions of (activation format, k) — `quantize_col`'s arm
+        // and `quantize_activations` both key on the format, never the
+        // weight type — and equal format with equal `k` yields equal
+        // `col_bytes`. Non-sharers never collide: a different format or
+        // fused-ness means the encoders disagree on at least the buffer's
+        // representation, so sharing would feed one pair the other's bytes.
+        let slot = (0..slots.len())
+            .find(|&s| {
+                let q = slots.get(s);
+                std::ptr::eq(q.x, *x)
+                    && q.cb == cb
+                    && gguf::activation_format(q.ty) == gguf::activation_format(ty)
+            })
+            .unwrap_or_else(|| {
+                slots.push(QuantSlot { x, ty, k, cb });
+                slots.len() - 1
+            });
+        bytes.push(b);
+        meta.push(PairMeta {
             ty,
-            total_rows as u64,
-            k as u64 * total_rows as u64,
-            weight_bytes,
-            t_call.elapsed().as_nanos() as u64,
-            &pacc,
-        );
+            k,
+            n,
+            row_bytes: b.len() / n,
+        });
+        slot_of.push(slot);
+        outs.push(Tensor2::scratch(n, x.ne1));
     }
-    for q in quantized {
-        q.release();
+    LAST_QUANT_SLOTS.store(slots.len(), std::sync::atomic::Ordering::Relaxed);
+
+    let mut quantized: Flex<QuantCols> = Flex::new();
+    quantize_slots(&slots, &mut quantized, lvl, &mut pacc);
+
+    let mut pairs: Flex<PairWork> = Flex::new();
+    for (i, out) in outs.iter_mut().enumerate() {
+        // SAFETY (construction site, referenced by every write): each pair's
+        // output pointer aliases that pair's `out.data`, caller-owned for the
+        // whole call. Each participant writes only cells `t * n + r` with
+        // `r` inside its own sub-range of the row split, which partitions
+        // the rows; the join publishes the writes; an early error discards
+        // the outputs either way.
+        pairs.push(PairWork::new(
+            out,
+            bytes.get(i),
+            quantized.get(*slot_of.get(i)),
+            *meta.get(i),
+        ));
     }
+    run_row_pool(&pairs, lvl, &mut pacc)?;
+
+    if let Some(t_call) = t_call {
+        // One row per distinct weight type the group carried. Rows, `k` and
+        // weight bytes are exact per type; wall and the stage accumulators
+        // split by weight-byte share — the honest per-type statement without
+        // per-type timers. The shares sum to the whole call, so
+        // `instrumented_ns` never counts a group twice, and a single-type
+        // group records exactly the homogeneous values.
+        let wall_ns = t_call.elapsed().as_nanos() as u64;
+        let wb_total: u64 = (0..bytes.len()).map(|i| bytes.get(i).len() as u64).sum();
+        let mut tys: Flex<(GgmlType, u64, u64, u64)> = Flex::new();
+        for i in 0..meta.len() {
+            let m = *meta.get(i);
+            let wb = bytes.get(i).len() as u64;
+            let mut j = 0;
+            while j < tys.len() && tys.get(j).0 != m.ty {
+                j += 1;
+            }
+            if j == tys.len() {
+                tys.push((m.ty, m.n as u64, m.k as u64 * m.n as u64, wb));
+            } else {
+                let e = tys.get_mut(j);
+                *e = (
+                    e.0,
+                    e.1 + m.n as u64,
+                    e.2 + m.k as u64 * m.n as u64,
+                    e.3 + wb,
+                );
+            }
+        }
+        for t in 0..tys.len() {
+            let &(ty, rows, k_total, wb) = tys.get(t);
+            let share = |ns: u64| ((ns as u128 * wb as u128) / wb_total as u128) as u64;
+            profile::record(
+                site,
+                ty,
+                rows,
+                k_total,
+                wb,
+                share(wall_ns),
+                &pacc.scaled(wb, wb_total),
+            );
+        }
+    }
+    quantized.release_all();
     Ok(outs)
 }

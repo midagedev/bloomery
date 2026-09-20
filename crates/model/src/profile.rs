@@ -149,6 +149,21 @@ impl CallAcc {
         self.ns_span += other.ns_span;
         self.ns_slowest += other.ns_slowest;
     }
+
+    /// Every stage scaled by `num/den` — a mixed group's per-type share of
+    /// one call's accumulators. Floor-rounded, so the per-type rows sum to
+    /// at most the whole call, never more.
+    pub fn scaled(&self, num: u64, den: u64) -> CallAcc {
+        let f = |ns: u64| ((ns as u128 * num as u128) / den as u128) as u64;
+        CallAcc {
+            ns_quant_act: f(self.ns_quant_act),
+            ns_dequant_w: f(self.ns_dequant_w),
+            ns_dot: f(self.ns_dot),
+            ns_gather: f(self.ns_gather),
+            ns_span: f(self.ns_span),
+            ns_slowest: f(self.ns_slowest),
+        }
+    }
 }
 
 /// Merge one finished call into the accumulators. Call this exactly once per hooked

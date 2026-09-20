@@ -301,3 +301,191 @@ fn hw_matmul_q_batch_matches_sequential() {
         experts.len()
     );
 }
+
+/// The heterogeneous dispatch proof: `matmul_q_group` over mixed types,
+/// shapes and inputs is the per-pair `matmul_q` to the last bit — the same
+/// kernels on the same bytes, only the dispatch shape changed. The set is
+/// the step's own mixture over this file's real quant blend: the attention
+/// pair (Q3_K, `n` 576 and 3072), the F32 router, blk.6's Q4_K
+/// `attn_output`, the blk.1 shexp gate and a Q5_0 routed-down expert view on
+/// its own 1408-wide input — six different `n`, three encodings. Also pins
+/// the activation-sharing rule's observable: one quantization slot per
+/// DISTINCT (input, encoding) — same-format pairs collapse (across weight
+/// types), different encodings do not.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_matmul_q_group_matches_sequential() {
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+
+    let (xs, xinf) = o.load("attn_norm-0", 0);
+    let x6 = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
+    let colset = |idx: &[usize]| {
+        let mut xb = Tensor2::zeros(x6.ne0, idx.len());
+        for (i, &t) in idx.iter().enumerate() {
+            xb.col_mut(i).copy_from_slice(x6.col(t));
+        }
+        xb
+    };
+    let x5 = colset(&[0, 1, 2, 3, 4]);
+    let x1 = colset(&[0]);
+
+    let wq = g.find("blk.0.attn_q.weight").unwrap();
+    let wa = g.find("blk.0.attn_kv_a_mqa.weight").unwrap();
+    let router = g.find("blk.1.ffn_gate_inp.weight").unwrap();
+    let shg = g.find("blk.1.ffn_gate_shexp.weight").unwrap();
+    let wo6 = g.find("blk.6.attn_output.weight").unwrap();
+    let outw = g.find("output.weight").unwrap();
+    assert_eq!(wq.ty, GgmlType::Q3_K, "the mixed set needs the real types");
+    assert_eq!(wa.ty, GgmlType::Q3_K);
+    assert_eq!(router.ty, GgmlType::F32);
+    assert_eq!(shg.ty, GgmlType::Q3_K);
+    assert_eq!(wo6.ty, GgmlType::Q4_K);
+    assert_eq!(outw.ty, GgmlType::Q6_K);
+    // The routed-down view sliced exactly the way moe.rs's expert_view does;
+    // its k is the expert width, so it reads its own input below.
+    let stack = g.find("blk.6.ffn_down_exps.weight").unwrap();
+    assert_eq!(stack.ty, GgmlType::Q5_0);
+    let per = stack.nbytes / stack.dims[2];
+    let e0 = gguf::TensorInfo {
+        name: stack.name.clone(),
+        dims: vec![stack.dims[0], stack.dims[1]],
+        ty: stack.ty,
+        offset: stack.offset + per,
+        nbytes: per,
+    };
+    let ns: Vec<u64> = [wq, wa, router, shg, wo6, &e0]
+        .iter()
+        .map(|w| w.dims[1])
+        .collect();
+    let distinct = ns.iter().collect::<std::collections::BTreeSet<_>>();
+    assert!(distinct.len() >= 5, "the set must span different n: {ns:?}");
+
+    // The 1408-wide input for the routed-down pair — synthetic like the
+    // fused-dispatch test's, non-zero so the dots mean something.
+    let yset = |m: usize| {
+        Tensor2::from_vec(
+            e0.dims[0] as usize,
+            m,
+            (0..e0.dims[0] as usize * m)
+                .map(|i| ((i % 13) as f32 - 6.0) * 0.031)
+                .collect(),
+        )
+    };
+    let y5 = yset(5);
+    let y1 = yset(1);
+
+    let ws: Vec<&gguf::TensorInfo> = vec![wq, wa, router, shg, wo6, &e0];
+    let check = |label: &str, x: &Tensor2, y: &Tensor2| {
+        let xs_ref: Vec<&Tensor2> = vec![x, x, x, x, x, y];
+        let got = model::ops::matmul_q_group(&g, &ws, &xs_ref).unwrap();
+        assert_eq!(got.len(), ws.len(), "one output per pair ({label})");
+        for (p, (w, xin)) in ws.iter().zip(&xs_ref).enumerate() {
+            let want = matmul_q(&g, w, xin).unwrap();
+            assert_eq!(
+                [got[p].ne0, got[p].ne1],
+                [want.ne0, want.ne1],
+                "pair {p} ({w:?}) shape ({label})"
+            );
+            let diffs = want
+                .data
+                .iter()
+                .zip(&got[p].data)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                diffs, 0,
+                "pair {p} ({w:?}): group must be bit-identical to sequential ({label})"
+            );
+        }
+    };
+    check("ne1=5", &x5, &y5);
+    check("ne1=1", &x1, &y1);
+    eprintln!(
+        "group of {} mixed pairs (Q3_K x3, Q4_K, Q5_0, F32; n spans {:?}) \
+         bit-identical to sequential at ne1=5 and ne1=1",
+        ws.len(),
+        distinct.iter().collect::<Vec<_>>(),
+    );
+
+    // The sharing rule's observable. The mixed group lands in FOUR slots:
+    // Q8K over x (wq, wa, shg), the F32 round trip over x (router), Q8_2X4
+    // over x (wo6), Q8_2X4 over y (e0 — same format as wo6, different input
+    // and stride).
+    assert_eq!(
+        model::ops::last_quant_slots(),
+        4,
+        "one slot per (input, encoding) in the mixed group"
+    );
+    // A same-encoding pair on one input collapses — even across weight types
+    // and different n: Q4_K and Q6_K both quantize to Q8_2X4 at k = 2048.
+    let got = model::ops::matmul_q_group(&g, &[wo6, outw], &[&x1, &x1]).unwrap();
+    assert_eq!(model::ops::last_quant_slots(), 1, "cross-type share");
+    let w_4k = matmul_q(&g, wo6, &x1).unwrap();
+    let w_6k = matmul_q(&g, outw, &x1).unwrap();
+    for (p, want) in [w_4k, w_6k].iter().enumerate() {
+        let diffs = want
+            .data
+            .iter()
+            .zip(&got[p].data)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(diffs, 0, "shared-slot pair {p} must stay bit-identical");
+    }
+    // Different formats on one input stay apart: Q3_K (Q8K) vs Q4_K.
+    model::ops::matmul_q_group(&g, &[wq, wo6], &[&x1, &x1]).unwrap();
+    assert_eq!(
+        model::ops::last_quant_slots(),
+        2,
+        "different encodings never share"
+    );
+
+    // A single-pair group is the single-pair call.
+    let one = model::ops::matmul_q_group(&g, &[wa], &[&x1]).unwrap();
+    let want_one = matmul_q(&g, wa, &x1).unwrap();
+    assert_eq!([one[0].ne0, one[0].ne1], [want_one.ne0, want_one.ne1]);
+    let diffs = want_one
+        .data
+        .iter()
+        .zip(&one[0].data)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(diffs, 0, "single-pair group must equal matmul_q");
+
+    // The empty group is Ok(empty), the empty batch's contract.
+    assert!(
+        model::ops::matmul_q_group(&g, &[], &[]).unwrap().is_empty(),
+        "the empty group is Ok(empty)"
+    );
+
+    // A mismatched pair errors exactly as the single-pair call does.
+    let bad = Tensor2::zeros(576, 1);
+    let e_group = model::ops::matmul_q_group(&g, &[wq], &[&bad]).unwrap_err();
+    let e_one = matmul_q(&g, wq, &bad).unwrap_err();
+    match (e_group, e_one) {
+        (
+            model::ModelError::Shape {
+                what: w1,
+                want_ne0: a1,
+                want_ne1: b1,
+                got_ne0: c1,
+                got_ne1: d1,
+            },
+            model::ModelError::Shape {
+                what: w2,
+                want_ne0: a2,
+                want_ne1: b2,
+                got_ne0: c2,
+                got_ne1: d2,
+            },
+        ) => {
+            assert_eq!(
+                (w1, a1, b1, c1, d1),
+                (w2, a2, b2, c2, d2),
+                "the group's per-pair error is matmul_q's own"
+            );
+        }
+        _ => panic!("both calls must return the same Shape error"),
+    }
+    eprintln!("sharing, single-pair, empty and error-parity contracts hold");
+}

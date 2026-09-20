@@ -10,7 +10,7 @@
 //!
 //! Gate: `crates/model/tests/ffn.rs` against the oracle.
 use crate::ModelError;
-use crate::ops::{Tensor2, matmul_q};
+use crate::ops::{Tensor2, matmul_q, matmul_q_group};
 use crate::profile;
 use gguf::{Gguf, TensorInfo};
 use std::time::Instant;
@@ -87,16 +87,18 @@ pub(crate) fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
     out
 }
 
-/// The FUSED_UP_GATE stage over an already-resolved trio: two matmuls and the
-/// SwiGLU combine. Single owner of that math — both public entries below call it.
+/// The FUSED_UP_GATE stage over an already-resolved trio: one group dispatch
+/// for the gate/up pair (same `x`, one row split) and the SwiGLU combine.
+/// Single owner of that math — both public entries below call it.
 fn up_gate_with(
     gguf: &Gguf,
     gate_w: &TensorInfo,
     up_w: &TensorInfo,
     x: &Tensor2,
 ) -> Result<Tensor2, ModelError> {
-    let gate = matmul_q(gguf, gate_w, x)?;
-    let up = matmul_q(gguf, up_w, x)?;
+    let mut gu = matmul_q_group(gguf, &[gate_w, up_w], &[x, x])?;
+    let up = gu.pop().expect("one output per pair");
+    let gate = gu.pop().expect("one output per pair");
     Ok(swiglu(&gate, &up))
 }
 

@@ -29,7 +29,7 @@ use gguf::{Gguf, TensorInfo};
 
 use crate::ModelError;
 use crate::ffn::swiglu;
-use crate::ops::{Tensor2, matmul_q, matmul_q_batch};
+use crate::ops::{Tensor2, matmul_q, matmul_q_group};
 use crate::profile;
 
 /// Tokens grouped by the expert they were routed to.
@@ -462,12 +462,14 @@ fn gather_expert_inputs(
     (experts, xbs, touched, gather_ns)
 }
 
-/// Phase 1 — gate and up for every routed expert, one dispatch. The views
-/// interleave [gate_e0, up_e0, gate_e1, up_e1, ..] so pair `2*s` is expert
-/// s's gate and `2*s + 1` its up; both read the same `xb` columns a
-/// sequential loop would have gathered per expert. The doubled reference is
-/// free: `matmul_q_multi`'s pre-pass quantizes each DISTINCT input once, so
-/// pushing `xb` twice costs one quantization, not two.
+/// Phase 1 — gate and up for every routed expert AND the shared expert, one
+/// dispatch. The views interleave [gate_e0, up_e0, gate_e1, up_e1, ..] so
+/// pair `2*s` is expert s's gate and `2*s + 1` its up; the shared pair
+/// [shexp_gate, shexp_up] sits last, on the same `x` the router read. The
+/// doubled references are free: the group's pre-pass quantizes each DISTINCT
+/// (input, encoding) once — every routed expert and the shared trio read
+/// `ffn_norm` in decode, two encodings when their weight formats differ.
+/// Prefill's gathered bucket copies ride the same code with their own slots.
 fn gate_up_batch(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
@@ -475,11 +477,8 @@ fn gate_up_batch(
     x: &Tensor2,
     xbs: &[Option<Tensor2>],
 ) -> Result<Vec<Tensor2>, ModelError> {
-    if experts.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut gu_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(experts.len() * 2);
-    let mut gu_xs: Vec<&Tensor2> = Vec::with_capacity(experts.len() * 2);
+    let mut gu_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(experts.len() * 2 + 2);
+    let mut gu_xs: Vec<&Tensor2> = Vec::with_capacity(experts.len() * 2 + 2);
     for &e in experts {
         gu_ws.push(&plan.gate_views[e]);
         gu_ws.push(&plan.up_views[e]);
@@ -489,25 +488,35 @@ fn gate_up_batch(
         gu_xs.push(xb);
         gu_xs.push(xb);
     }
-    matmul_q_batch(gguf, &gu_ws, &gu_xs)
+    gu_ws.push(&plan.shexp_gate);
+    gu_ws.push(&plan.shexp_up);
+    gu_xs.push(x);
+    gu_xs.push(x);
+    matmul_q_group(gguf, &gu_ws, &gu_xs)
 }
 
-/// Phase 2 — every expert's down projection, one dispatch.
+/// Phase 2 — every expert's down projection and the shared expert's, one
+/// dispatch. Each pair reads its own SwiGLU output: a distinct block,
+/// quantized once for its own encoding. Output `experts.len()` is the shared
+/// down, the slice before it the routed downs in expert order.
 fn down_batch(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
     experts: &[usize],
     pars: &[Tensor2],
+    shexp_par: &Tensor2,
 ) -> Result<Vec<Tensor2>, ModelError> {
-    if experts.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut down_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(experts.len());
+    let mut down_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(experts.len() + 1);
     for &e in experts {
         down_ws.push(&plan.down_views[e]);
     }
-    let down_xs: Vec<&Tensor2> = pars.iter().collect();
-    matmul_q_batch(gguf, &down_ws, &down_xs)
+    down_ws.push(&plan.shexp_down);
+    let mut down_xs: Vec<&Tensor2> = Vec::with_capacity(experts.len() + 1);
+    for p in pars {
+        down_xs.push(p);
+    }
+    down_xs.push(shexp_par);
+    matmul_q_group(gguf, &down_ws, &down_xs)
 }
 
 /// Scatter, expert-ascending — the accumulation order a sequential expert
@@ -552,33 +561,6 @@ fn scatter_experts(
             }
         }
     }
-}
-
-/// The shared experts: the same dense FFN shape as block 0 with `_shexp`
-/// names, resolved from the block plan. `ffn::dense_ffn` runs the same three
-/// ops; this copy stays so its stage times land under `moe_setup`, not
-/// `ffn_weights`.
-fn shexp_ffn(
-    gguf: &Gguf,
-    plan: &MoeBlockPlan,
-    x: &Tensor2,
-    lvl: u8,
-    setup_ns: &mut u64,
-) -> Result<Tensor2, ModelError> {
-    let t_setup2 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let shexp_gate = &plan.shexp_gate;
-    let shexp_up = &plan.shexp_up;
-    let shexp_down = &plan.shexp_down;
-    if let Some(t_setup2) = t_setup2 {
-        *setup_ns += t_setup2.elapsed().as_nanos() as u64;
-    }
-    if lvl > 0 {
-        profile::record_time("moe_setup", *setup_ns);
-    }
-    let g = matmul_q(gguf, shexp_gate, x)?;
-    let u = matmul_q(gguf, shexp_up, x)?;
-    let par = swiglu(&g, &u);
-    matmul_q(gguf, shexp_down, &par)
 }
 
 /// Debug lever: with `BLOOMERY_EXPERT_LOG=<path>` every `moe_ffn` call appends
@@ -644,6 +626,9 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     if let Some(t_setup) = t_setup {
         setup_ns += t_setup.elapsed().as_nanos() as u64;
     }
+    if lvl > 0 {
+        profile::record_time("moe_setup", setup_ns);
+    }
 
     let (buckets, sel) = route_inner(gguf, &plan.gate_inp, x, meta)?;
     log_experts(plan.block, n_tokens, &sel.ids);
@@ -669,20 +654,32 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     let (experts, xbs, touched, gather_ns) = gather_expert_inputs(x, &buckets, meta.n_expert, lvl);
     TOUCHED.with(|c| c.set(touched));
 
+    // The routed half and the shared half are independent math: the gate/up
+    // projections of both ride one group dispatch, and so do the down
+    // projections. Regrouping only — the same ops on the same inputs, the
+    // scatter still accumulates expert-ascending and the combine still adds
+    // the shared output last, so no value moves.
     let gu = gate_up_batch(gguf, plan, &experts, x, &xbs)?;
+    let n_e = experts.len();
     // The same swiglu a sequential loop ran per expert, in the same expert
     // order — elementwise, so the phase boundary it sits between is its only
     // change. `ffn::swiglu` records the same site per combine, so one row
     // answers "what does SwiGLU cost" across dense, shexp and routed experts.
-    let mut pars: Vec<Tensor2> = Vec::with_capacity(experts.len());
-    for slot in 0..experts.len() {
+    let mut pars: Vec<Tensor2> = Vec::with_capacity(n_e);
+    for slot in 0..n_e {
         pars.push(swiglu(&gu[2 * slot], &gu[2 * slot + 1]));
     }
-    let downs = down_batch(gguf, plan, &experts, &pars)?;
+    let shexp_par = swiglu(&gu[2 * n_e], &gu[2 * n_e + 1]);
+    let downs_all = down_batch(gguf, plan, &experts, &pars, &shexp_par)?;
+    // `split_last` yields (last, rest): the shared down is the group's last
+    // output, the routed downs keep expert order in the slice before it.
+    let (shexp_down, downs) = downs_all
+        .split_last()
+        .expect("the down group always carries the shared pair");
 
     let t_scatter = if lvl > 0 { Some(Instant::now()) } else { None };
     scatter_experts(
-        &buckets, &sel, &experts, &pars, &downs, meta, &mut sums, trace,
+        &buckets, &sel, &experts, &pars, downs, meta, &mut sums, trace,
     );
     let mut io_ns = gather_ns;
     if let Some(t_scatter) = t_scatter {
@@ -692,11 +689,9 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
         profile::record_time("moe_expert_io", io_ns);
     }
 
-    let sh = shexp_ffn(gguf, plan, x, lvl, &mut setup_ns)?;
-
     let t_trace2 = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut out = sums.routed.clone();
-    for (o, &sv) in out.data.iter_mut().zip(&sh.data) {
+    for (o, &sv) in out.data.iter_mut().zip(&shexp_down.data) {
         *o += sv;
     }
 
@@ -713,7 +708,7 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
                 gate_par: sums.gate_par,
                 down: sums.down_all,
                 routed_out: sums.routed.data.clone(),
-                shexp_out: sh.data.clone(),
+                shexp_out: shexp_down.data.clone(),
             })
         });
     }

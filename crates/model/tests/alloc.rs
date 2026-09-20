@@ -70,7 +70,10 @@ static ALLOC: Counting = Counting;
 /// bucketed pools, and the MoE trace behind an opt-in. What is left: the routing
 /// table's vectors and the per-batch bookkeeping (`ws`/`xs`/`bytes`/`outs`/`pairs`
 /// of a `matmul_q_batch` call), plus the KV row a growing cache owns.
-const LIMIT: u64 = 1_400;
+/// PIN(2026-09-21): 1291 -> 765 / 0.18 MB on the group dispatch round — the batch
+/// bookkeeping (`ws`/`xs`/`outs`/`pairs`) moved to fixed-capacity stack arrays. A
+/// step that grows the KV blocks adds 28.
+const LIMIT: u64 = 850;
 
 #[test]
 #[ignore = "hw: needs the box and the model file"]
