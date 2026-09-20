@@ -3,6 +3,7 @@
 //! ggml's own order (one row at a time, k ascending): a different order moves
 //! the last bit, which is what lets the gates stay tight.
 
+use crate::ffn::swiglu_timed;
 use crate::profile;
 use gguf::{GgmlType, Gguf, TensorInfo, dequant_row, quantize_activations};
 use std::cell::RefCell;
@@ -328,7 +329,7 @@ impl QuantCols {
 
     /// The write view the pool workers quantize through; SAFETY: the pointer
     /// aliases this buffer, owned by the caller for the whole dispatch — the
-    /// disjoint-cells argument at `quantize_distinct`'s construction site.
+    /// disjoint-cells argument at `run_group`'s construction site.
     fn shared(&mut self) -> SharedQuantCols {
         match self {
             QuantCols::Bytes { cb, buf } => SharedQuantCols::Bytes {
@@ -369,7 +370,7 @@ impl SharedOut {
     }
 }
 
-/// [`SharedOut`] for a distinct input's quantized-column buffer; the impls add no safety of their own — see the `quantize_distinct` construction site.
+/// [`SharedOut`] for a distinct input's quantized-column buffer; the impls add no safety of their own — see the `run_group` construction site.
 #[derive(Clone, Copy)]
 enum SharedQuantCols {
     /// `quantize_activations(w.ty, ..)` — f32 round trip, `k` cells per column.
@@ -387,8 +388,9 @@ impl SharedQuantCols {
     ///
     /// # Safety
     ///
-    /// `t` inside the caller's sub-range of the split; `x_col` is column
-    /// `t` of this buffer's input.
+    /// The caller owns column `t`'s cells — its own sub-range of the pre-pass
+    /// split, or the whole slot through a deferred claim's compare-exchange;
+    /// `x_col` is column `t` of this buffer's input.
     unsafe fn quantize_into(&self, ty: GgmlType, k: usize, x_col: &[f32], t: usize) {
         match self {
             SharedQuantCols::F32(ptr) => {
@@ -404,6 +406,17 @@ impl SharedQuantCols {
         }
     }
 }
+
+/// A SwiGLU slot's par block in the one form the dispatch state can carry
+/// (raw pointers are neither `Send` nor `Sync`); the impls add no safety of
+/// their own — see the construction site in `matmul_q_group_swiglu`.
+#[derive(Clone, Copy)]
+pub(crate) struct ParWrite(*mut f32, usize);
+// SAFETY: see the struct doc — the par block's only writer is the slot's
+// claimant, and no reader runs before the slot observes DONE or the join.
+unsafe impl Send for ParWrite {}
+// SAFETY: same argument, shared across the dispatch's participants.
+unsafe impl Sync for ParWrite {}
 
 /// `y = W · x` for a quantized 2-D `W` straight from the file, ggml's
 /// convention: `W.dims == [k, n]`, `k` contiguous; `x` must be `[k, n_tokens]`;
@@ -461,6 +474,224 @@ pub fn matmul_q_group(
     matmul_q_multi("matmul_q_group", gguf, ws, xs)
 }
 
+/// One pair's input for [`matmul_q_group_swiglu`]: a ready activation block,
+/// or the SwiGLU pair whose combine is the input.
+pub enum GroupInput<'a> {
+    Ready(&'a Tensor2),
+    /// (`gate`, `up`) — `silu(gate) · up` feeds the pair's weight.
+    Swiglu(&'a Tensor2, &'a Tensor2),
+}
+
+/// The heterogeneous group whose pairs' inputs may be SwiGLU combines:
+/// `y_i = W_i · silu(gate_i) · up_i`, one pool dispatch for every
+/// projection. For a decode group (every input one column, lever on) the
+/// dispatch's claimant produces each combine into a poisoned scratch par
+/// (`qdot::swiglu`, the exact call `ffn::swiglu` makes) and quantizes it
+/// before any row of its pair runs — the caller never serializes on the
+/// combine or the encoder. Inputs of more than one column, or
+/// `BLOOMERY_DEFER_QUANT=0`, keep today's shape: the combine runs on the
+/// caller (`ffn::swiglu`, its own profiler site) and the group takes the
+/// ordinary pre-pass.
+///
+/// Returns the outputs and the produced `par` blocks — one per `Swiglu`
+/// input, pair order. A `Ready` input's block is the caller's own and is
+/// not returned.
+pub fn matmul_q_group_swiglu(
+    gguf: &Gguf,
+    ws: &[&TensorInfo],
+    srcs: &[GroupInput<'_>],
+) -> Result<(Vec<Tensor2>, Vec<Tensor2>), crate::ModelError> {
+    if ws.len() != srcs.len() {
+        return Err(crate::ModelError::Shape {
+            what: "matmul_q batch",
+            want_ne0: ws.len(),
+            want_ne1: ws.len(),
+            got_ne0: srcs.len(),
+            got_ne1: srcs.len(),
+        });
+    }
+    if ws.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // Profiler hook: the same row and shape as `matmul_q_group`, with the
+    // combines' time handed to the `swiglu` site instead of riding the
+    // group's wall (the no-double-count rule).
+    let lvl = profile::level();
+    let mut pacc = profile::CallAcc::new();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
+    // Deferral needs one column per input and the claim states inline; a
+    // wider group keeps the caller-side combine and the pre-pass.
+    let defer = defer_quant()
+        && ws.len() <= MAX_DEFER_SLOTS
+        && srcs.iter().all(|s| match s {
+            GroupInput::Ready(x) => x.ne1 == 1,
+            GroupInput::Swiglu(gate, _) => gate.ne1 == 1,
+        });
+    let n_swiglu = srcs
+        .iter()
+        .filter(|s| matches!(s, GroupInput::Swiglu(..)))
+        .count();
+    // Exact capacity: the slot blocks reference these pars where they sit,
+    // so the Vec must never grow past its reservation.
+    let mut pars: Vec<Tensor2> = Vec::with_capacity(n_swiglu);
+    let mut bytes: Flex<&[u8]> = Flex::new();
+    let mut meta: Flex<PairMeta> = Flex::new();
+    let mut slot_of: Flex<usize> = Flex::new();
+    let mut slots: Flex<QuantSlot> = Flex::new();
+    let mut outs: Vec<Tensor2> = Vec::with_capacity(ws.len());
+    let mut swiglu_ns: u64 = 0;
+    for (w, src) in ws.iter().zip(srcs) {
+        let k = w.dims.first().copied().unwrap_or(0) as usize;
+        let n = if w.dims.len() > 1 {
+            w.dims[1] as usize
+        } else {
+            1
+        };
+        let ty = w.ty;
+        let xin = match src {
+            GroupInput::Ready(x) => *x,
+            GroupInput::Swiglu(gate, _) => *gate,
+        };
+        if xin.ne0 != k {
+            return Err(crate::ModelError::Shape {
+                what: "matmul_q input",
+                want_ne0: k,
+                want_ne1: xin.ne1,
+                got_ne0: xin.ne0,
+                got_ne1: xin.ne1,
+            });
+        }
+        let b = gguf.data(w)?;
+        // Fused path decided per pair, exactly the single-pair rule.
+        let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
+        let cb = if fused {
+            Some(qdot::col_bytes(ty, k))
+        } else {
+            None
+        };
+        // The combine: produced by the dispatch's claimant (deferred) or
+        // here on the caller (ordinary) — the same `qdot::swiglu` call
+        // either way, into a poisoned scratch par.
+        let (x, swiglu) = match src {
+            GroupInput::Ready(x) => (*x, None),
+            GroupInput::Swiglu(gate, up) => {
+                let par = if defer {
+                    Tensor2::scratch(k, xin.ne1)
+                } else {
+                    let (par, ns) = swiglu_timed(gate, up);
+                    swiglu_ns += ns;
+                    par
+                };
+                pars.push(par);
+                let last = pars.last_mut().expect("just pushed");
+                // The cells, not the block: the claimant's `&mut` covers the
+                // heap cells only, never the header the slot table reads.
+                let write = ParWrite(last.data.as_mut_ptr(), last.data.len());
+                let par: *const Tensor2 = last;
+                // SAFETY: the Vec sits at its exact final capacity, so the
+                // block never moves; the write view goes to exactly one
+                // claimant through the slot, and no reader runs before the
+                // slot observes DONE or the dispatch joins — this shared ref
+                // only names the block for the slot table (metadata reads).
+                (unsafe { &*par }, Some((*gate, *up, write)))
+            }
+        };
+        // The sharing rule among ready inputs (see `matmul_q_multi`); a
+        // SwiGLU pair's par is a fresh engine-owned block, distinct by
+        // construction, so those never share.
+        let slot = match swiglu {
+            Some(..) => {
+                slots.push(QuantSlot {
+                    x,
+                    ty,
+                    k,
+                    cb,
+                    swiglu,
+                });
+                slots.len() - 1
+            }
+            None => (0..slots.len())
+                .find(|&s| {
+                    let q = slots.get(s);
+                    q.swiglu.is_none()
+                        && std::ptr::eq(q.x, x)
+                        && q.cb == cb
+                        && gguf::activation_format(q.ty) == gguf::activation_format(ty)
+                })
+                .unwrap_or_else(|| {
+                    slots.push(QuantSlot {
+                        x,
+                        ty,
+                        k,
+                        cb,
+                        swiglu: None,
+                    });
+                    slots.len() - 1
+                }),
+        };
+        bytes.push(b);
+        meta.push(PairMeta {
+            ty,
+            k,
+            n,
+            row_bytes: b.len() / n,
+        });
+        slot_of.push(slot);
+        outs.push(Tensor2::scratch(n, xin.ne1));
+    }
+    LAST_QUANT_SLOTS.store(slots.len(), std::sync::atomic::Ordering::Relaxed);
+
+    // SAFETY: the construction-site argument in `run_group`'s pair build.
+    let worker_swiglu_ns = run_group(
+        &slots, &slot_of, &bytes, &meta, &mut outs, lvl, &mut pacc, defer,
+    )?;
+    if defer && lvl > 0 && n_swiglu > 0 {
+        profile::record_time("swiglu", worker_swiglu_ns);
+    }
+    swiglu_ns += worker_swiglu_ns;
+
+    if let Some(t_call) = t_call {
+        // One row per distinct weight type the group carried, the group's
+        // wall minus what the `swiglu` site records itself.
+        let wall_ns = (t_call.elapsed().as_nanos() as u64).saturating_sub(swiglu_ns);
+        let wb_total: u64 = (0..bytes.len()).map(|i| bytes.get(i).len() as u64).sum();
+        let mut tys: Flex<(GgmlType, u64, u64, u64)> = Flex::new();
+        for i in 0..meta.len() {
+            let m = *meta.get(i);
+            let wb = bytes.get(i).len() as u64;
+            let mut j = 0;
+            while j < tys.len() && tys.get(j).0 != m.ty {
+                j += 1;
+            }
+            if j == tys.len() {
+                tys.push((m.ty, m.n as u64, m.k as u64 * m.n as u64, wb));
+            } else {
+                let e = tys.get_mut(j);
+                *e = (
+                    e.0,
+                    e.1 + m.n as u64,
+                    e.2 + m.k as u64 * m.n as u64,
+                    e.3 + wb,
+                );
+            }
+        }
+        for t in 0..tys.len() {
+            let &(ty, rows, k_total, wb) = tys.get(t);
+            let share = |ns: u64| ((ns as u128 * wb as u128) / wb_total as u128) as u64;
+            profile::record(
+                "matmul_q_group",
+                ty,
+                rows,
+                k_total,
+                wb,
+                share(wall_ns),
+                &pacc.scaled(wb, wb_total),
+            );
+        }
+    }
+    Ok((outs, pars))
+}
+
 /// Pairs a group carries before its bookkeeping spills to the heap. The
 /// step's widest group is MoE gate/up — `2·n_used + 2 = 14` at `n_used = 6` —
 /// and `wv_b`'s per-head batch is 16; both stay inline, so a decode step's
@@ -514,16 +745,6 @@ impl<T> Flex<T> {
             &mut self.heap[i - GROUP_INLINE]
         }
     }
-
-    /// Move entry `i` out — the single-entry handoff in `quantize_one`.
-    fn take(&mut self, i: usize) -> T {
-        self.len -= 1;
-        if i < GROUP_INLINE {
-            self.inline[i].take().expect("index below len is filled")
-        } else {
-            self.heap.swap_remove(i - GROUP_INLINE)
-        }
-    }
 }
 
 impl Flex<QuantCols> {
@@ -557,13 +778,29 @@ struct PairWork<'a> {
     n: usize,
     bytes: &'a [u8],
     row_bytes: usize,
-    /// Fused qdot columns: (stride `cb`, quantized byte buffer).
-    fused_cols: Option<(usize, &'a [u8])>,
-    /// Scalar-path f32 round trip; empty on the fused path.
-    q_f32: &'a [f32],
+    /// Fused qdot columns: (stride `cb`, quantized byte buffer) as raw parts
+    /// — a deferred dispatch's claimer may still be writing them when this
+    /// pair is built, so `compute_rows` forms the slice only after the slot
+    /// observes DONE.
+    fused_cols: Option<(usize, *const u8)>,
+    /// Scalar-path f32 round trip; null on the fused path. Same raw-parts
+    /// contract as `fused_cols`.
+    q_f32: *const f32,
     ne1: usize,
     out: SharedOut,
+    /// The slot whose columns this pair reads, and the claim table when
+    /// quantization is deferred into the dispatch (`None`: the pre-pass
+    /// completed every column before any row runs).
+    slot: usize,
+    defer: Option<&'a DeferredSlots<'a>>,
 }
+// SAFETY: see the field docs — the raw column parts are only turned into
+// slices after the slot's state observes DONE (deferred) or the pre-pass
+// join (ordinary), and each participant writes only its own row range's
+// output cells, at the `run_group` construction site.
+unsafe impl<'a> Send for PairWork<'a> {}
+// SAFETY: same argument; the dispatch shares one table across its participants.
+unsafe impl<'a> Sync for PairWork<'a> {}
 
 /// The per-pair facts resolved before any output block exists.
 #[derive(Clone, Copy)]
@@ -578,11 +815,18 @@ impl<'a> PairWork<'a> {
     /// The one construction path both dispatch shapes ride; the SAFETY
     /// argument for the output pointer lives at the callers, where the split
     /// is decided.
-    fn new(out: &mut Tensor2, bytes: &'a [u8], q: &'a QuantCols, m: PairMeta) -> PairWork<'a> {
+    fn new(
+        out: &mut Tensor2,
+        bytes: &'a [u8],
+        q: SharedQuantCols,
+        m: PairMeta,
+        slot: usize,
+        defer: Option<&'a DeferredSlots<'a>>,
+    ) -> PairWork<'a> {
         let out_ptr = SharedOut(out.data.as_mut_ptr());
         let (fused_cols, q_f32) = match q {
-            QuantCols::Bytes { cb, buf } => (Some((*cb, buf.as_slice())), &[][..]),
-            QuantCols::F32(q) => (None, q.as_slice()),
+            SharedQuantCols::Bytes { cb, ptr } => (Some((cb, ptr as *const u8)), std::ptr::null()),
+            SharedQuantCols::F32(ptr) => (None, ptr as *const f32),
         };
         PairWork {
             ty: m.ty,
@@ -594,6 +838,8 @@ impl<'a> PairWork<'a> {
             q_f32,
             ne1: out.ne1,
             out: out_ptr,
+            slot,
+            defer,
         }
     }
 
@@ -605,7 +851,16 @@ impl<'a> PairWork<'a> {
         acc: &mut profile::CallAcc,
     ) -> Result<(), crate::ModelError> {
         let (ty, k, n) = (self.ty, self.k, self.n);
-        if let Some((cb, acol)) = self.fused_cols {
+        // A deferred slot's columns must be complete before its rows read
+        // them; on the pre-pass arm this is a no-op (no claim table).
+        if let Some(defer) = self.defer {
+            defer.wait_ready(self.slot);
+        }
+        if let Some((cb, aptr)) = self.fused_cols {
+            // SAFETY: the slot's buffer is `ne1 * cb` bytes as allocated,
+            // and its writes are ordered before this read — the pre-pass
+            // join, or the DONE store the wait above just observed.
+            let acol = unsafe { std::slice::from_raw_parts(aptr, self.ne1 * cb) };
             // Fused rows: `qdot::dot_row` dots the weight bytes and the
             // quantized column directly — no f32 row, ROW_BUF untouched;
             // `add_dequant_w` stays 0 (the dequant is in the dot timer).
@@ -623,6 +878,9 @@ impl<'a> PairWork<'a> {
             }
             Ok(())
         } else {
+            // SAFETY: `k * ne1` f32s as allocated, ordered before this read
+            // exactly as the fused arm above.
+            let q_f32 = unsafe { std::slice::from_raw_parts(self.q_f32, k * self.ne1) };
             ROW_BUF.with(|cell| {
                 let mut scratch = cell.borrow_mut();
                 if scratch.len() < k {
@@ -633,10 +891,10 @@ impl<'a> PairWork<'a> {
                     let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
                     // An F32 row against F32 columns: the reference's float
                     // kernel order, straight off the file bytes.
-                    if ty == GgmlType::F32 && qdot::dot_f32(src, &self.q_f32[..k]).is_some() {
+                    if ty == GgmlType::F32 && qdot::dot_f32(src, &q_f32[..k]).is_some() {
                         let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                         for t in 0..self.ne1 {
-                            let xc = &self.q_f32[t * k..(t + 1) * k];
+                            let xc = &q_f32[t * k..(t + 1) * k];
                             let v = qdot::dot_f32(src, xc).expect("support is per (cpu, k)");
                             // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
                             unsafe { self.out.write(t * n + r, v) };
@@ -660,7 +918,7 @@ impl<'a> PairWork<'a> {
                     }
                     let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                     for t in 0..self.ne1 {
-                        let xc = &self.q_f32[t * k..(t + 1) * k];
+                        let xc = &q_f32[t * k..(t + 1) * k];
                         let mut a = 0.0f32;
                         for i in 0..k {
                             a += row[i] * xc[i];
@@ -739,11 +997,17 @@ fn batch_shape(
 /// pinned to the input's `ne0` by the per-pair shape check, so key equality
 /// implies equal columns.
 struct QuantSlot<'a> {
+    /// The block whose columns are quantized — a ready input, or the par
+    /// block the slot's SwiGLU source produces (see `swiglu`).
     x: &'a Tensor2,
     ty: GgmlType,
     k: usize,
     /// `qdot::col_bytes(ty, k)` on the fused path, `None` on the scalar one.
     cb: Option<usize>,
+    /// The SwiGLU producer, when `x` is not a ready input: the claimer writes
+    /// `silu(gate)·up` through `par` (which aliases `x`) before quantizing
+    /// `x`'s columns. `None` on ready inputs — nothing writes `x`.
+    swiglu: Option<(&'a Tensor2, &'a Tensor2, ParWrite)>,
 }
 
 /// The column walker both dispatch shapes ride: quantize columns `cols` of the
@@ -784,63 +1048,202 @@ fn quant_range(
     }
 }
 
-/// Quantize one input's columns — the single-pair shape: one slot, no
-/// per-call lists. Bit-identity argument as [`quantize_slots`].
-fn quantize_one(
-    ty: GgmlType,
-    k: usize,
-    x: &Tensor2,
-    fused: bool,
-    lvl: u8,
-    pacc: &mut profile::CallAcc,
-) -> QuantCols {
-    let cb = if fused {
-        Some(qdot::col_bytes(ty, k))
-    } else {
-        None
-    };
-    let mut slots: Flex<QuantSlot> = Flex::new();
-    slots.push(QuantSlot { x, ty, k, cb });
-    let mut out: Flex<QuantCols> = Flex::new();
-    quantize_slots(&slots, &mut out, lvl, pacc);
-    out.take(0)
-}
-
-/// Column count under which the pre-pass runs inline on the caller. A pool
+/// Column count under which the caller-side pre-pass runs inline. A pool
 /// dispatch has a fixed floor — the pool bench's empty-closure dispatch —
-/// that a handful of columns cannot repay, and a decode group carries one
+/// that a handful of columns cannot repay, and a pre-pass group carries one
 /// column per slot. Either way the encoder runs once per column, so the
-/// bytes are identical; only WHO calls it changes.
+/// bytes are identical; only WHO calls it changes. The decode shape pays no
+/// pre-pass at all while the deferral lever is on: the row dispatch's
+/// participants claim the slots themselves ([`DeferredSlots`]), so the cap
+/// bounds the pre-pass arms only.
 const QUANT_INLINE_COLS: usize = 8;
 
-/// Quantize every slot's activation columns once: one pool dispatch over the
-/// concatenated column space (inline for the small counts above),
-/// chunk-straddling slots handled segment-wise. Each slot's `(ty, k)` pick
-/// its encoder — every pair on the slot is format-equal by the dedupe key,
-/// and both encoders are pure functions of (activation format, k).
+/// Ceiling on the slots a deferred dispatch carries: the claim states sit
+/// inline in the dispatch state, so a deferred dispatch never allocates. A
+/// wider one-column group keeps the caller-side pre-pass; the step's decode
+/// groups (one slot for the attention pair, one for gate/up, one `par` per
+/// down pair) all sit far below it.
+const MAX_DEFER_SLOTS: usize = 16;
+
+/// `BLOOMERY_DEFER_QUANT=0` forces today's caller-side pre-pass — the A/B
+/// lever. Same binary, same bytes: only WHO quantizes changes.
+fn defer_quant_env() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("BLOOMERY_DEFER_QUANT").map_or(true, |v| v != "0"))
+}
+
+/// The in-process override the deferral tests drive: the env var is read
+/// once per process, so this is how one binary exercises both arms.
+static DEFER_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test override for the deferral lever: `Some(true)` forces the deferred
+/// path, `Some(false)` forces the caller-side pre-pass, `None` follows
+/// `BLOOMERY_DEFER_QUANT`.
+#[doc(hidden)]
+pub fn set_defer_quant(mode: Option<bool>) {
+    DEFER_OVERRIDE.store(
+        match mode {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn defer_quant() -> bool {
+    match DEFER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => defer_quant_env(),
+    }
+}
+
+/// A deferred slot's claim state.
+const SLOT_TODO: u8 = 0;
+const SLOT_CLAIMED: u8 = 1;
+const SLOT_DONE: u8 = 2;
+
+/// Publishes DONE when a claim's scope ends, on unwind too: a producer that
+/// panics must not leave waiters spinning past the pool's barrier — the
+/// panic unwinds every participant's chunk and the dispatcher rethrows it
+/// once the join completes, discarding the outputs with it.
+struct ClaimDone<'a>(&'a std::sync::atomic::AtomicU8);
+impl Drop for ClaimDone<'_> {
+    fn drop(&mut self) {
+        self.0
+            .store(SLOT_DONE, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The claim table of a deferred dispatch: the slot list, the shared write
+/// views, and one state per slot. The decode shape carries exactly one
+/// column per slot, so a claim is one SwiGLU combine at most plus one
+/// encoder call over one column, and every wait is bounded by exactly that.
+struct DeferredSlots<'a> {
+    slots: &'a Flex<QuantSlot<'a>>,
+    shared: &'a Flex<SharedQuantCols>,
+    states: [std::sync::atomic::AtomicU8; MAX_DEFER_SLOTS],
+    /// SwiGLU combine time, summed by the claimers (level >= 1) and recorded
+    /// once on the caller after the join — the profiler's lock stays out of
+    /// the workers.
+    swiglu_ns: std::sync::atomic::AtomicU64,
+}
+
+impl<'a> DeferredSlots<'a> {
+    fn new(slots: &'a Flex<QuantSlot<'a>>, shared: &'a Flex<SharedQuantCols>) -> Self {
+        DeferredSlots {
+            slots,
+            shared,
+            states: std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(SLOT_TODO)),
+            swiglu_ns: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// A participant's first work in the dispatch: walk every slot and claim
+    /// each still-todo one, producing and quantizing it. A claim is held
+    /// only across the slot's own produce+quantize, which waits on
+    /// nothing — so no participant can wait on a slot whose claim is
+    /// stalled behind another wait, and the wait graph stays acyclic.
+    fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
+        for s in 0..self.slots.len() {
+            // Cheap look first: a finished or claimed slot costs a load.
+            if self.states[s].load(std::sync::atomic::Ordering::Relaxed) != SLOT_TODO {
+                continue;
+            }
+            if self.states[s]
+                .compare_exchange(
+                    SLOT_TODO,
+                    SLOT_CLAIMED,
+                    std::sync::atomic::Ordering::Acquire,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let _done = ClaimDone(&self.states[s]);
+            self.produce(s, lvl, acc);
+        }
+    }
+
+    /// Produce and quantize claimed slot `s` — the exact calls the inline
+    /// pre-pass and `ffn::swiglu` make today, whole column; only WHICH
+    /// thread runs them changes. Timers match those call sites: the combine
+    /// at level 1, the encoder at level 2.
+    fn produce(&self, s: usize, lvl: u8, acc: &mut profile::CallAcc) {
+        let q = self.slots.get(s);
+        if let Some((gate, up, par)) = q.swiglu {
+            let t_s = if lvl >= 1 { Some(Instant::now()) } else { None };
+            // SAFETY: `par` aliases this slot's `x`, the par block the entry
+            // allocated and handed off here. This claimer is the block's
+            // only writer: no other participant touches it before the slot
+            // observes DONE, and the caller reads it only after the join.
+            let par = unsafe { std::slice::from_raw_parts_mut(par.0, par.1) };
+            qdot::swiglu(&gate.data, &up.data, par);
+            if let Some(t_s) = t_s {
+                self.swiglu_ns.fetch_add(
+                    t_s.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
+            // SAFETY: column 0 is this claimer's exclusively (the
+            // compare-exchange above); the par block was written by this
+            // same thread just above.
+            unsafe { self.shared.get(s).quantize_into(q.ty, q.k, &par[..q.k], 0) };
+            if let Some(t_q) = t_q {
+                acc.add_quant_act(t_q.elapsed().as_nanos() as u64);
+            }
+        } else {
+            let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
+            // SAFETY: column 0 is this claimer's exclusively (the
+            // compare-exchange above).
+            unsafe { self.shared.get(s).quantize_into(q.ty, q.k, q.x.col(0), 0) };
+            if let Some(t_q) = t_q {
+                acc.add_quant_act(t_q.elapsed().as_nanos() as u64);
+            }
+        }
+    }
+
+    /// Block until slot `s` is quantized. Bounded: the claimer is a
+    /// participant already inside this dispatch, and a slot is one column of
+    /// production and quantization.
+    fn wait_ready(&self, s: usize) {
+        while self.states[s].load(std::sync::atomic::Ordering::Acquire) != SLOT_DONE {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// The claimers' SwiGLU time, read on the caller after the join (the
+    /// pool's completion protocol orders the adds before the return).
+    fn total_swiglu_ns(&self) -> u64 {
+        self.swiglu_ns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The caller-side pre-pass: quantize every slot's activation columns before
+/// any row runs — one pool dispatch over the concatenated column space
+/// (inline for the small counts below), chunk-straddling slots handled
+/// segment-wise. The decode shape does not come through here while the
+/// deferral lever is on (see [`run_group`]); `BLOOMERY_DEFER_QUANT=0` and
+/// multi-column inputs do.
 ///
 /// Bit identity: each column is a pure function of its own input, and the
 /// split partitions the output cells; splitting WITHIN a column would need
 /// its own argument (block-local scales).
 fn quantize_slots(
     slots: &Flex<QuantSlot<'_>>,
-    out: &mut Flex<QuantCols>,
+    shared: &Flex<SharedQuantCols>,
     lvl: u8,
     pacc: &mut profile::CallAcc,
 ) {
     let n = slots.len();
-    for s in 0..n {
-        out.push(QuantCols::new(slots.get(s).cb, slots.get(s).x));
-    }
     let mut col_starts: Flex<usize> = Flex::new();
     let mut total_cols = 0usize;
     for s in 0..n {
         col_starts.push(total_cols);
         total_cols += slots.get(s).x.ne1;
-    }
-    let mut shared: Flex<SharedQuantCols> = Flex::new();
-    for s in 0..n {
-        shared.push(out.get_mut(s).shared());
     }
     // SAFETY (construction site, referenced by every write): the pointers
     // alias buffers owned for the whole call; each participant writes only
@@ -858,7 +1261,7 @@ fn quantize_slots(
     if total_cols > QUANT_INLINE_COLS || total_cols > n {
         threads::pool().for_each_chunk(total_cols, |cols| {
             let mut acc = profile::CallAcc::new();
-            quant_range(slots, &col_starts, &shared, cols, lvl, &mut acc);
+            quant_range(slots, &col_starts, shared, cols, lvl, &mut acc);
             if let Some(collected) = &collected {
                 collected.push(acc);
             }
@@ -867,7 +1270,7 @@ fn quantize_slots(
         // The inline shape: the walker runs on the caller, no split —
         // deterministic, `tests/mt.rs` covers this branch too.
         let mut acc = profile::CallAcc::new();
-        quant_range(slots, &col_starts, &shared, 0..total_cols, lvl, &mut acc);
+        quant_range(slots, &col_starts, shared, 0..total_cols, lvl, &mut acc);
         if let Some(collected) = &collected {
             collected.push(acc);
         }
@@ -877,6 +1280,70 @@ fn quantize_slots(
             pacc.add_acc(&acc);
         }
     }
+}
+
+/// Quantize `slots` and run every pair's rows over one pool dispatch — the
+/// engine all three entry shapes ride. `want_defer` is the caller's lever
+/// reading ([`defer_quant`], or the entry's own shape-constrained variant);
+/// the shape checks here are the single owner of the deferral decision: the
+/// decode shape (every slot exactly one column) with inline claim states
+/// skips the pre-pass, and the row dispatch's participants claim the slots
+/// as their first work. Returns the SwiGLU nanoseconds the claims spent
+/// (worker-side, level >= 1 only) so the caller's profiler wall can hand
+/// them to the `swiglu` site instead of counting them twice.
+#[allow(clippy::too_many_arguments)]
+fn run_group(
+    slots: &Flex<QuantSlot<'_>>,
+    slot_of: &Flex<usize>,
+    bytes: &Flex<&[u8]>,
+    meta: &Flex<PairMeta>,
+    outs: &mut [Tensor2],
+    lvl: u8,
+    pacc: &mut profile::CallAcc,
+    want_defer: bool,
+) -> Result<u64, crate::ModelError> {
+    let n_slots = slots.len();
+    let mut quantized: Flex<QuantCols> = Flex::new();
+    for s in 0..n_slots {
+        quantized.push(QuantCols::new(slots.get(s).cb, slots.get(s).x));
+    }
+    let mut shared: Flex<SharedQuantCols> = Flex::new();
+    for s in 0..n_slots {
+        shared.push(quantized.get_mut(s).shared());
+    }
+    let deferred = (want_defer
+        && n_slots > 0
+        && n_slots <= MAX_DEFER_SLOTS
+        && (0..n_slots).all(|s| slots.get(s).x.ne1 == 1))
+    .then(|| DeferredSlots::new(slots, &shared));
+    if deferred.is_none() {
+        quantize_slots(slots, &shared, lvl, pacc);
+    }
+    let mut pairs: Flex<PairWork> = Flex::new();
+    for (i, out) in outs.iter_mut().enumerate() {
+        // SAFETY (construction site, referenced by every write): each pair's
+        // output pointer aliases that pair's `out.data`, caller-owned for the
+        // whole call. Each participant writes only cells `t * n + r` with
+        // `r` inside its own sub-range of the row split, which partitions
+        // the rows; the join publishes the writes; an early error discards
+        // the outputs either way. The quantized-column pointers alias the
+        // slot buffers, caller-owned for the whole call: on the pre-pass arm
+        // the columns are complete before any row runs; on the deferred arm
+        // a participant forms the slice only after the slot's state observes
+        // DONE (the claim's release store), which orders the claimer's
+        // writes before its read.
+        pairs.push(PairWork::new(
+            out,
+            bytes.get(i),
+            *shared.get(*slot_of.get(i)),
+            *meta.get(i),
+            *slot_of.get(i),
+            deferred.as_ref(),
+        ));
+    }
+    run_row_pool(&pairs, lvl, pacc, deferred.as_ref())?;
+    quantized.release_all();
+    Ok(deferred.map_or(0, |d| d.total_swiglu_ns()))
 }
 
 /// What one row of a pair costs a lane: its weight bytes once per input column
@@ -961,11 +1428,14 @@ impl ErrGate {
 ///
 /// A profiled dispatch pays the chunk collector (one `Vec` of pool-width
 /// slots); an unprofiled one runs the error channel above and allocates
-/// nothing unless a chunk fails.
+/// nothing unless a chunk fails. A dispatch with a claim table runs it as
+/// the participants' first work (`DeferredSlots::claim_pass`); a claimed
+/// slot's state gates every read of its columns (`PairWork::compute_rows`).
 fn run_row_pool(
     pairs: &Flex<PairWork<'_>>,
     lvl: u8,
     pacc: &mut profile::CallAcc,
+    deferred: Option<&DeferredSlots<'_>>,
 ) -> Result<(), crate::ModelError> {
     let npairs = pairs.len();
     let mut pair_starts: Flex<usize> = Flex::new();
@@ -1052,6 +1522,11 @@ fn run_row_pool(
             acc: profile::CallAcc::new(),
             err: None,
         };
+        // Deferred quantization: claims come first, before any row and any
+        // wait — a claim never waits on anything, so claim order cannot cycle.
+        if let Some(deferred) = deferred {
+            deferred.claim_pass(lvl, &mut chunk.acc);
+        }
         // Home lanes: the lane containing this chunk's start, plus every lane
         // that starts inside the chunk. Byte-cut boundaries need not align
         // with the pool's row-count chunks, and a start-match lookup would
@@ -1155,7 +1630,9 @@ fn run_row_pool(
 /// The single-pair dispatch `matmul_q` rides: one weight, one input, no
 /// per-call `Vec`s — the quantization buffer off the thread pool, the one
 /// `PairWork` inline. Same row loop, same `batch_shape` contract, same
-/// profiler row as the batch shape; only the bookkeeping is narrower.
+/// profiler row as the batch shape; only the bookkeeping is narrower. The
+/// decode shape (one column) defers its quantization into the row dispatch
+/// like every other group.
 fn matmul_q_one(
     site: &'static str,
     gguf: &Gguf,
@@ -1174,25 +1651,44 @@ fn matmul_q_one(
     let bytes = gguf.data(w)?;
     let row_bytes = bytes.len() / n;
     let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
+    let cb = if fused {
+        Some(qdot::col_bytes(ty, k))
+    } else {
+        None
+    };
 
-    let qc = quantize_one(ty, k, x, fused, lvl, &mut pacc);
+    let mut slots: Flex<QuantSlot> = Flex::new();
+    slots.push(QuantSlot {
+        x,
+        ty,
+        k,
+        cb,
+        swiglu: None,
+    });
+    let mut slot_of: Flex<usize> = Flex::new();
+    slot_of.push(0);
+    let mut bytes_f: Flex<&[u8]> = Flex::new();
+    bytes_f.push(bytes);
+    let mut meta: Flex<PairMeta> = Flex::new();
+    meta.push(PairMeta {
+        ty,
+        k,
+        n,
+        row_bytes,
+    });
     let mut out = Tensor2::scratch(n, x.ne1);
-    let mut pairs: Flex<PairWork> = Flex::new();
-    // SAFETY: the construction-site argument in `matmul_q_multi`'s pair build —
+    // SAFETY: the construction-site argument in `run_group`'s pair build —
     // one pair, the whole row split, the join publishes the writes.
-    pairs.push(PairWork::new(
-        &mut out,
-        bytes,
-        &qc,
-        PairMeta {
-            ty,
-            k,
-            n,
-            row_bytes,
-        },
-    ));
-    run_row_pool(&pairs, lvl, &mut pacc)?;
-    qc.release();
+    run_group(
+        &slots,
+        &slot_of,
+        &bytes_f,
+        &meta,
+        std::slice::from_mut(&mut out),
+        lvl,
+        &mut pacc,
+        defer_quant(),
+    )?;
 
     if let Some(t_call) = t_call {
         profile::record(
@@ -1392,12 +1888,19 @@ fn matmul_q_multi(
         let slot = (0..slots.len())
             .find(|&s| {
                 let q = slots.get(s);
-                std::ptr::eq(q.x, *x)
+                q.swiglu.is_none()
+                    && std::ptr::eq(q.x, *x)
                     && q.cb == cb
                     && gguf::activation_format(q.ty) == gguf::activation_format(ty)
             })
             .unwrap_or_else(|| {
-                slots.push(QuantSlot { x, ty, k, cb });
+                slots.push(QuantSlot {
+                    x,
+                    ty,
+                    k,
+                    cb,
+                    swiglu: None,
+                });
                 slots.len() - 1
             });
         bytes.push(b);
@@ -1412,25 +1915,17 @@ fn matmul_q_multi(
     }
     LAST_QUANT_SLOTS.store(slots.len(), std::sync::atomic::Ordering::Relaxed);
 
-    let mut quantized: Flex<QuantCols> = Flex::new();
-    quantize_slots(&slots, &mut quantized, lvl, &mut pacc);
-
-    let mut pairs: Flex<PairWork> = Flex::new();
-    for (i, out) in outs.iter_mut().enumerate() {
-        // SAFETY (construction site, referenced by every write): each pair's
-        // output pointer aliases that pair's `out.data`, caller-owned for the
-        // whole call. Each participant writes only cells `t * n + r` with
-        // `r` inside its own sub-range of the row split, which partitions
-        // the rows; the join publishes the writes; an early error discards
-        // the outputs either way.
-        pairs.push(PairWork::new(
-            out,
-            bytes.get(i),
-            quantized.get(*slot_of.get(i)),
-            *meta.get(i),
-        ));
-    }
-    run_row_pool(&pairs, lvl, &mut pacc)?;
+    // SAFETY: the construction-site argument in `run_group`'s pair build.
+    run_group(
+        &slots,
+        &slot_of,
+        &bytes,
+        &meta,
+        &mut outs,
+        lvl,
+        &mut pacc,
+        defer_quant(),
+    )?;
 
     if let Some(t_call) = t_call {
         // One row per distinct weight type the group carried. Rows, `k` and
@@ -1475,6 +1970,5 @@ fn matmul_q_multi(
             );
         }
     }
-    quantized.release_all();
     Ok(outs)
 }

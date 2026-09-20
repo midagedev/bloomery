@@ -4,9 +4,8 @@
 //! identical (a SwiGLU gate/up pair, then the down projection) and only the
 //! tensor names differ (`ffn_*` vs `ffn_*_shexp`). Which trio a block carries is
 //! decided by presence in the file, so no block number is special-cased. The
-//! MoE module runs its own copy of the three ops (`moe.rs::shexp_ffn`) so its
-//! tensor finds land under its own profiler sites; [`swiglu`] below is the one
-//! owner of the combine itself.
+//! MoE module runs its own group dispatches; [`swiglu`] below is the one owner
+//! of the combine itself.
 //!
 //! Gate: `crates/model/tests/ffn.rs` against the oracle.
 use crate::ModelError;
@@ -66,10 +65,19 @@ pub(crate) fn ffn_weights(
 /// produces numbers and only the oracle tells them apart. ggml fuses this with
 /// the two matmuls as FUSED_UP_GATE; the gate pins the product, not the fusion.
 pub(crate) fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
+    swiglu_timed(gate, up).0
+}
+
+/// [`swiglu`] with the combine's own wall time handed back, so a caller that
+/// wraps already-hooked work can keep its own site's wall free of the
+/// child's nanoseconds (the profiler's no-double-count rule). The record
+/// here is the same one [`swiglu`] always made.
+pub(crate) fn swiglu_timed(gate: &Tensor2, up: &Tensor2) -> (Tensor2, u64) {
     // Profiler hook (crate::profile): the SiLU·up combine, level-1 typeless —
-    // activation work, no weight read. `moe.rs` calls this per routed expert
-    // and for the shared expert, so one site answers "what does SwiGLU cost"
-    // across dense, shexp and routed experts.
+    // activation work, no weight read. The MoE down group rides it per
+    // routed expert and for the shared expert (caller-side for multi-column
+    // inputs, inside the dispatch for decode), so one site answers "what
+    // does SwiGLU cost" across dense, shexp and routed experts.
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     assert_eq!(
@@ -81,10 +89,15 @@ pub(crate) fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
     // slower per element and this runs once per routed expert per step.
     let mut out = Tensor2::scratch(gate.ne0, gate.ne1);
     qdot::swiglu(&gate.data, &up.data, &mut out.data);
-    if let Some(t_call) = t_call {
-        profile::record_time("swiglu", t_call.elapsed().as_nanos() as u64);
-    }
-    out
+    let ns = match t_call {
+        Some(t_call) => {
+            let ns = t_call.elapsed().as_nanos() as u64;
+            profile::record_time("swiglu", ns);
+            ns
+        }
+        None => 0,
+    };
+    (out, ns)
 }
 
 /// The FUSED_UP_GATE stage over an already-resolved trio: one group dispatch

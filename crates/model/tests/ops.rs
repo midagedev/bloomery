@@ -8,6 +8,12 @@ mod oracle;
 use gguf::GgmlType;
 use model::ops::{Tensor2, f32_tensor, matmul_q, rms_norm};
 
+/// The slot-count observable and the deferral override are process-global,
+/// and cargo runs this file's tests in parallel — the tests that touch
+/// either serialize here so no other gate's group can store a slot count
+/// between one test's call and its read.
+static SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_rms_norm_matches_ggml() {
@@ -318,6 +324,7 @@ fn hw_matmul_q_batch_matches_sequential() {
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_group_matches_sequential() {
+    let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
@@ -491,4 +498,209 @@ fn hw_matmul_q_group_matches_sequential() {
         _ => panic!("both calls must return the same Shape error"),
     }
     eprintln!("sharing, single-pair, empty and error-parity contracts hold");
+}
+
+/// The deferral identity: a decode-shaped heterogeneous group (mixed types,
+/// one input shared across two encodings, four slots) and the single-pair
+/// call produce bit-identical outputs whether quantization runs inside the
+/// row dispatch's claims or in the caller-side pre-pass. The lever is
+/// process-global (read once per process), so the test drives the in-process
+/// override `ops::set_defer_quant` — the same opt-in pattern
+/// `moe::set_trace_enabled` uses — and restores the env arm at the end.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_group_defer_matches_inline() {
+    let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let (xs, xinf) = o.load("attn_norm-0", 0);
+    let x6 = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
+    let colset = |idx: &[usize]| {
+        let mut xb = Tensor2::zeros(x6.ne0, idx.len());
+        for (i, &t) in idx.iter().enumerate() {
+            xb.col_mut(i).copy_from_slice(x6.col(t));
+        }
+        xb
+    };
+    let x1 = colset(&[0]);
+
+    let wq = g.find("blk.0.attn_q.weight").unwrap();
+    let wo6 = g.find("blk.6.attn_output.weight").unwrap();
+    let router = g.find("blk.1.ffn_gate_inp.weight").unwrap();
+    let stack = g.find("blk.6.ffn_down_exps.weight").unwrap();
+    assert_eq!(stack.dims.len(), 3, "expert stacks are dims len 3");
+    let per = stack.nbytes / stack.dims[2];
+    let e0 = gguf::TensorInfo {
+        name: stack.name.clone(),
+        dims: vec![stack.dims[0], stack.dims[1]],
+        ty: stack.ty,
+        offset: stack.offset + per,
+        nbytes: per,
+    };
+    let y1 = Tensor2::from_vec(
+        e0.dims[0] as usize,
+        1,
+        (0..e0.dims[0] as usize)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.031)
+            .collect(),
+    );
+
+    let ws: Vec<&gguf::TensorInfo> = vec![wq, wo6, router, &e0];
+    let xs1: Vec<&Tensor2> = vec![&x1, &x1, &x1, &y1];
+
+    let run = |mode: Option<bool>| {
+        model::ops::set_defer_quant(mode);
+        let got = model::ops::matmul_q_group(&g, &ws, &xs1).unwrap();
+        let slots = model::ops::last_quant_slots();
+        let one = matmul_q(&g, wq, &x1).unwrap();
+        (got, slots, one)
+    };
+    let (inline, slots_inline, one_inline) = run(Some(false));
+    let (deferred, slots_defer, one_defer) = run(Some(true));
+    model::ops::set_defer_quant(None);
+
+    // Four slots: Q8K over x1 (wq), Q8_2X4 over x1 (wo6 — the same input
+    // under a second encoding), the F32 round trip over x1 (router), and
+    // Q8_2X4 over y1 (e0 — same encoding as wo6, different input).
+    assert_eq!(slots_inline, 4, "the mixed group must build four slots");
+    assert_eq!(slots_defer, 4, "deferral keeps the slot table");
+    for p in 0..ws.len() {
+        let diffs = inline[p]
+            .data
+            .iter()
+            .zip(&deferred[p].data)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "pair {p}: deferred must be bit-identical to the pre-pass"
+        );
+    }
+    let diffs = one_inline
+        .data
+        .iter()
+        .zip(&one_defer.data)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        diffs, 0,
+        "single-pair: deferred must be bit-identical to the pre-pass"
+    );
+    eprintln!(
+        "group of {} pairs x 4 slots and the single-pair call: deferred == pre-pass, bit for bit",
+        ws.len()
+    );
+}
+
+/// The SwiGLU-slot entry: for a down group, the `par`s the dispatch produces
+/// and the outputs they feed are bit-identical to the caller-side
+/// composition — `qdot::swiglu` (the exact call `ffn::swiglu` makes) then
+/// `matmul_q_group` on the pre-pass arm. Both entry arms are checked against
+/// that reference: the deferred arm (claimants produce the combines, decode
+/// shape) and the caller arm, plus the multi-column decline a prefill down
+/// group takes with the lever on.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_group_swiglu_matches_caller_composition() {
+    let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let (xs, xinf) = o.load("ffn_norm-1", 0);
+    let xall = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
+    let colset = |idx: &[usize]| {
+        let mut xb = Tensor2::zeros(xall.ne0, idx.len());
+        for (i, &t) in idx.iter().enumerate() {
+            xb.col_mut(i).copy_from_slice(xall.col(t));
+        }
+        xb
+    };
+    let x1 = colset(&[0]);
+
+    // Two routed experts + the shexp trio: gate/up feed the combines, down
+    // is the group under test. Views sliced exactly the way moe.rs's
+    // expert_view does.
+    let gexps = g.find("blk.1.ffn_gate_exps.weight").unwrap();
+    let uexps = g.find("blk.1.ffn_up_exps.weight").unwrap();
+    let dexps = g.find("blk.1.ffn_down_exps.weight").unwrap();
+    assert_eq!(gexps.dims.len(), 3, "expert stacks are dims len 3");
+    let view = |w: &gguf::TensorInfo, e: u64| {
+        let per = w.nbytes / w.dims[2];
+        gguf::TensorInfo {
+            name: w.name.clone(),
+            dims: vec![w.dims[0], w.dims[1]],
+            ty: w.ty,
+            offset: w.offset + e * per,
+            nbytes: per,
+        }
+    };
+    let (g0, u0, d0) = (view(gexps, 0), view(uexps, 0), view(dexps, 0));
+    let (g1, u1, d1) = (view(gexps, 5), view(uexps, 5), view(dexps, 5));
+    let shg = g.find("blk.1.ffn_gate_shexp.weight").unwrap();
+    let shu = g.find("blk.1.ffn_up_shexp.weight").unwrap();
+    let shd = g.find("blk.1.ffn_down_shexp.weight").unwrap();
+
+    let check = |x: &Tensor2, label: &str| {
+        let gu_ws: Vec<&gguf::TensorInfo> = vec![&g0, &u0, &g1, &u1, &shg, &shu];
+        let gu_xs: Vec<&Tensor2> = vec![x, x, x, x, x, x];
+        let gu = model::ops::matmul_q_group(&g, &gu_ws, &gu_xs).unwrap();
+        let pairs = [(&gu[0], &gu[1]), (&gu[2], &gu[3]), (&gu[4], &gu[5])];
+
+        // Reference: caller-side combines into fresh blocks, then the
+        // ordinary group on the pre-pass arm.
+        let pars_ref: Vec<Tensor2> = pairs
+            .iter()
+            .map(|(gate, up)| {
+                let mut data = vec![0.0f32; gate.data.len()];
+                qdot::swiglu(&gate.data, &up.data, &mut data);
+                Tensor2::from_vec(gate.ne0, gate.ne1, data)
+            })
+            .collect();
+        let down_ws: Vec<&gguf::TensorInfo> = vec![&d0, &d1, &shd];
+        let par_refs: Vec<&Tensor2> = pars_ref.iter().collect();
+        model::ops::set_defer_quant(Some(false));
+        let outs_ref = model::ops::matmul_q_group(&g, &down_ws, &par_refs).unwrap();
+
+        let srcs: Vec<model::ops::GroupInput> = pairs
+            .iter()
+            .map(|(gate, up)| model::ops::GroupInput::Swiglu(gate, up))
+            .collect();
+        for (mode, tag) in [(Some(true), "deferred arm"), (Some(false), "caller arm")] {
+            model::ops::set_defer_quant(mode);
+            let (outs, pars) = model::ops::matmul_q_group_swiglu(&g, &down_ws, &srcs).unwrap();
+            assert_eq!(pars.len(), 3, "one par per SwiGLU input ({label}, {tag})");
+            for p in 0..3 {
+                assert_eq!(
+                    [pars[p].ne0, pars[p].ne1],
+                    [pars_ref[p].ne0, pars_ref[p].ne1],
+                    "par {p} shape ({label}, {tag})"
+                );
+                let pd = pars_ref[p]
+                    .data
+                    .iter()
+                    .zip(&pars[p].data)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    pd, 0,
+                    "par {p} ({label}, {tag}): must be bit-identical to qdot::swiglu"
+                );
+                let od = outs_ref[p]
+                    .data
+                    .iter()
+                    .zip(&outs[p].data)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    od, 0,
+                    "output {p} ({label}, {tag}): must be bit-identical to the caller composition"
+                );
+            }
+        }
+        model::ops::set_defer_quant(None);
+        eprintln!(
+            "{label}: 3 swiglu-slot pairs, both entry arms == caller composition, bit for bit"
+        );
+    };
+    check(&x1, "ne1=1 (decode)");
+    check(&xall, "ne1=6 (prefill decline)");
 }
