@@ -500,7 +500,7 @@ pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
     let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
     let mut q = [0i8; 32];
     for (j, &v) in x.iter().enumerate() {
-        q[j] = (v * id).round_ties_even().clamp(-128.0, 127.0) as i8;
+        q[j] = qdot::nearest_int(v * id).clamp(-128, 127) as i8;
     }
     Q8Block {
         d: f32_to_f16_bits(d),
@@ -540,7 +540,7 @@ fn quantize_act(x: &[f32]) -> ActBlock {
     let id = if d > 0.0 { 1.0 / d } else { 0.0 };
     let mut q = [0i8; 32];
     for (j, &v) in x.iter().enumerate() {
-        q[j] = (v * id).round_ties_even().clamp(-127.0, 127.0) as i8;
+        q[j] = qdot::nearest_int(v * id).clamp(-127, 127) as i8;
     }
     ActBlock { d, q }
 }

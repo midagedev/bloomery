@@ -328,8 +328,10 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
 /// |v| <= 127 domain `iscale * x` lives in, which is what lets gate 1
 /// compare restored values bit for bit against
 /// `quantize_row_q8_k_roundtrip` (which rounds with `round_ties_even`).
+/// Every activation encoder rounds through this: without SSE4.1 in the
+/// baseline target `round_ties_even` is a libm `rintf` call per element.
 #[inline]
-fn nearest_int(fval: f32) -> i32 {
+pub fn nearest_int(fval: f32) -> i32 {
     let val = fval + 12582912.0;
     let i = f32::to_bits(val);
     ((i & 0x007f_ffff) as i32) - 0x0040_0000
@@ -674,7 +676,7 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
             let qs = &mut group[16 + 32 * ir..16 + 32 * ir + 32];
             let mut isum = 0i32;
             for (m, &v) in xb.iter().enumerate() {
-                let q = (v * id).round_ties_even() as i32 as i8;
+                let q = nearest_int(v * id) as i8;
                 qs[m] = q as u8;
                 isum += q as i32;
             }
@@ -694,7 +696,7 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
         let qs = &mut tb[4..36];
         let mut isum = 0i32;
         for (m, &v) in xb.iter().enumerate() {
-            let q = (v * id).round_ties_even() as i32 as i8;
+            let q = nearest_int(v * id) as i8;
             qs[m] = q as u8;
             isum += q as i32;
         }
