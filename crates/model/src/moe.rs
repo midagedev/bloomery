@@ -446,7 +446,12 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
     // Phase 1 — gate and up for every routed expert, one dispatch. The views
     // interleave [gate_e0, up_e0, gate_e1, up_e1, ..] so pair `2*s` is expert
     // s's gate and `2*s + 1` its up; both read the same `xb` columns the
-    // sequential loop gathered per expert.
+    // sequential loop gathered per expert. The doubled reference is free:
+    // `matmul_q_multi`'s pre-pass quantizes each DISTINCT input once (MUL-37),
+    // so pushing `xb` twice costs one quantization, not two — until MUL-37
+    // the same push meant quantizing every bucket's columns twice, 156 of
+    // the batch's 312 pair-quantizations per decode step (MUL-35 §3, the
+    // duplicate this round exists to remove).
     let mut gu_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(experts.len() * 2);
     let mut gu_xs: Vec<&Tensor2> = Vec::with_capacity(experts.len() * 2);
     for (gate, up) in gate_views.iter().zip(&up_views) {
