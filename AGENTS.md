@@ -147,6 +147,18 @@ first suspect is a hung gate on the box, not the agent.
   round's first arm read 0.3–0.8 % slow (same-binary A/A), enough to flip a
   small verdict. `BLOOMERY_AB_ENVS="K=V;K=V"` adds same-binary arms that differ
   only by a lever — put an A/A arm in whenever the claim is under 1 %.
+- **Know the ruler before reading it.** Same-binary runs scatter with SD
+  0.6 % (18 runs, 2026-09-21), so the 95 % interval on a difference of two arm
+  means is ±1.0 % at four rounds and ±0.8 % at six; ±0.5 % takes about 23
+  rounds per arm, ±0.3 % about 63. Report the effect and its interval, not a
+  win count — 4/4 is p = 0.06 by the sign test. Under 1 %, judge only between
+  same-binary lever arms: two builds differ by link layout alone.
+- **A decode headline names its depth.** tg96 after a 6-token prompt measures
+  the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
+  each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
+  `llama-bench -gp d,96`); 2026-09-21: +1.7 % at depth 6, −15 % at 1024, −39 %
+  at 4096 (3.4 vs 0.87 µs per cached key per step). Any round that touches
+  attention or the KV cache is judged on the deep rows too.
 - **The step does no load-time work.** Anything that does not depend on the
   tokens — tensor lookups, names, metadata keys, views, decoded gains — is
   resolved once into `Derived`; the calling thread's serial time is the step's
