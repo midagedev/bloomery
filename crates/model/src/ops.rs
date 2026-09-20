@@ -411,10 +411,11 @@ fn matmul_q_multi(
     //
     // The fused qdot kernel (crates/qdot) dots the quantized codes directly,
     // so its activation input is `qdot::quantize_col`'s byte layout, not the
-    // f32 round trip. `supports(ty)` implies Q3_K — the only type the qdot API
-    // is built for — and the k check mirrors the kernel's whole-super-block
-    // contract (256 values per block). Decided once for the whole batch; every
-    // pair shares the type, so no pair can disagree with its own row loop.
+    // f32 round trip. `supports(ty)` is qdot's type table — Q3_K x q8_K,
+    // Q4_K and Q6_K x q8_2_x4 (MUL-27/MUL-31) — and the k check mirrors the
+    // kernel's whole-super-block contract (256 values per block). Decided
+    // once for the whole batch; every pair shares the type, so no pair can
+    // disagree with its own row loop.
     let fused = qdot::supports(ty) && k.is_multiple_of(256);
     let mut quantized: Vec<QuantCols> = Vec::with_capacity(xs.len());
     for x in xs {

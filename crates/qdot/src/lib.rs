@@ -1,5 +1,5 @@
-//! qdot — the fused quantized row dot for the host CPU: Q3_K x Q8_K and
-//! Q4_K x Q8_2_X4.
+//! qdot — the fused quantized row dot for the host CPU: Q3_K x Q8_K,
+//! Q4_K x Q8_2_X4, and Q6_K x Q8_2_X4.
 //!
 //! `model::ops::matmul_q` today dequantizes every weight row to f32
 //! (`gguf::quant::dequant_row`), round-trips the activations through the
@@ -38,6 +38,14 @@
 //!     kqv_out-0 by 6.4e-3 against the oracle (gate 5e-3), and carrying two
 //!     Q4_K kernels where the engine can select one invites exactly that
 //!     mistake again.
+//!   * the Q6_K row dot is ik's `mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2,
+//!     1>` (iqk_gemm_kquants.cpp:938) — the qY variant, NOT Q4_K's qX
+//!     template: the weight's MAGNITUDE is the u8 side of maddubs while its
+//!     SIGN is folded into the activation bytes (`prepare_signed` +
+//!     `_mm256_sign_epi8`), and the 16 sub-block scales reach the f32 lanes
+//!     through the k_shuff {0,2,4,6,1,3,5,7} interleave. Same q8_2_x4
+//!     activation format as Q4_K — the encoder is shared, dump
+//!     `q6k-x4-ik-dot.txt` (`tools/ref/q6k_x4_ref.cpp`).
 //!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108. Weight element 128c+32f+l
@@ -135,7 +143,11 @@ pub fn supports(w: GgmlType) -> bool {
     // it moved kqv_out-0 by 6.4e-3 against the oracle (gate 5e-3) — an
     // activation-format delta, not a bug. That kernel is gone; its dump
     // (q4k-ik-dot.txt) stays in BLOOMERY_DATA as the round's record.
-    matches!(w, GgmlType::Q3_K | GgmlType::Q4_K) && std::arch::is_x86_feature_detected!("avx2")
+    //
+    // Q6_K is wired as of 2026-09-20 (MUL-31): same activation format, qY
+    // template (iqk_gemm_kquants.cpp:2781).
+    matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K)
+        && std::arch::is_x86_feature_detected!("avx2")
 }
 
 /// Bytes one quantized activation column of `k` values occupies in `w`'s
@@ -149,7 +161,7 @@ pub fn supports(w: GgmlType) -> bool {
 /// super-block's, and `dot_row` enforces the same one.)
 pub fn col_bytes(w: GgmlType, k: usize) -> usize {
     assert!(
-        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K),
+        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K),
         "qdot has no activation format for {w:?} in this build"
     );
     assert!(
@@ -157,7 +169,7 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
         "qdot activation columns are whole 256-value super-blocks, k = {k}"
     );
     match w {
-        GgmlType::Q4_K => (k / 128) * Q82X4_STRIDE,
+        GgmlType::Q4_K | GgmlType::Q6_K => (k / 128) * Q82X4_STRIDE,
         _ => (k / 256) * Q8K_STRIDE,
     }
 }
@@ -173,13 +185,14 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
 /// representations; the gate checks that bit for bit (`tests/qdot.rs`,
 /// gate 1).
 ///
-/// Q4_K: port of the `__x86_64__` branch of ik's `quantize_row_q8_2_x4`
-/// (iqk_quantize.cpp:1005) — bf16-rounded `d`, `round_ties_even` quants,
-/// raw i16 sums. The gate checks the bytes bit for bit against ik's own
-/// coding of the same column (dump `q4k-x4-ik-dot.txt`).
+/// Q4_K / Q6_K: port of the `__x86_64__` branch of ik's
+/// `quantize_row_q8_2_x4` (iqk_quantize.cpp:1005) — bf16-rounded `d`,
+/// `round_ties_even` quants, raw i16 sums. The gate checks the bytes bit for
+/// bit against ik's own coding of the same column (dumps `q4k-x4-ik-dot.txt`
+/// and `q6k-x4-ik-dot.txt` — one encoder, two consumers).
 pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
     assert!(
-        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K),
+        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K),
         "qdot has no activation format for {w:?} in this build"
     );
     assert!(
@@ -188,7 +201,7 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
         x.len()
     );
     match w {
-        GgmlType::Q4_K => {
+        GgmlType::Q4_K | GgmlType::Q6_K => {
             assert_eq!(
                 out.len(),
                 (x.len() / 128) * Q82X4_STRIDE,
@@ -233,6 +246,10 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
             // SAFETY: AVX2+FMA were just detected; lengths validated above.
             Ok(unsafe { dot_q4k_q82x4_avx2(wrow, acol, nb) })
         }
+        (GgmlType::Q6_K, true) => {
+            // SAFETY: AVX2+FMA were just detected; lengths validated above.
+            Ok(unsafe { dot_q6k_q82x4_avx2(wrow, acol, nb) })
+        }
         // Unreachable in practice (check_row rejects other types first) but
         // the type system cannot see that; the scalar mirror is the safe
         // placeholder that keeps this total.
@@ -254,6 +271,7 @@ pub fn dot_row_scalar(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result
 fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     match w {
         GgmlType::Q4_K => dot_q4k_q82x4_emul(wrow, acol, nb),
+        GgmlType::Q6_K => dot_q6k_q82x4_emul(wrow, acol, nb),
         _ => dot_q3k_q8k_scalar(wrow, acol, nb),
     }
 }
@@ -273,6 +291,10 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_q4k_q82x4_avx2(wrow, acol, nb) })
         }
+        GgmlType::Q6_K => {
+            // SAFETY: asserted just above; lengths validated by check_row.
+            Ok(unsafe { dot_q6k_q82x4_avx2(wrow, acol, nb) })
+        }
         _ => {
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_q3k_q8k_avx2(wrow, acol, nb) })
@@ -284,7 +306,7 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
 /// weight super-block count on success. The supported-type check comes
 /// first so an unsupported type never touches the data.
 fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<usize, QdotError> {
-    if !matches!(w, GgmlType::Q3_K | GgmlType::Q4_K) {
+    if !matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K) {
         return Err(QdotError::UnsupportedType(w));
     }
     if !k.is_multiple_of(256) {
@@ -294,6 +316,7 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
     let need_w = nb
         * match w {
             GgmlType::Q4_K => Q4K_BLOCK,
+            GgmlType::Q6_K => Q6K_BLOCK,
             _ => Q3K_BLOCK,
         };
     if wrow_len < need_w {
@@ -305,7 +328,7 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
     }
     let need_a = nb
         * match w {
-            GgmlType::Q4_K => 2 * Q82X4_STRIDE,
+            GgmlType::Q4_K | GgmlType::Q6_K => 2 * Q82X4_STRIDE,
             _ => Q8K_STRIDE,
         };
     if acol_len < need_a {
@@ -1190,6 +1213,352 @@ fn dot_q4k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
                 let idx = 4 * j + (l & 3);
                 let d4d8 = all_scales[idx] * d8[idx];
                 accd[l] = d4d8.mul_add(sumi[l] as f32, accd[l]);
+            }
+        }
+    }
+
+    // hsum_float_8 in the kernel's exact order.
+    let t = [
+        accd[0] + accd[4],
+        accd[1] + accd[5],
+        accd[2] + accd[6],
+        accd[3] + accd[7],
+    ];
+    (t[0] + t[2]) + (t[1] + t[3])
+}
+
+// --------------------------------------------------------- Q6_K x Q8_2_X4
+// MUL-31. Port of ik's `mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2, 1>`
+// (iqk_gemm_kquants.cpp:938) — the pairing the oracle dispatches
+// (iqk_gemm_kquants.cpp:2753/2781), non-HAVE_FANCY_SIMD branch. The qY
+// template is NOT Q4_K's qX with a type swapped; two structural
+// differences, both ported verbatim:
+//
+//   * the weight never becomes a signed maddubs operand. `prepare_signed`
+//     (iqk_gemm_kquants.cpp:871) turns the 6-bit codes into i8 -32..31,
+//     then `us[k] = sign_epi8(values[k], values[k])` keeps only their
+//     MAGNITUDE as the u8 side of maddubs, while the SIGN is folded into
+//     the ACTIVATION bytes: `sign_epi8(qs, values[k])` negates the q8 lane
+//     where the weight is negative and zeroes it where the weight is zero.
+//     (us <= 32 and |q| <= 127, so maddubs' i16 saturation stays
+//     unreachable at |32*127*2| = 8128.)
+//   * the 16 s8 sub-block scales go through make_scales' sign-extension
+//     and then k_shuff, a shuffle_epi8 that reorders the eight i16 lanes
+//     per 128-bit half to {0,2,4,6,1,3,5,7} — the lane order the i16 pack
+//     chain's sums land in (the same reason the Q4_K round refused to
+//     hand-derive lane maps; here the shuffle IS the map, ported as bytes).
+//
+// There is no min term: block_q6_K has no dmin, so accd accumulates only
+// the two per-chunk fmadds. The activation side is the same
+// `quantize_q82x4_col` coding Q4_K consumes (one encoder, gate 0 shared).
+//
+// `#[target_feature]` is not optional (MUL-26 lesson, 21x on this box);
+// the MUL-27 measurement adds that helper SPLITS lose ~13% on this loop
+// shape, so the kernel is one monolithic fn.
+
+/// `block_q6_K` (ggml-common.h:386): ql u8[128] @0, qh u8[64] @128,
+/// scales s8[16] @192, d f16 @208 — 256 values, 210 bytes. Weight element
+/// 128c+l reads ql byte 64c+l field 0/2 (low nibble) or 64c+32+l field 1/3
+/// (high nibble), with two more bits from qh byte 32c+l — five-bit codes
+/// split across two arrays.
+const Q6K_BLOCK: usize = 210;
+
+/// `mul_mat_qY_K_q8_2_X4_T`'s k_shuff (iqk_gemm_kquants.cpp:949), verbatim:
+/// within each 16-byte half, output byte pairs (2p, 2p+1) take input scale
+/// {0,2,4,6,1,3,5,7}[p] — the {b0 b2 b4 b6 b1 b3 b5 b7} order the pack
+/// chain's i32 lanes come out in (the template's own lane comment).
+static K_SHUFFLE_Q6K: [u8; 32] = [
+    0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15, //
+    0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15,
+];
+
+/// Port of `mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2, 1>`
+/// (iqk_gemm_kquants.cpp:938) reduced to `matmul_q`'s shape: one weight row
+/// against one q8_2_x4 activation column. The template's iy loop is gone
+/// (nrc_y = 1), its ix loop is the caller's row loop. Scheduling follows
+/// MUL-27's surviving form: both chunks' integer chains are issued before
+/// the super-block's two fmadds, and the fmadds stay strictly ordered
+/// (chunk 0, chunk 1; super-blocks ascending) — the emulator and the
+/// 1-ULP-ik gate hold the bits.
+///
+/// # Safety
+/// The CPU must support AVX2+FMA, and the caller must have validated
+/// lengths: `wrow` at nb*210 readable bytes, `acol` at nb*288 (`check_row`
+/// does).
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_q6k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    unsafe {
+        let ml = _mm256_set1_epi8(0xF);
+        let mh = _mm256_set1_epi8(0x30);
+        let m32n = _mm256_set1_epi8(-32);
+        // SAFETY: 32-byte load inside the 32-byte static table.
+        let shuff = _mm256_loadu_si256(K_SHUFFLE_Q6K.as_ptr() as *const __m256i);
+        let mut accd = _mm256_setzero_ps();
+
+        for i in 0..nb {
+            let wb = wrow.as_ptr().add(Q6K_BLOCK * i);
+
+            // Super-block scale d: f16 @ +208.
+            // SAFETY: one unaligned u16 read inside the super-block.
+            let d = f16_bits_to_f32((wb.add(208) as *const u16).read_unaligned());
+            let vd = _mm256_set1_ps(d);
+            // make_scales + k_shuff: 16 s8 scales sign-extended to i16,
+            // then the {0,2,4,6,1,3,5,7} interleave; each 128-bit half of
+            // the shuffled register becomes one f32 scale vector.
+            // SAFETY: 16-byte unaligned load inside the super-block.
+            let sc16 = _mm256_shuffle_epi8(
+                _mm256_cvtepi8_epi16(_mm_loadu_si128(wb.add(192) as *const __m128i)),
+                shuff,
+            );
+            let mut scales = [
+                _mm256_mul_ps(
+                    vd,
+                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(sc16))),
+                ),
+                _mm256_mul_ps(
+                    vd,
+                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(sc16, 1))),
+                ),
+            ];
+
+            // The two x4 groups feeding super-block i: their bf16 scales as
+            // f32 (bits << 16). dy's halves ARE the group scales — lanes
+            // 0..3 group 2i, 4..7 group 2i+1 — broadcast onto the matching
+            // scale vector (the C's nrc_y == 1 branch).
+            // SAFETY: 8 readable bytes at the head of each validated group.
+            let g0 = acol.as_ptr().add((2 * i) * Q82X4_STRIDE);
+            let g1 = acol.as_ptr().add((2 * i + 1) * Q82X4_STRIDE);
+            let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
+            let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
+            let dy = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
+            let dyl = _mm256_castps256_ps128(dy);
+            let dyh = _mm256_extractf128_ps(dy, 1);
+            scales[0] = _mm256_mul_ps(scales[0], _mm256_set_m128(dyl, dyl));
+            scales[1] = _mm256_mul_ps(scales[1], _mm256_set_m128(dyh, dyh));
+
+            // Both chunks' integer chains first, then the two fmadds in the
+            // C's order. Same bits.
+            let mut sumis = [_mm256_setzero_si256(), _mm256_setzero_si256()];
+            for j in 0..2 {
+                // DequantizerQ6K_AVX2::prepare: ql bytes [64j, 64j+64) and
+                // qh bytes [32j, 32j+32) -> four 32-value planes of 5-bit
+                // codes (low nibble of ql / two bits of qh).
+                // SAFETY: loads stay inside the validated 210-byte block.
+                let lbits1 = _mm256_loadu_si256(wb.add(64 * j) as *const __m256i);
+                let lbits2 = _mm256_loadu_si256(wb.add(64 * j + 32) as *const __m256i);
+                let hbits = _mm256_loadu_si256(wb.add(128 + 32 * j) as *const __m256i);
+                let mut values = [
+                    _mm256_or_si256(
+                        _mm256_and_si256(lbits1, ml),
+                        _mm256_and_si256(_mm256_slli_epi16::<4>(hbits), mh),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(lbits2, ml),
+                        _mm256_and_si256(_mm256_slli_epi16::<2>(hbits), mh),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(lbits1), ml),
+                        _mm256_and_si256(hbits, mh),
+                    ),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(lbits2), ml),
+                        _mm256_and_si256(_mm256_srli_epi16::<2>(hbits), mh),
+                    ),
+                ];
+                // prepare_signed: codes - 32 -> i8 weights; us = |weight|,
+                // the u8 side of maddubs.
+                let mut us = [_mm256_setzero_si256(); 4];
+                for k in 0..4 {
+                    values[k] = _mm256_add_epi8(values[k], m32n);
+                    us[k] = _mm256_sign_epi8(values[k], values[k]);
+                }
+
+                // The x4 group for chunk j: its four 32-byte quant slices,
+                // each with the weight lane's sign folded in — qY's
+                // signature move.
+                // SAFETY: loads stay inside the validated activation group.
+                let qs = acol.as_ptr().add((2 * i + j) * Q82X4_STRIDE + 16);
+                let sumi1 = _mm256_maddubs_epi16(
+                    us[0],
+                    _mm256_sign_epi8(_mm256_loadu_si256(qs as *const __m256i), values[0]),
+                );
+                let sumi2 = _mm256_maddubs_epi16(
+                    us[1],
+                    _mm256_sign_epi8(_mm256_loadu_si256(qs.add(32) as *const __m256i), values[1]),
+                );
+                let sumi3 = _mm256_maddubs_epi16(
+                    us[2],
+                    _mm256_sign_epi8(_mm256_loadu_si256(qs.add(64) as *const __m256i), values[2]),
+                );
+                let sumi4 = _mm256_maddubs_epi16(
+                    us[3],
+                    _mm256_sign_epi8(_mm256_loadu_si256(qs.add(96) as *const __m256i), values[3]),
+                );
+                let t1 = _mm256_add_epi16(
+                    _mm256_unpacklo_epi32(sumi1, sumi2),
+                    _mm256_unpackhi_epi32(sumi1, sumi2),
+                );
+                let t3 = _mm256_add_epi16(
+                    _mm256_unpacklo_epi32(sumi3, sumi4),
+                    _mm256_unpackhi_epi32(sumi3, sumi4),
+                );
+                let t =
+                    _mm256_add_epi16(_mm256_unpacklo_epi64(t1, t3), _mm256_unpackhi_epi64(t1, t3));
+                sumis[j] = _mm256_madd_epi16(_mm256_set1_epi16(1), t);
+            }
+
+            accd = _mm256_fmadd_ps(scales[0], _mm256_cvtepi32_ps(sumis[0]), accd);
+            accd = _mm256_fmadd_ps(scales[1], _mm256_cvtepi32_ps(sumis[1]), accd);
+        }
+
+        hsum_float_8(accd)
+    }
+}
+
+// The instruction-graph emulator of [`dot_q6k_q82x4_avx2`] — same regime as
+// the Q4_K one: safe Rust, no ISA requirement, every operation in Intel's
+// exact semantics, the same loop structure. Two families of instructions
+// the Q4_K graph did not have are emulated here: the i16 shifts of the
+// code-assembly step (as real 16-bit lane ops on byte arrays, no per-byte
+// shortcut derived) and `_mm256_sign_epi8`.
+
+/// `_mm256_sign_epi8(a, b)`: lane = b < 0 ? -a : (b == 0 ? 0 : a), the i8
+/// negation wrapping at -128 (unreachable for the magnitudes here, written
+/// anyway so the emulator stays honest).
+#[inline]
+fn emul_sign_epi8(a: u8, b: i8) -> u8 {
+    if b < 0 {
+        (a as i8).wrapping_neg() as u8
+    } else if b == 0 {
+        0
+    } else {
+        a
+    }
+}
+
+/// `_mm256_slli_epi16` on a byte array: 16-bit lane left shift, wrapping
+/// (bits leaving a lane's top are gone; zeros enter the bottom).
+#[inline]
+fn emul_slli_epi16<const S: i32>(a: [u8; 32]) -> [u8; 32] {
+    let mut r = [0u8; 32];
+    for p in 0..16 {
+        let v = u16::from_le_bytes([a[2 * p], a[2 * p + 1]]);
+        let s = v.wrapping_shl(S as u32);
+        r[2 * p..2 * p + 2].copy_from_slice(&s.to_le_bytes());
+    }
+    r
+}
+
+/// `_mm256_srli_epi16` on a byte array: 16-bit lane LOGICAL right shift.
+#[inline]
+fn emul_srli_epi16<const S: i32>(a: [u8; 32]) -> [u8; 32] {
+    let mut r = [0u8; 32];
+    for p in 0..16 {
+        let v = u16::from_le_bytes([a[2 * p], a[2 * p + 1]]);
+        let s = v >> S;
+        r[2 * p..2 * p + 2].copy_from_slice(&s.to_le_bytes());
+    }
+    r
+}
+
+/// The emulator: the kernel's graph, one weight row against one q8_2_x4
+/// column, bit-identical to [`dot_q6k_q82x4_avx2`] by construction.
+fn dot_q6k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    let mut accd = [0.0f32; 8];
+
+    for i in 0..nb {
+        let wb = &wrow[i * Q6K_BLOCK..(i + 1) * Q6K_BLOCK];
+        let g0 = &acol[(2 * i) * Q82X4_STRIDE..(2 * i + 1) * Q82X4_STRIDE];
+        let g1 = &acol[(2 * i + 1) * Q82X4_STRIDE..(2 * i + 2) * Q82X4_STRIDE];
+
+        let d = f16_bits_to_f32(u16::from_le_bytes([wb[208], wb[209]]));
+
+        // make_scales: 16 s8 -> i16 into a little-endian 32-byte register,
+        // then shuffle_epi8 with k_shuff (per 128-bit lane, table byte's
+        // high bit would zero — K_SHUFFLE_Q6K entries are all < 16).
+        let mut reg = [0u8; 32];
+        for l in 0..16 {
+            reg[2 * l..2 * l + 2].copy_from_slice(&(wb[192 + l] as i8 as i16).to_le_bytes());
+        }
+        let mut sc16 = [0u8; 32];
+        for q in 0..32 {
+            sc16[q] = reg[16 * (q / 16) + K_SHUFFLE_Q6K[q] as usize];
+        }
+        // scales[j][l] = (d * sc16_lane) * dy_lane, two multiplies in the
+        // kernel's order; lanes 0..7 of the low half then the high half.
+        let mut scales = [[0.0f32; 8]; 2];
+        for l in 0..8 {
+            let lo = i16::from_le_bytes([sc16[2 * l], sc16[2 * l + 1]]) as f32;
+            let hi = i16::from_le_bytes([sc16[2 * l + 16], sc16[2 * l + 17]]) as f32;
+            scales[0][l] = d * lo;
+            scales[1][l] = d * hi;
+        }
+        let mut d8 = [0.0f32; 8];
+        for l in 0..4 {
+            d8[l] = bf16_bits_to_f32(u16::from_le_bytes([g0[2 * l], g0[2 * l + 1]]));
+            d8[4 + l] = bf16_bits_to_f32(u16::from_le_bytes([g1[2 * l], g1[2 * l + 1]]));
+        }
+        for l in 0..8 {
+            scales[0][l] *= d8[l & 3];
+            scales[1][l] *= d8[4 + (l & 3)];
+        }
+
+        for j in 0..2 {
+            // prepare: the four code planes, as the kernel builds them.
+            let lbits1: [u8; 32] = wb[64 * j..64 * j + 32].try_into().unwrap();
+            let lbits2: [u8; 32] = wb[64 * j + 32..64 * j + 64].try_into().unwrap();
+            let hbits: [u8; 32] = wb[128 + 32 * j..128 + 32 * j + 32].try_into().unwrap();
+            let hbits4 = emul_slli_epi16::<4>(hbits);
+            let hbits2 = emul_slli_epi16::<2>(hbits);
+            let lbits1h = emul_srli_epi16::<4>(lbits1);
+            let lbits2h = emul_srli_epi16::<4>(lbits2);
+            let hbitsh2 = emul_srli_epi16::<2>(hbits);
+            let mut values = [[0u8; 32]; 4];
+            for m in 0..32 {
+                values[0][m] = (lbits1[m] & 0xF) | (hbits4[m] & 0x30);
+                values[1][m] = (lbits2[m] & 0xF) | (hbits2[m] & 0x30);
+                values[2][m] = (lbits1h[m] & 0xF) | (hbits[m] & 0x30);
+                values[3][m] = (lbits2h[m] & 0xF) | (hbitsh2[m] & 0x30);
+            }
+            // prepare_signed: codes - 32 (wrapping i8), us = |weight|.
+            let mut us = [[0u8; 32]; 4];
+            for k in 0..4 {
+                for m in 0..32 {
+                    values[k][m] = (values[k][m] as i8).wrapping_add(-32) as u8;
+                    us[k][m] = emul_sign_epi8(values[k][m], values[k][m] as i8);
+                }
+            }
+
+            let g = &acol[(2 * i + j) * Q82X4_STRIDE..(2 * i + j + 1) * Q82X4_STRIDE];
+            let mut qs = [[0u8; 32]; 4];
+            for t in 0..4 {
+                qs[t].copy_from_slice(&g[16 + 32 * t..16 + 32 * t + 32]);
+            }
+            // The sign fold: qs bytes take the weight lane's sign.
+            let mut signed = [[0u8; 32]; 4];
+            for k in 0..4 {
+                for m in 0..32 {
+                    signed[k][m] = emul_sign_epi8(qs[k][m], values[k][m] as i8);
+                }
+            }
+            let sumi1 = emul_maddubs(us[0], signed[0]);
+            let sumi2 = emul_maddubs(us[1], signed[1]);
+            let sumi3 = emul_maddubs(us[2], signed[2]);
+            let sumi4 = emul_maddubs(us[3], signed[3]);
+            let t1 = emul_add_epi16(
+                emul_unpacklo_epi32(sumi1, sumi2),
+                emul_unpackhi_epi32(sumi1, sumi2),
+            );
+            let t3 = emul_add_epi16(
+                emul_unpacklo_epi32(sumi3, sumi4),
+                emul_unpackhi_epi32(sumi3, sumi4),
+            );
+            let t = emul_add_epi16(emul_unpacklo_epi64(t1, t3), emul_unpackhi_epi64(t1, t3));
+            let sumi = emul_madd1(t);
+
+            // One fused accumulate per chunk, in the kernel's order.
+            for l in 0..8 {
+                accd[l] = scales[j][l].mul_add(sumi[l] as f32, accd[l]);
             }
         }
     }

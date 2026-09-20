@@ -11,6 +11,10 @@
 //! round's "better than the port" mandate is judged by: ik's measured
 //! reference rate is in the rig-log record of this round, not invented here.
 //!
+//! MUL-31 (Q6_K round): a third row, same discipline at 210 B per 256
+//! values; ik's own kernel measured on the same shape by
+//! `tools/ref/q6k_x4_rate.cpp`.
+//!
 //! Synthetic weights (data-independent kernel) sized to the pre-study's
 //! `big` shape: 360,448 rows of K=2048, one quantized activation column,
 //! single-threaded — the per-core rate is the number that isolates the
@@ -69,7 +73,8 @@ fn bench(ty: GgmlType, row_bytes: usize, rows: usize) {
 
 fn main() {
     let rows: usize = 360_448;
-    // Q3_K: 110 B per 256 values; Q4_K: 144 B per 256 values.
+    // Q3_K: 110 B per 256 values; Q4_K: 144 B; Q6_K: 210 B (MUL-31).
     bench(GgmlType::Q3_K, (2048 / 256) * 110, rows);
     bench(GgmlType::Q4_K, (2048 / 256) * 144, rows);
+    bench(GgmlType::Q6_K, (2048 / 256) * 210, rows);
 }

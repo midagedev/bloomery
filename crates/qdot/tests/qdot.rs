@@ -473,6 +473,21 @@ fn rejects_unaligned_k() {
         Err(QdotError::ShortActivationCol { .. })
     ));
     assert_eq!(dot_row(GgmlType::Q4_K, &wrow4, &acol4, 2048).unwrap(), 0.0);
+    // Q6_K pairs the SAME q8_2_x4 activation column (MUL-31): its own
+    // stride is 210 weight bytes per 256 values.
+    assert_eq!(col_bytes(GgmlType::Q6_K, 2048), 144 * 16);
+    assert_eq!(col_bytes(GgmlType::Q6_K, 512), 144 * 4);
+    let wrow6 = vec![0u8; 210 * 8];
+    let acol6 = vec![0u8; 144 * 16];
+    assert!(matches!(
+        dot_row(GgmlType::Q6_K, &wrow6[..1679], &acol6, 2048),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q6_K, &wrow6, &acol6[..2303], 2048),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(dot_row(GgmlType::Q6_K, &wrow6, &acol6, 2048).unwrap(), 0.0);
     // supports(): the type must be in the table at all.
     // Q4_K joined the table in MUL-27; Q5_0 is the out-of-table witness now.
     assert!(!supports(GgmlType::Q5_0));
@@ -599,5 +614,120 @@ fn hw_q4k_dot_row_matches_scalar_and_predicts() {
     }
     eprintln!(
         "gate B: 64 rows within 1 ULP of ik's mul_mat_qX_K_q8_2_X4_T (on ik's own activations)"
+    );
+}
+
+#[test]
+#[ignore = "hw: needs the box and the model file"]
+fn hw_q6k_dot_row_matches_scalar_and_predicts() {
+    // MUL-31's gate triple for the Q6_K x Q8_2_X4 kernel — same regime as
+    // MUL-27's Q4_K triple. Gate 0 is shared by construction: the encoder
+    // IS the Q4_K round's port (one quantize_row_q8_2_x4 for both weight
+    // types), so its bytes must reproduce the dump's activation line again
+    // — a re-run of the same program, not a new claim. What is new is the
+    // kernel: ik's qY template (mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2,
+    // 1>), whose weight-magnitude/sign split and k_shuff scale interleave
+    // the Q4_K qX port does not exercise.
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let w = g
+        .iter_tensors()
+        .find(|w| w.ty == gguf::GgmlType::Q6_K && (w.dims[0] as usize).is_multiple_of(256))
+        .expect("the model must carry at least one aligned Q6_K tensor");
+    let k = w.dims[0] as usize;
+    let n = w.dims[1] as usize;
+
+    let bytes = g.data(w).unwrap();
+    let row_bytes = bytes.len() / n;
+    assert_eq!(row_bytes, 210 * k / 256);
+
+    // Real activations: the oracle's first-block normed input, first column.
+    let vals = oracle_f32("attn_norm-0", 2048 * 6);
+    let xs: Vec<f32> = vals[..k].to_vec();
+    let cb = qdot::col_bytes(gguf::GgmlType::Q6_K, k);
+    let mut acol = vec![0u8; cb];
+    qdot::quantize_col(gguf::GgmlType::Q6_K, &xs, &mut acol);
+
+    // The x4 dump: tools/ref/q6k_x4_ref.cpp runs ik's own kernel-table
+    // entry (mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2, 1>) on this tensor
+    // with ik's quantize_row_q8_2_x4 coding of the same column.
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let dump = std::fs::read_to_string(format!("{base}/ref/q6k-x4-ik-dot.txt"))
+        .expect("run tools/ref/q6k_x4_ref.cpp first (just build-ref does not build it)");
+    let mut dump_k = 0usize;
+    let mut want = Vec::new();
+    let mut ik_acol: Vec<u8> = Vec::new();
+    for line in dump.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next(), it.next(), it.next()) {
+            (Some("tensor"), Some(_), Some("k"), Some(kk)) => dump_k = kk.parse().unwrap(),
+            (Some("row"), Some(_), Some(hex), None) => {
+                want.push(u32::from_str_radix(hex, 16).expect("ik dumps raw f32 bits"));
+            }
+            // the one long hex line: ik's quantized activation bytes
+            (Some(hex), None, None, None) if hex.len() > 64 => {
+                let b = hex.as_bytes();
+                ik_acol.extend(
+                    b.chunks_exact(2)
+                        .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap()),
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        dump_k, k,
+        "the dump and this scan must land on the same tensor"
+    );
+    assert_eq!(
+        ik_acol.len(),
+        cb,
+        "ik's q8_2_x4 column must size-match ours"
+    );
+
+    // Gate 0 — the ENCODER bytes are bit-identical to ik's coding of the
+    // same column: the encoder is Q4_K's, unchanged, so this is a re-check
+    // of the same program on the Q6_K round's dump.
+    for (i, (a, b)) in ik_acol.iter().zip(&acol).enumerate() {
+        assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
+    }
+    eprintln!("gate 0: {cb} encoder bytes bit-identical to ik's quantize_row_q8_2_x4");
+
+    // Gate A — bit identity kernel vs instruction-graph emulator, on our
+    // (== ik's) activation bytes.
+    let rows = n.min(1024);
+    for r in 0..rows {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        let a = qdot::dot_row(gguf::GgmlType::Q6_K, src, &acol, k).unwrap();
+        let b = qdot::dot_row_scalar(gguf::GgmlType::Q6_K, src, &acol, k).unwrap();
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "row {r}: kernel and emulator must be bit-identical"
+        );
+    }
+    eprintln!("gate A: {rows} rows bit-identical (kernel vs emulator)");
+
+    // Gate B — against IK'S OWN KERNEL on the same rows with the same
+    // activations; 1 ULP covers the compiler's freedom in the f32
+    // multiplies the template shares across its iy loop (measured bound,
+    // same regime as the Q4_K round's gate).
+    assert!(want.len() >= 64, "dump needs 64 rows");
+    for (r, &w) in want.iter().take(64).enumerate() {
+        let got = qdot::dot_row(
+            gguf::GgmlType::Q6_K,
+            &bytes[r * row_bytes..(r + 1) * row_bytes],
+            &ik_acol,
+            k,
+        )
+        .unwrap();
+        let ulp = (got.to_bits() as i64 - w as i64).abs();
+        assert!(
+            ulp <= 1,
+            "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+            f32::from_bits(w)
+        );
+    }
+    eprintln!(
+        "gate B: 64 rows within 1 ULP of ik's mul_mat_qY_K_q8_2_X4_T (on ik's own activations)"
     );
 }
