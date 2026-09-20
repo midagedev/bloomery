@@ -1011,3 +1011,241 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
     }
     eprintln!("gate B: 64 rows within 1 ULP of ik's mul_mat_qX_1_q8_2_T (on ik's own activations)");
 }
+
+// ------------------------------------------------- MUL-38: q_nope2 cell kernel
+// The Q8_0 x act cell kernel's own gate: AVX2 kernel vs scalar mirror,
+// BIT for bit, over the model's shape and the boundary shapes the pool's
+// segment walk can produce (j0 mid-column, single-cell tails, nb = 1), on
+// code patterns that walk the sign fold's extremes — all-±127 blocks (the
+// maddubs pair bound 2·127·127 = 32258 and the i32 extreme 32·127² =
+// 516128), all-zero weight codes (every activation lane folded to zero),
+// and -128 WEIGHT codes (legal: |w| = 128 is a valid u8 magnitude and the
+// identity survives the two's-complement wrap, see the lib's section
+// header point 3). Activation codes of -128 under a negative weight are
+// deliberately absent: they are outside the kernel's contract and both
+// producers provably cannot emit them. No model file is read — the shapes
+// are constants; the `hw_` prefix is the ISA requirement
+// (`q_nope2_cells_avx2` panics without AVX2, and the gate wants the kernel
+// compared, not the dispatcher falling back to the mirror against itself).
+
+/// Deterministic xorshift64* — the crate has no rand dependency and the
+/// gate must be reproducible (a failing pattern must reappear on rerun).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform code in [-127, 127] — the producers' reachable range.
+    fn code(&mut self) -> i8 {
+        ((self.next() % 255) as i32 - 127) as i8
+    }
+}
+
+/// A few f16 bit patterns for the weight scales (1.0, 0.5, 2.0, ~0.0039,
+/// a denormal, and -1.0 — the arithmetic does not care about the sign, and
+/// half_to_f32 is the same function on both paths) and bf16-valued f32s
+/// for the activation scales.
+const W_SCALES: [u16; 6] = [0x3C00, 0x3800, 0x4000, 0x3B00, 0x0040, 0xBC00];
+const A_SCALES: [f32; 6] = [1.0, 0.5, 2.0, 0.00390625, 0.25, -1.0];
+
+fn gen_blocks(rng: &mut Rng, n: usize, side: u32) -> Vec<qdot::Q8Block> {
+    (0..n)
+        .map(|i| {
+            let mut q = [0i8; 32];
+            for c in &mut q {
+                *c = rng.code();
+            }
+            qdot::Q8Block {
+                d: W_SCALES[(i % W_SCALES.len() + side as usize) % W_SCALES.len()],
+                q,
+            }
+        })
+        .collect()
+}
+
+fn gen_acol(rng: &mut Rng, nb: usize) -> Vec<qdot::ActBlock> {
+    (0..nb)
+        .map(|i| {
+            let mut q = [0i8; 32];
+            for c in &mut q {
+                *c = rng.code();
+            }
+            qdot::ActBlock {
+                d: A_SCALES[i % A_SCALES.len()],
+                q,
+            }
+        })
+        .collect()
+}
+
+/// Compare kernel vs mirror over one (whead, acol) pair, segment by
+/// segment, on BITS.
+fn assert_cells_bit_identical(
+    what: &str,
+    whead: &[qdot::Q8Block],
+    acol: &[qdot::ActBlock],
+    segments: &[(usize, usize)],
+) {
+    let latent = whead.len() / acol.len();
+    for &(j0, j_end) in segments {
+        let len = j_end - j0;
+        let mut k = vec![0.0f32; len];
+        let mut s = vec![0.0f32; len];
+        qdot::q_nope2_cells_avx2(whead, acol, j0, j_end, &mut k);
+        qdot::q_nope2_cells_scalar(whead, acol, j0, j_end, &mut s);
+        for (jj, (a, b)) in k.iter().zip(&s).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{what}: cell {j0}+{jj} (latent {latent}, nb {}): kernel and mirror must be bit-identical",
+                acol.len()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "hw: needs the box's AVX2 (q_nope2_cells_avx2 panics without it)"]
+fn hw_q_nope2_cells_bit_identical() {
+    // The model's exact shape: latent 512, nb = nope/32 = 4 — every
+    // segment form the MUL-33 chunk walk produces, including a mid-column
+    // start, a single-cell tail, and whole-column runs.
+    let mut rng = Rng(0x5EED_3838_1234_5678);
+    let (latent, nb) = (512usize, 4usize);
+    let whead = gen_blocks(&mut rng, latent * nb, 0);
+    let acol = gen_acol(&mut rng, nb);
+    assert_cells_bit_identical(
+        "model shape, random codes",
+        &whead,
+        &acol,
+        &[(0, latent), (1, latent - 1), (137, 349), (511, 512), (0, 1)],
+    );
+
+    // Extreme patterns over the same shape: each row is one (whead, acol)
+    // pair whose codes are constant at the range ends.
+    let consts: &[(&str, i8, i8)] = &[
+        ("w+127 a+127 (max positive isum/pairs)", 127, 127),
+        ("w-127 a-127 (fold on every lane)", -127, -127),
+        ("w-127 a+127 (max negative isum)", -127, 127),
+        ("w+127 a-127", 127, -127),
+        ("w 0 a+127 (sign fold zeroes a)", 0, 127),
+        ("w+127 a 0", 127, 0),
+        ("w-128 a+127 (|w|=128 wraps into u8)", -128, 127),
+        ("w-128 a-127", -128, -127),
+    ];
+    for &(what, wc, ac) in consts {
+        let whead: Vec<qdot::Q8Block> = (0..latent * nb)
+            .map(|i| qdot::Q8Block {
+                d: W_SCALES[i % W_SCALES.len()],
+                q: [wc; 32],
+            })
+            .collect();
+        let acol: Vec<qdot::ActBlock> = (0..nb)
+            .map(|i| qdot::ActBlock {
+                d: A_SCALES[i % A_SCALES.len()],
+                q: [ac; 32],
+            })
+            .collect();
+        assert_cells_bit_identical(what, &whead, &acol, &[(0, latent), (3, latent)]);
+    }
+
+    // Alternating signs — adjacent-lane pair cancellation inside maddubs.
+    let alt = |i: usize| if i % 2 == 0 { 127 } else { -127 };
+    let whead: Vec<qdot::Q8Block> = (0..latent * nb)
+        .map(|i| qdot::Q8Block {
+            d: W_SCALES[i % W_SCALES.len()],
+            q: core::array::from_fn(alt),
+        })
+        .collect();
+    let acol: Vec<qdot::ActBlock> = (0..nb)
+        .map(|i| qdot::ActBlock {
+            d: A_SCALES[i % A_SCALES.len()],
+            q: core::array::from_fn(alt),
+        })
+        .collect();
+    assert_cells_bit_identical("alternating ±127", &whead, &acol, &[(0, latent)]);
+
+    // Boundary SHAPES: nb = 1 (nope = 32) and an odd nb = 3, small latents,
+    // first/last single-cell segments.
+    for (latent2, nb2) in [(8usize, 1usize), (5, 3), (1, 1), (33, 2)] {
+        let mut rng = Rng(0xD00D_0000_0000 + latent2 as u64 * 100 + nb2 as u64);
+        let whead = gen_blocks(&mut rng, latent2 * nb2, 1);
+        let acol = gen_acol(&mut rng, nb2);
+        assert_cells_bit_identical(
+            &format!("shape latent={latent2} nb={nb2}"),
+            &whead,
+            &acol,
+            &[(0, latent2), (0, 1), (latent2 - 1, latent2)],
+        );
+    }
+
+    // One hand-computed absolute value, so the gate does not only check the
+    // kernel against a mirror that could share its bug: w = a = +127 with
+    // d_w = d_a = 1.0 gives isum = 32·127² = 516128 and the cell exactly
+    // (1.0·1.0 as f64)·516128.0 — 516128.0 is exact in f32.
+    let whead = [qdot::Q8Block {
+        d: 0x3C00,
+        q: [127; 32],
+    }];
+    let acol = [qdot::ActBlock {
+        d: 1.0,
+        q: [127; 32],
+    }];
+    let mut out = [0.0f32; 1];
+    qdot::q_nope2_cells_avx2(&whead, &acol, 0, 1, &mut out);
+    assert_eq!(
+        out[0].to_bits(),
+        516128.0f32.to_bits(),
+        "hand value 516128.0"
+    );
+    qdot::q_nope2_cells_scalar(&whead, &acol, 0, 1, &mut out);
+    assert_eq!(out[0].to_bits(), 516128.0f32.to_bits(), "mirror hand value");
+
+    // The dispatcher the production path calls takes the same bits (on this
+    // box it selects the kernel; the sweep keeps the wiring honest).
+    let mut rng = Rng(0xABCD_EF01);
+    let whead = gen_blocks(&mut rng, latent * nb, 2);
+    let acol = gen_acol(&mut rng, nb);
+    let mut d = vec![0.0f32; latent];
+    let mut s = vec![0.0f32; latent];
+    qdot::q_nope2_cells(&whead, &acol, 0, latent, &mut d);
+    qdot::q_nope2_cells_scalar(&whead, &acol, 0, latent, &mut s);
+    for (a, b) in d.iter().zip(&s) {
+        assert_eq!(a.to_bits(), b.to_bits(), "dispatcher vs mirror");
+    }
+
+    eprintln!(
+        "q_nope2 cells: kernel == scalar mirror, bit for bit, over the model shape, extremes and boundary shapes"
+    );
+}
+
+/// The dispatcher's shape contract: loud panics, in every form (the pool
+/// callback cannot propagate Results — see the lib's `q_nope2_cells`).
+/// Pure: no ISA, no model. `AssertUnwindSafe` because the closures borrow
+/// `out` mutably — nothing here observes a panic mid-write.
+#[test]
+fn q_nope2_cells_rejects_bad_shapes() {
+    let whead = [qdot::Q8Block {
+        d: 0x3C00,
+        q: [1; 32],
+    }; 8];
+    let acol = [qdot::ActBlock { d: 1.0, q: [1; 32] }; 2];
+    let mut out = [0.0f32; 4];
+    let run = |j0, j_end, o: &mut [f32]| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            qdot::q_nope2_cells(&whead, &acol, j0, j_end, o)
+        }))
+    };
+    run(5, 4, &mut out).expect_err("j0 > j_end must panic");
+    run(0, 5, &mut out).expect_err("j_end past whead must panic");
+    run(0, 4, &mut out[..3]).expect_err("short out must panic");
+    // The legal boundary: j_end at the last cell with exactly-sized out.
+    run(0, 4, &mut out).expect("legal shape must not panic");
+}

@@ -525,14 +525,11 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
 
 // --------------------------------------------------------------- q_nope2
 
-/// One Q8_0 block over 32 values: f16-stored scale, int8 codes. `pub` because
-/// [`Derived`](crate::derived::Derived) stores these and the gate byte-compares
-/// them; equality on this type is equality of every byte it holds.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Q8Block {
-    d: u16,
-    q: [i8; 32],
-}
+// `Q8Block` moved to qdot with the cell kernel that consumes it (MUL-38);
+// re-exported here so `Derived`'s storage, the gates' `assert_eq!` and the
+// 34-byte size assertion (`tests/derived.rs`) keep compiling unchanged.
+// Field-wise equality on the type is equality of every byte it holds.
+pub use qdot::Q8Block;
 
 /// The weight requant the reference's `wk_b` cast runs: `quantize_row_q8_0`, x86
 /// branch (ggml-quants.c:938+): `d = amax/127` stored f16, `id = 127/amax` — a
@@ -558,13 +555,9 @@ pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
     }
 }
 
-/// One activation block in the format ik's small-M kernels consume (`block_q8_2`):
-/// the scale as **bf16**, int8 codes.
-#[derive(Clone, Copy)]
-struct ActBlock {
-    d: f32,
-    q: [i8; 32],
-}
+// `ActBlock` moved to qdot with the cell kernel (MUL-38); the quantizer
+// below still owns its conventions — the scale as **bf16**, int8 codes.
+use qdot::ActBlock;
 
 /// `ggml_compute_fp32_to_bf16` (ggml-impl.h:106): round-to-nearest-even via the carry
 /// trick. NaN cannot reach the gated graph.
@@ -610,7 +603,9 @@ fn quantize_act(x: &[f32]) -> ActBlock {
 /// activation itself, into its small-M `block_q8_2` format (see [`quantize_act`]) —
 /// the dot is then a sum over blocks of `f32(f16(dw)) · dq · Σ qw·qq` with an exact
 /// i32 inner sum. The block sum accumulates in f64: ggml's f32 SIMD lane order
-/// differs in its last ulp; ours is the exact sum.
+/// differs in its last ulp; ours is the exact sum. Since MUL-38 the i32 inner
+/// sum runs in qdot's AVX2 maddubs kernel — bit-identical to the scalar form
+/// by integer associativity (the argument and its gate: crates/qdot, MUL-38).
 ///
 /// The (column, row) cell space runs on the resident pool (MUL-33). Each output
 /// cell depends only on its own weight blocks and its column's quantized
@@ -694,8 +689,11 @@ pub fn q_nope2_absorbed(
     // space, so no two participants alias. The pool's completion protocol
     // publishes the writes before this function reads `out`, the same
     // ordering that publishes the matmul job slot. The per-cell arithmetic
-    // is untouched from the serial loop this replaced; `tests/mt.rs` holds
-    // the whole claim as a byte compare across thread counts.
+    // runs in qdot's cell kernel (MUL-38): its SIMD is integer-exact by
+    // associativity and its f64 block-sum epilogue is this loop's own
+    // expression and order, so every cell is bit-identical to the serial
+    // loop the kernel replaced — `tests/mt.rs` still holds the whole claim
+    // as a byte compare across thread counts.
     let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
     let latent = p.latent;
     let ne1 = q.ne1;
@@ -703,6 +701,12 @@ pub fn q_nope2_absorbed(
         Mutex::new(Vec::with_capacity(threads::pool().threads()));
     threads::pool().for_each_chunk(p.n_head * ne1 * latent, |cells| {
         let mut acc = profile::CallAcc::new();
+        // Per-worker scratch (MUL-38): qdot's kernel writes a segment's
+        // cells here and they then go to `out` through `SharedOut::write` —
+        // the one-cell method is what keeps this closure capturing a
+        // `&Sync` type (see `SharedOut`'s doc). One latent-wide f32 run per
+        // column segment, reused across the chunk's segments.
+        let mut cellbuf = vec![0.0f32; latent];
         // Walk the chunk column-segment-wise: a chunk may start mid-column
         // and end mid-column, so each iteration takes the intersection of the
         // remaining chunk and one column — `whead`/`qcol` are then fetched
@@ -716,20 +720,21 @@ pub fn q_nope2_absorbed(
             let whead = &wblocks[h * span..(h + 1) * span];
             let qcol = &qall[col * nblocks..(col + 1) * nblocks];
             let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
-            for j in j0..j_end {
-                let mut cell = 0.0f64;
-                for (b, qb) in qcol.iter().enumerate() {
-                    let wb = &whead[j * nblocks + b];
-                    let mut isum = 0i32;
-                    for l in 0..32 {
-                        isum += wb.q[l] as i32 * qb.q[l] as i32;
-                    }
-                    cell += (half_to_f32(wb.d) * qb.d) as f64 * f64::from(isum);
-                }
-                // SAFETY: cell `col * latent + j` belongs to this chunk's
-                // range of the cell split alone — see the construction-site
-                // comment above.
-                unsafe { out_ptr.write(col * latent + j, cell as f32) };
+            // MUL-38: the segment's per-block i32 dots run in qdot's AVX2
+            // maddubs kernel — the Q6_K qY sign fold (weight magnitude on
+            // the u8 side, weight sign folded into the activation bytes; no
+            // +128 prepare, no compensation sum, no reachable saturation).
+            // Integer associativity makes the lane order free and the
+            // kernel's f64 epilogue is the loop's own, so the cells are
+            // bit-identical to the scalar form — the argument and its gate
+            // live in crates/qdot (MUL-38 section).
+            let seg = &mut cellbuf[..j_end - j0];
+            qdot::q_nope2_cells(whead, qcol, j0, j_end, seg);
+            for (jj, &v) in seg.iter().enumerate() {
+                // SAFETY: cell `col * latent + j0 + jj` belongs to this
+                // chunk's range of the cell split alone — see the
+                // construction-site comment above.
+                unsafe { out_ptr.write(col * latent + j0 + jj, v) };
             }
             if let Some(t_dot) = t_dot {
                 acc.add_dot(t_dot.elapsed().as_nanos() as u64);
