@@ -1,5 +1,5 @@
-//! qdot — the fused quantized row dot for the host CPU: Q3_K x Q8_K and
-//! Q4_K x Q8_2_X4.
+//! qdot — the fused quantized row dot for the host CPU: Q3_K x Q8_K,
+//! Q4_K x Q8_2_X4, and Q5_0 x Q8_2_X4.
 //!
 //! `model::ops::matmul_q` today dequantizes every weight row to f32
 //! (`gguf::quant::dequant_row`), round-trips the activations through the
@@ -38,6 +38,18 @@
 //!     kqv_out-0 by 6.4e-3 against the oracle (gate 5e-3), and carrying two
 //!     Q4_K kernels where the engine can select one invites exactly that
 //!     mistake again.
+//!   * the Q5_0 row dot (MUL-32, 2026-09-20) is ik's
+//!     `mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker, 1>` (iqk_gemm_legacy_quants.cpp:507,
+//!     unpacker at 799, dispatched at 2494/2453 with expected_type_B =
+//!     Q8_2_X4) — found by reading the dispatch, not the traits table, the
+//!     MUL-27 lesson applied from the start. Both tables agree this time
+//!     (ggml.c:767 says vec_dot_type = Q8_2_X4 under __AVX2__ +
+//!     GGML_USE_IQK_MULMAT), so the activation encoder is the SAME
+//!     `quantize_row_q8_2_x4` port the Q4_K round landed — no new coder.
+//!     The weight side differs in kind: legacy 32-value blocks
+//!     (block_q5_0), codes left UNSIGNED (0..31) with the -16 offset
+//!     carried by the min path (-16 * d_w * d_a * raw-sum), which is what
+//!     ScaleHelperQ_0_1<16> + ScaleHelperQ8_2 + AccumT<MinusType1> compute.
 //!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108. Weight element 128c+32f+l
@@ -72,6 +84,16 @@ const Q8K_STRIDE: usize = 296;
 /// same number as Q4K_BLOCK is coincidence: one is per 256 WEIGHT values,
 /// the other per 128 ACTIVATION values.
 const Q82X4_STRIDE: usize = 144;
+/// `sizeof(block_q5_0)` (ggml-common.h:198): d f16 @0, qh u8[4] @2 (the
+/// 5th bits), qs u8[16] @6 (low/high nibble pairs) — 22 bytes / 32 values.
+const Q5F0_BLOCK: usize = 22;
+/// `sizeof(block_q8_2)`: d bf16 u16 @0, s raw i16 @2, qs s8[32] @4 — 36
+/// bytes. ik's `quantize_row_q8_1_x4_T<block_q8_2, block_q8_2_x4>` stores
+/// the blocks of a k % 32 (not % 128) column PAST the last whole x4 group
+/// in this plain form (`if (i < nb4) ... else y[i]`, iqk_quantize.cpp:1120),
+/// and the kernel's tail path indexes them the same way — `y + i` in
+/// block_q8_2 units lands at 144*(nb/4) + 36*(i - nb4) exactly.
+const Q82_BLOCK: usize = 36;
 
 // ----------------------------------------------------------- public errors
 
@@ -81,10 +103,13 @@ const Q82X4_STRIDE: usize = 144;
 /// wrong values, and this API rejects that class instead of panicking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QdotError {
-    /// The weight type has no fused kernel in this build (Q3_K only for now).
+    /// The weight type has no fused kernel in this build (Q3_K/Q4_K/Q5_0
+    /// for now).
     UnsupportedType(GgmlType),
-    /// `k` is not a multiple of 256; Q3_K x Q8_K works on whole super-blocks.
-    UnalignedK { k: usize },
+    /// `k` is not a multiple of the weight type's block size; every kernel
+    /// works on whole blocks (`gran` carries the modulus — 256 for the
+    /// K-quants' super-blocks, 32 for Q5_0's legacy blocks).
+    UnalignedK { k: usize, gran: usize },
     /// The weight row is shorter than `k` values implies.
     ShortWeightRow { have: usize, need: usize, k: usize },
     /// The activation column is shorter than `k` values implies.
@@ -100,10 +125,19 @@ impl fmt::Display for QdotError {
                     "no fused qdot kernel for weight type {w:?} in this build"
                 )
             }
-            QdotError::UnalignedK { k } => write!(
-                f,
-                "k = {k}: qdot rows are whole 256-value super-blocks (k % 256 != 0)"
-            ),
+            QdotError::UnalignedK { k, gran } => {
+                if *gran == 256 {
+                    write!(
+                        f,
+                        "k = {k}: qdot rows are whole 256-value super-blocks (k % 256 != 0)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "k = {k}: qdot rows are whole {gran}-value blocks (k % {gran} != 0)"
+                    )
+                }
+            }
             QdotError::ShortWeightRow { have, need, k } => {
                 write!(f, "weight row is {have} bytes, k = {k} needs {need}")
             }
@@ -125,7 +159,11 @@ impl std::error::Error for QdotError {}
 /// — the box is Zen 3: AVX2/FMA3/F16C/BMI2, no AVX-512, no VNNI). FMA is not
 /// used (the f32 scaling is plain multiplies, so the scalar mirror can match
 /// bit for bit) and the f16 read is an integer conversion, so `avx2` alone
-/// is the requirement.
+/// is the Q3_K/Q4_K requirement. Q5_0 (MUL-32) adds F16C for its WEIGHT
+/// scales (`_mm_cvtph_ps`, ik's own instruction there — measured 8.0 vs
+/// 13.2 GB/s against the branchy scalar conversion); every AVX2 machine
+/// carries F16C, `dot_row` detects it anyway, and the scalar mirror serves
+/// the type if it is somehow absent.
 pub fn supports(w: GgmlType) -> bool {
     // Q4_K is wired as of 2026-09-20 (MUL-27): its pairing is q8_2_x4 —
     // ik's dispatch is `mul_mat_qX_K_q8_2_X4_T<DequantizerQ4K_AVX2>`
@@ -135,28 +173,69 @@ pub fn supports(w: GgmlType) -> bool {
     // it moved kqv_out-0 by 6.4e-3 against the oracle (gate 5e-3) — an
     // activation-format delta, not a bug. That kernel is gone; its dump
     // (q4k-ik-dot.txt) stays in BLOOMERY_DATA as the round's record.
-    matches!(w, GgmlType::Q3_K | GgmlType::Q4_K) && std::arch::is_x86_feature_detected!("avx2")
+    //
+    // Q5_0 is wired as of 2026-09-20 (MUL-32), same lesson applied from
+    // the start: ik's dispatch is `mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker>`
+    // (iqk_gemm_legacy_quants.cpp:2494 -> 507) with expected_type_B =
+    // GGML_TYPE_Q8_2_X4 — and this time the traits table agrees
+    // (ggml.c:767, vec_dot_type = Q8_2_X4 under __AVX2__ + IQK_MULMAT).
+    matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0)
+        && std::arch::is_x86_feature_detected!("avx2")
+}
+
+/// The `k` contract of `w`'s fused path: `k` must be a multiple of the
+/// weight format's block size. One number per type, owned here so the
+/// engine's wiring condition and `col_bytes`/`check_row` cannot disagree:
+///
+/// | type | granularity | why |
+/// |---|---|---|
+/// | Q3_K, Q4_K | 256 | the K-quant super-block the dequant consumes |
+/// | Q5_0 | 32 | the legacy block (block_q5_0) |
+///
+/// MUL-32 (2026-09-20): the model's every Q5_0 site is ffn_down_exps with
+/// k = 1408 = 44 x 32 — NOT a multiple of 256 — so the single 256-value
+/// contract the crate carried would never fire on its largest stage-table
+/// site (23.1 ms/step, 32.5% of wall). This is the Q5_0 contract being
+/// ADDED, not the other types' being relaxed: Q3_K/Q4_K still demand whole
+/// 256-value super-blocks, and their kernels' shapes are untouched.
+pub fn k_granularity(w: GgmlType) -> usize {
+    match w {
+        GgmlType::Q5_0 => 32,
+        _ => 256,
+    }
 }
 
 /// Bytes one quantized activation column of `k` values occupies in `w`'s
 /// format: Q3_K pairs q8_K (`k / 256` blocks of 296 bytes), Q4_K pairs
-/// q8_2_x4 (`k / 128` groups of 144 bytes).
+/// q8_2_x4 (`k / 128` groups of 144 bytes), Q5_0 pairs q8_2_x4 with ik's
+/// tail convention (`k / 128` groups of 144 bytes plus `(k % 128) / 32`
+/// plain 36-byte blocks — see `Q82_BLOCK`).
 ///
-/// Panics if `w` has no activation format in this build or `k % 256 != 0` —
-/// both are caller constants at allocation time, and a made-up size for a
-/// partial block would allocate a buffer `quantize_col` cannot fill. (The
-/// x4 layout itself only needs `k % 128`; the 256 contract is the WEIGHT
-/// super-block's, and `dot_row` enforces the same one.)
+/// Panics if `w` has no activation format in this build or `k` breaks the
+/// type's [`k_granularity`] contract — both are caller constants at
+/// allocation time, and a made-up size for a partial block would allocate
+/// a buffer `quantize_col` cannot fill. (The x4 layout itself only needs
+/// `k % 128`; Q4_K's 256 contract is the WEIGHT super-block's, and
+/// `dot_row` enforces the same one.)
 pub fn col_bytes(w: GgmlType, k: usize) -> usize {
     assert!(
-        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K),
+        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0),
         "qdot has no activation format for {w:?} in this build"
     );
-    assert!(
-        k.is_multiple_of(256),
-        "qdot activation columns are whole 256-value super-blocks, k = {k}"
-    );
+    let gran = k_granularity(w);
+    if gran == 256 {
+        assert!(
+            k.is_multiple_of(256),
+            "qdot activation columns are whole 256-value super-blocks, k = {k}"
+        );
+    } else {
+        assert!(
+            k.is_multiple_of(gran),
+            "qdot activation columns are whole {gran}-value blocks ({w:?}), k = {k}"
+        );
+    }
     match w {
+        GgmlType::Q5_0 => (k / 128) * Q82X4_STRIDE + ((k % 128) / 32) * Q82_BLOCK,
         GgmlType::Q4_K => (k / 128) * Q82X4_STRIDE,
         _ => (k / 256) * Q8K_STRIDE,
     }
@@ -173,25 +252,30 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
 /// representations; the gate checks that bit for bit (`tests/qdot.rs`,
 /// gate 1).
 ///
-/// Q4_K: port of the `__x86_64__` branch of ik's `quantize_row_q8_2_x4`
-/// (iqk_quantize.cpp:1005) — bf16-rounded `d`, `round_ties_even` quants,
-/// raw i16 sums. The gate checks the bytes bit for bit against ik's own
-/// coding of the same column (dump `q4k-x4-ik-dot.txt`).
+/// Q4_K and Q5_0: port of the `__x86_64__` branch of ik's
+/// `quantize_row_q8_2_x4` (iqk_quantize.cpp:1005) — bf16-rounded `d`,
+/// `round_ties_even` quants, raw i16 sums. Q5_0's looser `k % 32` contract
+/// additionally exercises the tail: blocks past the last whole x4 group are
+/// stored as plain 36-byte block_q8_2 (`y[i]` in the C, iqk_quantize.cpp:1120)
+/// — the form ik's own kernel tail path indexes. The gate checks the bytes
+/// bit for bit against ik's own coding of the same column (dump
+/// `q5f0-ik-dot.txt`).
 pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
     assert!(
-        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K),
+        matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0),
         "qdot has no activation format for {w:?} in this build"
     );
+    let gran = k_granularity(w);
     assert!(
-        x.len().is_multiple_of(256),
-        "qdot activation columns are whole 256-value super-blocks, x.len() = {}",
+        x.len().is_multiple_of(gran),
+        "qdot activation columns are whole {gran}-value blocks ({w:?}), x.len() = {}",
         x.len()
     );
     match w {
-        GgmlType::Q4_K => {
+        GgmlType::Q4_K | GgmlType::Q5_0 => {
             assert_eq!(
                 out.len(),
-                (x.len() / 128) * Q82X4_STRIDE,
+                col_bytes(w, x.len()),
                 "out must be col_bytes(w, x.len())"
             );
             quantize_q82x4_col(x, out);
@@ -215,16 +299,24 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
 /// form: `wrow` is the raw row bytes straight out of the GGUF, `acol` is
 /// [`quantize_col`]'s output for the matching `k` values.
 ///
-/// Errors instead of guessing on shapes (`k % 256 != 0`, an unsupported
-/// weight type, or a short buffer is a [`QdotError`], not a panic) — a
-/// partial super-block would compute quietly wrong values, and this API
-/// refuses that. The dispatch is AVX2 when the CPU has it ([`supports`]),
-/// the scalar mirror otherwise; the two agree bit for bit (gate 4).
+/// Errors instead of guessing on shapes (`k` breaking the type's
+/// [`k_granularity`] contract, an unsupported weight type, or a short
+/// buffer is a [`QdotError`], not a panic) — a partial block would compute
+/// quietly wrong values, and this API refuses that. The dispatch is AVX2
+/// when the CPU has it ([`supports`]), the scalar mirror otherwise; the
+/// two agree bit for bit (gate 4).
 pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
     let avx2 =
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
-    match (w, avx2) {
+    // Q5_0's kernel additionally converts the weight scales with F16C
+    // (`_mm_cvtph_ps`, see the kernel's Safety note) — detected, and the
+    // scalar mirror takes the type when it is absent.
+    let hw = match w {
+        GgmlType::Q5_0 => avx2 && std::arch::is_x86_feature_detected!("f16c"),
+        _ => avx2,
+    };
+    match (w, hw) {
         (GgmlType::Q3_K, true) => {
             // SAFETY: AVX2 was just detected; lengths validated by check_row.
             Ok(unsafe { dot_q3k_q8k_avx2(wrow, acol, nb) })
@@ -232,6 +324,11 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
         (GgmlType::Q4_K, true) => {
             // SAFETY: AVX2+FMA were just detected; lengths validated above.
             Ok(unsafe { dot_q4k_q82x4_avx2(wrow, acol, nb) })
+        }
+        (GgmlType::Q5_0, true) => {
+            // SAFETY: AVX2+FMA+F16C were just detected; lengths validated
+            // above.
+            Ok(unsafe { dot_q5f0_q82x4_avx2(wrow, acol, nb) })
         }
         // Unreachable in practice (check_row rejects other types first) but
         // the type system cannot see that; the scalar mirror is the safe
@@ -254,6 +351,7 @@ pub fn dot_row_scalar(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result
 fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     match w {
         GgmlType::Q4_K => dot_q4k_q82x4_emul(wrow, acol, nb),
+        GgmlType::Q5_0 => dot_q5f0_q82x4_emul(wrow, acol, nb),
         _ => dot_q3k_q8k_scalar(wrow, acol, nb),
     }
 }
@@ -265,13 +363,18 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
     assert!(
-        std::arch::is_x86_feature_detected!("avx2"),
-        "dot_row_avx2 called on a CPU without AVX2"
+        std::arch::is_x86_feature_detected!("avx2")
+            && (w != GgmlType::Q5_0 || std::arch::is_x86_feature_detected!("f16c")),
+        "dot_row_avx2 called on a CPU without the kernel's ISA"
     );
     match w {
         GgmlType::Q4_K => {
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_q4k_q82x4_avx2(wrow, acol, nb) })
+        }
+        GgmlType::Q5_0 => {
+            // SAFETY: asserted just above; lengths validated by check_row.
+            Ok(unsafe { dot_q5f0_q82x4_avx2(wrow, acol, nb) })
         }
         _ => {
             // SAFETY: asserted just above; lengths validated by check_row.
@@ -281,21 +384,36 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
 }
 
 /// Shape validation shared by every `dot_row` entry point. Returns the
-/// weight super-block count on success. The supported-type check comes
-/// first so an unsupported type never touches the data.
+/// weight BLOCK count on success — in `w`'s own units (super-blocks for the
+/// K-quants, 32-value blocks for Q5_0); each kernel interprets its `nb`
+/// that way. The supported-type check comes first so an unsupported type
+/// never touches the data.
 fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<usize, QdotError> {
-    if !matches!(w, GgmlType::Q3_K | GgmlType::Q4_K) {
+    if !matches!(w, GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0) {
         return Err(QdotError::UnsupportedType(w));
     }
-    if !k.is_multiple_of(256) {
-        return Err(QdotError::UnalignedK { k });
+    let gran = k_granularity(w);
+    if !k.is_multiple_of(gran) {
+        return Err(QdotError::UnalignedK { k, gran });
     }
-    let nb = k / 256;
-    let need_w = nb
-        * match w {
-            GgmlType::Q4_K => Q4K_BLOCK,
-            _ => Q3K_BLOCK,
-        };
+    let (nb, need_w, need_a) = match w {
+        GgmlType::Q5_0 => {
+            let nb = k / 32;
+            (
+                nb,
+                nb * Q5F0_BLOCK,
+                (k / 128) * Q82X4_STRIDE + ((k % 128) / 32) * Q82_BLOCK,
+            )
+        }
+        GgmlType::Q4_K => {
+            let nb = k / 256;
+            (nb, nb * Q4K_BLOCK, nb * 2 * Q82X4_STRIDE)
+        }
+        _ => {
+            let nb = k / 256;
+            (nb, nb * Q3K_BLOCK, nb * Q8K_STRIDE)
+        }
+    };
     if wrow_len < need_w {
         return Err(QdotError::ShortWeightRow {
             have: wrow_len,
@@ -303,11 +421,6 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
             k,
         });
     }
-    let need_a = nb
-        * match w {
-            GgmlType::Q4_K => 2 * Q82X4_STRIDE,
-            _ => Q8K_STRIDE,
-        };
     if acol_len < need_a {
         return Err(QdotError::ShortActivationCol {
             have: acol_len,
@@ -758,13 +871,20 @@ fn bf16_bits_to_f32(h: u16) -> f32 {
 /// RAW i16 integer sum (see the section header). Blocks 4g..4g+4 interleave
 /// into one x4 group: d u16[8] (scales then sums), qs s8[128].
 ///
+/// Tail blocks (MUL-32): when k is a multiple of 32 but not 128, the C's
+/// `if (i < nb4) ... else y[i]` stores the leftover blocks PAST the last
+/// whole group as plain 36-byte block_q8_2 — d @0, raw i16 sum @2, qs @4 —
+/// at byte offset 144*(k/128) + 36*(i - nb4). Same arithmetic, different
+/// container; ik's kernel tail path indexes them exactly there.
+///
 /// Assumes finite activations (the oracle dumps are): the C's SIMD max/NaN
 /// lanes and a NaN's f32->i8 conversion have no scalar meaning worth
 /// mirroring, and a NaN here would fail the byte-identity gate loudly
 /// anyway.
 fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
     let (blocks, _) = x.as_chunks::<32>();
-    let (groups, _) = out.as_chunks_mut::<Q82X4_STRIDE>();
+    let nb4 = 4 * (blocks.len() / 4);
+    let (groups, _) = out[..nb4 / 4 * Q82X4_STRIDE].as_chunks_mut::<Q82X4_STRIDE>();
     for (gi, group) in groups.iter_mut().enumerate() {
         group.fill(0);
         for ir in 0..4 {
@@ -786,6 +906,25 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
             }
             group[8 + 2 * ir..8 + 2 * ir + 2].copy_from_slice(&(isum as i16).to_le_bytes());
         }
+    }
+    for (t, xb) in blocks[nb4..].iter().enumerate() {
+        let tb = &mut out[nb4 / 4 * Q82X4_STRIDE + t * Q82_BLOCK..][..Q82_BLOCK];
+        let mut amax = 0.0f32;
+        for &v in xb {
+            amax = amax.max(v.abs());
+        }
+        let b = fp32_to_bf16_bits(amax / 127.0);
+        let d = bf16_bits_to_f32(b);
+        tb[0..2].copy_from_slice(&b.to_le_bytes());
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let qs = &mut tb[4..36];
+        let mut isum = 0i32;
+        for (m, &v) in xb.iter().enumerate() {
+            let q = (v * id).round_ties_even() as i32 as i8;
+            qs[m] = q as u8;
+            isum += q as i32;
+        }
+        tb[2..4].copy_from_slice(&(isum as i16).to_le_bytes());
     }
 }
 
@@ -1202,4 +1341,436 @@ fn dot_q4k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         accd[3] + accd[7],
     ];
     (t[0] + t[2]) + (t[1] + t[3])
+}
+
+// --------------------------------------------------------- Q5_0 x Q8_2_X4
+// MUL-32 (2026-09-20). Port of ik's `mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker,
+// 1>` (iqk_gemm_legacy_quants.cpp:507; unpacker 799, dispatch 2494/2453,
+// expected_type_B = Q8_2_X4 at 2482) — the pairing the oracle dispatches at
+// decode (Ny = 1; the nrc_y >= 32 repack path `is_dequant_better` selects,
+// Q8_0_R8 via iqk_convert_qX_q80_r8, is a prefill shape this engine's
+// decode never runs). The activation side is the SAME q8_2_x4 coding the
+// Q4_K round ported (`quantize_q82x4_col`, now with the tail blocks);
+// nothing new was written there, and gate 0 re-checks the bytes against
+// ik's own coder (`tools/ref/q5f0_ref.cpp` dumps both).
+//
+// The arithmetic shape differs from Q4_K's kernel in kind:
+//   * the weight codes stay UNSIGNED 0..31 (Q5_1_Dequantizer<block_q5_0>:
+//     nibble | (qh bit << 4), iqk_gemm_legacy_quants.cpp:676) — maddubs
+//     takes them as the u8 operand directly, no sign tricks;
+//   * the -16 offset of the q5_0 decode rides the MIN path: per block,
+//     sum((code-16)*qa) = sum(code*qa) - 16*sum(qa), and sum(qa) is the
+//     raw i16 the encoder stored. ScaleHelperQ_0_1<16>::prepare4 makes the
+//     weight-side pair (d_w, -16.0*d_w); ScaleHelperQ8_2 + convert_scales
+//     make the activation-side (d_a, d_a*m_a); AccumT<MinusType1>:
+//     accm[l] += (-16*d_w[l]) * (d_a[l]*m_a[l]) per group, dall = d_w*d_a
+//     broadcast, acc = fmadd(dall, i32->f32(pall), acc);
+//   * the integer combine is an epi32 unpack chain on the madd outputs
+//     (Sum4<..., UnsignedDot, can_pack=false>, iqk_gemm_legacy_quants.cpp:56)
+//     — i32 lanes, not the i16 chain the Q4_K x4 kernel uses;
+//   * the final reduction is MinusType1::result: sum = lo128(acc)+hi128(acc),
+//     then hsum_float_4(sum + accm) (iqk_common.h:225) — the reduction
+//     ORDER is load-bearing for the mirror's bit identity, as always.
+//
+// `#[target_feature]` is not optional (the MUL-26 lesson): without it LLVM
+// legalizes the 256-bit intrinsic bodies for the SSE2 baseline. FMA is
+// required (one fmadd per group/tail block); the mirror reproduces it with
+// `f32::mul_add`. F16C is required for the weight scales (`_mm_cvtph_ps`).
+//
+// Scheduling measurements (2026-09-20, same round, box, single core
+// taskset -c 0, 360,448 rows x 968 B, qdot-rate vs ik's own kernel via
+// tools/ref/q5f0_rate.cpp, both runs within 0.1 GB/s):
+//
+// | form | GB/s |
+// |---|---|
+// | scalar `f16_bits_to_f32` x4 per group (branchy subnormal/NaN paths) | 8.0 |
+// | + named locals for qx/dw (no [__m256i; 4] indexing) | 8.0 |
+// | + one `_mm_cvtph_ps` for the four scales (this form) | 13.2 |
+// | ik's own kernel (gcc -O2 -mavx2, same shape) | 14.5 |
+//
+// The scale conversion was the whole first gap — 44 branchy scalar
+// conversions per 968-byte row is op pressure the hardware instruction
+// removes in one. The residual 13.2 vs 14.5 is codegen (same intrinsics,
+// same order), the same regime as the Q4_K round's 14.1 vs 16.3-17.1, and
+// the engine's DRAM-bound regime (4.6 GB/s/thread) sits three times below
+// either number.
+
+/// `HBitDequantizer`'s three constants (iqk_gemm_legacy_quants.cpp:660):
+/// the shuffle broadcasts qh byte j/8 to byte j of 32, the mask clears
+/// exactly bit j%8 of byte j, and minus1 is the all-0xFF cmpeq reference —
+/// so `cmpeq((shuffle | mask), 0xFF)` tests qh bit j, weight value j's 5th
+/// bit. Built once per row (the C constructs its unpacker's dequantizer
+/// once per call, constants included).
+struct Q5F0HBit {
+    shuffle: __m256i,
+    mask: __m256i,
+    minus1: __m256i,
+}
+
+/// One 32-value weight block's codes as UNSIGNED bytes 0..31:
+/// `Dequantizer4bit::dequant(qs)` (nibble split — low nibbles are values
+/// 0..15, high nibbles 16..31) OR'd with `Q5_1_Dequantizer<block_q5_0>`'s
+/// high bits (0x10 where the qh bit is set).
+///
+/// # Safety
+/// `blk` must hold 22 readable bytes (the caller slices a validated row).
+#[inline(always)]
+unsafe fn q5f0_codes(blk: &[u8], m4: __m256i, mh: __m256i, hb: &Q5F0HBit) -> __m256i {
+    unsafe {
+        // SAFETY: 16 readable bytes inside the 22-byte block.
+        let aux128 = _mm_loadu_si128(blk.as_ptr().add(6) as *const __m128i);
+        let nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16::<4>(aux128), aux128), m4);
+        // qh u32 @2 -> 32 one-bit bytes.
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        let bits = _mm256_or_si256(
+            // SAFETY: register-only intrinsic on a broadcast register.
+            _mm256_shuffle_epi8(_mm256_set1_epi32(qh as i32), hb.shuffle),
+            hb.mask,
+        );
+        let high = _mm256_and_si256(_mm256_cmpeq_epi8(bits, hb.minus1), mh);
+        _mm256_or_si256(nib, high)
+    }
+}
+
+/// Port of `mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker, 1>` reduced to
+/// `matmul_q`'s shape: one weight row against one q8_2_x4 activation
+/// column, nb = the 32-value weight block count. The template's nrc_x loop
+/// is the caller's row loop and nrc_y = 1; everything else is the C's
+/// arithmetic, non-FANCY branch, both the nb%4==0 group path and the tail
+/// path (`AccumT<MinusType1, 1, is_multiple_of_4>`, the 0.25-spread min
+/// correction included).
+///
+/// # Safety
+/// The CPU must support AVX2+FMA+F16C, and the caller must have validated
+/// lengths: `wrow` at nb*22 readable bytes, `acol` at
+/// (k/128)*144 + ((k%128)/32)*36 readable bytes (`check_row` does).
+/// F16C is this kernel's one addition to the crate's ISA surface: the
+/// weight scales convert through `_mm_cvtph_ps` (ik's own instruction
+/// there), and every AVX2 machine carries F16C (Ivy Bridge predates
+/// Haswell's AVX2) — `dot_row` still detects it rather than assuming.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_q5f0_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    // SAFETY: AVX2+FMA present (checked by dot_row) and both slices hold
+    // the validated lengths — nb*22 weight bytes and the matching activation
+    // column — per the fn contract; the pointer arithmetic below stays
+    // inside them, with the reasoning repeated at each load.
+    unsafe {
+        let m4 = _mm256_set1_epi8(0xF);
+        let mh = _mm256_set1_epi8(0x10);
+        let hb = Q5F0HBit {
+            shuffle: _mm256_set_epi64x(
+                0x0303_0303_0303_0303,
+                0x0202_0202_0202_0202,
+                0x0101_0101_0101_0101,
+                0x0000_0000_0000_0000,
+            ),
+            mask: _mm256_set1_epi64x(0x7fbf_dfef_f7fb_fdfe),
+            minus1: _mm256_set1_epi64x(-1),
+        };
+        let m1 = _mm256_set1_epi16(1);
+        let min16 = _mm_set1_ps(-16.0f32);
+        let mut acc = _mm256_setzero_ps();
+        let mut accm = _mm_setzero_ps();
+
+        let nbg = nb / 4;
+        for i in 0..nbg {
+            // Weight side: four blocks' codes plus their f16 scales
+            // gathered into one __m128 (the C's scales8[4] + cvtph_ps; the
+            // f16->f32 conversion is exact, so building it lane-wise from
+            // the same values is the same register). Named locals, NOT an
+            // array: an indexed [__m256i; 4] lives in memory and the
+            // register file walks the stack for every use — the MUL-27
+            // lesson. The scale gather is ONE `_mm_cvtph_ps`, exactly the
+            // C's scales8[4] + cvtph_ps: measured 8.0 vs ik's 14.4 GB/s
+            // when the four conversions went through the branchy scalar
+            // `f16_bits_to_f32` instead (its subnormal loop and NaN branch
+            // are per-lane work the hardware instruction does in one op).
+            let b0 = (4 * i) * Q5F0_BLOCK;
+            let b1 = (4 * i + 1) * Q5F0_BLOCK;
+            let b2 = (4 * i + 2) * Q5F0_BLOCK;
+            let b3 = (4 * i + 3) * Q5F0_BLOCK;
+            let qx0 = q5f0_codes(&wrow[b0..b0 + Q5F0_BLOCK], m4, mh, &hb);
+            let qx1 = q5f0_codes(&wrow[b1..b1 + Q5F0_BLOCK], m4, mh, &hb);
+            let qx2 = q5f0_codes(&wrow[b2..b2 + Q5F0_BLOCK], m4, mh, &hb);
+            let qx3 = q5f0_codes(&wrow[b3..b3 + Q5F0_BLOCK], m4, mh, &hb);
+            // SAFETY: 8 readable bytes inside the validated row: the four
+            // blocks' f16 d values, gathered exactly as the C gathers them.
+            let mut scales8 = [0u8; 8];
+            scales8[0..2].copy_from_slice(&wrow[b0..b0 + 2]);
+            scales8[2..4].copy_from_slice(&wrow[b1..b1 + 2]);
+            scales8[4..6].copy_from_slice(&wrow[b2..b2 + 2]);
+            scales8[6..8].copy_from_slice(&wrow[b3..b3 + 2]);
+            let s4 = _mm_cvtph_ps(_mm_loadl_epi64(scales8.as_ptr() as *const __m128i));
+            // other = (lo: d_w, hi: -16.0 * d_w) — ScaleHelperQ_0_1<16>.
+            let other = _mm256_set_m128(_mm_mul_ps(s4, min16), s4);
+
+            // Activation group i: convert_scales (iqk_legacy:132) —
+            // bf16 scales as bits<<16, i16 sums sign-extended to f32.
+            // SAFETY: 8 readable bytes at the head of the validated group.
+            let g = acol.as_ptr().add(i * Q82X4_STRIDE);
+            let aux_d = _mm_castsi128_ps(_mm_slli_epi32::<16>(_mm_cvtepu16_epi32(
+                _mm_loadl_epi64(g as *const __m128i),
+            )));
+            // SAFETY: 8 readable bytes at offset 8 of the group.
+            let aux_m = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(_mm_loadl_epi64(
+                g.add(8) as *const __m128i
+            )));
+            // prep = (lo: d_a, hi: d_a * m_a).
+            let prep = _mm256_set_m128(_mm_mul_ps(aux_d, aux_m), aux_d);
+            // s12 = other * prep — lo: d_w*d_a, hi: (-16*d_w)*(d_a*m_a).
+            let s12 = _mm256_mul_ps(other, prep);
+            // MinusType1: accm += hi; dall = lo broadcast to both halves.
+            accm = _mm_add_ps(accm, _mm256_extractf128_ps(s12, 1));
+            let lo = _mm256_castps256_ps128(s12);
+            let dall = _mm256_set_m128(lo, lo);
+
+            // Sum4<UnsignedDot, can_pack=false>: four maddubs->madd, then
+            // the epi32 unpack chain. The four integer chains issue first
+            // (independent work), the group's one fmadd last — the C's
+            // order, kept for the mirror's bit identity.
+            // SAFETY: 32 readable bytes at each offset inside the group
+            // (144-byte groups validated by check_row).
+            let p0 = _mm256_madd_epi16(
+                m1,
+                _mm256_maddubs_epi16(qx0, _mm256_loadu_si256(g.add(16) as *const __m256i)),
+            );
+            let p1 = _mm256_madd_epi16(
+                m1,
+                _mm256_maddubs_epi16(qx1, _mm256_loadu_si256(g.add(48) as *const __m256i)),
+            );
+            let p2 = _mm256_madd_epi16(
+                m1,
+                _mm256_maddubs_epi16(qx2, _mm256_loadu_si256(g.add(80) as *const __m256i)),
+            );
+            let p3 = _mm256_madd_epi16(
+                m1,
+                _mm256_maddubs_epi16(qx3, _mm256_loadu_si256(g.add(112) as *const __m256i)),
+            );
+            let p01 =
+                _mm256_add_epi32(_mm256_unpacklo_epi32(p0, p1), _mm256_unpackhi_epi32(p0, p1));
+            let p23 =
+                _mm256_add_epi32(_mm256_unpacklo_epi32(p2, p3), _mm256_unpackhi_epi32(p2, p3));
+            let pall = _mm256_add_epi32(
+                _mm256_unpacklo_epi64(p01, p23),
+                _mm256_unpackhi_epi64(p01, p23),
+            );
+            acc = _mm256_fmadd_ps(dall, _mm256_cvtepi32_ps(pall), acc);
+        }
+
+        // Tail blocks (nb % 4 != 0): AccumT's prepare1 path. The min
+        // correction is spread as 0.25 per lane (MinusType1's scalar
+        // compute), so the final horizontal sum over 4 lanes recovers the
+        // whole amount — replicate the exact arithmetic, not a tidier one.
+        let nb4 = 4 * nbg;
+        for i in nb4..nb {
+            let b = i * Q5F0_BLOCK;
+            let wb = &wrow[b..b + Q5F0_BLOCK];
+            let dw = f16_bits_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+            let qx0 = q5f0_codes(wb, m4, mh, &hb);
+            let tb = nb4 / 4 * Q82X4_STRIDE + (i - nb4) * Q82_BLOCK;
+            let da = bf16_bits_to_f32(u16::from_le_bytes([acol[tb], acol[tb + 1]]));
+            let ma = i16::from_le_bytes([acol[tb + 2], acol[tb + 3]]) as f32;
+            // s12 = (dw*da, (-16.0*dw) * (da*ma)); MinusType1 keeps
+            // dm.second*0.25f per lane and returns dm.first.
+            let d = dw * da;
+            let corr = (-16.0f32 * dw) * (da * ma) * 0.25f32;
+            accm = _mm_add_ps(accm, _mm_set1_ps(corr));
+            // SAFETY: 32 readable bytes at offset 4 of the tail block.
+            let qs = _mm256_loadu_si256(acol.as_ptr().add(tb + 4) as *const __m256i);
+            let p0 = _mm256_madd_epi16(m1, _mm256_maddubs_epi16(qx0, qs));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(p0), acc);
+        }
+
+        // MinusType1::result: sum = lo128(acc)+hi128(acc), hsum_float_4 of
+        // sum + accm (iqk_common.h:225 — movehl then movehdup).
+        let sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        let x = _mm_add_ps(sum, accm);
+        let x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+        _mm_cvtss_f32(_mm_add_ss(x, _mm_movehdup_ps(x)))
+    }
+}
+
+// The instruction-graph emulator of [`dot_q5f0_q82x4_avx2`] — safe Rust, no
+// ISA requirement, every operation in Intel's exact semantics, same regime
+// as the Q4_K round: the mirror matches the kernel bit for bit by
+// construction, and the kernel must agree with IK'S OWN Q5_0 kernel to
+// within 1 ULP on real rows (gate B, dump `q5f0-ik-dot.txt`). The epi32
+// unpack chain here is on I32 lanes — distinct from the i16-lane emulators
+// the Q4_K round wrote for its pack chain — so it gets its own helpers.
+
+/// `_mm256_unpacklo_epi32` on i32 lanes: per 128-bit half, interleave the
+/// low two dwords of a and b.
+#[inline]
+fn emul_unpacklo_epi32_i32(a: [i32; 8], b: [i32; 8]) -> [i32; 8] {
+    let mut r = [0i32; 8];
+    for h in 0..2 {
+        let o = 4 * h;
+        r[o] = a[o];
+        r[o + 1] = b[o];
+        r[o + 2] = a[o + 1];
+        r[o + 3] = b[o + 1];
+    }
+    r
+}
+
+/// `_mm256_unpackhi_epi32` on i32 lanes: per half, the high two dwords.
+#[inline]
+fn emul_unpackhi_epi32_i32(a: [i32; 8], b: [i32; 8]) -> [i32; 8] {
+    let mut r = [0i32; 8];
+    for h in 0..2 {
+        let o = 4 * h;
+        r[o] = a[o + 2];
+        r[o + 1] = b[o + 2];
+        r[o + 2] = a[o + 3];
+        r[o + 3] = b[o + 3];
+    }
+    r
+}
+
+/// `_mm256_unpacklo_epi64` on i32 lanes: per half, low qword of a then b.
+#[inline]
+fn emul_unpacklo_epi64_i32(a: [i32; 8], b: [i32; 8]) -> [i32; 8] {
+    let mut r = [0i32; 8];
+    for h in 0..2 {
+        let o = 4 * h;
+        r[o..o + 2].copy_from_slice(&a[o..o + 2]);
+        r[o + 2..o + 4].copy_from_slice(&b[o..o + 2]);
+    }
+    r
+}
+
+/// `_mm256_unpackhi_epi64` on i32 lanes: per half, high qword of a then b.
+#[inline]
+fn emul_unpackhi_epi64_i32(a: [i32; 8], b: [i32; 8]) -> [i32; 8] {
+    let mut r = [0i32; 8];
+    for h in 0..2 {
+        let o = 4 * h;
+        r[o..o + 2].copy_from_slice(&a[o + 2..o + 4]);
+        r[o + 2..o + 4].copy_from_slice(&b[o + 2..o + 4]);
+    }
+    r
+}
+
+/// `_mm256_add_epi32`, wrapping.
+#[inline]
+fn emul_add_epi32(a: [i32; 8], b: [i32; 8]) -> [i32; 8] {
+    let mut r = [0i32; 8];
+    for l in 0..8 {
+        r[l] = a[l].wrapping_add(b[l]);
+    }
+    r
+}
+
+/// The scalar decode of one 32-value block's codes — the HBit graph's net
+/// effect (the broadcast/mask/cmpeq dance IS a bit test of qh bit v) plus
+/// the nibble split, byte v = value v's code 0..31.
+#[inline]
+fn q5f0_codes_scalar(blk: &[u8]) -> [u8; 32] {
+    let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+    let nibbles = &blk[6..22];
+    let mut code = [0u8; 32];
+    for (v, c) in code.iter_mut().enumerate() {
+        // Values 0..15 read the low nibble, 16..31 the high nibble of qs
+        // byte v%16 — the Dequantizer4bit split.
+        *c = if v < 16 {
+            nibbles[v] & 0xF
+        } else {
+            nibbles[v - 16] >> 4
+        };
+        // The 5th bit: qh bit v (the HBit broadcast's net effect).
+        if (qh >> v) & 1 != 0 {
+            *c |= 0x10;
+        }
+    }
+    code
+}
+
+/// The emulator: the kernel's graph, one weight row against one q8_2_x4
+/// column, bit-identical to [`dot_q5f0_q82x4_avx2`] by construction — same
+/// operations, same order, `mul_add` where the kernel fuses.
+fn dot_q5f0_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let mut accm = [0.0f32; 4];
+
+    let nbg = nb / 4;
+    for i in 0..nbg {
+        // qx[j]: codes of weight block 4i+j; dw[j]: its f16 scale.
+        let mut qx = [[0u8; 32]; 4];
+        let mut dw = [0.0f32; 4];
+        for j in 0..4 {
+            let wb = &wrow[(4 * i + j) * Q5F0_BLOCK..(4 * i + j + 1) * Q5F0_BLOCK];
+            qx[j] = q5f0_codes_scalar(wb);
+            dw[j] = f16_bits_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+        }
+        let g = &acol[i * Q82X4_STRIDE..(i + 1) * Q82X4_STRIDE];
+        // convert_scales: da[l] bf16->f32 (bits<<16), ma[l] i16->f32.
+        let mut da = [0.0f32; 4];
+        let mut ma = [0.0f32; 4];
+        for l in 0..4 {
+            da[l] = bf16_bits_to_f32(u16::from_le_bytes([g[2 * l], g[2 * l + 1]]));
+            ma[l] = i16::from_le_bytes([g[8 + 2 * l], g[9 + 2 * l]]) as f32;
+        }
+        // s12: lo[j] = dw[j]*da[j], hi[j] = (-16*dw[j])*(da[j]*ma[j]).
+        // MinusType1: accm += hi; dall lanes l and 4+l use lo[l%4].
+        let mut lo = [0.0f32; 4];
+        for l in 0..4 {
+            lo[l] = dw[l] * da[l];
+            accm[l] += (-16.0f32 * dw[l]) * (da[l] * ma[l]);
+        }
+        // Sum4: p_j = emul_madd1(emul_maddubs(qx[j], qs_j)); the epi32
+        // unpack chain; pall lanes land per (block, byte-half).
+        let mut p = [[0i32; 8]; 4];
+        for (j, pj) in p.iter_mut().enumerate() {
+            let mut qs = [0u8; 32];
+            qs.copy_from_slice(&g[16 + 32 * j..16 + 32 * j + 32]);
+            *pj = emul_madd1(emul_maddubs(qx[j], qs));
+        }
+        let p01 = emul_add_epi32(
+            emul_unpacklo_epi32_i32(p[0], p[1]),
+            emul_unpackhi_epi32_i32(p[0], p[1]),
+        );
+        let p23 = emul_add_epi32(
+            emul_unpacklo_epi32_i32(p[2], p[3]),
+            emul_unpackhi_epi32_i32(p[2], p[3]),
+        );
+        let pall = emul_add_epi32(
+            emul_unpacklo_epi64_i32(p01, p23),
+            emul_unpackhi_epi64_i32(p01, p23),
+        );
+        // acc = fmadd(dall, pall, acc) over all 8 lanes.
+        for l in 0..8 {
+            acc[l] = lo[l % 4].mul_add(pall[l] as f32, acc[l]);
+        }
+    }
+
+    // Tail blocks — the 0.25-spread min correction, 4 lanes each.
+    let nb4 = 4 * nbg;
+    for i in nb4..nb {
+        let wb = &wrow[i * Q5F0_BLOCK..(i + 1) * Q5F0_BLOCK];
+        let dw = f16_bits_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+        let code = q5f0_codes_scalar(wb);
+        let tb = nb4 / 4 * Q82X4_STRIDE + (i - nb4) * Q82_BLOCK;
+        let blk = &acol[tb..tb + Q82_BLOCK];
+        let da = bf16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let ma = i16::from_le_bytes([blk[2], blk[3]]) as f32;
+        let d = dw * da;
+        let corr = (-16.0f32 * dw) * (da * ma) * 0.25f32;
+        for a in &mut accm {
+            *a += corr;
+        }
+        let mut qs = [0u8; 32];
+        qs.copy_from_slice(&blk[4..36]);
+        let p0 = emul_madd1(emul_maddubs(code, qs));
+        for l in 0..8 {
+            acc[l] = d.mul_add(p0[l] as f32, acc[l]);
+        }
+    }
+
+    // MinusType1::result + hsum_float_4: sum[l] = acc[l]+acc[4+l];
+    // x[l] = sum[l]+accm[l]; (x0 + x2) + (x1 + x3).
+    let mut x = [0.0f32; 4];
+    for l in 0..4 {
+        x[l] = (acc[l] + acc[4 + l]) + accm[l];
+    }
+    (x[0] + x[2]) + (x[1] + x[3])
 }
