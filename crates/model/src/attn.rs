@@ -205,6 +205,9 @@ pub fn block_attn_cached(
     if let Some(t_p3) = t_p3 {
         params_ns += t_p3.elapsed().as_nanos() as u64;
     }
+    if x.ne1 == 1 {
+        crate::ops::hint_next(gguf, &[], &[&ap.wo]);
+    }
     let (q_nope2, kqv_compressed, kqv_2d) = attn_heads_fused(
         gguf,
         derived.wk_b_all_heads(block)?,

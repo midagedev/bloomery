@@ -659,6 +659,16 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     // projections. Regrouping only — the same ops on the same inputs, the
     // scatter still accumulates expert-ascending and the combine still adds
     // the shared output last, so no value moves.
+    static PF_DOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pf_down = *PF_DOWN.get_or_init(|| std::env::var("BLOOMERY_PF_DOWN").map_or(true, |v| v != "0"));
+    static PF_NEXT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pf_next = *PF_NEXT.get_or_init(|| std::env::var("BLOOMERY_PF_NEXT").map_or(true, |v| v != "0"));
+    if n_tokens == 1 && pf_down {
+        // The down group's bytes are known as soon as the experts are.
+        let mut ws: Vec<&gguf::TensorInfo> = experts.iter().map(|&e| &plan.down_views[e]).collect();
+        ws.push(&plan.shexp_down);
+        crate::ops::hint_next(gguf, &[], &ws);
+    }
     let gu = gate_up_batch(gguf, plan, &experts, x, &xbs)?;
     let n_e = experts.len();
     // The same swiglu a sequential loop ran per expert, in the same expert
@@ -670,6 +680,9 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
         pars.push(swiglu(&gu[2 * slot], &gu[2 * slot + 1]));
     }
     let shexp_par = swiglu(&gu[2 * n_e], &gu[2 * n_e + 1]);
+    if n_tokens == 1 && pf_next {
+        crate::ops::hint_followup(gguf);
+    }
     let downs_all = down_batch(gguf, plan, &experts, &pars, &shexp_par)?;
     // `split_last` yields (last, rest): the shared down is the group's last
     // output, the routed downs keep expert order in the slice before it.

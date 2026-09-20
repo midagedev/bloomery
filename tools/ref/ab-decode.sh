@@ -13,6 +13,9 @@ N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
 IKBIN=${IKBIN:-/home/user/ik_llama.cpp/build/bin/llama-bench}
 IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
+# BLOOMERY_AB_ENVS="K=V;K=V K2=V2": 현재 트리의 같은 바이너리를 env만 바꿔 팔로 더 넣는다
+# (바이트가 같은 레버의 A/B — 빌드 둘의 링크 배치 차이가 끼지 않는다).
+IFS=';' read -r -a envs <<< "${BLOOMERY_AB_ENVS:-}"
 bins=()
 for d in "$@" "$(basename "$PWD")"; do
   b="$HOME/repo/$d/target/release/bloomery-decode"
@@ -35,6 +38,15 @@ for r in $(seq "$ROUNDS"); do
     med=$(echo "$out" | awk '/^ +[0-9]+ +[0-9]+ +[0-9.]+ /{print $3}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
     [ -n "$toks" ] || { echo "r$r $d produced no decode line" >&2; exit 1; }
     echo "r$r $d | prefill $pre | decode $toks | median ${med} ms"
+  done
+  for e in "${envs[@]}"; do
+    [ -n "$e" ] || continue
+    d=$(basename "$PWD")
+    out=$(env $e "$HOME/repo/$d/target/release/bloomery-decode" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r [$e] FAILED" >&2; exit 1; }
+    toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
+    huge=$(echo "$out" | awk '/^mem +AnonHugePages/{print $3 $4}')
+    [ -n "$toks" ] || { echo "r$r [$e] produced no decode line" >&2; exit 1; }
+    echo "r$r [$e] | decode $toks | AnonHuge ${huge:-?}"
   done
   # ik 팔(BLOOMERY_AB_IK=1): 가장 빠르게 잰 플래그 조합의 llama-bench를 같은 바퀴 안에 끼운다.
   # 막는 실패: 단발 헤드라인 하나를 ik의 다른 임대 숫자와 비교해 "넘었다"고 쓰는 것 —

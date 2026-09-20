@@ -1478,3 +1478,81 @@ fn matmul_q_multi(
     quantized.release_all();
     Ok(outs)
 }
+
+
+// ------------------------------------------------------------ idle prefetch hint
+
+/// `BLOOMERY_PF=0` turns the idle prefetch off (the A/B lever); `BLOOMERY_PF_CAP`
+/// caps one worker's share in KiB (default 1024).
+fn pf_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        if std::env::var("BLOOMERY_PF").is_ok_and(|v| v == "0") {
+            return 0;
+        }
+        std::env::var("BLOOMERY_PF_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1024)
+            * 1024
+    })
+}
+
+/// Tell the idle workers what the next dispatch reads: `ws` in its pair order,
+/// after `skip_ws` pairs this hint does not name (their bytes are not known
+/// yet, or not worth pulling). Decode shape only — the caller decides.
+pub(crate) fn hint_next(gguf: &Gguf, skip_ws: &[&TensorInfo], ws: &[&TensorInfo]) {
+    let cap = pf_cap();
+    if cap == 0 {
+        return;
+    }
+    let mut regs: [&[u8]; threads::MAX_HINT] = [&[]; threads::MAX_HINT];
+    let mut n = 0;
+    let mut bytes = 0usize;
+    for w in ws.iter().take(threads::MAX_HINT) {
+        if let Ok(d) = gguf.data(w) {
+            regs[n] = d;
+            bytes += d.len();
+            n += 1;
+        }
+    }
+    let skip: usize = skip_ws
+        .iter()
+        .map(|w| gguf.data(w).map_or(0, <[u8]>::len))
+        .sum();
+    threads::pool().set_idle_hint(&regs[..n], skip, skip + bytes, cap);
+}
+
+thread_local! {
+    /// What follows the current block's last dispatch: the next block's attention
+    /// projections, or the head. Set by the step loop, read by the FFN.
+    static FOLLOWUP: std::cell::Cell<Option<(*const TensorInfo, *const TensorInfo)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set (or clear) what the step dispatches right after the current block.
+pub(crate) fn set_followup(ws: Option<(&TensorInfo, Option<&TensorInfo>)>) {
+    FOLLOWUP.with(|f| {
+        f.set(ws.map(|(a, b)| {
+            (
+                std::ptr::from_ref(a),
+                b.map_or(std::ptr::null(), std::ptr::from_ref),
+            )
+        }))
+    });
+}
+
+/// Hint the follow-up, if the step loop named one.
+pub(crate) fn hint_followup(gguf: &Gguf) {
+    if let Some((a, b)) = FOLLOWUP.with(std::cell::Cell::get) {
+        // SAFETY: the step loop sets pointers into `Derived`'s plan, which outlives
+        // the step, and clears them before it returns.
+        let a = unsafe { &*a };
+        if b.is_null() {
+            hint_next(gguf, &[], &[a]);
+        } else {
+            // SAFETY: as above.
+            hint_next(gguf, &[], &[a, unsafe { &*b }]);
+        }
+    }
+}

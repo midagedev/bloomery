@@ -24,7 +24,7 @@
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Default spin iterations before a waiting worker parks.
@@ -81,6 +81,55 @@ pub fn pool() -> &'static Pool {
 }
 
 /// The fixed pool of resident workers.
+/// Regions one idle hint can name.
+pub const MAX_HINT: usize = 16;
+
+/// What the workers pull toward their caches while they wait for a dispatch:
+/// the bytes the NEXT dispatch will read. Between dispatches only the caller
+/// runs and the memory bus idles; a decode step is bus-bound inside them.
+/// A seqlock (`generation` odd while the caller writes). A torn or stale read only
+/// prefetches a useless address — a prefetch never faults and never writes.
+struct IdleHint {
+    generation: AtomicU64,
+    n: AtomicUsize,
+    /// Bytes of the next dispatch that lie before region 0, and its total: a
+    /// worker's share is its slice of `0..total`, the way the dispatch will cut it.
+    skip: AtomicUsize,
+    total: AtomicUsize,
+    /// Cap on one worker's share, bytes.
+    cap: AtomicUsize,
+    /// The hint names the dispatch AFTER the one the caller is about to make:
+    /// it arms once a worker has run job `after`. Pulled earlier, the bytes would
+    /// fight the dispatch in between for the bus and lose their cache slot to it.
+    after: AtomicUsize,
+    addr: [AtomicUsize; MAX_HINT],
+    len: [AtomicUsize; MAX_HINT],
+}
+
+impl IdleHint {
+    fn new() -> Self {
+        IdleHint {
+            generation: AtomicU64::new(0),
+            n: AtomicUsize::new(0),
+            skip: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+            cap: AtomicUsize::new(usize::MAX),
+            after: AtomicUsize::new(0),
+            addr: std::array::from_fn(|_| AtomicUsize::new(0)),
+            len: std::array::from_fn(|_| AtomicUsize::new(0)),
+        }
+    }
+}
+
+/// One worker's walk through the current hint.
+struct IdleWalk {
+    generation: u64,
+    /// (address, bytes) still to pull, in order.
+    todo: [(usize, usize); MAX_HINT],
+    n: usize,
+    at: usize,
+}
+
 pub struct Pool {
     nthreads: usize,
     spin: u64,
@@ -88,6 +137,11 @@ pub struct Pool {
     /// siblings — as detected, see `detect_topology`.
     topo: Vec<Vec<u32>>,
     pin_failed: AtomicBool,
+    hint: IdleHint,
+    /// True between a dispatch's barrier and the next dispatch: the bus is the
+    /// caller's alone. Workers pull only then — a finished worker pulling while a
+    /// straggler still streams takes bandwidth from the chunk the barrier waits on.
+    quiet: AtomicBool,
 
     // --- dispatch state -------------------------------------------------
     // `dispatch` serializes `for_each_chunk` calls; the job slot is handed to
@@ -226,6 +280,91 @@ impl Pool {
         }
     }
 
+    /// Name the bytes the next dispatch will read, in the order it will cut them:
+    /// `skip` bytes of that dispatch come before `regions[0]`, and it reads `total`
+    /// in all. Waiting workers prefetch their own slice (at most `cap` bytes each)
+    /// until the next dispatch arrives. Caller-thread only; replaces the last hint.
+    pub fn set_idle_hint(&self, regions: &[&[u8]], skip: usize, total: usize, cap: usize) {
+        let h = &self.hint;
+        let g = h.generation.load(Ordering::Relaxed);
+        h.generation.store(g | 1, Ordering::Release);
+        let n = regions.len().min(MAX_HINT);
+        for (i, r) in regions.iter().take(n).enumerate() {
+            h.addr[i].store(r.as_ptr() as usize, Ordering::Relaxed);
+            h.len[i].store(r.len(), Ordering::Relaxed);
+        }
+        h.n.store(n, Ordering::Relaxed);
+        h.skip.store(skip, Ordering::Relaxed);
+        h.total.store(total, Ordering::Relaxed);
+        h.cap.store(cap, Ordering::Relaxed);
+        h.after.store(self.seq.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+        h.generation.store((g | 1) + 1, Ordering::Release);
+    }
+
+    /// One idle-loop turn of worker `t`: prefetch the next lines of its slice.
+    /// False when there is nothing (left) to pull.
+    #[inline]
+    fn idle_pull(&self, t: usize, seen: usize, w: &mut IdleWalk) -> bool {
+        let h = &self.hint;
+        if !self.quiet.load(Ordering::Acquire) {
+            return false;
+        }
+        let g = h.generation.load(Ordering::Acquire);
+        if g & 1 == 1 || seen.wrapping_sub(h.after.load(Ordering::Relaxed)) > usize::MAX / 2 {
+            return false;
+        }
+        if g != w.generation {
+            let n = h.n.load(Ordering::Relaxed).min(MAX_HINT);
+            let skip = h.skip.load(Ordering::Relaxed);
+            let total = h.total.load(Ordering::Relaxed);
+            let cap = h.cap.load(Ordering::Relaxed);
+            let mut regs = [(0usize, 0usize); MAX_HINT];
+            for (i, r) in regs.iter_mut().enumerate().take(n) {
+                *r = (h.addr[i].load(Ordering::Relaxed), h.len[i].load(Ordering::Relaxed));
+            }
+            if h.generation.load(Ordering::Acquire) != g {
+                return false;
+            }
+            // This worker's slice of the dispatch, in dispatch byte space.
+            let lo = total / self.nthreads * t + (total % self.nthreads * t) / self.nthreads;
+            let hi = (lo + (total / self.nthreads).min(cap)).min(total);
+            w.n = 0;
+            w.at = 0;
+            let mut pos = skip;
+            for &(a, l) in regs.iter().take(n) {
+                let (s, e) = (pos.max(lo), (pos + l).min(hi));
+                if s < e {
+                    w.todo[w.n] = (a + (s - pos), e - s);
+                    w.n += 1;
+                }
+                pos += l;
+            }
+            w.generation = g;
+        }
+        if w.at >= w.n {
+            return false;
+        }
+        let (a, l) = &mut w.todo[w.at];
+        let step = (*l).min(256);
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_MM_HINT_T1, _mm_prefetch};
+            let mut off = 0;
+            while off < step {
+                // SAFETY: a prefetch is a hint — it cannot fault on any address
+                // and touches no architectural state.
+                unsafe { _mm_prefetch::<_MM_HINT_T1>((*a + off) as *const i8) };
+                off += 64;
+            }
+        }
+        *a += step;
+        *l -= step;
+        if *l == 0 {
+            w.at += 1;
+        }
+        true
+    }
+
     /// Split `n` into `threads()` contiguous chunks and run `f` on each, in
     /// parallel, returning when every chunk is done.
     ///
@@ -265,6 +404,7 @@ impl Pool {
             };
         }
         self.dispatches.fetch_add(1, Ordering::Relaxed);
+        self.quiet.store(false, Ordering::Release);
         let cur = self.seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         if self.parked.load(Ordering::SeqCst) != 0 {
             // A worker that raised `parked` holds `lock` until it is inside
@@ -300,6 +440,7 @@ impl Pool {
             self.dispatcher_parked.store(false, Ordering::SeqCst);
         }
 
+        self.quiet.store(true, Ordering::Release);
         if let Err(p) = own {
             let mut cell = self.panic.lock().unwrap_or_else(|e| e.into_inner());
             if cell.is_none() {
@@ -344,6 +485,8 @@ impl Pool {
             spin,
             topo,
             pin_failed: AtomicBool::new(false),
+            hint: IdleHint::new(),
+            quiet: AtomicBool::new(false),
             dispatch: Mutex::new(()),
             job: UnsafeCell::new(JobSlot {
                 data: std::ptr::null(),
@@ -405,6 +548,12 @@ impl Pool {
         // Publish readiness only after the snapshot above, so the ordering
         // "snapshot -> ready -> first dispatch" is guaranteed by pool().
         self.ready.fetch_add(1, Ordering::Release);
+        let mut walk = IdleWalk {
+            generation: 0,
+            todo: [(0, 0); MAX_HINT],
+            n: 0,
+            at: 0,
+        };
         loop {
             // Wait for the next job: spin (back-to-back dispatches stay in
             // cache), then park on cv_work.
@@ -414,6 +563,9 @@ impl Pool {
                 if cur != seen {
                     seen = cur;
                     break;
+                }
+                if self.idle_pull(t, seen, &mut walk) {
+                    continue;
                 }
                 if spins > 0 {
                     spins -= 1;

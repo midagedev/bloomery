@@ -320,7 +320,16 @@ pub fn step(
 
     let mut x = embed_with(gguf, &derived.plan().embed, tokens)?;
     for b in 0..n_block {
-        x = block_cached(gguf, b, &x, &slots, cache, &range, derived)?;
+        if tokens.len() == 1 {
+            let next = match derived.block_plan(b + 1) {
+                Ok(bp) => (&bp.attn.wq, Some(&bp.attn.wa)),
+                Err(_) => (&derived.plan().head.out_w, None),
+            };
+            crate::ops::set_followup(Some(next));
+        }
+        let r = block_cached(gguf, b, &x, &slots, cache, &range, derived);
+        crate::ops::set_followup(None);
+        x = r?;
     }
     let last = tokens.len() - 1;
     let tail = Tensor2::from_vec(x.ne0, 1, x.col(last).to_vec());
