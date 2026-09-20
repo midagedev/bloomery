@@ -31,6 +31,10 @@ fmt-check:
 check-recipes:
     ./tools/check-recipes.sh
 
+# 주석 규약(AGENTS.md Conventions): 엔진 크레이트 src/ 주석에 이슈 번호·날짜 금지, 예외는 `PIN(날짜):`.
+check-comments:
+    ./tools/check-comments.sh
+
 # GPU 커널 빌드. 디바이스 크레이트는 반드시 cargo oxide로, 평범한 cargo build로는 안 된다.
 build-gpu:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-q3k-gemv'
