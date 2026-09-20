@@ -183,33 +183,45 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
         eprintln!("  prompt {id} top-5: ik {want:?}, ours {got:?}");
     }
 
-    // The contract: 31 of 33, and the ones that differ are named, not tolerated in bulk.
+    // The contract: 33 of 33, and any divergence is named, not tolerated in bulk.
     //
-    // Measured 2026-09-20, after the Q3_K fused wiring (MUL-21): `ops::matmul_q` routes
-    // Q3_K through `crates/qdot`, which is MORE accurate than the f32 round trip it
-    // replaced, so every Q3_K logit moves and the near-ties move with them. The
-    // divergence set moved from {5} to {14, 24}:
-    //   * prompt 5 (`def add(a, b):`) matches again (ik 185, ours 185). It was the
-    //     2026-09-19 divergence, ik margin 0.262; the fused path moved our logit onto
-    //     ik's pick.
-    //   * prompt 14 (`A right triangle has`): ik 245, ours 9226, margin 0.108,
-    //     |dlogit| 0.285 -- a straight 1st/2nd swap.
-    //   * prompt 24 (`Machine learning models are trained on`): ik 245, ours 1191,
-    //     margin 0.151, |dlogit| 0.339 -- same 1st/2nd swap.
-    // Both flips sit far inside the drift this same run measured (worst |dlogit| 0.994),
-    // the same class as the old prompt 5: near-ties the inherited error can move, not
-    // different computations. The round spec's repin rule is met (≤ 2 mismatches, every
-    // flipped prompt at ik margin < 1.0): two flips, margins 0.108 and 0.151.
+    // Repinned 2026-09-20, after the Q4_K x Q8_2_X4 fused wiring (MUL-27):
+    // the divergence set moved from {14, 24} to {} — both near-ties now pick
+    // ik's token, argmax 33/33 for the first time since the oracle gates
+    // existed.
     //
-    // Where the drift is from was already documented and is unchanged in kind: `q_nope2`'s
-    // activation-code tie flips in `attn.rs`'s `quantize_act` (its own gate measures with
-    // a 3.8e-6 exact-input companion -- the flips come from the input, not from that
-    // stage's arithmetic). The wiring relocated the flips, it did not remove them.
+    // History of the set, because the pin's job is to make every move say
+    // what moved it:
+    //   * 2026-09-19 (pre-fused): {5} — `def add(a, b):`, ik margin 0.262.
+    //   * 2026-09-20, Q3_K fused wiring (MUL-21): {14, 24}. The fused path
+    //     was more accurate than the f32 round trip it replaced, every Q3_K
+    //     logit moved, prompt 5 matched again and two other near-ties
+    //     flipped: prompt 14 (`A right triangle has`, ik margin 0.108,
+    //     |dlogit| 0.285) and prompt 24 (`Machine learning models are
+    //     trained on`, ik margin 0.151, |dlogit| 0.339) — straight 1st/2nd
+    //     swaps inside the run's own drift.
+    //   * 2026-09-20, Q4_K x4 fused wiring (MUL-27): {}. The x4 kernel is
+    //     ik's own kernel arithmetic (qdot gate B: 64 rows within 1 ULP) fed
+    //     ik's own activation coder byte for byte (gate 0), so every Q4_K
+    //     site moved TOWARD ik and both flips landed on ik's picks: prompt
+    //     14 now 245 (ours == ik), prompt 24 now 245. A/B proof the wiring
+    //     caused it: supports() reverted to Q3_K-only for one run moved the
+    //     divergence set straight back to {14, 24} (same binary, same
+    //     oracle).
     //
-    // The set is pinned rather than counted. A third prompt flipping fails; one of these
-    // starting to match also fails, because that means something moved and the round that
-    // moved it should say what. Do not widen this to `len() <= 2`.
-    const KNOWN_DIVERGENCE: &[usize] = &[14, 24];
+    // Where the remaining drift is from is unchanged in kind and now smaller:
+    // `q_nope2`'s activation-code tie flips (`attn.rs`'s `quantize_act`) and
+    // the not-yet-fused Q5_0/Q5_1/Q6_K sites. worst |dlogit| over ik's top-5
+    // measured 1.298 this round (0.994 at MUL-21) — the raw worst got worse
+    // while both argmax flips fixed; near-tie ordering and raw drift are
+    // different quantities, and the logits band gate (forward.rs, 5e-2)
+    // holds the raw side at 3.2e-2.
+    //
+    // The set is pinned rather than counted. Any prompt flipping fails; one
+    // starting to match also fails, because that means something moved and
+    // the round that moved it should say what. Do not widen this to
+    // `len() <= N`.
+    const KNOWN_DIVERGENCE: &[usize] = &[];
     let ids: Vec<usize> = mismatched.iter().map(|(id, ..)| *id).collect();
     assert_eq!(
         ids,

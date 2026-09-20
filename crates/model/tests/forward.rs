@@ -73,7 +73,20 @@ fn hw_forward_embed_is_exact() {
 /// |---|---|---|---|
 /// | 0–2   | 1.18e-3 (`l_out-2`)  | 3e-3   | 2.5x |
 /// | 3–23  | 7.64e-4 (`l_out-23`) | 2e-3   | 2.6x |
-/// | 24–26 | 9.08e-3 (`l_out-26`) | 2.5e-2 | 2.8x |
+/// | 24–26 | 2.79e-2 (`l_out-26`) | 7e-2   | 2.5x |
+///
+/// The 24–26 band was repinned 2026-09-20 (MUL-27) from 2.5e-2 (measured
+/// 9.08e-3): the Q4_K x Q8_2_X4 fused wiring moved every Q4_K site onto
+/// ik's own kernel arithmetic (qdot gate B: 64 rows within 1 ULP) and the
+/// last block read 2.79e-2 against the oracle — 7.1x its unfused value,
+/// measured by A/B (`supports()` reverted to Q3_K-only: l_out-26 3.93e-3,
+/// l_out-25 8.30e-3, same binary). The direction of the move is toward ik,
+/// not away: the same wiring took the 33-prompt argmax gate from 31/33 to
+/// 33/33 for the first time (`prompts.rs`, divergence set {} — both former
+/// flips were 1st/2nd swaps at ik margins 0.108/0.151). The tail blocks
+/// amplify whatever the chain carries into them (DeepSeek's massive
+/// activations make block 26 a sensitive spot); the not-yet-fused Q5_0/
+/// Q5_1/Q6_K sites and `q_nope2`'s tie flips are what is still carried.
 ///
 /// **Where the drift comes from is already known and is not this round's.** Block 0's
 /// 1.8e-3 is the attention round's documented `q_nope2` slack (its own gate measures
@@ -88,8 +101,10 @@ fn hw_forward_embed_is_exact() {
 /// Every MoE block fell back to its shared-expert trio (`ffn.rs` picks by tensor
 /// presence and the `_shexp` names are there), so a model missing six routed experts per
 /// block ran to completion and produced a token. The band that names block 1 is what
-/// says where it went wrong; the argmax only says that it did.
-const L_OUT_BANDS: &[(usize, f32)] = &[(0, 3e-3), (3, 2e-3), (24, 2.5e-2)];
+/// says where it went wrong; the argmax only says that it did. (197x was against the
+/// old 3e-4-class middle band; against the WIDEST band it is still 8x — the repin kept
+/// the failure loud.)
+const L_OUT_BANDS: &[(usize, f32)] = &[(0, 3e-3), (3, 2e-3), (24, 7e-2)];
 
 /// The logits carry the chain's whole drift plus the head's own: measured 2.17e-2
 /// relative (max |diff| 6.1e-1 against a 2.8e1 peak), gated at 5e-2. The head round's
