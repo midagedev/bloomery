@@ -1,16 +1,16 @@
 //! Block-N MLA attention: `attn_norm-N` in, `kqv_out-N` out.
 //!
-//! Gate: `crates/model/tests/attn.rs` against the oracle. Owned by the attn round.
+//! Gate: `crates/model/tests/attn.rs` against the oracle.
 //!
 //! The reference is ik_llama.cpp's MLA graph (weight-absorbed form over the 512-wide
-//! latent), reproduced numerically, not just mathematically. Four of its choices are
+//! latent), reproduced numerically, not just mathematically. Six of its choices are
 //! invisible in the math and each one alone would blow the 1e-4 gate:
 //!
 //!   * **YaRN mscale does not scale the rope.** ik's graph divides the mscale back out
 //!     before rope (`attn_factor_scaled = 1/(1+0.1·ln(1/freq_scale))` cancels the
-//!     `mscale *= 1+0.1·ln(1/freq_scale)` inside `rope_yarn`; build_deepseek2.cpp:1250-1254
-//!     and ggml.c's `rope_yarn`), so rope is a pure rotation and the real mscale lands
-//!     in `kq_scale = mscale²/√key_length` on the attention logits.
+//!     `mscale *= 1+0.1·ln(1/freq_scale)` inside `rope_yarn`;
+//!     build_deepseek2.cpp:1250-1254), so rope is a pure rotation and the real mscale
+//!     lands in `kq_scale = mscale²/√key_length` on the attention logits.
 //!   * **`wk_b` is requantized to Q8_0.** The file's `attn_kv_b` is Q3_K; ik's
 //!     `llm_prepare_mla` (llama.cpp:3216-3230) dequantizes the k-up half, transposes it,
 //!     and casts to Q8_0 — 32-value blocks along the 128-wide q_nope axis, f16 scales.
@@ -22,23 +22,20 @@
 //!     and `id = 1/d` — see [`quantize_act`]. The two conventions differ by up to 2⁻⁹
 //!     relative, an order of magnitude past this gate.
 //!   * **The reference CPU flash-attention is ik's `iqk` templates, not ggml's generic
-//!     loop.** `iqk_flash_attn_noalibi` claims the node through its general prefill
-//!     path and runs `FlashAttn<576, 512, ·, 32>` with F16 K/V helpers
-//!     (iqk_flash_attn.cpp:576-605 → iqk_mul_mat.cpp:1379 → iqk_fa_576_512.cpp). The
-//!     KV cache is padded to 256 entries (`llama_kv_cache::get_padding` returns 256
-//!     with `-fa` on; `kv_self.n = max(pad, GGML_PAD(max_cell, pad))`, llama.cpp:7190)
-//!     and the F16 mask carries −inf on every padded cell — so pad rows take weight
-//!     exactly 0 and drop out of the arithmetic. q stays F32 end to end; the QK dot is
-//!     f32 FMAs in the gemm's two-partial lane order; softmax weights come from ik's
-//!     vector `v_expf` polynomial (not libm `expf`); V accumulates in an f32 FMA chain
-//!     and the row is normalized by a plain `1/S` multiply (see [`flash_attn_latent`]).
-//!   * **The flash kernel's inner loops are AVX2+FMA+F16C (MUL-36).** The kq dot sums
-//!     in 8-lane groups and V accumulates eight latent lanes per FMA; the scalar
-//!     transcription of the bullets above stays as the no-AVX2 fallback
-//!     ([`flash_attn_latent_scalar`]) and the gates' oracle — bit-identical to ik on
-//!     exact inputs. The SIMD twin's one numerical difference is the kq sum order,
-//!     which moves outputs off ik's bits by ULP-scale amounts; `tests/attn.rs` bands
-//!     it explicitly against the scalar twin.
+//!     loop.** `iqk_flash_attn_noalibi` runs `FlashAttn<576, 512, ·, 32>` with F16 K/V
+//!     helpers (iqk_fa_576_512.cpp). The KV cache is padded to 256 entries
+//!     (`llama_kv_cache::get_padding`, llama.cpp:7190) and the F16 mask carries −inf
+//!     on every padded cell — so pad rows take weight exactly 0 and drop out of the
+//!     arithmetic. q stays F32 end to end; the QK dot is f32 FMAs in the gemm's
+//!     two-partial lane order; softmax weights come from ik's vector `v_expf`
+//!     polynomial (not libm `expf`); V accumulates in an f32 FMA chain and the row is
+//!     normalized by a plain `1/S` multiply (see [`flash_attn_latent`]).
+//!   * **The flash kernel's inner loops are AVX2+FMA+F16C.** The kq dot sums
+//!     in 8-lane groups and V accumulates eight latent lanes per FMA; the
+//!     scalar transcription stays as the no-AVX2 fallback
+//!     ([`flash_attn_latent_scalar`]) and the gates' oracle — bit-identical
+//!     to ik on exact inputs, with the SIMD twin banded against it by
+//!     `tests/attn.rs`.
 //!
 //! Everything here mirrors those choices in the same operation order — there is no
 //! place where we are deliberately more exact than the reference.
@@ -95,9 +92,8 @@ pub fn block_attn(
 /// The same computation, keeping every intermediate the gate asserts.
 ///
 /// Prefill semantics: the batch is the whole history. Implemented by running the cached
-/// path against a cache that holds exactly this batch and nothing else — the two are one
-/// code path, so "caching changes nothing" is a property of the structure and not only
-/// of the measurement in `tests/kv.rs`.
+/// path against a cache that holds exactly this batch and nothing else — one code path,
+/// so "caching changes nothing" is structural, not only measured (`tests/kv.rs`).
 pub fn block_attn_trace(
     gguf: &Gguf,
     block: usize,
@@ -115,10 +111,10 @@ pub fn block_attn_trace(
 /// the cache holds every key. The new rows are appended to `cache_block` first, so a
 /// decode step attends against its own token as well as the prefix.
 ///
-/// `cache_block` is the cache's block index, which is the model's `block` in a real
-/// forward pass and 0 in the scratch cache `block_attn_trace` builds. They are separate
-/// parameters because they are separate things, and conflating them would make the
-/// scratch path allocate 27 empty blocks to use one.
+/// `cache_block` is the cache's block index: the model's `block` in a real forward
+/// pass, 0 in the scratch cache `block_attn_trace` builds. Separate parameters because
+/// they are separate things — conflating them would make the scratch path allocate 27
+/// empty blocks to use one.
 #[allow(clippy::too_many_arguments)]
 pub fn block_attn_cached(
     gguf: &Gguf,
@@ -130,12 +126,10 @@ pub fn block_attn_cached(
     range: &std::ops::Range<usize>,
     derived: &Derived,
 ) -> Result<AttnTrace, ModelError> {
-    // Profiler hook (crate::profile), coverage round: the attention prep that is
-    // not a matmul, as piece timers around the un-hooked regions only — the
-    // matmuls keep their own rows and coverage never counts a nanosecond twice:
-    //   * `attn_params` — `MlaParams::read` and the five tensor finds, every one
-    //     a linear scan of the tensor table (four pieces, they interleave with
-    //     the hooked calls).
+    // Profiler hook: piece timers around the attention prep that is not a matmul —
+    // the matmuls keep their own rows and coverage never counts a nanosecond twice:
+    //   * `attn_params` — `MlaParams::read` and the tensor finds, every one a
+    //     linear scan of the tensor table.
     //   * `attn_latent` — the latent copy out of `kv_rope_compressed`.
     //   * `attn_rope`   — the cos/sin caches and the k/q rope applications.
     //   * `attn_kvr`    — the kvr concat, the f32→f16 rounding and the cache push.
@@ -428,9 +422,8 @@ impl MlaParams {
         let latent = wkb.dims[0] as usize;
 
         // Derived geometry must close, or the file is not shaped like this MLA.
-        // checked_sub: key_length not covering the rope dims would underflow
-        // here (a debug panic today, a wrapped usize in release) — it is a
-        // malformed-file error, not an arithmetic one.
+        // checked_sub: key_length not covering the rope dims would underflow —
+        // a malformed-file error, not an arithmetic one.
         let Some(nope) = kq_head.checked_sub(rope_dims) else {
             return Err(ModelError::Shape {
                 what: "kq_head - rope_dims (key_length must cover the rope dims)",
@@ -463,21 +456,19 @@ impl MlaParams {
             wa.dims[1] as usize,
             latent + rope_dims,
         )?;
-        // Geometry the kernels below would truncate SILENTLY or panic on —
-        // the same fail-loudly policy the two span checks above apply
-        // (2026-09-20 hardening round). The exact contracts encoded:
+        // Geometry the kernels below would truncate SILENTLY or panic on — the same
+        // fail-loudly policy the two span checks above apply:
         //   * nope % 32: `q_nope2_absorbed` works in 32-value blocks
-        //     (`nope / 32` at its head and `chunks_exact(32)` over the q row
-        //     would both drop a tail without a sound);
-        //   * (rope_dims + latent) % 8: EVERY kq dot leg steps the
-        //     d_head-wide row 8 values at a time — the scalar `kq_dot_fa4`'s
-        //     `step_by(8)` drops a tail silently, the SIMD leg's stricter
-        //     % 32 panel contract is `flash_simd`'s own gate and a legal
-        //     scalar fallback, NOT an error. `latent % 8` alone is likewise
-        //     SIMD-only (the scalar V loop is per-element), so it is not
+        //     (`nope / 32` and `chunks_exact(32)` would both drop a tail
+        //     without a sound);
+        //   * (rope_dims + latent) % 8: every kq dot leg steps the d_head-wide
+        //     row 8 values at a time — `kq_dot_fa4`'s `step_by(8)` drops a
+        //     tail silently. The SIMD leg's stricter % 32 panel contract is
+        //     `flash_simd`'s own gate, and `latent % 8` alone is likewise
+        //     SIMD-only (the scalar V loop is per-element), so neither is
         //     encoded here;
-        //   * rope_dims % 2: rope rotates adjacent pairs — an odd width
-        //     would panic in `rope_pair`'s `src[i + 1]`.
+        //   * rope_dims % 2: rope rotates adjacent pairs — an odd width would
+        //     panic in `rope_pair`'s `src[i + 1]`.
         check("nope axis (32-value blocks)", 0, nope % 32)?;
         check(
             "kq row width rope+latent (8-value chunks)",
@@ -519,11 +510,10 @@ impl MlaParams {
 // ------------------------------------------------------------------ f16
 
 /// f32 → f16 bits, round-to-nearest-even — the conversion `vcvtps2ph $0x0` performs
-/// on the reference build (AVX2 + F16C; `ggml_fp32_to_fp16_row`, verified in the box's
-/// libggml disassembly 2026-09-19 — the build is *not* AVX-512).
-/// Subnormals and ties follow IEEE; NaN/inf collapse to inf (no NaN reaches the gated
-/// graph). One f16 round-trip helper for the whole crate: q rows, the KV cache and the
-/// V accumulator all round through here.
+/// on the reference build (AVX2 + F16C, `ggml_fp32_to_fp16_row`; the build is *not*
+/// AVX-512). Subnormals and ties follow IEEE; NaN/inf collapse to inf (no NaN reaches
+/// the gated graph). One f16 round-trip helper for the whole crate: q rows, the KV
+/// cache and the V accumulator all round through here.
 pub fn f32_to_f16_bits(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
@@ -565,22 +555,20 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
 
 // --------------------------------------------------------------- q_nope2
 
-// `Q8Block` moved to qdot with the cell kernel that consumes it (MUL-38);
-// re-exported here so `Derived`'s storage, the gates' `assert_eq!` and the
-// 34-byte size assertion (`tests/derived.rs`) keep compiling unchanged.
-// Field-wise equality on the type is equality of every byte it holds.
+// `Q8Block` lives in qdot with the cell kernel that consumes it; re-exported
+// here so `Derived`'s storage, the gates' `assert_eq!` and the 34-byte size
+// assertion (`tests/derived.rs`) keep compiling unchanged. Field-wise
+// equality on the type is equality of every byte it holds.
 pub use qdot::Q8Block;
 
 /// The weight requant the reference's `wk_b` cast runs: `quantize_row_q8_0`, x86
 /// branch (ggml-quants.c:938+): `d = amax/127` stored f16, `id = 127/amax` — a
 /// different f32 value than `1/d` — and `_mm256_round_ps(_MM_ROUND_NEAREST)` codes.
 /// The ref variant (`id = 1/d`, `roundf`) differs on last-ulp and tie cases and is
-/// NOT what runs here: switching to it flips codes on 10 of 16 heads and opens ~1e-2
-/// on the gate (measured 2026-09-19). Verified byte-identical to the reference's
-/// derived `attn_k_b.weight` for block 0 (0 of 69632 bytes differ).
+/// NOT what runs here.
 pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
     // One 32-value block at a time: a shorter slice would leave trailing
-    // codes at their 0 init silently (2026-09-20 hardening round).
+    // codes at their 0 init silently.
     assert_eq!(x.len(), 32, "quantize_q8_0: one 32-value block at a time");
     let mut amax = 0.0f32;
     for &v in x {
@@ -598,8 +586,8 @@ pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
     }
 }
 
-// `ActBlock` moved to qdot with the cell kernel (MUL-38); the quantizer
-// below still owns its conventions — the scale as **bf16**, int8 codes.
+// `ActBlock` lives in qdot with the cell kernel; the quantizer below still
+// owns its conventions — the scale as **bf16**, int8 codes.
 use qdot::ActBlock;
 
 /// `ggml_compute_fp32_to_bf16` (ggml-impl.h:106): round-to-nearest-even via the carry
@@ -617,17 +605,15 @@ fn bf16_round(x: f32) -> f32 {
 /// differ from Q8_0 twice: the scale `amax/127` is rounded to bf16 (8-bit mantissa),
 /// and the codes use `id = 1/d` on that rounded scale, RNE (the `_mm256_round_ps`
 /// there). Each difference alone moves gated values by up to 2⁻⁹ relative — far
-/// outside the 1e-4 gate. Found by bisection against the oracle (2026-09-19): with
-/// Q8_0 codes the q_nope2 residual is 4.6e-2; with this it is 1e-6.
+/// outside the 1e-4 gate.
 ///
-/// Codes are clamped to ±127, and that bound is ENFORCED here (2026-09-20
-/// hardening round), not defensive: a -128 activation code under a negative
-/// weight code is the one input pair outside the sign-fold kernel's
-/// bit-identity contract (`qdot::q_nope2_cells_avx2_inner`; the derived
-/// producer bound — |code| < 127.25 before RNE — means the clamp never
+/// Codes are clamped to ±127, and that bound is ENFORCED here, not defensive: a
+/// -128 activation code under a negative weight code is the one input pair outside
+/// the sign-fold kernel's bit-identity contract (`qdot::q_nope2_cells_avx2_inner`;
+/// the derived producer bound — |code| < 127.25 before RNE — means the clamp never
 /// engages on legal inputs, so tightening -128 to -127 is bit-identical by
-/// derivation; gate-attn/forward/prompts prove it). `quantize_q8_0`'s clamp
-/// stays -128: a WEIGHT code of -128 is a legal magnitude for the fold.
+/// derivation). `quantize_q8_0`'s clamp stays -128: a WEIGHT code of -128 is a
+/// legal magnitude for the fold.
 fn quantize_act(x: &[f32]) -> ActBlock {
     let mut amax = 0.0f32;
     for &v in x {
@@ -647,35 +633,29 @@ fn quantize_act(x: &[f32]) -> ActBlock {
 /// `wk_b` is not in the file — the reference derives it at load (`llm_prepare_mla`,
 /// llama.cpp:3229): the k-up rows of `attn_kv_b` are dequantized, transposed, and
 /// cast to Q8_0 whose 32-value blocks run along the 128-wide q_nope axis. That
-/// derivation is a pure function of the weights, so it now runs once in
+/// derivation is a pure function of the weights, so it runs once in
 /// [`Derived`](crate::derived::Derived) at load; this function receives the blocks
 /// (`wblocks`, one block's heads concatenated head-major) and does the per-token
 /// half. At M ≤ 7 rows ik's `iqk_mul_mat_4d` claims the node and quantizes the F32
-/// activation itself, into its small-M `block_q8_2` format (see [`quantize_act`]) —
-/// the dot is then a sum over blocks of `f32(f16(dw)) · dq · Σ qw·qq` with an exact
-/// i32 inner sum. The block sum accumulates in f64: ggml's f32 SIMD lane order
-/// differs in its last ulp; ours is the exact sum. Since MUL-38 the i32 inner
-/// sum runs in qdot's AVX2 maddubs kernel — bit-identical to the scalar form
-/// by integer associativity (the argument and its gate: crates/qdot, MUL-38).
+/// activation itself (see [`quantize_act`]); the dot is then a sum over blocks of
+/// `f32(f16(dw)) · dq · Σ qw·qq` with an exact i32 inner sum (qdot's AVX2 maddubs
+/// kernel — bit-identical to the scalar form by integer associativity; the argument
+/// and its gate live in crates/qdot). The block sum accumulates in f64: ggml's f32
+/// SIMD lane order differs in its last ulp; ours is the exact sum.
 ///
-/// The (column, row) cell space runs on the resident pool (MUL-33). Each output
-/// cell depends only on its own weight blocks and its column's quantized
-/// activation, and the only accumulation — the f64 block sum — stays inside the
-/// cell, so splitting cells cannot reorder anything and the output is
-/// bit-identical to the serial loop; `tests/mt.rs` holds that as a byte compare
-/// across thread counts. The activation quantization stays on the caller thread,
-/// once per (h, t), before the split.
+/// The (column, row) cell space runs on the resident pool, bit-identical to the
+/// serial loop by the cell-independence argument at the construction site below;
+/// `tests/mt.rs` holds it as a byte compare across thread counts. The activation
+/// quantization stays on the caller thread, once per (h, t), before the split.
 pub fn q_nope2_absorbed(
     wblocks: &[Q8Block],
     q: &Tensor2,
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
-    // Profiler hook (crate::profile). This site was hypothesis 3 — the per-step
-    // wk_b requant — and `Derived` closed it: what is left is the per-token half.
-    // The stage split keeps its axes (the caller-side quant pre-pass as
-    // `quant_act`, the pool cell loops as `dot`); `dequant_w` can no longer fire
-    // from this site, so a nonzero `dequant_w` row here would mean someone
-    // reintroduced a per-step requant.
+    // Profiler hook. `Derived` owns the wk_b requant; what is left here is the
+    // per-token half — the caller-side quant pre-pass (`quant_act`) and the pool
+    // cell loops (`dot`). `dequant_w` cannot fire from this site, so a nonzero
+    // `dequant_w` row here would mean someone reintroduced a per-step requant.
     let lvl = profile::level();
     let mut pacc = profile::CallAcc::new();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
@@ -700,11 +680,9 @@ pub fn q_nope2_absorbed(
     // `matmul_q_multi` rides at its own quantization site. One 128-wide slice
     // feeds all `latent` output rows of its column, and once the columns live
     // on the pool a column straddling a chunk boundary must not be quantized
-    // twice. Serial on purpose, as there: the quant stage is 0.4 of the site's
-    // 11.0 ms (level 2, 2026-09-20, timer tax included), and `quantize_act`
-    // is deterministic — a shared read-only `qall`, laid out column-major so
-    // chunk `col` reads a contiguous run, is byte-identical to the per-(h, t)
-    // Vec the serial loop used to build inside the t loop.
+    // twice. Serial on purpose, as there: `quantize_act` is deterministic, so
+    // the shared read-only `qall`, laid out column-major so chunk `col` reads
+    // a contiguous run, is byte-identical to a per-(h, t) quant.
     let t_qa = if lvl >= 2 { Some(Instant::now()) } else { None };
     let mut qall: Vec<ActBlock> = Vec::with_capacity(p.n_head * q.ne1 * nblocks);
     for h in 0..p.n_head {
@@ -718,33 +696,25 @@ pub fn q_nope2_absorbed(
         pacc.add_quant_act(t_qa.elapsed().as_nanos() as u64);
     }
 
-    // MUL-33: the output cell space — column `col = h·ne1 + t`, row `j` — runs
-    // on the resident pool. This was the last big serial site of the decode
-    // step (11.0 ms of a 41.2 ms wall, level 2, N=96, 2026-09-20; 27 calls per
-    // step, one per layer), all of it on the caller thread while the pool
-    // idled through the attention section. The independence argument is the
-    // cell form of the row split `matmul_q` rides (MUL-23): cell (col, j)
-    // reads only `wblocks[h·span + j·nblocks + b]` and its own column's
-    // quantized blocks, and its only accumulation — the b = 0..4 f64 sum — is
-    // confined inside the cell, so which thread computes which cell cannot
-    // change a bit. Splitting the b axis would reorder that f64 accumulation
-    // and is forbidden. ik dispatches this same node over (heads × row
-    // chunks) on its own pool (iqk_mul_mat.cpp:637-676); the cell split is
-    // this engine's spelling of that axis. `t` is the column axis, so prefill
-    // (ne1 > 1) is the same space with more columns — nothing below branches
-    // on which case it is.
+    // The output cell space — column `col = h·ne1 + t`, row `j` — runs on the
+    // resident pool. The independence argument is the cell form of the row
+    // split `matmul_q` rides: cell (col, j) reads only
+    // `wblocks[h·span + j·nblocks + b]` and its own column's quantized blocks,
+    // and its only accumulation — the b = 0..4 f64 sum — is confined inside
+    // the cell, so which thread computes which cell cannot change a bit.
+    // Splitting the b axis would reorder that f64 accumulation and is
+    // forbidden. ik dispatches this same node over (heads × row chunks) on its
+    // own pool (iqk_mul_mat.cpp:637-676); the cell split is this engine's
+    // spelling of that axis. `t` is the column axis, so prefill (ne1 > 1) is
+    // the same space with more columns — nothing below branches on which case
+    // it is.
     //
     // SAFETY (construction site): every participant computes cells of the
     // (col, j) space inside its own contiguous chunk and writes only cell
     // `col * latent + j` of `out.data` — the chunks partition the cell
     // space, so no two participants alias. The pool's completion protocol
     // publishes the writes before this function reads `out`, the same
-    // ordering that publishes the matmul job slot. The per-cell arithmetic
-    // runs in qdot's cell kernel (MUL-38): its SIMD is integer-exact by
-    // associativity and its f64 block-sum epilogue is this loop's own
-    // expression and order, so every cell is bit-identical to the serial
-    // loop the kernel replaced — `tests/mt.rs` still holds the whole claim
-    // as a byte compare across thread counts.
+    // ordering that publishes the matmul job slot.
     let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
     let latent = p.latent;
     let ne1 = q.ne1;
@@ -752,11 +722,11 @@ pub fn q_nope2_absorbed(
         Mutex::new(Vec::with_capacity(threads::pool().threads()));
     threads::pool().for_each_chunk(p.n_head * ne1 * latent, |cells| {
         let mut acc = profile::CallAcc::new();
-        // Per-worker scratch (MUL-38): qdot's kernel writes a segment's
-        // cells here and they then go to `out` through `SharedOut::write` —
-        // the one-cell method is what keeps this closure capturing a
-        // `&Sync` type (see `SharedOut`'s doc). One latent-wide f32 run per
-        // column segment, reused across the chunk's segments.
+        // Per-worker scratch: qdot's kernel writes a segment's cells here and
+        // they then go to `out` through `SharedOut::write` — the one-cell
+        // method is what keeps this closure capturing a `&Sync` type (see
+        // `SharedOut`'s doc). One latent-wide f32 run per column segment,
+        // reused across the chunk's segments.
         let mut cellbuf = vec![0.0f32; latent];
         // Walk the chunk column-segment-wise: a chunk may start mid-column
         // and end mid-column, so each iteration takes the intersection of the
@@ -771,14 +741,14 @@ pub fn q_nope2_absorbed(
             let whead = &wblocks[h * span..(h + 1) * span];
             let qcol = &qall[col * nblocks..(col + 1) * nblocks];
             let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
-            // MUL-38: the segment's per-block i32 dots run in qdot's AVX2
-            // maddubs kernel — the Q6_K qY sign fold (weight magnitude on
-            // the u8 side, weight sign folded into the activation bytes; no
-            // +128 prepare, no compensation sum, no reachable saturation).
+            // The segment's per-block i32 dots run in qdot's AVX2 maddubs
+            // kernel — the Q6_K qY sign fold (weight magnitude on the u8
+            // side, weight sign folded into the activation bytes; no +128
+            // prepare, no compensation sum, no reachable saturation).
             // Integer associativity makes the lane order free and the
             // kernel's f64 epilogue is the loop's own, so the cells are
             // bit-identical to the scalar form — the argument and its gate
-            // live in crates/qdot (MUL-38 section).
+            // live in crates/qdot.
             let seg = &mut cellbuf[..j_end - j0];
             qdot::q_nope2_cells(whead, qcol, j0, j_end, seg);
             for (jj, &v) in seg.iter().enumerate() {
@@ -792,14 +762,11 @@ pub fn q_nope2_absorbed(
             }
             // j_end is a row index INSIDE the column (0..latent); the walk
             // variable is absolute, so the next segment starts at the
-            // column's base plus j_end. Writing `c = j_end` here kept c at
-            // latent forever once the first column ended — the first
-            // segment only looked right because its base was zero.
+            // column's base plus j_end.
             c = col * latent + j_end;
         }
         // The one lock of the chunk — never per cell: a mutex inside the cell
-        // loop would profile the mutex. The accumulator mutex stays out of the
-        // measured region the same way `record`'s does.
+        // loop would profile the mutex.
         collected
             .lock()
             .expect("q_nope2_absorbed chunk accumulator")
@@ -810,9 +777,8 @@ pub fn q_nope2_absorbed(
     // fires exactly once per call, after its `Instant` pair closed. Arrival
     // order is nondeterministic and nothing depends on it — the fold is
     // addition, and there is no error precedence to keep because the shape
-    // check fired before the dispatch and the cell loop cannot fail. Since
-    // MUL-23 this section is bookkeeping only; level 2 times it as the
-    // `gather` stage to keep that honest, mirroring `matmul_q_multi`'s tail.
+    // check fired before the dispatch and the cell loop cannot fail. Level 2
+    // times it as the `gather` stage, mirroring `matmul_q_multi`'s tail.
     let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
     for acc in collected
         .into_inner()
@@ -898,7 +864,7 @@ fn v_expf(x: f32) -> f32 {
 /// F32 — the FA node's q is never rounded to f16 — and every K element is the exact
 /// f32 of its f16 cache bits (`F16::load(const char*)`).
 ///
-/// `pub` since MUL-36: this is the scalar leg of the gate's path comparison and the
+/// This is the scalar leg of the gate's path comparison and the
 /// no-AVX2 fallback of [`flash_attn_latent`] — the same contraction the AVX2 twin
 /// ([`kq_dot_simd`]) computes in a different sum order.
 pub fn kq_dot_fa4(q: &[f32], k: &[u16]) -> f32 {
@@ -917,25 +883,18 @@ pub fn kq_dot_fa4(q: &[f32], k: &[u16]) -> f32 {
     plo + phi
 }
 
-/// The AVX2+FMA+F16C twin of [`kq_dot_fa4`] (MUL-36): the same contraction over
+/// The AVX2+FMA+F16C twin of [`kq_dot_fa4`]: the same contraction over
 /// the same operands — every K element still the exact f32 of its f16 bits
 /// (`_mm256_cvtph_ps` converts f16→f32 without rounding, exactly what
 /// [`half_to_f32`] returns) and every product still one fused multiply-add —
-/// with the sum order the lanes define. Per 32-element panel `i` (ascending),
-/// four 8-lane partials `P0..P3` accumulate the elements `32i+0..8`, `+8..16`,
-/// `+16..24`, `+24..32`; the dot is `hsum((P0+P1)+(P2+P3))`, where the
-/// elementwise adds pair the partials in that order and `hsum` is the fixed
-/// lane tree `c[j] = lane j + lane j+4` then `(c0+c1)+(c2+c3)`. The scalar
-/// twin's two-partial chain is a different ordering of the same additions, so
+/// with the sum order the lanes define: per 32-element panel, four 8-lane
+/// partials `P0..P3`, dot = `hsum((P0+P1)+(P2+P3))`. The scalar twin's
+/// two-partial chain is a different ordering of the same additions, so
 /// the two dots differ by last-ulps only; `tests/attn.rs` bounds that
 /// difference with the explicit reassociation band.
 ///
-/// `#[target_feature]` is not optional (the MUL-26 lesson, 21x on this box):
-/// without it the intrinsics lower to scalar emulation with no error. The
-/// split from [`flash_row_avx2`] is at the per-key granularity the scalar
-/// path has always called its own dot at — nothing inside the 576-contraction
-/// is split (the MUL-27 lesson: finer splits round values through memory,
-/// 10–13 %).
+/// `#[target_feature]` is not optional: without it the intrinsics lower to
+/// scalar emulation with no error.
 ///
 /// # Safety
 /// The CPU must support AVX2+FMA+F16C, and `q.len() == k.len()` must be a
@@ -957,8 +916,7 @@ unsafe fn kq_dot_fa4_avx2(q: &[f32], k: &[u16]) -> f32 {
         for base in (0..q.len()).step_by(32) {
             // Four f16 octets convert in one op each — the F16C instruction
             // is the exact conversion the scalar loop pays a branchy soft
-            // function per element for (the scalar wall MUL-36 exists to
-            // remove).
+            // function per element for.
             let k0 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(base) as *const __m128i));
             let k1 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(base + 8) as *const __m128i));
             let k2 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(base + 16) as *const __m128i));
@@ -1028,18 +986,11 @@ fn lane_tree_sum(w: &[f32; 32]) -> f32 {
 ///   * V accumulation in an f32 FMA chain (`accumulate_qkv`), keys ascending;
 ///   * final row = `R · (1/S)`, one plain multiply per element.
 ///
-/// MUL-36: the two inner loops the site's scalar wall lived in (MUL-35 §6-H2:
-/// 0.28 GB/s, 259 ns per row-key ≈ 1,100 scalar FMAs) run the AVX2+FMA+F16C
-/// twin [`flash_row_avx2`] when the CPU and shapes allow ([`flash_simd`]):
-/// the kq dot in 8-lane groups ([`kq_dot_fa4_avx2`]) and the V accumulation
-/// eight latent lanes per FMA. Softmax, `v_expf`, the online M/S scan and
-/// MUL-29's row split are untouched, the per-key exp stays scalar, and the V
-/// stage is bit-identical to the scalar twin (vectorizing the j axis
-/// reorders nothing — every output element's key-order FMA chain descends
-/// exactly as the scalar wrote it). The one numerical difference is the kq
-/// sum order, which moves outputs off ik's bits by ULP-scale amounts;
-/// `tests/attn.rs` bands it against [`flash_attn_latent_scalar`], the scalar
-/// transcription that keeps the bit-exactness property on exact inputs.
+/// The two inner loops run the AVX2+FMA+F16C twin [`flash_row_avx2`] when the
+/// CPU and shapes allow ([`flash_simd`]); its one numerical difference from
+/// the scalar transcription is the kq sum order (see its doc), which
+/// `tests/attn.rs` bands against [`flash_attn_latent_scalar`] — the scalar
+/// twin that keeps the bit-exactness property on exact inputs.
 ///
 /// Blocks with no allowed key are skipped outright: their weights are all exactly `0.0`
 /// (see [`v_expf`]), `S += 0` and `fma(V, 0, R) = R` are exact no-ops, so skipping is
@@ -1084,18 +1035,16 @@ pub fn flash_attn_latent_scalar(
 
 /// Whether [`flash_attn_latent`]'s row kernel takes the AVX2+FMA+F16C twin:
 /// the CPU must carry all three (the kernel's `_mm256_cvtph_ps` loads and
-/// FMAs are native only under the attributes — the MUL-26 lesson), and the
-/// shapes must meet the vector panels' contract — the `d_head`-wide row a
-/// multiple of 32 (four 8-lane partials), the latent tail a multiple of 8.
-/// A differently-shaped MLA keeps the scalar transcription rather than
-/// quietly truncating a row: the same fail-loudly policy
-/// [`MlaParams::read`] applies one level up.
+/// FMAs are native only under the attributes), and the shapes must meet the
+/// vector panels' contract — the `d_head`-wide row a multiple of 32 (four
+/// 8-lane partials), the latent tail a multiple of 8. A differently-shaped
+/// MLA keeps the scalar transcription rather than quietly truncating a row:
+/// the same fail-loudly policy [`MlaParams::read`] applies one level up.
 ///
 /// `BLOOMERY_FLASH_SIMD=0` forces the scalar path for a whole process, read
 /// once (a [`OnceLock`], the `BLOOMERY_PROFILE` pattern). It is the gates'
 /// A/B lever: same binary, same oracle, the only bit that changes is the
-/// kernel choice — the run pair that attributes a moved divergence set to
-/// this round (`tests/prompts.rs`'s history records such pairs).
+/// kernel choice.
 fn flash_simd(p: &MlaParams) -> bool {
     static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
     if *FORCE_SCALAR.get_or_init(|| std::env::var("BLOOMERY_FLASH_SIMD").is_ok_and(|v| v == "0")) {
@@ -1108,11 +1057,11 @@ fn flash_simd(p: &MlaParams) -> bool {
         && std::arch::is_x86_feature_detected!("f16c")
 }
 
-/// The single owner of the MUL-29 row split both dispatch legs ride; `simd`
+/// The single owner of the row split both dispatch legs ride; `simd`
 /// is decided once per call (never per row — `flash_simd` reads a `OnceLock`
 /// and three cached feature flags). The row twins it picks between share the
-/// whole skeleton and differ only in the two inner loops MUL-36 vectorized
-/// (the kq dot and the V accumulation) — keep them in lockstep.
+/// whole skeleton and differ only in the two vectorized inner loops (the kq
+/// dot and the V accumulation) — keep them in lockstep.
 fn flash_attn_latent_impl(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
@@ -1122,19 +1071,17 @@ fn flash_attn_latent_impl(
     p: &MlaParams,
     simd: bool,
 ) -> Tensor2 {
-    // Profiler hook (crate::profile): level-1 timer over the whole kernel. The
+    // Profiler hook: level-1 timer over the whole kernel. The
     // shape statement: `rows` is the (token, head) query rows produced, `k` the
     // keys·d_head dot work each row walks, and `weight_bytes` the f16 KV rows
     // read at least once — V is the latent tail of the same rows, so the bytes
-    // are counted once. Level 1 only: a kq-dot / softmax / V-accumulate stage
-    // split is a later round's tool, worth building once this row says whether
-    // the site is big enough to care.
+    // are counted once.
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     // Queries and keys are two different counts the moment a KV cache exists: one
-    // decode step is a single query against a whole prefix. They were one array while
-    // the batch WAS the cache, and every index below that reads `n_tokens` is a query
-    // index -- `q_rope` and `q_nope2` are laid out by the batch, never by the cache.
+    // decode step is a single query against a whole prefix. Every index below that
+    // reads `n_tokens` is a query index -- `q_rope` and `q_nope2` are laid out by
+    // the batch, never by the cache.
     assert_eq!(
         keys16.len(),
         key_slots.len(),
@@ -1151,13 +1098,10 @@ fn flash_attn_latent_impl(
         "flash_attn_latent: KV rows must be rope+latent = {d_head} wide"
     );
 
-    // MUL-29: the (token, head) query rows are fully independent — each one
-    // walks the KV cache and writes its own contiguous `latent`-wide slice of
-    // `out`, so the row space splits on the pool with the same argument
-    // matmul_q rides (MUL-23). At short ctx this site was 10 ms/step and at
-    // average ctx 53 it was 73.8 ms — 42 % of the step (measured, level 1,
-    // N=96) — all of it serial on the caller thread while the pool idled
-    // through the attention section.
+    // The (token, head) query rows are fully independent — each one walks the
+    // KV cache and writes its own contiguous `latent`-wide slice of `out`, so
+    // the row space splits on the pool with the same argument `matmul_q`
+    // rides.
     //
     // SAFETY (construction site): every participant computes rows of the
     // (t, h) space inside its own chunk and writes only cells
@@ -1211,9 +1155,8 @@ fn flash_attn_latent_impl(
 }
 
 /// The per-row body of the flash kernel, scalar transcription — the no-AVX2
-/// fallback and the gates' oracle (see [`flash_attn_latent_scalar`]).
-/// Extracted verbatim from the MUL-29 row split; the AVX2 twin below differs
-/// ONLY in the two inner loops MUL-36 vectorized.
+/// fallback and the gates' oracle (see [`flash_attn_latent_scalar`]). The AVX2
+/// twin below differs ONLY in the two vectorized inner loops.
 #[allow(clippy::too_many_arguments)]
 fn flash_row_scalar(
     q_rope: &Tensor2,
@@ -1313,33 +1256,26 @@ fn flash_row_scalar(
     }
 }
 
-/// The AVX2+FMA+F16C twin of [`flash_row_scalar`] (MUL-36). Same skeleton,
-/// same softmax / `v_expf` / online M/S scan / MUL-29 row-split structure;
-/// the two inner loops the scalar wall lived in are vectorized:
+/// The AVX2+FMA+F16C twin of [`flash_row_scalar`]. Same skeleton,
+/// same softmax / `v_expf` / online M/S scan / row-split structure;
+/// the two inner loops are vectorized:
 ///
-///   * the kq dot — [`kq_dot_fa4_avx2`]: the f16 row converts through
-///     `_mm256_cvtph_ps` (the exact f32 of the same bits `half_to_f32`
-///     returns; the f16→f32 direction cannot round) and the contraction
-///     runs as four 8-lane FMA partials, so the SUM ORDER changes from the
-///     fa4 two-partial chain to lane groups. That order change is the twins'
-///     one numerical difference; `tests/attn.rs` gates it by an explicit
-///     reassociation band against the scalar dot.
+///   * the kq dot — [`kq_dot_fa4_avx2`]: only the SUM ORDER changes (fa4
+///     two-partial chain → lane groups); that order change is the twins'
+///     one numerical difference, gated by the explicit reassociation band
+///     in `tests/attn.rs`.
 ///   * the V accumulation — `r[d] = fma(v_d, w, r[d])`, eight `d` per
-///     instruction. **Vectorizing the j (=d) axis reorders nothing**: each
+///     instruction. **Vectorizing the j (=d) axis reorders nothing** — each
 ///     output element's FMA chain still descends key order exactly as the
-///     scalar wrote it — lane `d%8` of the instruction is element `d`'s own
-///     FMA with its own operands, and the per-key loop (the axis that must
-///     stay sequential) is untouched. Given the same weights this stage is
-///     therefore bit-identical to the scalar twin; the key-direction (l
-///     axis) is the one a regroup would have to reorder and it is not
-///     vectorized.
+///     scalar wrote it (the per-key loop, the axis that must stay
+///     sequential, is untouched) — so given the same weights this stage is
+///     bit-identical to the scalar twin.
 ///
-/// `#[target_feature]` is not optional (the MUL-26 lesson): without it the
-/// intrinsics lower to scalar emulation, 21x slower, with no error. The one
-/// split-out helper is the kq dot, at the per-key granularity the scalar
-/// path has always called its own dot at — nothing inside the contraction
-/// or the V loop is split (the MUL-27 lesson: finer splits round values
-/// through memory and cost 10–13 %).
+/// `#[target_feature]` is not optional: without it the intrinsics lower to
+/// scalar emulation with no error. The one split-out helper is the kq dot,
+/// at the per-key granularity the scalar path has always called its own dot
+/// at — nothing inside the contraction or the V loop is split (finer splits
+/// round values through memory).
 ///
 /// # Safety
 /// The CPU must support AVX2+FMA+F16C, and the caller must hold the contract
@@ -1474,27 +1410,22 @@ unsafe fn flash_row_avx2(
 /// `matmul_q_batch` over synthetic views of `attn_kv_b`'s v-up rows — the same views
 /// `ggml_view_3d` takes, expressed as file offsets. Activation gathering is needed
 /// because `kqv_compressed` interleaves heads (`t·n_head+h`) while each head's matmul
-/// wants six consecutive 512-wide rows.
-///
-/// MUL-25: this used to be one `matmul_q` per head — sixteen pool dispatches per
-/// layer, 432 per decode step, and MUL-24 had just measured small dispatches as
-/// where the orchestration residual lives (26 µs each here). All heads share the
-/// view shape, so the whole layer is one `matmul_q_batch` call now. Values are
-/// bit-identical by the batch primitive's argument: per-pair rows and activations
-/// are exactly what the per-head calls saw.
+/// wants six consecutive 512-wide rows. All heads share the view shape, so the whole
+/// layer is one `matmul_q_batch` call — values are bit-identical by the batch
+/// primitive's argument: per-pair rows and activations are exactly what per-head
+/// `matmul_q` calls would see.
 pub fn wv_b_heads(
     gguf: &Gguf,
     wkb: &TensorInfo,
     kqv_compressed: &Tensor2,
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
-    // Profiler hook (crate::profile): SELF time — the whole call minus what its
-    // one hooked `matmul_q_batch` child recorded (see `profile::site_ns_total`).
-    // What is left is the per-head activation gather, the view builds and the
-    // scatter into `kqv_2d`. Per-piece timers were rejected on the overhead
-    // rule: a piece here is a 512-float copy, the same order as an Instant
-    // pair, so pieces would measure the timer. The subtraction form measures
-    // the shuffling once, honestly.
+    // Profiler hook: SELF time — the whole call minus what its one hooked
+    // `matmul_q_batch` child recorded (see `profile::site_ns_total`): the
+    // per-head activation gather, the view builds and the scatter into
+    // `kqv_2d`. Per-piece timers would measure the timer here (a piece is a
+    // 512-float copy, the same order as an Instant pair); the subtraction
+    // form measures the shuffling once.
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let mm_before = if lvl > 0 {
@@ -1506,8 +1437,7 @@ pub fn wv_b_heads(
         wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
     // kqv_compressed interleaves heads as t·n_head+h; a column count that is
     // not a multiple of n_head would divide to a truncated n_tokens and the
-    // gather below would read another head's tokens silently (2026-09-20
-    // hardening round).
+    // gather below would read another head's tokens silently.
     assert!(
         kqv_compressed.ne1.is_multiple_of(p.n_head),
         "wv_b_heads: kqv_compressed has {} columns, not a multiple of n_head {}",
