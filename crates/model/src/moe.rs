@@ -286,7 +286,7 @@ fn route_inner(
             weight,
         },
         Selection {
-            logits: logits.data,
+            logits: logits.into_data(),
             probs,
             ids,
             weights,
@@ -391,7 +391,7 @@ fn gather_expert_inputs(
         }
         touched |= 1 << e;
         let m = buckets.bucket(e).len();
-        let mut xb = Tensor2::zeros(x.ne0, m);
+        let mut xb = Tensor2::scratch(x.ne0, m);
         for (i, &t) in buckets.bucket(e).iter().enumerate() {
             xb.col_mut(i).copy_from_slice(x.col(t as usize));
         }

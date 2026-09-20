@@ -338,7 +338,8 @@ impl Gguf {
         let start = self.data_base as usize + t.offset as usize;
         let end = start
             .checked_add(t.nbytes as usize)
-            .ok_or(LoadError::OutOfBounds {
+            // `ok_or_else`: the eager form cloned the name on every call, hit or not.
+            .ok_or_else(|| LoadError::OutOfBounds {
                 name: t.name.clone(),
                 base: self.data_base,
                 off: t.offset,

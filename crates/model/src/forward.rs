@@ -214,11 +214,10 @@ fn add(a: &Tensor2, b: &Tensor2) -> Tensor2 {
         (b.ne0, b.ne1),
         "residual add needs both sides at the same shape"
     );
-    let out = Tensor2::from_vec(
-        a.ne0,
-        a.ne1,
-        a.data.iter().zip(&b.data).map(|(&x, &y)| x + y).collect(),
-    );
+    let mut out = Tensor2::scratch(a.ne0, a.ne1);
+    for (o, (&x, &y)) in out.data.iter_mut().zip(a.data.iter().zip(&b.data)) {
+        *o = x + y;
+    }
     if let Some(t_call) = t_call {
         profile::record_time("residual_add", t_call.elapsed().as_nanos() as u64);
     }

@@ -11,20 +11,92 @@ use std::time::Instant;
 
 /// A 2-D activation block in ggml's layout: `ne0` contiguous, `ne1` strides by
 /// `ne0`; token `t` lives at `data[t*ne0..(t+1)*ne0]` (oracle, `docs/oracle.md`).
-#[derive(Clone, PartialEq, Debug)]
+///
+/// Buffers are recycled: `Drop` hands `data` to a per-thread free list and the
+/// constructors take from it, so a steady-state step does not go to malloc for
+/// activations (`tests/alloc.rs` pins the count).
+#[derive(PartialEq, Debug)]
 pub struct Tensor2 {
     pub ne0: usize,
     pub ne1: usize,
     pub data: Vec<f32>,
 }
 
+thread_local! {
+    static FREE: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) };
+}
+/// Free-list depth per thread. A decode step keeps under twenty blocks alive at once.
+const FREE_MAX: usize = 64;
+
+/// `BLOOMERY_POISON=1` fills every `scratch` block with NaN, so a kernel that
+/// leaves a cell unwritten fails the gates loudly instead of reading a stale value.
+fn poison() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("BLOOMERY_POISON").is_ok_and(|v| v != "0"))
+}
+
+/// A block of `n` f32 off the free list, contents unspecified (stale, never
+/// uninitialized). The capacity window keeps a logits-sized block from being spent
+/// on a 2048-wide request.
+fn take_block(n: usize) -> Vec<f32> {
+    let hit = FREE
+        .try_with(|f| {
+            let mut f = f.borrow_mut();
+            let i = f
+                .iter()
+                .position(|b| b.capacity() >= n && b.capacity() <= 2 * n)?;
+            Some(f.swap_remove(i))
+        })
+        .ok()
+        .flatten();
+    match hit {
+        Some(mut b) => {
+            b.resize(n, 0.0);
+            b
+        }
+        None => vec![0.0; n],
+    }
+}
+
+impl Drop for Tensor2 {
+    fn drop(&mut self) {
+        let block = std::mem::take(&mut self.data);
+        if block.capacity() == 0 {
+            return;
+        }
+        // `try_with`: a block dropped during thread teardown just frees.
+        let _ = FREE.try_with(|f| {
+            let mut f = f.borrow_mut();
+            if f.len() < FREE_MAX {
+                f.push(block);
+            }
+        });
+    }
+}
+
+impl Clone for Tensor2 {
+    fn clone(&self) -> Self {
+        let mut out = Self::scratch(self.ne0, self.ne1);
+        out.data.copy_from_slice(&self.data);
+        out
+    }
+}
+
 impl Tensor2 {
     pub fn zeros(ne0: usize, ne1: usize) -> Self {
-        Self {
-            ne0,
-            ne1,
-            data: vec![0.0; ne0 * ne1],
+        let mut data = take_block(ne0 * ne1);
+        data.fill(0.0);
+        Self { ne0, ne1, data }
+    }
+
+    /// A block whose every cell the caller is about to write; reading one first
+    /// is a bug (`BLOOMERY_POISON` makes it a NaN).
+    pub fn scratch(ne0: usize, ne1: usize) -> Self {
+        let mut data = take_block(ne0 * ne1);
+        if poison() {
+            data.fill(f32::NAN);
         }
+        Self { ne0, ne1, data }
     }
 
     pub fn from_vec(ne0: usize, ne1: usize, data: Vec<f32>) -> Self {
@@ -34,6 +106,11 @@ impl Tensor2 {
             "Tensor2 data length must be ne0 * ne1"
         );
         Self { ne0, ne1, data }
+    }
+
+    /// The values, leaving the free list out of it (`Drop` forbids moving `data` out).
+    pub fn into_data(mut self) -> Vec<f32> {
+        std::mem::take(&mut self.data)
     }
 
     /// Column `i`, i.e. token `i`'s `ne0` contiguous values.
@@ -79,7 +156,7 @@ pub fn rms_norm(x: &Tensor2, gain: &[f32], eps: f32) -> Tensor2 {
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     assert_eq!(gain.len(), x.ne0, "rms_norm gain must be ne0 long");
-    let mut out = Tensor2::zeros(x.ne0, x.ne1);
+    let mut out = Tensor2::scratch(x.ne0, x.ne1);
     for t in 0..x.ne1 {
         let src = x.col(t);
         let mut sum = 0.0f32;
@@ -589,7 +666,7 @@ fn matmul_q_multi(
     let (slot_of, distinct) = dedupe_inputs(xs);
     let quantized = quantize_distinct(ty, k, &distinct, fused, lvl, &mut pacc);
 
-    let mut outs: Vec<Tensor2> = xs.iter().map(|x| Tensor2::zeros(n, x.ne1)).collect();
+    let mut outs: Vec<Tensor2> = xs.iter().map(|x| Tensor2::scratch(n, x.ne1)).collect();
     let pairs = build_pair_work(&mut outs, &bytes, &quantized, &slot_of, row_bytes);
     run_row_pool(&pairs, ty, k, n, lvl, &mut pacc)?;
 

@@ -123,6 +123,12 @@ gate-forward:
 gate-kv:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test kv -- --ignored --nocapture'
 
+# 할당 게이트: 정상 상태 디코드 스텝 하나가 할당자를 몇 번 부르는가(전 스레드 합).
+# 속도를 지키는 게이트는 없지만 이 원인 하나는 정수로 환원된다 — 메인 스레드가
+# 할당·0 채우기를 하는 동안 워커 전부가 논다.
+gate-alloc:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test alloc -- --ignored --nocapture'
+
 # Derived 게이트: 토큰과 무관한 wk_b Q8_0 재양자화를 로드시 한 번으로 옮겼다 —
 # 사전 계산이 값을 바꾸지 않는다. 블록은 참조 구현(테스트 안의 예전 두 루프)과
 # 바이트 동일, step(명시적 Derived)과 forward(래퍼)의 로짓은 비트 동일.

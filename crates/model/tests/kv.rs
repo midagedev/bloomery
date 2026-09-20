@@ -108,7 +108,7 @@ fn hw_kv_every_split_is_bit_exact() {
 
     // One reference per prefix length, from the uncached path.
     let refs: Vec<Vec<f32>> = (1..=tokens.len())
-        .map(|n| forward(&g, &tokens[..n]).unwrap().data)
+        .map(|n| forward(&g, &tokens[..n]).unwrap().into_data())
         .collect();
 
     let mut cache = new_cache(&g).unwrap();
