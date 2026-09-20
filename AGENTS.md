@@ -131,6 +131,12 @@ first suspect is a hung gate on the box, not the agent.
 - **Do not split a `#[target_feature]` kernel body into helpers** (measured:
   10-13 % loss). Orchestration code is ordinary Rust: a function that no longer
   fits on two screens gets split.
+- **No gate guards speed, so a round that touches the dispatch path ends with
+  a same-lease A/B.** Build the base commit in a worktree (`just build-decode`
+  there), then `just ab-decode bloomery-<track>` from the changed tree; judge
+  by the interleaved relative numbers only — the same commit moves ~5 % between
+  windows. Bit-identical is not speed-identical: an expression moved from a
+  write-into-zeros loop to `map().collect()` doubled its site.
 - `rust-toolchain.toml` at the root pins the nightly; it moves only when the
   cuda-oxide pin moves. `cuda-oxide` itself is pinned by `rev` in
   `[workspace.dependencies]`; `just deny` fails if that ever floats.

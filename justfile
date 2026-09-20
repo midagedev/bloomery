@@ -75,6 +75,10 @@ measure-sweep: build-decode
 
 # 시간 귀속. 러너가 임대와 증인을 소유한다 — 프로파일 표도 측정이고, 옆에서 빌드
 # 하나만 돌아도 site 간 비율이 흔들린다. 레벨 1(배분)과 2(단계)를 연달아 찍는다.
+# 같은 임대 안 A/B: `just ab-decode bloomery-<track> ...` (각 트리는 미리 build-decode).
+ab-decode *DIRS: build-decode
+    ./tools/box.sh 'bash tools/ref/ab-decode.sh {{DIRS}}'
+
 measure-profile: build-decode
     ./tools/box.sh 'bash tools/ref/profile-measure.sh'
 
