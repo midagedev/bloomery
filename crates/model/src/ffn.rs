@@ -77,16 +77,12 @@ pub(crate) fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
         (up.ne0, up.ne1),
         "swiglu needs gate and up at the same shape"
     );
-    let data = gate
-        .data
-        .iter()
-        .zip(&up.data)
-        .map(|(&g, &u)| {
-            let s = g / (1.0 + (-g).exp());
-            s * u
-        })
-        .collect();
-    let out = Tensor2::from_vec(gate.ne0, gate.ne1, data);
+    // Written into a zeroed block, not `map().collect()`: the collect form is
+    // slower per element and this runs once per routed expert per step.
+    let mut out = Tensor2::zeros(gate.ne0, gate.ne1);
+    for (o, (&g, &u)) in out.data.iter_mut().zip(gate.data.iter().zip(&up.data)) {
+        *o = g / (1.0 + (-g).exp()) * u;
+    }
     if let Some(t_call) = t_call {
         profile::record_time("swiglu", t_call.elapsed().as_nanos() as u64);
     }
