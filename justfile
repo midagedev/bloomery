@@ -57,6 +57,10 @@ measure-cpu:
 box-gc:
     ./tools/box.sh 'for p in $(pgrep -f "$PWD/target" || true); do exe=$(readlink /proc/$p/exe 2>/dev/null); case "$exe" in "$PWD"/*) echo "kill $p ($exe)"; kill -9 $p ;; esac; done; echo gc-done'
 
+# 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove`로 stale 삭제.
+box-tracks *ARGS:
+    ./tools/box-tracks.sh {{ARGS}}
+
 # 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
 build-decode:
     ./tools/box.sh 'cargo build --release -p bloomery-model --bin bloomery-decode'
