@@ -393,6 +393,14 @@ unsafe fn field_dot<const SHIFT: i32, const BIT: i32>(
 /// The CPU must support AVX2, and the caller must have validated lengths:
 /// `wrow` at nb*110 readable bytes, `acol` at nb*296 readable bytes
 /// (`check_q3k` does).
+// `target_feature` is not optional here. Without it this fn compiles for the
+// baseline SSE2 target and LLVM legalizes the 256-bit intrinsic bodies into
+// narrow emulated sequences — measured on the box (MUL-26, 2026-09-20,
+// `qdot-rate`): 0.3 GB/s per core plain-release vs 6+ GB/s with the feature
+// enabled, a 20x gap that sat inside every engine number since the wiring
+// round. The runtime check lives in `dot_row`; this attribute is what makes
+// the detected feature reach codegen.
+#[target_feature(enable = "avx2")]
 unsafe fn dot_q3k_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     unsafe {
         // SAFETY: AVX2 present and both slices hold nb super-blocks per the
