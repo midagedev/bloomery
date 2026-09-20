@@ -41,6 +41,7 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
                       # ops attn ffn moe head forward kv derived mt profile
                       # threads qdot prompts 1-1
     just box-gc       # kill orphan processes under this track's remote dir
+    just box-tracks   # remote track dirs vs local worktrees; --remove deletes stale ones
 
 `just gate` excludes the measure targets on purpose: they need a quiet machine
 and take a lock, so running them is a separate, deliberate act. It also excludes
@@ -81,7 +82,9 @@ Track checklist, first and last:
    explicit `timeout` — never bare `cargo test` at a prompt you are not
    watching. If a command produces no output for minutes, assume it is hung on
    the box, not thinking: check `pgrep -fa '<remote dir>'`.
-3. **Last**: `just box-gc` again, then remove the worktree.
+3. **Last**: `just box-gc` again, remove the worktree, then `just box-tracks
+   --remove` — a removed worktree leaves its remote directory (and a
+   `target/` of several hundred MB) behind on the box.
 
 A quiet agent is a symptom, not a state: when a subagent goes inactive, the
 first suspect is a hung gate on the box, not the agent.

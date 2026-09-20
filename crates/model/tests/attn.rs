@@ -1,5 +1,5 @@
 //! Gate for `model::attn`: one block's MLA attention, end to end, against the
-//! ik_llama.cpp oracle — blocks 0 and 1, every intermediate the round owns.
+//! ik_llama.cpp oracle — blocks 0 and 1, every intermediate the trace holds.
 //!
 //! `hw_` prefix: needs the box (the model file and the oracle set), excluded by default.
 //!
@@ -8,26 +8,21 @@
 //! `Tensor2`'s layout with trailing dims folded, so a shape failure here is a real
 //! mismatch and not a convention gap.
 //!
-//! Tolerance policy: the five projection/rope/norm tensors gate at 1e-4. The last three
-//! carry documented bounds instead — every one of them fails a uniform 1e-4 today
-//! (FAIL-first measured 2026-09-19 against this exact source, manifest-free probe over
-//! the same files), and the mechanism is the same in each case: `ops::matmul_q`'s f32
-//! lane order differs from the reference SIMD kernels by last-ulps (~1.5e-5 on `q`),
-//! and `quantize_act`'s int8 codes are a step function — an activation value sitting
-//! on a rounding tie flips one code, which moves a whole q_nope2 column. Measured, the
-//! flip lands in exactly one (head, token) column per block (col 32 = head 5 token 2;
-//! col 57 = head 9 token 3). [2026-09-20, MUL-21: after the Q3_K fused wiring the
-//! seats moved — block 0 flips cols 32 and 62, block 1 flips none; two flips total,
-//! same as before, redistributed. The `max_cols` pin followed to 2; see the call site.]
-//! The attention arithmetic itself is a transcription: fed the
-//! oracle's own q_rope/q_nope2/kvr, the scalar path reproduces `kqv_compressed`
-//! with max |diff| = 0 (`hw_attn_exact_input_stages` asserts that at tolerance
-//! zero, on the `flash_attn_latent_scalar` leg). Since MUL-36 the default
-//! dispatch runs the AVX2+FMA+F16C twin, whose kq dot sums in 8-lane groups
-//! instead of the fa4 two-partial chain — ULP-scale off ik's bits, banded
-//! against the scalar path by `hw_flash_simd_bands_against_scalar` and by the
-//! dispatch leg of the exact-input test. The bounds cover two simultaneous tie flips, so an upstream `matmul_q` change that
-//! moves a tie re-reds the gate instead of silently widening it.
+//! Tolerance policy: the five projection/rope/norm tensors gate at 1e-4. The last
+//! three carry documented bounds instead — every one of them fails a uniform 1e-4,
+//! and the mechanism is the same in each case: `ops::matmul_q`'s f32 lane order
+//! differs from the reference SIMD kernels by last-ulps, and `quantize_act`'s int8
+//! codes are a step function — an activation value sitting on a rounding tie flips
+//! one code, which moves a whole q_nope2 column. The bounds cover two simultaneous
+//! tie flips, so an upstream `matmul_q` change that moves a tie re-reds the gate
+//! instead of silently widening it. The attention arithmetic itself is a
+//! transcription: fed the oracle's own q_rope/q_nope2/kvr, the scalar path
+//! reproduces `kqv_compressed` bit-exactly (`hw_attn_exact_input_stages`, tolerance
+//! zero, on the `flash_attn_latent_scalar` leg). The default dispatch runs the
+//! AVX2+FMA+F16C twin, whose kq dot sums in 8-lane groups instead of the fa4
+//! two-partial chain — ULP-scale off ik's bits, banded against the scalar path by
+//! `hw_flash_simd_bands_against_scalar` and by the dispatch leg of the exact-input
+//! test.
 #[path = "common/oracle.rs"]
 mod oracle;
 
@@ -65,28 +60,14 @@ fn check(o: &oracle::Oracle, got: &Tensor2, name: &str, occ: u32, what: &str, to
     oracle::assert_close(&got.data, &want, tol, what);
 }
 
-/// The same check, plus the shape of the deviation — for a tensor whose bound exists only
-/// to admit a tie flip. Lead-added 2026-09-19 on adoption.
+/// The same check, plus the shape of the deviation — for a tensor whose bound
+/// exists only to admit a tie flip.
 ///
-/// A blanket `3e-2` on `q_nope2` says "anything in these 49152 values may be 0.5 % wrong",
-/// which is not what the round measured and not what we want to allow. What it measured is
-/// that the flip is confined to ONE (head, token) column per block — 373 and 377 elements,
-/// all sharing a column index. So the gate states that instead: every element is within
-/// `strict`, EXCEPT elements lying in at most `max_cols` columns, which get `loose`.
-///
-/// `max_cols` was 1 at adoption (2026-09-19) on the argument below — that a SECOND
-/// flipped column is the "upstream `matmul_q` change" event and must re-red the gate.
-/// That event then happened (MUL-21, 2026-09-20: the Q3_K fused wiring re-seated the
-/// ties; two columns in block 0, none in block 1, flip total unchanged) — the gate
-/// reded, it was looked at with a both-ways control, and the pin moved to 2 WITH the
-/// same discipline: a third column re-reds. The argument is not retired; it has fired
-/// once and was adjudicated in the call site's dated note.
-///
-/// This is a tightening, so no re-authoring evidence is owed — but it was measured both
-/// ways anyway (2026-09-19, box): it passes on this source at 1 column per block, and
-/// adding 5e-4 to a single element in column 7 reds it with
-/// `2 columns deviate past 1e-4 ... Columns: [7, 32]`, while the blanket 3e-2 it replaces
-/// stayed green through that same perturbation.
+/// A blanket `3e-2` on `q_nope2` says "anything in these 49152 values may be 0.5 %
+/// wrong", which is not what we want to allow. The gate states the confinement
+/// instead: every element is within `strict`, EXCEPT elements lying in at most
+/// `max_cols` columns, which get `loose`. A tie flip moves ONE column; a SECOND
+/// deviating column is an upstream `matmul_q` change event and must re-red the gate.
 fn check_confined(
     o: &oracle::Oracle,
     got: &Tensor2,
@@ -142,9 +123,7 @@ fn check_block(o: &oracle::Oracle, n: usize) {
     // the manifest: q, kv_rope_compressed, kvr, q_nope2, kqv_compressed, kqv_out are
     // occurrence 0; q_rope and kv_compressed are occurrence 1 (occurrence 0 is the
     // pre-ROPE / pre-norm VIEW).
-    //
-    // Measured max |diff| (2026-09-19): blk0 / blk1.
-    check(o, &tr.q, &format!("q-{n}"), 0, &format!("q-{n}"), 1e-4); // 1.5e-5 / 1.5e-5
+    check(o, &tr.q, &format!("q-{n}"), 0, &format!("q-{n}"), 1e-4);
     check(
         o,
         &tr.kv_rope_compressed,
@@ -152,7 +131,7 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         0,
         &format!("kv_rope_compressed-{n}"),
         1e-4,
-    ); // 1.9e-5 / 5.1e-5
+    );
     check(
         o,
         &tr.q_rope,
@@ -160,7 +139,7 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         1,
         &format!("q_rope-{n} (rope out)"),
         1e-4,
-    ); // 1.5e-5 / 1.5e-5
+    );
     check(
         o,
         &tr.kv_compressed,
@@ -168,7 +147,7 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         1,
         &format!("kv_compressed-{n} (normed latent)"),
         1e-4,
-    ); // 1.4e-6 / 1.1e-6
+    );
     check(
         o,
         &tr.kvr,
@@ -176,20 +155,13 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         0,
         &format!("kvr-{n}"),
         1e-4,
-    ); // 8.6e-6 / 5.1e-5
-    // One flipped activation code moves one whole column; bound covers two flips.
-    // Measured 2.5e-3 / 1.1e-2 (373 and 377 of 49152 elements above 1e-4, one column
-    // each); exact-input companion is 3.8e-6 / 9.5e-7.
-    //
-    // Re-pinned 1 -> 2 columns by the LEAD on 2026-09-20, on the MUL-21 fused wiring.
-    // This is the event the max_cols=1 pin was built to catch, and it was caught and
-    // looked at: routing Q3_K through `crates/qdot` moved every Q3_K logit, which
-    // re-seated `quantize_act`'s ties. Measured on the box, same tree, both ways:
-    // fused -> block 0 deviates in cols [32, 62] and block 1 in none; scalar restore
-    // -> block 0 [32], block 1 [57], green. The flip TOTAL across blocks is unchanged
-    // at two — the upstream moved them between blocks, it did not add a fault class,
-    // and the exact-input companion still passes (bit-exact stage B). A THIRD column
-    // reds the gate again; that discipline moves with the pin.
+    );
+    // One flipped activation code moves one whole column; the bound covers two
+    // simultaneous flips (see `check_confined`).
+    // PIN(2026-09-20): max_cols 1 -> 2 — the Q3_K fused wiring re-seated
+    // `quantize_act`'s ties (two columns in block 0, none in block 1; flip total
+    // across blocks unchanged, exact-input companion still bit-exact). A THIRD
+    // column reds the gate.
     check_confined(
         o,
         &tr.q_nope2,
@@ -200,8 +172,8 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         3e-2,
         2,
     );
-    // Softmax damps the same tie-flip spikes ~100x. Measured 1.2e-4 / 8.1e-5; the
-    // exact-input companion is bit-exact (0), so nothing here is attention arithmetic.
+    // Softmax damps the same tie-flip spikes; the exact-input companion is
+    // bit-exact, so nothing here is attention arithmetic.
     check(
         o,
         &tr.kqv_compressed,
@@ -211,7 +183,6 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         5e-4,
     );
     // wv_b (Q3_K) and the output projection amplify the kqv_compressed residual.
-    // Measured 8.9e-4 / 2.7e-4; exact-input companion 1.4e-5 / 3.3e-7.
     check(
         o,
         &tr.kqv_out,
@@ -267,10 +238,10 @@ fn hw_attn_exact_input_stages() {
         let n_tok = 6usize;
         let slots: Vec<Slot> = (0..n_tok as u32).map(|t| Slot { seq: 0, pos: t }).collect();
 
-        // A: the absorption (Q8_0 requant + block_q8_2 activation + f64 block dot).
-        // Measured 3.8e-6 / 9.5e-7 — quantizer and dot conventions, no order slack
-        // beyond the f64-accumulated block sum. The Q8_0 weights come from `Derived`
-        // now (byte-identical to the in-place build by `tests/derived.rs`).
+        // A: the absorption (Q8_0 requant + block_q8_2 activation + f64 block dot)
+        // — quantizer and dot conventions, no order slack beyond the f64-accumulated
+        // block sum. The Q8_0 weights come from `Derived` (byte-identical to the
+        // in-place build by `tests/derived.rs`).
         let q_exact = load2(&format!("q-{blk}"), 0);
         let derived = model::derived::Derived::new(&g).unwrap();
         let out = model::attn::q_nope2_absorbed(derived.wk_b_all_heads(blk).unwrap(), &q_exact, &p)
@@ -282,14 +253,13 @@ fn hw_attn_exact_input_stages() {
             "stage A: absorption arithmetic"
         );
 
-        // B: the attention proper — two legs since MUL-36 (2026-09-20).
+        // B: the attention proper — two legs.
         //
         // The scalar leg (`flash_attn_latent_scalar`, the no-AVX2 fallback)
-        // keeps tolerance ZERO, the property this gate has always proven:
-        // fed the kernel's exact inputs, the scalar transcription reproduces
-        // the kernel's exact outputs bit for bit. It is also the A/B control
-        // for the dispatch leg in the same run — the wiring around the
-        // kernel changed nothing else.
+        // keeps tolerance ZERO: fed the kernel's exact inputs, the scalar
+        // transcription reproduces the kernel's exact outputs bit for bit,
+        // and doubles as the wiring control for the dispatch leg in the same
+        // run.
         //
         // The dispatch leg (AVX2+FMA+F16C on this box) re-pins the former
         // 0.0. Its kq dot sums in 8-lane groups (four FMA partials + a
@@ -302,13 +272,10 @@ fn hw_attn_exact_input_stages() {
         // the max scan's m, the factor 2), the softmax output is a convex
         // combination with S ≥ 1 (the argmax key's weight is exactly
         // `v_expf(0)` = 1), and a convex combination moves by at most
-        // max|Δw| times the spread of the values it mixes. Attribution: the
-        // V stage cannot contribute — its j-axis lanes preserve every output
+        // max|Δw| times the spread of the values it mixes. The V stage
+        // cannot contribute — its j-axis lanes preserve every output
         // element's key-order FMA chain, bit-identical by construction — so
-        // the whole leg-B difference is the kq sum order. Measured 2026-09-20
-        // on this tree (both blocks, joint worst): δ-band 2.13e-4, realized
-        // max|diff| 1.31e-6 — ~160x headroom, and the scalar leg at 0 in the
-        // same run is the wiring control.
+        // the whole leg-B difference is the kq sum order.
         let q_rope_exact = load2(&format!("q_rope-{blk}"), 1);
         let q_nope2_exact = load2(&format!("q_nope2-{blk}"), 0);
         let kvr_exact = load2(&format!("kvr-{blk}"), 0);
@@ -383,7 +350,6 @@ fn hw_attn_exact_input_stages() {
         oracle::assert_close(&kqv.data, &want.data, band, "stage B simd: banded");
 
         // C: wv_b (Q3_K view) + output projection — generic `matmul_q` order slack.
-        // Measured 1.4e-5 / 3.3e-7.
         let kqv_exact = load2(&format!("kqv_compressed-{blk}"), 0);
         let kqv_2d = model::attn::wv_b_heads(&g, wkb, &kqv_exact, &p).unwrap();
         let wo = g.find(&format!("blk.{blk}.attn_output.weight")).unwrap();
@@ -414,9 +380,9 @@ impl Lcg {
     }
 }
 
-/// MUL-36: the AVX2 flash kernel against its scalar twin on synthetic data —
-/// the scalar path IS the oracle here (same values, ik's own sum order), so
-/// this needs no model file and no dump, only AVX2+FMA+F16C.
+/// The AVX2 flash kernel against its scalar twin on synthetic data — the
+/// scalar path IS the oracle here (same values, ik's own sum order), so this
+/// needs no model file and no dump, only AVX2+FMA+F16C.
 ///
 /// The kq band is the textbook reassociation bound: both sum orders round at
 /// most `d_head` times, each rounding at most one unit-in-the-last-place
@@ -427,10 +393,7 @@ impl Lcg {
 /// 2), the softmax output is a convex combination with S ≥ 1 (the argmax
 /// key's weight is exactly `v_expf(0)` = 1), so the output moves by at most
 /// 2·kq_scale·δ·n_keys·spread(V). Prints the realized worst against both so
-/// a run says how much headroom each leaves. Measured 2026-09-20 on this
-/// tree: kq realized 1.30e-4 against the bound 1.34e-1 (~1000x — the
-/// textbook bound assumes every rounding aligns, which random data never
-/// does), flash realized 1.17e-5 against its band 1.62e-2.
+/// a run says how much headroom each leaves.
 #[test]
 #[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
 fn hw_flash_simd_bands_against_scalar() {
@@ -559,4 +522,204 @@ fn kq_reassoc_band(q: &[f32], k: &[u16]) -> f32 {
         .map(|(&qi, &ki)| qi.abs() * gguf::quant::half_to_f32(ki).abs())
         .sum();
     2.0 * q.len() as f32 * 2.0f32.powi(-24) * sum_abs
+}
+
+/// The synthetic deterministic batch the flash-SIMD lever test runs on: the
+/// real MLA's shapes (576-wide row, 512 latent — a shape the SIMD path WOULD
+/// take: row width % 32 == 0, latent % 8 == 0) at a small head/token count.
+/// No model file, no oracle — only the box's ISA. One struct so the re-exec
+/// child and its parent test consume the same bytes.
+struct FlashLeverFixture {
+    p: model::attn::MlaParams,
+    q_rope: Tensor2,
+    q_nope2: Tensor2,
+    keys16: Vec<Vec<u16>>,
+    key_slots: Vec<Slot>,
+    q_slots: Vec<Slot>,
+}
+
+fn flash_lever_fixture() -> FlashLeverFixture {
+    let p = model::attn::MlaParams {
+        n_head: 2,
+        kq_head: 576,
+        nope: 512,
+        rope_dims: 64,
+        v_head: 128,
+        latent: 512,
+        eps: 1e-6,
+        // The rope fields are dead here — flash reads only the dims.
+        rope: model::attn::RopeParams {
+            n_dims: 64,
+            freq_base: 1e4,
+            freq_scale: 0.025,
+            ext_factor: 1.0,
+            mscale_param: 0.7,
+            corr_dims: [10.0, 23.0],
+            theta_scale: 0.8,
+        },
+        kq_scale: 0.078,
+    };
+    let mut rng = Lcg(0x1eed_0000_beef_cafe);
+    let n_tok = 3usize;
+    let n_keys = 100usize;
+
+    let mut q_rope = Tensor2::zeros(p.rope_dims, p.n_head * n_tok);
+    let mut q_nope2 = Tensor2::zeros(p.latent, p.n_head * n_tok);
+    for t in 0..n_tok {
+        for h in 0..p.n_head {
+            for v in q_rope.col_mut(t * p.n_head + h).iter_mut() {
+                *v = rng.range(-3.0, 3.0);
+            }
+            for v in q_nope2.col_mut(h * n_tok + t).iter_mut() {
+                *v = rng.range(-3.0, 3.0);
+            }
+        }
+    }
+    let mut keys16: Vec<Vec<u16>> = Vec::with_capacity(n_keys);
+    for _ in 0..n_keys {
+        let row: Vec<u16> = (0..p.rope_dims + p.latent)
+            .map(|_| model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)))
+            .collect();
+        keys16.push(row);
+    }
+    // Every query keeps at least one allowed key; the key count crosses
+    // three whole 32-key blocks plus a partial fourth.
+    let key_slots: Vec<Slot> = (0..n_keys)
+        .map(|u| Slot {
+            seq: if u < 50 { 0 } else { 1 },
+            pos: (u % 25) as u32,
+        })
+        .collect();
+    let q_slots: Vec<Slot> = [24u32, 0, 5]
+        .iter()
+        .map(|&pos| Slot { seq: 0, pos })
+        .collect();
+    FlashLeverFixture {
+        p,
+        q_rope,
+        q_nope2,
+        keys16,
+        key_slots,
+        q_slots,
+    }
+}
+
+/// The re-exec entry point of [`hw_flash_simd_lever_forces_scalar`]. Not a
+/// test of its own: when `BLOOMERY_FLASH_SIMD_CHILD_DUMP` is absent (i.e.
+/// someone ran the file directly) it returns without doing anything — the
+/// pattern `tests/mt.rs`'s child helper set.
+#[test]
+#[ignore = "hw: re-exec child of hw_flash_simd_lever_forces_scalar; standalone it is a no-op"]
+fn hw_flash_simd_lever_child_dump() {
+    let Ok(dump) = std::env::var("BLOOMERY_FLASH_SIMD_CHILD_DUMP") else {
+        eprintln!("lever child: no BLOOMERY_FLASH_SIMD_CHILD_DUMP, nothing to do");
+        return;
+    };
+    let f = flash_lever_fixture();
+    // The public dispatch: with BLOOMERY_FLASH_SIMD=0 the OnceLock in
+    // `flash_simd` must force the scalar row twin for the whole process.
+    let out = model::attn::flash_attn_latent(
+        &f.q_rope,
+        &f.q_nope2,
+        &f.keys16,
+        &f.key_slots,
+        &f.q_slots,
+        &f.p,
+    );
+    let bytes: Vec<u8> = out.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(&dump, &bytes).unwrap();
+    eprintln!(
+        "lever child: {} f32 ({} bytes) dumped to {dump}",
+        out.data.len(),
+        bytes.len()
+    );
+}
+
+/// `BLOOMERY_FLASH_SIMD=0` is the A/B instrument of record for re-pins, so
+/// the env branch (`flash_simd`'s OnceLock) must be exercised. The lever is
+/// proven the only way a process-wide flag can be: a re-exec'd child of this binary —
+/// same code, same fixture, the env var set — runs the PUBLIC
+/// `flash_attn_latent` and dumps its output bytes; the parent requires those
+/// bytes to equal its own in-process `flash_attn_latent_scalar` run on the
+/// same fixture. A broken lever (the child silently running the SIMD twin)
+/// moves the output by the kq sum-order ULPs and reds the byte compare.
+#[test]
+#[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
+fn hw_flash_simd_lever_forces_scalar() {
+    let f = flash_lever_fixture();
+
+    // The scalar oracle, in-process: the bit-exact twin the SIMD path is
+    // banded against by `hw_flash_simd_bands_against_scalar`.
+    let want = model::attn::flash_attn_latent_scalar(
+        &f.q_rope,
+        &f.q_nope2,
+        &f.keys16,
+        &f.key_slots,
+        &f.q_slots,
+        &f.p,
+    );
+    let want_bytes: Vec<u8> = want.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    // The child: fresh process, BLOOMERY_FLASH_SIMD=0, public entry point.
+    let exe = std::env::current_exe().unwrap();
+    let dump =
+        std::env::temp_dir().join(format!("bloomery-flash-lever-{}.f32", std::process::id()));
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "hw_flash_simd_lever_child_dump",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BLOOMERY_FLASH_SIMD", "0")
+        .env("BLOOMERY_FLASH_SIMD_CHILD_DUMP", &dump)
+        .output()
+        .expect("re-exec of this test binary");
+    assert!(
+        out.status.success(),
+        "lever child failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = std::fs::read(&dump).unwrap();
+    let at = got.iter().zip(&want_bytes).position(|(x, y)| x != y);
+    assert_eq!(
+        got,
+        want_bytes,
+        "BLOOMERY_FLASH_SIMD=0 did not force the scalar path: the child's \
+         flash_attn_latent output differs from flash_attn_latent_scalar \
+         (first differing byte at {at:?} of {})",
+        got.len()
+    );
+    eprintln!(
+        "lever child (env-forced) vs in-process scalar: byte-identical ({} bytes)",
+        got.len()
+    );
+
+    // Evidence only, deliberately NOT asserted: the parent's own dispatch
+    // leg (env unset, SIMD on this box) against the same scalar twin. It
+    // differing is expected — the documented kq reassociation band; it
+    // being byte-identical would mean this fixture cannot tell the two row
+    // twins apart, in which case the compare above proves nothing.
+    let simd = model::attn::flash_attn_latent(
+        &f.q_rope,
+        &f.q_nope2,
+        &f.keys16,
+        &f.key_slots,
+        &f.q_slots,
+        &f.p,
+    );
+    let same = simd
+        .data
+        .iter()
+        .zip(&want.data)
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    eprintln!(
+        "parent in-process flash_attn_latent (SIMD, env unset): {} the scalar twin on this fixture",
+        if same {
+            "byte-identical to"
+        } else {
+            "differs from"
+        }
+    );
 }
