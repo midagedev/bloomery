@@ -1221,10 +1221,11 @@ unsafe fn flash_row_avx2(
                 // Each key row is its own heap Vec, so the hardware
                 // prefetcher restarts at every row boundary; pull the next
                 // row's lines while this one is dotted. Decode rows only
-                // (`n_tokens == 1`): a prefill row meets every key in cache
-                // already, and the hint there cost prefill 2 % at depth 4096
-                // (rig-log 09-21-e). A prefetch is a cache hint, never a
-                // value — no scalar twin of this.
+                // (`n_tokens == 1`): measured, the hint on prefill rows cost
+                // prefill 2 % at depth 4096 and bought nothing, and gating it
+                // here removed that cost (rig-log 09-21-e). A speculative
+                // step (`n_tokens = k`) also skips it. A prefetch is a cache
+                // hint, never a value — no scalar twin of this.
                 if n_tokens == 1 {
                     if let Some(next) = keys16.get(u + 1) {
                         let base = next.as_ptr().cast::<u8>();
