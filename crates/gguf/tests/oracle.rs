@@ -196,3 +196,25 @@ fn hw_dequant_matches_ggml() {
         println!("  {n:6} {d:.3e}");
     }
 }
+
+/// The resident backings hold the file's bytes at the file's offsets: every
+/// tensor slice equals the mapped one, so no gate downstream can tell them apart.
+#[test]
+#[ignore = "hw: needs the model on the box"]
+fn hw_resident_copy_is_the_file() {
+    let mapped = Gguf::open(MODEL).expect("open model");
+    for huge in [false, true] {
+        let res = Gguf::open_backed(MODEL, gguf::Weights::Resident { huge }).expect("resident");
+        assert_eq!(res.tensor_count(), mapped.tensor_count());
+        for i in 0..mapped.tensor_count() {
+            let t = mapped.tensor(i).unwrap();
+            let a = mapped.data(t).unwrap();
+            let b = res.data(res.tensor(i).unwrap()).unwrap();
+            assert!(
+                a == b,
+                "tensor {} differs in the resident copy (huge={huge})",
+                t.name
+            );
+        }
+    }
+}

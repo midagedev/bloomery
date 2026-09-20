@@ -89,9 +89,24 @@ fn main() {
     );
     // `BLOOMERY_POPULATE=0` keeps the lazy mapping, for the A/B.
     let populate = std::env::var("BLOOMERY_POPULATE").map_or(true, |v| v != "0");
-    let g = gguf::Gguf::open_with(&model, populate).expect("model file");
+    // `BLOOMERY_WEIGHTS=anon|huge` copies the file into anonymous memory (4 KiB or
+    // transparent 2 MiB pages) instead of running off the page cache, for the A/B.
+    let weights = match std::env::var("BLOOMERY_WEIGHTS").as_deref() {
+        Ok("anon") => gguf::Weights::Resident { huge: false },
+        Ok("huge") => gguf::Weights::Resident { huge: true },
+        _ => gguf::Weights::Mapped { populate },
+    };
+    let g = gguf::Gguf::open_backed(&model, weights).expect("model file");
     println!("model  {model}");
-    println!("open   {:?} (mmap, no dequant)", t_open.elapsed());
+    println!("open   {:?} ({weights:?}, no dequant)", t_open.elapsed());
+    if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+        for l in s
+            .lines()
+            .filter(|l| l.starts_with("AnonHugePages") || l.starts_with("Rss"))
+        {
+            println!("mem    {l}");
+        }
+    }
     // The wk_b Q8_0 requant, once per model instead of once per step. Its own
     // line for the same reason `open` gets one: it is load-time work, and mixing
     // it into the prefill or decode timings below would misattribute it.

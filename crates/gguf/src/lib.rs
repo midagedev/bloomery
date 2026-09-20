@@ -30,7 +30,7 @@ pub use quant::{
 use std::fs::File;
 use std::path::Path;
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 
 /// One GGUF metadata value. Tags are the on-disk value-type ids:
 /// 0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 f32, 7 bool, 8 string,
@@ -100,12 +100,38 @@ pub enum LoadError {
 pub struct Gguf {
     // Kept alive for the mapping's lifetime; the mapping borrows the fd.
     _file: File,
-    map: Mmap,
+    map: Backing,
     meta: Vec<(String, Value)>,
     tensors: Vec<TensorInfo>,
     /// File offset where the (aligned) tensor data section starts.
     data_base: u64,
     alignment: u64,
+}
+
+/// Where the file's bytes live while the model runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Weights {
+    /// The file mapping itself: page cache, 4 KiB pages.
+    Mapped { populate: bool },
+    /// A private anonymous copy; `huge` asks for transparent 2 MiB pages before
+    /// the first touch. Same bytes at the same offsets, so nothing downstream
+    /// can tell — only the TLB reach and the prefetcher's page boundaries move.
+    Resident { huge: bool },
+}
+
+enum Backing {
+    File(Mmap),
+    Anon(MmapMut),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Backing::File(m) => m,
+            Backing::Anon(m) => m,
+        }
+    }
 }
 
 impl Gguf {
@@ -120,16 +146,37 @@ impl Gguf {
     /// a MoE keeps meeting untouched experts for hundreds of steps; a process
     /// that will decode pays that once here instead. Tests open lazily.
     pub fn open_with(path: impl AsRef<Path>, populate: bool) -> Result<Gguf, LoadError> {
+        Self::open_backed(path, Weights::Mapped { populate })
+    }
+
+    /// `open`, with the caller choosing where the bytes live.
+    pub fn open_backed(path: impl AsRef<Path>, weights: Weights) -> Result<Gguf, LoadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         let mut opts = memmap2::MmapOptions::new();
-        if populate {
+        if weights == (Weights::Mapped { populate: true }) {
             opts.populate();
         }
         // SAFETY: the file is opened read-only and nothing maps it writable;
         // a concurrent truncation would surface as SIGBUS, the same contract
         // ik_llama.cpp's own mmap loader accepts.
-        let map = unsafe { opts.map(&file)? };
+        let file_map = unsafe { opts.map(&file)? };
+        let map = match weights {
+            Weights::Mapped { .. } => Backing::File(file_map),
+            Weights::Resident { huge } => {
+                let mut anon = memmap2::MmapOptions::new().len(len as usize).map_anon()?;
+                // Before the first touch: a page faulted in small stays small
+                // until khugepaged gets to it.
+                #[cfg(target_os = "linux")]
+                if huge {
+                    anon.advise(memmap2::Advice::HugePage)?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = huge;
+                anon.copy_from_slice(&file_map);
+                Backing::Anon(anon)
+            }
+        };
 
         let mut rd = Reader {
             b: &map,
