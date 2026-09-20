@@ -8,7 +8,10 @@
 
 use gguf::GgmlType;
 use gguf::quant::{dequant_row, quantize_row_q8_k_roundtrip};
-use qdot::{QdotError, col_bytes, dot_row, dot_row_avx2, dot_row_scalar, quantize_col, supports};
+use qdot::{
+    QdotError, col_bytes, dot_row, dot_row_avx2, dot_row_scalar, quantize_col, quantize_col_scalar,
+    supports,
+};
 
 fn model_path() -> String {
     std::env::var("BLOOMERY_MODEL")
@@ -1055,4 +1058,436 @@ fn swiglu_matches_scalar_and_is_position_independent() {
     let mut ends = [0.0f32; 2];
     qdot::swiglu(&[-200.0, 200.0], &[1.0, 1.0], &mut ends);
     assert_eq!(ends, [-0.0, 200.0]);
+}
+
+// ------------------------------------------- quantize_col AVX2 encoders
+// The activation encoders behind `quantize_col` run AVX2 when the CPU has it;
+// the scalar loops stay as the fallback and as this section's oracle. Every
+// test compares the dispatched `quantize_col` against `quantize_col_scalar`
+// on the bytes, and pins hand-computed bytes wherever the value is derivable
+// without borrowing either implementation.
+//
+// Contract <-> assertion table (q8_K = block_q8_K, q8_2 = block_q8_2_x4/tail):
+//
+// | contract (scalar semantics)                                    | assertion |
+// |----------------------------------------------------------------|-----------|
+// | q8_K: amax = max abs; max = FIRST value reaching it (strict >) | first-max ties: +/-m planted both orders, every one of the 8 lane positions, first and last 8-lane group, plus a third same-sign copy; d bytes checked against a hand first-scan |
+// | q8_K: iscale = -127/max, plain f32 ops, no FMA; d = 1/iscale   | tie columns at max = +/-127 make iscale = -/+1.0 exact; d bytes and all 256 codes checked |
+// | q8_K: code = min(127, nearest_int(iscale*v)) as i8             | products exactly n+0.5, even and odd n, both signs, both iscale signs; expected codes from the test-side round-ties-even oracle |
+// | q8_K: amax == 0 -> the whole 296-byte block is zero            | all +0.0, all -0.0, zero blocks mixed with live ones (both block slots) |
+// | q8_K layout: d@0..4, 0@4..8, codes@8..264, 16 i16 sums@264..296| every case compares the full byte range |
+// | q8_2: d = bf16(amax/127), id = 1/d if d > 0 else 0             | amax ~1e-40 (bf16 underflows to 0 -> codes 0); amax ~1e-38 (smallest bf16 subnormal, 1/d overflows to inf -> codes 0); bf16 tie-round blocks assert d bits |
+// | q8_2: code = nearest_int(v*id) as i8, NO clamp                 | tie columns with d = 1.0 and 2.0 exact (id = 1.0/0.5, products exact); expected codes from the same round-ties-even oracle |
+// | q8_2 layout: 4 x [bf16 d @2ir, i16 isum @8+2ir, codes @16+32ir] in a zero-filled 144 B group; 36 B tail = [d, isum, codes] | shapes with 0 and 1-3 tail blocks; zero group/tail bytes checked directly |
+// | byte identity on finite inputs                                | >= 200 pseudo-random columns per type per shape, magnitudes 1e-6..1e4, forced +/-max ties and zeros folded in |
+// | out of scope: NaN inputs (scalar Rust max and vmaxps disagree on NaN ordering); the encoders' domain is finite f32 | none (domain statement) |
+
+/// Deterministic LCG (Knuth MMIX) — the sweep must not grow a `rand` dependency.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+
+    /// Uniform in [-1, 1).
+    fn unit(&mut self) -> f32 {
+        (self.next_u32() as f32) / 2147483648.0 - 1.0
+    }
+}
+
+/// Round to nearest, ties to even — `nearest_int`'s semantics on the
+/// encoders' |y| <= 127 domain, as an oracle independent of both encoders.
+fn round_ties_even(v: f32) -> i32 {
+    let r = v.round(); // ties away from zero; fix the half cases to even
+    if (v - r).abs() == 0.5 && r % 2.0 != 0.0 {
+        (r - v.signum()) as i32
+    } else {
+        r as i32
+    }
+}
+
+/// The gates below only mean something where the AVX2 encoder is running.
+fn require_quantizer_avx2() {
+    assert!(
+        supports(GgmlType::Q3_K),
+        "this gate compares quantize_col's AVX2 path against the scalar mirror; this CPU has no AVX2"
+    );
+}
+
+/// Byte identity of the dispatched encoder against the scalar mirror, first
+/// differing byte named in the panic.
+fn assert_col_bit_identical(w: GgmlType, x: &[f32]) {
+    let mut a = vec![0u8; col_bytes(w, x.len())];
+    let mut b = vec![0u8; a.len()];
+    quantize_col(w, x, &mut a);
+    quantize_col_scalar(w, x, &mut b);
+    for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+        assert_eq!(
+            p,
+            q,
+            "{w:?} k = {}: byte {i}: avx2 {p:02x} != scalar {q:02x}",
+            x.len()
+        );
+    }
+}
+
+/// Sweep: 200 pseudo-random columns per type per shape over magnitudes
+/// 1e-6..1e4, with forced +/-max ties (both signs at max magnitude — the
+/// first-max pick decides) and zeros (both signs) folded in.
+#[test]
+fn quantize_col_random_bit_identical() {
+    require_quantizer_avx2();
+    // Q4_K/Q6_K k is whole 256-value super-blocks (k_granularity); the x4
+    // groups still tile the column 128 values at a time. Q5_0/Q5_1 take any
+    // 32-multiple, including 1-3 tail blocks past the groups.
+    let shapes: &[(GgmlType, &[usize])] = &[
+        (GgmlType::Q3_K, &[256, 512, 2048]),
+        (GgmlType::Q4_K, &[256, 512, 2048]),
+        (GgmlType::Q6_K, &[256, 512, 2048]),
+        (GgmlType::Q5_0, &[128, 160, 192, 352]),
+        (GgmlType::Q5_1, &[128, 192, 10944]),
+    ];
+    const COLS: usize = 200;
+    const MAGS: [f32; 11] = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10.0, 1e2, 1e3, 1e4];
+    let mut rng = Lcg(0x5EED_0AAC_5EED);
+    for &(w, ks) in shapes {
+        for &k in ks {
+            for c in 0..COLS {
+                let mag = MAGS[c % MAGS.len()];
+                let x: Vec<f32> = (0..k)
+                    .map(|i| {
+                        if i % 193 == 7 {
+                            -0.0
+                        } else if i % 97 == 3 {
+                            0.0
+                        } else if i % 89 == 11 {
+                            mag
+                        } else if i % 89 == 45 {
+                            -mag
+                        } else {
+                            rng.unit() * mag
+                        }
+                    })
+                    .collect();
+                assert_col_bit_identical(w, &x);
+            }
+        }
+    }
+}
+
+/// All-zero columns (both zero signs) and zero blocks beside live ones: the
+/// q8_K zero block is 296 zero bytes; the q8_2 zero group is 144 and the
+/// zero tail 36.
+#[test]
+fn quantize_col_zero_blocks_bit_identical() {
+    require_quantizer_avx2();
+    for fill in [0.0f32, -0.0] {
+        assert_col_bit_identical(GgmlType::Q3_K, &vec![fill; 512]);
+        assert_col_bit_identical(GgmlType::Q5_0, &vec![fill; 128]);
+    }
+    // q8_K: an all-zero middle block between live ones.
+    let mut mixed = vec![0.25f32; 768];
+    for v in mixed[256..512].iter_mut() {
+        *v = -0.0;
+    }
+    assert_col_bit_identical(GgmlType::Q3_K, &mixed);
+    let mut out = vec![0u8; col_bytes(GgmlType::Q3_K, 768)];
+    quantize_col(GgmlType::Q3_K, &mixed, &mut out);
+    assert!(
+        out[296..592].iter().all(|&b| b == 0),
+        "the all-zero middle q8_K block must be 296 zero bytes"
+    );
+    // q8_2: a zero group before live tails, and a zero tail after a live group.
+    let mut x = vec![0.5f32; 192];
+    for v in x[..128].iter_mut() {
+        *v = 0.0;
+    }
+    assert_col_bit_identical(GgmlType::Q5_0, &x);
+    let mut out = vec![0u8; col_bytes(GgmlType::Q5_0, 192)];
+    quantize_col(GgmlType::Q5_0, &x, &mut out);
+    assert!(
+        out[..144].iter().all(|&b| b == 0),
+        "the all-zero group must be 144 zero bytes"
+    );
+    let mut x = vec![0.5f32; 160];
+    for v in x[128..].iter_mut() {
+        *v = -0.0;
+    }
+    assert_col_bit_identical(GgmlType::Q5_1, &x);
+    let mut out = vec![0u8; col_bytes(GgmlType::Q5_1, 160)];
+    quantize_col(GgmlType::Q5_1, &x, &mut out);
+    assert!(
+        out[144..].iter().all(|&b| b == 0),
+        "the all-zero tail must be 36 zero bytes"
+    );
+}
+
+/// q8_K first-max ties: the signed `max` is the value of the FIRST element
+/// reaching amax. A wrong pick flips iscale's sign with it, and with it every
+/// code in the block — planted ties make that loud. Both super-blocks of a
+/// k = 512 column carry the pattern so both block slots are covered.
+#[test]
+fn quantize_col_q8k_first_max_ties() {
+    require_quantizer_avx2();
+    let k = 512usize;
+    let mut rng = Lcg(0xAB57_F1F1_0001);
+    for lane in 0..8usize {
+        for g8 in [0usize, 31] {
+            for plus_first in [true, false] {
+                let mut x: Vec<f32> = (0..k).map(|_| rng.unit() * 0.4).collect();
+                for blk in [0usize, 256] {
+                    let p = blk + 8 * g8 + lane;
+                    let q = blk + 8 * (31 - g8) + (7 - lane);
+                    let mid = blk + 128 + lane;
+                    let (first, last) = if plus_first {
+                        (3.0f32, -3.0)
+                    } else {
+                        (-3.0, 3.0)
+                    };
+                    x[p] = first;
+                    x[q] = last;
+                    x[mid] = first;
+                }
+                // Hand oracle: the scalar's sequential strict-> scan.
+                let mut amax = 0.0f32;
+                let mut max = 0.0f32;
+                for &v in &x {
+                    let ax = v.abs();
+                    if ax > amax {
+                        amax = ax;
+                        max = v;
+                    }
+                }
+                let expected_d = 1.0f32 / (-127.0f32 / max);
+                let mut out = vec![0u8; col_bytes(GgmlType::Q3_K, k)];
+                quantize_col(GgmlType::Q3_K, &x, &mut out);
+                assert_eq!(
+                    out[0..4],
+                    expected_d.to_le_bytes(),
+                    "lane {lane} group {g8} plus_first {plus_first}: d must come from the FIRST max (picked {max})"
+                );
+                assert_col_bit_identical(GgmlType::Q3_K, &x);
+            }
+        }
+    }
+}
+
+/// Rounding ties: columns built so iscale (resp. id) is exactly -/+1.0 or
+/// 0.5 and the products land exactly on n+0.5 — even and odd n, both signs.
+#[test]
+fn quantize_col_rounding_ties() {
+    require_quantizer_avx2();
+    let ties: [f32; 19] = [
+        0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5, 0.25, 7.5, -7.5, 63.5, -63.5, 120.5, -120.5,
+        0.0, -0.0, 127.0, -127.0,
+    ];
+
+    // q8_K: first max +/-127 -> iscale = -/+1.0 exact -> y = -+x exactly.
+    for first in [127.0f32, -127.0] {
+        let mut x: Vec<f32> = Vec::with_capacity(256);
+        x.push(first);
+        for i in 1..256 {
+            x.push(ties[i % ties.len()]);
+        }
+        let iscale = -127.0f32 / first;
+        let mut out = vec![0u8; col_bytes(GgmlType::Q3_K, 256)];
+        quantize_col(GgmlType::Q3_K, &x, &mut out);
+        for (j, &v) in x.iter().enumerate() {
+            let e = round_ties_even(v * iscale).min(127) as i8;
+            assert_eq!(out[8 + j], e as u8, "first max {first}: code {j} (v = {v})");
+        }
+        assert_col_bit_identical(GgmlType::Q3_K, &x);
+    }
+
+    // q8_2 over four blocks (one 144 B group): d = 1.0 (id = 1.0), d = 2.0
+    // (id = 0.5, values doubled so products are the same exact ties), and two
+    // bf16-conversion ties — 1+2^-8 rounds down to d = 1.0 (even kept lsb),
+    // 1+3·2^-8 rounds up to d = 1+2^-6 (odd kept lsb).
+    let mut x: Vec<f32> = Vec::with_capacity(128);
+    // 127*(1+2^-8) and 127*(1+3*2^-8): exact f32, both on bf16 tie boundaries.
+    let amaxes = [
+        127.0f32,
+        254.0,
+        127.0 + 127.0 / 256.0,
+        127.0 + 3.0 * 127.0 / 256.0,
+    ];
+    for (b, &amax) in amaxes.iter().enumerate() {
+        let scale = if b == 1 { 2.0 } else { 1.0 };
+        x.push(amax);
+        for i in 1..32 {
+            x.push(ties[i % ties.len()] * scale);
+        }
+    }
+    let mut out = vec![0u8; col_bytes(GgmlType::Q5_0, 128)];
+    quantize_col(GgmlType::Q5_0, &x, &mut out);
+    for ir in 0..4 {
+        let d = u16::from_le_bytes([out[2 * ir], out[2 * ir + 1]]);
+        let expect_d = match ir {
+            0 | 2 => 0x3F80, // bf16 1.0
+            1 => 0x4000,     // bf16 2.0
+            _ => 0x3F82,     // bf16 1+2^-8 (tie rounded up)
+        };
+        assert_eq!(d, expect_d, "block {ir}: bf16 scale bits");
+        if ir < 3 {
+            // id = 1.0 for blocks 0/2, 0.5 for block 1: products are the ties.
+            let id = if ir == 1 { 0.5f32 } else { 1.0 };
+            let mut isum = 0i32;
+            for j in 0..32 {
+                let v = x[32 * ir + j];
+                let e = round_ties_even(v * id) as i8;
+                assert_eq!(
+                    out[16 + 32 * ir + j],
+                    e as u8,
+                    "block {ir} code {j} (v = {v})"
+                );
+                isum += e as i32;
+            }
+            assert_eq!(
+                i16::from_le_bytes([out[8 + 2 * ir], out[9 + 2 * ir]]),
+                isum as i16,
+                "block {ir}: isum"
+            );
+        }
+    }
+    assert_col_bit_identical(GgmlType::Q5_0, &x);
+}
+
+/// The saturating end of both encoders. For q8_K, |fl(iscale)*v| <=
+/// 127*(1+2^-24)^2 < 127.5, so `nearest_int` never reaches 128 and the
+/// one-sided clamp stays dormant in-domain — the columns below pin the
+/// reachable extremes: codes at exactly -127/+127. For q8_2 the same extreme
+/// through the bf16 scale, including the tie that rounds amax/127 UP to d=1.
+#[test]
+fn quantize_col_saturation_ends() {
+    require_quantizer_avx2();
+    for (m, first_sign) in [
+        (0.00390625f32, 1.0f32),
+        (0.00390625, -1.0),
+        (127.0, 1.0),
+        (127.0, -1.0),
+    ] {
+        let x: Vec<f32> = (0..256)
+            .map(|i| {
+                if i == 0 {
+                    m * first_sign
+                } else if i % 2 == 0 {
+                    m
+                } else {
+                    -m
+                }
+            })
+            .collect();
+        let iscale = -127.0f32 / (m * first_sign);
+        let mut out = vec![0u8; col_bytes(GgmlType::Q3_K, 256)];
+        quantize_col(GgmlType::Q3_K, &x, &mut out);
+        let mut seen = (false, false);
+        for (j, &v) in x.iter().enumerate() {
+            let e = qdot::nearest_int(iscale * v).min(127) as i8;
+            assert_eq!(out[8 + j], e as u8, "m = {m} first {first_sign}: code {j}");
+            seen.0 |= e == -127;
+            seen.1 |= e == 127;
+        }
+        assert!(
+            seen.0 && seen.1,
+            "m = {m}: both code extremes must be reached"
+        );
+        assert_col_bit_identical(GgmlType::Q3_K, &x);
+    }
+
+    // q8_2: alternating +-amax blocks hit codes -/+127 (d = 2.0 gives
+    // id = 0.5 exactly on values 2*127); 127*(1-2^-9) rounds amax/127 UP to
+    // d = 1, id = 1.0, and the codes still reach the extreme.
+    let mut x: Vec<f32> = Vec::with_capacity(128);
+    let amp = 254.0f32;
+    let v126_75 = 127.0f32 - 127.0 / 512.0; // 127*(1-2^-9), exact in f32
+    for a in [amp, amp, amp, v126_75] {
+        for j in 0..32 {
+            let sign = if j % 2 == 0 { 1.0 } else { -1.0 };
+            x.push(a * sign);
+        }
+    }
+    let mut out = vec![0u8; col_bytes(GgmlType::Q5_0, 128)];
+    quantize_col(GgmlType::Q5_0, &x, &mut out);
+    for ir in 0..4 {
+        let d = u16::from_le_bytes([out[2 * ir], out[2 * ir + 1]]);
+        let expect_d = if ir < 3 { 0x4000 } else { 0x3F80 };
+        assert_eq!(d, expect_d, "block {ir}: bf16 scale bits");
+        let mut seen = (false, false);
+        for j in 0..32 {
+            let code = out[16 + 32 * ir + j] as i8;
+            seen.0 |= code == -127;
+            seen.1 |= code == 127;
+        }
+        assert!(
+            seen.0 && seen.1,
+            "block {ir}: both code extremes must be reached"
+        );
+    }
+    assert_col_bit_identical(GgmlType::Q5_0, &x);
+}
+
+/// Subnormal and tiny amax: the q8_2 scale's bf16 round-trip, and the iscale
+/// overflow of a subnormal-magnitude q8_K block. In the id = inf band every
+/// product is ±inf or NaN and the codes must come out 0 exactly like the
+/// scalar's mantissa-form nearest_int — a saturating convert would emit -1.
+#[test]
+fn quantize_col_subnormal_tiny_scales() {
+    require_quantizer_avx2();
+    // amax ~1e-40: amax/127 rounds to bf16 0 -> d == 0 -> id == 0 -> zero codes.
+    let mut x = vec![1e-40f32; 128];
+    x[0] = -1e-40;
+    assert_col_bit_identical(GgmlType::Q5_0, &x);
+    let mut out = vec![0u8; col_bytes(GgmlType::Q5_0, 128)];
+    quantize_col(GgmlType::Q5_0, &x, &mut out);
+    assert!(
+        out.iter().all(|&b| b == 0),
+        "bf16 scale underflowed to 0: the group must be all zero"
+    );
+
+    // amax ~1e-38: amax/127 rounds to the smallest bf16 subnormal (bits
+    // 0x0001); 1/d overflows to inf, so every product is ±inf or NaN and the
+    // wrapped mantissa-form round must give code 0 and isum 0, like scalar.
+    let x2 = vec![1e-38f32; 128];
+    assert_col_bit_identical(GgmlType::Q5_0, &x2);
+    let mut out2 = vec![0u8; col_bytes(GgmlType::Q5_0, 128)];
+    quantize_col(GgmlType::Q5_0, &x2, &mut out2);
+    for ir in 0..4 {
+        assert_eq!(
+            &out2[2 * ir..2 * ir + 2],
+            &[0x01, 0x00][..],
+            "block {ir}: d is the smallest bf16 subnormal"
+        );
+    }
+    assert!(
+        out2[8..].iter().all(|&b| b == 0),
+        "inf/NaN products must quantize to 0 codes and 0 isums"
+    );
+
+    // All three bands in one column: blocks must not bleed state.
+    let mut x3 = vec![0.0f32; 128];
+    x3[..32].fill(1e-40);
+    x3[32..64].fill(1e-38);
+    x3[64..].fill(0.5);
+    assert_col_bit_identical(GgmlType::Q5_0, &x3);
+
+    // q8_K subnormal amax: iscale = -127/1e-38 overflows to -inf, so d = -0.0
+    // and every product is ±inf or NaN -> all codes 0, like scalar.
+    let x4 = vec![1e-38f32; 256];
+    assert_col_bit_identical(GgmlType::Q3_K, &x4);
+    let mut out4 = vec![0u8; col_bytes(GgmlType::Q3_K, 256)];
+    quantize_col(GgmlType::Q3_K, &x4, &mut out4);
+    assert_eq!(
+        &out4[0..4],
+        &(-0.0f32).to_le_bytes()[..],
+        "d = 1/-inf = -0.0"
+    );
+    assert!(
+        out4[4..].iter().all(|&b| b == 0),
+        "inf/NaN products must quantize to 0 codes and 0 sums"
+    );
 }

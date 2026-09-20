@@ -161,8 +161,58 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
 ///
 /// Q3_K uses `block_q8_K` (296 B/256 values); Q4_K, Q5_0, Q5_1, and Q6_K use
 /// `block_q8_2_x4` (144 B/128 values), with 36-byte `block_q8_2` tails for Q5_0/Q5_1.
-/// `out.len()` must equal `col_bytes(w, x.len())`; panics otherwise.
+/// `out.len()` must equal `col_bytes(w, x.len())`; panics otherwise. Uses the
+/// AVX2 encoders when the CPU has AVX2 — byte-identical to the scalar mirrors.
 pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
+    quantize_col_check(w, x, out);
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    match w {
+        GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
+            if avx2 {
+                // SAFETY: AVX2 detected just above; quantize_col_check pinned
+                // out.len() to col_bytes(w, x.len()).
+                unsafe { quantize_q82x4_col_avx2(x, out) }
+            } else {
+                quantize_q82x4_col(x, out);
+            }
+        }
+        _ => {
+            let (xblocks, _) = x.as_chunks::<256>();
+            let (oblocks, _) = out.as_chunks_mut::<296>();
+            if avx2 {
+                for (xb, ob) in xblocks.iter().zip(oblocks.iter_mut()) {
+                    // SAFETY: AVX2 detected just above; fixed-size block arrays.
+                    unsafe { quantize_q8k_block_avx2(xb, ob) }
+                }
+            } else {
+                for (xb, ob) in xblocks.iter().zip(oblocks.iter_mut()) {
+                    quantize_q8k_block(xb, ob);
+                }
+            }
+        }
+    }
+}
+
+/// The scalar mirror behind [`quantize_col`] — the fallback the crate runs
+/// when AVX2 is absent, and the oracle its bit-identity gate compares against.
+pub fn quantize_col_scalar(w: GgmlType, x: &[f32], out: &mut [u8]) {
+    quantize_col_check(w, x, out);
+    match w {
+        GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
+            quantize_q82x4_col(x, out);
+        }
+        _ => {
+            let (xblocks, _) = x.as_chunks::<256>();
+            let (oblocks, _) = out.as_chunks_mut::<296>();
+            for (xb, ob) in xblocks.iter().zip(oblocks.iter_mut()) {
+                quantize_q8k_block(xb, ob);
+            }
+        }
+    }
+}
+
+/// The shape contract every `quantize_col` entry point enforces before encoding.
+fn quantize_col_check(w: GgmlType, x: &[f32], out: &[u8]) {
     assert!(
         matches!(
             w,
@@ -176,28 +226,11 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
         "qdot activation columns are whole {gran}-value blocks ({w:?}), x.len() = {}",
         x.len()
     );
-    match w {
-        GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
-            assert_eq!(
-                out.len(),
-                col_bytes(w, x.len()),
-                "out must be col_bytes(w, x.len())"
-            );
-            quantize_q82x4_col(x, out);
-        }
-        _ => {
-            assert_eq!(
-                out.len(),
-                (x.len() / 256) * Q8K_STRIDE,
-                "out must be col_bytes(w, x.len())"
-            );
-            let (xblocks, _) = x.as_chunks::<256>();
-            let (oblocks, _) = out.as_chunks_mut::<296>();
-            for (xb, ob) in xblocks.iter().zip(oblocks.iter_mut()) {
-                quantize_q8k_block(xb, ob);
-            }
-        }
-    }
+    assert_eq!(
+        out.len(),
+        col_bytes(w, x.len()),
+        "out must be col_bytes(w, x.len())"
+    );
 }
 
 /// Quantized row dot product: `dot(weight row, quantized activation column)`.
@@ -368,6 +401,138 @@ fn quantize_q8k_block(x: &[f32], out: &mut [u8]) {
         out[264 + 2 * j..264 + 2 * j + 2].copy_from_slice(&(sum as i16).to_le_bytes());
     }
     out[0..4].copy_from_slice(&f32::to_le_bytes(1.0 / iscale));
+}
+
+/// `nearest_int`, lane for lane: the scalar's 2^23 + 2^22 mantissa extraction
+/// as vector integer ops (`y + 12582912.0`, low 23 mantissa bits, minus the
+/// bias). On the encoders' |y| <= 127 band this equals `_mm256_cvtps_epi32`
+/// under the default round-to-nearest-even MXCSR; keeping the bit form also
+/// reproduces the scalar on the ±inf/NaN products of an overflowing scale,
+/// where a saturating convert would differ.
+///
+/// # Safety
+/// AVX2 must be available on the target.
+#[inline(always)]
+unsafe fn v_nearest_int(y: __m256) -> __m256i {
+    unsafe {
+        // SAFETY: register-only intrinsics, no memory access.
+        let z = _mm256_add_ps(y, _mm256_set1_ps(12582912.0));
+        let b = _mm256_castps_si256(z);
+        _mm256_sub_epi32(
+            _mm256_and_si256(b, _mm256_set1_epi32(0x007f_ffff)),
+            _mm256_set1_epi32(0x0040_0000),
+        )
+    }
+}
+
+/// Reduce lanes to the `as i8` wrap range [-128, 127]. In-domain codes never
+/// reach the wrap (|iscale * v| and |v * id| stay under 127.5 before
+/// rounding); the ±inf/NaN products of an overflowing scale extract to
+/// -2^22, whose low byte the scalar cast drops to 0 — the wrap reproduces
+/// that, where a saturating pack alone would emit -128.
+///
+/// # Safety
+/// AVX2 must be available on the target.
+#[inline(always)]
+unsafe fn v_wrap_i8(q: __m256i) -> __m256i {
+    unsafe {
+        // SAFETY: register-only intrinsics, no memory access.
+        let t = _mm256_and_si256(q, _mm256_set1_epi32(0xFF));
+        let ge = _mm256_cmpgt_epi32(t, _mm256_set1_epi32(127));
+        _mm256_sub_epi32(t, _mm256_and_si256(ge, _mm256_set1_epi32(256)))
+    }
+}
+
+/// Horizontal f32 max over the eight lanes; exact in any order on the finite
+/// domain the encoders reduce.
+///
+/// # Safety
+/// SSE3 must be available on the target.
+#[inline(always)]
+unsafe fn hmax_ps(v: __m256) -> f32 {
+    unsafe {
+        // SAFETY: register-only intrinsics, no memory access.
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let m = _mm_max_ps(lo, hi);
+        let m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+        _mm_cvtss_f32(_mm_max_ss(m, _mm_movehdup_ps(m)))
+    }
+}
+
+/// AVX2 twin of `quantize_q8k_block`, byte-identical by construction. The max
+/// pick reproduces the scalar's first-strictly-greater rule: horizontal max,
+/// then the first lane whose |v| equals it. Codes round through
+/// [`v_nearest_int`] with `iscale * v` a plain `_mm256_mul_ps` — no FMA in
+/// the value path — then clamp and wrap in the scalar's `.min(127) as i8`
+/// order. The one-sided +127 clamp is dormant in-domain
+/// (|fl(iscale) * v| <= 127·(1+2^-24)² < 127.5); both encoders carry it.
+///
+/// # Safety
+/// CPU must support AVX2; `x`/`out` are the fixed 256-value/296-byte block.
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_q8k_block_avx2(x: &[f32; 256], out: &mut [u8; 296]) {
+    // SAFETY: AVX2 present per contract; every load lands inside the 256-value
+    // block (whole 8-lane groups, no over-read) and every store inside the
+    // 296-byte block.
+    unsafe {
+        let sgn = _mm256_set1_ps(-0.0);
+        let mut m = _mm256_setzero_ps();
+        for i in 0..32 {
+            // SAFETY: 8-lane load at 8*i <= 248, inside the block.
+            let v = _mm256_loadu_ps(x.as_ptr().add(8 * i));
+            m = _mm256_max_ps(m, _mm256_andnot_ps(sgn, v));
+        }
+        let amax = hmax_ps(m);
+        if amax == 0.0 {
+            *out = [0u8; Q8K_STRIDE];
+            return;
+        }
+        // First lane whose |v| equals amax: the scalar's strict-`>` pick.
+        let amax_v = _mm256_set1_ps(amax);
+        let mut first = 256usize;
+        for i in 0..32 {
+            // SAFETY: 8-lane load at 8*i <= 248, inside the block.
+            let v = _mm256_loadu_ps(x.as_ptr().add(8 * i));
+            let eq = _mm256_cmp_ps(_mm256_andnot_ps(sgn, v), amax_v, _CMP_EQ_OQ);
+            let mask = _mm256_movemask_ps(eq) as u32;
+            if mask != 0 {
+                first = 8 * i + mask.trailing_zeros() as usize;
+                break;
+            }
+        }
+        debug_assert!(first < 256, "amax came off these lanes; one must equal it");
+        let max = x[first];
+        let iscale = -127.0f32 / max;
+        let iscale_v = _mm256_set1_ps(iscale);
+        let clamp = _mm256_set1_epi32(127);
+        for g in 0..8 {
+            let mut qi = [_mm256_setzero_si256(); 4];
+            for (j, q) in qi.iter_mut().enumerate() {
+                // SAFETY: 8-lane load at 32*g + 8*j <= 248, inside the block.
+                let v = _mm256_loadu_ps(x.as_ptr().add(32 * g + 8 * j));
+                let y = _mm256_mul_ps(v, iscale_v);
+                *q = v_wrap_i8(_mm256_min_epi32(v_nearest_int(y), clamp));
+            }
+            // In-order i32 -> i8: two packs plus the 32-lane fixup; lanes are
+            // already in i8 range, so the saturating packs are identity.
+            let p0 = _mm256_packs_epi32(qi[0], qi[1]);
+            let p1 = _mm256_packs_epi32(qi[2], qi[3]);
+            let c = _mm256_packs_epi16(p0, p1);
+            let c = _mm256_permutevar8x32_epi32(c, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+            // SAFETY: 32-byte store at 8 + 32*g <= 232, inside the codes span.
+            _mm256_storeu_si256(out.as_mut_ptr().add(8 + 32 * g) as *mut __m256i, c);
+            // i32 sums of codes 16j..16j+16 off the wrapped lanes; exact in
+            // any order at these magnitudes, then the scalar's `as i16`.
+            let slo = hsum_i32(_mm256_add_epi32(qi[0], qi[1]));
+            let shi = hsum_i32(_mm256_add_epi32(qi[2], qi[3]));
+            let base = 264 + 4 * g;
+            out[base..base + 2].copy_from_slice(&(slo as i16).to_le_bytes());
+            out[base + 2..base + 4].copy_from_slice(&(shi as i16).to_le_bytes());
+        }
+        out[0..4].copy_from_slice(&f32::to_le_bytes(1.0 / iscale));
+        out[4..8].fill(0);
+    }
 }
 
 // ------------------------------------------------------------- q3_K dot
@@ -701,6 +866,95 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
             isum += q as i32;
         }
         tb[2..4].copy_from_slice(&(isum as i16).to_le_bytes());
+    }
+}
+
+/// One 32-value block of the q8_2 family: (codes, bf16 d bits, i16 isum),
+/// byte-identical to the scalar loops in `quantize_q82x4_col`. `v * id` is a
+/// plain multiply (no FMA); codes carry no clamp — the scalar's bare `as i8`
+/// and the wrap-then-pack here agree because bf16's round-down is at most
+/// 2^-8 relative, keeping |v * id| < 127.5 before rounding, while the
+/// ±inf/NaN products of an overflowing id wrap to 0 through
+/// [`v_nearest_int`] + [`v_wrap_i8`].
+///
+/// # Safety
+/// AVX2 must be available on the target; `x` is the fixed 32-value block.
+#[inline(always)]
+unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
+    // SAFETY: AVX2 present per contract; loads stay inside the fixed 32-value
+    // block, the one store goes to a local array.
+    unsafe {
+        let sgn = _mm256_set1_ps(-0.0);
+        let mut m = _mm256_setzero_ps();
+        for j in 0..4 {
+            // SAFETY: 8-lane load at 8*j <= 24, inside the block.
+            let v = _mm256_loadu_ps(x.as_ptr().add(8 * j));
+            m = _mm256_max_ps(m, _mm256_andnot_ps(sgn, v));
+        }
+        let amax = hmax_ps(m);
+        // The bf16 scale round-trip stays scalar: one conversion per block.
+        let t = fp32_to_bf16_bits(amax / 127.0);
+        let d = bf16_bits_to_f32(t);
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let idv = _mm256_set1_ps(id);
+        let mut qi = [_mm256_setzero_si256(); 4];
+        for (j, q) in qi.iter_mut().enumerate() {
+            // SAFETY: 8-lane load at 8*j <= 24, inside the block.
+            let v = _mm256_loadu_ps(x.as_ptr().add(8 * j));
+            let y = _mm256_mul_ps(v, idv);
+            *q = v_wrap_i8(v_nearest_int(y));
+        }
+        // In-order i32 -> i8: two packs plus the 32-lane fixup; lanes are
+        // already in i8 range, so the saturating packs are identity.
+        let p0 = _mm256_packs_epi32(qi[0], qi[1]);
+        let p1 = _mm256_packs_epi32(qi[2], qi[3]);
+        let c = _mm256_packs_epi16(p0, p1);
+        let c = _mm256_permutevar8x32_epi32(c, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+        let mut codes = [0u8; 32];
+        // SAFETY: 32-byte store into the local 32-byte array.
+        _mm256_storeu_si256(codes.as_mut_ptr() as *mut __m256i, c);
+        // i32 sum of the 32 wrapped codes; exact in any order at these
+        // magnitudes, then the scalar's `as i16`.
+        let isum = hsum_i32(_mm256_add_epi32(
+            _mm256_add_epi32(qi[0], qi[1]),
+            _mm256_add_epi32(qi[2], qi[3]),
+        ));
+        (codes, t, isum as i16)
+    }
+}
+
+/// AVX2 twin of `quantize_q82x4_col`, byte-identical by construction: the
+/// same group/tail split, offsets and zero fill, block bodies through
+/// [`quantize_q82_block_avx2`].
+///
+/// # Safety
+/// CPU must support AVX2; `x.len()` must be a multiple of 32 and
+/// `out.len()` equal `col_bytes(w, x.len())` (both enforced by
+/// [`quantize_col_check`]).
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_q82x4_col_avx2(x: &[f32], out: &mut [u8]) {
+    // SAFETY: AVX2 present per contract; whole 8-lane loads of each 32-value
+    // block (no over-read of x) and writes confined to the sized-out column.
+    unsafe {
+        let (blocks, _) = x.as_chunks::<32>();
+        let nb4 = 4 * (blocks.len() / 4);
+        let (groups, _) = out[..nb4 / 4 * Q82X4_STRIDE].as_chunks_mut::<Q82X4_STRIDE>();
+        for (gi, group) in groups.iter_mut().enumerate() {
+            group.fill(0);
+            for ir in 0..4 {
+                let (codes, d, isum) = quantize_q82_block_avx2(&blocks[4 * gi + ir]);
+                group[2 * ir..2 * ir + 2].copy_from_slice(&d.to_le_bytes());
+                group[8 + 2 * ir..8 + 2 * ir + 2].copy_from_slice(&isum.to_le_bytes());
+                group[16 + 32 * ir..16 + 32 * ir + 32].copy_from_slice(&codes);
+            }
+        }
+        for (t, xb) in blocks[nb4..].iter().enumerate() {
+            let tb = &mut out[nb4 / 4 * Q82X4_STRIDE + t * Q82_BLOCK..][..Q82_BLOCK];
+            let (codes, d, isum) = quantize_q82_block_avx2(xb);
+            tb[0..2].copy_from_slice(&d.to_le_bytes());
+            tb[2..4].copy_from_slice(&isum.to_le_bytes());
+            tb[4..36].copy_from_slice(&codes);
+        }
     }
 }
 
