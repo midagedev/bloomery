@@ -1,30 +1,29 @@
 //! Greedy decode on the reference CPU path, and the tok/s this engine has.
 //!
-//! Two qualifiers left, both structural and both still round 1-5's to remove:
+//! Two qualifiers left, both structural:
 //!
-//!   1. **`ops::matmul_q` still materializes f32.** It runs its output rows on the
-//!      thread pool as of 2026-09-19, but each row is dequantized to f32 and dotted
-//!      in scalar f32. The profiler put dequant at 56 % of the step against the dot's
-//!      44 %, so the remaining factor is the fused AVX2 int8 kernel (`crates/q3k-cpu`
-//!      holds it; stage 1 does not call it), not more threads.
+//!   1. **`ops::matmul_q` still materializes f32.** Its output rows run on the
+//!      thread pool, but each row is dequantized to f32 and dotted in scalar f32;
+//!      the remaining factor is the fused AVX2 int8 kernel (`crates/q3k-cpu` holds
+//!      it; stage 1 does not call it), not more threads.
 //!   2. **CPU only.** Not one byte of this runs on either card.
 //!
-//! The third one is gone. Until 2026-09-19 this binary re-ran the whole prefix every
-//! step, so per-step cost grew with the output (13.5 s at ctx 6, 24.9 s at ctx 13) and
-//! the mean was not a decode rate at all. It now decodes against a `KvCache`, one token
-//! per step. **Flat is the claim** — the per-step column below is printed so that an
-//! unflat one is visible rather than averaged away.
+//! Decode runs against a `KvCache`, one token per step. **Flat is the claim** —
+//! the per-step column below is printed so that an unflat one is visible rather
+//! than averaged away.
 //!
-//! Prefill and decode are timed apart. They are different work: the prefill reads every
-//! weight once for `n` tokens, a decode step reads them again for one. Averaging the two
-//! is how a prefill-heavy run reports a decode rate it does not have.
+//! Prefill and decode are timed apart. They are different work: the prefill reads
+//! every weight once for `n` tokens, a decode step reads them again for one.
+//! Averaging the two is how a prefill-heavy run reports a decode rate it does not
+//! have.
 //!
-//! `--no-cache` keeps the old path so both can be measured inside one lease. It exists
-//! for that comparison and nothing else; `tests/kv.rs` proves the two agree to the last
-//! bit at every split.
+//! `--no-cache` keeps the prefix-re-prefill path so both can be measured inside
+//! one lease. It exists for that comparison and nothing else; `tests/kv.rs` proves
+//! the two agree to the last bit at every split.
 //!
-//! Run it through `tools/ref/decode-measure.sh`, which holds the box lease and records
-//! witnesses — a tok/s taken while something else has the machine is not a measurement.
+//! Run it through `tools/ref/decode-measure.sh`, which holds the box lease and
+//! records witnesses — a tok/s taken while something else has the machine is not
+//! a measurement.
 use model::derived::Derived;
 use model::forward::{argmax, forward, new_cache, step};
 use std::time::Instant;
@@ -138,10 +137,10 @@ fn main() {
 
     println!("\n{:>4} {:>6} {:>12} {:>9}", "step", "ctx", "ms", "tok/s");
     // Pool protocol counters, snapshotted around the decode loop so the
-    // prefill's dispatches stay out of the per-step arithmetic (MUL-23). A
-    // decode step makes ~850 pool calls; whether the workers park between
-    // them (futex wake per call) or stay hot on the spin budget is the first
-    // fork in attributing the step's orchestration share.
+    // prefill's dispatches stay out of the per-step arithmetic. Whether the
+    // workers park between dispatches (futex wake per call) or stay hot on
+    // the spin budget is the first fork in attributing the step's
+    // orchestration share.
     let pool0 = threads::pool().stats();
     for s in 0..n_predict {
         let ctx_at_start = ctx.len();
