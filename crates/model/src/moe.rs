@@ -3,10 +3,9 @@
 //! Dispatch is expert-bucketed, not per-token — `docs/research/quant-decode-efficiency.md`
 //! §Q6 decision 2, and it cannot be retrofitted. Build the bucket table first, then one
 //! matmul per bucket over the tokens routed to it, then scatter back through the inverse
-//! permutation and weight. A per-token loop that happens to pass the gate at n_tokens = 6
-//! is still the wrong structure and will be rejected in review. This mirrors what ik's
-//! own CPU `mul_mat_id` does (`matrix_row_counts`/`matrix_rows` group rows by expert
-//! before any dot runs — ggml.c:18258).
+//! permutation and weight. This mirrors what ik's own CPU `mul_mat_id` does
+//! (`matrix_row_counts`/`matrix_rows` group rows by expert before any dot runs —
+//! ggml.c:18258).
 //!
 //! The other structural line this module holds: only routed experts are read, never all
 //! 64. `docs/research/mistralrs-prior-art.md` §4.4 measures the failure mode — mistral.rs
@@ -21,13 +20,6 @@
 //! the plain `MUL_MAT` — fills its src1 scratch with `type_traits[vec_dot_type].from_float`
 //! (ggml.c:18564 for the fused op, the same call for `MUL_MAT_ID`), so the quantizer is
 //! the weight type's and nothing else. `crate::ops::matmul_q` is that single owner.
-//!
-//! This round shipped a second implementation with an f16-scale variant for the fused
-//! op; the lead read ggml.c on adoption (2026-09-19) and it is source-false — the fused
-//! op takes the same `from_float` as `MUL_MAT_ID`. The round's own probe had already
-//! said so without being believed: `gate_par` came out at 4.5776367e-5 under both
-//! spellings, to the last digit. The duplicate is gone; the gate numbers are the
-//! round's measured v1 column.
 
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
@@ -35,6 +27,7 @@ use std::time::Instant;
 use gguf::{Gguf, TensorInfo};
 
 use crate::ModelError;
+use crate::ffn::swiglu;
 use crate::ops::{Tensor2, matmul_q, matmul_q_batch};
 use crate::profile;
 
@@ -301,11 +294,6 @@ fn route_inner(
     ))
 }
 
-/// `silu(x) = x / (1 + e^{-x})`, ggml's `ggml_vec_silu_f` form.
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
 /// The `e`-th matrix of a stacked expert tensor `{k, n, n_expert}` as a 2-D
 /// `TensorInfo` into the same mapping. `gguf.data` bounds-checks the view again, so a
 /// miscomputed slice errors instead of reading a neighbor expert.
@@ -332,42 +320,20 @@ fn expert_view(w: &TensorInfo, e: usize, n_expert: usize) -> Result<TensorInfo, 
     })
 }
 
-/// The MoE FFN: `ffn_norm-N` in, `ffn_out-N` out — routed experts plus shared experts.
-///
-/// Routed half: one bucket at a time, three matmuls per routed expert, scatter through
-/// the inverse permutation with the router weights. Shared half: the dense FFN with
-/// `_shexp` names. This round computes it inline; it should later call
-/// `ffn::dense_ffn` once that module lands — the lead wires that swap.
-pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelError> {
-    // Profiler hook (crate::profile), coverage round. This function interleaves
-    // hooked `matmul_q` calls with its own work, so every site below is a piece
-    // timer around the un-hooked regions only — the matmuls keep their own rows
-    // and coverage never counts a nanosecond twice:
-    //   * `moe_setup`      — `Meta::read`, the six stack/shexp `find`s (linear
-    //     tensor-table scans) and the shape checks; two pieces.
-    //   * `moe_route`      — measured inside `route_inner` (this path and the
-    //     gate's `route` share it).
-    //   * `swiglu`         — the silu(gate)·up combines; same site as
-    //     `ffn::swiglu`, recorded per combine.
-    //   * `moe_expert_io`  — per routed expert: the token gather before the
-    //     gate/up matmuls and the rank-search/copy/weighted-accumulate scatter
-    //     after the down matmul; recorded per expert.
-    //   * `moe_trace`      — the MoETrace vectors this module allocates and
-    //     fills every call, plus the output clone/combine and the thread-local
-    //     TRACE write: bookkeeping that rides every step until a later round
-    //     moves it behind a flag. The final routed+shexp combine is graph work,
-    //     but it is glued to the bookkeeping and folded into this site.
-    let lvl = profile::level();
-    let mut setup_ns = 0u64;
-    let mut trace_ns = 0u64;
-    let t_setup = if lvl > 0 { Some(Instant::now()) } else { None };
-    TOUCHED.with(|c| c.set(0));
+/// The routed-expert weight stacks of `block`, shape-checked against the
+/// metadata and the input's width: gate and up map `embd -> ff`, down maps
+/// `ff -> embd`, all stacked `n_expert` deep. A mis-shaped stack must error
+/// before any expert runs, not stride into a neighbor expert's bytes.
+struct Stacks<'a> {
+    gate: &'a TensorInfo,
+    up: &'a TensorInfo,
+    down: &'a TensorInfo,
+}
+
+fn moe_stacks(gguf: &Gguf, block: usize, embd: usize) -> Result<(Meta, Stacks<'_>), ModelError> {
     let meta = Meta::read(gguf)?;
     let n_expert = meta.n_expert;
-    let n_used = meta.n_used;
     let ff = meta.ff;
-    let n_tokens = x.ne1;
-    let embd = x.ne0;
 
     let gate_exps = tensor(gguf, &format!("blk.{block}.ffn_gate_exps.weight"))?;
     let up_exps = tensor(gguf, &format!("blk.{block}.ffn_up_exps.weight"))?;
@@ -387,117 +353,140 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
     expect_stack(gate_exps, embd, ff)?;
     expect_stack(up_exps, embd, ff)?;
     expect_stack(down_exps, ff, embd)?;
-    if let Some(t_setup) = t_setup {
-        setup_ns += t_setup.elapsed().as_nanos() as u64;
-    }
+    Ok((
+        meta,
+        Stacks {
+            gate: gate_exps,
+            up: up_exps,
+            down: down_exps,
+        },
+    ))
+}
 
-    let (buckets, sel) = route_inner(gguf, block, x, &meta)?;
+/// Per-call routed-expert intermediates the scatter fills: the weighted
+/// accumulation and the two trace tensors.
+struct RoutedSums {
+    routed: Tensor2,
+    gate_par: Vec<f32>,
+    down_all: Vec<f32>,
+}
 
-    let t_trace1 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut routed = Tensor2::zeros(embd, n_tokens);
-    let mut gate_par = vec![0.0f32; ff * n_used * n_tokens];
-    let mut down_all = vec![0.0f32; embd * n_used * n_tokens];
-    if let Some(t_trace1) = t_trace1 {
-        trace_ns += t_trace1.elapsed().as_nanos() as u64;
-    }
-
-    // MUL-24: the expert loop used to pay three pool dispatches per routed
-    // expert (gate, up, down) — at ~850 Q3_K dispatches per decode step MUL-23
-    // measured the orchestration, not the arithmetic, at ~41 ms. The same work
-    // now runs as TWO dispatches per layer: every expert's gate+up in one, every
-    // down in one. Bit identity survives by construction — batching changes
-    // which worker computes which (expert, row), never a row's k-ascending
-    // accumulation, and the scatter below accumulates `routed` in the same
-    // expert-ascending order the sequential loop did.
+/// Gather each routed expert's input columns and the touched mask. An empty
+/// bucket contributes nothing — an unrouted expert's bytes are never read —
+/// and the mask is set where the weights are fetched, so it counts
+/// dequantized reality, not what the bucket table implies.
+fn gather_expert_inputs(
+    x: &Tensor2,
+    buckets: &Buckets,
+    n_expert: usize,
+    lvl: u8,
+) -> (Vec<usize>, Vec<Tensor2>, u64, u64) {
     let t_gather = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut experts: Vec<usize> = Vec::new();
     let mut xbs: Vec<Tensor2> = Vec::new();
     let mut touched = 0u64;
     for e in 0..n_expert {
         if buckets.bucket(e).is_empty() {
-            continue; // the whole point: an unrouted expert's bytes are never read
+            continue;
         }
-        // Set where the weights are fetched, so this mask counts dequantized reality.
         touched |= 1 << e;
         let m = buckets.bucket(e).len();
-        let mut xb = Tensor2::zeros(embd, m);
+        let mut xb = Tensor2::zeros(x.ne0, m);
         for (i, &t) in buckets.bucket(e).iter().enumerate() {
             xb.col_mut(i).copy_from_slice(x.col(t as usize));
         }
         experts.push(e);
         xbs.push(xb);
     }
-    let mut io_ns = if let Some(t_gather) = t_gather {
+    let gather_ns = if let Some(t_gather) = t_gather {
         t_gather.elapsed().as_nanos() as u64
     } else {
         0
     };
-    TOUCHED.with(|c| c.set(touched));
+    (experts, xbs, touched, gather_ns)
+}
 
-    let mut gate_views = Vec::with_capacity(experts.len());
-    let mut up_views = Vec::with_capacity(experts.len());
-    let mut down_views = Vec::with_capacity(experts.len());
-    for &e in &experts {
-        gate_views.push(expert_view(gate_exps, e, n_expert)?);
-        up_views.push(expert_view(up_exps, e, n_expert)?);
-        down_views.push(expert_view(down_exps, e, n_expert)?);
+/// The per-expert 2-D views of the three stacks, in the same order as
+/// `experts`.
+struct ExpertViews {
+    gate: Vec<TensorInfo>,
+    up: Vec<TensorInfo>,
+    down: Vec<TensorInfo>,
+}
+
+fn expert_views(
+    stacks: &Stacks<'_>,
+    experts: &[usize],
+    n_expert: usize,
+) -> Result<ExpertViews, ModelError> {
+    let mut views = ExpertViews {
+        gate: Vec::with_capacity(experts.len()),
+        up: Vec::with_capacity(experts.len()),
+        down: Vec::with_capacity(experts.len()),
+    };
+    for &e in experts {
+        views.gate.push(expert_view(stacks.gate, e, n_expert)?);
+        views.up.push(expert_view(stacks.up, e, n_expert)?);
+        views.down.push(expert_view(stacks.down, e, n_expert)?);
     }
+    Ok(views)
+}
 
-    // Phase 1 — gate and up for every routed expert, one dispatch. The views
-    // interleave [gate_e0, up_e0, gate_e1, up_e1, ..] so pair `2*s` is expert
-    // s's gate and `2*s + 1` its up; both read the same `xb` columns the
-    // sequential loop gathered per expert. The doubled reference is free:
-    // `matmul_q_multi`'s pre-pass quantizes each DISTINCT input once (MUL-37),
-    // so pushing `xb` twice costs one quantization, not two — until MUL-37
-    // the same push meant quantizing every bucket's columns twice, 156 of
-    // the batch's 312 pair-quantizations per decode step (MUL-35 §3, the
-    // duplicate this round exists to remove).
-    let mut gu_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(experts.len() * 2);
-    let mut gu_xs: Vec<&Tensor2> = Vec::with_capacity(experts.len() * 2);
-    for (gate, up) in gate_views.iter().zip(&up_views) {
+/// Phase 1 — gate and up for every routed expert, one dispatch. The views
+/// interleave [gate_e0, up_e0, gate_e1, up_e1, ..] so pair `2*s` is expert
+/// s's gate and `2*s + 1` its up; both read the same `xb` columns a
+/// sequential loop would have gathered per expert. The doubled reference is
+/// free: `matmul_q_multi`'s pre-pass quantizes each DISTINCT input once, so
+/// pushing `xb` twice costs one quantization, not two.
+fn gate_up_batch(
+    gguf: &Gguf,
+    views: &ExpertViews,
+    xbs: &[Tensor2],
+) -> Result<Vec<Tensor2>, ModelError> {
+    if views.gate.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut gu_ws: Vec<&gguf::TensorInfo> = Vec::with_capacity(views.gate.len() * 2);
+    let mut gu_xs: Vec<&Tensor2> = Vec::with_capacity(views.gate.len() * 2);
+    for (gate, up) in views.gate.iter().zip(&views.up) {
         gu_ws.push(gate);
         gu_ws.push(up);
     }
-    for xb in &xbs {
+    for xb in xbs {
         gu_xs.push(xb);
         gu_xs.push(xb);
     }
-    let gu = if experts.is_empty() {
-        Vec::new()
-    } else {
-        matmul_q_batch(gguf, &gu_ws, &gu_xs)?
-    };
+    matmul_q_batch(gguf, &gu_ws, &gu_xs)
+}
 
-    // The same swiglu the loop ran per expert, in the same expert order —
-    // elementwise, so the phase boundary it sits between is its only change.
-    let mut pars: Vec<Tensor2> = Vec::with_capacity(experts.len());
-    for slot in 0..experts.len() {
-        let t_silu = if lvl > 0 { Some(Instant::now()) } else { None };
-        let g = &gu[2 * slot];
-        let u = &gu[2 * slot + 1];
-        let mut par = Tensor2::zeros(g.ne0, g.ne1);
-        for (p, (&gv, &uv)) in par.data.iter_mut().zip(g.data.iter().zip(&u.data)) {
-            *p = silu(gv) * uv;
-        }
-        if let Some(t_silu) = t_silu {
-            profile::record_time("swiglu", t_silu.elapsed().as_nanos() as u64);
-        }
-        pars.push(par);
+/// Phase 2 — every expert's down projection, one dispatch.
+fn down_batch(
+    gguf: &Gguf,
+    views: &ExpertViews,
+    pars: &[Tensor2],
+) -> Result<Vec<Tensor2>, ModelError> {
+    if views.down.is_empty() {
+        return Ok(Vec::new());
     }
-
-    // Phase 2 — every expert's down projection, one dispatch.
-    let down_ws: Vec<&gguf::TensorInfo> = down_views.iter().collect();
+    let down_ws: Vec<&gguf::TensorInfo> = views.down.iter().collect();
     let down_xs: Vec<&Tensor2> = pars.iter().collect();
-    let downs = if experts.is_empty() {
-        Vec::new()
-    } else {
-        matmul_q_batch(gguf, &down_ws, &down_xs)?
-    };
+    matmul_q_batch(gguf, &down_ws, &down_xs)
+}
 
-    // Scatter, expert-ascending — the accumulation order the sequential loop
-    // used, so `routed` gathers its per-token sums in the same sequence of
-    // adds it always did.
-    let t_scatter = if lvl > 0 { Some(Instant::now()) } else { None };
+/// Scatter, expert-ascending — the accumulation order a sequential expert
+/// loop produces, so `routed` gathers its per-token sums in a fixed sequence
+/// of adds regardless of the dispatch shape. The rank search exists only for
+/// the trace layout (`gate_par`/`down_all` are keyed by `(token, rank)`).
+fn scatter_experts(
+    buckets: &Buckets,
+    sel: &Selection,
+    experts: &[usize],
+    pars: &[Tensor2],
+    downs: &[Tensor2],
+    meta: &Meta,
+    sums: &mut RoutedSums,
+) {
+    let embd = sums.routed.ne0;
     for (slot, &e) in experts.iter().enumerate() {
         let bucket = buckets.bucket(e);
         let weights = buckets.bucket_weights(e);
@@ -506,20 +495,108 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
         for i in 0..bucket.len() {
             let t = bucket[i] as usize;
             let w = weights[i] * meta.scale;
-            // Rank of `e` in token `t`'s selection — only the trace layout needs it.
-            let s = (0..n_used)
-                .find(|&s| sel.ids[t * n_used + s] as usize == e)
+            let s = (0..meta.n_used)
+                .find(|&s| sel.ids[t * meta.n_used + s] as usize == e)
                 .expect("every bucket entry comes from its token's selection");
-            gate_par[t * n_used * ff + s * ff..t * n_used * ff + (s + 1) * ff]
+            sums.gate_par[t * meta.n_used * meta.ff + s * meta.ff
+                ..t * meta.n_used * meta.ff + (s + 1) * meta.ff]
                 .copy_from_slice(par.col(i));
-            down_all[t * n_used * embd + s * embd..t * n_used * embd + (s + 1) * embd]
+            sums.down_all
+                [t * meta.n_used * embd + s * embd..t * meta.n_used * embd + (s + 1) * embd]
                 .copy_from_slice(d.col(i));
-            let acc = routed.col_mut(t);
+            let acc = sums.routed.col_mut(t);
             for (a, &dv) in acc.iter_mut().zip(d.col(i)) {
                 *a += w * dv;
             }
         }
     }
+}
+
+/// The shared experts: the same dense FFN shape as block 0 with `_shexp`
+/// names. `ffn::dense_ffn` runs the same three ops; this copy stays because
+/// the shexp tensor finds are timed under `moe_setup`, not `ffn_weights`.
+fn shexp_ffn(
+    gguf: &Gguf,
+    block: usize,
+    x: &Tensor2,
+    lvl: u8,
+    setup_ns: &mut u64,
+) -> Result<Tensor2, ModelError> {
+    let t_setup2 = if lvl > 0 { Some(Instant::now()) } else { None };
+    let shexp_gate = tensor(gguf, &format!("blk.{block}.ffn_gate_shexp.weight"))?;
+    let shexp_up = tensor(gguf, &format!("blk.{block}.ffn_up_shexp.weight"))?;
+    let shexp_down = tensor(gguf, &format!("blk.{block}.ffn_down_shexp.weight"))?;
+    if let Some(t_setup2) = t_setup2 {
+        *setup_ns += t_setup2.elapsed().as_nanos() as u64;
+    }
+    if lvl > 0 {
+        profile::record_time("moe_setup", *setup_ns);
+    }
+    let g = matmul_q(gguf, shexp_gate, x)?;
+    let u = matmul_q(gguf, shexp_up, x)?;
+    let par = swiglu(&g, &u);
+    matmul_q(gguf, shexp_down, &par)
+}
+
+/// The MoE FFN: `ffn_norm-N` in, `ffn_out-N` out — routed experts plus shared experts.
+///
+/// Routed half: route, then one gate+up dispatch for every routed expert, one
+/// down dispatch, and a scatter through the inverse permutation with the
+/// router weights. Shared half: the dense FFN with `_shexp` names. Batching
+/// changes which worker computes which (expert, row), never a row's
+/// k-ascending accumulation; the scatter accumulates `routed`
+/// expert-ascending, the order a sequential expert loop produced.
+pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelError> {
+    // Profiler hook (crate::profile): the matmuls keep their own rows, so every
+    // piece timer below wraps only un-hooked regions — coverage never counts a
+    // nanosecond twice. `moe_setup` is the metadata/stack/shexp finds and the
+    // shape checks; `moe_route` is measured inside route_inner; `swiglu` per
+    // combine; `moe_expert_io` per expert (the token gather before gate/up,
+    // the rank-search/scatter after down); `moe_trace` the trace vectors and
+    // the final combine, bookkeeping that rides every step.
+    let lvl = profile::level();
+    let mut setup_ns = 0u64;
+    let mut trace_ns = 0u64;
+    let n_tokens = x.ne1;
+    let embd = x.ne0;
+
+    let t_setup = if lvl > 0 { Some(Instant::now()) } else { None };
+    TOUCHED.with(|c| c.set(0));
+    let (meta, stacks) = moe_stacks(gguf, block, embd)?;
+    if let Some(t_setup) = t_setup {
+        setup_ns += t_setup.elapsed().as_nanos() as u64;
+    }
+
+    let (buckets, sel) = route_inner(gguf, block, x, &meta)?;
+
+    let t_trace1 = if lvl > 0 { Some(Instant::now()) } else { None };
+    let mut sums = RoutedSums {
+        routed: Tensor2::zeros(embd, n_tokens),
+        gate_par: vec![0.0f32; meta.ff * meta.n_used * n_tokens],
+        down_all: vec![0.0f32; embd * meta.n_used * n_tokens],
+    };
+    if let Some(t_trace1) = t_trace1 {
+        trace_ns += t_trace1.elapsed().as_nanos() as u64;
+    }
+
+    let (experts, xbs, touched, gather_ns) = gather_expert_inputs(x, &buckets, meta.n_expert, lvl);
+    TOUCHED.with(|c| c.set(touched));
+    let views = expert_views(&stacks, &experts, meta.n_expert)?;
+
+    let gu = gate_up_batch(gguf, &views, &xbs)?;
+    // The same swiglu a sequential loop ran per expert, in the same expert
+    // order — elementwise, so the phase boundary it sits between is its only
+    // change. `ffn::swiglu` records the same site per combine, so one row
+    // answers "what does SwiGLU cost" across dense, shexp and routed experts.
+    let mut pars: Vec<Tensor2> = Vec::with_capacity(experts.len());
+    for slot in 0..experts.len() {
+        pars.push(swiglu(&gu[2 * slot], &gu[2 * slot + 1]));
+    }
+    let downs = down_batch(gguf, &views, &pars)?;
+
+    let t_scatter = if lvl > 0 { Some(Instant::now()) } else { None };
+    scatter_experts(&buckets, &sel, &experts, &pars, &downs, &meta, &mut sums);
+    let mut io_ns = gather_ns;
     if let Some(t_scatter) = t_scatter {
         io_ns += t_scatter.elapsed().as_nanos() as u64;
     }
@@ -527,49 +604,26 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
         profile::record_time("moe_expert_io", io_ns);
     }
 
-    // Shared experts: same dense FFN shape as block 0 with `_shexp` names, and the
-    // same three ops `ffn::dense_ffn` runs. Kept inline here only until round 1-4 wires
-    // `forward` and the two can share one implementation.
-    let t_setup2 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let shexp_gate = tensor(gguf, &format!("blk.{block}.ffn_gate_shexp.weight"))?;
-    let shexp_up = tensor(gguf, &format!("blk.{block}.ffn_up_shexp.weight"))?;
-    let shexp_down = tensor(gguf, &format!("blk.{block}.ffn_down_shexp.weight"))?;
-    if let Some(t_setup2) = t_setup2 {
-        setup_ns += t_setup2.elapsed().as_nanos() as u64;
-    }
-    if lvl > 0 {
-        profile::record_time("moe_setup", setup_ns);
-    }
-    let g = matmul_q(gguf, shexp_gate, x)?;
-    let u = matmul_q(gguf, shexp_up, x)?;
-    let t_silu = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut par = Tensor2::zeros(g.ne0, g.ne1);
-    for (p, (&gv, &uv)) in par.data.iter_mut().zip(g.data.iter().zip(&u.data)) {
-        *p = silu(gv) * uv;
-    }
-    if let Some(t_silu) = t_silu {
-        profile::record_time("swiglu", t_silu.elapsed().as_nanos() as u64);
-    }
-    let sh = matmul_q(gguf, shexp_down, &par)?;
+    let sh = shexp_ffn(gguf, block, x, lvl, &mut setup_ns)?;
 
     let t_trace2 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut out = routed.clone();
+    let mut out = sums.routed.clone();
     for (o, &sv) in out.data.iter_mut().zip(&sh.data) {
         *o += sv;
     }
 
     TRACE.with(|t| {
         *t.borrow_mut() = Some(MoETrace {
-            n_expert,
-            n_used,
+            n_expert: meta.n_expert,
+            n_used: meta.n_used,
             n_tokens,
             logits: sel.logits,
             probs: sel.probs,
             ids: sel.ids,
             weights: sel.weights,
-            gate_par,
-            down: down_all,
-            routed_out: routed.data.clone(),
+            gate_par: sums.gate_par,
+            down: sums.down_all,
+            routed_out: sums.routed.data.clone(),
             shexp_out: sh.data.clone(),
         })
     });

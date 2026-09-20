@@ -1,12 +1,9 @@
 //! Weight-derived state: the `wk_b` Q8_0 requant, built once per file.
 //!
-//! `q_nope2_absorbed` used to rebuild this every call — dequantizing each head's
-//! k-up rows of `attn_kv_b` and requantizing them along the q_nope axis, per
-//! block, per head, per decode step. Both halves are pure functions of the
-//! weights: nothing about the tokens enters them. The decode profile of
-//! 2026-09-19 put that rebuild at 592 of the 614 ms the site spent per two
-//! steps (`dequant_w`), all of it re-deriving bytes the file had already fixed.
-//! [`Derived`] is those bytes, built eagerly at load.
+//! The absorption in `q_nope2_absorbed` consumes these blocks, and computing
+//! them is a pure function of the weights — nothing about the tokens enters —
+//! so rebuilding them per block, per head, per decode step re-derived bytes the
+//! file had already fixed. [`Derived`] is those bytes, built eagerly at load.
 //!
 //! Why this is its own struct and not a field of
 //! [`KvCache`](crate::kv::KvCache): the two change for different reasons, and
@@ -25,10 +22,8 @@
 //! the same class of cost this module exists to remove, and it makes "which
 //! step paid for the build" a question the profile answers differently every
 //! run. `new` fills every block and every head before returning; the path
-//! afterwards only ever sees `&Derived`. The size for this file is
-//! 27 blocks × 16 heads × 512 × 4 blocks × 34 bytes ≈ 30 MB (derived from the
-//! file's own shapes — `size_bytes` and the decode binary print the real
-//! number), and the build is one pass, once.
+//! afterwards only ever sees `&Derived`. `size_bytes` and the decode binary
+//! print the real size, and the build is one pass, once.
 
 use crate::ModelError;
 use crate::attn::{MlaParams, Q8Block, quantize_q8_0};

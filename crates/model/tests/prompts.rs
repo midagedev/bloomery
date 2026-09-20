@@ -185,80 +185,21 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
 
     // The contract: 33 of 33, and any divergence is named, not tolerated in bulk.
     //
-    // Repinned 2026-09-20, after the Q5_0 x Q8_2_X4 fused wiring (MUL-32):
-    // the divergence set moved from {} to {14} — prompt 14 is back, the
-    // same near-tie MUL-21 flipped and MUL-27 had landed (ik margin 0.108,
-    // a straight 1st/2nd swap: ik [245, 9226, ...], ours [9226, 245, ...];
-    // worst |dlogit| 1.3984, 1.298 at MUL-27).
-    //
-    // History of the set, because the pin's job is to make every move say
-    // what moved it:
-    //   * 2026-09-19 (pre-fused): {5} — `def add(a, b):`, ik margin 0.262.
-    //   * 2026-09-20, Q3_K fused wiring (MUL-21): {14, 24}. The fused path
-    //     was more accurate than the f32 round trip it replaced, every Q3_K
-    //     logit moved, prompt 5 matched again and two other near-ties
-    //     flipped: prompt 14 (`A right triangle has`, ik margin 0.108,
-    //     |dlogit| 0.285) and prompt 24 (`Machine learning models are
-    //     trained on`, ik margin 0.151, |dlogit| 0.339) — straight 1st/2nd
-    //     swaps inside the run's own drift.
-    //   * 2026-09-20, Q4_K x4 fused wiring (MUL-27): {}. The x4 kernel is
-    //     ik's own kernel arithmetic (qdot gate B: 64 rows within 1 ULP) fed
-    //     ik's own activation coder byte for byte (gate 0), so every Q4_K
-    //     site moved TOWARD ik and both flips landed on ik's picks: prompt
-    //     14 now 245 (ours == ik), prompt 24 now 245. A/B proof the wiring
-    //     caused it: supports() reverted to Q3_K-only for one run moved the
-    //     divergence set straight back to {14, 24} (same binary, same
-    //     oracle).
-    //   * 2026-09-20, Q5_0 x8_2_x4 fused wiring (MUL-32): {14}. A/B proof:
-    //     supports() with Q5_0 removed for one run (same binary, same
-    //     oracle) → {} again, 33/33. The Q5_0 site itself moved decisively
-    //     TOWARD ik — moe.rs's `ffn_moe_down-1` comparison against the
-    //     oracle's own MUL_MAT_ID output is now bit-exact (max|diff| = 0e0;
-    //     4.77e-6 unwired, same run pair), and the kernel is within 1 ULP
-    //     of ik's own on the site's real rows (qdot gate B) fed ik's coder
-    //     byte for byte (gate 0). The flip is the chain re-lottery, not the
-    //     site: exact Q5_0 bits propagate into a 0.108-margin tie that the
-    //     remaining scalar sites (Q5_1/Q6_K) and `q_nope2`'s activation-code
-    //     tie flips still carry ~1.4 logits of drift across.
-    //
-    // 2026-09-20, Q5_1 x q8_2_x4 fused wiring (MUL-34): the set did NOT
-    // move — {14} again, same prompt, same 1st/2nd swap (ik margin 0.108,
-    // ik [245, 9226, ...], ours [9226, 245, ...]), 32/33. What moved is the
-    // drift itself: worst |dlogit| over ik's top-5 fell 1.3984 -> 0.9458
-    // with the model's last scalar quant site (blk.0.ffn_down, held
-    // bit-identical to the qdot composition by the ops dispatch proof and
-    // within 1 ULP of ik's kernel by qdot gate B) on ik's arithmetic. No
-    // A/B was needed to attribute anything: nothing flipped, so the pin's
-    // "say what moved it" has nothing to say.
-    //
-    // 2026-09-20, flash SIMD wiring (MUL-36): the set moved {14} -> {24}.
-    // A/B proof the SIMD path caused it: BLOOMERY_FLASH_SIMD=0 for one run
-    // (same binary, same oracle — the env override `flash_simd` reads once)
-    // -> divergence set {14} again, 32/33, prompt 14 back to its 1st/2nd
-    // swap at ik margin 0.108; default dispatch -> prompt 14 now matches
-    // and prompt 24 flipped instead (`Machine learning models are trained
-    // on`, ik margin 0.151, |dlogit| 0.3509, straight 1st/2nd swap —
-    // worst |dlogit| 1.0048). The flip class is unchanged: a near-tie
-    // re-lottery, not a new fault. What moved is one arithmetic bit — the
-    // kq dot's sum order (fa4 two-partial chain -> 8-lane groups;
-    // `attn.rs`'s `kq_dot_fa4_avx2`), banded at ULP scale against the
-    // scalar path in `attn.rs`'s exact-input gate (scalar leg bit-exact at
-    // 0, SIMD leg 1.31e-6 against a 2.13e-4 band, same run); the V stage
-    // is bit-identical by construction (j-axis lanes reorder nothing).
-    // `gate-mt` still byte-identical across thread counts — MUL-29's row
-    // split is intact.
-    //
-    // Where the remaining drift is from: with Q5_1 fused every quant site
-    // runs ik's own kernel arithmetic, so what is left is `q_nope2`'s
-    // activation-code tie flips (`attn.rs`'s `quantize_act`) plus, since
-    // MUL-36, the flash kq lane order — near-tie ordering and raw drift are
-    // different quantities, and the logits band gate (forward.rs, 5e-2)
-    // holds the raw side (result_output rel 2.91e-2 this run).
-    //
     // The set is pinned rather than counted. Any prompt flipping fails; one
     // starting to match also fails, because that means something moved and
     // the round that moved it should say what. Do not widen this to
     // `len() <= N`.
+    //
+    // Every entry is a near-tie re-lottery, not a new fault: with every
+    // quant site on ik's own kernel arithmetic, what is left is `q_nope2`'s
+    // activation-code tie flips plus the flash kq lane order — near-tie
+    // ordering and raw drift are different quantities, and the logits band
+    // gate (forward.rs, 5e-2) holds the raw side.
+    //
+    // PIN(2026-09-20): divergence set {14} -> {24} with the flash SIMD
+    // wiring (the kq dot's sum order moved to 8-lane groups; A/B:
+    // BLOOMERY_FLASH_SIMD=0 restores {14}) — prompt 24 flips at ik margin
+    // 0.151, a straight 1st/2nd swap.
     const KNOWN_DIVERGENCE: &[usize] = &[24];
     let ids: Vec<usize> = mismatched.iter().map(|(id, ..)| *id).collect();
     assert_eq!(

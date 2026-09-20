@@ -3,10 +3,12 @@
 //! Block 0 in this model, and the shared expert of every MoE block: the math is
 //! identical (a SwiGLU gate/up pair, then the down projection) and only the
 //! tensor names differ (`ffn_*` vs `ffn_*_shexp`). Which trio a block carries is
-//! decided by presence in the file, so no block number is special-cased and the
-//! moe round calls this same function for the shared experts.
+//! decided by presence in the file, so no block number is special-cased. The
+//! MoE module runs its own copy of the three ops (`moe.rs::shexp_ffn`) so its
+//! tensor finds land under its own profiler sites; [`swiglu`] below is the one
+//! owner of the combine itself.
 //!
-//! Gate: `crates/model/tests/ffn.rs` against the oracle. Owned by the ffn round.
+//! Gate: `crates/model/tests/ffn.rs` against the oracle.
 use crate::ModelError;
 use crate::ops::{Tensor2, matmul_q};
 use crate::profile;
@@ -25,8 +27,8 @@ fn ffn_weights(
     block: usize,
 ) -> Result<(&TensorInfo, &TensorInfo, &TensorInfo), ModelError> {
     // Profiler hook (crate::profile): resolving the trio costs up to six
-    // `find`s, each a linear scan of the tensor table — paid once per step for
-    // block 0's dense FFN. Level-1 only, typeless: nothing is read, only found.
+    // `find`s, each a linear scan of the tensor table. Level-1 only, typeless:
+    // nothing is read, only found.
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let gate = format!("blk.{block}.ffn_gate.weight");
@@ -63,11 +65,11 @@ fn ffn_weights(
 /// `[ne0, n_tokens]` block. The order is the contract — `silu(up) * gate` also
 /// produces numbers and only the oracle tells them apart. ggml fuses this with
 /// the two matmuls as FUSED_UP_GATE; the gate pins the product, not the fusion.
-fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
+pub(crate) fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
     // Profiler hook (crate::profile): the SiLU·up combine, level-1 typeless —
-    // activation work, no weight read. `moe.rs` runs two inline copies of this
-    // loop that record the SAME site, so one row answers "what does SwiGLU
-    // cost" across dense, shexp and routed experts.
+    // activation work, no weight read. `moe.rs` calls this per routed expert
+    // and for the shared expert, so one site answers "what does SwiGLU cost"
+    // across dense, shexp and routed experts.
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     assert_eq!(

@@ -7,8 +7,8 @@
 //! (`$IK/ggml/src/ggml-quants.c`, IK=/home/user/ik_llama.cpp), line numbers
 //! cited per function. Nothing here is invented.
 //!
-//! FMA parity (measured on the box, 2026-09-19, `objdump -d --disassemble=…`
-//! on `$IK/build/ggml/src/libggml.so`): the compiled q5_1 uses
+//! FMA parity (verified by disassembling the compiled library,
+//! `$IK/build/ggml/src/libggml.so`): the compiled q5_1 uses
 //! `vfmadd132ps` (x0*d + m fused) and q4_K uses `vfmsub132ps` (q*d1 - m1
 //! fused); q5_0, q3_K and q6_K contain no fused ops. The Rust ports mirror
 //! exactly that: `mul_add` where the library fused, separate multiplies
@@ -447,9 +447,8 @@ fn dequant_q6_k(src: &[u8], dst: &mut [f32]) {
 /// ggml does not multiply K-quant weights by f32 activations. Before a
 /// `ggml_vec_dot_q*_K_q8_K` it quantizes the activation row to Q8_K — 256 values per block,
 /// one f16-ish scale, int8 codes — and does the dot in integers. An f32 reference therefore
-/// does NOT reproduce ggml's output: measured 2026-09-19 against the oracle's `q-0`, an
-/// exact f32 matmul was off by 0.6 % relative (max |diff| 0.12 where the row's largest value
-/// was 16), uniformly across tokens. That is the quantization, not an error.
+/// does NOT reproduce ggml's output: on the oracle's own inputs the exact-f32 matmul is
+/// percent-level off, uniformly across tokens. That is the quantization, not an error.
 ///
 /// So the stage-1 reference quantizes activations too, and the gates stay tight instead of
 /// being opened to 1e-1 to make room for a difference we understand.
@@ -499,10 +498,9 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
 /// | Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q8_0 | `Q8_2_X4` |
 /// | F32, F16 | none |
 ///
-/// Using Q8_K for all of them is wrong by ~1e-3 — measured 2026-09-19 on `ffn_out-0`
-/// (Q5_1 down projection): 2.0e-3 with the wrong activation, **1.4e-7** with this one. The
-/// error ratio between two tensors of different row length was √(10944/2816) = 1.97, the
-/// signature of activation-quantization noise rather than a logic error.
+/// Using Q8_K for all of them is wrong by ~1e-3 on the Q5_1 down projection; the
+/// error grows with the row length like √k, the signature of
+/// activation-quantization noise rather than a logic error.
 ///
 /// Block geometry (`ggml-common.h`, `block_q8_2`): 32 values, `d` as **bf16** (not f16),
 /// `s` a sum this reference does not need, then 32 int8 codes. `_x4` interleaves four such

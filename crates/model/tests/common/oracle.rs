@@ -4,11 +4,18 @@
 //!
 //! The reference set is produced by the lead and only read here. If it is absent this
 //! stops with an error naming the command — it never falls back to computing something,
-//! because a gate that quietly measures nothing stays green (measured 2026-09-19: a runner
-//! kept pointing at a stale binary through every green gate).
+//! because a gate that quietly measures nothing stays green.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// The model file every gate opens: `$BLOOMERY_MODEL`, or the box's default
+/// path. One owner — the gates must all open the same file the oracle came
+/// from.
+pub fn model_path() -> String {
+    std::env::var("BLOOMERY_MODEL")
+        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
+}
 
 #[derive(Clone, Debug)]
 pub struct RefTensor {
@@ -41,9 +48,7 @@ impl Oracle {
             )
         });
         // The dumper's last line is its completion proof. A manifest without it is from a
-        // run that died, and the .f32 files beside it are then a mixture of two runs --
-        // which is what 2026-09-19 produced (27 tensors from an aborted dump, a zero-byte
-        // manifest, and gates that would have compared against whichever half survived).
+        // run that died, and the .f32 files beside it are then a mixture of two runs.
         // File count cannot detect that; the trailer can.
         if !text.lines().any(|l| l.starts_with("# complete\t")) {
             panic!(
@@ -125,8 +130,10 @@ impl Oracle {
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("oracle file {} is missing ({e})", path.display()));
         let vals: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         (vals, info)
     }

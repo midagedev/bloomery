@@ -113,12 +113,10 @@ pub struct Pool {
     /// not return until this reaches the worker count, so no dispatch can
     /// race a starting worker: a worker whose first `seq` load happens after
     /// job 1 is published would initialize `seen` past it, skip the job
-    /// entirely and strand the dispatcher at `remaining > 0` forever
-    /// (field-caught 2026-09-19 on the box: 3-4 slow-to-start workers per
-    /// run, different ones each time).
+    /// entirely and strand the dispatcher at `remaining > 0` forever.
     ready: AtomicUsize,
 
-    // --- observability (MUL-23) -----------------------------------------
+    // --- observability ----------------------------------------------------
     // Relaxed counting of the protocol itself, so a round that attacks
     // dispatch overhead can tell "workers park between matmul_q calls" from
     // "workers stay hot and the time goes elsewhere". One fetch_add per

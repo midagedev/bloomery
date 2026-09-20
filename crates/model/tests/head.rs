@@ -8,42 +8,29 @@
 //! independence of a 6-wide input in `hw_head_batch_is_column_independent`.
 //!
 //! The reference's own activation dialect for Q6_K is ik's Q8_2_X4 (an AVX2-only
-//! fork trait) — identified and matched inside `matmul_q` during this round; the
-//! gate constants below carry the measured derivation and the FAIL-first history.
+//! fork trait) — identified and matched inside `matmul_q`; the gate constants
+//! below carry the derivation.
 //!
 //! `hw_` prefix: needs the box, the model file and `$BLOOMERY_DATA/ref`.
 #[path = "common/oracle.rs"]
 mod oracle;
 
 use model::head::head;
-use model::ops::{Tensor2, rms_norm};
-
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
+use model::ops::{Tensor2, f32_tensor, rms_norm};
 
 /// Logit gate: `|got - want| <= ATOL + RTOL * |want|`.
 ///
-/// Derived 2026-09-19 from measurement, after the reference's activation
-/// dialect was identified and matched:
-///
-/// * The reference logits run ik's fork-specific Q6_K path: on AVX2 its ggml.c
-///   type traits set `Q6_K.vec_dot_type = Q8_2_X4`, so the activation row is
-///   quantized per 32 elements with a bf16-rounded scale (`d = bf16rt(amax/127)`,
-///   codes `round_even(v * (1/d))`, iqk_quantize.cpp ~1089) and dotted in
-///   exact integer math per 16-element group (iqk_gemm_kquants.cpp ~948). A
-///   probe simulating that arithmetic against the oracle's own `result_norm`
-///   reproduced it to max |diff| 1.2e-5 — identification closed.
-/// * `matmul_q` routes Q6_K through `quantize_row_q8_2_x4_roundtrip` (the same
-///   semantics; merged by the lead from the ffn round's Q5_1 finding while this
-///   round ran). Measured end to end here: max |diff| 4.0e-5, worst relative
-///   1.8e-5 over the 102400 logits, max |ref| 28.21. The 3e-5 over the
-///   simulation floor is this gate's own `rms_norm` input (9.5e-7 away from
-///   ik's) plus the elementwise `d*q` reconstruction.
-/// * FAIL-first: against the pre-fix stock-Q8_K-for-everything `matmul_q` these
-///   same constants failed at 409x (max |diff| 0.5588, measured 2026-09-19);
-///   against the fixed code the worst entry sits at ~0.2x — 5x headroom.
+/// The reference logits run ik's fork-specific Q6_K path: on AVX2 its ggml.c
+/// type traits set `Q6_K.vec_dot_type = Q8_2_X4`, so the activation row is
+/// quantized per 32 elements with a bf16-rounded scale (`d = bf16rt(amax/127)`,
+/// codes `round_even(v * (1/d))`, iqk_quantize.cpp ~1089) and dotted in exact
+/// integer math per 16-element group (iqk_gemm_kquants.cpp ~948).
+/// `matmul_q` routes Q6_K through `quantize_row_q8_2_x4_roundtrip` — the same
+/// semantics — so these constants hold the end-to-end residual of that match
+/// (this gate's own `rms_norm` input error plus the elementwise `d*q`
+/// reconstruction) with ~5x headroom on the worst entry. A stock
+/// Q8_K-for-everything `matmul_q` fails them by ~400x, which is the bug class
+/// the relative form exists to catch.
 const RTOL: f32 = 1e-4;
 const ATOL: f32 = 1e-3;
 
@@ -111,7 +98,7 @@ fn top5(v: &[f32]) -> Vec<(usize, f32)> {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_head_matches_oracle() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     // The manifest pins the sequence; any other token set invalidates every number below.
     assert_eq!(
@@ -155,13 +142,7 @@ fn hw_head_matches_oracle() {
         .and_then(|v| v.as_f32())
         .expect("rms eps must come from the file, never from a literal");
     let norm_t = g.find("output_norm.weight").unwrap();
-    let norm_bytes = g.data(norm_t).unwrap();
-    let gain: Vec<f32> = norm_bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let gain = f32_tensor(&g, norm_t).unwrap();
     let normed = rms_norm(&x, &gain, eps);
     assert_eq!(
         [normed.ne0 as i64, normed.ne1 as i64],
@@ -193,7 +174,7 @@ fn hw_head_matches_oracle() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_head_batch_is_column_independent() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     let (xs, xinf) = o.load("l_out-26", 0);
     let ne0 = xinf.ne[0] as usize;

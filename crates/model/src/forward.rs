@@ -7,18 +7,10 @@
 //! still land on ik's numbers when every input is our own output? See
 //! `crates/model/tests/forward.rs` for the measured per-block answer.
 //!
-//! What this is not, so the tok/s next to it is read correctly:
-//!
-//!   * **CPU only.** Not one byte of this runs on either card.
-//!   * **`ops::matmul_q` still dequantizes a weight row to f32 before a scalar dot.**
-//!     It is parallel over output rows now (2026-09-19), but the arithmetic is the
-//!     reference arithmetic: `crates/q3k-cpu` holds the AVX2 int8 path that fuses the
-//!     dequant into the dot, and stage 1 does not call it yet. The profiler measured
-//!     that fusion, not thread count, as the remaining per-core factor.
-//!
-//! Struck 2026-09-19: this header used to say "there is no KV cache" and "single-
-//! threaded". Both were true when it was written and neither is now — `KvCache`
-//! landed in `fcd59e8` and the row parallelization the same day.
+//! **CPU only** — not one byte of this runs on either card. `ops::matmul_q` runs on
+//! the resident thread pool, split over output rows: fused sites dot the quantized
+//! codes through `crates/qdot`, scalar sites dequantize a weight row to f32 first
+//! (`ops::matmul_q`'s doc owns that split).
 //!
 //! The last block is a special case in the reference graph and not here: ik inserts
 //! `inp_out_ids` before block 26's FFN (`last_attn-26`/`last_ffn_inp-26` are

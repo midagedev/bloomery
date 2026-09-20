@@ -30,11 +30,6 @@ use model::attn::{MlaParams, Q8Block, q_nope2_absorbed, quantize_q8_0};
 use model::derived::Derived;
 use model::forward::{forward, new_cache, step};
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-
 /// The pre-`Derived` build, verbatim: the two loops `q_nope2_absorbed` used to
 /// run per call — dequantize the head's k-up rows of `attn_kv_b`, requant
 /// column `j`'s 32-value spans along the q_nope axis into Q8_0. This file's
@@ -76,7 +71,7 @@ fn reference_wblocks(
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_derived_wblocks_bit_identical() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let d = Derived::new(&g).unwrap();
     let n_block = g.block_count().unwrap() as usize;
 
@@ -138,7 +133,7 @@ fn hw_derived_wblocks_bit_identical() {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_derived_all_blocks_all_heads_filled() {
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let d = Derived::new(&g).unwrap();
     let n_block = g.block_count().unwrap() as usize;
     let p0 = MlaParams::read(&g, 0).unwrap();
@@ -182,7 +177,7 @@ fn hw_derived_all_blocks_all_heads_filled() {
 #[ignore = "hw: needs the box and the model file"]
 fn hw_derived_step_equals_forward_bit_exact() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
 
     let wrapper = forward(&g, &tokens).unwrap();

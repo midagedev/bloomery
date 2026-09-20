@@ -31,11 +31,6 @@ use model::forward::{argmax, forward, new_cache, step};
 use model::profile;
 use std::time::Instant;
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-
 /// The re-exec entry point. Not a test of its own: when `BLOOMERY_PROFILE_CHILD_DUMP`
 /// is absent (i.e. someone ran the file directly) it returns without doing anything —
 /// all assertions live in [`hw_profile_gate`].
@@ -47,7 +42,7 @@ fn hw_profile_child_logits() {
         return;
     };
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
     let logits = forward(&g, &tokens).unwrap();
     let bytes: Vec<u8> = logits.data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -141,7 +136,7 @@ fn hw_profile_gate() {
     unsafe { std::env::set_var("BLOOMERY_PROFILE", "2") };
 
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
 
     // The prefill fills the cache; its profile lands in the accumulators too, so it
@@ -160,43 +155,22 @@ fn hw_profile_gate() {
 
     // 2. Coverage. Integer arithmetic on purpose — no float equality near a gate.
     //
-    // Raised 80 -> 98 on 2026-09-20 by the coverage round: after the thread pool
-    // and `Derived`, measured coverage fell to 91.6% (level-1 table, decode, 2
-    // steps, wall 475.0 ms) — the ~20 ms/step the table could not name was
-    // already larger than ik's whole 12.9 ms step, so the gate was told to
-    // demand that the round hook it. With the typeless sites in place the same
-    // gate measures 98.1% on this tree (the first green run's output, not a
-    // target chosen in advance). 98 leaves 0.1 points of headroom — thin on
-    // purpose: the unhooked remainder this round leaves behind is ~4.4 ms of
-    // step glue per 233 ms step, so a healthy tree cannot drift far below, and
-    // a site the size of `flash_attn_latent` (9.6 ms, 4.1%) going dark lands
-    // near 94% and fails loud, not marginal.
+    // The floor is a frontier pin, not a constant: a round that removes HOOKED
+    // work (the fused wiring removed whole dequant stages) moves the ratio down
+    // without any new dark region, so the pin follows the frontier — when a
+    // round attacks the work still visible inside a site's wall, this floor
+    // should follow it back up. Catch power survives either way: a site the
+    // size of `flash_attn_latent` (~4.7% of a step) going dark lands near 93%
+    // and fails loud, and new unhooked work up to ~2 ms/step still falls short
+    // of the floor. Anything that pushes this below 97 is new unhooked work,
+    // which is the thing the gate is for. Do not lower the threshold to make
+    // such a run pass; hook the work.
     //
-    // Six runs stand behind that: four by the lead on the merged tree before
-    // committing (98.04, 98.08, 98.09, 98.11 %) and two by the round on its own
-    // tree (98.06, 98.10), over walls of 189 to 237 ms. The ratio does
-    // not move with the wall — the unhooked remainder is step glue that scales
-    // with the step, not a fixed overhead — so the 0.04 points of headroom at
-    // the worst run are not a noise band waiting to flip. Anything that does
-    // push this below 98 is new unhooked work, which is the thing the gate is
-    // for. Do not lower the threshold to make such a run pass; hook the work.
-    //
-    // Re-baselined 98 -> 97 by the LEAD on 2026-09-20, on the MUL-21 fused wiring —
-    // the first event the paragraph above did not predict, measured before the pin
-    // moved: the wiring removed ~14 ms of HOOKED work per step (Q3_K dequant; step
-    // wall 233 -> ~205-219 ms) while the step glue stayed fixed, so the ratio landed
-    // at 97.9-98.3% and the 98 floor flickered run to run. The "glue scales with the
-    // step" premise above is falsified by exactly this: glue is fixed per step, and a
-    // round that shrinks HOOKED work moves the ratio down without any new dark region.
-    // Controls run on the box, same tree: fused -> 97.9% three times and 98.3% once;
-    // `fused = false` restore -> 98.0% twice; all 21 sites live; the level-2 stage
-    // table names no new unaccounted stage. This is a frontier re-pin, not an
-    // admission of unhooked work — the catch-power argument survives: a site the size
-    // of `flash_attn_latent` (~9.6 ms, ~4.7% of a 205 ms step) going dark lands near
-    // 93.3% and still fails loud, and new unhooked work up to ~2 ms/step still falls
-    // short of the floor. When the dispatch/sync round attacks the ~28 ms/step now
-    // visible inside the Q3_K site wall (stage table, worker-sum vs site wall), the
-    // frontier moves back up and this floor should follow it.
+    // PIN(2026-09-20): raised 80 -> 98 when the coverage round hooked the
+    // typeless sites.
+    // PIN(2026-09-20): re-baselined 98 -> 97 on the fused wiring — it removed
+    // ~14 ms of hooked dequant per step while the step glue stayed fixed, so
+    // the 98 floor flickered run to run.
     let instrumented = profile::instrumented_ns();
     let pct = instrumented as f64 / wall_ns as f64 * 100.0;
     assert!(

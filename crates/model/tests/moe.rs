@@ -21,11 +21,6 @@ mod oracle;
 use model::Tensor2;
 use model::moe;
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-
 /// `ffn_norm-1` — the MoE block's input, straight from the oracle.
 fn moe_input(o: &oracle::Oracle) -> Tensor2 {
     let (xs, xinf) = o.load("ffn_norm-1", 0);
@@ -36,7 +31,7 @@ fn moe_input(o: &oracle::Oracle) -> Tensor2 {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_router_exact() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let x = moe_input(&o);
 
     let b = moe::route(&g, 1, &x).unwrap();
@@ -118,7 +113,7 @@ fn hw_moe_router_exact() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_forward_matches_ggml() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let x = moe_input(&o);
 
     let out = moe::moe_ffn(&g, 1, &x).unwrap();
@@ -131,42 +126,25 @@ fn hw_moe_forward_matches_ggml() {
 
     let (down, dinf) = o.load("ffn_moe_down-1", 0);
     assert_eq!(dinf.op, "MUL_MAT_ID");
-    // This one gate is opened above the spec's 1e-4. The spec's relaxation rule asks
-    // for a dated comment, a derivation, and FAIL-first evidence — all three here.
+    // This one gate is opened above the spec's 1e-4, with the derivation and
+    // the FAIL-first evidence the relaxation rule asks for.
     //
-    // 2026-09-19: the reference's fused up/gate kernel accumulates in f32 (AVX2
-    // `mul_mat_up_gate_NxM` tiles), so its own `gate_par` — the very tensor
-    // `MUL_MAT_ID` then quantizes — sits at most 4.6e-5 from this engine's (p50
-    // ~3e-8, measured over all 6*6*1408 entries; this engine accumulates in f64 over
-    // operands that are exact in f32, i.e. it holds the truer value). The down
-    // quantizer is a discontinuous function of that input (bf16 block scale + integer
-    // codes): in the two affected token columns a handful of the 36*44 input blocks
-    // sit close enough to a code or bf16-scale boundary that the reference's own noise
-    // flips them, and one flipped input code perturbs the whole 2048-entry output
-    // column by |w_row| * d16. Measured over this batch: tokens 0/1/2/5 exact to
-    // <= 1.4e-6; token 3 has 358 entries over 1e-4 (max 2.81e-4), token 4 has 272
-    // (max 2.46e-4) — the discrete signature of ~1-2 flipped codes, not a scale or
-    // accumulation error, which would show as a smooth spread across all columns.
-    // Cross-check: the same floor appears unchanged when the whole MoE path runs on
-    // `ops::matmul_q`'s Q8_K activation quantizer instead of the source-derived
-    // q8_2_x4 one (max 2.809167e-4, same per-token distribution) — the floor is a
-    // property of the reference, not of the quantizer this engine picks.
+    // The reference's fused up/gate kernel accumulates in f32, so its own
+    // `gate_par` — the very tensor `MUL_MAT_ID` then quantizes — sits a few
+    // 1e-5 from this engine's, and the down quantizer is a discontinuous
+    // function of that input (bf16 block scale + integer codes): a couple of
+    // input blocks per batch sit close enough to a code or scale boundary
+    // that the reference's own noise flips them, and one flipped code
+    // perturbs a whole 2048-entry output column. The per-token error
+    // signature (a few columns at ~2.8e-4, the rest exact) is that discrete
+    // flip pattern, not a smooth scale or accumulation error; the same floor
+    // appears whichever activation quantizer feeds the down matmul, so it is
+    // a property of the reference, not of this engine's quantizer choice.
     //
-    // FAIL-first, both directions (box runs 2026-09-19):
-    // * at 1e-4 this comparison fails on the current, correct implementation:
-    //   `moe_ffn -> ffn_moe_down-1: max |diff| = 2.809912e-4 at index 46823
-    //    (got -0.12958647, reference -0.12986746)`.
-    // * at 4e-4 it still catches the real bug class: quantizing the down activations
-    //   with the f16 scale format instead of bf16 fails at max |diff| = 2.8e-2,
-    //   70x over the gate.
-    // 4e-4 is 1.4x the observed maximum and 1/25th of the "1e-2 is a bug" line.
-    //
-    // 2026-09-20 (MUL-32): the Q5_0 x Q8_2_X4 fused wiring measures this
-    // comparison at max|diff| = 0e0 — bit-exact against the oracle's own
-    // MUL_MAT_ID output, over all 6*2048 entries. A/B on the same run pair
-    // (supports() with Q5_0 removed): 4.77e-6. The gate stays at 4e-4 —
-    // it is the reference-noise bound, not ours, and it is what still
-    // catches the f16-scale bug class above.
+    // PIN(2026-09-19): opened 1e-4 -> 4e-4 — the reference's own gate_par
+    // noise flips ~1-2 down-quantizer codes per batch; 4e-4 is 1.4x the
+    // observed maximum and still fails an f16-scale-in-place-of-bf16 bug at
+    // 70x the gate.
     oracle::assert_close(&tr.down, &down, 4e-4, "moe_ffn -> ffn_moe_down-1");
 
     // The weighted sum and the shared-expert sum are gated separately: they are two
@@ -187,18 +165,14 @@ fn hw_moe_forward_matches_ggml() {
 /// Structure, not numbers: the engine may only dequantize experts some token actually
 /// routed to. mistral.rs dequantizes all 64 experts per token on x86_64
 /// (`mistralrs-quant/src/gguf/cpu.rs:74`, see docs/research/mistralrs-prior-art.md
-/// §4.4) and that failure mode costs 442 ms/layer/token against 0.20 ms. This gate
-/// keeps it out of this engine: `moe::last_touched_experts()` is set where the expert
-/// bytes are fetched, so an empty-bucket matmul that touches all 64 trips it.
-///
-/// FAIL-first: verified 2026-09-19 by deleting the empty-bucket skip in `moe_ffn` (the
-/// naive version then dequantizes all 64 stacks): it fails with `distinct experts
-/// dequantized must equal distinct experts routed to (25), got 64`.
+/// §4.4); this gate keeps that failure mode out of this engine —
+/// `moe::last_touched_experts()` is set where the expert bytes are fetched, so a
+/// missing empty-bucket skip trips it at "64 distinct experts dequantized".
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_touches_only_routed_experts() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let x = moe_input(&o);
 
     moe::moe_ffn(&g, 1, &x).unwrap();

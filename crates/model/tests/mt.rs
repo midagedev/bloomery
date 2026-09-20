@@ -30,11 +30,6 @@ mod oracle;
 
 use model::forward::forward;
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-
 /// The re-exec entry point. Not a test of its own: when `BLOOMERY_MT_CHILD_DUMP`
 /// is absent (i.e. someone ran the file directly) it returns without doing
 /// anything — all assertions live in [`hw_mt_gate`].
@@ -46,7 +41,7 @@ fn hw_mt_child_logits() {
         return;
     };
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
     let logits = forward(&g, &tokens).unwrap();
     let bytes: Vec<u8> = logits.data.iter().flat_map(|v| v.to_le_bytes()).collect();

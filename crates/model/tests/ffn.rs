@@ -8,14 +8,6 @@ mod oracle;
 use model::ffn::{dense_ffn, dense_ffn_up_gate};
 use model::ops::Tensor2;
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-// NOTE: `model_path` duplicates `tests/ops.rs` on purpose — integration tests are
-// separate crates and can only share via `tests/common/`, which this round does
-// not own (file whitelist: this file and `src/ffn.rs`).
-
 fn load_input(o: &oracle::Oracle, name: &str) -> Tensor2 {
     let (data, info) = o.load(name, 0);
     Tensor2::from_vec(info.ne[0] as usize, info.ne[1] as usize, data)
@@ -38,7 +30,7 @@ fn check_tokens(o: &oracle::Oracle) {
 fn hw_dense_ffn_block0_matches_ggml() {
     let o = oracle::Oracle::open();
     check_tokens(&o);
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     // The intermediate width is the file's, not a literal (cf. the ops gate,
     // where eps comes from the file and never from a literal).
@@ -87,7 +79,7 @@ fn hw_dense_ffn_block0_matches_ggml() {
 fn hw_dense_ffn_shexp_block1_matches_ggml() {
     let o = oracle::Oracle::open();
     check_tokens(&o);
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     // 2 shared experts × 1408, from the file's own keys.
     let shared = g

@@ -125,12 +125,8 @@ fn panic_propagates_and_pool_survives() {
 /// Nesting `for_each_chunk` inside a chunk closure deadlocks — from a worker on
 /// the dispatch mutex the caller holds, from the calling thread (which runs the
 /// last chunk itself) on the mutex it holds already. Either way a hang with no
-/// message. The pool asserts instead, and this proves the assertion fires.
-///
-/// Added by the lead 2026-09-19 after reading the round's diff, and the first
-/// version of this guard only marked the resident workers — which left the
-/// caller's own chunk deadlocking exactly as before. It was this test hanging
-/// the gate on the box that said so, which is the argument for the test.
+/// message. The pool asserts instead, and this proves the assertion fires — on
+/// the caller's own chunk too, not just the resident workers.
 ///
 /// The watchdog matters here more than anywhere: if the assertion is ever removed,
 /// this test does not fail, it hangs — so the 30 s channel is the actual gate.

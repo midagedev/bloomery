@@ -1,17 +1,7 @@
 //! Where one decode step's nanoseconds go — the single owner of the stage-1 profiler.
 //!
-//! The 37x gap to ik_llama.cpp had three candidate causes (scalar f32 dot, per-call
-//! weight dequant, per-step `wk_b` requant in `q_nope2_absorbed`) and no measurement
-//! saying which one was big. Fixing blind would have spent a round on the small one,
-//! so this module only *attributes time*; the fixes are separate rounds fed by its
-//! table.
-//!
-//! What it answered, 2026-09-19, in one lease (decode, 2 steps, 7350.6 ms wall):
-//! `matmul_q` 91.4 % and `q_nope2_absorbed` 8.4 %; by stage, dequant 4128.5 ms against
-//! the dot's 3286.2 — so the first two causes are one cause (a fused int8 kernel, not
-//! a faster f32 dot), and the third was 592.1 of its 614.6 ms, all of it independent
-//! of the token. `Derived` closed the third and the thread pool the arithmetic's
-//! parallelism; the fused kernel is still open. The table is `just measure-profile`.
+//! This module only *attributes time*; the fixes are separate rounds fed by its
+//! table (`just measure-profile` owns the measurement itself).
 //!
 //! Design constraints, each load-bearing:
 //!
@@ -34,10 +24,7 @@
 //! first hooked call does nothing, which is what the decode binary's `--profile` flag
 //! relies on when it sets the variable before any model code runs.
 //!
-//! The coverage round (2026-09-20) added the sites that are not matmuls, after the
-//! thread pool shrank `matmul_q`'s share to 91.6 % and left ~20 ms per token that the
-//! table could not name — larger than ik's whole step. Three rules for reading their
-//! rows:
+//! Sites that are not matmuls record too. Three rules for reading their rows:
 //!
 //!   * **Typeless sites record through [`record_time`]** under the sentinel type
 //!     `GgmlType::Unknown(0)` (tag 0 is F32, so no tensor in any file can produce
@@ -109,11 +96,9 @@ pub struct CallAcc {
     ns_quant_act: u64,
     ns_dequant_w: u64,
     ns_dot: u64,
-    /// Caller-side join aftermath: chunk sort, error scan, the transpose copy
-    /// into `out`, accumulator merge. Level 2 only, and it is the number the
-    /// dispatch round (MUL-23) asked for — the site's wall minus
-    /// quant/dequant/dot/gather is what the pool protocol and chunk-arrival
-    /// skew cost.
+    /// Caller-side join aftermath: chunk sort, error scan, accumulator merge.
+    /// Level 2 only — the site's wall minus quant/dequant/dot/gather is what
+    /// the pool protocol and chunk-arrival skew cost.
     ns_gather: u64,
 }
 

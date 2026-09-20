@@ -19,11 +19,6 @@ mod oracle;
 
 use model::forward::{forward, new_cache, step};
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-
 fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(
         got.len(),
@@ -46,7 +41,7 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_one_shot_equals_uncached() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
 
     let plain = forward(&g, &tokens).unwrap();
@@ -70,7 +65,7 @@ fn hw_kv_one_shot_equals_uncached() {
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_incremental_is_bit_exact() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
     let split = tokens.len() - 1;
 
@@ -108,7 +103,7 @@ fn hw_kv_incremental_is_bit_exact() {
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_every_split_is_bit_exact() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
 
     // One reference per prefix length, from the uncached path.

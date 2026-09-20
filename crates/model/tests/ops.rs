@@ -6,28 +6,19 @@
 mod oracle;
 
 use gguf::GgmlType;
-use model::ops::{Tensor2, matmul_q, rms_norm};
-
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
+use model::ops::{Tensor2, f32_tensor, matmul_q, rms_norm};
 
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_rms_norm_matches_ggml() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     let (inp, inf) = o.load("inp_embd", 0);
     let x = Tensor2::from_vec(inf.ne[0] as usize, inf.ne[1] as usize, inp);
 
     let gain_t = g.find("blk.0.attn_norm.weight").unwrap();
-    let gain_bytes = g.data(gain_t).unwrap();
-    let gain: Vec<f32> = gain_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let gain = f32_tensor(&g, gain_t).unwrap();
 
     let eps = g
         .value("deepseek2.attention.layer_norm_rms_epsilon")
@@ -48,7 +39,7 @@ fn hw_rms_norm_matches_ggml() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_matches_ggml() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     let (xs, xinf) = o.load("attn_norm-0", 0);
     let x = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
@@ -64,28 +55,26 @@ fn hw_matmul_q_matches_ggml() {
         winf.op, "MUL_MAT",
         "occurrence 0 of q-0 must be the matmul, not the concat"
     );
-    // 1e-4 on values that reach 18: the residual is f32 accumulation order against ggml's
-    // integer sum, measured at 1.5e-5. Before activations went through Q8_K it was 1.2e-1.
+    // 1e-4 on values that reach 18: the residual is f32 accumulation order
+    // against ggml's integer sum.
     oracle::assert_close(&got.data, &want, 1e-4, "matmul_q -> q-0");
 }
 
-/// The dispatch proof for the qdot wiring (MUL-21, 2026-09-20): `matmul_q` must route
-/// Q3_K with k a multiple of 256 through the fused kernel and leave every other type
-/// on the scalar path. The two paths are known NOT to agree bit for bit — the fused
-/// kernel is the more accurate one (measured against an f64 exact answer in the qdot
-/// round) — so this test proves the move HAPPENED, not that it did not: bit equality
-/// against the fused composition (ground A), at least one differing element against
-/// the old scalar composition (ground B). The leak watch this test carried until
-/// MUL-34 (a non-Q3_K matmul bit-identical to the scalar composition) retired when
-/// Q5_1 — its witness — became the model's LAST fused type: with every quant type
-/// wired, the meaningful statement for Q5_1 is the same dispatch proof Q3_K gets
-/// (grounds A/B against blk.0.ffn_down), which also catches the one failure the
-/// k_granularity contract exists for — the fused path silently not firing.
+/// The dispatch proof for the qdot wiring: `matmul_q` must route Q3_K with k
+/// a multiple of 256 through the fused kernel. The two paths are known NOT to
+/// agree bit for bit — the fused kernel is the more accurate one — so this
+/// test proves the move HAPPENED, not that it did not: bit equality against
+/// the fused composition (ground A), at least one differing element against
+/// the old scalar composition (ground B). Q5_1 gets the same two grounds
+/// against blk.0.ffn_down (k = 10944 = 342 x 32, not a multiple of 256 — the
+/// shape the per-type `k_granularity` contract exists for); with every quant
+/// type in the model fused, the failure this watches for is the fused path
+/// silently not firing.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_q3k_fused_dispatch() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     // Same input as hw_matmul_q_matches_ggml: attn_norm-0 through blk.0.attn_q.
     let (xs, xinf) = o.load("attn_norm-0", 0);
@@ -169,10 +158,7 @@ fn hw_matmul_q_q3k_fused_dispatch() {
         n * x.ne1
     );
 
-    // Q5_1 dispatch proof (MUL-34) — the old leak watch's witness became the
-    // model's last fused type, so the statement flips to the same grounds Q3_K
-    // gets. blk.0.ffn_down, k = 10944 = 342 x 32 (not a multiple of 256 — the
-    // shape the per-type k_granularity contract exists for); the input is
+    // Q5_1 dispatch proof: blk.0.ffn_down, the same two grounds. The input is
     // synthetic (all ones, k-matched), so this needs no oracle entry.
     let wf = g.find("blk.0.ffn_down.weight").unwrap();
     assert_eq!(wf.ty, GgmlType::Q5_1, "this is the Q5_1 dispatch proof");
@@ -227,12 +213,12 @@ fn hw_matmul_q_q3k_fused_dispatch() {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_matmul_q_batch_matches_sequential() {
-    // MUL-24's dispatch proof: the batched primitive is the per-pair matmul_q
-    // to the last bit, on the tensors it actually serves (the routed-expert
+    // The dispatch proof: the batched primitive is the per-pair matmul_q to
+    // the last bit, on the tensors it actually serves (the routed-expert
     // stacks) with the shapes that actually differ between pairs (bucket
     // sizes — here 2 and 5 columns, mixed on purpose so a pair that read its
     // neighbor's activations fails on length alone).
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
     // Slice the expert stack exactly the way moe.rs's expert_view does; the
     // test rebuilds it because the batch must equal the sequential view, not
@@ -283,8 +269,8 @@ fn hw_matmul_q_batch_matches_sequential() {
     let xbs: Vec<Tensor2> = cols.iter().map(|c| colset(c)).collect();
     let views: Vec<gguf::TensorInfo> = experts.iter().map(|&e| view(e as u64)).collect();
 
-    // Reference: one dispatch per pair, exactly what the expert loop did
-    // before batching.
+    // Reference: one dispatch per pair, exactly what a sequential expert loop
+    // runs.
     let seq: Vec<Tensor2> = views
         .iter()
         .zip(&xbs)

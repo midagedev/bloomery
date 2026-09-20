@@ -11,11 +11,6 @@ mod oracle;
 
 use model::forward::{argmax, embed, forward_trace};
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-
 fn max_abs_diff(got: &[f32], want: &[f32]) -> (f32, usize) {
     assert_eq!(
         got.len(),
@@ -43,7 +38,7 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> (f32, usize) {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_forward_embed_is_exact() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
 
     let got = embed(&g, &tokens).unwrap();
@@ -61,63 +56,19 @@ fn hw_forward_embed_is_exact() {
     eprintln!("inp_embd                               max|diff| = 0   exact");
 }
 
-/// Tolerance for the residual chain, derived 2026-09-19 from the profile this test
+/// Tolerance for the residual chain, derived from the profile this test
 /// prints. It is **relative to the block's own peak**, not absolute, because the
 /// residual stream is not one scale: `l_out-2` peaks at 2.1e1 and `l_out-3` at 1.1e3
 /// (DeepSeek's massive-activation jump, visible in the printed table). An absolute gate
 /// picked at block 0 would be meaningless by block 3 and vice versa.
 ///
-/// Measured worst per band, with the headroom each constant leaves:
+/// The bands hold the measured worst per segment with ~2.5x headroom
+/// (0–2 at 3e-3, 3–23 at 2e-3, 24–26 at 7e-2).
 ///
-/// | blocks | measured worst rel | gate | headroom |
-/// |---|---|---|---|
-/// | 0–2   | 1.18e-3 (`l_out-2`)  | 3e-3   | 2.5x |
-/// | 3–23  | 7.64e-4 (`l_out-23`) | 2e-3   | 2.6x |
-/// | 24–26 | 2.79e-2 (`l_out-26`) | 7e-2   | 2.5x |
-///
-/// The 24–26 band was repinned 2026-09-20 (MUL-27) from 2.5e-2 (measured
-/// 9.08e-3): the Q4_K x Q8_2_X4 fused wiring moved every Q4_K site onto
-/// ik's own kernel arithmetic (qdot gate B: 64 rows within 1 ULP) and the
-/// last block read 2.79e-2 against the oracle — 7.1x its unfused value,
-/// measured by A/B (`supports()` reverted to Q3_K-only: l_out-26 3.93e-3,
-/// l_out-25 8.30e-3, same binary). The direction of the move is toward ik,
-/// not away: the same wiring took the 33-prompt argmax gate from 31/33 to
-/// 33/33 for the first time (`prompts.rs`, divergence set {} — both former
-/// flips were 1st/2nd swaps at ik margins 0.108/0.151). The tail blocks
-/// amplify whatever the chain carries into them (DeepSeek's massive
-/// activations make block 26 a sensitive spot); the not-yet-fused
-/// Q5_1/Q6_K sites and `q_nope2`'s tie flips are what is still carried.
-///
-/// 2026-09-20 (MUL-32): the Q5_0 fused wiring (every ffn_down_exps site,
-/// k = 1408, now ik's own kernel arithmetic — moe.rs's `ffn_moe_down-1`
-/// is bit-exact, 0e0) brought the band's worst DOWN to 4.99e-3 (`l_out-25`;
-/// `l_out-24` 2.03e-3, `l_out-26` 3.58e-3, `result_output` 2.35e-2 against
-/// the 5e-2 logit gate). No repin: 7e-2 held. The argmax near-tie
-/// re-lottery this caused is recorded in `prompts.rs` (set {14}, A/B
-/// proof there).
-///
-/// 2026-09-20 (MUL-34): the Q5_1 fused wiring (blk.0.ffn_down, k = 10944 —
-/// the model's LAST unfused quant type; the ops dispatch proof holds the
-/// site bit-identical to the qdot composition, qdot gate B within 1 ULP of
-/// ik's own kernel) moved the 24–26 band's worst to 7.21e-3 (`l_out-25`;
-/// `l_out-24` 1.49e-3, `l_out-26` 3.18e-3, `result_output` 2.64e-2) — up
-/// from 4.99e-3 but still 10x under the 7e-2 pin, and with every quant
-/// site now on ik's own arithmetic there is no scalar/fused mixture left
-/// in the chain to blame drift on except `q_nope2`'s activation-code tie
-/// flips. No repin. The argmax set did not move this time (`prompts.rs`,
-/// still {14}, worst |dlogit| 1.3984 -> 0.9458).
-///
-/// 2026-09-20 (MUL-36): the flash SIMD wiring (every attention site's kq
-/// dot in 8-lane groups, V accumulation eight latent lanes per FMA) moved
-/// the bands only at the ULP-noise scale: 0–2 worst 1.17e-3 (`l_out-2`),
-/// 3–23 worst 7.91e-4 (`l_out-23`), 24–26 worst 1.08e-2 (`l_out-25`;
-/// `l_out-26` 3.49e-3), `result_output` 2.91e-2 against the 5e-2 logit
-/// gate. No repin: every band held with ≥2.5x headroom. The attention
-/// arithmetic itself is banded against its own scalar twin in
-/// `attn.rs`'s gate (1.31e-6 realized); what lands here is that noise
-/// compounding through 27 blocks on top of the inherited drift. The argmax
-/// re-lottery this caused is recorded in `prompts.rs` (set {24}, A/B proof
-/// there).
+/// PIN(2026-09-20): the 24–26 band was raised 2.5e-2 -> 7e-2 when the Q4_K
+/// fused wiring moved that block's sites onto ik's own kernel arithmetic —
+/// a move TOWARD ik (the argmax gate went to 33/33 the same day), with the
+/// tail blocks amplifying whatever the chain carries into them.
 ///
 /// **Where the drift comes from is already known and is not this round's.** Block 0's
 /// 1.8e-3 is the attention round's documented `q_nope2` slack (its own gate measures
@@ -127,14 +78,12 @@ fn hw_forward_embed_is_exact() {
 /// three blocks are where it grows, and that is the band to watch when the cache lands.
 ///
 /// FAIL-first, measured not assumed: with `is_moe` forced to `false` the chain fails at
-/// `l_out-1` — the first MoE block — at rel 5.9e-1, 197x its band, and the argmax goes
-/// to 41138 against ik's 8913. Worth noting what the probe did NOT do: nothing errored.
+/// `l_out-1` — the first MoE block — at rel 5.9e-1, and the argmax picks a different
+/// token than ik's. Worth noting what the probe did NOT do: nothing errored.
 /// Every MoE block fell back to its shared-expert trio (`ffn.rs` picks by tensor
 /// presence and the `_shexp` names are there), so a model missing six routed experts per
 /// block ran to completion and produced a token. The band that names block 1 is what
-/// says where it went wrong; the argmax only says that it did. (197x was against the
-/// old 3e-4-class middle band; against the WIDEST band it is still 8x — the repin kept
-/// the failure loud.)
+/// says where it went wrong; the argmax only says that it did.
 const L_OUT_BANDS: &[(usize, f32)] = &[(0, 3e-3), (3, 2e-3), (24, 7e-2)];
 
 /// The logits carry the chain's whole drift plus the head's own: measured 2.17e-2
@@ -153,7 +102,7 @@ const LOGIT_REL_TOL: f32 = 5e-2;
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_forward_chain_matches_oracle() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
 
     let t0 = std::time::Instant::now();
