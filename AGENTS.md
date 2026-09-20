@@ -37,6 +37,7 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
     just measure-gpu  # quiet-machine GPU measurement, witnesses included
     just measure-cpu  # same for the CPU tier, serialized by a file lock
     just gate         # fmt-check + lint + both builds; run before committing
+    just box-gc       # kill orphan processes under this track's remote dir
 
 `just gate` excludes the measure targets on purpose: they need a quiet machine
 and take a lock, so running them is a separate, deliberate act. It also excludes
@@ -45,6 +46,37 @@ and take a lock, so running them is a separate, deliberate act. It also excludes
 Build artifacts land in the workspace root `target/`, not under `crates/*/`.
 The measure runners read from there and exit rather than fall back, because a
 stale binary at an old path is a wrong number, not a missing one.
+
+Every `gate-*` recipe runs its `cargo test` under
+`timeout --kill-after=10 900`: warm runs take seconds, cold builds a few
+minutes, and a gate that hangs must fail loudly in fifteen minutes rather than
+hang a pipeline forever. (2026-09-20: an infinite loop in a first-draft chunk
+walk hung `gate-mt` past an hour; two parallel agents died as "inactive"
+watching it, and orphaned test processes piled up on the box until they were
+found by hand. The bound, `box-gc`, and the checklist below all come from that
+incident.)
+
+## Parallel tracks (subagent rounds)
+
+Independent rounds run as git worktrees, each with its own remote directory via
+`BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh '...'` — the protocol
+box.sh's header already reserved. Lease-taking measurements (decode-measure,
+profile-of-record) stay with the main track: the lease is machine-wide, so
+measurement is serialized by design.
+
+Track checklist, first and last:
+
+1. **First**: `just box-gc` — clear anything a previous track left under this
+   remote dir. An orphaned test binary can hold the cargo build lock and make
+   every later command wait forever.
+2. **Always** run long box commands through the `gate-*` recipes or with an
+   explicit `timeout` — never bare `cargo test` at a prompt you are not
+   watching. If a command produces no output for minutes, assume it is hung on
+   the box, not thinking: check `pgrep -fa '<remote dir>'`.
+3. **Last**: `just box-gc` again, then remove the worktree.
+
+A quiet agent is a symptom, not a state: when a subagent goes inactive, the
+first suspect is a hung gate on the box, not the agent.
 
 ## Layout
 
