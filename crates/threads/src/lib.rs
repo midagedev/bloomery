@@ -351,7 +351,9 @@ impl Pool {
                 n: 0,
             }),
             seq: AtomicUsize::new(0),
-            done: (0..nthreads.saturating_sub(1)).map(|_| DoneMark(AtomicUsize::new(0))).collect(),
+            done: (0..nthreads.saturating_sub(1))
+                .map(|_| DoneMark(AtomicUsize::new(0)))
+                .collect(),
             parked: AtomicUsize::new(0),
             dispatcher_parked: AtomicBool::new(false),
             lock: Mutex::new(()),

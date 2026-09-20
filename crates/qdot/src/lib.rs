@@ -2247,7 +2247,11 @@ unsafe fn q_nope2_cells_avx2_inner(
 /// half onto lower, `movehl`, `movehdup`). `None` when the CPU lacks AVX2+FMA or
 /// `k` is not a multiple of 8; the caller keeps its scalar loop for that.
 pub fn dot_f32(wrow: &[u8], x: &[f32]) -> Option<f32> {
-    assert_eq!(wrow.len(), x.len() * 4, "dot_f32: row bytes vs column length");
+    assert_eq!(
+        wrow.len(),
+        x.len() * 4,
+        "dot_f32: row bytes vs column length"
+    );
     #[cfg(target_arch = "x86_64")]
     if !x.is_empty()
         && x.len().is_multiple_of(8)
@@ -2364,7 +2368,10 @@ unsafe fn swiglu_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
         upad[..n - full].copy_from_slice(&up[full..]);
         // SAFETY: the three arrays are eight f32 each.
         unsafe {
-            let r = _mm256_mul_ps(v_silu(_mm256_loadu_ps(gp.as_ptr())), _mm256_loadu_ps(upad.as_ptr()));
+            let r = _mm256_mul_ps(
+                v_silu(_mm256_loadu_ps(gp.as_ptr())),
+                _mm256_loadu_ps(upad.as_ptr()),
+            );
             _mm256_storeu_ps(op.as_mut_ptr(), r);
         }
         out[full..].copy_from_slice(&op[..n - full]);
@@ -2394,11 +2401,14 @@ unsafe fn v_expf(x: __m256) -> __m256 {
     let n = _mm256_sub_ps(z, r);
     let b = _mm256_fnmadd_ps(
         n,
-        f(0x35BF_BE8E), // 0x1.7f7d1cp-20
+        f(0x35BF_BE8E),                         // 0x1.7f7d1cp-20
         _mm256_fnmadd_ps(n, f(0x3F31_7200), x), // 0x1.62e4p-1
     );
     let e = _mm256_slli_epi32(_mm256_castps_si256(z), 23);
-    let k = _mm256_castsi256_ps(_mm256_add_epi32(e, _mm256_castps_si256(_mm256_set1_ps(1.0))));
+    let k = _mm256_castsi256_ps(_mm256_add_epi32(
+        e,
+        _mm256_castps_si256(_mm256_set1_ps(1.0)),
+    ));
     let absn = _mm256_andnot_ps(_mm256_set1_ps(-0.0), n);
     let c = _mm256_cmp_ps(absn, _mm256_set1_ps(126.0), _CMP_GT_OQ);
     let u = _mm256_mul_ps(b, b);

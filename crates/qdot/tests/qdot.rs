@@ -1042,17 +1042,29 @@ fn q_nope2_cells_rejects_bad_shapes() {
 #[test]
 fn swiglu_matches_scalar_and_is_position_independent() {
     let n = 1408 + 5;
-    let gate: Vec<f32> = (0..n).map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.02).collect();
-    let up: Vec<f32> = (0..n).map(|i| ((i * 91 % 1777) as f32 - 888.0) * 0.003).collect();
+    let gate: Vec<f32> = (0..n)
+        .map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.02)
+        .collect();
+    let up: Vec<f32> = (0..n)
+        .map(|i| ((i * 91 % 1777) as f32 - 888.0) * 0.003)
+        .collect();
     let mut out = vec![0.0f32; n];
     qdot::swiglu(&gate, &up, &mut out);
     for i in 0..n {
         let want = gate[i] / (1.0 + (-gate[i]).exp()) * up[i];
         let tol = 2e-6 * want.abs().max(1e-3);
-        assert!((out[i] - want).abs() <= tol, "i={i} got {} want {want}", out[i]);
+        assert!(
+            (out[i] - want).abs() <= tol,
+            "i={i} got {} want {want}",
+            out[i]
+        );
         let mut one = [0.0f32];
         qdot::swiglu(&gate[i..i + 1], &up[i..i + 1], &mut one);
-        assert_eq!(one[0].to_bits(), out[i].to_bits(), "i={i} moves with its position");
+        assert_eq!(
+            one[0].to_bits(),
+            out[i].to_bits(),
+            "i={i} moves with its position"
+        );
     }
     // The saturating ends: exp overflow must give 0 and x, not NaN.
     let mut ends = [0.0f32; 2];
@@ -1066,11 +1078,19 @@ fn swiglu_matches_scalar_and_is_position_independent() {
 #[test]
 fn sum_sq_f64_narrows_to_the_sequential_sum() {
     for n in [8usize, 512, 2048, 2048 + 5] {
-        let x: Vec<f32> = (0..n).map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.0137).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.0137)
+            .collect();
         let seq: f64 = x.iter().fold(0.0f64, |a, &v| a + (v * v) as f64);
         let got = qdot::sum_sq_f64(&x);
-        assert!(((got - seq) / seq).abs() < 1e-14, "n={n} got {got} seq {seq}");
-        assert_eq!(((got / n as f64) as f32).to_bits(), ((seq / n as f64) as f32).to_bits());
+        assert!(
+            ((got - seq) / seq).abs() < 1e-14,
+            "n={n} got {got} seq {seq}"
+        );
+        assert_eq!(
+            ((got / n as f64) as f32).to_bits(),
+            ((seq / n as f64) as f32).to_bits()
+        );
     }
 }
 
@@ -1080,8 +1100,12 @@ fn sum_sq_f64_narrows_to_the_sequential_sum() {
 #[test]
 fn dot_f32_is_the_reference_lane_order() {
     let k = 2048;
-    let w: Vec<f32> = (0..k).map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.0013).collect();
-    let x: Vec<f32> = (0..k).map(|i| ((i * 91 % 1777) as f32 - 888.0) * 0.0071).collect();
+    let w: Vec<f32> = (0..k)
+        .map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.0013)
+        .collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i * 91 % 1777) as f32 - 888.0) * 0.0071)
+        .collect();
     let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
     let Some(got) = qdot::dot_f32(&bytes, &x) else {
         return; // no AVX2+FMA: the caller's scalar loop owns the value

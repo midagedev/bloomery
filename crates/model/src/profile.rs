@@ -357,7 +357,12 @@ pub fn report(wall_ns: u64, label: &str) -> String {
                 ms(a.ns_slowest)
             ));
         } else {
-            out.push_str(&format!("{} {} {}\n", base, ms(a.ns_span), ms(a.ns_slowest)));
+            out.push_str(&format!(
+                "{} {} {}\n",
+                base,
+                ms(a.ns_span),
+                ms(a.ns_slowest)
+            ));
         }
     }
     let instrumented: u64 = map.values().map(|a| a.ns_total).sum();
