@@ -194,28 +194,28 @@ pub fn block_attn_cached(
         profile::record_time("attn_kvr", t_kvr.elapsed().as_nanos() as u64);
     }
 
-    // 6. q_nope2 = wk_b(Q8_0)ᵀ q_nope per head — the weight absorption. The requant
-    //    lives in `Derived`; `block` (the model's) selects the derived weights —
-    //    never `cache_block`, which is 0 on the scratch path.
+    // 6-8. The per-head chain — q_nope2 absorption, attention over the latent,
+    //      wv_b — as ONE pool dispatch over the (token, head) rows; three
+    //      separate dispatches paid two caller-alone barriers per block for
+    //      stages that are independent per row. `block` (the model's) selects
+    //      the derived weights — never `cache_block`, which is 0 on the
+    //      scratch path.
     let t_p3 = if lvl > 0 { Some(Instant::now()) } else { None };
     let v_up_views = &ap.v_up_views;
     if let Some(t_p3) = t_p3 {
         params_ns += t_p3.elapsed().as_nanos() as u64;
     }
-    let q_nope2 = q_nope2_absorbed(derived.wk_b_all_heads(block)?, &q, p)?;
-
-    // 7. Attention over the latent.
-    let kqv_compressed = flash_attn_latent(
+    let (q_nope2, kqv_compressed, kqv_2d) = attn_heads_fused(
+        gguf,
+        derived.wk_b_all_heads(block)?,
+        &q,
         &q_rope,
-        &q_nope2,
         cache.keys(cache_block),
         cache.slots(),
         slots,
+        v_up_views,
         p,
-    );
-
-    // 8. wv_b (still Q3_K) per head, then the output projection.
-    let kqv_2d = wv_b_heads_with(gguf, v_up_views, &kqv_compressed, p)?;
+    )?;
     let t_p4 = if lvl > 0 { Some(Instant::now()) } else { None };
     let wo = &ap.wo;
     if let Some(t_p4) = t_p4 {
@@ -1380,4 +1380,198 @@ pub fn wv_b_heads_with(
         profile::record_time("wv_b_heads", self_ns);
     }
     Ok(kqv_2d)
+}
+
+// ------------------------------------------------------------ fused step
+
+/// The step path: the whole per-head attention chain — `q_nope2` absorption,
+/// flash over the latent, `wv_b` — as ONE pool dispatch over the (token,
+/// head) rows. Between dispatches the calling thread works alone while every
+/// worker idles, and the three stages are independent per row, so the two
+/// barriers the chain paid bought nothing. The three stage functions above
+/// stay `pub`: they are the oracle this path is gated against, bit for bit.
+///
+/// Bit identity with the chain `q_nope2_absorbed` → `flash_attn_latent` →
+/// `wv_b_heads_with` (`hw_attn_heads_fused_bit_identical`): every
+/// `quantize_act`, `q_nope2_cells`, flash-row and `quantize_col`/`dot_row`
+/// call receives exactly the bytes it receives in the chain — `wv_b`'s
+/// gathered input is a copy of the `kqv_compressed` column, and a copy
+/// quantizes to the same bytes — so only WHICH thread makes each call
+/// changes. The two index conventions are the chain's own: `q_nope2` columns
+/// are head-major (`h·ne1 + t`), `kqv_compressed` rows and `kqv_2d` head
+/// spans are token-major (`t·n_head + h`).
+#[allow(clippy::too_many_arguments)]
+pub fn attn_heads_fused(
+    gguf: &Gguf,
+    wblocks: &[Q8Block],
+    q: &Tensor2,
+    q_rope: &Tensor2,
+    keys16: &[Vec<u16>],
+    key_slots: &[Slot],
+    q_slots: &[Slot],
+    views: &[TensorInfo],
+    p: &MlaParams,
+) -> Result<(Tensor2, Tensor2, Tensor2), ModelError> {
+    // Profiler hook: level-1 timer over the whole call, typeless
+    // (`record_time`) — the call walks three differently-shaped weight reads
+    // (derived Q8_0 blocks, F16 KV rows, Q3_K v_up views), and no single
+    // rows/k/weight-bytes triple would be honest for all three. The wall is
+    // the statement, the same convention `wv_b_heads`' self time used.
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
+    let nblocks = p.nope / 32;
+    let span = p.latent * nblocks;
+    // A wrong-length slice would read another head's weights silently.
+    if wblocks.len() != p.n_head * span {
+        return Err(ModelError::Shape {
+            what: "attn_heads wblocks (n_head·latent·nope/32)",
+            want_ne0: p.n_head * span,
+            want_ne1: 0,
+            got_ne0: wblocks.len(),
+            got_ne1: 0,
+        });
+    }
+    let ne1 = q_slots.len();
+    assert_eq!(q.ne1, ne1, "one q column per query slot");
+    assert_eq!(
+        keys16.len(),
+        key_slots.len(),
+        "every cached key row needs its slot"
+    );
+    let d_head = p.rope_dims + p.latent;
+    assert!(
+        keys16.iter().all(|k| k.len() == d_head),
+        "attn_heads_fused: KV rows must be rope+latent = {d_head} wide"
+    );
+    assert_eq!(
+        views.len(),
+        p.n_head,
+        "attn_heads_fused: one v_up view per head"
+    );
+
+    let mut q_nope2 = Tensor2::scratch(p.latent, p.n_head * ne1);
+    let mut kqv_compressed = Tensor2::scratch(p.latent, ne1 * p.n_head);
+    let mut kqv_2d = Tensor2::scratch(p.n_head * p.v_head, ne1);
+    // The row twin is decided once per call, exactly as `flash_attn_latent` does.
+    let simd = flash_simd(p);
+
+    // The (token, head) rows are fully independent: row (t, h) writes only
+    // its own cells in all three outputs — `q_nope2` column `h·ne1 + t`,
+    // `kqv_compressed` row `t·n_head + h`, `kqv_2d` column `t`'s span
+    // `h·v_head..(h+1)·v_head` — and reads, inside the same iteration, only
+    // cells that same row wrote (flash reads the `q_nope2` column stage (a)
+    // produced, the `wv_b` matvec the `kqv_compressed` row flash produced) —
+    // same thread, so the read is sequenced after the write.
+    //
+    // SAFETY (construction site): the pool chunks partition the row space,
+    // each participant writes only its own rows' cells through these three
+    // pointers (no aliasing between participants), and the join publishes
+    // every write before any tensor is read. The stage-(b)/(c) reads go
+    // through shared references into cells no other participant touches.
+    let qn2_ptr = crate::ops::SharedOut(q_nope2.data.as_mut_ptr());
+    let kc_ptr = crate::ops::SharedOut(kqv_compressed.data.as_mut_ptr());
+    let kv2_ptr = crate::ops::SharedOut(kqv_2d.data.as_mut_ptr());
+    // The matvec wants a real `&mut` span, so this one's base is dereferenced
+    // in the closure (`kv2.0.add(..)`) — through this `&SharedOut` local, so
+    // the closure captures the wrapper (Sync) and not the raw-pointer field
+    // (not Sync); the method calls below get that for free from `&self`.
+    let kv2 = &kv2_ptr;
+    // The matvec is the one fallible stage; lowest-row-first precedence, the
+    // `run_row_pool` error-channel pattern.
+    let gate = crate::ops::ErrGate::new();
+    let latent = p.latent;
+    let v_head = p.v_head;
+    let kv2_ne0 = kqv_2d.ne0;
+    threads::pool().for_each_chunk(ne1 * p.n_head, |rows| {
+        // Per-worker scratch, recycled across dispatches: the four
+        // thread-locals the three stages use separately, taken once per
+        // chunk and returned even when a row error breaks the loop early.
+        // Every element is rewritten before it is read.
+        let mut qcol = QALL.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let mut cellbuf = CELL_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let mut qrow_buf = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if qcol.len() < nblocks {
+            qcol.resize(
+                nblocks,
+                ActBlock {
+                    d: 0.0,
+                    q: [0i8; 32],
+                },
+            );
+        }
+        if cellbuf.len() < latent {
+            cellbuf.resize(latent, 0.0);
+        }
+        if qrow_buf.len() < d_head {
+            qrow_buf.resize(d_head, 0.0);
+        }
+        if r_buf.len() < latent {
+            r_buf.resize(latent, 0.0);
+        }
+        let qrow = &mut qrow_buf[..d_head];
+        let r = &mut r_buf[..latent];
+        let seg = &mut cellbuf[..latent];
+        let mut w = [0.0f32; 32];
+        for row in rows {
+            let t = row / p.n_head;
+            let h = row % p.n_head;
+            // (a) `q_nope2` column `h·ne1 + t`: the same `quantize_act`
+            // blocks the chain quantizes on the caller, quantized by this
+            // row's worker; `q_nope2_cells` computes each cell from its own
+            // weight blocks and the column's blocks, so the whole-column
+            // call and the chain's segmented pool call agree bit for bit.
+            let qbase = t * q.ne0 + h * p.kq_head;
+            let qnope = &q.data[qbase..qbase + p.nope];
+            for (b, chk) in qnope.as_chunks::<32>().0.iter().enumerate() {
+                qcol[b] = quantize_act(chk);
+            }
+            let whead = &wblocks[h * span..(h + 1) * span];
+            qdot::q_nope2_cells(whead, &qcol[..nblocks], 0, latent, seg);
+            for (j, &v) in seg.iter().enumerate() {
+                // SAFETY: cell `(h·ne1 + t)·latent + j` is this row's own — see the construction site.
+                unsafe { qn2_ptr.write((h * ne1 + t) * latent + j, v) };
+            }
+            // (b) the flash row, unchanged: it reads the column (a) just
+            // wrote on this thread and writes `kqv_compressed` row `row`.
+            if simd {
+                // SAFETY: `flash_simd` checked ISA and panel shapes; the row-width assert above and the scratch sizing complete the contract.
+                unsafe {
+                    flash_row_avx2(
+                        q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r, &mut w,
+                        &kc_ptr,
+                    )
+                };
+            } else {
+                flash_row_scalar(
+                    q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r, &mut w,
+                    &kc_ptr,
+                );
+            }
+            // (c) head h's `wv_b` leg: the same one-column `matmul_q` bytes
+            // the chain's batch computes — its gathered input is a copy of
+            // this exact column, and a copy quantizes to the same bytes.
+            // SAFETY: `t·kv2_ne0 + h·v_head .. +v_head` is this row's own span of `kqv_2d` column `t` — see the construction site.
+            let out_col = unsafe {
+                std::slice::from_raw_parts_mut(kv2.0.add(t * kv2_ne0 + h * v_head), v_head)
+            };
+            if let Err(e) =
+                crate::ops::matvec_q_local(gguf, &views[h], kqv_compressed.col(row), out_col)
+            {
+                gate.offer(row, e);
+                break;
+            }
+        }
+        QALL.with(|c| *c.borrow_mut() = qcol);
+        CELL_BUF.with(|c| *c.borrow_mut() = cellbuf);
+        FLASH_QROW.with(|c| *c.borrow_mut() = qrow_buf);
+        FLASH_R.with(|c| *c.borrow_mut() = r_buf);
+    });
+    if let Some(e) = gate.take() {
+        return Err(e);
+    }
+    if let Some(t_call) = t_call {
+        profile::record_time("attn_heads", t_call.elapsed().as_nanos() as u64);
+    }
+    Ok((q_nope2, kqv_compressed, kqv_2d))
 }

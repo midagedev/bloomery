@@ -363,6 +363,96 @@ fn hw_attn_exact_input_stages() {
     }
 }
 
+/// The fused (token, head) attention dispatch must produce the three tensors
+/// of the three-call chain BIT-identically — `to_bits` on every element, no
+/// tolerance: the fuse moves calls between threads, it must not move a bit.
+/// The oracle's own `q`/`q_rope`/`kvr` feed both sides, so any difference is
+/// the fused wiring's, not upstream slack. `n_tokens` 1 is the decode shape,
+/// 6 the prefill shape (a chunk straddling more than one (t, h) row).
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_attn_heads_fused_bit_identical() {
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let blk = 0usize;
+    let p = model::attn::MlaParams::read(&g, blk).unwrap();
+    let derived = model::derived::Derived::new(&g).unwrap();
+    let views = &derived.attn_plan(blk).unwrap().v_up_views;
+    let wblocks = derived.wk_b_all_heads(blk).unwrap();
+
+    let load2 = |name: &str, occ: u32| -> Tensor2 {
+        let (v, inf) = o.load(name, occ);
+        Tensor2::from_vec(
+            inf.ne[0] as usize,
+            (inf.ne[1] * inf.ne[2] * inf.ne[3]) as usize,
+            v,
+        )
+    };
+    let q_full = load2(&format!("q-{blk}"), 0);
+    let q_rope_full = load2(&format!("q_rope-{blk}"), 1);
+    let kvr_full = load2(&format!("kvr-{blk}"), 0);
+
+    for n_tok in [1usize, 6] {
+        // The batch's own tokens are the KV entries, the scratch-cache shape.
+        let slots: Vec<Slot> = (0..n_tok as u32).map(|t| Slot { seq: 0, pos: t }).collect();
+        let cache16: Vec<Vec<u16>> = (0..n_tok)
+            .map(|t| {
+                kvr_full
+                    .col(t)
+                    .iter()
+                    .map(|&v| model::attn::f32_to_f16_bits(v))
+                    .collect()
+            })
+            .collect();
+        let first_cols = |src: &Tensor2, n: usize| {
+            Tensor2::from_vec(src.ne0, n, src.data[..src.ne0 * n].to_vec())
+        };
+        let q = first_cols(&q_full, n_tok);
+        let q_rope = first_cols(&q_rope_full, p.n_head * n_tok);
+
+        // The chain the fused dispatch replaces, stage by stage.
+        let q_nope2 = model::attn::q_nope2_absorbed(wblocks, &q, &p).unwrap();
+        let kqv_compressed =
+            model::attn::flash_attn_latent(&q_rope, &q_nope2, &cache16, &slots, &slots, &p);
+        let kqv_2d = model::attn::wv_b_heads_with(&g, views, &kqv_compressed, &p).unwrap();
+
+        // The fused dispatch, same inputs.
+        let (fq, fc, f2) = model::attn::attn_heads_fused(
+            &g, wblocks, &q, &q_rope, &cache16, &slots, &slots, views, &p,
+        )
+        .unwrap();
+
+        let cmp = |name: &str, chain: &Tensor2, fused: &Tensor2| {
+            assert_eq!(
+                (fused.ne0, fused.ne1),
+                (chain.ne0, chain.ne1),
+                "{name} shape, n_tok {n_tok}"
+            );
+            let at = chain
+                .data
+                .iter()
+                .zip(&fused.data)
+                .position(|(x, y)| x.to_bits() != y.to_bits());
+            assert!(
+                at.is_none(),
+                "{name} (n_tok {n_tok}): fused differs from the chain at element \
+                 {at:?} of {} — the fuse moved a bit",
+                chain.data.len()
+            );
+        };
+        cmp("q_nope2", &q_nope2, &fq);
+        cmp("kqv_compressed", &kqv_compressed, &fc);
+        cmp("kqv_2d", &kqv_2d, &f2);
+        eprintln!(
+            "attn_heads_fused, n_tok {n_tok}:        q_nope2, kqv_compressed, kqv_2d \
+             bit-identical to the chain ({} + {} + {} values)",
+            fq.data.len(),
+            fc.data.len(),
+            f2.data.len()
+        );
+    }
+}
+
 /// Deterministic uniform noise for the synthetic band test — no model file,
 /// no oracle, only the box's ISA.
 struct Lcg(u64);

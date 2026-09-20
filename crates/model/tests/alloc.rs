@@ -73,7 +73,10 @@ static ALLOC: Counting = Counting;
 /// PIN(2026-09-21): 1291 -> 765 / 0.18 MB on the group dispatch round — the batch
 /// bookkeeping (`ws`/`xs`/`outs`/`pairs`) moved to fixed-capacity stack arrays. A
 /// step that grows the KV blocks adds 28.
-const LIMIT: u64 = 850;
+/// PIN(2026-09-21): 765 -> 630 / 0.13 MB on the fused attention round — the
+/// per-head `wv_b` gather (sixteen activation blocks and its batch bookkeeping)
+/// left the step; worst warm step 658. A step that grows the KV blocks adds 28.
+const LIMIT: u64 = 700;
 
 #[test]
 #[ignore = "hw: needs the box and the model file"]

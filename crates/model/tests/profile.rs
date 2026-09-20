@@ -199,10 +199,17 @@ fn hw_profile_gate() {
     // plan: a decode step no longer reads an f32 tensor from the file, so the
     // only way the site could fire is dead work the step was told to stop
     // doing. It still records at load (`Derived::new` decodes the gains).
+    // PIN(2026-09-21): `q_nope2_absorbed`, `flash_attn_latent` and `wv_b_heads`
+    // left the list — their only step callers were steps 6-8 of
+    // `block_attn_cached`, which the fused attention dispatch replaced with
+    // one `attn_heads` site (the three `pub` stage functions stay, gated
+    // against the fused path by `tests/attn.rs`). `matmul_q_batch` was never
+    // listed: its one step caller sat inside `wv_b_heads_with`, and
+    // `tests/ops.rs` still calls it directly.
     for site in [
         "matmul_q",
         "matmul_q_group",
-        "q_nope2_absorbed",
+        "attn_heads",
         "embed",
         "rms_norm",
         "residual_add",
@@ -213,8 +220,6 @@ fn hw_profile_gate() {
         "attn_latent",
         "attn_rope",
         "attn_kvr",
-        "flash_attn_latent",
-        "wv_b_heads",
         "moe_setup",
         "moe_route",
         "swiglu",
@@ -229,7 +234,7 @@ fn hw_profile_gate() {
             .sum();
         assert!(calls > 0, "site {site} recorded nothing — its hook is dead");
     }
-    eprintln!("sites                                all 21 hooked sites live");
+    eprintln!("sites                                all 19 hooked sites live");
 
     // The table itself, printed whatever the verdict — a coverage number without the
     // rows behind it cannot be acted on.

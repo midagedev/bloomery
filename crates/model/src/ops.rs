@@ -894,13 +894,13 @@ const STEAL_BLOCKS: usize = 4;
 /// allocation — a clean chunk touches nothing, and the mutex only locks when
 /// an error exists. The winning error is the lowest failing row's, exactly
 /// what the sorted scan decided on the profiled path.
-struct ErrGate {
+pub(crate) struct ErrGate {
     any: std::sync::atomic::AtomicBool,
     slot: std::sync::Mutex<Option<(usize, crate::ModelError)>>,
 }
 
 impl ErrGate {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ErrGate {
             any: std::sync::atomic::AtomicBool::new(false),
             slot: std::sync::Mutex::new(None),
@@ -910,7 +910,7 @@ impl ErrGate {
     /// Offer the error of the chunk that starts at `start`; a lower start
     /// replaces a higher one. Compared under the lock, so the payload and the
     /// minimum cannot come from different chunks.
-    fn offer(&self, start: usize, e: crate::ModelError) {
+    pub(crate) fn offer(&self, start: usize, e: crate::ModelError) {
         let mut slot = self.slot.lock().expect("row error slot");
         if slot.as_ref().is_none_or(|(s, _)| start < *s) {
             *slot = Some((start, e));
@@ -918,11 +918,15 @@ impl ErrGate {
         self.any.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn take(&self) -> Option<crate::ModelError> {
+    pub(crate) fn take(&self) -> Option<crate::ModelError> {
         if !self.any.load(std::sync::atomic::Ordering::Acquire) {
             return None;
         }
-        self.slot.lock().expect("row error slot").take().map(|(_, e)| e)
+        self.slot
+            .lock()
+            .expect("row error slot")
+            .take()
+            .map(|(_, e)| e)
     }
 }
 
@@ -1187,6 +1191,97 @@ fn matmul_q_one(
         );
     }
     Ok(out)
+}
+
+/// `matmul_q_one` for a one-column input, on the calling thread, no pool
+/// dispatch: the fused attention round calls it from inside one pool row,
+/// where a nested dispatch would idle every worker for a barrier per head.
+/// This is the `ne1 = 1` shape of `PairWork::compute_rows` — same `fused`
+/// decision, same `quantize_col`/`quantize_activations` encoder into the
+/// same recycled poisoned buffers, same per-row op order — so the values are
+/// those of a one-column `matmul_q` and only WHICH thread computes them
+/// changes (`tests/attn.rs` pins the bit identity end to end).
+pub(crate) fn matvec_q_local(
+    gguf: &Gguf,
+    w: &TensorInfo,
+    x_col: &[f32],
+    out: &mut [f32],
+) -> Result<(), crate::ModelError> {
+    let k = w.dims.first().copied().unwrap_or(0) as usize;
+    let n = if w.dims.len() > 1 {
+        w.dims[1] as usize
+    } else {
+        1
+    };
+    let ty = w.ty;
+    if x_col.len() != k {
+        return Err(crate::ModelError::Shape {
+            what: "matmul_q input",
+            want_ne0: k,
+            want_ne1: 1,
+            got_ne0: x_col.len(),
+            got_ne1: 1,
+        });
+    }
+    if out.len() != n {
+        return Err(crate::ModelError::Shape {
+            what: "matvec_q out",
+            want_ne0: n,
+            want_ne1: 1,
+            got_ne0: out.len(),
+            got_ne1: 1,
+        });
+    }
+    let bytes = gguf.data(w)?;
+    let row_bytes = bytes.len() / n;
+    let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
+    if fused {
+        // The QuantCols::new contract: recycled byte buffer, poisoned under
+        // BLOOMERY_POISON, one `quantize_col` writing the whole column.
+        let mut buf = take_u8(qdot::col_bytes(ty, k));
+        if poison() {
+            buf.fill(0xA5);
+        }
+        qdot::quantize_col(ty, x_col, &mut buf);
+        for r in 0..n {
+            let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+            out[r] = qdot::dot_row(ty, src, &buf, k)?;
+        }
+        give_u8(buf);
+    } else {
+        let mut qbuf = take_f32(k);
+        if poison() {
+            qbuf.fill(f32::NAN);
+        }
+        quantize_activations(ty, x_col, &mut qbuf);
+        ROW_BUF.with(|cell| -> Result<(), crate::ModelError> {
+            let mut scratch = cell.borrow_mut();
+            if scratch.len() < k {
+                scratch.resize(k, 0.0);
+            }
+            let row = &mut scratch[..k];
+            for r in 0..n {
+                let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+                // Weight side: dequant_row, or the byte walk in its place for F32 rows.
+                if ty == GgmlType::F32 {
+                    for (i, v) in row.iter_mut().enumerate() {
+                        *v = f32::from_le_bytes(src[i * 4..i * 4 + 4].try_into().unwrap());
+                    }
+                } else {
+                    dequant_row(ty, src, row)?;
+                }
+                let xc = &qbuf[..k];
+                let mut a = 0.0f32;
+                for i in 0..k {
+                    a += row[i] * xc[i];
+                }
+                out[r] = a;
+            }
+            Ok(())
+        })?;
+        give_f32(qbuf);
+    }
+    Ok(())
 }
 
 /// Quantization slots the most recent `matmul_q_multi` call built — the
