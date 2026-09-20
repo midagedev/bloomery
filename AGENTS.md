@@ -112,6 +112,10 @@ first suspect is a hung gate on the box, not the agent.
 
 - Correctness is defined against ggml, not against intuition: kernels must match
   its output within the relative-error band recorded in each crate's RESULTS file.
+- **GPU-stage toolchain defects and gaps (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go
+  into `docs/upstream/nvlabs-ledger.md` the moment they are met** — one line, before any
+  workaround is written; a workaround erases the evidence. The user wants these as upstream
+  issues/PRs; the ledger is where the lead triages them.
 - Prose in this repository is Korean; code comments and anything headed upstream
   are English. This file is English because other tools and outside readers read it.
 - **Comments state what is true now, not how we got here.** Keep: `// SAFETY:`
