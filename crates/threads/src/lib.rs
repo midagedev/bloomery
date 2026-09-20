@@ -98,10 +98,24 @@ pub struct Pool {
     /// move; the dispatcher bumps `seq` (release) only after the job slot and
     /// `remaining` are in place, so the bump publishes them.
     seq: AtomicUsize,
-    /// Workers that have not yet finished the current job. The last one to
-    /// decrement wakes the dispatcher.
-    remaining: AtomicUsize,
+    /// Per-worker completion marks: worker `t` stores the `seq` of the job it
+    /// just finished. `remaining` in this file's comments is the number of
+    /// marks that differ from the current `seq`; the job is over when it is
+    /// zero. One padded line per worker, not one shared counter: thirty-one
+    /// decrements of a single line serialize through its ownership transfers,
+    /// and that chain was most of an empty dispatch.
+    done: Box<[DoneMark]>,
     lock: Mutex<()>,
+    /// Workers currently inside the park path (from before their final `seq`
+    /// recheck until they wake). The dispatcher notifies only when this is
+    /// nonzero: a `notify_all` is a futex syscall even with nobody waiting, and
+    /// at hundreds of dispatches per step that is the dispatch path's one
+    /// syscall. Correctness is the store-load handshake — the worker raises
+    /// `parked` THEN rechecks `seq`, the dispatcher bumps `seq` THEN reads
+    /// `parked`, all SeqCst, so at least one side sees the other.
+    parked: AtomicUsize,
+    /// The dispatcher's twin of `parked`, for the last worker's `cv_done` wake.
+    dispatcher_parked: AtomicBool,
     /// Workers park here waiting for `seq` to move.
     cv_work: Condvar,
     /// The dispatcher parks here waiting for `remaining` to hit zero.
@@ -230,7 +244,6 @@ impl Pool {
             return;
         }
         let _dispatch = self.dispatch.lock().unwrap_or_else(|e| e.into_inner());
-        let nworkers = self.nthreads - 1;
 
         // SAFETY: we hold the dispatch lock and the previous job (if any)
         // completed — its `remaining` reached zero before that call returned,
@@ -251,14 +264,13 @@ impl Pool {
                 n,
             };
         }
-        self.remaining.store(nworkers, Ordering::Release);
         self.dispatches.fetch_add(1, Ordering::Relaxed);
-        {
-            // Bumping `seq` under the lock guarantees no worker can be about
-            // to park past the bump (a parked worker rechecks under this same
-            // lock), so the notify cannot be missed.
+        let cur = self.seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        if self.parked.load(Ordering::SeqCst) != 0 {
+            // A worker that raised `parked` holds `lock` until it is inside
+            // `wait`, so taking the lock here means the notify cannot land
+            // between its recheck and its wait.
             let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-            self.seq.fetch_add(1, Ordering::Release);
             self.cv_work.notify_all();
         }
 
@@ -271,7 +283,7 @@ impl Pool {
         // mid-chunk), then park on cv_done.
         let mut spins = self.spin;
         loop {
-            if self.remaining.load(Ordering::Acquire) == 0 {
+            if self.all_done(cur) {
                 break;
             }
             if spins > 0 {
@@ -280,10 +292,12 @@ impl Pool {
                 continue;
             }
             let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-            if self.remaining.load(Ordering::Acquire) != 0 {
+            self.dispatcher_parked.store(true, Ordering::SeqCst);
+            if !self.all_done(cur) {
                 self.dispatcher_parks.fetch_add(1, Ordering::Relaxed);
                 drop(self.cv_done.wait(guard).unwrap_or_else(|e| e.into_inner()));
             }
+            self.dispatcher_parked.store(false, Ordering::SeqCst);
         }
 
         if let Err(p) = own {
@@ -337,7 +351,9 @@ impl Pool {
                 n: 0,
             }),
             seq: AtomicUsize::new(0),
-            remaining: AtomicUsize::new(0),
+            done: (0..nthreads.saturating_sub(1)).map(|_| DoneMark(AtomicUsize::new(0))).collect(),
+            parked: AtomicUsize::new(0),
+            dispatcher_parked: AtomicBool::new(false),
             lock: Mutex::new(()),
             cv_work: Condvar::new(),
             cv_done: Condvar::new(),
@@ -375,6 +391,11 @@ impl Pool {
         g[(t / nccd).min(g.len() - 1)]
     }
 
+    /// Every worker's mark equals `cur`: `remaining == 0`.
+    fn all_done(&self, cur: usize) -> bool {
+        self.done.iter().all(|d| d.0.load(Ordering::SeqCst) == cur)
+    }
+
     fn worker_main(&'static self, t: usize) {
         if !pin(self.cpu_for(t)) {
             // Not fatal: containers cannot pin. Recorded, pool continues.
@@ -400,10 +421,12 @@ impl Pool {
                     continue;
                 }
                 let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-                if self.seq.load(Ordering::Acquire) == seen {
+                self.parked.fetch_add(1, Ordering::SeqCst);
+                if self.seq.load(Ordering::SeqCst) == seen {
                     self.worker_parks.fetch_add(1, Ordering::Relaxed);
                     drop(self.cv_work.wait(guard).unwrap_or_else(|e| e.into_inner()));
                 }
+                self.parked.fetch_sub(1, Ordering::SeqCst);
             }
 
             // SAFETY: `seen` just moved, which happens-after the dispatcher's
@@ -433,14 +456,21 @@ impl Pool {
                     *cell = Some(p);
                 }
             }
-            if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                // Last to arrive: wake the (possibly parked) dispatcher.
+            self.done[t].0.store(seen, Ordering::SeqCst);
+            if self.dispatcher_parked.load(Ordering::SeqCst) {
+                // The dispatcher is in its park path: it holds `lock` until it
+                // is inside `wait`, so this cannot land between its recheck
+                // and its wait. Any worker may wake it; it rechecks every mark.
                 let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
                 self.cv_done.notify_all();
             }
         }
     }
 }
+
+/// One worker's completion mark on its own cache line.
+#[repr(align(64))]
+struct DoneMark(AtomicUsize);
 
 /// The partition `for_each_chunk` uses, exposed so it can be tested without
 /// threads. Deterministic: the same `(n, threads)` always yields the same
