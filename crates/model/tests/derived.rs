@@ -17,7 +17,9 @@
 //!      anyway pins the production path end to end.
 //!   3. **End to end.** `forward` (which builds its own `Derived` inside) and
 //!      `step` (explicit `Derived`) land on identical logits — the wiring
-//!      claim that block `b`'s absorption gets block `b`'s blocks.
+//!      claim that block `b`'s absorption gets block `b`'s blocks. That is the
+//!      same computation as the cache shim's identity claim, so one test owns
+//!      both: `tests/kv.rs::hw_kv_one_shot_equals_uncached`.
 //!
 //! `hw_` prefix: needs the box and the model file. Like `tests/kv.rs`, this
 //! compares our paths against each other — `tests/attn.rs` and
@@ -28,7 +30,6 @@ mod oracle;
 use model::Tensor2;
 use model::attn::{MlaParams, Q8Block, q_nope2_absorbed, quantize_q8_0};
 use model::derived::Derived;
-use model::forward::{forward, new_cache, step};
 
 /// The pre-`Derived` build, verbatim: the two loops `q_nope2_absorbed` used to
 /// run per call — dequantize the head's k-up rows of `attn_kv_b`, requant
@@ -169,38 +170,4 @@ fn hw_derived_all_blocks_all_heads_filled() {
         total,
         d.size_bytes() as f64 / 1e6
     );
-}
-
-/// Layer 3: the logits of the wrapper (`forward`, own `Derived`) and the
-/// explicit path (`step`, handed the same `Derived`) agree bit for bit.
-#[test]
-#[ignore = "hw: needs the box and the model file"]
-fn hw_derived_step_equals_forward_bit_exact() {
-    let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
-
-    let wrapper = forward(&g, &tokens).unwrap();
-    let derived = Derived::new(&g).unwrap();
-    let mut cache = new_cache(&g).unwrap();
-    let explicit = step(&g, &tokens, &mut cache, &derived).unwrap();
-
-    assert_eq!(
-        explicit.data.len(),
-        wrapper.data.len(),
-        "logit count {} vs {}",
-        explicit.data.len(),
-        wrapper.data.len()
-    );
-    let worst = explicit
-        .data
-        .iter()
-        .zip(&wrapper.data)
-        .map(|(&a, &b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert_eq!(
-        worst, 0.0,
-        "step(explicit Derived) vs forward(wrapper Derived): max|diff| {worst:e}"
-    );
-    eprintln!("step vs forward   max|diff| = 0   exact");
 }

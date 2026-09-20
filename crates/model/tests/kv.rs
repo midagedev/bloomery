@@ -36,7 +36,10 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
 /// One `step` on an empty cache must equal the uncached forward exactly. This is the
 /// shim's own claim: `block_attn_trace` now runs the cached code against a cache holding
 /// only its batch, so any difference here means the shim is not the identity it says
-/// it is.
+/// it is. The same run is `Derived`'s end-to-end claim (`tests/derived.rs`, layer 3):
+/// `forward` builds its own `Derived`, `step` is handed one, and block `b`'s absorption
+/// must get block `b`'s blocks either way. Bits, not differences: `NaN - NaN` folds to
+/// a clean zero through `f32::max`.
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_one_shot_equals_uncached() {
@@ -50,12 +53,19 @@ fn hw_kv_one_shot_equals_uncached() {
     let cached = step(&g, &tokens, &mut cache, &derived).unwrap();
 
     assert_eq!(cache.len(), tokens.len(), "the cache holds the whole batch");
+    assert_eq!(cached.data.len(), plain.data.len(), "logit count");
+    let differing = cached
+        .data
+        .iter()
+        .zip(&plain.data)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
     let worst = max_abs_diff(&cached.data, &plain.data);
     assert_eq!(
-        worst, 0.0,
-        "one-shot cached vs uncached: max|diff| {worst:e}"
+        differing, 0,
+        "one-shot cached vs uncached: {differing} logits differ in bits, max|diff| {worst:e}"
     );
-    eprintln!("one-shot cached == uncached          max|diff| = 0   exact");
+    eprintln!("one-shot cached == uncached          bit-identical");
 }
 
 /// Prefill n-1, then one decode step: the logits must equal the n-token one-shot pass
