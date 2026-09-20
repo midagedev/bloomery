@@ -221,13 +221,22 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
     //     remaining scalar sites (Q5_1/Q6_K) and `q_nope2`'s activation-code
     //     tie flips still carry ~1.4 logits of drift across.
     //
-    // Where the remaining drift is from is unchanged in kind: `q_nope2`'s
-    // activation-code tie flips (`attn.rs`'s `quantize_act`) and the
-    // not-yet-fused Q5_1/Q6_K sites. worst |dlogit| over ik's top-5
-    // measured 1.3984 this round (1.298 at MUL-27) — near-tie ordering and
-    // raw drift are different quantities, and the logits band gate
-    // (forward.rs, 5e-2) holds the raw side (result_output rel 2.35e-2 this
-    // run).
+    // 2026-09-20, Q5_1 x q8_2_x4 fused wiring (MUL-34): the set did NOT
+    // move — {14} again, same prompt, same 1st/2nd swap (ik margin 0.108,
+    // ik [245, 9226, ...], ours [9226, 245, ...]), 32/33. What moved is the
+    // drift itself: worst |dlogit| over ik's top-5 fell 1.3984 -> 0.9458
+    // with the model's last scalar quant site (blk.0.ffn_down, held
+    // bit-identical to the qdot composition by the ops dispatch proof and
+    // within 1 ULP of ik's kernel by qdot gate B) on ik's arithmetic. No
+    // A/B was needed to attribute anything: nothing flipped, so the pin's
+    // "say what moved it" has nothing to say.
+    //
+    // Where the remaining drift is from: with Q5_1 fused every quant site
+    // runs ik's own kernel arithmetic, so what is left is `q_nope2`'s
+    // activation-code tie flips (`attn.rs`'s `quantize_act`) — near-tie
+    // ordering and raw drift are different quantities, and the logits band
+    // gate (forward.rs, 5e-2) holds the raw side (result_output rel 2.64e-2
+    // this run).
     //
     // The set is pinned rather than counted. Any prompt flipping fails; one
     // starting to match also fails, because that means something moved and

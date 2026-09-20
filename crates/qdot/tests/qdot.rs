@@ -442,12 +442,12 @@ fn rejects_unaligned_k() {
         }
     }
     // A type outside this build's table refuses before reading any bytes.
-    // Q4_K joined the table in MUL-27, so the rejection witness is Q5_0 now.
-    // Q5_0 joined the table in MUL-32, so the rejection witness is Q5_1
-    // now (it was Q5_0 before, Q4_K before that).
+    // Q4_K joined the table in MUL-27, Q5_0 in MUL-32, Q5_1 in MUL-34 —
+    // with Q5_1 the model's every quant type is fused, so the rejection
+    // witness is Q5_K now: a real ggml type this model does not carry.
     assert!(matches!(
-        dot_row(GgmlType::Q5_1, &wrow, &acol, 2048),
-        Err(QdotError::UnsupportedType(GgmlType::Q5_1))
+        dot_row(GgmlType::Q5_K, &wrow, &acol, 2048),
+        Err(QdotError::UnsupportedType(GgmlType::Q5_K))
     ));
     // Short buffers are errors, not reads past the slice.
     assert!(matches!(
@@ -508,10 +508,30 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::Q5_0, &wrow5[..21], &acol5, 1408),
         Err(QdotError::ShortWeightRow { .. })
     ));
+    // Q5_1 carries the SAME legacy contract (MUL-34), with its own 24-byte
+    // block: the model's site k = 10944 is 85 whole groups + TWO tail
+    // blocks — the first Q5-family shape whose tail is real.
+    assert_eq!(col_bytes(GgmlType::Q5_1, 10944), 144 * 85 + 2 * 36);
+    assert_eq!(col_bytes(GgmlType::Q5_1, 160), 144 + 36);
+    let wrow51 = vec![0u8; 24 * 342];
+    let acol51 = vec![0u8; 144 * 85 + 2 * 36];
+    assert_eq!(
+        dot_row(GgmlType::Q5_1, &wrow51, &acol51, 10944).unwrap(),
+        0.0
+    );
+    assert!(matches!(
+        dot_row(GgmlType::Q5_1, &wrow51, &acol51, 100),
+        Err(QdotError::UnalignedK { k: 100, gran: 32 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q5_1, &wrow51[..23], &acol51, 10944),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
     // supports(): the type must be in the table at all. Q4_K joined in
-    // MUL-27, Q6_K in MUL-31, Q5_0 in MUL-32; Q5_1 is the out-of-table
-    // witness now.
-    assert!(!supports(GgmlType::Q5_1));
+    // MUL-27, Q6_K in MUL-31, Q5_0 in MUL-32, Q5_1 in MUL-34 (the model's
+    // last unfused type); Q5_K is the out-of-table witness now.
+    assert!(!supports(GgmlType::Q5_K));
+    assert!(supports(GgmlType::Q5_1));
 }
 
 /// Gate 5's sibling: `col_bytes` panics (documented) on an unaligned k —
@@ -524,7 +544,7 @@ fn col_bytes_rejects_unaligned_k() {
 }
 
 /// Parse one of the ik kernel dumps (`q4k-x4-ik-dot.txt`,
-/// `q5f0-ik-dot.txt`): tensor header, one long hex line of ik's own
+/// `q5f0-ik-dot.txt`, `q5f1-ik-dot.txt`): tensor header, one long hex line of ik's own
 /// quantized activation bytes, then `row R %08x` lines of its kernel's
 /// output bits. One parser so both rounds' gates read the same bytes.
 fn parse_ik_dot_dump(dump: &str) -> (usize, Vec<u8>, Vec<u32>) {
@@ -874,6 +894,109 @@ fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
     for (r, &w) in want.iter().take(64).enumerate() {
         let got = qdot::dot_row(
             gguf::GgmlType::Q5_0,
+            &bytes[r * row_bytes..(r + 1) * row_bytes],
+            &ik_acol,
+            k,
+        )
+        .unwrap();
+        let ulp = (got.to_bits() as i64 - w as i64).abs();
+        assert!(
+            ulp <= 1,
+            "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+            f32::from_bits(w)
+        );
+    }
+    eprintln!("gate B: 64 rows within 1 ULP of ik's mul_mat_qX_1_q8_2_T (on ik's own activations)");
+}
+
+/// MUL-34's gate triple for the Q5_1 x Q8_2_X4 kernel — the pairing this
+/// round found in the same dispatch section Q5_0 came from
+/// (iqk_gemm_legacy_quants.cpp:2343-2344 -> mul_mat_qX_1_q8_2_T<
+/// Q5_1_Unpacker>, expected_type_B = Q8_2_X4 at :2329; ggml.c:777's traits
+/// agree under __AVX2__ + IQK_MULMAT). The encoder is the same
+/// `quantize_row_q8_2_x4` port again (gate 0 re-checks its bytes), the
+/// kernel differs from Q5_0's in exactly one thing — block_q5_1's SECOND
+/// stored scale m (d f16 + m f16, 24 B) replaces the -16*d min term. The
+/// site is the model's only Q5_1 tensor, blk.0.ffn_down: k = 10944 = 85
+/// whole x4 groups + TWO tail blocks, the first round whose tail path is
+/// live in both the encoder bytes and the kernel — and the model's last
+/// unfused quant type, so with this every matmul_q site is fused.
+#[test]
+#[ignore = "hw: needs the box and the model file"]
+fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let w = g
+        .iter_tensors()
+        .find(|w| w.ty == gguf::GgmlType::Q5_1 && (w.dims[0] as usize).is_multiple_of(32))
+        .expect("the model must carry the Q5_1 tensor (blk.0.ffn_down)");
+    let k = w.dims[0] as usize;
+    let n = w.dims[1] as usize;
+    assert_eq!(k, 10944, "the model's Q5_1 site is the dense ffn_down");
+
+    let bytes = g.data(w).unwrap();
+    let row_bytes = bytes.len() / n;
+    assert_eq!(row_bytes, 24 * k / 32);
+
+    // Real activations: the down projection's own input — the oracle's
+    // fused gate/up product dump (ffn_up_gate-0, [10944 x 6]).
+    let vals = oracle_f32("ffn_up_gate-0", k * 6);
+    let xs: Vec<f32> = vals[..k].to_vec();
+    let cb = qdot::col_bytes(gguf::GgmlType::Q5_1, k);
+    let mut acol = vec![0u8; cb];
+    qdot::quantize_col(gguf::GgmlType::Q5_1, &xs, &mut acol);
+
+    // The q5f1 dump: tools/ref/q5f1_ref.cpp runs ik's own kernel-table
+    // entry (mul_mat_qX_1_q8_2_T<Q5_1_Unpacker, 1>) on this tensor with
+    // ik's quantize_row_q8_2_x4 coding of the same column.
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let dump = std::fs::read_to_string(format!("{base}/ref/q5f1-ik-dot.txt"))
+        .expect("run tools/ref/q5f1_ref.cpp first (just build-ref does not build it)");
+    let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
+    assert_eq!(
+        dump_k, k,
+        "the dump and this scan must land on the same tensor"
+    );
+    assert_eq!(
+        ik_acol.len(),
+        cb,
+        "ik's q8_2_x4 column must size-match ours"
+    );
+
+    // Gate 0 — the ENCODER is bit-identical to ik's on a column WITH tail
+    // blocks: the same x86 quantize_row_q8_2_x4, re-checked on the first
+    // shape that stores blocks past the last x4 group (the 2-block tail).
+    for (i, (a, b)) in ik_acol.iter().zip(&acol).enumerate() {
+        assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
+    }
+    eprintln!(
+        "gate 0: {cb} encoder bytes bit-identical to ik's quantize_row_q8_2_x4 (incl. 2 tail blocks)"
+    );
+
+    // Gate A — bit identity kernel vs instruction-graph emulator, on our
+    // (== ik's) activation bytes. The kernel's tail path runs here for the
+    // first time on real data.
+    let rows = n.min(1024);
+    for r in 0..rows {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        let a = qdot::dot_row(gguf::GgmlType::Q5_1, src, &acol, k).unwrap();
+        let b = qdot::dot_row_scalar(gguf::GgmlType::Q5_1, src, &acol, k).unwrap();
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "row {r}: kernel and emulator must be bit-identical"
+        );
+    }
+    eprintln!("gate A: {rows} rows bit-identical (kernel vs emulator)");
+
+    // Gate B — against IK'S OWN KERNEL on the same rows with the same
+    // activations. The port keeps the C's arithmetic (the (d,m) scale
+    // pair, the m*(d_a*m_a) min term, the fmadd order, the 0.25-spread
+    // tail); 1 ULP covers the compiler's freedom in the s12 multiplies —
+    // the measured bound the Q5_0 round's gate B used, same template.
+    assert!(want.len() >= 64, "dump needs 64 rows");
+    for (r, &w) in want.iter().take(64).enumerate() {
+        let got = qdot::dot_row(
+            gguf::GgmlType::Q5_1,
             &bytes[r * row_bytes..(r + 1) * row_bytes],
             &ik_acol,
             k,

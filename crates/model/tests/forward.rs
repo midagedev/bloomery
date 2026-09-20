@@ -96,6 +96,17 @@ fn hw_forward_embed_is_exact() {
 /// re-lottery this caused is recorded in `prompts.rs` (set {14}, A/B
 /// proof there).
 ///
+/// 2026-09-20 (MUL-34): the Q5_1 fused wiring (blk.0.ffn_down, k = 10944 —
+/// the model's LAST unfused quant type; the ops dispatch proof holds the
+/// site bit-identical to the qdot composition, qdot gate B within 1 ULP of
+/// ik's own kernel) moved the 24–26 band's worst to 7.21e-3 (`l_out-25`;
+/// `l_out-24` 1.49e-3, `l_out-26` 3.18e-3, `result_output` 2.64e-2) — up
+/// from 4.99e-3 but still 10x under the 7e-2 pin, and with every quant
+/// site now on ik's own arithmetic there is no scalar/fused mixture left
+/// in the chain to blame drift on except `q_nope2`'s activation-code tie
+/// flips. No repin. The argmax set did not move this time (`prompts.rs`,
+/// still {14}, worst |dlogit| 1.3984 -> 0.9458).
+///
 /// **Where the drift comes from is already known and is not this round's.** Block 0's
 /// 1.8e-3 is the attention round's documented `q_nope2` slack (its own gate measures
 /// `kqv_out-0` at 8.9e-4 fed the oracle's input, from activation-code tie flips in ik's
