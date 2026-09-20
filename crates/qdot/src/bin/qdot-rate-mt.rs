@@ -1,95 +1,32 @@
-//! MT streaming ceiling for `dot_row` (MUL-35, track B), plus the
-//! dispatch-granularity probe that goes with it — the two numbers that
-//! separate "the kernels are slow" from "the dispatch shape is slow".
+//! MT streaming ceiling for `dot_row` and dispatch-granularity probe.
 //!
-//! Why this exists: the N=96 decode stage table (MUL-35 level 1, per-lease
-//! measurement) shows every site's achieved GB/s tracking rows/call — the
-//! pool's redispatch unit — rather than kernel quality:
-//!
-//! | site | MB/step | ms/step | GB/s | calls/step | rows/call |
-//! |---|---|---|---|---|---|
-//! | batch Q3_K | 399 | 5.67 | 70 | 53 | ~9333 |
-//! | matmul_q Q3_K | 235 | 4.58 | 51 | 108 | ~2470 |
-//! | batch Q5_0 | 309 | 4.56 | 68 | 26 | ~12288 |
-//! | matmul_q Q4_K | 148 | 3.12 | 47 | 53 | 2048 |
-//! | matmul_q Q6_K | 172 | 1.44 | 119 | 1 | 102400 |
-//! | matmul_q Q5_1 | 16.8 | 0.223 | 75 | 1 | 2048 |
-//!
-//! while the single-core kernel rates (`qdot-rate`, MUL-26..34: 10.8 GB/s
-//! Q3_K, 14.4 Q4_K, 16.7 Q6_K, per core) sit far above what any site
-//! reaches per thread at 32 threads even against the 147.7 GB/s STREAM
-//! ceiling, and the engine issues 322 pool dispatches per step. The
-//! suspicion this bin is built to cut: achieved bandwidth is set by
-//! rows/call, not by the kernels. Two modes, zero engine orchestration in
-//! both:
-//!
-//! * default (the MT ceiling): T in {1, 8, 16, 32} plain
-//!   `std::thread::scope` threads over one shared ~2.5 GB weight buffer,
-//!   each streaming its own contiguous row range of real `dot_row` calls —
-//!   no job slots, no parking, no pinning. std-only on purpose: this is
-//!   the OS-scheduled ceiling of OUR kernels with the engine contributing
-//!   nothing.
-//! * `--granularity`: T = 32 fixed, R rows/call swept over the stage
-//!   table's live range. Each thread walks its contiguous share of R rows,
-//!   then all 32 resynchronize on a `std::sync::Barrier` before the next
-//!   call. CAVEAT, corrected against this round's own measurement on the
-//!   box (2026-09-20): std's Barrier is a mutex+condvar broadcast, and it
-//!   is NOT cheaper than the pool's job-slot/parking protocol — at
-//!   R = 2048 (the Q4_K site's granularity) this probe measures 18.3 GB/s
-//!   while the engine itself reaches 47 GB/s on the same shape, and
-//!   `pool-rate` prices the pool's spin-hot dispatch at ~4.7 µs vs the
-//!   ~100 µs this probe's per-call Barrier sync implies. So the R sweep
-//!   characterizes the Barrier, not the pool: with one fixed sync
-//!   primitive it shows the rows/call law cleanly (GB/s rising monotone
-//!   with R until ~25k rows/call), and at small R it is a FLOOR — the
-//!   engine's cheaper dispatch already beats it. The engine's actual
-//!   granularity at the Q4_K site is 2048 rows/call over 32 threads =
-//!   64 rows/thread/call.
-//!
-//! Shapes are the five stage-table sites at their real k and row sizes
-//! (source: the MUL-35 level-1 table quoted above). Weights are xorshift64*
-//! filler — any bytes are valid quantized codes and the kernels are
-//! data-independent — and the activation column goes through the real
-//! `quantize_col`, exactly the discipline `qdot-rate` (MUL-26)
-//! established. Each thread's accumulator is returned from its scoped
-//! closure and printed after the timed region, so the loops cannot be
-//! optimized away and the timing contains no printing. Aggregate GB/s
-//! counts WEIGHT bytes only (the activation column is a few KB, shared
-//! read-only, cache-resident).
+//! Measures sustained bandwidth across thread counts T in {1, 8, 16, 32} using
+//! scoped threads over a shared ~2.5 GB buffer, and under `--granularity`
+//! measures rows/call scaling at T=32 with barrier resynchronization.
 
 use std::sync::Barrier;
 use std::time::Instant;
 
 use gguf::GgmlType;
 
-/// Timed-section target per cell: long enough for a stable aggregate,
-/// short enough that the whole shape sweep finishes in minutes.
+/// Timed-section target per cell.
 const TARGET_SECS: f64 = 3.0;
-/// Pass/sweep clamps: at least two passes (a single pass is a warm-up, not
-/// a number), at most enough to keep the fastest cell bounded.
+/// Pass/sweep clamps for calibration.
 const MIN_PASSES: u32 = 2;
 const MAX_PASSES: u32 = 4000;
 const MIN_SWEEPS: usize = 2;
 const MAX_SWEEPS: usize = 200;
 
-/// The granularity probe's rows/call values (T = 32 fixed): the stage
-/// table's live range from the Q4_K site's 2048 (and sub-site scales below
-/// it) up to the Q6_K site's 102400 — with 9333 and 12288, the batch Q3_K
-/// and Q5_0 sites' real ragged rows/call (~9333 measured as 53 calls over
-/// ~495k rows, 12288 as 26 over 319k).
+/// The granularity probe's rows/call values (T = 32 fixed).
 const RS: [usize; 9] = [512, 1024, 2048, 4096, 9333, 12288, 25600, 51200, 102400];
 const T_GRAN: usize = 32;
 
-/// One stage-table site: type, its real k, the model's real row size in
-/// bytes, and the row count of the shared streaming buffer.
+/// Site shape: type, k, row size in bytes, and buffer row count.
 struct Shape {
     ty: GgmlType,
     k: usize,
     row_bytes: usize,
-    /// Multiple of 102400 so every T in {1, 8, 16, 32} splits it into whole
-    /// rows and every R in [`RS`] lands on whole-row call boundaries; sized
-    /// so the buffer sits at ~2.5 GB — far past the 128 MB of L3, so every
-    /// pass is DRAM streaming, not cache reuse.
+    /// Row count sized to ~2.5 GB to exceed L3 cache.
     rows: usize,
     site: &'static str,
 }
@@ -134,9 +71,8 @@ fn shapes() -> [Shape; 5] {
     ]
 }
 
-/// xorshift64* filler — `qdot-rate`'s discipline (MUL-26): any bytes are
-/// valid quantized codes and the kernels' time is data-independent. The
-/// fill also touches every page, so the timed passes never fault.
+/// xorshift64* filler: any bytes are valid quantized codes, and the
+/// fill touches every page to avoid faults in timed passes.
 fn fill(rows: usize, row_bytes: usize) -> Vec<u8> {
     let mut s = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move || {
@@ -153,8 +89,7 @@ fn fill(rows: usize, row_bytes: usize) -> Vec<u8> {
     w
 }
 
-/// The real activation column for `k` values, through the real
-/// `quantize_col` — same filler column as `qdot-rate`.
+/// Activation column for `k` values, through `quantize_col`.
 fn acol(ty: GgmlType, k: usize) -> Vec<u8> {
     let col: Vec<f32> = (0..k)
         .map(|i| (((i as i64 % 31) as f32) - 15.0) / 16.0)
@@ -164,11 +99,7 @@ fn acol(ty: GgmlType, k: usize) -> Vec<u8> {
     a
 }
 
-/// The pool's partition arithmetic, copied from `threads::chunk_bounds`
-/// (kept local so this bin stays std-only): chunk `t` of `threads` over
-/// `n` rows, the first `n % threads` chunks one row longer — exactly how
-/// `for_each_chunk` splits R rows across the pool, ragged R included
-/// (9333 = 21 x 292 + 11 x 291 over 32 threads).
+/// Partition arithmetic: chunk `t` of `threads` over `n` rows.
 fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
     debug_assert!(t < threads);
     let base = n / threads;
@@ -183,12 +114,8 @@ fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
 
 // ---------------------------------------------------------------- mode 1
 
-/// One MT-ceiling cell: `t_threads` scoped threads each stream their
-/// contiguous `rows / t_threads` share of the shared buffer `passes`
-/// times. The extra Barrier participant is the main thread: its `wait()`
-/// return IS the start gun (workers are released by the same barrier), so
-/// `t0` is taken at the true start and spawn cost stays outside the timed
-/// region. Returns (weight bytes moved, seconds, checksum).
+/// One MT-ceiling cell: `t_threads` scoped threads stream contiguous shares
+/// of the shared buffer. Returns (weight bytes moved, seconds, checksum).
 fn run_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, passes: u32) -> (f64, f64, f32) {
     let share = sh.rows / t_threads;
     let row = sh.row_bytes;
@@ -224,8 +151,7 @@ fn run_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize, passes: u32) -> (
     })
 }
 
-/// One (shape, T) measurement: a single timed warm-up pass calibrates the
-/// pass count for [`TARGET_SECS`], then the timed passes report.
+/// One (shape, T) measurement: warm-up calibrates pass count, then timed passes report.
 fn cell_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize) {
     let (_, warm, _) = run_mt(sh, w, acol, t_threads, 1);
     let passes = ((TARGET_SECS / warm).ceil() as u32).clamp(MIN_PASSES, MAX_PASSES);
@@ -245,12 +171,7 @@ fn cell_mt(sh: &Shape, w: &[u8], acol: &[u8], t_threads: usize) {
 
 // ---------------------------------------------------------------- mode 2
 
-/// One granularity cell: 32 threads march the buffer in `calls_per_sweep`
-/// calls of `rows_per_call` rows — each thread does its `chunk_bounds`
-/// share, then everyone meets on the per-call Barrier, the sync stand-in
-/// for a redispatch (heavier than the pool's spin-hot protocol — see the
-/// header caveat). One timed warm-up sweep calibrates the sweep count; the
-/// reported GB/s is the sustained rate across the timed sweeps.
+/// One granularity cell: 32 threads step through the buffer in calls of `rows_per_call` rows.
 fn run_gran(
     sh: &Shape,
     w: &[u8],
@@ -258,7 +179,7 @@ fn run_gran(
     rows_per_call: usize,
     sweeps: usize,
 ) -> (f64, f64, f32) {
-    let calls = sh.rows / rows_per_call; // remainder rows are simply unvisited
+    let calls = sh.rows / rows_per_call; // remainder rows are unvisited
     let row = sh.row_bytes;
     let ty = sh.ty;
     let k = sh.k;
@@ -280,8 +201,7 @@ fn run_gran(
                             for r in 0..width {
                                 acc += qdot::dot_row(ty, &w[base + r * row..], acol, k).unwrap();
                             }
-                            // The dispatch stand-in: no thread starts call
-                            // c+1 before every thread finished call c.
+                            // Resync threads between calls.
                             call_sync.wait();
                         }
                     }
@@ -348,6 +268,6 @@ fn main() {
                 cell_mt(&sh, &w, &a, t);
             }
         }
-        drop(w); // the ~2.5 GB goes back before the next shape allocates
+        drop(w); // free memory before the next shape allocates
     }
 }

@@ -1,21 +1,10 @@
-//! qdot gates: the fused Q3_K x Q8_K kernel against the path `matmul_q`
-//! runs today, against an exact f64 reference, and against its own scalar
-//! mirror.
+//! qdot gates: fused kernels against matmul_q, exact f64 reference, and scalar mirrors.
 //!
 //! `hw_` prefix: needs the box (the model file and `$BLOOMERY_DATA/ref`),
 //! excluded by default, run by `just gate-qdot`. The one pure gate
 //! (`rejects_unaligned_k`) runs in the default set.
 //!
-//! Data is real on purpose: weights come straight out of the model mmap
-//! (`blk.1.ffn_gate_exps.weight`, Q3_K, k = 2048, expert 0's slice of the
-//! 3-D stack; `blk.1.attn_kv_b.weight`, Q3_K, k = 512), activations from
-//! the oracle's dumps of the same block's inputs (`ffn_norm-1.0.f32`,
-//! `kv_compressed-1.0.f32` — the exact tensors `matmul_q` consumes for
-//! these weights). Real quantization codes decide which branches of the
-//! decode run; synthetic random bytes walk fewer of them.
-//!
-//! The gates assert with `assert!` (not `debug_assert!`) because they run
-//! in release.
+//! The gates assert with `assert!` (not `debug_assert!`) because they run in release.
 
 use gguf::GgmlType;
 use gguf::quant::{dequant_row, quantize_row_q8_k_roundtrip};
@@ -26,9 +15,7 @@ fn model_path() -> String {
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
 }
 
-/// The oracle's f32 dump of one tensor, byte length checked against the
-/// expected value count — a truncated dump must fail the gate, not quietly
-/// shift every column (same stance as the model crates' oracle reader).
+/// The oracle's f32 dump of one tensor, byte length checked against expected value count.
 fn oracle_f32(name: &str, expect: usize) -> Vec<f32> {
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let path = format!("{base}/ref/{name}.0.f32");
@@ -46,20 +33,18 @@ fn oracle_f32(name: &str, expect: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Rows dotted per tensor. The spec's floor is 1000; 1024 keeps it even.
+/// Rows dotted per tensor.
 const ROWS: usize = 1024;
 
 struct Case<'a> {
     name: &'static str,
     k: usize,
     row_bytes: usize,
-    /// The first `ROWS` rows of the tensor (expert 0's slice for the 3-D
-    /// expert stack — the routed expert chosen varies with the prompt, the
-    /// code distribution does not).
+    /// First `ROWS` rows of the tensor.
     bytes: &'a [u8],
-    /// Token 0's activation column (the dump's first k values).
+    /// Token 0's activation column.
     act: Vec<f32>,
-    /// `act` in Q8_K blocks, what `dot_row` consumes.
+    /// `act` in Q8_K blocks consumed by `dot_row`.
     acol: Vec<u8>,
 }
 
@@ -100,9 +85,7 @@ fn load_case<'a>(
     }
 }
 
-/// The current path's value for one row: dequant_row + Q8_K round trip +
-/// sequential f32 dot, exactly the arithmetic `ops::matmul_q` performs
-/// (verified against ggml at 1e-4 through the model gates).
+/// Current path value: dequant_row + Q8_K roundtrip + sequential f32 dot.
 fn current_path_dot(c: &Case, qa: &[f32], wbuf: &mut [f32], r: usize) -> f32 {
     dequant_row(GgmlType::Q3_K, &c.bytes[r * c.row_bytes..], wbuf).unwrap();
     let mut acc = 0.0f32;
@@ -112,15 +95,7 @@ fn current_path_dot(c: &Case, qa: &[f32], wbuf: &mut [f32], r: usize) -> f32 {
     acc
 }
 
-/// The gate's own f64 reference, deliberately independent of the lib's two
-/// decoders: the integer codes (sub-block scale, low bits, high bit, q8)
-/// are decoded here again from the raw bytes, summed in i64 per
-/// super-block, and scaled once in f64. Every product a real path computes
-/// in f32 is exact here, so the distance it reports is exactly the f32
-/// rounding of the path under test. Geometry per `dequantize_row_q3_K`
-/// (stage 0 verified it at 1e-7 against ggml): element 128c + 32f + 16h +
-/// l reads qs byte 32c + 16h + l field f, high bit hmask byte 16h + l bit
-/// 4c + f, sub-block scale index 8c + 2f + h.
+/// Exact f64 reference: integer codes decoded from raw bytes, summed in i64, scaled once in f64.
 fn exact_dot_f64(wrow: &[u8], acol: &[u8], k: usize) -> f64 {
     const KMASK1: u32 = 0x0303_0303;
     const KMASK2: u32 = 0x0f0f_0f0f;
@@ -140,8 +115,7 @@ fn exact_dot_f64(wrow: &[u8], acol: &[u8], k: usize) -> f64 {
             2 => ((aux[0] >> 4) & KMASK2) | (((aux[2] >> 4) & KMASK1) << 4),
             _ => ((aux[1] >> 4) & KMASK2) | (((aux[2] >> 6) & KMASK1) << 4),
         };
-        // Unpacked scale byte 0..63, actual scale byte - 32 (quant.rs:348,
-        // the AVX2 kernel's _mm_sub_epi8).
+        // Unpacked scale byte 0..63, actual scale byte - 32.
         let scale = |idx: usize| (word(idx / 4).to_le_bytes()[idx % 4] as i8 - 32) as i64;
         let d = gguf::quant::half_to_f32(u16::from_le_bytes([blk[108], blk[109]])) as f64;
         let dcol = f32::from_le_bytes(acol[sb * 296..sb * 296 + 4].try_into().unwrap()) as f64;
@@ -173,10 +147,7 @@ fn exact_dot_f64(wrow: &[u8], acol: &[u8], k: usize) -> f64 {
 // ------------------------------------------------------------- gate 1
 
 /// Gate 1: restoring `d * q` from `quantize_col`'s packed codes and scale
-/// must reproduce `quantize_row_q8_k_roundtrip`'s f32 output bit for bit,
-/// over every token column of both activation dumps. This is where a
-/// rounding or sign inconsistency between the two representations of the
-/// same quantization shows up.
+/// must reproduce `quantize_row_q8_k_roundtrip`'s f32 output bit for bit.
 #[test]
 #[ignore = "hw: needs the box and $BLOOMERY_DATA/ref"]
 fn hw_quantize_col_matches_roundtrip_bits() {
@@ -186,14 +157,7 @@ fn hw_quantize_col_matches_roundtrip_bits() {
         let mut rt = vec![0.0f32; k];
         let mut restored = vec![0.0f32; k];
         let mut bad = 0usize;
-        // +0.0 vs -0.0 is the one f32 pair that is numerically equal with
-        // different bits. A code of 0 restores to d*0 whose sign is the
-        // multiplication's, not information the packed codes carry: the C
-        // quantizer codes every zero — +0.0 and -0.0 alike — as 0, and every
-        // consumer adds it as zero. Those pairs are counted separately and
-        // never treated as a material difference; any other equal-value /
-        // different-bits case is impossible (equal non-zero f32s are
-        // bit-identical).
+        // +0.0 vs -0.0: numerically equal with different bits; counted separately.
         let mut zero_sign = 0usize;
         let mut first: Option<(usize, usize, f32, f32)> = None;
         for t in 0..6 {
@@ -236,12 +200,7 @@ fn hw_quantize_col_matches_roundtrip_bits() {
 
 // ------------------------------------------------------------- gate 2
 
-/// Gate 2: `dot_row` must match the current path (dequant + round trip +
-/// sequential f32 dot, the arithmetic `matmul_q` performs and the model
-/// gates verified against ggml at 1e-4) on the same rows and the same
-/// activation values. Relative difference at the tensor scale
-/// (max |diff| / max |current|, the metric the q3k-cpu gate uses) <= 1e-5
-/// for both k. Per-row worsts are printed for the report.
+/// Gate 2: `dot_row` matches the current path within relative difference <= 1e-5.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_dot_row_matches_current_path() {
@@ -301,13 +260,7 @@ fn hw_dot_row_matches_current_path() {
 
 // ------------------------------------------------------------- gate 3
 
-/// Gate 3: the fused kernel is a prediction — it should land closer to the
-/// exact f64 value than the current f32 path on more than half the rows,
-/// and its worst relative error must not exceed the current path's worst.
-/// The reference is exact (integer codes summed in i64, one f64 scaling per
-/// super-block), so the only thing it measures is each path's f32 rounding.
-/// If the closer-count comes out at or below half, the kernel is wrong —
-/// that is the failure mode this gate exists to catch.
+/// Gate 3: fused kernel lands closer to exact f64 than current f32 path on >50% of rows.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_dot_row_closer_to_exact_than_current_path() {
@@ -373,11 +326,7 @@ fn hw_dot_row_closer_to_exact_than_current_path() {
 
 // ------------------------------------------------------------- gate 4
 
-/// Gate 4: the scalar fallback (what a machine without AVX2 runs) is
-/// bit-identical to the AVX2 kernel on the same rows. The integer
-/// super-block sums are exact in i32 and the f32 scaling is the same
-/// expression in the same order, so bit equality is the expected outcome —
-/// anything looser would hide a real decode difference.
+/// Gate 4: scalar fallback is bit-identical to the AVX2 kernel.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_scalar_fallback_bit_identical_to_avx2() {
@@ -425,14 +374,10 @@ fn hw_scalar_fallback_bit_identical_to_avx2() {
 
 // ------------------------------------------------------------- gate 5
 
-/// Gate 5 (pure): `k % 256 != 0` is rejected — an `Err`, never a panic,
-/// never a silently wrong value — and the shape contract around it holds:
-/// unsupported types refuse before touching the data, short buffers are
-/// errors, and `col_bytes` is the allocation contract `quantize_col`
-/// asserts against.
+/// Gate 5 (pure): unaligned k is rejected with Err, and buffer size contracts hold.
 #[test]
 fn rejects_unaligned_k() {
-    // Buffers sized for k = 2048 so only `k` can be at fault.
+    // Buffers sized for k = 2048.
     let wrow = vec![0u8; 110 * 8];
     let acol = vec![0u8; 296 * 8];
     for k in [1usize, 100, 255, 2048 + 128] {
@@ -441,10 +386,7 @@ fn rejects_unaligned_k() {
             other => panic!("k = {k}: expected UnalignedK, got {other:?}"),
         }
     }
-    // A type outside this build's table refuses before reading any bytes.
-    // Q4_K joined the table in MUL-27, Q5_0 in MUL-32, Q5_1 in MUL-34 —
-    // with Q5_1 the model's every quant type is fused, so the rejection
-    // witness is Q5_K now: a real ggml type this model does not carry.
+    // Unsupported type refuses before reading bytes.
     assert!(matches!(
         dot_row(GgmlType::Q5_K, &wrow, &acol, 2048),
         Err(QdotError::UnsupportedType(GgmlType::Q5_K))
@@ -458,14 +400,12 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::Q3_K, &wrow, &acol[..295], 2048),
         Err(QdotError::ShortActivationCol { .. })
     ));
-    // The aligned k on the same buffers is a valid (all-zero) dot, not an
-    // error — and `UnalignedK` for k = 2048 + 128 was a k problem, not a
-    // buffer problem, which this line pins.
+    // Aligned k on valid buffers succeeds.
     assert_eq!(dot_row(GgmlType::Q3_K, &wrow, &acol, 2048).unwrap(), 0.0);
-    // col_bytes is the allocation contract quantize_col asserts against.
+    // col_bytes allocation contracts per type.
     assert_eq!(col_bytes(GgmlType::Q3_K, 2048), 296 * 8);
     assert_eq!(col_bytes(GgmlType::Q3_K, 512), 296 * 2);
-    // Q4_K pairs q8_2_x4: 144 bytes per 128 values (MUL-27 x4 round).
+    // Q4_K pairs q8_2_x4: 144 bytes per 128 values.
     assert_eq!(col_bytes(GgmlType::Q4_K, 2048), 144 * 16);
     assert_eq!(col_bytes(GgmlType::Q4_K, 512), 144 * 4);
     let wrow4 = vec![0u8; 144 * 8];
@@ -475,8 +415,7 @@ fn rejects_unaligned_k() {
         Err(QdotError::ShortActivationCol { .. })
     ));
     assert_eq!(dot_row(GgmlType::Q4_K, &wrow4, &acol4, 2048).unwrap(), 0.0);
-    // Q6_K pairs the SAME q8_2_x4 activation column (MUL-31): its own
-    // stride is 210 weight bytes per 256 values.
+    // Q6_K pairs q8_2_x4 with 210 weight bytes per 256 values.
     assert_eq!(col_bytes(GgmlType::Q6_K, 2048), 144 * 16);
     assert_eq!(col_bytes(GgmlType::Q6_K, 512), 144 * 4);
     let wrow6 = vec![0u8; 210 * 8];
@@ -490,10 +429,7 @@ fn rejects_unaligned_k() {
         Err(QdotError::ShortActivationCol { .. })
     ));
     assert_eq!(dot_row(GgmlType::Q6_K, &wrow6, &acol6, 2048).unwrap(), 0.0);
-    // Q5_0's contract is its OWN 32-value block, not the K-quants' 256
-    // (MUL-32): k = 1408 — the model's ffn_down_exps rows, 44 blocks, 11
-    // whole x4 groups — is legal, and so is a k with tail blocks (160 =
-    // one group + one 36-byte tail; 192 = one group + two).
+    // Q5_0 uses 32-value blocks (22 bytes per 32 values).
     assert_eq!(col_bytes(GgmlType::Q5_0, 1408), 144 * 11);
     assert_eq!(col_bytes(GgmlType::Q5_0, 160), 144 + 36);
     assert_eq!(col_bytes(GgmlType::Q5_0, 192), 144 + 2 * 36);
@@ -508,9 +444,7 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::Q5_0, &wrow5[..21], &acol5, 1408),
         Err(QdotError::ShortWeightRow { .. })
     ));
-    // Q5_1 carries the SAME legacy contract (MUL-34), with its own 24-byte
-    // block: the model's site k = 10944 is 85 whole groups + TWO tail
-    // blocks — the first Q5-family shape whose tail is real.
+    // Q5_1 uses 32-value blocks (24 bytes per 32 values).
     assert_eq!(col_bytes(GgmlType::Q5_1, 10944), 144 * 85 + 2 * 36);
     assert_eq!(col_bytes(GgmlType::Q5_1, 160), 144 + 36);
     let wrow51 = vec![0u8; 24 * 342];
@@ -527,26 +461,19 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::Q5_1, &wrow51[..23], &acol51, 10944),
         Err(QdotError::ShortWeightRow { .. })
     ));
-    // supports(): the type must be in the table at all. Q4_K joined in
-    // MUL-27, Q6_K in MUL-31, Q5_0 in MUL-32, Q5_1 in MUL-34 (the model's
-    // last unfused type); Q5_K is the out-of-table witness now.
+    // Supported type table check.
     assert!(!supports(GgmlType::Q5_K));
     assert!(supports(GgmlType::Q5_1));
 }
 
-/// Gate 5's sibling: `col_bytes` panics (documented) on an unaligned k —
-/// allocation-time constants are asserts, data-dependent shapes are
-/// `Err`s.
+/// `col_bytes` panics on unaligned k.
 #[test]
 #[should_panic(expected = "whole 256-value super-blocks")]
 fn col_bytes_rejects_unaligned_k() {
     col_bytes(GgmlType::Q3_K, 100);
 }
 
-/// Parse one of the ik kernel dumps (`q4k-x4-ik-dot.txt`,
-/// `q5f0-ik-dot.txt`, `q5f1-ik-dot.txt`): tensor header, one long hex line of ik's own
-/// quantized activation bytes, then `row R %08x` lines of its kernel's
-/// output bits. One parser so both rounds' gates read the same bytes.
+/// Parse ik kernel reference dump: tensor header, hex activation bytes, and output rows.
 fn parse_ik_dot_dump(dump: &str) -> (usize, Vec<u8>, Vec<u32>) {
     let mut dump_k = 0usize;
     let mut rows = Vec::new();
@@ -558,7 +485,7 @@ fn parse_ik_dot_dump(dump: &str) -> (usize, Vec<u8>, Vec<u32>) {
             (Some("row"), Some(_), Some(hex), None) => {
                 rows.push(u32::from_str_radix(hex, 16).expect("ik dumps raw f32 bits"));
             }
-            // the one long hex line: ik's quantized activation bytes
+            // Hex-encoded activation bytes.
             (Some(hex), None, None, None) if hex.len() > 64 => {
                 let b = hex.as_bytes();
                 acol.extend(
@@ -575,13 +502,7 @@ fn parse_ik_dot_dump(dump: &str) -> (usize, Vec<u8>, Vec<u32>) {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_q4k_dot_row_matches_scalar_and_predicts() {
-    // MUL-27's gate triple for the Q4_K x Q8_2_X4 kernel — the pairing the
-    // oracle actually dispatches. Same regime as the Q3_K round plus one
-    // gate the x4 pairing makes possible: the encoder is a port of ik's OWN
-    // x86 quantizer, so its bytes can be checked BIT-IDENTICAL, not merely
-    // close (the q8_K round could only count encoder diffs — its coder was
-    // ik's q8_K path, ours deliberately matched the engine's; here the two
-    // implementations are the same program).
+    // Gate triple for Q4_K x Q8_2_X4: encoder bit-identical, kernel vs emulator bit-identical, within 1 ULP of reference.
     let g = gguf::Gguf::open(model_path()).unwrap();
     let w = g
         .iter_tensors()
@@ -601,9 +522,7 @@ fn hw_q4k_dot_row_matches_scalar_and_predicts() {
     let mut acol = vec![0u8; cb];
     qdot::quantize_col(gguf::GgmlType::Q4_K, &xs, &mut acol);
 
-    // The x4 dump: tools/ref/q4k_x4_ref.cpp runs ik's own kernel-table
-    // entry (mul_mat_qX_K_q8_2_X4_T<DequantizerQ4K_AVX2, 1>) on this tensor
-    // with ik's quantize_row_q8_2_x4 coding of the same column.
+    // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q4k-x4-ik-dot.txt"))
         .expect("run tools/ref/q4k_x4_ref.cpp first (just build-ref does not build it)");
@@ -618,16 +537,13 @@ fn hw_q4k_dot_row_matches_scalar_and_predicts() {
         "ik's q8_2_x4 column must size-match ours"
     );
 
-    // Gate 0 — the ENCODER is bit-identical to ik's: both are the x86
-    // branch of quantize_row_q8_2_x4, so every bf16 rounding and every i16
-    // sum must agree. A diff here means the port slipped, full stop.
+    // Gate 0: encoder bit-identical to reference.
     for (i, (a, b)) in ik_acol.iter().zip(&acol).enumerate() {
         assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
     }
     eprintln!("gate 0: {cb} encoder bytes bit-identical to ik's quantize_row_q8_2_x4");
 
-    // Gate A — bit identity kernel vs instruction-graph emulator, on our
-    // (== ik's) activation bytes.
+    // Gate A: bit identity between kernel and scalar emulator.
     let rows = n.min(1024);
     for r in 0..rows {
         let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
@@ -641,11 +557,7 @@ fn hw_q4k_dot_row_matches_scalar_and_predicts() {
     }
     eprintln!("gate A: {rows} rows bit-identical (kernel vs emulator)");
 
-    // Gate B — against IK'S OWN KERNEL on the same rows with the same
-    // activations: verbatim port means the bits agree to the last float
-    // rounding; 1 ULP covers the compiler's freedom in the two f32
-    // multiplies the template shares across its iy loop (measured bound,
-    // same regime as the q8_K round's gate).
+    // Gate B: matches reference kernel within 1 ULP.
     assert!(want.len() >= 64, "dump needs 64 rows");
     for (r, &w) in want.iter().take(64).enumerate() {
         let got = qdot::dot_row(
@@ -670,14 +582,7 @@ fn hw_q4k_dot_row_matches_scalar_and_predicts() {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_q6k_dot_row_matches_scalar_and_predicts() {
-    // MUL-31's gate triple for the Q6_K x Q8_2_X4 kernel — same regime as
-    // MUL-27's Q4_K triple. Gate 0 is shared by construction: the encoder
-    // IS the Q4_K round's port (one quantize_row_q8_2_x4 for both weight
-    // types), so its bytes must reproduce the dump's activation line again
-    // — a re-run of the same program, not a new claim. What is new is the
-    // kernel: ik's qY template (mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2,
-    // 1>), whose weight-magnitude/sign split and k_shuff scale interleave
-    // the Q4_K qX port does not exercise.
+    // Gate triple for Q6_K x Q8_2_X4: encoder bit-identical, kernel vs emulator bit-identical, within 1 ULP of reference.
     let g = gguf::Gguf::open(model_path()).unwrap();
     let w = g
         .iter_tensors()
@@ -697,9 +602,7 @@ fn hw_q6k_dot_row_matches_scalar_and_predicts() {
     let mut acol = vec![0u8; cb];
     qdot::quantize_col(gguf::GgmlType::Q6_K, &xs, &mut acol);
 
-    // The x4 dump: tools/ref/q6k_x4_ref.cpp runs ik's own kernel-table
-    // entry (mul_mat_qY_K_q8_2_X4_T<DequantizerQ6K_AVX2, 1>) on this tensor
-    // with ik's quantize_row_q8_2_x4 coding of the same column.
+    // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q6k-x4-ik-dot.txt"))
         .expect("run tools/ref/q6k_x4_ref.cpp first (just build-ref does not build it)");
@@ -714,16 +617,13 @@ fn hw_q6k_dot_row_matches_scalar_and_predicts() {
         "ik's q8_2_x4 column must size-match ours"
     );
 
-    // Gate 0 — the ENCODER bytes are bit-identical to ik's coding of the
-    // same column: the encoder is Q4_K's, unchanged, so this is a re-check
-    // of the same program on the Q6_K round's dump.
+    // Gate 0: encoder bit-identical to reference.
     for (i, (a, b)) in ik_acol.iter().zip(&acol).enumerate() {
         assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
     }
     eprintln!("gate 0: {cb} encoder bytes bit-identical to ik's quantize_row_q8_2_x4");
 
-    // Gate A — bit identity kernel vs instruction-graph emulator, on our
-    // (== ik's) activation bytes.
+    // Gate A: bit identity between kernel and scalar emulator.
     let rows = n.min(1024);
     for r in 0..rows {
         let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
@@ -737,10 +637,7 @@ fn hw_q6k_dot_row_matches_scalar_and_predicts() {
     }
     eprintln!("gate A: {rows} rows bit-identical (kernel vs emulator)");
 
-    // Gate B — against IK'S OWN KERNEL on the same rows with the same
-    // activations; 1 ULP covers the compiler's freedom in the f32
-    // multiplies the template shares across its iy loop (measured bound,
-    // same regime as the Q4_K round's gate).
+    // Gate B: matches reference kernel within 1 ULP.
     assert!(want.len() >= 64, "dump needs 64 rows");
     for (r, &w) in want.iter().take(64).enumerate() {
         let got = qdot::dot_row(
@@ -762,18 +659,7 @@ fn hw_q6k_dot_row_matches_scalar_and_predicts() {
     );
 }
 
-/// MUL-32's gate triple for the Q5_0 x Q8_2_X4 kernel — the pairing this
-/// round found by reading ik's dispatch (iqk_gemm_legacy_quants.cpp:2494
-/// -> mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker>, expected_type_B = Q8_2_X4 at
-/// 2482; ggml.c:767's traits agree under __AVX2__ + IQK_MULMAT). Same
-/// regime as the Q4_K round: the encoder is a port of ik's OWN x86
-/// quantizer (the same `quantize_row_q8_2_x4`, nothing new), so gate 0
-/// checks its bytes BIT-IDENTICAL; gate A checks the kernel against the
-/// instruction-graph emulator; gate B checks the kernel against IK'S OWN
-/// kernel on ik's own activation bytes, 1 ULP. The site this unlocks is
-/// the model's largest: every Q5_0 tensor is ffn_down_exps with
-/// k = 1408 = 44 x 32 — not a multiple of 256, which is why the fused
-/// path never fired on it before the per-type block contract.
+/// Gate triple for Q5_0 x Q8_2_X4: encoder bit-identical, kernel vs emulator bit-identical, within 1 ULP of reference.
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
@@ -787,10 +673,7 @@ fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
         })
         .expect("the model must carry at least one aligned Q5_0 tensor");
     let k = w.dims[0] as usize;
-    // ffn_down_exps is a 3-D stack (k, rows_per_expert, 64 experts): a row
-    // stride is bytes.len() / (rows * experts) — dividing by dims[1] alone
-    // would make row "strides" 64 rows wide. The C harness reads the same
-    // rows (rs*64 bytes from the tensor offset = expert 0's first 64).
+    // ffn_down_exps is a 3-D stack (k, rows_per_expert, 64 experts).
     let n: usize = w.dims[1..].iter().product::<u64>() as usize;
 
     let bytes = g.data(w).unwrap();
@@ -805,9 +688,7 @@ fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
     let mut acol = vec![0u8; cb];
     qdot::quantize_col(gguf::GgmlType::Q5_0, &xs, &mut acol);
 
-    // The q5f0 dump: tools/ref/q5f0_ref.cpp runs ik's own kernel-table
-    // entry (mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker, 1>) on this tensor with
-    // ik's quantize_row_q8_2_x4 coding of the same column.
+    // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q5f0-ik-dot.txt"))
         .expect("run tools/ref/q5f0_ref.cpp first (just build-ref does not build it)");
@@ -822,16 +703,13 @@ fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
         "ik's q8_2_x4 column must size-match ours"
     );
 
-    // Gate 0 — the ENCODER is bit-identical to ik's: the same x86
-    // quantize_row_q8_2_x4 the Q4_K round verified, re-checked on a
-    // k % 256 != 0 shape (the Q5_0 rows).
+    // Gate 0: encoder bit-identical to reference.
     for (i, (a, b)) in ik_acol.iter().zip(&acol).enumerate() {
         assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
     }
     eprintln!("gate 0: {cb} encoder bytes bit-identical to ik's quantize_row_q8_2_x4");
 
-    // Gate A — bit identity kernel vs instruction-graph emulator, on our
-    // (== ik's) activation bytes.
+    // Gate A: bit identity between kernel and scalar emulator.
     let rows = n.min(1024);
     for r in 0..rows {
         let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
@@ -845,11 +723,7 @@ fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
     }
     eprintln!("gate A: {rows} rows bit-identical (kernel vs emulator)");
 
-    // Gate B — against IK'S OWN KERNEL on the same rows with the same
-    // activations. The port keeps the C's arithmetic (unsigned codes, the
-    // min path, the fmadd order); 1 ULP covers the compiler's freedom in
-    // the two f32 multiplies s12 carries (the measured bound the Q4_K
-    // round's gate B used, same regime).
+    // Gate B: matches reference kernel within 1 ULP.
     assert!(want.len() >= 64, "dump needs 64 rows");
     for (r, &w) in want.iter().take(64).enumerate() {
         let got = qdot::dot_row(
@@ -869,18 +743,7 @@ fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
     eprintln!("gate B: 64 rows within 1 ULP of ik's mul_mat_qX_1_q8_2_T (on ik's own activations)");
 }
 
-/// MUL-34's gate triple for the Q5_1 x Q8_2_X4 kernel — the pairing this
-/// round found in the same dispatch section Q5_0 came from
-/// (iqk_gemm_legacy_quants.cpp:2343-2344 -> mul_mat_qX_1_q8_2_T<
-/// Q5_1_Unpacker>, expected_type_B = Q8_2_X4 at :2329; ggml.c:777's traits
-/// agree under __AVX2__ + IQK_MULMAT). The encoder is the same
-/// `quantize_row_q8_2_x4` port again (gate 0 re-checks its bytes), the
-/// kernel differs from Q5_0's in exactly one thing — block_q5_1's SECOND
-/// stored scale m (d f16 + m f16, 24 B) replaces the -16*d min term. The
-/// site is the model's only Q5_1 tensor, blk.0.ffn_down: k = 10944 = 85
-/// whole x4 groups + TWO tail blocks, the first round whose tail path is
-/// live in both the encoder bytes and the kernel — and the model's last
-/// unfused quant type, so with this every matmul_q site is fused.
+/// Gate triple for Q5_1 x Q8_2_X4: encoder bit-identical, kernel vs emulator bit-identical, within 1 ULP of reference.
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
@@ -897,17 +760,14 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
     let row_bytes = bytes.len() / n;
     assert_eq!(row_bytes, 24 * k / 32);
 
-    // Real activations: the down projection's own input — the oracle's
-    // fused gate/up product dump (ffn_up_gate-0, [10944 x 6]).
+    // Real activations from oracle ffn_up_gate dump.
     let vals = oracle_f32("ffn_up_gate-0", k * 6);
     let xs: Vec<f32> = vals[..k].to_vec();
     let cb = qdot::col_bytes(gguf::GgmlType::Q5_1, k);
     let mut acol = vec![0u8; cb];
     qdot::quantize_col(gguf::GgmlType::Q5_1, &xs, &mut acol);
 
-    // The q5f1 dump: tools/ref/q5f1_ref.cpp runs ik's own kernel-table
-    // entry (mul_mat_qX_1_q8_2_T<Q5_1_Unpacker, 1>) on this tensor with
-    // ik's quantize_row_q8_2_x4 coding of the same column.
+    // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q5f1-ik-dot.txt"))
         .expect("run tools/ref/q5f1_ref.cpp first (just build-ref does not build it)");
@@ -922,9 +782,7 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
         "ik's q8_2_x4 column must size-match ours"
     );
 
-    // Gate 0 — the ENCODER is bit-identical to ik's on a column WITH tail
-    // blocks: the same x86 quantize_row_q8_2_x4, re-checked on the first
-    // shape that stores blocks past the last x4 group (the 2-block tail).
+    // Gate 0: encoder bit-identical to reference on tail blocks.
     for (i, (a, b)) in ik_acol.iter().zip(&acol).enumerate() {
         assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
     }
@@ -932,9 +790,7 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
         "gate 0: {cb} encoder bytes bit-identical to ik's quantize_row_q8_2_x4 (incl. 2 tail blocks)"
     );
 
-    // Gate A — bit identity kernel vs instruction-graph emulator, on our
-    // (== ik's) activation bytes. The kernel's tail path runs here for the
-    // first time on real data.
+    // Gate A: bit identity between kernel and scalar emulator.
     let rows = n.min(1024);
     for r in 0..rows {
         let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
@@ -948,11 +804,7 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
     }
     eprintln!("gate A: {rows} rows bit-identical (kernel vs emulator)");
 
-    // Gate B — against IK'S OWN KERNEL on the same rows with the same
-    // activations. The port keeps the C's arithmetic (the (d,m) scale
-    // pair, the m*(d_a*m_a) min term, the fmadd order, the 0.25-spread
-    // tail); 1 ULP covers the compiler's freedom in the s12 multiplies —
-    // the measured bound the Q5_0 round's gate B used, same template.
+    // Gate B: matches reference kernel within 1 ULP.
     assert!(want.len() >= 64, "dump needs 64 rows");
     for (r, &w) in want.iter().take(64).enumerate() {
         let got = qdot::dot_row(
@@ -972,24 +824,11 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
     eprintln!("gate B: 64 rows within 1 ULP of ik's mul_mat_qX_1_q8_2_T (on ik's own activations)");
 }
 
-// ------------------------------------------------- MUL-38: q_nope2 cell kernel
-// The Q8_0 x act cell kernel's own gate: AVX2 kernel vs scalar mirror,
-// BIT for bit, over the model's shape and the boundary shapes the pool's
-// segment walk can produce (j0 mid-column, single-cell tails, nb = 1), on
-// code patterns that walk the sign fold's extremes — all-±127 blocks (the
-// maddubs pair bound 2·127·127 = 32258 and the i32 extreme 32·127² =
-// 516128), all-zero weight codes (every activation lane folded to zero),
-// and -128 WEIGHT codes (legal: |w| = 128 is a valid u8 magnitude and the
-// identity survives the two's-complement wrap, see the lib's section
-// header point 3). Activation codes of -128 under a negative weight are
-// deliberately absent: they are outside the kernel's contract and both
-// producers provably cannot emit them. No model file is read — the shapes
-// are constants; the `hw_` prefix is the ISA requirement
-// (`q_nope2_cells_avx2` panics without AVX2, and the gate wants the kernel
-// compared, not the dispatcher falling back to the mirror against itself).
+// ------------------------------------------------- q_nope2 cell kernel
+// Q8_0 x act cell kernel gates: AVX2 kernel vs scalar mirror, bit for bit,
+// over model and boundary shapes and extreme code patterns.
 
-/// Deterministic xorshift64* — the crate has no rand dependency and the
-/// gate must be reproducible (a failing pattern must reappear on rerun).
+/// Deterministic xorshift64* generator.
 struct Rng(u64);
 
 impl Rng {
@@ -1002,16 +841,13 @@ impl Rng {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    /// Uniform code in [-127, 127] — the producers' reachable range.
+    /// Uniform code in [-127, 127].
     fn code(&mut self) -> i8 {
         ((self.next() % 255) as i32 - 127) as i8
     }
 }
 
-/// A few f16 bit patterns for the weight scales (1.0, 0.5, 2.0, ~0.0039,
-/// a denormal, and -1.0 — the arithmetic does not care about the sign, and
-/// half_to_f32 is the same function on both paths) and bf16-valued f32s
-/// for the activation scales.
+/// Weight f16 scales and activation f32 scales.
 const W_SCALES: [u16; 6] = [0x3C00, 0x3800, 0x4000, 0x3B00, 0x0040, 0xBC00];
 const A_SCALES: [f32; 6] = [1.0, 0.5, 2.0, 0.00390625, 0.25, -1.0];
 
@@ -1045,8 +881,7 @@ fn gen_acol(rng: &mut Rng, nb: usize) -> Vec<qdot::ActBlock> {
         .collect()
 }
 
-/// Compare kernel vs mirror over one (whead, acol) pair, segment by
-/// segment, on BITS.
+/// Compare kernel vs mirror over one (whead, acol) pair on bits.
 fn assert_cells_bit_identical(
     what: &str,
     whead: &[qdot::Q8Block],
@@ -1074,9 +909,7 @@ fn assert_cells_bit_identical(
 #[test]
 #[ignore = "hw: needs the box's AVX2 (q_nope2_cells_avx2 panics without it)"]
 fn hw_q_nope2_cells_bit_identical() {
-    // The model's exact shape: latent 512, nb = nope/32 = 4 — every
-    // segment form the MUL-33 chunk walk produces, including a mid-column
-    // start, a single-cell tail, and whole-column runs.
+    // Model shape: latent 512, nb = nope/32 = 4.
     let mut rng = Rng(0x5EED_3838_1234_5678);
     let (latent, nb) = (512usize, 4usize);
     let whead = gen_blocks(&mut rng, latent * nb, 0);
@@ -1088,8 +921,7 @@ fn hw_q_nope2_cells_bit_identical() {
         &[(0, latent), (1, latent - 1), (137, 349), (511, 512), (0, 1)],
     );
 
-    // Extreme patterns over the same shape: each row is one (whead, acol)
-    // pair whose codes are constant at the range ends.
+    // Extreme patterns over the same shape.
     let consts: &[(&str, i8, i8)] = &[
         ("w+127 a+127 (max positive isum/pairs)", 127, 127),
         ("w-127 a-127 (fold on every lane)", -127, -127),
@@ -1116,7 +948,7 @@ fn hw_q_nope2_cells_bit_identical() {
         assert_cells_bit_identical(what, &whead, &acol, &[(0, latent), (3, latent)]);
     }
 
-    // Alternating signs — adjacent-lane pair cancellation inside maddubs.
+    // Alternating signs for pair cancellation in maddubs.
     let alt = |i: usize| if i % 2 == 0 { 127 } else { -127 };
     let whead: Vec<qdot::Q8Block> = (0..latent * nb)
         .map(|i| qdot::Q8Block {
@@ -1132,8 +964,7 @@ fn hw_q_nope2_cells_bit_identical() {
         .collect();
     assert_cells_bit_identical("alternating ±127", &whead, &acol, &[(0, latent)]);
 
-    // Boundary SHAPES: nb = 1 (nope = 32) and an odd nb = 3, small latents,
-    // first/last single-cell segments.
+    // Boundary shapes: nb = 1, odd nb = 3, small latents, single-cell segments.
     for (latent2, nb2) in [(8usize, 1usize), (5, 3), (1, 1), (33, 2)] {
         let mut rng = Rng(0xD00D_0000_0000 + latent2 as u64 * 100 + nb2 as u64);
         let whead = gen_blocks(&mut rng, latent2 * nb2, 1);
@@ -1146,10 +977,7 @@ fn hw_q_nope2_cells_bit_identical() {
         );
     }
 
-    // One hand-computed absolute value, so the gate does not only check the
-    // kernel against a mirror that could share its bug: w = a = +127 with
-    // d_w = d_a = 1.0 gives isum = 32·127² = 516128 and the cell exactly
-    // (1.0·1.0 as f64)·516128.0 — 516128.0 is exact in f32.
+    // Hand-computed absolute value: w = a = +127, d_w = d_a = 1.0 -> 32*127^2 = 516128.0.
     let whead = [qdot::Q8Block {
         d: 0x3C00,
         q: [127; 32],
@@ -1168,8 +996,7 @@ fn hw_q_nope2_cells_bit_identical() {
     qdot::q_nope2_cells_scalar(&whead, &acol, 0, 1, &mut out);
     assert_eq!(out[0].to_bits(), 516128.0f32.to_bits(), "mirror hand value");
 
-    // The dispatcher the production path calls takes the same bits (on this
-    // box it selects the kernel; the sweep keeps the wiring honest).
+    // Dispatcher matches scalar mirror bit for bit.
     let mut rng = Rng(0xABCD_EF01);
     let whead = gen_blocks(&mut rng, latent * nb, 2);
     let acol = gen_acol(&mut rng, nb);
@@ -1186,10 +1013,7 @@ fn hw_q_nope2_cells_bit_identical() {
     );
 }
 
-/// The dispatcher's shape contract: loud panics, in every form (the pool
-/// callback cannot propagate Results — see the lib's `q_nope2_cells`).
-/// Pure: no ISA, no model. `AssertUnwindSafe` because the closures borrow
-/// `out` mutably — nothing here observes a panic mid-write.
+/// Dispatcher shape contract: panics on out-of-bounds arguments.
 #[test]
 fn q_nope2_cells_rejects_bad_shapes() {
     let whead = [qdot::Q8Block {
@@ -1206,6 +1030,6 @@ fn q_nope2_cells_rejects_bad_shapes() {
     run(5, 4, &mut out).expect_err("j0 > j_end must panic");
     run(0, 5, &mut out).expect_err("j_end past whead must panic");
     run(0, 4, &mut out[..3]).expect_err("short out must panic");
-    // The legal boundary: j_end at the last cell with exactly-sized out.
+    // Legal boundary shape.
     run(0, 4, &mut out).expect("legal shape must not panic");
 }
