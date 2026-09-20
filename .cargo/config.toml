@@ -1,0 +1,5 @@
+# 박스(5975WX, Zen 3)가 유일한 실행 기계다. 기준 x86-64 타깃으로는 스칼라 루프가 SSE2로만
+# 컴파일되고 round_ties_even 같은 것이 libm 호출이 된다. rustc는 mul+add를 FMA로 합치지
+# 않으므로 값은 그대로다 — 비트 게이트 전부가 이 플래그 아래서 돈다.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=znver3"]

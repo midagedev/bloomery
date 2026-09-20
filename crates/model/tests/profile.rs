@@ -162,7 +162,7 @@ fn hw_profile_gate() {
     // should follow it back up. Catch power survives either way: a site the
     // size of `flash_attn_latent` (~4.7% of a step) going dark lands near 93%
     // and fails loud, and new unhooked work up to ~2 ms/step still falls short
-    // of the floor. Anything that pushes this below 97 is new unhooked work,
+    // of the floor. Anything that pushes this below the floor is new unhooked work,
     // which is the thing the gate is for. Do not lower the threshold to make
     // such a run pass; hook the work.
     //
@@ -171,11 +171,16 @@ fn hw_profile_gate() {
     // PIN(2026-09-20): re-baselined 98 -> 97 on the fused wiring — it removed
     // ~14 ms of hooked dequant per step while the step glue stayed fixed, so
     // the 98 floor flickered run to run.
+    // PIN(2026-09-20): 97 -> 96 on `-C target-cpu=znver3`. The dark region did not
+    // grow — 0.59 ms before (19.84 of 20.43), 0.60 ms after (19.2 of 19.8) — the
+    // hooked work under it shrank, and 97.1% became 96.9% four runs out of four.
+    // The dark 0.6 ms is per-step lookups and drops; when those move to load time
+    // this floor goes back up.
     let instrumented = profile::instrumented_ns();
     let pct = instrumented as f64 / wall_ns as f64 * 100.0;
     assert!(
-        instrumented * 100 >= wall_ns * 97,
-        "coverage {pct:.1}% < 97%: an unhooked hot loop is eating the step \
+        instrumented * 100 >= wall_ns * 96,
+        "coverage {pct:.1}% < 96%: an unhooked hot loop is eating the step \
          ({:.1} ms instrumented of {:.1} ms wall)",
         instrumented as f64 / 1e6,
         wall_ns as f64 / 1e6
