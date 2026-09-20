@@ -1,6 +1,7 @@
 //! qdot — the fused quantized row dot for the host CPU: Q3_K x Q8_K,
 //! Q4_K x Q8_2_X4, Q6_K x Q8_2_X4 (MUL-31), Q5_0
-//! x Q8_2_X4 (MUL-32), and Q5_1 x Q8_2_X4 (MUL-34).
+//! x Q8_2_X4 (MUL-32), Q5_1 x Q8_2_X4 (MUL-34), and the Q8_0 x act cell
+//! kernel of the q_nope2 absorption (MUL-38) at the file's end.
 //!
 //! `model::ops::matmul_q` today dequantizes every weight row to f32
 //! (`gguf::quant::dequant_row`), round-trips the activations through the
@@ -2524,4 +2525,285 @@ fn dot_q5f1_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
         x[l] = (acc[l] + acc[4 + l]) + accm[l];
     }
     (x[0] + x[2]) + (x[1] + x[3])
+}
+
+// ------------------------------------------------- Q8_0 x act cells (MUL-38)
+// The q_nope2_absorbed site (model::attn): one output cell is an f64 block
+// sum over `nope/32` blocks of `(f16(w_d) * a_d) as f64 * f64::from(isum)`,
+// where isum is the i32 dot of a Q8_0 weight block's codes against a
+// block_q8_2-convention activation block's codes (model::attn::quantize_act
+// — bf16-valued f32 scale + i8 codes, NOT one of the packed formats above).
+// The MUL-35 ledger put that dot at 11.17 ms CPU per step against 30.08 MB
+// of blocks — a scalar i32 loop at ~2.7 GB/s/core, 16-25% of this crate's
+// other kernels. This section is its AVX2 replacement, in the crate's
+// three-part shape reduced to two, with the reduction's reason written out:
+//
+//   * KERNEL — one maddubs chain per 32-value block, the Q6_K qY sign fold
+//     (`prepare_signed`'s move, the Q6_K section above): the weight
+//     MAGNITUDE becomes maddubs' u8 side (`sign_epi8(w, w)` = |w|) and the
+//     weight SIGN is folded into the ACTIVATION bytes (`sign_epi8(a, w)`),
+//     so `|w| · (a·sign(w)) = w·a` term by term — exact integer arithmetic,
+//     no +128 offset, hence NO compensation sum. The +128 prepare is the
+//     form that works when the u8 side has limited range (Q6_K's codes are
+//     -32..31, so +32 puts the u8 side at <= 63 and pairs peak at
+//     2·63·127 = 16002, inside i16); it does NOT survive this pairing: a
+//     Q8_0 block at +128 has u8 lanes 0..255 against s8 lanes -128..127,
+//     pairs reach ±255·127·2 = ±64770 — past i16 — while the sign fold's
+//     pairs peak at 2·128·127 = 32512 (see the saturation proof below).
+//
+//   * SCALAR MIRROR — the cell loop verbatim from attn.rs (the mission
+//     contract: the current scalar loop stays as the no-AVX2 fallback) and
+//     the gate's comparison mirror.
+//
+//   * no separate EMULATOR. The Q4_K/Q6_K rounds needed an
+//     instruction-graph emulator because their f32 lane trees REORDER
+//     roundings — a hand-derived lane map can be wrong and stay green. This
+//     kernel's only reordering is of INTEGER adds: products w[l]·a[l] lie in
+//     [-127·127, 127·127] and their 32-term sum in [-516128, 516128], well
+//     inside i32, and integer addition is associative and commutative
+//     EXACTLY — every lane tree computes the same i32 as the scalar
+//     ascending loop. The f64 epilogue is not SIMD at all (see the kernel),
+//     so there is no second lane order to emulate. Bit identity between
+//     kernel and mirror is algebra, not a port.
+//
+// THE BIT-IDENTITY CLAIM (this round's core argument, held by
+// `tests/qdot.rs::hw_q_nope2_cells_bit_identical` and, end to end, by the
+// model's exact-zero gates):
+//
+//   1. Per block b, `isum_b = Σ_l w[l]·a[l]` is an exact i32 in any
+//      summation order (bounds above) — the maddubs/hadd/madd tree therefore
+//      reproduces the scalar isum bit for bit.
+//   2. The cell is `Σ_b (half_to_f32(w_d[b]) * a_d[b]) as f64 *
+//      f64::from(isum_b)`, blocks ascending, accumulated in f64 with plain
+//      (non-fused) mul+add — the same expression in the same order the
+//      scalar loop evaluates, so every rounding lands identically.
+//   3. Only one input escapes the identity: an activation code of -128
+//      under a NEGATIVE weight code. `sign_epi8(a, w)` negates a through
+//      8-bit two's complement, and -(-128) wraps to -128, flipping that
+//      term's sign. Weight codes of -128 are fine (|w| = 128 is a legal u8
+//      magnitude and the fold's products stay |<= 128·127 = 16256| per
+//      term). Both producers cannot emit -128 activations:
+//      `model::attn::quantize_act` codes are `v/d` with d a bf16 rounding
+//      of amax/127 and |v| <= amax, so |code| <= 127/(1 - 2^-9)·(1+2^-24)^3
+//      < 127.25, and round-to-nearest-even of anything below 127.5 is at
+//      most 127 (the -128 clamp there is defensive dead code); the same
+//      bound with (1+2^-24)^3 alone covers `quantize_q8_0`'s
+//      id = 127/amax. A debug_assert scans for the excluded pair anyway —
+//      a future producer change should fail loudly in debug, not quietly
+//      flip signs.
+//   4. maddubs i16 saturation is unreachable on ANY i8 x i8 input in the
+//      sign-fold form, let alone the legal domain: a positive pair is at
+//      most 2·128·127 = 32512 (sq is i8 and cannot hold +128, so a
+//      128·128 positive product does not exist), and a negative pair is at
+//      least 2·128·(-128) = -32768 — exactly i16::MIN, representable.
+//      (Q6_K's section derives its own bound, 8128, from its -32..31
+//      codes; this one is the full-i8 statement.)
+
+/// One Q8_0 block over 32 values: f16 scale bits then 32 int8 codes —
+/// ggml's `block_q8_0` layout (34 bytes). Home is qdot (MUL-38): the cell
+/// kernel consumes these, and `model::attn` re-exports the type so
+/// `Derived`'s storage and the gate's `assert_eq!` (field-wise `PartialEq`
+/// — equality here is equality of every value it holds) keep compiling
+/// unchanged. `repr(C)` pins the field order to the file layout the
+/// reference bytes were verified against (2026-09-19, 0 of 69632 differ);
+/// `tests/derived.rs` asserts the 34-byte size.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Q8Block {
+    /// f16 bits of the block scale (convert with `half_to_f32`).
+    pub d: u16,
+    /// The int8 codes, `[-127, 127]` by the producer bound (see section
+    /// header, point 3).
+    pub q: [i8; 32],
+}
+
+/// One quantized activation block in the q_nope2 cell contract: the
+/// bf16-valued scale held as f32 plus 32 int8 codes — ik's small-M
+/// `block_q8_2` CONVENTIONS (scale rounded to bf16, codes from `id = 1/d`)
+/// in a Rust-side layout; not the packed x4 form the K-quant kernels eat.
+/// Codes are `[-127, 127]` by the same producer bound.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ActBlock {
+    /// The bf16-valued block scale as f32 (already rounded; used as-is).
+    pub d: f32,
+    /// The int8 codes.
+    pub q: [i8; 32],
+}
+
+/// The cell-segment kernel behind `q_nope2_absorbed`'s pool split: computes
+/// output cells `j in [j0, j_end)` of ONE column of the (col, j) cell space
+/// — `whead` is the head's weight blocks (`latent * acol.len()` of them,
+/// cell j reading `whead[j*nb .. j*nb+nb]`), `acol` this column's
+/// quantized activation blocks, `out` receives the `j_end - j0` cells in
+/// j order. The f64 block sum, its block order and its expression are the
+/// scalar loop's, exactly (section header, points 1-2); dispatch is AVX2
+/// when the CPU has it, the scalar mirror otherwise — same bits either way.
+///
+/// Panics (not `QdotError`) on shape errors: the caller is a pool callback
+/// that cannot propagate a `Result`, the bounds are the caller's own cell
+/// split, and a panic through the pool is loud (the pool propagates it —
+/// `tests/pool.rs`). A wrong length here would otherwise index another
+/// cell's blocks and keep producing plausible numbers, the same failure
+/// class `check_row` rejects for `dot_row`.
+pub fn q_nope2_cells(
+    whead: &[Q8Block],
+    acol: &[ActBlock],
+    j0: usize,
+    j_end: usize,
+    out: &mut [f32],
+) {
+    assert!(j0 <= j_end, "q_nope2_cells: j0 {j0} > j_end {j_end}");
+    assert!(
+        whead.len() >= j_end * acol.len(),
+        "q_nope2_cells: whead has {} blocks; cells up to j_end {j_end} at {} per cell need {}",
+        whead.len(),
+        acol.len(),
+        j_end * acol.len()
+    );
+    assert!(
+        out.len() >= j_end - j0,
+        "q_nope2_cells: out holds {} cells, segment is {}",
+        out.len(),
+        j_end - j0
+    );
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: AVX2+FMA detected just now; the shape asserts above bound
+        // every index the kernel touches.
+        unsafe { q_nope2_cells_avx2_inner(whead, acol, j0, j_end, out) }
+    } else {
+        q_nope2_cells_scalar(whead, acol, j0, j_end, out);
+    }
+}
+
+/// The scalar mirror: the cell loop verbatim from `q_nope2_absorbed`'s
+/// pre-MUL-38 body, and the crate's no-AVX2 fallback for this pairing.
+/// Bit-identical to the kernel by the integer-exactness argument (section
+/// header) — not by emulation; there is no lane order to reproduce.
+/// Public for the gate's kernel-vs-mirror compare.
+pub fn q_nope2_cells_scalar(
+    whead: &[Q8Block],
+    acol: &[ActBlock],
+    j0: usize,
+    j_end: usize,
+    out: &mut [f32],
+) {
+    let nb = acol.len();
+    for j in j0..j_end {
+        let mut cell = 0.0f64;
+        for (b, ab) in acol.iter().enumerate() {
+            let wb = &whead[j * nb + b];
+            let mut isum = 0i32;
+            for l in 0..32 {
+                isum += wb.q[l] as i32 * ab.q[l] as i32;
+            }
+            cell += (half_to_f32(wb.d) * ab.d) as f64 * f64::from(isum);
+        }
+        out[j - j0] = cell as f32;
+    }
+}
+
+/// The AVX2 kernel behind [`q_nope2_cells`], for the gate's path comparison
+/// (the mirror of [`dot_row_avx2`]). Panics when the CPU lacks AVX2+FMA —
+/// on such a machine there is nothing to compare and the gate wants the
+/// loud failure, not a quiet fallback.
+pub fn q_nope2_cells_avx2(
+    whead: &[Q8Block],
+    acol: &[ActBlock],
+    j0: usize,
+    j_end: usize,
+    out: &mut [f32],
+) {
+    assert!(
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma"),
+        "q_nope2_cells_avx2 called on a CPU without AVX2+FMA"
+    );
+    assert!(j0 <= j_end, "q_nope2_cells_avx2: j0 {j0} > j_end {j_end}");
+    assert!(
+        whead.len() >= j_end * acol.len(),
+        "q_nope2_cells_avx2: whead has {} blocks; cells up to j_end {j_end} at {} per cell need {}",
+        whead.len(),
+        acol.len(),
+        j_end * acol.len()
+    );
+    assert!(
+        out.len() >= j_end - j0,
+        "q_nope2_cells_avx2: out holds {} cells, segment is {}",
+        out.len(),
+        j_end - j0
+    );
+    // SAFETY: asserted just above.
+    unsafe { q_nope2_cells_avx2_inner(whead, acol, j0, j_end, out) }
+}
+
+/// The kernel: one monolithic fn on purpose (the MUL-27 measurement —
+/// helper splits lose 10-13% on this loop shape; the MUL-26 lesson —
+/// missing `target_feature` is not an error and costs tens of times over).
+/// Per 32-value block: sign fold (2 `vpsignb`), one `vpmaddubsw`, one
+/// `vpmaddwd`, two `vphaddd`, two extracts — an exact i32 by the section
+/// header's associativity argument — then the scalar f64 epilogue in the
+/// scalar loop's own order. No FMA instruction appears (the f64 mul+add
+/// must stay two roundings to match the mirror; Rust never contracts
+/// them); `fma` is enabled anyway so the detection and the attribute agree
+/// with the crate's other kernels.
+///
+/// # Safety
+/// The CPU must support AVX2+FMA, and the caller must have validated the
+/// segment bounds: `j_end * acol.len()` weight blocks, all of `acol`, and
+/// `j_end - j0` out cells ([`q_nope2_cells`] asserts all three).
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn q_nope2_cells_avx2_inner(
+    whead: &[Q8Block],
+    acol: &[ActBlock],
+    j0: usize,
+    j_end: usize,
+    out: &mut [f32],
+) {
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let nb = acol.len();
+        for j in j0..j_end {
+            let mut cell = 0.0f64;
+            for b in 0..nb {
+                let wb = &whead[j * nb + b];
+                let ab = &acol[b];
+                // SAFETY: 32-byte unaligned loads inside the 32-byte code
+                // arrays of blocks whose counts the dispatcher asserted.
+                let wv = _mm256_loadu_si256(wb.q.as_ptr() as *const __m256i);
+                let av = _mm256_loadu_si256(ab.q.as_ptr() as *const __m256i);
+                // The qY sign fold: |w| on the u8 side, w's sign folded
+                // into a's bytes. w·a = |w|·(a·sign(w)) term by term; the
+                // -128 activation corner this identity misses is excluded
+                // by the producer bound (section header, point 3).
+                let us = _mm256_sign_epi8(wv, wv);
+                let sq = _mm256_sign_epi8(av, wv);
+                // 16 i16 pair sums, then 8 i32 quads, then the hadd chain —
+                // integer adds, associative, the tree shape is free.
+                let pairs = _mm256_maddubs_epi16(us, sq);
+                let quads = _mm256_madd_epi16(ones, pairs);
+                let h1 = _mm256_hadd_epi32(quads, quads);
+                let h2 = _mm256_hadd_epi32(h1, h1);
+                // Lane 0 holds the low 128-bit half's total, lane 4 the
+                // high half's; their sum is the block's exact i32.
+                let isum = _mm256_extract_epi32(h2, 0) + _mm256_extract_epi32(h2, 4);
+                // Debug-only guard on the one input pair outside the sign
+                // fold's identity (section header, point 3); zero cost in
+                // release, loud in debug if a producer ever changes.
+                #[cfg(debug_assertions)]
+                for l in 0..32 {
+                    debug_assert!(
+                        !(ab.q[l] == -128 && wb.q[l] < 0),
+                        "activation code -128 under a negative weight code: \
+                         outside the sign-fold kernel's contract"
+                    );
+                }
+                // The scalar loop's epilogue, character for character: one
+                // f32 multiply (one rounding), the exact widening to f64,
+                // one f64 multiply and one f64 add per block, blocks
+                // ascending. This line IS the bit-identity contract's step 2.
+                cell += (half_to_f32(wb.d) * ab.d) as f64 * f64::from(isum);
+            }
+            out[j - j0] = cell as f32;
+        }
+    }
 }
