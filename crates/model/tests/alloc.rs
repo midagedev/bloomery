@@ -64,7 +64,13 @@ static ALLOC: Counting = Counting;
 /// KV blocks adds 28. What is left is per-call `Vec`s in `matmul_q_multi`, the
 /// `TensorInfo` views built per expert and per head, and metadata keys formatted per
 /// block — token-independent work that belongs in `Derived`.
-const LIMIT: u64 = 11_600;
+/// PIN(2026-09-20): 11463 -> 1291 / 0.32 MB on the load-time plan round — every
+/// tensor-name find, metadata read, norm-gain decode and per-head/per-expert view
+/// moved into `Derived`, the quantization and flash scratch into per-thread
+/// bucketed pools, and the MoE trace behind an opt-in. What is left: the routing
+/// table's vectors and the per-batch bookkeeping (`ws`/`xs`/`bytes`/`outs`/`pairs`
+/// of a `matmul_q_batch` call), plus the KV row a growing cache owns.
+const LIMIT: u64 = 1_400;
 
 #[test]
 #[ignore = "hw: needs the box and the model file"]
@@ -72,12 +78,22 @@ fn hw_steady_step_allocations_bounded() {
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let mut cache = new_cache(&g).unwrap();
     let derived = model::derived::Derived::new(&g).unwrap();
-    step(&g, &[100000, 549, 6077, 280, 7239, 317], &mut cache, &derived).unwrap();
+    step(
+        &g,
+        &[100000, 549, 6077, 280, 7239, 317],
+        &mut cache,
+        &derived,
+    )
+    .unwrap();
     // Warm steps first: pools fill and the KV blocks grow on their own schedule.
     IS_MAIN.with(|m| m.set(true));
     let mut worst = 0u64;
     for i in 0..8 {
-        let (c0, b0, m0) = (CALLS.load(Relaxed), BYTES.load(Relaxed), MAIN_CALLS.load(Relaxed));
+        let (c0, b0, m0) = (
+            CALLS.load(Relaxed),
+            BYTES.load(Relaxed),
+            MAIN_CALLS.load(Relaxed),
+        );
         step(&g, &[549], &mut cache, &derived).unwrap();
         let (c, b) = (CALLS.load(Relaxed) - c0, BYTES.load(Relaxed) - b0);
         let m = MAIN_CALLS.load(Relaxed) - m0;

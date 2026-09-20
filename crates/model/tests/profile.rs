@@ -176,11 +176,13 @@ fn hw_profile_gate() {
     // hooked work under it shrank, and 97.1% became 96.9% four runs out of four.
     // The dark 0.6 ms is per-step lookups and drops; when those move to load time
     // this floor goes back up.
+    // PIN(2026-09-20): 96 -> 97, as promised above — with the lookups in the
+    // load-time plan the dark region is 0.37–0.39 ms and coverage reads 97.9–98.0%.
     let instrumented = profile::instrumented_ns();
     let pct = instrumented as f64 / wall_ns as f64 * 100.0;
     assert!(
-        instrumented * 100 >= wall_ns * 96,
-        "coverage {pct:.1}% < 96%: an unhooked hot loop is eating the step \
+        instrumented * 100 >= wall_ns * 97,
+        "coverage {pct:.1}% < 97%: an unhooked hot loop is eating the step \
          ({:.1} ms instrumented of {:.1} ms wall)",
         instrumented as f64 / 1e6,
         wall_ns as f64 / 1e6
@@ -193,12 +195,15 @@ fn hw_profile_gate() {
 
     // 3. Every hooked site did something. The list is every site the crate
     // records; a new hook that forgets to fire shows up here by name.
+    // `f32_tensor` left the list when the norm gains moved into the load-time
+    // plan: a decode step no longer reads an f32 tensor from the file, so the
+    // only way the site could fire is dead work the step was told to stop
+    // doing. It still records at load (`Derived::new` decodes the gains).
     for site in [
         "matmul_q",
         "q_nope2_absorbed",
         "embed",
         "rms_norm",
-        "f32_tensor",
         "residual_add",
         "gain",
         "is_moe",
@@ -223,7 +228,7 @@ fn hw_profile_gate() {
             .sum();
         assert!(calls > 0, "site {site} recorded nothing — its hook is dead");
     }
-    eprintln!("sites                                all 21 hooked sites live");
+    eprintln!("sites                                all 20 hooked sites live");
 
     // The table itself, printed whatever the verdict — a coverage number without the
     // rows behind it cannot be acted on.

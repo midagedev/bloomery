@@ -23,11 +23,12 @@
 
 use crate::derived::Derived;
 use crate::kv::KvCache;
-use crate::ops::{f32_tensor, matmul_q, matmul_q_batch, rms_norm};
+use crate::ops::{matmul_q, matmul_q_batch, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo};
+use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -93,7 +94,11 @@ pub fn block_attn_cached(
     let lvl = profile::level();
     let mut params_ns = 0u64;
     let t_p1 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let p = MlaParams::read(gguf, block)?;
+    // The plan holds everything this block's attention reads that the tokens
+    // cannot change: geometry, weight views, the decoded kv_a norm gain.
+    // `Derived::new` already ran `MlaParams::read`'s cross-checks for it.
+    let ap = derived.attn_plan(block)?;
+    let p = &ap.params;
     let slots = q_slots;
     if slots.len() != x.ne1 {
         return Err(ModelError::Shape {
@@ -107,21 +112,20 @@ pub fn block_attn_cached(
     let kv_width = p.latent + p.rope_dims;
 
     // 1. The two projections out of the normed activations.
-    let wq = find(gguf, &format!("blk.{block}.attn_q.weight"))?;
-    let wa = find(gguf, &format!("blk.{block}.attn_kv_a_mqa.weight"))?;
+    let wq = &ap.wq;
+    let wa = &ap.wa;
     if let Some(t_p1) = t_p1 {
         params_ns += t_p1.elapsed().as_nanos() as u64;
     }
     let q = matmul_q(gguf, wq, x)?;
     let kv_rope_compressed = matmul_q(gguf, wa, x)?;
 
-    // 2. Latent norm. The gain is F32 in the file.
+    // 2. Latent norm. The gain is F32 in the file, decoded once at load.
     let t_p2 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let gain_t = find(gguf, &format!("blk.{block}.attn_kv_a_norm.weight"))?;
+    let gain = &ap.kv_a_norm_gain;
     if let Some(t_p2) = t_p2 {
         params_ns += t_p2.elapsed().as_nanos() as u64;
     }
-    let gain = f32_tensor(gguf, gain_t)?;
     let t_lat = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut latent = Tensor2::zeros(p.latent, x.ne1);
     for t in 0..x.ne1 {
@@ -131,24 +135,34 @@ pub fn block_attn_cached(
     if let Some(t_lat) = t_lat {
         profile::record_time("attn_latent", t_lat.elapsed().as_nanos() as u64);
     }
-    let kv_compressed = rms_norm(&latent, &gain, p.eps);
+    let kv_compressed = rms_norm(&latent, gain, p.eps);
 
     // 3. Rope: one cos/sin cache per position, shared by every head; k_rope from the
-    //    kv_a tail, q_rope from each q head's rope slice.
+    //    kv_a tail, q_rope from each q head's rope slice. The cache buffers are
+    //    per-thread and recycled: the values are position-dependent, the storage
+    //    is not, and every element is rewritten before it is read.
     let t_rope = if lvl > 0 { Some(Instant::now()) } else { None };
-    let caches: Vec<Vec<f32>> = slots.iter().map(|s| p.rope.cache(s.pos)).collect();
     let mut k_rope = Tensor2::zeros(p.rope_dims, x.ne1);
     let mut q_rope = Tensor2::zeros(p.rope_dims, p.n_head * x.ne1);
-    for t in 0..x.ne1 {
-        let cache = &caches[t];
-        let ksrc = &kv_rope_compressed.data[t * kv_width + p.latent..(t + 1) * kv_width];
-        rope_pair(ksrc, k_rope.col_mut(t), cache);
-        for h in 0..p.n_head {
-            let base = t * q.ne0 + h * p.kq_head + p.nope;
-            let qsrc = &q.data[base..base + p.rope_dims];
-            rope_pair(qsrc, q_rope.col_mut(t * p.n_head + h), cache);
+    ROPE_BUFS.with(|pool| {
+        let mut bufs = pool.borrow_mut();
+        if bufs.len() < x.ne1 {
+            bufs.resize_with(x.ne1, || vec![0.0f32; p.rope.n_dims]);
         }
-    }
+        for (t, s) in slots.iter().enumerate() {
+            p.rope.cache_into(s.pos, &mut bufs[t]);
+        }
+        for t in 0..x.ne1 {
+            let cache = &bufs[t];
+            let ksrc = &kv_rope_compressed.data[t * kv_width + p.latent..(t + 1) * kv_width];
+            rope_pair(ksrc, k_rope.col_mut(t), cache);
+            for h in 0..p.n_head {
+                let base = t * q.ne0 + h * p.kq_head + p.nope;
+                let qsrc = &q.data[base..base + p.rope_dims];
+                rope_pair(qsrc, q_rope.col_mut(t * p.n_head + h), cache);
+            }
+        }
+    });
     if let Some(t_rope) = t_rope {
         profile::record_time("attn_rope", t_rope.elapsed().as_nanos() as u64);
     }
@@ -181,11 +195,11 @@ pub fn block_attn_cached(
     //    lives in `Derived`; `block` (the model's) selects the derived weights —
     //    never `cache_block`, which is 0 on the scratch path.
     let t_p3 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let wkb = find(gguf, &format!("blk.{block}.attn_kv_b.weight"))?;
+    let v_up_views = &ap.v_up_views;
     if let Some(t_p3) = t_p3 {
         params_ns += t_p3.elapsed().as_nanos() as u64;
     }
-    let q_nope2 = q_nope2_absorbed(derived.wk_b_all_heads(block)?, &q, &p)?;
+    let q_nope2 = q_nope2_absorbed(derived.wk_b_all_heads(block)?, &q, p)?;
 
     // 7. Attention over the latent.
     let kqv_compressed = flash_attn_latent(
@@ -194,13 +208,13 @@ pub fn block_attn_cached(
         cache.keys(cache_block),
         cache.slots(),
         slots,
-        &p,
+        p,
     );
 
     // 8. wv_b (still Q3_K) per head, then the output projection.
-    let kqv_2d = wv_b_heads(gguf, wkb, &kqv_compressed, &p)?;
+    let kqv_2d = wv_b_heads_with(gguf, v_up_views, &kqv_compressed, p)?;
     let t_p4 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let wo = find(gguf, &format!("blk.{block}.attn_output.weight"))?;
+    let wo = &ap.wo;
     if let Some(t_p4) = t_p4 {
         params_ns += t_p4.elapsed().as_nanos() as u64;
     }
@@ -229,6 +243,7 @@ fn find<'a>(gguf: &'a Gguf, name: &str) -> Result<&'a TensorInfo, ModelError> {
 // --------------------------------------------------------------------- rope
 
 /// Everything rope needs, with the YaRN constants the graph passes: `beta_fast = 32.0f`, `beta_slow = 1.0f`, `ext_factor = attn_factor = 1.0f` (llama-graph.cpp call-site constants, not in the file).
+#[derive(Clone)]
 pub struct RopeParams {
     pub n_dims: usize,
     pub freq_base: f32,
@@ -262,16 +277,26 @@ impl RopeParams {
     /// cos/sin cache for one position: `[cos0, sin0, …]` per pair.
     /// `ggml_rope_cache_init` (ggml.c:20813): theta is a running product (× `theta_scale` per pair), hence a loop, not `powi`; `sin_sign = +1`, so the multiply by it is skipped as the no-op it is.
     pub fn cache(&self, pos: u32) -> Vec<f32> {
-        let npairs = self.n_dims / 2;
         let mut out = vec![0.0f32; self.n_dims];
+        self.cache_into(pos, &mut out);
+        out
+    }
+
+    /// [`cache`](RopeParams::cache) into caller storage — the same op order, so
+    /// a recycled buffer and a fresh one hold the same bytes.
+    pub fn cache_into(&self, pos: u32, dst: &mut Vec<f32>) {
+        let npairs = self.n_dims / 2;
+        if dst.len() != self.n_dims {
+            dst.clear();
+            dst.resize(self.n_dims, 0.0);
+        }
         let mut theta = pos as f32;
         for i in 0..npairs {
             let (c, s) = self.yarn(theta, 2 * i);
-            out[2 * i] = c;
-            out[2 * i + 1] = s;
+            dst[2 * i] = c;
+            dst[2 * i + 1] = s;
             theta *= self.theta_scale;
         }
-        out
     }
 
     /// `rope_yarn` (ggml.c:20794). `i0` is the *dim* loop variable (steps of 2); the ramp compares `i0/2` — the pair index — against `corr_dims`.
@@ -305,9 +330,18 @@ fn rope_pair(src: &[f32], dst: &mut [f32], cache: &[f32]) {
     }
 }
 
+thread_local! {
+    /// Per-thread rope cos/sin buffers, recycled across calls: the values are
+    /// recomputed for the position every call (the fill covers the whole row —
+    /// rope dims are even, `MlaParams::read` checks it), only the storage is
+    /// reused. One outer buffer per token of the batch.
+    static ROPE_BUFS: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) };
+}
+
 // -------------------------------------------------------------- parameters
 
 /// The block's geometry and scalars, all read from the file (never literals), with the derived relations cross-checked so a differently-shaped MLA file fails loudly.
+#[derive(Clone)]
 pub struct MlaParams {
     pub n_head: usize,
     /// qk head dim = nope + rope.
@@ -545,6 +579,19 @@ fn quantize_act(x: &[f32]) -> ActBlock {
     ActBlock { d, q }
 }
 
+thread_local! {
+    /// Per-thread recycled scratch for the pool dispatches: the (h, t)
+    /// activation blocks and the gather on the caller thread, one cell/row
+    /// buffer set per worker. Each dispatch rewrites what it reads; the
+    /// buffers only ever grow, never shrink.
+    static QALL: RefCell<Vec<ActBlock>> = const { RefCell::new(Vec::new()) };
+    static CELL_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// The flash row kernel's query row and V accumulator, one pair per worker
+    /// thread — sliced to the exact `d_head`/`latent` the row kernels index.
+    static FLASH_QROW: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static FLASH_R: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
 /// `q_nope2 = wk_b(Q8_0)ᵀ · q_nope` per head — the weight-absorption step.
 ///
 /// `wk_b` is not in the file: the reference derives it at load (`llm_prepare_mla`,
@@ -589,7 +636,12 @@ pub fn q_nope2_absorbed(
     // straddling a chunk boundary must not be quantized twice. Deterministic, so the
     // shared column-major `qall` is byte-identical to a per-(h, t) quant.
     let t_qa = if lvl >= 2 { Some(Instant::now()) } else { None };
-    let mut qall: Vec<ActBlock> = Vec::with_capacity(p.n_head * q.ne1 * nblocks);
+    // Recycled across calls: the quantized (h, t) blocks are per-step values in
+    // stable storage — the same capacity serves every block of a run. Held for
+    // the whole call on this thread; pool workers read it by shared reference.
+    let mut qall = QALL.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    qall.clear();
+    qall.reserve(p.n_head * q.ne1 * nblocks);
     for h in 0..p.n_head {
         for t in 0..q.ne1 {
             let qbase = t * q.ne0 + h * p.kq_head;
@@ -615,13 +667,23 @@ pub fn q_nope2_absorbed(
     let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
     let latent = p.latent;
     let ne1 = q.ne1;
-    let collected: profile::ChunkSlots<profile::CallAcc> = profile::ChunkSlots::new();
+    // Only a profiled dispatch pays for the chunk collector; the cell loop
+    // cannot fail, so an unprofiled one needs no error channel either.
+    let collected = if lvl > 0 {
+        Some(profile::ChunkSlots::<profile::CallAcc>::new())
+    } else {
+        None
+    };
     threads::pool().for_each_chunk(p.n_head * ne1 * latent, |cells| {
         let mut acc = profile::CallAcc::new();
         // Per-worker scratch: qdot's kernel writes a segment's cells here, then they
         // go to `out` via `SharedOut::write` (the `&Sync` capture); one latent-wide
-        // run per column segment.
-        let mut cellbuf = vec![0.0f32; latent];
+        // run per column segment. Thread-local and recycled — every pool thread
+        // survives many dispatches.
+        let mut cellbuf = CELL_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if cellbuf.len() < latent {
+            cellbuf.resize(latent, 0.0);
+        }
         // Walk column-segment-wise: a chunk may start and end mid-column, so each
         // iteration takes the intersection of the remaining chunk and one column —
         // `whead`/`qcol` fetched once per segment.
@@ -651,8 +713,9 @@ pub fn q_nope2_absorbed(
             // so the next segment starts at the column base + j_end.
             c = col * latent + j_end;
         }
+        CELL_BUF.with(|c| *c.borrow_mut() = cellbuf);
         // Only a profiled chunk has anything to report.
-        if lvl > 0 {
+        if let Some(collected) = &collected {
             collected.push(acc);
         }
     });
@@ -661,9 +724,12 @@ pub fn q_nope2_absorbed(
     // fold is addition, no error precedence to keep (the shape check fired before
     // the dispatch; the cell loop cannot fail).
     let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
-    for acc in collected.into_vec() {
-        pacc.add_acc(&acc);
+    if let Some(collected) = collected {
+        for acc in collected.into_vec() {
+            pacc.add_acc(&acc);
+        }
     }
+    QALL.with(|c| *c.borrow_mut() = qall);
     if let Some(t_gather) = t_gather {
         pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
     }
@@ -931,27 +997,39 @@ fn flash_attn_latent_impl(
     let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
     let latent = p.latent;
     threads::pool().for_each_chunk(n_tokens * p.n_head, |rows| {
-        // Per-worker scratch: the caller's stack buffers, one set per participant,
-        // sized exactly as the serial version had them.
-        let mut qrow = vec![0.0f32; d_head];
-        let mut r = vec![0.0f32; latent];
+        // Per-worker scratch, one set per participant, sized exactly as the
+        // serial version had them — recycled across dispatches. The exact-length
+        // slices are load-bearing: the row kernels walk the whole `qrow` slice
+        // against `d_head`-wide key rows.
+        let mut qrow_buf = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if qrow_buf.len() < d_head {
+            qrow_buf.resize(d_head, 0.0);
+        }
+        if r_buf.len() < latent {
+            r_buf.resize(latent, 0.0);
+        }
+        let qrow = &mut qrow_buf[..d_head];
+        let r = &mut r_buf[..latent];
         let mut w = [0.0f32; 32];
         for row in rows {
             if simd {
                 // SAFETY: `flash_simd` checked ISA and panel shapes; the row-width assert above and the scratch sizing complete the contract.
                 unsafe {
                     flash_row_avx2(
-                        q_rope, q_nope2, keys16, key_slots, q_slots, p, n_tokens, row, &mut qrow,
-                        &mut r, &mut w, &out_ptr,
+                        q_rope, q_nope2, keys16, key_slots, q_slots, p, n_tokens, row, qrow, r,
+                        &mut w, &out_ptr,
                     )
                 };
             } else {
                 flash_row_scalar(
-                    q_rope, q_nope2, keys16, key_slots, q_slots, p, n_tokens, row, &mut qrow,
-                    &mut r, &mut w, &out_ptr,
+                    q_rope, q_nope2, keys16, key_slots, q_slots, p, n_tokens, row, qrow, r, &mut w,
+                    &out_ptr,
                 );
             }
         }
+        FLASH_QROW.with(|c| *c.borrow_mut() = qrow_buf);
+        FLASH_R.with(|c| *c.borrow_mut() = r_buf);
     });
     if let Some(t_call) = t_call {
         let acc = profile::CallAcc::new();
@@ -1221,6 +1299,38 @@ pub fn wv_b_heads(
     kqv_compressed: &Tensor2,
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
+    let views = v_up_views(wkb, p);
+    wv_b_heads_with(gguf, &views, kqv_compressed, p)
+}
+
+/// The per-head v_up views of `attn_kv_b` — the views `ggml_view_3d` takes, as
+/// file offsets. One owner of the geometry: `Derived::new` builds these once per
+/// block, and the direct-call path above builds them per call. Pure function of
+/// the tensor info and the geometry — no error path.
+pub(crate) fn v_up_views(wkb: &TensorInfo, p: &MlaParams) -> Vec<TensorInfo> {
+    let row_bytes =
+        wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
+    (0..p.n_head)
+        .map(|h| TensorInfo {
+            name: format!("{}.v_up.head{h}", wkb.name),
+            dims: vec![p.latent as u64, p.v_head as u64],
+            ty: wkb.ty,
+            offset: wkb.offset + ((h * (p.nope + p.v_head) + p.nope) * row_bytes) as u64,
+            nbytes: wkb.ty.type_size().unwrap()
+                * (p.latent / wkb.ty.blck_size().unwrap() as usize) as u64
+                * p.v_head as u64,
+        })
+        .collect()
+}
+
+/// The `wv_b` gather-matmul-scatter over prebuilt views — the step path, which
+/// takes the views from [`Derived`](crate::derived::Derived).
+pub fn wv_b_heads_with(
+    gguf: &Gguf,
+    views: &[TensorInfo],
+    kqv_compressed: &Tensor2,
+    p: &MlaParams,
+) -> Result<Tensor2, ModelError> {
     // Profiler hook: SELF time — the whole call minus what its one hooked
     // `matmul_q_batch` child recorded (`profile::site_ns_total`): the gather, view
     // builds and scatter. Per-piece timers would measure the timer (a piece is a
@@ -1232,8 +1342,6 @@ pub fn wv_b_heads(
     } else {
         0
     };
-    let row_bytes =
-        wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
     // kqv_compressed interleaves heads as t·n_head+h; a column count not a multiple
     // of n_head would truncate n_tokens and read another head's tokens silently.
     assert!(
@@ -1248,21 +1356,11 @@ pub fn wv_b_heads(
     let mut xhs: Vec<Tensor2> = (0..p.n_head)
         .map(|_| Tensor2::zeros(p.latent, n_tokens))
         .collect();
-    let mut views: Vec<TensorInfo> = Vec::with_capacity(p.n_head);
     for h in 0..p.n_head {
         for t in 0..n_tokens {
             let src = kqv_compressed.col(t * p.n_head + h);
             xhs[h].col_mut(t).copy_from_slice(src);
         }
-        views.push(TensorInfo {
-            name: format!("{}.v_up.head{h}", wkb.name),
-            dims: vec![p.latent as u64, p.v_head as u64],
-            ty: wkb.ty,
-            offset: wkb.offset + ((h * (p.nope + p.v_head) + p.nope) * row_bytes) as u64,
-            nbytes: wkb.ty.type_size().unwrap()
-                * (p.latent / wkb.ty.blck_size().unwrap() as usize) as u64
-                * p.v_head as u64,
-        });
     }
     let ws: Vec<&TensorInfo> = views.iter().collect();
     let xs: Vec<&Tensor2> = xhs.iter().collect();

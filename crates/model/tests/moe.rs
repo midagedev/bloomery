@@ -33,6 +33,7 @@ fn hw_moe_router_exact() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let x = moe_input(&o);
+    moe::set_trace_enabled(true);
 
     let b = moe::route(&g, 1, &x).unwrap();
     let tr = moe::last_trace().expect("route must leave a trace");
@@ -115,6 +116,7 @@ fn hw_moe_forward_matches_ggml() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let x = moe_input(&o);
+    moe::set_trace_enabled(true);
 
     let out = moe::moe_ffn(&g, 1, &x).unwrap();
     let tr = moe::last_trace().expect("moe_ffn must leave a trace");
@@ -174,6 +176,7 @@ fn hw_moe_touches_only_routed_experts() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let x = moe_input(&o);
+    moe::set_trace_enabled(true);
 
     moe::moe_ffn(&g, 1, &x).unwrap();
     let tr = moe::last_trace().expect("moe_ffn must leave a trace");

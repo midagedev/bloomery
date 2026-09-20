@@ -21,11 +21,23 @@
 //! that trade starts to matter.
 use crate::derived::Derived;
 use crate::kv::KvCache;
-use crate::ops::{Tensor2, f32_tensor, rms_norm};
+use crate::ops::{Tensor2, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot};
 use gguf::{Gguf, TensorInfo, dequant_row};
 use std::time::Instant;
+
+/// Time a plan lookup under `site` when profiling is on. The lookup sites the
+/// step used to pay file scans for still owe the coverage table a row; near
+/// zero is that row saying the cost moved to load time, not that the site died.
+fn timed<T>(site: &'static str, lvl: u8, f: impl FnOnce() -> T) -> T {
+    let t = if lvl > 0 { Some(Instant::now()) } else { None };
+    let v = f();
+    if let Some(t) = t {
+        profile::record_time(site, t.elapsed().as_nanos() as u64);
+    }
+    v
+}
 
 /// Every block's residual output, kept for the gate. `l_out[b]` is the oracle's
 /// `l_out-<b>`; `logits` is `result_output`, one column for the sampled position.
@@ -45,15 +57,23 @@ pub struct ForwardTrace {
 /// The row is dequantized, not converted: `token_embd.weight` is Q3_K in this file and
 /// the 1-1 gate proved our Q3_K dequant is bit-identical to ggml's `to_float`, so this
 /// lookup is expected to match the oracle **exactly**, not within a tolerance.
+///
+/// Resolves the table per call — the direct-call path; a step hands the view
+/// from [`Derived`](crate::derived::Derived) to [`embed_with`] instead.
 pub fn embed(gguf: &Gguf, tokens: &[u32]) -> Result<Tensor2, ModelError> {
+    let w = gguf
+        .find("token_embd.weight")
+        .ok_or_else(|| ModelError::MissingTensor("token_embd.weight".into()))?;
+    embed_with(gguf, w, tokens)
+}
+
+/// The embedding lookup over an already-resolved table view — the step path.
+pub fn embed_with(gguf: &Gguf, w: &TensorInfo, tokens: &[u32]) -> Result<Tensor2, ModelError> {
     // Profiler hook (crate::profile): the whole lookup is weight dequant, so the
     // level-2 split has one stage and it is `dequant_w`.
     let lvl = profile::level();
     let mut pacc = profile::CallAcc::new();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let w = gguf
-        .find("token_embd.weight")
-        .ok_or_else(|| ModelError::MissingTensor("token_embd.weight".into()))?;
     let embd = w.dims[0] as usize;
     let vocab = w.dims[1] as usize;
     let bytes = gguf.data(w)?;
@@ -92,83 +112,46 @@ pub fn embed(gguf: &Gguf, tokens: &[u32]) -> Result<Tensor2, ModelError> {
     Ok(out)
 }
 
-/// Whether block `b` routes to experts. Decided by the file, the same way `ffn.rs`
-/// decides between the dense and the shared-expert trio: presence, never a block
-/// number. A V2-Lite file has one dense block and the V4.1 files ahead have three.
-fn is_moe(gguf: &Gguf, b: usize) -> bool {
-    // Profiler hook (crate::profile): the deciding `find` is a linear scan of
-    // the tensor table (377 tensors in this file), paid per block per step.
-    // Level-1 only, typeless: no weight is read, only looked for.
-    let lvl = profile::level();
-    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let routed = gguf.find(&format!("blk.{b}.ffn_gate_inp.weight")).is_some();
-    if let Some(t_call) = t_call {
-        profile::record_time("is_moe", t_call.elapsed().as_nanos() as u64);
-    }
-    routed
-}
-
-/// The architecture-wide rms epsilon, from the file. The same key `head.rs` reads; the
-/// 1e-4 gates on every `attn_norm-N` are the proof that it is the right one.
-fn rms_eps(gguf: &Gguf) -> f32 {
+/// The architecture-wide rms epsilon, from the file. The same key `head.rs`'s
+/// plan reads; the 1e-4 gates on every `attn_norm-N` are the proof that it is
+/// the right one.
+pub(crate) fn rms_eps(gguf: &Gguf) -> f32 {
     gguf.architecture()
         .and_then(|a| gguf.value(&format!("{a}.attention.layer_norm_rms_epsilon")))
         .and_then(gguf::Value::as_f32)
         .expect("rms eps must come from the file, never from a literal")
 }
 
-fn gain(gguf: &Gguf, name: &str) -> Result<Vec<f32>, ModelError> {
-    // Profiler hook (crate::profile): SELF time — the whole call minus what the
-    // hooked `f32_tensor` child recorded (see `profile::site_ns_total`), which
-    // leaves the `find`: a linear scan over the file's tensor table, paid twice
-    // per block per step for the two norm gains.
-    let lvl = profile::level();
-    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let f32_before = if lvl > 0 {
-        profile::site_ns_total("f32_tensor")
-    } else {
-        0
-    };
-    let t: &TensorInfo = gguf
-        .find(name)
-        .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
-    let v = f32_tensor(gguf, t);
-    if let Some(t_call) = t_call {
-        let child = profile::site_ns_total("f32_tensor") - f32_before;
-        let self_ns = (t_call.elapsed().as_nanos() as u64).saturating_sub(child);
-        profile::record_time("gain", self_ns);
-    }
-    v
-}
-
 /// One transformer block against a KV cache: `l_out-(b-1)` in, `l_out-b` out.
 ///
 /// Identical to [`block`] except that attention reads the cache instead of only the
 /// batch. `block` is the shim now — it builds a cache holding exactly its batch.
-#[allow(clippy::too_many_arguments)]
+/// Every weight, gain and flag comes from `derived`'s plan.
 pub fn block_cached(
     gguf: &Gguf,
     b: usize,
     x: &Tensor2,
     q_slots: &[Slot],
-    eps: f32,
     cache: &mut KvCache,
     range: &std::ops::Range<usize>,
     derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
-    let attn_gain = gain(gguf, &format!("blk.{b}.attn_norm.weight"))?;
-    let normed = rms_norm(x, &attn_gain, eps);
+    let lvl = profile::level();
+    let bp = derived.block_plan(b)?;
+    let attn_gain = timed("gain", lvl, || &bp.attn_gain);
+    let normed = rms_norm(x, attn_gain, derived.plan().eps);
     let kqv_out =
         crate::attn::block_attn_cached(gguf, b, &normed, q_slots, cache, b, range, derived)?
             .kqv_out;
     let ffn_inp = add(x, &kqv_out);
 
-    let ffn_gain = gain(gguf, &format!("blk.{b}.ffn_norm.weight"))?;
-    let ffn_normed = rms_norm(&ffn_inp, &ffn_gain, eps);
-    let ffn_out = if is_moe(gguf, b) {
-        crate::moe::moe_ffn(gguf, b, &ffn_normed)?
+    let ffn_gain = timed("gain", lvl, || &bp.ffn_gain);
+    let ffn_normed = rms_norm(&ffn_inp, ffn_gain, derived.plan().eps);
+    let ffn_out = if timed("is_moe", lvl, || bp.routed) {
+        crate::moe::moe_ffn_with(gguf, bp.moe()?, &ffn_normed)?
     } else {
-        crate::ffn::dense_ffn(gguf, b, &ffn_normed)?
+        let (gate_w, up_w, down_w) = timed("ffn_weights", lvl, || bp.dense());
+        crate::ffn::dense_ffn_with(gguf, gate_w, up_w, down_w, &ffn_normed)?
     };
     Ok(add(&ffn_inp, &ffn_out))
 }
@@ -177,26 +160,28 @@ pub fn block_cached(
 ///
 /// `attn_norm → attention → residual → ffn_norm → (dense | moe) → residual`, which is
 /// `build_deepseek2`'s block verbatim. The intermediate after the first add is the
-/// oracle's `ffn_inp-N`.
+/// oracle's `ffn_inp-N`. Weights and gains come from `derived`'s plan.
 pub fn block(
     gguf: &Gguf,
     b: usize,
     x: &Tensor2,
     slots: &[Slot],
-    eps: f32,
     derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
-    let attn_gain = gain(gguf, &format!("blk.{b}.attn_norm.weight"))?;
-    let normed = rms_norm(x, &attn_gain, eps);
+    let lvl = profile::level();
+    let bp = derived.block_plan(b)?;
+    let attn_gain = timed("gain", lvl, || &bp.attn_gain);
+    let normed = rms_norm(x, attn_gain, derived.plan().eps);
     let kqv_out = crate::attn::block_attn(gguf, b, &normed, slots, derived)?;
     let ffn_inp = add(x, &kqv_out);
 
-    let ffn_gain = gain(gguf, &format!("blk.{b}.ffn_norm.weight"))?;
-    let ffn_normed = rms_norm(&ffn_inp, &ffn_gain, eps);
-    let ffn_out = if is_moe(gguf, b) {
-        crate::moe::moe_ffn(gguf, b, &ffn_normed)?
+    let ffn_gain = timed("gain", lvl, || &bp.ffn_gain);
+    let ffn_normed = rms_norm(&ffn_inp, ffn_gain, derived.plan().eps);
+    let ffn_out = if timed("is_moe", lvl, || bp.routed) {
+        crate::moe::moe_ffn_with(gguf, bp.moe()?, &ffn_normed)?
     } else {
-        crate::ffn::dense_ffn(gguf, b, &ffn_normed)?
+        let (gate_w, up_w, down_w) = timed("ffn_weights", lvl, || bp.dense());
+        crate::ffn::dense_ffn_with(gguf, gate_w, up_w, down_w, &ffn_normed)?
     };
     Ok(add(&ffn_inp, &ffn_out))
 }
@@ -248,17 +233,16 @@ pub fn forward_trace(gguf: &Gguf, tokens: &[u32]) -> Result<ForwardTrace, ModelE
         .block_count()
         .ok_or_else(|| ModelError::MissingTensor("metadata key block_count".into()))?
         as usize;
-    let eps = rms_eps(gguf);
     let slots: Vec<Slot> = (0..tokens.len() as u32)
         .map(|pos| Slot { seq: 0, pos })
         .collect();
     let derived = Derived::new(gguf)?;
 
-    let inp_embd = embed(gguf, tokens)?;
+    let inp_embd = embed_with(gguf, &derived.plan().embed, tokens)?;
     let mut x = inp_embd.clone();
     let mut l_out = Vec::with_capacity(n_block);
     for b in 0..n_block {
-        x = block(gguf, b, &x, &slots, eps, &derived)?;
+        x = block(gguf, b, &x, &slots, &derived)?;
         l_out.push(x.clone());
     }
 
@@ -266,7 +250,7 @@ pub fn forward_trace(gguf: &Gguf, tokens: &[u32]) -> Result<ForwardTrace, ModelE
     // here instead of before the last block's FFN.
     let last = tokens.len() - 1;
     let tail = Tensor2::from_vec(x.ne0, 1, x.col(last).to_vec());
-    let logits = crate::head::head(gguf, &tail)?;
+    let logits = crate::head::head_with(gguf, &derived.plan().head, &tail)?;
     Ok(ForwardTrace {
         inp_embd,
         l_out,
@@ -315,15 +299,16 @@ pub fn new_cache(gguf: &Gguf) -> Result<KvCache, ModelError> {
 /// `derived` is the weight side of the step — built once per model (by the caller,
 /// right after open) and shared by every step against this `gguf`. The cache is the
 /// sequence side; the two are passed separately because they are cleared for
-/// different reasons (see `derived`'s module doc).
+/// different reasons (see `derived`'s module doc). The plan inside must come from
+/// this `gguf` — `step` checks that before it reads a byte.
 pub fn step(
     gguf: &Gguf,
     tokens: &[u32],
     cache: &mut KvCache,
     derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
+    derived.plan().check_origin(gguf)?;
     let n_block = cache.n_block();
-    let eps = rms_eps(gguf);
     let base = cache.next_pos(0);
     let slots: Vec<Slot> = (0..tokens.len() as u32)
         .map(|i| Slot {
@@ -333,11 +318,11 @@ pub fn step(
         .collect();
     let range = cache.begin(&slots);
 
-    let mut x = embed(gguf, tokens)?;
+    let mut x = embed_with(gguf, &derived.plan().embed, tokens)?;
     for b in 0..n_block {
-        x = block_cached(gguf, b, &x, &slots, eps, cache, &range, derived)?;
+        x = block_cached(gguf, b, &x, &slots, cache, &range, derived)?;
     }
     let last = tokens.len() - 1;
     let tail = Tensor2::from_vec(x.ne0, 1, x.col(last).to_vec());
-    crate::head::head(gguf, &tail)
+    crate::head::head_with(gguf, &derived.plan().head, &tail)
 }

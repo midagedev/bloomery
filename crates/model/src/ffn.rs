@@ -22,7 +22,7 @@ use std::time::Instant;
 /// dense trio. In this file the two are mutually exclusive per block, so the
 /// preference never triggers — it exists so a file with both stays deterministic
 /// instead of silently ambiguous. A missing tensor reports its exact name.
-fn ffn_weights(
+pub(crate) fn ffn_weights(
     gguf: &Gguf,
     block: usize,
 ) -> Result<(&TensorInfo, &TensorInfo, &TensorInfo), ModelError> {
@@ -113,9 +113,23 @@ pub fn dense_ffn_up_gate(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tenso
 /// `ffn_out-N` (block 0) or its shared-expert output `ffn_shexp-N` (MoE blocks).
 ///
 /// Activations stay `[ne0, n_tokens]` throughout — batch first class, M = 1 the
-/// special case.
+/// special case. Resolves the trio per call — the direct-call path; a decode
+/// step hands the trio from [`Derived`](crate::derived::Derived) to
+/// [`dense_ffn_with`] instead.
 pub fn dense_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelError> {
     let (gate_w, up_w, down_w) = ffn_weights(gguf, block)?;
+    dense_ffn_with(gguf, gate_w, up_w, down_w, x)
+}
+
+/// One dense-shaped FFN over an already-resolved trio — the step path, which
+/// takes the tensors from [`Derived`](crate::derived::Derived).
+pub fn dense_ffn_with(
+    gguf: &Gguf,
+    gate_w: &TensorInfo,
+    up_w: &TensorInfo,
+    down_w: &TensorInfo,
+    x: &Tensor2,
+) -> Result<Tensor2, ModelError> {
     let h = up_gate_with(gguf, gate_w, up_w, x)?;
     matmul_q(gguf, down_w, &h)
 }

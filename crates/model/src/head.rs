@@ -9,38 +9,63 @@
 use crate::ops::{f32_tensor, matmul_q, rms_norm};
 use crate::profile;
 use crate::{ModelError, Tensor2};
-use gguf::Gguf;
+use gguf::{Gguf, TensorInfo};
 use std::time::Instant;
+
+/// The head's load-time state: the architecture-wide eps, the decoded
+/// `output_norm.weight` gain and the `output.weight` view — everything a step
+/// re-read from the file before this existed. Built once per file by
+/// `Derived::new` and per call by [`head`].
+pub struct HeadPlan {
+    pub(crate) eps: f32,
+    pub(crate) gain: Vec<f32>,
+    pub(crate) out_w: TensorInfo,
+}
+
+impl HeadPlan {
+    pub fn new(gguf: &Gguf) -> Result<HeadPlan, ModelError> {
+        // deepseek2 carries one architecture-wide rms eps; the file has no separate
+        // final-norm key. The 1e-4 gate on `result_norm` is the numeric proof that
+        // this key is the one the final norm runs with.
+        let eps = crate::forward::rms_eps(gguf);
+        let norm_t = gguf
+            .find("output_norm.weight")
+            .ok_or_else(|| ModelError::MissingTensor("output_norm.weight".into()))?;
+        let gain = f32_tensor(gguf, norm_t)?;
+        let out_w = gguf
+            .find("output.weight")
+            .ok_or_else(|| ModelError::MissingTensor("output.weight".into()))?
+            .clone();
+        Ok(HeadPlan { eps, gain, out_w })
+    }
+}
 
 /// Returns the logits for every token position; the oracle only holds the last one.
 ///
 /// `x` is the final block's output `[embd, n_tokens]`; the result is
 /// `[vocab, n_tokens]`, where the vocab axis is `output.weight`'s own width — the
 /// gate checks it against `deepseek2.vocab_size` from the file, never a literal.
+///
+/// Resolves the head plan per call — the direct-call path; a decode step hands
+/// the plan from [`Derived`](crate::derived::Derived) to [`head_with`].
 pub fn head(gguf: &Gguf, x: &Tensor2) -> Result<Tensor2, ModelError> {
+    let plan = HeadPlan::new(gguf)?;
+    head_with(gguf, &plan, x)
+}
+
+/// The head over a load-time plan — the step path.
+pub fn head_with(gguf: &Gguf, plan: &HeadPlan, x: &Tensor2) -> Result<Tensor2, ModelError> {
     // Profiler hook (crate::profile), coverage round: `head_params` covers the
-    // eps lookup and the two tensor finds — linear metadata/tensor-table scans
-    // rerun every step. The norm itself records under `rms_norm`, the gain read
-    // under `f32_tensor`, the projection under `matmul_q`.
+    // plan resolution that the eps lookup and the two tensor finds used to be.
+    // The norm itself records under `rms_norm`, the projection under `matmul_q`.
     let lvl = profile::level();
     let mut params_ns = 0u64;
     let t_p1 = if lvl > 0 { Some(Instant::now()) } else { None };
-    // deepseek2 carries one architecture-wide rms eps; the file has no separate
-    // final-norm key. The 1e-4 gate on `result_norm` is the numeric proof that
-    // this key is the one the final norm runs with.
-    let eps = gguf
-        .architecture()
-        .and_then(|a| gguf.value(&format!("{a}.attention.layer_norm_rms_epsilon")))
-        .and_then(gguf::Value::as_f32)
-        .expect("rms eps must come from the file, never from a literal");
-
-    let norm_t = gguf
-        .find("output_norm.weight")
-        .ok_or_else(|| ModelError::MissingTensor("output_norm.weight".into()))?;
+    let eps = plan.eps;
+    let gain = &plan.gain;
     if let Some(t_p1) = t_p1 {
         params_ns += t_p1.elapsed().as_nanos() as u64;
     }
-    let gain = f32_tensor(gguf, norm_t)?;
 
     if x.ne0 != gain.len() {
         return Err(ModelError::Shape {
@@ -52,12 +77,10 @@ pub fn head(gguf: &Gguf, x: &Tensor2) -> Result<Tensor2, ModelError> {
         });
     }
 
-    let normed = rms_norm(x, &gain, eps);
+    let normed = rms_norm(x, gain, eps);
 
     let t_p2 = if lvl > 0 { Some(Instant::now()) } else { None };
-    let out_t = gguf
-        .find("output.weight")
-        .ok_or_else(|| ModelError::MissingTensor("output.weight".into()))?;
+    let out_t = &plan.out_w;
     if let Some(t_p2) = t_p2 {
         params_ns += t_p2.elapsed().as_nanos() as u64;
     }
