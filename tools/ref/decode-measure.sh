@@ -96,3 +96,13 @@ echo "=== ik_llama.cpp, same file, same lease, CPU only ==="
 witness pre-ik
 CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2
 witness post-ik
+
+# 기본 플래그의 ik는 ik의 천장이 아니다. 2026-09-21에 같은 임대에서 다섯 조합을 쟀고
+# (기본 82.66 / -fmoe 82.22 / -rtr 83.77 / -fmoe -rtr 84.03 / 아래 조합 84.55 tok/s)
+# 가장 빠른 조합을 같은 임대 안에서 한 번 더 잰다 — "넘었다"는 말은 이 행을 상대로만 한다.
+echo
+echo "=== ik_llama.cpp, fastest measured flags (${IK_BEST_FLAGS:=-mla 3 -fa 1 -fmoe 1 -rtr 1}) ==="
+witness pre-ik-best
+# shellcheck disable=SC2086
+CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2 $IK_BEST_FLAGS
+witness post-ik-best
