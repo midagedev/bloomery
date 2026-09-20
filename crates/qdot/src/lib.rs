@@ -172,13 +172,18 @@ impl std::error::Error for QdotError {}
 // ------------------------------------------------------------ public API
 
 /// Whether the fused path handles this weight type on this machine: the type
-/// is in this build's table AND the CPU has the ISA the kernel needs.
+/// is in this build's table AND the CPU has the ISA the kernel needs —
+/// [`has_features`] owns that per-type table (Q3_K: avx2; Q4_K/Q6_K:
+/// avx2+fma; Q5_0/Q5_1: avx2+fma+f16c), so it cannot drift against the
+/// kernels' `#[target_feature]` sets.
 ///
 /// The kernel's widest instructions are AVX2 (`vpmaddubsw`/`vpmaddwd` chains
-/// — the box is Zen 3: AVX2/FMA3/F16C/BMI2, no AVX-512, no VNNI). FMA is not
-/// used (the f32 scaling is plain multiplies, so the scalar mirror can match
-/// bit for bit) and the f16 read is an integer conversion, so `avx2` alone
-/// is the Q3_K/Q4_K requirement. Q5_0 (MUL-32) adds F16C for its WEIGHT
+/// — the box is Zen 3: AVX2/FMA3/F16C/BMI2, no AVX-512, no VNNI). Q3_K
+/// needs avx2 alone: its f32 scaling is plain multiplies (so the scalar
+/// mirror can match bit for bit) and its f16 read is an integer conversion.
+/// The Q4_K and Q6_K kernels additionally fuse (`_mm256_fmadd_ps`, which the
+/// mirrors reproduce with `f32::mul_add`), so FMA is part of their
+/// requirement. Q5_0 (MUL-32) and Q5_1 (MUL-34) add F16C for their WEIGHT
 /// scales (`_mm_cvtph_ps`, ik's own instruction there — measured 8.0 vs
 /// 13.2 GB/s against the branchy scalar conversion); every AVX2 machine
 /// carries F16C, `dot_row` detects it anyway, and the scalar mirror serves
@@ -213,7 +218,37 @@ pub fn supports(w: GgmlType) -> bool {
     matches!(
         w,
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K
-    ) && std::arch::is_x86_feature_detected!("avx2")
+    ) && has_features(w)
+}
+
+/// The per-type ISA table, the single owner of what each fused kernel's
+/// `#[target_feature]` set needs at runtime — Q3_K: avx2
+/// (`dot_q3k_q8k_avx2`); Q4_K/Q6_K: avx2+fma (`dot_q4k_q82x4_avx2`,
+/// `dot_q6k_q82x4_avx2`); Q5_0/Q5_1: avx2+fma+f16c (`dot_q5f0_q82x4_avx2`,
+/// `dot_q5f1_q82x4_avx2`). [`supports`], `dot_row`'s dispatch and
+/// `dot_row_avx2`'s assert all read this one fn: a safe pub fn reaching a
+/// `target_feature` fn whose features were not detected is UB, and the table
+/// is the one place that can drift against the attributes (2026-09-20
+/// hardening round — `supports` used to admit Q4_K/Q6_K on avx2-without-fma,
+/// which is exactly that UB).
+fn has_features(w: GgmlType) -> bool {
+    match w {
+        // dot_q3k_q8k_avx2: enable = "avx2"
+        GgmlType::Q3_K => std::arch::is_x86_feature_detected!("avx2"),
+        // dot_q4k_q82x4_avx2 / dot_q6k_q82x4_avx2: enable = "avx2", "fma"
+        GgmlType::Q4_K | GgmlType::Q6_K => {
+            std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+        }
+        // dot_q5f0_q82x4_avx2 / dot_q5f1_q82x4_avx2:
+        // enable = "avx2", "fma", "f16c"
+        GgmlType::Q5_0 | GgmlType::Q5_1 => {
+            std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+                && std::arch::is_x86_feature_detected!("f16c")
+        }
+        _ => false,
+    }
 }
 
 /// The `k` contract of `w`'s fused path: `k` must be a multiple of the
@@ -348,15 +383,10 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
 /// two agree bit for bit (gate 4).
 pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
-    let avx2 =
-        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
-    // Q5_0/Q5_1's kernel additionally converts the weight scales with F16C
-    // (`_mm_cvtph_ps`, see the kernels' Safety notes) — detected, and the
-    // scalar mirror takes the type when it is absent.
-    let hw = match w {
-        GgmlType::Q5_0 | GgmlType::Q5_1 => avx2 && std::arch::is_x86_feature_detected!("f16c"),
-        _ => avx2,
-    };
+    // The single-owner ISA table: Q3_K avx2; Q4_K/Q6_K +fma (`_mm256_fmadd_ps`);
+    // Q5_0/Q5_1 +f16c (the `_mm_cvtph_ps` scale gather, see the kernels'
+    // Safety notes). Whatever the table rejects takes the scalar mirror.
+    let hw = has_features(w);
     match (w, hw) {
         (GgmlType::Q3_K, true) => {
             // SAFETY: AVX2 was just detected; lengths validated by check_row.
@@ -409,16 +439,16 @@ fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 }
 
 /// The AVX2 kernel behind [`dot_row`], for the gate's path comparison
-/// (gate 4). Panics when the CPU has no AVX2 — on such a machine there is
-/// nothing to compare against and the caller (a gate) wants the loud
-/// failure, not a quiet fall back.
+/// (gate 4). Panics when the CPU lacks the type's kernel ISA — [`has_features`]'s
+/// table: avx2 for Q3_K, +fma for Q4_K/Q6_K, +f16c for Q5_0/Q5_1 — on such a
+/// machine there is nothing to compare against and the caller (a gate) wants
+/// the loud failure, not a quiet fall back.
 pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, QdotError> {
     let nb = check_row(w, wrow.len(), acol.len(), k)?;
     assert!(
-        std::arch::is_x86_feature_detected!("avx2")
-            && (w != GgmlType::Q5_0 && w != GgmlType::Q5_1
-                || std::arch::is_x86_feature_detected!("f16c")),
-        "dot_row_avx2 called on a CPU without the kernel's ISA"
+        has_features(w),
+        "dot_row_avx2 called on a CPU without the kernel's ISA \
+         (avx2; +fma for Q4_K/Q6_K; +f16c for Q5_0/Q5_1)"
     );
     match w {
         GgmlType::Q4_K => {
@@ -460,36 +490,19 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
     if !k.is_multiple_of(gran) {
         return Err(QdotError::UnalignedK { k, gran });
     }
-    let (nb, need_w, need_a) = match w {
-        GgmlType::Q6_K => {
-            let nb = k / 256;
-            (nb, nb * Q6K_BLOCK, nb * 2 * Q82X4_STRIDE)
-        }
-        GgmlType::Q5_0 => {
-            let nb = k / 32;
-            (
-                nb,
-                nb * Q5F0_BLOCK,
-                (k / 128) * Q82X4_STRIDE + ((k % 128) / 32) * Q82_BLOCK,
-            )
-        }
-        GgmlType::Q5_1 => {
-            let nb = k / 32;
-            (
-                nb,
-                nb * Q5F1_BLOCK,
-                (k / 128) * Q82X4_STRIDE + ((k % 128) / 32) * Q82_BLOCK,
-            )
-        }
-        GgmlType::Q4_K => {
-            let nb = k / 256;
-            (nb, nb * Q4K_BLOCK, nb * 2 * Q82X4_STRIDE)
-        }
-        _ => {
-            let nb = k / 256;
-            (nb, nb * Q3K_BLOCK, nb * Q8K_STRIDE)
-        }
+    // The activation byte length is `col_bytes`'s, not a second arithmetic:
+    // per type the hand form was Q3_K (k/256)·296, Q4_K/Q6_K (k/256)·288 =
+    // (k/128)·144, Q5_0/Q5_1 the same tail expression `col_bytes` carries —
+    // equal for every type, so the one owner (col_bytes) is the only copy
+    // (verified equal per type in the 2026-09-20 hardening round).
+    let (nb, need_w) = match w {
+        GgmlType::Q6_K => (k / 256, (k / 256) * Q6K_BLOCK),
+        GgmlType::Q5_0 => (k / 32, (k / 32) * Q5F0_BLOCK),
+        GgmlType::Q5_1 => (k / 32, (k / 32) * Q5F1_BLOCK),
+        GgmlType::Q4_K => (k / 256, (k / 256) * Q4K_BLOCK),
+        _ => (k / 256, (k / 256) * Q3K_BLOCK),
     };
+    let need_a = col_bytes(w, k);
     if wrow_len < need_w {
         return Err(QdotError::ShortWeightRow {
             have: wrow_len,
@@ -1039,7 +1052,17 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 /// q4_K kernel: the reduction ORDER is load-bearing — the scalar mirror
 /// repeats exactly this sequence, because f32 addition is not associative
 /// and bit identity of the two paths is the gate.
-#[inline]
+///
+/// `#[inline(always)]` to match the crate's other intrinsic helpers
+/// (`hsum_i32`, `field_dot`, `q5x_codes`): this was already inlined in
+/// today's release binary (`nm` verified), and the attribute makes that a
+/// guarantee instead of an optimizer decision (2026-09-20 hardening round).
+///
+/// # Safety
+/// AVX must be available (and SSE3 for `_mm_movehdup_ps`); every caller is
+/// the body of a `#[target_feature(enable = "avx2", …)]` kernel, which
+/// covers both.
+#[inline(always)]
 unsafe fn hsum_float_8(x: __m256) -> f32 {
     unsafe {
         let mut res = _mm256_extractf128_ps(x, 1);
@@ -1875,6 +1898,14 @@ unsafe fn q5x_codes<const QH_OFF: usize, const QS_OFF: usize>(
 /// path (`AccumT<MinusType1, 1, is_multiple_of_4>`, the 0.25-spread min
 /// correction included).
 ///
+/// TWIN of [`dot_q5f1_q82x4_avx2`] — the same template with four
+/// differences only: block width (22 vs 24), the `q5x_codes` offsets (qh
+/// @2/qs @6 vs @4/@8), the scale gather (four d's through one
+/// `_mm_cvtph_ps` vs the (d,m) pair shuffle), and the tail min correction
+/// (-16·d_w vs the stored m_w). Every edit outside those four must be made
+/// in both. Do NOT merge them — measured: helper splits cost 10-13% on
+/// these loops (MUL-27).
+///
 /// # Safety
 /// The CPU must support AVX2+FMA+F16C, and the caller must have validated
 /// lengths: `wrow` at nb*22 readable bytes, `acol` at
@@ -2281,6 +2312,14 @@ fn dot_q5f0_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 /// groups) and tail path (the remainder blocks) both live — the model's
 /// only Q5_1 site exercises the tail (k = 10944: 85 groups + 2 blocks).
 ///
+/// TWIN of [`dot_q5f0_q82x4_avx2`] — the same template with four
+/// differences only: block width (24 vs 22), the `q5x_codes` offsets (qh
+/// @4/qs @8 vs @2/@6), the scale gather (the (d,m) pair shuffle through one
+/// `_mm256_cvtph_ps` vs four d's), and the tail min correction (the stored
+/// m_w vs -16·d_w). Every edit outside those four must be made in both. Do
+/// NOT merge them — measured: helper splits cost 10-13% on these loops
+/// (MUL-27).
+///
 /// # Safety
 /// The CPU must support AVX2+FMA+F16C, and the caller must have validated
 /// lengths: `wrow` at nb*24 readable bytes, `acol` at
@@ -2586,11 +2625,15 @@ fn dot_q5f1_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 //      `model::attn::quantize_act` codes are `v/d` with d a bf16 rounding
 //      of amax/127 and |v| <= amax, so |code| <= 127/(1 - 2^-9)·(1+2^-24)^3
 //      < 127.25, and round-to-nearest-even of anything below 127.5 is at
-//      most 127 (the -128 clamp there is defensive dead code); the same
-//      bound with (1+2^-24)^3 alone covers `quantize_q8_0`'s
-//      id = 127/amax. A debug_assert scans for the excluded pair anyway —
-//      a future producer change should fail loudly in debug, not quietly
-//      flip signs.
+//      most 127 — the producer's clamp is -127 and ENFORCED there since
+//      2026-09-20 (the old -128 clamp was defensive dead code; the bound
+//      means it never engaged, so tightening it is bit-identical by
+//      derivation and the gates prove it end to end); the same bound with
+//      (1+2^-24)^3 alone covers `quantize_q8_0`'s id = 127/amax (its clamp
+//      stays -128: a WEIGHT code of -128 is a legal u8 magnitude for the
+//      fold, only the activation side is excluded). A debug_assert scans
+//      for the excluded pair anyway — a future producer change should fail
+//      loudly in debug, not quietly flip signs.
 //   4. maddubs i16 saturation is unreachable on ANY i8 x i8 input in the
 //      sign-fold form, let alone the legal domain: a positive pair is at
 //      most 2·128·127 = 32512 (sq is i8 and cannot hold +128, so a
