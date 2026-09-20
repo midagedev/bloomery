@@ -538,6 +538,29 @@ fn shexp_ffn(
     matmul_q(gguf, shexp_down, &par)
 }
 
+/// Debug lever: with `BLOOMERY_EXPERT_LOG=<path>` every `moe_ffn` call appends
+/// `block<TAB>n_tokens<TAB>id,id,...` (ids in `{n_used, n_tokens}` order). Off:
+/// one `OnceLock` read. It answers "which experts would k tokens share".
+fn log_experts(block: usize, n_tokens: usize, ids: &[i32]) {
+    use std::io::Write;
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let path = std::env::var_os("BLOOMERY_EXPERT_LOG")?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("BLOOMERY_EXPERT_LOG must be writable");
+        Some(std::sync::Mutex::new(file))
+    });
+    if let Some(file) = log {
+        let ids: Vec<String> = ids.iter().map(i32::to_string).collect();
+        let mut file = file.lock().expect("expert log poisoned");
+        writeln!(file, "{block}\t{n_tokens}\t{}", ids.join(",")).expect("expert log write");
+    }
+}
+
 /// The MoE FFN: `ffn_norm-N` in, `ffn_out-N` out — routed experts plus shared experts.
 ///
 /// Routed half: route, then one gate+up dispatch for every routed expert, one
@@ -568,6 +591,7 @@ pub fn moe_ffn(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Tensor2, ModelE
     }
 
     let (buckets, sel) = route_inner(gguf, block, x, &meta)?;
+    log_experts(block, n_tokens, &sel.ids);
 
     let t_trace1 = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut sums = RoutedSums {
