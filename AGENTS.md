@@ -161,6 +161,21 @@ first suspect is a hung gate on the box, not the agent.
   skips startup, not teardown — cut the report with `--time`, or the
   `munmap` of the populated mapping reads as step cost. Use `-e cpu-clock`
   (the default IBS event misattributes symbols on this CPU).
+- **Price a serial cost with a doubling probe, not a perf percentage.** A
+  detached worktree, a one-line patch that runs the suspect work twice, `just
+  build-decode` there, then `just ab-decode <that-tree>`: the slowdown is the
+  work's cost per step (a lower bound — the second run is cache-warm). perf put
+  caller-side quantization at 14–15 % of the main thread twice; the probe
+  priced it at 1.3 %. Do this before spending a round on the item.
+- **The line to beat is the reference at its fastest flags, measured
+  interleaved.** `decode-measure.sh` runs ik twice (default, and
+  `IK_BEST_FLAGS`); a difference under 1 % is only claimable from
+  `BLOOMERY_AB_IK=1 just ab-decode` rounds, never from one headline.
+- **Matching the reference's sum order can be faster and exact at once.** The
+  F32 router dot and `rms_norm` were scalar "to keep the bits"; the reference
+  sums in lanes (`dot_f32`) and in f64 (`sum_sq_f64`), and porting that order
+  took both to max|diff| 0 against the oracle. Read the reference kernel before
+  assuming SIMD opens a gate.
 - `rust-toolchain.toml` at the root pins the nightly; it moves only when the
   cuda-oxide pin moves. `cuda-oxide` itself is pinned by `rev` in
   `[workspace.dependencies]`; `just deny` fails if that ever floats.
