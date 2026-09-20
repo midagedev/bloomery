@@ -50,6 +50,7 @@
 
 use gguf::GgmlType;
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, OnceLock};
 
 /// One accumulator row per (call site, weight type). `GgmlType` is part of the key
@@ -68,6 +69,8 @@ struct Acc {
     ns_dequant_w: u64,
     ns_dot: u64,
     ns_gather: u64,
+    ns_span: u64,
+    ns_slowest: u64,
 }
 
 static LEVEL: OnceLock<u8> = OnceLock::new();
@@ -100,6 +103,12 @@ pub struct CallAcc {
     /// Level 2 only — the site's wall minus quant/dequant/dot/gather is what
     /// the pool protocol and chunk-arrival skew cost.
     ns_gather: u64,
+    /// Profiled runs — the row dispatch's wall (`for_each_chunk` call to return)
+    /// and, inside it, the busiest chunk's own time. `span − slowest` is what the
+    /// barrier itself costs; `slowest − dot/threads` is chunk skew. The two
+    /// answer "is a dispatch slow because of the pool or because one worker is".
+    ns_span: u64,
+    ns_slowest: u64,
 }
 
 impl CallAcc {
@@ -123,6 +132,11 @@ impl CallAcc {
         self.ns_gather += ns;
     }
 
+    pub fn add_span(&mut self, span_ns: u64, slowest_ns: u64) {
+        self.ns_span += span_ns;
+        self.ns_slowest += slowest_ns;
+    }
+
     /// Fold a finished worker accumulator into this one. The row-parallel sites
     /// build one `CallAcc` per pool chunk and merge them after the join, so
     /// [`record`] still fires exactly once per call and the accumulator mutex
@@ -132,6 +146,8 @@ impl CallAcc {
         self.ns_dequant_w += other.ns_dequant_w;
         self.ns_dot += other.ns_dot;
         self.ns_gather += other.ns_gather;
+        self.ns_span += other.ns_span;
+        self.ns_slowest += other.ns_slowest;
     }
 }
 
@@ -161,6 +177,8 @@ pub fn record(
     e.ns_dequant_w += acc.ns_dequant_w;
     e.ns_dot += acc.ns_dot;
     e.ns_gather += acc.ns_gather;
+    e.ns_span += acc.ns_span;
+    e.ns_slowest += acc.ns_slowest;
 }
 
 /// The typeless sibling of [`record`]: a site that reads no weight matrix of its
@@ -199,6 +217,20 @@ pub fn site_ns_total(site: &str) -> u64 {
 /// report and the decode loop so the two tables do not mix work.
 pub fn reset() {
     ACCS.lock().expect("profiler accumulator mutex").clear();
+    for c in &CHUNK_BUSY {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Level 2: row-dispatch busy time per chunk index (chunk `i` is worker `i`'s, the
+/// last is the caller's). A flat line means skew is noise; a slope or a step at a
+/// CCD boundary means it is the machine, and a weighted split would buy it back.
+static CHUNK_BUSY: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+pub(crate) fn add_chunk_busy(idx: usize, ns: u64) {
+    if let Some(c) = CHUNK_BUSY.get(idx) {
+        c.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Typed row for the gate. The gate asserts on calls and coverage; parsing the
@@ -254,7 +286,7 @@ pub fn report(wall_ns: u64, label: &str) -> String {
     );
     if lvl >= 2 {
         out.push_str(&format!(
-            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10} {:>10} {:>10}\n",
+            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
             "site",
             "ty",
             "calls",
@@ -265,12 +297,14 @@ pub fn report(wall_ns: u64, label: &str) -> String {
             "quant ms",
             "dequant ms",
             "dot ms",
-            "gather ms"
+            "gather ms",
+            "span ms",
+            "slowest ms"
         ));
     } else {
         out.push_str(&format!(
-            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7}\n",
-            "site", "ty", "calls", "rows", "weight MB", "ms", "% wall"
+            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10}\n",
+            "site", "ty", "calls", "rows", "weight MB", "ms", "% wall", "span ms", "slowest ms"
         ));
     }
     for ((site, ty), a) in rows {
@@ -298,16 +332,17 @@ pub fn report(wall_ns: u64, label: &str) -> String {
         );
         if lvl >= 2 {
             out.push_str(&format!(
-                "{} {} {} {} {}\n",
+                "{} {} {} {} {} {} {}\n",
                 base,
                 ms(a.ns_quant_act),
                 ms(a.ns_dequant_w),
                 ms(a.ns_dot),
-                ms(a.ns_gather)
+                ms(a.ns_gather),
+                ms(a.ns_span),
+                ms(a.ns_slowest)
             ));
         } else {
-            out.push_str(&base);
-            out.push('\n');
+            out.push_str(&format!("{} {} {}\n", base, ms(a.ns_span), ms(a.ns_slowest)));
         }
     }
     let instrumented: u64 = map.values().map(|a| a.ns_total).sum();
@@ -322,6 +357,25 @@ pub fn report(wall_ns: u64, label: &str) -> String {
         wall_ns as f64 / 1e6,
         coverage
     ));
+    {
+        let busy: Vec<u64> = CHUNK_BUSY
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        let n = busy.iter().rposition(|&b| b > 0).map_or(0, |i| i + 1);
+        if n > 0 {
+            let mean = busy[..n].iter().sum::<u64>() as f64 / n as f64;
+            out.push_str(&format!(
+                "row dispatches: mean chunk busy {} ms in total — compare the sum of `slowest ms`\n",
+                ms(mean as u64).trim()
+            ));
+            out.push_str("chunk busy / mean, by chunk index:");
+            for b in &busy[..n] {
+                out.push_str(&format!(" {:.2}", *b as f64 / mean));
+            }
+            out.push('\n');
+        }
+    }
     if lvl >= 2 {
         out.push_str(
             "level 2: the stage split calls Instant::now() twice per row — timer tax \

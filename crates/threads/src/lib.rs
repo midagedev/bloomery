@@ -491,7 +491,7 @@ pub fn chunks(n: usize, threads: usize) -> Vec<Range<usize>> {
 
 /// Chunk `t` of `threads` over `0..n`: the first `n % threads` chunks are one
 /// element longer than the rest.
-fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
+pub fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
     assert!(t < threads);
     let base = n / threads;
     let rem = n % threads;

@@ -283,6 +283,8 @@ thread_local! {
 /// `out` via `out_ptr`; crosses threads in one mutex take per chunk.
 struct RowChunk {
     start: usize,
+    /// The chunk's own wall, profiled runs only.
+    busy_ns: u64,
     acc: profile::CallAcc,
     err: Option<crate::ModelError>,
 }
@@ -817,6 +819,22 @@ fn build_pair_work<'a>(
         .collect()
 }
 
+/// One lane of a row dispatch: the next unclaimed row and the lane's end, on
+/// its own cache line so an owner's claims do not fight its neighbours'.
+#[repr(align(64))]
+struct Lane {
+    next: std::sync::atomic::AtomicUsize,
+    end: usize,
+}
+const MAX_LANES: usize = 64;
+fn steal_enabled() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("BLOOMERY_STEAL").map_or(true, |v| v != "0"))
+}
+/// Blocks a lane is cut into, and the smallest block worth a claim.
+const STEAL_BLOCKS: usize = 4;
+const STEAL_MIN_ROWS: usize = 8;
+
 /// The unprofiled dispatch's error channel: no chunk collector, no
 /// allocation — a clean chunk touches nothing, and the mutex only locks when
 /// an error exists. The winning error is the lowest failing row's, exactly
@@ -878,24 +896,79 @@ fn run_row_pool(
         None
     };
     let gate = ErrGate::new();
+    let t_span = if lvl >= 1 { Some(Instant::now()) } else { None };
+    // Lanes: the pool's own static split, one cursor each. A participant walks
+    // its home lane front to back in blocks, then takes blocks off the front of
+    // whatever lanes are still unfinished. The slowest chunk of a dispatch runs
+    // 20–40 % over the mean and which chunk that is changes every dispatch, so
+    // the barrier waits on noise; the tail is the only part worth sharing, and
+    // the owner still streams its rows contiguously. A row's value does not
+    // depend on who computes it.
+    let nlanes = threads::pool().threads();
+    let lanes: [Lane; MAX_LANES] = std::array::from_fn(|t| {
+        let (start, end) = if t < nlanes {
+            threads::chunk_bounds(total_rows, nlanes, t)
+        } else {
+            (0, 0)
+        };
+        Lane {
+            next: std::sync::atomic::AtomicUsize::new(start),
+            end,
+        }
+    });
+    assert!(nlanes <= MAX_LANES, "row pool lanes: {nlanes} threads");
+    // `BLOOMERY_STEAL=0` is the A/B lever: whole-lane blocks, home lane only.
+    let steal = steal_enabled();
+    let block = if steal {
+        (total_rows / nlanes / STEAL_BLOCKS).max(STEAL_MIN_ROWS)
+    } else {
+        total_rows.max(1)
+    };
     threads::pool().for_each_chunk(total_rows, |rows| {
+        let t_busy = if lvl >= 1 { Some(Instant::now()) } else { None };
         let mut chunk = RowChunk {
             start: rows.start,
+            busy_ns: 0,
             acc: profile::CallAcc::new(),
             err: None,
         };
-        let mut gr = rows.start;
-        while gr < rows.end {
-            let p = gr / n;
-            let sub_end = rows.end.min((p + 1) * n);
-            let r0 = gr - p * n;
-            if let Err(e) =
-                pairs[p].compute_rows(ty, k, n, r0..r0 + (sub_end - gr), lvl, &mut chunk.acc)
-            {
-                chunk.err = Some(e);
-                break;
+        let home = (0..nlanes)
+            .find(|&t| !rows.is_empty() && threads::chunk_bounds(total_rows, nlanes, t).0 == rows.start)
+            .unwrap_or(0);
+        'lanes: for off in 0..if steal { nlanes } else { 1 } {
+            let lane = &lanes[(home + off) % nlanes];
+            loop {
+                // A cheap look first: a finished lane costs a read, not a write.
+                if lane.next.load(std::sync::atomic::Ordering::Relaxed) >= lane.end {
+                    break;
+                }
+                let from = lane.next.fetch_add(block, std::sync::atomic::Ordering::Relaxed);
+                if from >= lane.end {
+                    break;
+                }
+                let to = lane.end.min(from + block);
+                let mut gr = from;
+                while gr < to {
+                    let p = gr / n;
+                    let sub_end = to.min((p + 1) * n);
+                    let r0 = gr - p * n;
+                    if let Err(e) = pairs[p].compute_rows(
+                        ty,
+                        k,
+                        n,
+                        r0..r0 + (sub_end - gr),
+                        lvl,
+                        &mut chunk.acc,
+                    ) {
+                        chunk.err = Some(e);
+                        break 'lanes;
+                    }
+                    gr = sub_end;
+                }
             }
-            gr = sub_end;
+        }
+        if let Some(t_busy) = t_busy {
+            chunk.busy_ns = t_busy.elapsed().as_nanos() as u64;
         }
         // A clean unprofiled chunk has nothing to report.
         if let Some(collected) = &collected {
@@ -905,6 +978,7 @@ fn run_row_pool(
         }
     });
 
+    let span_ns = t_span.map(|t| t.elapsed().as_nanos() as u64);
     if let Some(collected) = collected {
         // Arrival order is nondeterministic; sorting by `start` keeps the first
         // error the lowest failing row's, as a sequential `?` would return.
@@ -916,6 +990,14 @@ fn run_row_pool(
         }
         for c in &chunks {
             pacc.add_acc(&c.acc);
+        }
+        if lvl >= 1 {
+            for (i, c) in chunks.iter().enumerate() {
+                profile::add_chunk_busy(i, c.busy_ns);
+            }
+        }
+        if let Some(span_ns) = span_ns {
+            pacc.add_span(span_ns, chunks.iter().map(|c| c.busy_ns).max().unwrap_or(0));
         }
         if let Some(t_gather) = t_gather {
             pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
