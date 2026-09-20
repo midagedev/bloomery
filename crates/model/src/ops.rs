@@ -171,7 +171,7 @@ enum QuantCols {
 /// The impls carry no new safety — they point at the argument documented at
 /// the construction site (disjoint cells by the row split, published by the
 /// pool's completion protocol), which is what makes sharing the pointer sound.
-struct SharedOut(*mut f32);
+pub(crate) struct SharedOut(pub(crate) *mut f32);
 // SAFETY: see the struct doc — the pointer is only dereferenced under the
 // disjoint-cell and join-ordering argument at its construction site.
 unsafe impl Send for SharedOut {}
@@ -189,7 +189,7 @@ impl SharedOut {
     /// `idx` must name a cell inside the caller's own row range of the split
     /// `threads::chunks` produced — the construction-site comment owns the
     /// full argument.
-    unsafe fn write(&self, idx: usize, v: f32) {
+    pub(crate) unsafe fn write(&self, idx: usize, v: f32) {
         // SAFETY: the caller guarantees the disjointness contract above.
         unsafe { *self.0.add(idx) = v };
     }

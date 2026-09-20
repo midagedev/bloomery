@@ -820,11 +820,33 @@ pub fn flash_attn_latent(
     let d_head = p.rope_dims + p.latent;
     let mut out = Tensor2::zeros(p.latent, n_tokens * p.n_head);
 
-    let mut qrow = vec![0.0f32; d_head];
-    let mut r = vec![0.0f32; p.latent];
-    let mut w = [0.0f32; 32];
-    for t in 0..n_tokens {
-        for h in 0..p.n_head {
+    // MUL-29: the (token, head) query rows are fully independent — each one
+    // walks the KV cache and writes its own contiguous `latent`-wide slice of
+    // `out`, so the row space splits on the pool with the same argument
+    // matmul_q rides (MUL-23). At short ctx this site was 10 ms/step and at
+    // average ctx 53 it was 73.8 ms — 42 % of the step (measured, level 1,
+    // N=96) — all of it serial on the caller thread while the pool idled
+    // through the attention section.
+    //
+    // SAFETY (construction site): every participant computes rows of the
+    // (t, h) space inside its own chunk and writes only cells
+    // `row * latent .. (row + 1) * latent` of `out.data` — one contiguous
+    // disjoint slice per row, so no two participants alias. The pool's
+    // completion protocol publishes the writes before this function reads
+    // `out`, the same ordering that publishes the matmul job slot. The
+    // per-row arithmetic is untouched: `tests/mt.rs` holds the whole claim as
+    // a byte compare across thread counts.
+    let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
+    let latent = p.latent;
+    threads::pool().for_each_chunk(n_tokens * p.n_head, |rows| {
+        // Per-worker scratch: the caller's stack buffers became one set per
+        // participant. Sized exactly as the serial version had them.
+        let mut qrow = vec![0.0f32; d_head];
+        let mut r = vec![0.0f32; latent];
+        let mut w = [0.0f32; 32];
+        for row in rows {
+            let t = row / p.n_head;
+            let h = row % p.n_head;
             // The FA row: [q_rope ; q_nope2], F32, never rounded.
             qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
             qrow[p.rope_dims..].copy_from_slice(q_nope2.col(h * n_tokens + t));
@@ -886,19 +908,20 @@ pub fn flash_attn_latent(
                         continue; // masked lane: fma(V, 0, R) == R exactly
                     }
                     let krow = &keys16[blk + l];
-                    for d in 0..p.latent {
+                    for d in 0..latent {
                         r[d] = half_to_f32(krow[p.rope_dims + d]).mul_add(w[l], r[d]);
                     }
                 }
             }
 
             let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
-            let dst = out.col_mut(t * p.n_head + h);
             for (d, &v) in r.iter().enumerate() {
-                dst[d] = s_inv * v;
+                // SAFETY: cell `row * latent + d` belongs to this row alone —
+                // see the construction-site comment above.
+                unsafe { out_ptr.write(row * latent + d, s_inv * v) };
             }
         }
-    }
+    });
     if let Some(t_call) = t_call {
         let acc = profile::CallAcc::new();
         profile::record(

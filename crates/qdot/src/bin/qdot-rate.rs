@@ -35,7 +35,9 @@ fn main() {
     for c in w.chunks_exact_mut(8) {
         c.copy_from_slice(&next().to_le_bytes());
     }
-    let col: Vec<f32> = (0..k).map(|i| (((i as i64 % 31) as f32) - 15.0) / 16.0).collect();
+    let col: Vec<f32> = (0..k)
+        .map(|i| (((i as i64 % 31) as f32) - 15.0) / 16.0)
+        .collect();
     let cb = qdot::col_bytes(gguf::GgmlType::Q3_K, k);
     let mut acol = vec![0u8; cb];
     qdot::quantize_col(gguf::GgmlType::Q3_K, &col, &mut acol);
