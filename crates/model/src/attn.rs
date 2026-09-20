@@ -1091,7 +1091,9 @@ fn flash_row_scalar(
             }
             // TWIN: flash_row_avx2 — every edit outside the two marked
             // regions must be made in both. (This is the kq dot region; the
-            // scalar form is the bit-exact oracle.)
+            // scalar form is the bit-exact oracle. The AVX2 twin also
+            // prefetches the next KV row inside this region — a cache hint
+            // touches no value, so it has no scalar counterpart.)
             let kq = kq_dot_fa4(qrow, &keys16[u]);
             *sl = p.kq_scale * kq;
             smax = smax.max(*sl);
@@ -1216,6 +1218,20 @@ unsafe fn flash_row_avx2(
                 // TWIN: flash_row_scalar — every edit outside the two marked
                 // regions must be made in both. (This is the kq dot region;
                 // only the sum order may differ from the scalar oracle.)
+                // Each key row is its own heap Vec, so the hardware
+                // prefetcher restarts at every row boundary; pull the next
+                // row's lines while this one is dotted. A prefetch is a
+                // cache hint, never a value — no scalar twin of this.
+                if let Some(next) = keys16.get(u + 1) {
+                    let base = next.as_ptr().cast::<u8>();
+                    let mut off = 0usize;
+                    while off < next.len() * 2 {
+                        // SAFETY: prefetch reads nothing; `off` stays inside
+                        // the row's own `len() * 2` bytes.
+                        _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
+                        off += 64;
+                    }
+                }
                 // SAFETY: plus the fn contract: `u` indexes keys16 in bounds
                 // (len asserted at the dispatch) and its row is d_head wide.
                 let kq = kq_dot_fa4_avx2(qrow, &keys16[u]);
