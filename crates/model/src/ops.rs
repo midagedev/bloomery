@@ -195,6 +195,58 @@ impl SharedOut {
     }
 }
 
+/// One distinct activation input's quantized-column buffer, in the one form
+/// the quant pre-pass pool closure can capture: the [`SharedOut`] trick
+/// again — raw pointers are neither `Send` nor `Sync`, and the closure must
+/// be `Sync`. The impls carry no new safety; they point at the buffer
+/// `matmul_q_multi` owns for the whole call, and what makes sharing them
+/// sound is the column-split argument at the dispatch site (disjoint cells,
+/// published by the pool's completion protocol).
+enum SharedQuantCols {
+    /// `quantize_activations(w.ty, ..)` — f32 round-trip representation,
+    /// `k` cells per column.
+    F32(*mut f32),
+    /// `qdot::quantize_col(w.ty, ..)` — one `cb`-byte column per token.
+    Bytes { cb: usize, ptr: *mut u8 },
+}
+// SAFETY: see the enum doc — the pointer is only dereferenced under the
+// disjoint-cell and join-ordering argument at its construction site.
+unsafe impl Send for SharedQuantCols {}
+// SAFETY: same argument; workers only write cells their own column range
+// of the split owns.
+unsafe impl Sync for SharedQuantCols {}
+
+impl SharedQuantCols {
+    /// Quantize one column into its cell of this buffer. These are the
+    /// exact calls the serial pre-pass made per column, untouched — moving
+    /// the pass onto the pool changed WHO calls them, never the calls, so
+    /// the byte-identity claim below never has to talk about the encoders
+    /// themselves.
+    ///
+    /// # Safety
+    ///
+    /// `t` must name a column inside the caller's own sub-range of the
+    /// column split, and `x_col` must be column `t` of the input this
+    /// buffer was built for — the construction-site comment in
+    /// `matmul_q_multi` owns the full argument.
+    unsafe fn quantize_into(&self, ty: GgmlType, k: usize, x_col: &[f32], t: usize) {
+        match self {
+            SharedQuantCols::F32(ptr) => {
+                // SAFETY: the caller guarantees the disjoint-cell contract
+                // above; the cell is `k` f32s, as allocated.
+                let cell = unsafe { std::slice::from_raw_parts_mut(ptr.add(t * k), k) };
+                quantize_activations(ty, x_col, cell);
+            }
+            SharedQuantCols::Bytes { cb, ptr } => {
+                // SAFETY: same contract; the cell is `cb` bytes, as
+                // allocated by `col_bytes`.
+                let cell = unsafe { std::slice::from_raw_parts_mut(ptr.add(t * cb), *cb) };
+                qdot::quantize_col(ty, x_col, cell);
+            }
+        }
+    }
+}
+
 /// `y = W · x` where `W` is a quantized 2-D tensor straight out of the file.
 ///
 /// ggml's convention, kept verbatim: `W.dims == [k, n]` with `k` contiguous, so a row of
@@ -227,13 +279,17 @@ pub fn matmul_q(gguf: &Gguf, w: &TensorInfo, x: &Tensor2) -> Result<Tensor2, cra
 
 /// The batched sibling of [`matmul_q`] (MUL-24): `y_i = W_i · x_i` for a list
 /// of same-`(k, n)` weight views, in **one** pool dispatch over the concatenated
-/// row space. The MoE expert loop used to pay three dispatches per expert —
-/// gate, up, down — and MUL-23 measured the resulting orchestration at
-/// ~41 ms per decode step (1089 dispatches, workers re-parked 899 times);
-/// batching a layer's gate+up into one call and its downs into another folds
-/// that count. Rows still split only on the output row of one pair — the
-/// bit-identity argument of [`matmul_q`] is unchanged, `tests/ops.rs` holds
-/// batched ≡ sequential as a byte compare.
+/// row space (plus the quant pre-pass's own, MUL-37). The MoE expert loop used
+/// to pay three dispatches per expert — gate, up, down — and MUL-23 measured
+/// the resulting orchestration at ~41 ms per decode step (1089 dispatches,
+/// workers re-parked 899 times); batching a layer's gate+up into one call and
+/// its downs into another folds that count. Rows still split only on the
+/// output row of one pair — the bit-identity argument of [`matmul_q`] is
+/// unchanged, `tests/ops.rs` holds batched ≡ sequential as a byte compare.
+/// Pairs may share an activation block by reference (`x_i == x_j`): each
+/// DISTINCT block is quantized once and the sharers read the same bytes —
+/// deterministic encoders make that identical to quantizing per pair, and
+/// the MoE gate/up interleave is the caller it exists for.
 ///
 /// Every `W_i` must agree on dims and type (they are slices of one expert
 /// stack); the `x_i` may differ in token count (buckets do).
@@ -405,13 +461,12 @@ fn matmul_q_multi(
     let bytes: Vec<&[u8]> = ws.iter().map(|w| gguf.data(w)).collect::<Result<_, _>>()?;
     let row_bytes = bytes[0].len() / n;
 
-    // Quantize every activation column once per pair, not once per weight row.
-    // WHICH format is a property of the WEIGHT type, not a global choice —
-    // `gguf::activation_format` owns the table. Using Q8_K for everything was
-    // wrong by 2e-3 on the Q5_1 down projection (found 2026-09-19 by the ffn
-    // round, proven against libggml's own quantizer). Single-threaded on
-    // purpose: a measured 0.2 % of one decode step (level 2, 12.8 of 7588 ms)
-    // — parallelizing it would cost more than it could return.
+    // Quantize every activation column once per DISTINCT input, not once per
+    // pair and not once per weight row. WHICH format is a property of the
+    // WEIGHT type, not a global choice — `gguf::activation_format` owns the
+    // table. Using Q8_K for everything was wrong by 2e-3 on the Q5_1 down
+    // projection (found 2026-09-19 by the ffn round, proven against
+    // libggml's own quantizer).
     //
     // The fused qdot kernel (crates/qdot) dots the quantized codes directly,
     // so its activation input is `qdot::quantize_col`'s byte layout, not the
@@ -431,27 +486,143 @@ fn matmul_q_multi(
     // is fused). Decided once for the whole batch; every pair shares the
     // type, so no pair can disagree with its own row loop.
     let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
-    let mut quantized: Vec<QuantCols> = Vec::with_capacity(xs.len());
+
+    // Distinct activation blocks. The MoE gate/up batch interleaves two
+    // weight views over ONE `xb` (moe.rs phase 1 pushes the same reference
+    // twice), and until MUL-37 that meant quantizing the same columns
+    // twice — 156 of the batch's 312 pair-quantizations per decode step
+    // (MUL-35 §3). `quantize_col` and `quantize_activations` are pure
+    // functions of the column, so one quantization shared by both consumers
+    // is byte-identical to two; identity here is reference identity
+    // (`std::ptr::eq` on the `&Tensor2`), which two distinct blocks cannot
+    // report by accident. A miss is only a lost optimization, never a
+    // wrong byte.
+    let mut slot_of: Vec<usize> = Vec::with_capacity(xs.len());
+    let mut distinct: Vec<&Tensor2> = Vec::with_capacity(xs.len());
     for x in xs {
-        let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
-        let q = if fused {
-            let cb = qdot::col_bytes(ty, k);
-            let mut buf = vec![0u8; x.ne1 * cb];
-            for t in 0..x.ne1 {
-                qdot::quantize_col(ty, x.col(t), &mut buf[t * cb..(t + 1) * cb]);
+        match distinct.iter().position(|d| std::ptr::eq(*d, *x)) {
+            Some(s) => slot_of.push(s),
+            None => {
+                slot_of.push(distinct.len());
+                distinct.push(x);
             }
-            QuantCols::Bytes { cb, buf }
-        } else {
-            let mut q = vec![0.0f32; x.data.len()];
-            for t in 0..x.ne1 {
-                quantize_activations(ty, x.col(t), &mut q[t * k..(t + 1) * k]);
-            }
-            QuantCols::F32(q)
-        };
-        if let Some(t_q) = t_q {
-            pacc.add_quant_act(t_q.elapsed().as_nanos() as u64);
         }
-        quantized.push(q);
+    }
+
+    let cb = if fused {
+        Some(qdot::col_bytes(ty, k))
+    } else {
+        None
+    };
+    let mut quantized: Vec<QuantCols> = distinct
+        .iter()
+        .map(|x| match cb {
+            Some(cb) => QuantCols::Bytes {
+                cb,
+                buf: vec![0u8; x.ne1 * cb],
+            },
+            None => QuantCols::F32(vec![0.0f32; x.data.len()]),
+        })
+        .collect();
+    let mut col_starts: Vec<usize> = Vec::with_capacity(distinct.len());
+    let mut total_cols = 0usize;
+    for x in &distinct {
+        col_starts.push(total_cols);
+        total_cols += x.ne1;
+    }
+
+    // MUL-37: the pre-pass runs on the resident pool, split over the
+    // concatenated column space of the distinct inputs. Until this round it
+    // was serial on the caller thread "on purpose" (0.2 % of a step, 12.8
+    // of 7588 ms) — a rationale MUL-35 buried in measurement: the same
+    // pre-pass now costs 4.03 ms of every 31.9 ms decode step (level 2,
+    // tax-free, 2026-09-20) while the pool idles at an average 9.1 of 32
+    // workers through the section. The byte-identity argument is the pair
+    // form of the ones two earlier rounds rode: `matmul_q`'s row split
+    // (MUL-23 — which thread computes which row cannot change a bit) and
+    // `q_nope2_absorbed`'s qall pre-pass (MUL-33 — the quantizers are
+    // deterministic, so a shared read-only quantized buffer is
+    // byte-identical to whatever order built it). Here both apply at once:
+    // each column's output depends only on that column's input values
+    // through a deterministic encoder, and the split partitions the output
+    // cells, so which worker quantizes which column cannot change a byte.
+    // Splitting WITHIN a column is not done and would need its own
+    // argument (block-local scales); nothing here invites it.
+    //
+    // SAFETY (construction site, referenced by every write): the raw
+    // pointers alias the buffers `quantized` owns for the whole call.
+    // Every participant quantizes only columns inside its own contiguous
+    // sub-range of the split, the split partitions the concatenated column
+    // space of the distinct inputs, so no two participants ever write the
+    // same cell. The pool's completion protocol publishes the writes to
+    // this thread before `for_each_chunk` returns — the same ordering that
+    // publishes the row-split job slot — and the buffers are not read
+    // until the PairWork build below, after the join. A column straddling
+    // a chunk boundary is walked as two segments, never quantized twice:
+    // the walker hands each segment the intersection of the chunk and one
+    // input, exactly the row walker's pair-boundary rule.
+    let shared: Vec<SharedQuantCols> = quantized
+        .iter_mut()
+        .map(|q| match q {
+            QuantCols::Bytes { cb, buf } => SharedQuantCols::Bytes {
+                cb: *cb,
+                ptr: buf.as_mut_ptr(),
+            },
+            QuantCols::F32(q) => SharedQuantCols::F32(q.as_mut_ptr()),
+        })
+        .collect();
+    let collected: Mutex<Vec<profile::CallAcc>> =
+        Mutex::new(Vec::with_capacity(threads::pool().threads()));
+    let quant_pass = |cols: Range<usize>| {
+        let mut acc = profile::CallAcc::new();
+        let mut c = cols.start;
+        while c < cols.end {
+            // The input whose column range contains `c`. `col_starts` is
+            // sorted, so this is a partition point; a zero-width input can
+            // never be selected — its start equals its successor's, and the
+            // partition point lands on the LAST start `<= c`, so the walk
+            // always takes a nonempty segment and always advances.
+            let d = col_starts.partition_point(|&s| s <= c) - 1;
+            let t0 = c - col_starts[d];
+            let t_end = t0 + (cols.end - c).min(distinct[d].ne1 - t0);
+            let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
+            for t in t0..t_end {
+                // SAFETY: column `t` of input `d` is inside this chunk's
+                // sub-range of the column split — see the construction-site
+                // comment above.
+                unsafe { shared[d].quantize_into(ty, k, distinct[d].col(t), t) };
+            }
+            if let Some(t_q) = t_q {
+                acc.add_quant_act(t_q.elapsed().as_nanos() as u64);
+            }
+            c = col_starts[d] + t_end;
+        }
+        // The one lock of the chunk — never per column, for the same reason
+        // the row walker locks once: a mutex inside the column loop would
+        // profile the mutex. The accumulator folds into `pacc` after the
+        // join, so `profile::record` still fires exactly once per call.
+        collected
+            .lock()
+            .expect("matmul_q quant chunk collector")
+            .push(acc);
+    };
+    if total_cols > 1 {
+        threads::pool().for_each_chunk(total_cols, quant_pass);
+    } else {
+        // One column (or none): there is no split to make, and waking
+        // `threads()` workers to hand one of them a single column would
+        // pay the dispatch for nothing. The same closure runs inline on the
+        // caller — `quantize_into` is deterministic, so the bytes are the
+        // bytes the pool would have produced; `tests/mt.rs`'s cross-thread
+        // byte compare covers this branch too, because `total_cols` does
+        // not depend on the thread count.
+        quant_pass(0..total_cols);
+    }
+    for acc in collected
+        .into_inner()
+        .expect("matmul_q quant chunk collector")
+    {
+        pacc.add_acc(&acc);
     }
     let mut outs: Vec<Tensor2> = xs.iter().map(|x| Tensor2::zeros(n, x.ne1)).collect();
 
@@ -476,7 +647,11 @@ fn matmul_q_multi(
     let pairs: Vec<PairWork> = outs
         .iter_mut()
         .zip(&bytes)
-        .zip(&quantized)
+        // Pairs that share an activation block (the MoE gate/up interleave)
+        // share one quantized buffer — the dedupe above already argued why
+        // that is the same bytes; here it is read-only sharing, the row
+        // split is the only writer and it is done.
+        .zip(slot_of.iter().map(|s| &quantized[*s]))
         .map(|((out, bytes), q)| {
             // SAFETY (construction site, referenced by every write): the raw
             // pointer aliases this pair's `out.data`, owned here for the whole
