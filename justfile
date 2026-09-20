@@ -166,4 +166,4 @@ gate-1-1:
     ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && bash tools/gate.sh -p bloomery-gguf -- --ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes fmt-check lint build-gpu build-cpu gate-1-1
+gate: check-recipes check-comments fmt-check lint build-gpu build-cpu gate-1-1
