@@ -11,6 +11,8 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
+IKBIN=${IKBIN:-/home/user/ik_llama.cpp/build/bin/llama-bench}
+IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 bins=()
 for d in "$@" "$(basename "$PWD")"; do
   b="$HOME/repo/$d/target/release/bloomery-decode"
@@ -34,5 +36,13 @@ for r in $(seq "$ROUNDS"); do
     [ -n "$toks" ] || { echo "r$r $d produced no decode line" >&2; exit 1; }
     echo "r$r $d | prefill $pre | decode $toks | median ${med} ms"
   done
+  # ik 팔(BLOOMERY_AB_IK=1): 가장 빠르게 잰 플래그 조합의 llama-bench를 같은 바퀴 안에 끼운다.
+  # 막는 실패: 단발 헤드라인 하나를 ik의 다른 임대 숫자와 비교해 "넘었다"고 쓰는 것 —
+  # 1% 안쪽의 차이는 번갈아 잰 표본 여러 개로만 말할 수 있다. -r 1: 바퀴가 곧 반복이다.
+  if [ "${BLOOMERY_AB_IK:-0}" = 1 ]; then
+    ik=$(CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 1 $IK_BEST_FLAGS 2>&1 | grep -E "tg$N" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
+    [ -n "$ik" ] || { echo "r$r ik produced no tg$N line" >&2; exit 1; }
+    echo "r$r ik[$IK_BEST_FLAGS] | decode $ik tok/s"
+  fi
 done
 witness post
