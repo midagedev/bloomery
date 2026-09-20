@@ -131,6 +131,12 @@ first suspect is a hung gate on the box, not the agent.
 - **Do not split a `#[target_feature]` kernel body into helpers** (measured:
   10-13 % loss). Orchestration code is ordinary Rust: a function that no longer
   fits on two screens gets split.
+- **An unprofiled chunk takes no lock and reports nothing.** Per-chunk
+  collectors (`Mutex<Vec<_>>`) are for `BLOOMERY_PROFILE` and for errors only:
+  balanced chunks finish together, so an unconditional lock at the end of each
+  is a futex convoy per dispatch. The symptom is a flat thread-scaling curve
+  (8 threads as fast as 32) — `SWEEP="8 16 24 32" just measure-decode` is the
+  first question to ask of any dispatch-path slowness.
 - **No gate guards speed, so a round that touches the dispatch path ends with
   a same-lease A/B.** Build the base commit in a worktree (`just build-decode`
   there), then `just ab-decode bloomery-<track>` from the changed tree; judge

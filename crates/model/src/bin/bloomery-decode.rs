@@ -79,6 +79,14 @@ fn main() {
     }
 
     let t_open = Instant::now();
+    // This binary owns its main thread, so it takes the dispatcher's cpu slot.
+    // `BLOOMERY_PIN_MAIN=0` leaves it floating, for the A/B.
+    let pin_main = std::env::var("BLOOMERY_PIN_MAIN").map_or(true, |v| v != "0");
+    let pinned = pin_main && threads::pool().pin_caller();
+    println!(
+        "main   pinned={pinned} threads={}",
+        threads::pool().threads()
+    );
     let g = gguf::Gguf::open(&model).expect("model file");
     println!("model  {model}");
     println!("open   {:?} (mmap, no dequant)", t_open.elapsed());

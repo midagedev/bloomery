@@ -652,11 +652,13 @@ pub fn q_nope2_absorbed(
             // so the next segment starts at the column base + j_end.
             c = col * latent + j_end;
         }
-        // The one lock of the chunk — a mutex in the cell loop would profile the mutex.
-        collected
-            .lock()
-            .expect("q_nope2_absorbed chunk accumulator")
-            .push(acc);
+        // The one lock of the chunk, and only a profiled chunk has anything to report.
+        if lvl > 0 {
+            collected
+                .lock()
+                .expect("q_nope2_absorbed chunk accumulator")
+                .push(acc);
+        }
     });
 
     // Post-join: fold the chunk accumulators so `record` fires once per call; the

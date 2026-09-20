@@ -16,8 +16,8 @@
 //! Threading shape: with `threads()` = T there are T-1 resident workers,
 //! pinned across CCDs, and the calling thread runs the last chunk itself —
 //! one fewer wake per call, same as the bench binary's "main is the last
-//! participant". The caller is never pinned: the pool is process-wide and
-//! must not hijack an arbitrary caller's affinity. `BLOOMERY_THREADS=1`
+//! participant". The pool never pins the caller on its own: it is process-wide
+//! and must not hijack an arbitrary caller's affinity (`pin_caller` opts in). `BLOOMERY_THREADS=1`
 //! spawns nothing at all and the caller runs the whole range inline, so the
 //! single-threaded path pays no barrier cost.
 
@@ -192,6 +192,14 @@ impl Pool {
     /// keeps running unpinned in that case.
     pub fn pin_failed(&self) -> bool {
         self.pin_failed.load(Ordering::Relaxed)
+    }
+
+    /// Opt-in: pin the calling thread to the cpu slot of the chunk it runs
+    /// (the last one). The pool never does this on its own — a binary that
+    /// owns its main thread calls it once. Unpinned, the dispatcher floats onto
+    /// an SMT sibling of a spinning worker and every barrier waits for it.
+    pub fn pin_caller(&self) -> bool {
+        pin(self.cpu_for(self.nthreads - 1))
     }
 
     /// Protocol counters since process start. Diagnostic only — nothing in

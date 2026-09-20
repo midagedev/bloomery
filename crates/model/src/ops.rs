@@ -450,11 +450,13 @@ fn quantize_distinct(
             }
             c = col_starts[d] + t_end;
         }
-        // The one lock of the chunk — a mutex in the column loop would profile the mutex.
-        collected
-            .lock()
-            .expect("matmul_q quant chunk collector")
-            .push(acc);
+        // The one lock of the chunk, and only a profiled chunk has anything to report.
+        if lvl > 0 {
+            collected
+                .lock()
+                .expect("matmul_q quant chunk collector")
+                .push(acc);
+        }
     };
     if total_cols > 1 {
         threads::pool().for_each_chunk(total_cols, quant_pass);
@@ -543,11 +545,15 @@ fn run_row_pool(
             }
             gr = sub_end;
         }
-        // The one lock of the chunk — a mutex in the row loop would profile the mutex.
-        collected
-            .lock()
-            .expect("matmul_q row-chunk collector")
-            .push(chunk);
+        // The one lock of the chunk — a mutex in the row loop would profile the
+        // mutex. A clean unprofiled chunk has nothing to report and takes no
+        // lock: every worker queueing here is a barrier straggler per dispatch.
+        if lvl > 0 || chunk.err.is_some() {
+            collected
+                .lock()
+                .expect("matmul_q row-chunk collector")
+                .push(chunk);
+        }
     });
 
     // Arrival order is nondeterministic; sorting by `start` keeps the first
