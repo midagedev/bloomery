@@ -27,6 +27,10 @@ fmt:
 fmt-check:
     ./tools/box.sh 'cargo fmt --all -- --check'
 
+# 레시피 자체의 점검(맥, grep뿐). 게이트 줄의 `||`는 종료 코드를 삼킨다 — tools/check-recipes.sh 머리말.
+check-recipes:
+    ./tools/check-recipes.sh
+
 # GPU 커널 빌드. 디바이스 크레이트는 반드시 cargo oxide로, 평범한 cargo build로는 안 된다.
 build-gpu:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-q3k-gemv'
@@ -84,61 +88,61 @@ dump-ref:
 
 # 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다.
 gate-ops:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test -p bloomery-model --test ops -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test ops -- --ignored --nocapture'
 
 gate-attn:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test -p bloomery-model --test attn -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test attn -- --ignored --nocapture'
 
 gate-ffn:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test -p bloomery-model --test ffn -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test ffn -- --ignored --nocapture'
 
 gate-moe:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test -p bloomery-model --test moe -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test moe -- --ignored --nocapture'
 
 gate-head:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test -p bloomery-model --test head -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test head -- --ignored --nocapture'
 
 # 1-4 조립 게이트. --release로 도는 유일한 게이트다 — 27블록 전체를 디버그 빌드로 돌리면
 # 분 단위로 늘어나고, Rust는 f32를 재결합하지 않으므로 수치는 프로파일과 무관하게 같다.
 gate-forward:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-model --test forward -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test forward -- --ignored --nocapture'
 
 # 1-5 KV 캐시 게이트: 캐시가 있는 경로와 없는 경로의 로짓이 비트 동일한가.
 gate-kv:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-model --test kv -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test kv -- --ignored --nocapture'
 
 # Derived 게이트: 토큰과 무관한 wk_b Q8_0 재양자화를 로드시 한 번으로 옮겼다 —
 # 사전 계산이 값을 바꾸지 않는다. 블록은 참조 구현(테스트 안의 예전 두 루프)과
 # 바이트 동일, step(명시적 Derived)과 forward(래퍼)의 로짓은 비트 동일.
 gate-derived:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-model --test derived -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test derived -- --ignored --nocapture'
 
 # 행 병렬 게이트: 스레드 수(1/3/32)가 로짓을 한 비트도 안 바꾸는가. BLOOMERY_THREADS는
 # 프로세스당 한 번 읽히므로 자식 프로세스 재실행으로 덤프를 뽑아 바이트 비교한다
 # (tests/mt.rs의 패턴 설명 참조).
 gate-mt:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-model --test mt -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test mt -- --ignored --nocapture'
 
 # 1-5 프로파일러 게이트: 계측이 로짓을 한 비트도 안 바꾸고, 스텝 시간의 80% 이상을 커버하며,
 # 세 site가 전부 살아 있는가. --test-threads=1은 게이트 본체의 set_var이 자식 헬퍼 테스트와
 # 경쟁하지 않게 하는 장치다(테스트 파일의 SAFETY 주석 참조).
 gate-profile:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1 || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1'
 
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
 # hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다.
 gate-threads:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-threads --test pool -- --include-ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-threads --test pool -- --include-ignored --nocapture'
 
 # 2단계 qdot 게이트: Q3_K×Q8_K 융합 커널이 현재 경로(dequant+roundtrip+f32)와
 # 1e-5 안팎에서 일치하고, 정확해(f64)에 더 가깝고, 스칼라 폴백과 비트 동일인가.
 # 순수 게이트(rejects_unaligned_k)는 #[ignore]가 아니라 --include-ignored로 같이 돈다.
 gate-qdot:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-qdot --test qdot -- --include-ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-qdot --test qdot -- --include-ignored --nocapture'
 
 # 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
 gate-prompts:
-    ./tools/box.sh 'timeout --kill-after=10 900 cargo test --release -p bloomery-model --test prompts -- --ignored --nocapture || echo "GATE TIMED OUT after the 900s bound (exit $?) — a gate that hangs is a red gate, not a silent one" 1>&2'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test prompts -- --ignored --nocapture'
 
 # ik의 답(프롬프트 32개의 greedy 다음 토큰). 오라클과 달리 파일 하나만 쓰고
 # $BLOOMERY_DATA/ref는 건드리지 않는다 — argmax.sh가 끝에서 매니페스트 해시로 확인한다.
@@ -151,7 +155,7 @@ argmax-ref:
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
 gate-1-1:
-    ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && timeout --kill-after=10 900 cargo test -p bloomery-gguf -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && bash tools/gate.sh -p bloomery-gguf -- --ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: fmt-check lint build-gpu build-cpu gate-1-1
+gate: check-recipes fmt-check lint build-gpu build-cpu gate-1-1
