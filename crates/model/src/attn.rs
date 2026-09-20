@@ -30,6 +30,7 @@ use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo};
 use std::cell::RefCell;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 
 /// All intermediates, for the gate. `Tensor2` holds `ne0` contiguous with trailing dims folded into `ne1`, laid out exactly as the oracle dumps flatten them.
@@ -1091,7 +1092,9 @@ fn flash_row_scalar(
             }
             // TWIN: flash_row_avx2 — every edit outside the two marked
             // regions must be made in both. (This is the kq dot region; the
-            // scalar form is the bit-exact oracle.)
+            // scalar form is the bit-exact oracle. The AVX2 twin also
+            // prefetches the next KV row inside this region — a cache hint
+            // touches no value, so it has no scalar counterpart.)
             let kq = kq_dot_fa4(qrow, &keys16[u]);
             *sl = p.kq_scale * kq;
             smax = smax.max(*sl);
@@ -1216,6 +1219,20 @@ unsafe fn flash_row_avx2(
                 // TWIN: flash_row_scalar — every edit outside the two marked
                 // regions must be made in both. (This is the kq dot region;
                 // only the sum order may differ from the scalar oracle.)
+                // Each key row is its own heap Vec, so the hardware
+                // prefetcher restarts at every row boundary; pull the next
+                // row's lines while this one is dotted. A prefetch is a
+                // cache hint, never a value — no scalar twin of this.
+                if let Some(next) = keys16.get(u + 1) {
+                    let base = next.as_ptr().cast::<u8>();
+                    let mut off = 0usize;
+                    while off < next.len() * 2 {
+                        // SAFETY: prefetch reads nothing; `off` stays inside
+                        // the row's own `len() * 2` bytes.
+                        _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
+                        off += 64;
+                    }
+                }
                 // SAFETY: plus the fn contract: `u` indexes keys16 in bounds
                 // (len asserted at the dispatch) and its row is d_head wide.
                 let kq = kq_dot_fa4_avx2(qrow, &keys16[u]);
@@ -1384,12 +1401,142 @@ pub fn wv_b_heads_with(
 
 // ------------------------------------------------------------ fused step
 
+/// `BLOOMERY_HEAD_HALVES=0` forces the single-worker row path for a whole
+/// process (read once) — the A/B lever. Same binary, same bytes: only WHICH
+/// thread computes which cell/row changes.
+fn head_halves_env() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("BLOOMERY_HEAD_HALVES").map_or(true, |v| v != "0"))
+}
+
+/// The in-process override the halves tests drive: the env var is read once
+/// per process, so this is how one binary exercises both arms (the
+/// `ops::set_defer_quant` pattern).
+static HEAD_HALVES_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+/// Test override for the halves lever: `Some(true)` forces the split path,
+/// `Some(false)` the single-worker path, `None` follows `BLOOMERY_HEAD_HALVES`.
+#[doc(hidden)]
+pub fn set_head_halves(mode: Option<bool>) {
+    HEAD_HALVES_OVERRIDE.store(
+        match mode {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn head_halves() -> bool {
+    match HEAD_HALVES_OVERRIDE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => head_halves_env(),
+    }
+}
+
+/// Whether the most recent `attn_heads_fused` call dispatched the split
+/// path — the engagement observable the halves gate asserts: a pool too
+/// narrow for two participants per row declines the split, and a gate that
+/// silently never split would prove nothing.
+static LAST_HEAD_HALVES: AtomicBool = AtomicBool::new(false);
+
+/// The reading side of [`LAST_HEAD_HALVES`].
+#[doc(hidden)]
+pub fn last_head_halves() -> bool {
+    LAST_HEAD_HALVES.load(Ordering::Relaxed)
+}
+
+/// A split row's five claimable tasks: the two `q_nope2` cell halves (A),
+/// the flash row (B), the two `v_up` row halves (C).
+const TASK_A0: usize = 0;
+const TASK_A1: usize = 1;
+const TASK_B: usize = 2;
+const TASK_C0: usize = 3;
+const TASK_C1: usize = 4;
+
+/// A claimable task's state.
+const TASK_TODO: u8 = 0;
+const TASK_CLAIMED: u8 = 1;
+const TASK_DONE: u8 = 2;
+
+/// Publishes DONE when a claim's scope ends, on unwind too: a task body
+/// that panics must not leave the row's other participant spinning past the
+/// pool's barrier — the panic unwinds every participant's chunk and the
+/// dispatcher rethrows it once the join completes, discarding the outputs
+/// with it.
+struct TaskDone<'a>(&'a AtomicU8);
+impl Drop for TaskDone<'_> {
+    fn drop(&mut self) {
+        self.0.store(TASK_DONE, Ordering::Release);
+    }
+}
+
+/// Ceiling on the rows a split dispatch carries: the claim states sit inline
+/// in the dispatch state, so a split dispatch allocates nothing.
+const MAX_HALF_ROWS: usize = 64;
+
+/// The claim table of a split dispatch: one state per task per row, the
+/// `DeferredSlots` pattern. A claim is held only across its task's own
+/// body, which waits on nothing — see the participant protocol at the
+/// construction site.
+struct HeadHalfTasks {
+    states: [AtomicU8; 5 * MAX_HALF_ROWS],
+}
+
+impl HeadHalfTasks {
+    fn new() -> Self {
+        HeadHalfTasks {
+            states: std::array::from_fn(|_| AtomicU8::new(TASK_TODO)),
+        }
+    }
+
+    fn state(&self, row: usize, task: usize) -> &AtomicU8 {
+        &self.states[row * 5 + task]
+    }
+
+    /// Claim task `task` of row `row` if it is still todo.
+    fn try_claim(&self, row: usize, task: usize) -> bool {
+        let st = self.state(row, task);
+        // Cheap look first: a finished or claimed task costs a load.
+        if st.load(Ordering::Relaxed) != TASK_TODO {
+            return false;
+        }
+        st.compare_exchange(
+            TASK_TODO,
+            TASK_CLAIMED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    }
+
+    /// Block until task `task` of row `row` is DONE. Bounded: the claimant
+    /// is a participant already inside this dispatch running the task's
+    /// wait-free body.
+    fn wait_done(&self, row: usize, task: usize) {
+        while self.state(row, task).load(Ordering::Acquire) != TASK_DONE {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 /// The step path: the whole per-head attention chain — `q_nope2` absorption,
 /// flash over the latent, `wv_b` — as ONE pool dispatch over the (token,
 /// head) rows. Between dispatches the calling thread works alone while every
 /// worker idles, and the three stages are independent per row, so the two
 /// barriers the chain paid bought nothing. The three stage functions above
 /// stay `pub`: they are the oracle this path is gated against, bit for bit.
+///
+/// At the decode shape (rows within `MAX_HALF_ROWS`, pool at least twice the
+/// rows) each row runs as TWO participants splitting stages (a) and (c) in
+/// halves behind [`HeadHalfTasks`] — stage (b), the flash row, is one task
+/// the row's participants race to claim, its online M/S scan being
+/// sequential in the keys. The bytes every call receives are unchanged, so
+/// the bit-identity contract below covers the split too
+/// (`hw_attn_heads_fused_halves_bit_identical`); `BLOOMERY_HEAD_HALVES=0`
+/// forces the single-worker path.
 ///
 /// Bit identity with the chain `q_nope2_absorbed` → `flash_attn_latent` →
 /// `wv_b_heads_with` (`hw_attn_heads_fused_bit_identical`): every
@@ -1482,91 +1629,240 @@ pub fn attn_heads_fused(
     let latent = p.latent;
     let v_head = p.v_head;
     let kv2_ne0 = kqv_2d.ne0;
-    threads::pool().for_each_chunk(ne1 * p.n_head, |rows| {
-        // Per-worker scratch, recycled across dispatches: the four
-        // thread-locals the three stages use separately, taken once per
-        // chunk and returned even when a row error breaks the loop early.
-        // Every element is rewritten before it is read.
-        let mut qcol = QALL.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut cellbuf = CELL_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut qrow_buf = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        if qcol.len() < nblocks {
-            qcol.resize(
-                nblocks,
-                ActBlock {
-                    d: 0.0,
-                    q: [0i8; 32],
-                },
-            );
-        }
-        if cellbuf.len() < latent {
-            cellbuf.resize(latent, 0.0);
-        }
-        if qrow_buf.len() < d_head {
-            qrow_buf.resize(d_head, 0.0);
-        }
-        if r_buf.len() < latent {
-            r_buf.resize(latent, 0.0);
-        }
-        let qrow = &mut qrow_buf[..d_head];
-        let r = &mut r_buf[..latent];
-        let seg = &mut cellbuf[..latent];
-        let mut w = [0.0f32; 32];
-        for row in rows {
-            let t = row / p.n_head;
-            let h = row % p.n_head;
-            // (a) `q_nope2` column `h·ne1 + t`: the same `quantize_act`
-            // blocks the chain quantizes on the caller, quantized by this
-            // row's worker; `q_nope2_cells` computes each cell from its own
-            // weight blocks and the column's blocks, so the whole-column
-            // call and the chain's segmented pool call agree bit for bit.
-            let qbase = t * q.ne0 + h * p.kq_head;
-            let qnope = &q.data[qbase..qbase + p.nope];
-            for (b, chk) in qnope.as_chunks::<32>().0.iter().enumerate() {
-                qcol[b] = quantize_act(chk);
-            }
-            let whead = &wblocks[h * span..(h + 1) * span];
-            qdot::q_nope2_cells(whead, &qcol[..nblocks], 0, latent, seg);
-            for (j, &v) in seg.iter().enumerate() {
-                // SAFETY: cell `(h·ne1 + t)·latent + j` is this row's own — see the construction site.
-                unsafe { qn2_ptr.write((h * ne1 + t) * latent + j, v) };
-            }
-            // (b) the flash row, unchanged: it reads the column (a) just
-            // wrote on this thread and writes `kqv_compressed` row `row`.
-            if simd {
-                // SAFETY: `flash_simd` checked ISA and panel shapes; the row-width assert above and the scratch sizing complete the contract.
-                unsafe {
-                    flash_row_avx2(
-                        q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r, &mut w,
-                        &kc_ptr,
-                    )
-                };
-            } else {
-                flash_row_scalar(
-                    q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r, &mut w,
-                    &kc_ptr,
+    // The decode split: at `2·rows` participants or fewer on a pool at least
+    // that wide there is an idle worker for every half-row, so stages (a)
+    // and (c) — which split in two — go to two participants per row. Past
+    // the pool's width there is no idle worker to give a half to, and past
+    // `MAX_HALF_ROWS` the inline claim table ends; those shapes keep the
+    // single-worker row path. Both paths run the same task bodies on the
+    // same bytes.
+    let halves = head_halves()
+        && 2 * ne1 * p.n_head <= threads::pool().threads()
+        && ne1 * p.n_head <= MAX_HALF_ROWS;
+    LAST_HEAD_HALVES.store(halves, Ordering::Relaxed);
+    if halves {
+        let half_lat = latent / 2;
+        let half_v = v_head / 2;
+        let tasks = HeadHalfTasks::new();
+        // SAFETY (construction site, referenced by every write below): the
+        // split partitions each row's work by task, not only by row. The A
+        // halves write disjoint cell ranges of `q_nope2` column `h·ne1 + t`
+        // (cells `[0, latent/2)` and `[latent/2, latent)`); B writes
+        // `kqv_compressed` row `row`; the C halves write disjoint row ranges
+        // of `kqv_2d` column `t`'s span `h·v_head..(h+1)·v_head` — no two
+        // tasks share a cell. Cross-thread reads are ordered by the claim
+        // states: B's claimant has already observed both A states DONE (the
+        // Release store of `TaskDone` pairs with the Acquire load of
+        // `wait_done`), which orders the A writers' cell stores before B's
+        // read of the column through `&q_nope2`; each C claimant likewise
+        // observed B DONE before reading `kqv_compressed` column `row`. The
+        // join publishes every write before any tensor is read.
+        threads::pool().for_each_chunk(2 * ne1 * p.n_head, |units| {
+            // Per-participant scratch, the single-worker path's four
+            // thread-locals: A needs `qcol`+`cellbuf`, B `qrow`+`r`+`w` —
+            // one participant may run tasks of every kind.
+            let mut qcol = QALL.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut cellbuf = CELL_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut qrow_buf = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            if qcol.len() < nblocks {
+                qcol.resize(
+                    nblocks,
+                    ActBlock {
+                        d: 0.0,
+                        q: [0i8; 32],
+                    },
                 );
             }
-            // (c) head h's `wv_b` leg: the same one-column `matmul_q` bytes
-            // the chain's batch computes — its gathered input is a copy of
-            // this exact column, and a copy quantizes to the same bytes.
-            // SAFETY: `t·kv2_ne0 + h·v_head .. +v_head` is this row's own span of `kqv_2d` column `t` — see the construction site.
-            let out_col = unsafe {
-                std::slice::from_raw_parts_mut(kv2.0.add(t * kv2_ne0 + h * v_head), v_head)
-            };
-            if let Err(e) =
-                crate::ops::matvec_q_local(gguf, &views[h], kqv_compressed.col(row), out_col)
-            {
-                gate.offer(row, e);
-                break;
+            if cellbuf.len() < latent {
+                cellbuf.resize(latent, 0.0);
             }
-        }
-        QALL.with(|c| *c.borrow_mut() = qcol);
-        CELL_BUF.with(|c| *c.borrow_mut() = cellbuf);
-        FLASH_QROW.with(|c| *c.borrow_mut() = qrow_buf);
-        FLASH_R.with(|c| *c.borrow_mut() = r_buf);
-    });
+            if qrow_buf.len() < d_head {
+                qrow_buf.resize(d_head, 0.0);
+            }
+            if r_buf.len() < latent {
+                r_buf.resize(latent, 0.0);
+            }
+            let qrow = &mut qrow_buf[..d_head];
+            let r = &mut r_buf[..latent];
+            let mut w = [0.0f32; 32];
+            'unit: for u in units {
+                let row = u / 2;
+                let half = u % 2;
+                let t = row / p.n_head;
+                let h = row % p.n_head;
+                // (a) both cell halves, own first: each claimant quantizes
+                // the whole nope slice itself — `quantize_act` is pure, so
+                // either participant's blocks are the same bytes — then
+                // computes its half's cells. The second claim covers a
+                // partner that never arrives (one thread running every
+                // unit in order).
+                for hx in [half, 1 - half] {
+                    let lo = hx * half_lat;
+                    let hi = if hx == 0 { half_lat } else { latent };
+                    let task = if hx == 0 { TASK_A0 } else { TASK_A1 };
+                    if tasks.try_claim(row, task) {
+                        let _done = TaskDone(tasks.state(row, task));
+                        let qbase = t * q.ne0 + h * p.kq_head;
+                        let qnope = &q.data[qbase..qbase + p.nope];
+                        for (b, chk) in qnope.as_chunks::<32>().0.iter().enumerate() {
+                            qcol[b] = quantize_act(chk);
+                        }
+                        let whead = &wblocks[h * span..(h + 1) * span];
+                        let seg = &mut cellbuf[..hi - lo];
+                        qdot::q_nope2_cells(whead, &qcol[..nblocks], lo, hi, seg);
+                        for (j, &v) in seg.iter().enumerate() {
+                            // SAFETY: cell `(h·ne1 + t)·latent + lo + j` is this task's half of the column — see the construction site.
+                            unsafe { qn2_ptr.write((h * ne1 + t) * latent + lo + j, v) };
+                        }
+                    }
+                }
+                tasks.wait_done(row, TASK_A0);
+                tasks.wait_done(row, TASK_A1);
+                // (b) the flash row, unchanged: the claim's loser waits, so
+                // a row is never computed twice. Its reads of the column
+                // the A tasks wrote are ordered by the waits above.
+                if tasks.try_claim(row, TASK_B) {
+                    let _done = TaskDone(tasks.state(row, TASK_B));
+                    if simd {
+                        // SAFETY: `flash_simd` checked ISA and panel shapes; the row-width assert above and the scratch sizing complete the contract.
+                        unsafe {
+                            flash_row_avx2(
+                                q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r,
+                                &mut w, &kc_ptr,
+                            )
+                        };
+                    } else {
+                        flash_row_scalar(
+                            q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r,
+                            &mut w, &kc_ptr,
+                        );
+                    }
+                } else {
+                    tasks.wait_done(row, TASK_B);
+                }
+                // (c) both halves of head h's `wv_b` leg, own first: the
+                // same `matvec_q` bytes the chain's batch computes — each
+                // half quantizes the whole column (pure function), and a
+                // row's dot reads only its own weight row.
+                for hx in [half, 1 - half] {
+                    let r0 = hx * half_v;
+                    let r1 = if hx == 0 { half_v } else { v_head };
+                    let task = if hx == 0 { TASK_C0 } else { TASK_C1 };
+                    if tasks.try_claim(row, task) {
+                        let _done = TaskDone(tasks.state(row, task));
+                        // SAFETY: `t·kv2_ne0 + h·v_head + r0 .. r1` is this task's half of the row's own span of `kqv_2d` column `t` — see the construction site.
+                        let out_rows = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                kv2.0.add(t * kv2_ne0 + h * v_head + r0),
+                                r1 - r0,
+                            )
+                        };
+                        if let Err(e) = crate::ops::matvec_q_local_rows(
+                            gguf,
+                            &views[h],
+                            kqv_compressed.col(row),
+                            out_rows,
+                            r0..r1,
+                        ) {
+                            gate.offer(row, e);
+                            break 'unit;
+                        }
+                    }
+                }
+            }
+            QALL.with(|c| *c.borrow_mut() = qcol);
+            CELL_BUF.with(|c| *c.borrow_mut() = cellbuf);
+            FLASH_QROW.with(|c| *c.borrow_mut() = qrow_buf);
+            FLASH_R.with(|c| *c.borrow_mut() = r_buf);
+        });
+    } else {
+        threads::pool().for_each_chunk(ne1 * p.n_head, |rows| {
+            // Per-worker scratch, recycled across dispatches: the four
+            // thread-locals the three stages use separately, taken once per
+            // chunk and returned even when a row error breaks the loop early.
+            // Every element is rewritten before it is read.
+            let mut qcol = QALL.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut cellbuf = CELL_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut qrow_buf = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            if qcol.len() < nblocks {
+                qcol.resize(
+                    nblocks,
+                    ActBlock {
+                        d: 0.0,
+                        q: [0i8; 32],
+                    },
+                );
+            }
+            if cellbuf.len() < latent {
+                cellbuf.resize(latent, 0.0);
+            }
+            if qrow_buf.len() < d_head {
+                qrow_buf.resize(d_head, 0.0);
+            }
+            if r_buf.len() < latent {
+                r_buf.resize(latent, 0.0);
+            }
+            let qrow = &mut qrow_buf[..d_head];
+            let r = &mut r_buf[..latent];
+            let seg = &mut cellbuf[..latent];
+            let mut w = [0.0f32; 32];
+            for row in rows {
+                let t = row / p.n_head;
+                let h = row % p.n_head;
+                // (a) `q_nope2` column `h·ne1 + t`: the same `quantize_act`
+                // blocks the chain quantizes on the caller, quantized by this
+                // row's worker; `q_nope2_cells` computes each cell from its own
+                // weight blocks and the column's blocks, so the whole-column
+                // call and the chain's segmented pool call agree bit for bit.
+                let qbase = t * q.ne0 + h * p.kq_head;
+                let qnope = &q.data[qbase..qbase + p.nope];
+                for (b, chk) in qnope.as_chunks::<32>().0.iter().enumerate() {
+                    qcol[b] = quantize_act(chk);
+                }
+                let whead = &wblocks[h * span..(h + 1) * span];
+                qdot::q_nope2_cells(whead, &qcol[..nblocks], 0, latent, seg);
+                for (j, &v) in seg.iter().enumerate() {
+                    // SAFETY: cell `(h·ne1 + t)·latent + j` is this row's own — see the construction site.
+                    unsafe { qn2_ptr.write((h * ne1 + t) * latent + j, v) };
+                }
+                // (b) the flash row, unchanged: it reads the column (a) just
+                // wrote on this thread and writes `kqv_compressed` row `row`.
+                if simd {
+                    // SAFETY: `flash_simd` checked ISA and panel shapes; the row-width assert above and the scratch sizing complete the contract.
+                    unsafe {
+                        flash_row_avx2(
+                            q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r,
+                            &mut w, &kc_ptr,
+                        )
+                    };
+                } else {
+                    flash_row_scalar(
+                        q_rope, &q_nope2, keys16, key_slots, q_slots, p, ne1, row, qrow, r, &mut w,
+                        &kc_ptr,
+                    );
+                }
+                // (c) head h's `wv_b` leg: the same one-column `matmul_q` bytes
+                // the chain's batch computes — its gathered input is a copy of
+                // this exact column, and a copy quantizes to the same bytes.
+                // SAFETY: `t·kv2_ne0 + h·v_head .. +v_head` is this row's own span of `kqv_2d` column `t` — see the construction site.
+                let out_col = unsafe {
+                    std::slice::from_raw_parts_mut(kv2.0.add(t * kv2_ne0 + h * v_head), v_head)
+                };
+                if let Err(e) =
+                    crate::ops::matvec_q_local(gguf, &views[h], kqv_compressed.col(row), out_col)
+                {
+                    gate.offer(row, e);
+                    break;
+                }
+            }
+            QALL.with(|c| *c.borrow_mut() = qcol);
+            CELL_BUF.with(|c| *c.borrow_mut() = cellbuf);
+            FLASH_QROW.with(|c| *c.borrow_mut() = qrow_buf);
+            FLASH_R.with(|c| *c.borrow_mut() = r_buf);
+        });
+    }
     if let Some(e) = gate.take() {
         return Err(e);
     }

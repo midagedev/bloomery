@@ -29,6 +29,12 @@ mod oracle;
 use model::attn::block_attn_trace;
 use model::{Slot, Tensor2};
 
+/// Serializes the tests that call `attn_heads_fused`: the halves lever and
+/// its `last_head_halves` observable are process-global, so a concurrent
+/// call's engagement store must not land between another test's call and its
+/// read (the ops tests' `SLOT_LOCK` pattern).
+static HALVES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn model_path() -> String {
     std::env::var("BLOOMERY_MODEL")
         .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
@@ -196,6 +202,7 @@ fn check_block(o: &oracle::Oracle, n: usize) {
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_block0_matches_ggml() {
+    let _halves = HALVES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
     check_block(&o, 0);
 }
@@ -203,6 +210,7 @@ fn hw_attn_block0_matches_ggml() {
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_block1_matches_ggml() {
+    let _halves = HALVES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
     check_block(&o, 1);
 }
@@ -372,6 +380,7 @@ fn hw_attn_exact_input_stages() {
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_heads_fused_bit_identical() {
+    let _halves = HALVES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(model_path()).unwrap();
     let blk = 0usize;
@@ -451,6 +460,124 @@ fn hw_attn_heads_fused_bit_identical() {
             f2.data.len()
         );
     }
+}
+
+/// The decode split of the fused dispatch: at `n_tokens == 1` (16 rows on a
+/// pool at least twice as wide) each row's stages (a) and (c) run as two
+/// halves behind the claim table, stage (b) claimed by one of the two
+/// participants. The three outputs must be bit-identical BOTH to the
+/// single-worker path and to the three-call chain — the split moves calls
+/// between threads, it must not move a bit. The lever is process-global, so
+/// the test drives the in-process override `attn::set_head_halves` for each
+/// arm and asserts the split actually engaged (`last_head_halves`): a pool
+/// narrower than two participants per row would decline it, and a silently
+/// unengaged run of this gate would prove nothing.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_attn_heads_fused_halves_bit_identical() {
+    let _halves = HALVES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let blk = 0usize;
+    let p = model::attn::MlaParams::read(&g, blk).unwrap();
+    let derived = model::derived::Derived::new(&g).unwrap();
+    let views = &derived.attn_plan(blk).unwrap().v_up_views;
+    let wblocks = derived.wk_b_all_heads(blk).unwrap();
+
+    let load2 = |name: &str, occ: u32| -> Tensor2 {
+        let (v, inf) = o.load(name, occ);
+        Tensor2::from_vec(
+            inf.ne[0] as usize,
+            (inf.ne[1] * inf.ne[2] * inf.ne[3]) as usize,
+            v,
+        )
+    };
+    let q_full = load2(&format!("q-{blk}"), 0);
+    let q_rope_full = load2(&format!("q_rope-{blk}"), 1);
+    let kvr_full = load2(&format!("kvr-{blk}"), 0);
+
+    let n_tok = 1usize;
+    let slots: Vec<Slot> = (0..n_tok as u32).map(|t| Slot { seq: 0, pos: t }).collect();
+    let cache16: Vec<Vec<u16>> = (0..n_tok)
+        .map(|t| {
+            kvr_full
+                .col(t)
+                .iter()
+                .map(|&v| model::attn::f32_to_f16_bits(v))
+                .collect()
+        })
+        .collect();
+    let first_cols =
+        |src: &Tensor2, n: usize| Tensor2::from_vec(src.ne0, n, src.data[..src.ne0 * n].to_vec());
+    let q = first_cols(&q_full, n_tok);
+    let q_rope = first_cols(&q_rope_full, p.n_head * n_tok);
+
+    assert!(
+        2 * n_tok * p.n_head <= threads::pool().threads(),
+        "pool has {} threads, the split needs {} participants — this gate \
+         cannot exercise the split path on this machine",
+        threads::pool().threads(),
+        2 * n_tok * p.n_head
+    );
+
+    // The chain the fused dispatch replaces, stage by stage.
+    let q_nope2 = model::attn::q_nope2_absorbed(wblocks, &q, &p).unwrap();
+    let kqv_compressed =
+        model::attn::flash_attn_latent(&q_rope, &q_nope2, &cache16, &slots, &slots, &p);
+    let kqv_2d = model::attn::wv_b_heads_with(&g, views, &kqv_compressed, &p).unwrap();
+
+    let run = |mode: Option<bool>| -> (Tensor2, Tensor2, Tensor2, bool) {
+        model::attn::set_head_halves(mode);
+        let r = model::attn::attn_heads_fused(
+            &g, wblocks, &q, &q_rope, &cache16, &slots, &slots, views, &p,
+        )
+        .unwrap();
+        (r.0, r.1, r.2, model::attn::last_head_halves())
+    };
+    let (sq, sc, s2, s_engaged) = run(Some(false));
+    let (hq, hc, h2, h_engaged) = run(Some(true));
+    model::attn::set_head_halves(None);
+
+    assert!(
+        !s_engaged,
+        "the forced single-worker call took the split — the lever's off arm is broken"
+    );
+    assert!(
+        h_engaged,
+        "the forced split call declined — the pool-shape gate refused a shape it must take"
+    );
+
+    let cmp = |name: &str, chain: &Tensor2, single: &Tensor2, split: &Tensor2| {
+        for (tag, got) in [("single-worker", single), ("split", split)] {
+            assert_eq!(
+                (got.ne0, got.ne1),
+                (chain.ne0, chain.ne1),
+                "{name} shape ({tag})"
+            );
+            let at = chain
+                .data
+                .iter()
+                .zip(&got.data)
+                .position(|(x, y)| x.to_bits() != y.to_bits());
+            assert!(
+                at.is_none(),
+                "{name} ({tag}): differs from the chain at element {at:?} of {} — \
+                 the split moved a bit",
+                chain.data.len()
+            );
+        }
+    };
+    cmp("q_nope2", &q_nope2, &sq, &hq);
+    cmp("kqv_compressed", &kqv_compressed, &sc, &hc);
+    cmp("kqv_2d", &kqv_2d, &s2, &h2);
+    eprintln!(
+        "attn_heads_fused halves, n_tok {n_tok}:  q_nope2, kqv_compressed, kqv_2d \
+         bit-identical to the chain and to the single-worker path \
+         ({} + {} + {} values)",
+        hq.data.len(),
+        hc.data.len(),
+        h2.data.len()
+    );
 }
 
 /// Deterministic uniform noise for the synthetic band test — no model file,

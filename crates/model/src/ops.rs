@@ -1707,16 +1707,36 @@ fn matmul_q_one(
 /// `matmul_q_one` for a one-column input, on the calling thread, no pool
 /// dispatch: the fused attention round calls it from inside one pool row,
 /// where a nested dispatch would idle every worker for a barrier per head.
-/// This is the `ne1 = 1` shape of `PairWork::compute_rows` — same `fused`
-/// decision, same `quantize_col`/`quantize_activations` encoder into the
-/// same recycled poisoned buffers, same per-row op order — so the values are
-/// those of a one-column `matmul_q` and only WHICH thread computes them
-/// changes (`tests/attn.rs` pins the bit identity end to end).
+/// The `0..n` case of [`matvec_q_local_rows`].
 pub(crate) fn matvec_q_local(
     gguf: &Gguf,
     w: &TensorInfo,
     x_col: &[f32],
     out: &mut [f32],
+) -> Result<(), crate::ModelError> {
+    let n = if w.dims.len() > 1 {
+        w.dims[1] as usize
+    } else {
+        1
+    };
+    matvec_q_local_rows(gguf, w, x_col, out, 0..n)
+}
+
+/// [`matvec_q_local`] restricted to weight rows `rows`, writing
+/// `out_rows[i]` for row `rows.start + i`: the halves-split attention
+/// dispatch hands one head's `v_up` rows to two workers. Same `fused`
+/// decision, same `quantize_col`/`quantize_activations` encoder of the
+/// WHOLE column (a pure function — two halves quantizing it twice produce
+/// the same bytes), same `dot_row` per row, same scalar branch, so a row's
+/// value depends only on its own weight row and the shared column, never on
+/// which thread computes it (`tests/attn.rs` pins the bit identity end to
+/// end). This is the `ne1 = 1` shape of `PairWork::compute_rows`.
+pub(crate) fn matvec_q_local_rows(
+    gguf: &Gguf,
+    w: &TensorInfo,
+    x_col: &[f32],
+    out_rows: &mut [f32],
+    rows: Range<usize>,
 ) -> Result<(), crate::ModelError> {
     let k = w.dims.first().copied().unwrap_or(0) as usize;
     let n = if w.dims.len() > 1 {
@@ -1734,12 +1754,21 @@ pub(crate) fn matvec_q_local(
             got_ne1: 1,
         });
     }
-    if out.len() != n {
+    if rows.start > rows.end || rows.end > n {
         return Err(crate::ModelError::Shape {
-            what: "matvec_q out",
+            what: "matvec_q rows",
             want_ne0: n,
             want_ne1: 1,
-            got_ne0: out.len(),
+            got_ne0: rows.end.max(rows.start),
+            got_ne1: 1,
+        });
+    }
+    if out_rows.len() != rows.len() {
+        return Err(crate::ModelError::Shape {
+            what: "matvec_q out",
+            want_ne0: rows.len(),
+            want_ne1: 1,
+            got_ne0: out_rows.len(),
             got_ne1: 1,
         });
     }
@@ -1754,9 +1783,9 @@ pub(crate) fn matvec_q_local(
             buf.fill(0xA5);
         }
         qdot::quantize_col(ty, x_col, &mut buf);
-        for r in 0..n {
+        for r in rows.start..rows.end {
             let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
-            out[r] = qdot::dot_row(ty, src, &buf, k)?;
+            out_rows[r - rows.start] = qdot::dot_row(ty, src, &buf, k)?;
         }
         give_u8(buf);
     } else {
@@ -1771,11 +1800,11 @@ pub(crate) fn matvec_q_local(
                 scratch.resize(k, 0.0);
             }
             let row = &mut scratch[..k];
-            for r in 0..n {
+            for r in rows.start..rows.end {
                 let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
                 if ty == GgmlType::F32 {
                     if let Some(v) = qdot::dot_f32(src, &qbuf[..k]) {
-                        out[r] = v;
+                        out_rows[r - rows.start] = v;
                         continue;
                     }
                 }
@@ -1792,7 +1821,7 @@ pub(crate) fn matvec_q_local(
                 for i in 0..k {
                     a += row[i] * xc[i];
                 }
-                out[r] = a;
+                out_rows[r - rows.start] = a;
             }
             Ok(())
         })?;
