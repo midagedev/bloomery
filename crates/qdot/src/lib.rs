@@ -1983,3 +1983,111 @@ unsafe fn q_nope2_cells_avx2_inner(
         }
     }
 }
+
+// ------------------------------------------------------------ SwiGLU combine
+
+/// `out[i] = silu(gate[i]) * up[i]`, the reference's AVX2 form: `ggml_v_expf` and
+/// `ggml_v_silu` ported lane for lane (`x / (1 + exp(-x))`, then `* up`), so the
+/// result tracks ik's bits rather than libm's. A tail shorter than eight goes
+/// through the same lanes on a padded copy — an element's value never depends on
+/// where in the block it sits. Falls back to the scalar libm form without AVX2+FMA.
+pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    assert!(gate.len() == up.len() && gate.len() == out.len());
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; the slices are equal length.
+        unsafe { swiglu_avx2(gate, up, out) };
+        return;
+    }
+    for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
+        *o = g / (1.0 + (-g).exp()) * u;
+    }
+}
+
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn swiglu_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    let n = gate.len();
+    let full = n / 8 * 8;
+    let mut i = 0;
+    while i < full {
+        // SAFETY: `i + 8 <= full <= n` for all three slices.
+        unsafe {
+            let g = _mm256_loadu_ps(gate.as_ptr().add(i));
+            let u = _mm256_loadu_ps(up.as_ptr().add(i));
+            _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_mul_ps(v_silu(g), u));
+        }
+        i += 8;
+    }
+    if full < n {
+        let (mut gp, mut upad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+        gp[..n - full].copy_from_slice(&gate[full..]);
+        upad[..n - full].copy_from_slice(&up[full..]);
+        // SAFETY: the three arrays are eight f32 each.
+        unsafe {
+            let r = _mm256_mul_ps(v_silu(_mm256_loadu_ps(gp.as_ptr())), _mm256_loadu_ps(upad.as_ptr()));
+            _mm256_storeu_ps(op.as_mut_ptr(), r);
+        }
+        out[full..].copy_from_slice(&op[..n - full]);
+    }
+}
+
+/// `ggml_v_silu`: `x / (1 + exp(-x))`.
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+unsafe fn v_silu(x: __m256) -> __m256 {
+    let neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+    // SAFETY: same target features as the caller.
+    let e = unsafe { v_expf(neg_x) };
+    _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), e))
+}
+
+/// `ggml_v_expf` (the Arm optimized-routines polynomial): `exp(x) = 2^n · (1 + j(b))`
+/// with `n = round(x / ln2)` and `b = x − n·ln2` in two pieces. Constants are the
+/// reference's hex floats as bit patterns. The special-case tail (|n| > 126) is
+/// the reference's too: overflow to inf past 192, a two-step scale otherwise.
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+unsafe fn v_expf(x: __m256) -> __m256 {
+    let f = |bits: u32| _mm256_set1_ps(f32::from_bits(bits));
+    let r = f(0x4B40_0000); // 0x1.8p23
+    let z = _mm256_fmadd_ps(x, f(0x3FB8_AA3B), r); // 0x1.715476p+0
+    let n = _mm256_sub_ps(z, r);
+    let b = _mm256_fnmadd_ps(
+        n,
+        f(0x35BF_BE8E), // 0x1.7f7d1cp-20
+        _mm256_fnmadd_ps(n, f(0x3F31_7200), x), // 0x1.62e4p-1
+    );
+    let e = _mm256_slli_epi32(_mm256_castps_si256(z), 23);
+    let k = _mm256_castsi256_ps(_mm256_add_epi32(e, _mm256_castps_si256(_mm256_set1_ps(1.0))));
+    let absn = _mm256_andnot_ps(_mm256_set1_ps(-0.0), n);
+    let c = _mm256_cmp_ps(absn, _mm256_set1_ps(126.0), _CMP_GT_OQ);
+    let u = _mm256_mul_ps(b, b);
+    let j = _mm256_fmadd_ps(
+        _mm256_fmadd_ps(
+            _mm256_fmadd_ps(f(0x3C07_2010), b, f(0x3D2B_9F17)), // 0x1.0e4020p-7, 0x1.573e2ep-5
+            u,
+            _mm256_fmadd_ps(f(0x3E2A_AF33), b, f(0x3EFF_FEDB)), // 0x1.555e66p-3, 0x1.fffdb6p-2
+        ),
+        u,
+        _mm256_mul_ps(f(0x3F7F_FFF6), b), // 0x1.ffffecp-1
+    );
+    if _mm256_movemask_ps(c) == 0 {
+        return _mm256_fmadd_ps(j, k, k);
+    }
+    let g = _mm256_and_si256(
+        _mm256_castps_si256(_mm256_cmp_ps(n, _mm256_setzero_ps(), _CMP_LE_OQ)),
+        _mm256_set1_epi32(0x8200_0000u32 as i32),
+    );
+    let s1 = _mm256_castsi256_ps(_mm256_add_epi32(g, _mm256_set1_epi32(0x7f00_0000)));
+    let s2 = _mm256_castsi256_ps(_mm256_sub_epi32(e, g));
+    let d = _mm256_cmp_ps(absn, _mm256_set1_ps(192.0), _CMP_GT_OQ);
+    _mm256_or_ps(
+        _mm256_and_ps(d, _mm256_mul_ps(s1, s1)),
+        _mm256_andnot_ps(
+            d,
+            _mm256_or_ps(
+                _mm256_and_ps(c, _mm256_mul_ps(_mm256_fmadd_ps(s2, j, s2), s1)),
+                _mm256_andnot_ps(c, _mm256_fmadd_ps(k, j, k)),
+            ),
+        ),
+    )
+}

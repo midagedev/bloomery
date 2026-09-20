@@ -1033,3 +1033,26 @@ fn q_nope2_cells_rejects_bad_shapes() {
     // Legal boundary shape.
     run(0, 4, &mut out).expect("legal shape must not panic");
 }
+
+/// The eight-lane SwiGLU against the scalar libm form, and the tail rule: an
+/// element's value does not depend on its position in the block.
+#[test]
+fn swiglu_matches_scalar_and_is_position_independent() {
+    let n = 1408 + 5;
+    let gate: Vec<f32> = (0..n).map(|i| ((i * 37 % 2001) as f32 - 1000.0) * 0.02).collect();
+    let up: Vec<f32> = (0..n).map(|i| ((i * 91 % 1777) as f32 - 888.0) * 0.003).collect();
+    let mut out = vec![0.0f32; n];
+    qdot::swiglu(&gate, &up, &mut out);
+    for i in 0..n {
+        let want = gate[i] / (1.0 + (-gate[i]).exp()) * up[i];
+        let tol = 2e-6 * want.abs().max(1e-3);
+        assert!((out[i] - want).abs() <= tol, "i={i} got {} want {want}", out[i]);
+        let mut one = [0.0f32];
+        qdot::swiglu(&gate[i..i + 1], &up[i..i + 1], &mut one);
+        assert_eq!(one[0].to_bits(), out[i].to_bits(), "i={i} moves with its position");
+    }
+    // The saturating ends: exp overflow must give 0 and x, not NaN.
+    let mut ends = [0.0f32; 2];
+    qdot::swiglu(&[-200.0, 200.0], &[1.0, 1.0], &mut ends);
+    assert_eq!(ends, [-0.0, 200.0]);
+}

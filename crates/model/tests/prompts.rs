@@ -200,7 +200,13 @@ fn hw_argmax_matches_ik_on_the_prompt_set() {
     // wiring (the kq dot's sum order moved to 8-lane groups; A/B:
     // BLOOMERY_FLASH_SIMD=0 restores {14}) — prompt 24 flips at ik margin
     // 0.151, a straight 1st/2nd swap.
-    const KNOWN_DIVERGENCE: &[usize] = &[24];
+    //
+    // PIN(2026-09-20): {24} -> {} with SwiGLU on the reference's 8-lane exp
+    // (`qdot::swiglu`, a port of `ggml_v_expf`; libm's `expf` before). The
+    // gate failed first with the old pin ("0 of 32 prompts chose a different
+    // token"). Prompt 24 is the same 0.151 near-tie, so this is the lottery
+    // landing on ik's side, not evidence that the rest of the drift closed.
+    const KNOWN_DIVERGENCE: &[usize] = &[];
     let ids: Vec<usize> = mismatched.iter().map(|(id, ..)| *id).collect();
     assert_eq!(
         ids,
