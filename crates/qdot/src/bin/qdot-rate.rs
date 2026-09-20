@@ -15,6 +15,13 @@
 //! values; ik's own kernel measured on the same shape by
 //! `tools/ref/q6k_x4_rate.cpp`.
 //!
+//! MUL-34 (Q5_1 round): a fifth row at the REAL site's shape — the model's
+//! single Q5_1 tensor is blk.0.ffn_down with k = 10944 (342 x 24 B =
+//! 8208 B/row, 85 whole x4 groups + 2 tail blocks, the first bench whose
+//! tail path is live); ik's own kernel measured on the same shape by
+//! `tools/ref/q5f1_rate.cpp`. That round's measured table lives in the
+//! Q5_1 kernel's section comment in `lib.rs`.
+//!
 //! Synthetic weights (data-independent kernel) sized to the pre-study's
 //! `big` shape: 360,448 rows of K=2048, one quantized activation column,
 //! single-threaded — the per-core rate is the number that isolates the
@@ -79,4 +86,7 @@ fn main() {
     bench(GgmlType::Q4_K, 2048, (2048 / 256) * 144, rows);
     bench(GgmlType::Q6_K, 2048, (2048 / 256) * 210, rows);
     bench(GgmlType::Q5_0, 1408, (1408 / 32) * 22, rows);
+    // The ffn_down shape: 2.96 GB of weights for the full row count, well
+    // inside the box's RAM (measured free 245 GB, 2026-09-20).
+    bench(GgmlType::Q5_1, 10944, (10944 / 32) * 24, rows);
 }

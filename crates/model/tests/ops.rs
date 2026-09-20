@@ -75,8 +75,12 @@ fn hw_matmul_q_matches_ggml() {
 /// kernel is the more accurate one (measured against an f64 exact answer in the qdot
 /// round) — so this test proves the move HAPPENED, not that it did not: bit equality
 /// against the fused composition (ground A), at least one differing element against
-/// the old scalar composition (ground B), and bit equality of a non-Q3_K matmul
-/// against the scalar composition (leak watch).
+/// the old scalar composition (ground B). The leak watch this test carried until
+/// MUL-34 (a non-Q3_K matmul bit-identical to the scalar composition) retired when
+/// Q5_1 — its witness — became the model's LAST fused type: with every quant type
+/// wired, the meaningful statement for Q5_1 is the same dispatch proof Q3_K gets
+/// (grounds A/B against blk.0.ffn_down), which also catches the one failure the
+/// k_granularity contract exists for — the fused path silently not firing.
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_q3k_fused_dispatch() {
@@ -165,21 +169,40 @@ fn hw_matmul_q_q3k_fused_dispatch() {
         n * x.ne1
     );
 
-    // Leak watch — a non-Q3_K matmul must stay on the scalar path, bit for bit.
-    // blk.0.ffn_down is Q5_1; the input is synthetic (all ones, k-matched), so
-    // this needs no oracle entry. Any difference here means the Q3_K wiring
-    // reached into another type's path.
+    // Q5_1 dispatch proof (MUL-34) — the old leak watch's witness became the
+    // model's last fused type, so the statement flips to the same grounds Q3_K
+    // gets. blk.0.ffn_down, k = 10944 = 342 x 32 (not a multiple of 256 — the
+    // shape the per-type k_granularity contract exists for); the input is
+    // synthetic (all ones, k-matched), so this needs no oracle entry.
     let wf = g.find("blk.0.ffn_down.weight").unwrap();
-    assert_eq!(wf.ty, GgmlType::Q5_1, "the leak watch is a Q5_1 statement");
+    assert_eq!(wf.ty, GgmlType::Q5_1, "this is the Q5_1 dispatch proof");
     let kf = wf.dims[0] as usize;
     let nf = wf.dims[1] as usize;
     let xf = Tensor2::from_vec(kf, 1, vec![1.0f32; kf]);
     let gotf = matmul_q(&g, wf, &xf).unwrap();
     let fbytes = g.data(wf).unwrap();
     let frow_bytes = fbytes.len() / nf;
+    // Ground A' — bit-identical to the fused composition (tail blocks
+    // included: k % 128 = 64 leaves two of them).
+    let fcb = qdot::col_bytes(GgmlType::Q5_1, kf);
+    let mut facol = vec![0u8; fcb];
+    qdot::quantize_col(GgmlType::Q5_1, xf.col(0), &mut facol);
+    for r in 0..nf {
+        let src = &fbytes[r * frow_bytes..(r + 1) * frow_bytes];
+        let v = qdot::dot_row(GgmlType::Q5_1, src, &facol, kf).unwrap();
+        assert_eq!(
+            gotf.data[r].to_bits(),
+            v.to_bits(),
+            "row {r}: must be bit-identical to the fused composition"
+        );
+    }
+    eprintln!("ground A': {nf} rows bit-identical to the qdot Q5_1 composition");
+    // Ground B' — must differ somewhere from the OLD scalar composition, or
+    // the fused path never ran.
     let mut fq = vec![0.0f32; kf];
     gguf::quantize_activations(GgmlType::Q5_1, xf.col(0), &mut fq);
     let mut frow = vec![0.0f32; kf];
+    let mut fdiffs = 0usize;
     for r in 0..nf {
         let src = &fbytes[r * frow_bytes..(r + 1) * frow_bytes];
         gguf::dequant_row(GgmlType::Q5_1, src, &mut frow).unwrap();
@@ -187,13 +210,18 @@ fn hw_matmul_q_q3k_fused_dispatch() {
         for i in 0..kf {
             acc += frow[i] * fq[i];
         }
-        assert_eq!(
-            gotf.data[r].to_bits(),
-            acc.to_bits(),
-            "row {r}: the Q3_K wiring must not touch the Q5_1 scalar path"
-        );
+        if acc.to_bits() != gotf.data[r].to_bits() {
+            fdiffs += 1;
+        }
     }
-    eprintln!("leak watch: Q5_1 all-ones x ffn_down bit-identical over {nf} rows");
+    assert!(
+        fdiffs >= 1,
+        "bit-identical to the scalar composition — the Q5_1 fused path did not \
+         run, so ground A' proved nothing ({nf} rows compared)"
+    );
+    eprintln!(
+        "ground B': {fdiffs} of {nf} rows differ from the scalar composition — Q5_1 moved onto the fused path"
+    );
 }
 
 #[test]

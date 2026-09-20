@@ -416,17 +416,20 @@ fn matmul_q_multi(
     // The fused qdot kernel (crates/qdot) dots the quantized codes directly,
     // so its activation input is `qdot::quantize_col`'s byte layout, not the
     // f32 round trip. `supports(ty)` is qdot's type table — Q3_K x q8_K,
-    // Q4_K/Q6_K x q8_2_x4 (MUL-27/MUL-31) — and the k check is the WEIGHT
-    // TYPE'S block contract, owned by `qdot::k_granularity` so this call
-    // site and the kernel's own shape validation cannot drift apart:
-    // 256-value super-blocks for Q3_K/Q4_K/Q6_K, 32-value blocks for Q5_0
-    // (MUL-32, 2026-09-20: Q5_0's rows in this model are ffn_down_exps
-    // k = 1408 = 44 x 32 — NOT a multiple of 256 — so the single 256-value
-    // check this line carried until then would never fire on the stage
-    // table's largest site. The per-type number ADDS Q5_0's contract;
-    // the other types keep theirs exactly). Decided once for the whole
-    // batch; every pair shares the type, so no pair can disagree with its
-    // own row loop.
+    // Q4_K/Q6_K x q8_2_x4 (MUL-27/MUL-31), Q5_0/Q5_1 x q8_2_x4
+    // (MUL-32/MUL-34, the legacy 32-value block pair) — and the k check is
+    // the WEIGHT TYPE'S block contract, owned by `qdot::k_granularity` so
+    // this call site and the kernel's own shape validation cannot drift
+    // apart: 256-value super-blocks for Q3_K/Q4_K/Q6_K, 32-value blocks for
+    // Q5_0/Q5_1 (MUL-32, 2026-09-20: Q5_0's rows in this model are
+    // ffn_down_exps k = 1408 = 44 x 32 — NOT a multiple of 256 — so the
+    // single 256-value check this line carried until then would never fire
+    // on the stage table's largest site. The per-type number ADDS the
+    // legacy contracts; the other types keep theirs exactly. MUL-34 wired
+    // Q5_1 the same day: blk.0.ffn_down k = 10944 = 342 x 32, the model's
+    // last unfused quant type — with it every matmul_q site in the model
+    // is fused). Decided once for the whole batch; every pair shares the
+    // type, so no pair can disagree with its own row loop.
     let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
     let mut quantized: Vec<QuantCols> = Vec::with_capacity(xs.len());
     for x in xs {
