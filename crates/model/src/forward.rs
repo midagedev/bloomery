@@ -79,7 +79,7 @@ pub fn embed_with(gguf: &Gguf, w: &TensorInfo, tokens: &[u32]) -> Result<Tensor2
     let bytes = gguf.data(w)?;
     let row_bytes = bytes.len() / vocab;
 
-    let mut out = Tensor2::zeros(embd, tokens.len());
+    let mut out = Tensor2::scratch(embd, tokens.len());
     for (t, &id) in tokens.iter().enumerate() {
         let id = id as usize;
         if id >= vocab {

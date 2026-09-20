@@ -429,23 +429,30 @@ fn gather_expert_inputs(
     buckets: &Buckets,
     n_expert: usize,
     lvl: u8,
-) -> (Vec<usize>, Vec<Tensor2>, u64, u64) {
+) -> (Vec<usize>, Vec<Option<Tensor2>>, u64, u64) {
     let t_gather = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut experts: Vec<usize> = Vec::new();
-    let mut xbs: Vec<Tensor2> = Vec::new();
+    let mut xbs: Vec<Option<Tensor2>> = Vec::new();
     let mut touched = 0u64;
     for e in 0..n_expert {
         if buckets.bucket(e).is_empty() {
             continue;
         }
         touched |= 1 << e;
-        let m = buckets.bucket(e).len();
-        let mut xb = Tensor2::scratch(x.ne0, m);
-        for (i, &t) in buckets.bucket(e).iter().enumerate() {
+        let bucket = buckets.bucket(e);
+        experts.push(e);
+        // A bucket that is every token in order gathers a copy of `x` — always
+        // the case in decode. `None` stands for `x` itself: the batch then sees
+        // ONE distinct input across those experts and quantizes it once.
+        if bucket.len() == x.ne1 && bucket.iter().enumerate().all(|(i, &t)| t as usize == i) {
+            xbs.push(None);
+            continue;
+        }
+        let mut xb = Tensor2::scratch(x.ne0, bucket.len());
+        for (i, &t) in bucket.iter().enumerate() {
             xb.col_mut(i).copy_from_slice(x.col(t as usize));
         }
-        experts.push(e);
-        xbs.push(xb);
+        xbs.push(Some(xb));
     }
     let gather_ns = if let Some(t_gather) = t_gather {
         t_gather.elapsed().as_nanos() as u64
@@ -465,7 +472,8 @@ fn gate_up_batch(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
     experts: &[usize],
-    xbs: &[Tensor2],
+    x: &Tensor2,
+    xbs: &[Option<Tensor2>],
 ) -> Result<Vec<Tensor2>, ModelError> {
     if experts.is_empty() {
         return Ok(Vec::new());
@@ -477,6 +485,7 @@ fn gate_up_batch(
         gu_ws.push(&plan.up_views[e]);
     }
     for xb in xbs {
+        let xb = xb.as_ref().unwrap_or(x);
         gu_xs.push(xb);
         gu_xs.push(xb);
     }
@@ -660,7 +669,7 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     let (experts, xbs, touched, gather_ns) = gather_expert_inputs(x, &buckets, meta.n_expert, lvl);
     TOUCHED.with(|c| c.set(touched));
 
-    let gu = gate_up_batch(gguf, plan, &experts, &xbs)?;
+    let gu = gate_up_batch(gguf, plan, &experts, x, &xbs)?;
     // The same swiglu a sequential loop ran per expert, in the same expert
     // order — elementwise, so the phase boundary it sits between is its only
     // change. `ffn::swiglu` records the same site per combine, so one row

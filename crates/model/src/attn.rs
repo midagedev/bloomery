@@ -127,7 +127,7 @@ pub fn block_attn_cached(
         params_ns += t_p2.elapsed().as_nanos() as u64;
     }
     let t_lat = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut latent = Tensor2::zeros(p.latent, x.ne1);
+    let mut latent = Tensor2::scratch(p.latent, x.ne1);
     for t in 0..x.ne1 {
         let src = &kv_rope_compressed.col(t)[..p.latent];
         latent.col_mut(t).copy_from_slice(src);
@@ -142,8 +142,8 @@ pub fn block_attn_cached(
     //    per-thread and recycled: the values are position-dependent, the storage
     //    is not, and every element is rewritten before it is read.
     let t_rope = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut k_rope = Tensor2::zeros(p.rope_dims, x.ne1);
-    let mut q_rope = Tensor2::zeros(p.rope_dims, p.n_head * x.ne1);
+    let mut k_rope = Tensor2::scratch(p.rope_dims, x.ne1);
+    let mut q_rope = Tensor2::scratch(p.rope_dims, p.n_head * x.ne1);
     ROPE_BUFS.with(|pool| {
         let mut bufs = pool.borrow_mut();
         if bufs.len() < x.ne1 {
@@ -169,7 +169,7 @@ pub fn block_attn_cached(
 
     // 4. kvr = [k_rope ; kv_compressed] (order verified against the oracle dump).
     let t_kvr = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut kvr = Tensor2::zeros(kv_width, x.ne1);
+    let mut kvr = Tensor2::scratch(kv_width, x.ne1);
     for t in 0..x.ne1 {
         let dst = kvr.col_mut(t);
         dst[..p.rope_dims].copy_from_slice(k_rope.col(t));
@@ -629,7 +629,7 @@ pub fn q_nope2_absorbed(
             got_ne1: 0,
         });
     }
-    let mut out = Tensor2::zeros(p.latent, p.n_head * q.ne1);
+    let mut out = Tensor2::scratch(p.latent, p.n_head * q.ne1);
 
     // Quantize each (h, t) slice once, on the caller thread, before the cell split —
     // the "quantize once per pair" argument `matmul_q_multi` rides; a column
@@ -978,7 +978,7 @@ fn flash_attn_latent_impl(
     );
     let n_tokens = q_slots.len();
     let d_head = p.rope_dims + p.latent;
-    let mut out = Tensor2::zeros(p.latent, n_tokens * p.n_head);
+    let mut out = Tensor2::scratch(p.latent, n_tokens * p.n_head);
     // Every cached row must be `d_head` wide — the AVX2 twin's unchecked loads need
     // it up front; a short row is a caller bug to catch first.
     assert!(
@@ -1351,10 +1351,10 @@ pub fn wv_b_heads_with(
         p.n_head
     );
     let n_tokens = kqv_compressed.ne1 / p.n_head;
-    let mut kqv_2d = Tensor2::zeros(p.n_head * p.v_head, n_tokens);
+    let mut kqv_2d = Tensor2::scratch(p.n_head * p.v_head, n_tokens);
 
     let mut xhs: Vec<Tensor2> = (0..p.n_head)
-        .map(|_| Tensor2::zeros(p.latent, n_tokens))
+        .map(|_| Tensor2::scratch(p.latent, n_tokens))
         .collect();
     for h in 0..p.n_head {
         for t in 0..n_tokens {
