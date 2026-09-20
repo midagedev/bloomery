@@ -333,3 +333,36 @@ pub fn report(wall_ns: u64, label: &str) -> String {
     }
     out
 }
+
+/// Per-dispatch collector the chunks write without a lock: each arrival claims
+/// the next slot with one atomic add. A `Mutex<Vec<_>>` here is a futex convoy
+/// — balanced chunks finish together — and it made the profiled run a
+/// different machine from the one it was measuring.
+pub(crate) struct ChunkSlots<T> {
+    slots: Vec<std::sync::OnceLock<T>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl<T> ChunkSlots<T> {
+    /// One slot per pool participant: a dispatch runs at most that many chunks.
+    pub(crate) fn new() -> Self {
+        let n = threads::pool().threads();
+        Self {
+            slots: (0..n).map(|_| std::sync::OnceLock::new()).collect(),
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn push(&self, v: T) {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(self.slots[i].set(v).is_ok(), "chunk slot {i} claimed twice");
+    }
+
+    /// Arrival order, which is nondeterministic.
+    pub(crate) fn into_vec(self) -> Vec<T> {
+        self.slots
+            .into_iter()
+            .filter_map(std::sync::OnceLock::into_inner)
+            .collect()
+    }
+}

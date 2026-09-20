@@ -7,7 +7,6 @@ use crate::profile;
 use gguf::{GgmlType, Gguf, TensorInfo, dequant_row, quantize_activations};
 use std::cell::RefCell;
 use std::ops::Range;
-use std::sync::Mutex;
 use std::time::Instant;
 
 /// A 2-D activation block in ggml's layout: `ne0` contiguous, `ne1` strides by
@@ -428,8 +427,7 @@ fn quantize_distinct(
             QuantCols::F32(q) => SharedQuantCols::F32(q.as_mut_ptr()),
         })
         .collect();
-    let collected: Mutex<Vec<profile::CallAcc>> =
-        Mutex::new(Vec::with_capacity(threads::pool().threads()));
+    let collected: profile::ChunkSlots<profile::CallAcc> = profile::ChunkSlots::new();
     let quant_pass = |cols: Range<usize>| {
         let mut acc = profile::CallAcc::new();
         let mut c = cols.start;
@@ -450,12 +448,9 @@ fn quantize_distinct(
             }
             c = col_starts[d] + t_end;
         }
-        // The one lock of the chunk, and only a profiled chunk has anything to report.
+        // Only a profiled chunk has anything to report.
         if lvl > 0 {
-            collected
-                .lock()
-                .expect("matmul_q quant chunk collector")
-                .push(acc);
+            collected.push(acc);
         }
     };
     if total_cols > 1 {
@@ -464,10 +459,7 @@ fn quantize_distinct(
         // One column (or none): no split — the closure runs inline on the caller; deterministic, `tests/mt.rs` covers this branch too.
         quant_pass(0..total_cols);
     }
-    for acc in collected
-        .into_inner()
-        .expect("matmul_q quant chunk collector")
-    {
+    for acc in collected.into_vec() {
         pacc.add_acc(&acc);
     }
     quantized
@@ -525,7 +517,7 @@ fn run_row_pool(
     pacc: &mut profile::CallAcc,
 ) -> Result<(), crate::ModelError> {
     let total_rows = n * pairs.len();
-    let collected: Mutex<Vec<RowChunk>> = Mutex::new(Vec::with_capacity(threads::pool().threads()));
+    let collected: profile::ChunkSlots<RowChunk> = profile::ChunkSlots::new();
     threads::pool().for_each_chunk(total_rows, |rows| {
         let mut chunk = RowChunk {
             start: rows.start,
@@ -545,23 +537,16 @@ fn run_row_pool(
             }
             gr = sub_end;
         }
-        // The one lock of the chunk — a mutex in the row loop would profile the
-        // mutex. A clean unprofiled chunk has nothing to report and takes no
-        // lock: every worker queueing here is a barrier straggler per dispatch.
+        // A clean unprofiled chunk has nothing to report.
         if lvl > 0 || chunk.err.is_some() {
-            collected
-                .lock()
-                .expect("matmul_q row-chunk collector")
-                .push(chunk);
+            collected.push(chunk);
         }
     });
 
     // Arrival order is nondeterministic; sorting by `start` keeps the first
     // error the lowest failing row's, as a sequential `?` would return.
     let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
-    let mut chunks = collected
-        .into_inner()
-        .expect("matmul_q row-chunk collector");
+    let mut chunks = collected.into_vec();
     chunks.sort_by_key(|c| c.start);
     if let Some(e) = chunks.iter_mut().find_map(|c| c.err.take()) {
         return Err(e);

@@ -28,7 +28,7 @@ use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 /// All intermediates, for the gate. `Tensor2` holds `ne0` contiguous with trailing dims folded into `ne1`, laid out exactly as the oracle dumps flatten them.
@@ -615,8 +615,7 @@ pub fn q_nope2_absorbed(
     let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
     let latent = p.latent;
     let ne1 = q.ne1;
-    let collected: Mutex<Vec<profile::CallAcc>> =
-        Mutex::new(Vec::with_capacity(threads::pool().threads()));
+    let collected: profile::ChunkSlots<profile::CallAcc> = profile::ChunkSlots::new();
     threads::pool().for_each_chunk(p.n_head * ne1 * latent, |cells| {
         let mut acc = profile::CallAcc::new();
         // Per-worker scratch: qdot's kernel writes a segment's cells here, then they
@@ -652,12 +651,9 @@ pub fn q_nope2_absorbed(
             // so the next segment starts at the column base + j_end.
             c = col * latent + j_end;
         }
-        // The one lock of the chunk, and only a profiled chunk has anything to report.
+        // Only a profiled chunk has anything to report.
         if lvl > 0 {
-            collected
-                .lock()
-                .expect("q_nope2_absorbed chunk accumulator")
-                .push(acc);
+            collected.push(acc);
         }
     });
 
@@ -665,10 +661,7 @@ pub fn q_nope2_absorbed(
     // fold is addition, no error precedence to keep (the shape check fired before
     // the dispatch; the cell loop cannot fail).
     let t_gather = if lvl >= 2 { Some(Instant::now()) } else { None };
-    for acc in collected
-        .into_inner()
-        .expect("q_nope2_absorbed chunk accumulator")
-    {
+    for acc in collected.into_vec() {
         pacc.add_acc(&acc);
     }
     if let Some(t_gather) = t_gather {
