@@ -59,6 +59,37 @@
 //!   end.
 //! - Final row: `r · (1/s)`, one plain multiply.
 //!
+//! The head-blocked segment pass [`flash_kernels::flash_latent_hseg`] is the
+//! same family with one geometry change: a block carries [`HROWS`] query
+//! rows instead of one, so the grid is `head_groups(q_rows) * segments` and
+//! a key row is read once for every head of the token rather than once per
+//! head. Its reduction contract, in the same terms:
+//! - QK dot per key: unchanged per head — the same [`KEY_TILE`] x
+//!   [`DIM_SPLIT`] split, the same [`ILP`] rotating partials combined by
+//!   `(a0+a1)+(a2+a3)` with the trailing steps folded into `a0`, the same
+//!   four-step xor butterfly. The thread loads each key dim once and feeds
+//!   all [`HROWS`] heads from it, so the loads fall by `HROWS` while the
+//!   arithmetic per head does not move: a head's logit here is bit for bit
+//!   the one-row form's. Every head loop in this kernel is `#[unroll]`ed,
+//!   which is what keeps `HROWS` rotating sets in registers — indexed
+//!   dynamically they go to local memory, and a spilled accumulator turns
+//!   every accumulate into a dependent round trip.
+//! - Online softmax: warp `h` owns head `h`, its thirty-two lanes the tile's
+//!   thirty-two keys, and every lane of that warp carries the head's
+//!   `(m, s)`. The tile max, the weights and the weight sum are the same
+//!   five-step butterflies as above, now sixteen at once with no warp idle;
+//!   the state is the one-row form's bit for bit, the logits being equal.
+//! - V accumulation: keys ascending, **one** partial per head — the tile's
+//!   key `l` is loaded once and takes one fused multiply-add into each of
+//!   the thread's `HROWS` accumulators. The sixteen independent chains are
+//!   this loop's instruction-level parallelism, in place of the rotating
+//!   partials the one-row form carries. This is a different summation order
+//!   from the one-row form, so the two are in the same band rather than
+//!   bit-equal, exactly as the segment split already is against the single
+//!   block; reruns and graph replays of either are bit-identical.
+//! - Partials layout is unchanged (`part_v[row][seg][dim]`,
+//!   `part_ms[(row, seg)]`), so both passes feed the same merge.
+//!
 //! Keys at or past the causal limit (mask, cache padding) carry weight
 //! exactly `0.0`. Only the last tile of a run can reach past the limit, and
 //! it takes a guarded path whose `wl == 0.0` test skips those loads — so
@@ -104,6 +135,40 @@ pub const ILP: usize = 4;
 /// four thousand keys but leaves it half empty at one thousand, and this one
 /// measured faster at both depths.
 pub const SEG_KEYS: usize = 128;
+
+/// Query rows one block of the head-blocked segment pass
+/// ([`FlashKernels::enqueue_flash_latent_hseg`]) carries. A decode step's
+/// heads are its query rows, so sixteen of them is one token's whole head
+/// set: the block reads a key row once and feeds every head from it.
+pub const HROWS: usize = 16;
+/// Floats the head-blocked pass stages its query rows into: [`HROWS`] rows
+/// of [`MAX_WIDTH`], one row per head.
+pub const HSTAGE: usize = MAX_WIDTH * HROWS;
+/// Floats a tile's per-head logits (then weights) take: [`HROWS`] rows of
+/// [`KEY_TILE`].
+pub const HTILE: usize = KEY_TILE * HROWS;
+
+/// Whether the split launch's segment pass is the head-blocked
+/// [`flash_kernels::flash_latent_hseg`] rather than the per-head
+/// [`flash_kernels::flash_latent_seg`]. `BLOOMERY_FLASH_HEADS=block` picks
+/// it, `row` (the default) the other. Read once, at first use: the value
+/// fixes a captured graph's grid, so it must not change between capture and
+/// replay. A value that is set but unusable panics rather than falling back.
+pub fn flash_heads_block() -> bool {
+    static HB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HB.get_or_init(|| match std::env::var("BLOOMERY_FLASH_HEADS") {
+        Err(_) => false,
+        Ok(v) if v == "block" => true,
+        Ok(v) if v == "row" => false,
+        Ok(v) => panic!("BLOOMERY_FLASH_HEADS={v} is neither `block` nor `row`"),
+    })
+}
+
+/// Blocks the head-blocked pass needs for `q_rows` query rows: the rows are
+/// cut into groups of [`HROWS`], and every group runs each segment.
+pub fn head_groups(q_rows: usize) -> usize {
+    q_rows.div_ceil(HROWS)
+}
 
 /// Keys per segment, [`SEG_KEYS`] unless `BLOOMERY_FLASH_SEG` names another
 /// multiple of [`KEY_TILE`]. Read once, at first use: the value fixes a
@@ -536,6 +601,361 @@ mod flash_kernels {
         unsafe {
             *part_v.get_unchecked_mut(idx * lat + tid) = r;
             if tid == 0 {
+                *part_ms.get_unchecked_mut(2 * idx) = mx;
+                *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
+            }
+        }
+    }
+
+    /// The head-blocked segment pass: block `(group, segment)` attends keys
+    /// `[segment * seg_keys, min((segment + 1) * seg_keys, limit))` for the
+    /// [`HROWS`] query rows `group * HROWS ..` at once and writes the same
+    /// partials [`flash_latent_seg`] writes, so [`flash_merge`] and
+    /// [`flash_merge_q8`] serve it unchanged. The module doc's head-blocked
+    /// reduction contract is this kernel's.
+    ///
+    /// Reading a key row once for every head of the token is the whole point:
+    /// the one-row form has each head's block read the same row, and both the
+    /// QK dims and the latent tail twice over.
+    ///
+    /// Every row of the group has its own causal limit, so a head whose limit
+    /// the segment has already passed sees `−inf` at every key and leaves the
+    /// neutral partial (`m = −inf`, `s = 0`) and a zero `Σ exp·V` behind, the
+    /// same value the one-row form's skipped block writes. A block whose
+    /// group is wholly past its limits returns before reading a key row. No
+    /// key row at or past `hi_max` — the group's widest live key — is ever
+    /// loaded, which is what keeps padded rows holding NaN out of every
+    /// result.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_hseg(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+    ) {
+        // The group's query rows, staged once: every key's dots read them all.
+        static mut QROWS: SharedArray<f32, HSTAGE> = SharedArray::UNINIT;
+        // Per head, the tile's scaled logits and then its weights.
+        static mut KLOG: SharedArray<f32, HTILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, HTILE> = SharedArray::UNINIT;
+        // Per head, the tile's max-bump rescale and the row's causal limit.
+        static mut VMS: SharedArray<f32, HROWS> = SharedArray::UNINIT;
+        static mut LIM: SharedArray<u32, HROWS> = SharedArray::UNINIT;
+
+        let b = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let rows = q_rows as usize;
+        let n_seg = segs as usize;
+        let groups = rows.div_ceil(HROWS);
+        if b >= groups * n_seg {
+            return; // block-uniform: no barrier and no warp collective is skipped
+        }
+        let seg = b / groups;
+        let grp = b - seg * groups;
+        let base_row = grp * HROWS;
+        let rope = rope_dims as usize;
+        let lat = latent as usize;
+        let width = rope + lat;
+        let lo = seg * seg_keys as usize;
+        // The group's widest limit: limits rise with the row, and a row past
+        // `q_rows` is not a row at all, so the last live row of the group
+        // carries it. Every thread derives the same value from the same
+        // load, so the early return below stays block-uniform.
+        let last_row = (base_row + HROWS - 1).min(rows - 1);
+        let lim_max = causal_limit(n_keys_buf, dst_rows, last_row, n_heads, m);
+        if lo >= lim_max {
+            if tid < HROWS && base_row + tid < rows {
+                let idx = (base_row + tid) * n_seg + seg;
+                // SAFETY: idx < q_rows * segs, so both slots are inside
+                // part_ms (launch contract).
+                unsafe {
+                    *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                    *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+                }
+            }
+            return; // block-uniform, and no key row of this segment is read
+        }
+        let hi_max = (lo + seg_keys as usize).min(lim_max);
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation; every access below is bounded by the array's length
+        // and ordered by `sync_threads`.
+        let (qs, klog, kw, vms_sh, lim_sh) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut QROWS),
+                SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                SharedArray::as_raw_mut_ptr(&raw mut KW),
+                SharedArray::as_raw_mut_ptr(&raw mut VMS),
+                SharedArray::as_raw_mut_ptr(&raw mut LIM),
+            )
+        };
+
+        // Each head's causal limit, and the group's query rows. A row past
+        // `q_rows` gets limit 0 and a zero query row: its logits are `−inf`
+        // at every key and nothing of it is ever stored.
+        if tid < HROWS {
+            let row = base_row + tid;
+            let l = if row < rows {
+                causal_limit(n_keys_buf, dst_rows, row, n_heads, m)
+            } else {
+                0
+            };
+            // SAFETY: tid < HROWS bounds the store.
+            unsafe {
+                *lim_sh.add(tid) = l as u32;
+            }
+        }
+        let mut h = 0usize;
+        #[unroll]
+        while h < HROWS {
+            let row = base_row + h;
+            let live_row = row < rows;
+            let mut s = tid;
+            while s < width {
+                // SAFETY: row is inside q's rows when live and s < width
+                // bound the load by the launch contract; h < HROWS and
+                // s < width <= MAX_WIDTH (host-validated) bound the store.
+                unsafe {
+                    let v = if live_row {
+                        *q.get_unchecked(row * width + s)
+                    } else {
+                        0.0
+                    };
+                    *qs.add(h * MAX_WIDTH + s) = v;
+                }
+                s += LATENT;
+            }
+            h += 1;
+        }
+
+        // This thread's key inside a tile and its slice of that key's dims,
+        // then its head for the softmax (warp `wh`) and its latent dim.
+        let key = tid / DIM_SPLIT;
+        let dim0 = tid % DIM_SPLIT;
+        let lane = warp::lane_id() as usize;
+        let wh = tid / KEY_TILE;
+        let tail = rope + tid;
+
+        let mut mx = f32::NEG_INFINITY;
+        let mut s_sum = 0.0f32;
+        let mut r = [0.0f32; HROWS];
+
+        thread::sync_threads(); // the staged rows and the limits are visible
+
+        let mut blk = lo;
+        while blk < hi_max {
+            // ---- QK dot: the key row's dims read once, all heads fed from
+            // each. Per head this is the one-row form's reduction exactly.
+            let mut a = [[0.0f32; ILP]; HROWS];
+            if blk + key < hi_max {
+                let kb = (blk + key) * width;
+                let mut i = dim0;
+                while i + (ILP - 1) * DIM_SPLIT < width {
+                    // SAFETY: blk + key < hi_max <= dst_rows and every dim
+                    // index below is < width by this loop's test, so each
+                    // load is inside the key's row of kv (launch contract);
+                    // the shared reads are below HROWS * MAX_WIDTH.
+                    unsafe {
+                        let k0 = half_bits_to_f32(*kv.get_unchecked(kb + i));
+                        let k1 = half_bits_to_f32(*kv.get_unchecked(kb + i + DIM_SPLIT));
+                        let k2 = half_bits_to_f32(*kv.get_unchecked(kb + i + 2 * DIM_SPLIT));
+                        let k3 = half_bits_to_f32(*kv.get_unchecked(kb + i + 3 * DIM_SPLIT));
+                        let mut h = 0usize;
+                        #[unroll]
+                        while h < HROWS {
+                            let qb = h * MAX_WIDTH + i;
+                            a[h][0] = f32::mul_add(*qs.add(qb), k0, a[h][0]);
+                            a[h][1] = f32::mul_add(*qs.add(qb + DIM_SPLIT), k1, a[h][1]);
+                            a[h][2] = f32::mul_add(*qs.add(qb + 2 * DIM_SPLIT), k2, a[h][2]);
+                            a[h][3] = f32::mul_add(*qs.add(qb + 3 * DIM_SPLIT), k3, a[h][3]);
+                            h += 1;
+                        }
+                    }
+                    i += ILP * DIM_SPLIT;
+                }
+                while i < width {
+                    // SAFETY: as above, for the trailing steps.
+                    unsafe {
+                        let k0 = half_bits_to_f32(*kv.get_unchecked(kb + i));
+                        let mut h = 0usize;
+                        #[unroll]
+                        while h < HROWS {
+                            a[h][0] = f32::mul_add(*qs.add(h * MAX_WIDTH + i), k0, a[h][0]);
+                            h += 1;
+                        }
+                    }
+                    i += DIM_SPLIT;
+                }
+            }
+            // The key's DIM_SPLIT threads are one aligned lane group, so the
+            // four-step butterfly stays inside the key. Every thread calls
+            // it: the guard above shapes the value, never the control flow.
+            let mut h = 0usize;
+            #[unroll]
+            while h < HROWS {
+                let mut acc = (a[h][0] + a[h][1]) + (a[h][2] + a[h][3]);
+                acc += warp::shuffle_xor_f32(acc, 1);
+                acc += warp::shuffle_xor_f32(acc, 2);
+                acc += warp::shuffle_xor_f32(acc, 4);
+                acc += warp::shuffle_xor_f32(acc, 8);
+                if dim0 == 0 {
+                    // SAFETY: h < HROWS and key < KEY_TILE, and one thread
+                    // per (head, key) writes the slot; lim_sh is published
+                    // before the barrier above.
+                    unsafe {
+                        let sv = if (blk + key) < *lim_sh.add(h) as usize {
+                            scale * acc
+                        } else {
+                            f32::NEG_INFINITY
+                        };
+                        *klog.add(h * KEY_TILE + key) = sv;
+                    }
+                }
+                h += 1;
+            }
+            thread::sync_threads();
+
+            // ---- online softmax: warp `wh` owns head `wh`, one lane per key
+            // SAFETY: wh < HROWS and lane < KEY_TILE bound the slots, and one
+            // lane writes each.
+            unsafe {
+                let sv = *klog.add(wh * KEY_TILE + lane);
+                let smax = warp::reduce_max_f32(sv);
+                // FlashMS update: s is rescaled here, the V partials just
+                // before this tile's accumulation (the CPU oracle's order).
+                // A first bump scales by 0.0 — the partials are still zero,
+                // so the reset and the scale are the same value.
+                let mut vms = 1.0f32;
+                if smax > mx {
+                    vms = if mx > f32::NEG_INFINITY {
+                        dev_exp(mx - smax)
+                    } else {
+                        0.0
+                    };
+                    s_sum *= vms;
+                    mx = smax;
+                }
+                let w = if sv == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    dev_exp(sv - mx)
+                };
+                s_sum += warp::reduce_sum_f32(w);
+                *kw.add(wh * KEY_TILE + lane) = w;
+                if lane == 0 {
+                    *vms_sh.add(wh) = vms;
+                }
+            }
+            thread::sync_threads();
+
+            // ---- V accumulation: this thread's own latent dim for every
+            // head, the tile's keys ascending, one partial per head.
+            // SAFETY: VMS and KW hold this tile's published values (both
+            // barriers above) and every index below is inside its array.
+            let mut h = 0usize;
+            #[unroll]
+            while h < HROWS {
+                // SAFETY: h < HROWS bounds the read, and VMS holds this
+                // tile's rescale (published before the barrier above).
+                unsafe {
+                    r[h] *= *vms_sh.add(h);
+                }
+                h += 1;
+            }
+            if blk + KEY_TILE <= hi_max {
+                let mut l = 0usize;
+                while l < KEY_TILE {
+                    // SAFETY: the whole tile is below hi_max <= dst_rows, so
+                    // all ILP rows' tails are inside kv (launch contract);
+                    // tail < width and l + ILP <= KEY_TILE.
+                    unsafe {
+                        let base = (blk + l) * width + tail;
+                        let v0 = half_bits_to_f32(*kv.get_unchecked(base));
+                        let v1 = half_bits_to_f32(*kv.get_unchecked(base + width));
+                        let v2 = half_bits_to_f32(*kv.get_unchecked(base + 2 * width));
+                        let v3 = half_bits_to_f32(*kv.get_unchecked(base + 3 * width));
+                        let mut h = 0usize;
+                        #[unroll]
+                        while h < HROWS {
+                            let kb = h * KEY_TILE + l;
+                            let mut rh = r[h];
+                            rh = f32::mul_add(*kw.add(kb), v0, rh);
+                            rh = f32::mul_add(*kw.add(kb + 1), v1, rh);
+                            rh = f32::mul_add(*kw.add(kb + 2), v2, rh);
+                            rh = f32::mul_add(*kw.add(kb + 3), v3, rh);
+                            r[h] = rh;
+                            h += 1;
+                        }
+                    }
+                    l += ILP;
+                }
+            } else {
+                // The run's last tile is the only one that reaches past the
+                // group's widest live key, and those rows are the ones this
+                // must not load. A head already past its own limit has
+                // weight exactly `0.0` here and takes nothing from the row.
+                let mut l = 0usize;
+                while l < KEY_TILE {
+                    if blk + l < hi_max {
+                        // SAFETY: blk + l < hi_max <= dst_rows, so the row's
+                        // tail is inside kv; h < HROWS and l < KEY_TILE.
+                        unsafe {
+                            let v = half_bits_to_f32(*kv.get_unchecked((blk + l) * width + tail));
+                            let mut h = 0usize;
+                            #[unroll]
+                            while h < HROWS {
+                                r[h] = f32::mul_add(*kw.add(h * KEY_TILE + l), v, r[h]);
+                                h += 1;
+                            }
+                        }
+                    }
+                    l += 1;
+                }
+            }
+            blk += KEY_TILE;
+        }
+
+        let mut h = 0usize;
+        #[unroll]
+        while h < HROWS {
+            let row = base_row + h;
+            if row < rows {
+                // SAFETY: row < q_rows and tid < LATENT = latent
+                // (host-validated), so the store is inside part_v.
+                unsafe {
+                    *part_v.get_unchecked_mut((row * n_seg + seg) * lat + tid) = r[h];
+                }
+            }
+            h += 1;
+        }
+        if lane == 0 && base_row + wh < rows {
+            let idx = (base_row + wh) * n_seg + seg;
+            // SAFETY: idx < q_rows * segs, so both slots are inside part_ms;
+            // `mx` and `s_sum` are head `wh`'s state, held by every lane of
+            // warp `wh`.
+            unsafe {
                 *part_ms.get_unchecked_mut(2 * idx) = mx;
                 *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
             }
@@ -1060,7 +1480,8 @@ mod flash_kernels {
 }
 
 /// The loaded P5 device module: `kv_append`, `kv_append_pos_buf`,
-/// `flash_latent`, `flash_latent_seg`, `flash_merge`. Owns no context and no
+/// `flash_latent`, `flash_latent_seg`, `flash_latent_hseg`, `flash_merge`.
+/// Owns no context and no
 /// stream — every enqueue takes the
 /// engine stream (`Gpu::stream()`), so launches order with the rest of the
 /// step and are capturable.
@@ -1312,6 +1733,74 @@ impl FlashKernels {
             0,
         ))?;
         self.module.flash_latent_seg(
+            stream,
+            &prep,
+            q,
+            kv.buf(),
+            n_keys_buf,
+            scale,
+            m as u32,
+            n_heads as u32,
+            q_rows as u32,
+            rope_dims as u32,
+            latent as u32,
+            kv.rows() as u32,
+            segs as u32,
+            seg_keys() as u32,
+            part_v,
+            part_ms,
+        )?;
+        Ok(())
+    }
+
+    /// The head-blocked segment pass — [`FlashKernels::enqueue_flash_latent_seg`]'s
+    /// twin, writing the same partials from a grid of
+    /// [`head_groups`]`(q_rows) * `[`segments_for`]`(kv.rows())` blocks: a
+    /// block carries [`HROWS`] query rows and reads each key row once for
+    /// all of them. The merge that follows is the same one, and the choice
+    /// between the two passes is the caller's — `BLOOMERY_FLASH_HEADS`
+    /// ([`flash_heads_block`]) is where the engine makes it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_flash_latent_hseg(
+        &self,
+        stream: &CudaStream,
+        q: &DeviceBuffer<f32>,
+        kv: &DeviceTensor<u16>,
+        n_keys_buf: &DeviceBuffer<u32>,
+        scale: f32,
+        m: usize,
+        n_heads: usize,
+        rope_dims: usize,
+        latent: usize,
+        part_v: &mut DeviceBuffer<f32>,
+        part_ms: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let segs = segments_for(kv.rows());
+        let q_rows = check_flash(
+            "enqueue_flash_latent_hseg",
+            q.len(),
+            kv,
+            n_keys_buf.len(),
+            m,
+            n_heads,
+            rope_dims,
+            latent,
+            None,
+        )?;
+        check_partials(
+            "enqueue_flash_latent_hseg",
+            part_v.len(),
+            part_ms.len(),
+            q_rows,
+            segs,
+            latent,
+        )?;
+        let prep = self.module.prepare_flash_latent_hseg(LaunchConfig1D::new(
+            (head_groups(q_rows) * segs) as u32,
+            LATENT as u32,
+            0,
+        ))?;
+        self.module.flash_latent_hseg(
             stream,
             &prep,
             q,

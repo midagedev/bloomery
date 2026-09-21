@@ -17,6 +17,10 @@
 #                        헤드라인을 낸 그 프롬프트(id 0 = "The capital of France is")로 계기를
 #                        재현할 때 쓴다 — LCG 팔과 같은 길이에서 값이 같아야 "토큰 값은 시간에
 #                        안 걸린다"가 주장이 아니라 관측이 된다.
+#   env=<K=V[,K=V]>:<나머지 팔>  우리 팔인데 그 호출에만 환경 변수를 건다. 레버 하나만 다른 두 팔을
+#                        같은 임대 안에 번갈아 세우려고 있다(ab-decode.sh의 BLOOMERY_AB_ENVS와 같은 이유):
+#                        커널 선택처럼 프로세스 시작 때 한 번 읽히는 레버는 프로세스를 갈라야 갈린다.
+#                        변수 목록이 팔 이름에 붙으므로 평균 표에서 두 팔이 섞이지 않는다.
 #   <깊이>:<ctx>[:<n>]   우리 팔. ctx는 generate의 --ctx이고, 세그먼트 수를 정한다
 #                        (flash::segments_for(ctx) = ceil(ctx/128)). ctx는 깊이가 아니라 캐시 높이라
 #                        죽은 세그먼트도 블록을 런치한다 — 그래서 ctx는 팔마다 명시한다.
@@ -120,14 +124,19 @@ for r in $(seq "$ROUNDS"); do
       *)
         use_ab=0
         case $a in ab:*) use_ab=1; a=${a#ab:} ;; esac
+        arm_env=(); env_tag=
+        case $a in
+          env=*) rest0=${a#env=}; IFS=',' read -r -a arm_env <<< "${rest0%%:*}"; a=${rest0#*:}
+                 env_tag="+$(echo "${arm_env[*]}" | tr ' ' '+')" ;;
+        esac
         case $a in
           toks=*)
             rest=${a#toks=}; toks=${rest%%:*}; rest=${rest#*:}; ctx=${rest%%:*}
-            dep=$(echo "$toks" | awk -F, '{print NF}'); label="lit"
+            dep=$(echo "$toks" | awk -F, '{print NF}'); label="lit$env_tag"
             ;;
           *)
             dep=${a%%:*}; rest=${a#*:}; ctx=${rest%%:*}
-            toks=$(prompt "$dep"); label="lcg"
+            toks=$(prompt "$dep"); label="lcg$env_tag"
             ;;
         esac
         n=$N; case $rest in *:*) n=${rest#*:} ;; esac
@@ -135,9 +144,9 @@ for r in $(seq "$ROUNDS"); do
         witness "pre r$r ours($label,$inst) d=$dep ctx=$ctx n=$n"
         t0=$(date +%s)
         if [ "$use_ab" = 1 ]; then
-          out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" 2>&1)
+          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" 2>&1)
         else
-          out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time 2>&1)
+          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time 2>&1)
         fi
         rc=$?
         t1=$(date +%s)

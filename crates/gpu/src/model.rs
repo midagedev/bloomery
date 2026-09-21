@@ -3069,19 +3069,38 @@ fn enqueue_attn(
             ]),
         )?;
     } else {
-        gpu.flash().enqueue_flash_latent_seg(
-            stream,
-            &s.f_rows,
-            kv_l,
-            &s.n_keys_buf,
-            mla.kq_scale,
-            1,
-            mla.n_head,
-            rope,
-            latent,
-            &mut s.part_v,
-            &mut s.part_ms,
-        )?;
+        // One block per (head, segment), or one per (head group, segment)
+        // with the heads inside it — the same partials either way, so the
+        // merge below and the launch count do not move.
+        if crate::flash::flash_heads_block() {
+            gpu.flash().enqueue_flash_latent_hseg(
+                stream,
+                &s.f_rows,
+                kv_l,
+                &s.n_keys_buf,
+                mla.kq_scale,
+                1,
+                mla.n_head,
+                rope,
+                latent,
+                &mut s.part_v,
+                &mut s.part_ms,
+            )?;
+        } else {
+            gpu.flash().enqueue_flash_latent_seg(
+                stream,
+                &s.f_rows,
+                kv_l,
+                &s.n_keys_buf,
+                mla.kq_scale,
+                1,
+                mla.n_head,
+                rope,
+                latent,
+                &mut s.part_v,
+                &mut s.part_ms,
+            )?;
+        }
         // Same reads as the single-block launch; the partials of the live
         // segments out, plus the `(−inf, 0)` pair every segment past the
         // live keys still writes so the merge can skip it.

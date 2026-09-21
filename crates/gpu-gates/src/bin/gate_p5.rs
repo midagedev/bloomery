@@ -34,8 +34,9 @@
 //!
 //! One shape check joins them, read off the device code this binary carries
 //! rather than off a clock: every flash entry — the single-block
-//! `flash_latent`, the split pair `flash_latent_seg`/`flash_merge`, and both
-//! appends — must compile with no local depot.
+//! `flash_latent`, the split pair `flash_latent_seg`/`flash_merge`, the
+//! head-blocked segment pass `flash_latent_hseg`, and both appends — must
+//! compile with no local depot.
 //! A per-thread accumulator array the backend cannot hold in registers is
 //! spilled to local memory, and every accumulate becomes a dependent local
 //! round trip — a defect that changes no output and no band, so nothing else
@@ -49,7 +50,8 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::flash::{
-    FlashKernels, f32_to_f16_bits, partials_ms_len, partials_v_len, seg_keys, segments_for,
+    FlashKernels, f32_to_f16_bits, head_groups, partials_ms_len, partials_v_len, seg_keys,
+    segments_for,
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu};
@@ -115,7 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          the single-block flash within {FLASH_BAND} of the f64 reference on real layers, \
          both paths and their distance inside it on the depth and segment edges; reruns \
          bit-identical; padded NaN rows never read; one captured graph replays \
-         bit-identically at every key count; the flash kernels compile with no local depot"
+         bit-identically at every key count; the head-blocked segment pass inside the same \
+         band against both the reference and the one-row pass; the flash kernels compile \
+         with no local depot"
     );
     Ok(())
 }
@@ -134,6 +138,7 @@ fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     for name in [
         "flash_latent",
         "flash_latent_seg",
+        "flash_latent_hseg",
         "flash_merge",
         "kv_append",
         "kv_append_pos_buf",
@@ -523,6 +528,12 @@ fn depth_cases(
     let mut part_v = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_heads, depth_rows))?;
     let mut part_ms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_heads, depth_rows))?;
     let mut y_one = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
+    // The head-blocked segment pass writes the same partials from its own
+    // buffers, so its distance to the one-row pass is a comparison of two
+    // full results and not of a shared scratch.
+    let mut part_vh = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_heads, depth_rows))?;
+    let mut part_msh = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_heads, depth_rows))?;
+    let mut y_h = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
     // 1/31/32/33 are the key-tile edges; seg-1/seg/seg+1 the segment edges a
     // split launch adds; 1 and 31 are also `n_keys` far below one segment
     // with a tall cache. 4096 is a whole number of 256-key segments and
@@ -560,6 +571,36 @@ fn depth_cases(
             .map(|_| ())
     })?;
     let graph_nodes = graph.node_count();
+    // The head-blocked pass's own graph, captured at the same one live
+    // segment: its grid comes from the cache height and the head count, so a
+    // replay must follow `n_keys_buf` across every segment boundary too.
+    let graph_h = gpu.capture(|_s| {
+        flash.enqueue_flash_latent_hseg(
+            stream,
+            &q_dev,
+            &cache,
+            &n_keys_dev,
+            scale,
+            1,
+            n_heads,
+            rope,
+            latent,
+            &mut part_vh,
+            &mut part_msh,
+        )?;
+        flash.enqueue_flash_merge(
+            stream,
+            &n_keys_dev,
+            depth_rows,
+            1,
+            n_heads,
+            latent,
+            &part_vh,
+            &part_msh,
+            &mut y_h,
+        )
+    })?;
+    let graph_h_nodes = graph_h.node_count();
     for n_keys in cases {
         n_keys_dev.copy_from_host(stream, &[n_keys as u32])?;
         let run = |y: &mut DeviceBuffer<f32>,
@@ -623,6 +664,62 @@ fn depth_cases(
         stream.synchronize()?;
         let y_graph = y_dev.to_host_vec(stream)?;
         let replay_same = bits_equal(&y1, &y_graph);
+        // The head-blocked pass on the same inputs, through the same merge.
+        // Its V sum order differs from the one-row pass, so the two are
+        // asserted inside the band against each other and against the f64
+        // reference — not bit for bit, exactly as the split already is
+        // against the single block.
+        let run_h = |y: &mut DeviceBuffer<f32>,
+                     pv: &mut DeviceBuffer<f32>,
+                     pm: &mut DeviceBuffer<f32>|
+         -> Result<(), Box<dyn std::error::Error>> {
+            flash.enqueue_flash_latent_hseg(
+                stream,
+                &q_dev,
+                &cache,
+                &n_keys_dev,
+                scale,
+                1,
+                n_heads,
+                rope,
+                latent,
+                pv,
+                pm,
+            )?;
+            flash.enqueue_flash_merge(
+                stream,
+                &n_keys_dev,
+                depth_rows,
+                1,
+                n_heads,
+                latent,
+                pv,
+                pm,
+                y,
+            )?;
+            stream.synchronize()?;
+            Ok(())
+        };
+        run_h(&mut y_h, &mut part_vh, &mut part_msh)?;
+        let h1 = y_h.to_host_vec(stream)?;
+        run_h(&mut y_h, &mut part_vh, &mut part_msh)?;
+        let h2 = y_h.to_host_vec(stream)?;
+        let rerun_same_h = bits_equal(&h1, &h2);
+        let rel_h = max_rel_err(&h1, &y_ref)?;
+        let cross_h = max_rel_err(&h1, &y1)?;
+        graph_h.launch(stream)?;
+        stream.synchronize()?;
+        let h_graph = y_h.to_host_vec(stream)?;
+        let replay_same_h = bits_equal(&h1, &h_graph);
+        let pass_h = rel_h <= band && cross_h <= band && rerun_same_h && replay_same_h;
+        println!(
+            "shape op=flash_latent_hseg_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} head_groups={} max_rel_err={rel_h:.3e} hseg_vs_seg={cross_h:.3e} bit_identical_rerun={rerun_same_h} graph_nodes={graph_h_nodes} replay_bit_identical={replay_same_h} {}",
+            head_groups(n_heads),
+            verdict(pass_h)
+        );
+        if !pass_h {
+            *ok = false;
+        }
         let pass = rel <= band && one_rel <= band && cross_rel <= band && rerun_same && replay_same;
         println!(
             "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} live_segs={} nan_pad_rows={} max_rel_err={rel:.3e} single_launch_rel={one_rel:.3e} split_vs_single={cross_rel:.3e} bit_identical_rerun={rerun_same} graph_nodes={graph_nodes} replay_bit_identical={replay_same} {}",
