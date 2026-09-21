@@ -527,9 +527,6 @@ struct Block0Scratch {
     kv_s: DeviceBuffer<f32>,
     /// `[k_rope | kv_compressed]` — the row the KV append consumes.
     kvr: DeviceBuffer<f32>,
-    /// The derived q_nope2 planes in the q8f32 shape (see `new`).
-    qn2_qs: DeviceTensor<u32>,
-    qn2_d: DeviceTensor<f32>,
     /// Flash query rows, `[q_rope | q_nope2]` per head.
     f_rows: DeviceBuffer<f32>,
     kqvc: DeviceBuffer<f32>,
@@ -576,7 +573,6 @@ impl Block0Scratch {
         .iter()
         .map(|b| b.num_bytes())
         .sum::<usize>();
-        total += self.qn2_qs.buf().len() * 4 + self.qn2_d.buf().len() * 4;
         total +=
             self.pos_buf.num_bytes() + self.n_keys_buf.num_bytes() + self.token_buf.num_bytes();
         let act = |a: &Q8Act| {
@@ -817,7 +813,7 @@ impl GpuModel {
         let gpu = Gpu::new()?;
         let stream = gpu.stream();
         let weights = Weights::load(stream, gguf, layers.clone(), true)?;
-        let scratch = Block0Scratch::new(stream, gguf, &weights, &mla)?;
+        let scratch = Block0Scratch::new(stream, &weights, &mla)?;
         let kv_width = mla.latent + mla.rope_dims;
         let kv = (0..layers.len())
             .map(|_| DeviceTensor::<u16>::zeroed(stream, ctx_max, kv_width))
@@ -1048,23 +1044,13 @@ impl Block0Scratch {
     /// Derive every size from the resident weights and the MLA metadata,
     /// cross-check the geometry the enqueue leans on, and allocate the arena
     /// (plus the pair tables the gathers run). Load-time only.
-    fn new(
-        stream: &CudaStream,
-        gguf: &gguf::Gguf,
-        w: &Weights,
-        mla: &MlaParams,
-    ) -> Result<Block0Scratch, GpuError> {
+    fn new(stream: &CudaStream, w: &Weights, mla: &MlaParams) -> Result<Block0Scratch, GpuError> {
         let hidden = f32_gain(w, "blk.0.attn_norm.weight")?.len();
         let q_rows = kq_weight(w, "blk.0.attn_q.weight")?.rows();
         let kv_width = kq_weight(w, "blk.0.attn_kv_a_mqa.weight")?.rows();
         let ff = kq_weight(w, "blk.0.ffn_gate.weight")?.rows();
-        // The derived q_nope2 planes, uploaded HERE in the q8f32 shape
-        // (`rows x k/4` words, `rows x k/32` scales, rows = n_head*latent):
-        // `Weights`'s own Q8_0Derived entry stores the same bytes shaped
-        // blocks-as-rows, whose `d.cols()` of 1 the gemv's k-derivation
-        // cannot consume — this is the one resident plane the step
-        // re-uploads instead of reading through `Weights::get`.
-        let (qn2_qs, qn2_d, derived, derived_k) = derived_planes(stream, gguf, mla)?;
+        let (_, qn2_d) = q8_derived(w, 0)?;
+        let (derived, derived_k) = (qn2_d.rows(), qn2_d.cols() * 32);
         let kv_b_rows = kq_weight(w, "blk.0.attn_kv_b.weight")?.rows();
         let check = |what: &str, want: usize, got: usize| -> Result<(), GpuError> {
             if want == got {
@@ -1127,8 +1113,6 @@ impl Block0Scratch {
             kv_a: f32n(kv_width)?,
             kv_s: f32n(kv_width)?,
             kvr: f32n(kv_width)?,
-            qn2_qs,
-            qn2_d,
             f_rows: f32n(mla.n_head * kv_width)?,
             kqvc: f32n(mla.n_head * latent)?,
             act_kv_lo: Q8Act::with_k(stream, 8, latent)?,
@@ -1173,44 +1157,15 @@ impl Block0Scratch {
     }
 }
 
-/// The derived q_nope2 planes of block 0 in the q8f32 kernel's shape —
-/// `rows = n_head * latent` rows of `k = nope` values, `qs` rows x k/4 code
-/// words (code j in word j/4, byte j%4), `d` rows x k/32 f32 scales (the
-/// block's f16 scale widened — the exact value the reference dequantizes
-/// with). Bytes transcribed from the CPU crate's `Derived` blocks, never
-/// re-derived on device; also returns (rows, k) for the size checks.
-fn derived_planes(
-    stream: &CudaStream,
-    gguf: &gguf::Gguf,
-    mla: &MlaParams,
-) -> Result<(DeviceTensor<u32>, DeviceTensor<f32>, usize, usize), GpuError> {
-    let derived = crate::weights::Derived::new(gguf)?;
-    let blocks = derived.wk_b_all_heads(0)?;
-    let (rows, k) = (mla.n_head * mla.latent, mla.nope);
-    let blocks_per_row = k / 32;
-    if blocks.len() != rows * blocks_per_row {
-        return Err(format!(
-            "derived_planes: {} blocks are not {rows} rows x {blocks_per_row} blocks",
-            blocks.len()
-        )
-        .into());
+/// The resident derived q_nope2 planes of block `l` (`qs` rows x k/4 code
+/// words, `d` rows x k/32 scales, rows = n_head * latent, k = nope).
+fn q8_derived(w: &Weights, l: usize) -> Result<(&DeviceTensor<u32>, &DeviceTensor<f32>), GpuError> {
+    let name = crate::weights::derived_name(l);
+    match w.get(&name) {
+        Some(DevWeight::Q8_0Derived { qs, d, .. }) => Ok((qs, d)),
+        Some(_) => Err(format!("q8_derived: {name} is not the derived variant").into()),
+        None => Err(format!("q8_derived: {name} not resident").into()),
     }
-    let mut qs = Vec::with_capacity(blocks.len() * 8);
-    let mut d = Vec::with_capacity(blocks.len());
-    for b in blocks {
-        let mut words = [0u32; 8];
-        for (j, &q) in b.q.iter().enumerate() {
-            words[j / 4] |= u32::from(q as u8) << (8 * (j % 4));
-        }
-        qs.extend_from_slice(&words);
-        d.push(gguf::quant::half_to_f32(b.d));
-    }
-    Ok((
-        DeviceTensor::upload(stream, &qs, rows, k / 4)?,
-        DeviceTensor::upload(stream, &d, rows, blocks_per_row)?,
-        rows,
-        k,
-    ))
 }
 
 /// The resident Q3_K/Q4_K/Q6_K/Q5 word plane of a weight, by name.
@@ -1317,10 +1272,11 @@ fn enqueue_block0(
     //    of head h against q's nope slice of that head (x base h*kq_head,
     //    m = 1 per row), writing the nope2 span of flash row h directly
     //    (y base h*kv_width + rope).
+    let (qn2_qs, qn2_d) = q8_derived(w, 0)?;
     step.enqueue_q8_0_gemv_heads(
         stream,
-        &s.qn2_qs,
-        &s.qn2_d,
+        qn2_qs,
+        qn2_d,
         &s.q,
         latent,
         mla.kq_head,
