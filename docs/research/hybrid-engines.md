@@ -1,6 +1,6 @@
 # CPU 오프로딩에서 두 프로세서를 같이 돌리기 — 엔진들이 실제로 하는 것
 
-2026-09-21. 엔진 소스 독해 조사(opus 서브에이전트), 원문은 [`hybrid-engines-report.md`](hybrid-engines-report.md). 학술 문헌과 형식 모델은 별도 조사(`hybrid-lit`)가 하고 있고, 둘을 맞댄 종합은 그 뒤에 `hybrid.md`로 쓴다. ik 인용은 리드가 로컬 체크아웃에서 줄까지 확인했다(`ggml-backend.cpp` 940·2019·2083·2221·2254·2398·2483행, `GGML_CUDA_MIN_BATCH_OFFLOAD` 32). 시간은 전부 **유도값**이고 GPU 대역폭을 두 눈금으로 괄호 친다: 700 GB/s(커널 바닥 — 우리 엔진이 볼 쪽)와 247 GB/s(오늘의 ik 전체 패스 평균, 정지 포함).
+2026-09-21. 엔진 소스 독해 조사(opus 서브에이전트), 원문은 [`hybrid-engines-report.md`](hybrid-engines-report.md). 학술 문헌과 형식 모델은 별도 조사(`hybrid-lit`)가 하고 있고, 둘을 맞댄 종합은 [`hybrid.md`](hybrid.md)다 — R3의 괄호(적중률 0.5)가 낙관이라는 것과 단일 스트림 상한이 거기 있다. ik 인용은 리드가 로컬 체크아웃에서 줄까지 확인했다(`ggml-backend.cpp` 940·2019·2083·2221·2254·2398·2483행, `GGML_CUDA_MIN_BATCH_OFFLOAD` 32). 시간은 전부 **유도값**이고 GPU 대역폭을 두 눈금으로 괄호 친다: 700 GB/s(커널 바닥 — 우리 엔진이 볼 쪽)와 247 GB/s(오늘의 ik 전체 패스 평균, 정지 포함).
 
 ## 리드의 스펙 오류 하나
 
