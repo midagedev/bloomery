@@ -1,0 +1,20 @@
+[package]
+name = "bloomery-gpu-gates"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+# Optional for the same reason as gpu-spike: with the feature off this package
+# has no edge to the device crate, so plain cargo never resolves the
+# embedded-bundle anchor symbol.
+bloomery-gpu = { path = "../gpu", optional = true }
+cuda-core = { workspace = true, optional = true }
+
+[features]
+gpu = ["dep:bloomery-gpu", "dep:cuda-core"]

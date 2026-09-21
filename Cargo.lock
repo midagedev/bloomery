@@ -75,6 +75,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-gpu-gates"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "cuda-core",
+]
+
+[[package]]
 name = "bloomery-gpu-spike"
 version = "0.1.0"
 dependencies = [

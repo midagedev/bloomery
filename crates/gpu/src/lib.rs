@@ -19,6 +19,8 @@ pub mod cores;
 pub mod graph;
 pub mod model;
 pub mod probe;
+pub mod q5;
+pub mod q8f32;
 pub mod tensor;
 
 pub use graph::Graph;
