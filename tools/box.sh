@@ -25,7 +25,10 @@ case "$CARD" in
   a6000|both) PICK='
     A=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "A6000" | cut -d, -f1)
     T=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "3090" | cut -d, -f1)
-    [ -n "$A" ] && [ -n "$T" ] || { echo "box.sh: card lookup failed" >&2; exit 75; }
+    # a6000 alone needs only its own UUID — the 3090 has fallen off the bus twice on 2026-09-22 and must not
+    # take the healthy card down with it. both needs both.
+    [ -n "$A" ] || { echo "box.sh: A6000 lookup failed" >&2; exit 75; }
+    [ "'"$CARD"'" != both ] || [ -n "$T" ] || { echo "box.sh: 3090 lookup failed (both)" >&2; exit 75; }
     if [ "$(systemctl is-active llm.service)" = active ]; then echo "box.sh: llm.service holds the A6000" >&2; exit 75; fi
     if [ -n "$(nvidia-smi -i "$A" --query-compute-apps=pid --format=csv,noheader)" ]; then
       echo "box.sh: the A6000 has compute processes (serving or training) — not taking it" >&2; exit 75; fi
