@@ -209,7 +209,8 @@ All 13 subsystem gates pass on main with real exit codes (rerun after the
 `cargo test` runs almost nothing by design, and `.config/nextest.toml` fences
 them out of the fast loop. The `just gate-*` recipes are how they run.
 
-`just lint` reports 0 errors and 114 warnings (measured 2026-09-20; 74 on
+`just lint` reports 0 errors and 144 warnings on main (measured 2026-09-21 morning;
+169 on the `gpu-p0` tree with `crates/gpu` + `crates/gpu-spike` as members; 114 on 2026-09-20; 74 on
 09-19). 81 are in the stage-0 crates (q3k-gemv 60, q3k-cpu 21); the engine
 crates carry 33 (model 16, qdot 13, gguf 4). 63 are
 `undocumented_unsafe_blocks` (q3k-gemv 49, q3k-cpu 10, qdot 4), kept at `warn`;
