@@ -614,6 +614,14 @@ impl Bands {
         }
     }
 
+    /// Bands pinned by the lead from a measured table — `(kind, layer,
+    /// band)` triples, each carrying its `PIN(date)` at the call site.
+    pub fn pinned(table: &[(TapKind, usize, f32)]) -> Bands {
+        Bands {
+            map: table.iter().map(|&(k, l, b)| ((k, l), b)).collect(),
+        }
+    }
+
     pub fn band(&self, kind: TapKind, layer: usize) -> Option<f32> {
         self.map.get(&(kind, layer)).copied()
     }

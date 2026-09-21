@@ -3,11 +3,13 @@
 //! CUDA oracle dump. The tap rels are PRINTED, never banded — the lead pins
 //! the block bands from this table. What is asserted:
 //! - (a) every tap finite;
-//! - a structural fence per tap: `rel <= 0.25`. This is NOT a pinned band —
-//!   it is an order of magnitude above the quantization noise the design
-//!   predicts for `l_out` (1e-2 order) and below the O(0.5..1) rels a wrong
-//!   concat/permutation produces (measured with the FAIL-first mutation
-//!   below). A violation here is a layout defect, not noise;
+//! - the pinned block bands (`BANDS`, one per tap) — engine-vs-oracle rels
+//!   must stay inside them; the first violation in forward order names the
+//!   op that broke;
+//! - a structural fence per tap: `rel <= 0.25`, an order of magnitude above
+//!   the bands and below the O(0.5..1) rels a wrong concat/permutation
+//!   produces (measured with the FAIL-first mutation below). A violation
+//!   here is a layout defect, not noise;
 //! - (b) an eager rerun bit-identical;
 //! - (c) the captured graph replays bit-identical to eager (node count
 //!   printed);
@@ -28,7 +30,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::GpuModel;
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
+use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
@@ -42,10 +44,36 @@ const PROMPT: [u32; 6] = [100000, 549, 6077, 280, 7239, 317];
 /// Cache rows allocated for the gate's runs (the dump uses 6).
 #[cfg(feature = "gpu")]
 const CTX_MAX: usize = 64;
-/// Structural fence — see the module doc. Not a band; the pinned bands come
-/// from this gate's printed table.
+/// Structural fence — see the module doc. Not a band.
 #[cfg(feature = "gpu")]
 const FENCE: f32 = 0.25;
+
+/// Block-0 bands, PIN(2026-09-21) from this gate's first table (engine vs
+/// `ref_cuda_v2`, last token: attn_norm 1.1e-7, q 4.2e-3,
+/// kv_rope_compressed 2.4e-3, q_rope 4.2e-3, k_rope 3.3e-3, kv_compressed
+/// 5.6e-3, kqv_compressed 3.4e-3, kqv_out 4.8e-3, ffn_inp 2.5e-3, l_out
+/// 1.65e-3) and the ruler of the two oracles' own distance (ik CPU vs CUDA,
+/// `gate_block`: q 6.3e-3, kv_rope_compressed 3.6e-3, q_rope 6.1e-3, k_rope
+/// 5.1e-3, kv_compressed 6.7e-3, kqv_compressed 2.6e-2, kqv_out 2.3e-2,
+/// ffn_inp 1.1e-2, l_out 5.0e-3). Derivation: each band is the larger of
+/// 2 x the measured rel and the oracle-pair distance, rounded up to one
+/// digit — a band cannot be narrower than the distance between the two
+/// oracles themselves, and 2 x is the rerun margin `gate_block` uses.
+/// `attn_norm` is exact arithmetic on both sides (1.1e-7 on every table),
+/// so its band is 1e-6.
+#[cfg(feature = "gpu")]
+const BANDS: [(TapKind, usize, f32); 10] = [
+    (TapKind::AttnNorm, 0, 1e-6),
+    (TapKind::Q, 0, 1e-2),
+    (TapKind::KvRopeCompressed, 0, 5e-3),
+    (TapKind::QRope, 0, 1e-2),
+    (TapKind::KRope, 0, 7e-3),
+    (TapKind::KvCompressed, 0, 1.2e-2),
+    (TapKind::KqvCompressed, 0, 3e-2),
+    (TapKind::KqvOut, 0, 2.5e-2),
+    (TapKind::FfnInp, 0, 1.2e-2),
+    (TapKind::LOut, 0, 6e-3),
+];
 
 #[cfg(feature = "gpu")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -136,13 +164,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n: per,
         });
     }
+    let bands = Bands::pinned(&BANDS);
     block::print_table(
         "block0_step",
         "gpu_step",
         "ref_cuda[last_token]",
         &results,
-        None,
+        Some(&bands),
     );
+    if let Err(v) = bands.assert_within(&results) {
+        eprintln!("FAIL: {v}");
+        ok = false;
+    }
     for r in &results {
         if r.rel > FENCE {
             eprintln!(
