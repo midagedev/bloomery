@@ -125,6 +125,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_ok = false;
     }
 
+    // A capture whose body fails or panics must leave the stream capturable:
+    // the next capture records the same two nodes and replays bit-identically.
+    {
+        let failed = gpu
+            .capture(|_s| {
+                gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+                Err("injected body failure".into())
+            })
+            .is_err();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu.capture(|_s| -> Result<(), bloomery_gpu::GpuError> {
+                panic!("injected body panic")
+            })
+            .map(|_| ())
+        }))
+        .is_err();
+        y_dev.zero_async(stream)?;
+        stream.synchronize()?;
+        let after = gpu.capture(|_s| {
+            gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+            gpu.enqueue_gemv_q4k(&w_dev, &act, &mut y_dev)?;
+            Ok(())
+        });
+        let recovered = match after {
+            Ok(g) => {
+                g.launch(stream)?;
+                stream.synchronize()?;
+                let y = y_dev.to_host_vec(stream)?;
+                g.node_count() == 2
+                    && y.len() == y_eager.len()
+                    && y.iter()
+                        .zip(&y_eager)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+            }
+            Err(e) => {
+                eprintln!("capture after a failed body: {e}");
+                false
+            }
+        };
+        println!(
+            "P0 gate: body_err_reported={failed} body_panic_propagated={panicked} stream_capturable_after={recovered}"
+        );
+        if !failed || !panicked || !recovered {
+            eprintln!("FAIL: P0 gate (a failed capture body must not strand the stream)");
+            all_ok = false;
+        }
+    }
+
     // Host submission cost, step shape: enqueue the two-kernel sequence
     // `iters` times with ONE synchronize at the end, eager vs graph replay.
     // Design figures (shared box, dev or release host build as printed

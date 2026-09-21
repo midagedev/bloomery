@@ -62,7 +62,9 @@ impl Graph {
     /// readable error instead of `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`. The
     /// body must not allocate, free or synchronize (no `DeviceBuffer::zeroed`
     /// / `from_host` / `to_host_vec`, no drops of device buffers) — those are
-    /// not capturable and abort the capture.
+    /// not capturable and abort the capture. A body that returns `Err` or
+    /// panics still ends the capture and frees the partial template: the
+    /// stream is capturable again afterwards.
     pub fn capture<F>(stream: &CudaStream, body: F) -> Result<Graph, GpuError>
     where
         F: FnOnce(&CudaStream) -> Result<(), GpuError>,
@@ -84,13 +86,36 @@ impl Graph {
             )
         };
         cu(begun, "cuStreamBeginCapture_v2")?;
-        let body_result = body(stream);
+        // The body may fail or unwind; either way the stream must leave
+        // capture mode and the half-recorded template must not leak, or every
+        // later capture on this stream fails.
+        let body_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(stream)));
         let mut graph: sys::CUgraph = ptr::null_mut();
-        // SAFETY: the stream is capturing (begun above); end_capture always
-        // leaves the stream un-captured, whether or not the body failed.
-        let end = unsafe { sys::cuStreamEndCapture(hs, &mut graph) };
-        body_result?;
-        cu(end, "cuStreamEndCapture")?;
+        // SAFETY: the stream is capturing (begun above); end_capture leaves
+        // the stream un-captured on every path.
+        let ended = cu(
+            unsafe { sys::cuStreamEndCapture(hs, &mut graph) },
+            "cuStreamEndCapture",
+        );
+        let discard = |graph: sys::CUgraph| {
+            if !graph.is_null() {
+                // SAFETY: a non-null handle from end_capture is a valid
+                // template, destroyed exactly once here.
+                unsafe { sys::cuGraphDestroy(graph) };
+            }
+        };
+        match body_result {
+            Err(payload) => {
+                discard(graph);
+                std::panic::resume_unwind(payload);
+            }
+            Ok(Err(e)) => {
+                discard(graph);
+                return Err(e);
+            }
+            Ok(Ok(())) => {}
+        }
+        ended?;
 
         let mut nodes = 0usize;
         // SAFETY: a null node array asks only for the count.
