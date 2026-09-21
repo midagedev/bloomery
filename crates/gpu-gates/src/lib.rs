@@ -13,6 +13,7 @@
 //! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
 pub mod block;
+pub mod prompts;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
