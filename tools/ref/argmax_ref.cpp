@@ -26,6 +26,11 @@
 // the stop. gen_ids[0] is always the row's argmax column. --gen 0 (the default)
 // prints exactly the five columns below, byte for byte.
 //
+// Prompts are isolated by llama_kv_cache_clear AND by a priming decode at startup: ik builds
+// a warmup graph -- all experts instead of n_expert_used -- for the first single-token BOS
+// decode of a context whose n_eval is still 0, which is exactly the shape of every prompt's
+// first step here. See the block in main(). Without it every row is a 64-expert answer.
+//
 // --step-prefill feeds the prompt one token per llama_decode (the M=1 path)
 // instead of one batch. ik's CUDA backend writes prompt-independent logits
 // for batch prefill of nine tokens and up in this build — one token at a
@@ -123,6 +128,28 @@ int main(int argc, char ** argv) {
     }
     const int n_vocab = llama_n_vocab(init.model);
     const llama_token eos = llama_token_eos(init.model);
+
+    // Prime the context so that no measured sequence is built as a warmup graph.
+    //
+    // ik decides per graph: is_warming_up = n_eval == 0 && n_tokens == 1 && token[0] == BOS
+    // (llama-build-context.cpp), and a warmup graph runs ALL experts instead of the model's
+    // n_expert_used. Every prompt here starts with BOS and --step-prefill feeds one token per
+    // decode, so the first decode of a sequence matches that shape; n_eval is raised only inside
+    // llama_synchronize, and only when a single token was queued. Reading the top-5 row after a
+    // whole prompt queues n_tokens > 1, so without this block n_eval stays 0 for the entire run
+    // and every row is a 64-expert answer. One lone decode plus one synchronize raises n_eval
+    // for the life of the context; llama_reset_timings would put it back to 0, so this tool does
+    // not call it.
+    {
+        llama_token bos = llama_token_bos(init.model);
+        if (bos == -1) bos = eos;
+        if (llama_decode(init.context, llama_batch_get_one(&bos, 1, 0, 0))) {
+            fprintf(stderr, "argmax_ref: priming decode failed\n");
+            return 1;
+        }
+        llama_synchronize(init.context);
+        llama_kv_cache_clear(init.context);
+    }
 
     // Top-2 of a logit vector under the row's order (logit desc, id asc): the
     // greedy pick and its margin without the top-5 partial_sort. The caller

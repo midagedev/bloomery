@@ -265,6 +265,15 @@ build-argmax:
 argmax-ref:
     ./tools/box.sh 'bash tools/ref/argmax.sh'
 
+# kv-clear / warmup 재현자. ik가 문맥의 n_eval이 0인 동안 들어온 "BOS 한 토큰" 디코드를
+# 워밍업 그래프로 지어 전문가를 전부(64개) 돌린다 — 그 그래프가 쓴 KV가 그 시퀀스 전체를
+# 바꾼다. 팔마다 그 술어의 접속사 하나씩만 뒤집는다. 산출물은 스크래치로만 간다.
+build-kvclear:
+    ./tools/box.sh 'bash tools/ref/build-kvclear.sh'
+
+kvclear-probe *ARGS:
+    ./tools/box.sh 'CUDA_VISIBLE_DEVICES= /root/bloomery-scratch/ikclear/bin/kvclear_probe -m /models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf --prompts tools/ref/prompts.tsv -ngl 0 -c 512 -t 32 {{ARGS}}'
+
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
 gate-1-1:

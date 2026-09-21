@@ -46,8 +46,10 @@ case $BACKEND in
 esac
 if [ "$GEN" -gt 0 ]; then NAME="greedy-ik-$BACKEND-$GEN.tsv"; fi
 OUT=${BLOOMERY_ARGMAX_OUT:-$BLOOMERY_DATA/$NAME}
-# The context must hold the longest prompt (56 today) plus every generated step.
-CTX=$((512 + GEN))
+# One fixed context for every file this script writes. The longest prompt is 56 and GEN is at
+# most 32, so 512 holds both; a GEN-dependent -c made the argmax file and the greedy file two
+# different run conditions, which is not a difference a consumer can reason about.
+CTX=${BLOOMERY_REF_CTX:-512}
 [ -x "$BIN" ] || { echo "no argmax_ref at $BIN — run: just build-argmax" >&2; exit 2; }
 
 before=$(md5sum "$BLOOMERY_DATA/ref/MANIFEST.tsv" | cut -d' ' -f1)
