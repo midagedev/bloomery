@@ -269,8 +269,8 @@ gate-gpu-head:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && ./target/release/gate_head_gpu'
 
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
-# 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). 이 ik 빌드의 CUDA 배치 프리필은 9토큰
-# 이상에서 프롬프트와 무관한 로짓을 내므로 argmax.sh가 --step-prefill(M=1 경로)로 먹인다 —
+# 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
+# 들어가면 쓰레기를 낸다(upstream의 MMQ 경로, mainline이 양자화한 파일에서만). 그래서 argmax.sh가 --step-prefill(M=1 경로)로 먹인다 —
 # 사정과 되돌리는 법(BLOOMERY_REF_BATCH_PREFILL=1)은 argmax.sh 머리글. 8 GB 모델을 1분 안에
 # 올렸다 내리는 정확성 실행이라 임대는 필요 없다. 카드에 다른 컴퓨트 프로세스가 있으면
 # 끝나기를 기다린다 — 죽이지 않는다.

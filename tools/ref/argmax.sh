@@ -9,10 +9,13 @@
 # BLOOMERY_REF_BACKEND=cuda runs the GPU engine's token reference instead: CUDA left
 # visible on the card the box env pins, every layer offloaded (-ngl 99) — dump.sh's
 # card selection and offload depth. Two deviations from dump.sh's invocation, both
-# forced by the same measured fact: ik's CUDA backend writes prompt-independent logits
-# for batch prefill of nine tokens and up in this build (llama-cli at -ngl 99 answers
-# "emanoicisananan..." to "The first president of the United States was"; one token at
-# a time, or CUDA hidden, answers " George Washington"). So the cuda path feeds the
+# forced by the same measured fact: ik's CUDA backend answers garbage (different per
+# prompt) whenever ONE UBATCH holds nine tokens or more — the MMVQ_MAX_BATCH_SIZE 8
+# boundary, not prompt length — with MLA on and a 256-block-quant attn_kv_b, which is
+# what mainline-quantized files like this one carry. It is upstream's MMQ path (master
+# 9cba2e38 has it; a GGML_CUDA_FORCE_CUBLAS=ON build is correct). llama-cli at -ngl 99
+# answers "emanoicisananan..." to "The first president of the United States was"; one
+# token at a time, -ub 8, or CUDA hidden, answers " George Washington". So the cuda path feeds the
 # prompt through argmax_ref --step-prefill (M=1 kernels, same tokens/positions/KV), and
 # it needs no -mla/-fa flags: they do not touch the defect, and fused MoE is this
 # build's default (there is no -fmoe; only -no-fmoe). Set BLOOMERY_REF_BATCH_PREFILL=1
