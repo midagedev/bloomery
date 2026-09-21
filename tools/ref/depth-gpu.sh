@@ -25,6 +25,13 @@
 #                        준비 시간만 없다 — 깊이 4096에서 팔 하나의 준비가 16초에서 0에 가까워진다.
 #                        찍히는 토큰은 무의미하다(씨앗 행은 모델이 쓴 키가 아니다). 시간만 읽는다.
 #                        `ab:seed=`는 없다 — --ab의 팔마다 reset()이 씨앗을 지운다(generate가 거부한다).
+#                        씨앗 팔은 씨앗 팔과만 비교한다: 4바퀴 대조에서 깊이 4096의 씨앗 팔이 매 바퀴 0.7% 빨랐다
+#                        (자 ±1% 안이지만 잡음이 아닌 편향 — 값 압축성이나 준비 시간 차의 발열이 후보). 씨앗 µs를
+#                        진짜 프롬프트 기준선 옆에 놓지 않는다.
+#   env=<K=V[,K=V]>:<나머지 팔>  우리 팔인데 그 호출에만 환경 변수를 건다. 레버 하나만 다른 두 팔을
+#                        같은 임대 안에 번갈아 세우려고 있다(ab-decode.sh의 BLOOMERY_AB_ENVS와 같은 이유):
+#                        커널 선택처럼 프로세스 시작 때 한 번 읽히는 레버는 프로세스를 갈라야 갈린다.
+#                        변수 목록이 팔 이름에 붙으므로 평균 표에서 두 팔이 섞이지 않는다.
 #   <깊이>:<ctx>[:<n>]   우리 팔. ctx는 generate의 --ctx이고, 세그먼트 수를 정한다
 #                        (flash::segments_for(ctx) = ceil(ctx/128)). ctx는 깊이가 아니라 캐시 높이라
 #                        죽은 세그먼트도 블록을 런치한다 — 그래서 ctx는 팔마다 명시한다.
@@ -128,35 +135,40 @@ for r in $(seq "$ROUNDS"); do
       *)
         use_ab=0
         case $a in ab:*) use_ab=1; a=${a#ab:} ;; esac
+        arm_env=(); env_tag=
+        case $a in
+          env=*) rest0=${a#env=}; IFS=',' read -r -a arm_env <<< "${rest0%%:*}"; a=${rest0#*:}
+                 env_tag="+$(echo "${arm_env[*]}" | tr ' ' '+')" ;;
+        esac
         case $a in
           seed=*)
             rest=${a#seed=}; dep=${rest%%:*}; rest=${rest#*:}; ctx=${rest%%:*}
-            toks=""; label="seed"
+            toks=""; label="seed$env_tag"
             ;;
           toks=*)
             rest=${a#toks=}; toks=${rest%%:*}; rest=${rest#*:}; ctx=${rest%%:*}
-            dep=$(echo "$toks" | awk -F, '{print NF}'); label="lit"
+            dep=$(echo "$toks" | awk -F, '{print NF}'); label="lit$env_tag"
             ;;
           *)
             dep=${a%%:*}; rest=${a#*:}; ctx=${rest%%:*}
-            toks=$(prompt "$dep"); label="lcg"
+            toks=$(prompt "$dep"); label="lcg$env_tag"
             ;;
         esac
         n=$N; case $rest in *:*) n=${rest#*:} ;; esac
         inst=time; [ "$use_ab" = 1 ] && inst=ab
         # --ab의 팔마다 reset()이 캐시를 0으로 되감아 씨앗을 지운다: 조용히 깊이 1을 재게 된다.
-        if [ "$use_ab" = 1 ] && [ "$label" = seed ]; then
+        if [ "$use_ab" = 1 ] && [[ "$label" == seed* ]]; then
           echo "ab:seed= 는 없다 — --ab의 팔마다 reset()이 씨앗을 지운다. seed=<깊이>:<ctx> 를 쓴다." >&2
           exit 2
         fi
         witness "pre r$r ours($label,$inst) d=$dep ctx=$ctx n=$n"
         t0=$(date +%s)
         if [ "$use_ab" = 1 ]; then
-          out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
-        elif [ "$label" = seed ]; then
-          out=$("$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time 2>&1)
+          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
+        elif [[ "$label" == seed* ]]; then
+          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time 2>&1)
         else
-          out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time 2>&1)
+          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time 2>&1)
         fi
         rc=$?
         t1=$(date +%s)
