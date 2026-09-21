@@ -13,6 +13,9 @@
 #                        `--ab`에는 워밍 라운드가 있고 `--time`에는 없다 — 둘을 같은 임대 안에
 #                        번갈아 세워야 그 차이가 계기 차이인지 창 표류인지 갈린다. 보고되는 값은
 #                        base 팔(레버 전부 끔 = 실제 경로)의 바퀴별 p50 평균이다.
+#                        BLOOMERY_AB_SET(기본 비어 있음)을 주면 `--ab-set`으로 넘기고, ROW 옆에
+#                        모든 팔의 `ab` 줄을 `ARM` 접두로 같이 찍는다 — keyaxis 세트에서는
+#                        base가 아니라 팔들의 차가 질문이기 때문이다.
 #   toks=<id,id,...>:<ctx>[:<n>]  우리 팔인데 프롬프트를 LCG가 아니라 리터럴 id로 준다.
 #                        헤드라인을 낸 그 프롬프트(id 0 = "The capital of France is")로 계기를
 #                        재현할 때 쓴다 — LCG 팔과 같은 길이에서 값이 같아야 "토큰 값은 시간에
@@ -135,7 +138,7 @@ for r in $(seq "$ROUNDS"); do
         witness "pre r$r ours($label,$inst) d=$dep ctx=$ctx n=$n"
         t0=$(date +%s)
         if [ "$use_ab" = 1 ]; then
-          out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" 2>&1)
+          out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
         else
           out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time 2>&1)
         fi
@@ -158,6 +161,10 @@ for r in $(seq "$ROUNDS"); do
           # base 팔의 바퀴별 p50 평균이므로, 통계 이름을 키에 박아 두 행을 같은 열에서
           # 잘못 읽지 않게 한다(열 하나에 통계 둘이 들어가는 것이 이 표의 유일한 함정이다).
           sums+=("ours($label,ab:base_p50) d=$dep ctx=$ctx n=$n|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')")
+          # 팔 세트를 준 라운드는 팔들의 차가 질문이므로 모든 ab 줄을 그대로 남긴다.
+          if [ -n "${BLOOMERY_AB_SET:-}" ]; then
+            echo "$out" | grep -E '^ab (round|arm)=' | sed "s/^/ARM r$r d=$dep | /"
+          fi
           continue
         fi
         smoke=$(echo "$out" | grep -E '^SMOKE ')

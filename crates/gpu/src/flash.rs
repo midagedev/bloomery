@@ -64,6 +64,14 @@
 //! it takes a guarded path whose `wl == 0.0` test skips those loads — so
 //! padded rows holding NaN bit patterns are never read into any result. A
 //! tile wholly inside the limit reads only real rows and needs no guard.
+//!
+//! Beside the shipped entries this module carries one probe entry per stage
+//! of the segment walk, and one for the merge fold ([`TWICE_QK`] and its
+//! siblings). Each runs its stage a second time and folds that result in
+//! with a zero launch scalar, so it writes what the shipped entry writes and
+//! costs what the shipped entry costs plus that stage — a same-binary A/B
+//! over them prices the stages of an attention step against each other.
+//! They are instruments; no step ships through one.
 
 use crate::GpuError;
 use crate::q8_1_quant_vals;
@@ -122,6 +130,32 @@ pub fn seg_keys() -> usize {
         },
     })
 }
+
+/// Stages of the segment pass one probe entry does a second time, as the
+/// bits of [`FlashKernels::enqueue_flash_latent_seg_twice`]'s `twice` and of
+/// `latent_range`'s const parameter. A probe entry is a TIMING INSTRUMENT:
+/// it folds its second result in with [`PROBE_JIG`], so its partials are the
+/// shipped entry's and the slowdown against them is that stage's price in
+/// the step. The shipped entries pass [`TWICE_NONE`] and every probe branch
+/// folds away at compile time.
+pub const TWICE_NONE: u32 = 0;
+/// The QK dot loop, over the thread's own key row or another (`shift`).
+pub const TWICE_QK: u32 = 1;
+/// The V accumulation loop, over the same tile's rows or another's.
+pub const TWICE_V: u32 = 1 << 1;
+/// The key butterfly, and the tile max and weight sum warp reductions.
+pub const TWICE_COLL: u32 = 1 << 2;
+/// The tile's two block barriers.
+pub const TWICE_SYNC: u32 = 1 << 3;
+/// Warp 0's per-lane softmax arithmetic, both exponentials included.
+pub const TWICE_SM: u32 = 1 << 4;
+
+/// The weight a probe entry folds its second result in with:
+/// `fma(PROBE_JIG, second, first)`. Zero, so the fold returns `first` to the
+/// bit — every value a probe folds is finite — and a launch scalar rather
+/// than a literal, so no pass can see that it is zero and delete the second
+/// pass it weighs.
+pub const PROBE_JIG: f32 = 0.0;
 
 /// Segments a `cache_rows`-tall cache is cut into. One means the cache fits
 /// in a single segment and the single-launch [`flash_latent`] serves it.
@@ -303,8 +337,8 @@ mod flash_kernels {
         // SAFETY: the pointers are this block's shared scratch, `row` is
         // inside q's rows and `0..limit` inside kv's (launch contract).
         let (_, s_sum, r) = unsafe {
-            latent_range(
-                q, kv, qs, klog, kw, st, row, tid, 0, limit, rope, lat, scale,
+            latent_range::<TWICE_NONE>(
+                q, kv, qs, klog, kw, st, row, tid, 0, limit, rope, lat, scale, 0, PROBE_JIG,
             )
         };
 
@@ -411,8 +445,8 @@ mod flash_kernels {
         // SAFETY: the pointers are this block's shared scratch, `row` is
         // inside q's rows and `0..limit` inside kv's (launch contract).
         let (_, s_sum, r) = unsafe {
-            latent_range(
-                q, kv, qs, klog, kw, st, row, tid, 0, limit, rope, lat, scale,
+            latent_range::<TWICE_NONE>(
+                q, kv, qs, klog, kw, st, row, tid, 0, limit, rope, lat, scale, 0, PROBE_JIG,
             )
         };
 
@@ -490,6 +524,67 @@ mod flash_kernels {
         static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
         static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
 
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, which is `seg_pass`'s precondition on the scratch; the
+        // rest of it is this kernel's launch contract.
+        unsafe {
+            seg_pass::<TWICE_NONE>(
+                q,
+                kv,
+                n_keys_buf,
+                scale,
+                m,
+                n_heads,
+                q_rows,
+                rope_dims,
+                latent,
+                dst_rows,
+                segs,
+                seg_keys,
+                &mut part_v,
+                &mut part_ms,
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QROW),
+                    SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                    SharedArray::as_raw_mut_ptr(&raw mut KW),
+                    SharedArray::as_raw_mut_ptr(&raw mut ST),
+                ),
+                0,
+                PROBE_JIG,
+            );
+        }
+    }
+
+    /// The segment pass's body, shared by [`flash_latent_seg`] and the probe
+    /// entries below so the thing timed is the thing shipped: the block's
+    /// `(row, segment)` bookkeeping, the neutral partial of a segment past
+    /// the limit, the walk, and the partial stores. `TWICE`, `shift` and
+    /// `jig` go straight to `latent_range`.
+    ///
+    /// SAFETY: `scratch` is the calling block's own
+    /// `(MAX_WIDTH, KEY_TILE, KEY_TILE, 2)` f32 shared arrays, and the
+    /// arguments satisfy [`flash_latent_seg`]'s launch contract.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn seg_pass<const TWICE: u32>(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &mut DisjointSlice<f32>,
+        part_ms: &mut DisjointSlice<f32>,
+        scratch: (*mut f32, *mut f32, *mut f32, *mut f32),
+        shift: usize,
+        jig: f32,
+    ) {
         let b = thread::blockIdx_x() as usize;
         let tid = thread::threadIdx_x() as usize;
         let rows = q_rows as usize;
@@ -516,21 +611,14 @@ mod flash_kernels {
             return; // block-uniform, and no key row of this segment is read
         }
         let hi = (lo + seg_keys as usize).min(limit);
-        // SAFETY: each `static mut` above is this block's own shared
-        // allocation; every access below is bounded by the array's length
-        // and ordered by `sync_threads`.
-        let (qs, klog, kw, st) = unsafe {
-            (
-                SharedArray::as_raw_mut_ptr(&raw mut QROW),
-                SharedArray::as_raw_mut_ptr(&raw mut KLOG),
-                SharedArray::as_raw_mut_ptr(&raw mut KW),
-                SharedArray::as_raw_mut_ptr(&raw mut ST),
-            )
-        };
+        let (qs, klog, kw, st) = scratch;
         // SAFETY: the pointers are this block's shared scratch, `row` is
         // inside q's rows and `lo..hi <= limit <= dst_rows` inside kv's.
-        let (mx, s_sum, r) =
-            unsafe { latent_range(q, kv, qs, klog, kw, st, row, tid, lo, hi, rope, lat, scale) };
+        let (mx, s_sum, r) = unsafe {
+            latent_range::<TWICE>(
+                q, kv, qs, klog, kw, st, row, tid, lo, hi, rope, lat, scale, shift, jig,
+            )
+        };
         // SAFETY: idx < q_rows * segs and tid < LATENT = latent
         // (host-validated), so both stores are inside their buffers.
         unsafe {
@@ -539,6 +627,359 @@ mod flash_kernels {
                 *part_ms.get_unchecked_mut(2 * idx) = mx;
                 *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
             }
+        }
+    }
+
+    /// [`flash_latent_seg`] with the QK dot loop run a second time — a
+    /// probe entry, not a path the step ships.
+    ///
+    /// Every probe entry in this family takes the segment pass's parameters
+    /// plus `shift`, the second pass's row offset inside the segment (0
+    /// re-reads the rows just read), and `jig`, the weight its second result
+    /// folds in with. The host passes [`PROBE_JIG`], so every one of them
+    /// writes [`flash_latent_seg`]'s partials to the bit and the only thing
+    /// that separates them is time. See [`TWICE_QK`] and its siblings.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_seg_qk2(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+        shift: u32,
+        jig: f32,
+    ) {
+        static mut QROW: SharedArray<f32, MAX_WIDTH> = SharedArray::UNINIT;
+        static mut KLOG: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
+
+        // SAFETY: as in `flash_latent_seg` — the shared arrays are this
+        // block's own and the arguments are that kernel's launch contract.
+        unsafe {
+            seg_pass::<TWICE_QK>(
+                q,
+                kv,
+                n_keys_buf,
+                scale,
+                m,
+                n_heads,
+                q_rows,
+                rope_dims,
+                latent,
+                dst_rows,
+                segs,
+                seg_keys,
+                &mut part_v,
+                &mut part_ms,
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QROW),
+                    SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                    SharedArray::as_raw_mut_ptr(&raw mut KW),
+                    SharedArray::as_raw_mut_ptr(&raw mut ST),
+                ),
+                shift as usize,
+                jig,
+            );
+        }
+    }
+
+    /// [`flash_latent_seg`] with the V accumulation loop run a second time
+    /// — a probe entry ([`TWICE_V`]). Of the family this is the one whose
+    /// second pass needs registers of its own; it compiles to a wider
+    /// budget than the shipped entry and a small local spill, at the same
+    /// two blocks resident per multiprocessor. Keeping that residency is
+    /// the point — an arm one block short would price the lost residency
+    /// and not the loop.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_seg_v2(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+        shift: u32,
+        jig: f32,
+    ) {
+        static mut QROW: SharedArray<f32, MAX_WIDTH> = SharedArray::UNINIT;
+        static mut KLOG: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
+
+        // SAFETY: as in `flash_latent_seg_qk2`.
+        unsafe {
+            seg_pass::<TWICE_V>(
+                q,
+                kv,
+                n_keys_buf,
+                scale,
+                m,
+                n_heads,
+                q_rows,
+                rope_dims,
+                latent,
+                dst_rows,
+                segs,
+                seg_keys,
+                &mut part_v,
+                &mut part_ms,
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QROW),
+                    SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                    SharedArray::as_raw_mut_ptr(&raw mut KW),
+                    SharedArray::as_raw_mut_ptr(&raw mut ST),
+                ),
+                shift as usize,
+                jig,
+            );
+        }
+    }
+
+    /// [`flash_latent_seg`] with the butterfly and the two warp reductions
+    /// run a second time — a probe entry ([`TWICE_COLL`]).
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_seg_coll2(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+        shift: u32,
+        jig: f32,
+    ) {
+        static mut QROW: SharedArray<f32, MAX_WIDTH> = SharedArray::UNINIT;
+        static mut KLOG: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
+
+        // SAFETY: as in `flash_latent_seg_qk2`.
+        unsafe {
+            seg_pass::<TWICE_COLL>(
+                q,
+                kv,
+                n_keys_buf,
+                scale,
+                m,
+                n_heads,
+                q_rows,
+                rope_dims,
+                latent,
+                dst_rows,
+                segs,
+                seg_keys,
+                &mut part_v,
+                &mut part_ms,
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QROW),
+                    SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                    SharedArray::as_raw_mut_ptr(&raw mut KW),
+                    SharedArray::as_raw_mut_ptr(&raw mut ST),
+                ),
+                shift as usize,
+                jig,
+            );
+        }
+    }
+
+    /// [`flash_latent_seg`] with a second pair of block barriers per tile —
+    /// a probe entry ([`TWICE_SYNC`]).
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_seg_sync2(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+        shift: u32,
+        jig: f32,
+    ) {
+        static mut QROW: SharedArray<f32, MAX_WIDTH> = SharedArray::UNINIT;
+        static mut KLOG: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
+
+        // SAFETY: as in `flash_latent_seg_qk2`.
+        unsafe {
+            seg_pass::<TWICE_SYNC>(
+                q,
+                kv,
+                n_keys_buf,
+                scale,
+                m,
+                n_heads,
+                q_rows,
+                rope_dims,
+                latent,
+                dst_rows,
+                segs,
+                seg_keys,
+                &mut part_v,
+                &mut part_ms,
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QROW),
+                    SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                    SharedArray::as_raw_mut_ptr(&raw mut KW),
+                    SharedArray::as_raw_mut_ptr(&raw mut ST),
+                ),
+                shift as usize,
+                jig,
+            );
+        }
+    }
+
+    /// [`flash_latent_seg`] with warp 0's softmax arithmetic run a second
+    /// time — a probe entry ([`TWICE_SM`]).
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_seg_sm2(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+        shift: u32,
+        jig: f32,
+    ) {
+        static mut QROW: SharedArray<f32, MAX_WIDTH> = SharedArray::UNINIT;
+        static mut KLOG: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
+
+        // SAFETY: as in `flash_latent_seg_qk2`.
+        unsafe {
+            seg_pass::<TWICE_SM>(
+                q,
+                kv,
+                n_keys_buf,
+                scale,
+                m,
+                n_heads,
+                q_rows,
+                rope_dims,
+                latent,
+                dst_rows,
+                segs,
+                seg_keys,
+                &mut part_v,
+                &mut part_ms,
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut QROW),
+                    SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                    SharedArray::as_raw_mut_ptr(&raw mut KW),
+                    SharedArray::as_raw_mut_ptr(&raw mut ST),
+                ),
+                shift as usize,
+                jig,
+            );
         }
     }
 
@@ -587,8 +1028,9 @@ mod flash_kernels {
         // so the store is inside y's row segment (launch contract), and the
         // partial reads are inside theirs.
         unsafe {
-            let v = merge_row(
+            let v = merge_row::<false>(
                 n_keys_buf, m, n_heads, dst_rows, segs, seg_keys, part_v, part_ms, row, tid, lat,
+                0, PROBE_JIG,
             );
             *y.get_unchecked_mut(row * lat + tid) = v;
         }
@@ -672,8 +1114,9 @@ mod flash_kernels {
         let lat = latent as usize;
         // SAFETY: as in `flash_merge`.
         let v = unsafe {
-            let v = merge_row(
+            let v = merge_row::<false>(
                 n_keys_buf, m, n_heads, dst_rows, segs, seg_keys, part_v, part_ms, row, tid, lat,
+                0, PROBE_JIG,
             );
             *y.get_unchecked_mut(row * lat + tid) = v;
             v
@@ -694,16 +1137,117 @@ mod flash_kernels {
         }
     }
 
+    /// [`flash_merge_q8`] with the partial fold run a second time — the
+    /// merge pass's probe entry, not a path the step ships. `shift` enters
+    /// the second fold that many segments along and `jig` is the weight its
+    /// result folds in with; the host passes [`PROBE_JIG`], so this writes
+    /// [`flash_merge_q8`]'s `y` and side output to the bit.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2,
+            y.len() >= q_rows * latent,
+            q3a.len() >= m_lo * 64 * half_it,
+            q4a.len() >= m_lo * 256 * quad_it,
+            q6a.len() >= m_lo * 128 * half_it,
+            s8a.len() >= m_lo * 8 * n_sb,
+            d8a.len() >= m_lo * 2 * n_sb,
+            q3b.len() >= (q_rows - m_lo) * 64 * half_it,
+            q4b.len() >= (q_rows - m_lo) * 256 * quad_it,
+            q6b.len() >= (q_rows - m_lo) * 128 * half_it,
+            s8b.len() >= (q_rows - m_lo) * 8 * n_sb,
+            d8b.len() >= (q_rows - m_lo) * 2 * n_sb
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_merge2_q8(
+        n_keys_buf: &[u32],
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        m_lo: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        mut y: DisjointSlice<f32>,
+        mut q3a: DisjointSlice<u64>,
+        mut q4a: DisjointSlice<u32>,
+        mut q6a: DisjointSlice<u32>,
+        mut s8a: DisjointSlice<i32>,
+        mut d8a: DisjointSlice<f32>,
+        mut q3b: DisjointSlice<u64>,
+        mut q4b: DisjointSlice<u32>,
+        mut q6b: DisjointSlice<u32>,
+        mut s8b: DisjointSlice<i32>,
+        mut d8b: DisjointSlice<f32>,
+        shift: u32,
+        jig: f32,
+    ) {
+        static mut VROW: SharedArray<f32, LATENT> = SharedArray::UNINIT;
+
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        if row >= q_rows as usize {
+            return; // block-uniform
+        }
+        let lat = latent as usize;
+        // SAFETY: as in `flash_merge_q8`.
+        let v = unsafe {
+            let v = merge_row::<true>(
+                n_keys_buf,
+                m,
+                n_heads,
+                dst_rows,
+                segs,
+                seg_keys,
+                part_v,
+                part_ms,
+                row,
+                tid,
+                lat,
+                shift as usize,
+                jig,
+            );
+            *y.get_unchecked_mut(row * lat + tid) = v;
+            v
+        };
+        // SAFETY: as in `flash_merge_q8`.
+        let vs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut VROW) };
+        // SAFETY: as in `flash_merge_q8`.
+        unsafe {
+            quant_row(
+                v, vs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
+                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b,
+            );
+        }
+    }
+
     /// One query row's fold over its segments' partials, the standard
     /// online-softmax rescale in ascending segment order — the shared body
     /// of [`flash_merge`] and [`flash_merge_q8`], so the two cannot drift.
     /// Returns this thread's final latent value.
     ///
+    /// `TWICE` is false in every shipped entry. The probe twin sets it and
+    /// the fold runs a second time over the same partials, entered `shift`
+    /// segments along and wrapped, its result folded in by `jig` — zero from
+    /// the host, so the returned value is the shipped one.
+    ///
     /// SAFETY: `row < q_rows`, `tid < latent`, and the partial buffers hold
     /// `q_rows * segs * latent` / `q_rows * segs * 2` elements.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    unsafe fn merge_row(
+    unsafe fn merge_row<const TWICE: bool>(
         n_keys_buf: &[u32],
         m: u32,
         n_heads: u32,
@@ -715,6 +1259,8 @@ mod flash_kernels {
         row: usize,
         tid: usize,
         lat: usize,
+        shift: usize,
+        jig: f32,
     ) -> f32 {
         let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
         let n_seg = limit.div_ceil(seg_keys as usize).min(segs as usize);
@@ -754,6 +1300,51 @@ mod flash_kernels {
                 }
             }
             seg += 1;
+        }
+        if TWICE {
+            // The same fold over the same partials, entered `shift`
+            // segments along so no pass can rewrite its loads as the ones
+            // above.
+            let mut mx2 = f32::NEG_INFINITY;
+            let mut s2 = 0.0f32;
+            let mut acc2 = 0.0f32;
+            let mut at = shift % n_seg.max(1);
+            let mut left = n_seg;
+            while left > 0 {
+                let idx = row * segs as usize + at;
+                // SAFETY: idx < q_rows * segs, so both slots are inside
+                // part_ms (caller's contract).
+                let (mj, sj) = unsafe {
+                    (
+                        *part_ms.get_unchecked(2 * idx),
+                        *part_ms.get_unchecked(2 * idx + 1),
+                    )
+                };
+                if sj != 0.0 {
+                    // SAFETY: as in the fold above.
+                    let vj = unsafe { *part_v.get_unchecked(idx * lat + tid) };
+                    if mj > mx2 {
+                        let f = if mx2 > f32::NEG_INFINITY {
+                            dev_exp(mx2 - mj)
+                        } else {
+                            0.0
+                        };
+                        s2 = f32::mul_add(s2, f, sj);
+                        acc2 = f32::mul_add(acc2, f, vj);
+                        mx2 = mj;
+                    } else {
+                        let g = dev_exp(mj - mx2);
+                        s2 = f32::mul_add(sj, g, s2);
+                        acc2 = f32::mul_add(vj, g, acc2);
+                    }
+                }
+                at += 1;
+                if at == n_seg {
+                    at = 0;
+                }
+                left -= 1;
+            }
+            acc = f32::mul_add(jig, acc2 + s2, acc);
         }
         let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
         s_inv * acc
@@ -862,9 +1453,18 @@ mod flash_kernels {
     /// `lo` is a multiple of [`KEY_TILE`] and `hi <= limit <= dst_rows`, so
     /// only the final tile can reach past `hi` and it takes the guarded path
     /// whose `wl == 0.0` test skips those loads.
+    ///
+    /// `TWICE` is [`TWICE_NONE`] in every shipped entry and each probe
+    /// branch below folds away with it. A probe entry sets one bit and that
+    /// stage runs a second time, its result folded in by
+    /// `fma(jig, second, first)` — the host passes `jig = 0.0`, so the
+    /// returned triple is the shipped one. The two loops' second pass reads
+    /// row `k + shift` for key `k`, wrapped inside `lo..hi`: `shift = 0`
+    /// re-reads the rows this tile just read and a larger one reads rows it
+    /// did not, never a row outside the walk.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn latent_range(
+    unsafe fn latent_range<const TWICE: u32>(
         q: &[f32],
         kv: &[u16],
         qs: *mut f32,
@@ -878,6 +1478,8 @@ mod flash_kernels {
         rope: usize,
         lat: usize,
         scale: f32,
+        shift: usize,
+        jig: f32,
     ) -> (f32, f32, f32) {
         let lane = warp::lane_id() as usize;
         let width = rope + lat;
@@ -896,6 +1498,14 @@ mod flash_kernels {
         // This thread's key inside a tile, and its slice of that key's dims.
         let key = tid / DIM_SPLIT;
         let dim0 = tid % DIM_SPLIT;
+        // Probe only: the second passes' row offset, reduced into the walk
+        // so a wrapped row stays inside `lo..hi`. A probe entry always walks
+        // a live segment, so `hi > lo` wherever this is reached.
+        let step = if TWICE & (TWICE_QK | TWICE_V) != 0 {
+            shift % (hi - lo)
+        } else {
+            0
+        };
 
         let mut mx = f32::NEG_INFINITY;
         let mut s_sum = 0.0f32;
@@ -946,6 +1556,48 @@ mod flash_kernels {
                     i += DIM_SPLIT;
                 }
                 acc = (a0 + a1) + (a2 + a3);
+                if TWICE & TWICE_QK != 0 {
+                    // The same walk over this key's partner row, `step`
+                    // along and wrapped inside the walk.
+                    let mut p = blk + key + step;
+                    if p >= hi {
+                        p -= hi - lo;
+                    }
+                    let pb = p * width;
+                    let mut b0 = 0.0f32;
+                    let mut b1 = 0.0f32;
+                    let mut b2 = 0.0f32;
+                    let mut b3 = 0.0f32;
+                    let mut i = dim0;
+                    while i + (ILP - 1) * DIM_SPLIT < width {
+                        // SAFETY: lo <= p < hi <= dst_rows and every dim
+                        // index is < width, so each load is inside that row
+                        // of kv, exactly as in the pass above.
+                        unsafe {
+                            let k0 = half_bits_to_f32(*kv.get_unchecked(pb + i));
+                            let k1 = half_bits_to_f32(*kv.get_unchecked(pb + i + DIM_SPLIT));
+                            let k2 = half_bits_to_f32(*kv.get_unchecked(pb + i + 2 * DIM_SPLIT));
+                            let k3 = half_bits_to_f32(*kv.get_unchecked(pb + i + 3 * DIM_SPLIT));
+                            b0 = f32::mul_add(*qs.add(i), k0, b0);
+                            b1 = f32::mul_add(*qs.add(i + DIM_SPLIT), k1, b1);
+                            b2 = f32::mul_add(*qs.add(i + 2 * DIM_SPLIT), k2, b2);
+                            b3 = f32::mul_add(*qs.add(i + 3 * DIM_SPLIT), k3, b3);
+                        }
+                        i += ILP * DIM_SPLIT;
+                    }
+                    while i < width {
+                        // SAFETY: as above, for the trailing steps.
+                        unsafe {
+                            b0 = f32::mul_add(
+                                *qs.add(i),
+                                half_bits_to_f32(*kv.get_unchecked(pb + i)),
+                                b0,
+                            );
+                        }
+                        i += DIM_SPLIT;
+                    }
+                    acc = f32::mul_add(jig, (b0 + b1) + (b2 + b3), acc);
+                }
             }
             // The key's DIM_SPLIT threads are one aligned lane group, so the
             // four-step butterfly stays inside the key. Every thread calls
@@ -954,6 +1606,16 @@ mod flash_kernels {
             acc += warp::shuffle_xor_f32(acc, 2);
             acc += warp::shuffle_xor_f32(acc, 4);
             acc += warp::shuffle_xor_f32(acc, 8);
+            if TWICE & TWICE_COLL != 0 {
+                // The same butterfly again. Its input carries `jig` so no
+                // pass can rewrite it as the one above.
+                let mut c = acc + jig;
+                c += warp::shuffle_xor_f32(c, 1);
+                c += warp::shuffle_xor_f32(c, 2);
+                c += warp::shuffle_xor_f32(c, 4);
+                c += warp::shuffle_xor_f32(c, 8);
+                acc = f32::mul_add(jig, c, acc);
+            }
             if dim0 == 0 {
                 let sv = if blk + key < hi {
                     scale * acc
@@ -966,12 +1628,18 @@ mod flash_kernels {
                 }
             }
             thread::sync_threads();
+            if TWICE & TWICE_SYNC != 0 {
+                thread::sync_threads();
+            }
 
             // ---- online softmax: warp 0 owns (m, s) and publishes the tile
             if tid < KEY_TILE {
                 // SAFETY: lane == tid < KEY_TILE here.
                 let sv = unsafe { *klog.add(lane) };
-                let smax = warp::reduce_max_f32(sv);
+                let mut smax = warp::reduce_max_f32(sv);
+                if TWICE & TWICE_COLL != 0 {
+                    smax = f32::mul_add(jig, warp::reduce_max_f32(sv + jig), smax);
+                }
                 // FlashMS update: s is rescaled here, the V partials just
                 // before this tile's accumulation (the CPU oracle's order).
                 // A first bump scales by 0.0 — the partials are still zero,
@@ -983,15 +1651,35 @@ mod flash_kernels {
                     } else {
                         0.0
                     };
+                    if TWICE & TWICE_SM != 0 {
+                        let again = if mx > f32::NEG_INFINITY {
+                            dev_exp((mx + jig) - smax)
+                        } else {
+                            0.0
+                        };
+                        vms = f32::mul_add(jig, again, vms);
+                    }
                     s_sum *= vms;
                     mx = smax;
                 }
-                let w = if sv == f32::NEG_INFINITY {
+                let mut w = if sv == f32::NEG_INFINITY {
                     0.0
                 } else {
                     dev_exp(sv - mx)
                 };
+                if TWICE & TWICE_SM != 0 {
+                    let sv2 = sv + jig;
+                    let again = if sv2 == f32::NEG_INFINITY {
+                        0.0
+                    } else {
+                        dev_exp(sv2 - mx)
+                    };
+                    w = f32::mul_add(jig, again, w);
+                }
                 s_sum += warp::reduce_sum_f32(w);
+                if TWICE & TWICE_COLL != 0 {
+                    s_sum = f32::mul_add(jig, warp::reduce_sum_f32(w + jig), s_sum);
+                }
                 // SAFETY: lane < KEY_TILE; one lane writes each slot, and
                 // lane 0 alone writes the rescale.
                 unsafe {
@@ -1002,6 +1690,9 @@ mod flash_kernels {
                 }
             }
             thread::sync_threads();
+            if TWICE & TWICE_SYNC != 0 {
+                thread::sync_threads();
+            }
 
             // ---- V accumulation: this thread's own latent dim, four keys
             // in flight. SAFETY: ST[0] and KW hold this tile's published
@@ -1031,6 +1722,40 @@ mod flash_kernels {
                     }
                     l += ILP;
                 }
+                if TWICE & TWICE_V != 0 {
+                    // The same walk over a partner tile: the one `step`
+                    // along while it is whole, else the walk's first tile,
+                    // which is whole because this one is. Four partials of
+                    // its own, as above, and one fold each at the end.
+                    let nb = blk + step;
+                    let pb = if nb + KEY_TILE <= hi { nb } else { lo };
+                    let mut u0 = 0.0f32;
+                    let mut u1 = 0.0f32;
+                    let mut u2 = 0.0f32;
+                    let mut u3 = 0.0f32;
+                    let mut l = 0usize;
+                    while l < KEY_TILE {
+                        // SAFETY: lo <= pb and pb + KEY_TILE <= hi <=
+                        // dst_rows, so all ILP rows' tails are inside kv;
+                        // tail < width and l + ILP <= KEY_TILE.
+                        unsafe {
+                            let base = (pb + l) * width + tail;
+                            let v0 = half_bits_to_f32(*kv.get_unchecked(base));
+                            let v1 = half_bits_to_f32(*kv.get_unchecked(base + width));
+                            let v2 = half_bits_to_f32(*kv.get_unchecked(base + 2 * width));
+                            let v3 = half_bits_to_f32(*kv.get_unchecked(base + 3 * width));
+                            u0 = f32::mul_add(*kw.add(l), v0, u0);
+                            u1 = f32::mul_add(*kw.add(l + 1), v1, u1);
+                            u2 = f32::mul_add(*kw.add(l + 2), v2, u2);
+                            u3 = f32::mul_add(*kw.add(l + 3), v3, u3);
+                        }
+                        l += ILP;
+                    }
+                    r0 = f32::mul_add(jig, u0, r0);
+                    r1 = f32::mul_add(jig, u1, r1);
+                    r2 = f32::mul_add(jig, u2, r2);
+                    r3 = f32::mul_add(jig, u3, r3);
+                }
             } else {
                 // The run's last tile is the only one that reaches past the
                 // limit: a zero weight is exactly a row this must not load.
@@ -1051,6 +1776,33 @@ mod flash_kernels {
                     }
                     l += 1;
                 }
+                if TWICE & TWICE_V != 0 {
+                    // The guarded walk again, each live key's partner row
+                    // `step` along and wrapped inside the walk.
+                    let mut u0 = 0.0f32;
+                    let mut l = 0usize;
+                    while l < KEY_TILE {
+                        // SAFETY: l < KEY_TILE.
+                        let wl = unsafe { *kw.add(l) };
+                        if wl != 0.0 {
+                            let mut p = blk + l + step;
+                            if p >= hi {
+                                p -= hi - lo;
+                            }
+                            // SAFETY: lo <= p < hi <= dst_rows, so that
+                            // row's tail is inside kv.
+                            unsafe {
+                                u0 = f32::mul_add(
+                                    wl,
+                                    half_bits_to_f32(*kv.get_unchecked(p * width + tail)),
+                                    u0,
+                                );
+                            }
+                        }
+                        l += 1;
+                    }
+                    r0 = f32::mul_add(jig, u0, r0);
+                }
             }
             blk += KEY_TILE;
         }
@@ -1060,7 +1812,8 @@ mod flash_kernels {
 }
 
 /// The loaded P5 device module: `kv_append`, `kv_append_pos_buf`,
-/// `flash_latent`, `flash_latent_seg`, `flash_merge`. Owns no context and no
+/// `flash_latent`, `flash_latent_seg`, `flash_merge`, their q8 twins and the
+/// stage-doubling probe entries. Owns no context and no
 /// stream — every enqueue takes the
 /// engine stream (`Gpu::stream()`), so launches order with the rest of the
 /// step and are capturable.
@@ -1332,6 +2085,101 @@ impl FlashKernels {
         Ok(())
     }
 
+    /// [`FlashKernels::enqueue_flash_latent_seg`] through the probe entry
+    /// that runs one stage of the walk a second time: `twice` is one of
+    /// [`TWICE_QK`], [`TWICE_V`], [`TWICE_COLL`], [`TWICE_SYNC`] and
+    /// [`TWICE_SM`], and `shift` is the second pass's row offset inside the
+    /// segment — 0 re-reads the rows just read, [`KEY_TILE`] reads the next
+    /// tile's — which only the two loop stages look at. A TIMING
+    /// INSTRUMENT: the partials are the shipped entry's to the bit, so an
+    /// arm's slowdown against it is that stage's price in the step.
+    /// Asynchronous, allocation-free, capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_flash_latent_seg_twice(
+        &self,
+        stream: &CudaStream,
+        q: &DeviceBuffer<f32>,
+        kv: &DeviceTensor<u16>,
+        n_keys_buf: &DeviceBuffer<u32>,
+        scale: f32,
+        m: usize,
+        n_heads: usize,
+        rope_dims: usize,
+        latent: usize,
+        part_v: &mut DeviceBuffer<f32>,
+        part_ms: &mut DeviceBuffer<f32>,
+        twice: u32,
+        shift: usize,
+    ) -> Result<(), GpuError> {
+        let segs = segments_for(kv.rows());
+        let q_rows = check_flash(
+            "enqueue_flash_latent_seg_twice",
+            q.len(),
+            kv,
+            n_keys_buf.len(),
+            m,
+            n_heads,
+            rope_dims,
+            latent,
+            None,
+        )?;
+        check_partials(
+            "enqueue_flash_latent_seg_twice",
+            part_v.len(),
+            part_ms.len(),
+            q_rows,
+            segs,
+            latent,
+        )?;
+        if segs == 1 {
+            return Err(
+                "enqueue_flash_latent_seg_twice: the probe entries are the split \
+                        launch's, and a one-segment cache runs the single-block kernel"
+                    .into(),
+            );
+        }
+        let cfg = LaunchConfig1D::new((q_rows * segs) as u32, LATENT as u32, 0);
+        macro_rules! probe {
+            ($prepare:ident, $entry:ident) => {{
+                let prep = self.module.$prepare(cfg)?;
+                self.module.$entry(
+                    stream,
+                    &prep,
+                    q,
+                    kv.buf(),
+                    n_keys_buf,
+                    scale,
+                    m as u32,
+                    n_heads as u32,
+                    q_rows as u32,
+                    rope_dims as u32,
+                    latent as u32,
+                    kv.rows() as u32,
+                    segs as u32,
+                    seg_keys() as u32,
+                    part_v,
+                    part_ms,
+                    shift as u32,
+                    PROBE_JIG,
+                )?;
+            }};
+        }
+        match twice {
+            TWICE_QK => probe!(prepare_flash_latent_seg_qk2, flash_latent_seg_qk2),
+            TWICE_V => probe!(prepare_flash_latent_seg_v2, flash_latent_seg_v2),
+            TWICE_COLL => probe!(prepare_flash_latent_seg_coll2, flash_latent_seg_coll2),
+            TWICE_SYNC => probe!(prepare_flash_latent_seg_sync2, flash_latent_seg_sync2),
+            TWICE_SM => probe!(prepare_flash_latent_seg_sm2, flash_latent_seg_sm2),
+            other => {
+                return Err(format!(
+                    "enqueue_flash_latent_seg_twice: {other} names no single probe stage"
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     /// The merge pass alone — the second of the two launches. `cache_rows`
     /// is the height the partials were written for, so the segment count
     /// matches the segment pass's grid exactly.
@@ -1480,6 +2328,94 @@ impl FlashKernels {
             &mut hi.q6,
             &mut hi.s8,
             &mut hi.d8,
+        )?;
+        Ok(())
+    }
+
+    /// [`FlashKernels::enqueue_flash_merge_q8`] through the probe entry that
+    /// folds the partials a second time, `shift` segments along. A TIMING
+    /// INSTRUMENT: `y` and the side output are the shipped entry's to the
+    /// bit, so the arm's slowdown against it is the fold's price in the
+    /// step. Asynchronous, allocation-free, capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_flash_merge2_q8(
+        &self,
+        stream: &CudaStream,
+        n_keys_buf: &DeviceBuffer<u32>,
+        cache_rows: usize,
+        m: usize,
+        n_heads: usize,
+        latent: usize,
+        part_v: &DeviceBuffer<f32>,
+        part_ms: &DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+        lo: &mut Q8Act,
+        hi: &mut Q8Act,
+        shift: usize,
+    ) -> Result<(), GpuError> {
+        let segs = segments_for(cache_rows);
+        let q_rows = m * n_heads;
+        if n_keys_buf.is_empty() {
+            return Err("enqueue_flash_merge2_q8: n_keys_buf must hold 1 u32".into());
+        }
+        if latent != LATENT {
+            return Err(format!(
+                "enqueue_flash_merge2_q8: this family's latent tail is {LATENT}, got {latent}"
+            )
+            .into());
+        }
+        check_partials(
+            "enqueue_flash_merge2_q8",
+            part_v.len(),
+            part_ms.len(),
+            q_rows,
+            segs,
+            latent,
+        )?;
+        if y.len() < q_rows * latent {
+            return Err(format!(
+                "enqueue_flash_merge2_q8: y.len() {} < m*n_heads*latent = {}",
+                y.len(),
+                q_rows * latent
+            )
+            .into());
+        }
+        let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge2_q8", lo, hi, q_rows, latent)?;
+        let prep = self.module.prepare_flash_merge2_q8(LaunchConfig1D::new(
+            q_rows as u32,
+            LATENT as u32,
+            0,
+        ))?;
+        self.module.flash_merge2_q8(
+            stream,
+            &prep,
+            n_keys_buf,
+            m as u32,
+            n_heads as u32,
+            q_rows as u32,
+            latent as u32,
+            cache_rows as u32,
+            segs as u32,
+            seg_keys() as u32,
+            m_lo as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            n_sb.div_ceil(4) as u32,
+            part_v,
+            part_ms,
+            y,
+            &mut lo.q3,
+            &mut lo.q4,
+            &mut lo.q6,
+            &mut lo.s8,
+            &mut lo.d8,
+            &mut hi.q3,
+            &mut hi.q4,
+            &mut hi.q6,
+            &mut hi.s8,
+            &mut hi.d8,
+            shift as u32,
+            PROBE_JIG,
         )?;
         Ok(())
     }

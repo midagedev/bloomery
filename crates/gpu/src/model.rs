@@ -1353,6 +1353,14 @@ pub enum StepMode {
 /// launch plus a synchronize, and the step runs as graph nodes.
 /// `pad_per_layer` adds empty nodes and prices the slope; `skip_quant` drops
 /// the five small quantize launches and prices their removal, work included.
+///
+/// The `flash_*` levers ask the other question — what one STAGE of the
+/// attention walk costs — and they answer it by doing that stage a second
+/// time (`crate::flash::TWICE_QK` and its siblings). They are launch-shape
+/// neutral and value neutral: the same node count, and the same tokens as
+/// the shipped path, which `gate_e2e` pins. The slowdown of one against
+/// `base` is a lower bound on that stage's price, the second pass running
+/// against a warm cache.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StepProbe {
     /// Empty `probe::touch` launches enqueued once per layer. The captured
@@ -1387,6 +1395,117 @@ pub struct StepProbe {
     /// that carries both geometries. The launch order around them does not
     /// change, so this arm isolates the merge itself.
     pub split_moe_quant: bool,
+    /// Run the flash segment pass's QK dot twice, over the same key rows.
+    pub flash_qk2: bool,
+    /// The same, over rows one key tile along inside the segment — the same
+    /// work on rows the tile did not just read, so the pair brackets what a
+    /// cache hit is worth in that loop.
+    pub flash_qk2c: bool,
+    /// Run the segment pass's V accumulation twice, over the same rows.
+    pub flash_v2: bool,
+    /// The same, over the neighbouring tile's rows.
+    pub flash_v2c: bool,
+    /// Run the key butterfly and the two warp reductions twice.
+    pub flash_coll2: bool,
+    /// Give every tile a second pair of block barriers.
+    pub flash_sync2: bool,
+    /// Run warp 0's softmax arithmetic twice, both exponentials included.
+    pub flash_sm2: bool,
+    /// Run the merge pass's fold over the segment partials twice.
+    pub flash_merge2: bool,
+}
+
+impl StepProbe {
+    /// The flash stage-doubling arms, in the order
+    /// `generate --ab-set keyaxis` rotates them: the shipped path and each
+    /// lever alone. One list, so the gate that pins their tokens and the
+    /// runner that times them cannot disagree about what an arm is.
+    pub fn keyaxis_arms() -> [(&'static str, StepProbe); 9] {
+        let arm = |set: fn(&mut StepProbe)| {
+            let mut p = StepProbe::default();
+            set(&mut p);
+            p
+        };
+        [
+            ("base", StepProbe::default()),
+            ("flash_qk2", arm(|p| p.flash_qk2 = true)),
+            ("flash_qk2c", arm(|p| p.flash_qk2c = true)),
+            ("flash_v2", arm(|p| p.flash_v2 = true)),
+            ("flash_v2c", arm(|p| p.flash_v2c = true)),
+            ("flash_coll2", arm(|p| p.flash_coll2 = true)),
+            ("flash_sync2", arm(|p| p.flash_sync2 = true)),
+            ("flash_sm2", arm(|p| p.flash_sm2 = true)),
+            ("flash_merge2", arm(|p| p.flash_merge2 = true)),
+        ]
+    }
+
+    /// The segment-pass probe entry this probe selects, as the stage bit and
+    /// the second pass's row offset; `None` is the shipped entry.
+    fn flash_seg_twice(&self) -> Option<(u32, usize)> {
+        [
+            (self.flash_qk2, crate::flash::TWICE_QK, 0),
+            (
+                self.flash_qk2c,
+                crate::flash::TWICE_QK,
+                crate::flash::KEY_TILE,
+            ),
+            (self.flash_v2, crate::flash::TWICE_V, 0),
+            (
+                self.flash_v2c,
+                crate::flash::TWICE_V,
+                crate::flash::KEY_TILE,
+            ),
+            (self.flash_coll2, crate::flash::TWICE_COLL, 0),
+            (self.flash_sync2, crate::flash::TWICE_SYNC, 0),
+            (self.flash_sm2, crate::flash::TWICE_SM, 0),
+        ]
+        .into_iter()
+        .find(|&(on, _, _)| on)
+        .map(|(_, bit, shift)| (bit, shift))
+    }
+
+    /// Refuse a flash lever that would silently do nothing — the shape a
+    /// later round reads as a broken lever. Two segment-pass levers would
+    /// each claim the one segment launch; a cache short enough to hold one
+    /// segment runs a kernel with no probe twin at all; and the merge lever
+    /// probes the q8 merge, which `skip_quant` and `split_flash_quant`
+    /// replace with the plain one.
+    fn check(&self, cache_rows: usize) -> Result<(), GpuError> {
+        let seg = [
+            self.flash_qk2,
+            self.flash_qk2c,
+            self.flash_v2,
+            self.flash_v2c,
+            self.flash_coll2,
+            self.flash_sync2,
+            self.flash_sm2,
+        ]
+        .iter()
+        .filter(|on| **on)
+        .count();
+        if seg > 1 {
+            return Err(
+                "StepProbe: one flash segment-pass lever at a time — each names the probe \
+                 entry the segment launch runs, and they are one launch"
+                    .into(),
+            );
+        }
+        if (seg == 1 || self.flash_merge2) && crate::flash::segments_for(cache_rows) == 1 {
+            return Err(format!(
+                "StepProbe: the flash levers probe the split launch, and a {cache_rows}-row \
+                 cache takes the single-block kernel — raise ctx or drop the lever"
+            )
+            .into());
+        }
+        if self.flash_merge2 && (self.skip_quant || self.split_flash_quant) {
+            return Err(
+                "StepProbe: flash_merge2 probes the q8 merge, and skip_quant / \
+                 split_flash_quant put the plain merge back in its place"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One resident model: its stages in layer order, covering every block
@@ -1609,6 +1728,7 @@ impl GpuModel {
     /// instrument: `skip_quant` leaves activation buffers unwritten, so the
     /// tokens that come out are not the model's answer.
     pub fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
+        probe.check(self.ctx_max)?;
         let (_, residency) = self.stage_parts("set_probe")?;
         residency.scratch.probe_cfg = probe;
         self.step_graph = None;
@@ -3069,19 +3189,38 @@ fn enqueue_attn(
             ]),
         )?;
     } else {
-        gpu.flash().enqueue_flash_latent_seg(
-            stream,
-            &s.f_rows,
-            kv_l,
-            &s.n_keys_buf,
-            mla.kq_scale,
-            1,
-            mla.n_head,
-            rope,
-            latent,
-            &mut s.part_v,
-            &mut s.part_ms,
-        )?;
+        // A flash lever swaps the segment launch for the probe entry that
+        // does one stage twice — the same launch, the same partials.
+        match s.probe_cfg.flash_seg_twice() {
+            None => gpu.flash().enqueue_flash_latent_seg(
+                stream,
+                &s.f_rows,
+                kv_l,
+                &s.n_keys_buf,
+                mla.kq_scale,
+                1,
+                mla.n_head,
+                rope,
+                latent,
+                &mut s.part_v,
+                &mut s.part_ms,
+            )?,
+            Some((twice, shift)) => gpu.flash().enqueue_flash_latent_seg_twice(
+                stream,
+                &s.f_rows,
+                kv_l,
+                &s.n_keys_buf,
+                mla.kq_scale,
+                1,
+                mla.n_head,
+                rope,
+                latent,
+                &mut s.part_v,
+                &mut s.part_ms,
+                twice,
+                shift,
+            )?,
+        }
         // Same reads as the single-block launch; the partials of the live
         // segments out, plus the `(−inf, 0)` pair every segment past the
         // live keys still writes so the merge can skip it.
@@ -3099,19 +3238,36 @@ fn enqueue_attn(
             ]),
         )?;
         if fold_quant {
-            gpu.flash().enqueue_flash_merge_q8(
-                stream,
-                &s.n_keys_buf,
-                kv_l.rows(),
-                1,
-                mla.n_head,
-                latent,
-                &s.part_v,
-                &s.part_ms,
-                &mut s.kqvc,
-                &mut s.act_kv_lo,
-                &mut s.act_kv_hi,
-            )?;
+            if s.probe_cfg.flash_merge2 {
+                gpu.flash().enqueue_flash_merge2_q8(
+                    stream,
+                    &s.n_keys_buf,
+                    kv_l.rows(),
+                    1,
+                    mla.n_head,
+                    latent,
+                    &s.part_v,
+                    &s.part_ms,
+                    &mut s.kqvc,
+                    &mut s.act_kv_lo,
+                    &mut s.act_kv_hi,
+                    0,
+                )?;
+            } else {
+                gpu.flash().enqueue_flash_merge_q8(
+                    stream,
+                    &s.n_keys_buf,
+                    kv_l.rows(),
+                    1,
+                    mla.n_head,
+                    latent,
+                    &s.part_v,
+                    &s.part_ms,
+                    &mut s.kqvc,
+                    &mut s.act_kv_lo,
+                    &mut s.act_kv_hi,
+                )?;
+            }
         } else {
             gpu.flash().enqueue_flash_merge(
                 stream,

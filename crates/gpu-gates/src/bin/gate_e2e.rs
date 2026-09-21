@@ -32,6 +32,13 @@
 //! - (2) graph mode reproduces the eager sequence token for token on every
 //!   prompt — the eager-equals-replay arm every step gate has.
 //! - (3) determinism: two eager runs give identical tables.
+//! - (4) every flash stage-doubling arm (`StepProbe::keyaxis_arms`) writes
+//!   the base path's tokens, on this prompt set and on a deeper prompt, at
+//!   the same node count. Those arms are the ruler the attention rounds
+//!   read their stage prices off, and the reading is only a stage's price
+//!   while nothing else moves: identical tokens mean identical routing, so
+//!   the rest of the step is the same work. This is where the probes'
+//!   `fma(jig, second, first)` fold is pinned as the no-op it claims to be.
 //!
 //! The classifier, the reference reader and the three classes are
 //! `gpu_gates::prompts`; this gate does not re-implement them.
@@ -45,7 +52,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::GpuModel;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::StepMode;
+use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::open_model;
 #[cfg(feature = "gpu")]
@@ -61,6 +68,15 @@ const GEN: usize = 32;
 /// between prompts.
 #[cfg(feature = "gpu")]
 const CTX_MAX: usize = 256;
+
+/// The keyaxis arms' deeper case: a prompt whose live keys reach past one
+/// flash segment, so the merge folds more than one partial and a probe's
+/// second pass wraps inside a whole segment instead of a short first one.
+/// `DEEP_PROMPT + DEEP_GEN` stays inside `CTX_MAX`.
+#[cfg(feature = "gpu")]
+const DEEP_PROMPT: usize = 200;
+#[cfg(feature = "gpu")]
+const DEEP_GEN: usize = 16;
 
 /// PIN(2026-09-21): the reference top1-top2 margin below which a first
 /// difference is a near-tie re-lottery rather than a fault. Derivation: the
@@ -204,6 +220,46 @@ fn run_set(
         out.push(seq);
     }
     Ok(out)
+}
+
+/// A fixed pseudo-random prompt of `n` ids: BOS, then an LCG walk over the
+/// id range the depth runners feed. Random ids are less kind to the caches
+/// than real text, which is what the deep arm wants of them.
+#[cfg(feature = "gpu")]
+fn lcg_prompt(n: usize) -> Vec<u32> {
+    let mut s: u64 = 12345;
+    let mut out = vec![100000u32];
+    while out.len() < n {
+        s = s.wrapping_mul(1103515245).wrapping_add(12345) % 2147483648;
+        out.push(1000 + (s % 90000) as u32);
+    }
+    out
+}
+
+/// One continuation of `prompt`: fresh caches, the prompt fed one token at
+/// a time, then `DEEP_GEN` - 1 feedback steps.
+#[cfg(feature = "gpu")]
+fn run_deep(model: &mut GpuModel, prompt: &[u32]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    model.reset()?;
+    let mut next = model.step(prompt)?;
+    let mut seq = Vec::with_capacity(DEEP_GEN);
+    seq.push(next);
+    for _ in 1..DEEP_GEN {
+        next = model.step(&[next])?;
+        seq.push(next);
+    }
+    Ok(seq)
+}
+
+/// The first place two token tables differ, as `(prompt index, token
+/// index)` — what a failing arm needs to say about itself.
+#[cfg(feature = "gpu")]
+fn first_diff(a: &[Vec<u32>], b: &[Vec<u32>]) -> Option<(usize, usize)> {
+    a.iter().zip(b).enumerate().find_map(|(i, (x, y))| {
+        (0..x.len().min(y.len()))
+            .find(|&k| x[k] != y[k])
+            .map(|k| (i, k))
+    })
 }
 
 #[cfg(feature = "gpu")]
@@ -384,12 +440,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // (4) The flash stage-doubling arms against the base path they are read
+    // against. Every arm runs the whole set and the deeper prompt in graph
+    // mode; `base` runs too, which also says the graph arm above reproduces
+    // itself after a probe rebuild.
+    let deep_prompt = lcg_prompt(DEEP_PROMPT);
+    let mut deep_base: Vec<u32> = Vec::new();
+    for (name, probe) in StepProbe::keyaxis_arms() {
+        model.set_probe(probe)?;
+        let nodes = model.capture_step()?;
+        let set = run_set(&mut model, &prompts, &reference)?;
+        let deep = run_deep(&mut model, &deep_prompt)?;
+        if name == "base" {
+            deep_base = deep.clone();
+        }
+        let set_same = set == graph;
+        let deep_same = deep == deep_base;
+        let pass = set_same && deep_same && nodes == NODES_CHAIN;
+        println!(
+            "keyaxis arm={name} graph_nodes={nodes} set_identical={set_same} \
+             deep_identical={deep_same} {}",
+            if pass { "ok" } else { "FAIL" }
+        );
+        if !pass {
+            ok = false;
+            if let Some((i, k)) = first_diff(&set, &graph) {
+                println!(
+                    "  prompt {} token {k}: arm {} vs base {}",
+                    reference[i].id, set[i][k], graph[i][k]
+                );
+            }
+            if let Some(k) = (0..deep.len().min(deep_base.len())).find(|&k| deep[k] != deep_base[k])
+            {
+                println!(
+                    "  deep prompt token {k}: arm {} vs base {}",
+                    deep[k], deep_base[k]
+                );
+            }
+            if nodes != NODES_CHAIN {
+                println!("  the arm captured {nodes} nodes, the pin is {NODES_CHAIN}");
+            }
+        }
+    }
+    model.set_probe(StepProbe::default())?;
+
     if ok {
         println!(
             "gate_e2e: PASS — the whole chain picks the greedy reference's first token on \
              every prompt or misses it only inside MARGIN_FLOOR; graph replay equals eager \
-             token for token at the pinned node count; two eager runs are identical; and the \
-             two reference files agree with each other."
+             token for token at the pinned node count; two eager runs are identical; every \
+             flash stage-doubling arm writes the base path's tokens at that same node count; \
+             and the two reference files agree with each other."
         );
         Ok(())
     } else {

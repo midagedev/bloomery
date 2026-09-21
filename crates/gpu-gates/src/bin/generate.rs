@@ -7,7 +7,7 @@
 //! position per call — and to print what came out.
 //!
 //!     generate [--prompt-id <id> | --tokens a,b,c] [-n N] [--ctx C]
-//!              [--mode eager|graph] [--time] [--ab R]
+//!              [--mode eager|graph] [--time] [--ab R [--ab-set SET]]
 //!
 //! Defaults: prompt 0, N 32, ctx 512, mode graph.
 //!
@@ -33,6 +33,13 @@
 //! round reads fast, which is enough to flip a claim of about a percent.
 //! Each arm run rewinds to an empty cache and re-captures its graph, so an
 //! arm never inherits the previous one's state.
+//!
+//! `--ab-set` picks which arms: `launch` (the default) is the launch-shape
+//! levers, each restoring one merge to the pair it replaced; `keyaxis` is
+//! `StepProbe::keyaxis_arms` — the shipped path and each flash
+//! stage-doubling lever alone, where an arm's gap to `base` is the price of
+//! the attention stage it does twice. Both sets are same-binary, and every
+//! arm of either writes the tokens `base` writes.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -121,6 +128,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         split_kqvc: std::env::args().any(|a| a == "--probe-split-kqvc"),
         split_flash_quant: std::env::args().any(|a| a == "--probe-split-flash-quant"),
         split_moe_quant: std::env::args().any(|a| a == "--probe-split-moe-quant"),
+        // The flash stage-doubling levers are an arm set, not flags: they
+        // are only worth reading interleaved against `base`.
+        ..StepProbe::default()
     };
 
     // `split_kqvc` rolls the kqvc quantize PAIR back into two launches, and
@@ -136,12 +146,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
 
+    // Refused rather than ignored: an arm set with no `--ab` to run it is
+    // the shape a later round reads as "the set is broken".
+    let ab_set = flag_value("--ab-set");
+    if ab_set.is_some() && flag_value("--ab").is_none() {
+        return Err(
+            "generate: --ab-set picks the arms of --ab, which this run has not asked \
+                    for. Pass both, or neither."
+                .into(),
+        );
+    }
+
     let gguf = open_model()?;
     let mut model = GpuModel::load_full(&gguf, ctx)?;
     model.set_mode(mode);
     if let Some(rounds) = flag_value("--ab") {
         let rounds: usize = rounds.parse()?;
-        return ab(&mut model, &tokens, n_gen, rounds, mode);
+        let arms: Vec<(&str, StepProbe)> = match ab_set.as_deref() {
+            None | Some("launch") => launch_arms().to_vec(),
+            Some("keyaxis") => StepProbe::keyaxis_arms().to_vec(),
+            Some(other) => {
+                return Err(format!("generate: --ab-set is launch or keyaxis, not {other}").into());
+            }
+        };
+        return ab(&mut model, &tokens, n_gen, rounds, mode, &arms);
     }
     if probe != StepProbe::default() {
         model.set_probe(probe)?;
@@ -232,9 +260,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// deviation, which is what a reader needs to know whether a sub-percent
 /// gap is a gap — this card's same-binary scatter is of that size.
 ///
-/// `base` (every lever off) is the shipped path; each other arm restores
-/// one merge to the launch shape it replaced. Their outputs are all
-/// bit-identical by the gates, so a difference here is launch cost alone.
+/// `base` (every lever off) is the shipped path; each other arm of the
+/// `launch` set restores one merge to the launch shape it replaced, and
+/// each arm of the `keyaxis` set does one attention stage twice. Their
+/// outputs are all bit-identical by the gates, so a difference here is
+/// launch cost or that stage's cost alone.
 #[cfg(feature = "gpu")]
 fn ab(
     model: &mut GpuModel,
@@ -242,39 +272,15 @@ fn ab(
     n_gen: usize,
     rounds: usize,
     mode: StepMode,
+    arms: &[(&str, StepProbe)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if rounds == 0 || n_gen < 2 {
         return Err("generate: --ab wants R >= 1 and -n >= 2".into());
     }
-    let arms: [(&str, StepProbe); 4] = [
-        ("base", StepProbe::default()),
-        (
-            "split_flash_quant",
-            StepProbe {
-                split_flash_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-        (
-            "split_moe_quant",
-            StepProbe {
-                split_moe_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-        (
-            "split_both",
-            StepProbe {
-                split_flash_quant: true,
-                split_moe_quant: true,
-                ..StepProbe::default()
-            },
-        ),
-    ];
     let mut p50s: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); arms.len()];
     // One untimed warm round: the first arm of the first round otherwise
     // carries the load's cold caches into its own number.
-    for (_, probe) in &arms {
+    for (_, probe) in arms {
         arm_p50(model, tokens, n_gen, *probe)?;
     }
     for r in 0..rounds {
@@ -311,6 +317,37 @@ fn ab(
     }
     println!("reference {IK_REFERENCE}");
     Ok(())
+}
+
+/// The launch-shape arm set, `--ab-set launch`: the shipped path and the
+/// rollback of each merge the fusion rounds made.
+#[cfg(feature = "gpu")]
+fn launch_arms() -> [(&'static str, StepProbe); 4] {
+    [
+        ("base", StepProbe::default()),
+        (
+            "split_flash_quant",
+            StepProbe {
+                split_flash_quant: true,
+                ..StepProbe::default()
+            },
+        ),
+        (
+            "split_moe_quant",
+            StepProbe {
+                split_moe_quant: true,
+                ..StepProbe::default()
+            },
+        ),
+        (
+            "split_both",
+            StepProbe {
+                split_flash_quant: true,
+                split_moe_quant: true,
+                ..StepProbe::default()
+            },
+        ),
+    ]
 }
 
 /// One arm run: rewind to an empty cache, set the probe (which drops any
