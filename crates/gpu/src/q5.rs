@@ -702,6 +702,26 @@ impl Q8Blocks32 {
     pub fn q_stride(&self) -> usize {
         self.q_stride
     }
+
+    /// Read the three buffers back to the host — a gate's comparison between
+    /// two paths (the fields are crate-private). Diagnostic readback:
+    /// synchronizes `stream`, so load-time/gate use only, never inside a
+    /// graph capture.
+    pub fn readback(&self, stream: &CudaStream) -> Result<Q8Blocks32Host, GpuError> {
+        Ok(Q8Blocks32Host {
+            q: self.q.to_host_vec(stream)?,
+            s8: self.s8.to_host_vec(stream)?,
+            d8: self.d8.to_host_vec(stream)?,
+        })
+    }
+}
+
+/// The three buffers of a `Q8Blocks32` on the host, as `readback` returns
+/// them.
+pub struct Q8Blocks32Host {
+    pub q: Vec<u32>,
+    pub s8: Vec<i32>,
+    pub d8: Vec<f32>,
 }
 
 /// Repack `rows` rows of raw gguf Q5_0 bytes (22 B per 32-value block: d f16,
