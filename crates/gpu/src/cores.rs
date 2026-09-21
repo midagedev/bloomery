@@ -10,6 +10,7 @@
 //! established exception is `q4k_a_chain`, which loads its own q8 window and
 //! predates the rule (measured on the 3090 with the loads inside).
 
+use cuda_device::convert::cvt_f32_f16x2_lo;
 use cuda_device::dotprod::dp4a_s32;
 
 // ---- shared ----
@@ -20,8 +21,18 @@ use cuda_device::dotprod::dp4a_s32;
 /// ggml's own table — on all 65,536 patterns, NaN payloads included.
 /// `gate_p4`'s `half_decode` asserts that whole space. The hardware's
 /// one-instruction `cvt.f32.f16` (`flash::half_bits_to_f32`) agrees on every
-/// finite and infinite input but canonicalizes NaN payloads, so it is not a
-/// substitute here while the payload is part of the contract.
+/// finite and infinite input but canonicalizes NaN payloads.
+///
+/// That makes the hardware convert a substitute exactly where the value
+/// cannot be a NaN, and nowhere else. `q3k_sb_decode` takes it for the Q3_K
+/// super-block scale (2026-09-21, q3kdec round): a scale read from a GGUF is
+/// finite or the model's output is not a number, and ik reads the same field
+/// with `__half2float`. Q4_K's `d`/`dmin`, Q6_K's inline decode and
+/// `gate_p4`'s whole-space assertion still call this function, and
+/// `gate_p6`'s `q3k_half_decode_shape` is what keeps the split from drifting
+/// silently — no `clz` in the Q3_K entries, `clz` still present in the
+/// others. A site where the payload could carry meaning keeps the software
+/// path.
 #[inline(always)]
 pub fn half_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) as u32) << 31;
@@ -586,6 +597,38 @@ pub fn q3k_sub_scale(t: &[u32; 4], sx: usize) -> i32 {
     (((wx >> (8 * (sx & 3))) & 0xff) as u8 as i8 as i32) - 32
 }
 
+/// The four sub-block scales one lane of [`q3k_row_dot`] needs, read out of
+/// the three funneled scale words directly instead of building all sixteen
+/// first. `s0` is the lane's first sub-block index and takes one of four
+/// values, which fixes both the byte pair and the nibble half for all four:
+/// the low nibbles of sub-blocks `s0` and `s0+2` sit in bytes `s0&1` and
+/// `(s0&1)+2` of `a0w`, those of `s0+4` and `s0+6` in the same two bytes of
+/// `a1w`, and every 2-bit high part comes from those same two bytes of
+/// `a2w`, the second pair two bits up. Two packed halves carry a pair at a
+/// time, so the whole extraction is six masked shifts and two ORs.
+///
+/// Identical to `q3k_sub_scale(&q3k_aux_scales(a0w, a1w, a2w), s0 + 2j)` for
+/// j in 0..4 — the same bits by a shorter route, which is what lets the
+/// decode keep one owner. `q3k_aux_scales` still builds the full sixteen for
+/// the dequant-to-rows kernel, which wants every sub-block.
+#[inline(always)]
+pub fn q3k_sub_scales4(a0w: u32, a1w: u32, a2w: u32, s0: usize) -> [i32; 4] {
+    // 8*(s0&1) picks the byte pair inside the word, 4*(s0>>3) the nibble
+    // half. Both come from the lane index alone, so the shift is loop
+    // invariant and lifts out of the row walk.
+    let sh = (((s0 & 1) << 3) | ((s0 >> 3) << 2)) as u32;
+    let p0 = ((a0w >> sh) & 0x000f_000f) | (((a2w >> sh) & 0x0003_0003) << 4);
+    let p1 = ((a1w >> sh) & 0x000f_000f) | (((a2w >> (sh + 2)) & 0x0003_0003) << 4);
+    // Every scale byte is at most 63, so the 32 offset folded into Q3_K
+    // scales subtracts without a sign extension.
+    [
+        (p0 & 0xff) as i32 - 32,
+        (p0 >> 16) as i32 - 32,
+        (p1 & 0xff) as i32 - 32,
+        (p1 >> 16) as i32 - 32,
+    ]
+}
+
 /// SWAR dequant of the lane's four field quads to signed bytes: vi byte b =
 /// vil - 4*(1 - hbit). The |0x80 / ^0x80 bias makes the per-byte subtract
 /// borrow-free; dp4a_s32 reads the bytes as signed.
@@ -668,7 +711,6 @@ pub fn q3k_sb_decode(w: &[u32], base: usize, w16: usize, s0: usize) -> ([u32; 4]
     } else {
         (funnel16(aw0, aw1), funnel16(aw1, aw2), funnel16(aw2, aw3))
     };
-    let ts = q3k_aux_scales(a0w, a1w, a2w);
 
     // Super-block scale d (f16 at bytes base+108..109): low half of aw3
     // for an even window (word covers 108..111), high half for odd (word
@@ -678,15 +720,15 @@ pub fn q3k_sb_decode(w: &[u32], base: usize, w16: usize, s0: usize) -> ([u32; 4]
     } else {
         (aw3 >> 16) as u16
     };
-    let drow = half_to_f32(d_bits);
+    // The hardware's widening convert, not `half_to_f32`: widening f16 to
+    // f32 is exact, so the two agree on every finite and infinite pattern,
+    // and a super-block scale read from a GGUF is one of those. The decode
+    // is one instruction here against a seven-block branch tree whose
+    // subnormal arm is a loop, and it sits on the row walk's critical path.
+    let drow = cvt_f32_f16x2_lo(d_bits as u32);
 
     // Sub-block scales for fields 0..3: sub-block s0+2j.
-    let sc = [
-        q3k_sub_scale(&ts, s0),
-        q3k_sub_scale(&ts, s0 + 2),
-        q3k_sub_scale(&ts, s0 + 4),
-        q3k_sub_scale(&ts, s0 + 6),
-    ];
+    let sc = q3k_sub_scales4(a0w, a1w, a2w, s0);
 
     // Dequantize the four quads to signed bytes (SWAR): q3k_dequant folds
     // the hbit subtract borrow-free.

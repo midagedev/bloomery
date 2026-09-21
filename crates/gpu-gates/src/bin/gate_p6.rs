@@ -474,6 +474,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     router_shape(&mut ok)?;
+    q3k_half_decode_shape(&mut ok)?;
 
     // ---- lead-only timing under the machine lease
     // (`time-gate.sh gate_p6 --time-router`); correctness runs never reach
@@ -673,6 +674,66 @@ fn router_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
             c.depot,
             c.ld_local,
             c.st_local,
+            verdict(pass)
+        );
+        if !pass {
+            *ok = false;
+        }
+    }
+    Ok(())
+}
+
+/// The Q3_K gemvs decode their super-block scale with the hardware's
+/// widening convert, not the integer `cores::half_to_f32`.
+///
+/// No gate can see this from the outputs: the two agree on every finite and
+/// infinite pattern, so swapping one for the other leaves `gate_p1`'s pinned
+/// hashes and every bit-identity gate green and moves only the clock. What
+/// the PTX can see is the mechanism — `half_to_f32`'s subnormal arm is a
+/// normalize loop, which is the only thing in a Q3_K gemv that compiles to
+/// `clz`, and it sits on the row walk's per-super-block path. So: no `clz`
+/// in these two entries, and the hardware convert present.
+///
+/// The Q4_K and Q6_K entries are the control. They still call
+/// `half_to_f32` (Q4_K twice per super-block, for `d` and `dmin`), so they
+/// carry `clz` and are asserted to — the day one of them is converted this
+/// arm is what says which entries moved.
+///
+/// GATE(2026-09-21, q3kdec round). FAIL-first observed: with only the
+/// `q3k_sb_decode` call site reverted to `half_to_f32` and the binary
+/// rebuilt (the build log shows `Compiling bloomery-gpu`, so not a stale
+/// artifact), this printed `shape op=q3k_gemv clz=2 want=0 cvt_f32_f16=0
+/// want>=1 FAIL` and `op=q3k_gemv_sel clz=1 … FAIL` while the control arm
+/// stayed green and every bit-identity gate stayed green — which is the
+/// point: the outputs cannot see this change, only the PTX can.
+#[cfg(feature = "gpu")]
+fn q3k_half_decode_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+    let blob = std::fs::read(std::env::current_exe()?)?;
+    let counts = |name: &str| -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        let b = bloomery_gpu_gates::ptx::body(&blob, name)
+            .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
+        Ok((
+            bloomery_gpu_gates::ptx::count(b, b"clz."),
+            bloomery_gpu_gates::ptx::count(b, b"cvt.f32.f16"),
+        ))
+    };
+    for name in ["q3k_gemv", "q3k_gemv_sel"] {
+        let (clz, cvt) = counts(name)?;
+        let pass = clz == 0 && cvt >= 1;
+        println!(
+            "shape op={name} clz={clz} want=0 cvt_f32_f16={cvt} want>=1 {}",
+            verdict(pass)
+        );
+        if !pass {
+            *ok = false;
+        }
+    }
+    for name in ["q4k_gemv", "q6k_gemv"] {
+        let (clz, cvt) = counts(name)?;
+        let pass = clz >= 1;
+        println!(
+            "shape op={name} clz={clz} want>=1 (software half decode, control) \
+             cvt_f32_f16={cvt} {}",
             verdict(pass)
         );
         if !pass {
