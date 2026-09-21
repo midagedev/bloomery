@@ -64,10 +64,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-gpu"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-model",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+]
+
+[[package]]
+name = "bloomery-gpu-spike"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gpu",
+ "cuda-core",
+]
+
+[[package]]
 name = "bloomery-model"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-qdot",
  "bloomery-threads",
  "thiserror",
 ]

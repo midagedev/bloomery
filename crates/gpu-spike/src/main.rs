@@ -1,4 +1,6 @@
-//! gpu-spike — a binary in its own package calling the bloomery-gpu library.
+//! gpu-spike — a binary in its own package calling the bloomery-gpu library,
+//! and the P0 gate: an eagerly enqueued kernel sequence and its captured
+//! graph replay must produce bit-identical output bytes.
 //!
 //! Correctness uses the same files the stage-0 binary's q4k rows use
 //! (crates/q3k-gemv/src/main.rs): `$BLOOMERY_DATA/attn.q4k` (27 concatenated
@@ -14,8 +16,17 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use cuda_core::DeviceBuffer;
+
     let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    let gpu = bloomery_gpu::Gpu::new()?;
+    let gpu = Gpu::new()?;
+    let profile = if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "release"
+    };
+    println!("host build profile: {profile}");
 
     let w_bytes = std::fs::read(format!("{data}/attn.q4k"))?;
     assert!(w_bytes.len() % 4 == 0, "attn.q4k not u32-divisible");
@@ -63,10 +74,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Launch-cost probe on a tiny shape (one 256-thread block): bare
-    // kernel launch+sync from a library call, then the full gemv_q4k call
-    // (which adds uploads, quantize, allocations and the copy-back per
-    // call). Design figures, not benchmarks of record.
+    // P0 gate: the step shape. Resident weight, resident activation scratch,
+    // resident output; the two-kernel sequence enqueued eagerly on the engine
+    // stream vs the same sequence captured once and replayed. Both write the
+    // same addresses, so the outputs must be byte-identical; the graph's node
+    // count is the launch-count column of the first lease measurement.
+    let (n, m) = (2048usize, 1usize);
+    let stream = gpu.stream();
+    let w_dev = DeviceTensor::upload(stream, &w_host[..n * 288], n, 288)?;
+    let x_dev = DeviceBuffer::from_host(stream, &x_m1)?;
+    let mut act = Q8Act::new(stream, m)?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n * m)?;
+
+    gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+    gpu.enqueue_gemv_q4k(&w_dev, &act, &mut y_dev)?;
+    stream.synchronize()?;
+    let y_eager = y_dev.to_host_vec(stream)?;
+
+    y_dev.zero_async(stream)?;
+    stream.synchronize()?;
+    let graph = gpu.capture(|_s| {
+        gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+        gpu.enqueue_gemv_q4k(&w_dev, &act, &mut y_dev)?;
+        Ok(())
+    })?;
+    graph.launch(stream)?;
+    stream.synchronize()?;
+    let y_graph = y_dev.to_host_vec(stream)?;
+
+    let identical = y_eager.len() == y_graph.len()
+        && y_eager
+            .iter()
+            .zip(y_graph.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+    let ref_ok = {
+        let yref = read_f32(&format!("{data}/y_ref_attn0_m1.f32"));
+        let denom = yref.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let maxerr = y_graph
+            .iter()
+            .zip(yref.iter())
+            .fold(0.0f32, |a, (&g, &r)| a.max((g - r).abs()));
+        maxerr / denom <= 1e-2
+    };
+    println!(
+        "P0 gate: eager_vs_graph_bit_identical={identical} graph_nodes={} graph_within_1e-2_of_ref={ref_ok}",
+        graph.node_count()
+    );
+    if !identical || !ref_ok || graph.node_count() != 2 {
+        eprintln!("FAIL: P0 gate (expected bit-identical, 2 nodes, within 1e-2)");
+        all_ok = false;
+    }
+
+    // Host submission cost, step shape: enqueue the two-kernel sequence
+    // `iters` times with ONE synchronize at the end, eager vs graph replay.
+    // Design figures (shared box, dev or release host build as printed
+    // above), not benchmarks of record; the lease measurement is P8's.
+    let iters = 1000u32;
+    for _ in 0..10 {
+        gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+        gpu.enqueue_gemv_q4k(&w_dev, &act, &mut y_dev)?;
+        graph.launch(stream)?;
+    }
+    stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+        gpu.enqueue_gemv_q4k(&w_dev, &act, &mut y_dev)?;
+    }
+    let eager_submit_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+    stream.synchronize()?;
+    let eager_total_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+    let t1 = std::time::Instant::now();
+    for _ in 0..iters {
+        graph.launch(stream)?;
+    }
+    let graph_submit_us = t1.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+    stream.synchronize()?;
+    let graph_total_us = t1.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
+    println!(
+        "submission probe n={n} m={m} x{iters}: eager submit {eager_submit_us:.2} us/step (incl. device {eager_total_us:.2}), \
+         graph submit {graph_submit_us:.2} us/step (incl. device {graph_total_us:.2})"
+    );
+
+    // Bare launch+sync and full-call figures, kept from the packaging spike.
     let (n, m) = (8usize, 1usize);
     let launch_us = gpu.probe_q4k_launch_us(&w_host[..n * 288], &x_m1, n, m, 1000)?;
     let t0 = std::time::Instant::now();
@@ -81,7 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !all_ok {
         std::process::exit(1);
     }
-    println!("PASSED: bloomery-gpu gemv_q4k within 1e-2 of y_ref (q8_1 activation design)");
+    println!("PASSED: bloomery-gpu gemv_q4k within 1e-2 of y_ref; P0 eager == graph replay");
     Ok(())
 }
 

@@ -39,6 +39,12 @@ check-comments:
 build-gpu:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-q3k-gemv'
 
+# GPU P0 게이트(docs/gpu-design.md 꾸러미 P0): 라이브러리 gemv가 y_ref 1e-2 안이고, 즉시 실행과
+# 그래프 재생의 출력 바이트가 같아야 한다. 호스트 제출 비용도 찍으므로 release 호스트 빌드다
+# (dev 호스트는 P0가 재려는 그 숫자를 부풀린다). 3090만 쓴다(박스 env가 UUID를 핀).
+gate-gpu-p0:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-spike --features gpu --release && ./target/release/gpu-spike'
+
 build-cpu:
     ./tools/box.sh 'cd crates/q3k-cpu && RUSTFLAGS="-C target-cpu=znver3" cargo build --release'
 

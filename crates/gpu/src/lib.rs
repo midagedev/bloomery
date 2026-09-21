@@ -8,23 +8,23 @@
 //! inside `kernels::load` pulls that member into any final binary that calls
 //! this API.
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, dotprod::dp4a_s32, kernel, launch_bounds, launch_contract, thread, warp,
 };
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-/// Compile-time probe of the dependency direction: the device-bundle crate
-/// reads model metadata through `bloomery-model`. Removed once `GpuModel`
-/// uses it for real.
-pub fn mla_width(gguf: &gguf::Gguf) -> Result<usize, GpuError> {
-    let p = model::attn::MlaParams::read(gguf, 0)?;
-    Ok(p.rope_dims + p.latent)
-}
+pub mod graph;
+pub mod model;
+pub mod tensor;
+
+pub use graph::Graph;
+pub use model::{GpuModel, mla_width};
+pub use tensor::{DeviceTensor, Q8Act};
 
 /// Host-side failure: context creation, module loading, device allocation,
-/// launch, or copy-back.
+/// launch, capture, or copy-back.
 pub type GpuError = Box<dyn std::error::Error>;
 
 #[cuda_module]
@@ -506,30 +506,142 @@ mod kernels {
     }
 }
 
-/// A CUDA context on device 0 with this crate's device module loaded.
+/// A CUDA context on device 0 with this crate's device module loaded and one
+/// non-blocking stream that every launch and copy of this engine goes on.
+///
+/// The stream is a real `cuStreamCreate` stream, not the legacy default: the
+/// driver refuses graph capture on the null stream, and `Graph::capture`
+/// records whatever is enqueued on `self.stream()` between begin and end.
 pub struct Gpu {
     ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
 }
 
 impl Gpu {
-    /// Create the context and load the embedded device bundle.
+    /// Create the context, the engine stream, and load the embedded device
+    /// bundle.
     pub fn new() -> Result<Gpu, GpuError> {
         let ctx = CudaContext::new(0)?;
+        let stream = ctx.new_stream()?;
         // SAFETY: this package owns the embedded device bundle produced for
-        // the kernels module above; gemv_q4k checks every launch contract
-        // before launching.
+        // the kernels module above; every launcher checks its launch
+        // contract before launching.
         let module = unsafe { kernels::load(&ctx)? };
-        Ok(Gpu { ctx, module })
+        Ok(Gpu {
+            ctx,
+            stream,
+            module,
+        })
     }
 
-    /// Q4_K (K=2048) gemv through the shared q8_1 activation quantizer.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
+    /// The engine stream. Allocations at load time and the per-step
+    /// synchronize go here too, so nothing ever orders against the null
+    /// stream.
+    pub fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
+    /// Capture `body`'s enqueues on the engine stream into a replayable
+    /// graph. See `Graph::capture` for what the body may not do.
+    pub fn capture<F>(&self, body: F) -> Result<Graph, GpuError>
+    where
+        F: FnOnce(&CudaStream) -> Result<(), GpuError>,
+    {
+        Graph::capture(&self.stream, body)
+    }
+
+    /// Enqueue the q8_1 quantization of `x` (`act.m()` columns of 2048 f32)
+    /// into `act`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_quantize_q8_1(
+        &self,
+        x: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        let m = act.m();
+        if x.len() < m * 2048 {
+            return Err(format!(
+                "enqueue_quantize_q8_1: x.len() {} < m*2048 = {}",
+                x.len(),
+                m * 2048
+            )
+            .into());
+        }
+        // Prepared per call for now: the prepare step is host-only contract
+        // validation, and it is exactly the kind of per-launch host cost a
+        // captured graph removes. Caching per shape is P8's business.
+        let prep =
+            self.module
+                .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(16 * m as u32, 32, 0))?;
+        self.module.q3k_quantize_q8_1(
+            &self.stream,
+            &prep,
+            x,
+            m as u32,
+            &mut act.q3,
+            &mut act.q4,
+            &mut act.q6,
+            &mut act.s8,
+            &mut act.d8,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue `y = w · act` for a Q4_K (K=2048) weight of `w.rows()` rows
+    /// (288 u32 words per row) against the quantized activations in `act`.
+    /// `y` holds `rows * m` f32, row-major with `m` outputs per row.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_gemv_q4k(
+        &self,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (n_rows, m) = (w.rows(), act.m());
+        if w.cols() != 288 {
+            return Err(format!(
+                "enqueue_gemv_q4k: Q4_K K=2048 rows are 288 words, got {}",
+                w.cols()
+            )
+            .into());
+        }
+        if y.len() < n_rows * m {
+            return Err(format!(
+                "enqueue_gemv_q4k: y.len() {} < rows*m = {}",
+                y.len(),
+                n_rows * m
+            )
+            .into());
+        }
+        let prep =
+            self.module
+                .prepare_q4k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
+        self.module.q4k_gemv(
+            &self.stream,
+            &prep,
+            w.buf(),
+            &act.q4,
+            &act.s8,
+            &act.d8,
+            n_rows as u32,
+            m as u32,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Q4_K (K=2048) gemv through the shared q8_1 activation quantizer, with
+    /// upload, scratch allocation and copy-back inside the call — the
+    /// stage-0 correctness shape, not the step shape.
     ///
     /// `w` is `n_rows * 288` little-endian u32 words of Q4_K rows (144 B
     /// per super-block, 8 super-blocks per row); `x` is `m` activation
     /// columns of 2048 f32 each, concatenated; the result is `n_rows * m`
-    /// f32, row-major with `m` outputs per row — the same buffers, launch
-    /// geometry and contracts as the stage-0 binary's q4k shapes.
+    /// f32, row-major with `m` outputs per row.
     pub fn gemv_q4k(
         &self,
         w: &[u32],
@@ -538,47 +650,15 @@ impl Gpu {
         m: usize,
     ) -> Result<Vec<f32>, GpuError> {
         check_q4k_geometry(w.len(), x.len(), n_rows, m)?;
-        let stream = self.ctx.default_stream();
-
-        let w_dev = DeviceBuffer::from_host(&stream, w)?;
-        let x_dev = DeviceBuffer::from_host(&stream, x)?;
-        let mut q3_dev = DeviceBuffer::<u64>::zeroed(&stream, m * 256)?;
-        let mut q4_dev = DeviceBuffer::<u32>::zeroed(&stream, m * 512)?;
-        let mut q6_dev = DeviceBuffer::<u32>::zeroed(&stream, m * 512)?;
-        let mut s8_dev = DeviceBuffer::<i32>::zeroed(&stream, m * 64)?;
-        let mut d8_dev = DeviceBuffer::<f32>::zeroed(&stream, m * 16)?;
-        let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, n_rows * m)?;
-
-        let prep_q =
-            self.module
-                .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(16 * m as u32, 32, 0))?;
-        let prep_g =
-            self.module
-                .prepare_q4k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
-        self.module.q3k_quantize_q8_1(
-            &stream,
-            &prep_q,
-            &x_dev,
-            m as u32,
-            &mut q3_dev,
-            &mut q4_dev,
-            &mut q6_dev,
-            &mut s8_dev,
-            &mut d8_dev,
-        )?;
-        self.module.q4k_gemv(
-            &stream,
-            &prep_g,
-            &w_dev,
-            &q4_dev,
-            &s8_dev,
-            &d8_dev,
-            n_rows as u32,
-            m as u32,
-            &mut y_dev,
-        )?;
+        let stream = &self.stream;
+        let w_dev = DeviceTensor::upload(stream, &w[..n_rows * 288], n_rows, 288)?;
+        let x_dev = DeviceBuffer::from_host(stream, &x[..m * 2048])?;
+        let mut act = Q8Act::new(stream, m)?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n_rows * m)?;
+        self.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+        self.enqueue_gemv_q4k(&w_dev, &act, &mut y_dev)?;
         stream.synchronize()?;
-        Ok(y_dev.to_host_vec(&stream)?)
+        Ok(y_dev.to_host_vec(stream)?)
     }
 
     /// Rough launch-cost probe for design, NOT a benchmark of record: stages
@@ -597,47 +677,15 @@ impl Gpu {
         if iters == 0 {
             return Err("probe_q4k_launch_us: iters must be >= 1".into());
         }
-        let stream = self.ctx.default_stream();
-
-        let w_dev = DeviceBuffer::from_host(&stream, w)?;
-        let x_dev = DeviceBuffer::from_host(&stream, x)?;
-        let mut q3_dev = DeviceBuffer::<u64>::zeroed(&stream, m * 256)?;
-        let mut q4_dev = DeviceBuffer::<u32>::zeroed(&stream, m * 512)?;
-        let mut q6_dev = DeviceBuffer::<u32>::zeroed(&stream, m * 512)?;
-        let mut s8_dev = DeviceBuffer::<i32>::zeroed(&stream, m * 64)?;
-        let mut d8_dev = DeviceBuffer::<f32>::zeroed(&stream, m * 16)?;
-        let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, n_rows * m)?;
-
-        let prep_q =
-            self.module
-                .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(16 * m as u32, 32, 0))?;
-        let prep_g =
-            self.module
-                .prepare_q4k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
-        self.module.q3k_quantize_q8_1(
-            &stream,
-            &prep_q,
-            &x_dev,
-            m as u32,
-            &mut q3_dev,
-            &mut q4_dev,
-            &mut q6_dev,
-            &mut s8_dev,
-            &mut d8_dev,
-        )?;
+        let stream = &self.stream;
+        let w_dev = DeviceTensor::upload(stream, &w[..n_rows * 288], n_rows, 288)?;
+        let x_dev = DeviceBuffer::from_host(stream, &x[..m * 2048])?;
+        let mut act = Q8Act::new(stream, m)?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n_rows * m)?;
+        self.enqueue_quantize_q8_1(&x_dev, &mut act)?;
 
         let mut launch_gemv = || -> Result<(), GpuError> {
-            self.module.q4k_gemv(
-                &stream,
-                &prep_g,
-                &w_dev,
-                &q4_dev,
-                &s8_dev,
-                &d8_dev,
-                n_rows as u32,
-                m as u32,
-                &mut y_dev,
-            )?;
+            self.enqueue_gemv_q4k(&w_dev, &act, &mut y_dev)?;
             stream.synchronize()?;
             Ok(())
         };

@@ -17,6 +17,7 @@ workspace = true
 # device crate at all, so plain `cargo build`/`cargo test` never resolve the
 # embedded-bundle anchor symbol (which only the cargo-oxide backend defines).
 bloomery-gpu = { path = "../gpu", optional = true }
+cuda-core = { workspace = true, optional = true }
 
 [features]
-gpu = ["dep:bloomery-gpu"]
+gpu = ["dep:bloomery-gpu", "dep:cuda-core"]
