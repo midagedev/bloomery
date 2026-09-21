@@ -16,8 +16,9 @@ ssh "$HOST" "mkdir -p $REMOTE"
 rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 # 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
-# CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). A6000은 서빙·야간 학습과 공유하는
-# 카드라, llm.service가 살아 있거나 그 카드에 컴퓨트 프로세스가 있으면 실행하지 않고 rc 75로 끝난다.
+# CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). 두 카드 다 우리 것이다(야간 학습은
+# 2026-09-21에 끝났고 llm.service는 꺼져 있다). 그래도 그 카드에 이미 컴퓨트 프로세스가 있으면 — 우리 다른
+# 라운드일 것이다 — 겹쳐 올리지 않고 rc 75로 끝난다. llm.service 검사는 누가 다시 켰을 때의 안전장치다.
 CARD=${BLOOMERY_CARD:-3090}
 case "$CARD" in
   3090) PICK=":" ;;
