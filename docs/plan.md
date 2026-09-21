@@ -235,7 +235,7 @@ flowchart LR
 | A2-2 | 스테이지 분할(2스테이지 = 1스테이지 비트 동일). A2-1은 머지됐고(`c9f5ace`) 전 층 조립은 e2e(`0294d4a`)가 한 그래프로 끝냈으므로, 남은 것은 **여러 스테이지로 나누는 것**뿐이다 — 카드는 두 카드에 걸칠 때 값을 받는다 | `gpu/model.rs` | opus | 2스테이지 = 1스테이지 비트 동일 | e2e | M |
 | ~~A2~~ | ~~MoE 층 조립: `Stage`를 층 l 일반화, `moe_fused`+라우터+층별 KV, 2스테이지=1스테이지 비트 동일 | `gpu/model.rs`, 새 `gate_p8b.rs`, `block.rs`(MoE 탭 밴드 표 인쇄) | GLM | 블록 1 탭 표 인쇄(리드가 핀), eager==replay, 2스테이지 비트 동일 | A1c — **A2-1 머지 c9f5ace**(opus): 층 1 = 31노드, 라우터 ids 정수 일치, 다른 입력 재생이 라우팅을 따라감, 밴드 미핀(A6 뒤 gate_p8과 함께) | L → 둘로: A2-1 층 조립·탭, A2-2 스테이지 분할~~ — **A2-1 끝남, 남은 A2-2는 위 행으로 옮겼다(2026-09-22)** |
 | A4b | **키 축 원인 축소**: flash 단계별 배가 프로브(`StepProbe` 레버 + `generate --ab-set keyaxis`) ‖ ik·메인라인 독해 ‖ 그 계열 밖 독해(exllamav3·FlashInfer·vLLM·FlashMLA) | `gpu/flash.rs`, `gpu/model.rs`(StepProbe·flash 호출부), `generate.rs`, `depth-gpu.sh` ‖ 독해 둘은 읽기 전용 | opus ×3 병렬(`kprobe`·`ikread`·`peerread`) | 깊이 1024·4096 단계별 분해표 + 합 검사(Σ단계 대 `base(깊이) − base(6)`), 프로브 팔 값 불변 단언(FAIL-first), 참조 나란히 표 | A4 | M — **비행 중**(2026-09-22 아침) |
-| A4c | 키 축 구현 — A4b가 지목한 자리에 | A4b 뒤에 정한다 | opus | 깊이 4096 tok/s 대 ik 188.54(n=96 창), 깊이 6·1024 비회귀, `gate-gpu-e2e`(노드 수가 바뀌면 재핀 3요건) | A4b | M~L |
+| A4c | ~~키 축 구현 — A4b가 지목한 자리에~~ **닫힘(측정 미달, 2026-09-22 밤)**: 헤드 16개를 한 블록에 모은 스칼라 `flash_latent_hseg`가 A6000에서 깊이 4096 층당 −8.6 µs(목표 −55), 깊이 6 +32 µs, 세그 32로 블록 4배에도 무변화, ncu 1024에서 102.7 대 32.4 µs(블록 9, SM당 1블록). A4b 표(QK 37 + V 30 µs = 층의 85%, softmax·셔플·배리어 2.3)와 합치면 비용은 바이트가 아니라 **로드 명령 수** — 공유메모리 브로드캐스트로는 안 줄어든다. 브랜치 `a4c`(`14c97d1`) 기록, 미머지. 다음: **A4d — Q를 MMA 조각에**(`cuda_device::wmma::mma_m16n8k16_f32_f16`·`ldmatrix_x4` 확인됨). 기록 rig-log 09-22-h | 닫힘 | opus | (성공 기준은 A4d로: 같은 카드 hseg→MMA 비율, ik 대비 깊이 4096 ≥ 1.0) |
 | A6 잔여 | 스텝 파라미터 세 카피(`token_buf`·`pos_buf`·`n_keys_buf`, `model.rs:1835–1837`)를 버퍼 하나·카피 하나로 | `gpu/model.rs` | opus | 값 불변(`gate-gpu-e2e`·`gate-gpu-p8`), 스텝 µs 전후 | kprobe 머지(model.rs 점유) | S |
 | W41 | `generate --time` 계기 결함 셋(WKS-41): 깊이마다 찍히는 깊이 0 기준 상수, `--time` 루프 안 `println!` 둘, `--warm` 없음 | `generate.rs` | opus | `gate-gpu-e2e`·`gate-gpu-p8` 648/18 그대로, `--time` 대 `--ab` 차가 깊이 6 n=32에서 닫히는지 | kprobe 머지(generate.rs 점유) | S |
 | A5 | 프리필: m>1 활성값 다리 + IMMA GEMM 커널(m 16~512) | 새 `gpu/gemm.rs`, 새 `gate_gemm.rs`; 조립은 별도 라운드 | GLM(커널) → GLM(조립, model.rs) | 커널 밴드 + 프리필 tok/s | A3m; 커널 부분은 A2와 병렬 가능 | L |
@@ -280,7 +280,7 @@ flowchart LR
 | 파동 | 병렬로 뜨는 것 | 리드가 그 사이 하는 것 | 파동을 닫는 조건 |
 |---|---|---|---|
 | **5′ (지금, 2026-09-22 아침)** | `kprobe`(flash.rs·model.rs·generate.rs·depth-gpu.sh, 임대) ‖ `ikread`·`peerread`(읽기 전용) ‖ `planmerge`(docs, 끝남) | 병합 검수·끊긴 참조 수선, ncu 러너(`tools/ref/ncu-gpu.sh`)로 깊이별 커널 카운터 | A4b 세 보고 → A4c 스펙 |
-| 6′ | A4c(flash.rs·model.rs) ‖ `seeddepth`(측정 준비 시간 제거) ‖ B0c 도구 ‖ C1(`crates/server` 신설) | A4c 깊이 재측정 | A4c 머지 |
+| 6′ | ~~A4c(flash.rs·model.rs) ‖ `seeddepth`(측정 준비 시간 제거) ‖ B0c 도구 ‖ C1(`crates/server` 신설)~~ **끝(2026-09-22 밤)**: A4b 프로브 머지 `76c8673`(첫 분해표), seeddepth 머지 `c21fd71`(±1% 안, 씨앗-대-씨앗 규칙), A4c 닫힘(위), `env=` 팔 `06a51f3`, ik #2501 제출. 3090 두 번째 낙하로 시간 카드가 A6000이 됨(09-22-g). B0c·C1은 미발사 | A4d 스펙 | — |
 
 model.rs 점유 순서(하나씩): A1b → A1c → A1d → A2-1 → ~~A2-2~~ → A3-1 → A3-2 → A6 → B2 → A5 조립 → B5 → C4.
 **갱신(2026-09-22)** 여기서부터: `kprobe`(비행 중) → A4c → A6 잔여 → A2-2 → B2 → A5 조립 → B5 → C4. `generate.rs`는 별도 축이다: `kprobe` → W41 → `seeddepth`.
