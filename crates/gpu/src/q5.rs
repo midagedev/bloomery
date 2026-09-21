@@ -519,6 +519,87 @@ mod q5_kernels {
         }
     }
 
+    /// Q5_0 gemv over expert slots selected on the device (the MoE down
+    /// projection, decode shape): one launch computes `n_slots` experts of
+    /// the resident flat stack — `n_experts * rows_per_expert` rows of
+    /// `q_stride + k_blocks` words — where slot s reads activation column
+    /// `s` of the q8 scratch (each expert's down input differs) and writes
+    /// `y[s*rows_per_expert + r]`; m_cols = 1 per slot. The selected ids
+    /// are read from `sel`, a device buffer, so the launch is addressable
+    /// from inside a captured graph whose replay consumes whatever a
+    /// router kernel last wrote there. The per-row body is `q5_row_dot`
+    /// (col0 = slot, m_cols = 1), bit-identical to `q5_0_gemv` run with
+    /// row0 = sel[s]*rows_per_expert, col0 = s.
+    ///
+    /// An id >= n_experts cannot be rejected by the host contract (it
+    /// lives in device memory): the slot's warps return before their first
+    /// load — warp-uniform, no divergent branch — leaving that slot of `y`
+    /// untouched and every other slot unaffected.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows_per_expert * (q_stride + k_blocks),
+            q.len() >= n_slots * q_stride,
+            d8.len() >= n_slots * k_blocks,
+            s8.len() >= n_slots * k_blocks,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q5_0_gemv_sel(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        s8: &[i32],
+        sel: &[u32],
+        k_blocks: u32,
+        q_stride: u32,
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        let slot = row / rows_per_expert as usize;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform (all 32 lanes of the warp share `row`, hence
+        // `slot`), so the out-of-range return below never diverges a warp.
+        let id = unsafe { *sel.get_unchecked(slot) } as usize;
+        if id >= n_experts as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let f = q5_row_dot(
+            w,
+            q,
+            d8,
+            s8,
+            k_blocks as usize,
+            q_stride as usize,
+            id * rows_per_expert as usize + row % rows_per_expert as usize,
+            slot, // col0: slot s reads activation column s
+            1,    // m_cols: one output per slot row
+            lane,
+            false,
+        );
+        let s = reduce_cols(f, 1);
+        if lane == 0 {
+            // SAFETY: row < n_slots*rows_per_expert <= y.len() by the launch
+            // contract; only lane 0 of the warp writes y[row].
+            unsafe {
+                *y.get_unchecked_mut(row) = s[0];
+            }
+        }
+    }
+
     /// Warp-uniform reduction of the eight accumulators. m_cols is a
     /// launch-wide constant, so every lane takes the same branch and the
     /// shuffles stay warp-collective; inactive columns keep their zero
@@ -825,6 +906,86 @@ impl Q5Kernels {
             col0 as u32,
             m_cols as u32,
             y0 as u32,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the device-indirect MoE down projection for Q5_0: one launch
+    /// computes `n_slots` experts, slot s writing
+    /// `y[s*rows_per_expert .. (s+1)*rows_per_expert]` as
+    /// `w[sel[s]*rows_per_expert .. +rows_per_expert] · act` column `s` (m
+    /// per slot is 1; `act` holds at least `n_slots` quantized columns).
+    /// `w` is the full resident stack packed by `pack_q5_0`,
+    /// `cols = q_stride + k/32`, `rows` a positive multiple of
+    /// `rows_per_expert` (`n_experts = rows/rows_per_expert`). `sel` is a
+    /// device buffer of at least `n_slots` ids read by the kernel per
+    /// launch, so a captured graph replay picks up new ids written between
+    /// replays; an id >= n_experts leaves that slot of `y` untouched.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_gemv_q5_0_sel(
+        &self,
+        stream: &CudaStream,
+        w: &crate::DeviceTensor<u32>,
+        act: &Q8Blocks32,
+        sel: &DeviceBuffer<u32>,
+        n_slots: usize,
+        rows_per_expert: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let k_blocks = act.k() / 32;
+        if w.cols() != act.q_stride() + k_blocks {
+            return Err(format!(
+                "enqueue_gemv_q5_0_sel: Q5_0 row is q_stride + k/32 = {} words, got cols {}",
+                act.q_stride() + k_blocks,
+                w.cols()
+            )
+            .into());
+        }
+        if rows_per_expert == 0 || w.rows() % rows_per_expert != 0 {
+            return Err(format!(
+                "enqueue_gemv_q5_0_sel: w.rows() {} must be a positive multiple of \
+                 rows_per_expert {rows_per_expert}",
+                w.rows()
+            )
+            .into());
+        }
+        if n_slots == 0 || n_slots > act.m() || sel.len() < n_slots {
+            return Err(format!(
+                "enqueue_gemv_q5_0_sel: need 1 <= n_slots <= act.m() = {} and sel.len() >= \
+                 n_slots, got n_slots {n_slots} sel.len() {}",
+                act.m(),
+                sel.len()
+            )
+            .into());
+        }
+        if y.len() < n_slots * rows_per_expert {
+            return Err(format!(
+                "enqueue_gemv_q5_0_sel: y.len() {len} < n_slots*rows_per_expert = {need}",
+                len = y.len(),
+                need = n_slots * rows_per_expert
+            )
+            .into());
+        }
+        let n_experts = w.rows() / rows_per_expert;
+        let prep = self.module.prepare_q5_0_gemv_sel(LaunchConfig1D::new(
+            (n_slots * rows_per_expert).div_ceil(8) as u32,
+            256,
+            0,
+        ))?;
+        self.module.q5_0_gemv_sel(
+            stream,
+            &prep,
+            w.buf(),
+            &act.q,
+            &act.d8,
+            &act.s8,
+            sel,
+            k_blocks as u32,
+            act.q_stride() as u32,
+            n_experts as u32,
+            rows_per_expert as u32,
+            n_slots as u32,
             y,
         )?;
         Ok(())

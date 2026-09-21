@@ -1123,6 +1123,172 @@ mod kernels {
             }
         }
     }
+    /// Q3_K gemv over expert slots selected on the device (the MoE decode
+    /// shape): one launch computes `n_slots` experts of a resident flat
+    /// stack — `n_experts * rows_per_expert` rows of `110 * n_sb` bytes —
+    /// against the ONE quantized activation column of `q`/`d8` (m = 1;
+    /// gate and up read the same input). The selected ids are read from
+    /// `sel`, a device buffer, so the launch is addressable from inside a
+    /// captured graph whose replay consumes whatever a router kernel last
+    /// wrote there. Thread geometry as `q3k_gemv` (one warp per output
+    /// row); thread row `n = slot * rows_per_expert + row_in_expert`
+    /// stores `y[n]` and reads weight row `sel[slot] * rows_per_expert +
+    /// row_in_expert`. The arithmetic is the m = 1 path of `q3k_gemv`
+    /// verbatim (same cores, same accumulation order), so a slot's output
+    /// is bit-identical to `q3k_gemv` run on that expert alone.
+    ///
+    /// An id >= n_experts cannot be rejected by the host contract (it
+    /// lives in device memory): the slot's warps return before their first
+    /// load — warp-uniform, no divergent branch — leaving that slot of `y`
+    /// untouched and every other slot unaffected.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_experts * rows_per_expert * 110 * n_sb,
+            q.len() >= 64 * iters,
+            d8.len() >= 2 * n_sb,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q3k_gemv_sel(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        let slot = row / rows_per_expert as usize;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform (all 32 lanes of the warp share `row`, hence
+        // `slot`), so the out-of-range return below never diverges a warp.
+        let id = unsafe { *sel.get_unchecked(slot) } as usize;
+        if id >= n_experts as usize {
+            return;
+        }
+        let row_abs = id * rows_per_expert as usize + row % rows_per_expert as usize;
+        let lane = warp::lane_id() as usize;
+        let n_sb = n_sb as usize;
+        let row_bytes = 110 * n_sb;
+
+        // Per-lane constants, as q3k_gemv (see the Q3_K packing comment
+        // there; the q8 word base is the permutation position 64*it + lane).
+        let w16 = lane & 15;
+        let half = lane >> 4; // 0: even super-block, 1: odd
+        let s0 = 8 * (w16 >> 3) + ((w16 & 7) >> 2); // first sub-block index
+        let d8_base = w16 >> 3; // half super-block = one 128-value q8_1 block
+
+        let mut f0 = 0.0f32;
+
+        let mut it: u32 = 0;
+        while it < iters {
+            let sbp = ((it << 1) | half as u32) as usize;
+            // The sbp guard makes a partial final iteration safe; always
+            // true when n_sb is even.
+            if sbp < n_sb {
+                let base = row_abs * row_bytes + sbp * 110; // byte offset
+                let par = (base >> 1) & 1;
+
+                // qs word: bytes base+32+4*w16 .. +3; odd windows reassemble
+                // with a 16-bit funnel.
+                let qk = (base + 32 + 4 * w16) >> 2;
+                // SAFETY: row_abs < n_experts*rows_per_expert, sbp < n_sb,
+                // w16 < 16, so qk+1 stays inside row_abs's ceil(row_bytes/4)
+                // words; the launch contract bounds
+                // 4*w.len() >= n_experts*rows_per_expert*110*n_sb.
+                let (lo, hi) = unsafe { (*w.get_unchecked(qk), *w.get_unchecked(qk + 1)) };
+                let vl = if par == 0 { lo } else { funnel16(lo, hi) };
+
+                // hmask word (bytes base+4*(w16%8) .. +3), inverted and
+                // pre-shifted to bit 0 of each byte.
+                let hk = (base + 4 * (w16 & 7)) >> 2;
+                // SAFETY: same row_abs/sbp/w16 bounds as the qs window.
+                let (hlo, hhi) = unsafe { (*w.get_unchecked(hk), *w.get_unchecked(hk + 1)) };
+                let hm = if par == 0 { hlo } else { funnel16(hlo, hhi) };
+                let vh1 = (!hm) >> (4 * (w16 >> 3)) as u32;
+
+                // scales: 12 bytes at base+96..108 via the aux[] shuffle.
+                let ak = (base + 96) >> 2;
+                // SAFETY: ak+3 < ceil((row_abs+1)*row_bytes/4) <= w.len():
+                // the 16-byte window ends at most 2 bytes past the row end,
+                // but the floored word index stays inside the row's words.
+                let (aw0, aw1, aw2, aw3) = unsafe {
+                    (
+                        *w.get_unchecked(ak),
+                        *w.get_unchecked(ak + 1),
+                        *w.get_unchecked(ak + 2),
+                        *w.get_unchecked(ak + 3),
+                    )
+                };
+                let (a0w, a1w, a2w) = if par == 0 {
+                    (aw0, aw1, aw2)
+                } else {
+                    (funnel16(aw0, aw1), funnel16(aw1, aw2), funnel16(aw2, aw3))
+                };
+                let ts = q3k_aux_scales(a0w, a1w, a2w);
+
+                // Super-block scale d (f16 at bytes base+108..109).
+                let d_bits = if par == 0 {
+                    (aw3 & 0xffff) as u16
+                } else {
+                    (aw3 >> 16) as u16
+                };
+                let drow = half_to_f32(d_bits);
+
+                // Sub-block scales for fields 0..3: sub-block s0+2j.
+                let sc = [
+                    q3k_sub_scale(&ts, s0),
+                    q3k_sub_scale(&ts, s0 + 2),
+                    q3k_sub_scale(&ts, s0 + 4),
+                    q3k_sub_scale(&ts, s0 + 6),
+                ];
+
+                // Dequantize the four quads to signed bytes (SWAR).
+                let vi = q3k_dequant(vl, vh1);
+
+                // q8_1 words in the q3 u64 pairing of the single column:
+                // field pair (2p, 2p+1) in u64 slot 64*it + 32p + lane — lo
+                // is field 2p, hi is 2p+1.
+                let qb = 64 * it as usize + lane;
+                let d8b = 2 * sbp + d8_base;
+                {
+                    // SAFETY: qb + 32 <= 64*iters - 1 — both u64 slots are
+                    // inside the column's 64*iters u64s (q.len() >= 64*iters
+                    // by the launch contract); d8b < 2*n_sb <= d8.len() by
+                    // the sbp guard.
+                    let w01 = unsafe { *q.get_unchecked(qb) };
+                    let w23 = unsafe { *q.get_unchecked(qb + 32) };
+                    let a = q3k_chain(&vi, w01, w23, &sc);
+                    f0 += (a as f32) * (unsafe { *d8.get_unchecked(d8b) } * drow);
+                }
+            }
+
+            it += 1;
+        }
+
+        let s0 = warp::reduce_sum_f32(f0);
+        if lane == 0 {
+            // SAFETY: row < n_slots*rows_per_expert <= y.len() by the launch
+            // contract; only lane 0 of the warp writes y[row].
+            unsafe {
+                *y.get_unchecked_mut(row) = s0;
+            }
+        }
+    }
 }
 
 /// A CUDA context on device 0 with this crate's device module loaded and one
@@ -1318,6 +1484,99 @@ impl Gpu {
             &act.d8,
             n_rows as u32,
             m as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the device-indirect MoE decode step for a Q3_K expert stack:
+    /// one launch computes `n_slots` experts, slot s writing
+    /// `y[s*rows_per_expert .. (s+1)*rows_per_expert]` as
+    /// `w[sel[s]*rows_per_expert .. +rows_per_expert] · act` — every slot
+    /// dots the ONE activation column of `act` (m = 1: gate and up read the
+    /// same input). `w` is the full resident stack, `w.rows()` a multiple of
+    /// `rows_per_expert` (`n_experts = w.rows()/rows_per_expert`), rows as in
+    /// `enqueue_gemv_q3k` (`110 * n_sb / 4` words, even n_sb). `sel` is a
+    /// device buffer of at least `n_slots` ids read by the kernel per launch,
+    /// so a captured graph replay picks up new ids written between replays;
+    /// an id >= n_experts leaves that slot of `y` untouched. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_gemv_q3k_sel(
+        &self,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        sel: &DeviceBuffer<u32>,
+        n_slots: usize,
+        rows_per_expert: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let n_sb = act.n_sb();
+        if act.m() != 1 {
+            return Err(format!(
+                "enqueue_gemv_q3k_sel: m = 1 only (the shared expert input), got act.m() = {}",
+                act.m()
+            )
+            .into());
+        }
+        if n_sb % 2 != 0 {
+            return Err(format!(
+                "enqueue_gemv_q3k_sel: odd super-block count {n_sb} (K={}) leaves rows \
+                 unaligned; repack rows at load time",
+                act.k()
+            )
+            .into());
+        }
+        if w.cols() != 110 * n_sb / 4 {
+            return Err(format!(
+                "enqueue_gemv_q3k_sel: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
+                110 * n_sb / 4,
+                act.k(),
+                w.cols()
+            )
+            .into());
+        }
+        if rows_per_expert == 0 || w.rows() % rows_per_expert != 0 {
+            return Err(format!(
+                "enqueue_gemv_q3k_sel: w.rows() {} must be a positive multiple of \
+                 rows_per_expert {rows_per_expert}",
+                w.rows()
+            )
+            .into());
+        }
+        if n_slots == 0 || sel.len() < n_slots {
+            return Err(format!(
+                "enqueue_gemv_q3k_sel: need n_slots >= 1 and sel.len() >= n_slots, got \
+                 n_slots {n_slots} sel.len() {}",
+                sel.len()
+            )
+            .into());
+        }
+        if y.len() < n_slots * rows_per_expert {
+            return Err(format!(
+                "enqueue_gemv_q3k_sel: y.len() {} < n_slots*rows_per_expert = {}",
+                y.len(),
+                n_slots * rows_per_expert
+            )
+            .into());
+        }
+        let n_experts = w.rows() / rows_per_expert;
+        let prep = self.module.prepare_q3k_gemv_sel(LaunchConfig1D::new(
+            (n_slots * rows_per_expert).div_ceil(8) as u32,
+            256,
+            0,
+        ))?;
+        self.module.q3k_gemv_sel(
+            &self.stream,
+            &prep,
+            w.buf(),
+            &act.q3,
+            &act.d8,
+            sel,
+            n_experts as u32,
+            rows_per_expert as u32,
+            n_slots as u32,
             n_sb as u32,
             n_sb.div_ceil(2) as u32,
             y,
