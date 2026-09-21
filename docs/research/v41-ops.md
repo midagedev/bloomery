@@ -9,9 +9,13 @@
 
 ## 전제 정정 둘
 
-로컬의 ik_llama.cpp 스냅샷은 V4.1을 못 돌린다. 아키텍처 표에 `deepseek4`만 있고 압축 비율이 4/128로
-박혀 있으며 engram이 없다. V4.1 고유의 것은 전부 공식 참조와 mainline 포크 둘에만 있다. ik는 공통
-연산(윈도우 어텐션 꼬리, 하이퍼커넥션, MoE)의 두 번째 의견으로만 쓴다.
+~~로컬의 ik_llama.cpp 스냅샷은 V4.1을 못 돌린다 … V4.1 고유의 것은 전부 공식 참조와 mainline 포크 둘에만 있다.~~
+정정(같은 날): 조사가 읽은 것은 ik의 `main`(3bb386eb)이고, 그 위에 V4.1 포트가 셋 있다 — 우리 자신의 포트
+(ikawrakow/ik_llama.cpp#2455, 브랜치 `v41/model`, mainline과 PPL 대등을 잰 것), 이슈 #2438에 링크된 Skelectric의
+`v41-on-vision`(`llama-engram.cpp`, KV 양자화 작업 포함, 2026-09-21에도 갱신), 닫힌 초안 #2449의 Phylliida `v41-flash`
+(전문가 캐시 + engram을 SSD에서 서빙, 3090 한 장에서 6–8 tok/s 보고). 위임 스펙이 `main`을 가리킨 것이 리드의 실수다.
+아래 본문에서 "ik"라고 쓴 것은 전부 `main`의 V4 코드에 대한 말로 읽는다. 세 포트를 나란히 읽은 결과는
+[`v41-ports.md`](v41-ports.md)(조사 중)에 둔다. 셋은 `~/repo/upstream/v41-ports/{mine,skelectric,phylliida}`에 체크아웃돼 있다.
 
 공식 참조에는 `engram.py`가 빠져 있다. 해시 구성은 포크의 변환기와 런타임이 유일한 출처다. 다만
 상수(승수·소수·오프셋·토큰 맵·pad id)는 **GGUF 메타데이터에 들어 있다**
