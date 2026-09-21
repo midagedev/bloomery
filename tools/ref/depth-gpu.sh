@@ -38,16 +38,24 @@ BIN=${BLOOMERY_GEN_BIN:-target/release/generate}
 ARMS_SPEC=${BLOOMERY_GPU_ARMS:-6:512 ik:0 1024:1120 ik:1024 4096:4192 ik:4096}
 GPU_3090=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
 GPU_A6000=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
+# 시간을 재는 카드는 A6000이다(사용자, 2026-09-22 — 3090이 같은 날 부하 아래서 두 번 버스에서 떨어져
+# 기준선을 A6000에서 다시 잡았다). 우리 바이너리와 ik 둘 다 이 카드에서 돈다 — env 파일의 3090 핀을 덮어쓴다.
+# 3090은 게이트·빌드 카드다. 옛 3090 수치와 이 카드 수치는 같은 표에 놓지 않는다(증인이 카드를 적는다).
+TIMING_GPU=${BLOOMERY_TIMING_GPU:-$GPU_A6000}
+OTHER_GPU=$GPU_3090; [ "$TIMING_GPU" = "$GPU_3090" ] && OTHER_GPU=$GPU_A6000
+export CUDA_VISIBLE_DEVICES=$TIMING_GPU
 LOCK=/root/bloomery-cpu.lock
 [ -x "$BIN" ] || { echo "no generate binary at $BIN — build it with cargo oxide first" >&2; exit 2; }
 [ -x "$IKBIN" ] || { echo "no llama-bench at $IKBIN" >&2; exit 2; }
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# 행마다 전후로 남기는 증인. 3090의 컴퓨트 앱이 자기 프로세스뿐인지가 핵심이고, loadavg는
+# 행마다 전후로 남기는 증인. 시간 카드의 컴퓨트 앱이 자기 프로세스뿐인지가 핵심이고, loadavg는
 # 신호가 아니다(rig-log docs/quiet-machine.md) — IO 압력과 실제 프로세스 목록이 신호다.
+# 첫 줄이 카드 이름과 전력 제한이다: 카드가 바뀐 날부터 카드 없는 숫자는 뜻이 없다.
 witness() {
   echo "--- witness $1 $(now)"
+  echo "    timing-card: $(nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv,noheader -i "$TIMING_GPU")"
   echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
   echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
   echo "    gpu: $(nvidia-smi --query-gpu=index,utilization.gpu,power.draw,clocks.sm --format=csv,noheader | tr '\n' ';')"
@@ -55,17 +63,16 @@ witness() {
   echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
 }
 
-# A6000은 우리 카드다(사용자, 2026-09-22 — 야간 학습은 09-21에 끝났고 llm.service는 꺼져 있다). 그 카드에
-# 컴퓨트 앱이 있으면 우리 다른 라운드의 게이트·빌드일 가능성이 크다. 중단하지 않고 **증인에 남긴다** —
-# 3090의 시간 수치가 옆 카드 부하에 흔들리는지는 이 증인 열로 나중에 판정한다(아직 잰 적 없다).
-# 중단이 필요하면 BLOOMERY_A6000_STRICT=1.
-guard_a6000() {
+# 두 카드가 다 우리 것이다(사용자, 2026-09-22). 시간을 안 재는 옆 카드에 컴퓨트 앱이 있으면 우리 다른
+# 라운드의 게이트·빌드일 가능성이 크다. 중단하지 않고 **증인에 남긴다** — 시간 카드의 수치가 옆 카드
+# 부하에 흔들리는지는 이 증인 열로 나중에 판정한다(아직 잰 적 없다). 중단이 필요하면 BLOOMERY_OTHER_STRICT=1.
+guard_other() {
   local apps
-  apps=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000")
+  apps=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$OTHER_GPU")
   [ -n "$apps" ] || return 0
-  echo "[a6000-busy] $(now) idx 1에 컴퓨트 앱: [$(echo "$apps" | tr '\n' ';')]" >&2
-  if [ "${BLOOMERY_A6000_STRICT:-}" = 1 ]; then
-    witness abort-a6000 >&2
+  echo "[other-busy] $(now) 옆 카드($OTHER_GPU)에 컴퓨트 앱: [$(echo "$apps" | tr '\n' ';')]" >&2
+  if [ "${BLOOMERY_OTHER_STRICT:-}" = 1 ]; then
+    witness abort-other >&2
     exit 75
   fi
 }
@@ -82,27 +89,27 @@ flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
 echo "[lease] held by pid $$ at $(now)"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS ik_flags=$IK_GPU_FLAGS"
 echo "[config] arms=$ARMS_SPEC"
-echo "[config] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 witness pre
-guard_a6000
+guard_other
 
 read -r -a arms <<< "$ARMS_SPEC"
 sums=()
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#arms[@]} - 1))); do
     a=${arms[$(((i + r - 1) % ${#arms[@]}))]}
-    guard_a6000
+    guard_other
     case $a in
       ik:*)
         dep=${a#ik:}
         witness "pre r$r ik d=$dep"
         if [ "$dep" = 0 ]; then
           # shellcheck disable=SC2086
-          raw=$(CUDA_VISIBLE_DEVICES="$GPU_3090" "$IKBIN" -m "$MODEL" -p 0 -n "$N" -r 1 $IK_GPU_FLAGS 2>&1)
+          raw=$("$IKBIN" -m "$MODEL" -p 0 -n "$N" -r 1 $IK_GPU_FLAGS 2>&1)
           val=$(echo "$raw" | grep -E "tg$N" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
         else
           # shellcheck disable=SC2086
-          raw=$(CUDA_VISIBLE_DEVICES="$GPU_3090" "$IKBIN" -m "$MODEL" -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_GPU_FLAGS 2>&1)
+          raw=$("$IKBIN" -m "$MODEL" -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_GPU_FLAGS 2>&1)
           val=$(echo "$raw" | grep -E "tg$N@pp$dep" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
         fi
         witness "post r$r ik d=$dep"

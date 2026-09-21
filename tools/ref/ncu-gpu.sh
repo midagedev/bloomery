@@ -43,6 +43,9 @@ OUTDIR=${BLOOMERY_NCU_OUT:-/root/bloomery-data/ncu}
 GPU_3090=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
 GPU_A6000=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
 LOCK=/root/bloomery-cpu.lock
+# 시간 카드는 A6000이다(depth-gpu.sh와 같은 규칙, 2026-09-22). env 파일의 3090 핀을 덮어쓴다.
+TIMING_GPU=${BLOOMERY_TIMING_GPU:-$GPU_A6000}
+export CUDA_VISIBLE_DEVICES=$TIMING_GPU
 
 # 섹션으로 묻는다(개별 메트릭 이름은 드라이버·ncu 판마다 흔들린다). 이 넷이 답하는 것:
 #   SpeedOfLight       — 이 커널이 계산에 붙었나 메모리에 붙었나, 각각 피크의 몇 %인가
@@ -72,6 +75,7 @@ now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 witness() {
   echo "--- witness $1 $(now)"
+  echo "    timing-card: $(nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv,noheader -i "$TIMING_GPU")"
   echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
   echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
   echo "    gpu: $(nvidia-smi --query-gpu=index,utilization.gpu,power.draw,clocks.sm --format=csv,noheader | tr '\n' ';')"
