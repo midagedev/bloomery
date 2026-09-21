@@ -24,9 +24,10 @@
 //! Dump convention this gate relies on, probe-verified on the box: VIEW
 //! tensors are dumped as flat memory from the view's base pointer, not
 //! materialized — `kv_compressed-L.0` is `kv_rope_compressed-L[0..]`,
-//! `k_rope-L.0` is `[latent..]`, `q_rope-L.0` is `q-L[nope..]`. The true op
-//! inputs are reconstructed from the base tensors (MUL_MAT outputs,
-//! contiguous) and the flat property is asserted before each use.
+//! `k_rope-L.0` is `[latent..]`, `q_rope-L.0` is `q-L[nope..]`. The flat
+//! property is asserted before each use (`view_flat`); the kernel INPUTS
+//! are the logical tensors, read through `ref_tensor_logical` (the v2
+//! `.logical.f32` twins).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -38,8 +39,8 @@ fn main() {
 use bloomery_gpu_gates::RefRow;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    activations, bytes_to_words, find_ref_row, max_rel_err, open_model, ref_manifest,
-    ref_tensor_of, row_bytes, tensor_bytes,
+    activations, bytes_to_words, f32_tensor, find_ref_row, max_rel_err, open_model, ref_manifest,
+    ref_tensor_logical, ref_tensor_of, row_bytes, tensor_bytes, view_flat,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -196,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The kv_a norm: the input is the latent slice of kv_rope_compressed
     // (the dump's kv_compressed.0 VIEW is the flat base memory — proved
-    // below — so the true input is gathered per token).
+    // below — so the input is the row's logical twin).
     {
         let label = "kv_compressed-1";
         let (base_row, krc) = load_ref(&man, "kv_rope_compressed-1", 0)?;
@@ -217,11 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "VIEW",
         )?;
         view_flat(&view, &krc, 0, label)?;
-        let mut x = vec![0.0f32; m * mla.latent];
-        for t in 0..m {
-            x[t * mla.latent..(t + 1) * mla.latent]
-                .copy_from_slice(&krc[t * kv_w..t * kv_w + mla.latent]);
-        }
+        let x = ref_tensor_logical(label, 0)?.1;
         let out_row = find_ref_row(&man, label, 1)?;
         expect(
             &out_row,
@@ -253,9 +250,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================== rope
     // q_rope-L occurrence 0 (VIEW) -> occurrence 1 (ROPE), same for k_rope-L;
     // positions 0..5, one host YaRN cache per position. The VIEW inputs are
-    // flat base memory in the dump (proved per layer), so the true inputs are
-    // gathered from q-L (the rope slice of each head) and the rope tail of
-    // kv_rope_compressed-L.
+    // flat base memory in the dump (proved per layer); the kernel inputs are
+    // the rows' logical twins — the rope slice of each q-L head and the rope
+    // tail of each token's kv_rope_compressed-L.
     {
         let nd = mla.rope_dims;
         assert_eq!(nd % 2, 0, "rope dims must pair");
@@ -267,7 +264,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let cs_dev = DeviceBuffer::from_host(stream, &cs)?;
         for l in [0usize, 1, 26] {
-            // The q side: head h's rope slice of token t in q-L.
+            // The q side's base tensor, loaded for the flat-view proof.
             let q_name = format!("q-{l}");
             let (q_row, qv) = load_ref(&man, &q_name, 0)?;
             expect(
@@ -277,16 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 [(mla.n_head * mla.kq_head) as u64, m as u64, 1, 1],
                 "MUL_MAT",
             )?;
-            let qw = mla.n_head * mla.kq_head;
-            let mut q_src = vec![0.0f32; m * mla.n_head * nd];
-            for t in 0..m {
-                for h in 0..mla.n_head {
-                    let dst = (t * mla.n_head + h) * nd;
-                    let src = t * qw + h * mla.kq_head + mla.nope;
-                    q_src[dst..dst + nd].copy_from_slice(&qv[src..src + nd]);
-                }
-            }
-            // The k side: the rope tail of each token's kv_rope_compressed.
+            // The k side's base tensor, same proof.
             let krc_name = format!("kv_rope_compressed-{l}");
             let (krc_row, krc) = load_ref(&man, &krc_name, 0)?;
             let kv_w = mla.latent + nd;
@@ -297,14 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 [kv_w as u64, m as u64, 1, 1],
                 "MUL_MAT",
             )?;
-            let mut k_src = vec![0.0f32; m * nd];
-            for t in 0..m {
-                k_src[t * nd..(t + 1) * nd].copy_from_slice(&krc[t * kv_w + mla.latent..][..nd]);
-            }
-            for (what, n_vec, src) in [
-                ("q_rope", mla.n_head as u32, &q_src),
-                ("k_rope", 1u32, &k_src),
-            ] {
+            for (what, n_vec) in [("q_rope", mla.n_head as u32), ("k_rope", 1u32)] {
                 let name = format!("{what}-{l}");
                 let (in_row, view) = load_ref(&man, &name, 0)?;
                 let out_row = find_ref_row(&man, &name, 1)?;
@@ -323,12 +304,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "ROPE",
                 )?;
                 // Prove the flat-view convention: the dump equals the base
-                // memory from the slice's start, which is NOT the gathered
-                // input fed to the kernel below.
+                // memory from the slice's start, which is NOT the logical
+                // tensor fed to the kernel below.
                 let base_off = if n_vec == 1 { mla.latent } else { mla.nope };
                 view_flat(&view, if n_vec == 1 { &krc } else { &qv }, base_off, &name)?;
+                let src = ref_tensor_logical(&name, 0)?.1;
 
-                let src_dev = DeviceBuffer::from_host(stream, src)?;
+                let src_dev = DeviceBuffer::from_host(stream, &src)?;
                 let mut dst_dev = DeviceBuffer::<f32>::zeroed(stream, src.len())?;
                 elem.enqueue_rope(stream, &src_dev, &cs_dev, nd, n_vec, m, &mut dst_dev)?;
                 stream.synchronize()?;
@@ -337,7 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stream.synchronize()?;
                 let rerun = bits_equal(&y, &dst_dev.to_host_vec(stream)?);
 
-                let y_ref = rope_ref(src, &cs, nd, n_vec as usize, m);
+                let y_ref = rope_ref(&src, &cs, nd, n_vec as usize, m);
                 let rel = max_rel_err(&y, &y_ref)?;
                 let exact = bits_equal(&y, &y_ref);
                 let ik = ref_tensor_of(out_row)?;
@@ -694,48 +676,6 @@ fn expect(
         .into());
     }
     Ok(())
-}
-
-/// Prove the dump's VIEW convention for one view: `view` must equal `base`
-/// from `off` — flat memory from the view's base pointer, not the
-/// materialized gather the kernel consumes.
-#[cfg(feature = "gpu")]
-fn view_flat(
-    view: &[f32],
-    base: &[f32],
-    off: usize,
-    what: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if off + view.len() > base.len() || !bits_equal(view, &base[off..off + view.len()]) {
-        return Err(format!(
-            "gate_p4: {what}: dump is not the flat base memory at +{off} — view convention changed"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// An F32 tensor from the file as f32 (norm gains), length-checked.
-#[cfg(feature = "gpu")]
-fn f32_tensor(
-    gguf: &gguf::Gguf,
-    name: &str,
-    want: usize,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let (t, b) = tensor_bytes(gguf, name)?;
-    if t.ty != GgmlType::F32 || b.len() != want * 4 {
-        return Err(format!(
-            "gate_p4: {name} is {:?} with {} bytes, want F32 x {want}",
-            t.ty,
-            b.len()
-        )
-        .into());
-    }
-    Ok(b.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect())
 }
 
 /// Element sum in f64 — the operand-pair proof of the add chains.

@@ -14,16 +14,15 @@
 //!
 //! Printed, NOT asserted: distance to the ik CUDA oracle on real inputs —
 //! `ffn_moe_logits-L` in; probs vs `ffn_moe_probs-L` (SOFT_MAX), weights vs
-//! `ffn_moe_weights-L` (GET_ROWS), ids vs `ffn_moe_topk-L`. Ids are
-//! categorical: the ids distance is a mismatch count, not a `max_rel_err`.
-//! The topk rows are VIEWs of the argsort output (ggml_top_k returns a
-//! view); byte inspection (see `ref_i32_tensor`) shows the files hold each
-//! id cast to f32, read contiguously from the parent's base — token 0's
-//! descending ranking — so the ids comparison covers token 0 only and the
-//! rest is skipped with a printed reason. Synthetic inputs cover what the
-//! dump cannot supply (an exact tie at the 6th/7th rank, all-equal logits,
-//! ±80 extreme logits, and m = 8) and pin the tie rule and overflow
-//! behaviour against the same host reference.
+//! `ffn_moe_weights-L` (GET_ROWS). Ids are categorical and ARE asserted:
+//! the distance is a mismatch count, not a `max_rel_err`, and all of it
+//! must be zero. The topk rows are VIEWs of the argsort output whose plain
+//! files are flat reads (token 0's ranking only), so ids come from the v2
+//! logical twins (`ffn_moe_topk-L.0.logical.f32`, every token's top-6 ids
+//! cast to f32) and every token's ids must equal the routing reference.
+//! Synthetic inputs cover what the dump cannot supply (an exact tie at the
+//! 6th/7th rank, all-equal logits, ±80 extreme logits, and m = 8) and pin
+//! the tie rule and overflow behaviour against the same host reference.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -36,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::router::{N_EXPERT, N_USED, RouterKernels};
     use bloomery_gpu_gates::{
-        find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of, tensor_bytes,
+        find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of, route_ref, tensor_bytes,
     };
     use cuda_core::DeviceBuffer;
 
@@ -110,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         let x_ik = ref_tensor_of(logits_row)?; // ggml t-major: x[t*64 + e]
-        let (probs_ref, ids_ref, w_ref) = route_ref(&x_ik, m, scale);
+        let (probs_ref, ids_ref, w_ref) = route_ref(&x_ik, m, scale)?;
 
         // The router's oracle outputs, chain-checked against the logits row.
         let probs_row = find_ref_row(&man, &format!("ffn_moe_probs-{l}"), 0)?;
@@ -148,13 +147,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let ik_probs = ref_tensor_of(probs_row)?; // t-major [64, m]
         let ik_w = ref_tensor_of(weights_row)?; // t-major [6, m]
-        // Byte-inspected (see ref_i32_tensor): the ids file holds token 0's
-        // descending ranking, first 6*m positions — the dump tool read the
-        // VIEW's nelements*4 bytes contiguously from the argsort parent's
-        // base. Only file[0..6] are the dumped topk of token 0; for m > 1
-        // the ids of tokens >= 1 are not in the dump at all.
-        let ik_ids_file = ref_i32_tensor(topk_row)?;
-        let ik_ids_t0 = &ik_ids_file[..N_USED];
+        // The topk ids are the row's LOGICAL twin: every token's top-6,
+        // each id cast to f32 by the dumper (see `topk_ids_logical`). The
+        // plain file is the flat read of the argsort parent — token 0's
+        // ranking only — and is not the tensor.
+        let ik_ids = topk_ids_logical(topk_row)?;
         // Per-token softmax sanity of the loaded probs (sum 1 within f32
         // rounding) — catches a layout mix-up before any comparison.
         for t in 0..m {
@@ -168,30 +165,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        // GET_ROWS proof, dump-internal: token 0's weights are bit-exact
-        // copies of token 0's probs at token 0's ids; tokens >= 1 have no
-        // ids in the dump, so each of their weights is instead proven to be
-        // one of that token's probs, bit-exact.
-        for s in 0..N_USED {
-            let e = ik_ids_t0[s] as usize;
-            if e >= N_EXPERT || ik_w[s].to_bits() != ik_probs[e].to_bits() {
-                return Err(format!(
-                    "gate_p6: ffn_moe_weights-{l} (0,{s}) is not probs[{e}]: {} vs {}",
-                    ik_w[s],
-                    if e < N_EXPERT { ik_probs[e] } else { f32::NAN }
-                )
-                .into());
-            }
-        }
-        for t in 1..m {
+        // GET_ROWS proof, dump-internal: every token's weights are bit-exact
+        // copies of that token's probs at that token's ids.
+        for t in 0..m {
             for s in 0..N_USED {
+                let e = ik_ids[t * N_USED + s] as usize;
                 let wv = ik_w[t * N_USED + s];
-                if !ik_probs[t * N_EXPERT..(t + 1) * N_EXPERT]
-                    .iter()
-                    .any(|&p| p.to_bits() == wv.to_bits())
-                {
+                if e >= N_EXPERT || wv.to_bits() != ik_probs[t * N_EXPERT + e].to_bits() {
                     return Err(format!(
-                        "gate_p6: ffn_moe_weights-{l} ({t},{s}) = {wv} is not one of the token's probs"
+                        "gate_p6: ffn_moe_weights-{l} ({t},{s}) is not probs[{e}]: {wv} vs {}",
+                        if e < N_EXPERT {
+                            ik_probs[t * N_EXPERT + e]
+                        } else {
+                            f32::NAN
+                        }
                     )
                     .into());
                 }
@@ -212,25 +199,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let w_err = max_rel_err(&w_t, &w_ref)?;
         let ik_probs_rel = max_rel_err(&probs_t, &ik_probs)?;
         let ik_w_rel = max_rel_err(&w_t, &ik_w)?;
-        let ik_ids_mis = ids_t[..N_USED]
-            .iter()
-            .zip(ik_ids_t0)
-            .filter(|(a, b)| a != b)
-            .count();
-        let pass = ids_exact && probs_err <= BAND && w_err <= BAND && out.rerun_bit_same;
+        let ik_ids_exact = ik_ids == ids_ref;
+        let ik_ids_mis = ids_t.iter().zip(&ik_ids).filter(|(a, b)| a != b).count();
+        let pass =
+            ids_exact && ik_ids_exact && probs_err <= BAND && w_err <= BAND && out.rerun_bit_same;
         println!(
-            "shape op=router_topk src=ffn_moe_logits-{l} m={m} ids_exact={ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} ik_probs_rel={ik_probs_rel:.3e} ik_weights_rel={ik_w_rel:.3e} ik_ids_mismatch={ik_ids_mis}/6 {}",
+            "shape op=router_topk src=ffn_moe_logits-{l} m={m} ids_exact={ids_exact} ik_ids_exact={ik_ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} ik_probs_rel={ik_probs_rel:.3e} ik_weights_rel={ik_w_rel:.3e} ik_ids_mismatch={ik_ids_mis}/{} {}",
             out.rerun_bit_same,
+            N_USED * m,
             verdict(pass)
         );
+        if !ik_ids_exact {
+            for t in 0..m {
+                for s in 0..N_USED {
+                    let i = t * N_USED + s;
+                    if ik_ids[i] != ids_ref[i] {
+                        println!(
+                            "divergence op=router_topk layer={l} token={t} slot={s} dump_id={} route_ref_id={} device_id={}",
+                            ik_ids[i], ids_ref[i], ids_t[i]
+                        );
+                    }
+                }
+            }
+        }
         if !pass {
             ok = false;
-        }
-        if m > 1 {
-            println!(
-                "skip compare=ids layer={l} tokens=1..{m} reason=\"ffn_moe_topk file is a contiguous read of the argsort parent (token 0 ranks 0..{}); ids of tokens >= 1 absent\"",
-                6 * m - 1
-            );
         }
 
         // The decode (m=1) table over this layer's token-0 ids: slot-major
@@ -248,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "dump ffn_moe_topk: manifest type i32 op VIEW; files hold each id CAST TO F32 (i32 reading of the words sums ~3.9e10, the manifest element sum is the small integral), read contiguously from the argsort parent's base — token 0's descending ranking, first 6*m positions (verified: file[6..36] == token 0 ranks 6..35 on L=1/L=13); ids taken from file[0..6]"
+        "dump ffn_moe_topk: manifest type i32 op VIEW; the plain file is the flat read of the argsort parent (token 0's ranking) — ids are the v2 logical twin's, every token's top-6, each id cast to f32, integral 0..63 checked"
     );
 
     // ---- synthetic: shapes and values the dump cannot supply.
@@ -302,7 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|&v| v as i32)
         .collect();
     let w_t = transpose(&out.weights, N_USED, 8);
-    let (probs_ref, ids_ref, w_ref) = route_ref(&xt, 8, scale);
+    let (probs_ref, ids_ref, w_ref) = route_ref(&xt, 8, scale)?;
     let ids_exact = ids_t == ids_ref;
     let probs_err = max_rel_err(&probs_t, &probs_ref)?;
     let w_err = max_rel_err(&w_t, &w_ref)?;
@@ -433,11 +426,11 @@ fn synth_case(
     scale: f32,
     ok: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use bloomery_gpu_gates::max_rel_err;
+    use bloomery_gpu_gates::{max_rel_err, route_ref};
 
     const BAND: f32 = 1e-6;
     let out = run_router(router, stream, logits, 1, scale)?;
-    let (probs_ref, ids_ref, w_ref) = route_ref(logits, 1, scale);
+    let (probs_ref, ids_ref, w_ref) = route_ref(logits, 1, scale)?;
     let ids_dev: Vec<i32> = out.ids.iter().map(|&v| v as i32).collect();
     let ids_exact = ids_dev == ids_ref;
     let probs_err = max_rel_err(&out.probs, &probs_ref)?;
@@ -539,48 +532,6 @@ fn run_table(
     Ok((exact, rerun))
 }
 
-/// Host scalar reference, transcribed from the CPU engine's routing
-/// (`model::moe::route_inner`): softmax with a serial f32 max fold, f32
-/// `exp`, f64 sum ascending, f32 divide by `sum as f32`; top-k by
-/// `(probability desc, id asc)`; weights `probs[id] * scale`. Layout ggml
-/// t-major: logits/probs `[64, m]`, ids/weights `[6, m]`.
-#[cfg(feature = "gpu")]
-fn route_ref(logits: &[f32], m: usize, scale: f32) -> (Vec<f32>, Vec<i32>, Vec<f32>) {
-    let (n, k) = (64usize, 6usize);
-    let mut probs = vec![0.0f32; n * m];
-    for t in 0..m {
-        let src = &logits[t * n..(t + 1) * n];
-        let max = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f64;
-        let dst = &mut probs[t * n..(t + 1) * n];
-        for (o, &v) in dst.iter_mut().zip(src) {
-            let e = (v - max).exp();
-            *o = e;
-            sum += f64::from(e);
-        }
-        for o in dst.iter_mut() {
-            *o /= sum as f32;
-        }
-    }
-    let mut ids = vec![0i32; k * m];
-    let mut weights = vec![0.0f32; k * m];
-    let mut ranked: Vec<u32> = (0..n as u32).collect();
-    for t in 0..m {
-        let p = &probs[t * n..(t + 1) * n];
-        ranked.sort_by(|&a, &b| {
-            p[b as usize]
-                .partial_cmp(&p[a as usize])
-                .unwrap()
-                .then(a.cmp(&b))
-        });
-        for (s, &e) in ranked.iter().take(k).enumerate() {
-            ids[t * k + s] = e as i32;
-            weights[t * k + s] = p[e as usize] * scale;
-        }
-    }
-    (probs, ids, weights)
-}
-
 /// Transpose from the kernels' layouts to ggml's: `src` as `per` rows of
 /// `m` (expert/slot-major, the kernels' buffers) becomes `m` rows of `per`
 /// (token-major, the dump's tensors).
@@ -608,39 +559,44 @@ fn to_expert_major<T: Copy>(src: &[T], per: usize, m: usize) -> Vec<T> {
     out
 }
 
-/// One manifest row's ids file. The `ffn_moe_topk-L` rows are VIEWs of an
-/// i32 tensor the dumper pushed through its f32 writer: the file holds each
-/// id CAST TO F32 (byte inspection: the i32 reading of the words sums to
-/// ~3.9e10 while the manifest's element sum is the small integral 1282 —
-/// f32-cast small integers, not raw i32 bit patterns), and the manifest's
-/// `type` column still names the source tensor's i32. Accepted only when
-/// every f32 value is integral in `0..64` and the element sum equals the
-/// manifest's, which rules out any stride or cast mix-up.
+/// The topk row's ids from its LOGICAL twin: `ffn_moe_topk-L` is an i32
+/// VIEW of the argsort output whose plain file is the flat parent read
+/// (token 0's ranking only); the `.logical.f32` twin holds every token's
+/// top-6 ids, each cast to f32 by the dumper. Accepted only when the row
+/// carries a twin and every value is integral in `0..64`, which rules out
+/// any stride or cast mix-up; the manifest's element-sum column describes
+/// the plain file and is not checked here.
 #[cfg(feature = "gpu")]
-fn ref_i32_tensor(
+fn topk_ids_logical(
     row: &bloomery_gpu_gates::RefRow,
 ) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
     use bloomery_gpu_gates::ref_dir;
 
-    let path = ref_dir().join(row.file_name());
-    let raw = std::fs::read(&path)
-        .map_err(|e| format!("gate_p6: cannot read {}: {e}", path.display()))?;
-    if raw.len() as u64 != row.bytes {
+    if row.logical != Some(1) {
         return Err(format!(
-            "gate_p6: {} is {} bytes, manifest says {}",
-            path.display(),
-            raw.len(),
-            row.bytes
+            "gate_p6: {} has no logical twin — the ids need a v2 dump set",
+            row.name
         )
         .into());
     }
-    let vals: Vec<f32> = raw
+    let path = ref_dir().join(format!("{}.{}.logical.f32", row.name, row.occurrence));
+    let raw = std::fs::read(&path)
+        .map_err(|e| format!("gate_p6: cannot read {}: {e}", path.display()))?;
+    let expect = 4_u64
+        .checked_mul(row.count())
+        .ok_or("gate_p6: topk element count overflows")?;
+    if raw.len() as u64 != expect {
+        return Err(format!(
+            "gate_p6: {} is {} bytes, want {expect} (4*count)",
+            path.display(),
+            raw.len()
+        )
+        .into());
+    }
+    let ids: Vec<i32> = raw
         .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let ids: Vec<i32> = vals
-        .iter()
-        .map(|&v| {
+        .map(|c| {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             if v.fract() == 0.0 && (0.0..64.0).contains(&v) {
                 Ok(v as i32)
             } else {
@@ -652,15 +608,6 @@ fn ref_i32_tensor(
             }
         })
         .collect::<Result<_, Box<dyn std::error::Error>>>()?;
-    let sum: f64 = vals.iter().map(|&v| f64::from(v)).sum();
-    if (sum - row.sum).abs() > 1e-6 {
-        return Err(format!(
-            "gate_p6: {} element sum {sum} != manifest {}",
-            path.display(),
-            row.sum
-        )
-        .into());
-    }
     Ok(ids)
 }
 

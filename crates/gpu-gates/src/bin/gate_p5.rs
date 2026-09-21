@@ -38,6 +38,7 @@ use bloomery_gpu_gates::RefRow;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     activations, find_ref_row, max_rel_err, open_model, ref_dir, ref_manifest, ref_tensor_of,
+    widened_f16_bits,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -266,7 +267,7 @@ fn real_layer(
     let neighbours = bits1[tokens * width..].iter().all(|&b| b == 0);
     // ik's own cache rows: an f16 VIEW whose file the dumper widened to f32
     // exactly, so rounding back recovers ik's bits (ref_tensor_of rejects
-    // the f16 label, hence the local file checks in widened_f16_bits).
+    // the f16 label, hence the widened_f16_bits helper in the lib).
     let ik_cache_row = find_ref_row(man, &format!("kv_cache-{l}"), 0)?;
     if ik_cache_row.ty != "f16"
         || ik_cache_row.op != "VIEW"
@@ -721,49 +722,6 @@ fn ik_kqv_rows(kqv: &[f32], t: usize, n_heads: usize, latent: usize) -> Vec<f32>
     (0..n_heads)
         .flat_map(|h| (0..latent).map(move |d| kqv[d + latent * h + latent * n_heads * t]))
         .collect()
-}
-
-/// The f16 cache view's first `rows` rows as f16 bits: the dump widened the
-/// halves to f32 exactly, so rounding back recovers ik's own bits.
-/// `ref_tensor_of` rejects the f16 manifest label, so its file checks live
-/// here.
-#[cfg(feature = "gpu")]
-fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
-    let path = ref_dir().join(row.file_name());
-    let raw = std::fs::read(&path)
-        .map_err(|e| format!("gate_p5: cannot read {}: {e}", path.display()))?;
-    if raw.len() as u64 != row.bytes {
-        return Err(format!(
-            "gate_p5: {} is {} bytes, manifest says {}",
-            path.display(),
-            raw.len(),
-            row.bytes
-        )
-        .into());
-    }
-    let width = row.ne[0] as usize;
-    let count = row.count() as usize;
-    if row.bytes != 4 * count as u64 || raw.len() != row.bytes as usize {
-        return Err(format!(
-            "gate_p5: {} is {} bytes, manifest says {} for {count} widened values",
-            path.display(),
-            raw.len(),
-            row.bytes
-        )
-        .into());
-    }
-    if rows * width > count {
-        return Err(format!(
-            "gate_p5: {} holds {count} values, asked for {rows} rows of {width}",
-            path.display()
-        )
-        .into());
-    }
-    Ok(raw
-        .chunks_exact(4)
-        .take(rows * width)
-        .map(|c| f32_to_f16_bits(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-        .collect())
 }
 
 #[cfg(feature = "gpu")]

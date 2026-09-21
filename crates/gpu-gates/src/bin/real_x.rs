@@ -50,8 +50,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // output.weight rows driven (and given an exact reference): the head's
     // full 102400 rows add nothing the first 4096 do not show.
     const HEAD_ROWS: usize = 4096;
-    // Rows the gate/up attribution probe compares before the full run.
-    const ATTR_ROWS: usize = 64;
 
     let gguf = open_model()?;
     let gpu = Gpu::new()?;
@@ -146,8 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- fused gate/up sites. The dump's FUSED_UP_GATE tensor is the
     // swiglu of the two projections ([I,t], not a raw half of [2I,t]); the
-    // operand order is probe-verified per site and our chain is both gemvs
-    // over ONE quantization + host swiglu (see `swiglu_site`).
+    // operand order is asserted from the manifest (src0 = up, src1 = gate)
+    // and our chain is both gemvs over ONE quantization + host swiglu
+    // (see `swiglu_site`).
     let dense_norm = find_ref_row(&man, "ffn_norm-0", 0)?;
     let dense_up_gate = find_ref_row(&man, "ffn_up_gate-0", 0)?;
     if let Some(v) = swiglu_site(
@@ -158,7 +157,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dense_up_gate,
         "blk.0.ffn_gate.weight",
         "blk.0.ffn_up.weight",
-        ATTR_ROWS,
     )? {
         push(GgmlType::Q3_K, v);
     }
@@ -173,7 +171,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             up_gate,
             &format!("blk.{l}.ffn_gate_shexp.weight"),
             &format!("blk.{l}.ffn_up_shexp.weight"),
-            ATTR_ROWS,
         )? {
             push(GgmlType::Q3_K, v);
         }
@@ -418,12 +415,12 @@ fn kq_device_run(
 /// A fused gate/up site. The dump's FUSED_UP_GATE tensor is NOT a raw half
 /// of the [gate; up] concat — it is [I, t] where I is the FFN intermediate,
 /// i.e. the swiglu of the two projections (the fused kernel applies it).
-/// Which operand order is probe-verified per site against the exact
-/// references before the full run, and printed. Our chain mirrors the
-/// engine's: ONE q8_1 quantization of the norm output, both Q3_K gemvs
-/// against it, then the host swiglu silu(f(·))·(other) in f32.
+/// The operand order is the manifest's, asserted before any number is read:
+/// `src0` names the up projection, `src1` the gate projection — the fused
+/// `silu(gate)·up`. Our chain mirrors the engine's: ONE q8_1 quantization
+/// of the norm output, both Q3_K gemvs against it, then the host swiglu
+/// silu(gate)·up in f32.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
 fn swiglu_site(
     gpu: &Gpu,
     gguf: &Gguf,
@@ -432,12 +429,22 @@ fn swiglu_site(
     up_gate_row: &RefRow,
     gate_tensor: &str,
     up_tensor: &str,
-    attr_rows: usize,
 ) -> Result<Option<[f32; 3]>, Box<dyn std::error::Error>> {
     if up_gate_row.op != "FUSED_UP_GATE" {
         return Err(format!(
             "real_x: {site}: {} is op {}, want FUSED_UP_GATE",
             up_gate_row.name, up_gate_row.op
+        )
+        .into());
+    }
+    // src0 = up, src1 = gate — anything else is not the fused
+    // silu(gate)·up this chain models.
+    if up_gate_row.src0.as_deref() != Some(up_tensor)
+        || up_gate_row.src1.as_deref() != Some(gate_tensor)
+    {
+        return Err(format!(
+            "real_x: {site}: {} src0={:?} src1={:?}, want src0 {up_tensor} / src1 {gate_tensor}",
+            up_gate_row.name, up_gate_row.src0, up_gate_row.src1
         )
         .into());
     }
@@ -478,34 +485,6 @@ fn swiglu_site(
     let yk = ref_tensor_of(up_gate_row)?;
     let ik = ik_to_ours(&yk, rows, m);
     let rb = row_bytes(GgmlType::Q3_K, k)?;
-    let probe = attr_rows.min(rows);
-
-    // Operand-order probe: silu(gate)·up vs gate·silu(up), exact
-    // references, first `probe` rows. The wrong order is uncorrelated.
-    let g_probe = ref_gemv(GgmlType::Q3_K, &g_bytes[..rb * probe], k, probe, &x, m)?;
-    let u_probe = ref_gemv(GgmlType::Q3_K, &u_bytes[..rb * probe], k, probe, &x, m)?;
-    let silu_gu: Vec<f32> = g_probe
-        .iter()
-        .zip(&u_probe)
-        .map(|(&g, &u)| silu(g) * u)
-        .collect();
-    let silu_ug: Vec<f32> = g_probe
-        .iter()
-        .zip(&u_probe)
-        .map(|(&g, &u)| g * silu(u))
-        .collect();
-    let rel_gu = max_rel_err(&ik[..probe * m], &silu_gu)?;
-    let rel_ug = max_rel_err(&ik[..probe * m], &silu_ug)?;
-    println!(
-        "attr site={site:<28} probe_rows={probe} silu(gate)*up rel={rel_gu:.3e} gate*silu(up) rel={rel_ug:.3e}"
-    );
-    let ug_order = rel_ug < 0.1;
-    if !(rel_gu < 0.1 || ug_order) {
-        println!(
-            "skip site={site} reason=\"dumped ffn_up_gate matches neither swiglu operand order within 0.1\""
-        );
-        return Ok(None);
-    }
 
     // Our chain: one quantization, both gemvs, host swiglu.
     let (y_g, y_u) = q3k_two_gemv(
@@ -517,40 +496,23 @@ fn swiglu_site(
         &x,
         m,
     )?;
-    let s: Vec<f32> = if ug_order {
-        y_g.iter().zip(&y_u).map(|(&g, &u)| g * silu(u)).collect()
-    } else {
-        y_g.iter().zip(&y_u).map(|(&g, &u)| silu(g) * u).collect()
-    };
+    let s: Vec<f32> = y_g.iter().zip(&y_u).map(|(&g, &u)| silu(g) * u).collect();
     if let Some(i) = s.iter().position(|v| !v.is_finite()) {
         return Err(format!("real_x: {site}: non-finite swiglu output at index {i}").into());
     }
     let g_exact = ref_gemv(GgmlType::Q3_K, &g_bytes[..rb * rows], k, rows, &x, m)?;
     let u_exact = ref_gemv(GgmlType::Q3_K, &u_bytes[..rb * rows], k, rows, &x, m)?;
-    let s_ref: Vec<f32> = if ug_order {
-        g_exact
-            .iter()
-            .zip(&u_exact)
-            .map(|(&g, &u)| g * silu(u))
-            .collect()
-    } else {
-        g_exact
-            .iter()
-            .zip(&u_exact)
-            .map(|(&g, &u)| silu(g) * u)
-            .collect()
-    };
+    let s_ref: Vec<f32> = g_exact
+        .iter()
+        .zip(&u_exact)
+        .map(|(&g, &u)| silu(g) * u)
+        .collect();
     let raw_x_rel = max_rel_err(&s, &s_ref)?;
     let ik_rel = max_rel_err(&s, &ik)?;
     let ik_vs_exact = max_rel_err(&ik, &s_ref)?;
     let (amax, ratio) = spikiness(&x, site)?;
-    let order = if ug_order {
-        "gate*silu(up)"
-    } else {
-        "silu(gate)*up"
-    };
     println!(
-        "real site={site:<28} T=Q3_K K={k} rows={rows} m={m} w={gate_tensor}|{up_tensor} order={order} raw_x_rel={raw_x_rel:.3e} ik_rel={ik_rel:.3e} ik_vs_exact={ik_vs_exact:.3e} amax={amax:.3e} amax/rms={ratio:.1}"
+        "real site={site:<28} T=Q3_K K={k} rows={rows} m={m} w={gate_tensor}|{up_tensor} raw_x_rel={raw_x_rel:.3e} ik_rel={ik_rel:.3e} ik_vs_exact={ik_vs_exact:.3e} amax={amax:.3e} amax/rms={ratio:.1}"
     );
     Ok(Some([raw_x_rel, ik_rel, ik_vs_exact]))
 }

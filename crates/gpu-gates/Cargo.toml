@@ -10,6 +10,9 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
+# Host-only edge: the exact f32->f16 rounding (`model::attn`) without the
+# device crate — `widened_f16_bits` needs it outside the `gpu` feature.
+bloomery-model = { path = "../model" }
 # Optional for the same reason as gpu-spike: with the feature off this package
 # has no edge to the device crate, so plain cargo never resolves the
 # embedded-bundle anchor symbol.

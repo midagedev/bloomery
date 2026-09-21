@@ -185,10 +185,10 @@ impl RefRow {
 
 /// Directory of the ik CUDA oracle dump (docs/gpu-design.md decision 3):
 /// `$BLOOMERY_REF_CUDA` if set (an absolute path), else the set named by
-/// `$BLOOMERY_REF_SET`, else `$BLOOMERY_DATA/ref_cuda`, else the
+/// `$BLOOMERY_REF_SET`, else `$BLOOMERY_DATA/ref_cuda_v2`, else the
 /// workstation default. Read-only for every caller. `BLOOMERY_REF_SET` is
-/// how a gate points itself at `ref_cuda_v2` or the CPU `ref` without a
-/// code change; leaving it unset keeps the pre-v2 behaviour.
+/// how a gate points itself at the pre-v2 `ref_cuda` (plain files only,
+/// no logical twins) or the CPU `ref` without a code change.
 pub fn ref_dir() -> PathBuf {
     if let Ok(p) = std::env::var("BLOOMERY_REF_CUDA") {
         return PathBuf::from(p);
@@ -197,7 +197,7 @@ pub fn ref_dir() -> PathBuf {
         return ref_dir_named(&s);
     }
     let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    PathBuf::from(data).join("ref_cuda")
+    PathBuf::from(data).join("ref_cuda_v2")
 }
 
 /// A named dump set's directory: an absolute `set` is the directory
@@ -532,13 +532,11 @@ pub fn f32_tensor(gguf: &Gguf, name: &str, want: usize) -> Result<Vec<f32>, Gate
 
 /// The f16 cache view's first `rows` rows as f16 bits: the dump widened
 /// the halves to f32 exactly, so rounding back recovers ik's own bits
-/// (gate_p5's local `widened_f16_bits`). Under the `gpu` feature because
-/// the one exact f32→f16 rounding (the CPU oracle's own, re-exported by
-/// the device crate) lives there; a second transcription here would be a
-/// second thing to drift.
-#[cfg(feature = "gpu")]
+/// (gate_p5's local `widened_f16_bits`). The rounding is
+/// `model::attn::f32_to_f16_bits` itself — the CPU oracle's own — so a
+/// second transcription here cannot drift.
 pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError> {
-    use bloomery_gpu::flash::f32_to_f16_bits;
+    use model::attn::f32_to_f16_bits;
 
     let path = ref_dir().join(row.file_name());
     let raw = std::fs::read(&path)
