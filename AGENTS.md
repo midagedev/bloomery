@@ -46,7 +46,10 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
                       # even a `touch` lost to the box clock running 4.1 s ahead
                       # of the Mac — the MUTATED binary was served twice.)
                       # Before trusting a run whose source changed, the build
-                      # log must still show `Compiling <crate>`.
+                      # log must still show `Compiling <crate>`. The flip side
+                      # (2026-09-21): a Mac `touch` changes no content, so the
+                      # box never sees it — to force a rebuild of UNCHANGED
+                      # source, touch on the box (`box.sh 'touch <file> && …'`).
     just fmt          # cargo fmt --all
     just build-gpu    # cargo oxide build --arch sm_86 -- -p q3k-gemv
     just build-cpu    # release build with -C target-cpu=znver3

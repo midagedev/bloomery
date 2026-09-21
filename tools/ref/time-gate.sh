@@ -34,8 +34,11 @@ echo "[lease] waiting for $LOCK ..."
 flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
 echo "[lease] held by pid $$ at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 witness pre
-timeout --kill-after=10 600 "$BIN" "${ARGS[@]}"
-rc=$?
+# `|| rc=$?`, not a bare `rc=$?`: under `set -e` a non-zero gate exits the script on the
+# spot, and the post witness and the rc line never print (measured 2026-09-21 — a FAIL-first
+# timing run lost its post witness). A failing timed run must still be a complete record.
+rc=0
+timeout --kill-after=10 600 "$BIN" "${ARGS[@]}" || rc=$?
 witness post
 echo "$NAME ${ARGS[*]} rc=$rc"
 exit $rc
