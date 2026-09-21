@@ -17,6 +17,8 @@
 //! i.e. the stage-0 "3–5e-3 floor" premise does not transfer to this
 //! generator and geometry — the raw-x comparison cannot sit under 1e-2
 //! here, so it is reported, not asserted.
+//! On real activations (`just rawx-floor`, Q5_0 moe_down) the same
+//! deviation measures 1.3–1.4e-2.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {

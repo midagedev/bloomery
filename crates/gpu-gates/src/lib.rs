@@ -19,8 +19,13 @@ use std::path::PathBuf;
 /// The model every gate reads unless `BLOOMERY_REF_MODEL` says otherwise.
 pub const DEFAULT_MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
 
-/// The stage-0 kernel gate band.
-pub const KERNEL_BAND: f32 = 1e-2;
+/// Kernel gate band against the quantized-input reference.
+/// PIN(2026-09-21): tightened 1e-2 -> 1e-5. Measured worst on the landed
+/// kernels: 1.149e-7 (gate_p1, 12 shapes), 1.375e-7 (gate_p2); the f32
+/// gemvs already gate at 1e-5 (worst 1.9e-7). 1e-2 was sized for the
+/// raw-activation comparison this band no longer makes, and would pass a
+/// sub-block scale defect landing near 1e-3 on a shape with no hash pin.
+pub const KERNEL_BAND: f32 = 1e-5;
 
 pub type GateError = Box<dyn std::error::Error>;
 
