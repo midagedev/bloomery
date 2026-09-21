@@ -21,13 +21,20 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
   else holds the A6000 any more — the nightly vocoder training ended 2026-09-21
   and `llm.service` is inactive and disabled — so a compute process on either
   card that is not one of our rounds is a surprise to investigate, not a tenant
-  to yield to. The default card stays the 3090 (pinned by `CUDA_VISIBLE_DEVICES`
-  in the box env); take the A6000 through `BLOOMERY_CARD=a6000|both
-  tools/box.sh …`, which still refuses (rc 75) while the card has a compute
-  process, as a collision guard between our own rounds. **Timed numbers stay on
-  the 3090** (the ik baselines were measured there); the A6000 runs correctness
-  gates and builds' functional checks in parallel with a 3090 lease, and the
-  two-card stage gate.
+  to yield to. **Timed numbers are taken on the A6000** (user, 2026-09-22 —
+  the 3090 fell off the bus twice that day under load, Xid 79 at 01:51 and
+  21:38 UTC; the timing runners `tools/ref/depth-gpu.sh`, `nsys-gpu.sh`,
+  `ncu-gpu.sh` pin it through `TIMING_GPU`, override with
+  `BLOOMERY_TIMING_GPU`, and every witness block opens with the card name and
+  power limit). The ik baselines are re-measured there; **3090 numbers from
+  before that date and A6000 numbers never share a table**. The 3090 is the
+  gate-and-build card: `tools/box.sh` defaults to it (the box env pin), it is
+  capped at 300 W by a systemd oneshot (`gpu-power-limit.service`), and a
+  compute process on it does not stop a timing run — the runner records it as
+  `[other-busy]` (abort with `BLOOMERY_OTHER_STRICT=1`). `BLOOMERY_CARD=a6000|
+  both tools/box.sh …` still exists for functional runs on the A6000 and
+  refuses (rc 75) while that card has a compute process — i.e. while a timing
+  run holds it.
 - **Never relax a gate or a lint to make it pass.** Raise it with a dated
   comment and a reason, or file an issue. The lint levels in the root
   `Cargo.toml` carry the hit counts they were chosen from.
