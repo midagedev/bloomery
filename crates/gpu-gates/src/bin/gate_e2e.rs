@@ -201,12 +201,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Cross-check, PRINTED not asserted. The two files are two ik runs at
-    // different context sizes — `argmax.sh` sizes `-c` as `512 + GEN`, so
-    // the argmax file ran at 512 and the greedy file at 544 — and they are
-    // not the same quantity. Which one is right is the reference tooling's
-    // question; this gate records the distance and judges against the
-    // greedy file, the only one carrying continuations.
+    // Cross-check, ASSERTED since the ikclear round (2026-09-21). It used to
+    // be printed only, on the premise that the two files were ik runs at
+    // different context sizes (`argmax.sh` sized `-c` as `512 + GEN`) and so
+    // were not the same quantity. That premise was wrong twice over: the
+    // context size makes no difference here (regenerating the greedy file at
+    // -c 544 is byte-identical to -c 512), and the real cause of the skew was
+    // ik widening a sequence's first graph to all 64 experts whenever it
+    // matched its warmup predicate — which the argmax file hit on every row
+    // and the greedy file only on row 0. `argmax_ref` now primes the context
+    // so neither does, and the two files agree by construction: same model,
+    // same prompts, same first token, same top-5. Any future regeneration
+    // that reintroduces the skew has hit that class of bug again, and this
+    // gate is where it should stop. Derivation of the threshold: zero, not a
+    // margin — both files are the same greedy argmax of the same logits, so
+    // any difference at all is a defect in how they were produced.
     let tok_diff: Vec<_> = argmax_only
         .iter()
         .zip(&reference)
@@ -218,14 +227,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .zip(&reference)
         .filter(|((_, _, t5), r)| *t5 != r.top5)
         .count();
+    let refs_agree = tok_diff.is_empty() && top5_diff == 0;
     println!(
-        "sanity rows={} argmax_vs_greedy_step1_token_diff={} top5_set_diff={top5_diff} \
-         (printed, not asserted — the two files are ik runs at -c 512 and -c 544)",
+        "sanity rows={} argmax_vs_greedy_step1_token_diff={} top5_set_diff={top5_diff} {}",
         reference.len(),
-        tok_diff.len()
+        tok_diff.len(),
+        if refs_agree { "ok" } else { "FAIL" }
     );
     for (id, a, g) in &tok_diff {
         println!("  sanity prompt {id}: argmax file {a}, greedy file step 1 {g}");
+    }
+    if !refs_agree {
+        println!(
+            "  the two reference files disagree — they are the same quantity, so one of them \
+             was produced under a different graph shape (see tools/ref/argmax_ref.cpp's \
+             priming block). Regenerate both with `just argmax-ref` before trusting either."
+        );
+        ok = false;
     }
 
     let gguf = open_model()?;
@@ -334,8 +352,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "gate_e2e: PASS — the whole chain picks the greedy reference's first token on \
              every prompt or misses it only inside MARGIN_FLOOR; graph replay equals eager \
-             token for token at the pinned node count; two eager runs are identical. The \
-             two reference files' own disagreement is printed above, not gated."
+             token for token at the pinned node count; two eager runs are identical; and the \
+             two reference files agree with each other."
         );
         Ok(())
     } else {
