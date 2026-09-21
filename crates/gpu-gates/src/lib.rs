@@ -12,6 +12,8 @@
 //! up to 1.7e-2: that distance is the design's quantization noise and is
 //! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
+pub mod block;
+
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
 use std::path::PathBuf;
@@ -152,6 +154,8 @@ pub fn bytes_to_words(b: &[u8]) -> Vec<u32> {
 /// ne0..ne3 as written: ne0 is the contiguous dimension (values of an
 /// activation, rows of a MUL_MAT output); `sum` is the dumper's element
 /// sum, usable to prove a VIEW row carries the same bytes as its base.
+/// The four trailing fields are the v2 columns (`contig`, `logical`,
+/// `src0`, `src1`); `None` on a set written before they existed.
 #[derive(Debug, Clone)]
 pub struct RefRow {
     pub name: String,
@@ -161,6 +165,10 @@ pub struct RefRow {
     pub bytes: u64,
     pub sum: f64,
     pub op: String,
+    pub contig: Option<u8>,
+    pub logical: Option<u8>,
+    pub src0: Option<String>,
+    pub src1: Option<String>,
 }
 
 impl RefRow {
@@ -176,22 +184,43 @@ impl RefRow {
 }
 
 /// Directory of the ik CUDA oracle dump (docs/gpu-design.md decision 3):
-/// `$BLOOMERY_REF_CUDA` if set, else `$BLOOMERY_DATA/ref_cuda`, else the
-/// workstation default. Read-only for every caller.
+/// `$BLOOMERY_REF_CUDA` if set (an absolute path), else the set named by
+/// `$BLOOMERY_REF_SET`, else `$BLOOMERY_DATA/ref_cuda`, else the
+/// workstation default. Read-only for every caller. `BLOOMERY_REF_SET` is
+/// how a gate points itself at `ref_cuda_v2` or the CPU `ref` without a
+/// code change; leaving it unset keeps the pre-v2 behaviour.
 pub fn ref_dir() -> PathBuf {
     if let Ok(p) = std::env::var("BLOOMERY_REF_CUDA") {
         return PathBuf::from(p);
+    }
+    if let Ok(s) = std::env::var("BLOOMERY_REF_SET") {
+        return ref_dir_named(&s);
     }
     let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
     PathBuf::from(data).join("ref_cuda")
 }
 
-/// Parse the dump's MANIFEST.tsv. Header lines start with `#`; data rows
-/// are tab-separated
-/// `tensor name occurrence type ne0 ne1 ne2 ne3 bytes sum op`.
-/// Tensor names may contain spaces, so fields are split on tabs only.
-pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {
-    let path = ref_dir().join("MANIFEST.tsv");
+/// A named dump set's directory: an absolute `set` is the directory
+/// itself, anything else is `<$BLOOMERY_DATA>/<set>` (`ref_cuda_v2`, the
+/// CPU `ref`, ...). Unlike `ref_dir` this consults no environment.
+pub fn ref_dir_named(set: &str) -> PathBuf {
+    let p = PathBuf::from(set);
+    if p.is_absolute() {
+        return p;
+    }
+    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
+    PathBuf::from(data).join(set)
+}
+
+/// Parse the MANIFEST.tsv of the set at `dir`. Header lines start with
+/// `#`; data rows are tab-separated
+/// `tensor name occurrence type ne0 ne1 ne2 ne3 bytes sum op`
+/// with four optional trailing fields `contig logical src0 src1` —
+/// sets written before the v2 columns carry the 11-field width and parse
+/// to `None`s. Tensor names may contain spaces, so fields are split on
+/// tabs only.
+pub fn ref_manifest_in(dir: &std::path::Path) -> Result<Vec<RefRow>, GateError> {
+    let path = dir.join("MANIFEST.tsv");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("ref_manifest: cannot read {}: {e}", path.display()))?;
     let mut rows = Vec::new();
@@ -200,9 +229,9 @@ pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {
             continue;
         }
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 11 {
+        if f.len() != 11 && f.len() != 15 {
             return Err(format!(
-                "ref_manifest: {}: row has {} fields, want 11: {line}",
+                "ref_manifest: {}: row has {} fields, want 11 or 15: {line}",
                 path.display(),
                 f.len()
             )
@@ -224,6 +253,10 @@ pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {
             bytes: uparse(f[8])?,
             sum: fparse(f[9])?,
             op: f[10].to_string(),
+            contig: f.get(11).map(|s| uparse(s)).transpose()?.map(|v| v as u8),
+            logical: f.get(12).map(|s| uparse(s)).transpose()?.map(|v| v as u8),
+            src0: f.get(13).map(|s| s.to_string()),
+            src1: f.get(14).map(|s| s.to_string()),
         });
     }
     if rows.is_empty() {
@@ -232,8 +265,24 @@ pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {
     Ok(rows)
 }
 
+/// `ref_manifest_in` of `ref_dir()`.
+pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {
+    ref_manifest_in(&ref_dir())
+}
+
 /// The manifest row for `(name, occurrence)`, if the dump holds it.
 pub fn find_ref_row<'a>(
+    man: &'a [RefRow],
+    name: &str,
+    occurrence: u32,
+) -> Result<&'a RefRow, GateError> {
+    find_ref_row_in(&ref_dir(), man, name, occurrence)
+}
+
+/// `find_ref_row` naming `dir` in the error (the manifest slice is
+/// directory-independent; only the message was not).
+pub fn find_ref_row_in<'a>(
+    dir: &std::path::Path,
     man: &'a [RefRow],
     name: &str,
     occurrence: u32,
@@ -245,7 +294,7 @@ pub fn find_ref_row<'a>(
                 "find_ref_row: {}/{} not in {}MANIFEST.tsv",
                 name,
                 occurrence,
-                ref_dir().display()
+                dir.display()
             )
             .into()
         })
@@ -256,7 +305,12 @@ pub fn find_ref_row<'a>(
 /// the file's length, and every value must be finite. Every error names the
 /// offending path.
 pub fn ref_tensor_of(row: &RefRow) -> Result<Vec<f32>, GateError> {
-    let path = ref_dir().join(row.file_name());
+    ref_tensor_of_in(&ref_dir(), row)
+}
+
+/// `ref_tensor_of` of the set at `dir`.
+pub fn ref_tensor_of_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<f32>, GateError> {
+    let path = dir.join(row.file_name());
     if row.ty != "f32" {
         return Err(format!(
             "ref_tensor_of: {} has type {}, want f32",
@@ -308,6 +362,218 @@ pub fn ref_tensor(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), Gat
     let man = ref_manifest()?;
     let row = find_ref_row(&man, name, occurrence)?;
     Ok((row.clone(), ref_tensor_of(row)?))
+}
+
+/// The tensor's LOGICAL elements in ggml index order from `ref_dir()`: the
+/// `.logical.f32` twin when the dump wrote one, else the plain file when
+/// the row is provably not a flat VIEW read (a contiguous tensor's plain
+/// file IS its logical order; a pre-v2 manifest without the `contig`
+/// column is accepted for non-VIEW rows only). A VIEW row without a
+/// logical twin is an error, never a silent flat read — that flat read is
+/// a different tensor than the one being asked for.
+pub fn ref_tensor_logical(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), GateError> {
+    let man = ref_manifest()?;
+    let row = find_ref_row(&man, name, occurrence)?;
+    Ok((row.clone(), ref_tensor_logical_in(&ref_dir(), row)?))
+}
+
+/// `ref_tensor_logical` of the set at `dir`, over a row already found.
+pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<f32>, GateError> {
+    if row.logical == Some(1) {
+        if row.ty != "f32" {
+            return Err(format!(
+                "ref_tensor_logical: {} has type {}, want f32",
+                row.name, row.ty
+            )
+            .into());
+        }
+        let path = dir.join(format!("{}.{}.logical.f32", row.name, row.occurrence));
+        let expect = 4_u64
+            .checked_mul(row.count())
+            .ok_or("ref_tensor_logical: element count overflows")?;
+        let raw = std::fs::read(&path)
+            .map_err(|e| format!("ref_tensor_logical: cannot read {}: {e}", path.display()))?;
+        if raw.len() as u64 != expect {
+            return Err(format!(
+                "ref_tensor_logical: {} is {} bytes, want {} (4*count)",
+                path.display(),
+                raw.len(),
+                expect
+            )
+            .into());
+        }
+        let vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        if let Some(i) = vals.iter().position(|v| !v.is_finite()) {
+            return Err(format!(
+                "ref_tensor_logical: non-finite value at index {i} of {}",
+                path.display()
+            )
+            .into());
+        }
+        return Ok(vals);
+    }
+    let plain_ok = match (row.contig, row.op.as_str()) {
+        // v2 manifest: the column decides. Pre-v2 manifest: only the op
+        // can rule out a flat VIEW read.
+        (Some(c), _) => c == 1,
+        (None, "VIEW") => false,
+        (None, _) => true,
+    };
+    if !plain_ok {
+        return Err(format!(
+            "ref_tensor_logical: {} is a view/non-contiguous row with no \
+             logical twin in {} — the plain file is a flat read, not the tensor",
+            row.name,
+            dir.display()
+        )
+        .into());
+    }
+    ref_tensor_of_in(dir, row)
+}
+
+// -------------------------------------------------- promoted gate helpers
+// Single owners of the reference-side helpers the gate bins first wrote
+// locally. The bins keep their private copies until their owning tracks
+// switch them over; the math here is the transcription those copies carry.
+
+/// Prove the dump's VIEW convention for one view read as a PLAIN file:
+/// `view` must equal `base` from `off` — flat memory from the view's base
+/// pointer, not the materialized gather a consumer of the logical tensor
+/// wants (gate_p4's local `view_flat`).
+pub fn view_flat(view: &[f32], base: &[f32], off: usize, what: &str) -> Result<(), GateError> {
+    if off + view.len() > base.len()
+        || !view
+            .iter()
+            .zip(&base[off..off + view.len()])
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+    {
+        return Err(format!(
+            "view_flat: {what}: dump is not the flat base memory at +{off} — \
+             view convention changed"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Host scalar router reference, transcribed from the CPU engine's routing
+/// (`model::moe::route_inner`): softmax with a serial f32 max fold, f32
+/// `exp`, f64 sum accumulated ascending, f32 divide by `sum as f32`; top-k
+/// by `(probability desc, id asc)`; weights `probs[id] * scale`. Layout
+/// ggml t-major: logits/probs `[64, m]`, ids/weights `[6, m]`. Non-finite
+/// logits are an error (gate_p6's local `route_ref` panics there).
+pub fn route_ref(
+    logits: &[f32],
+    m: usize,
+    scale: f32,
+) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>), GateError> {
+    let (n, k) = (64usize, 6usize);
+    if logits.len() != n * m {
+        return Err(format!("route_ref: logits.len() {} != {n}*{m}", logits.len()).into());
+    }
+    if let Some(i) = logits.iter().position(|v| !v.is_finite()) {
+        return Err(format!("route_ref: non-finite logit at {i}").into());
+    }
+    let mut probs = vec![0.0f32; n * m];
+    for t in 0..m {
+        let src = &logits[t * n..(t + 1) * n];
+        let max = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f64;
+        let dst = &mut probs[t * n..(t + 1) * n];
+        for (o, &v) in dst.iter_mut().zip(src) {
+            let e = (v - max).exp();
+            *o = e;
+            sum += f64::from(e);
+        }
+        for o in dst.iter_mut() {
+            *o /= sum as f32;
+        }
+    }
+    let mut ids = vec![0i32; k * m];
+    let mut weights = vec![0.0f32; k * m];
+    let mut ranked: Vec<u32> = (0..n as u32).collect();
+    for t in 0..m {
+        let p = &probs[t * n..(t + 1) * n];
+        ranked.sort_by(|&a, &b| {
+            p[b as usize]
+                .partial_cmp(&p[a as usize])
+                .expect("route_ref: finite probs sorted")
+                .then(a.cmp(&b))
+        });
+        for (s, &e) in ranked.iter().take(k).enumerate() {
+            ids[t * k + s] = e as i32;
+            weights[t * k + s] = p[e as usize] * scale;
+        }
+    }
+    Ok((probs, ids, weights))
+}
+
+/// An F32 tensor from the model file as f32 (norm gains), length-checked
+/// (gate_p4's local `f32_tensor`).
+pub fn f32_tensor(gguf: &Gguf, name: &str, want: usize) -> Result<Vec<f32>, GateError> {
+    let (t, b) = tensor_bytes(gguf, name)?;
+    if t.ty != GgmlType::F32 || b.len() != want * 4 {
+        return Err(format!(
+            "f32_tensor: {name} is {:?} with {} bytes, want F32 x {want}",
+            t.ty,
+            b.len()
+        )
+        .into());
+    }
+    Ok(b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect())
+}
+
+/// The f16 cache view's first `rows` rows as f16 bits: the dump widened
+/// the halves to f32 exactly, so rounding back recovers ik's own bits
+/// (gate_p5's local `widened_f16_bits`). Under the `gpu` feature because
+/// the one exact f32→f16 rounding (the CPU oracle's own, re-exported by
+/// the device crate) lives there; a second transcription here would be a
+/// second thing to drift.
+#[cfg(feature = "gpu")]
+pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError> {
+    use bloomery_gpu::flash::f32_to_f16_bits;
+
+    let path = ref_dir().join(row.file_name());
+    let raw = std::fs::read(&path)
+        .map_err(|e| format!("widened_f16_bits: cannot read {}: {e}", path.display()))?;
+    if raw.len() as u64 != row.bytes {
+        return Err(format!(
+            "widened_f16_bits: {} is {} bytes, manifest says {}",
+            path.display(),
+            raw.len(),
+            row.bytes
+        )
+        .into());
+    }
+    let width = row.ne[0] as usize;
+    let count = row.count() as usize;
+    if row.bytes != 4 * count as u64 {
+        return Err(format!(
+            "widened_f16_bits: {} is {} bytes for {count} widened values",
+            path.display(),
+            raw.len()
+        )
+        .into());
+    }
+    if rows * width > count {
+        return Err(format!(
+            "widened_f16_bits: {} holds {count} values, asked for {rows} rows of {width}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(raw
+        .chunks_exact(4)
+        .take(rows * width)
+        .map(|c| f32_to_f16_bits(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect())
 }
 
 #[cfg(test)]

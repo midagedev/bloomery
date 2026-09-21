@@ -27,6 +27,10 @@ case $BACKEND in
   cuda) SET=ref_cuda; NGL=99; HIDE_CUDA=0 ;;
   *) echo "dump.sh: BLOOMERY_REF_BACKEND must be cpu or cuda, got '$BACKEND'" >&2; exit 2 ;;
 esac
+# Output-set override: the backend still picks the offload depth and CUDA visibility,
+# BLOOMERY_REF_SET only renames the destination (e.g. ref_cuda_v2), so an instrumented
+# dumper can produce a second set beside the one the gates read without touching it.
+SET=${BLOOMERY_REF_SET:-$SET}
 MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${BLOOMERY_REF_TOKENS:-100000,549,6077,280,7239,317}
 BIN="$BLOOMERY_DATA/bin/dump_ref"

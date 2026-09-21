@@ -20,6 +20,17 @@
 // Quantized tensors are skipped (there is no f32 to write); the manifest records the skip
 // so a missing file is never mistaken for a tensor that did not run.
 //
+// A VIEW / non-contiguous tensor's main file is the FLAT memory at the tensor's own data
+// pointer, nelements values read contiguously — not the logical tensor (a top-6 ids view
+// of an argsort holds the parent's head, not each token's top-6). Every such tensor ALSO
+// gets `<name>.<occurrence>.logical.f32`: the logical elements in ggml index order (ne0
+// fastest), gathered through the tensor's own nb strides from its own data pointer, same
+// per-type f32 conversion as the main file. Manifest rows carry four trailing columns:
+// `contig` (ggml_is_contiguous), `logical` (1 = a logical twin exists), `src0`/`src1`
+// (names of the producing tensors, `-` if none) so chains are readable from the manifest
+// instead of probes. Sets written before these columns exist stay readable: the loader
+// accepts both row widths.
+//
 // Build: tools/ref/build-dump.sh   Run: $BLOOMERY_DATA/bin/dump_ref -m <gguf> --tokens 1,2,3
 
 #include "common.h"
@@ -113,12 +124,63 @@ static int on_tensor(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     fclose(f);
 
+    // The logical twin: for every view or non-contiguous tensor, the elements in ggml
+    // index order, gathered through this tensor's own nb strides from its own data
+    // pointer. `src` maps byte 0 to t->data (host pointer, or the staging copy the
+    // backend filled from t->data), and ggml_nbytes covers the furthest strided element,
+    // so the walk stays inside the buffer the main file was read from.
+    const bool contig = ggml_is_contiguous(t);
+    const bool is_view = t->view_src != nullptr;
+    int wrote_logical = 0;
+    if (!contig || is_view) {
+        std::vector<float> logical((size_t) n);
+        size_t li = 0;
+        for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+        for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+            const size_t off = (size_t) i0 * t->nb[0] + (size_t) i1 * t->nb[1]
+                             + (size_t) i2 * t->nb[2] + (size_t) i3 * t->nb[3];
+            float v;
+            switch (t->type) {
+                case GGML_TYPE_F32:  v = ((const float *)    src)[off / sizeof(float)]; break;
+                case GGML_TYPE_F16:  v = ggml_fp16_to_fp32(((const ggml_fp16_t *) src)[off / sizeof(ggml_fp16_t)]); break;
+                case GGML_TYPE_I32:  v = (float) ((const int32_t *) src)[off / sizeof(int32_t)]; break;
+                case GGML_TYPE_I16:  v = (float) ((const int16_t *) src)[off / sizeof(int16_t)]; break;
+                case GGML_TYPE_I8:   v = (float) ((const int8_t  *) src)[off]; break;
+                default:             v = 0.0f; break;  // unreachable: the flat pass returned above
+            }
+            logical[li++] = v;
+        }
+        snprintf(path, sizeof(path), "%s/%s.%d.logical.f32", d->dir.c_str(), safe_name(t->name).c_str(), occurrence);
+        FILE * lf = fopen(path, "wb");
+        if (!lf) {
+            fprintf(stderr, "dump_ref: cannot write %s\n", path);
+            return 0;
+        }
+        if (fwrite(logical.data(), sizeof(float), want, lf) != want) {
+            fprintf(stderr, "dump_ref: short write on %s\n", path);
+            fclose(lf);
+            return 0;
+        }
+        fclose(lf);
+        wrote_logical = 1;
+    }
+
+    // src names for the chain columns: a producer's name if it has one, `-` otherwise.
+    auto src_name = [](const struct ggml_tensor * s) -> const char * {
+        return (s && s->name[0]) ? s->name : "-";
+    };
+
     // ne[] in ggml order, verbatim — bloomery's tensors carry the same order by decision
     // (docs/plan.md), so a shape mismatch in the gate is a real mismatch, not a convention.
-    fprintf(d->manifest, "tensor\t%s\t%d\t%s\t%lld\t%lld\t%lld\t%lld\t%zu\t%.6f\t%s\n",
+    // The four trailing columns are v2 additions; the first eleven fields are byte-for-byte
+    // what earlier sets carry (the flat `sum` included: it is the flat read's sum).
+    fprintf(d->manifest, "tensor\t%s\t%d\t%s\t%lld\t%lld\t%lld\t%lld\t%zu\t%.6f\t%s\t%d\t%d\t%s\t%s\n",
             t->name, occurrence, ggml_type_name(t->type),
             (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
-            want * sizeof(float), sum, ggml_op_desc(t));
+            want * sizeof(float), sum, ggml_op_desc(t),
+            contig ? 1 : 0, wrote_logical, src_name(t->src[0]), src_name(t->src[1]));
     d->written++;
     return 1;
 }
@@ -196,7 +258,7 @@ int main(int argc, char ** argv) {
     }
     fprintf(d.manifest, "# tokens\t");
     for (size_t i = 0; i < tokens.size(); ++i) fprintf(d.manifest, "%s%d", i ? "," : "", tokens[i]);
-    fprintf(d.manifest, "\n# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\n");
+    fprintf(d.manifest, "\n# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n");
 
     llama_backend_init();
     llama_numa_init(params.numa);
