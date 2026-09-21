@@ -86,7 +86,7 @@ const FENCE: f32 = 0.25;
 /// on a cache that fits in one flash segment, and one more when the cache is
 /// cut into segments and the merge pass joins the chain (`NODES_BLOCK0 +
 /// (segments > 1)`). Measured by this gate's own `graph graph_nodes=21` line
-/// at ctx_max 64 (prof2 round, 2026-09-21 — HANDOFF §7 "prof2 머지"; the lead's
+/// at ctx_max 64 (prof2 round, 2026-09-21 — docs/plan.md, 장부; the lead's
 /// own rerun agreed). This is not a band: the node
 /// count is a deterministic property of the chain, so the pin is exact and
 /// its margin is zero — the derivation is "what the chain enqueues today,
