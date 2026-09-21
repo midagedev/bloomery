@@ -1,6 +1,4 @@
-<!-- Upstream PR body for NVlabs/cuda-oxide. Branch fix/const-fold-mixed-width-shift
-     (one DCO-signed commit). Title: fix(dialect-mir): fold shifts whose amount has a different width
-     Testing figures marked <…> are filled from the box logs before filing. -->
+<!-- Filed as https://github.com/NVlabs/cuda-oxide/pull/1314 on 2026-09-21; body below is what went up. -->
 
 ## Summary
 
@@ -32,10 +30,13 @@ The fix mirrors the lowering rather than touching pliron's `APInt` asserts, so t
 
 ## Testing
 
-- The new test fails before the fix with exactly the message above and passes after. `cargo test -p dialect-mir`, `cargo clippy -p dialect-mir --all-targets -- -D warnings` and `cargo fmt --check` clean.
+- The new test fails before the fix with exactly the message above and passes after.
 - End to end on an RTX 3090 (sm_86, CUDA 13.0, nightly-2026-08-28), selecting the backend with `CUDA_OXIDE_BACKEND`: built from `b0f961d`, the kernel above fails with the ICE (exit 101); built from this branch it compiles and runs, all 32 elements `== 1`; a four-trip variant (`acc |= 1u32 << (2 * i)`) gives `== 85`, so the folded values are right, not merely accepted.
-- `scripts/smoketest.sh --compile-only` over every example under the patched backend: <N> pass, <F> fail — the same <F> fail under the `b0f961d` backend, so none is new. `unroll_smoke` and `unroll_bounds_check` executed on the 3090: pass.
-- `just check` minus `fmt-check`, run recipe by recipe on the same machine: clippy, test (<T> tests), test-cuda, check-guards, doc-check all pass. `cargo oxide fmt --check` reports the same pre-existing set on unpatched `main` and on this branch (two example manifests that need a nightly Cargo feature; not touched here).
+- `scripts/smoketest.sh --compile-only` over all 230 examples, patched backend: 227 pass, 3 fail (`gemm_sol`, `gemm_sol_final`, `tcgen05_matmul`). The `b0f961d` backend gives the same 227/3 with the same three, all for one reason: the machine's LLVM 21 `llc` does not know `llvm.nvvm.stmatrix.sync.aligned.m8n8.x2.b16.p3`. `unroll_smoke` and `unroll_bounds_check` executed on the 3090: pass.
+- `just check` minus `fmt-check`, run recipe by recipe on the same machine (no `just` there): clippy, test (5359 tests, 0 failed), test-cuda, check-guards, doc-check all pass. `cargo oxide fmt --check` reports the same set on unpatched `main` and on this branch (two example manifests need a nightly Cargo feature; not touched here); the two files this PR changes are rustfmt-clean.
+- [x] `cargo test -p dialect-mir`, `cargo clippy -p dialect-mir --all-targets -- -D warnings` pass
+- [ ] `just check` as one command: not run (see above for the per-recipe results)
+- [ ] New example: none — the dialect test carries the regression, and the kernel above is the runtime check
 
 ## Checklist
 
