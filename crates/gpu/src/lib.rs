@@ -1056,6 +1056,7 @@ pub struct Gpu {
     elem: elem::ElemKernels,
     flash: flash::FlashKernels,
     router: router::RouterKernels,
+    fused: fused::FusedKernels,
 }
 
 impl Gpu {
@@ -1080,6 +1081,7 @@ impl Gpu {
             elem: elem::ElemKernels::load(&ctx)?,
             flash: flash::FlashKernels::load(&ctx)?,
             router: router::RouterKernels::load(&ctx)?,
+            fused: fused::FusedKernels::load(&ctx)?,
             ctx,
             stream,
             module,
@@ -1109,6 +1111,12 @@ impl Gpu {
     /// Router top-6 and the expert offset table.
     pub fn router(&self) -> &router::RouterKernels {
         &self.router
+    }
+
+    /// The fused block kernels (P0b): norm+quantize, gate·up·swiglu,
+    /// down+residual — bit-identical to the per-op path they replace.
+    pub fn fused(&self) -> &fused::FusedKernels {
+        &self.fused
     }
 
     pub fn context(&self) -> &Arc<CudaContext> {
