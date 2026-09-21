@@ -657,9 +657,9 @@ mod q5_kernels {
 /// padding past `8*k_blocks` is never touched), `k_blocks = k/32` i32 block
 /// sums and `k_blocks` f32 block scales.
 pub struct Q8Blocks32 {
-    q: DeviceBuffer<u32>,
-    s8: DeviceBuffer<i32>,
-    d8: DeviceBuffer<f32>,
+    pub(crate) q: DeviceBuffer<u32>,
+    pub(crate) s8: DeviceBuffer<i32>,
+    pub(crate) d8: DeviceBuffer<f32>,
     m: usize,
     k: usize,
     q_stride: usize,
