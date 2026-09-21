@@ -19,9 +19,20 @@ use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale};
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
+
+/// Threads a norm gives one token. The row's serial memory depth is
+/// `k / RMS_THREADS` loads per thread, not `k / 32`: one warp per token
+/// leaves a single warp resident for the whole launch, so nothing is in
+/// flight to cover a load's latency. `rms_norm` and the fused `norm_quant`
+/// share this geometry — their sum of squares must agree bit for bit.
+pub const RMS_THREADS: usize = 256;
+/// Warps in that block, and so the width of the second-stage combine.
+pub const RMS_WARPS: usize = RMS_THREADS / 32;
 
 // ------------------------------------------------------------------ cores
 //
@@ -92,6 +103,33 @@ pub fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
         (aw3 >> 16) as u16
     };
     (half_to_f32(d_bits) * sc as f32) * ((qv as i32 - hv) as f32)
+}
+
+/// The partial sum of squares thread `tid` of an [`RMS_THREADS`] block owns
+/// for the row of `k` values at `base`: values `tid, tid + RMS_THREADS, …`
+/// ascending, one multiply and one add each. The norm's fixed per-thread
+/// order, shared by `rms_norm` and the fused `norm_quant`.
+///
+/// Caller contract: `base + k <= x.len()`, `tid < RMS_THREADS`.
+#[inline(always)]
+pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
+    let mut acc = 0.0f32;
+    let mut it = tid;
+    while it < k {
+        // SAFETY: it < k and base + k <= x.len() by the caller contract.
+        let v = unsafe { *x.get_unchecked(base + it) };
+        acc += v * v;
+        it += RMS_THREADS;
+    }
+    acc
+}
+
+/// The row's sum of squares from its [`RMS_WARPS`] warp sums, in the fixed
+/// tree `((w0+w1)+(w2+w3)) + ((w4+w5)+(w6+w7))`. This order is the gate: it
+/// is what makes the fused norm's scale equal the op path's.
+#[inline(always)]
+pub fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
+    ((w[0] + w[1]) + (w[2] + w[3])) + ((w[4] + w[5]) + (w[6] + w[7]))
 }
 
 /// The norm's scale from the summed squares: the mean divided in the sum's
@@ -199,11 +237,12 @@ mod elem_kernels {
         }
     }
 
-    /// RMS norm, one warp per token: lane partial sums of squares over
-    /// values `32·it + lane` (it ascending), the fixed five-step butterfly,
-    /// then `(scale · gain) · x` per value in the reference's order. `k` a
-    /// positive multiple of 32 (host-checked); the row guard is
-    /// warp-uniform, so the butterfly always sees a full warp.
+    /// RMS norm, one [`RMS_THREADS`] block per token: `rms_partial_sq` per
+    /// thread, the fixed five-step butterfly per warp, the warp sums combined
+    /// by `rms_warp_tree`, then `(scale · gain) · x` per value in the
+    /// reference's order. `k` a positive multiple of 32 (host-checked); the
+    /// token guard is block-uniform, so no barrier and no warp collective is
+    /// skipped, and a thread past `k` contributes an exact zero.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -212,34 +251,52 @@ mod elem_kernels {
         requires = (x.len() >= k * m, gain.len() >= k, y.len() >= k * m)
     )]
     pub fn rms_norm(x: &[f32], gain: &[f32], eps: f32, k: u32, m: u32, mut y: DisjointSlice<f32>) {
-        let t = thread::index_1d().get() / 32;
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
         if t >= m as usize {
             return;
         }
-        let lane = warp::lane_id() as usize;
+        let tid = thread::threadIdx_x() as usize;
         let k = k as usize;
         let base = t * k;
-        let mut acc = 0.0f32;
-        let mut it = lane;
-        while it < k {
-            // SAFETY: it < k <= x.len() - base by the launch contract.
-            let v = unsafe { *x.get_unchecked(base + it) };
-            acc += v * v;
-            it += 32;
+        // SAFETY: WSUM is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every access is below RMS_WARPS and ordered by `sync_threads`.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        let part = warp::reduce_sum_f32(rms_partial_sq(x, base, k, tid));
+        if warp::lane_id() == 0 {
+            // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
+            unsafe {
+                *ws.add(tid / 32) = part;
+            }
         }
-        let scale = rms_scale(warp::reduce_sum_f32(acc), k as u32, eps);
-        let mut it = lane;
+        thread::sync_threads();
+        // SAFETY: every slot was written above and is visible past the
+        // barrier.
+        let sums = unsafe {
+            [
+                *ws.add(0),
+                *ws.add(1),
+                *ws.add(2),
+                *ws.add(3),
+                *ws.add(4),
+                *ws.add(5),
+                *ws.add(6),
+                *ws.add(7),
+            ]
+        };
+        let scale = rms_scale(rms_warp_tree(sums), k as u32, eps);
+        let mut it = tid;
         while it < k {
             // SAFETY: it < k bounds the gain read by the contract and the x
-            // read as above; base + it < k*m <= y.len() by the contract.
-            let g = unsafe { *gain.get_unchecked(it) };
-            let v = unsafe { *x.get_unchecked(base + it) };
-            // SAFETY: the store index equals the load index, inside y by the
-            // contract.
+            // read as base + it < k*m; base + it < k*m <= y.len() too.
             unsafe {
+                let g = *gain.get_unchecked(it);
+                let v = *x.get_unchecked(base + it);
                 *y.get_unchecked_mut(base + it) = (scale * g) * v;
             }
-            it += 32;
+            it += RMS_THREADS;
         }
     }
 
@@ -502,7 +559,7 @@ impl ElemKernels {
         }
         let prep =
             self.module
-                .prepare_rms_norm(LaunchConfig1D::new(m.div_ceil(8) as u32, 256, 0))?;
+                .prepare_rms_norm(LaunchConfig1D::new(m as u32, RMS_THREADS as u32, 0))?;
         self.module
             .rms_norm(stream, &prep, x, gain, eps, k as u32, m as u32, y)?;
         Ok(())

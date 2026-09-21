@@ -594,15 +594,94 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    norm_geometry(&mut ok)?;
+
     if !ok {
         eprintln!("FAILED: gate_p4");
         std::process::exit(1);
     }
     println!(
         "PASSED: elem kernels within their bands of the host references; bit-identical reruns; \
-         eager == graph replay; chains proven from the dump"
+         eager == graph replay; chains proven from the dump; the norm's launch geometry \
+         keeps every row's serial load depth inside NORM_MAX_TRIPS"
     );
     Ok(())
+}
+
+/// The norm's launch geometry, asserted as a shape and not as a clock: a
+/// token's row is walked `k / RMS_THREADS` times per thread, and that trip
+/// count is the row's serial memory depth — one warp per token turns a
+/// 2048-value norm into 64 loads deep per lane with a single warp resident
+/// to cover them, which no band and no bit-identity here can see. The bound
+/// is the architecture's widest norm (`k = 2048`) at the block width the
+/// kernels are written for. The width is taken from the compiled entry's own
+/// `.reqntid`, so the constant cannot drift from the block the device code
+/// was built for; the grid (one block per token) is not in the device code
+/// and stays uncovered.
+#[cfg(feature = "gpu")]
+fn norm_geometry(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+    use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS};
+
+    /// Loads deep a norm's row may be per thread.
+    const NORM_MAX_TRIPS: usize = 8;
+    /// Every `k` a decode step norms: the hidden width and the MLA latent.
+    const NORM_K: [usize; 2] = [2048, 512];
+
+    let blob = std::fs::read(std::env::current_exe()?)?;
+    let shaped = RMS_THREADS % 32 == 0 && RMS_THREADS <= 1024 && RMS_WARPS == RMS_THREADS / 32;
+    // Both norms share the sum of squares, so both must share its block.
+    for name in ["rms_norm", "norm_quant"] {
+        let ntid = entry_reqntid(&blob, name)
+            .ok_or_else(|| format!("gate_p4: no PTX entry {name} with a .reqntid"))?;
+        let pass = ntid == RMS_THREADS;
+        println!(
+            "shape op={name} geometry block_reqntid={ntid} RMS_THREADS={RMS_THREADS} {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            *ok = false;
+        }
+    }
+    for k in NORM_K {
+        let trips = k.div_ceil(RMS_THREADS);
+        let pass = shaped && trips <= NORM_MAX_TRIPS;
+        println!(
+            "shape op=rms_norm geometry k={k} threads_per_token={RMS_THREADS} \
+             warps={RMS_WARPS} trips_per_thread={trips} max={NORM_MAX_TRIPS} {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            *ok = false;
+        }
+    }
+    Ok(())
+}
+
+/// The `x` of one PTX entry's `.reqntid x, y, z` — the block width the device
+/// code was compiled for. The device bundle rides in this executable as PTX
+/// text, so the whole check is a scan of `/proc/self/exe`.
+#[cfg(feature = "gpu")]
+fn entry_reqntid(blob: &[u8], name: &str) -> Option<usize> {
+    const ENTRY: &[u8] = b".visible .entry ";
+    let head = format!(".visible .entry {name}(");
+    let start = find(blob, head.as_bytes())? + head.len();
+    let rest = &blob[start..];
+    let body = match find(rest, ENTRY) {
+        Some(end) => &rest[..end],
+        None => rest,
+    };
+    let at = find(body, b".reqntid ")? + b".reqntid ".len();
+    let digits: Vec<u8> = body[at..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    String::from_utf8(digits).ok()?.parse().ok()
+}
+
+#[cfg(feature = "gpu")]
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// One rms_norm case: run the kernel twice on `x`, assert against the host

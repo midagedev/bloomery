@@ -22,6 +22,13 @@
 //! Captured-graph checks: flash replay byte-identical to eager, and the
 //! pos-buffer append re-reads its position on every replay while the scalar
 //! variant stays frozen at its capture-time row.
+//!
+//! One shape check joins them, read off the device code this binary carries
+//! rather than off a clock: `flash_latent` must compile with no local depot.
+//! A per-thread accumulator array the backend cannot hold in registers is
+//! spilled to local memory, and every accumulate becomes a dependent local
+//! round trip — a defect that changes no output and no band, so nothing else
+//! here can see it.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -84,6 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &flash, stream, scale, WIDTH, ROPE, LATENT, N_HEADS, DEPTH_ROWS, FLASH_BAND, &mut ok,
     )?;
     edge_values(&flash, stream, &mut ok)?;
+    no_local_depot(&mut ok)?;
 
     if !ok {
         eprintln!("FAILED: gate_p5");
@@ -92,9 +100,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "PASSED: gate_p5 kv_append bits exact (incl. IEEE edges, ik cache bits equal); \
          flash_latent within {FLASH_BAND} of the f64 reference on real layers and depth \
-         edges; reruns bit-identical; padded NaN rows never read; graph replay identical"
+         edges; reruns bit-identical; padded NaN rows never read; graph replay identical; \
+         the flash kernels compile with no local depot"
     );
     Ok(())
+}
+
+// ------------------------------------------------------------ kernel shape
+
+/// This package's kernels, asserted to carry no local depot. The device
+/// bundle is embedded in this executable as PTX text, so the check reads
+/// `/proc/self/exe` and looks inside each entry's own body — the same thing
+/// the backend would report, at no device cost and with no timing in it.
+#[cfg(feature = "gpu")]
+fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+    let blob = std::fs::read(std::env::current_exe()?)?;
+    for name in ["flash_latent", "kv_append", "kv_append_pos_buf"] {
+        let body = entry_body(&blob, name)
+            .ok_or_else(|| format!("gate_p5: no PTX entry {name} in this executable"))?;
+        let depot = find(body, b"__local_depot").is_some();
+        let loads = count(body, b"ld.local");
+        let stores = count(body, b"st.local");
+        let pass = !depot && loads == 0 && stores == 0;
+        println!(
+            "shape kernel={name} local_depot={depot} ld_local={loads} st_local={stores} {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        if !pass {
+            *ok = false;
+        }
+    }
+    Ok(())
+}
+
+/// The PTX body of one `.visible .entry`: from its header to the next
+/// entry's, or to the end of the bundle.
+#[cfg(feature = "gpu")]
+fn entry_body<'a>(blob: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    const ENTRY: &[u8] = b".visible .entry ";
+    let head = format!(".visible .entry {name}(");
+    let start = find(blob, head.as_bytes())?;
+    let rest = &blob[start + head.len()..];
+    Some(match find(rest, ENTRY) {
+        Some(end) => &rest[..end],
+        None => rest,
+    })
+}
+
+#[cfg(feature = "gpu")]
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(feature = "gpu")]
+fn count(hay: &[u8], needle: &[u8]) -> usize {
+    hay.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
 // ------------------------------------------------------------ real layers

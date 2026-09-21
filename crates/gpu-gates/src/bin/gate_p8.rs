@@ -17,6 +17,15 @@
 //!   reproduces an eager pos-4 run's `l_out-0` bit for bit — what the
 //!   device-side `pos_buf`/`n_keys_buf` buy.
 //!
+//! `--profile-pos <P>` moves the profiled step to position `P` (default: the
+//! dump's last position) so the per-op table can be read at depth; it raises
+//! the resident cache to `P + 1` rows for that run only. The correctness arms
+//! above are untouched by it: they run at the dump's positions, where the
+//! extra rows are past every kernel's live extent (`n_keys` clamps the flash
+//! and `pos` the append), so their bits do not depend on the cache height.
+//! Rows the dump did not seed are zeros — a real key row for timing, not a
+//! skipped one.
+//!
 //! `--time` (lead-only, under the machine lease) replays the graph 2000x
 //! and prints us/replay plus an empty-graph reference; correctness runs
 //! never reach it. `--profile` (lead-only, the same lease — the profiling
@@ -85,11 +94,18 @@ const BANDS: [(TapKind, usize, f32); 10] = [
 #[cfg(feature = "gpu")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ok = true;
+    // `--profile-pos` is read before the load: the cache height is a load-time
+    // decision, and the profile arm needs `pos + 1` rows.
+    let profile_pos = parse_profile_pos(std::env::args())?;
+    let ctx_max = match profile_pos {
+        Some(p) => CTX_MAX.max(p as usize + 1),
+        None => CTX_MAX,
+    };
     let gguf = open_model()?;
     let man = ref_manifest()?;
-    let mut model = GpuModel::load_blocks(&gguf, CTX_MAX, 0..1)?;
+    let mut model = GpuModel::load_blocks(&gguf, ctx_max, 0..1)?;
     println!(
-        "resident stage_bytes={} ctx_max={CTX_MAX} m=1",
+        "resident stage_bytes={} ctx_max={ctx_max} m=1",
         model.stages()[0].resident_bytes()
     );
 
@@ -302,11 +318,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--profile") {
         const PROF_REPS: u32 = 200;
         const N: u32 = 2000;
+        // The profiled position: the dump's last by default, `--profile-pos`
+        // otherwise. The token id is the dump's last either way — at depth the
+        // keys past the seeded prefix are the cache's zero rows, which is a
+        // key count, not a correctness claim.
+        let prof_pos = profile_pos.unwrap_or((M_TOKENS - 1) as u32);
+        let prof_token = PROMPT[M_TOKENS - 1];
         // The &mut model calls come first; the shared `stream` borrow taken
         // below must not overlap them.
-        let ops = model.profile_block0(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32, PROF_REPS)?;
-        let refresh_us =
-            model.refresh_params_us(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32, PROF_REPS)?;
+        let ops = model.profile_block0(prof_token, prof_pos, PROF_REPS)?;
+        let refresh_us = model.refresh_params_us(prof_token, prof_pos, PROF_REPS)?;
         let probe = bloomery_gpu::probe::Probe::load(model.stages()[0].gpu().context())?;
         let stream = model.stages()[0].gpu().stream();
         let mut tbuf = cuda_core::DeviceBuffer::<f32>::zeroed(stream, 32)?;
@@ -350,8 +371,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "prof reps={PROF_REPS} warmup=20 ops={} sync_floor_samples={PROF_REPS} \
-             sample=eager_launch+body+one_sync",
-            ops.len()
+             sample=eager_launch+body+one_sync pos={prof_pos} n_keys={} ctx_max={ctx_max}",
+            ops.len(),
+            prof_pos + 1
         );
         for op in &ops {
             println!(
@@ -391,6 +413,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          token, rerun/replay/second-position bit-identical, inside the structural fence"
     );
     Ok(())
+}
+
+/// `--profile-pos <P>`: the position the `--profile` table is taken at.
+/// Absent, the profile stays at the dump's last position.
+#[cfg(feature = "gpu")]
+fn parse_profile_pos(
+    args: impl Iterator<Item = String>,
+) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+    let mut args = args.skip_while(|a| a != "--profile-pos");
+    match args.next() {
+        None => Ok(None),
+        Some(_) => {
+            let v = args
+                .next()
+                .ok_or("gate_p8: --profile-pos wants a position argument")?;
+            let p: u32 = v
+                .parse()
+                .map_err(|_| format!("gate_p8: --profile-pos {v} is not a position"))?;
+            Ok(Some(p))
+        }
+    }
 }
 
 #[cfg(feature = "gpu")]

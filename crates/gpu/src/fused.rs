@@ -3,11 +3,13 @@
 
 use crate::GpuError;
 use crate::cores::{q3_slot, q3k_row_dot, q4_slot, q6_slot, q8_quad};
-use crate::elem::{rms_scale, silu_mul};
+use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree, silu_mul};
 use crate::q5::{Q8Blocks32, q5_row_dot};
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -31,25 +33,27 @@ use std::sync::Arc;
 mod fused_kernels {
     use super::*;
 
-    /// rms_norm + 128-value q8_1 quantization, ONE warp per column (token):
-    /// phase A is `elem::rms_norm`'s body verbatim (lane-strided partial
-    /// sums of squares over the whole row, the fixed butterfly, `rms_scale`),
-    /// phase B is `kernels::q3k_quantize_q8_1`'s body per 128-value block
-    /// with the normalized value computed in registers as `(scale · gain) ·
-    /// x` — the same expression and order `elem::rms_norm` stores — then the
-    /// same block amax / scale / rounding / permuted stores. One warp owning
-    /// the whole row is what removes the launch boundary: the block amax
-    /// needs the normalized values, the normalized values need the row's sum
-    /// of squares, and both reductions close inside the warp — no grid
+    /// rms_norm + 128-value q8_1 quantization, ONE [`RMS_THREADS`] block per
+    /// column (token): phase A is `elem::rms_norm`'s body verbatim
+    /// (`rms_partial_sq` per thread, the fixed butterfly per warp,
+    /// `rms_warp_tree`, `rms_scale`), phase B is
+    /// `kernels::q3k_quantize_q8_1`'s body per 128-value block with the
+    /// normalized value computed in registers as `(scale · gain) · x` — the
+    /// same expression and order `elem::rms_norm` stores — then the same
+    /// block amax / scale / rounding / permuted stores, warp `w` taking
+    /// blocks `w, w + RMS_WARPS, …`. One block owning the whole column is
+    /// what removes the launch boundary: the 128-value amax needs the
+    /// normalized values, the normalized values need the row's sum of
+    /// squares, and both reductions close inside the block — no grid
     /// barrier. `k` a multiple of 128 (every `Q8Act` k is a multiple of
-    /// 256); the column guard is warp-uniform, so every collective sees a
-    /// full warp.
+    /// 256); the column guard is block-uniform, so no barrier is skipped and
+    /// every warp collective sees a full warp.
     #[allow(clippy::too_many_arguments)]
     #[kernel]
-    #[launch_bounds(32)]
+    #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
-        block = (32, 1, 1),
+        block = (256, 1, 1),
         requires = (
             x.len() >= k * m,
             gain.len() >= k,
@@ -75,35 +79,58 @@ mod fused_kernels {
         mut s8: DisjointSlice<i32>,
         mut d8: DisjointSlice<f32>,
     ) {
-        // One 32-thread block per column: t is the COLUMN index (global
-        // tid / 32), not the thread id.
-        let t = thread::index_1d().get() / 32;
+        // One RMS_THREADS block per column: t is the COLUMN index (the block
+        // index), not the thread id.
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
         if t >= m as usize {
             return;
         }
+        let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
+        let warp_of = tid / 32;
         let k = k as usize;
         let n_sb = n_sb as usize;
         let base = t * k;
 
-        // Phase A: the sum of squares, exactly `elem::rms_norm`'s loop and
+        // Phase A: the sum of squares, exactly `elem::rms_norm`'s cores and
         // reduction tree.
-        let mut acc = 0.0f32;
-        let mut it = lane;
-        while it < k {
-            // SAFETY: it < k <= x.len() - base by the launch contract.
-            let v = unsafe { *x.get_unchecked(base + it) };
-            acc += v * v;
-            it += 32;
+        // SAFETY: WSUM is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every access is below RMS_WARPS and ordered by `sync_threads`.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        let part = warp::reduce_sum_f32(rms_partial_sq(x, base, k, tid));
+        if lane == 0 {
+            // SAFETY: warp_of < RMS_WARPS; one lane per warp writes its slot.
+            unsafe {
+                *ws.add(warp_of) = part;
+            }
         }
-        let scale = rms_scale(warp::reduce_sum_f32(acc), k as u32, eps);
+        thread::sync_threads();
+        // SAFETY: every slot was written above and is visible past the
+        // barrier.
+        let sums = unsafe {
+            [
+                *ws.add(0),
+                *ws.add(1),
+                *ws.add(2),
+                *ws.add(3),
+                *ws.add(4),
+                *ws.add(5),
+                *ws.add(6),
+                *ws.add(7),
+            ]
+        };
+        let scale = rms_scale(rms_warp_tree(sums), k as u32, eps);
 
         // Phase B: the quantizer's body per 128-value block, reading the
         // raw x and gain at the quantizer's four-consecutive-values
         // geometry (the op path round-trips through the norm's store; the
-        // recomputation reproduces those bits).
+        // recomputation reproduces those bits). A block belongs wholly to
+        // one warp, so every collective below stays warp-uniform.
         let blocks = k / 128; // = 2 * n_sb
-        let mut b = 0usize;
+        let mut b = warp_of;
         while b < blocks {
             let vb = base + 128 * b + 4 * lane;
             // SAFETY: vb + 3 < base + k <= x.len() and the gain reads stay
@@ -179,7 +206,7 @@ mod fused_kernels {
                 }
             }
 
-            b += 1;
+            b += RMS_WARPS;
         }
     }
 
@@ -349,9 +376,9 @@ impl FusedKernels {
             )
             .into());
         }
-        let prep = self
-            .module
-            .prepare_norm_quant(LaunchConfig1D::new(m as u32, 32, 0))?;
+        let prep =
+            self.module
+                .prepare_norm_quant(LaunchConfig1D::new(m as u32, RMS_THREADS as u32, 0))?;
         self.module.norm_quant(
             stream,
             &prep,
