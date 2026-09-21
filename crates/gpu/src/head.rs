@@ -53,6 +53,12 @@ fn head_out_w(w: &Weights) -> Result<(&DeviceTensor<u32>, usize), GpuError> {
 /// buffer is allocated at `new`; `enqueue` and a graph replay touch addresses
 /// only, so one captured graph serves every input written into `x`.
 pub struct Head {
+    /// Declared FIRST: fields drop in declaration order, and a captured graph
+    /// must be destroyed while every buffer it addresses is still alive
+    /// (`GpuModel` and `Stage` order theirs the same way — the reverse order
+    /// segfaulted the 12.4 GB model in the e2e round; this head survived at
+    /// 432 KB only by luck).
+    graph: Option<Graph>,
     eps: f32,
     hidden: usize,
     n_vocab: usize,
@@ -63,7 +69,6 @@ pub struct Head {
     act: Q8Act,
     logits: DeviceBuffer<f32>,
     token_out: DeviceBuffer<u32>,
-    graph: Option<Graph>,
 }
 
 impl Head {
