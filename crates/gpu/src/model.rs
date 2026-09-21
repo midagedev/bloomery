@@ -3273,8 +3273,25 @@ fn enqueue_attn(
         )?;
     } else {
         // A flash lever swaps the segment launch for the probe entry that
-        // does one stage twice — the same launch, the same partials.
+        // does one stage twice — the same launch, the same partials. The
+        // tensor-core pass is the third shape of that one launch: one block
+        // per (head group, segment) instead of per (head, segment), the
+        // same partials, so the merge below and the launch count do not
+        // move.
         match s.probe_cfg.flash_seg_twice() {
+            None if crate::flash::flash_mma() => gpu.flash().enqueue_flash_latent_mma(
+                stream,
+                &s.f_rows,
+                kv_l,
+                &s.n_keys_buf,
+                mla.kq_scale,
+                1,
+                mla.n_head,
+                rope,
+                latent,
+                &mut s.part_v,
+                &mut s.part_ms,
+            )?,
             None => gpu.flash().enqueue_flash_latent_seg(
                 stream,
                 &s.f_rows,
