@@ -1,8 +1,9 @@
 //! GPU gate for package P10 (docs/gpu-design.md 작업 꾸러미): resident
 //! weights — the whole model file uploaded once, in the device format each
 //! kernel consumes, proven against the per-gate uploads P1/P2/P3/P9 made.
-//! Every assertion is bit-exact (no bands: this gate is about bytes and
-//! addressing, not arithmetic).
+//! Every assertion is bit-exact (this gate is about bytes and addressing)
+//! except the derived consumer, whose one arithmetic comparison sits at
+//! `KERNEL_BAND`.
 //!
 //! 1. Census: every tensor of the file classified; per type count, file
 //!    bytes, resident bytes, plus totals. A type with no device format
@@ -20,7 +21,17 @@
 //!    `DevWeight` equals the same kernel on a gate-style upload of the same
 //!    tensor under the same `activations()` input, bit for bit — and the
 //!    whole table reruns bit-identically.
-//! 5. Derived parity: layer 1's resident derived q_nope2, read back, is the
+//! 5. Derived shape: every resident `derived.blk.L.q_nope2` carries the MLA
+//!    geometry — `rows = n_head·latent` rows of `k = nope`, `qs` rows ×
+//!    k/4, `d` rows × k/32 — asserted against `MlaParams` and the
+//!    `Derived` block count, never against the resident tensor's own
+//!    reading of itself.
+//! 6. Derived consumer: layer 1's resident planes through the real q8f32
+//!    gemv at m = 1 and m = 8, against a host f64 reference over the
+//!    `Q8Block` bytes with the per-head row geometry, within
+//!    `KERNEL_BAND` — a resident plane with a wrong 2-D shape runs the
+//!    wrong k over the wrong row count and cannot pass.
+//! 7. Derived parity: layer 1's resident derived q_nope2, read back, is the
 //!    CPU crate's `Derived` blocks byte for byte (the f16 scale <-> f32
 //!    plane round trip is bijective, so plane-bits equality is block-bytes
 //!    equality).
@@ -40,7 +51,9 @@ use bloomery_gpu::weights::{Derived, DevWeight, Q8Block, Weights, resident_size}
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{activations, bytes_to_words, open_model, row_bytes, tensor_bytes};
+use bloomery_gpu_gates::{
+    KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, row_bytes, tensor_bytes,
+};
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
 #[cfg(feature = "gpu")]
@@ -239,6 +252,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ok = false;
     }
 
+    // -------------------------------------- 2b. derived shape + consumer
+    // The derived planes' bytes carry no 2-D geometry of their own: every
+    // shape assertion anchors on the MLA metadata and the Derived block
+    // count, never on the resident tensor's reading of itself.
+    for l in 0..n_layers {
+        let p = &derived.block_plan(l)?.attn.params;
+        let (rows, k) = (p.n_head * p.latent, p.nope);
+        let dw = full
+            .get(&bloomery_gpu::weights::derived_name(l))
+            .ok_or(format!("gate_p10: derived.blk.{l}.q_nope2 missing"))?;
+        let DevWeight::Q8_0Derived { qs, d, k: rk } = dw else {
+            return Err(
+                format!("gate_p10: derived.blk.{l}.q_nope2 is not the derived variant").into(),
+            );
+        };
+        let pass = dw.rows() == rows
+            && *rk == k
+            && d.cols() * 32 == k
+            && qs.cols() == k / 4
+            && qs.rows() == d.rows()
+            && rows * k / 32 == derived.wk_b_all_heads(l)?.len();
+        println!(
+            "derived_shape layer={l} rows={rows} k={k} qs={}x{} d={}x{} {}",
+            qs.rows(),
+            qs.cols(),
+            d.rows(),
+            d.cols(),
+            verdict(pass)
+        );
+        if !pass {
+            eprintln!(
+                "FAIL: derived_shape layer={l}: resident qs {}x{} d {}x{}, want qs {}x{} d {}x{}",
+                qs.rows(),
+                qs.cols(),
+                d.rows(),
+                d.cols(),
+                rows,
+                k / 4,
+                rows,
+                k / 32
+            );
+            ok = false;
+        }
+    }
+
+    // The consumer: layer 1's resident planes through the real q8f32 gemv,
+    // against a host f64 reference over the Q8Block bytes. y is sized by
+    // the metadata rows, so a resident plane shaped any other way fails the
+    // enqueue itself — no fallback to the resident geometry.
+    {
+        let p = &derived.block_plan(1)?.attn.params;
+        let (rows, k) = (p.n_head * p.latent, p.nope);
+        let blocks = derived.wk_b_all_heads(1)?;
+        let DevWeight::Q8_0Derived { qs, d, .. } = full
+            .get(&bloomery_gpu::weights::derived_name(1))
+            .ok_or("gate_p10: derived.blk.1.q_nope2 missing")?
+        else {
+            return Err("gate_p10: derived.blk.1.q_nope2 is not the derived variant".into());
+        };
+        for m in [1usize, 8] {
+            let x = activations(k, m, SEED);
+            let y_ref = derived_ref_gemv(blocks, rows, k, &x, m);
+            let x_dev = DeviceBuffer::from_host(stream, &x)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
+            let got: Result<Vec<f32>, Box<dyn std::error::Error>> = (|| {
+                q8f32.enqueue_q8_0_gemv(stream, qs, d, &x_dev, m, &mut y)?;
+                stream.synchronize()?;
+                Ok(y.to_host_vec(stream)?)
+            })();
+            let (rel, pass) = match got {
+                Ok(v) => match max_rel_err(&v, &y_ref) {
+                    Ok(rel) => (format!("{rel:.3e}"), rel <= KERNEL_BAND),
+                    Err(e) => (format!("err({e})"), false),
+                },
+                Err(e) => (format!("err({e})"), false),
+            };
+            println!(
+                "derived_consumer layer=1 m={m} rows={rows} k={k} max_rel={rel} band={KERNEL_BAND:e} {}",
+                verdict(pass)
+            );
+            if !pass {
+                eprintln!("FAIL: derived_consumer layer=1 m={m}: {rel} (band {KERNEL_BAND:e})");
+                ok = false;
+            }
+        }
+    }
+
     // The full load's names and resident total; then it goes away.
     let full_names: BTreeSet<String> = full.names().map(str::to_owned).collect();
     let full_resident = full.resident_bytes();
@@ -395,6 +495,34 @@ fn gate_q8_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
         d.push(half_to_f32(b.d));
     }
     (qs, d)
+}
+
+/// Host f64 reference for one derived q_nope2 gemv shape, from the Q8Block
+/// bytes with the per-head row geometry the resident planes address: row r
+/// is head `r / latent`, latent row `r % latent`; the weight at value j of
+/// row r is `q · half_to_f32(d)` of block `r·nope/32 + j/32`, code `j % 32`
+/// — dequantized in f32 (the kernel's own dequant), accumulated in f64 as
+/// `ref_gemv` does. Promotion candidate: the gates lib's `ref_gemv` covers
+/// typed file rows only, not Q8Block-backed derived rows.
+#[cfg(feature = "gpu")]
+fn derived_ref_gemv(blocks: &[Q8Block], rows: usize, k: usize, x: &[f32], m: usize) -> Vec<f32> {
+    let bpr = k / 32;
+    let mut y = vec![0.0f32; rows * m];
+    for r in 0..rows {
+        let rb = &blocks[r * bpr..(r + 1) * bpr];
+        for c in 0..m {
+            let xc = &x[c * k..(c + 1) * k];
+            let mut dot = 0.0f64;
+            for (bi, b) in rb.iter().enumerate() {
+                let scale = half_to_f32(b.d);
+                for j in 0..32 {
+                    dot += f64::from(b.q[j] as f32 * scale) * f64::from(xc[bi * 32 + j]);
+                }
+            }
+            y[r * m + c] = dot as f32;
+        }
+    }
+    y
 }
 
 /// One kernel-identity row set: per format, the owning kernel on the
@@ -580,22 +708,25 @@ fn run_table(
     }
 
     // The q8f32 format through the derived variant: layer 1's q_nope2
-    // planes, resident vs a gate_p3-style upload of the same planes.
+    // planes, resident vs a gate_p3-style upload of the same planes. The
+    // upload's geometry comes from the MLA metadata — never from the
+    // resident tensor — so this row cannot inherit a wrong shape from the
+    // thing under test.
     {
-        let DevWeight::Q8_0Derived { qs: rqs, d: rd, k } = w
+        let DevWeight::Q8_0Derived { qs: rqs, d: rd, .. } = w
             .get(&bloomery_gpu::weights::derived_name(1))
             .ok_or("run_table: derived.blk.1.q_nope2 missing")?
         else {
             return Err("run_table: derived.blk.1.q_nope2 is not the derived variant".into());
         };
+        let p = &derived.block_plan(1)?.attn.params;
+        let (nrows, k) = (p.n_head * p.latent, p.nope);
         let (qs, d) = gate_q8_planes(derived.wk_b_all_heads(1)?);
-        let nrows = d.len();
-        let rqs_ref = DeviceTensor::upload(stream, &qs, nrows, qs.len() / nrows)?;
-        let rd_ref = DeviceTensor::upload(stream, &d, nrows, d.len() / nrows)?;
+        let rqs_ref = DeviceTensor::upload(stream, &qs, nrows, k / 4)?;
+        let rd_ref = DeviceTensor::upload(stream, &d, nrows, k / 32)?;
         for m in [1usize, 8] {
-            let (same, rerun, bits) = kid_q8_derived(
-                q8f32, stream, rqs, rd, &rqs_ref, &rd_ref, nrows, *k, m, seed,
-            )?;
+            let (same, rerun, bits) =
+                kid_q8_derived(q8f32, stream, rqs, rd, &rqs_ref, &rd_ref, nrows, k, m, seed)?;
             println!(
                 "kid row=q8_0_derived_m{m} K={k} rows={nrows} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
                 verdict(same && rerun)
