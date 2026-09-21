@@ -36,6 +36,7 @@ use crate::{Gpu, GpuError, Graph};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
+use gguf::quant::GgmlType;
 use model::attn::MlaParams;
 use std::ops::Range;
 use std::sync::Arc;
@@ -699,6 +700,11 @@ struct LayerScratch {
     n_keys_buf: DeviceBuffer<u32>,
     token_buf: DeviceBuffer<u32>,
     cs_buf: DeviceBuffer<f32>,
+    /// Host mirror of `pos_buf`, written by the same `refresh_params` that
+    /// fills the device buffers. The launches never read it: it is what the
+    /// byte accounting counts the live key rows from, since the count the
+    /// kernels use lives on the device.
+    pos_host: u32,
 }
 
 impl LayerScratch {
@@ -967,34 +973,137 @@ impl LayerTaps {
     }
 }
 
-/// Per-op timing of one block-0 chain run from
-/// [`GpuModel::profile_block0`]: `us_mean`/`us_min` over the measured reps
-/// of that op's eager launch + body + the one stream synchronize the
-/// profiling observer issues after it. Every op carries the same sync
-/// overhead; subtract a touch-launch+sync constant (the gate's
-/// `sync_floor_us`) to compare op bodies.
+/// Device bytes one launch touches, each distinct byte counted once: the
+/// weight rows it addresses, the activation planes it reads, the spans it
+/// writes. Allocation padding no thread addresses (a `Q8Act` group tail, a
+/// q5 `q_stride` window) is not counted, and a byte several blocks read
+/// counts once — the number is the op's traffic, the divisor of its
+/// effective GB/s. `None` is an op whose count is not derivable from the
+/// shapes this file holds; the profile prints it as `?`.
+pub type Bytes = Option<u64>;
+
+/// Sum of byte parts, `None` if any part is not derivable.
+fn bsum(parts: &[Option<usize>]) -> Bytes {
+    parts
+        .iter()
+        .try_fold(0usize, |acc, p| Some(acc + (*p)?))
+        .map(|v| v as u64)
+}
+
+/// Bytes of one K-quant row: the type's super-block size times the row's
+/// super-block count. `None` for a type with no block geometry or a `k`
+/// that is not a whole number of blocks.
+fn kq_row_bytes(ty: GgmlType, k: usize) -> Option<usize> {
+    let blck = ty.blck_size()? as usize;
+    if blck == 0 || !k.is_multiple_of(blck) {
+        return None;
+    }
+    Some(ty.type_size()? as usize * (k / blck))
+}
+
+/// Bytes of `rows` rows of a resident weight in the layout its kernel
+/// addresses. The q5 rows are eight code words plus the block's scale
+/// (Q5_0) or scale and min (Q5_1) per 32 values — the `q_stride` window
+/// padding past the last block is allocated but never addressed.
+fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
+    let k = w.k();
+    Some(match w {
+        DevWeight::KQuant { ty, .. } => rows * kq_row_bytes(*ty, k)?,
+        DevWeight::Q5_0 { .. } => rows * 36 * (k / 32),
+        DevWeight::Q5_1 { .. } => rows * 40 * (k / 32),
+        DevWeight::Q8_0 { .. } | DevWeight::Q8_0Derived { .. } => rows * (k + 4 * (k / 32)),
+        DevWeight::F32 { .. } => rows * k * 4,
+    })
+}
+
+/// Bytes of one q8_1 activation column's five planes at `k` values, in the
+/// order `(q3, q4, q6, s8, d8)` — the geometry `Q8Act::with_k` allocates,
+/// minus the group tails it never writes.
+fn act_planes(k: usize) -> (usize, usize, usize, usize, usize) {
+    let n_sb = k / 256;
+    (
+        8 * 64 * n_sb.div_ceil(2),
+        4 * 256 * n_sb.div_ceil(4),
+        4 * 128 * n_sb.div_ceil(2),
+        4 * 8 * n_sb,
+        4 * 2 * n_sb,
+    )
+}
+
+/// Bytes `cols` columns of the q8_1 quantizer write: every plane, since one
+/// quantize serves the Q3_K, Q4_K and Q6_K gemvs alike.
+fn act_write_bytes(a: &Q8Act, cols: usize) -> usize {
+    let (q3, q4, q6, s8, d8) = act_planes(a.k());
+    cols * (q3 + q4 + q6 + s8 + d8)
+}
+
+/// Bytes `cols` activation columns cost the gemv of `w`: Q3_K loads the u64
+/// code plane and the block scales, Q4_K the 32-bit codes, the group sums
+/// and the scales, Q6_K its own code plane and the scales. `None` for a
+/// weight that is not a K-quant.
+fn gemv_act_bytes(w: &DevWeight, a: &Q8Act, cols: usize) -> Option<usize> {
+    let (q3, q4, q6, s8, d8) = act_planes(a.k());
+    let DevWeight::KQuant { ty, .. } = w else {
+        return None;
+    };
+    Some(
+        cols * match ty {
+            GgmlType::Q3_K => q3 + d8,
+            GgmlType::Q4_K => q4 + s8 + d8,
+            GgmlType::Q6_K => q6 + d8,
+            _ => return None,
+        },
+    )
+}
+
+/// Bytes of `cols` columns of the 32-value q8 blocks the q5 gemvs read and
+/// their quantizer writes: eight code words, one scale and one sum per 32
+/// values (the `q_stride` padding is never addressed).
+fn blocks32_bytes(b: &Q8Blocks32, cols: usize) -> usize {
+    cols * 40 * (b.k() / 32)
+}
+
+/// The resident weight by name — the `DevWeight` itself, which carries the
+/// quantization type and `k` the byte accounting needs.
+fn dev_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DevWeight, GpuError> {
+    w.get(name)
+        .ok_or_else(|| format!("dev_weight: {name} not resident").into())
+}
+
+/// Per-op timing of one layer chain run from [`GpuModel::profile_layer`]:
+/// `us_mean`/`us_min` over the measured reps of that op's eager launch +
+/// body + the one stream synchronize the profiling observer issues after
+/// it. Every op carries the same sync overhead; subtract a touch-launch+sync
+/// constant (the gate's `sync_floor_us`) to compare op bodies. `bytes` is
+/// the op's [`Bytes`] count, recorded by the same `tick` that names it.
 pub struct OpTime {
     pub index: usize,
     pub name: &'static str,
     pub us_mean: f64,
     pub us_min: f64,
+    pub bytes: Bytes,
 }
 
-/// The profiling observer's state: per-op sample lists and the wall clock
-/// of the previous synchronize. Owned by [`GpuModel::profile_block0`]'s rep
-/// loop, borrowed by the observer closure for one chain run at a time.
+/// The profiling observer's state: per-op sample lists with the op's byte
+/// count, and the wall clock of the previous synchronize. Owned by
+/// [`GpuModel::profile_layer`]'s rep loop, borrowed by the observer closure
+/// for one chain run at a time.
 struct ProfRec {
-    ops: Vec<(&'static str, Vec<f64>)>,
+    ops: Vec<(&'static str, Bytes, Vec<f64>)>,
     last: std::time::Instant,
 }
 
 impl ProfRec {
     /// Synchronize after op `i`'s enqueue and record the wall time since the
-    /// previous sync — the op's eager launch + body + one synchronize.
+    /// previous sync — the op's eager launch + body + one synchronize. The
+    /// name and the byte count must be the same on every rep: both are
+    /// functions of the shapes, so a rep that changes either would be
+    /// timing a different chain.
     fn observe(
         &mut self,
         i: usize,
         name: &'static str,
+        bytes: Bytes,
         stream: &CudaStream,
     ) -> Result<(), GpuError> {
         stream.synchronize()?;
@@ -1002,17 +1111,24 @@ impl ProfRec {
         let us = now.duration_since(self.last).as_secs_f64() * 1e6;
         self.last = now;
         if i == self.ops.len() {
-            self.ops.push((name, Vec::new()));
+            self.ops.push((name, bytes, Vec::new()));
         }
         let slot = &mut self.ops[i];
         if slot.0 != name {
             return Err(format!(
-                "profile_block0: op {i} was {} on an earlier rep, now {name}",
+                "profile_layer: op {i} was {} on an earlier rep, now {name}",
                 slot.0
             )
             .into());
         }
-        slot.1.push(us);
+        if slot.1 != bytes {
+            return Err(format!(
+                "profile_layer: op {i} ({name}) touched {:?} bytes on an earlier rep, now {bytes:?}",
+                slot.1
+            )
+            .into());
+        }
+        slot.2.push(us);
         Ok(())
     }
 }
@@ -1238,6 +1354,7 @@ impl GpuModel {
         s.token_buf.copy_from_host(stream, &[token])?;
         s.pos_buf.copy_from_host(stream, &[pos])?;
         s.n_keys_buf.copy_from_host(stream, &[pos + 1])?;
+        s.pos_host = pos;
         Ok(())
     }
 
@@ -1265,7 +1382,7 @@ impl GpuModel {
             &mla,
             moe.as_ref(),
             true,
-            &mut |_, _| Ok(()),
+            &mut |_, _, _| Ok(()),
         )
     }
 
@@ -1294,7 +1411,7 @@ impl GpuModel {
             &mla,
             moe.as_ref(),
             false,
-            &mut |_, _| Ok(()),
+            &mut |_, _, _| Ok(()),
         )
     }
 
@@ -1457,7 +1574,7 @@ impl GpuModel {
                 &mla,
                 moe.as_ref(),
                 false,
-                &mut |_, _| Ok(()),
+                &mut |_, _, _| Ok(()),
             )
         })?;
         let nodes = graph.node_count();
@@ -1521,7 +1638,7 @@ impl GpuModel {
                 &mla,
                 moe.as_ref(),
                 true,
-                &mut |_, _| Ok(()),
+                &mut |_, _, _| Ok(()),
             )
         })?;
         let nodes = graph.node_count();
@@ -1566,33 +1683,53 @@ impl GpuModel {
         Ok(())
     }
 
-    /// Time the block-0 step op by op: `reps` measured chain runs (after 20
-    /// warm-up runs, discarded), each enqueued eagerly at `(token, pos)` with
-    /// an observer that synchronizes after every op and records wall time
-    /// since the previous sync. Each sample is therefore an eager launch,
-    /// body and one synchronize — it overstates every op by the same host
-    /// sync cost, which the caller calibrates against a bare launch+sync
-    /// constant. Parameters are refreshed once before the loop; the chain is
-    /// idempotent at a fixed `(token, pos)` (it rewrites the same KV row and
-    /// every scratch buffer it reads), so the runs leave the model exactly
-    /// where one eager step would. Errs if the observed op count differs
-    /// from the node count of a capture of the same chain — one tick per
-    /// launch is what makes a row's time that row's op. Debug/profiling use
-    /// — never inside a capture (the observer synchronizes).
+    /// [`GpuModel::profile_layer`] of block 0 — the model's first layer,
+    /// which embeds its token in front.
     pub fn profile_block0(
         &mut self,
         token: u32,
         pos: u32,
         reps: u32,
     ) -> Result<Vec<OpTime>, GpuError> {
-        self.check_pos(pos, "profile_block0")?;
+        self.profile_layer(0, token, pos, reps)
+    }
+
+    /// Time layer `l`'s step op by op: `reps` measured chain runs (after 20
+    /// warm-up runs, discarded), each enqueued eagerly at `(token, pos)` with
+    /// an observer that synchronizes after every op and records wall time
+    /// since the previous sync. Each sample is therefore an eager launch,
+    /// body and one synchronize — it overstates every op by the same host
+    /// sync cost, which the caller calibrates against a bare launch+sync
+    /// constant. Layer 0 embeds `token` in front; every other layer reads
+    /// the input residual the caller left in the resident input buffer
+    /// ([`GpuModel::set_layer_input`]) and ignores `token`. Parameters are
+    /// refreshed once before the loop; the chain is idempotent at a fixed
+    /// `(token, pos)` (it rewrites the same KV row and every scratch buffer
+    /// it reads), so the runs leave the model exactly where one eager step
+    /// would. Errs if the observed op count differs from the node count of a
+    /// capture of the same chain — one tick per launch is what makes a row's
+    /// time that row's op. A routed layer additionally reads its expert ids
+    /// back afterwards and errs unless they are distinct: the expert ops'
+    /// byte counts are `n_used` whole expert blocks, which is the traffic
+    /// only when no slot repeats. Debug/profiling use — never inside a
+    /// capture (the observer synchronizes).
+    pub fn profile_layer(
+        &mut self,
+        l: usize,
+        token: u32,
+        pos: u32,
+        reps: u32,
+    ) -> Result<Vec<OpTime>, GpuError> {
+        self.check_pos(pos, "profile_layer")?;
         if reps == 0 {
-            return Err("profile_block0: reps must be >= 1".into());
+            return Err("profile_layer: reps must be >= 1".into());
         }
+        let slot = self.layer_slot(l, "profile_layer")?;
+        let embed = l == 0;
         self.refresh_params(token, pos)?;
         let mla = self.mla.clone();
         let moe = self.moe.clone();
-        let (gpu, residency) = self.block0_parts()?;
+        let (gpu, residency) = self.stage_parts("profile_layer")?;
         let gpu: &Gpu = gpu;
         let stream = gpu.stream();
         let Residency {
@@ -1602,30 +1739,32 @@ impl GpuModel {
             scratch,
             step,
         } = residency;
+        let routed = names[slot].routed;
         let mut rec = ProfRec {
             // Slot i is created by op i's first firing (indices arrive in
-            // chain order); the name is cross-checked on every later rep.
+            // chain order); the name and the byte count are cross-checked on
+            // every later rep.
             ops: Vec::new(),
             last: std::time::Instant::now(),
         };
         const WARMUP: u32 = 20;
         for rep in 0..(WARMUP + reps) {
             rec.last = std::time::Instant::now();
-            let mut obs = |i: usize, name: &'static str| rec.observe(i, name, stream);
+            let mut obs = |i: usize, name: &'static str, b: Bytes| rec.observe(i, name, b, stream);
             enqueue_layer(
                 gpu,
                 step,
                 weights,
-                &names[0],
-                &mut kv[0],
+                &names[slot],
+                &mut kv[slot],
                 scratch,
                 &mla,
                 moe.as_ref(),
-                true,
+                embed,
                 &mut obs,
             )?;
             if rep < WARMUP {
-                for (_, s) in rec.ops.iter_mut() {
+                for (_, _, s) in rec.ops.iter_mut() {
                     s.clear();
                 }
             }
@@ -1641,18 +1780,18 @@ impl GpuModel {
                 gpu,
                 step,
                 weights,
-                &names[0],
-                &mut kv[0],
+                &names[slot],
+                &mut kv[slot],
                 scratch,
                 &mla,
                 moe.as_ref(),
-                true,
-                &mut |_, _| Ok(()),
+                embed,
+                &mut |_, _, _| Ok(()),
             )
         })?;
         if rec.ops.len() != probe.node_count() {
             return Err(format!(
-                "profile_block0: {} ops observed but the same chain captures {} nodes — an op \
+                "profile_layer: {} ops observed but the same chain captures {} nodes — an op \
                  issued more than one launch before its tick, so its neighbours' times are \
                  mis-attributed",
                 rec.ops.len(),
@@ -1660,15 +1799,37 @@ impl GpuModel {
             )
             .into());
         }
+        if routed {
+            let ids = match scratch.moe.as_ref() {
+                Some(m) => m.ids.to_host_vec(stream)?,
+                None => {
+                    return Err(format!(
+                        "profile_layer: layer {l} routes but the stage carries no MoE arena"
+                    )
+                    .into());
+                }
+            };
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.len() != ids.len() {
+                return Err(format!(
+                    "profile_layer: layer {l} routed to {ids:?} — a repeated slot makes the \
+                     expert ops' byte counts an overcount of the rows actually read"
+                )
+                .into());
+            }
+        }
         Ok(rec
             .ops
             .into_iter()
             .enumerate()
-            .map(|(index, (name, s))| OpTime {
+            .map(|(index, (name, bytes, s))| OpTime {
                 index,
                 name,
                 us_mean: s.iter().sum::<f64>() / s.len() as f64,
                 us_min: s.iter().cloned().fold(f64::INFINITY, f64::min),
+                bytes,
             })
             .collect())
     }
@@ -1746,8 +1907,6 @@ impl MoeDims {
     /// against the resident expert stacks of `names` — the quantization
     /// types and row counts the enqueue leans on are proven here, at load.
     fn read(gguf: &gguf::Gguf, w: &Weights, names: &LayerNames) -> Result<MoeDims, GpuError> {
-        use gguf::quant::GgmlType;
-
         let meta = model::moe::Meta::read(gguf)?;
         let hidden = f32_gain(w, &names.attn_norm)?.len();
         // The router kernel ranks a fixed 64 experts into a fixed 6 slots.
@@ -1993,6 +2152,7 @@ impl LayerScratch {
             n_keys_buf: DeviceBuffer::from_host(stream, &[1u32])?,
             token_buf: DeviceBuffer::from_host(stream, &[0u32])?,
             cs_buf: f32n(rope)?,
+            pos_host: 0,
             dims,
         })
     }
@@ -2042,21 +2202,29 @@ pub(crate) fn f32_tensor<'a>(
 }
 
 /// Tick the observer for op `*i` and advance. `obs` fires on the host after
-/// every enqueue, carrying the op's index (one per launch, in chain order)
-/// and the name of the numbered step it belongs to; returning `Err` aborts
-/// the chain at that op. The normal and captured paths pass a no-op, which
-/// issues byte-for-byte the same launches in the same order as an
-/// uninstrumented chain — the observer is host-side only and never touches
-/// the stream. The op index is the graph node index of the same launch.
+/// every enqueue, carrying the op's index (one per launch, in chain order),
+/// the name of the numbered step it belongs to and the [`Bytes`] that
+/// launch touches; returning `Err` aborts the chain at that op. The byte
+/// count is computed at the tick, from the same shapes and buffers the
+/// launch above it was given, so it cannot name a different op's traffic.
+/// The normal and captured paths pass a no-op, which issues byte-for-byte
+/// the same launches in the same order as an uninstrumented chain — the
+/// observer is host-side only and never touches the stream. The op index is
+/// the graph node index of the same launch.
 fn tick(
     i: &mut usize,
-    obs: &mut dyn FnMut(usize, &'static str) -> Result<(), GpuError>,
+    obs: &mut Observer<'_>,
     name: &'static str,
+    bytes: Bytes,
 ) -> Result<(), GpuError> {
-    obs(*i, name)?;
+    obs(*i, name, bytes)?;
     *i += 1;
     Ok(())
 }
+
+/// The host-side observer a chain enqueue ticks: `(op index, op name, the
+/// bytes that launch touches)`.
+type Observer<'a> = dyn FnMut(usize, &'static str, Bytes) -> Result<(), GpuError> + 'a;
 
 /// Enqueue one layer's whole step at m = 1: the token embedding when the
 /// layer is the first of the model, the attention half every layer shares,
@@ -2077,7 +2245,7 @@ fn enqueue_layer(
     mla: &MlaParams,
     moe: Option<&MoeDims>,
     embed: bool,
-    obs: &mut dyn FnMut(usize, &'static str) -> Result<(), GpuError>,
+    obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
     let mut i = 0usize;
     if embed {
@@ -2088,7 +2256,14 @@ fn enqueue_layer(
             &s.token_buf,
             &mut s.x,
         )?;
-        tick(&mut i, obs, "embed")?;
+        // One table row dequantized into x, the id read from its buffer.
+        let embd = dev_weight(w, "token_embd.weight")?;
+        tick(
+            &mut i,
+            obs,
+            "embed",
+            bsum(&[weight_bytes(embd, 1), Some(4), Some(4 * s.x.len())]),
+        )?;
     }
     enqueue_attn(gpu, step, w, names, kv_l, s, mla, &mut i, obs)?;
     if names.routed {
@@ -2120,11 +2295,15 @@ fn enqueue_attn(
     s: &mut LayerScratch,
     mla: &MlaParams,
     i: &mut usize,
-    obs: &mut dyn FnMut(usize, &'static str) -> Result<(), GpuError>,
+    obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let (hidden, latent, rope) = (s.dims.hidden, mla.latent, mla.rope_dims);
     let kv_width = latent + rope;
+    // Live key rows of this step, from the host mirror of `pos_buf`: the
+    // count the flash kernels read lives on the device, so the byte
+    // accounting takes it from the refresh that wrote it.
+    let n_keys = s.pos_host as usize + 1;
     let gather =
         |gt: &Gather, src: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
             step.enqueue_gather(stream, src, &gt.src, &gt.dst, gt.n, y)
@@ -2141,12 +2320,42 @@ fn enqueue_attn(
         &mut s.act_q,
         &mut s.normed,
     )?;
-    tick(i, obs, "attn_norm_quant")?;
+    // x and the gain in, the five q8_1 planes and the f32 vector out.
+    tick(
+        i,
+        obs,
+        "attn_norm_quant",
+        bsum(&[
+            Some(8 * hidden),
+            Some(act_write_bytes(&s.act_q, 1)),
+            Some(4 * hidden),
+        ]),
+    )?;
     // 2. the two projections over that one q8_1 activation.
     gpu.enqueue_gemv_q3k(kq_weight(w, &names.attn_q)?, &s.act_q, &mut s.q)?;
-    tick(i, obs, "gemv_q3k(attn_q)")?;
+    let wq = dev_weight(w, &names.attn_q)?;
+    tick(
+        i,
+        obs,
+        "gemv_q3k(attn_q)",
+        bsum(&[
+            weight_bytes(wq, wq.rows()),
+            gemv_act_bytes(wq, &s.act_q, 1),
+            Some(4 * s.q.len()),
+        ]),
+    )?;
     gpu.enqueue_gemv_q3k(kq_weight(w, &names.attn_kv_a_mqa)?, &s.act_q, &mut s.kv_a)?;
-    tick(i, obs, "gemv_q3k(attn_kv_a_mqa)")?;
+    let wkva = dev_weight(w, &names.attn_kv_a_mqa)?;
+    tick(
+        i,
+        obs,
+        "gemv_q3k(attn_kv_a_mqa)",
+        bsum(&[
+            weight_bytes(wkva, wkva.rows()),
+            gemv_act_bytes(wkva, &s.act_q, 1),
+            Some(4 * s.kv_a.len()),
+        ]),
+    )?;
     // 4. rope over every 64-value column of both projections: the q layout
     //    puts each head's rope slice on a column boundary (3 columns per
     //    head, the slice last), the kv layout its rope tail (last column);
@@ -2160,7 +2369,17 @@ fn enqueue_attn(
         1,
         &mut s.q_rope_all,
     )?;
-    tick(i, obs, "rope(q)")?;
+    // Every value of q rotated against the position's cos/sin pair.
+    tick(
+        i,
+        obs,
+        "rope(q)",
+        bsum(&[
+            Some(4 * s.q.len()),
+            Some(4 * rope),
+            Some(4 * s.q_rope_all.len()),
+        ]),
+    )?;
     // 5. the whole key path of this step in one launch: the latent norm and
     //    the rope of the key's tail leave `kv_s` as
     //    `[kv_compressed | k_rope]`, the permutation leaves `kvr` as the
@@ -2181,7 +2400,18 @@ fn enqueue_attn(
         &mut s.kvr,
         kv_l,
     )?;
-    tick(i, obs, "kv_norm_rope_append")?;
+    // kv_a, the latent gain and the cos/sin pair in; the two f32 forms and
+    // the one f16 cache row out.
+    tick(
+        i,
+        obs,
+        "kv_norm_rope_append",
+        bsum(&[
+            Some(4 * (kv_width + latent + rope + 1)),
+            Some(4 * (s.kv_s.len() + s.kvr.len())),
+            Some(2 * kv_width),
+        ]),
+    )?;
     // 6. q_nope2 per head: one per-head launch dots every derived wk_b row
     //    of head h against q's nope slice of that head (x base h*kq_head,
     //    m = 1 per row), writing the nope2 span of flash row h directly
@@ -2198,14 +2428,36 @@ fn enqueue_attn(
         rope,
         &mut s.f_rows,
     )?;
-    tick(i, obs, "gemv_q8_0_heads(q_nope2)")?;
+    // Every derived row, each head's nope slice of q, the nope2 spans out.
+    let wqn2 = dev_weight(w, &names.derived)?;
+    tick(
+        i,
+        obs,
+        "gemv_q8_0_heads(q_nope2)",
+        bsum(&[
+            weight_bytes(wqn2, wqn2.rows()),
+            Some(4 * mla.n_head * mla.nope),
+            Some(4 * mla.n_head * latent),
+        ]),
+    )?;
     // 7. the flash q rows `[q_rope | q_nope2]` per head — the rope spans are
     //    copies of q_rope_all's per-head rope slices (the nope2 span is
     //    already in place).
     gather(&s.g_f_rope_lo, &s.q_rope_all, &mut s.f_rows)?;
-    tick(i, obs, "gather(f_rope_lo)")?;
+    // Per pair: two index words, one value read, one value written.
+    tick(
+        i,
+        obs,
+        "gather(f_rope_lo)",
+        bsum(&[Some(16 * s.g_f_rope_lo.n)]),
+    )?;
     gather(&s.g_f_rope_hi, &s.q_rope_all, &mut s.f_rows)?;
-    tick(i, obs, "gather(f_rope_hi)")?;
+    tick(
+        i,
+        obs,
+        "gather(f_rope_hi)",
+        bsum(&[Some(16 * s.g_f_rope_hi.n)]),
+    )?;
     // 8. attend over `n_keys` rows — the count lives in a device buffer, so
     //    a captured replay follows it.
     // The merge pass exists only when the cache is tall enough to be cut
@@ -2226,7 +2478,17 @@ fn enqueue_attn(
             latent,
             &mut s.kqvc,
         )?;
-        tick(i, obs, "flash_latent")?;
+        // The query rows, the live cache rows as f16, the attended output.
+        tick(
+            i,
+            obs,
+            "flash_latent",
+            bsum(&[
+                Some(4 * (mla.n_head * kv_width + 1)),
+                Some(2 * n_keys * kv_width),
+                Some(4 * mla.n_head * latent),
+            ]),
+        )?;
     } else {
         gpu.flash().enqueue_flash_latent_seg(
             stream,
@@ -2241,7 +2503,22 @@ fn enqueue_attn(
             &mut s.part_v,
             &mut s.part_ms,
         )?;
-        tick(i, obs, "flash_latent")?;
+        // Same reads as the single-block launch; the partials of the live
+        // segments out, plus the `(−inf, 0)` pair every segment past the
+        // live keys still writes so the merge can skip it.
+        let segs = crate::flash::segments_for(kv_l.rows());
+        let live = n_keys.div_ceil(crate::flash::seg_keys()).min(segs);
+        tick(
+            i,
+            obs,
+            "flash_latent",
+            bsum(&[
+                Some(4 * (mla.n_head * kv_width + 1)),
+                Some(2 * n_keys * kv_width),
+                Some(4 * mla.n_head * live * latent),
+                Some(8 * mla.n_head * segs),
+            ]),
+        )?;
         gpu.flash().enqueue_flash_merge(
             stream,
             &s.n_keys_buf,
@@ -2253,7 +2530,18 @@ fn enqueue_attn(
             &s.part_ms,
             &mut s.kqvc,
         )?;
-        tick(i, obs, "flash_merge")?;
+        // The live segments' partials in, the attended output out.
+        tick(
+            i,
+            obs,
+            "flash_merge",
+            bsum(&[
+                Some(4),
+                Some(4 * mla.n_head * live * latent),
+                Some(8 * mla.n_head * live),
+                Some(4 * mla.n_head * latent),
+            ]),
+        )?;
     }
     // 9. wv_b per head: flash's output is head-major — kqvc column h is
     //    head h's compressed values, the m-column layout the quantizer
@@ -2263,10 +2551,27 @@ fn enqueue_attn(
     //    h*(nope+v_head) + nope + j, activation column h - head_base,
     //    m = 1), writing the flat, head-major kqv_2d directly — the wk_b
     //    rows are never read.
+    let half = mla.n_head / 2;
     gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
-    tick(i, obs, "quantize_q8_1(kqvc_lo)")?;
-    gpu.enqueue_quantize_q8_1_at(&s.kqvc, (mla.n_head / 2) * latent, &mut s.act_kv_hi)?;
-    tick(i, obs, "quantize_q8_1(kqvc_hi)")?;
+    tick(
+        i,
+        obs,
+        "quantize_q8_1(kqvc_lo)",
+        bsum(&[
+            Some(4 * s.act_kv_lo.m() * latent),
+            Some(act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())),
+        ]),
+    )?;
+    gpu.enqueue_quantize_q8_1_at(&s.kqvc, half * latent, &mut s.act_kv_hi)?;
+    tick(
+        i,
+        obs,
+        "quantize_q8_1(kqvc_hi)",
+        bsum(&[
+            Some(4 * s.act_kv_hi.m() * latent),
+            Some(act_write_bytes(&s.act_kv_hi, s.act_kv_hi.m())),
+        ]),
+    )?;
     let kv_b = kq_weight(w, &names.attn_kv_b)?;
     step.enqueue_q3k_gemv_heads(
         stream,
@@ -2279,7 +2584,16 @@ fn enqueue_attn(
         mla.v_head,
         &mut s.kqv_2d,
     )?;
-    tick(i, obs, "gemv_q3k_heads(wv_b_lo)")?;
+    // Half the heads' wv_b rows against their own activation columns.
+    let wkvb = dev_weight(w, &names.attn_kv_b)?;
+    let wv_b_bytes = |a: &Q8Act| -> Bytes {
+        bsum(&[
+            weight_bytes(wkvb, half * mla.v_head),
+            gemv_act_bytes(wkvb, a, a.m()),
+            Some(4 * half * mla.v_head),
+        ])
+    };
+    tick(i, obs, "gemv_q3k_heads(wv_b_lo)", wv_b_bytes(&s.act_kv_lo))?;
     step.enqueue_q3k_gemv_heads(
         stream,
         kv_b,
@@ -2291,19 +2605,37 @@ fn enqueue_attn(
         mla.v_head,
         &mut s.kqv_2d,
     )?;
-    tick(i, obs, "gemv_q3k_heads(wv_b_hi)")?;
+    tick(i, obs, "gemv_q3k_heads(wv_b_hi)", wv_b_bytes(&s.act_kv_hi))?;
     // 10. attn_output over the flat kqv_2d, then the attention residual.
     gpu.enqueue_quantize_q8_1(&s.kqv_2d, &mut s.act_ao)?;
-    tick(i, obs, "quantize_q8_1(act_ao)")?;
+    tick(
+        i,
+        obs,
+        "quantize_q8_1(act_ao)",
+        bsum(&[
+            Some(4 * s.kqv_2d.len()),
+            Some(act_write_bytes(&s.act_ao, s.act_ao.m())),
+        ]),
+    )?;
     gpu.enqueue_gemv_q4k(
         kq_weight(w, &names.attn_output)?,
         &s.act_ao,
         &mut s.attn_out,
     )?;
-    tick(i, obs, "gemv_q4k(attn_output)")?;
+    let wao = dev_weight(w, &names.attn_output)?;
+    tick(
+        i,
+        obs,
+        "gemv_q4k(attn_output)",
+        bsum(&[
+            weight_bytes(wao, wao.rows()),
+            gemv_act_bytes(wao, &s.act_ao, 1),
+            Some(4 * s.attn_out.len()),
+        ]),
+    )?;
     gpu.elem()
         .enqueue_add(stream, &s.attn_out, &s.x, hidden, &mut s.ffn_inp)?;
-    tick(i, obs, "add(attn_resid)")?;
+    tick(i, obs, "add(attn_resid)", bsum(&[Some(12 * hidden)]))?;
     Ok(())
 }
 
@@ -2318,9 +2650,10 @@ fn enqueue_ffn_dense(
     s: &mut LayerScratch,
     mla: &MlaParams,
     i: &mut usize,
-    obs: &mut dyn FnMut(usize, &'static str) -> Result<(), GpuError>,
+    obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
+    let hidden = s.dims.hidden;
     let LayerScratch {
         ffn_inp,
         act_ffn,
@@ -2345,7 +2678,16 @@ fn enqueue_ffn_dense(
         act_ffn,
         &mut d.h,
     )?;
-    tick(i, obs, "ffn_norm_quant")?;
+    tick(
+        i,
+        obs,
+        "ffn_norm_quant",
+        bsum(&[
+            Some(8 * hidden),
+            Some(act_write_bytes(act_ffn, 1)),
+            Some(4 * hidden),
+        ]),
+    )?;
     gpu.fused().enqueue_gate_up_swiglu(
         stream,
         kq_weight(w, &names.ffn_gate)?,
@@ -2353,9 +2695,29 @@ fn enqueue_ffn_dense(
         act_ffn,
         &mut d.h,
     )?;
-    tick(i, obs, "ffn_gate_up_swiglu")?;
+    // Both projections' rows over the one activation, the swiglu out.
+    let (wg, wu) = (
+        dev_weight(w, &names.ffn_gate)?,
+        dev_weight(w, &names.ffn_up)?,
+    );
+    tick(
+        i,
+        obs,
+        "ffn_gate_up_swiglu",
+        bsum(&[
+            weight_bytes(wg, wg.rows()),
+            weight_bytes(wu, wu.rows()),
+            gemv_act_bytes(wg, act_ffn, 1),
+            Some(4 * wg.rows()),
+        ]),
+    )?;
     gpu.q5().enqueue_quantize_q8(stream, &d.h, &mut d.act32)?;
-    tick(i, obs, "ffn_quantize_q8")?;
+    tick(
+        i,
+        obs,
+        "ffn_quantize_q8",
+        bsum(&[Some(4 * d.h.len()), Some(blocks32_bytes(&d.act32, 1))]),
+    )?;
     gpu.fused().enqueue_down_add_q5_1(
         stream,
         kq_weight(w, &names.ffn_down)?,
@@ -2363,7 +2725,18 @@ fn enqueue_ffn_dense(
         ffn_inp,
         l_out,
     )?;
-    tick(i, obs, "ffn_down_add")?;
+    // Every down row, the quantized swiglu, the residual, the block output.
+    let wd = dev_weight(w, &names.ffn_down)?;
+    tick(
+        i,
+        obs,
+        "ffn_down_add",
+        bsum(&[
+            weight_bytes(wd, wd.rows()),
+            Some(blocks32_bytes(&d.act32, 1)),
+            Some(8 * hidden),
+        ]),
+    )?;
     Ok(())
 }
 
@@ -2385,7 +2758,7 @@ fn enqueue_ffn_moe(
     mla: &MlaParams,
     dims: &MoeDims,
     i: &mut usize,
-    obs: &mut dyn FnMut(usize, &'static str) -> Result<(), GpuError>,
+    obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let hidden = s.dims.hidden;
@@ -2414,7 +2787,16 @@ fn enqueue_ffn_moe(
         act_ffn,
         &mut m.normed,
     )?;
-    tick(i, obs, "moe_ffn_norm_quant")?;
+    tick(
+        i,
+        obs,
+        "moe_ffn_norm_quant",
+        bsum(&[
+            Some(8 * hidden),
+            Some(act_write_bytes(act_ffn, 1)),
+            Some(4 * hidden),
+        ]),
+    )?;
     // 2-3. the router: an f32 gemv over the normed vector, then softmax +
     //      top-k + scale. `m.ids` is the `sel` every expert launch reads.
     gpu.q8f32().enqueue_f32_gemv(
@@ -2424,7 +2806,17 @@ fn enqueue_ffn_moe(
         1,
         &mut m.logits,
     )?;
-    tick(i, obs, "moe_router_gemv")?;
+    let wr = dev_weight(w, &names.ffn_gate_inp)?;
+    tick(
+        i,
+        obs,
+        "moe_router_gemv",
+        bsum(&[
+            weight_bytes(wr, wr.rows()),
+            Some(4 * hidden),
+            Some(4 * dims.n_expert),
+        ]),
+    )?;
     gpu.router().enqueue_router_topk(
         stream,
         &m.logits,
@@ -2434,7 +2826,13 @@ fn enqueue_ffn_moe(
         &mut m.ids,
         &mut m.weights,
     )?;
-    tick(i, obs, "moe_router_topk")?;
+    // The logits in; the probabilities, the chosen ids and their weights out.
+    tick(
+        i,
+        obs,
+        "moe_router_topk",
+        bsum(&[Some(8 * dims.n_expert), Some(8 * dims.n_used)]),
+    )?;
     // 4-6. the routed experts, all six per launch through `sel`.
     gpu.moe_fused().enqueue_expert_gate_up_swiglu(
         stream,
@@ -2446,10 +2844,37 @@ fn enqueue_ffn_moe(
         dims.ff,
         &mut m.h_exp,
     )?;
-    tick(i, obs, "moe_expert_gate_up_swiglu")?;
+    // Only the selected experts' rows are read — `n_used` blocks of
+    // `ff` rows out of the stack, the same count for any selection
+    // because the ids the router writes are distinct
+    // (`profile_layer` asserts that on the ids it reads back).
+    let (wge, wue) = (
+        dev_weight(w, &names.ffn_gate_exps)?,
+        dev_weight(w, &names.ffn_up_exps)?,
+    );
+    tick(
+        i,
+        obs,
+        "moe_expert_gate_up_swiglu",
+        bsum(&[
+            weight_bytes(wge, dims.n_used * dims.ff),
+            weight_bytes(wue, dims.n_used * dims.ff),
+            gemv_act_bytes(wge, act_ffn, 1),
+            Some(4 * dims.n_used),
+            Some(4 * dims.n_used * dims.ff),
+        ]),
+    )?;
     gpu.q5()
         .enqueue_quantize_q8(stream, &m.h_exp, &mut m.act32_exp)?;
-    tick(i, obs, "moe_expert_quantize_q8")?;
+    tick(
+        i,
+        obs,
+        "moe_expert_quantize_q8",
+        bsum(&[
+            Some(4 * dims.n_used * dims.ff),
+            Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
+        ]),
+    )?;
     gpu.q5().enqueue_gemv_q5_0_sel(
         stream,
         kq_weight(w, &names.ffn_down_exps)?,
@@ -2459,7 +2884,18 @@ fn enqueue_ffn_moe(
         hidden,
         &mut m.down,
     )?;
-    tick(i, obs, "moe_expert_down")?;
+    let wde = dev_weight(w, &names.ffn_down_exps)?;
+    tick(
+        i,
+        obs,
+        "moe_expert_down",
+        bsum(&[
+            weight_bytes(wde, dims.n_used * hidden),
+            Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
+            Some(4 * dims.n_used),
+            Some(4 * dims.n_used * hidden),
+        ]),
+    )?;
     // 7-9. the shared expert: the dense fused gate·up·swiglu at its own
     //      width on the same quantized input, then a Q4_K down projection
     //      whose K is the shared width (odd super-block count, which the
@@ -2471,15 +2907,47 @@ fn enqueue_ffn_moe(
         act_ffn,
         &mut m.h_sh,
     )?;
-    tick(i, obs, "shexp_gate_up_swiglu")?;
+    let (wgs, wus) = (
+        dev_weight(w, &names.ffn_gate_shexp)?,
+        dev_weight(w, &names.ffn_up_shexp)?,
+    );
+    tick(
+        i,
+        obs,
+        "shexp_gate_up_swiglu",
+        bsum(&[
+            weight_bytes(wgs, wgs.rows()),
+            weight_bytes(wus, wus.rows()),
+            gemv_act_bytes(wgs, act_ffn, 1),
+            Some(4 * dims.shexp_ff),
+        ]),
+    )?;
     gpu.enqueue_quantize_q8_1(&m.h_sh, &mut m.act_sh)?;
-    tick(i, obs, "shexp_quantize_q8_1")?;
+    tick(
+        i,
+        obs,
+        "shexp_quantize_q8_1",
+        bsum(&[
+            Some(4 * dims.shexp_ff),
+            Some(act_write_bytes(&m.act_sh, m.act_sh.m())),
+        ]),
+    )?;
     gpu.enqueue_gemv_q4k(
         kq_weight(w, &names.ffn_down_shexp)?,
         &m.act_sh,
         &mut m.shexp,
     )?;
-    tick(i, obs, "shexp_down")?;
+    let wds = dev_weight(w, &names.ffn_down_shexp)?;
+    tick(
+        i,
+        obs,
+        "shexp_down",
+        bsum(&[
+            weight_bytes(wds, wds.rows()),
+            gemv_act_bytes(wds, &m.act_sh, 1),
+            Some(4 * hidden),
+        ]),
+    )?;
     // 10. (Σ w·down + shexp) + resid, the dump's own grouping.
     gpu.moe_fused().enqueue_moe_combine(
         stream,
@@ -2491,6 +2959,13 @@ fn enqueue_ffn_moe(
         dims.n_used,
         l_out,
     )?;
-    tick(i, obs, "moe_combine")?;
+    // The slots' down projections and weights, the shared expert, the
+    // residual, the block output.
+    tick(
+        i,
+        obs,
+        "moe_combine",
+        bsum(&[Some(4 * dims.n_used * (hidden + 1)), Some(12 * hidden)]),
+    )?;
     Ok(())
 }

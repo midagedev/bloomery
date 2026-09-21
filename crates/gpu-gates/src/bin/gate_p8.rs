@@ -11,8 +11,9 @@
 //!   produces (measured with the FAIL-first mutation below). A violation
 //!   here is a layout defect, not noise;
 //! - (b) an eager rerun bit-identical;
-//! - (c) the captured graph replays bit-identical to eager (node count
-//!   printed);
+//! - (c) the captured graph replays bit-identical to eager, and the node
+//!   count equals its pin (`NODES_BLOCK0`, plus the flash merge when the
+//!   cache is cut into segments);
 //! - (d) the SAME graph, reseeded to a second position (pos 4, n_keys 5),
 //!   reproduces an eager pos-4 run's `l_out-0` bit for bit — what the
 //!   device-side `pos_buf`/`n_keys_buf` buy.
@@ -32,16 +33,26 @@
 //! to the bit. Rows the dump did not seed are zeros — a real key row for
 //! timing, not a skipped one.
 //!
+//! `--profile-layer <L>` profiles layer `L` instead of block 0 — blocks
+//! `0..=L` then load, and the profiled layer's input residual is block 0's
+//! own output at the profiled position (a lone layer has none of its own).
+//! The correctness arms stay on block 0 whatever the flag says.
+//!
 //! `--time` (lead-only, under the machine lease) replays the graph 2000x
 //! and prints us/replay plus an empty-graph reference; correctness runs
 //! never reach it. `--profile` (lead-only, the same lease — the profiling
 //! numbers are measurements too) additionally runs `GpuModel::profile_block0`:
 //! one line per op — eager launch + body + one synchronize, so the printed
 //! `sync_floor_us` (a bare `touch` launch + sync, sampled the same way) is
-//! the per-op overhead to subtract via `net_us` — then the sums, the
+//! the per-op overhead to subtract via `net_us` — with the bytes that op
+//! touches and `bytes / net_us` as GB/s beside it, then the sums, the
 //! attention/FFN split (ops up to and including the attention residual add
-//! vs the four fused FFN ops), `refresh_params`' host time, and the
-//! graph-replay number of `--time` measured in the same process.
+//! vs the layer's FFN ops), `refresh_params`' host time, and the
+//! graph-replay number of `--time` measured in the same process. The bytes
+//! are exact counts of what the launch addresses, carried out of the engine
+//! by the same tick that names the op; the footer prints their sum, the
+//! effective GB/s of the whole chain and the two references of
+//! docs/roofline.md so a reader sees where each op sits between them.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -69,6 +80,35 @@ const CTX_MAX: usize = 64;
 /// Structural fence — see the module doc. Not a band.
 #[cfg(feature = "gpu")]
 const FENCE: f32 = 0.25;
+/// PIN(2026-09-21): block 0's chain captures exactly this many graph nodes
+/// on a cache that fits in one flash segment, and one more when the cache is
+/// cut into segments and the merge pass joins the chain (`NODES_BLOCK0 +
+/// (segments > 1)`). Measured by this gate's own `graph graph_nodes=21` line
+/// at ctx_max 64 (prof2 round, 2026-09-21 — HANDOFF §7 "prof2 머지"; the lead's
+/// own rerun agreed). This is not a band: the node
+/// count is a deterministic property of the chain, so the pin is exact and
+/// its margin is zero — the derivation is "what the chain enqueues today,
+/// after the fuse1 round's two fusions". A silently added launch — a fused
+/// pair that stopped fusing, a debug copy left in the chain — keeps every
+/// other arm of this gate green (eager still equals replay, ops still equal
+/// nodes) and fails only here.
+#[cfg(feature = "gpu")]
+const NODES_BLOCK0: usize = 21;
+/// Print-only markers for the profile table, not gates: an op touching at
+/// least a mebibyte should be paying for bytes, not for its launch, so one
+/// that stays under this effective bandwidth is a shape-defect candidate the
+/// reader should look at.
+#[cfg(feature = "gpu")]
+const MARK_BYTES: u64 = 1 << 20;
+#[cfg(feature = "gpu")]
+const MARK_GBPS: f64 = 100.0;
+/// The two references the per-op GB/s is read against, both derived in
+/// docs/roofline.md: the kernel-level floor this card's gemvs reach and the
+/// whole-pass average the reference engine shows.
+#[cfg(feature = "gpu")]
+const REF_KERNEL_FLOOR_GBPS: f64 = 700.0;
+#[cfg(feature = "gpu")]
+const REF_WHOLE_PASS_GBPS: f64 = 247.0;
 
 /// Block-0 bands, PIN(2026-09-21) from this gate's first table (engine vs
 /// `ref_cuda_v2`, last token: attn_norm 1.1e-7, q 4.2e-3,
@@ -104,6 +144,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // decision, and the profile arm needs `pos + 1` rows.
     let profile_pos = parse_u32_flag(std::env::args(), "--profile-pos")?;
     let profile_ctx = parse_u32_flag(std::env::args(), "--profile-ctx")?;
+    // The profiled layer is a load-time decision too: layer L needs blocks
+    // 0..=L resident, block 0 because a lone layer has no embedding to make
+    // its input residual and this gate takes that residual from block 0's
+    // own output. The correctness arms below stay on block 0 either way.
+    let profile_layer = parse_u32_flag(std::env::args(), "--profile-layer")?.unwrap_or(0) as usize;
     let ctx_max = match profile_pos {
         Some(p) => CTX_MAX.max(p as usize + 1),
         None => CTX_MAX,
@@ -111,10 +156,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .max(profile_ctx.unwrap_or(0) as usize);
     let gguf = open_model()?;
     let man = ref_manifest()?;
-    let mut model = GpuModel::load_blocks(&gguf, ctx_max, 0..1)?;
+    let mut model = GpuModel::load_blocks(&gguf, ctx_max, 0..profile_layer + 1)?;
     println!(
-        "resident stage_bytes={} ctx_max={ctx_max} m=1",
-        model.stages()[0].resident_bytes()
+        "resident stage_bytes={} ctx_max={ctx_max} m=1 layers=0..{}",
+        model.stages()[0].resident_bytes(),
+        profile_layer + 1
     );
 
     // The dump's own cache rows for tokens 0..4: seeding them makes the last
@@ -234,11 +280,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     model.replay_block0(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32)?;
     let taps3 = model.block0_taps()?;
     let replay_same = taps3.bits_equal(&taps1);
+    // The merge pass exists only when the cache is cut into segments, so the
+    // pinned count carries that one term and nothing else.
+    let want_nodes = NODES_BLOCK0 + usize::from(bloomery_gpu::flash::segments_for(ctx_max) > 1);
+    let nodes_pinned = nodes == want_nodes;
     println!(
-        "graph graph_nodes={nodes} eager_vs_replay_bit_identical={replay_same} {}",
-        verdict(replay_same)
+        "graph graph_nodes={nodes} pinned_nodes={want_nodes} nodes_equal_pin={nodes_pinned} \
+         eager_vs_replay_bit_identical={replay_same} {}",
+        verdict(replay_same && nodes_pinned)
     );
     if !replay_same {
+        ok = false;
+    }
+    if !nodes_pinned {
+        eprintln!(
+            "FAIL: block 0 captures {nodes} nodes, the pin is {want_nodes} \
+             (NODES_BLOCK0 {NODES_BLOCK0} + {} for the flash merge) — a launch was added or \
+             removed",
+            usize::from(bloomery_gpu::flash::segments_for(ctx_max) > 1)
+        );
         ok = false;
     }
 
@@ -334,7 +394,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let prof_token = PROMPT[M_TOKENS - 1];
         // The &mut model calls come first; the shared `stream` borrow taken
         // below must not overlap them.
-        let ops = model.profile_block0(prof_token, prof_pos, PROF_REPS)?;
+        // A layer above 0 reads its input residual from the resident input
+        // buffer: block 0's own output at this position fills it, which is
+        // what the layer would receive in a stitched step.
+        if profile_layer > 0 {
+            let taps = model.step_block0_taps(prof_token, prof_pos)?;
+            model.set_layer_input(&taps.l_out)?;
+        }
+        let ops = model.profile_layer(profile_layer, prof_token, prof_pos, PROF_REPS)?;
         let refresh_us = model.refresh_params_us(prof_token, prof_pos, PROF_REPS)?;
         let probe = bloomery_gpu::probe::Probe::load(model.stages()[0].gpu().context())?;
         let stream = model.stages()[0].gpu().stream();
@@ -365,35 +432,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stream.synchronize()?;
         let graph_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(N);
 
+        // The FFN half starts at the layer's own norm: the fused dense four
+        // for a layer without a router, the routed ten for a layer with one.
+        let (anchor, want_ffn_ops) = match ops.iter().any(|o| o.name == "moe_ffn_norm_quant") {
+            true => ("moe_ffn_norm_quant", 10),
+            false => ("ffn_norm_quant", 4),
+        };
         let ffn_start = ops
             .iter()
-            .position(|o| o.name == "ffn_norm_quant")
-            .ok_or("gate_p8: the profile holds no ffn_norm_quant op")?;
-        if ops.len() - ffn_start != 4 {
+            .position(|o| o.name == anchor)
+            .ok_or("gate_p8: the profile holds no FFN norm op")?;
+        if ops.len() - ffn_start != want_ffn_ops {
             return Err(format!(
-                "gate_p8: the fused FFN is {} ops after {ffn_start}, want the four of the \
-                 P0b shape",
+                "gate_p8: the FFN half is {} ops after {ffn_start}, want the {want_ffn_ops} of \
+                 the {anchor} shape",
                 ops.len() - ffn_start
             )
             .into());
         }
         println!(
-            "prof reps={PROF_REPS} warmup=20 ops={} sync_floor_samples={PROF_REPS} \
-             sample=eager_launch+body+one_sync pos={prof_pos} n_keys={} ctx_max={ctx_max} \
-             seg_keys={} flash_segs={}",
+            "prof reps={PROF_REPS} warmup=20 layer={profile_layer} ops={} \
+             sync_floor_samples={PROF_REPS} sample=eager_launch+body+one_sync pos={prof_pos} \
+             n_keys={} ctx_max={ctx_max} seg_keys={} flash_segs={}",
             ops.len(),
             prof_pos + 1,
             bloomery_gpu::flash::seg_keys(),
             bloomery_gpu::flash::segments_for(ctx_max)
         );
+        // Bytes are exact counts of what the launch addresses (weight rows,
+        // activation planes, outputs), each distinct byte once; `?` is an op
+        // whose count the engine cannot derive. GB/s is that count over the
+        // op's net time, so it is only as honest as `net_us` — an op whose
+        // net time is not positive prints `?` rather than a clamped number.
+        let gbps = |op: &bloomery_gpu::model::OpTime| -> Option<f64> {
+            let net = op.us_min - floor_min;
+            match (op.bytes, net > 0.0) {
+                (Some(b), true) => Some(b as f64 / net / 1e3),
+                _ => None,
+            }
+        };
+        let show = |v: Option<f64>| match v {
+            Some(x) => format!("{x:.1}"),
+            None => "?".to_string(),
+        };
         for op in &ops {
+            let mark = match (op.bytes, gbps(op)) {
+                (Some(b), Some(g)) if b >= MARK_BYTES && g < MARK_GBPS => " shape_defect_candidate",
+                _ => "",
+            };
             println!(
-                "prof i={:02} op={} us_mean={:.3} us_min={:.3} net_us={:.3}",
+                "prof i={:02} op={} us_mean={:.3} us_min={:.3} net_us={:.3} bytes={} gbps={}{mark}",
                 op.index,
                 op.name,
                 op.us_mean,
                 op.us_min,
-                op.us_min - floor_min
+                op.us_min - floor_min,
+                match op.bytes {
+                    Some(b) => b.to_string(),
+                    None => "?".to_string(),
+                },
+                show(gbps(op))
             );
         }
         let sum_us: f64 = ops.iter().map(|o| o.us_mean).sum();
@@ -402,11 +500,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ffn_us: f64 = ops[ffn_start..].iter().map(|o| o.us_mean).sum();
         let attn_net_us: f64 = ops[..ffn_start].iter().map(|o| o.us_min - floor_min).sum();
         let ffn_net_us: f64 = ops[ffn_start..].iter().map(|o| o.us_min - floor_min).sum();
+        let unknown = ops.iter().filter(|o| o.bytes.is_none()).count();
+        let sum_bytes: u64 = ops.iter().filter_map(|o| o.bytes).sum();
         println!(
             "prof sum_us={sum_us:.3} sum_net_us={sum_net_us:.3} sync_floor_us={floor_min:.3} \
              sync_floor_mean_us={:.3} refresh_params_us={refresh_us:.3} \
-             graph_replay_us={graph_us:.3}",
+             graph_replay_us={graph_us:.3} graph_of=block0",
             floor_sum / f64::from(PROF_REPS)
+        );
+        println!(
+            "prof bytes sum_bytes={sum_bytes} bytes_unknown_ops={unknown} \
+             sum_net_us={sum_net_us:.3} effective_gbps={} \
+             ref_kernel_floor_gbps={REF_KERNEL_FLOOR_GBPS:.0} \
+             ref_whole_pass_gbps={REF_WHOLE_PASS_GBPS:.0} refs=docs/roofline.md \
+             marker=bytes>={MARK_BYTES}_and_gbps<{MARK_GBPS:.0}",
+            show((sum_net_us > 0.0).then(|| sum_bytes as f64 / sum_net_us / 1e3))
         );
         println!(
             "prof split attn_ops={ffn_start} ffn_ops={} attn_us={attn_us:.3} ffn_us={ffn_us:.3} \

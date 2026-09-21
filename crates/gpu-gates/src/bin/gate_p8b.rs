@@ -14,15 +14,17 @@
 //!   `ffn_moe_topk-1` last-token ids AND to the host routing reference, in
 //!   rank order, with the router weights within `ROUTER_BAND` of it;
 //! - (c) an eager rerun bit-identical;
-//! - (d) the captured graph replays bit-identical to eager (node count
-//!   printed);
+//! - (d) the captured graph replays bit-identical to eager, and the node
+//!   count equals its pin (`NODES_LAYER1`);
 //! - (e) the SAME graph at a second position (pos 4, n_keys 5) reproducing
 //!   an eager run there bit for bit — what the device-side
 //!   `pos_buf`/`n_keys_buf` buy;
 //! - (f) the SAME graph on a DIFFERENT input vector that routes to at least
 //!   one different expert, still bit-identical to its own eager run — what
 //!   the device-resident `sel` buys. A captured graph that froze the routing
-//!   passes (d) and (e) and fails here.
+//!   passes (d) and (e) and fails here. How many slots that probe moves is
+//!   pinned too (`PROBE_SLOTS_CHANGED`): it is a property of the dump and
+//!   the router, not of a sample.
 //!
 //! Two taps of the MoE block are not exposed: `moe_combine` folds the
 //! weighted expert sum, the shared expert and the residual into one store,
@@ -62,6 +64,27 @@ const FENCE: f32 = 0.25;
 /// bit-mirrored (`gate_moe_fused`'s constant). Ids are exact.
 #[cfg(feature = "gpu")]
 const ROUTER_BAND: f32 = 1e-5;
+/// PIN(2026-09-21): the MoE layer's chain captures exactly this many graph
+/// nodes — sixteen attention ops (block 0's seventeen without the embed) and
+/// ten routed FFN ops, on this gate's one-segment cache. Measured by this
+/// gate's own `graph graph_nodes=26` line (prof2 round, 2026-09-21 — HANDOFF §7
+/// "prof2 머지"; three runs identical, the lead's rerun agreed). Not a band: the count is a deterministic property
+/// of the chain, so the pin is exact and its margin is zero. A silently
+/// added launch keeps the bit-identity arms green and fails only here.
+#[cfg(feature = "gpu")]
+const NODES_LAYER1: usize = 26;
+/// PIN(2026-09-21): slots the routing probe's input moves. The probe is the
+/// first `l_out-0` column that routes differently from the last token's, so
+/// both id vectors are fixed by the dump and the router alone: `[5, 38, 8,
+/// 20, 26, 27]` against `[57, 60, 56, 8, 26, 43]` differ in five of six
+/// slots. Measured identical on three consecutive runs
+/// (prof2 round, 2026-09-21 — HANDOFF §7 "prof2 머지"), which is what makes it
+/// pinnable — nothing here samples. Margin zero for the same reason as the
+/// node pin. What it catches: a routing change that still leaves (f) green
+/// because the replay follows it. A legitimate change of the dump or of the
+/// router's tie-breaking re-pins this line with its own measurement.
+#[cfg(feature = "gpu")]
+const PROBE_SLOTS_CHANGED: usize = 5;
 
 #[cfg(feature = "gpu")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -254,11 +277,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     model.replay_layer(LAYER, &column(last), last as u32)?;
     let taps3 = model.layer_taps(LAYER)?;
     let replay_same = taps3.bits_equal(&taps1);
+    let nodes_pinned = nodes == NODES_LAYER1;
     println!(
-        "graph graph_nodes={nodes} eager_vs_replay_bit_identical={replay_same} {}",
-        verdict(replay_same)
+        "graph graph_nodes={nodes} pinned_nodes={NODES_LAYER1} nodes_equal_pin={nodes_pinned} \
+         eager_vs_replay_bit_identical={replay_same} {}",
+        verdict(replay_same && nodes_pinned)
     );
     if !replay_same {
+        ok = false;
+    }
+    if !nodes_pinned {
+        eprintln!(
+            "FAIL: layer {LAYER} captures {nodes} nodes, the pin is {NODES_LAYER1} — a launch \
+             was added or removed"
+        );
         ok = false;
     }
 
@@ -324,15 +356,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|&e| e as i32)
             .eq(dump_ids.iter().copied());
+        let slots_pinned = changed == PROBE_SLOTS_CHANGED;
         println!(
             "routing_probe src=l_out-0[token_{t}] ids={:?} base_ids={:?} slots_changed={changed} \
+             pinned_slots_changed={PROBE_SLOTS_CHANGED} slots_equal_pin={slots_pinned} \
              replay_bit_identical_to_eager={same} replay_ids_follow_router={routed_on_device} \
-             dump_ids={dump_ids:?} eager_ids_equal_dump={dump_agrees} (printed, not asserted) {}",
+             dump_ids={dump_ids:?} eager_ids_equal_dump={dump_agrees} (dump_ids printed, not \
+             asserted) {}",
             probe_ids,
             taps1.moe_ids,
-            verdict(same && routed_on_device)
+            verdict(same && routed_on_device && slots_pinned)
         );
         if !(same && routed_on_device) {
+            ok = false;
+        }
+        if !slots_pinned {
+            eprintln!(
+                "FAIL: the routing probe moves {changed} slots, the pin is \
+                 {PROBE_SLOTS_CHANGED} — the routing of this dump's columns changed"
+            );
             ok = false;
         }
     }
