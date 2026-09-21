@@ -384,6 +384,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.n_identical, report.n_near_tie, report.n_diverged
     );
 
+    // The segment pass under the lever, and the divergence set it leaves.
+    // The tensor-core pass rounds the query rows to f16, so its tokens are
+    // not the scalar path's bit for bit and a near-tie may be re-drawn; what
+    // may not move is the number of prompts that leave the near-tie floor.
+    // PIN(2026-09-22): DIVERGED_PIN is the scalar path's count on this set.
+    const DIVERGED_PIN: usize = 3;
+    let classes_ok = report.n_diverged <= DIVERGED_PIN;
+    println!(
+        "flash_mma={} seg_keys={} diverged={} pin<={DIVERGED_PIN} {}",
+        bloomery_gpu::flash::flash_mma(),
+        bloomery_gpu::flash::seg_keys(),
+        report.n_diverged,
+        if classes_ok { "ok" } else { "FAIL" }
+    );
+    if !classes_ok {
+        ok = false;
+    }
+
     // (1) The decision criterion: the chain must produce ik's FIRST token,
     // or miss it only where the reference itself was inside the floor. A
     // divergence later in the continuation is a different question — the two
@@ -448,9 +466,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // against. Every arm runs the whole set and the deeper prompt in graph
     // mode; `base` runs too, which also says the graph arm above reproduces
     // itself after a probe rebuild.
+    //
+    // The probe entries double a stage of the SCALAR segment pass, so under
+    // the tensor-core lever an arm would run a different kernel from the
+    // base it is compared against. They are that pass's instruments; the
+    // lever's own arm is the class line above.
     let deep_prompt = lcg_prompt(DEEP_PROMPT);
     let mut deep_base: Vec<u32> = Vec::new();
     for (name, probe) in StepProbe::keyaxis_arms() {
+        if bloomery_gpu::flash::flash_mma() && name != "base" {
+            println!("keyaxis arm={name} skipped — it probes the scalar segment pass");
+            continue;
+        }
         model.set_probe(probe)?;
         let nodes = model.capture_step()?;
         let set = run_set(&mut model, &prompts, &reference)?;

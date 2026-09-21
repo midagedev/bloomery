@@ -77,7 +77,9 @@ use crate::GpuError;
 use crate::q8_1_quant_vals;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::convert::cvt_f32_f16x2_lo;
+use cuda_device::convert::{cvt_f32_f16x2_lo, cvt_f32x2_f16x2};
+use cuda_device::shared::cvta_generic_to_shared_u32;
+use cuda_device::wmma::{ldmatrix_x4_shared_u32, mma_m16n8k16_f32_f16};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
@@ -113,7 +115,84 @@ pub const ILP: usize = 4;
 /// measured faster at both depths.
 pub const SEG_KEYS: usize = 128;
 
-/// Keys per segment, [`SEG_KEYS`] unless `BLOOMERY_FLASH_SEG` names another
+// ------------------------------------------------- tensor-core geometry
+
+/// Query rows one block of [`flash_kernels::flash_latent_mma`] carries: a
+/// decode step's whole head set, and so the `M` axis of its `mma.sync`.
+pub const MMA_ROWS: usize = 16;
+/// Warps in an `flash_latent_mma` block. Each owns one `n`-tile of the
+/// `S = Q·Kᵀ` product and, in the online softmax, four of the heads.
+pub const MMA_WARPS: usize = 4;
+/// Threads in an `flash_latent_mma` block.
+pub const MMA_BLOCK: usize = MMA_WARPS * 32;
+/// Keys one warp's `mma.sync` `n`-tile covers — the instruction's `n`.
+pub const MMA_NTILE: usize = 8;
+/// Keys one `flash_latent_mma` tile covers: every warp's `n`-tile at once.
+pub const MMA_KEYS: usize = MMA_WARPS * MMA_NTILE;
+/// Dims one `mma.sync` step covers — the instruction's `k`.
+pub const MMA_K: usize = 16;
+/// The `rope_dims + latent` row width `flash_latent_mma` is built for. Its
+/// shared tiles are sized for it and its chunk walk assumes the width
+/// divides by [`MMA_CHUNK`], so the host entry rejects any other width
+/// rather than reading past a tile.
+pub const MMA_WIDTH: usize = 576;
+/// f16 lanes between two staged query rows. `MMA_QSTRIDE * 2 ≡ 16 (mod 128)`
+/// is what makes every `ldmatrix` phase read eight rows across all thirty-two
+/// banks exactly once; the unpadded 576 would put all sixteen rows in the
+/// same bank.
+pub const MMA_QSTRIDE: usize = MMA_WIDTH + 8;
+/// `MMA_QSTRIDE` as u32 words, the staged tile's element type.
+pub const MMA_QROW_W: usize = MMA_QSTRIDE / 2;
+/// u32 words the staged query tile takes.
+pub const MMA_QWORDS: usize = MMA_ROWS * MMA_QROW_W;
+/// Dims of a key tile staged at a time. The whole `[MMA_KEYS][MMA_WIDTH]`
+/// tile would put this kernel's shared memory past the 48 KB a static
+/// allocation may take, so the `k` axis is walked in chunks and the `S`
+/// accumulators carry across them. `MMA_WIDTH` divides by it.
+pub const MMA_CHUNK: usize = 192;
+/// f16 lanes between two staged key rows — padded for the same reason as
+/// [`MMA_QSTRIDE`], and by the same amount.
+pub const MMA_KSTRIDE: usize = MMA_CHUNK + 8;
+/// `MMA_KSTRIDE` as u32 words.
+pub const MMA_KROW_W: usize = MMA_KSTRIDE / 2;
+/// u32 words the staged key chunk takes.
+pub const MMA_KWORDS: usize = MMA_KEYS * MMA_KROW_W;
+/// Floats a tile's per-head logits (then weights) take.
+pub const MMA_TILE: usize = MMA_ROWS * MMA_KEYS;
+/// Keys one segment of the tensor-core pass walks, and so [`seg_keys`]'s
+/// default while that pass is selected. One block carries every head, so the
+/// grid is the segment count alone: the shipped [`SEG_KEYS`] would leave a
+/// 4192-row cache at thirty-three blocks on eighty-four SMs, which is the
+/// shape the head-blocked scalar round died of. Sixty-four keys give
+/// sixty-six blocks there and keep the merge's fold half the length a
+/// thirty-two-key segment would.
+pub const MMA_SEG_KEYS: usize = 64;
+
+/// Whether the split launch's segment pass is the tensor-core
+/// [`flash_kernels::flash_latent_mma`] rather than the per-head
+/// [`flash_kernels::flash_latent_seg`]. `BLOOMERY_FLASH_MMA=1` picks it, `0`
+/// (the default) the other. Read once, at first use: the value fixes a
+/// captured graph's grid and the segment size under it, so it must not
+/// change between capture and replay. A value that is set but unusable
+/// panics rather than falling back.
+pub fn flash_mma() -> bool {
+    static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MMA.get_or_init(|| match std::env::var("BLOOMERY_FLASH_MMA") {
+        Err(_) => false,
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" => false,
+        Ok(v) => panic!("BLOOMERY_FLASH_MMA={v} is neither `1` nor `0`"),
+    })
+}
+
+/// Blocks the tensor-core pass needs for `q_rows` query rows: the rows are
+/// cut into groups of [`MMA_ROWS`], and every group runs each segment.
+pub fn mma_groups(q_rows: usize) -> usize {
+    q_rows.div_ceil(MMA_ROWS)
+}
+
+/// Keys per segment: [`MMA_SEG_KEYS`] while [`flash_mma`] is on and
+/// [`SEG_KEYS`] otherwise, unless `BLOOMERY_FLASH_SEG` names another
 /// multiple of [`KEY_TILE`]. Read once, at first use: the value fixes a
 /// captured graph's grid, so it must not change between capture and replay.
 /// A value that is set but unusable panics rather than falling back — a
@@ -121,6 +200,7 @@ pub const SEG_KEYS: usize = 128;
 pub fn seg_keys() -> usize {
     static SEG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SEG.get_or_init(|| match std::env::var("BLOOMERY_FLASH_SEG") {
+        Err(_) if flash_mma() => MMA_SEG_KEYS,
         Err(_) => SEG_KEYS,
         Ok(v) => match v.parse::<usize>() {
             Ok(n) if n >= KEY_TILE && n.is_multiple_of(KEY_TILE) => n,
@@ -626,6 +706,410 @@ mod flash_kernels {
             if tid == 0 {
                 *part_ms.get_unchecked_mut(2 * idx) = mx;
                 *part_ms.get_unchecked_mut(2 * idx + 1) = s_sum;
+            }
+        }
+    }
+
+    /// The tensor-core segment pass: block `(group, segment)` attends keys
+    /// `[segment * seg_keys, min((segment + 1) * seg_keys, limit))` for the
+    /// [`MMA_ROWS`] query rows `group * MMA_ROWS ..` at once and writes the
+    /// same partials [`flash_latent_seg`] writes, so [`flash_merge`] and
+    /// [`flash_merge_q8`] serve it unchanged.
+    ///
+    /// The heads are the `M` axis of `mma.sync.aligned.m16n8k16`: one
+    /// instruction takes sixteen heads times eight keys times sixteen dims,
+    /// where the scalar form issues that many fused multiply-adds. The
+    /// fragment coordinates, in `cuda_device::wmma`'s terms (`group =
+    /// lane / 4`, `thread = lane % 4`):
+    /// - `A` is the staged query tile, row-major 16x16 (head, dim). One
+    ///   `ldmatrix.x4` with lane `l` addressing row `l % 16` at dim
+    ///   `d + 8 * (l / 16)` returns exactly `a[0..4]`: `a[0]` is
+    ///   `q[group][d + 2*thread + {0,1}]`, `a[1]` the same at head
+    ///   `group + 8`, `a[2]` and `a[3]` those two at `d + 8`.
+    /// - `B` is the staged key chunk, column-major 16x8 (dim, key) — which
+    ///   is what a `[key][dim]` row already is, so nothing is transposed.
+    ///   One `ldmatrix.x4` with lane `l` addressing key
+    ///   `key0 + l % 8` at dim `d + 8 * (l / 8)` returns two whole `B`
+    ///   fragments: `[r0, r1]` for dims `d..d+16` and `[r2, r3]` for
+    ///   `d+16..d+32`, each element `kt[key0 + group][d + 2*thread + {0,1}]`
+    ///   as `B`'s `(row = dim, col = key)` wants.
+    /// - `C`/`D` element `j` is head `group + 8 * (j >= 2)` and key
+    ///   `key0 + 2 * thread + (j & 1)`, which is where the logit store below
+    ///   sends it.
+    ///
+    /// Both staged strides are padded so that eight rows of one `ldmatrix`
+    /// phase cover the thirty-two shared banks exactly once.
+    ///
+    /// Every row of the group has its own causal limit, so a head whose
+    /// limit the segment has already passed sees `−inf` at every key and
+    /// leaves the neutral partial (`m = −inf`, `s = 0`) and a zero `Σ exp·V`
+    /// behind, the same value the one-row form's skipped block writes. A
+    /// block whose group is wholly past its limits returns before reading a
+    /// key row. No key row at or past `hi_max` — the group's widest live key
+    /// — is ever loaded: the staging leaves those tile rows zero and the
+    /// logit store masks them, which is what keeps padded rows holding NaN
+    /// out of every result.
+    ///
+    /// The query rows and the products are f16, so this entry is a different
+    /// arithmetic class from the f32 scalar passes and carries its own band.
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_mma(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+    ) {
+        // The group's query rows as f16, staged once: every key tile's mma
+        // reads them all. 16-byte aligned, as `ldmatrix` requires.
+        static mut QS: SharedArray<u32, MMA_QWORDS, 16> = SharedArray::UNINIT;
+        // One chunk of the tile's key rows as f16, restaged per chunk.
+        static mut KT: SharedArray<u32, MMA_KWORDS, 16> = SharedArray::UNINIT;
+        // Per head, the tile's scaled logits and then its weights.
+        static mut KLOG: SharedArray<f32, MMA_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, MMA_TILE> = SharedArray::UNINIT;
+        // Per head, the tile's max-bump rescale and the row's causal limit.
+        static mut VMS: SharedArray<f32, MMA_ROWS> = SharedArray::UNINIT;
+        static mut LIM: SharedArray<u32, MMA_ROWS> = SharedArray::UNINIT;
+
+        let b = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let rows = q_rows as usize;
+        let n_seg = segs as usize;
+        let groups = rows.div_ceil(MMA_ROWS);
+        if b >= groups * n_seg {
+            return; // block-uniform: no barrier and no warp collective is skipped
+        }
+        let seg = b / groups;
+        let grp = b - seg * groups;
+        let base_row = grp * MMA_ROWS;
+        let rope = rope_dims as usize;
+        let lat = latent as usize;
+        let width = rope + lat;
+        let lo = seg * seg_keys as usize;
+        // The group's widest limit: limits rise with the row, and a row past
+        // `q_rows` is not a row at all, so the last live row carries it.
+        let last_row = (base_row + MMA_ROWS - 1).min(rows - 1);
+        let lim_max = causal_limit(n_keys_buf, dst_rows, last_row, n_heads, m);
+        if lo >= lim_max {
+            if tid < MMA_ROWS && base_row + tid < rows {
+                let idx = (base_row + tid) * n_seg + seg;
+                // SAFETY: idx < q_rows * segs, so both slots are inside
+                // part_ms (launch contract).
+                unsafe {
+                    *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                    *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+                }
+            }
+            return; // block-uniform, and no key row of this segment is read
+        }
+        let hi_max = (lo + seg_keys as usize).min(lim_max);
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation; every access below is bounded by the array's length
+        // and ordered by `sync_threads`.
+        let (qs, kt, klog, kw, vms_sh, lim_sh) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KT),
+                SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                SharedArray::as_raw_mut_ptr(&raw mut KW),
+                SharedArray::as_raw_mut_ptr(&raw mut VMS),
+                SharedArray::as_raw_mut_ptr(&raw mut LIM),
+            )
+        };
+        // The cache row pair-wise. `width` and `rope` are even and the
+        // buffer is device-allocated, so every u32 read below is aligned.
+        let kvw = kv.as_ptr().cast::<u32>();
+
+        // Each head's causal limit. A row past `q_rows` gets limit 0 and a
+        // zero query row: its logits are `−inf` at every key.
+        if tid < MMA_ROWS {
+            let row = base_row + tid;
+            let l = if row < rows {
+                causal_limit(n_keys_buf, dst_rows, row, n_heads, m)
+            } else {
+                0
+            };
+            // SAFETY: tid < MMA_ROWS bounds the store.
+            unsafe {
+                *lim_sh.add(tid) = l as u32;
+            }
+        }
+        // The group's query rows, f32 pairs rounded to one f16 pair each.
+        let qw = width / 2;
+        let mut f = tid;
+        while f < MMA_ROWS * qw {
+            let h = f / qw;
+            let w = f - h * qw;
+            let row = base_row + h;
+            // SAFETY: row is inside q's rows when live and 2 * w + 1 < width
+            // bound the loads by the launch contract; h < MMA_ROWS and
+            // w < qw <= MMA_QROW_W bound the store.
+            unsafe {
+                let packed = if row < rows {
+                    let a = f32_to_f16_bits(*q.get_unchecked(row * width + 2 * w)) as u32;
+                    let c = f32_to_f16_bits(*q.get_unchecked(row * width + 2 * w + 1)) as u32;
+                    a | (c << 16)
+                } else {
+                    0
+                };
+                *qs.add(h * MMA_QROW_W + w) = packed;
+            }
+            f += MMA_BLOCK;
+        }
+
+        let lane = warp::lane_id() as usize;
+        let wid = tid / 32;
+        // This warp's eight keys inside a tile, its four heads in the
+        // softmax, and this thread's four latent dims in the V loop.
+        let key0 = wid * MMA_NTILE;
+        let head0 = wid * (MMA_ROWS / MMA_WARPS);
+        let d0 = tid * (LATENT / MMA_BLOCK);
+        // `ldmatrix` lane roles: A addresses row `lane % 16` at dim half
+        // `lane / 16`; B addresses key `lane % 8` of the warp's eight at dim
+        // octet `lane / 8`.
+        let arow = lane % MMA_ROWS;
+        let ahalf = lane / MMA_ROWS;
+        let bkey = lane % MMA_NTILE;
+        let boct = lane / MMA_NTILE;
+
+        let mut mx = [f32::NEG_INFINITY; MMA_ROWS / MMA_WARPS];
+        let mut ss = [0.0f32; MMA_ROWS / MMA_WARPS];
+        let mut r = [[0.0f32; LATENT / MMA_BLOCK]; MMA_ROWS];
+
+        let mut blk = lo;
+        while blk < hi_max {
+            // ---- QK: S = Q · Kᵀ for all sixteen heads, on the tensor cores
+            let mut c = [0.0f32; 4];
+            let mut base = 0usize;
+            while base < width {
+                let n = if base + MMA_CHUNK <= width {
+                    MMA_CHUNK
+                } else {
+                    width - base
+                };
+                // The previous chunk's fragment reads are done, and so are
+                // the previous tile's weight reads.
+                thread::sync_threads();
+                let cw = n / 2;
+                let mut f = tid;
+                while f < MMA_KEYS * cw {
+                    let rr = f / cw;
+                    let ww = f - rr * cw;
+                    let key = blk + rr;
+                    // SAFETY: a row is read only while key < hi_max <=
+                    // dst_rows, and 2 * (base / 2 + ww) < width, so the load
+                    // is inside that cache row (launch contract); rr <
+                    // MMA_KEYS and ww < cw <= MMA_KROW_W bound the store.
+                    unsafe {
+                        let v = if key < hi_max {
+                            *kvw.add((key * width + base) / 2 + ww)
+                        } else {
+                            0
+                        };
+                        *kt.add(rr * MMA_KROW_W + ww) = v;
+                    }
+                    f += MMA_BLOCK;
+                }
+                thread::sync_threads();
+                // Two k-steps per B load: `ldmatrix.x4` returns four 8x8
+                // tiles, which is thirty-two dims of this warp's eight keys.
+                // The host pins `width` to a multiple of `MMA_CHUNK` and
+                // `MMA_CHUNK` to a multiple of `2 * MMA_K`, so this walk
+                // covers the chunk exactly.
+                let mut d = 0usize;
+                while d + 2 * MMA_K <= n {
+                    // SAFETY: every lane of the warp reaches this call with
+                    // the same qualifiers and an address inside its staged
+                    // tile, and the barrier above orders the staging writes
+                    // before the loads.
+                    unsafe {
+                        let bp = kt.add((key0 + bkey) * MMA_KROW_W + d / 2 + boct * 4);
+                        let bf = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                            bp.cast_const().cast::<u8>(),
+                        ));
+                        let ap0 = qs.add(arow * MMA_QROW_W + (base + d) / 2 + ahalf * (MMA_K / 4));
+                        let af0 = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                            ap0.cast_const().cast::<u8>(),
+                        ));
+                        c = mma_m16n8k16_f32_f16(c, af0, [bf[0], bf[1]]);
+                        let ap1 = ap0.add(MMA_K / 2);
+                        let af1 = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                            ap1.cast_const().cast::<u8>(),
+                        ));
+                        c = mma_m16n8k16_f32_f16(c, af1, [bf[2], bf[3]]);
+                    }
+                    d += 2 * MMA_K;
+                }
+                base += MMA_CHUNK;
+            }
+            // The accumulator's four values are heads `group` and
+            // `group + 8` at keys `key0 + 2 * thread + {0, 1}`. A key at or
+            // past its head's limit is `−inf`, which also covers every key
+            // at or past `hi_max` (their tile rows were staged zero).
+            let g = lane / 4;
+            let t4 = lane % 4;
+            let mut j = 0usize;
+            #[unroll]
+            while j < 4 {
+                let head = g + if j >= 2 { MMA_ROWS / 2 } else { 0 };
+                let key = key0 + 2 * t4 + (j & 1);
+                // SAFETY: head < MMA_ROWS and key < MMA_KEYS bound both
+                // slots, and one lane of one warp writes each.
+                unsafe {
+                    let sv = if blk + key < *lim_sh.add(head) as usize {
+                        scale * c[j]
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+                    *klog.add(head * MMA_KEYS + key) = sv;
+                }
+                j += 1;
+            }
+            thread::sync_threads();
+
+            // ---- online softmax: warp `wid` owns heads `head0 ..  + 4`,
+            // its thirty-two lanes the tile's thirty-two keys.
+            let mut hh = 0usize;
+            #[unroll]
+            while hh < MMA_ROWS / MMA_WARPS {
+                let head = head0 + hh;
+                // SAFETY: head < MMA_ROWS and lane < MMA_KEYS bound the
+                // slots, and one lane writes each.
+                unsafe {
+                    let sv = *klog.add(head * MMA_KEYS + lane);
+                    let smax = warp::reduce_max_f32(sv);
+                    // FlashMS update: s is rescaled here, the V partials
+                    // just before this tile's accumulation (the CPU
+                    // oracle's order). A first bump scales by 0.0 — the
+                    // partials are still zero, so the reset and the scale
+                    // are the same value.
+                    let mut vms = 1.0f32;
+                    if smax > mx[hh] {
+                        vms = if mx[hh] > f32::NEG_INFINITY {
+                            dev_exp(mx[hh] - smax)
+                        } else {
+                            0.0
+                        };
+                        ss[hh] *= vms;
+                        mx[hh] = smax;
+                    }
+                    let w = if sv == f32::NEG_INFINITY {
+                        0.0
+                    } else {
+                        dev_exp(sv - mx[hh])
+                    };
+                    ss[hh] += warp::reduce_sum_f32(w);
+                    *kw.add(head * MMA_KEYS + lane) = w;
+                    if lane == 0 {
+                        *vms_sh.add(head) = vms;
+                    }
+                }
+                hh += 1;
+            }
+            thread::sync_threads();
+
+            // ---- V accumulation: this thread's four latent dims for every
+            // head, the tile's keys ascending, one partial per head. The
+            // key row's tail is read once and takes one fused multiply-add
+            // into each of the sixteen accumulators.
+            let mut h = 0usize;
+            #[unroll]
+            while h < MMA_ROWS {
+                // SAFETY: h < MMA_ROWS bounds the read, and VMS holds this
+                // tile's rescale (published before the barrier above).
+                unsafe {
+                    let s = *vms_sh.add(h);
+                    r[h][0] *= s;
+                    r[h][1] *= s;
+                    r[h][2] *= s;
+                    r[h][3] *= s;
+                }
+                h += 1;
+            }
+            let mut l = 0usize;
+            while l < MMA_KEYS {
+                if blk + l < hi_max {
+                    // SAFETY: blk + l < hi_max <= dst_rows and rope + d0 + 3
+                    // < width, so both word loads are inside that cache row
+                    // (launch contract); every shared index below is inside
+                    // KW.
+                    unsafe {
+                        let bw = ((blk + l) * width + rope + d0) / 2;
+                        let (v0, v1) = cvt_f32x2_f16x2(*kvw.add(bw));
+                        let (v2, v3) = cvt_f32x2_f16x2(*kvw.add(bw + 1));
+                        let mut h = 0usize;
+                        #[unroll]
+                        while h < MMA_ROWS {
+                            let wgt = *kw.add(h * MMA_KEYS + l);
+                            r[h][0] = f32::mul_add(wgt, v0, r[h][0]);
+                            r[h][1] = f32::mul_add(wgt, v1, r[h][1]);
+                            r[h][2] = f32::mul_add(wgt, v2, r[h][2]);
+                            r[h][3] = f32::mul_add(wgt, v3, r[h][3]);
+                            h += 1;
+                        }
+                    }
+                }
+                l += 1;
+            }
+            blk += MMA_KEYS;
+        }
+
+        let mut h = 0usize;
+        #[unroll]
+        while h < MMA_ROWS {
+            let row = base_row + h;
+            if row < rows {
+                // SAFETY: row < q_rows and d0 + 3 < LATENT = latent
+                // (host-validated), so all four stores are inside part_v.
+                unsafe {
+                    let o = (row * n_seg + seg) * lat + d0;
+                    *part_v.get_unchecked_mut(o) = r[h][0];
+                    *part_v.get_unchecked_mut(o + 1) = r[h][1];
+                    *part_v.get_unchecked_mut(o + 2) = r[h][2];
+                    *part_v.get_unchecked_mut(o + 3) = r[h][3];
+                }
+            }
+            h += 1;
+        }
+        if lane == 0 {
+            let mut hh = 0usize;
+            #[unroll]
+            while hh < MMA_ROWS / MMA_WARPS {
+                let row = base_row + head0 + hh;
+                if row < rows {
+                    let idx = row * n_seg + seg;
+                    // SAFETY: idx < q_rows * segs, so both slots are inside
+                    // part_ms; `mx` and `ss` are this warp's heads' state.
+                    unsafe {
+                        *part_ms.get_unchecked_mut(2 * idx) = mx[hh];
+                        *part_ms.get_unchecked_mut(2 * idx + 1) = ss[hh];
+                    }
+                }
+                hh += 1;
             }
         }
     }
@@ -2065,6 +2549,94 @@ impl FlashKernels {
             0,
         ))?;
         self.module.flash_latent_seg(
+            stream,
+            &prep,
+            q,
+            kv.buf(),
+            n_keys_buf,
+            scale,
+            m as u32,
+            n_heads as u32,
+            q_rows as u32,
+            rope_dims as u32,
+            latent as u32,
+            kv.rows() as u32,
+            segs as u32,
+            seg_keys() as u32,
+            part_v,
+            part_ms,
+        )?;
+        Ok(())
+    }
+
+    /// The tensor-core segment pass —
+    /// [`FlashKernels::enqueue_flash_latent_seg`]'s twin, writing the same
+    /// partials from a grid of [`mma_groups`]`(q_rows) * `[`segments_for`]
+    /// `(kv.rows())` blocks of [`MMA_BLOCK`] threads: a block carries
+    /// [`MMA_ROWS`] query rows and puts their `Q·Kᵀ` on `mma.sync`. The
+    /// merge that follows is the same one, and the choice between the two
+    /// passes is the caller's — [`flash_mma`] is where the engine makes it.
+    ///
+    /// The kernel's shared tiles are sized for a [`MMA_WIDTH`] row and its
+    /// `k` walk assumes the width divides by [`MMA_CHUNK`], so any other
+    /// width is refused here rather than read past a tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_flash_latent_mma(
+        &self,
+        stream: &CudaStream,
+        q: &DeviceBuffer<f32>,
+        kv: &DeviceTensor<u16>,
+        n_keys_buf: &DeviceBuffer<u32>,
+        scale: f32,
+        m: usize,
+        n_heads: usize,
+        rope_dims: usize,
+        latent: usize,
+        part_v: &mut DeviceBuffer<f32>,
+        part_ms: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let segs = segments_for(kv.rows());
+        let q_rows = check_flash(
+            "enqueue_flash_latent_mma",
+            q.len(),
+            kv,
+            n_keys_buf.len(),
+            m,
+            n_heads,
+            rope_dims,
+            latent,
+            None,
+        )?;
+        check_partials(
+            "enqueue_flash_latent_mma",
+            part_v.len(),
+            part_ms.len(),
+            q_rows,
+            segs,
+            latent,
+        )?;
+        if rope_dims + latent != MMA_WIDTH {
+            return Err(format!(
+                "enqueue_flash_latent_mma: rope_dims + latent = {} — this kernel's staged \
+                 tiles are sized for {MMA_WIDTH}",
+                rope_dims + latent
+            )
+            .into());
+        }
+        if !seg_keys().is_multiple_of(MMA_KEYS) {
+            return Err(format!(
+                "enqueue_flash_latent_mma: seg_keys {} is not a multiple of the {MMA_KEYS}-key \
+                 tile",
+                seg_keys()
+            )
+            .into());
+        }
+        let prep = self.module.prepare_flash_latent_mma(LaunchConfig1D::new(
+            (mma_groups(q_rows) * segs) as u32,
+            MMA_BLOCK as u32,
+            0,
+        ))?;
+        self.module.flash_latent_mma(
             stream,
             &prep,
             q,

@@ -34,8 +34,9 @@
 //!
 //! One shape check joins them, read off the device code this binary carries
 //! rather than off a clock: every flash entry — the single-block
-//! `flash_latent`, the split pair `flash_latent_seg`/`flash_merge`, and both
-//! appends — must compile with no local depot.
+//! `flash_latent`, the split pair `flash_latent_seg`/`flash_merge`, the
+//! tensor-core segment pass `flash_latent_mma`, and both appends — must
+//! compile with no local depot.
 //! A per-thread accumulator array the backend cannot hold in registers is
 //! spilled to local memory, and every accumulate becomes a dependent local
 //! round trip — a defect that changes no output and no band, so nothing else
@@ -49,7 +50,8 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::flash::{
-    FlashKernels, f32_to_f16_bits, partials_ms_len, partials_v_len, seg_keys, segments_for,
+    FlashKernels, f32_to_f16_bits, mma_groups, partials_ms_len, partials_v_len, seg_keys,
+    segments_for,
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu};
@@ -72,6 +74,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The flash arithmetic is not exact by construction (exp, two reduction
     // trees): this package's asserted band. The conversion op asserts bits.
     const FLASH_BAND: f32 = 1e-5;
+    // The tensor-core pass rounds the query rows to f16 and accumulates the
+    // logits from f16 products, so it is a different arithmetic class from
+    // the f32 scalar passes and cannot sit inside their band. Its own band,
+    // twice the largest relative error measured over every depth case
+    // against the f64 reference and against the one-row pass.
+    // PIN(2026-09-22): 8.49e-4 was the largest over every depth case at both
+    // segment sizes, against the f64 reference and against the one-row pass
+    // alike; this is twice that. The class is f16 query rows and f16
+    // products, which is ik's CUDA flash attention's class.
+    const FLASH_MMA_BAND: f32 = 1.7e-3;
     const WIDTH: usize = 576; // rope 64 + latent 512 (checked against the dump)
     const ROPE: usize = 64;
     const LATENT: usize = 512;
@@ -101,7 +113,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     depth_cases(
-        &gpu, &flash, scale, WIDTH, ROPE, LATENT, N_HEADS, DEPTH_ROWS, FLASH_BAND, &mut ok,
+        &gpu,
+        &flash,
+        scale,
+        WIDTH,
+        ROPE,
+        LATENT,
+        N_HEADS,
+        DEPTH_ROWS,
+        FLASH_BAND,
+        FLASH_MMA_BAND,
+        &mut ok,
     )?;
     edge_values(&flash, stream, &mut ok)?;
     no_local_depot(&mut ok)?;
@@ -115,7 +137,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          the single-block flash within {FLASH_BAND} of the f64 reference on real layers, \
          both paths and their distance inside it on the depth and segment edges; reruns \
          bit-identical; padded NaN rows never read; one captured graph replays \
-         bit-identically at every key count; the flash kernels compile with no local depot"
+         bit-identically at every key count; the tensor-core segment pass inside its own \
+         {FLASH_MMA_BAND} band against both the reference and the one-row pass; the flash \
+         kernels compile with no local depot"
     );
     Ok(())
 }
@@ -134,6 +158,7 @@ fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     for name in [
         "flash_latent",
         "flash_latent_seg",
+        "flash_latent_mma",
         "flash_merge",
         "kv_append",
         "kv_append_pos_buf",
@@ -500,6 +525,7 @@ fn depth_cases(
     n_heads: usize,
     depth_rows: usize,
     band: f32,
+    mma_band: f32,
     ok: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stream = gpu.stream();
@@ -541,6 +567,12 @@ fn depth_cases(
     // bit for bit on the eager run. A grid derived from the key count would
     // pass every other arm here and fail this one.
     let mut n_keys_dev = DeviceBuffer::from_host(stream, &[1u32])?;
+    // The tensor-core pass writes the same partials from its own buffers, so
+    // its distance to the one-row pass is a comparison of two full results
+    // and not of a shared scratch.
+    let mut part_vm = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_heads, depth_rows))?;
+    let mut part_msm = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_heads, depth_rows))?;
+    let mut y_m = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
     let graph = gpu.capture(|_s| {
         flash
             .enqueue_flash_latent_split(
@@ -560,6 +592,36 @@ fn depth_cases(
             .map(|_| ())
     })?;
     let graph_nodes = graph.node_count();
+    // The tensor-core pass's own graph, captured at the same one live
+    // segment: its grid comes from the cache height and the head count, so a
+    // replay must follow `n_keys_buf` across every segment boundary too.
+    let graph_m = gpu.capture(|_s| {
+        flash.enqueue_flash_latent_mma(
+            stream,
+            &q_dev,
+            &cache,
+            &n_keys_dev,
+            scale,
+            1,
+            n_heads,
+            rope,
+            latent,
+            &mut part_vm,
+            &mut part_msm,
+        )?;
+        flash.enqueue_flash_merge(
+            stream,
+            &n_keys_dev,
+            depth_rows,
+            1,
+            n_heads,
+            latent,
+            &part_vm,
+            &part_msm,
+            &mut y_m,
+        )
+    })?;
+    let graph_m_nodes = graph_m.node_count();
     for n_keys in cases {
         n_keys_dev.copy_from_host(stream, &[n_keys as u32])?;
         let run = |y: &mut DeviceBuffer<f32>,
@@ -623,6 +685,61 @@ fn depth_cases(
         stream.synchronize()?;
         let y_graph = y_dev.to_host_vec(stream)?;
         let replay_same = bits_equal(&y1, &y_graph);
+        // The tensor-core pass on the same inputs, through the same merge.
+        // Its query rows and products are f16, so it carries its own band
+        // (`mma_band`) against the f64 reference and against the one-row
+        // pass; reruns and graph replays of it are still bit-identical.
+        let run_m = |y: &mut DeviceBuffer<f32>,
+                     pv: &mut DeviceBuffer<f32>,
+                     pm: &mut DeviceBuffer<f32>|
+         -> Result<(), Box<dyn std::error::Error>> {
+            flash.enqueue_flash_latent_mma(
+                stream,
+                &q_dev,
+                &cache,
+                &n_keys_dev,
+                scale,
+                1,
+                n_heads,
+                rope,
+                latent,
+                pv,
+                pm,
+            )?;
+            flash.enqueue_flash_merge(
+                stream,
+                &n_keys_dev,
+                depth_rows,
+                1,
+                n_heads,
+                latent,
+                pv,
+                pm,
+                y,
+            )?;
+            stream.synchronize()?;
+            Ok(())
+        };
+        run_m(&mut y_m, &mut part_vm, &mut part_msm)?;
+        let m1 = y_m.to_host_vec(stream)?;
+        run_m(&mut y_m, &mut part_vm, &mut part_msm)?;
+        let m2 = y_m.to_host_vec(stream)?;
+        let rerun_same_m = bits_equal(&m1, &m2);
+        let rel_m = max_rel_err(&m1, &y_ref)?;
+        let cross_m = max_rel_err(&m1, &y1)?;
+        graph_m.launch(stream)?;
+        stream.synchronize()?;
+        let m_graph = y_m.to_host_vec(stream)?;
+        let replay_same_m = bits_equal(&m1, &m_graph);
+        let pass_m = rel_m <= mma_band && cross_m <= mma_band && rerun_same_m && replay_same_m;
+        println!(
+            "shape op=flash_latent_mma_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={} band={mma_band:.3e} max_rel_err={rel_m:.3e} mma_vs_seg={cross_m:.3e} bit_identical_rerun={rerun_same_m} graph_nodes={graph_m_nodes} replay_bit_identical={replay_same_m} {}",
+            mma_groups(n_heads),
+            verdict(pass_m)
+        );
+        if !pass_m {
+            *ok = false;
+        }
         let pass = rel <= band && one_rel <= band && cross_rel <= band && rerun_same && replay_same;
         println!(
             "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} live_segs={} nan_pad_rows={} max_rel_err={rel:.3e} single_launch_rel={one_rel:.3e} split_vs_single={cross_rel:.3e} bit_identical_rerun={rerun_same} graph_nodes={graph_nodes} replay_bit_identical={replay_same} {}",
