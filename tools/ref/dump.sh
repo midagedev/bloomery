@@ -14,8 +14,19 @@
 # CUDA is switched off, not merely unused: with the CUDA backend registered, ik splits
 # the graph (measured 2026-09-19: 351 splits with -ngl 0, 1 split with CUDA hidden) and
 # the reference would then be a GPU reduction order that our CPU rounds cannot match.
+#
+# BLOOMERY_REF_BACKEND=cuda writes the GPU engine's oracle instead: the same dumper, the
+# same tokens, every layer offloaded (-ngl 99) on the card the box env pins, into
+# $BLOOMERY_DATA/ref_cuda/. The CPU set is never touched by that run. The GPU kernels use
+# q8_1 activations like ik's CUDA path, so their band is against this set, not the CPU one.
 set -euo pipefail
 BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
+case $BACKEND in
+  cpu)  SET=ref;      NGL=0;  HIDE_CUDA=1 ;;
+  cuda) SET=ref_cuda; NGL=99; HIDE_CUDA=0 ;;
+  *) echo "dump.sh: BLOOMERY_REF_BACKEND must be cpu or cuda, got '$BACKEND'" >&2; exit 2 ;;
+esac
 MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${BLOOMERY_REF_TOKENS:-100000,549,6077,280,7239,317}
 BIN="$BLOOMERY_DATA/bin/dump_ref"
@@ -25,8 +36,8 @@ BIN="$BLOOMERY_DATA/bin/dump_ref"
 # that a dumper killed halfway left a half-set with nothing to compare it against, and on
 # 2026-09-19 that is exactly what happened (a round ran the binary under gdb; every
 # breakpoint killed it mid-write). A dump that does not finish must cost nothing.
-REF="$BLOOMERY_DATA/ref"
-STAGE="$BLOOMERY_DATA/ref.staging"
+REF="$BLOOMERY_DATA/$SET"
+STAGE="$BLOOMERY_DATA/$SET.staging"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
@@ -36,17 +47,18 @@ mkdir -p "$STAGE"
 # Not $HOME/ik_llama.cpp: the dump runs as root and the tree is the serving user's.
 BUILD=$(git -C "${IK:-/home/user/ik_llama.cpp}" rev-parse --short HEAD 2>/dev/null || echo unknown)
 
+if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" \
-  CUDA_VISIBLE_DEVICES="" "$BIN" -m "$MODEL" --tokens "$TOKENS" -ngl 0 -c 512 -t 32
+  "$BIN" -m "$MODEL" --tokens "$TOKENS" -ngl "$NGL" -c 512 -t 32
 
 # The trailer is the dumper's completion proof; without it the staged set is not installed.
 grep -q '^# complete' "$STAGE/MANIFEST.tsv" || {
     echo "dump.sh: the staged set has no completion trailer — not installing it" >&2
     exit 1
 }
-rm -rf "$BLOOMERY_DATA/ref.old"
-if [ -d "$REF" ]; then mv "$REF" "$BLOOMERY_DATA/ref.old"; fi
+rm -rf "$REF.old"
+if [ -d "$REF" ]; then mv "$REF" "$REF.old"; fi
 mv "$STAGE" "$REF"
-rm -rf "$BLOOMERY_DATA/ref.old"
+rm -rf "$REF.old"
 grep -c '^tensor' "$REF/MANIFEST.tsv" | xargs echo "reference tensors:"
-echo "build: $BUILD"
+echo "build: $BUILD  backend: $BACKEND  set: $REF"

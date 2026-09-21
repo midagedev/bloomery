@@ -57,6 +57,8 @@
 
 ## 미정
 
+- **두 오라클 사이의 거리 — 측정(2026-09-21, 같은 ik 빌드, 같은 6토큰).** ik의 CPU 참조와 CUDA 참조는 max|Δ|/max|ref|로 `l_out-0` 5.0e-3, `l_out-1` 1.4e-2, `l_out-13` 6.4e-3, `l_out-26` 1.2e-2, `result_output` 2.9e-2만큼 다르고 마지막 행 argmax는 같다(8913). 블록 밴드를 핀할 때의 눈금이다: 같은 엔진의 두 백엔드가 이만큼 벌어지니, 우리 GPU 경로가 ref_cuda에서 1e-2 자릿수로 떨어져 있는 것은 결함의 증거가 아니다 — 밴드는 첫 측정에서 핀하되(결정 3) 이 표보다 좁을 것을 기대하지 않는다.
+
 - ~~ik의 3090 디코드 tok/s(미측정, 첫 임대의 첫 행).~~ 측정(2026-09-21 아침, 임대·증인, llm.service inactive, 3090 UUID 고정, n=3): `llama-bench -ngl 99 -mla 3 -fa 1 -fmoe 1`에서 tg96 **216.6**, tg96@pp1024 **204.6**, tg96@pp4096 **189.7 tok/s**(바퀴 간 퍼짐 0.3–0.8%). 플래그는 CPU 최속 조합에서 `-rtr 1`만 뺀 것이고 GPU 플래그 스윕은 하지 않았다 — "이 플래그에서"로 읽는다. 유도 천장 700의 31%: 런치 수가 1차 병목이라는 위 절의 순서를 지지한다.
 - ~~cuda-oxide에 CUDA 그래프 상당의 수단이 있는가(위).~~ ~~확인(2026-09-21 아침): 반쪽만 있다 — cuda-bindings 0.3.1에는 `cuGraphInstantiate`·`cuGraphLaunch`·`cuGraphExecDestroy`가 없다.~~ 정정(같은 날 낮): **바인딩은 전부 있다.** cuda-bindings는 build.rs의 bindgen이 `^cu.*`를 `OUT_DIR`에 생성해 `dlopen`으로 푸는 구조라 크레이트 소스 grep에는 안 잡혔다(생성물에서 `cuGraph*` 확인). 없는 것은 **안전 래퍼**다 — cuda-core 0.3.1의 `begin_capture`/`end_capture`는 구식 `runtime::Stream`에만 있고 런처가 받는 `simt::CudaStream`에는 없으며, 인스턴스화·런치·Drop 래퍼는 어느 층에도 없다. bloomery는 `crates/gpu/src/graph.rs`에 그 래퍼를 두고(`Graph::capture`/`launch`/`node_count`), 이것이 cutile-rs 기여 후보다(장부 #3). 전제 하나: 캡처는 null 스트림에서 불법이라 `Gpu`가 `new_stream()`(비블로킹)을 소유하고 모든 런치가 그 위에서 돈다 — 스파이크의 `default_stream()`은 null이었다.
 - **ik는 이 모델의 디코드에서 CUDA 그래프를 쓴다 — 측정.** 같은 임대, 3090, 번갈아 세 바퀴: `GGML_CUDA_DISABLE_GRAPHS=1`에서 tg96 196.2, 그래프 켜서 216.9 tok/s(**+10.6%**). 코드 독해(`ggml-cuda.cu:4493`, `MUL_MAT_ID`의 ids `ne[0] != 1`이면 그래프 비활성)는 이 경로에서 틀렸다 — `-fmoe`가 그 노드를 `MOE_FUSED_UP_GATE`로 접기 때문으로 보이나 이것은 추측이다. 결론은 둘: 그래프 재생은 우리에게 선택이 아니라 ik와 같은 출발선이고, 그래프를 쓰는 ik도 천장의 31%에 있으니 런치 수 자체(융합)가 그 다음 축이다.
@@ -76,7 +78,7 @@
 | P4 | 원소별·리덕션 | 임베딩 행 디퀀트, rms_norm, rope(YaRN 캐시는 호스트 계산·업로드), swiglu, 잔차, 가중합, argmax | 블록 조립 |
 | P5 | 어텐션 | KV 추가(F32→F16), latent flash(온라인 softmax, 디코드 M=1 먼저) | 블록 조립 |
 | P6 | 라우터 | softmax + top-6 + 정규화, 전문가 오프셋 표 | MoE 블록 |
-| P7 | CUDA 오라클 | dump.sh의 `-ngl 99` 변형, ref_cuda, 블록·종단 게이트 하네스 | 블록 이후의 모든 판정 |
+| P7 | CUDA 오라클 | ~~dump.sh의 `-ngl 99` 변형, ref_cuda~~ **ref_cuda 완료(2026-09-21, 리드)**: `just dump-ref-cuda`(`BLOOMERY_REF_BACKEND=cuda`), ik c10fbbcc, 1155 텐서, 이름 집합이 CPU 참조와 동일(1047). 남은 것: 블록·종단 게이트 하네스 | 블록 이후의 모든 판정 |
 | P8 | 조립(리드) | `GpuModel::step`, 블록 0 → MoE 블록 → 전체, 밴드 핀 | 측정 |
 
 P1–P3과 P7은 서로 독립이라 P0 직후 병렬로 나간다. P4–P6은 P0의 버퍼 계약만 있으면 된다. 커널 트랙은 3090에서 정확성 실행을 하지만 측정은 하지 않는다 — `measure.sh`(기계 전역 임대, GPU 유휴 대기, 증인)는 메인 단독이고 CPU 측정과 직렬이다.

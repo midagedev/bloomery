@@ -115,6 +115,10 @@ build-ref-dump:
 dump-ref:
     ./tools/box.sh 'bash tools/ref/dump.sh'
 
+# GPU 엔진의 오라클: 같은 계측기를 -ngl 99로, $BLOOMERY_DATA/ref_cuda/에. CPU 참조는 건드리지 않는다.
+dump-ref-cuda:
+    ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
+
 # 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다.
 gate-ops:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test ops -- --ignored --nocapture'
