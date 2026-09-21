@@ -13,3 +13,7 @@ cuda-device.workspace = true
 cuda-host.workspace = true
 # Shared host-side runtime, published from NVlabs/cutile-rs.
 cuda-core.workspace = true
+# Dependency direction is gpu -> model/gguf only (docs/gpu-design.md decision 1):
+# metadata readers and `Derived` are reused, and model never learns about gpu.
+bloomery-model = { path = "../model" }
+bloomery-gguf = { path = "../gguf" }

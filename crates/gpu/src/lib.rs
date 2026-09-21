@@ -15,6 +15,14 @@ use cuda_device::{
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
+/// Compile-time probe of the dependency direction: the device-bundle crate
+/// reads model metadata through `bloomery-model`. Removed once `GpuModel`
+/// uses it for real.
+pub fn mla_width(gguf: &gguf::Gguf) -> Result<usize, GpuError> {
+    let p = model::attn::MlaParams::read(gguf, 0)?;
+    Ok(p.rope_dims + p.latent)
+}
+
 /// Host-side failure: context creation, module loading, device allocation,
 /// launch, or copy-back.
 pub type GpuError = Box<dyn std::error::Error>;
