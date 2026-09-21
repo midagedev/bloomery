@@ -156,6 +156,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          graph submit {graph_submit_us:.2} us/step (incl. device {graph_total_us:.2})"
     );
 
+    // Node-gap probe: one graph of N nodes (the two-kernel pair repeated),
+    // replayed with a synchronize per replay, so us/node is what a step of N
+    // op-kernels costs on the device once host submission is gone. Two row
+    // counts: at 8 rows the gemv body is near-empty and the figure reads as
+    // the per-node gap; at 2048 rows it carries a real attn-sized body.
+    // Design figures, same standing as the submission probe above.
+    for rows in [8usize, 2048] {
+        let w_probe = DeviceTensor::upload(stream, &w_host[..rows * 288], rows, 288)?;
+        let mut y_probe = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
+        for pairs in [50usize, 150, 350] {
+            let g = gpu.capture(|_s| {
+                for _ in 0..pairs {
+                    gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+                    gpu.enqueue_gemv_q4k(&w_probe, &act, &mut y_probe)?;
+                }
+                Ok(())
+            })?;
+            for _ in 0..5 {
+                g.launch(stream)?;
+            }
+            stream.synchronize()?;
+            let reps = 50u32;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                g.launch(stream)?;
+                stream.synchronize()?;
+            }
+            let replay_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+            println!(
+                "node-gap probe rows={rows} nodes={}: replay+sync {replay_us:.1} us = {:.2} us/node",
+                g.node_count(),
+                replay_us / g.node_count() as f64
+            );
+        }
+    }
+
     // Bare launch+sync and full-call figures, kept from the packaging spike.
     let (n, m) = (8usize, 1usize);
     let launch_us = gpu.probe_q4k_launch_us(&w_host[..n * 288], &x_m1, n, m, 1000)?;
