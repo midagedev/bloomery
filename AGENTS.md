@@ -28,8 +28,9 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
 ## Commands
 
     just check        # cargo check --workspace --all-targets — also the step that
-                      # refreshes Cargo.lock after a dependency edit (measured:
-                      # `cargo oxide build` does not rewrite the lock)
+                      # refreshes Cargo.lock after a dependency edit — `cargo oxide
+                      # build` does not rewrite the lock (lock md5 unchanged
+                      # across oxide builds in the gates-v2 round)
     just lint         # cargo clippy --workspace; contract is 0 errors
     just fmt          # cargo fmt --all
     just build-gpu    # cargo oxide build --arch sm_86 -- -p q3k-gemv
