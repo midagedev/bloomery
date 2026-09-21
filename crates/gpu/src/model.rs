@@ -14,11 +14,14 @@
 //! (both live in the CPU chain: the `kvr`/flash-row concats and the
 //! per-head `wv_b`/q_nope2 legs of `attn.rs`), so this file carries one
 //! small `#[cuda_module]` of its own — decision 6's per-file module rule:
-//! a pair-table gather. Everything else runs the gated kernels verbatim;
-//! the per-head sites ride the gemvs' m-column geometry (heads as
-//! activation columns) with gather-built inputs and gather-extracted
-//! outputs, which keeps the per-head arithmetic inside kernels that
-//! already carry gates.
+//! a pair-table gather and two per-head gemv wrappers. The wrappers give
+//! the q_nope2 (derived Q8_0) and wv_b (Q3_K) sites one launch each: one
+//! warp per output row, the row's head selecting both the activation
+//! slice it reads (an x base or a column of the quantized activation)
+//! and the output slot it writes, m = 1 through the gated row bodies
+//! (`q8f32::q8_0_lane_partials`, `cores::q3k_row_dot`) — so every dot
+//! equals the plain gemv's on the same row and column bit for bit.
+//! Everything else runs the gated kernels verbatim.
 
 use crate::q5::Q8Blocks32;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -43,6 +46,9 @@ pub fn mla_width(gguf: &gguf::Gguf) -> Result<usize, GpuError> {
 #[cuda_module]
 mod step_kernels {
     use super::*;
+    use crate::cores::q3k_row_dot;
+    use crate::q8f32::q8_0_lane_partials;
+    use cuda_device::warp;
 
     /// `y[dst_idx[i]] = x[src_idx[i]]` for `i < n` — the f32 concat/extract
     /// the step needs and no P4 op provides. Both tables are load-time
@@ -81,6 +87,143 @@ mod step_kernels {
             // SAFETY: both indices guarded against their buffers' lengths.
             unsafe {
                 *y.get_unchecked_mut(d) = *x.get_unchecked(s);
+            }
+        }
+    }
+
+    /// Q8_0 gemv over per-head activation slices: launch row `r` belongs to
+    /// head `h = r / rows_per_head` and output slot `r % rows_per_head` of
+    /// that head; it dots weight row `r` of the derived planes against
+    /// `x[h*x_head_stride .. +k]` (m = 1 through the gated row body, the
+    /// `q8_0_gemv` skeleton with one warp per row, 8 rows per 256-thread
+    /// block), lane 0 storing `y[h*y_head_stride + y_off + r %
+    /// rows_per_head]`. `n_rows` must be `n_heads * rows_per_head`; every
+    /// store is disjoint because each (head, slot) pair belongs to exactly
+    /// one row.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            32 * d.len() >= n_rows * k,
+            x.len() >= (n_heads - 1) * x_head_stride + k,
+            y.len() >= (n_heads - 1) * y_head_stride + y_off + rows_per_head
+        )
+    )]
+    pub fn q8_0_gemv_heads(
+        qs: &[u32],
+        d: &[f32],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        n_heads: u32,
+        rows_per_head: u32,
+        x_head_stride: u32,
+        y_head_stride: u32,
+        y_off: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let h = row / rows_per_head as usize;
+        // The launch contract cannot bind n_rows to n_heads*rows_per_head
+        // (no division in its grammar); this guard keeps a violated
+        // divisibility from writing outside the last head's y span.
+        if h >= n_heads as usize {
+            return;
+        }
+        let j = row % rows_per_head as usize;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: the launch contract bounds the row's x window the way
+        // `q8_0_lane_partials` demands: x0 = h*x_head_stride <=
+        // (n_heads-1)*x_head_stride and x.len() >= x0 + k.
+        let f = q8_0_lane_partials(qs, d, x, k, row, h * x_head_stride as usize, 1, lane);
+        let s0 = warp::reduce_sum_f32(f[0]);
+        if lane == 0 {
+            // SAFETY: only lane 0 of the warp owning `row` writes; the slot
+            // h*y_head_stride + y_off + j is inside y by the launch contract
+            // and belongs to this row alone.
+            unsafe {
+                *y.get_unchecked_mut(h * y_head_stride as usize + y_off as usize + j) = s0;
+            }
+        }
+    }
+
+    /// Q3_K gemv over per-head activation columns: launch row `r` belongs
+    /// to head `h = head_base + r / rows_per_head`, dots absolute weight
+    /// row `h * row_stride_per_head + row_off + r % rows_per_head` against
+    /// activation column `r / rows_per_head` of `q`/`d8` (m = 1 through
+    /// the gated row body, one warp per row, 8 rows per 256-thread block),
+    /// lane 0 storing `y[h * y_head_stride + r % rows_per_head]`.
+    /// `n_rows` must be `heads * rows_per_head` and
+    /// `row_off + rows_per_head <= row_stride_per_head` (host-validated),
+    /// which keeps every `row_abs` below
+    /// `(head_base + heads) * row_stride_per_head` — the bound the launch
+    /// contract puts on `w`. Stores are disjoint: each (head, slot) pair
+    /// belongs to exactly one row.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= (head_base + heads) * row_stride_per_head * 110 * n_sb,
+            q.len() >= heads * 64 * iters,
+            d8.len() >= heads * 2 * n_sb,
+            y.len() >= (head_base + heads - 1) * y_head_stride + rows_per_head
+        )
+    )]
+    pub fn q3k_gemv_heads(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        iters: u32,
+        head_base: u32,
+        heads: u32,
+        rows_per_head: u32,
+        row_stride_per_head: u32,
+        row_off: u32,
+        y_head_stride: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let hi = row / rows_per_head as usize;
+        // The launch contract cannot bind n_rows to heads*rows_per_head
+        // (no division in its grammar); this guard keeps a violated
+        // divisibility from reading weight rows past the last head's
+        // block.
+        if hi >= heads as usize {
+            return;
+        }
+        let row_in = row % rows_per_head as usize;
+        let h = head_base as usize + hi;
+        let row_abs = h * row_stride_per_head as usize + row_off as usize + row_in;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row_abs + 1 <= (head_base + heads) * row_stride_per_head
+        // (the contract's bound on w, given the host-validated
+        // row_off + rows_per_head <= row_stride_per_head); column hi <
+        // heads keeps q/d8 inside their contract bounds.
+        let f = q3k_row_dot(w, q, d8, n_sb as usize, iters, row_abs, hi, 1, lane);
+        let s0 = warp::reduce_sum_f32(f[0]);
+        if lane == 0 {
+            // SAFETY: only lane 0 of the warp owning `row` writes; the slot
+            // h*y_head_stride + row_in is inside y by the launch contract
+            // and belongs to this row alone.
+            unsafe {
+                *y.get_unchecked_mut(h * y_head_stride as usize + row_in) = s0;
             }
         }
     }
@@ -132,6 +275,192 @@ impl StepKernels {
         ))?;
         self.module
             .gather_pairs(stream, &prep, x, src_idx, dst_idx, n as u32, y)?;
+        Ok(())
+    }
+
+    /// Enqueue the per-head Q8_0 gemv: `d.rows()` weight rows (the derived
+    /// planes, `qs`/`d` as `enqueue_q8_0_gemv` takes them, k =
+    /// `d.cols() * 32`), each dotted against its head's slice of `x` —
+    /// head `h` reads `x[h*x_head_stride .. +k]`, m = 1 — with lane 0
+    /// writing `y[h*y_head_stride + y_off + j]` for weight row
+    /// `h*rows_per_head + j`. `d.rows()` must be a multiple of
+    /// `rows_per_head` (then `n_heads = d.rows() / rows_per_head`). Asynchronous,
+    /// allocation-free, capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_q8_0_gemv_heads(
+        &self,
+        stream: &CudaStream,
+        qs: &DeviceTensor<u32>,
+        d: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        rows_per_head: usize,
+        x_head_stride: usize,
+        y_head_stride: usize,
+        y_off: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let n_rows = d.rows();
+        let k = d.cols() * 32;
+        if k == 0 || !k.is_multiple_of(32) {
+            return Err(format!(
+                "enqueue_q8_0_gemv_heads: need k a positive multiple of 32, got k={k} \
+                 (d is {}x{})",
+                d.rows(),
+                d.cols()
+            )
+            .into());
+        }
+        if qs.rows() != n_rows || qs.cols() != d.cols() * 8 {
+            return Err(format!(
+                "enqueue_q8_0_gemv_heads: qs is {}x{}, want {}x{} (k/4 words per row, k = \
+                 d.cols()*32 = {k})",
+                qs.rows(),
+                qs.cols(),
+                n_rows,
+                d.cols() * 8
+            )
+            .into());
+        }
+        if rows_per_head == 0 || n_rows % rows_per_head != 0 {
+            return Err(format!(
+                "enqueue_q8_0_gemv_heads: n_rows={n_rows} is not a positive multiple of \
+                 rows_per_head={rows_per_head}"
+            )
+            .into());
+        }
+        let n_heads = n_rows / rows_per_head;
+        if x.len() < (n_heads - 1) * x_head_stride + k {
+            return Err(format!(
+                "enqueue_q8_0_gemv_heads: x.len() {} < (n_heads-1)*x_head_stride + k = \
+                 {}*{x_head_stride} + {k}",
+                x.len(),
+                n_heads - 1
+            )
+            .into());
+        }
+        if y.len() < (n_heads - 1) * y_head_stride + y_off + rows_per_head {
+            return Err(format!(
+                "enqueue_q8_0_gemv_heads: y.len() {} < (n_heads-1)*y_head_stride + y_off + \
+                 rows_per_head = {}*{y_head_stride} + {y_off} + {rows_per_head}",
+                y.len(),
+                n_heads - 1
+            )
+            .into());
+        }
+        let prep = self.module.prepare_q8_0_gemv_heads(LaunchConfig1D::new(
+            n_rows.div_ceil(8) as u32,
+            256,
+            0,
+        ))?;
+        self.module.q8_0_gemv_heads(
+            stream,
+            &prep,
+            qs.buf(),
+            d.buf(),
+            x,
+            n_rows as u32,
+            k as u32,
+            n_heads as u32,
+            rows_per_head as u32,
+            x_head_stride as u32,
+            y_head_stride as u32,
+            y_off as u32,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the per-head Q3_K gemv: `heads` heads starting at
+    /// `head_base` (of the `w.rows()`-row weight, `row_stride_per_head`
+    /// rows per head), each head's `rows_per_head` output rows dotting
+    /// absolute weight row `h*row_stride_per_head + row_off + j` against
+    /// activation column `h - head_base` of `act` (m = 1), lane 0 writing
+    /// `y[h*y_head_stride + j]`. `heads` must be `act.m()` (one column per
+    /// head), `w.cols()` `110 * n_sb / 4` words with even `n_sb` (as
+    /// `enqueue_gemv_q3k`), and `row_off + rows_per_head <=
+    /// row_stride_per_head` so a head's rows stay on its own block.
+    /// Asynchronous, allocation-free, capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_q3k_gemv_heads(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        head_base: usize,
+        rows_per_head: usize,
+        row_stride_per_head: usize,
+        row_off: usize,
+        y_head_stride: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let n_sb = act.n_sb();
+        let heads = act.m();
+        if !n_sb.is_multiple_of(2) {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads: odd super-block count {n_sb} (K={}) leaves rows \
+                 unaligned; repack rows at load time",
+                act.k()
+            )
+            .into());
+        }
+        if w.cols() != 110 * n_sb / 4 {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
+                110 * n_sb / 4,
+                act.k(),
+                w.cols()
+            )
+            .into());
+        }
+        if row_off + rows_per_head > row_stride_per_head || rows_per_head == 0 {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads: row_off {row_off} + rows_per_head {rows_per_head} \
+                 must lie inside row_stride_per_head {row_stride_per_head}"
+            )
+            .into());
+        }
+        if (head_base + heads) * row_stride_per_head > w.rows() {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads: heads {head_base}..{} need (head_base+heads)*\
+                 row_stride_per_head = {} rows, w has {}",
+                head_base + heads,
+                (head_base + heads) * row_stride_per_head,
+                w.rows()
+            )
+            .into());
+        }
+        let n_rows = heads * rows_per_head;
+        if y.len() < (head_base + heads - 1) * y_head_stride + rows_per_head {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads: y.len() {} < (head_base+heads-1)*y_head_stride + \
+                 rows_per_head = {}*{y_head_stride} + {rows_per_head}",
+                y.len(),
+                head_base + heads - 1
+            )
+            .into());
+        }
+        let prep = self.module.prepare_q3k_gemv_heads(LaunchConfig1D::new(
+            n_rows.div_ceil(8) as u32,
+            256,
+            0,
+        ))?;
+        self.module.q3k_gemv_heads(
+            stream,
+            &prep,
+            w.buf(),
+            &act.q3,
+            &act.d8,
+            n_rows as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            head_base as u32,
+            heads as u32,
+            rows_per_head as u32,
+            row_stride_per_head as u32,
+            row_off as u32,
+            y_head_stride as u32,
+            y,
+        )?;
         Ok(())
     }
 }
@@ -198,21 +527,14 @@ struct Block0Scratch {
     kv_s: DeviceBuffer<f32>,
     /// `[k_rope | kv_compressed]` — the row the KV append consumes.
     kvr: DeviceBuffer<f32>,
-    xn_lo: DeviceBuffer<f32>,
-    xn_hi: DeviceBuffer<f32>,
-    qn2_lo: DeviceBuffer<f32>,
-    qn2_hi: DeviceBuffer<f32>,
     /// The derived q_nope2 planes in the q8f32 shape (see `new`).
     qn2_qs: DeviceTensor<u32>,
     qn2_d: DeviceTensor<f32>,
     /// Flash query rows, `[q_rope | q_nope2]` per head.
     f_rows: DeviceBuffer<f32>,
     kqvc: DeviceBuffer<f32>,
-    kqvc_hi: DeviceBuffer<f32>,
     act_kv_lo: Q8Act,
     act_kv_hi: Q8Act,
-    wvb_lo: DeviceBuffer<f32>,
-    wvb_hi: DeviceBuffer<f32>,
     kqv_2d: DeviceBuffer<f32>,
     act_ao: Q8Act,
     attn_out: DeviceBuffer<f32>,
@@ -222,15 +544,8 @@ struct Block0Scratch {
     act32: Q8Blocks32,
     l_out: DeviceBuffer<f32>,
     g_kvr: Gather,
-    g_xn_lo: Gather,
-    g_xn_hi: Gather,
     g_f_rope_lo: Gather,
-    g_f_nope2_lo: Gather,
     g_f_rope_hi: Gather,
-    g_f_nope2_hi: Gather,
-    g_kqvc_hi: Gather,
-    g_kqv_lo: Gather,
-    g_kqv_hi: Gather,
     pos_buf: DeviceBuffer<u32>,
     n_keys_buf: DeviceBuffer<u32>,
     token_buf: DeviceBuffer<u32>,
@@ -249,15 +564,8 @@ impl Block0Scratch {
             &self.kv_a,
             &self.kv_s,
             &self.kvr,
-            &self.xn_lo,
-            &self.xn_hi,
-            &self.qn2_lo,
-            &self.qn2_hi,
             &self.f_rows,
             &self.kqvc,
-            &self.kqvc_hi,
-            &self.wvb_lo,
-            &self.wvb_hi,
             &self.kqv_2d,
             &self.attn_out,
             &self.ffn_inp,
@@ -286,21 +594,10 @@ impl Block0Scratch {
             + self.act32.q.num_bytes()
             + self.act32.s8.num_bytes()
             + self.act32.d8.num_bytes();
-        total += [
-            &self.g_kvr,
-            &self.g_xn_lo,
-            &self.g_xn_hi,
-            &self.g_f_rope_lo,
-            &self.g_f_nope2_lo,
-            &self.g_f_rope_hi,
-            &self.g_f_nope2_hi,
-            &self.g_kqvc_hi,
-            &self.g_kqv_lo,
-            &self.g_kqv_hi,
-        ]
-        .iter()
-        .map(|g| g.src.num_bytes() + g.dst.num_bytes())
-        .sum::<usize>();
+        total += [&self.g_kvr, &self.g_f_rope_lo, &self.g_f_rope_hi]
+            .iter()
+            .map(|g| g.src.num_bytes() + g.dst.num_bytes())
+            .sum::<usize>();
         total
     }
 }
@@ -808,7 +1105,8 @@ impl Block0Scratch {
         let half = mla.n_head / 2;
         if !mla.n_head.is_multiple_of(2) || half > 8 {
             return Err(format!(
-                "Block0Scratch: the per-head column pairing needs an even n_head <= 16, got {}",
+                "Block0Scratch: the half-split m = 8 quantize at the wv_b site needs an even \
+                 n_head <= 16, got {}",
                 mla.n_head
             )
             .into());
@@ -829,19 +1127,12 @@ impl Block0Scratch {
             kv_a: f32n(kv_width)?,
             kv_s: f32n(kv_width)?,
             kvr: f32n(kv_width)?,
-            xn_lo: f32n(half * nope)?,
-            xn_hi: f32n(half * nope)?,
-            qn2_lo: f32n(derived * 8)?,
-            qn2_hi: f32n(derived * 8)?,
             qn2_qs,
             qn2_d,
             f_rows: f32n(mla.n_head * kv_width)?,
             kqvc: f32n(mla.n_head * latent)?,
-            kqvc_hi: f32n(half * latent)?,
             act_kv_lo: Q8Act::with_k(stream, 8, latent)?,
             act_kv_hi: Q8Act::with_k(stream, 8, latent)?,
-            wvb_lo: f32n(kv_b_rows * 8)?,
-            wvb_hi: f32n(kv_b_rows * 8)?,
             kqv_2d: f32n(mla.n_head * mla.v_head)?,
             act_ao: Q8Act::with_k(stream, 1, hidden)?,
             attn_out: f32n(hidden)?,
@@ -857,17 +1148,6 @@ impl Block0Scratch {
                     .chain((0..latent).map(|i| (i, rope + i))),
                 "kvr",
             )?,
-            g_xn_lo: Gather::new(
-                stream,
-                (0..half).flat_map(|h| (0..nope).map(move |j| (h * kq_head + j, h * nope + j))),
-                "xn_lo",
-            )?,
-            g_xn_hi: Gather::new(
-                stream,
-                (half..mla.n_head)
-                    .flat_map(|h| (0..nope).map(move |j| (h * kq_head + j, (h - half) * nope + j))),
-                "xn_hi",
-            )?,
             g_f_rope_lo: Gather::new(
                 stream,
                 (0..half).flat_map(|h| {
@@ -876,13 +1156,6 @@ impl Block0Scratch {
                 }),
                 "f_rope_lo",
             )?,
-            g_f_nope2_lo: Gather::new(
-                stream,
-                (0..half).flat_map(|h| {
-                    (0..latent).map(move |j| ((h * latent + j) * 8 + h, h * kv_width + rope + j))
-                }),
-                "f_nope2_lo",
-            )?,
             g_f_rope_hi: Gather::new(
                 stream,
                 (half..mla.n_head).flat_map(|h| {
@@ -890,43 +1163,6 @@ impl Block0Scratch {
                     (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
                 }),
                 "f_rope_hi",
-            )?,
-            g_f_nope2_hi: Gather::new(
-                stream,
-                (half..mla.n_head).flat_map(|h| {
-                    (0..latent)
-                        .map(move |j| ((h * latent + j) * 8 + (h - half), h * kv_width + rope + j))
-                }),
-                "f_nope2_hi",
-            )?,
-            g_kqvc_hi: Gather::new(
-                stream,
-                (0..half * latent).map(|i| (half * latent + i, i)),
-                "kqvc_hi",
-            )?,
-            g_kqv_lo: Gather::new(
-                stream,
-                (0..half).flat_map(|h| {
-                    (0..mla.v_head).map(move |j| {
-                        (
-                            (h * (nope + mla.v_head) + nope + j) * 8 + h,
-                            h * mla.v_head + j,
-                        )
-                    })
-                }),
-                "kqv_lo",
-            )?,
-            g_kqv_hi: Gather::new(
-                stream,
-                (half..mla.n_head).flat_map(|h| {
-                    (0..mla.v_head).map(move |j| {
-                        (
-                            (h * (nope + mla.v_head) + nope + j) * 8 + (h - half),
-                            h * mla.v_head + j,
-                        )
-                    })
-                }),
-                "kqv_hi",
             )?,
             pos_buf: DeviceBuffer::from_host(stream, &[0u32])?,
             n_keys_buf: DeviceBuffer::from_host(stream, &[1u32])?,
@@ -1011,6 +1247,7 @@ fn enqueue_block0(
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let (hidden, latent, rope) = (s.dims.hidden, mla.latent, mla.rope_dims);
+    let kv_width = latent + rope;
     let gather =
         |gt: &Gather, src: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
             step.enqueue_gather(stream, src, &gt.src, &gt.dst, gt.n, y)
@@ -1076,21 +1313,26 @@ fn enqueue_block0(
     )?;
     // 6. kvr = [k_rope | kv_compressed] — the oracle's CONCAT order.
     gather(&s.g_kvr, &s.kv_s, &mut s.kvr)?;
-    // 7. q_nope2 per head: the derived Q8_0 gemv dots m <= 8 activation
-    //    columns, so the heads' nope slices are gathered into column layout
-    //    (two halves of n_head/2) and the head-paired outputs extracted.
-    gather(&s.g_xn_lo, &s.q, &mut s.xn_lo)?;
-    gather(&s.g_xn_hi, &s.q, &mut s.xn_hi)?;
-    gpu.q8f32()
-        .enqueue_q8_0_gemv(stream, &s.qn2_qs, &s.qn2_d, &s.xn_lo, 8, &mut s.qn2_lo)?;
-    gpu.q8f32()
-        .enqueue_q8_0_gemv(stream, &s.qn2_qs, &s.qn2_d, &s.xn_hi, 8, &mut s.qn2_hi)?;
-    // 8. the flash q rows `[q_rope | q_nope2]` per head — the oracle's
-    //    CONCAT order.
+    // 7. q_nope2 per head: one per-head launch dots every derived wk_b row
+    //    of head h against q's nope slice of that head (x base h*kq_head,
+    //    m = 1 per row), writing the nope2 span of flash row h directly
+    //    (y base h*kv_width + rope).
+    step.enqueue_q8_0_gemv_heads(
+        stream,
+        &s.qn2_qs,
+        &s.qn2_d,
+        &s.q,
+        latent,
+        mla.kq_head,
+        kv_width,
+        rope,
+        &mut s.f_rows,
+    )?;
+    // 8. the flash q rows `[q_rope | q_nope2]` per head — the rope spans are
+    //    copies of q_rope_all's per-head rope slices (the nope2 span is
+    //    already in place).
     gather(&s.g_f_rope_lo, &s.q_rope_all, &mut s.f_rows)?;
-    gather(&s.g_f_nope2_lo, &s.qn2_lo, &mut s.f_rows)?;
     gather(&s.g_f_rope_hi, &s.q_rope_all, &mut s.f_rows)?;
-    gather(&s.g_f_nope2_hi, &s.qn2_hi, &mut s.f_rows)?;
     // 9. append the kvr row at `pos`, then attend over `n_keys` rows — both
     //    read from device buffers, so a captured replay follows the position.
     gpu.flash()
@@ -1107,18 +1349,39 @@ fn enqueue_block0(
         latent,
         &mut s.kqvc,
     )?;
-    // 10. wv_b per head: flash's output is head-major, which is the
-    //     m-column layout the quantizer and the kv_b gemv consume; the
-    //     second half rides an (offset) gathered copy. The v-up outputs are
-    //     extracted into the flat, head-major kqv_2d.
-    gather(&s.g_kqvc_hi, &s.kqvc, &mut s.kqvc_hi)?;
+    // 10. wv_b per head: flash's output is head-major — kqvc column h is
+    //     head h's compressed values, the m-column layout the quantizer
+    //     consumes; the heads 8..15 half quantizes from kqvc's base offset
+    //     (the quantizer's x base), so no gathered copy. Each per-head
+    //     launch dots only its heads' wv_b rows (absolute row
+    //     h*(nope+v_head) + nope + j, activation column h - head_base,
+    //     m = 1), writing the flat, head-major kqv_2d directly — the wk_b
+    //     rows are never read.
     gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
-    gpu.enqueue_quantize_q8_1(&s.kqvc_hi, &mut s.act_kv_hi)?;
+    gpu.enqueue_quantize_q8_1_at(&s.kqvc, (mla.n_head / 2) * latent, &mut s.act_kv_hi)?;
     let kv_b = kq_weight(w, "blk.0.attn_kv_b.weight")?;
-    gpu.enqueue_gemv_q3k(kv_b, &s.act_kv_lo, &mut s.wvb_lo)?;
-    gpu.enqueue_gemv_q3k(kv_b, &s.act_kv_hi, &mut s.wvb_hi)?;
-    gather(&s.g_kqv_lo, &s.wvb_lo, &mut s.kqv_2d)?;
-    gather(&s.g_kqv_hi, &s.wvb_hi, &mut s.kqv_2d)?;
+    step.enqueue_q3k_gemv_heads(
+        stream,
+        kv_b,
+        &s.act_kv_lo,
+        0,
+        mla.v_head,
+        mla.nope + mla.v_head,
+        mla.nope,
+        mla.v_head,
+        &mut s.kqv_2d,
+    )?;
+    step.enqueue_q3k_gemv_heads(
+        stream,
+        kv_b,
+        &s.act_kv_hi,
+        mla.n_head / 2,
+        mla.v_head,
+        mla.nope + mla.v_head,
+        mla.nope,
+        mla.v_head,
+        &mut s.kqv_2d,
+    )?;
     // 11. attn_output over the flat kqv_2d, then the attention residual.
     gpu.enqueue_quantize_q8_1(&s.kqv_2d, &mut s.act_ao)?;
     gpu.enqueue_gemv_q4k(

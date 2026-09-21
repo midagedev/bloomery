@@ -64,9 +64,11 @@ mod kernels {
     /// scale (16 weights = one field-group of the word) applied per dp4a.
 
     /// Quantize f32 activations to q8_1: per 128-value block, d = amax/127 and
-    /// int8 q = round(x/d). One warp per block; each lane quantizes its four
-    /// consecutive values and writes the packed u32 word once per gemv lane
-    /// geometry — the same bytes in the permutation that makes its format's
+    /// int8 q = round(x/d). The m columns of `k = 256*n_sb` values each are
+    /// read from base `x0`, so a caller can quantize a slice of a wider
+    /// buffer without copying it. One warp per block; each lane quantizes
+    /// its four consecutive values and writes the packed u32 word once per
+    /// gemv lane geometry — the same bytes in the permutation that makes its format's
     /// gemv load instruction address 32 lane-consecutive words (one 128B L1
     /// line) instead of four strided clusters (four lines, four wavefronts
     /// per load — the M>1 marginal cost MUL-8 chased; the index identity
@@ -91,7 +93,7 @@ mod kernels {
         domain = 1,
         block = (32, 1, 1),
         requires = (
-            x.len() >= m_cols * 256 * n_sb,
+            x.len() >= x0 + m_cols * 256 * n_sb,
             q3.len() >= m_cols * 64 * half_it,
             q4.len() >= m_cols * 256 * quad_it,
             q6.len() >= m_cols * 128 * half_it,
@@ -101,6 +103,7 @@ mod kernels {
     )]
     pub fn q3k_quantize_q8_1(
         x: &[f32],
+        x0: u32,
         m_cols: u32,
         n_sb: u32,
         half_it: u32,
@@ -128,7 +131,7 @@ mod kernels {
         // block; the warp max over the four per-lane maxima is the block
         // amax (no cross-lane byte packing needed, unlike the 32-value
         // geometry where one value per lane forced two shuffle_downs).
-        let base = col * 256 * n_sb + 128 * b + 4 * lane;
+        let base = x0 as usize + col * 256 * n_sb + 128 * b + 4 * lane;
         let v0 = unsafe { *x.get_unchecked(base) };
         let v1 = unsafe { *x.get_unchecked(base + 1) };
         let v2 = unsafe { *x.get_unchecked(base + 2) };
@@ -1156,13 +1159,29 @@ impl Gpu {
         x: &DeviceBuffer<f32>,
         act: &mut Q8Act,
     ) -> Result<(), GpuError> {
+        self.enqueue_quantize_q8_1_at(x, 0, act)
+    }
+
+    /// Enqueue the q8_1 quantization of `x[x0 .. x0 + m*k]` (`m = act.m()`
+    /// columns of `act.k()` f32 each) into `act` — the same quantization
+    /// `enqueue_quantize_q8_1` runs, on a base-offset slice of a wider
+    /// buffer, so the quantized bytes equal a copy-then-quantize. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_quantize_q8_1_at(
+        &self,
+        x: &DeviceBuffer<f32>,
+        x0: usize,
+        act: &mut Q8Act,
+    ) -> Result<(), GpuError> {
         let m = act.m();
         let n_sb = act.n_sb();
-        if x.len() < m * act.k() {
+        if x.len() < x0 + m * act.k() {
             return Err(format!(
-                "enqueue_quantize_q8_1: x.len() {} < m*k = {}",
+                "enqueue_quantize_q8_1_at: x.len() {} < x0 + m*k = {} + {}*{}",
                 x.len(),
-                m * act.k()
+                x0,
+                m,
+                act.k()
             )
             .into());
         }
@@ -1178,6 +1197,7 @@ impl Gpu {
             &self.stream,
             &prep,
             x,
+            x0 as u32,
             m as u32,
             n_sb as u32,
             n_sb.div_ceil(2) as u32,

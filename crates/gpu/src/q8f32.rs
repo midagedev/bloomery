@@ -107,12 +107,14 @@ pub fn f32_lane_partials(
 /// Lane `lane`'s partial sums for one Q8_0 row: the weight at value `kk` of
 /// `row` is `q·d` with `q` the signed code in word `qs[row·k/4 + kk/4]`,
 /// byte `kk%4`, and `d` the block scale `d[row·k/32 + kk/32]` — the same
-/// bits the reference's dequantizer produces. Accumulation order as
+/// bits the reference's dequantizer produces. `x` is read from base `x0`
+/// (column c's values at `x0 + c*k .. +k`), so a caller can dot against a
+/// slice of a wider buffer without subslicing it. Accumulation order as
 /// `f32_lane_partials`.
 ///
 /// Caller contract: `qs.len() >= (row + 1) * k/4`, `d.len() >= (row + 1) *
-/// k/32`, `x.len() >= m_cols * k`, `k` a positive multiple of 32, `m_cols`
-/// in 1..=8, `lane < 32`.
+/// k/32`, `x.len() >= x0 + m_cols * k`, `k` a positive multiple of 32,
+/// `m_cols` in 1..=8, `lane < 32`.
 #[inline(always)]
 pub fn q8_0_lane_partials(
     qs: &[u32],
@@ -120,6 +122,7 @@ pub fn q8_0_lane_partials(
     x: &[f32],
     k: u32,
     row: usize,
+    x0: usize,
     m_cols: u32,
     lane: usize,
 ) -> [f32; 8] {
@@ -144,36 +147,37 @@ pub fn q8_0_lane_partials(
         // contract.
         let wv = q as f32 * unsafe { *d.get_unchecked(d_row + it) };
         // Column 0 (always active).
-        // SAFETY: kk < k <= x.len() by the caller contract (m_cols >= 1).
-        f0 = f32::mul_add(wv, unsafe { *x.get_unchecked(kk) }, f0);
+        // SAFETY: kk < k, and x0 + kk < x0 + k <= x.len() by the caller
+        // contract (m_cols >= 1).
+        f0 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + kk) }, f0);
         // Columns 1..7, one launch-uniform guard per column.
         if m_cols > 1 {
-            // SAFETY: m_cols > 1 => x.len() >= 2*k > k + kk.
-            f1 = f32::mul_add(wv, unsafe { *x.get_unchecked(k + kk) }, f1);
+            // SAFETY: m_cols > 1 => x.len() >= x0 + 2*k > x0 + k + kk.
+            f1 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + k + kk) }, f1);
         }
         if m_cols > 2 {
-            // SAFETY: m_cols > 2 => x.len() >= 3*k > 2*k + kk.
-            f2 = f32::mul_add(wv, unsafe { *x.get_unchecked(2 * k + kk) }, f2);
+            // SAFETY: m_cols > 2 => x.len() >= x0 + 3*k > x0 + 2*k + kk.
+            f2 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 2 * k + kk) }, f2);
         }
         if m_cols > 3 {
-            // SAFETY: m_cols > 3 => x.len() >= 4*k > 3*k + kk.
-            f3 = f32::mul_add(wv, unsafe { *x.get_unchecked(3 * k + kk) }, f3);
+            // SAFETY: m_cols > 3 => x.len() >= x0 + 4*k > x0 + 3*k + kk.
+            f3 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 3 * k + kk) }, f3);
         }
         if m_cols > 4 {
-            // SAFETY: m_cols > 4 => x.len() >= 5*k > 4*k + kk.
-            f4 = f32::mul_add(wv, unsafe { *x.get_unchecked(4 * k + kk) }, f4);
+            // SAFETY: m_cols > 4 => x.len() >= x0 + 5*k > x0 + 4*k + kk.
+            f4 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 4 * k + kk) }, f4);
         }
         if m_cols > 5 {
-            // SAFETY: m_cols > 5 => x.len() >= 6*k > 5*k + kk.
-            f5 = f32::mul_add(wv, unsafe { *x.get_unchecked(5 * k + kk) }, f5);
+            // SAFETY: m_cols > 5 => x.len() >= x0 + 6*k > x0 + 5*k + kk.
+            f5 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 5 * k + kk) }, f5);
         }
         if m_cols > 6 {
-            // SAFETY: m_cols > 6 => x.len() >= 7*k > 6*k + kk.
-            f6 = f32::mul_add(wv, unsafe { *x.get_unchecked(6 * k + kk) }, f6);
+            // SAFETY: m_cols > 6 => x.len() >= x0 + 7*k > x0 + 6*k + kk.
+            f6 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 6 * k + kk) }, f6);
         }
         if m_cols > 7 {
-            // SAFETY: m_cols > 7 => x.len() >= 8*k > 7*k + kk.
-            f7 = f32::mul_add(wv, unsafe { *x.get_unchecked(7 * k + kk) }, f7);
+            // SAFETY: m_cols > 7 => x.len() >= x0 + 8*k > x0 + 7*k + kk.
+            f7 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 7 * k + kk) }, f7);
         }
         it += 1;
     }
@@ -326,7 +330,10 @@ mod q8f32_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        let sums = gemv_lane_sums(q8_0_lane_partials(qs, d, x, k, row, m_cols, lane), m_cols);
+        let sums = gemv_lane_sums(
+            q8_0_lane_partials(qs, d, x, k, row, 0, m_cols, lane),
+            m_cols,
+        );
         let m = m_cols as usize;
         if lane == 0 {
             // SAFETY: as in f32_gemv — lane 0 of the row's warp writes only
