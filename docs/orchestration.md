@@ -83,7 +83,7 @@ M 하루 / L 하루 넘음(쪼갤 후보).
 | id | 라운드 | 파일 경계 | 백엔드 | 게이트 | 앞 | 크기 |
 |---|---|---|---|---|---|---|
 | B0a | V4.1 아키 독해(2026-09-21 개정 — 사용자: ik 외 구현도 참고, 과도하게 따라가지 않는다): **1차 출처는 DeepSeek 공식 참조 구현 model.py**, ik 포트·mainline 포크는 GGUF 이름과 구현 차이 교차 확인. ~~ik 포트 #2455의 V4.1 그래프를 op 목록으로~~(하이퍼커넥션·공유 압축 KV·저랭크 query norm·engram 조회·DSpark 헤드), V2-Lite와 같은 op·다른 op·새 op 세 열 | `docs/research/v41-ops.md`(새) | ~~agy~~ GLM(agy 개인 쿼터 소진 rc 3) | 문서; op마다 model.py·ik·mainline 파일:줄 | — **비행 중** | M |
-| B0b | GGUF 인벤토리 도구: 444 GiB 헤더만 읽어 텐서 이름·형상·타입·바이트를 표로(engram 텐서 포함), 티어별 합계 | `crates/gguf` 바이너리 1개, `docs/v41-inventory.md` | GLM (실행은 박스, 헤더만 읽어 임대 불필요) | 표 + 합계가 roofline 444.23 GiB와 일치 | — **지금** | S |
+| B0b | GGUF 인벤토리 도구: 444 GiB 헤더만 읽어 텐서 이름·형상·타입·바이트를 표로(engram 텐서 포함), 티어별 합계 | `crates/gguf` 바이너리 1개, `docs/v41-inventory.md` | GLM (실행은 박스, 헤더만 읽어 임대 불필요) | 표 + 합계가 roofline 444.23 GiB와 일치 | — **머지 e63caf3**: 40블록 전부 MoE, engram 사이트 blk.1·blk.14, 없는 타입 q8_0·bf16 | S |
 | B0c | 오라클 v3: ik에서 V4.1 중간 텐서 덤프(덤퍼 확장) — 실행은 RAM 250 GB·두 카드를 쓰므로 **llm.service 중단 + 임대** | ik 트리 덤퍼 패치, `tools/ref/dump-ref-v41.sh` | GLM(도구) → 리드(실행) | 덤프 세트 + MANIFEST | B0a | M |
 | B1 | 배치 로더: 텐서마다 (디바이스, dtype) 주소를 로드 시 배정, expert 단위; 444 GiB mmap 창; 상주 표 인쇄 | `gpu/weights.rs`, `crates/model` 로더, 새 `gate_place.rs` | GLM | 배치 표가 설계와 일치, 상주 바이트 합 | A1a, B0b | M |
 | B2 | 하이브리드 경계: 일부 층 expert를 CPU 풀에(V2-Lite로 연습), 활성값 왕복·동기 | `gpu/model.rs`, `crates/model/moe.rs` | GLM | 로짓 대 순GPU 밴드, 왕복 µs, 층 ms 대 하한 | A3 | M |
