@@ -17,8 +17,15 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
   (GPU) and `tools/ref/cpu-measure.sh` (CPU). They own the quiet-machine
   protocol: a machine-wide lock, GPU-idle wait, and witness blocks around every
   timed region. A number produced outside them is not admissible.
-- **Never touch the A6000.** It serves models and runs nightly training. The
-  dev card is the 3090, pinned by `CUDA_VISIBLE_DEVICES` in the box env.
+- **The A6000 is shared, not forbidden** (user, 2026-09-21: it may be used for
+  development). It also serves models (`llm.service`) and runs nightly training
+  from 00:00, so: the default card stays the 3090 (pinned by
+  `CUDA_VISIBLE_DEVICES` in the box env); take the A6000 only through
+  `BLOOMERY_CARD=a6000|both tools/box.sh …`, which refuses (rc 75) while
+  `llm.service` is active or the card has compute processes — never kill or
+  stop what holds it. **Timed numbers stay on the 3090** (the ik baselines were
+  measured there); the A6000 is for correctness gates in parallel with a 3090
+  lease, and for the two-card stage gate.
 - **Never relax a gate or a lint to make it pass.** Raise it with a dated
   comment and a reason, or file an issue. The lint levels in the root
   `Cargo.toml` carry the hit counts they were chosen from.

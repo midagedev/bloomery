@@ -12,4 +12,21 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 ssh "$HOST" "mkdir -p $REMOTE"
 rsync -az --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
-ssh "$HOST" "source ~/bloomery-env.sh && export BLOOMERY_DATA=$DATA && cd $REMOTE && $*"
+# 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
+# CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). A6000은 서빙·야간 학습과 공유하는
+# 카드라, llm.service가 살아 있거나 그 카드에 컴퓨트 프로세스가 있으면 실행하지 않고 rc 75로 끝난다.
+CARD=${BLOOMERY_CARD:-3090}
+case "$CARD" in
+  3090) PICK=":" ;;
+  a6000|both) PICK='
+    A=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "A6000" | cut -d, -f1)
+    T=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "3090" | cut -d, -f1)
+    [ -n "$A" ] && [ -n "$T" ] || { echo "box.sh: card lookup failed" >&2; exit 75; }
+    if [ "$(systemctl is-active llm.service)" = active ]; then echo "box.sh: llm.service holds the A6000" >&2; exit 75; fi
+    if [ -n "$(nvidia-smi -i "$A" --query-compute-apps=pid --format=csv,noheader)" ]; then
+      echo "box.sh: the A6000 has compute processes (serving or training) — not taking it" >&2; exit 75; fi
+    '"$( [ "$CARD" = both ] && echo 'export CUDA_VISIBLE_DEVICES="$T,$A"' || echo 'export CUDA_VISIBLE_DEVICES="$A"' )" ;;
+  *) echo "box.sh: BLOOMERY_CARD must be 3090, a6000 or both" >&2; exit 64 ;;
+esac
+ssh "$HOST" "source ~/bloomery-env.sh && export BLOOMERY_DATA=$DATA && { $PICK
+} && cd $REMOTE && $*"
