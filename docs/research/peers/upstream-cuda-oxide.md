@@ -76,7 +76,7 @@ Searched upstream issues, pull requests, and discussions via GitHub CLI read-onl
   - Tests: Add unit tests in `crates/dialect-mir/` verifying `MirShlOp` and `MirShrOp` constant folding with operands of mismatched bitwidths (e.g., `ui32` value shifted by `ui64` amount and vice versa).
 
 ### 6. Adversarial Review of Our Draft
-A maintainer reading `/Users/hckim/repo/bloomery/docs/upstream/cuda-oxide-unroll-ice.md` would push back on the following points:
+A maintainer reading `bloomery/docs/upstream/cuda-oxide-unroll-ice.md` would push back on the following points:
 1. **Missing `cargo oxide doctor` output**:
    - Upstream's `.github/ISSUE_TEMPLATE/bug_report.md:24–36` explicitly requests pasting `cargo oxide doctor` inside a `<details>` block to capture resolved `llc`, libNVVM, toolchain components, and driver configuration. The draft provides handwritten bullet points instead.
    - *Edit*: Run `cargo oxide doctor` and embed its verbatim output under an `Environment` details fold.

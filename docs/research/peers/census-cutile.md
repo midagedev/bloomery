@@ -5,7 +5,7 @@
 **Target Upstream Repositories**:
 - `NVlabs/cutile-rs` (`e04245bdcf1f5bfc602a2078168eff90ee40bebb`, 2026-09-18, crates `cutile`, `cuda-core`, `cuda-bindings`, `cuda-async`, `cutile-compiler`, `cutile-ir`)
 - `NVlabs/cuda-oxide` (`b0f961df3af0ff140b3b006fa2b6750b71f43f62`, 2026-09-20, crates `cuda-device`, `cuda-host`, `cuda-macros`)
-**Reference Downstream Engine**: `/Users/hckim/repo/bloomery` (`crates/gpu`, batch-1 decode of DeepSeek-V2-Lite MoE Q3_K_M on RTX 3090 `sm_86`)
+**Reference Downstream Engine**: `bloomery/` (`crates/gpu`, batch-1 decode of DeepSeek-V2-Lite MoE Q3_K_M on RTX 3090 `sm_86`)
 
 ---
 
@@ -242,7 +242,7 @@ Every repository below was shallow-cloned into `<scratch>/peers-b/src/<owner>__<
 ### 4.1 Who Captures and Replays Graphs?
 Four projects in this ecosystem capture and replay CUDA graphs for decode:
 
-1. **`bloomery`** (`/Users/hckim/repo/bloomery/crates/gpu/src/graph.rs`):
+1. **`bloomery`** (`bloomery/crates/gpu/src/graph.rs`):
    - Safe driver-level wrapper `Graph::capture`, `launch`, `node_count`, and `Drop` over `cuda_core::sys` (`cuStreamBeginCapture_v2`, `cuStreamEndCapture`, `cuGraphInstantiateWithFlags`, `cuGraphLaunch`, `cuGraphExecDestroy`, `cuGraphDestroy`).
 2. **`EricLBuehler/mistral.rs`** (`mistralrs-core/src/pipeline/cuda_graph.rs:842-920`):
    - `CudaGraphHandle` wrapping `sys::CUgraph`, `sys::CUgraphExec`, and `stream: Arc<CudaStream>` directly over `cudarc::driver::sys`.
@@ -449,17 +449,17 @@ From our exhaustive census across all public repositories in the ecosystem:
 
 ## (c) Improvement Opportunities Noticed Beyond the Spec for Bloomery
 
-1. **CUDA Graph Stream Synchronization on Drop** (`/Users/hckim/repo/bloomery/crates/gpu/src/graph.rs:135-145`):
+1. **CUDA Graph Stream Synchronization on Drop** (`bloomery/crates/gpu/src/graph.rs:135-145`):
    - *Issue*: `Graph::drop` currently invokes `cuGraphExecDestroy` and `cuGraphDestroy` immediately. If the graph is dropped while a replay is in-flight on the stream, driver undefined behavior or panic can occur.
    - *Fix*: Call `stream.synchronize()` and ensure thread context binding before destruction, matching `mistral.rs` (`mistralrs-core/src/pipeline/cuda_graph.rs:852`).
    - *Size*: Trivial (5 lines of code).
 
-2. **In-Graph Argmax to Eliminate D2H Bandwidth** (`/Users/hckim/repo/bloomery/crates/gpu/src/lib.rs:GpuModel::step`):
+2. **In-Graph Argmax to Eliminate D2H Bandwidth** (`bloomery/crates/gpu/src/lib.rs:GpuModel::step`):
    - *Issue*: Bloomery materializes or returns logits at the end of each decode step, paying host-device transfer overhead.
    - *Fix*: Capture the argmax kernel into the CUDA graph (as demonstrated in `grout/src/model.rs:342-363`), write the token directly to the device buffer for the next step's embedding kernel, and read back only the 4-byte token ID via asynchronous D2H copy.
    - *Size*: One round (requires chaining argmax kernel into graph capture and returning `u32`).
 
-3. **Dynamic Sequence Length Passing for Captured MLA Attention** (`/Users/hckim/repo/bloomery/crates/gpu/src/graph.rs` & `docs/gpu-design.md` P5):
+3. **Dynamic Sequence Length Passing for Captured MLA Attention** (`bloomery/crates/gpu/src/graph.rs` & `docs/gpu-design.md` P5):
    - *Issue*: As context length grows token-by-token, launch scalars (like `seq_len`) cannot be modified in a captured CUDA graph.
    - *Fix*: Adopt Grout's device buffer pattern (`s_kv_ptr: *mut i32` in `grout/src/flash_decode.rs:107-128`), updating the sequence length with a 4-byte H2D copy before graph replay and reading it inside the kernel via `tile_to_scalar` / device memory read.
    - *Size*: Design question / One round (part of P5 attention block assembly).
@@ -474,7 +474,7 @@ From our exhaustive census across all public repositories in the ecosystem:
    - Investigation task only; no test or build commands were specified in `task.md`.
    - All searches, clones, and inspections ran synchronously without background tasks.
 3. **Self-Verification**:
-   1. *Existing behavior removed or weakened*: None. No production code was modified (`git status /Users/hckim/repo/bloomery` clean).
+   1. *Existing behavior removed or weakened*: None. No production code was modified (`git status bloomery/` clean).
    2. *New constants/mappings/tables*: None added to codebase.
    3. *Other surfaces that should agree*: N/A.
    4. *Changed test assertions*: None.
@@ -482,7 +482,7 @@ From our exhaustive census across all public repositories in the ecosystem:
 4. **What you could not implement or verify**:
    - Could not run or benchmark any kernels on GPU, in strict compliance with task rules ("Do not build or run anything; do not touch a GPU").
 5. **What you deliberately left untouched**:
-   - Left all repositories in `/Users/hckim/repo/bloomery` untouched (read-only reference).
+   - Left all repositories in `bloomery/` untouched (read-only reference).
    - Cloned candidate repositories in `/private/tmp/.../peers-b/src/` were read only.
 6. **Improvement opportunities noticed beyond the spec**:
    - Documented in section (c) above (`crates/gpu/src/graph.rs:135` drop synchronization, in-graph argmax token feedback, and dynamic sequence length passing via device buffer).

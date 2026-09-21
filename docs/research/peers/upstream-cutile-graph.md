@@ -2,7 +2,7 @@
 
 **Target Repository**: `https://github.com/NVlabs/cutile-rs` (crate `cuda-core`)  
 **Secondary Repository**: `https://github.com/NVlabs/cuda-oxide`  
-**Downstream Consumer**: `/Users/hckim/repo/bloomery` (`crates/gpu/src/graph.rs`, `crates/gpu/src/lib.rs`, `crates/gpu-gates/src/bin/gate_p2.rs`)  
+**Downstream Consumer**: `bloomery/` (`crates/gpu/src/graph.rs`, `crates/gpu/src/lib.rs`, `crates/gpu-gates/src/bin/gate_p2.rs`)  
 **Investigation Commit Hashes**:
 - `NVlabs/cutile-rs`: `e04245bdcf1f5bfc602a2078168eff90ee40bebb` (2026-09-18)
 - `NVlabs/cuda-oxide`: `b0f961df3af0ff140b3b006fa2b6750b71f43f62` (2026-09-20)
@@ -413,7 +413,7 @@ Signed-off-by: nihalpasham <nihalp@nvidia.com>
 
 ### 5. What Was Deliberately Left Untouched
 - `cutile-rs` and `cuda-oxide` cloned trees in `scratchpad/up-cutile/src/`: Left unmodified in compliance with read-only repository rules.
-- Bloomery codebase (`/Users/hckim/repo/bloomery`): Left untouched as instructed.
+- Bloomery codebase (`bloomery/`): Left untouched as instructed.
 
 ### 6. Improvement Opportunities Noticed Beyond Spec
 - `cutile-rs/cuda-core/src/simt/context.rs:382`: Avoid calling `cuCtxGetCurrent` on every launch by caching the last-bound context handle per thread (size: ~1 round / design question).

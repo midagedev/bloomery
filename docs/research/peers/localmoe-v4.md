@@ -2,7 +2,7 @@
 
 **Date**: 2026-09-21  
 **Investigated Repository**: `<scratch>/peers-a/src/andyzpb__localMoE` (commit `dcdee6f`, "Run DeepSeek-v4-pro (1600B MoE) on a 24GB-RAM consumer machine — rust, streamed from disk")  
-**Investigating Target**: Bloomery (`/Users/hckim/repo/bloomery`), workstation target: RTX 3090 (24 GB) + RTX A6000 (48 GB) + 256 GB DDR4 (8-channel ~148 GB/s) + NVMe, aiming for DeepSeek V4.1-Flash.
+**Investigating Target**: Bloomery (`bloomery/`), workstation target: RTX 3090 (24 GB) + RTX A6000 (48 GB) + 256 GB DDR4 (8-channel ~148 GB/s) + NVMe, aiming for DeepSeek V4.1-Flash.
 
 ---
 
@@ -304,7 +304,7 @@ With 256 GB DDR4 host RAM and RTX 3090 (24 GB) + A6000 (48 GB) = 72 GB VRAM:
 
 ## 8. What Was Deliberately Left Untouched
 
-1. `/Users/hckim/repo/bloomery`: Left completely unmodified. Absolute ban on repository modification respected.
+1. `bloomery/`: Left completely unmodified. Absolute ban on repository modification respected.
 2. `/private/tmp/.../andyzpb__localMoE`: Left completely unmodified. Read-only inspection only.
 3. Git state: No commits, checkouts, stashes, or branch switches made.
 
@@ -312,7 +312,7 @@ With 256 GB DDR4 host RAM and RTX 3090 (24 GB) + A6000 (48 GB) = 72 GB VRAM:
 
 ## 9. Self-Verification
 
-1. **Existing behavior this change removed or weakened**: None. This round is an investigation and reporting task only. Grep verification of git status in bloomery confirms zero modifications: `git -C /Users/hckim/repo/bloomery status --porcelain` is clean of any new unstaged files from this task.
+1. **Existing behavior this change removed or weakened**: None. This round is an investigation and reporting task only. Grep verification of git status in bloomery confirms zero modifications: `git -C bloomery/ status --porcelain` is clean of any new unstaged files from this task.
 2. **New constants/mappings/tables**: None added to bloomery.
 3. **Other surfaces that should now agree**: Not applicable.
 4. **Changed test assertions**: None changed.
@@ -322,7 +322,7 @@ With 256 GB DDR4 host RAM and RTX 3090 (24 GB) + A6000 (48 GB) = 72 GB VRAM:
 
 ## 10. Improvement Opportunities Noticed for Bloomery
 
-1. **CUDA Graph Safety & Allocations in GPU Stage** ([`crates/gpu/src/graph.rs`](file:///Users/hckim/repo/bloomery/crates/gpu/src/graph.rs)):
+1. **CUDA Graph Safety & Allocations in GPU Stage** ([`crates/gpu/src/graph.rs`](file://bloomery/crates/gpu/src/graph.rs)):
    - *Observation*: LocalMoE struggled with CUDA graph replay because intermediate expert addresses varied dynamically. Bloomery's P9 design (`_sel` kernels passing expert indices through device buffers) is the correct pattern to avoid recreating graph nodes.
    - *Size*: Design confirmed.
 2. **Ampere FP4 Tensor Core Strategy for V4.1**:

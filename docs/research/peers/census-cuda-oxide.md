@@ -74,7 +74,7 @@ zTgx__cublas-rs: 46e4cc089a663362ea74e72a31b22842f68222fd Thu May 28 15:22:10 20
 ## 3. Self-Verification
 1. **Existing behavior this change removed or weakened:** None (`grep -rn "report.md"` showed no previous deliverable existed). This investigation is strictly read-only analysis and report production.
 2. **New constants/mappings/tables:** Added census taxonomy (seed list of 19 + 4 newly discovered repos, categorized by domain, lines of kernel code, pin rev, verdict). No existing equivalence table existed in the workspace.
-3. **Other surfaces:** Checked our reference repository `/Users/hckim/repo/bloomery` (`crates/gpu/src/lib.rs`, `q5.rs`, `q8f32.rs`, `graph.rs`, `docs/gpu-design.md`, `docs/upstream/nvlabs-ledger.md`). The findings directly align with and validate the open upstream candidate issues tracked in `nvlabs-ledger.md`.
+3. **Other surfaces:** Checked our reference repository `bloomery/` (`crates/gpu/src/lib.rs`, `q5.rs`, `q8f32.rs`, `graph.rs`, `docs/gpu-design.md`, `docs/upstream/nvlabs-ledger.md`). The findings directly align with and validate the open upstream candidate issues tracked in `nvlabs-ledger.md`.
 4. **Changed test assertions:** None (read-only investigation, no test code modified).
 5. **Contract clauses that conflicted:** None. The instruction to clone foreground-only without background tasks was strictly honored; broken directories (`SH11235__tatara`) were repaired and all 24 repositories were checked synchronously.
 
@@ -88,15 +88,15 @@ zTgx__cublas-rs: 46e4cc089a663362ea74e72a31b22842f68222fd Thu May 28 15:22:10 20
 ---
 
 ## 5. What you deliberately left untouched
-- `/Users/hckim/repo/bloomery`: Kept strictly read-only per rule ("Modify no repository; write nothing outside scratchpad/peers-a").
+- `bloomery/`: Kept strictly read-only per rule ("Modify no repository; write nothing outside scratchpad/peers-a").
 - All repositories cloned under `/private/tmp/.../scratchpad/peers-a/src/`: Left intact and unmodified; only inspected via read tools and python analysis scripts.
 
 ---
 
 ## 6. Improvement opportunities noticed beyond the spec
-1. `/Users/hckim/repo/bloomery/crates/gpu/src/lib.rs`: Loop counters in while loops can be typed `let mut k: u32 = 0;` rather than `usize`, which allows immediate use of `#[unroll(N)]` without triggering the `APInt::shl: bitwidth mismatch` compiler panic (size: trivial).
-2. `/Users/hckim/repo/bloomery/crates/gpu/src/graph.rs:60`: Implement `Drop for GraphCapture` to call `cuStreamEndCapture` and `cuGraphDestroy` if a panic or error occurs during capture, preventing stream poisoning (pattern seen in `orielhaim/FeLLM/crates/backend-cuda/src/graph.rs:118-128`) (size: trivial).
-3. `/Users/hckim/repo/bloomery/Cargo.toml`: Decouple `crates/gpu` via an isolated `[workspace]` or template build pattern (as seen in `frames-sg/j2k` and `rdaum/eider`), allowing normal `cargo check`, `cargo test`, and `rustfmt` to run on the rest of the workspace on stable Rust (size: a round).
+1. `bloomery/crates/gpu/src/lib.rs`: Loop counters in while loops can be typed `let mut k: u32 = 0;` rather than `usize`, which allows immediate use of `#[unroll(N)]` without triggering the `APInt::shl: bitwidth mismatch` compiler panic (size: trivial).
+2. `bloomery/crates/gpu/src/graph.rs:60`: Implement `Drop for GraphCapture` to call `cuStreamEndCapture` and `cuGraphDestroy` if a panic or error occurs during capture, preventing stream poisoning (pattern seen in `orielhaim/FeLLM/crates/backend-cuda/src/graph.rs:118-128`) (size: trivial).
+3. `bloomery/Cargo.toml`: Decouple `crates/gpu` via an isolated `[workspace]` or template build pattern (as seen in `frames-sg/j2k` and `rdaum/eider`), allowing normal `cargo check`, `cargo test`, and `rustfmt` to run on the rest of the workspace on stable Rust (size: a round).
 
 ---
 

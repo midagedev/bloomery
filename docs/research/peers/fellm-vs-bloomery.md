@@ -5,7 +5,7 @@
 **Target Hardware / Model Context**: DeepSeek-V2-Lite Q3_K_M, batch-1 decode, NVIDIA GeForce RTX 3090 (sm_86), single captured CUDA graph per step, bit-identical rerun discipline.  
 **Repositories Investigated**:
 - **Peer**: FeLLM (`plugins/cuda_kernels`, commit `bdd6507cff168e5a74236f35d381682ec592e903`)
-- **Ours**: bloomery (`/Users/hckim/repo/bloomery`, `crates/gpu`, `docs/gpu-design.md`)
+- **Ours**: bloomery (`bloomery/`, `crates/gpu`, `docs/gpu-design.md`)
 
 ---
 
@@ -321,7 +321,7 @@ fn mmvq_multirow(out_dim: u32, n_blocks: u32) -> bool {
 1. **Files changed**:
    - `scratchpad/fellm/report.md`: Created comparative investigation report.
 2. **Completion criteria commands**:
-   - Investigation only: read code from `<scratch>/peers-a/src/orielhaim__FeLLM` (commit `bdd6507`) and `/Users/hckim/repo/bloomery`. No repositories modified, no git state changes, no GPU execution.
+   - Investigation only: read code from `<scratch>/peers-a/src/orielhaim__FeLLM` (commit `bdd6507`) and `bloomery/`. No repositories modified, no git state changes, no GPU execution.
 3. **Self-verification**:
    - *Existing behavior removed/weakened*: None (read-only investigation).
    - *New constants/mappings/tables*: None added to any codebase.
