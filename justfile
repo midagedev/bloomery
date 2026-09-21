@@ -42,37 +42,40 @@ build-gpu:
 # GPU P0 게이트(docs/gpu-design.md 꾸러미 P0): 라이브러리 gemv가 y_ref 1e-2 안이고, 즉시 실행과
 # 그래프 재생의 출력 바이트가 같아야 한다. 호스트 제출 비용도 찍으므로 release 호스트 빌드다
 # (dev 호스트는 P0가 재려는 그 숫자를 부풀린다). 3090만 쓴다(박스 env가 UUID를 핀).
+# GPU 게이트 바이너리는 박스의 게이트 락 하나에 줄을 선다(빌드는 병렬, 실행만 직렬). 게이트 하나가 모델을 12 GB
+# 올리므로 둘이 같은 카드에 겹치면 OOM이다 — 2026-09-22, 세 워크트리의 게이트가 3090에 동시에 올라 하나가
+# DriverError(2)로 죽었다. 시간 러너의 임대(/root/bloomery-cpu.lock)와는 다른 락이다: 게이트는 3090, 시간은 A6000.
 gate-gpu-p0:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-spike --features gpu --release && ./target/release/gpu-spike'
 
 # GPU 커널 게이트 P1–P3: 트랙마다 자기 바이너리 하나(crates/gpu-gates/src/bin/gate_pN.rs).
 # 참조는 bloomery_gpu_gates(gguf 디퀀트 + f64 내적), 밴드는 KERNEL_BAND = 1e-2. 정확성 실행이고 측정이 아니다.
 gate-gpu-p1:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p1 && ./target/release/gate_p1'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p1 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p1'
 
 gate-gpu-p2:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p2 && ./target/release/gate_p2'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p2 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p2'
 
 gate-gpu-p3:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p3 && ./target/release/gate_p3'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p3 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p3'
 
 gate-gpu-p4:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p4 && ./target/release/gate_p4'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p4 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p4'
 
 gate-gpu-p5:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p5 && ./target/release/gate_p5'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p5 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p5'
 
 gate-gpu-p6:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p6 && ./target/release/gate_p6'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p6 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p6'
 
 gate-gpu-p9:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p9 && ./target/release/gate_p9'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p9 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p9'
 
 # 종단 게이트: 27층 + lm_head + argmax 전체 사슬을 ik CUDA greedy(33프롬프트 × 32스텝)와 대조하고,
 # 그래프 재생이 즉시 실행과 토큰 단위로 같은지 본다(정확성 실행, 측정 아님). 이름이 pN이 아닌 이유는
 # gate_e2e.rs 머리글 — P9·P10은 커널 꾸러미로 이미 쓰이고 있다.
 gate-gpu-e2e *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && ./target/release/gate_e2e {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_e2e {{ARGS}}'
 
 # 얇은 끝-끝 디코드 CLI(greedy, 토큰 하나씩, 프리필 커널 없음). `--time` 없이 토큰만 찍는 것은
 # 평범한 실행이고, `--time`은 측정이라 임대가 필요하다 — time-gpu-generate가 그쪽이다.
@@ -86,7 +89,7 @@ time-gpu-generate *ARGS:
 
 # P0b: 블록 0 FFN 융합 스파이크 — 융합 4런치가 op 8런치와 비트 동일한지(정확성 실행). 시간은 리드가 임대 안에서 `--time`으로 잰다.
 gate-gpu-p0b *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && ./target/release/gate_p0b {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p0b {{ARGS}}'
 
 # P0b 시간(리드 전용): 기계 전역 임대 아래 op 8노드 대 융합 4노드 그래프의 재생 µs, 빈 커널 4/8노드 참조 포함, 증인 블록 전후.
 time-gpu-p0b:
@@ -114,11 +117,11 @@ time-gpu-moe:
 
 # P8: 조립된 디코드 스텝(블록 0부터)을 덤프와 대조 — 엔진 자신의 탭.
 gate-gpu-p8 *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && ./target/release/gate_p8 {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p8 {{ARGS}}'
 
 # MoE 융합(P8 준비): 전문가 여섯의 gate·up·swiglu 한 런치 + 결합 한 런치가 op 경로와 비트 동일한지(정확성 실행).
 gate-gpu-moe:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && ./target/release/gate_moe_fused'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_moe_fused'
 
 # P7 뒤 절반: 블록·종단 게이트 하네스의 자기 검증(호스트 전용 — 두 오라클 사이의 알려진 거리를 재현해야 한다).
 gate-gpu-block:
@@ -126,7 +129,7 @@ gate-gpu-block:
 
 # P10: 가중치 상주 — 모델 파일의 모든 텐서를 커널이 먹는 디바이스 형식으로 올린다(정확성 실행, 측정 아님).
 gate-gpu-p10:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p10 && ./target/release/gate_p10'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p10 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p10'
 
 # 원시-x 측정 프로브(호스트 전용, 게이트 아님): ref_cuda의 실활성화에 대해 q8_1 양자화 바닥을 잰다.
 # 정확 참조(ref_gemv)를 재사용하고 판정은 하지 않는다 — 수치로 밴드·생성기를 재판단하는 건 리드다.
@@ -298,7 +301,7 @@ inventory-v41:
 # GPU 헤드(P8의 head 조각): result_norm → lm_head(Q6_K) → argmax를 그래프 하나로 잡아
 # 덤프의 마지막 토큰과 대조(정확성 실행, 핀된 헤드 밴드 안).
 gate-gpu-head:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && ./target/release/gate_head_gpu'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_head_gpu'
 
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
@@ -317,7 +320,7 @@ greedy-ref-cuda:
 # P8b: 조립된 MoE 층(층 1) 스텝을 덤프와 대조 — 어텐션 절반 + 라우터·전문가 여섯·공유 전문가·결합.
 # 입력은 오라클의 l_out-0, KV는 오라클의 kv_cache-1 앞 다섯 행. 밴드는 핀하지 않고 표만 찍는다.
 gate-gpu-p8b *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8b && ./target/release/gate_p8b {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8b && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p8b {{ARGS}}'
 
 # PTX 스캔(계측기, 게이트 아님 — 항상 exit 0): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
