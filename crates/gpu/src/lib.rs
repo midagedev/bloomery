@@ -158,7 +158,8 @@ pub(crate) fn q8_1_quant_block(
 mod kernels {
     use super::*;
     use crate::cores::{
-        funnel16, half_to_f32, q3k_row_dot, q4k_row_dot, q6k_chain, q6k_dequant, q6k_sub_scale,
+        funnel16, half_to_f32, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot, q4k_row_dot_1col,
+        q6k_chain, q6k_dequant, q6k_sub_scale,
     };
 
     /// Q3_K packing recap (decode verified against ggml's
@@ -412,6 +413,23 @@ mod kernels {
         }
         let lane = warp::lane_id() as usize;
         let m = m_cols as usize;
+        // One column takes the single-column body directly. Reached through
+        // the array-returning `cores::q4k_row_dot`, its `m_cols == 1` early
+        // return hands back seven constant zeros that the caller's m > 1
+        // reduction still merges, and the backend keeps them as copies in the
+        // walk — a launch-uniform column count is the one thing that lets the
+        // entry pick the body instead.
+        if m == 1 {
+            let f0 = q4k_row_dot_1col(w, q, s8, d8, n_sb as usize, iters, row, 0, lane);
+            let s0 = warp::reduce_sum_f32(f0);
+            if lane == 0 {
+                // SAFETY: only lane 0 writes; warp `row` owns y[row].
+                unsafe {
+                    *y.get_unchecked_mut(row) = s0;
+                }
+            }
+            return;
+        }
         // The per-row body (lane constants, the four-super-block iteration
         // with the hoisted SWAR nibble decode, the guarded column chains) is
         // `cores::q4k_row_dot`, so a fused kernel reusing it agrees with this
@@ -429,19 +447,12 @@ mod kernels {
             lane,
         );
 
-        // Warp-uniform reduction (m is a launch-wide constant). Column c's
-        // reduction runs only when m > c; every lane takes the same branch,
-        // so the shuffles stay warp-collective, and the tail scales with m
-        // exactly like the column bodies above.
+        // Warp-uniform reduction (m is a launch-wide constant, and > 1 here).
+        // Column c's reduction runs only when m > c; every lane takes the same
+        // branch, so the shuffles stay warp-collective, and the tail scales
+        // with m exactly like the column bodies above.
         let s0 = warp::reduce_sum_f32(f[0]);
-        if m == 1 {
-            if lane == 0 {
-                // SAFETY: only lane 0 writes; warp `row` owns y[row].
-                unsafe {
-                    *y.get_unchecked_mut(row) = s0;
-                }
-            }
-        } else {
+        {
             let s1 = warp::reduce_sum_f32(f[1]);
             let s2 = if m > 2 {
                 warp::reduce_sum_f32(f[2])
@@ -913,6 +924,21 @@ mod kernels {
         }
         let lane = warp::lane_id() as usize;
         let m = m_cols as usize;
+        // One column takes the single-column body directly — see the same
+        // shape in `q4k_gemv`. The entries whose column count is a literal 1
+        // (`q3k_gemv_sel`, the fused block and expert kernels) already get
+        // this by constant folding; an entry that takes it at launch does not.
+        if m == 1 {
+            let f0 = q3k_row_dot_1col(w, q, d8, n_sb as usize, iters, row, 0, lane);
+            let s0 = warp::reduce_sum_f32(f0);
+            if lane == 0 {
+                // SAFETY: only lane 0 writes; warp `row` owns y[row].
+                unsafe {
+                    *y.get_unchecked_mut(row) = s0;
+                }
+            }
+            return;
+        }
         // The per-row body (lane constants, the two-super-block iteration
         // with the SWAR weight decode, the guarded column chains) is
         // `cores::q3k_row_dot`, shared with `q3k_gemv_sel` and the fused
@@ -929,19 +955,12 @@ mod kernels {
             lane,
         );
 
-        // Warp-uniform reduction (m is a launch-wide constant). Column c's
-        // reduction runs only when m > c; every lane takes the same branch,
-        // so the shuffles stay warp-collective, and the tail scales with m
-        // exactly like the column bodies above.
+        // Warp-uniform reduction (m is a launch-wide constant, and > 1 here).
+        // Column c's reduction runs only when m > c; every lane takes the same
+        // branch, so the shuffles stay warp-collective, and the tail scales
+        // with m exactly like the column bodies above.
         let s0 = warp::reduce_sum_f32(f[0]);
-        if m == 1 {
-            if lane == 0 {
-                // SAFETY: only lane 0 writes; warp `row` owns y[row].
-                unsafe {
-                    *y.get_unchecked_mut(row) = s0;
-                }
-            }
-        } else {
+        {
             let s1 = warp::reduce_sum_f32(f[1]);
             let s2 = if m > 2 {
                 warp::reduce_sum_f32(f[2])

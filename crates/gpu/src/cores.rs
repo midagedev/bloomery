@@ -742,7 +742,8 @@ pub fn q3k_sb_decode(w: &[u32], base: usize, w16: usize, s0: usize) -> ([u32; 4]
 /// the walk's accumulation is — which is what lets the walk issue several
 /// iterations' loads before the first add.
 ///
-/// SAFETY: callers guarantee `sbp < n_sb` and the buffer lengths of
+/// SAFETY: callers guarantee `sbp < n_sb`, that `base` is that
+/// super-block's byte offset inside row `row_abs`, and the buffer lengths of
 /// [`q3k_row_dot`] at `m_cols` 1.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
@@ -750,9 +751,8 @@ fn q3k_iter_term(
     w: &[u32],
     q: &[u64],
     d8: &[f32],
-    n_sb: usize,
+    base: usize,
     it: u32,
-    row_abs: usize,
     qb0: usize,
     d8b0: usize,
     w16: usize,
@@ -762,9 +762,9 @@ fn q3k_iter_term(
     lane: usize,
 ) -> f32 {
     let sbp = ((it << 1) | half as u32) as usize;
-    // SAFETY: row_abs is inside `w` and sbp < n_sb by this fn's contract,
-    // so the super-block's window stays in the row.
-    let (vi, sc, drow) = q3k_sb_decode(w, row_abs * 110 * n_sb + sbp * 110, w16, s0);
+    // SAFETY: `base` is this super-block's byte offset inside the row by this
+    // fn's contract, so its window stays in the row.
+    let (vi, sc, drow) = q3k_sb_decode(w, base, w16, s0);
     let qb = 64 * it as usize + lane;
     let d8b = 2 * sbp + d8_base;
     // SAFETY: qb0 + qb < (col0+1)*64*iters, the column's u64 slots, by the
@@ -816,18 +816,25 @@ pub fn q3k_row_dot_1col(
     let qb0 = col0 * q_col;
     let d8b0 = col0 * d8_col;
 
+    // The super-block's byte offset is affine in the iteration — the walk
+    // steps two super-blocks, 220 bytes — so it is carried and bumped.
+    // Rebuilt from `it` it is a 64-bit multiply and a fresh window
+    // derivation every pass: the funnel's `>> 2` of a 110-byte stride is
+    // what stops the backend from reducing it.
+    let mut base = row_abs * 110 * n_sb + half * 110;
+
     let mut it: u32 = 0;
     while it < iters {
         let sbp = ((it << 1) | half as u32) as usize;
         // As `q3k_row_dot`: the guard makes a partial final iteration safe
         // and is always true when n_sb is even.
         if sbp < n_sb {
-            // SAFETY: the guard is this term's `sbp < n_sb` precondition.
-            f0 += q3k_iter_term(
-                w, q, d8, n_sb, it, row_abs, qb0, d8b0, w16, half, s0, d8_base, lane,
-            );
+            // SAFETY: the guard is this term's `sbp < n_sb` precondition, and
+            // `base` is that super-block's byte offset in row `row_abs`.
+            f0 += q3k_iter_term(w, q, d8, base, it, qb0, d8b0, w16, half, s0, d8_base, lane);
         }
 
+        base += 220;
         it += 1;
     }
 
