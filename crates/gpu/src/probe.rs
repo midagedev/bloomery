@@ -5,7 +5,9 @@
 
 use crate::GpuError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_device::{
+    DisjointSlice, cooperative_launch, grid, kernel, launch_bounds, launch_contract, thread,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -25,6 +27,32 @@ mod probe_kernels {
         // SAFETY: i < n <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = 1.0;
+        }
+    }
+
+    /// Two phases inside ONE launch, ordered by a grid-wide barrier: every
+    /// block writes 1.0, all blocks meet at `grid::sync`, then every block
+    /// writes 3.0. Cooperative launch is what makes the barrier legal — all
+    /// blocks are co-resident — and is the ordering primitive a fused block
+    /// kernel needs between its stages.
+    #[kernel]
+    #[cooperative_launch]
+    #[launch_bounds(32)]
+    #[launch_contract(domain = 1, block = (32, 1, 1), requires = (y.len() >= n))]
+    pub fn two_phase(n: u32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i < n as usize {
+            // SAFETY: i < n <= y.len() by the launch contract.
+            unsafe {
+                *y.get_unchecked_mut(i) = 1.0;
+            }
+        }
+        grid::sync();
+        if i < n as usize {
+            // SAFETY: as above.
+            unsafe {
+                *y.get_unchecked_mut(i) = 3.0;
+            }
         }
     }
 }
@@ -50,6 +78,21 @@ impl Probe {
     ) -> Result<(), GpuError> {
         let prep = self.module.prepare_touch(LaunchConfig1D::new(1, 32, 0))?;
         self.module.touch(stream, &prep, 32, y)?;
+        Ok(())
+    }
+
+    /// Enqueue one cooperative `two_phase` over `blocks` 32-thread blocks
+    /// (`y.len() >= blocks * 32`).
+    pub fn enqueue_two_phase(
+        &self,
+        stream: &CudaStream,
+        blocks: u32,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let prep = self
+            .module
+            .prepare_two_phase(LaunchConfig1D::new(blocks, 32, 0))?;
+        self.module.two_phase(stream, &prep, blocks * 32, y)?;
         Ok(())
     }
 }

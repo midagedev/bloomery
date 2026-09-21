@@ -159,8 +159,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Node-gap probe: one graph of N nodes (the two-kernel pair repeated),
     // replayed with a synchronize per replay, so us/node is what a step of N
     // op-kernels costs on the device once host submission is gone. Two row
-    // counts: at 8 rows the gemv body is near-empty and the figure reads as
-    // the per-node gap; at 2048 rows it carries a real attn-sized body.
+    // counts, both carrying real bodies (the 2048-column quantizer's
+    // reductions dominate the 8-row figure); the pure per-node gap is the
+    // `touch` probe below.
     // Design figures, same standing as the submission probe above.
     for rows in [8usize, 2048] {
         let w_probe = DeviceTensor::upload(stream, &w_host[..rows * 288], rows, 288)?;
@@ -224,6 +225,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if touched.iter().any(|&v| v != 1.0) {
         eprintln!("FAIL: touch kernel from the second device module did not write its 32 elements");
         all_ok = false;
+    }
+
+    // Cooperative launch: a two-phase kernel whose phases are ordered by one
+    // grid-wide barrier. Correctness (every element saw phase 2), capture
+    // (one node, replay bit-identical), and the barrier's cost per launch at
+    // 1 / 8 / 64 blocks against `touch` at the same geometry.
+    for blocks in [1u32, 8, 64] {
+        let len = blocks as usize * 32;
+        let mut y2 = DeviceBuffer::<f32>::zeroed(stream, len)?;
+        probe.enqueue_two_phase(stream, blocks, &mut y2)?;
+        stream.synchronize()?;
+        let eager = y2.to_host_vec(stream)?;
+        y2.zero_async(stream)?;
+        stream.synchronize()?;
+        let g = gpu.capture(|s| probe.enqueue_two_phase(s, blocks, &mut y2))?;
+        g.launch(stream)?;
+        stream.synchronize()?;
+        let replay = y2.to_host_vec(stream)?;
+        let ok = eager.iter().all(|&v| v == 3.0) && replay.iter().all(|&v| v == 3.0);
+        let reps = 200u32;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            g.launch(stream)?;
+        }
+        stream.synchronize()?;
+        let us = t.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        println!(
+            "cooperative probe blocks={blocks}: two_phase_ok={ok} graph_nodes={} replay {us:.2} us/launch",
+            g.node_count()
+        );
+        if !ok {
+            eprintln!("FAIL: cooperative two_phase did not reach phase 2 everywhere");
+            all_ok = false;
+        }
     }
 
     // Bare launch+sync and full-call figures, kept from the packaging spike.
