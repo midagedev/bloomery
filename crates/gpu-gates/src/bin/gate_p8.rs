@@ -102,6 +102,17 @@ const NODES_BLOCK0: usize = 21;
 const MARK_BYTES: u64 = 1 << 20;
 #[cfg(feature = "gpu")]
 const MARK_GBPS: f64 = 100.0;
+/// The second axis, for the ops the bandwidth marker above cannot see: an op
+/// under `MARK_BYTES` has no bytes to be slow for, so its cost is latency —
+/// a lane walking a row with one load in flight, or one thread walking a
+/// table. `sync_floor_us` is this harness's own per-op cost, so an op below
+/// it is mostly instrument and an op at several times it is spending real
+/// device time on almost no traffic. Two floors is where that separation
+/// falls on this chain: it names the two ops of the router pair and no
+/// other row of the layer-1 table, on the table before this round's kernels
+/// and on the table after.
+#[cfg(feature = "gpu")]
+const MARK_FLOOR_MULT: f64 = 2.0;
 /// The two references the per-op GB/s is read against, both derived in
 /// docs/roofline.md: the kernel-level floor this card's gemvs reach and the
 /// whole-pass average the reference engine shows.
@@ -403,34 +414,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let ops = model.profile_layer(profile_layer, prof_token, prof_pos, PROF_REPS)?;
         let refresh_us = model.refresh_params_us(prof_token, prof_pos, PROF_REPS)?;
-        let probe = bloomery_gpu::probe::Probe::load(model.stages()[0].gpu().context())?;
-        let stream = model.stages()[0].gpu().stream();
-        let mut tbuf = cuda_core::DeviceBuffer::<f32>::zeroed(stream, 32)?;
-        for _ in 0..20 {
-            probe.enqueue_touch(stream, &mut tbuf)?;
+        // Scoped: the stream borrow taken here must end before the layer
+        // capture below, which needs `&mut model`.
+        let (floor_min, floor_sum, graph_us) = {
+            let probe = bloomery_gpu::probe::Probe::load(model.stages()[0].gpu().context())?;
+            let stream = model.stages()[0].gpu().stream();
+            let mut tbuf = cuda_core::DeviceBuffer::<f32>::zeroed(stream, 32)?;
+            for _ in 0..20 {
+                probe.enqueue_touch(stream, &mut tbuf)?;
+                stream.synchronize()?;
+            }
+            let mut floor_min = f64::INFINITY;
+            let mut floor_sum = 0.0f64;
+            for _ in 0..PROF_REPS {
+                let t0 = std::time::Instant::now();
+                probe.enqueue_touch(stream, &mut tbuf)?;
+                stream.synchronize()?;
+                let us = t0.elapsed().as_secs_f64() * 1e6;
+                floor_min = floor_min.min(us);
+                floor_sum += us;
+            }
+            // The --time number, measured in this same process.
+            for _ in 0..2 {
+                model.launch_block0_graph()?;
+            }
             stream.synchronize()?;
-        }
-        let mut floor_min = f64::INFINITY;
-        let mut floor_sum = 0.0f64;
-        for _ in 0..PROF_REPS {
             let t0 = std::time::Instant::now();
-            probe.enqueue_touch(stream, &mut tbuf)?;
+            for _ in 0..N {
+                model.launch_block0_graph()?;
+            }
             stream.synchronize()?;
-            let us = t0.elapsed().as_secs_f64() * 1e6;
-            floor_min = floor_min.min(us);
-            floor_sum += us;
-        }
-        // The --time number, measured in this same process.
-        for _ in 0..2 {
-            model.launch_block0_graph()?;
-        }
-        stream.synchronize()?;
-        let t0 = std::time::Instant::now();
-        for _ in 0..N {
-            model.launch_block0_graph()?;
-        }
-        stream.synchronize()?;
-        let graph_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(N);
+            (
+                floor_min,
+                floor_sum,
+                t0.elapsed().as_secs_f64() * 1e6 / f64::from(N),
+            )
+        };
 
         // The FFN half starts at the layer's own norm: the fused dense four
         // for a layer without a router, the routed ten for a layer with one.
@@ -476,8 +495,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => "?".to_string(),
         };
         for op in &ops {
+            let net = op.us_min - floor_min;
             let mark = match (op.bytes, gbps(op)) {
                 (Some(b), Some(g)) if b >= MARK_BYTES && g < MARK_GBPS => " shape_defect_candidate",
+                (Some(b), _) if b < MARK_BYTES && net >= MARK_FLOOR_MULT * floor_min => {
+                    " latency_defect_candidate"
+                }
                 _ => "",
             };
             println!(
@@ -513,14 +536,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              sum_net_us={sum_net_us:.3} effective_gbps={} \
              ref_kernel_floor_gbps={REF_KERNEL_FLOOR_GBPS:.0} \
              ref_whole_pass_gbps={REF_WHOLE_PASS_GBPS:.0} refs=docs/roofline.md \
-             marker=bytes>={MARK_BYTES}_and_gbps<{MARK_GBPS:.0}",
-            show((sum_net_us > 0.0).then(|| sum_bytes as f64 / sum_net_us / 1e3))
+             marker=bytes>={MARK_BYTES}_and_gbps<{MARK_GBPS:.0} \
+             marker2=bytes<{MARK_BYTES}_and_net_us>={mark_floor:.3}(={MARK_FLOOR_MULT:.0}x_sync_floor)",
+            show((sum_net_us > 0.0).then(|| sum_bytes as f64 / sum_net_us / 1e3)),
+            mark_floor = MARK_FLOOR_MULT * floor_min,
         );
         println!(
             "prof split attn_ops={ffn_start} ffn_ops={} attn_us={attn_us:.3} ffn_us={ffn_us:.3} \
              attn_net_us={attn_net_us:.3} ffn_net_us={ffn_net_us:.3}",
             ops.len() - ffn_start
         );
+
+        // The profiled layer, captured and replayed. Every row above is an
+        // eager launch + body + one synchronize; the replay is what the same
+        // chain costs as graph nodes, which is the form the decode step runs
+        // in. The two together say whether a row's net time is device work or
+        // the profile's own submit path. Only for a layer above 0: block 0's
+        // replay is `graph_replay_us` above, and `capture_layer` captures
+        // without the embedding in front, so at layer 0 it would time a
+        // shorter chain than the table it is printed beside.
+        if profile_layer > 0 {
+            let layer_nodes = model.capture_layer(profile_layer)?;
+            let stream = model.stages()[0].gpu().stream();
+            for _ in 0..2 {
+                model.launch_layer_graph(profile_layer)?;
+            }
+            stream.synchronize()?;
+            let mut best = f64::INFINITY;
+            let mut worst = 0.0f64;
+            let mut sum = 0.0f64;
+            const ROUNDS: u32 = 7;
+            for _ in 0..ROUNDS {
+                let t0 = std::time::Instant::now();
+                for _ in 0..N {
+                    model.launch_layer_graph(profile_layer)?;
+                }
+                stream.synchronize()?;
+                let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(N);
+                best = best.min(us);
+                worst = worst.max(us);
+                sum += us;
+            }
+            println!(
+                "prof layer_replay layer={profile_layer} nodes={layer_nodes} rounds={ROUNDS} \
+                 n_per_round={N} replay_us_min={best:.3} replay_us_mean={:.3} \
+                 replay_us_max={worst:.3} eager_sum_net_us={sum_net_us:.3} \
+                 eager_sum_us={sum_us:.3} replay_over_eager_net={:.3}",
+                sum / f64::from(ROUNDS),
+                best / sum_net_us
+            );
+        }
+    }
+
+    // ---- R-1(b/c): the honest per-launch cost of the kernels the profile
+    // table flags, free of its per-op synchronize. Lead-only, same lease.
+    if std::env::args().any(|a| a == "--bench-kernels") {
+        bench_kernels(&model)?;
     }
 
     if !ok {
@@ -532,6 +603,141 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          token, rerun/replay/second-position bit-identical, inside the structural fence"
     );
     Ok(())
+}
+
+/// R-1: per-launch cost of the kernels the profile table flags, measured the
+/// two ways that bracket what a per-op row cannot say. `eager` is N launches
+/// issued back to back with one synchronize at the end — the larger of host
+/// submit rate and device time, with no per-op sync in it. `graph` is the
+/// same N launches captured into one graph and replayed — what a node of the
+/// step's own graph costs. `touch` (an empty kernel) is the floor of both.
+/// The f32 gemv runs at three row counts in one process, so the router's
+/// 64-row shape is read against the big shapes on the same instrument.
+#[cfg(feature = "gpu")]
+fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
+    use bloomery_gpu::{DeviceTensor, GpuError, Graph};
+    use cuda_core::{CudaStream, DeviceBuffer};
+
+    /// Launches per burst, and nodes per captured graph.
+    const N: usize = 64;
+    /// Bursts (or graph replays) per arm — the spread of these is printed.
+    const ROUNDS: u32 = 7;
+    /// Graph launches per round, so the one synchronize is amortized.
+    const GREPS: usize = 4;
+
+    fn burst(
+        stream: &CudaStream,
+        enq: &mut dyn FnMut(&CudaStream) -> Result<(), GpuError>,
+    ) -> Result<(f64, f64, f64), Box<dyn std::error::Error>> {
+        for _ in 0..N {
+            enq(stream)?;
+        }
+        stream.synchronize()?;
+        let (mut lo, mut hi, mut sum) = (f64::INFINITY, 0.0f64, 0.0f64);
+        for _ in 0..ROUNDS {
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                enq(stream)?;
+            }
+            stream.synchronize()?;
+            let us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
+            lo = lo.min(us);
+            hi = hi.max(us);
+            sum += us;
+        }
+        Ok((lo, sum / f64::from(ROUNDS), hi))
+    }
+
+    fn replay(
+        stream: &CudaStream,
+        g: &Graph,
+    ) -> Result<(f64, f64, f64), Box<dyn std::error::Error>> {
+        for _ in 0..2 {
+            g.launch(stream)?;
+        }
+        stream.synchronize()?;
+        let (mut lo, mut hi, mut sum) = (f64::INFINITY, 0.0f64, 0.0f64);
+        for _ in 0..ROUNDS {
+            let t0 = std::time::Instant::now();
+            for _ in 0..GREPS {
+                g.launch(stream)?;
+            }
+            stream.synchronize()?;
+            let us = t0.elapsed().as_secs_f64() * 1e6 / (N * GREPS) as f64;
+            lo = lo.min(us);
+            hi = hi.max(us);
+            sum += us;
+        }
+        Ok((lo, sum / f64::from(ROUNDS), hi))
+    }
+
+    let gpu = model.stages()[0].gpu();
+    let stream = gpu.stream();
+    let probe = bloomery_gpu::probe::Probe::load(gpu.context())?;
+
+    let x = DeviceBuffer::<f32>::zeroed(stream, 2048)?;
+    let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
+    let mut probs = DeviceBuffer::<f32>::zeroed(stream, 64)?;
+    let mut ids = DeviceBuffer::<u32>::zeroed(stream, 6)?;
+    let mut wts = DeviceBuffer::<f32>::zeroed(stream, 6)?;
+
+    println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS} m_cols=1");
+
+    {
+        let mut enq = |s: &CudaStream| probe.enqueue_touch(s, &mut tbuf);
+        let e = burst(stream, &mut enq)?;
+        let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+        let r = replay(stream, &g)?;
+        print_arm("touch", 0, 0, g.node_count(), e, r);
+    }
+
+    for rows in [64usize, 576, 2048] {
+        let w = DeviceTensor::<f32>::zeroed(stream, rows, 2048)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, rows)?;
+        let mut enq = |s: &CudaStream| gpu.q8f32().enqueue_f32_gemv(s, &w, &x, 1, &mut y);
+        let e = burst(stream, &mut enq)?;
+        let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+        let r = replay(stream, &g)?;
+        // What the launch addresses: the whole weight plus one activation
+        // column plus the outputs — the profile's own byte convention.
+        let bytes = (rows * 2048 * 4 + 2048 * 4 + rows * 4) as u64;
+        print_arm("f32_gemv", rows, bytes, g.node_count(), e, r);
+    }
+
+    {
+        let mut enq = |s: &CudaStream| {
+            gpu.router()
+                .enqueue_router_topk(s, &x, 1, 1.0, &mut probs, &mut ids, &mut wts)
+        };
+        let e = burst(stream, &mut enq)?;
+        let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+        let r = replay(stream, &g)?;
+        print_arm("router_topk", 1, 560, g.node_count(), e, r);
+    }
+    Ok(())
+}
+
+/// One `bench` row: the eager burst and the graph replay of the same launch,
+/// each as min/mean/max over the arm's rounds, with the graph GB/s beside it.
+#[cfg(feature = "gpu")]
+fn print_arm(
+    name: &str,
+    rows: usize,
+    bytes: u64,
+    nodes: usize,
+    eager: (f64, f64, f64),
+    graph: (f64, f64, f64),
+) {
+    let gbps = match (bytes > 0, graph.0 > 0.0) {
+        (true, true) => format!("{:.1}", bytes as f64 / graph.0 / 1e3),
+        _ => "?".to_string(),
+    };
+    println!(
+        "bench op={name} rows={rows} nodes={nodes} bytes={bytes} \
+         eager_us_min={:.3} eager_us_mean={:.3} eager_us_max={:.3} \
+         graph_us_min={:.3} graph_us_mean={:.3} graph_us_max={:.3} graph_gbps={gbps}",
+        eager.0, eager.1, eager.2, graph.0, graph.1, graph.2
+    );
 }
 
 /// One `<flag> <u32>` pair off the command line: `--profile-pos` names the

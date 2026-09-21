@@ -1871,6 +1871,15 @@ impl GpuModel {
         self.launch_graph((0, true))
     }
 
+    /// Enqueue one replay of a captured layer graph ([`GpuModel::capture_layer`])
+    /// — no parameter refresh, no synchronization. The profile's layer-replay
+    /// arm drives this in a loop, the way [`GpuModel::launch_block0_graph`]
+    /// serves block 0: a per-op table taken eagerly cannot say how much of a
+    /// row is the launch, and only a replay of the same chain can.
+    pub fn launch_layer_graph(&self, l: usize) -> Result<(), GpuError> {
+        self.launch_graph((l, false))
+    }
+
     /// Launch the stage's graph, requiring it to be the capture of `want`
     /// (layer, embeds in front).
     fn launch_graph(&self, want: (usize, bool)) -> Result<(), GpuError> {

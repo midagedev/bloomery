@@ -613,11 +613,53 @@ fn eat(mut h: u64, bytes: &[u8]) -> u64 {
 /// and the assertion pins it: the f64 sum of the 64 exps is contracted to
 /// ascending expert order, so one thread owns one token whole and the block
 /// only has to cover `m <= 8`.
+///
+/// The router's other launch is `f32_gemv`, and its compiled shape is
+/// asserted here too, for the defect one file over: a lane walks its row in
+/// 32-value chunks, and when the eight activation columns are guarded by
+/// runtime tests *inside* that walk, each chunk's multiply-add sits in its
+/// own basic block and the lane can only ever have that chunk's load in
+/// flight. The row then costs one memory round trip per chunk no matter how
+/// many blocks the grid has — a 64-row weight and a 576-row weight take the
+/// same time — so no launch-geometry assertion can see it. What can see it
+/// is the entry's `fma.` count: a body carrying one multiply-add per column
+/// and nothing else is the starved shape, and the single-column body
+/// (`q8f32::f32_lane_partial_1col`, the decode shape) adds `LANE_UNROLL`
+/// more, one per chunk whose load it hoists. `q8_0_gemv` shares that core
+/// and is pinned with it, because an assertion on one would not catch the
+/// other being reverted.
 #[cfg(feature = "gpu")]
 fn router_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+    use bloomery_gpu::q8f32::LANE_UNROLL;
     use bloomery_gpu::router::ROUTER_THREADS;
 
+    /// Activation columns the general gemv body guards, one multiply-add
+    /// each: the count an entry carrying *only* the starved body shows.
+    const GEMV_COLS: usize = 8;
+    /// Floor on a gemv entry's `fma.`: the general body's one per column
+    /// plus the single-column body's one per hoisted chunk. A body that lost
+    /// the single-column path, or kept it without hoisting, cannot reach it.
+    /// The floor, not the exact count — the backend is free to duplicate a
+    /// body it inlines, and pinning the duplication would be pinning the
+    /// compiler rather than the shape.
+    let gemv_fma_floor = GEMV_COLS + LANE_UNROLL;
+
     let blob = std::fs::read(std::env::current_exe()?)?;
+    for name in ["f32_gemv", "q8_0_gemv"] {
+        let c = bloomery_gpu_gates::ptx::counts(&blob, name)
+            .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
+        let pass = c.fma >= gemv_fma_floor && !c.depot;
+        println!(
+            "shape op={name} fma={} fma_floor={gemv_fma_floor} (cols={GEMV_COLS} + \
+             LANE_UNROLL={LANE_UNROLL}) local_depot={} {}",
+            c.fma,
+            c.depot,
+            verdict(pass)
+        );
+        if !pass {
+            *ok = false;
+        }
+    }
     for name in ["router_topk", "expert_table"] {
         let c = bloomery_gpu_gates::ptx::counts(&blob, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;

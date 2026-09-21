@@ -51,6 +51,22 @@ pub fn f32_lane_partials(
     m_cols: u32,
     lane: usize,
 ) -> [f32; 8] {
+    // One column is the decode shape, and it gets a body of its own: the
+    // guards below are runtime tests, so in the general loop each chunk's
+    // multiply-add sits behind its own branch and the lane can have only
+    // that chunk's load in flight. See `f32_lane_partial_1col`.
+    if m_cols == 1 {
+        return [
+            f32_lane_partial_1col(w, x, k, row, lane),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+    }
     let k = k as usize;
     let w_row = row * k;
     let mut f0 = 0.0f32;
@@ -104,6 +120,64 @@ pub fn f32_lane_partials(
     [f0, f1, f2, f3, f4, f5, f6, f7]
 }
 
+/// Chunks whose loads a single-column lane body issues before its first
+/// multiply-add. The row walk is a dependent chain — each chunk's address is
+/// known in advance but its multiply-add feeds the next — so with one chunk
+/// in flight a lane pays one memory round trip per chunk and the row's cost
+/// is the chunk count times that latency, whatever the grid geometry is.
+/// Issuing this many loads first is what turns the walk into a bandwidth
+/// problem; it does not touch the accumulation order.
+pub const LANE_UNROLL: usize = 4;
+
+/// Lane `lane`'s partial sum for one F32 row against a single activation
+/// column: `Σ_it fma(w[row·k + 32·it + lane], x[32·it + lane])`, accumulated
+/// sequentially in `it` — [`f32_lane_partials`]'s column 0, in the same order,
+/// with [`LANE_UNROLL`] chunks' loads hoisted above the multiply-adds that
+/// consume them. Caller contract as [`f32_lane_partials`] with `m_cols` 1.
+#[inline(always)]
+pub fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, lane: usize) -> f32 {
+    let k = k as usize;
+    let w_row = row * k;
+    let iters = k >> 5;
+    let mut f = 0.0f32;
+    let mut it = 0usize;
+    // Named scalars, not an array: an array whose element a loop selects is
+    // served from a local depot whatever the loop unrolls to, and the round
+    // trip that costs is the thing this body exists to avoid.
+    while it + LANE_UNROLL <= iters {
+        let kk = it * 32 + lane;
+        // SAFETY: kk + 96 < k by the loop guard (LANE_UNROLL = 4), so every
+        // read is inside w[w_row .. w_row + k] and x[0 .. k], both covered by
+        // the caller contract (w.len() >= (row+1)*k, x.len() >= k).
+        let (w0, w1, w2, w3, x0, x1, x2, x3) = unsafe {
+            (
+                *w.get_unchecked(w_row + kk),
+                *w.get_unchecked(w_row + kk + 32),
+                *w.get_unchecked(w_row + kk + 64),
+                *w.get_unchecked(w_row + kk + 96),
+                *x.get_unchecked(kk),
+                *x.get_unchecked(kk + 32),
+                *x.get_unchecked(kk + 64),
+                *x.get_unchecked(kk + 96),
+            )
+        };
+        f = f32::mul_add(w0, x0, f);
+        f = f32::mul_add(w1, x1, f);
+        f = f32::mul_add(w2, x2, f);
+        f = f32::mul_add(w3, x3, f);
+        it += LANE_UNROLL;
+    }
+    while it < iters {
+        let kk = it * 32 + lane;
+        // SAFETY: kk < k by the loop guard, so both reads are inside
+        // w[w_row .. w_row + k] and x[0 .. k] by the caller contract.
+        let (wv, xv) = unsafe { (*w.get_unchecked(w_row + kk), *x.get_unchecked(kk)) };
+        f = f32::mul_add(wv, xv, f);
+        it += 1;
+    }
+    f
+}
+
 /// Lane `lane`'s partial sums for one Q8_0 row: the weight at value `kk` of
 /// `row` is `q·d` with `q` the signed code in word `qs[row·k/4 + kk/4]`,
 /// byte `kk%4`, and `d` the block scale `d[row·k/32 + kk/32]` — the same
@@ -126,6 +200,20 @@ pub fn q8_0_lane_partials(
     m_cols: u32,
     lane: usize,
 ) -> [f32; 8] {
+    // As `f32_lane_partials`: one column is the decode shape and gets the
+    // body whose loads are hoisted.
+    if m_cols == 1 {
+        return [
+            q8_0_lane_partial_1col(qs, d, x, k, row, x0, lane),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+    }
     let k = k as usize;
     let qs_row = row * (k >> 2);
     let d_row = row * (k >> 5);
@@ -182,6 +270,76 @@ pub fn q8_0_lane_partials(
         it += 1;
     }
     [f0, f1, f2, f3, f4, f5, f6, f7]
+}
+
+/// Lane `lane`'s partial sum for one Q8_0 row against a single activation
+/// column — [`q8_0_lane_partials`]'s column 0, same weight decode and same
+/// order, with [`LANE_UNROLL`] chunks' code, scale and activation loads
+/// hoisted above the multiply-adds that consume them. Caller contract as
+/// [`q8_0_lane_partials`] with `m_cols` 1.
+#[inline(always)]
+pub fn q8_0_lane_partial_1col(
+    qs: &[u32],
+    d: &[f32],
+    x: &[f32],
+    k: u32,
+    row: usize,
+    x0: usize,
+    lane: usize,
+) -> f32 {
+    let k = k as usize;
+    let qs_row = row * (k >> 2);
+    let d_row = row * (k >> 5);
+    let iters = k >> 5;
+    let mut f = 0.0f32;
+    let mut it = 0usize;
+    while it + LANE_UNROLL <= iters {
+        let kk = it * 32 + lane;
+        let sh = 8 * (kk & 3);
+        // SAFETY: kk + 96 < k by the loop guard, so word (kk + 96)/4 < k/4
+        // and scale it + 3 < k/32 are inside qs and d from their row bases,
+        // and x0 + kk + 96 < x0 + k <= x.len() — all by the caller contract.
+        // The four chunks are 32 values apart, so each keeps the byte lane
+        // `kk & 3` of its own word.
+        let (q0, q1, q2, q3, d0, d1, d2, d3, x0v, x1v, x2v, x3v) = unsafe {
+            (
+                *qs.get_unchecked(qs_row + (kk >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 32) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 64) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 96) >> 2)),
+                *d.get_unchecked(d_row + it),
+                *d.get_unchecked(d_row + it + 1),
+                *d.get_unchecked(d_row + it + 2),
+                *d.get_unchecked(d_row + it + 3),
+                *x.get_unchecked(x0 + kk),
+                *x.get_unchecked(x0 + kk + 32),
+                *x.get_unchecked(x0 + kk + 64),
+                *x.get_unchecked(x0 + kk + 96),
+            )
+        };
+        f = f32::mul_add((q0 >> sh) as u8 as i8 as f32 * d0, x0v, f);
+        f = f32::mul_add((q1 >> sh) as u8 as i8 as f32 * d1, x1v, f);
+        f = f32::mul_add((q2 >> sh) as u8 as i8 as f32 * d2, x2v, f);
+        f = f32::mul_add((q3 >> sh) as u8 as i8 as f32 * d3, x3v, f);
+        it += LANE_UNROLL;
+    }
+    while it < iters {
+        let kk = it * 32 + lane;
+        // SAFETY: kk < k by the loop guard, so word kk/4 and scale it are
+        // inside qs and d from their row bases, and x0 + kk < x0 + k
+        // <= x.len() — all by the caller contract.
+        let (qw, dv, xv) = unsafe {
+            (
+                *qs.get_unchecked(qs_row + (kk >> 2)),
+                *d.get_unchecked(d_row + it),
+                *x.get_unchecked(x0 + kk),
+            )
+        };
+        let wv = (qw >> (8 * (kk & 3))) as u8 as i8 as f32 * dv;
+        f = f32::mul_add(wv, xv, f);
+        it += 1;
+    }
+    f
 }
 
 /// The row's m sums from the per-lane partials: the fixed five-step

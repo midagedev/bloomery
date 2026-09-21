@@ -16,8 +16,11 @@
 //! `x[e * m + t]` (expert e of token t) — the router gemv's `y` as produced.
 
 use crate::GpuError;
+use crate::elem::argmax_take;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -93,7 +96,118 @@ mod router_kernels {
         mut ids: DisjointSlice<u32>,
         mut weights: DisjointSlice<f32>,
     ) {
+        // The token's 64 probabilities for the decode path below: lane 0
+        // writes them in the contract's order, the whole warp reads them past
+        // the barrier. Shared, not a per-thread array — an array a
+        // data-dependent id selects is served from a local depot whatever the
+        // loops unroll to, and that round trip is what this kernel's shape
+        // exists to keep out.
+        static mut P: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
+
         let t = thread::index_1d().get();
+        if m == 1 {
+            // SAFETY: P is this block's own shared allocation; the raw form
+            // is the only way to reach it without a reference to a
+            // `static mut`. Every index below is an expert id < N_EXPERT, and
+            // lane 0's writes precede every other lane's reads by
+            // `sync_threads`.
+            let p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut P) };
+            if t == 0 {
+                // Passes 1-3, the module doc's orders op for op — the serial
+                // ascending `f32::max` fold, `exp` in f32, the sum in f64 in
+                // ascending expert order, the f32 divide by `sum as f32`. The
+                // quotients land in shared and in `probs`, which its real
+                // consumers read.
+                let mut mx = f32::NEG_INFINITY;
+                let mut e = 0usize;
+                while e < N_EXPERT {
+                    // SAFETY: e < 64 = 64*m <= x.len() by the launch contract.
+                    let le = unsafe { *x.get_unchecked(e) };
+                    mx = mx.max(le);
+                    e += 1;
+                }
+                let mut sum = 0.0f64;
+                let mut e = 0usize;
+                while e < N_EXPERT {
+                    // SAFETY: e < 64 <= x.len(); p.add(e) is inside P.
+                    let ex = unsafe {
+                        let ex = (*x.get_unchecked(e) - mx).exp();
+                        *p.add(e) = ex;
+                        ex
+                    };
+                    sum += f64::from(ex);
+                    e += 1;
+                }
+                let inv = sum as f32;
+                let mut e = 0usize;
+                while e < N_EXPERT {
+                    // SAFETY: e < 64 — inside P, and inside probs, whose
+                    // length is >= 64*m = 64 by the launch contract.
+                    unsafe {
+                        let v = *p.add(e) / inv;
+                        *p.add(e) = v;
+                        *probs.get_unchecked_mut(e) = v;
+                    }
+                    e += 1;
+                }
+            }
+            thread::sync_threads();
+            // Pass 4 over the warp. Lane L owns experts L and L+32, read once
+            // — the six selections differ only by the `taken` mask.
+            // `argmax_take` is the total order (probability descending, id
+            // ascending) that the serial scan's strict `>` over ascending
+            // experts realizes, so no regrouping can move a tie, and its
+            // `(-inf, 0)` seed is the serial scan's seed, so a token no
+            // comparison ever wins answers expert 0 on both paths. A NaN
+            // probability never enters the reduction: `argmax_take` takes a
+            // candidate only on `>` or `==`, both false for NaN, so no lane's
+            // running best is ever NaN and the merge only ever sees numbers.
+            let lane = warp::lane_id() as usize;
+            let (e0, e1) = (lane, lane + 32);
+            // SAFETY: e0 < 32 and e1 < 64 — inside P, written above and
+            // visible past the barrier.
+            let (p0, p1) = unsafe { (*p.add(e0), *p.add(e1)) };
+            let mut taken = 0u64;
+            let mut s = 0usize;
+            while s < N_USED {
+                let mut bv = f32::NEG_INFINITY;
+                let mut bi = 0u32;
+                if (taken >> e0) & 1 == 0 && argmax_take(p0, e0 as u32, bv, bi) {
+                    bv = p0;
+                    bi = e0 as u32;
+                }
+                if (taken >> e1) & 1 == 0 && argmax_take(p1, e1 as u32, bv, bi) {
+                    bv = p1;
+                    bi = e1 as u32;
+                }
+                let mut off = 16u32;
+                while off > 0 {
+                    let (ov, oi) = (warp::shuffle_xor_f32(bv, off), warp::shuffle_xor(bi, off));
+                    if argmax_take(ov, oi, bv, bi) {
+                        bv = ov;
+                        bi = oi;
+                    }
+                    off >>= 1;
+                }
+                // Every lane leaves the butterfly with the same winner, so
+                // every lane masks the same expert out for the next slot.
+                taken |= 1u64 << bi;
+                if t == 0 {
+                    // SAFETY: bi < 64 — inside P; s < 6 <= ids.len() and
+                    // weights.len() by the launch contract. The weight is
+                    // read from the winner's slot rather than from the
+                    // comparison, so a prob no comparison won is carried
+                    // through unchanged.
+                    unsafe {
+                        let w = *p.add(bi as usize) * scale;
+                        *ids.get_unchecked_mut(s) = bi;
+                        *weights.get_unchecked_mut(s) = w;
+                    }
+                }
+                s += 1;
+            }
+            return;
+        }
         if t >= m as usize {
             return;
         }
