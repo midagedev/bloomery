@@ -32,6 +32,14 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
                       # build` does not rewrite the lock (lock md5 unchanged
                       # across oxide builds in the gates-v2 round)
     just lint         # cargo clippy --workspace; contract is 0 errors
+                      # FAIL-first on the box: after restoring a mutated source
+                      # (`mv x.bak x`, `git checkout`), `touch` it — the restore
+                      # hands back an OLDER mtime, `box.sh`'s rsync -a keeps it,
+                      # and cargo then serves the MUTATED binary (measured:
+                      # three timed gate_p8 runs failed on a band no source
+                      # carried; the build log showed no `Compiling`). Before
+                      # trusting a run, the build log must show `Compiling
+                      # <crate>` when the source changed.
     just fmt          # cargo fmt --all
     just build-gpu    # cargo oxide build --arch sm_86 -- -p q3k-gemv
     just build-cpu    # release build with -C target-cpu=znver3

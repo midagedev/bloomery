@@ -74,7 +74,15 @@ gate-gpu-p0b *ARGS:
 
 # P0b 시간(리드 전용): 기계 전역 임대 아래 op 8노드 대 융합 4노드 그래프의 재생 µs, 빈 커널 4/8노드 참조 포함, 증인 블록 전후.
 time-gpu-p0b:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/ref/time-p0b.sh'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/ref/time-gate.sh gate_p0b'
+
+# P8a 블록 0 스텝(33노드)의 재생 µs — 임대·증인, 리드 전용.
+time-gpu-p8:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8'
+
+# MoE 융합 op 8노드 대 융합 4노드의 재생 µs — 임대·증인, 리드 전용.
+time-gpu-moe:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/ref/time-gate.sh gate_moe_fused'
 
 # P8: 조립된 디코드 스텝(블록 0부터)을 덤프와 대조 — 엔진 자신의 탭.
 gate-gpu-p8 *ARGS:
