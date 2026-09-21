@@ -1,0 +1,427 @@
+//! GPU gate for package P8b (docs/gpu-design.md 작업 꾸러미): the assembled
+//! MoE decode step of layer 1 (`GpuModel::step_layer_taps`), m = 1, against
+//! the ik CUDA oracle dump. A lone layer has no embedding in front of it, so
+//! its input residual is the oracle's own `l_out-0` column and its KV cache
+//! is seeded from the oracle's `kv_cache-1` rows, exactly as `gate_p8` seeds
+//! layer 0 — the tap table then isolates this layer's own ops. The tap rels
+//! are PRINTED, never banded; the lead pins the MoE block bands from this
+//! table. What is asserted:
+//! - (a) every tap finite, and a structural fence per tap (`rel <= 0.25`,
+//!   the same fence `gate_p8` carries: an order of magnitude above the
+//!   measured rels and below the O(0.5..1) a wrong concat or a wrong expert
+//!   produces). A violation here is a layout or routing defect, not noise;
+//! - (b) the router's expert ids integer-equal to the dump's
+//!   `ffn_moe_topk-1` last-token ids AND to the host routing reference, in
+//!   rank order, with the router weights within `ROUTER_BAND` of it;
+//! - (c) an eager rerun bit-identical;
+//! - (d) the captured graph replays bit-identical to eager (node count
+//!   printed);
+//! - (e) the SAME graph at a second position (pos 4, n_keys 5) reproducing
+//!   an eager run there bit for bit — what the device-side
+//!   `pos_buf`/`n_keys_buf` buy;
+//! - (f) the SAME graph on a DIFFERENT input vector that routes to at least
+//!   one different expert, still bit-identical to its own eager run — what
+//!   the device-resident `sel` buys. A captured graph that froze the routing
+//!   passes (d) and (e) and fails here.
+//!
+//! Two taps of the MoE block are not exposed: `moe_combine` folds the
+//! weighted expert sum, the shared expert and the residual into one store,
+//! so neither `ffn_moe_out-1` nor `ffn_out-1` exists as a buffer. `l_out-1`
+//! carries that span; `ffn_moe_out-1` is additionally compared against the
+//! host recombination of the engine's own `expert_down` and router weights,
+//! which is the operand pair the fused store consumes — the table marks that
+//! row `recombined`.
+
+#[cfg(not(feature = "gpu"))]
+fn main() {
+    eprintln!("gate_p8b: built without the `gpu` feature; see `just gate-gpu-p8b`.");
+    std::process::exit(2);
+}
+
+#[cfg(feature = "gpu")]
+use bloomery_gpu::GpuModel;
+#[cfg(feature = "gpu")]
+use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
+#[cfg(feature = "gpu")]
+use bloomery_gpu_gates::{
+    RefRow, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
+    ref_tensor_logical_in, route_ref, widened_f16_bits,
+};
+
+/// The layer this gate assembles — the first MoE block of the model.
+#[cfg(feature = "gpu")]
+const LAYER: usize = 1;
+/// Cache rows allocated for the gate's runs (the dump uses 6).
+#[cfg(feature = "gpu")]
+const CTX_MAX: usize = 64;
+/// Structural fence — see the module doc. Not a band.
+#[cfg(feature = "gpu")]
+const FENCE: f32 = 0.25;
+/// Router weights against `route_ref` on the same logits: the device `exp`
+/// and the host libm differ by a few ulp, everything else in that chain is
+/// bit-mirrored (`gate_moe_fused`'s constant). Ids are exact.
+#[cfg(feature = "gpu")]
+const ROUTER_BAND: f32 = 1e-5;
+
+#[cfg(feature = "gpu")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ok = true;
+    let gguf = open_model()?;
+    let man = ref_manifest()?;
+    let dir = ref_dir();
+    let mut model = GpuModel::load_blocks(&gguf, CTX_MAX, LAYER..LAYER + 1)?;
+    println!(
+        "resident stage_bytes={} ctx_max={CTX_MAX} m=1 layer={LAYER}",
+        model.stages()[0].resident_bytes()
+    );
+
+    // The layer's input residual is the previous block's output: the dump's
+    // own `l_out-0`, one column per token.
+    let lo0_row = find_ref_row_in(&dir, &man, "l_out-0", 0)?;
+    if lo0_row.ty != "f32" || lo0_row.op != "ADD" || lo0_row.ne[1] != M_TOKENS as u64 {
+        return Err(format!(
+            "gate_p8b: l_out-0 is {} {} {:?}, want f32 ADD with {M_TOKENS} token columns",
+            lo0_row.op, lo0_row.ty, lo0_row.ne
+        )
+        .into());
+    }
+    let hidden = lo0_row.ne[0] as usize;
+    let l_out0 = ref_tensor_logical_in(&dir, lo0_row)?;
+    let column = |t: usize| l_out0[t * hidden..(t + 1) * hidden].to_vec();
+
+    // This layer's own cache rows for tokens 0..4, the way gate_p8 seeds
+    // layer 0's: the last token's attention then reads exactly the keys ik's
+    // did, and the tap table measures this step's ops alone.
+    let ik_cache = find_ref_row(&man, &format!("kv_cache-{LAYER}"), 0)?;
+    if ik_cache.ty != "f16" || ik_cache.op != "VIEW" || ik_cache.ne != [576, 256, 1, 1] {
+        return Err(format!(
+            "gate_p8b: kv_cache-{LAYER} is {} {} {:?}, want VIEW f16 [576, 256]",
+            ik_cache.op, ik_cache.ty, ik_cache.ne
+        )
+        .into());
+    }
+
+    // ---- eager run at the last position, tap table, finiteness
+    let last = M_TOKENS - 1;
+    let seed5 = widened_f16_bits(ik_cache, last)?;
+    model.seed_layer_cache(LAYER, &seed5)?;
+    let taps1 = model.step_layer_taps(LAYER, &column(last), last as u32)?;
+    if let Some(name) = taps1.non_finite() {
+        eprintln!("FAIL: tap {name} holds a non-finite value");
+        ok = false;
+    }
+
+    // The fused combine's operands, recombined the way its store does —
+    // `Σ_s w[s] · down[s*rows + d]` in slot order — so the dump's
+    // `ffn_moe_out-1` still has something to be compared against.
+    let moe_out_recombined = recombine(&taps1.expert_down, &taps1.moe_weights, hidden)?;
+
+    let mut results: Vec<TapResult> = Vec::new();
+    for tap in block::taps(BlockKind::Moe, LAYER) {
+        let got: &[f32] = match tap.kind {
+            TapKind::AttnNorm => &taps1.attn_norm,
+            TapKind::Q => &taps1.q,
+            TapKind::KvRopeCompressed => &taps1.kv_rope_compressed,
+            TapKind::QRope => &taps1.q_rope,
+            TapKind::KRope => &taps1.k_rope,
+            TapKind::KvCompressed => &taps1.kv_compressed,
+            TapKind::KqvCompressed => &taps1.kqv_compressed,
+            TapKind::KqvOut => &taps1.kqv_out,
+            TapKind::FfnInp => &taps1.ffn_inp,
+            TapKind::FfnNorm => &taps1.ffn_norm,
+            TapKind::FfnMoeLogits => &taps1.moe_logits,
+            TapKind::FfnMoeWeights => &taps1.moe_weights,
+            TapKind::FfnMoeOut => &moe_out_recombined,
+            TapKind::FfnShexp => &taps1.ffn_shexp,
+            TapKind::LOut => &taps1.l_out,
+            // `moe_combine` writes one store; the moe+shexp sum before the
+            // residual never exists as a buffer.
+            TapKind::FfnOut => {
+                println!(
+                    "tap {} op={} unexposed=moe_combine covered_by=l_out-{LAYER}",
+                    tap.name(),
+                    tap.op
+                );
+                continue;
+            }
+            _ => unreachable!("the MoE tap list holds only the kinds above"),
+        };
+        if tap.kind == TapKind::FfnMoeOut {
+            println!(
+                "tap {} op={} unexposed=moe_combine compared=recombined(expert_down,moe_weights)",
+                tap.name(),
+                tap.op
+            );
+        }
+        let row = find_ref_row_in(&dir, &man, &tap.name(), tap.occurrence)?;
+        block::check_row(row, &tap, M_TOKENS)?;
+        let ref_all = ref_tensor_logical_in(&dir, row)?;
+        let per = tap.kind.per_token();
+        let ref_last = &ref_all[last * per..M_TOKENS * per];
+        if got.len() != per {
+            return Err(format!(
+                "gate_p8b: {} got {} values, the tap's token column is {per}",
+                tap.name(),
+                got.len()
+            )
+            .into());
+        }
+        let rel = max_rel_err(got, ref_last)?;
+        let mut worst_index = 0usize;
+        let mut worst_d = -1.0f32;
+        for (i, (&g, &r)) in got.iter().zip(ref_last).enumerate() {
+            let d = (g - r).abs();
+            if d > worst_d {
+                worst_d = d;
+                worst_index = i;
+            }
+        }
+        results.push(TapResult {
+            tap,
+            rel,
+            worst_index,
+            n: per,
+        });
+    }
+    block::print_table(
+        "moe_layer_step",
+        "gpu_step",
+        "ref_cuda[last_token]",
+        &results,
+        None,
+    );
+    for r in &results {
+        if r.rel > FENCE {
+            eprintln!(
+                "FAIL: tap {} rel={:.3e} leaves the structural fence {FENCE}",
+                r.tap.name(),
+                r.rel
+            );
+            ok = false;
+        }
+    }
+
+    // ---- (b) routing: ids integer-equal to the dump AND to route_ref, in
+    // rank order; weights inside the router band of route_ref.
+    let topk_row = find_ref_row(&man, &format!("ffn_moe_topk-{LAYER}"), 0)?;
+    let n_used = taps1.moe_ids.len();
+    if topk_row.ty != "i32"
+        || topk_row.op != "VIEW"
+        || topk_row.ne != [n_used as u64, M_TOKENS as u64, 1, 1]
+    {
+        return Err(format!(
+            "gate_p8b: ffn_moe_topk-{LAYER} is {} {} {:?}, want i32 VIEW [{n_used}, {M_TOKENS}]",
+            topk_row.ty, topk_row.op, topk_row.ne
+        )
+        .into());
+    }
+    let ik_ids = topk_ids_logical(topk_row)?;
+    let scale = router_scale(&gguf)?;
+    let (_, ids_ref, w_ref) = route_ref(&taps1.moe_logits, 1, scale)?;
+    let ours: Vec<i32> = taps1.moe_ids.iter().map(|&e| e as i32).collect();
+    let ik_last = &ik_ids[last * n_used..M_TOKENS * n_used];
+    let ids_match_dump = ours == ik_last;
+    let ids_match_ref = ours == ids_ref;
+    let weights_err = max_rel_err(&taps1.moe_weights, &w_ref)?;
+    let router_ok = ids_match_dump && ids_match_ref && weights_err <= ROUTER_BAND;
+    println!(
+        "router scale={scale} n_used={n_used} ids={ours:?} dump_ids={ik_last:?} \
+         ids_equal_dump={ids_match_dump} ids_equal_route_ref={ids_match_ref} \
+         weights_err={weights_err:.3e} band={ROUTER_BAND:.0e} {}",
+        verdict(router_ok)
+    );
+    if !router_ok {
+        ok = false;
+    }
+
+    // ---- (c) eager rerun bit-identical
+    model.seed_layer_cache(LAYER, &seed5)?;
+    let taps2 = model.step_layer_taps(LAYER, &column(last), last as u32)?;
+    let rerun_same = taps1.bits_equal(&taps2);
+    println!(
+        "rerun eager_bit_identical={rerun_same} {}",
+        verdict(rerun_same)
+    );
+    if !rerun_same {
+        ok = false;
+    }
+
+    // ---- (d) captured graph: replay bit-identical to eager
+    let nodes = model.capture_layer(LAYER)?;
+    model.seed_layer_cache(LAYER, &seed5)?;
+    model.replay_layer(LAYER, &column(last), last as u32)?;
+    let taps3 = model.layer_taps(LAYER)?;
+    let replay_same = taps3.bits_equal(&taps1);
+    println!(
+        "graph graph_nodes={nodes} eager_vs_replay_bit_identical={replay_same} {}",
+        verdict(replay_same)
+    );
+    if !replay_same {
+        ok = false;
+    }
+
+    // ---- (e) the same graph at a second position: reseed tokens 0..3,
+    // pos 4 / n_keys 5; the replay must equal a fresh eager run there.
+    {
+        let pos = last - 1;
+        let seed4 = widened_f16_bits(ik_cache, pos)?;
+        model.seed_layer_cache(LAYER, &seed4)?;
+        let eager = model.step_layer_taps(LAYER, &column(pos), pos as u32)?;
+        model.seed_layer_cache(LAYER, &seed4)?;
+        model.replay_layer(LAYER, &column(pos), pos as u32)?;
+        let replayed = model.layer_taps(LAYER)?;
+        let same = eager.bits_equal(&replayed);
+        println!(
+            "second_pos pos={pos} n_keys={} replay_bit_identical_to_eager={same} {}",
+            pos + 1,
+            verdict(same)
+        );
+        if !same {
+            ok = false;
+        }
+    }
+
+    // ---- (f) the same graph on an input that routes differently. The
+    // candidate inputs are the other `l_out-0` columns; the first one whose
+    // eager routing differs from the last token's is the probe. Everything
+    // else about the run is held fixed (same position, same seeded cache),
+    // so the only thing that moved is the routing.
+    {
+        let mut probe: Option<(usize, Vec<u32>)> = None;
+        for t in 0..last {
+            model.seed_layer_cache(LAYER, &seed5)?;
+            let taps = model.step_layer_taps(LAYER, &column(t), last as u32)?;
+            if taps.moe_ids != taps1.moe_ids {
+                probe = Some((t, taps.moe_ids.clone()));
+                break;
+            }
+        }
+        let Some((t, probe_ids)) = probe else {
+            return Err(format!(
+                "gate_p8b: none of the l_out-0 columns 0..{last} routes differently from the \
+                 last token's {:?} — (f) has no probe on this dump",
+                taps1.moe_ids
+            )
+            .into());
+        };
+        let changed = probe_ids
+            .iter()
+            .zip(&taps1.moe_ids)
+            .filter(|(a, b)| a != b)
+            .count();
+        model.seed_layer_cache(LAYER, &seed5)?;
+        let eager = model.step_layer_taps(LAYER, &column(t), last as u32)?;
+        model.seed_layer_cache(LAYER, &seed5)?;
+        model.replay_layer(LAYER, &column(t), last as u32)?;
+        let replayed = model.layer_taps(LAYER)?;
+        let same = eager.bits_equal(&replayed);
+        let routed_on_device = changed > 0 && replayed.moe_ids == probe_ids;
+        let dump_ids = &ik_ids[t * n_used..(t + 1) * n_used];
+        let dump_agrees = eager
+            .moe_ids
+            .iter()
+            .map(|&e| e as i32)
+            .eq(dump_ids.iter().copied());
+        println!(
+            "routing_probe src=l_out-0[token_{t}] ids={:?} base_ids={:?} slots_changed={changed} \
+             replay_bit_identical_to_eager={same} replay_ids_follow_router={routed_on_device} \
+             dump_ids={dump_ids:?} eager_ids_equal_dump={dump_agrees} (printed, not asserted) {}",
+            probe_ids,
+            taps1.moe_ids,
+            verdict(same && routed_on_device)
+        );
+        if !(same && routed_on_device) {
+            ok = false;
+        }
+    }
+
+    if !ok {
+        eprintln!("FAILED: gate_p8b");
+        std::process::exit(1);
+    }
+    println!(
+        "PASSED: gate_p8b — MoE layer {LAYER} step assembled: taps printed against the dump's \
+         last token, routing exact, rerun/replay/second-position/second-routing bit-identical, \
+         inside the structural fence"
+    );
+    Ok(())
+}
+
+/// `Σ_s w[s] · down[s*rows + d]` over the slots, in slot order — the sum
+/// `moe_combine` folds into its store, recomputed on the host from the
+/// engine's own operands.
+#[cfg(feature = "gpu")]
+fn recombine(down: &[f32], w: &[f32], rows: usize) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    if w.is_empty() || down.len() != w.len() * rows {
+        return Err(format!(
+            "gate_p8b: recombine: down {} values for {} slots of {rows}",
+            down.len(),
+            w.len()
+        )
+        .into());
+    }
+    let mut y = vec![0.0f32; rows];
+    for (s, &ws) in w.iter().enumerate() {
+        for (d, o) in y.iter_mut().enumerate() {
+            *o += ws * down[s * rows + d];
+        }
+    }
+    Ok(y)
+}
+
+/// The dump's top-k ids: the row's LOGICAL twin holds every token's ids cast
+/// to f32 (the flat VIEW file is token 0's ranking only).
+#[cfg(feature = "gpu")]
+fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
+    if row.logical != Some(1) {
+        return Err(format!(
+            "gate_p8b: {} has no logical twin — the ids need a v2 dump set",
+            row.name
+        )
+        .into());
+    }
+    let path = ref_dir().join(format!("{}.{}.logical.f32", row.name, row.occurrence));
+    let raw = std::fs::read(&path)
+        .map_err(|e| format!("gate_p8b: cannot read {}: {e}", path.display()))?;
+    let expect = 4_u64
+        .checked_mul(row.count())
+        .ok_or("gate_p8b: topk element count overflows")?;
+    if raw.len() as u64 != expect {
+        return Err(format!(
+            "gate_p8b: {} is {} bytes, want {expect} (4*count)",
+            path.display(),
+            raw.len()
+        )
+        .into());
+    }
+    raw.chunks_exact(4)
+        .map(|c| {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            if v.fract() == 0.0 && (0.0..64.0).contains(&v) {
+                Ok(v as i32)
+            } else {
+                Err(format!(
+                    "gate_p8b: {} holds non-integral id {v} — not ids cast to f32",
+                    path.display()
+                )
+                .into())
+            }
+        })
+        .collect()
+}
+
+/// The file's `expert_weights_scale` — the router weight multiplier the
+/// engine reads from the same key.
+#[cfg(feature = "gpu")]
+fn router_scale(gguf: &gguf::Gguf) -> Result<f32, Box<dyn std::error::Error>> {
+    Ok(gguf
+        .architecture()
+        .and_then(|a| gguf.value(&format!("{a}.expert_weights_scale")))
+        .and_then(gguf::Value::as_f32)
+        .unwrap_or(1.0))
+}
+
+#[cfg(feature = "gpu")]
+fn verdict(pass: bool) -> &'static str {
+    if pass { "PASS" } else { "FAIL" }
+}
