@@ -279,21 +279,25 @@ fn hw_attn_exact_input_stages() {
         let q_rope_exact = load2(&format!("q_rope-{blk}"), 1);
         let q_nope2_exact = load2(&format!("q_nope2-{blk}"), 0);
         let kvr_exact = load2(&format!("kvr-{blk}"), 0);
-        let cache16: Vec<Vec<u16>> = (0..n_tok)
-            .map(|t| {
+        // One flat row-major buffer, the cache's own layout, columns in token
+        // order — the same f16 bits the per-row fixture held.
+        let d_head = p.rope_dims + p.latent;
+        let mut cache16: Vec<u16> = Vec::with_capacity(n_tok * d_head);
+        for t in 0..n_tok {
+            cache16.extend(
                 kvr_exact
                     .col(t)
                     .iter()
-                    .map(|&v| model::attn::f32_to_f16_bits(v))
-                    .collect()
-            })
-            .collect();
+                    .map(|&v| model::attn::f32_to_f16_bits(v)),
+            );
+        }
+        let cache = model::kv::KvRows::new(&cache16, d_head);
         let want = load2(&format!("kqv_compressed-{blk}"), 0);
 
         let kqv_scalar = model::attn::flash_attn_latent_scalar(
             &q_rope_exact,
             &q_nope2_exact,
-            &cache16,
+            cache,
             &slots,
             &slots,
             &p,
@@ -313,7 +317,7 @@ fn hw_attn_exact_input_stages() {
         let kqv = model::attn::flash_attn_latent(
             &q_rope_exact,
             &q_nope2_exact,
-            &cache16,
+            cache,
             &slots,
             &slots,
             &p,
@@ -329,7 +333,8 @@ fn hw_attn_exact_input_stages() {
                 let mut qrow = vec![0.0f32; p.rope_dims + p.latent];
                 qrow[..p.rope_dims].copy_from_slice(q_rope_exact.col(t * p.n_head + h));
                 qrow[p.rope_dims..].copy_from_slice(q_nope2_exact.col(h * n_tok + t));
-                for k in &cache16 {
+                for u in 0..n_tok {
+                    let k = cache.row(u);
                     delta = delta.max(
                         (model::attn::kq_dot_simd(&qrow, k) - model::attn::kq_dot_fa4(&qrow, k))
                             .abs(),
@@ -339,8 +344,8 @@ fn hw_attn_exact_input_stages() {
         }
         let mut v_lo = f32::INFINITY;
         let mut v_hi = f32::NEG_INFINITY;
-        for row in &cache16 {
-            for &b in &row[p.rope_dims..] {
+        for u in 0..n_tok {
+            for &b in &cache.row(u)[p.rope_dims..] {
                 let v = gguf::quant::half_to_f32(b);
                 v_lo = v_lo.min(v);
                 v_hi = v_hi.max(v);
@@ -395,15 +400,19 @@ fn hw_attn_heads_fused_bit_identical() {
     for n_tok in [1usize, 6] {
         // The batch's own tokens are the KV entries, the scratch-cache shape.
         let slots: Vec<Slot> = (0..n_tok as u32).map(|t| Slot { seq: 0, pos: t }).collect();
-        let cache16: Vec<Vec<u16>> = (0..n_tok)
-            .map(|t| {
+        // One flat row-major buffer, the cache's own layout, columns in token
+        // order — the same f16 bits the per-row fixture held.
+        let d_head = p.rope_dims + p.latent;
+        let mut cache16: Vec<u16> = Vec::with_capacity(n_tok * d_head);
+        for t in 0..n_tok {
+            cache16.extend(
                 kvr_full
                     .col(t)
                     .iter()
-                    .map(|&v| model::attn::f32_to_f16_bits(v))
-                    .collect()
-            })
-            .collect();
+                    .map(|&v| model::attn::f32_to_f16_bits(v)),
+            );
+        }
+        let cache = model::kv::KvRows::new(&cache16, d_head);
         let first_cols = |src: &Tensor2, n: usize| {
             Tensor2::from_vec(src.ne0, n, src.data[..src.ne0 * n].to_vec())
         };
@@ -413,12 +422,12 @@ fn hw_attn_heads_fused_bit_identical() {
         // The chain the fused dispatch replaces, stage by stage.
         let q_nope2 = model::attn::q_nope2_absorbed(wblocks, &q, &p).unwrap();
         let kqv_compressed =
-            model::attn::flash_attn_latent(&q_rope, &q_nope2, &cache16, &slots, &slots, &p);
+            model::attn::flash_attn_latent(&q_rope, &q_nope2, cache, &slots, &slots, &p);
         let kqv_2d = model::attn::wv_b_heads_with(&g, views, &kqv_compressed, &p).unwrap();
 
         // The fused dispatch, same inputs.
         let (fq, fc, f2) = model::attn::attn_heads_fused(
-            &g, wblocks, &q, &q_rope, &cache16, &slots, &slots, views, &p,
+            &g, wblocks, &q, &q_rope, cache, &slots, &slots, views, &p,
         )
         .unwrap();
 
@@ -527,20 +536,25 @@ fn hw_flash_simd_bands_against_scalar() {
             }
         }
     }
-    let mut keys16: Vec<Vec<u16>> = Vec::with_capacity(n_keys);
+    // One flat row-major buffer, the cache's own layout: the RNG draws run in
+    // the same per-row, per-element order as before, so the values are the
+    // same bytes the per-row fixture held.
+    let width = p.rope_dims + p.latent;
+    let mut keys16: Vec<u16> = Vec::with_capacity(n_keys * width);
     let mut v_lo = f32::INFINITY;
     let mut v_hi = f32::NEG_INFINITY;
     for _ in 0..n_keys {
-        let row: Vec<u16> = (0..p.rope_dims + p.latent)
-            .map(|_| model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)))
-            .collect();
-        for &b in &row[p.rope_dims..] {
+        let start = keys16.len();
+        for _ in 0..width {
+            keys16.push(model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)));
+        }
+        for &b in &keys16[start + p.rope_dims..] {
             let v = gguf::quant::half_to_f32(b);
             v_lo = v_lo.min(v);
             v_hi = v_hi.max(v);
         }
-        keys16.push(row);
     }
+    let keys = model::kv::KvRows::new(&keys16, width);
     // Sequences and positions chosen so every mask path fires: half the keys
     // are another sequence, positions wrap past the queries (future
     // masking), and every query keeps at least one allowed key.
@@ -563,7 +577,8 @@ fn hw_flash_simd_bands_against_scalar() {
             let mut qrow = vec![0.0f32; p.rope_dims + p.latent];
             qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
             qrow[p.rope_dims..].copy_from_slice(q_nope2.col(h * n_tok + t));
-            for (u, k) in keys16.iter().enumerate() {
+            for u in 0..n_keys {
+                let k = keys.row(u);
                 let d =
                     (model::attn::kq_dot_simd(&qrow, k) - model::attn::kq_dot_fa4(&qrow, k)).abs();
                 let band = kq_reassoc_band(&qrow, k);
@@ -583,9 +598,9 @@ fn hw_flash_simd_bands_against_scalar() {
     );
 
     // Leg 2 — the whole kernel, propagating the realized δ of leg 1.
-    let a = model::attn::flash_attn_latent(&q_rope, &q_nope2, &keys16, &key_slots, &q_slots, &p);
+    let a = model::attn::flash_attn_latent(&q_rope, &q_nope2, keys, &key_slots, &q_slots, &p);
     let b =
-        model::attn::flash_attn_latent_scalar(&q_rope, &q_nope2, &keys16, &key_slots, &q_slots, &p);
+        model::attn::flash_attn_latent_scalar(&q_rope, &q_nope2, keys, &key_slots, &q_slots, &p);
     let flash_band = 2.0 * p.kq_scale * worst_kq * n_keys as f32 * (v_hi - v_lo);
     let mut worst_flash = 0.0f32;
     for (i, (&x, &y)) in a.data.iter().zip(&b.data).enumerate() {
@@ -623,9 +638,17 @@ struct FlashLeverFixture {
     p: model::attn::MlaParams,
     q_rope: Tensor2,
     q_nope2: Tensor2,
-    keys16: Vec<Vec<u16>>,
+    /// The KV rows as one flat row-major buffer, the cache's own layout.
+    keys16: Vec<u16>,
     key_slots: Vec<Slot>,
     q_slots: Vec<Slot>,
+}
+
+impl FlashLeverFixture {
+    /// The cache view over the flat buffer, at the real row width.
+    fn keys(&self) -> model::kv::KvRows<'_> {
+        model::kv::KvRows::new(&self.keys16, self.p.rope_dims + self.p.latent)
+    }
 }
 
 fn flash_lever_fixture() -> FlashLeverFixture {
@@ -665,12 +688,15 @@ fn flash_lever_fixture() -> FlashLeverFixture {
             }
         }
     }
-    let mut keys16: Vec<Vec<u16>> = Vec::with_capacity(n_keys);
+    // One flat row-major buffer, the cache's own layout: the RNG draws run in
+    // the same per-row, per-element order as before, so the fixture's bytes are
+    // the ones the per-row fixture held.
+    let width = p.rope_dims + p.latent;
+    let mut keys16: Vec<u16> = Vec::with_capacity(n_keys * width);
     for _ in 0..n_keys {
-        let row: Vec<u16> = (0..p.rope_dims + p.latent)
-            .map(|_| model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)))
-            .collect();
-        keys16.push(row);
+        for _ in 0..width {
+            keys16.push(model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)));
+        }
     }
     // Every query keeps at least one allowed key; the key count crosses
     // three whole 32-key blocks plus a partial fourth.
@@ -711,7 +737,7 @@ fn hw_flash_simd_lever_child_dump() {
     let out = model::attn::flash_attn_latent(
         &f.q_rope,
         &f.q_nope2,
-        &f.keys16,
+        f.keys(),
         &f.key_slots,
         &f.q_slots,
         &f.p,
@@ -743,7 +769,7 @@ fn hw_flash_simd_lever_forces_scalar() {
     let want = model::attn::flash_attn_latent_scalar(
         &f.q_rope,
         &f.q_nope2,
-        &f.keys16,
+        f.keys(),
         &f.key_slots,
         &f.q_slots,
         &f.p,
@@ -794,7 +820,7 @@ fn hw_flash_simd_lever_forces_scalar() {
     let simd = model::attn::flash_attn_latent(
         &f.q_rope,
         &f.q_nope2,
-        &f.keys16,
+        f.keys(),
         &f.key_slots,
         &f.q_slots,
         &f.p,
@@ -811,5 +837,116 @@ fn hw_flash_simd_lever_forces_scalar() {
         } else {
             "differs from"
         }
+    );
+}
+
+/// The KV prefetch lever is observed, not assumed: on a one-query row the
+/// AVX2 twin reports which arm it took, the two arms are bit-identical
+/// (a prefetch is a hint, never a value), and a multi-query row never
+/// prefetches whatever the lever says. The observable is process-global and
+/// every simd row writes it, so the assertions run in a fresh child process
+/// where this is the only test — the same re-exec shape as
+/// `hw_flash_simd_lever_forces_scalar`; in the parent's `--ignored` run a
+/// neighbouring test's multi-query row could land between the call and
+/// the read.
+#[test]
+#[ignore]
+fn hw_kv_prefetch_lever_is_observed() {
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "hw_kv_prefetch_lever_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BLOOMERY_KV_PREFETCH_CHILD", "1")
+        .output()
+        .expect("re-exec of this test binary");
+    assert!(
+        out.status.success(),
+        "kv prefetch lever child failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("kv prefetch lever: one-query on/off observed"),
+        "child ran but did not report the observation\n{stdout}"
+    );
+}
+
+/// The child half of `hw_kv_prefetch_lever_is_observed`: only meaningful in
+/// the re-exec, where no other row writes the observable.
+#[test]
+#[ignore]
+fn hw_kv_prefetch_lever_child() {
+    if std::env::var_os("BLOOMERY_KV_PREFETCH_CHILD").is_none() {
+        eprintln!("hw_kv_prefetch_lever_child: run through hw_kv_prefetch_lever_is_observed");
+        return;
+    }
+    if !(std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c"))
+    {
+        panic!(
+            "hw_kv_prefetch_lever_child: no AVX2+FMA+F16C on this box — the gate has nothing to observe"
+        );
+    }
+    let f = flash_lever_fixture();
+    let n_tok = f.q_slots.len();
+    // One query (token 0) against the whole cache: `q_rope` columns are
+    // `t * n_head + h`, `q_nope2` columns are `h * n_tok + t`.
+    let mut q_rope = Tensor2::zeros(f.p.rope_dims, f.p.n_head);
+    let mut q_nope2 = Tensor2::zeros(f.p.latent, f.p.n_head);
+    for h in 0..f.p.n_head {
+        q_rope.col_mut(h).copy_from_slice(f.q_rope.col(h));
+        q_nope2.col_mut(h).copy_from_slice(f.q_nope2.col(h * n_tok));
+    }
+    let q1 = &f.q_slots[..1];
+
+    model::attn::set_kv_prefetch(Some(true));
+    let on = model::attn::flash_attn_latent(&q_rope, &q_nope2, f.keys(), &f.key_slots, q1, &f.p);
+    assert_eq!(
+        model::attn::last_kv_prefetch(),
+        Some(true),
+        "one-query row with the lever forced on must report prefetching"
+    );
+    model::attn::set_kv_prefetch(Some(false));
+    let off = model::attn::flash_attn_latent(&q_rope, &q_nope2, f.keys(), &f.key_slots, q1, &f.p);
+    assert_eq!(
+        model::attn::last_kv_prefetch(),
+        Some(false),
+        "one-query row with the lever forced off must report no prefetch"
+    );
+    let same = on
+        .data
+        .iter()
+        .zip(off.data.iter())
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    assert!(
+        same,
+        "prefetch on vs off changed a value — a hint touched arithmetic"
+    );
+
+    // Multi-query rows (prefill) never prefetch, lever or no lever.
+    model::attn::set_kv_prefetch(Some(true));
+    let _ = model::attn::flash_attn_latent(
+        &f.q_rope,
+        &f.q_nope2,
+        f.keys(),
+        &f.key_slots,
+        &f.q_slots,
+        &f.p,
+    );
+    assert_eq!(
+        model::attn::last_kv_prefetch(),
+        Some(false),
+        "a {n_tok}-query row must not prefetch"
+    );
+    model::attn::set_kv_prefetch(None);
+    println!(
+        "kv prefetch lever: one-query on/off observed, {} values bit-identical, {n_tok}-query never prefetches",
+        on.data.len()
     );
 }

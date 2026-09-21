@@ -22,7 +22,7 @@
 //! KV entries (prefill); `t` attends to `u` iff `slots[u].seq == slots[t].seq && slots[u].pos <= slots[t].pos`.
 
 use crate::derived::Derived;
-use crate::kv::KvCache;
+use crate::kv::{KvCache, KvRows};
 use crate::ops::{matmul_q, matmul_q_batch, matmul_q_group, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
@@ -180,16 +180,15 @@ pub fn block_attn_cached(
     }
 
     // 5. The F16 rows the reference attends over: K = f16(kvr), V = its latent tail.
-    //    Pushed before attention — a prefill attends to itself.
-    let new_rows: Vec<Vec<u16>> = (0..x.ne1)
-        .map(|t| {
-            kvr.col(t)
-                .iter()
-                .map(|&v| f32_to_f16_bits(v))
-                .collect::<Vec<u16>>()
-        })
-        .collect();
-    cache.push(cache_block, range, new_rows);
+    //    Pushed before attention — a prefill attends to itself. One flat row-major
+    //    buffer — the cache's own layout — filled column by column, since `kvr` is
+    //    column-major (one column per token); the f16 roundings run in the same
+    //    per-token order they always did.
+    let mut new_rows: Vec<u16> = Vec::with_capacity(x.ne1 * kv_width);
+    for t in 0..x.ne1 {
+        new_rows.extend(kvr.col(t).iter().map(|&v| f32_to_f16_bits(v)));
+    }
+    cache.push(cache_block, range, &new_rows);
     if let Some(t_kvr) = t_kvr {
         profile::record_time("attn_kvr", t_kvr.elapsed().as_nanos() as u64);
     }
@@ -903,7 +902,7 @@ fn lane_tree_sum(w: &[f32; 32]) -> f32 {
 pub fn flash_attn_latent(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
-    keys16: &[Vec<u16>],
+    keys16: KvRows<'_>,
     key_slots: &[Slot],
     q_slots: &[Slot],
     p: &MlaParams,
@@ -926,7 +925,7 @@ pub fn flash_attn_latent(
 pub fn flash_attn_latent_scalar(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
-    keys16: &[Vec<u16>],
+    keys16: KvRows<'_>,
     key_slots: &[Slot],
     q_slots: &[Slot],
     p: &MlaParams,
@@ -954,13 +953,64 @@ fn flash_simd(p: &MlaParams) -> bool {
         && std::arch::is_x86_feature_detected!("f16c")
 }
 
+/// `BLOOMERY_KV_PREFETCH=0` disables the AVX2 flash twin's next-row prefetch —
+/// the A/B lever that prices what the contiguous KV layout alone buys, same
+/// binary, same bytes: only the cache hint changes.
+fn kv_prefetch_env() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("BLOOMERY_KV_PREFETCH").map_or(true, |v| v != "0"))
+}
+
+/// The in-process override the prefetch-lever tests drive: the env var is read
+/// once per process, so this is how one binary exercises both arms.
+static KV_PREFETCH_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Test override for the KV prefetch lever: `Some(true)` forces the prefetch,
+/// `Some(false)` disables it, `None` follows `BLOOMERY_KV_PREFETCH`.
+#[doc(hidden)]
+pub fn set_kv_prefetch(mode: Option<bool>) {
+    KV_PREFETCH_OVERRIDE.store(
+        match mode {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// What the AVX2 flash twin's last decode row decided: 0 = no row yet,
+/// 1 = prefetching, 2 = not. The lever tests read it; a lever whose effect
+/// is only "the gate still passes" proves nothing about the branch.
+static LAST_KV_PREFETCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The observable behind [`set_kv_prefetch`]: `Some(true)` if the last
+/// AVX2 flash row (any `n_tokens`) resolved to prefetching, `Some(false)`
+/// if not, `None` before any row ran.
+#[doc(hidden)]
+pub fn last_kv_prefetch() -> Option<bool> {
+    match LAST_KV_PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+fn kv_prefetch() -> bool {
+    match KV_PREFETCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => kv_prefetch_env(),
+    }
+}
+
 /// The single owner of the row split both dispatch legs ride; `simd` is decided once
 /// per call. The row twins share the whole skeleton and differ only in the two
 /// vectorized inner loops (kq dot, V accumulation) — keep them in lockstep.
 fn flash_attn_latent_impl(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
-    keys16: &[Vec<u16>],
+    keys16: KvRows<'_>,
     key_slots: &[Slot],
     q_slots: &[Slot],
     p: &MlaParams,
@@ -982,11 +1032,13 @@ fn flash_attn_latent_impl(
     let n_tokens = q_slots.len();
     let d_head = p.rope_dims + p.latent;
     let mut out = Tensor2::scratch(p.latent, n_tokens * p.n_head);
-    // Every cached row must be `d_head` wide — the AVX2 twin's unchecked loads need
-    // it up front; a short row is a caller bug to catch first.
+    // Every cached row is `width` wide by construction (one flat buffer, fixed
+    // stride) — the AVX2 twin's unchecked loads need the stride to BE `d_head`,
+    // which a mismatched cache width would silently violate.
     assert!(
-        keys16.iter().all(|k| k.len() == d_head),
-        "flash_attn_latent: KV rows must be rope+latent = {d_head} wide"
+        keys16.width() == d_head,
+        "flash_attn_latent: KV rows must be rope+latent = {d_head} wide, cache width is {}",
+        keys16.width()
     );
 
     // The (token, head) query rows are fully independent — each walks the KV cache
@@ -1056,7 +1108,7 @@ fn flash_attn_latent_impl(
 fn flash_row_scalar(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
-    keys16: &[Vec<u16>],
+    keys16: KvRows<'_>,
     key_slots: &[Slot],
     q_slots: &[Slot],
     p: &MlaParams,
@@ -1094,7 +1146,7 @@ fn flash_row_scalar(
             // scalar form is the bit-exact oracle. The AVX2 twin also
             // prefetches the next KV row inside this region — a cache hint
             // touches no value, so it has no scalar counterpart.)
-            let kq = kq_dot_fa4(qrow, &keys16[u]);
+            let kq = kq_dot_fa4(qrow, keys16.row(u));
             *sl = p.kq_scale * kq;
             smax = smax.max(*sl);
         }
@@ -1138,7 +1190,7 @@ fn flash_row_scalar(
             // TWIN: flash_row_avx2 — every edit outside the two marked
             // regions must be made in both. (This is the V accumulation
             // region.)
-            let krow = &keys16[blk + l];
+            let krow = keys16.row(blk + l);
             for d in 0..latent {
                 r[d] = half_to_f32(krow[p.rope_dims + d]).mul_add(w[l], r[d]);
             }
@@ -1171,14 +1223,16 @@ fn flash_row_scalar(
 /// # Safety
 /// The CPU must support AVX2+FMA+F16C, and the caller must hold the contract
 /// `flash_simd` gated on: `d_head = rope_dims + latent` a multiple of 32,
-/// `latent` a multiple of 8, every KV row `d_head` wide (asserted at the
-/// dispatch), and the scratch slices sized `d_head` / `latent` / `32`.
+/// `latent` a multiple of 8, `keys16.width() == d_head` (asserted at the
+/// dispatch) — the unchecked row loads index through `keys16.row(u)`, whose
+/// checked bounds and fixed stride are the whole guarantee — and the scratch
+/// slices sized `d_head` / `latent` / `32`.
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn flash_row_avx2(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
-    keys16: &[Vec<u16>],
+    keys16: KvRows<'_>,
     key_slots: &[Slot],
     q_slots: &[Slot],
     p: &MlaParams,
@@ -1203,6 +1257,15 @@ unsafe fn flash_row_avx2(
         let mut m = f32::NEG_INFINITY;
         let mut s_sum = 0.0f32;
         r.fill(0.0);
+        // Decided once per row, not per key: the lever is a process-wide
+        // constant and the kq loop is the hot walk. Feeds only the cache
+        // hint below, so no scalar twin; the observable lets a test assert
+        // which arm this row actually took.
+        let prefetch = n_tokens == 1 && kv_prefetch();
+        LAST_KV_PREFETCH.store(
+            if prefetch { 1 } else { 2 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
         for blk in (0..key_slots.len()).step_by(32) {
             let mut s = [f32::NEG_INFINITY; 32];
             let mut smax = f32::NEG_INFINITY;
@@ -1218,29 +1281,32 @@ unsafe fn flash_row_avx2(
                 // TWIN: flash_row_scalar — every edit outside the two marked
                 // regions must be made in both. (This is the kq dot region;
                 // only the sum order may differ from the scalar oracle.)
-                // Each key row is its own heap Vec, so the hardware
-                // prefetcher restarts at every row boundary; pull the next
-                // row's lines while this one is dotted. Decode rows only
-                // (`n_tokens == 1`): measured, the hint on prefill rows cost
-                // prefill 2 % at depth 4096 and bought nothing, and gating it
-                // here removed that cost (rig-log 09-21-e). A speculative
-                // step (`n_tokens = k`) also skips it. A prefetch is a cache
+                // Pull the next key row's lines while this one is dotted —
+                // the kq walk streams each row exactly once. Measured on the
+                // per-row heap layout this cache carried before the one
+                // contiguous buffer: +6.3 % at depth 4096 decode, and on
+                // prefill rows the hint cost 2 % and bought nothing, so
+                // decode rows only (`n_tokens == 1`); a speculative step
+                // (`n_tokens = k`) skips it too (rig-log 09-21-e).
+                // `BLOOMERY_KV_PREFETCH=0` turns the hint off for a whole
+                // process, same binary — the lever that prices what the
+                // fixed-stride layout buys on its own. A prefetch is a cache
                 // hint, never a value — no scalar twin of this.
-                if n_tokens == 1 {
-                    if let Some(next) = keys16.get(u + 1) {
-                        let base = next.as_ptr().cast::<u8>();
-                        let mut off = 0usize;
-                        while off < next.len() * 2 {
-                            // SAFETY: prefetch reads nothing; `off` stays inside
-                            // the row's own `len() * 2` bytes.
-                            _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
-                            off += 64;
-                        }
+                if prefetch && u + 1 < keys16.len() {
+                    let next = keys16.row(u + 1);
+                    let base = next.as_ptr().cast::<u8>();
+                    let mut off = 0usize;
+                    while off < next.len() * 2 {
+                        // SAFETY: prefetch reads nothing; `off` stays inside
+                        // the row's own `len() * 2` bytes.
+                        _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
+                        off += 64;
                     }
                 }
-                // SAFETY: plus the fn contract: `u` indexes keys16 in bounds
-                // (len asserted at the dispatch) and its row is d_head wide.
-                let kq = kq_dot_fa4_avx2(qrow, &keys16[u]);
+                // SAFETY: plus the fn contract: `keys16.row(u)` is
+                // bounds-checked and its width is `d_head` (asserted at the
+                // dispatch), so the panel walk stays inside one row.
+                let kq = kq_dot_fa4_avx2(qrow, keys16.row(u));
                 *sl = p.kq_scale * kq;
                 smax = smax.max(*sl);
             }
@@ -1285,7 +1351,7 @@ unsafe fn flash_row_avx2(
                 // regions must be made in both. (This is the V accumulation
                 // region; given the same weights it is bit-identical to the
                 // scalar form — only the kq region may differ.)
-                let krow = &keys16[blk + l];
+                let krow = keys16.row(blk + l);
                 let wl = _mm256_set1_ps(w[l]);
                 // The latent tail: eight f16 per cvtph, the j-axis FMA
                 // `r[d..d+8] = fma(v, w, r[d..d+8])` — see the fn doc: reorders nothing.
@@ -1428,7 +1494,7 @@ pub fn attn_heads_fused(
     wblocks: &[Q8Block],
     q: &Tensor2,
     q_rope: &Tensor2,
-    keys16: &[Vec<u16>],
+    keys16: KvRows<'_>,
     key_slots: &[Slot],
     q_slots: &[Slot],
     views: &[TensorInfo],
@@ -1462,8 +1528,9 @@ pub fn attn_heads_fused(
     );
     let d_head = p.rope_dims + p.latent;
     assert!(
-        keys16.iter().all(|k| k.len() == d_head),
-        "attn_heads_fused: KV rows must be rope+latent = {d_head} wide"
+        keys16.width() == d_head,
+        "attn_heads_fused: KV rows must be rope+latent = {d_head} wide, cache width is {}",
+        keys16.width()
     );
     assert_eq!(
         views.len(),

@@ -134,3 +134,52 @@ fn hw_kv_every_split_is_bit_exact() {
     }
     assert_eq!(cache.len(), tokens.len());
 }
+
+/// The contiguous storage contract: `keys(b)` views ONE flat row-major buffer —
+/// `row(i)` is exactly the i-th `width`-wide slice, and the buffer is `len * width`
+/// long. This is the shape the reference's `kv_cache-N` has; anything between `push`
+/// and the flash kernel that reinterprets a row (a stale length, a shifted stride)
+/// reds this gate before it can hand a kernel another row's bytes. Pure construction
+/// — no model file, no oracle.
+#[test]
+#[ignore = "hw: construction-only; runs with the other kv gates"]
+fn hw_kv_rows_view_is_row_major() {
+    let width = 12usize;
+    let mut cache = model::kv::KvCache::new(2, width);
+    let batches: [&[u32]; 2] = [&[7, 11], &[13]];
+    // The expected rows in push order — batch, then token, each the f16 of its
+    // source column. Distinct values per (batch, token, element) so a shifted
+    // row read cannot pass by accident.
+    let mut want: Vec<Vec<u16>> = Vec::new();
+    for (bi, positions) in batches.iter().enumerate() {
+        let slots: Vec<model::Slot> = positions
+            .iter()
+            .map(|&pos| model::Slot { seq: 0, pos })
+            .collect();
+        let range = cache.begin(&slots);
+        let mut flat: Vec<u16> = Vec::with_capacity(slots.len() * width);
+        for t in 0..slots.len() {
+            let col: Vec<u16> = (0..width)
+                .map(|e| model::attn::f32_to_f16_bits((bi * 100 + t * 10 + e) as f32))
+                .collect();
+            flat.extend_from_slice(&col);
+            want.push(col);
+        }
+        for b in 0..2 {
+            cache.push(b, &range, &flat);
+        }
+    }
+    for b in 0..2 {
+        let keys = cache.keys(b);
+        assert_eq!(keys.len(), want.len(), "block {b} row count");
+        assert_eq!(keys.width(), width, "block {b} row width");
+        assert_eq!(
+            keys.as_slice().len(),
+            want.len() * width,
+            "block {b}: one flat buffer of len * width"
+        );
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(keys.row(i), &w[..], "block {b} row {i}");
+        }
+    }
+}
