@@ -286,3 +286,8 @@ greedy-ref-cuda:
 # 입력은 오라클의 l_out-0, KV는 오라클의 kv_cache-1 앞 다섯 행. 밴드는 핀하지 않고 표만 찍는다.
 gate-gpu-p8b *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8b && ./target/release/gate_p8b {{ARGS}}'
+
+# PTX 스캔(계측기, 게이트 아님 — 항상 exit 0): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
+# 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
+ptx-scan BIN *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin {{BIN}} && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'

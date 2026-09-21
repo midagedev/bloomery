@@ -14,6 +14,7 @@
 
 pub mod block;
 pub mod prompts;
+pub mod ptx;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
@@ -573,6 +574,51 @@ pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError
         .take(rows * width)
         .map(|c| f32_to_f16_bits(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
         .collect())
+}
+
+/// The topk row's ids from its LOGICAL twin: `ffn_moe_topk-L` is an i32
+/// VIEW of the argsort output whose plain file is the flat parent read
+/// (token 0's ranking only), so the ids of every token live in the
+/// `.logical.f32` twin, each cast to f32 by the dumper. Accepted only when
+/// the row carries a twin and every value is integral in `0..64`, which
+/// rules out any stride or cast mix-up; the manifest's element-sum column
+/// describes the plain file and is not checked here.
+pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
+    if row.logical != Some(1) {
+        return Err(format!(
+            "topk_ids_logical: {} has no logical twin — the ids need a v2 dump set",
+            row.name
+        )
+        .into());
+    }
+    let path = ref_dir().join(format!("{}.{}.logical.f32", row.name, row.occurrence));
+    let raw = std::fs::read(&path)
+        .map_err(|e| format!("topk_ids_logical: cannot read {}: {e}", path.display()))?;
+    let expect = 4_u64
+        .checked_mul(row.count())
+        .ok_or("topk_ids_logical: topk element count overflows")?;
+    if raw.len() as u64 != expect {
+        return Err(format!(
+            "topk_ids_logical: {} is {} bytes, want {expect} (4*count)",
+            path.display(),
+            raw.len()
+        )
+        .into());
+    }
+    raw.chunks_exact(4)
+        .map(|c| {
+            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            if v.fract() == 0.0 && (0.0..64.0).contains(&v) {
+                Ok(v as i32)
+            } else {
+                Err(format!(
+                    "topk_ids_logical: {} holds non-integral id {v} — not ids cast to f32",
+                    path.display()
+                )
+                .into())
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -126,6 +126,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// bundle is embedded in this executable as PTX text, so the check reads
 /// `/proc/self/exe` and looks inside each entry's own body — the same thing
 /// the backend would report, at no device cost and with no timing in it.
+/// The scan itself is `bloomery_gpu_gates::ptx`; `tools/ptx-scan.sh` prints
+/// the same counts for every entry without asserting any of them.
 #[cfg(feature = "gpu")]
 fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     let blob = std::fs::read(std::env::current_exe()?)?;
@@ -136,11 +138,9 @@ fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
         "kv_append",
         "kv_append_pos_buf",
     ] {
-        let body = entry_body(&blob, name)
+        let c = bloomery_gpu_gates::ptx::counts(&blob, name)
             .ok_or_else(|| format!("gate_p5: no PTX entry {name} in this executable"))?;
-        let depot = find(body, b"__local_depot").is_some();
-        let loads = count(body, b"ld.local");
-        let stores = count(body, b"st.local");
+        let (depot, loads, stores) = (c.depot, c.ld_local, c.st_local);
         let pass = !depot && loads == 0 && stores == 0;
         println!(
             "shape kernel={name} local_depot={depot} ld_local={loads} st_local={stores} {}",
@@ -151,30 +151,6 @@ fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-}
-
-/// The PTX body of one `.visible .entry`: from its header to the next
-/// entry's, or to the end of the bundle.
-#[cfg(feature = "gpu")]
-fn entry_body<'a>(blob: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    const ENTRY: &[u8] = b".visible .entry ";
-    let head = format!(".visible .entry {name}(");
-    let start = find(blob, head.as_bytes())?;
-    let rest = &blob[start + head.len()..];
-    Some(match find(rest, ENTRY) {
-        Some(end) => &rest[..end],
-        None => rest,
-    })
-}
-
-#[cfg(feature = "gpu")]
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-#[cfg(feature = "gpu")]
-fn count(hay: &[u8], needle: &[u8]) -> usize {
-    hay.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
 // ------------------------------------------------------------ real layers

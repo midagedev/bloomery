@@ -45,7 +45,7 @@ use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     RefRow, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
-    ref_tensor_logical_in, route_ref, widened_f16_bits,
+    ref_tensor_logical_in, route_ref, topk_ids_logical, widened_f16_bits,
 };
 
 /// The layer this gate assembles — the first MoE block of the model.
@@ -216,7 +216,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let ik_ids = topk_ids_logical(topk_row)?;
-    let scale = router_scale(&gguf)?;
+    // The router weight multiplier, read by the engine's own MoE metadata
+    // reader so the gate cannot drift from what the step applies.
+    let scale = model::moe::Meta::read(&gguf)?.scale;
     let (_, ids_ref, w_ref) = route_ref(&taps1.moe_logits, 1, scale)?;
     let ours: Vec<i32> = taps1.moe_ids.iter().map(|&e| e as i32).collect();
     let ik_last = &ik_ids[last * n_used..M_TOKENS * n_used];
@@ -367,58 +369,6 @@ fn recombine(down: &[f32], w: &[f32], rows: usize) -> Result<Vec<f32>, Box<dyn s
         }
     }
     Ok(y)
-}
-
-/// The dump's top-k ids: the row's LOGICAL twin holds every token's ids cast
-/// to f32 (the flat VIEW file is token 0's ranking only).
-#[cfg(feature = "gpu")]
-fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
-    if row.logical != Some(1) {
-        return Err(format!(
-            "gate_p8b: {} has no logical twin — the ids need a v2 dump set",
-            row.name
-        )
-        .into());
-    }
-    let path = ref_dir().join(format!("{}.{}.logical.f32", row.name, row.occurrence));
-    let raw = std::fs::read(&path)
-        .map_err(|e| format!("gate_p8b: cannot read {}: {e}", path.display()))?;
-    let expect = 4_u64
-        .checked_mul(row.count())
-        .ok_or("gate_p8b: topk element count overflows")?;
-    if raw.len() as u64 != expect {
-        return Err(format!(
-            "gate_p8b: {} is {} bytes, want {expect} (4*count)",
-            path.display(),
-            raw.len()
-        )
-        .into());
-    }
-    raw.chunks_exact(4)
-        .map(|c| {
-            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            if v.fract() == 0.0 && (0.0..64.0).contains(&v) {
-                Ok(v as i32)
-            } else {
-                Err(format!(
-                    "gate_p8b: {} holds non-integral id {v} — not ids cast to f32",
-                    path.display()
-                )
-                .into())
-            }
-        })
-        .collect()
-}
-
-/// The file's `expert_weights_scale` — the router weight multiplier the
-/// engine reads from the same key.
-#[cfg(feature = "gpu")]
-fn router_scale(gguf: &gguf::Gguf) -> Result<f32, Box<dyn std::error::Error>> {
-    Ok(gguf
-        .architecture()
-        .and_then(|a| gguf.value(&format!("{a}.expert_weights_scale")))
-        .and_then(gguf::Value::as_f32)
-        .unwrap_or(1.0))
 }
 
 #[cfg(feature = "gpu")]

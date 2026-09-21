@@ -15,7 +15,13 @@ use cuda_device::dotprod::dp4a_s32;
 // ---- shared ----
 
 /// IEEE-754 half to float, integer-only so no `f16` feature gate is needed
-/// on either side of the unified compilation.
+/// on either side of the unified compilation, and bit-identical to
+/// `gguf::quant::half_to_f32` — the transcription gate-1-1 pins against
+/// ggml's own table — on all 65,536 patterns, NaN payloads included.
+/// `gate_p4`'s `half_decode` asserts that whole space. The hardware's
+/// one-instruction `cvt.f32.f16` (`flash::half_bits_to_f32`) agrees on every
+/// finite and infinite input but canonicalizes NaN payloads, so it is not a
+/// substitute here while the payload is part of the contract.
 #[inline(always)]
 pub fn half_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) as u32) << 31;

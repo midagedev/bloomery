@@ -34,6 +34,15 @@ pub const RMS_THREADS: usize = 256;
 /// Warps in that block, and so the width of the second-stage combine.
 pub const RMS_WARPS: usize = RMS_THREADS / 32;
 
+/// Threads the argmax gives one vector. Same reason as [`RMS_THREADS`] and
+/// the same shape: the head's row is 102,400 logits, so one warp over the
+/// whole vector is 3,200 dependent loads per lane with a single warp
+/// resident. The scan is strided by this width, the merge is a per-warp
+/// butterfly then a fixed ascending walk of the warp slots.
+pub const ARGMAX_THREADS: usize = 256;
+/// Warps in that block, and so the width of the argmax's final combine.
+pub const ARGMAX_WARPS: usize = ARGMAX_THREADS / 32;
+
 // ------------------------------------------------------------------ cores
 //
 // Same standing as `crate::cores`: ordinary `#[inline(always)]` functions a
@@ -424,21 +433,56 @@ mod elem_kernels {
         }
     }
 
-    /// Index of the maximum of `n` f32, ties to the lower index — the greedy
-    /// sampler's rule. One warp over the whole row: each lane's best over
-    /// its strided values (indices ascending within a lane), then the fixed
-    /// xor butterfly merges by (value desc, index asc). Both stages are a
-    /// total order, so the result is a function of the input alone. The
-    /// result stays on the device (`out[0]`, u32); the step reads it back
-    /// once. Inputs are finite — the gate's loader rejects anything else.
+    /// Widen `n` f16 bit patterns (one per word of `bits`, the low 16 bits)
+    /// to f32 through [`half_to_f32`], the decode every weight scale in this
+    /// package goes through. It exists so the gate can hold that decode
+    /// against the host's transcription over the whole 16-bit input space —
+    /// the only exhaustive statement available about a conversion whose
+    /// hardware and software forms need not agree on NaN payloads.
     #[kernel]
-    #[launch_bounds(32)]
-    #[launch_contract(domain = 1, block = (32, 1, 1), requires = (x.len() >= n, out.len() >= 1))]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (bits.len() >= n, y.len() >= n)
+    )]
+    pub fn half_decode(bits: &[u32], n: u32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= bits.len() by the launch contract.
+        let b = unsafe { *bits.get_unchecked(i) } as u16;
+        // SAFETY: i < n <= y.len() by the launch contract.
+        unsafe {
+            *y.get_unchecked_mut(i) = half_to_f32(b);
+        }
+    }
+
+    /// Index of the maximum of `n` f32, ties to the lower index — the greedy
+    /// sampler's rule. One [`ARGMAX_THREADS`] block over the whole vector:
+    /// each thread's best over its strided share (indices ascending within a
+    /// thread), the fixed xor butterfly merging by (value desc, index asc)
+    /// inside each warp, then thread 0 walking the [`ARGMAX_WARPS`] warp
+    /// slots in ascending order. Every stage is the same total order
+    /// ([`argmax_take`]), so the result is a function of the input alone
+    /// and the tie rule survives every regrouping. A thread whose share is
+    /// empty keeps the `(-inf, 0)` sentinel and can never win against a real
+    /// value, which is also what an all-`-inf` vector answers: index 0, the
+    /// host reference's answer. The result stays on the device (`out[0]`,
+    /// u32); the step reads it back once. Inputs are finite — the gate's
+    /// loader rejects anything else.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (x.len() >= n, out.len() >= 1))]
     pub fn argmax(x: &[f32], n: u32, mut out: DisjointSlice<u32>) {
-        let lane = warp::lane_id();
+        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
+        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
         let mut best_v = f32::NEG_INFINITY;
         let mut best_i = 0u32;
-        let mut i = lane;
+        let mut i = tid;
         while i < n {
             // SAFETY: i < n <= x.len() by the launch contract.
             let v = unsafe { *x.get_unchecked(i as usize) };
@@ -446,7 +490,7 @@ mod elem_kernels {
                 best_v = v;
                 best_i = i;
             }
-            i += 32;
+            i += ARGMAX_THREADS as u32;
         }
         let mut off = 16u32;
         while off > 0 {
@@ -460,11 +504,43 @@ mod elem_kernels {
             }
             off >>= 1;
         }
-        if lane == 0 {
-            // SAFETY: out.len() >= 1 by the launch contract; only lane 0
+        // SAFETY: both arrays are this block's own shared allocations; the
+        // raw form is the only way to reach them without a reference to a
+        // `static mut`. Every access is below ARGMAX_WARPS and ordered by
+        // `sync_threads`.
+        let (bv, bi) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+            )
+        };
+        if warp::lane_id() == 0 {
+            // SAFETY: tid / 32 < ARGMAX_WARPS; one lane per warp writes its
+            // own slot, and the pair is written together.
+            unsafe {
+                *bv.add(tid as usize / 32) = best_v;
+                *bi.add(tid as usize / 32) = best_i;
+            }
+        }
+        thread::sync_threads();
+        if tid == 0 {
+            // SAFETY: every slot was written above and is visible past the
+            // barrier; the walk stays below ARGMAX_WARPS.
+            let (mut fv, mut fi) = unsafe { (*bv.add(0), *bi.add(0)) };
+            let mut w = 1usize;
+            while w < ARGMAX_WARPS {
+                // SAFETY: w < ARGMAX_WARPS, written above, past the barrier.
+                let (cv, ci) = unsafe { (*bv.add(w), *bi.add(w)) };
+                if argmax_take(cv, ci, fv, fi) {
+                    fv = cv;
+                    fi = ci;
+                }
+                w += 1;
+            }
+            // SAFETY: out.len() >= 1 by the launch contract; only thread 0
             // writes.
             unsafe {
-                *out.get_unchecked_mut(0) = best_i;
+                *out.get_unchecked_mut(0) = fi;
             }
         }
     }
@@ -708,9 +784,32 @@ impl ElemKernels {
         Ok(())
     }
 
+    /// Enqueue the f16 widening of `bits` (the low 16 bits of each word)
+    /// into `y`, through the same `cores::half_to_f32` the gemvs and the
+    /// embedding dequant call. The gate's instrument, not a step op.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_half_decode(
+        &self,
+        stream: &CudaStream,
+        bits: &DeviceBuffer<u32>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let n = bits.len();
+        if n == 0 || y.len() < n {
+            return Err(
+                format!("enqueue_half_decode: n={n}, y.len() {} (need {n})", y.len()).into(),
+            );
+        }
+        let prep =
+            self.module
+                .prepare_half_decode(LaunchConfig1D::new(n.div_ceil(256) as u32, 256, 0))?;
+        self.module.half_decode(stream, &prep, bits, n as u32, y)?;
+        Ok(())
+    }
+
     /// Enqueue the argmax of `n` f32 into `out[0]` (u32, device-resident;
-    /// ties to the lower index). One warp walks the whole row. Asynchronous,
-    /// allocation-free, capturable.
+    /// ties to the lower index). One [`ARGMAX_THREADS`] block walks the
+    /// whole vector. Asynchronous, allocation-free, capturable.
     pub fn enqueue_argmax(
         &self,
         stream: &CudaStream,
@@ -726,7 +825,9 @@ impl ElemKernels {
             )
             .into());
         }
-        let prep = self.module.prepare_argmax(LaunchConfig1D::new(1, 32, 0))?;
+        let prep = self
+            .module
+            .prepare_argmax(LaunchConfig1D::new(1, ARGMAX_THREADS as u32, 0))?;
         self.module.argmax(stream, &prep, x, n as u32, out)?;
         Ok(())
     }

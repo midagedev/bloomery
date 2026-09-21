@@ -35,7 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::router::{N_EXPERT, N_USED, RouterKernels};
     use bloomery_gpu_gates::{
-        find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of, route_ref, tensor_bytes,
+        find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of, route_ref,
+        tensor_bytes, topk_ids_logical,
     };
     use cuda_core::DeviceBuffer;
 
@@ -557,58 +558,6 @@ fn to_expert_major<T: Copy>(src: &[T], per: usize, m: usize) -> Vec<T> {
         }
     }
     out
-}
-
-/// The topk row's ids from its LOGICAL twin: `ffn_moe_topk-L` is an i32
-/// VIEW of the argsort output whose plain file is the flat parent read
-/// (token 0's ranking only); the `.logical.f32` twin holds every token's
-/// top-6 ids, each cast to f32 by the dumper. Accepted only when the row
-/// carries a twin and every value is integral in `0..64`, which rules out
-/// any stride or cast mix-up; the manifest's element-sum column describes
-/// the plain file and is not checked here.
-#[cfg(feature = "gpu")]
-fn topk_ids_logical(
-    row: &bloomery_gpu_gates::RefRow,
-) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
-    use bloomery_gpu_gates::ref_dir;
-
-    if row.logical != Some(1) {
-        return Err(format!(
-            "gate_p6: {} has no logical twin — the ids need a v2 dump set",
-            row.name
-        )
-        .into());
-    }
-    let path = ref_dir().join(format!("{}.{}.logical.f32", row.name, row.occurrence));
-    let raw = std::fs::read(&path)
-        .map_err(|e| format!("gate_p6: cannot read {}: {e}", path.display()))?;
-    let expect = 4_u64
-        .checked_mul(row.count())
-        .ok_or("gate_p6: topk element count overflows")?;
-    if raw.len() as u64 != expect {
-        return Err(format!(
-            "gate_p6: {} is {} bytes, want {expect} (4*count)",
-            path.display(),
-            raw.len()
-        )
-        .into());
-    }
-    let ids: Vec<i32> = raw
-        .chunks_exact(4)
-        .map(|c| {
-            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            if v.fract() == 0.0 && (0.0..64.0).contains(&v) {
-                Ok(v as i32)
-            } else {
-                Err(format!(
-                    "gate_p6: {} holds non-integral id {v} — not ids cast to f32",
-                    path.display()
-                )
-                .into())
-            }
-        })
-        .collect::<Result<_, Box<dyn std::error::Error>>>()?;
-    Ok(ids)
 }
 
 #[cfg(feature = "gpu")]

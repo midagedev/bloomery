@@ -49,7 +49,7 @@ use gguf::quant::{GgmlType, dequant_row};
 
 #[cfg(feature = "gpu")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use bloomery_gpu::elem::ElemKernels;
+    use bloomery_gpu::elem::{ARGMAX_THREADS, ElemKernels};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuModel};
 
     // Reduction ops' band vs the f64 host reference (the package's gate rule:
@@ -527,31 +527,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ok = false;
         }
 
-        // Tie rule: equal maxima, the lower index must win on both sides. One
-        // pair shares a lane (100 and 132 are 32 apart — the lane's strided
-        // scan visits both), one pair straddles lanes; the shared-lane pair
-        // is what catches a strict-`>`-weakened lane scan, the straddling
-        // pair the butterfly's merge order.
-        let mut tie = activations(102400, 1, 5555);
-        for v in tie.iter_mut() {
-            *v *= 0.25;
-        }
-        tie[100] = 4.0;
-        tie[132] = 4.0;
-        tie[70000] = 4.0;
-        let want = argmax_ref(&tie);
-        let t_dev = DeviceBuffer::from_host(stream, &tie)?;
-        let mut t_idx = DeviceBuffer::<u32>::zeroed(stream, 1)?;
-        elem.enqueue_argmax(stream, &t_dev, tie.len(), &mut t_idx)?;
-        stream.synchronize()?;
-        let got = t_idx.to_host_vec(stream)?[0];
-        let tie_pass = got == want && want == 100;
-        println!(
-            "shape op=argmax tie_probe n=102400 tied_at=100,132,70000 argmax_dev={got} argmax_host={want} {}",
-            verdict(tie_pass)
-        );
-        if !tie_pass {
-            ok = false;
+        // Tie rule: equal maxima, the LOWEST index must win. The parallel
+        // reduce merges in three stages, and a careless combine breaks a
+        // different one of them, so every case below names the stage it
+        // aims at (ARGMAX_THREADS threads, 32 lanes per warp): two indices
+        // ARGMAX_THREADS apart land in one thread's own strided scan, two
+        // adjacent indices in one warp's butterfly, two 32 apart in
+        // different warps' shared slots — that last one is the only case a
+        // `>=` in the final warp walk cannot survive. The boundary cases are
+        // a tie at index 0, a tie at the last index, and an all-equal
+        // vector, where every stage compares equal values from start to end.
+        // The last case is a length that is not a multiple of the block
+        // width, with a poison maximum parked one past `n` in a longer
+        // buffer: a scan bound rounded up to the stride reads it and loses.
+        {
+            const TIE_N: usize = 102400;
+            let base = |seed: u32, n: usize| -> Vec<f32> {
+                let mut v = activations(n, 1, seed);
+                for x in v.iter_mut() {
+                    *x *= 0.25;
+                }
+                v
+            };
+            let mut cases: Vec<(&str, Vec<f32>, usize, u32)> = Vec::new();
+
+            // Same thread's own scan: 100 and 100 + ARGMAX_THREADS.
+            let mut v = base(5555, TIE_N);
+            v[100] = 4.0;
+            v[100 + ARGMAX_THREADS] = 4.0;
+            cases.push(("same_thread", v, TIE_N, 100));
+
+            // Same warp, adjacent lanes.
+            let mut v = base(5556, TIE_N);
+            v[100] = 4.0;
+            v[101] = 4.0;
+            cases.push(("same_warp", v, TIE_N, 100));
+
+            // Different warps (32 apart), plus a third far-away tie.
+            let mut v = base(5557, TIE_N);
+            v[100] = 4.0;
+            v[132] = 4.0;
+            v[70000] = 4.0;
+            cases.push(("cross_warp", v, TIE_N, 100));
+
+            // The first index tied with a later one.
+            let mut v = base(5558, TIE_N);
+            v[0] = 4.0;
+            v[9999] = 4.0;
+            cases.push(("first_index", v, TIE_N, 0));
+
+            // The last index tied with an earlier one: the winner is the
+            // earlier one, and the tail must still have been scanned.
+            let mut v = base(5559, TIE_N);
+            v[TIE_N - 1] = 4.0;
+            v[TIE_N - 1 - ARGMAX_THREADS] = 4.0;
+            cases.push(("last_index", v, TIE_N, (TIE_N - 1 - ARGMAX_THREADS) as u32));
+
+            // The last index alone: the unique maximum at the very end.
+            let mut v = base(5560, TIE_N);
+            v[TIE_N - 1] = 4.0;
+            cases.push(("tail_unique", v, TIE_N, (TIE_N - 1) as u32));
+
+            // Every value equal.
+            cases.push(("all_equal", vec![0.5f32; TIE_N], TIE_N, 0));
+
+            // n not a multiple of the block width, with a poison maximum at
+            // index n of a longer buffer.
+            const RAGGED_N: usize = 1000;
+            let mut v = base(5561, RAGGED_N + ARGMAX_THREADS);
+            v[777] = 4.0;
+            for x in v.iter_mut().skip(RAGGED_N) {
+                *x = 9.0;
+            }
+            cases.push(("ragged_n_poison_past_n", v, RAGGED_N, 777));
+
+            let mut t_idx = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+            for (label, x, n, want) in cases {
+                let host = argmax_ref(&x[..n]);
+                let x_dev = DeviceBuffer::from_host(stream, &x)?;
+                elem.enqueue_argmax(stream, &x_dev, n, &mut t_idx)?;
+                stream.synchronize()?;
+                let got = t_idx.to_host_vec(stream)?[0];
+                let pass = got == want && host == want;
+                println!(
+                    "shape op=argmax tie_case={label} n={n} buf={} argmax_dev={got} argmax_host={host} want={want} {}",
+                    x.len(),
+                    verdict(pass)
+                );
+                if !pass {
+                    ok = false;
+                }
+            }
         }
 
         // ======================================= captured graph (3 ops)
@@ -592,6 +658,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !g_pass {
             ok = false;
         }
+
+        // ---- lead-only timing under the machine lease
+        // (`time-gate.sh gate_p4 --time-argmax`); correctness runs never
+        // reach this. What it prices is the argmax's launch geometry over
+        // the head's real width: one captured single-node graph replayed N
+        // times, with an empty-kernel graph as the submission floor, so the
+        // difference is the kernel body and not the submit path.
+        if std::env::args().any(|a| a == "--time-argmax") {
+            const N: u32 = 2000;
+            let probe = bloomery_gpu::probe::Probe::load(gpu.context())?;
+            let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
+            let empty = gpu.capture(|_| probe.enqueue_touch(stream, &mut tbuf))?;
+            let am =
+                gpu.capture(|_| elem.enqueue_argmax(stream, &x_dev, logits.len(), &mut idx_dev))?;
+            let time_replays =
+                |g: &bloomery_gpu::Graph| -> Result<f64, Box<dyn std::error::Error>> {
+                    for _ in 0..2 {
+                        g.launch(stream)?;
+                    }
+                    stream.synchronize()?;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..N {
+                        g.launch(stream)?;
+                    }
+                    stream.synchronize()?;
+                    Ok(t0.elapsed().as_secs_f64() * 1e6 / f64::from(N))
+                };
+            let argmax_us = time_replays(&am)?;
+            let touch_us = time_replays(&empty)?;
+            println!(
+                "time op=argmax n={} reps={N} argmax_us_per_replay={argmax_us:.3} \
+                 touch1_us_per_replay={touch_us:.3} net_us={:.3}",
+                logits.len(),
+                argmax_us - touch_us
+            );
+        }
+    }
+
+    // ======================================================= f16 decode
+    // Exhaustive: every one of the 65,536 f16 bit patterns through the
+    // device's `cores::half_to_f32` against `gguf::quant::half_to_f32`, the
+    // host transcription gate-1-1 pins against ggml's own table. Compared
+    // bit for bit over the whole input space, NaN payloads included — that
+    // is the decode's contract, and it is what separates the transcription
+    // from the hardware's `cvt.f32.f16`, which agrees on every finite and
+    // infinite input and canonicalizes every NaN payload to one quiet NaN.
+    // The two mismatch classes are counted apart so a failure says which.
+    {
+        const N16: usize = 1 << 16;
+        let bits: Vec<u32> = (0..N16 as u32).collect();
+        let bits_dev = DeviceBuffer::from_host(stream, &bits)?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, N16)?;
+        elem.enqueue_half_decode(stream, &bits_dev, &mut y_dev)?;
+        stream.synchronize()?;
+        let y = y_dev.to_host_vec(stream)?;
+
+        let mut finite_bad = 0usize;
+        let mut nan_bad = 0usize;
+        let mut first_bad: Option<(u16, u32, u32)> = None;
+        for b in 0..N16 {
+            let want = gguf::quant::half_to_f32(b as u16);
+            let got = y[b];
+            if got.to_bits() == want.to_bits() {
+                continue;
+            }
+            if want.is_nan() && got.is_nan() {
+                nan_bad += 1;
+            } else {
+                finite_bad += 1;
+            }
+            if first_bad.is_none() {
+                first_bad = Some((b as u16, want.to_bits(), got.to_bits()));
+            }
+        }
+        let shown = match first_bad {
+            Some((b, w, g)) => format!("first_diff=0x{b:04x}:host=0x{w:08x},dev=0x{g:08x}"),
+            None => "first_diff=none".to_string(),
+        };
+        let pass = finite_bad == 0 && nan_bad == 0;
+        println!(
+            "shape op=half_decode patterns={N16} non_nan_mismatches={finite_bad} \
+             nan_bit_pattern_diffs={nan_bad} {shown} {}",
+            verdict(pass)
+        );
+        if !pass {
+            ok = false;
+        }
     }
 
     norm_geometry(&mut ok)?;
@@ -602,8 +755,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "PASSED: elem kernels within their bands of the host references; bit-identical reruns; \
-         eager == graph replay; chains proven from the dump; the norm's launch geometry \
-         keeps every row's serial load depth inside NORM_MAX_TRIPS"
+         eager == graph replay; chains proven from the dump; the argmax's tie rule holds at \
+         every stage of its parallel reduce; the norm's launch geometry keeps every row's \
+         serial load depth inside NORM_MAX_TRIPS and the argmax's block stays wide"
     );
     Ok(())
 }
@@ -654,34 +808,52 @@ fn norm_geometry(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
             *ok = false;
         }
     }
+    argmax_geometry(&blob, ok)
+}
+
+/// The argmax's launch geometry, the same shape assertion as the norm's and
+/// for the same defect: the head's vector is the widest reduction a decode
+/// step runs, and one warp over it is a serial load chain no band and no
+/// bit-identity can see. The block width is read from the compiled entry's
+/// own `.reqntid`, so the host's `LaunchConfig1D` and the device code cannot
+/// drift apart; `ARGMAX_MIN_WARPS` is the residency the shape has to buy,
+/// and the trip count is what the stride actually costs at the head's width.
+#[cfg(feature = "gpu")]
+fn argmax_geometry(blob: &[u8], ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+    use bloomery_gpu::elem::{ARGMAX_THREADS, ARGMAX_WARPS};
+
+    /// Warps the argmax block must keep resident — one warp was the defect.
+    const ARGMAX_MIN_WARPS: usize = 8;
+    /// The head's vocabulary: the one vector a decode step argmaxes.
+    const ARGMAX_N: usize = 102_400;
+
+    let ntid =
+        entry_reqntid(blob, "argmax").ok_or("gate_p4: no PTX entry argmax with a .reqntid")?;
+    let trips = ARGMAX_N.div_ceil(ARGMAX_THREADS);
+    let pass = ntid == ARGMAX_THREADS
+        && ARGMAX_THREADS % 32 == 0
+        && ARGMAX_THREADS <= 1024
+        && ARGMAX_WARPS == ARGMAX_THREADS / 32
+        && ARGMAX_WARPS >= ARGMAX_MIN_WARPS;
+    println!(
+        "shape op=argmax geometry block_reqntid={ntid} ARGMAX_THREADS={ARGMAX_THREADS} \
+         warps={ARGMAX_WARPS} min_warps={ARGMAX_MIN_WARPS} n={ARGMAX_N} \
+         trips_per_thread={trips} {}",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    if !pass {
+        *ok = false;
+    }
     Ok(())
 }
 
 /// The `x` of one PTX entry's `.reqntid x, y, z` — the block width the device
 /// code was compiled for. The device bundle rides in this executable as PTX
-/// text, so the whole check is a scan of `/proc/self/exe`.
+/// text, so the whole check is a scan of `/proc/self/exe`
+/// (`bloomery_gpu_gates::ptx`).
 #[cfg(feature = "gpu")]
 fn entry_reqntid(blob: &[u8], name: &str) -> Option<usize> {
-    const ENTRY: &[u8] = b".visible .entry ";
-    let head = format!(".visible .entry {name}(");
-    let start = find(blob, head.as_bytes())? + head.len();
-    let rest = &blob[start..];
-    let body = match find(rest, ENTRY) {
-        Some(end) => &rest[..end],
-        None => rest,
-    };
-    let at = find(body, b".reqntid ")? + b".reqntid ".len();
-    let digits: Vec<u8> = body[at..]
-        .iter()
-        .copied()
-        .take_while(u8::is_ascii_digit)
-        .collect();
-    String::from_utf8(digits).ok()?.parse().ok()
-}
-
-#[cfg(feature = "gpu")]
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+    bloomery_gpu_gates::ptx::body(blob, name).and_then(bloomery_gpu_gates::ptx::reqntid)
 }
 
 /// One rms_norm case: run the kernel twice on `x`, assert against the host

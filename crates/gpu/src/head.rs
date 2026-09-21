@@ -16,19 +16,11 @@ use crate::{Gpu, Graph};
 use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
 
-/// The final norm's gain (`output_norm.weight`), resident F32. A local twin
-/// of model.rs's private `f32_gain` — that helper is not exported and this
-/// file owns its weights reads.
+/// The final norm's gain (`output_norm.weight`), resident F32 — the shared
+/// weights reader, so the head's residency error reads like every other
+/// stage's.
 fn head_gain(w: &Weights) -> Result<&DeviceBuffer<f32>, GpuError> {
-    match w.get("output_norm.weight") {
-        Some(DevWeight::F32 { w, .. }) => Ok(w.buf()),
-        Some(_) => Err("head_gain: output_norm.weight is not F32".into()),
-        None => Err(
-            "head_gain: output_norm.weight not resident — load Weights with \
-             globals"
-                .into(),
-        ),
-    }
+    crate::model::f32_gain(w, "output_norm.weight")
 }
 
 /// The lm_head weight (`output.weight`): its Q6_K word plane and row width.
