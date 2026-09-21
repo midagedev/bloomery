@@ -76,6 +76,10 @@ gate-gpu-p0b *ARGS:
 time-gpu-p0b:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/ref/time-p0b.sh'
 
+# MoE 융합(P8 준비): 전문가 여섯의 gate·up·swiglu 한 런치 + 결합 한 런치가 op 경로와 비트 동일한지(정확성 실행).
+gate-gpu-moe:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && ./target/release/gate_moe_fused'
+
 # P7 뒤 절반: 블록·종단 게이트 하네스의 자기 검증(호스트 전용 — 두 오라클 사이의 알려진 거리를 재현해야 한다).
 gate-gpu-block:
     ./tools/box.sh 'cargo run --release -p bloomery-gpu-gates --bin gate_block'

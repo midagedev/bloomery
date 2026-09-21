@@ -25,6 +25,7 @@ pub mod cores;
 pub mod elem;
 pub mod flash;
 pub mod fused;
+pub mod moe_fused;
 pub mod graph;
 pub mod model;
 pub mod probe;
