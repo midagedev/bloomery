@@ -24,8 +24,8 @@ fn main() {
 use bloomery_gpu_gates::RefRow;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    bytes_to_words, find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of, row_bytes,
-    tensor_bytes,
+    bytes_to_words, f32_tensor, find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of,
+    row_bytes, tensor_bytes,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -484,29 +484,6 @@ fn expect(
         .into());
     }
     Ok(())
-}
-
-/// An F32 tensor from the file as f32 (norm gains), length-checked.
-#[cfg(feature = "gpu")]
-fn f32_tensor(
-    gguf: &gguf::Gguf,
-    name: &str,
-    want: usize,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let (t, b) = tensor_bytes(gguf, name)?;
-    if t.ty != GgmlType::F32 || b.len() != want * 4 {
-        return Err(format!(
-            "gate_p0b: {name} is {:?} with {} bytes, want F32 x {want}",
-            t.ty,
-            b.len()
-        )
-        .into());
-    }
-    Ok(b.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect())
 }
 
 #[cfg(feature = "gpu")]

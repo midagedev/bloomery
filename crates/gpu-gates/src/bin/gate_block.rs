@@ -23,7 +23,9 @@ use bloomery_gpu_gates::block::{
     Bands, BlockKind, M_TOKENS, TapKind, check_logical_views, check_row, compare_in, print_table,
     taps,
 };
-use bloomery_gpu_gates::{find_ref_row_in, ref_dir_named, ref_manifest_in, ref_tensor_logical_in};
+use bloomery_gpu_gates::{
+    find_ref_row_in, ref_dir, ref_dir_named, ref_manifest_in, ref_tensor_logical_in,
+};
 use std::path::PathBuf;
 
 /// The distance between ik's own CPU and CUDA backends, measured when the
@@ -47,9 +49,14 @@ const IK_ARGMAX: usize = 8913;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ok = true;
 
-    let cuda_set = std::env::var("BLOOMERY_REF_SET").unwrap_or_else(|_| "ref_cuda_v2".to_string());
     let cpu_set = std::env::var("BLOOMERY_REF_CPU_SET").unwrap_or_else(|_| "ref".to_string());
-    let cuda_dir: PathBuf = ref_dir_named(&cuda_set);
+    // The CUDA set is `ref_dir()`'s (default `ref_cuda_v2`, overridable by
+    // `BLOOMERY_REF_SET` / `BLOOMERY_REF_CUDA`) — one owner of the default.
+    let cuda_dir: PathBuf = ref_dir();
+    let cuda_set = cuda_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cuda_dir.display().to_string());
     let cpu_dir: PathBuf = ref_dir_named(&cpu_set);
     let man_c = ref_manifest_in(&cuda_dir)?;
     let man_cpu = ref_manifest_in(&cpu_dir)?;

@@ -1058,6 +1058,7 @@ pub struct Gpu {
     flash: flash::FlashKernels,
     router: router::RouterKernels,
     fused: fused::FusedKernels,
+    moe_fused: moe_fused::MoeFusedKernels,
 }
 
 impl Gpu {
@@ -1083,6 +1084,7 @@ impl Gpu {
             flash: flash::FlashKernels::load(&ctx)?,
             router: router::RouterKernels::load(&ctx)?,
             fused: fused::FusedKernels::load(&ctx)?,
+            moe_fused: moe_fused::MoeFusedKernels::load(&ctx)?,
             ctx,
             stream,
             module,
@@ -1118,6 +1120,13 @@ impl Gpu {
     /// down+residual — bit-identical to the per-op path they replace.
     pub fn fused(&self) -> &fused::FusedKernels {
         &self.fused
+    }
+
+    /// The fused MoE kernels: six experts' gate·up·swiglu in one launch and
+    /// the weighted combine (+shexp, +residual) in one — bit-identical to
+    /// the per-op `_sel` path they replace.
+    pub fn moe_fused(&self) -> &moe_fused::MoeFusedKernels {
+        &self.moe_fused
     }
 
     pub fn context(&self) -> &Arc<CudaContext> {
@@ -1248,7 +1257,7 @@ impl Gpu {
     ) -> Result<(), GpuError> {
         let (n_rows, m) = (w.rows(), act.m());
         let n_sb = act.n_sb();
-        if n_sb % 2 != 0 {
+        if !n_sb.is_multiple_of(2) {
             return Err(format!(
                 "enqueue_gemv_q3k: odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
@@ -1320,7 +1329,7 @@ impl Gpu {
             )
             .into());
         }
-        if n_sb % 2 != 0 {
+        if !n_sb.is_multiple_of(2) {
             return Err(format!(
                 "enqueue_gemv_q3k_sel: odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
@@ -1337,7 +1346,7 @@ impl Gpu {
             )
             .into());
         }
-        if rows_per_expert == 0 || w.rows() % rows_per_expert != 0 {
+        if rows_per_expert == 0 || !w.rows().is_multiple_of(rows_per_expert) {
             return Err(format!(
                 "enqueue_gemv_q3k_sel: w.rows() {} must be a positive multiple of \
                  rows_per_expert {rows_per_expert}",
@@ -1399,7 +1408,7 @@ impl Gpu {
     ) -> Result<(), GpuError> {
         let (n_rows, m) = (w.rows(), act.m());
         let n_sb = act.n_sb();
-        if n_sb % 2 != 0 {
+        if !n_sb.is_multiple_of(2) {
             return Err(format!(
                 "enqueue_gemv_q6k: odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",

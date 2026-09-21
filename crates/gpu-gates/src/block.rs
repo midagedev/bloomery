@@ -1,7 +1,8 @@
 //! Block / end-to-end oracle harness (docs/gpu-design.md decision 3,
 //! block layer): compare a whole forward pass, tap by tap, against the ik
-//! dump sets — our engine against `ref_cuda`, or one oracle against the
-//! other. The kernel gates judge single ops against exact references;
+//! dump sets — our engine against the CUDA set (`ref_cuda_v2`), or one
+//! oracle against the other. The kernel gates judge single ops against
+//! exact references;
 //! this is the layer where quantization noise is the signal, and the
 //! question is "which op left its band first".
 //!
