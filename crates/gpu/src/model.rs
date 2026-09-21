@@ -725,6 +725,56 @@ impl Block0Taps {
     }
 }
 
+/// Per-op timing of one block-0 chain run from
+/// [`GpuModel::profile_block0`]: `us_mean`/`us_min` over the measured reps
+/// of that op's eager launch + body + the one stream synchronize the
+/// profiling observer issues after it. Every op carries the same sync
+/// overhead; subtract a touch-launch+sync constant (the gate's
+/// `sync_floor_us`) to compare op bodies.
+pub struct OpTime {
+    pub index: usize,
+    pub name: &'static str,
+    pub us_mean: f64,
+    pub us_min: f64,
+}
+
+/// The profiling observer's state: per-op sample lists and the wall clock
+/// of the previous synchronize. Owned by [`GpuModel::profile_block0`]'s rep
+/// loop, borrowed by the observer closure for one chain run at a time.
+struct ProfRec {
+    ops: Vec<(&'static str, Vec<f64>)>,
+    last: std::time::Instant,
+}
+
+impl ProfRec {
+    /// Synchronize after op `i`'s enqueue and record the wall time since the
+    /// previous sync — the op's eager launch + body + one synchronize.
+    fn observe(
+        &mut self,
+        i: usize,
+        name: &'static str,
+        stream: &CudaStream,
+    ) -> Result<(), GpuError> {
+        stream.synchronize()?;
+        let now = std::time::Instant::now();
+        let us = now.duration_since(self.last).as_secs_f64() * 1e6;
+        self.last = now;
+        if i == self.ops.len() {
+            self.ops.push((name, Vec::new()));
+        }
+        let slot = &mut self.ops[i];
+        if slot.0 != name {
+            return Err(format!(
+                "profile_block0: op {i} was {} on an earlier rep, now {name}",
+                slot.0
+            )
+            .into());
+        }
+        slot.1.push(us);
+        Ok(())
+    }
+}
+
 /// One resident model: its stages in layer order, covering every block
 /// exactly once. Everything `step` touches is allocated at load, never per
 /// step.
@@ -912,7 +962,15 @@ impl GpuModel {
             scratch,
             step,
         } = residency;
-        enqueue_block0(gpu, step, weights, &mut kv[0], scratch, &mla)
+        enqueue_block0(
+            gpu,
+            step,
+            weights,
+            &mut kv[0],
+            scratch,
+            &mla,
+            &mut |_, _| Ok(()),
+        )
     }
 
     /// Eagerly run block 0's step for `token` at `pos` (`pos + 1` live keys,
@@ -977,8 +1035,17 @@ impl GpuModel {
             return Err("GpuModel::capture_block0: stage carries no residency".into());
         };
         let gpu = &stage.gpu;
-        let graph =
-            gpu.capture(|_| enqueue_block0(gpu, step, weights, &mut kv[0], scratch, &mla))?;
+        let graph = gpu.capture(|_| {
+            enqueue_block0(
+                gpu,
+                step,
+                weights,
+                &mut kv[0],
+                scratch,
+                &mla,
+                &mut |_, _| Ok(()),
+            )
+        })?;
         let nodes = graph.node_count();
         stage.graph = Some(graph);
         Ok(nodes)
@@ -1004,6 +1071,92 @@ impl GpuModel {
         let stream = self.stages[0].gpu.stream();
         stream.synchronize()?;
         Ok(())
+    }
+
+    /// Time the block-0 step op by op: `reps` measured chain runs (after 20
+    /// warm-up runs, discarded), each enqueued eagerly at `(token, pos)` with
+    /// an observer that synchronizes after every op and records wall time
+    /// since the previous sync. Each sample is therefore an eager launch,
+    /// body and one synchronize — it overstates every op by the same host
+    /// sync cost, which the caller calibrates against a bare launch+sync
+    /// constant. Parameters are refreshed once before the loop; the chain is
+    /// idempotent at a fixed `(token, pos)` (it rewrites the same KV row and
+    /// every scratch buffer it reads), so the runs leave the model exactly
+    /// where one eager step would. Debug/profiling use — never inside a
+    /// capture (the observer synchronizes).
+    pub fn profile_block0(
+        &mut self,
+        token: u32,
+        pos: u32,
+        reps: u32,
+    ) -> Result<Vec<OpTime>, GpuError> {
+        self.check_pos(pos, "profile_block0")?;
+        if reps == 0 {
+            return Err("profile_block0: reps must be >= 1".into());
+        }
+        self.refresh_params(token, pos)?;
+        let mla = self.mla.clone();
+        let (gpu, residency) = self.block0_parts()?;
+        let stream = gpu.stream();
+        let Residency {
+            weights,
+            kv,
+            scratch,
+            step,
+        } = residency;
+        let mut rec = ProfRec {
+            // Slot i is created by op i's first firing (indices arrive in
+            // chain order); the name is cross-checked on every later rep.
+            ops: Vec::new(),
+            last: std::time::Instant::now(),
+        };
+        const WARMUP: u32 = 20;
+        for rep in 0..(WARMUP + reps) {
+            rec.last = std::time::Instant::now();
+            let mut obs = |i: usize, name: &'static str| rec.observe(i, name, stream);
+            enqueue_block0(gpu, step, weights, &mut kv[0], scratch, &mla, &mut obs)?;
+            if rep < WARMUP {
+                for (_, s) in rec.ops.iter_mut() {
+                    s.clear();
+                }
+            }
+        }
+        stream.synchronize()?;
+        Ok(rec
+            .ops
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, s))| OpTime {
+                index,
+                name,
+                us_mean: s.iter().sum::<f64>() / s.len() as f64,
+                us_min: s.iter().cloned().fold(f64::INFINITY, f64::min),
+            })
+            .collect())
+    }
+
+    /// Mean host wall time (µs) of one `refresh_params` call — the four
+    /// host→device parameter copies that sit outside the captured graph but
+    /// inside every real decode step. Same 20-run warm-up convention as
+    /// [`GpuModel::profile_block0`]; the timed window is the call itself,
+    /// not the copies' stream completion.
+    pub fn refresh_params_us(&mut self, token: u32, pos: u32, reps: u32) -> Result<f64, GpuError> {
+        self.check_pos(pos, "refresh_params_us")?;
+        if reps == 0 {
+            return Err("refresh_params_us: reps must be >= 1".into());
+        }
+        for _ in 0..20 {
+            self.refresh_params(token, pos)?;
+        }
+        self.stages[0].gpu.stream().synchronize()?;
+        let mut total = 0.0f64;
+        for _ in 0..reps {
+            let t0 = std::time::Instant::now();
+            self.refresh_params(token, pos)?;
+            total += t0.elapsed().as_secs_f64() * 1e6;
+        }
+        self.stages[0].gpu.stream().synchronize()?;
+        Ok(total / f64::from(reps))
     }
 
     /// Write `rows` (whole `kv_width`-wide rows, `rows.len() <= ctx_max * kv_width`)
@@ -1191,6 +1344,13 @@ fn f32_gain<'a>(w: &'a Weights, name: &str) -> Result<&'a DeviceBuffer<f32>, Gpu
 /// Enqueue the whole block-0 step for one token (m = 1). Mirrors
 /// `model::attn::block_attn_cached`'s op order with the gated kernels plus
 /// this file's gather. Asynchronous throughout — capturable as a body.
+///
+/// `obs` fires on the host after every enqueue, carrying the op's index (one
+/// per launch, in chain order) and the name of the numbered step it belongs
+/// to; returning `Err` aborts the chain at that op. The normal and captured
+/// paths pass a no-op, which issues byte-for-byte the same launches in the
+/// same order as an uninstrumented chain — the observer is host-side only
+/// and never touches the stream.
 #[allow(clippy::too_many_arguments)]
 fn enqueue_block0(
     gpu: &Gpu,
@@ -1199,6 +1359,7 @@ fn enqueue_block0(
     kv0: &mut DeviceTensor<u16>,
     s: &mut Block0Scratch,
     mla: &MlaParams,
+    obs: &mut dyn FnMut(usize, &'static str) -> Result<(), GpuError>,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let (hidden, latent, rope) = (s.dims.hidden, mla.latent, mla.rope_dims);
@@ -1215,6 +1376,7 @@ fn enqueue_block0(
         &s.token_buf,
         &mut s.x,
     )?;
+    obs(0, "embed")?;
     // 1. attn_norm(x) — the dump's FUSED_RMS_NORM output.
     gpu.elem().enqueue_rms_norm(
         stream,
@@ -1225,14 +1387,18 @@ fn enqueue_block0(
         1,
         &mut s.normed,
     )?;
+    obs(1, "attn_norm")?;
     // 2-3. the two projections over one q8_1 activation of the normed x.
     gpu.enqueue_quantize_q8_1(&s.normed, &mut s.act_q)?;
+    obs(2, "quantize_q8_1(act_q)")?;
     gpu.enqueue_gemv_q3k(kq_weight(w, "blk.0.attn_q.weight")?, &s.act_q, &mut s.q)?;
+    obs(3, "gemv_q3k(attn_q)")?;
     gpu.enqueue_gemv_q3k(
         kq_weight(w, "blk.0.attn_kv_a_mqa.weight")?,
         &s.act_q,
         &mut s.kv_a,
     )?;
+    obs(4, "gemv_q3k(attn_kv_a_mqa)")?;
     // 4. rope over every 64-value column of both projections: the q layout
     //    puts each head's rope slice on a column boundary (3 columns per
     //    head, the slice last), the kv layout its rope tail (last column);
@@ -1246,6 +1412,7 @@ fn enqueue_block0(
         1,
         &mut s.q_rope_all,
     )?;
+    obs(5, "rope(q)")?;
     gpu.elem().enqueue_rope(
         stream,
         &s.kv_a,
@@ -1255,6 +1422,7 @@ fn enqueue_block0(
         1,
         &mut s.kv_s,
     )?;
+    obs(6, "rope(kv_a)")?;
     // 5. the latent norm overwrites `kv_s`'s head, leaving the rope tail in
     //    place: `kv_s` ends as `[kv_compressed | k_rope]`.
     gpu.elem().enqueue_rms_norm(
@@ -1266,8 +1434,10 @@ fn enqueue_block0(
         1,
         &mut s.kv_s,
     )?;
+    obs(7, "rms_norm(attn_kv_a_norm)")?;
     // 6. kvr = [k_rope | kv_compressed] — the oracle's CONCAT order.
     gather(&s.g_kvr, &s.kv_s, &mut s.kvr)?;
+    obs(8, "gather(kvr)")?;
     // 7. q_nope2 per head: one per-head launch dots every derived wk_b row
     //    of head h against q's nope slice of that head (x base h*kq_head,
     //    m = 1 per row), writing the nope2 span of flash row h directly
@@ -1284,15 +1454,19 @@ fn enqueue_block0(
         rope,
         &mut s.f_rows,
     )?;
+    obs(9, "gemv_q8_0_heads(q_nope2)")?;
     // 8. the flash q rows `[q_rope | q_nope2]` per head — the rope spans are
     //    copies of q_rope_all's per-head rope slices (the nope2 span is
     //    already in place).
     gather(&s.g_f_rope_lo, &s.q_rope_all, &mut s.f_rows)?;
+    obs(10, "gather(f_rope_lo)")?;
     gather(&s.g_f_rope_hi, &s.q_rope_all, &mut s.f_rows)?;
+    obs(11, "gather(f_rope_hi)")?;
     // 9. append the kvr row at `pos`, then attend over `n_keys` rows — both
     //    read from device buffers, so a captured replay follows the position.
     gpu.flash()
         .enqueue_kv_append_pos_buf(stream, &s.kvr, &s.pos_buf, kv0, 1)?;
+    obs(12, "kv_append(pos)")?;
     gpu.flash().enqueue_flash_latent(
         stream,
         &s.f_rows,
@@ -1305,6 +1479,7 @@ fn enqueue_block0(
         latent,
         &mut s.kqvc,
     )?;
+    obs(13, "flash_latent")?;
     // 10. wv_b per head: flash's output is head-major — kqvc column h is
     //     head h's compressed values, the m-column layout the quantizer
     //     consumes; the heads 8..15 half quantizes from kqvc's base offset
@@ -1314,7 +1489,9 @@ fn enqueue_block0(
     //     m = 1), writing the flat, head-major kqv_2d directly — the wk_b
     //     rows are never read.
     gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
+    obs(14, "quantize_q8_1(kqvc_lo)")?;
     gpu.enqueue_quantize_q8_1_at(&s.kqvc, (mla.n_head / 2) * latent, &mut s.act_kv_hi)?;
+    obs(15, "quantize_q8_1(kqvc_hi)")?;
     let kv_b = kq_weight(w, "blk.0.attn_kv_b.weight")?;
     step.enqueue_q3k_gemv_heads(
         stream,
@@ -1327,6 +1504,7 @@ fn enqueue_block0(
         mla.v_head,
         &mut s.kqv_2d,
     )?;
+    obs(16, "gemv_q3k_heads(wv_b_lo)")?;
     step.enqueue_q3k_gemv_heads(
         stream,
         kv_b,
@@ -1338,15 +1516,19 @@ fn enqueue_block0(
         mla.v_head,
         &mut s.kqv_2d,
     )?;
+    obs(17, "gemv_q3k_heads(wv_b_hi)")?;
     // 11. attn_output over the flat kqv_2d, then the attention residual.
     gpu.enqueue_quantize_q8_1(&s.kqv_2d, &mut s.act_ao)?;
+    obs(18, "quantize_q8_1(act_ao)")?;
     gpu.enqueue_gemv_q4k(
         kq_weight(w, "blk.0.attn_output.weight")?,
         &s.act_ao,
         &mut s.attn_out,
     )?;
+    obs(19, "gemv_q4k(attn_output)")?;
     gpu.elem()
         .enqueue_add(stream, &s.attn_out, &s.x, hidden, &mut s.ffn_inp)?;
+    obs(20, "add(attn_resid)")?;
     // 12. the fused FFN: norm+quantize, gate·up·swiglu, 32-value quantize,
     //     down+residual — bit-identical to the op path (the P0b contract).
     gpu.fused().enqueue_norm_quant(
@@ -1356,6 +1538,7 @@ fn enqueue_block0(
         mla.eps,
         &mut s.act_ffn,
     )?;
+    obs(21, "ffn_norm_quant")?;
     gpu.fused().enqueue_gate_up_swiglu(
         stream,
         kq_weight(w, "blk.0.ffn_gate.weight")?,
@@ -1363,7 +1546,9 @@ fn enqueue_block0(
         &s.act_ffn,
         &mut s.h,
     )?;
+    obs(22, "ffn_gate_up_swiglu")?;
     gpu.q5().enqueue_quantize_q8(stream, &s.h, &mut s.act32)?;
+    obs(23, "ffn_quantize_q8")?;
     gpu.fused().enqueue_down_add_q5_1(
         stream,
         kq_weight(w, "blk.0.ffn_down.weight")?,
@@ -1371,5 +1556,6 @@ fn enqueue_block0(
         &s.ffn_inp,
         &mut s.l_out,
     )?;
+    obs(24, "ffn_down_add")?;
     Ok(())
 }

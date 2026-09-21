@@ -19,7 +19,14 @@
 //!
 //! `--time` (lead-only, under the machine lease) replays the graph 2000x
 //! and prints us/replay plus an empty-graph reference; correctness runs
-//! never reach it.
+//! never reach it. `--profile` (lead-only, the same lease — the profiling
+//! numbers are measurements too) additionally runs `GpuModel::profile_block0`:
+//! one line per op — eager launch + body + one synchronize, so the printed
+//! `sync_floor_us` (a bare `touch` launch + sync, sampled the same way) is
+//! the per-op overhead to subtract via `net_us` — then the sums, the
+//! attention/FFN split (ops up to and including the attention residual add
+//! vs the four fused FFN ops), `refresh_params`' host time, and the
+//! graph-replay number of `--time` measured in the same process.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -229,6 +236,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ok = false;
     }
 
+    // ---- (e) the profile mode leaves no state behind: a small
+    // `profile_block0` run must observe exactly the captured graph's node
+    // count (every instrumented op is a node), and a fresh eager step after
+    // it must reproduce the pre-profile eager taps bit for bit.
+    {
+        let ops = model.profile_block0(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32, 3)?;
+        model.seed_block0_cache(&seed5)?;
+        let taps6 = model.step_block0_taps(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32)?;
+        let ops_match_graph = ops.len() == nodes;
+        let post_profile_same = taps6.bits_equal(&taps1);
+        println!(
+            "profile ops={} graph_nodes={nodes} ops_match_graph={ops_match_graph} \
+             post_profile_eager_bit_identical={post_profile_same} {}",
+            ops.len(),
+            verdict(ops_match_graph && post_profile_same)
+        );
+        if !(ops_match_graph && post_profile_same) {
+            ok = false;
+        }
+    }
+
     // ---- lead-only timing under the machine lease; correctness runs never
     // reach this.
     if std::env::args().any(|a| a == "--time") {
@@ -265,6 +293,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| -> Box<dyn std::error::Error> { e })
         })?;
         println!("time n={N} step_us_per_replay={step_us:.3} touch4_us_per_replay={touch_us:.3}");
+    }
+
+    // ---- lead-only per-op profile under the machine lease; correctness
+    // runs never reach this. Each op's sample is eager launch + body + one
+    // synchronize; `sync_floor_us` (a `touch` launch + sync, same sample
+    // count) is that per-op overhead, subtracted in `net_us`.
+    if std::env::args().any(|a| a == "--profile") {
+        const PROF_REPS: u32 = 200;
+        const N: u32 = 2000;
+        // The &mut model calls come first; the shared `stream` borrow taken
+        // below must not overlap them.
+        let ops = model.profile_block0(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32, PROF_REPS)?;
+        let refresh_us =
+            model.refresh_params_us(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32, PROF_REPS)?;
+        let probe = bloomery_gpu::probe::Probe::load(model.stages()[0].gpu().context())?;
+        let stream = model.stages()[0].gpu().stream();
+        let mut tbuf = cuda_core::DeviceBuffer::<f32>::zeroed(stream, 32)?;
+        for _ in 0..20 {
+            probe.enqueue_touch(stream, &mut tbuf)?;
+            stream.synchronize()?;
+        }
+        let mut floor_min = f64::INFINITY;
+        let mut floor_sum = 0.0f64;
+        for _ in 0..PROF_REPS {
+            let t0 = std::time::Instant::now();
+            probe.enqueue_touch(stream, &mut tbuf)?;
+            stream.synchronize()?;
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            floor_min = floor_min.min(us);
+            floor_sum += us;
+        }
+        // The --time number, measured in this same process.
+        for _ in 0..2 {
+            model.launch_block0_graph()?;
+        }
+        stream.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            model.launch_block0_graph()?;
+        }
+        stream.synchronize()?;
+        let graph_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(N);
+
+        let ffn_start = ops
+            .iter()
+            .position(|o| o.name == "ffn_norm_quant")
+            .ok_or("gate_p8: the profile holds no ffn_norm_quant op")?;
+        if ops.len() - ffn_start != 4 {
+            return Err(format!(
+                "gate_p8: the fused FFN is {} ops after {ffn_start}, want the four of the \
+                 P0b shape",
+                ops.len() - ffn_start
+            )
+            .into());
+        }
+        println!(
+            "prof reps={PROF_REPS} warmup=20 ops={} sync_floor_samples={PROF_REPS} \
+             sample=eager_launch+body+one_sync",
+            ops.len()
+        );
+        for op in &ops {
+            println!(
+                "prof i={:02} op={} us_mean={:.3} us_min={:.3} net_us={:.3}",
+                op.index,
+                op.name,
+                op.us_mean,
+                op.us_min,
+                op.us_min - floor_min
+            );
+        }
+        let sum_us: f64 = ops.iter().map(|o| o.us_mean).sum();
+        let sum_net_us: f64 = ops.iter().map(|o| o.us_min - floor_min).sum();
+        let attn_us: f64 = ops[..ffn_start].iter().map(|o| o.us_mean).sum();
+        let ffn_us: f64 = ops[ffn_start..].iter().map(|o| o.us_mean).sum();
+        let attn_net_us: f64 = ops[..ffn_start].iter().map(|o| o.us_min - floor_min).sum();
+        let ffn_net_us: f64 = ops[ffn_start..].iter().map(|o| o.us_min - floor_min).sum();
+        println!(
+            "prof sum_us={sum_us:.3} sum_net_us={sum_net_us:.3} sync_floor_us={floor_min:.3} \
+             sync_floor_mean_us={:.3} refresh_params_us={refresh_us:.3} \
+             graph_replay_us={graph_us:.3}",
+            floor_sum / f64::from(PROF_REPS)
+        );
+        println!(
+            "prof split attn_ops={ffn_start} ffn_ops={} attn_us={attn_us:.3} ffn_us={ffn_us:.3} \
+             attn_net_us={attn_net_us:.3} ffn_net_us={ffn_net_us:.3}",
+            ops.len() - ffn_start
+        );
     }
 
     if !ok {
