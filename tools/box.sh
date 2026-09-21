@@ -10,7 +10,10 @@ HOST=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$(cd "$(dirname "$0")/.." && pwd)")"}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 ssh "$HOST" "mkdir -p $REMOTE"
-rsync -az --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
+# 시각은 싣지 않는다(-t 없음) — 바뀐 파일은 내용 체크섬(-c)으로 고르고, 박스에 닿은 파일의 mtime은 박스 시계의 "지금"이 된다.
+# 맥의 mtime을 그대로 실으면 cargo가 낡은 바이너리를 내준다: 박스 시계가 맥보다 앞서 있어(실측 4.1초) 복원 직후의 touch조차
+# 직전 빌드 산출물보다 과거로 찍힌다(변이 바이너리가 두 번 그대로 돌았다).
+rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 # 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
 # CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). A6000은 서빙·야간 학습과 공유하는
