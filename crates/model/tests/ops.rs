@@ -11,7 +11,8 @@ use model::ops::{Tensor2, f32_tensor, matmul_q, rms_norm};
 /// The slot-count observable and the deferral override are process-global,
 /// and cargo runs this file's tests in parallel — the tests that touch
 /// either serialize here so no other gate's group can store a slot count
-/// between one test's call and its read.
+/// between one test's call and its read. Every test that reaches a quantized
+/// matmul takes it, writers of the observable included, not only its readers.
 static SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
@@ -47,6 +48,7 @@ fn hw_rms_norm_matches_ggml() {
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_matches_ggml() {
+    let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
@@ -82,6 +84,7 @@ fn hw_matmul_q_matches_ggml() {
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_matmul_q_q3k_fused_dispatch() {
+    let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
 
@@ -222,6 +225,7 @@ fn hw_matmul_q_q3k_fused_dispatch() {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_matmul_q_batch_matches_sequential() {
+    let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The dispatch proof: the batched primitive is the per-pair matmul_q to
     // the last bit, on the tensors it actually serves (the routed-expert
     // stacks) with the shapes that actually differ between pairs (bucket
