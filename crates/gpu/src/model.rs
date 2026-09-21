@@ -1762,6 +1762,65 @@ impl GpuModel {
         Ok(())
     }
 
+    /// Fill the first `rows` cache rows of every resident layer and stand at
+    /// position `rows` — the state a prompt of `rows` tokens leaves behind,
+    /// without decoding one. There is no prefill kernel, so a deep prompt
+    /// costs one body per token; a prepared cache buys the same step shape
+    /// for a copy. This is an instrument: the rows are not what the model
+    /// would have written, so the tokens that come out are meaningless.
+    ///
+    /// It is a step-shape equivalence, not a value one. The step's cost does
+    /// not depend on the key values — no kernel branches on them, and the
+    /// one value-dependent guard drops keys past the causal limit rather
+    /// than reading their size.
+    ///
+    /// The pattern is deterministic in `rows` alone: the same `rows` gives
+    /// the same bytes. Every row differs (a repeated row makes the softmax
+    /// uniform, a different path from a real cache) and no value is zero,
+    /// inf or NaN by construction.
+    ///
+    /// Synchronizes; never inside a capture.
+    pub fn seed_depth(&mut self, rows: usize) -> Result<(), GpuError> {
+        if rows == 0 {
+            return Err("GpuModel::seed_depth: rows must be at least 1".into());
+        }
+        if rows >= self.ctx_max {
+            return Err(format!(
+                "GpuModel::seed_depth: {rows} seeded rows leave no room for a step in the \
+                 resident cache's {} rows",
+                self.ctx_max
+            )
+            .into());
+        }
+        let (slots, width) = match self.stages.first().and_then(|s| s.residency.as_ref()) {
+            Some(r) => (r.kv.len(), r.kv[0].cols()),
+            None => return Err("GpuModel::seed_depth: stage carries no residency".into()),
+        };
+        let block = seed_pattern(rows, width);
+        for slot in 0..slots {
+            let (gpu, residency) = self.stage_parts("seed_depth")?;
+            seed_cache(gpu, &mut residency.kv[slot], &block, "seed_depth")?;
+        }
+        self.pos = rows as u32;
+        Ok(())
+    }
+
+    /// The step parameters as the DEVICE holds them: `(pos_buf[0],
+    /// n_keys_buf[0])`, both written by the last `refresh_params`. The host
+    /// `pos` is the row the next token lands in; these are what the launches
+    /// actually read, and a gate that asserts a prepared cache stands where a
+    /// decoded prompt would needs the device side of that claim.
+    pub fn device_step_params(&mut self) -> Result<(u32, u32), GpuError> {
+        let (gpu, residency) = self.stage_parts("device_step_params")?;
+        let stream = gpu.stream();
+        let pos = residency.scratch.pos_buf.to_host_vec(stream)?;
+        let n_keys = residency.scratch.n_keys_buf.to_host_vec(stream)?;
+        match (pos.first(), n_keys.first()) {
+            (Some(p), Some(k)) => Ok((*p, *k)),
+            _ => Err("GpuModel::device_step_params: empty parameter buffer".into()),
+        }
+    }
+
     /// Capture the whole chain — every resident layer plus the head — into
     /// one graph over the resident buffers, and return its node count. One
     /// graph, not a chain of per-layer graphs: the layers differ only in
@@ -2487,6 +2546,30 @@ impl GpuModel {
         }
         Ok(())
     }
+}
+
+/// `rows` cache rows of `width` f16 values for [`GpuModel::seed_depth`],
+/// deterministic in `(rows, width)` alone.
+///
+/// An LCG over the flat index picks each value's sign and mantissa; the
+/// exponent is one of two, so every magnitude lands in `[0.25, 1.0)` — a
+/// real cache row's scale, and zero, inf and NaN are unreachable rather
+/// than merely unlikely. Zero rows would flatten the softmax and NaN would
+/// change what the causal guard means, so neither may be produced by
+/// accident.
+fn seed_pattern(rows: usize, width: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(rows * width);
+    let mut s: u32 = 12345;
+    for _ in 0..rows * width {
+        s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        // f16 = sign(1) | exponent(5) | mantissa(10); exponent 13 gives
+        // [0.25, 0.5) and 14 gives [0.5, 1.0).
+        let sign = (s >> 24) & 1;
+        let exponent = 13 + ((s >> 23) & 1);
+        let mantissa = (s >> 13) & 0x3ff;
+        out.push(((sign << 15) | (exponent << 10) | mantissa) as u16);
+    }
+    out
 }
 
 /// Write `rows` (whole cache rows) at the head of `cache`, zeroing the rest.

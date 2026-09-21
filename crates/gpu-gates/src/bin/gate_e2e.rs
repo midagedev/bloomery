@@ -39,6 +39,10 @@
 //!   while nothing else moves: identical tokens mean identical routing, so
 //!   the rest of the step is the same work. This is where the probes'
 //!   `fma(jig, second, first)` fold is pinned as the no-op it claims to be.
+//! - (5) a cache prepared by `GpuModel::seed_depth` leaves the next step at
+//!   the same position and live key count a decoded prompt of the same
+//!   depth does, at the same captured node count — the contract
+//!   `generate --seed-depth` rests on. State, not time.
 //!
 //! The classifier, the reference reader and the three classes are
 //! `gpu_gates::prompts`; this gate does not re-implement them.
@@ -483,14 +487,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     model.set_probe(StepProbe::default())?;
+    // (5) A prepared cache stands where a decoded prompt stands.
+    // `GpuModel::seed_depth` fills KV rows directly so a deep step can be
+    // timed without decoding a prompt into them; that is only an instrument
+    // if the step which follows has the same shape. Asserted as state, not
+    // as time: the captured node count, and the position and live key count
+    // the launches actually read. The seeded rows are a deterministic
+    // pattern and not the model's own keys, so the two arms' VALUES are not
+    // comparable and are not compared — this arm pins the shape alone.
+    //
+    // The twin is `SEED_D` seeded rows plus one token against `SEED_D + 1`
+    // decoded tokens: both leave the last `refresh_params` at position
+    // `SEED_D`, so all three numbers must read `SEED_D + 1`, `SEED_D`,
+    // `SEED_D + 1`. The node count is a property of `CTX_MAX` rather than of
+    // the cache contents, so it is the weaker half of the claim; it is here
+    // because a seeded run that captured a different chain would not be the
+    // chain the timing arm means to measure.
+    const SEED_D: usize = 128;
+    let seed_token = prompts[0].tokens[0];
+    model.reset()?;
+    model.seed_depth(SEED_D)?;
+    let seed_nodes = model.capture_step()?;
+    model.step(&[seed_token])?;
+    let (seed_pos_buf, seed_keys) = model.device_step_params()?;
+    let seeded = (model.pos(), seed_pos_buf, seed_keys);
+
+    model.reset()?;
+    let twin = vec![seed_token; SEED_D + 1];
+    model.step(&twin)?;
+    let (twin_pos_buf, twin_keys) = model.device_step_params()?;
+    let decoded = (model.pos(), twin_pos_buf, twin_keys);
+
+    let want = (SEED_D as u32 + 1, SEED_D as u32, SEED_D as u32 + 1);
+    let seed_ok = seeded == want && decoded == want && seed_nodes == NODES_CHAIN;
+    println!(
+        "seed depth={SEED_D} graph_nodes={seed_nodes} want_nodes={NODES_CHAIN} \
+         seeded(pos,pos_buf,n_keys)={seeded:?} decoded={decoded:?} want={want:?} {}",
+        if seed_ok { "ok" } else { "FAIL" }
+    );
+    if !seed_ok {
+        ok = false;
+    }
 
     if ok {
         println!(
             "gate_e2e: PASS — the whole chain picks the greedy reference's first token on \
              every prompt or misses it only inside MARGIN_FLOOR; graph replay equals eager \
              token for token at the pinned node count; two eager runs are identical; every \
-             flash stage-doubling arm writes the base path's tokens at that same node count; \
-             and the two reference files agree with each other."
+             flash stage-doubling arm writes the base path's tokens at that same node count; a \
+             seeded cache leaves the step at the same position and key count a decoded \
+             prompt does; and the two reference files agree with each other."
         );
         Ok(())
     } else {

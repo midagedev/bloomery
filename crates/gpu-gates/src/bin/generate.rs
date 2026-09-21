@@ -6,10 +6,23 @@
 //! job is to drive `GpuModel::step` — every layer plus the head, one
 //! position per call — and to print what came out.
 //!
-//!     generate [--prompt-id <id> | --tokens a,b,c] [-n N] [--ctx C]
-//!              [--mode eager|graph] [--time] [--ab R [--ab-set SET]]
+//!     generate [--prompt-id <id> | --tokens a,b,c | --seed-depth D]
+//!              [-n N] [--ctx C] [--mode eager|graph] [--time] [--ab R [--ab-set SET]]
 //!
 //! Defaults: prompt 0, N 32, ctx 512, mode graph.
+//!
+//! `--seed-depth D` stands the model at depth `D` without decoding a prompt
+//! there. `GpuModel::seed_depth` fills `D - 1` cache rows directly and one
+//! literal token is then fed through the ordinary path, so the timed steps
+//! run at exactly the positions a `--tokens <D ids>` prompt leaves — same
+//! `pos`, same `n_keys`, same untimed step in front to absorb the first
+//! graph launch. What it does not reproduce is the values: the seeded rows
+//! are a deterministic pattern, so the tokens printed under this flag are
+//! meaningless and only the timing footer is. It exists because a depth of
+//! 4096 otherwise costs 4096 single-token bodies before the first timed
+//! step. It is refused together with a prompt, and together with `--ab`:
+//! every `--ab` arm rewinds with `reset()`, which would erase the seed and
+//! silently measure depth 1.
 //!
 //! `--time` is a MEASUREMENT and belongs under the machine-wide lease
 //! (`tools/ref/time-gate.sh generate … --time`), never at a bare prompt. It
@@ -92,12 +105,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_gen: usize = flag_value("-n").map_or(Ok(32), |s| s.parse())?;
     let ctx: usize = flag_value("--ctx").map_or(Ok(512), |s| s.parse())?;
 
-    let tokens: Vec<u32> = match flag_value("--tokens") {
-        Some(list) => list
+    let seed_depth: Option<usize> = match flag_value("--seed-depth") {
+        Some(s) => Some(s.parse()?),
+        None => None,
+    };
+    if seed_depth.is_some()
+        && (flag_value("--tokens").is_some() || flag_value("--prompt-id").is_some())
+    {
+        return Err(
+            "generate: --seed-depth prepares the cache instead of decoding a \
+                    prompt, so it takes neither --tokens nor --prompt-id. Pass one."
+                .into(),
+        );
+    }
+
+    let tokens: Vec<u32> = match (seed_depth, flag_value("--tokens")) {
+        // Under `--seed-depth` one token is fed at the last seeded position:
+        // the ordinary untimed step in front of the timed ones. Which token
+        // does not matter — the seeded rows already make the output
+        // meaningless — so it is the prompt set's own first id rather than a
+        // second place where this model's BOS is written down.
+        (Some(_), _) => {
+            let rows = read_prompts(&prompts_path())?;
+            vec![
+                *rows.first().and_then(|r| r.tokens.first()).ok_or_else(|| {
+                    format!("generate: no tokens in {}", prompts_path().display())
+                })?,
+            ]
+        }
+        (None, Some(list)) => list
             .split(',')
             .map(|t| t.trim().parse::<u32>())
             .collect::<Result<Vec<_>, _>>()?,
-        None => {
+        (None, None) => {
             let id: usize = flag_value("--prompt-id").map_or(Ok(0), |s| s.parse())?;
             let rows = read_prompts(&prompts_path())?;
             rows.iter()
@@ -110,10 +150,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if tokens.is_empty() {
         return Err("generate: empty prompt".into());
     }
-    if tokens.len() + n_gen > ctx {
+    // The depth this run occupies: the seeded rows plus their one decoded
+    // token, or the prompt's own length.
+    let depth = seed_depth.unwrap_or(tokens.len());
+    if depth == 0 {
+        return Err("generate: --seed-depth wants a depth of at least 1".into());
+    }
+    if depth + n_gen > ctx {
         return Err(format!(
-            "generate: prompt {} + {n_gen} generated tokens exceed --ctx {ctx}",
-            tokens.len()
+            "generate: depth {depth} + {n_gen} generated tokens exceed --ctx {ctx}"
         )
         .into());
     }
@@ -161,6 +206,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = GpuModel::load_full(&gguf, ctx)?;
     model.set_mode(mode);
     if let Some(rounds) = flag_value("--ab") {
+        if seed_depth.is_some() {
+            return Err(
+                "generate: --ab with --seed-depth would measure depth 1: every arm \
+                        rewinds with reset(), which zeroes the seeded rows. Use --time."
+                    .into(),
+            );
+        }
         let rounds: usize = rounds.parse()?;
         let arms: Vec<(&str, StepProbe)> = match ab_set.as_deref() {
             None | Some("launch") => launch_arms().to_vec(),
@@ -200,6 +252,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("capture graph_nodes={}", model.capture_step()?);
     }
 
+    // Depth `D` is `D - 1` prepared rows plus the one token below, so the
+    // step that follows lands in row `D - 1` exactly as the last token of a
+    // `D`-token prompt does.
+    // Depth 1 is that token alone and has no rows to prepare.
+    if let Some(d) = seed_depth.filter(|d| *d > 1) {
+        model.seed_depth(d - 1)?;
+        println!("seed rows={} pos={}", d - 1, model.pos());
+    }
+
     // The prompt, one token per position; the argmax of its last token is
     // generated token 0, so it costs a `step` of P tokens and is not timed.
     // The N - 1 feedback steps after it are the per-step distribution.
@@ -229,7 +290,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // of the prompt's own `step` call and is not one of them, so N
         // generated tokens give N - 1 timed feedback steps.
         println!(
-            "SMOKE mode={} prompt_tokens={} generated={n_gen} steps={} p50_ms={p50:.4} \
+            "SMOKE mode={} prompt_tokens={} depth={depth} seeded={} generated={n_gen} \
+             steps={} p50_ms={p50:.4} \
              mean_ms={mean:.4} tok/s(p50)={:.2} probe_pad={pad} probe_skip_quant={skip} \
              probe_split_heads={split} probe_split_kqvc={split_kqvc} \
              probe_split_flash_quant={split_fq} probe_split_moe_quant={split_mq}",
@@ -239,6 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "eager"
             },
             tokens.len(),
+            seed_depth.is_some(),
             step_ms.len(),
             1e3 / p50,
             pad = probe.pad_per_layer,

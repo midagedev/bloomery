@@ -20,6 +20,11 @@
 #                        헤드라인을 낸 그 프롬프트(id 0 = "The capital of France is")로 계기를
 #                        재현할 때 쓴다 — LCG 팔과 같은 길이에서 값이 같아야 "토큰 값은 시간에
 #                        안 걸린다"가 주장이 아니라 관측이 된다.
+#   seed=<깊이>:<ctx>[:<n>]  우리 팔인데 프롬프트를 디코드하지 않고 KV 캐시를 직접 채워 그 깊이에
+#                        선다(generate --seed-depth). 같은 깊이의 리터럴/LCG 팔과 pos·n_keys가 같고
+#                        준비 시간만 없다 — 깊이 4096에서 팔 하나의 준비가 16초에서 0에 가까워진다.
+#                        찍히는 토큰은 무의미하다(씨앗 행은 모델이 쓴 키가 아니다). 시간만 읽는다.
+#                        `ab:seed=`는 없다 — --ab의 팔마다 reset()이 씨앗을 지운다(generate가 거부한다).
 #   <깊이>:<ctx>[:<n>]   우리 팔. ctx는 generate의 --ctx이고, 세그먼트 수를 정한다
 #                        (flash::segments_for(ctx) = ceil(ctx/128)). ctx는 깊이가 아니라 캐시 높이라
 #                        죽은 세그먼트도 블록을 런치한다 — 그래서 ctx는 팔마다 명시한다.
@@ -124,6 +129,10 @@ for r in $(seq "$ROUNDS"); do
         use_ab=0
         case $a in ab:*) use_ab=1; a=${a#ab:} ;; esac
         case $a in
+          seed=*)
+            rest=${a#seed=}; dep=${rest%%:*}; rest=${rest#*:}; ctx=${rest%%:*}
+            toks=""; label="seed"
+            ;;
           toks=*)
             rest=${a#toks=}; toks=${rest%%:*}; rest=${rest#*:}; ctx=${rest%%:*}
             dep=$(echo "$toks" | awk -F, '{print NF}'); label="lit"
@@ -135,10 +144,17 @@ for r in $(seq "$ROUNDS"); do
         esac
         n=$N; case $rest in *:*) n=${rest#*:} ;; esac
         inst=time; [ "$use_ab" = 1 ] && inst=ab
+        # --ab의 팔마다 reset()이 캐시를 0으로 되감아 씨앗을 지운다: 조용히 깊이 1을 재게 된다.
+        if [ "$use_ab" = 1 ] && [ "$label" = seed ]; then
+          echo "ab:seed= 는 없다 — --ab의 팔마다 reset()이 씨앗을 지운다. seed=<깊이>:<ctx> 를 쓴다." >&2
+          exit 2
+        fi
         witness "pre r$r ours($label,$inst) d=$dep ctx=$ctx n=$n"
         t0=$(date +%s)
         if [ "$use_ab" = 1 ]; then
           out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
+        elif [ "$label" = seed ]; then
+          out=$("$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time 2>&1)
         else
           out=$("$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time 2>&1)
         fi
