@@ -33,6 +33,7 @@ pub mod router;
 pub mod tensor;
 pub mod weights;
 
+pub use ::model::attn::MlaParams;
 pub use graph::Graph;
 pub use model::{GpuModel, mla_width};
 pub use tensor::{DeviceTensor, Q8Act};
@@ -1302,23 +1303,64 @@ pub struct Gpu {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
+    q5: q5::Q5Kernels,
+    q8f32: q8f32::Q8F32Kernels,
+    elem: elem::ElemKernels,
+    flash: flash::FlashKernels,
+    router: router::RouterKernels,
 }
 
 impl Gpu {
-    /// Create the context, the engine stream, and load the embedded device
-    /// bundle.
+    /// `with_device(0)`: under the box environment device 0 is the dev card.
     pub fn new() -> Result<Gpu, GpuError> {
-        let ctx = CudaContext::new(0)?;
+        Gpu::with_device(0)
+    }
+
+    /// Create the context on CUDA device `device`, the engine stream, and
+    /// load every device module of this crate into that context — the
+    /// K-quant module here and one per kernel file. Load-time only.
+    pub fn with_device(device: usize) -> Result<Gpu, GpuError> {
+        let ctx = CudaContext::new(device)?;
         let stream = ctx.new_stream()?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the kernels module above; every launcher checks its launch
         // contract before launching.
         let module = unsafe { kernels::load(&ctx)? };
         Ok(Gpu {
+            q5: q5::Q5Kernels::load(&ctx)?,
+            q8f32: q8f32::Q8F32Kernels::load(&ctx)?,
+            elem: elem::ElemKernels::load(&ctx)?,
+            flash: flash::FlashKernels::load(&ctx)?,
+            router: router::RouterKernels::load(&ctx)?,
             ctx,
             stream,
             module,
         })
+    }
+
+    /// Q5_0 / Q5_1 gemv and the 32-value activation quantizer.
+    pub fn q5(&self) -> &q5::Q5Kernels {
+        &self.q5
+    }
+
+    /// Q8_0 and F32 gemv over f32 activations.
+    pub fn q8f32(&self) -> &q8f32::Q8F32Kernels {
+        &self.q8f32
+    }
+
+    /// Element-wise and reduction kernels.
+    pub fn elem(&self) -> &elem::ElemKernels {
+        &self.elem
+    }
+
+    /// KV append and latent flash attention.
+    pub fn flash(&self) -> &flash::FlashKernels {
+        &self.flash
+    }
+
+    /// Router top-6 and the expert offset table.
+    pub fn router(&self) -> &router::RouterKernels {
+        &self.router
     }
 
     pub fn context(&self) -> &Arc<CudaContext> {

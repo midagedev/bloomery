@@ -37,7 +37,7 @@ Without `#[unroll]` the same kernel compiles; with a `u32` counter it compiles; 
   - backend built from `b0f961d` (main): the kernel above fails to compile with the ICE, exit 101;
   - backend built from this branch: it compiles and runs, all 32 elements `== 1`;
   - a four-trip variant (`acc |= 1u32 << (2 * i)`, `while i < 4`) compiles and runs, all elements `== 85` (`0x55`), so the folded values are right, not merely accepted.
-- [ ] `just check` passes — <!-- fill from the local run before filing -->
+- [ ] `just check`: not completed locally. On the macOS machine used for the unit tests it stops in `fmt-check` at `examples/disjoint_slice_len/Cargo.toml` (`profile-rustflags` needs a nightly Cargo; that example is untouched by this PR), and the CUDA box has no `just`. What did run is listed above, scoped to `dialect-mir`, plus the end-to-end A/B.
 
 ## Checklist
 
