@@ -6,13 +6,15 @@
 
 소스는 타르볼로 받아져 커밋 해시를 git으로 확인할 수 없다(보고는 해시를 적었으나 미확인). 파일은 2026-09-21에 받은 master다.
 
-**EXL3의 MoE는 층당 런치 두 번이다 [확인].** `exllamav3_ext/quant/exl3_moe_coop_kernel.cuh` 머리 주석이 설계를 그대로 적는다: 커널 A = (전문가 런, 32열 그룹, 투영)마다 블록 하나로 gate·up을 같이 돌고, 128열 청크를 덮는 마지막 도착 블록이 **완료 카운터**를 보고 출력 회전·활성화·down 입력 회전까지 끝낸다. 커널 B = down, 마지막 도착이 슬롯들을 고정 순서로 합치고 공유 전문가를 병합해 저장한다. 호스트 개입이 없고, 전문가 가중치는 디바이스의 포인터 표(`*_ptrs_trellis`)로 찌른다. 런치는 `cudaLaunchCooperativeKernel`(그리드를 동시 상주 가능한 블록 수로 제한, `cudaOccupancyMaxActiveBlocksPerMultiprocessor`)이다. 같은 파일의 메모: MoE 디코드에서 k-분할은 "measured ineffective"라 1로 둔다. **이것은 포맷이 아니라 엔진의 성질이다** — 어떤 가중치 표현으로도 만들 수 있다. 우리 설계서의 결정 5("첫 판은 6전문가를 런치 6번")의 도착점이 이미 구현돼 있는 선례다.
+**EXL3의 MoE는 층당 런치 두 번이다 [확인].** `exllamav3_ext/quant/exl3_moe_coop_kernel.cuh` 머리 주석이 설계를 그대로 적는다: 커널 A = (전문가 런, 32열 그룹, 투영)마다 블록 하나로 gate·up을 같이 돌고, 128열 청크를 덮는 마지막 도착 블록이 **완료 카운터**를 보고 출력 회전·활성화·down 입력 회전까지 끝낸다. 커널 B = down, 마지막 도착이 슬롯들을 고정 순서로 합치고 공유 전문가를 병합해 저장한다. 호스트 개입이 없고, 전문가 가중치는 디바이스의 포인터 표(`*_ptrs_trellis`)로 찌른다. 런치는 `cudaLaunchCooperativeKernel`(그리드를 동시 상주 가능한 블록 수로 제한, `cudaOccupancyMaxActiveBlocksPerMultiprocessor`)이다. 같은 계열 파일의 메모: MoE 디코드에서 k-분할은 "measured ineffective"라 1로 둔다(`exl3_moe_coop.cu:74-75`); 3 bpw는 Ampere에서 레지스터 디퀀트가 블록 파이프라인 커널에 져서 staged 경로에 남는다(`exl3_moe_coop_kernel.cuh`의 `tile_reg`, sm_86 분기). **이것은 포맷이 아니라 엔진의 성질이다** — 어떤 가중치 표현으로도 만들 수 있다. 우리 설계서의 결정 5("첫 판은 6전문가를 런치 6번")의 도착점이 이미 구현돼 있는 선례다. **우리 툴체인 쪽 선결 [확인: 박스의 cuda-core 0.3.1]**: `launch_kernel_cooperative`·`launch_kernel_cooperative_on_stream`이 있고 런치 계약에 `cooperative` 필드가 있다(`src/lib.rs:31`, `src/simt/launch.rs:241`). `#[cuda_module]`이 생성하는 런처에서 그것을 고를 수 있는지, 협동 런치가 그래프에 캡처되는지는 미확인 — P0b의 첫 걸음이고, 안 되면 NVlabs 장부 후보다.
 
 **EXL3의 코드북은 표가 아니라 계산이다 [확인].** `codebook.cuh`의 `mul1`(cb 2): 트렐리스 인덱스에 상수 `0x83DCD12D`를 곱하고 `dp4a(x, 0x01010101, 0x6400)`로 네 바이트를 더한 뒤 fp16 FMA 한 번으로 스케일·바이어스를 건다. 룩업 테이블 0바이트. 같은 파일에 sm_86 전용 인라인 asm 훅과 "CUDA 13.2부터는 평범한 곱이 ~4% 빠르다"는 주석이 있다 — 저자가 3090을 1급 대상으로 조율한다는 뜻이다.
 
 **int8 활성값 경로가 있다 [확인].** `exl3_gemv_int8_kernel.cuh`: `mul1` 코드북 값이 (x·M의 네 바이트 합)에 대해 아핀이므로, 활성값을 int8로 양자화하면 `dp4a(x·M, splat(a_int8), acc)` 한 명령이 "코드북(x) × a"를 낸다. 가중치를 부동소수로 풀지 않는다. 잔차 모드(두 번째 dp4a로 반올림 오차 r = a − q·i를 누적)는 활성값 유효 정밀도 15–16비트를 주장한다. 우리 q8_1 설계(정수 내적 + 블록 스케일)와 같은 계열이고, 스케일 평면이 아예 없다는 점이 다르다.
 
 **EXL3의 바이트 [보고, 구조는 파일 목록과 일치].** 16×16 타일, 정수 비트레이트 K에서 타일당 정확히 256·K비트(패딩 0), 스케일 텐서 없음(부호 벡터 su·sv와 128점 Hadamard로 비간섭화; 변환은 GEMV 커널의 프롤로그·에필로그에 융합). K-quant는 스케일에 0.4–0.5 bpw를 쓴다. 제약: 두 차원이 128의 배수.
+
+**그 밖에 원본에서 대조한 것 [확인].** Q·K·V를 한 커널로 도는 `SlicedMultiLinear`(`exllamav3/modules/multilinear.py:46`), gate/up의 비트레이트를 변환 시 묶는 `--tie`(`doc/optimize.md:204` — 융합 경로가 같은 타일 구조를 요구하기 때문), DeepSeek V3/V4와 MLA 지원(`architecture/deepseek_v4.py`, `modules/mla_attn.py`), EXL2의 로드 시 순열 해소(`exllamav2/mlp.py:162-164`: down을 `unmap=True`로 읽고 그 맵을 gate/up의 `output_map`으로 넘긴다).
 
 **EXL2 [보고].** 열 방향 32비트 워드 패킹, 그룹별 4비트 비선형 스케일((q+1)²·max), 한 텐서 안의 혼합 비트폭, 로드 시 비트 셔플로 fp16 가수에 맞춘 한 명령 디퀀트, act-order 순열은 로드 시 앞 층의 출력 열을 재배열해 런타임 게더를 없앤다(gate/up → down). MoE는 전문가마다 런치(16개 이하) 또는 호스트 동기 후 활성 전문가만 — V3에서 버린 설계다.
 
@@ -56,4 +58,4 @@
 
 1. **포맷이 천장을 올리는 길은 bpw 하나**이고, 그 시험은 포맷을 새로 만들지 않고도 할 수 있다: ik의 `IQ3_KT`/`IQ4_KT`.
 2. 그 밖에 "ExLlama가 빠른 이유"로 꼽히는 것 — MoE 층당 2런치, gate·up 융합, 입력 변환 공유, 정렬된 연속 읽기 — 는 엔진과 로드 시 재포장의 일이고 GGUF 위에서 한다. P0b와 결정 5가 그 자리다.
-3. **실험(트래커에 올림)**: V2-Lite의 원본 가중치에서 `llama-quantize`로 IQ3_KT 혼합을 만들고, 같은 임대에서 ik CUDA의 tg를 Q3_K_M과 나란히 잰다(바이트 −9%가 tok/s로 오는가, 트렐리스 디코드 비용이 그것을 먹는가). 품질은 같은 하네스의 perplexity/KL로. 이기면 우리 커널 목록에 IQ3_KT가 들어가고, 지면 "이 카드에서는 K-quant가 맞다"가 측정으로 남는다. 선결: 원본(bf16, ~31 GB) 다운로드와 imatrix.
+3. **실험(트래커에 올림)**: V2-Lite의 원본 가중치에서 `llama-quantize`로 IQ3_KT 혼합을 만들고, 같은 임대에서 ik CUDA의 tg를 Q3_K_M과 나란히 잰다(바이트 −9%가 tok/s로 오는가, 트렐리스 디코드 비용이 그것을 먹는가). 품질은 같은 하네스의 perplexity/KL로. 이기면 우리 커널 목록에 IQ3_KT가 들어가고, 지면 "이 카드에서는 K-quant가 맞다"가 측정으로 남는다. 선결: 원본(bf16, ~31 GB) 다운로드와 imatrix. 트래커는 WKS-37이 소유하고 측정도 그쪽 세션이 한다. 속도만 먼저 볼 수 있는 파일이 따로 있다: 박스 `/models/scratch-kt/V2-Lite.IQ{3,2}_KT.requant.gguf` — Q3_K_M에서 `--allow-requantize`로 만든 것이라 **품질 판정에는 쓸 수 없다**.
