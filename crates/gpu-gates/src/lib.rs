@@ -10,6 +10,7 @@
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
+use std::path::PathBuf;
 
 /// The model every gate reads unless `BLOOMERY_REF_MODEL` says otherwise.
 pub const DEFAULT_MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
@@ -77,7 +78,11 @@ pub fn ref_gemv(
         dequant_row(ty, &w[r * rb..(r + 1) * rb], &mut row)?;
         for c in 0..m {
             let xc = &x[c * k..(c + 1) * k];
-            let dot: f64 = row.iter().zip(xc).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+            let dot: f64 = row
+                .iter()
+                .zip(xc)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
             y[r * m + c] = dot as f32;
         }
     }
@@ -85,8 +90,13 @@ pub fn ref_gemv(
 }
 
 /// Raw bytes of tensor `name`, with its info (dims[0] is K, the row width).
-pub fn tensor_bytes<'a>(gguf: &'a Gguf, name: &str) -> Result<(&'a TensorInfo, &'a [u8]), GateError> {
-    let t = gguf.find(name).ok_or_else(|| format!("tensor {name} not in the model"))?;
+pub fn tensor_bytes<'a>(
+    gguf: &'a Gguf,
+    name: &str,
+) -> Result<(&'a TensorInfo, &'a [u8]), GateError> {
+    let t = gguf
+        .find(name)
+        .ok_or_else(|| format!("tensor {name} not in the model"))?;
     Ok((t, gguf.data(t)?))
 }
 
@@ -99,7 +109,10 @@ pub fn max_rel_err(y: &[f32], y_ref: &[f32]) -> Result<f32, GateError> {
     if denom == 0.0 {
         return Err("max_rel_err: reference is all zero".into());
     }
-    let num = y.iter().zip(y_ref).fold(0.0f32, |a, (&g, &r)| a.max((g - r).abs()));
+    let num = y
+        .iter()
+        .zip(y_ref)
+        .fold(0.0f32, |a, (&g, &r)| a.max((g - r).abs()));
     if !num.is_finite() {
         return Err("max_rel_err: non-finite kernel output".into());
     }
@@ -116,4 +129,168 @@ pub fn bytes_to_words(b: &[u8]) -> Vec<u32> {
             u32::from_le_bytes(w)
         })
         .collect()
+}
+
+// ------------------------------------------------------- ik CUDA dump
+
+/// One `tensor` row of the CUDA oracle dump's MANIFEST.tsv. `ne` is
+/// ne0..ne3 as written: ne0 is the contiguous dimension (values of an
+/// activation, rows of a MUL_MAT output); `sum` is the dumper's element
+/// sum, usable to prove a VIEW row carries the same bytes as its base.
+#[derive(Debug, Clone)]
+pub struct RefRow {
+    pub name: String,
+    pub occurrence: u32,
+    pub ty: String,
+    pub ne: [u64; 4],
+    pub bytes: u64,
+    pub sum: f64,
+    pub op: String,
+}
+
+impl RefRow {
+    /// Product of the four ne counts (elements, = bytes/4 for an f32 row).
+    pub fn count(&self) -> u64 {
+        self.ne.iter().product()
+    }
+
+    /// The dump file's name: `<name>.<occurrence>.f32`.
+    pub fn file_name(&self) -> String {
+        format!("{}.{}.f32", self.name, self.occurrence)
+    }
+}
+
+/// Directory of the ik CUDA oracle dump (docs/gpu-design.md decision 3):
+/// `$BLOOMERY_REF_CUDA` if set, else `$BLOOMERY_DATA/ref_cuda`, else the
+/// workstation default. Read-only for every caller.
+pub fn ref_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("BLOOMERY_REF_CUDA") {
+        return PathBuf::from(p);
+    }
+    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
+    PathBuf::from(data).join("ref_cuda")
+}
+
+/// Parse the dump's MANIFEST.tsv. Header lines start with `#`; data rows
+/// are tab-separated
+/// `tensor name occurrence type ne0 ne1 ne2 ne3 bytes sum op`.
+/// Tensor names may contain spaces, so fields are split on tabs only.
+pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {
+    let path = ref_dir().join("MANIFEST.tsv");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("ref_manifest: cannot read {}: {e}", path.display()))?;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') || !line.starts_with("tensor\t") {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 11 {
+            return Err(format!(
+                "ref_manifest: {}: row has {} fields, want 11: {line}",
+                path.display(),
+                f.len()
+            )
+            .into());
+        }
+        let uparse = |s: &str| -> Result<u64, GateError> {
+            s.parse::<u64>()
+                .map_err(|e| format!("ref_manifest: {}: {s:?}: {e}", path.display()).into())
+        };
+        let fparse = |s: &str| -> Result<f64, GateError> {
+            s.parse::<f64>()
+                .map_err(|e| format!("ref_manifest: {}: {s:?}: {e}", path.display()).into())
+        };
+        rows.push(RefRow {
+            name: f[1].to_string(),
+            occurrence: uparse(f[2])? as u32,
+            ty: f[3].to_string(),
+            ne: [uparse(f[4])?, uparse(f[5])?, uparse(f[6])?, uparse(f[7])?],
+            bytes: uparse(f[8])?,
+            sum: fparse(f[9])?,
+            op: f[10].to_string(),
+        });
+    }
+    if rows.is_empty() {
+        return Err(format!("ref_manifest: no tensor rows in {}", path.display()).into());
+    }
+    Ok(rows)
+}
+
+/// The manifest row for `(name, occurrence)`, if the dump holds it.
+pub fn find_ref_row<'a>(
+    man: &'a [RefRow],
+    name: &str,
+    occurrence: u32,
+) -> Result<&'a RefRow, GateError> {
+    man.iter()
+        .find(|r| r.name == name && r.occurrence == occurrence)
+        .ok_or_else(|| {
+            format!(
+                "find_ref_row: {}/{} not in {}MANIFEST.tsv",
+                name,
+                occurrence,
+                ref_dir().display()
+            )
+            .into()
+        })
+}
+
+/// Load one manifest row's f32 file, checking it against its own row: the
+/// type must be f32, the row's byte count must equal 4·ne0·ne1·ne2·ne3 and
+/// the file's length, and every value must be finite. Every error names the
+/// offending path.
+pub fn ref_tensor_of(row: &RefRow) -> Result<Vec<f32>, GateError> {
+    let path = ref_dir().join(row.file_name());
+    if row.ty != "f32" {
+        return Err(format!(
+            "ref_tensor_of: {} has type {}, want f32",
+            path.display(),
+            row.ty
+        )
+        .into());
+    }
+    let expect = 4_u64
+        .checked_mul(row.count())
+        .ok_or("ref_tensor_of: element count overflows")?;
+    if row.bytes != expect {
+        return Err(format!(
+            "ref_tensor_of: {} manifest bytes {} != 4*count {}",
+            path.display(),
+            row.bytes,
+            expect
+        )
+        .into());
+    }
+    let raw = std::fs::read(&path)
+        .map_err(|e| format!("ref_tensor_of: cannot read {}: {e}", path.display()))?;
+    if raw.len() as u64 != row.bytes {
+        return Err(format!(
+            "ref_tensor_of: {} is {} bytes, manifest says {}",
+            path.display(),
+            raw.len(),
+            row.bytes
+        )
+        .into());
+    }
+    let vals: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if let Some(i) = vals.iter().position(|v| !v.is_finite()) {
+        return Err(format!(
+            "ref_tensor_of: non-finite value at index {i} of {}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(vals)
+}
+
+/// `ref_tensor_of` over `find_ref_row`: load `(name, occurrence)`'s f32
+/// file with its manifest row (dims, op, sum) for chain checking.
+pub fn ref_tensor(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), GateError> {
+    let man = ref_manifest()?;
+    let row = find_ref_row(&man, name, occurrence)?;
+    Ok((row.clone(), ref_tensor_of(row)?))
 }
