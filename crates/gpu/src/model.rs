@@ -1,32 +1,338 @@
 //! `GpuModel` — the GPU engine that stands beside `forward::step`
 //! (docs/gpu-design.md decisions 1 and 7). Weights, KV and scratch live on
 //! the device from `load`, split into stages by layer range; `step` enqueues
-//! one decode step stage by stage and synchronizes once for the argmax. P0 leaves the body a skeleton: the
-//! buffer and stream ownership are real, the kernels behind `step` arrive with
-//! P1–P7 and P8 assembles them.
+//! one decode step stage by stage and synchronizes once for the argmax.
+//!
+//! This round assembles block 0 (the dense block) at m = 1 only: embed →
+//! MLA attention → fused FFN, one token at position `pos` with `pos + 1`
+//! live keys. Every per-replay quantity (position, live key count, token id,
+//! rope cos/sin cache) lives in a device buffer refreshed before the
+//! enqueue/replay, so one captured graph serves every position. Blocks
+//! 1..=26 (MoE) are another round; [`GpuModel::step`] names that.
+//!
+//! The op set of P1–P7 has no f32 concat or strided per-head addressing
+//! (both live in the CPU chain: the `kvr`/flash-row concats and the
+//! per-head `wv_b`/q_nope2 legs of `attn.rs`), so this file carries one
+//! small `#[cuda_module]` of its own — decision 6's per-file module rule:
+//! a pair-table gather. Everything else runs the gated kernels verbatim;
+//! the per-head sites ride the gemvs' m-column geometry (heads as
+//! activation columns) with gather-built inputs and gather-extracted
+//! outputs, which keeps the per-head arithmetic inside kernels that
+//! already carry gates.
 
-use crate::{Gpu, GpuError};
+use crate::q5::Q8Blocks32;
+use crate::tensor::{DeviceTensor, Q8Act};
+use crate::weights::{DevWeight, Weights};
+use crate::{Gpu, GpuError, Graph};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_host::cuda_module;
 use model::attn::MlaParams;
+use std::ops::Range;
+use std::sync::Arc;
 
 /// Compile-time probe of the dependency direction (gpu → model → gguf): the
 /// device-bundle crate reads model metadata through `bloomery-model`.
-/// Kept until `GpuModel::load` reads the same parameters for real.
 pub fn mla_width(gguf: &gguf::Gguf) -> Result<usize, GpuError> {
     let p = MlaParams::read(gguf, 0)?;
     Ok(p.rope_dims + p.latent)
 }
 
+// ------------------------------------------------------------- step kernels
+
+#[cuda_module]
+mod step_kernels {
+    use super::*;
+
+    /// `y[dst_idx[i]] = x[src_idx[i]]` for `i < n` — the f32 concat/extract
+    /// the step needs and no P4 op provides. Both tables are load-time
+    /// constants built by the host side from the buffer shapes it owns, so a
+    /// pair is always in range; the guard keeps a wrong table a deterministic
+    /// no-op rather than an out-of-bounds access (the policy `embed_rows`
+    /// takes for its device-resident ids). Destinations must not overlap.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            x.len() >= 1,
+            src_idx.len() >= n,
+            dst_idx.len() >= n,
+            y.len() >= 1
+        )
+    )]
+    pub fn gather_pairs(
+        x: &[f32],
+        src_idx: &[u32],
+        dst_idx: &[u32],
+        n: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= src_idx.len() by the launch contract.
+        let s = unsafe { *src_idx.get_unchecked(i) } as usize;
+        // SAFETY: i < n <= dst_idx.len() by the launch contract.
+        let d = unsafe { *dst_idx.get_unchecked(i) } as usize;
+        if s < x.len() && d < y.len() {
+            // SAFETY: both indices guarded against their buffers' lengths.
+            unsafe {
+                *y.get_unchecked_mut(d) = *x.get_unchecked(s);
+            }
+        }
+    }
+}
+
+/// The loaded step module of this file. Owns no context and no stream —
+/// every enqueue takes the engine stream, so it orders with the rest of the
+/// step and is capturable.
+pub struct StepKernels {
+    module: step_kernels::LoadedModule,
+}
+
+impl StepKernels {
+    /// Load this file's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<StepKernels, GpuError> {
+        // SAFETY: this package owns the embedded device bundle produced for
+        // the module above; the launcher checks its launch contract.
+        let module = unsafe { step_kernels::load(ctx)? };
+        Ok(StepKernels { module })
+    }
+
+    /// Enqueue the pair-table gather of `n` pairs. Asynchronous,
+    /// allocation-free, capturable. The tables must be built for the shapes
+    /// of `x` and `y` this call pairs (load-time construction owns that).
+    pub fn enqueue_gather(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        src_idx: &DeviceBuffer<u32>,
+        dst_idx: &DeviceBuffer<u32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if n == 0 || src_idx.len() < n || dst_idx.len() < n || x.is_empty() || y.is_empty() {
+            return Err(format!(
+                "enqueue_gather: n={n}, src_idx.len() {}, dst_idx.len() {}, x.len() {}, \
+                 y.len() {}",
+                src_idx.len(),
+                dst_idx.len(),
+                x.len(),
+                y.len()
+            )
+            .into());
+        }
+        let prep = self.module.prepare_gather_pairs(LaunchConfig1D::new(
+            n.div_ceil(256) as u32,
+            256,
+            0,
+        ))?;
+        self.module
+            .gather_pairs(stream, &prep, x, src_idx, dst_idx, n as u32, y)?;
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------------ scratch
+
+/// The shapes the block-0 scratch is sized for, derived once from the
+/// resident weights and `MlaParams` — never literals.
+struct Dims {
+    hidden: usize,
+    /// `q_rows / rope_dims` — the 64-value columns `enqueue_rope` walks over
+    /// the q projection.
+    q_cols: usize,
+    /// `kv_width / rope_dims` — same for the kv_a projection.
+    kv_cols: usize,
+}
+
+/// One device index table for the gather (source and destination indices of
+/// one permutation).
+struct Gather {
+    src: DeviceBuffer<u32>,
+    dst: DeviceBuffer<u32>,
+    n: usize,
+}
+
+impl Gather {
+    /// Build the table for `pairs: (src, dst)`. Load-time only.
+    fn new(
+        stream: &CudaStream,
+        pairs: impl Iterator<Item = (usize, usize)>,
+        what: &str,
+    ) -> Result<Gather, GpuError> {
+        let (mut src, mut dst) = (Vec::new(), Vec::new());
+        for (s, d) in pairs {
+            if s > u32::MAX as usize || d > u32::MAX as usize {
+                return Err(format!("Gather::new {what}: index overflows u32").into());
+            }
+            src.push(s as u32);
+            dst.push(d as u32);
+        }
+        if src.is_empty() {
+            return Err(format!("Gather::new {what}: empty table").into());
+        }
+        Ok(Gather {
+            n: src.len(),
+            src: DeviceBuffer::from_host(stream, &src)?,
+            dst: DeviceBuffer::from_host(stream, &dst)?,
+        })
+    }
+}
+
+/// The block-0 scratch arena and the device-side step parameters, sized at
+/// load for m = 1 (decision 4: nothing here is allocated per step).
+struct Block0Scratch {
+    dims: Dims,
+    x: DeviceBuffer<f32>,
+    normed: DeviceBuffer<f32>,
+    act_q: Q8Act,
+    q: DeviceBuffer<f32>,
+    q_rope_all: DeviceBuffer<f32>,
+    kv_a: DeviceBuffer<f32>,
+    /// `[kv_compressed | k_rope]`: rope's last column writes the tail, then
+    /// the kv norm overwrites the latent head.
+    kv_s: DeviceBuffer<f32>,
+    /// `[k_rope | kv_compressed]` — the row the KV append consumes.
+    kvr: DeviceBuffer<f32>,
+    xn_lo: DeviceBuffer<f32>,
+    xn_hi: DeviceBuffer<f32>,
+    qn2_lo: DeviceBuffer<f32>,
+    qn2_hi: DeviceBuffer<f32>,
+    /// The derived q_nope2 planes in the q8f32 shape (see `new`).
+    qn2_qs: DeviceTensor<u32>,
+    qn2_d: DeviceTensor<f32>,
+    /// Flash query rows, `[q_rope | q_nope2]` per head.
+    f_rows: DeviceBuffer<f32>,
+    kqvc: DeviceBuffer<f32>,
+    kqvc_hi: DeviceBuffer<f32>,
+    act_kv_lo: Q8Act,
+    act_kv_hi: Q8Act,
+    wvb_lo: DeviceBuffer<f32>,
+    wvb_hi: DeviceBuffer<f32>,
+    kqv_2d: DeviceBuffer<f32>,
+    act_ao: Q8Act,
+    attn_out: DeviceBuffer<f32>,
+    ffn_inp: DeviceBuffer<f32>,
+    act_ffn: Q8Act,
+    h: DeviceBuffer<f32>,
+    act32: Q8Blocks32,
+    l_out: DeviceBuffer<f32>,
+    g_kvr: Gather,
+    g_xn_lo: Gather,
+    g_xn_hi: Gather,
+    g_f_rope_lo: Gather,
+    g_f_nope2_lo: Gather,
+    g_f_rope_hi: Gather,
+    g_f_nope2_hi: Gather,
+    g_kqvc_hi: Gather,
+    g_kqv_lo: Gather,
+    g_kqv_hi: Gather,
+    pos_buf: DeviceBuffer<u32>,
+    n_keys_buf: DeviceBuffer<u32>,
+    token_buf: DeviceBuffer<u32>,
+    cs_buf: DeviceBuffer<f32>,
+}
+
+impl Block0Scratch {
+    /// Device bytes of the arena and the parameter buffers (weights and KV
+    /// are counted by their owners).
+    fn bytes(&self) -> usize {
+        let mut total = [
+            &self.x,
+            &self.normed,
+            &self.q,
+            &self.q_rope_all,
+            &self.kv_a,
+            &self.kv_s,
+            &self.kvr,
+            &self.xn_lo,
+            &self.xn_hi,
+            &self.qn2_lo,
+            &self.qn2_hi,
+            &self.f_rows,
+            &self.kqvc,
+            &self.kqvc_hi,
+            &self.wvb_lo,
+            &self.wvb_hi,
+            &self.kqv_2d,
+            &self.attn_out,
+            &self.ffn_inp,
+            &self.h,
+            &self.l_out,
+            &self.cs_buf,
+        ]
+        .iter()
+        .map(|b| b.num_bytes())
+        .sum::<usize>();
+        total += self.qn2_qs.buf().len() * 4 + self.qn2_d.buf().len() * 4;
+        total +=
+            self.pos_buf.num_bytes() + self.n_keys_buf.num_bytes() + self.token_buf.num_bytes();
+        let act = |a: &Q8Act| {
+            a.q3.num_bytes()
+                + a.q4.num_bytes()
+                + a.q6.num_bytes()
+                + a.s8.num_bytes()
+                + a.d8.num_bytes()
+        };
+        total += act(&self.act_q)
+            + act(&self.act_kv_lo)
+            + act(&self.act_kv_hi)
+            + act(&self.act_ao)
+            + act(&self.act_ffn)
+            + self.act32.q.num_bytes()
+            + self.act32.s8.num_bytes()
+            + self.act32.d8.num_bytes();
+        total += [
+            &self.g_kvr,
+            &self.g_xn_lo,
+            &self.g_xn_hi,
+            &self.g_f_rope_lo,
+            &self.g_f_nope2_lo,
+            &self.g_f_rope_hi,
+            &self.g_f_nope2_hi,
+            &self.g_kqvc_hi,
+            &self.g_kqv_lo,
+            &self.g_kqv_hi,
+        ]
+        .iter()
+        .map(|g| g.src.num_bytes() + g.dst.num_bytes())
+        .sum::<usize>();
+        total
+    }
+}
+
+// ------------------------------------------------------------------- stage
+
 /// A contiguous range of blocks resident on one device (docs/gpu-design.md
-/// decision 7). A stage owns its `Gpu` — context, stream, modules — and, as
-/// P1–P7 land, its weights, KV rows and scratch; what crosses a stage
-/// boundary is one hidden vector. Two stages may sit on the same card: that
-/// is the shape the 2-stage = 1-stage bit-identity gate runs in.
+/// decision 7). A stage owns its `Gpu` — context, stream, modules — and its
+/// weights, KV rows and scratch once loaded with residency; what crosses a
+/// stage boundary is one hidden vector. Two stages may sit on the same
+/// card: that is the shape the 2-stage = 1-stage bit-identity gate runs in.
+///
+/// `residency` is filled by [`GpuModel::load_blocks`]; a stage from
+/// [`GpuModel::load_staged`] carries only the metadata (that entry must stay
+/// cheap — metadata probes call it).
 pub struct Stage {
     gpu: Gpu,
     /// Blocks `layers.start..layers.end` of the model, in order.
     layers: std::ops::Range<usize>,
-    /// Captured decode step of this stage, once P8 assembles one.
-    graph: Option<crate::graph::Graph>,
+    /// The captured decode step of this stage, once one is assembled.
+    graph: Option<Graph>,
+    /// Weights, KV and scratch — present once loaded with residency.
+    residency: Option<Residency>,
+}
+
+/// Everything a stage's step touches, allocated at load (decision 4).
+struct Residency {
+    weights: Weights,
+    /// One `[ctx_max, kv_width]` u16 cache per layer, `kvr` row layout.
+    kv: Vec<DeviceTensor<u16>>,
+    scratch: Block0Scratch,
+    step: StepKernels,
 }
 
 impl Stage {
@@ -42,6 +348,88 @@ impl Stage {
     pub fn has_graph(&self) -> bool {
         self.graph.is_some()
     }
+
+    /// Device bytes held by the residency: weights, KV caches, scratch.
+    /// Zero for a metadata-only stage.
+    pub fn resident_bytes(&self) -> usize {
+        self.residency.as_ref().map_or(0, |r| {
+            r.weights.resident_bytes()
+                + r.kv.iter().map(|c| c.buf().len() * 2).sum::<usize>()
+                + r.scratch.bytes()
+        })
+    }
+}
+
+/// Host copies of block 0's tap tensors for one position, in the dump's
+/// logical order at that position. The fused FFN exposes neither
+/// `ffn_norm-0` nor the down-projection `ffn_out-0` (the norm feeds the
+/// quantizer in registers; the down store folds the residual) — `l_out-0`
+/// carries that span.
+pub struct Block0Taps {
+    pub attn_norm: Vec<f32>,
+    pub q: Vec<f32>,
+    pub kv_rope_compressed: Vec<f32>,
+    /// Head-major `q_rope(h)` per head, the dump's `(d, h, t)` at one t.
+    pub q_rope: Vec<f32>,
+    pub k_rope: Vec<f32>,
+    pub kv_compressed: Vec<f32>,
+    /// Head-major `kqv(h)` per head.
+    pub kqv_compressed: Vec<f32>,
+    pub kqv_out: Vec<f32>,
+    pub ffn_inp: Vec<f32>,
+    pub l_out: Vec<f32>,
+}
+
+impl Block0Taps {
+    /// First tap holding a non-finite value, if any — the gate's finiteness
+    /// check over every span, including the ones not compared.
+    pub fn non_finite(&self) -> Option<&'static str> {
+        let all: [&str; 10] = [
+            "attn_norm",
+            "q",
+            "kv_rope_compressed",
+            "q_rope",
+            "k_rope",
+            "kv_compressed",
+            "kqv_compressed",
+            "kqv_out",
+            "ffn_inp",
+            "l_out",
+        ];
+        let vals: [&[f32]; 10] = [
+            &self.attn_norm,
+            &self.q,
+            &self.kv_rope_compressed,
+            &self.q_rope,
+            &self.k_rope,
+            &self.kv_compressed,
+            &self.kqv_compressed,
+            &self.kqv_out,
+            &self.ffn_inp,
+            &self.l_out,
+        ];
+        all.iter()
+            .zip(vals)
+            .find(|(_, v)| v.iter().any(|x| !x.is_finite()))
+            .map(|(n, _)| *n)
+    }
+
+    /// Bit equality of every tap — the gate's rerun/replay checks.
+    pub fn bits_equal(&self, other: &Block0Taps) -> bool {
+        let eq = |a: &[f32], b: &[f32]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        };
+        eq(&self.attn_norm, &other.attn_norm)
+            && eq(&self.q, &other.q)
+            && eq(&self.kv_rope_compressed, &other.kv_rope_compressed)
+            && eq(&self.q_rope, &other.q_rope)
+            && eq(&self.k_rope, &other.k_rope)
+            && eq(&self.kv_compressed, &other.kv_compressed)
+            && eq(&self.kqv_compressed, &other.kqv_compressed)
+            && eq(&self.kqv_out, &other.kqv_out)
+            && eq(&self.ffn_inp, &other.ffn_inp)
+            && eq(&self.l_out, &other.l_out)
+    }
 }
 
 /// One resident model: its stages in layer order, covering every block
@@ -55,16 +443,16 @@ pub struct GpuModel {
 }
 
 impl GpuModel {
-    /// The whole model as one stage.
+    /// The whole model as one stage (metadata only — a resident stage comes
+    /// from [`GpuModel::load_blocks`]).
     pub fn load(gguf: &gguf::Gguf, ctx_max: usize) -> Result<GpuModel, GpuError> {
         GpuModel::load_staged(gguf, ctx_max, &[])
     }
 
     /// Split the blocks at `cuts` (strictly ascending, each in
     /// `1..block_count`): `cuts.len() + 1` stages. Reads the metadata `step`
-    /// needs and sizes the resident buffers for `ctx_max` KV rows; weight
-    /// upload and KV/scratch allocation land here as P1–P7 deliver their
-    /// formats.
+    /// needs; the stages carry no residency until [`GpuModel::load_blocks`]
+    /// fills one.
     pub fn load_staged(
         gguf: &gguf::Gguf,
         ctx_max: usize,
@@ -93,11 +481,63 @@ impl GpuModel {
                 gpu: Gpu::new()?,
                 layers: w[0]..w[1],
                 graph: None,
+                residency: None,
             });
         }
         let mla = MlaParams::read(gguf, 0)?;
         Ok(GpuModel {
             stages,
+            mla,
+            ctx_max,
+        })
+    }
+
+    /// One stage over `layers` WITH residency: every tensor of that range
+    /// plus the globals in its kernels' device format, one KV cache per
+    /// layer, the m = 1 block-0 scratch and this file's step module. The
+    /// assembled step requires the range to be exactly `0..1` (block 0
+    /// alone) — the geometry checks below fail any other shape at load,
+    /// not mid-step.
+    pub fn load_blocks(
+        gguf: &gguf::Gguf,
+        ctx_max: usize,
+        layers: Range<usize>,
+    ) -> Result<GpuModel, GpuError> {
+        if ctx_max == 0 {
+            return Err("GpuModel::load_blocks: ctx_max must be >= 1".into());
+        }
+        let n_layers = gguf
+            .block_count()
+            .ok_or("GpuModel::load_blocks: metadata key block_count missing")?
+            as usize;
+        if layers.start >= layers.end || layers.end > n_layers {
+            return Err(format!(
+                "GpuModel::load_blocks: layer range {layers:?} outside 0..{n_layers}"
+            )
+            .into());
+        }
+        let mla = MlaParams::read(gguf, 0)?;
+        let gpu = Gpu::new()?;
+        let stream = gpu.stream();
+        let weights = Weights::load(stream, gguf, layers.clone(), true)?;
+        let scratch = Block0Scratch::new(stream, gguf, &weights, &mla)?;
+        let kv_width = mla.latent + mla.rope_dims;
+        let kv = (0..layers.len())
+            .map(|_| DeviceTensor::<u16>::zeroed(stream, ctx_max, kv_width))
+            .collect::<Result<Vec<_>, _>>()?;
+        let step = StepKernels::load(gpu.context())?;
+        Ok(GpuModel {
+            stages: vec![Stage {
+                gpu,
+                layers,
+                graph: None,
+                residency: Some(Residency {
+                    weights,
+                    kv,
+                    scratch,
+                    step,
+                }),
+            }],
             mla,
             ctx_max,
         })
@@ -116,12 +556,601 @@ impl GpuModel {
     }
 
     /// One decode step: append `tokens` to the KV cache and return the argmax
-    /// of the last position's logits. Not assembled before P8; until then
-    /// this is an error, not a panic, so a caller can probe for it.
+    /// of the last position's logits. Only block 0 is assembled; the MoE
+    /// blocks and the head are the remaining rounds, so this is an error,
+    /// not a panic, and a caller can probe for it.
     pub fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         if tokens.is_empty() {
             return Err("GpuModel::step: empty token slice".into());
         }
-        Err("GpuModel::step: not assembled yet (P8; kernels P1–P7)".into())
+        Err(
+            "GpuModel::step: blocks 1..=26 are MoE (another round fuses their \
+             expert half) and the lm_head is not resident; only block 0 is \
+             assembled — see step_block0_taps"
+                .into(),
+        )
     }
+
+    // ------------------------------------------------- block-0 assembled step
+
+    /// The one stage, requiring it to be block 0 alone with residency.
+    fn block0_parts(&mut self) -> Result<(&mut Gpu, &mut Residency), GpuError> {
+        if self.stages.len() != 1 || self.stages[0].layers != (0..1) {
+            return Err(
+                "GpuModel: the assembled block-0 step needs the single 0..1 stage of \
+                 load_blocks"
+                    .into(),
+            );
+        }
+        let stage = &mut self.stages[0];
+        let Some(residency) = stage.residency.as_mut() else {
+            return Err("GpuModel: stage carries no residency (load_blocks fills it)".into());
+        };
+        Ok((&mut stage.gpu, residency))
+    }
+
+    /// Refresh every per-step device parameter for `(token, pos)`: the rope
+    /// cos/sin cache (host YaRN math, one position), the token id, the KV
+    /// landing row and the live key count. Runs before an eager enqueue or a
+    /// graph replay; a captured graph reads these buffers at run time, which
+    /// is what lets one graph serve every position.
+    fn refresh_params(&mut self, token: u32, pos: u32) -> Result<(), GpuError> {
+        let mut cs = Vec::new();
+        self.mla.rope.cache_into(pos, &mut cs);
+        let (gpu, residency) = self.block0_parts()?;
+        let stream = gpu.stream();
+        let s = &mut residency.scratch;
+        s.cs_buf.copy_from_host(stream, &cs)?;
+        s.token_buf.copy_from_host(stream, &[token])?;
+        s.pos_buf.copy_from_host(stream, &[pos])?;
+        s.n_keys_buf.copy_from_host(stream, &[pos + 1])?;
+        Ok(())
+    }
+
+    /// Enqueue the block-0 step on the engine stream (eager form). Pure
+    /// enqueues — no allocation, no synchronization — so the same body is
+    /// what [`GpuModel::capture_block0`] records.
+    fn enqueue_step(&mut self) -> Result<(), GpuError> {
+        let mla = self.mla.clone();
+        let (gpu, residency) = self.block0_parts()?;
+        let Residency {
+            weights,
+            kv,
+            scratch,
+            step,
+        } = residency;
+        enqueue_block0(gpu, step, weights, &mut kv[0], scratch, &mla)
+    }
+
+    /// Eagerly run block 0's step for `token` at `pos` (`pos + 1` live keys,
+    /// rows `0..pos` already in the cache — this call appends row `pos`) and
+    /// read every tap back. Synchronizes; gate/debug use.
+    pub fn step_block0_taps(&mut self, token: u32, pos: u32) -> Result<Block0Taps, GpuError> {
+        self.check_pos(pos, "step_block0_taps")?;
+        self.refresh_params(token, pos)?;
+        self.enqueue_step()?;
+        self.block0_taps()
+    }
+
+    /// Read the tap tensors of the last run (eager or replay). Synchronizes
+    /// per readback; gate/debug use.
+    pub fn block0_taps(&mut self) -> Result<Block0Taps, GpuError> {
+        let mla = self.mla.clone();
+        let (gpu, residency) = self.block0_parts()?;
+        let stream = gpu.stream();
+        let s = &residency.scratch;
+        let rd =
+            |b: &DeviceBuffer<f32>| -> Result<Vec<f32>, GpuError> { Ok(b.to_host_vec(stream)?) };
+        let f_rows = rd(&s.f_rows)?;
+        let width = mla.rope_dims + mla.latent;
+        let mut q_rope = Vec::with_capacity(mla.n_head * mla.rope_dims);
+        for h in 0..mla.n_head {
+            q_rope.extend_from_slice(&f_rows[h * width..h * width + mla.rope_dims]);
+        }
+        let kv_s = rd(&s.kv_s)?;
+        let kvr = rd(&s.kvr)?;
+        Ok(Block0Taps {
+            attn_norm: rd(&s.normed)?,
+            q: rd(&s.q)?,
+            kv_rope_compressed: rd(&s.kv_a)?,
+            q_rope,
+            k_rope: kvr[..mla.rope_dims].to_vec(),
+            kv_compressed: kv_s[..mla.latent].to_vec(),
+            kqv_compressed: rd(&s.kqvc)?,
+            kqv_out: rd(&s.attn_out)?,
+            ffn_inp: rd(&s.ffn_inp)?,
+            l_out: rd(&s.l_out)?,
+        })
+    }
+
+    /// Capture the block-0 step into the stage's graph over the resident
+    /// buffers (their addresses freeze — they were allocated at load).
+    /// Returns the node count.
+    pub fn capture_block0(&mut self) -> Result<usize, GpuError> {
+        let mla = self.mla.clone();
+        if self.stages.len() != 1 || self.stages[0].layers != (0..1) {
+            return Err(
+                "GpuModel::capture_block0: needs the single 0..1 stage of load_blocks".into(),
+            );
+        }
+        let stage = &mut self.stages[0];
+        let Some(Residency {
+            weights,
+            kv,
+            scratch,
+            step,
+        }) = stage.residency.as_mut()
+        else {
+            return Err("GpuModel::capture_block0: stage carries no residency".into());
+        };
+        let gpu = &stage.gpu;
+        let graph =
+            gpu.capture(|_| enqueue_block0(gpu, step, weights, &mut kv[0], scratch, &mla))?;
+        let nodes = graph.node_count();
+        stage.graph = Some(graph);
+        Ok(nodes)
+    }
+
+    /// Enqueue one replay of the captured graph — no parameter refresh, no
+    /// synchronization. The timing arm of the gate drives this in a loop.
+    pub fn launch_block0_graph(&self) -> Result<(), GpuError> {
+        let stage = &self.stages[0];
+        let graph = stage
+            .graph
+            .as_ref()
+            .ok_or("GpuModel::launch_block0_graph: no captured graph")?;
+        graph.launch(stage.gpu.stream())
+    }
+
+    /// Refresh the step parameters for `(token, pos)` and replay the
+    /// captured block-0 graph. Synchronizes.
+    pub fn replay_block0(&mut self, token: u32, pos: u32) -> Result<(), GpuError> {
+        self.check_pos(pos, "replay_block0")?;
+        self.refresh_params(token, pos)?;
+        self.launch_block0_graph()?;
+        let stream = self.stages[0].gpu.stream();
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Write `rows` (whole `kv_width`-wide rows, `rows.len() <= ctx_max * kv_width`)
+    /// at the head of layer 0's cache, zeroing the rest — the seeding path
+    /// the gate uses to give the step a prefix of oracle rows. Synchronizes;
+    /// never inside a capture.
+    pub fn seed_block0_cache(&mut self, rows: &[u16]) -> Result<(), GpuError> {
+        let (gpu, residency) = self.block0_parts()?;
+        let cache = &mut residency.kv[0];
+        let full_len = cache.rows() * cache.cols();
+        if rows.is_empty() || rows.len() > full_len || !rows.len().is_multiple_of(cache.cols()) {
+            return Err(format!(
+                "seed_block0_cache: {} values are not whole {}-wide rows inside {full_len}",
+                rows.len(),
+                cache.cols()
+            )
+            .into());
+        }
+        let mut full = vec![0u16; full_len];
+        full[..rows.len()].copy_from_slice(rows);
+        cache.buf_mut().copy_from_host(gpu.stream(), &full)?;
+        Ok(())
+    }
+
+    fn check_pos(&self, pos: u32, what: &str) -> Result<(), GpuError> {
+        if pos as usize + 1 > self.ctx_max {
+            return Err(format!(
+                "GpuModel::{what}: pos {pos} + 1 exceeds the resident cache's {} rows",
+                self.ctx_max
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl Block0Scratch {
+    /// Derive every size from the resident weights and the MLA metadata,
+    /// cross-check the geometry the enqueue leans on, and allocate the arena
+    /// (plus the pair tables the gathers run). Load-time only.
+    fn new(
+        stream: &CudaStream,
+        gguf: &gguf::Gguf,
+        w: &Weights,
+        mla: &MlaParams,
+    ) -> Result<Block0Scratch, GpuError> {
+        let hidden = f32_gain(w, "blk.0.attn_norm.weight")?.len();
+        let q_rows = kq_weight(w, "blk.0.attn_q.weight")?.rows();
+        let kv_width = kq_weight(w, "blk.0.attn_kv_a_mqa.weight")?.rows();
+        let ff = kq_weight(w, "blk.0.ffn_gate.weight")?.rows();
+        // The derived q_nope2 planes, uploaded HERE in the q8f32 shape
+        // (`rows x k/4` words, `rows x k/32` scales, rows = n_head*latent):
+        // `Weights`'s own Q8_0Derived entry stores the same bytes shaped
+        // blocks-as-rows, whose `d.cols()` of 1 the gemv's k-derivation
+        // cannot consume — this is the one resident plane the step
+        // re-uploads instead of reading through `Weights::get`.
+        let (qn2_qs, qn2_d, derived, derived_k) = derived_planes(stream, gguf, mla)?;
+        let kv_b_rows = kq_weight(w, "blk.0.attn_kv_b.weight")?.rows();
+        let check = |what: &str, want: usize, got: usize| -> Result<(), GpuError> {
+            if want == got {
+                Ok(())
+            } else {
+                Err(format!("Block0Scratch: {what}: {want} != {got}").into())
+            }
+        };
+        check(
+            "attn_q rows vs n_head*kq_head",
+            q_rows,
+            mla.n_head * mla.kq_head,
+        )?;
+        check(
+            "kv_a rows vs latent+rope",
+            kv_width,
+            mla.latent + mla.rope_dims,
+        )?;
+        check(
+            "derived rows vs n_head*latent",
+            derived,
+            mla.n_head * mla.latent,
+        )?;
+        check("derived k vs nope", derived_k, mla.nope)?;
+        check(
+            "kv_b rows vs n_head*(nope+v_head)",
+            kv_b_rows,
+            mla.n_head * (mla.nope + mla.v_head),
+        )?;
+        if q_rows % mla.rope_dims != 0 || kv_width % mla.rope_dims != 0 {
+            return Err(format!(
+                "Block0Scratch: rope walks 64-value columns from the buffer start; q rows \
+                 {q_rows} / kv width {kv_width} are not {}-aligned",
+                mla.rope_dims
+            )
+            .into());
+        }
+        let half = mla.n_head / 2;
+        if !mla.n_head.is_multiple_of(2) || half > 8 {
+            return Err(format!(
+                "Block0Scratch: the per-head column pairing needs an even n_head <= 16, got {}",
+                mla.n_head
+            )
+            .into());
+        }
+        let (rope, latent, nope, kq_head) = (mla.rope_dims, mla.latent, mla.nope, mla.kq_head);
+        let dims = Dims {
+            hidden,
+            q_cols: q_rows / rope,
+            kv_cols: kv_width / rope,
+        };
+        let f32n = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        Ok(Block0Scratch {
+            x: f32n(hidden)?,
+            normed: f32n(hidden)?,
+            act_q: Q8Act::with_k(stream, 1, hidden)?,
+            q: f32n(q_rows)?,
+            q_rope_all: f32n(q_rows)?,
+            kv_a: f32n(kv_width)?,
+            kv_s: f32n(kv_width)?,
+            kvr: f32n(kv_width)?,
+            xn_lo: f32n(half * nope)?,
+            xn_hi: f32n(half * nope)?,
+            qn2_lo: f32n(derived * 8)?,
+            qn2_hi: f32n(derived * 8)?,
+            qn2_qs,
+            qn2_d,
+            f_rows: f32n(mla.n_head * kv_width)?,
+            kqvc: f32n(mla.n_head * latent)?,
+            kqvc_hi: f32n(half * latent)?,
+            act_kv_lo: Q8Act::with_k(stream, 8, latent)?,
+            act_kv_hi: Q8Act::with_k(stream, 8, latent)?,
+            wvb_lo: f32n(kv_b_rows * 8)?,
+            wvb_hi: f32n(kv_b_rows * 8)?,
+            kqv_2d: f32n(mla.n_head * mla.v_head)?,
+            act_ao: Q8Act::with_k(stream, 1, hidden)?,
+            attn_out: f32n(hidden)?,
+            ffn_inp: f32n(hidden)?,
+            act_ffn: Q8Act::with_k(stream, 1, hidden)?,
+            h: f32n(ff)?,
+            act32: Q8Blocks32::new(stream, ff, 1)?,
+            l_out: f32n(hidden)?,
+            g_kvr: Gather::new(
+                stream,
+                (0..rope)
+                    .map(|i| (latent + i, i))
+                    .chain((0..latent).map(|i| (i, rope + i))),
+                "kvr",
+            )?,
+            g_xn_lo: Gather::new(
+                stream,
+                (0..half).flat_map(|h| (0..nope).map(move |j| (h * kq_head + j, h * nope + j))),
+                "xn_lo",
+            )?,
+            g_xn_hi: Gather::new(
+                stream,
+                (half..mla.n_head)
+                    .flat_map(|h| (0..nope).map(move |j| (h * kq_head + j, (h - half) * nope + j))),
+                "xn_hi",
+            )?,
+            g_f_rope_lo: Gather::new(
+                stream,
+                (0..half).flat_map(|h| {
+                    let col = (h * kq_head + nope) / rope;
+                    (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
+                }),
+                "f_rope_lo",
+            )?,
+            g_f_nope2_lo: Gather::new(
+                stream,
+                (0..half).flat_map(|h| {
+                    (0..latent).map(move |j| ((h * latent + j) * 8 + h, h * kv_width + rope + j))
+                }),
+                "f_nope2_lo",
+            )?,
+            g_f_rope_hi: Gather::new(
+                stream,
+                (half..mla.n_head).flat_map(|h| {
+                    let col = (h * kq_head + nope) / rope;
+                    (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
+                }),
+                "f_rope_hi",
+            )?,
+            g_f_nope2_hi: Gather::new(
+                stream,
+                (half..mla.n_head).flat_map(|h| {
+                    (0..latent)
+                        .map(move |j| ((h * latent + j) * 8 + (h - half), h * kv_width + rope + j))
+                }),
+                "f_nope2_hi",
+            )?,
+            g_kqvc_hi: Gather::new(
+                stream,
+                (0..half * latent).map(|i| (half * latent + i, i)),
+                "kqvc_hi",
+            )?,
+            g_kqv_lo: Gather::new(
+                stream,
+                (0..half).flat_map(|h| {
+                    (0..mla.v_head).map(move |j| {
+                        (
+                            (h * (nope + mla.v_head) + nope + j) * 8 + h,
+                            h * mla.v_head + j,
+                        )
+                    })
+                }),
+                "kqv_lo",
+            )?,
+            g_kqv_hi: Gather::new(
+                stream,
+                (half..mla.n_head).flat_map(|h| {
+                    (0..mla.v_head).map(move |j| {
+                        (
+                            (h * (nope + mla.v_head) + nope + j) * 8 + (h - half),
+                            h * mla.v_head + j,
+                        )
+                    })
+                }),
+                "kqv_hi",
+            )?,
+            pos_buf: DeviceBuffer::from_host(stream, &[0u32])?,
+            n_keys_buf: DeviceBuffer::from_host(stream, &[1u32])?,
+            token_buf: DeviceBuffer::from_host(stream, &[0u32])?,
+            cs_buf: f32n(rope)?,
+            dims,
+        })
+    }
+}
+
+/// The derived q_nope2 planes of block 0 in the q8f32 kernel's shape —
+/// `rows = n_head * latent` rows of `k = nope` values, `qs` rows x k/4 code
+/// words (code j in word j/4, byte j%4), `d` rows x k/32 f32 scales (the
+/// block's f16 scale widened — the exact value the reference dequantizes
+/// with). Bytes transcribed from the CPU crate's `Derived` blocks, never
+/// re-derived on device; also returns (rows, k) for the size checks.
+fn derived_planes(
+    stream: &CudaStream,
+    gguf: &gguf::Gguf,
+    mla: &MlaParams,
+) -> Result<(DeviceTensor<u32>, DeviceTensor<f32>, usize, usize), GpuError> {
+    let derived = crate::weights::Derived::new(gguf)?;
+    let blocks = derived.wk_b_all_heads(0)?;
+    let (rows, k) = (mla.n_head * mla.latent, mla.nope);
+    let blocks_per_row = k / 32;
+    if blocks.len() != rows * blocks_per_row {
+        return Err(format!(
+            "derived_planes: {} blocks are not {rows} rows x {blocks_per_row} blocks",
+            blocks.len()
+        )
+        .into());
+    }
+    let mut qs = Vec::with_capacity(blocks.len() * 8);
+    let mut d = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        let mut words = [0u32; 8];
+        for (j, &q) in b.q.iter().enumerate() {
+            words[j / 4] |= u32::from(q as u8) << (8 * (j % 4));
+        }
+        qs.extend_from_slice(&words);
+        d.push(gguf::quant::half_to_f32(b.d));
+    }
+    Ok((
+        DeviceTensor::upload(stream, &qs, rows, k / 4)?,
+        DeviceTensor::upload(stream, &d, rows, blocks_per_row)?,
+        rows,
+        k,
+    ))
+}
+
+/// The resident Q3_K/Q4_K/Q6_K/Q5 word plane of a weight, by name.
+fn kq_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DeviceTensor<u32>, GpuError> {
+    match w.get(name) {
+        Some(DevWeight::KQuant { w, .. })
+        | Some(DevWeight::Q5_0 { w, .. })
+        | Some(DevWeight::Q5_1 { w, .. }) => Ok(w),
+        Some(_) => Err(format!("kq_weight: {name} is not a word-plane variant").into()),
+        None => Err(format!("kq_weight: {name} not resident").into()),
+    }
+}
+
+/// The resident F32 plane (norm gains), by name.
+fn f32_gain<'a>(w: &'a Weights, name: &str) -> Result<&'a DeviceBuffer<f32>, GpuError> {
+    match w.get(name) {
+        Some(DevWeight::F32 { w, .. }) => Ok(w.buf()),
+        Some(_) => Err(format!("f32_gain: {name} is not F32").into()),
+        None => Err(format!("f32_gain: {name} not resident").into()),
+    }
+}
+
+/// Enqueue the whole block-0 step for one token (m = 1). Mirrors
+/// `model::attn::block_attn_cached`'s op order with the gated kernels plus
+/// this file's gather. Asynchronous throughout — capturable as a body.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_block0(
+    gpu: &Gpu,
+    step: &StepKernels,
+    w: &Weights,
+    kv0: &mut DeviceTensor<u16>,
+    s: &mut Block0Scratch,
+    mla: &MlaParams,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let (hidden, latent, rope) = (s.dims.hidden, mla.latent, mla.rope_dims);
+    let gather =
+        |gt: &Gather, src: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
+            step.enqueue_gather(stream, src, &gt.src, &gt.dst, gt.n, y)
+        };
+
+    // 0. embed(token) — the block input x, kept intact for both residuals.
+    gpu.elem().enqueue_embed_rows(
+        stream,
+        kq_weight(w, "token_embd.weight")?,
+        &s.token_buf,
+        &mut s.x,
+    )?;
+    // 1. attn_norm(x) — the dump's FUSED_RMS_NORM output.
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        &s.x,
+        f32_gain(w, "blk.0.attn_norm.weight")?,
+        mla.eps,
+        hidden,
+        1,
+        &mut s.normed,
+    )?;
+    // 2-3. the two projections over one q8_1 activation of the normed x.
+    gpu.enqueue_quantize_q8_1(&s.normed, &mut s.act_q)?;
+    gpu.enqueue_gemv_q3k(kq_weight(w, "blk.0.attn_q.weight")?, &s.act_q, &mut s.q)?;
+    gpu.enqueue_gemv_q3k(
+        kq_weight(w, "blk.0.attn_kv_a_mqa.weight")?,
+        &s.act_q,
+        &mut s.kv_a,
+    )?;
+    // 4. rope over every 64-value column of both projections: the q layout
+    //    puts each head's rope slice on a column boundary (3 columns per
+    //    head, the slice last), the kv layout its rope tail (last column);
+    //    the rotated neighbours are never read.
+    gpu.elem().enqueue_rope(
+        stream,
+        &s.q,
+        &s.cs_buf,
+        rope,
+        s.dims.q_cols as u32,
+        1,
+        &mut s.q_rope_all,
+    )?;
+    gpu.elem().enqueue_rope(
+        stream,
+        &s.kv_a,
+        &s.cs_buf,
+        rope,
+        s.dims.kv_cols as u32,
+        1,
+        &mut s.kv_s,
+    )?;
+    // 5. the latent norm overwrites `kv_s`'s head, leaving the rope tail in
+    //    place: `kv_s` ends as `[kv_compressed | k_rope]`.
+    gpu.elem().enqueue_rms_norm(
+        stream,
+        &s.kv_a,
+        f32_gain(w, "blk.0.attn_kv_a_norm.weight")?,
+        mla.eps,
+        latent,
+        1,
+        &mut s.kv_s,
+    )?;
+    // 6. kvr = [k_rope | kv_compressed] — the oracle's CONCAT order.
+    gather(&s.g_kvr, &s.kv_s, &mut s.kvr)?;
+    // 7. q_nope2 per head: the derived Q8_0 gemv dots m <= 8 activation
+    //    columns, so the heads' nope slices are gathered into column layout
+    //    (two halves of n_head/2) and the head-paired outputs extracted.
+    gather(&s.g_xn_lo, &s.q, &mut s.xn_lo)?;
+    gather(&s.g_xn_hi, &s.q, &mut s.xn_hi)?;
+    gpu.q8f32()
+        .enqueue_q8_0_gemv(stream, &s.qn2_qs, &s.qn2_d, &s.xn_lo, 8, &mut s.qn2_lo)?;
+    gpu.q8f32()
+        .enqueue_q8_0_gemv(stream, &s.qn2_qs, &s.qn2_d, &s.xn_hi, 8, &mut s.qn2_hi)?;
+    // 8. the flash q rows `[q_rope | q_nope2]` per head — the oracle's
+    //    CONCAT order.
+    gather(&s.g_f_rope_lo, &s.q_rope_all, &mut s.f_rows)?;
+    gather(&s.g_f_nope2_lo, &s.qn2_lo, &mut s.f_rows)?;
+    gather(&s.g_f_rope_hi, &s.q_rope_all, &mut s.f_rows)?;
+    gather(&s.g_f_nope2_hi, &s.qn2_hi, &mut s.f_rows)?;
+    // 9. append the kvr row at `pos`, then attend over `n_keys` rows — both
+    //    read from device buffers, so a captured replay follows the position.
+    gpu.flash()
+        .enqueue_kv_append_pos_buf(stream, &s.kvr, &s.pos_buf, kv0, 1)?;
+    gpu.flash().enqueue_flash_latent(
+        stream,
+        &s.f_rows,
+        kv0,
+        &s.n_keys_buf,
+        mla.kq_scale,
+        1,
+        mla.n_head,
+        rope,
+        latent,
+        &mut s.kqvc,
+    )?;
+    // 10. wv_b per head: flash's output is head-major, which is the
+    //     m-column layout the quantizer and the kv_b gemv consume; the
+    //     second half rides an (offset) gathered copy. The v-up outputs are
+    //     extracted into the flat, head-major kqv_2d.
+    gather(&s.g_kqvc_hi, &s.kqvc, &mut s.kqvc_hi)?;
+    gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
+    gpu.enqueue_quantize_q8_1(&s.kqvc_hi, &mut s.act_kv_hi)?;
+    let kv_b = kq_weight(w, "blk.0.attn_kv_b.weight")?;
+    gpu.enqueue_gemv_q3k(kv_b, &s.act_kv_lo, &mut s.wvb_lo)?;
+    gpu.enqueue_gemv_q3k(kv_b, &s.act_kv_hi, &mut s.wvb_hi)?;
+    gather(&s.g_kqv_lo, &s.wvb_lo, &mut s.kqv_2d)?;
+    gather(&s.g_kqv_hi, &s.wvb_hi, &mut s.kqv_2d)?;
+    // 11. attn_output over the flat kqv_2d, then the attention residual.
+    gpu.enqueue_quantize_q8_1(&s.kqv_2d, &mut s.act_ao)?;
+    gpu.enqueue_gemv_q4k(
+        kq_weight(w, "blk.0.attn_output.weight")?,
+        &s.act_ao,
+        &mut s.attn_out,
+    )?;
+    gpu.elem()
+        .enqueue_add(stream, &s.attn_out, &s.x, hidden, &mut s.ffn_inp)?;
+    // 12. the fused FFN: norm+quantize, gate·up·swiglu, 32-value quantize,
+    //     down+residual — bit-identical to the op path (the P0b contract).
+    gpu.fused().enqueue_norm_quant(
+        stream,
+        &s.ffn_inp,
+        f32_gain(w, "blk.0.ffn_norm.weight")?,
+        mla.eps,
+        &mut s.act_ffn,
+    )?;
+    gpu.fused().enqueue_gate_up_swiglu(
+        stream,
+        kq_weight(w, "blk.0.ffn_gate.weight")?,
+        kq_weight(w, "blk.0.ffn_up.weight")?,
+        &s.act_ffn,
+        &mut s.h,
+    )?;
+    gpu.q5().enqueue_quantize_q8(stream, &s.h, &mut s.act32)?;
+    gpu.fused().enqueue_down_add_q5_1(
+        stream,
+        kq_weight(w, "blk.0.ffn_down.weight")?,
+        &s.act32,
+        &s.ffn_inp,
+        &mut s.l_out,
+    )?;
+    Ok(())
 }

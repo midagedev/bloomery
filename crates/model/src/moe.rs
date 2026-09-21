@@ -134,7 +134,7 @@ pub struct Meta {
 }
 
 impl Meta {
-    fn read(gguf: &Gguf) -> Result<Meta, ModelError> {
+    pub fn read(gguf: &Gguf) -> Result<Meta, ModelError> {
         let get = |key: &str| -> Result<u64, ModelError> {
             gguf.arch_get_u64(key).ok_or_else(|| {
                 // ModelError has no metadata variant; MissingTensor carries the key so
