@@ -76,7 +76,7 @@ gate-gpu-p0b *ARGS:
 time-gpu-p0b:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/ref/time-gate.sh gate_p0b'
 
-# P8a 블록 0 스텝(ctx_max 64에서 25노드, 한 구간보다 큰 캐시에서는 flash_merge가 붙어 26)의 재생 µs — 임대·증인, 리드 전용.
+# P8a 블록 0 스텝(ctx_max 64에서 21노드 — fuse1 뒤; 한 구간보다 큰 캐시에서는 flash_merge가 붙어 22)의 재생 µs — 임대·증인, 리드 전용.
 time-gpu-p8:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8'
 
