@@ -192,6 +192,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The same probe over a one-store kernel from the crate's second device
+    // module: the per-node cost with no body to speak of.
+    let probe = bloomery_gpu::probe::Probe::load(gpu.context())?;
+    let mut y_touch = DeviceBuffer::<f32>::zeroed(stream, 32)?;
+    for nodes in [100usize, 700] {
+        let g = gpu.capture(|s| {
+            for _ in 0..nodes {
+                probe.enqueue_touch(s, &mut y_touch)?;
+            }
+            Ok(())
+        })?;
+        for _ in 0..5 {
+            g.launch(stream)?;
+        }
+        stream.synchronize()?;
+        let reps = 50u32;
+        let t = std::time::Instant::now();
+        for _ in 0..reps {
+            g.launch(stream)?;
+            stream.synchronize()?;
+        }
+        let replay_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(reps);
+        println!(
+            "node-gap probe touch nodes={}: replay+sync {replay_us:.1} us = {:.2} us/node",
+            g.node_count(),
+            replay_us / g.node_count() as f64
+        );
+    }
+    let touched = y_touch.to_host_vec(stream)?;
+    if touched.iter().any(|&v| v != 1.0) {
+        eprintln!("FAIL: touch kernel from the second device module did not write its 32 elements");
+        all_ok = false;
+    }
+
     // Bare launch+sync and full-call figures, kept from the packaging spike.
     let (n, m) = (8usize, 1usize);
     let launch_us = gpu.probe_q4k_launch_us(&w_host[..n * 288], &x_m1, n, m, 1000)?;
