@@ -72,6 +72,10 @@ gate-gpu-p9:
 gate-gpu-p0b *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && ./target/release/gate_p0b {{ARGS}}'
 
+# P7 뒤 절반: 블록·종단 게이트 하네스의 자기 검증(호스트 전용 — 두 오라클 사이의 알려진 거리를 재현해야 한다).
+gate-gpu-block:
+    ./tools/box.sh 'cargo run --release -p bloomery-gpu-gates --bin gate_block'
+
 # P10: 가중치 상주 — 모델 파일의 모든 텐서를 커널이 먹는 디바이스 형식으로 올린다(정확성 실행, 측정 아님).
 gate-gpu-p10:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p10 && ./target/release/gate_p10'
