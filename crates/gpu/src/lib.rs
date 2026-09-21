@@ -31,6 +31,7 @@ pub mod q5;
 pub mod q8f32;
 pub mod router;
 pub mod tensor;
+pub mod weights;
 
 pub use graph::Graph;
 pub use model::{GpuModel, mla_width};

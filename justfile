@@ -68,6 +68,10 @@ gate-gpu-p6:
 gate-gpu-p9:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p9 && ./target/release/gate_p9'
 
+# P10: 가중치 상주 — 모델 파일의 모든 텐서를 커널이 먹는 디바이스 형식으로 올린다(정확성 실행, 측정 아님).
+gate-gpu-p10:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p10 && ./target/release/gate_p10'
+
 # 원시-x 측정 프로브(호스트 전용, 게이트 아님): ref_cuda의 실활성화에 대해 q8_1 양자화 바닥을 잰다.
 # 정확 참조(ref_gemv)를 재사용하고 판정은 하지 않는다 — 수치로 밴드·생성기를 재판단하는 건 리드다.
 rawx-floor:
