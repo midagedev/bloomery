@@ -38,8 +38,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const PIN_Q3K_K2048: (u64, u64) = (0x2404_4dc6_74fe_c873, 0x54ad_6fdb_a9c2_1a63);
     const PIN_Q4K_K2048: (u64, u64) = (0xe4e9_931f_39ac_4346, 0xa47c_3723_65b0_08c3);
     const PIN_Q6K_K2048: (u64, u64) = (0xf488_ed75_9aff_b869, 0xa4b6_6ba0_05f5_012d);
+    // PIN(2026-09-21): the shapes generalization opened (K=512, the K=2816
+    // partial group, a row count off the 8-lane grid), taken from the lead's
+    // rerun of the landed P1 tree (cbf46c3) — equal to the delegate's run.
+    // These guard the paths against later fusion work; they prove nothing
+    // about stage 0, which never ran these shapes.
+    const PIN_Q3K_K512: (u64, u64) = (0xf378_f732_ab02_4bfa, 0xa32a_f561_6481_a47e);
+    const PIN_Q4K_K2816: (u64, u64) = (0x4729_e493_2486_9646, 0x1779_5da0_e13a_3350);
+    const PIN_Q3K_R1407: (u64, u64) = (0xfe53_dbd4_e64b_d903, 0xe9bb_5923_c457_b5ff);
 
-    // (name, tensor, type, K, row cap: None = all rows, K=2048 pin pair)
+    // (name, tensor, type, K, row cap: None = all rows, (m=1, m=8) pin pair)
     let shapes: &[(
         &str,
         &str,
@@ -81,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             GgmlType::Q3_K,
             512,
             None,
-            None,
+            Some(PIN_Q3K_K512),
         ),
         (
             "q4k_k2816",
@@ -89,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             GgmlType::Q4_K,
             2816,
             None,
-            None,
+            Some(PIN_Q4K_K2816),
         ),
         (
             "q3k_k2048_r1407",
@@ -97,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             GgmlType::Q3_K,
             2048,
             Some(1407),
-            None,
+            Some(PIN_Q3K_R1407),
         ),
     ];
 
@@ -172,7 +180,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if hash != pin {
                     eprintln!(
                         "FAIL: {name} m={m} fnv1a64 {hash:#018x} != pinned {pin:#018x} \
-                         (K=2048 bits changed)"
+                         (pinned output bits changed)"
                     );
                     all_ok = false;
                 }
@@ -185,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "PASSED: gate_p1 K-quant gemvs within {KERNEL_BAND} of the q8_1 reference, \
-         reruns bit-identical, K=2048 pins matched"
+         reruns bit-identical, pins matched"
     );
     Ok(())
 }

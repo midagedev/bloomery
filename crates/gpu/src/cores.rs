@@ -106,8 +106,9 @@ pub fn q4k_nibble(qsw: u32, nib_sh: u32) -> u32 {
 /// SAFETY: callers keep `qb + 7*32` inside one column's q8 words.
 #[inline(always)]
 pub fn q4k_a_chain(vi: &[u32; 8], q: &[u32], qb: usize) -> i32 {
-    // SAFETY: qb + 224 <= 511 inside the caller's column span by this
-    // fn's contract (max qb within a column is 256 + 31).
+    // SAFETY: qb + 224 stays inside the caller's column span by this fn's
+    // contract: within quad group g the largest qb is 256*g + 31, so the
+    // last load is at 256*g + 255 < 256*ceil(n_sb/4), the column's words.
     let (w0, w1, w2, w3, w4, w5, w6, w7) = unsafe {
         (
             *q.get_unchecked(qb),
