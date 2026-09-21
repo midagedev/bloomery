@@ -257,3 +257,8 @@ gate: check-recipes check-comments fmt-check lint build-gpu build-cpu gate-1-1
 inventory-v41:
     ./tools/box.sh 'cargo run --release -p bloomery-gguf --bin gguf-inventory -- --markdown /tmp/v41-inventory.md /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-0000*-of-00009.gguf'
     scp "${BLOOMERY_BOX:-ws}:/tmp/v41-inventory.md" docs/v41-inventory.md
+
+# GPU 헤드(P8의 head 조각): result_norm → lm_head(Q6_K) → argmax를 그래프 하나로 잡아
+# 덤프의 마지막 토큰과 대조(정확성 실행, 핀된 헤드 밴드 안).
+gate-gpu-head:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && ./target/release/gate_head_gpu'
