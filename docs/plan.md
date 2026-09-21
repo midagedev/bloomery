@@ -51,7 +51,7 @@ A3이 국면의 끝이다. A4·A5는 B로 넘어가기 전에 **재기만** 하�
 ### B. V4.1-Flash를 이 기계에 — 배치, CPU expert 티어, engram, NVMe
 
 바이트가 말하는 것(roofline, 2026-09-16 서빙 배치 기준): 토큰당 11.7 GB 중 dense 7.66 GB는 VRAM, 라우팅 expert
-4.04 GB 중 3.34 GB가 DDR4(33블록), 0.71 GB가 VRAM(7블록); engram 194.9 GiB는 **토큰당 5.2 KiB**만 읽는다.
+4.04 GB 중 3.34 GB가 DDR4(33블록), 0.71 GB가 VRAM(7블록); engram 194.9 GiB는 **토큰당 48행(12.75 KiB)**만 읽는다.
 가중치 249 GiB(444 − 195)는 RAM 256 + VRAM 72에 들어가므로 **expert의 NVMe 오프로딩은 이 양자화에서는 필요 없다**;
 NVMe에 두는 것은 engram 하나다. 더 큰 양자화(Q4)를 올리려면 그때 expert 일부가 NVMe로 가고, 그것은 별도 측정 뒤의
 선택이다.
@@ -61,7 +61,7 @@ NVMe에 두는 것은 engram 하나다. 더 큰 양자화(Q4)를 올리려면 �
 | B0 | 선행: V4.1 아키 독해 — ik 포트(#2455)를 참조로 하이퍼커넥션·공유 압축 KV·저랭크 query norm·engram 조회 경로를 op 목록으로; ik에서 V4.1 중간 텐서 덤프(오라클 v3) | 덤프 세트 + op 인벤토리(문서) |
 | B1 | 로더: 텐서마다 (디바이스, dtype) 주소를 로드 시 배정(층 단위가 아니라 expert 단위 — mistral.rs가 못 하는 그것); GGUF 444 GiB의 mmap 창 | 로드 시간, 상주 바이트 표(어디에 몇 GB) |
 | B2 | **CPU expert 티어**(옛 2단계): 라우팅 expert의 sparse gemv를 CPU 풀에 — 커널은 이미 ik의 95~99%; 남은 것은 GPU 스텝과의 경계(활성값 전송, 동기) | 층·토큰당 호스트 항 ms 대 roofline 하한(3.34 GB ÷ 147.7 GB/s = 22.6 ms); GPU↔호스트 왕복 µs |
-| B3 | **engram**: 테이블은 NVMe mmap, 토큰당 조회 5.2 KiB를 `WILLNEED`/`io_uring` 선행 읽기로; 캐시 안 하는 것이 설계 | 조회 지연 µs(p50/p99, 콜드·웜), 스텝에서의 몫 |
+| B3 | **engram**: 테이블은 NVMe mmap, 토큰당 48행(12.75 KiB, 흩어진 272 B 읽기)을 `WILLNEED`/`io_uring` 선행 읽기로; 캐시 안 하는 것이 설계 | 조회 지연 µs(p50/p99, 콜드·웜), 스텝에서의 몫 |
 | B4 | V4.1 고유 op 셋(B0 목록)을 GPU 커널로, 오라클 v3 대비 게이트 | 층 탭 표 밴드 안 |
 | B5 | 조립 + 첫 V4.1 토큰 | **PPL 2.2355(ik) 패리티, tok/s 대 25.05(mainline, 2026-09-16)**·ik 20.4~20.7 |
 
