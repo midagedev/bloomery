@@ -613,9 +613,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// step's own graph costs. `touch` (an empty kernel) is the floor of both.
 /// The f32 gemv runs at three row counts in one process, so the router's
 /// 64-row shape is read against the big shapes on the same instrument.
+///
+/// The K-quant arms run at the layer's own shapes, and each Q3_K shape runs
+/// twice: `q3k_gemv` takes its column count at launch, `q3k_gemv_sel` on a
+/// one-expert stack of one slot is the same core over the same rows with
+/// that count a compile-time 1. Same body, same accumulation order, same
+/// traffic — so the pair prices the runtime column guards on their own,
+/// with no kernel change. `_sel` also reads one `sel` word before its first
+/// weight load, a round trip `q3k_gemv` does not pay, so the pair's gap is
+/// a lower bound on the guards' cost. Weights and activations are zeroed
+/// buffers: neither core branches on a value, only on lane- and
+/// launch-derived indices.
 #[cfg(feature = "gpu")]
 fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
-    use bloomery_gpu::{DeviceTensor, GpuError, Graph};
+    use bloomery_gpu::{DeviceTensor, GpuError, Graph, Q8Act};
     use cuda_core::{CudaStream, DeviceBuffer};
 
     /// Launches per burst, and nodes per captured graph.
@@ -713,6 +724,77 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
         let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
         let r = replay(stream, &g)?;
         print_arm("router_topk", 1, 560, g.node_count(), e, r);
+    }
+
+    // Q3_K: attn_kv_a_mqa's 576 rows, attn_q's 3072, and the MoE expert
+    // stack's six-expert width 6*1408 — the last one past this card's 6 MiB
+    // L2, where the smaller two fit. Each shape paired with the
+    // constant-folded `_sel` launch over the same rows.
+    for (rows, k) in [(576usize, 2048usize), (3072, 2048), (8448, 2048)] {
+        let n_sb = k / 256;
+        let act = Q8Act::with_k(stream, 1, k)?;
+        let w = DeviceTensor::<u32>::zeroed(stream, rows, 110 * n_sb / 4)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, rows)?;
+        // The profile's byte convention: the weight rows the launch reads,
+        // the activation buffers it addresses, and the outputs it writes.
+        let bytes =
+            (rows * 110 * n_sb + 8 * 64 * n_sb.div_ceil(2) + 4 * 2 * n_sb + 4 * rows) as u64;
+        {
+            let mut enq = |_s: &CudaStream| gpu.enqueue_gemv_q3k(&w, &act, &mut y);
+            let e = burst(stream, &mut enq)?;
+            let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+            let r = replay(stream, &g)?;
+            print_arm("q3k_gemv", rows, bytes, g.node_count(), e, r);
+        }
+        {
+            let sel = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+            let mut enq =
+                |_s: &CudaStream| gpu.enqueue_gemv_q3k_sel(&w, &act, &sel, 1, rows, &mut y);
+            let e = burst(stream, &mut enq)?;
+            let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+            let r = replay(stream, &g)?;
+            print_arm("q3k_gemv_sel", rows, bytes, g.node_count(), e, r);
+        }
+    }
+
+    // Q4_K: attn_output's 2048x2048 and shexp_down's 2048x2816 (n_sb 11,
+    // the odd count whose last iteration the per-lane `sbp` guard trims),
+    // plus a stack-sized 8192 rows past L2. No constant-folded twin exists
+    // for this core — the guard lever itself is the measurement there.
+    for (rows, k) in [(2048usize, 2048usize), (2048, 2816), (8192, 2048)] {
+        let n_sb = k / 256;
+        let act = Q8Act::with_k(stream, 1, k)?;
+        let w = DeviceTensor::<u32>::zeroed(stream, rows, 36 * n_sb)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, rows)?;
+        let bytes = (rows * 144 * n_sb
+            + 4 * 256 * n_sb.div_ceil(4)
+            + 4 * 8 * n_sb
+            + 4 * 2 * n_sb
+            + 4 * rows) as u64;
+        let mut enq = |_s: &CudaStream| gpu.enqueue_gemv_q4k(&w, &act, &mut y);
+        let e = burst(stream, &mut enq)?;
+        let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+        let r = replay(stream, &g)?;
+        print_arm(&format!("q4k_gemv_k{k}"), rows, bytes, g.node_count(), e, r);
+    }
+
+    // Q6_K at the lm_head's own width. The head launches once per step, not
+    // once per layer, and it is the one K-quant gemv the per-op table never
+    // shows, so its shape is priced here: `q6k_gemv` takes its column count
+    // at launch like the two this round fixed, and nothing has folded it.
+    {
+        let (rows, k) = (102_400usize, 2048usize);
+        let n_sb = k / 256;
+        let act = Q8Act::with_k(stream, 1, k)?;
+        let w = DeviceTensor::<u32>::zeroed(stream, rows, 210 * n_sb / 4)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, rows)?;
+        let bytes =
+            (rows * 210 * n_sb + 4 * 128 * n_sb.div_ceil(2) + 4 * 2 * n_sb + 4 * rows) as u64;
+        let mut enq = |_s: &CudaStream| gpu.enqueue_gemv_q6k(&w, &act, &mut y);
+        let e = burst(stream, &mut enq)?;
+        let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+        let r = replay(stream, &g)?;
+        print_arm("q6k_gemv_lm_head", rows, bytes, g.node_count(), e, r);
     }
     Ok(())
 }

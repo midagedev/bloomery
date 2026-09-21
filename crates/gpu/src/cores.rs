@@ -168,6 +168,196 @@ pub fn q4k_coeff(d: f32, dmin: f32, sc: i32, mi: i32) -> (f32, f32) {
     (cda, cdb)
 }
 
+/// Everything one Q4_K super-block yields before a column is named: the
+/// eight SWAR-decoded qs words every column's A chain reuses, and the two
+/// chain coefficients of this lane's sub-block. `wk` is the super-block's
+/// word base in `w` and `s` the lane's sub-block within it. The whole
+/// decode lives here so the single-column body and the m-column body cannot
+/// drift apart.
+///
+/// SAFETY: callers keep `wk + 35` — the super-block's last word — inside
+/// `w`.
+#[inline(always)]
+pub fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
+    // d/dmin word + the 12 scale bytes in words 1..3.
+    // SAFETY: wk + 3 <= wk + 35, inside `w` by this fn's contract.
+    let (w0, w1, w2, w3) = unsafe {
+        (
+            *w.get_unchecked(wk),
+            *w.get_unchecked(wk + 1),
+            *w.get_unchecked(wk + 2),
+            *w.get_unchecked(wk + 3),
+        )
+    };
+    let d = half_to_f32((w0 & 0xffff) as u16);
+    let dmin = half_to_f32((w0 >> 16) as u16);
+
+    let (sc, mi) = q4k_scale_min(s, w1, w2, w3);
+    // Column-independent chain coefficients.
+    let (cda, cdb) = q4k_coeff(d, dmin, sc, mi);
+
+    // qs word base: 8 words from super-block word 4 + 8*(s>>1); nibble
+    // select is the sub-block parity, 0 (low) or 4 (high). Hoisted
+    // (MUL-8): the window and its SWAR decode are column-independent, so
+    // decode once per iteration and let every column's A chain reuse the
+    // registers.
+    let qsk = wk + 4 + 8 * (s >> 1);
+    let nib_sh = (s as u32 & 1) * 4;
+    // SAFETY: qsk + 7 <= wk + 35, the same bound as w0..w3 above.
+    let vi = unsafe {
+        [
+            q4k_nibble(*w.get_unchecked(qsk), nib_sh),
+            q4k_nibble(*w.get_unchecked(qsk + 1), nib_sh),
+            q4k_nibble(*w.get_unchecked(qsk + 2), nib_sh),
+            q4k_nibble(*w.get_unchecked(qsk + 3), nib_sh),
+            q4k_nibble(*w.get_unchecked(qsk + 4), nib_sh),
+            q4k_nibble(*w.get_unchecked(qsk + 5), nib_sh),
+            q4k_nibble(*w.get_unchecked(qsk + 6), nib_sh),
+            q4k_nibble(*w.get_unchecked(qsk + 7), nib_sh),
+        ]
+    };
+    (vi, cda, cdb)
+}
+
+/// One iteration's term of a single-column Q4_K row walk: the super-block
+/// `sbp`'s decode, this lane's A chain against column `col0`'s q8 window,
+/// and the sub-block sum, as the one value the walk adds to its
+/// accumulator. Every load the iteration makes is in here, and none of the
+/// walk's accumulation is — which is what lets the walk issue several
+/// iterations' loads before the first add.
+///
+/// SAFETY: callers guarantee `sbp < n_sb` and the buffer lengths of
+/// [`q4k_row_dot`] at `m_cols` 1.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn q4k_iter_term(
+    w: &[u32],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    n_sb: usize,
+    it: u32,
+    row_abs: usize,
+    qb0: usize,
+    s8b0: usize,
+    d8b0: usize,
+    s: usize,
+    grp: usize,
+    lane: usize,
+) -> f32 {
+    let sbp = 4 * it as usize + grp;
+    // SAFETY: sbp < n_sb by this fn's contract, so the super-block's words
+    // wk..wk+35 are inside row `row_abs` of `w`.
+    let (vi, cda, cdb) = q4k_sb_decode(w, row_abs * 36 * n_sb + 36 * sbp, s);
+    let qb = 256 * it as usize + lane;
+    let s8b = 32 * it as usize + lane;
+    let d8b = 2 * sbp + (s >> 2);
+    let a = q4k_a_chain(&vi, q, qb0 + qb);
+    // SAFETY: sbp < n_sb keeps s8b < 8*n_sb, and s8.len() >=
+    // (col0+1)*8*n_sb by the contract.
+    let b = unsafe { *s8.get_unchecked(s8b0 + s8b) };
+    // SAFETY: sbp < n_sb keeps d8b < 2*n_sb, and d8.len() >=
+    // (col0+1)*2*n_sb by the contract.
+    let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
+    (a as f32 * cda + b as f32 * cdb) * e0
+}
+
+/// Iterations of the single-column Q4_K walk whose loads are issued before
+/// the first multiply-add that consumes them. The walk is a dependent chain
+/// — every iteration's addresses are known in advance but its term feeds
+/// the next add — so with one iteration in flight a lane can pay a memory
+/// round trip per iteration. Issuing this many iterations' loads first is
+/// what turns that walk into a bandwidth problem; it does not touch the
+/// accumulation order, which stays increasing in the iteration index.
+///
+/// Q3_K has no such constant on purpose: the same lever measured flat on
+/// its walk, so [`q3k_row_dot_1col`] keeps one iteration per pass. The two
+/// walks load alike per weight — what differs is which one was waiting.
+pub const Q4K_ITER_UNROLL: u32 = 2;
+
+/// One row's Q4_K dot product against a single activation column —
+/// [`q4k_row_dot`]'s column 0, the same loads and the same accumulation
+/// order, with the column guards gone at compile time. The guards are
+/// runtime tests, so in the m-column walk each iteration's work sits behind
+/// its own branch and a lane can have only that iteration's loads in
+/// flight. This body runs the iterations whose super-blocks are live for
+/// every lane — `n_sb/4` of them, no `sbp` test — [`Q4K_ITER_UNROLL`] at a
+/// time, and leaves the guarded walk as the tail.
+///
+/// Caller contract as [`q4k_row_dot`] with `m_cols` 1.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn q4k_row_dot_1col(
+    w: &[u32],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    n_sb: usize,
+    iters: u32,
+    row_abs: usize,
+    col0: usize,
+    lane: usize,
+) -> f32 {
+    let q_col = 256 * iters as usize; // q8 words per column
+    let s8_col = 8 * n_sb; // 32-value groups per column
+    let d8_col = 2 * n_sb; // 128-value blocks per column
+
+    let s = lane & 7; // sub-block within the super-block
+    let grp = lane >> 3; // super-block within this iteration (0..4)
+
+    let mut f0 = 0.0f32;
+
+    let qb0 = col0 * q_col;
+    let s8b0 = col0 * s8_col;
+    let d8b0 = col0 * d8_col;
+
+    // Iterations every lane takes: `sbp = 4*it + grp <= 4*full - 1 <= n_sb
+    // - 1` for `it < full`, whatever `grp` is, so the walk's guard is dead
+    // here and the backend sees one straight counted loop.
+    let full = (n_sb / 4) as u32;
+    let mut it: u32 = 0;
+    while it + Q4K_ITER_UNROLL <= full {
+        // SAFETY: it + Q4K_ITER_UNROLL <= full, so each term's `sbp < n_sb`;
+        // the rest of the contract is this fn's.
+        let t0 = q4k_iter_term(
+            w, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
+        );
+        let t1 = q4k_iter_term(
+            w,
+            q,
+            s8,
+            d8,
+            n_sb,
+            it + 1,
+            row_abs,
+            qb0,
+            s8b0,
+            d8b0,
+            s,
+            grp,
+            lane,
+        );
+        f0 += t0;
+        f0 += t1;
+        it += Q4K_ITER_UNROLL;
+    }
+    while it < iters {
+        let sbp = 4 * it as usize + grp;
+        // As `q4k_row_dot`: the guard makes a partial final iteration safe
+        // and is always true when n_sb is a multiple of 4.
+        if sbp < n_sb {
+            // SAFETY: the guard is this term's `sbp < n_sb` precondition.
+            f0 += q4k_iter_term(
+                w, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
+            );
+        }
+
+        it += 1;
+    }
+
+    f0
+}
+
 /// One row's Q4_K dot products with `m_cols` (1..=8) activation columns,
 /// pre-reduction: lane `lane` of the row's warp walks `iters`
 /// four-super-block iterations keeping per-column partial sums in scalars
@@ -203,6 +393,21 @@ pub fn q4k_row_dot(
     m_cols: usize,
     lane: usize,
 ) -> [f32; 8] {
+    // One column is the decode shape, and it gets a body of its own: the
+    // guards below are runtime tests, so in this walk each iteration's work
+    // sits behind its own branch. See `q4k_row_dot_1col`.
+    if m_cols == 1 {
+        return [
+            q4k_row_dot_1col(w, q, s8, d8, n_sb, iters, row_abs, col0, lane),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+    }
     let m = m_cols;
     let row_words = 36 * n_sb; // 144 B per super-block
     let q_col = 256 * iters as usize; // q8 words per column
@@ -233,48 +438,12 @@ pub fn q4k_row_dot(
         // lanes load nothing of w/q/s8/d8. It is always true when n_sb
         // is a multiple of 4.
         if sbp < n_sb {
-            let wk = row_abs * row_words + 36 * sbp; // super-block word base
-
-            // d/dmin word + the 12 scale bytes in words 1..3.
-            // SAFETY: sbp < n_sb, so wk+3 <= row_abs*row_words +
-            // 36*(n_sb-1) + 3 < (row_abs+1)*row_words <= w.len() by this
-            // fn's contract.
-            let (w0, w1, w2, w3) = unsafe {
-                (
-                    *w.get_unchecked(wk),
-                    *w.get_unchecked(wk + 1),
-                    *w.get_unchecked(wk + 2),
-                    *w.get_unchecked(wk + 3),
-                )
-            };
-            let d = half_to_f32((w0 & 0xffff) as u16);
-            let dmin = half_to_f32((w0 >> 16) as u16);
-
-            let (sc, mi) = q4k_scale_min(s, w1, w2, w3);
-            // Column-independent chain coefficients.
-            let (cda, cdb) = q4k_coeff(d, dmin, sc, mi);
-
-            // qs word base: 8 words from super-block word 4 + 8*(s>>1);
-            // nibble select is the sub-block parity, 0 (low) or 4 (high).
-            // Hoisted (MUL-8): the window and its SWAR decode are
-            // column-independent, so decode once per iteration and let
-            // every column's A chain reuse the registers.
-            let qsk = wk + 4 + 8 * (s >> 1);
-            let nib_sh = (s as u32 & 1) * 4;
-            // SAFETY: qsk + 7 <= wk + 35, inside the row's word span by
-            // the same bound as w0..w3 above.
-            let vi = unsafe {
-                [
-                    q4k_nibble(*w.get_unchecked(qsk), nib_sh),
-                    q4k_nibble(*w.get_unchecked(qsk + 1), nib_sh),
-                    q4k_nibble(*w.get_unchecked(qsk + 2), nib_sh),
-                    q4k_nibble(*w.get_unchecked(qsk + 3), nib_sh),
-                    q4k_nibble(*w.get_unchecked(qsk + 4), nib_sh),
-                    q4k_nibble(*w.get_unchecked(qsk + 5), nib_sh),
-                    q4k_nibble(*w.get_unchecked(qsk + 6), nib_sh),
-                    q4k_nibble(*w.get_unchecked(qsk + 7), nib_sh),
-                ]
-            };
+            // The super-block's column-independent decode — the eight
+            // hoisted qs words and the chain coefficients — is
+            // `q4k_sb_decode`, shared with `q4k_row_dot_1col`.
+            // SAFETY: sbp < n_sb, so the super-block's words wk..wk+35 are
+            // inside row `row_abs` of `w` by this fn's contract.
+            let (vi, cda, cdb) = q4k_sb_decode(w, row_abs * row_words + 36 * sbp, s);
 
             // This lane's q8 words in the q4 permutation: word i of
             // column c lives at q_col*c + 256it + 32i + lane
@@ -445,6 +614,184 @@ pub fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32 {
         + dp4a_s32(vi[3], (w23 >> 32) as u32, 0) * sc[3]
 }
 
+/// Everything one Q3_K super-block yields before a column is named: this
+/// lane's four dequantized weight quads, the four sub-block scales its
+/// integer chain scales by, and the super-block scale. `base` is the
+/// super-block's BYTE offset in `w`, `w16`/`s0` the lane constants of
+/// [`q3k_row_dot`]. The whole decode lives here so the single-column body
+/// and the m-column body cannot drift apart.
+///
+/// SAFETY: callers keep the super-block at `base` inside a row whose
+/// ceil(bytes/4) words are all in `w`.
+#[inline(always)]
+pub fn q3k_sb_decode(w: &[u32], base: usize, w16: usize, s0: usize) -> ([u32; 4], [i32; 4], f32) {
+    // A super-block sits 0 or 2 mod 4 depending on the row's own offset
+    // too (odd n_sb shifts every other row), so the funnel select comes
+    // from the byte window, not from the super-block index.
+    let par = (base >> 1) & 1;
+
+    // qs word: bytes base+32+4*w16 .. +3. The window start is 0 mod 4 or
+    // 2 mod 4 with the super-block, so the same floor division addresses
+    // both; odd windows reassemble with a 16-bit funnel.
+    let qk = (base + 32 + 4 * w16) >> 2;
+    // SAFETY: w16 < 16, so qk+1 stays inside the row's ceil(bytes/4)
+    // words by this fn's contract (odd super-blocks only shift the window
+    // by 2).
+    let (lo, hi) = unsafe { (*w.get_unchecked(qk), *w.get_unchecked(qk + 1)) };
+    let vl = if par == 0 { lo } else { funnel16(lo, hi) };
+
+    // hmask word (bytes base+4*(w16%8) .. +3), one bit per weight: bit
+    // 4*(w16/8)+field. Invert so a clear hmask bit (subtract 4) becomes a
+    // set bit, pre-shifted to bit 0 of each byte.
+    let hk = (base + 4 * (w16 & 7)) >> 2;
+    // SAFETY: same row/base/w16 bounds as the qs window above.
+    let (hlo, hhi) = unsafe { (*w.get_unchecked(hk), *w.get_unchecked(hk + 1)) };
+    let hm = if par == 0 { hlo } else { funnel16(hlo, hhi) };
+    let vh1 = (!hm) >> (4 * (w16 >> 3)) as u32;
+
+    // scales: 12 bytes at base+96..108, decoded with the aux[] shuffle of
+    // dequantize_row_q3_K. The 16-byte window base+96..112 (even) /
+    // base+94..110 (odd) is covered by four aligned words.
+    let ak = (base + 96) >> 2;
+    // SAFETY: the 16-byte window ends at most 2 bytes past the row end,
+    // but the floored word index stays inside the row's words.
+    let (aw0, aw1, aw2, aw3) = unsafe {
+        (
+            *w.get_unchecked(ak),
+            *w.get_unchecked(ak + 1),
+            *w.get_unchecked(ak + 2),
+            *w.get_unchecked(ak + 3),
+        )
+    };
+    let (a0w, a1w, a2w) = if par == 0 {
+        (aw0, aw1, aw2)
+    } else {
+        (funnel16(aw0, aw1), funnel16(aw1, aw2), funnel16(aw2, aw3))
+    };
+    let ts = q3k_aux_scales(a0w, a1w, a2w);
+
+    // Super-block scale d (f16 at bytes base+108..109): low half of aw3
+    // for an even window (word covers 108..111), high half for odd (word
+    // covers 106..109).
+    let d_bits = if par == 0 {
+        (aw3 & 0xffff) as u16
+    } else {
+        (aw3 >> 16) as u16
+    };
+    let drow = half_to_f32(d_bits);
+
+    // Sub-block scales for fields 0..3: sub-block s0+2j.
+    let sc = [
+        q3k_sub_scale(&ts, s0),
+        q3k_sub_scale(&ts, s0 + 2),
+        q3k_sub_scale(&ts, s0 + 4),
+        q3k_sub_scale(&ts, s0 + 6),
+    ];
+
+    // Dequantize the four quads to signed bytes (SWAR): q3k_dequant folds
+    // the hbit subtract borrow-free.
+    (q3k_dequant(vl, vh1), sc, drow)
+}
+
+/// One iteration's term of a single-column Q3_K row walk: the super-block
+/// `sbp`'s decode, this lane's integer chain against column `col0`'s q8
+/// pair slots, and the two shared scales, as the one value the walk adds to
+/// its accumulator. Every load the iteration makes is in here, and none of
+/// the walk's accumulation is — which is what lets the walk issue several
+/// iterations' loads before the first add.
+///
+/// SAFETY: callers guarantee `sbp < n_sb` and the buffer lengths of
+/// [`q3k_row_dot`] at `m_cols` 1.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn q3k_iter_term(
+    w: &[u32],
+    q: &[u64],
+    d8: &[f32],
+    n_sb: usize,
+    it: u32,
+    row_abs: usize,
+    qb0: usize,
+    d8b0: usize,
+    w16: usize,
+    half: usize,
+    s0: usize,
+    d8_base: usize,
+    lane: usize,
+) -> f32 {
+    let sbp = ((it << 1) | half as u32) as usize;
+    // SAFETY: row_abs is inside `w` and sbp < n_sb by this fn's contract,
+    // so the super-block's window stays in the row.
+    let (vi, sc, drow) = q3k_sb_decode(w, row_abs * 110 * n_sb + sbp * 110, w16, s0);
+    let qb = 64 * it as usize + lane;
+    let d8b = 2 * sbp + d8_base;
+    // SAFETY: qb0 + qb < (col0+1)*64*iters, the column's u64 slots, by the
+    // permutation's group bound and this fn's contract.
+    let w01 = unsafe { *q.get_unchecked(qb0 + qb) };
+    // SAFETY: qb0 + qb + 32 <= (col0+1)*64*iters - 1 — the pair's second
+    // slot is inside the same column.
+    let w23 = unsafe { *q.get_unchecked(qb0 + qb + 32) };
+    let a = q3k_chain(&vi, w01, w23, &sc);
+    // SAFETY: d8b0 + d8b < (col0+1)*2*n_sb by sbp < n_sb and the contract.
+    let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
+    (a as f32) * (e0 * drow)
+}
+
+/// One row's Q3_K dot product against a single activation column —
+/// [`q3k_row_dot`]'s column 0, the same loads and the same accumulation
+/// order, with the column guards gone at compile time. The guards are
+/// runtime tests, so in the m-column walk each iteration's work sits behind
+/// its own branch and a lane can have only that iteration's loads in
+/// flight; this body is one straight run of the walk instead.
+///
+/// It keeps one iteration per pass. Q4_K's extra lever — a guard-free
+/// prefix of [`Q4K_ITER_UNROLL`] iterations whose loads all precede the
+/// adds — measured flat here, so it is not carried.
+///
+/// Caller contract as [`q3k_row_dot`] with `m_cols` 1.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn q3k_row_dot_1col(
+    w: &[u32],
+    q: &[u64],
+    d8: &[f32],
+    n_sb: usize,
+    iters: u32,
+    row_abs: usize,
+    col0: usize,
+    lane: usize,
+) -> f32 {
+    let q_col = 64 * iters as usize; // q8 u64 slots per column
+    let d8_col = 2 * n_sb; // 128-value blocks per column
+
+    let w16 = lane & 15;
+    let half = lane >> 4; // 0: even super-block, 1: odd
+    let s0 = 8 * (w16 >> 3) + ((w16 & 7) >> 2); // first sub-block index
+    let d8_base = w16 >> 3; // half super-block = one 128-value q8_1 block
+
+    let mut f0 = 0.0f32;
+
+    let qb0 = col0 * q_col;
+    let d8b0 = col0 * d8_col;
+
+    let mut it: u32 = 0;
+    while it < iters {
+        let sbp = ((it << 1) | half as u32) as usize;
+        // As `q3k_row_dot`: the guard makes a partial final iteration safe
+        // and is always true when n_sb is even.
+        if sbp < n_sb {
+            // SAFETY: the guard is this term's `sbp < n_sb` precondition.
+            f0 += q3k_iter_term(
+                w, q, d8, n_sb, it, row_abs, qb0, d8b0, w16, half, s0, d8_base, lane,
+            );
+        }
+
+        it += 1;
+    }
+
+    f0
+}
+
 /// One row's Q3_K dot products with `m_cols` (1..=8) activation columns,
 /// pre-reduction: lane `lane` of the row's warp walks `iters`
 /// two-super-block iterations keeping per-column partial sums in scalars
@@ -477,6 +824,21 @@ pub fn q3k_row_dot(
     m_cols: usize,
     lane: usize,
 ) -> [f32; 8] {
+    // One column is the decode shape, and it gets a body of its own: the
+    // guards below are runtime tests, so in this walk each iteration's work
+    // sits behind its own branch. See `q3k_row_dot_1col`.
+    if m_cols == 1 {
+        return [
+            q3k_row_dot_1col(w, q, d8, n_sb, iters, row_abs, col0, lane),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+    }
     let m = m_cols;
     let row_bytes = 110 * n_sb;
     let q_col = 64 * iters as usize; // q8 u64 slots per column
@@ -510,78 +872,13 @@ pub fn q3k_row_dot(
         // The sbp guard makes a partial final iteration safe; always
         // true when n_sb is even.
         if sbp < n_sb {
-            let base = row_abs * row_bytes + sbp * 110; // byte offset
-            // A super-block sits 0 or 2 mod 4 depending on the row's own
-            // offset too (odd n_sb shifts every other row), so the
-            // funnel select comes from the byte window, not from sbp.
-            let par = (base >> 1) & 1;
-
-            // qs word: bytes base+32+4*w16 .. +3. The window start is
-            // 0 mod 4 or 2 mod 4 with the super-block, so the same floor
-            // division addresses both; odd windows reassemble with a
-            // 16-bit funnel.
-            let qk = (base + 32 + 4 * w16) >> 2;
-            // SAFETY: row_abs is inside w by this fn's contract, sbp <
-            // n_sb, w16 < 16, so qk+1 stays inside the row's
-            // ceil(row_bytes/4) words (odd super-blocks only shift the
-            // window by 2).
-            let (lo, hi) = unsafe { (*w.get_unchecked(qk), *w.get_unchecked(qk + 1)) };
-            let vl = if par == 0 { lo } else { funnel16(lo, hi) };
-
-            // hmask word (bytes base+4*(w16%8) .. +3), one bit per
-            // weight: bit 4*(w16/8)+field. Invert so a clear hmask bit
-            // (subtract 4) becomes a set bit, pre-shifted to bit 0 of
-            // each byte.
-            let hk = (base + 4 * (w16 & 7)) >> 2;
-            // SAFETY: same row/sbp/w16 bounds as the qs window above.
-            let (hlo, hhi) = unsafe { (*w.get_unchecked(hk), *w.get_unchecked(hk + 1)) };
-            let hm = if par == 0 { hlo } else { funnel16(hlo, hhi) };
-            let vh1 = (!hm) >> (4 * (w16 >> 3)) as u32;
-
-            // scales: 12 bytes at base+96..108, decoded with the aux[]
-            // shuffle of dequantize_row_q3_K. The 16-byte window
-            // base+96..112 (even) / base+94..110 (odd) is covered by four
-            // aligned words.
-            let ak = (base + 96) >> 2;
-            // SAFETY: ak+3 < ceil((row_abs+1)*row_bytes/4) <= w.len(): the
-            // 16-byte window ends at most 2 bytes past the row end, but
-            // the floored word index stays inside the row's words.
-            let (aw0, aw1, aw2, aw3) = unsafe {
-                (
-                    *w.get_unchecked(ak),
-                    *w.get_unchecked(ak + 1),
-                    *w.get_unchecked(ak + 2),
-                    *w.get_unchecked(ak + 3),
-                )
-            };
-            let (a0w, a1w, a2w) = if par == 0 {
-                (aw0, aw1, aw2)
-            } else {
-                (funnel16(aw0, aw1), funnel16(aw1, aw2), funnel16(aw2, aw3))
-            };
-            let ts = q3k_aux_scales(a0w, a1w, a2w);
-
-            // Super-block scale d (f16 at bytes base+108..109): low half
-            // of aw3 for an even window (word covers 108..111), high
-            // half for odd (word covers 106..109).
-            let d_bits = if par == 0 {
-                (aw3 & 0xffff) as u16
-            } else {
-                (aw3 >> 16) as u16
-            };
-            let drow = half_to_f32(d_bits);
-
-            // Sub-block scales for fields 0..3: sub-block s0+2j.
-            let sc = [
-                q3k_sub_scale(&ts, s0),
-                q3k_sub_scale(&ts, s0 + 2),
-                q3k_sub_scale(&ts, s0 + 4),
-                q3k_sub_scale(&ts, s0 + 6),
-            ];
-
-            // Dequantize the four quads to signed bytes (SWAR):
-            // q3k_dequant folds the hbit subtract borrow-free.
-            let vi = q3k_dequant(vl, vh1);
+            // The super-block's column-independent decode — the lane's
+            // four dequantized quads, its sub-block scales and the
+            // super-block scale — is `q3k_sb_decode`, shared with
+            // `q3k_row_dot_1col`.
+            // SAFETY: row_abs is inside w by this fn's contract and sbp <
+            // n_sb, so the super-block's window stays in the row.
+            let (vi, sc, drow) = q3k_sb_decode(w, row_abs * row_bytes + sbp * 110, w16, s0);
 
             // q8_1 words in the q3 u64 pairing: field pair (2p, 2p+1)
             // of column c lives in u64 slot q_col*c + 64it + 32p + lane
