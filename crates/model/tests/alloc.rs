@@ -78,7 +78,10 @@ static ALLOC: Counting = Counting;
 /// left the step; worst warm step 658. A step that grows the KV blocks adds 28.
 /// PIN(2026-09-21): 630 -> 603 / 0.13 MB on the contiguous-KV round — one flat
 /// buffer per block replaces one `Vec` per cached row plus its outer `Vec`.
-const LIMIT: u64 = 700;
+/// LIMIT 700 -> 660 on the same round: worst warm step measured 631 (the capacity-
+/// doubling step, 864 KB); 660 keeps ~5 % headroom over that and the ratchet only
+/// moves down.
+const LIMIT: u64 = 660;
 
 #[test]
 #[ignore = "hw: needs the box and the model file"]
