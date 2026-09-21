@@ -629,6 +629,91 @@ fn kq_reassoc_band(q: &[f32], k: &[u16]) -> f32 {
     2.0 * q.len() as f32 * 2.0f32.powi(-24) * sum_abs
 }
 
+/// The split-out V-accumulation twins against each other, bit for bit — the
+/// property the kernel-level "given the same weights, bit-identical" claim
+/// rests on, pinned at helper granularity so latents the full kernel would
+/// never vectorize (64 and 72: one tile, and tile + tail) still cover the
+/// tile tail. Both `r` buffers start from the same random non-zero state:
+/// the accumulator carries across blocks in the kernel, never re-zeroed
+/// between them.
+#[test]
+#[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
+fn hw_flash_v_accum_avx2_matches_scalar() {
+    if !(std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && std::arch::is_x86_feature_detected!("f16c"))
+    {
+        eprintln!(
+            "hw_flash_v_accum_avx2_matches_scalar: no AVX2+FMA+F16C on this machine — skipped"
+        );
+        return;
+    }
+    let rope = 64usize;
+    let mut rng = Lcg(0x0acc_6512_2311_9f10);
+    let nz = |rng: &mut Lcg| {
+        let v = rng.range(-2.0, 2.0);
+        if v == 0.0 { 0.25 } else { v }
+    };
+    let mut compared = 0usize;
+    // 512 = the model's latent (8 whole tiles), 64 = one tile, 72 = tile +
+    // single-vector tail.
+    for &latent in &[512usize, 64, 72] {
+        let width = rope + latent;
+        // 40 rows: a whole 32-lane block at 0, and a short block at 32 whose
+        // lanes past the cache end carry w = 0 — the padding shape the row
+        // kernel's `break` leaves behind.
+        let mut keys16: Vec<u16> = Vec::with_capacity(40 * width);
+        for _ in 0..40 * width {
+            keys16.push(model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)));
+        }
+        let keys = model::kv::KvRows::new(&keys16, width);
+        // (blk, half-masked?, shape name) — the three weight shapes the row
+        // kernel produces: every lane active, a random ~half masked to
+        // exactly 0.0, and the short last block with the past-the-end lanes
+        // masked.
+        for (blk, half, shape) in [
+            (0usize, false, "all 32 lanes active"),
+            (0usize, true, "random half masked"),
+            (
+                32usize,
+                false,
+                "short last block, lanes past the end masked",
+            ),
+        ] {
+            let mut w = [0.0f32; 32];
+            for (l, wl) in w.iter_mut().enumerate() {
+                *wl = if blk + l >= 40 || (half && rng.unit() < 0.5) {
+                    0.0
+                } else {
+                    rng.range(1e-6, 1.0)
+                };
+            }
+            let mut r_s: Vec<f32> = (0..latent).map(|_| nz(&mut rng)).collect();
+            let mut r_a = r_s.clone();
+            model::attn::flash_v_accum_scalar(&w, keys, blk, rope, &mut r_s);
+            // SAFETY: the ISA check at the top owns the fn's ISA half;
+            // `keys` is `rope + latent` wide, `r` is `latent` long (a
+            // multiple of 8 in all three shapes), and every lane with
+            // w[l] != 0 satisfies `blk + l < 40 = keys.len()` by the mask
+            // construction above.
+            unsafe { model::attn::flash_v_accum_avx2(&w, keys, blk, rope, &mut r_a) };
+            for (d, (&a, &b)) in r_s.iter().zip(r_a.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "V accumulation, latent {latent}, blk {blk} ({shape}): element {d} of {} — scalar {a:e} vs avx2 {b:e}",
+                    r_s.len()
+                );
+            }
+            compared += r_s.len();
+        }
+    }
+    eprintln!(
+        "hw_flash_v_accum_avx2_matches_scalar: {compared} accumulator elements bit-identical \
+         (latent 512/64/72 x all-active/half-masked/short-block)"
+    );
+}
+
 /// The synthetic deterministic batch the flash-SIMD lever test runs on: the
 /// real MLA's shapes (576-wide row, 512 latent — a shape the SIMD path WOULD
 /// take: row width % 32 == 0, latent % 8 == 0) at a small head/token count.

@@ -1101,6 +1101,138 @@ fn flash_attn_latent_impl(
     out
 }
 
+/// Scalar twin: `r[d] = fma(V[blk+l][d], w[l], r[d])` for lanes `l` ascending,
+/// `d` over the whole latent — the V stage of one 32-key block, split out at
+/// block granularity (the kq dot is the per-key split). Lanes with
+/// `w[l] == 0` are skipped: the row kernel writes exactly `0.0` there (causally
+/// masked or past the cache end), and `fma(V, 0, R) == R` exactly. `pub` +
+/// `#[doc(hidden)]` so the twin-pair gate in `tests/attn.rs` can call both
+/// halves (the `dot_row_scalar` pattern).
+// TWIN: flash_v_accum_avx2 — same FMAs in the same per-element order; every
+// edit to the arithmetic or the lane semantics must be made in both.
+#[doc(hidden)]
+pub fn flash_v_accum_scalar(
+    w: &[f32; 32],
+    keys16: KvRows<'_>,
+    blk: usize,
+    rope_dims: usize,
+    r: &mut [f32],
+) {
+    for (l, &wl) in w.iter().enumerate() {
+        if wl == 0.0 {
+            continue; // masked lane: fma(V, 0, R) == R exactly
+        }
+        let krow = keys16.row(blk + l);
+        for (rd, &v) in r.iter_mut().zip(&krow[rope_dims..]) {
+            *rd = half_to_f32(v).mul_add(wl, *rd);
+        }
+    }
+}
+
+/// The AVX2+FMA+F16C twin of [`flash_v_accum_scalar`], register-blocked:
+/// d-outer in tiles of `T` ymm vectors, key-inner over the block's active
+/// lanes — the `w[l] != 0` lanes, collected into a stack list once per call
+/// (a masked lane contributes nothing, exactly the scalar twin's `continue`).
+/// Per tile the `T` accumulators load from `r` once, every active lane FMAs
+/// its `T` V vectors in (weight broadcast by `_mm256_set1_ps`), and the
+/// accumulators store once — `r` crosses the lane walk once per tile instead
+/// of once per key. The numerical contract: each element `d`'s FMA chain
+/// applies the active lanes in ascending lane order, one FMA per lane, on the
+/// running element, so the tile nesting reorders nothing and the output bits
+/// equal the scalar twin's. A latent not a multiple of the tile takes a
+/// single-vector tail with the same per-element chain.
+///
+/// `#[target_feature]` is not optional: without it the intrinsics lower to
+/// scalar emulation with no error.
+///
+/// # Safety
+/// The CPU must support AVX2+FMA+F16C; `keys16.width() == rope_dims + r.len()`;
+/// `r.len()` a multiple of 8; `blk + l < keys16.len()` for every lane with
+/// `w[l] != 0.0` — inactive lanes are never read.
+// TWIN: flash_v_accum_scalar — same FMAs in the same per-element order; every
+// edit to the arithmetic or the lane semantics must be made in both.
+#[doc(hidden)]
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+pub unsafe fn flash_v_accum_avx2(
+    w: &[f32; 32],
+    keys16: KvRows<'_>,
+    blk: usize,
+    rope_dims: usize,
+    r: &mut [f32],
+) {
+    // SAFETY: the fn contract above — the caller proves the ISA and the row
+    // width, and only lanes the list below admits are ever dereferenced.
+    unsafe {
+        use std::arch::x86_64::*;
+        // 8 ymm per tile: 8 accumulators + one V vector + the broadcast
+        // weight leaves the 16-register ymm file headroom for address math.
+        const T: usize = 8;
+
+        // The active lanes and their V-row tails, resolved once per call: the
+        // tile walk below visits each lane once per tile, and a lane's row
+        // address never moves inside the call. Membership is `w[l] == 0.0` —
+        // the predicate the scalar twin's `continue` tests — so the lane set
+        // is identical whatever `w` holds. Stack storage only: no allocation.
+        let mut tails = [std::ptr::null::<u16>(); 32];
+        let mut lanes = [0u8; 32];
+        let mut n_lanes = 0usize;
+        for (l, &wl) in w.iter().enumerate() {
+            if wl == 0.0 {
+                continue; // masked lane: fma(V, 0, R) == R exactly
+            }
+            // SAFETY: the fn contract keeps `blk + l` inside the cache, and
+            // `rope_dims < width` (r is nonempty and 8-divisible), so the
+            // tail pointer stays inside the row.
+            tails[n_lanes] = keys16.row(blk + l).as_ptr().add(rope_dims);
+            lanes[n_lanes] = l as u8;
+            n_lanes += 1;
+        }
+
+        let latent = r.len();
+        let rp = r.as_mut_ptr();
+        let full = latent / (T * 8) * (T * 8);
+        for d0 in (0..full).step_by(T * 8) {
+            let mut acc = [_mm256_setzero_ps(); T];
+            for (j, a) in acc.iter_mut().enumerate() {
+                // SAFETY: `d0 + j*8 + 8 <= full <= latent = r.len()` — the
+                // accumulator load stays inside `r`.
+                *a = _mm256_loadu_ps(rp.add(d0 + j * 8));
+            }
+            for (&l, tp) in lanes[..n_lanes].iter().zip(tails[..n_lanes].iter()) {
+                let wl = _mm256_set1_ps(w[l as usize]);
+                let vp = tp.add(d0);
+                for (j, a) in acc.iter_mut().enumerate() {
+                    // SAFETY: row `blk + l` is `width = rope_dims + latent`
+                    // wide, so the tile's eight f16 octets at `rope_dims +
+                    // d0 + j*8` lie inside it.
+                    let v = _mm256_cvtph_ps(_mm_loadu_si128(vp.add(j * 8) as *const __m128i));
+                    *a = _mm256_fmadd_ps(v, wl, *a);
+                }
+            }
+            for (j, &a) in acc.iter().enumerate() {
+                // SAFETY: the same span the load above took — inside `r`.
+                _mm256_storeu_ps(rp.add(d0 + j * 8), a);
+            }
+        }
+        // The tail: latents not a multiple of the tile, one vector at a
+        // time, lanes inner — each element's chain still descends the active
+        // lanes in ascending order.
+        for d in (full..latent).step_by(8) {
+            // SAFETY: `d + 8 <= latent = r.len()` — inside `r`.
+            let mut acc = _mm256_loadu_ps(rp.add(d));
+            for (&l, tp) in lanes[..n_lanes].iter().zip(tails[..n_lanes].iter()) {
+                let wl = _mm256_set1_ps(w[l as usize]);
+                // SAFETY: the row is `width` wide and `d + 8 <= latent`, so
+                // the octet at `rope_dims + d` lies inside it.
+                let v = _mm256_cvtph_ps(_mm_loadu_si128(tp.add(d) as *const __m128i));
+                acc = _mm256_fmadd_ps(v, wl, acc);
+            }
+            // SAFETY: the same span the load above took — inside `r`.
+            _mm256_storeu_ps(rp.add(d), acc);
+        }
+    }
+}
+
 /// The per-row body of the flash kernel, scalar transcription — the no-AVX2
 /// fallback and the gates' oracle (see [`flash_attn_latent_scalar`]); the
 /// AVX2 twin below differs ONLY in the two vectorized inner loops.
@@ -1183,18 +1315,10 @@ fn flash_row_scalar(
             2 => r.fill(0.0),
             _ => {}
         }
-        for l in 0..32 {
-            if w[l] == 0.0 {
-                continue; // masked lane: fma(V, 0, R) == R exactly
-            }
-            // TWIN: flash_row_avx2 — every edit outside the two marked
-            // regions must be made in both. (This is the V accumulation
-            // region.)
-            let krow = keys16.row(blk + l);
-            for d in 0..latent {
-                r[d] = half_to_f32(krow[p.rope_dims + d]).mul_add(w[l], r[d]);
-            }
-        }
+        // TWIN: flash_row_avx2 — every edit outside the two marked regions
+        // must be made in both. (This is the V accumulation region; the
+        // arithmetic lives in the split-out twin pair above.)
+        flash_v_accum_scalar(w, keys16, blk, p.rope_dims, r);
     }
 
     let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
@@ -1210,15 +1334,19 @@ fn flash_row_scalar(
 ///   * the kq dot — [`kq_dot_fa4_avx2`]: only the SUM ORDER changes (fa4
 ///     two-partial chain → lane groups); the twins' one numerical difference,
 ///     gated by the explicit reassociation band in `tests/attn.rs`;
-///   * the V accumulation — eight `d` per FMA. The j (=d) axis reorder is
-///     nothing: each output element's FMA chain still descends key order
-///     exactly as the scalar wrote it, so given the same weights this stage is
-///     bit-identical to the scalar twin.
+///   * the V accumulation — [`flash_v_accum_avx2`], register-blocked: the
+///     latent runs d-outer in tiles of 8 ymm whose accumulators stay in
+///     registers while the block's active lanes walk inner, so `r` is read
+///     and written once per tile instead of once per key. The axis reorder
+///     is nothing: each output element's FMA chain still descends key order
+///     exactly as the scalar wrote it, so given the same weights this stage
+///     is bit-identical to the scalar twin.
 ///
 /// `#[target_feature]` is not optional: without it the intrinsics lower to scalar
-/// emulation with no error. The one split-out helper is the kq dot, at the scalar
-/// path's own per-key granularity — nothing inside the contraction or the V loop
-/// is split (finer splits round through memory).
+/// emulation with no error. The split-out helpers are the kq dot, at the scalar
+/// path's own per-key granularity, and the V accumulation, at block granularity
+/// — the kq contraction stays whole (finer splits round through memory); the V
+/// stage tiles the other axis to keep its accumulators in registers.
 ///
 /// # Safety
 /// The CPU must support AVX2+FMA+F16C, and the caller must hold the contract
@@ -1343,28 +1471,16 @@ unsafe fn flash_row_avx2(
                 2 => r.fill(0.0),
                 _ => {}
             }
-            for l in 0..32 {
-                if w[l] == 0.0 {
-                    continue; // masked lane: fma(V, 0, R) == R exactly
-                }
-                // TWIN: flash_row_scalar — every edit outside the two marked
-                // regions must be made in both. (This is the V accumulation
-                // region; given the same weights it is bit-identical to the
-                // scalar form — only the kq region may differ.)
-                let krow = keys16.row(blk + l);
-                let wl = _mm256_set1_ps(w[l]);
-                // The latent tail: eight f16 per cvtph, the j-axis FMA
-                // `r[d..d+8] = fma(v, w, r[d..d+8])` — see the fn doc: reorders nothing.
-                let vp = krow.as_ptr().add(p.rope_dims);
-                let rp = r.as_mut_ptr();
-                for d in (0..latent).step_by(8) {
-                    // SAFETY: latent % 8 == 0 and r.len() == latent (the fn
-                    // contract), so d+8 <= latent in both the key row and r.
-                    let v = _mm256_cvtph_ps(_mm_loadu_si128(vp.add(d) as *const __m128i));
-                    let acc = _mm256_loadu_ps(rp.add(d));
-                    _mm256_storeu_ps(rp.add(d), _mm256_fmadd_ps(v, wl, acc));
-                }
-            }
+            // TWIN: flash_row_scalar — every edit outside the two marked
+            // regions must be made in both. (This is the V accumulation
+            // region; given the same weights it is bit-identical to the
+            // scalar form — only the kq region may differ.)
+            // SAFETY: the fn contract plus the mask above: every lane left
+            // out of the active list is causally masked or past the cache
+            // end, so `blk + l < keys16.len()` holds for each lane read; the
+            // dispatch asserted `keys16.width() == rope_dims + latent`, and
+            // `flash_simd` gated `latent % 8 == 0`.
+            flash_v_accum_avx2(w, keys16, blk, p.rope_dims, r);
         }
 
         let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
