@@ -243,4 +243,6 @@ Compile-time levers in `q3k-cpu` are `const` values with dead branches behind
 them; MUL-11 converts them to `#[cfg(feature)]` so the on-side also compiles.
 Runtime levers: `BLOOMERY_THREADS`, `BLOOMERY_SPIN` (threads),
 `BLOOMERY_PROFILE` (model::profile), `BLOOMERY_FLASH_SIMD=0` (attn, scalar
-rollback), `BLOOMERY_GATE_BOUND` (tools/gate.sh). Each is read once, at first use.
+rollback), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
+segment, a multiple of 32; an unusable value panics instead of falling back).
+Each is read once, at first use.
