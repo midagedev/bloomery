@@ -21,7 +21,11 @@ use std::sync::Arc;
 
 // Fusion rule (docs/gpu-design.md "P0b의 모양"): merge launches wherever
 // there is NO true cross-thread dependency, keep a launch boundary where
-// there is one — a grid-wide barrier costs more than the nodes it saves.
+// there is one — a grid-wide barrier, plus the cooperative launch it
+// requires, costs more than the one node it saves. That is a measurement,
+// not a belief: the `gap_*` arms of `gate_p8 --bench-kernels` price the
+// barrier and the cooperative launch separately at the grids a fold here
+// would use.
 // The op path's eight launches:
 //   rms_norm -> quantize q8_1(128) -> gate gemv -> up gemv -> swiglu
 //   -> quantize q8(32) -> down gemv -> residual add

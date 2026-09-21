@@ -77,8 +77,6 @@ pub(crate) fn q8_1_quant_block(
     s8: &mut DisjointSlice<i32>,
     d8: &mut DisjointSlice<f32>,
 ) {
-    use crate::cores::{q3_slot, q4_slot, q6_slot, q8_quad};
-
     // Lane covers the four consecutive values 4*lane .. 4*lane+3 of the
     // block; the warp max over the four per-lane maxima is the block amax
     // (no cross-lane byte packing needed, unlike the 32-value geometry where
@@ -86,14 +84,46 @@ pub(crate) fn q8_1_quant_block(
     let base = x0 + col * 256 * n_sb + 128 * b + 4 * lane;
     // SAFETY: base + 3 < x0 + (col+1)*256*n_sb <= x.len() by the caller's
     // contract.
-    let (v0, v1, v2, v3) = unsafe {
-        (
+    let v = unsafe {
+        [
             *x.get_unchecked(base),
             *x.get_unchecked(base + 1),
             *x.get_unchecked(base + 2),
             *x.get_unchecked(base + 3),
-        )
+        ]
     };
+    // SAFETY: the caller's contract, forwarded unchanged.
+    unsafe { q8_1_quant_vals(v, col, b, n_sb, half_it, quad_it, lane, q3, q4, q6, s8, d8) }
+}
+
+/// The same 128-value q8_1 quantization from the four values already in a
+/// lane's registers, for a producer that holds them. The partition is the
+/// caller's to keep: the warp entering this must be the same 32 lanes
+/// holding the same block's 128 values in the same order, because the amax
+/// below is a warp collective and a scale computed over a different set of
+/// values changes every byte quantized with it.
+///
+/// SAFETY: as [`q8_1_quant_block`], and `v` must be values `128 * b + 4 *
+/// lane .. +3` of column `col`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn q8_1_quant_vals(
+    v: [f32; 4],
+    col: usize,
+    b: usize,
+    n_sb: usize,
+    half_it: u32,
+    quad_it: u32,
+    lane: usize,
+    q3: &mut DisjointSlice<u64>,
+    q4: &mut DisjointSlice<u32>,
+    q6: &mut DisjointSlice<u32>,
+    s8: &mut DisjointSlice<i32>,
+    d8: &mut DisjointSlice<f32>,
+) {
+    use crate::cores::{q3_slot, q4_slot, q6_slot, q8_quad};
+
+    let (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
     let amax = warp::reduce_max_f32(v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()));
     let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
     let (word, quad) = q8_quad([v0, v1, v2, v3], d);

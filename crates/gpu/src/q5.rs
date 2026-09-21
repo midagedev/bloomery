@@ -5,6 +5,7 @@
 //! the load-time weight repack, the activation scratch and the enqueue API.
 
 use crate::GpuError;
+use crate::q8_1_quant_block;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, dotprod::dp4a_s32, kernel, launch_bounds, launch_contract, thread, warp,
@@ -246,6 +247,87 @@ pub fn q5_row_dot(
     [f0, f1, f2, f3, f4, f5, f6, f7]
 }
 
+/// One warp's group of four 32-value quant blocks of column `col`: the body
+/// both [`q5_kernels::q5_quantize_q8`] and the merged pair kernel run, so
+/// neither can drift from the other. Lane ℓ owns the values of word ℓ
+/// (values `128g + 4ℓ .. +3`), its octet `ℓ>>3` is one 32-value block, and
+/// the block's scale and byte sum are 1-2-4 xor butterflies inside that
+/// octet — masks that never cross an octet, so a partial last group is safe.
+/// Lanes past the last block read the final block's values (full-warp
+/// shuffles, in bounds) and store nothing.
+///
+/// Lives outside the `#[cuda_module]` for the reason the cores above do: a
+/// device-callable body shared by two kernels. It takes the module's
+/// `DisjointSlice` outputs, which no core does.
+///
+/// SAFETY: the caller guarantees `col < m_cols`, `g < n_groups`, the launch
+/// contract's bounds on `x`, `q`, `s8` and `d8`, and that all 32 lanes of
+/// one warp enter with the same `(col, g)` — the shuffles below are
+/// warp-wide.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn q5_quant_group(
+    x: &[f32],
+    col: usize,
+    g: usize,
+    k_blocks: u32,
+    q_stride: u32,
+    lane: usize,
+    q: &mut DisjointSlice<u32>,
+    s8: &mut DisjointSlice<i32>,
+    d8: &mut DisjointSlice<f32>,
+) {
+    let oct = lane >> 3; // block within the group (0..4)
+    let i = lane & 7; // word within the block (0..8)
+    let b = 4 * g + oct;
+    let active = b < k_blocks as usize;
+    // Inactive lanes of a partial last group read the LAST block's values
+    // so every shuffle below runs on a full warp; they store nothing.
+    let bread = if active { b } else { k_blocks as usize - 1 };
+    let base = col * k_blocks as usize * 32 + 32 * bread + 4 * i;
+    // SAFETY: base + 3 < (col+1)*32*k_blocks <= m_cols*k_blocks*32 <=
+    // x.len() by the caller's contract.
+    let (v0, v1, v2, v3) = unsafe {
+        (
+            *x.get_unchecked(base),
+            *x.get_unchecked(base + 1),
+            *x.get_unchecked(base + 2),
+            *x.get_unchecked(base + 3),
+        )
+    };
+    // Octet amax (masks 1, 2, 4 stay inside the octet).
+    let lmax = v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs());
+    let mut amax = lmax;
+    amax = amax.max(warp::shuffle_xor_f32(amax, 1));
+    amax = amax.max(warp::shuffle_xor_f32(amax, 2));
+    amax = amax.max(warp::shuffle_xor_f32(amax, 4));
+    let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let q0 = ((v0 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+    let q1 = ((v1 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+    let q2 = ((v2 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+    let q3 = ((v3 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
+    let word = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+    // Octet block sum (the same masks), so lane&7 == 0 holds the total.
+    let mut s = (q0 as i8 as i32) + (q1 as i8 as i32) + (q2 as i8 as i32) + (q3 as i8 as i32);
+    s += warp::shuffle_xor(s as u32, 1) as i32;
+    s += warp::shuffle_xor(s as u32, 2) as i32;
+    s += warp::shuffle_xor(s as u32, 4) as i32;
+    if active {
+        // SAFETY: b < k_blocks, so 256*(b>>5) + 32*i + (b&31) + 0 (i < 8)
+        // < 256*((b>>5)+1) <= q_stride, hence slot < (col+1)*q_stride <=
+        // m_cols*q_stride <= q.len(); and col*k_blocks + b < m_cols*k_blocks
+        // <= s8.len() and d8.len(). One lane writes each slot.
+        unsafe {
+            *q.get_unchecked_mut(col * q_stride as usize + 256 * (b >> 5) + 32 * i + (b & 31)) =
+                word;
+            if i == 0 {
+                *s8.get_unchecked_mut(col * k_blocks as usize + b) = s;
+                *d8.get_unchecked_mut(col * k_blocks as usize + b) = d;
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------- module
 
 #[cuda_module]
@@ -298,55 +380,92 @@ mod q5_kernels {
         let col = grp / n_groups as usize;
         let g = grp % n_groups as usize;
         let lane = warp::lane_id() as usize;
-
-        let oct = lane >> 3; // block within the group (0..4)
-        let i = lane & 7; // word within the block (0..8)
-        let b = 4 * g + oct;
-        let active = b < k_blocks as usize;
-        // Inactive lanes of a partial last group read the LAST block's values
-        // so every shuffle below runs on a full warp; they store nothing.
-        let bread = if active { b } else { k_blocks as usize - 1 };
-        let base = col * k_blocks as usize * 32 + 32 * bread + 4 * i;
-        // SAFETY: base + 3 < (col+1)*32*k_blocks <= m_cols*k_blocks*32 <=
-        // x.len() by the launch contract.
-        let (v0, v1, v2, v3) = unsafe {
-            (
-                *x.get_unchecked(base),
-                *x.get_unchecked(base + 1),
-                *x.get_unchecked(base + 2),
-                *x.get_unchecked(base + 3),
+        // SAFETY: col < m_cols and g < n_groups by the two lines above; the
+        // launch contract carries the rest of `q5_quant_group`'s
+        // preconditions, and the group index is warp-uniform.
+        unsafe {
+            q5_quant_group(
+                x, col, g, k_blocks, q_stride, lane, &mut q, &mut s8, &mut d8,
             )
-        };
-        // Octet amax (masks 1, 2, 4 stay inside the octet).
-        let lmax = v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs());
-        let mut amax = lmax;
-        amax = amax.max(warp::shuffle_xor_f32(amax, 1));
-        amax = amax.max(warp::shuffle_xor_f32(amax, 2));
-        amax = amax.max(warp::shuffle_xor_f32(amax, 4));
-        let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let q0 = ((v0 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
-        let q1 = ((v1 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
-        let q2 = ((v2 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
-        let q3 = ((v3 / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
-        let word = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
-        // Octet block sum (the same masks), so lane&7 == 0 holds the total.
-        let mut s = (q0 as i8 as i32) + (q1 as i8 as i32) + (q2 as i8 as i32) + (q3 as i8 as i32);
-        s += warp::shuffle_xor(s as u32, 1) as i32;
-        s += warp::shuffle_xor(s as u32, 2) as i32;
-        s += warp::shuffle_xor(s as u32, 4) as i32;
-        if active {
-            // SAFETY: b < k_blocks, so 256*(b>>5) + 32*i + (b&31) + 0 (i < 8)
-            // < 256*((b>>5)+1) <= q_stride, hence slot < (col+1)*q_stride <=
-            // m_cols*q_stride <= q.len(); and col*k_blocks + b < total <=
-            // s8.len() and d8.len(). One lane writes each slot.
-            unsafe {
-                *q.get_unchecked_mut(
-                    col * q_stride as usize + 256 * (b >> 5) + 32 * i + (b & 31),
-                ) = word;
-                if i == 0 {
-                    *s8.get_unchecked_mut(col * k_blocks as usize + b) = s;
-                    *d8.get_unchecked_mut(col * k_blocks as usize + b) = d;
-                }
+        }
+    }
+
+    /// The two quantizations of the MoE half in one launch: blocks below
+    /// `total_a` run [`q5_quant_group`] over `xa` (the routed experts'
+    /// 32-value form), the rest [`q8_1_quant_block`] over `xb` (the shared
+    /// expert's q8_1). Both read only their own source and write only their
+    /// own outputs, and the two sources do not alias, so this is one launch
+    /// where there were two — not a change of work.
+    ///
+    /// The arm is a block-uniform branch and each body is the one its own
+    /// kernel calls, so each output is the bytes its own launch would have
+    /// written. The two geometries differ (a q5 group is four 32-value
+    /// blocks, a q8_1 block is 128 values) and stay separate: nothing is
+    /// reduced across the arm.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            xa.len() >= m_a * k_blocks * 32,
+            qa.len() >= m_a * q_stride,
+            s8a.len() >= m_a * k_blocks,
+            d8a.len() >= m_a * k_blocks,
+            xb.len() >= m_b * 256 * n_sb,
+            q3b.len() >= m_b * 64 * half_it,
+            q4b.len() >= m_b * 256 * quad_it,
+            q6b.len() >= m_b * 128 * half_it,
+            s8b.len() >= m_b * 8 * n_sb,
+            d8b.len() >= m_b * 2 * n_sb
+        )
+    )]
+    pub fn q5_q8_1_quantize_pair(
+        xa: &[f32],
+        xb: &[f32],
+        m_a: u32,
+        n_groups: u32,
+        k_blocks: u32,
+        q_stride: u32,
+        m_b: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut qa: DisjointSlice<u32>,
+        mut s8a: DisjointSlice<i32>,
+        mut d8a: DisjointSlice<f32>,
+        mut q3b: DisjointSlice<u64>,
+        mut q4b: DisjointSlice<u32>,
+        mut q6b: DisjointSlice<u32>,
+        mut s8b: DisjointSlice<i32>,
+        mut d8b: DisjointSlice<f32>,
+    ) {
+        let blk = thread::index_1d().get() / 32;
+        let total_a = m_a as usize * n_groups as usize;
+        let n_sb = n_sb as usize;
+        let total_b = m_b as usize * 2 * n_sb;
+        if blk >= total_a + total_b {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY (both arms): the arm's index is inside its own total, so
+        // the column and group/block indices below are in range, and the
+        // launch contract bounds that arm's source and outputs. The arm is
+        // chosen by the block index, so a warp never splits across it.
+        unsafe {
+            if blk < total_a {
+                let (col, g) = (blk / n_groups as usize, blk % n_groups as usize);
+                q5_quant_group(
+                    xa, col, g, k_blocks, q_stride, lane, &mut qa, &mut s8a, &mut d8a,
+                );
+            } else {
+                let k = blk - total_a;
+                let (col, b) = (k / (2 * n_sb), k % (2 * n_sb));
+                q8_1_quant_block(
+                    xb, 0, col, b, n_sb, half_it, quad_it, lane, &mut q3b, &mut q4b, &mut q6b,
+                    &mut s8b, &mut d8b,
+                );
             }
         }
     }
@@ -855,6 +974,68 @@ impl Q5Kernels {
             &mut act.q,
             &mut act.s8,
             &mut act.d8,
+        )?;
+        Ok(())
+    }
+
+    /// Both MoE quantizations in one launch: `xa` into the routed experts'
+    /// 32-value scratch `a`, `xb` into the shared expert's q8_1 scratch `b`.
+    /// The bytes are the ones `enqueue_quantize_q8(xa, a)` and
+    /// `Gpu::enqueue_quantize_q8_1(xb, b)` write, so the two sources must
+    /// not alias and the caller must have enqueued both producers first.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_quantize_q8_pair(
+        &self,
+        stream: &CudaStream,
+        xa: &DeviceBuffer<f32>,
+        a: &mut Q8Blocks32,
+        xb: &DeviceBuffer<f32>,
+        b: &mut crate::tensor::Q8Act,
+    ) -> Result<(), GpuError> {
+        let (m_a, k_blocks, q_stride) = (a.m(), a.k() / 32, a.q_stride());
+        if xa.len() < m_a * k_blocks * 32 {
+            return Err(format!(
+                "enqueue_quantize_q8_pair: xa.len() {len} < m*k = {need}",
+                len = xa.len(),
+                need = m_a * k_blocks * 32
+            )
+            .into());
+        }
+        let (m_b, n_sb) = (b.m(), b.n_sb());
+        if xb.len() < m_b * b.k() {
+            return Err(format!(
+                "enqueue_quantize_q8_pair: xb.len() {len} < m*k = {need}",
+                len = xb.len(),
+                need = m_b * b.k()
+            )
+            .into());
+        }
+        let n_groups = k_blocks.div_ceil(4);
+        let blocks = m_a * n_groups + m_b * 2 * n_sb;
+        let prep = self
+            .module
+            .prepare_q5_q8_1_quantize_pair(LaunchConfig1D::new(blocks as u32, 32, 0))?;
+        self.module.q5_q8_1_quantize_pair(
+            stream,
+            &prep,
+            xa,
+            xb,
+            m_a as u32,
+            n_groups as u32,
+            k_blocks as u32,
+            q_stride as u32,
+            m_b as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            n_sb.div_ceil(4) as u32,
+            &mut a.q,
+            &mut a.s8,
+            &mut a.d8,
+            &mut b.q3,
+            &mut b.q4,
+            &mut b.q6,
+            &mut b.s8,
+            &mut b.d8,
         )?;
         Ok(())
     }

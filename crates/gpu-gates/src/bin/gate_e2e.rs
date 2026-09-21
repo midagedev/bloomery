@@ -107,10 +107,29 @@ fn data_file(name: &str) -> std::path::PathBuf {
 /// `NODES_LAYER1` = 24, each plus one merge on a split cache):
 /// (19 + 1) + 26 × (24 + 1) + 27 + 4 = 20 + 650 + 27 + 4 = 701. Both merges
 /// carry a value-neutral rollback lever (`StepProbe::split_heads`,
-/// `split_kqvc`); with both set the chain captures 755 again, and its
-/// tokens are identical to the default path's.
+/// `split_kqvc`). Since the fmerge round the levers nest, so restoring the
+/// original 755 takes all four of them; measured at `--ctx 256` (lead,
+/// 2026-09-22): none 648, `split_heads`+`split_flash_quant` **702**,
+/// plus `split_kqvc` 729, plus `split_moe_quant` **755**. The tokens are
+/// identical to the default path's at every one of those counts.
+/// `split_kqvc` alone does nothing — there is no pair launch to split until
+/// `split_flash_quant` restores one — so `generate` refuses that
+/// combination rather than reading as a broken lever.
+///
+/// PIN(2026-09-22, fmerge round): 701 → 648. Two launches left every
+/// routed layer and one left block 0: the `kqvc` q8_1 quantization became a
+/// side output of the attention launch (every layer), and the MoE half's
+/// two quantize launches became one `moe_quantize_pair` (routed layers
+/// only). Derivation on the new pins (`NODES_BLOCK0` = 18,
+/// `NODES_LAYER1` = 22, each plus one merge on a split cache — `CTX_MAX`
+/// 256 is split): (18 + 1) + 26 × (22 + 1) + 27 residual copies + the
+/// head's 4 = 19 + 598 + 27 + 4 = 648. FAIL-first held: the same source
+/// with this constant still 701 printed `graph graph_nodes=648 want=701
+/// eager_vs_graph_identical=true FAIL`, with the token classes and the
+/// determinism arm unchanged. Both new merges carry a value-neutral
+/// rollback lever (`StepProbe::split_flash_quant`, `split_moe_quant`).
 #[cfg(feature = "gpu")]
-const NODES_CHAIN: usize = 701;
+const NODES_CHAIN: usize = 648;
 
 /// The argmax-only reference (`argmax-ik-cuda.tsv`): each data row's id,
 /// its argmax and its top-5 ids. `gpu_gates::prompts::read_greedy` rejects

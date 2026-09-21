@@ -43,6 +43,8 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::GpuModel;
 #[cfg(feature = "gpu")]
+use bloomery_gpu::model::StepProbe;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
@@ -80,8 +82,21 @@ const ROUTER_BAND: f32 = 1e-5;
 /// PIN(2026-09-21, lfold round): 25 → 24. The attention half's two
 /// `quantize_q8_1(kqvc_*)` launches became one whose grid covers both
 /// halves. Derivation: 14 attention ops + 10 routed FFN ops = 24.
+///
+/// PIN(2026-09-22, fmerge round): 24 → 22, one launch from each half. The
+/// attention half's `quantize_q8_1(kqvc)` is now a side output of the
+/// attention launch itself (13 attention ops). The FFN half's
+/// `moe_expert_quantize_q8` and `shexp_quantize_q8_1` became one
+/// `moe_quantize_pair` carrying both geometries, which the shared expert's
+/// `gate_up_swiglu` moving earlier makes adjacent (9 routed FFN ops).
+/// Derivation: 13 + 9 = 22. FAIL-first held: the same source with this
+/// constant still 24 printed `FAIL: layer 1 captures 22 nodes, the pin is
+/// 24 — a launch was added or removed` while every bit-identity arm stayed
+/// green, including the two new `merge` arms that compare each shape
+/// against the launches it replaced. Both carry a value-neutral rollback
+/// lever (`StepProbe::split_flash_quant`, `split_moe_quant`).
 #[cfg(feature = "gpu")]
-const NODES_LAYER1: usize = 24;
+const NODES_LAYER1: usize = 22;
 /// PIN(2026-09-21): slots the routing probe's input moves. The probe is the
 /// first `l_out-0` column that routes differently from the last token's, so
 /// both id vectors are fixed by the dump and the router alone: `[5, 38, 8,
@@ -280,7 +295,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ok = false;
     }
 
+    // ---- (c2) the two merged launch shapes of this layer are bit-identical
+    // to the launch shapes they replaced. `split_flash_quant` puts the
+    // `kqvc` quantization back on a launch of its own instead of riding
+    // inside the attention launch; `split_moe_quant` splits the MoE half's
+    // one mixed-geometry quantize back into its two. Both are launch moves
+    // that may not move a value, and this is the arm that says so — a scale
+    // reduced over a different set of values changes every byte quantized
+    // with it, which no band on `l_out` sees reliably.
+    for (what, probe) in [
+        (
+            "split_flash_quant",
+            StepProbe {
+                split_flash_quant: true,
+                ..StepProbe::default()
+            },
+        ),
+        (
+            "split_moe_quant",
+            StepProbe {
+                split_moe_quant: true,
+                ..StepProbe::default()
+            },
+        ),
+    ] {
+        model.set_probe(probe)?;
+        model.seed_layer_cache(LAYER, &seed5)?;
+        let taps_split = model.step_layer_taps(LAYER, &column(last), last as u32)?;
+        model.set_probe(StepProbe::default())?;
+        let same = taps1.bits_equal(&taps_split);
+        println!("merge {what}_bit_identical={same} {}", verdict(same));
+        if !same {
+            ok = false;
+        }
+    }
+
     // ---- (d) captured graph: replay bit-identical to eager
+    model.seed_layer_cache(LAYER, &seed5)?;
     let nodes = model.capture_layer(LAYER)?;
     model.seed_layer_cache(LAYER, &seed5)?;
     model.replay_layer(LAYER, &column(last), last as u32)?;

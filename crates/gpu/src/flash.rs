@@ -66,7 +66,8 @@
 //! tile wholly inside the limit reads only real rows and needs no guard.
 
 use crate::GpuError;
-use crate::tensor::DeviceTensor;
+use crate::q8_1_quant_vals;
+use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::cvt_f32_f16x2_lo;
 use cuda_device::{
@@ -324,6 +325,124 @@ mod flash_kernels {
         }
     }
 
+    /// [`flash_latent`] with [`flash_merge_q8`]'s q8_1 side output. The
+    /// single-segment path never reaches the merge, so without this twin a
+    /// cache short enough to hold one segment would take the folded step
+    /// down a path that does not quantize at all — the two paths have to
+    /// agree or neither may fold.
+    ///
+    /// The staging buffer is `QROW`, the query row's own: the last read of
+    /// it is inside `latent_range`, which ends at a `sync_threads` before
+    /// this writes.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            q.len() >= q_rows * (rope_dims + latent),
+            kv.len() >= dst_rows * (rope_dims + latent),
+            y.len() >= q_rows * latent,
+            q3a.len() >= m_lo * 64 * half_it,
+            q4a.len() >= m_lo * 256 * quad_it,
+            q6a.len() >= m_lo * 128 * half_it,
+            s8a.len() >= m_lo * 8 * n_sb,
+            d8a.len() >= m_lo * 2 * n_sb,
+            q3b.len() >= (q_rows - m_lo) * 64 * half_it,
+            q4b.len() >= (q_rows - m_lo) * 256 * quad_it,
+            q6b.len() >= (q_rows - m_lo) * 128 * half_it,
+            s8b.len() >= (q_rows - m_lo) * 8 * n_sb,
+            d8b.len() >= (q_rows - m_lo) * 2 * n_sb
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_latent_q8(
+        q: &[f32],
+        kv: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        rope_dims: u32,
+        latent: u32,
+        dst_rows: u32,
+        m_lo: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut y: DisjointSlice<f32>,
+        mut q3a: DisjointSlice<u64>,
+        mut q4a: DisjointSlice<u32>,
+        mut q6a: DisjointSlice<u32>,
+        mut s8a: DisjointSlice<i32>,
+        mut d8a: DisjointSlice<f32>,
+        mut q3b: DisjointSlice<u64>,
+        mut q4b: DisjointSlice<u32>,
+        mut q6b: DisjointSlice<u32>,
+        mut s8b: DisjointSlice<i32>,
+        mut d8b: DisjointSlice<f32>,
+    ) {
+        static mut QROW: SharedArray<f32, MAX_WIDTH> = SharedArray::UNINIT;
+        static mut KLOG: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
+        static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
+
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        if row >= q_rows as usize {
+            return; // block-uniform: no barrier and no warp collective is skipped
+        }
+        let rope = rope_dims as usize;
+        let lat = latent as usize;
+        // SAFETY: as in `flash_latent` — each `static mut` is this block's
+        // own shared allocation, every access bounded and ordered by
+        // `sync_threads`.
+        let (qs, klog, kw, st) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut QROW),
+                SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                SharedArray::as_raw_mut_ptr(&raw mut KW),
+                SharedArray::as_raw_mut_ptr(&raw mut ST),
+            )
+        };
+        let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
+        // SAFETY: the pointers are this block's shared scratch, `row` is
+        // inside q's rows and `0..limit` inside kv's (launch contract).
+        let (_, s_sum, r) = unsafe {
+            latent_range(
+                q, kv, qs, klog, kw, st, row, tid, 0, limit, rope, lat, scale,
+            )
+        };
+
+        if tid == 0 {
+            // SAFETY: thread 0 alone writes ST[1]; no thread reads it before
+            // the barrier below. `s_sum` is the block state, valid in warp 0.
+            unsafe {
+                *st.add(1) = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
+            }
+        }
+        thread::sync_threads();
+        // SAFETY: ST[1] is published above.
+        let s_inv = unsafe { *st.add(1) };
+        let v = s_inv * r;
+        // SAFETY: row < q_rows and tid < LATENT = latent (host-validated),
+        // so the store is inside y's row segment (launch contract).
+        unsafe {
+            *y.get_unchecked_mut(row * lat + tid) = v;
+        }
+        // SAFETY: `qs` is this block's `MAX_WIDTH >= LATENT` shared array
+        // and its last read is inside `latent_range`, before the barrier
+        // above; the helper's own preconditions hold as in `flash_merge_q8`.
+        unsafe {
+            quant_row(
+                v, qs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
+                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b,
+            );
+        }
+    }
+
     /// The segment pass of the split launch: block `(row, segment)` attends
     /// keys `[segment * seg_keys, min((segment + 1) * seg_keys, limit))` of
     /// query row `row` and writes that segment's partials — `part_ms` holds
@@ -464,6 +583,139 @@ mod flash_kernels {
             return; // block-uniform
         }
         let lat = latent as usize;
+        // SAFETY: row < q_rows and tid < LATENT = latent (host-validated),
+        // so the store is inside y's row segment (launch contract), and the
+        // partial reads are inside theirs.
+        unsafe {
+            let v = merge_row(
+                n_keys_buf, m, n_heads, dst_rows, segs, seg_keys, part_v, part_ms, row, tid, lat,
+            );
+            *y.get_unchecked_mut(row * lat + tid) = v;
+        }
+    }
+
+    /// [`flash_merge`] with the q8_1 side output: the same fold, the same
+    /// `y`, and the merged row also leaves the block as the quantized
+    /// activation the `wv_b` gemv reads — so the quantize launch that used
+    /// to follow is deleted rather than merged.
+    ///
+    /// A block already holds a whole head's `latent` = 512 values, which is
+    /// exactly four whole q8_1 blocks, so the scale reduction's partition is
+    /// unchanged: warp `w` of the first four takes 128-value block `w` with
+    /// lane ℓ holding values `4ℓ .. +3`, the same 32 lanes over the same 128
+    /// values the standalone quantizer's warp had. The values go through
+    /// shared memory because this kernel's threads hold one latent dim each
+    /// and the quantizer's lanes want four consecutive — a transpose inside
+    /// the block, not a different set of values.
+    ///
+    /// Rows below `m_lo` quantize into the `_a` outputs at column `row`, the
+    /// rest into `_b` at column `row − m_lo`: the same split
+    /// `q3k_quantize_q8_1_pair` made over the two halves of `kqvc`. The
+    /// branch is on the block index, so no warp splits across it.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2,
+            y.len() >= q_rows * latent,
+            q3a.len() >= m_lo * 64 * half_it,
+            q4a.len() >= m_lo * 256 * quad_it,
+            q6a.len() >= m_lo * 128 * half_it,
+            s8a.len() >= m_lo * 8 * n_sb,
+            d8a.len() >= m_lo * 2 * n_sb,
+            q3b.len() >= (q_rows - m_lo) * 64 * half_it,
+            q4b.len() >= (q_rows - m_lo) * 256 * quad_it,
+            q6b.len() >= (q_rows - m_lo) * 128 * half_it,
+            s8b.len() >= (q_rows - m_lo) * 8 * n_sb,
+            d8b.len() >= (q_rows - m_lo) * 2 * n_sb
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_merge_q8(
+        n_keys_buf: &[u32],
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        m_lo: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        mut y: DisjointSlice<f32>,
+        mut q3a: DisjointSlice<u64>,
+        mut q4a: DisjointSlice<u32>,
+        mut q6a: DisjointSlice<u32>,
+        mut s8a: DisjointSlice<i32>,
+        mut d8a: DisjointSlice<f32>,
+        mut q3b: DisjointSlice<u64>,
+        mut q4b: DisjointSlice<u32>,
+        mut q6b: DisjointSlice<u32>,
+        mut s8b: DisjointSlice<i32>,
+        mut d8b: DisjointSlice<f32>,
+    ) {
+        static mut VROW: SharedArray<f32, LATENT> = SharedArray::UNINIT;
+
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        if row >= q_rows as usize {
+            return; // block-uniform
+        }
+        let lat = latent as usize;
+        // SAFETY: as in `flash_merge`.
+        let v = unsafe {
+            let v = merge_row(
+                n_keys_buf, m, n_heads, dst_rows, segs, seg_keys, part_v, part_ms, row, tid, lat,
+            );
+            *y.get_unchecked_mut(row * lat + tid) = v;
+            v
+        };
+        // SAFETY: VROW is this block's own shared allocation; tid < 512 =
+        // LATENT and every read below is bounded by the same length and
+        // ordered by the `sync_threads` inside the helper.
+        let vs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut VROW) };
+        // SAFETY: the launch contract bounds both output sets; `row` picks a
+        // column inside its own half, and the helper's preconditions on
+        // lane, block and geometry are the ones this kernel's block shape
+        // gives it.
+        unsafe {
+            quant_row(
+                v, vs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
+                &mut s8a, &mut d8a, &mut q3b, &mut q4b, &mut q6b, &mut s8b, &mut d8b,
+            );
+        }
+    }
+
+    /// One query row's fold over its segments' partials, the standard
+    /// online-softmax rescale in ascending segment order — the shared body
+    /// of [`flash_merge`] and [`flash_merge_q8`], so the two cannot drift.
+    /// Returns this thread's final latent value.
+    ///
+    /// SAFETY: `row < q_rows`, `tid < latent`, and the partial buffers hold
+    /// `q_rows * segs * latent` / `q_rows * segs * 2` elements.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn merge_row(
+        n_keys_buf: &[u32],
+        m: u32,
+        n_heads: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        row: usize,
+        tid: usize,
+        lat: usize,
+    ) -> f32 {
         let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
         let n_seg = limit.div_ceil(seg_keys as usize).min(segs as usize);
         let mut mx = f32::NEG_INFINITY;
@@ -473,7 +725,7 @@ mod flash_kernels {
         while seg < n_seg {
             let idx = row * segs as usize + seg;
             // SAFETY: idx < q_rows * segs, so both slots are inside part_ms
-            // (launch contract).
+            // (caller's contract).
             let (mj, sj) = unsafe {
                 (
                     *part_ms.get_unchecked(2 * idx),
@@ -504,10 +756,87 @@ mod flash_kernels {
             seg += 1;
         }
         let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
-        // SAFETY: row < q_rows and tid < LATENT = latent (host-validated),
-        // so the store is inside y's row segment (launch contract).
+        s_inv * acc
+    }
+
+    /// The q8_1 side output of a block that holds one whole column: thread
+    /// `tid` contributes its value `v`, the block transposes through shared
+    /// memory, and the first `lat / 128` warps each quantize one 128-value
+    /// block through `q8_1_quant_vals` — the one owner of that body.
+    ///
+    /// The transpose is what makes the fold bit-identical rather than merely
+    /// close: the quantizer's warp sees the same 128 values in the same
+    /// lanes as it would reading the stored column back, so its `amax` is
+    /// the same reduction over the same set.
+    ///
+    /// SAFETY: `vs` is the calling block's own `LATENT`-element shared
+    /// array, `tid < lat <= LATENT`, `lat` is a multiple of 128, `col` is a
+    /// column of the half `row` selects, and the launch contract bounds both
+    /// output sets.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn quant_row(
+        v: f32,
+        vs: *mut f32,
+        tid: usize,
+        lat: usize,
+        row: usize,
+        m_lo: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        q3a: &mut DisjointSlice<u64>,
+        q4a: &mut DisjointSlice<u32>,
+        q6a: &mut DisjointSlice<u32>,
+        s8a: &mut DisjointSlice<i32>,
+        d8a: &mut DisjointSlice<f32>,
+        q3b: &mut DisjointSlice<u64>,
+        q4b: &mut DisjointSlice<u32>,
+        q6b: &mut DisjointSlice<u32>,
+        s8b: &mut DisjointSlice<i32>,
+        d8b: &mut DisjointSlice<f32>,
+    ) {
+        // SAFETY: tid < lat <= LATENT, the shared array's length.
         unsafe {
-            *y.get_unchecked_mut(row * lat + tid) = s_inv * acc;
+            *vs.add(tid) = v;
+        }
+        thread::sync_threads();
+        let blk = tid / 32; // warp index, and the 128-value block it takes
+        if blk >= lat / 128 {
+            return; // warp-uniform: the collectives below stay full-warp
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: 128*blk + 4*lane + 3 < 128*(blk+1) <= lat <= LATENT.
+        let vals = unsafe {
+            let base = vs.add(128 * blk + 4 * lane);
+            [*base, *base.add(1), *base.add(2), *base.add(3)]
+        };
+        let n_sb = n_sb as usize;
+        // SAFETY (both arms): the values are block `blk`'s, held four per
+        // lane in value order, which is `q8_1_quant_vals`'s precondition;
+        // the column is inside the half's `m` and the launch contract bounds
+        // that half's five outputs. The branch is on the block index.
+        unsafe {
+            if row < m_lo as usize {
+                q8_1_quant_vals(
+                    vals, row, blk, n_sb, half_it, quad_it, lane, q3a, q4a, q6a, s8a, d8a,
+                );
+            } else {
+                q8_1_quant_vals(
+                    vals,
+                    row - m_lo as usize,
+                    blk,
+                    n_sb,
+                    half_it,
+                    quad_it,
+                    lane,
+                    q3b,
+                    q4b,
+                    q6b,
+                    s8b,
+                    d8b,
+                );
+            }
         }
     }
 
@@ -1068,6 +1397,190 @@ impl FlashKernels {
         )?;
         Ok(())
     }
+
+    /// [`FlashKernels::enqueue_flash_merge`] that also writes the q8_1 form
+    /// of the merged rows into `lo` and `hi`: the rows below `lo.m()` fill
+    /// `lo`'s columns in order, the rest `hi`'s. The bytes are the ones
+    /// `Gpu::enqueue_quantize_q8_1_pair(y, 0, lo, lo.m() * latent, hi)`
+    /// would have written, so this deletes that launch rather than merging
+    /// it. Asynchronous, allocation-free, capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_flash_merge_q8(
+        &self,
+        stream: &CudaStream,
+        n_keys_buf: &DeviceBuffer<u32>,
+        cache_rows: usize,
+        m: usize,
+        n_heads: usize,
+        latent: usize,
+        part_v: &DeviceBuffer<f32>,
+        part_ms: &DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+        lo: &mut Q8Act,
+        hi: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        let segs = segments_for(cache_rows);
+        let q_rows = m * n_heads;
+        if n_keys_buf.is_empty() {
+            return Err("enqueue_flash_merge_q8: n_keys_buf must hold 1 u32".into());
+        }
+        if latent != LATENT {
+            return Err(format!(
+                "enqueue_flash_merge_q8: this family's latent tail is {LATENT}, got {latent}"
+            )
+            .into());
+        }
+        check_partials(
+            "enqueue_flash_merge_q8",
+            part_v.len(),
+            part_ms.len(),
+            q_rows,
+            segs,
+            latent,
+        )?;
+        if y.len() < q_rows * latent {
+            return Err(format!(
+                "enqueue_flash_merge_q8: y.len() {} < m*n_heads*latent = {}",
+                y.len(),
+                q_rows * latent
+            )
+            .into());
+        }
+        let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge_q8", lo, hi, q_rows, latent)?;
+        let prep = self.module.prepare_flash_merge_q8(LaunchConfig1D::new(
+            q_rows as u32,
+            LATENT as u32,
+            0,
+        ))?;
+        self.module.flash_merge_q8(
+            stream,
+            &prep,
+            n_keys_buf,
+            m as u32,
+            n_heads as u32,
+            q_rows as u32,
+            latent as u32,
+            cache_rows as u32,
+            segs as u32,
+            seg_keys() as u32,
+            m_lo as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            n_sb.div_ceil(4) as u32,
+            part_v,
+            part_ms,
+            y,
+            &mut lo.q3,
+            &mut lo.q4,
+            &mut lo.q6,
+            &mut lo.s8,
+            &mut lo.d8,
+            &mut hi.q3,
+            &mut hi.q4,
+            &mut hi.q6,
+            &mut hi.s8,
+            &mut hi.d8,
+        )?;
+        Ok(())
+    }
+
+    /// [`FlashKernels::enqueue_flash_latent`] with the same q8_1 side output
+    /// as [`FlashKernels::enqueue_flash_merge_q8`] — the single-segment path,
+    /// so both paths of the folded step quantize.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_flash_latent_q8(
+        &self,
+        stream: &CudaStream,
+        q: &DeviceBuffer<f32>,
+        kv: &DeviceTensor<u16>,
+        n_keys_buf: &DeviceBuffer<u32>,
+        scale: f32,
+        m: usize,
+        n_heads: usize,
+        rope_dims: usize,
+        latent: usize,
+        y: &mut DeviceBuffer<f32>,
+        lo: &mut Q8Act,
+        hi: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        let q_rows = check_flash(
+            "enqueue_flash_latent_q8",
+            q.len(),
+            kv,
+            n_keys_buf.len(),
+            m,
+            n_heads,
+            rope_dims,
+            latent,
+            Some(y.len()),
+        )?;
+        let (m_lo, n_sb) = check_side_quant("enqueue_flash_latent_q8", lo, hi, q_rows, latent)?;
+        let prep = self.module.prepare_flash_latent_q8(LaunchConfig1D::new(
+            q_rows as u32,
+            LATENT as u32,
+            0,
+        ))?;
+        self.module.flash_latent_q8(
+            stream,
+            &prep,
+            q,
+            kv.buf(),
+            n_keys_buf,
+            scale,
+            m as u32,
+            n_heads as u32,
+            q_rows as u32,
+            rope_dims as u32,
+            latent as u32,
+            kv.rows() as u32,
+            m_lo as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            n_sb.div_ceil(4) as u32,
+            y,
+            &mut lo.q3,
+            &mut lo.q4,
+            &mut lo.q6,
+            &mut lo.s8,
+            &mut lo.d8,
+            &mut hi.q3,
+            &mut hi.q4,
+            &mut hi.q6,
+            &mut hi.s8,
+            &mut hi.d8,
+        )?;
+        Ok(())
+    }
+}
+
+/// The side output's shape check, shared by the two q8 twins: the two
+/// scratches must together cover the launch's query rows one column each,
+/// at the latent width, and `lat / 128` must be the block count per column
+/// a 512-thread block can quantize in one pass. Returns `(lo.m(), n_sb)`.
+fn check_side_quant(
+    what: &str,
+    lo: &Q8Act,
+    hi: &Q8Act,
+    q_rows: usize,
+    latent: usize,
+) -> Result<(usize, usize), GpuError> {
+    if lo.k() != latent || hi.k() != latent {
+        return Err(format!(
+            "{what}: the side scratches' k must be the latent width {latent}, got {} and {}",
+            lo.k(),
+            hi.k()
+        )
+        .into());
+    }
+    if lo.m() + hi.m() != q_rows {
+        return Err(format!(
+            "{what}: the side scratches hold {} + {} columns, the launch has {q_rows} query rows",
+            lo.m(),
+            hi.m()
+        )
+        .into());
+    }
+    Ok((lo.m(), lo.n_sb()))
 }
 
 /// The partials both split launches share.

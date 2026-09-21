@@ -63,6 +63,8 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::GpuModel;
 #[cfg(feature = "gpu")]
+use bloomery_gpu::model::StepProbe;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
@@ -109,8 +111,21 @@ const FENCE: f32 = 0.25;
 /// Both merges carry a value-neutral rollback lever
 /// (`StepProbe::split_heads`, `split_kqvc`), so this count is the default
 /// path's, not the only one the binary can capture.
+///
+/// PIN(2026-09-22, fmerge round): 19 → 18. The `kqvc` q8_1 quantization
+/// stopped being a launch: the attention launch's last kernel already holds
+/// one head's whole latent row per block, so it emits the quantized form as
+/// a side output (`flash_latent_q8` on a one-segment cache,
+/// `flash_merge_q8` on a split one). Derivation: 19 − 1, the whole
+/// `quantize_q8_1(kqvc)` node. FAIL-first held: the same source with this
+/// constant still 19 printed `FAIL: block 0 captures 18 nodes, the pin is
+/// 19 (NODES_BLOCK0 19 + 0 for the flash merge)` while every bit-identity
+/// arm stayed green, the new `fold` arm included. The rollback lever is
+/// `StepProbe::split_flash_quant`, which puts the quantize back on its own
+/// launch (and is what `split_kqvc` now needs to be set with to have any
+/// effect at all).
 #[cfg(feature = "gpu")]
-const NODES_BLOCK0: usize = 19;
+const NODES_BLOCK0: usize = 18;
 /// Print-only markers for the profile table, not gates: an op touching at
 /// least a mebibyte should be paying for bytes, not for its launch, so one
 /// that stays under this effective bandwidth is a shape-defect candidate the
@@ -303,6 +318,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ok = false;
     }
 
+    // ---- (b2) the folded q8_1 side output is bit-identical to the
+    // standalone quantize launch. `kqvc`'s quantization moved inside the
+    // attention launch, where a block holds one head's whole latent row;
+    // this asserts what that move is only allowed to be — the same bytes,
+    // reached by a different launch shape. It is the arm that would catch a
+    // scale computed over a different set of values, which changes every
+    // byte quantized with it and which no band on `l_out` is sharp enough to
+    // see reliably.
+    model.set_probe(StepProbe {
+        split_flash_quant: true,
+        ..StepProbe::default()
+    })?;
+    let taps_split = model.step_block0_taps(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32)?;
+    model.set_probe(StepProbe::default())?;
+    let fold_same = taps1.bits_equal(&taps_split);
+    println!(
+        "fold folded_quant_bit_identical_to_split_launch={fold_same} {}",
+        verdict(fold_same)
+    );
+    if !fold_same {
+        ok = false;
+    }
+
     // ---- (c) captured graph: replay bit-identical to eager
     let nodes = model.capture_block0()?;
     model.replay_block0(PROMPT[M_TOKENS - 1], (M_TOKENS - 1) as u32)?;
@@ -470,24 +508,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // The FFN half starts at the layer's own norm: the fused dense four
         // for a layer without a router, the routed ten for a layer with one.
-        let (anchor, want_ffn_ops) = match ops.iter().any(|o| o.name == "moe_ffn_norm_quant") {
-            true => ("moe_ffn_norm_quant", 10),
-            false => ("ffn_norm_quant", 4),
+        // The FFN half runs from the layer's own norm to the op that writes
+        // the block output. Both ends are named, and the count between them
+        // is derived — it used to be a literal (10 routed, 4 dense), which
+        // is a restatement of the chain that goes stale the first time two
+        // launches inside the half merge, and does so inside `--profile`,
+        // the measurement path, rather than in a gate. What is worth
+        // asserting is the boundary, not the launch count: the anchor must
+        // exist exactly once, and the last op must be the terminal.
+        let (anchor, terminal) = match ops.iter().any(|o| o.name == "moe_ffn_norm_quant") {
+            true => ("moe_ffn_norm_quant", "moe_combine"),
+            false => ("ffn_norm_quant", "ffn_down_add"),
         };
+        let anchors = ops.iter().filter(|o| o.name == anchor).count();
+        if anchors != 1 {
+            return Err(format!(
+                "gate_p8: the profile holds {anchors} ops named {anchor}, want exactly one — \
+                 the FFN split point is ambiguous"
+            )
+            .into());
+        }
         let ffn_start = ops
             .iter()
             .position(|o| o.name == anchor)
             .ok_or("gate_p8: the profile holds no FFN norm op")?;
-        if ops.len() - ffn_start != want_ffn_ops {
-            return Err(format!(
-                "gate_p8: the FFN half is {} ops after {ffn_start}, want the {want_ffn_ops} of \
-                 the {anchor} shape",
-                ops.len() - ffn_start
-            )
-            .into());
+        match ops.last() {
+            Some(o) if o.name == terminal => {}
+            Some(o) => {
+                return Err(format!(
+                    "gate_p8: the profile's last op is {}, want {terminal} — the {anchor} \
+                     shape does not end where the block output is written",
+                    o.name
+                )
+                .into());
+            }
+            None => return Err("gate_p8: the profile holds no ops".into()),
         }
+        let want_ffn_ops = ops.len() - ffn_start;
         println!(
             "prof reps={PROF_REPS} warmup=20 layer={profile_layer} ops={} \
+             ffn_shape={anchor}..{terminal} ffn_ops_derived={want_ffn_ops} \
              sync_floor_samples={PROF_REPS} sample=eager_launch+body+one_sync pos={prof_pos} \
              n_keys={} ctx_max={ctx_max} seg_keys={} flash_segs={}",
             ops.len(),
@@ -638,11 +698,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// traffic — so the pair prices the runtime column guards on their own,
 /// with no kernel change. `_sel` also reads one `sel` word before its first
 /// weight load, a round trip `q3k_gemv` does not pay, so the pair's gap is
-/// a lower bound on the guards' cost. Weights and activations are zeroed
-/// buffers: neither core branches on a value, only on lane- and
-/// launch-derived indices.
+/// a lower bound on the guards' cost.
+///
+/// Weight and activation bytes come from [`fill_pattern`], a fixed
+/// non-trivial bit pattern. A K-quant core's control flow does not branch on
+/// a value, but its f16 scale decode does: `cores::half_to_f32` takes its
+/// cheapest arm on a zero, so a zeroed weight buffer makes every arm that
+/// runs a decode path read faster than the step it is meant to predict. The
+/// pattern is not modelled on any weight distribution — it exists so that no
+/// decode arm is skipped, and nothing here asserts on the results.
+///
+/// The `gap_*` arms are not gemvs: they are the grid-barrier trio
+/// (`probe::GapArm`) at the grids a fold would use. Their subtractions give
+/// the cooperative launch's price and the barrier's price in the same
+/// instrument, and against the same `touch` floor, as the node price.
 #[cfg(feature = "gpu")]
 fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
+    use bloomery_gpu::probe::{GAP_THREADS, GapArm};
     use bloomery_gpu::{DeviceTensor, GpuError, Graph, Q8Act};
     use cuda_core::{CudaStream, DeviceBuffer};
 
@@ -703,7 +775,10 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
     let stream = gpu.stream();
     let probe = bloomery_gpu::probe::Probe::load(gpu.context())?;
 
-    let x = DeviceBuffer::<f32>::zeroed(stream, 2048)?;
+    // The f32 activation column every arm reads, and the source the q8
+    // scratch below is quantized from: a real spread of exponents and signs
+    // rather than a buffer of zeros.
+    let x = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(2048))?;
     let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
     let mut probs = DeviceBuffer::<f32>::zeroed(stream, 64)?;
     let mut ids = DeviceBuffer::<u32>::zeroed(stream, 6)?;
@@ -749,8 +824,10 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
     // constant-folded `_sel` launch over the same rows.
     for (rows, k) in [(576usize, 2048usize), (3072, 2048), (8448, 2048)] {
         let n_sb = k / 256;
-        let act = Q8Act::with_k(stream, 1, k)?;
-        let w = DeviceTensor::<u32>::zeroed(stream, rows, 110 * n_sb / 4)?;
+        let mut act = Q8Act::with_k(stream, 1, k)?;
+        gpu.enqueue_quantize_q8_1(&x, &mut act)?;
+        let cols = 110 * n_sb / 4;
+        let w = DeviceTensor::<u32>::upload(stream, &fill_pattern(rows * cols), rows, cols)?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, rows)?;
         // The profile's byte convention: the weight rows the launch reads,
         // the activation buffers it addresses, and the outputs it writes.
@@ -780,8 +857,13 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
     // for this core — the guard lever itself is the measurement there.
     for (rows, k) in [(2048usize, 2048usize), (2048, 2816), (8192, 2048)] {
         let n_sb = k / 256;
-        let act = Q8Act::with_k(stream, 1, k)?;
-        let w = DeviceTensor::<u32>::zeroed(stream, rows, 36 * n_sb)?;
+        let mut act = Q8Act::with_k(stream, 1, k)?;
+        // Bound, not a temporary: the quantize is asynchronous, so the
+        // source has to outlive the launch rather than the statement.
+        let xk = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(k))?;
+        gpu.enqueue_quantize_q8_1(&xk, &mut act)?;
+        let cols = 36 * n_sb;
+        let w = DeviceTensor::<u32>::upload(stream, &fill_pattern(rows * cols), rows, cols)?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, rows)?;
         let bytes = (rows * 144 * n_sb
             + 4 * 256 * n_sb.div_ceil(4)
@@ -793,6 +875,27 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
         let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
         let r = replay(stream, &g)?;
         print_arm(&format!("q4k_gemv_k{k}"), rows, bytes, g.node_count(), e, r);
+        // The standing control for `fill_pattern`: the same shape over a
+        // zeroed weight, which is what this bench fed every arm before the
+        // pattern fill. It is here so the gap stays visible rather than
+        // becoming a claim in a log — a zero f16 takes `half_to_f32`'s
+        // cheapest arm, so a decode-path arm reads faster than the step it
+        // is meant to predict.
+        if (rows, k) == (2048, 2048) {
+            let wz = DeviceTensor::<u32>::zeroed(stream, rows, cols)?;
+            let mut enq = |_s: &CudaStream| gpu.enqueue_gemv_q4k(&wz, &act, &mut y);
+            let e = burst(stream, &mut enq)?;
+            let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+            let r = replay(stream, &g)?;
+            print_arm(
+                &format!("q4k_gemv_k{k}_zerow"),
+                rows,
+                bytes,
+                g.node_count(),
+                e,
+                r,
+            );
+        }
     }
 
     // Q6_K at the lm_head's own width. The head launches once per step, not
@@ -802,8 +905,10 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
     {
         let (rows, k) = (102_400usize, 2048usize);
         let n_sb = k / 256;
-        let act = Q8Act::with_k(stream, 1, k)?;
-        let w = DeviceTensor::<u32>::zeroed(stream, rows, 210 * n_sb / 4)?;
+        let mut act = Q8Act::with_k(stream, 1, k)?;
+        gpu.enqueue_quantize_q8_1(&x, &mut act)?;
+        let cols = 210 * n_sb / 4;
+        let w = DeviceTensor::<u32>::upload(stream, &fill_pattern(rows * cols), rows, cols)?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, rows)?;
         let bytes =
             (rows * 210 * n_sb + 4 * 128 * n_sb.div_ceil(2) + 4 * 2 * n_sb + 4 * rows) as u64;
@@ -813,7 +918,68 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
         let r = replay(stream, &g)?;
         print_arm("q6k_gemv_lm_head", rows, bytes, g.node_count(), e, r);
     }
+
+    // The grid-barrier trio. The grids are the ones the three stopped folds
+    // would have launched at — 16 and 22 of this card's 82 SMs — plus one
+    // block per SM and two, so the reader can see whether either price is a
+    // function of the grid at all. Arm order inside a grid is fixed
+    // (plain, coop, coop_sync) and every arm is its own captured graph, so
+    // the subtraction is between two graph replays of the same shape.
+    for blocks in [16u32, 22, 82, 164] {
+        let mut y =
+            DeviceBuffer::<f32>::zeroed(stream, 2 * blocks as usize * GAP_THREADS as usize)?;
+        for arm in [GapArm::Plain, GapArm::Coop, GapArm::CoopSync] {
+            let mut enq = |s: &CudaStream| probe.enqueue_gap(s, arm, blocks, &mut y);
+            let e = burst(stream, &mut enq)?;
+            let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+            let r = replay(stream, &g)?;
+            // Two stores per thread, both halves written; the phase-B half
+            // holding 3.0 everywhere is what says the barrier arm got past
+            // its `grid::sync`.
+            let got = y.to_host_vec(stream)?;
+            let n = blocks as usize * GAP_THREADS as usize;
+            let phases_ok =
+                got[..n].iter().all(|&v| v == 1.0) && got[n..].iter().all(|&v| v == 3.0);
+            print_arm(
+                &format!("{}_b{blocks}_ok{}", arm.name(), u8::from(phases_ok)),
+                blocks as usize,
+                8 * n as u64,
+                g.node_count(),
+                e,
+                r,
+            );
+            if !phases_ok {
+                return Err(format!(
+                    "gate_p8 bench: {} at {blocks} blocks did not write both phases",
+                    arm.name()
+                )
+                .into());
+            }
+        }
+    }
     Ok(())
+}
+
+/// A fixed non-trivial u32 pattern — a multiplicative hash of the index,
+/// which spreads bits through every byte and every f16 field a K-quant
+/// super-block carries. Not a model of any weight distribution: its one job
+/// is that no value-dependent decode path (`half_to_f32`'s zero arm above
+/// all) is skipped by a buffer of zeros.
+#[cfg(feature = "gpu")]
+fn fill_pattern(n: usize) -> Vec<u32> {
+    (0..n)
+        .map(|i| (i as u32).wrapping_mul(2_654_435_761) ^ 0x9E37_79B9)
+        .collect()
+}
+
+/// The same pattern as f32 activations, mapped into roughly ±1 so a
+/// quantization of it exercises rounding rather than saturation.
+#[cfg(feature = "gpu")]
+fn fill_pattern_f32(n: usize) -> Vec<f32> {
+    fill_pattern(n)
+        .into_iter()
+        .map(|w| (w >> 8) as f32 / 8_388_608.0 - 1.0)
+        .collect()
 }
 
 /// One `bench` row: the eager burst and the graph replay of the same launch,
