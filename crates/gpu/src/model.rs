@@ -685,6 +685,11 @@ struct LayerScratch {
     /// The routed half's arena — present iff the stage holds a routed layer.
     moe: Option<MoeScratch>,
     l_out: DeviceBuffer<f32>,
+    /// Flash split partials: `Σ exp·V` per (query row, key segment), and
+    /// the `(running max, Σ exp)` pair beside it. Sized at load from the
+    /// cache height, so the split launch allocates nothing per step.
+    part_v: DeviceBuffer<f32>,
+    part_ms: DeviceBuffer<f32>,
     g_kvr: Gather,
     g_f_rope_lo: Gather,
     g_f_rope_hi: Gather,
@@ -713,6 +718,8 @@ impl LayerScratch {
             &self.ffn_inp,
             &self.l_out,
             &self.cs_buf,
+            &self.part_v,
+            &self.part_ms,
         ]
         .iter()
         .map(|b| b.num_bytes())
@@ -1107,7 +1114,7 @@ impl GpuModel {
             Some(n) => Some(MoeDims::read(gguf, &weights, n)?),
             None => None,
         };
-        let scratch = LayerScratch::new(stream, &weights, &mla, &names, moe.as_ref())?;
+        let scratch = LayerScratch::new(stream, &weights, &mla, &names, moe.as_ref(), ctx_max)?;
         let kv_width = mla.latent + mla.rope_dims;
         let kv = (0..layers.len())
             .map(|_| DeviceTensor::<u16>::zeroed(stream, ctx_max, kv_width))
@@ -1818,6 +1825,7 @@ impl LayerScratch {
         mla: &MlaParams,
         names: &[LayerNames],
         moe: Option<&MoeDims>,
+        ctx_max: usize,
     ) -> Result<LayerScratch, GpuError> {
         let first = names
             .first()
@@ -1953,6 +1961,8 @@ impl LayerScratch {
                 }),
                 "f_rope_hi",
             )?,
+            part_v: f32n(crate::flash::partials_v_len(mla.n_head, ctx_max))?,
+            part_ms: f32n(crate::flash::partials_ms_len(mla.n_head, ctx_max))?,
             pos_buf: DeviceBuffer::from_host(stream, &[0u32])?,
             n_keys_buf: DeviceBuffer::from_host(stream, &[1u32])?,
             token_buf: DeviceBuffer::from_host(stream, &[0u32])?,
@@ -2180,19 +2190,53 @@ fn enqueue_attn(
     gpu.flash()
         .enqueue_kv_append_pos_buf(stream, &s.kvr, &s.pos_buf, kv_l, 1)?;
     tick(i, obs, "kv_append(pos)")?;
-    gpu.flash().enqueue_flash_latent(
-        stream,
-        &s.f_rows,
-        kv_l,
-        &s.n_keys_buf,
-        mla.kq_scale,
-        1,
-        mla.n_head,
-        rope,
-        latent,
-        &mut s.kqvc,
-    )?;
-    tick(i, obs, "flash_latent")?;
+    // The merge pass exists only when the cache is tall enough to be cut
+    // into segments; a one-segment cache runs the single-block kernel and
+    // this layer is one node shorter. The choice is the cache height's, so
+    // it cannot differ between capture and replay. The two launches are
+    // enqueued separately so an observer times each on its own.
+    if crate::flash::segments_for(kv_l.rows()) == 1 {
+        gpu.flash().enqueue_flash_latent(
+            stream,
+            &s.f_rows,
+            kv_l,
+            &s.n_keys_buf,
+            mla.kq_scale,
+            1,
+            mla.n_head,
+            rope,
+            latent,
+            &mut s.kqvc,
+        )?;
+        tick(i, obs, "flash_latent")?;
+    } else {
+        gpu.flash().enqueue_flash_latent_seg(
+            stream,
+            &s.f_rows,
+            kv_l,
+            &s.n_keys_buf,
+            mla.kq_scale,
+            1,
+            mla.n_head,
+            rope,
+            latent,
+            &mut s.part_v,
+            &mut s.part_ms,
+        )?;
+        tick(i, obs, "flash_latent")?;
+        gpu.flash().enqueue_flash_merge(
+            stream,
+            &s.n_keys_buf,
+            kv_l.rows(),
+            1,
+            mla.n_head,
+            latent,
+            &s.part_v,
+            &s.part_ms,
+            &mut s.kqvc,
+        )?;
+        tick(i, obs, "flash_merge")?;
+    }
     // 10. wv_b per head: flash's output is head-major — kqvc column h is
     //     head h's compressed values, the m-column layout the quantizer
     //     consumes; the heads 8..15 half quantizes from kqvc's base offset

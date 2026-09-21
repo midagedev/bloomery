@@ -19,12 +19,18 @@
 //!
 //! `--profile-pos <P>` moves the profiled step to position `P` (default: the
 //! dump's last position) so the per-op table can be read at depth; it raises
-//! the resident cache to `P + 1` rows for that run only. The correctness arms
-//! above are untouched by it: they run at the dump's positions, where the
-//! extra rows are past every kernel's live extent (`n_keys` clamps the flash
-//! and `pos` the append), so their bits do not depend on the cache height.
-//! Rows the dump did not seed are zeros — a real key row for timing, not a
-//! skipped one.
+//! the resident cache to `P + 1` rows for that run only. `--profile-ctx <N>`
+//! raises that cache height on its own, without moving the position — the
+//! shallow step on a tall cache, which is what a real decode run looks like
+//! at its start and the case a key-split attention has to stay honest in.
+//! The correctness arms above still run at the dump's positions, and the
+//! extra rows stay past every kernel's live extent (`n_keys` clamps the
+//! flash, `pos` the append) — but the cache height also picks the flash
+//! path, so a run with either flag is the split launch's block-level
+//! correctness run and one without it the single-block kernel's. The two
+//! differ in summation order, so their taps are the same to the band and not
+//! to the bit. Rows the dump did not seed are zeros — a real key row for
+//! timing, not a skipped one.
 //!
 //! `--time` (lead-only, under the machine lease) replays the graph 2000x
 //! and prints us/replay plus an empty-graph reference; correctness runs
@@ -96,11 +102,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ok = true;
     // `--profile-pos` is read before the load: the cache height is a load-time
     // decision, and the profile arm needs `pos + 1` rows.
-    let profile_pos = parse_profile_pos(std::env::args())?;
+    let profile_pos = parse_u32_flag(std::env::args(), "--profile-pos")?;
+    let profile_ctx = parse_u32_flag(std::env::args(), "--profile-ctx")?;
     let ctx_max = match profile_pos {
         Some(p) => CTX_MAX.max(p as usize + 1),
         None => CTX_MAX,
-    };
+    }
+    .max(profile_ctx.unwrap_or(0) as usize);
     let gguf = open_model()?;
     let man = ref_manifest()?;
     let mut model = GpuModel::load_blocks(&gguf, ctx_max, 0..1)?;
@@ -371,9 +379,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "prof reps={PROF_REPS} warmup=20 ops={} sync_floor_samples={PROF_REPS} \
-             sample=eager_launch+body+one_sync pos={prof_pos} n_keys={} ctx_max={ctx_max}",
+             sample=eager_launch+body+one_sync pos={prof_pos} n_keys={} ctx_max={ctx_max} \
+             seg_keys={} flash_segs={}",
             ops.len(),
-            prof_pos + 1
+            prof_pos + 1,
+            bloomery_gpu::flash::seg_keys(),
+            bloomery_gpu::flash::segments_for(ctx_max)
         );
         for op in &ops {
             println!(
@@ -415,22 +426,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `--profile-pos <P>`: the position the `--profile` table is taken at.
-/// Absent, the profile stays at the dump's last position.
+/// One `<flag> <u32>` pair off the command line: `--profile-pos` names the
+/// position the `--profile` table is taken at, `--profile-ctx` the cache
+/// height to allocate. Absent, the profile stays at the dump's last position
+/// on the gate's own cache height.
 #[cfg(feature = "gpu")]
-fn parse_profile_pos(
+fn parse_u32_flag(
     args: impl Iterator<Item = String>,
+    flag: &str,
 ) -> Result<Option<u32>, Box<dyn std::error::Error>> {
-    let mut args = args.skip_while(|a| a != "--profile-pos");
+    let mut args = args.skip_while(|a| a != flag);
     match args.next() {
         None => Ok(None),
         Some(_) => {
             let v = args
                 .next()
-                .ok_or("gate_p8: --profile-pos wants a position argument")?;
+                .ok_or_else(|| format!("gate_p8: {flag} wants a number argument"))?;
             let p: u32 = v
                 .parse()
-                .map_err(|_| format!("gate_p8: --profile-pos {v} is not a position"))?;
+                .map_err(|_| format!("gate_p8: {flag} {v} is not a number"))?;
             Ok(Some(p))
         }
     }
