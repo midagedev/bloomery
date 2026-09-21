@@ -5,9 +5,15 @@
 //! IDENTITY, not a band: both paths run the same cores
 //! (`cores::q3k_row_dot`, `elem::{rms_scale, silu_mul}`, `q5::q5_row_dot`,
 //! the quantizer tail), so any differing bit is a fusion defect.
-//! Asserted: the step-1 Q8Act contents, the step-2 h, the final y, eager vs
-//! captured-graph replay for both paths, node counts 8 and 4, and
-//! bit-identical reruns of both paths. Printed, never asserted: `ik_rel` of
+//! Asserted: the step-1 Q8Act contents AND the f32 normed side output, the
+//! step-2 h, the final y, eager vs captured-graph replay for both paths,
+//! node counts 8 and 4, and bit-identical reruns of both paths. A second
+//! section does the same for the attention chain's MLA key path: the fused
+//! `kv_norm_rope_append` against the four launches it replaces
+//! (rope + rms_norm + kvr gather + kv_append), on the dump's own
+//! `kv_rope_compressed-0` column and the model's real rope cache — `kv_s`,
+//! `kvr` and the appended f16 cache row bit for bit, rerun, eager vs
+//! captured-graph replay, and the SAME captured graph at a second position. Printed, never asserted: `ik_rel` of
 //! y against dump `l_out-0`'s last column and of h against `ffn_up_gate-0`'s
 //! (the block-layer bands are pinned by the lead from these numbers, not
 //! here). `--time` (lead-only, under the machine lease) replays each
@@ -131,6 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut norm_y = DeviceBuffer::<f32>::zeroed(stream, K)?;
     let mut act_op = Q8Act::with_k(stream, 1, K)?;
     let mut act_fu = Q8Act::with_k(stream, 1, K)?;
+    let mut norm_fu = DeviceBuffer::<f32>::zeroed(stream, K)?;
     let mut gate_y = DeviceBuffer::<f32>::zeroed(stream, FF)?;
     let mut up_y = DeviceBuffer::<f32>::zeroed(stream, FF)?;
     let mut h_op = DeviceBuffer::<f32>::zeroed(stream, FF)?;
@@ -189,11 +196,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wd_dev: &DeviceTensor<u32>,
         eps: f32,
         act_fu: &mut Q8Act,
+        norm_fu: &mut DeviceBuffer<f32>,
         h_fu: &mut DeviceBuffer<f32>,
         act32_fu: &mut Q8Blocks32,
         y_fu: &mut DeviceBuffer<f32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        fused.enqueue_norm_quant(stream, x_dev, gain_dev, eps, act_fu)?;
+        fused.enqueue_norm_quant(stream, x_dev, gain_dev, eps, act_fu, norm_fu)?;
         fused.enqueue_gate_up_swiglu(stream, wg_dev, wu_dev, act_fu, h_fu)?;
         gpu.q5().enqueue_quantize_q8(stream, h_fu, act32_fu)?;
         fused.enqueue_down_add_q5_1(stream, wd_dev, act32_fu, x_dev, y_fu)
@@ -234,12 +242,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &wd_dev,
         eps,
         &mut act_fu,
+        &mut norm_fu,
         &mut h_fu,
         &mut act32_fu,
         &mut y_fu,
     )?;
     stream.synchronize()?;
     let act_fu_h = readback_q8act(stream, &act_fu)?;
+    let norm_fu_1 = norm_fu.to_host_vec(stream)?;
     let h_fu_1 = h_fu.to_host_vec(stream)?;
     let y_fu_1 = y_fu.to_host_vec(stream)?;
 
@@ -263,6 +273,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         act_op_h.d8.len()
     );
     if !act_same {
+        ok = false;
+    }
+    let norm_same = bits_equal(&norm_y.to_host_vec(stream)?, &norm_fu_1);
+    println!(
+        "step1b op=rms_norm vs fused=norm_quant[f32_side_output] normed_bit_identical={norm_same} n={K}"
+    );
+    if !norm_same {
         ok = false;
     }
     let h_same = bits_equal(&h_op_1, &h_fu_1);
@@ -310,6 +327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &wd_dev,
         eps,
         &mut act_fu,
+        &mut norm_fu,
         &mut h_fu,
         &mut act32_fu,
         &mut y_fu,
@@ -365,6 +383,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &wd_dev,
             eps,
             &mut act_fu,
+            &mut norm_fu,
             &mut h_fu,
             &mut act32_fu,
             &mut y_fu,
@@ -383,6 +402,254 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if !(nodes_ok && op_replay_same && fu_replay_same) {
         ok = false;
+    }
+
+    // ---- the MLA key path: `kv_norm_rope_append` vs the four launches it
+    // replaces, on the dump's own kv_a column and the model's real rope
+    // cache. Same shape of proof as above: bits, rerun, eager vs replay,
+    // and the same captured graph at a second position.
+    {
+        use bloomery_gpu::MlaParams;
+        use bloomery_gpu::model::StepKernels;
+
+        const CACHE_ROWS: usize = 64;
+        let mla = MlaParams::read(&gguf, 0)?;
+        let (latent, rope) = (mla.latent, mla.rope_dims);
+        let width = latent + rope;
+        let step = StepKernels::load(gpu.context())?;
+
+        let (kv_row, kv_all) = load_ref(&man, "kv_rope_compressed-0", 0)?;
+        expect(
+            &kv_row,
+            "kv_rope_compressed-0",
+            "f32",
+            [width as u64, TOKENS as u64, 1, 1],
+            "MUL_MAT",
+        )?;
+        let kv_a = kv_all[(TOKENS - 1) * width..TOKENS * width].to_vec();
+        let kv_gain = f32_tensor(&gguf, "blk.0.attn_kv_a_norm.weight", latent)?;
+
+        let kv_a_dev = DeviceBuffer::from_host(stream, &kv_a)?;
+        let kv_gain_dev = DeviceBuffer::from_host(stream, &kv_gain)?;
+        let mut cs_dev = DeviceBuffer::from_host(stream, &mla.rope.cache((TOKENS - 1) as u32))?;
+        let mut pos_dev = DeviceBuffer::from_host(stream, &[(TOKENS - 1) as u32])?;
+        // The `kvr` permutation the op path needs as a gather pair table:
+        // [k_rope | kv_compressed], the oracle's CONCAT order.
+        let g_src: Vec<u32> = (0..rope)
+            .map(|i| (latent + i) as u32)
+            .chain((0..latent).map(|i| i as u32))
+            .collect();
+        let g_dst: Vec<u32> = (0..rope)
+            .map(|i| i as u32)
+            .chain((0..latent).map(|i| (rope + i) as u32))
+            .collect();
+        let g_src_dev = DeviceBuffer::from_host(stream, &g_src)?;
+        let g_dst_dev = DeviceBuffer::from_host(stream, &g_dst)?;
+
+        let mut kv_s_op = DeviceBuffer::<f32>::zeroed(stream, width)?;
+        let mut kvr_op = DeviceBuffer::<f32>::zeroed(stream, width)?;
+        let mut cache_op = DeviceTensor::<u16>::zeroed(stream, CACHE_ROWS, width)?;
+        let mut kv_s_fu = DeviceBuffer::<f32>::zeroed(stream, width)?;
+        let mut kvr_fu = DeviceBuffer::<f32>::zeroed(stream, width)?;
+        let mut cache_fu = DeviceTensor::<u16>::zeroed(stream, CACHE_ROWS, width)?;
+
+        #[allow(clippy::too_many_arguments)]
+        fn key_op(
+            gpu: &Gpu,
+            step: &StepKernels,
+            stream: &cuda_core::CudaStream,
+            kv_a: &DeviceBuffer<f32>,
+            gain: &DeviceBuffer<f32>,
+            cs: &DeviceBuffer<f32>,
+            pos: &DeviceBuffer<u32>,
+            src: &DeviceBuffer<u32>,
+            dst: &DeviceBuffer<u32>,
+            eps: f32,
+            latent: usize,
+            rope: usize,
+            kv_s: &mut DeviceBuffer<f32>,
+            kvr: &mut DeviceBuffer<f32>,
+            cache: &mut DeviceTensor<u16>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let width = latent + rope;
+            gpu.elem()
+                .enqueue_rope(stream, kv_a, cs, rope, (width / rope) as u32, 1, kv_s)?;
+            gpu.elem()
+                .enqueue_rms_norm(stream, kv_a, gain, eps, latent, 1, kv_s)?;
+            step.enqueue_gather(stream, kv_s, src, dst, width, kvr)?;
+            gpu.flash()
+                .enqueue_kv_append_pos_buf(stream, kvr, pos, cache, 1)?;
+            Ok(())
+        }
+
+        let mut run_op_key = |kv_s: &mut DeviceBuffer<f32>,
+                              kvr: &mut DeviceBuffer<f32>,
+                              cache: &mut DeviceTensor<u16>|
+         -> Result<(), Box<dyn std::error::Error>> {
+            key_op(
+                &gpu,
+                &step,
+                stream,
+                &kv_a_dev,
+                &kv_gain_dev,
+                &cs_dev,
+                &pos_dev,
+                &g_src_dev,
+                &g_dst_dev,
+                mla.eps,
+                latent,
+                rope,
+                kv_s,
+                kvr,
+                cache,
+            )
+        };
+        run_op_key(&mut kv_s_op, &mut kvr_op, &mut cache_op)?;
+        stream.synchronize()?;
+        let (kv_s_op_1, kvr_op_1) = (kv_s_op.to_host_vec(stream)?, kvr_op.to_host_vec(stream)?);
+        let cache_op_1 = cache_op.buf().to_host_vec(stream)?;
+
+        fused.enqueue_kv_norm_rope_append(
+            stream,
+            &kv_a_dev,
+            &kv_gain_dev,
+            &cs_dev,
+            &pos_dev,
+            mla.eps,
+            latent,
+            rope,
+            &mut kv_s_fu,
+            &mut kvr_fu,
+            &mut cache_fu,
+        )?;
+        stream.synchronize()?;
+        let (kv_s_fu_1, kvr_fu_1) = (kv_s_fu.to_host_vec(stream)?, kvr_fu.to_host_vec(stream)?);
+        let cache_fu_1 = cache_fu.buf().to_host_vec(stream)?;
+
+        let key_same = bits_equal(&kv_s_op_1, &kv_s_fu_1)
+            && bits_equal(&kvr_op_1, &kvr_fu_1)
+            && cache_op_1 == cache_fu_1;
+        println!(
+            "key op=rope+rms_norm+gather+kv_append vs fused=kv_norm_rope_append \
+             kv_s_bit_identical={} kvr_bit_identical={} cache_bit_identical={} pos={} \
+             latent={latent} rope={rope} cache_rows={CACHE_ROWS} {}",
+            bits_equal(&kv_s_op_1, &kv_s_fu_1),
+            bits_equal(&kvr_op_1, &kvr_fu_1),
+            cache_op_1 == cache_fu_1,
+            TOKENS - 1,
+            verdict(key_same)
+        );
+        if !key_same {
+            ok = false;
+        }
+
+        // Reruns: both paths are functions of their inputs alone.
+        run_op_key(&mut kv_s_op, &mut kvr_op, &mut cache_op)?;
+        fused.enqueue_kv_norm_rope_append(
+            stream,
+            &kv_a_dev,
+            &kv_gain_dev,
+            &cs_dev,
+            &pos_dev,
+            mla.eps,
+            latent,
+            rope,
+            &mut kv_s_fu,
+            &mut kvr_fu,
+            &mut cache_fu,
+        )?;
+        stream.synchronize()?;
+        let key_rerun = bits_equal(&kvr_op_1, &kvr_op.to_host_vec(stream)?)
+            && bits_equal(&kvr_fu_1, &kvr_fu.to_host_vec(stream)?)
+            && cache_fu_1 == cache_fu.buf().to_host_vec(stream)?;
+        println!("key rerun_bit_identical={key_rerun} {}", verdict(key_rerun));
+        if !key_rerun {
+            ok = false;
+        }
+
+        // Captured graphs: four nodes against one, and each replay equal to
+        // its own eager run.
+        let g_key_op = gpu.capture(|_| {
+            key_op(
+                &gpu,
+                &step,
+                stream,
+                &kv_a_dev,
+                &kv_gain_dev,
+                &cs_dev,
+                &pos_dev,
+                &g_src_dev,
+                &g_dst_dev,
+                mla.eps,
+                latent,
+                rope,
+                &mut kv_s_op,
+                &mut kvr_op,
+                &mut cache_op,
+            )
+            .map_err(|e| -> bloomery_gpu::GpuError { e.to_string().into() })
+        })?;
+        let key_op_nodes = g_key_op.node_count();
+        let g_key_fu = gpu.capture(|_| {
+            fused.enqueue_kv_norm_rope_append(
+                stream,
+                &kv_a_dev,
+                &kv_gain_dev,
+                &cs_dev,
+                &pos_dev,
+                mla.eps,
+                latent,
+                rope,
+                &mut kv_s_fu,
+                &mut kvr_fu,
+                &mut cache_fu,
+            )
+        })?;
+        let key_fu_nodes = g_key_fu.node_count();
+        g_key_op.launch(stream)?;
+        g_key_fu.launch(stream)?;
+        stream.synchronize()?;
+        let key_replay = bits_equal(&kvr_op_1, &kvr_op.to_host_vec(stream)?)
+            && bits_equal(&kv_s_fu_1, &kv_s_fu.to_host_vec(stream)?)
+            && bits_equal(&kvr_fu_1, &kvr_fu.to_host_vec(stream)?)
+            && cache_fu_1 == cache_fu.buf().to_host_vec(stream)?;
+        let key_nodes_ok = key_op_nodes == 4 && key_fu_nodes == 1;
+        println!(
+            "key graph op_nodes={key_op_nodes} fused_nodes={key_fu_nodes} \
+             eager_vs_replay_bit_identical={key_replay} {}",
+            verdict(key_nodes_ok && key_replay)
+        );
+        if !(key_nodes_ok && key_replay) {
+            ok = false;
+        }
+
+        // The same captured graphs at a second position: the append reads
+        // `pos_buf` on the device, so rewriting it moves the landing row.
+        // The row written at the first position must survive untouched.
+        const POS2: u32 = (TOKENS - 2) as u32;
+        pos_dev.copy_from_host(stream, &[POS2])?;
+        cs_dev.copy_from_host(stream, &mla.rope.cache(POS2))?;
+        g_key_op.launch(stream)?;
+        g_key_fu.launch(stream)?;
+        stream.synchronize()?;
+        let cache_op_2 = cache_op.buf().to_host_vec(stream)?;
+        let cache_fu_2 = cache_fu.buf().to_host_vec(stream)?;
+        let row1 = (TOKENS - 1) * width;
+        let row2 = POS2 as usize * width;
+        let second_same = cache_op_2 == cache_fu_2
+            && cache_fu_2[row2..row2 + width] != cache_fu_1[row2..row2 + width]
+            && cache_fu_2[row1..row1 + width] == cache_fu_1[row1..row1 + width];
+        println!(
+            "key second_pos pos={POS2} replay_cache_bit_identical_to_op_path={} \
+             new_row_written={} first_row_untouched={} {}",
+            cache_op_2 == cache_fu_2,
+            cache_fu_2[row2..row2 + width] != cache_fu_1[row2..row2 + width],
+            cache_fu_2[row1..row1 + width] == cache_fu_1[row1..row1 + width],
+            verdict(second_same)
+        );
+        if !second_same {
+            ok = false;
+        }
     }
 
     // ---- printed, never asserted: distance to the CUDA oracle's own
@@ -450,7 +717,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "PASSED: gate_p0b fused 4-launch block-0 FFN bit-identical to the 8-launch op path \
-         (Q8Act, h, y, reruns, graph replays); node counts 8 and 4"
+         (Q8Act, f32 normed, h, y, reruns, graph replays); node counts 8 and 4. The MLA key \
+         path fused to 1 launch bit-identical to its 4 (kv_s, kvr, cache row, rerun, replay, \
+         second position)"
     );
     Ok(())
 }

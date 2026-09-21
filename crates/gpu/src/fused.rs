@@ -1,9 +1,15 @@
 //! Fused block kernels (package P0b — filled by its track): the dense FFN
-//! half as four launches, bit-identical to the eight-launch op path.
+//! half as four launches, bit-identical to the eight-launch op path, plus the
+//! two attention-chain fusions built on the same rule — `norm_quant`'s f32
+//! side-output (the norm's two consumers from one launch) and the MLA key
+//! path's `rope + rms_norm + gather + kv_append` as one launch.
 
 use crate::GpuError;
 use crate::cores::{q3_slot, q3k_row_dot, q4_slot, q6_slot, q8_quad};
-use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree, silu_mul};
+use crate::elem::{
+    RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree, rope_pair_core, silu_mul,
+};
+use crate::flash::f32_to_f16_bits;
 use crate::q5::{Q8Blocks32, q5_row_dot};
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -48,6 +54,11 @@ mod fused_kernels {
     /// barrier. `k` a multiple of 128 (every `Q8Act` k is a multiple of
     /// 256); the column guard is block-uniform, so no barrier is skipped and
     /// every warp collective sees a full warp.
+    ///
+    /// `y` takes the f32 normalized vector as well — the same registers the
+    /// quantizer consumes, so it holds `elem::rms_norm`'s store bit for bit.
+    /// The attention norm's tap and the MoE router read it; a site with no
+    /// f32 consumer passes a buffer it is about to overwrite anyway.
     #[allow(clippy::too_many_arguments)]
     #[kernel]
     #[launch_bounds(256)]
@@ -61,7 +72,8 @@ mod fused_kernels {
             q4.len() >= m * 256 * quad_it,
             q6.len() >= m * 128 * half_it,
             s8.len() >= m * 8 * n_sb,
-            d8.len() >= m * 2 * n_sb
+            d8.len() >= m * 2 * n_sb,
+            y.len() >= k * m
         )
     )]
     pub fn norm_quant(
@@ -78,6 +90,7 @@ mod fused_kernels {
         mut q6: DisjointSlice<u32>,
         mut s8: DisjointSlice<i32>,
         mut d8: DisjointSlice<f32>,
+        mut y: DisjointSlice<f32>,
     ) {
         // One RMS_THREADS block per column: t is the COLUMN index (the block
         // index), not the thread id.
@@ -153,6 +166,15 @@ mod fused_kernels {
             let nv1 = (scale * gn1) * v1;
             let nv2 = (scale * gn2) * v2;
             let nv3 = (scale * gn3) * v3;
+            // SAFETY: vb + 3 < base + k <= k*m <= y.len() by the launch
+            // contract; each value of the column is written by exactly one
+            // lane of exactly one warp.
+            unsafe {
+                *y.get_unchecked_mut(vb) = nv0;
+                *y.get_unchecked_mut(vb + 1) = nv1;
+                *y.get_unchecked_mut(vb + 2) = nv2;
+                *y.get_unchecked_mut(vb + 3) = nv3;
+            }
             let amax = warp::reduce_max_f32(nv0.abs().max(nv1.abs()).max(nv2.abs()).max(nv3.abs()));
             let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
             let (word, quad) = q8_quad([nv0, nv1, nv2, nv3], d);
@@ -207,6 +229,148 @@ mod fused_kernels {
             }
 
             b += RMS_WARPS;
+        }
+    }
+
+    /// The MLA key path of one decode step as ONE launch: the latent norm,
+    /// the rope of the key's rope tail, the `[k_rope | kv_compressed]`
+    /// permutation and the f16 cache append, all off the single `kv_a` row
+    /// of `latent + rope` f32. One [`RMS_THREADS`] block, m = 1.
+    ///
+    /// Bit identity with the four launches it replaces comes from running
+    /// their bodies unchanged: the norm is `elem::rms_norm` at `k = latent`
+    /// (`rms_partial_sq` on the same per-thread stride, the same warp
+    /// butterfly, `rms_warp_tree`, `rms_scale`, the same
+    /// `(scale · gain) · x` store), the tail is `elem::rope`'s
+    /// `rope_pair_core` on the LAST 64-value column (the only column the
+    /// chain reads back: the op path rotates all of them into `kv_s` and the
+    /// norm immediately overwrites the first `latent`, so writing just these
+    /// two spans leaves `kv_s` in the same state), the permutation is the
+    /// `[k_rope | kv_compressed]` concat written from registers instead of
+    /// through a gather's pair table, and the cache row is
+    /// `flash::kv_append_pos_buf`'s `f32_to_f16_bits` at `pos_buf[0]`, with
+    /// the same skip for a position at or past the cache's height.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            kv_a.len() >= latent + rope,
+            gain.len() >= latent,
+            cs.len() >= rope,
+            pos_buf.len() >= 1,
+            kv_s.len() >= latent + rope,
+            kvr.len() >= latent + rope,
+            cache.len() >= dst_rows * (latent + rope)
+        )
+    )]
+    pub fn kv_norm_rope_append(
+        kv_a: &[f32],
+        gain: &[f32],
+        cs: &[f32],
+        pos_buf: &[u32],
+        eps: f32,
+        latent: u32,
+        rope: u32,
+        dst_rows: u32,
+        mut kv_s: DisjointSlice<f32>,
+        mut kvr: DisjointSlice<f32>,
+        mut cache: DisjointSlice<u16>,
+    ) {
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let k = latent as usize;
+        let nd = rope as usize;
+        let width = k + nd;
+
+        // Phase A: `elem::rms_norm`'s sum of squares over the latent head.
+        // SAFETY: WSUM is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every access is below RMS_WARPS and ordered by `sync_threads`.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        let part = warp::reduce_sum_f32(rms_partial_sq(kv_a, 0, k, tid));
+        if lane == 0 {
+            // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
+            unsafe {
+                *ws.add(tid / 32) = part;
+            }
+        }
+        thread::sync_threads();
+        // SAFETY: every slot was written above and is visible past the
+        // barrier.
+        let sums = unsafe {
+            [
+                *ws.add(0),
+                *ws.add(1),
+                *ws.add(2),
+                *ws.add(3),
+                *ws.add(4),
+                *ws.add(5),
+                *ws.add(6),
+                *ws.add(7),
+            ]
+        };
+        let scale = rms_scale(rms_warp_tree(sums), latent, eps);
+
+        // SAFETY: pos_buf.len() >= 1 by the launch contract.
+        let pos = unsafe { *pos_buf.get_unchecked(0) } as usize;
+        // The append's own bound: `pos` comes from device memory, so a row
+        // at or past the cache's height is skipped, not clamped. Launch
+        // uniform — every thread reads the same slot.
+        let live = pos < dst_rows as usize;
+        let crow = pos * width;
+
+        // The latent half, on `elem::rms_norm`'s own loop order. Each value
+        // lands in `kv_s` (the norm's output), at `kvr`'s permuted slot and,
+        // rounded once, in the cache row.
+        let mut it = tid;
+        while it < k {
+            // SAFETY: it < k bounds the gain and kv_a reads by the contract;
+            // the kv_s slot is it < k < width <= kv_s.len(), the kvr slot is
+            // nd + it < width <= kvr.len(), and the cache slot is
+            // crow + nd + it < (pos + 1) * width <= dst_rows * width <=
+            // cache.len() because `live` bounds pos below dst_rows.
+            unsafe {
+                let g = *gain.get_unchecked(it);
+                let v = *kv_a.get_unchecked(it);
+                let nv = (scale * g) * v;
+                *kv_s.get_unchecked_mut(it) = nv;
+                *kvr.get_unchecked_mut(nd + it) = nv;
+                if live {
+                    *cache.get_unchecked_mut(crow + nd + it) = f32_to_f16_bits(nv);
+                }
+            }
+            it += RMS_THREADS;
+        }
+
+        // The rope tail: one thread per pair of the last 64-value column,
+        // which `elem::rope` addresses as column `width/nd - 1` of token 0 —
+        // so its cos/sin slots are `cs[d]`, `cs[d + 1]`.
+        if 2 * tid < nd {
+            let d = 2 * tid;
+            // SAFETY: d + 1 < nd, so the kv_a reads stay below k + nd <=
+            // kv_a.len(), the cs reads below nd <= cs.len(), the kv_s slots
+            // below width, the kvr slots below nd <= width, and the cache
+            // slots below (pos + 1) * width <= cache.len() under `live`.
+            unsafe {
+                let x0 = *kv_a.get_unchecked(k + d);
+                let x1 = *kv_a.get_unchecked(k + d + 1);
+                let c = *cs.get_unchecked(d);
+                let s = *cs.get_unchecked(d + 1);
+                let (y0, y1) = rope_pair_core(x0, x1, c, s);
+                *kv_s.get_unchecked_mut(k + d) = y0;
+                *kv_s.get_unchecked_mut(k + d + 1) = y1;
+                *kvr.get_unchecked_mut(d) = y0;
+                *kvr.get_unchecked_mut(d + 1) = y1;
+                if live {
+                    *cache.get_unchecked_mut(crow + d) = f32_to_f16_bits(y0);
+                    *cache.get_unchecked_mut(crow + d + 1) = f32_to_f16_bits(y1);
+                }
+            }
         }
     }
 
@@ -347,10 +511,13 @@ impl FusedKernels {
 
     /// Enqueue rms_norm + 128-value q8_1 quantization of `x` (`act.m()`
     /// columns of `act.k()` f32, token-major, one warp per column) by
-    /// `gain`/`eps` into `act` — the same five buffers `elem::rms_norm`
-    /// followed by `Gpu::enqueue_quantize_q8_1` produce, bit for bit.
-    /// `act.k()` must be a multiple of 128 (every `Q8Act` k is a multiple
-    /// of 256). Asynchronous, allocation-free, capturable.
+    /// `gain`/`eps` into `act`, and the f32 normed vector into `y` — the
+    /// same six buffers `elem::rms_norm` followed by
+    /// `Gpu::enqueue_quantize_q8_1` produce, bit for bit. `y` holds
+    /// `act.m() * act.k()` f32; a caller with no f32 consumer passes a
+    /// buffer of that width it overwrites later in the chain. `act.k()`
+    /// must be a multiple of 128 (every `Q8Act` k is a multiple of 256).
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_norm_quant(
         &self,
         stream: &CudaStream,
@@ -358,6 +525,7 @@ impl FusedKernels {
         gain: &DeviceBuffer<f32>,
         eps: f32,
         act: &mut Q8Act,
+        y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let (m, k, n_sb) = (act.m(), act.k(), act.n_sb());
         if k % 128 != 0 {
@@ -367,12 +535,14 @@ impl FusedKernels {
             )
             .into());
         }
-        if x.len() < m * k || gain.len() < k {
+        if x.len() < m * k || gain.len() < k || y.len() < m * k {
             return Err(format!(
-                "enqueue_norm_quant: x.len() {} (need m*k = {mk}), gain.len() {gl} (need {k})",
+                "enqueue_norm_quant: x.len() {} (need m*k = {mk}), gain.len() {gl} (need {k}), \
+                 y.len() {yl} (need {mk})",
                 x.len(),
                 mk = m * k,
-                gl = gain.len()
+                gl = gain.len(),
+                yl = y.len()
             )
             .into());
         }
@@ -395,6 +565,101 @@ impl FusedKernels {
             &mut act.q6,
             &mut act.s8,
             &mut act.d8,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the MLA key path of one decode step: `kv_a` (the
+    /// `latent + rope` f32 projection) normed by `gain`/`eps` over its
+    /// latent head and roped over its rope tail into `kv_s`
+    /// (`[kv_compressed | k_rope]`), permuted into `kvr`
+    /// (`[k_rope | kv_compressed]`) and appended as f16 at row
+    /// `pos_buf[0]` of `cache` — the same three buffers
+    /// `elem::rope` + `elem::rms_norm` + the `kvr` gather +
+    /// `FlashKernels::enqueue_kv_append_pos_buf` produce, bit for bit.
+    /// `cache` rows are `latent + rope` wide; a position at or past its
+    /// height leaves the cache untouched. m = 1. Asynchronous,
+    /// allocation-free, capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_kv_norm_rope_append(
+        &self,
+        stream: &CudaStream,
+        kv_a: &DeviceBuffer<f32>,
+        gain: &DeviceBuffer<f32>,
+        cs: &DeviceBuffer<f32>,
+        pos_buf: &DeviceBuffer<u32>,
+        eps: f32,
+        latent: usize,
+        rope: usize,
+        kv_s: &mut DeviceBuffer<f32>,
+        kvr: &mut DeviceBuffer<f32>,
+        cache: &mut DeviceTensor<u16>,
+    ) -> Result<(), GpuError> {
+        let width = latent + rope;
+        if latent == 0 || latent % 32 != 0 {
+            return Err(format!(
+                "enqueue_kv_norm_rope_append: the norm's geometry needs a positive multiple of \
+                 32, got latent {latent}"
+            )
+            .into());
+        }
+        if rope < 2 || rope % 2 != 0 || rope > 2 * RMS_THREADS {
+            return Err(format!(
+                "enqueue_kv_norm_rope_append: the rope tail is one pair per thread of the one \
+                 {RMS_THREADS}-thread block, so rope must be even and at most {}, got {rope}",
+                2 * RMS_THREADS
+            )
+            .into());
+        }
+        if cache.cols() != width {
+            return Err(format!(
+                "enqueue_kv_norm_rope_append: cache rows are {} wide, the kvr row is \
+                 latent + rope = {width}",
+                cache.cols()
+            )
+            .into());
+        }
+        if kv_a.len() < width || gain.len() < latent || cs.len() < rope {
+            return Err(format!(
+                "enqueue_kv_norm_rope_append: kv_a.len() {} (need {width}), gain.len() {} \
+                 (need {latent}), cs.len() {} (need {rope})",
+                kv_a.len(),
+                gain.len(),
+                cs.len()
+            )
+            .into());
+        }
+        if kv_s.len() < width || kvr.len() < width {
+            return Err(format!(
+                "enqueue_kv_norm_rope_append: kv_s.len() {} and kvr.len() {} vs the row width \
+                 {width}",
+                kv_s.len(),
+                kvr.len()
+            )
+            .into());
+        }
+        if pos_buf.len() < 1 {
+            return Err("enqueue_kv_norm_rope_append: pos_buf must hold 1 u32".into());
+        }
+        let rows = cache.rows();
+        let prep = self
+            .module
+            .prepare_kv_norm_rope_append(LaunchConfig1D::new(1, RMS_THREADS as u32, 0))?;
+        self.module.kv_norm_rope_append(
+            stream,
+            &prep,
+            kv_a,
+            gain,
+            cs,
+            pos_buf,
+            eps,
+            latent as u32,
+            rope as u32,
+            rows as u32,
+            kv_s,
+            kvr,
+            cache.buf_mut(),
         )?;
         Ok(())
     }
