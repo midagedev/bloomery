@@ -5,8 +5,12 @@
 //! against ggml's `to_float` — and dotted with the activation in f64. No
 //! device code here; the gate binaries under `src/bin/` bring the device.
 //!
-//! The kernel gate is `max|y - y_ref| / max|y_ref| <= 1e-2` per shape, the
-//! stage-0 contract for q8_1-activation kernels (measured floor 3–5e-3).
+//! The kernel gate is `max|y - y_ref| / max|y_ref| <= 1e-2` per shape, with
+//! `y_ref` computed on the SAME quantized activations the kernel consumes
+//! (a correct kernel sits near 1e-7). Against the raw activations a correct
+//! q8_1 kernel measures up to 2.4e-2 on real inputs and ik's own CUDA output
+//! up to 1.7e-2: that distance is the design's quantization noise and is
+//! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
@@ -100,10 +104,19 @@ pub fn tensor_bytes<'a>(
     Ok((t, gguf.data(t)?))
 }
 
-/// `max|y - y_ref| / max|y_ref|`; an all-zero reference is an error, not 0.
+/// `max|y - y_ref| / max|y_ref|`; an all-zero reference or any non-finite
+/// value on either side is an error, not a score.
 pub fn max_rel_err(y: &[f32], y_ref: &[f32]) -> Result<f32, GateError> {
     if y.len() != y_ref.len() {
         return Err(format!("max_rel_err: len {} vs {}", y.len(), y_ref.len()).into());
+    }
+    // `f32::max` returns the other operand for NaN, so the folds below
+    // cannot see one: an all-NaN output would score 0. Scan first.
+    if let Some(i) = y.iter().position(|v| !v.is_finite()) {
+        return Err(format!("max_rel_err: non-finite kernel output at {i}").into());
+    }
+    if let Some(i) = y_ref.iter().position(|v| !v.is_finite()) {
+        return Err(format!("max_rel_err: non-finite reference at {i}").into());
     }
     let denom = y_ref.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     if denom == 0.0 {
@@ -113,9 +126,6 @@ pub fn max_rel_err(y: &[f32], y_ref: &[f32]) -> Result<f32, GateError> {
         .iter()
         .zip(y_ref)
         .fold(0.0f32, |a, (&g, &r)| a.max((g - r).abs()));
-    if !num.is_finite() {
-        return Err("max_rel_err: non-finite kernel output".into());
-    }
     Ok(num / denom)
 }
 
@@ -293,4 +303,20 @@ pub fn ref_tensor(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), Gat
     let man = ref_manifest()?;
     let row = find_ref_row(&man, name, occurrence)?;
     Ok((row.clone(), ref_tensor_of(row)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_rel_err;
+
+    /// `f32::max` drops NaN, so a fold alone scores an all-NaN output as 0.
+    #[test]
+    fn max_rel_err_rejects_nan_output() {
+        let y_ref = [1.0f32, -2.0, 3.0];
+        assert!(max_rel_err(&[f32::NAN; 3], &y_ref).is_err());
+        assert!(max_rel_err(&[1.0, f32::NAN, 3.0], &y_ref).is_err());
+        assert!(max_rel_err(&[1.0, f32::INFINITY, 3.0], &y_ref).is_err());
+        assert!(max_rel_err(&[1.0, -2.0, 3.0], &[1.0, f32::NAN, 3.0]).is_err());
+        assert_eq!(max_rel_err(&[1.0, -2.0, 3.0], &y_ref).unwrap(), 0.0);
+    }
 }
