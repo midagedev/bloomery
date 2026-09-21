@@ -73,9 +73,9 @@ impl GpuModel {
         if ctx_max == 0 {
             return Err("GpuModel::load: ctx_max must be >= 1".into());
         }
-        let n_layers = gguf
-            .block_count()
-            .ok_or("GpuModel::load: metadata key block_count missing")? as usize;
+        let n_layers =
+            gguf.block_count()
+                .ok_or("GpuModel::load: metadata key block_count missing")? as usize;
         let mut bounds = vec![0usize];
         for &c in cuts {
             if c <= *bounds.last().unwrap_or(&0) || c >= n_layers {
