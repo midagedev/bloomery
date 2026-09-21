@@ -28,76 +28,15 @@ pub const N_EXPERT: usize = 64;
 /// Experts each token routes to (this model's `expert_used_count`).
 pub const N_USED: usize = 6;
 
+/// Threads both router kernels launch with, and the width their device code
+/// is compiled for. One thread owns one token whole — the f64 sum of the 64
+/// exps is contracted to ascending expert order, so the token cannot be
+/// split across lanes — and the router drives `m` in 1..=8, so one warp
+/// covers every shape. `gate_p6`'s `router_shape` asserts the compiled
+/// `.reqntid` against this.
+pub const ROUTER_THREADS: usize = 32;
+
 // --------------------------------------------------------------- cores
-
-/// The softmax over token `t`'s 64 router logits: `x[e * m + t]` in, the
-/// prob of expert e at `out[e]`, in the module doc's numeric order (serial
-/// ascending max fold, f32 `exp`, f64 sum accumulated ascending, f32 divide
-/// by `sum as f32`).
-///
-/// Caller contract: `x.len() >= 64 * m`, `t < m`, and the token's 64 logits
-/// finite.
-#[inline(always)]
-pub fn softmax64(x: &[f32], m: u32, t: usize) -> [f32; 64] {
-    let m = m as usize;
-    let mut v = [0.0f32; 64];
-    let mut mx = f32::NEG_INFINITY;
-    let mut e = 0usize;
-    while e < 64 {
-        // SAFETY: e < 64 and t < m, so e*m + t < 64*m <= x.len() by the
-        // caller contract.
-        let le = unsafe { *x.get_unchecked(e * m + t) };
-        v[e] = le;
-        mx = mx.max(le);
-        e += 1;
-    }
-    let mut sum = 0.0f64;
-    let mut e = 0usize;
-    while e < 64 {
-        let ex = (v[e] - mx).exp();
-        v[e] = ex;
-        sum += f64::from(ex);
-        e += 1;
-    }
-    let inv = sum as f32;
-    let mut e = 0usize;
-    while e < 64 {
-        v[e] /= inv;
-        e += 1;
-    }
-    v
-}
-
-/// The top-6 of one token's 64 softmax probs: descending probability, ties
-/// toward the smaller expert id — the order the CPU engine's argsort states
-/// (`p[b].cmp(p[a]).then(a.cmp(b))`, a total order over distinct ids).
-/// Strict `>` over an ascending scan is that same order: the first of equal
-/// probs wins, and taken ids are masked out. Returns the 6 expert ids and
-/// their weights `probs[id] * scale`.
-#[inline(always)]
-pub fn top6(probs: &[f32; 64], scale: f32) -> ([u32; 6], [f32; 6]) {
-    let mut ids = [0u32; 6];
-    let mut ws = [0.0f32; 6];
-    let mut taken = 0u64;
-    let mut s = 0usize;
-    while s < 6 {
-        let mut best = 0u32;
-        let mut best_p = f32::NEG_INFINITY;
-        let mut e = 0u32;
-        while e < 64 {
-            if (taken >> e) & 1 == 0 && probs[e as usize] > best_p {
-                best = e;
-                best_p = probs[e as usize];
-            }
-            e += 1;
-        }
-        taken |= 1u64 << best;
-        ids[s] = best;
-        ws[s] = probs[best as usize] * scale;
-        s += 1;
-    }
-    (ids, ws)
-}
 
 /// Expert `id`'s first row in a flat stacked expert tensor with `rows` rows
 /// per expert: the row0 a gemv launch's row addressing starts from. Exact in
@@ -116,8 +55,24 @@ mod router_kernels {
     /// The router: `m` (1..=8) tokens' logits in the layout `x[e*m + t]` ->
     /// probs in the same layout, ids `ids[s*m + t]` and weights
     /// `weights[s*m + t]` (slot s = the token's rank by descending
-    /// probability). One 32-thread block, thread `t` owning token `t` whole;
-    /// every store is this thread's own token's slot.
+    /// probability). One [`ROUTER_THREADS`] block, thread `t` owning token
+    /// `t` whole; every store is this thread's own token's slot.
+    ///
+    /// The numeric order is the module doc's, op for op. It is carried in
+    /// four passes over the token's own slots of `probs` rather than in a
+    /// 64-element per-thread array: the selection reads `probs[best]` at a
+    /// data-dependent index, which puts such an array in local memory
+    /// whatever the loops unroll to, and every read of it then costs a
+    /// round trip. Passes 2 and 3 park the exps and then the quotients in
+    /// the slots they have to be written to anyway, and the selection reads
+    /// them back — the same thread's own stores, in program order, so no
+    /// barrier and no collective is involved. `gate_p6`'s `router_shape`
+    /// asserts the compiled entry carries no depot.
+    ///
+    /// The width is one thread per token by contract, not by convenience:
+    /// the f64 sum of the 64 exps is specified in ascending expert order,
+    /// and a tree over lanes is a different sum. `m <= 8`, so one warp
+    /// covers every shape the router is launched at.
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(
@@ -143,24 +98,77 @@ mod router_kernels {
             return;
         }
         let mi = m as usize;
-        let p = softmax64(x, m, t);
-        let (top, w) = top6(&p, scale);
+
+        // Pass 1: the largest of the token's 64 logits, by a serial
+        // ascending `f32::max` fold.
+        let mut mx = f32::NEG_INFINITY;
         let mut e = 0usize;
         while e < 64 {
-            // SAFETY: e < 64 and t < m, so e*m + t < 64*m <= probs.len() by
-            // the launch contract.
+            // SAFETY: e < 64 and t < m, so e*mi + t < 64*m <= x.len() by the
+            // launch contract.
+            let le = unsafe { *x.get_unchecked(e * mi + t) };
+            mx = mx.max(le);
+            e += 1;
+        }
+
+        // Pass 2: `exp` in f32 into the token's own prob slots, the sum
+        // accumulated in f64 in ascending expert order.
+        let mut sum = 0.0f64;
+        let mut e = 0usize;
+        while e < 64 {
+            // SAFETY: e < 64 and t < m, so e*mi + t is inside both x.len()
+            // and probs.len() (>= 64*m) by the launch contract.
+            let ex = unsafe {
+                let ex = (*x.get_unchecked(e * mi + t) - mx).exp();
+                *probs.get_unchecked_mut(e * mi + t) = ex;
+                ex
+            };
+            sum += f64::from(ex);
+            e += 1;
+        }
+
+        // Pass 3: the f32 divide by `sum as f32`, in place.
+        let inv = sum as f32;
+        let mut e = 0usize;
+        while e < 64 {
+            // SAFETY: as pass 2 — this thread's own slot of probs.
             unsafe {
-                *probs.get_unchecked_mut(e * mi + t) = p[e];
+                *probs.get_unchecked_mut(e * mi + t) /= inv;
             }
             e += 1;
         }
+
+        // Pass 4: the top-6 by descending probability with ties toward the
+        // smaller expert id. Strict `>` over an ascending scan is that
+        // order — the first of equal probs wins — and taken ids are masked
+        // out; the weight is the winner's prob times `scale`, read from the
+        // slot rather than from the comparison so a prob no comparison ever
+        // won (an all-NaN token) is carried through unchanged.
+        let mut taken = 0u64;
         let mut s = 0usize;
         while s < 6 {
-            // SAFETY: s < 6 and t < m, so s*m + t < 6*m <= ids.len() and
+            let mut best = 0u32;
+            let mut best_p = f32::NEG_INFINITY;
+            let mut e = 0u32;
+            while e < 64 {
+                if (taken >> e) & 1 == 0 {
+                    // SAFETY: e < 64 and t < m — this thread's own slot.
+                    let pv = unsafe { *probs.get_unchecked_mut(e as usize * mi + t) };
+                    if pv > best_p {
+                        best = e;
+                        best_p = pv;
+                    }
+                }
+                e += 1;
+            }
+            taken |= 1u64 << best;
+            // SAFETY: best < 64 and t < m — this thread's own prob slot.
+            let w = unsafe { *probs.get_unchecked_mut(best as usize * mi + t) } * scale;
+            // SAFETY: s < 6 and t < m, so s*mi + t < 6*m <= ids.len() and
             // weights.len() by the launch contract.
             unsafe {
-                *ids.get_unchecked_mut(s * mi + t) = top[s];
-                *weights.get_unchecked_mut(s * mi + t) = w[s];
+                *ids.get_unchecked_mut(s * mi + t) = best;
+                *weights.get_unchecked_mut(s * mi + t) = w;
             }
             s += 1;
         }
@@ -272,9 +280,9 @@ impl RouterKernels {
             )
             .into());
         }
-        let prep = self
-            .module
-            .prepare_router_topk(LaunchConfig1D::new(1, 32, 0))?;
+        let prep =
+            self.module
+                .prepare_router_topk(LaunchConfig1D::new(1, ROUTER_THREADS as u32, 0))?;
         self.module
             .router_topk(stream, &prep, x, m as u32, scale, probs, ids, weights)?;
         Ok(())
@@ -323,9 +331,9 @@ impl RouterKernels {
             )
             .into());
         }
-        let prep = self
-            .module
-            .prepare_expert_table(LaunchConfig1D::new(1, 32, 0))?;
+        let prep =
+            self.module
+                .prepare_expert_table(LaunchConfig1D::new(1, ROUTER_THREADS as u32, 0))?;
         self.module.expert_table(
             stream,
             &prep,

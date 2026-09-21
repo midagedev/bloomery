@@ -21,8 +21,23 @@
 //! logical twins (`ffn_moe_topk-L.0.logical.f32`, every token's top-6 ids
 //! cast to f32) and every token's ids must equal the routing reference.
 //! Synthetic inputs cover what the dump cannot supply (an exact tie at the
-//! 6th/7th rank, all-equal logits, ±80 extreme logits, and m = 8) and pin
-//! the tie rule and overflow behaviour against the same host reference.
+//! 6th/7th rank, ties filling the whole top-6, tie pairs across the range,
+//! all-equal logits, ±80 extreme logits, `-inf` logits in the tail, inside
+//! the top and everywhere but one expert, and m = 8) and pin the tie rule
+//! and overflow behaviour against the same host reference.
+//!
+//! Every case also prints an FNV-1a 64 digest of its (probs, ids, weights)
+//! bits. The digest asserts nothing — it is the line a kernel reshape is
+//! read against: the routing contract is EXACT, so a shape change must
+//! leave every digest unchanged.
+//!
+//! Asserted as a shape and not as a clock: `router_topk` and `expert_table`
+//! compile with no local depot and at the block width their host side
+//! launches (`router_shape`, the `gate_p5::no_local_depot` /
+//! `gate_p4::argmax_geometry` pattern). A per-thread array indexed by a
+//! data-dependent id is a register spill that no band and no bit-identity
+//! can see — it was the router's whole defect, and the assertion is what
+//! keeps it closed.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -205,9 +220,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pass =
             ids_exact && ik_ids_exact && probs_err <= BAND && w_err <= BAND && out.rerun_bit_same;
         println!(
-            "shape op=router_topk src=ffn_moe_logits-{l} m={m} ids_exact={ids_exact} ik_ids_exact={ik_ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} ik_probs_rel={ik_probs_rel:.3e} ik_weights_rel={ik_w_rel:.3e} ik_ids_mismatch={ik_ids_mis}/{} {}",
+            "shape op=router_topk src=ffn_moe_logits-{l} m={m} ids_exact={ids_exact} ik_ids_exact={ik_ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} ik_probs_rel={ik_probs_rel:.3e} ik_weights_rel={ik_w_rel:.3e} ik_ids_mismatch={ik_ids_mis}/{} digest={:#018x} {}",
             out.rerun_bit_same,
             N_USED * m,
+            digest(&out.probs, &out.ids, &out.weights),
             verdict(pass)
         );
         if !ik_ids_exact {
@@ -276,6 +292,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     synth_case(&router, stream, "extreme_pm80", &ext, scale, &mut ok)?;
 
+    // Ties filling the whole top-6 and one rank past it: experts 0..=7 share
+    // the largest logit, so every one of the six ranks is decided by the tie
+    // rule alone and the ids must be 0..=5.
+    let mut tie_top = vec![-1.0f32; N_EXPERT];
+    for v in tie_top.iter_mut().take(8) {
+        *v = 2.0;
+    }
+    synth_case(&router, stream, "tie_fills_top6", &tie_top, scale, &mut ok)?;
+
+    // Ties two by two across the whole range: experts 2j and 2j+1 share a
+    // logit, so each rank picks the even id and the ids are 0, 2, 4, 6, 8, 10.
+    let tie_pairs: Vec<f32> = (0..N_EXPERT).map(|e| -0.5 * (e / 2) as f32).collect();
+    synth_case(&router, stream, "tie_pairs", &tie_pairs, scale, &mut ok)?;
+
+    // `-inf` in the tail: experts 40.. are masked off entirely. Their exps
+    // are exactly +0.0, so nothing becomes non-finite and the top-6 comes
+    // from the live head.
+    let mut inf_tail: Vec<f32> = (0..N_EXPERT).map(|e| 1.0 - 0.02 * e as f32).collect();
+    for v in inf_tail.iter_mut().skip(40) {
+        *v = f32::NEG_INFINITY;
+    }
+    synth_case(&router, stream, "neg_inf_tail", &inf_tail, scale, &mut ok)?;
+
+    // `-inf` inside what would have been the top-6: experts 0 and 2 are
+    // masked off the head of the ranking, so the six slots must come from
+    // the live experts below them and no masked id may appear. The pair at
+    // 8 and 9 is an exact tie sitting well under the cut — it must stay
+    // under it. The boundary tie itself is `tie_6th_7th`'s.
+    let mut inf_top = inf_tail.clone();
+    inf_top[0] = f32::NEG_INFINITY;
+    inf_top[2] = f32::NEG_INFINITY;
+    inf_top[8] = 0.5;
+    inf_top[9] = 0.5;
+    synth_case(&router, stream, "neg_inf_in_top6", &inf_top, scale, &mut ok)?;
+
+    // Everything but one expert masked: that expert takes prob 1.0 and the
+    // five remaining slots are an all-zero tie, so the ids are the live
+    // expert followed by the five smallest masked ids.
+    let mut inf_all_but_one = vec![f32::NEG_INFINITY; N_EXPERT];
+    inf_all_but_one[37] = 0.0;
+    synth_case(
+        &router,
+        stream,
+        "neg_inf_all_but_one",
+        &inf_all_but_one,
+        scale,
+        &mut ok,
+    )?;
+
     // m = 8 (the layout bound): distinct logits per token, one exact tie in
     // token 2, extremes in token 6.
     let mut xt = vec![0.0f32; N_EXPERT * 8];
@@ -302,8 +367,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let w_err = max_rel_err(&w_t, &w_ref)?;
     let pass = ids_exact && probs_err <= BAND && w_err <= BAND && out.rerun_bit_same;
     println!(
-        "shape op=router_topk synthetic=m8_stride_with_tie m=8 ids_exact={ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} {}",
+        "shape op=router_topk synthetic=m8_stride_with_tie m=8 ids_exact={ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} digest={:#018x} {}",
         out.rerun_bit_same,
+        digest(&out.probs, &out.ids, &out.weights),
         verdict(pass)
     );
     if !pass {
@@ -407,12 +473,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ok = false;
     }
 
+    router_shape(&mut ok)?;
+
+    // ---- lead-only timing under the machine lease
+    // (`time-gate.sh gate_p6 --time-router`); correctness runs never reach
+    // this. What it prices is the router at the decode shape — one token,
+    // one thread — as a captured single-node graph replayed N times, with
+    // an empty-kernel graph as the submission floor, so the difference is
+    // the kernel body and not the submit path.
+    if std::env::args().any(|a| a == "--time-router") {
+        const N: u32 = 2000;
+        let x1: Vec<f32> = (0..N_EXPERT).map(|e| x_ik[e]).collect();
+        let x1_dev = DeviceBuffer::from_host(stream, &x1)?;
+        let mut p1 = DeviceBuffer::<f32>::zeroed(stream, N_EXPERT)?;
+        let mut i1 = DeviceBuffer::<u32>::zeroed(stream, N_USED)?;
+        let mut w1 = DeviceBuffer::<f32>::zeroed(stream, N_USED)?;
+        let probe = bloomery_gpu::probe::Probe::load(gpu.context())?;
+        let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
+        let empty = gpu.capture(|_| probe.enqueue_touch(stream, &mut tbuf))?;
+        let rt = gpu.capture(|_| {
+            router.enqueue_router_topk(stream, &x1_dev, 1, scale, &mut p1, &mut i1, &mut w1)
+        })?;
+        let time_replays = |g: &bloomery_gpu::Graph| -> Result<f64, Box<dyn std::error::Error>> {
+            for _ in 0..2 {
+                g.launch(stream)?;
+            }
+            stream.synchronize()?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                g.launch(stream)?;
+            }
+            stream.synchronize()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e6 / f64::from(N))
+        };
+        let router_us = time_replays(&rt)?;
+        let touch_us = time_replays(&empty)?;
+        println!(
+            "time op=router_topk m=1 experts={N_EXPERT} reps={N} \
+             router_us_per_replay={router_us:.3} touch1_us_per_replay={touch_us:.3} \
+             net_us={:.3}",
+            router_us - touch_us
+        );
+    }
+
     if !ok {
         eprintln!("FAILED: gate_p6");
         std::process::exit(1);
     }
     println!(
-        "PASSED: router ids exact / probs+weights within 1e-6 of the route_inner reference; expert table exact; eager == graph replay"
+        "PASSED: router ids exact / probs+weights within 1e-6 of the route_inner reference; expert table exact; eager == graph replay; the router kernels compile with no local depot at the width their host side launches"
     );
     Ok(())
 }
@@ -431,19 +540,102 @@ fn synth_case(
 
     const BAND: f32 = 1e-6;
     let out = run_router(router, stream, logits, 1, scale)?;
-    let (probs_ref, ids_ref, w_ref) = route_ref(logits, 1, scale)?;
+    let (probs_ref, ids_ref, w_ref) = route_ref(&finite_logits(logits), 1, scale)?;
     let ids_dev: Vec<i32> = out.ids.iter().map(|&v| v as i32).collect();
     let ids_exact = ids_dev == ids_ref;
     let probs_err = max_rel_err(&out.probs, &probs_ref)?;
     let w_err = max_rel_err(&out.weights, &w_ref)?;
     let pass = ids_exact && probs_err <= BAND && w_err <= BAND && out.rerun_bit_same;
     println!(
-        "shape op=router_topk synthetic={name} m=1 ids_exact={ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} {}",
+        "shape op=router_topk synthetic={name} m=1 ids_exact={ids_exact} probs_err={probs_err:.3e} weights_err={w_err:.3e} bit_identical_rerun={} ids={:?} digest={:#018x} {}",
         out.rerun_bit_same,
+        out.ids,
+        digest(&out.probs, &out.ids, &out.weights),
         verdict(pass)
     );
     if !pass {
         *ok = false;
+    }
+    Ok(())
+}
+
+/// The host reference's input for a case carrying `-inf` logits.
+/// `route_ref` takes finite logits only, and `f32::MIN` routes identically:
+/// the ascending `f32::max` fold picks neither over a larger logit, `exp`
+/// of either minus a finite max is exactly `+0.0`, and a `+0.0` term leaves
+/// the f64 sum and every quotient unchanged. Finite logits pass through, so
+/// a case that is not about `-inf` compares against its own vector; any
+/// other non-finite value stays non-finite and `route_ref` rejects it.
+#[cfg(feature = "gpu")]
+fn finite_logits(logits: &[f32]) -> Vec<f32> {
+    logits
+        .iter()
+        .map(|&v| if v == f32::NEG_INFINITY { f32::MIN } else { v })
+        .collect()
+}
+
+/// FNV-1a 64 over the bits of one case's whole routing output, probs then
+/// ids then weights. Print-only: the routing contract is exact, so this is
+/// the one line that says a kernel reshape moved no bit.
+#[cfg(feature = "gpu")]
+fn digest(probs: &[f32], ids: &[u32], weights: &[f32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in probs {
+        h = eat(h, &v.to_bits().to_le_bytes());
+    }
+    for v in ids {
+        h = eat(h, &v.to_le_bytes());
+    }
+    for v in weights {
+        h = eat(h, &v.to_bits().to_le_bytes());
+    }
+    h
+}
+
+/// One FNV-1a 64 step per byte.
+#[cfg(feature = "gpu")]
+fn eat(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The router kernels' compiled shape, asserted from the PTX the executable
+/// carries and not from a clock. Two defects are closed here at once. A
+/// per-thread array whose index depends on the data — the 64 softmax probs
+/// the selection re-reads at `probs[best]` — is a register spill the
+/// backend serves from a `__local_depot`, one round trip per read, and no
+/// band or bit-identity can see it. And the block width is read from the
+/// entry's own `.reqntid`, so the device code and the host's
+/// `LaunchConfig1D` cannot drift apart. One warp is the right width here
+/// and the assertion pins it: the f64 sum of the 64 exps is contracted to
+/// ascending expert order, so one thread owns one token whole and the block
+/// only has to cover `m <= 8`.
+#[cfg(feature = "gpu")]
+fn router_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+    use bloomery_gpu::router::ROUTER_THREADS;
+
+    let blob = std::fs::read(std::env::current_exe()?)?;
+    for name in ["router_topk", "expert_table"] {
+        let c = bloomery_gpu_gates::ptx::counts(&blob, name)
+            .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
+        let ntid = c
+            .reqntid
+            .ok_or_else(|| format!("gate_p6: PTX entry {name} declares no .reqntid"))?;
+        let pass = !c.depot && c.ld_local == 0 && c.st_local == 0 && ntid == ROUTER_THREADS;
+        println!(
+            "shape op={name} local_depot={} ld_local={} st_local={} block_reqntid={ntid} \
+             ROUTER_THREADS={ROUTER_THREADS} {}",
+            c.depot,
+            c.ld_local,
+            c.st_local,
+            verdict(pass)
+        );
+        if !pass {
+            *ok = false;
+        }
     }
     Ok(())
 }

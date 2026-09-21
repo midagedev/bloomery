@@ -49,8 +49,8 @@ pub type GpuError = Box<dyn std::error::Error>;
 mod kernels {
     use super::*;
     use crate::cores::{
-        funnel16, half_to_f32, q3_slot, q3k_row_dot, q4_slot, q4k_a_chain, q4k_coeff, q4k_nibble,
-        q4k_scale_min, q6_slot, q6k_chain, q6k_dequant, q6k_sub_scale, q8_quad,
+        funnel16, half_to_f32, q3_slot, q3k_row_dot, q4_slot, q4k_row_dot, q6_slot, q6k_chain,
+        q6k_dequant, q6k_sub_scale, q8_quad,
     };
 
     /// Q3_K packing recap (decode verified against ggml's
@@ -256,176 +256,28 @@ mod kernels {
         }
         let lane = warp::lane_id() as usize;
         let m = m_cols as usize;
-        let n_sb = n_sb as usize;
-        let row_words = 36 * n_sb; // 144 B per super-block
-        let q_col = 256 * iters as usize; // q8 words per column
-        let s8_col = 8 * n_sb; // 32-value groups per column
-        let d8_col = 2 * n_sb; // 128-value blocks per column
-
-        let s = lane & 7; // sub-block within the super-block
-        let grp = lane >> 3; // super-block within this iteration (0..4)
-
-        // Scalar accumulators (launch-uniform m keeps them in registers).
-        let mut f0 = 0.0f32;
-        let mut f1 = 0.0f32;
-        let mut f2 = 0.0f32;
-        let mut f3 = 0.0f32;
-        let mut f4 = 0.0f32;
-        let mut f5 = 0.0f32;
-        let mut f6 = 0.0f32;
-        let mut f7 = 0.0f32;
-
-        let mut it: u32 = 0;
-        while it < iters {
-            let sbp = 4 * it as usize + grp;
-            // The sbp guard makes a partial final iteration safe: guarded
-            // lanes load nothing of w/q/s8/d8. It is always true when n_sb
-            // is a multiple of 4.
-            if sbp < n_sb {
-                let wk = row * row_words + 36 * sbp; // super-block word base
-
-                // d/dmin word + the 12 scale bytes in words 1..3.
-                // SAFETY: sbp < n_sb, so wk+3 <= row*row_words +
-                // 36*(n_sb-1) + 3 < (row+1)*row_words <= w.len() by the
-                // launch contract.
-                let (w0, w1, w2, w3) = unsafe {
-                    (
-                        *w.get_unchecked(wk),
-                        *w.get_unchecked(wk + 1),
-                        *w.get_unchecked(wk + 2),
-                        *w.get_unchecked(wk + 3),
-                    )
-                };
-                let d = half_to_f32((w0 & 0xffff) as u16);
-                let dmin = half_to_f32((w0 >> 16) as u16);
-
-                let (sc, mi) = q4k_scale_min(s, w1, w2, w3);
-                // Column-independent chain coefficients.
-                let (cda, cdb) = q4k_coeff(d, dmin, sc, mi);
-
-                // qs word base: 8 words from super-block word 4 + 8*(s>>1);
-                // nibble select is the sub-block parity, 0 (low) or 4 (high).
-                // Hoisted (MUL-8): the window and its SWAR decode are
-                // column-independent, so decode once per iteration and let
-                // every column's A chain reuse the registers.
-                let qsk = wk + 4 + 8 * (s >> 1);
-                let nib_sh = (s as u32 & 1) * 4;
-                // SAFETY: qsk + 7 <= wk + 35, inside the row's word span by
-                // the same bound as w0..w3 above.
-                let vi = unsafe {
-                    [
-                        q4k_nibble(*w.get_unchecked(qsk), nib_sh),
-                        q4k_nibble(*w.get_unchecked(qsk + 1), nib_sh),
-                        q4k_nibble(*w.get_unchecked(qsk + 2), nib_sh),
-                        q4k_nibble(*w.get_unchecked(qsk + 3), nib_sh),
-                        q4k_nibble(*w.get_unchecked(qsk + 4), nib_sh),
-                        q4k_nibble(*w.get_unchecked(qsk + 5), nib_sh),
-                        q4k_nibble(*w.get_unchecked(qsk + 6), nib_sh),
-                        q4k_nibble(*w.get_unchecked(qsk + 7), nib_sh),
-                    ]
-                };
-
-                // This lane's q8 words in the q4 permutation: word i of
-                // column c lives at q_col*c + 256it + 32i + lane
-                // (host-verified identity with the value-order slot the
-                // linear layout used). The B-chain group of (it, lane) is
-                // 32it + lane: 32 consecutive i32 across the warp, one 128B
-                // line.
-                let qb = 256 * it as usize + lane;
-                let s8b = 32 * it as usize + lane;
-                // This lane's fields all sit in q8_1 block 2*sbp + s/4.
-                let d8b = 2 * sbp + (s >> 2);
-
-                // Column 0 (always active).
-                {
-                    let a = q4k_a_chain(&vi, q, qb);
-                    // SAFETY: the sbp guard keeps s8b < s8_col and
-                    // d8b < d8_col; s8.len() >= m*s8_col and d8.len() >=
-                    // m*d8_col by the contract (m >= 1).
-                    let b = unsafe { *s8.get_unchecked(s8b) };
-                    let e0 = unsafe { *d8.get_unchecked(d8b) };
-                    f0 += (a as f32 * cda + b as f32 * cdb) * e0;
-                }
-                // Columns 1..7, one launch-uniform guard per column so the
-                // work scales with m (MUL-8 amortization curve). Column c
-                // reads q8 words at q_col*c + qb (q4k_a_chain adds 32i), the
-                // s8 group at s8_col*c + s8b and block d8b + d8_col*c.
-                // SAFETY: guard c+1 means m >= c+1 is launch-uniform, so the
-                // buffer lengths (m*q_col / m*s8_col / m*d8_col) cover every
-                // offset below and the branch never diverges within a warp.
-                if m > 1 {
-                    // SAFETY: m > 1 => q.len() >= 2*q_col > q_col + qb + 224,
-                    // s8.len() >= 2*s8_col > s8_col + s8b,
-                    // d8.len() >= 2*d8_col > d8b + d8_col.
-                    let a = q4k_a_chain(&vi, q, q_col + qb);
-                    let b = unsafe { *s8.get_unchecked(s8_col + s8b) };
-                    let e1 = unsafe { *d8.get_unchecked(d8b + d8_col) };
-                    f1 += (a as f32 * cda + b as f32 * cdb) * e1;
-                }
-                if m > 2 {
-                    // SAFETY: m > 2 => q.len() >= 3*q_col > 2*q_col + qb + 224,
-                    // s8.len() >= 3*s8_col > 2*s8_col + s8b,
-                    // d8.len() >= 3*d8_col > d8b + 2*d8_col.
-                    let a = q4k_a_chain(&vi, q, 2 * q_col + qb);
-                    let b = unsafe { *s8.get_unchecked(2 * s8_col + s8b) };
-                    let e2 = unsafe { *d8.get_unchecked(d8b + 2 * d8_col) };
-                    f2 += (a as f32 * cda + b as f32 * cdb) * e2;
-                }
-                if m > 3 {
-                    // SAFETY: m > 3 => q.len() >= 4*q_col > 3*q_col + qb + 224,
-                    // s8.len() >= 4*s8_col > 3*s8_col + s8b,
-                    // d8.len() >= 4*d8_col > d8b + 3*d8_col.
-                    let a = q4k_a_chain(&vi, q, 3 * q_col + qb);
-                    let b = unsafe { *s8.get_unchecked(3 * s8_col + s8b) };
-                    let e3 = unsafe { *d8.get_unchecked(d8b + 3 * d8_col) };
-                    f3 += (a as f32 * cda + b as f32 * cdb) * e3;
-                }
-                if m > 4 {
-                    // SAFETY: m > 4 => q.len() >= 5*q_col > 4*q_col + qb + 224,
-                    // s8.len() >= 5*s8_col > 4*s8_col + s8b,
-                    // d8.len() >= 5*d8_col > d8b + 4*d8_col.
-                    let a = q4k_a_chain(&vi, q, 4 * q_col + qb);
-                    let b = unsafe { *s8.get_unchecked(4 * s8_col + s8b) };
-                    let e4 = unsafe { *d8.get_unchecked(d8b + 4 * d8_col) };
-                    f4 += (a as f32 * cda + b as f32 * cdb) * e4;
-                }
-                if m > 5 {
-                    // SAFETY: m > 5 => q.len() >= 6*q_col > 5*q_col + qb + 224,
-                    // s8.len() >= 6*s8_col > 5*s8_col + s8b,
-                    // d8.len() >= 6*d8_col > d8b + 5*d8_col.
-                    let a = q4k_a_chain(&vi, q, 5 * q_col + qb);
-                    let b = unsafe { *s8.get_unchecked(5 * s8_col + s8b) };
-                    let e5 = unsafe { *d8.get_unchecked(d8b + 5 * d8_col) };
-                    f5 += (a as f32 * cda + b as f32 * cdb) * e5;
-                }
-                if m > 6 {
-                    // SAFETY: m > 6 => q.len() >= 7*q_col > 6*q_col + qb + 224,
-                    // s8.len() >= 7*s8_col > 6*s8_col + s8b,
-                    // d8.len() >= 7*d8_col > d8b + 6*d8_col.
-                    let a = q4k_a_chain(&vi, q, 6 * q_col + qb);
-                    let b = unsafe { *s8.get_unchecked(6 * s8_col + s8b) };
-                    let e6 = unsafe { *d8.get_unchecked(d8b + 6 * d8_col) };
-                    f6 += (a as f32 * cda + b as f32 * cdb) * e6;
-                }
-                if m > 7 {
-                    // SAFETY: m > 7 => q.len() >= 8*q_col > 7*q_col + qb + 224,
-                    // s8.len() >= 8*s8_col > 7*s8_col + s8b,
-                    // d8.len() >= 8*d8_col > d8b + 7*d8_col.
-                    let a = q4k_a_chain(&vi, q, 7 * q_col + qb);
-                    let b = unsafe { *s8.get_unchecked(7 * s8_col + s8b) };
-                    let e7 = unsafe { *d8.get_unchecked(d8b + 7 * d8_col) };
-                    f7 += (a as f32 * cda + b as f32 * cdb) * e7;
-                }
-            }
-
-            it += 1;
-        }
+        // The per-row body (lane constants, the four-super-block iteration
+        // with the hoisted SWAR nibble decode, the guarded column chains) is
+        // `cores::q4k_row_dot`, so a fused kernel reusing it agrees with this
+        // one bit for bit.
+        let f = q4k_row_dot(
+            w,
+            q,
+            s8,
+            d8,
+            n_sb as usize,
+            iters,
+            row,
+            0,
+            m_cols as usize,
+            lane,
+        );
 
         // Warp-uniform reduction (m is a launch-wide constant). Column c's
         // reduction runs only when m > c; every lane takes the same branch,
         // so the shuffles stay warp-collective, and the tail scales with m
         // exactly like the column bodies above.
-        let s0 = warp::reduce_sum_f32(f0);
+        let s0 = warp::reduce_sum_f32(f[0]);
         if m == 1 {
             if lane == 0 {
                 // SAFETY: only lane 0 writes; warp `row` owns y[row].
@@ -434,13 +286,37 @@ mod kernels {
                 }
             }
         } else {
-            let s1 = warp::reduce_sum_f32(f1);
-            let s2 = if m > 2 { warp::reduce_sum_f32(f2) } else { 0.0 };
-            let s3 = if m > 3 { warp::reduce_sum_f32(f3) } else { 0.0 };
-            let s4 = if m > 4 { warp::reduce_sum_f32(f4) } else { 0.0 };
-            let s5 = if m > 5 { warp::reduce_sum_f32(f5) } else { 0.0 };
-            let s6 = if m > 6 { warp::reduce_sum_f32(f6) } else { 0.0 };
-            let s7 = if m > 7 { warp::reduce_sum_f32(f7) } else { 0.0 };
+            let s1 = warp::reduce_sum_f32(f[1]);
+            let s2 = if m > 2 {
+                warp::reduce_sum_f32(f[2])
+            } else {
+                0.0
+            };
+            let s3 = if m > 3 {
+                warp::reduce_sum_f32(f[3])
+            } else {
+                0.0
+            };
+            let s4 = if m > 4 {
+                warp::reduce_sum_f32(f[4])
+            } else {
+                0.0
+            };
+            let s5 = if m > 5 {
+                warp::reduce_sum_f32(f[5])
+            } else {
+                0.0
+            };
+            let s6 = if m > 6 {
+                warp::reduce_sum_f32(f[6])
+            } else {
+                0.0
+            };
+            let s7 = if m > 7 {
+                warp::reduce_sum_f32(f[7])
+            } else {
+                0.0
+            };
             if lane == 0 {
                 // SAFETY: only lane 0 of each warp writes the disjoint
                 // segment y[row*m .. row*m+m]: store c is guarded by m > c,

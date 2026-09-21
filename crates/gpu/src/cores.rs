@@ -168,6 +168,221 @@ pub fn q4k_coeff(d: f32, dmin: f32, sc: i32, mi: i32) -> (f32, f32) {
     (cda, cdb)
 }
 
+/// One row's Q4_K dot products with `m_cols` (1..=8) activation columns,
+/// pre-reduction: lane `lane` of the row's warp walks `iters`
+/// four-super-block iterations keeping per-column partial sums in scalars
+/// (the qs window decoded once per iteration and shared by every column —
+/// the per-op gemv's own shape), and the CALLER reduces the returned
+/// partials across the warp. The body is `q4k_gemv`'s, so a fused kernel
+/// that calls this one agrees with the per-op gemv bit for bit by
+/// construction.
+///
+/// Buffer layouts as `q4k_gemv` (see the Q4_K packing recap there): `w`
+/// holds rows of `36 * n_sb` u32 words (row `row_abs` based at word
+/// `row_abs * 36 * n_sb`; `row_abs` may be an indirect expert row), `q`
+/// holds per column `256 * iters` u32 in the quantizer's q4 permutation,
+/// `s8` per column `8 * n_sb` 32-value group sums and `d8` per column
+/// `2 * n_sb` block scales. Column c reads `(col0 + c)` of each.
+///
+/// SAFETY: callers guarantee `w.len() >= (row_abs + 1) * 36 * n_sb`,
+/// `q.len() >= (col0 + m_cols) * 256 * iters`, `s8.len() >= (col0 +
+/// m_cols) * 8 * n_sb`, `d8.len() >= (col0 + m_cols) * 2 * n_sb`,
+/// `iters = n_sb.div_ceil(4)`, and invoke this from all 32 lanes of one
+/// warp.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn q4k_row_dot(
+    w: &[u32],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    n_sb: usize,
+    iters: u32,
+    row_abs: usize,
+    col0: usize,
+    m_cols: usize,
+    lane: usize,
+) -> [f32; 8] {
+    let m = m_cols;
+    let row_words = 36 * n_sb; // 144 B per super-block
+    let q_col = 256 * iters as usize; // q8 words per column
+    let s8_col = 8 * n_sb; // 32-value groups per column
+    let d8_col = 2 * n_sb; // 128-value blocks per column
+
+    let s = lane & 7; // sub-block within the super-block
+    let grp = lane >> 3; // super-block within this iteration (0..4)
+
+    // Scalar accumulators (launch-uniform m keeps them in registers).
+    let mut f0 = 0.0f32;
+    let mut f1 = 0.0f32;
+    let mut f2 = 0.0f32;
+    let mut f3 = 0.0f32;
+    let mut f4 = 0.0f32;
+    let mut f5 = 0.0f32;
+    let mut f6 = 0.0f32;
+    let mut f7 = 0.0f32;
+
+    let qb0 = col0 * q_col;
+    let s8b0 = col0 * s8_col;
+    let d8b0 = col0 * d8_col;
+
+    let mut it: u32 = 0;
+    while it < iters {
+        let sbp = 4 * it as usize + grp;
+        // The sbp guard makes a partial final iteration safe: guarded
+        // lanes load nothing of w/q/s8/d8. It is always true when n_sb
+        // is a multiple of 4.
+        if sbp < n_sb {
+            let wk = row_abs * row_words + 36 * sbp; // super-block word base
+
+            // d/dmin word + the 12 scale bytes in words 1..3.
+            // SAFETY: sbp < n_sb, so wk+3 <= row_abs*row_words +
+            // 36*(n_sb-1) + 3 < (row_abs+1)*row_words <= w.len() by this
+            // fn's contract.
+            let (w0, w1, w2, w3) = unsafe {
+                (
+                    *w.get_unchecked(wk),
+                    *w.get_unchecked(wk + 1),
+                    *w.get_unchecked(wk + 2),
+                    *w.get_unchecked(wk + 3),
+                )
+            };
+            let d = half_to_f32((w0 & 0xffff) as u16);
+            let dmin = half_to_f32((w0 >> 16) as u16);
+
+            let (sc, mi) = q4k_scale_min(s, w1, w2, w3);
+            // Column-independent chain coefficients.
+            let (cda, cdb) = q4k_coeff(d, dmin, sc, mi);
+
+            // qs word base: 8 words from super-block word 4 + 8*(s>>1);
+            // nibble select is the sub-block parity, 0 (low) or 4 (high).
+            // Hoisted (MUL-8): the window and its SWAR decode are
+            // column-independent, so decode once per iteration and let
+            // every column's A chain reuse the registers.
+            let qsk = wk + 4 + 8 * (s >> 1);
+            let nib_sh = (s as u32 & 1) * 4;
+            // SAFETY: qsk + 7 <= wk + 35, inside the row's word span by
+            // the same bound as w0..w3 above.
+            let vi = unsafe {
+                [
+                    q4k_nibble(*w.get_unchecked(qsk), nib_sh),
+                    q4k_nibble(*w.get_unchecked(qsk + 1), nib_sh),
+                    q4k_nibble(*w.get_unchecked(qsk + 2), nib_sh),
+                    q4k_nibble(*w.get_unchecked(qsk + 3), nib_sh),
+                    q4k_nibble(*w.get_unchecked(qsk + 4), nib_sh),
+                    q4k_nibble(*w.get_unchecked(qsk + 5), nib_sh),
+                    q4k_nibble(*w.get_unchecked(qsk + 6), nib_sh),
+                    q4k_nibble(*w.get_unchecked(qsk + 7), nib_sh),
+                ]
+            };
+
+            // This lane's q8 words in the q4 permutation: word i of
+            // column c lives at q_col*c + 256it + 32i + lane
+            // (host-verified identity with the value-order slot the
+            // linear layout used). The B-chain group of (it, lane) is
+            // 32it + lane: 32 consecutive i32 across the warp, one 128B
+            // line.
+            let qb = 256 * it as usize + lane;
+            let s8b = 32 * it as usize + lane;
+            // This lane's fields all sit in q8_1 block 2*sbp + s/4.
+            let d8b = 2 * sbp + (s >> 2);
+
+            // Column 0 (always active).
+            {
+                let a = q4k_a_chain(&vi, q, qb0 + qb);
+                // SAFETY: the sbp guard keeps s8b < s8_col and
+                // d8b < d8_col; s8.len() >= (col0+1)*s8_col and d8.len() >=
+                // (col0+1)*d8_col by the contract (m >= 1).
+                let b = unsafe { *s8.get_unchecked(s8b0 + s8b) };
+                let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
+                f0 += (a as f32 * cda + b as f32 * cdb) * e0;
+            }
+            // Columns 1..7, one launch-uniform guard per column so the
+            // work scales with m (MUL-8 amortization curve). Column c
+            // reads q8 words at q_col*c + qb (q4k_a_chain adds 32i), the
+            // s8 group at s8_col*c + s8b and block d8b + d8_col*c.
+            // SAFETY: guard c+1 means m >= c+1 is launch-uniform, so the
+            // buffer lengths ((col0+m)*q_col / *s8_col / *d8_col) cover
+            // every offset below and the branch never diverges within a
+            // warp.
+            if m > 1 {
+                // SAFETY: m > 1 => q.len() >= (col0+2)*q_col >
+                // qb0 + 1*q_col + qb + 224, s8.len() >= (col0+2)*s8_col >
+                // s8b0 + 1*s8_col + s8b, d8.len() >= (col0+2)*d8_col >
+                // d8b0 + d8b + 1*d8_col.
+                let a = q4k_a_chain(&vi, q, qb0 + q_col + qb);
+                let b = unsafe { *s8.get_unchecked(s8b0 + s8_col + s8b) };
+                let e1 = unsafe { *d8.get_unchecked(d8b0 + d8b + d8_col) };
+                f1 += (a as f32 * cda + b as f32 * cdb) * e1;
+            }
+            if m > 2 {
+                // SAFETY: m > 2 => q.len() >= (col0+3)*q_col >
+                // qb0 + 2*q_col + qb + 224, s8.len() >= (col0+3)*s8_col >
+                // s8b0 + 2*s8_col + s8b, d8.len() >= (col0+3)*d8_col >
+                // d8b0 + d8b + 2*d8_col.
+                let a = q4k_a_chain(&vi, q, qb0 + 2 * q_col + qb);
+                let b = unsafe { *s8.get_unchecked(s8b0 + 2 * s8_col + s8b) };
+                let e2 = unsafe { *d8.get_unchecked(d8b0 + d8b + 2 * d8_col) };
+                f2 += (a as f32 * cda + b as f32 * cdb) * e2;
+            }
+            if m > 3 {
+                // SAFETY: m > 3 => q.len() >= (col0+4)*q_col >
+                // qb0 + 3*q_col + qb + 224, s8.len() >= (col0+4)*s8_col >
+                // s8b0 + 3*s8_col + s8b, d8.len() >= (col0+4)*d8_col >
+                // d8b0 + d8b + 3*d8_col.
+                let a = q4k_a_chain(&vi, q, qb0 + 3 * q_col + qb);
+                let b = unsafe { *s8.get_unchecked(s8b0 + 3 * s8_col + s8b) };
+                let e3 = unsafe { *d8.get_unchecked(d8b0 + d8b + 3 * d8_col) };
+                f3 += (a as f32 * cda + b as f32 * cdb) * e3;
+            }
+            if m > 4 {
+                // SAFETY: m > 4 => q.len() >= (col0+5)*q_col >
+                // qb0 + 4*q_col + qb + 224, s8.len() >= (col0+5)*s8_col >
+                // s8b0 + 4*s8_col + s8b, d8.len() >= (col0+5)*d8_col >
+                // d8b0 + d8b + 4*d8_col.
+                let a = q4k_a_chain(&vi, q, qb0 + 4 * q_col + qb);
+                let b = unsafe { *s8.get_unchecked(s8b0 + 4 * s8_col + s8b) };
+                let e4 = unsafe { *d8.get_unchecked(d8b0 + d8b + 4 * d8_col) };
+                f4 += (a as f32 * cda + b as f32 * cdb) * e4;
+            }
+            if m > 5 {
+                // SAFETY: m > 5 => q.len() >= (col0+6)*q_col >
+                // qb0 + 5*q_col + qb + 224, s8.len() >= (col0+6)*s8_col >
+                // s8b0 + 5*s8_col + s8b, d8.len() >= (col0+6)*d8_col >
+                // d8b0 + d8b + 5*d8_col.
+                let a = q4k_a_chain(&vi, q, qb0 + 5 * q_col + qb);
+                let b = unsafe { *s8.get_unchecked(s8b0 + 5 * s8_col + s8b) };
+                let e5 = unsafe { *d8.get_unchecked(d8b0 + d8b + 5 * d8_col) };
+                f5 += (a as f32 * cda + b as f32 * cdb) * e5;
+            }
+            if m > 6 {
+                // SAFETY: m > 6 => q.len() >= (col0+7)*q_col >
+                // qb0 + 6*q_col + qb + 224, s8.len() >= (col0+7)*s8_col >
+                // s8b0 + 6*s8_col + s8b, d8.len() >= (col0+7)*d8_col >
+                // d8b0 + d8b + 6*d8_col.
+                let a = q4k_a_chain(&vi, q, qb0 + 6 * q_col + qb);
+                let b = unsafe { *s8.get_unchecked(s8b0 + 6 * s8_col + s8b) };
+                let e6 = unsafe { *d8.get_unchecked(d8b0 + d8b + 6 * d8_col) };
+                f6 += (a as f32 * cda + b as f32 * cdb) * e6;
+            }
+            if m > 7 {
+                // SAFETY: m > 7 => q.len() >= (col0+8)*q_col >
+                // qb0 + 7*q_col + qb + 224, s8.len() >= (col0+8)*s8_col >
+                // s8b0 + 7*s8_col + s8b, d8.len() >= (col0+8)*d8_col >
+                // d8b0 + d8b + 7*d8_col.
+                let a = q4k_a_chain(&vi, q, qb0 + 7 * q_col + qb);
+                let b = unsafe { *s8.get_unchecked(s8b0 + 7 * s8_col + s8b) };
+                let e7 = unsafe { *d8.get_unchecked(d8b0 + d8b + 7 * d8_col) };
+                f7 += (a as f32 * cda + b as f32 * cdb) * e7;
+            }
+        }
+
+        it += 1;
+    }
+
+    [f0, f1, f2, f3, f4, f5, f6, f7]
+}
+
 // ---- Q3_K ----
 
 /// The aux[] shuffle of ggml's dequantize_row_q3_K over the three funneled
