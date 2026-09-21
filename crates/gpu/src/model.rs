@@ -13,8 +13,13 @@
 //! enqueue/replay, so one captured graph serves every position, and the
 //! routed expert ids live in a device buffer the expert kernels read per
 //! launch, so one captured graph serves every routing.
-//! Stitching the layers of a stage into one [`GpuModel::step`] is another
-//! round; that entry names what is missing.
+//! [`GpuModel::step`] stitches those layers into the whole chain — layer 0
+//! embedding its token, every later layer reading the previous layer's
+//! output residual, the `head.rs` output head on the last — and returns the
+//! argmax of the last token it was given. The chain submits in one of two
+//! modes ([`StepMode`]): eager, which enqueues the body per token, or graph,
+//! which captures the body once and replays it. Only the argmax readback
+//! synchronizes.
 //!
 //! The op set of P1–P7 has no f32 concat or strided per-head addressing
 //! (both live in the CPU chain: the `kvr`/flash-row concats and the
@@ -29,6 +34,7 @@
 //! equals the plain gemv's on the same row and column bit for bit.
 //! Everything else runs the gated kernels verbatim.
 
+use crate::head::Head;
 use crate::q5::Q8Blocks32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, Weights};
@@ -1133,16 +1139,43 @@ impl ProfRec {
     }
 }
 
+/// How [`GpuModel::step`] submits the chain. Both modes run the same body
+/// over the same resident buffers; the graph mode records it once and
+/// replays, so it pays the host submit of ~700 launches only at capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepMode {
+    /// Enqueue the whole body per token.
+    Eager,
+    /// Capture the body on first use, then replay it per token.
+    Graph,
+}
+
 /// One resident model: its stages in layer order, covering every block
 /// exactly once. Everything `step` touches is allocated at load, never per
 /// step.
 pub struct GpuModel {
+    /// The whole chain (every layer plus the head) captured once and
+    /// replayed per token. Deliberately not `Stage::graph`, whose
+    /// `(layer, embed)` identity the block gates own.
+    ///
+    /// Declared FIRST, and the head second, because fields drop in
+    /// declaration order and a graph must be destroyed while every buffer
+    /// it addresses is still alive — the same reason `Stage` declares its
+    /// `graph` above `residency`.
+    step_graph: Option<Graph>,
+    /// The output head — present only on a model that holds every block
+    /// ([`GpuModel::load_full`]). A partial stage has no logits to take, so
+    /// `step` refuses on one.
+    head: Option<Head>,
     stages: Vec<Stage>,
     mla: MlaParams,
     /// The MoE shapes — `None` when no resident layer routes.
     moe: Option<MoeDims>,
     /// KV rows the resident cache was sized for; `step` refuses to grow it.
     ctx_max: usize,
+    mode: StepMode,
+    /// The cache row the next `step` token lands in.
+    pos: u32,
 }
 
 impl GpuModel {
@@ -1194,6 +1227,10 @@ impl GpuModel {
             mla,
             moe: None,
             ctx_max,
+            head: None,
+            step_graph: None,
+            mode: StepMode::Graph,
+            pos: 0,
         })
     }
 
@@ -1255,7 +1292,30 @@ impl GpuModel {
             mla,
             moe,
             ctx_max,
+            head: None,
+            step_graph: None,
+            mode: StepMode::Graph,
+            pos: 0,
         })
+    }
+
+    /// Every block of the file resident, plus the output head: the model
+    /// [`GpuModel::step`] needs. `load_blocks(0..block_count)` first (so the
+    /// head's `output_norm.weight` / `output.weight` arrive with the
+    /// globals), then the head over those same resident weights.
+    pub fn load_full(gguf: &gguf::Gguf, ctx_max: usize) -> Result<GpuModel, GpuError> {
+        let n_layers = gguf
+            .block_count()
+            .ok_or("GpuModel::load_full: metadata key block_count missing")?
+            as usize;
+        let mut m = GpuModel::load_blocks(gguf, ctx_max, 0..n_layers)?;
+        let eps = m.mla.eps;
+        let head = {
+            let (gpu, residency) = m.stage_parts("load_full")?;
+            Head::new(gpu, &residency.weights, eps)?
+        };
+        m.head = Some(head);
+        Ok(m)
     }
 
     pub fn stages(&self) -> &[Stage] {
@@ -1270,21 +1330,179 @@ impl GpuModel {
         self.ctx_max
     }
 
-    /// One decode step: append `tokens` to the KV cache and return the argmax
-    /// of the last position's logits. The layers are assembled one at a time
-    /// (`step_layer_taps`) but not yet stitched into a stage-wide chain, and
-    /// the lm_head lives in `head.rs`, so this is an error, not a panic, and
-    /// a caller can probe for it.
+    /// Device bytes of everything this model holds resident: the stage's
+    /// weights, caches and scratch, plus the head's scratch when it has one.
+    pub fn resident_bytes(&self) -> usize {
+        self.stages.iter().map(Stage::resident_bytes).sum::<usize>()
+            + self.head.as_ref().map_or(0, Head::resident_bytes)
+    }
+
+    /// The cache row the next [`GpuModel::step`] token lands in.
+    pub fn pos(&self) -> u32 {
+        self.pos
+    }
+
+    pub fn mode(&self) -> StepMode {
+        self.mode
+    }
+
+    /// Choose how the chain submits. Changing the mode drops any captured
+    /// chain: the graph is a recording of this body over these buffers, and
+    /// a later `Graph` run recaptures rather than replay a stale one.
+    pub fn set_mode(&mut self, mode: StepMode) {
+        if mode != self.mode {
+            self.step_graph = None;
+        }
+        self.mode = mode;
+    }
+
+    /// Rewind to position 0 with empty caches — the fresh-context state for
+    /// the next prompt. The weights, the scratch and any captured chain stay
+    /// (they do not depend on the cache contents); every layer's cache is
+    /// zeroed, because the flash walks whole key segments and a stale row
+    /// inside the last segment of a short run is a real key row, not a
+    /// skipped one.
+    pub fn reset(&mut self) -> Result<(), GpuError> {
+        let slots = match self.stages.first().and_then(|s| s.residency.as_ref()) {
+            Some(r) => r.kv.len(),
+            None => return Err("GpuModel::reset: stage carries no residency".into()),
+        };
+        let zero_row = {
+            let r = self.stages[0].residency.as_ref().unwrap();
+            vec![0u16; r.kv[0].cols()]
+        };
+        for slot in 0..slots {
+            let (gpu, residency) = self.stage_parts("reset")?;
+            seed_cache(gpu, &mut residency.kv[slot], &zero_row, "reset")?;
+        }
+        self.pos = 0;
+        Ok(())
+    }
+
+    /// Capture the whole chain — every resident layer plus the head — into
+    /// one graph over the resident buffers, and return its node count. One
+    /// graph, not a chain of per-layer graphs: the layers differ only in
+    /// which weights and which cache they address, all of them frozen at
+    /// load, and a single `cuGraphLaunch` is the whole point of the capture
+    /// (a chain of 27 launches would pay 27 host submits per token).
+    pub fn capture_step(&mut self) -> Result<usize, GpuError> {
+        let mla = self.mla.clone();
+        let moe = self.moe.clone();
+        let head = self
+            .head
+            .as_mut()
+            .ok_or("GpuModel::capture_step: no output head — load with load_full")?;
+        let stage = self
+            .stages
+            .first_mut()
+            .ok_or("GpuModel::capture_step: no stage")?;
+        let Some(Residency {
+            weights,
+            kv,
+            names,
+            scratch,
+            step,
+        }) = stage.residency.as_mut()
+        else {
+            return Err("GpuModel::capture_step: stage carries no residency".into());
+        };
+        let gpu = &stage.gpu;
+        let graph = gpu.capture(|_| {
+            enqueue_chain(
+                gpu,
+                step,
+                weights,
+                names,
+                kv,
+                scratch,
+                &mla,
+                moe.as_ref(),
+                head,
+            )
+        })?;
+        let nodes = graph.node_count();
+        self.step_graph = Some(graph);
+        Ok(nodes)
+    }
+
+    /// Enqueue the whole chain eagerly on the engine stream. Pure enqueues —
+    /// the same body [`GpuModel::capture_step`] records.
+    fn enqueue_chain_step(&mut self) -> Result<(), GpuError> {
+        let mla = self.mla.clone();
+        let moe = self.moe.clone();
+        let head = self
+            .head
+            .as_mut()
+            .ok_or("GpuModel::step: no output head — load with load_full")?;
+        let stage = self.stages.first_mut().ok_or("GpuModel::step: no stage")?;
+        let Some(Residency {
+            weights,
+            kv,
+            names,
+            scratch,
+            step,
+        }) = stage.residency.as_mut()
+        else {
+            return Err("GpuModel::step: stage carries no residency".into());
+        };
+        enqueue_chain(
+            &stage.gpu,
+            step,
+            weights,
+            names,
+            kv,
+            scratch,
+            &mla,
+            moe.as_ref(),
+            head,
+        )
+    }
+
+    /// Feed `tokens` through the chain one position at a time and return the
+    /// argmax of the LAST one — the greedy next token. Each token gets its
+    /// own `refresh_params` (outside any capture) and one body; only the
+    /// argmax readback at the end synchronizes the stream, so a prompt of P
+    /// tokens is P bodies and one sync.
+    ///
+    /// Positions continue from wherever the model stands: a prompt then its
+    /// continuation is `step(&prompt)` followed by one `step(&[tok])` per
+    /// generated token. [`GpuModel::reset`] rewinds.
     pub fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         if tokens.is_empty() {
             return Err("GpuModel::step: empty token slice".into());
         }
-        Err(
-            "GpuModel::step: the stage-wide chain (layer to layer residual, the \
-             head) is another round; one layer at a time is assembled — see \
-             step_block0_taps and step_layer_taps"
-                .into(),
-        )
+        if self.head.is_none() {
+            return Err("GpuModel::step: no output head — load with load_full".into());
+        }
+        if self.stages.len() != 1 || self.stages[0].layers.start != 0 {
+            return Err(
+                "GpuModel::step: the token loop needs the single whole-model stage of \
+                 load_full"
+                    .into(),
+            );
+        }
+        if self.mode == StepMode::Graph && self.step_graph.is_none() {
+            self.capture_step()?;
+        }
+        for &token in tokens {
+            let pos = self.pos;
+            self.check_pos(pos, "step")?;
+            self.refresh_params(token, pos)?;
+            match self.mode {
+                StepMode::Eager => self.enqueue_chain_step()?,
+                StepMode::Graph => self
+                    .step_graph
+                    .as_ref()
+                    .ok_or("GpuModel::step: no captured chain")?
+                    .launch(self.stages[0].gpu.stream())?,
+            }
+            self.pos = pos + 1;
+        }
+        let gpu = &self.stages[0].gpu;
+        self.head
+            .as_ref()
+            .ok_or("GpuModel::step: no output head")?
+            .token(gpu)
     }
 
     // ------------------------------------------------- assembled layer step
@@ -2225,6 +2443,60 @@ fn tick(
 /// The host-side observer a chain enqueue ticks: `(op index, op name, the
 /// bytes that launch touches)`.
 type Observer<'a> = dyn FnMut(usize, &'static str, Bytes) -> Result<(), GpuError> + 'a;
+
+/// Enqueue the whole decode chain at m = 1: layer 0 with its embedding,
+/// every later layer reading the previous layer's output, then the head.
+/// Asynchronous throughout — no allocation, no synchronization, no host
+/// round trip — so this is both the eager body and what the capture records.
+///
+/// The residual chain is a copy, not an alias: a layer reads its input from
+/// `s.x` and writes its output to `s.l_out` (the down store folds the
+/// residual in), and one arena serves every layer, so the boundary is one
+/// 8 KiB device-to-device copy per layer — a memcpy node inside the capture.
+/// The last layer copies into the head's own input buffer instead.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_chain(
+    gpu: &Gpu,
+    step: &StepKernels,
+    w: &Weights,
+    names: &[LayerNames],
+    kv: &mut [DeviceTensor<u16>],
+    s: &mut LayerScratch,
+    mla: &MlaParams,
+    moe: Option<&MoeDims>,
+    head: &mut Head,
+) -> Result<(), GpuError> {
+    if names.is_empty() || names.len() != kv.len() {
+        return Err(format!(
+            "enqueue_chain: {} layers and {} caches",
+            names.len(),
+            kv.len()
+        )
+        .into());
+    }
+    let stream = gpu.stream();
+    let last = names.len() - 1;
+    for slot in 0..names.len() {
+        enqueue_layer(
+            gpu,
+            step,
+            w,
+            &names[slot],
+            &mut kv[slot],
+            s,
+            mla,
+            moe,
+            slot == 0,
+            &mut |_, _, _| Ok(()),
+        )?;
+        if slot == last {
+            head.input_mut().copy_from_device_async(&s.l_out, stream)?;
+        } else {
+            s.x.copy_from_device_async(&s.l_out, stream)?;
+        }
+    }
+    head.enqueue(gpu, w)
+}
 
 /// Enqueue one layer's whole step at m = 1: the token embedding when the
 /// layer is the first of the model, the attention half every layer shares,
