@@ -45,12 +45,120 @@ pub use tensor::{DeviceTensor, Q8Act};
 /// launch, capture, or copy-back.
 pub type GpuError = Box<dyn std::error::Error>;
 
+/// One 128-value q8_1 block of column `col` of the activation plane based at
+/// `x0`, quantized and stored in the three gemv permutations plus the group
+/// sums and the block scale. The body of `kernels::q3k_quantize_q8_1` — the
+/// whole numeric contract of q8_1 activations lives here once, and the
+/// single- and pair-destination kernels are the two ways of reaching it, so
+/// their bytes agree by construction rather than by inspection.
+///
+/// Lives outside the `#[cuda_module]` for the reason `cores` does: a
+/// device-callable body. It is not in `cores` because its stores need the
+/// module's `DisjointSlice` outputs, which no core takes.
+///
+/// SAFETY: the caller guarantees `col < m_cols`, `b < 2 * n_sb`, the launch
+/// contract's bounds on `x` at base `x0` and on the five outputs, and that
+/// all 32 lanes of one warp enter with the same `(col, b)` — the collectives
+/// below are warp-wide.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) fn q8_1_quant_block(
+    x: &[f32],
+    x0: usize,
+    col: usize,
+    b: usize,
+    n_sb: usize,
+    half_it: u32,
+    quad_it: u32,
+    lane: usize,
+    q3: &mut DisjointSlice<u64>,
+    q4: &mut DisjointSlice<u32>,
+    q6: &mut DisjointSlice<u32>,
+    s8: &mut DisjointSlice<i32>,
+    d8: &mut DisjointSlice<f32>,
+) {
+    use crate::cores::{q3_slot, q4_slot, q6_slot, q8_quad};
+
+    // Lane covers the four consecutive values 4*lane .. 4*lane+3 of the
+    // block; the warp max over the four per-lane maxima is the block amax
+    // (no cross-lane byte packing needed, unlike the 32-value geometry where
+    // one value per lane forced two shuffle_downs).
+    let base = x0 + col * 256 * n_sb + 128 * b + 4 * lane;
+    // SAFETY: base + 3 < x0 + (col+1)*256*n_sb <= x.len() by the caller's
+    // contract.
+    let (v0, v1, v2, v3) = unsafe {
+        (
+            *x.get_unchecked(base),
+            *x.get_unchecked(base + 1),
+            *x.get_unchecked(base + 2),
+            *x.get_unchecked(base + 3),
+        )
+    };
+    let amax = warp::reduce_max_f32(v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()));
+    let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let (word, quad) = q8_quad([v0, v1, v2, v3], d);
+
+    // v4 = this word's index in value order within the column: the word
+    // covers values 128b + 4*lane .. +3, so v4 = 32b + lane (32 words per
+    // 128-value block, 2*n_sb blocks per column). Each q*_slot maps it to
+    // the load slot of the named gemv geometry — permutations per
+    // 2-super-block (q3/q6) or 4-super-block (q4) group, host-verified
+    // including this value-span tie (an earlier draft said 16b + lane, which
+    // the load-site check alone could not catch because both sides then
+    // agree on a wrong bijection over half the column).
+    let v4 = (32 * b + lane) as u32;
+    // Q3_K u64 pairing: the two fields of a gemv load PAIR (j, j^1) are
+    // always held by quantize lanes lane and lane^8 of one block (v4 differs
+    // only in bit 3), so q3_slot(v4) is a bijection onto the column's
+    // 64*half_it u64 slots with v4's bit 3 selecting the half. All lanes run
+    // the collective shuffle; the bit3-clear half stores.
+    let g3 = q3_slot(v4);
+    let partner = warp::shuffle_xor(word, 8);
+    let cb = col * 64 * half_it as usize;
+    let p4 = q4_slot(v4);
+    let p6 = q6_slot(v4);
+    let cu4 = col * 256 * quad_it as usize;
+    let cu6 = col * 128 * half_it as usize;
+    // SAFETY: q3_slot < 64*half_it, q4_slot < 256*quad_it and q6_slot <
+    // 128*half_it per column (permutations of the column's value words onto
+    // its group slots, host-verified bijections incl. the q3 pair check);
+    // the three stores hit three distinct buffers, bit3-clear lanes of a
+    // block write disjoint u64 positions, every lane its own u32 position.
+    unsafe {
+        if lane & 8 == 0 {
+            *q3.get_unchecked_mut(cb + g3 as usize) = (word as u64) | ((partner as u64) << 32);
+        }
+        *q4.get_unchecked_mut(cu4 + p4 as usize) = word;
+        *q6.get_unchecked_mut(cu6 + p6 as usize) = word;
+    }
+
+    // 32-value-group signed sums: butterfly over the lane-local quad sums
+    // (masks 1, 2, 4); afterwards every lane holds its octet's total and
+    // lanes 8k write group 4b + k of the column.
+    let mut g = quad;
+    g += warp::shuffle_xor(g as u32, 1) as i32;
+    g += warp::shuffle_xor(g as u32, 2) as i32;
+    g += warp::shuffle_xor(g as u32, 4) as i32;
+    if lane & 7 == 0 {
+        // SAFETY: group index 4b + lane/8 < 8*n_sb per column; s8 holds
+        // m_cols*8*n_sb words and one lane writes each group.
+        unsafe {
+            *s8.get_unchecked_mut(col * 8 * n_sb + 4 * b + (lane >> 3)) = g;
+        }
+    }
+    if lane == 0 {
+        // SAFETY: lane 0 of each warp writes its own d8 slot.
+        unsafe {
+            *d8.get_unchecked_mut(col * 2 * n_sb + b) = d;
+        }
+    }
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
     use crate::cores::{
-        funnel16, half_to_f32, q3_slot, q3k_row_dot, q4_slot, q4k_row_dot, q6_slot, q6k_chain,
-        q6k_dequant, q6k_sub_scale, q8_quad,
+        funnel16, half_to_f32, q3k_row_dot, q4k_row_dot, q6k_chain, q6k_dequant, q6k_sub_scale,
     };
 
     /// Q3_K packing recap (decode verified against ggml's
@@ -127,74 +235,122 @@ mod kernels {
         let col = blk / blocks_per_col;
         let b = blk % blocks_per_col;
         let lane = warp::lane_id() as usize;
+        // SAFETY: col < m_cols and b < 2*n_sb by the two lines above; the
+        // launch contract carries the rest of `q8_1_quant_block`'s
+        // preconditions, and the block index is warp-uniform.
+        q8_1_quant_block(
+            x,
+            x0 as usize,
+            col,
+            b,
+            n_sb,
+            half_it,
+            quad_it,
+            lane,
+            &mut q3,
+            &mut q4,
+            &mut q6,
+            &mut s8,
+            &mut d8,
+        );
+    }
 
-        // Lane covers the four consecutive values 4*lane .. 4*lane+3 of the
-        // block; the warp max over the four per-lane maxima is the block
-        // amax (no cross-lane byte packing needed, unlike the 32-value
-        // geometry where one value per lane forced two shuffle_downs).
-        let base = x0 as usize + col * 256 * n_sb + 128 * b + 4 * lane;
-        let v0 = unsafe { *x.get_unchecked(base) };
-        let v1 = unsafe { *x.get_unchecked(base + 1) };
-        let v2 = unsafe { *x.get_unchecked(base + 2) };
-        let v3 = unsafe { *x.get_unchecked(base + 3) };
-        let amax = warp::reduce_max_f32(v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs()));
-        let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let (word, quad) = q8_quad([v0, v1, v2, v3], d);
-
-        // v4 = this word's index in value order within the column: the word
-        // covers values 128b + 4*lane .. +3, so v4 = 32b + lane (32 words
-        // per 128-value block, 2*n_sb blocks per column). Each q*_slot maps
-        // it to the load slot of the named gemv geometry — permutations per
-        // 2-super-block (q3/q6) or 4-super-block (q4) group, host-verified
-        // including this value-span tie (an earlier draft said 16b + lane,
-        // which the load-site check alone could not catch because both
-        // sides then agree on a wrong bijection over half the column).
-        let v4 = (32 * b + lane) as u32;
-        // Q3_K u64 pairing: the two fields of a gemv load PAIR (j, j^1) are
-        // always held by quantize lanes lane and lane^8 of one block (v4
-        // differs only in bit 3), so q3_slot(v4) is a bijection onto the
-        // column's 64*half_it u64 slots with v4's bit 3 selecting the half.
-        // All lanes run the collective shuffle; the bit3-clear half stores.
-        let g3 = q3_slot(v4);
-        let partner = warp::shuffle_xor(word, 8);
-        let cb = col * 64 * half_it as usize;
-        let p4 = q4_slot(v4);
-        let p6 = q6_slot(v4);
-        let cu4 = col * 256 * quad_it as usize;
-        let cu6 = col * 128 * half_it as usize;
-        // SAFETY: q3_slot < 64*half_it, q4_slot < 256*quad_it and
-        // q6_slot < 128*half_it per column (permutations of the column's
-        // value words onto its group slots, host-verified bijections incl.
-        // the q3 pair check); the three stores hit three distinct buffers,
-        // bit3-clear lanes of a block write disjoint u64 positions, every
-        // lane its own u32 position.
-        unsafe {
-            if lane & 8 == 0 {
-                *q3.get_unchecked_mut(cb + g3 as usize) = (word as u64) | ((partner as u64) << 32);
-            }
-            *q4.get_unchecked_mut(cu4 + p4 as usize) = word;
-            *q6.get_unchecked_mut(cu6 + p6 as usize) = word;
+    /// Two independent q8_1 quantizations of the SAME source buffer in one
+    /// launch: blocks below `m_cols * 2 * n_sb` quantize the plane at `x0_a`
+    /// into the `_a` outputs, the rest the plane at `x0_b` into `_b`. Both
+    /// planes are `m_cols` columns of `256 * n_sb` values, so the grid is
+    /// twice the single form's and the arm is a block-uniform branch — no
+    /// warp splits, every collective inside the body still warp-wide.
+    ///
+    /// The body is `q8_1_quant_block` either way, so each output is the
+    /// bytes its own `q3k_quantize_q8_1` launch would have written.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= x0_a + m_cols * 256 * n_sb,
+            x.len() >= x0_b + m_cols * 256 * n_sb,
+            q3a.len() >= m_cols * 64 * half_it,
+            q4a.len() >= m_cols * 256 * quad_it,
+            q6a.len() >= m_cols * 128 * half_it,
+            s8a.len() >= m_cols * 8 * n_sb,
+            d8a.len() >= m_cols * 2 * n_sb,
+            q3b.len() >= m_cols * 64 * half_it,
+            q4b.len() >= m_cols * 256 * quad_it,
+            q6b.len() >= m_cols * 128 * half_it,
+            s8b.len() >= m_cols * 8 * n_sb,
+            d8b.len() >= m_cols * 2 * n_sb
+        )
+    )]
+    pub fn q3k_quantize_q8_1_pair(
+        x: &[f32],
+        x0_a: u32,
+        x0_b: u32,
+        m_cols: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3a: DisjointSlice<u64>,
+        mut q4a: DisjointSlice<u32>,
+        mut q6a: DisjointSlice<u32>,
+        mut s8a: DisjointSlice<i32>,
+        mut d8a: DisjointSlice<f32>,
+        mut q3b: DisjointSlice<u64>,
+        mut q4b: DisjointSlice<u32>,
+        mut q6b: DisjointSlice<u32>,
+        mut s8b: DisjointSlice<i32>,
+        mut d8b: DisjointSlice<f32>,
+    ) {
+        let blk = thread::index_1d().get() / 32;
+        let n_sb = n_sb as usize;
+        let blocks_per_col = 2 * n_sb;
+        let total = m_cols as usize * blocks_per_col;
+        if blk >= 2 * total {
+            return;
         }
-
-        // 32-value-group signed sums: butterfly over the lane-local quad
-        // sums (masks 1, 2, 4); afterwards every lane holds its octet's
-        // total and lanes 8k write group 4b + k of the column.
-        let mut g = quad;
-        g += warp::shuffle_xor(g as u32, 1) as i32;
-        g += warp::shuffle_xor(g as u32, 2) as i32;
-        g += warp::shuffle_xor(g as u32, 4) as i32;
-        if lane & 7 == 0 {
-            // SAFETY: group index 4b + lane/8 < 8*n_sb per column; s8 holds
-            // m_cols*8*n_sb words and one lane writes each group.
-            unsafe {
-                *s8.get_unchecked_mut(col * 8 * n_sb + 4 * b + (lane >> 3)) = g;
-            }
-        }
-        if lane == 0 {
-            // SAFETY: lane 0 of each warp writes its own d8 slot.
-            unsafe {
-                *d8.get_unchecked_mut(col * 2 * n_sb + b) = d;
-            }
+        let lane = warp::lane_id() as usize;
+        // SAFETY (both arms): the arm's index is below `total`, so col <
+        // m_cols and b < 2*n_sb; the launch contract bounds `x` at both
+        // bases and each arm's five outputs. The arm is chosen by the block
+        // index, so a warp never splits across it.
+        if blk < total {
+            let (col, b) = (blk / blocks_per_col, blk % blocks_per_col);
+            q8_1_quant_block(
+                x,
+                x0_a as usize,
+                col,
+                b,
+                n_sb,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3a,
+                &mut q4a,
+                &mut q6a,
+                &mut s8a,
+                &mut d8a,
+            );
+        } else {
+            let k = blk - total;
+            let (col, b) = (k / blocks_per_col, k % blocks_per_col);
+            q8_1_quant_block(
+                x,
+                x0_b as usize,
+                col,
+                b,
+                n_sb,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3b,
+                &mut q4b,
+                &mut q6b,
+                &mut s8b,
+                &mut d8b,
+            );
         }
     }
 
@@ -1084,6 +1240,65 @@ impl Gpu {
             &mut act.q6,
             &mut act.s8,
             &mut act.d8,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the q8_1 quantization of TWO slices of the same buffer in one
+    /// launch: `x[a0 .. a0 + m*k]` into `a` and `x[b0 .. b0 + m*k]` into `b`,
+    /// the same bytes the two `enqueue_quantize_q8_1_at` calls write. Both
+    /// scratches must have the same shape (one grid covers both halves).
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_quantize_q8_1_pair(
+        &self,
+        x: &DeviceBuffer<f32>,
+        a0: usize,
+        a: &mut Q8Act,
+        b0: usize,
+        b: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        let (m, n_sb) = (a.m(), a.n_sb());
+        if b.m() != m || b.k() != a.k() {
+            return Err(format!(
+                "enqueue_quantize_q8_1_pair: both halves must share a shape, got a {}x{} b {}x{}",
+                a.m(),
+                a.k(),
+                b.m(),
+                b.k()
+            )
+            .into());
+        }
+        let need = m * a.k();
+        if x.len() < a0 + need || x.len() < b0 + need {
+            return Err(format!(
+                "enqueue_quantize_q8_1_pair: x.len() {} < max(a0 {a0}, b0 {b0}) + m*k = {need}",
+                x.len()
+            )
+            .into());
+        }
+        let prep = self
+            .module
+            .prepare_q3k_quantize_q8_1_pair(LaunchConfig1D::new((m * n_sb * 4) as u32, 32, 0))?;
+        self.module.q3k_quantize_q8_1_pair(
+            &self.stream,
+            &prep,
+            x,
+            a0 as u32,
+            b0 as u32,
+            m as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            n_sb.div_ceil(4) as u32,
+            &mut a.q3,
+            &mut a.q4,
+            &mut a.q6,
+            &mut a.s8,
+            &mut a.d8,
+            &mut b.q3,
+            &mut b.q4,
+            &mut b.q6,
+            &mut b.s8,
+            &mut b.d8,
         )?;
         Ok(())
     }

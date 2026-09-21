@@ -92,8 +92,25 @@ const FENCE: f32 = 0.25;
 /// pair that stopped fusing, a debug copy left in the chain — keeps every
 /// other arm of this gate green (eager still equals replay, ops still equal
 /// nodes) and fails only here.
+///
+/// PIN(2026-09-21, lfold round): 21 → 20. The attention half's two
+/// `gemv_q3k_heads` launches (heads 0..7 and 8..15) became one
+/// `gemv_q3k_heads_pair` launch over all sixteen, each head still dotting
+/// its own activation column — one launch fewer, the same rows, the same
+/// arithmetic. Derivation: 21 − 1. FAIL-first held: the same source with
+/// this constant still 21 printed `block 0 captures 20 nodes, the pin is
+/// 21` while every bit-identity arm of this gate stayed green.
+///
+/// PIN(2026-09-21, lfold round): 20 → 19. The attention half's two
+/// `quantize_q8_1(kqvc_*)` launches became one `quantize_q8_1_pair` whose
+/// grid covers both halves of the same buffer, each block running the same
+/// per-block body. Derivation: 20 − 1. FAIL-first held the same way
+/// (`block 0 captures 19 nodes, the pin is 20`, every other arm green).
+/// Both merges carry a value-neutral rollback lever
+/// (`StepProbe::split_heads`, `split_kqvc`), so this count is the default
+/// path's, not the only one the binary can capture.
 #[cfg(feature = "gpu")]
-const NODES_BLOCK0: usize = 21;
+const NODES_BLOCK0: usize = 19;
 /// Print-only markers for the profile table, not gates: an op touching at
 /// least a mebibyte should be paying for bytes, not for its launch, so one
 /// that stays under this effective bandwidth is a shape-defect candidate the

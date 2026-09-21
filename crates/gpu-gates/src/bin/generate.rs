@@ -34,7 +34,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::GpuModel;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::StepMode;
+use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::open_model;
 #[cfg(feature = "gpu")]
@@ -102,9 +102,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    // The node-price probe. Either lever makes this run a timing instrument
+    // and the tokens it prints meaningless — the footer says which arm it was
+    // so a row can never be read as a value run.
+    let probe = StepProbe {
+        pad_per_layer: flag_value("--probe-pad").map_or(Ok(0), |s| s.parse())?,
+        skip_quant: std::env::args().any(|a| a == "--probe-skip-quant"),
+        split_heads: std::env::args().any(|a| a == "--probe-split-heads"),
+        split_kqvc: std::env::args().any(|a| a == "--probe-split-kqvc"),
+    };
+
     let gguf = open_model()?;
     let mut model = GpuModel::load_full(&gguf, ctx)?;
     model.set_mode(mode);
+    if probe != StepProbe::default() {
+        model.set_probe(probe)?;
+    }
+    println!(
+        "probe pad_per_layer={} skip_quant={} split_heads={}",
+        probe.pad_per_layer, probe.skip_quant, probe.split_heads
+    );
     println!(
         "load resident_bytes={} ctx={ctx} layers={} mode={}",
         model.resident_bytes(),
@@ -151,7 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // generated tokens give N - 1 timed feedback steps.
         println!(
             "SMOKE mode={} prompt_tokens={} generated={n_gen} steps={} p50_ms={p50:.4} \
-             mean_ms={mean:.4} tok/s(p50)={:.2}",
+             mean_ms={mean:.4} tok/s(p50)={:.2} probe_pad={pad} probe_skip_quant={skip} \
+             probe_split_heads={split}",
             if mode == StepMode::Graph {
                 "graph"
             } else {
@@ -159,7 +177,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             tokens.len(),
             step_ms.len(),
-            1e3 / p50
+            1e3 / p50,
+            pad = probe.pad_per_layer,
+            skip = probe.skip_quant,
+            split = probe.split_heads,
         );
         println!("reference {IK_REFERENCE}");
     }

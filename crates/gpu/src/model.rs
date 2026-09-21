@@ -240,6 +240,91 @@ mod step_kernels {
             }
         }
     }
+
+    /// Both head halves of [`q3k_gemv_heads`] in ONE launch: the same body
+    /// over the same rows, taking the activation from the half the row's
+    /// head belongs to — heads below `split` read `(q_lo, d8_lo)` at column
+    /// `hi`, the rest `(q_hi, d8_hi)` at column `hi - split`. The two halves
+    /// read DIFFERENT weight rows, so this saves a launch, not a weight
+    /// read.
+    ///
+    /// The branch is warp-uniform: a warp owns one row, hence one head, so
+    /// all 32 lanes take the same side and the warp reduction inside
+    /// `q3k_row_dot` still sees a full warp. Every row's loads, accumulation
+    /// order and store are the ones the two-launch form runs, so the outputs
+    /// agree bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= (head_base + heads) * row_stride_per_head * 110 * n_sb,
+            q_lo.len() >= split * 64 * iters,
+            d8_lo.len() >= split * 2 * n_sb,
+            q_hi.len() >= (heads - split) * 64 * iters,
+            d8_hi.len() >= (heads - split) * 2 * n_sb,
+            y.len() >= (head_base + heads - 1) * y_head_stride + rows_per_head
+        )
+    )]
+    pub fn q3k_gemv_heads_pair(
+        w: &[u32],
+        q_lo: &[u64],
+        d8_lo: &[f32],
+        q_hi: &[u64],
+        d8_hi: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        iters: u32,
+        head_base: u32,
+        heads: u32,
+        split: u32,
+        rows_per_head: u32,
+        row_stride_per_head: u32,
+        row_off: u32,
+        y_head_stride: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let hi = row / rows_per_head as usize;
+        // As `q3k_gemv_heads`: the launch contract cannot bind n_rows to
+        // heads*rows_per_head, so a violated divisibility stops here rather
+        // than read weight rows past the last head's block.
+        if hi >= heads as usize {
+            return;
+        }
+        let row_in = row % rows_per_head as usize;
+        let h = head_base as usize + hi;
+        let row_abs = h * row_stride_per_head as usize + row_off as usize + row_in;
+        let lane = warp::lane_id() as usize;
+        // SAFETY (both arms): row_abs + 1 <= (head_base + heads) *
+        // row_stride_per_head (the contract's bound on w, given the
+        // host-validated row_off + rows_per_head <= row_stride_per_head);
+        // the column is below `split` on the lo side and below
+        // `heads - split` on the hi side, which are the contract's bounds on
+        // the two activation pairs.
+        let s0 = if hi < split as usize {
+            let f = q3k_row_dot(w, q_lo, d8_lo, n_sb as usize, iters, row_abs, hi, 1, lane);
+            warp::reduce_sum_f32(f[0])
+        } else {
+            let col = hi - split as usize;
+            let f = q3k_row_dot(w, q_hi, d8_hi, n_sb as usize, iters, row_abs, col, 1, lane);
+            warp::reduce_sum_f32(f[0])
+        };
+        if lane == 0 {
+            // SAFETY: only lane 0 of the warp owning `row` writes; the slot
+            // h*y_head_stride + row_in is inside y by the launch contract
+            // and belongs to this row alone.
+            unsafe {
+                *y.get_unchecked_mut(h * y_head_stride as usize + row_in) = s0;
+            }
+        }
+    }
 }
 
 /// The loaded step module of this file. Owns no context and no stream —
@@ -468,6 +553,107 @@ impl StepKernels {
             n_sb.div_ceil(2) as u32,
             head_base as u32,
             heads as u32,
+            rows_per_head as u32,
+            row_stride_per_head as u32,
+            row_off as u32,
+            y_head_stride as u32,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`StepKernels::enqueue_q3k_gemv_heads`] for BOTH head halves
+    /// in one launch: heads `head_base .. head_base + lo.m()` take their
+    /// activation column from `lo`, the `hi.m()` heads after them from `hi`.
+    /// Same weight, same shapes and the same per-head contract as the single
+    /// call — the two together replace the pair of launches, bit for bit.
+    /// Asynchronous, allocation-free, capturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_q3k_gemv_heads_pair(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        lo: &Q8Act,
+        hi: &Q8Act,
+        head_base: usize,
+        rows_per_head: usize,
+        row_stride_per_head: usize,
+        row_off: usize,
+        y_head_stride: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let n_sb = lo.n_sb();
+        let (split, heads) = (lo.m(), lo.m() + hi.m());
+        if hi.n_sb() != n_sb || hi.k() != lo.k() {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads_pair: both halves must share K, got lo k={} hi k={}",
+                lo.k(),
+                hi.k()
+            )
+            .into());
+        }
+        if !n_sb.is_multiple_of(2) {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads_pair: odd super-block count {n_sb} (K={}) leaves rows \
+                 unaligned; repack rows at load time",
+                lo.k()
+            )
+            .into());
+        }
+        if w.cols() != 110 * n_sb / 4 {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads_pair: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, \
+                 got {}",
+                110 * n_sb / 4,
+                lo.k(),
+                w.cols()
+            )
+            .into());
+        }
+        if row_off + rows_per_head > row_stride_per_head || rows_per_head == 0 {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads_pair: row_off {row_off} + rows_per_head \
+                 {rows_per_head} must lie inside row_stride_per_head {row_stride_per_head}"
+            )
+            .into());
+        }
+        if (head_base + heads) * row_stride_per_head > w.rows() {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads_pair: heads {head_base}..{} need (head_base+heads)*\
+                 row_stride_per_head = {} rows, w has {}",
+                head_base + heads,
+                (head_base + heads) * row_stride_per_head,
+                w.rows()
+            )
+            .into());
+        }
+        let n_rows = heads * rows_per_head;
+        if y.len() < (head_base + heads - 1) * y_head_stride + rows_per_head {
+            return Err(format!(
+                "enqueue_q3k_gemv_heads_pair: y.len() {} < (head_base+heads-1)*y_head_stride \
+                 + rows_per_head = {}*{y_head_stride} + {rows_per_head}",
+                y.len(),
+                head_base + heads - 1
+            )
+            .into());
+        }
+        let prep = self
+            .module
+            .prepare_q3k_gemv_heads_pair(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
+        self.module.q3k_gemv_heads_pair(
+            stream,
+            &prep,
+            w.buf(),
+            &lo.q3,
+            &lo.d8,
+            &hi.q3,
+            &hi.d8,
+            n_rows as u32,
+            n_sb as u32,
+            n_sb.div_ceil(2) as u32,
+            head_base as u32,
+            heads as u32,
+            split as u32,
             rows_per_head as u32,
             row_stride_per_head as u32,
             row_off as u32,
@@ -711,6 +897,12 @@ struct LayerScratch {
     /// byte accounting counts the live key rows from, since the count the
     /// kernels use lives on the device.
     pos_host: u32,
+    /// The node-price probe's empty kernel and the 32 f32 it stores into.
+    /// Resident always (128 B); launched only when `probe_cfg` asks.
+    probe: crate::probe::Probe,
+    probe_buf: DeviceBuffer<f32>,
+    /// Off in every normal step — see [`StepProbe`].
+    probe_cfg: StepProbe,
 }
 
 impl LayerScratch {
@@ -738,8 +930,10 @@ impl LayerScratch {
         .iter()
         .map(|b| b.num_bytes())
         .sum::<usize>();
-        total +=
-            self.pos_buf.num_bytes() + self.n_keys_buf.num_bytes() + self.token_buf.num_bytes();
+        total += self.pos_buf.num_bytes()
+            + self.n_keys_buf.num_bytes()
+            + self.token_buf.num_bytes()
+            + self.probe_buf.num_bytes();
         let act = |a: &Q8Act| {
             a.q3.num_bytes()
                 + a.q4.num_bytes()
@@ -1150,6 +1344,37 @@ pub enum StepMode {
     Graph,
 }
 
+/// What the step's node-price probe does to the chain. Both levers are off
+/// in every value-carrying step; a chain either lever armed is a TIMING
+/// INSTRUMENT and its logits are not the model's answer.
+///
+/// The question it exists to answer is what one graph node costs in the
+/// assembled step, which no per-op table can say: a per-op row is an eager
+/// launch plus a synchronize, and the step runs as graph nodes.
+/// `pad_per_layer` adds empty nodes and prices the slope; `skip_quant` drops
+/// the five small quantize launches and prices their removal, work included.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepProbe {
+    /// Empty `probe::touch` launches enqueued once per layer. The captured
+    /// step is a linear chain, so the site does not change a node's marginal
+    /// cost; these sit at the end of the attention half.
+    pub pad_per_layer: usize,
+    /// Skip the layer's five small quantize launches — the two `kqvc`
+    /// halves, `act_ao`, the routed experts' 32-value quantize and the
+    /// shared expert's q8_1. Their consumers then read whatever the
+    /// activation buffers already hold (zeros from load), which addresses
+    /// the same bytes and runs the same launches.
+    pub skip_quant: bool,
+    /// Run the head gemv as the two half-launches instead of the merged
+    /// one. Value-neutral — the merged launch is bit-identical to the pair,
+    /// so this is the same-binary arm a sub-1 % claim about the merge is
+    /// judged against, and the rollback if one is ever needed.
+    pub split_heads: bool,
+    /// The same, for the `kqvc` q8_1 quantization: two launches instead of
+    /// the one that covers both halves.
+    pub split_kqvc: bool,
+}
+
 /// One resident model: its stages in layer order, covering every block
 /// exactly once. Everything `step` touches is allocated at load, never per
 /// step.
@@ -1269,7 +1494,15 @@ impl GpuModel {
             Some(n) => Some(MoeDims::read(gguf, &weights, n)?),
             None => None,
         };
-        let scratch = LayerScratch::new(stream, &weights, &mla, &names, moe.as_ref(), ctx_max)?;
+        let scratch = LayerScratch::new(
+            gpu.context(),
+            stream,
+            &weights,
+            &mla,
+            &names,
+            moe.as_ref(),
+            ctx_max,
+        )?;
         let kv_width = mla.latent + mla.rope_dims;
         let kv = (0..layers.len())
             .map(|_| DeviceTensor::<u16>::zeroed(stream, ctx_max, kv_width))
@@ -1354,6 +1587,22 @@ impl GpuModel {
             self.step_graph = None;
         }
         self.mode = mode;
+    }
+
+    /// Arm (or disarm) the node-price probe. Like [`GpuModel::set_mode`] this
+    /// drops any captured chain, since the probe changes which launches the
+    /// body issues. A probe with either lever set makes the chain a timing
+    /// instrument: `skip_quant` leaves activation buffers unwritten, so the
+    /// tokens that come out are not the model's answer.
+    pub fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
+        let (_, residency) = self.stage_parts("set_probe")?;
+        residency.scratch.probe_cfg = probe;
+        self.step_graph = None;
+        if let Some(stage) = self.stages.first_mut() {
+            stage.graph = None;
+            stage.graph_of = None;
+        }
+        Ok(())
     }
 
     /// Rewind to position 0 with empty caches — the fresh-context state for
@@ -2240,6 +2489,7 @@ impl LayerScratch {
     /// sized from the stage's first dense layer, the routed ones from
     /// `moe`. Load-time only.
     fn new(
+        ctx: &Arc<CudaContext>,
         stream: &CudaStream,
         w: &Weights,
         mla: &MlaParams,
@@ -2380,6 +2630,9 @@ impl LayerScratch {
             token_buf: DeviceBuffer::from_host(stream, &[0u32])?,
             cs_buf: f32n(rope)?,
             pos_host: 0,
+            probe: crate::probe::Probe::load(ctx)?,
+            probe_buf: f32n(32)?,
+            probe_cfg: StepProbe::default(),
             dims,
         })
     }
@@ -2833,71 +3086,122 @@ fn enqueue_attn(
     //    m = 1), writing the flat, head-major kqv_2d directly — the wk_b
     //    rows are never read.
     let half = mla.n_head / 2;
-    gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
-    tick(
-        i,
-        obs,
-        "quantize_q8_1(kqvc_lo)",
-        bsum(&[
-            Some(4 * s.act_kv_lo.m() * latent),
-            Some(act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())),
-        ]),
-    )?;
-    gpu.enqueue_quantize_q8_1_at(&s.kqvc, half * latent, &mut s.act_kv_hi)?;
-    tick(
-        i,
-        obs,
-        "quantize_q8_1(kqvc_hi)",
-        bsum(&[
-            Some(4 * s.act_kv_hi.m() * latent),
-            Some(act_write_bytes(&s.act_kv_hi, s.act_kv_hi.m())),
-        ]),
-    )?;
+    if !s.probe_cfg.skip_quant {
+        if s.probe_cfg.split_kqvc {
+            gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
+            tick(
+                i,
+                obs,
+                "quantize_q8_1(kqvc_lo)",
+                bsum(&[
+                    Some(4 * s.act_kv_lo.m() * latent),
+                    Some(act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())),
+                ]),
+            )?;
+            gpu.enqueue_quantize_q8_1_at(&s.kqvc, half * latent, &mut s.act_kv_hi)?;
+            tick(
+                i,
+                obs,
+                "quantize_q8_1(kqvc_hi)",
+                bsum(&[
+                    Some(4 * s.act_kv_hi.m() * latent),
+                    Some(act_write_bytes(&s.act_kv_hi, s.act_kv_hi.m())),
+                ]),
+            )?;
+        } else {
+            // Both halves of `kqvc` in one launch: the same two planes of
+            // the same buffer, one grid covering both.
+            let (lo, hi) = (&mut s.act_kv_lo, &mut s.act_kv_hi);
+            gpu.enqueue_quantize_q8_1_pair(&s.kqvc, 0, lo, half * latent, hi)?;
+            tick(
+                i,
+                obs,
+                "quantize_q8_1(kqvc)",
+                bsum(&[
+                    Some(4 * (s.act_kv_lo.m() + s.act_kv_hi.m()) * latent),
+                    Some(act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())),
+                    Some(act_write_bytes(&s.act_kv_hi, s.act_kv_hi.m())),
+                ]),
+            )?;
+        }
+    }
     let kv_b = kq_weight(w, &names.attn_kv_b)?;
-    step.enqueue_q3k_gemv_heads(
-        stream,
-        kv_b,
-        &s.act_kv_lo,
-        0,
-        mla.v_head,
-        mla.nope + mla.v_head,
-        mla.nope,
-        mla.v_head,
-        &mut s.kqv_2d,
-    )?;
-    // Half the heads' wv_b rows against their own activation columns.
     let wkvb = dev_weight(w, &names.attn_kv_b)?;
-    let wv_b_bytes = |a: &Q8Act| -> Bytes {
-        bsum(&[
-            weight_bytes(wkvb, half * mla.v_head),
-            gemv_act_bytes(wkvb, a, a.m()),
-            Some(4 * half * mla.v_head),
-        ])
-    };
-    tick(i, obs, "gemv_q3k_heads(wv_b_lo)", wv_b_bytes(&s.act_kv_lo))?;
-    step.enqueue_q3k_gemv_heads(
-        stream,
-        kv_b,
-        &s.act_kv_hi,
-        mla.n_head / 2,
-        mla.v_head,
-        mla.nope + mla.v_head,
-        mla.nope,
-        mla.v_head,
-        &mut s.kqv_2d,
-    )?;
-    tick(i, obs, "gemv_q3k_heads(wv_b_hi)", wv_b_bytes(&s.act_kv_hi))?;
+    if s.probe_cfg.split_heads {
+        // The two-launch form: half the heads' wv_b rows against their own
+        // activation columns, then the other half.
+        let wv_b_bytes = |a: &Q8Act| -> Bytes {
+            bsum(&[
+                weight_bytes(wkvb, half * mla.v_head),
+                gemv_act_bytes(wkvb, a, a.m()),
+                Some(4 * half * mla.v_head),
+            ])
+        };
+        step.enqueue_q3k_gemv_heads(
+            stream,
+            kv_b,
+            &s.act_kv_lo,
+            0,
+            mla.v_head,
+            mla.nope + mla.v_head,
+            mla.nope,
+            mla.v_head,
+            &mut s.kqv_2d,
+        )?;
+        tick(i, obs, "gemv_q3k_heads(wv_b_lo)", wv_b_bytes(&s.act_kv_lo))?;
+        step.enqueue_q3k_gemv_heads(
+            stream,
+            kv_b,
+            &s.act_kv_hi,
+            half,
+            mla.v_head,
+            mla.nope + mla.v_head,
+            mla.nope,
+            mla.v_head,
+            &mut s.kqv_2d,
+        )?;
+        tick(i, obs, "gemv_q3k_heads(wv_b_hi)", wv_b_bytes(&s.act_kv_hi))?;
+    } else {
+        // Both halves' wv_b rows in one launch, each head against its own
+        // activation column. The halves read different weight rows, so this
+        // saves the launch, not the weight read.
+        step.enqueue_q3k_gemv_heads_pair(
+            stream,
+            kv_b,
+            &s.act_kv_lo,
+            &s.act_kv_hi,
+            0,
+            mla.v_head,
+            mla.nope + mla.v_head,
+            mla.nope,
+            mla.v_head,
+            &mut s.kqv_2d,
+        )?;
+        tick(
+            i,
+            obs,
+            "gemv_q3k_heads(wv_b)",
+            bsum(&[
+                weight_bytes(wkvb, mla.n_head * mla.v_head),
+                gemv_act_bytes(wkvb, &s.act_kv_lo, s.act_kv_lo.m()),
+                gemv_act_bytes(wkvb, &s.act_kv_hi, s.act_kv_hi.m()),
+                Some(4 * mla.n_head * mla.v_head),
+            ]),
+        )?;
+    }
     // 10. attn_output over the flat kqv_2d, then the attention residual.
-    gpu.enqueue_quantize_q8_1(&s.kqv_2d, &mut s.act_ao)?;
-    tick(
-        i,
-        obs,
-        "quantize_q8_1(act_ao)",
-        bsum(&[
-            Some(4 * s.kqv_2d.len()),
-            Some(act_write_bytes(&s.act_ao, s.act_ao.m())),
-        ]),
-    )?;
+    if !s.probe_cfg.skip_quant {
+        gpu.enqueue_quantize_q8_1(&s.kqv_2d, &mut s.act_ao)?;
+        tick(
+            i,
+            obs,
+            "quantize_q8_1(act_ao)",
+            bsum(&[
+                Some(4 * s.kqv_2d.len()),
+                Some(act_write_bytes(&s.act_ao, s.act_ao.m())),
+            ]),
+        )?;
+    }
     gpu.enqueue_gemv_q4k(
         kq_weight(w, &names.attn_output)?,
         &s.act_ao,
@@ -2917,6 +3221,12 @@ fn enqueue_attn(
     gpu.elem()
         .enqueue_add(stream, &s.attn_out, &s.x, hidden, &mut s.ffn_inp)?;
     tick(i, obs, "add(attn_resid)", bsum(&[Some(12 * hidden)]))?;
+    // The probe's empty nodes, if it is armed. Nothing downstream reads
+    // `probe_buf`, so these change the node count and nothing else.
+    for _ in 0..s.probe_cfg.pad_per_layer {
+        s.probe.enqueue_touch(stream, &mut s.probe_buf)?;
+        tick(i, obs, "probe_pad", bsum(&[Some(4 * 32)]))?;
+    }
     Ok(())
 }
 
@@ -3048,6 +3358,7 @@ fn enqueue_ffn_moe(
         act_ffn,
         moe,
         l_out,
+        probe_cfg: StepProbe { skip_quant, .. },
         ..
     } = s;
     let m = moe.as_mut().ok_or_else(|| -> GpuError {
@@ -3145,17 +3456,19 @@ fn enqueue_ffn_moe(
             Some(4 * dims.n_used * dims.ff),
         ]),
     )?;
-    gpu.q5()
-        .enqueue_quantize_q8(stream, &m.h_exp, &mut m.act32_exp)?;
-    tick(
-        i,
-        obs,
-        "moe_expert_quantize_q8",
-        bsum(&[
-            Some(4 * dims.n_used * dims.ff),
-            Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
-        ]),
-    )?;
+    if !*skip_quant {
+        gpu.q5()
+            .enqueue_quantize_q8(stream, &m.h_exp, &mut m.act32_exp)?;
+        tick(
+            i,
+            obs,
+            "moe_expert_quantize_q8",
+            bsum(&[
+                Some(4 * dims.n_used * dims.ff),
+                Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
+            ]),
+        )?;
+    }
     gpu.q5().enqueue_gemv_q5_0_sel(
         stream,
         kq_weight(w, &names.ffn_down_exps)?,
@@ -3203,16 +3516,18 @@ fn enqueue_ffn_moe(
             Some(4 * dims.shexp_ff),
         ]),
     )?;
-    gpu.enqueue_quantize_q8_1(&m.h_sh, &mut m.act_sh)?;
-    tick(
-        i,
-        obs,
-        "shexp_quantize_q8_1",
-        bsum(&[
-            Some(4 * dims.shexp_ff),
-            Some(act_write_bytes(&m.act_sh, m.act_sh.m())),
-        ]),
-    )?;
+    if !*skip_quant {
+        gpu.enqueue_quantize_q8_1(&m.h_sh, &mut m.act_sh)?;
+        tick(
+            i,
+            obs,
+            "shexp_quantize_q8_1",
+            bsum(&[
+                Some(4 * dims.shexp_ff),
+                Some(act_write_bytes(&m.act_sh, m.act_sh.m())),
+            ]),
+        )?;
+    }
     gpu.enqueue_gemv_q4k(
         kq_weight(w, &names.ffn_down_shexp)?,
         &m.act_sh,

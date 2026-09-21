@@ -92,8 +92,25 @@ fn data_file(name: &str) -> std::path::PathBuf {
 /// a band — the node count is deterministic, the margin is zero. A debug
 /// copy left in the chain, or a fused pair that stopped fusing, keeps every
 /// other arm of this gate green and fails only here.
+///
+/// PIN(2026-09-21, lfold round): 755 → 728. The attention half's two
+/// `gemv_q3k_heads` launches became one `gemv_q3k_heads_pair` over all
+/// sixteen heads, one launch fewer in every layer. Derivation on the new
+/// pins (`NODES_BLOCK0` = 20, `NODES_LAYER1` = 25, each plus one merge on a
+/// split cache): (20 + 1) + 26 × (25 + 1) + 27 residual copies + the head's
+/// 4 = 21 + 676 + 27 + 4 = 728. At `--ctx 64`, where no merge runs:
+/// 20 + 650 + 27 + 4 = 701.
+///
+/// PIN(2026-09-21, lfold round): 728 → 701. The attention half's two
+/// `quantize_q8_1(kqvc_*)` launches became one, again one launch fewer in
+/// every layer. Derivation on the new pins (`NODES_BLOCK0` = 19,
+/// `NODES_LAYER1` = 24, each plus one merge on a split cache):
+/// (19 + 1) + 26 × (24 + 1) + 27 + 4 = 20 + 650 + 27 + 4 = 701. Both merges
+/// carry a value-neutral rollback lever (`StepProbe::split_heads`,
+/// `split_kqvc`); with both set the chain captures 755 again, and its
+/// tokens are identical to the default path's.
 #[cfg(feature = "gpu")]
-const NODES_CHAIN: usize = 755;
+const NODES_CHAIN: usize = 701;
 
 /// The argmax-only reference (`argmax-ik-cuda.tsv`): each data row's id,
 /// its argmax and its top-5 ids. `gpu_gates::prompts::read_greedy` rejects

@@ -71,8 +71,17 @@ const ROUTER_BAND: f32 = 1e-5;
 /// "prof2 머지"; three runs identical, the lead's rerun agreed). Not a band: the count is a deterministic property
 /// of the chain, so the pin is exact and its margin is zero. A silently
 /// added launch keeps the bit-identity arms green and fails only here.
+///
+/// PIN(2026-09-21, lfold round): 26 → 25. The attention half's two
+/// `gemv_q3k_heads` launches became one `gemv_q3k_heads_pair` over all
+/// sixteen heads, so the sixteen attention ops are fifteen. Derivation:
+/// 15 + 10 routed FFN ops = 25.
+///
+/// PIN(2026-09-21, lfold round): 25 → 24. The attention half's two
+/// `quantize_q8_1(kqvc_*)` launches became one whose grid covers both
+/// halves. Derivation: 14 attention ops + 10 routed FFN ops = 24.
 #[cfg(feature = "gpu")]
-const NODES_LAYER1: usize = 26;
+const NODES_LAYER1: usize = 24;
 /// PIN(2026-09-21): slots the routing probe's input moves. The probe is the
 /// first `l_out-0` column that routes differently from the last token's, so
 /// both id vectors are fixed by the dump and the router alone: `[5, 38, 8,
