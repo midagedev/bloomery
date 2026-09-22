@@ -55,7 +55,7 @@ use bloomery_gpu::flash::{
     segments_for,
 };
 #[cfg(feature = "gpu")]
-use bloomery_gpu::{DeviceTensor, Gpu};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::RefRow;
 #[cfg(feature = "gpu")]
@@ -93,7 +93,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const CTX_MAX: usize = 64; // per-layer cache rows allocated for the real cases
     const DEPTH_ROWS: usize = 4160; // depth cache: 4096 keys + NaN pad
 
-    let mut ok = true;
     let gguf = open_model()?;
     let scale = kq_scale_of(&gguf)?;
     let gpu = Gpu::new()?;
@@ -113,6 +112,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         latent_dims: LATENT,
         heads: N_HEADS,
     };
+    // Every helper runs all of its cases and returns whether they all
+    // passed; `&=` (not `&&`) so a failure never skips a later helper's lines.
+    let mut ok = true;
     for l in [0usize, 1, 13, 26] {
         let case = RealCase {
             man: &man,
@@ -122,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokens: TOKENS,
             ctx_max: CTX_MAX,
         };
-        real_layer(&gpu, &flash, &case, &mut ok)?;
+        ok &= real_layer(&gpu, &flash, &case)?;
     }
 
     let case = DepthCase {
@@ -131,9 +133,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         band: FLASH_BAND,
         mma_band: FLASH_MMA_BAND,
     };
-    depth_cases(&gpu, &flash, &case, &mut ok)?;
-    edge_values(&flash, stream, &mut ok)?;
-    no_local_depot(&mut ok)?;
+    ok &= depth_cases(&gpu, &flash, &case)?;
+    ok &= edge_values(&flash, stream)?;
+    ok &= no_local_depot()?;
 
     if !ok {
         eprintln!("FAILED: gate_p5");
@@ -160,8 +162,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The scan itself is `bloomery_gpu_gates::ptx`; `tools/ptx-scan.sh` prints
 /// the same counts for every entry without asserting any of them.
 #[cfg(feature = "gpu")]
-fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+fn no_local_depot() -> Result<bool, Box<dyn std::error::Error>> {
     let blob = std::fs::read(std::env::current_exe()?)?;
+    let mut ok = true;
     for name in [
         "flash_latent",
         "flash_latent_seg",
@@ -178,11 +181,9 @@ fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
             "shape kernel={name} local_depot={depot} ld_local={loads} st_local={stores} {}",
             if pass { "PASS" } else { "FAIL" }
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
-    Ok(())
+    Ok(ok)
 }
 
 // ------------------------------------------------------------ cases
@@ -242,7 +243,96 @@ struct GraphFlashCase<'a> {
     y_eager: &'a [f32],
 }
 
+/// The split launch's partials, sized for `q_rows` query rows over a cache
+/// of `cache_rows`.
+#[cfg(feature = "gpu")]
+struct Partials {
+    v: DeviceBuffer<f32>,
+    ms: DeviceBuffer<f32>,
+}
+
+#[cfg(feature = "gpu")]
+impl Partials {
+    fn zeroed(
+        stream: &CudaStream,
+        q_rows: usize,
+        cache_rows: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            v: DeviceBuffer::zeroed(stream, partials_v_len(q_rows, cache_rows))?,
+            ms: DeviceBuffer::zeroed(stream, partials_ms_len(q_rows, cache_rows))?,
+        })
+    }
+}
+
+/// Two eager runs of the split launch into `y`, each synchronized and read
+/// back: the result and its rerun.
+#[cfg(feature = "gpu")]
+fn split_twice(
+    flash: &FlashKernels,
+    stream: &CudaStream,
+    inputs: FlashInputs<'_>,
+    part: &mut Partials,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+    let mut run = || -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        flash.enqueue_flash_latent_split(
+            stream,
+            FlashSplitArgs {
+                inputs,
+                part_v: &mut part.v,
+                part_ms: &mut part.ms,
+                y: &mut *y,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    };
+    let y1 = run()?;
+    let y2 = run()?;
+    Ok((y1, y2))
+}
+
+/// The split launch captured into a graph, not launched: its grid is fixed
+/// from the cache height at capture time, the live key count read from
+/// `n_keys_buf` on every replay.
+#[cfg(feature = "gpu")]
+fn split_graph(
+    gpu: &Gpu,
+    flash: &FlashKernels,
+    inputs: FlashInputs<'_>,
+    part: &mut Partials,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<Graph, GpuError> {
+    let stream = gpu.stream();
+    gpu.capture(|_s| {
+        flash
+            .enqueue_flash_latent_split(
+                stream,
+                FlashSplitArgs {
+                    inputs,
+                    part_v: &mut part.v,
+                    part_ms: &mut part.ms,
+                    y,
+                },
+            )
+            .map(|_| ())
+    })
+}
+
 // ------------------------------------------------------------ real layers
+
+/// One real layer's dump tensors, each proved against the manifest and the
+/// CONCAT orders proved bit-exact against their operands.
+#[cfg(feature = "gpu")]
+struct RealChains {
+    /// `kvr-L` `[width, tokens]`: `[k_rope | kv_compressed]` per token.
+    kvr: Vec<f32>,
+    /// `q-L` occ 1 `[width, tokens, heads]`, rows `t + tokens*h`.
+    q1: Vec<f32>,
+    /// `kqv_compressed-L` `[latent, heads, tokens]`, the oracle's output.
+    kqv: Vec<f32>,
+}
 
 /// One layer's real-input cases: the cache build, the five m=1 decode
 /// positions, the m=TOKENS causal prefill shape, and (layer 0 only) the
@@ -252,36 +342,45 @@ fn real_layer(
     gpu: &Gpu,
     flash: &FlashKernels,
     case: &RealCase<'_>,
-    ok: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let RealCase {
-        man,
-        layer: l,
-        dims,
-        band,
-        tokens,
-        ctx_max,
-    } = *case;
-    let Dims {
-        kq_scale: scale,
-        width,
-        rope_dims: rope,
-        latent_dims: latent,
-        heads: n_heads,
-    } = dims;
+) -> Result<bool, Box<dyn std::error::Error>> {
     let stream = gpu.stream();
     // The split launch's partials, sized for the widest shape below (the
     // m=tokens prefill) over this cache height. At ctx_max = 64 the height
     // is one segment, so every call here takes the single-launch fast path
     // and leaves them untouched — that choice is itself asserted by the
     // graph node count.
-    let mut part_v =
-        DeviceBuffer::<f32>::zeroed(stream, partials_v_len(tokens * n_heads, ctx_max))?;
-    let mut part_ms =
-        DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(tokens * n_heads, ctx_max))?;
+    let mut part = Partials::zeroed(stream, case.tokens * case.dims.heads, case.ctx_max)?;
+    let chains = RealChains {
+        kvr: kvr_chain(case)?,
+        q1: q_chain(case)?,
+        kqv: kqv_chain(case)?,
+    };
+    let (cache, mut ok) = real_append(flash, stream, case, &chains.kvr)?;
+    ok &= real_decode(gpu, flash, case, &chains, &cache, &mut part)?;
+    ok &= real_prefill(flash, stream, case, &chains, &cache, &mut part)?;
+    if case.layer == 0 {
+        ok &= graph_check_append(gpu, flash, &chains.kvr[..case.dims.width])?;
+    }
+    Ok(ok)
+}
 
-    // ---- chain: kvr-L [width, tokens] CONCAT of [k_rope | kv_compressed];
-    // k_rope occ 1 is (d, t), kv_compressed occ 1 is (d, t).
+/// kvr-L [width, tokens] CONCAT of [k_rope | kv_compressed]; k_rope occ 1
+/// is (d, t), kv_compressed occ 1 is (d, t).
+#[cfg(feature = "gpu")]
+fn kvr_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let RealCase {
+        man,
+        layer: l,
+        dims,
+        tokens,
+        ..
+    } = *case;
+    let Dims {
+        width,
+        rope_dims: rope,
+        latent_dims: latent,
+        ..
+    } = dims;
     let kvr_row = find_ref_row(man, &format!("kvr-{l}"), 0)?;
     if kvr_row.op != "CONCAT"
         || kvr_row.ty != "f32"
@@ -334,10 +433,27 @@ fn real_layer(
             }
         }
     }
+    Ok(kvr)
+}
 
-    // ---- chain: q-L occ 1 [width, tokens, heads] CONCAT of [q_rope |
-    // q_nope2]; rows (t + tokens*h); q_rope occ 1 is (d, h, t), q_nope2
-    // occ 0 is (d, t, h).
+/// q-L occ 1 [width, tokens, heads] CONCAT of [q_rope | q_nope2]; rows
+/// (t + tokens*h); q_rope occ 1 is (d, h, t), q_nope2 occ 0 is (d, t, h).
+#[cfg(feature = "gpu")]
+fn q_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let RealCase {
+        man,
+        layer: l,
+        dims,
+        tokens,
+        ..
+    } = *case;
+    let Dims {
+        width,
+        rope_dims: rope,
+        latent_dims: latent,
+        heads: n_heads,
+        ..
+    } = dims;
     let q_row = find_ref_row(man, &format!("q-{l}"), 1)?;
     if q_row.op != "CONCAT"
         || q_row.ty != "f32"
@@ -393,8 +509,20 @@ fn real_layer(
             }
         }
     }
+    Ok(q1)
+}
 
-    // ---- chain: kqv_compressed-L [latent, heads, tokens] FLASH_ATTN_EXT.
+/// kqv_compressed-L [latent, heads, tokens] FLASH_ATTN_EXT.
+#[cfg(feature = "gpu")]
+fn kqv_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let RealCase {
+        man,
+        layer: l,
+        dims,
+        tokens,
+        ..
+    } = *case;
+    let (latent, n_heads) = (dims.latent_dims, dims.heads);
     let kqv_row = find_ref_row(man, &format!("kqv_compressed-{l}"), 0)?;
     if kqv_row.op != "FLASH_ATTN_EXT"
         || kqv_row.ty != "f32"
@@ -407,9 +535,35 @@ fn real_layer(
         )
         .into());
     }
-    let kqv = ref_tensor_of(kqv_row)?;
+    ref_tensor_of(kqv_row)
+}
 
-    // ---- kv_append: build THIS layer's cache from the kvr rows.
+/// One real layer's f16 cache as [`real_append`] built it: on the device
+/// for the kernels, and its bits as read back for the reference.
+#[cfg(feature = "gpu")]
+struct LayerCache {
+    dev: DeviceTensor<u16>,
+    bits: Vec<u16>,
+}
+
+/// kv_append: build THIS layer's cache from the kvr rows, and check it.
+/// Returns the cache and the verdict.
+#[cfg(feature = "gpu")]
+fn real_append(
+    flash: &FlashKernels,
+    stream: &CudaStream,
+    case: &RealCase<'_>,
+    kvr: &[f32],
+) -> Result<(LayerCache, bool), Box<dyn std::error::Error>> {
+    let RealCase {
+        man,
+        layer: l,
+        dims,
+        tokens,
+        ctx_max,
+        ..
+    } = *case;
+    let width = dims.width;
     let src = DeviceBuffer::from_host(stream, &kvr[..tokens * width])?;
     let mut cache = DeviceTensor::<u16>::zeroed(stream, ctx_max, width)?;
     flash.enqueue_kv_append(stream, &src, &mut cache, tokens, 0)?;
@@ -447,149 +601,33 @@ fn real_layer(
         "shape op=kv_append layer={l} rows={tokens} width={width} bits_exact={bits_exact} ik_cache_bits_equal={ik_cache_bits_equal} neighbours_untouched={neighbours} bit_identical_rerun={rerun_same} {}",
         verdict(pass)
     );
-    if !pass {
-        *ok = false;
-    }
-
-    // ---- flash m=1: five decode positions (one query over a causal
-    // prefix), the cache built above supplying the f16 keys.
-    for t in 1..tokens {
-        let n_keys = t + 1;
-        let mut qbuf = vec![0.0f32; n_heads * width];
-        for h in 0..n_heads {
-            qbuf[h * width..(h + 1) * width]
-                .copy_from_slice(&q1[(t + tokens * h) * width..(t + tokens * h + 1) * width]);
-        }
-        let q_dev = DeviceBuffer::from_host(stream, &qbuf)?;
-        let n_keys_dev = DeviceBuffer::from_host(stream, &[n_keys as u32])?;
-        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
-        let inputs = FlashInputs {
-            q: &q_dev,
-            kv: &cache,
-            n_keys_buf: &n_keys_dev,
-            kq_scale: scale,
-            geom: dims.geom(1),
-        };
-        let run = |y: &mut DeviceBuffer<f32>,
-                   pv: &mut DeviceBuffer<f32>,
-                   pm: &mut DeviceBuffer<f32>|
-         -> Result<(), Box<dyn std::error::Error>> {
-            flash.enqueue_flash_latent_split(
-                stream,
-                FlashSplitArgs {
-                    inputs,
-                    part_v: pv,
-                    part_ms: pm,
-                    y,
-                },
-            )?;
-            stream.synchronize()?;
-            Ok(())
-        };
-        run(&mut y_dev, &mut part_v, &mut part_ms)?;
-        let y1 = y_dev.to_host_vec(stream)?;
-        run(&mut y_dev, &mut part_v, &mut part_ms)?;
-        let y2 = y_dev.to_host_vec(stream)?;
-        let rerun_same = bits_equal(&y1, &y2);
-        let y_ref = flash_f64_ref(&qbuf, &bits1, n_keys, scale, dims.geom(1));
-        let rel = max_rel_err(&y1, &y_ref)?;
-        let ik = ik_kqv_rows(&kqv, t, n_heads, latent);
-        let ik_rel = max_rel_err(&y1, &ik)?;
-        let pass = rel <= band && rerun_same;
-        println!(
-            "shape op=flash_latent layer={l} t={t} n_keys={n_keys} m=1 max_rel_err={rel:.3e} bit_identical_rerun={rerun_same} ik_rel={ik_rel:.3e} {}",
-            verdict(pass)
-        );
-        if !pass {
-            *ok = false;
-        }
-        if l == 0 && t == tokens - 1 {
-            let case = GraphFlashCase {
-                inputs,
-                y_eager: &y1,
-            };
-            graph_check_flash(gpu, flash, &case, ok)?;
-        }
-    }
-
-    // ---- flash m=tokens: the causal prefill shape, all heads and tokens in
-    // one launch (the m<=8 variant; the loop above was the m=1 decode shape).
-    let mut qbuf = vec![0.0f32; tokens * n_heads * width];
-    for t in 0..tokens {
-        for h in 0..n_heads {
-            let src_base = (t + tokens * h) * width;
-            let dst_base = (t * n_heads + h) * width;
-            qbuf[dst_base..dst_base + width].copy_from_slice(&q1[src_base..src_base + width]);
-        }
-    }
-    let q_dev = DeviceBuffer::from_host(stream, &qbuf)?;
-    let n_keys_dev = DeviceBuffer::from_host(stream, &[tokens as u32])?;
-    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, tokens * n_heads * latent)?;
-    let inputs = FlashInputs {
-        q: &q_dev,
-        kv: &cache,
-        n_keys_buf: &n_keys_dev,
-        kq_scale: scale,
-        geom: dims.geom(tokens),
-    };
-    let run = |y: &mut DeviceBuffer<f32>,
-               pv: &mut DeviceBuffer<f32>,
-               pm: &mut DeviceBuffer<f32>|
-     -> Result<(), Box<dyn std::error::Error>> {
-        flash.enqueue_flash_latent_split(
-            stream,
-            FlashSplitArgs {
-                inputs,
-                part_v: pv,
-                part_ms: pm,
-                y,
-            },
-        )?;
-        stream.synchronize()?;
-        Ok(())
-    };
-    run(&mut y_dev, &mut part_v, &mut part_ms)?;
-    let y1 = y_dev.to_host_vec(stream)?;
-    run(&mut y_dev, &mut part_v, &mut part_ms)?;
-    let y2 = y_dev.to_host_vec(stream)?;
-    let rerun_same = bits_equal(&y1, &y2);
-    let y_ref = flash_f64_ref(&qbuf, &bits1, tokens, scale, dims.geom(tokens));
-    let rel = max_rel_err(&y1, &y_ref)?;
-    let mut ik = vec![0.0f32; tokens * n_heads * latent];
-    for (t, chunk) in ik.chunks_mut(n_heads * latent).enumerate() {
-        chunk.copy_from_slice(&ik_kqv_rows(&kqv, t, n_heads, latent));
-    }
-    let ik_rel = max_rel_err(&y1, &ik)?;
-    let pass = rel <= band && rerun_same;
-    println!(
-        "shape op=flash_latent layer={l} m={tokens} n_keys={tokens} causal=prefill max_rel_err={rel:.3e} bit_identical_rerun={rerun_same} ik_rel={ik_rel:.3e} {}",
-        verdict(pass)
-    );
-    if !pass {
-        *ok = false;
-    }
-    if l == 0 {
-        graph_check_append(gpu, flash, &kvr[..width], ok)?;
-    }
-    Ok(())
+    Ok((
+        LayerCache {
+            dev: cache,
+            bits: bits1,
+        },
+        pass,
+    ))
 }
 
-// ----------------------------------------------------------- depth cases
-
-/// Synthetic LCG keys/queries at the 32-key block edges, every row past
-/// `n_keys` holding the f16 NaN bit pattern.
+/// flash m=1: five decode positions (one query over a causal prefix), the
+/// cache built by [`real_append`] supplying the f16 keys. On layer 0 the
+/// last position is also the eager run [`graph_check_flash`] replays.
 #[cfg(feature = "gpu")]
-fn depth_cases(
+fn real_decode(
     gpu: &Gpu,
     flash: &FlashKernels,
-    case: &DepthCase,
-    ok: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let DepthCase {
+    case: &RealCase<'_>,
+    chains: &RealChains,
+    cache: &LayerCache,
+    part: &mut Partials,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let RealCase {
+        layer: l,
         dims,
-        cache_rows: depth_rows,
         band,
-        mma_band,
+        tokens,
+        ..
     } = *case;
     let Dims {
         kq_scale: scale,
@@ -599,14 +637,210 @@ fn depth_cases(
         ..
     } = dims;
     let stream = gpu.stream();
-    let keys = activations(width, 4096, 50021);
-    let queries = activations(width, n_heads, 60013);
-    let mut cache_bits = vec![0x7e00u16; depth_rows * width]; // NaN pad everywhere
-    for (b, &v) in cache_bits.iter_mut().zip(&keys) {
-        *b = f32_to_f16_bits(v);
+    let mut ok = true;
+    for t in 1..tokens {
+        let n_keys = t + 1;
+        let mut qbuf = vec![0.0f32; n_heads * width];
+        for h in 0..n_heads {
+            qbuf[h * width..(h + 1) * width].copy_from_slice(
+                &chains.q1[(t + tokens * h) * width..(t + tokens * h + 1) * width],
+            );
+        }
+        let q_dev = DeviceBuffer::from_host(stream, &qbuf)?;
+        let n_keys_dev = DeviceBuffer::from_host(stream, &[n_keys as u32])?;
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
+        let inputs = FlashInputs {
+            q: &q_dev,
+            kv: &cache.dev,
+            n_keys_buf: &n_keys_dev,
+            kq_scale: scale,
+            geom: dims.geom(1),
+        };
+        let (y1, y2) = split_twice(flash, stream, inputs, part, &mut y_dev)?;
+        let rerun_same = bits_equal(&y1, &y2);
+        let y_ref = flash_f64_ref(&qbuf, &cache.bits, n_keys, scale, dims.geom(1));
+        let rel = max_rel_err(&y1, &y_ref)?;
+        let ik = ik_kqv_rows(&chains.kqv, t, n_heads, latent);
+        let ik_rel = max_rel_err(&y1, &ik)?;
+        let pass = rel <= band && rerun_same;
+        println!(
+            "shape op=flash_latent layer={l} t={t} n_keys={n_keys} m=1 max_rel_err={rel:.3e} bit_identical_rerun={rerun_same} ik_rel={ik_rel:.3e} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        if l == 0 && t == tokens - 1 {
+            let case = GraphFlashCase {
+                inputs,
+                y_eager: &y1,
+            };
+            ok &= graph_check_flash(gpu, flash, &case)?;
+        }
     }
-    let cache = DeviceTensor::upload(stream, &cache_bits, depth_rows, width)?;
-    let q_dev = DeviceBuffer::from_host(stream, &queries)?;
+    Ok(ok)
+}
+
+/// flash m=tokens: the causal prefill shape, all heads and tokens in one
+/// launch (the m<=8 variant; [`real_decode`] is the m=1 decode shape).
+#[cfg(feature = "gpu")]
+fn real_prefill(
+    flash: &FlashKernels,
+    stream: &CudaStream,
+    case: &RealCase<'_>,
+    chains: &RealChains,
+    cache: &LayerCache,
+    part: &mut Partials,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let RealCase {
+        layer: l,
+        dims,
+        band,
+        tokens,
+        ..
+    } = *case;
+    let Dims {
+        kq_scale: scale,
+        width,
+        latent_dims: latent,
+        heads: n_heads,
+        ..
+    } = dims;
+    let mut qbuf = vec![0.0f32; tokens * n_heads * width];
+    for t in 0..tokens {
+        for h in 0..n_heads {
+            let src_base = (t + tokens * h) * width;
+            let dst_base = (t * n_heads + h) * width;
+            qbuf[dst_base..dst_base + width]
+                .copy_from_slice(&chains.q1[src_base..src_base + width]);
+        }
+    }
+    let q_dev = DeviceBuffer::from_host(stream, &qbuf)?;
+    let n_keys_dev = DeviceBuffer::from_host(stream, &[tokens as u32])?;
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, tokens * n_heads * latent)?;
+    let inputs = FlashInputs {
+        q: &q_dev,
+        kv: &cache.dev,
+        n_keys_buf: &n_keys_dev,
+        kq_scale: scale,
+        geom: dims.geom(tokens),
+    };
+    let (y1, y2) = split_twice(flash, stream, inputs, part, &mut y_dev)?;
+    let rerun_same = bits_equal(&y1, &y2);
+    let y_ref = flash_f64_ref(&qbuf, &cache.bits, tokens, scale, dims.geom(tokens));
+    let rel = max_rel_err(&y1, &y_ref)?;
+    let mut ik = vec![0.0f32; tokens * n_heads * latent];
+    for (t, chunk) in ik.chunks_mut(n_heads * latent).enumerate() {
+        chunk.copy_from_slice(&ik_kqv_rows(&chains.kqv, t, n_heads, latent));
+    }
+    let ik_rel = max_rel_err(&y1, &ik)?;
+    let pass = rel <= band && rerun_same;
+    println!(
+        "shape op=flash_latent layer={l} m={tokens} n_keys={tokens} causal=prefill max_rel_err={rel:.3e} bit_identical_rerun={rerun_same} ik_rel={ik_rel:.3e} {}",
+        verdict(pass)
+    );
+    Ok(pass)
+}
+
+// ----------------------------------------------------------- depth cases
+
+/// The depth cases' shared inputs: LCG queries, and LCG keys as f16 bits in
+/// a cache whose every row past the keys holds the f16 NaN pattern — on the
+/// host (for the reference) and on the device.
+#[cfg(feature = "gpu")]
+struct DepthInputs {
+    queries: Vec<f32>,
+    cache_bits: Vec<u16>,
+    cache: DeviceTensor<u16>,
+    q_dev: DeviceBuffer<f32>,
+}
+
+#[cfg(feature = "gpu")]
+impl DepthInputs {
+    fn new(stream: &CudaStream, case: &DepthCase) -> Result<Self, Box<dyn std::error::Error>> {
+        let (width, n_heads) = (case.dims.width, case.dims.heads);
+        let keys = activations(width, 4096, 50021);
+        let queries = activations(width, n_heads, 60013);
+        let mut cache_bits = vec![0x7e00u16; case.cache_rows * width]; // NaN pad everywhere
+        for (b, &v) in cache_bits.iter_mut().zip(&keys) {
+            *b = f32_to_f16_bits(v);
+        }
+        let cache = DeviceTensor::upload(stream, &cache_bits, case.cache_rows, width)?;
+        let q_dev = DeviceBuffer::from_host(stream, &queries)?;
+        Ok(Self {
+            queries,
+            cache_bits,
+            cache,
+            q_dev,
+        })
+    }
+
+    /// The m=1 launch inputs over this cache, the live key count read from
+    /// `n_keys_buf`.
+    fn inputs<'a>(&'a self, n_keys_buf: &'a DeviceBuffer<u32>, dims: Dims) -> FlashInputs<'a> {
+        FlashInputs {
+            q: &self.q_dev,
+            kv: &self.cache,
+            n_keys_buf,
+            kq_scale: dims.kq_scale,
+            geom: dims.geom(1),
+        }
+    }
+}
+
+/// The key counts the depth cases run at. 1/31/32/33 are the key-tile
+/// edges; seg-1/seg/seg+1 the segment edges a split launch adds; 1 and 31
+/// are also `n_keys` far below one segment with a tall cache. 4096 is a
+/// whole number of 256-key segments and leaves the last segment of the
+/// 4160-row cache wholly empty.
+#[cfg(feature = "gpu")]
+fn depth_key_counts(cache_rows: usize) -> Vec<usize> {
+    let seg = seg_keys();
+    let mut cases = vec![1usize, 31, 32, 33, 1000, 4096];
+    for extra in [seg - 1, seg, seg + 1, 2 * seg] {
+        if extra < cache_rows && !cases.contains(&extra) {
+            cases.push(extra);
+        }
+    }
+    cases.sort_unstable();
+    cases
+}
+
+/// What the split path measured at one key count.
+#[cfg(feature = "gpu")]
+struct SplitDepth {
+    y1: Vec<f32>,
+    rel: f32,
+    one_rel: f32,
+    cross_rel: f32,
+    rerun_same: bool,
+    replay_same: bool,
+}
+
+/// What the tensor-core path measured at one key count.
+#[cfg(feature = "gpu")]
+struct MmaDepth {
+    rel: f32,
+    cross: f32,
+    rerun_same: bool,
+    replay_same: bool,
+}
+
+/// Synthetic LCG keys/queries at the 32-key block edges, every row past
+/// `n_keys` holding the f16 NaN bit pattern.
+#[cfg(feature = "gpu")]
+fn depth_cases(
+    gpu: &Gpu,
+    flash: &FlashKernels,
+    case: &DepthCase,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let DepthCase {
+        dims,
+        cache_rows: depth_rows,
+        band,
+        mma_band,
+    } = *case;
+    let (n_heads, latent) = (dims.heads, dims.latent_dims);
+    let stream = gpu.stream();
+    let d = DepthInputs::new(stream, case)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
     // This cache is tall enough to be cut into segments, so every case below
     // runs the split launch. `segs` counts the whole cache, not the live
@@ -616,20 +850,8 @@ fn depth_cases(
     // fail the finiteness check inside `max_rel_err`.
     let segs = segments_for(depth_rows);
     let seg = seg_keys();
-    let mut part_v = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_heads, depth_rows))?;
-    let mut part_ms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_heads, depth_rows))?;
+    let mut part = Partials::zeroed(stream, n_heads, depth_rows)?;
     let mut y_one = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
-    // 1/31/32/33 are the key-tile edges; seg-1/seg/seg+1 the segment edges a
-    // split launch adds; 1 and 31 are also `n_keys` far below one segment
-    // with a tall cache. 4096 is a whole number of 256-key segments and
-    // leaves the last segment of the 4160-row cache wholly empty.
-    let mut cases = vec![1usize, 31, 32, 33, 1000, 4096];
-    for extra in [seg - 1, seg, seg + 1, 2 * seg] {
-        if extra < depth_rows && !cases.contains(&extra) {
-            cases.push(extra);
-        }
-    }
-    cases.sort_unstable();
     // One key-count buffer and ONE captured graph for every case below. The
     // grid was fixed from the cache height at capture time, so a replay must
     // follow `n_keys_buf` across segment boundaries — from a single live
@@ -640,178 +862,207 @@ fn depth_cases(
     // The tensor-core pass writes the same partials from its own buffers, so
     // its distance to the one-row pass is a comparison of two full results
     // and not of a shared scratch.
-    let mut part_vm = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_heads, depth_rows))?;
-    let mut part_msm = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_heads, depth_rows))?;
+    let mut part_m = Partials::zeroed(stream, n_heads, depth_rows)?;
     let mut y_m = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
-    let geom = dims.geom(1);
-    let graph = gpu.capture(|_s| {
-        flash
-            .enqueue_flash_latent_split(
-                stream,
-                FlashSplitArgs {
-                    inputs: FlashInputs {
-                        q: &q_dev,
-                        kv: &cache,
-                        n_keys_buf: &n_keys_dev,
-                        kq_scale: scale,
-                        geom,
-                    },
-                    part_v: &mut part_v,
-                    part_ms: &mut part_ms,
-                    y: &mut y_dev,
-                },
-            )
-            .map(|_| ())
-    })?;
+    let graph = split_graph(
+        gpu,
+        flash,
+        d.inputs(&n_keys_dev, dims),
+        &mut part,
+        &mut y_dev,
+    )?;
     let graph_nodes = graph.node_count();
     // The tensor-core pass's own graph, captured at the same one live
     // segment: its grid comes from the cache height and the head count, so a
     // replay must follow `n_keys_buf` across every segment boundary too.
     let graph_m = gpu.capture(|_s| {
-        flash.enqueue_flash_latent_mma(
+        mma_enqueue(
+            flash,
             stream,
-            FlashSegArgs {
-                inputs: FlashInputs {
-                    q: &q_dev,
-                    kv: &cache,
-                    n_keys_buf: &n_keys_dev,
-                    kq_scale: scale,
-                    geom,
-                },
-                part_v: &mut part_vm,
-                part_ms: &mut part_msm,
-            },
-        )?;
-        flash.enqueue_flash_merge(
-            stream,
-            FlashMergeArgs {
-                n_keys_buf: &n_keys_dev,
-                cache_rows: depth_rows,
-                tokens: geom.tokens,
-                heads: geom.heads,
-                latent_dims: geom.latent_dims,
-                part_v: &part_vm,
-                part_ms: &part_msm,
-                y: &mut y_m,
-            },
+            d.inputs(&n_keys_dev, dims),
+            depth_rows,
+            &mut part_m,
+            &mut y_m,
         )
     })?;
     let graph_m_nodes = graph_m.node_count();
-    for n_keys in cases {
+    let mut ok = true;
+    for n_keys in depth_key_counts(depth_rows) {
         n_keys_dev.copy_from_host(stream, &[n_keys as u32])?;
-        let inputs = FlashInputs {
-            q: &q_dev,
-            kv: &cache,
-            n_keys_buf: &n_keys_dev,
-            kq_scale: scale,
-            geom,
-        };
-        let run = |y: &mut DeviceBuffer<f32>,
-                   pv: &mut DeviceBuffer<f32>,
-                   pm: &mut DeviceBuffer<f32>|
-         -> Result<(), Box<dyn std::error::Error>> {
-            flash.enqueue_flash_latent_split(
-                stream,
-                FlashSplitArgs {
-                    inputs,
-                    part_v: pv,
-                    part_ms: pm,
-                    y,
-                },
-            )?;
-            stream.synchronize()?;
-            Ok(())
-        };
-        run(&mut y_dev, &mut part_v, &mut part_ms)?;
-        let y1 = y_dev.to_host_vec(stream)?;
-        run(&mut y_dev, &mut part_v, &mut part_ms)?;
-        let y2 = y_dev.to_host_vec(stream)?;
-        let rerun_same = bits_equal(&y1, &y2);
-        let y_ref = flash_f64_ref(&queries, &cache_bits, n_keys, scale, geom);
-        let rel = max_rel_err(&y1, &y_ref)?;
-        // The single-block entry on the same inputs: the path a cache short
-        // enough to hold one segment takes. Both must land inside the band
-        // against the f64 reference, and so must their distance to each
-        // other — the split moves the summation order, nothing else.
-        flash.enqueue_flash_latent(
+        let inputs = d.inputs(&n_keys_dev, dims);
+        let y_ref = flash_f64_ref(
+            &d.queries,
+            &d.cache_bits,
+            n_keys,
+            dims.kq_scale,
+            inputs.geom,
+        );
+        let s = depth_split(
+            flash,
             stream,
-            FlashLatentArgs {
-                inputs,
-                y: &mut y_one,
-            },
+            inputs,
+            &graph,
+            (&mut part, &mut y_dev, &mut y_one),
+            &y_ref,
         )?;
-        stream.synchronize()?;
-        let y_single = y_one.to_host_vec(stream)?;
-        let one_rel = max_rel_err(&y_single, &y_ref)?;
-        let cross_rel = max_rel_err(&y1, &y_single)?;
-        graph.launch(stream)?;
-        stream.synchronize()?;
-        let y_graph = y_dev.to_host_vec(stream)?;
-        let replay_same = bits_equal(&y1, &y_graph);
-        // The tensor-core pass on the same inputs, through the same merge.
-        // Its query rows and products are f16, so it carries its own band
-        // (`mma_band`) against the f64 reference and against the one-row
-        // pass; reruns and graph replays of it are still bit-identical.
-        let run_m = |y: &mut DeviceBuffer<f32>,
-                     pv: &mut DeviceBuffer<f32>,
-                     pm: &mut DeviceBuffer<f32>|
-         -> Result<(), Box<dyn std::error::Error>> {
-            flash.enqueue_flash_latent_mma(
-                stream,
-                FlashSegArgs {
-                    inputs,
-                    part_v: &mut *pv,
-                    part_ms: &mut *pm,
-                },
-            )?;
-            flash.enqueue_flash_merge(
-                stream,
-                FlashMergeArgs {
-                    n_keys_buf: &n_keys_dev,
-                    cache_rows: depth_rows,
-                    tokens: geom.tokens,
-                    heads: geom.heads,
-                    latent_dims: geom.latent_dims,
-                    part_v: pv,
-                    part_ms: pm,
-                    y,
-                },
-            )?;
-            stream.synchronize()?;
-            Ok(())
-        };
-        run_m(&mut y_m, &mut part_vm, &mut part_msm)?;
-        let m1 = y_m.to_host_vec(stream)?;
-        run_m(&mut y_m, &mut part_vm, &mut part_msm)?;
-        let m2 = y_m.to_host_vec(stream)?;
-        let rerun_same_m = bits_equal(&m1, &m2);
-        let rel_m = max_rel_err(&m1, &y_ref)?;
-        let cross_m = max_rel_err(&m1, &y1)?;
-        graph_m.launch(stream)?;
-        stream.synchronize()?;
-        let m_graph = y_m.to_host_vec(stream)?;
-        let replay_same_m = bits_equal(&m1, &m_graph);
-        let pass_m = rel_m <= mma_band && cross_m <= mma_band && rerun_same_m && replay_same_m;
+        let m = depth_mma(
+            flash,
+            stream,
+            inputs,
+            &graph_m,
+            (&mut part_m, &mut y_m),
+            &y_ref,
+            &s.y1,
+        )?;
+        // Printed mma first, split second: the order the log has always had.
+        let pass_m = m.rel <= mma_band && m.cross <= mma_band && m.rerun_same && m.replay_same;
         println!(
-            "shape op=flash_latent_mma_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={} band={mma_band:.3e} max_rel_err={rel_m:.3e} mma_vs_seg={cross_m:.3e} bit_identical_rerun={rerun_same_m} graph_nodes={graph_m_nodes} replay_bit_identical={replay_same_m} {}",
+            "shape op=flash_latent_mma_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={} band={mma_band:.3e} max_rel_err={:.3e} mma_vs_seg={:.3e} bit_identical_rerun={} graph_nodes={graph_m_nodes} replay_bit_identical={} {}",
             mma_groups(n_heads),
+            m.rel,
+            m.cross,
+            m.rerun_same,
+            m.replay_same,
             verdict(pass_m)
         );
-        if !pass_m {
-            *ok = false;
-        }
-        let pass = rel <= band && one_rel <= band && cross_rel <= band && rerun_same && replay_same;
+        ok &= pass_m;
+        let pass = s.rel <= band
+            && s.one_rel <= band
+            && s.cross_rel <= band
+            && s.rerun_same
+            && s.replay_same;
         println!(
-            "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} live_segs={} nan_pad_rows={} max_rel_err={rel:.3e} single_launch_rel={one_rel:.3e} split_vs_single={cross_rel:.3e} bit_identical_rerun={rerun_same} graph_nodes={graph_nodes} replay_bit_identical={replay_same} {}",
+            "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} live_segs={} nan_pad_rows={} max_rel_err={:.3e} single_launch_rel={:.3e} split_vs_single={:.3e} bit_identical_rerun={} graph_nodes={graph_nodes} replay_bit_identical={} {}",
             n_keys.div_ceil(seg),
             depth_rows - n_keys,
+            s.rel,
+            s.one_rel,
+            s.cross_rel,
+            s.rerun_same,
+            s.replay_same,
             verdict(pass)
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
-    Ok(())
+    Ok(ok)
+}
+
+/// The split path at one key count: two eager runs, the single-block entry
+/// on the same inputs, and a replay of the one captured graph.
+#[cfg(feature = "gpu")]
+fn depth_split(
+    flash: &FlashKernels,
+    stream: &CudaStream,
+    inputs: FlashInputs<'_>,
+    graph: &Graph,
+    (part, y_dev, y_one): (
+        &mut Partials,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+    ),
+    y_ref: &[f32],
+) -> Result<SplitDepth, Box<dyn std::error::Error>> {
+    let (y1, y2) = split_twice(flash, stream, inputs, part, y_dev)?;
+    let rerun_same = bits_equal(&y1, &y2);
+    let rel = max_rel_err(&y1, y_ref)?;
+    // The single-block entry on the same inputs: the path a cache short
+    // enough to hold one segment takes. Both must land inside the band
+    // against the f64 reference, and so must their distance to each
+    // other — the split moves the summation order, nothing else.
+    flash.enqueue_flash_latent(
+        stream,
+        FlashLatentArgs {
+            inputs,
+            y: &mut *y_one,
+        },
+    )?;
+    stream.synchronize()?;
+    let y_single = y_one.to_host_vec(stream)?;
+    let one_rel = max_rel_err(&y_single, y_ref)?;
+    let cross_rel = max_rel_err(&y1, &y_single)?;
+    graph.launch(stream)?;
+    stream.synchronize()?;
+    let y_graph = y_dev.to_host_vec(stream)?;
+    let replay_same = bits_equal(&y1, &y_graph);
+    Ok(SplitDepth {
+        y1,
+        rel,
+        one_rel,
+        cross_rel,
+        rerun_same,
+        replay_same,
+    })
+}
+
+/// The tensor-core segment pass and the merge after it, enqueued (not
+/// synchronized) — the body of both the eager runs and the captured graph.
+#[cfg(feature = "gpu")]
+fn mma_enqueue(
+    flash: &FlashKernels,
+    stream: &CudaStream,
+    inputs: FlashInputs<'_>,
+    cache_rows: usize,
+    part: &mut Partials,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    flash.enqueue_flash_latent_mma(
+        stream,
+        FlashSegArgs {
+            inputs,
+            part_v: &mut part.v,
+            part_ms: &mut part.ms,
+        },
+    )?;
+    flash.enqueue_flash_merge(
+        stream,
+        FlashMergeArgs {
+            n_keys_buf: inputs.n_keys_buf,
+            cache_rows,
+            tokens: inputs.geom.tokens,
+            heads: inputs.geom.heads,
+            latent_dims: inputs.geom.latent_dims,
+            part_v: &part.v,
+            part_ms: &part.ms,
+            y,
+        },
+    )
+}
+
+/// The tensor-core pass at one key count, through the same merge. Its query
+/// rows and products are f16, so it carries its own band (`mma_band`)
+/// against the f64 reference and against the one-row pass (`y_split`);
+/// reruns and graph replays of it are still bit-identical.
+#[cfg(feature = "gpu")]
+fn depth_mma(
+    flash: &FlashKernels,
+    stream: &CudaStream,
+    inputs: FlashInputs<'_>,
+    graph_m: &Graph,
+    (part, y_m): (&mut Partials, &mut DeviceBuffer<f32>),
+    y_ref: &[f32],
+    y_split: &[f32],
+) -> Result<MmaDepth, Box<dyn std::error::Error>> {
+    let cache_rows = inputs.kv.rows();
+    let mut run = || -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        mma_enqueue(flash, stream, inputs, cache_rows, &mut *part, &mut *y_m)?;
+        stream.synchronize()?;
+        Ok(y_m.to_host_vec(stream)?)
+    };
+    let m1 = run()?;
+    let m2 = run()?;
+    let rerun_same = bits_equal(&m1, &m2);
+    let rel = max_rel_err(&m1, y_ref)?;
+    let cross = max_rel_err(&m1, y_split)?;
+    graph_m.launch(stream)?;
+    stream.synchronize()?;
+    let m_graph = y_m.to_host_vec(stream)?;
+    let replay_same = bits_equal(&m1, &m_graph);
+    Ok(MmaDepth {
+        rel,
+        cross,
+        rerun_same,
+        replay_same,
+    })
 }
 
 // ----------------------------------------------------------- IEEE edges
@@ -823,8 +1074,7 @@ fn depth_cases(
 fn edge_values(
     flash: &FlashKernels,
     stream: &CudaStream,
-    ok: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let edges: Vec<f32> = vec![
         0.0,
         -0.0,
@@ -859,10 +1109,7 @@ fn edge_values(
         "shape op=kv_append_edges width={width} bits_exact={bits_exact} row1_untouched={row1_untouched} {}",
         verdict(pass)
     );
-    if !pass {
-        *ok = false;
-    }
-    Ok(())
+    Ok(pass)
 }
 
 // --------------------------------------------------------------- graphs
@@ -873,28 +1120,14 @@ fn graph_check_flash(
     gpu: &Gpu,
     flash: &FlashKernels,
     case: &GraphFlashCase<'_>,
-    ok: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let GraphFlashCase { inputs, y_eager } = *case;
     let (cache, n_heads, latent) = (inputs.kv, inputs.geom.heads, inputs.geom.latent_dims);
     let stream = gpu.stream();
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
     let segs = segments_for(cache.rows());
-    let mut part_v = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_heads, cache.rows()))?;
-    let mut part_ms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_heads, cache.rows()))?;
-    let graph = gpu.capture(|_s| {
-        flash
-            .enqueue_flash_latent_split(
-                stream,
-                FlashSplitArgs {
-                    inputs,
-                    part_v: &mut part_v,
-                    part_ms: &mut part_ms,
-                    y: &mut y_dev,
-                },
-            )
-            .map(|_| ())
-    })?;
+    let mut part = Partials::zeroed(stream, n_heads, cache.rows())?;
+    let graph = split_graph(gpu, flash, inputs, &mut part, &mut y_dev)?;
     graph.launch(stream)?;
     stream.synchronize()?;
     let y_graph = y_dev.to_host_vec(stream)?;
@@ -908,10 +1141,7 @@ fn graph_check_flash(
         "graph op=flash_latent segs={segs} graph_nodes={nodes} want_nodes={want_nodes} eager_vs_graph_bit_identical={identical} {}",
         verdict(pass)
     );
-    if !pass {
-        *ok = false;
-    }
-    Ok(())
+    Ok(pass)
 }
 
 /// The pos-buffer append inside a captured graph: rewriting the buffer
@@ -923,8 +1153,7 @@ fn graph_check_append(
     gpu: &Gpu,
     flash: &FlashKernels,
     one_row: &[f32],
-    ok: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let stream = gpu.stream();
     let src = DeviceBuffer::from_host(stream, one_row)?;
     let mut pos_buf = DeviceBuffer::from_host(stream, &[0u32])?;
@@ -972,10 +1201,7 @@ fn graph_check_append(
         scalar_frozen,
         verdict(pass)
     );
-    if !pass {
-        *ok = false;
-    }
-    Ok(())
+    Ok(pass)
 }
 
 // -------------------------------------------------------------- helpers
