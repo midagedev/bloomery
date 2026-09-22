@@ -46,6 +46,9 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::verdict;
+
+#[cfg(feature = "gpu")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::router::{N_EXPERT, N_USED, RouterKernels};
@@ -853,9 +856,4 @@ fn to_expert_major<T: Copy>(src: &[T], per: usize, m: usize) -> Vec<T> {
         }
     }
     out
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

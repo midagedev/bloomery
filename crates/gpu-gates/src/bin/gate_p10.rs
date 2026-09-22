@@ -52,7 +52,8 @@ use bloomery_gpu::weights::{Derived, DevWeight, Q8Block, Weights, resident_size}
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, row_bytes, tensor_bytes,
+    KERNEL_BAND, activations, bits_equal, bytes_to_words, max_rel_err, open_model, row_bytes,
+    tensor_bytes, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -183,7 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (
                     "f32".to_string(),
                     want.len() as u64 * 4,
-                    bits_equal_f32(&got, &want),
+                    bits_equal(&got, &want),
                     None,
                 )
             }
@@ -196,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (
                     "derived_q_nope2".to_string(),
                     qs_want.len() as u64 * 4 + d_want.len() as u64 * 4,
-                    qs_got == qs_want && bits_equal_f32(&d_got, &d_want),
+                    qs_got == qs_want && bits_equal(&d_got, &d_want),
                     None,
                 )
             }
@@ -794,8 +795,8 @@ fn kid_kquant(
     stream.synchronize()?;
     let y1b = y1.to_host_vec(stream)?;
     Ok((
-        bits_equal_f32(&y1v, &y2v),
-        bits_equal_f32(&y1v, &y1b),
+        bits_equal(&y1v, &y2v),
+        bits_equal(&y1v, &y1b),
         y1v.iter().map(|v| v.to_bits()).collect(),
     ))
 }
@@ -846,8 +847,8 @@ fn kid_q5_1(
     stream.synchronize()?;
     let y1b = y1.to_host_vec(stream)?;
     Ok((
-        bits_equal_f32(&y1v, &y2v),
-        bits_equal_f32(&y1v, &y1b),
+        bits_equal(&y1v, &y2v),
+        bits_equal(&y1v, &y1b),
         y1v.iter().map(|v| v.to_bits()).collect(),
     ))
 }
@@ -892,8 +893,8 @@ fn kid_q5_0_sel(
     stream.synchronize()?;
     let y1b = y1.to_host_vec(stream)?;
     Ok((
-        bits_equal_f32(&y1v, &y2v),
-        bits_equal_f32(&y1v, &y1b),
+        bits_equal(&y1v, &y2v),
+        bits_equal(&y1v, &y1b),
         y1v.iter().map(|v| v.to_bits()).collect(),
     ))
 }
@@ -938,8 +939,8 @@ fn kid_q3k_sel(
     stream.synchronize()?;
     let y1b = y1.to_host_vec(stream)?;
     Ok((
-        bits_equal_f32(&y1v, &y2v),
-        bits_equal_f32(&y1v, &y1b),
+        bits_equal(&y1v, &y2v),
+        bits_equal(&y1v, &y1b),
         y1v.iter().map(|v| v.to_bits()).collect(),
     ))
 }
@@ -986,8 +987,8 @@ fn kid_f32(
     stream.synchronize()?;
     let y1b = y1.to_host_vec(stream)?;
     Ok((
-        bits_equal_f32(&y1v, &y2v),
-        bits_equal_f32(&y1v, &y1b),
+        bits_equal(&y1v, &y2v),
+        bits_equal(&y1v, &y1b),
         y1v.iter().map(|v| v.to_bits()).collect(),
     ))
 }
@@ -1046,18 +1047,8 @@ fn kid_q8_derived(
     stream.synchronize()?;
     let y1b = y1.to_host_vec(stream)?;
     Ok((
-        bits_equal_f32(&y1v, &y2v),
-        bits_equal_f32(&y1v, &y1b),
+        bits_equal(&y1v, &y2v),
+        bits_equal(&y1v, &y1b),
         y1v.iter().map(|v| v.to_bits()).collect(),
     ))
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal_f32(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

@@ -27,6 +27,9 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::{bits_equal, verdict};
+
+#[cfg(feature = "gpu")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1};
     use bloomery_gpu::{DeviceTensor, Gpu};
@@ -258,14 +261,4 @@ fn q8_hat(x: &[f32], k: usize) -> Vec<f32> {
         }
     }
     out
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

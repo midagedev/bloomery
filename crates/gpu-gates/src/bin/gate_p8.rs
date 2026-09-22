@@ -68,8 +68,8 @@ use bloomery_gpu::model::StepProbe;
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
-    ref_tensor_logical_in, widened_f16_bits,
+    bits_equal, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
+    ref_tensor_logical_in, verdict, widened_f16_bits,
 };
 
 /// The six-token prompt the CUDA dump was made for (gate_p4's constant —
@@ -1027,14 +1027,4 @@ fn parse_u32_flag(
             Ok(Some(p))
         }
     }
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

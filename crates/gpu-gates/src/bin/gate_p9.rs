@@ -29,7 +29,9 @@ use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{activations, bytes_to_words, open_model, tensor_bytes};
+use bloomery_gpu_gates::{
+    activations, bits_equal, bytes_to_words, open_model, tensor_bytes, verdict,
+};
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
 #[cfg(feature = "gpu")]
@@ -375,14 +377,4 @@ fn q5_expert_col_ref(
     q5.enqueue_gemv_q5_0(stream, w, act, id * rpe, rpe, slot, 1, &mut y, 0)?;
     stream.synchronize()?;
     Ok(y.to_host_vec(stream)?)
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

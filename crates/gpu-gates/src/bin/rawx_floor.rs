@@ -18,10 +18,11 @@
 //! K do not match the expected geometry are skipped with what was found
 //! rather than measured on a guessed layout.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bloomery_gpu_gates::{
-    DEFAULT_MODEL, activations, max_rel_err, open_model, ref_gemv, row_bytes, tensor_bytes,
+    DEFAULT_MODEL, activations, max_rel_err, open_model, ref_dir_named, ref_gemv, row_bytes,
+    tensor_bytes,
 };
 use gguf::Gguf;
 use gguf::quant::GgmlType;
@@ -145,7 +146,9 @@ fn sites() -> Vec<Site> {
 
 fn main() -> Result<(), ProbeError> {
     let model = std::env::var("BLOOMERY_REF_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    let dir = ref_dir();
+    // The probe reads the pre-v2 plain-file set by name, not the environment:
+    // its sites name `<tensor>-<layer>.0.f32` files that only that set carries.
+    let dir = ref_dir_named("ref_cuda");
     let gguf = open_model()?;
     println!("rawx_floor: model {model}");
     println!("rawx_floor: activations dir {}", dir.display());
@@ -179,12 +182,6 @@ fn main() -> Result<(), ProbeError> {
     );
     println!("synth_*    : the same site with activations(K, 1, 1) as x");
     Ok(())
-}
-
-/// `$BLOOMERY_DATA/ref_cuda` — where the reference engine's CUDA dump lives.
-fn ref_dir() -> PathBuf {
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    PathBuf::from(data).join("ref_cuda")
 }
 
 fn run_site(gguf: &Gguf, dir: &Path, s: &Site) -> Result<(), ProbeError> {

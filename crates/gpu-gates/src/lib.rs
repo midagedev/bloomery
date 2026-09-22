@@ -183,6 +183,21 @@ impl RefRow {
     pub fn file_name(&self) -> String {
         format!("{}.{}.f32", self.name, self.occurrence)
     }
+
+    /// Prove this row's type, dims and op — the chain check every consumer
+    /// runs before trusting a tensor (`op` = what produced it). `op = "in"`
+    /// only checks type and dims (an input's op varies). `what` names the
+    /// call site in the error.
+    pub fn expect(&self, what: &str, ty: &str, ne: [u64; 4], op: &str) -> Result<(), GateError> {
+        if self.ty != ty || self.ne != ne || (op != "in" && self.op != op) {
+            return Err(format!(
+                "expect: {what}: {} is {} {:?} op {}, want {ty} {ne:?} op {op}",
+                self.name, self.ty, self.ne, self.op
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 /// Directory of the ik CUDA oracle dump (docs/gpu-design.md decision 3):
@@ -361,8 +376,14 @@ pub fn ref_tensor_of_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<f32>,
 /// `ref_tensor_of` over `find_ref_row`: load `(name, occurrence)`'s f32
 /// file with its manifest row (dims, op, sum) for chain checking.
 pub fn ref_tensor(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), GateError> {
-    let man = ref_manifest()?;
-    let row = find_ref_row(&man, name, occurrence)?;
+    load_ref(&ref_manifest()?, name, occurrence)
+}
+
+/// `ref_tensor` over a manifest the caller already parsed: load
+/// `(name, occ)`'s f32 file with its manifest row. A gate that reads many
+/// tensors parses the manifest once and calls this.
+pub fn load_ref(man: &[RefRow], name: &str, occ: u32) -> Result<(RefRow, Vec<f32>), GateError> {
+    let row = find_ref_row(man, name, occ)?;
     Ok((row.clone(), ref_tensor_of(row)?))
 }
 
@@ -440,6 +461,40 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
 // Single owners of the reference-side helpers the gate bins first wrote
 // locally. The bins keep their private copies until their owning tracks
 // switch them over; the math here is the transcription those copies carry.
+
+/// The word a gate prints for one check's outcome: `PASS` or `FAIL`. The
+/// gates' tables are compared line by line across rounds, so the spelling
+/// has one owner.
+pub fn verdict(pass: bool) -> &'static str {
+    if pass { "PASS" } else { "FAIL" }
+}
+
+/// Same length and the same bits at every index — the bit-identity contract
+/// the fusion, rerun and replay checks assert. Not `==`: that calls `-0.0`
+/// equal to `0.0` and two NaNs unequal, and both are differences a fusion
+/// defect can produce.
+pub fn bits_equal(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Mean microseconds per replay of graph `g`: one warm replay and a
+/// synchronize, then `n` replays timed to a single synchronize at the end.
+/// Lead-only timing under the machine lease — no correctness path calls it.
+#[cfg(feature = "gpu")]
+pub fn us_per_replay(
+    g: &bloomery_gpu::Graph,
+    stream: &cuda_core::CudaStream,
+    n: u32,
+) -> Result<f64, GateError> {
+    g.launch(stream)?;
+    stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        g.launch(stream)?;
+    }
+    stream.synchronize()?;
+    Ok(t0.elapsed().as_secs_f64() * 1e6 / f64::from(n))
+}
 
 /// Prove the dump's VIEW convention for one view read as a PLAIN file:
 /// `view` must equal `base` from `off` — flat memory from the view's base

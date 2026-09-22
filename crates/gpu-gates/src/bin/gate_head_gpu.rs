@@ -38,7 +38,9 @@ use bloomery_gpu::weights::Weights;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{find_ref_row, open_model, ref_dir, ref_manifest, ref_tensor_logical_in};
+use bloomery_gpu_gates::{
+    bits_equal, find_ref_row, open_model, ref_dir, ref_manifest, ref_tensor_logical_in, verdict,
+};
 
 /// The oracle's own greedy token for the prompt the dump sets were made with
 /// (`gate_block`'s pin: both of ik's backends argmax here). Re-proved here so
@@ -275,14 +277,4 @@ fn top5(v: &[f32]) -> Vec<(usize, f32)> {
     idx.sort_by(|&a, &b| v[b].total_cmp(&v[a]).then(a.cmp(&b)));
     idx.truncate(5);
     idx.into_iter().map(|i| (i, v[i])).collect()
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

@@ -27,11 +27,9 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::RefRow;
-#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    bytes_to_words, f32_tensor, find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of,
-    row_bytes, tensor_bytes,
+    bits_equal, bytes_to_words, f32_tensor, load_ref, max_rel_err, open_model, ref_manifest,
+    row_bytes, tensor_bytes, us_per_replay, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -43,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use bloomery_gpu::fused::{FusedKernels, readback_q8act};
     use bloomery_gpu::probe::Probe;
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
-    use bloomery_gpu::{DeviceTensor, Gpu, Graph, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 
     // The block-0 shapes (asserted from the file below): hidden width 2048,
     // FFN intermediate 10944 (gate/up rows, down K), down rows 2048. The
@@ -71,13 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The input: dump ffn_inp-0's last token column, dims proven first.
     let (inp_row, ffn_inp) = load_ref(&man, "ffn_inp-0", 0)?;
-    expect(
-        &inp_row,
-        "ffn_inp-0",
-        "f32",
-        [K as u64, TOKENS as u64, 1, 1],
-        "in",
-    )?;
+    inp_row.expect("ffn_inp-0", "f32", [K as u64, TOKENS as u64, 1, 1], "in")?;
     let x = ffn_inp[(TOKENS - 1) * K..TOKENS * K].to_vec();
     println!(
         "input op=ffn_inp-0 dims={:?} used=last_token_position_{} K={K} m=1 eps={eps:e}",
@@ -419,8 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let step = StepKernels::load(gpu.context())?;
 
         let (kv_row, kv_all) = load_ref(&man, "kv_rope_compressed-0", 0)?;
-        expect(
-            &kv_row,
+        kv_row.expect(
             "kv_rope_compressed-0",
             "f32",
             [width as u64, TOKENS as u64, 1, 1],
@@ -656,18 +647,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // outputs on the same position.
     {
         let (l_row, l_out) = load_ref(&man, "l_out-0", 0)?;
-        expect(
-            &l_row,
-            "l_out-0",
-            "f32",
-            [K as u64, TOKENS as u64, 1, 1],
-            "ADD",
-        )?;
+        l_row.expect("l_out-0", "f32", [K as u64, TOKENS as u64, 1, 1], "ADD")?;
         let ik_y = max_rel_err(&y_fu_1, &l_out[(TOKENS - 1) * K..TOKENS * K])?;
         let (ug_row, up_gate) = load_ref(&man, "ffn_up_gate-0", 0)?;
         // The dump's fused gate/up output: dims match h exactly.
-        expect(
-            &ug_row,
+        ug_row.expect(
             "ffn_up_gate-0",
             "f32",
             [FF as u64, TOKENS as u64, 1, 1],
@@ -690,24 +674,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpu.capture(|_| (0..4).try_for_each(|_| probe.enqueue_touch(stream, &mut tbuf)))?;
         let g8 =
             gpu.capture(|_| (0..8).try_for_each(|_| probe.enqueue_touch(stream, &mut tbuf)))?;
-        fn us_per_replay(g: &Graph, stream: &cuda_core::CudaStream, n: u32) -> f64 {
-            // Correctness-run code never calls this; unwrap keeps the probe
-            // readable.
-            g.launch(stream).unwrap();
-            stream.synchronize().unwrap();
-            let t0 = std::time::Instant::now();
-            for _ in 0..n {
-                g.launch(stream).unwrap();
-            }
-            stream.synchronize().unwrap();
-            t0.elapsed().as_secs_f64() * 1e6 / f64::from(n)
-        }
         println!(
             "time n={N} op_us_per_replay={:.3} fused_us_per_replay={:.3} touch4_us_per_replay={:.3} touch8_us_per_replay={:.3}",
-            us_per_replay(&graph_op, stream, N),
-            us_per_replay(&graph_fu, stream, N),
-            us_per_replay(&g4, stream, N),
-            us_per_replay(&g8, stream, N),
+            us_per_replay(&graph_op, stream, N)?,
+            us_per_replay(&graph_fu, stream, N)?,
+            us_per_replay(&g4, stream, N)?,
+            us_per_replay(&g8, stream, N)?,
         );
     }
 
@@ -722,45 +694,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          second position)"
     );
     Ok(())
-}
-
-/// Load `(name, occurrence)` from the dump with its manifest row.
-#[cfg(feature = "gpu")]
-fn load_ref(
-    man: &[RefRow],
-    name: &str,
-    occ: u32,
-) -> Result<(RefRow, Vec<f32>), Box<dyn std::error::Error>> {
-    let row = find_ref_row(man, name, occ)?;
-    Ok((row.clone(), ref_tensor_of(row)?))
-}
-
-/// Prove a dump row's type, dims and op — the chain check every consumer
-/// runs before trusting a tensor. `op = "in"` only checks type and dims.
-#[cfg(feature = "gpu")]
-fn expect(
-    row: &RefRow,
-    what: &str,
-    ty: &str,
-    ne: [u64; 4],
-    op: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if row.ty != ty || row.ne != ne || (op != "in" && row.op != op) {
-        return Err(format!(
-            "gate_p0b: {what}: {} is {} {:?} op {}, want {} {:?} op {}",
-            row.name, row.ty, row.ne, row.op, ty, ne, op
-        )
-        .into());
-    }
-    Ok(())
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

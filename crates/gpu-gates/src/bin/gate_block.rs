@@ -24,7 +24,7 @@ use bloomery_gpu_gates::block::{
     taps,
 };
 use bloomery_gpu_gates::{
-    find_ref_row_in, ref_dir, ref_dir_named, ref_manifest_in, ref_tensor_logical_in,
+    find_ref_row_in, ref_dir, ref_dir_named, ref_manifest_in, ref_tensor_logical_in, verdict,
 };
 use std::path::PathBuf;
 
@@ -217,8 +217,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          a corrupted mid-chain tensor is named as the first divergence"
     );
     Ok(())
-}
-
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

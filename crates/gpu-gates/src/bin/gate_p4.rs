@@ -39,8 +39,9 @@ fn main() {
 use bloomery_gpu_gates::RefRow;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    activations, bytes_to_words, f32_tensor, find_ref_row, max_rel_err, open_model, ref_manifest,
-    ref_tensor_logical, ref_tensor_of, row_bytes, tensor_bytes, view_flat,
+    activations, bits_equal, bytes_to_words, f32_tensor, find_ref_row, load_ref, max_rel_err,
+    open_model, ref_manifest, ref_tensor_logical, ref_tensor_of, row_bytes, tensor_bytes, verdict,
+    view_flat,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -124,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Oracle: inp_embd (GET_ROWS of the same prompt).
         let row = find_ref_row(&man, "inp_embd", 0)?;
-        expect(row, "inp_embd", "f32", [2048, 6, 1, 1], "GET_ROWS")?;
+        row.expect("inp_embd", "f32", [2048, 6, 1, 1], "GET_ROWS")?;
         let ik = ref_tensor_of(row)?;
         let ik_rel = max_rel_err(&y, &ik)?;
 
@@ -178,9 +179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let out_row = find_ref_row(&man, out_name, out_occ)?;
         let k = in_row.ne[0] as usize;
         let mi = in_row.ne[1] as usize;
-        expect(&in_row, in_name, "f32", [k as u64, mi as u64, 1, 1], "in")?;
-        expect(
-            &out_row,
+        in_row.expect(in_name, "f32", [k as u64, mi as u64, 1, 1], "in")?;
+        out_row.expect(
             out_name,
             "f32",
             [k as u64, mi as u64, 1, 1],
@@ -202,26 +202,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let label = "kv_compressed-1";
         let (base_row, krc) = load_ref(&man, "kv_rope_compressed-1", 0)?;
         let kv_w = mla.latent + mla.rope_dims;
-        expect(
-            &base_row,
+        base_row.expect(
             "kv_rope_compressed-1",
             "f32",
             [kv_w as u64, m as u64, 1, 1],
             "MUL_MAT",
         )?;
         let (view_row, view) = load_ref(&man, label, 0)?;
-        expect(
-            &view_row,
-            label,
-            "f32",
-            [mla.latent as u64, m as u64, 1, 1],
-            "VIEW",
-        )?;
+        view_row.expect(label, "f32", [mla.latent as u64, m as u64, 1, 1], "VIEW")?;
         view_flat(&view, &krc, 0, label)?;
         let x = ref_tensor_logical(label, 0)?.1;
         let out_row = find_ref_row(&man, label, 1)?;
-        expect(
-            &out_row,
+        out_row.expect(
             label,
             "f32",
             [mla.latent as u64, m as u64, 1, 1],
@@ -267,8 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The q side's base tensor, loaded for the flat-view proof.
             let q_name = format!("q-{l}");
             let (q_row, qv) = load_ref(&man, &q_name, 0)?;
-            expect(
-                &q_row,
+            q_row.expect(
                 &q_name,
                 "f32",
                 [(mla.n_head * mla.kq_head) as u64, m as u64, 1, 1],
@@ -278,31 +269,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let krc_name = format!("kv_rope_compressed-{l}");
             let (krc_row, krc) = load_ref(&man, &krc_name, 0)?;
             let kv_w = mla.latent + nd;
-            expect(
-                &krc_row,
-                &krc_name,
-                "f32",
-                [kv_w as u64, m as u64, 1, 1],
-                "MUL_MAT",
-            )?;
+            krc_row.expect(&krc_name, "f32", [kv_w as u64, m as u64, 1, 1], "MUL_MAT")?;
             for (what, n_vec) in [("q_rope", mla.n_head as u32), ("k_rope", 1u32)] {
                 let name = format!("{what}-{l}");
                 let (in_row, view) = load_ref(&man, &name, 0)?;
                 let out_row = find_ref_row(&man, &name, 1)?;
-                expect(
-                    &in_row,
-                    &name,
-                    "f32",
-                    [nd as u64, n_vec as u64, m as u64, 1],
-                    "VIEW",
-                )?;
-                expect(
-                    &out_row,
-                    &name,
-                    "f32",
-                    [nd as u64, n_vec as u64, m as u64, 1],
-                    "ROPE",
-                )?;
+                in_row.expect(&name, "f32", [nd as u64, n_vec as u64, m as u64, 1], "VIEW")?;
+                out_row.expect(&name, "f32", [nd as u64, n_vec as u64, m as u64, 1], "ROPE")?;
                 // Prove the flat-view convention: the dump equals the base
                 // memory from the slice's start, which is NOT the logical
                 // tensor fed to the kernel below.
@@ -396,9 +369,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (a_row, a) = load_ref(&man, a_name, 0)?;
             let (b_row, b) = load_ref(&man, b_name, 0)?;
             let (out_row, out) = load_ref(&man, out_name, 0)?;
-            expect(&a_row, a_name, "f32", [2048, 6, 1, 1], "in")?;
-            expect(&b_row, b_name, "f32", [2048, 6, 1, 1], "in")?;
-            expect(&out_row, out_name, "f32", [2048, 6, 1, 1], "ADD")?;
+            a_row.expect(a_name, "f32", [2048, 6, 1, 1], "in")?;
+            b_row.expect(b_name, "f32", [2048, 6, 1, 1], "in")?;
+            out_row.expect(out_name, "f32", [2048, 6, 1, 1], "ADD")?;
             let (sa, sb, so) = (f64_sum(&a), f64_sum(&b), f64_sum(&out));
             if (sa + sb - so).abs() > 1e-3 * so.abs().max(1.0) {
                 println!(
@@ -443,21 +416,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (down_row, down) = load_ref(&man, "ffn_moe_down-1", 0)?;
         let (w_row, wts) = load_ref(&man, "ffn_moe_weights-1", 0)?;
         let (out_row, out) = load_ref(&man, "ffn_moe_out-1", 0)?;
-        expect(
-            &down_row,
-            "ffn_moe_down-1",
-            "f32",
-            [2048, 6, 6, 1],
-            "MUL_MAT_ID",
-        )?;
-        expect(&w_row, "ffn_moe_weights-1", "f32", [1, 6, 6, 1], "GET_ROWS")?;
-        expect(
-            &out_row,
-            "ffn_moe_out-1",
-            "f32",
-            [2048, 6, 1, 1],
-            "MUL_MULTI_ADD",
-        )?;
+        down_row.expect("ffn_moe_down-1", "f32", [2048, 6, 6, 1], "MUL_MAT_ID")?;
+        w_row.expect("ffn_moe_weights-1", "f32", [1, 6, 6, 1], "GET_ROWS")?;
+        out_row.expect("ffn_moe_out-1", "f32", [2048, 6, 1, 1], "MUL_MULTI_ADD")?;
         let (rows, n_exp) = (2048usize, 6u32);
         for mm in [6usize, 1] {
             let span = n_exp as usize * rows * mm;
@@ -500,13 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================ argmax
     {
         let (out_row, logits) = load_ref(&man, "result_output", 0)?;
-        expect(
-            &out_row,
-            "result_output",
-            "f32",
-            [102400, 1, 1, 1],
-            "MUL_MAT",
-        )?;
+        out_row.expect("result_output", "f32", [102400, 1, 1, 1], "MUL_MAT")?;
         let host = argmax_ref(&logits);
         let x_dev = DeviceBuffer::from_host(stream, &logits)?;
         let mut idx_dev = DeviceBuffer::<u32>::zeroed(stream, 1)?;
@@ -897,38 +852,6 @@ fn rms_case(
     ))
 }
 
-/// Load `(name, occurrence)` from the dump with its manifest row.
-#[cfg(feature = "gpu")]
-fn load_ref(
-    man: &[RefRow],
-    name: &str,
-    occ: u32,
-) -> Result<(RefRow, Vec<f32>), Box<dyn std::error::Error>> {
-    let row = find_ref_row(man, name, occ)?;
-    Ok((row.clone(), ref_tensor_of(row)?))
-}
-
-/// Prove a dump row's type, dims and op — the chain check every consumer
-/// runs before trusting a tensor (`op` = what produced it). `op = "in"` only
-/// checks type and dims (an input's op varies).
-#[cfg(feature = "gpu")]
-fn expect(
-    row: &RefRow,
-    what: &str,
-    ty: &str,
-    ne: [u64; 4],
-    op: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if row.ty != ty || row.ne != ne || (op != "in" && row.op != op) {
-        return Err(format!(
-            "gate_p4: {what}: {} is {} {:?} op {}, want {} {:?} op {}",
-            row.name, row.ty, row.ne, row.op, ty, ne, op
-        )
-        .into());
-    }
-    Ok(())
-}
-
 /// Element sum in f64 — the operand-pair proof of the add chains.
 #[cfg(feature = "gpu")]
 fn f64_sum(x: &[f32]) -> f64 {
@@ -984,14 +907,4 @@ fn argmax_ref(x: &[f32]) -> u32 {
         }
     }
     best as u32
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }
