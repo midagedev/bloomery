@@ -21,13 +21,11 @@
 use std::path::Path;
 
 use bloomery_gpu_gates::{
-    DEFAULT_MODEL, activations, max_rel_err, open_model, ref_dir_named, ref_gemv, row_bytes,
-    tensor_bytes,
+    DEFAULT_MODEL, GateError, activations, max_rel_err, open_model, ref_dir_named, ref_gemv,
+    row_bytes, tensor_bytes,
 };
 use gguf::Gguf;
 use gguf::quant::GgmlType;
-
-type ProbeError = Box<dyn std::error::Error>;
 
 /// One measurement site: the dumped intermediate `x_file`, the quantized
 /// `tensor` whose gemv consumes it, and the q8_1 `block` size that gemv
@@ -144,7 +142,11 @@ fn sites() -> Vec<Site> {
     v
 }
 
-fn main() -> Result<(), ProbeError> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("rawx_floor", run())
+}
+
+fn run() -> Result<(), GateError> {
     let model = std::env::var("BLOOMERY_REF_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     // Pinned by name to the pre-v2 `ref_cuda` set, not steered by the
     // environment the way `ref_dir()` is (which resolves to `ref_cuda_v2`).
@@ -184,7 +186,7 @@ fn main() -> Result<(), ProbeError> {
     Ok(())
 }
 
-fn run_site(gguf: &Gguf, dir: &Path, s: &Site) -> Result<(), ProbeError> {
+fn run_site(gguf: &Gguf, dir: &Path, s: &Site) -> Result<(), GateError> {
     let layer = s.layer.map_or_else(|| "-".to_string(), |l| l.to_string());
     let x_path = dir.join(&s.x_file);
     let x_bytes = match std::fs::read(&x_path) {
@@ -324,7 +326,7 @@ fn col_rel_errs(
     y_exact: &[f32],
     rows: usize,
     m: usize,
-) -> Result<Vec<f32>, ProbeError> {
+) -> Result<Vec<f32>, GateError> {
     let mut out = Vec::with_capacity(m);
     for c in 0..m {
         let mut num = 0.0f32;

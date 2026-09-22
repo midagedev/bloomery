@@ -52,8 +52,8 @@ use bloomery_gpu::weights::{Derived, DevWeight, Q8Block, Weights, resident_size}
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    KERNEL_BAND, activations, bits_equal, bytes_to_words, max_rel_err, open_model, row_bytes,
-    tensor_bytes, verdict,
+    GateError, KERNEL_BAND, activations, bits_equal, bytes_to_words, max_rel_err, open_model,
+    row_bytes, tensor_bytes, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -72,7 +72,12 @@ const SEED: u32 = 10;
 const SEL: [u32; 6] = [0, 5, 63, 17, 17, 2];
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p10", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     // The staging cut; layer 1 (the kernel-identity rows) sits below it.
     const CUT: usize = 14;
 
@@ -317,7 +322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let y_ref = derived_ref_gemv(blocks, rows, k, &x, m);
             let x_dev = DeviceBuffer::from_host(stream, &x)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
-            let got: Result<Vec<f32>, Box<dyn std::error::Error>> = (|| {
+            let got: Result<Vec<f32>, GateError> = (|| {
                 q8f32.enqueue_q8_0_gemv(stream, qs, d, &x_dev, m, &mut y)?;
                 stream.synchronize()?;
                 Ok(y.to_host_vec(stream)?)
@@ -446,7 +451,7 @@ fn expected_planes(
     derived: &Derived,
     name: &str,
     n_layers: usize,
-) -> Result<HostPlanes, Box<dyn std::error::Error>> {
+) -> Result<HostPlanes, GateError> {
     if let Some(rest) = name.strip_prefix("derived.blk.") {
         let l: usize = rest
             .strip_suffix(".q_nope2")
@@ -544,7 +549,7 @@ fn run_table(
     w: &Weights,
     derived: &Derived,
     seed: u32,
-) -> Result<Vec<(String, Vec<u32>)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(String, Vec<u32>)>, GateError> {
     let mut rows: Vec<(String, Vec<u32>)> = Vec::new();
 
     // K-quant plain rows: layer-1 tensors (attn_q Q3_K, attn_output Q4_K)
@@ -778,7 +783,7 @@ fn kid_kquant(
     k: usize,
     m: usize,
     seed: u32,
-) -> Result<(bool, bool, Vec<u32>), Box<dyn std::error::Error>> {
+) -> Result<(bool, bool, Vec<u32>), GateError> {
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_kquant: resident {}x{} vs reference {}x{}",
@@ -840,7 +845,7 @@ fn kid_q5_1(
     k: usize,
     m: usize,
     seed: u32,
-) -> Result<(bool, bool, Vec<u32>), Box<dyn std::error::Error>> {
+) -> Result<(bool, bool, Vec<u32>), GateError> {
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_q5_1: resident {}x{} vs reference {}x{}",
@@ -893,7 +898,7 @@ fn kid_q5_0_sel(
     act: &Q8Blocks32,
     sel: &DeviceBuffer<u32>,
     rpe: usize,
-) -> Result<(bool, bool, Vec<u32>), Box<dyn std::error::Error>> {
+) -> Result<(bool, bool, Vec<u32>), GateError> {
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_q5_0_sel: resident {}x{} vs reference {}x{}",
@@ -941,7 +946,7 @@ fn kid_q3k_sel(
     act: &Q8Act,
     sel: &DeviceBuffer<u32>,
     rpe: usize,
-) -> Result<(bool, bool, Vec<u32>), Box<dyn std::error::Error>> {
+) -> Result<(bool, bool, Vec<u32>), GateError> {
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_q3k_sel: resident {}x{} vs reference {}x{}",
@@ -989,7 +994,7 @@ fn kid_f32(
     k: usize,
     m: usize,
     seed: u32,
-) -> Result<(bool, bool, Vec<u32>), Box<dyn std::error::Error>> {
+) -> Result<(bool, bool, Vec<u32>), GateError> {
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_f32: resident {}x{} vs reference {}x{}",
@@ -1042,7 +1047,7 @@ fn kid_q8_derived(
     k: usize,
     m: usize,
     seed: u32,
-) -> Result<(bool, bool, Vec<u32>), Box<dyn std::error::Error>> {
+) -> Result<(bool, bool, Vec<u32>), GateError> {
     if rqs.rows() != qs_ref.rows()
         || rqs.cols() != qs_ref.cols()
         || rd.rows() != d_ref.rows()

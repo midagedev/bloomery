@@ -20,7 +20,15 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+use bloomery_gpu_gates::GateError;
+
+#[cfg(feature = "gpu")]
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p3", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     use bloomery_gpu::q8f32::Q8F32Kernels;
     use bloomery_gpu::{DeviceTensor, Gpu};
     use cuda_core::DeviceBuffer;
@@ -138,7 +146,7 @@ fn run_f32(
     m: usize,
     x: &[f32],
     y_ref: &[f32],
-) -> Result<(f32, bool), Box<dyn std::error::Error>> {
+) -> Result<(f32, bool), GateError> {
     use cuda_core::DeviceBuffer;
     let x_dev = DeviceBuffer::from_host(stream, x)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
@@ -163,7 +171,7 @@ fn run_q8(
     m: usize,
     x: &[f32],
     y_ref: &[f32],
-) -> Result<(f32, bool), Box<dyn std::error::Error>> {
+) -> Result<(f32, bool), GateError> {
     use cuda_core::DeviceBuffer;
     let x_dev = DeviceBuffer::from_host(stream, x)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;

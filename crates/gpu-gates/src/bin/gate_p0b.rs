@@ -28,8 +28,8 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    bits_equal, bytes_to_words, f32_tensor, load_ref, max_rel_err, open_model, ref_manifest,
-    row_bytes, tensor_bytes, us_per_replay, verdict,
+    GateError, bits_equal, bytes_to_words, f32_tensor, load_ref, max_rel_err, open_model,
+    ref_manifest, row_bytes, tensor_bytes, us_per_replay, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -37,7 +37,12 @@ use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p0b", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     use bloomery_gpu::fused::{FusedKernels, readback_q8act};
     use bloomery_gpu::probe::Probe;
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};

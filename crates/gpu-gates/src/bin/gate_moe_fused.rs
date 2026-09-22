@@ -27,8 +27,8 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    bits_equal, load_ref, max_rel_err, open_model, ref_manifest, route_ref, tensor_bytes,
-    us_per_replay, verdict,
+    GateError, bits_equal, load_ref, max_rel_err, open_model, ref_manifest, route_ref,
+    tensor_bytes, us_per_replay, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -36,7 +36,12 @@ use cuda_core::DeviceBuffer;
 use gguf::quant::GgmlType;
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_moe_fused", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     use bloomery_gpu::moe_fused::MoeFusedKernels;
     use bloomery_gpu::probe::Probe;
     use bloomery_gpu::q5::Q8Blocks32;
@@ -187,10 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- resident weights: layer 1 only, the tensors this block consumes.
     let wts = Weights::load(stream, &gguf, 1..2, false)?;
-    fn kq<'a>(
-        wts: &'a Weights,
-        name: &str,
-    ) -> Result<&'a DeviceTensor<u32>, Box<dyn std::error::Error>> {
+    fn kq<'a>(wts: &'a Weights, name: &str) -> Result<&'a DeviceTensor<u32>, GateError> {
         let Some(DevWeight::KQuant { ty, w, .. }) = wts.get(name) else {
             return Err(format!("gate_moe_fused: {name} is not a KQuant resident weight").into());
         };

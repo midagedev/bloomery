@@ -75,9 +75,9 @@ use bloomery_gpu::GpuModel;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::open_model;
-#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::read_prompts;
+#[cfg(feature = "gpu")]
+use bloomery_gpu_gates::{GateError, open_model};
 
 /// ik's own decode on this model, tok/s at the depths the depth table
 /// stands at. A decode step's attention term is linear in the cached keys,
@@ -128,7 +128,12 @@ fn flag_value(name: &str) -> Option<String> {
 }
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("generate", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     let timed = std::env::args().any(|a| a == "--time");
     let mode = match flag_value("--mode").as_deref() {
         None | Some("graph") => StepMode::Graph,
@@ -411,7 +416,7 @@ fn ab(
     rounds: usize,
     mode: StepMode,
     arms: &[(&str, StepProbe)],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), GateError> {
     if rounds == 0 || n_gen < 2 {
         return Err("generate: --ab wants R >= 1 and -n >= 2".into());
     }
@@ -499,7 +504,7 @@ fn arm_p50(
     tokens: &[u32],
     n_gen: usize,
     probe: StepProbe,
-) -> Result<f64, Box<dyn std::error::Error>> {
+) -> Result<f64, GateError> {
     model.reset()?;
     model.set_probe(probe)?;
     let mut next = model.step(tokens)?;

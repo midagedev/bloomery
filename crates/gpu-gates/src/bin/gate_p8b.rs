@@ -48,7 +48,7 @@ use bloomery_gpu::model::StepProbe;
 use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
+    GateError, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
     ref_tensor_logical_in, route_ref, topk_ids_logical, verdict, widened_f16_bits,
 };
 
@@ -110,7 +110,12 @@ const NODES_LAYER1: usize = 22;
 const PROBE_SLOTS_CHANGED: usize = 5;
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p8b", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     let mut ok = true;
     let gguf = open_model()?;
     let man = ref_manifest()?;
@@ -454,7 +459,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `moe_combine` folds into its store, recomputed on the host from the
 /// engine's own operands.
 #[cfg(feature = "gpu")]
-fn recombine(down: &[f32], w: &[f32], rows: usize) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+fn recombine(down: &[f32], w: &[f32], rows: usize) -> Result<Vec<f32>, GateError> {
     if w.is_empty() || down.len() != w.len() * rows {
         return Err(format!(
             "gate_p8b: recombine: down {} values for {} slots of {rows}",

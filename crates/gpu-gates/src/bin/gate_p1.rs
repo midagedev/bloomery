@@ -19,7 +19,15 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+use bloomery_gpu_gates::GateError;
+
+#[cfg(feature = "gpu")]
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p1", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_gates::{
         KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, ref_gemv, row_bytes,
@@ -135,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let x_dev = DeviceBuffer::from_host(stream, &x)?;
             let mut act = Q8Act::with_k(stream, m, k)?;
             let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
-            let mut run = |y: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn std::error::Error>> {
+            let mut run = |y: &mut DeviceBuffer<f32>| -> Result<(), GateError> {
                 gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
                 match ty {
                     GgmlType::Q3_K => gpu.enqueue_gemv_q3k(&w, &act, y)?,

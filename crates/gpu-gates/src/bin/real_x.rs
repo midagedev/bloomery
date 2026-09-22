@@ -29,7 +29,7 @@ use bloomery_gpu::q5::Q5Kernels;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::RefRow;
+use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     activations, bytes_to_words, find_ref_row, max_rel_err, open_model, ref_dir, ref_gemv,
@@ -43,7 +43,12 @@ use gguf::Gguf;
 use gguf::quant::GgmlType;
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("real_x", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     // Synthetic-contrast seed, fixed: the contrast lines must be
     // reproducible like the gates' pinned draws.
     const SEED: u32 = 1;
@@ -283,7 +288,7 @@ fn ik_to_ours(ik: &[f32], rows: usize, m: usize) -> Vec<f32> {
 
 /// (amax, amax/rms) of an activation block; a zero rms is a broken input.
 #[cfg(feature = "gpu")]
-fn spikiness(x: &[f32], site: &str) -> Result<(f32, f32), Box<dyn std::error::Error>> {
+fn spikiness(x: &[f32], site: &str) -> Result<(f32, f32), GateError> {
     let amax = x.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     let sumsq: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
     let rms = (sumsq / x.len() as f64).sqrt();
@@ -314,7 +319,7 @@ fn real_kq_site(
     out_name: &str,
     out_op: &str,
     row_cap: Option<usize>,
-) -> Result<Option<[f32; 3]>, Box<dyn std::error::Error>> {
+) -> Result<Option<[f32; 3]>, GateError> {
     let (info, bytes) = tensor_bytes(gguf, tensor)?;
     let ty = info.ty;
     let k = info.dims[0] as usize;
@@ -386,7 +391,7 @@ fn kq_device_run(
     rows: usize,
     x: &[f32],
     m: usize,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+) -> Result<Vec<f32>, GateError> {
     let words = bytes_to_words(w_bytes);
     if words.len() % rows != 0 {
         return Err(format!(
@@ -432,7 +437,7 @@ fn swiglu_site(
     up_gate_row: &RefRow,
     gate_tensor: &str,
     up_tensor: &str,
-) -> Result<Option<[f32; 3]>, Box<dyn std::error::Error>> {
+) -> Result<Option<[f32; 3]>, GateError> {
     if up_gate_row.op != "FUSED_UP_GATE" {
         return Err(format!(
             "real_x: {site}: {} is op {}, want FUSED_UP_GATE",
@@ -533,7 +538,7 @@ fn q3k_two_gemv(
     rows: usize,
     x: &[f32],
     m: usize,
-) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+) -> Result<(Vec<f32>, Vec<f32>), GateError> {
     let words1 = bytes_to_words(w1_bytes);
     let words2 = bytes_to_words(w2_bytes);
     if words1.len() % rows != 0 || words2.len() % rows != 0 {
@@ -584,7 +589,7 @@ fn synth_kq_site(
     row_cap: Option<usize>,
     m: usize,
     seed: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), GateError> {
     let (info, bytes) = tensor_bytes(gguf, tensor)?;
     if info.ty != ty {
         return Err(format!("real_x: {site}: {tensor} is {:?}, want {ty:?}", info.ty).into());
@@ -619,7 +624,7 @@ fn synth_q5_1_site(
     site: &str,
     m: usize,
     seed: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
 
     let (info, bytes) = tensor_bytes(gguf, "blk.0.ffn_down.weight")?;
@@ -671,7 +676,7 @@ fn synth_q5_0_site(
     expert: usize,
     m: usize,
     seed: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
 
     let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_down_exps.weight")?;

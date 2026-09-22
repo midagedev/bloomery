@@ -46,10 +46,15 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::verdict;
+use bloomery_gpu_gates::{GateError, verdict};
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p6", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::router::{N_EXPERT, N_USED, RouterKernels};
     use bloomery_gpu_gates::{
@@ -498,7 +503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rt = gpu.capture(|_| {
             router.enqueue_router_topk(stream, &x1_dev, 1, scale, &mut p1, &mut i1, &mut w1)
         })?;
-        let time_replays = |g: &bloomery_gpu::Graph| -> Result<f64, Box<dyn std::error::Error>> {
+        let time_replays = |g: &bloomery_gpu::Graph| -> Result<f64, GateError> {
             for _ in 0..2 {
                 g.launch(stream)?;
             }
@@ -539,7 +544,7 @@ fn synth_case(
     logits: &[f32],
     scale: f32,
     ok: &mut bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), GateError> {
     use bloomery_gpu_gates::{max_rel_err, route_ref};
 
     const BAND: f32 = 1e-6;
@@ -633,7 +638,7 @@ fn eat(mut h: u64, bytes: &[u8]) -> u64 {
 /// and is pinned with it, because an assertion on one would not catch the
 /// other being reverted.
 #[cfg(feature = "gpu")]
-fn router_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+fn router_shape(ok: &mut bool) -> Result<(), GateError> {
     use bloomery_gpu::q8f32::LANE_UNROLL;
     use bloomery_gpu::router::ROUTER_THREADS;
 
@@ -706,9 +711,9 @@ fn router_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
 /// alone — `clz` reappears in both Q3_K entries and the hardware convert
 /// goes — while the control arm and every bit-identity gate stay green.
 #[cfg(feature = "gpu")]
-fn q3k_half_decode_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+fn q3k_half_decode_shape(ok: &mut bool) -> Result<(), GateError> {
     let blob = std::fs::read(std::env::current_exe()?)?;
-    let counts = |name: &str| -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let counts = |name: &str| -> Result<(usize, usize), GateError> {
         let b = bloomery_gpu_gates::ptx::body(&blob, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
         Ok((
@@ -759,7 +764,7 @@ fn run_router(
     x: &[f32],
     m: usize,
     scale: f32,
-) -> Result<RouterOut, Box<dyn std::error::Error>> {
+) -> Result<RouterOut, GateError> {
     use bloomery_gpu::router::{N_EXPERT, N_USED};
     use cuda_core::DeviceBuffer;
 
@@ -797,7 +802,7 @@ fn run_table(
     ids: &[u32],
     rows_gu: usize,
     rows_dn: usize,
-) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+) -> Result<(bool, bool), GateError> {
     use bloomery_gpu::router::N_USED;
     use cuda_core::DeviceBuffer;
 

@@ -36,7 +36,7 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::RefRow;
+use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     activations, bits_equal, bytes_to_words, f32_tensor, find_ref_row, load_ref, max_rel_err,
@@ -49,7 +49,12 @@ use cuda_core::DeviceBuffer;
 use gguf::quant::{GgmlType, dequant_row};
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p4", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     use bloomery_gpu::elem::{ARGMAX_THREADS, ElemKernels};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuModel};
 
@@ -627,19 +632,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let empty = gpu.capture(|_| probe.enqueue_touch(stream, &mut tbuf))?;
             let am =
                 gpu.capture(|_| elem.enqueue_argmax(stream, &x_dev, logits.len(), &mut idx_dev))?;
-            let time_replays =
-                |g: &bloomery_gpu::Graph| -> Result<f64, Box<dyn std::error::Error>> {
-                    for _ in 0..2 {
-                        g.launch(stream)?;
-                    }
-                    stream.synchronize()?;
-                    let t0 = std::time::Instant::now();
-                    for _ in 0..N {
-                        g.launch(stream)?;
-                    }
-                    stream.synchronize()?;
-                    Ok(t0.elapsed().as_secs_f64() * 1e6 / f64::from(N))
-                };
+            let time_replays = |g: &bloomery_gpu::Graph| -> Result<f64, GateError> {
+                for _ in 0..2 {
+                    g.launch(stream)?;
+                }
+                stream.synchronize()?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..N {
+                    g.launch(stream)?;
+                }
+                stream.synchronize()?;
+                Ok(t0.elapsed().as_secs_f64() * 1e6 / f64::from(N))
+            };
             let argmax_us = time_replays(&am)?;
             let touch_us = time_replays(&empty)?;
             println!(
@@ -728,7 +732,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// was built for; the grid (one block per token) is not in the device code
 /// and stays uncovered.
 #[cfg(feature = "gpu")]
-fn norm_geometry(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+fn norm_geometry(ok: &mut bool) -> Result<(), GateError> {
     use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS};
 
     /// Loads deep a norm's row may be per thread.
@@ -774,7 +778,7 @@ fn norm_geometry(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
 /// drift apart; `ARGMAX_MIN_WARPS` is the residency the shape has to buy,
 /// and the trip count is what the stride actually costs at the head's width.
 #[cfg(feature = "gpu")]
-fn argmax_geometry(blob: &[u8], ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
+fn argmax_geometry(blob: &[u8], ok: &mut bool) -> Result<(), GateError> {
     use bloomery_gpu::elem::{ARGMAX_THREADS, ARGMAX_WARPS};
 
     /// Warps the argmax block must keep resident — one warp was the defect.
@@ -826,7 +830,7 @@ fn rms_case(
     gain_name: &str,
     out_row: &RefRow,
     eps: f32,
-) -> Result<(bool, String), Box<dyn std::error::Error>> {
+) -> Result<(bool, String), GateError> {
     let gain = f32_tensor(gguf, gain_name, k)?;
     let gain_dev = DeviceBuffer::from_host(stream, &gain)?;
     let x_dev = DeviceBuffer::from_host(stream, x)?;

@@ -39,7 +39,8 @@ use bloomery_gpu::weights::Weights;
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    bits_equal, find_ref_row, open_model, ref_dir, ref_manifest, ref_tensor_logical_in, verdict,
+    GateError, bits_equal, find_ref_row, open_model, ref_dir, ref_manifest, ref_tensor_logical_in,
+    verdict,
 };
 
 /// The oracle's own greedy token for the prompt the dump sets were made with
@@ -68,7 +69,12 @@ const BANDS: [(TapKind, usize, f32); 2] = [
 ];
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_head_gpu", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     let mut ok = true;
     let gguf = open_model()?;
     let man = ref_manifest()?;

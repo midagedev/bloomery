@@ -30,7 +30,7 @@ use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0};
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    activations, bits_equal, bytes_to_words, open_model, tensor_bytes, verdict,
+    GateError, activations, bits_equal, bytes_to_words, open_model, tensor_bytes, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -40,7 +40,12 @@ use gguf::quant::GgmlType;
 use std::collections::HashMap;
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p9", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     // Fixed seeds: the gate is bit identity, so every input is fixed.
     const SEED_Q3K: u32 = 4211;
     const SEED_Q5: u32 = 5327;
@@ -346,7 +351,7 @@ fn q3k_expert_ref(
     rpe: usize,
     wpm: usize,
     cache: &mut HashMap<usize, Vec<f32>>,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+) -> Result<Vec<f32>, GateError> {
     if let Some(v) = cache.get(&id) {
         return Ok(v.clone());
     }
@@ -372,7 +377,7 @@ fn q5_expert_col_ref(
     id: usize,
     slot: usize,
     rpe: usize,
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+) -> Result<Vec<f32>, GateError> {
     let mut y = DeviceBuffer::<f32>::zeroed(stream, rpe)?;
     q5.enqueue_gemv_q5_0(stream, w, act, id * rpe, rpe, slot, 1, &mut y, 0)?;
     stream.synchronize()?;

@@ -27,10 +27,15 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{bits_equal, verdict};
+use bloomery_gpu_gates::{GateError, bits_equal, verdict};
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p2", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1};
     use bloomery_gpu::{DeviceTensor, Gpu};
     use bloomery_gpu_gates::{

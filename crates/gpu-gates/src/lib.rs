@@ -33,6 +33,28 @@ pub const KERNEL_BAND: f32 = 1e-5;
 
 pub type GateError = Box<dyn std::error::Error>;
 
+/// The exit of every gate binary's `main`: `Ok` is success; an `Err` prints
+/// `<name>: <error>` (the Display, not the Debug a `Result` main prints) and
+/// each `source()` beneath it as `  caused by: ...` to stderr, then fails.
+/// A message that already opens with `<name>: ` is not prefixed twice.
+pub fn exit_with(name: &str, r: Result<(), GateError>) -> std::process::ExitCode {
+    let Err(e) = r else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let msg = e.to_string();
+    if msg.starts_with(&format!("{name}: ")) {
+        eprintln!("{msg}");
+    } else {
+        eprintln!("{name}: {msg}");
+    }
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        eprintln!("  caused by: {c}");
+        cause = c.source();
+    }
+    std::process::ExitCode::FAILURE
+}
+
 pub fn open_model() -> Result<Gguf, GateError> {
     let path = std::env::var("BLOOMERY_REF_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     Ok(Gguf::open(path)?)

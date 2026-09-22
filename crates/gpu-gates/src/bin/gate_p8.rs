@@ -68,8 +68,8 @@ use bloomery_gpu::model::StepProbe;
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    bits_equal, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
-    ref_tensor_logical_in, verdict, widened_f16_bits,
+    GateError, bits_equal, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir,
+    ref_manifest, ref_tensor_logical_in, verdict, widened_f16_bits,
 };
 
 /// The six-token prompt the CUDA dump was made for (gate_p4's constant —
@@ -180,7 +180,12 @@ const BANDS: [(TapKind, usize, f32); 10] = [
 ];
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p8", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     let mut ok = true;
     // `--profile-pos` is read before the load: the cache height is a load-time
     // decision, and the profile arm needs `pos + 1` rows.
@@ -416,10 +421,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let empty = model.stages()[0]
             .gpu()
             .capture(|_| (0..4).try_for_each(|_| probe.enqueue_touch(stream, &mut tbuf)))?;
-        let time_replays = |launch: &dyn Fn() -> Result<(), Box<dyn std::error::Error>>| -> Result<
-            f64,
-            Box<dyn std::error::Error>,
-        > {
+        let time_replays = |launch: &dyn Fn() -> Result<(), GateError>| -> Result<f64, GateError> {
             for _ in 0..2 {
                 launch()?;
             }
@@ -434,12 +436,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let step_us = time_replays(&|| {
             model
                 .launch_block0_graph()
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                .map_err(|e| -> GateError { Box::new(e) })
         })?;
         let touch_us = time_replays(&|| {
             empty
                 .launch(stream)
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                .map_err(|e| -> GateError { Box::new(e) })
         })?;
         println!("time n={N} step_us_per_replay={step_us:.3} touch4_us_per_replay={touch_us:.3}");
     }
@@ -712,7 +714,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// the cooperative launch's price and the barrier's price in the same
 /// instrument, and against the same `touch` floor, as the node price.
 #[cfg(feature = "gpu")]
-fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
+fn bench_kernels(model: &GpuModel) -> Result<(), GateError> {
     use bloomery_gpu::probe::{GAP_THREADS, GapArm};
     use bloomery_gpu::{DeviceTensor, GpuError, Graph, Q8Act};
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -727,7 +729,7 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
     fn burst(
         stream: &CudaStream,
         enq: &mut dyn FnMut(&CudaStream) -> Result<(), GpuError>,
-    ) -> Result<(f64, f64, f64), Box<dyn std::error::Error>> {
+    ) -> Result<(f64, f64, f64), GateError> {
         for _ in 0..N {
             enq(stream)?;
         }
@@ -747,10 +749,7 @@ fn bench_kernels(model: &GpuModel) -> Result<(), Box<dyn std::error::Error>> {
         Ok((lo, sum / f64::from(ROUNDS), hi))
     }
 
-    fn replay(
-        stream: &CudaStream,
-        g: &Graph,
-    ) -> Result<(f64, f64, f64), Box<dyn std::error::Error>> {
+    fn replay(stream: &CudaStream, g: &Graph) -> Result<(f64, f64, f64), GateError> {
         for _ in 0..2 {
             g.launch(stream)?;
         }
@@ -1012,7 +1011,7 @@ fn print_arm(
 fn parse_u32_flag(
     args: impl Iterator<Item = String>,
     flag: &str,
-) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+) -> Result<Option<u32>, GateError> {
     let mut args = args.skip_while(|a| a != flag);
     match args.next() {
         None => Ok(None),

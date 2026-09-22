@@ -57,7 +57,7 @@ use bloomery_gpu::flash::{
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::RefRow;
+use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     activations, bits_equal, find_ref_row, max_rel_err, open_model, ref_dir, ref_manifest,
@@ -71,7 +71,12 @@ use gguf::Gguf;
 use gguf::quant::half_to_f32;
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_p5", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     // The flash arithmetic is not exact by construction (exp, two reduction
     // trees): this package's asserted band. The conversion op asserts bits.
     const FLASH_BAND: f32 = 1e-5;
@@ -162,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The scan itself is `bloomery_gpu_gates::ptx`; `tools/ptx-scan.sh` prints
 /// the same counts for every entry without asserting any of them.
 #[cfg(feature = "gpu")]
-fn no_local_depot() -> Result<bool, Box<dyn std::error::Error>> {
+fn no_local_depot() -> Result<bool, GateError> {
     let blob = std::fs::read(std::env::current_exe()?)?;
     let mut ok = true;
     for name in [
@@ -253,11 +258,7 @@ struct Partials {
 
 #[cfg(feature = "gpu")]
 impl Partials {
-    fn zeroed(
-        stream: &CudaStream,
-        q_rows: usize,
-        cache_rows: usize,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    fn zeroed(stream: &CudaStream, q_rows: usize, cache_rows: usize) -> Result<Self, GateError> {
         Ok(Self {
             v: DeviceBuffer::zeroed(stream, partials_v_len(q_rows, cache_rows))?,
             ms: DeviceBuffer::zeroed(stream, partials_ms_len(q_rows, cache_rows))?,
@@ -274,8 +275,8 @@ fn split_twice(
     inputs: FlashInputs<'_>,
     part: &mut Partials,
     y: &mut DeviceBuffer<f32>,
-) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
-    let mut run = || -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<f32>, Vec<f32>), GateError> {
+    let mut run = || -> Result<Vec<f32>, GateError> {
         flash.enqueue_flash_latent_split(
             stream,
             FlashSplitArgs {
@@ -338,11 +339,7 @@ struct RealChains {
 /// positions, the m=TOKENS causal prefill shape, and (layer 0 only) the
 /// captured-graph checks.
 #[cfg(feature = "gpu")]
-fn real_layer(
-    gpu: &Gpu,
-    flash: &FlashKernels,
-    case: &RealCase<'_>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn real_layer(gpu: &Gpu, flash: &FlashKernels, case: &RealCase<'_>) -> Result<bool, GateError> {
     let stream = gpu.stream();
     // The split launch's partials, sized for the widest shape below (the
     // m=tokens prefill) over this cache height. At ctx_max = 64 the height
@@ -367,7 +364,7 @@ fn real_layer(
 /// kvr-L [width, tokens] CONCAT of [k_rope | kv_compressed]; k_rope occ 1
 /// is (d, t), kv_compressed occ 1 is (d, t).
 #[cfg(feature = "gpu")]
-fn kvr_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+fn kvr_chain(case: &RealCase<'_>) -> Result<Vec<f32>, GateError> {
     let RealCase {
         man,
         layer: l,
@@ -439,7 +436,7 @@ fn kvr_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>
 /// q-L occ 1 [width, tokens, heads] CONCAT of [q_rope | q_nope2]; rows
 /// (t + tokens*h); q_rope occ 1 is (d, h, t), q_nope2 occ 0 is (d, t, h).
 #[cfg(feature = "gpu")]
-fn q_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+fn q_chain(case: &RealCase<'_>) -> Result<Vec<f32>, GateError> {
     let RealCase {
         man,
         layer: l,
@@ -514,7 +511,7 @@ fn q_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> 
 
 /// kqv_compressed-L [latent, heads, tokens] FLASH_ATTN_EXT.
 #[cfg(feature = "gpu")]
-fn kqv_chain(case: &RealCase<'_>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+fn kqv_chain(case: &RealCase<'_>) -> Result<Vec<f32>, GateError> {
     let RealCase {
         man,
         layer: l,
@@ -554,7 +551,7 @@ fn real_append(
     stream: &CudaStream,
     case: &RealCase<'_>,
     kvr: &[f32],
-) -> Result<(LayerCache, bool), Box<dyn std::error::Error>> {
+) -> Result<(LayerCache, bool), GateError> {
     let RealCase {
         man,
         layer: l,
@@ -621,7 +618,7 @@ fn real_decode(
     chains: &RealChains,
     cache: &LayerCache,
     part: &mut Partials,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, GateError> {
     let RealCase {
         layer: l,
         dims,
@@ -689,7 +686,7 @@ fn real_prefill(
     chains: &RealChains,
     cache: &LayerCache,
     part: &mut Partials,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, GateError> {
     let RealCase {
         layer: l,
         dims,
@@ -755,7 +752,7 @@ struct DepthInputs {
 
 #[cfg(feature = "gpu")]
 impl DepthInputs {
-    fn new(stream: &CudaStream, case: &DepthCase) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(stream: &CudaStream, case: &DepthCase) -> Result<Self, GateError> {
         let (width, n_heads) = (case.dims.width, case.dims.heads);
         let keys = activations(width, 4096, 50021);
         let queries = activations(width, n_heads, 60013);
@@ -827,11 +824,7 @@ struct MmaDepth {
 /// Synthetic LCG keys/queries at the 32-key block edges, every row past
 /// `n_keys` holding the f16 NaN bit pattern.
 #[cfg(feature = "gpu")]
-fn depth_cases(
-    gpu: &Gpu,
-    flash: &FlashKernels,
-    case: &DepthCase,
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool, GateError> {
     let DepthCase {
         dims,
         cache_rows: depth_rows,
@@ -961,7 +954,7 @@ fn depth_split(
         &mut DeviceBuffer<f32>,
     ),
     y_ref: &[f32],
-) -> Result<SplitDepth, Box<dyn std::error::Error>> {
+) -> Result<SplitDepth, GateError> {
     let (y1, y2) = split_twice(flash, stream, inputs, part, y_dev)?;
     let rerun_same = bits_equal(&y1, &y2);
     let rel = max_rel_err(&y1, y_ref)?;
@@ -1041,9 +1034,9 @@ fn depth_mma(
     (part, y_m): (&mut Partials, &mut DeviceBuffer<f32>),
     y_ref: &[f32],
     y_split: &[f32],
-) -> Result<MmaDepth, Box<dyn std::error::Error>> {
+) -> Result<MmaDepth, GateError> {
     let cache_rows = inputs.kv.rows();
-    let mut run = || -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let mut run = || -> Result<Vec<f32>, GateError> {
         mma_enqueue(flash, stream, inputs, cache_rows, &mut *part, &mut *y_m)?;
         stream.synchronize()?;
         Ok(y_m.to_host_vec(stream)?)
@@ -1071,10 +1064,7 @@ fn depth_mma(
 /// zeros, signed zero, subnormals on both sides, the f16 finite boundary,
 /// overflow, and the NaN class (which collapses to inf, the oracle's rule).
 #[cfg(feature = "gpu")]
-fn edge_values(
-    flash: &FlashKernels,
-    stream: &CudaStream,
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn edge_values(flash: &FlashKernels, stream: &CudaStream) -> Result<bool, GateError> {
     let edges: Vec<f32> = vec![
         0.0,
         -0.0,
@@ -1120,7 +1110,7 @@ fn graph_check_flash(
     gpu: &Gpu,
     flash: &FlashKernels,
     case: &GraphFlashCase<'_>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, GateError> {
     let GraphFlashCase { inputs, y_eager } = *case;
     let (cache, n_heads, latent) = (inputs.kv, inputs.geom.heads, inputs.geom.latent_dims);
     let stream = gpu.stream();
@@ -1149,11 +1139,7 @@ fn graph_check_flash(
 /// needs. The scalar-pos append captured beside it stays frozen at its
 /// capture-time row, which is why the step cannot use it.
 #[cfg(feature = "gpu")]
-fn graph_check_append(
-    gpu: &Gpu,
-    flash: &FlashKernels,
-    one_row: &[f32],
-) -> Result<bool, Box<dyn std::error::Error>> {
+fn graph_check_append(gpu: &Gpu, flash: &FlashKernels, one_row: &[f32]) -> Result<bool, GateError> {
     let stream = gpu.stream();
     let src = DeviceBuffer::from_host(stream, one_row)?;
     let mut pos_buf = DeviceBuffer::from_host(stream, &[0u32])?;
@@ -1212,8 +1198,8 @@ fn graph_check_append(
 /// bloomery-model; the `ik_rel` columns are what prove the value against the
 /// oracle.
 #[cfg(feature = "gpu")]
-fn kq_scale_of(gguf: &Gguf) -> Result<f32, Box<dyn std::error::Error>> {
-    let f32v = |key: &str| -> Result<f32, Box<dyn std::error::Error>> {
+fn kq_scale_of(gguf: &Gguf) -> Result<f32, GateError> {
+    let f32v = |key: &str| -> Result<f32, GateError> {
         gguf.value(key)
             .and_then(|v| v.as_f32())
             .ok_or_else(|| format!("gate_p5: metadata {key} missing").into())

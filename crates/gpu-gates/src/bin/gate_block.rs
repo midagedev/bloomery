@@ -24,7 +24,8 @@ use bloomery_gpu_gates::block::{
     taps,
 };
 use bloomery_gpu_gates::{
-    find_ref_row_in, ref_dir, ref_dir_named, ref_manifest_in, ref_tensor_logical_in, verdict,
+    GateError, find_ref_row_in, ref_dir, ref_dir_named, ref_manifest_in, ref_tensor_logical_in,
+    verdict,
 };
 use std::path::PathBuf;
 
@@ -46,7 +47,11 @@ const KNOWN_DISTANCES: [(TapKind, usize, f32); 5] = [
 /// with; both backends' last row must argmax here.
 const IK_ARGMAX: usize = 8913;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_block", run())
+}
+
+fn run() -> Result<(), GateError> {
     let mut ok = true;
 
     let cpu_set = std::env::var("BLOOMERY_REF_CPU_SET").unwrap_or_else(|_| "ref".to_string());

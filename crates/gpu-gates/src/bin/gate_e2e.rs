@@ -65,11 +65,11 @@ use bloomery_gpu::GpuModel;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::open_model;
-#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{
     GreedyClass, GreedyRow, compare_forced, compare_greedy, read_greedy,
 };
+#[cfg(feature = "gpu")]
+use bloomery_gpu_gates::{GateError, open_model};
 
 /// Generated tokens per prompt — the reference file's own width
 /// (`greedy-ik-cuda-32.tsv`, written with `BLOOMERY_REF_GEN=32`).
@@ -187,9 +187,7 @@ const NODES_CHAIN: usize = 648;
 /// vacuously identical — so the cross-check between the two reference files
 /// needs these fields read here. Deliberately not a second general reader.
 #[cfg(feature = "gpu")]
-fn read_argmax_ids(
-    path: &std::path::Path,
-) -> Result<Vec<(usize, u32, Vec<u32>)>, Box<dyn std::error::Error>> {
+fn read_argmax_ids(path: &std::path::Path) -> Result<Vec<(usize, u32, Vec<u32>)>, GateError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read_argmax_ids: cannot read {}: {e}", path.display()))?;
     let mut rows = Vec::new();
@@ -230,7 +228,7 @@ fn run_set(
     model: &mut GpuModel,
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
-) -> Result<Vec<Vec<u32>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Vec<u32>>, GateError> {
     let mut out = Vec::with_capacity(reference.len());
     for (r, p) in reference.iter().zip(prompts) {
         if r.id != p.id || r.n_tokens != p.tokens.len() {
@@ -272,7 +270,7 @@ fn run_forced(
     model: &mut GpuModel,
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
-) -> Result<Vec<Vec<u32>>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Vec<u32>>, GateError> {
     let mut out = Vec::with_capacity(reference.len());
     for (r, p) in reference.iter().zip(prompts) {
         if r.id != p.id || r.n_tokens != p.tokens.len() {
@@ -314,7 +312,7 @@ fn check_forced(
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
     eager: &[Vec<u32>],
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, GateError> {
     let forced = run_forced(model, prompts, reference)?;
     let step0: Vec<usize> = (0..forced.len())
         .filter(|&i| eager[i].first() != forced[i].first())
@@ -383,7 +381,7 @@ fn lcg_prompt(n: usize) -> Vec<u32> {
 /// One continuation of `prompt`: fresh caches, the prompt fed one token at
 /// a time, then `DEEP_GEN` - 1 feedback steps.
 #[cfg(feature = "gpu")]
-fn run_deep(model: &mut GpuModel, prompt: &[u32]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+fn run_deep(model: &mut GpuModel, prompt: &[u32]) -> Result<Vec<u32>, GateError> {
     model.reset()?;
     let mut next = model.step(prompt)?;
     let mut seq = Vec::with_capacity(DEEP_GEN);
@@ -407,7 +405,12 @@ fn first_diff(a: &[Vec<u32>], b: &[Vec<u32>]) -> Option<(usize, usize)> {
 }
 
 #[cfg(feature = "gpu")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_e2e", run())
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
     let mut ok = true;
     let prompts_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/prompts.tsv");
