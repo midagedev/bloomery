@@ -6,14 +6,14 @@
 
 계기: `just lint`(`--features gpu`) 출력의 `grep -c '^warning:'` — 타깃마다 한 번씩 세므로 에이전트의 유니크 계수보다 높다. **같은 계기로 전후를 잰다.** 래칫 다운만.
 
-| 계기 | 2026-09-22 밤 (리뷰 전, `685462d`) | 2026-09-22 새벽 (리뷰 1회차 후, `0ff785e`) | 2026-09-22 저녁 (`48ee5c2`) |
-|---|---|---|---|
-| `just lint` 경고 | **308** (gpu 피처 없이 260; 09-21 아침 144) | **221** | **211** (gatesc 뒤 `c69642b` **210**) |
-| `undocumented_unsafe_blocks` | 123 | **63** — q3k-gemv 49, q3k-cpu 9(스테이지 0 스파이크, MUL-10/11 몫), model 4, gpu 1(`flash.rs`) | **62** — q3k-gemv 49, q3k-cpu 9, model 4, gpu 0 |
-| `too_many_arguments` 경고(allow 없이) | 12 | 17 (8/7 ×12, 9/7 ×2, 11/7 ×3) — R8 라운드 대상; allow에는 전부 `reason` (§0 재측정 전; r8args가 런처·gate_p5 헬퍼의 allow를 걷었다) | 16 (8/7 ×11, 9/7 ×2, 10/7 ×1, 11/7 ×2) |
-| `chunks_exact` 상수 → `as_chunks` | 17 | 23 (R17 2차 — 핫 패스는 A/B 동반) | 23 |
-| `crates/gpu` `as` 캐스트 | 637 | 미재측(R5 라운드 전) | 미재측 |
-| 가장 큰 파일 | `model.rs` 3901, `flash.rs` 2628 | `flash.rs` 3241(a4d·a4e 커널), `model.rs` 3963 | `flash.rs` 3397, `qdot/lib.rs` 2466(fnsplit 뒤 `gpu/model.rs` 1252) |
+| 계기 | 2026-09-22 밤 (리뷰 전, `685462d`) | 2026-09-22 새벽 (리뷰 1회차 후, `0ff785e`) | 2026-09-22 저녁 (`48ee5c2`) | 2026-09-22 밤 (야간 파동 뒤, `2d1abc0`) |
+|---|---|---|---|---|
+| `just lint` 경고 | **308** (gpu 피처 없이 260; 09-21 아침 144) | **221** | **211** (gatesc 뒤 `c69642b` **210**) | **175** (gatesd 210 → tools6 210 → mechlint 189 → gatesc2 175 → gpucast 175) |
+| `undocumented_unsafe_blocks` | 123 | **63** — q3k-gemv 49, q3k-cpu 9(스테이지 0 스파이크, MUL-10/11 몫), model 4, gpu 1(`flash.rs`) | **62** — q3k-gemv 49, q3k-cpu 9, model 4, gpu 0 | **58** — q3k-gemv 49, q3k-cpu 9, model 0(mechlint가 `tests/alloc.rs`의 넷을 적었다), gpu 0. 남은 58은 전부 스테이지 0 크레이트다 |
+| `too_many_arguments` 경고(allow 없이) | 12 | 17 (8/7 ×12, 9/7 ×2, 11/7 ×3) — R8 라운드 대상; allow에는 전부 `reason` (§0 재측정 전; r8args가 런처·gate_p5 헬퍼의 allow를 걷었다) | 16 (8/7 ×11, 9/7 ×2, 10/7 ×1, 11/7 ×2) | 15 (8/7 ×10, 9/7 ×2, 10/7 ×1, 11/7 ×2) |
+| `chunks_exact` 상수 → `as_chunks` | 17 | 23 (R17 2차 — 핫 패스는 A/B 동반) | 23 | 11 (`chunks_exact` 9 + `_mut` 2). 남은 것은 핫 패스 넷과 런타임 청크 크기라 lint가 안 잡는 자리들이다 |
+| `crates/gpu` `as` 캐스트 | 637 | 미재측(R5 라운드 전) | 미재측 | 호스트 축소 263곳이 `launch_u32`·상수쌍·`try_from`으로(gpucast). 637의 계기는 다시 안 돌렸다 — gpucast의 계기로는 `crates/gpu/src` 정수 `as` 719 중 호스트 300(축소 263) |
+| 가장 큰 파일 | `model.rs` 3901, `flash.rs` 2628 | `flash.rs` 3241(a4d·a4e 커널), `model.rs` 3963 | `flash.rs` 3397, `qdot/lib.rs` 2466(fnsplit 뒤 `gpu/model.rs` 1252) | `flash.rs` 3443, `qdot/lib.rs` 2466, `gpu/model.rs` 1253 |
 
 리뷰 1회차(agy 3 라운드)와 리팩토링 4 라운드(opus: `qtools`·`gatesdedup`·`cpumech`·`gpusafety`, 각 한 축)가 하루 만에 늘어난 116을 되돌리고 그 아래로 87을 더 내렸다. 리뷰 미완: `flash.rs`·`model.rs`·`gate_p5`·`gate_e2e`(a4e 뒤로 미룬 4파일), `GpuError` 열거형(R9), `*Args` 구조체(R8).
 
