@@ -306,10 +306,12 @@ ruler). 2026-09-22 night, measured: 308 before the quality rounds; 234 after
 `gpusafety`, 305 after `gatesdedup` on its own base — the merged value is re-measured
 and written here when a round lands — 221 on main `0ff785e` after the four rounds, 211 on main `48ee5c2` (after fnsplit), 210 on main `c69642b` (after gatesc), **175 on main `2d1abc0`** (after the night wave: gatesd, tools6, mechlint, gatesc2, gpucast). Of the 175, 58 are
 `undocumented_unsafe_blocks` and all 58 are in the stage-0 crates.
-`gate-qdot`'s four hw tests read `$BLOOMERY_DATA/ref/*-ik-dot.txt`; `just build-ref` writes
-them (`tools/ref/build-qdot-ref.sh` builds and runs the x4 harnesses) — before 2026-09-22
-no recipe did, and the four were a standing red on every tree. Rerun `build-ref` when ik
-moves. `docs/rust-quality.md` §0 is the table that tracks the lint count. Timed recipes (`time-gpu-*`, `prof-gpu-p8`, `bench-gpu-kernels`) run on the
+`gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` — six read
+`*-ik-dot.txt`, one reads q5_K's `q5k-v41-dequant.raw`/`.meta` (q5_K comes from the V4.1
+first shard: V2-Lite has no Q5_K tensor); `just build-ref` writes them
+(`tools/ref/build-qdot-ref.sh` builds and runs the x4 harnesses) — before 2026-09-22
+no recipe did, and the four that existed then were a standing red on every tree. Rerun
+`build-ref` when ik moves. `docs/rust-quality.md` §0 is the table that tracks the lint count. Timed recipes (`time-gpu-*`, `prof-gpu-p8`, `bench-gpu-kernels`) run on the
 A6000 since the runners share `tools/ref/timing-card.sh`; their earlier 3090 numbers do
 not belong in the same table.
 

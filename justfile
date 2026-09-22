@@ -265,9 +265,10 @@ measure-profile: build-decode
     ./tools/box.sh 'bash tools/ref/profile-measure.sh'
 
 # 참조 하네스(ggml에 링크하는 C++). 진실값과 기준 속도의 출처다.
-# build-qdot-ref.sh는 ik의 커널 테이블까지 링크하는 x4 하네스 여덟을 짓고 참조 하네스 넷을
-# **실행까지** 한다 — gate-qdot의 hw 테스트 넷이 읽는 $BLOOMERY_DATA/ref/*-ik-dot.txt가 그
-# 산출물이다. 나머지 넷(*_rate)은 빌드만 한다: 실행은 측정이다.
+# build-qdot-ref.sh는 ik의 커널 테이블까지 링크하는 x4 하네스 열을 짓고 참조 하네스 다섯을
+# **실행까지** 한다 — gate-qdot의 hw 테스트 일곱이 읽는 $BLOOMERY_DATA/ref/의 덤프
+# (*-ik-dot.txt 다섯과 q5_K의 to_float 행)가 그 산출물이다. q5_K는 V2-Lite에 없어서 V4.1 첫
+# 샤드를 읽는다. 나머지 다섯(*_rate)은 빌드만 한다: 실행은 측정이다.
 build-ref:
     ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh && bash tools/ref/build-qdot-ref.sh'
 

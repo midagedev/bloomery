@@ -9,11 +9,14 @@
 //!
 //! FMA parity (verified by disassembling the compiled library,
 //! `$IK/build/ggml/src/libggml.so`): the compiled q5_1 uses
-//! `vfmadd132ps` (x0*d + m fused) and q4_K uses `vfmsub132ps` (q*d1 - m1
-//! fused); q5_0, q3_K and q6_K contain no fused ops. The Rust ports mirror
-//! exactly that: `mul_add` where the library fused, separate multiplies
-//! where it did not. Diverging here would show up as ~1-ulp differences
-//! against the oracle — the gate is 1e-6 absolute, so the mirror matters.
+//! `vfmadd132ps` (x0*d + m fused), q4_K and q5_K use `vfmsub132ps`
+//! (q*d1 - m1 fused); q5_0, q3_K and q6_K contain no fused ops. The Rust
+//! ports mirror exactly that: `mul_add` where the library fused, separate
+//! multiplies where it did not. For these types the mirror does not decide
+//! the bits: an f16 scale times the small integer codes stays within f32's
+//! 24 significant bits, so every product is exact, the single add or
+//! subtract is the only rounding, and the fused and unfused forms agree.
+//! A type whose product rounds would need the mirror to match the oracle.
 
 use std::fmt;
 
@@ -34,7 +37,7 @@ pub enum GgmlType {
     Q5_1,
     Q3_K,
     Q4_K,
-    Q5_K, // tag 13, present in the enum for the citation table only
+    Q5_K,
     Q6_K,
     Unknown(u32),
 }
