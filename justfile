@@ -180,11 +180,14 @@ prof-gpu-p8:
 bench-gpu-kernels *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --bench-kernels {{ARGS}}'
 
-# V4.1 형상 밀집 읽기 벤치의 정확성 실행: 사이트마다 첫·끝 사본의 몇 행을 같은 바이트의 f64 참조와 대조한다(측정 아님, 3090).
+# V4.1 한 토큰이 GPU에서 내는 gemv 20개 사이트의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다.
+# 사이트마다 첫 사본과 끝 사본에서 여섯 행을 같은 바이트로 계산한 f64 참조와 대조한다. 3090, 게이트 락.
 bench-gpu-v41-check:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && flock -w 1800 /root/bloomery-gate.lock timeout --kill-after=10 600 ./target/release/bench_v41 --check'
 
-# V4.1 형상 밀집 읽기 시간(리드 전용): 사이트별 eager·그래프 재생 µs와 토큰 한 개의 그래프 재생 µs, 대조를 먼저 통과해야 잰다. 임대·증인·A6000 핀은 time-gate.sh 소유.
+# 같은 벤치의 시간(리드 전용): 사이트마다 eager 버스트와 그래프 재생, 토큰 하나를 통째로 잡은 그래프 둘(오늘의
+# 묶음 attn_output_a, 밀집 등가)과 노드 수가 같은 빈 그래프. 대조가 빨강이면 재지 않는다. 임대·증인·A6000 고정은
+# time-gate.sh가 쥔다.
 time-gpu-v41:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
 
