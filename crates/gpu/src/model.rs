@@ -473,7 +473,7 @@ impl StepKernels {
                 ),
             ));
         }
-        if rows_per_head == 0 || n_rows % rows_per_head != 0 {
+        if rows_per_head == 0 || !n_rows.is_multiple_of(rows_per_head) {
             return Err(GpuError::shape(
                 "enqueue_q8_0_gemv_heads",
                 format!(
@@ -555,60 +555,22 @@ impl StepKernels {
         } = a;
         let n_sb = act.n_sb();
         let heads = act.m();
-        if !n_sb.is_multiple_of(2) {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads",
-                format!(
-                    "odd super-block count {n_sb} (K={}) leaves rows \
-                 unaligned; repack rows at load time",
-                    act.k()
-                ),
-            ));
-        }
-        if w.cols() != 110 * n_sb / 4 {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads",
-                format!(
-                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
-                    110 * n_sb / 4,
-                    act.k(),
-                    w.cols()
-                ),
-            ));
-        }
-        if row_off + rows_per_head > row_stride_per_head || rows_per_head == 0 {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads",
-                format!(
-                    "row_off {row_off} + rows_per_head {rows_per_head} \
-                 must lie inside row_stride_per_head {row_stride_per_head}"
-                ),
-            ));
-        }
-        if (head_base + heads) * row_stride_per_head > w.rows() {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads",
-                format!(
-                    "heads {head_base}..{} need (head_base+heads)*\
-                 row_stride_per_head = {} rows, w has {}",
-                    head_base + heads,
-                    (head_base + heads) * row_stride_per_head,
-                    w.rows()
-                ),
-            ));
-        }
+        check_q3k_heads(
+            "enqueue_q3k_gemv_heads",
+            w,
+            HeadsShape {
+                n_sb,
+                k: act.k(),
+                head_base,
+                heads,
+                rows_per_head,
+                row_stride_per_head,
+                row_off,
+                y_head_stride,
+            },
+            y.len(),
+        )?;
         let n_rows = heads * rows_per_head;
-        if y.len() < (head_base + heads - 1) * y_head_stride + rows_per_head {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads",
-                format!(
-                    "y.len() {} < (head_base+heads-1)*y_head_stride + \
-                 rows_per_head = {}*{y_head_stride} + {rows_per_head}",
-                    y.len(),
-                    head_base + heads - 1
-                ),
-            ));
-        }
         let prep = self.module.prepare_q3k_gemv_heads(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,
             256,
@@ -668,61 +630,22 @@ impl StepKernels {
                 ),
             ));
         }
-        if !n_sb.is_multiple_of(2) {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads_pair",
-                format!(
-                    "odd super-block count {n_sb} (K={}) leaves rows \
-                 unaligned; repack rows at load time",
-                    lo.k()
-                ),
-            ));
-        }
-        if w.cols() != 110 * n_sb / 4 {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads_pair",
-                format!(
-                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, \
-                 got {}",
-                    110 * n_sb / 4,
-                    lo.k(),
-                    w.cols()
-                ),
-            ));
-        }
-        if row_off + rows_per_head > row_stride_per_head || rows_per_head == 0 {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads_pair",
-                format!(
-                    "row_off {row_off} + rows_per_head \
-                 {rows_per_head} must lie inside row_stride_per_head {row_stride_per_head}"
-                ),
-            ));
-        }
-        if (head_base + heads) * row_stride_per_head > w.rows() {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads_pair",
-                format!(
-                    "heads {head_base}..{} need (head_base+heads)*\
-                 row_stride_per_head = {} rows, w has {}",
-                    head_base + heads,
-                    (head_base + heads) * row_stride_per_head,
-                    w.rows()
-                ),
-            ));
-        }
+        check_q3k_heads(
+            "enqueue_q3k_gemv_heads_pair",
+            w,
+            HeadsShape {
+                n_sb,
+                k: lo.k(),
+                head_base,
+                heads,
+                rows_per_head,
+                row_stride_per_head,
+                row_off,
+                y_head_stride,
+            },
+            y.len(),
+        )?;
         let n_rows = heads * rows_per_head;
-        if y.len() < (head_base + heads - 1) * y_head_stride + rows_per_head {
-            return Err(GpuError::shape(
-                "enqueue_q3k_gemv_heads_pair",
-                format!(
-                    "y.len() {} < (head_base+heads-1)*y_head_stride \
-                 + rows_per_head = {}*{y_head_stride} + {rows_per_head}",
-                    y.len(),
-                    head_base + heads - 1
-                ),
-            ));
-        }
         let prep = self
             .module
             .prepare_q3k_gemv_heads_pair(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
@@ -748,6 +671,91 @@ impl StepKernels {
         )?;
         Ok(())
     }
+}
+
+/// The per-head Q3_K launch's geometry, as [`check_q3k_heads`] reads it:
+/// `n_sb` super-blocks at `K = k`, `heads` heads from `head_base`.
+struct HeadsShape {
+    n_sb: usize,
+    k: usize,
+    head_base: usize,
+    heads: usize,
+    rows_per_head: usize,
+    row_stride_per_head: usize,
+    row_off: usize,
+    y_head_stride: usize,
+}
+
+/// The shape checks both per-head Q3_K launches share: even `n_sb`, `w`'s
+/// row width, a head's rows inside its own block, the heads inside `w`, and
+/// `y` covering the last head's rows.
+fn check_q3k_heads(
+    what: &'static str,
+    w: &DeviceTensor<u32>,
+    s: HeadsShape,
+    y_len: usize,
+) -> Result<(), GpuError> {
+    let HeadsShape {
+        n_sb,
+        k,
+        head_base,
+        heads,
+        rows_per_head,
+        row_stride_per_head,
+        row_off,
+        y_head_stride,
+    } = s;
+    if !n_sb.is_multiple_of(2) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "odd super-block count {n_sb} (K={k}) leaves rows unaligned; repack rows at \
+                 load time"
+            ),
+        ));
+    }
+    if w.cols() != 110 * n_sb / 4 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "Q3_K rows are 110*{n_sb}/4 = {} words at K={k}, got {}",
+                110 * n_sb / 4,
+                w.cols()
+            ),
+        ));
+    }
+    if row_off + rows_per_head > row_stride_per_head || rows_per_head == 0 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "row_off {row_off} + rows_per_head {rows_per_head} must lie inside \
+                 row_stride_per_head {row_stride_per_head}"
+            ),
+        ));
+    }
+    if (head_base + heads) * row_stride_per_head > w.rows() {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "heads {head_base}..{} need (head_base+heads)*row_stride_per_head = {} rows, \
+                 w has {}",
+                head_base + heads,
+                (head_base + heads) * row_stride_per_head,
+                w.rows()
+            ),
+        ));
+    }
+    if y_len < (head_base + heads - 1) * y_head_stride + rows_per_head {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "y.len() {y_len} < (head_base+heads-1)*y_head_stride + rows_per_head = \
+                 {}*{y_head_stride} + {rows_per_head}",
+                head_base + heads - 1
+            ),
+        ));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ scratch
@@ -1878,19 +1886,14 @@ impl GpuModel {
     /// inside the last segment of a short run is a real key row, not a
     /// skipped one.
     pub fn reset(&mut self) -> Result<(), GpuError> {
-        let slots = match self.stages.first().and_then(|s| s.residency.as_ref()) {
-            Some(r) => r.kv.len(),
-            None => {
-                return Err(GpuError::state(
-                    "GpuModel::reset",
-                    "stage carries no residency",
-                ));
-            }
+        let Some(r) = self.stages.first().and_then(|s| s.residency.as_ref()) else {
+            return Err(GpuError::state(
+                "GpuModel::reset",
+                "stage carries no residency",
+            ));
         };
-        let zero_row = {
-            let r = self.stages[0].residency.as_ref().unwrap();
-            vec![0u16; r.kv[0].cols()]
-        };
+        let slots = r.kv.len();
+        let zero_row = vec![0u16; r.kv[0].cols()];
         for slot in 0..slots {
             let (gpu, residency) = self.stage_parts("GpuModel::reset")?;
             seed_cache(gpu, &mut residency.kv[slot], &zero_row, "reset")?;

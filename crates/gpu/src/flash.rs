@@ -101,6 +101,7 @@ pub const KEY_TILE: usize = 32;
 /// Threads sharing one key's QK dot; the block's `LATENT` threads cover
 /// `KEY_TILE` keys at a time.
 pub const DIM_SPLIT: usize = LATENT / KEY_TILE;
+const _: () = assert!(LATENT.is_multiple_of(KEY_TILE));
 /// Widest `rope_dims + latent` row the shared staging buffer holds.
 pub const MAX_WIDTH: usize = 640;
 /// Rotating partials each hot loop carries, and so the loads a thread keeps
@@ -139,6 +140,8 @@ pub const MMA_QK_WARPS: usize = 4;
 /// once. It is also the lane count of a warp, which is what lets the softmax
 /// finish a head's tile without a shared reduction.
 pub const MMA_KEYS: usize = MMA_QK_WARPS * MMA_NTILE;
+const _: () = assert!(MMA_KEYS == MMA_QK_WARPS * MMA_NTILE);
+const _: () = assert!(MMA_KEYS == 32);
 /// Dims one `mma.sync` step covers — the instruction's `k`.
 pub const MMA_K: usize = 16;
 /// The `rope_dims + latent` row width `flash_latent_mma` is built for. Its
@@ -146,11 +149,13 @@ pub const MMA_K: usize = 16;
 /// by `2 * MMA_K`, so the host entry rejects any other width rather than
 /// reading past a tile.
 pub const MMA_WIDTH: usize = 576;
+const _: () = assert!(MMA_WIDTH.is_multiple_of(2 * MMA_K));
 /// f16 lanes between two staged query rows. `MMA_QSTRIDE * 2 ≡ 16 (mod 128)`
 /// is what makes every `ldmatrix` phase read eight rows across all thirty-two
 /// banks exactly once; the unpadded 576 would put all sixteen rows in the
 /// same bank.
 pub const MMA_QSTRIDE: usize = MMA_WIDTH + 8;
+const _: () = assert!(MMA_QSTRIDE * 2 % 128 == 16);
 /// `MMA_QSTRIDE` as u32 words, the staged tile's element type.
 pub const MMA_QROW_W: usize = MMA_QSTRIDE / 2;
 /// u32 words one staged query tile takes.
@@ -162,6 +167,7 @@ pub const MMA_QSTAGE: usize = MMA_WIDTH / 2 / 32;
 /// f16 lanes between two staged key rows — padded for the same reason as
 /// [`MMA_QSTRIDE`], and by the same amount.
 pub const MMA_KSTRIDE: usize = MMA_WIDTH + 8;
+const _: () = assert!(MMA_KSTRIDE * 2 % 128 == 16);
 /// `MMA_KSTRIDE` as u32 words.
 pub const MMA_KROW_W: usize = MMA_KSTRIDE / 2;
 /// u32 words the staged key tile takes. The tile is whole — every key row's
@@ -537,9 +543,8 @@ mod flash_kernels {
         }
         let rope = rope_dims as usize;
         let lat = latent as usize;
-        // SAFETY: as in `flash_latent` — each `static mut` is this block's
-        // own shared allocation, every access bounded and ordered by
-        // `sync_threads`.
+        // SAFETY: each `static mut` is this block's own shared allocation,
+        // every access bounded and ordered by `sync_threads`.
         let (qs, klog, kw, st) = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(&raw mut QROW),
@@ -575,7 +580,8 @@ mod flash_kernels {
         }
         // SAFETY: `qs` is this block's `MAX_WIDTH >= LATENT` shared array
         // and its last read is inside `latent_range`, before the barrier
-        // above; the helper's own preconditions hold as in `flash_merge_q8`.
+        // above; the launch contract bounds both output sets and `row`
+        // picks a column inside its own half.
         unsafe {
             quant_row(
                 v, qs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
@@ -899,11 +905,11 @@ mod flash_kernels {
             #[unroll]
             while i < MMA_QSTAGE {
                 let w = lane + i * 32;
-                // SAFETY: row < q_rows when live and 2 * w + 1 < MMA_WIDTH =
-                // width, so both loads are inside that query row (launch
-                // contract).
-                unsafe {
-                    if live {
+                if live {
+                    // SAFETY: row < q_rows and 2 * w + 1 < MMA_WIDTH = width,
+                    // so both loads are inside that query row (launch
+                    // contract).
+                    unsafe {
                         raw[2 * i] = *q.get_unchecked(row * width + 2 * w);
                         raw[2 * i + 1] = *q.get_unchecked(row * width + 2 * w + 1);
                     }
@@ -961,11 +967,11 @@ mod flash_kernels {
                 #[unroll]
                 while i < MMA_KSTAGE {
                     let ww = lane + i * 32;
-                    // SAFETY: a row is read only while key < hi_max <=
-                    // dst_rows, and 2 * ww < MMA_WIDTH = width, so the load
-                    // is inside that cache row (launch contract).
-                    unsafe {
-                        if live {
+                    if live {
+                        // SAFETY: key < hi_max <= dst_rows and 2 * ww <
+                        // MMA_WIDTH = width, so the load is inside that cache
+                        // row (launch contract).
+                        unsafe {
                             raw[i] = *kvw.add(key * (width / 2) + ww);
                         }
                     }
@@ -1049,33 +1055,39 @@ mod flash_kernels {
             // ---- online softmax: warp `wid` owns head `wid`, its
             // thirty-two lanes the tile's thirty-two keys, so the head's
             // (max, Σ exp) is a warp reduction and never leaves registers.
-            // SAFETY: wid < MMA_ROWS and lane < MMA_KEYS bound the slots,
-            // and one lane writes each.
-            unsafe {
-                let sv = *klog.add(wid * MMA_KEYS + lane);
-                let smax = warp::reduce_max_f32(sv);
-                // FlashMS update: s is rescaled here, the V partials just
-                // before this tile's accumulation (the CPU oracle's order).
-                // A first bump scales by 0.0 — the partials are still zero,
-                // so the reset and the scale are the same value.
-                let mut vms = 1.0f32;
-                if smax > mx {
-                    vms = if mx > f32::NEG_INFINITY {
-                        dev_exp(mx - smax)
-                    } else {
-                        0.0
-                    };
-                    ss *= vms;
-                    mx = smax;
-                }
-                let w = if sv == f32::NEG_INFINITY {
-                    0.0
+            // SAFETY: wid < MMA_ROWS and lane < MMA_KEYS bound the read
+            // inside KLOG, published by the barrier above.
+            let sv = unsafe { *klog.add(wid * MMA_KEYS + lane) };
+            let smax = warp::reduce_max_f32(sv);
+            // FlashMS update: s is rescaled here, the V partials just
+            // before this tile's accumulation (the CPU oracle's order).
+            // A first bump scales by 0.0 — the partials are still zero,
+            // so the reset and the scale are the same value.
+            let mut vms = 1.0f32;
+            if smax > mx {
+                vms = if mx > f32::NEG_INFINITY {
+                    dev_exp(mx - smax)
                 } else {
-                    dev_exp(sv - mx)
+                    0.0
                 };
-                ss += warp::reduce_sum_f32(w);
+                ss *= vms;
+                mx = smax;
+            }
+            let w = if sv == f32::NEG_INFINITY {
+                0.0
+            } else {
+                dev_exp(sv - mx)
+            };
+            ss += warp::reduce_sum_f32(w);
+            // SAFETY: wid < MMA_ROWS and lane < MMA_KEYS bound the slot
+            // inside KW, and one lane writes each.
+            unsafe {
                 *kw.add(wid * MMA_KEYS + lane) = w;
-                if lane == 0 {
+            }
+            if lane == 0 {
+                // SAFETY: wid < MMA_ROWS bounds the store, and lane 0 of
+                // warp `wid` is its only writer.
+                unsafe {
                     *vms_sh.add(wid) = vms;
                 }
             }
@@ -1195,8 +1207,9 @@ mod flash_kernels {
         static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
         static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
 
-        // SAFETY: as in `flash_latent_seg` — the shared arrays are this
-        // block's own and the arguments are that kernel's launch contract.
+        // SAFETY: the four `static mut` arrays are this block's own
+        // `(MAX_WIDTH, KEY_TILE, KEY_TILE, 2)` shared scratch, and this
+        // entry's launch contract is `seg_pass`'s.
         unsafe {
             seg_pass::<TWICE_QK>(
                 q,
@@ -1269,7 +1282,9 @@ mod flash_kernels {
         static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
         static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
 
-        // SAFETY: as in `flash_latent_seg_qk2`.
+        // SAFETY: the four `static mut` arrays are this block's own
+        // `(MAX_WIDTH, KEY_TILE, KEY_TILE, 2)` shared scratch, and this
+        // entry's launch contract is `seg_pass`'s.
         unsafe {
             seg_pass::<TWICE_V>(
                 q,
@@ -1337,7 +1352,9 @@ mod flash_kernels {
         static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
         static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
 
-        // SAFETY: as in `flash_latent_seg_qk2`.
+        // SAFETY: the four `static mut` arrays are this block's own
+        // `(MAX_WIDTH, KEY_TILE, KEY_TILE, 2)` shared scratch, and this
+        // entry's launch contract is `seg_pass`'s.
         unsafe {
             seg_pass::<TWICE_COLL>(
                 q,
@@ -1405,7 +1422,9 @@ mod flash_kernels {
         static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
         static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
 
-        // SAFETY: as in `flash_latent_seg_qk2`.
+        // SAFETY: the four `static mut` arrays are this block's own
+        // `(MAX_WIDTH, KEY_TILE, KEY_TILE, 2)` shared scratch, and this
+        // entry's launch contract is `seg_pass`'s.
         unsafe {
             seg_pass::<TWICE_SYNC>(
                 q,
@@ -1473,7 +1492,9 @@ mod flash_kernels {
         static mut KW: SharedArray<f32, KEY_TILE> = SharedArray::UNINIT;
         static mut ST: SharedArray<f32, 2> = SharedArray::UNINIT;
 
-        // SAFETY: as in `flash_latent_seg_qk2`.
+        // SAFETY: the four `static mut` arrays are this block's own
+        // `(MAX_WIDTH, KEY_TILE, KEY_TILE, 2)` shared scratch, and this
+        // entry's launch contract is `seg_pass`'s.
         unsafe {
             seg_pass::<TWICE_SM>(
                 q,
@@ -1631,7 +1652,9 @@ mod flash_kernels {
             return; // block-uniform
         }
         let lat = latent as usize;
-        // SAFETY: as in `flash_merge`.
+        // SAFETY: row < q_rows and tid < LATENT = latent (host-validated),
+        // so the store is inside y's row segment and the partial reads are
+        // inside theirs (launch contract).
         let v = unsafe {
             let v = merge_row::<false>(
                 n_keys_buf, m, n_heads, dst_rows, segs, seg_keys, part_v, part_ms, row, tid, lat,
@@ -1721,7 +1744,9 @@ mod flash_kernels {
             return; // block-uniform
         }
         let lat = latent as usize;
-        // SAFETY: as in `flash_merge_q8`.
+        // SAFETY: row < q_rows and tid < LATENT = latent (host-validated),
+        // so the store is inside y's row segment and the partial reads are
+        // inside theirs (launch contract).
         let v = unsafe {
             let v = merge_row::<true>(
                 n_keys_buf,
@@ -1741,9 +1766,11 @@ mod flash_kernels {
             *y.get_unchecked_mut(row * lat + tid) = v;
             v
         };
-        // SAFETY: as in `flash_merge_q8`.
+        // SAFETY: VROW is this block's own shared allocation; tid < 512 =
+        // LATENT bounds every access to it.
         let vs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut VROW) };
-        // SAFETY: as in `flash_merge_q8`.
+        // SAFETY: the launch contract bounds both output sets, `row` picks
+        // a column inside its own half, and the block is `quant_row`'s shape.
         unsafe {
             quant_row(
                 v, vs, tid, lat, row, m_lo, n_sb, half_it, quad_it, &mut q3a, &mut q4a, &mut q6a,
@@ -1840,7 +1867,8 @@ mod flash_kernels {
                     )
                 };
                 if sj != 0.0 {
-                    // SAFETY: as in the fold above.
+                    // SAFETY: idx < q_rows * segs and tid < latent, so the
+                    // read is inside part_v (caller's contract).
                     let vj = unsafe { *part_v.get_unchecked(idx * lat + tid) };
                     if mj > mx2 {
                         let f = if mx2 > f32::NEG_INFINITY {
@@ -2064,7 +2092,9 @@ mod flash_kernels {
                     i += ILP * DIM_SPLIT;
                 }
                 while i < width {
-                    // SAFETY: as above, for the trailing steps.
+                    // SAFETY: blk + key < hi <= dst_rows and i < width <=
+                    // MAX_WIDTH, so the kv load is inside the key's row and
+                    // the shared read inside the staged query row.
                     unsafe {
                         a0 = f32::mul_add(
                             *qs.add(i),
@@ -2105,7 +2135,9 @@ mod flash_kernels {
                         i += ILP * DIM_SPLIT;
                     }
                     while i < width {
-                        // SAFETY: as above, for the trailing steps.
+                        // SAFETY: p < hi <= dst_rows and i < width <=
+                        // MAX_WIDTH, so the kv load is inside that row and
+                        // the shared read inside the staged query row.
                         unsafe {
                             b0 = f32::mul_add(
                                 *qs.add(i),
@@ -2499,7 +2531,7 @@ impl FlashKernels {
         m: usize,
     ) -> Result<(), GpuError> {
         let (rows, width) = (cache.rows(), cache.cols());
-        if pos_buf.len() < 1 {
+        if pos_buf.is_empty() {
             return Err(GpuError::shape(
                 "enqueue_kv_append_pos_buf",
                 "pos_buf must hold 1 u32",
@@ -2667,21 +2699,13 @@ impl FlashKernels {
             latent_dims: latent,
         } = geom;
         let segs = segments_for(kv.rows());
-        let q_rows = check_flash(
+        let q_rows = check_seg(
             "enqueue_flash_latent_seg",
             q.len(),
             kv,
             n_keys_buf.len(),
             geom,
-            None,
-        )?;
-        check_partials(
-            "enqueue_flash_latent_seg",
-            part_v.len(),
-            part_ms.len(),
-            q_rows,
-            segs,
-            latent,
+            (part_v.len(), part_ms.len()),
         )?;
         let prep = self.module.prepare_flash_latent_seg(LaunchConfig1D::new(
             (q_rows * segs) as u32,
@@ -2744,21 +2768,13 @@ impl FlashKernels {
             latent_dims: latent,
         } = geom;
         let segs = segments_for(kv.rows());
-        let q_rows = check_flash(
+        let q_rows = check_seg(
             "enqueue_flash_latent_mma",
             q.len(),
             kv,
             n_keys_buf.len(),
             geom,
-            None,
-        )?;
-        check_partials(
-            "enqueue_flash_latent_mma",
-            part_v.len(),
-            part_ms.len(),
-            q_rows,
-            segs,
-            latent,
+            (part_v.len(), part_ms.len()),
         )?;
         if rope_dims + latent != MMA_WIDTH {
             return Err(GpuError::shape(
@@ -2844,21 +2860,13 @@ impl FlashKernels {
             latent_dims: latent,
         } = geom;
         let segs = segments_for(kv.rows());
-        let q_rows = check_flash(
+        let q_rows = check_seg(
             "enqueue_flash_latent_seg_twice",
             q.len(),
             kv,
             n_keys_buf.len(),
             geom,
-            None,
-        )?;
-        check_partials(
-            "enqueue_flash_latent_seg_twice",
-            part_v.len(),
-            part_ms.len(),
-            q_rows,
-            segs,
-            latent,
+            (part_v.len(), part_ms.len()),
         )?;
         if segs == 1 {
             return Err(GpuError::shape(
@@ -2929,36 +2937,15 @@ impl FlashKernels {
         } = a;
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
-        if n_keys_buf.is_empty() {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge",
-                "n_keys_buf must hold 1 u32",
-            ));
-        }
-        if latent != LATENT {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge",
-                format!("this family's latent tail is {LATENT}, got {latent}"),
-            ));
-        }
-        check_partials(
+        check_merge(
             "enqueue_flash_merge",
-            part_v.len(),
-            part_ms.len(),
+            n_keys_buf.len(),
+            latent,
+            (part_v.len(), part_ms.len()),
             q_rows,
             segs,
-            latent,
+            y.len(),
         )?;
-        if y.len() < q_rows * latent {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge",
-                format!(
-                    "y.len() {} < m*n_heads*latent = {}",
-                    y.len(),
-                    q_rows * latent
-                ),
-            ));
-        }
         let prep = self.module.prepare_flash_merge(LaunchConfig1D::new(
             q_rows as u32,
             LATENT as u32,
@@ -3010,36 +2997,15 @@ impl FlashKernels {
         } = a;
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
-        if n_keys_buf.is_empty() {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge_q8",
-                "n_keys_buf must hold 1 u32",
-            ));
-        }
-        if latent != LATENT {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge_q8",
-                format!("this family's latent tail is {LATENT}, got {latent}"),
-            ));
-        }
-        check_partials(
+        check_merge(
             "enqueue_flash_merge_q8",
-            part_v.len(),
-            part_ms.len(),
+            n_keys_buf.len(),
+            latent,
+            (part_v.len(), part_ms.len()),
             q_rows,
             segs,
-            latent,
+            y.len(),
         )?;
-        if y.len() < q_rows * latent {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge_q8",
-                format!(
-                    "y.len() {} < m*n_heads*latent = {}",
-                    y.len(),
-                    q_rows * latent
-                ),
-            ));
-        }
         let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge_q8", lo, hi, q_rows, latent)?;
         let prep = self.module.prepare_flash_merge_q8(LaunchConfig1D::new(
             q_rows as u32,
@@ -3106,36 +3072,15 @@ impl FlashKernels {
         } = a;
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
-        if n_keys_buf.is_empty() {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge2_q8",
-                "n_keys_buf must hold 1 u32",
-            ));
-        }
-        if latent != LATENT {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge2_q8",
-                format!("this family's latent tail is {LATENT}, got {latent}"),
-            ));
-        }
-        check_partials(
+        check_merge(
             "enqueue_flash_merge2_q8",
-            part_v.len(),
-            part_ms.len(),
+            n_keys_buf.len(),
+            latent,
+            (part_v.len(), part_ms.len()),
             q_rows,
             segs,
-            latent,
+            y.len(),
         )?;
-        if y.len() < q_rows * latent {
-            return Err(GpuError::shape(
-                "enqueue_flash_merge2_q8",
-                format!(
-                    "y.len() {} < m*n_heads*latent = {}",
-                    y.len(),
-                    q_rows * latent
-                ),
-            ));
-        }
         let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge2_q8", lo, hi, q_rows, latent)?;
         let prep = self.module.prepare_flash_merge2_q8(LaunchConfig1D::new(
             q_rows as u32,
@@ -3301,6 +3246,60 @@ fn check_partials(
     Ok(())
 }
 
+/// The merge pass's inputs, shared by its three entries: the live-count
+/// buffer, the latent tail, the partials for `q_rows` rows over `segs`
+/// segments, and `y`. `parts` is `(part_v.len(), part_ms.len())`.
+fn check_merge(
+    what: &'static str,
+    n_keys_len: usize,
+    latent: usize,
+    parts: (usize, usize),
+    q_rows: usize,
+    segs: usize,
+    y_len: usize,
+) -> Result<(), GpuError> {
+    if n_keys_len == 0 {
+        return Err(GpuError::shape(what, "n_keys_buf must hold 1 u32"));
+    }
+    if latent != LATENT {
+        return Err(GpuError::shape(
+            what,
+            format!("this family's latent tail is {LATENT}, got {latent}"),
+        ));
+    }
+    check_partials(what, parts.0, parts.1, q_rows, segs, latent)?;
+    if y_len < q_rows * latent {
+        return Err(GpuError::shape(
+            what,
+            format!("y.len() {y_len} < m*n_heads*latent = {}", q_rows * latent),
+        ));
+    }
+    Ok(())
+}
+
+/// The segment pass's inputs, shared by its three entries: [`check_flash`]
+/// without a `y`, then the partials at [`segments_for`]`(kv.rows())`.
+/// `parts` is `(part_v.len(), part_ms.len())`. Returns the query rows.
+fn check_seg(
+    what: &'static str,
+    q_len: usize,
+    kv: &DeviceTensor<u16>,
+    n_keys_len: usize,
+    geom: FlashGeom,
+    parts: (usize, usize),
+) -> Result<usize, GpuError> {
+    let q_rows = check_flash(what, q_len, kv, n_keys_len, geom, None)?;
+    check_partials(
+        what,
+        parts.0,
+        parts.1,
+        q_rows,
+        segments_for(kv.rows()),
+        geom.latent_dims,
+    )?;
+    Ok(q_rows)
+}
+
 /// The geometry both flash entries share: the block width is the latent
 /// tail, the query row is staged in shared memory, and the QK dot splits a
 /// row across [`DIM_SPLIT`] threads; `y_len` is `None` for the segment pass,
@@ -3362,7 +3361,7 @@ fn check_flash(
             ),
         ));
     }
-    if n_keys_len < 1 {
+    if n_keys_len == 0 {
         return Err(GpuError::shape(what, "n_keys_buf must hold 1 u32"));
     }
     let q_rows = m * n_heads;
