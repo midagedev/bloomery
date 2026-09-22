@@ -9,11 +9,11 @@
 ~~**비행 중(2026-09-22 아침)**: A4b 두 라운드 — `kprobe`·`ikread`·`peerread`.~~
 
 **인계(2026-09-22 저녁, 세션을 rig-log에서 이 레포로 옮기며)**
-- **비행 중**: 없다. ~~워크트리는 `bloomery-a4c`만 남아 있다~~ 회수했다(브랜치 `a4c`는 origin에 있다, 박스 디렉터리도 삭제).
+- **비행 중**: 없다. ~~`gatesc`~~ 머지(`c69642b`): 모델 텐서 전제 조건 35곳이 `lib.rs::tensor_bytes_as` 하나로 모였고(assert 패닉 exit 101 → 게이트 자신의 오류 줄 exit 1), `run()` 끝의 `exit(1)` 15곳이 `Err(checks_failed())`로 `exit_with`를 지난다. 게이트 15개 통과 출력 줄 동일(리드 재실행), FAIL-first 둘, lint 211 → 210. 워크트리·박스 디렉터리 회수. ~~워크트리는 `bloomery-a4c`만 남아 있다~~ 회수했다(브랜치 `a4c`는 origin에 있다, 박스 디렉터리도 삭제).
 - **오늘 닫힌 것**: errsrc — 참값 대비 추가 오차의 원인은 활성 128값 블록(시뮬 41 → 32값 25, σ 0.378 → 0.255 = ik 수준). 사용자 결정으로 **기본값은 128 유지, 32값은 `exact_ref --act ik` 시뮬로만**(「모델 / 성능이 먼저, 정확도는 선택」). σ는 `gate-gpu-e2e`의 진단 줄이 됐다(핀 아님, 엔진 0.3518). fnsplit 머지 완료.
 - ~~**결정 대기(사용자)**: MMA 레버 기본값.~~ **결정(사용자, 2026-09-22 저녁): 기본 on.** 조건은 "1023위치에서 MMA가 우리 규칙 시뮬(`--act ours`)보다 스칼라 이상으로 벗어나는 위치가 없으면"이었고, 없었다 — MMA 대 시뮬 RMS 0.310, 스칼라 대 시뮬 0.332, 꼬리 개수도 스칼라 이하(`docs/research/errsrc/engine/`). 핀 6에 여유 없이 걸린다(MMA 6, 스칼라 4). `just gate-gpu-e2e`는 두 패스를 다 돈다. 롤백 `BLOOMERY_FLASH_MMA=0`. **다음 결정 후보**: 「성능이 먼저」는 엔진이 경로 하나만 싣는다고 했다 — 스칼라 세그먼트 패스(와 그것만 재는 keyaxis 계기 8개)를 지울지.
 - **리드 할 일**: ~~데이터 경로 세 곳을 `lib.rs::data_dir()`로~~ 했다. ~~`docs/rust-quality.md` §0 재측정~~ 했다(lint 211, unsafe 무주석 62). ~~오늘치 rig-log 기록~~ 09-22-m(`c27c3a7`).
-- **다음 리팩터 후보**(트리아지 원본은 세션 스크래치였다 — 요지만): tools6(셸 기본값을 `ref-paths.sh`로), gates-c(`gate_p10` `Table`, `assert_eq!`→`Err`, 검사 중복), gpucast(R5), 미해결 doc 링크 8건 + rustdoc 게이트, `model::probe`→`instrument` 개명, 커널 모듈 `pub` 52개 가시성, exact_ref 가중치 재역양자화 캐시.
+- **다음 리팩터 후보**(트리아지 원본은 세션 스크래치였다 — 요지만): tools6(셸 기본값을 `ref-paths.sh`로), ~~gates-c~~ 머지. 그 라운드가 남긴 것 셋: **gates-c2**(같은 축의 잔여 — `real_x.rs` 461–485·594·631·683과 `rawx_floor.rs` 228의 손 검사, `gate_p6.rs` 98–111, `lib.rs::f32_tensor`의 타입 검사, 랭크 확인 없는 `dims[1]`/`dims[2]` 인덱싱 — `gate_p10.rs` 698·744, `exact_ref.rs` 74 `view()`, `gate_p4.rs` 131의 토큰 id 대 vocab, `generate.rs` 125의 CLI `panic!`), **gates-d**(`gate_p10` `kid_*` 인자 구조체, R8), 기계 라운드 몫(`lib.rs` `route_ref`의 `partial_cmp().expect()` → `total_cmp` R23, `manual_range_contains`·`is_multiple_of`·`chunks_exact` 잔여 R17). 탭 목록의 `unreachable!`은 내부 불변식이라 둔다(R10), gpucast(R5), 미해결 doc 링크 8건 + rustdoc 게이트, `model::probe`→`instrument` 개명, 커널 모듈 `pub` 52개 가시성, exact_ref 가중치 재역양자화 캐시.
 
 ### GPU 선
 
