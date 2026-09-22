@@ -2,18 +2,20 @@
 
 이 문서는 리뷰어와 리팩토링 라운드가 인용하는 규칙표다. 규칙마다 번호(`R1`…)가 있고, 리뷰 보고는 `경로:줄 — R번호 — 한 줄 — 크기`로 적는다. 근거는 Rust 공식 권고(API Guidelines, Rustonomicon, Unsafe Code Guidelines, clippy 린트 등급)와 이 레포에서 실제로 난 사고다. `AGENTS.md` Conventions가 도메인 계약(정확성·측정·주석)을 담고, 이 문서는 **코드의 모양**을 담는다. 둘이 충돌하면 AGENTS.md가 이긴다.
 
-## 0. 기준선 (2026-09-22 밤, main `54f0b9e`; 경고 분포는 a4d 트리 `0537327`의 `just lint` 로그에서 — 총수는 main과 같은 260)
+## 0. 기준선
 
-| 계기 | 값 | 방향 |
+계기: `just lint`(`--features gpu`) 출력의 `grep -c '^warning:'` — 타깃마다 한 번씩 세므로 에이전트의 유니크 계수보다 높다. **같은 계기로 전후를 잰다.** 래칫 다운만.
+
+| 계기 | 2026-09-22 밤 (리뷰 전, `685462d`) | 2026-09-22 새벽 (리뷰 1회차 후, `0ff785e`) |
 |---|---|---|
-| `just lint` 경고 | **260** (2026-09-21 아침 144 — 하루 만에 +116); `--features gpu`를 켜면 **308**(gpu-gates 바이너리 17개 본체가 그제야 검사된다 — 리뷰 2026-09-22가 잡은 lint 사각) | 래칫 다운만; 기준 계기는 `just lint`(`--features gpu`) 출력의 `grep -c '^warning:'` — 타깃마다 한 번씩 세므로 에이전트의 유니크 계수(같은 트리 256)보다 높다. **같은 계기로 전후를 잰다** |
-| `undocumented_unsafe_blocks` | 123 (전체 경고의 47 %) | 0 → `deny` (MUL-10) |
-| `too_many_arguments` | 12 (8/7 ×9, 11/7 ×3) | 0 |
-| `crates/gpu` `as` 캐스트 | 637 | 호스트 코드에서 0 (커널은 R5 예외) |
-| `crates/gpu`·`model` `unwrap()`/`expect(` | 33 | 라이브러리 크레이트에서 0 |
-| 가장 큰 파일 | `gpu/src/model.rs` 3901, `flash.rs` 2628 | 파일당 상한 없음, 함수당 두 화면(AGENTS) |
+| `just lint` 경고 | **308** (gpu 피처 없이 260; 09-21 아침 144) | **221** |
+| `undocumented_unsafe_blocks` | 123 | **63** — q3k-gemv 49, q3k-cpu 9(스테이지 0 스파이크, MUL-10/11 몫), model 4, gpu 1(`flash.rs`) |
+| `too_many_arguments` 경고(allow 없이) | 12 | 17 (8/7 ×12, 9/7 ×2, 11/7 ×3) — R8 라운드 대상; allow에는 전부 `reason` |
+| `chunks_exact` 상수 → `as_chunks` | 17 | 23 (R17 2차 — 핫 패스는 A/B 동반) |
+| `crates/gpu` `as` 캐스트 | 637 | 미재측(R5 라운드 전) |
+| 가장 큰 파일 | `model.rs` 3901, `flash.rs` 2628 | `flash.rs` 3241(a4d·a4e 커널), `model.rs` 3963 |
 
-경고 수가 하루에 116 늘었다는 것이 이 문서를 쓰는 이유다. 규칙이 없으면 라운드마다 는다.
+리뷰 1회차(agy 3 라운드)와 리팩토링 4 라운드(opus: `qtools`·`gatesdedup`·`cpumech`·`gpusafety`, 각 한 축)가 하루 만에 늘어난 116을 되돌리고 그 아래로 87을 더 내렸다. 리뷰 미완: `flash.rs`·`model.rs`·`gate_p5`·`gate_e2e`(a4e 뒤로 미룬 4파일), `GpuError` 열거형(R9), `*Args` 구조체(R8).
 
 ## 1. unsafe — 범위는 최소, 불변식은 타입에
 

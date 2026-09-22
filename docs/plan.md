@@ -283,6 +283,7 @@ flowchart LR
 |---|---|---|---|
 | **5′ (지금, 2026-09-22 아침)** | `kprobe`(flash.rs·model.rs·generate.rs·depth-gpu.sh, 임대) ‖ `ikread`·`peerread`(읽기 전용) ‖ `planmerge`(docs, 끝남) | 병합 검수·끊긴 참조 수선, ncu 러너(`tools/ref/ncu-gpu.sh`)로 깊이별 커널 카운터 | A4b 세 보고 → A4c 스펙 |
 | 6′ | ~~A4c(flash.rs·model.rs) ‖ `seeddepth`(측정 준비 시간 제거) ‖ B0c 도구 ‖ C1(`crates/server` 신설)~~ **끝(2026-09-22 밤)**: A4b 프로브 머지 `76c8673`(첫 분해표), seeddepth 머지 `c21fd71`(±1% 안, 씨앗-대-씨앗 규칙), A4c 닫힘(위), `env=` 팔 `06a51f3`, ik #2501 제출. 3090 두 번째 낙하로 시간 카드가 A6000이 됨(09-22-g). B0c·C1은 미발사 | A4d 스펙 | — |
+| 7′ (2026-09-22 새벽) | a4e(커널) ‖ 리뷰 agy 3(cpu·gates·gpuside, `docs/rust-quality.md` 기준) → 리팩토링 opus 4(`qtools`·`gatesdedup`·`cpumech`·`gpusafety`, 한 축씩) ‖ w41·a6rest·ptxscan | **끝**: a4e 머지(레버 off, d4096 ik 1.11×), 리팩토링 넷 전부 ff 머지 — lint 308→**221**, PTX 표 동일, 게이트 출력 문자열 동일, cpumech A/B ±0.5 % 안. 남은 축: R9 `GpuError`, R8 `*Args`, flash/model 리뷰, gate-qdot 참조 덤프 | e2e 발산 핀 재정의(사용자) → 레버 기본값 | — |
 
 model.rs 점유 순서(하나씩): A1b → A1c → A1d → A2-1 → ~~A2-2~~ → A3-1 → A3-2 → A6 → B2 → A5 조립 → B5 → C4.
 **갱신(2026-09-22)** 여기서부터: `kprobe`(비행 중) → A4c → A6 잔여 → A2-2 → B2 → A5 조립 → B5 → C4. `generate.rs`는 별도 축이다: `kprobe` → W41 → `seeddepth`.

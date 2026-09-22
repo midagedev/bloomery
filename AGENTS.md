@@ -251,7 +251,10 @@ are dummy mains and their bodies are never linted). The ratchet counter is
 appears in (an agent's unique-count will read lower — same direction, different
 ruler). 2026-09-22 night, measured: 308 before the quality rounds; 234 after
 `gpusafety`, 305 after `gatesdedup` on its own base — the merged value is re-measured
-and written here when a round lands. `docs/rust-quality.md` §0 is the table that
+and written here when a round lands — **221 on main `0ff785e` after the four rounds**.
+`gate-qdot`'s four hw tests are red on every tree because the box has no `*-ik-dot.txt`
+reference dumps and no recipe builds them (`tools/ref/q4k_x4_ref.cpp` and siblings) — a
+standing red is not a gate; a tools round owes `build-ref` that step. `docs/rust-quality.md` §0 is the table that
 tracks it. Timed recipes (`time-gpu-*`, `prof-gpu-p8`, `bench-gpu-kernels`) run on the
 A6000 since the runners share `tools/ref/timing-card.sh`; their earlier 3090 numbers do
 not belong in the same table.
