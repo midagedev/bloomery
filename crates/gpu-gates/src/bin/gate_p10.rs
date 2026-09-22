@@ -397,8 +397,18 @@ fn run() -> Result<(), GateError> {
     // row below, through the derived variant.
     println!("skip q8_0 absent");
     let w = Weights::load(stream, &gguf, 0..2, true)?;
-    let t1 = run_table(&gguf, &gpu, &q5, &q8f32, stream, &w, &derived, SEED)?;
-    let t2 = run_table(&gguf, &gpu, &q5, &q8f32, stream, &w, &derived, SEED)?;
+    let table = Table {
+        gguf: &gguf,
+        gpu: &gpu,
+        q5: &q5,
+        q8f32: &q8f32,
+        stream,
+        w: &w,
+        derived: &derived,
+        seed: SEED,
+    };
+    let t1 = run_table(&table)?;
+    let t2 = run_table(&table)?;
     let mut rerun_same = t1.len() == t2.len();
     for ((l1, y1), (l2, y2)) in t1.iter().zip(t2.iter()) {
         let same = l1 == l2 && y1 == y2;
@@ -531,30 +541,75 @@ fn derived_ref_gemv(blocks: &[Q8Block], rows: usize, k: usize, x: &[f32], m: usi
     y
 }
 
+/// One kernel-identity row: its label and the resident output bits.
+#[cfg(feature = "gpu")]
+type KidRow = (String, Vec<u32>);
+
+/// What every kernel-identity row reads: the model file, the kernels, the
+/// resident weights under test, and the activation seed.
+#[cfg(feature = "gpu")]
+struct Table<'a> {
+    gguf: &'a Gguf,
+    gpu: &'a Gpu,
+    q5: &'a Q5Kernels,
+    q8f32: &'a Q8F32Kernels,
+    stream: &'a CudaStream,
+    w: &'a Weights,
+    derived: &'a Derived,
+    seed: u32,
+}
+
 /// One kernel-identity row set: per format, the owning kernel on the
 /// resident `DevWeight` vs a gate-style upload of the same tensor under the
 /// same `activations()` input. Returns each row's resident output bits (the
 /// whole-table rerun compares these).
 #[cfg(feature = "gpu")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
-)]
-fn run_table(
-    gguf: &Gguf,
-    gpu: &Gpu,
-    q5: &Q5Kernels,
-    q8f32: &bloomery_gpu::q8f32::Q8F32Kernels,
-    stream: &CudaStream,
-    w: &Weights,
-    derived: &Derived,
-    seed: u32,
-) -> Result<Vec<(String, Vec<u32>)>, GateError> {
-    let mut rows: Vec<(String, Vec<u32>)> = Vec::new();
+fn run_table(t: &Table<'_>) -> Result<Vec<KidRow>, GateError> {
+    let mut rows = Vec::new();
+    kid_kquant_rows(t, &mut rows)?;
+    kid_q5_1_rows(t, &mut rows)?;
+    kid_q5_0_sel_row(t, &mut rows)?;
+    kid_q3k_sel_row(t, &mut rows)?;
+    kid_f32_router_rows(t, &mut rows)?;
+    kid_q8_derived_rows(t, &mut rows)?;
+    Ok(rows)
+}
 
-    // K-quant plain rows: layer-1 tensors (attn_q Q3_K, attn_output Q4_K)
-    // and the global Q6_K output matrix, each at m = 1 and m = 8, against a
-    // gate_p1-style word upload.
+/// One row's verdict line, then the row itself; a row that fails ends the
+/// table (the rerun comparison needs every row). `geom` is the line's shape
+/// fields between the label and the two identities.
+#[cfg(feature = "gpu")]
+fn record(
+    rows: &mut Vec<KidRow>,
+    label: String,
+    geom: &str,
+    (same, rerun, bits): (bool, bool, Vec<u32>),
+) -> Result<(), GateError> {
+    let pass = same && rerun;
+    println!(
+        "kid row={label} {geom} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
+        verdict(pass)
+    );
+    if !pass {
+        return Err(format!("run_table: row {label} failed").into());
+    }
+    rows.push((label, bits));
+    Ok(())
+}
+
+/// K-quant plain rows: layer-1 tensors (attn_q Q3_K, attn_output Q4_K)
+/// and the global Q6_K output matrix, each at m = 1 and m = 8, against a
+/// gate_p1-style word upload.
+#[cfg(feature = "gpu")]
+fn kid_kquant_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
+    let Table {
+        gguf,
+        gpu,
+        stream,
+        w,
+        seed,
+        ..
+    } = *t;
     for (label, name) in [
         ("q3k", "blk.1.attn_q.weight"),
         ("q4k", "blk.1.attn_output.weight"),
@@ -579,190 +634,225 @@ fn run_table(
             .into());
         }
         for m in [1usize, 8] {
-            let (same, rerun, bits) =
-                kid_kquant(gpu, stream, info.ty, res, &rref, nrows, k, m, seed)?;
-            println!(
-                "kid row={label}_m{m} K={k} rows={nrows} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
-                verdict(same && rerun)
-            );
-            rows.push((format!("{label}_m{m}"), bits));
-            if !(same && rerun) {
-                return Err(format!("run_table: row {label}_m{m} failed").into());
-            }
+            let kid = kid_kquant(gpu, stream, info.ty, res, &rref, nrows, k, m, seed)?;
+            record(
+                rows,
+                format!("{label}_m{m}"),
+                &format!("K={k} rows={nrows}"),
+                kid,
+            )?;
         }
     }
+    Ok(())
+}
 
-    // Q5_1: the dense down projection of block 0 (the only Q5_1 site), m =
-    // 1 and 8, against a gate_p2-style packed upload.
-    {
-        let (info, bytes) = tensor_bytes(gguf, "blk.0.ffn_down.weight")?;
-        assert_eq!(info.ty, GgmlType::Q5_1, "blk.0.ffn_down type");
-        let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
-        let kb = k / 32;
-        let cols = 256 * kb.div_ceil(32) + 2 * kb;
-        let rref = DeviceTensor::upload(stream, &pack_q5_1(bytes, k, nrows)?, nrows, cols)?;
-        let DevWeight::Q5_1 { w: res, .. } = w
-            .get("blk.0.ffn_down.weight")
-            .ok_or("run_table: blk.0.ffn_down is not resident")?
-        else {
-            return Err("run_table: blk.0.ffn_down is not Q5_1".into());
-        };
-        for m in [1usize, 8] {
-            let (same, rerun, bits) = kid_q5_1(q5, stream, res, &rref, nrows, k, m, seed)?;
-            println!(
-                "kid row=q5_1_m{m} K={k} rows={nrows} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
-                verdict(same && rerun)
-            );
-            rows.push((format!("q5_1_m{m}"), bits));
-            if !(same && rerun) {
-                return Err(format!("run_table: row q5_1_m{m} failed").into());
-            }
-        }
-    }
-
-    // Q5_0 expert stack through the device-indirect down projection, sel as
-    // gate_p9 used it, against a gate_p9-style packed upload of the stack.
-    {
-        let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_down_exps.weight")?;
-        assert_eq!(info.ty, GgmlType::Q5_0, "blk.1.ffn_down_exps type");
-        let (k, rpe, nexp) = (
-            info.dims[0] as usize,
-            info.dims[1] as usize,
-            info.dims[2] as usize,
-        );
-        let kb = k / 32;
-        let rref = DeviceTensor::upload(
-            stream,
-            &pack_q5_0(bytes, k, nexp * rpe)?,
-            nexp * rpe,
-            256 * kb.div_ceil(32) + kb,
+/// Q5_1: the dense down projection of block 0 (the only Q5_1 site), m =
+/// 1 and 8, against a gate_p2-style packed upload.
+#[cfg(feature = "gpu")]
+fn kid_q5_1_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
+    let Table {
+        gguf,
+        q5,
+        stream,
+        w,
+        seed,
+        ..
+    } = *t;
+    let (info, bytes) = tensor_bytes(gguf, "blk.0.ffn_down.weight")?;
+    assert_eq!(info.ty, GgmlType::Q5_1, "blk.0.ffn_down type");
+    let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
+    let kb = k / 32;
+    let cols = 256 * kb.div_ceil(32) + 2 * kb;
+    let rref = DeviceTensor::upload(stream, &pack_q5_1(bytes, k, nrows)?, nrows, cols)?;
+    let DevWeight::Q5_1 { w: res, .. } = w
+        .get("blk.0.ffn_down.weight")
+        .ok_or("run_table: blk.0.ffn_down is not resident")?
+    else {
+        return Err("run_table: blk.0.ffn_down is not Q5_1".into());
+    };
+    for m in [1usize, 8] {
+        let kid = kid_q5_1(q5, stream, res, &rref, nrows, k, m, seed)?;
+        record(
+            rows,
+            format!("q5_1_m{m}"),
+            &format!("K={k} rows={nrows}"),
+            kid,
         )?;
-        let DevWeight::Q5_0 { w: res, .. } = w
-            .get("blk.1.ffn_down_exps.weight")
-            .ok_or("run_table: blk.1.ffn_down_exps is not resident")?
-        else {
-            return Err("run_table: blk.1.ffn_down_exps is not Q5_0".into());
-        };
-        let x = activations(k, SEL.len(), seed);
-        let x_dev = DeviceBuffer::from_host(stream, &x)?;
-        let mut act = Q8Blocks32::new(stream, k, SEL.len())?;
-        q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
-        let sel_dev = DeviceBuffer::from_host(stream, &SEL)?;
-        let (same, rerun, bits) = kid_q5_0_sel(q5, stream, res, &rref, &act, &sel_dev, rpe)?;
-        println!(
-            "kid row=q5_0_sel sel={SEL:?} K={k} rows_per_expert={rpe} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
-            verdict(same && rerun)
-        );
-        rows.push(("q5_0_sel".into(), bits));
-        if !(same && rerun) {
-            return Err("run_table: row q5_0_sel failed".into());
-        }
     }
+    Ok(())
+}
 
-    // Q3_K expert stack through the device-indirect gate projection, same
-    // sel, against a gate_p9-style word upload of the stack.
-    {
-        let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_gate_exps.weight")?;
-        assert_eq!(info.ty, GgmlType::Q3_K, "blk.1.ffn_gate_exps type");
-        let (k, rpe, nexp) = (
-            info.dims[0] as usize,
-            info.dims[1] as usize,
-            info.dims[2] as usize,
-        );
-        let wpm = 110 * (k / 256) / 4;
-        let words = bytes_to_words(bytes);
-        if words.len() != nexp * rpe * wpm {
-            return Err(format!(
-                "run_table: blk.1.ffn_gate_exps: {} words != {nexp}*{rpe}*{wpm}",
-                words.len()
-            )
-            .into());
-        }
-        let rref = DeviceTensor::upload(stream, &words, nexp * rpe, wpm)?;
-        let DevWeight::KQuant { w: res, .. } = w
-            .get("blk.1.ffn_gate_exps.weight")
-            .ok_or("run_table: blk.1.ffn_gate_exps is not resident")?
-        else {
-            return Err("run_table: blk.1.ffn_gate_exps is not KQuant".into());
-        };
-        let x = activations(k, 1, seed);
-        let x_dev = DeviceBuffer::from_host(stream, &x)?;
-        let mut act = Q8Act::with_k(stream, 1, k)?;
-        gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
-        stream.synchronize()?;
-        let sel_dev = DeviceBuffer::from_host(stream, &SEL)?;
-        let (same, rerun, bits) = kid_q3k_sel(gpu, stream, res, &rref, &act, &sel_dev, rpe)?;
-        println!(
-            "kid row=q3k_sel sel={SEL:?} K={k} rows_per_expert={rpe} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
-            verdict(same && rerun)
-        );
-        rows.push(("q3k_sel".into(), bits));
-        if !(same && rerun) {
-            return Err("run_table: row q3k_sel failed".into());
-        }
+/// Q5_0 expert stack through the device-indirect down projection, sel as
+/// gate_p9 used it, against a gate_p9-style packed upload of the stack.
+#[cfg(feature = "gpu")]
+fn kid_q5_0_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
+    let Table {
+        gguf,
+        q5,
+        stream,
+        w,
+        seed,
+        ..
+    } = *t;
+    let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_down_exps.weight")?;
+    assert_eq!(info.ty, GgmlType::Q5_0, "blk.1.ffn_down_exps type");
+    let (k, rpe, nexp) = (
+        info.dims[0] as usize,
+        info.dims[1] as usize,
+        info.dims[2] as usize,
+    );
+    let kb = k / 32;
+    let rref = DeviceTensor::upload(
+        stream,
+        &pack_q5_0(bytes, k, nexp * rpe)?,
+        nexp * rpe,
+        256 * kb.div_ceil(32) + kb,
+    )?;
+    let DevWeight::Q5_0 { w: res, .. } = w
+        .get("blk.1.ffn_down_exps.weight")
+        .ok_or("run_table: blk.1.ffn_down_exps is not resident")?
+    else {
+        return Err("run_table: blk.1.ffn_down_exps is not Q5_0".into());
+    };
+    let x = activations(k, SEL.len(), seed);
+    let x_dev = DeviceBuffer::from_host(stream, &x)?;
+    let mut act = Q8Blocks32::new(stream, k, SEL.len())?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+    let sel_dev = DeviceBuffer::from_host(stream, &SEL)?;
+    let kid = kid_q5_0_sel(q5, stream, res, &rref, &act, &sel_dev, rpe)?;
+    record(
+        rows,
+        "q5_0_sel".into(),
+        &format!("sel={SEL:?} K={k} rows_per_expert={rpe}"),
+        kid,
+    )?;
+    Ok(())
+}
+
+/// Q3_K expert stack through the device-indirect gate projection, same
+/// sel, against a gate_p9-style word upload of the stack.
+#[cfg(feature = "gpu")]
+fn kid_q3k_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
+    let Table {
+        gguf,
+        gpu,
+        stream,
+        w,
+        seed,
+        ..
+    } = *t;
+    let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_gate_exps.weight")?;
+    assert_eq!(info.ty, GgmlType::Q3_K, "blk.1.ffn_gate_exps type");
+    let (k, rpe, nexp) = (
+        info.dims[0] as usize,
+        info.dims[1] as usize,
+        info.dims[2] as usize,
+    );
+    let wpm = 110 * (k / 256) / 4;
+    let words = bytes_to_words(bytes);
+    if words.len() != nexp * rpe * wpm {
+        return Err(format!(
+            "run_table: blk.1.ffn_gate_exps: {} words != {nexp}*{rpe}*{wpm}",
+            words.len()
+        )
+        .into());
     }
+    let rref = DeviceTensor::upload(stream, &words, nexp * rpe, wpm)?;
+    let DevWeight::KQuant { w: res, .. } = w
+        .get("blk.1.ffn_gate_exps.weight")
+        .ok_or("run_table: blk.1.ffn_gate_exps is not resident")?
+    else {
+        return Err("run_table: blk.1.ffn_gate_exps is not KQuant".into());
+    };
+    let x = activations(k, 1, seed);
+    let x_dev = DeviceBuffer::from_host(stream, &x)?;
+    let mut act = Q8Act::with_k(stream, 1, k)?;
+    gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+    stream.synchronize()?;
+    let sel_dev = DeviceBuffer::from_host(stream, &SEL)?;
+    let kid = kid_q3k_sel(gpu, stream, res, &rref, &act, &sel_dev, rpe)?;
+    record(
+        rows,
+        "q3k_sel".into(),
+        &format!("sel={SEL:?} K={k} rows_per_expert={rpe}"),
+        kid,
+    )?;
+    Ok(())
+}
 
-    // F32 router: blk.1.ffn_gate_inp against a gate_p3-style f32 upload.
-    {
-        let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_gate_inp.weight")?;
-        assert_eq!(info.ty, GgmlType::F32, "blk.1.ffn_gate_inp type");
-        let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
-        let vals: Vec<f32> = bytes[..nrows * k * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let rref = DeviceTensor::upload(stream, &vals, nrows, k)?;
-        let DevWeight::F32 { w: res, .. } = w
-            .get("blk.1.ffn_gate_inp.weight")
-            .ok_or("run_table: blk.1.ffn_gate_inp is not resident")?
-        else {
-            return Err("run_table: blk.1.ffn_gate_inp is not F32".into());
-        };
-        for m in [1usize, 8] {
-            let (same, rerun, bits) = kid_f32(q8f32, stream, res, &rref, nrows, k, m, seed)?;
-            println!(
-                "kid row=f32_router_m{m} K={k} rows={nrows} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
-                verdict(same && rerun)
-            );
-            rows.push((format!("f32_router_m{m}"), bits));
-            if !(same && rerun) {
-                return Err(format!("run_table: row f32_router_m{m} failed").into());
-            }
-        }
+/// F32 router: blk.1.ffn_gate_inp against a gate_p3-style f32 upload.
+#[cfg(feature = "gpu")]
+fn kid_f32_router_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
+    let Table {
+        gguf,
+        q8f32,
+        stream,
+        w,
+        seed,
+        ..
+    } = *t;
+    let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_gate_inp.weight")?;
+    assert_eq!(info.ty, GgmlType::F32, "blk.1.ffn_gate_inp type");
+    let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
+    let vals: Vec<f32> = bytes[..nrows * k * 4]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let rref = DeviceTensor::upload(stream, &vals, nrows, k)?;
+    let DevWeight::F32 { w: res, .. } = w
+        .get("blk.1.ffn_gate_inp.weight")
+        .ok_or("run_table: blk.1.ffn_gate_inp is not resident")?
+    else {
+        return Err("run_table: blk.1.ffn_gate_inp is not F32".into());
+    };
+    for m in [1usize, 8] {
+        let kid = kid_f32(q8f32, stream, res, &rref, nrows, k, m, seed)?;
+        record(
+            rows,
+            format!("f32_router_m{m}"),
+            &format!("K={k} rows={nrows}"),
+            kid,
+        )?;
     }
+    Ok(())
+}
 
-    // The q8f32 format through the derived variant: layer 1's q_nope2
-    // planes, resident vs a gate_p3-style upload of the same planes. The
-    // upload's geometry comes from the MLA metadata — never from the
-    // resident tensor — so this row cannot inherit a wrong shape from the
-    // thing under test.
-    {
-        let DevWeight::Q8_0Derived { qs: rqs, d: rd, .. } = w
-            .get(&bloomery_gpu::weights::derived_name(1))
-            .ok_or("run_table: derived.blk.1.q_nope2 missing")?
-        else {
-            return Err("run_table: derived.blk.1.q_nope2 is not the derived variant".into());
-        };
-        let p = &derived.block_plan(1)?.attn.params;
-        let (nrows, k) = (p.n_head * p.latent, p.nope);
-        let (qs, d) = gate_q8_planes(derived.wk_b_all_heads(1)?);
-        let rqs_ref = DeviceTensor::upload(stream, &qs, nrows, k / 4)?;
-        let rd_ref = DeviceTensor::upload(stream, &d, nrows, k / 32)?;
-        for m in [1usize, 8] {
-            let (same, rerun, bits) =
-                kid_q8_derived(q8f32, stream, rqs, rd, &rqs_ref, &rd_ref, nrows, k, m, seed)?;
-            println!(
-                "kid row=q8_0_derived_m{m} K={k} rows={nrows} resident_vs_gate_upload_bit_identical={same} resident_rerun_bit_identical={rerun} {}",
-                verdict(same && rerun)
-            );
-            rows.push((format!("q8_0_derived_m{m}"), bits));
-            if !(same && rerun) {
-                return Err(format!("run_table: row q8_0_derived_m{m} failed").into());
-            }
-        }
+/// The q8f32 format through the derived variant: layer 1's q_nope2
+/// planes, resident vs a gate_p3-style upload of the same planes. The
+/// upload's geometry comes from the MLA metadata — never from the
+/// resident tensor — so this row cannot inherit a wrong shape from the
+/// thing under test.
+#[cfg(feature = "gpu")]
+fn kid_q8_derived_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
+    let Table {
+        q8f32,
+        stream,
+        w,
+        derived,
+        seed,
+        ..
+    } = *t;
+    let DevWeight::Q8_0Derived { qs: rqs, d: rd, .. } = w
+        .get(&bloomery_gpu::weights::derived_name(1))
+        .ok_or("run_table: derived.blk.1.q_nope2 missing")?
+    else {
+        return Err("run_table: derived.blk.1.q_nope2 is not the derived variant".into());
+    };
+    let p = &derived.block_plan(1)?.attn.params;
+    let (nrows, k) = (p.n_head * p.latent, p.nope);
+    let (qs, d) = gate_q8_planes(derived.wk_b_all_heads(1)?);
+    let rqs_ref = DeviceTensor::upload(stream, &qs, nrows, k / 4)?;
+    let rd_ref = DeviceTensor::upload(stream, &d, nrows, k / 32)?;
+    for m in [1usize, 8] {
+        let kid = kid_q8_derived(q8f32, stream, rqs, rd, &rqs_ref, &rd_ref, nrows, k, m, seed)?;
+        record(
+            rows,
+            format!("q8_0_derived_m{m}"),
+            &format!("K={k} rows={nrows}"),
+            kid,
+        )?;
     }
-
-    Ok(rows)
+    Ok(())
 }
 
 /// One K-quant gemv shape on two uploads of the same tensor, one shared

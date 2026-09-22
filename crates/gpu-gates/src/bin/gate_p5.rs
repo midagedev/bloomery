@@ -379,40 +379,27 @@ fn kvr_chain(case: &RealCase<'_>) -> Result<Vec<f32>, GateError> {
         ..
     } = dims;
     let kvr_row = find_ref_row(man, &format!("kvr-{l}"), 0)?;
-    if kvr_row.op != "CONCAT"
-        || kvr_row.ty != "f32"
-        || kvr_row.ne != [width as u64, tokens as u64, 1, 1]
-    {
-        return Err(format!(
-            "gate_p5: kvr-{l} is {} {} {:?}, want CONCAT f32 [{width}, {tokens}]",
-            kvr_row.op, kvr_row.ty, kvr_row.ne
-        )
-        .into());
-    }
+    kvr_row.expect(
+        "kvr_chain",
+        "f32",
+        [width as u64, tokens as u64, 1, 1],
+        "CONCAT",
+    )?;
     let kvr = ref_tensor_of(kvr_row)?;
     let k_rope_row = find_ref_row(man, &format!("k_rope-{l}"), 1)?;
     let kv_compressed_row = find_ref_row(man, &format!("kv_compressed-{l}"), 1)?;
-    if k_rope_row.op != "ROPE"
-        || k_rope_row.ty != "f32"
-        || k_rope_row.ne != [rope as u64, 1, tokens as u64, 1]
-    {
-        return Err(format!(
-            "gate_p5: k_rope-{l}/1 is {} {} {:?}, want ROPE f32 [{rope}, 1, {tokens}]",
-            k_rope_row.op, k_rope_row.ty, k_rope_row.ne
-        )
-        .into());
-    }
-    if kv_compressed_row.op != "FUSED_RMS_NORM"
-        || kv_compressed_row.ty != "f32"
-        || kv_compressed_row.ne != [latent as u64, tokens as u64, 1, 1]
-    {
-        return Err(format!(
-            "gate_p5: kv_compressed-{l}/1 is {} {} {:?}, want FUSED_RMS_NORM f32 \
-             [{latent}, {tokens}]",
-            kv_compressed_row.op, kv_compressed_row.ty, kv_compressed_row.ne
-        )
-        .into());
-    }
+    k_rope_row.expect(
+        "kvr_chain",
+        "f32",
+        [rope as u64, 1, tokens as u64, 1],
+        "ROPE",
+    )?;
+    kv_compressed_row.expect(
+        "kvr_chain",
+        "f32",
+        [latent as u64, tokens as u64, 1, 1],
+        "FUSED_RMS_NORM",
+    )?;
     let k_rope = ref_tensor_of(k_rope_row)?;
     let kv_compressed = ref_tensor_of(kv_compressed_row)?;
     for t in 0..tokens {
@@ -452,40 +439,27 @@ fn q_chain(case: &RealCase<'_>) -> Result<Vec<f32>, GateError> {
         ..
     } = dims;
     let q_row = find_ref_row(man, &format!("q-{l}"), 1)?;
-    if q_row.op != "CONCAT"
-        || q_row.ty != "f32"
-        || q_row.ne != [width as u64, tokens as u64, n_heads as u64, 1]
-    {
-        return Err(format!(
-            "gate_p5: q-{l}/1 is {} {} {:?}, want CONCAT f32 [{width}, {tokens}, {n_heads}]",
-            q_row.op, q_row.ty, q_row.ne
-        )
-        .into());
-    }
+    q_row.expect(
+        "q_chain",
+        "f32",
+        [width as u64, tokens as u64, n_heads as u64, 1],
+        "CONCAT",
+    )?;
     let q1 = ref_tensor_of(q_row)?;
     let q_rope_row = find_ref_row(man, &format!("q_rope-{l}"), 1)?;
     let q_nope2_row = find_ref_row(man, &format!("q_nope2-{l}"), 0)?;
-    if q_rope_row.op != "ROPE"
-        || q_rope_row.ty != "f32"
-        || q_rope_row.ne != [rope as u64, n_heads as u64, tokens as u64, 1]
-    {
-        return Err(format!(
-            "gate_p5: q_rope-{l}/1 is {} {} {:?}, want ROPE f32 [{rope}, {n_heads}, {tokens}]",
-            q_rope_row.op, q_rope_row.ty, q_rope_row.ne
-        )
-        .into());
-    }
-    if q_nope2_row.op != "MUL_MAT"
-        || q_nope2_row.ty != "f32"
-        || q_nope2_row.ne != [latent as u64, tokens as u64, n_heads as u64, 1]
-    {
-        return Err(format!(
-            "gate_p5: q_nope2-{l}/0 is {} {} {:?}, want MUL_MAT f32 \
-             [{latent}, {tokens}, {n_heads}]",
-            q_nope2_row.op, q_nope2_row.ty, q_nope2_row.ne
-        )
-        .into());
-    }
+    q_rope_row.expect(
+        "q_chain",
+        "f32",
+        [rope as u64, n_heads as u64, tokens as u64, 1],
+        "ROPE",
+    )?;
+    q_nope2_row.expect(
+        "q_chain",
+        "f32",
+        [latent as u64, tokens as u64, n_heads as u64, 1],
+        "MUL_MAT",
+    )?;
     let q_rope = ref_tensor_of(q_rope_row)?;
     let q_nope2 = ref_tensor_of(q_nope2_row)?;
     for h in 0..n_heads {
@@ -521,17 +495,12 @@ fn kqv_chain(case: &RealCase<'_>) -> Result<Vec<f32>, GateError> {
     } = *case;
     let (latent, n_heads) = (dims.latent_dims, dims.heads);
     let kqv_row = find_ref_row(man, &format!("kqv_compressed-{l}"), 0)?;
-    if kqv_row.op != "FLASH_ATTN_EXT"
-        || kqv_row.ty != "f32"
-        || kqv_row.ne != [latent as u64, n_heads as u64, tokens as u64, 1]
-    {
-        return Err(format!(
-            "gate_p5: kqv_compressed-{l} is {} {} {:?}, want FLASH_ATTN_EXT f32 \
-             [{latent}, {n_heads}, {tokens}]",
-            kqv_row.op, kqv_row.ty, kqv_row.ne
-        )
-        .into());
-    }
+    kqv_row.expect(
+        "kqv_chain",
+        "f32",
+        [latent as u64, n_heads as u64, tokens as u64, 1],
+        "FLASH_ATTN_EXT",
+    )?;
     ref_tensor_of(kqv_row)
 }
 
@@ -579,16 +548,7 @@ fn real_append(
     // exactly, so rounding back recovers ik's bits (ref_tensor_of rejects
     // the f16 label, hence the widened_f16_bits helper in the lib).
     let ik_cache_row = find_ref_row(man, &format!("kv_cache-{l}"), 0)?;
-    if ik_cache_row.ty != "f16"
-        || ik_cache_row.op != "VIEW"
-        || ik_cache_row.ne != [width as u64, 256, 1, 1]
-    {
-        return Err(format!(
-            "gate_p5: kv_cache-{l} is {} {} {:?}, want VIEW f16 [{width}, 256]",
-            ik_cache_row.op, ik_cache_row.ty, ik_cache_row.ne
-        )
-        .into());
-    }
+    ik_cache_row.expect("real_append", "f16", [width as u64, 256, 1, 1], "VIEW")?;
     let ik_bits = widened_f16_bits(ik_cache_row, tokens)?;
     let ik_cache_bits_equal = bits1[..tokens * width] == ik_bits[..];
     // The ik column is printed, not asserted (the package's gate rule): the
@@ -864,7 +824,6 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
         &mut part,
         &mut y_dev,
     )?;
-    let graph_nodes = graph.node_count();
     // The tensor-core pass's own graph, captured at the same one live
     // segment: its grid comes from the cache height and the head count, so a
     // replay must follow `n_keys_buf` across every segment boundary too.
@@ -878,7 +837,16 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
             &mut y_m,
         )
     })?;
-    let graph_m_nodes = graph_m.node_count();
+    let lines = DepthLines {
+        cache_rows: depth_rows,
+        seg,
+        segs,
+        groups: mma_groups(n_heads),
+        band,
+        mma_band,
+        graph_nodes: graph.node_count(),
+        graph_m_nodes: graph_m.node_count(),
+    };
     let mut ok = true;
     for n_keys in depth_key_counts(depth_rows) {
         n_keys_dev.copy_from_host(stream, &[n_keys as u32])?;
@@ -907,37 +875,64 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
             &y_ref,
             &s.y1,
         )?;
-        // Printed mma first, split second: the order the log has always had.
-        let pass_m = m.rel <= mma_band && m.cross <= mma_band && m.rerun_same && m.replay_same;
-        println!(
-            "shape op=flash_latent_mma_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={} band={mma_band:.3e} max_rel_err={:.3e} mma_vs_seg={:.3e} bit_identical_rerun={} graph_nodes={graph_m_nodes} replay_bit_identical={} {}",
-            mma_groups(n_heads),
-            m.rel,
-            m.cross,
-            m.rerun_same,
-            m.replay_same,
-            verdict(pass_m)
-        );
-        ok &= pass_m;
-        let pass = s.rel <= band
-            && s.one_rel <= band
-            && s.cross_rel <= band
-            && s.rerun_same
-            && s.replay_same;
-        println!(
-            "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} live_segs={} nan_pad_rows={} max_rel_err={:.3e} single_launch_rel={:.3e} split_vs_single={:.3e} bit_identical_rerun={} graph_nodes={graph_nodes} replay_bit_identical={} {}",
-            n_keys.div_ceil(seg),
-            depth_rows - n_keys,
-            s.rel,
-            s.one_rel,
-            s.cross_rel,
-            s.rerun_same,
-            s.replay_same,
-            verdict(pass)
-        );
-        ok &= pass;
+        ok &= depth_report(&lines, n_keys, &s, &m);
     }
     Ok(ok)
+}
+
+/// What the two depth verdict lines print besides one key count's results:
+/// the cache and segment geometry, the bands, and the two graphs' node
+/// counts — fixed for the whole run.
+#[cfg(feature = "gpu")]
+struct DepthLines {
+    cache_rows: usize,
+    seg: usize,
+    segs: usize,
+    groups: usize,
+    band: f32,
+    mma_band: f32,
+    graph_nodes: usize,
+    graph_m_nodes: usize,
+}
+
+/// The two verdict lines of one key count — the tensor-core pass first, the
+/// split path second, the order the log has always had — and their joint
+/// verdict. Both lines print whatever the first one says.
+#[cfg(feature = "gpu")]
+fn depth_report(p: &DepthLines, n_keys: usize, s: &SplitDepth, m: &MmaDepth) -> bool {
+    let DepthLines {
+        cache_rows: depth_rows,
+        seg,
+        segs,
+        groups,
+        band,
+        mma_band,
+        graph_nodes,
+        graph_m_nodes,
+    } = *p;
+    let pass_m = m.rel <= mma_band && m.cross <= mma_band && m.rerun_same && m.replay_same;
+    println!(
+        "shape op=flash_latent_mma_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={groups} band={mma_band:.3e} max_rel_err={:.3e} mma_vs_seg={:.3e} bit_identical_rerun={} graph_nodes={graph_m_nodes} replay_bit_identical={} {}",
+        m.rel,
+        m.cross,
+        m.rerun_same,
+        m.replay_same,
+        verdict(pass_m)
+    );
+    let pass =
+        s.rel <= band && s.one_rel <= band && s.cross_rel <= band && s.rerun_same && s.replay_same;
+    println!(
+        "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} live_segs={} nan_pad_rows={} max_rel_err={:.3e} single_launch_rel={:.3e} split_vs_single={:.3e} bit_identical_rerun={} graph_nodes={graph_nodes} replay_bit_identical={} {}",
+        n_keys.div_ceil(seg),
+        depth_rows - n_keys,
+        s.rel,
+        s.one_rel,
+        s.cross_rel,
+        s.rerun_same,
+        s.replay_same,
+        verdict(pass)
+    );
+    pass_m & pass
 }
 
 /// The split path at one key count: two eager runs, the single-block entry

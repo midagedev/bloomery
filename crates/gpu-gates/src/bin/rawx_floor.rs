@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use bloomery_gpu_gates::{
-    DEFAULT_MODEL, GateError, activations, max_rel_err, open_model, ref_dir_named, ref_gemv,
+    GateError, activations, max_rel_err, open_model, ref_dir_named, ref_gemv, ref_model_path,
     row_bytes, tensor_bytes,
 };
 use gguf::Gguf;
@@ -147,12 +147,12 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), GateError> {
-    let model = std::env::var("BLOOMERY_REF_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model = ref_model_path();
     // Pinned by name to the pre-v2 `ref_cuda` set, not steered by the
     // environment the way `ref_dir()` is (which resolves to `ref_cuda_v2`).
     let dir = ref_dir_named("ref_cuda");
     let gguf = open_model()?;
-    println!("rawx_floor: model {model}");
+    println!("rawx_floor: model {}", model.display());
     println!("rawx_floor: activations dir {}", dir.display());
     println!();
     println!(

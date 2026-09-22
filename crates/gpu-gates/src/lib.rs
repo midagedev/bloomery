@@ -55,9 +55,22 @@ pub fn exit_with(name: &str, r: Result<(), GateError>) -> std::process::ExitCode
     std::process::ExitCode::FAILURE
 }
 
+/// The model file every gate opens: `$BLOOMERY_REF_MODEL`, else
+/// [`DEFAULT_MODEL`]. `open_model` and any gate that prints the path read it
+/// here, so the printed name is the file that was opened.
+pub fn ref_model_path() -> PathBuf {
+    std::env::var("BLOOMERY_REF_MODEL").map_or_else(|_| PathBuf::from(DEFAULT_MODEL), PathBuf::from)
+}
+
+/// The data directory on the box (reference dumps, oracle binaries):
+/// `$BLOOMERY_DATA`, else the workstation default `tools/box.sh` also sets.
+pub fn data_dir() -> PathBuf {
+    std::env::var("BLOOMERY_DATA")
+        .map_or_else(|_| PathBuf::from("/root/bloomery-data"), PathBuf::from)
+}
+
 pub fn open_model() -> Result<Gguf, GateError> {
-    let path = std::env::var("BLOOMERY_REF_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    Ok(Gguf::open(path)?)
+    Ok(Gguf::open(ref_model_path())?)
 }
 
 /// `m` activation columns of `k` f32 each, concatenated. A fixed LCG mapped
@@ -213,8 +226,8 @@ impl RefRow {
     pub fn expect(&self, what: &str, ty: &str, ne: [u64; 4], op: &str) -> Result<(), GateError> {
         if self.ty != ty || self.ne != ne || (op != "in" && self.op != op) {
             return Err(format!(
-                "expect: {what}: {} is {} {:?} op {}, want {ty} {ne:?} op {op}",
-                self.name, self.ty, self.ne, self.op
+                "expect: {what}: {}/{} is {} {:?} op {}, want {ty} {ne:?} op {op}",
+                self.name, self.occurrence, self.ty, self.ne, self.op
             )
             .into());
         }
@@ -235,20 +248,19 @@ pub fn ref_dir() -> PathBuf {
     if let Ok(s) = std::env::var("BLOOMERY_REF_SET") {
         return ref_dir_named(&s);
     }
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    PathBuf::from(data).join("ref_cuda_v2")
+    data_dir().join("ref_cuda_v2")
 }
 
 /// A named dump set's directory: an absolute `set` is the directory
 /// itself, anything else is `<$BLOOMERY_DATA>/<set>` (`ref_cuda_v2`, the
-/// CPU `ref`, ...). Unlike `ref_dir` this consults no environment.
+/// CPU `ref`, ...). Unlike `ref_dir` this consults no `BLOOMERY_REF_*`
+/// variable — only the data directory.
 pub fn ref_dir_named(set: &str) -> PathBuf {
     let p = PathBuf::from(set);
     if p.is_absolute() {
         return p;
     }
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    PathBuf::from(data).join(set)
+    data_dir().join(set)
 }
 
 /// Parse the MANIFEST.tsv of the set at `dir`. Header lines start with

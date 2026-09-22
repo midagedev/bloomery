@@ -706,7 +706,7 @@ fn run() -> Result<(), GateError> {
         }
     }
 
-    norm_geometry(&mut ok)?;
+    ok &= norm_geometry()?;
 
     if !ok {
         eprintln!("FAILED: gate_p4");
@@ -730,9 +730,10 @@ fn run() -> Result<(), GateError> {
 /// kernels are written for. The width is taken from the compiled entry's own
 /// `.reqntid`, so the constant cannot drift from the block the device code
 /// was built for; the grid (one block per token) is not in the device code
-/// and stays uncovered.
+/// and stays uncovered. Returns the verdict of these lines and of
+/// [`argmax_geometry`]'s.
 #[cfg(feature = "gpu")]
-fn norm_geometry(ok: &mut bool) -> Result<(), GateError> {
+fn norm_geometry() -> Result<bool, GateError> {
     use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS};
 
     /// Loads deep a norm's row may be per thread.
@@ -741,6 +742,7 @@ fn norm_geometry(ok: &mut bool) -> Result<(), GateError> {
     const NORM_K: [usize; 2] = [2048, 512];
 
     let blob = std::fs::read(std::env::current_exe()?)?;
+    let mut ok = true;
     let shaped = RMS_THREADS % 32 == 0 && RMS_THREADS <= 1024 && RMS_WARPS == RMS_THREADS / 32;
     // Both norms share the sum of squares, so both must share its block.
     for name in ["rms_norm", "norm_quant"] {
@@ -751,9 +753,7 @@ fn norm_geometry(ok: &mut bool) -> Result<(), GateError> {
             "shape op={name} geometry block_reqntid={ntid} RMS_THREADS={RMS_THREADS} {}",
             if pass { "PASS" } else { "FAIL" }
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
     for k in NORM_K {
         let trips = k.div_ceil(RMS_THREADS);
@@ -763,11 +763,10 @@ fn norm_geometry(ok: &mut bool) -> Result<(), GateError> {
              warps={RMS_WARPS} trips_per_thread={trips} max={NORM_MAX_TRIPS} {}",
             if pass { "PASS" } else { "FAIL" }
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
-    argmax_geometry(&blob, ok)
+    ok &= argmax_geometry(&blob)?;
+    Ok(ok)
 }
 
 /// The argmax's launch geometry, the same shape assertion as the norm's and
@@ -778,7 +777,7 @@ fn norm_geometry(ok: &mut bool) -> Result<(), GateError> {
 /// drift apart; `ARGMAX_MIN_WARPS` is the residency the shape has to buy,
 /// and the trip count is what the stride actually costs at the head's width.
 #[cfg(feature = "gpu")]
-fn argmax_geometry(blob: &[u8], ok: &mut bool) -> Result<(), GateError> {
+fn argmax_geometry(blob: &[u8]) -> Result<bool, GateError> {
     use bloomery_gpu::elem::{ARGMAX_THREADS, ARGMAX_WARPS};
 
     /// Warps the argmax block must keep resident — one warp was the defect.
@@ -800,10 +799,7 @@ fn argmax_geometry(blob: &[u8], ok: &mut bool) -> Result<(), GateError> {
          trips_per_thread={trips} {}",
         if pass { "PASS" } else { "FAIL" }
     );
-    if !pass {
-        *ok = false;
-    }
-    Ok(())
+    Ok(pass)
 }
 
 /// The `x` of one PTX entry's `.reqntid x, y, z` — the block width the device

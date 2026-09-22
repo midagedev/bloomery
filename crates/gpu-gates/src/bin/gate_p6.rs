@@ -282,11 +282,11 @@ fn run() -> Result<(), GateError> {
             1.4 - 0.01 * (e - 7) as f32
         };
     }
-    synth_case(&router, stream, "tie_6th_7th", &tie, scale, &mut ok)?;
+    ok &= synth_case(&router, stream, "tie_6th_7th", &tie, scale)?;
 
     // All-equal logits: probs all 1/64, ids 0..=5 (every rank a tie).
     let flat = vec![1.25f32; N_EXPERT];
-    synth_case(&router, stream, "all_equal", &flat, scale, &mut ok)?;
+    ok &= synth_case(&router, stream, "all_equal", &flat, scale)?;
 
     // Extreme finite logits (+80 vs -80, rest moderate): exp underflows to
     // 0 for the far tail and nothing becomes non-finite.
@@ -298,7 +298,7 @@ fn run() -> Result<(), GateError> {
             _ => e as f32 * 0.25 - 7.75,
         };
     }
-    synth_case(&router, stream, "extreme_pm80", &ext, scale, &mut ok)?;
+    ok &= synth_case(&router, stream, "extreme_pm80", &ext, scale)?;
 
     // Ties filling the whole top-6 and one rank past it: experts 0..=7 share
     // the largest logit, so every one of the six ranks is decided by the tie
@@ -307,12 +307,12 @@ fn run() -> Result<(), GateError> {
     for v in tie_top.iter_mut().take(8) {
         *v = 2.0;
     }
-    synth_case(&router, stream, "tie_fills_top6", &tie_top, scale, &mut ok)?;
+    ok &= synth_case(&router, stream, "tie_fills_top6", &tie_top, scale)?;
 
     // Ties two by two across the whole range: experts 2j and 2j+1 share a
     // logit, so each rank picks the even id and the ids are 0, 2, 4, 6, 8, 10.
     let tie_pairs: Vec<f32> = (0..N_EXPERT).map(|e| -0.5 * (e / 2) as f32).collect();
-    synth_case(&router, stream, "tie_pairs", &tie_pairs, scale, &mut ok)?;
+    ok &= synth_case(&router, stream, "tie_pairs", &tie_pairs, scale)?;
 
     // `-inf` in the tail: experts 40.. are masked off entirely. Their exps
     // are exactly +0.0, so nothing becomes non-finite and the top-6 comes
@@ -321,7 +321,7 @@ fn run() -> Result<(), GateError> {
     for v in inf_tail.iter_mut().skip(40) {
         *v = f32::NEG_INFINITY;
     }
-    synth_case(&router, stream, "neg_inf_tail", &inf_tail, scale, &mut ok)?;
+    ok &= synth_case(&router, stream, "neg_inf_tail", &inf_tail, scale)?;
 
     // `-inf` inside what would have been the top-6: experts 0 and 2 are
     // masked off the head of the ranking, so the six slots must come from
@@ -333,20 +333,19 @@ fn run() -> Result<(), GateError> {
     inf_top[2] = f32::NEG_INFINITY;
     inf_top[8] = 0.5;
     inf_top[9] = 0.5;
-    synth_case(&router, stream, "neg_inf_in_top6", &inf_top, scale, &mut ok)?;
+    ok &= synth_case(&router, stream, "neg_inf_in_top6", &inf_top, scale)?;
 
     // Everything but one expert masked: that expert takes prob 1.0 and the
     // five remaining slots are an all-zero tie, so the ids are the live
     // expert followed by the five smallest masked ids.
     let mut inf_all_but_one = vec![f32::NEG_INFINITY; N_EXPERT];
     inf_all_but_one[37] = 0.0;
-    synth_case(
+    ok &= synth_case(
         &router,
         stream,
         "neg_inf_all_but_one",
         &inf_all_but_one,
         scale,
-        &mut ok,
     )?;
 
     // m = 8 (the layout bound): distinct logits per token, one exact tie in
@@ -481,8 +480,8 @@ fn run() -> Result<(), GateError> {
         ok = false;
     }
 
-    router_shape(&mut ok)?;
-    q3k_half_decode_shape(&mut ok)?;
+    ok &= router_shape()?;
+    ok &= q3k_half_decode_shape()?;
 
     // ---- lead-only timing under the machine lease
     // (`time-gate.sh gate_p6 --time-router`); correctness runs never reach
@@ -535,7 +534,8 @@ fn run() -> Result<(), GateError> {
     Ok(())
 }
 
-/// One synthetic m=1 shape, asserted against the same host reference.
+/// One synthetic m=1 shape, asserted against the same host reference;
+/// returns its verdict.
 #[cfg(feature = "gpu")]
 fn synth_case(
     router: &bloomery_gpu::router::RouterKernels,
@@ -543,8 +543,7 @@ fn synth_case(
     name: &str,
     logits: &[f32],
     scale: f32,
-    ok: &mut bool,
-) -> Result<(), GateError> {
+) -> Result<bool, GateError> {
     use bloomery_gpu_gates::{max_rel_err, route_ref};
 
     const BAND: f32 = 1e-6;
@@ -562,10 +561,7 @@ fn synth_case(
         digest(&out.probs, &out.ids, &out.weights),
         verdict(pass)
     );
-    if !pass {
-        *ok = false;
-    }
-    Ok(())
+    Ok(pass)
 }
 
 /// The host reference's input for a case carrying `-inf` logits.
@@ -638,7 +634,7 @@ fn eat(mut h: u64, bytes: &[u8]) -> u64 {
 /// and is pinned with it, because an assertion on one would not catch the
 /// other being reverted.
 #[cfg(feature = "gpu")]
-fn router_shape(ok: &mut bool) -> Result<(), GateError> {
+fn router_shape() -> Result<bool, GateError> {
     use bloomery_gpu::q8f32::LANE_UNROLL;
     use bloomery_gpu::router::ROUTER_THREADS;
 
@@ -654,6 +650,7 @@ fn router_shape(ok: &mut bool) -> Result<(), GateError> {
     let gemv_fma_floor = GEMV_COLS + LANE_UNROLL;
 
     let blob = std::fs::read(std::env::current_exe()?)?;
+    let mut ok = true;
     for name in ["f32_gemv", "q8_0_gemv"] {
         let c = bloomery_gpu_gates::ptx::counts(&blob, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
@@ -665,9 +662,7 @@ fn router_shape(ok: &mut bool) -> Result<(), GateError> {
             c.depot,
             verdict(pass)
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
     for name in ["router_topk", "expert_table"] {
         let c = bloomery_gpu_gates::ptx::counts(&blob, name)
@@ -684,11 +679,9 @@ fn router_shape(ok: &mut bool) -> Result<(), GateError> {
             c.st_local,
             verdict(pass)
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
-    Ok(())
+    Ok(ok)
 }
 
 /// The Q3_K gemvs decode their super-block scale with the hardware's
@@ -711,8 +704,9 @@ fn router_shape(ok: &mut bool) -> Result<(), GateError> {
 /// alone — `clz` reappears in both Q3_K entries and the hardware convert
 /// goes — while the control arm and every bit-identity gate stay green.
 #[cfg(feature = "gpu")]
-fn q3k_half_decode_shape(ok: &mut bool) -> Result<(), GateError> {
+fn q3k_half_decode_shape() -> Result<bool, GateError> {
     let blob = std::fs::read(std::env::current_exe()?)?;
+    let mut ok = true;
     let counts = |name: &str| -> Result<(usize, usize), GateError> {
         let b = bloomery_gpu_gates::ptx::body(&blob, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
@@ -728,9 +722,7 @@ fn q3k_half_decode_shape(ok: &mut bool) -> Result<(), GateError> {
             "shape op={name} clz={clz} want=0 cvt_f32_f16={cvt} want>=1 {}",
             verdict(pass)
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
     for name in ["q4k_gemv", "q6k_gemv"] {
         let (clz, cvt) = counts(name)?;
@@ -740,11 +732,9 @@ fn q3k_half_decode_shape(ok: &mut bool) -> Result<(), GateError> {
              cvt_f32_f16={cvt} {}",
             verdict(pass)
         );
-        if !pass {
-            *ok = false;
-        }
+        ok &= pass;
     }
-    Ok(())
+    Ok(ok)
 }
 
 /// The router on resident-free (fresh) buffers, run twice: the outputs of

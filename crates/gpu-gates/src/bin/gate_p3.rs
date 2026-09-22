@@ -62,7 +62,7 @@ fn run() -> Result<(), GateError> {
         let x = bloomery_gpu_gates::activations(2048, m, 3);
         let y_ref = bloomery_gpu_gates::ref_gemv(GgmlType::F32, w_bytes, 2048, 64, &x, m)?;
         let (rel, bit_same) = run_f32(&kernels, stream, &w_dev, 64, m, &x, &y_ref)?;
-        report("f32", 2048, 64, m, rel, bit_same, BAND, &mut all_ok);
+        all_ok &= report("f32", 2048, 64, m, rel, bit_same, BAND);
     }
 
     // F32, synthetic shape (K=512, rows=1000): weights from the shared LCG.
@@ -72,7 +72,7 @@ fn run() -> Result<(), GateError> {
         let x = bloomery_gpu_gates::activations(512, m, 11);
         let y_ref = ref_f64_dot(&w_synth, 512, &x, m);
         let (rel, bit_same) = run_f32(&kernels, stream, &w_synth_dev, 1000, m, &x, &y_ref)?;
-        report("f32", 512, 1000, m, rel, bit_same, BAND, &mut all_ok);
+        all_ok &= report("f32", 512, 1000, m, rel, bit_same, BAND);
     }
 
     // Q8_0: weights quantized here from LCG rows, reference = the
@@ -91,7 +91,7 @@ fn run() -> Result<(), GateError> {
             let x = bloomery_gpu_gates::activations(k, m, x_seed);
             let y_ref = ref_f64_dot(&deq, k, &x, m);
             let (rel, bit_same) = run_q8(&kernels, stream, &qs_dev, &d_dev, rows, m, &x, &y_ref)?;
-            report("q8_0", k, rows, m, rel, bit_same, BAND, &mut all_ok);
+            all_ok &= report("q8_0", k, rows, m, rel, bit_same, BAND);
         }
 
         // Eager vs captured-graph byte identity, once per Q8_0 shape: the
@@ -119,13 +119,14 @@ fn run() -> Result<(), GateError> {
             "graph gate: type=q8_0 K={k} rows={rows} m=8 eager_vs_graph_bit_identical={identical} nodes={}",
             graph.node_count()
         );
-        if !identical || graph.node_count() != 1 {
+        let pass = identical && graph.node_count() == 1;
+        if !pass {
             eprintln!(
                 "FAIL: graph gate K={k} rows={rows}: identical={identical} nodes={}",
                 graph.node_count()
             );
-            all_ok = false;
         }
+        all_ok &= pass;
     }
 
     if !all_ok {
@@ -185,27 +186,19 @@ fn run_q8(
     Ok((bloomery_gpu_gates::max_rel_err(&y1, y_ref)?, bit_same))
 }
 
-/// One shape line and its verdict.
+/// One shape line; returns its verdict (a FAIL also goes to stderr).
 #[cfg(feature = "gpu")]
-fn report(
-    ty: &str,
-    k: usize,
-    rows: usize,
-    m: usize,
-    rel: f32,
-    bit_same: bool,
-    band: f32,
-    all_ok: &mut bool,
-) {
+fn report(ty: &str, k: usize, rows: usize, m: usize, rel: f32, bit_same: bool, band: f32) -> bool {
     println!(
         "shape type={ty} K={k} rows={rows} m={m} max_rel_err={rel:.3e} bit_identical_rerun={bit_same}"
     );
-    if rel > band || !bit_same {
+    let fail = rel > band || !bit_same;
+    if fail {
         eprintln!(
             "FAIL: {ty} K={k} rows={rows} m={m}: rel {rel:.3e} (band {band:.0e}), bit_identical_rerun={bit_same}"
         );
-        *all_ok = false;
     }
+    !fail
 }
 
 // ------------------------------------------------- local Q8_0 quantizer

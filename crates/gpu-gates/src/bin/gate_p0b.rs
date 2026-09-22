@@ -487,9 +487,9 @@ fn run() -> Result<(), GateError> {
             Ok(())
         }
 
-        let mut run_op_key = |kv_s: &mut DeviceBuffer<f32>,
-                              kvr: &mut DeviceBuffer<f32>,
-                              cache: &mut DeviceTensor<u16>|
+        let run_op_key = |kv_s: &mut DeviceBuffer<f32>,
+                          kvr: &mut DeviceBuffer<f32>,
+                          cache: &mut DeviceTensor<u16>|
          -> Result<(), bloomery_gpu::GpuError> {
             key_op(
                 &gpu,
