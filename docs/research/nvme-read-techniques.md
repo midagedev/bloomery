@@ -50,12 +50,12 @@ B3가 남긴 숫자(rig-log 09-22-p: 토큰당 310 µs, 그중 발행 209 µs)�
 | 기법 | 6.8 | 발행 | 폴트 | 확대 | 캐시 오염 | 근거 | 판정 |
 |---|---|---|---|---|---|---|---|
 | 헬퍼 스레드 선행 + 사본 소비 | 필요 없음 | 스텝에서 −221 | 스텝에서 −90 | — | — | 우리 팔 + AGENTS.md 직렬 시간 규칙 | **B3b 첫 팔** |
-| `MADV_POPULATE_READ`(5.14) | ✅ | 같음 | −90(터치 없이 채움) | — | — | madvise(2) | 동기라 헬퍼 위에서만; B3b 둘째 팔 |
+| `MADV_POPULATE_READ`(5.14) | ✅ | 같음 | 유저 트랩만 없앤다(폴트당 ~0.5–1 µs, 추정) | — | — | madvise(2) | 동기다: `MADV_RANDOM` 아래 단독으로 쓰면 페이지마다 디바이스 왕복(48 × 92 ≈ 4.4 ms) — `WILLNEED` 뒤에, 헬퍼 위에서만; B3b 둘째 팔 |
 | `io_uring` `O_DIRECT` `READ_FIXED` `DEFER_TASKRUN` | ✅ | 221 → 19–144 | → 0 | 16 → ~2.9(파생) | **0** | Haas & Leis PVLDB'23; arXiv 2512.04859 | **B3c**, 크레이트 `io-uring` |
 | 둘째 드라이브(980 PRO 2 TB)에 복제 | ✅ | — | — | — | — | Haas Fig. 2a 드라이브 수에 선형 | p99용, B3c 뒤 |
 | 핫 행 DRAM 캐시(빈도) | ✅ | 미스율에 비례 | 같음 | — | +수 GB | Engram §다층 캐시; Engram-Nine 55 %; FlashEmbedding 1 % | **B3d 계측 뒤** |
 | `process_madvise` 48범위 | ✅이나 **`CAP_SYS_NICE` 무조건**(6.13에서야 자기 면제) | −40 상한 | — | — | — | v6.8 `mm/madvise.c:1500`(리드 확인) | 안 함 |
-| `IORING_OP_MADVISE`/`FADVISE(WILLNEED)` | 있으나 **무조건 io-wq**(`REQ_F_FORCE_ASYNC`) | +7.3 µs × 48(악화) | — | — | — | v6.8 `io_uring/advise.c:42`(리드 확인); io-wq 7.3 µs는 2512.04859 | **하지 않는다** |
+| `IORING_OP_MADVISE`/`FADVISE(WILLNEED)` | 있으나 **무조건 io-wq**(`REQ_F_FORCE_ASYNC`) | 총비용 +7.3 µs × 48(악화); 스텝 스레드 축에서도 명시적 헬퍼가 제어·비용 모두 우세 | — | — | — | v6.8 `io_uring/advise.c:42`(리드 확인); io-wq 7.3 µs는 2512.04859 | **하지 않는다** |
 | NVMe 패스스루 `URING_CMD` `/dev/ng0n1`(5.19) | ✅ | 조금 더 | — | — | — | FAST'24 Joshi et al.; LPC 2022 | FIEMAP로 익스텐트를 직접 풀어야 함 — 아니오 |
 | SQPOLL / IOPOLL | ✅ / 부트 파라미터 | +30 µs 깨움 / — | | | | 2512.04859 §2.2; io_uring_setup(2) | 아니오 |
 | `RWF_DONTCACHE` | **6.14** | | | | 0 | LWN 997548 | 커널 올리면 재고 |
@@ -98,10 +98,10 @@ B3가 남긴 숫자(rig-log 09-22-p: 토큰당 310 µs, 그중 발행 209 µs)�
 ## 계획에 남는 것
 
 - **B3b**(새 의존성 없음, 반나절): `engram-rate`에 팔 셋 — ① 헬퍼 스레드가 `WILLNEED`+터치, 스텝 스레드는 플래그 대기,
-  두 스레드의 시간을 따로 찍는다 ② 헬퍼가 `MADV_POPULATE_READ`로 채우고 사본 13,056 B로 복사, 스텝은 memcpy만
+  두 스레드의 시간을 따로 찍는다 ② 헬퍼가 `WILLNEED` 48 뒤 `MADV_POPULATE_READ` 48로 채우고 사본 13,056 B로 복사, 스텝은 memcpy만
   ③ 사본 소비를 `Site::rows_into`의 기본 경로로. **예측**: 스텝 스레드 몫 310 → 1–5 µs(memcpy + 동기화), 헬퍼 몫 ~310 µs
-  (①) / ~220 µs(②, 폴트 90이 사라짐) — 둘 다 다른 코어. 이 팔이 먼저인 이유는 B3c가 "무엇을 위해 있는가"를 바꾸기 때문.
-- **B3c**(`io-uring` 크레이트, 하루): `O_DIRECT` 열기, 48 × 4 KiB 정렬 고정 버퍼, `READ_FIXED` 48개를 `enter` 한 번,
+  (①) / ~260–300 µs(②, 폴트당 유저 트랩만 사라진다) — 둘 다 다른 코어. 이 팔이 먼저인 이유는 B3c가 "무엇을 위해 있는가"를 바꾸기 때문.
+- **B3c**(`io-uring` 크레이트, 하루): `O_DIRECT` 열기, 48 × 8 KiB 정렬 고정 버퍼(행의 6.25 %가 페이지 경계를 넘는다), `READ_FIXED` 48개를 `enter` 한 번,
   `DEFER_TASKRUN|SINGLE_ISSUER`, 헬퍼 스레드 위. 같은 라운드에 fio 512 B 대 4 KiB QD1 팔과 `/sys/block` 증인. **예측**:
   헬퍼 CPU 220 → 19–144 µs, 페이지 캐시 증가 0(`buff/cache` 델타로 증인).
 - **B3d**(실제 해시 뒤): 실 토큰 스트림 10만 토큰에서 사이트·차수별 distinct 행 수와 재사용률. 결과가 Zipf 꼴이면 수 GB
