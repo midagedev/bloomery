@@ -1,4 +1,4 @@
-//! `GpuModel<B>` — the GPU engine that stands beside `forward::step`
+//! `GpuModel<B>` — the GPU engine; an architecture's CPU `forward::step` is its reference
 //! (docs/gpu-design.md decisions 1 and 7). Weights and everything a step
 //! touches live on the device from `load`, split into stages by layer range;
 //! `step` enqueues one decode step stage by stage and synchronizes once for

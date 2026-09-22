@@ -96,7 +96,14 @@ dispatch=(
   # 디스패치가 아닌 유일한 항목: 하네스의 기본 참조 세트. ref_dir 가 Arch 를 받기 전까지 남는다.
   'crates/gpu-gates/src/lib\.rs:[0-9]+:[[:space:]]*data_dir\(\)\.join\(oracle::deepseek2::ORACLE\.cuda_set\)$'
 )
-archpath=$(grep -rnE '\b(deepseek2|deepseek41)::' crates/*/src --include='*.rs' 2>/dev/null \
+# 세 모양을 본다: 경로 안의 `deepseek2::…`, 모듈을 통째로 들여오거나 재수출하는 use 줄
+# (`use …::arch::deepseek2 as x;`, `pub use …::deepseek2;` — 뒤에 `::`가 없어 첫 모양에 안 걸린다),
+# 그리고 rustfmt가 여러 줄로 나눈 `use …::{`의 한 줄에 모듈 이름만 남은 것(`    deepseek2,`).
+archpath=$({ grep -rnE '\b(deepseek2|deepseek41)::' crates/*/src --include='*.rs' 2>/dev/null
+             grep -rnE '^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?use[[:space:]][^;]*\b(deepseek2|deepseek41)\b' \
+               crates/*/src --include='*.rs' 2>/dev/null
+             grep -rnE '^[[:space:]]*(deepseek2|deepseek41)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*$' \
+               crates/*/src --include='*.rs' 2>/dev/null; } | sort -u \
   | grep -vE '^crates/[^/]+/src/arch/' \
   | grep -vE '^crates/gpu-gates/src/bin/' \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)

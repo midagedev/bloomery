@@ -320,10 +320,15 @@ crates carry 33 (model 16, qdot 13, gguf 4). 63 are
 `undocumented_unsafe_blocks` (q3k-gemv 49, q3k-cpu 10, qdot 4), kept at `warn`;
 MUL-10 ratchets it to `deny`. New engine code should not add to that count.
 
-No `RUSTFLAGS`/`.cargo/config` enables AVX2 globally: every kernel's
-`#[target_feature]` is load-bearing. A helper that touches `_mm*` intrinsics
-is either `#[inline(always)]` (it inherits the caller's features) or carries
-the attribute itself; with neither it compiles and runs tens of times slower.
+~~No `RUSTFLAGS`/`.cargo/config` enables AVX2 globally: every kernel's
+`#[target_feature]` is load-bearing.~~ Corrected 2026-09-23: `.cargo/config.toml`
+has set `-C target-cpu=znver3` for `x86_64-unknown-linux-gnu` since `48fc38c`
+(2026-09-20), so every box build compiles with AVX2 and FMA on. The attributes
+stay — they are what keeps a kernel right in a build without that config
+(another target, a `RUSTFLAGS` override). A helper that touches `_mm*`
+intrinsics is either `#[inline(always)]` (it inherits the caller's features)
+or carries the attribute itself; with neither it runs tens of times slower in
+any build without the config — on the box the config now hides that mistake.
 
 Compile-time levers in `q3k-cpu` are `const` values with dead branches behind
 them; MUL-11 converts them to `#[cfg(feature)]` so the on-side also compiles.

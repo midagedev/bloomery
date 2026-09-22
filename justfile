@@ -34,7 +34,7 @@ fmt-check:
 check-recipes:
     ./tools/check-recipes.sh
 
-# 아키텍처 축 점검(맥, grep뿐) — docs/arch-split.md 「검사」. 셋 다 엄격하다.
+# 아키텍처 축 점검(맥, grep뿐) — docs/arch-split.md 「검사」. 넷 다 엄격하다.
 check-arch:
     bash tools/check-arch.sh
 

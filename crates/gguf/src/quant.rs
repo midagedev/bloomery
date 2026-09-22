@@ -619,6 +619,7 @@ pub fn quantize_activations(weight: GgmlType, x: &[f32], out: &mut [f32]) {
 pub struct Q8Block {
     /// f16 bits of the block scale (convert with `half_to_f32`).
     pub d: u16,
-    /// The int8 codes, `[-127, 127]`.
+    /// The int8 codes: any i8. A weight code of -128 is legal; only activation codes are
+    /// held to [-127, 127] (the DOMAIN note in qdot's Q8_0 x Q8_0 kernel).
     pub q: [i8; 32],
 }

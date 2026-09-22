@@ -1,9 +1,11 @@
-//! DeepSeek-V2-Lite forward pass — the stage-1 model crate.
+//! The CPU engine: the shared modules (`ops`, `ffn`, `moe`, `head`, `kv`, `profile`) and,
+//! under `arch/`, one module per model architecture — `arch::deepseek2` holds
+//! DeepSeek-V2-Lite's `attn`, `derived` and `forward`.
 //!
-//! The module boundaries here are the parallel work boundaries: each of `attn`, `ffn`,
-//! `moe` and `head` is written and gated against `$BLOOMERY_DATA/ref/` independently, and
-//! `forward` in this file only wires them. Nothing reads another module's output during
-//! development, because the oracle already holds every intermediate (see `docs/oracle.md`).
+//! The module boundaries are the parallel work boundaries: each op module is written and
+//! gated against the oracle set (`$BLOOMERY_DATA/ref/`) independently, and an architecture's
+//! `forward` only wires them. Nothing reads another module's output during development,
+//! because the oracle already holds every intermediate (see `docs/oracle.md`).
 //!
 //! Three shapes are fixed here on purpose, because `docs/research/quant-decode-efficiency.md`
 //! §Q6 marks them as decisions that cannot be retrofitted:

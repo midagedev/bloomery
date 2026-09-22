@@ -42,7 +42,7 @@ impl HeadPlan {
 ///
 /// `x` is the final block's output `[embd, n_tokens]`; the result is
 /// `[vocab, n_tokens]`, where the vocab axis is `output.weight`'s own width — the
-/// gate checks it against `deepseek2.vocab_size` from the file, never a literal.
+/// gate checks it against the architecture's `vocab_size` key from the file, never a literal.
 ///
 /// Resolves the head plan per call — the direct-call path; a decode step hands
 /// the plan its architecture built at load to [`head_with`]. `eps` is the final
