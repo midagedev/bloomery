@@ -3,7 +3,7 @@
 2026-09-22 밤. 지금 트리는 모델이 하나(DeepSeek-V2-Lite, GGUF `general.architecture` = `deepseek2`)라
 모델을 아는 코드와 모르는 코드가 한 파일에 섞여 있어도 아무것도 아프지 않았다. V4.1-Flash(`deepseek41`)가
 들어오면 그 섞임이 값을 받는다 — B1·B2·B4·B5가 전부 `gpu/model.rs`·`gpu/model/dispatch.rs`·`gpu/weights.rs`·
-`model/derived.rs`를 지나고, 그 파일들은 V2-Lite의 게이트 15개가 증명하는 파일이다. 나누지 않으면 V4.1 라운드마다
+`model/derived.rs`를 지나고, 그 파일들은 V2-Lite의 게이트 ~~15개~~ 16개가 증명하는 파일이다. 나누지 않으면 V4.1 라운드마다
 증명이 "V2-Lite 게이트 전부 초록"이 되고, 두 모델의 불변식이 한 함수 안에서 `if`로 갈린다.
 
 이 문서는 **무엇을 어디에 두는가**를 정하고, 그 이동을 라운드로 자른다. V4.1 코드는 여기서 한 줄도 쓰지 않는다.
@@ -38,7 +38,7 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
 | 헤드 | `output_norm` + `output`, eps는 `mla.eps` | 같음 + 마지막 FFN의 `pre`로 스트림을 접는 마지막 접기 | **거의 공유** — 접기는 사슬 끝에서, `Head`는 eps를 계획에서 받는다 |
 | 파생 가중치 | `wk_b`의 Q8_0 재양자화(`Derived`, 로드 시 CPU) | 알려진 것 없음(hc `comb`·층 종류별 rope 표는 후보 — B4가 정한다) | **아키텍처 계획** |
 | 가중치 형식 | `DevWeight`: K-quant(Q3/Q4/Q6)·Q5_0·Q5_1·F32 + 파생 Q8_0. **파일 텐서로서의 Q8_0 팔이 없고, BF16이 없고, Q5_K는 `weights.rs`의 `resident_size`·`upload_file_tensor`가 거부** | q8_0 **332개(216 GB)**, bf16 45개, q5_K 2개(인벤토리 `## types`) | **공유 크레이트의 일**(B1의 이웃) — 아키텍처가 아니다 |
-| 오라클·탭 | `$BLOOMERY_DATA/ref_cuda`(ik main CUDA 덤프), 탭 `l_out-N`·MLA 중간, `gpu-gates/lib.rs`의 `DEFAULT_MODEL` 상수 | 오라클 v3(B0c, V4.1 포트에서), 정수 일치 탭 셋(engram 행 id·인덱서 top-k·라우터 top-6) + `l_out` | **표** — `gpu-gates/src/oracle/<name>.rs`(디렉터리·매니페스트·탭 이름), 하네스는 공유 |
+| 오라클·탭 | `$BLOOMERY_DATA/ref_cuda`(ik main CUDA 덤프), 탭 `l_out-N`·MLA 중간, ~~`gpu-gates/lib.rs`의 `DEFAULT_MODEL` 상수~~ 모델 경로는 도구 프로필의 것(`tools/box.sh`가 `BLOOMERY_REF_MODEL`로 export — M3, `db7dd30`) | 오라클 v3(B0c, V4.1 포트에서), 정수 일치 탭 셋(engram 행 id·인덱서 top-k·라우터 top-6) + `l_out` | **표** — `gpu-gates/src/oracle/<name>.rs`(디렉터리·매니페스트·탭 이름), 하네스는 공유 |
 | 참조 엔진·도구 | ik `main`, `-mla 3 -fa 1 -fmoe 1`, `prompts.tsv`, `ref-paths.sh`의 `MODEL` 기본값 | **다른 트리** — 우리 V4.1 포트(#2455, `~/repo/upstream/v41-ports/mine`), 다른 플래그, 다른 프롬프트·PPL 셋 | **표** — `tools/ref/models/<name>.sh`, `BLOOMERY_MODEL`로 고른다. 증인 블록이 카드처럼 **모델 이름**을 찍고, 두 모델의 숫자는 한 표에 놓지 않는다 |
 | 바이너리 | `generate`·`gate_e2e`·`bloomery-decode`가 `GpuModel`/`forward::step`을 직접 부른다 | 같은 바이너리 | 열 때 `general.architecture`를 **한 곳**에서 읽어 `AnyEngine` 팔을 고른다. 모르는 값은 그 문자열을 든 오류 한 줄(exit 1) |
 
@@ -177,7 +177,7 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
   ③ `general.architecture`를 읽는 자리는 `arch/mod.rs` 하나다
 - 커널 파일은 모델 이름을 모른다(결정 6) — ②가 `crates/gpu/src/*.rs`에도 걸린다.
 - 이관 라운드의 증명은 전부 「Derive first」의 **이동 클래스**다: `just ptx-scan` 표 동일(`gate_p5`·`gate_p8` 54행),
-  그래프 노드 수 불변(지금 648), eager = replay, e2e 집합 동일(두 패스), CPU 게이트 레시피 전부·GPU 게이트 15개
+  그래프 노드 수 불변(지금 648), eager = replay, e2e 집합 동일(두 패스), CPU 게이트 레시피 전부·GPU 게이트 ~~15개~~ 16개
   초록, lint 수는 오르지 않는다. 시간은 재지 않는다 — 스텝의 호스트 코드가 그래프 모드에서 스텝당 0회 도는 것은
   gpucast에서 이미 세운 논거다.
 
@@ -189,8 +189,8 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
 |---|---|---|---|---|---|
 | S0 | **스파이크 — 크레이트 밖 디바이스 코드**: 새 크레이트에 `#[cuda_module]` 하나, `bloomery_gpu::cores::q3k_row_dot`(`pub`으로)을 부르는 래퍼 하나. `cargo oxide`가 빌드하는가, PTX가 크레이트 안 래퍼와 동일한가(`ptx-scan`), `.oxart` 멤버 둘이 한 게이트 바이너리에 링크되는가, `cargo oxide build` 시간의 차(전·후 각 3회) | 새 `crates/gpu-xcrate-spike`(머지하지 않음), `cores.rs` 가시성 한 줄 | 셋에 대한 답 + 시간 표. 실패면 `docs/upstream/nvlabs-ledger.md`에 한 줄 먼저 | — | S |
 | M1 | **`crates/model`의 arch 이관**: `attn.rs`·`derived.rs`·`forward.rs`가 `arch/deepseek2/`로, `kv.rs`는 슬롯 표·`KvRows`만 남기고 폭은 계획에서, `arch/mod.rs`의 `Arch::detect`, `MlaParams::read`의 f32 리터럴 넷 → `arch_get_f32`(`gguf`) | `crates/model/src/**`, `crates/gguf/src/lib.rs`(getter 한 개), `crates/gpu`·`gpu-gates`는 **`use` 줄만** | CPU 게이트 레시피 전부 동일, `gate-derived` 바이트 동일, `gate-alloc` 수 동일, lint 불상승, `check-arch` 초록 | — | S~M |
-| M2 | **`crates/gpu`의 arch 이관**: `GpuModel<B: ChainBody>`, `Residency<B>`, `dispatch`·`scratch`·`names`·`seed`·`lookup`·`kernels`·`model/probe`가 `arch/deepseek2/`로, `mla`·`moe` 필드가 `Body` 안으로, `Head`의 eps는 `head_eps()`에서 | `crates/gpu/src/model.rs`, `crates/gpu/src/model/**` → `arch/deepseek2/**`, `lib.rs`의 `mod`·`pub use` 줄 | `ptx-scan` 54행 동일, 648노드, eager = replay, e2e 집합 동일(두 패스), GPU 게이트 15개, lint 불상승 | M1 | M — **`model.rs`를 만지는 라운드라 한 시점에 하나** |
-| M3 | **게이트·바이너리**: `gpu-gates/src/oracle/deepseek2.rs`(디렉터리·매니페스트·탭 이름 표), `DEFAULT_MODEL` 상수 → 도구 프로필이 주는 경로, `generate`·`gate_e2e`·`bloomery-decode`가 `AnyEngine` 위에서, 모르는 아키텍처는 오류 한 줄 exit 1 | `crates/gpu-gates/src/**`, `crates/model/src/bin/bloomery-decode.rs` | 게이트 15개 출력 줄 동일; **FAIL-first**: V4.1 파일을 `generate`에 주면 지금은 어디서 어떻게 죽는지 기록 → 뒤에는 `unsupported architecture "deepseek41"` 한 줄 | M2 | S |
+| M2 | **`crates/gpu`의 arch 이관**: `GpuModel<B: ChainBody>`, `Residency<B>`, `dispatch`·`scratch`·`names`·`seed`·`lookup`·`kernels`·`model/probe`가 `arch/deepseek2/`로, `mla`·`moe` 필드가 `Body` 안으로, `Head`의 eps는 `head_eps()`에서 | `crates/gpu/src/model.rs`, `crates/gpu/src/model/**` → `arch/deepseek2/**`, `lib.rs`의 `mod`·`pub use` 줄 | `ptx-scan` 54행 동일, 648노드, eager = replay, e2e 집합 동일(두 패스), GPU 게이트 ~~15개~~ 16개, lint 불상승 | M1 | M — **`model.rs`를 만지는 라운드라 한 시점에 하나** |
+| M3 | **게이트·바이너리**: `gpu-gates/src/oracle/deepseek2.rs`(디렉터리·매니페스트·탭 이름 표), `DEFAULT_MODEL` 상수 → 도구 프로필이 주는 경로, `generate`·`gate_e2e`·`bloomery-decode`가 `AnyEngine` 위에서, 모르는 아키텍처는 오류 한 줄 exit 1 | `crates/gpu-gates/src/**`, `crates/model/src/bin/bloomery-decode.rs` | 게이트 ~~15개~~ 16개 출력 줄 동일; **FAIL-first**: V4.1 파일을 `generate`에 주면 지금은 어디서 어떻게 죽는지 기록 → 뒤에는 `unsupported architecture "deepseek41"` 한 줄 | M2 | S |
 | M4 | **도구 프로필**: `tools/ref/models/deepseek2.sh`(MODEL·IK 트리·플래그·프롬프트·PPL 셋·오라클 디렉터리), `ref-paths.sh`가 `BLOOMERY_MODEL`(기본 deepseek2)로 소스, 증인 블록이 모델 이름을 찍음, `check-arch.sh` 신설 | `tools/ref/**`, `tools/check-arch.sh`, `justfile` 레시피 한 줄 | 빈 환경에서 해석값 바이트 동일(tools6의 방법), `build-ref` md5 동일, shellcheck 불상승 | — | S |
 
 **파동**: {S0 ‖ M1 ‖ M4} → {M2} → {M3}. 첫 파동 셋은 파일이 겹치지 않는다(새 크레이트 / `crates/model` /
