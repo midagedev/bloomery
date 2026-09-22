@@ -70,13 +70,24 @@ struct View<'a> {
 }
 
 fn view<'a>(t: &'a TensorInfo, expert: Option<usize>) -> Res<View<'a>> {
-    let k = t.dims[0] as usize;
-    let rows = t.dims[1] as usize;
+    let &[k, rows, ..] = t.dims.as_slice() else {
+        return Err(format!("exact_ref: {} is {:?}, want [K, rows, ..]", t.name, t.dims).into());
+    };
+    let (k, rows) = (k as usize, rows as usize);
     let blck = t.ty.blck_size().ok_or("exact_ref: unsupported type")? as usize;
     let tsz = t.ty.type_size().ok_or("exact_ref: unsupported type")? as usize;
     let row_bytes = k / blck * tsz;
     let offset = match expert {
-        Some(e) => e * rows * row_bytes,
+        Some(e) => {
+            // A 2-D tensor is a stack of one.
+            let n = t.dims.get(2).copied().unwrap_or(1);
+            if e as u64 >= n {
+                return Err(
+                    format!("exact_ref: {} holds {n} experts, want expert {e}", t.name).into(),
+                );
+            }
+            e * rows * row_bytes
+        }
         None => 0,
     };
     Ok(View {

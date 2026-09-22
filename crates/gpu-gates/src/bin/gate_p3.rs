@@ -52,8 +52,10 @@ fn run() -> Result<(), GateError> {
         Some(&[2048, 64]),
     )?;
     let w_router: Vec<f32> = w_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let w_dev = DeviceTensor::upload(stream, &w_router, 64, 2048)?;
     for m in [1usize, 8] {
@@ -287,7 +289,7 @@ fn nearest_int(fval: f32) -> i32 {
 /// bits the kernel reconstructs).
 #[cfg(feature = "gpu")]
 fn quant_q8_0_row(x: &[f32], qs: &mut Vec<u32>, d: &mut Vec<f32>, deq: &mut Vec<f32>) {
-    for blk in x.chunks_exact(32) {
+    for blk in x.as_chunks::<32>().0 {
         let mut amax = 0.0f32;
         for &v in blk {
             amax = amax.max(v.abs());

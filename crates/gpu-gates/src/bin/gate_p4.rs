@@ -107,6 +107,9 @@ fn run() -> Result<(), GateError> {
         )
         .into());
     }
+    if let Some(&id) = PROMPT.iter().find(|&&id| id as usize >= vocab) {
+        return Err(format!("prompt id {id} is past token_embd.weight's {vocab} rows").into());
+    }
     let emb_dev = DeviceTensor::upload(stream, &emb_words, vocab, 220)?;
     let m = PROMPT.len();
     let ids_dev = DeviceBuffer::from_host(stream, &PROMPT)?;

@@ -59,9 +59,10 @@ fn run() -> Result<(), GateError> {
     use bloomery_gpu::router::{N_EXPERT, N_USED, RouterKernels};
     use bloomery_gpu_gates::{
         find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of, route_ref,
-        tensor_bytes, topk_ids_logical,
+        tensor_bytes_as, topk_ids_logical,
     };
     use cuda_core::DeviceBuffer;
+    use gguf::quant::GgmlType;
 
     // Router weights band: device `exp` vs host libm differ by at most a few
     // ulp, and everything else in the chain is bit-mirrored, so a correct
@@ -94,21 +95,22 @@ fn run() -> Result<(), GateError> {
         .and_then(|v| v.as_f32())
         .unwrap_or(1.0);
 
-    // Rows per expert of the three stacks the offset table addresses.
-    let (gate_info, _) = tensor_bytes(&gguf, "blk.1.ffn_gate_exps.weight")?;
-    let (down_info, _) = tensor_bytes(&gguf, "blk.1.ffn_down_exps.weight")?;
-    if gate_info.dims.len() != 3
-        || gate_info.dims[2] != n_expert as u64
-        || down_info.dims.len() != 3
-        || down_info.dims[2] != n_expert as u64
-    {
-        return Err(format!(
-            "gate_p6: expert stacks are {:?} / {:?}, want [K, rows, {n_expert}]",
-            gate_info.dims, down_info.dims
-        )
-        .into());
-    }
-    let (rows_gu, rows_dn) = (gate_info.dims[1] as usize, down_info.dims[1] as usize);
+    // Rows per expert of the three stacks the offset table addresses, typed
+    // as the Q3_K gate/up and Q5_0 down gemvs those offsets feed.
+    let (gate_info, _) =
+        tensor_bytes_as(&gguf, "blk.1.ffn_gate_exps.weight", GgmlType::Q3_K, None)?;
+    let (down_info, _) =
+        tensor_bytes_as(&gguf, "blk.1.ffn_down_exps.weight", GgmlType::Q5_0, None)?;
+    let n = n_expert as u64;
+    let (rows_gu, rows_dn) = match (gate_info.dims.as_slice(), down_info.dims.as_slice()) {
+        (&[_, gu, eg], &[_, dn, ed]) if eg == n && ed == n => (gu as usize, dn as usize),
+        (g, d) => {
+            return Err(format!(
+                "gate_p6: expert stacks are {g:?} / {d:?}, want [K, rows, {n_expert}]"
+            )
+            .into());
+        }
+    };
 
     // ---- real layers: logits from the dump, all tokens it holds.
     for l in [1usize, 13, 26] {

@@ -423,8 +423,10 @@ pub fn ref_tensor_of_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<f32>,
         .into());
     }
     let vals: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     if let Some(i) = vals.iter().position(|v| !v.is_finite()) {
         return Err(format!(
@@ -489,8 +491,10 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
             .into());
         }
         let vals: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         if let Some(i) = vals.iter().position(|v| !v.is_finite()) {
             return Err(format!(
@@ -617,12 +621,7 @@ pub fn route_ref(
     let mut ranked: Vec<u32> = (0..n as u32).collect();
     for t in 0..m {
         let p = &probs[t * n..(t + 1) * n];
-        ranked.sort_by(|&a, &b| {
-            p[b as usize]
-                .partial_cmp(&p[a as usize])
-                .expect("route_ref: finite probs sorted")
-                .then(a.cmp(&b))
-        });
+        ranked.sort_by(|&a, &b| p[b as usize].total_cmp(&p[a as usize]).then(a.cmp(&b)));
         for (s, &e) in ranked.iter().take(k).enumerate() {
             ids[t * k + s] = e as i32;
             weights[t * k + s] = p[e as usize] * scale;
@@ -634,11 +633,10 @@ pub fn route_ref(
 /// An F32 tensor from the model file as f32 (norm gains), length-checked
 /// (gate_p4's local `f32_tensor`).
 pub fn f32_tensor(gguf: &Gguf, name: &str, want: usize) -> Result<Vec<f32>, GateError> {
-    let (t, b) = tensor_bytes(gguf, name)?;
-    if t.ty != GgmlType::F32 || b.len() != want * 4 {
+    let (_, b) = tensor_bytes_as(gguf, name, GgmlType::F32, None)?;
+    if b.len() != want * 4 {
         return Err(format!(
-            "f32_tensor: {name} is {:?} with {} bytes, want F32 x {want}",
-            t.ty,
+            "f32_tensor: {name} is F32 with {} bytes, want F32 x {want}",
             b.len()
         )
         .into());
@@ -688,9 +686,11 @@ pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError
         .into());
     }
     Ok(raw
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(rows * width)
-        .map(|c| f32_to_f16_bits(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .map(|c| f32_to_f16_bits(f32::from_le_bytes(*c)))
         .collect())
 }
 
@@ -723,9 +723,11 @@ pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
         )
         .into());
     }
-    raw.chunks_exact(4)
+    raw.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| {
-            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let v = f32::from_le_bytes(*c);
             if v.fract() == 0.0 && (0.0..64.0).contains(&v) {
                 Ok(v as i32)
             } else {

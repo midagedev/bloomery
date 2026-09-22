@@ -111,7 +111,7 @@ fn run() -> Result<(), GateError> {
     let wg_words = bytes_to_words(&wg_bytes[..rb3 * FF]);
     let wu_words = bytes_to_words(&wu_bytes[..rb3 * FF]);
     assert!(
-        wg_words.len() % FF == 0 && wu_words.len() % FF == 0,
+        wg_words.len().is_multiple_of(FF) && wu_words.len().is_multiple_of(FF),
         "Q3_K words not row-divisible"
     );
     let wg_dev = DeviceTensor::upload(stream, &wg_words, FF, rb3 / 4)?;

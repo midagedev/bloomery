@@ -22,7 +22,7 @@ use std::path::Path;
 
 use bloomery_gpu_gates::{
     GateError, activations, max_rel_err, open_model, ref_dir_named, ref_gemv, ref_model_path,
-    row_bytes, tensor_bytes,
+    row_bytes, tensor_bytes_as,
 };
 use gguf::Gguf;
 use gguf::quant::GgmlType;
@@ -213,29 +213,33 @@ fn run_site(gguf: &Gguf, dir: &Path, s: &Site) -> Result<(), GateError> {
         return Ok(());
     }
     let x: Vec<f32> = x_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     let m = x.len() / s.k;
 
-    let (info, bytes) = match tensor_bytes(gguf, &s.tensor) {
+    let (info, bytes) = match tensor_bytes_as(gguf, &s.tensor, s.ty, None) {
         Ok(v) => v,
         Err(e) => {
             println!("{:<18} {:>2} SKIP: tensor {}: {e}", s.name, layer, s.tensor);
             return Ok(());
         }
     };
-    if info.ty != s.ty || info.dims.first().copied() != Some(s.k as u64) || info.dims.len() < 2 {
-        println!(
-            "{:<18} {:>2} SKIP: {} is {:?} dims {:?}, expected type {:?} with dims[0] = {}",
-            s.name, layer, s.tensor, info.ty, info.dims, s.ty, s.k
-        );
-        return Ok(());
-    }
     // dims[1] is the row count of expert 0 for the 3-D expert stacks (rows
     // are expert-major in the flat byte order), so the first `rows` raw rows
     // are expert 0's rows for those and just the leading rows for 2-D ones.
-    let rows = usize::try_from(info.dims[1])?.min(s.rows_cap);
+    let rows = match info.dims.as_slice() {
+        &[k, rows, ..] if k == s.k as u64 => usize::try_from(rows)?.min(s.rows_cap),
+        _ => {
+            println!(
+                "{:<18} {:>2} SKIP: {} is {:?} dims {:?}, expected dims [{}, rows, ..]",
+                s.name, layer, s.tensor, info.ty, info.dims, s.k
+            );
+            return Ok(());
+        }
+    };
     let rb = row_bytes(s.ty, s.k)?;
     if bytes.len() < rb * rows {
         println!(

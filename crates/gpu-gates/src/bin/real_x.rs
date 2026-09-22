@@ -33,7 +33,7 @@ use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     activations, bytes_to_words, find_ref_row, max_rel_err, open_model, ref_dir, ref_gemv,
-    ref_manifest, ref_tensor_of, row_bytes, tensor_bytes,
+    ref_manifest, ref_tensor_of, row_bytes, tensor_bytes, tensor_bytes_as,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -456,38 +456,20 @@ fn swiglu_site(
         )
         .into());
     }
-    let (g_info, g_bytes) = tensor_bytes(gguf, gate_tensor)?;
-    let (u_info, u_bytes) = tensor_bytes(gguf, up_tensor)?;
-    if g_info.ty != GgmlType::Q3_K || u_info.ty != GgmlType::Q3_K {
+    // The chain: `in_row` [K, t, 1, 1] through both weights [K, rows] to
+    // `up_gate_row` [rows, t]. K and rows are the dump's; each weight must
+    // be exactly [K, rows].
+    if up_gate_row.ne[1] != in_row.ne[1] || in_row.ne[2] != 1 || in_row.ne[3] != 1 {
         return Err(format!(
-            "real_x: {site}: {gate_tensor}/{up_tensor} are {:?}/{:?}, want Q3_K",
-            g_info.ty, u_info.ty
+            "real_x: {site}: chain dims {} {:?} vs {} {:?} do not prove the chain",
+            in_row.name, in_row.ne, up_gate_row.name, up_gate_row.ne
         )
         .into());
     }
-    let k = in_row.ne[0] as usize;
-    let rows = g_info.dims[1] as usize;
-    if g_info.dims[0] as usize != k
-        || u_info.dims[0] as usize != k
-        || u_info.dims[1] as usize != rows
-        || up_gate_row.ne[0] != rows as u64
-        || up_gate_row.ne[1] != in_row.ne[1]
-        || in_row.ne[2] != 1
-        || in_row.ne[3] != 1
-    {
-        return Err(format!(
-            "real_x: {site}: chain dims {} [{:?}] x {gate_tensor}/{up_tensor} [K={}/{}, rows={}/{}] vs {} [{:?}] do not prove the chain",
-            in_row.name,
-            in_row.ne,
-            g_info.dims[0],
-            u_info.dims[0],
-            g_info.dims[1],
-            u_info.dims[1],
-            up_gate_row.name,
-            up_gate_row.ne
-        )
-        .into());
-    }
+    let w_dims = [in_row.ne[0], up_gate_row.ne[0]];
+    let (_, g_bytes) = tensor_bytes_as(gguf, gate_tensor, GgmlType::Q3_K, Some(&w_dims))?;
+    let (_, u_bytes) = tensor_bytes_as(gguf, up_tensor, GgmlType::Q3_K, Some(&w_dims))?;
+    let (k, rows) = (w_dims[0] as usize, w_dims[1] as usize);
     let m = in_row.ne[1] as usize;
     let x = ref_tensor_of(in_row)?;
     let yk = ref_tensor_of(up_gate_row)?;
@@ -590,10 +572,7 @@ fn synth_kq_site(
     m: usize,
     seed: u32,
 ) -> Result<(), GateError> {
-    let (info, bytes) = tensor_bytes(gguf, tensor)?;
-    if info.ty != ty {
-        return Err(format!("real_x: {site}: {tensor} is {:?}, want {ty:?}", info.ty).into());
-    }
+    let (info, bytes) = tensor_bytes_as(gguf, tensor, ty, None)?;
     let k = info.dims[0] as usize;
     let rows_total: usize = info.dims[1..].iter().product::<u64>() as usize;
     let rows = row_cap.map_or(rows_total, |c| rows_total.min(c));
@@ -627,14 +606,13 @@ fn synth_q5_1_site(
 ) -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
 
-    let (info, bytes) = tensor_bytes(gguf, "blk.0.ffn_down.weight")?;
-    if info.ty != GgmlType::Q5_1 || info.dims[0] != 10944 || info.dims[1] != 2048 {
-        return Err(format!(
-            "real_x: {site}: blk.0.ffn_down.weight is {:?} {:?}",
-            info.ty, info.dims
-        )
-        .into());
-    }
+    // dims [K, rows]
+    let (_, bytes) = tensor_bytes_as(
+        gguf,
+        "blk.0.ffn_down.weight",
+        GgmlType::Q5_1,
+        Some(&[10944, 2048]),
+    )?;
     let (k, rows) = (10944usize, 2048usize);
     let k_blocks = k / 32;
     let q_stride = 256 * k_blocks.div_ceil(32);
@@ -679,14 +657,13 @@ fn synth_q5_0_site(
 ) -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
 
-    let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_down_exps.weight")?;
-    if info.ty != GgmlType::Q5_0 || info.dims[0] != 1408 || info.dims[1] != 2048 {
-        return Err(format!(
-            "real_x: {site}: blk.1.ffn_down_exps.weight is {:?} {:?}",
-            info.ty, info.dims
-        )
-        .into());
-    }
+    // dims [K, rows, experts]
+    let (_, bytes) = tensor_bytes_as(
+        gguf,
+        "blk.1.ffn_down_exps.weight",
+        GgmlType::Q5_0,
+        Some(&[1408, 2048, 64]),
+    )?;
     let (k, rows, n_exp) = (1408usize, 2048usize, 64usize);
     let rb = row_bytes(GgmlType::Q5_0, k)?;
     let k_blocks = k / 32;

@@ -117,14 +117,19 @@ fn prompts_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/prompts.tsv")
 }
 
+/// The argument after flag `name`: `None` when the flag is absent, an error
+/// when the flag is the last argument.
 #[cfg(feature = "gpu")]
-fn flag_value(name: &str) -> Option<String> {
+fn flag_value(name: &str) -> Result<Option<String>, GateError> {
     let args: Vec<String> = std::env::args().collect();
-    args.iter().position(|a| a == name).map(|i| {
-        args.get(i + 1)
-            .unwrap_or_else(|| panic!("generate: {name} needs a value"))
-            .clone()
-    })
+    args.iter()
+        .position(|a| a == name)
+        .map(|i| {
+            args.get(i + 1)
+                .cloned()
+                .ok_or_else(|| GateError::from(format!("generate: {name} needs a value")))
+        })
+        .transpose()
 }
 
 #[cfg(feature = "gpu")]
@@ -135,23 +140,23 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     let timed = std::env::args().any(|a| a == "--time");
-    let mode = match flag_value("--mode").as_deref() {
+    let mode = match flag_value("--mode")?.as_deref() {
         None | Some("graph") => StepMode::Graph,
         Some("eager") => StepMode::Eager,
         Some(other) => {
             return Err(format!("generate: --mode is eager or graph, not {other}").into());
         }
     };
-    let n_gen: usize = flag_value("-n").map_or(Ok(32), |s| s.parse())?;
-    let ctx: usize = flag_value("--ctx").map_or(Ok(512), |s| s.parse())?;
-    let warm: usize = flag_value("--warm").map_or(Ok(0), |s| s.parse())?;
+    let n_gen: usize = flag_value("-n")?.map_or(Ok(32), |s| s.parse())?;
+    let ctx: usize = flag_value("--ctx")?.map_or(Ok(512), |s| s.parse())?;
+    let warm: usize = flag_value("--warm")?.map_or(Ok(0), |s| s.parse())?;
 
-    let seed_depth: Option<usize> = match flag_value("--seed-depth") {
+    let seed_depth: Option<usize> = match flag_value("--seed-depth")? {
         Some(s) => Some(s.parse()?),
         None => None,
     };
     if seed_depth.is_some()
-        && (flag_value("--tokens").is_some() || flag_value("--prompt-id").is_some())
+        && (flag_value("--tokens")?.is_some() || flag_value("--prompt-id")?.is_some())
     {
         return Err(
             "generate: --seed-depth prepares the cache instead of decoding a \
@@ -160,7 +165,7 @@ fn run() -> Result<(), GateError> {
         );
     }
 
-    let tokens: Vec<u32> = match (seed_depth, flag_value("--tokens")) {
+    let tokens: Vec<u32> = match (seed_depth, flag_value("--tokens")?) {
         // Under `--seed-depth` one token is fed at the last seeded position:
         // the ordinary untimed step in front of the timed ones. Which token
         // does not matter — the seeded rows already make the output
@@ -179,7 +184,7 @@ fn run() -> Result<(), GateError> {
             .map(|t| t.trim().parse::<u32>())
             .collect::<Result<Vec<_>, _>>()?,
         (None, None) => {
-            let id: usize = flag_value("--prompt-id").map_or(Ok(0), |s| s.parse())?;
+            let id: usize = flag_value("--prompt-id")?.map_or(Ok(0), |s| s.parse())?;
             let rows = read_prompts(&prompts_path())?;
             rows.iter()
                 .find(|r| r.id == id)
@@ -208,7 +213,7 @@ fn run() -> Result<(), GateError> {
     // and the tokens it prints meaningless — the footer says which arm it was
     // so a row can never be read as a value run.
     let probe = StepProbe {
-        pad_per_layer: flag_value("--probe-pad").map_or(Ok(0), |s| s.parse())?,
+        pad_per_layer: flag_value("--probe-pad")?.map_or(Ok(0), |s| s.parse())?,
         skip_quant: std::env::args().any(|a| a == "--probe-skip-quant"),
         split_heads: std::env::args().any(|a| a == "--probe-split-heads"),
         split_kqvc: std::env::args().any(|a| a == "--probe-split-kqvc"),
@@ -234,8 +239,8 @@ fn run() -> Result<(), GateError> {
 
     // Refused rather than ignored: an arm set with no `--ab` to run it is
     // the shape a later round reads as "the set is broken".
-    let ab_set = flag_value("--ab-set");
-    if ab_set.is_some() && flag_value("--ab").is_none() {
+    let ab_set = flag_value("--ab-set")?;
+    if ab_set.is_some() && flag_value("--ab")?.is_none() {
         return Err(
             "generate: --ab-set picks the arms of --ab, which this run has not asked \
                     for. Pass both, or neither."
@@ -247,8 +252,8 @@ fn run() -> Result<(), GateError> {
     // untimed round of every arm before it counts anything, so a second
     // warming lever there would be two names for one thing; and outside
     // `--time` there are no statistics for `--warm` to trim.
-    if flag_value("--warm").is_some() {
-        if flag_value("--ab").is_some() {
+    if flag_value("--warm")?.is_some() {
+        if flag_value("--ab")?.is_some() {
             return Err(
                 "generate: --warm warms --time, and --ab already runs one untimed \
                         round of every arm before it counts. Pass one, not both."
@@ -274,7 +279,7 @@ fn run() -> Result<(), GateError> {
     let gguf = open_model()?;
     let mut model = GpuModel::load_full(&gguf, ctx)?;
     model.set_mode(mode);
-    if let Some(rounds) = flag_value("--ab") {
+    if let Some(rounds) = flag_value("--ab")? {
         if seed_depth.is_some() {
             return Err(
                 "generate: --ab with --seed-depth would measure depth 1: every arm \

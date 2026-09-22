@@ -112,7 +112,7 @@ fn run() -> Result<(), GateError> {
         tensor_bytes_as(&gguf, name, ty, Some(dims))?;
     }
     let (k, rows) = (k as usize, rows as usize);
-    if n_used < 1 || n_used > 8 {
+    if !(1..=8).contains(&n_used) {
         return Err(format!(
             "gate_moe_fused: n_used {n_used} outside 1..=8 (the activation scratch width)"
         )
