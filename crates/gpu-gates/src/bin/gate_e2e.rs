@@ -27,8 +27,15 @@
 //!   `MARGIN_FLOOR` and the flip is a near-tie re-lottery. Near ties are
 //!   printed, not failed — the criterion `crates/model/tests/prompts.rs`
 //!   holds for the CPU chain, carried to the GPU chain. Divergences past
-//!   index 0 are printed and not failed: pinning the divergence set is A3's
-//!   later round and needs three runs first.
+//!   index 0 are printed and not failed; the free-running class counts are
+//!   a diagnostic and no longer a decision.
+//! - (1t) the teacher-forced arm, and the one the divergence question is
+//!   decided on: with the reference's own tokens fed as input, our argmax is
+//!   compared at every one of the set's positions, and the disagreements the
+//!   reference itself was clear about (margin at or above `MARGIN_FLOOR`)
+//!   must not exceed `FORCED_PIN`. Free running gives one event per prompt
+//!   and mis-aligns `gen_margins` past the first difference; forcing gives
+//!   `GEN` events per prompt, each with the margin that belongs to it.
 //! - (2) graph mode reproduces the eager sequence token for token on every
 //!   prompt — the eager-equals-replay arm every step gate has.
 //! - (3) determinism: two eager runs give identical tables.
@@ -44,7 +51,7 @@
 //!   depth does, at the same captured node count — the contract
 //!   `generate --seed-depth` rests on. State, not time.
 //!
-//! The classifier, the reference reader and the three classes are
+//! The classifiers, the reference reader and the three classes are
 //! `gpu_gates::prompts`; this gate does not re-implement them.
 
 #[cfg(not(feature = "gpu"))]
@@ -60,7 +67,9 @@ use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::open_model;
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::prompts::{GreedyClass, GreedyRow, compare_greedy, read_greedy};
+use bloomery_gpu_gates::prompts::{
+    GreedyClass, GreedyRow, compare_forced, compare_greedy, read_greedy,
+};
 
 /// Generated tokens per prompt — the reference file's own width
 /// (`greedy-ik-cuda-32.tsv`, written with `BLOOMERY_REF_GEN=32`).
@@ -93,6 +102,28 @@ const DEEP_GEN: usize = 16;
 /// owns.
 #[cfg(feature = "gpu")]
 const MARGIN_FLOOR: f32 = 0.5;
+
+/// PIN(2026-09-22): teacher-forced positions at which our argmax leaves the
+/// reference's token while the reference's own margin there is at least
+/// `MARGIN_FLOOR`. Derivation: the scalar path — f32 query rows, so a more
+/// precise path than ik CUDA's own f16-query MMA — was measured on this set
+/// with the pin lifted, and left the reference at 42 of 1056 positions, 4 of
+/// them at or above the floor (margins 1.244, 0.526, 0.515, 0.506; the rest
+/// are 19 under 0.1 and 19 in [0.1, 0.5)). Those 4 are the floor at which
+/// two correct implementations of the same model part company, not a fault,
+/// so the pin is that count plus a sample-noise allowance of its own square
+/// root: 4 + ⌈√4⌉ = 6. Calibrated on the scalar arm alone and before any
+/// tensor-core arm was read, so it is not a threshold shaped to admit one.
+///
+/// The unit is the POSITION and not the prompt, which is what this replaced.
+/// Free running gave one event per prompt — 33 samples, where a move of one
+/// or two is noise — and past a row's first difference the two engines are
+/// conditioned on different text, so `gen_margins` no longer describes the
+/// place it is read at. Forcing the reference's own path keeps both sides at
+/// the same position at every step, which makes all 1056 of them evidence
+/// and each margin the one that belongs to its disagreement.
+#[cfg(feature = "gpu")]
+const FORCED_PIN: usize = 6;
 
 /// `$BLOOMERY_DATA/<name>` — the reference files the box holds.
 #[cfg(feature = "gpu")]
@@ -225,6 +256,116 @@ fn run_set(
     Ok(out)
 }
 
+/// One teacher-forced argmax table per reference row, in file order: fresh
+/// caches, the prompt fed one token at a time for step 0, then the
+/// REFERENCE's own token fed for each later step. `out[s]` is therefore our
+/// argmax at the position `reference.gen_ids[s]` holds, and the margin that
+/// belongs to it is `gen_margins[s]` — the alignment free running loses at
+/// its first difference.
+///
+/// The off-by-one is the trap: step `s` is reached by feeding `gen_ids[s-1]`,
+/// so the loop feeds the token BEFORE the one it is about to judge. A row is
+/// run for its own `gen_ids.len()` — a reference row that stopped early on
+/// EOS has no tokens to force past its end.
+#[cfg(feature = "gpu")]
+fn run_forced(
+    model: &mut GpuModel,
+    prompts: &[bloomery_gpu_gates::prompts::PromptRow],
+    reference: &[GreedyRow],
+) -> Result<Vec<Vec<u32>>, Box<dyn std::error::Error>> {
+    let mut out = Vec::with_capacity(reference.len());
+    for (r, p) in reference.iter().zip(prompts) {
+        if r.id != p.id || r.n_tokens != p.tokens.len() {
+            return Err(format!(
+                "run_forced: prompt {} has {} tokens, the reference row {} says {}",
+                p.id,
+                p.tokens.len(),
+                r.id,
+                r.n_tokens
+            )
+            .into());
+        }
+        model.reset()?;
+        let len = r.gen_ids.len();
+        let mut seq = Vec::with_capacity(len);
+        seq.push(model.step(&p.tokens)?);
+        for s in 1..len {
+            seq.push(model.step(&[r.gen_ids[s - 1]])?);
+        }
+        out.push(seq);
+    }
+    Ok(out)
+}
+
+/// The teacher-forced arm: run the forced tables, check them against the
+/// free-running table at step 0, print every disagreeing position, and judge
+/// the set on the disagreements outside `MARGIN_FLOOR`. Returns whether the
+/// arm passed.
+///
+/// `eager` is the free-running table from the same model state. Nothing has
+/// been fed back yet at step 0, so the two must agree there on every prompt.
+/// Where they do not, either this loop is wrong or the step is not
+/// reproducible — the determinism arm separates those — and either way the
+/// disagreement counts below describe nothing, so the arm fails on it rather
+/// than reporting a divergence it caused itself.
+#[cfg(feature = "gpu")]
+fn check_forced(
+    model: &mut GpuModel,
+    prompts: &[bloomery_gpu_gates::prompts::PromptRow],
+    reference: &[GreedyRow],
+    eager: &[Vec<u32>],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let forced = run_forced(model, prompts, reference)?;
+    let step0: Vec<usize> = (0..forced.len())
+        .filter(|&i| eager[i].first() != forced[i].first())
+        .collect();
+    println!(
+        "forced_selfcheck rows={} step0_eager_vs_forced_diff={} {}",
+        forced.len(),
+        step0.len(),
+        if step0.is_empty() { "ok" } else { "FAIL" }
+    );
+    for &i in &step0 {
+        println!(
+            "  prompt {}: free-running step 0 {:?}, forced step 0 {:?} — nothing has been fed \
+             back yet, so either this forcing loop is wrong or the step is not reproducible; \
+             the determinism arm below tells the two apart",
+            reference[i].id,
+            eager[i].first(),
+            forced[i].first()
+        );
+    }
+
+    let report = compare_forced(&forced, reference, MARGIN_FLOOR);
+    println!(
+        "{:>3} {:>4} {:>8} {:>8} {:>10}",
+        "id", "step", "ours", "theirs", "margin"
+    );
+    for d in &report.disagree {
+        println!(
+            "{:>3} {:>4} {:>8} {:>8} {:>10.3}",
+            d.id, d.step, d.ours, d.theirs, d.ref_margin
+        );
+    }
+    let pass = step0.is_empty() && report.disagree_ge_floor <= FORCED_PIN;
+    println!(
+        "forced positions={} disagree={} buckets=[{} {} {} {}] ge_floor={} pin<={FORCED_PIN} \
+         max_margin={} {}",
+        report.positions,
+        report.disagree.len(),
+        report.buckets[0],
+        report.buckets[1],
+        report.buckets[2],
+        report.buckets[3],
+        report.disagree_ge_floor,
+        report
+            .max_margin
+            .map_or_else(|| "-".to_string(), |m| format!("{m:.3}")),
+        if pass { "ok" } else { "FAIL" }
+    );
+    Ok(pass)
+}
+
 /// A fixed pseudo-random prompt of `n` ids: BOS, then an LCG walk over the
 /// id range the depth runners feed. Random ids are less kind to the caches
 /// than real text, which is what the deep arm wants of them.
@@ -349,6 +490,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         model.stages()[0].layers().end
     );
 
+    // Calibration, printed and not judged: ik's own CPU backend against the
+    // CUDA reference on the free-running ruler. Two backends of the same
+    // engine sit at diverged=3 on this set (2026-09-22), the count the old
+    // per-prompt pin held the scalar path to — that pin was ik's own noise
+    // floor, not a correctness edge. Absent on a box without the file.
+    let cpu_path = data_file("greedy-ik-cpu-32.tsv");
+    if cpu_path.is_file() {
+        let cpu = read_greedy(&cpu_path)?;
+        if cpu.len() == reference.len() && cpu.iter().zip(&reference).all(|(a, b)| a.id == b.id) {
+            let cpu_tables: Vec<Vec<u32>> = cpu.iter().map(|r| r.gen_ids.clone()).collect();
+            let cal = compare_greedy(&cpu_tables, &reference, MARGIN_FLOOR);
+            println!(
+                "ik_cpu_vs_cuda classes identical={} near_tie={} diverged={} (calibration)",
+                cal.n_identical, cal.n_near_tie, cal.n_diverged
+            );
+        } else {
+            println!("ik_cpu_vs_cuda rows do not line up with the cuda file (calibration skipped)");
+        }
+    } else {
+        println!("ik_cpu_vs_cuda (absent: no greedy-ik-cpu-32.tsv)");
+    }
+
     // Eager first: the correctness path the graph is checked against.
     model.set_mode(StepMode::Eager);
     let eager = run_set(&mut model, &prompts, &reference)?;
@@ -383,29 +546,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.n_identical, report.n_near_tie, report.n_diverged
     );
 
-    // The segment pass under the lever, and the divergence set it leaves.
-    // The tensor-core pass rounds the query rows to f16, so its tokens are
-    // not the scalar path's bit for bit and a near-tie may be re-drawn; what
-    // may not move is the number of prompts that leave the near-tie floor.
-    // PIN(2026-09-22): DIVERGED_PIN is the scalar path's count on this set.
-    const DIVERGED_PIN: usize = 3;
-    let classes_ok = report.n_diverged <= DIVERGED_PIN;
+    // The segment pass under the lever, and the free-running divergence set
+    // it leaves. Diagnostic: one event per prompt is 33 samples, and past a
+    // row's first difference the two engines answer different questions, so
+    // this count mixes "is the kernel wrong" with "did a near tie fall the
+    // other way". The teacher-forced arm below is where that is decided.
     println!(
-        "flash_mma={} seg_keys={} diverged={} pin<={DIVERGED_PIN} {}",
+        "flash_mma={} seg_keys={} diverged={} (diagnostic)",
         bloomery_gpu::flash::flash_mma(),
         bloomery_gpu::flash::seg_keys(),
         report.n_diverged,
-        if classes_ok { "ok" } else { "FAIL" }
     );
-    if !classes_ok {
+
+    // (1t) The decision arm.
+    if !check_forced(&mut model, &prompts, &reference, &eager)? {
         ok = false;
     }
 
-    // (1) The decision criterion: the chain must produce ik's FIRST token,
-    // or miss it only where the reference itself was inside the floor. A
-    // divergence later in the continuation is a different question — the two
-    // sides are conditioned on different text from there — and pinning that
-    // set is a later round.
+    // (1) The chain must produce ik's FIRST token, or miss it only where the
+    // reference itself was inside the floor. This one position needs no
+    // forcing — both sides start from the same prompt and nothing has been
+    // fed back yet — so it stays its own arm.
     let bad_at_zero: Vec<&_> = report
         .rows
         .iter()
@@ -558,7 +719,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if ok {
         println!(
             "gate_e2e: PASS — the whole chain picks the greedy reference's first token on \
-             every prompt or misses it only inside MARGIN_FLOOR; graph replay equals eager \
+             every prompt or misses it only inside MARGIN_FLOOR; fed the reference's own \
+             path, it leaves that path at no more than FORCED_PIN positions the reference \
+             was clear about; graph replay equals eager \
              token for token at the pinned node count; two eager runs are identical; every \
              flash stage-doubling arm writes the base path's tokens at that same node count; a \
              seeded cache leaves the step at the same position and key count a decoded \

@@ -8,11 +8,21 @@
 //! `tools/ref/prompts.tsv`; neither tokenizes — a tokenizer difference would
 //! surface as a wrong token id and read as a kernel bug.
 //!
-//! Only the FIRST difference is judged. After it the two continuations are
-//! conditioned on different text, so every later token answers a different
-//! question and carries no evidence. `compare_greedy` therefore reports the
-//! first differing index, the reference's own top1-top2 margin there, and one
-//! of three classes; what happens past that index never enters the verdict.
+//! There are two comparers, and they answer different questions.
+//!
+//! `compare_greedy` judges a FREE-RUNNING continuation, and only its FIRST
+//! difference. After that difference the two continuations are conditioned on
+//! different text, so every later token answers a different question and
+//! carries no evidence. It reports the first differing index, the reference's
+//! own top1-top2 margin there, and one of three classes; what happens past
+//! that index never enters the verdict. The cost is its sample size: one
+//! event per prompt.
+//!
+//! `compare_forced` judges a TEACHER-FORCED table, where our argmax at every
+//! step was taken with the reference's own tokens fed as input. Both sides
+//! then stand at the same position on the same text at every step, so every
+//! step is evidence and `gen_margins[s]` is the margin at the place it is
+//! read. The unit is the position, not the prompt.
 
 use std::path::Path;
 
@@ -288,6 +298,113 @@ pub fn compare_greedy(
     }
 }
 
+/// One teacher-forced position: our argmax where the reference's own path
+/// was fed, against the reference's token there and its margin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ForcedPos {
+    /// The prompt's id, from the reference row.
+    pub id: usize,
+    /// The step inside the continuation, indexed like `gen_ids`.
+    pub step: usize,
+    /// Our argmax at that step.
+    pub ours: u32,
+    /// The reference's token there.
+    pub theirs: u32,
+    /// The reference's own top1-top2 margin at that step, `gen_margins[step]`.
+    pub ref_margin: f32,
+}
+
+/// Margin bucket edges of [`ForcedReport::buckets`], as half-open lower
+/// bounds: `[0, 0.1)`, `[0.1, 0.5)`, `[0.5, 1.0)`, `[1.0, inf)`. Fixed, not
+/// derived from `margin_floor`: the shape of the disagreement distribution is
+/// what the reader wants, and it must not move when a threshold does.
+pub const FORCED_BUCKETS: [f32; 3] = [0.1, 0.5, 1.0];
+
+/// `compare_forced`'s whole-set result.
+#[derive(Debug, Clone)]
+pub struct ForcedReport {
+    /// Positions compared: the sum over rows of the shorter of the two
+    /// lengths. The denominator of every count below.
+    pub positions: usize,
+    /// Every position where our argmax is not the reference's token, in row
+    /// then step order.
+    pub disagree: Vec<ForcedPos>,
+    /// Disagreements by reference margin, cut at [`FORCED_BUCKETS`]. A margin
+    /// exactly on an edge falls in the upper bucket.
+    pub buckets: [usize; 4],
+    /// Disagreements whose reference margin is at least `margin_floor` — the
+    /// ones the reference itself was clear about, and the decision quantity.
+    pub disagree_ge_floor: usize,
+    /// The largest reference margin at any disagreement, `None` when there
+    /// are none.
+    pub max_margin: Option<f32>,
+}
+
+/// Judge our teacher-forced argmaxes against the reference, position by
+/// position.
+///
+/// `ours[i][s]` must be our argmax for `reference[i]` at step `s` taken with
+/// `reference[i].gen_ids[..s]` fed as input — the reference's path, not our
+/// own. Fed our own path instead, this reads as a free-running comparison
+/// with the wrong margins attached and is not what it claims to measure.
+/// A row is compared over the shorter of the two lengths, the same
+/// convention [`compare_greedy`] holds for a reference row that stopped
+/// early on EOS.
+///
+/// # Panics
+///
+/// Panics when `ours.len() != reference.len()`: every reference row must be
+/// answered, and silently skipping some would under-report disagreements.
+#[must_use]
+pub fn compare_forced(
+    ours: &[Vec<u32>],
+    reference: &[GreedyRow],
+    margin_floor: f32,
+) -> ForcedReport {
+    assert_eq!(
+        ours.len(),
+        reference.len(),
+        "compare_forced: {} tables for {} reference rows",
+        ours.len(),
+        reference.len()
+    );
+    let mut positions = 0usize;
+    let mut disagree = Vec::new();
+    let mut buckets = [0usize; 4];
+    let mut disagree_ge_floor = 0usize;
+    let mut max_margin: Option<f32> = None;
+    for (table, r) in ours.iter().zip(reference) {
+        let span = table.len().min(r.gen_ids.len());
+        positions += span;
+        for step in 0..span {
+            if table[step] == r.gen_ids[step] {
+                continue;
+            }
+            let m = r.gen_margins[step];
+            let b = FORCED_BUCKETS.iter().filter(|&&e| m >= e).count();
+            buckets[b] += 1;
+            if m >= margin_floor {
+                disagree_ge_floor += 1;
+            }
+            max_margin = Some(max_margin.map_or(m, |x: f32| x.max(m)));
+            disagree.push(ForcedPos {
+                id: r.id,
+                step,
+                ours: table[step],
+                theirs: r.gen_ids[step],
+                ref_margin: m,
+            });
+        }
+    }
+    ForcedReport {
+        positions,
+        disagree,
+        buckets,
+        disagree_ge_floor,
+        max_margin,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +463,66 @@ mod tests {
         let r = compare_greedy(&[vec![10, 11, 100_001, 40, 41]], &reference, floor);
         assert_eq!(r.rows[0].class, GreedyClass::Identical);
         assert_eq!((r.rows[0].n_ours, r.rows[0].n_ref), (5, 3));
+    }
+
+    /// The teacher-forced ruler counts EVERY disagreeing position, not the
+    /// first one per row — the mirror of
+    /// `compare_greedy_classifies_the_first_difference_only`, on rows built
+    /// so the two comparers must give different answers. Bucket edges are
+    /// checked on the edge itself: a margin of exactly 0.1, 0.5 or 1.0 falls
+    /// in the upper bucket, and the floor is `>=`, not `>`.
+    #[test]
+    fn compare_forced_counts_every_position_not_only_the_first() {
+        let floor = 0.5f32;
+        let reference = vec![
+            row(0, &[10, 11, 12], &[2.0, 1.5, 0.9]),
+            row(1, &[20, 21, 22], &[2.0, 0.2, 0.05]),
+            row(2, &[30, 31, 32], &[1.0, 0.5, 0.1]),
+        ];
+        let ours = vec![vec![10, 11, 12], vec![20, 99, 98], vec![77, 88, 99]];
+        let f = compare_forced(&ours, &reference, floor);
+        assert_eq!(f.positions, 9);
+        assert_eq!(f.disagree.len(), 5);
+        // [0,0.1): 0.05. [0.1,0.5): 0.2 and 0.1. [0.5,1.0): 0.5. [1.0,inf): 1.0.
+        assert_eq!(f.buckets, [1, 2, 1, 1]);
+        assert_eq!(f.disagree_ge_floor, 2);
+        assert_eq!(f.max_margin, Some(1.0));
+        // The second row's LATER difference is a position of its own here;
+        // the first-difference comparer never sees it.
+        assert_eq!(
+            f.disagree[1],
+            ForcedPos {
+                id: 1,
+                step: 2,
+                ours: 98,
+                theirs: 22,
+                ref_margin: 0.05,
+            }
+        );
+        let g = compare_greedy(&ours, &reference, floor);
+        assert_eq!((g.n_identical, g.n_near_tie, g.n_diverged), (1, 1, 1));
+    }
+
+    /// A row is compared over the shorter of the two lengths in either
+    /// direction — a reference row that stopped on EOS, and a table of ours
+    /// that is short — and a set with no disagreement carries no
+    /// `max_margin`.
+    #[test]
+    fn compare_forced_spans_the_shorter_of_the_two_lengths() {
+        let floor = 0.5f32;
+        let reference = vec![row(5, &[10, 11, 100_001], &[1.0, 0.8, 3.0])];
+
+        let f = compare_forced(&[vec![10, 99, 100_001, 40, 41]], &reference, floor);
+        assert_eq!(f.positions, 3);
+        assert_eq!(f.buckets, [0, 0, 1, 0]);
+        assert_eq!(f.disagree_ge_floor, 1);
+        assert_eq!(f.max_margin, Some(0.8));
+
+        let f = compare_forced(&[vec![10]], &reference, floor);
+        assert_eq!(f.positions, 1);
+        assert!(f.disagree.is_empty());
+        assert_eq!(f.buckets, [0, 0, 0, 0]);
+        assert_eq!(f.max_margin, None);
     }
 
     /// `read_greedy` parses only the 7-column `--gen` format, and enforces
