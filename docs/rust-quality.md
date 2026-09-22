@@ -78,6 +78,14 @@
 
 **기각**: ① `flash_row_scalar`/`flash_row_avx2` 트윈의 공통 코어 추출(cpu 리뷰 1순위) — `#[target_feature]` 본체 분리 금지(AGENTS, 측정 10–13 %)와 정면 충돌. 트윈은 의도된 형태고 `TWIN` 주석이 계약이다. 남는 것은 트윈 **밖**의 소프트맥스 스캔 산술을 `#[inline(always)]` 코어로 빼되 SASS·A/B 동일을 보이는 것 — 별도 라운드, 지금 아님. ② `head.rs` 드롭 순서 결함 — 이미 그래프가 먼저다(오탐; 규칙 R25로만 받음). ③ "cuda-oxide가 구조체 인자를 못 받는다"는 리뷰어 주장은 미확인이라 R8 보강의 근거로 쓰지 않았다(ABI 이유로 충분).
 
+## 7″. 리뷰 2회차(2026-09-22, agy — `flash.rs`·`model.rs`·`gate_p5`·`gate_e2e`, 커널 라운드 뒤로 미뤘던 넷)
+
+8,814줄에서 위반 약 90건. 처분은 원본에서 확인한 것만.
+
+- **받음 → 라운드** ① **R8 `*Args`** — 런처 12곳(flash.rs `enqueue_flash_*` 9 + `check_flash`, model.rs `enqueue_*_gemv_heads*` 3)과 `gate_p5` 헬퍼 4곳. 리뷰어의 상위 5(`enqueue_flash_latent_split` 13인자부터)가 순서다. `enqueue_chain/layer/attn/ffn_moe`의 내부 컨텍스트 구조체(`ChainCtx` 류)는 **같은 축이 아니다**(디스패치 경로 — A/B 동반) → 별도. ② **R1 범위** — `flash_latent_mma`의 `unsafe { if live { … } }` 2곳(905·967)과 워프 리덕션을 감싼 28줄(1052–1081), `// SAFETY: as in …` 8곳(1272·1340·1408·1476·1634·1724·1744·1746) — gpusafety가 flash.rs를 제외했던 잔여. ③ **R6 const assert** — `MMA_QSTRIDE*2 ≡ 16 (mod 128)`·`MMA_KSTRIDE` 같은 뱅크 회피 불변식과 `MMA_KEYS == MMA_QK_WARPS*MMA_NTILE`, `MMA_WIDTH % (2*MMA_K)`, `LATENT % KEY_TILE` — 산문이 아니라 `const _: () = assert!`로. ptx-scan 동일이 증명. ④ **R12 `enqueue_attn` 510줄 / `enqueue_ffn_moe` 257줄 / `LayerScratch::new` 167줄**과 **R15 model.rs 분할**(`step_kernels.rs` + `model/{residency,dispatch,profile}.rs`) — 리뷰어의 5분할안을 뼈대로 받되 **파일 이동만 하는 라운드와 함수 분할 라운드를 나눈다**(R21). 둘 다 R20 전항(e2e 648노드·p8·ptx-scan 동일·A/B). ⑤ **R10** `model.rs:1795` `residency.as_ref().unwrap()` — 확인, gpuerr 뒤 gpu 주석 라운드에. ⑥ **R24** `gate_p5` `ok: &mut bool` 6곳 — 7′에서 이미 규칙, 라운드 대상. ⑦ **R13** `mla_width`(재수출만, 호출 0) 등 가시성 — 단 리뷰어의 "MMA_* 20개는 flash.rs 밖 참조 0"은 **미확인**(gate_p5가 flash 상수를 쓴다): 컴파일러가 판정한다 — `pub(crate)`로 내리고 깨지는 것만 되돌리는 기계 라운드. ⑧ **R5 캐스트** `q_rows as u32` 류 host 축소 캐스트 20여 곳 — `u32::try_from(..).expect(..)`는 그리드 인자에서 옳다(사용자 지시의 8배 사고 부류). 축 하나로 묶어 기계 라운드, ptx-scan 동일.
+- **기각** ① `gate_e2e.rs:538·544` `device_step_params()` "연속 중복 호출" — 오탐: 사이는 `reset()`+다른 `step()`이고 두 값은 seeded/decoded 두 상태의 비교 대상이다. ② `flash.rs` R12 `flash_latent_mma` 354줄·`latent_range` 345줄 — `#[kernel]` 면제(7′). ③ R5 "`m`·`latent`·`segs`에 뉴타입" — 커널 ABI 경계까지 뉴타입을 밀면 `#[kernel]` 인자에서 풀어야 해 이득이 없다; 호스트 쪽 `*Args` 구조체의 **필드 이름**이 그 단위를 든다(①로 흡수).
+- **e2e 발산 핀** — 리뷰 밖이지만 같은 파일: 자유 생성 첫 차이 33표본의 `diverged ≤ 3`을 **교사 강제 위치 분포**(1056위치, ik 마진 ≥ 0.5 불일치 수)로 옮기는 라운드(`e2epin`)가 이 리뷰와 같은 날 열렸다. 게이트 재저작이라 PIN·FAIL-first·스칼라 캘리브레이션이 완료 조건.
+
 ## 8. 리뷰 절차
 
 1. 리뷰어(조사 라운드)는 크레이트 하나씩 읽고 위반을 `경로:줄 — R번호 — 한 줄 — 크기(XS/S/M/L)`로 낸다. 심각도는 리뷰어가 매기지 않는다 — 규칙 번호가 곧 분류다. 리뷰어는 코드를 고치지 않는다.
