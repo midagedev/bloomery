@@ -492,9 +492,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Calibration, printed and not judged: ik's own CPU backend against the
     // CUDA reference on the free-running ruler. Two backends of the same
-    // engine sit at diverged=3 on this set (2026-09-22), the count the old
-    // per-prompt pin held the scalar path to — that pin was ik's own noise
-    // floor, not a correctness edge. Absent on a box without the file.
+    // engine already diverge on this set, so a free-running divergence
+    // count is a noise floor, not a correctness edge. Absent on a box
+    // without the file.
     let cpu_path = data_file("greedy-ik-cpu-32.tsv");
     if cpu_path.is_file() {
         let cpu = read_greedy(&cpu_path)?;
