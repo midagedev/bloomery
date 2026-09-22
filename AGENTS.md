@@ -111,7 +111,9 @@ Track checklist, first and last:
 2. **Always** run long box commands through the `gate-*` recipes or with an
    explicit `timeout` — never bare `cargo test` at a prompt you are not
    watching. If a command produces no output for minutes, assume it is hung on
-   the box, not thinking: check `pgrep -fa '<remote dir>'`.
+   the box, not thinking: check `just box-gc --dry-run` (it selects by
+   `/proc/<pid>/exe`, never by cmdline — a `pgrep -f '<dir>'` also matches the
+   shell that runs it).
 3. **Last**: `just box-gc` again, remove the worktree, then `just box-tracks
    --remove` — a removed worktree leaves its remote directory (and a
    `target/` of several hundred MB) behind on the box.
@@ -243,7 +245,18 @@ All 13 subsystem gates pass on main with real exit codes (rerun after the
 `cargo test` runs almost nothing by design, and `.config/nextest.toml` fences
 them out of the fast loop. The `just gate-*` recipes are how they run.
 
-`just lint` reports 0 errors and 144 warnings on main (measured 2026-09-21 morning;
+`just lint` runs clippy **with `--features gpu`** (without it the 17 gpu-gates binaries
+are dummy mains and their bodies are never linted). The ratchet counter is
+`grep -c '^warning:'` on that output, which counts a warning once per target it
+appears in (an agent's unique-count will read lower — same direction, different
+ruler). 2026-09-22 night, measured: 308 before the quality rounds; 234 after
+`gpusafety`, 305 after `gatesdedup` on its own base — the merged value is re-measured
+and written here when a round lands. `docs/rust-quality.md` §0 is the table that
+tracks it. Timed recipes (`time-gpu-*`, `prof-gpu-p8`, `bench-gpu-kernels`) run on the
+A6000 since the runners share `tools/ref/timing-card.sh`; their earlier 3090 numbers do
+not belong in the same table.
+
+Older baselines, kept for the slope: 144 warnings on main (2026-09-21 morning;
 169 on the `gpu-p0` tree with `crates/gpu` + `crates/gpu-spike` as members; 114 on 2026-09-20; 74 on
 09-19). 81 are in the stage-0 crates (q3k-gemv 60, q3k-cpu 21); the engine
 crates carry 33 (model 16, qdot 13, gguf 4). 63 are
