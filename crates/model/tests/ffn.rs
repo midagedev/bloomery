@@ -5,7 +5,7 @@
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use model::ffn::{dense_ffn, dense_ffn_up_gate};
+use model::arch::deepseek2::plan::{dense_ffn, dense_ffn_up_gate};
 use model::ops::Tensor2;
 
 fn load_input(o: &oracle::Oracle, name: &str) -> Tensor2 {

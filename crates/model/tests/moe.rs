@@ -19,6 +19,7 @@
 mod oracle;
 
 use model::Tensor2;
+use model::arch::deepseek2::plan;
 use model::moe;
 
 /// `ffn_norm-1` — the MoE block's input, straight from the oracle.
@@ -35,7 +36,7 @@ fn hw_moe_router_exact() {
     let x = moe_input(&o);
     moe::set_trace_enabled(true);
 
-    let b = moe::route(&g, 1, &x).unwrap();
+    let b = plan::route(&g, 1, &x).unwrap();
     let tr = moe::last_trace().expect("route must leave a trace");
     let (n_expert, n_used, n_tokens) = (tr.n_expert, tr.n_used, tr.n_tokens);
     assert_eq!(
@@ -121,7 +122,7 @@ fn hw_moe_forward_matches_ggml() {
     let x = moe_input(&o);
     moe::set_trace_enabled(true);
 
-    let out = moe::moe_ffn(&g, 1, &x).unwrap();
+    let out = plan::moe_ffn(&g, 1, &x).unwrap();
     let tr = moe::last_trace().expect("moe_ffn must leave a trace");
     assert_eq!((out.ne0, out.ne1), (2048, 6), "ffn_out-1 shape");
 
@@ -181,7 +182,7 @@ fn hw_moe_touches_only_routed_experts() {
     let x = moe_input(&o);
     moe::set_trace_enabled(true);
 
-    moe::moe_ffn(&g, 1, &x).unwrap();
+    plan::moe_ffn(&g, 1, &x).unwrap();
     let tr = moe::last_trace().expect("moe_ffn must leave a trace");
     let touched = moe::last_touched_experts();
 

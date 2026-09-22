@@ -1,9 +1,10 @@
 //! Every `blk.{N}.<tensor>.weight` string this architecture reads, in one place.
 //!
 //! The tensor names are a value that differs per architecture, not a type: the
-//! shared modules (`ffn`, `moe`) hold the math and ask this table for the name
-//! of the weight they need. Anything that formats a `blk.` literal elsewhere in
-//! `crates/model/src` is a name this table does not yet own.
+//! shared modules (`ffn`, `moe`) hold the math and take resolved tensors, and
+//! `plan` asks this table for the name of each weight they need. Anything that
+//! formats a `blk.` literal elsewhere in `crates/model/src` is a name this
+//! table does not yet own.
 
 /// `blk.{block}.attn_q.weight` — the query projection.
 pub fn attn_q(block: usize) -> String {

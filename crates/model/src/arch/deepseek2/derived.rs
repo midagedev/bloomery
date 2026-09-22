@@ -88,7 +88,7 @@ pub struct BlockPlan {
     /// `blk.{b}.ffn_norm.weight`, decoded.
     pub ffn_gain: Vec<f32>,
     /// Whether the block routes to experts — decided by the file, the same way
-    /// `ffn.rs` decides between the dense and the shared-expert trio: presence
+    /// `plan.rs` decides between the dense and the shared-expert trio: presence
     /// of `ffn_gate_inp`, never a block number.
     pub routed: bool,
 }
@@ -136,7 +136,8 @@ pub enum FfnPlan {
     Moe(MoeBlockPlan),
 }
 
-/// The (gate, up, down) trio `ffn::ffn_weights` selected, owned.
+/// The (gate, up, down) trio [`plan::ffn_weights`](super::plan::ffn_weights)
+/// selected, owned.
 pub struct DenseTrio {
     pub gate: TensorInfo,
     pub up: TensorInfo,
@@ -216,9 +217,9 @@ impl Derived {
             };
             let routed = gguf.find(&names::ffn_gate_inp(b)).is_some();
             let ffn = if routed {
-                FfnPlan::Moe(crate::moe::moe_block_plan(gguf, b, embd)?)
+                FfnPlan::Moe(super::plan::moe_block_plan(gguf, b, embd)?)
             } else {
-                let (gate, up, down) = crate::ffn::ffn_weights(gguf, b)?;
+                let (gate, up, down) = super::plan::ffn_weights(gguf, b)?;
                 FfnPlan::Dense(DenseTrio {
                     gate: gate.clone(),
                     up: up.clone(),
