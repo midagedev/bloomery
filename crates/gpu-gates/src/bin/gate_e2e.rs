@@ -31,11 +31,18 @@
 //!   a diagnostic and no longer a decision.
 //! - (1t) the teacher-forced arm, and the one the divergence question is
 //!   decided on: with the reference's own tokens fed as input, our argmax is
-//!   compared at every one of the set's positions, and the disagreements the
-//!   reference itself was clear about (margin at or above `MARGIN_FLOOR`)
-//!   must not exceed `FORCED_PIN`. Free running gives one event per prompt
-//!   and mis-aligns `gen_margins` past the first difference; forcing gives
-//!   `GEN` events per prompt, each with the margin that belongs to it.
+//!   compared at every one of the set's positions against the model's EXACT
+//!   answer there — `exact_ref`'s f64 truth on the same path, read from
+//!   `exact-forced-32.tsv` (`just build-exact-forced`) — and the
+//!   disagreements the truth is clear about (exact margin at or above
+//!   `MARGIN_FLOOR`) must not exceed `FORCED_PIN`. The truth file must name
+//!   the forced token file's sha256 and answer every position; a missing or
+//!   stale one fails the arm rather than falling back to ik. The same table
+//!   against ik's own tokens and margins prints as a diagnostic: ik is an
+//!   engine with its own rounding, and on that ruler its wrong answers count
+//!   as ours. Free running gives one event per prompt and mis-aligns
+//!   `gen_margins` past the first difference; forcing gives `GEN` events per
+//!   prompt, each with the margin that belongs to it.
 //! - (2) graph mode reproduces the eager sequence token for token on every
 //!   prompt — the eager-equals-replay arm every step gate has.
 //! - (3) determinism: two eager runs give identical tables.
@@ -66,7 +73,8 @@ use bloomery_gpu::GpuModel;
 use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{
-    GreedyClass, GreedyRow, compare_forced, compare_greedy, read_greedy,
+    ExactRow, GreedyClass, GreedyRow, compare_forced, compare_forced_exact, compare_greedy,
+    exact_covers, read_exact, read_greedy,
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, open_model};
@@ -99,21 +107,33 @@ const DEEP_GEN: usize = 16;
 /// both inside this floor. 0.5 is also the floor `prompts.rs`'s own
 /// classifier tests are written around. It is a classification threshold,
 /// not a band: raising it hides faults, and it is the one number this gate
-/// owns.
+/// owns. The forced arm applies the same floor to the exact margin.
 #[cfg(feature = "gpu")]
 const MARGIN_FLOOR: f32 = 0.5;
 
-/// PIN(2026-09-22): teacher-forced positions at which our argmax leaves the
-/// reference's token while the reference's own margin there is at least
-/// `MARGIN_FLOOR`. Derivation: the scalar path — f32 query rows, so a more
-/// precise path than ik CUDA's own f16-query MMA — was measured on this set
-/// with the pin lifted, and left the reference at 42 of 1056 positions, 4 of
-/// them at or above the floor (margins 1.244, 0.526, 0.515, 0.506; the rest
-/// are 19 under 0.1 and 19 in [0.1, 0.5)). Those 4 are the floor at which
-/// two correct implementations of the same model part company, not a fault,
-/// so the pin is that count plus a sample-noise allowance of its own square
-/// root: 4 + ⌈√4⌉ = 6. Calibrated on the scalar arm alone and before any
-/// tensor-core arm was read, so it is not a threshold shaped to admit one.
+/// The forced path: ik CUDA's greedy continuations, `GEN` wide.
+#[cfg(feature = "gpu")]
+const FORCED_FILE: &str = "greedy-ik-cuda-32.tsv";
+
+/// The exact truth on the forced path, written by `just build-exact-forced`.
+#[cfg(feature = "gpu")]
+const EXACT_FILE: &str = "exact-forced-32.tsv";
+
+/// PIN(2026-09-22) [잠정 — errsrc 뒤 재보정]: teacher-forced positions at
+/// which our argmax leaves the model's EXACT top1 (`exact-forced-32.tsv`)
+/// while the exact margin there is at least `MARGIN_FLOOR`. Derivation: the
+/// scalar segment pass (default levers) was measured on this set against
+/// the truth and left it at 41 of 1056 positions, 4 of them at or above the
+/// floor — 8/2 (exact margin 1.368), 18/31 (0.682), 21/24 (0.527), and
+/// 29/27 (1.382, where we pick ik's token and ik is the one that is wrong);
+/// the rest are 18 under 0.1 and 19 in [0.1, 0.5). The pin is that count
+/// plus a sample-noise allowance of its own square root: 4 + ⌈√4⌉ = 6.
+/// Calibrated on the scalar arm alone, before any tensor-core arm was read
+/// on this ruler. The scalar path is not exact either — it rounds
+/// activations to q8 and the cache to f16 as ik does — and ik itself misses
+/// the truth at 29/27 by 1.382; the provisional mark stands until the
+/// error-source round's scalar sum-order variants give the spread this
+/// count should be pinned to.
 ///
 /// The unit is the POSITION and not the prompt, which is what this replaced.
 /// Free running gave one event per prompt — 33 samples, where a move of one
@@ -296,9 +316,10 @@ fn run_forced(
 }
 
 /// The teacher-forced arm: run the forced tables, check them against the
-/// free-running table at step 0, print every disagreeing position, and judge
-/// the set on the disagreements outside `MARGIN_FLOOR`. Returns whether the
-/// arm passed.
+/// free-running table at step 0, print ik's ruler as a diagnostic and every
+/// position that disagrees with the exact truth, and judge the set on the
+/// disagreements whose exact margin is at least `MARGIN_FLOOR`. Returns
+/// whether the arm passed.
 ///
 /// `eager` is the free-running table from the same model state. Nothing has
 /// been fed back yet at step 0, so the two must agree there on every prompt.
@@ -334,21 +355,52 @@ fn check_forced(
         );
     }
 
-    let report = compare_forced(&forced, reference, MARGIN_FLOOR);
+    let ik = compare_forced(&forced, reference, MARGIN_FLOOR);
     println!(
-        "{:>3} {:>4} {:>8} {:>8} {:>10}",
-        "id", "step", "ours", "theirs", "margin"
+        "forced_ik positions={} disagree={} buckets=[{} {} {} {}] ge_floor={} max_margin={} \
+         (diagnostic)",
+        ik.positions,
+        ik.disagree.len(),
+        ik.buckets[0],
+        ik.buckets[1],
+        ik.buckets[2],
+        ik.buckets[3],
+        ik.disagree_ge_floor,
+        ik.max_margin
+            .map_or_else(|| "-".to_string(), |m| format!("{m:.3}")),
+    );
+
+    let truth = match load_truth(reference) {
+        Ok(t) => t,
+        Err(why) => {
+            println!(
+                "forced_exact {why} — the forced arm is judged on the exact truth only; build \
+                 it with `just build-exact-forced` FAIL"
+            );
+            return Ok(false);
+        }
+    };
+    let report = compare_forced_exact(&forced, &truth, MARGIN_FLOOR);
+    println!(
+        "{:>3} {:>4} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "id", "step", "ours", "exact", "ik", "exact_m", "ik_m"
     );
     for d in &report.disagree {
+        // `exact_covers` held, so the truth and the reference line up row
+        // for row and every disagreement's step is inside the reference row.
+        let r = reference
+            .iter()
+            .find(|r| r.id == d.id)
+            .expect("exact_covers matched every id");
         println!(
-            "{:>3} {:>4} {:>8} {:>8} {:>10.3}",
-            d.id, d.step, d.ours, d.theirs, d.ref_margin
+            "{:>3} {:>4} {:>8} {:>8} {:>8} {:>8.3} {:>8.3}",
+            d.id, d.step, d.ours, d.theirs, r.gen_ids[d.step], d.ref_margin, r.gen_margins[d.step]
         );
     }
     let pass = step0.is_empty() && report.disagree_ge_floor <= FORCED_PIN;
     println!(
-        "forced positions={} disagree={} buckets=[{} {} {} {}] ge_floor={} pin<={FORCED_PIN} \
-         max_margin={} {}",
+        "forced_exact positions={} disagree={} buckets=[{} {} {} {}] ge_floor={} \
+         pin<={FORCED_PIN} max_margin={} {}",
         report.positions,
         report.disagree.len(),
         report.buckets[0],
@@ -362,6 +414,49 @@ fn check_forced(
         if pass { "ok" } else { "FAIL" }
     );
     Ok(pass)
+}
+
+/// The exact truth for the forced arm, checked against what it must have
+/// been computed from: the header names `kv=f64` and the sha256 of the
+/// forced token file the gate is reading now, and the rows answer every
+/// forced position. `Err` is the reason the arm cannot be judged — a truth
+/// file computed on an older forced path answers different questions.
+#[cfg(feature = "gpu")]
+fn load_truth(reference: &[GreedyRow]) -> Result<Vec<ExactRow>, String> {
+    let path = data_file(EXACT_FILE);
+    if !path.is_file() {
+        return Err(format!("absent: no {}", path.display()));
+    }
+    let file = read_exact(&path).map_err(|e| e.to_string())?;
+    if file.header_value("kv") != Some("f64") {
+        return Err(format!(
+            "{}: header {:?} does not say kv=f64",
+            path.display(),
+            file.header
+        ));
+    }
+    let want = file
+        .header_value("forced_sha256")
+        .ok_or_else(|| format!("{}: header carries no forced_sha256", path.display()))?;
+    let forced = data_file(FORCED_FILE);
+    let out = std::process::Command::new("sha256sum")
+        .arg(&forced)
+        .output()
+        .map_err(|e| format!("sha256sum {}: {e}", forced.display()))?;
+    if !out.status.success() {
+        return Err(format!("sha256sum {}: {}", forced.display(), out.status));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let have = stdout.split_whitespace().next().unwrap_or_default();
+    if have != want {
+        return Err(format!(
+            "stale: {} was computed on forced_sha256={want}, {} is now {have}",
+            path.display(),
+            forced.display()
+        ));
+    }
+    exact_covers(&file.rows, reference).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(file.rows)
 }
 
 /// A fixed pseudo-random prompt of `n` ids: BOS, then an LCG walk over the
@@ -415,7 +510,7 @@ fn run() -> Result<(), GateError> {
     let prompts_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/prompts.tsv");
     let prompts = bloomery_gpu_gates::prompts::read_prompts(&prompts_path)?;
-    let reference = read_greedy(&data_file("greedy-ik-cuda-32.tsv"))?;
+    let reference = read_greedy(&data_file(FORCED_FILE))?;
     let argmax_only = read_argmax_ids(&data_file("argmax-ik-cuda.tsv"))?;
 
     // (0) Structural sanity, asserted: the three files describe the same
@@ -723,8 +818,8 @@ fn run() -> Result<(), GateError> {
         println!(
             "gate_e2e: PASS — the whole chain picks the greedy reference's first token on \
              every prompt or misses it only inside MARGIN_FLOOR; fed the reference's own \
-             path, it leaves that path at no more than FORCED_PIN positions the reference \
-             was clear about; graph replay equals eager \
+             path, it leaves the model's exact answer on that path at no more than \
+             FORCED_PIN positions the exact margin was clear about; graph replay equals eager \
              token for token at the pinned node count; two eager runs are identical; every \
              flash stage-doubling arm writes the base path's tokens at that same node count; a \
              seeded cache leaves the step at the same position and key count a decoded \

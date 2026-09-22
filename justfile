@@ -91,6 +91,44 @@ forced-probe ID STEP *ARGS:
 exact-ref ID *ARGS:
     ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin exact_ref && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} {{ARGS}}'
 
+# gate-gpu-e2e 교사 강제 팔의 참값 파일: prompts.tsv의 프롬프트마다 exact_ref --emit(32스텝 전부)을 돌려
+# $BLOOMERY_DATA/exact-forced-32.tsv 하나로 모은다. 머리 주석에 모델 경로, 강제 토큰 파일(greedy-ik-cuda-32.tsv)의
+# sha256, exact_ref 빌드 커밋(맥 워크트리의 git describe — 박스 트리에는 .git이 없다)과 실행한 바이너리의 sha256.
+# 임대는 프롬프트마다 따로 잡는다(전체 약 50분 — 다른 라운드가 그 사이에 끼어들 수 있게). 실행하는 바이너리는
+# 조각 디렉터리로 복사한 사본이라 도중의 다른 빌드가 바꾸지 못한다. 최종 파일은 .tmp.<pid>에 쓰고 rename한다.
+# 강제 토큰 파일을 다시 만들었으면(greedy-ref-cuda) 이것도 다시 — 게이트가 sha256으로 낡은 참값을 거부한다.
+build-exact-forced:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    commit=$(git describe --always --dirty --abbrev=12)
+    script=$(cat <<'EOF'
+    set -euo pipefail
+    cargo build --release -p bloomery-gpu-gates --bin exact_ref
+    out="$BLOOMERY_DATA/exact-forced-32.tsv"
+    forced="$BLOOMERY_DATA/greedy-ik-cuda-32.tsv"
+    ids=$(grep -v -e '^#' -e '^$' tools/ref/prompts.tsv | cut -f1)
+    parts="$out.parts.$$"
+    mkdir -p "$parts"
+    cp target/release/exact_ref "$parts/exact_ref"
+    for id in $ids; do
+      flock -w 3600 /root/bloomery-cpu.lock "$parts/exact_ref" --prompt-id "$id" --emit "$parts/p$id.tsv" > "$parts/p$id.log"
+      echo "exact-forced p$id rows=$(grep -vc '^#' "$parts/p$id.tsv")"
+    done
+    heads=$(for id in $ids; do head -n 1 "$parts/p$id.tsv"; done | sort -u)
+    [ "$(printf '%s\n' "$heads" | wc -l)" = 1 ] || { echo "build-exact-forced: parts disagree: $heads" >&2; exit 1; }
+    tmp="$out.tmp.$$"
+    {
+      echo "$heads forced=greedy-ik-cuda-32.tsv forced_sha256=$(sha256sum "$forced" | cut -d' ' -f1) exact_ref_commit=$COMMIT exact_ref_sha256=$(sha256sum "$parts/exact_ref" | cut -d' ' -f1)"
+      printf '#id\tstep\texact_top1\texact_top2\texact_margin\n'
+      for id in $ids; do grep -v '^#' "$parts/p$id.tsv"; done
+    } > "$tmp"
+    mv "$tmp" "$out"
+    rm -rf "$parts"
+    echo "build-exact-forced: wrote $out rows=$(grep -vc '^#' "$out")"
+    EOF
+    )
+    ./tools/box.sh "COMMIT=$commit; $script"
+
 # 얇은 끝-끝 디코드 CLI(greedy, 토큰 하나씩, 프리필 커널 없음). `--time` 없이 토큰만 찍는 것은
 # 평범한 실행이고, `--time`은 측정이라 임대가 필요하다 — time-gpu-generate가 그쪽이다.
 generate *ARGS:

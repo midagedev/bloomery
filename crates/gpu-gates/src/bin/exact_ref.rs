@@ -6,11 +6,18 @@
 //! cache to f16 — a position where they disagree is judged here.
 //!
 //!     exact_ref --prompt-id ID [--steps S,S,...] [--kv f64|f16] [--threads N]
+//!               [--emit PATH]
 //!
 //! The state is `gate_e2e`'s forced arm: the prompt, then the reference's own
 //! tokens (`greedy-ik-cuda-32.tsv`). For every step it prints our exact
 //! top-2 margin and where the reference's token ranks; for each `--steps`
-//! entry also the top-5. `--kv f16` rounds the latent and rope key rows to
+//! entry also the top-5. Without `--emit` the largest `--steps` entry is the
+//! last step run. `--emit PATH` runs every step of the row whatever `--steps`
+//! says and writes one `id step exact_top1 exact_top2 exact_margin` line per
+//! step to PATH — the per-prompt part `just build-exact-forced` gathers into
+//! the truth file `gate_e2e` judges the forced arm on.
+//!
+//! `--kv f16` rounds the latent and rope key rows to
 //! f16 before they are used, as both engines' caches do — the one storage
 //! rounding the model's graph itself specifies — so the two runs separate
 //! that rounding from the engines' arithmetic.
@@ -354,7 +361,11 @@ fn run() -> Res<()> {
         .iter()
         .find(|p| p.id == id)
         .ok_or_else(|| format!("exact_ref: no prompt {id}"))?;
-    let last = steps.iter().copied().max().unwrap_or(r.gen_ids.len() - 1);
+    let emit = flag_value("--emit");
+    let last = match (&emit, steps.iter().copied().max()) {
+        (None, Some(s)) => s,
+        _ => r.gen_ids.len() - 1,
+    };
     if last >= r.gen_ids.len() {
         return Err(format!(
             "exact_ref: step {last} is past the row's {}",
@@ -393,6 +404,7 @@ fn run() -> Res<()> {
     );
     println!("step\tpos\ttheirs\texact_top1\texact_margin\ttheirs_gap\tref_margin");
     let n_prompt = pr.tokens.len();
+    let mut emitted = Vec::new();
     let mut logits = Vec::new();
     for (i, &tok) in pr.tokens.iter().enumerate() {
         logits = m.step(tok, i as u32)?;
@@ -411,6 +423,7 @@ fn run() -> Res<()> {
             logits[rk[0]] - logits[theirs],
             r.gen_margins[s]
         );
+        emitted.push((rk[0], rk[1], logits[rk[0]] - logits[rk[1]]));
         if steps.contains(&s) {
             println!(
                 "  top5 step {s}: {}",
@@ -422,5 +435,42 @@ fn run() -> Res<()> {
             );
         }
     }
+    if let Some(path) = emit {
+        let model = std::env::var("BLOOMERY_REF_MODEL")
+            .unwrap_or_else(|_| bloomery_gpu_gates::DEFAULT_MODEL.to_string());
+        write_emit(Path::new(&path), id, &model, kv_f16, &emitted)?;
+    }
+    Ok(())
+}
+
+/// The `--emit` part: a header naming what the rows were computed from, then
+/// one line per step. Written to `<path>.tmp.<pid>` and renamed, so a reader
+/// never sees a half-written part.
+fn write_emit(
+    path: &Path,
+    id: usize,
+    model: &str,
+    kv_f16: bool,
+    rows: &[(usize, usize, f64)],
+) -> Res<()> {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "# exact_ref model={model} kv={}\n",
+        if kv_f16 { "f16" } else { "f64" }
+    );
+    for (s, (t1, t2, m)) in rows.iter().enumerate() {
+        writeln!(text, "{id}\t{s}\t{t1}\t{t2}\t{m:.6}")?;
+    }
+    let tmp = path.with_file_name(format!(
+        "{}.tmp.{}",
+        path.file_name()
+            .ok_or("exact_ref: --emit needs a file path")?
+            .to_string_lossy(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, text)
+        .map_err(|e| format!("exact_ref: cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("exact_ref: cannot rename to {}: {e}", path.display()))?;
     Ok(())
 }

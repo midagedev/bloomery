@@ -8,7 +8,7 @@
 //! `tools/ref/prompts.tsv`; neither tokenizes — a tokenizer difference would
 //! surface as a wrong token id and read as a kernel bug.
 //!
-//! There are two comparers, and they answer different questions.
+//! There are three comparers, and they answer different questions.
 //!
 //! `compare_greedy` judges a FREE-RUNNING continuation, and only its FIRST
 //! difference. After that difference the two continuations are conditioned on
@@ -23,6 +23,14 @@
 //! then stand at the same position on the same text at every step, so every
 //! step is evidence and `gen_margins[s]` is the margin at the place it is
 //! read. The unit is the position, not the prompt.
+//!
+//! `compare_forced_exact` is the same teacher-forced table judged against a
+//! different answer: the f64 truth `exact_ref` computes on the reference's
+//! path (`just build-exact-forced`, read by [`read_exact`]). The input path
+//! is still the reference's tokens — both engines stand on the same text —
+//! but the right answer and its margin at each position are the model's own
+//! exact ones, so a position the reference itself gets wrong is not counted
+//! against us, and one where we agree with the reference's wrong answer is.
 
 use std::path::Path;
 
@@ -299,18 +307,22 @@ pub fn compare_greedy(
 }
 
 /// One teacher-forced position: our argmax where the reference's own path
-/// was fed, against the reference's token there and its margin.
+/// was fed, against the ruler's answer there and its margin. The ruler is
+/// the reference itself under [`compare_forced`] and the exact truth under
+/// [`compare_forced_exact`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ForcedPos {
-    /// The prompt's id, from the reference row.
+    /// The prompt's id, from the ruler's row.
     pub id: usize,
     /// The step inside the continuation, indexed like `gen_ids`.
     pub step: usize,
     /// Our argmax at that step.
     pub ours: u32,
-    /// The reference's token there.
+    /// The ruler's token there: the reference's `gen_ids[step]`, or the
+    /// exact top1.
     pub theirs: u32,
-    /// The reference's own top1-top2 margin at that step, `gen_margins[step]`.
+    /// The ruler's top1-top2 margin at that step: the reference's
+    /// `gen_margins[step]`, or the exact margin.
     pub ref_margin: f32,
 }
 
@@ -320,24 +332,147 @@ pub struct ForcedPos {
 /// what the reader wants, and it must not move when a threshold does.
 pub const FORCED_BUCKETS: [f32; 3] = [0.1, 0.5, 1.0];
 
-/// `compare_forced`'s whole-set result.
+/// The whole-set result of [`compare_forced`] and [`compare_forced_exact`].
+/// "The ruler" below is the reference under the first and the exact truth
+/// under the second; the fields mean the same thing against either.
 #[derive(Debug, Clone)]
 pub struct ForcedReport {
     /// Positions compared: the sum over rows of the shorter of the two
     /// lengths. The denominator of every count below.
     pub positions: usize,
-    /// Every position where our argmax is not the reference's token, in row
+    /// Every position where our argmax is not the ruler's token, in row
     /// then step order.
     pub disagree: Vec<ForcedPos>,
-    /// Disagreements by reference margin, cut at [`FORCED_BUCKETS`]. A margin
-    /// exactly on an edge falls in the upper bucket.
+    /// Disagreements by the ruler's margin, cut at [`FORCED_BUCKETS`]. A
+    /// margin exactly on an edge falls in the upper bucket.
     pub buckets: [usize; 4],
-    /// Disagreements whose reference margin is at least `margin_floor` — the
-    /// ones the reference itself was clear about, and the decision quantity.
+    /// Disagreements whose ruler margin is at least `margin_floor` — the
+    /// ones the ruler was clear about, and the decision quantity.
     pub disagree_ge_floor: usize,
-    /// The largest reference margin at any disagreement, `None` when there
-    /// are none.
+    /// The largest ruler margin at any disagreement, `None` when there are
+    /// none.
     pub max_margin: Option<f32>,
+}
+
+/// One prompt of the exact truth file (`just build-exact-forced`,
+/// `exact_ref --emit`): at each step of the reference's forced path, the
+/// model's exact top1 and top2 and the margin between them. Indexed like
+/// `gen_ids`.
+#[derive(Debug, Clone)]
+pub struct ExactRow {
+    pub id: usize,
+    pub top1: Vec<u32>,
+    pub top2: Vec<u32>,
+    pub margins: Vec<f32>,
+}
+
+/// The exact truth file: its first comment line (what the rows were
+/// computed from, as `key=value` words) and one [`ExactRow`] per prompt in
+/// file order.
+#[derive(Debug, Clone)]
+pub struct ExactFile {
+    pub header: String,
+    pub rows: Vec<ExactRow>,
+}
+
+impl ExactFile {
+    /// The value of `key=value` in the header, `None` when the header does
+    /// not carry the key.
+    #[must_use]
+    pub fn header_value(&self, key: &str) -> Option<&str> {
+        self.header
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+    }
+}
+
+/// The exact truth file written by `just build-exact-forced`: a header
+/// comment, a column comment, then `id step exact_top1 exact_top2
+/// exact_margin` lines. A prompt's lines are contiguous and its steps run
+/// 0, 1, 2, … without a gap — a missing step would leave a forced position
+/// with no answer, and the comparer must never skip one silently.
+pub fn read_exact(path: &Path) -> Result<ExactFile, GateError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read_exact: cannot read {}: {e}", path.display()))?;
+    let mut header = None;
+    let mut rows: Vec<ExactRow> = Vec::new();
+    for line in text.lines() {
+        if let Some(c) = line.strip_prefix('#') {
+            if header.is_none() {
+                header = Some(c.trim().to_string());
+            }
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let bad = |why: &str| -> GateError {
+            format!("read_exact: {}: {why}: {line:?}", path.display()).into()
+        };
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 5 {
+            return Err(bad("want id<tab>step<tab>top1<tab>top2<tab>margin"));
+        }
+        let int = |s: &str| s.trim().parse::<usize>().map_err(|e| bad(&e.to_string()));
+        let tok = |s: &str| s.trim().parse::<u32>().map_err(|e| bad(&e.to_string()));
+        let (id, step) = (int(f[0])?, int(f[1])?);
+        let margin = f[4]
+            .trim()
+            .parse::<f32>()
+            .map_err(|e| bad(&e.to_string()))?;
+        if rows.last().is_none_or(|r| r.id != id) {
+            if rows.iter().any(|r| r.id == id) {
+                return Err(bad("the prompt's rows are not contiguous"));
+            }
+            rows.push(ExactRow {
+                id,
+                top1: Vec::new(),
+                top2: Vec::new(),
+                margins: Vec::new(),
+            });
+        }
+        let r = rows.last_mut().expect("a row was pushed above");
+        if step != r.top1.len() {
+            return Err(bad(&format!("step {step} where {} was next", r.top1.len())));
+        }
+        r.top1.push(tok(f[2])?);
+        r.top2.push(tok(f[3])?);
+        r.margins.push(margin);
+    }
+    if rows.is_empty() {
+        return Err(format!("read_exact: no rows in {}", path.display()).into());
+    }
+    Ok(ExactFile {
+        header: header.unwrap_or_default(),
+        rows,
+    })
+}
+
+/// Whether `exact` answers every forced position of `reference`: the same
+/// prompts in the same order, each with at least the reference row's own
+/// length of steps. `Err` says which position has no answer.
+pub fn exact_covers(exact: &[ExactRow], reference: &[GreedyRow]) -> Result<(), String> {
+    if exact.len() != reference.len() {
+        return Err(format!(
+            "{} truth rows for {} reference rows",
+            exact.len(),
+            reference.len()
+        ));
+    }
+    for (e, r) in exact.iter().zip(reference) {
+        if e.id != r.id {
+            return Err(format!("truth row {} against reference row {}", e.id, r.id));
+        }
+        if e.top1.len() < r.gen_ids.len() {
+            return Err(format!(
+                "prompt {}: the truth has {} steps, the reference {}",
+                r.id,
+                e.top1.len(),
+                r.gen_ids.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Judge our teacher-forced argmaxes against the reference, position by
@@ -368,19 +503,73 @@ pub fn compare_forced(
         ours.len(),
         reference.len()
     );
+    tally_forced(
+        ours.iter().zip(reference).map(|(t, r)| {
+            (
+                r.id,
+                t.as_slice(),
+                r.gen_ids.as_slice(),
+                r.gen_margins.as_slice(),
+            )
+        }),
+        margin_floor,
+    )
+}
+
+/// Judge our teacher-forced argmaxes against the exact truth, position by
+/// position: [`compare_forced`] with the answer and margin at every position
+/// taken from `exact` instead of from the reference.
+///
+/// `ours[i]` is the same forced table [`compare_forced`] takes — the
+/// reference's path fed as input — and `exact[i]` is the truth computed on
+/// that same path for the same prompt (check with [`exact_covers`] first).
+/// A row is compared over the shorter of the two lengths.
+///
+/// # Panics
+///
+/// Panics when `ours.len() != exact.len()`, for the reason
+/// [`compare_forced`] does.
+#[must_use]
+pub fn compare_forced_exact(
+    ours: &[Vec<u32>],
+    exact: &[ExactRow],
+    margin_floor: f32,
+) -> ForcedReport {
+    assert_eq!(
+        ours.len(),
+        exact.len(),
+        "compare_forced_exact: {} tables for {} truth rows",
+        ours.len(),
+        exact.len()
+    );
+    tally_forced(
+        ours.iter()
+            .zip(exact)
+            .map(|(t, e)| (e.id, t.as_slice(), e.top1.as_slice(), e.margins.as_slice())),
+        margin_floor,
+    )
+}
+
+/// The two forced comparers' shared count: per row `(id, ours, the ruler's
+/// tokens, the ruler's margins)`, compared over the shorter of `ours` and
+/// the ruler's tokens.
+fn tally_forced<'a>(
+    rows: impl Iterator<Item = (usize, &'a [u32], &'a [u32], &'a [f32])>,
+    margin_floor: f32,
+) -> ForcedReport {
     let mut positions = 0usize;
     let mut disagree = Vec::new();
     let mut buckets = [0usize; 4];
     let mut disagree_ge_floor = 0usize;
     let mut max_margin: Option<f32> = None;
-    for (table, r) in ours.iter().zip(reference) {
-        let span = table.len().min(r.gen_ids.len());
+    for (id, table, truth, margins) in rows {
+        let span = table.len().min(truth.len());
         positions += span;
         for step in 0..span {
-            if table[step] == r.gen_ids[step] {
+            if table[step] == truth[step] {
                 continue;
             }
-            let m = r.gen_margins[step];
+            let m = margins[step];
             let b = FORCED_BUCKETS.iter().filter(|&&e| m >= e).count();
             buckets[b] += 1;
             if m >= margin_floor {
@@ -388,10 +577,10 @@ pub fn compare_forced(
             }
             max_margin = Some(max_margin.map_or(m, |x: f32| x.max(m)));
             disagree.push(ForcedPos {
-                id: r.id,
+                id,
                 step,
                 ours: table[step],
-                theirs: r.gen_ids[step],
+                theirs: truth[step],
                 ref_margin: m,
             });
         }
@@ -523,6 +712,117 @@ mod tests {
         assert!(f.disagree.is_empty());
         assert_eq!(f.buckets, [0, 0, 0, 0]);
         assert_eq!(f.max_margin, None);
+    }
+
+    /// The exact ruler judges against the truth's answer and margin, not the
+    /// reference's: a position where we side with a wrong reference counts,
+    /// one where we side with the truth against a confident reference does
+    /// not, and the buckets and the floor read the truth's margin. Rows
+    /// built so the two forced comparers must give different answers.
+    #[test]
+    fn compare_forced_exact_judges_against_the_truth_not_the_reference() {
+        let floor = 0.5f32;
+        let reference = vec![
+            row(0, &[10, 11, 12], &[2.0, 0.9, 0.3]),
+            row(1, &[20, 21, 22], &[1.0, 0.1, 0.2]),
+        ];
+        let exact = vec![
+            // Step 1: the reference's 11 is wrong, the truth is 15 by 1.4.
+            // Step 2: the reference is right but the truth's margin is 0.05.
+            ExactRow {
+                id: 0,
+                top1: vec![10, 15, 12],
+                top2: vec![7, 11, 13],
+                margins: vec![2.1, 1.4, 0.05],
+            },
+            // Step 0: the reference's 20 is wrong by a near tie, truth 23 by
+            // 0.2; step 1 right, margin exactly on the floor.
+            ExactRow {
+                id: 1,
+                top1: vec![23, 21, 22],
+                top2: vec![20, 9, 8],
+                margins: vec![0.2, 0.5, 1.0],
+            },
+        ];
+        // Row 0: we side with the reference at 1 (wrong), differ from both at 2.
+        // Row 1: we side with the truth at 0, differ from both at 1.
+        let ours = vec![vec![10, 11, 99], vec![23, 98, 22]];
+        let f = compare_forced_exact(&ours, &exact, floor);
+        assert_eq!(f.positions, 6);
+        assert_eq!(f.disagree.len(), 3);
+        // [0,0.1): 0.05. [0.1,0.5): none. [0.5,1.0): 0.5. [1.0,inf): 1.4.
+        assert_eq!(f.buckets, [1, 0, 1, 1]);
+        assert_eq!(f.disagree_ge_floor, 2);
+        assert_eq!(f.max_margin, Some(1.4));
+        assert_eq!(
+            f.disagree[0],
+            ForcedPos {
+                id: 0,
+                step: 1,
+                ours: 11,
+                theirs: 15,
+                ref_margin: 1.4,
+            }
+        );
+        // The reference ruler sees the same table differently: it counts row
+        // 1 step 0 (reference margin 1.0) and never sees row 0 step 1.
+        let g = compare_forced(&ours, &reference, floor);
+        assert_eq!(g.disagree.len(), 3);
+        assert_eq!(g.disagree_ge_floor, 1);
+        assert_eq!((g.disagree[1].id, g.disagree[1].step), (1, 0));
+    }
+
+    /// `read_exact` groups contiguous steps per prompt and reads the header;
+    /// a gap in the steps, a prompt split in two, or a short line is an
+    /// error, and `exact_covers` names a prompt the truth does not answer
+    /// all the way.
+    #[test]
+    fn read_exact_takes_contiguous_steps_and_checks_coverage() -> std::io::Result<()> {
+        let uniq = std::process::id();
+        let dir = std::env::temp_dir();
+        let head = "# exact_ref model=/m.gguf kv=f64 forced_sha256=abc\n\
+                    #id\tstep\texact_top1\texact_top2\texact_margin\n";
+        let p = dir.join(format!("bloomery-read-exact-{uniq}.tsv"));
+        std::fs::write(
+            &p,
+            format!(
+                "{head}0\t0\t10\t7\t2.000000\n0\t1\t11\t9\t0.250000\n\
+                 1\t0\t20\t3\t1.500000\n"
+            ),
+        )?;
+        let f = read_exact(&p).unwrap();
+        assert_eq!(f.header_value("kv"), Some("f64"));
+        assert_eq!(f.header_value("forced_sha256"), Some("abc"));
+        assert_eq!(f.header_value("sha256"), None);
+        assert_eq!(f.rows.len(), 2);
+        assert_eq!(f.rows[0].top1, vec![10, 11]);
+        assert_eq!(f.rows[0].top2, vec![7, 9]);
+        assert_eq!(f.rows[0].margins, vec![2.0, 0.25]);
+        assert_eq!((f.rows[1].id, f.rows[1].top1.len()), (1, 1));
+
+        let reference = vec![row(0, &[10, 11], &[1.0, 1.0]), row(1, &[20], &[1.0])];
+        assert!(exact_covers(&f.rows, &reference).is_ok());
+        let longer = vec![
+            row(0, &[10, 11], &[1.0, 1.0]),
+            row(1, &[20, 21], &[1.0, 1.0]),
+        ];
+        assert!(exact_covers(&f.rows, &longer).is_err());
+        let other = vec![row(0, &[10, 11], &[1.0, 1.0]), row(2, &[20], &[1.0])];
+        assert!(exact_covers(&f.rows, &other).is_err());
+
+        for (name, body) in [
+            ("gap", "0\t0\t10\t7\t2.0\n0\t2\t11\t9\t0.25\n"),
+            (
+                "split",
+                "0\t0\t10\t7\t2.0\n1\t0\t20\t3\t1.5\n0\t1\t11\t9\t0.25\n",
+            ),
+            ("short", "0\t0\t10\t7\n"),
+        ] {
+            let pb = dir.join(format!("bloomery-read-exact-{name}-{uniq}.tsv"));
+            std::fs::write(&pb, format!("{head}{body}"))?;
+            assert!(read_exact(&pb).is_err(), "{name} must not parse");
+        }
+        Ok(())
     }
 
     /// `read_greedy` parses only the 7-column `--gen` format, and enforces
