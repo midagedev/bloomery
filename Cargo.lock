@@ -92,7 +92,7 @@ dependencies = [
  "bloomery-gpu",
  "bloomery-model",
  "cuda-core",
- "oxide-artifacts 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c)",
+ "oxide-artifacts",
 ]
 
 [[package]]
@@ -240,7 +240,7 @@ dependencies = [
  "cuda-bindings",
  "cuda-core-derive",
  "half",
- "oxide-artifacts 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "oxide-artifacts",
 ]
 
 [[package]]
@@ -513,14 +513,6 @@ name = "oxide-artifacts"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74d9a941c0c43d2dceaf25f5c9ca4c9f9cceb28dfa5e4e3cfd14e476f003e7c9"
-dependencies = [
- "object",
-]
-
-[[package]]
-name = "oxide-artifacts"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
 dependencies = [
  "object",
 ]

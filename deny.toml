@@ -14,8 +14,13 @@ allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# 워크스페이스 멤버끼리는 버전 없는 path 의존으로 묶이고, 멤버는 전부 publish = false다. 이 설정이
+# 풀어 주는 것은 정확히 그 경우뿐이다 — crates.io·git 의존의 와일드카드는 여전히 막힌다.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = ["https://github.com/NVlabs/cuda-oxide.git"]
+# git 의존은 rev로만 받는다. branch나 tag로 떠 있으면 rc가 0이 아니다(git-source-underspecified).
+required-git-spec = "rev"

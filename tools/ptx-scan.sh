@@ -18,9 +18,13 @@
 # read from those files and from nothing else in the section.
 #
 # Asserting is the gates' job. This script only prints a table:
-#   gate_p5 `no_local_depot`  — depot, ld.local and st.local are all 0 for the five flash kernels
-#   gate_p4 `norm_geometry`   — .reqntid of rms_norm and norm_quant == RMS_THREADS
-#   gate_p4 `argmax_geometry` — .reqntid of argmax == ARGMAX_THREADS
+#   gate_p5 `no_local_depot`        — depot, ld.local and st.local are all 0 for the four flash
+#                                     kernels and the two kv_append entries
+#   gate_p4 `norm_geometry`         — .reqntid of rms_norm and norm_quant == RMS_THREADS
+#   gate_p4 `argmax_geometry`       — .reqntid of argmax == ARGMAX_THREADS
+#   gate_p6 `router_shape`          — the fma floor and no depot for f32_gemv and q8_0_gemv, and
+#                                     .reqntid of router_topk and expert_table
+#   gate_p6 `q3k_half_decode_shape` — no clz and a hardware f16 convert in both Q3_K entries
 #
 # Mind the spelling: PTX writes a fused multiply-add as `fma.rn.f32` (and `fma.rm.f32`). There is
 # no `fma.f32` anywhere, so counting that silently returns 0 and the kernel reads as clean — here
@@ -101,7 +105,13 @@ if ! "$EXTRACT" "$PTX" "$MODS" >"$MODS/list"; then
 fi
 sed 's/^/ptx-scan: /' "$MODS/list" >&2
 NMOD=$(grep -c '^mod[0-9]' "$MODS/list")
-if [ -x "$PTXAS" ]; then TOOLS="ptxas=$PTXAS arch=$ARCH"; else TOOLS=ptxas=none; fi
+# The version names the assembler the last four columns come from: a toolkit move changes them.
+if [ -x "$PTXAS" ]; then
+  PTXAS_VER=$("$PTXAS" --version 2>/dev/null | sed -n 's/.*, V\([0-9][0-9.]*\)$/\1/p')
+  TOOLS="ptxas=$PTXAS ptxas-version=${PTXAS_VER:-unknown} arch=$ARCH"
+else
+  TOOLS=ptxas=none
+fi
 if [ "$NMOD" = 0 ]; then
   echo "ptx-scan: the .oxart section carries no PTX payload" >&2
   fail "$SEC $TOOLS modules=0"

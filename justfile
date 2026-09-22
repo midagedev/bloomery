@@ -430,7 +430,7 @@ gate-1-1:
     ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && "$BLOOMERY_DATA/bin/dequant_ref" "${BLOOMERY_V41_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}" "$BLOOMERY_DATA/ref-v41" f32 bf16 q8_0 && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1
+gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-gpu-gates-lib
 
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.
@@ -448,6 +448,9 @@ gate-gpu-head:
 gate-gpu-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib'
 
+# bloomery-gpu-gates 라이브러리의 단위 시험(호스트 전용, 카드·게이트 락 없음). ptx.rs의 컨테이너 판독 계약 —
+# 8의 배수 길이 페이로드의 마지막 본문, 번들 경계, 파서가 거부한 섹션은 빈 표가 아니라 오류 — 이 여기서 돈다.
+# gpu 피처 없이 빌드하므로 디바이스 크레이트를 컴파일하지 않고, 그래서 평범한 cargo다. just gate가 부른다.
 gate-gpu-gates-lib:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib'
 

@@ -18,7 +18,9 @@
 //! multiply-add), and a launch geometry that left one warp resident for a
 //! whole row. `gate_p5::no_local_depot` asserts the depot counts of the
 //! flash kernels; `gate_p4::norm_geometry` asserts `rms_norm`/`norm_quant`
-//! and `argmax` against the block width their host side launches.
+//! and `argmax` against the block width their host side launches;
+//! `gate_p6` asserts the router gemvs' multiply-add floor and the Q3_K
+//! entries' hardware f16 convert.
 //!
 //! Spelling matters more than it looks: PTX writes a fused multiply-add as
 //! `fma.rn.f32` (and `fma.rm.f32`), never `fma.f32`, so [`Counts::fma`]
