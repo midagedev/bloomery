@@ -34,3 +34,4 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref}"
 : "${REF_SET_CUDA:=ref_cuda}"
+REF_TOKENS=100000,549,6077,280,7239,317
