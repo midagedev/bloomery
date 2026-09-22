@@ -13,7 +13,7 @@
 //! weights, and caching it is not the design: each site is mapped and read
 //! where it lies.
 //!
-//! Three shapes the caller has to know about:
+//! Four shapes the caller has to know about:
 //!
 //! * **Rows are borrowed from the mapping.** [`Site::row`] returns a slice into
 //!   the mapped file; nothing is copied and nothing is allocated per row.
@@ -24,6 +24,11 @@
 //! * **Prefetch is a cold-path lever and a warm-path tax.** It costs one
 //!   syscall per row whether or not the page is resident, so a caller that
 //!   expects hits should not pay it.
+//! * **Borrowing moves the faults onto whoever reads.** A consumer that reads
+//!   through the mapping takes one minor fault per row no matter who advised
+//!   the pages, and the engine's step is its calling thread's serial time. So
+//!   [`Site::copy_rows`] and [`prefetch::Prefetcher`] exist: the helper thread
+//!   advises, faults and copies, and the step thread gets one memcpy.
 //!
 //! The strict reader ([`gguf::Gguf`]) refuses these shards: the engine has no
 //! `GgmlType` for Q8_0-as-a-weight yet. So the header comes from
@@ -36,6 +41,8 @@ use std::path::{Path, PathBuf};
 
 use gguf::{LoadError, RawTensorInfo, inventory_of};
 use memmap2::{Advice, Mmap, UncheckedAdvice};
+
+pub mod prefetch;
 
 /// ggml type id of Q8_0, the type both engram tables carry.
 const GGML_TYPE_Q8_0: u32 = 8;
@@ -78,8 +85,23 @@ pub enum EngramError {
         nbytes: u64,
         len: u64,
     },
+    #[error("{name}: copying {rows} rows wants a {want} B buffer, got {got} B")]
+    OutBufferSize {
+        name: String,
+        rows: usize,
+        want: usize,
+        got: usize,
+    },
     #[error("{name}: row {id} is past the {rows} rows the header states")]
     RowOutOfRange { name: String, id: u32, rows: u64 },
+    #[error("prefetcher: {0}")]
+    Prefetch(&'static str),
+}
+
+/// A byte count as `posix_fadvise` takes it. The mapping is far under
+/// `off_t::MAX`, so this cannot fail on any host that mapped the file.
+fn fadvise_off(n: usize) -> libc::off_t {
+    libc::off_t::try_from(n).expect("a span inside a mapping fits an off_t")
 }
 
 /// One engram table: a Q8_0 row store mapped where it lies in its shard.
@@ -96,7 +118,7 @@ pub struct Site {
     base: u64,
     row_bytes: u64,
     rows: u64,
-    /// `sysconf(_SC_PAGESIZE)`, read once: the unit `evict_range` must round to.
+    /// `sysconf(_SC_PAGESIZE)`, read once: the unit `page_span` rounds to.
     page: u64,
 }
 
@@ -264,6 +286,53 @@ impl Site {
         Ok(())
     }
 
+    /// Fault `ids`' pages in and return only when they are resident.
+    ///
+    /// `MADV_POPULATE_READ` walks the range in the kernel, so the later touch
+    /// takes no user-mode trap per page. It is **synchronous**: under
+    /// `MADV_RANDOM` a cold page is one device round trip and this call waits
+    /// for each of them in turn. The order that makes it cheap is
+    /// [`Site::prefetch`] first — `WILLNEED` submits every row's read at once —
+    /// and `populate` after, which then waits on reads already in flight.
+    /// Calling it alone on cold rows pays the device latency once per row.
+    pub fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
+        for &id in ids {
+            if u64::from(id) >= self.rows {
+                return Err(EngramError::RowOutOfRange {
+                    name: self.name.clone(),
+                    id,
+                    rows: self.rows,
+                });
+            }
+            let (first, span) = self.page_span(self.file_offset(id), self.row_bytes);
+            self.map.advise_range(Advice::PopulateRead, first, span)?;
+        }
+        Ok(())
+    }
+
+    /// Every row of `ids`, in order, **copied** into `out`.
+    ///
+    /// `out.len()` must be exactly `ids.len() * row_bytes()`. The reads go
+    /// through the mapping, so the faults land on the calling thread — which is
+    /// the point: [`prefetch::Prefetcher`] calls this on its helper so the step
+    /// thread never touches the mapping.
+    pub fn copy_rows(&self, ids: &[u32], out: &mut [u8]) -> Result<(), EngramError> {
+        let stride = self.row_bytes as usize;
+        let want = ids.len() * stride;
+        if out.len() != want {
+            return Err(EngramError::OutBufferSize {
+                name: self.name.clone(),
+                rows: ids.len(),
+                want,
+                got: out.len(),
+            });
+        }
+        for (&id, slot) in ids.iter().zip(out.chunks_exact_mut(stride)) {
+            slot.copy_from_slice(self.row(id)?);
+        }
+        Ok(())
+    }
+
     /// Drop `ids`' pages from this process and from the page cache, so the next
     /// read of them is a real device read again.
     ///
@@ -295,20 +364,27 @@ impl Site {
         self.evict_range(self.base, self.rows * self.row_bytes)
     }
 
-    fn evict_range(&self, at: u64, len: u64) -> Result<(), EngramError> {
-        // `posix_fadvise(DONTNEED)` rounds its range **inward** — the start up to
-        // a page, the end down to one — so that it never drops a page the caller
-        // named only part of. A 272 B row names no whole page, so the un-grown
-        // call invalidates nothing and the "cold" read that follows is a page-
-        // cache hit. Growing to whole pages is what makes this function do
-        // anything, and every page in the range holds rows of this table and
-        // nothing else, so the whole page is the right unit.
+    /// `at..at + len` grown outward to whole pages, clamped to the mapping.
+    ///
+    /// `posix_fadvise(DONTNEED)` rounds its range **inward** — the start up to
+    /// a page, the end down to one — so that it never drops a page the caller
+    /// named only part of. A 272 B row names no whole page, so the un-grown
+    /// call invalidates nothing and the "cold" read that follows is a page-
+    /// cache hit. Growing to whole pages is what makes eviction do anything,
+    /// and every page in the range holds rows of this table and nothing else,
+    /// so the whole page is the right unit. The advice paths round the same way
+    /// for the same reason: a row that straddles names both its pages.
+    fn page_span(&self, at: u64, len: u64) -> (usize, usize) {
         let first = at / self.page * self.page;
         let end = (at + len)
             .div_ceil(self.page)
             .min((self.map.len() as u64).div_ceil(self.page))
             * self.page;
-        let span = (end - first) as usize;
+        (first as usize, (end - first) as usize)
+    }
+
+    fn evict_range(&self, at: u64, len: u64) -> Result<(), EngramError> {
+        let (first, span) = self.page_span(at, len);
 
         // SAFETY: `map` is a read-only `MAP_SHARED` view of a file. MADV_DONTNEED
         // on such a mapping drops the page-table entries only — the next touch
@@ -317,14 +393,14 @@ impl Site {
         // anonymous.
         unsafe {
             self.map
-                .unchecked_advise_range(UncheckedAdvice::DontNeed, first as usize, span)?;
+                .unchecked_advise_range(UncheckedAdvice::DontNeed, first, span)?;
         }
         // SAFETY: the descriptor is this file's own and `self` outlives the call.
         let rc = unsafe {
             libc::posix_fadvise(
                 self.file.as_raw_fd(),
-                first as libc::off_t,
-                span as libc::off_t,
+                fadvise_off(first),
+                fadvise_off(span),
                 libc::POSIX_FADV_DONTNEED,
             )
         };
@@ -400,13 +476,31 @@ pub struct Faults {
     pub minor: u64,
 }
 
+/// glibc `bits/resource.h` defines `RUSAGE_THREAD` as 1; the `libc` crate
+/// exposes it for uclibc and emscripten but not for linux-gnu.
+const RUSAGE_THREAD: libc::c_int = 1;
+
 /// This process's fault counts right now.
 pub fn faults() -> Faults {
+    faults_of(libc::RUSAGE_SELF)
+}
+
+/// The **calling thread's** fault counts right now.
+///
+/// This is the counter a helper-thread design needs: the process total cannot
+/// say which thread paid for a fault, and the whole claim of moving the read
+/// off the step thread is that the step thread stops taking them. Sample it on
+/// the thread it describes — a thread cannot ask for another's.
+pub fn faults_thread() -> Faults {
+    faults_of(RUSAGE_THREAD)
+}
+
+fn faults_of(who: libc::c_int) -> Faults {
     // SAFETY: `usage` is a live, writable `rusage` for the duration of the call
     // and `getrusage` fills it or leaves it untouched.
     let usage = unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
-        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        libc::getrusage(who, &mut usage);
         usage
     };
     Faults {

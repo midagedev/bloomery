@@ -114,6 +114,45 @@ fn hw_engram_rows_match_pread() {
     }
 }
 
+/// A copied row is the borrowed row.
+///
+/// The copied path is what a helper thread hands the step thread, so it is the
+/// bytes the engine will actually consume — and it is the one path with an
+/// arithmetic of its own: `ids.len() * row_bytes` of destination, sliced per
+/// row. An off-by-one stride there, or a straddling row copied short, would be
+/// invisible to the borrowing gates above. The sample carries the page
+/// straddler for exactly that reason.
+#[test]
+#[ignore = "hw: needs the box and the V4.1 split"]
+fn hw_engram_copy_rows_matches_row() {
+    let engram = open();
+
+    for site in engram.sites() {
+        let ids = sample(site, 64);
+        let stride = site.row_bytes() as usize;
+        let mut copied = vec![0u8; ids.len() * stride];
+        site.copy_rows(&ids, &mut copied).unwrap();
+
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(
+                &copied[i * stride..(i + 1) * stride],
+                site.row(id).unwrap(),
+                "{} row {id}: the copy disagrees with the borrow",
+                site.name(),
+            );
+        }
+
+        // The length contract is the other half: a buffer that is not exactly
+        // one row per id is an error, never a short copy.
+        assert!(
+            site.copy_rows(&ids, &mut copied[..ids.len() * stride - 1])
+                .is_err(),
+            "{}: a short buffer must be refused",
+            site.name()
+        );
+    }
+}
+
 /// The row stride tiles the tensor exactly, and the last row ends on the
 /// tensor's last byte.
 ///
