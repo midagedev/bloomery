@@ -127,8 +127,11 @@ pub(crate) fn f32_lane_partials(
 /// in flight a lane pays one memory round trip per chunk and the row's cost
 /// is the chunk count times that latency, whatever the grid geometry is.
 /// Issuing this many loads first is what turns the walk into a bandwidth
-/// problem; it does not touch the accumulation order.
-pub const LANE_UNROLL: usize = 4;
+/// problem; it does not touch the accumulation order. Both bodies spell the
+/// chunks out as named scalars, so the value is pinned to the width they are
+/// written for.
+pub const LANE_UNROLL: usize = 8;
+const _: () = assert!(LANE_UNROLL == 8);
 
 /// Lane `lane`'s partial sum for one F32 row against a single activation
 /// column: `Σ_it fma(w[row·k + 32·it + lane], x[32·it + lane])`, accumulated
@@ -147,25 +150,37 @@ pub(crate) fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, la
     // trip that costs is the thing this body exists to avoid.
     while it + LANE_UNROLL <= iters {
         let kk = it * 32 + lane;
-        // SAFETY: kk + 96 < k by the loop guard (LANE_UNROLL = 4), so every
+        // SAFETY: kk + 224 < k by the loop guard (LANE_UNROLL = 8), so every
         // read is inside w[w_row .. w_row + k] and x[0 .. k], both covered by
         // the caller contract (w.len() >= (row+1)*k, x.len() >= k).
-        let (w0, w1, w2, w3, x0, x1, x2, x3) = unsafe {
+        let (w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7) = unsafe {
             (
                 *w.get_unchecked(w_row + kk),
                 *w.get_unchecked(w_row + kk + 32),
                 *w.get_unchecked(w_row + kk + 64),
                 *w.get_unchecked(w_row + kk + 96),
+                *w.get_unchecked(w_row + kk + 128),
+                *w.get_unchecked(w_row + kk + 160),
+                *w.get_unchecked(w_row + kk + 192),
+                *w.get_unchecked(w_row + kk + 224),
                 *x.get_unchecked(kk),
                 *x.get_unchecked(kk + 32),
                 *x.get_unchecked(kk + 64),
                 *x.get_unchecked(kk + 96),
+                *x.get_unchecked(kk + 128),
+                *x.get_unchecked(kk + 160),
+                *x.get_unchecked(kk + 192),
+                *x.get_unchecked(kk + 224),
             )
         };
         f = f32::mul_add(w0, x0, f);
         f = f32::mul_add(w1, x1, f);
         f = f32::mul_add(w2, x2, f);
         f = f32::mul_add(w3, x3, f);
+        f = f32::mul_add(w4, x4, f);
+        f = f32::mul_add(w5, x5, f);
+        f = f32::mul_add(w6, x6, f);
+        f = f32::mul_add(w7, x7, f);
         it += LANE_UNROLL;
     }
     while it < iters {
@@ -276,8 +291,9 @@ pub(crate) fn q8_0_lane_partials(
 /// Lane `lane`'s partial sum for one Q8_0 row against a single activation
 /// column — [`q8_0_lane_partials`]'s column 0, same weight decode and same
 /// order, with [`LANE_UNROLL`] chunks' code, scale and activation loads
-/// hoisted above the multiply-adds that consume them. Caller contract as
-/// [`q8_0_lane_partials`] with `m_cols` 1.
+/// hoisted above the multiply-adds that consume them, then four for a
+/// remainder of four or more. Caller contract as [`q8_0_lane_partials`] with
+/// `m_cols` 1.
 #[inline(always)]
 pub(crate) fn q8_0_lane_partial_1col(
     qs: &[u32],
@@ -297,11 +313,84 @@ pub(crate) fn q8_0_lane_partial_1col(
     while it + LANE_UNROLL <= iters {
         let kk = it * 32 + lane;
         let sh = 8 * (kk & 3);
-        // SAFETY: kk + 96 < k by the loop guard, so word (kk + 96)/4 < k/4
-        // and scale it + 3 < k/32 are inside qs and d from their row bases,
-        // and x0 + kk + 96 < x0 + k <= x.len() — all by the caller contract.
-        // The four chunks are 32 values apart, so each keeps the byte lane
-        // `kk & 3` of its own word.
+        // SAFETY: kk + 224 < k by the loop guard (LANE_UNROLL = 8), so word
+        // (kk + 224)/4 < k/4 and scale it + 7 < k/32 are inside qs and d from
+        // their row bases, and x0 + kk + 224 < x0 + k <= x.len() — all by the
+        // caller contract. The eight chunks are 32 values apart, so each keeps
+        // the byte lane `kk & 3` of its own word.
+        let (
+            q0,
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            d0,
+            d1,
+            d2,
+            d3,
+            d4,
+            d5,
+            d6,
+            d7,
+            x0v,
+            x1v,
+            x2v,
+            x3v,
+            x4v,
+            x5v,
+            x6v,
+            x7v,
+        ) = unsafe {
+            (
+                *qs.get_unchecked(qs_row + (kk >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 32) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 64) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 96) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 128) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 160) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 192) >> 2)),
+                *qs.get_unchecked(qs_row + ((kk + 224) >> 2)),
+                *d.get_unchecked(d_row + it),
+                *d.get_unchecked(d_row + it + 1),
+                *d.get_unchecked(d_row + it + 2),
+                *d.get_unchecked(d_row + it + 3),
+                *d.get_unchecked(d_row + it + 4),
+                *d.get_unchecked(d_row + it + 5),
+                *d.get_unchecked(d_row + it + 6),
+                *d.get_unchecked(d_row + it + 7),
+                *x.get_unchecked(x0 + kk),
+                *x.get_unchecked(x0 + kk + 32),
+                *x.get_unchecked(x0 + kk + 64),
+                *x.get_unchecked(x0 + kk + 96),
+                *x.get_unchecked(x0 + kk + 128),
+                *x.get_unchecked(x0 + kk + 160),
+                *x.get_unchecked(x0 + kk + 192),
+                *x.get_unchecked(x0 + kk + 224),
+            )
+        };
+        f = f32::mul_add((q0 >> sh) as u8 as i8 as f32 * d0, x0v, f);
+        f = f32::mul_add((q1 >> sh) as u8 as i8 as f32 * d1, x1v, f);
+        f = f32::mul_add((q2 >> sh) as u8 as i8 as f32 * d2, x2v, f);
+        f = f32::mul_add((q3 >> sh) as u8 as i8 as f32 * d3, x3v, f);
+        f = f32::mul_add((q4 >> sh) as u8 as i8 as f32 * d4, x4v, f);
+        f = f32::mul_add((q5 >> sh) as u8 as i8 as f32 * d5, x5v, f);
+        f = f32::mul_add((q6 >> sh) as u8 as i8 as f32 * d6, x6v, f);
+        f = f32::mul_add((q7 >> sh) as u8 as i8 as f32 * d7, x7v, f);
+        it += LANE_UNROLL;
+    }
+    // Four or more chunks left: hoist four, so a short row (a 128-value head
+    // dot is exactly four chunks) has its loads in flight together in the
+    // PTX itself; the loop below is one chunk per iteration unless the
+    // assembler unrolls it.
+    if it + 4 <= iters {
+        let kk = it * 32 + lane;
+        let sh = 8 * (kk & 3);
+        // SAFETY: kk + 96 < k by the guard, so word (kk + 96)/4 < k/4 and
+        // scale it + 3 < k/32 are inside qs and d from their row bases, and
+        // x0 + kk + 96 < x0 + k <= x.len() — all by the caller contract.
         let (q0, q1, q2, q3, d0, d1, d2, d3, x0v, x1v, x2v, x3v) = unsafe {
             (
                 *qs.get_unchecked(qs_row + (kk >> 2)),
@@ -322,7 +411,7 @@ pub(crate) fn q8_0_lane_partial_1col(
         f = f32::mul_add((q1 >> sh) as u8 as i8 as f32 * d1, x1v, f);
         f = f32::mul_add((q2 >> sh) as u8 as i8 as f32 * d2, x2v, f);
         f = f32::mul_add((q3 >> sh) as u8 as i8 as f32 * d3, x3v, f);
-        it += LANE_UNROLL;
+        it += 4;
     }
     while it < iters {
         let kk = it * 32 + lane;
