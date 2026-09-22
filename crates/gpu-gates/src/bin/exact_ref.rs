@@ -38,7 +38,7 @@
 //! The engines' Q8_0 requant of `wk_b` is not modelled: both carry it.
 
 use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
-use bloomery_gpu_gates::{GateError, open_model};
+use bloomery_gpu_gates::{GateError, data_dir, open_model};
 use gguf::quant::{GgmlType, dequant_row, half_to_f32};
 use gguf::{Gguf, TensorInfo};
 use model::attn::{MlaParams, f32_to_f16_bits};
@@ -527,8 +527,7 @@ fn run() -> Res<()> {
         |s| s.parse(),
     )?;
 
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    let reference = read_greedy(&Path::new(&data).join("greedy-ik-cuda-32.tsv"))?;
+    let reference = read_greedy(&data_dir().join("greedy-ik-cuda-32.tsv"))?;
     let prompts =
         read_prompts(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/prompts.tsv"))?;
     let r = reference

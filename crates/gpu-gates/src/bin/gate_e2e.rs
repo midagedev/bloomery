@@ -163,8 +163,7 @@ const FORCED_PIN: usize = 6;
 /// `$BLOOMERY_DATA/<name>` — the reference files the box holds.
 #[cfg(feature = "gpu")]
 fn data_file(name: &str) -> std::path::PathBuf {
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    std::path::PathBuf::from(data).join(name)
+    bloomery_gpu_gates::data_dir().join(name)
 }
 
 /// PIN(2026-09-21): the whole chain captures exactly this many graph nodes

@@ -34,7 +34,7 @@ use bloomery_gpu::model::{LayerTaps, StepMode};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{GateError, open_model};
+use bloomery_gpu_gates::{GateError, data_dir, open_model};
 #[cfg(feature = "gpu")]
 use std::path::{Path, PathBuf};
 
@@ -145,8 +145,7 @@ fn run() -> Res<()> {
     let ctx: usize = flag_value("--ctx").map_or(Ok(256), |s| s.parse())?;
     let top: usize = flag_value("--top").map_or(Ok(5), |s| s.parse())?;
 
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".to_string());
-    let reference = read_greedy(&Path::new(&data).join("greedy-ik-cuda-32.tsv"))?;
+    let reference = read_greedy(&data_dir().join("greedy-ik-cuda-32.tsv"))?;
     let prompts =
         read_prompts(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/prompts.tsv"))?;
     let r = reference

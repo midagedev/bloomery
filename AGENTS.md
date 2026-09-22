@@ -304,7 +304,7 @@ are dummy mains and their bodies are never linted). The ratchet counter is
 appears in (an agent's unique-count will read lower — same direction, different
 ruler). 2026-09-22 night, measured: 308 before the quality rounds; 234 after
 `gpusafety`, 305 after `gatesdedup` on its own base — the merged value is re-measured
-and written here when a round lands — **221 on main `0ff785e` after the four rounds**.
+and written here when a round lands — 221 on main `0ff785e` after the four rounds, **211 on main `48ee5c2`** (after fnsplit).
 `gate-qdot`'s four hw tests read `$BLOOMERY_DATA/ref/*-ik-dot.txt`; `just build-ref` writes
 them (`tools/ref/build-qdot-ref.sh` builds and runs the x4 harnesses) — before 2026-09-22
 no recipe did, and the four were a standing red on every tree. Rerun `build-ref` when ik
