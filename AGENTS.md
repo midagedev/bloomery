@@ -146,6 +146,10 @@ first suspect is a hung gate on the box, not the agent.
   into `docs/upstream/nvlabs-ledger.md` the moment they are met** — one line, before any
   workaround is written; a workaround erases the evidence. The user wants these as upstream
   issues/PRs; the ledger is where the lead triages them.
+- **Code shape is judged by `docs/rust-quality.md`** (numbered rules R1–R22: unsafe scope,
+  unit-carrying types, error enums per crate, clippy ratchet, refactor = bit-identical gates +
+  same-lease A/B). Review reports cite rule numbers; the warning baseline in Known state only
+  goes down.
 - Prose in this repository is Korean; code comments and anything headed upstream
   are English. This file is English because other tools and outside readers read it.
 - **Comments state what is true now, not how we got here.** Keep: `// SAFETY:`
