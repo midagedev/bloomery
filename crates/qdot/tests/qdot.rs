@@ -391,8 +391,8 @@ fn rejects_unaligned_k() {
     }
     // Unsupported type refuses before reading bytes.
     assert!(matches!(
-        dot_row(GgmlType::Q5_K, &wrow, &acol, 2048),
-        Err(QdotError::UnsupportedType(GgmlType::Q5_K))
+        dot_row(GgmlType::F16, &wrow, &acol, 2048),
+        Err(QdotError::UnsupportedType(GgmlType::F16))
     ));
     // Short buffers are errors, not reads past the slice.
     assert!(matches!(
@@ -464,8 +464,29 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::Q5_1, &wrow51[..23], &acol51, 10944),
         Err(QdotError::ShortWeightRow { .. })
     ));
+    // Q5_K pairs q8_2_x4 with 176 weight bytes per 256 values (k = 2304, the V4.1 down rows).
+    assert_eq!(col_bytes(GgmlType::Q5_K, 2304), 144 * 18);
+    let wrow5k = vec![0u8; 176 * 9];
+    let acol5k = vec![0u8; 144 * 18];
+    assert!(matches!(
+        dot_row(GgmlType::Q5_K, &wrow5k, &acol5k, 2304 + 32),
+        Err(QdotError::UnalignedK { k: 2336, gran: 256 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q5_K, &wrow5k[..176 * 9 - 1], &acol5k, 2304),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::Q5_K, &wrow5k, &acol5k[..144 * 18 - 1], 2304),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::Q5_K, &wrow5k, &acol5k, 2304).unwrap(),
+        0.0
+    );
     // Supported type table check.
-    assert!(!supports(GgmlType::Q5_K));
+    assert!(!supports(GgmlType::F16));
+    assert!(supports(GgmlType::Q5_K));
     assert!(supports(GgmlType::Q5_1));
 }
 
@@ -827,6 +848,255 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
         );
     }
     eprintln!("gate B: 64 rows within 1 ULP of ik's mul_mat_qX_1_q8_2_T (on ik's own activations)");
+}
+
+// ------------------------------------------------------- Q5_K x Q8_2_X4
+// The reference model carries no Q5_K tensor; the V4.1 file's first shard holds
+// blk.0.ffn_down_exps.weight (k = 2304). The strict `Gguf::open` refuses that shard (its
+// token_embd is bf16), so the tensor is found through the header-only inventory and its rows
+// are read at `data_base + offset`. Gates 0, A and B are the triple the other x4 types carry,
+// one test each so that one broken kernel shows every gate it breaks.
+
+/// The V4.1 first shard; `BLOOMERY_Q5K_MODEL` overrides it.
+const Q5K_MODEL: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
+
+/// The first Q5_K tensor with k % 256 == 0 — the scan `tools/ref/q5k_x4_ref.cpp` does.
+struct Q5kCase {
+    name: String,
+    k: usize,
+    row_bytes: usize,
+    /// The tensor's first rows.
+    bytes: Vec<u8>,
+    /// The column the ik harness codes, through `quantize_col`.
+    acol: Vec<u8>,
+}
+
+impl Q5kCase {
+    fn row(&self, r: usize) -> &[u8] {
+        &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes]
+    }
+}
+
+fn load_q5k(rows: usize) -> Q5kCase {
+    use std::os::unix::fs::FileExt;
+    let path = std::env::var("BLOOMERY_Q5K_MODEL").unwrap_or_else(|_| Q5K_MODEL.into());
+    let inv = gguf::inventory_of(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let t = inv
+        .tensors
+        .iter()
+        .find(|t| t.type_id == GgmlType::Q5_K.as_u32() && t.dims[0].is_multiple_of(256))
+        .unwrap_or_else(|| panic!("{path} carries no aligned Q5_K tensor"));
+    let k = t.dims[0] as usize;
+    let n = t.dims[1..].iter().product::<u64>() as usize;
+    let row_bytes = 176 * k / 256;
+    assert_eq!(t.nbytes, Some((n * row_bytes) as u64), "{}: bytes", t.name);
+    assert!(
+        n >= rows,
+        "{}: only {n} rows, the gate needs {rows}",
+        t.name
+    );
+    let mut bytes = vec![0u8; rows * row_bytes];
+    std::fs::File::open(&path)
+        .and_then(|f| f.read_exact_at(&mut bytes, inv.data_base + t.offset))
+        .unwrap_or_else(|e| panic!("{path}: read {}: {e}", t.name));
+    // The attn_norm-0 dump is 2048 values per token: the first k = 2304 are token 0 and the
+    // start of token 1, the column the ik harness reads.
+    let xs = oracle_f32("attn_norm-0", 2048 * 6)[..k].to_vec();
+    let mut acol = vec![0u8; col_bytes(GgmlType::Q5_K, k)];
+    quantize_col(GgmlType::Q5_K, &xs, &mut acol);
+    Q5kCase {
+        name: t.name.clone(),
+        k,
+        row_bytes,
+        bytes,
+        acol,
+    }
+}
+
+/// ik's dump for the Q5_K tensor: its activation bytes and its 64 row results.
+fn q5k_ik_dump(c: &Q5kCase) -> (Vec<u8>, Vec<u32>) {
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let dump = std::fs::read_to_string(format!("{base}/ref/q5k-x4-ik-dot.txt"))
+        .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
+    let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
+    assert_eq!(
+        dump_k, c.k,
+        "the dump and this scan must land on the same tensor"
+    );
+    assert_eq!(
+        ik_acol.len(),
+        c.acol.len(),
+        "ik's q8_2_x4 column must size-match ours"
+    );
+    (ik_acol, want)
+}
+
+/// Q5_K gate 0: `quantize_col` codes the column byte for byte as ik's `quantize_row_q8_2_x4`.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shard and $BLOOMERY_DATA/ref"]
+fn hw_q5k_encoder_matches_ik() {
+    let c = load_q5k(1);
+    let (ik_acol, _) = q5k_ik_dump(&c);
+    for (i, (a, b)) in ik_acol.iter().zip(&c.acol).enumerate() {
+        assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
+    }
+    eprintln!(
+        "q5k gate 0: {} encoder bytes bit-identical to ik's quantize_row_q8_2_x4 ({}, k = {})",
+        c.acol.len(),
+        c.name,
+        c.k
+    );
+}
+
+/// Q5_K gate A: the AVX2 kernel and its emulator agree bit for bit on real rows.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shard and $BLOOMERY_DATA/ref"]
+fn hw_q5k_kernel_matches_emulator() {
+    assert!(
+        supports(GgmlType::Q5_K),
+        "gate A compares the AVX2 kernel against its emulator; this CPU has no AVX2+FMA"
+    );
+    let c = load_q5k(ROWS);
+    for r in 0..ROWS {
+        let a = dot_row_avx2(GgmlType::Q5_K, c.row(r), &c.acol, c.k).unwrap();
+        let b = dot_row_scalar(GgmlType::Q5_K, c.row(r), &c.acol, c.k).unwrap();
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "row {r}: kernel {a:e} (bits {:#x}) and emulator {b:e} (bits {:#x}) must be bit-identical",
+            a.to_bits(),
+            b.to_bits()
+        );
+    }
+    eprintln!(
+        "q5k gate A: {ROWS} rows bit-identical (kernel vs emulator, {})",
+        c.name
+    );
+}
+
+/// Q5_K gate B: on ik's own activations the kernel is within 1 ULP of ik's
+/// `mul_mat_qX_K_q8_2_X4_T<DequantizerQ5K_AVX2>` on all 64 dumped rows.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shard and $BLOOMERY_DATA/ref"]
+fn hw_q5k_kernel_predicts_ik() {
+    let c = load_q5k(64);
+    let (ik_acol, want) = q5k_ik_dump(&c);
+    assert!(want.len() >= 64, "dump needs 64 rows");
+    let mut worst = 0i64;
+    let mut exact = 0usize;
+    for (r, &w) in want.iter().take(64).enumerate() {
+        let got = dot_row(GgmlType::Q5_K, c.row(r), &ik_acol, c.k).unwrap();
+        let ulp = (got.to_bits() as i64 - w as i64).abs();
+        assert!(
+            ulp <= 1,
+            "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+            f32::from_bits(w)
+        );
+        worst = worst.max(ulp);
+        exact += usize::from(ulp == 0);
+    }
+    eprintln!(
+        "q5k gate B: 64 rows within 1 ULP of ik's mul_mat_qX_K_q8_2_X4_T<DequantizerQ5K_AVX2> \
+         (on ik's own activations): max {worst} ULP, {exact}/64 rows at 0 ULP"
+    );
+}
+
+/// A q8_2_x4 column as the kernels read it: per 32-value block, the bf16 scale at `2*ir` of its
+/// 144-byte group times each i8 code at `16 + 32*ir`. Whole groups only — a K-quant column
+/// has no tail blocks.
+fn restore_q82x4(acol: &[u8]) -> Vec<f64> {
+    assert!(acol.len().is_multiple_of(144), "whole 144-byte groups only");
+    let mut out = Vec::with_capacity(acol.len() / 144 * 128);
+    for g in acol.as_chunks::<144>().0 {
+        for ir in 0..4 {
+            let d = f32::from_bits(u32::from(u16::from_le_bytes([g[2 * ir], g[2 * ir + 1]])) << 16);
+            out.extend(
+                g[16 + 32 * ir..16 + 32 * ir + 32]
+                    .iter()
+                    .map(|&q| f64::from(d) * f64::from(q as i8)),
+            );
+        }
+    }
+    out
+}
+
+/// Q5_K dequantization: `dequant_row` equals ggml's own `to_float` (dumped by q5k_x4_ref.cpp)
+/// on the tensor's first rows, bit for bit — the transcription keeps ggml's operation order,
+/// including the multiply-subtract the compiled library fuses. Then the kernel against an f64
+/// dot of those rows with the restored column, in gate 2's band: max |diff| / max |ref| <= 1e-5.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shard and $BLOOMERY_DATA/ref"]
+fn hw_q5k_dequant_matches_ggml() {
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let meta = std::fs::read_to_string(format!("{base}/ref/q5k-v41-dequant.meta"))
+        .expect("run just build-ref first (build-qdot-ref.sh writes the q5_K dequant dump)");
+    let field = |key: &str| {
+        meta.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("q5k-v41-dequant.meta has no {key}"))
+    };
+    let rows: usize = field("rows=").parse().unwrap();
+    let c = load_q5k(rows);
+    assert_eq!(
+        field("tensor="),
+        c.name,
+        "the dump and this scan must land on the same tensor"
+    );
+    assert_eq!(field("rowlen=").parse::<usize>().unwrap(), c.k);
+    let raw = std::fs::read(format!("{base}/ref/q5k-v41-dequant.raw")).unwrap();
+    assert_eq!(
+        raw.len(),
+        rows * c.k * 4,
+        "q5k-v41-dequant.raw: {rows} rows of {} f32",
+        c.k
+    );
+    let want: Vec<f32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+
+    let mut got = vec![0.0f32; c.k];
+    for r in 0..rows {
+        dequant_row(GgmlType::Q5_K, c.row(r), &mut got).unwrap();
+        for (i, (g, w)) in got.iter().zip(&want[r * c.k..(r + 1) * c.k]).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "row {r} value {i}: ours {g:e} (bits {:#x}) vs ggml {w:e} (bits {:#x})",
+                g.to_bits(),
+                w.to_bits()
+            );
+        }
+    }
+    eprintln!(
+        "q5k dequant: {rows} rows x {} values bit-identical to ggml's to_float ({})",
+        c.k, c.name
+    );
+
+    let act = restore_q82x4(&c.acol);
+    let mut max_abs = 0.0f64;
+    let mut denom = 0.0f64;
+    for r in 0..rows {
+        let reference: f64 = want[r * c.k..(r + 1) * c.k]
+            .iter()
+            .zip(&act)
+            .map(|(&w, &a)| f64::from(w) * a)
+            .sum();
+        let fused = f64::from(dot_row(GgmlType::Q5_K, c.row(r), &c.acol, c.k).unwrap());
+        max_abs = max_abs.max((fused - reference).abs());
+        denom = denom.max(reference.abs());
+    }
+    let global_rel = max_abs / denom;
+    eprintln!(
+        "q5k dequant band: {rows} rows, kernel vs f64 dot of ggml's rows: max|diff|={max_abs:.4e} \
+         max|ref|={denom:.4e} global_rel={global_rel:.3e} (gate 2's band 1e-5)"
+    );
+    assert!(
+        global_rel <= 1e-5,
+        "kernel vs f64 dot of ggml's dequantized rows: global rel {global_rel:.3e} > 1e-5"
+    );
 }
 
 // ------------------------------------------------- q_nope2 cell kernel

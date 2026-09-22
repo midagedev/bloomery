@@ -1,4 +1,4 @@
-//! qdot — fused quantized row dots for host CPU: Q3_K x Q8_K, Q4_K x Q8_2_X4,
+//! qdot — fused quantized row dots for host CPU: Q3_K x Q8_K, Q4_K/Q5_K x Q8_2_X4,
 //! Q6_K x Q8_2_X4, Q5_0 x Q8_2_X4, Q5_1 x Q8_2_X4, and Q8_0 x act cell kernels.
 //!
 //! Dots quantized weight rows directly against quantized activation columns without
@@ -6,6 +6,7 @@
 //! - Q3_K x Q8_K: port of `ggml_vec_dot_q3_K_q8_K` (ggml-quants.c:6482).
 //! - Q4_K x Q8_2_X4: port of ik's `mul_mat_qX_K_q8_2_X4_T` (iqk_gemm_kquants.cpp:787).
 //! - Q6_K x Q8_2_X4: port of ik's `mul_mat_qY_K_q8_2_X4_T` (iqk_gemm_kquants.cpp:938).
+//! - Q5_K x Q8_2_X4: the Q4_K template with ik's `DequantizerQ5K_AVX2` (iqk_gemm_kquants.cpp:763).
 //! - Q5_0 x Q8_2_X4: port of ik's `mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker>` (iqk_gemm_legacy_quants.cpp:507).
 //! - Q5_1 x Q8_2_X4: port of ik's `mul_mat_qX_1_q8_2_T<Q5_1_Unpacker>` (iqk_gemm_legacy_quants.cpp:804).
 //! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
@@ -91,19 +92,24 @@ impl std::error::Error for QdotError {}
 pub fn supports(w: GgmlType) -> bool {
     matches!(
         w,
-        GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K
+        GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::Q6_K
     ) && has_features(w)
 }
 
 /// The per-type ISA table matching each fused kernel's `#[target_feature]` requirements.
 ///
-/// Q3_K needs avx2; Q4_K and Q6_K need avx2+fma; Q5_0 and Q5_1 need avx2+fma+f16c.
+/// Q3_K needs avx2; Q4_K, Q5_K and Q6_K need avx2+fma; Q5_0 and Q5_1 need avx2+fma+f16c.
 fn has_features(w: GgmlType) -> bool {
     match w {
         // dot_q3k_q8k_avx2: enable = "avx2"
         GgmlType::Q3_K => std::arch::is_x86_feature_detected!("avx2"),
-        // dot_q4k_q82x4_avx2 / dot_q6k_q82x4_avx2: enable = "avx2", "fma"
-        GgmlType::Q4_K | GgmlType::Q6_K => {
+        // dot_q4k_q82x4_avx2 / dot_q5k_q82x4_avx2 / dot_q6k_q82x4_avx2: enable = "avx2", "fma"
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => {
             std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma")
         }
@@ -136,7 +142,12 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
     assert!(
         matches!(
             w,
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K
+            GgmlType::Q3_K
+                | GgmlType::Q4_K
+                | GgmlType::Q5_K
+                | GgmlType::Q5_0
+                | GgmlType::Q5_1
+                | GgmlType::Q6_K
         ),
         "qdot has no activation format for {w:?} in this build"
     );
@@ -154,14 +165,14 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
     }
     match w {
         GgmlType::Q5_0 | GgmlType::Q5_1 => (k / 128) * Q82X4_STRIDE + ((k % 128) / 32) * Q82_BLOCK,
-        GgmlType::Q4_K | GgmlType::Q6_K => (k / 128) * Q82X4_STRIDE,
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => (k / 128) * Q82X4_STRIDE,
         _ => (k / 256) * Q8K_STRIDE,
     }
 }
 
 /// Quantize one activation column into the block format `w` implies.
 ///
-/// Q3_K uses `block_q8_K` (296 B/256 values); Q4_K, Q5_0, Q5_1, and Q6_K use
+/// Q3_K uses `block_q8_K` (296 B/256 values); Q4_K, Q5_K, Q5_0, Q5_1, and Q6_K use
 /// `block_q8_2_x4` (144 B/128 values), with 36-byte `block_q8_2` tails for Q5_0/Q5_1.
 /// `out.len()` must equal `col_bytes(w, x.len())`; panics otherwise. Uses the
 /// AVX2 encoders when the CPU has AVX2 — byte-identical to the scalar mirrors.
@@ -169,7 +180,7 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
     quantize_col_check(w, x, out);
     let avx2 = std::arch::is_x86_feature_detected!("avx2");
     match w {
-        GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
             if avx2 {
                 // SAFETY: AVX2 detected just above; quantize_col_check pinned
                 // out.len() to col_bytes(w, x.len()).
@@ -200,7 +211,7 @@ pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
 pub fn quantize_col_scalar(w: GgmlType, x: &[f32], out: &mut [u8]) {
     quantize_col_check(w, x, out);
     match w {
-        GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K => {
             quantize_q82x4_col(x, out);
         }
         _ => {
@@ -218,7 +229,12 @@ fn quantize_col_check(w: GgmlType, x: &[f32], out: &[u8]) {
     assert!(
         matches!(
             w,
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K
+            GgmlType::Q3_K
+                | GgmlType::Q4_K
+                | GgmlType::Q5_K
+                | GgmlType::Q5_0
+                | GgmlType::Q5_1
+                | GgmlType::Q6_K
         ),
         "qdot has no activation format for {w:?} in this build"
     );
@@ -251,6 +267,10 @@ pub fn dot_row(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f32, Q
             // SAFETY: AVX2+FMA were just detected; lengths validated above.
             Ok(unsafe { dot_q4k_q82x4_avx2(wrow, acol, nb) })
         }
+        (GgmlType::Q5_K, true) => {
+            // SAFETY: AVX2+FMA were just detected; lengths validated above.
+            Ok(unsafe { dot_q5k_q82x4_avx2(wrow, acol, nb) })
+        }
         (GgmlType::Q6_K, true) => {
             // SAFETY: AVX2+FMA were just detected; lengths validated above.
             Ok(unsafe { dot_q6k_q82x4_avx2(wrow, acol, nb) })
@@ -280,6 +300,7 @@ pub fn dot_row_scalar(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result
 fn dot_row_scalar_ty(w: GgmlType, wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     match w {
         GgmlType::Q4_K => dot_q4k_q82x4_emul(wrow, acol, nb),
+        GgmlType::Q5_K => dot_q5k_q82x4_emul(wrow, acol, nb),
         GgmlType::Q6_K => dot_q6k_q82x4_emul(wrow, acol, nb),
         GgmlType::Q5_0 => dot_q5f0_q82x4_emul(wrow, acol, nb),
         GgmlType::Q5_1 => dot_q5f1_q82x4_emul(wrow, acol, nb),
@@ -293,12 +314,16 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
     assert!(
         has_features(w),
         "dot_row_avx2 called on a CPU without the kernel's ISA \
-         (avx2; +fma for Q4_K/Q6_K; +f16c for Q5_0/Q5_1)"
+         (avx2; +fma for Q4_K/Q5_K/Q6_K; +f16c for Q5_0/Q5_1)"
     );
     match w {
         GgmlType::Q4_K => {
             // SAFETY: asserted just above; lengths validated by check_row.
             Ok(unsafe { dot_q4k_q82x4_avx2(wrow, acol, nb) })
+        }
+        GgmlType::Q5_K => {
+            // SAFETY: asserted just above; lengths validated by check_row.
+            Ok(unsafe { dot_q5k_q82x4_avx2(wrow, acol, nb) })
         }
         GgmlType::Q6_K => {
             // SAFETY: asserted just above; lengths validated by check_row.
@@ -323,7 +348,12 @@ pub fn dot_row_avx2(w: GgmlType, wrow: &[u8], acol: &[u8], k: usize) -> Result<f
 fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<usize, QdotError> {
     if !matches!(
         w,
-        GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q6_K
+        GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::Q6_K
     ) {
         return Err(QdotError::UnsupportedType(w));
     }
@@ -336,6 +366,7 @@ fn check_row(w: GgmlType, wrow_len: usize, acol_len: usize, k: usize) -> Result<
         GgmlType::Q5_0 => (k / 32, (k / 32) * Q5F0_BLOCK),
         GgmlType::Q5_1 => (k / 32, (k / 32) * Q5F1_BLOCK),
         GgmlType::Q4_K => (k / 256, (k / 256) * Q4K_BLOCK),
+        GgmlType::Q5_K => (k / 256, (k / 256) * Q5K_BLOCK),
         _ => (k / 256, (k / 256) * Q3K_BLOCK),
     };
     let need_a = col_bytes(w, k);
@@ -1532,6 +1563,234 @@ fn dot_q6k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 
             for l in 0..8 {
                 accd[l] = scales[j][l].mul_add(sumi[l] as f32, accd[l]);
+            }
+        }
+    }
+
+    let t = [
+        accd[0] + accd[4],
+        accd[1] + accd[5],
+        accd[2] + accd[6],
+        accd[3] + accd[7],
+    ];
+    (t[0] + t[2]) + (t[1] + t[3])
+}
+
+// --------------------------------------------------------- Q5_K x Q8_2_X4
+
+/// `block_q5_K` (ggml-common.h:367): d f16 @0, dmin f16 @2, scales u8[12] @4, qh u8[32] @16,
+/// qs u8[128] @48.
+const Q5K_BLOCK: usize = 176;
+
+/// AVX2+FMA row dot: Q5_K weights against Q8_2_X4 column.
+///
+/// TWIN of [`dot_q4k_q82x4_avx2`] — ik runs both through `mul_mat_qX_K_q8_2_X4_T`,
+/// and they differ in three places only: block width (176 vs 144), the nibble
+/// offset (qs @48 vs @16), and `DequantizerQ5K_AVX2::prepare`'s fold of qh into
+/// bit 4 of each code. In half j, value 128j + 32b + l takes bit 4j + b of qh[l]:
+/// qh itself at j = 0, qh >> 4 (16-bit lanes) at j = 1, shifted left by 4 - b
+/// onto bit 4. Every edit outside those three must be made in both.
+/// i16: codes 0..31 against activations in [-127, 127]; after the two
+/// `add_epi16` levels a lane holds 8 products, at most 8*31*127 = 31496, so
+/// saturation is unreachable.
+///
+/// # Safety
+/// Caller must ensure AVX2+FMA are available and buffers match `nb` blocks.
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_q5k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    // SAFETY: AVX2+FMA present and both slices hold nb blocks per contract.
+    unsafe {
+        let ml = _mm256_set1_epi8(0xF);
+        let mh = _mm256_set1_epi8(0x10);
+        let mut accd = _mm256_setzero_ps();
+
+        for i in 0..nb {
+            let wb = &wrow[i * Q5K_BLOCK..(i + 1) * Q5K_BLOCK];
+
+            let d = f16_bits_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+            let dmin = f16_bits_to_f32(u16::from_le_bytes([wb[2], wb[3]]));
+
+            let utmp = make_q4_scales(&wb[4..16]);
+            // SAFETY: 8 readable bytes inside the local u32[4].
+            let mins_v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                utmp.as_ptr().add(2) as *const __m128i,
+            )));
+            let mins = _mm256_mul_ps(_mm256_set1_ps(-dmin), mins_v);
+
+            // SAFETY: 8 readable bytes at the head of each validated group.
+            let g0 = acol.as_ptr().add((2 * i) * Q82X4_STRIDE);
+            let g1 = acol.as_ptr().add((2 * i + 1) * Q82X4_STRIDE);
+            let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
+            let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
+            let dy = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
+            let dy4 = [_mm256_castps256_ps128(dy), _mm256_extractf128_ps(dy, 1)];
+            // SAFETY: 8 readable bytes at offset 8 of each group.
+            let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
+            let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
+            let myi = _mm256_set_m128i(m4_2, m4_1);
+            let my = _mm256_mul_ps(dy, _mm256_cvtepi32_ps(myi));
+
+            // SAFETY: 8 readable bytes inside the local u32[4].
+            let all_scales = _mm256_mul_ps(
+                _mm256_set1_ps(d),
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    utmp.as_ptr() as *const __m128i
+                ))),
+            );
+            let lo = _mm256_castps256_ps128(all_scales);
+            let hi = _mm256_extractf128_ps(all_scales, 1);
+            let scales = [_mm256_set_m128(lo, lo), _mm256_set_m128(hi, hi)];
+            let d4d8 = [
+                _mm256_mul_ps(scales[0], _mm256_set_m128(dy4[0], dy4[0])),
+                _mm256_mul_ps(scales[1], _mm256_set_m128(dy4[1], dy4[1])),
+            ];
+
+            // SAFETY: 32-byte load inside the validated 176-byte block.
+            let qh = _mm256_loadu_si256(wb.as_ptr().add(16) as *const __m256i);
+            let q5 = &wb[48..48 + 128];
+            let mut sumi_f = [_mm256_setzero_ps(), _mm256_setzero_ps()];
+            for (j, sf) in sumi_f.iter_mut().enumerate() {
+                // SAFETY: loads stay inside the validated 176-byte block.
+                let bits0 = _mm256_loadu_si256(q5.as_ptr().add(64 * j) as *const __m256i);
+                let bits1 = _mm256_loadu_si256(q5.as_ptr().add(64 * j + 32) as *const __m256i);
+                let hbits = if j == 0 {
+                    qh
+                } else {
+                    _mm256_srli_epi16::<4>(qh)
+                };
+                let values0 = _mm256_or_si256(
+                    _mm256_and_si256(bits0, ml),
+                    _mm256_and_si256(_mm256_slli_epi16::<4>(hbits), mh),
+                );
+                let values1 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(bits0), ml),
+                    _mm256_and_si256(_mm256_slli_epi16::<3>(hbits), mh),
+                );
+                let values2 = _mm256_or_si256(
+                    _mm256_and_si256(bits1, ml),
+                    _mm256_and_si256(_mm256_slli_epi16::<2>(hbits), mh),
+                );
+                let values3 = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(bits1), ml),
+                    _mm256_and_si256(_mm256_slli_epi16::<1>(hbits), mh),
+                );
+
+                // SAFETY: loads stay inside the validated activation group.
+                let qs = acol.as_ptr().add((2 * i + j) * Q82X4_STRIDE + 16);
+                let sumi1 = _mm256_maddubs_epi16(values0, _mm256_loadu_si256(qs as *const __m256i));
+                let sumi2 =
+                    _mm256_maddubs_epi16(values1, _mm256_loadu_si256(qs.add(32) as *const __m256i));
+                let sumi3 =
+                    _mm256_maddubs_epi16(values2, _mm256_loadu_si256(qs.add(64) as *const __m256i));
+                let sumi4 =
+                    _mm256_maddubs_epi16(values3, _mm256_loadu_si256(qs.add(96) as *const __m256i));
+                let t1 = _mm256_add_epi16(
+                    _mm256_unpacklo_epi32(sumi1, sumi2),
+                    _mm256_unpackhi_epi32(sumi1, sumi2),
+                );
+                let t3 = _mm256_add_epi16(
+                    _mm256_unpacklo_epi32(sumi3, sumi4),
+                    _mm256_unpackhi_epi32(sumi3, sumi4),
+                );
+                let t =
+                    _mm256_add_epi16(_mm256_unpacklo_epi64(t1, t3), _mm256_unpackhi_epi64(t1, t3));
+                let sumi = _mm256_madd_epi16(_mm256_set1_epi16(1), t);
+                *sf = _mm256_cvtepi32_ps(sumi);
+            }
+
+            accd = _mm256_fmadd_ps(my, mins, accd);
+            accd = _mm256_fmadd_ps(d4d8[0], sumi_f[0], accd);
+            accd = _mm256_fmadd_ps(d4d8[1], sumi_f[1], accd);
+        }
+
+        hsum_float_8(accd)
+    }
+}
+
+/// Emulates `dot_q5k_q82x4_avx2` with bit identity: `dot_q4k_q82x4_emul` with
+/// the qh fold's 16-bit lane shifts emulated as the kernel issues them.
+fn dot_q5k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    let mut accd = [0.0f32; 8];
+
+    for i in 0..nb {
+        let wb = &wrow[i * Q5K_BLOCK..(i + 1) * Q5K_BLOCK];
+        let g0 = &acol[(2 * i) * Q82X4_STRIDE..(2 * i + 1) * Q82X4_STRIDE];
+        let g1 = &acol[(2 * i + 1) * Q82X4_STRIDE..(2 * i + 2) * Q82X4_STRIDE];
+
+        let d = f16_bits_to_f32(u16::from_le_bytes([wb[0], wb[1]]));
+        let dmin = f16_bits_to_f32(u16::from_le_bytes([wb[2], wb[3]]));
+
+        let utmp = make_q4_scales(&wb[4..16]);
+        let sb = [utmp[0].to_le_bytes(), utmp[1].to_le_bytes()];
+        let mb = [utmp[2].to_le_bytes(), utmp[3].to_le_bytes()];
+
+        // The kernel's (-dmin) * m: negation is exact, so -(dmin * m) is the same bits.
+        let mut mins = [0.0f32; 8];
+        for l in 0..8 {
+            let m = mb[l / 4][l % 4];
+            mins[l] = -(dmin * (m as f32));
+        }
+
+        let mut d8 = [0.0f32; 8];
+        for l in 0..4 {
+            d8[l] = bf16_bits_to_f32(u16::from_le_bytes([g0[2 * l], g0[2 * l + 1]]));
+            d8[4 + l] = bf16_bits_to_f32(u16::from_le_bytes([g1[2 * l], g1[2 * l + 1]]));
+        }
+        for l in 0..4 {
+            let s0 = i16::from_le_bytes([g0[8 + 2 * l], g0[9 + 2 * l]]) as f32;
+            let s1 = i16::from_le_bytes([g1[8 + 2 * l], g1[9 + 2 * l]]) as f32;
+            accd[l] = (d8[l] * s0).mul_add(mins[l], accd[l]);
+            accd[4 + l] = (d8[4 + l] * s1).mul_add(mins[4 + l], accd[4 + l]);
+        }
+
+        let mut all_scales = [0.0f32; 8];
+        for l in 0..8 {
+            all_scales[l] = d * (sb[l / 4][l % 4] as f32);
+        }
+
+        let qh: [u8; 32] = wb[16..48].try_into().unwrap();
+        let q5 = &wb[48..48 + 128];
+        for j in 0..2 {
+            let hbits = if j == 0 { qh } else { emul_srli_epi16::<4>(qh) };
+            let high = [
+                emul_slli_epi16::<4>(hbits),
+                emul_slli_epi16::<3>(hbits),
+                emul_slli_epi16::<2>(hbits),
+                emul_slli_epi16::<1>(hbits),
+            ];
+            let mut values = [[0u8; 32]; 4];
+            for m in 0..32 {
+                let b0 = q5[64 * j + m];
+                let b1 = q5[64 * j + 32 + m];
+                values[0][m] = (b0 & 0xF) | (high[0][m] & 0x10);
+                values[1][m] = (b0 >> 4) | (high[1][m] & 0x10);
+                values[2][m] = (b1 & 0xF) | (high[2][m] & 0x10);
+                values[3][m] = (b1 >> 4) | (high[3][m] & 0x10);
+            }
+            let g = &acol[(2 * i + j) * Q82X4_STRIDE..(2 * i + j + 1) * Q82X4_STRIDE];
+            let mut qs = [[0u8; 32]; 4];
+            for t in 0..4 {
+                qs[t].copy_from_slice(&g[16 + 32 * t..16 + 32 * t + 32]);
+            }
+            let sumi1 = emul_maddubs(values[0], qs[0]);
+            let sumi2 = emul_maddubs(values[1], qs[1]);
+            let sumi3 = emul_maddubs(values[2], qs[2]);
+            let sumi4 = emul_maddubs(values[3], qs[3]);
+            let t1 = emul_add_epi16(
+                emul_unpacklo_epi32(sumi1, sumi2),
+                emul_unpackhi_epi32(sumi1, sumi2),
+            );
+            let t3 = emul_add_epi16(
+                emul_unpacklo_epi32(sumi3, sumi4),
+                emul_unpackhi_epi32(sumi3, sumi4),
+            );
+            let t = emul_add_epi16(emul_unpacklo_epi64(t1, t3), emul_unpackhi_epi64(t1, t3));
+            let sumi = emul_madd1(t);
+
+            for l in 0..8 {
+                let idx = 4 * j + (l & 3);
+                let d4d8 = all_scales[idx] * d8[idx];
+                accd[l] = d4d8.mul_add(sumi[l] as f32, accd[l]);
             }
         }
     }

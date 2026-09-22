@@ -194,8 +194,9 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::Q5_1 => dequant_q5_1(&src[..need], dst),
         GgmlType::Q3_K => dequant_q3_k(&src[..need], dst),
         GgmlType::Q4_K => dequant_q4_k(&src[..need], dst),
+        GgmlType::Q5_K => dequant_q5_k(&src[..need], dst),
         GgmlType::Q6_K => dequant_q6_k(&src[..need], dst),
-        GgmlType::Q5_K | GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
+        GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
     }
     Ok(())
 }
@@ -442,6 +443,55 @@ fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
                 o[l + 32] = ((q[l] >> 4) as f32).mul_add(d2, -m2);
             }
             is += 2;
+        }
+    }
+}
+
+/// Port of `dequantize_row_q5_K` (ggml-quants.c:3025). Block geometry
+/// (block_q5_K, ggml-common.h:367, 176 bytes / 256 values):
+/// d f16 @0, dmin f16 @2, scales[12] @4 (q4_K's 6-bit packing, via
+/// get_scale_min_k4), qh[32] @16, qs[128] @48 (nibbles as in q4_K).
+///
+/// Value 64j+l takes bit 2j of qh[l] as its fifth bit, value 64j+32+l bit
+/// 2j+1. The compiled library computes `d1*q - m1` with one `vfmsub`, as it
+/// does for q4_K — mirrored with `mul_add(…, -m1)`. The mirror is for the
+/// reader, not the bits: `d*sc` and `d*sc*q` (at most 11+6+5 significant
+/// bits) and `dmin*m` are exact in f32, so the subtraction is the only
+/// rounding and the fused and unfused forms agree.
+fn dequant_q5_k(src: &[u8], dst: &mut [f32]) {
+    for (blk, out) in src
+        .as_chunks::<176>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<256>().0)
+    {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let scales: &[u8; 12] = blk[4..16].try_into().unwrap();
+        let qh = &blk[16..48];
+        let qs = &blk[48..176];
+
+        let mut is = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for j in 0..4 {
+            let (sc, mi) = get_scale_min_k4(is, scales);
+            let d1 = d * sc as f32;
+            let m1 = dmin * mi as f32;
+            let (sc, mi) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc as f32;
+            let m2 = dmin * mi as f32;
+            let ql = &qs[32 * j..32 * j + 32];
+            let o = &mut out[64 * j..64 * j + 64];
+            for l in 0..32 {
+                let h1 = if qh[l] & u1 != 0 { 16 } else { 0 };
+                let h2 = if qh[l] & u2 != 0 { 16 } else { 0 };
+                o[l] = (((ql[l] & 0x0f) + h1) as f32).mul_add(d1, -m1);
+                o[l + 32] = (((ql[l] >> 4) + h2) as f32).mul_add(d2, -m2);
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 }

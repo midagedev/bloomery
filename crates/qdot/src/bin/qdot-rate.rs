@@ -55,4 +55,6 @@ fn main() {
     bench(GgmlType::Q5_0, 1408, (1408 / 32) * 22, rows);
     // Real ffn_down shape: k = 10944 (342 x 24 B = 8208 B/row).
     bench(GgmlType::Q5_1, 10944, (10944 / 32) * 24, rows);
+    // V4.1 ffn_down_exps shape (layers 0 and 1): k = 2304 (9 x 176 B = 1584 B/row).
+    bench(GgmlType::Q5_K, 2304, (2304 / 256) * 176, rows);
 }
