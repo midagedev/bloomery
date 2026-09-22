@@ -120,7 +120,7 @@ could not win on a kernel already at ~700 GB/s.
 | launch count only | Δt = ΔN × c_node, predicted | the owning gate | once, only if occupancy moves too |
 | instruction count on a kernel near ~700 GB/s | model says 0 — do not open the round | — | — |
 | occupancy / geometry | occupancy computed from regs, smem, threads, SM count (ptxas `-v`) and written in the spec | the owning gate | once, to confirm |
-| float sum order or precision | the error model (σ against `exact-forced-32.tsv`) | `gate-gpu-e2e` | once, to confirm |
+| float sum order or precision | the error model (σ against `exact-forced-32.tsv`, a diagnostic — see the next section) | `gate-gpu-e2e` count pin | once, to confirm |
 
 Measurement comes first only for the named residue: hardware faults (Xid 79),
 compiler register allocation, cache effects with no mechanism yet. Anything
@@ -129,6 +129,21 @@ registers) is a compile-time ratchet and is not re-measured at runtime.
 
 Every number carries its conditions — `tok/s @ n=N, depth D, card` — or it is
 not a number: the n=32 vs n=96 ratios lost on 2026-09-22 were a units error.
+
+## Performance first, accuracy opt-in (user, 2026-09-22)
+
+When a choice trades speed against closeness to the exact result, the default
+is the faster one. The more exact variant is kept as an opt-in switch (a cargo
+feature or a load-time env var that picks other kernels; never a per-element
+branch in the default kernels), off by default, and the default path stays
+PTX-identical to what it was. Accuracy measures (σ, forced_exact buckets) are
+diagnostics that tell how far the default sits from the truth; they do not
+block a performance change. The only accuracy pins are bug catchers — the
+existing forced_exact count pin and the reference gates — not a precision
+ranking to ratchet down. Case that set it: the 32-value activation block
+(errsrc) would bring σ from 0.378 to ~0.26, ik's level, but costs 4× the
+activation scales, a re-pin of every bit gate and a CPU/GPU rule split, so it
+went in as `act32` opt-in, not as the default.
 
 ## Parallel tracks (subagent rounds)
 
