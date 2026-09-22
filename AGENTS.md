@@ -133,17 +133,20 @@ not a number: the n=32 vs n=96 ratios lost on 2026-09-22 were a units error.
 ## Performance first, accuracy opt-in (user, 2026-09-22)
 
 When a choice trades speed against closeness to the exact result, the default
-is the faster one. The more exact variant is kept as an opt-in switch (a cargo
-feature or a load-time env var that picks other kernels; never a per-element
-branch in the default kernels), off by default, and the default path stays
-PTX-identical to what it was. Accuracy measures (σ, forced_exact buckets) are
+is the faster one, and the engine carries only that path. A more exact variant
+is not built into the engine as a second path; it lives on the verification
+side, in the f64 referee (`exact_ref --act f64|ours|ik|ik16` simulates each
+rounding rule). Bug hunting compares the engine with the simulation of its own
+rule (`--act ours`): a position off by more than σ is a bug candidate, one
+within σ is rounding. Accuracy measures (σ, forced_exact buckets) are
 diagnostics that tell how far the default sits from the truth; they do not
 block a performance change. The only accuracy pins are bug catchers — the
 existing forced_exact count pin and the reference gates — not a precision
 ranking to ratchet down. Case that set it: the 32-value activation block
 (errsrc) would bring σ from 0.378 to ~0.26, ik's level, but costs 4× the
-activation scales, a re-pin of every bit gate and a CPU/GPU rule split, so it
-went in as `act32` opt-in, not as the default.
+activation scales, a re-pin of every bit gate and a CPU/GPU rule split; an
+opt-in GPU path was considered and dropped (a second path needs its own gate
+to not rot), so 32-value exists only as `exact_ref --act ik`.
 
 ## Parallel tracks (subagent rounds)
 
