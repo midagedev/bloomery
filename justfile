@@ -325,6 +325,12 @@ dump-ref-v41:
 check-int-twins *ARGS:
     ./tools/box.sh 'python3 tools/ref/check-int-twins.py {{ARGS}}'
 
+# V4.1 라우터 추적(B10): 토큰 스트림을 프리필로 흘려, 층마다 토큰별로 고른 expert 여섯을 $BLOOMERY_DATA/router/<이름>/에
+# 쓴다. CPU 임대 안에서 돌고 30분에서 끊는다. CORPUS가 `oracle`이면 오라클의 다섯 토큰으로 돌려 덤프의 id와 정수로
+# 맞춰 본다. 인자는 러너 머리글 참조(--name, --chunk, --max-tokens, --top-k-only).
+trace-router CORPUS *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
+
 # 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다.
 gate-ops:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test ops -- --ignored --nocapture'
