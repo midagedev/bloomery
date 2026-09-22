@@ -37,11 +37,31 @@ ik 커널을 디버거로 들여다볼 일이 있으면 `llama-cli`나 `llama-ev
 
 ik_llama.cpp의 순전파를 고정 토큰 수열로 한 번 돌리고, 그래프의 **모든 중간 텐서를
 raw f32로** 파일에 떨군다. 텐서당 `<이름>.<발생순번>.f32`, 그리고 `MANIFEST.tsv`가
-이름·발생순번·타입·`ne[0..3]`·바이트·합·연산을 적는다. V2-Lite 6토큰에서 텐서 1155개, 91 MB.
+이름·발생순번·타입·`ne[0..3]`·바이트·합·연산을 적는다. V2-Lite 6토큰에서 텐서 1155개, ~~91 MB~~ .f32 합 92,846,160 B(2026-09-23 재측정, v1 세트).
 
 고정 토큰 수열은 `100000,549,6077,280,7239,317`("The capital of France is", 이 모델의
 토크나이저로 한 번 읽은 값). **계측기는 토큰화를 하지 않는다.** 하면 토크나이저 차이가
 하류 모든 텐서의 수치 차이로 나타나 커널 버그처럼 읽힌다. 토크나이저는 1단계가 재는 것이 아니다.
+
+## v3 형식 (2026-09-23, B0c — `3a7e3f0`·`e3cf0dc`)
+
+V4.1을 받으려고 덤퍼를 넓혔다. V2-Lite에서 기존 `.f32` 1155개와 tensor 행 1–11열은 v1과 바이트까지 같고, 게이트 다섯(attn·ffn·moe·head·forward)이 두 세트에서 같은 값을 낸다. 달라진 것은 여섯 가지다.
+
+**정수는 무손실 사본을 따로 둔다.** f32는 2^24까지만 정수를 정확히 담는데, V4.1의 engram 행 id는 384,016,682까지 간다. 그래서 I8·I16·I32 텐서는 `.i32`, I64는 `.i64` 사본을 받는다. logical 파일이 있는 행은 `.logical.i32`/`.logical.i64`도 받는다. 모두 raw 리틀엔디언이고 원소 순서는 f32 파일과 같다. 매니페스트에는 `int` 행(12열: `int name occurrence of type twin layout count bytes sum absmax file`)이 붙고, `sum`은 64비트 wrapping 정수합이다. f32 파일에는 예전처럼 C 캐스트 값이 들어간다. 2^24를 넘는 값(engram 행 id)은 사본으로만 읽을 수 있다. expert id(V4.1은 0..384)는 f32로도 정확하지만, 정확히 일치해야 하는 라우팅 게이트는 캐스트를 거치지 않은 사본을 읽는 편이 맞다.
+
+**그래프 입력을 잡는다.** 토큰 id·위치·마스크·engram 행 id는 노드가 아니라 leaf라 콜백에 노드로 보이지 않는다. 처음 읽는 노드에서 한 번씩 `input` 행과 `<이름>.<발생순번>.input.f32`(정수면 사본도)로 쓴다. 발생순번은 노드와 따로 세고, 트레일러 수에는 넣지 않는다. 스케줄러의 split 복사는 INPUT과 OUTPUT 플래그를 둘 다 달기 때문에 제외된다.
+
+**다 쓰지 못한 것을 드러낸다.** 이름 없는 노드와 src는 `(unnamed)`로 쓴다(v1이었다면 숨김 파일 `.<occ>.f32`가 생겼다). 변환기가 모르는 타입은 `skip … unhandled` 행이 되고, stderr에 `dump_ref: N tensors skipped as unhandled: …` 한 줄이 찍힌다(0개면 `none`). buffer나 data가 없는 노드는 `skip … unallocated`다. 파일 쓰기가 하나라도 실패하면(fclose 포함) 트레일러 없이 rc 1로 끝난다. ik 스케줄러는 콜백이 그래프를 멈춰도 성공을 돌려주기 때문에, 이 확인이 없으면 트레일러가 반쪽 세트를 인증한다.
+
+**매니페스트 머리에 모델을 적는다.** `# arch`(파일의 `general.architecture`)와 `# model_file`(basename)이 붙고, `# int`·`# input` 열 설명 줄이 붙는다. 리더들은 `tensor\t`로 시작하지 않는 행을 무시하고, 새 키 이름은 기존 접두사(`# tokens\t`·`# model\t`·`# complete\t`)와 겹치지 않는다. 트레일러 `# complete <written> <skipped>`의 뜻은 그대로다(노드만 센다).
+
+**러너가 모델 프로필을 따른다.** 토큰은 프로필(`tools/ref/models/<arch>.sh`)의 `REF_TOKENS`에서 오고 `BLOOMERY_REF_TOKENS`가 덮는다. 프로필 이름이 곧 덤퍼가 기대하는 아키텍처다(`--expect-arch`). 덤퍼는 헤더를 먼저 읽어 다른 아키텍처의 파일을 적재 전에 거부한다 — 세트 이름·토큰·임대가 파일이 아니라 프로필에서 오기 때문이다. `REF_DUMP_LEASE=1`인 프로필은 기계 전역 CPU 임대(`/root/bloomery-cpu.lock`) 아래서 돌고, 앞뒤로 증인 블록(시각, 모델 장치에서 읽은 섹터, major fault, MemAvailable·Cached)을 찍는다. 교체는 다른 모델 파일이 만든 세트 위에는 설치하지 않는다. **프로필은 맥 쪽에서 고른다**: `BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump.sh'`. 명령 안에서 고르면 `tools/box.sh`가 이미 기본 프로필로 모델을 정한 뒤라 `ref-paths.sh`가 rc 64로 거부한다. 거부하기 전에는 V2-Lite 파일이 V4.1 세트 이름으로 rc 0에 설치됐다(머지 때 재현).
+
+**체커가 있다.** `tools/ref/check-int-twins.py <세트>`는 정수 행마다 사본이 있는지, 크기·합·absmax가 다시 계산해도 같은지, f32가 사본의 RNE인지, `inp_tokens`가 `# tokens`와 같은지 본다. 아직 `just gate`에 넣지 않는다 — 실제 V2-Lite `ref`가 v1이라 구조적으로 빨강이다.
+
+V4.1 세트(`ref_deepseek41`)는 토큰 `671,6102,294,8760,344`를 쓴다. BOS 없이 다섯 개다(파일이 `tokenizer.ggml.add_bos_token=false`). engram id는 입력으로 잡힌다(`engram_rows-<층>`). 인덱서 top-k 노드는 5토큰에서 생기지 않는다 — `indexer_top_k(512) < n_kv`일 때만 빌드되는데 n_kv가 256으로 패딩되기 때문이다. top-k 탭이 필요하면 더 긴 프리필 뒤 한 스텝만 덤프하는 기능이 있어야 한다(없다). I64 경로가 처음 도는 것도 이 덤프다.
+
+실제 V2-Lite `ref`는 아직 v1이다. 다시 뜨면 교체가 같은 디렉터리에 다른 도구가 쓴 파일 17개(qdot `*-ik-dot.txt` 넷, dequant `*.raw`·`*.meta`·`manifest.txt`)를 지운다. 그 소유권을 먼저 가른다(장부 B0c 카드의 트래커 ①).
 
 ## 왜 `llama-eval-callback`이 아닌가
 
