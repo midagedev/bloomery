@@ -1,0 +1,18 @@
+positions judged: 1023 (f64 has 1023)
+arm                           !=f64  !=f64 & m>=0.5  clear positions
+ik CUDA (theirs)                 25               1  29/27
+sim ours                         41               4  16/6 23/20 28/24 28/30
+sim ik                           25               2  28/24 29/27
+
+pairwise top1 disagreements (count over judged positions):
+                              ik CUDA (their        sim ours          sim ik
+ik CUDA (theirs)                           0              45              25
+sim ours                                  45               0              32
+sim ik                                    25              32               0
+sim ours: mean |margin - f64 margin| = 0.2003 over 982
+sim ik: mean |margin - f64 margin| = 0.1481 over 998
+
+sigma (RMS of signed margin error), mean bias, expected vs actual mismatches at true margin >= 0.5:
+ik CUDA (theirs)             sigma 0.2711 bias -0.0207  clear: expected 1.00 actual 1   all: expected 44.7 actual 25
+sim ours                     sigma 0.3780 bias -0.0270  clear: expected 4.65 actual 4   all: expected 60.0 actual 41
+sim ik                       sigma 0.2552 bias -0.0239  clear: expected 0.70 actual 2   all: expected 42.2 actual 25
