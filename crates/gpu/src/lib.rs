@@ -60,7 +60,10 @@ pub type GpuError = Box<dyn std::error::Error>;
 /// contract's bounds on `x` at base `x0` and on the five outputs, and that
 /// all 32 lanes of one warp enter with the same `(col, b)` — the collectives
 /// below are warp-wide.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub(crate) fn q8_1_quant_block(
     x: &[f32],
@@ -92,7 +95,10 @@ pub(crate) fn q8_1_quant_block(
             *x.get_unchecked(base + 3),
         ]
     };
-    // SAFETY: the caller's contract, forwarded unchanged.
+    // SAFETY: this fn's own contract gives `col < m_cols`, `b < 2*n_sb`, the
+    // output bounds and the warp-uniform `(col, b)` that
+    // [`q8_1_quant_vals`] requires, and `v` holds exactly its values
+    // `128*b + 4*lane .. +3` of column `col` — the rest of its contract.
     unsafe { q8_1_quant_vals(v, col, b, n_sb, half_it, quad_it, lane, q3, q4, q6, s8, d8) }
 }
 
@@ -105,7 +111,10 @@ pub(crate) fn q8_1_quant_block(
 ///
 /// SAFETY: as [`q8_1_quant_block`], and `v` must be values `128 * b + 4 *
 /// lane .. +3` of column `col`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub(crate) unsafe fn q8_1_quant_vals(
     v: [f32; 4],
@@ -192,16 +201,16 @@ mod kernels {
         q6k_chain, q6k_dequant, q6k_sub_scale,
     };
 
-    /// Q3_K packing recap (decode verified against ggml's
-    /// `dequantize_row_q3_K` in the round-1 kernel at 1e-7):
-    /// super-block = hmask[32] @ +0, qs[64] @ +32, scales[12] @ +96, d @ +108.
-    /// Weight k within the super-block (k = 128c+32j+16h+8p+o) reads its low
-    /// 2 bits from qs byte 32c+16h+8p+o, field j, and its high bit from
-    /// hmask byte (k mod 32), bit 4c+j. Inverting: qs word w (bytes 4w..4w+3),
-    /// field j, covers the four CONSECUTIVE weights
-    /// k = 128*(w/8) + 32*j + 4*(w%8) + b — one dp4a per (word, field)
-    /// against u32 word (k/4) of the q8_1 activation, with the sub-block
-    /// scale (16 weights = one field-group of the word) applied per dp4a.
+    // Q3_K packing recap (decode verified against ggml's
+    // `dequantize_row_q3_K` in the round-1 kernel at 1e-7):
+    // super-block = hmask[32] @ +0, qs[64] @ +32, scales[12] @ +96, d @ +108.
+    // Weight k within the super-block (k = 128c+32j+16h+8p+o) reads its low
+    // 2 bits from qs byte 32c+16h+8p+o, field j, and its high bit from
+    // hmask byte (k mod 32), bit 4c+j. Inverting: qs word w (bytes 4w..4w+3),
+    // field j, covers the four CONSECUTIVE weights
+    // k = 128*(w/8) + 32*j + 4*(w%8) + b — one dp4a per (word, field)
+    // against u32 word (k/4) of the q8_1 activation, with the sub-block
+    // scale (16 weights = one field-group of the word) applied per dp4a.
 
     /// Quantize f32 activations to q8_1: per 128-value block, d = amax/127 and
     /// int8 q = round(x/d). The m columns of `k = 256*n_sb` values each are
@@ -295,7 +304,10 @@ mod kernels {
     ///
     /// The body is `q8_1_quant_block` either way, so each output is the
     /// bytes its own `q3k_quantize_q8_1` launch would have written.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(
@@ -399,7 +411,7 @@ mod kernels {
     /// B = dp4a(1s, q8) = sum q8 (the -8 offset moves 8*B between the
     /// chains). 16 dp4a cover 32 values — twice Q3_K's density, inherent to
     /// the nibble-sibling layout.
-
+    ///
     /// Q4_K (K = 256*n_sb values, n_sb super-blocks per row) times q8_1
     /// activations, M <= 8. One warp per row, guarded scalar accumulators.
     /// The warp covers FOUR super-blocks per iteration (lane L owns the
@@ -559,7 +571,7 @@ mod kernels {
     /// every 32 bytes), which is easy to get wrong. q6 - 32 in [-32,31]
     /// fits a signed byte, so one SWAR subtract folds the offset and the
     /// whole sub-block is a single dp4a chain — no B chain, no min term.
-
+    ///
     /// Q6_K (K = 256*n_sb values, n_sb super-blocks per row) times q8_1
     /// activations, M <= 8. Same lane geometry as q3k_gemv: one warp per
     /// row, iteration covers two super-blocks (lanes 0..15 even, 16..31
@@ -746,6 +758,8 @@ mod kernels {
                 if m > 1 {
                     let cb = q_col + qb;
                     let d8c = d8b + d8_col;
+                    // SAFETY: m > 1, so q.len() >= 2*q_col > cb + 99 and
+                    // d8.len() >= 2*d8_col > d8c.
                     let (q0, q1, q2, q3, e1) = unsafe {
                         (
                             *q.get_unchecked(cb),
@@ -761,6 +775,8 @@ mod kernels {
                 if m > 2 {
                     let cb = 2 * q_col + qb;
                     let d8c = d8b + 2 * d8_col;
+                    // SAFETY: m > 2, so q.len() >= 3*q_col > cb + 99 and
+                    // d8.len() >= 3*d8_col > d8c.
                     let (q0, q1, q2, q3, e2) = unsafe {
                         (
                             *q.get_unchecked(cb),
@@ -776,6 +792,8 @@ mod kernels {
                 if m > 3 {
                     let cb = 3 * q_col + qb;
                     let d8c = d8b + 3 * d8_col;
+                    // SAFETY: m > 3, so q.len() >= 4*q_col > cb + 99 and
+                    // d8.len() >= 4*d8_col > d8c.
                     let (q0, q1, q2, q3, e3) = unsafe {
                         (
                             *q.get_unchecked(cb),
@@ -791,6 +809,8 @@ mod kernels {
                 if m > 4 {
                     let cb = 4 * q_col + qb;
                     let d8c = d8b + 4 * d8_col;
+                    // SAFETY: m > 4, so q.len() >= 5*q_col > cb + 99 and
+                    // d8.len() >= 5*d8_col > d8c.
                     let (q0, q1, q2, q3, e4) = unsafe {
                         (
                             *q.get_unchecked(cb),
@@ -806,6 +826,8 @@ mod kernels {
                 if m > 5 {
                     let cb = 5 * q_col + qb;
                     let d8c = d8b + 5 * d8_col;
+                    // SAFETY: m > 5, so q.len() >= 6*q_col > cb + 99 and
+                    // d8.len() >= 6*d8_col > d8c.
                     let (q0, q1, q2, q3, e5) = unsafe {
                         (
                             *q.get_unchecked(cb),
@@ -821,6 +843,8 @@ mod kernels {
                 if m > 6 {
                     let cb = 6 * q_col + qb;
                     let d8c = d8b + 6 * d8_col;
+                    // SAFETY: m > 6, so q.len() >= 7*q_col > cb + 99 and
+                    // d8.len() >= 7*d8_col > d8c.
                     let (q0, q1, q2, q3, e6) = unsafe {
                         (
                             *q.get_unchecked(cb),
@@ -836,6 +860,8 @@ mod kernels {
                 if m > 7 {
                     let cb = 7 * q_col + qb;
                     let d8c = d8b + 7 * d8_col;
+                    // SAFETY: m > 7, so q.len() >= 8*q_col > cb + 99 and
+                    // d8.len() >= 8*d8_col > d8c.
                     let (q0, q1, q2, q3, e7) = unsafe {
                         (
                             *q.get_unchecked(cb),
@@ -1072,7 +1098,10 @@ mod kernels {
     /// lives in device memory): the slot's warps return before their first
     /// load — warp-uniform, no divergent branch — leaving that slot of `y`
     /// untouched and every other slot unaffected.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(

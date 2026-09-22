@@ -34,7 +34,7 @@ use cuda_device::dotprod::dp4a_s32;
 /// others. A site where the payload could carry meaning keeps the software
 /// path.
 #[inline(always)]
-pub fn half_to_f32(bits: u16) -> f32 {
+pub(crate) fn half_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) as u32) << 31;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let mant = (bits & 0x3ff) as u32;
@@ -113,7 +113,7 @@ pub fn q6_slot(v4: u32) -> u32 {
 /// was half of q4k's per-column instruction count and with it twice
 /// attnstk's M>1 marginal cost (MUL-8).
 #[inline(always)]
-pub fn q4k_nibble(qsw: u32, nib_sh: u32) -> u32 {
+pub(crate) fn q4k_nibble(qsw: u32, nib_sh: u32) -> u32 {
     ((((qsw >> nib_sh) & 0x0f0f0f0f) | 0x80808080).wrapping_sub(0x08080808)) ^ 0x80808080
 }
 
@@ -239,7 +239,10 @@ pub fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
 ///
 /// SAFETY: callers guarantee `sbp < n_sb` and the buffer lengths of
 /// [`q4k_row_dot`] at `m_cols` 1.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 fn q4k_iter_term(
     w: &[u32],
@@ -296,7 +299,10 @@ pub const Q4K_ITER_UNROLL: u32 = 2;
 /// time, and leaves the guarded walk as the tail.
 ///
 /// Caller contract as [`q4k_row_dot`] with `m_cols` 1.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub fn q4k_row_dot_1col(
     w: &[u32],
@@ -390,7 +396,10 @@ pub fn q4k_row_dot_1col(
 /// m_cols) * 8 * n_sb`, `d8.len() >= (col0 + m_cols) * 2 * n_sb`,
 /// `iters = n_sb.div_ceil(4)`, and invoke this from all 32 lanes of one
 /// warp.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub fn q4k_row_dot(
     w: &[u32],
@@ -474,6 +483,8 @@ pub fn q4k_row_dot(
                 // d8b < d8_col; s8.len() >= (col0+1)*s8_col and d8.len() >=
                 // (col0+1)*d8_col by the contract (m >= 1).
                 let b = unsafe { *s8.get_unchecked(s8b0 + s8b) };
+                // SAFETY: d8b < d8_col by the sbp guard, so d8b0 + d8b <
+                // (col0+1)*d8_col <= d8.len() by the contract (m >= 1).
                 let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
                 f0 += (a as f32 * cda + b as f32 * cdb) * e0;
             }
@@ -486,72 +497,86 @@ pub fn q4k_row_dot(
             // every offset below and the branch never diverges within a
             // warp.
             if m > 1 {
-                // SAFETY: m > 1 => q.len() >= (col0+2)*q_col >
-                // qb0 + 1*q_col + qb + 224, s8.len() >= (col0+2)*s8_col >
-                // s8b0 + 1*s8_col + s8b, d8.len() >= (col0+2)*d8_col >
-                // d8b0 + d8b + 1*d8_col.
+                // q.len() >= (col0+2)*q_col > qb0 + 1*q_col + qb + 224
+                // by the same guard, which is `q4k_a_chain`'s contract.
                 let a = q4k_a_chain(&vi, q, qb0 + q_col + qb);
+                // SAFETY: m > 1 => s8.len() >= (col0+2)*s8_col >
+                // s8b0 + 1*s8_col + s8b.
                 let b = unsafe { *s8.get_unchecked(s8b0 + s8_col + s8b) };
+                // SAFETY: m > 1 => d8.len() >= (col0+2)*d8_col >
+                // d8b0 + d8b + 1*d8_col.
                 let e1 = unsafe { *d8.get_unchecked(d8b0 + d8b + d8_col) };
                 f1 += (a as f32 * cda + b as f32 * cdb) * e1;
             }
             if m > 2 {
-                // SAFETY: m > 2 => q.len() >= (col0+3)*q_col >
-                // qb0 + 2*q_col + qb + 224, s8.len() >= (col0+3)*s8_col >
-                // s8b0 + 2*s8_col + s8b, d8.len() >= (col0+3)*d8_col >
-                // d8b0 + d8b + 2*d8_col.
+                // q.len() >= (col0+3)*q_col > qb0 + 2*q_col + qb + 224
+                // by the same guard, which is `q4k_a_chain`'s contract.
                 let a = q4k_a_chain(&vi, q, qb0 + 2 * q_col + qb);
+                // SAFETY: m > 2 => s8.len() >= (col0+3)*s8_col >
+                // s8b0 + 2*s8_col + s8b.
                 let b = unsafe { *s8.get_unchecked(s8b0 + 2 * s8_col + s8b) };
+                // SAFETY: m > 2 => d8.len() >= (col0+3)*d8_col >
+                // d8b0 + d8b + 2*d8_col.
                 let e2 = unsafe { *d8.get_unchecked(d8b0 + d8b + 2 * d8_col) };
                 f2 += (a as f32 * cda + b as f32 * cdb) * e2;
             }
             if m > 3 {
-                // SAFETY: m > 3 => q.len() >= (col0+4)*q_col >
-                // qb0 + 3*q_col + qb + 224, s8.len() >= (col0+4)*s8_col >
-                // s8b0 + 3*s8_col + s8b, d8.len() >= (col0+4)*d8_col >
-                // d8b0 + d8b + 3*d8_col.
+                // q.len() >= (col0+4)*q_col > qb0 + 3*q_col + qb + 224
+                // by the same guard, which is `q4k_a_chain`'s contract.
                 let a = q4k_a_chain(&vi, q, qb0 + 3 * q_col + qb);
+                // SAFETY: m > 3 => s8.len() >= (col0+4)*s8_col >
+                // s8b0 + 3*s8_col + s8b.
                 let b = unsafe { *s8.get_unchecked(s8b0 + 3 * s8_col + s8b) };
+                // SAFETY: m > 3 => d8.len() >= (col0+4)*d8_col >
+                // d8b0 + d8b + 3*d8_col.
                 let e3 = unsafe { *d8.get_unchecked(d8b0 + d8b + 3 * d8_col) };
                 f3 += (a as f32 * cda + b as f32 * cdb) * e3;
             }
             if m > 4 {
-                // SAFETY: m > 4 => q.len() >= (col0+5)*q_col >
-                // qb0 + 4*q_col + qb + 224, s8.len() >= (col0+5)*s8_col >
-                // s8b0 + 4*s8_col + s8b, d8.len() >= (col0+5)*d8_col >
-                // d8b0 + d8b + 4*d8_col.
+                // q.len() >= (col0+5)*q_col > qb0 + 4*q_col + qb + 224
+                // by the same guard, which is `q4k_a_chain`'s contract.
                 let a = q4k_a_chain(&vi, q, qb0 + 4 * q_col + qb);
+                // SAFETY: m > 4 => s8.len() >= (col0+5)*s8_col >
+                // s8b0 + 4*s8_col + s8b.
                 let b = unsafe { *s8.get_unchecked(s8b0 + 4 * s8_col + s8b) };
+                // SAFETY: m > 4 => d8.len() >= (col0+5)*d8_col >
+                // d8b0 + d8b + 4*d8_col.
                 let e4 = unsafe { *d8.get_unchecked(d8b0 + d8b + 4 * d8_col) };
                 f4 += (a as f32 * cda + b as f32 * cdb) * e4;
             }
             if m > 5 {
-                // SAFETY: m > 5 => q.len() >= (col0+6)*q_col >
-                // qb0 + 5*q_col + qb + 224, s8.len() >= (col0+6)*s8_col >
-                // s8b0 + 5*s8_col + s8b, d8.len() >= (col0+6)*d8_col >
-                // d8b0 + d8b + 5*d8_col.
+                // q.len() >= (col0+6)*q_col > qb0 + 5*q_col + qb + 224
+                // by the same guard, which is `q4k_a_chain`'s contract.
                 let a = q4k_a_chain(&vi, q, qb0 + 5 * q_col + qb);
+                // SAFETY: m > 5 => s8.len() >= (col0+6)*s8_col >
+                // s8b0 + 5*s8_col + s8b.
                 let b = unsafe { *s8.get_unchecked(s8b0 + 5 * s8_col + s8b) };
+                // SAFETY: m > 5 => d8.len() >= (col0+6)*d8_col >
+                // d8b0 + d8b + 5*d8_col.
                 let e5 = unsafe { *d8.get_unchecked(d8b0 + d8b + 5 * d8_col) };
                 f5 += (a as f32 * cda + b as f32 * cdb) * e5;
             }
             if m > 6 {
-                // SAFETY: m > 6 => q.len() >= (col0+7)*q_col >
-                // qb0 + 6*q_col + qb + 224, s8.len() >= (col0+7)*s8_col >
-                // s8b0 + 6*s8_col + s8b, d8.len() >= (col0+7)*d8_col >
-                // d8b0 + d8b + 6*d8_col.
+                // q.len() >= (col0+7)*q_col > qb0 + 6*q_col + qb + 224
+                // by the same guard, which is `q4k_a_chain`'s contract.
                 let a = q4k_a_chain(&vi, q, qb0 + 6 * q_col + qb);
+                // SAFETY: m > 6 => s8.len() >= (col0+7)*s8_col >
+                // s8b0 + 6*s8_col + s8b.
                 let b = unsafe { *s8.get_unchecked(s8b0 + 6 * s8_col + s8b) };
+                // SAFETY: m > 6 => d8.len() >= (col0+7)*d8_col >
+                // d8b0 + d8b + 6*d8_col.
                 let e6 = unsafe { *d8.get_unchecked(d8b0 + d8b + 6 * d8_col) };
                 f6 += (a as f32 * cda + b as f32 * cdb) * e6;
             }
             if m > 7 {
-                // SAFETY: m > 7 => q.len() >= (col0+8)*q_col >
-                // qb0 + 7*q_col + qb + 224, s8.len() >= (col0+8)*s8_col >
-                // s8b0 + 7*s8_col + s8b, d8.len() >= (col0+8)*d8_col >
-                // d8b0 + d8b + 7*d8_col.
+                // q.len() >= (col0+8)*q_col > qb0 + 7*q_col + qb + 224
+                // by the same guard, which is `q4k_a_chain`'s contract.
                 let a = q4k_a_chain(&vi, q, qb0 + 7 * q_col + qb);
+                // SAFETY: m > 7 => s8.len() >= (col0+8)*s8_col >
+                // s8b0 + 7*s8_col + s8b.
                 let b = unsafe { *s8.get_unchecked(s8b0 + 7 * s8_col + s8b) };
+                // SAFETY: m > 7 => d8.len() >= (col0+8)*d8_col >
+                // d8b0 + d8b + 7*d8_col.
                 let e7 = unsafe { *d8.get_unchecked(d8b0 + d8b + 7 * d8_col) };
                 f7 += (a as f32 * cda + b as f32 * cdb) * e7;
             }
@@ -745,7 +770,10 @@ pub fn q3k_sb_decode(w: &[u32], base: usize, w16: usize, s0: usize) -> ([u32; 4]
 /// SAFETY: callers guarantee `sbp < n_sb`, that `base` is that
 /// super-block's byte offset inside row `row_abs`, and the buffer lengths of
 /// [`q3k_row_dot`] at `m_cols` 1.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 fn q3k_iter_term(
     w: &[u32],
@@ -791,7 +819,10 @@ fn q3k_iter_term(
 /// adds — measured flat here, so it is not carried.
 ///
 /// Caller contract as [`q3k_row_dot`] with `m_cols` 1.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub fn q3k_row_dot_1col(
     w: &[u32],
@@ -860,7 +891,10 @@ pub fn q3k_row_dot_1col(
 /// span), `q.len() >= (col0 + m_cols) * 64 * iters`, `d8.len() >= (col0 +
 /// m_cols) * 2 * n_sb`, `iters = n_sb.div_ceil(2)`, and invoke this from all
 /// 32 lanes of one warp.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub fn q3k_row_dot(
     w: &[u32],
@@ -951,8 +985,12 @@ pub fn q3k_row_dot(
                 // permutation's group bound); d8b0 + d8b < (col0+1)*d8_col
                 // by the sbp guard.
                 let w01 = unsafe { *q.get_unchecked(qb0 + qb) };
+                // SAFETY: the second u64 slot of the same pair, still inside
+                // the column: qb0 + qb + 32 <= (col0+1)*q_col - 1.
                 let w23 = unsafe { *q.get_unchecked(qb0 + qb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: d8b0 + d8b < (col0+1)*d8_col <= d8.len() by the sbp
+                // guard and the contract (m >= 1).
                 f0 += (a as f32) * (unsafe { *d8.get_unchecked(d8b0 + d8b) } * drow);
             }
             // Columns 1..7, one launch-uniform guard per column so the
@@ -965,57 +1003,85 @@ pub fn q3k_row_dot(
             if m > 1 {
                 let cb = qb0 + q_col + qb;
                 let d8c = d8b0 + d8_col + d8b;
+                // SAFETY: m > 1 => q.len() >= (col0+2)*q_col > cb + 32,
+                // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
+                // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: m > 1 => d8.len() >= (col0+2)*d8_col > d8c.
                 f1 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
             }
             if m > 2 {
                 let cb = qb0 + 2 * q_col + qb;
                 let d8c = d8b0 + 2 * d8_col + d8b;
+                // SAFETY: m > 2 => q.len() >= (col0+3)*q_col > cb + 32,
+                // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
+                // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: m > 2 => d8.len() >= (col0+3)*d8_col > d8c.
                 f2 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
             }
             if m > 3 {
                 let cb = qb0 + 3 * q_col + qb;
                 let d8c = d8b0 + 3 * d8_col + d8b;
+                // SAFETY: m > 3 => q.len() >= (col0+4)*q_col > cb + 32,
+                // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
+                // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: m > 3 => d8.len() >= (col0+4)*d8_col > d8c.
                 f3 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
             }
             if m > 4 {
                 let cb = qb0 + 4 * q_col + qb;
                 let d8c = d8b0 + 4 * d8_col + d8b;
+                // SAFETY: m > 4 => q.len() >= (col0+5)*q_col > cb + 32,
+                // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
+                // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: m > 4 => d8.len() >= (col0+5)*d8_col > d8c.
                 f4 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
             }
             if m > 5 {
                 let cb = qb0 + 5 * q_col + qb;
                 let d8c = d8b0 + 5 * d8_col + d8b;
+                // SAFETY: m > 5 => q.len() >= (col0+6)*q_col > cb + 32,
+                // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
+                // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: m > 5 => d8.len() >= (col0+6)*d8_col > d8c.
                 f5 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
             }
             if m > 6 {
                 let cb = qb0 + 6 * q_col + qb;
                 let d8c = d8b0 + 6 * d8_col + d8b;
+                // SAFETY: m > 6 => q.len() >= (col0+7)*q_col > cb + 32,
+                // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
+                // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: m > 6 => d8.len() >= (col0+7)*d8_col > d8c.
                 f6 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
             }
             if m > 7 {
                 let cb = qb0 + 7 * q_col + qb;
                 let d8c = d8b0 + 7 * d8_col + d8b;
+                // SAFETY: m > 7 => q.len() >= (col0+8)*q_col > cb + 32,
+                // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
+                // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
+                // SAFETY: m > 7 => d8.len() >= (col0+8)*d8_col > d8c.
                 f7 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
             }
         }

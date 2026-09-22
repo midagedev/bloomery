@@ -96,6 +96,7 @@ impl DevWeight {
     }
 
     /// Device bytes held across all planes.
+    #[must_use]
     pub fn resident_bytes(&self) -> usize {
         match self {
             DevWeight::KQuant { w, .. } | DevWeight::Q5_0 { w, .. } | DevWeight::Q5_1 { w, .. } => {
@@ -199,6 +200,7 @@ impl Weights {
 
 /// The name under which block `l`'s derived q_nope2 weights are resident.
 /// The `derived.` prefix keeps it out of the file-tensor namespace.
+#[must_use]
 pub fn derived_name(l: usize) -> String {
     format!("derived.blk.{l}.q_nope2")
 }
@@ -227,6 +229,7 @@ fn tensor_rows(t: &TensorInfo) -> usize {
 /// type has no device format. The uploads follow the same arithmetic, so a
 /// census totals check against a loaded `Weights::resident_bytes` pins the
 /// two together.
+#[must_use]
 pub fn resident_size(ty: GgmlType, k: usize, rows: usize) -> Option<usize> {
     let q_stride_words = |k: usize| 256 * (k / 32).div_ceil(32);
     match ty {

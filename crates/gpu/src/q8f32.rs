@@ -494,9 +494,10 @@ mod q8f32_kernels {
         );
         let m = m_cols as usize;
         if lane == 0 {
-            // SAFETY: as in f32_gemv — lane 0 of the row's warp writes only
-            // the m live slots of its row segment, inside y by the launch
-            // contract.
+            // SAFETY: row < n_rows, so the m = m_cols slots written below lie
+            // in row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(),
+            // the launch contract's bound; only lane 0 of the row's warp
+            // writes them.
             unsafe {
                 let b = row * m;
                 *y.get_unchecked_mut(b) = sums[0];

@@ -132,7 +132,8 @@ impl Graph {
         // is the one the bindings expose.
         let rc = unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
         if let Err(e) = cu(rc, "cuGraphInstantiateWithFlags") {
-            // SAFETY: as above.
+            // SAFETY: graph is still the valid handle end_capture returned;
+            // the failed instantiation left it untouched.
             unsafe { sys::cuGraphDestroy(graph) };
             return Err(e);
         }
@@ -152,6 +153,7 @@ impl Graph {
     /// Number of nodes the capture recorded — kernel launches plus any memset
     /// or copy nodes. This is the "launch count" column of the first lease
     /// measurement (docs/gpu-design.md §런치 수).
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes
     }

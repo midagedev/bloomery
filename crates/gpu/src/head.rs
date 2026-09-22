@@ -111,6 +111,7 @@ impl Head {
     }
 
     /// Device bytes of the scratch (the weights are counted by their owner).
+    #[must_use]
     pub fn resident_bytes(&self) -> usize {
         self.x.num_bytes()
             + self.normed.num_bytes()

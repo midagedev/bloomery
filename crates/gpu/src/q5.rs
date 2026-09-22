@@ -104,7 +104,10 @@ fn q5_block_col(cw: &[u32; 8], q: &[u32], qb: usize, d: f32, mds: f32, e: f32) -
 /// `row_words = q_stride + k_blocks`, or `+ 2*k_blocks` when `q5_1`),
 /// `q.len() >= (col0 + m_cols) * q_stride`, `d8.len()` and `s8.len()`
 /// `>= (col0 + m_cols) * k_blocks`, and `1 <= m_cols <= 8`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub fn q5_row_dot(
     w: &[u32],
@@ -152,12 +155,14 @@ pub fn q5_row_dot(
         };
         let qslot = 256 * (b >> 5) + (b & 31);
 
-        // Column 0 (always active).
-        // SAFETY: d8b0 + b < (col0+1)*k_blocks <= d8.len() and q0 + qslot +
-        // 224 < (col0+1)*q_stride <= q.len() (m_cols >= 1).
+        // Column 0 (always active). q0 + qslot + 224 < (col0+1)*q_stride <=
+        // q.len() (m_cols >= 1) is `q5_block_col`'s contract.
         {
+            // SAFETY: d8b0 + b < (col0+1)*k_blocks <= d8.len() (m_cols >= 1).
             let e0 = unsafe { *d8.get_unchecked(d8b0 + b) };
             let s0 = if q5_1 {
+                // SAFETY: the same index as e0 in the parallel s8 buffer:
+                // d8b0 + b < (col0+1)*k_blocks <= s8.len() when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + b) }
             } else {
                 0
@@ -169,11 +174,12 @@ pub fn q5_row_dot(
         // q0 + c*q_stride + qslot (+224 inside the chain), the d8/s8 block
         // at d8b0 + c*k_blocks + b.
         if m_cols > 1 {
-            // SAFETY: m_cols > 1 => column col0+1 exists, so the indices
-            // below are under (col0+2)*k_blocks / (col0+2)*q_stride, both
-            // <= the contract bounds.
+            // SAFETY: m_cols > 1 => d8.len() >= (col0+2)*k_blocks >
+            // d8b0 + k_blocks + b.
             let e1 = unsafe { *d8.get_unchecked(d8b0 + k_blocks + b) };
             let s1 = if q5_1 {
+                // SAFETY: the same index in the parallel s8 buffer, which is
+                // as long as d8 when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + k_blocks + b) }
             } else {
                 0
@@ -181,9 +187,12 @@ pub fn q5_row_dot(
             f1 += q5_block_col(&cw, q, q0 + q_stride + qslot, d, mv * s1 as f32, e1);
         }
         if m_cols > 2 {
-            // SAFETY: as column 1, one column further; m_cols > 2 covers it.
+            // SAFETY: m_cols > 2 => d8.len() >= (col0+3)*k_blocks >
+            // d8b0 + 2*k_blocks + b.
             let e2 = unsafe { *d8.get_unchecked(d8b0 + 2 * k_blocks + b) };
             let s2 = if q5_1 {
+                // SAFETY: the same index in the parallel s8 buffer, which is
+                // as long as d8 when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + 2 * k_blocks + b) }
             } else {
                 0
@@ -191,9 +200,12 @@ pub fn q5_row_dot(
             f2 += q5_block_col(&cw, q, q0 + 2 * q_stride + qslot, d, mv * s2 as f32, e2);
         }
         if m_cols > 3 {
-            // SAFETY: as column 1, one column further; m_cols > 3 covers it.
+            // SAFETY: m_cols > 3 => d8.len() >= (col0+4)*k_blocks >
+            // d8b0 + 3*k_blocks + b.
             let e3 = unsafe { *d8.get_unchecked(d8b0 + 3 * k_blocks + b) };
             let s3 = if q5_1 {
+                // SAFETY: the same index in the parallel s8 buffer, which is
+                // as long as d8 when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + 3 * k_blocks + b) }
             } else {
                 0
@@ -201,9 +213,12 @@ pub fn q5_row_dot(
             f3 += q5_block_col(&cw, q, q0 + 3 * q_stride + qslot, d, mv * s3 as f32, e3);
         }
         if m_cols > 4 {
-            // SAFETY: as column 1, one column further; m_cols > 4 covers it.
+            // SAFETY: m_cols > 4 => d8.len() >= (col0+5)*k_blocks >
+            // d8b0 + 4*k_blocks + b.
             let e4 = unsafe { *d8.get_unchecked(d8b0 + 4 * k_blocks + b) };
             let s4 = if q5_1 {
+                // SAFETY: the same index in the parallel s8 buffer, which is
+                // as long as d8 when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + 4 * k_blocks + b) }
             } else {
                 0
@@ -211,9 +226,12 @@ pub fn q5_row_dot(
             f4 += q5_block_col(&cw, q, q0 + 4 * q_stride + qslot, d, mv * s4 as f32, e4);
         }
         if m_cols > 5 {
-            // SAFETY: as column 1, one column further; m_cols > 5 covers it.
+            // SAFETY: m_cols > 5 => d8.len() >= (col0+6)*k_blocks >
+            // d8b0 + 5*k_blocks + b.
             let e5 = unsafe { *d8.get_unchecked(d8b0 + 5 * k_blocks + b) };
             let s5 = if q5_1 {
+                // SAFETY: the same index in the parallel s8 buffer, which is
+                // as long as d8 when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + 5 * k_blocks + b) }
             } else {
                 0
@@ -221,9 +239,12 @@ pub fn q5_row_dot(
             f5 += q5_block_col(&cw, q, q0 + 5 * q_stride + qslot, d, mv * s5 as f32, e5);
         }
         if m_cols > 6 {
-            // SAFETY: as column 1, one column further; m_cols > 6 covers it.
+            // SAFETY: m_cols > 6 => d8.len() >= (col0+7)*k_blocks >
+            // d8b0 + 6*k_blocks + b.
             let e6 = unsafe { *d8.get_unchecked(d8b0 + 6 * k_blocks + b) };
             let s6 = if q5_1 {
+                // SAFETY: the same index in the parallel s8 buffer, which is
+                // as long as d8 when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + 6 * k_blocks + b) }
             } else {
                 0
@@ -231,9 +252,12 @@ pub fn q5_row_dot(
             f6 += q5_block_col(&cw, q, q0 + 6 * q_stride + qslot, d, mv * s6 as f32, e6);
         }
         if m_cols > 7 {
-            // SAFETY: as column 1, one column further; m_cols > 7 covers it.
+            // SAFETY: m_cols > 7 => d8.len() >= (col0+8)*k_blocks >
+            // d8b0 + 7*k_blocks + b.
             let e7 = unsafe { *d8.get_unchecked(d8b0 + 7 * k_blocks + b) };
             let s7 = if q5_1 {
+                // SAFETY: the same index in the parallel s8 buffer, which is
+                // as long as d8 when q5_1.
                 unsafe { *s8.get_unchecked(d8b0 + 7 * k_blocks + b) }
             } else {
                 0
@@ -264,7 +288,10 @@ pub fn q5_row_dot(
 /// contract's bounds on `x`, `q`, `s8` and `d8`, and that all 32 lanes of
 /// one warp enter with the same `(col, g)` — the shuffles below are
 /// warp-wide.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 pub(crate) unsafe fn q5_quant_group(
     x: &[f32],
@@ -402,7 +429,10 @@ mod q5_kernels {
     /// written. The two geometries differ (a q5 group is four 32-value
     /// blocks, a q8_1 block is 128 values) and stay separate: nothing is
     /// reduced across the arm.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(
@@ -449,7 +479,7 @@ mod q5_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        // SAFETY (both arms): the arm's index is inside its own total, so
+        // SAFETY: the arm's index is inside its own total, so
         // the column and group/block indices below are in range, and the
         // launch contract bounds that arm's source and outputs. The arm is
         // chosen by the block index, so a warp never splits across it.
@@ -476,7 +506,10 @@ mod q5_kernels {
     /// scratch, writing `y[y0 + r*m_cols + c]` (r the local row). Layouts and
     /// bounds: `q5_row_dot`, whose contract this kernel's launch contract
     /// states over its own parameters (`row_words = q_stride + k_blocks`).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -559,7 +592,10 @@ mod q5_kernels {
     /// Q5_1 gemv: same geometry as `q5_0_gemv` over the Q5_1 layout
     /// (`row_words = q_stride + 2*k_blocks`; unsigned codes plus the
     /// `m·(block sum)` offset term). See `q5_row_dot`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -609,8 +645,9 @@ mod q5_kernels {
         let s = reduce_cols(f, m_cols as usize);
         if lane == 0 {
             let yb = y0 as usize + row * m_cols as usize;
-            // SAFETY: same bound as q5_0_gemv — the contracts are identical
-            // here.
+            // SAFETY: row < n_rows, so the slots written below lie in
+            // yb .. yb + m_cols <= y0 + n_rows*m_cols <= y.len(), the launch
+            // contract's bound; only lane 0 of the row's warp writes.
             unsafe {
                 *y.get_unchecked_mut(yb) = s[0];
                 if m_cols > 1 {
@@ -654,7 +691,10 @@ mod q5_kernels {
     /// lives in device memory): the slot's warps return before their first
     /// load — warp-uniform, no divergent branch — leaving that slot of `y`
     /// untouched and every other slot unaffected.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -787,7 +827,7 @@ pub struct Q8Blocks32 {
 impl Q8Blocks32 {
     /// Allocate for `m` (1..=8) columns of `k` values. Load-time only.
     pub fn new(stream: &CudaStream, k: usize, m: usize) -> Result<Self, GpuError> {
-        if k == 0 || k % 32 != 0 {
+        if k == 0 || !k.is_multiple_of(32) {
             return Err(
                 format!("Q8Blocks32::new: k must be a positive multiple of 32, got {k}").into(),
             );
@@ -863,7 +903,7 @@ pub fn pack_q5_1(bytes: &[u8], k: usize, rows: usize) -> Result<Vec<u32>, GpuErr
 }
 
 fn pack_q5(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<u32>, GpuError> {
-    if k == 0 || k % 32 != 0 {
+    if k == 0 || !k.is_multiple_of(32) {
         return Err(format!("pack_q5: k must be a positive multiple of 32, got {k}").into());
     }
     let k_blocks = k / 32;
@@ -1044,7 +1084,10 @@ impl Q5Kernels {
     /// (col0 + c)` for Q5_0 weights packed by `pack_q5_0` — `w` uploaded
     /// with `cols = q_stride + k/32` over the whole flat stack, so experts
     /// are reached by `row0` without a gather copy.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
     pub fn enqueue_gemv_q5_0(
         &self,
         stream: &CudaStream,
@@ -1143,7 +1186,7 @@ impl Q5Kernels {
             )
             .into());
         }
-        if rows_per_expert == 0 || w.rows() % rows_per_expert != 0 {
+        if rows_per_expert == 0 || !w.rows().is_multiple_of(rows_per_expert) {
             return Err(format!(
                 "enqueue_gemv_q5_0_sel: w.rows() {} must be a positive multiple of \
                  rows_per_expert {rows_per_expert}",
@@ -1194,7 +1237,10 @@ impl Q5Kernels {
 
     /// Enqueue the Q5_1 counterpart of `enqueue_gemv_q5_0` — `w` packed by
     /// `pack_q5_1` with `cols = q_stride + 2*k/32`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
     pub fn enqueue_gemv_q5_1(
         &self,
         stream: &CudaStream,

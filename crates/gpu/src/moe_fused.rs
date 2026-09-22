@@ -54,7 +54,10 @@ mod moe_fused_kernels {
     /// warp-uniform, no divergent branch — leaving that slot of `h`
     /// untouched and every other slot unaffected, exactly as `q3k_gemv_sel`
     /// leaves its `y`.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -192,7 +195,10 @@ impl MoeFusedKernels {
     /// captured graph replay picks up new ids written between replays; an
     /// id >= n_experts leaves that slot of `h` untouched. Asynchronous,
     /// allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
     pub fn enqueue_expert_gate_up_swiglu(
         &self,
         stream: &CudaStream,
@@ -296,7 +302,10 @@ impl MoeFusedKernels {
     /// output layout (slot-major), `w` the router's `n_slots` per-slot
     /// weights, `shexp`/`resid`/`y` `rows` f32 each. Asynchronous,
     /// allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
     pub fn enqueue_moe_combine(
         &self,
         stream: &CudaStream,

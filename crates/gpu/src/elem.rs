@@ -192,6 +192,8 @@ pub fn weighted_expert_sum(
         // the down index (t*n_exp + e)*rows + d inside their buffers by the
         // caller contract.
         let wv = unsafe { *w.get_unchecked(t * n_exp + e) };
+        // SAFETY: the same e < n_exp and t < m bound the down index
+        // (t*n_exp + e)*rows + d inside `down` by the caller contract.
         let dv = unsafe { *down.get_unchecked((t * n_exp + e) * rows + d) };
         acc += wv * dv;
         e += 1;
@@ -583,7 +585,7 @@ impl ElemKernels {
             )
             .into());
         }
-        if ids.len() == 0 {
+        if ids.is_empty() {
             return Err("enqueue_embed_rows: empty ids".into());
         }
         if y.len() < 2048 * ids.len() {
@@ -617,7 +619,7 @@ impl ElemKernels {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        if k == 0 || k % 32 != 0 {
+        if k == 0 || !k.is_multiple_of(32) {
             return Err(
                 format!("enqueue_rms_norm: k must be a positive multiple of 32, got {k}").into(),
             );
@@ -657,7 +659,7 @@ impl ElemKernels {
         m: usize,
         dst: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        if n_dims < 2 || n_dims % 2 != 0 {
+        if n_dims < 2 || !n_dims.is_multiple_of(2) {
             return Err(format!("enqueue_rope: n_dims must be even and >= 2, got {n_dims}").into());
         }
         if n_vec == 0 || m == 0 {
@@ -817,7 +819,7 @@ impl ElemKernels {
         n: usize,
         out: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        if n == 0 || x.len() < n || out.len() < 1 {
+        if n == 0 || x.len() < n || out.is_empty() {
             return Err(format!(
                 "enqueue_argmax: n={n}, x.len() {}, out.len() {}",
                 x.len(),

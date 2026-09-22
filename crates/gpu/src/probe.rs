@@ -62,7 +62,8 @@ mod probe_kernels {
         }
         grid::sync();
         if i < n as usize {
-            // SAFETY: as above.
+            // SAFETY: i < n <= y.len() by the launch contract; the grid
+            // barrier above published the first store.
             unsafe {
                 *y.get_unchecked_mut(i) = 3.0;
             }
@@ -100,7 +101,7 @@ mod probe_kernels {
         if i >= n as usize {
             return;
         }
-        // SAFETY: as in `gap_plain`.
+        // SAFETY: i < n and n + i < 2n <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = 1.0;
             *y.get_unchecked_mut(n as usize + i) = 3.0;

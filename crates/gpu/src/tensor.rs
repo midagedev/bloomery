@@ -101,7 +101,7 @@ impl Q8Act {
         if !(1..=8).contains(&m) {
             return Err(format!("Q8Act::with_k: 1 <= m <= 8, got {m}").into());
         }
-        if k % 256 != 0 || !(256..=10944).contains(&k) {
+        if !k.is_multiple_of(256) || !(256..=10944).contains(&k) {
             return Err(format!(
                 "Q8Act::with_k: k must be a multiple of 256 in 256..=10944, got {k}"
             )
@@ -129,6 +129,7 @@ impl Q8Act {
 
     /// Super-blocks per row (k/256) — the row geometry every K-quant gemv
     /// of this engine launches with.
+    #[must_use]
     pub fn n_sb(&self) -> usize {
         self.k / 256
     }

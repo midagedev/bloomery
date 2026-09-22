@@ -63,7 +63,10 @@ mod fused_kernels {
     /// quantizer consumes, so it holds `elem::rms_norm`'s store bit for bit.
     /// The attention norm's tap and the MoE router read it; a site with no
     /// f32 consumer passes a buffer it is about to overwrite anyway.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -254,7 +257,10 @@ mod fused_kernels {
     /// through a gather's pair table, and the cache row is
     /// `flash::kv_append_pos_buf`'s `f32_to_f16_bits` at `pos_buf[0]`, with
     /// the same skip for a position at or past the cache's height.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -387,7 +393,10 @@ mod fused_kernels {
     /// row dots the ONE quantized column of `q`/`d8` (gate and up read the
     /// same input). Weights as `enqueue_gemv_q3k` (rows of `110 * n_sb / 4`
     /// u32 words, even n_sb), gate and up of the same row count.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -438,7 +447,10 @@ mod fused_kernels {
     /// a = the down dot (the op path's ffn_out operand), b = `resid` (its
     /// ffn_inp operand). Weight layout as `enqueue_gemv_q5_1`
     /// (`q_stride + 2*k_blocks` words per row). m = 1.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -585,7 +597,10 @@ impl FusedKernels {
     /// `cache` rows are `latent + rope` wide; a position at or past its
     /// height leaves the cache untouched. m = 1. Asynchronous,
     /// allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
     pub fn enqueue_kv_norm_rope_append(
         &self,
         stream: &CudaStream,
@@ -601,14 +616,14 @@ impl FusedKernels {
         cache: &mut DeviceTensor<u16>,
     ) -> Result<(), GpuError> {
         let width = latent + rope;
-        if latent == 0 || latent % 32 != 0 {
+        if latent == 0 || !latent.is_multiple_of(32) {
             return Err(format!(
                 "enqueue_kv_norm_rope_append: the norm's geometry needs a positive multiple of \
                  32, got latent {latent}"
             )
             .into());
         }
-        if rope < 2 || rope % 2 != 0 || rope > 2 * RMS_THREADS {
+        if rope < 2 || !rope.is_multiple_of(2) || rope > 2 * RMS_THREADS {
             return Err(format!(
                 "enqueue_kv_norm_rope_append: the rope tail is one pair per thread of the one \
                  {RMS_THREADS}-thread block, so rope must be even and at most {}, got {rope}",
@@ -643,7 +658,7 @@ impl FusedKernels {
             )
             .into());
         }
-        if pos_buf.len() < 1 {
+        if pos_buf.is_empty() {
             return Err("enqueue_kv_norm_rope_append: pos_buf must hold 1 u32".into());
         }
         let rows = cache.rows();
@@ -690,7 +705,7 @@ impl FusedKernels {
             )
             .into());
         }
-        if n_sb % 2 != 0 {
+        if !n_sb.is_multiple_of(2) {
             return Err(format!(
                 "enqueue_gate_up_swiglu: odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",

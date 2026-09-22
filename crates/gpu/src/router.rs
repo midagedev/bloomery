@@ -245,7 +245,8 @@ mod router_kernels {
         let inv = sum as f32;
         let mut e = 0usize;
         while e < 64 {
-            // SAFETY: as pass 2 — this thread's own slot of probs.
+            // SAFETY: e < 64 and t < m, so e*mi + t < 64*m <= probs.len()
+            // by the launch contract — this thread's own slot.
             unsafe {
                 *probs.get_unchecked_mut(e * mi + t) /= inv;
             }
@@ -355,7 +356,10 @@ impl RouterKernels {
     /// probability, ties to the smaller id). `scale` is the file's
     /// `expert_weights_scale` (1.0 in this model). Asynchronous,
     /// allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
     pub fn enqueue_router_topk(
         &self,
         stream: &CudaStream,
@@ -408,7 +412,10 @@ impl RouterKernels {
     /// (`ids[s] * rows_dn`), 6 u32 each. `rows_gu` is the gate/up stacks'
     /// rows per expert (1408, K = 2048), `rows_dn` the down stack's (2048,
     /// K = 1408). Asynchronous, allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
     pub fn enqueue_expert_table(
         &self,
         stream: &CudaStream,
