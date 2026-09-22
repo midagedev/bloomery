@@ -4,8 +4,14 @@
 # 대상은 엔진 크레이트의 src/ (스테이지 0 크레이트 q3k-*는 MUL-10/11의 몫이라 제외).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+dirs=("$ROOT"/crates/{gguf,threads,qdot,model}/src)
+# GPU 크레이트도 같은 규약을 진다. 임시 스위치: CHECK_COMMENTS_GPU=0으로 끄면 옛 대상만 본다
+# (main에서 이 경로가 빨강이면 리드가 머지 순서를 정하는 동안 끄는 손잡이다).
+if [ "${CHECK_COMMENTS_GPU:-1}" != 0 ]; then
+  dirs+=("$ROOT/crates/gpu/src" "$ROOT/crates/gpu-gates/src")
+fi
 bad=$(grep -rnE '//.*(MUL-[0-9]+|20[0-9]{2}-[0-9]{2}-[0-9]{2})' \
-        "$ROOT"/crates/{gguf,threads,qdot,model}/src --include='*.rs' | grep -v 'PIN(' || true)
+        "${dirs[@]}" --include='*.rs' | grep -v 'PIN(' || true)
 if [ -n "$bad" ]; then
   n=$(printf '%s\n' "$bad" | wc -l | tr -d ' ')
   printf '%s\n' "$bad" | head -40 >&2

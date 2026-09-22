@@ -24,8 +24,15 @@ done < <(ssh "$HOST" "cd ~/repo && du -sh ${MAIN} ${MAIN}-* 2>/dev/null")
 for name in "${stale[@]}"; do
   case "$name" in "$MAIN"-?*) ;; *) echo "refusing odd name: $name" >&2; exit 1 ;; esac
   # 그 디렉터리 아래 실행 파일을 문 프로세스가 있으면 지우지 않는다(돌고 있는 트랙일 수 있다).
-  if ssh "$HOST" "pgrep -f \"\$HOME/repo/$name/target\" >/dev/null"; then
+  # 판정은 box-gc.sh와 같은 스캐너다(/proc/<pid>/exe 접두 비교) — cmdline 매칭은 자기 셸과 ssh
+  # 자식을 같이 고른다. stale 디렉터리에는 그 스크립트가 없을 수 있으므로 stdin으로 넘긴다.
+  rc=0
+  ssh "$HOST" "bash -s -- --check \"\$HOME/repo/$name\"" < "$HERE/tools/box-gc.sh" > /dev/null || rc=$?
+  if [ "$rc" = 10 ]; then
     echo "skip   $name — a process still runs from its target/" >&2
+    continue
+  elif [ "$rc" != 0 ]; then
+    echo "skip   $name — the process scan failed (rc $rc)" >&2
     continue
   fi
   ssh "$HOST" "rm -rf ~/repo/$name" && echo "removed $name"

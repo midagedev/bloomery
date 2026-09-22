@@ -11,7 +11,10 @@
 set -euo pipefail
 export BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 LOCK=/root/bloomery-cpu.lock
-GPU_UUID=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
+# The card pin, the witness lines and the stale-binary refusal are the same code the three
+# depth/profile runners use; this runner used to pin the 3090 by hand and print no card name.
+# shellcheck source=tools/ref/timing-card.sh
+source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 NAME=${1:?usage: time-gate.sh <gate_bin_name> [extra args...]}
 shift
 ARGS=("$@")
@@ -19,20 +22,15 @@ if [ ${#ARGS[@]} -eq 0 ]; then
   ARGS=(--time)
 fi
 BIN=target/release/$NAME
-[ -x "$BIN" ] || { echo "no $BIN — run the matching just gate-gpu-* recipe first" >&2; exit 2; }
+assert_fresh_binary "$BIN" || exit $?
 witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,power.draw,clocks.sm --format=csv
-  echo "compute-apps-3090:"
-  nvidia-smi --query-compute-apps=pid,used_memory --format=csv -i "$GPU_UUID"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  echo "llm.service: $(systemctl is-active llm.service || true)"
+  echo "--- witness $1 $(now) ---"
+  witness_card
 }
 exec 9>"$LOCK"
 echo "[lease] waiting for $LOCK ..."
 flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] held by pid $$ at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "[lease] held by pid $$ at $(now)"
 witness pre
 # `|| rc=$?`, not a bare `rc=$?`: under `set -e` a non-zero gate exits the script on the
 # spot, and the post witness and the rc line never print (measured 2026-09-21 — a FAIL-first

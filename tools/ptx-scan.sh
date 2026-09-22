@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# PTX 스캔 — 게이트 바이너리가 싣고 있는 디바이스 코드를 읽는다. 계측기지 게이트가 아니다(항상 exit 0).
+# PTX scan — read the device code a gate binary carries. An instrument, not a gate (always exits 0).
 #
-# `cargo oxide`는 번들의 PTX 텍스트를 실행 파일의 `.oxart` ELF 섹션에 그대로 넣는다. 그래서 커널의
-# 컴파일된 모양 — 레지스터가 로컬로 쏟아졌는지(`__local_depot`), 그 왕복이 몇 번인지(ld.local/st.local),
-# 블록 폭이 얼마인지(`.reqntid`) — 은 디바이스 없이 바이트 스캔으로 읽힌다. 원인 둘을 이렇게 찾았다:
-# flash의 lane별 누산 배열이 디포로 쏟아진 것, rms_norm이 warp 하나만 상주하는 런치 기하.
+# `cargo oxide` puts the bundle's PTX text into the executable's `.oxart` ELF section verbatim.
+# So a kernel's compiled shape — whether registers spilled to local (`__local_depot`), how many
+# round trips that costs (ld.local/st.local), how wide the block is (`.reqntid`) — reads out of a
+# byte scan with no device. Two root causes were found this way: flash's per-lane accumulator
+# array spilling to a depot, and rms_norm's launch geometry leaving one resident warp.
 #
-# 단언하는 것은 게이트다. 이 스크립트는 표만 낸다:
-#   gate_p5 `no_local_depot`  — flash 커널 다섯의 디포·ld.local·st.local이 전부 0
-#   gate_p4 `norm_geometry`   — rms_norm·norm_quant의 .reqntid == RMS_THREADS
-#   gate_p4 `argmax_geometry` — argmax의 .reqntid == ARGMAX_THREADS
+# Asserting is the gates' job. This script only prints a table:
+#   gate_p5 `no_local_depot`  — depot, ld.local and st.local are all 0 for the five flash kernels
+#   gate_p4 `norm_geometry`   — .reqntid of rms_norm and norm_quant == RMS_THREADS
+#   gate_p4 `argmax_geometry` — .reqntid of argmax == ARGMAX_THREADS
 #
-# 철자 주의: PTX는 융합 곱셈-덧셈을 `fma.rn.f32`(와 `fma.rm.f32`)로 쓴다. `fma.f32`는 아무 데도 없어서
-# 그걸 세면 조용히 0이 나오고 깨끗한 커널처럼 읽힌다 — 여기서도 게이트에서도 `fma.` 접두를 센다.
+# Mind the spelling: PTX writes a fused multiply-add as `fma.rn.f32` (and `fma.rm.f32`). There is
+# no `fma.f32` anywhere, so counting that silently returns 0 and the kernel reads as clean — here
+# and in the gates, the `fma.` prefix is what is counted.
 #
-# 사용: tools/ptx-scan.sh <바이너리 이름> [엔트리 부분문자열]
-#   target/release/<바이너리>를 읽는다. 레시피(`just ptx-scan <바이너리>`)가 빌드까지 한다.
-# 출력은 디포를 가진 엔트리 먼저, 그 안에서 이름 오름차순 — 디포가 결함이고 나머지는 맥락이다.
+# Usage: tools/ptx-scan.sh <binary name> [entry substring]
+#   Reads target/release/<binary>. The recipe (`just ptx-scan <binary>`) builds it first.
+# Output puts entries that have a depot first, then by name ascending — a depot is the defect and
+# the rest is context.
 #
 # The last four columns come from `ptxas -v` on the same PTX, not from the byte scan:
 #   regs   registers per thread ("Used N registers")

@@ -9,13 +9,16 @@
 default:
     @just --list
 
+# `--features gpu`(R26): 피처 뒤에 본체가 숨은 바이너리는 그 피처를 켜야 검사된다 —
+# gpu-gates 바이너리 17개 본체가 끄면 통째로 안 보인다.
 # 빠른 루프: 타입 검사만, 커널은 안 만든다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu'
 
+# check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26).
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu'
 
 # fmt는 맥에서 돈다. box.sh의 rsync가 단방향이라 박스에서 포맷하면 결과가 돌아오지
 # 않고 다음 명령에 덮여 사라진다(2026-09-19에 그렇게 한 번 날렸다). cargo fmt는 컴파일을
@@ -143,20 +146,26 @@ probe-gpu-real-x:
 build-cpu:
     ./tools/box.sh 'cd crates/q3k-cpu && RUSTFLAGS="-C target-cpu=znver3" cargo build --release'
 
+# 빌드는 레시피 의존성이 한다(measure-decode와 같은 모양) — 러너가 재는 것은 방금 빌드된
+# 바이너리여야 하고, 빌드는 임대·유휴 대기 밖에서 끝나야 한다. build-ref는 두 참조 하네스
+# ($BLOOMERY_DATA/bin/q3k_ref·q3k_cpu_ref)를 만든다: cpu-measure.sh는 그것을 부르면서
+# 빌드는 하지 않았다.
 # 측정. 러너가 조용한 기계 규약(GPU 유휴 대기 / 기계 전역 flock)과 증인 기록을 소유한다.
 # 측정값을 손으로 모으지 말고 이 두 타깃만 쓴다.
-measure-gpu:
+measure-gpu: build-ref build-gpu
     ./tools/box.sh 'bash tools/ref/measure.sh'
 
-measure-cpu:
+measure-cpu: build-ref build-cpu
     ./tools/box.sh 'bash tools/ref/cpu-measure.sh'
 
 # 2026-09-20 사고(q_nope2 무한루크가 gate-mt를 매달아 병렬 에이전트 둘을 '무활동'으로 죽임)의
 # 보강. 이 트랙 원격 디렉터리 아래 실행 파일을 물고 있는 고아 프로세스를 찾아 죽인다.
-# $PWD는 원격 셸에서 '실행 시에' 확장되므로 이 스크립트 자신과 ssh 핸들러(축자 cmdline)는
-# 걸리지 않고, target/ 아래 exe를 가진 프로세스만 걸린다. 병렬 트랙 시작·끝에 한 번씩.
-box-gc:
-    ./tools/box.sh 'for p in $(pgrep -f "$PWD/target" || true); do exe=$(readlink /proc/$p/exe 2>/dev/null); case "$exe" in "$PWD"/*) echo "kill $p ($exe)"; kill -9 $p ;; esac; done; echo gc-done'
+# 고르는 축은 /proc/<pid>/exe이지 cmdline이 아니다 — `pgrep -f "<dir>/target"`은 그 패턴을
+# 자기 argv에 든 셸(스캔하는 셸 자신, ssh 핸들러)도 같이 고른다. 자신과 조상 pid는 접두
+# 비교 전에 제외한다. 죽이는 것은 TERM → 5초 → KILL. 목록만 보려면 `just box-gc --dry-run`.
+# 이 트랙 원격 디렉터리 아래 실행 파일을 문 고아 프로세스를 죽인다. 병렬 트랙 시작·끝에 한 번씩.
+box-gc *ARGS='--kill':
+    ./tools/box.sh 'bash tools/box-gc.sh {{ARGS}}'
 
 # 박스에 남은 트랙 디렉터리를 로컬 워크트리와 대조한다. 인자 없이 목록, `just box-tracks --remove`로 stale 삭제.
 box-tracks *ARGS:
