@@ -33,8 +33,8 @@
 # Usage: tools/ptx-scan.sh <binary name> [entry substring]
 #   Reads target/release/<binary> and runs the extractor on its section. The recipe
 #   (`just ptx-scan <binary>`) builds both first. PTX_SCAN_PTXAS (default
-#   /usr/local/cuda/bin/ptxas), PTX_SCAN_ARCH (default sm_86) and PTX_SCAN_EXTRACT (default
-#   target/release/oxart_ptx) override the tools.
+#   $CUDA_TOOLKIT_PATH/bin/ptxas, else /usr/local/cuda/bin/ptxas), PTX_SCAN_ARCH (default
+#   sm_86) and PTX_SCAN_EXTRACT (default target/release/oxart_ptx) override the tools.
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
 #
@@ -69,7 +69,9 @@
 set -uo pipefail
 NAME=${1:-}
 FILTER=${2:-}
-PTXAS=${PTX_SCAN_PTXAS:-/usr/local/cuda/bin/ptxas}
+# The toolkit the build uses (the box env's CUDA_TOOLKIT_PATH): toolkits differ here by a register
+# on some entries, so the scan reads the one the bindings were generated from.
+PTXAS=${PTX_SCAN_PTXAS:-${CUDA_TOOLKIT_PATH:-/usr/local/cuda}/bin/ptxas}
 ARCH=${PTX_SCAN_ARCH:-sm_86}
 EXTRACT=${PTX_SCAN_EXTRACT:-target/release/oxart_ptx}
 if [ -z "$NAME" ]; then
