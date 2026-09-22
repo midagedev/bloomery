@@ -331,9 +331,10 @@ check-int-twins *ARGS:
 trace-router CORPUS *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
 
-# 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다.
+# 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다. gate-ops는 bloomery-model 라이브러리의 단위 시험도
+# 같이 돈다(--lib, --include-ignored) — 그것을 도는 레시피가 따로 없다.
 gate-ops:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test ops -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --lib --test ops -- --include-ignored --nocapture'
 
 gate-attn:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test attn -- --ignored --nocapture'
