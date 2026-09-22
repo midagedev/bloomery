@@ -10,13 +10,13 @@
 # 트리 팔: 인자 <remote-dir>... — ab-decode.sh의 방식이다(현재 트리 자동 포함, 각 트리는
 # 워크트리에서 `just build-decode`로 만든 것). 결과 줄과 평균 줄은 트리 이름을 단다.
 set -uo pipefail
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
+# 모델·ik 트리·llama-bench 기본값(BLOOMERY_REF_MODEL·IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와
+# 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
 DEPTHS=${BLOOMERY_DEPTHS:-6 1024 4096}
-# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
-# shellcheck source=tools/ref/ref-paths.sh
-source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 trees=()
 for d in "$@" "$(basename "$PWD")"; do

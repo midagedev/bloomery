@@ -4,6 +4,9 @@
 # Runs on the box under tools/box.sh. Prints witness blocks around each
 # engine's timed section.
 set -euo pipefail
+# BLOOMERY_DATA defaults in ref-paths.sh, as in every runner here (BLOOMERY_DATA overrides it).
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 GPU_UUID=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
 
 wait_gpu() {
@@ -33,7 +36,7 @@ witness() {
 }
 
 bash tools/ref/build.sh
-export BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+export BLOOMERY_DATA
 mkdir -p "$BLOOMERY_DATA"
 
 wait_gpu

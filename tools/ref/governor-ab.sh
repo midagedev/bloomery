@@ -2,11 +2,11 @@
 # CPU 거버너 A/B: 같은 임대 안에서 원래 거버너와 performance를 번갈아, bloomery와 ik 둘 다 잰다.
 # 막는 실패: 거버너를 바꾼 채 죽는 것 — 모든 종료 경로에서 원래 값으로 복원한다(trap).
 set -uo pipefail
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
-TOKENS=100000,549,6077,280,7239,317
-# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# 모델·ik 트리·llama-bench 기본값(BLOOMERY_REF_MODEL·IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와
+# 같은 파일이 소유한다.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+TOKENS=100000,549,6077,280,7239,317
 BIN=target/release/bloomery-decode
 G=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
 ORIG=$(cat "$G")

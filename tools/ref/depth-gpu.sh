@@ -44,15 +44,15 @@
 # 우리 팔의 프롬프트는 depth-decode.sh와 같은 LCG 의사난수 id다(BOS 뒤 고정 수열). 반복 프롬프트보다
 # 캐시에 덜 친절하고, CPU 깊이 표가 쓴 것과 같은 프롬프트라 두 표가 같은 말을 한다.
 set -uo pipefail
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
+# 모델·ik 트리·llama-bench 기본값(BLOOMERY_REF_MODEL·IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와
+# 같은 파일이 소유한다. 우리 팔의 generate는 모델을 BLOOMERY_REF_MODEL에서 직접 연다(같은 기본값).
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 N=${BLOOMERY_DECODE_N:-96}
 # --time 팔의 워밍(generate --warm W): 앞 W 스텝은 돌되 통계에서 빠진다. 비면 안 붙는다. ab 팔에는
 # 안 붙인다 — --ab는 팔마다 untimed 라운드를 이미 돌리고, generate가 둘을 같이 주면 거부한다.
 WARM=${BLOOMERY_GEN_WARM:-}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
-# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
-# shellcheck source=tools/ref/ref-paths.sh
-source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # 3090 기준선(216.6/204.6/189.7)이 쓴 그 조합. CPU 최속 조합에서 -rtr 1만 뺀 것이고 GPU 플래그
 # 스윕은 아직 없다 — "이 플래그에서"의 숫자다.
 IK_GPU_FLAGS=${IK_GPU_FLAGS:--ngl 99 -mla 3 -fa 1 -fmoe 1}

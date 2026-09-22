@@ -20,9 +20,10 @@
 # $BLOOMERY_DATA/ref_cuda/. The CPU set is never touched by that run. The GPU kernels use
 # q8_1 activations like ik's CUDA path, so their band is against this set, not the CPU one.
 set -euo pipefail
+# MODEL, BLOOMERY_DATA and IK default in ref-paths.sh (BLOOMERY_REF_MODEL, BLOOMERY_DATA and IK
+# override them).
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 case $BACKEND in
   cpu)  SET=ref;      NGL=0;  HIDE_CUDA=1 ;;
@@ -33,7 +34,6 @@ esac
 # BLOOMERY_REF_SET only renames the destination (e.g. ref_cuda_v2), so an instrumented
 # dumper can produce a second set beside the one the gates read without touching it.
 SET=${BLOOMERY_REF_SET:-$SET}
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${BLOOMERY_REF_TOKENS:-100000,549,6077,280,7239,317}
 BIN="$BLOOMERY_DATA/bin/dump_ref"
 [ -x "$BIN" ] || { echo "no dump_ref at $BIN — run: just build-ref-dump" >&2; exit 2; }

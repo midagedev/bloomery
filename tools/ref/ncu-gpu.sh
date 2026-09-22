@@ -17,7 +17,10 @@
 # node라 노드별 커널 카운터가 그대로 나온다. eager로도 같은 커널이 뜨므로, 의심스러우면
 # BLOOMERY_NCU_MODE=eager로 한 번 더 돌려 두 표가 같은 말을 하는지 본다.
 set -uo pipefail
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
+# 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다(같은 기본값).
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate}
 NCU=${NCU:-/usr/local/cuda/bin/ncu}
 DEPTHS=${BLOOMERY_NCU_DEPTHS:-6 4096}
@@ -39,7 +42,7 @@ SKIP_STEPS=${BLOOMERY_NCU_SKIP_STEPS:-1}
 # 필터에 걸리는 스텝당 런치 수. 기본 54는 KERNELS=flash일 때의 값이고, 필터를 바꾸면 nsys-gpu.sh의
 # 표(재생당 런치 수)에서 읽어 넘긴다. BLOOMERY_NCU_SKIP은 절대값 덮어쓰기.
 PER_STEP=${BLOOMERY_NCU_PER_STEP:-54}
-OUTDIR=${BLOOMERY_NCU_OUT:-/root/bloomery-data/ncu}
+OUTDIR=${BLOOMERY_NCU_OUT:-$BLOOMERY_DATA/ncu}
 LOCK=/root/bloomery-cpu.lock
 # 카드 핀·증인 줄·바이너리 신선도는 러너 넷이 같은 파일에서 읽는다.
 # shellcheck source=tools/ref/timing-card.sh

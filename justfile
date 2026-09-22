@@ -369,7 +369,7 @@ build-kvclear:
     ./tools/box.sh 'bash tools/ref/build-kvclear.sh'
 
 kvclear-probe *ARGS:
-    ./tools/box.sh 'CUDA_VISIBLE_DEVICES= /root/bloomery-scratch/ikclear/bin/kvclear_probe -m /models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf --prompts tools/ref/prompts.tsv -ngl 0 -c 512 -t 32 {{ARGS}}'
+    ./tools/box.sh 'source tools/ref/ref-paths.sh && CUDA_VISIBLE_DEVICES= /root/bloomery-scratch/ikclear/bin/kvclear_probe -m "$MODEL" --prompts tools/ref/prompts.tsv -ngl 0 -c 512 -t 32 {{ARGS}}'
 
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.

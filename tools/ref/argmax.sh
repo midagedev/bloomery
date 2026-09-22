@@ -30,10 +30,12 @@
 # This writes ONE file and never touches $BLOOMERY_DATA/ref. The check at the end says so
 # out loud: the oracle's manifest must be byte-identical afterwards.
 set -euo pipefail
-BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+# MODEL and BLOOMERY_DATA default in ref-paths.sh, as in dump.sh (BLOOMERY_REF_MODEL and
+# BLOOMERY_DATA override them).
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 GEN=${BLOOMERY_REF_GEN:-0}
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 BIN="$BLOOMERY_DATA/bin/argmax_ref"
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 PROMPTS=${BLOOMERY_PROMPTS:-$HERE/tools/ref/prompts.tsv}

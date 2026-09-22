@@ -9,7 +9,10 @@
 # Extra args replace the default `--time` wholesale; the lease and witness blocks wrap whatever
 # runs, unchanged.
 set -euo pipefail
-export BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+# BLOOMERY_DATA defaults in ref-paths.sh, as in every runner here (BLOOMERY_DATA overrides it).
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+export BLOOMERY_DATA
 LOCK=/root/bloomery-cpu.lock
 # The card pin, the witness lines and the stale-binary refusal are the same code the three
 # depth/profile runners use; this runner used to pin the 3090 by hand and print no card name.

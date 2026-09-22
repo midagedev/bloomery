@@ -11,9 +11,12 @@
 # 둘을 나란히 두는 이유가 그것이다: 레벨 1이 "어느 site 가 큰가"를, 레벨 2가 "그 site
 # 안에서 어느 단계가 큰가"를 답한다. 한 표에 섞으면 세금이 배분까지 오염시킨다.
 set -euo pipefail
-export BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+# 모델·데이터 디렉터리 기본값(BLOOMERY_REF_MODEL·BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드
+# 스크립트와 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+export BLOOMERY_DATA
 LOCK=/root/bloomery-cpu.lock
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
 # 기본이 2 스텝인 이유: 이 표가 답하는 질문은 배분이고 배분은 스텝 하나로 정해진다.
 # 스텝을 늘리면 임대만 길어진다. 평탄성은 decode-measure.sh 가 재는 다른 질문이다.

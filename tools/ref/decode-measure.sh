@@ -8,16 +8,16 @@
 # CUDA 를 숨기는 이유는 오라클 덤프와 같다: 백엔드가 등록돼 있으면 ik 가 -ngl 0 에서도
 # 그래프를 쪼갠다(실측 2026-09-19: splits 351 대 1).
 set -euo pipefail
-export BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+# 모델·데이터 디렉터리·ik 트리·llama-bench 기본값(BLOOMERY_REF_MODEL·BLOOMERY_DATA·IK·IKBIN 오버라이드는
+# 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+export BLOOMERY_DATA
 LOCK=/root/bloomery-cpu.lock
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 # 오라클과 프롬프트 파일이 공유하는 id 0 = "The capital of France is".
 TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
 N=${BLOOMERY_DECODE_N:-8}
 BIN=${BLOOMERY_DECODE_BIN:-target/release/bloomery-decode}
-# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
-# shellcheck source=tools/ref/ref-paths.sh
-source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 [ -x "$BIN" ] || { echo "no decode binary at $BIN — run: just build-decode" >&2; exit 2; }
 
 witness() {

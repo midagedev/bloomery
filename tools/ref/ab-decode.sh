@@ -7,13 +7,13 @@
 # 움직이므로, 디스패치 경로를 만진 라운드의 속도 판정은 이 스크립트의 상대값으로만 한다.
 # 각 <remote-dir>는 ~/repo/ 아래 이름(워크트리에서 `just build-decode`로 만든 것).
 set -uo pipefail
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
+# 모델·ik 트리·llama-bench 기본값(BLOOMERY_REF_MODEL·IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와
+# 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
-# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
-# shellcheck source=tools/ref/ref-paths.sh
-source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 # BLOOMERY_AB_ENVS="K=V;K=V K2=V2": 현재 트리의 같은 바이너리를 env만 바꿔 팔로 더 넣는다
 # (바이트가 같은 레버의 A/B — 빌드 둘의 링크 배치 차이가 끼지 않는다).

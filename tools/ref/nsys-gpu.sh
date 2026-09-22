@@ -20,14 +20,17 @@
 # 같이 찍는다 — 둘의 차가 런치 사이 빈틈이고, 창 벽시계가 depth-gpu.sh의 스텝 ms와 맞아야 이 표를
 # 그 기록 옆에 놓을 수 있다.
 set -uo pipefail
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
+# 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다(같은 기본값).
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate}
 NSYS=${NSYS:-/usr/local/cuda/bin/nsys}
 DEPTHS=${BLOOMERY_NSYS_DEPTHS:-6 4096}
 MODE=${BLOOMERY_NSYS_MODE:-graph}
 # 디코드 스텝 수. 마지막 재생을 표로 내고, 그 앞 재생을 대조로 낸다.
 NGEN=${BLOOMERY_NSYS_N:-4}
-OUTDIR=${BLOOMERY_NSYS_OUT:-/root/bloomery-data/nsys}
+OUTDIR=${BLOOMERY_NSYS_OUT:-$BLOOMERY_DATA/nsys}
 TOP=${BLOOMERY_NSYS_TOP:-24}
 LOCK=/root/bloomery-cpu.lock
 # 카드 핀·증인 줄·바이너리 신선도는 러너 넷이 같은 파일에서 읽는다.

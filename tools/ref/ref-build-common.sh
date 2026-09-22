@@ -9,9 +9,9 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
 #
 # What it owns, so that seven scripts cannot link against seven different ggml builds: the ik
-# tree (IK, whose default lives in ref-paths.sh — the timing runners read the same one), the
-# data root, the repo root, the compiler and its base flags, and the include and link flags for
-# libggml and for libllama+libcommon. Each script keeps what is its own: extra
+# tree and the data root (IK and BLOOMERY_DATA, whose defaults live in ref-paths.sh — the
+# runners read the same ones), the repo root, the compiler and its base flags, and the include
+# and link flags for libggml and for libllama+libcommon. Each script keeps what is its own: extra
 # include roots and ISA flags, the source file, the output name, and its *_OUT override.
 #
 # Binaries live outside the tree: tools/box.sh rsyncs it with --delete before every command.
@@ -21,7 +21,6 @@
 # shellcheck disable=SC2034,SC2054
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
-BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 # Default output directory of the installed reference binaries.
 REF_BIN=$BLOOMERY_DATA/bin
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
