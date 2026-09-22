@@ -37,10 +37,10 @@ use crate::head::Head;
 use crate::tensor::DeviceTensor;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph};
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaStream, DeviceBuffer};
 use dispatch::{enqueue_chain, enqueue_layer};
 use model::attn::MlaParams;
-use probe::ProfRec;
+use probe::{Observer, ProfRec};
 use scratch::{LayerNames, LayerScratch, MoeDims, MoeScratch, SP_N_KEYS, SP_POS};
 use seed::{seed_cache, seed_pattern};
 use std::ops::Range;
@@ -751,29 +751,7 @@ impl GpuModel {
         let mla = self.mla.clone();
         let (gpu, residency) = self.block0_parts()?;
         let stream = gpu.stream();
-        let s = &residency.scratch;
-        let rd =
-            |b: &DeviceBuffer<f32>| -> Result<Vec<f32>, GpuError> { Ok(b.to_host_vec(stream)?) };
-        let f_rows = rd(&s.f_rows)?;
-        let width = mla.rope_dims + mla.latent;
-        let mut q_rope = Vec::with_capacity(mla.n_head * mla.rope_dims);
-        for h in 0..mla.n_head {
-            q_rope.extend_from_slice(&f_rows[h * width..h * width + mla.rope_dims]);
-        }
-        let kv_s = rd(&s.kv_s)?;
-        let kvr = rd(&s.kvr)?;
-        Ok(Block0Taps {
-            attn_norm: rd(&s.normed)?,
-            q: rd(&s.q)?,
-            kv_rope_compressed: rd(&s.kv_a)?,
-            q_rope,
-            k_rope: kvr[..mla.rope_dims].to_vec(),
-            kv_compressed: kv_s[..mla.latent].to_vec(),
-            kqv_compressed: rd(&s.kqvc)?,
-            kqv_out: rd(&s.attn_out)?,
-            ffn_inp: rd(&s.ffn_inp)?,
-            l_out: rd(&s.l_out)?,
-        })
+        read_block_taps(stream, &residency.scratch, &mla)
     }
 
     /// Read layer `l`'s tap tensors of the last run (eager or replay). The
@@ -786,16 +764,7 @@ impl GpuModel {
         let stream = gpu.stream();
         let routed = residency.names[slot].routed;
         let s = &residency.scratch;
-        let rd =
-            |b: &DeviceBuffer<f32>| -> Result<Vec<f32>, GpuError> { Ok(b.to_host_vec(stream)?) };
-        let f_rows = rd(&s.f_rows)?;
-        let width = mla.rope_dims + mla.latent;
-        let mut q_rope = Vec::with_capacity(mla.n_head * mla.rope_dims);
-        for h in 0..mla.n_head {
-            q_rope.extend_from_slice(&f_rows[h * width..h * width + mla.rope_dims]);
-        }
-        let kv_s = rd(&s.kv_s)?;
-        let kvr = rd(&s.kvr)?;
+        let a = read_block_taps(stream, s, &mla)?;
         let moe = if routed { s.moe.as_ref() } else { None };
         let moe_rd = |pick: fn(&MoeScratch) -> &DeviceBuffer<f32>| -> Result<Vec<f32>, GpuError> {
             match moe {
@@ -805,15 +774,15 @@ impl GpuModel {
         };
         Ok(LayerTaps {
             layer: l,
-            attn_norm: rd(&s.normed)?,
-            q: rd(&s.q)?,
-            kv_rope_compressed: rd(&s.kv_a)?,
-            q_rope,
-            k_rope: kvr[..mla.rope_dims].to_vec(),
-            kv_compressed: kv_s[..mla.latent].to_vec(),
-            kqv_compressed: rd(&s.kqvc)?,
-            kqv_out: rd(&s.attn_out)?,
-            ffn_inp: rd(&s.ffn_inp)?,
+            attn_norm: a.attn_norm,
+            q: a.q,
+            kv_rope_compressed: a.kv_rope_compressed,
+            q_rope: a.q_rope,
+            k_rope: a.k_rope,
+            kv_compressed: a.kv_compressed,
+            kqv_compressed: a.kqv_compressed,
+            kqv_out: a.kqv_out,
+            ffn_inp: a.ffn_inp,
             ffn_norm: moe_rd(|m| &m.normed)?,
             moe_logits: moe_rd(|m| &m.logits)?,
             moe_ids: match moe {
@@ -823,7 +792,7 @@ impl GpuModel {
             moe_weights: moe_rd(|m| &m.weights)?,
             expert_down: moe_rd(|m| &m.down)?,
             ffn_shexp: moe_rd(|m| &m.shexp)?,
-            l_out: rd(&s.l_out)?,
+            l_out: a.l_out,
         })
     }
 
@@ -1080,17 +1049,9 @@ impl GpuModel {
             step,
         } = residency;
         let routed = names[slot].routed;
-        let mut rec = ProfRec {
-            // Slot i is created by op i's first firing (indices arrive in
-            // chain order); the name and the byte count are cross-checked on
-            // every later rep.
-            ops: Vec::new(),
-            last: std::time::Instant::now(),
-        };
-        const WARMUP: u32 = 20;
-        for rep in 0..(WARMUP + reps) {
-            rec.last = std::time::Instant::now();
-            let mut obs = |i: usize, name: &'static str, b: Bytes| rec.observe(i, name, b, stream);
+        // One run of layer `l`'s chain under the given observer: the rep
+        // loop times it, the node-count check captures it.
+        let mut run = |obs: &mut Observer<'_>| {
             enqueue_layer(
                 gpu,
                 step,
@@ -1101,68 +1062,14 @@ impl GpuModel {
                 &mla,
                 moe.as_ref(),
                 embed,
-                &mut obs,
-            )?;
-            if rep < WARMUP {
-                for (_, _, s) in rec.ops.iter_mut() {
-                    s.clear();
-                }
-            }
-        }
-        stream.synchronize()?;
-        // The observer bills the window between two ticks to one op, so a
-        // tick that covered two launches would fold them into one row with
-        // no sign of it. Capture the same chain into a throwaway graph (the
-        // stage's own capture is untouched) and require one node per tick:
-        // the node count is where a folded pair shows.
-        let probe = gpu.capture(|_| {
-            enqueue_layer(
-                gpu,
-                step,
-                weights,
-                &names[slot],
-                &mut kv[slot],
-                scratch,
-                &mla,
-                moe.as_ref(),
-                embed,
-                &mut |_, _, _| Ok(()),
+                obs,
             )
-        })?;
-        if rec.ops.len() != probe.node_count() {
-            return Err(GpuError::shape(
-                "profile_layer",
-                format!(
-                    "{} ops observed but the same chain captures {} nodes — an op \
-                 issued more than one launch before its tick, so its neighbours' times are \
-                 mis-attributed",
-                    rec.ops.len(),
-                    probe.node_count()
-                ),
-            ));
-        }
+        };
+        let rec = profile_reps(stream, reps, &mut run)?;
+        stream.synchronize()?;
+        check_one_node_per_tick(gpu, rec.ops.len(), &mut run)?;
         if routed {
-            let ids = match scratch.moe.as_ref() {
-                Some(m) => m.ids.to_host_vec(stream)?,
-                None => {
-                    return Err(GpuError::shape(
-                        "profile_layer",
-                        format!("layer {l} routes but the stage carries no MoE arena"),
-                    ));
-                }
-            };
-            let mut sorted = ids.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            if sorted.len() != ids.len() {
-                return Err(GpuError::shape(
-                    "profile_layer",
-                    format!(
-                        "layer {l} routed to {ids:?} — a repeated slot makes the \
-                     expert ops' byte counts an overcount of the rows actually read"
-                    ),
-                ));
-            }
+            check_distinct_ids(scratch.moe.as_ref(), stream, l)?;
         }
         Ok(rec
             .ops
@@ -1223,4 +1130,123 @@ impl GpuModel {
         }
         Ok(())
     }
+}
+
+/// [`GpuModel::profile_layer`]'s rep loop: 20 warm-up runs whose samples
+/// are discarded, then `reps` measured runs of `run` under the profiling
+/// observer.
+fn profile_reps(
+    stream: &CudaStream,
+    reps: u32,
+    run: &mut impl FnMut(&mut Observer<'_>) -> Result<(), GpuError>,
+) -> Result<ProfRec, GpuError> {
+    let mut rec = ProfRec {
+        // Slot i is created by op i's first firing (indices arrive in
+        // chain order); the name and the byte count are cross-checked on
+        // every later rep.
+        ops: Vec::new(),
+        last: std::time::Instant::now(),
+    };
+    const WARMUP: u32 = 20;
+    for rep in 0..(WARMUP + reps) {
+        rec.last = std::time::Instant::now();
+        let mut obs = |i: usize, name: &'static str, b: Bytes| rec.observe(i, name, b, stream);
+        run(&mut obs)?;
+        if rep < WARMUP {
+            for (_, _, s) in rec.ops.iter_mut() {
+                s.clear();
+            }
+        }
+    }
+    Ok(rec)
+}
+
+/// Err unless a capture of `run` holds exactly `observed` nodes.
+fn check_one_node_per_tick(
+    gpu: &Gpu,
+    observed: usize,
+    run: &mut impl FnMut(&mut Observer<'_>) -> Result<(), GpuError>,
+) -> Result<(), GpuError> {
+    // The observer bills the window between two ticks to one op, so a
+    // tick that covered two launches would fold them into one row with
+    // no sign of it. Capture the same chain into a throwaway graph (the
+    // stage's own capture is untouched) and require one node per tick:
+    // the node count is where a folded pair shows.
+    let probe = gpu.capture(|_| run(&mut |_, _, _| Ok(())))?;
+    if observed != probe.node_count() {
+        return Err(GpuError::shape(
+            "profile_layer",
+            format!(
+                "{} ops observed but the same chain captures {} nodes — an op \
+             issued more than one launch before its tick, so its neighbours' times are \
+             mis-attributed",
+                observed,
+                probe.node_count()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Err unless routed layer `l`'s expert ids, read back from `moe`, are
+/// distinct: the expert ops' byte counts are `n_used` whole expert blocks,
+/// which is the traffic only when no slot repeats.
+fn check_distinct_ids(
+    moe: Option<&MoeScratch>,
+    stream: &CudaStream,
+    l: usize,
+) -> Result<(), GpuError> {
+    let ids = match moe {
+        Some(m) => m.ids.to_host_vec(stream)?,
+        None => {
+            return Err(GpuError::shape(
+                "profile_layer",
+                format!("layer {l} routes but the stage carries no MoE arena"),
+            ));
+        }
+    };
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != ids.len() {
+        return Err(GpuError::shape(
+            "profile_layer",
+            format!(
+                "layer {l} routed to {ids:?} — a repeated slot makes the \
+             expert ops' byte counts an overcount of the rows actually read"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the taps every layer's attention half and output share, from the
+/// arena `s` of the last run. The flash q rows' rope spans are cut out per
+/// head into `q_rope`. Synchronizes per readback.
+fn read_block_taps(
+    stream: &CudaStream,
+    s: &LayerScratch,
+    mla: &MlaParams,
+) -> Result<Block0Taps, GpuError> {
+    let rd = |b: &DeviceBuffer<f32>| -> Result<Vec<f32>, GpuError> { Ok(b.to_host_vec(stream)?) };
+    let f_rows = rd(&s.f_rows)?;
+    let width = mla.rope_dims + mla.latent;
+    let mut q_rope = Vec::with_capacity(mla.n_head * mla.rope_dims);
+    for h in 0..mla.n_head {
+        q_rope.extend_from_slice(&f_rows[h * width..h * width + mla.rope_dims]);
+    }
+    let kv_s = rd(&s.kv_s)?;
+    let kvr = rd(&s.kvr)?;
+    Ok(Block0Taps {
+        attn_norm: rd(&s.normed)?,
+        q: rd(&s.q)?,
+        kv_rope_compressed: rd(&s.kv_a)?,
+        q_rope,
+        k_rope: kvr[..mla.rope_dims].to_vec(),
+        kv_compressed: kv_s[..mla.latent].to_vec(),
+        kqv_compressed: rd(&s.kqvc)?,
+        kqv_out: rd(&s.attn_out)?,
+        ffn_inp: rd(&s.ffn_inp)?,
+        l_out: rd(&s.l_out)?,
+    })
 }

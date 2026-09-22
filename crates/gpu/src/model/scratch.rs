@@ -491,113 +491,30 @@ impl LayerScratch {
             Some(n) => Some(kq_weight(w, &n.ffn_gate)?.rows()),
             None => None,
         };
-        let (_, qn2_d) = q8_derived(w, &first.derived)?;
-        let (derived, derived_k) = (qn2_d.rows(), qn2_d.cols() * 32);
-        let kv_b_rows = kq_weight(w, &first.attn_kv_b)?.rows();
-        let check = |what: &'static str, want: usize, got: usize| -> Result<(), GpuError> {
-            if want == got {
-                Ok(())
-            } else {
-                Err(GpuError::shape(
-                    "LayerScratch",
-                    format!("{what}: {want} != {got}"),
-                ))
-            }
-        };
-        check(
-            "attn_q rows vs n_head*kq_head",
-            q_rows,
-            mla.n_head * mla.kq_head,
-        )?;
-        check(
-            "kv_a rows vs latent+rope",
-            kv_width,
-            mla.latent + mla.rope_dims,
-        )?;
-        check(
-            "derived rows vs n_head*latent",
-            derived,
-            mla.n_head * mla.latent,
-        )?;
-        check("derived k vs nope", derived_k, mla.nope)?;
-        check(
-            "kv_b rows vs n_head*(nope+v_head)",
-            kv_b_rows,
-            mla.n_head * (mla.nope + mla.v_head),
-        )?;
-        if mla.rope_dims == 0 {
-            return Err(GpuError::shape(
-                "LayerScratch",
-                "rope_dims must be at least 1",
-            ));
-        }
-        if !q_rows.is_multiple_of(mla.rope_dims) {
-            return Err(GpuError::shape(
-                "LayerScratch",
-                format!(
-                    "rope walks 64-value columns from the buffer start; q rows \
-                 {q_rows} are not {}-aligned",
-                    mla.rope_dims
-                ),
-            ));
-        }
+        check_geometry(w, mla, first, q_rows, kv_width)?;
+        let (rope, latent) = (mla.rope_dims, mla.latent);
         let half = mla.n_head / 2;
-        if !mla.n_head.is_multiple_of(2) || half > 8 {
-            return Err(GpuError::shape(
-                "LayerScratch",
-                format!(
-                    "the half-split m = 8 quantize at the wv_b site needs an even \
-                 n_head <= 16, got {}",
-                    mla.n_head
-                ),
-            ));
-        }
-        let (rope, latent, nope, kq_head) = (mla.rope_dims, mla.latent, mla.nope, mla.kq_head);
         let dims = Dims {
             hidden,
             q_cols: q_rows / rope,
         };
         let f32n = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let dense = match dense_ff {
-            Some(ff) => Some(DenseScratch {
-                h: f32n(ff)?,
-                act32: Q8Blocks32::new(stream, ff, 1)?,
-            }),
+            Some(ff) => Some(DenseScratch::new(stream, ff)?),
             None => None,
         };
         let moe = match moe {
-            Some(m) => Some(MoeScratch {
-                normed: f32n(hidden)?,
-                logits: f32n(m.n_expert)?,
-                probs: f32n(m.n_expert)?,
-                ids: DeviceBuffer::<u32>::zeroed(stream, m.n_used)?,
-                weights: f32n(m.n_used)?,
-                h_exp: f32n(m.n_used * m.ff)?,
-                act32_exp: Q8Blocks32::new(stream, m.ff, m.n_used)?,
-                down: f32n(m.n_used * hidden)?,
-                h_sh: f32n(m.shexp_ff)?,
-                act_sh: Q8Act::with_k(stream, 1, m.shexp_ff)?,
-                shexp: f32n(hidden)?,
-            }),
+            Some(m) => Some(MoeScratch::new(stream, m, hidden)?),
             None => None,
         };
-        // The step image starts where `refresh_params` would leave position 0:
-        // token 0, pos 0, one live key, a zeroed rope table.
-        let mut params_host = vec![0u32; SP_CS + rope];
-        params_host[SP_N_KEYS] = 1;
-        let step_params = DeviceBuffer::from_host(stream, &params_host)?;
-        // SAFETY: each window is inside `step_params`'s extent by the `SP_*`
-        // layout, every offset is a u32 multiple and so four-byte aligned, and
-        // `step_params` moves into the arena below, where it outlives them and
-        // is never reallocated.
-        let (cs_buf, token_buf, pos_buf, n_keys_buf) = unsafe {
-            (
-                param_view::<f32>(&step_params, SP_CS, rope),
-                param_view::<u32>(&step_params, SP_TOKEN, 1),
-                param_view::<u32>(&step_params, SP_POS, 1),
-                param_view::<u32>(&step_params, SP_N_KEYS, 1),
-            )
-        };
+        let ParamImage {
+            step_params,
+            params_host,
+            pos_buf,
+            n_keys_buf,
+            token_buf,
+            cs_buf,
+        } = ParamImage::new(stream, rope)?;
         Ok(LayerScratch {
             x: f32n(hidden)?,
             normed: f32n(hidden)?,
@@ -619,20 +536,12 @@ impl LayerScratch {
             dense,
             moe,
             l_out: f32n(hidden)?,
-            g_f_rope_lo: Gather::new(
+            g_f_rope_lo: rope_gather(stream, mla, kv_width, 0..half, "Gather::new f_rope_lo")?,
+            g_f_rope_hi: rope_gather(
                 stream,
-                (0..half).flat_map(|h| {
-                    let col = (h * kq_head + nope) / rope;
-                    (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
-                }),
-                "Gather::new f_rope_lo",
-            )?,
-            g_f_rope_hi: Gather::new(
-                stream,
-                (half..mla.n_head).flat_map(|h| {
-                    let col = (h * kq_head + nope) / rope;
-                    (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
-                }),
+                mla,
+                kv_width,
+                half..mla.n_head,
                 "Gather::new f_rope_hi",
             )?,
             part_v: f32n(crate::flash::partials_v_len(mla.n_head, ctx_max))?,
@@ -650,4 +559,174 @@ impl LayerScratch {
             dims,
         })
     }
+}
+
+/// Cross-check the geometry the enqueue leans on: the projection and
+/// derived-plane row counts against the MLA metadata, and the rope and
+/// half-split shapes the launches assume. `first` is the stage's first
+/// layer; `q_rows` and `kv_width` are its projections' row counts.
+fn check_geometry(
+    w: &Weights,
+    mla: &MlaParams,
+    first: &LayerNames,
+    q_rows: usize,
+    kv_width: usize,
+) -> Result<(), GpuError> {
+    let (_, qn2_d) = q8_derived(w, &first.derived)?;
+    let (derived, derived_k) = (qn2_d.rows(), qn2_d.cols() * 32);
+    let kv_b_rows = kq_weight(w, &first.attn_kv_b)?.rows();
+    let check = |what: &'static str, want: usize, got: usize| -> Result<(), GpuError> {
+        if want == got {
+            Ok(())
+        } else {
+            Err(GpuError::shape(
+                "LayerScratch",
+                format!("{what}: {want} != {got}"),
+            ))
+        }
+    };
+    check(
+        "attn_q rows vs n_head*kq_head",
+        q_rows,
+        mla.n_head * mla.kq_head,
+    )?;
+    check(
+        "kv_a rows vs latent+rope",
+        kv_width,
+        mla.latent + mla.rope_dims,
+    )?;
+    check(
+        "derived rows vs n_head*latent",
+        derived,
+        mla.n_head * mla.latent,
+    )?;
+    check("derived k vs nope", derived_k, mla.nope)?;
+    check(
+        "kv_b rows vs n_head*(nope+v_head)",
+        kv_b_rows,
+        mla.n_head * (mla.nope + mla.v_head),
+    )?;
+    if mla.rope_dims == 0 {
+        return Err(GpuError::shape(
+            "LayerScratch",
+            "rope_dims must be at least 1",
+        ));
+    }
+    if !q_rows.is_multiple_of(mla.rope_dims) {
+        return Err(GpuError::shape(
+            "LayerScratch",
+            format!(
+                "rope walks 64-value columns from the buffer start; q rows \
+                 {q_rows} are not {}-aligned",
+                mla.rope_dims
+            ),
+        ));
+    }
+    let half = mla.n_head / 2;
+    if !mla.n_head.is_multiple_of(2) || half > 8 {
+        return Err(GpuError::shape(
+            "LayerScratch",
+            format!(
+                "the half-split m = 8 quantize at the wv_b site needs an even \
+                 n_head <= 16, got {}",
+                mla.n_head
+            ),
+        ));
+    }
+    Ok(())
+}
+
+impl DenseScratch {
+    /// The dense arena for a gate/up width of `ff`. Load-time only.
+    fn new(stream: &CudaStream, ff: usize) -> Result<DenseScratch, GpuError> {
+        Ok(DenseScratch {
+            h: DeviceBuffer::<f32>::zeroed(stream, ff)?,
+            act32: Q8Blocks32::new(stream, ff, 1)?,
+        })
+    }
+}
+
+impl MoeScratch {
+    /// The routed arena for the shapes `m` at `hidden`. Load-time only.
+    fn new(stream: &CudaStream, m: &MoeDims, hidden: usize) -> Result<MoeScratch, GpuError> {
+        let f32n = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        Ok(MoeScratch {
+            normed: f32n(hidden)?,
+            logits: f32n(m.n_expert)?,
+            probs: f32n(m.n_expert)?,
+            ids: DeviceBuffer::<u32>::zeroed(stream, m.n_used)?,
+            weights: f32n(m.n_used)?,
+            h_exp: f32n(m.n_used * m.ff)?,
+            act32_exp: Q8Blocks32::new(stream, m.ff, m.n_used)?,
+            down: f32n(m.n_used * hidden)?,
+            h_sh: f32n(m.shexp_ff)?,
+            act_sh: Q8Act::with_k(stream, 1, m.shexp_ff)?,
+            shexp: f32n(hidden)?,
+        })
+    }
+}
+
+/// The per-step parameter image and its four windows, as
+/// `LayerScratch::new` moves them into the arena.
+struct ParamImage {
+    step_params: DeviceBuffer<u32>,
+    params_host: Vec<u32>,
+    pos_buf: ManuallyDrop<DeviceBuffer<u32>>,
+    n_keys_buf: ManuallyDrop<DeviceBuffer<u32>>,
+    token_buf: ManuallyDrop<DeviceBuffer<u32>>,
+    cs_buf: ManuallyDrop<DeviceBuffer<f32>>,
+}
+
+impl ParamImage {
+    /// Allocate the image for a rope table of `rope` values and cut the
+    /// windows out of it. Load-time only.
+    fn new(stream: &CudaStream, rope: usize) -> Result<ParamImage, GpuError> {
+        // The step image starts where `refresh_params` would leave position 0:
+        // token 0, pos 0, one live key, a zeroed rope table.
+        let mut params_host = vec![0u32; SP_CS + rope];
+        params_host[SP_N_KEYS] = 1;
+        let step_params = DeviceBuffer::from_host(stream, &params_host)?;
+        // SAFETY: each window is inside `step_params`'s extent by the `SP_*`
+        // layout, every offset is a u32 multiple and so four-byte aligned, and
+        // `step_params` moves into the arena beside them (a move of the handle,
+        // not of the allocation), where it outlives them and is never
+        // reallocated.
+        let (cs_buf, token_buf, pos_buf, n_keys_buf) = unsafe {
+            (
+                param_view::<f32>(&step_params, SP_CS, rope),
+                param_view::<u32>(&step_params, SP_TOKEN, 1),
+                param_view::<u32>(&step_params, SP_POS, 1),
+                param_view::<u32>(&step_params, SP_N_KEYS, 1),
+            )
+        };
+        Ok(ParamImage {
+            step_params,
+            params_host,
+            pos_buf,
+            n_keys_buf,
+            token_buf,
+            cs_buf,
+        })
+    }
+}
+
+/// The gather table that copies each rope slice of q (`q_rope_all`'s
+/// 64-value column holding head `h`'s rope span) into the rope span of
+/// flash row `h`, for the heads in `heads`. Load-time only.
+fn rope_gather(
+    stream: &CudaStream,
+    mla: &MlaParams,
+    kv_width: usize,
+    heads: std::ops::Range<usize>,
+    what: &'static str,
+) -> Result<Gather, GpuError> {
+    let (rope, nope, kq_head) = (mla.rope_dims, mla.nope, mla.kq_head);
+    Gather::new(
+        stream,
+        heads.flat_map(|h| {
+            let col = (h * kq_head + nope) / rope;
+            (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
+        }),
+        what,
+    )
 }

@@ -9,7 +9,7 @@ use super::probe::{
     Bytes, Observer, StepProbe, act_write_bytes, blocks32_bytes, bsum, gemv_act_bytes, tick,
     weight_bytes,
 };
-use super::scratch::{Gather, LayerNames, LayerScratch, MoeDims};
+use super::scratch::{Gather, LayerNames, LayerScratch, MoeDims, MoeScratch};
 use crate::flash::{
     FlashGeom, FlashInputs, FlashLatentArgs, FlashLatentQ8Args, FlashMerge2Q8Args, FlashMergeArgs,
     FlashMergeQ8Args, FlashSegArgs, FlashSegTwiceArgs,
@@ -146,17 +146,41 @@ fn enqueue_attn(
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
+    attn_proj(gpu, w, names, kv_l, s, mla, i, obs)?;
+    attn_qrows(gpu, step, w, names, s, mla, i, obs)?;
+    // The last launch of either flash path also writes `kqvc`'s q8_1 form:
+    // a block there holds one head's whole latent row, which is four whole
+    // q8_1 blocks, so the quantization rides inside it instead of taking a
+    // launch of its own. Both paths carry it or neither does — a half-done
+    // fold would leave the single-segment path unquantized. The kqvc
+    // quantizer reads the same flag to skip its own launch.
+    let fold_quant = !s.probe_cfg.skip_quant && !s.probe_cfg.split_flash_quant;
+    attn_flash(gpu, kv_l, s, mla, fold_quant, i, obs)?;
+    attn_kqvc_quant(gpu, s, mla, fold_quant, i, obs)?;
+    attn_wv_b(gpu, step, w, names, s, mla, i, obs)?;
+    attn_out(gpu, w, names, s, i, obs)
+}
+
+/// Stages 1–5 of the attention half: the norm, the q and kv_a projections,
+/// the rope of q, and the fused key path that appends this step's row to
+/// `kv_l`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_attn`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn attn_proj(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    kv_l: &mut DeviceTensor<u16>,
+    s: &mut LayerScratch,
+    mla: &MlaParams,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let (hidden, latent, rope) = (s.dims.hidden, mla.latent, mla.rope_dims);
     let kv_width = latent + rope;
-    // Live key rows of this step, from the host mirror of `pos_buf`: the
-    // count the flash kernels read lives on the device, so the byte
-    // accounting takes it from the refresh that wrote it.
-    let n_keys = s.pos_host as usize + 1;
-    let gather =
-        |gt: &Gather, src: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
-            step.enqueue_gather(stream, src, &gt.src, &gt.dst, gt.n, y)
-        };
 
     // 1. attn_norm(x) — the dump's FUSED_RMS_NORM output — in both forms the
     //    chain needs: the f32 vector (the block's `attn_norm` tap) and the
@@ -261,6 +285,33 @@ fn enqueue_attn(
             Some(2 * kv_width),
         ]),
     )?;
+    Ok(())
+}
+
+/// Stages 6–7 of the attention half: the flash query rows
+/// `[q_rope | q_nope2]` per head, assembled in `s.f_rows`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_attn`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn attn_qrows(
+    gpu: &Gpu,
+    step: &StepKernels,
+    w: &Weights,
+    names: &LayerNames,
+    s: &mut LayerScratch,
+    mla: &MlaParams,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let (latent, rope) = (mla.latent, mla.rope_dims);
+    let kv_width = latent + rope;
+    let gather =
+        |gt: &Gather, src: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| -> Result<(), GpuError> {
+            step.enqueue_gather(stream, src, &gt.src, &gt.dst, gt.n, y)
+        };
+
     // 6. q_nope2 per head: one per-head launch dots every derived wk_b row
     //    of head h against q's nope slice of that head (x base h*kq_head,
     //    m = 1 per row), writing the nope2 span of flash row h directly
@@ -309,6 +360,28 @@ fn enqueue_attn(
         "gather(f_rope_hi)",
         bsum(&[Some(16 * s.g_f_rope_hi.n)]),
     )?;
+    Ok(())
+}
+
+/// Stage 8 of the attention half: flash over the live rows of `kv_l` into
+/// `s.kqvc`, and its q8_1 form alongside when `fold_quant` is set.
+fn attn_flash(
+    gpu: &Gpu,
+    kv_l: &DeviceTensor<u16>,
+    s: &mut LayerScratch,
+    mla: &MlaParams,
+    fold_quant: bool,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let (latent, rope) = (mla.latent, mla.rope_dims);
+    let kv_width = latent + rope;
+    // Live key rows of this step, from the host mirror of `pos_buf`: the
+    // count the flash kernels read lives on the device, so the byte
+    // accounting takes it from the refresh that wrote it.
+    let n_keys = s.pos_host as usize + 1;
+
     // 8. attend over `n_keys` rows — the count lives in a device buffer, so
     //    a captured replay follows it.
     // The merge pass exists only when the cache is tall enough to be cut
@@ -316,14 +389,6 @@ fn enqueue_attn(
     // this layer is one node shorter. The choice is the cache height's, so
     // it cannot differ between capture and replay. The two launches are
     // enqueued separately so an observer times each on its own.
-    //
-    // The last launch of either path also writes `kqvc`'s q8_1 form: a
-    // block there holds one head's whole latent row, which is four whole
-    // q8_1 blocks, so the quantization rides inside it instead of taking a
-    // launch of its own. Both paths carry it or neither does — a half-done
-    // fold would leave the single-segment path unquantized.
-    let half = mla.n_head / 2;
-    let fold_quant = !s.probe_cfg.skip_quant && !s.probe_cfg.split_flash_quant;
     // The side output's bytes: the same activation planes the standalone
     // quantizer wrote.
     let side_bytes = act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())
@@ -464,14 +529,27 @@ fn enqueue_attn(
             ]),
         )?;
     }
+    Ok(())
+}
+
+/// Stage 9 of the attention half, first part: `s.kqvc`'s q8_1 form in
+/// `s.act_kv_lo`/`s.act_kv_hi`, unless flash already wrote it
+/// (`fold_quant`) or the probe skips it.
+fn attn_kqvc_quant(
+    gpu: &Gpu,
+    s: &mut LayerScratch,
+    mla: &MlaParams,
+    fold_quant: bool,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let latent = mla.latent;
+    let half = mla.n_head / 2;
+
     // 9. wv_b per head: flash's output is head-major — kqvc column h is
     //    head h's compressed values, the m-column layout the quantizer
     //    consumes; the heads 8..15 half quantizes from kqvc's base offset
-    //    (the quantizer's x base), so no gathered copy. Each per-head
-    //    launch dots only its heads' wv_b rows (absolute row
-    //    h*(nope+v_head) + nope + j, activation column h - head_base,
-    //    m = 1), writing the flat, head-major kqv_2d directly — the wk_b
-    //    rows are never read.
+    //    (the quantizer's x base), so no gathered copy.
     if !fold_quant && !s.probe_cfg.skip_quant {
         if s.probe_cfg.split_kqvc {
             gpu.enqueue_quantize_q8_1(&s.kqvc, &mut s.act_kv_lo)?;
@@ -511,6 +589,32 @@ fn enqueue_attn(
             )?;
         }
     }
+    Ok(())
+}
+
+/// Stage 9 of the attention half, second part: wv_b per head over the
+/// quantized `kqvc` into `s.kqv_2d`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_attn`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn attn_wv_b(
+    gpu: &Gpu,
+    step: &StepKernels,
+    w: &Weights,
+    names: &LayerNames,
+    s: &mut LayerScratch,
+    mla: &MlaParams,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let half = mla.n_head / 2;
+
+    // Each per-head launch dots only its heads' wv_b rows (absolute row
+    // h*(nope+v_head) + nope + j, activation column h - head_base, m = 1),
+    // writing the flat, head-major kqv_2d directly — the wk_b rows are
+    // never read.
     let kv_b = kq_weight(w, &names.attn_kv_b)?;
     let wkvb = dev_weight(w, &names.attn_kv_b)?;
     let geom = HeadsGeom {
@@ -579,6 +683,23 @@ fn enqueue_attn(
             ]),
         )?;
     }
+    Ok(())
+}
+
+/// Stage 10 of the attention half: attn_output over `s.kqv_2d` and the
+/// attention residual into `s.ffn_inp`, then the probe's empty nodes when
+/// it is armed.
+fn attn_out(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    s: &mut LayerScratch,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let hidden = s.dims.hidden;
+
     // 10. attn_output over the flat kqv_2d, then the attention residual.
     if !s.probe_cfg.skip_quant {
         gpu.enqueue_quantize_q8_1(&s.kqv_2d, &mut s.act_ao)?;
@@ -788,6 +909,30 @@ fn enqueue_ffn_moe(
             Some(4 * hidden),
         ]),
     )?;
+    moe_route(gpu, w, names, act_ffn, m, dims, hidden, i, obs)?;
+    moe_shexp_gate_up(gpu, w, names, act_ffn, m, dims, i, obs)?;
+    moe_quantize(gpu, m, dims, *skip_quant, *split_moe_quant, i, obs)?;
+    moe_down_combine(gpu, w, names, ffn_inp, l_out, m, dims, hidden, i, obs)
+}
+
+/// Stages 2–6 of the routed FFN half: the router over `m.normed`, then the
+/// selected experts' fused gate·up·swiglu into `m.h_exp`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_route(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    act_ffn: &Q8Act,
+    m: &mut MoeScratch,
+    dims: &MoeDims,
+    hidden: usize,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
     // 2-3. the router: an f32 gemv over the normed vector, then softmax +
     //      top-k + scale. `m.ids` is the `sel` every expert launch reads.
     gpu.q8f32().enqueue_f32_gemv(
@@ -855,6 +1000,26 @@ fn enqueue_ffn_moe(
             Some(4 * dims.n_used * dims.ff),
         ]),
     )?;
+    Ok(())
+}
+
+/// Stage 7 of the routed FFN half: the shared expert's gate·up·swiglu into
+/// `m.h_sh`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_shexp_gate_up(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    act_ffn: &Q8Act,
+    m: &mut MoeScratch,
+    dims: &MoeDims,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
     // 7. the shared expert's dense fused gate·up·swiglu at its own width, on
     //    the same quantized input. It comes before the quantize below rather
     //    than after the routed experts' down projection: it reads only
@@ -884,12 +1049,28 @@ fn enqueue_ffn_moe(
             Some(4 * dims.shexp_ff),
         ]),
     )?;
+    Ok(())
+}
+
+/// Stage 8 of the routed FFN half: `m.h_exp`'s 32-value form and `m.h_sh`'s
+/// q8_1 form, in one launch or two as the probe asks, or none when it
+/// skips them.
+fn moe_quantize(
+    gpu: &Gpu,
+    m: &mut MoeScratch,
+    dims: &MoeDims,
+    skip_quant: bool,
+    split_moe_quant: bool,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
     // 8. both quantizations in one launch: the routed experts' 32-value form
     //    and the shared expert's q8_1. Different sources, different outputs,
     //    different geometries — merged because they are two launches, not
     //    because they share work.
-    if !*skip_quant {
-        if *split_moe_quant {
+    if !skip_quant {
+        if split_moe_quant {
             gpu.q5()
                 .enqueue_quantize_q8(stream, &m.h_exp, &mut m.act32_exp)?;
             tick(
@@ -932,6 +1113,29 @@ fn enqueue_ffn_moe(
             )?;
         }
     }
+    Ok(())
+}
+
+/// Stages 9–10 of the routed FFN half: the selected experts' and the shared
+/// expert's down projections, then the combine with the residual
+/// `ffn_inp` into `l_out`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_down_combine(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    ffn_inp: &DeviceBuffer<f32>,
+    l_out: &mut DeviceBuffer<f32>,
+    m: &mut MoeScratch,
+    dims: &MoeDims,
+    hidden: usize,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
     gpu.q5().enqueue_gemv_q5_0_sel(
         stream,
         kq_weight(w, &names.ffn_down_exps)?,
