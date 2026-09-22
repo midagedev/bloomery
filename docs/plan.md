@@ -12,7 +12,7 @@
 - **비행 중**: 없다. 워크트리는 `bloomery-a4c`만 남아 있다(이전 라운드 것 — 열기 전에 상태 확인).
 - **오늘 닫힌 것**: errsrc — 참값 대비 추가 오차의 원인은 활성 128값 블록(시뮬 41 → 32값 25, σ 0.378 → 0.255 = ik 수준). 사용자 결정으로 **기본값은 128 유지, 32값은 `exact_ref --act ik` 시뮬로만**(「모델 / 성능이 먼저, 정확도는 선택」). σ는 `gate-gpu-e2e`의 진단 줄이 됐다(핀 아님, 엔진 0.3518). fnsplit 머지 완료.
 - **결정 대기(사용자)**: MMA 레버 기본값.
-- **리드 할 일**: ~~데이터 경로 세 곳을 `lib.rs::data_dir()`로~~ 했다. ~~`docs/rust-quality.md` §0 재측정~~ 했다(lint 211, unsafe 무주석 62). 오늘치 rig-log 기록(참값 자 전환, ik도 29/27에서 틀림, 스칼라 합산 순서 잡음, 리팩터 라운드).
+- **리드 할 일**: ~~데이터 경로 세 곳을 `lib.rs::data_dir()`로~~ 했다. ~~`docs/rust-quality.md` §0 재측정~~ 했다(lint 211, unsafe 무주석 62). ~~오늘치 rig-log 기록~~ 09-22-m(`39e84f2`).
 - **다음 리팩터 후보**(트리아지 원본은 세션 스크래치였다 — 요지만): tools6(셸 기본값을 `ref-paths.sh`로), gates-c(`gate_p10` `Table`, `assert_eq!`→`Err`, 검사 중복), gpucast(R5), 미해결 doc 링크 8건 + rustdoc 게이트, `model::probe`→`instrument` 개명, 커널 모듈 `pub` 52개 가시성, exact_ref 가중치 재역양자화 캐시.
 
 ### GPU 선
