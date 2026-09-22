@@ -53,7 +53,7 @@ use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, KERNEL_BAND, activations, bits_equal, bytes_to_words, max_rel_err, open_model,
-    row_bytes, tensor_bytes, verdict,
+    row_bytes, tensor_bytes, tensor_bytes_as, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -135,11 +135,11 @@ fn run() -> Result<(), GateError> {
         for (name, ty) in &unknown {
             eprintln!("FAIL: census: tensor {name} has type {ty} with no device format");
         }
-        eprintln!(
-            "FAILED: gate_p10 census — {} unclassifiable tensor(s)",
+        return Err(format!(
+            "FAILED: census — {} unclassifiable tensor(s)",
             unknown.len()
-        );
-        std::process::exit(1);
+        )
+        .into());
     }
 
     // ------------------------------------------ 2. full load + read-back
@@ -428,8 +428,7 @@ fn run() -> Result<(), GateError> {
     drop(w);
 
     if !ok {
-        eprintln!("FAILED: gate_p10");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p10 — census complete, every resident tensor reads back as its independent \
@@ -658,8 +657,7 @@ fn kid_q5_1_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError>
         seed,
         ..
     } = *t;
-    let (info, bytes) = tensor_bytes(gguf, "blk.0.ffn_down.weight")?;
-    assert_eq!(info.ty, GgmlType::Q5_1, "blk.0.ffn_down type");
+    let (info, bytes) = tensor_bytes_as(gguf, "blk.0.ffn_down.weight", GgmlType::Q5_1, None)?;
     let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
     let kb = k / 32;
     let cols = 256 * kb.div_ceil(32) + 2 * kb;
@@ -694,8 +692,7 @@ fn kid_q5_0_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErr
         seed,
         ..
     } = *t;
-    let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_down_exps.weight")?;
-    assert_eq!(info.ty, GgmlType::Q5_0, "blk.1.ffn_down_exps type");
+    let (info, bytes) = tensor_bytes_as(gguf, "blk.1.ffn_down_exps.weight", GgmlType::Q5_0, None)?;
     let (k, rpe, nexp) = (
         info.dims[0] as usize,
         info.dims[1] as usize,
@@ -741,8 +738,7 @@ fn kid_q3k_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErro
         seed,
         ..
     } = *t;
-    let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_gate_exps.weight")?;
-    assert_eq!(info.ty, GgmlType::Q3_K, "blk.1.ffn_gate_exps type");
+    let (info, bytes) = tensor_bytes_as(gguf, "blk.1.ffn_gate_exps.weight", GgmlType::Q3_K, None)?;
     let (k, rpe, nexp) = (
         info.dims[0] as usize,
         info.dims[1] as usize,
@@ -791,8 +787,7 @@ fn kid_f32_router_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), Gate
         seed,
         ..
     } = *t;
-    let (info, bytes) = tensor_bytes(gguf, "blk.1.ffn_gate_inp.weight")?;
-    assert_eq!(info.ty, GgmlType::F32, "blk.1.ffn_gate_inp type");
+    let (info, bytes) = tensor_bytes_as(gguf, "blk.1.ffn_gate_inp.weight", GgmlType::F32, None)?;
     let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
     let vals: Vec<f32> = bytes[..nrows * k * 4]
         .chunks_exact(4)

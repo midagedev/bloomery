@@ -143,8 +143,7 @@ fn run() -> Result<(), GateError> {
     ok &= no_local_depot()?;
 
     if !ok {
-        eprintln!("FAILED: gate_p5");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p5 kv_append bits exact (incl. IEEE edges, ik cache bits equal); \

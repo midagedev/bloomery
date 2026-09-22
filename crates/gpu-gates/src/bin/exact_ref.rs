@@ -92,13 +92,15 @@ fn view<'a>(t: &'a TensorInfo, expert: Option<usize>) -> Res<View<'a>> {
 /// `threads` scoped threads. Each row's dot is one f64 sum, so the split
 /// changes no bit.
 fn matvec(g: &Gguf, w: View<'_>, x: &[f64], threads: usize) -> Res<Vec<f64>> {
-    assert_eq!(
-        x.len(),
-        w.k,
-        "matvec {}: x has {} values",
-        w.t.name,
-        x.len()
-    );
+    if x.len() != w.k {
+        return Err(format!(
+            "matvec {}: x has {} values, want K = {}",
+            w.t.name,
+            x.len(),
+            w.k
+        )
+        .into());
+    }
     let data = g.data(w.t)?;
     let mut y = vec![0.0f64; w.rows];
     let chunk = w.rows.div_ceil(threads);
@@ -201,15 +203,13 @@ impl Act {
     }
 
     /// `x` as the product sees it: each block rounded to `d * q`.
-    fn round(self, ty: GgmlType, x: &[f64]) -> Vec<f64> {
+    fn round(self, ty: GgmlType, x: &[f64]) -> Res<Vec<f64>> {
         let Some(b) = self.block(ty) else {
-            return x.to_vec();
+            return Ok(x.to_vec());
         };
-        assert!(
-            x.len().is_multiple_of(b),
-            "{} values do not split into {b}-value blocks",
-            x.len()
-        );
+        if !x.len().is_multiple_of(b) {
+            return Err(format!("{} values do not split into {b}-value blocks", x.len()).into());
+        }
         let mut out = Vec::with_capacity(x.len());
         for blk in x.chunks(b) {
             let v: Vec<f32> = blk.iter().map(|&a| a as f32).collect();
@@ -225,7 +225,7 @@ impl Act {
                     .map(|&a| f64::from((a / d).round().clamp(-127.0, 127.0)) * f64::from(dq)),
             );
         }
-        out
+        Ok(out)
     }
 }
 
@@ -295,7 +295,11 @@ struct Model<'a> {
 impl Model<'_> {
     /// `W x` with `x` rounded the way this arm's engine feeds `W`.
     fn mvq(&self, w: View<'_>, x: &[f64]) -> Res<Vec<f64>> {
-        matvec(self.g, w, &self.act.round(w.t.ty, x), self.threads)
+        let xq = self
+            .act
+            .round(w.t.ty, x)
+            .map_err(|e| format!("{}: {e}", w.t.name))?;
+        matvec(self.g, w, &xq, self.threads)
     }
 
     fn tap(&mut self) -> Option<&mut Taps> {

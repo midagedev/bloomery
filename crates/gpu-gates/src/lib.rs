@@ -55,6 +55,13 @@ pub fn exit_with(name: &str, r: Result<(), GateError>) -> std::process::ExitCode
     std::process::ExitCode::FAILURE
 }
 
+/// The error a gate returns when its `ok` accumulator came out false. Every
+/// failing check has printed its own line by then; this ends the run through
+/// [`exit_with`]. One spelling for every gate, as [`verdict`] is for a check.
+pub fn checks_failed() -> GateError {
+    "FAILED: one or more checks above did not pass".into()
+}
+
 /// The model file every gate opens: `$BLOOMERY_REF_MODEL`, else
 /// [`DEFAULT_MODEL`]. `open_model` and any gate that prints the path read it
 /// here, so the printed name is the file that was opened.
@@ -146,6 +153,28 @@ pub fn tensor_bytes<'a>(
         .find(name)
         .ok_or_else(|| format!("tensor {name} not in the model"))?;
     Ok((t, gguf.data(t)?))
+}
+
+/// [`tensor_bytes`] of a tensor proven to be the one the gate was written
+/// for: type `ty` and, when `dims` is given, exactly those dims (ggml order,
+/// dims[0] = K). The error names the tensor, what the file holds and what
+/// was wanted.
+pub fn tensor_bytes_as<'a>(
+    gguf: &'a Gguf,
+    name: &str,
+    ty: GgmlType,
+    dims: Option<&[u64]>,
+) -> Result<(&'a TensorInfo, &'a [u8]), GateError> {
+    let (t, b) = tensor_bytes(gguf, name)?;
+    if t.ty != ty || dims.is_some_and(|d| t.dims.as_slice() != d) {
+        let want_dims = dims.map_or_else(String::new, |d| format!(" {d:?}"));
+        return Err(format!(
+            "tensor_bytes_as: {name} is {:?} {:?}, want {ty:?}{want_dims}",
+            t.ty, t.dims
+        )
+        .into());
+    }
+    Ok((t, b))
 }
 
 /// `max|y - y_ref| / max|y_ref|`; an all-zero reference or any non-finite

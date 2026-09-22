@@ -673,8 +673,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !ok {
-        eprintln!("FAILED: gate_p8");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p8 — block-0 step assembled: taps printed against the dump's last \

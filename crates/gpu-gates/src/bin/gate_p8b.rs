@@ -444,8 +444,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !ok {
-        eprintln!("FAILED: gate_p8b");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p8b — MoE layer {LAYER} step assembled: taps printed against the dump's \

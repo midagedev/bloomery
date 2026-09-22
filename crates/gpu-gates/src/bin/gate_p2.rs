@@ -39,7 +39,7 @@ fn run() -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1};
     use bloomery_gpu::{DeviceTensor, Gpu};
     use bloomery_gpu_gates::{
-        KERNEL_BAND, activations, max_rel_err, open_model, ref_gemv, row_bytes, tensor_bytes,
+        KERNEL_BAND, activations, max_rel_err, open_model, ref_gemv, row_bytes, tensor_bytes_as,
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::GgmlType;
@@ -52,13 +52,13 @@ fn run() -> Result<(), GateError> {
 
     // ---- Q5_0: the expert stack, experts 0/5/63 by row0 (flat-stack
     // addressing, no gather copy), m in {1, 8}.
-    let (info, w_bytes) = tensor_bytes(&gguf, "blk.1.ffn_down_exps.weight")?;
-    assert_eq!(info.ty, GgmlType::Q5_0, "blk.1.ffn_down_exps type");
-    assert_eq!(
-        info.dims,
-        [1408, 2048, 64],
-        "blk.1.ffn_down_exps dims [K, rows, experts]"
-    );
+    // dims [K, rows, experts]
+    let (_, w_bytes) = tensor_bytes_as(
+        &gguf,
+        "blk.1.ffn_down_exps.weight",
+        GgmlType::Q5_0,
+        Some(&[1408, 2048, 64]),
+    )?;
     let (k0, rows0, n_exp) = (1408usize, 2048usize, 64usize);
     let rb0 = row_bytes(GgmlType::Q5_0, k0)?;
     let k_blocks0 = k0 / 32;
@@ -163,9 +163,13 @@ fn run() -> Result<(), GateError> {
     }
 
     // ---- Q5_1: the dense down projection, all rows, m in {1, 8}.
-    let (info1, w1_bytes) = tensor_bytes(&gguf, "blk.0.ffn_down.weight")?;
-    assert_eq!(info1.ty, GgmlType::Q5_1, "blk.0.ffn_down type");
-    assert_eq!(info1.dims, [10944, 2048], "blk.0.ffn_down dims [K, rows]");
+    // dims [K, rows]
+    let (_, w1_bytes) = tensor_bytes_as(
+        &gguf,
+        "blk.0.ffn_down.weight",
+        GgmlType::Q5_1,
+        Some(&[10944, 2048]),
+    )?;
     let (k1, rows1) = (10944usize, 2048usize);
     let k_blocks1 = k1 / 32;
     let q_stride1 = 256 * k_blocks1.div_ceil(32);
@@ -238,8 +242,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !ok {
-        eprintln!("FAILED: gate_p2");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: q5_0/q5_1 gemv within KERNEL_BAND of the quantized-input reference; col0/y0 addressing clean; eager == graph replay"

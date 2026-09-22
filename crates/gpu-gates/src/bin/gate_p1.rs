@@ -31,7 +31,7 @@ fn run() -> Result<(), GateError> {
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_gates::{
         KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, ref_gemv, row_bytes,
-        tensor_bytes,
+        tensor_bytes_as,
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::GgmlType;
@@ -123,9 +123,10 @@ fn run() -> Result<(), GateError> {
     let mut all_ok = true;
 
     for &(name, tensor, ty, k, cap, pins) in shapes {
-        let (info, bytes) = tensor_bytes(&gguf, tensor)?;
-        assert_eq!(info.ty, ty, "{tensor}: unexpected quant type");
-        assert_eq!(info.dims[0] as usize, k, "{tensor}: unexpected K");
+        let (info, bytes) = tensor_bytes_as(&gguf, tensor, ty, None)?;
+        if info.dims[0] != k as u64 {
+            return Err(format!("{tensor} is {:?}, want K = {k} at dims[0]", info.dims).into());
+        }
         let rows_total: usize = info.dims[1..].iter().product::<u64>() as usize;
         let rows = cap.map_or(rows_total, |c| rows_total.min(c));
         assert!(rows >= 1, "{tensor}: no rows");
@@ -197,7 +198,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !all_ok {
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p1 K-quant gemvs within {KERNEL_BAND} of the q8_1 reference, \

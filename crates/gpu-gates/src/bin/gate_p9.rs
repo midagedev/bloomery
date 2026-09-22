@@ -30,7 +30,7 @@ use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0};
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    GateError, activations, bits_equal, bytes_to_words, open_model, tensor_bytes, verdict,
+    GateError, activations, bits_equal, bytes_to_words, open_model, tensor_bytes_as, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -66,13 +66,13 @@ fn run() -> Result<(), GateError> {
     let stream = gpu.stream();
 
     // ------------------------------------------------ Q3_K: ffn_gate_exps
-    let (info3, w3_bytes) = tensor_bytes(&gguf, "blk.1.ffn_gate_exps.weight")?;
-    assert_eq!(info3.ty, GgmlType::Q3_K, "blk.1.ffn_gate_exps type");
-    assert_eq!(
-        info3.dims,
-        [2048, 1408, 64],
-        "blk.1.ffn_gate_exps dims [K, rows, experts]"
-    );
+    // dims [K, rows, experts]
+    let (_, w3_bytes) = tensor_bytes_as(
+        &gguf,
+        "blk.1.ffn_gate_exps.weight",
+        GgmlType::Q3_K,
+        Some(&[2048, 1408, 64]),
+    )?;
     let (k3, rpe3, nexp3) = (2048usize, 1408usize, 64usize);
     let wpm3 = 110 * (k3 / 256) / 4; // 220 u32 words per row
     let words3 = bytes_to_words(w3_bytes);
@@ -218,13 +218,13 @@ fn run() -> Result<(), GateError> {
     }
 
     // ------------------------------------------------ Q5_0: ffn_down_exps
-    let (info5, w5_bytes) = tensor_bytes(&gguf, "blk.1.ffn_down_exps.weight")?;
-    assert_eq!(info5.ty, GgmlType::Q5_0, "blk.1.ffn_down_exps type");
-    assert_eq!(
-        info5.dims,
-        [1408, 2048, 64],
-        "blk.1.ffn_down_exps dims [K, rows, experts]"
-    );
+    // dims [K, rows, experts]
+    let (_, w5_bytes) = tensor_bytes_as(
+        &gguf,
+        "blk.1.ffn_down_exps.weight",
+        GgmlType::Q5_0,
+        Some(&[1408, 2048, 64]),
+    )?;
     let (k5, rpe5, nexp5) = (1408usize, 2048usize, 64usize);
     let k_blocks5 = k5 / 32;
     let q_stride5 = 256 * k_blocks5.div_ceil(32);
@@ -328,8 +328,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !ok {
-        eprintln!("FAILED: gate_p9");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p9 _sel outputs bit-identical to the per-expert kernels slot by slot; \

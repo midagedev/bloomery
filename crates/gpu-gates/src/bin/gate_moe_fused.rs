@@ -28,7 +28,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, bits_equal, load_ref, max_rel_err, open_model, ref_manifest, route_ref,
-    tensor_bytes, us_per_replay, verdict,
+    tensor_bytes, tensor_bytes_as, us_per_replay, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -81,36 +81,37 @@ fn run() -> Result<(), GateError> {
         .and_then(gguf::Value::as_f32)
         .unwrap_or(1.0);
 
-    let (gu_info, _) = tensor_bytes(&gguf, "blk.1.ffn_gate_exps.weight")?;
-    let (up_info, _) = tensor_bytes(&gguf, "blk.1.ffn_up_exps.weight")?;
+    // K is the gate stack's row width and `rows` the down stack's row count,
+    // both read from the file; every other extent is the metadata above.
+    let k = tensor_bytes(&gguf, "blk.1.ffn_gate_exps.weight")?.0.dims[0];
     let (dn_info, _) = tensor_bytes(&gguf, "blk.1.ffn_down_exps.weight")?;
-    let (gi_info, _) = tensor_bytes(&gguf, "blk.1.ffn_gate_inp.weight")?;
-    assert_eq!(gu_info.ty, GgmlType::Q3_K, "blk.1.ffn_gate_exps type");
-    assert_eq!(up_info.ty, GgmlType::Q3_K, "blk.1.ffn_up_exps type");
-    assert_eq!(dn_info.ty, GgmlType::Q5_0, "blk.1.ffn_down_exps type");
-    assert_eq!(gi_info.ty, GgmlType::F32, "blk.1.ffn_gate_inp type");
-    let k = gu_info.dims[0] as usize;
-    let rows = dn_info.dims[1] as usize;
-    assert_eq!(
-        gu_info.dims,
-        [k as u64, ff as u64, n_expert as u64],
-        "blk.1.ffn_gate_exps dims [K, expert_ff, experts]"
-    );
-    assert_eq!(
-        up_info.dims,
-        [k as u64, ff as u64, n_expert as u64],
-        "blk.1.ffn_up_exps dims [K, expert_ff, experts]"
-    );
-    assert_eq!(
-        dn_info.dims,
-        [ff as u64, rows as u64, n_expert as u64],
-        "blk.1.ffn_down_exps dims [expert_ff, rows, experts]"
-    );
-    assert_eq!(
-        gi_info.dims,
-        [k as u64, n_expert as u64],
-        "blk.1.ffn_gate_inp dims [K, experts]"
-    );
+    let rows = *dn_info.dims.get(1).ok_or_else(|| {
+        format!(
+            "gate_moe_fused: blk.1.ffn_down_exps.weight is {:?}, want [expert_ff, rows, experts]",
+            dn_info.dims
+        )
+    })?;
+    // Dims in ggml order: gate and up [K, expert_ff, experts], down
+    // [expert_ff, rows, experts], the router [K, experts].
+    let (ff_d, n_d) = (ff as u64, n_expert as u64);
+    let want: [(&str, GgmlType, &[u64]); 4] = [
+        (
+            "blk.1.ffn_gate_exps.weight",
+            GgmlType::Q3_K,
+            &[k, ff_d, n_d],
+        ),
+        ("blk.1.ffn_up_exps.weight", GgmlType::Q3_K, &[k, ff_d, n_d]),
+        (
+            "blk.1.ffn_down_exps.weight",
+            GgmlType::Q5_0,
+            &[ff_d, rows, n_d],
+        ),
+        ("blk.1.ffn_gate_inp.weight", GgmlType::F32, &[k, n_d]),
+    ];
+    for (name, ty, dims) in want {
+        tensor_bytes_as(&gguf, name, ty, Some(dims))?;
+    }
+    let (k, rows) = (k as usize, rows as usize);
     if n_used < 1 || n_used > 8 {
         return Err(format!(
             "gate_moe_fused: n_used {n_used} outside 1..=8 (the activation scratch width)"
@@ -681,8 +682,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !ok {
-        eprintln!("FAILED: gate_moe_fused");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_moe_fused fused 4-launch MoE routed half bit-identical to the 8-launch op \

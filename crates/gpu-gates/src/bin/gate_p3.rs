@@ -45,14 +45,12 @@ fn run() -> Result<(), GateError> {
     let mut all_ok = true;
 
     // F32, real router weight: blk.1.ffn_gate_inp.weight, F32 [2048, 64].
-    let (t, w_bytes) = bloomery_gpu_gates::tensor_bytes(&gguf, "blk.1.ffn_gate_inp.weight")?;
-    if t.ty != GgmlType::F32 || t.dims.len() != 2 || t.dims[0] != 2048 || t.dims[1] != 64 {
-        return Err(format!(
-            "router tensor is {:?} {:?}, want F32 [2048, 64]",
-            t.ty, t.dims
-        )
-        .into());
-    }
+    let (_, w_bytes) = bloomery_gpu_gates::tensor_bytes_as(
+        &gguf,
+        "blk.1.ffn_gate_inp.weight",
+        GgmlType::F32,
+        Some(&[2048, 64]),
+    )?;
     let w_router: Vec<f32> = w_bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -130,7 +128,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !all_ok {
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!("PASSED: f32 and q8_0 gemv within 1e-5 of the f64 reference; eager == graph replay");
     Ok(())

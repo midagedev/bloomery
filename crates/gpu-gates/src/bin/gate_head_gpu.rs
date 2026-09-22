@@ -247,8 +247,7 @@ fn run() -> Result<(), GateError> {
     println!("top-5 oracle: {:?}", top5(&oracle));
 
     if !ok {
-        eprintln!("FAILED: gate_head_gpu");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_head_gpu — head chain taps printed against the dump's last \

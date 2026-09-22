@@ -40,8 +40,8 @@ use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     activations, bits_equal, bytes_to_words, f32_tensor, find_ref_row, load_ref, max_rel_err,
-    open_model, ref_manifest, ref_tensor_logical, ref_tensor_of, row_bytes, tensor_bytes, verdict,
-    view_flat,
+    open_model, ref_manifest, ref_tensor_logical, ref_tensor_of, row_bytes, tensor_bytes,
+    tensor_bytes_as, verdict, view_flat,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -90,16 +90,23 @@ fn run() -> Result<(), GateError> {
     let mla = GpuModel::load(&gguf, 1)?.mla().clone();
 
     // The embedding table, uploaded once in the load-time format.
-    let (emb_info, emb_bytes) = tensor_bytes(&gguf, "token_embd.weight")?;
-    assert_eq!(emb_info.ty, GgmlType::Q3_K, "token_embd.weight type");
-    assert_eq!(emb_info.dims[0], 2048, "token_embd.weight K");
-    let vocab = emb_info.dims[1] as usize;
+    let (emb_info, emb_bytes) = tensor_bytes_as(&gguf, "token_embd.weight", GgmlType::Q3_K, None)?;
+    let &[2048, vocab, ..] = emb_info.dims.as_slice() else {
+        return Err(format!(
+            "token_embd.weight is {:?}, want [2048, vocab, ..]",
+            emb_info.dims
+        )
+        .into());
+    };
+    let vocab = vocab as usize;
     let emb_words = bytes_to_words(emb_bytes);
-    assert!(
-        vocab > 0 && emb_words.len() % vocab == 0 && emb_words.len() / vocab == 220,
-        "token_embd.weight: {} words over {vocab} rows",
-        emb_words.len()
-    );
+    if !(vocab > 0 && emb_words.len().is_multiple_of(vocab) && emb_words.len() / vocab == 220) {
+        return Err(format!(
+            "token_embd.weight: {} words over {vocab} rows, want 220 per row",
+            emb_words.len()
+        )
+        .into());
+    }
     let emb_dev = DeviceTensor::upload(stream, &emb_words, vocab, 220)?;
     let m = PROMPT.len();
     let ids_dev = DeviceBuffer::from_host(stream, &PROMPT)?;
@@ -252,7 +259,9 @@ fn run() -> Result<(), GateError> {
     // tail of each token's kv_rope_compressed-L.
     {
         let nd = mla.rope_dims;
-        assert_eq!(nd % 2, 0, "rope dims must pair");
+        if !nd.is_multiple_of(2) {
+            return Err(format!("rope_dims {nd} is odd; rope rotates dim pairs").into());
+        }
         let mut cs = vec![0.0f32; m * nd];
         let mut buf: Vec<f32> = Vec::new();
         for t in 0..m {
@@ -327,7 +336,13 @@ fn run() -> Result<(), GateError> {
         let mut case = 0u32;
         for (site, tensor, ff) in sites {
             let (info, _) = tensor_bytes(&gguf, tensor)?;
-            assert_eq!(info.dims[1] as usize, ff, "{tensor} intermediate width");
+            if info.dims.get(1) != Some(&(ff as u64)) {
+                return Err(format!(
+                    "{tensor} is {:?}, want intermediate width {ff} at dims[1]",
+                    info.dims
+                )
+                .into());
+            }
             for mm in [1usize, 8] {
                 case += 1;
                 let gate = activations(ff, mm, 7000 + case * 31);
@@ -709,8 +724,7 @@ fn run() -> Result<(), GateError> {
     ok &= norm_geometry()?;
 
     if !ok {
-        eprintln!("FAILED: gate_p4");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: elem kernels within their bands of the host references; bit-identical reruns; \

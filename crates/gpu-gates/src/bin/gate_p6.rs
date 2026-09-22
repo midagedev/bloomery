@@ -525,8 +525,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !ok {
-        eprintln!("FAILED: gate_p6");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: router ids exact / probs+weights within 1e-6 of the route_inner reference; expert table exact; eager == graph replay; the router kernels compile with no local depot at the width their host side launches"

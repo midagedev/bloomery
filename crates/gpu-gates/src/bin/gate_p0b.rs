@@ -29,7 +29,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, bits_equal, bytes_to_words, f32_tensor, load_ref, max_rel_err, open_model,
-    ref_manifest, row_bytes, tensor_bytes, us_per_replay, verdict,
+    ref_manifest, row_bytes, tensor_bytes_as, us_per_replay, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -82,29 +82,26 @@ fn run() -> Result<(), GateError> {
         TOKENS - 1
     );
 
-    // Weights: the real block-0 FFN tensors.
+    // Weights: the real block-0 FFN tensors, each dims [K, rows].
     let gain = f32_tensor(&gguf, "blk.0.ffn_norm.weight", K)?;
-    let (wg_info, wg_bytes) = tensor_bytes(&gguf, "blk.0.ffn_gate.weight")?;
-    assert_eq!(wg_info.ty, GgmlType::Q3_K, "blk.0.ffn_gate type");
-    assert_eq!(
-        wg_info.dims,
-        [K as u64, FF as u64],
-        "blk.0.ffn_gate dims [K, rows]"
-    );
-    let (wu_info, wu_bytes) = tensor_bytes(&gguf, "blk.0.ffn_up.weight")?;
-    assert_eq!(wu_info.ty, GgmlType::Q3_K, "blk.0.ffn_up type");
-    assert_eq!(
-        wu_info.dims,
-        [K as u64, FF as u64],
-        "blk.0.ffn_up dims [K, rows]"
-    );
-    let (wd_info, wd_bytes) = tensor_bytes(&gguf, "blk.0.ffn_down.weight")?;
-    assert_eq!(wd_info.ty, GgmlType::Q5_1, "blk.0.ffn_down type");
-    assert_eq!(
-        wd_info.dims,
-        [FF as u64, ROWS as u64],
-        "blk.0.ffn_down dims [K, rows]"
-    );
+    let (_, wg_bytes) = tensor_bytes_as(
+        &gguf,
+        "blk.0.ffn_gate.weight",
+        GgmlType::Q3_K,
+        Some(&[K as u64, FF as u64]),
+    )?;
+    let (_, wu_bytes) = tensor_bytes_as(
+        &gguf,
+        "blk.0.ffn_up.weight",
+        GgmlType::Q3_K,
+        Some(&[K as u64, FF as u64]),
+    )?;
+    let (_, wd_bytes) = tensor_bytes_as(
+        &gguf,
+        "blk.0.ffn_down.weight",
+        GgmlType::Q5_1,
+        Some(&[FF as u64, ROWS as u64]),
+    )?;
 
     let rb3 = row_bytes(GgmlType::Q3_K, K)?;
     assert!(
@@ -697,8 +694,7 @@ fn run() -> Result<(), GateError> {
     }
 
     if !ok {
-        eprintln!("FAILED: gate_p0b");
-        std::process::exit(1);
+        return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p0b fused 4-launch block-0 FFN bit-identical to the 8-launch op path \
