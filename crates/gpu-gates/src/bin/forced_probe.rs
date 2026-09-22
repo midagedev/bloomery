@@ -1,10 +1,12 @@
 //! `forced_probe` — one teacher-forced position of the end-to-end gate, laid
 //! open: our logits' top-k there, where the reference's token ranks in them,
 //! every forced step's margin on the way, and each layer's taps at that
-//! position. With `--against` it reads another arm's dump and prints both
-//! arms side by side with the per-layer relative distance.
+//! position. With `--against` it reads other arms' dumps (a comma list) and
+//! prints, for each, both arms side by side with the per-layer relative
+//! distance. `exact_ref --dump` writes the same layout, so an f64 arm is
+//! one of them (`just exact-taps`).
 //!
-//!     forced_probe --prompt-id ID --step S --dump DIR [--against DIR]
+//!     forced_probe --prompt-id ID --step S --dump DIR [--against DIR[,DIR…]]
 //!                  [--ctx C] [--top K]
 //!
 //! Two arms of a process-wide lever (`BLOOMERY_FLASH_MMA`, read once) are two
@@ -51,12 +53,14 @@ fn flag_value(name: &str) -> Option<String> {
 /// flash output (every head's latent row), the first value the lever moves
 /// at a position.
 #[cfg(feature = "gpu")]
-const TAPS: [&str; 8] = [
+const TAPS: [&str; 10] = [
+    "attn_norm",
     "q",
     "kv_compressed",
     "kqv_compressed",
     "kqv_out",
     "ffn_inp",
+    "ffn_norm",
     "moe_logits",
     "moe_weights",
     "l_out",
@@ -65,11 +69,13 @@ const TAPS: [&str; 8] = [
 #[cfg(feature = "gpu")]
 fn tap<'a>(t: &'a LayerTaps, name: &str) -> &'a [f32] {
     match name {
+        "attn_norm" => &t.attn_norm,
         "q" => &t.q,
         "kv_compressed" => &t.kv_compressed,
         "kqv_compressed" => &t.kqv_compressed,
         "kqv_out" => &t.kqv_out,
         "ffn_inp" => &t.ffn_inp,
+        "ffn_norm" => &t.ffn_norm,
         "moe_logits" => &t.moe_logits,
         "moe_weights" => &t.moe_weights,
         "l_out" => &t.l_out,
@@ -133,7 +139,9 @@ fn run() -> Res<()> {
         .ok_or("forced_probe: --step is required")?
         .parse()?;
     let dump = PathBuf::from(flag_value("--dump").ok_or("forced_probe: --dump DIR is required")?);
-    let against = flag_value("--against").map(PathBuf::from);
+    let against: Vec<PathBuf> = flag_value("--against")
+        .map(|s| s.split(',').map(PathBuf::from).collect())
+        .unwrap_or_default();
     let ctx: usize = flag_value("--ctx").map_or(Ok(256), |s| s.parse())?;
     let top: usize = flag_value("--top").map_or(Ok(5), |s| s.parse())?;
 
@@ -276,9 +284,16 @@ fn run() -> Res<()> {
         r.gen_margins[step]
     );
 
-    let Some(other) = against else {
-        return Ok(());
-    };
+    for other in &against {
+        compare(&logits, &taps, other, top)?;
+    }
+    Ok(())
+}
+
+/// This arm's logits and taps against the dump in `other`: its top-k, the
+/// logits' distance, and the per-layer relative distance of every tap.
+#[cfg(feature = "gpu")]
+fn compare(logits: &[f32], taps: &[LayerTaps], other: &Path, top: usize) -> Res<()> {
     let other_logits = read_f32(&other.join("logits.f32"))?;
     let ork = ranked(&other_logits);
     println!(
@@ -290,14 +305,14 @@ fn run() -> Res<()> {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let (lrel, lmax) = distance(&logits, &other_logits);
+    let (lrel, lmax) = distance(logits, &other_logits);
     println!("logits rel={lrel:.3e} max_abs={lmax:.4}");
     print!("{:>3}", "L");
     for name in TAPS {
         print!(" {name:>15}");
     }
     println!("  moe_ids(this | against)");
-    for t in &taps {
+    for t in taps {
         print!("{:>3}", t.layer);
         for name in TAPS {
             let b = read_f32(&other.join(format!("L{:02}.{name}.f32", t.layer)))?;
