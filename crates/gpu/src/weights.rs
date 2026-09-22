@@ -84,7 +84,7 @@ impl DevWeight {
     }
 
     /// Values per row: `dims[0]` of the file tensor, `nope` for the derived.
-    pub fn k(&self) -> usize {
+    pub(crate) fn k(&self) -> usize {
         match self {
             DevWeight::KQuant { k, .. }
             | DevWeight::Q5_0 { k, .. }
@@ -97,7 +97,7 @@ impl DevWeight {
 
     /// Device bytes held across all planes.
     #[must_use]
-    pub fn resident_bytes(&self) -> usize {
+    pub(crate) fn resident_bytes(&self) -> usize {
         match self {
             DevWeight::KQuant { w, .. } | DevWeight::Q5_0 { w, .. } | DevWeight::Q5_1 { w, .. } => {
                 w.buf().len() * 4

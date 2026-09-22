@@ -52,13 +52,6 @@ use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Compile-time probe of the dependency direction (gpu → model → gguf): the
-/// device-bundle crate reads model metadata through `bloomery-model`.
-pub fn mla_width(gguf: &gguf::Gguf) -> Result<usize, GpuError> {
-    let p = MlaParams::read(gguf, 0)?;
-    Ok(p.rope_dims + p.latent)
-}
-
 // ------------------------------------------------------------- step kernels
 
 #[cuda_module]
@@ -341,7 +334,7 @@ pub struct StepKernels {
 
 /// [`StepKernels::enqueue_q8_0_gemv_heads`]'s arguments. The strides and
 /// the offset count f32 elements, `rows_per_head` weight rows.
-pub struct Q8_0GemvHeadsArgs<'a> {
+pub(crate) struct Q8_0GemvHeadsArgs<'a> {
     pub qs: &'a DeviceTensor<u32>,
     pub d: &'a DeviceTensor<f32>,
     pub x: &'a DeviceBuffer<f32>,
@@ -352,31 +345,33 @@ pub struct Q8_0GemvHeadsArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-/// [`StepKernels::enqueue_q3k_gemv_heads`]'s arguments. `head_base` counts
-/// heads, `rows_per_head`/`row_stride_per_head`/`row_off` weight rows, and
-/// `y_head_stride` f32 elements.
-pub struct Q3kGemvHeadsArgs<'a> {
-    pub w: &'a DeviceTensor<u32>,
-    pub act: &'a Q8Act,
+/// The per-head Q3_K launch's head layout, shared by both of its entries.
+/// `head_base` counts heads, `rows_per_head`/`row_stride_per_head`/`row_off`
+/// weight rows, and `y_head_stride` f32 elements.
+#[derive(Clone, Copy)]
+pub(crate) struct HeadsGeom {
     pub head_base: usize,
     pub rows_per_head: usize,
     pub row_stride_per_head: usize,
     pub row_off: usize,
     pub y_head_stride: usize,
+}
+
+/// [`StepKernels::enqueue_q3k_gemv_heads`]'s arguments.
+pub(crate) struct Q3kGemvHeadsArgs<'a> {
+    pub w: &'a DeviceTensor<u32>,
+    pub act: &'a Q8Act,
+    pub geom: HeadsGeom,
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
 /// [`StepKernels::enqueue_q3k_gemv_heads_pair`]'s arguments: as
 /// [`Q3kGemvHeadsArgs`], the activation columns split over `lo` and `hi`.
-pub struct Q3kGemvHeadsPairArgs<'a> {
+pub(crate) struct Q3kGemvHeadsPairArgs<'a> {
     pub w: &'a DeviceTensor<u32>,
     pub lo: &'a Q8Act,
     pub hi: &'a Q8Act,
-    pub head_base: usize,
-    pub rows_per_head: usize,
-    pub row_stride_per_head: usize,
-    pub row_off: usize,
-    pub y_head_stride: usize,
+    pub geom: HeadsGeom,
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
@@ -432,7 +427,7 @@ impl StepKernels {
     /// `h*rows_per_head + j`. `d.rows()` must be a multiple of
     /// `rows_per_head` (then `n_heads = d.rows() / rows_per_head`). Asynchronous,
     /// allocation-free, capturable.
-    pub fn enqueue_q8_0_gemv_heads(
+    pub(crate) fn enqueue_q8_0_gemv_heads(
         &self,
         stream: &CudaStream,
         a: Q8_0GemvHeadsArgs<'_>,
@@ -538,36 +533,27 @@ impl StepKernels {
     /// `enqueue_gemv_q3k`), and `row_off + rows_per_head <=
     /// row_stride_per_head` so a head's rows stay on its own block.
     /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_q3k_gemv_heads(
+    pub(crate) fn enqueue_q3k_gemv_heads(
         &self,
         stream: &CudaStream,
         a: Q3kGemvHeadsArgs<'_>,
     ) -> Result<(), GpuError> {
-        let Q3kGemvHeadsArgs {
-            w,
-            act,
+        let Q3kGemvHeadsArgs { w, act, geom, y } = a;
+        let HeadsGeom {
             head_base,
             rows_per_head,
             row_stride_per_head,
             row_off,
             y_head_stride,
-            y,
-        } = a;
+        } = geom;
         let n_sb = act.n_sb();
         let heads = act.m();
         check_q3k_heads(
             "enqueue_q3k_gemv_heads",
             w,
-            HeadsShape {
-                n_sb,
-                k: act.k(),
-                head_base,
-                heads,
-                rows_per_head,
-                row_stride_per_head,
-                row_off,
-                y_head_stride,
-            },
+            (n_sb, act.k()),
+            heads,
+            geom,
             y.len(),
         )?;
         let n_rows = heads * rows_per_head;
@@ -602,22 +588,19 @@ impl StepKernels {
     /// Same weight, same shapes and the same per-head contract as the single
     /// call — the two together replace the pair of launches, bit for bit.
     /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_q3k_gemv_heads_pair(
+    pub(crate) fn enqueue_q3k_gemv_heads_pair(
         &self,
         stream: &CudaStream,
         a: Q3kGemvHeadsPairArgs<'_>,
     ) -> Result<(), GpuError> {
-        let Q3kGemvHeadsPairArgs {
-            w,
-            lo,
-            hi,
+        let Q3kGemvHeadsPairArgs { w, lo, hi, geom, y } = a;
+        let HeadsGeom {
             head_base,
             rows_per_head,
             row_stride_per_head,
             row_off,
             y_head_stride,
-            y,
-        } = a;
+        } = geom;
         let n_sb = lo.n_sb();
         let (split, heads) = (lo.m(), lo.m() + hi.m());
         if hi.n_sb() != n_sb || hi.k() != lo.k() {
@@ -633,16 +616,9 @@ impl StepKernels {
         check_q3k_heads(
             "enqueue_q3k_gemv_heads_pair",
             w,
-            HeadsShape {
-                n_sb,
-                k: lo.k(),
-                head_base,
-                heads,
-                rows_per_head,
-                row_stride_per_head,
-                row_off,
-                y_head_stride,
-            },
+            (n_sb, lo.k()),
+            heads,
+            geom,
             y.len(),
         )?;
         let n_rows = heads * rows_per_head;
@@ -673,38 +649,25 @@ impl StepKernels {
     }
 }
 
-/// The per-head Q3_K launch's geometry, as [`check_q3k_heads`] reads it:
-/// `n_sb` super-blocks at `K = k`, `heads` heads from `head_base`.
-struct HeadsShape {
-    n_sb: usize,
-    k: usize,
-    head_base: usize,
-    heads: usize,
-    rows_per_head: usize,
-    row_stride_per_head: usize,
-    row_off: usize,
-    y_head_stride: usize,
-}
-
 /// The shape checks both per-head Q3_K launches share: even `n_sb`, `w`'s
 /// row width, a head's rows inside its own block, the heads inside `w`, and
-/// `y` covering the last head's rows.
+/// `y` covering the last head's rows. `(n_sb, k)` is the activation's
+/// super-block count at `K = k`; `heads` heads start at `geom.head_base`.
 fn check_q3k_heads(
     what: &'static str,
     w: &DeviceTensor<u32>,
-    s: HeadsShape,
+    (n_sb, k): (usize, usize),
+    heads: usize,
+    geom: HeadsGeom,
     y_len: usize,
 ) -> Result<(), GpuError> {
-    let HeadsShape {
-        n_sb,
-        k,
+    let HeadsGeom {
         head_base,
-        heads,
         rows_per_head,
         row_stride_per_head,
         row_off,
         y_head_stride,
-    } = s;
+    } = geom;
     if !n_sb.is_multiple_of(2) {
         return Err(GpuError::shape(
             what,
@@ -1127,17 +1090,14 @@ struct Residency {
 }
 
 impl Stage {
+    /// The device this stage's layers run on.
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
     }
 
+    /// The model layers this stage carries, as a range of layer indices.
     pub fn layers(&self) -> std::ops::Range<usize> {
         self.layers.clone()
-    }
-
-    /// Whether this stage replays a captured graph or enqueues eagerly.
-    pub fn has_graph(&self) -> bool {
-        self.graph.is_some()
     }
 
     /// Device bytes held by the residency: weights, KV caches, scratch.
@@ -1314,7 +1274,7 @@ impl LayerTaps {
 /// counts once — the number is the op's traffic, the divisor of its
 /// effective GB/s. `None` is an op whose count is not derivable from the
 /// shapes this file holds; the profile prints it as `?`.
-pub type Bytes = Option<u64>;
+pub(crate) type Bytes = Option<u64>;
 
 /// Sum of byte parts, `None` if any part is not derivable.
 fn bsum(parts: &[Option<usize>]) -> Bytes {
@@ -1684,7 +1644,7 @@ impl GpuModel {
     /// `1..block_count`): `cuts.len() + 1` stages. Reads the metadata `step`
     /// needs; the stages carry no residency until [`GpuModel::load_blocks`]
     /// fills one.
-    pub fn load_staged(
+    pub(crate) fn load_staged(
         gguf: &gguf::Gguf,
         ctx_max: usize,
         cuts: &[usize],
@@ -1824,16 +1784,14 @@ impl GpuModel {
         Ok(m)
     }
 
+    /// The model's stages, in layer order.
     pub fn stages(&self) -> &[Stage] {
         &self.stages
     }
 
+    /// The attention geometry read from the model file at load.
     pub fn mla(&self) -> &MlaParams {
         &self.mla
-    }
-
-    pub fn ctx_max(&self) -> usize {
-        self.ctx_max
     }
 
     /// Device bytes of everything this model holds resident: the stage's
@@ -1846,10 +1804,6 @@ impl GpuModel {
     /// The cache row the next [`GpuModel::step`] token lands in.
     pub fn pos(&self) -> u32 {
         self.pos
-    }
-
-    pub fn mode(&self) -> StepMode {
-        self.mode
     }
 
     /// Choose how the chain submits. Changing the mode drops any captured
@@ -1893,7 +1847,13 @@ impl GpuModel {
             ));
         };
         let slots = r.kv.len();
-        let zero_row = vec![0u16; r.kv[0].cols()];
+        let Some(kv0) = r.kv.first() else {
+            return Err(GpuError::state(
+                "GpuModel::reset",
+                "residency carries no cache slots",
+            ));
+        };
+        let zero_row = vec![0u16; kv0.cols()];
         for slot in 0..slots {
             let (gpu, residency) = self.stage_parts("GpuModel::reset")?;
             seed_cache(gpu, &mut residency.kv[slot], &zero_row, "reset")?;
@@ -1938,7 +1898,15 @@ impl GpuModel {
             ));
         }
         let (slots, width) = match self.stages.first().and_then(|s| s.residency.as_ref()) {
-            Some(r) => (r.kv.len(), r.kv[0].cols()),
+            Some(r) => match r.kv.first() {
+                Some(kv0) => (r.kv.len(), kv0.cols()),
+                None => {
+                    return Err(GpuError::state(
+                        "GpuModel::seed_depth",
+                        "residency carries no cache slots",
+                    ));
+                }
+            },
             None => {
                 return Err(GpuError::state(
                     "GpuModel::seed_depth",
@@ -2973,7 +2941,13 @@ impl LayerScratch {
             kv_b_rows,
             mla.n_head * (mla.nope + mla.v_head),
         )?;
-        if q_rows % mla.rope_dims != 0 {
+        if mla.rope_dims == 0 {
+            return Err(GpuError::shape(
+                "LayerScratch",
+                "rope_dims must be at least 1",
+            ));
+        }
+        if !q_rows.is_multiple_of(mla.rope_dims) {
             return Err(GpuError::shape(
                 "LayerScratch",
                 format!(
@@ -3654,6 +3628,13 @@ fn enqueue_attn(
     }
     let kv_b = kq_weight(w, &names.attn_kv_b)?;
     let wkvb = dev_weight(w, &names.attn_kv_b)?;
+    let geom = HeadsGeom {
+        head_base: 0,
+        rows_per_head: mla.v_head,
+        row_stride_per_head: mla.nope + mla.v_head,
+        row_off: mla.nope,
+        y_head_stride: mla.v_head,
+    };
     if s.probe_cfg.split_heads {
         // The two-launch form: half the heads' wv_b rows against their own
         // activation columns, then the other half.
@@ -3669,11 +3650,7 @@ fn enqueue_attn(
             Q3kGemvHeadsArgs {
                 w: kv_b,
                 act: &s.act_kv_lo,
-                head_base: 0,
-                rows_per_head: mla.v_head,
-                row_stride_per_head: mla.nope + mla.v_head,
-                row_off: mla.nope,
-                y_head_stride: mla.v_head,
+                geom,
                 y: &mut s.kqv_2d,
             },
         )?;
@@ -3683,11 +3660,10 @@ fn enqueue_attn(
             Q3kGemvHeadsArgs {
                 w: kv_b,
                 act: &s.act_kv_hi,
-                head_base: half,
-                rows_per_head: mla.v_head,
-                row_stride_per_head: mla.nope + mla.v_head,
-                row_off: mla.nope,
-                y_head_stride: mla.v_head,
+                geom: HeadsGeom {
+                    head_base: half,
+                    ..geom
+                },
                 y: &mut s.kqv_2d,
             },
         )?;
@@ -3702,11 +3678,7 @@ fn enqueue_attn(
                 w: kv_b,
                 lo: &s.act_kv_lo,
                 hi: &s.act_kv_hi,
-                head_base: 0,
-                rows_per_head: mla.v_head,
-                row_stride_per_head: mla.nope + mla.v_head,
-                row_off: mla.nope,
-                y_head_stride: mla.v_head,
+                geom,
                 y: &mut s.kqv_2d,
             },
         )?;

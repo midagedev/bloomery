@@ -57,7 +57,7 @@ impl Graph {
     /// not capturable and abort the capture. A body that returns `Err` or
     /// panics still ends the capture and frees the partial template: the
     /// stream is capturable again afterwards.
-    pub fn capture<F>(stream: &CudaStream, body: F) -> Result<Graph, GpuError>
+    pub(crate) fn capture<F>(stream: &CudaStream, body: F) -> Result<Graph, GpuError>
     where
         F: FnOnce(&CudaStream) -> Result<(), GpuError>,
     {

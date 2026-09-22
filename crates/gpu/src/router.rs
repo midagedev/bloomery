@@ -45,7 +45,7 @@ pub const ROUTER_THREADS: usize = 32;
 /// per expert: the row0 a gemv launch's row addressing starts from. Exact in
 /// u32 for this model's stacks (63 * 2048 is the largest product).
 #[inline(always)]
-pub fn expert_row0(id: u32, rows: u32) -> u32 {
+pub(crate) fn expert_row0(id: u32, rows: u32) -> u32 {
     id * rows
 }
 

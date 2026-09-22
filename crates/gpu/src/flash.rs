@@ -94,104 +94,109 @@ pub use model::attn::f32_to_f16_bits;
 /// Latent tail this kernel family's geometry is built for, and so the block's
 /// thread count: one thread per latent dim. `enqueue_flash_latent` rejects
 /// any other latent width.
-pub const LATENT: usize = 512;
+pub(crate) const LATENT: usize = 512;
 /// Keys per online-softmax tile — one warp's worth, so a tile's max and
 /// weight sum are single warp butterflies.
-pub const KEY_TILE: usize = 32;
+pub(crate) const KEY_TILE: usize = 32;
 /// Threads sharing one key's QK dot; the block's `LATENT` threads cover
 /// `KEY_TILE` keys at a time.
-pub const DIM_SPLIT: usize = LATENT / KEY_TILE;
+pub(crate) const DIM_SPLIT: usize = LATENT / KEY_TILE;
 const _: () = assert!(LATENT.is_multiple_of(KEY_TILE));
 /// Widest `rope_dims + latent` row the shared staging buffer holds.
-pub const MAX_WIDTH: usize = 640;
+pub(crate) const MAX_WIDTH: usize = 640;
 /// Rotating partials each hot loop carries, and so the loads a thread keeps
 /// in flight. Four is measured, not derived: eight measured slower at depth
 /// on this card, so the loops are not short of memory-level parallelism. The
 /// partials are combined by a fixed tree, never by the loop order.
-pub const ILP: usize = 4;
+pub(crate) const ILP: usize = 4;
 /// Keys one segment block of the split launch walks. A multiple of
 /// [`KEY_TILE`], so only the last live segment of a row can meet a partial
 /// tile and the guarded tail path is the one already there. The value is
 /// measured, not derived: a segment twice this size still fills the card at
 /// four thousand keys but leaves it half empty at one thousand, and this one
 /// measured faster at both depths.
-pub const SEG_KEYS: usize = 128;
+pub(crate) const SEG_KEYS: usize = 128;
 
 // ------------------------------------------------- tensor-core geometry
 
 /// Query rows one block of [`flash_kernels::flash_latent_mma`] carries: a
 /// decode step's whole head set, and so the `M` axis of its `mma.sync`.
-pub const MMA_ROWS: usize = 16;
+pub(crate) const MMA_ROWS: usize = 16;
 /// Warps in an `flash_latent_mma` block, one per query row of the group: the
 /// block's thread count is the latent width, so the V accumulation gives each
 /// thread one latent dim and the online softmax gives each warp one head.
 /// Four warps issue the `S = Q·Kᵀ` product; every warp stages, reduces and
 /// accumulates.
-pub const MMA_WARPS: usize = MMA_ROWS;
+pub(crate) const MMA_WARPS: usize = MMA_ROWS;
 /// Threads in an `flash_latent_mma` block.
-pub const MMA_BLOCK: usize = MMA_WARPS * 32;
+pub(crate) const MMA_BLOCK: usize = MMA_WARPS * 32;
 /// Keys one warp's `mma.sync` `n`-tile covers — the instruction's `n`.
-pub const MMA_NTILE: usize = 8;
+pub(crate) const MMA_NTILE: usize = 8;
 /// Warps that issue the `S = Q·Kᵀ` `mma.sync`. Four of them cover a tile's
 /// keys, and the accumulator's four values per lane then cover every
 /// (head, key) slot of the tile exactly once.
-pub const MMA_QK_WARPS: usize = 4;
+pub(crate) const MMA_QK_WARPS: usize = 4;
 /// Keys one `flash_latent_mma` tile covers: every issuing warp's `n`-tile at
 /// once. It is also the lane count of a warp, which is what lets the softmax
 /// finish a head's tile without a shared reduction.
-pub const MMA_KEYS: usize = MMA_QK_WARPS * MMA_NTILE;
+pub(crate) const MMA_KEYS: usize = MMA_QK_WARPS * MMA_NTILE;
 const _: () = assert!(MMA_KEYS == MMA_QK_WARPS * MMA_NTILE);
 const _: () = assert!(MMA_KEYS == 32);
 /// Dims one `mma.sync` step covers — the instruction's `k`.
-pub const MMA_K: usize = 16;
+pub(crate) const MMA_K: usize = 16;
 /// The `rope_dims + latent` row width `flash_latent_mma` is built for. Its
 /// shared tiles are sized for it and its `k` walk assumes the width divides
 /// by `2 * MMA_K`, so the host entry rejects any other width rather than
 /// reading past a tile.
-pub const MMA_WIDTH: usize = 576;
+pub(crate) const MMA_WIDTH: usize = 576;
 const _: () = assert!(MMA_WIDTH.is_multiple_of(2 * MMA_K));
 /// f16 lanes between two staged query rows. `MMA_QSTRIDE * 2 ≡ 16 (mod 128)`
 /// is what makes every `ldmatrix` phase read eight rows across all thirty-two
 /// banks exactly once; the unpadded 576 would put all sixteen rows in the
 /// same bank.
-pub const MMA_QSTRIDE: usize = MMA_WIDTH + 8;
+pub(crate) const MMA_QSTRIDE: usize = MMA_WIDTH + 8;
 const _: () = assert!(MMA_QSTRIDE * 2 % 128 == 16);
 /// `MMA_QSTRIDE` as u32 words, the staged tile's element type.
-pub const MMA_QROW_W: usize = MMA_QSTRIDE / 2;
+pub(crate) const MMA_QROW_W: usize = MMA_QSTRIDE / 2;
 /// u32 words one staged query tile takes.
-pub const MMA_QWORDS: usize = MMA_ROWS * MMA_QROW_W;
+pub(crate) const MMA_QWORDS: usize = MMA_ROWS * MMA_QROW_W;
 /// Words of its query row one lane stages. The row is [`MMA_WIDTH`] f16 lanes
 /// and a warp is thirty-two, so this is a compile-time trip count and the
 /// staging loop's loads all issue before any of them is consumed.
-pub const MMA_QSTAGE: usize = MMA_WIDTH / 2 / 32;
+pub(crate) const MMA_QSTAGE: usize = MMA_WIDTH / 2 / 32;
+// Both staging loops (this one and `MMA_KSTAGE`'s) cover the row exactly.
+const _: () = assert!(MMA_WIDTH.is_multiple_of(64));
 /// f16 lanes between two staged key rows — padded for the same reason as
 /// [`MMA_QSTRIDE`], and by the same amount.
-pub const MMA_KSTRIDE: usize = MMA_WIDTH + 8;
+pub(crate) const MMA_KSTRIDE: usize = MMA_WIDTH + 8;
 const _: () = assert!(MMA_KSTRIDE * 2 % 128 == 16);
 /// `MMA_KSTRIDE` as u32 words.
-pub const MMA_KROW_W: usize = MMA_KSTRIDE / 2;
+pub(crate) const MMA_KROW_W: usize = MMA_KSTRIDE / 2;
 /// u32 words the staged key tile takes. The tile is whole — every key row's
 /// whole width, so the `k` axis is one walk and the row's latent tail is
 /// still in shared memory when the V accumulation wants it. Together with
 /// the query tile that is past the 48 KB a static allocation may take, so
 /// both live in this kernel's dynamic shared memory.
-pub const MMA_KWORDS: usize = MMA_KEYS * MMA_KROW_W;
-/// Key rows one warp stages, and the words of each one lane takes. Both are
-/// compile-time trip counts, for the same reason [`MMA_QSTAGE`] is.
-pub const MMA_KROWS_PER_WARP: usize = MMA_KEYS / MMA_WARPS;
-pub const MMA_KSTAGE: usize = MMA_WIDTH / 2 / 32;
+pub(crate) const MMA_KWORDS: usize = MMA_KEYS * MMA_KROW_W;
+/// Key rows one warp stages — a compile-time trip count, for the same reason
+/// [`MMA_QSTAGE`] is.
+pub(crate) const MMA_KROWS_PER_WARP: usize = MMA_KEYS / MMA_WARPS;
+const _: () = assert!(MMA_KEYS.is_multiple_of(MMA_WARPS));
+/// Words of each staged key row one lane takes — a compile-time trip count,
+/// for the same reason [`MMA_QSTAGE`] is.
+pub(crate) const MMA_KSTAGE: usize = MMA_WIDTH / 2 / 32;
 /// Bytes of dynamic shared memory one `flash_latent_mma` block takes: the
 /// query tile then the key tile, in that order. Both are `u32` arrays and
 /// the base is sixteen-byte aligned, so the query tile's word count is the
 /// key tile's offset.
-pub const MMA_DYN_BYTES: usize = (MMA_QWORDS + MMA_KWORDS) * 4;
+pub(crate) const MMA_DYN_BYTES: usize = (MMA_QWORDS + MMA_KWORDS) * 4;
 /// `#[launch_contract(dynamic_shared = ...)]` takes an integer literal and
 /// not a constant, so the kernel's declaration spells the byte count out.
 /// This is the two sides agreeing: change the geometry and the build stops
 /// here rather than at a launch the driver rejects.
 const _: () = assert!(MMA_DYN_BYTES == 56064);
 /// Floats a tile's per-head logits (then weights) take.
-pub const MMA_TILE: usize = MMA_ROWS * MMA_KEYS;
+pub(crate) const MMA_TILE: usize = MMA_ROWS * MMA_KEYS;
 /// Keys one segment of the tensor-core pass walks, and so [`seg_keys`]'s
 /// default while that pass is selected. One block carries every head, so the
 /// grid is the segment count alone: the shipped [`SEG_KEYS`] would leave a
@@ -199,7 +204,7 @@ pub const MMA_TILE: usize = MMA_ROWS * MMA_KEYS;
 /// shape the head-blocked scalar round died of. Sixty-four keys give
 /// sixty-six blocks there and keep the merge's fold half the length a
 /// thirty-two-key segment would.
-pub const MMA_SEG_KEYS: usize = 64;
+pub(crate) const MMA_SEG_KEYS: usize = 64;
 
 /// Whether the split launch's segment pass is the tensor-core
 /// [`flash_kernels::flash_latent_mma`] rather than the per-head
@@ -251,24 +256,24 @@ pub fn seg_keys() -> usize {
 /// shipped entry's and the slowdown against them is that stage's price in
 /// the step. The shipped entries pass [`TWICE_NONE`] and every probe branch
 /// folds away at compile time.
-pub const TWICE_NONE: u32 = 0;
+pub(crate) const TWICE_NONE: u32 = 0;
 /// The QK dot loop, over the thread's own key row or another (`shift`).
-pub const TWICE_QK: u32 = 1;
+pub(crate) const TWICE_QK: u32 = 1;
 /// The V accumulation loop, over the same tile's rows or another's.
-pub const TWICE_V: u32 = 1 << 1;
+pub(crate) const TWICE_V: u32 = 1 << 1;
 /// The key butterfly, and the tile max and weight sum warp reductions.
-pub const TWICE_COLL: u32 = 1 << 2;
+pub(crate) const TWICE_COLL: u32 = 1 << 2;
 /// The tile's two block barriers.
-pub const TWICE_SYNC: u32 = 1 << 3;
+pub(crate) const TWICE_SYNC: u32 = 1 << 3;
 /// Warp 0's per-lane softmax arithmetic, both exponentials included.
-pub const TWICE_SM: u32 = 1 << 4;
+pub(crate) const TWICE_SM: u32 = 1 << 4;
 
 /// The weight a probe entry folds its second result in with:
 /// `fma(PROBE_JIG, second, first)`. Zero, so the fold returns `first` to the
 /// bit — every value a probe folds is finite — and a launch scalar rather
 /// than a literal, so no pass can see that it is zero and delete the second
 /// pass it weighs.
-pub const PROBE_JIG: f32 = 0.0;
+pub(crate) const PROBE_JIG: f32 = 0.0;
 
 /// Segments a `cache_rows`-tall cache is cut into. One means the cache fits
 /// in a single segment and the single-launch [`flash_latent`] serves it.
@@ -294,7 +299,7 @@ pub fn partials_ms_len(q_rows: usize, cache_rows: usize) -> usize {
 /// deterministic instruction whose ~1e-7 relative error sits far inside every
 /// band this package gates against, with no dependence on host libm.
 #[inline(always)]
-pub fn dev_exp(x: f32) -> f32 {
+pub(crate) fn dev_exp(x: f32) -> f32 {
     cuda_device::float::ex2_approx_f32(x * std::f32::consts::LOG2_E)
 }
 
@@ -303,7 +308,7 @@ pub fn dev_exp(x: f32) -> f32 {
 /// `cores::half_to_f32`'s value for every finite and infinite input — one
 /// instruction instead of a decode whose subnormal branch is a loop.
 #[inline(always)]
-pub fn half_bits_to_f32(bits: u16) -> f32 {
+pub(crate) fn half_bits_to_f32(bits: u16) -> f32 {
     cvt_f32_f16x2_lo(bits as u32)
 }
 
@@ -1002,26 +1007,47 @@ mod flash_kernels {
                 let mut d = 0usize;
                 #[unroll]
                 while d < MMA_WIDTH {
-                    // SAFETY: every lane of the warp reaches this call with
-                    // the same qualifiers and an address inside its staged
-                    // tile, and the barrier above orders the staging writes
-                    // before the loads.
-                    unsafe {
-                        let bp = kt.add((key0 + bkey) * MMA_KROW_W + d / 2 + boct * 4);
-                        let bf = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                    // SAFETY: key row `key0 + bkey < MMA_KEYS` and words
+                    // `d / 2 + boct * 4 .. + 4 <= MMA_WIDTH / 2` are inside
+                    // the staged key tile.
+                    let bp = unsafe { kt.add((key0 + bkey) * MMA_KROW_W + d / 2 + boct * 4) };
+                    // SAFETY: every lane of the warp reaches this load with
+                    // the same qualifiers and an address inside the key tile,
+                    // and the barrier above orders the staging writes first.
+                    let bf = unsafe {
+                        ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
                             bp.cast_const().cast::<u8>(),
-                        ));
-                        let ap0 = qs.add(arow * MMA_QROW_W + d / 2 + ahalf * (MMA_K / 4));
-                        let af0 = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                        ))
+                    };
+                    // SAFETY: query row `arow < MMA_ROWS` and words
+                    // `d / 2 + ahalf * (MMA_K / 4) .. + 4 + MMA_K / 2 <=
+                    // MMA_WIDTH / 2` keep this and `ap1` inside the query tile.
+                    let ap0 = unsafe { qs.add(arow * MMA_QROW_W + d / 2 + ahalf * (MMA_K / 4)) };
+                    // SAFETY: every lane of the warp reaches this load with
+                    // the same qualifiers and `ap0` inside the query tile,
+                    // published by the first pass's barrier.
+                    let af0 = unsafe {
+                        ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
                             ap0.cast_const().cast::<u8>(),
-                        ));
-                        c = mma_m16n8k16_f32_f16(c, af0, [bf[0], bf[1]]);
-                        let ap1 = ap0.add(MMA_K / 2);
-                        let af1 = ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
+                        ))
+                    };
+                    // SAFETY: the whole warp issues this `mma.sync` (the
+                    // branch is on the warp index) with fragments it loaded.
+                    c = unsafe { mma_m16n8k16_f32_f16(c, af0, [bf[0], bf[1]]) };
+                    // SAFETY: `MMA_K / 2` words past `ap0` is still inside
+                    // its query row — the bound on `ap0` includes this step.
+                    let ap1 = unsafe { ap0.add(MMA_K / 2) };
+                    // SAFETY: every lane of the warp reaches this load with
+                    // the same qualifiers and `ap1` inside the query tile,
+                    // published by the first pass's barrier.
+                    let af1 = unsafe {
+                        ldmatrix_x4_shared_u32(cvta_generic_to_shared_u32(
                             ap1.cast_const().cast::<u8>(),
-                        ));
-                        c = mma_m16n8k16_f32_f16(c, af1, [bf[2], bf[3]]);
-                    }
+                        ))
+                    };
+                    // SAFETY: the whole warp issues this `mma.sync` (the
+                    // branch is on the warp index) with fragments it loaded.
+                    c = unsafe { mma_m16n8k16_f32_f16(c, af1, [bf[2], bf[3]]) };
                     d += 2 * MMA_K;
                 }
             }
@@ -1037,14 +1063,17 @@ mod flash_kernels {
                 while j < 4 {
                     let head = g + if j >= 2 { MMA_ROWS / 2 } else { 0 };
                     let key = key0 + 2 * t4 + (j & 1);
-                    // SAFETY: head < MMA_ROWS and key < MMA_KEYS bound both
-                    // slots, and one lane of one warp writes each.
+                    // SAFETY: head < MMA_ROWS bounds the read inside LIM,
+                    // written before the tile loop's first barrier.
+                    let lim = unsafe { *lim_sh.add(head) } as usize;
+                    let sv = if blk + key < lim {
+                        scale * c[j]
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+                    // SAFETY: head < MMA_ROWS and key < MMA_KEYS bound the
+                    // slot, and one lane of one warp writes each.
                     unsafe {
-                        let sv = if blk + key < *lim_sh.add(head) as usize {
-                            scale * c[j]
-                        } else {
-                            f32::NEG_INFINITY
-                        };
                         *klog.add(head * MMA_KEYS + key) = sv;
                     }
                     j += 1;
@@ -1950,16 +1979,21 @@ mod flash_kernels {
             [*base, *base.add(1), *base.add(2), *base.add(3)]
         };
         let n_sb = n_sb as usize;
-        // SAFETY (both arms): the values are block `blk`'s, held four per
-        // lane in value order, which is `q8_1_quant_vals`'s precondition;
-        // the column is inside the half's `m` and the launch contract bounds
-        // that half's five outputs. The branch is on the block index.
-        unsafe {
-            if row < m_lo as usize {
+        // The branch is on the block index, so each arm runs block-uniform.
+        if row < m_lo as usize {
+            // SAFETY: the values are block `blk`'s, held four per lane in
+            // value order (`q8_1_quant_vals`'s precondition); `row < m_lo` is
+            // inside the first half and the launch contract bounds its outputs.
+            unsafe {
                 q8_1_quant_vals(
                     vals, row, blk, n_sb, half_it, quad_it, lane, q3a, q4a, q6a, s8a, d8a,
                 );
-            } else {
+            }
+        } else {
+            // SAFETY: the values are block `blk`'s, held four per lane in
+            // value order (`q8_1_quant_vals`'s precondition); `row - m_lo` is
+            // inside the second half and the launch contract bounds its outputs.
+            unsafe {
                 q8_1_quant_vals(
                     vals,
                     row - m_lo as usize,
@@ -2402,7 +2436,7 @@ pub struct FlashLatentArgs<'a> {
 }
 
 /// [`FlashKernels::enqueue_flash_latent_q8`]'s arguments.
-pub struct FlashLatentQ8Args<'a> {
+pub(crate) struct FlashLatentQ8Args<'a> {
     pub inputs: FlashInputs<'a>,
     pub y: &'a mut DeviceBuffer<f32>,
     pub lo: &'a mut Q8Act,
@@ -2428,7 +2462,7 @@ pub struct FlashSegArgs<'a> {
 /// [`FlashKernels::enqueue_flash_latent_seg_twice`]'s arguments: the
 /// segment pass's, the stage to run twice (one `TWICE_*`), and the second
 /// pass's row offset inside the segment.
-pub struct FlashSegTwiceArgs<'a> {
+pub(crate) struct FlashSegTwiceArgs<'a> {
     pub seg: FlashSegArgs<'a>,
     pub twice: u32,
     pub shift_rows: usize,
@@ -2448,7 +2482,7 @@ pub struct FlashMergeArgs<'a> {
 }
 
 /// [`FlashKernels::enqueue_flash_merge_q8`]'s arguments.
-pub struct FlashMergeQ8Args<'a> {
+pub(crate) struct FlashMergeQ8Args<'a> {
     pub merge: FlashMergeArgs<'a>,
     pub lo: &'a mut Q8Act,
     pub hi: &'a mut Q8Act,
@@ -2456,7 +2490,7 @@ pub struct FlashMergeQ8Args<'a> {
 
 /// [`FlashKernels::enqueue_flash_merge2_q8`]'s arguments: the q8 merge's
 /// and the second fold's offset, in segments.
-pub struct FlashMerge2Q8Args<'a> {
+pub(crate) struct FlashMerge2Q8Args<'a> {
     pub merge: FlashMergeArgs<'a>,
     pub lo: &'a mut Q8Act,
     pub hi: &'a mut Q8Act,
@@ -2675,7 +2709,7 @@ impl FlashKernels {
     /// wants the two launches timed or observed separately enqueues this and
     /// [`FlashKernels::enqueue_flash_merge`] itself, after asking
     /// [`segments_for`] whether the cache is tall enough to need them at all.
-    pub fn enqueue_flash_latent_seg(
+    pub(crate) fn enqueue_flash_latent_seg(
         &self,
         stream: &CudaStream,
         a: FlashSegArgs<'_>,
@@ -2698,8 +2732,7 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
-        let segs = segments_for(kv.rows());
-        let q_rows = check_seg(
+        let (q_rows, segs) = check_seg(
             "enqueue_flash_latent_seg",
             q.len(),
             kv,
@@ -2742,7 +2775,7 @@ impl FlashKernels {
     /// passes is the caller's — [`flash_mma`] is where the engine makes it.
     ///
     /// The kernel's shared tiles are sized for a [`MMA_WIDTH`] row and its
-    /// `k` walk assumes the width divides by [`MMA_CHUNK`], so any other
+    /// `k` walk assumes the width divides by `2 * `[`MMA_K`], so any other
     /// width is refused here rather than read past a tile.
     pub fn enqueue_flash_latent_mma(
         &self,
@@ -2767,8 +2800,7 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
-        let segs = segments_for(kv.rows());
-        let q_rows = check_seg(
+        let (q_rows, segs) = check_seg(
             "enqueue_flash_latent_mma",
             q.len(),
             kv,
@@ -2831,7 +2863,7 @@ impl FlashKernels {
     /// INSTRUMENT: the partials are the shipped entry's to the bit, so an
     /// arm's slowdown against it is that stage's price in the step.
     /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_flash_latent_seg_twice(
+    pub(crate) fn enqueue_flash_latent_seg_twice(
         &self,
         stream: &CudaStream,
         a: FlashSegTwiceArgs<'_>,
@@ -2859,8 +2891,7 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
-        let segs = segments_for(kv.rows());
-        let q_rows = check_seg(
+        let (q_rows, segs) = check_seg(
             "enqueue_flash_latent_seg_twice",
             q.len(),
             kv,
@@ -2925,6 +2956,7 @@ impl FlashKernels {
         stream: &CudaStream,
         a: FlashMergeArgs<'_>,
     ) -> Result<(), GpuError> {
+        let (q_rows, segs) = check_merge("enqueue_flash_merge", &a)?;
         let FlashMergeArgs {
             n_keys_buf,
             cache_rows,
@@ -2935,17 +2967,6 @@ impl FlashKernels {
             part_ms,
             y,
         } = a;
-        let segs = segments_for(cache_rows);
-        let q_rows = m * n_heads;
-        check_merge(
-            "enqueue_flash_merge",
-            n_keys_buf.len(),
-            latent,
-            (part_v.len(), part_ms.len()),
-            q_rows,
-            segs,
-            y.len(),
-        )?;
         let prep = self.module.prepare_flash_merge(LaunchConfig1D::new(
             q_rows as u32,
             LATENT as u32,
@@ -2975,37 +2996,23 @@ impl FlashKernels {
     /// `Gpu::enqueue_quantize_q8_1_pair(y, 0, lo, lo.m() * latent, hi)`
     /// would have written, so this deletes that launch rather than merging
     /// it. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_flash_merge_q8(
+    pub(crate) fn enqueue_flash_merge_q8(
         &self,
         stream: &CudaStream,
         a: FlashMergeQ8Args<'_>,
     ) -> Result<(), GpuError> {
-        let FlashMergeQ8Args {
-            merge:
-                FlashMergeArgs {
-                    n_keys_buf,
-                    cache_rows,
-                    tokens: m,
-                    heads: n_heads,
-                    latent_dims: latent,
-                    part_v,
-                    part_ms,
-                    y,
-                },
-            lo,
-            hi,
-        } = a;
-        let segs = segments_for(cache_rows);
-        let q_rows = m * n_heads;
-        check_merge(
-            "enqueue_flash_merge_q8",
-            n_keys_buf.len(),
-            latent,
-            (part_v.len(), part_ms.len()),
-            q_rows,
-            segs,
-            y.len(),
-        )?;
+        let FlashMergeQ8Args { merge, lo, hi } = a;
+        let (q_rows, segs) = check_merge("enqueue_flash_merge_q8", &merge)?;
+        let FlashMergeArgs {
+            n_keys_buf,
+            cache_rows,
+            tokens: m,
+            heads: n_heads,
+            latent_dims: latent,
+            part_v,
+            part_ms,
+            y,
+        } = merge;
         let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge_q8", lo, hi, q_rows, latent)?;
         let prep = self.module.prepare_flash_merge_q8(LaunchConfig1D::new(
             q_rows as u32,
@@ -3049,38 +3056,28 @@ impl FlashKernels {
     /// INSTRUMENT: `y` and the side output are the shipped entry's to the
     /// bit, so the arm's slowdown against it is the fold's price in the
     /// step. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_flash_merge2_q8(
+    pub(crate) fn enqueue_flash_merge2_q8(
         &self,
         stream: &CudaStream,
         a: FlashMerge2Q8Args<'_>,
     ) -> Result<(), GpuError> {
         let FlashMerge2Q8Args {
-            merge:
-                FlashMergeArgs {
-                    n_keys_buf,
-                    cache_rows,
-                    tokens: m,
-                    heads: n_heads,
-                    latent_dims: latent,
-                    part_v,
-                    part_ms,
-                    y,
-                },
+            merge,
             lo,
             hi,
             shift_segs: shift,
         } = a;
-        let segs = segments_for(cache_rows);
-        let q_rows = m * n_heads;
-        check_merge(
-            "enqueue_flash_merge2_q8",
-            n_keys_buf.len(),
-            latent,
-            (part_v.len(), part_ms.len()),
-            q_rows,
-            segs,
-            y.len(),
-        )?;
+        let (q_rows, segs) = check_merge("enqueue_flash_merge2_q8", &merge)?;
+        let FlashMergeArgs {
+            n_keys_buf,
+            cache_rows,
+            tokens: m,
+            heads: n_heads,
+            latent_dims: latent,
+            part_v,
+            part_ms,
+            y,
+        } = merge;
         let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge2_q8", lo, hi, q_rows, latent)?;
         let prep = self.module.prepare_flash_merge2_q8(LaunchConfig1D::new(
             q_rows as u32,
@@ -3124,7 +3121,7 @@ impl FlashKernels {
     /// [`FlashKernels::enqueue_flash_latent`] with the same q8_1 side output
     /// as [`FlashKernels::enqueue_flash_merge_q8`] — the single-segment path,
     /// so both paths of the folded step quantize.
-    pub fn enqueue_flash_latent_q8(
+    pub(crate) fn enqueue_flash_latent_q8(
         &self,
         stream: &CudaStream,
         a: FlashLatentQ8Args<'_>,
@@ -3247,18 +3244,15 @@ fn check_partials(
 }
 
 /// The merge pass's inputs, shared by its three entries: the live-count
-/// buffer, the latent tail, the partials for `q_rows` rows over `segs`
-/// segments, and `y`. `parts` is `(part_v.len(), part_ms.len())`.
-fn check_merge(
-    what: &'static str,
-    n_keys_len: usize,
-    latent: usize,
-    parts: (usize, usize),
-    q_rows: usize,
-    segs: usize,
-    y_len: usize,
-) -> Result<(), GpuError> {
-    if n_keys_len == 0 {
+/// buffer, the latent tail, the partials for `tokens * heads` rows over
+/// [`segments_for`]`(cache_rows)` segments, and `y`. Returns the query rows
+/// and the segment count.
+fn check_merge(what: &'static str, a: &FlashMergeArgs<'_>) -> Result<(usize, usize), GpuError> {
+    let latent = a.latent_dims;
+    let q_rows = a.tokens * a.heads;
+    let segs = segments_for(a.cache_rows);
+    let y_len = a.y.len();
+    if a.n_keys_buf.is_empty() {
         return Err(GpuError::shape(what, "n_keys_buf must hold 1 u32"));
     }
     if latent != LATENT {
@@ -3267,19 +3261,20 @@ fn check_merge(
             format!("this family's latent tail is {LATENT}, got {latent}"),
         ));
     }
-    check_partials(what, parts.0, parts.1, q_rows, segs, latent)?;
+    check_partials(what, a.part_v.len(), a.part_ms.len(), q_rows, segs, latent)?;
     if y_len < q_rows * latent {
         return Err(GpuError::shape(
             what,
             format!("y.len() {y_len} < m*n_heads*latent = {}", q_rows * latent),
         ));
     }
-    Ok(())
+    Ok((q_rows, segs))
 }
 
 /// The segment pass's inputs, shared by its three entries: [`check_flash`]
 /// without a `y`, then the partials at [`segments_for`]`(kv.rows())`.
-/// `parts` is `(part_v.len(), part_ms.len())`. Returns the query rows.
+/// `parts` is `(part_v.len(), part_ms.len())`. Returns the query rows and
+/// the segment count, the launch grid's two factors.
 fn check_seg(
     what: &'static str,
     q_len: usize,
@@ -3287,17 +3282,11 @@ fn check_seg(
     n_keys_len: usize,
     geom: FlashGeom,
     parts: (usize, usize),
-) -> Result<usize, GpuError> {
+) -> Result<(usize, usize), GpuError> {
     let q_rows = check_flash(what, q_len, kv, n_keys_len, geom, None)?;
-    check_partials(
-        what,
-        parts.0,
-        parts.1,
-        q_rows,
-        segments_for(kv.rows()),
-        geom.latent_dims,
-    )?;
-    Ok(q_rows)
+    let segs = segments_for(kv.rows());
+    check_partials(what, parts.0, parts.1, q_rows, segs, geom.latent_dims)?;
+    Ok((q_rows, segs))
 }
 
 /// The geometry both flash entries share: the block width is the latent

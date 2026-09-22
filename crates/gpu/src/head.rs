@@ -110,10 +110,12 @@ impl Head {
         })
     }
 
+    /// The hidden width the head's norm and projection take.
     pub fn hidden(&self) -> usize {
         self.hidden
     }
 
+    /// The vocabulary size, the logit count the projection writes.
     pub fn n_vocab(&self) -> usize {
         self.n_vocab
     }
@@ -188,7 +190,7 @@ impl Head {
 
     /// The chain's input buffer — the assembly round's write target, so the
     /// last block's residual add lands directly in the head.
-    pub fn input_mut(&mut self) -> &mut DeviceBuffer<f32> {
+    pub(crate) fn input_mut(&mut self) -> &mut DeviceBuffer<f32> {
         &mut self.x
     }
 

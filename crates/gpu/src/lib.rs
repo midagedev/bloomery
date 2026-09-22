@@ -16,16 +16,23 @@
 //! launch contracts bind every buffer length as products of those scalars —
 //! the grammar has no division, so the ceils travel as arguments.
 
+#![allow(
+    rustdoc::private_intra_doc_links,
+    reason = "public docs name crate-private constants and kernels on purpose: the crate is \
+              not published, its docs are read in source or with --document-private-items, \
+              and the link keeps the name checkable"
+)]
+
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-pub mod cores;
+pub(crate) mod cores;
 pub mod elem;
 pub mod flash;
 pub mod fused;
-pub mod graph;
+pub(crate) mod graph;
 pub mod head;
 pub mod model;
 pub mod moe_fused;
@@ -33,12 +40,12 @@ pub mod probe;
 pub mod q5;
 pub mod q8f32;
 pub mod router;
-pub mod tensor;
+pub(crate) mod tensor;
 pub mod weights;
 
 pub use ::model::attn::MlaParams;
 pub use graph::Graph;
-pub use model::{GpuModel, mla_width};
+pub use model::GpuModel;
 pub use tensor::{DeviceTensor, Q8Act};
 
 /// Host-side failure: context creation, module loading, device allocation,
@@ -1325,7 +1332,7 @@ impl Gpu {
     /// Create the context on CUDA device `device`, the engine stream, and
     /// load every device module of this crate into that context — the
     /// K-quant module here and one per kernel file. Load-time only.
-    pub fn with_device(device: usize) -> Result<Gpu, GpuError> {
+    pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
         let ctx = CudaContext::new(device)?;
         let stream = ctx.new_stream()?;
         // SAFETY: this package owns the embedded device bundle produced for
@@ -1373,17 +1380,18 @@ impl Gpu {
 
     /// The fused block kernels (P0b): norm+quantize, gate·up·swiglu,
     /// down+residual — bit-identical to the per-op path they replace.
-    pub fn fused(&self) -> &fused::FusedKernels {
+    pub(crate) fn fused(&self) -> &fused::FusedKernels {
         &self.fused
     }
 
     /// The fused MoE kernels: six experts' gate·up·swiglu in one launch and
     /// the weighted combine (+shexp, +residual) in one — bit-identical to
     /// the per-op `_sel` path they replace.
-    pub fn moe_fused(&self) -> &moe_fused::MoeFusedKernels {
+    pub(crate) fn moe_fused(&self) -> &moe_fused::MoeFusedKernels {
         &self.moe_fused
     }
 
+    /// The CUDA context this device's buffers and modules live in.
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.ctx
     }
@@ -1419,7 +1427,7 @@ impl Gpu {
     /// `enqueue_quantize_q8_1` runs, on a base-offset slice of a wider
     /// buffer, so the quantized bytes equal a copy-then-quantize. Asynchronous,
     /// allocation-free, capturable.
-    pub fn enqueue_quantize_q8_1_at(
+    pub(crate) fn enqueue_quantize_q8_1_at(
         &self,
         x: &DeviceBuffer<f32>,
         x0: usize,
@@ -1470,7 +1478,7 @@ impl Gpu {
     /// the same bytes the two `enqueue_quantize_q8_1_at` calls write. Both
     /// scratches must have the same shape (one grid covers both halves).
     /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_quantize_q8_1_pair(
+    pub(crate) fn enqueue_quantize_q8_1_pair(
         &self,
         x: &DeviceBuffer<f32>,
         a0: usize,

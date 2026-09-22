@@ -65,7 +65,7 @@ pub const ARGMAX_WARPS: usize = ARGMAX_THREADS / 32;
 /// super-block; the scale window funnels the 2-mod-4 case, single bytes load
 /// from their covering words), `v16 < 256`.
 #[inline(always)]
-pub fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
+pub(crate) fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
     let field = (v16 >> 5) & 3;
     let qs_byte = 32 * (v16 >> 7) + 16 * ((v16 >> 4) & 1) + (v16 & 15);
     // Single bytes load directly from their covering word — the value's qs
@@ -121,7 +121,7 @@ pub fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
 ///
 /// Caller contract: `base + k <= x.len()`, `tid < RMS_THREADS`.
 #[inline(always)]
-pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
+pub(crate) fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
     let mut acc = 0.0f32;
     let mut it = tid;
     while it < k {
@@ -137,7 +137,7 @@ pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
 /// tree `((w0+w1)+(w2+w3)) + ((w4+w5)+(w6+w7))`. This order is the gate: it
 /// is what makes the fused norm's scale equal the op path's.
 #[inline(always)]
-pub fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
+pub(crate) fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
     ((w[0] + w[1]) + (w[2] + w[3])) + ((w[4] + w[5]) + (w[6] + w[7]))
 }
 
@@ -146,7 +146,7 @@ pub fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
 /// reference sums the squares in f64 serially; the device's fixed f32
 /// lane/butterfly tree moves last ulps only, which the gate's band owns.
 #[inline(always)]
-pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
+pub(crate) fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
     let mean = sum_sq / k as f32;
     1.0 / (mean + eps).sqrt()
 }
@@ -155,7 +155,7 @@ pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
 /// pairs are (2i, 2i+1), not NeoX split halves): `y0 = x0·cos − x1·sin`,
 /// `y1 = x0·sin + x1·cos`, plain multiplies.
 #[inline(always)]
-pub fn rope_pair_core(x0: f32, x1: f32, c: f32, s: f32) -> (f32, f32) {
+pub(crate) fn rope_pair_core(x0: f32, x1: f32, c: f32, s: f32) -> (f32, f32) {
     (x0 * c - x1 * s, x0 * s + x1 * c)
 }
 
@@ -163,7 +163,7 @@ pub fn rope_pair_core(x0: f32, x1: f32, c: f32, s: f32) -> (f32, f32) {
 /// then one multiply. The device `expf` and the host's differ in the last
 /// ulps; the gate bands that distance and prints the measured max.
 #[inline(always)]
-pub fn silu_mul(g: f32, u: f32) -> f32 {
+pub(crate) fn silu_mul(g: f32, u: f32) -> f32 {
     g / (1.0 + (-g).exp()) * u
 }
 
@@ -175,7 +175,7 @@ pub fn silu_mul(g: f32, u: f32) -> f32 {
 /// Caller contract: `down.len() >= rows * n_exp * m`, `w.len() >= n_exp * m`,
 /// `t < m`, `d < rows`.
 #[inline(always)]
-pub fn weighted_expert_sum(
+pub(crate) fn weighted_expert_sum(
     down: &[f32],
     w: &[f32],
     rows: u32,
@@ -206,7 +206,7 @@ pub fn weighted_expert_sum(
 /// rule. A total order on (value, index), so any fixed reduction tree over
 /// it is deterministic.
 #[inline(always)]
-pub fn argmax_take(v: f32, i: u32, best_v: f32, best_i: u32) -> bool {
+pub(crate) fn argmax_take(v: f32, i: u32, best_v: f32, best_i: u32) -> bool {
     v > best_v || (v == best_v && i < best_i)
 }
 

@@ -150,6 +150,7 @@ pub enum GapArm {
 }
 
 impl GapArm {
+    /// The kernel entry name this arm launches.
     pub fn name(self) -> &'static str {
         match self {
             GapArm::Plain => "gap_plain",
@@ -165,6 +166,7 @@ pub struct Probe {
 }
 
 impl Probe {
+    /// Load this file's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Probe, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.

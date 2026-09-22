@@ -43,7 +43,7 @@ use std::sync::Arc;
 /// Caller contract: `w.len() >= (row + 1) * k`, `x.len() >= m_cols * k`,
 /// `k` a positive multiple of 32, `m_cols` in 1..=8, `lane < 32`.
 #[inline(always)]
-pub fn f32_lane_partials(
+pub(crate) fn f32_lane_partials(
     w: &[f32],
     x: &[f32],
     k: u32,
@@ -135,7 +135,7 @@ pub const LANE_UNROLL: usize = 4;
 /// with [`LANE_UNROLL`] chunks' loads hoisted above the multiply-adds that
 /// consume them. Caller contract as [`f32_lane_partials`] with `m_cols` 1.
 #[inline(always)]
-pub fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, lane: usize) -> f32 {
+pub(crate) fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, lane: usize) -> f32 {
     let k = k as usize;
     let w_row = row * k;
     let iters = k >> 5;
@@ -190,7 +190,7 @@ pub fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, lane: usi
 /// k/32`, `x.len() >= x0 + m_cols * k`, `k` a positive multiple of 32,
 /// `m_cols` in 1..=8, `lane < 32`.
 #[inline(always)]
-pub fn q8_0_lane_partials(
+pub(crate) fn q8_0_lane_partials(
     qs: &[u32],
     d: &[f32],
     x: &[f32],
@@ -278,7 +278,7 @@ pub fn q8_0_lane_partials(
 /// hoisted above the multiply-adds that consume them. Caller contract as
 /// [`q8_0_lane_partials`] with `m_cols` 1.
 #[inline(always)]
-pub fn q8_0_lane_partial_1col(
+pub(crate) fn q8_0_lane_partial_1col(
     qs: &[u32],
     d: &[f32],
     x: &[f32],
@@ -347,7 +347,7 @@ pub fn q8_0_lane_partial_1col(
 /// left at 0.0. `m_cols` must be warp-uniform — a launch-wide constant in
 /// every caller.
 #[inline(always)]
-pub fn gemv_lane_sums(f: [f32; 8], m_cols: u32) -> [f32; 8] {
+pub(crate) fn gemv_lane_sums(f: [f32; 8], m_cols: u32) -> [f32; 8] {
     let s0 = warp::reduce_sum_f32(f[0]);
     if m_cols == 1 {
         return [s0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];

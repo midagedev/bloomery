@@ -41,10 +41,12 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         Ok(DeviceTensor { buf, rows, cols })
     }
 
+    /// Row count.
     pub fn rows(&self) -> usize {
         self.rows
     }
 
+    /// Elements per row.
     pub fn cols(&self) -> usize {
         self.cols
     }
@@ -56,7 +58,7 @@ impl<T: DeviceCopy> DeviceTensor<T> {
     }
 
     /// Writable view for `DisjointSlice<T>` / `&mut [T]` kernel parameters.
-    pub fn buf_mut(&mut self) -> &mut DeviceBuffer<T> {
+    pub(crate) fn buf_mut(&mut self) -> &mut DeviceBuffer<T> {
         &mut self.buf
     }
 }
@@ -119,18 +121,18 @@ impl Q8Act {
         })
     }
 
-    pub fn m(&self) -> usize {
+    pub(crate) fn m(&self) -> usize {
         self.m
     }
 
-    pub fn k(&self) -> usize {
+    pub(crate) fn k(&self) -> usize {
         self.k
     }
 
     /// Super-blocks per row (k/256) — the row geometry every K-quant gemv
     /// of this engine launches with.
     #[must_use]
-    pub fn n_sb(&self) -> usize {
+    pub(crate) fn n_sb(&self) -> usize {
         self.k / 256
     }
 }

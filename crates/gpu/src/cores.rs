@@ -61,7 +61,7 @@ pub(crate) fn half_to_f32(bits: u16) -> f32 {
 /// The u32 at a byte window sitting 2 mod 4, assembled from the two aligned
 /// words that cover it (Q3_K and Q6_K super-blocks are 110/210 bytes).
 #[inline(always)]
-pub fn funnel16(lo: u32, hi: u32) -> u32 {
+pub(crate) fn funnel16(lo: u32, hi: u32) -> u32 {
     (lo >> 16) | (hi << 16)
 }
 
@@ -72,7 +72,7 @@ pub fn funnel16(lo: u32, hi: u32) -> u32 {
 /// warp): the packed little-endian byte word, and the lane-local signed
 /// quad sum the s8 butterfly starts from.
 #[inline(always)]
-pub fn q8_quad(v: [f32; 4], d: f32) -> (u32, i32) {
+pub(crate) fn q8_quad(v: [f32; 4], d: f32) -> (u32, i32) {
     let q0 = ((v[0] / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
     let q1 = ((v[1] / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
     let q2 = ((v[2] / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
@@ -87,21 +87,21 @@ pub fn q8_quad(v: [f32; 4], d: f32) -> (u32, i32) {
 /// v4's bit 3 selects the lo/hi half of the slot and is dropped here (the
 /// store combines this lane's word with its lane^8 partner's).
 #[inline(always)]
-pub fn q3_slot(v4: u32) -> u32 {
+pub(crate) fn q3_slot(v4: u32) -> u32 {
     64 * (v4 >> 7) + 32 * ((v4 >> 4) & 1) + 16 * ((v4 >> 6) & 1) + 8 * ((v4 >> 5) & 1) + (v4 & 7)
 }
 
 /// q4 slot of v4: the gemv reads word i of iteration it at 256*it + 32*i +
 /// lane — a permutation per 4-super-block group.
 #[inline(always)]
-pub fn q4_slot(v4: u32) -> u32 {
+pub(crate) fn q4_slot(v4: u32) -> u32 {
     256 * (v4 >> 8) + 32 * (v4 & 7) + 8 * ((v4 >> 6) & 3) + ((v4 >> 3) & 7)
 }
 
 /// q6 slot of v4: the gemv reads word i of iteration it at 128*it + 32*i +
 /// lane — a permutation per 2-super-block group.
 #[inline(always)]
-pub fn q6_slot(v4: u32) -> u32 {
+pub(crate) fn q6_slot(v4: u32) -> u32 {
     128 * (v4 >> 7) + 32 * (v4 & 3) + 16 * ((v4 >> 6) & 1) + ((v4 >> 2) & 15)
 }
 
@@ -122,7 +122,7 @@ pub(crate) fn q4k_nibble(qsw: u32, nib_sh: u32) -> u32 {
 /// the eight loads is 32 lane-consecutive words across the warp).
 /// SAFETY: callers keep `qb + 7*32` inside one column's q8 words.
 #[inline(always)]
-pub fn q4k_a_chain(vi: &[u32; 8], q: &[u32], qb: usize) -> i32 {
+pub(crate) fn q4k_a_chain(vi: &[u32; 8], q: &[u32], qb: usize) -> i32 {
     // SAFETY: qb + 224 stays inside the caller's column span by this fn's
     // contract: within quad group g the largest qb is 256*g + 31, so the
     // last load is at 256*g + 255 < 256*ceil(n_sb/4), the column's words.
@@ -153,7 +153,7 @@ pub fn q4k_a_chain(vi: &[u32; 8], q: &[u32], qb: usize) -> i32 {
 /// (w2,w3) for s>=4; the s>=4 branch borrows bytes s-4 and s for the 6-bit
 /// high parts.
 #[inline(always)]
-pub fn q4k_scale_min(s: usize, w1: u32, w2: u32, w3: u32) -> (i32, i32) {
+pub(crate) fn q4k_scale_min(s: usize, w1: u32, w2: u32, w3: u32) -> (i32, i32) {
     if s < 4 {
         let sh = 8 * s as u32;
         (((w1 >> sh) & 63) as i32, ((w2 >> sh) & 63) as i32)
@@ -173,7 +173,7 @@ pub fn q4k_scale_min(s: usize, w1: u32, w2: u32, w3: u32) -> (i32, i32) {
 /// quantized activations is d8*(cda*A + cdb*B) with A = dp4a(nib-8, q8)
 /// and B = sum q8 — the -8 offset moves 8*B between the chains.
 #[inline(always)]
-pub fn q4k_coeff(d: f32, dmin: f32, sc: i32, mi: i32) -> (f32, f32) {
+pub(crate) fn q4k_coeff(d: f32, dmin: f32, sc: i32, mi: i32) -> (f32, f32) {
     let cda = d * sc as f32;
     let cdb = 8.0 * d * sc as f32 - dmin * mi as f32;
     (cda, cdb)
@@ -189,7 +189,7 @@ pub fn q4k_coeff(d: f32, dmin: f32, sc: i32, mi: i32) -> (f32, f32) {
 /// SAFETY: callers keep `wk + 35` — the super-block's last word — inside
 /// `w`.
 #[inline(always)]
-pub fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
+pub(crate) fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
     // d/dmin word + the 12 scale bytes in words 1..3.
     // SAFETY: wk + 3 <= wk + 35, inside `w` by this fn's contract.
     let (w0, w1, w2, w3) = unsafe {
@@ -287,7 +287,7 @@ fn q4k_iter_term(
 /// Q3_K has no such constant on purpose: the same lever measured flat on
 /// its walk, so [`q3k_row_dot_1col`] keeps one iteration per pass. The two
 /// walks load alike per weight — what differs is which one was waiting.
-pub const Q4K_ITER_UNROLL: u32 = 2;
+pub(crate) const Q4K_ITER_UNROLL: u32 = 2;
 
 /// One row's Q4_K dot product against a single activation column —
 /// [`q4k_row_dot`]'s column 0, the same loads and the same accumulation
@@ -304,7 +304,7 @@ pub const Q4K_ITER_UNROLL: u32 = 2;
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub fn q4k_row_dot_1col(
+pub(crate) fn q4k_row_dot_1col(
     w: &[u32],
     q: &[u32],
     s8: &[i32],
@@ -401,7 +401,7 @@ pub fn q4k_row_dot_1col(
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub fn q4k_row_dot(
+pub(crate) fn q4k_row_dot(
     w: &[u32],
     q: &[u32],
     s8: &[i32],
@@ -594,7 +594,7 @@ pub fn q4k_row_dot(
 /// scale words (12 scale bytes at super-block +96): t0..t3 hold the 16
 /// sub-block scale bytes, the 2-bit high parts borrowed from a2w.
 #[inline(always)]
-pub fn q3k_aux_scales(a0w: u32, a1w: u32, a2w: u32) -> [u32; 4] {
+pub(crate) fn q3k_aux_scales(a0w: u32, a1w: u32, a2w: u32) -> [u32; 4] {
     let kmask1 = 0x03030303u32;
     let kmask2 = 0x0f0f0f0fu32;
     [
@@ -609,7 +609,7 @@ pub fn q3k_aux_scales(a0w: u32, a1w: u32, a2w: u32) -> [u32; 4] {
 /// (the 4-way if-chain keeps constant shifts out of local memory), minus
 /// the 32 offset folded into every Q3_K scale byte.
 #[inline(always)]
-pub fn q3k_sub_scale(t: &[u32; 4], sx: usize) -> i32 {
+pub(crate) fn q3k_sub_scale(t: &[u32; 4], sx: usize) -> i32 {
     let wx = if sx < 4 {
         t[2]
     } else if sx < 8 {
@@ -637,7 +637,7 @@ pub fn q3k_sub_scale(t: &[u32; 4], sx: usize) -> i32 {
 /// decode keep one owner. `q3k_aux_scales` still builds the full sixteen for
 /// the dequant-to-rows kernel, which wants every sub-block.
 #[inline(always)]
-pub fn q3k_sub_scales4(a0w: u32, a1w: u32, a2w: u32, s0: usize) -> [i32; 4] {
+pub(crate) fn q3k_sub_scales4(a0w: u32, a1w: u32, a2w: u32, s0: usize) -> [i32; 4] {
     // 8*(s0&1) picks the byte pair inside the word, 4*(s0>>3) the nibble
     // half. Both come from the lane index alone, so the shift is loop
     // invariant and lifts out of the row walk.
@@ -658,7 +658,7 @@ pub fn q3k_sub_scales4(a0w: u32, a1w: u32, a2w: u32, s0: usize) -> [i32; 4] {
 /// vil - 4*(1 - hbit). The |0x80 / ^0x80 bias makes the per-byte subtract
 /// borrow-free; dp4a_s32 reads the bytes as signed.
 #[inline(always)]
-pub fn q3k_dequant(vl: u32, vh1: u32) -> [u32; 4] {
+pub(crate) fn q3k_dequant(vl: u32, vh1: u32) -> [u32; 4] {
     [
         (((vl & 0x03030303) | 0x80808080).wrapping_sub((vh1 << 2) & 0x04040404)) ^ 0x80808080,
         (((vl >> 2) & 0x03030303) | 0x80808080).wrapping_sub(((vh1 >> 1) << 2) & 0x04040404)
@@ -675,7 +675,7 @@ pub fn q3k_dequant(vl: u32, vh1: u32) -> [u32; 4] {
 /// each scaled in int by its sub-block scale so one f32 FMA per column
 /// carries both shared scales.
 #[inline(always)]
-pub fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32 {
+pub(crate) fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32 {
     dp4a_s32(vi[0], w01 as u32, 0) * sc[0]
         + dp4a_s32(vi[1], (w01 >> 32) as u32, 0) * sc[1]
         + dp4a_s32(vi[2], w23 as u32, 0) * sc[2]
@@ -692,7 +692,12 @@ pub fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32 {
 /// SAFETY: callers keep the super-block at `base` inside a row whose
 /// ceil(bytes/4) words are all in `w`.
 #[inline(always)]
-pub fn q3k_sb_decode(w: &[u32], base: usize, w16: usize, s0: usize) -> ([u32; 4], [i32; 4], f32) {
+pub(crate) fn q3k_sb_decode(
+    w: &[u32],
+    base: usize,
+    w16: usize,
+    s0: usize,
+) -> ([u32; 4], [i32; 4], f32) {
     // A super-block sits 0 or 2 mod 4 depending on the row's own offset
     // too (odd n_sb shifts every other row), so the funnel select comes
     // from the byte window, not from the super-block index.
@@ -824,7 +829,7 @@ fn q3k_iter_term(
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub fn q3k_row_dot_1col(
+pub(crate) fn q3k_row_dot_1col(
     w: &[u32],
     q: &[u64],
     d8: &[f32],
@@ -896,7 +901,7 @@ pub fn q3k_row_dot_1col(
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub fn q3k_row_dot(
+pub(crate) fn q3k_row_dot(
     w: &[u32],
     q: &[u64],
     d8: &[f32],
@@ -1096,7 +1101,7 @@ pub fn q3k_row_dot(
 
 /// Sub-block scale: byte w16 of the four funneled scale words, signed.
 #[inline(always)]
-pub fn q6k_sub_scale(sw: &[u32; 4], w16: usize) -> i32 {
+pub(crate) fn q6k_sub_scale(sw: &[u32; 4], w16: usize) -> i32 {
     let wx = if w16 < 4 {
         sw[0]
     } else if w16 < 8 {
@@ -1113,7 +1118,7 @@ pub fn q6k_sub_scale(sw: &[u32; 4], w16: usize) -> i32 {
 /// (nibble | high-bits<<4, then one borrow-free subtract with the |0x80
 /// bias).
 #[inline(always)]
-pub fn q6k_dequant(ql: u32, qh: u32, nib_sh: u32, hib_sh: u32) -> u32 {
+pub(crate) fn q6k_dequant(ql: u32, qh: u32, nib_sh: u32, hib_sh: u32) -> u32 {
     (((((ql >> nib_sh) & 0x0f0f0f0f) | (((qh >> hib_sh) & 0x03030303) << 4)) | 0x80808080)
         .wrapping_sub(0x20202020))
         ^ 0x80808080
@@ -1122,7 +1127,7 @@ pub fn q6k_dequant(ql: u32, qh: u32, nib_sh: u32, hib_sh: u32) -> u32 {
 /// One lane's whole per-column dp4a chain over its four vi words — no B
 /// chain, no min term.
 #[inline(always)]
-pub fn q6k_chain(vi: &[u32; 4], q: &[u32; 4]) -> i32 {
+pub(crate) fn q6k_chain(vi: &[u32; 4], q: &[u32; 4]) -> i32 {
     let a = dp4a_s32(vi[0], q[0], 0);
     let a = dp4a_s32(vi[1], q[1], a);
     let a = dp4a_s32(vi[2], q[2], a);

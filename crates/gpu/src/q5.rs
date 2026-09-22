@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// `b < k_blocks` and the row based at `wbase` carries `q_stride >= 256`
 /// code words with `q_stride >= 256*((b>>5)+1)`.
 #[inline(always)]
-pub fn q5_code_words(w: &[u32], wbase: usize, b: usize) -> [u32; 8] {
+pub(crate) fn q5_code_words(w: &[u32], wbase: usize, b: usize) -> [u32; 8] {
     let base = wbase + 256 * (b >> 5) + (b & 31);
     // SAFETY: base + 224 <= wbase + 256*(b>>5) + 255 < wbase + q_stride by
     // this fn's contract.
@@ -50,7 +50,7 @@ pub fn q5_code_words(w: &[u32], wbase: usize, b: usize) -> [u32; 8] {
 ///
 /// SAFETY: callers keep `qb + 7*32` inside one column's q8 word span.
 #[inline(always)]
-pub fn q5_a_chain(cw: &[u32; 8], q: &[u32], qb: usize) -> i32 {
+pub(crate) fn q5_a_chain(cw: &[u32; 8], q: &[u32], qb: usize) -> i32 {
     // SAFETY: qb + 224 is inside the caller's column span by this fn's
     // contract (max qb within a window is 256*(b>>5) + (b&31), so + 224
     // stays under the next window boundary).
@@ -109,7 +109,7 @@ fn q5_block_col(cw: &[u32; 8], q: &[u32], qb: usize, d: f32, mds: f32, e: f32) -
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub fn q5_row_dot(
+pub(crate) fn q5_row_dot(
     w: &[u32],
     q: &[u32],
     d8: &[f32],
@@ -852,17 +852,17 @@ impl Q8Blocks32 {
     }
 
     /// Quantized columns available (the allocation width).
-    pub fn m(&self) -> usize {
+    pub(crate) fn m(&self) -> usize {
         self.m
     }
 
     /// Values per column.
-    pub fn k(&self) -> usize {
+    pub(crate) fn k(&self) -> usize {
         self.k
     }
 
     /// u32 words per column of `q` (window-padded; see the struct doc).
-    pub fn q_stride(&self) -> usize {
+    pub(crate) fn q_stride(&self) -> usize {
         self.q_stride
     }
 
@@ -982,6 +982,7 @@ pub struct Q5Kernels {
 }
 
 impl Q5Kernels {
+    /// Load this file's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Q5Kernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
@@ -1035,7 +1036,7 @@ impl Q5Kernels {
     /// `Gpu::enqueue_quantize_q8_1(xb, b)` write, so the two sources must
     /// not alias and the caller must have enqueued both producers first.
     /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_quantize_q8_pair(
+    pub(crate) fn enqueue_quantize_q8_pair(
         &self,
         stream: &CudaStream,
         xa: &DeviceBuffer<f32>,
