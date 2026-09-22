@@ -43,6 +43,18 @@
 //!   as ours. Free running gives one event per prompt and mis-aligns
 //!   `gen_margins` past the first difference; forcing gives `GEN` events per
 //!   prompt, each with the margin that belongs to it.
+//! - (1σ) on the same forced table, the continuous measure: the logits are
+//!   read back after every forced step, and `forced_sigma` prints σ, the RMS
+//!   of our top1-top2 margin signed toward the exact top1 minus the exact
+//!   margin, over every position; its bias; and the clear-position
+//!   disagreements a Gaussian of that width expects beside the ones counted.
+//!   σ is a diagnostic and never fails the gate: accuracy is not ranked
+//!   against speed (AGENTS.md, performance first). The host's argmax of the logits read back
+//!   must equal the chain's own token at every step (`host_argmax_diff`), or
+//!   the margins describe some other answer. `--margins PATH` writes one row
+//!   per position (`id step our_top1 our_margin exact_top1 exact_margin`) for
+//!   the offline judge. The lever that picks the flash kernel is read once
+//!   per process, so each flash arm is its own run with its own line.
 //! - (2) graph mode reproduces the eager sequence token for token on every
 //!   prompt — the eager-equals-replay arm every step gate has.
 //! - (3) determinism: two eager runs give identical tables.
@@ -74,7 +86,7 @@ use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{
     ExactRow, GreedyClass, GreedyRow, compare_forced, compare_forced_exact, compare_greedy,
-    exact_covers, read_exact, read_greedy,
+    exact_covers, read_exact, read_greedy, sigma_forced,
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, open_model};
@@ -119,7 +131,7 @@ const FORCED_FILE: &str = "greedy-ik-cuda-32.tsv";
 #[cfg(feature = "gpu")]
 const EXACT_FILE: &str = "exact-forced-32.tsv";
 
-/// PIN(2026-09-22) [잠정 — errsrc 뒤 재보정]: teacher-forced positions at
+/// PIN(2026-09-22): teacher-forced positions at
 /// which our argmax leaves the model's EXACT top1 (`exact-forced-32.tsv`)
 /// while the exact margin there is at least `MARGIN_FLOOR`. Derivation: the
 /// scalar segment pass (default levers) was measured on this set against
@@ -142,6 +154,9 @@ const EXACT_FILE: &str = "exact-forced-32.tsv";
 /// place it is read at. Forcing the reference's own path keeps both sides at
 /// the same position at every step, which makes all 1056 of them evidence
 /// and each margin the one that belongs to its disagreement.
+/// errsrc closed the recalibration: the cause is the 128-value activation
+/// block, which stays the default (performance first); 32-value blocks live
+/// only in `exact_ref --act ik`. The value stands.
 #[cfg(feature = "gpu")]
 const FORCED_PIN: usize = 6;
 
@@ -274,12 +289,45 @@ fn run_set(
     Ok(out)
 }
 
+/// The teacher-forced tables of [`run_forced`], indexed like the reference
+/// rows: our argmax at every forced step, our top1-top2 logit margin there,
+/// and every step at which the host's argmax of the downloaded logits is
+/// strictly above the chain's own token — `(id, step, chain, host)`. A margin
+/// is signed toward the chain's token, so one read off a different top1
+/// would be a meaningless σ term; the arm fails on any such step.
+#[cfg(feature = "gpu")]
+struct Forced {
+    tokens: Vec<Vec<u32>>,
+    margins: Vec<Vec<f32>>,
+    argmax_mismatch: Vec<(usize, usize, u32, u32)>,
+}
+
+/// The logits' top1-top2 margin taken at `top1`: `logits[top1]` minus the
+/// largest other logit, and the host's own argmax. A download, not a launch —
+/// the captured chain and its node count do not see it.
+#[cfg(feature = "gpu")]
+fn margin_at(logits: &[f32], top1: u32) -> (f32, u32) {
+    let at = logits[top1 as usize];
+    let mut best = 0usize;
+    let mut second = f32::NEG_INFINITY;
+    for (j, &v) in logits.iter().enumerate() {
+        if v.total_cmp(&logits[best]).is_gt() {
+            best = j;
+        }
+        if j != top1 as usize && v.total_cmp(&second).is_gt() {
+            second = v;
+        }
+    }
+    (at - second, best as u32)
+}
+
 /// One teacher-forced argmax table per reference row, in file order: fresh
 /// caches, the prompt fed one token at a time for step 0, then the
-/// REFERENCE's own token fed for each later step. `out[s]` is therefore our
-/// argmax at the position `reference.gen_ids[s]` holds, and the margin that
-/// belongs to it is `gen_margins[s]` — the alignment free running loses at
-/// its first difference.
+/// REFERENCE's own token fed for each later step. `tokens[i][s]` is therefore
+/// our argmax at the position `reference.gen_ids[s]` holds, and the margin
+/// that belongs to it is `gen_margins[s]` — the alignment free running loses
+/// at its first difference. After every step the head's logits are read back
+/// for our own margin there.
 ///
 /// The off-by-one is the trap: step `s` is reached by feeding `gen_ids[s-1]`,
 /// so the loop feeds the token BEFORE the one it is about to judge. A row is
@@ -290,8 +338,12 @@ fn run_forced(
     model: &mut GpuModel,
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
-) -> Result<Vec<Vec<u32>>, GateError> {
-    let mut out = Vec::with_capacity(reference.len());
+) -> Result<Forced, GateError> {
+    let mut out = Forced {
+        tokens: Vec::with_capacity(reference.len()),
+        margins: Vec::with_capacity(reference.len()),
+        argmax_mismatch: Vec::new(),
+    };
     for (r, p) in reference.iter().zip(prompts) {
         if r.id != p.id || r.n_tokens != p.tokens.len() {
             return Err(format!(
@@ -306,13 +358,61 @@ fn run_forced(
         model.reset()?;
         let len = r.gen_ids.len();
         let mut seq = Vec::with_capacity(len);
-        seq.push(model.step(&p.tokens)?);
-        for s in 1..len {
-            seq.push(model.step(&[r.gen_ids[s - 1]])?);
+        let mut margins = Vec::with_capacity(len);
+        for s in 0..len {
+            let token = if s == 0 {
+                model.step(&p.tokens)?
+            } else {
+                model.step(&[r.gen_ids[s - 1]])?
+            };
+            let logits = model.logits()?;
+            let (margin, host) = margin_at(&logits, token);
+            if logits[host as usize] > logits[token as usize] {
+                out.argmax_mismatch.push((r.id, s, token, host));
+            }
+            seq.push(token);
+            margins.push(margin);
         }
-        out.push(seq);
+        out.tokens.push(seq);
+        out.margins.push(margins);
     }
     Ok(out)
+}
+
+/// One row per judged forced position — `id step our_top1 our_margin
+/// exact_top1 exact_margin` — for the offline judge
+/// (`docs/research/errsrc/tools/errsrc-judge.py`) to read engine data
+/// instead of a simulation. Written to `path.tmp.<pid>`, then renamed.
+#[cfg(feature = "gpu")]
+fn write_margins(
+    path: &std::path::Path,
+    forced: &Forced,
+    truth: &[ExactRow],
+) -> Result<usize, GateError> {
+    use std::fmt::Write as _;
+    let mut text = String::from(
+        "# gate_e2e --margins: teacher-forced arm against exact-forced-32.tsv; \
+         our_margin is signed toward our_top1\n#id\tstep\tour_top1\tour_margin\texact_top1\t\
+         exact_margin\n",
+    );
+    let mut rows = 0usize;
+    for ((t, g), e) in forced.tokens.iter().zip(&forced.margins).zip(truth) {
+        for s in 0..t.len().min(g.len()).min(e.top1.len()) {
+            writeln!(
+                text,
+                "{}\t{s}\t{}\t{:.6}\t{}\t{:.6}",
+                e.id, t[s], g[s], e.top1[s], e.margins[s]
+            )?;
+            rows += 1;
+        }
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, text).map_err(|e| format!("write_margins: {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("write_margins: rename to {}: {e}", path.display()))?;
+    Ok(rows)
 }
 
 /// The teacher-forced arm: run the forced tables, check them against the
@@ -333,16 +433,20 @@ fn check_forced(
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
     eager: &[Vec<u32>],
+    margins_out: Option<&std::path::Path>,
 ) -> Result<bool, GateError> {
-    let forced = run_forced(model, prompts, reference)?;
+    let run = run_forced(model, prompts, reference)?;
+    let forced = &run.tokens;
     let step0: Vec<usize> = (0..forced.len())
         .filter(|&i| eager[i].first() != forced[i].first())
         .collect();
+    let selfcheck = step0.is_empty() && run.argmax_mismatch.is_empty();
     println!(
-        "forced_selfcheck rows={} step0_eager_vs_forced_diff={} {}",
+        "forced_selfcheck rows={} step0_eager_vs_forced_diff={} host_argmax_diff={} {}",
         forced.len(),
         step0.len(),
-        if step0.is_empty() { "ok" } else { "FAIL" }
+        run.argmax_mismatch.len(),
+        if selfcheck { "ok" } else { "FAIL" }
     );
     for &i in &step0 {
         println!(
@@ -354,8 +458,14 @@ fn check_forced(
             forced[i].first()
         );
     }
+    for (id, step, chain, host) in &run.argmax_mismatch {
+        println!(
+            "  prompt {id} step {step}: the chain's argmax {chain} is below the downloaded \
+             logits' max at {host} — the logits read back are not the ones the argmax saw"
+        );
+    }
 
-    let ik = compare_forced(&forced, reference, MARGIN_FLOOR);
+    let ik = compare_forced(forced, reference, MARGIN_FLOOR);
     println!(
         "forced_ik positions={} disagree={} buckets=[{} {} {} {}] ge_floor={} max_margin={} \
          (diagnostic)",
@@ -380,7 +490,7 @@ fn check_forced(
             return Ok(false);
         }
     };
-    let report = compare_forced_exact(&forced, &truth, MARGIN_FLOOR);
+    let report = compare_forced_exact(forced, &truth, MARGIN_FLOOR);
     println!(
         "{:>3} {:>4} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "id", "step", "ours", "exact", "ik", "exact_m", "ik_m"
@@ -413,7 +523,20 @@ fn check_forced(
             .map_or_else(|| "-".to_string(), |m| format!("{m:.3}")),
         if pass { "ok" } else { "FAIL" }
     );
-    Ok(pass)
+
+    match sigma_forced(forced, &run.margins, &truth, MARGIN_FLOOR) {
+        Some(sg) => println!(
+            "forced_sigma positions={} sigma={:.4} bias={:+.4} expected_ge_floor={:.2} \
+             actual_ge_floor={} (diagnostic)",
+            sg.positions, sg.sigma, sg.bias, sg.expected_ge_floor, sg.actual_ge_floor
+        ),
+        None => println!("forced_sigma positions=0 (diagnostic)"),
+    }
+    if let Some(path) = margins_out {
+        let rows = write_margins(path, &run, &truth)?;
+        println!("forced_margins rows={rows} path={}", path.display());
+    }
+    Ok(pass && selfcheck)
 }
 
 /// The exact truth for the forced arm, checked against what it must have
@@ -499,6 +622,24 @@ fn first_diff(a: &[Vec<u32>], b: &[Vec<u32>]) -> Option<(usize, usize)> {
     })
 }
 
+/// The gate's one flag: `--margins PATH` writes the forced arm's per-position
+/// margins (see [`write_margins`]). Anything else is an error, not ignored.
+#[cfg(feature = "gpu")]
+fn parse_args() -> Result<Option<std::path::PathBuf>, GateError> {
+    let mut margins = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--margins" => {
+                let path = args.next().ok_or("gate_e2e: --margins needs a path")?;
+                margins = Some(std::path::PathBuf::from(path));
+            }
+            other => return Err(format!("gate_e2e: unknown argument {other:?}").into()),
+        }
+    }
+    Ok(margins)
+}
+
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_e2e", run())
@@ -506,6 +647,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
+    let margins_out = parse_args()?;
     let mut ok = true;
     let prompts_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/prompts.tsv");
@@ -657,7 +799,13 @@ fn run() -> Result<(), GateError> {
     );
 
     // (1t) The decision arm.
-    if !check_forced(&mut model, &prompts, &reference, &eager)? {
+    if !check_forced(
+        &mut model,
+        &prompts,
+        &reference,
+        &eager,
+        margins_out.as_deref(),
+    )? {
         ok = false;
     }
 

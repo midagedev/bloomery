@@ -31,6 +31,10 @@
 //! but the right answer and its margin at each position are the model's own
 //! exact ones, so a position the reference itself gets wrong is not counted
 //! against us, and one where we agree with the reference's wrong answer is.
+//!
+//! `sigma_forced` reads the same table and truth as a continuous quantity:
+//! the RMS distance of our margin from the exact margin over every position,
+//! and the clear-position disagreement count that width predicts.
 
 use std::path::Path;
 
@@ -594,6 +598,104 @@ fn tally_forced<'a>(
     }
 }
 
+/// The continuous measure of a teacher-forced table against the exact truth:
+/// how far our top1-top2 margin sits from the model's exact one, over every
+/// judged position. A count of clear disagreements moves in steps of one on a
+/// sample of a handful; this moves with every position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SigmaReport {
+    /// Positions judged: the sum over rows of the shortest of our tokens, our
+    /// margins and the truth's steps.
+    pub positions: usize,
+    /// RMS of `s_i - m_i`, where `m_i` is the exact margin and `s_i` our
+    /// margin signed toward the exact top1: `+margin` where our top1 is the
+    /// exact top1, `-margin` where it is not (the exact top1 is then at best
+    /// our runner-up).
+    pub sigma: f64,
+    /// Mean of `s_i - m_i`.
+    pub bias: f64,
+    /// `Σ Φ(-m_i / σ)` over the positions with `m_i >= margin_floor` — the
+    /// disagreements a Gaussian error of width σ predicts there. Only the
+    /// clear positions: near ties the prediction overshoots, because the
+    /// quantization error is bounded and not Gaussian-tailed.
+    pub expected_ge_floor: f64,
+    /// Positions with `m_i >= margin_floor` whose top1 is not the exact top1.
+    pub actual_ge_floor: usize,
+}
+
+/// [`SigmaReport`] of a forced table against the exact truth. `top1[i][s]`
+/// is our argmax at the same position [`compare_forced_exact`] judges, and
+/// `margins[i][s]` our top1-top2 logit margin there (non-negative when `top1`
+/// is the logits' own argmax). A row is judged over the shortest of the three
+/// lengths. Returns `None` when no position is judged.
+///
+/// # Panics
+///
+/// Panics when the three tables do not have the same number of rows, for
+/// the reason [`compare_forced`] does.
+#[must_use]
+pub fn sigma_forced(
+    top1: &[Vec<u32>],
+    margins: &[Vec<f32>],
+    exact: &[ExactRow],
+    margin_floor: f32,
+) -> Option<SigmaReport> {
+    assert!(
+        top1.len() == exact.len() && margins.len() == exact.len(),
+        "sigma_forced: {} tables and {} margin tables for {} truth rows",
+        top1.len(),
+        margins.len(),
+        exact.len()
+    );
+    // (s_i - m_i, m_i, top1 matches) per judged position.
+    let mut d = Vec::new();
+    for ((t, g), e) in top1.iter().zip(margins).zip(exact) {
+        let span = t.len().min(g.len()).min(e.top1.len());
+        for s in 0..span {
+            let hit = t[s] == e.top1[s];
+            let ours = f64::from(g[s]);
+            let signed = if hit { ours } else { -ours };
+            let m = f64::from(e.margins[s]);
+            d.push((signed - m, m, hit));
+        }
+    }
+    if d.is_empty() {
+        return None;
+    }
+    let n = d.len() as f64;
+    let sigma = (d.iter().map(|&(x, _, _)| x * x).sum::<f64>() / n).sqrt();
+    let bias = d.iter().map(|&(x, _, _)| x).sum::<f64>() / n;
+    let floor = f64::from(margin_floor);
+    let clear = d.iter().filter(|&&(_, m, _)| m >= floor);
+    let expected_ge_floor = clear
+        .clone()
+        .map(|&(_, m, _)| std_normal_cdf(-m / sigma))
+        .sum();
+    let actual_ge_floor = clear.filter(|&&(_, _, hit)| !hit).count();
+    Some(SigmaReport {
+        positions: d.len(),
+        sigma,
+        bias,
+        expected_ge_floor,
+        actual_ge_floor,
+    })
+}
+
+/// Φ, the standard normal CDF, through Abramowitz & Stegun 7.1.26 for erfc
+/// (absolute error under 1.5e-7) — std has no `erf`, and two decimals of an
+/// expected count need no more.
+#[must_use]
+pub fn std_normal_cdf(z: f64) -> f64 {
+    let x = z.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let tail = 0.5 * poly * (-x * x).exp();
+    if z >= 0.0 { 1.0 - tail } else { tail }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +872,60 @@ mod tests {
         assert_eq!(g.disagree.len(), 3);
         assert_eq!(g.disagree_ge_floor, 1);
         assert_eq!((g.disagree[1].id, g.disagree[1].step), (1, 0));
+    }
+
+    /// σ signs our margin toward the exact top1, so a disagreement adds its
+    /// margin to the error instead of cancelling it; the expected and actual
+    /// counts read only the positions at or above the floor, the floor
+    /// itself included; a row is judged over the shortest of its three
+    /// lengths.
+    #[test]
+    fn sigma_forced_signs_toward_the_truth_and_counts_only_clear_positions() {
+        let exact = vec![
+            ExactRow {
+                id: 0,
+                top1: vec![10, 15, 12],
+                top2: vec![7, 11, 13],
+                margins: vec![1.5, 1.0, 9.0],
+            },
+            ExactRow {
+                id: 1,
+                top1: vec![20],
+                top2: vec![21],
+                margins: vec![0.5],
+            },
+        ];
+        // Row 0: agree by 2.0 (d +0.5), disagree by 0.5 (d -1.5); step 2 has
+        // no margin of ours and is not judged. Row 1: agree by 0.3 (d -0.2),
+        // exact margin exactly on the floor.
+        let top1 = vec![vec![10, 11, 12], vec![20]];
+        let margins = vec![vec![2.0, 0.5], vec![0.3]];
+        let r = sigma_forced(&top1, &margins, &exact, 0.5).unwrap();
+        assert_eq!(r.positions, 3);
+        let sigma = (2.54f64 / 3.0).sqrt();
+        assert!((r.sigma - sigma).abs() < 1e-6, "{}", r.sigma);
+        assert!((r.bias - (-0.4)).abs() < 1e-6, "{}", r.bias);
+        let want = std_normal_cdf(-1.5 / sigma)
+            + std_normal_cdf(-1.0 / sigma)
+            + std_normal_cdf(-0.5 / sigma);
+        assert!((r.expected_ge_floor - want).abs() < 1e-9);
+        assert_eq!(r.actual_ge_floor, 1);
+
+        assert_eq!(sigma_forced(&[vec![]], &[vec![]], &exact[..1], 0.5), None);
+    }
+
+    /// Φ against tabulated values, both tails.
+    #[test]
+    fn std_normal_cdf_matches_the_table() {
+        for (z, want) in [
+            (0.0, 0.5),
+            (-1.0, 0.158_655_25),
+            (-2.0, 0.022_750_13),
+            (-3.0, 0.001_349_90),
+            (1.0, 0.841_344_75),
+        ] {
+            assert!((std_normal_cdf(z) - want).abs() < 2e-7, "Φ({z})");
+        }
     }
 
     /// `read_exact` groups contiguous steps per prompt and reads the header;

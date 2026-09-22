@@ -306,10 +306,7 @@ impl Model<'_> {
         let (g, t) = (self.g, self.threads);
         let p = self.p.clone();
         let (nh, nope, rd, vh, lat) = (p.n_head, p.nope, p.rope_dims, p.v_head, p.latent);
-        let q = self.mvq(
-            view(find(g, &format!("blk.{l}.attn_q.weight"))?, None)?,
-            x,
-        )?;
+        let q = self.mvq(view(find(g, &format!("blk.{l}.attn_q.weight"))?, None)?, x)?;
         let kva = self.mvq(
             view(find(g, &format!("blk.{l}.attn_kv_a_mqa.weight"))?, None)?,
             x,
