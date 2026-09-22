@@ -186,15 +186,26 @@ measure-sweep: build-decode
 # 시간 귀속. 러너가 임대와 증인을 소유한다 — 프로파일 표도 측정이고, 옆에서 빌드
 # 하나만 돌아도 site 간 비율이 흔들린다. 레벨 1(배분)과 2(단계)를 연달아 찍는다.
 # 같은 임대 안 A/B: `just ab-decode bloomery-<track> ...` (각 트리는 미리 build-decode).
+# 인자는 박스 `~/repo/` 아래 **디렉터리 이름**이다 — 맥 절대경로를 줘도 basename으로 바꾼다.
+# 맥 셸의 BLOOMERY_AB_ROUNDS·BLOOMERY_AB_ENVS·BLOOMERY_AB_IK는 ssh를 그냥 넘지 않으므로 여기서
+# 원격 명령줄 앞에 K=V로 실어 보낸다. BLOOMERY_AB_ENVS는 작은따옴표로 싸서 넘기므로 값 안의
+# 작은따옴표 하나가 그 인용을 깬다 — `K=V;K2=V2` 형태(이 변수의 문법 전부)는 안전하다.
+#   BLOOMERY_AB_ROUNDS=6 BLOOMERY_AB_ENVS="BLOOMERY_SPIN=0" just ab-decode bloomery-foo
 ab-decode *DIRS: build-decode
-    ./tools/box.sh 'bash tools/ref/ab-decode.sh {{DIRS}}'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    names=
+    for d in {{DIRS}}; do names="$names $(basename "$d")"; done
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS} ${BLOOMERY_AB_ENVS:+BLOOMERY_AB_ENVS='$BLOOMERY_AB_ENVS'} ${BLOOMERY_AB_IK:+BLOOMERY_AB_IK=$BLOOMERY_AB_IK} bash tools/ref/ab-decode.sh$names"
 
 measure-profile: build-decode
     ./tools/box.sh 'bash tools/ref/profile-measure.sh'
 
 # 참조 하네스(ggml에 링크하는 C++). 진실값과 기준 속도의 출처다.
+# build-qdot-ref.sh는 ik의 커널 테이블까지 링크하는 x4 하네스 넷을 짓고 **실행까지** 한다 —
+# gate-qdot의 hw 테스트 넷이 읽는 $BLOOMERY_DATA/ref/*-ik-dot.txt가 그 산출물이다.
 build-ref:
-    ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh'
+    ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh && bash tools/ref/build-qdot-ref.sh'
 
 # 의존성 감사. cuda-oxide가 rev로 고정돼 있는지가 핵심이다.
 deny:

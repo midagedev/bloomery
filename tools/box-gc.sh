@@ -33,7 +33,10 @@ self=$$
 anc=" $self "
 p=$self
 while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
-  p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+  # PPid from status, not field 4 of stat: a comm containing a space or a ')' shifts every
+  # field of stat, and the ancestor walk then stops at the wrong pid — which would put the
+  # scanning shell's own parent back among the candidates.
+  p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null)
   [ -n "$p" ] || break
   anc="$anc$p "
 done

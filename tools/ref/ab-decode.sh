@@ -29,6 +29,9 @@ witness() {
 }
 exec 9>/root/bloomery-cpu.lock
 flock -w 1800 9 || { echo "[lease] timed out" >&2; exit 75; }
+# 러너가 실제로 읽은 값. 맥 셸의 BLOOMERY_AB_* 는 ssh를 그냥 넘지 않는다(레시피가 실어 보낸다) —
+# 이 줄이 없으면 "env가 박스에 닿았나"를 바퀴 수를 세어 추측해야 했다.
+echo "[config] rounds=$ROUNDS n=$N trees=${bins[*]} envs=${BLOOMERY_AB_ENVS:-} ik=${BLOOMERY_AB_IK:-0}"
 witness pre
 # 팔 목록: 트리 팔("tree:<dir>")과 env 팔("env:<K=V ...>")을 한 줄로 세우고 바퀴마다 한 칸씩
 # 돌린다. 막는 실패: 위치 편향 — 고정 순서에서는 바퀴의 첫 팔이 0.3–0.8% 느리게 나왔고

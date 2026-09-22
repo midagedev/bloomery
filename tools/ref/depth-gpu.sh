@@ -107,7 +107,7 @@ for r in $(seq "$ROUNDS"); do
         witness "post r$r ik d=$dep"
         [ -n "$val" ] || { echo "r$r $a produced no tg line" >&2; echo "$raw" | tail -n 8 >&2; exit 1; }
         echo "ROW r$r ik d=$dep | tok/s $val"
-        sums+=("ik d=$dep|$val")
+        sums+=("ik d=$dep|$val||")
         ;;
       *)
         use_ab=0
@@ -165,7 +165,7 @@ for r in $(seq "$ROUNDS"); do
           # 평균 줄의 첫 열은 `--time` 행에서 mean_ms 기반이다. ab 행이 거기 내놓는 것은
           # base 팔의 바퀴별 p50 평균이므로, 통계 이름을 키에 박아 두 행을 같은 열에서
           # 잘못 읽지 않게 한다(열 하나에 통계 둘이 들어가는 것이 이 표의 유일한 함정이다).
-          sums+=("ours($label,ab:base_p50) d=$dep ctx=$ctx n=$n|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')")
+          sums+=("ours($label,ab:base_p50) d=$dep ctx=$ctx n=$n|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')|")
           # 팔 세트를 준 라운드는 팔들의 차가 질문이므로 모든 ab 줄을 그대로 남긴다.
           if [ -n "${BLOOMERY_AB_SET:-}" ]; then
             echo "$out" | grep -E '^ab (round|arm)=' | sed "s/^/ARM r$r d=$dep | /"
@@ -188,18 +188,22 @@ for r in $(seq "$ROUNDS"); do
         warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
         ikref=$(echo "$out" | sed -n 's/^reference ik \([0-9.]*\) tok\/s at depth \([0-9]*\).*/\1@\2/p')
         echo "ROW r$r ours($label) d=$dep ctx=$ctx n=$n | p50 ${p50} ms | mean ${mean} ms | warm ${warmcol:-0} | ik_ref ${ikref:-?} | tok/s(p50) $(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}') | tok/s(mean) $(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}') | nodes ${nodes:-?} | first10_p50 ${h10} | last10_p50 ${t10} | wall $((t1 - t0))s | steps ${last} | distinct_tokens ${uniq_tok}"
-        sums+=("ours($label) d=$dep ctx=$ctx n=$n|$(awk -v m="$mean" 'BEGIN{printf "%.4f", 1e3/m}')|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')")
+        sums+=("ours($label) d=$dep ctx=$ctx n=$n|$(awk -v m="$mean" 'BEGIN{printf "%.4f", 1e3/m}')|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')|$uniq_tok")
         ;;
     esac
   done
 done
 echo
 echo "=== 팔별 평균 (tok/s). 첫 열: --time 행은 mean_ms 기반(교차 엔진 비율용), ab:base_p50 행은"
-echo "    base 팔의 바퀴별 p50 평균 기반. 끝 열의 p50은 계열 비교용이다. ==="
+echo "    base 팔의 바퀴별 p50 평균 기반. 끝 열의 p50은 계열 비교용이다."
+echo "    distinct_tokens = 그 팔이 뽑은 서로 다른 토큰 수(바퀴 간 범위). 팔마다 다르면 MoE 전문가 집합이"
+echo "    달라 시간이 교란된다 — ROW에 이미 있던 열을 평균 표에도 세운다. ik·ab 팔에는 없다. ==="
 printf '%s\n' "${sums[@]}" | awk -F'|' '{
   s[$1]+=$2; n[$1]++; if($3!=""){sp[$1]+=$3; np[$1]++}
   if(mn[$1]==""||$2+0<mn[$1]+0)mn[$1]=$2; if(mx[$1]==""||$2+0>mx[$1]+0)mx[$1]=$2
+  if($4!=""){if(tmn[$1]==""||$4+0<tmn[$1]+0)tmn[$1]=$4; if(tmx[$1]==""||$4+0>tmx[$1]+0)tmx[$1]=$4}
 } END{for(k in s){
   spread = (mn[k]>0) ? 100*(mx[k]-mn[k])/mn[k] : 0
-  printf "mean %-26s %8.2f tok/s(mean_ms)  [%s..%s, spread %.2f%%]  %s (n=%d)\n", k, s[k]/n[k], mn[k], mx[k], spread, (np[k]?sprintf("%.2f tok/s(p50)", sp[k]/np[k]):""), n[k]}}' | sort
+  dtok = (tmn[k]=="") ? "-" : ((tmn[k]==tmx[k]) ? tmn[k] : tmn[k] ".." tmx[k])
+  printf "mean %-26s %8.2f tok/s(mean_ms)  [%s..%s, spread %.2f%%]  distinct_tokens %-7s %s (n=%d)\n", k, s[k]/n[k], mn[k], mx[k], spread, dtok, (np[k]?sprintf("%.2f tok/s(p50)", sp[k]/np[k]):""), n[k]}}' | sort
 witness post

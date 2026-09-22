@@ -528,7 +528,7 @@ fn hw_q4k_dot_row_matches_scalar_and_predicts() {
     // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q4k-x4-ik-dot.txt"))
-        .expect("run tools/ref/q4k_x4_ref.cpp first (just build-ref does not build it)");
+        .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
     let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
     assert_eq!(
         dump_k, k,
@@ -608,7 +608,7 @@ fn hw_q6k_dot_row_matches_scalar_and_predicts() {
     // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q6k-x4-ik-dot.txt"))
-        .expect("run tools/ref/q6k_x4_ref.cpp first (just build-ref does not build it)");
+        .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
     let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
     assert_eq!(
         dump_k, k,
@@ -694,7 +694,7 @@ fn hw_q5f0_dot_row_matches_scalar_and_predicts_ik() {
     // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q5f0-ik-dot.txt"))
-        .expect("run tools/ref/q5f0_ref.cpp first (just build-ref does not build it)");
+        .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
     let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
     assert_eq!(
         dump_k, k,
@@ -773,7 +773,7 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
     // Reference dump from ik's kernel on this tensor.
     let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
     let dump = std::fs::read_to_string(format!("{base}/ref/q5f1-ik-dot.txt"))
-        .expect("run tools/ref/q5f1_ref.cpp first (just build-ref does not build it)");
+        .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
     let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
     assert_eq!(
         dump_k, k,

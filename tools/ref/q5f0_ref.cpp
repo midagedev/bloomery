@@ -27,9 +27,14 @@
 #include "iqk_gemm_legacy_quants.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// The data directory the gates read (tools/box.sh exports BLOOMERY_DATA; a parallel
+// track moves both this harness's input and its dump by setting it).
+static const char *kDataDir = getenv("BLOOMERY_DATA") ? getenv("BLOOMERY_DATA") : "/root/bloomery-data";
 
 static const char *kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
 
@@ -70,7 +75,7 @@ int main() {
     ggml_free(gctx);
     const char *nm = tensor_name.c_str();
 
-    FILE *f = fopen("/root/bloomery-data/ref/attn_norm-0.0.f32", "rb");
+    FILE *f = fopen((std::string(kDataDir) + "/ref/attn_norm-0.0.f32").c_str(), "rb");
     if (!f) { fprintf(stderr, "no oracle dump\n"); return 1; }
     std::vector<float> x(k);
     if (fread(x.data(), 4, k, f) != (size_t)k) { fprintf(stderr, "short dump\n"); return 1; }
@@ -104,7 +109,7 @@ int main() {
     // size (iqk_mul_mat.cpp:96). Zero here computed row 0 sixty-four times.
     kernels[0](k, w.data(), rs, info, 64);
 
-    FILE *out = fopen("/root/bloomery-data/ref/q5f0-ik-dot.txt", "w");
+    FILE *out = fopen((std::string(kDataDir) + "/ref/q5f0-ik-dot.txt").c_str(), "w");
     fprintf(out, "tensor %s k %d\n", nm, k);
     for (size_t i = 0; i < y.size(); ++i) fprintf(out, "%02x", y[i]);
     fprintf(out, "\n");

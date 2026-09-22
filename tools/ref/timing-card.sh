@@ -37,6 +37,15 @@ witness_card() {
 # round's gate or build: it is recorded, not obeyed — whether the timing card's numbers move
 # with load on the other card is a question this witness column will answer later, and it has
 # never been measured. BLOOMERY_OTHER_STRICT=1 aborts instead.
+# The default witness block. Every runner defines its own right after sourcing this file and
+# that definition wins; this one exists so guard_other below does not depend on the caller
+# having done so — an abort path that calls an undefined function prints nothing where the
+# record matters most.
+witness() {
+  echo "--- witness $1 $(now)"
+  witness_card
+}
+
 guard_other() {
   local apps
   apps=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$OTHER_GPU")
@@ -57,6 +66,9 @@ guard_other() {
 #
 # Only files cargo reads are compared. A whole-tree -newer sweep over-refuses, because the sync
 # gives every file it transfers the box's own "now" and a RESULTS.md is not a build input.
+# crates/oxide-ice-unroll is pruned for the same reason: it is excluded from the workspace on
+# purpose (a compiler-bug reproducer that must not compile), so nothing in it is an input to
+# any binary this function guards.
 # The sha256 is taken once here and printed by every later witness block: it is what makes a
 # past log answer "which binary was that row?" without rerunning anything.
 assert_fresh_binary() {
@@ -69,6 +81,7 @@ assert_fresh_binary() {
   BIN_SHA=$(sha256sum "$BIN_PATH" | cut -c1-12)
   BIN_MTIME=$(date -u -r "$BIN_PATH" +%Y-%m-%dT%H:%M:%SZ)
   newer=$(find crates Cargo.toml Cargo.lock \
+            -path 'crates/oxide-ice-unroll' -prune -o \
             \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
             -newer "$BIN_PATH" -print 2>/dev/null | head -n 5 || true)
   if [ -n "$newer" ]; then
