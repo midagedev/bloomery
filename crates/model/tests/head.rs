@@ -25,10 +25,13 @@ use model::ops::{Tensor2, f32_tensor, rms_norm};
 /// quantized per 32 elements with a bf16-rounded scale (`d = bf16rt(amax/127)`,
 /// codes `round_even(v * (1/d))`, iqk_quantize.cpp ~1089) and dotted in exact
 /// integer math per 16-element group (iqk_gemm_kquants.cpp ~948).
-/// `matmul_q` routes Q6_K through `quantize_row_q8_2_x4_roundtrip` — the same
-/// semantics — so these constants hold the end-to-end residual of that match
-/// (this gate's own `rms_norm` input error plus the elementwise `d*q`
-/// reconstruction) with ~5x headroom on the worst entry. A stock
+/// `matmul_q` sends Q6_K down the fused kernel: `qdot::quantize_col` writes that
+/// same Q8_2_X4 dialect and `dot_q6k_q82x4_avx2` is the port of the dot above, so
+/// these constants hold the end-to-end residual of that match (this gate's own
+/// `rms_norm` input error plus the elementwise `d*q` reconstruction). They were
+/// derived with ~5x headroom on the worst entry against the scalar
+/// `quantize_row_q8_2_x4_roundtrip` encoder, which is the path a type with no
+/// fused kernel still takes. A stock
 /// Q8_K-for-everything `matmul_q` fails them by ~400x, which is the bug class
 /// the relative form exists to catch.
 const RTOL: f32 = 1e-4;

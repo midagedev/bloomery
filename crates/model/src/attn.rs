@@ -600,7 +600,9 @@ thread_local! {
 /// `wk_b` is not in the file: the reference derives it at load (`llm_prepare_mla`,
 /// llama.cpp:3229 — k-up rows of `attn_kv_b`, dequantized, transposed, Q8_0 blocks
 /// along q_nope), a pure function of the weights, so it runs once in
-/// [`Derived`](crate::derived::Derived); this is the per-token half.
+/// [`Derived`](crate::derived::Derived); this is the per-token half in staged form —
+/// the step folds it into [`attn_heads_fused`], and `tests/attn.rs` holds the two
+/// together.
 ///
 /// The dot is a sum over blocks of `f32(f16(dw)) · dq · Σ qw·qq` with an exact i32
 /// inner sum (qdot's AVX2 maddubs kernel — bit-identical to scalar by integer
@@ -1537,8 +1539,9 @@ pub(crate) fn v_up_views(wkb: &TensorInfo, p: &MlaParams) -> Result<Vec<TensorIn
         .collect())
 }
 
-/// The `wv_b` gather-matmul-scatter over prebuilt views — the step path, which
-/// takes the views from [`Derived`](crate::derived::Derived).
+/// The `wv_b` gather-matmul-scatter over prebuilt views, in staged form: the step
+/// folds it into [`attn_heads_fused`], and `tests/attn.rs` holds the two together.
+/// The views come from [`Derived`](crate::derived::Derived).
 pub fn wv_b_heads_with(
     gguf: &Gguf,
     views: &[TensorInfo],
