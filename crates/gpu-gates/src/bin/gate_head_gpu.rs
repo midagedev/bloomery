@@ -96,13 +96,12 @@ fn run() -> Result<(), GateError> {
     // The architecture-wide rms eps, read here independently of the caller
     // that hands it to Head (the CPU head gate's second-reader pattern).
     let eps = gguf
-        .value("deepseek2.attention.layer_norm_rms_epsilon")
-        .and_then(|v| v.as_f32())
+        .arch_get_f32("attention.layer_norm_rms_epsilon")
         .ok_or("gate_head_gpu: rms eps key missing or not f32")?;
 
     let gpu = Gpu::new()?;
-    // Globals only: the head reads no block tensors, and an empty layer range
-    // loads no derived weights.
+    // Globals only: the head reads no block tensors and no derived weights,
+    // so nothing is derived after the load.
     let w = Weights::load(gpu.stream(), &gguf, 0..0, true)?;
     let mut head = Head::new(&gpu, &w, eps)?;
     println!(

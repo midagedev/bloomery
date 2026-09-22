@@ -42,6 +42,8 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
+    use bloomery_gpu::arch::deepseek2::Body;
+    use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::moe_fused::MoeFusedKernels;
     use bloomery_gpu::probe::Probe;
     use bloomery_gpu::q5::Q8Blocks32;
@@ -75,11 +77,7 @@ fn run() -> Result<(), GateError> {
         .arch_get_u64("expert_feed_forward_length")
         .ok_or("gate_moe_fused: metadata key expert_feed_forward_length missing")?
         as usize;
-    let scale = gguf
-        .architecture()
-        .and_then(|a| gguf.value(&format!("{a}.expert_weights_scale")))
-        .and_then(gguf::Value::as_f32)
-        .unwrap_or(1.0);
+    let scale = gguf.arch_get_f32("expert_weights_scale").unwrap_or(1.0);
 
     // K is the gate stack's row width and `rows` the down stack's row count,
     // both read from the file; every other extent is the metadata above.
@@ -191,8 +189,10 @@ fn run() -> Result<(), GateError> {
         );
     }
 
-    // ---- resident weights: layer 1 only, the tensors this block consumes.
-    let wts = Weights::load(stream, &gguf, 1..2, false)?;
+    // ---- resident weights: layer 1 only, as a stage holds it — the tensors
+    // this block consumes, plus the block's derived weights.
+    let mut wts = Weights::load(stream, &gguf, 1..2, false)?;
+    Body::derive(stream, &gguf, 1..2, &mut wts)?;
     fn kq<'a>(wts: &'a Weights, name: &str) -> Result<&'a DeviceTensor<u32>, GateError> {
         let Some(DevWeight::KQuant { ty, w, .. }) = wts.get(name) else {
             return Err(format!("gate_moe_fused: {name} is not a KQuant resident weight").into());

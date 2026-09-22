@@ -7,9 +7,10 @@
 //! This file is the part that is the same for every architecture
 //! (docs/arch-split.md): the graph drop order, the capture identity
 //! `(layer, embed)`, the rule that a mode change discards a capture, the `pos`
-//! advance and the single argmax readback. What a layer chain enqueues, which
-//! rows it appends to which cache and what one step's host input is belong to
-//! a [`ChainBody`] under [`crate::arch`]; `GpuModel` is generic over it and
+//! advance and the single argmax readback. Which weights a model derives at
+//! load, what a layer chain enqueues, which rows it appends to which cache and
+//! what one step's host input is belong to a [`ChainBody`] under
+//! [`crate::arch`]; `GpuModel` is generic over it and
 //! monomorphic at every call site, so nothing on the token path is a virtual
 //! call. [`GpuModel::step`] stitches the body's layers into the whole chain —
 //! layer 0 embedding its token, every later layer reading the previous
@@ -43,8 +44,9 @@ use std::ops::Range;
 
 /// One architecture's layer chain: what the shared skeleton drives at capture
 /// time, and everything the step touches that is shaped by the model rather
-/// than by the runtime — the KV row store, the load-time arena, the weight
-/// names, the step's own kernels (docs/arch-split.md, 「트레이트 둘」).
+/// than by the runtime — the derived weights, the KV row store, the load-time
+/// arena, the weight names, the step's own kernels (docs/arch-split.md,
+/// 「트레이트 둘」).
 ///
 /// Monomorphic by construction: `GpuModel<B>` names one body, and a binary
 /// that can open two architectures branches once, on the enum around the
@@ -58,8 +60,20 @@ pub trait ChainBody: Sized {
     /// The architecture this body is the chain of.
     fn arch() -> Arch;
 
+    /// File into `w` the weights this architecture's plan computes at load
+    /// for the blocks of `layers` — after the file tensors are resident,
+    /// before [`ChainBody::load`] reads them. Required, with no default body,
+    /// so an architecture cannot forget its derived weights silently.
+    fn derive(
+        stream: &CudaStream,
+        gguf: &gguf::Gguf,
+        layers: Range<usize>,
+        w: &mut Weights,
+    ) -> Result<(), GpuError>;
+
     /// Everything the chain of `layers` needs resident, over the weights the
-    /// caller has already loaded: the caches, the arena and the step module.
+    /// caller has already loaded and derived: the caches, the arena and the
+    /// step module.
     fn load(
         gpu: &Gpu,
         gguf: &gguf::Gguf,
@@ -263,9 +277,10 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// One stage over `layers` WITH residency: every tensor of that range
-    /// plus the globals in its kernels' device format, and the body those
-    /// weights drive — its caches, its m = 1 arena and its step module. The
-    /// geometry checks run at load, not mid-step.
+    /// plus the globals in its kernels' device format, the weights the body
+    /// derives from them, and the body those weights drive — its caches, its
+    /// m = 1 arena and its step module. The geometry checks run at load, not
+    /// mid-step.
     pub fn load_blocks(
         gguf: &gguf::Gguf,
         ctx_max: usize,
@@ -288,7 +303,8 @@ impl<B: ChainBody> GpuModel<B> {
             ));
         }
         let gpu = Gpu::new()?;
-        let weights = Weights::load(gpu.stream(), gguf, layers.clone(), true)?;
+        let mut weights = Weights::load(gpu.stream(), gguf, layers.clone(), true)?;
+        B::derive(gpu.stream(), gguf, layers.clone(), &mut weights)?;
         let body = B::load(&gpu, gguf, &weights, layers.clone(), ctx_max)?;
         Ok(GpuModel {
             stages: vec![Stage {

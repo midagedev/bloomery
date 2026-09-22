@@ -12,16 +12,14 @@ use crate::tensor::DeviceTensor;
 use cuda_core::CudaStream;
 use gguf::quant::{GgmlType, half_to_f32};
 use gguf::{Gguf, TensorInfo};
-// Re-exported for the gate binaries: bloomery-gpu-gates has no edge to
-// bloomery-model, and the dependency direction (gpu -> model) is fixed.
+// The Q8_0 block `q8_0_planes` packs; the gate binaries name it through here.
 pub use model::attn::Q8Block;
-pub use model::derived::Derived;
 use std::collections::BTreeMap;
 use std::ops::Range;
 
 /// One resident weight in the format its kernel loads. A new meaning gets a
-/// new variant: the derived q_nope2 weights have their own (`Q8_0Derived`)
-/// and never travel as a file tensor.
+/// new variant: derived weights have their own (`Q8_0Derived`) and never
+/// travel as a file tensor.
 pub enum DevWeight {
     /// Q3_K/Q4_K/Q6_K file tensor: the raw row stream as little-endian u32
     /// words, the final word zero-padded when the stream is not 4-aligned —
@@ -52,11 +50,10 @@ pub enum DevWeight {
         d: DeviceTensor<f32>,
         k: usize,
     },
-    /// The derived q_nope2 weights of one block — the `wk_b` Q8_0 requant,
-    /// bytes taken from the CPU crate's [`Derived`] (never re-derived here):
-    /// the same two planes as `Q8_0` over `rows = n_head · latent` rows of
-    /// `k = nope` (`qs` rows × k/4 words, `d` rows × k/32 scales),
-    /// head-major, block (row, b) at `wblocks[row·nope/32 + b]`. A distinct
+    /// A derived weight — computed at load by an architecture's plan, never
+    /// read from the file — in the same two planes as `Q8_0` (`qs` rows ×
+    /// k/4 words, `d` rows × k/32 scales); its row geometry is the plan's
+    /// ([`ChainBody::derive`](crate::model::ChainBody::derive)). A distinct
     /// variant so nothing can read derived bytes as a file tensor or vice
     /// versa.
     Q8_0Derived {
@@ -72,7 +69,7 @@ pub enum DevWeight {
 
 impl DevWeight {
     /// Rows of the resident tensor. An expert stack counts every expert's
-    /// rows; the derived variant counts every head's.
+    /// rows; a derived weight, every row its plan uploaded.
     pub fn rows(&self) -> usize {
         match self {
             DevWeight::KQuant { w, .. } | DevWeight::Q5_0 { w, .. } | DevWeight::Q5_1 { w, .. } => {
@@ -83,7 +80,8 @@ impl DevWeight {
         }
     }
 
-    /// Values per row: `dims[0]` of the file tensor, `nope` for the derived.
+    /// Values per row: `dims[0]` of a file tensor, the plan's row width for a
+    /// derived weight.
     pub(crate) fn k(&self) -> usize {
         match self {
             DevWeight::KQuant { k, .. }
@@ -111,9 +109,9 @@ impl DevWeight {
 }
 
 /// The resident weights of a layer range: every `blk.L.*` tensor with L in
-/// `layers`, the derived q_nope2 of each of those blocks, and — when loaded
-/// with globals — the non-block tensors. Load-time only; per-step code reads
-/// through `get` and never allocates.
+/// `layers`, what the architecture derives for those blocks, and — when
+/// loaded with globals — the non-block tensors. Load-time only; per-step
+/// code reads through `get` and never allocates.
 pub struct Weights {
     by_name: BTreeMap<String, DevWeight>,
 }
@@ -123,7 +121,9 @@ impl Weights {
     /// `globals`) in the device format each kernel consumes. Packs and
     /// uploads tensor by tensor, so at most one host packing of one tensor
     /// is alive at a time. A tensor whose type has no device format is an
-    /// error naming the tensor and type — never a silent skip.
+    /// error naming the tensor and type — never a silent skip. File tensors
+    /// only: what an architecture derives from them is filed afterwards,
+    /// through `Weights::insert_derived`.
     pub fn load(
         stream: &CudaStream,
         gguf: &Gguf,
@@ -150,42 +150,21 @@ impl Weights {
                 by_name.insert(t.name.clone(), dw);
             }
         }
-        if !layers.is_empty() {
-            let derived = Derived::new(gguf)?;
-            for l in layers.clone() {
-                let params = &derived.block_plan(l)?.attn.params;
-                let (rows, k) = (params.n_head * params.latent, params.nope);
-                let blocks = derived.wk_b_all_heads(l)?;
-                // The resident shape is the q8f32 kernel's: rows = n_head·
-                // latent rows of k = nope. The block count must be exactly
-                // rows·k/32 — a disagreement is a load error naming the
-                // geometry, never a silent reshape.
-                let want = rows * (k / 32);
-                if blocks.len() != want {
-                    return Err(GpuError::shape(
-                        "Weights::load",
-                        format!(
-                            "block {l}: {} q8 blocks, want rows·k/32 = {rows}·{k}/32 = {want}",
-                            blocks.len()
-                        ),
-                    ));
-                }
-                let (qs, d) = q8_0_planes(blocks);
-                by_name.insert(
-                    derived_name(l),
-                    DevWeight::Q8_0Derived {
-                        qs: DeviceTensor::upload(stream, &qs, rows, k / 4)?,
-                        d: DeviceTensor::upload(stream, &d, rows, k / 32)?,
-                        k,
-                    },
-                );
-            }
-        }
         Ok(Weights { by_name })
     }
 
-    /// The resident weight for `name` — a file tensor name, or
-    /// `derived.blk.L.q_nope2` for the derived weights of block L.
+    /// File `w` as a derived weight under `name`. The `derived.` prefix keeps
+    /// it out of the file-tensor namespace: a name without it is refused, and
+    /// so is a name already resident, so a derived weight never shadows a
+    /// file tensor or another derived one.
+    pub(crate) fn insert_derived(&mut self, name: String, w: DevWeight) -> Result<(), GpuError> {
+        derived_slot_free(&self.by_name, &name)?;
+        self.by_name.insert(name, w);
+        Ok(())
+    }
+
+    /// The resident weight for `name` — a file tensor name, or the `derived.`
+    /// name an architecture filed a derived weight under.
     pub fn get(&self, name: &str) -> Option<&DevWeight> {
         self.by_name.get(name)
     }
@@ -201,11 +180,26 @@ impl Weights {
     }
 }
 
-/// The name under which block `l`'s derived q_nope2 weights are resident.
-/// The `derived.` prefix keeps it out of the file-tensor namespace.
-#[must_use]
-pub fn derived_name(l: usize) -> String {
-    format!("derived.blk.{l}.q_nope2")
+/// The prefix every derived weight's name carries.
+const DERIVED_PREFIX: &str = "derived.";
+
+/// Err unless `name` is free for a derived weight in `by_name`: under
+/// [`DERIVED_PREFIX`] and not yet resident. Generic over the value so the
+/// rule is checkable without a device.
+fn derived_slot_free<V>(by_name: &BTreeMap<String, V>, name: &str) -> Result<(), GpuError> {
+    if !name.starts_with(DERIVED_PREFIX) {
+        return Err(GpuError::shape(
+            "Weights::insert_derived",
+            format!("{name:?} is not a {DERIVED_PREFIX:?} name"),
+        ));
+    }
+    if by_name.contains_key(name) {
+        return Err(GpuError::shape(
+            "Weights::insert_derived",
+            format!("{name:?} is already resident"),
+        ));
+    }
+    Ok(())
 }
 
 /// `Some(L)` for a `blk.L.*` tensor name, `None` for a non-block name; a
@@ -378,7 +372,7 @@ fn words_of(b: &[u8]) -> Vec<u32> {
 /// in word j/4, byte j%4) and one f32 scale converted from the stored f16
 /// bits — the exact value the reference dequantizes with, so the device side
 /// never does f16 arithmetic.
-fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
+pub(crate) fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
     let mut qs = Vec::with_capacity(blocks.len() * 8);
     let mut d = Vec::with_capacity(blocks.len());
     for b in blocks {
@@ -390,4 +384,23 @@ fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
         d.push(half_to_f32(b.d));
     }
     (qs, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derived_slot_free;
+    use std::collections::BTreeMap;
+
+    /// `insert_derived`'s guard, which runs before anything is filed: a name
+    /// outside the `derived.` prefix is refused even when nothing holds it,
+    /// and a `derived.` name already resident is refused.
+    #[test]
+    fn derived_slot_refuses_a_file_name_and_a_resident_name() {
+        let mut by_name = BTreeMap::new();
+        by_name.insert("output.weight".to_string(), ());
+        by_name.insert("derived.a".to_string(), ());
+        assert!(derived_slot_free(&by_name, "derived.b").is_ok());
+        assert!(derived_slot_free(&by_name, "output_norm.weight").is_err());
+        assert!(derived_slot_free(&by_name, "derived.a").is_err());
+    }
 }

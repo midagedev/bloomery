@@ -1,6 +1,6 @@
-//! The DeepSeek-V2-Lite chain: the layer bodies [`crate::model::GpuModel`]
-//! drives, the KV rows they append to, the load-time arena they run over and
-//! the taps a gate reads back.
+//! The DeepSeek-V2-Lite chain: the weights it derives at load, the layer
+//! bodies [`crate::model::GpuModel`] drives, the KV rows they append to, the
+//! load-time arena they run over and the taps a gate reads back.
 //!
 //! One layer is an MLA attention half over that layer's own latent cache
 //! followed by one of two FFN halves — the fused dense FFN for a layer without
@@ -21,16 +21,18 @@ mod scratch;
 mod seed;
 mod taps;
 
+pub use names::derived_name;
 pub use taps::{Block0Taps, LayerTaps};
 
 use crate::model::probe::Observer;
 use crate::model::{ChainBody, StepKernels, StepProbe};
 use crate::tensor::DeviceTensor;
-use crate::weights::Weights;
+use crate::weights::{DevWeight, Weights, q8_0_planes};
 use crate::{Gpu, GpuError};
 use cuda_core::CudaStream;
 use model::arch::Arch;
 use model::attn::MlaParams;
+use model::derived::Derived;
 use names::LayerNames;
 use scratch::{LayerScratch, MoeDims};
 use seed::{seed_cache, seed_pattern};
@@ -102,6 +104,52 @@ impl ChainBody for Body {
 
     fn arch() -> Arch {
         Arch::Deepseek2
+    }
+
+    /// The derived q_nope2 weights of every block in `layers`: `wk_b`
+    /// requantized to Q8_0 by the CPU crate's [`Derived`] (never re-derived
+    /// here), in the q8f32 two-plane layout over `rows = n_head · latent`
+    /// rows of `k = nope` (`qs` rows × k/4 words, `d` rows × k/32 scales),
+    /// head-major, block (row, b) at `wblocks[row·nope/32 + b]`, each filed
+    /// under [`derived_name`]. An empty range derives nothing.
+    fn derive(
+        stream: &CudaStream,
+        gguf: &gguf::Gguf,
+        layers: Range<usize>,
+        w: &mut Weights,
+    ) -> Result<(), GpuError> {
+        if !layers.is_empty() {
+            let derived = Derived::new(gguf)?;
+            for l in layers {
+                let params = &derived.block_plan(l)?.attn.params;
+                let (rows, k) = (params.n_head * params.latent, params.nope);
+                let blocks = derived.wk_b_all_heads(l)?;
+                // The resident shape is the q8f32 kernel's: rows = n_head·
+                // latent rows of k = nope. The block count must be exactly
+                // rows·k/32 — a disagreement is a load error naming the
+                // geometry, never a silent reshape.
+                let want = rows * (k / 32);
+                if blocks.len() != want {
+                    return Err(GpuError::shape(
+                        "Body::derive",
+                        format!(
+                            "block {l}: {} q8 blocks, want rows·k/32 = {rows}·{k}/32 = {want}",
+                            blocks.len()
+                        ),
+                    ));
+                }
+                let (qs, d) = q8_0_planes(blocks);
+                w.insert_derived(
+                    derived_name(l),
+                    DevWeight::Q8_0Derived {
+                        qs: DeviceTensor::upload(stream, &qs, rows, k / 4)?,
+                        d: DeviceTensor::upload(stream, &d, rows, k / 32)?,
+                        k,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn load(

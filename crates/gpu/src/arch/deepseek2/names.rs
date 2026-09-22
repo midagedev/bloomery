@@ -5,6 +5,14 @@
 
 use crate::weights::Weights;
 
+/// The name under which block `l`'s derived q_nope2 weights are resident.
+/// The `derived.` prefix keeps it out of the file-tensor namespace — the
+/// rule `Weights::insert_derived` holds every derived name to.
+#[must_use]
+pub fn derived_name(l: usize) -> String {
+    format!("derived.blk.{l}.q_nope2")
+}
+
 /// The weight names one layer's chain looks up, built once at load so the
 /// step never formats a string (decision 4). `routed` is read from the
 /// file, not from the layer index: a layer is MoE exactly when its router
@@ -59,7 +67,7 @@ impl LayerNames {
             ffn_gate_shexp: n("ffn_gate_shexp"),
             ffn_up_shexp: n("ffn_up_shexp"),
             ffn_down_shexp: n("ffn_down_shexp"),
-            derived: crate::weights::derived_name(l),
+            derived: derived_name(l),
         }
     }
 }

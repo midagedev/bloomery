@@ -43,11 +43,15 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::arch::deepseek2::Body;
+#[cfg(feature = "gpu")]
+use bloomery_gpu::model::ChainBody;
+#[cfg(feature = "gpu")]
 use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0, pack_q5_1};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q8f32::Q8F32Kernels;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::weights::{Derived, DevWeight, Q8Block, Weights, resident_size};
+use bloomery_gpu::weights::{DevWeight, Q8Block, Weights, resident_size};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
@@ -61,6 +65,8 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Gguf;
 #[cfg(feature = "gpu")]
 use gguf::quant::{GgmlType, half_to_f32};
+#[cfg(feature = "gpu")]
+use model::derived::Derived;
 #[cfg(feature = "gpu")]
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -143,7 +149,8 @@ fn run() -> Result<(), GateError> {
     }
 
     // ------------------------------------------ 2. full load + read-back
-    let full = Weights::load(stream, &gguf, 0..n_layers, true)?;
+    let mut full = Weights::load(stream, &gguf, 0..n_layers, true)?;
+    Body::derive(stream, &gguf, 0..n_layers, &mut full)?;
     if full.resident_bytes() as u64 != res_total + derived_total as u64 {
         eprintln!(
             "FAIL: resident totals disagree: loaded {} vs census {}",
@@ -219,7 +226,7 @@ fn run() -> Result<(), GateError> {
         // Q8_0 block bytes are the f16 scale bits plus the 32 codes, and
         // both map to the planes bijectively (every f16 is exact in f32),
         // so plane-bits equality is block-bytes equality.
-        if name == bloomery_gpu::weights::derived_name(1) {
+        if name == bloomery_gpu::arch::deepseek2::derived_name(1) {
             let DevWeight::Q8_0Derived { qs, d, .. } = dw else {
                 return Err(format!("gate_p10: {name}: not the derived variant").into());
             };
@@ -266,7 +273,7 @@ fn run() -> Result<(), GateError> {
         let p = &derived.block_plan(l)?.attn.params;
         let (rows, k) = (p.n_head * p.latent, p.nope);
         let dw = full
-            .get(&bloomery_gpu::weights::derived_name(l))
+            .get(&bloomery_gpu::arch::deepseek2::derived_name(l))
             .ok_or(format!("gate_p10: derived.blk.{l}.q_nope2 missing"))?;
         let DevWeight::Q8_0Derived { qs, d, k: rk } = dw else {
             return Err(
@@ -312,7 +319,7 @@ fn run() -> Result<(), GateError> {
         let (rows, k) = (p.n_head * p.latent, p.nope);
         let blocks = derived.wk_b_all_heads(1)?;
         let DevWeight::Q8_0Derived { qs, d, .. } = full
-            .get(&bloomery_gpu::weights::derived_name(1))
+            .get(&bloomery_gpu::arch::deepseek2::derived_name(1))
             .ok_or("gate_p10: derived.blk.1.q_nope2 missing")?
         else {
             return Err("gate_p10: derived.blk.1.q_nope2 is not the derived variant".into());
@@ -354,7 +361,8 @@ fn run() -> Result<(), GateError> {
     let mut staged: BTreeSet<String> = BTreeSet::new();
     let mut staged_resident = 0usize;
     for (range, globals) in [(0..CUT, false), (CUT..n_layers, false), (0..0, true)] {
-        let w = Weights::load(stream, &gguf, range.clone(), globals)?;
+        let mut w = Weights::load(stream, &gguf, range.clone(), globals)?;
+        Body::derive(stream, &gguf, range.clone(), &mut w)?;
         let names: BTreeSet<String> = w.names().map(str::to_owned).collect();
         let res = w.resident_bytes();
         println!(
@@ -396,7 +404,8 @@ fn run() -> Result<(), GateError> {
     // arm and refuses such a file at open. The q8f32 format still runs, one
     // row below, through the derived variant.
     println!("skip q8_0 absent");
-    let w = Weights::load(stream, &gguf, 0..2, true)?;
+    let mut w = Weights::load(stream, &gguf, 0..2, true)?;
+    Body::derive(stream, &gguf, 0..2, &mut w)?;
     let table = Table {
         gguf: &gguf,
         gpu: &gpu,
@@ -818,7 +827,7 @@ fn kid_q8_derived_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), Gate
         stream, w, derived, ..
     } = *t;
     let DevWeight::Q8_0Derived { qs: rqs, d: rd, .. } = w
-        .get(&bloomery_gpu::weights::derived_name(1))
+        .get(&bloomery_gpu::arch::deepseek2::derived_name(1))
         .ok_or("run_table: derived.blk.1.q_nope2 missing")?
     else {
         return Err("run_table: derived.blk.1.q_nope2 is not the derived variant".into());
