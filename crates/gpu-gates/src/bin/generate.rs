@@ -7,9 +7,10 @@
 //! position per call — and to print what came out.
 //!
 //!     generate [--prompt-id <id> | --tokens a,b,c | --seed-depth D]
-//!              [-n N] [--ctx C] [--mode eager|graph] [--time] [--ab R [--ab-set SET]]
+//!              [-n N] [--ctx C] [--mode eager|graph] [--time [--warm W]]
+//!              [--ab R [--ab-set SET]]
 //!
-//! Defaults: prompt 0, N 32, ctx 512, mode graph.
+//! Defaults: prompt 0, N 32, ctx 512, mode graph, W 0.
 //!
 //! `--seed-depth D` stands the model at depth `D` without decoding a prompt
 //! there. `GpuModel::seed_depth` fills `D - 1` cache rows directly and one
@@ -30,6 +31,15 @@
 //! readback synchronizes inside, so the wall time is the whole step. The
 //! prompt is fed untimed: it is P steps of the same body and would drag the
 //! per-step distribution toward whatever the prompt length happens to be.
+//! Nothing is printed between two timed steps: every line of the loop is
+//! held and written after it, because a `println!` is a write syscall on
+//! the host and the steps it would separate are the measurement.
+//!
+//! `--warm W` drops the first W generated steps from the `--time`
+//! statistics; they still run, and their `time step` lines still print,
+//! marked `warm`, so the clock-ramp question stays readable in the log. The
+//! default of 0 is the old behaviour. It is refused with `--ab`, which
+//! already runs one untimed round of every arm before it counts anything.
 //!
 //! Which number is the record: the fusion rounds this runner serves compare
 //! GRAPH REPLAY µs, so the graph-mode footer is the one that becomes the
@@ -69,11 +79,36 @@ use bloomery_gpu_gates::open_model;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::read_prompts;
 
-/// ik's own decode on this card and this model, so the footer shows the gap
-/// and the depth it was read at.
+/// ik's own decode on this model, tok/s at the depths the depth table
+/// stands at. A decode step's attention term is linear in the cached keys,
+/// so a footer that quotes one row at every depth quotes the wrong engine
+/// number everywhere but there.
 #[cfg(feature = "gpu")]
-const IK_REFERENCE: &str =
-    "ik 216.6 tok/s at depth 0 (3090, 2026-09-21 morning, n=3; 204.6 at 1024, 189.7 at 4096)";
+const IK_REFERENCE: [(usize, f64); 3] = [(0, 207.59), (1024, 196.40), (4096, 181.32)];
+
+/// Where the rows above were read. They are 3090 numbers and timed runs
+/// are now taken on the A6000, so the footer carries the card with them
+/// and a reader does not put the two in one table.
+#[cfg(feature = "gpu")]
+const IK_REFERENCE_WHERE: &str = "A6000 at 300 W, 2026-09-22, 3 rounds";
+
+/// The ik row a run at `depth` is read against: the deepest measured depth
+/// that is not past it, printed with that depth so the line is never
+/// mistaken for a reading at this run's own. Rows are not interpolated — a
+/// number between two measured points is one nobody measured.
+#[cfg(feature = "gpu")]
+fn ik_reference(depth: usize) -> String {
+    let (at, tok_s) = IK_REFERENCE
+        .iter()
+        .rev()
+        .find(|(d, _)| *d <= depth)
+        .copied()
+        .unwrap_or(IK_REFERENCE[0]);
+    format!(
+        "ik {tok_s} tok/s at depth {at} (deepest measured row at or below this run's \
+         depth {depth}; {IK_REFERENCE_WHERE})"
+    )
+}
 
 /// `tools/ref/prompts.tsv`, relative to this crate — the same file both
 /// engines read their token ids from.
@@ -104,6 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let n_gen: usize = flag_value("-n").map_or(Ok(32), |s| s.parse())?;
     let ctx: usize = flag_value("--ctx").map_or(Ok(512), |s| s.parse())?;
+    let warm: usize = flag_value("--warm").map_or(Ok(0), |s| s.parse())?;
 
     let seed_depth: Option<usize> = match flag_value("--seed-depth") {
         Some(s) => Some(s.parse()?),
@@ -202,6 +238,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Refused rather than ignored, like the levers above. `--ab` runs one
+    // untimed round of every arm before it counts anything, so a second
+    // warming lever there would be two names for one thing; and outside
+    // `--time` there are no statistics for `--warm` to trim.
+    if flag_value("--warm").is_some() {
+        if flag_value("--ab").is_some() {
+            return Err(
+                "generate: --warm warms --time, and --ab already runs one untimed \
+                        round of every arm before it counts. Pass one, not both."
+                    .into(),
+            );
+        }
+        if !timed {
+            return Err("generate: --warm drops the first W steps from --time's \
+                        statistics, which this run has not asked for. Pass both, or neither."
+                .into());
+        }
+    }
+    if timed && warm > 0 && warm >= n_gen.saturating_sub(1) {
+        return Err(format!(
+            "generate: --warm {warm} leaves no timed step of the {} that -n {n_gen} \
+             generates — generated token 0 comes out of the prompt's own step, so the \
+             warm count must stay under n - 1.",
+            n_gen.saturating_sub(1)
+        )
+        .into());
+    }
+
     let gguf = open_model()?;
     let mut model = GpuModel::load_full(&gguf, ctx)?;
     model.set_mode(mode);
@@ -266,32 +330,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The N - 1 feedback steps after it are the per-step distribution.
     let mut next = model.step(&tokens)?;
     println!("step 0 {} {next}", model.pos() - 1);
-    let mut step_ms: Vec<f64> = Vec::with_capacity(n_gen.saturating_sub(1));
-    for i in 1..n_gen {
+    // `(pos, token, ms)` per feedback step, written out after the loop:
+    // holding them keeps every write syscall out of the gaps between two
+    // timed steps. The Vec is sized up front so the loop allocates nothing.
+    let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(n_gen.saturating_sub(1));
+    for _ in 1..n_gen {
         let t0 = std::time::Instant::now();
         next = model.step(&[next])?;
         let ms = t0.elapsed().as_secs_f64() * 1e3;
-        step_ms.push(ms);
-        println!("step {i} {} {next}", model.pos() - 1);
+        rows.push((model.pos() - 1, next, ms));
+    }
+    for (k, (pos, tok, ms)) in rows.iter().enumerate() {
+        let i = k + 1;
+        println!("step {i} {pos} {tok}");
         if timed {
-            println!("time step {i} ms={ms:.4}");
+            // The warm steps print too, marked: `--warm` answers whether
+            // the early steps are slow, and a log that hid them could not.
+            let tag = if i <= warm { " warm" } else { "" };
+            println!("time step {i}{tag} ms={ms:.4}");
         }
     }
+    let step_ms: Vec<f64> = rows.iter().map(|(_, _, ms)| *ms).collect();
 
     if timed {
         if step_ms.is_empty() {
             return Err("generate: --time with -n 1 has no generated step to time".into());
         }
-        let mut sorted = step_ms.clone();
+        let counted = &step_ms[warm..];
+        let mut sorted = counted.to_vec();
         sorted.sort_by(f64::total_cmp);
         let p50 = sorted[sorted.len() / 2];
-        let mean = step_ms.iter().sum::<f64>() / step_ms.len() as f64;
-        // `steps` is the number of TIMED steps: generated token 0 comes out
-        // of the prompt's own `step` call and is not one of them, so N
-        // generated tokens give N - 1 timed feedback steps.
+        let mean = counted.iter().sum::<f64>() / counted.len() as f64;
+        // `steps` is the number of COUNTED steps: generated token 0 comes
+        // out of the prompt's own `step` call and is not one of them, and
+        // the first `warm` feedback steps are run but not counted.
         println!(
             "SMOKE mode={} prompt_tokens={} depth={depth} seeded={} generated={n_gen} \
-             steps={} p50_ms={p50:.4} \
+             warm={warm} steps={} p50_ms={p50:.4} \
              mean_ms={mean:.4} tok/s(p50)={:.2} probe_pad={pad} probe_skip_quant={skip} \
              probe_split_heads={split} probe_split_kqvc={split_kqvc} \
              probe_split_flash_quant={split_fq} probe_split_moe_quant={split_mq}",
@@ -302,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             tokens.len(),
             seed_depth.is_some(),
-            step_ms.len(),
+            counted.len(),
             1e3 / p50,
             pad = probe.pad_per_layer,
             skip = probe.skip_quant,
@@ -311,7 +386,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             split_fq = probe.split_flash_quant,
             split_mq = probe.split_moe_quant,
         );
-        println!("reference {IK_REFERENCE}");
+        println!("reference {}", ik_reference(depth));
     }
     Ok(())
 }
@@ -378,7 +453,9 @@ fn ab(
             1e3 * (m - base_mean)
         );
     }
-    println!("reference {IK_REFERENCE}");
+    // `--ab` is refused with `--seed-depth`, so the prompt's length is the
+    // depth every arm stands at.
+    println!("reference {}", ik_reference(tokens.len()));
     Ok(())
 }
 

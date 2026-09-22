@@ -44,6 +44,9 @@
 set -uo pipefail
 MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 N=${BLOOMERY_DECODE_N:-96}
+# --time 팔의 워밍(generate --warm W): 앞 W 스텝은 돌되 통계에서 빠진다. 비면 안 붙는다. ab 팔에는
+# 안 붙인다 — --ab는 팔마다 untimed 라운드를 이미 돌리고, generate가 둘을 같이 주면 거부한다.
+WARM=${BLOOMERY_GEN_WARM:-}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
 IKBIN=${IKBIN:-/home/user/ik_llama.cpp/build/bin/llama-bench}
 # 3090 기준선(216.6/204.6/189.7)이 쓴 그 조합. CPU 최속 조합에서 -rtr 1만 뺀 것이고 GPU 플래그
@@ -102,7 +105,7 @@ exec 9>"$LOCK"
 echo "[lease] waiting for $LOCK ..."
 flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
 echo "[lease] held by pid $$ at $(now)"
-echo "[config] model=$MODEL n=$N rounds=$ROUNDS ik_flags=$IK_GPU_FLAGS"
+echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} ik_flags=$IK_GPU_FLAGS"
 echo "[config] arms=$ARMS_SPEC"
 echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 witness pre
@@ -166,9 +169,9 @@ for r in $(seq "$ROUNDS"); do
         if [ "$use_ab" = 1 ]; then
           out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
         elif [[ "$label" == seed* ]]; then
-          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time 2>&1)
+          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
         else
-          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time 2>&1)
+          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
         fi
         rc=$?
         t1=$(date +%s)
@@ -208,7 +211,9 @@ for r in $(seq "$ROUNDS"); do
         t10=$(echo "$series" | tail -n 10 | med)
         last=$(echo "$out" | grep -cE '^step ')
         uniq_tok=$(echo "$out" | awk '/^step /{print $NF}' | sort -u | wc -l | tr -d ' ')
-        echo "ROW r$r ours($label) d=$dep ctx=$ctx n=$n | p50 ${p50} ms | mean ${mean} ms | tok/s(p50) $(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}') | tok/s(mean) $(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}') | nodes ${nodes:-?} | first10_p50 ${h10} | last10_p50 ${t10} | wall $((t1 - t0))s | steps ${last} | distinct_tokens ${uniq_tok}"
+        warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
+        ikref=$(echo "$out" | sed -n 's/^reference ik \([0-9.]*\) tok\/s at depth \([0-9]*\).*/\1@\2/p')
+        echo "ROW r$r ours($label) d=$dep ctx=$ctx n=$n | p50 ${p50} ms | mean ${mean} ms | warm ${warmcol:-0} | ik_ref ${ikref:-?} | tok/s(p50) $(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}') | tok/s(mean) $(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}') | nodes ${nodes:-?} | first10_p50 ${h10} | last10_p50 ${t10} | wall $((t1 - t0))s | steps ${last} | distinct_tokens ${uniq_tok}"
         sums+=("ours($label) d=$dep ctx=$ctx n=$n|$(awk -v m="$mean" 'BEGIN{printf "%.4f", 1e3/m}')|$(awk -v p="$p50" 'BEGIN{printf "%.4f", 1e3/p}')")
         ;;
     esac
