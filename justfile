@@ -448,6 +448,9 @@ gate-gpu-head:
 gate-gpu-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib'
 
+gate-gpu-gates-lib:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib'
+
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
 # 들어가면 쓰레기를 낸다(upstream의 MMQ 경로, mainline이 양자화한 파일에서만). 그래서 argmax.sh가 --step-prefill(M=1 경로)로 먹인다 —
@@ -467,7 +470,7 @@ greedy-ref-cuda:
 gate-gpu-p8b *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8b && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p8b {{ARGS}}'
 
-# PTX 스캔(계측기, 게이트 아님 — 항상 exit 0): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
+# PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
 ptx-scan BIN *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin {{BIN}} && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'

@@ -161,13 +161,15 @@ fn run() -> Result<(), GateError> {
 
 /// This package's kernels, asserted to carry no local depot. The device
 /// bundle is embedded in this executable as PTX text, so the check reads
-/// `/proc/self/exe` and looks inside each entry's own body — the same thing
-/// the backend would report, at no device cost and with no timing in it.
-/// The scan itself is `bloomery_gpu_gates::ptx`; `tools/ptx-scan.sh` prints
-/// the same counts for every entry without asserting any of them.
+/// the PTX payload out of `/proc/self/exe` and looks inside each entry's
+/// own body — the same thing the backend would report, at no device cost
+/// and with no timing in it. The scan itself is `bloomery_gpu_gates::ptx`;
+/// `tools/ptx-scan.sh` prints the same counts for every entry without
+/// asserting any of them.
 #[cfg(feature = "gpu")]
 fn no_local_depot() -> Result<bool, GateError> {
-    let blob = std::fs::read(std::env::current_exe()?)?;
+    let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
+    let modules = bloomery_gpu_gates::ptx::modules(&bundles);
     let mut ok = true;
     for name in [
         "flash_latent",
@@ -177,7 +179,7 @@ fn no_local_depot() -> Result<bool, GateError> {
         "kv_append",
         "kv_append_pos_buf",
     ] {
-        let c = bloomery_gpu_gates::ptx::counts(&blob, name)
+        let c = bloomery_gpu_gates::ptx::counts(&modules, name)
             .ok_or_else(|| format!("gate_p5: no PTX entry {name} in this executable"))?;
         let (depot, loads, stores) = (c.depot, c.ld_local, c.st_local);
         let pass = !depot && loads == 0 && stores == 0;

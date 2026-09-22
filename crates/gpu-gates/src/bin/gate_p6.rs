@@ -646,10 +646,11 @@ fn router_shape() -> Result<bool, GateError> {
     // compiler rather than the shape.
     let gemv_fma_floor = GEMV_COLS + LANE_UNROLL;
 
-    let blob = std::fs::read(std::env::current_exe()?)?;
+    let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
+    let modules = bloomery_gpu_gates::ptx::modules(&bundles);
     let mut ok = true;
     for name in ["f32_gemv", "q8_0_gemv"] {
-        let c = bloomery_gpu_gates::ptx::counts(&blob, name)
+        let c = bloomery_gpu_gates::ptx::counts(&modules, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
         let pass = c.fma >= gemv_fma_floor && !c.depot;
         println!(
@@ -662,7 +663,7 @@ fn router_shape() -> Result<bool, GateError> {
         ok &= pass;
     }
     for name in ["router_topk", "expert_table"] {
-        let c = bloomery_gpu_gates::ptx::counts(&blob, name)
+        let c = bloomery_gpu_gates::ptx::counts(&modules, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
         let ntid = c
             .reqntid
@@ -702,10 +703,11 @@ fn router_shape() -> Result<bool, GateError> {
 /// goes — while the control arm and every bit-identity gate stay green.
 #[cfg(feature = "gpu")]
 fn q3k_half_decode_shape() -> Result<bool, GateError> {
-    let blob = std::fs::read(std::env::current_exe()?)?;
+    let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
+    let modules = bloomery_gpu_gates::ptx::modules(&bundles);
     let mut ok = true;
     let counts = |name: &str| -> Result<(usize, usize), GateError> {
-        let b = bloomery_gpu_gates::ptx::body(&blob, name)
+        let b = bloomery_gpu_gates::ptx::body(&modules, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
         Ok((
             bloomery_gpu_gates::ptx::count(b, b"clz."),

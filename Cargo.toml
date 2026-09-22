@@ -8,6 +8,7 @@ exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_s
 # cuda-oxide는 rev로 고정한다. 떠 있으면 어제의 수치와 오늘의 수치가 다른 컴파일러에서 나온다.
 cuda-device = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
 cuda-host = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+oxide-artifacts = { version = "0.2.1", git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
 cuda-core = "0.3.1"
 libc = "0.2"
 memmap2 = "0.9"
