@@ -68,7 +68,7 @@
 - **R1 보강** — 커널의 연속 벡터 로드(4·8워드 `get_unchecked` 묶음)는 **묶음 하나에 SAFETY 하나**로 충분하다: 청크 경계(`base + 8 <= len`)를 증명하는 한 줄. 공유메모리 배열(`SharedArray`)의 집합적 접근은 표준 문구를 쓴다 — `// SAFETY: block-shared, N == blockDim.x, written before the barrier that publishes it`. "as above"·"as in X"·"cuda-oxide shared array access"는 SAFETY가 아니다(12곳).
 - **R8 보강** — `#[kernel]` 엔트리는 인자 수 제한에서 **면제**(디바이스 ABI가 인자를 그대로 받는다). 호스트 `enqueue_*` 런처는 면제가 아니다 — `*Args` 구조체 하나를 받아 커널 런치에 펼친다.
 - **R12 보강** — `#[kernel]` 본체는 `#[target_feature]` 본체와 같은 면제(AGENTS의 측정 근거). 게이트 바이너리의 `main`은 선형 파이프라인이라 120줄이 아니라 **논리 단계(로드 / eager / graph / 타이밍) 단위 분리**까지만 요구한다.
-- **R9 예외** — `gpu-gates`의 `lib.rs`(게이트 보조 라이브러리)는 `Box<dyn Error>`를 유지한다: 소비자가 전부 게이트 바이너리고 실패는 곧 종료다. `crates/gpu`의 `GpuError = Box<dyn Error>`는 예외가 **아니다** — R9 위반이고 라운드 대상.
+- **R9 예외** — `gpu-gates`의 `lib.rs`(게이트 보조 라이브러리)는 `Box<dyn Error>`를 유지한다: 소비자가 전부 게이트 바이너리고 실패는 곧 종료다. `crates/gpu`의 `GpuError = Box<dyn Error>`는 예외가 **아니다** — R9 위반이고 라운드 대상. → 2026-09-22 `gpuerr`로 닫힘(`960bde5`, 9변형, 수동 impl). `thiserror`는 workspace 의존성이라(`gguf`·`model`·`qdot`) 써도 새 의존성이 아니다 — 수동 impl을 고른 것은 그 라운드 스펙의 판단이고 규칙이 아니다.
 - **R10 예외** — 포이즌 락 회수(`lock().unwrap_or_else(|e| e.into_inner())`)는 `unwrap`이 아니다. 벤치 루프 안 `launch().unwrap()`(gate_moe_fused/p0b `us_per_replay`)은 바이너리라 R10 대상 아님.
 - **R23 (신설)** — **부동소수 비교·정렬은 `total_cmp`**. `partial_cmp().unwrap()`은 NaN에서 패닉이고 NaN은 게이트가 잡아야 할 값이지 패닉 사유가 아니다.
 - **R24 (신설)** — **`let x = e.unwrap() else { … }`는 죽은 코드다**(unwrap이 먼저 패닉). `ok_or_else(..)?` 또는 `match`. 검증 헬퍼의 `ok: &mut bool` 누적 인자도 같은 부류 — `bool`/`Result`를 돌려준다.
