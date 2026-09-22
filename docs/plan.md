@@ -8,9 +8,10 @@
 
 ~~**비행 중(2026-09-22 아침)**: A4b 두 라운드 — `kprobe`·`ikread`·`peerread`.~~
 
-**인계(2026-09-22 오후, 세션을 rig-log에서 이 레포로 옮기며)**
-- **비행 중**: `errsrc`(워크트리 `bloomery-errsrc`) — 우리 K-quant 활성 양자화가 128값 블록당 스케일 하나, ik q8_1은 32값 블록이다. 이것이 참값 대비 추가 오차를 설명하는지 전 세트 시뮬레이션으로 확인하는 중. 보고에 "기본 모드(`--act` 없음, `--kv f64`)가 전과 같은 수를 내는지"(프롬프트 12 전 스텝 대조)가 있어야 한다. `fnsplit`(워크트리 `bloomery-fnsplit`) — `enqueue_attn`·`enqueue_ffn_moe`·`LayerScratch::new`·`profile_layer` R12 분할과 탭 헬퍼 R14. 이동·분할 클래스라 PTX 표 동일이면 A/B 없이 머지.
-- **결정 대기(사용자)**: e2e 핀을 이산 개수에서 σ 연속량으로 바꿀지(「모델 / 오차 모델과 핀」), 32값 활성 블록 수정 라운드를 열지(errsrc 결과 뒤), MMA 레버 기본값.
+**인계(2026-09-22 저녁, 세션을 rig-log에서 이 레포로 옮기며)**
+- **비행 중**: 없다. 워크트리는 `bloomery-a4c`만 남아 있다(이전 라운드 것 — 열기 전에 상태 확인).
+- **오늘 닫힌 것**: errsrc — 참값 대비 추가 오차의 원인은 활성 128값 블록(시뮬 41 → 32값 25, σ 0.378 → 0.255 = ik 수준). 사용자 결정으로 **기본값은 128 유지, 32값은 `exact_ref --act ik` 시뮬로만**(「모델 / 성능이 먼저, 정확도는 선택」). σ는 `gate-gpu-e2e`의 진단 줄이 됐다(핀 아님, 엔진 0.3518). fnsplit 머지 완료.
+- **결정 대기(사용자)**: MMA 레버 기본값.
 - **리드 할 일**: `gate_e2e.rs`의 `data_file`·`exact_ref.rs`의 `BLOOMERY_DATA`·`forced_probe.rs`의 데이터 경로를 `lib.rs::data_dir()`로. `docs/rust-quality.md` §0 재측정(lint 211). 오늘치 rig-log 기록(참값 자 전환, ik도 29/27에서 틀림, 스칼라 합산 순서 잡음, 리팩터 라운드).
 - **다음 리팩터 후보**(트리아지 원본은 세션 스크래치였다 — 요지만): tools6(셸 기본값을 `ref-paths.sh`로), gates-c(`gate_p10` `Table`, `assert_eq!`→`Err`, 검사 중복), gpucast(R5), 미해결 doc 링크 8건 + rustdoc 게이트, `model::probe`→`instrument` 개명, 커널 모듈 `pub` 52개 가시성, exact_ref 가중치 재역양자화 캐시.
 
