@@ -34,7 +34,7 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
 | 어텐션 | MLA — 잠재 K, rope 꼬리 64, `wk_b` 흡수, 헤드별 `wv_b`; flash는 `[k_rope ; kv_compressed]` 576행 | MLA 아님 — 512차원 잠재 하나가 K=V, 64헤드 직접 내적, 헤드별 sink, 출력 꼬리 역-rope, 블록 대각 `wo_a`→`wo_b`; 윈도우 128행 + 고른 512행 = 최대 640행 | **아키텍처 사슬** + deepseek41 전용 커널(sink 어텐션·역-rope·그룹 출력 투영·압축기·인덱서·hc·engram 게이트) |
 | KV 토폴로지 | 층마다 `[ctx_max, 576]` f16 평면 하나(`Vec<DeviceTensor<u16>>`), 슬롯 표는 하나 | 층마다 128행 링(윈도우) + **비율 그룹 넷이 공유**하는 압축 행(2–7·8–13·14–19·20–39) + 인덱서 키 | **아키텍처 타입** — 결정 2의 `(seq, pos)` 슬롯 표는 공유, **행 저장소**만 아키텍처 것. 그룹 공유 캐시는 "층 슬롯당 버퍼 하나"로는 표현이 안 된다 — 이것이 타입이 갈리는 첫 자리다 |
 | 스텝 입력 | 토큰 id, 위치(`step_params` 1버퍼) | 토큰 id, 위치, **engram 48행(13,056 B, 한 스텝 앞서 발행)**, 압축 층의 **호스트 색인 계획**(`v41-ports.md`: 비율 기계는 그래프 분기가 아니라 스텝마다 호스트가 세우는 계획) | **아키텍처 타입** — `ChainBody::Input` |
-| MoE | 라우터 softmax → top-6 → 정규화·스케일, **64 → 6 핀**(`MoeDims::read`가 전문가 수·슬롯 수·텐서별 양자화 타입을 핀) | `√softplus` + 선택 편향 → top-6 → 재정규화 ×1.5, 384 → 6, SwiGLU ±10, 합 `Σ+1e-20` | 라우터·점수는 **아키텍처 커널**, 전문가 `_sel` 본체(gate/up/down, K 인자)는 **공유**, 전문가 **배치와 호스트 티어는 공유 서비스**(아래 「직교」) |
+| MoE | 라우터 softmax → top-6 → 정규화·스케일, **64 → 6 핀**(`MoeDims::read`가 전문가 수·슬롯 수·텐서별 양자화 타입을 핀) | `√softplus` + 선택 편향 → top-6 → 재정규화 ×1.5, 384 → 6, SwiGLU ±10, 합 `Σ+1e-20` | 라우터·점수는 **아키텍처 커널**; 전문가 `_sel` 본체는 형상이 같으니 **공유**되되 타입이 갈린다 — gate/up은 q3_K(있음), down은 **q5_K(커널도 디퀀트도 없다**, `quant.rs:198`·`weights.rs:253`), shared 전문가는 q8_0(우리 융합 gate/up은 q3_K 전용); 전문가 **배치와 호스트 티어는 공유 서비스**(아래 「직교」) |
 | 헤드 | `output_norm` + `output`, eps는 `mla.eps` | 같음 + 마지막 FFN의 `pre`로 스트림을 접는 마지막 접기 | **거의 공유** — 접기는 사슬 끝에서, `Head`는 eps를 계획에서 받는다 |
 | 파생 가중치 | `wk_b`의 Q8_0 재양자화(`Derived`, 로드 시 CPU) | 알려진 것 없음(hc `comb`·층 종류별 rope 표는 후보 — B4가 정한다) | **아키텍처 계획** |
 | 가중치 형식 | `DevWeight`: K-quant(Q3/Q4/Q6)·Q5_0·Q5_1·F32 + 파생 Q8_0. **파일 텐서로서의 Q8_0 팔이 없고, BF16이 없고, Q5_K는 `weights.rs:253/356`이 거부** | q8_0 **332개(216 GB)**, bf16 45개, q5_K 2개(인벤토리 `## types`) | **공유 크레이트의 일**(B1의 이웃) — 아키텍처가 아니다 |
@@ -153,9 +153,10 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
   것이지만 그 뒤 "선택된 전문가를 gate/up/down `_sel`로 돌려 합친다"는 두 모델이 같은 모양이다 → 공유
   `moe::enqueue_experts(placement, …)` 하나를 두 사슬이 부르고, **B2의 경계는 그 함수 안 한 곳**이다.
 - **engram(B3)**: 공유 크레이트, 부르는 것은 deepseek41의 `Body`뿐.
-- **DSpark(C4)**: 같은 파일의 40–42층, 같은 상주 가중치 위의 **두 번째 사슬**. `GpuModel`이 캡처 그래프를 `Chain`
-  종류별로 들 수 있게 필드를 스칼라가 아니라 맵으로 둔다 — 문만 열어 두고 짓지 않는다. deepseek2는 `Chain::Decode`
-  하나다.
+- **DSpark(C4)**: 같은 상주 가중치 위의 **두 번째 사슬**(드래프트 층 + 본 경로의 층 입력 평균). `GpuModel`이 캡처
+  그래프를 `Chain` 종류별로 들 수 있게 필드를 스칼라가 아니라 맵으로 둔다 — 문만 열어 두고 짓지 않는다. deepseek2는
+  `Chain::Decode` 하나다. **우리 V4.1 파일에는 DSpark 텐서가 없다**(`v41-op-map` 발견: `mtp_nextn` 티어 0개, 포트의
+  그래프도 MTP 꺼짐을 단언) — C4는 그 텐서를 실은 다른 양자화 파일이 먼저다.
 - **프리필 m>1(A5)**: `Input`이 m을 든다. 두 사슬 다.
 
 ## 검사 — 기계가 잡는 것
@@ -199,5 +200,10 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
 
 - 크레이트 밖 디바이스 코드(S0). 이 답이 `crates/gpu-deepseek41`인지 피처인지를 정한다.
 - V4.1 커널 모듈 하나가 `cargo oxide build`에 더하는 시간(S0가 하나를 재고, N개는 파생으로만 말한다).
-- V4.1 파일의 메타데이터 키 전수 — 인벤토리는 텐서만 적었다(샤드 1에 kv 68개). `v41-op-map.md`(비행 중)가
-  가져오지 않으면 `gguf-inventory`에 키 표를 더한다. `deepseek41.engram.*`이 있다는 것은 `v41-ops.md`의 독해다.
+- V4.1 파일의 메타데이터 키 전수 — 인벤토리는 텐서만 적었다(샤드 1에 kv 68개). 포트의 로더가 **요구하는** 키는
+  `v41-op-map`이 원본에서 확인했다(`deepseek41.engram.{layer_ids, head_count, key_length, max_ngram_size, pad_id,
+  multipliers, primes, offsets, token_map}` 아홉 개, 하나라도 없으면 로드 실패) — 우리 파일이 그 값을 무엇으로 갖는지는
+  `gguf-inventory`에 키 표를 더해야 읽힌다(헤더만, 임대 없음).
+- **계획은 기본값을 만들지 않는다.** 포트는 `hyper_connection.sinkhorn_iterations`가 없으면 조용히 **3**(참조 20),
+  `hyper_connection.epsilon`이 없으면 rms eps로 떨어진다(`v41-op-map` 발견). 우리 `arch/deepseek41/hparams.rs`는
+  `rms_eps`처럼 없는 키를 오류로 낸다 — 파일이 값을 안 가지면 그 사실이 게이트 줄이지, 리터럴이 아니다.
