@@ -9,7 +9,7 @@
 **2026-09-23 새벽(사용자 "적극적으로 병렬 오케스트레이션, 자율 진행")** — main `8707bf1`, origin보다 23커밋 앞(푸시는 사용자 승인).
 
 - **툴체인이 CUDA 13.3이 됐다(리드, 박스)**: 13.3.1 툴킷을 13.0 옆에 설치했다(apt 신규 63·업그레이드 0·제거 0, 드라이버 615.71.09 그대로 — 이미 UMD 13.4). `~/bloomery-env.sh`의 `PATH`·`CUDA_TOOLKIT_PATH`를 13.3으로(원본 `~/bloomery-env.sh.cuda130`). **커널은 안 바뀐다**: cuda-oxide 커널은 PTX로 실려 드라이버가 JIT하고, 13.3으로 지은 `.oxart`가 세 바이너리 모두 md5 `61edb10b…`로 13.0과 같다. 툴킷이 닿는 곳은 bindgen 드라이버 바인딩뿐이다(13.3에서 `cuGraphNodeGetParams`·`cuLaunchHostFunc_v2`·`cuDevSmResourceSplit` 등이 늘었다). 13.3 환경에서 GPU 게이트 16개의 판정 줄 416줄이 main 기준과 같고, `forced_exact` 40/41·σ 0.3641/0.3518·648노드·eager = replay도 같다. **ik는 13.0 그대로다**: `/usr/local/cuda` 대안을 13.0에 수동 고정했다(ik의 CMake `nvcc`와 `ldconfig`가 그 경로를 따른다). `llama-bench`는 RUNPATH로 13.0의 cudart·cuBLAS를 문다. **바뀐 계기 하나**: PATH의 `ncu`/`nsys`가 2026.2.1/2026.1.3이 됐다 — 다음 프로파일 표는 새 계기로 도니 첫 표를 한 번 교차 확인한다. cutile-rs(sm_8x에 13.2 이상)의 전제가 섰다(MUL-6).
-- **비행 중(파동 8′)**: `m3` ‖ `m3b` ‖ `b3e` ‖ `cudares`(13.1~13.3에서 새로 생긴 것 중 sm_86에 닿는 것 조사). 아래 「파동」 참조.
+- **비행 중(파동 8′)**: `m3` ‖ `m3b` ‖ `b3e` ‖ `b0c`(오라클 v3 도구 — 덤퍼의 BF16·I64와 정수 무손실 사본, deepseek41 프로필; V4.1 실행은 리드가 추정을 보고 정한다) ‖ `cudares`(13.1~13.3에서 새로 생긴 것 중 sm_86에 닿는 것 조사). 아래 「파동」 참조.
 - **리드 몫**: 세 라운드 검수·머지 → `check-arch` 엄격 전환(`weights.rs`의 `strip_prefix("blk.")`는 모든 아키텍처가 공유하는 접두 파싱이라 검사 ②의 정밀 수정 몫) → B3b 헬퍼 팔과 B3e 캐시 팔 임대 측정 → rig-log. CUDA 전환 기록도 rig-log에.
 - **사용자 판단 대기**: bloomery main 푸시, B0c 오라클 v3 덤프(RAM 250 GB·두 카드, 30분 초과), ik를 13.3으로 다시 빌드할지(빌드하면 ik 기준선을 다시 재야 한다).
 - **열린 결정 후보**: 스칼라 세그먼트 패스(와 그것만 재는 keyaxis 계기 8개)를 지울지 — 「성능이 먼저」는 엔진이 경로 하나만 싣는다고 했다.
@@ -355,7 +355,7 @@ flowchart LR
 
 | 파동 | 병렬로 뜨는 것 | 리드가 그 사이 하는 것 | 파동을 닫는 조건 |
 |---|---|---|---|
-| **8′ (2026-09-23 새벽)** | `m3`(`gpu-gates`·`AnyEngine`·`DEFAULT_MODEL` → 프로필) ‖ `m3b`(`weights.rs`·`model.rs`·`arch/deepseek2`) ‖ `b3e`(`crates/engram`) ‖ `cudares`(조사, 파일 무변경) — 전부 opus | CUDA 13.3 전환(끝남 — 「지금」), plan.md 분할, 세 머지 → `check-arch` 엄격 전환 → B3b·B3e 임대 측정 | 세 머지, `check-arch` 엄격 초록 |
+| **8′ (2026-09-23 새벽)** | `m3`(`gpu-gates`·`AnyEngine`·`DEFAULT_MODEL` → 프로필) ‖ `m3b`(`weights.rs`·`model.rs`·`arch/deepseek2`) ‖ `b3e`(`crates/engram`) ‖ `b0c`(`tools/ref` 덤퍼·프로필, 박스 쓰기는 `/root/bloomery-data-b0c`만) ‖ `cudares`(조사, 파일 무변경) — 전부 opus | CUDA 13.3 전환(끝남 — 「지금」), plan.md 분할, 세 머지 → `check-arch` 엄격 전환 → B3b·B3e 임대 측정 | 세 머지, `check-arch` 엄격 초록 |
 
 `model.rs` 점유 순서(하나씩): `m3b` → A2-2 → B2 → A5 조립 → B5 → C4.
 
