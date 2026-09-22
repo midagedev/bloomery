@@ -17,14 +17,24 @@
 #              blocks, not clean prose. It is the long-stream witness (millions of tokens),
 #              not a prose measurement; its repetition is an upper bound, because near-identical
 #              build instructions and log formats recur across threads.
+#   threads    those github-data/ threads alone, in byte order — the conversational set
+#   korean     this repository's own Korean prose: every docs/**/*.md at least 20 % Hangul by
+#              character, in byte order — the one non-English set on the box
+#
+# The two newer sets sort under LC_ALL=C, so their file order does not depend on the box's
+# locale; the first three keep the locale sort their existing .ids files were built with.
+# `korean` reads the synced tree, so its text is the commit box.sh last synced — record the
+# commit next to the .ids md5 when a number rests on it.
 #
 # Output: $BLOOMERY_DATA/engram/corpus-<name>.ids, one decimal token id per line. Text, not
 # packed u32, so the file greps, diffs and truncates like everything else under $BLOOMERY_DATA.
 #
-# Usage: bash tools/ref/engram-corpus.sh [code|prose|prose-all]...   (default: all three)
+# Usage: bash tools/ref/engram-corpus.sh [code|prose|prose-all|threads|korean]...
+#        (default: the first three)
 set -euo pipefail
 
 IK=${IK:-/home/user/ik_llama.cpp}
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TOKENIZE=${TOKENIZE:-$IK/build/bin/llama-tokenize}
 DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 V41_DIR=${BLOOMERY_V41_DIR:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8}
@@ -50,8 +60,18 @@ gather() {
       { find "$IK/docs" -name '*.md' | sort | xargs -d '\n' cat --; cat -- "$IK/README.md"; } ;;
     prose-all)
       find "$IK" -name '*.md' -not -path '*/.git/*' | sort | xargs -d '\n' cat -- ;;
+    threads)
+      find "$IK/github-data" -name '*.md' | LC_ALL=C sort | xargs -d '\n' cat -- ;;
+    korean)
+      find "$ROOT/docs" -name '*.md' | LC_ALL=C sort | python3 -c '
+import sys
+for path in sys.stdin.read().splitlines():
+    t = open(path, encoding="utf-8").read()
+    if sum("\uac00" <= c <= "\ud7a3" for c in t) >= 0.2 * max(1, len(t)):
+        print(path)
+' | xargs -d '\n' cat -- ;;
     *)
-      echo "engram-corpus: unknown set '$1' (code, prose, prose-all)" >&2; exit 64 ;;
+      echo "engram-corpus: unknown set '$1' (code, prose, prose-all, threads, korean)" >&2; exit 64 ;;
   esac
 }
 
