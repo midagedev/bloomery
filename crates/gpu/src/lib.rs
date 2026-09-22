@@ -39,6 +39,7 @@ pub mod head;
 pub mod model;
 pub mod moe_fused;
 pub mod probe;
+pub mod q4k_sel;
 pub mod q5;
 pub mod q8f32;
 pub mod router;
@@ -1336,6 +1337,7 @@ pub struct Gpu {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
+    q4k_sel: q4k_sel::Q4kSelKernels,
     q5: q5::Q5Kernels,
     q8f32: q8f32::Q8F32Kernels,
     elem: elem::ElemKernels,
@@ -1362,6 +1364,7 @@ impl Gpu {
         // contract before launching.
         let module = unsafe { kernels::load(&ctx)? };
         Ok(Gpu {
+            q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx)?,
             q5: q5::Q5Kernels::load(&ctx)?,
             q8f32: q8f32::Q8F32Kernels::load(&ctx)?,
             elem: elem::ElemKernels::load(&ctx)?,
@@ -1373,6 +1376,11 @@ impl Gpu {
             stream,
             module,
         })
+    }
+
+    /// Q4_K gemv over expert slots selected on the device (the down shape).
+    pub fn q4k_sel(&self) -> &q4k_sel::Q4kSelKernels {
+        &self.q4k_sel
     }
 
     /// Q5_0 / Q5_1 gemv and the 32-value activation quantizer.

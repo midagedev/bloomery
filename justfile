@@ -78,6 +78,10 @@ gate-gpu-p6:
 gate-gpu-p9:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p9 && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_p9'
 
+# B6: q4k_gemv_sel — 슬롯마다 그 expert 하나로 돈 q4k_gemv와 비트 동일, 범위 밖 id는 슬롯을 건드리지 않는다.
+gate-gpu-q4k-sel:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_q4k_sel && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_q4k_sel'
+
 # 종단 게이트: 27층 + lm_head + argmax 전체 사슬을 ik CUDA greedy(33프롬프트 × 32스텝)와 대조하고,
 # 그래프 재생이 즉시 실행과 토큰 단위로 같은지 본다(정확성 실행, 측정 아님). 이름이 pN이 아닌 이유는
 # gate_e2e.rs 머리글 — P9·P10은 커널 꾸러미로 이미 쓰이고 있다. 두 번 돈다: 기본 패스(텐서 코어 flash)와
