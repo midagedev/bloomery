@@ -71,7 +71,7 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::GpuModel;
+use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
@@ -277,7 +277,7 @@ fn run() -> Result<(), GateError> {
     }
 
     let gguf = open_model()?;
-    let mut model = GpuModel::load_full(&gguf, ctx)?;
+    let mut model = Deepseek2Model::load_full(&gguf, ctx)?;
     model.set_mode(mode);
     if let Some(rounds) = flag_value("--ab")? {
         if seed_depth.is_some() {
@@ -417,7 +417,7 @@ fn run() -> Result<(), GateError> {
 /// launch cost or that stage's cost alone.
 #[cfg(feature = "gpu")]
 fn ab(
-    model: &mut GpuModel,
+    model: &mut Deepseek2Model,
     tokens: &[u32],
     n_gen: usize,
     rounds: usize,
@@ -507,7 +507,7 @@ fn launch_arms() -> [(&'static str, StepProbe); 4] {
 /// then time the `n_gen - 1` feedback steps and return their p50.
 #[cfg(feature = "gpu")]
 fn arm_p50(
-    model: &mut GpuModel,
+    model: &mut Deepseek2Model,
     tokens: &[u32],
     n_gen: usize,
     probe: StepProbe,

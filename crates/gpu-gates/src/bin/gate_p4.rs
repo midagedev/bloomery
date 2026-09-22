@@ -56,7 +56,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::elem::{ARGMAX_THREADS, ElemKernels};
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuModel};
+    use bloomery_gpu::{DeviceTensor, Gpu, MlaParams};
 
     // Reduction ops' band vs the f64 host reference (the package's gate rule:
     // 1e-5 for a tree-vs-serial sum); 1e-6 for the plain-op band of rope and
@@ -84,10 +84,10 @@ fn run() -> Result<(), GateError> {
         .and_then(gguf::Value::as_f32)
         .ok_or("gate_p4: metadata <arch>.attention.layer_norm_rms_epsilon missing")?;
 
-    // The rope parameters, built by the CPU engine's own reader — the only
-    // public constructor of `RopeParams` reachable from this package (via
-    // `GpuModel`); the YaRN cache must be the engine's exact math.
-    let mla = GpuModel::load(&gguf, 1)?.mla().clone();
+    // The rope parameters, built by the CPU engine's own reader — the same
+    // call the engine's own load makes; the YaRN cache must be the engine's
+    // exact math.
+    let mla = MlaParams::read(&gguf, 0)?;
 
     // The embedding table, uploaded once in the load-time format.
     let (emb_info, emb_bytes) = tensor_bytes_as(&gguf, "token_embd.weight", GgmlType::Q3_K, None)?;

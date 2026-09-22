@@ -80,7 +80,7 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::GpuModel;
+use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
@@ -264,7 +264,7 @@ fn read_argmax_ids(path: &std::path::Path) -> Result<Vec<(usize, u32, Vec<u32>)>
 /// cross-checked against the file's.
 #[cfg(feature = "gpu")]
 fn run_set(
-    model: &mut GpuModel,
+    model: &mut Deepseek2Model,
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
 ) -> Result<Vec<Vec<u32>>, GateError> {
@@ -339,7 +339,7 @@ fn margin_at(logits: &[f32], top1: u32) -> (f32, u32) {
 /// EOS has no tokens to force past its end.
 #[cfg(feature = "gpu")]
 fn run_forced(
-    model: &mut GpuModel,
+    model: &mut Deepseek2Model,
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
 ) -> Result<Forced, GateError> {
@@ -433,7 +433,7 @@ fn write_margins(
 /// than reporting a divergence it caused itself.
 #[cfg(feature = "gpu")]
 fn check_forced(
-    model: &mut GpuModel,
+    model: &mut Deepseek2Model,
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
     eager: &[Vec<u32>],
@@ -603,7 +603,7 @@ fn lcg_prompt(n: usize) -> Vec<u32> {
 /// One continuation of `prompt`: fresh caches, the prompt fed one token at
 /// a time, then `DEEP_GEN` - 1 feedback steps.
 #[cfg(feature = "gpu")]
-fn run_deep(model: &mut GpuModel, prompt: &[u32]) -> Result<Vec<u32>, GateError> {
+fn run_deep(model: &mut Deepseek2Model, prompt: &[u32]) -> Result<Vec<u32>, GateError> {
     model.reset()?;
     let mut next = model.step(prompt)?;
     let mut seq = Vec::with_capacity(DEEP_GEN);
@@ -727,7 +727,7 @@ fn run() -> Result<(), GateError> {
     }
 
     let gguf = open_model()?;
-    let mut model = GpuModel::load_full(&gguf, CTX_MAX)?;
+    let mut model = Deepseek2Model::load_full(&gguf, CTX_MAX)?;
     println!(
         "resident bytes={} ctx_max={CTX_MAX} layers=0..{} gen={GEN}",
         model.resident_bytes(),

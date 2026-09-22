@@ -1,5 +1,6 @@
-//! Instrumentation of the step: the tap snapshots, the per-launch byte
-//! accounting, the per-op profiling observer, and the node-price probe.
+//! Instrumentation of the step, shared by every architecture: the per-launch
+//! byte accounting, the per-op profiling observer, and the node-price probe.
+//! The tap snapshots an architecture reads back live beside its chain.
 
 use crate::GpuError;
 use crate::q5::Q8Blocks32;
@@ -7,162 +8,6 @@ use crate::tensor::Q8Act;
 use crate::weights::DevWeight;
 use cuda_core::CudaStream;
 use gguf::quant::GgmlType;
-
-/// Host copies of block 0's tap tensors for one position, in the dump's
-/// logical order at that position. The fused FFN exposes neither
-/// `ffn_norm-0` nor the down-projection `ffn_out-0` (the norm feeds the
-/// quantizer in registers; the down store folds the residual) — `l_out-0`
-/// carries that span.
-pub struct Block0Taps {
-    pub attn_norm: Vec<f32>,
-    pub q: Vec<f32>,
-    pub kv_rope_compressed: Vec<f32>,
-    /// Head-major `q_rope(h)` per head, the dump's `(d, h, t)` at one t.
-    pub q_rope: Vec<f32>,
-    pub k_rope: Vec<f32>,
-    pub kv_compressed: Vec<f32>,
-    /// Head-major `kqv(h)` per head.
-    pub kqv_compressed: Vec<f32>,
-    pub kqv_out: Vec<f32>,
-    pub ffn_inp: Vec<f32>,
-    pub l_out: Vec<f32>,
-}
-
-impl Block0Taps {
-    /// First tap holding a non-finite value, if any — the gate's finiteness
-    /// check over every span, including the ones not compared.
-    pub fn non_finite(&self) -> Option<&'static str> {
-        let all: [&str; 10] = [
-            "attn_norm",
-            "q",
-            "kv_rope_compressed",
-            "q_rope",
-            "k_rope",
-            "kv_compressed",
-            "kqv_compressed",
-            "kqv_out",
-            "ffn_inp",
-            "l_out",
-        ];
-        let vals: [&[f32]; 10] = [
-            &self.attn_norm,
-            &self.q,
-            &self.kv_rope_compressed,
-            &self.q_rope,
-            &self.k_rope,
-            &self.kv_compressed,
-            &self.kqv_compressed,
-            &self.kqv_out,
-            &self.ffn_inp,
-            &self.l_out,
-        ];
-        all.iter()
-            .zip(vals)
-            .find(|(_, v)| v.iter().any(|x| !x.is_finite()))
-            .map(|(n, _)| *n)
-    }
-
-    /// Bit equality of every tap — the gate's rerun/replay checks.
-    pub fn bits_equal(&self, other: &Block0Taps) -> bool {
-        let eq = |a: &[f32], b: &[f32]| {
-            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-        };
-        eq(&self.attn_norm, &other.attn_norm)
-            && eq(&self.q, &other.q)
-            && eq(&self.kv_rope_compressed, &other.kv_rope_compressed)
-            && eq(&self.q_rope, &other.q_rope)
-            && eq(&self.k_rope, &other.k_rope)
-            && eq(&self.kv_compressed, &other.kv_compressed)
-            && eq(&self.kqv_compressed, &other.kqv_compressed)
-            && eq(&self.kqv_out, &other.kqv_out)
-            && eq(&self.ffn_inp, &other.ffn_inp)
-            && eq(&self.l_out, &other.l_out)
-    }
-}
-
-/// Host copies of one layer's tap tensors for one position, in the dump's
-/// logical order at that position. The MoE spans are empty for a layer
-/// without a router, and so is `ffn_norm` (the fused dense FFN keeps its
-/// normed vector in registers). The routed
-/// half's `ffn_moe_out` and `ffn_out` are not here: `moe_combine` folds the
-/// weighted sum, the shared expert and the residual into one store, so
-/// `l_out` carries that span — `expert_down` and `moe_weights` are the
-/// operands a caller can recombine.
-pub struct LayerTaps {
-    pub layer: usize,
-    pub attn_norm: Vec<f32>,
-    pub q: Vec<f32>,
-    pub kv_rope_compressed: Vec<f32>,
-    /// Head-major `q_rope(h)` per head, the dump's `(d, h, t)` at one t.
-    pub q_rope: Vec<f32>,
-    pub k_rope: Vec<f32>,
-    pub kv_compressed: Vec<f32>,
-    /// Head-major `kqv(h)` per head.
-    pub kqv_compressed: Vec<f32>,
-    pub kqv_out: Vec<f32>,
-    pub ffn_inp: Vec<f32>,
-    pub ffn_norm: Vec<f32>,
-    pub moe_logits: Vec<f32>,
-    /// The router's chosen expert ids, rank order — the `sel` the expert
-    /// kernels read.
-    pub moe_ids: Vec<u32>,
-    /// The router weight of each chosen expert, same order.
-    pub moe_weights: Vec<f32>,
-    /// Each slot's down projection, slot-major (`n_used * hidden`).
-    pub expert_down: Vec<f32>,
-    pub ffn_shexp: Vec<f32>,
-    pub l_out: Vec<f32>,
-}
-
-impl LayerTaps {
-    /// Every f32 span with its name, in forward order — the finiteness and
-    /// bit-equality checks walk this one list so a new tap cannot be added
-    /// to the struct and forgotten by the checks.
-    fn spans(&self) -> [(&'static str, &[f32]); 14] {
-        [
-            ("attn_norm", &self.attn_norm),
-            ("q", &self.q),
-            ("kv_rope_compressed", &self.kv_rope_compressed),
-            ("q_rope", &self.q_rope),
-            ("k_rope", &self.k_rope),
-            ("kv_compressed", &self.kv_compressed),
-            ("kqv_compressed", &self.kqv_compressed),
-            ("kqv_out", &self.kqv_out),
-            ("ffn_inp", &self.ffn_inp),
-            ("ffn_norm", &self.ffn_norm),
-            ("moe_logits", &self.moe_logits),
-            ("moe_weights", &self.moe_weights),
-            ("expert_down", &self.expert_down),
-            ("ffn_shexp", &self.ffn_shexp),
-        ]
-    }
-
-    /// First tap holding a non-finite value, if any — the gate's finiteness
-    /// check over every span, including the ones not compared.
-    pub fn non_finite(&self) -> Option<&'static str> {
-        self.spans()
-            .into_iter()
-            .chain([("l_out", self.l_out.as_slice())])
-            .find(|(_, v)| v.iter().any(|x| !x.is_finite()))
-            .map(|(n, _)| n)
-    }
-
-    /// Bit equality of every tap, the routed ids included — the gate's
-    /// rerun/replay checks.
-    pub fn bits_equal(&self, other: &LayerTaps) -> bool {
-        let eq = |a: &[f32], b: &[f32]| {
-            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-        };
-        self.layer == other.layer
-            && self.moe_ids == other.moe_ids
-            && eq(&self.l_out, &other.l_out)
-            && self
-                .spans()
-                .into_iter()
-                .zip(other.spans())
-                .all(|((_, a), (_, b))| eq(a, b))
-    }
-}
 
 /// Device bytes one launch touches, each distinct byte counted once: the
 /// weight rows it addresses, the activation planes it reads, the spans it
@@ -174,7 +19,7 @@ impl LayerTaps {
 pub(crate) type Bytes = Option<u64>;
 
 /// Sum of byte parts, `None` if any part is not derivable.
-pub(super) fn bsum(parts: &[Option<usize>]) -> Bytes {
+pub(crate) fn bsum(parts: &[Option<usize>]) -> Bytes {
     parts
         .iter()
         .try_fold(0usize, |acc, p| Some(acc + (*p)?))
@@ -196,7 +41,7 @@ fn kq_row_bytes(ty: GgmlType, k: usize) -> Option<usize> {
 /// addresses. The q5 rows are eight code words plus the block's scale
 /// (Q5_0) or scale and min (Q5_1) per 32 values — the `q_stride` window
 /// padding past the last block is allocated but never addressed.
-pub(super) fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
+pub(crate) fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
     let k = w.k();
     Some(match w {
         DevWeight::KQuant { ty, .. } => rows * kq_row_bytes(*ty, k)?,
@@ -223,7 +68,7 @@ fn act_planes(k: usize) -> (usize, usize, usize, usize, usize) {
 
 /// Bytes `cols` columns of the q8_1 quantizer write: every plane, since one
 /// quantize serves the Q3_K, Q4_K and Q6_K gemvs alike.
-pub(super) fn act_write_bytes(a: &Q8Act, cols: usize) -> usize {
+pub(crate) fn act_write_bytes(a: &Q8Act, cols: usize) -> usize {
     let (q3, q4, q6, s8, d8) = act_planes(a.k());
     cols * (q3 + q4 + q6 + s8 + d8)
 }
@@ -232,7 +77,7 @@ pub(super) fn act_write_bytes(a: &Q8Act, cols: usize) -> usize {
 /// code plane and the block scales, Q4_K the 32-bit codes, the group sums
 /// and the scales, Q6_K its own code plane and the scales. `None` for a
 /// weight that is not a K-quant.
-pub(super) fn gemv_act_bytes(w: &DevWeight, a: &Q8Act, cols: usize) -> Option<usize> {
+pub(crate) fn gemv_act_bytes(w: &DevWeight, a: &Q8Act, cols: usize) -> Option<usize> {
     let (q3, q4, q6, s8, d8) = act_planes(a.k());
     let DevWeight::KQuant { ty, .. } = w else {
         return None;
@@ -250,7 +95,7 @@ pub(super) fn gemv_act_bytes(w: &DevWeight, a: &Q8Act, cols: usize) -> Option<us
 /// Bytes of `cols` columns of the 32-value q8 blocks the q5 gemvs read and
 /// their quantizer writes: eight code words, one scale and one sum per 32
 /// values (the `q_stride` padding is never addressed).
-pub(super) fn blocks32_bytes(b: &Q8Blocks32, cols: usize) -> usize {
+pub(crate) fn blocks32_bytes(b: &Q8Blocks32, cols: usize) -> usize {
     cols * 40 * (b.k() / 32)
 }
 
@@ -272,9 +117,9 @@ pub struct OpTime {
 /// count, and the wall clock of the previous synchronize. Owned by
 /// [`GpuModel::profile_layer`](crate::GpuModel::profile_layer)'s rep loop, borrowed by the observer closure
 /// for one chain run at a time.
-pub(super) struct ProfRec {
-    pub(super) ops: Vec<(&'static str, Bytes, Vec<f64>)>,
-    pub(super) last: std::time::Instant,
+pub(crate) struct ProfRec {
+    pub(crate) ops: Vec<(&'static str, Bytes, Vec<f64>)>,
+    pub(crate) last: std::time::Instant,
 }
 
 impl ProfRec {
@@ -283,7 +128,7 @@ impl ProfRec {
     /// name and the byte count must be the same on every rep: both are
     /// functions of the shapes, so a rep that changes either would be
     /// timing a different chain.
-    pub(super) fn observe(
+    pub(crate) fn observe(
         &mut self,
         i: usize,
         name: &'static str,
@@ -415,7 +260,7 @@ impl StepProbe {
 
     /// The segment-pass probe entry this probe selects, as the stage bit and
     /// the second pass's row offset; `None` is the shipped entry.
-    pub(super) fn flash_seg_twice(&self) -> Option<(u32, usize)> {
+    pub(crate) fn flash_seg_twice(&self) -> Option<(u32, usize)> {
         [
             (self.flash_qk2, crate::flash::TWICE_QK, 0),
             (
@@ -444,7 +289,7 @@ impl StepProbe {
     /// segment runs a kernel with no probe twin at all; and the merge lever
     /// probes the q8 merge, which `skip_quant` and `split_flash_quant`
     /// replace with the plain one.
-    pub(super) fn check(&self, cache_rows: usize) -> Result<(), GpuError> {
+    pub(crate) fn check(&self, cache_rows: usize) -> Result<(), GpuError> {
         let seg = [
             self.flash_qk2,
             self.flash_qk2c,
@@ -494,7 +339,7 @@ impl StepProbe {
 /// the same launches in the same order as an uninstrumented chain — the
 /// observer is host-side only and never touches the stream. The op index is
 /// the graph node index of the same launch.
-pub(super) fn tick(
+pub(crate) fn tick(
     i: &mut usize,
     obs: &mut Observer<'_>,
     name: &'static str,
@@ -507,4 +352,60 @@ pub(super) fn tick(
 
 /// The host-side observer a chain enqueue ticks: `(op index, op name, the
 /// bytes that launch touches)`.
-pub(super) type Observer<'a> = dyn FnMut(usize, &'static str, Bytes) -> Result<(), GpuError> + 'a;
+pub(crate) type Observer<'a> = dyn FnMut(usize, &'static str, Bytes) -> Result<(), GpuError> + 'a;
+
+/// The rep loop a per-op profile runs: 20 warm-up runs whose samples are
+/// discarded, then `reps` measured runs of `run` under the profiling
+/// observer.
+pub(crate) fn profile_reps(
+    stream: &CudaStream,
+    reps: u32,
+    run: &mut impl FnMut(&mut Observer<'_>) -> Result<(), GpuError>,
+) -> Result<ProfRec, GpuError> {
+    let mut rec = ProfRec {
+        // Slot i is created by op i's first firing (indices arrive in
+        // chain order); the name and the byte count are cross-checked on
+        // every later rep.
+        ops: Vec::new(),
+        last: std::time::Instant::now(),
+    };
+    const WARMUP: u32 = 20;
+    for rep in 0..(WARMUP + reps) {
+        rec.last = std::time::Instant::now();
+        let mut obs = |i: usize, name: &'static str, b: Bytes| rec.observe(i, name, b, stream);
+        run(&mut obs)?;
+        if rep < WARMUP {
+            for (_, _, s) in rec.ops.iter_mut() {
+                s.clear();
+            }
+        }
+    }
+    Ok(rec)
+}
+
+/// Err unless a capture of `run` holds exactly `observed` nodes.
+pub(crate) fn check_one_node_per_tick(
+    gpu: &crate::Gpu,
+    observed: usize,
+    run: &mut impl FnMut(&mut Observer<'_>) -> Result<(), GpuError>,
+) -> Result<(), GpuError> {
+    // The observer bills the window between two ticks to one op, so a
+    // tick that covered two launches would fold them into one row with
+    // no sign of it. Capture the same chain into a throwaway graph (the
+    // stage's own capture is untouched) and require one node per tick:
+    // the node count is where a folded pair shows.
+    let probe = gpu.capture(|_| run(&mut |_, _, _| Ok(())))?;
+    if observed != probe.node_count() {
+        return Err(GpuError::shape(
+            "profile_layer",
+            format!(
+                "{} ops observed but the same chain captures {} nodes — an op \
+             issued more than one launch before its tick, so its neighbours' times are \
+             mis-attributed",
+                observed,
+                probe.node_count()
+            ),
+        ));
+    }
+    Ok(())
+}

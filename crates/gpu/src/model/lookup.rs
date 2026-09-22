@@ -7,7 +7,7 @@ use cuda_core::DeviceBuffer;
 
 /// The resident weight by name — the `DevWeight` itself, which carries the
 /// quantization type and `k` the byte accounting needs.
-pub(super) fn dev_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DevWeight, GpuError> {
+pub(crate) fn dev_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DevWeight, GpuError> {
     w.get(name)
         .ok_or_else(|| GpuError::tensor("dev_weight", name, "resident"))
 }

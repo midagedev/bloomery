@@ -61,7 +61,7 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::GpuModel;
+use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::StepProbe;
 #[cfg(feature = "gpu")]
@@ -203,7 +203,7 @@ fn run() -> Result<(), GateError> {
     .max(profile_ctx.unwrap_or(0) as usize);
     let gguf = open_model()?;
     let man = ref_manifest()?;
-    let mut model = GpuModel::load_blocks(&gguf, ctx_max, 0..profile_layer + 1)?;
+    let mut model = Deepseek2Model::load_blocks(&gguf, ctx_max, 0..profile_layer + 1)?;
     println!(
         "resident stage_bytes={} ctx_max={ctx_max} m=1 layers=0..{}",
         model.stages()[0].resident_bytes(),
@@ -713,7 +713,7 @@ fn run() -> Result<(), GateError> {
 /// the cooperative launch's price and the barrier's price in the same
 /// instrument, and against the same `touch` floor, as the node price.
 #[cfg(feature = "gpu")]
-fn bench_kernels(model: &GpuModel) -> Result<(), GateError> {
+fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
     use bloomery_gpu::probe::{GAP_THREADS, GapArm};
     use bloomery_gpu::{DeviceTensor, GpuError, Graph, Q8Act};
     use cuda_core::{CudaStream, DeviceBuffer};

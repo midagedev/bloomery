@@ -28,6 +28,7 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread,
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
+pub mod arch;
 pub mod cores;
 pub mod elem;
 pub mod flash;
@@ -46,6 +47,9 @@ pub mod weights;
 pub use ::model::attn::MlaParams;
 pub use graph::Graph;
 pub use model::GpuModel;
+/// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
+/// before the skeleton became generic over its architecture.
+pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;
 pub use tensor::{DeviceTensor, Q8Act};
 
 /// Host-side failure: context creation, module loading, device allocation,
@@ -559,8 +563,8 @@ mod kernels {
     }
 
     /// Q4_K packing recap (word arithmetic verified against ggml's
-    /// `dequantize_row_q4_K` on blk.0.attn_output bytes at 3.6e-8 before this
-    /// kernel was written): super-block = d f16 @0, dmin f16 @2, scales[12]
+    /// `dequantize_row_q4_K` on a real attention-output row at 3.6e-8 before
+    /// this kernel was written): super-block = d f16 @0, dmin f16 @2, scales[12]
     /// @4, qs[128] @16 — 144 bytes, always 4-aligned, no funnel needed.
     /// Sub-block s (32 consecutive weights, values 32s..32s+32) is nibble
     /// s&1 of qs bytes 32*(s>>1) .. +32: one nibble per byte, the sibling

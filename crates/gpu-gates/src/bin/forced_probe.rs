@@ -28,7 +28,7 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::GpuModel;
+use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::{LayerTaps, StepMode};
 #[cfg(feature = "gpu")]
@@ -166,7 +166,7 @@ fn run() -> Res<()> {
     std::fs::create_dir_all(&dump)?;
 
     let gguf = open_model()?;
-    let mut model = GpuModel::load_full(&gguf, ctx)?;
+    let mut model = Deepseek2Model::load_full(&gguf, ctx)?;
     model.set_mode(StepMode::Eager);
     let layers = model.stages()[0].layers();
     println!(
@@ -193,7 +193,7 @@ fn run() -> Res<()> {
         (&p.tokens[..], r.gen_ids[step - 1])
     };
     let mut trace = String::from("step\tours\ttheirs\tour_margin\ttheirs_gap\tref_margin\n");
-    let mut note = |s: usize, model: &GpuModel, ours: u32| -> Res<()> {
+    let mut note = |s: usize, model: &Deepseek2Model, ours: u32| -> Res<()> {
         let lg = model.logits()?;
         let rk = ranked(&lg);
         let theirs = r.gen_ids[s];

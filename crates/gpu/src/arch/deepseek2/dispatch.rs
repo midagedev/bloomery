@@ -1,20 +1,21 @@
 //! Launch order: the chain, one layer, and the layer's attention and FFN
 //! halves, enqueued asynchronously against the resident arena.
 
-use super::kernels::{
-    HeadsGeom, Q3kGemvHeadsArgs, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels,
-};
-use super::lookup::{dev_weight, f32_gain, f32_tensor, kq_weight, q8_derived};
-use super::probe::{
-    Bytes, Observer, StepProbe, act_write_bytes, blocks32_bytes, bsum, gemv_act_bytes, tick,
-    weight_bytes,
-};
-use super::scratch::{Gather, LayerNames, LayerScratch, MoeDims, MoeScratch};
+use super::names::LayerNames;
+use super::scratch::{Gather, LayerScratch, MoeDims, MoeScratch};
 use crate::flash::{
     FlashGeom, FlashInputs, FlashLatentArgs, FlashLatentQ8Args, FlashMerge2Q8Args, FlashMergeArgs,
     FlashMergeQ8Args, FlashSegArgs, FlashSegTwiceArgs,
 };
 use crate::head::Head;
+use crate::model::kernels::{
+    HeadsGeom, Q3kGemvHeadsArgs, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels,
+};
+use crate::model::lookup::{dev_weight, f32_gain, f32_tensor, kq_weight, q8_derived};
+use crate::model::probe::{
+    Bytes, Observer, StepProbe, act_write_bytes, blocks32_bytes, bsum, gemv_act_bytes, tick,
+    weight_bytes,
+};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};

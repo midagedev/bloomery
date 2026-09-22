@@ -41,7 +41,7 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::GpuModel;
+use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::StepProbe;
 #[cfg(feature = "gpu")]
@@ -120,7 +120,7 @@ fn run() -> Result<(), GateError> {
     let gguf = open_model()?;
     let man = ref_manifest()?;
     let dir = ref_dir();
-    let mut model = GpuModel::load_blocks(&gguf, CTX_MAX, LAYER..LAYER + 1)?;
+    let mut model = Deepseek2Model::load_blocks(&gguf, CTX_MAX, LAYER..LAYER + 1)?;
     println!(
         "resident stage_bytes={} ctx_max={CTX_MAX} m=1 layer={LAYER}",
         model.stages()[0].resident_bytes()
