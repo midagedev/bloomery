@@ -147,15 +147,16 @@ build-cpu:
     ./tools/box.sh 'cd crates/q3k-cpu && RUSTFLAGS="-C target-cpu=znver3" cargo build --release'
 
 # 빌드는 레시피 의존성이 한다(measure-decode와 같은 모양) — 러너가 재는 것은 방금 빌드된
-# 바이너리여야 하고, 빌드는 임대·유휴 대기 밖에서 끝나야 한다. build-ref는 두 참조 하네스
+# 바이너리여야 하고, 빌드는 임대·유휴 대기 밖에서 끝나야 한다. build-ref-bench는 두 참조 하네스
 # ($BLOOMERY_DATA/bin/q3k_ref·q3k_cpu_ref)를 만든다: cpu-measure.sh는 그것을 부르면서
-# 빌드는 하지 않았다.
+# 빌드는 하지 않았다. 전부(x4 하네스와 덤프까지)가 필요하면 build-ref다 — 측정 앞에 그것을
+# 걸면 매 측정이 gate-qdot의 참조 덤프를 다시 쓰게 된다.
 # 측정. 러너가 조용한 기계 규약(GPU 유휴 대기 / 기계 전역 flock)과 증인 기록을 소유한다.
 # 측정값을 손으로 모으지 말고 이 두 타깃만 쓴다.
-measure-gpu: build-ref build-gpu
+measure-gpu: build-ref-bench build-gpu
     ./tools/box.sh 'bash tools/ref/measure.sh'
 
-measure-cpu: build-ref build-cpu
+measure-cpu: build-ref-bench build-cpu
     ./tools/box.sh 'bash tools/ref/cpu-measure.sh'
 
 # 2026-09-20 사고(q_nope2 무한루크가 gate-mt를 매달아 병렬 에이전트 둘을 '무활동'으로 죽임)의
@@ -202,10 +203,18 @@ measure-profile: build-decode
     ./tools/box.sh 'bash tools/ref/profile-measure.sh'
 
 # 참조 하네스(ggml에 링크하는 C++). 진실값과 기준 속도의 출처다.
-# build-qdot-ref.sh는 ik의 커널 테이블까지 링크하는 x4 하네스 넷을 짓고 **실행까지** 한다 —
-# gate-qdot의 hw 테스트 넷이 읽는 $BLOOMERY_DATA/ref/*-ik-dot.txt가 그 산출물이다.
+# build-qdot-ref.sh는 ik의 커널 테이블까지 링크하는 x4 하네스 여덟을 짓고 참조 하네스 넷을
+# **실행까지** 한다 — gate-qdot의 hw 테스트 넷이 읽는 $BLOOMERY_DATA/ref/*-ik-dot.txt가 그
+# 산출물이다. 나머지 넷(*_rate)은 빌드만 한다: 실행은 측정이다.
 build-ref:
     ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh && bash tools/ref/build-qdot-ref.sh'
+
+# measure-gpu·measure-cpu가 거는 좁은 쪽: 두 러너가 실제로 부르는 ggml 링크 하네스
+# ($BLOOMERY_DATA/bin/q3k_ref·q3k_cpu_ref)만 짓는다. x4 하네스를 짓고 **실행**하는
+# build-qdot-ref.sh는 여기 없다 — 그 실행이 gate-qdot의 참조 덤프를 덮어쓰므로, 측정 하나가
+# 다른 트랙의 게이트 입력을 갈아치우는 일이 된다.
+build-ref-bench:
+    ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh'
 
 # 의존성 감사. cuda-oxide가 rev로 고정돼 있는지가 핵심이다.
 deny:

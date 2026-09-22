@@ -61,8 +61,8 @@ guard_other() {
 # was measured. tools/box.sh syncs source and builds nothing (AGENTS "Profile the binary you
 # think you are profiling"), so a runner invoked without its build recipe measures whatever the
 # last round left in target/ — that is how an ik_ref column printed an older binary's values.
-# rc 2 = no binary, rc 3 = stale. Call this before taking the lease: a run that will be refused
-# must not first wait half an hour for the lock.
+# rc 2 = no binary or not called from the repo root, rc 3 = stale. Call this before taking the
+# lease: a run that will be refused must not first wait half an hour for the lock.
 #
 # Only files cargo reads are compared. A whole-tree -newer sweep over-refuses, because the sync
 # gives every file it transfers the box's own "now" and a RESULTS.md is not a build input.
@@ -72,6 +72,9 @@ guard_other() {
 # The sha256 is taken once here and printed by every later witness block: it is what makes a
 # past log answer "which binary was that row?" without rerunning anything.
 assert_fresh_binary() {
+  # The find below is relative, so the caller's cwd is part of the contract: from anywhere else
+  # it walks nothing, finds nothing newer, and the staleness check silently passes.
+  [ -f Cargo.toml ] || { echo "assert_fresh_binary: run from the repo root" >&2; return 2; }
   BIN_PATH=$1
   local newer
   if [ ! -x "$BIN_PATH" ]; then

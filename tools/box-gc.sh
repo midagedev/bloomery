@@ -32,7 +32,15 @@ PREFIX="$ROOT/target"
 self=$$
 anc=" $self "
 p=$self
+# Bounded: a PPid chain that never reaches 1 would spin here forever, and this scan runs at
+# the start and end of every track.
+steps=0
 while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
+  steps=$((steps + 1))
+  if [ "$steps" -gt 64 ]; then
+    echo "box-gc: ancestor walk exceeded 64 steps at pid $p — never-candidates may be incomplete" >&2
+    break
+  fi
   # PPid from status, not field 4 of stat: a comm containing a space or a ')' shifts every
   # field of stat, and the ancestor walk then stops at the wrong pid — which would put the
   # scanning shell's own parent back among the candidates.

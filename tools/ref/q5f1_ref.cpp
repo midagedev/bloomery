@@ -33,6 +33,8 @@
 #define IQK_IMPLEMENT
 #include "iqk_gemm_legacy_quants.h"
 
+#include <cerrno>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,7 +122,17 @@ int main() {
     // size (iqk_mul_mat.cpp:96). Zero here computed row 0 sixty-four times.
     kernels[0](k, w.data(), rs, info, 64);
 
-    FILE *out = fopen((std::string(kDataDir) + "/ref/q5f1-ik-dot.txt").c_str(), "w");
+    // Write to <path>.tmp and rename: a reader (gate-qdot on another track, same
+    // shared $BLOOMERY_DATA) must never see a half-written dump. rename(2) within
+    // one directory is atomic, so the final path is either the old dump or the new one; the pid
+    // suffix keeps two tracks running build-ref at once from renaming each other's half file.
+    const std::string out_p = std::string(kDataDir) + "/ref/q5f1-ik-dot.txt";
+    const std::string tmp_p = out_p + ".tmp." + std::to_string(getpid());
+    FILE *out = fopen(tmp_p.c_str(), "w");
+    if (!out) {
+        fprintf(stderr, "q5f1_ref: cannot open %s for writing: %s\n", tmp_p.c_str(), strerror(errno));
+        return 1;
+    }
     fprintf(out, "tensor %s k %d\n", nm, k);
     for (size_t i = 0; i < y.size(); ++i) fprintf(out, "%02x", y[i]);
     fprintf(out, "\n");
@@ -128,7 +140,14 @@ int main() {
         uint32_t bits; memcpy(&bits, &dst[r], 4);
         fprintf(out, "row %d %08x\n", r, bits);
     }
-    fclose(out);
+    if (fclose(out) != 0) {
+        fprintf(stderr, "q5f1_ref: cannot write %s: %s\n", tmp_p.c_str(), strerror(errno));
+        return 1;
+    }
+    if (rename(tmp_p.c_str(), out_p.c_str()) != 0) {
+        fprintf(stderr, "q5f1_ref: cannot rename %s to %s: %s\n", tmp_p.c_str(), out_p.c_str(), strerror(errno));
+        return 1;
+    }
     printf("dumped 64 rows of %s (q8_2_x4 pairing, %zu-byte column with %d tail blocks)\n",
            nm, ysz, (k % 128) / 32);
     return 0;

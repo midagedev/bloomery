@@ -16,9 +16,12 @@ IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 # BLOOMERY_AB_ENVS="K=V;K=V K2=V2": 현재 트리의 같은 바이너리를 env만 바꿔 팔로 더 넣는다
 # (바이트가 같은 레버의 A/B — 빌드 둘의 링크 배치 차이가 끼지 않는다).
 IFS=';' read -r -a envs <<< "${BLOOMERY_AB_ENVS:-}"
+# 트리 이름 → 바이너리 경로. 사전 검사와 본 루프가 같은 규칙을 쓰게 하는 한 곳
+# (둘이 갈리면 "있다"고 확인한 것과 다른 파일을 잰다).
+bin_of() { echo "$HOME/repo/$1/target/release/bloomery-decode"; }
 bins=()
 for d in "$@" "$(basename "$PWD")"; do
-  b="$HOME/repo/$d/target/release/bloomery-decode"
+  b=$(bin_of "$d")
   [ -x "$b" ] || { echo "no decode binary at $b — run just build-decode in that tree" >&2; exit 2; }
   bins+=("$d")
 done
@@ -48,7 +51,7 @@ for r in $(seq "$ROUNDS"); do
       tree:*) d=${a#tree:}; label=$d; e="" ;;
       env:*) d=$here; e=${a#env:}; label="[$e]" ;;
     esac
-    out=$(env $e "$HOME/repo/$d/target/release/bloomery-decode" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
+    out=$(env $e "$(bin_of "$d")" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
     toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
     pre=$(echo "$out" | grep -E '^prefill' | sed 's/.*= //')
     med=$(echo "$out" | awk '/^ +[0-9]+ +[0-9]+ +[0-9.]+ /{print $3}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
