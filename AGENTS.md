@@ -35,6 +35,14 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
   both tools/box.sh …` still exists for functional runs on the A6000 and
   refuses (rc 75) while that card has a compute process — i.e. while a timing
   run holds it.
+- **Never start a box job longer than 30 minutes without the user's approval**
+  (user, 2026-09-22). Estimate the wall time before launching — full-set CPU
+  simulations, truth-file builds, depth sweeps, timing tables — and batch such
+  jobs so one approval covers one sitting of box time. A round spec that needs
+  one says so and names the estimate; the round waits for the lead, and the
+  lead asks the user. Gates and builds that finish inside 30 minutes need no
+  approval. (Context: the error-source round queued ~2 h of CPU simulation,
+  50 min of it a duplicate arm, without anyone asking.)
 - **Never relax a gate or a lint to make it pass.** Raise it with a dated
   comment and a reason, or file an issue. The lint levels in the root
   `Cargo.toml` carry the hit counts they were chosen from.
