@@ -107,7 +107,7 @@ could not win on a kernel already at ~700 GB/s.
 
 | Change class | Proof | Runtime gate | Timed A/B |
 |---|---|---|---|
-| move, split, rename (semantics kept) | `just ptx-scan` table identical | none (build + lint) | none |
+| move, split, rename (semantics kept) | `just ptx-scan` table identical — that proves the kernels only; host dispatch code also needs its structural lines unchanged (graph node count, eager = replay, e2e set identical) | none beyond those structural lines | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
 | launch count only | Δt = ΔN × c_node, predicted | the owning gate | once, only if occupancy moves too |
 | instruction count on a kernel near ~700 GB/s | model says 0 — do not open the round | — | — |
