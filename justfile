@@ -225,6 +225,11 @@ measure-gpu: build-ref-bench build-gpu
 measure-cpu: build-ref-bench build-cpu
     ./tools/box.sh 'bash tools/ref/cpu-measure.sh'
 
+# qdot 커널률(리드 전용): ik 자신의 x4 커널과 Rust qdot-rate를 같은 CPU 임대 안에서 한 코어에 고정해 번갈아 돈다.
+# ik 하네스는 build-ref가 짓는다. 인자는 라운드 수(기본 3).
+measure-qdot-rate *ARGS:
+    ./tools/box.sh 'cargo build --release -p bloomery-qdot --bin qdot-rate && bash tools/ref/qdot-rate.sh {{ARGS}}'
+
 # 2026-09-20 사고(q_nope2 무한루크가 gate-mt를 매달아 병렬 에이전트 둘을 '무활동'으로 죽임)의
 # 보강. 이 트랙 원격 디렉터리 아래 실행 파일을 물고 있는 고아 프로세스를 찾아 죽인다.
 # 고르는 축은 /proc/<pid>/exe이지 cmdline이 아니다 — `pgrep -f "<dir>/target"`은 그 패턴을
