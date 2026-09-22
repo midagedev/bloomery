@@ -1,4 +1,4 @@
-//! GPU kernel gate for package P2 (docs/gpu-design.md 작업 꾸러미): Q5_0 gemv
+//! GPU kernel gate for package P2 (docs/gpu-design.md work package): Q5_0 gemv
 //! on `blk.1.ffn_down_exps.weight` (the flat 64-expert stack, experts reached
 //! by `row0`) and Q5_1 on `blk.0.ffn_down.weight`, each within `KERNEL_BAND`
 //! against `ref_gemv` over the same rows. Also pins: bit-identical rerun per

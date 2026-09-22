@@ -1,4 +1,4 @@
-//! GPU gate for package P10 (docs/gpu-design.md 작업 꾸러미): resident
+//! GPU gate for package P10 (docs/gpu-design.md work package): resident
 //! weights — the whole model file uploaded once, in the device format each
 //! kernel consumes, proven against the per-gate uploads P1/P2/P3/P9 made.
 //! Every assertion is bit-exact (this gate is about bytes and addressing)
@@ -531,7 +531,10 @@ fn derived_ref_gemv(blocks: &[Q8Block], rows: usize, k: usize, x: &[f32], m: usi
 /// same `activations()` input. Returns each row's resident output bits (the
 /// whole-table rerun compares these).
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
+)]
 fn run_table(
     gguf: &Gguf,
     gpu: &Gpu,
@@ -557,7 +560,10 @@ fn run_table(
         let rb = row_bytes(info.ty, k)?;
         let words = bytes_to_words(&bytes[..rb * nrows]);
         let rref = DeviceTensor::upload(stream, &words, nrows, words.len() / nrows)?;
-        let DevWeight::KQuant { ty, w: res, .. } = w.get(name).unwrap() else {
+        let DevWeight::KQuant { ty, w: res, .. } = w
+            .get(name)
+            .ok_or_else(|| format!("run_table: {name} is not resident"))?
+        else {
             return Err(format!("run_table: {name} is not a KQuant resident weight").into());
         };
         if *ty != info.ty {
@@ -590,7 +596,10 @@ fn run_table(
         let kb = k / 32;
         let cols = 256 * kb.div_ceil(32) + 2 * kb;
         let rref = DeviceTensor::upload(stream, &pack_q5_1(bytes, k, nrows)?, nrows, cols)?;
-        let DevWeight::Q5_1 { w: res, .. } = w.get("blk.0.ffn_down.weight").unwrap() else {
+        let DevWeight::Q5_1 { w: res, .. } = w
+            .get("blk.0.ffn_down.weight")
+            .ok_or("run_table: blk.0.ffn_down is not resident")?
+        else {
             return Err("run_table: blk.0.ffn_down is not Q5_1".into());
         };
         for m in [1usize, 8] {
@@ -623,7 +632,10 @@ fn run_table(
             nexp * rpe,
             256 * kb.div_ceil(32) + kb,
         )?;
-        let DevWeight::Q5_0 { w: res, .. } = w.get("blk.1.ffn_down_exps.weight").unwrap() else {
+        let DevWeight::Q5_0 { w: res, .. } = w
+            .get("blk.1.ffn_down_exps.weight")
+            .ok_or("run_table: blk.1.ffn_down_exps is not resident")?
+        else {
             return Err("run_table: blk.1.ffn_down_exps is not Q5_0".into());
         };
         let x = activations(k, SEL.len(), seed);
@@ -662,7 +674,10 @@ fn run_table(
             .into());
         }
         let rref = DeviceTensor::upload(stream, &words, nexp * rpe, wpm)?;
-        let DevWeight::KQuant { w: res, .. } = w.get("blk.1.ffn_gate_exps.weight").unwrap() else {
+        let DevWeight::KQuant { w: res, .. } = w
+            .get("blk.1.ffn_gate_exps.weight")
+            .ok_or("run_table: blk.1.ffn_gate_exps is not resident")?
+        else {
             return Err("run_table: blk.1.ffn_gate_exps is not KQuant".into());
         };
         let x = activations(k, 1, seed);
@@ -692,7 +707,10 @@ fn run_table(
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let rref = DeviceTensor::upload(stream, &vals, nrows, k)?;
-        let DevWeight::F32 { w: res, .. } = w.get("blk.1.ffn_gate_inp.weight").unwrap() else {
+        let DevWeight::F32 { w: res, .. } = w
+            .get("blk.1.ffn_gate_inp.weight")
+            .ok_or("run_table: blk.1.ffn_gate_inp is not resident")?
+        else {
             return Err("run_table: blk.1.ffn_gate_inp is not F32".into());
         };
         for m in [1usize, 8] {
@@ -746,7 +764,10 @@ fn run_table(
 /// quantized activation: (resident vs reference, resident rerun, resident
 /// output bits).
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
+)]
 fn kid_kquant(
     gpu: &Gpu,
     stream: &CudaStream,
@@ -804,7 +825,10 @@ fn kid_kquant(
 /// One Q5_1 gemv shape on two uploads, one shared quantized activation:
 /// returns as `kid_kquant`.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
+)]
 fn kid_q5_1(
     q5: &Q5Kernels,
     stream: &CudaStream,
@@ -856,7 +880,10 @@ fn kid_q5_1(
 /// One Q5_0 `_sel` launch on two uploads of the expert stack: six slots
 /// read six quantized columns and select rows of the stack by `sel`.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
+)]
 fn kid_q5_0_sel(
     q5: &Q5Kernels,
     stream: &CudaStream,
@@ -902,7 +929,10 @@ fn kid_q5_0_sel(
 /// One Q3_K `_sel` launch on two uploads of the expert stack (m = 1: every
 /// slot shares the one quantized column).
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
+)]
 fn kid_q3k_sel(
     gpu: &Gpu,
     stream: &CudaStream,
@@ -947,7 +977,10 @@ fn kid_q3k_sel(
 
 /// One F32 gemv shape on two uploads: returns as `kid_kquant`.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
+)]
 fn kid_f32(
     q8f32: &bloomery_gpu::q8f32::Q8F32Kernels,
     stream: &CudaStream,
@@ -996,7 +1029,10 @@ fn kid_f32(
 /// One Q8_0 gemv shape on two uploads of the two planes: returns as
 /// `kid_kquant`.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
+)]
 fn kid_q8_derived(
     q8f32: &bloomery_gpu::q8f32::Q8F32Kernels,
     stream: &CudaStream,

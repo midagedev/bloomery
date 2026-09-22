@@ -146,8 +146,8 @@ fn sites() -> Vec<Site> {
 
 fn main() -> Result<(), ProbeError> {
     let model = std::env::var("BLOOMERY_REF_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-    // The probe reads the pre-v2 plain-file set by name, not the environment:
-    // its sites name `<tensor>-<layer>.0.f32` files that only that set carries.
+    // Pinned by name to the pre-v2 `ref_cuda` set, not steered by the
+    // environment the way `ref_dir()` is (which resolves to `ref_cuda_v2`).
     let dir = ref_dir_named("ref_cuda");
     let gguf = open_model()?;
     println!("rawx_floor: model {model}");

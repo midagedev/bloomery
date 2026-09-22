@@ -1,4 +1,4 @@
-//! GPU kernel gate for package P9 (docs/gpu-design.md 작업 꾸러미):
+//! GPU kernel gate for package P9 (docs/gpu-design.md work package):
 //! device-indirect expert addressing — one launch computes all `n_slots`
 //! selected experts of a resident 3-D stack, the ids read from a device
 //! buffer, so the launch is addressable from inside a captured CUDA graph

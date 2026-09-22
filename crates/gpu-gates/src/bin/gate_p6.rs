@@ -1,4 +1,4 @@
-//! GPU kernel gate for package P6 (docs/gpu-design.md 작업 꾸러미): the MoE
+//! GPU kernel gate for package P6 (docs/gpu-design.md work package): the MoE
 //! router — softmax over 64, top-6, weights — and the expert offset table.
 //!
 //! Asserted (implementation correctness) against a host scalar reference
@@ -702,13 +702,9 @@ fn router_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
 /// carry `clz` and are asserted to — the day one of them is converted this
 /// arm is what says which entries moved.
 ///
-/// GATE(2026-09-21, q3kdec round). FAIL-first observed: with only the
-/// `q3k_sb_decode` call site reverted to `half_to_f32` and the binary
-/// rebuilt (the build log shows `Compiling bloomery-gpu`, so not a stale
-/// artifact), this printed `shape op=q3k_gemv clz=2 want=0 cvt_f32_f16=0
-/// want>=1 FAIL` and `op=q3k_gemv_sel clz=1 … FAIL` while the control arm
-/// stayed green and every bit-identity gate stayed green — which is the
-/// point: the outputs cannot see this change, only the PTX can.
+/// Reverting `q3k_sb_decode`'s scale decode to `half_to_f32` fails this arm
+/// alone — `clz` reappears in both Q3_K entries and the hardware convert
+/// goes — while the control arm and every bit-identity gate stay green.
 #[cfg(feature = "gpu")]
 fn q3k_half_decode_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     let blob = std::fs::read(std::env::current_exe()?)?;

@@ -459,8 +459,8 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
 
 // -------------------------------------------------- promoted gate helpers
 // Single owners of the reference-side helpers the gate bins first wrote
-// locally. The bins keep their private copies until their owning tracks
-// switch them over; the math here is the transcription those copies carry.
+// locally; the bins import them from here. `gate_p5` still carries its own
+// `verdict` and `bits_equal` — its track owns that file.
 
 /// The word a gate prints for one check's outcome: `PASS` or `FAIL`. The
 /// gates' tables are compared line by line across rounds, so the spelling

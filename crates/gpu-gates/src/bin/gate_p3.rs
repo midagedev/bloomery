@@ -1,4 +1,4 @@
-//! GPU kernel gate for package P3 (docs/gpu-design.md 작업 꾸러미): the F32
+//! GPU kernel gate for package P3 (docs/gpu-design.md work package): the F32
 //! router gemv and the derived-Q8_0 gemv, f32 activations, against an f64
 //! reference over dequantized rows. The reference side is
 //! `bloomery_gpu_gates`; the band is 1e-5 — far tighter than

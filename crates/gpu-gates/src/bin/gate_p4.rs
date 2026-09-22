@@ -1,4 +1,4 @@
-//! GPU kernel gate for package P4 (docs/gpu-design.md 작업 꾸러미): the
+//! GPU kernel gate for package P4 (docs/gpu-design.md work package): the
 //! element-wise and reduction kernels of `bloomery_gpu::elem` — embedding row
 //! dequant, rms_norm, rope, swiglu, residual add, routed-expert weighted sum,
 //! argmax. Two layers per op (the package's gate rule):

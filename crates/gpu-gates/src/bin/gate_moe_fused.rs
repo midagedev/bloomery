@@ -284,7 +284,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The op path: eight enqueues. The adds are add(a, b) in the dump's own
     // operand order — ffn_out = moe + shexp, then y = ffn_out + resid.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a gate-local runner threading the buffer set its launches take; folding them into a params struct is R8's axis"
+    )]
     fn run_op(
         gpu: &Gpu,
         stream: &cuda_core::CudaStream,
@@ -324,7 +327,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The fused path: four enqueues.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a gate-local runner threading the buffer set its launches take; folding them into a params struct is R8's axis"
+    )]
     fn run_fu(
         gpu: &Gpu,
         moe: &MoeFusedKernels,

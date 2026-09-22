@@ -1,4 +1,4 @@
-//! GPU gate for package P8 (docs/gpu-design.md 작업 꾸러미): the assembled
+//! GPU gate for package P8 (docs/gpu-design.md work package): the assembled
 //! block-0 decode step (`GpuModel::step_block0_taps`), m = 1, against the ik
 //! CUDA oracle dump. The tap rels are PRINTED, never banded — the lead pins
 //! the block bands from this table. What is asserted:
@@ -86,8 +86,7 @@ const FENCE: f32 = 0.25;
 /// on a cache that fits in one flash segment, and one more when the cache is
 /// cut into segments and the merge pass joins the chain (`NODES_BLOCK0 +
 /// (segments > 1)`). Measured by this gate's own `graph graph_nodes=21` line
-/// at ctx_max 64 (prof2 round, 2026-09-21 — docs/plan.md, 장부; the lead's
-/// own rerun agreed). This is not a band: the node
+/// at ctx_max 64. This is not a band: the node
 /// count is a deterministic property of the chain, so the pin is exact and
 /// its margin is zero — the derivation is "what the chain enqueues today,
 /// after the fuse1 round's two fusions". A silently added launch — a fused

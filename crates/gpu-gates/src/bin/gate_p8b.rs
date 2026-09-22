@@ -1,4 +1,4 @@
-//! GPU gate for package P8b (docs/gpu-design.md 작업 꾸러미): the assembled
+//! GPU gate for package P8b (docs/gpu-design.md work package): the assembled
 //! MoE decode step of layer 1 (`GpuModel::step_layer_taps`), m = 1, against
 //! the ik CUDA oracle dump. A lone layer has no embedding in front of it, so
 //! its input residual is the oracle's own `l_out-0` column and its KV cache
@@ -69,8 +69,8 @@ const ROUTER_BAND: f32 = 1e-5;
 /// PIN(2026-09-21): the MoE layer's chain captures exactly this many graph
 /// nodes — sixteen attention ops (block 0's seventeen without the embed) and
 /// ten routed FFN ops, on this gate's one-segment cache. Measured by this
-/// gate's own `graph graph_nodes=26` line (prof2 round, 2026-09-21 — docs/plan.md,
-/// 장부; three runs identical, the lead's rerun agreed). Not a band: the count is a deterministic property
+/// gate's own `graph graph_nodes=26` line, identical on three consecutive
+/// runs. Not a band: the count is a deterministic property
 /// of the chain, so the pin is exact and its margin is zero. A silently
 /// added launch keeps the bit-identity arms green and fails only here.
 ///
@@ -101,9 +101,8 @@ const NODES_LAYER1: usize = 22;
 /// first `l_out-0` column that routes differently from the last token's, so
 /// both id vectors are fixed by the dump and the router alone: `[5, 38, 8,
 /// 20, 26, 27]` against `[57, 60, 56, 8, 26, 43]` differ in five of six
-/// slots. Measured identical on three consecutive runs
-/// (prof2 round, 2026-09-21 — docs/plan.md, 장부), which is what makes it
-/// pinnable — nothing here samples. Margin zero for the same reason as the
+/// slots. Measured identical on three consecutive runs, which is what makes
+/// it pinnable — nothing here samples. Margin zero for the same reason as the
 /// node pin. What it catches: a routing change that still leaves (f) green
 /// because the replay follows it. A legitimate change of the dump or of the
 /// router's tie-breaking re-pins this line with its own measurement.

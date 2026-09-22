@@ -1,4 +1,4 @@
-//! GPU gate for package P0b (docs/gpu-design.md 작업 꾸러미): the dense
+//! GPU gate for package P0b (docs/gpu-design.md work package): the dense
 //! block-0 FFN half as FOUR fused launches vs the EIGHT-launch op path, on
 //! the real block-0 tensors and the CUDA oracle dump's own activations
 //! (input = dump `ffn_inp-0`'s LAST token column). The contract is BIT
@@ -144,7 +144,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1-2 (norm+quantize) and 5 (swiglu). The residual add is
     // add(a=down output, b=ffn_inp) — the dump's `l_out-0 = ffn_out-0 +
     // ffn_inp-0` operand order.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a gate-local runner threading the buffer set its launches take; folding them into a params struct is R8's axis"
+    )]
     fn run_op(
         gpu: &Gpu,
         stream: &cuda_core::CudaStream,
@@ -176,7 +179,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The fused path: four enqueues, the same intermediates.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a gate-local runner threading the buffer set its launches take; folding them into a params struct is R8's axis"
+    )]
     fn run_fu(
         gpu: &Gpu,
         fused: &FusedKernels,
@@ -444,7 +450,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut kvr_fu = DeviceBuffer::<f32>::zeroed(stream, width)?;
         let mut cache_fu = DeviceTensor::<u16>::zeroed(stream, CACHE_ROWS, width)?;
 
-        #[allow(clippy::too_many_arguments)]
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "a gate-local runner threading the buffer set its launches take; folding them into a params struct is R8's axis"
+        )]
         fn key_op(
             gpu: &Gpu,
             step: &StepKernels,

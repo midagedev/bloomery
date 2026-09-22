@@ -1,4 +1,4 @@
-//! GPU kernel gate for package P1 (docs/gpu-design.md 작업 꾸러미): the
+//! GPU kernel gate for package P1 (docs/gpu-design.md work package): the
 //! K-quant gemvs and the shared q8_1 quantizer generalized from K=2048 to K
 //! as a launch argument.
 //!

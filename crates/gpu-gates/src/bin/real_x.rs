@@ -300,7 +300,10 @@ fn spikiness(x: &[f32], site: &str) -> Result<(f32, f32), Box<dyn std::error::Er
 /// reference) — the head's line prints `rows=<cap>/<total>`. Returns the
 /// three columns for the family summary, or None with a skip line printed.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local measurement site threading the dump row, tensor and geometry it measures; folding them into a params struct is R8's axis"
+)]
 fn real_kq_site(
     gpu: &Gpu,
     gguf: &Gguf,
