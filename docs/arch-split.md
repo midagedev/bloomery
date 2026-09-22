@@ -198,8 +198,16 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
 
 ## 열린 것 — 재서 닫는다
 
-- 크레이트 밖 디바이스 코드(S0). 이 답이 `crates/gpu-deepseek41`인지 피처인지를 정한다.
-- V4.1 커널 모듈 하나가 `cargo oxide build`에 더하는 시간(S0가 하나를 재고, N개는 파생으로만 말한다).
+- ~~크레이트 밖 디바이스 코드(S0). 이 답이 `crates/gpu-deepseek41`인지 피처인지를 정한다.~~ **닫힘(2026-09-23, 브랜치 `s0`
+  스파이크)**: `crates/gpu-deepseek41`이다. 다른 크레이트의 `#[cuda_module]`이 `bloomery_gpu::cores::q3k_row_dot`을 인라인해
+  PTX가 명령 단위로 같고(정규화 md5 동일, 라벨에 `bloomery_gpu__cores__q3k_row_dot_1col`이 남는다), 64행 비트 동일, `.oxart`
+  둘이 한 프로세스에 뜬다(앵커는 크레이트·버전으로 구분된다). 조건 둘: ① 공유 본체는 `pub` + `#[inline(always)]`(코어 14/14
+  이미 충족, `cores`·`q3k_row_dot`·`q8_1_quant_block`을 `pub`으로) ② **커널 엔트리 이름은 바이너리 전역 유일** — cuda-oxide의
+  호스트 커널 심벌 `cuda_oxide_kernel_246e25db_<entry>`가 크레이트·모듈로 네임스페이스되지 않아 같은 이름은 링크 실패
+  (`nvlabs-ledger` #12). 그래서 `crates/gpu-deepseek41`의 엔트리는 접두를 단다(`ds41_` — B4의 첫 op가 정한다). 피처 폴백은 필요 없다.
+- ~~V4.1 커널 모듈 하나가 `cargo oxide build`에 더하는 시간~~ S0가 잰 것은 가시성 확대의 값뿐이다(`gate_p8b` 증분 재빌드 중앙값
+  10.31 → 9.99 s, 3표본 — 차이가 분해되지 않는다). 새 디바이스 크레이트 하나의 값은 그 크레이트에 의존하는 바이너리가
+  생길 때(B4) 같은 방법으로 잰다.
 - V4.1 파일의 메타데이터 키 전수 — 인벤토리는 텐서만 적었다(샤드 1에 kv 68개). 포트의 로더가 **요구하는** 키는
   `v41-op-map`이 원본에서 확인했다(`deepseek41.engram.{layer_ids, head_count, key_length, max_ngram_size, pad_id,
   multipliers, primes, offsets, token_map}` 아홉 개, 하나라도 없으면 로드 실패) — 우리 파일이 그 값을 무엇으로 갖는지는
