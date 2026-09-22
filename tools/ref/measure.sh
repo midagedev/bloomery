@@ -7,7 +7,12 @@ set -euo pipefail
 # BLOOMERY_DATA defaults in ref-paths.sh, as in every runner here (BLOOMERY_DATA overrides it).
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-GPU_UUID=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
+# This runner stays on the 3090: the stage-0 rates it has recorded are that card's, and two
+# cards' numbers never share a table. timing-card.sh is not sourced here on purpose — it
+# exports CUDA_VISIBLE_DEVICES for the timing card, which would move this runner silently.
+# shellcheck source=tools/ref/cards.sh
+source "${BASH_SOURCE[0]%/*}/cards.sh"
+GPU_UUID=$GPU_3090
 
 wait_gpu() {
   local i out lines

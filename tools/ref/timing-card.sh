@@ -13,8 +13,8 @@
 # Timed numbers are taken on the A6000 and this overrides the 3090 pin in the box env file.
 # The 3090 is the gate-and-build card. Numbers from the two cards never belong in one table,
 # which is why the first witness line names the card and its power limit.
-GPU_3090=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1
-GPU_A6000=GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4
+# shellcheck source=tools/ref/cards.sh
+source "${BASH_SOURCE[0]%/*}/cards.sh"
 TIMING_GPU=${BLOOMERY_TIMING_GPU:-$GPU_A6000}
 if [ "$TIMING_GPU" = "$GPU_3090" ]; then OTHER_GPU=$GPU_A6000; else OTHER_GPU=$GPU_3090; fi
 export CUDA_VISIBLE_DEVICES=$TIMING_GPU
