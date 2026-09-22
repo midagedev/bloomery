@@ -45,7 +45,8 @@
 # 캐시에 덜 친절하고, CPU 깊이 표가 쓴 것과 같은 프롬프트라 두 표가 같은 말을 한다.
 set -uo pipefail
 # 모델·ik 트리·llama-bench 기본값(BLOOMERY_REF_MODEL·IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와
-# 같은 파일이 소유한다. 우리 팔의 generate는 모델을 BLOOMERY_REF_MODEL에서 직접 연다(같은 기본값).
+# 같은 파일이 소유한다. 우리 팔의 generate는 모델을 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가
+# 이 파일의 MODEL을 그 이름으로 export한다(generate 자신에게는 기본값이 없다).
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 N=${BLOOMERY_DECODE_N:-96}

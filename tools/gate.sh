@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 게이트 러너 — 박스에서, box.sh가 들어간 원격 디렉터리에서 돈다. 인자는 `cargo test` 뒤에 그대로 붙는다.
 #   ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test mt -- --ignored --nocapture'
+# 첫 인자가 --oxide면 디바이스 크레이트용으로 `cargo oxide test --arch sm_86 --` 뒤에 붙는다(plain cargo는
+# 디바이스 크레이트를 빌드하지 못한다 — AGENTS.md 「Never」).
+#   ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib'
 #
 # 막는 실패 둘:
 #  1. 매달린 게이트(2026-09-20 q_nope2 무한루프가 gate-mt를 한 시간 넘게 붙잡음) — 900초 상한,
@@ -11,7 +14,12 @@
 #     cargo의 코드를 그대로 돌려주고, 타임아웃 문구는 타임아웃일 때만 찍는다.
 set -uo pipefail
 BOUND=${BLOOMERY_GATE_BOUND:-900}
-timeout --kill-after=10 "$BOUND" cargo test "$@"
+RUN=(cargo test)
+if [ "${1:-}" = --oxide ]; then
+  shift
+  RUN=(cargo oxide test --arch sm_86 --)
+fi
+timeout --kill-after=10 "$BOUND" "${RUN[@]}" "$@"
 rc=$?
 # 124 = timeout이 TERM으로 끝냄, 137 = TERM을 무시해 --kill-after의 KILL로 끝냄.
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then

@@ -34,10 +34,9 @@ fmt-check:
 check-recipes:
     ./tools/check-recipes.sh
 
-# 아키텍처 축 점검(맥, grep뿐) — docs/arch-split.md 「검사」. --allow-pending 은 ②·③을 경고로
-# 낮춘다: 이관(M1~M3) 전에는 둘이 실제로 빨강이다. ②가 crates/gpu(M2 의 파일)에서 빨강이라 M2 가 머지되면 이 플래그를 뺀다.
+# 아키텍처 축 점검(맥, grep뿐) — docs/arch-split.md 「검사」. 셋 다 엄격하다.
 check-arch:
-    bash tools/check-arch.sh --allow-pending
+    bash tools/check-arch.sh
 
 # 주석 규약(AGENTS.md Conventions): 엔진 크레이트 src/ 주석에 이슈 번호·날짜 금지, 예외는 `PIN(날짜):`.
 check-comments:
@@ -366,7 +365,8 @@ gate-engram:
 build-engram:
     ./tools/box.sh 'cargo build --release -p bloomery-engram --bin engram-rate'
 
-# engram 토큰당 비용 표(팔 다섯). 기계 전역 임대를 잡으므로 리드가 조용한 시점에 친다.
+# engram 토큰당 비용 표(기본 팔 여덟 — 캐시 팔은 --ids와 함께 --arms로 부를 때만 돈다). 기계 전역 임대를
+# 잡으므로 리드가 조용한 시점에 친다.
 measure-engram *ARGS: build-engram
     ./tools/box.sh 'bash tools/ref/engram-rate.sh {{ARGS}}'
 
@@ -414,6 +414,11 @@ inventory-v41:
 # 덤프의 마지막 토큰과 대조(정확성 실행, 핀된 헤드 밴드 안).
 gate-gpu-head:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_head_gpu'
+
+# bloomery-gpu 라이브러리의 단위 시험(호스트 전용 — 카드를 쓰지 않아 게이트 락을 잡지 않는다).
+# 디바이스 크레이트라 cargo oxide test로 돈다; tools/gate.sh --oxide가 상한과 종료 코드를 같이 쥔다.
+gate-gpu-lib:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib'
 
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이

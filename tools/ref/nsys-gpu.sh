@@ -21,7 +21,8 @@
 # 그 기록 옆에 놓을 수 있다.
 set -uo pipefail
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
-# 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다(같은 기본값).
+# 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
+# export한다(generate 자신에게는 기본값이 없다).
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate}

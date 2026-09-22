@@ -8,10 +8,9 @@
 #   ③ general.architecture 를 읽는 자리는 crates/model/src/arch/mod.rs 하나다.
 #      crates/gguf 의 접근자는 저장소 쪽이라 허용한다.
 #
-# 계약: --allow-pending(또는 CHECK_ARCH_PENDING=1)은 ②·③을 경고로 낮춘다. M1·M2·M3 이관이
-# 끝나기 전에는 둘이 실제로 빨강이라 레시피를 지금 붙이려면 이 문이 필요하고, M1 이 머지되면
-# 리드가 레시피에서 이 플래그를 뺀다. ①은 어느 모드에서도 엄격하다 — 지금은 두 디렉터리가
-# 아직 없어서 통과하고, 생기는 순간부터 값을 한다.
+# 계약: `just check-arch`는 셋 다 엄격하게 돈다. --allow-pending(또는 CHECK_ARCH_PENDING=1)은 ②·③을
+# 경고로 낮추는 문이다 — 이관 라운드가 한동안 둘을 빨강으로 두어야 할 때 그 라운드 안에서만 쓴다.
+# ①은 어느 모드에서도 엄격하다.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,8 +36,8 @@ report() { # report <번호> <설명> <위반 줄들>
   fi
 }
 
-# ① 두 아키텍처 디렉터리가 서로를 use 하지 않는다. 디렉터리가 아직 없으면 grep 대상이 없어
-#    통과한다 — arch/deepseek41/ 은 B4 의 첫 op 가 만든다.
+# ① 두 아키텍처 디렉터리가 서로를 use 하지 않는다. 한쪽 디렉터리가 없으면 그쪽은 grep 대상이 없어
+#    통과하고, 생기는 순간부터 값을 한다.
 cross=
 cross_one() { # cross_one <이 아키텍처 디렉터리> <여기서 use 하면 안 되는 이름>
   local dirs hits
