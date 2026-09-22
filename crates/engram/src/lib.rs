@@ -1,17 +1,17 @@
 //! engram — the NVMe-resident lookup table of DeepSeek-V4.1-Flash.
 //!
-//! **This crate is the IO path, not the model path.** It answers one question:
-//! can NVMe serve 48 scattered row reads inside a decode step? It does not know
-//! which rows a token wants — that derivation (the rolling hash over the last
-//! three tokens, with its constants in the GGUF metadata) belongs to the model
-//! side and plugs in at [`Site::rows_into`], whose only input is a slice of row
-//! ids. [`SeededRows`] stands in for it so the access pattern is reproducible.
+//! **This crate is the IO path first.** It answers one question: can NVMe serve
+//! 48 scattered row reads inside a decode step? Which rows a token wants is the
+//! [`hash`] module's, built from the GGUF metadata's own constants; the two meet
+//! at [`Site::rows_into`], whose only input is a slice of row ids.
+//! [`SeededRows`] stands in for the hash when the point is the access pattern
+//! alone — a uniform draw is the zero-reuse floor.
 //!
-//! The table is `blk.1.engram_embd.weight` and `blk.14.engram_embd.weight`:
-//! two Q8_0 tensors of 256 values per row — 8 blocks × 34 B = **272 B a row** —
-//! and ~384 M rows each, 194.55 GiB together. It cannot live in RAM beside the
-//! weights, and caching it is not the design: each site is mapped and read
-//! where it lies.
+//! The tables are the `engram_embd` weights of the blocks the metadata names
+//! (blk.1 and blk.14 in V4.1-Flash): Q8_0 tensors of 256 values per row —
+//! 8 blocks × 34 B = **272 B a row** — and ~384 M rows each, 194.55 GiB
+//! together. They cannot live in RAM beside the weights, and each site is
+//! mapped and read where it lies.
 //!
 //! Four shapes the caller has to know about:
 //!
@@ -39,10 +39,13 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use gguf::{LoadError, RawTensorInfo, inventory_of};
+use gguf::{Inventory, LoadError, RawTensorInfo, inventory_of};
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 
+pub mod hash;
 pub mod prefetch;
+
+pub use hash::{Context, Hash};
 
 /// ggml type id of Q8_0, the type both engram tables carry.
 const GGML_TYPE_Q8_0: u32 = 8;
@@ -50,8 +53,21 @@ const GGML_TYPE_Q8_0: u32 = 8;
 const Q8_0_BLOCK: u64 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
 
-/// The tensors this crate opens. Same order as the block index.
-const SITE_NAMES: [&str; 2] = ["blk.1.engram_embd.weight", "blk.14.engram_embd.weight"];
+/// The tensor one engram site lives in. The block index is metadata, so this is
+/// the only place the name's shape is written down.
+fn site_name(layer_id: u32) -> String {
+    format!("blk.{layer_id}.engram_embd.weight")
+}
+
+/// Every `*.gguf` of a split set, in name order.
+fn shards_in(dir: &Path) -> Result<Vec<PathBuf>, EngramError> {
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
+        .collect();
+    shards.sort();
+    Ok(shards)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngramError {
@@ -59,8 +75,32 @@ pub enum EngramError {
     Io(#[from] std::io::Error),
     #[error("gguf header: {0}")]
     Header(#[from] LoadError),
-    #[error("no engram tensor in the shards given; looked for {0}")]
-    NoSites(String),
+    #[error("no shard carries the engram metadata; looked for {0}")]
+    NoHashMetadata(String),
+    #[error("the metadata names an engram site at {name}, and no shard carries that tensor")]
+    MissingSite { name: String },
+    #[error("gguf metadata has no key {key}")]
+    MissingKey { key: String },
+    #[error("{key}: the file's value is not {want}")]
+    KeyType { key: String, want: &'static str },
+    #[error("{key}: expected {want} values, the file has {got}")]
+    KeyLength {
+        key: String,
+        want: usize,
+        got: usize,
+    },
+    #[error("{key}: entry {at} is not {what}")]
+    KeyValue {
+        key: String,
+        at: usize,
+        what: &'static str,
+    },
+    #[error("engram site {site} is past the {sites} the metadata names")]
+    SiteOutOfRange { site: usize, sites: usize },
+    #[error("the context window wants {want} mapped tokens, got {got}")]
+    WindowSize { want: usize, got: usize },
+    #[error("one site's row ids want a {want}-id buffer, got {got}")]
+    RowBufferSize { want: usize, got: usize },
     #[error("{name}: ggml type {ty} is not Q8_0 ({GGML_TYPE_Q8_0})")]
     NotQ8_0 { name: String, ty: u32 },
     #[error("{name}: expected a 2-D tensor, header says dims {dims:?}")]
@@ -411,49 +451,69 @@ impl Site {
     }
 }
 
-/// The engram table of one model: one [`Site`] per engram layer.
+/// The engram table of one model: the hash and one [`Site`] per engram layer.
 pub struct Engram {
+    hash: Hash,
     sites: Vec<Site>,
 }
 
 impl Engram {
-    /// Open every engram table found in `shards`. Headers only — the tensor
+    /// Open every engram table the metadata names. Headers only — the tensor
     /// bytes are never touched, so a 444 GiB split opens in the time nine
     /// header parses take.
+    ///
+    /// The sites come back in `layer_ids` order, not in shard order, so
+    /// `sites()[e]` and the hash's site `e` are the same site by construction.
+    /// Every site the metadata names must be present: a set missing one is an
+    /// error, because the caller's `e` would otherwise silently mean a
+    /// different table.
     pub fn open<P: AsRef<Path>>(
         shards: impl IntoIterator<Item = P>,
     ) -> Result<Engram, EngramError> {
-        let mut sites = Vec::new();
-        for shard in shards {
-            let path = shard.as_ref();
-            let inv = inventory_of(path)?;
-            for name in SITE_NAMES {
+        let paths: Vec<PathBuf> = shards
+            .into_iter()
+            .map(|p| p.as_ref().to_path_buf())
+            .collect();
+        let mut invs: Vec<Inventory> = Vec::with_capacity(paths.len());
+        for path in &paths {
+            invs.push(inventory_of(path)?);
+        }
+        let hash = Hash::from_shards(&invs)?;
+
+        let mut slots: Vec<Option<Site>> = (0..hash.sites()).map(|_| None).collect();
+        for (path, inv) in paths.iter().zip(&invs) {
+            for (e, slot) in slots.iter_mut().enumerate() {
+                let name = site_name(hash.layer_ids()[e]);
                 let Some(t) = inv.tensors.iter().find(|t| t.name == name) else {
                     continue;
                 };
-                sites.push(Site::open(path, inv.data_base, inv.file_len, t)?);
+                *slot = Some(Site::open(path, inv.data_base, inv.file_len, t)?);
             }
         }
-        if sites.is_empty() {
-            return Err(EngramError::NoSites(SITE_NAMES.join(", ")));
+
+        let mut sites = Vec::with_capacity(slots.len());
+        for (e, slot) in slots.into_iter().enumerate() {
+            sites.push(slot.ok_or_else(|| EngramError::MissingSite {
+                name: site_name(hash.layer_ids()[e]),
+            })?);
         }
-        Ok(Engram { sites })
+        Ok(Engram { hash, sites })
     }
 
     /// Open the engram tables of the split set in `dir` (every `*.gguf` in it,
     /// in name order).
     pub fn open_dir(dir: impl AsRef<Path>) -> Result<Engram, EngramError> {
-        let mut shards: Vec<PathBuf> = std::fs::read_dir(dir.as_ref())?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
-            .collect();
-        shards.sort();
-        Engram::open(shards)
+        Engram::open(shards_in(dir.as_ref())?)
     }
 
-    /// The tables, in the order the shards named them.
+    /// The tables, in `layer_ids` order.
     pub fn sites(&self) -> &[Site] {
         &self.sites
+    }
+
+    /// The row derivation, with this model's own constants.
+    pub fn hash(&self) -> &Hash {
+        &self.hash
     }
 
     /// Bytes in the whole table, both sites summed.
@@ -559,19 +619,15 @@ impl Counters {
 
 /// Reproducible row ids, standing in for the model's derivation.
 ///
-/// **The real thing is not here.** In V4.1 a site's 24 ids per token come from
-/// a rolling hash over the last three tokens (3 orders × 8 heads) whose
-/// constants live in the GGUF metadata (`deepseek41.engram.{multipliers,
-/// primes, offsets, token_map, pad_id}`); the 24 buckets partition the table
-/// into disjoint prime-sized intervals, so one token's rows are spread over the
-/// whole table. That derivation is the model side's, and it meets this crate at
-/// [`Site::rows_into`] — a slice of ids is the entire interface.
+/// **The real derivation is [`Hash`]**, and an arm that wants the rows a real
+/// token stream asks for uses it. What this reproduces instead is the **access
+/// pattern**: uniform over the table, the same sequence for the same seed, with
+/// no allocation and no metadata.
 ///
-/// What this reproduces is the **access pattern**: uniform over the table, the
-/// same sequence for the same seed. What it does not reproduce is **reuse** —
-/// the real hash keys on n-grams, so common unigrams and bigrams re-hit rows
-/// that are still resident. A uniform draw over 384 M rows is the zero-reuse
-/// floor; real decode sits between it and an all-resident table.
+/// What it does not reproduce is **reuse** — the real hash keys on n-grams, so
+/// common bigrams re-hit rows that are still resident. A uniform draw over
+/// 384 M rows is the zero-reuse floor; real decode sits between it and an
+/// all-resident table, and `engram-reuse` is where that distance is measured.
 pub struct SeededRows {
     state: u64,
 }

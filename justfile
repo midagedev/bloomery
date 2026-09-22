@@ -370,6 +370,11 @@ build-engram:
 measure-engram *ARGS: build-engram
     ./tools/box.sh 'bash tools/ref/engram-rate.sh {{ARGS}}'
 
+# engram-reuse가 읽을 토큰 스트림. 참조 엔진의 토크나이저가 vocab만 읽는다 —
+# 측정이 아니라서 임대도, 조용한 기계도 필요 없다(초 단위).
+engram-corpus *ARGS:
+    ./tools/box.sh 'bash tools/ref/engram-corpus.sh {{ARGS}}'
+
 # 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
 gate-prompts:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test prompts -- --ignored --nocapture'

@@ -1,5 +1,7 @@
-//! Gates for the engram crate. Both are about **what the mapping serves**, not
-//! about how fast it serves it — speed belongs to `engram-rate` under a lease.
+//! Gates for the engram crate: what the mapping serves, and which rows the
+//! hash asks it for. Not how fast — speed belongs to `engram-rate` under a
+//! lease. Nothing here reads a row the identity gates did not name, so the
+//! whole file costs a few hundred page faults and not a few hundred thousand.
 //!
 //! `hw_` prefix: these need the box and the V4.1 split. They do not need the
 //! oracle — the reference here is the file itself, read a second way.
@@ -7,7 +9,7 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-use engram::{Engram, SeededRows, Site};
+use engram::{Context, Engram, SeededRows, Site};
 
 /// The split set the gates open: `$BLOOMERY_V41_DIR`, or the box's default.
 fn model_dir() -> String {
@@ -206,4 +208,215 @@ fn hw_engram_row_stride_tiles_the_tensor() {
             inv.file_len
         );
     }
+}
+
+/// The port's formula, written out a second time from the same constants.
+///
+/// The gate below compares this against `Hash::rows_into`, the way
+/// `hw_engram_rows_match_pread` compares the mapping against a `pread` at an
+/// offset it recomputes: asking the crate for both sides would let a wrong
+/// stride, a swapped context slot or an off-by-one agree with itself. Read it
+/// beside `llama_set_engram_rows` in the port, which is where it comes from.
+fn reference_rows(hash: &engram::Hash, site: usize, window: &[u64], out: &mut [u32]) {
+    let mult = hash.multipliers(site).unwrap();
+    let prime = hash.primes(site).unwrap();
+    let offset = hash.offsets(site).unwrap();
+    let heads = hash.n_heads();
+
+    let mut rolling = window[0].wrapping_mul(mult[0]);
+    for s in 1..hash.n_gram() {
+        rolling ^= window[s].wrapping_mul(mult[s]);
+        for h in 0..heads {
+            let b = (s - 1) * heads + h;
+            out[b] = (rolling % prime[b] + offset[b]) as u32;
+        }
+    }
+}
+
+/// The 24 buckets partition the site's table exactly, every id the hash
+/// produces is a row of that table, and the ids are the port's own formula.
+///
+/// Three facts, one contract. The primes sum to the row count the *header*
+/// states — a second witness, not a literal — and the offsets are their
+/// exclusive prefix sums, so bucket `b` owns `[offset[b], offset[b] + prime[b])`
+/// and the intervals tile the table with no gap and no overlap. Given those
+/// two, every `offset[b] + rolling % prime[b]` is in range and in its own
+/// bucket; the ids drawn here are the third fact, checked rather than argued,
+/// because the arithmetic that produces them is the part that can be wrong.
+///
+/// The contexts cover the three shapes that differ: ids inside the map, ids
+/// past its end (which must map to pad, not panic or index), and a window fresh
+/// from `reset()`, where every older slot is pad — the sequence start the port
+/// spends one token in.
+#[test]
+#[ignore = "hw: needs the box and the V4.1 split"]
+fn hw_engram_hash_buckets_partition_the_table() {
+    let engram = open();
+    let hash = engram.hash();
+    assert_eq!(
+        hash.sites(),
+        engram.sites().len(),
+        "one site per engram layer the metadata names"
+    );
+
+    let n_cols = hash.n_cols();
+    assert_eq!(
+        n_cols,
+        (hash.n_gram() - 1) * hash.n_heads(),
+        "buckets are (n_gram - 1) x heads"
+    );
+
+    let vocab = hash.token_map().len() as u32;
+    let mut rng = SeededRows::new(0xB3D0_1CE5);
+    let mut ids = vec![0u32; n_cols];
+
+    for (e, site) in engram.sites().iter().enumerate() {
+        let primes = hash.primes(e).unwrap();
+        let offsets = hash.offsets(e).unwrap();
+
+        assert_eq!(
+            hash.partition_rows(e).unwrap(),
+            site.rows(),
+            "{}: the buckets must cover the table the header describes exactly",
+            site.name()
+        );
+        let mut at = 0u64;
+        for (b, (&p, &o)) in primes.iter().zip(offsets).enumerate() {
+            assert_ne!(p, 0, "{}: bucket {b} divides by its prime", site.name());
+            assert_eq!(
+                o,
+                at,
+                "{}: bucket {b} must start where bucket {} ended",
+                site.name(),
+                b.wrapping_sub(1)
+            );
+            at += p;
+        }
+
+        // 10,000 contexts: two thirds inside the vocabulary, one third past its
+        // end, and every hundredth window starting fresh from a reset.
+        let mut ctx = Context::new(hash);
+        let mut draw = Vec::new();
+        let mut want = vec![0u32; n_cols];
+        for n in 0..10_000u32 {
+            let fresh = n % 100 == 0;
+            if fresh {
+                ctx.reset();
+            }
+            let previous = ctx.window()[0];
+            rng.next_into(u64::from(vocab) * 3 / 2, 1, &mut draw);
+            ctx.push(draw[0]);
+
+            // The window's slot order is what `reference_rows` cannot check:
+            // it is handed the window and would agree with a shift the wrong
+            // way. Slot 0 is the token just pushed, slot 1 the one before it,
+            // and after a reset every older slot is pad.
+            let window = ctx.window();
+            assert_eq!(
+                window[0],
+                hash.map_token(draw[0]),
+                "context {n}: slot 0 must be the token just pushed, mapped"
+            );
+            if fresh {
+                assert!(
+                    window[1..].iter().all(|&v| v == hash.pad_id()),
+                    "context {n}: after a reset every older slot must be pad, \
+                     the value the port substitutes before a sequence starts"
+                );
+            } else {
+                assert_eq!(
+                    window[1], previous,
+                    "context {n}: slot 1 must be what slot 0 held before the push"
+                );
+            }
+            hash.rows_into(e, ctx.window(), &mut ids).unwrap();
+            reference_rows(hash, e, ctx.window(), &mut want);
+            assert_eq!(
+                ids,
+                want,
+                "{}: context {n} — the crate's ids differ from the formula \
+                 re-derived here from the same constants",
+                site.name()
+            );
+
+            for (b, &id) in ids.iter().enumerate() {
+                let lo = offsets[b];
+                let hi = lo + primes[b];
+                assert!(
+                    u64::from(id) >= lo && u64::from(id) < hi,
+                    "{}: context {n} bucket {b} produced row {id}, outside its \
+                     interval [{lo}, {hi})",
+                    site.name(),
+                );
+                assert!(
+                    u64::from(id) < site.rows(),
+                    "{}: context {n} bucket {b} produced row {id}, past the \
+                     {} the table holds",
+                    site.name(),
+                    site.rows(),
+                );
+            }
+        }
+    }
+}
+
+/// `token_map`'s codomain is the compressed vocabulary: it covers `0..=max`
+/// with no hole, and its domain is the tokenizer's whole vocabulary.
+///
+/// A distinct contract from the partition above, and the one the hash's first
+/// line rests on. Both halves have a witness inside the same file, so neither
+/// is a literal: the domain is checked against `tokenizer.ggml.tokens`, and the
+/// codomain's density is checked against itself — a map with a hole would be a
+/// compression that lost a slot, and `map_token` for an id past the domain
+/// would then be indistinguishable from a real value. The pad the port
+/// substitutes there must itself be inside the codomain, or a sequence start
+/// would address a row no trained embedding sits in.
+#[test]
+#[ignore = "hw: needs the box and the V4.1 split"]
+fn hw_engram_token_map_is_the_compressed_vocabulary() {
+    let engram = open();
+    let hash = engram.hash();
+    let map = hash.token_map();
+
+    // The metadata is in shard 1 and the tables are not (blk.1's is in shard 2),
+    // so the carrier is found here rather than asked of a site. Finding it the
+    // way the crate does would compare the crate against itself.
+    let dir = model_dir();
+    let mut shards: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
+        .collect();
+    shards.sort();
+    let inv = shards
+        .iter()
+        .map(|p| gguf::inventory_of(p).unwrap())
+        .find(|inv| inv.value("deepseek41.engram.token_map").is_some())
+        .unwrap_or_else(|| panic!("no shard under {dir} carries the engram metadata"));
+    let Some(gguf::Value::Array(tokens)) = inv.value("tokenizer.ggml.tokens") else {
+        panic!("the shard that carries the engram metadata must also carry the vocabulary");
+    };
+    assert_eq!(
+        map.len(),
+        tokens.len(),
+        "the map is indexed by token id, so it is as wide as the vocabulary"
+    );
+
+    let max = *map.iter().max().expect("the map is not empty");
+    let mut hit = vec![false; max as usize + 1];
+    for &v in map {
+        hit[v as usize] = true;
+    }
+    let holes = hit.iter().filter(|h| !**h).count();
+    assert_eq!(
+        holes, 0,
+        "the codomain 0..={max} must be dense; {holes} of its values are unused, \
+         so the map is not a compression of the vocabulary"
+    );
+    assert!(
+        hash.pad_id() <= u64::from(max),
+        "pad {} is outside the codomain 0..={max}, so a sequence start would \
+         address a row the model never trained",
+        hash.pad_id()
+    );
 }
