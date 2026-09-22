@@ -19,8 +19,10 @@ IFS=';' read -r -a envs <<< "${BLOOMERY_AB_ENVS:-}"
 # 트리 이름 → 바이너리 경로. 사전 검사와 본 루프가 같은 규칙을 쓰게 하는 한 곳
 # (둘이 갈리면 "있다"고 확인한 것과 다른 파일을 잰다).
 bin_of() { echo "$HOME/repo/$1/target/release/bloomery-decode"; }
+# 현재 트리 이름: 트리 팔 목록에 자동으로 들어가고, env 팔이 도는 바이너리이기도 하다.
+here=$(basename "$PWD")
 bins=()
-for d in "$@" "$(basename "$PWD")"; do
+for d in "$@" "$here"; do
   b=$(bin_of "$d")
   [ -x "$b" ] || { echo "no decode binary at $b — run just build-decode in that tree" >&2; exit 2; }
   bins+=("$d")
@@ -43,7 +45,6 @@ arms=()
 sums=()
 for d in "${bins[@]}"; do arms+=("tree:$d"); done
 for e in "${envs[@]}"; do [ -n "$e" ] && arms+=("env:$e"); done
-here=$(basename "$PWD")
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#arms[@]} - 1))); do
     a=${arms[$(((i + r - 1) % ${#arms[@]}))]}

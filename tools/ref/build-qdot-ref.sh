@@ -19,16 +19,16 @@
 # compiling with the rest.
 #
 # Everything goes outside the tree, which tools/box.sh rsyncs with --delete
-# before every command.
+# before every command. IK, the data root and the ggml flags come from
+# ref-build-common.sh.
 #
 # IQK_IMPLEMENT plus the three ik include roots is what makes the kernel table
 # visible; -mavx2 -mfma -mf16c is the ISA those kernels are written for (a
 # build without them does not compile).
 set -euo pipefail
-: "${IK:=/home/user/ik_llama.cpp}"
-BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
-OUT=${Q3K_OUT:-$BLOOMERY_DATA/bin}
-HERE=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source=tools/ref/ref-build-common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
+OUT=${Q3K_OUT:-$REF_BIN}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
 DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref"
@@ -37,12 +37,8 @@ RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate"
 # Same flags for both sets: the rate harnesses include the same ik headers under
 # the same IQK_IMPLEMENT as their _ref twins.
 for name in $DUMPERS $RATES; do
-  g++ -std=c++17 -O2 -mavx2 -mfma -mf16c -o "$OUT/$name" "$HERE/tools/ref/$name.cpp" \
-    -I"$IK/ggml/include" \
-    -I"$IK/ggml/src" \
-    -I"$IK/ggml/src/iqk" \
-    -L"$IK/build/ggml/src" -lggml \
-    -Wl,-rpath,"$IK/build/ggml/src"
+  ref_cxx -mavx2 -mfma -mf16c -o "$OUT/$name" "$HERE/tools/ref/$name.cpp" \
+    "${REF_GGML_INC[@]}" -I"$IK/ggml/src" -I"$IK/ggml/src/iqk" "${REF_GGML_LINK[@]}"
   echo "built $OUT/$name"
 done
 

@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# Build the stage-1 oracle instrument on the box. Mirrors tools/ref/build.sh.
-# The runner rsyncs this tree with --delete, so the binary lives outside it.
+# Build the stage-1 oracle instrument on the box. Links libllama + libcommon (loads the model
+# through llama.h); the flags come from ref-build-common.sh. Output: DUMP_OUT or $BLOOMERY_DATA/bin.
 set -euo pipefail
-: "${IK:=/home/user/ik_llama.cpp}"
-BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
-OUT=${DUMP_OUT:-$BLOOMERY_DATA/bin}
-HERE=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source=tools/ref/ref-build-common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
+OUT=${DUMP_OUT:-$REF_BIN}
 mkdir -p "$OUT"
-g++ -std=c++17 -O2 -o "$OUT/dump_ref" "$HERE/tools/ref/dump_ref.cpp" \
-  -I"$IK/ggml/include" -I"$IK/include" -I"$IK/common" -I"$IK/src" \
-  -L"$IK/build/common" -L"$IK/build/src" -L"$IK/build/ggml/src" \
-  -lcommon -lllama -lggml \
-  -Wl,-rpath,"$IK/build/src" -Wl,-rpath,"$IK/build/ggml/src"
+ref_cxx -o "$OUT/dump_ref" "$HERE/tools/ref/dump_ref.cpp" "${REF_LLAMA_INC[@]}" "${REF_LLAMA_LINK[@]}"
 echo "built $OUT/dump_ref"

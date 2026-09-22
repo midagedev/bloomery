@@ -3,10 +3,10 @@
 // mul_mat_qX_K_q8_2_X4_T<DequantizerQ4K_AVX2>, expected_type_B =
 // GGML_TYPE_Q8_2_X4) — on the first aligned Q4_K tensor's first 64 rows,
 // with ik's quantize_row_q8_2_x4 coding the same attn_norm-0 column the
-// Rust gate quantizes. Output file format matches q4k-ik-dot.txt (tensor
-// header, one long hex line of ik's activation bytes, `row R %08x` lines)
-// so the Rust side parses both dumps the same way. Extraction pattern
-// copied from q4k_ref.cpp.
+// Rust gate quantizes. Output file format: a tensor header, one long hex
+// line of ik's activation bytes, then `row R %08x` lines — the format every
+// *-ik-dot.txt dump shares, so the Rust side parses them the same way.
+// Extraction pattern as in q3k_cpu_ref.cpp.
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -51,8 +51,8 @@ int main() {
         if (c && c->type == GGML_TYPE_Q4_K && c->ne[0] % 256 == 0) { pick = i; break; }
     }
     if (pick < 0) { fprintf(stderr, "no Q4_K tensor\n"); return 1; }
-    // Copy the name BEFORE freeing (q4k_ref.cpp lesson: the pointer dies
-    // with the context).
+    // Copy the name BEFORE freeing: gguf_get_tensor_name points into the
+    // context, so a name read after gguf_free is freed memory.
     std::string tensor_name = gguf_get_tensor_name(gguf, pick);
     struct ggml_tensor *t = ggml_get_tensor(gctx, tensor_name.c_str());
     const int k = (int)t->ne[0];
