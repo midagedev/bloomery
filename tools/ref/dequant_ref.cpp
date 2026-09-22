@@ -22,9 +22,10 @@
 #include <vector>
 
 #include "ggml.h"
+#include "ref_paths.h"
 
-static const char * kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
-static const char * kDataDir = getenv("BLOOMERY_DATA") ? getenv("BLOOMERY_DATA") : "/root/bloomery-data";
+static const char * kGgufPath = ref_model_path();
+static const char * kDataDir = ref_data_dir();
 static const int64_t kRows = 4; // first N rows of the chosen tensor, per type
 
 static void fail(const std::string & msg) {

@@ -14,7 +14,9 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
 DEPTHS=${BLOOMERY_DEPTHS:-6 1024 4096}
-IKBIN=${IKBIN:-/home/user/ik_llama.cpp/build/bin/llama-bench}
+# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 trees=()
 for d in "$@" "$(basename "$PWD")"; do
@@ -57,6 +59,8 @@ for r in $(seq "$ROUNDS"); do
         ;;
       ik:*)
         dep=${a##*:}
+        # 분할이 의도다: IK_BEST_FLAGS는 플래그 여럿을 담은 한 문자열이다(ab-decode.sh와 같다).
+        # shellcheck disable=SC2086
         raw=$(CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_BEST_FLAGS 2>&1)
         ik=$(echo "$raw" | grep -E "tg$N@pp$dep" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
         [ -n "$ik" ] || { echo "r$r $a produced no tg$N@pp$dep line" >&2; echo "$raw" | tail -n 8 >&2; exit 1; }

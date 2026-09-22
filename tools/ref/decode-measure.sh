@@ -15,7 +15,9 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
 N=${BLOOMERY_DECODE_N:-8}
 BIN=${BLOOMERY_DECODE_BIN:-target/release/bloomery-decode}
-IKBIN=${IKBIN:-/home/user/ik_llama.cpp/build/bin/llama-bench}
+# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 [ -x "$BIN" ] || { echo "no decode binary at $BIN — run: just build-decode" >&2; exit 2; }
 
 witness() {

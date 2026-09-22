@@ -20,6 +20,8 @@
 # $BLOOMERY_DATA/ref_cuda/. The CPU set is never touched by that run. The GPU kernels use
 # q8_1 activations like ik's CUDA path, so their band is against this set, not the CPU one.
 set -euo pipefail
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BLOOMERY_DATA=${BLOOMERY_DATA:-/root/bloomery-data}
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 case $BACKEND in
@@ -47,9 +49,9 @@ mkdir -p "$STAGE"
 
 # Which ik build this set is the output of — recorded in the manifest, because the
 # reference is that build's answer and nothing else's.
-# Same default as tools/ref/build-dump.sh's $IK — the tree this binary was linked against.
-# Not $HOME/ik_llama.cpp: the dump runs as root and the tree is the serving user's.
-BUILD=$(git -C "${IK:-/home/user/ik_llama.cpp}" rev-parse --short HEAD 2>/dev/null || echo unknown)
+# $IK comes from ref-paths.sh, the file build-dump.sh reads too — the tree this binary was
+# linked against. Not $HOME/ik_llama.cpp: the dump runs as root and the tree is the serving user's.
+BUILD=$(git -C "$IK" rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" \

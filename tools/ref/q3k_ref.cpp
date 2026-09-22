@@ -43,10 +43,11 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "ref_paths.h"
 
 static const char * kTensorName = "blk.1.ffn_gate_exps.weight";
-static const char * kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
-static const char * kDataDir = getenv("BLOOMERY_DATA") ? getenv("BLOOMERY_DATA") : "/root/bloomery-data";
+static const char * kGgufPath = ref_model_path();
+static const char * kDataDir = ref_data_dir();
 
 static void fail(const std::string & msg) {
     std::fprintf(stderr, "q3k_ref FATAL: %s\n", msg.c_str());

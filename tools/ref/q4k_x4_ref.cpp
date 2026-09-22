@@ -20,12 +20,13 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "ref_paths.h"
 
 // The data directory the gates read (tools/box.sh exports BLOOMERY_DATA; a parallel
 // track moves both this harness's input and its dump by setting it).
-static const char *kDataDir = getenv("BLOOMERY_DATA") ? getenv("BLOOMERY_DATA") : "/root/bloomery-data";
+static const char *kDataDir = ref_data_dir();
 
-static const char *kGgufPath = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
+static const char *kGgufPath = ref_model_path();
 
 static std::vector<uint8_t> read_range(const std::string &p, int64_t off, size_t n) {
     FILE *f = fopen(p.c_str(), "rb");

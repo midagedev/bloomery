@@ -48,7 +48,9 @@ N=${BLOOMERY_DECODE_N:-96}
 # 안 붙인다 — --ab는 팔마다 untimed 라운드를 이미 돌리고, generate가 둘을 같이 주면 거부한다.
 WARM=${BLOOMERY_GEN_WARM:-}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
-IKBIN=${IKBIN:-/home/user/ik_llama.cpp/build/bin/llama-bench}
+# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # 3090 기준선(216.6/204.6/189.7)이 쓴 그 조합. CPU 최속 조합에서 -rtr 1만 뺀 것이고 GPU 플래그
 # 스윕은 아직 없다 — "이 플래그에서"의 숫자다.
 IK_GPU_FLAGS=${IK_GPU_FLAGS:--ngl 99 -mla 3 -fa 1 -fmoe 1}
@@ -132,7 +134,7 @@ for r in $(seq "$ROUNDS"); do
             ;;
         esac
         n=$N; case $rest in *:*) n=${rest#*:} ;; esac
-        inst=time; [ "$use_ab" = 1 ] && inst=ab
+        inst="time"; [ "$use_ab" = 1 ] && inst=ab  # 라벨 문자열(--time 모드)이다, time 명령이 아니다
         # --ab의 팔마다 reset()이 캐시를 0으로 되감아 씨앗을 지운다: 조용히 깊이 1을 재게 된다.
         if [ "$use_ab" = 1 ] && [[ "$label" == seed* ]]; then
           echo "ab:seed= 는 없다 — --ab의 팔마다 reset()이 씨앗을 지운다. seed=<깊이>:<ctx> 를 쓴다." >&2

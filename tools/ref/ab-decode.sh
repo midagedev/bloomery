@@ -11,7 +11,9 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
-IKBIN=${IKBIN:-/home/user/ik_llama.cpp/build/bin/llama-bench}
+# ik 트리·llama-bench 기본값(IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 # BLOOMERY_AB_ENVS="K=V;K=V K2=V2": 현재 트리의 같은 바이너리를 env만 바꿔 팔로 더 넣는다
 # (바이트가 같은 레버의 A/B — 빌드 둘의 링크 배치 차이가 끼지 않는다).
@@ -52,7 +54,9 @@ for r in $(seq "$ROUNDS"); do
       tree:*) d=${a#tree:}; label=$d; e="" ;;
       env:*) d=$here; e=${a#env:}; label="[$e]" ;;
     esac
-    out=$(env $e "$(bin_of "$d")" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
+    # env 팔의 "K=V K2=V2"를 단어로 나눠 넘긴다 — depth-gpu.sh의 arm_env와 같은 철자(글롭 전개 없음).
+    read -r -a e_args <<< "$e"
+    out=$(env ${e_args[@]+"${e_args[@]}"} "$(bin_of "$d")" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
     toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
     pre=$(echo "$out" | grep -E '^prefill' | sed 's/.*= //')
     med=$(echo "$out" | awk '/^ +[0-9]+ +[0-9]+ +[0-9.]+ /{print $3}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
@@ -64,6 +68,8 @@ for r in $(seq "$ROUNDS"); do
   # 막는 실패: 단발 헤드라인 하나를 ik의 다른 임대 숫자와 비교해 "넘었다"고 쓰는 것 —
   # 1% 안쪽의 차이는 번갈아 잰 표본 여러 개로만 말할 수 있다. -r 1: 바퀴가 곧 반복이다.
   if [ "${BLOOMERY_AB_IK:-0}" = 1 ]; then
+    # 분할이 의도다: IK_BEST_FLAGS는 플래그 여럿을 담은 한 문자열이고 호출자가 그 모양으로 덮어쓴다.
+    # shellcheck disable=SC2086
     ik=$(CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 1 $IK_BEST_FLAGS 2>&1 | grep -E "tg$N" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
     [ -n "$ik" ] || { echo "r$r ik produced no tg$N line" >&2; exit 1; }
     echo "r$r ik[$IK_BEST_FLAGS] | decode $ik tok/s"
