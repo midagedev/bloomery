@@ -122,27 +122,25 @@ pub(crate) fn rms_eps(gguf: &Gguf) -> f32 {
         .expect("rms eps must come from the file, never from a literal")
 }
 
-/// One transformer block against a KV cache: `l_out-(b-1)` in, `l_out-b` out.
-///
-/// Identical to [`block`] except that attention reads the cache instead of only the
-/// batch. `block` is the shim now — it builds a cache holding exactly its batch.
-/// Every weight, gain and flag comes from `derived`'s plan.
-pub fn block_cached(
+/// The block skeleton both entry points share: `attn_norm → attention → residual
+/// → ffn_norm → (dense | moe) → residual`, which is `build_deepseek2`'s block
+/// verbatim. The intermediate after the first add is the oracle's `ffn_inp-N`.
+/// Weights, gains and the routed flag all come from `derived`'s plan; the one
+/// thing the two callers do differently is `attn`, which takes the normed block
+/// and returns `kqv_out`. Generic, so each caller monomorphizes to the straight
+/// line it had before.
+fn block_common(
     gguf: &Gguf,
     b: usize,
     x: &Tensor2,
-    q_slots: &[Slot],
-    cache: &mut KvCache,
-    range: &std::ops::Range<usize>,
     derived: &Derived,
+    attn: impl FnOnce(&Tensor2) -> Result<Tensor2, ModelError>,
 ) -> Result<Tensor2, ModelError> {
     let lvl = profile::level();
     let bp = derived.block_plan(b)?;
     let attn_gain = timed("gain", lvl, || &bp.attn_gain);
     let normed = rms_norm(x, attn_gain, derived.plan().eps);
-    let kqv_out =
-        crate::attn::block_attn_cached(gguf, b, &normed, q_slots, cache, b, range, derived)?
-            .kqv_out;
+    let kqv_out = attn(&normed)?;
     let ffn_inp = add(x, &kqv_out);
 
     let ffn_gain = timed("gain", lvl, || &bp.ffn_gain);
@@ -156,11 +154,30 @@ pub fn block_cached(
     Ok(add(&ffn_inp, &ffn_out))
 }
 
+/// One transformer block against a KV cache: `l_out-(b-1)` in, `l_out-b` out.
+///
+/// [`block_common`] with attention reading the cache instead of only the batch.
+/// `block` is the shim now — it builds a cache holding exactly its batch.
+pub fn block_cached(
+    gguf: &Gguf,
+    b: usize,
+    x: &Tensor2,
+    q_slots: &[Slot],
+    cache: &mut KvCache,
+    range: &std::ops::Range<usize>,
+    derived: &Derived,
+) -> Result<Tensor2, ModelError> {
+    block_common(gguf, b, x, derived, |normed| {
+        Ok(
+            crate::attn::block_attn_cached(gguf, b, normed, q_slots, cache, b, range, derived)?
+                .kqv_out,
+        )
+    })
+}
+
 /// One transformer block: `l_out-(b-1)` in, `l_out-b` out.
 ///
-/// `attn_norm → attention → residual → ffn_norm → (dense | moe) → residual`, which is
-/// `build_deepseek2`'s block verbatim. The intermediate after the first add is the
-/// oracle's `ffn_inp-N`. Weights and gains come from `derived`'s plan.
+/// [`block_common`] with attention over the batch alone.
 pub fn block(
     gguf: &Gguf,
     b: usize,
@@ -168,22 +185,9 @@ pub fn block(
     slots: &[Slot],
     derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
-    let lvl = profile::level();
-    let bp = derived.block_plan(b)?;
-    let attn_gain = timed("gain", lvl, || &bp.attn_gain);
-    let normed = rms_norm(x, attn_gain, derived.plan().eps);
-    let kqv_out = crate::attn::block_attn(gguf, b, &normed, slots, derived)?;
-    let ffn_inp = add(x, &kqv_out);
-
-    let ffn_gain = timed("gain", lvl, || &bp.ffn_gain);
-    let ffn_normed = rms_norm(&ffn_inp, ffn_gain, derived.plan().eps);
-    let ffn_out = if timed("is_moe", lvl, || bp.routed) {
-        crate::moe::moe_ffn_with(gguf, bp.moe()?, &ffn_normed)?
-    } else {
-        let (gate_w, up_w, down_w) = timed("ffn_weights", lvl, || bp.dense());
-        crate::ffn::dense_ffn_with(gguf, gate_w, up_w, down_w, &ffn_normed)?
-    };
-    Ok(add(&ffn_inp, &ffn_out))
+    block_common(gguf, b, x, derived, |normed| {
+        crate::attn::block_attn(gguf, b, normed, slots, derived)
+    })
 }
 
 /// ggml's `ADD` over two same-shaped blocks. f32, elementwise, no accumulation order
@@ -261,6 +265,7 @@ pub fn forward_trace(gguf: &Gguf, tokens: &[u32]) -> Result<ForwardTrace, ModelE
 /// The highest-scoring token id, ties to the lower id — `llama_sampler_init_greedy`'s
 /// rule. Greedy decode is the only sampler stage 1 has, and it is what the 32-prompt
 /// gate compares against ik.
+#[must_use]
 pub fn argmax(logits: &[f32]) -> u32 {
     let mut best = 0usize;
     for (i, &v) in logits.iter().enumerate() {

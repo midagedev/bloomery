@@ -353,9 +353,11 @@ impl QuantCols {
 /// (raw pointers are neither `Send` nor `Sync`); the impls add no safety of
 /// their own — see the construction site.
 pub(crate) struct SharedOut(pub(crate) *mut f32);
-// SAFETY: see the struct doc — disjoint cells and join ordering, argued at the construction site.
+// SAFETY: the pointer is into the dispatch's own output block, which outlives the
+// split, and it is only ever written through — never read, never freed, by a worker.
 unsafe impl Send for SharedOut {}
-// SAFETY: same argument; workers write only cells their own row range owns.
+// SAFETY: sharing adds no aliasing — the split's row ranges are disjoint, so a worker
+// writes only cells no other worker touches, and the join precedes every read.
 unsafe impl Sync for SharedOut {}
 
 impl SharedOut {
@@ -378,9 +380,12 @@ enum SharedQuantCols {
     /// `qdot::quantize_col(w.ty, ..)` — one `cb`-byte column per token.
     Bytes { cb: usize, ptr: *mut u8 },
 }
-// SAFETY: see the enum doc — disjoint cells and join ordering, argued at the construction site.
+// SAFETY: the pointer is into the dispatch's own quantized-column buffer, which
+// outlives the split, and a worker only writes through it — never reads, never frees.
 unsafe impl Send for SharedQuantCols {}
-// SAFETY: same argument; workers write only their own column range's cells.
+// SAFETY: sharing adds no aliasing — one column is one cell, and a column is written
+// by exactly one participant (its pre-pass sub-range, or the claim that won the slot's
+// compare-exchange); the join or the slot's DONE precedes every read.
 unsafe impl Sync for SharedQuantCols {}
 
 impl SharedQuantCols {
@@ -412,10 +417,11 @@ impl SharedQuantCols {
 /// their own — see the construction site in `matmul_q_group_swiglu`.
 #[derive(Clone, Copy)]
 pub(crate) struct ParWrite(*mut f32, usize);
-// SAFETY: see the struct doc — the par block's only writer is the slot's
-// claimant, and no reader runs before the slot observes DONE or the join.
+// SAFETY: the pointer is into the SwiGLU slot's par block, which outlives the
+// dispatch, and the length travels with it so the slice it becomes is in bounds.
 unsafe impl Send for ParWrite {}
-// SAFETY: same argument, shared across the dispatch's participants.
+// SAFETY: sharing adds no aliasing — the block's only writer is the participant that
+// claimed the slot, and no reader runs before that slot observes DONE or the join.
 unsafe impl Sync for ParWrite {}
 
 /// `y = W · x` for a quantized 2-D `W` straight from the file, ggml's
@@ -794,12 +800,14 @@ struct PairWork<'a> {
     slot: usize,
     defer: Option<&'a DeferredSlots<'a>>,
 }
-// SAFETY: see the field docs — the raw column parts are only turned into
-// slices after the slot's state observes DONE (deferred) or the pre-pass
-// join (ordinary), and each participant writes only its own row range's
-// output cells, at the `run_group` construction site.
+// SAFETY: `fused_cols` and `q_f32` are bare pointers — the type does not bind them
+// to `'a`, so the contract is the `run_group` construction site's: they point into
+// column buffers that outlive the dispatch, and `compute_rows` forms a slice only
+// after the slot observes DONE (deferred) or the pre-pass join (ordinary).
 unsafe impl<'a> Send for PairWork<'a> {}
-// SAFETY: same argument; the dispatch shares one table across its participants.
+// SAFETY: sharing one table across the dispatch adds no aliasing — the column cells
+// are read-only once published, and each participant writes only the output cells its
+// own row range owns.
 unsafe impl<'a> Sync for PairWork<'a> {}
 
 /// The per-pair facts resolved before any output block exists.
@@ -907,8 +915,10 @@ impl<'a> PairWork<'a> {
                     // Weight side: dequant_row, or the byte walk in its place for F32 rows.
                     let t_d = if lvl >= 2 { Some(Instant::now()) } else { None };
                     if ty == GgmlType::F32 {
-                        for (i, v) in row.iter_mut().enumerate() {
-                            *v = f32::from_le_bytes(src[i * 4..i * 4 + 4].try_into().unwrap());
+                        let (words, _) = src.as_chunks::<4>();
+                        let words = &words[..row.len()];
+                        for (v, w) in row.iter_mut().zip(words) {
+                            *v = f32::from_le_bytes(*w);
                         }
                     } else {
                         dequant_row(ty, src, row)?;
@@ -1781,8 +1791,10 @@ pub(crate) fn matvec_q_local(
                 }
                 // Weight side: dequant_row, or the byte walk in its place for F32 rows.
                 if ty == GgmlType::F32 {
-                    for (i, v) in row.iter_mut().enumerate() {
-                        *v = f32::from_le_bytes(src[i * 4..i * 4 + 4].try_into().unwrap());
+                    let (words, _) = src.as_chunks::<4>();
+                    let words = &words[..row.len()];
+                    for (v, w) in row.iter_mut().zip(words) {
+                        *v = f32::from_le_bytes(*w);
                     }
                 } else {
                     dequant_row(ty, src, row)?;

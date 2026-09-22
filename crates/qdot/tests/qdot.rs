@@ -473,7 +473,7 @@ fn rejects_unaligned_k() {
 #[test]
 #[should_panic(expected = "whole 256-value super-blocks")]
 fn col_bytes_rejects_unaligned_k() {
-    col_bytes(GgmlType::Q3_K, 100);
+    let _ = col_bytes(GgmlType::Q3_K, 100);
 }
 
 /// Parse ik kernel reference dump: tensor header, hex activation bytes, and output rows.

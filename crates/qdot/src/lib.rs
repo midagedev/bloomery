@@ -87,6 +87,7 @@ impl std::error::Error for QdotError {}
 
 /// Whether the fused path handles this weight type on this machine: the type
 /// is supported and the CPU has the required features.
+#[must_use]
 pub fn supports(w: GgmlType) -> bool {
     matches!(
         w,
@@ -130,6 +131,7 @@ pub fn k_granularity(w: GgmlType) -> usize {
 ///
 /// Panics if `w` has no activation format in this build or `k` breaks the
 /// type's [`k_granularity`] contract.
+#[must_use]
 pub fn col_bytes(w: GgmlType, k: usize) -> usize {
     assert!(
         matches!(
@@ -584,8 +586,8 @@ unsafe fn field_dot<const SHIFT: i32, const BIT: i32>(
     masks: &Masks,
     sumi: &mut __m256i,
 ) {
+    // SAFETY: AVX2 present and `q8` points at 32 readable bytes per contract.
     unsafe {
-        // SAFETY: AVX2 present and `q8` points at 32 readable bytes per contract.
         let q3l = _mm256_and_si256(_mm256_srli_epi16::<SHIFT>(q3bits), masks.m3);
         let q3h = _mm256_slli_epi16::<2>(_mm256_srli_epi16::<BIT>(_mm256_andnot_si256(
             hbits,
@@ -610,8 +612,8 @@ unsafe fn field_dot<const SHIFT: i32, const BIT: i32>(
 /// CPU must support AVX2; buffers must hold `nb` super-blocks.
 #[target_feature(enable = "avx2")]
 unsafe fn dot_q3k_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    // SAFETY: AVX2 present and both slices hold nb super-blocks per contract.
     unsafe {
-        // SAFETY: AVX2 present and both slices hold nb super-blocks per contract.
         let masks = Masks {
             m3: _mm256_set1_epi8(3),
             mone: _mm256_set1_epi8(1),
@@ -991,6 +993,7 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 /// AVX and SSE3 must be available on the target.
 #[inline(always)]
 unsafe fn hsum_float_8(x: __m256) -> f32 {
+    // SAFETY: AVX and SSE3 present per contract; register-only, no memory is touched.
     unsafe {
         let mut res = _mm256_extractf128_ps(x, 1);
         res = _mm_add_ps(res, _mm256_castps256_ps128(x));
@@ -1008,6 +1011,7 @@ unsafe fn hsum_float_8(x: __m256) -> f32 {
 /// Caller must ensure AVX2+FMA are available and buffers match `nb` blocks.
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_q4k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    // SAFETY: AVX2+FMA present and both slices hold nb blocks per contract.
     unsafe {
         let ml = _mm256_set1_epi8(0xF);
         let mut accd = _mm256_setzero_ps();
@@ -1291,6 +1295,7 @@ static K_SHUFFLE_Q6K: [u8; 32] = [
 /// Caller must ensure AVX2+FMA are available and buffers match `nb` blocks.
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_q6k_q82x4_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+    // SAFETY: AVX2+FMA present and both slices hold nb blocks per contract.
     unsafe {
         let ml = _mm256_set1_epi8(0xF);
         let mh = _mm256_set1_epi8(0x30);
@@ -1560,8 +1565,8 @@ unsafe fn q5x_codes<const QH_OFF: usize, const QS_OFF: usize>(
     mh: __m256i,
     hb: &Q5HBit,
 ) -> __m256i {
+    // SAFETY: 16 readable bytes inside the block.
     unsafe {
-        // SAFETY: 16 readable bytes inside the block.
         let aux128 = _mm_loadu_si128(blk.as_ptr().add(QS_OFF) as *const __m128i);
         let nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16::<4>(aux128), aux128), m4);
         let qh = u32::from_le_bytes([
@@ -2205,6 +2210,7 @@ unsafe fn q_nope2_cells_avx2_inner(
     j_end: usize,
     out: &mut [f32],
 ) {
+    // SAFETY: AVX2+FMA present and the slice lengths match the segment bounds per contract.
     unsafe {
         let ones = _mm256_set1_epi16(1);
         let nb = acol.len();
@@ -2264,6 +2270,10 @@ pub fn dot_f32(wrow: &[u8], x: &[f32]) -> Option<f32> {
     None
 }
 
+/// # Safety
+/// The CPU must support AVX2 and FMA. `x` must be non-empty with a length that
+/// is a multiple of eight, and `wrow` must hold `4 * x.len()` readable bytes —
+/// the row's f32s, little-endian.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_f32_avx2(wrow: &[u8], x: &[f32]) -> f32 {
@@ -2302,6 +2312,9 @@ pub fn sum_sq_f64(x: &[f32]) -> f64 {
     x.iter().map(|&v| (v * v) as f64).sum()
 }
 
+/// # Safety
+/// The CPU must support AVX2. Any `x` is in range — the eight-wide loop stops
+/// at `x.len() / 8 * 8` and the tail is a safe scalar loop.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn sum_sq_f64_avx2(x: &[f32]) -> f64 {
@@ -2348,6 +2361,9 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// # Safety
+/// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
+/// the same length — the loads and the store share one index.
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn swiglu_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
     let n = gate.len();
@@ -2379,6 +2395,9 @@ unsafe fn swiglu_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
 }
 
 /// `ggml_v_silu`: `x / (1 + exp(-x))`.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA. Register-only: no memory is touched.
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
 unsafe fn v_silu(x: __m256) -> __m256 {
@@ -2392,6 +2411,9 @@ unsafe fn v_silu(x: __m256) -> __m256 {
 /// with `n = round(x / ln2)` and `b = x − n·ln2` in two pieces. Constants are the
 /// reference's hex floats as bit patterns. The special-case tail (|n| > 126) is
 /// the reference's too: overflow to inf past 192, a two-step scale otherwise.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA. Register-only: no memory is touched.
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
 unsafe fn v_expf(x: __m256) -> __m256 {

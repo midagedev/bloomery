@@ -30,6 +30,7 @@ pub struct KvRows<'a> {
 impl<'a> KvRows<'a> {
     /// View `data` as rows of `width` u16. `width` must be nonzero and divide the
     /// length, or the row split below would be a lie.
+    #[must_use]
     pub fn new(data: &'a [u16], width: usize) -> Self {
         assert!(width > 0, "KvRows: width must be nonzero");
         assert!(
@@ -178,6 +179,7 @@ impl KvCache {
     /// Derived from the table rather than counted separately: one source of truth for
     /// "where are we", so a caller that appends out of order gets a wrong answer here
     /// instead of a silently wrong mask later.
+    #[must_use]
     pub fn next_pos(&self, seq: u32) -> u32 {
         self.slots
             .iter()

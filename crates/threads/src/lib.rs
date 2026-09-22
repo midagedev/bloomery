@@ -191,6 +191,7 @@ impl Copy for JobSlot {}
 unsafe impl Sync for Pool {}
 
 impl Pool {
+    #[must_use]
     pub fn threads(&self) -> usize {
         self.nthreads
     }
@@ -481,6 +482,7 @@ struct DoneMark(AtomicUsize);
 /// does not divide evenly, the first `n % threads` chunks get one extra
 /// element; empty chunks (`n < threads`) are normal and their `f` calls
 /// return immediately.
+#[must_use]
 pub fn chunks(n: usize, threads: usize) -> Vec<Range<usize>> {
     assert!(threads > 0, "threads must be at least 1");
     (0..threads)
@@ -493,6 +495,7 @@ pub fn chunks(n: usize, threads: usize) -> Vec<Range<usize>> {
 
 /// Chunk `t` of `threads` over `0..n`: the first `n % threads` chunks are one
 /// element longer than the rest.
+#[must_use]
 pub fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
     assert!(t < threads);
     let base = n / threads;

@@ -64,6 +64,7 @@ pub(crate) fn ffn_weights(
 /// `[ne0, n_tokens]` block. The order is the contract — `silu(up) * gate` also
 /// produces numbers and only the oracle tells them apart. ggml fuses this with
 /// the two matmuls as FUSED_UP_GATE; the gate pins the product, not the fusion.
+#[must_use]
 pub(crate) fn swiglu(gate: &Tensor2, up: &Tensor2) -> Tensor2 {
     swiglu_timed(gate, up).0
 }

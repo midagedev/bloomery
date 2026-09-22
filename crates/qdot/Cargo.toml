@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
+bloomery-threads = { path = "../threads" }

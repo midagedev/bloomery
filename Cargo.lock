@@ -123,6 +123,7 @@ name = "bloomery-qdot"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-threads",
 ]
 
 [[package]]

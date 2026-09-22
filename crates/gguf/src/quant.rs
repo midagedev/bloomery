@@ -40,6 +40,7 @@ pub enum GgmlType {
 }
 
 impl GgmlType {
+    #[must_use]
     pub fn from_u32(v: u32) -> Self {
         match v {
             0 => GgmlType::F32,
@@ -206,6 +207,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
 /// f16 is representable in f32 — so it matches ggml's table lookup bit for
 /// bit.
 #[inline]
+#[must_use]
 pub fn half_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) as u32) << 31;
     let exp = ((bits >> 10) & 0x1f) as u32;

@@ -251,12 +251,10 @@ fn route_inner(
     let mut ranked: Vec<u32> = (0..n_expert as u32).collect();
     for t in 0..n_tokens {
         let p = &probs[t * n_expert..(t + 1) * n_expert];
-        ranked.sort_by(|&a, &b| {
-            p[b as usize]
-                .partial_cmp(&p[a as usize])
-                .unwrap()
-                .then(a.cmp(&b))
-        });
+        // `total_cmp` rather than `partial_cmp().unwrap()`: the probabilities are
+        // `exp(·)/sum`, so neither sign of zero nor any ordering differs from the
+        // partial order, and a NaN out of a broken router sorts instead of panicking.
+        ranked.sort_by(|&a, &b| p[b as usize].total_cmp(&p[a as usize]).then(a.cmp(&b)));
         for (s, &e) in ranked.iter().take(n_used).enumerate() {
             ids[t * n_used + s] = e as i32;
             weights[t * n_used + s] = p[e as usize];

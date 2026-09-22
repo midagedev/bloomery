@@ -205,7 +205,7 @@ impl Derived {
                             ModelError::MissingTensor(format!("blk.{b}.attn_kv_a_norm.weight"))
                         })?,
                 )?,
-                v_up_views: crate::attn::v_up_views(wkb, &p),
+                v_up_views: crate::attn::v_up_views(wkb, &p)?,
             };
             let gain = |suffix: &str| -> Result<Vec<f32>, ModelError> {
                 f32_tensor(
@@ -314,8 +314,7 @@ impl Derived {
 /// so any "equivalent" restructuring here is a gate event, not a refactoring.
 fn build_block(gguf: &Gguf, wkb: &TensorInfo, p: &MlaParams) -> Result<BlockDerived, ModelError> {
     let bytes = gguf.data(wkb)?;
-    let row_bytes =
-        wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
+    let row_bytes = crate::attn::wkb_row_bytes(wkb, p.latent)?;
     let nblocks = p.nope / 32;
     let span = p.latent * nblocks;
     let mut blocks = Vec::with_capacity(p.n_head * span);

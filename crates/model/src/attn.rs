@@ -26,6 +26,7 @@ use crate::kv::{KvCache, KvRows};
 use crate::ops::{matmul_q, matmul_q_batch, matmul_q_group, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
+use gguf::QuantError;
 use gguf::quant::half_to_f32;
 use gguf::{Gguf, TensorInfo};
 use std::cell::RefCell;
@@ -1506,28 +1507,34 @@ pub fn wv_b_heads(
     kqv_compressed: &Tensor2,
     p: &MlaParams,
 ) -> Result<Tensor2, ModelError> {
-    let views = v_up_views(wkb, p);
+    let views = v_up_views(wkb, p)?;
     wv_b_heads_with(gguf, &views, kqv_compressed, p)
+}
+
+/// Bytes one `latent`-wide row of `attn_kv_b` occupies in the file: the type's
+/// block size in bytes times the number of blocks the row spans. One owner, so
+/// the k-up and v_up sides of the same tensor cannot drift apart.
+pub(crate) fn wkb_row_bytes(wkb: &TensorInfo, latent: usize) -> Result<usize, ModelError> {
+    let ts = wkb.ty.type_size().ok_or(QuantError::Unsupported(wkb.ty))? as usize;
+    let blck = wkb.ty.blck_size().ok_or(QuantError::Unsupported(wkb.ty))? as usize;
+    Ok(ts * (latent / blck))
 }
 
 /// The per-head v_up views of `attn_kv_b` — the views `ggml_view_3d` takes, as
 /// file offsets. One owner of the geometry: `Derived::new` builds these once per
-/// block, and the direct-call path above builds them per call. Pure function of
-/// the tensor info and the geometry — no error path.
-pub(crate) fn v_up_views(wkb: &TensorInfo, p: &MlaParams) -> Vec<TensorInfo> {
-    let row_bytes =
-        wkb.ty.type_size().unwrap() as usize * (p.latent / wkb.ty.blck_size().unwrap() as usize);
-    (0..p.n_head)
+/// block, and the direct-call path above builds them per call. The only way this
+/// fails is a weight type with no block geometry, which [`wkb_row_bytes`] names.
+pub(crate) fn v_up_views(wkb: &TensorInfo, p: &MlaParams) -> Result<Vec<TensorInfo>, ModelError> {
+    let row_bytes = wkb_row_bytes(wkb, p.latent)?;
+    Ok((0..p.n_head)
         .map(|h| TensorInfo {
             name: format!("{}.v_up.head{h}", wkb.name),
             dims: vec![p.latent as u64, p.v_head as u64],
             ty: wkb.ty,
             offset: wkb.offset + ((h * (p.nope + p.v_head) + p.nope) * row_bytes) as u64,
-            nbytes: wkb.ty.type_size().unwrap()
-                * (p.latent / wkb.ty.blck_size().unwrap() as usize) as u64
-                * p.v_head as u64,
+            nbytes: (row_bytes * p.v_head) as u64,
         })
-        .collect()
+        .collect())
 }
 
 /// The `wv_b` gather-matmul-scatter over prebuilt views — the step path, which

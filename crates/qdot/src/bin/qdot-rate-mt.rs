@@ -8,6 +8,7 @@ use std::sync::Barrier;
 use std::time::Instant;
 
 use gguf::GgmlType;
+use threads::chunk_bounds;
 
 /// Timed-section target per cell.
 const TARGET_SECS: f64 = 3.0;
@@ -97,19 +98,6 @@ fn acol(ty: GgmlType, k: usize) -> Vec<u8> {
     let mut a = vec![0u8; qdot::col_bytes(ty, k)];
     qdot::quantize_col(ty, &col, &mut a);
     a
-}
-
-/// Partition arithmetic: chunk `t` of `threads` over `n` rows.
-fn chunk_bounds(n: usize, threads: usize, t: usize) -> (usize, usize) {
-    debug_assert!(t < threads);
-    let base = n / threads;
-    let rem = n % threads;
-    let start = if t < rem {
-        t * (base + 1)
-    } else {
-        rem * (base + 1) + (t - rem) * base
-    };
-    (start, start + base + usize::from(t < rem))
 }
 
 // ---------------------------------------------------------------- mode 1
