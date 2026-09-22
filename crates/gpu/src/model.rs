@@ -34,6 +34,10 @@
 //! equals the plain gemv's on the same row and column bit for bit.
 //! Everything else runs the gated kernels verbatim.
 
+use crate::flash::{
+    FlashGeom, FlashInputs, FlashLatentArgs, FlashLatentQ8Args, FlashMerge2Q8Args, FlashMergeArgs,
+    FlashMergeQ8Args, FlashSegArgs, FlashSegTwiceArgs,
+};
 use crate::head::Head;
 use crate::q5::Q8Blocks32;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -335,6 +339,47 @@ pub struct StepKernels {
     module: step_kernels::LoadedModule,
 }
 
+/// [`StepKernels::enqueue_q8_0_gemv_heads`]'s arguments. The strides and
+/// the offset count f32 elements, `rows_per_head` weight rows.
+pub struct Q8_0GemvHeadsArgs<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub d: &'a DeviceTensor<f32>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub rows_per_head: usize,
+    pub x_head_stride: usize,
+    pub y_head_stride: usize,
+    pub y_off: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`StepKernels::enqueue_q3k_gemv_heads`]'s arguments. `head_base` counts
+/// heads, `rows_per_head`/`row_stride_per_head`/`row_off` weight rows, and
+/// `y_head_stride` f32 elements.
+pub struct Q3kGemvHeadsArgs<'a> {
+    pub w: &'a DeviceTensor<u32>,
+    pub act: &'a Q8Act,
+    pub head_base: usize,
+    pub rows_per_head: usize,
+    pub row_stride_per_head: usize,
+    pub row_off: usize,
+    pub y_head_stride: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`StepKernels::enqueue_q3k_gemv_heads_pair`]'s arguments: as
+/// [`Q3kGemvHeadsArgs`], the activation columns split over `lo` and `hi`.
+pub struct Q3kGemvHeadsPairArgs<'a> {
+    pub w: &'a DeviceTensor<u32>,
+    pub lo: &'a Q8Act,
+    pub hi: &'a Q8Act,
+    pub head_base: usize,
+    pub rows_per_head: usize,
+    pub row_stride_per_head: usize,
+    pub row_off: usize,
+    pub y_head_stride: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
 impl StepKernels {
     /// Load this file's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<StepKernels, GpuError> {
@@ -387,19 +432,21 @@ impl StepKernels {
     /// `h*rows_per_head + j`. `d.rows()` must be a multiple of
     /// `rows_per_head` (then `n_heads = d.rows() / rows_per_head`). Asynchronous,
     /// allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_q8_0_gemv_heads(
         &self,
         stream: &CudaStream,
-        qs: &DeviceTensor<u32>,
-        d: &DeviceTensor<f32>,
-        x: &DeviceBuffer<f32>,
-        rows_per_head: usize,
-        x_head_stride: usize,
-        y_head_stride: usize,
-        y_off: usize,
-        y: &mut DeviceBuffer<f32>,
+        a: Q8_0GemvHeadsArgs<'_>,
     ) -> Result<(), GpuError> {
+        let Q8_0GemvHeadsArgs {
+            qs,
+            d,
+            x,
+            rows_per_head,
+            x_head_stride,
+            y_head_stride,
+            y_off,
+            y,
+        } = a;
         let n_rows = d.rows();
         let k = d.cols() * 32;
         if k == 0 || !k.is_multiple_of(32) {
@@ -491,19 +538,21 @@ impl StepKernels {
     /// `enqueue_gemv_q3k`), and `row_off + rows_per_head <=
     /// row_stride_per_head` so a head's rows stay on its own block.
     /// Asynchronous, allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_q3k_gemv_heads(
         &self,
         stream: &CudaStream,
-        w: &DeviceTensor<u32>,
-        act: &Q8Act,
-        head_base: usize,
-        rows_per_head: usize,
-        row_stride_per_head: usize,
-        row_off: usize,
-        y_head_stride: usize,
-        y: &mut DeviceBuffer<f32>,
+        a: Q3kGemvHeadsArgs<'_>,
     ) -> Result<(), GpuError> {
+        let Q3kGemvHeadsArgs {
+            w,
+            act,
+            head_base,
+            rows_per_head,
+            row_stride_per_head,
+            row_off,
+            y_head_stride,
+            y,
+        } = a;
         let n_sb = act.n_sb();
         let heads = act.m();
         if !n_sb.is_multiple_of(2) {
@@ -591,20 +640,22 @@ impl StepKernels {
     /// Same weight, same shapes and the same per-head contract as the single
     /// call — the two together replace the pair of launches, bit for bit.
     /// Asynchronous, allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_q3k_gemv_heads_pair(
         &self,
         stream: &CudaStream,
-        w: &DeviceTensor<u32>,
-        lo: &Q8Act,
-        hi: &Q8Act,
-        head_base: usize,
-        rows_per_head: usize,
-        row_stride_per_head: usize,
-        row_off: usize,
-        y_head_stride: usize,
-        y: &mut DeviceBuffer<f32>,
+        a: Q3kGemvHeadsPairArgs<'_>,
     ) -> Result<(), GpuError> {
+        let Q3kGemvHeadsPairArgs {
+            w,
+            lo,
+            hi,
+            head_base,
+            rows_per_head,
+            row_stride_per_head,
+            row_off,
+            y_head_stride,
+            y,
+        } = a;
         let n_sb = lo.n_sb();
         let (split, heads) = (lo.m(), lo.m() + hi.m());
         if hi.n_sb() != n_sb || hi.k() != lo.k() {
@@ -3340,14 +3391,16 @@ fn enqueue_attn(
     let (qn2_qs, qn2_d) = q8_derived(w, &names.derived)?;
     step.enqueue_q8_0_gemv_heads(
         stream,
-        qn2_qs,
-        qn2_d,
-        &s.q,
-        latent,
-        mla.kq_head,
-        kv_width,
-        rope,
-        &mut s.f_rows,
+        Q8_0GemvHeadsArgs {
+            qs: qn2_qs,
+            d: qn2_d,
+            x: &s.q,
+            rows_per_head: latent,
+            x_head_stride: mla.kq_head,
+            y_head_stride: kv_width,
+            y_off: rope,
+            y: &mut s.f_rows,
+        },
     )?;
     // Every derived row, each head's nope slice of q, the nope2 spans out.
     let wqn2 = dev_weight(w, &names.derived)?;
@@ -3398,34 +3451,36 @@ fn enqueue_attn(
     // quantizer wrote.
     let side_bytes = act_write_bytes(&s.act_kv_lo, s.act_kv_lo.m())
         + act_write_bytes(&s.act_kv_hi, s.act_kv_hi.m());
+    let inputs = FlashInputs {
+        q: &s.f_rows,
+        kv: kv_l,
+        n_keys_buf: &s.n_keys_buf,
+        kq_scale: mla.kq_scale,
+        geom: FlashGeom {
+            tokens: 1,
+            heads: mla.n_head,
+            rope_dims: rope,
+            latent_dims: latent,
+        },
+    };
     if crate::flash::segments_for(kv_l.rows()) == 1 {
         if fold_quant {
             gpu.flash().enqueue_flash_latent_q8(
                 stream,
-                &s.f_rows,
-                kv_l,
-                &s.n_keys_buf,
-                mla.kq_scale,
-                1,
-                mla.n_head,
-                rope,
-                latent,
-                &mut s.kqvc,
-                &mut s.act_kv_lo,
-                &mut s.act_kv_hi,
+                FlashLatentQ8Args {
+                    inputs,
+                    y: &mut s.kqvc,
+                    lo: &mut s.act_kv_lo,
+                    hi: &mut s.act_kv_hi,
+                },
             )?;
         } else {
             gpu.flash().enqueue_flash_latent(
                 stream,
-                &s.f_rows,
-                kv_l,
-                &s.n_keys_buf,
-                mla.kq_scale,
-                1,
-                mla.n_head,
-                rope,
-                latent,
-                &mut s.kqvc,
+                FlashLatentArgs {
+                    inputs,
+                    y: &mut s.kqvc,
+                },
             )?;
         }
         // The query rows, the live cache rows as f16, the attended output,
@@ -3448,47 +3503,23 @@ fn enqueue_attn(
         // per (head group, segment) instead of per (head, segment), the
         // same partials, so the merge below and the launch count do not
         // move.
+        let seg = FlashSegArgs {
+            inputs,
+            part_v: &mut s.part_v,
+            part_ms: &mut s.part_ms,
+        };
         match s.probe_cfg.flash_seg_twice() {
-            None if crate::flash::flash_mma() => gpu.flash().enqueue_flash_latent_mma(
-                stream,
-                &s.f_rows,
-                kv_l,
-                &s.n_keys_buf,
-                mla.kq_scale,
-                1,
-                mla.n_head,
-                rope,
-                latent,
-                &mut s.part_v,
-                &mut s.part_ms,
-            )?,
-            None => gpu.flash().enqueue_flash_latent_seg(
-                stream,
-                &s.f_rows,
-                kv_l,
-                &s.n_keys_buf,
-                mla.kq_scale,
-                1,
-                mla.n_head,
-                rope,
-                latent,
-                &mut s.part_v,
-                &mut s.part_ms,
-            )?,
+            None if crate::flash::flash_mma() => {
+                gpu.flash().enqueue_flash_latent_mma(stream, seg)?
+            }
+            None => gpu.flash().enqueue_flash_latent_seg(stream, seg)?,
             Some((twice, shift)) => gpu.flash().enqueue_flash_latent_seg_twice(
                 stream,
-                &s.f_rows,
-                kv_l,
-                &s.n_keys_buf,
-                mla.kq_scale,
-                1,
-                mla.n_head,
-                rope,
-                latent,
-                &mut s.part_v,
-                &mut s.part_ms,
-                twice,
-                shift,
+                FlashSegTwiceArgs {
+                    seg,
+                    twice,
+                    shift_rows: shift,
+                },
             )?,
         }
         // Same reads as the single-block launch; the partials of the live
@@ -3507,49 +3538,39 @@ fn enqueue_attn(
                 Some(8 * mla.n_head * segs),
             ]),
         )?;
+        let merge = FlashMergeArgs {
+            n_keys_buf: &s.n_keys_buf,
+            cache_rows: kv_l.rows(),
+            tokens: 1,
+            heads: mla.n_head,
+            latent_dims: latent,
+            part_v: &s.part_v,
+            part_ms: &s.part_ms,
+            y: &mut s.kqvc,
+        };
         if fold_quant {
             if s.probe_cfg.flash_merge2 {
                 gpu.flash().enqueue_flash_merge2_q8(
                     stream,
-                    &s.n_keys_buf,
-                    kv_l.rows(),
-                    1,
-                    mla.n_head,
-                    latent,
-                    &s.part_v,
-                    &s.part_ms,
-                    &mut s.kqvc,
-                    &mut s.act_kv_lo,
-                    &mut s.act_kv_hi,
-                    0,
+                    FlashMerge2Q8Args {
+                        merge,
+                        lo: &mut s.act_kv_lo,
+                        hi: &mut s.act_kv_hi,
+                        shift_segs: 0,
+                    },
                 )?;
             } else {
                 gpu.flash().enqueue_flash_merge_q8(
                     stream,
-                    &s.n_keys_buf,
-                    kv_l.rows(),
-                    1,
-                    mla.n_head,
-                    latent,
-                    &s.part_v,
-                    &s.part_ms,
-                    &mut s.kqvc,
-                    &mut s.act_kv_lo,
-                    &mut s.act_kv_hi,
+                    FlashMergeQ8Args {
+                        merge,
+                        lo: &mut s.act_kv_lo,
+                        hi: &mut s.act_kv_hi,
+                    },
                 )?;
             }
         } else {
-            gpu.flash().enqueue_flash_merge(
-                stream,
-                &s.n_keys_buf,
-                kv_l.rows(),
-                1,
-                mla.n_head,
-                latent,
-                &s.part_v,
-                &s.part_ms,
-                &mut s.kqvc,
-            )?;
+            gpu.flash().enqueue_flash_merge(stream, merge)?;
         }
         // The live segments' partials in, the attended output out, and the
         // quantized form when it rides along.
@@ -3627,26 +3648,30 @@ fn enqueue_attn(
         };
         step.enqueue_q3k_gemv_heads(
             stream,
-            kv_b,
-            &s.act_kv_lo,
-            0,
-            mla.v_head,
-            mla.nope + mla.v_head,
-            mla.nope,
-            mla.v_head,
-            &mut s.kqv_2d,
+            Q3kGemvHeadsArgs {
+                w: kv_b,
+                act: &s.act_kv_lo,
+                head_base: 0,
+                rows_per_head: mla.v_head,
+                row_stride_per_head: mla.nope + mla.v_head,
+                row_off: mla.nope,
+                y_head_stride: mla.v_head,
+                y: &mut s.kqv_2d,
+            },
         )?;
         tick(i, obs, "gemv_q3k_heads(wv_b_lo)", wv_b_bytes(&s.act_kv_lo))?;
         step.enqueue_q3k_gemv_heads(
             stream,
-            kv_b,
-            &s.act_kv_hi,
-            half,
-            mla.v_head,
-            mla.nope + mla.v_head,
-            mla.nope,
-            mla.v_head,
-            &mut s.kqv_2d,
+            Q3kGemvHeadsArgs {
+                w: kv_b,
+                act: &s.act_kv_hi,
+                head_base: half,
+                rows_per_head: mla.v_head,
+                row_stride_per_head: mla.nope + mla.v_head,
+                row_off: mla.nope,
+                y_head_stride: mla.v_head,
+                y: &mut s.kqv_2d,
+            },
         )?;
         tick(i, obs, "gemv_q3k_heads(wv_b_hi)", wv_b_bytes(&s.act_kv_hi))?;
     } else {
@@ -3655,15 +3680,17 @@ fn enqueue_attn(
         // saves the launch, not the weight read.
         step.enqueue_q3k_gemv_heads_pair(
             stream,
-            kv_b,
-            &s.act_kv_lo,
-            &s.act_kv_hi,
-            0,
-            mla.v_head,
-            mla.nope + mla.v_head,
-            mla.nope,
-            mla.v_head,
-            &mut s.kqv_2d,
+            Q3kGemvHeadsPairArgs {
+                w: kv_b,
+                lo: &s.act_kv_lo,
+                hi: &s.act_kv_hi,
+                head_base: 0,
+                rows_per_head: mla.v_head,
+                row_stride_per_head: mla.nope + mla.v_head,
+                row_off: mla.nope,
+                y_head_stride: mla.v_head,
+                y: &mut s.kqv_2d,
+            },
         )?;
         tick(
             i,

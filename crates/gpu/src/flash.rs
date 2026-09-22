@@ -2340,6 +2340,97 @@ pub struct FlashKernels {
     module: flash_kernels::LoadedModule,
 }
 
+/// The query geometry every flash launch over the cache shares: `tokens`
+/// query tokens (1..=8) of `heads` heads each, so `tokens * heads` query
+/// rows of `rope_dims + latent_dims` f32, row `t * heads + h`.
+#[derive(Clone, Copy, Debug)]
+pub struct FlashGeom {
+    pub tokens: usize,
+    pub heads: usize,
+    pub rope_dims: usize,
+    pub latent_dims: usize,
+}
+
+/// What every attending launch reads: the query rows `q`, the `[rows x
+/// rope_dims + latent_dims]` f16 cache `kv`, the device-side live key count
+/// `n_keys_buf[0]`, and `kq_scale` (`MlaParams::kq_scale`).
+#[derive(Clone, Copy)]
+pub struct FlashInputs<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub kv: &'a DeviceTensor<u16>,
+    pub n_keys_buf: &'a DeviceBuffer<u32>,
+    pub kq_scale: f32,
+    pub geom: FlashGeom,
+}
+
+/// [`FlashKernels::enqueue_flash_latent`]'s arguments.
+pub struct FlashLatentArgs<'a> {
+    pub inputs: FlashInputs<'a>,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashKernels::enqueue_flash_latent_q8`]'s arguments.
+pub struct FlashLatentQ8Args<'a> {
+    pub inputs: FlashInputs<'a>,
+    pub y: &'a mut DeviceBuffer<f32>,
+    pub lo: &'a mut Q8Act,
+    pub hi: &'a mut Q8Act,
+}
+
+/// [`FlashKernels::enqueue_flash_latent_split`]'s arguments.
+pub struct FlashSplitArgs<'a> {
+    pub inputs: FlashInputs<'a>,
+    pub part_v: &'a mut DeviceBuffer<f32>,
+    pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The segment pass's arguments — [`FlashKernels::enqueue_flash_latent_seg`]
+/// and its tensor-core twin [`FlashKernels::enqueue_flash_latent_mma`].
+pub struct FlashSegArgs<'a> {
+    pub inputs: FlashInputs<'a>,
+    pub part_v: &'a mut DeviceBuffer<f32>,
+    pub part_ms: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashKernels::enqueue_flash_latent_seg_twice`]'s arguments: the
+/// segment pass's, the stage to run twice (one `TWICE_*`), and the second
+/// pass's row offset inside the segment.
+pub struct FlashSegTwiceArgs<'a> {
+    pub seg: FlashSegArgs<'a>,
+    pub twice: u32,
+    pub shift_rows: usize,
+}
+
+/// [`FlashKernels::enqueue_flash_merge`]'s arguments: `cache_rows` is the
+/// height the partials were written for.
+pub struct FlashMergeArgs<'a> {
+    pub n_keys_buf: &'a DeviceBuffer<u32>,
+    pub cache_rows: usize,
+    pub tokens: usize,
+    pub heads: usize,
+    pub latent_dims: usize,
+    pub part_v: &'a DeviceBuffer<f32>,
+    pub part_ms: &'a DeviceBuffer<f32>,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashKernels::enqueue_flash_merge_q8`]'s arguments.
+pub struct FlashMergeQ8Args<'a> {
+    pub merge: FlashMergeArgs<'a>,
+    pub lo: &'a mut Q8Act,
+    pub hi: &'a mut Q8Act,
+}
+
+/// [`FlashKernels::enqueue_flash_merge2_q8`]'s arguments: the q8 merge's
+/// and the second fold's offset, in segments.
+pub struct FlashMerge2Q8Args<'a> {
+    pub merge: FlashMergeArgs<'a>,
+    pub lo: &'a mut Q8Act,
+    pub hi: &'a mut Q8Act,
+    pub shift_segs: usize,
+}
+
 impl FlashKernels {
     /// Load this file's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<FlashKernels, GpuError> {
@@ -2433,40 +2524,43 @@ impl FlashKernels {
         Ok(())
     }
 
-    /// Enqueue the latent flash attention: `q` holds `m * n_heads` rows of
-    /// `rope_dims + latent` f32 (row `t * n_heads + h`, content
+    /// Enqueue the latent flash attention: `q` holds `tokens * heads` rows
+    /// of `rope_dims + latent_dims` f32 (row `t * heads + h`, content
     /// `[q_rope | q_nope2]`), `kv` is the `[rows x width]` u16 cache, and
-    /// `n_keys_buf[0]` names the live key count (`>= m`: the batch's own
-    /// rows are appended first) — query `t` attends to keys
-    /// `0..n_keys − m + t`. `y` holds `m * n_heads` rows of `latent` f32,
-    /// the `kqv_compressed` order. `scale` is `MlaParams::kq_scale` (the
-    /// YaRN mscale is inside it — not `1/√d`). `latent` must be [`LATENT`],
-    /// this family's block width; `rope_dims` is free as long as
-    /// `rope_dims + latent` is a multiple of [`DIM_SPLIT`] and at most
-    /// [`MAX_WIDTH`] (the shared staging row). Asynchronous,
-    /// allocation-free, capturable.
+    /// `n_keys_buf[0]` names the live key count (`>= tokens`: the batch's
+    /// own rows are appended first) — query `t` attends to keys
+    /// `0..n_keys − tokens + t`. `y` holds `tokens * heads` rows of
+    /// `latent_dims` f32, the `kqv_compressed` order. `kq_scale` is
+    /// `MlaParams::kq_scale` (the YaRN mscale is inside it — not `1/√d`).
+    /// `latent_dims` must be [`LATENT`], this family's block width;
+    /// `rope_dims` is free as long as `rope_dims + latent_dims` is a
+    /// multiple of [`DIM_SPLIT`] and at most [`MAX_WIDTH`] (the shared
+    /// staging row). Asynchronous, allocation-free, capturable.
     pub fn enqueue_flash_latent(
         &self,
         stream: &CudaStream,
-        q: &DeviceBuffer<f32>,
-        kv: &DeviceTensor<u16>,
-        n_keys_buf: &DeviceBuffer<u32>,
-        scale: f32,
-        m: usize,
-        n_heads: usize,
-        rope_dims: usize,
-        latent: usize,
-        y: &mut DeviceBuffer<f32>,
+        a: FlashLatentArgs<'_>,
     ) -> Result<(), GpuError> {
+        let FlashLatentArgs { inputs, y } = a;
+        let FlashInputs {
+            q,
+            kv,
+            n_keys_buf,
+            kq_scale: scale,
+            geom,
+        } = inputs;
+        let FlashGeom {
+            tokens: m,
+            heads: n_heads,
+            rope_dims,
+            latent_dims: latent,
+        } = geom;
         let q_rows = check_flash(
             "enqueue_flash_latent",
             q.len(),
             kv,
             n_keys_buf.len(),
-            m,
-            n_heads,
-            rope_dims,
-            latent,
+            geom,
             Some(y.len()),
         )?;
         let prep = self.module.prepare_flash_latent(LaunchConfig1D::new(
@@ -2502,43 +2596,44 @@ impl FlashKernels {
     /// graph, and the grid does not move with `n_keys_buf`.
     ///
     /// `part_v` must hold [`partials_v_len`] and `part_ms`
-    /// [`partials_ms_len`] for the same `m * n_heads` rows and cache height.
+    /// [`partials_ms_len`] for the same `tokens * heads` rows and cache
+    /// height.
     /// Asynchronous, allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_latent_split(
         &self,
         stream: &CudaStream,
-        q: &DeviceBuffer<f32>,
-        kv: &DeviceTensor<u16>,
-        n_keys_buf: &DeviceBuffer<u32>,
-        scale: f32,
-        m: usize,
-        n_heads: usize,
-        rope_dims: usize,
-        latent: usize,
-        part_v: &mut DeviceBuffer<f32>,
-        part_ms: &mut DeviceBuffer<f32>,
-        y: &mut DeviceBuffer<f32>,
+        a: FlashSplitArgs<'_>,
     ) -> Result<usize, GpuError> {
-        if segments_for(kv.rows()) == 1 {
-            self.enqueue_flash_latent(
-                stream, q, kv, n_keys_buf, scale, m, n_heads, rope_dims, latent, y,
-            )?;
-            return Ok(1);
-        }
-        self.enqueue_flash_latent_seg(
-            stream, q, kv, n_keys_buf, scale, m, n_heads, rope_dims, latent, part_v, part_ms,
-        )?;
-        self.enqueue_flash_merge(
-            stream,
-            n_keys_buf,
-            kv.rows(),
-            m,
-            n_heads,
-            latent,
+        let FlashSplitArgs {
+            inputs,
             part_v,
             part_ms,
             y,
+        } = a;
+        if segments_for(inputs.kv.rows()) == 1 {
+            self.enqueue_flash_latent(stream, FlashLatentArgs { inputs, y })?;
+            return Ok(1);
+        }
+        self.enqueue_flash_latent_seg(
+            stream,
+            FlashSegArgs {
+                inputs,
+                part_v: &mut *part_v,
+                part_ms: &mut *part_ms,
+            },
+        )?;
+        self.enqueue_flash_merge(
+            stream,
+            FlashMergeArgs {
+                n_keys_buf: inputs.n_keys_buf,
+                cache_rows: inputs.kv.rows(),
+                tokens: inputs.geom.tokens,
+                heads: inputs.geom.heads,
+                latent_dims: inputs.geom.latent_dims,
+                part_v,
+                part_ms,
+                y,
+            },
         )?;
         Ok(2)
     }
@@ -2548,31 +2643,36 @@ impl FlashKernels {
     /// wants the two launches timed or observed separately enqueues this and
     /// [`FlashKernels::enqueue_flash_merge`] itself, after asking
     /// [`segments_for`] whether the cache is tall enough to need them at all.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_latent_seg(
         &self,
         stream: &CudaStream,
-        q: &DeviceBuffer<f32>,
-        kv: &DeviceTensor<u16>,
-        n_keys_buf: &DeviceBuffer<u32>,
-        scale: f32,
-        m: usize,
-        n_heads: usize,
-        rope_dims: usize,
-        latent: usize,
-        part_v: &mut DeviceBuffer<f32>,
-        part_ms: &mut DeviceBuffer<f32>,
+        a: FlashSegArgs<'_>,
     ) -> Result<(), GpuError> {
+        let FlashSegArgs {
+            inputs,
+            part_v,
+            part_ms,
+        } = a;
+        let FlashInputs {
+            q,
+            kv,
+            n_keys_buf,
+            kq_scale: scale,
+            geom,
+        } = inputs;
+        let FlashGeom {
+            tokens: m,
+            heads: n_heads,
+            rope_dims,
+            latent_dims: latent,
+        } = geom;
         let segs = segments_for(kv.rows());
         let q_rows = check_flash(
             "enqueue_flash_latent_seg",
             q.len(),
             kv,
             n_keys_buf.len(),
-            m,
-            n_heads,
-            rope_dims,
-            latent,
+            geom,
             None,
         )?;
         check_partials(
@@ -2620,31 +2720,36 @@ impl FlashKernels {
     /// The kernel's shared tiles are sized for a [`MMA_WIDTH`] row and its
     /// `k` walk assumes the width divides by [`MMA_CHUNK`], so any other
     /// width is refused here rather than read past a tile.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_latent_mma(
         &self,
         stream: &CudaStream,
-        q: &DeviceBuffer<f32>,
-        kv: &DeviceTensor<u16>,
-        n_keys_buf: &DeviceBuffer<u32>,
-        scale: f32,
-        m: usize,
-        n_heads: usize,
-        rope_dims: usize,
-        latent: usize,
-        part_v: &mut DeviceBuffer<f32>,
-        part_ms: &mut DeviceBuffer<f32>,
+        a: FlashSegArgs<'_>,
     ) -> Result<(), GpuError> {
+        let FlashSegArgs {
+            inputs,
+            part_v,
+            part_ms,
+        } = a;
+        let FlashInputs {
+            q,
+            kv,
+            n_keys_buf,
+            kq_scale: scale,
+            geom,
+        } = inputs;
+        let FlashGeom {
+            tokens: m,
+            heads: n_heads,
+            rope_dims,
+            latent_dims: latent,
+        } = geom;
         let segs = segments_for(kv.rows());
         let q_rows = check_flash(
             "enqueue_flash_latent_mma",
             q.len(),
             kv,
             n_keys_buf.len(),
-            m,
-            n_heads,
-            rope_dims,
-            latent,
+            geom,
             None,
         )?;
         check_partials(
@@ -2704,39 +2809,47 @@ impl FlashKernels {
     /// [`FlashKernels::enqueue_flash_latent_seg`] through the probe entry
     /// that runs one stage of the walk a second time: `twice` is one of
     /// [`TWICE_QK`], [`TWICE_V`], [`TWICE_COLL`], [`TWICE_SYNC`] and
-    /// [`TWICE_SM`], and `shift` is the second pass's row offset inside the
+    /// [`TWICE_SM`], and `shift_rows` is the second pass's row offset inside the
     /// segment — 0 re-reads the rows just read, [`KEY_TILE`] reads the next
     /// tile's — which only the two loop stages look at. A TIMING
     /// INSTRUMENT: the partials are the shipped entry's to the bit, so an
     /// arm's slowdown against it is that stage's price in the step.
     /// Asynchronous, allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_latent_seg_twice(
         &self,
         stream: &CudaStream,
-        q: &DeviceBuffer<f32>,
-        kv: &DeviceTensor<u16>,
-        n_keys_buf: &DeviceBuffer<u32>,
-        scale: f32,
-        m: usize,
-        n_heads: usize,
-        rope_dims: usize,
-        latent: usize,
-        part_v: &mut DeviceBuffer<f32>,
-        part_ms: &mut DeviceBuffer<f32>,
-        twice: u32,
-        shift: usize,
+        a: FlashSegTwiceArgs<'_>,
     ) -> Result<(), GpuError> {
+        let FlashSegTwiceArgs {
+            seg:
+                FlashSegArgs {
+                    inputs,
+                    part_v,
+                    part_ms,
+                },
+            twice,
+            shift_rows: shift,
+        } = a;
+        let FlashInputs {
+            q,
+            kv,
+            n_keys_buf,
+            kq_scale: scale,
+            geom,
+        } = inputs;
+        let FlashGeom {
+            tokens: m,
+            heads: n_heads,
+            rope_dims,
+            latent_dims: latent,
+        } = geom;
         let segs = segments_for(kv.rows());
         let q_rows = check_flash(
             "enqueue_flash_latent_seg_twice",
             q.len(),
             kv,
             n_keys_buf.len(),
-            m,
-            n_heads,
-            rope_dims,
-            latent,
+            geom,
             None,
         )?;
         check_partials(
@@ -2799,19 +2912,21 @@ impl FlashKernels {
     /// The merge pass alone — the second of the two launches. `cache_rows`
     /// is the height the partials were written for, so the segment count
     /// matches the segment pass's grid exactly.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_merge(
         &self,
         stream: &CudaStream,
-        n_keys_buf: &DeviceBuffer<u32>,
-        cache_rows: usize,
-        m: usize,
-        n_heads: usize,
-        latent: usize,
-        part_v: &DeviceBuffer<f32>,
-        part_ms: &DeviceBuffer<f32>,
-        y: &mut DeviceBuffer<f32>,
+        a: FlashMergeArgs<'_>,
     ) -> Result<(), GpuError> {
+        let FlashMergeArgs {
+            n_keys_buf,
+            cache_rows,
+            tokens: m,
+            heads: n_heads,
+            latent_dims: latent,
+            part_v,
+            part_ms,
+            y,
+        } = a;
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
         if n_keys_buf.is_empty() {
@@ -2873,21 +2988,26 @@ impl FlashKernels {
     /// `Gpu::enqueue_quantize_q8_1_pair(y, 0, lo, lo.m() * latent, hi)`
     /// would have written, so this deletes that launch rather than merging
     /// it. Asynchronous, allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_merge_q8(
         &self,
         stream: &CudaStream,
-        n_keys_buf: &DeviceBuffer<u32>,
-        cache_rows: usize,
-        m: usize,
-        n_heads: usize,
-        latent: usize,
-        part_v: &DeviceBuffer<f32>,
-        part_ms: &DeviceBuffer<f32>,
-        y: &mut DeviceBuffer<f32>,
-        lo: &mut Q8Act,
-        hi: &mut Q8Act,
+        a: FlashMergeQ8Args<'_>,
     ) -> Result<(), GpuError> {
+        let FlashMergeQ8Args {
+            merge:
+                FlashMergeArgs {
+                    n_keys_buf,
+                    cache_rows,
+                    tokens: m,
+                    heads: n_heads,
+                    latent_dims: latent,
+                    part_v,
+                    part_ms,
+                    y,
+                },
+            lo,
+            hi,
+        } = a;
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
         if n_keys_buf.is_empty() {
@@ -2959,26 +3079,31 @@ impl FlashKernels {
     }
 
     /// [`FlashKernels::enqueue_flash_merge_q8`] through the probe entry that
-    /// folds the partials a second time, `shift` segments along. A TIMING
+    /// folds the partials a second time, `shift_segs` segments along. A TIMING
     /// INSTRUMENT: `y` and the side output are the shipped entry's to the
     /// bit, so the arm's slowdown against it is the fold's price in the
     /// step. Asynchronous, allocation-free, capturable.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_merge2_q8(
         &self,
         stream: &CudaStream,
-        n_keys_buf: &DeviceBuffer<u32>,
-        cache_rows: usize,
-        m: usize,
-        n_heads: usize,
-        latent: usize,
-        part_v: &DeviceBuffer<f32>,
-        part_ms: &DeviceBuffer<f32>,
-        y: &mut DeviceBuffer<f32>,
-        lo: &mut Q8Act,
-        hi: &mut Q8Act,
-        shift: usize,
+        a: FlashMerge2Q8Args<'_>,
     ) -> Result<(), GpuError> {
+        let FlashMerge2Q8Args {
+            merge:
+                FlashMergeArgs {
+                    n_keys_buf,
+                    cache_rows,
+                    tokens: m,
+                    heads: n_heads,
+                    latent_dims: latent,
+                    part_v,
+                    part_ms,
+                    y,
+                },
+            lo,
+            hi,
+            shift_segs: shift,
+        } = a;
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
         if n_keys_buf.is_empty() {
@@ -3054,31 +3179,31 @@ impl FlashKernels {
     /// [`FlashKernels::enqueue_flash_latent`] with the same q8_1 side output
     /// as [`FlashKernels::enqueue_flash_merge_q8`] — the single-segment path,
     /// so both paths of the folded step quantize.
-    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_flash_latent_q8(
         &self,
         stream: &CudaStream,
-        q: &DeviceBuffer<f32>,
-        kv: &DeviceTensor<u16>,
-        n_keys_buf: &DeviceBuffer<u32>,
-        scale: f32,
-        m: usize,
-        n_heads: usize,
-        rope_dims: usize,
-        latent: usize,
-        y: &mut DeviceBuffer<f32>,
-        lo: &mut Q8Act,
-        hi: &mut Q8Act,
+        a: FlashLatentQ8Args<'_>,
     ) -> Result<(), GpuError> {
+        let FlashLatentQ8Args { inputs, y, lo, hi } = a;
+        let FlashInputs {
+            q,
+            kv,
+            n_keys_buf,
+            kq_scale: scale,
+            geom,
+        } = inputs;
+        let FlashGeom {
+            tokens: m,
+            heads: n_heads,
+            rope_dims,
+            latent_dims: latent,
+        } = geom;
         let q_rows = check_flash(
             "enqueue_flash_latent_q8",
             q.len(),
             kv,
             n_keys_buf.len(),
-            m,
-            n_heads,
-            rope_dims,
-            latent,
+            geom,
             Some(y.len()),
         )?;
         let (m_lo, n_sb) = check_side_quant("enqueue_flash_latent_q8", lo, hi, q_rows, latent)?;
@@ -3179,19 +3304,21 @@ fn check_partials(
 /// The geometry both flash entries share: the block width is the latent
 /// tail, the query row is staged in shared memory, and the QK dot splits a
 /// row across [`DIM_SPLIT`] threads; `y_len` is `None` for the segment pass,
-/// which writes partials instead. Returns `m * n_heads`, the query rows.
-#[allow(clippy::too_many_arguments)]
+/// which writes partials instead. Returns `tokens * heads`, the query rows.
 fn check_flash(
     what: &'static str,
     q_len: usize,
     kv: &DeviceTensor<u16>,
     n_keys_len: usize,
-    m: usize,
-    n_heads: usize,
-    rope_dims: usize,
-    latent: usize,
+    geom: FlashGeom,
     y_len: Option<usize>,
 ) -> Result<usize, GpuError> {
+    let FlashGeom {
+        tokens: m,
+        heads: n_heads,
+        rope_dims,
+        latent_dims: latent,
+    } = geom;
     if !(1..=8).contains(&m) {
         return Err(GpuError::shape(what, format!("1 <= m <= 8, got {m}")));
     }
