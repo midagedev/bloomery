@@ -26,6 +26,8 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::oracle::deepseek2::L_OUT_1;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, bits_equal, load_ref, max_rel_err, open_model, ref_manifest, route_ref,
     tensor_bytes, tensor_bytes_as, us_per_replay, verdict,
@@ -142,8 +144,8 @@ fn run() -> Result<(), GateError> {
     let resid = in_vals[t0 * k..tokens * k].to_vec();
     let (fo_row, fo_vals) = load_ref(&man, "ffn_out-1", 0)?;
     fo_row.expect("ffn_out-1", "f32", [k as u64, tokens as u64, 1, 1], "ADD")?;
-    let (lo_row, l_out) = load_ref(&man, "l_out-1", 0)?;
-    lo_row.expect("l_out-1", "f32", [k as u64, tokens as u64, 1, 1], "ADD")?;
+    let (lo_row, l_out) = load_ref(&man, L_OUT_1, 0)?;
+    lo_row.expect(L_OUT_1, "f32", [k as u64, tokens as u64, 1, 1], "ADD")?;
     let (mm_row, moe_exp) = load_ref(&man, "ffn_moe_out-1", 0)?;
     mm_row.expect(
         "ffn_moe_out-1",

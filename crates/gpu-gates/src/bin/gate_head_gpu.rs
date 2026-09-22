@@ -38,6 +38,8 @@ use bloomery_gpu::weights::Weights;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::oracle::deepseek2::L_OUT_26;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, bits_equal, find_ref_row, open_model, ref_dir, ref_manifest, ref_tensor_logical_in,
     verdict,
@@ -83,7 +85,7 @@ fn run() -> Result<(), GateError> {
     // The head's input: the dump's l_out-26 — the last block's residual ADD,
     // last position only (the reference runs the head there alone). The same
     // contract the CPU head gate pins.
-    let in_row = find_ref_row(&man, "l_out-26", 0)?;
+    let in_row = find_ref_row(&man, L_OUT_26, 0)?;
     if in_row.ty != "f32" || in_row.op != "ADD" || in_row.ne != [2048, 1, 1, 1] {
         return Err(format!(
             "gate_head_gpu: l_out-26/0 is {} {} {:?}, want f32 ADD [2048, 1]",

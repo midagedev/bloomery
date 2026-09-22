@@ -36,6 +36,8 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::oracle::deepseek2::{L_OUT_0, L_OUT_1, L_OUT_26};
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
@@ -79,9 +81,7 @@ fn run() -> Result<(), GateError> {
     // norm (attn_norm, ffn_norm, kv_a norm, output_norm alike) — the key
     // `forward::rms_eps` reads, never a literal.
     let eps: f32 = gguf
-        .architecture()
-        .and_then(|a| gguf.value(&format!("{a}.attention.layer_norm_rms_epsilon")))
-        .and_then(gguf::Value::as_f32)
+        .arch_get_f32("attention.layer_norm_rms_epsilon")
         .ok_or("gate_p4: metadata <arch>.attention.layer_norm_rms_epsilon missing")?;
 
     // The rope parameters, built by the CPU engine's own reader — the same
@@ -169,7 +169,7 @@ fn run() -> Result<(), GateError> {
         ),
         (
             "attn_norm-1",
-            "l_out-0",
+            L_OUT_0,
             "attn_norm-1",
             0,
             "blk.1.attn_norm.weight",
@@ -183,7 +183,7 @@ fn run() -> Result<(), GateError> {
         ),
         (
             "result_norm",
-            "l_out-26",
+            L_OUT_26,
             "result_norm",
             0,
             "output_norm.weight",
@@ -383,10 +383,10 @@ fn run() -> Result<(), GateError> {
     // (out, a, b) with the operand pairs proven by element sums before use.
     {
         let chains = [
-            ("ffn_inp-1", "kqv_out-1", "l_out-0"),
+            ("ffn_inp-1", "kqv_out-1", L_OUT_0),
             ("ffn_out-1", "ffn_moe_out-1", "ffn_shexp-1"),
-            ("l_out-1", "ffn_out-1", "ffn_inp-1"),
-            ("l_out-0", "ffn_out-0", "ffn_inp-0"),
+            (L_OUT_1, "ffn_out-1", "ffn_inp-1"),
+            (L_OUT_0, "ffn_out-0", "ffn_inp-0"),
         ];
         for (out_name, a_name, b_name) in chains {
             let (a_row, a) = load_ref(&man, a_name, 0)?;

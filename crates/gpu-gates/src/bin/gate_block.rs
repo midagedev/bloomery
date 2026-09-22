@@ -23,6 +23,7 @@ use bloomery_gpu_gates::block::{
     Bands, BlockKind, M_TOKENS, TapKind, check_logical_views, check_row, compare_in, print_table,
     taps,
 };
+use bloomery_gpu_gates::oracle::deepseek2::ORACLE;
 use bloomery_gpu_gates::{
     GateError, find_ref_row_in, ref_dir, ref_dir_named, ref_manifest_in, ref_tensor_logical_in,
     verdict,
@@ -54,7 +55,8 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), GateError> {
     let mut ok = true;
 
-    let cpu_set = std::env::var("BLOOMERY_REF_CPU_SET").unwrap_or_else(|_| "ref".to_string());
+    let cpu_set =
+        std::env::var("BLOOMERY_REF_CPU_SET").unwrap_or_else(|_| ORACLE.cpu_set.to_string());
     // The CUDA set is `ref_dir()`'s (default `ref_cuda_v2`, overridable by
     // `BLOOMERY_REF_SET` / `BLOOMERY_REF_CUDA`) — one owner of the default.
     let cuda_dir: PathBuf = ref_dir();

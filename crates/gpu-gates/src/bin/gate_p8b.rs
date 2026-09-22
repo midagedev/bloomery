@@ -47,6 +47,8 @@ use bloomery_gpu::model::StepProbe;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::oracle::deepseek2::L_OUT_0;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
     ref_tensor_logical_in, route_ref, topk_ids_logical, verdict, widened_f16_bits,
@@ -128,7 +130,7 @@ fn run() -> Result<(), GateError> {
 
     // The layer's input residual is the previous block's output: the dump's
     // own `l_out-0`, one column per token.
-    let lo0_row = find_ref_row_in(&dir, &man, "l_out-0", 0)?;
+    let lo0_row = find_ref_row_in(&dir, &man, L_OUT_0, 0)?;
     if lo0_row.ty != "f32" || lo0_row.op != "ADD" || lo0_row.ne[1] != M_TOKENS as u64 {
         return Err(format!(
             "gate_p8b: l_out-0 is {} {} {:?}, want f32 ADD with {M_TOKENS} token columns",

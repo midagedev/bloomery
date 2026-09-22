@@ -10,10 +10,12 @@
 # it defines compiler flags) and the runners never compile.
 #
 # MODEL and BLOOMERY_DATA come from the variables the C++ harnesses (ref_paths.h) and the Rust
-# gates (bloomery_gpu_gates::{ref_model_path, data_dir}) read, with the same defaults, so one
-# override reaches all three: BLOOMERY_REF_MODEL moves the model, BLOOMERY_DATA the data
-# directory. An empty variable counts as unset, as in ref_paths.h. BLOOMERY_REF_MODEL itself is
-# left as the caller set it; MODEL is the name the scripts use.
+# gates (bloomery_gpu_gates::{ref_model_path, data_dir}) read, so one override reaches all three:
+# BLOOMERY_REF_MODEL moves the model, BLOOMERY_DATA the data directory. ref_paths.h and data_dir
+# carry the same defaults; ref_model_path has none, and tools/box.sh exports this file's MODEL as
+# BLOOMERY_REF_MODEL into every box command. An empty variable counts as unset, as in
+# ref_paths.h. BLOOMERY_REF_MODEL itself is left as the caller set it; MODEL is the name the
+# scripts use.
 #
 # IK and IKBIN each keep their override: IK moves the whole tree (and IKBIN with it), IKBIN
 # alone points at a different llama-bench.

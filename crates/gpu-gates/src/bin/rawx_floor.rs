@@ -20,12 +20,14 @@
 
 use std::path::Path;
 
+use bloomery_gpu_gates::oracle::deepseek2::ORACLE;
 use bloomery_gpu_gates::{
     GateError, activations, max_rel_err, open_model, ref_dir_named, ref_gemv, ref_model_path,
     row_bytes, tensor_bytes_as,
 };
 use gguf::Gguf;
 use gguf::quant::GgmlType;
+use model::arch::deepseek2::names;
 
 /// One measurement site: the dumped intermediate `x_file`, the quantized
 /// `tensor` whose gemv consumes it, and the q8_1 `block` size that gemv
@@ -49,14 +51,24 @@ struct Site {
 /// `attn_output` (its input `kqv_2d`) so both readings of the site exist;
 /// the input row is the one that grounds the gemv floor.
 fn sites() -> Vec<Site> {
+    // (site, x file stem, tensor name, type, K, q8 block, row cap, note)
+    type Row = (
+        &'static str,
+        &'static str,
+        fn(usize) -> String,
+        GgmlType,
+        usize,
+        usize,
+        usize,
+        &'static str,
+    );
     let mut v = Vec::new();
     for layer in [1u32, 13] {
-        // (site, x file stem, tensor infix, type, K, q8 block, row cap, note)
-        let per_layer: [(&str, &str, &str, GgmlType, usize, usize, usize, &str); 6] = [
+        let per_layer: [Row; 6] = [
             (
                 "attn_q",
                 "attn_norm",
-                "attn_q",
+                names::attn_q,
                 GgmlType::Q3_K,
                 2048,
                 128,
@@ -66,7 +78,7 @@ fn sites() -> Vec<Site> {
             (
                 "attn_output",
                 "kqv_2d",
-                "attn_output",
+                names::attn_output,
                 GgmlType::Q4_K,
                 2048,
                 128,
@@ -76,7 +88,7 @@ fn sites() -> Vec<Site> {
             (
                 "attn_output_post",
                 "kqv_out",
-                "attn_output",
+                names::attn_output,
                 GgmlType::Q4_K,
                 2048,
                 128,
@@ -86,7 +98,7 @@ fn sites() -> Vec<Site> {
             (
                 "moe_gate",
                 "ffn_norm",
-                "ffn_gate_exps",
+                names::ffn_gate_exps,
                 GgmlType::Q3_K,
                 2048,
                 128,
@@ -96,7 +108,7 @@ fn sites() -> Vec<Site> {
             (
                 "shexp_down",
                 "ffn_up_gate",
-                "ffn_down_shexp",
+                names::ffn_down_shexp,
                 GgmlType::Q4_K,
                 2816,
                 128,
@@ -106,7 +118,7 @@ fn sites() -> Vec<Site> {
             (
                 "moe_down",
                 "ffn_moe_gate_par",
-                "ffn_down_exps",
+                names::ffn_down_exps,
                 GgmlType::Q5_0,
                 1408,
                 32,
@@ -114,12 +126,12 @@ fn sites() -> Vec<Site> {
                 "x is tokens x experts x 1408; every 1408-value slice is one column",
             ),
         ];
-        for (name, stem, infix, ty, k, block, cap, note) in per_layer {
+        for (name, stem, tensor, ty, k, block, cap, note) in per_layer {
             v.push(Site {
                 name,
                 layer: Some(layer),
                 x_file: format!("{stem}-{layer}.0.f32"),
-                tensor: format!("blk.{layer}.{infix}.weight"),
+                tensor: tensor(layer as usize),
                 ty,
                 k,
                 block,
@@ -147,10 +159,10 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), GateError> {
-    let model = ref_model_path();
-    // Pinned by name to the pre-v2 `ref_cuda` set, not steered by the
-    // environment the way `ref_dir()` is (which resolves to `ref_cuda_v2`).
-    let dir = ref_dir_named("ref_cuda");
+    let model = ref_model_path()?;
+    // Pinned to the pre-v2 set, not steered by the environment the way
+    // `ref_dir()` is (which resolves to the table's v2 CUDA set).
+    let dir = ref_dir_named(ORACLE.legacy_cuda_set);
     let gguf = open_model()?;
     println!("rawx_floor: model {}", model.display());
     println!("rawx_floor: activations dir {}", dir.display());

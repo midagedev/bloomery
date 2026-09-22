@@ -89,11 +89,7 @@ fn run() -> Result<(), GateError> {
         )
         .into());
     }
-    let scale = gguf
-        .architecture()
-        .and_then(|a| gguf.value(&format!("{a}.expert_weights_scale")))
-        .and_then(|v| v.as_f32())
-        .unwrap_or(1.0);
+    let scale = gguf.arch_get_f32("expert_weights_scale").unwrap_or(1.0);
 
     // Rows per expert of the three stacks the offset table addresses, typed
     // as the Q3_K gate/up and Q5_0 down gemvs those offsets feed.

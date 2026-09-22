@@ -41,6 +41,8 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Gguf;
 #[cfg(feature = "gpu")]
 use gguf::quant::GgmlType;
+#[cfg(feature = "gpu")]
+use model::arch::deepseek2::names;
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -92,15 +94,10 @@ fn run() -> Result<(), GateError> {
     for l in [0usize, 1, 13, 26] {
         let in_norm = find_ref_row(&man, &format!("attn_norm-{l}"), 0)?;
         for (site, tensor, out, out_op) in [
-            (
-                "attn_q",
-                format!("blk.{l}.attn_q.weight"),
-                format!("q-{l}"),
-                "MUL_MAT",
-            ),
+            ("attn_q", names::attn_q(l), format!("q-{l}"), "MUL_MAT"),
             (
                 "attn_kv_a_mqa",
-                format!("blk.{l}.attn_kv_a_mqa.weight"),
+                names::attn_kv_a_mqa(l),
                 format!("kv_rope_compressed-{l}"),
                 "MUL_MAT",
             ),
@@ -137,7 +134,7 @@ fn run() -> Result<(), GateError> {
             &gguf,
             &man,
             &format!("attn_output L={l}"),
-            &format!("blk.{l}.attn_output.weight"),
+            &names::attn_output(l),
             kqv_2d,
             &format!("kqv_out-{l}"),
             "MUL_MAT",
@@ -160,8 +157,8 @@ fn run() -> Result<(), GateError> {
         "ffn_swiglu_dense L=0",
         dense_norm,
         dense_up_gate,
-        "blk.0.ffn_gate.weight",
-        "blk.0.ffn_up.weight",
+        &names::ffn_gate(0),
+        &names::ffn_up(0),
     )? {
         push(GgmlType::Q3_K, v);
     }
@@ -174,8 +171,8 @@ fn run() -> Result<(), GateError> {
             &format!("ffn_swiglu_shexp L={l}"),
             norm,
             up_gate,
-            &format!("blk.{l}.ffn_gate_shexp.weight"),
-            &format!("blk.{l}.ffn_up_shexp.weight"),
+            &names::ffn_gate_shexp(l),
+            &names::ffn_up_shexp(l),
         )? {
             push(GgmlType::Q3_K, v);
         }
@@ -214,7 +211,7 @@ fn run() -> Result<(), GateError> {
         &gpu,
         &gguf,
         "attn_q_synth",
-        "blk.1.attn_q.weight",
+        &names::attn_q(1),
         GgmlType::Q3_K,
         None,
         6,
@@ -224,7 +221,7 @@ fn run() -> Result<(), GateError> {
         &gpu,
         &gguf,
         "attn_output_synth",
-        "blk.1.attn_output.weight",
+        &names::attn_output(1),
         GgmlType::Q4_K,
         None,
         6,
@@ -609,7 +606,7 @@ fn synth_q5_1_site(
     // dims [K, rows]
     let (_, bytes) = tensor_bytes_as(
         gguf,
-        "blk.0.ffn_down.weight",
+        &names::ffn_down(0),
         GgmlType::Q5_1,
         Some(&[10944, 2048]),
     )?;
@@ -660,7 +657,7 @@ fn synth_q5_0_site(
     // dims [K, rows, experts]
     let (_, bytes) = tensor_bytes_as(
         gguf,
-        "blk.1.ffn_down_exps.weight",
+        &names::ffn_down_exps(1),
         GgmlType::Q5_0,
         Some(&[1408, 2048, 64]),
     )?;

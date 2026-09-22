@@ -1193,13 +1193,12 @@ fn graph_check_append(gpu: &Gpu, flash: &FlashKernels, one_row: &[f32]) -> Resul
 /// oracle.
 #[cfg(feature = "gpu")]
 fn kq_scale_of(gguf: &Gguf) -> Result<f32, GateError> {
-    let f32v = |key: &str| -> Result<f32, GateError> {
-        gguf.value(key)
-            .and_then(|v| v.as_f32())
-            .ok_or_else(|| format!("gate_p5: metadata {key} missing").into())
+    let f32v = |suffix: &str| -> Result<f32, GateError> {
+        gguf.arch_get_f32(suffix)
+            .ok_or_else(|| format!("gate_p5: metadata {} missing", gguf.arch_key(suffix)).into())
     };
-    let scaling = f32v("deepseek2.rope.scaling.factor")?;
-    let log_mul = f32v("deepseek2.rope.scaling.yarn_log_multiplier")?;
+    let scaling = f32v("rope.scaling.factor")?;
+    let log_mul = f32v("rope.scaling.yarn_log_multiplier")?;
     let kq_head = gguf
         .arch_get_u64("attention.key_length")
         .ok_or("gate_p5: metadata attention.key_length missing")?;

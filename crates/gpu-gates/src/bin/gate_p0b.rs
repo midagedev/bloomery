@@ -27,6 +27,8 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::oracle::deepseek2::L_OUT_0;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, bits_equal, bytes_to_words, f32_tensor, load_ref, max_rel_err, open_model,
     ref_manifest, row_bytes, tensor_bytes_as, us_per_replay, verdict,
@@ -67,9 +69,7 @@ fn run() -> Result<(), GateError> {
 
     // The one architecture-wide rms epsilon (as gate_p4 reads it).
     let eps: f32 = gguf
-        .architecture()
-        .and_then(|a| gguf.value(&format!("{a}.attention.layer_norm_rms_epsilon")))
-        .and_then(gguf::Value::as_f32)
+        .arch_get_f32("attention.layer_norm_rms_epsilon")
         .ok_or("gate_p0b: metadata <arch>.attention.layer_norm_rms_epsilon missing")?;
 
     // The input: dump ffn_inp-0's last token column, dims proven first.
@@ -656,8 +656,8 @@ fn run() -> Result<(), GateError> {
     // ---- printed, never asserted: distance to the CUDA oracle's own
     // outputs on the same position.
     {
-        let (l_row, l_out) = load_ref(&man, "l_out-0", 0)?;
-        l_row.expect("l_out-0", "f32", [K as u64, TOKENS as u64, 1, 1], "ADD")?;
+        let (l_row, l_out) = load_ref(&man, L_OUT_0, 0)?;
+        l_row.expect(L_OUT_0, "f32", [K as u64, TOKENS as u64, 1, 1], "ADD")?;
         let ik_y = max_rel_err(&y_fu_1, &l_out[(TOKENS - 1) * K..TOKENS * K])?;
         let (ug_row, up_gate) = load_ref(&man, "ffn_up_gate-0", 0)?;
         // The dump's fused gate/up output: dims match h exactly.

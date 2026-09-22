@@ -38,9 +38,10 @@
 //! The engines' Q8_0 requant of `wk_b` is not modelled: both carry it.
 
 use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
-use bloomery_gpu_gates::{GateError, data_dir, open_model};
+use bloomery_gpu_gates::{GateError, data_dir, open_model, ref_model_path};
 use gguf::quant::{GgmlType, dequant_row, half_to_f32};
 use gguf::{Gguf, TensorInfo};
+use model::arch::deepseek2::names;
 use model::attn::{MlaParams, f32_to_f16_bits};
 use std::path::{Path, PathBuf};
 
@@ -321,12 +322,9 @@ impl Model<'_> {
         let (g, t) = (self.g, self.threads);
         let p = self.p.clone();
         let (nh, nope, rd, vh, lat) = (p.n_head, p.nope, p.rope_dims, p.v_head, p.latent);
-        let q = self.mvq(view(find(g, &format!("blk.{l}.attn_q.weight"))?, None)?, x)?;
-        let kva = self.mvq(
-            view(find(g, &format!("blk.{l}.attn_kv_a_mqa.weight"))?, None)?,
-            x,
-        )?;
-        let gain = f32_vec(g, find(g, &format!("blk.{l}.attn_kv_a_norm.weight"))?)?;
+        let q = self.mvq(view(find(g, &names::attn_q(l))?, None)?, x)?;
+        let kva = self.mvq(view(find(g, &names::attn_kv_a_mqa(l))?, None)?, x)?;
+        let gain = f32_vec(g, find(g, &names::attn_kv_a_norm(l))?)?;
         let normed = rms_norm(&kva[..lat], &gain, self.eps);
         let mut c_kv = normed.clone();
         let cs = p.rope.cache(pos);
@@ -335,7 +333,7 @@ impl Model<'_> {
             round_f16(&mut c_kv);
             round_f16(&mut k_pe);
         }
-        let wkvb = find(g, &format!("blk.{l}.attn_kv_b.weight"))?;
+        let wkvb = find(g, &names::attn_kv_b(l))?;
         // The key side reads the cached row itself: no engine quantizes it.
         let kvb = matvec(g, view(wkvb, None)?, &c_kv, t)?;
         let mut k_nope = Vec::with_capacity(nh * nope);
@@ -384,10 +382,7 @@ impl Model<'_> {
             };
             out.extend(self.mvq(wv, &kqvc[h * lat..(h + 1) * lat])?);
         }
-        let y = self.mvq(
-            view(find(g, &format!("blk.{l}.attn_output.weight"))?, None)?,
-            &out,
-        )?;
+        let y = self.mvq(view(find(g, &names::attn_output(l))?, None)?, &out)?;
         if let Some(tp) = self.tap() {
             tp.q = q;
             tp.kv_compressed = normed;
@@ -406,12 +401,12 @@ impl Model<'_> {
 
     fn ffn(&mut self, l: usize, x: &[f64]) -> Res<Vec<f64>> {
         let g = self.g;
-        let t = |s: &str| find(g, &format!("blk.{l}.{s}.weight"));
-        let Some(router) = g.find(&format!("blk.{l}.ffn_gate_inp.weight")) else {
+        let t = |name: fn(usize) -> String| find(g, &name(l));
+        let Some(router) = g.find(&names::ffn_gate_inp(l)) else {
             return self.mlp(
-                view(t("ffn_gate")?, None)?,
-                view(t("ffn_up")?, None)?,
-                view(t("ffn_down")?, None)?,
+                view(t(names::ffn_gate)?, None)?,
+                view(t(names::ffn_up)?, None)?,
+                view(t(names::ffn_down)?, None)?,
                 x,
             );
         };
@@ -422,9 +417,9 @@ impl Model<'_> {
         let mut ids: Vec<usize> = (0..self.n_expert).collect();
         ids.sort_by(|&a, &b| e[b].total_cmp(&e[a]).then(a.cmp(&b)));
         let mut out = self.mlp(
-            view(t("ffn_gate_shexp")?, None)?,
-            view(t("ffn_up_shexp")?, None)?,
-            view(t("ffn_down_shexp")?, None)?,
+            view(t(names::ffn_gate_shexp)?, None)?,
+            view(t(names::ffn_up_shexp)?, None)?,
+            view(t(names::ffn_down_shexp)?, None)?,
             x,
         )?;
         let chosen = ids[..self.n_used].to_vec();
@@ -434,9 +429,9 @@ impl Model<'_> {
             .collect();
         for (&id, &w) in chosen.iter().zip(&weights) {
             let y = self.mlp(
-                view(t("ffn_gate_exps")?, Some(id))?,
-                view(t("ffn_up_exps")?, Some(id))?,
-                view(t("ffn_down_exps")?, Some(id))?,
+                view(t(names::ffn_gate_exps)?, Some(id))?,
+                view(t(names::ffn_up_exps)?, Some(id))?,
+                view(t(names::ffn_down_exps)?, Some(id))?,
                 x,
             )?;
             for (o, v) in out.iter_mut().zip(&y) {
@@ -465,18 +460,18 @@ impl Model<'_> {
             if let Some(t) = self.taps.as_mut() {
                 t.push(Taps::default());
             }
-            let gain = f32_vec(g, find(g, &format!("blk.{l}.attn_norm.weight"))?)?;
+            let gain = f32_vec(g, find(g, &names::attn_norm(l))?)?;
             let an = rms_norm(&x, &gain, self.eps);
             let a = self.attn(l, &an, pos)?;
             for (xi, ai) in x.iter_mut().zip(&a) {
                 *xi += ai;
             }
-            let routed = g.find(&format!("blk.{l}.ffn_gate_inp.weight")).is_some();
+            let routed = g.find(&names::ffn_gate_inp(l)).is_some();
             if let Some(tp) = self.tap() {
                 tp.attn_norm = an;
                 tp.ffn_inp.clone_from(&x);
             }
-            let gain = f32_vec(g, find(g, &format!("blk.{l}.ffn_norm.weight"))?)?;
+            let gain = f32_vec(g, find(g, &names::ffn_norm(l))?)?;
             let fnorm = rms_norm(&x, &gain, self.eps);
             let f = self.ffn(l, &fnorm)?;
             for (xi, fi) in x.iter_mut().zip(&f) {
@@ -575,9 +570,7 @@ fn run() -> Res<()> {
     let p = MlaParams::read(&g, 0)?;
     let eps = f64::from(p.eps);
     let expert_scale = g
-        .architecture()
-        .and_then(|a| g.value(&format!("{a}.expert_weights_scale")))
-        .and_then(gguf::Value::as_f32)
+        .arch_get_f32("expert_weights_scale")
         .map_or(1.0, f64::from);
     let mut m = Model {
         g: &g,
@@ -646,8 +639,7 @@ fn run() -> Res<()> {
         println!("dumped step {last} taps to {}", dir.display());
     }
     if let Some(path) = emit {
-        let model = std::env::var("BLOOMERY_REF_MODEL")
-            .unwrap_or_else(|_| bloomery_gpu_gates::DEFAULT_MODEL.to_string());
+        let model = ref_model_path()?.display().to_string();
         write_emit(Path::new(&path), id, &model, kv_f16, &emitted)?;
     }
     Ok(())

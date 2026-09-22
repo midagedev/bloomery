@@ -31,6 +31,7 @@ use std::sync::Arc;
 pub mod arch;
 pub mod cores;
 pub mod elem;
+pub mod engine;
 pub mod flash;
 pub mod fused;
 pub(crate) mod graph;
@@ -45,6 +46,7 @@ pub(crate) mod tensor;
 pub mod weights;
 
 pub use ::model::attn::MlaParams;
+pub use engine::AnyEngine;
 pub use graph::Graph;
 pub use model::GpuModel;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
@@ -98,6 +100,9 @@ pub enum GpuError {
     },
     /// Planning, metadata or dequantization carried up from the model crate.
     Model(Box<::model::ModelError>),
+    /// The file declares an architecture the model crate knows but this
+    /// crate has no engine for; the string is the name the file declares.
+    UnsupportedArch(String),
 }
 
 impl GpuError {
@@ -163,6 +168,7 @@ impl std::fmt::Display for GpuError {
             GpuError::Tensor { what, name, need } => write!(f, "{what}: {name} is not {need}"),
             GpuError::State { what, missing } => write!(f, "{what}: {missing}"),
             GpuError::Model(e) => write!(f, "{e}"),
+            GpuError::UnsupportedArch(name) => write!(f, "unsupported architecture {name:?}"),
         }
     }
 }

@@ -71,9 +71,9 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::Deepseek2Model;
-#[cfg(feature = "gpu")]
 use bloomery_gpu::model::{StepMode, StepProbe};
+#[cfg(feature = "gpu")]
+use bloomery_gpu::{AnyEngine, Deepseek2Model};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::read_prompts;
 #[cfg(feature = "gpu")]
@@ -277,7 +277,11 @@ fn run() -> Result<(), GateError> {
     }
 
     let gguf = open_model()?;
-    let mut model = Deepseek2Model::load_full(&gguf, ctx)?;
+    // The drive below needs more than the `Engine` surface (step mode,
+    // probe, graph capture, the stage table), so it names its arm. A second
+    // arm makes this pattern refutable, and the build then asks for that
+    // arm's path here.
+    let AnyEngine::Deepseek2(mut model) = AnyEngine::open(&gguf, ctx)?;
     model.set_mode(mode);
     if let Some(rounds) = flag_value("--ab")? {
         if seed_depth.is_some() {

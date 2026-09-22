@@ -80,9 +80,9 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu::Deepseek2Model;
+use bloomery_gpu::model::{Engine, StepMode, StepProbe};
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::{StepMode, StepProbe};
+use bloomery_gpu::{AnyEngine, Deepseek2Model};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{
     ExactRow, GreedyClass, GreedyRow, compare_forced, compare_forced_exact, compare_greedy,
@@ -263,8 +263,8 @@ fn read_argmax_ids(path: &std::path::Path) -> Result<Vec<(usize, u32, Vec<u32>)>
 /// answer the same question; `reference[i].n_tokens` is ik's count and is
 /// cross-checked against the file's.
 #[cfg(feature = "gpu")]
-fn run_set(
-    model: &mut Deepseek2Model,
+fn run_set<E: Engine>(
+    model: &mut E,
     prompts: &[bloomery_gpu_gates::prompts::PromptRow],
     reference: &[GreedyRow],
 ) -> Result<Vec<Vec<u32>>, GateError> {
@@ -603,7 +603,7 @@ fn lcg_prompt(n: usize) -> Vec<u32> {
 /// One continuation of `prompt`: fresh caches, the prompt fed one token at
 /// a time, then `DEEP_GEN` - 1 feedback steps.
 #[cfg(feature = "gpu")]
-fn run_deep(model: &mut Deepseek2Model, prompt: &[u32]) -> Result<Vec<u32>, GateError> {
+fn run_deep<E: Engine>(model: &mut E, prompt: &[u32]) -> Result<Vec<u32>, GateError> {
     model.reset()?;
     let mut next = model.step(prompt)?;
     let mut seq = Vec::with_capacity(DEEP_GEN);
@@ -727,7 +727,12 @@ fn run() -> Result<(), GateError> {
     }
 
     let gguf = open_model()?;
-    let mut model = Deepseek2Model::load_full(&gguf, CTX_MAX)?;
+    // `run_set` and `run_deep` need only the `Engine` surface; the rest of
+    // this gate reads more (step mode, probes, graph capture, logits, the
+    // device step parameters, the stage table), so it names its arm. A
+    // second arm makes this pattern refutable, and the build then asks for
+    // that arm's path here.
+    let AnyEngine::Deepseek2(mut model) = AnyEngine::open(&gguf, CTX_MAX)?;
     println!(
         "resident bytes={} ctx_max={CTX_MAX} layers=0..{} gen={GEN}",
         model.resident_bytes(),

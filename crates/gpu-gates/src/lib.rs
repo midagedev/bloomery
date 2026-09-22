@@ -13,15 +13,13 @@
 //! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
 pub mod block;
+pub mod oracle;
 pub mod prompts;
 pub mod ptx;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
 use std::path::PathBuf;
-
-/// The model every gate reads unless `BLOOMERY_REF_MODEL` says otherwise.
-pub const DEFAULT_MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
 
 /// Kernel gate band against the quantized-input reference.
 /// PIN(2026-09-21): tightened 1e-2 -> 1e-5. Measured worst on the landed
@@ -62,11 +60,22 @@ pub fn checks_failed() -> GateError {
     "FAILED: one or more checks above did not pass".into()
 }
 
-/// The model file every gate opens: `$BLOOMERY_REF_MODEL`, else
-/// [`DEFAULT_MODEL`]. `open_model` and any gate that prints the path read it
-/// here, so the printed name is the file that was opened.
-pub fn ref_model_path() -> PathBuf {
-    std::env::var("BLOOMERY_REF_MODEL").map_or_else(|_| PathBuf::from(DEFAULT_MODEL), PathBuf::from)
+/// The model file every gate opens: `$BLOOMERY_REF_MODEL`, with no default
+/// here. The file is a property of the model profile
+/// (`tools/ref/models/<architecture>.sh`); `tools/box.sh` exports it into
+/// every box command, the same value the runners and the C++ harnesses
+/// read. An empty value counts as unset, as in the profile. `open_model` and
+/// any gate that prints the path read it here, so the printed name is the
+/// file that was opened.
+pub fn ref_model_path() -> Result<PathBuf, GateError> {
+    match std::env::var_os("BLOOMERY_REF_MODEL") {
+        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => Err(
+            "BLOOMERY_REF_MODEL unset — run through tools/box.sh or the just recipes, \
+                  which export it from the model profile"
+                .into(),
+        ),
+    }
 }
 
 /// The data directory on the box (reference dumps, oracle binaries):
@@ -77,7 +86,7 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub fn open_model() -> Result<Gguf, GateError> {
-    Ok(Gguf::open(ref_model_path())?)
+    Ok(Gguf::open(ref_model_path()?)?)
 }
 
 /// `m` activation columns of `k` f32 each, concatenated. A fixed LCG mapped
@@ -266,10 +275,11 @@ impl RefRow {
 
 /// Directory of the ik CUDA oracle dump (docs/gpu-design.md decision 3):
 /// `$BLOOMERY_REF_CUDA` if set (an absolute path), else the set named by
-/// `$BLOOMERY_REF_SET`, else `$BLOOMERY_DATA/ref_cuda_v2`, else the
-/// workstation default. Read-only for every caller. `BLOOMERY_REF_SET` is
-/// how a gate points itself at the pre-v2 `ref_cuda` (plain files only,
-/// no logical twins) or the CPU `ref` without a code change.
+/// `$BLOOMERY_REF_SET`, else the deepseek2 table's CUDA set
+/// ([`oracle::deepseek2::ORACLE`]) under [`data_dir`]. Read-only for every
+/// caller. `BLOOMERY_REF_SET` is how a gate points itself at the pre-v2
+/// `ref_cuda` (plain files only, no logical twins) or the CPU `ref` without
+/// a code change.
 pub fn ref_dir() -> PathBuf {
     if let Ok(p) = std::env::var("BLOOMERY_REF_CUDA") {
         return PathBuf::from(p);
@@ -277,7 +287,7 @@ pub fn ref_dir() -> PathBuf {
     if let Ok(s) = std::env::var("BLOOMERY_REF_SET") {
         return ref_dir_named(&s);
     }
-    data_dir().join("ref_cuda_v2")
+    data_dir().join(oracle::deepseek2::ORACLE.cuda_set)
 }
 
 /// A named dump set's directory: an absolute `set` is the directory

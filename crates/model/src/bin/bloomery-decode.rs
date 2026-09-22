@@ -24,19 +24,20 @@
 //! Run it through `tools/ref/decode-measure.sh`, which holds the box lease and
 //! records witnesses — a tok/s taken while something else has the machine is not
 //! a measurement.
+use model::arch::Arch;
 use model::derived::Derived;
 use model::forward::{argmax, forward, new_cache, step};
 use std::time::Instant;
 
 fn main() {
-    let mut model = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".to_string();
+    let mut model: Option<String> = None;
     let mut tokens: Vec<u32> = Vec::new();
     let mut n_predict = 8usize;
     let mut use_cache = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "-m" => model = args.next().expect("-m needs a path"),
+            "-m" => model = Some(args.next().expect("-m needs a path")),
             "-n" => n_predict = args.next().expect("-n needs a count").parse().unwrap(),
             "--no-cache" => use_cache = false,
             "--profile" => {
@@ -76,6 +77,43 @@ fn main() {
     if tokens.is_empty() {
         eprintln!("bloomery-decode: --tokens is required; this tool does not tokenize");
         std::process::exit(2);
+    }
+    // The model is a property of the tool profile, not of this binary: `-m`,
+    // or the `BLOOMERY_REF_MODEL` that tools/box.sh exports from the profile
+    // (empty counts as unset).
+    let model = model
+        .or_else(|| {
+            std::env::var("BLOOMERY_REF_MODEL")
+                .ok()
+                .filter(|p| !p.is_empty())
+        })
+        .unwrap_or_else(|| {
+            eprintln!(
+                "bloomery-decode: no model — pass -m <gguf>, or run through tools/box.sh, \
+                 which exports BLOOMERY_REF_MODEL from the model profile"
+            );
+            std::process::exit(2);
+        });
+    // The architecture first, from a lazy open that reads the header only: a
+    // file this binary cannot run is refused before the open below faults its
+    // weight pages in. The probe is dropped before that open maps the file
+    // again.
+    {
+        let probe = gguf::Gguf::open(&model).unwrap_or_else(|e| {
+            eprintln!("bloomery-decode: {model}: {e}");
+            std::process::exit(1);
+        });
+        match Arch::detect(&probe) {
+            Ok(Arch::Deepseek2) => {}
+            Ok(a @ Arch::Deepseek41) => {
+                eprintln!("bloomery-decode: unsupported architecture {:?}", a.name());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("bloomery-decode: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let t_open = Instant::now();
