@@ -304,6 +304,16 @@ dump-ref:
 dump-ref-cuda:
     ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
+# V4.1 오라클(B0c): 같은 계측기를 deepseek41 프로필로 돌려 $BLOOMERY_DATA/ref_deepseek41/에 쓴다. CPU 백엔드만
+# 쓰지만 NVMe에서 ~477 GB를 읽어 page cache를 통째로 뒤집는다 — V4.1을 읽는 트랙이 없는 틈에 리드가 친다.
+dump-ref-v41:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump.sh'
+
+# 오라클 세트의 정수 사본 검사(B0c): 정수 텐서마다 무손실 사본이 있고, f32 파일이 그 값의 RNE인가.
+# 인자는 세트 디렉터리(기본 $BLOOMERY_DATA/ref). V2-Lite의 ref는 v1이라 사본이 없어 빨강이다 — just gate에 넣지 않는다.
+check-int-twins *ARGS:
+    ./tools/box.sh 'python3 tools/ref/check-int-twins.py {{ARGS}}'
+
 # 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다.
 gate-ops:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-model --test ops -- --ignored --nocapture'
@@ -353,6 +363,9 @@ gate-mt:
 gate-profile:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1'
 
+# B1a 배치 게이트: V4.1 샤드 아홉의 헤더만으로 텐서마다 역할·장치·형식·상주 바이트를 정하고, 설계 §5의 두 안
+# ((a) A6000 + DDR4, (b) A6000 0–19층 + 3090 20–39층)이 설계의 핀과 같은지 본다. 텐서 바이트·GPU·임대 없이 초 단위다.
+# BLOOMERY_PLACEMENT_TABLE=1이면 텐서별 표도 찍는다.
 gate-placement:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test placement -- --ignored --nocapture'
 
@@ -411,6 +424,8 @@ kvclear-probe *ARGS:
 
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
+# 덤프는 둘이다: V2-Lite의 여섯 타입은 $BLOOMERY_DATA/ref에, V4.1 첫 샤드의 f32·bf16·q8_0은
+# $BLOOMERY_DATA/ref-v41에. --include-ignored라 split 리더와 인벤토리의 평범한 테스트도 같이 돈다.
 gate-1-1:
     ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && "$BLOOMERY_DATA/bin/dequant_ref" "${BLOOMERY_V41_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}" "$BLOOMERY_DATA/ref-v41" f32 bf16 q8_0 && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 

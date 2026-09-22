@@ -2,15 +2,15 @@
 
 | shard | path | version | tensors | kv | header_end | data_base | alignment | file_bytes | tensor_bytes | unknown_size | pad | split.no | split.count | split.tensors.count |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf | 3 | 37 | 68 | 5,770,702 | 5,770,720 | 32 | 9,190,797,024 | 9,185,026,264 | 0 | 40 | 0 | 9 |  |
-| 2 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00002-of-00009.gguf | 3 | 6 | 3 | 466 | 480 | 32 | 104,616,879,968 | 104,616,879,488 | 0 | 0 | 1 | 9 |  |
-| 3 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00003-of-00009.gguf | 3 | 163 | 3 | 10,221 | 10,240 | 32 | 44,802,132,736 | 44,802,122,256 | 0 | 240 | 2 | 9 |  |
-| 4 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00004-of-00009.gguf | 3 | 177 | 3 | 11,172 | 11,200 | 32 | 41,808,611,008 | 41,808,599,528 | 0 | 280 | 3 | 9 |  |
-| 5 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00005-of-00009.gguf | 3 | 8 | 3 | 615 | 640 | 32 | 107,180,313,376 | 107,180,312,736 | 0 | 0 | 4 | 9 |  |
-| 6 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00006-of-00009.gguf | 3 | 183 | 3 | 11,591 | 11,616 | 32 | 43,773,808,480 | 43,773,796,584 | 0 | 280 | 5 | 9 |  |
-| 7 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00007-of-00009.gguf | 3 | 158 | 3 | 10,044 | 10,048 | 32 | 44,233,617,984 | 44,233,607,696 | 0 | 240 | 6 | 9 |  |
-| 8 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00008-of-00009.gguf | 3 | 175 | 3 | 11,077 | 11,104 | 32 | 44,370,290,016 | 44,370,278,632 | 0 | 280 | 7 | 9 |  |
-| 9 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00009-of-00009.gguf | 3 | 139 | 3 | 8,833 | 8,864 | 32 | 37,015,004,320 | 37,014,995,216 | 0 | 240 | 8 | 9 |  |
+| 1 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf | 3 | 37 | 68 | 5,770,702 | 5,770,720 | 32 | 9,190,797,024 | 9,185,026,264 | 0 | 40 | 0 | 9 | 1046 |
+| 2 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00002-of-00009.gguf | 3 | 6 | 3 | 466 | 480 | 32 | 104,616,879,968 | 104,616,879,488 | 0 | 0 | 1 | 9 | 1046 |
+| 3 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00003-of-00009.gguf | 3 | 163 | 3 | 10,221 | 10,240 | 32 | 44,802,132,736 | 44,802,122,256 | 0 | 240 | 2 | 9 | 1046 |
+| 4 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00004-of-00009.gguf | 3 | 177 | 3 | 11,172 | 11,200 | 32 | 41,808,611,008 | 41,808,599,528 | 0 | 280 | 3 | 9 | 1046 |
+| 5 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00005-of-00009.gguf | 3 | 8 | 3 | 615 | 640 | 32 | 107,180,313,376 | 107,180,312,736 | 0 | 0 | 4 | 9 | 1046 |
+| 6 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00006-of-00009.gguf | 3 | 183 | 3 | 11,591 | 11,616 | 32 | 43,773,808,480 | 43,773,796,584 | 0 | 280 | 5 | 9 | 1046 |
+| 7 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00007-of-00009.gguf | 3 | 158 | 3 | 10,044 | 10,048 | 32 | 44,233,617,984 | 44,233,607,696 | 0 | 240 | 6 | 9 | 1046 |
+| 8 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00008-of-00009.gguf | 3 | 175 | 3 | 11,077 | 11,104 | 32 | 44,370,290,016 | 44,370,278,632 | 0 | 280 | 7 | 9 | 1046 |
+| 9 | /models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00009-of-00009.gguf | 3 | 139 | 3 | 8,833 | 8,864 | 32 | 37,015,004,320 | 37,014,995,216 | 0 | 240 | 8 | 9 | 1046 |
 
 Model: 1046 tensors across 9 shard(s), 0 duplicate name(s).
 
@@ -19,12 +19,12 @@ Model: 1046 tensors across 9 shard(s), 0 duplicate name(s).
 | id | type | tensors | bytes | unknown_size | in engine GgmlType |
 |---|---|---:|---:|---:|---|
 | 0 | f32 | 449 | 2,097,600 | 0 | yes |
-| 8 | q8_0 | 332 | 216,166,225,440 | 0 | no |
+| 8 | q8_0 | 332 | 216,166,225,440 | 0 | yes |
 | 11 | q3_K | 179 | 155,738,992,640 | 0 | yes |
 | 12 | q4_K | 38 | 96,825,507,840 | 0 | yes |
 | 13 | q5_K | 2 | 6,228,541,440 | 0 | yes |
 | 14 | q6_K | 1 | 542,976,000 | 0 | yes |
-| 30 | bf16 | 45 | 1,481,277,440 | 0 | no |
+| 30 | bf16 | 45 | 1,481,277,440 | 0 | yes |
 
 ## tensors
 

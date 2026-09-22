@@ -700,12 +700,12 @@ pub fn q_nope2_absorbed(
     }
     if let Some(t_call) = t_call {
         // Shape statement for the derived weights consumed: `n_head · latent` rows
-        // contracted over `nope`; tag 8 is ggml's Q8_0 — the row names what the
-        // step reads (derived blocks), not what the file holds.
+        // contracted over `nope`; the type names what the step reads (derived
+        // Q8_0 blocks), not what the file holds.
         let w_rows = (p.n_head * p.latent) as u64;
         profile::record(
             "q_nope2_absorbed",
-            gguf::GgmlType::Unknown(8),
+            gguf::GgmlType::Q8_0,
             w_rows,
             w_rows * p.nope as u64,
             std::mem::size_of_val(wblocks) as u64,

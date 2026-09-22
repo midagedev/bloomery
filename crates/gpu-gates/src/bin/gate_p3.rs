@@ -7,11 +7,12 @@
 //! at most 2048 terms, which leaves orders of margin. If a shape measures
 //! above the band the gate FAILs and the figure is reported, never absorbed.
 //!
-//! The Q8_0 weights are quantized here, not read: the shared `dequant_row`
-//! has no Q8_0 arm (`GgmlType` models the file's storage types; the engine's
-//! derived Q8_0 lives in `gguf::quant` as `Q8Block`), so the ggml quantize rule
-//! the engine's load-time requant runs and its dequantizer are transcribed
-//! below, verbatim from `model::arch::deepseek2::attn` and `gguf::quant`.
+//! The Q8_0 weights are quantized here, not read: the engine's Q8_0 on this
+//! model is derived at load (`gguf::quant::Q8Block`), not a file tensor, so the
+//! ggml quantize rule the engine's load-time requant runs is transcribed below,
+//! verbatim from `model::arch::deepseek2::attn` and `gguf::quant`, and each
+//! reference value is `code × scale` as the block is written — the product
+//! `dequant_row`'s Q8_0 arm computes, exact in f32.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {

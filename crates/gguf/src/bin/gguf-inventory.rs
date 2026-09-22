@@ -335,9 +335,12 @@ fn main() -> ExitCode {
     for s in &shards {
         let tensor_bytes: u64 = s.inv.tensors.iter().filter_map(|t| t.nbytes).sum();
         let unknown = s.inv.tensors.iter().filter(|t| t.nbytes.is_none()).count();
-        let split_no = s.inv.value("split.no").and_then(|v| v.as_u64());
-        let split_count = s.inv.value("split.count").and_then(|v| v.as_u64());
-        let split_tensors = s.inv.value("split.tensors.count").and_then(|v| v.as_u64());
+        let split_no = s.inv.value("split.no").and_then(|v| v.as_unsigned());
+        let split_count = s.inv.value("split.count").and_then(|v| v.as_unsigned());
+        let split_tensors = s
+            .inv
+            .value("split.tensors.count")
+            .and_then(|v| v.as_unsigned());
         out.push_str(&format!(
             "shard {}: {}\n  version={} tensors={} kv={} header_end={} data_base={} alignment={}\n  file_bytes={} tensor_bytes={} unknown_size={} pad={}\n",
             s.ordinal,
@@ -400,7 +403,7 @@ fn main() -> ExitCode {
         let shard_label = shards
             .get(r.shard)
             .and_then(|s| s.inv.value("split.no"))
-            .and_then(|v| v.as_u64())
+            .and_then(|v| v.as_unsigned())
             .map(|v| v.to_string())
             .unwrap_or_else(|| (r.shard + 1).to_string());
         out.push_str(&format!(
@@ -556,17 +559,17 @@ fn main() -> ExitCode {
                     .saturating_sub(tensor_bytes),
                 s.inv
                     .value("split.no")
-                    .and_then(|v| v.as_u64())
+                    .and_then(|v| v.as_unsigned())
                     .map(|v| v.to_string())
                     .unwrap_or_default(),
                 s.inv
                     .value("split.count")
-                    .and_then(|v| v.as_u64())
+                    .and_then(|v| v.as_unsigned())
                     .map(|v| v.to_string())
                     .unwrap_or_default(),
                 s.inv
                     .value("split.tensors.count")
-                    .and_then(|v| v.as_u64())
+                    .and_then(|v| v.as_unsigned())
                     .map(|v| v.to_string())
                     .unwrap_or_default(),
             ));
@@ -602,7 +605,7 @@ fn main() -> ExitCode {
             let shard_label = shards
                 .get(r.shard)
                 .and_then(|s| s.inv.value("split.no"))
-                .and_then(|v| v.as_u64())
+                .and_then(|v| v.as_unsigned())
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| (r.shard + 1).to_string());
             m.push_str(&format!(

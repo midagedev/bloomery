@@ -42,8 +42,8 @@ pub enum DevWeight {
     /// Q8_0 in the q8f32 two-plane layout: `qs` rows × k/4 u32 words (code j
     /// of a 32-value block in word j/4, byte j%4) and `d` rows × k/32 f32
     /// block scales converted from the f16 storage at load. No file tensor
-    /// fills this variant today — this reader has no Q8_0 arm and refuses
-    /// such a file at open — but the format is the contract the derived
+    /// fills this variant today — `upload_file_tensor` has no Q8_0 arm and
+    /// refuses such a tensor — but the format is the contract the derived
     /// variant shares.
     Q8_0 {
         qs: DeviceTensor<u32>,

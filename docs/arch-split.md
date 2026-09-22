@@ -53,7 +53,9 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
       src/{ops,profile,head,ffn,moe,kv}.rs    공유 — kv.rs는 SlotTable·KvRows(행 폭은 계획이 준다)
       src/arch/mod.rs                         `Arch` 열거형 + `Arch::detect(&Gguf)` — general.architecture를 읽는 유일한 자리
       src/arch/deepseek2/{attn,derived,forward,names}.rs   지금의 파일이 그대로 이사한 것
-      src/arch/deepseek41/{hparams,names,plan}.rs          B4가 처음 만든다 — 순전파는 없다(아래)
+      src/placement.rs                        공유 배치 서비스(B1a) — 아키텍처 이름·`"blk.` 리터럴 없이 역할·장치·형식·상주 바이트
+      src/arch/deepseek41/{roles,kv}.rs                    B1a가 만들었다 — 텐서 이름 → 역할, KV 배치 산술
+      src/arch/deepseek41/{hparams,names,plan}.rs          B4가 더한다 — 순전파는 없다(아래)
     crates/gpu                  런타임(Gpu·Graph·Weights·DeviceTensor·Q8Act) + 커널 전부(지금 있는 파일 그대로)
       src/model.rs                            `GpuModel<B: ChainBody>` — 스테이지·모드·캡처/재생·pos·헤드. 공유 골격
       src/arch/deepseek2/{dispatch,scratch,names,seed,lookup,kernels,probe}.rs → `impl ChainBody`

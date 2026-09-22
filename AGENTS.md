@@ -77,7 +77,7 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
     just gate         # check-recipes + fmt-check + lint + both builds + gate-1-1
     just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
                       # ops attn ffn moe head forward kv derived mt profile
-                      # threads qdot prompts 1-1
+                      # alloc threads qdot engram prompts placement 1-1
     just box-gc       # kill orphan processes under this track's remote dir
     just box-tracks   # remote track dirs vs local worktrees; --remove deletes stale ones
 
