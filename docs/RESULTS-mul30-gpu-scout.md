@@ -12,7 +12,7 @@
 | 금지 GPU (index 1) | 존재(사용 금지) | `NVIDIA RTX A6000`, 49140 MiB, 유휴 | 同上 |
 | 드라이버 / CUDA UMD | 설치됨 | `NVIDIA-SMI 615.71.09`, `CUDA UMD Version: 13.4` — cuda-oxide 요구 "R580+" 충족 | nvidia-smi; cuda-oxide README |
 | nvcc (툴킷) | 설치됨 — 단 **13.0** | `release 13.0, V13.0.88` (Built 2025-08-20), `/usr/local/cuda-13.0` | box.sh `nvcc --version`, `ls /usr/local/cuda*` |
-| CUDA 13.2/13.3 툴킷 | **누락** | `/usr/local/`에 `cuda`, `cuda-13`, `cuda-13.0`만 — cutile-rs sm_8x 요건(13.2) 미충족 | box.sh `ls /usr/local/` |
+| CUDA 13.2/13.3 툴킷 | **누락** | `/usr/local/`에 `cuda`, `cuda-13`, `cuda-13.0`만 — cutile-rs sm_8x 요건(13.2) 미충족(2026-09-23: 13.3을 옆에 설치했다. 13.2는 Tile IR 바이트코드의 하한이고, Ampere 지원을 알린 툴킷은 13.3이다 — `research/cuda-13.1-13.3-report.md` §6) | box.sh `ls /usr/local/` |
 | cargo-oxide | 설치됨 | `/root/.cargo/bin/cargo-oxide`, `cargo-oxide 0.2.1` | box.sh `which cargo-oxide && cargo-oxide --version` |
 | LLVM llc (cuda-oxide 백엔드) | 설치됨 | `LLVM version 21.1.8`, `/root/opt/LLVM-21.1.8-Linux-X64/bin/llc` | box.sh llc --version |
 | Rust 툴체인 | 설치됨 | `rustc 1.100.0-nightly (e457a7b0d 2026-08-27)` = 핀 `nightly-2026-08-28` | box.sh rustc --version; `rust-toolchain.toml` |

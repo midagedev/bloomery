@@ -1,0 +1,41 @@
+D=       6: KV alloc all layers        293,632 B   KV read/token        433,920 B
+D=    1024: KV alloc all layers      8,548,352 B   KV read/token     26,869,760 B
+D=    4096: KV alloc all layers     18,378,752 B   KV read/token     31,981,568 B
+D=   32768: KV alloc all layers    110,129,152 B   KV read/token     79,691,776 B
+D= 1048576: KV alloc all layers  3,360,714,752 B   KV read/token  1,769,996,288 B
+kv_alloc split c=20: layers0-19 65,560,576 20-39 44,568,576 @1M 2,015,911,936 1,344,802,816
+usable A6000 50,952,404,992 3090 25,350,373,376
+(a) A6000 dense 8,576,674,240 kv32k 110,129,152 experts 40,574,177,280 2419 full [34, 35, 36, 37, 38, 39] partial [(33, 115)] headroom 1,087,444,544
+(a) VRAM experts total 40,574,177,280 host expert bytes total 218,193,408,000 host/token 3,409,272,000 frac GPU 0.1568
+ headline (BWg A6000 575 / 3090 700, BWh 147.7):
+   D=    6 ser  40.61 ms  24.63 tok/s
+   D=    6 R1   38.20 ms  26.18 tok/s
+   D= 1024 ser  40.74 ms  24.54 tok/s
+   D= 1024 R1   38.34 ms  26.09 tok/s
+   D= 4096 ser  40.77 ms  24.53 tok/s
+   D= 4096 R1   38.36 ms  26.07 tok/s
+ bands @D=4096, R1 / serial:
+   BWh  122.6: g450: 21.34/20.02 | g575: 23.21/21.98 | g650: 24.09/22.91
+   BWh  147.7: g450: 23.73/22.12 | g575: 26.07/24.53 | g650: 27.18/25.69
+   BWh  230.4: g450: 29.54/27.08 | g575: 33.25/30.79 | g650: 35.08/32.64
+ with engram 0.31 ms on step thread @4096 R1: 25.86
+ ctx_max 1M @4096 R1: 25.95
+ ik-like GPU 247 GB/s, serial: 16.12
+(b) A6000 dense 4,190,828,000 kv32k 65,560,576 experts 45,002,280,960 2683 full [14, 15, 16, 17, 18, 19] partial [(13, 379)] headroom 1,089,755,680
+(b) 3090 dense 4,385,846,240 kv32k 44,568,576 experts 19,238,768,640 1147 full [38, 39] partial [(37, 379)] headroom 1,077,210,144
+(b) VRAM experts total 64,241,049,600 host expert bytes total 194,526,535,680 host/token 3,039,477,120 frac GPU 0.2483
+ headline (BWg A6000 575 / 3090 700, BWh 147.7):
+   D=    6 ser  37.28 ms  26.82 tok/s
+   D=    6 R1   35.37 ms  28.27 tok/s
+   D= 1024 ser  37.42 ms  26.73 tok/s
+   D= 1024 R1   35.51 ms  28.16 tok/s
+   D= 4096 ser  37.44 ms  26.71 tok/s
+   D= 4096 R1   35.53 ms  28.14 tok/s
+ bands @D=4096, R1 / serial:
+   BWh  122.6: g450: 23.02/21.80 | g575: 25.17/24.01 | g650: 26.18/25.07
+   BWh  147.7: g450: 25.49/24.00 | g575: 28.15/26.71 | g650: 29.42/28.02
+   BWh  230.4: g450: 31.40/29.18 | g575: 35.53/33.28 | g650: 37.58/35.34
+ with engram 0.31 ms on step thread @4096 R1: 27.90
+ ctx_max 1M @4096 R1: 28.18
+ ik-like GPU 247 GB/s, serial: 17.36
+ms/token per GB VRAM->experts @147.7: 0.10578876100203115
