@@ -163,7 +163,8 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
 
 - `tools/check-arch.sh`(맥, grep뿐 — `check-recipes.sh`와 같은 부류, `just check-arch`):
   ① `arch/deepseek41/` 아래에서 `deepseek2`를 `use`하는 줄, 그 반대 방향도 없다
-  ② `blk.N.<name>` 문자열 리터럴과 `deepseek2.`·`deepseek41.` 접두 키는 `arch/`와 `tools/ref/models/` 밖에 없다
+  ② `blk.N.<name>` 문자열 리터럴과 `deepseek2.`·`deepseek41.` 접두 키는 `arch/`와 `tools/ref/models/` 밖에 없다.
+     맨 접두 `"blk."` 하나는 이름이 아니라 GGUF 블록 규약이라 걸리지 않는다(2026-09-23 — 공유 로더의 층 번호 파싱)
   ③ `general.architecture`를 읽는 자리는 `arch/mod.rs` 하나다
 - 커널 파일은 모델 이름을 모른다(결정 6) — ②가 `crates/gpu/src/*.rs`에도 걸린다.
 - 이관 라운드의 증명은 전부 「Derive first」의 **이동 클래스**다: `just ptx-scan` 표 동일(`gate_p5`·`gate_p8` 54행),

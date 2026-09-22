@@ -58,6 +58,10 @@ report 1 "arch dirs use each other" "$cross"
 # bin(인벤토리 도구는 이름을 찍는 저장소 쪽이다 — ③이 gguf 접근자를 허용하는 것과 같은 논거),
 # 그리고 주석 줄(문서의 예시 이름은 코드가 아니다). 이 파일 자신은 tools/ 바로 아래라 안 걸린다 —
 # 점검기의 설명문이 자기 점검에 걸리면 어떤 트리에서도 빨강이다.
+# 맨 접두 리터럴 "blk." 하나는 이름이 아니다(2026-09-23): 모든 아키텍처가 텐서를 `blk.<층>.` 아래에
+# 두는 GGUF 규약이고, 공유 로더가 층 번호를 파싱하는 자리(gpu/weights.rs 의 block_index)가 그것을 쓴다.
+# 규칙이 막는 것은 `blk.N.<name>`이므로, 줄에서 그 리터럴을 지운 뒤에도 패턴이 남는 줄만 잡는다 —
+# `"blk.{l}.ffn_up"`·`"blk.0.attn_q"`와, 맨 접두와 이름이 한 줄에 같이 있는 줄은 그대로 걸린다.
 lits=$(grep -rnE '"blk\.|blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
   | grep -vE '^crates/[^/]+/src/arch/' \
   | grep -vE '^tools/ref/models/' \
@@ -65,7 +69,9 @@ lits=$(grep -rnE '"blk\.|blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --
   | grep -vE '^crates/gpu-gates/src/bin/' \
   | grep -vE '^crates/engram/' \
   | grep -vE '^crates/gguf/src/bin/' \
-  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
+  | awk '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
+           if (body ~ /"blk\.|blk\.[{]|"deepseek2\.|"deepseek41\./) print }' || true)
 report 2 "model-aware string literals outside arch/" "$lits"
 
 # ③ general.architecture 는 한 곳에서만 읽는다.
