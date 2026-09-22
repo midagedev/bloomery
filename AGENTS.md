@@ -95,6 +95,33 @@ that window. The exit code now has one owner, `tools/gate.sh`, and
 `just check-recipes` fails on a test recipe that carries `||` or a bare
 `cargo test`.)
 
+## Derive first, measure the gap (2026-09-22)
+
+A round opens with a prediction, not only an end number: the value and band
+derived from the cost and error models in `docs/plan.md` (section 「모델」),
+and the proof its change class needs. Measurement checks the prediction; when
+it misses, which term of the model was wrong is the round's finding. Looking
+back, several closed rounds were arithmetic before they were code — A4d's 8.3 %
+occupancy is 4 warps of 48 on the SMs its 18 blocks reach; A3f's f16 lever
+could not win on a kernel already at ~700 GB/s.
+
+| Change class | Proof | Runtime gate | Timed A/B |
+|---|---|---|---|
+| move, split, rename (semantics kept) | `just ptx-scan` table identical | none (build + lint) | none |
+| integer-path reorder | bit-identical by associativity | the owning gate once | none |
+| launch count only | Δt = ΔN × c_node, predicted | the owning gate | once, only if occupancy moves too |
+| instruction count on a kernel near ~700 GB/s | model says 0 — do not open the round | — | — |
+| occupancy / geometry | occupancy computed from regs, smem, threads, SM count (ptxas `-v`) and written in the spec | the owning gate | once, to confirm |
+| float sum order or precision | the error model (σ against `exact-forced-32.tsv`) | `gate-gpu-e2e` | once, to confirm |
+
+Measurement comes first only for the named residue: hardware faults (Xid 79),
+compiler register allocation, cache effects with no mechanism yet. Anything
+fixed at build time (node count, launch count, per-kernel instructions and
+registers) is a compile-time ratchet and is not re-measured at runtime.
+
+Every number carries its conditions — `tok/s @ n=N, depth D, card` — or it is
+not a number: the n=32 vs n=96 ratios lost on 2026-09-22 were a units error.
+
 ## Parallel tracks (subagent rounds)
 
 Independent rounds run as git worktrees, each with its own remote directory via
