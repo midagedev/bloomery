@@ -169,7 +169,12 @@ Track checklist, first and last:
    shell that runs it).
 3. **Last**: `just box-gc` again, remove the worktree, then `just box-tracks
    --remove` — a removed worktree leaves its remote directory (and a
-   `target/` of several hundred MB) behind on the box.
+   `target/` of several hundred MB) behind on the box. Read the listing
+   before removing. A track's auxiliary remote directory (a `git archive`
+   base tree, say) is named `bloomery-<track>-<suffix>`: `box-tracks` lists
+   it as `aux` of the live track and removes it only after that track's
+   worktree is gone, and it never removes a directory a process runs in
+   (an exe under its `target/`, or a cwd inside it — a build in progress).
 
 A quiet agent is a symptom, not a state: when a subagent goes inactive, the
 first suspect is a hung gate on the box, not the agent.

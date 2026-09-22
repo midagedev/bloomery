@@ -6,7 +6,10 @@
 #   bash tools/box-gc.sh [--dry-run|--check|--kill] [root]     root defaults to $PWD
 #
 # --dry-run lists and exits 0 (what a human runs), --check lists and exits 10 when anything
-# matched (what box-tracks.sh asks before deleting a directory), --kill collects.
+# matched (what box-tracks.sh asks before deleting a directory), --kill collects. --check also
+# counts a process whose cwd is under root: a build in progress runs cargo and rustc from the
+# toolchain, not from target/, so the exe test alone calls that directory idle. --kill never
+# selects by cwd — a build is not an orphan.
 #
 # It selects a process by `readlink /proc/<pid>/exe`, never by matching a command line.
 # `pgrep -f "<dir>/target"` also matches every shell that carries that pattern in its own
@@ -57,8 +60,14 @@ for d in /proc/[0-9]*; do
   case "$anc" in *" $pid "*) continue ;; esac
   exe=$(readlink "$d/exe" 2>/dev/null) || continue
   case "$exe" in
-    "$PREFIX"/*) pids+=("$pid"); exes+=("$exe") ;;
+    "$PREFIX"/*) pids+=("$pid"); exes+=("$exe"); continue ;;
   esac
+  if [ "$MODE" = --check ]; then
+    cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
+    case "$cwd" in
+      "$ROOT" | "$ROOT"/*) pids+=("$pid"); exes+=("$exe (cwd $cwd)") ;;
+    esac
+  fi
 done
 
 for i in "${!pids[@]}"; do
