@@ -53,20 +53,26 @@ cross_one deepseek2 deepseek41
 report 1 "arch dirs use each other" "$cross"
 
 # ② 모델을 아는 문자열은 arch/ 와 도구 프로필 안에만.
-# 훑는 범위는 crates 의 러스트와 tools/ref 의 셸이다. 이 파일 자신은 tools/ 바로 아래라 안 걸린다 —
+# 훑는 범위는 crates 의 러스트와 tools/ref 의 셸이다. 빼는 것: 시험(오라클 탭 이름을 고정한다),
+# gpu-gates 의 bin(오라클 탭 — M3 가 표로 옮긴다), engram(SITE_NAMES 는 추적 중인 잔여), gguf 의
+# bin(인벤토리 도구는 이름을 찍는 저장소 쪽이다 — ③이 gguf 접근자를 허용하는 것과 같은 논거),
+# 그리고 주석 줄(문서의 예시 이름은 코드가 아니다). 이 파일 자신은 tools/ 바로 아래라 안 걸린다 —
 # 점검기의 설명문이 자기 점검에 걸리면 어떤 트리에서도 빨강이다.
 lits=$(grep -rnE '"blk\.|blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
   | grep -vE '^crates/[^/]+/src/arch/' \
   | grep -vE '^tools/ref/models/' \
   | grep -vE '^crates/[^/]+/tests/' \
   | grep -vE '^crates/gpu-gates/src/bin/' \
-  | grep -vE '^crates/engram/' || true)
+  | grep -vE '^crates/engram/' \
+  | grep -vE '^crates/gguf/src/bin/' \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 report 2 "model-aware string literals outside arch/" "$lits"
 
 # ③ general.architecture 는 한 곳에서만 읽는다.
 archread=$(grep -rn 'general\.architecture' crates --include='*.rs' 2>/dev/null \
   | grep -vE '^crates/gguf/' \
-  | grep -vE '^crates/model/src/arch/mod\.rs:' || true)
+  | grep -vE '^crates/model/src/arch/mod\.rs:' \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 report 3 "general.architecture read outside crates/model/src/arch/mod.rs" "$archread"
 
 if [ "$fail" = 1 ]; then

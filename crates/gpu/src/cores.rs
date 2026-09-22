@@ -901,7 +901,7 @@ pub(crate) fn q3k_row_dot_1col(
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub(crate) fn q3k_row_dot(
+pub fn q3k_row_dot(
     w: &[u32],
     q: &[u64],
     d8: &[f32],

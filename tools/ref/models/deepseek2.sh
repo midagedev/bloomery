@@ -14,6 +14,7 @@
 #   IK_BEST_FLAGS   the CPU decode flags measured fastest for this model
 #   IK_GPU_FLAGS    the same question with the layers offloaded: the CPU combination with
 #                   -rtr 1 dropped; no GPU flag sweep has been run, so these are "at these flags"
+#                   (3090 기준선 216.6/204.6/189.7 이 쓴 그 조합이다 — depth-gpu.sh 가 들고 있던 문장)
 #   REF_PROMPTS     the prompt set the argmax/greedy files and the expert union are taken over
 #   REF_CTX         the one context the reference files are produced at
 #   REF_SET_CPU     oracle directories under $BLOOMERY_DATA: ik's CPU dump and its CUDA dump

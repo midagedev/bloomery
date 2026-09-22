@@ -35,7 +35,7 @@ check-recipes:
     ./tools/check-recipes.sh
 
 # 아키텍처 축 점검(맥, grep뿐) — docs/arch-split.md 「검사」. --allow-pending 은 ②·③을 경고로
-# 낮춘다: 이관(M1~M3) 전에는 둘이 실제로 빨강이다. M1 이 머지되면 이 플래그를 뺀다.
+# 낮춘다: 이관(M1~M3) 전에는 둘이 실제로 빨강이다. ②가 crates/gpu(M2 의 파일)에서 빨강이라 M2 가 머지되면 이 플래그를 뺀다.
 check-arch:
     bash tools/check-arch.sh --allow-pending
 
