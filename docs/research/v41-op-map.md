@@ -58,7 +58,7 @@ gemv는 dtype만 갈리고 그대로 일반화된다, 어텐션은 일반화되�
 6. **q8_0 로더** — 332텐서 216 GB. 커널(`q8_0_gemv`)은 있고 `GgmlType`에 팔이 없다. B1의 항목이고 전부를 막는다.
 7. **bf16 읽기 경로 없음** — 45텐서(`token_embd`, 모든 `ffn_gate_inp`, `engram_{k,q}`). 대기 중인 커널도 없다.
    읽기 경로냐 로드 시 f32 디코드냐를 B1이 로더 형상을 굳히기 전에 정한다.
-8. **q5_K 커널 없음** — `blk.0/1.ffn_down_exps` 두 텐서 6.2 GB. `weights.rs:253/356`이 거부하고 `quant.rs:198`은
+8. **q5_K 커널 없음** — `blk.0/1.ffn_down_exps` 두 텐서 6.2 GB. `weights.rs`의 `resident_size`·`upload_file_tensor`가 거부하고 `quant.rs:198`은
    디퀀트도 없다. 두 층이 이것 없이는 돌지 않는다.
 9. 압축기 풀링 / 10. 그룹 출력 투영(배치 gemv) / 11. rope 기준 둘 + 역-rope / 12. 라우터·SwiGLU 델타 /
 13. Hadamard(포트 유물 — 참조와 대조 뒤 결정).

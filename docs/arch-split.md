@@ -34,10 +34,10 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
 | 어텐션 | MLA — 잠재 K, rope 꼬리 64, `wk_b` 흡수, 헤드별 `wv_b`; flash는 `[k_rope ; kv_compressed]` 576행 | MLA 아님 — 512차원 잠재 하나가 K=V, 64헤드 직접 내적, 헤드별 sink, 출력 꼬리 역-rope, 블록 대각 `wo_a`→`wo_b`; 윈도우 128행 + 고른 512행 = 최대 640행 | **아키텍처 사슬** + deepseek41 전용 커널(sink 어텐션·역-rope·그룹 출력 투영·압축기·인덱서·hc·engram 게이트) |
 | KV 토폴로지 | 층마다 `[ctx_max, 576]` f16 평면 하나(`Vec<DeviceTensor<u16>>`), 슬롯 표는 하나 | 층마다 128행 링(윈도우) + **비율 그룹 넷이 공유**하는 압축 행(2–7·8–13·14–19·20–39) + 인덱서 키 | **아키텍처 타입** — 결정 2의 `(seq, pos)` 슬롯 표는 공유, **행 저장소**만 아키텍처 것. 그룹 공유 캐시는 "층 슬롯당 버퍼 하나"로는 표현이 안 된다 — 이것이 타입이 갈리는 첫 자리다 |
 | 스텝 입력 | 토큰 id, 위치(`step_params` 1버퍼) | 토큰 id, 위치, **engram 48행(13,056 B, 한 스텝 앞서 발행)**, 압축 층의 **호스트 색인 계획**(`v41-ports.md`: 비율 기계는 그래프 분기가 아니라 스텝마다 호스트가 세우는 계획) | **아키텍처 타입** — `ChainBody::Input` |
-| MoE | 라우터 softmax → top-6 → 정규화·스케일, **64 → 6 핀**(`MoeDims::read`가 전문가 수·슬롯 수·텐서별 양자화 타입을 핀) | `√softplus` + 선택 편향 → top-6 → 재정규화 ×1.5, 384 → 6, SwiGLU ±10, 합 `Σ+1e-20` | 라우터·점수는 **아키텍처 커널**; 전문가 `_sel` 본체는 형상이 같으니 **공유**되되 타입이 갈린다 — gate/up은 q3_K(있음), down은 **q5_K(커널도 디퀀트도 없다**, `quant.rs:198`·`weights.rs:253`), shared 전문가는 q8_0(우리 융합 gate/up은 q3_K 전용); 전문가 **배치와 호스트 티어는 공유 서비스**(아래 「직교」) |
+| MoE | 라우터 softmax → top-6 → 정규화·스케일, **64 → 6 핀**(`MoeDims::read`가 전문가 수·슬롯 수·텐서별 양자화 타입을 핀) | `√softplus` + 선택 편향 → top-6 → 재정규화 ×1.5, 384 → 6, SwiGLU ±10, 합 `Σ+1e-20` | 라우터·점수는 **아키텍처 커널**; 전문가 `_sel` 본체는 형상이 같으니 **공유**되되 타입이 갈린다 — gate/up은 q3_K(있음), down은 **q5_K(커널도 디퀀트도 없다**, `quant.rs:198`, `weights.rs`의 `resident_size`·`upload_file_tensor`), shared 전문가는 q8_0(우리 융합 gate/up은 q3_K 전용); 전문가 **배치와 호스트 티어는 공유 서비스**(아래 「직교」) |
 | 헤드 | `output_norm` + `output`, eps는 `mla.eps` | 같음 + 마지막 FFN의 `pre`로 스트림을 접는 마지막 접기 | **거의 공유** — 접기는 사슬 끝에서, `Head`는 eps를 계획에서 받는다 |
 | 파생 가중치 | `wk_b`의 Q8_0 재양자화(`Derived`, 로드 시 CPU) | 알려진 것 없음(hc `comb`·층 종류별 rope 표는 후보 — B4가 정한다) | **아키텍처 계획** |
-| 가중치 형식 | `DevWeight`: K-quant(Q3/Q4/Q6)·Q5_0·Q5_1·F32 + 파생 Q8_0. **파일 텐서로서의 Q8_0 팔이 없고, BF16이 없고, Q5_K는 `weights.rs:253/356`이 거부** | q8_0 **332개(216 GB)**, bf16 45개, q5_K 2개(인벤토리 `## types`) | **공유 크레이트의 일**(B1의 이웃) — 아키텍처가 아니다 |
+| 가중치 형식 | `DevWeight`: K-quant(Q3/Q4/Q6)·Q5_0·Q5_1·F32 + 파생 Q8_0. **파일 텐서로서의 Q8_0 팔이 없고, BF16이 없고, Q5_K는 `weights.rs`의 `resident_size`·`upload_file_tensor`가 거부** | q8_0 **332개(216 GB)**, bf16 45개, q5_K 2개(인벤토리 `## types`) | **공유 크레이트의 일**(B1의 이웃) — 아키텍처가 아니다 |
 | 오라클·탭 | `$BLOOMERY_DATA/ref_cuda`(ik main CUDA 덤프), 탭 `l_out-N`·MLA 중간, `gpu-gates/lib.rs`의 `DEFAULT_MODEL` 상수 | 오라클 v3(B0c, V4.1 포트에서), 정수 일치 탭 셋(engram 행 id·인덱서 top-k·라우터 top-6) + `l_out` | **표** — `gpu-gates/src/oracle/<name>.rs`(디렉터리·매니페스트·탭 이름), 하네스는 공유 |
 | 참조 엔진·도구 | ik `main`, `-mla 3 -fa 1 -fmoe 1`, `prompts.tsv`, `ref-paths.sh`의 `MODEL` 기본값 | **다른 트리** — 우리 V4.1 포트(#2455, `~/repo/upstream/v41-ports/mine`), 다른 플래그, 다른 프롬프트·PPL 셋 | **표** — `tools/ref/models/<name>.sh`, `BLOOMERY_MODEL`로 고른다. 증인 블록이 카드처럼 **모델 이름**을 찍고, 두 모델의 숫자는 한 표에 놓지 않는다 |
 | 바이너리 | `generate`·`gate_e2e`·`bloomery-decode`가 `GpuModel`/`forward::step`을 직접 부른다 | 같은 바이너리 | 열 때 `general.architecture`를 **한 곳**에서 읽어 `AnyEngine` 팔을 고른다. 모르는 값은 그 문자열을 든 오류 한 줄(exit 1) |
@@ -79,17 +79,26 @@ deepseek2 커널의 컴파일러 결함은 어차피 deepseek2 게이트를 붉�
 
 ### 트레이트 둘, 둘 다 작다
 
+아래 스케치는 코드(`crates/gpu/src/model.rs`)에 맞춘 것이다(2026-09-23: M2가 층 하나씩이던 `enqueue_layer`를 사슬 전체의 `enqueue_chain`으로 바꿨고, M3b가 `derive`를 더했다). 둘이 어긋나면 코드가 맞다.
+
 ```rust
 /// What the shared skeleton drives at capture time. Monomorphic: `GpuModel<B>`.
 pub trait ChainBody: Sized {
     /// Per-replay host values: deepseek2 = token/pos/n_keys/cs; deepseek41 adds the
     /// engram rows and the compressed-index plan.
     type Input;
+    fn arch() -> Arch;
+    /// Weights the plan computes at load (deepseek2: wk_b -> Q8_0), filed through
+    /// `Weights::insert_derived` under `derived.` names. Required, no default body.
+    fn derive(stream: &CudaStream, gguf: &Gguf, layers: Range<usize>, w: &mut Weights) -> Result<(), GpuError>;
     fn load(gpu: &Gpu, gguf: &Gguf, w: &Weights, layers: Range<usize>, ctx_max: usize) -> Result<Self, GpuError>;
+    fn decode_input(&mut self, token: u32, pos: u32) -> Result<Self::Input, GpuError>;
     fn refresh(&mut self, stream: &CudaStream, input: &Self::Input) -> Result<(), GpuError>;
-    /// One layer's capturable body: no allocation, no synchronization.
-    fn enqueue_layer(&mut self, gpu: &Gpu, w: &Weights, slot: usize, embed: bool, obs: &mut Observer<'_>) -> Result<(), GpuError>;
+    /// The whole layer chain, capturable: no allocation, no synchronization.
+    fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError>;
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError>;
+    fn seed_depth(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError>;
+    fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError>;
     fn head_eps(&self) -> f32;
     fn resident_bytes(&self) -> usize;
 }

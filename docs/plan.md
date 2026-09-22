@@ -6,11 +6,11 @@
 
 ## 지금
 
-**2026-09-23 새벽(사용자 "적극적으로 병렬 오케스트레이션, 자율 진행")** — main `8707bf1`, origin보다 23커밋 앞(푸시는 사용자 승인).
+**2026-09-23 새벽(사용자 "적극적으로 병렬 오케스트레이션, 자율 진행")** — main `c179548`, origin보다 30커밋 앞(푸시는 사용자 승인).
 
 - **툴체인이 CUDA 13.3이 됐다(리드, 박스)**: 13.3.1 툴킷을 13.0 옆에 설치했다(apt 신규 63·업그레이드 0·제거 0, 드라이버 615.71.09 그대로 — 이미 UMD 13.4). `~/bloomery-env.sh`의 `PATH`·`CUDA_TOOLKIT_PATH`를 13.3으로(원본 `~/bloomery-env.sh.cuda130`). **커널은 안 바뀐다**: cuda-oxide 커널은 PTX로 실려 드라이버가 JIT하고, 13.3으로 지은 `.oxart`가 세 바이너리 모두 md5 `61edb10b…`로 13.0과 같다. 툴킷이 닿는 곳은 bindgen 드라이버 바인딩뿐이다(13.3에서 `cuGraphNodeGetParams`·`cuLaunchHostFunc_v2`·`cuDevSmResourceSplit` 등이 늘었다). 13.3 환경에서 GPU 게이트 16개의 판정 줄 416줄이 main 기준과 같고, `forced_exact` 40/41·σ 0.3641/0.3518·648노드·eager = replay도 같다. **ik는 13.0 그대로다**: `/usr/local/cuda` 대안을 13.0에 수동 고정했다(ik의 CMake `nvcc`와 `ldconfig`가 그 경로를 따른다). `llama-bench`는 RUNPATH로 13.0의 cudart·cuBLAS를 문다. **바뀐 계기 하나**: PATH의 `ncu`/`nsys`가 2026.2.1/2026.1.3이 됐다 — 다음 프로파일 표는 새 계기로 도니 첫 표를 한 번 교차 확인한다. cutile-rs(sm_8x에 13.2 이상)의 전제가 섰다(MUL-6).
-- **비행 중(파동 8′)**: `m3` ‖ `m3b` ‖ `b3e` ‖ `b0c`(오라클 v3 도구 — 덤퍼의 BF16·I64와 정수 무손실 사본, deepseek41 프로필; V4.1 실행은 리드가 추정을 보고 정한다) ‖ `cudares`(13.1~13.3에서 새로 생긴 것 중 sm_86에 닿는 것 조사) ‖ `b1d`(V4.1 배치 설계 유도, 읽기 전용 — B1의 게이트가 대조할 표, A2-2의 두 카드 분할 위치, q5_K·bf16을 CPU와 GPU 중 어디서 할지가 여기서 나온다. 상주 바이트는 파일 바이트가 아니라 로더 형식으로 세고, 3090을 쓰지 않는 안도 같이 유도한다). 아래 「파동」 참조.
-- **리드 몫**: 세 라운드 검수·머지 → `check-arch` 엄격 전환(`weights.rs`의 `strip_prefix("blk.")`는 모든 아키텍처가 공유하는 접두 파싱이라 검사 ②의 정밀 수정 몫) → B3b 헬퍼 팔과 B3e 캐시 팔 임대 측정 → rig-log. CUDA 전환 기록도 rig-log에.
+- **비행 중(파동 8′)**: `m3` ‖ ~~`m3b`~~ 머지(`c179548` — 파생 가중치가 `ChainBody::derive`로, 리드 재실행 초록) ‖ `b3e` ‖ `b0c`(오라클 v3 도구 — 덤퍼의 BF16·I64와 정수 무손실 사본, deepseek41 프로필; V4.1 실행은 리드가 추정을 보고 정한다) ‖ `cudares`(13.1~13.3에서 새로 생긴 것 중 sm_86에 닿는 것 조사) ‖ `b1d`(V4.1 배치 설계 유도, 읽기 전용 — B1의 게이트가 대조할 표, A2-2의 두 카드 분할 위치, q5_K·bf16을 CPU와 GPU 중 어디서 할지가 여기서 나온다. 상주 바이트는 파일 바이트가 아니라 로더 형식으로 세고, 3090을 쓰지 않는 안도 같이 유도한다). 아래 「파동」 참조.
+- **리드 몫**: 남은 라운드 검수·머지 → `check-arch` 엄격 전환 — **main에서 이미 엄격 모드 0건이다**(검사 ②를 문서 규칙 `blk.N.<name>`에 맞춘 `c34403d` + M3b). 레시피에서 `--allow-pending`을 빼는 것은 justfile을 쥔 m3가 머지된 뒤 → B3b 헬퍼 팔과 B3e 캐시 팔 임대 측정 → rig-log. CUDA 전환 기록도 rig-log에.
 - **사용자 판단 대기**: bloomery main 푸시, B0c 오라클 v3 덤프(RAM 250 GB·두 카드, 30분 초과), ik를 13.3으로 다시 빌드할지(빌드하면 ik 기준선을 다시 재야 한다).
 - **열린 결정 후보**: 스칼라 세그먼트 패스(와 그것만 재는 keyaxis 계기 8개)를 지울지 — 「성능이 먼저」는 엔진이 경로 하나만 싣는다고 했다.
 - 지난 인계와 파동 기록은 장부 「「지금」에서 옮긴 것」에 있고, 열린 트리아지 원문은 「대기열 / GPU 선 트리아지」에 있다.
@@ -323,7 +323,7 @@ flowchart LR
 | id | 라운드 | 파일 경계 | 백엔드 | 게이트 | 앞 | 크기 |
 |---|---|---|---|---|---|---|
 | M3 | 게이트·바이너리: `gpu-gates/src/oracle/deepseek2.rs`(디렉터리·매니페스트·탭 표), `DEFAULT_MODEL` → 도구 프로필, `generate`·`gate_e2e`·`bloomery-decode`가 `AnyEngine` 위에서, 모르는 아키텍처는 오류 한 줄 exit 1 | `gpu-gates/src/**`, `model/src/bin/bloomery-decode.rs` | opus | 게이트 15개 출력 줄 동일; FAIL-first: V4.1 파일을 `generate`에 준 지금의 죽는 모양 기록 → `unsupported architecture "deepseek41"` 한 줄 | M2, M4 | S |
-| M3b | **공유 로더에서 MLA 파생 가중치를 뺀다**: `Weights::load`가 deepseek2의 `Derived::new`를 무조건 부르고(`weights.rs:154`) `derived.blk.L.q_nope2`를 공유 이름공간에 쓴다(`:208`). 파생은 아키텍처 계획의 일이다(`arch-split.md` 「무엇이 어디로」 파생 가중치 행) — `ChainBody::derive` 훅으로 `arch/deepseek2`가 만들고 이름도 거기서 짓는다. `check-arch` ②를 막는 두 줄 중 하나를 원인에서 닫는다 | `gpu/weights.rs`, `gpu/model.rs`, `gpu/arch/deepseek2/**`, `gate_p10`·`gate_head_gpu`·`gate_moe_fused` | opus | 이동 클래스: 세 게이트 출력 전체가 base와 동일, GPU 게이트 16개, 648노드·eager = replay, ptx-scan 동일, lint 불상승, `check-arch` 경고 2 → 1 | M2 | S~M — `model.rs` 라운드 |
+| M3c | **arch 이관의 작은 잔여**(M3b가 본 것): 공유 `weights.rs`가 `Q8Block`을 deepseek2의 `model::attn` 경로로 들여온다 → `Q8Block`을 `gguf::quant`(`half_to_f32` 옆)로 옮긴다. `model/lookup.rs` `q8_derived`의 문서가 deepseek2 형상을 서술한다(호출자는 `arch/deepseek2`뿐 — 옮기거나 중립으로). `gate_p10`의 `expected_planes`가 `derived_name(l)`을 쓰게, `gpu-gates/Cargo.toml` 주석. 재발 방지: 공유 파일이 `arch::deepseek2`·`model::attn`을 `use`하지 않는다는 줄을 `check-arch`에(FAIL-first) | `crates/gguf/src/quant.rs`, `crates/model`(`Q8Block` 정의·재수출), `gpu/weights.rs` import 한 줄, `gpu/model/lookup.rs`, `gate_p10.rs`, `gpu-gates/Cargo.toml`, `tools/check-arch.sh` | opus | 이동 클래스: `gate-derived` 바이트 동일, GPU 게이트 16개, ptx-scan 동일, lint 불상승, 새 검사 FAIL-first | M3 | S |
 
 #### B — V4.1
 
@@ -355,9 +355,9 @@ flowchart LR
 
 | 파동 | 병렬로 뜨는 것 | 리드가 그 사이 하는 것 | 파동을 닫는 조건 |
 |---|---|---|---|
-| **8′ (2026-09-23 새벽)** | `m3`(`gpu-gates`·`AnyEngine`·`DEFAULT_MODEL` → 프로필) ‖ `m3b`(`weights.rs`·`model.rs`·`arch/deepseek2`) ‖ `b3e`(`crates/engram`) ‖ `b0c`(`tools/ref` 덤퍼·프로필, 박스 쓰기는 `/root/bloomery-data-b0c`만) ‖ `cudares`(조사, 파일 무변경) ‖ `b1d`(B1 배치 설계 유도, 파일 무변경) — 전부 opus | CUDA 13.3 전환(끝남 — 「지금」), plan.md 분할, 세 머지 → `check-arch` 엄격 전환 → B3b·B3e 임대 측정 | 세 머지, `check-arch` 엄격 초록 |
+| **8′ (2026-09-23 새벽)** | `m3`(`gpu-gates`·`AnyEngine`·`DEFAULT_MODEL` → 프로필) ‖ ~~`m3b`~~(`weights.rs`·`model.rs`·`arch/deepseek2`) 머지 `c179548` ‖ `b3e`(`crates/engram`) ‖ `b0c`(`tools/ref` 덤퍼·프로필, 박스 쓰기는 `/root/bloomery-data-b0c`만) ‖ `cudares`(조사, 파일 무변경) ‖ `b1d`(B1 배치 설계 유도, 파일 무변경) — 전부 opus | CUDA 13.3 전환(끝남 — 「지금」), plan.md 분할, 세 머지 → `check-arch` 엄격 전환 → B3b·B3e 임대 측정 | 세 머지, `check-arch` 엄격 초록 |
 
-`model.rs` 점유 순서(하나씩): `m3b` → A2-2 → B2 → A5 조립 → B5 → C4.
+`model.rs` 점유 순서(하나씩): ~~`m3b`~~(`c179548`) → A2-2 → B2 → A5 조립 → B5 → C4. **A2-2와 B2의 순서는 b1d 보고 뒤에 정한다**(2026-09-23): A2-2(두 카드 스테이지 분할)의 값은 V4.1이 3090을 서빙에 쓰느냐에 달렸고, B2(CPU expert 티어 경계)는 어느 배치안에서도 필요하다.
 
 ### 갱신 규칙
 
