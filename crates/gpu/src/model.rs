@@ -2108,6 +2108,21 @@ impl GpuModel {
             .token(gpu)
     }
 
+    /// The head's logits of the last `step` (`n_vocab` f32). Blocking read;
+    /// gate/debug use.
+    pub fn logits(&self) -> Result<Vec<f32>, GpuError> {
+        let head = self
+            .head
+            .as_ref()
+            .ok_or(GpuError::state("GpuModel::logits", "no output head"))?;
+        let gpu = &self
+            .stages
+            .first()
+            .ok_or(GpuError::state("GpuModel::logits", "no stage"))?
+            .gpu;
+        head.logits_to_host(gpu)
+    }
+
     // ------------------------------------------------- assembled layer step
 
     /// The one resident stage. Every assembled path needs exactly one stage
