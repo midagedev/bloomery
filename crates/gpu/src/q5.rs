@@ -828,12 +828,16 @@ impl Q8Blocks32 {
     /// Allocate for `m` (1..=8) columns of `k` values. Load-time only.
     pub fn new(stream: &CudaStream, k: usize, m: usize) -> Result<Self, GpuError> {
         if k == 0 || !k.is_multiple_of(32) {
-            return Err(
-                format!("Q8Blocks32::new: k must be a positive multiple of 32, got {k}").into(),
-            );
+            return Err(GpuError::shape(
+                "Q8Blocks32::new",
+                format!("k must be a positive multiple of 32, got {k}"),
+            ));
         }
         if !(1..=8).contains(&m) {
-            return Err(format!("Q8Blocks32::new: 1 <= m <= 8, got {m}").into());
+            return Err(GpuError::shape(
+                "Q8Blocks32::new",
+                format!("1 <= m <= 8, got {m}"),
+            ));
         }
         let k_blocks = k / 32;
         let q_stride = 256 * k_blocks.div_ceil(32);
@@ -904,17 +908,22 @@ pub fn pack_q5_1(bytes: &[u8], k: usize, rows: usize) -> Result<Vec<u32>, GpuErr
 
 fn pack_q5(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<u32>, GpuError> {
     if k == 0 || !k.is_multiple_of(32) {
-        return Err(format!("pack_q5: k must be a positive multiple of 32, got {k}").into());
+        return Err(GpuError::shape(
+            "pack_q5",
+            format!("k must be a positive multiple of 32, got {k}"),
+        ));
     }
     let k_blocks = k / 32;
     let blk_bytes = if q5_1 { 24 } else { 22 };
     let need = k_blocks * blk_bytes * rows;
     if bytes.len() < need {
-        return Err(format!(
-            "pack_q5: bytes.len() {len} < k/32 * block * rows = {need}",
-            len = bytes.len()
-        )
-        .into());
+        return Err(GpuError::shape(
+            "pack_q5",
+            format!(
+                "bytes.len() {len} < k/32 * block * rows = {need}",
+                len = bytes.len()
+            ),
+        ));
     }
     let q_stride = 256 * k_blocks.div_ceil(32);
     let scale_words = if q5_1 { 2 * k_blocks } else { k_blocks };
@@ -990,12 +999,14 @@ impl Q5Kernels {
     ) -> Result<(), GpuError> {
         let (m, k_blocks, q_stride) = (act.m(), act.k() / 32, act.q_stride());
         if x.len() < m * k_blocks * 32 {
-            return Err(format!(
-                "enqueue_quantize_q8: x.len() {len} < m*k = {need}",
-                len = x.len(),
-                need = m * k_blocks * 32
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_quantize_q8",
+                format!(
+                    "x.len() {len} < m*k = {need}",
+                    len = x.len(),
+                    need = m * k_blocks * 32
+                ),
+            ));
         }
         let n_groups = k_blocks.div_ceil(4);
         let prep = self.module.prepare_q5_quantize_q8(LaunchConfig1D::new(
@@ -1034,21 +1045,25 @@ impl Q5Kernels {
     ) -> Result<(), GpuError> {
         let (m_a, k_blocks, q_stride) = (a.m(), a.k() / 32, a.q_stride());
         if xa.len() < m_a * k_blocks * 32 {
-            return Err(format!(
-                "enqueue_quantize_q8_pair: xa.len() {len} < m*k = {need}",
-                len = xa.len(),
-                need = m_a * k_blocks * 32
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_quantize_q8_pair",
+                format!(
+                    "xa.len() {len} < m*k = {need}",
+                    len = xa.len(),
+                    need = m_a * k_blocks * 32
+                ),
+            ));
         }
         let (m_b, n_sb) = (b.m(), b.n_sb());
         if xb.len() < m_b * b.k() {
-            return Err(format!(
-                "enqueue_quantize_q8_pair: xb.len() {len} < m*k = {need}",
-                len = xb.len(),
-                need = m_b * b.k()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_quantize_q8_pair",
+                format!(
+                    "xb.len() {len} < m*k = {need}",
+                    len = xb.len(),
+                    need = m_b * b.k()
+                ),
+            ));
         }
         let n_groups = k_blocks.div_ceil(4);
         let blocks = m_a * n_groups + m_b * 2 * n_sb;
@@ -1102,34 +1117,42 @@ impl Q5Kernels {
     ) -> Result<(), GpuError> {
         let k_blocks = act.k() / 32;
         if w.cols() != act.q_stride() + k_blocks {
-            return Err(format!(
-                "enqueue_gemv_q5_0: Q5_0 row is q_stride + k/32 = {} words, got cols {}",
-                act.q_stride() + k_blocks,
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0",
+                format!(
+                    "Q5_0 row is q_stride + k/32 = {} words, got cols {}",
+                    act.q_stride() + k_blocks,
+                    w.cols()
+                ),
+            ));
         }
         if w.rows() < row0 + n_rows || n_rows == 0 {
-            return Err(format!(
-                "enqueue_gemv_q5_0: rows {rows} < row0 {row0} + n_rows {n_rows} or n_rows == 0",
-                rows = w.rows()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0",
+                format!(
+                    "rows {rows} < row0 {row0} + n_rows {n_rows} or n_rows == 0",
+                    rows = w.rows()
+                ),
+            ));
         }
         if !(1..=8).contains(&m_cols) || col0 + m_cols > act.m() {
-            return Err(format!(
-                "enqueue_gemv_q5_0: need 1 <= m_cols <= 8 and col0 + m_cols <= {}, got col0 {col0} m_cols {m_cols}",
-                act.m()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0",
+                format!(
+                    "need 1 <= m_cols <= 8 and col0 + m_cols <= {}, got col0 {col0} m_cols {m_cols}",
+                    act.m()
+                ),
+            ));
         }
         if y.len() < y0 + n_rows * m_cols {
-            return Err(format!(
-                "enqueue_gemv_q5_0: y.len() {len} < y0 + n_rows*m_cols = {need}",
-                len = y.len(),
-                need = y0 + n_rows * m_cols
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0",
+                format!(
+                    "y.len() {len} < y0 + n_rows*m_cols = {need}",
+                    len = y.len(),
+                    need = y0 + n_rows * m_cols
+                ),
+            ));
         }
         let prep = self.module.prepare_q5_0_gemv(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,
@@ -1179,37 +1202,45 @@ impl Q5Kernels {
     ) -> Result<(), GpuError> {
         let k_blocks = act.k() / 32;
         if w.cols() != act.q_stride() + k_blocks {
-            return Err(format!(
-                "enqueue_gemv_q5_0_sel: Q5_0 row is q_stride + k/32 = {} words, got cols {}",
-                act.q_stride() + k_blocks,
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0_sel",
+                format!(
+                    "Q5_0 row is q_stride + k/32 = {} words, got cols {}",
+                    act.q_stride() + k_blocks,
+                    w.cols()
+                ),
+            ));
         }
         if rows_per_expert == 0 || !w.rows().is_multiple_of(rows_per_expert) {
-            return Err(format!(
-                "enqueue_gemv_q5_0_sel: w.rows() {} must be a positive multiple of \
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0_sel",
+                format!(
+                    "w.rows() {} must be a positive multiple of \
                  rows_per_expert {rows_per_expert}",
-                w.rows()
-            )
-            .into());
+                    w.rows()
+                ),
+            ));
         }
         if n_slots == 0 || n_slots > act.m() || sel.len() < n_slots {
-            return Err(format!(
-                "enqueue_gemv_q5_0_sel: need 1 <= n_slots <= act.m() = {} and sel.len() >= \
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0_sel",
+                format!(
+                    "need 1 <= n_slots <= act.m() = {} and sel.len() >= \
                  n_slots, got n_slots {n_slots} sel.len() {}",
-                act.m(),
-                sel.len()
-            )
-            .into());
+                    act.m(),
+                    sel.len()
+                ),
+            ));
         }
         if y.len() < n_slots * rows_per_expert {
-            return Err(format!(
-                "enqueue_gemv_q5_0_sel: y.len() {len} < n_slots*rows_per_expert = {need}",
-                len = y.len(),
-                need = n_slots * rows_per_expert
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_0_sel",
+                format!(
+                    "y.len() {len} < n_slots*rows_per_expert = {need}",
+                    len = y.len(),
+                    need = n_slots * rows_per_expert
+                ),
+            ));
         }
         let n_experts = w.rows() / rows_per_expert;
         let prep = self.module.prepare_q5_0_gemv_sel(LaunchConfig1D::new(
@@ -1255,34 +1286,42 @@ impl Q5Kernels {
     ) -> Result<(), GpuError> {
         let k_blocks = act.k() / 32;
         if w.cols() != act.q_stride() + 2 * k_blocks {
-            return Err(format!(
-                "enqueue_gemv_q5_1: Q5_1 row is q_stride + 2*k/32 = {} words, got cols {}",
-                act.q_stride() + 2 * k_blocks,
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_1",
+                format!(
+                    "Q5_1 row is q_stride + 2*k/32 = {} words, got cols {}",
+                    act.q_stride() + 2 * k_blocks,
+                    w.cols()
+                ),
+            ));
         }
         if w.rows() < row0 + n_rows || n_rows == 0 {
-            return Err(format!(
-                "enqueue_gemv_q5_1: rows {rows} < row0 {row0} + n_rows {n_rows} or n_rows == 0",
-                rows = w.rows()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_1",
+                format!(
+                    "rows {rows} < row0 {row0} + n_rows {n_rows} or n_rows == 0",
+                    rows = w.rows()
+                ),
+            ));
         }
         if !(1..=8).contains(&m_cols) || col0 + m_cols > act.m() {
-            return Err(format!(
-                "enqueue_gemv_q5_1: need 1 <= m_cols <= 8 and col0 + m_cols <= {}, got col0 {col0} m_cols {m_cols}",
-                act.m()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_1",
+                format!(
+                    "need 1 <= m_cols <= 8 and col0 + m_cols <= {}, got col0 {col0} m_cols {m_cols}",
+                    act.m()
+                ),
+            ));
         }
         if y.len() < y0 + n_rows * m_cols {
-            return Err(format!(
-                "enqueue_gemv_q5_1: y.len() {len} < y0 + n_rows*m_cols = {need}",
-                len = y.len(),
-                need = y0 + n_rows * m_cols
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q5_1",
+                format!(
+                    "y.len() {len} < y0 + n_rows*m_cols = {need}",
+                    len = y.len(),
+                    need = y0 + n_rows * m_cols
+                ),
+            ));
         }
         let prep = self.module.prepare_q5_1_gemv(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,

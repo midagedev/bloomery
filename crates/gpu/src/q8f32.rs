@@ -592,14 +592,16 @@ impl Q8F32Kernels {
         let k = d.cols() * 32;
         check_gemv_geometry("enqueue_q8_0_gemv", n_rows, k, x.len(), m, y.len())?;
         if qs.rows() != n_rows || qs.cols() != d.cols() * 8 {
-            return Err(format!(
-                "enqueue_q8_0_gemv: qs is {}x{}, want {}x{} (k/4 words per row, k = d.cols()*32 = {k})",
-                qs.rows(),
-                qs.cols(),
-                n_rows,
-                d.cols() * 8
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_q8_0_gemv",
+                format!(
+                    "qs is {}x{}, want {}x{} (k/4 words per row, k = d.cols()*32 = {k})",
+                    qs.rows(),
+                    qs.cols(),
+                    n_rows,
+                    d.cols() * 8
+                ),
+            ));
         }
         let prep = self.module.prepare_q8_0_gemv(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,
@@ -625,7 +627,7 @@ impl Q8F32Kernels {
 /// the row in 32-value chunks, so k must be a positive multiple of 32, rows
 /// >= 1, and both support 1..=8 columns.
 fn check_gemv_geometry(
-    what: &str,
+    what: &'static str,
     n_rows: usize,
     k: usize,
     x_len: usize,
@@ -633,19 +635,28 @@ fn check_gemv_geometry(
     y_len: usize,
 ) -> Result<(), GpuError> {
     if n_rows == 0 || k == 0 || !k.is_multiple_of(32) {
-        return Err(format!(
-            "{what}: need n_rows >= 1 and k a positive multiple of 32, got n_rows={n_rows} k={k}"
-        )
-        .into());
+        return Err(GpuError::shape(
+            what,
+            format!("need n_rows >= 1 and k a positive multiple of 32, got n_rows={n_rows} k={k}"),
+        ));
     }
     if !(1..=8).contains(&m) {
-        return Err(format!("{what}: need 1 <= m <= 8, got m={m}").into());
+        return Err(GpuError::shape(
+            what,
+            format!("need 1 <= m <= 8, got m={m}"),
+        ));
     }
     if x_len < m * k {
-        return Err(format!("{what}: x.len() {x_len} < m*k = {}", m * k).into());
+        return Err(GpuError::shape(
+            what,
+            format!("x.len() {x_len} < m*k = {}", m * k),
+        ));
     }
     if y_len < n_rows * m {
-        return Err(format!("{what}: y.len() {y_len} < n_rows*m = {}", n_rows * m).into());
+        return Err(GpuError::shape(
+            what,
+            format!("y.len() {y_len} < n_rows*m = {}", n_rows * m),
+        ));
     }
     Ok(())
 }

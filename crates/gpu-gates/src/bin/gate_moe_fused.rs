@@ -310,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         moe_y: &mut DeviceBuffer<f32>,
         ffn_out: &mut DeviceBuffer<f32>,
         y_op: &mut DeviceBuffer<f32>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), bloomery_gpu::GpuError> {
         gpu.enqueue_gemv_q3k_sel(wg, act, sel, n_used, ff, gate_y)?;
         gpu.enqueue_gemv_q3k_sel(wu, act, sel, n_used, ff, up_y)?;
         gpu.elem()
@@ -350,7 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         act32_fu: &mut Q8Blocks32,
         down_fu: &mut DeviceBuffer<f32>,
         y_fu: &mut DeviceBuffer<f32>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), bloomery_gpu::GpuError> {
         moe.enqueue_expert_gate_up_swiglu(stream, wg, wu, act, sel, n_used, ff, h_fu)?;
         gpu.q5().enqueue_quantize_q8(stream, h_fu, act32_fu)?;
         gpu.q5()

@@ -371,32 +371,33 @@ impl RouterKernels {
         weights: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if !(1..=8).contains(&m) {
-            return Err(format!("enqueue_router_topk: need 1 <= m <= 8, got m={m}").into());
+            return Err(GpuError::shape(
+                "enqueue_router_topk",
+                format!("need 1 <= m <= 8, got m={m}"),
+            ));
         }
         if x.len() < N_EXPERT * m {
-            return Err(format!(
-                "enqueue_router_topk: x.len() {} < 64*m = {}",
-                x.len(),
-                N_EXPERT * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_router_topk",
+                format!("x.len() {} < 64*m = {}", x.len(), N_EXPERT * m),
+            ));
         }
         if probs.len() < N_EXPERT * m {
-            return Err(format!(
-                "enqueue_router_topk: probs.len() {} < 64*m = {}",
-                probs.len(),
-                N_EXPERT * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_router_topk",
+                format!("probs.len() {} < 64*m = {}", probs.len(), N_EXPERT * m),
+            ));
         }
         if ids.len() < N_USED * m || weights.len() < N_USED * m {
-            return Err(format!(
-                "enqueue_router_topk: ids.len() {} / weights.len() {} < 6*m = {}",
-                ids.len(),
-                weights.len(),
-                N_USED * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_router_topk",
+                format!(
+                    "ids.len() {} / weights.len() {} < 6*m = {}",
+                    ids.len(),
+                    weights.len(),
+                    N_USED * m
+                ),
+            ));
         }
         let prep =
             self.module
@@ -431,26 +432,27 @@ impl RouterKernels {
             || rows_dn == 0
             || rows_dn > u32::MAX as usize
         {
-            return Err(format!(
-                "enqueue_expert_table: rows per expert must be 1..=u32::MAX, got gu={rows_gu} dn={rows_dn}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_expert_table",
+                format!("rows per expert must be 1..=u32::MAX, got gu={rows_gu} dn={rows_dn}"),
+            ));
         }
         if ids.len() < N_USED {
-            return Err(format!(
-                "enqueue_expert_table: ids.len() {} < 6 (decode m=1 shape)",
-                ids.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_expert_table",
+                format!("ids.len() {} < 6 (decode m=1 shape)", ids.len()),
+            ));
         }
         if row0_gate.len() < N_USED || row0_up.len() < N_USED || row0_down.len() < N_USED {
-            return Err(format!(
-                "enqueue_expert_table: row0 buffers need 6 u32 each, got {} / {} / {}",
-                row0_gate.len(),
-                row0_up.len(),
-                row0_down.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_expert_table",
+                format!(
+                    "row0 buffers need 6 u32 each, got {} / {} / {}",
+                    row0_gate.len(),
+                    row0_up.len(),
+                    row0_down.len()
+                ),
+            ));
         }
         let prep =
             self.module

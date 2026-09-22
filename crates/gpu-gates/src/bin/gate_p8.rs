@@ -434,12 +434,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let step_us = time_replays(&|| {
             model
                 .launch_block0_graph()
-                .map_err(|e| -> Box<dyn std::error::Error> { e })
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         })?;
         let touch_us = time_replays(&|| {
             empty
                 .launch(stream)
-                .map_err(|e| -> Box<dyn std::error::Error> { e })
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         })?;
         println!("time n={N} step_us_per_replay={step_us:.3} touch4_us_per_replay={touch_us:.3}");
     }

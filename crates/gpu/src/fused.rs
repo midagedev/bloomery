@@ -545,22 +545,26 @@ impl FusedKernels {
     ) -> Result<(), GpuError> {
         let (m, k, n_sb) = (act.m(), act.k(), act.n_sb());
         if k % 128 != 0 {
-            return Err(format!(
-                "enqueue_norm_quant: k must be a multiple of 128 (one q8_1 \
+            return Err(GpuError::shape(
+                "enqueue_norm_quant",
+                format!(
+                    "k must be a multiple of 128 (one q8_1 \
                  block per four lanes), got {k}"
-            )
-            .into());
+                ),
+            ));
         }
         if x.len() < m * k || gain.len() < k || y.len() < m * k {
-            return Err(format!(
-                "enqueue_norm_quant: x.len() {} (need m*k = {mk}), gain.len() {gl} (need {k}), \
+            return Err(GpuError::shape(
+                "enqueue_norm_quant",
+                format!(
+                    "x.len() {} (need m*k = {mk}), gain.len() {gl} (need {k}), \
                  y.len() {yl} (need {mk})",
-                x.len(),
-                mk = m * k,
-                gl = gain.len(),
-                yl = y.len()
-            )
-            .into());
+                    x.len(),
+                    mk = m * k,
+                    gl = gain.len(),
+                    yl = y.len()
+                ),
+            ));
         }
         let prep =
             self.module
@@ -617,49 +621,62 @@ impl FusedKernels {
     ) -> Result<(), GpuError> {
         let width = latent + rope;
         if latent == 0 || !latent.is_multiple_of(32) {
-            return Err(format!(
-                "enqueue_kv_norm_rope_append: the norm's geometry needs a positive multiple of \
+            return Err(GpuError::shape(
+                "enqueue_kv_norm_rope_append",
+                format!(
+                    "the norm's geometry needs a positive multiple of \
                  32, got latent {latent}"
-            )
-            .into());
+                ),
+            ));
         }
         if rope < 2 || !rope.is_multiple_of(2) || rope > 2 * RMS_THREADS {
-            return Err(format!(
-                "enqueue_kv_norm_rope_append: the rope tail is one pair per thread of the one \
+            return Err(GpuError::shape(
+                "enqueue_kv_norm_rope_append",
+                format!(
+                    "the rope tail is one pair per thread of the one \
                  {RMS_THREADS}-thread block, so rope must be even and at most {}, got {rope}",
-                2 * RMS_THREADS
-            )
-            .into());
+                    2 * RMS_THREADS
+                ),
+            ));
         }
         if cache.cols() != width {
-            return Err(format!(
-                "enqueue_kv_norm_rope_append: cache rows are {} wide, the kvr row is \
+            return Err(GpuError::shape(
+                "enqueue_kv_norm_rope_append",
+                format!(
+                    "cache rows are {} wide, the kvr row is \
                  latent + rope = {width}",
-                cache.cols()
-            )
-            .into());
+                    cache.cols()
+                ),
+            ));
         }
         if kv_a.len() < width || gain.len() < latent || cs.len() < rope {
-            return Err(format!(
-                "enqueue_kv_norm_rope_append: kv_a.len() {} (need {width}), gain.len() {} \
+            return Err(GpuError::shape(
+                "enqueue_kv_norm_rope_append",
+                format!(
+                    "kv_a.len() {} (need {width}), gain.len() {} \
                  (need {latent}), cs.len() {} (need {rope})",
-                kv_a.len(),
-                gain.len(),
-                cs.len()
-            )
-            .into());
+                    kv_a.len(),
+                    gain.len(),
+                    cs.len()
+                ),
+            ));
         }
         if kv_s.len() < width || kvr.len() < width {
-            return Err(format!(
-                "enqueue_kv_norm_rope_append: kv_s.len() {} and kvr.len() {} vs the row width \
+            return Err(GpuError::shape(
+                "enqueue_kv_norm_rope_append",
+                format!(
+                    "kv_s.len() {} and kvr.len() {} vs the row width \
                  {width}",
-                kv_s.len(),
-                kvr.len()
-            )
-            .into());
+                    kv_s.len(),
+                    kvr.len()
+                ),
+            ));
         }
         if pos_buf.is_empty() {
-            return Err("enqueue_kv_norm_rope_append: pos_buf must hold 1 u32".into());
+            return Err(GpuError::shape(
+                "enqueue_kv_norm_rope_append",
+                "pos_buf must hold 1 u32",
+            ));
         }
         let rows = cache.rows();
         let prep = self
@@ -699,51 +716,51 @@ impl FusedKernels {
     ) -> Result<(), GpuError> {
         let n_sb = act.n_sb();
         if act.m() != 1 {
-            return Err(format!(
-                "enqueue_gate_up_swiglu: m = 1 only (the decode shape), got act.m() = {}",
-                act.m()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gate_up_swiglu",
+                format!("m = 1 only (the decode shape), got act.m() = {}", act.m()),
+            ));
         }
         if !n_sb.is_multiple_of(2) {
-            return Err(format!(
-                "enqueue_gate_up_swiglu: odd super-block count {n_sb} (K={}) leaves rows \
+            return Err(GpuError::shape(
+                "enqueue_gate_up_swiglu",
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
-                act.k()
-            )
-            .into());
+                    act.k()
+                ),
+            ));
         }
         if wg.cols() != 110 * n_sb / 4 || wu.cols() != 110 * n_sb / 4 {
-            return Err(format!(
-                "enqueue_gate_up_swiglu: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got \
+            return Err(GpuError::shape(
+                "enqueue_gate_up_swiglu",
+                format!(
+                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got \
                  gate {} x {}, up {} x {}",
-                110 * n_sb / 4,
-                act.k(),
-                wg.rows(),
-                wg.cols(),
-                wu.rows(),
-                wu.cols()
-            )
-            .into());
+                    110 * n_sb / 4,
+                    act.k(),
+                    wg.rows(),
+                    wg.cols(),
+                    wu.rows(),
+                    wu.cols()
+                ),
+            ));
         }
         if wg.rows() != wu.rows() {
-            return Err(format!(
-                "enqueue_gate_up_swiglu: gate rows {} != up rows {}",
-                wg.rows(),
-                wu.rows()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gate_up_swiglu",
+                format!("gate rows {} != up rows {}", wg.rows(), wu.rows()),
+            ));
         }
         let n_rows = wg.rows();
         if n_rows == 0 {
-            return Err("enqueue_gate_up_swiglu: empty weight".into());
+            return Err(GpuError::shape("enqueue_gate_up_swiglu", "empty weight"));
         }
         if h.len() < n_rows {
-            return Err(format!(
-                "enqueue_gate_up_swiglu: h.len() {} < rows {n_rows}",
-                h.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gate_up_swiglu",
+                format!("h.len() {} < rows {n_rows}", h.len()),
+            ));
         }
         let prep = self.module.prepare_gate_up_swiglu_q3k(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,
@@ -781,31 +798,34 @@ impl FusedKernels {
     ) -> Result<(), GpuError> {
         let k_blocks = act.k() / 32;
         if act.m() != 1 {
-            return Err(format!(
-                "enqueue_down_add_q5_1: m = 1 only (the decode shape), got act.m() = {}",
-                act.m()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_down_add_q5_1",
+                format!("m = 1 only (the decode shape), got act.m() = {}", act.m()),
+            ));
         }
         if w.cols() != act.q_stride() + 2 * k_blocks {
-            return Err(format!(
-                "enqueue_down_add_q5_1: Q5_1 row is q_stride + 2*k/32 = {} words, got cols {}",
-                act.q_stride() + 2 * k_blocks,
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_down_add_q5_1",
+                format!(
+                    "Q5_1 row is q_stride + 2*k/32 = {} words, got cols {}",
+                    act.q_stride() + 2 * k_blocks,
+                    w.cols()
+                ),
+            ));
         }
         let n_rows = w.rows();
         if n_rows == 0 {
-            return Err("enqueue_down_add_q5_1: empty weight".into());
+            return Err(GpuError::shape("enqueue_down_add_q5_1", "empty weight"));
         }
         if resid.len() < n_rows || y.len() < n_rows {
-            return Err(format!(
-                "enqueue_down_add_q5_1: resid.len() {} and y.len() {} vs rows {n_rows}",
-                resid.len(),
-                y.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_down_add_q5_1",
+                format!(
+                    "resid.len() {} and y.len() {} vs rows {n_rows}",
+                    resid.len(),
+                    y.len()
+                ),
+            ));
         }
         let prep = self.module.prepare_down_add_q5_1(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,

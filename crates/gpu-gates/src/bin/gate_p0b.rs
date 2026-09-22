@@ -165,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         act32_op: &mut Q8Blocks32,
         down_y: &mut DeviceBuffer<f32>,
         y_op: &mut DeviceBuffer<f32>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), bloomery_gpu::GpuError> {
         gpu.elem()
             .enqueue_rms_norm(stream, x_dev, gain_dev, eps, K, 1, norm_y)?;
         gpu.enqueue_quantize_q8_1(norm_y, act_op)?;
@@ -198,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         h_fu: &mut DeviceBuffer<f32>,
         act32_fu: &mut Q8Blocks32,
         y_fu: &mut DeviceBuffer<f32>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), bloomery_gpu::GpuError> {
         fused.enqueue_norm_quant(stream, x_dev, gain_dev, eps, act_fu, norm_fu)?;
         fused.enqueue_gate_up_swiglu(stream, wg_dev, wu_dev, act_fu, h_fu)?;
         gpu.q5().enqueue_quantize_q8(stream, h_fu, act32_fu)?;
@@ -470,7 +470,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kv_s: &mut DeviceBuffer<f32>,
             kvr: &mut DeviceBuffer<f32>,
             cache: &mut DeviceTensor<u16>,
-        ) -> Result<(), Box<dyn std::error::Error>> {
+        ) -> Result<(), bloomery_gpu::GpuError> {
             let width = latent + rope;
             gpu.elem()
                 .enqueue_rope(stream, kv_a, cs, rope, (width / rope) as u32, 1, kv_s)?;
@@ -485,7 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut run_op_key = |kv_s: &mut DeviceBuffer<f32>,
                               kvr: &mut DeviceBuffer<f32>,
                               cache: &mut DeviceTensor<u16>|
-         -> Result<(), Box<dyn std::error::Error>> {
+         -> Result<(), bloomery_gpu::GpuError> {
             key_op(
                 &gpu,
                 &step,
@@ -587,7 +587,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut kvr_op,
                 &mut cache_op,
             )
-            .map_err(|e| -> bloomery_gpu::GpuError { e.to_string().into() })
         })?;
         let key_op_nodes = g_key_op.node_count();
         let g_key_fu = gpu.capture(|_| {

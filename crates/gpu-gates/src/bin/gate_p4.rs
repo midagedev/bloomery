@@ -586,7 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run3 = |emb_y: &mut DeviceBuffer<f32>,
                     norm_y: &mut DeviceBuffer<f32>,
                     am_y: &mut DeviceBuffer<u32>|
-         -> Result<(), Box<dyn std::error::Error>> {
+         -> Result<(), bloomery_gpu::GpuError> {
             elem.enqueue_embed_rows(stream, &emb_dev, &ids_dev, emb_y)?;
             elem.enqueue_rms_norm(stream, emb_y, &gain0_dev, eps, 2048, m, norm_y)?;
             elem.enqueue_argmax(stream, &x_dev, logits.len(), am_y)

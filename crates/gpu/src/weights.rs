@@ -132,11 +132,12 @@ impl Weights {
     ) -> Result<Weights, GpuError> {
         let n_layers =
             gguf.block_count()
-                .ok_or("Weights::load: metadata key block_count missing")? as usize;
+                .ok_or(GpuError::metadata("Weights::load", "block_count"))? as usize;
         if layers.start > layers.end || layers.end > n_layers {
-            return Err(
-                format!("Weights::load: layer range {layers:?} outside 0..{n_layers}").into(),
-            );
+            return Err(GpuError::shape(
+                "Weights::load",
+                format!("layer range {layers:?} outside 0..{n_layers}"),
+            ));
         }
         let mut by_name = BTreeMap::new();
         for t in gguf.iter_tensors() {
@@ -161,11 +162,13 @@ impl Weights {
                 // geometry, never a silent reshape.
                 let want = rows * (k / 32);
                 if blocks.len() != want {
-                    return Err(format!(
-                        "Weights::load: block {l}: {} q8 blocks, want rows·k/32 = {rows}·{k}/32 = {want}",
-                        blocks.len()
-                    )
-                    .into());
+                    return Err(GpuError::shape(
+                        "Weights::load",
+                        format!(
+                            "block {l}: {} q8 blocks, want rows·k/32 = {rows}·{k}/32 = {want}",
+                            blocks.len()
+                        ),
+                    ));
                 }
                 let (qs, d) = q8_0_planes(blocks);
                 by_name.insert(
@@ -214,7 +217,10 @@ fn block_index(name: &str) -> Result<Option<usize>, GpuError> {
     let l = rest.split('.').next().unwrap_or_default();
     match l.parse::<usize>() {
         Ok(l) => Ok(Some(l)),
-        Err(_) => Err(format!("Weights::load: tensor {name:?} is not blk.<layer>.*").into()),
+        Err(_) => Err(GpuError::shape(
+            "Weights::load",
+            format!("tensor {name:?} is not blk.<layer>.*"),
+        )),
     }
 }
 
@@ -258,32 +264,50 @@ fn upload_file_tensor(
     let k = t.dims[0] as usize;
     let rows = tensor_rows(t);
     if k == 0 || rows == 0 {
-        return Err(format!("Weights::load: tensor {name} has a zero dimension").into());
+        return Err(GpuError::shape(
+            "Weights::load",
+            format!("tensor {name} has a zero dimension"),
+        ));
     }
     let bytes = gguf.data(t)?;
     match t.ty {
         GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K => {
-            let blck = t.ty.blck_size().ok_or("no blck")? as usize;
-            let rb = t.ty.type_size().ok_or("no type size")? as usize * (k / blck);
-            if bytes.len() < rb * rows {
-                return Err(format!(
-                    "Weights::load: tensor {name} holds {} bytes, rows need {}",
-                    bytes.len(),
-                    rb * rows
+            let blck = t.ty.blck_size().ok_or_else(|| {
+                GpuError::shape(
+                    "Weights::load",
+                    format!("ggml type of {name} has no block size"),
                 )
-                .into());
+            })? as usize;
+            let rb = t.ty.type_size().ok_or_else(|| {
+                GpuError::shape(
+                    "Weights::load",
+                    format!("ggml type of {name} has no type size"),
+                )
+            })? as usize
+                * (k / blck);
+            if bytes.len() < rb * rows {
+                return Err(GpuError::shape(
+                    "Weights::load",
+                    format!(
+                        "tensor {name} holds {} bytes, rows need {}",
+                        bytes.len(),
+                        rb * rows
+                    ),
+                ));
             }
             // The gates' packing verbatim (gate_p1/gate_p9): the whole row
             // span as one word stream, so the kernels' byte-offset row
             // addressing sees contiguous rows.
             let words = words_of(&bytes[..rb * rows]);
             if !words.len().is_multiple_of(rows) {
-                return Err(format!(
-                    "Weights::load: tensor {name} packs {} words not divisible by \
+                return Err(GpuError::shape(
+                    "Weights::load",
+                    format!(
+                        "tensor {name} packs {} words not divisible by \
                      {rows} rows — the row stream cannot be represented per row",
-                    words.len()
-                )
-                .into());
+                        words.len()
+                    ),
+                ));
             }
             Ok(DevWeight::KQuant {
                 ty: t.ty,
@@ -309,12 +333,14 @@ fn upload_file_tensor(
         }
         GgmlType::F32 => {
             if bytes.len() < rows * k * 4 {
-                return Err(format!(
-                    "Weights::load: tensor {name} holds {} bytes, rows×k×4 = {}",
-                    bytes.len(),
-                    rows * k * 4
-                )
-                .into());
+                return Err(GpuError::shape(
+                    "Weights::load",
+                    format!(
+                        "tensor {name} holds {} bytes, rows×k×4 = {}",
+                        bytes.len(),
+                        rows * k * 4
+                    ),
+                ));
             }
             let vals: Vec<f32> = bytes[..rows * k * 4]
                 .as_chunks::<4>()
@@ -327,11 +353,10 @@ fn upload_file_tensor(
                 k,
             })
         }
-        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Unknown(_) => Err(format!(
-            "Weights::load: tensor {name} has type {} with no device format",
-            t.ty
-        )
-        .into()),
+        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Unknown(_) => Err(GpuError::shape(
+            "Weights::load",
+            format!("tensor {name} has type {} with no device format", t.ty),
+        )),
     }
 }
 

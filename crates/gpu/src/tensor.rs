@@ -26,13 +26,10 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         cols: usize,
     ) -> Result<Self, GpuError> {
         if data.len() != rows * cols {
-            return Err(format!(
-                "DeviceTensor::upload: data.len() {} != rows*cols = {}*{}",
-                data.len(),
-                rows,
-                cols
-            )
-            .into());
+            return Err(GpuError::shape(
+                "DeviceTensor::upload",
+                format!("data.len() {} != rows*cols = {}*{}", data.len(), rows, cols),
+            ));
         }
         let buf = DeviceBuffer::from_host(stream, data)?;
         Ok(DeviceTensor { buf, rows, cols })
@@ -99,13 +96,16 @@ impl Q8Act {
     /// only.
     pub fn with_k(stream: &CudaStream, m: usize, k: usize) -> Result<Self, GpuError> {
         if !(1..=8).contains(&m) {
-            return Err(format!("Q8Act::with_k: 1 <= m <= 8, got {m}").into());
+            return Err(GpuError::shape(
+                "Q8Act::with_k",
+                format!("1 <= m <= 8, got {m}"),
+            ));
         }
         if !k.is_multiple_of(256) || !(256..=10944).contains(&k) {
-            return Err(format!(
-                "Q8Act::with_k: k must be a multiple of 256 in 256..=10944, got {k}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "Q8Act::with_k",
+                format!("k must be a multiple of 256 in 256..=10944, got {k}"),
+            ));
         }
         let n_sb = k / 256;
         Ok(Q8Act {

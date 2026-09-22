@@ -12,28 +12,20 @@
 //! so replay is the common starting line, not an optimization to earn later.
 
 use crate::GpuError;
-use cuda_core::{CudaStream, sys};
-use std::ffi::CStr;
+use cuda_core::{CudaStream, DriverError, sys};
 use std::ptr;
 
-/// Map a driver result to `GpuError` with the driver's own string.
-pub(crate) fn cu(result: sys::CUresult, what: &str) -> Result<(), GpuError> {
+/// Map a driver result to `GpuError::Driver`, tagged with the driver entry
+/// point we called. `DriverError` carries the code and asks the driver for
+/// its own string when it is printed.
+pub(crate) fn cu(result: sys::CUresult, what: &'static str) -> Result<(), GpuError> {
     if result == sys::cudaError_enum_CUDA_SUCCESS {
         return Ok(());
     }
-    let mut msg: *const std::os::raw::c_char = ptr::null();
-    // SAFETY: cuGetErrorString only writes the out-pointer; a failure leaves
-    // it null, which the branch below handles.
-    let rc = unsafe { sys::cuGetErrorString(result, &mut msg) };
-    let text = if rc == sys::cudaError_enum_CUDA_SUCCESS && !msg.is_null() {
-        // SAFETY: the driver returns a NUL-terminated static string.
-        unsafe { CStr::from_ptr(msg) }
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        format!("CUresult {result}")
-    };
-    Err(format!("{what}: {text}").into())
+    Err(GpuError::Driver {
+        op: Some(what),
+        source: DriverError(result),
+    })
 }
 
 /// A captured kernel sequence, instantiated for replay.
@@ -71,11 +63,11 @@ impl Graph {
     {
         let hs = stream.cu_stream();
         if hs.is_null() {
-            return Err(
-                "Graph::capture: refused on the legacy default (null) stream; \
-                        capture needs CudaContext::new_stream()"
-                    .into(),
-            );
+            return Err(GpuError::state(
+                "Graph::capture",
+                "refused on the legacy default (null) stream; capture needs \
+                 CudaContext::new_stream()",
+            ));
         }
         // SAFETY: hs is a live stream of the current context and not capturing
         // (a nested capture fails here with the driver's own error).

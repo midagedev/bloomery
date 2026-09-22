@@ -578,23 +578,23 @@ impl ElemKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if w.cols() != 220 || w.rows() == 0 {
-            return Err(format!(
-                "enqueue_embed_rows: Q3_K table is 220 words (880 bytes) per row, got {}x{}",
-                w.rows(),
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_embed_rows",
+                format!(
+                    "Q3_K table is 220 words (880 bytes) per row, got {}x{}",
+                    w.rows(),
+                    w.cols()
+                ),
+            ));
         }
         if ids.is_empty() {
-            return Err("enqueue_embed_rows: empty ids".into());
+            return Err(GpuError::shape("enqueue_embed_rows", "empty ids"));
         }
         if y.len() < 2048 * ids.len() {
-            return Err(format!(
-                "enqueue_embed_rows: y.len() {} < 2048*{}",
-                y.len(),
-                ids.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_embed_rows",
+                format!("y.len() {} < 2048*{}", y.len(), ids.len()),
+            ));
         }
         let prep = self.module.prepare_embed_rows(LaunchConfig1D::new(
             (ids.len() * 2048).div_ceil(256) as u32,
@@ -620,20 +620,23 @@ impl ElemKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if k == 0 || !k.is_multiple_of(32) {
-            return Err(
-                format!("enqueue_rms_norm: k must be a positive multiple of 32, got {k}").into(),
-            );
+            return Err(GpuError::shape(
+                "enqueue_rms_norm",
+                format!("k must be a positive multiple of 32, got {k}"),
+            ));
         }
         if m == 0 || x.len() < k * m || gain.len() < k || y.len() < k * m {
-            return Err(format!(
-                "enqueue_rms_norm: m={m}, x.len() {} (need {}), gain.len() {} (need {k}), y.len() {} (need {})",
-                x.len(),
-                k * m,
-                gain.len(),
-                y.len(),
-                k * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_rms_norm",
+                format!(
+                    "m={m}, x.len() {} (need {}), gain.len() {} (need {k}), y.len() {} (need {})",
+                    x.len(),
+                    k * m,
+                    gain.len(),
+                    y.len(),
+                    k * m
+                ),
+            ));
         }
         let prep =
             self.module
@@ -660,24 +663,29 @@ impl ElemKernels {
         dst: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if n_dims < 2 || !n_dims.is_multiple_of(2) {
-            return Err(format!("enqueue_rope: n_dims must be even and >= 2, got {n_dims}").into());
+            return Err(GpuError::shape(
+                "enqueue_rope",
+                format!("n_dims must be even and >= 2, got {n_dims}"),
+            ));
         }
         if n_vec == 0 || m == 0 {
-            return Err(format!(
-                "enqueue_rope: need n_vec >= 1 and m >= 1, got n_vec={n_vec} m={m}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_rope",
+                format!("need n_vec >= 1 and m >= 1, got n_vec={n_vec} m={m}"),
+            ));
         }
         let span = m * n_vec as usize * n_dims;
         if src.len() < span || cs.len() < m * n_dims || dst.len() < span {
-            return Err(format!(
-                "enqueue_rope: src.len() {} / cs.len() {} / dst.len() {} vs span {span}, cache {}",
-                src.len(),
-                cs.len(),
-                dst.len(),
-                m * n_dims
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_rope",
+                format!(
+                    "src.len() {} / cs.len() {} / dst.len() {} vs span {span}, cache {}",
+                    src.len(),
+                    cs.len(),
+                    dst.len(),
+                    m * n_dims
+                ),
+            ));
         }
         let threads = m * n_vec as usize * (n_dims / 2);
         let prep =
@@ -699,13 +707,15 @@ impl ElemKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if n == 0 || gate.len() < n || up.len() < n || y.len() < n {
-            return Err(format!(
-                "enqueue_swiglu: n={n}, gate.len() {}, up.len() {}, y.len() {}",
-                gate.len(),
-                up.len(),
-                y.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_swiglu",
+                format!(
+                    "n={n}, gate.len() {}, up.len() {}, y.len() {}",
+                    gate.len(),
+                    up.len(),
+                    y.len()
+                ),
+            ));
         }
         let prep =
             self.module
@@ -725,13 +735,15 @@ impl ElemKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if n == 0 || a.len() < n || b.len() < n || y.len() < n {
-            return Err(format!(
-                "enqueue_add: n={n}, a.len() {}, b.len() {}, y.len() {}",
-                a.len(),
-                b.len(),
-                y.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_add",
+                format!(
+                    "n={n}, a.len() {}, b.len() {}, y.len() {}",
+                    a.len(),
+                    b.len(),
+                    y.len()
+                ),
+            ));
         }
         let prep = self
             .module
@@ -756,25 +768,27 @@ impl ElemKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if rows == 0 || n_exp == 0 || m == 0 {
-            return Err(format!(
-                "enqueue_weighted_sum: need rows/n_exp/m >= 1, got {rows}/{n_exp}/{m}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_weighted_sum",
+                format!("need rows/n_exp/m >= 1, got {rows}/{n_exp}/{m}"),
+            ));
         }
         if down.len() < rows * n_exp as usize * m
             || w.len() < n_exp as usize * m
             || y.len() < rows * m
         {
-            return Err(format!(
-                "enqueue_weighted_sum: down.len() {} (need {}), w.len() {} (need {}), y.len() {} (need {})",
-                down.len(),
-                rows * n_exp as usize * m,
-                w.len(),
-                n_exp as usize * m,
-                y.len(),
-                rows * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_weighted_sum",
+                format!(
+                    "down.len() {} (need {}), w.len() {} (need {}), y.len() {} (need {})",
+                    down.len(),
+                    rows * n_exp as usize * m,
+                    w.len(),
+                    n_exp as usize * m,
+                    y.len(),
+                    rows * m
+                ),
+            ));
         }
         let prep = self.module.prepare_weighted_sum(LaunchConfig1D::new(
             (rows * m).div_ceil(256) as u32,
@@ -798,9 +812,10 @@ impl ElemKernels {
     ) -> Result<(), GpuError> {
         let n = bits.len();
         if n == 0 || y.len() < n {
-            return Err(
-                format!("enqueue_half_decode: n={n}, y.len() {} (need {n})", y.len()).into(),
-            );
+            return Err(GpuError::shape(
+                "enqueue_half_decode",
+                format!("n={n}, y.len() {} (need {n})", y.len()),
+            ));
         }
         let prep =
             self.module
@@ -820,12 +835,10 @@ impl ElemKernels {
         out: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         if n == 0 || x.len() < n || out.is_empty() {
-            return Err(format!(
-                "enqueue_argmax: n={n}, x.len() {}, out.len() {}",
-                x.len(),
-                out.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_argmax",
+                format!("n={n}, x.len() {}, out.len() {}", x.len(), out.len()),
+            ));
         }
         let prep = self
             .module

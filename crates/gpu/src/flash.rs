@@ -2366,12 +2366,14 @@ impl FlashKernels {
         let (rows, width) = (cache.rows(), cache.cols());
         check_append("enqueue_kv_append", src.len(), width, m)?;
         if pos as usize + m > rows {
-            return Err(format!(
-                "enqueue_kv_append: rows {}..{} land past the cache's {rows} rows",
-                pos,
-                pos as usize + m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_kv_append",
+                format!(
+                    "rows {}..{} land past the cache's {rows} rows",
+                    pos,
+                    pos as usize + m
+                ),
+            ));
         }
         let prep = self.module.prepare_kv_append(LaunchConfig1D::new(
             (m * width).div_ceil(256) as u32,
@@ -2407,7 +2409,10 @@ impl FlashKernels {
     ) -> Result<(), GpuError> {
         let (rows, width) = (cache.rows(), cache.cols());
         if pos_buf.len() < 1 {
-            return Err("enqueue_kv_append_pos_buf: pos_buf must hold 1 u32".into());
+            return Err(GpuError::shape(
+                "enqueue_kv_append_pos_buf",
+                "pos_buf must hold 1 u32",
+            ));
         }
         check_append("enqueue_kv_append_pos_buf", src.len(), width, m)?;
         let prep = self.module.prepare_kv_append_pos_buf(LaunchConfig1D::new(
@@ -2651,20 +2656,24 @@ impl FlashKernels {
             latent,
         )?;
         if rope_dims + latent != MMA_WIDTH {
-            return Err(format!(
-                "enqueue_flash_latent_mma: rope_dims + latent = {} — this kernel's staged \
+            return Err(GpuError::shape(
+                "enqueue_flash_latent_mma",
+                format!(
+                    "rope_dims + latent = {} — this kernel's staged \
                  tiles are sized for {MMA_WIDTH}",
-                rope_dims + latent
-            )
-            .into());
+                    rope_dims + latent
+                ),
+            ));
         }
         if !seg_keys().is_multiple_of(MMA_KEYS) {
-            return Err(format!(
-                "enqueue_flash_latent_mma: seg_keys {} is not a multiple of the {MMA_KEYS}-key \
+            return Err(GpuError::shape(
+                "enqueue_flash_latent_mma",
+                format!(
+                    "seg_keys {} is not a multiple of the {MMA_KEYS}-key \
                  tile",
-                seg_keys()
-            )
-            .into());
+                    seg_keys()
+                ),
+            ));
         }
         let prep = self.module.prepare_flash_latent_mma(LaunchConfig1D::new(
             (mma_groups(q_rows) * segs) as u32,
@@ -2739,11 +2748,11 @@ impl FlashKernels {
             latent,
         )?;
         if segs == 1 {
-            return Err(
-                "enqueue_flash_latent_seg_twice: the probe entries are the split \
-                        launch's, and a one-segment cache runs the single-block kernel"
-                    .into(),
-            );
+            return Err(GpuError::shape(
+                "enqueue_flash_latent_seg_twice",
+                "the probe entries are the split \
+                        launch's, and a one-segment cache runs the single-block kernel",
+            ));
         }
         let cfg = LaunchConfig1D::new((q_rows * segs) as u32, LATENT as u32, 0);
         macro_rules! probe {
@@ -2778,10 +2787,10 @@ impl FlashKernels {
             TWICE_SYNC => probe!(prepare_flash_latent_seg_sync2, flash_latent_seg_sync2),
             TWICE_SM => probe!(prepare_flash_latent_seg_sm2, flash_latent_seg_sm2),
             other => {
-                return Err(format!(
-                    "enqueue_flash_latent_seg_twice: {other} names no single probe stage"
-                )
-                .into());
+                return Err(GpuError::shape(
+                    "enqueue_flash_latent_seg_twice",
+                    format!("{other} names no single probe stage"),
+                ));
             }
         }
         Ok(())
@@ -2806,13 +2815,16 @@ impl FlashKernels {
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
         if n_keys_buf.is_empty() {
-            return Err("enqueue_flash_merge: n_keys_buf must hold 1 u32".into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge",
+                "n_keys_buf must hold 1 u32",
+            ));
         }
         if latent != LATENT {
-            return Err(format!(
-                "enqueue_flash_merge: this family's latent tail is {LATENT}, got {latent}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge",
+                format!("this family's latent tail is {LATENT}, got {latent}"),
+            ));
         }
         check_partials(
             "enqueue_flash_merge",
@@ -2823,12 +2835,14 @@ impl FlashKernels {
             latent,
         )?;
         if y.len() < q_rows * latent {
-            return Err(format!(
-                "enqueue_flash_merge: y.len() {} < m*n_heads*latent = {}",
-                y.len(),
-                q_rows * latent
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge",
+                format!(
+                    "y.len() {} < m*n_heads*latent = {}",
+                    y.len(),
+                    q_rows * latent
+                ),
+            ));
         }
         let prep = self.module.prepare_flash_merge(LaunchConfig1D::new(
             q_rows as u32,
@@ -2877,13 +2891,16 @@ impl FlashKernels {
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
         if n_keys_buf.is_empty() {
-            return Err("enqueue_flash_merge_q8: n_keys_buf must hold 1 u32".into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge_q8",
+                "n_keys_buf must hold 1 u32",
+            ));
         }
         if latent != LATENT {
-            return Err(format!(
-                "enqueue_flash_merge_q8: this family's latent tail is {LATENT}, got {latent}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge_q8",
+                format!("this family's latent tail is {LATENT}, got {latent}"),
+            ));
         }
         check_partials(
             "enqueue_flash_merge_q8",
@@ -2894,12 +2911,14 @@ impl FlashKernels {
             latent,
         )?;
         if y.len() < q_rows * latent {
-            return Err(format!(
-                "enqueue_flash_merge_q8: y.len() {} < m*n_heads*latent = {}",
-                y.len(),
-                q_rows * latent
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge_q8",
+                format!(
+                    "y.len() {} < m*n_heads*latent = {}",
+                    y.len(),
+                    q_rows * latent
+                ),
+            ));
         }
         let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge_q8", lo, hi, q_rows, latent)?;
         let prep = self.module.prepare_flash_merge_q8(LaunchConfig1D::new(
@@ -2963,13 +2982,16 @@ impl FlashKernels {
         let segs = segments_for(cache_rows);
         let q_rows = m * n_heads;
         if n_keys_buf.is_empty() {
-            return Err("enqueue_flash_merge2_q8: n_keys_buf must hold 1 u32".into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge2_q8",
+                "n_keys_buf must hold 1 u32",
+            ));
         }
         if latent != LATENT {
-            return Err(format!(
-                "enqueue_flash_merge2_q8: this family's latent tail is {LATENT}, got {latent}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge2_q8",
+                format!("this family's latent tail is {LATENT}, got {latent}"),
+            ));
         }
         check_partials(
             "enqueue_flash_merge2_q8",
@@ -2980,12 +3002,14 @@ impl FlashKernels {
             latent,
         )?;
         if y.len() < q_rows * latent {
-            return Err(format!(
-                "enqueue_flash_merge2_q8: y.len() {} < m*n_heads*latent = {}",
-                y.len(),
-                q_rows * latent
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_flash_merge2_q8",
+                format!(
+                    "y.len() {} < m*n_heads*latent = {}",
+                    y.len(),
+                    q_rows * latent
+                ),
+            ));
         }
         let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge2_q8", lo, hi, q_rows, latent)?;
         let prep = self.module.prepare_flash_merge2_q8(LaunchConfig1D::new(
@@ -3101,34 +3125,38 @@ impl FlashKernels {
 /// at the latent width, and `lat / 128` must be the block count per column
 /// a 512-thread block can quantize in one pass. Returns `(lo.m(), n_sb)`.
 fn check_side_quant(
-    what: &str,
+    what: &'static str,
     lo: &Q8Act,
     hi: &Q8Act,
     q_rows: usize,
     latent: usize,
 ) -> Result<(usize, usize), GpuError> {
     if lo.k() != latent || hi.k() != latent {
-        return Err(format!(
-            "{what}: the side scratches' k must be the latent width {latent}, got {} and {}",
-            lo.k(),
-            hi.k()
-        )
-        .into());
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the side scratches' k must be the latent width {latent}, got {} and {}",
+                lo.k(),
+                hi.k()
+            ),
+        ));
     }
     if lo.m() + hi.m() != q_rows {
-        return Err(format!(
-            "{what}: the side scratches hold {} + {} columns, the launch has {q_rows} query rows",
-            lo.m(),
-            hi.m()
-        )
-        .into());
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the side scratches hold {} + {} columns, the launch has {q_rows} query rows",
+                lo.m(),
+                hi.m()
+            ),
+        ));
     }
     Ok((lo.m(), lo.n_sb()))
 }
 
 /// The partials both split launches share.
 fn check_partials(
-    what: &str,
+    what: &'static str,
     v_len: usize,
     ms_len: usize,
     q_rows: usize,
@@ -3137,11 +3165,13 @@ fn check_partials(
 ) -> Result<(), GpuError> {
     let (want_v, want_ms) = (q_rows * segs * latent, q_rows * segs * 2);
     if v_len < want_v || ms_len < want_ms {
-        return Err(format!(
-            "{what}: partials are {v_len}/{ms_len} f32, want {want_v}/{want_ms} for \
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "partials are {v_len}/{ms_len} f32, want {want_v}/{want_ms} for \
              {q_rows} rows x {segs} segments"
-        )
-        .into());
+            ),
+        ));
     }
     Ok(())
 }
@@ -3152,7 +3182,7 @@ fn check_partials(
 /// which writes partials instead. Returns `m * n_heads`, the query rows.
 #[allow(clippy::too_many_arguments)]
 fn check_flash(
-    what: &str,
+    what: &'static str,
     q_len: usize,
     kv: &DeviceTensor<u16>,
     n_keys_len: usize,
@@ -3163,60 +3193,66 @@ fn check_flash(
     y_len: Option<usize>,
 ) -> Result<usize, GpuError> {
     if !(1..=8).contains(&m) {
-        return Err(format!("{what}: 1 <= m <= 8, got {m}").into());
+        return Err(GpuError::shape(what, format!("1 <= m <= 8, got {m}")));
     }
     if n_heads == 0 {
-        return Err(format!("{what}: n_heads >= 1").into());
+        return Err(GpuError::shape(what, "n_heads >= 1"));
     }
     if latent != LATENT {
-        return Err(format!(
-            "{what}: this family's latent tail is {LATENT} (one block thread per dim), \
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "this family's latent tail is {LATENT} (one block thread per dim), \
              got {latent}"
-        )
-        .into());
+            ),
+        ));
     }
     let width = rope_dims + latent;
     if !width.is_multiple_of(DIM_SPLIT) {
-        return Err(format!(
-            "{what}: the QK dot splits a row across {DIM_SPLIT} threads, need rope_dims + \
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the QK dot splits a row across {DIM_SPLIT} threads, need rope_dims + \
              latent = {width} a multiple of {DIM_SPLIT}"
-        )
-        .into());
+            ),
+        ));
     }
     if width > MAX_WIDTH {
-        return Err(format!(
-            "{what}: the query row is staged in {MAX_WIDTH} shared f32, got rope_dims + \
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the query row is staged in {MAX_WIDTH} shared f32, got rope_dims + \
              latent = {width}"
-        )
-        .into());
+            ),
+        ));
     }
     if kv.cols() != width {
-        return Err(format!(
-            "{what}: kv is {}-wide, want rope_dims + latent = {width}",
-            kv.cols()
-        )
-        .into());
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "kv is {}-wide, want rope_dims + latent = {width}",
+                kv.cols()
+            ),
+        ));
     }
     if n_keys_len < 1 {
-        return Err(format!("{what}: n_keys_buf must hold 1 u32").into());
+        return Err(GpuError::shape(what, "n_keys_buf must hold 1 u32"));
     }
     let q_rows = m * n_heads;
     if q_len < q_rows * width {
-        return Err(format!(
-            "{what}: q.len() {q_len} < m*n_heads*width = {}",
-            q_rows * width
-        )
-        .into());
+        return Err(GpuError::shape(
+            what,
+            format!("q.len() {q_len} < m*n_heads*width = {}", q_rows * width),
+        ));
     }
     // The segment pass has no `y` of its own — it writes partials.
     if let Some(y_len) = y_len
         && y_len < q_rows * latent
     {
-        return Err(format!(
-            "{what}: y.len() {y_len} < m*n_heads*latent = {}",
-            q_rows * latent
-        )
-        .into());
+        return Err(GpuError::shape(
+            what,
+            format!("y.len() {y_len} < m*n_heads*latent = {}", q_rows * latent),
+        ));
     }
     Ok(q_rows)
 }
@@ -3224,12 +3260,23 @@ fn check_flash(
 /// Reject geometry the append kernels' launch contracts do not cover:
 /// positive width, `m` rows, and `src` holding all of them. The landing-row
 /// bound is checked only where `pos` is a host scalar.
-fn check_append(what: &str, src_len: usize, width: usize, m: usize) -> Result<(), GpuError> {
+fn check_append(
+    what: &'static str,
+    src_len: usize,
+    width: usize,
+    m: usize,
+) -> Result<(), GpuError> {
     if width == 0 || m == 0 {
-        return Err(format!("{what}: need width >= 1 and m >= 1, got {width}/{m}").into());
+        return Err(GpuError::shape(
+            what,
+            format!("need width >= 1 and m >= 1, got {width}/{m}"),
+        ));
     }
     if src_len < m * width {
-        return Err(format!("{what}: src.len() {src_len} < m*width = {}", m * width).into());
+        return Err(GpuError::shape(
+            what,
+            format!("src.len() {src_len} < m*width = {}", m * width),
+        ));
     }
     Ok(())
 }

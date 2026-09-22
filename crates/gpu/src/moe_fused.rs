@@ -212,62 +212,74 @@ impl MoeFusedKernels {
     ) -> Result<(), GpuError> {
         let n_sb = act.n_sb();
         if act.m() != 1 {
-            return Err(format!(
-                "enqueue_expert_gate_up_swiglu: m = 1 only (the shared expert input), got \
+            return Err(GpuError::shape(
+                "enqueue_expert_gate_up_swiglu",
+                format!(
+                    "m = 1 only (the shared expert input), got \
                  act.m() = {}",
-                act.m()
-            )
-            .into());
+                    act.m()
+                ),
+            ));
         }
         if !n_sb.is_multiple_of(2) {
-            return Err(format!(
-                "enqueue_expert_gate_up_swiglu: odd super-block count {n_sb} (K={}) leaves \
+            return Err(GpuError::shape(
+                "enqueue_expert_gate_up_swiglu",
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves \
                  rows unaligned; repack rows at load time",
-                act.k()
-            )
-            .into());
+                    act.k()
+                ),
+            ));
         }
         if wg.cols() != 110 * n_sb / 4 || wu.cols() != 110 * n_sb / 4 {
-            return Err(format!(
-                "enqueue_expert_gate_up_swiglu: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, \
+            return Err(GpuError::shape(
+                "enqueue_expert_gate_up_swiglu",
+                format!(
+                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, \
                  got gate {} x {}, up {} x {}",
-                110 * n_sb / 4,
-                act.k(),
-                wg.rows(),
-                wg.cols(),
-                wu.rows(),
-                wu.cols()
-            )
-            .into());
+                    110 * n_sb / 4,
+                    act.k(),
+                    wg.rows(),
+                    wg.cols(),
+                    wu.rows(),
+                    wu.cols()
+                ),
+            ));
         }
         if rows_per_expert == 0
             || !wg.rows().is_multiple_of(rows_per_expert)
             || !wu.rows().is_multiple_of(rows_per_expert)
             || wg.rows() != wu.rows()
         {
-            return Err(format!(
-                "enqueue_expert_gate_up_swiglu: gate rows {} and up rows {} must be the same \
+            return Err(GpuError::shape(
+                "enqueue_expert_gate_up_swiglu",
+                format!(
+                    "gate rows {} and up rows {} must be the same \
                  positive multiple of rows_per_expert {rows_per_expert}",
-                wg.rows(),
-                wu.rows()
-            )
-            .into());
+                    wg.rows(),
+                    wu.rows()
+                ),
+            ));
         }
         if n_slots == 0 || sel.len() < n_slots {
-            return Err(format!(
-                "enqueue_expert_gate_up_swiglu: need n_slots >= 1 and sel.len() >= n_slots, \
+            return Err(GpuError::shape(
+                "enqueue_expert_gate_up_swiglu",
+                format!(
+                    "need n_slots >= 1 and sel.len() >= n_slots, \
                  got n_slots {n_slots} sel.len() {}",
-                sel.len()
-            )
-            .into());
+                    sel.len()
+                ),
+            ));
         }
         if h.len() < n_slots * rows_per_expert {
-            return Err(format!(
-                "enqueue_expert_gate_up_swiglu: h.len() {} < n_slots*rows_per_expert = {}",
-                h.len(),
-                n_slots * rows_per_expert
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_expert_gate_up_swiglu",
+                format!(
+                    "h.len() {} < n_slots*rows_per_expert = {}",
+                    h.len(),
+                    n_slots * rows_per_expert
+                ),
+            ));
         }
         let n_experts = wg.rows() / rows_per_expert;
         let prep = self
@@ -318,30 +330,34 @@ impl MoeFusedKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if rows == 0 || n_slots == 0 {
-            return Err(format!(
-                "enqueue_moe_combine: need rows/n_slots >= 1, got {rows}/{n_slots}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_moe_combine",
+                format!("need rows/n_slots >= 1, got {rows}/{n_slots}"),
+            ));
         }
         if down.len() < rows * n_slots || w.len() < n_slots {
-            return Err(format!(
-                "enqueue_moe_combine: down.len() {} (need rows*n_slots = {}), w.len() {} (need \
+            return Err(GpuError::shape(
+                "enqueue_moe_combine",
+                format!(
+                    "down.len() {} (need rows*n_slots = {}), w.len() {} (need \
                  {n_slots})",
-                down.len(),
-                rows * n_slots,
-                w.len()
-            )
-            .into());
+                    down.len(),
+                    rows * n_slots,
+                    w.len()
+                ),
+            ));
         }
         if shexp.len() < rows || resid.len() < rows || y.len() < rows {
-            return Err(format!(
-                "enqueue_moe_combine: shexp.len() {} / resid.len() {} / y.len() {} vs rows \
+            return Err(GpuError::shape(
+                "enqueue_moe_combine",
+                format!(
+                    "shexp.len() {} / resid.len() {} / y.len() {} vs rows \
                  {rows}",
-                shexp.len(),
-                resid.len(),
-                y.len()
-            )
-            .into());
+                    shexp.len(),
+                    resid.len(),
+                    y.len()
+                ),
+            ));
         }
         let prep = self.module.prepare_moe_combine(LaunchConfig1D::new(
             rows.div_ceil(256) as u32,

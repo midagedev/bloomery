@@ -794,16 +794,18 @@ fn kid_kquant(
     let mut act = Q8Act::with_k(stream, m, k)?;
     gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
     stream.synchronize()?;
-    let run = |w: &DeviceTensor<u32>,
-               y: &mut DeviceBuffer<f32>|
-     -> Result<(), Box<dyn std::error::Error>> {
-        match ty {
-            GgmlType::Q3_K => gpu.enqueue_gemv_q3k(w, &act, y),
-            GgmlType::Q4_K => gpu.enqueue_gemv_q4k(w, &act, y),
-            GgmlType::Q6_K => gpu.enqueue_gemv_q6k(w, &act, y),
-            other => Err(format!("kid_kquant: no gemv for {other:?}").into()),
-        }
-    };
+    let run =
+        |w: &DeviceTensor<u32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {
+            match ty {
+                GgmlType::Q3_K => gpu.enqueue_gemv_q3k(w, &act, y),
+                GgmlType::Q4_K => gpu.enqueue_gemv_q4k(w, &act, y),
+                GgmlType::Q6_K => gpu.enqueue_gemv_q6k(w, &act, y),
+                other => Err(bloomery_gpu::GpuError::Shape {
+                    what: "kid_kquant",
+                    detail: format!("no gemv for {other:?}"),
+                }),
+            }
+        };
     let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
@@ -854,11 +856,10 @@ fn kid_q5_1(
     let mut act = Q8Blocks32::new(stream, k, m)?;
     q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
     stream.synchronize()?;
-    let run = |w: &DeviceTensor<u32>,
-               y: &mut DeviceBuffer<f32>|
-     -> Result<(), Box<dyn std::error::Error>> {
-        q5.enqueue_gemv_q5_1(stream, w, &act, 0, nrows, 0, m, y, 0)
-    };
+    let run =
+        |w: &DeviceTensor<u32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {
+            q5.enqueue_gemv_q5_1(stream, w, &act, 0, nrows, 0, m, y, 0)
+        };
     let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
@@ -903,11 +904,10 @@ fn kid_q5_0_sel(
         )
         .into());
     }
-    let run = |w: &DeviceTensor<u32>,
-               y: &mut DeviceBuffer<f32>|
-     -> Result<(), Box<dyn std::error::Error>> {
-        q5.enqueue_gemv_q5_0_sel(stream, w, act, sel, SEL.len(), rpe, y)
-    };
+    let run =
+        |w: &DeviceTensor<u32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {
+            q5.enqueue_gemv_q5_0_sel(stream, w, act, sel, SEL.len(), rpe, y)
+        };
     let mut y1 = DeviceBuffer::<f32>::zeroed(stream, SEL.len() * rpe)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
@@ -952,11 +952,10 @@ fn kid_q3k_sel(
         )
         .into());
     }
-    let run = |w: &DeviceTensor<u32>,
-               y: &mut DeviceBuffer<f32>|
-     -> Result<(), Box<dyn std::error::Error>> {
-        gpu.enqueue_gemv_q3k_sel(w, act, sel, SEL.len(), rpe, y)
-    };
+    let run =
+        |w: &DeviceTensor<u32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {
+            gpu.enqueue_gemv_q3k_sel(w, act, sel, SEL.len(), rpe, y)
+        };
     let mut y1 = DeviceBuffer::<f32>::zeroed(stream, SEL.len() * rpe)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
@@ -1003,11 +1002,10 @@ fn kid_f32(
     }
     let x = activations(k, m, seed);
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
-    let run = |w: &DeviceTensor<f32>,
-               y: &mut DeviceBuffer<f32>|
-     -> Result<(), Box<dyn std::error::Error>> {
-        q8f32.enqueue_f32_gemv(stream, w, &x_dev, m, y)
-    };
+    let run =
+        |w: &DeviceTensor<f32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {
+            q8f32.enqueue_f32_gemv(stream, w, &x_dev, m, y)
+        };
     let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
@@ -1068,7 +1066,7 @@ fn kid_q8_derived(
     let run = |qs: &DeviceTensor<u32>,
                d: &DeviceTensor<f32>,
                y: &mut DeviceBuffer<f32>|
-     -> Result<(), Box<dyn std::error::Error>> {
+     -> Result<(), bloomery_gpu::GpuError> {
         q8f32.enqueue_q8_0_gemv(stream, qs, d, &x_dev, m, y)
     };
     let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;

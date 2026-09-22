@@ -131,7 +131,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let failed = gpu
             .capture(|_s| {
                 gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
-                Err("injected body failure".into())
+                Err(bloomery_gpu::GpuError::State {
+                    what: "gpu-spike",
+                    missing: "injected body failure",
+                })
             })
             .is_err();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -43,7 +43,148 @@ pub use tensor::{DeviceTensor, Q8Act};
 
 /// Host-side failure: context creation, module loading, device allocation,
 /// launch, capture, or copy-back.
-pub type GpuError = Box<dyn std::error::Error>;
+///
+/// The variants are the kinds a reader has to tell apart when a gate prints
+/// one: a driver refusal, a caller's geometry mistake, a missing tensor or
+/// metadata key, a model object that is not ready, or a failure another
+/// crate already described. Every variant names the entry point it came
+/// from, because the same geometry complaint reaches a dozen kernels.
+#[derive(Debug)]
+pub enum GpuError {
+    /// A CUDA driver entry point returned a failure code. `op` names the
+    /// driver call our wrapper made; a plain `?` on a cuda-core call has no
+    /// name of ours to add.
+    Driver {
+        op: Option<&'static str>,
+        source: cuda_core::DriverError,
+    },
+    /// The embedded device module could not be loaded into the context.
+    Module(Box<cuda_host::EmbeddedModuleError>),
+    /// A launch configuration does not meet a kernel's launch contract.
+    Launch(Box<cuda_core::LaunchContractError>),
+    /// The GGUF file could not be read.
+    Load(Box<gguf::LoadError>),
+    /// An argument breaks an entry point's geometry contract: `what` is the
+    /// entry point, `detail` the lengths or shapes that disagree.
+    Shape { what: &'static str, detail: String },
+    /// A GGUF metadata key the loader needs is absent from the file.
+    Metadata {
+        what: &'static str,
+        key: &'static str,
+    },
+    /// A tensor is not resident, or is resident in a device format other
+    /// than the one the caller reads it as.
+    Tensor {
+        what: &'static str,
+        name: String,
+        need: &'static str,
+    },
+    /// The model does not hold what the call needs: a stage, that stage's
+    /// residency, an output head, or a captured graph.
+    State {
+        what: &'static str,
+        missing: &'static str,
+    },
+    /// Planning, metadata or dequantization carried up from the model crate.
+    Model(Box<::model::ModelError>),
+}
+
+impl GpuError {
+    /// A geometry contract broken by the caller of `what`.
+    pub(crate) fn shape(what: &'static str, detail: impl Into<String>) -> GpuError {
+        GpuError::Shape {
+            what,
+            detail: detail.into(),
+        }
+    }
+
+    /// A tensor `what` looked up that is absent or in the wrong format;
+    /// `need` completes "is not …".
+    pub(crate) fn tensor(
+        what: &'static str,
+        name: impl Into<String>,
+        need: &'static str,
+    ) -> GpuError {
+        GpuError::Tensor {
+            what,
+            name: name.into(),
+            need,
+        }
+    }
+
+    /// A model object `what` needs that the caller has not built yet.
+    pub(crate) fn state(what: &'static str, missing: &'static str) -> GpuError {
+        GpuError::State { what, missing }
+    }
+
+    /// A metadata key `what` reads that the file does not carry.
+    pub(crate) fn metadata(what: &'static str, key: &'static str) -> GpuError {
+        GpuError::Metadata { what, key }
+    }
+}
+
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuError::Driver {
+                op: Some(op),
+                source,
+            } => write!(f, "{op}: {source}"),
+            GpuError::Driver { op: None, source } => write!(f, "{source}"),
+            GpuError::Module(e) => write!(f, "{e}"),
+            GpuError::Launch(e) => write!(f, "{e}"),
+            GpuError::Load(e) => write!(f, "{e}"),
+            GpuError::Shape { what, detail } => write!(f, "{what}: {detail}"),
+            GpuError::Metadata { what, key } => write!(f, "{what}: metadata key {key} missing"),
+            GpuError::Tensor { what, name, need } => write!(f, "{what}: {name} is not {need}"),
+            GpuError::State { what, missing } => write!(f, "{what}: {missing}"),
+            GpuError::Model(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for GpuError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GpuError::Driver { source, .. } => Some(source),
+            GpuError::Module(e) => Some(&**e),
+            GpuError::Launch(e) => Some(&**e),
+            GpuError::Load(e) => Some(&**e),
+            GpuError::Model(e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
+
+impl From<cuda_core::DriverError> for GpuError {
+    fn from(source: cuda_core::DriverError) -> GpuError {
+        GpuError::Driver { op: None, source }
+    }
+}
+
+impl From<cuda_host::EmbeddedModuleError> for GpuError {
+    fn from(e: cuda_host::EmbeddedModuleError) -> GpuError {
+        GpuError::Module(Box::new(e))
+    }
+}
+
+impl From<cuda_core::LaunchContractError> for GpuError {
+    fn from(e: cuda_core::LaunchContractError) -> GpuError {
+        GpuError::Launch(Box::new(e))
+    }
+}
+
+impl From<gguf::LoadError> for GpuError {
+    fn from(e: gguf::LoadError) -> GpuError {
+        GpuError::Load(Box::new(e))
+    }
+}
+
+impl From<::model::ModelError> for GpuError {
+    fn from(e: ::model::ModelError) -> GpuError {
+        GpuError::Model(Box::new(e))
+    }
+}
 
 /// One 128-value q8_1 block of column `col` of the activation plane based at
 /// `x0`, quantized and stored in the three gemv permutations plus the group
@@ -1287,14 +1428,16 @@ impl Gpu {
         let m = act.m();
         let n_sb = act.n_sb();
         if x.len() < x0 + m * act.k() {
-            return Err(format!(
-                "enqueue_quantize_q8_1_at: x.len() {} < x0 + m*k = {} + {}*{}",
-                x.len(),
-                x0,
-                m,
-                act.k()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_quantize_q8_1_at",
+                format!(
+                    "x.len() {} < x0 + m*k = {} + {}*{}",
+                    x.len(),
+                    x0,
+                    m,
+                    act.k()
+                ),
+            ));
         }
         // Prepared per call for now: the prepare step is host-only contract
         // validation, and it is exactly the kind of per-launch host cost a
@@ -1337,22 +1480,23 @@ impl Gpu {
     ) -> Result<(), GpuError> {
         let (m, n_sb) = (a.m(), a.n_sb());
         if b.m() != m || b.k() != a.k() {
-            return Err(format!(
-                "enqueue_quantize_q8_1_pair: both halves must share a shape, got a {}x{} b {}x{}",
-                a.m(),
-                a.k(),
-                b.m(),
-                b.k()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_quantize_q8_1_pair",
+                format!(
+                    "both halves must share a shape, got a {}x{} b {}x{}",
+                    a.m(),
+                    a.k(),
+                    b.m(),
+                    b.k()
+                ),
+            ));
         }
         let need = m * a.k();
         if x.len() < a0 + need || x.len() < b0 + need {
-            return Err(format!(
-                "enqueue_quantize_q8_1_pair: x.len() {} < max(a0 {a0}, b0 {b0}) + m*k = {need}",
-                x.len()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_quantize_q8_1_pair",
+                format!("x.len() {} < max(a0 {a0}, b0 {b0}) + m*k = {need}", x.len()),
+            ));
         }
         let prep = self
             .module
@@ -1395,22 +1539,22 @@ impl Gpu {
         let (n_rows, m) = (w.rows(), act.m());
         let n_sb = act.n_sb();
         if w.cols() != 36 * n_sb {
-            return Err(format!(
-                "enqueue_gemv_q4k: Q4_K rows are 36*{} = {} words at K={}, got {}",
-                n_sb,
-                36 * n_sb,
-                act.k(),
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q4k",
+                format!(
+                    "Q4_K rows are 36*{} = {} words at K={}, got {}",
+                    n_sb,
+                    36 * n_sb,
+                    act.k(),
+                    w.cols()
+                ),
+            ));
         }
         if y.len() < n_rows * m {
-            return Err(format!(
-                "enqueue_gemv_q4k: y.len() {} < rows*m = {}",
-                y.len(),
-                n_rows * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q4k",
+                format!("y.len() {} < rows*m = {}", y.len(), n_rows * m),
+            ));
         }
         let prep =
             self.module
@@ -1448,29 +1592,31 @@ impl Gpu {
         let (n_rows, m) = (w.rows(), act.m());
         let n_sb = act.n_sb();
         if !n_sb.is_multiple_of(2) {
-            return Err(format!(
-                "enqueue_gemv_q3k: odd super-block count {n_sb} (K={}) leaves rows \
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k",
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
-                act.k()
-            )
-            .into());
+                    act.k()
+                ),
+            ));
         }
         if w.cols() != 110 * n_sb / 4 {
-            return Err(format!(
-                "enqueue_gemv_q3k: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
-                110 * n_sb / 4,
-                act.k(),
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k",
+                format!(
+                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
+                    110 * n_sb / 4,
+                    act.k(),
+                    w.cols()
+                ),
+            ));
         }
         if y.len() < n_rows * m {
-            return Err(format!(
-                "enqueue_gemv_q3k: y.len() {} < rows*m = {}",
-                y.len(),
-                n_rows * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k",
+                format!("y.len() {} < rows*m = {}", y.len(), n_rows * m),
+            ));
         }
         let prep =
             self.module
@@ -1513,52 +1659,64 @@ impl Gpu {
     ) -> Result<(), GpuError> {
         let n_sb = act.n_sb();
         if act.m() != 1 {
-            return Err(format!(
-                "enqueue_gemv_q3k_sel: m = 1 only (the shared expert input), got act.m() = {}",
-                act.m()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k_sel",
+                format!(
+                    "m = 1 only (the shared expert input), got act.m() = {}",
+                    act.m()
+                ),
+            ));
         }
         if !n_sb.is_multiple_of(2) {
-            return Err(format!(
-                "enqueue_gemv_q3k_sel: odd super-block count {n_sb} (K={}) leaves rows \
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k_sel",
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
-                act.k()
-            )
-            .into());
+                    act.k()
+                ),
+            ));
         }
         if w.cols() != 110 * n_sb / 4 {
-            return Err(format!(
-                "enqueue_gemv_q3k_sel: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
-                110 * n_sb / 4,
-                act.k(),
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k_sel",
+                format!(
+                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
+                    110 * n_sb / 4,
+                    act.k(),
+                    w.cols()
+                ),
+            ));
         }
         if rows_per_expert == 0 || !w.rows().is_multiple_of(rows_per_expert) {
-            return Err(format!(
-                "enqueue_gemv_q3k_sel: w.rows() {} must be a positive multiple of \
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k_sel",
+                format!(
+                    "w.rows() {} must be a positive multiple of \
                  rows_per_expert {rows_per_expert}",
-                w.rows()
-            )
-            .into());
+                    w.rows()
+                ),
+            ));
         }
         if n_slots == 0 || sel.len() < n_slots {
-            return Err(format!(
-                "enqueue_gemv_q3k_sel: need n_slots >= 1 and sel.len() >= n_slots, got \
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k_sel",
+                format!(
+                    "need n_slots >= 1 and sel.len() >= n_slots, got \
                  n_slots {n_slots} sel.len() {}",
-                sel.len()
-            )
-            .into());
+                    sel.len()
+                ),
+            ));
         }
         if y.len() < n_slots * rows_per_expert {
-            return Err(format!(
-                "enqueue_gemv_q3k_sel: y.len() {} < n_slots*rows_per_expert = {}",
-                y.len(),
-                n_slots * rows_per_expert
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q3k_sel",
+                format!(
+                    "y.len() {} < n_slots*rows_per_expert = {}",
+                    y.len(),
+                    n_slots * rows_per_expert
+                ),
+            ));
         }
         let n_experts = w.rows() / rows_per_expert;
         let prep = self.module.prepare_q3k_gemv_sel(LaunchConfig1D::new(
@@ -1599,29 +1757,31 @@ impl Gpu {
         let (n_rows, m) = (w.rows(), act.m());
         let n_sb = act.n_sb();
         if !n_sb.is_multiple_of(2) {
-            return Err(format!(
-                "enqueue_gemv_q6k: odd super-block count {n_sb} (K={}) leaves rows \
+            return Err(GpuError::shape(
+                "enqueue_gemv_q6k",
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
-                act.k()
-            )
-            .into());
+                    act.k()
+                ),
+            ));
         }
         if w.cols() != 210 * n_sb / 4 {
-            return Err(format!(
-                "enqueue_gemv_q6k: Q6_K rows are 210*{n_sb}/4 = {} words at K={}, got {}",
-                210 * n_sb / 4,
-                act.k(),
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q6k",
+                format!(
+                    "Q6_K rows are 210*{n_sb}/4 = {} words at K={}, got {}",
+                    210 * n_sb / 4,
+                    act.k(),
+                    w.cols()
+                ),
+            ));
         }
         if y.len() < n_rows * m {
-            return Err(format!(
-                "enqueue_gemv_q6k: y.len() {} < rows*m = {}",
-                y.len(),
-                n_rows * m
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_gemv_q6k",
+                format!("y.len() {} < rows*m = {}", y.len(), n_rows * m),
+            ));
         }
         let prep =
             self.module
@@ -1682,7 +1842,7 @@ impl Gpu {
     ) -> Result<f64, GpuError> {
         check_q4k_geometry(w.len(), x.len(), n_rows, m)?;
         if iters == 0 {
-            return Err("probe_q4k_launch_us: iters must be >= 1".into());
+            return Err(GpuError::shape("probe_q4k_launch_us", "iters must be >= 1"));
         }
         let stream = &self.stream;
         let w_dev = DeviceTensor::upload(stream, &w[..n_rows * 288], n_rows, 288)?;
@@ -1712,16 +1872,22 @@ impl Gpu {
 /// and both support 1..=8 columns.
 fn check_q4k_geometry(w_len: usize, x_len: usize, n_rows: usize, m: usize) -> Result<(), GpuError> {
     if n_rows == 0 || !(1..=8).contains(&m) {
-        return Err(format!(
-            "gemv_q4k: need n_rows >= 1 and 1 <= m <= 8, got n_rows={n_rows} m={m}"
-        )
-        .into());
+        return Err(GpuError::shape(
+            "gemv_q4k",
+            format!("need n_rows >= 1 and 1 <= m <= 8, got n_rows={n_rows} m={m}"),
+        ));
     }
     if w_len < n_rows * 288 {
-        return Err(format!("gemv_q4k: w.len() {w_len} < n_rows*288 = {}", n_rows * 288).into());
+        return Err(GpuError::shape(
+            "gemv_q4k",
+            format!("w.len() {w_len} < n_rows*288 = {}", n_rows * 288),
+        ));
     }
     if x_len < m * 2048 {
-        return Err(format!("gemv_q4k: x.len() {x_len} < m*2048 = {}", m * 2048).into());
+        return Err(GpuError::shape(
+            "gemv_q4k",
+            format!("x.len() {x_len} < m*2048 = {}", m * 2048),
+        ));
     }
     Ok(())
 }

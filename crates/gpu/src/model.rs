@@ -357,15 +357,17 @@ impl StepKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         if n == 0 || src_idx.len() < n || dst_idx.len() < n || x.is_empty() || y.is_empty() {
-            return Err(format!(
-                "enqueue_gather: n={n}, src_idx.len() {}, dst_idx.len() {}, x.len() {}, \
+            return Err(GpuError::shape(
+                "enqueue_gather",
+                format!(
+                    "n={n}, src_idx.len() {}, dst_idx.len() {}, x.len() {}, \
                  y.len() {}",
-                src_idx.len(),
-                dst_idx.len(),
-                x.len(),
-                y.len()
-            )
-            .into());
+                    src_idx.len(),
+                    dst_idx.len(),
+                    x.len(),
+                    y.len()
+                ),
+            ));
         }
         let prep = self.module.prepare_gather_pairs(LaunchConfig1D::new(
             n.div_ceil(256) as u32,
@@ -401,50 +403,60 @@ impl StepKernels {
         let n_rows = d.rows();
         let k = d.cols() * 32;
         if k == 0 || !k.is_multiple_of(32) {
-            return Err(format!(
-                "enqueue_q8_0_gemv_heads: need k a positive multiple of 32, got k={k} \
+            return Err(GpuError::shape(
+                "enqueue_q8_0_gemv_heads",
+                format!(
+                    "need k a positive multiple of 32, got k={k} \
                  (d is {}x{})",
-                d.rows(),
-                d.cols()
-            )
-            .into());
+                    d.rows(),
+                    d.cols()
+                ),
+            ));
         }
         if qs.rows() != n_rows || qs.cols() != d.cols() * 8 {
-            return Err(format!(
-                "enqueue_q8_0_gemv_heads: qs is {}x{}, want {}x{} (k/4 words per row, k = \
+            return Err(GpuError::shape(
+                "enqueue_q8_0_gemv_heads",
+                format!(
+                    "qs is {}x{}, want {}x{} (k/4 words per row, k = \
                  d.cols()*32 = {k})",
-                qs.rows(),
-                qs.cols(),
-                n_rows,
-                d.cols() * 8
-            )
-            .into());
+                    qs.rows(),
+                    qs.cols(),
+                    n_rows,
+                    d.cols() * 8
+                ),
+            ));
         }
         if rows_per_head == 0 || n_rows % rows_per_head != 0 {
-            return Err(format!(
-                "enqueue_q8_0_gemv_heads: n_rows={n_rows} is not a positive multiple of \
+            return Err(GpuError::shape(
+                "enqueue_q8_0_gemv_heads",
+                format!(
+                    "n_rows={n_rows} is not a positive multiple of \
                  rows_per_head={rows_per_head}"
-            )
-            .into());
+                ),
+            ));
         }
         let n_heads = n_rows / rows_per_head;
         if x.len() < (n_heads - 1) * x_head_stride + k {
-            return Err(format!(
-                "enqueue_q8_0_gemv_heads: x.len() {} < (n_heads-1)*x_head_stride + k = \
+            return Err(GpuError::shape(
+                "enqueue_q8_0_gemv_heads",
+                format!(
+                    "x.len() {} < (n_heads-1)*x_head_stride + k = \
                  {}*{x_head_stride} + {k}",
-                x.len(),
-                n_heads - 1
-            )
-            .into());
+                    x.len(),
+                    n_heads - 1
+                ),
+            ));
         }
         if y.len() < (n_heads - 1) * y_head_stride + y_off + rows_per_head {
-            return Err(format!(
-                "enqueue_q8_0_gemv_heads: y.len() {} < (n_heads-1)*y_head_stride + y_off + \
+            return Err(GpuError::shape(
+                "enqueue_q8_0_gemv_heads",
+                format!(
+                    "y.len() {} < (n_heads-1)*y_head_stride + y_off + \
                  rows_per_head = {}*{y_head_stride} + {y_off} + {rows_per_head}",
-                y.len(),
-                n_heads - 1
-            )
-            .into());
+                    y.len(),
+                    n_heads - 1
+                ),
+            ));
         }
         let prep = self.module.prepare_q8_0_gemv_heads(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,
@@ -495,48 +507,58 @@ impl StepKernels {
         let n_sb = act.n_sb();
         let heads = act.m();
         if !n_sb.is_multiple_of(2) {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads: odd super-block count {n_sb} (K={}) leaves rows \
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads",
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
-                act.k()
-            )
-            .into());
+                    act.k()
+                ),
+            ));
         }
         if w.cols() != 110 * n_sb / 4 {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
-                110 * n_sb / 4,
-                act.k(),
-                w.cols()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads",
+                format!(
+                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
+                    110 * n_sb / 4,
+                    act.k(),
+                    w.cols()
+                ),
+            ));
         }
         if row_off + rows_per_head > row_stride_per_head || rows_per_head == 0 {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads: row_off {row_off} + rows_per_head {rows_per_head} \
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads",
+                format!(
+                    "row_off {row_off} + rows_per_head {rows_per_head} \
                  must lie inside row_stride_per_head {row_stride_per_head}"
-            )
-            .into());
+                ),
+            ));
         }
         if (head_base + heads) * row_stride_per_head > w.rows() {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads: heads {head_base}..{} need (head_base+heads)*\
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads",
+                format!(
+                    "heads {head_base}..{} need (head_base+heads)*\
                  row_stride_per_head = {} rows, w has {}",
-                head_base + heads,
-                (head_base + heads) * row_stride_per_head,
-                w.rows()
-            )
-            .into());
+                    head_base + heads,
+                    (head_base + heads) * row_stride_per_head,
+                    w.rows()
+                ),
+            ));
         }
         let n_rows = heads * rows_per_head;
         if y.len() < (head_base + heads - 1) * y_head_stride + rows_per_head {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads: y.len() {} < (head_base+heads-1)*y_head_stride + \
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads",
+                format!(
+                    "y.len() {} < (head_base+heads-1)*y_head_stride + \
                  rows_per_head = {}*{y_head_stride} + {rows_per_head}",
-                y.len(),
-                head_base + heads - 1
-            )
-            .into());
+                    y.len(),
+                    head_base + heads - 1
+                ),
+            ));
         }
         let prep = self.module.prepare_q3k_gemv_heads(LaunchConfig1D::new(
             n_rows.div_ceil(8) as u32,
@@ -586,57 +608,69 @@ impl StepKernels {
         let n_sb = lo.n_sb();
         let (split, heads) = (lo.m(), lo.m() + hi.m());
         if hi.n_sb() != n_sb || hi.k() != lo.k() {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads_pair: both halves must share K, got lo k={} hi k={}",
-                lo.k(),
-                hi.k()
-            )
-            .into());
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads_pair",
+                format!(
+                    "both halves must share K, got lo k={} hi k={}",
+                    lo.k(),
+                    hi.k()
+                ),
+            ));
         }
         if !n_sb.is_multiple_of(2) {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads_pair: odd super-block count {n_sb} (K={}) leaves rows \
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads_pair",
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves rows \
                  unaligned; repack rows at load time",
-                lo.k()
-            )
-            .into());
+                    lo.k()
+                ),
+            ));
         }
         if w.cols() != 110 * n_sb / 4 {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads_pair: Q3_K rows are 110*{n_sb}/4 = {} words at K={}, \
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads_pair",
+                format!(
+                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, \
                  got {}",
-                110 * n_sb / 4,
-                lo.k(),
-                w.cols()
-            )
-            .into());
+                    110 * n_sb / 4,
+                    lo.k(),
+                    w.cols()
+                ),
+            ));
         }
         if row_off + rows_per_head > row_stride_per_head || rows_per_head == 0 {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads_pair: row_off {row_off} + rows_per_head \
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads_pair",
+                format!(
+                    "row_off {row_off} + rows_per_head \
                  {rows_per_head} must lie inside row_stride_per_head {row_stride_per_head}"
-            )
-            .into());
+                ),
+            ));
         }
         if (head_base + heads) * row_stride_per_head > w.rows() {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads_pair: heads {head_base}..{} need (head_base+heads)*\
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads_pair",
+                format!(
+                    "heads {head_base}..{} need (head_base+heads)*\
                  row_stride_per_head = {} rows, w has {}",
-                head_base + heads,
-                (head_base + heads) * row_stride_per_head,
-                w.rows()
-            )
-            .into());
+                    head_base + heads,
+                    (head_base + heads) * row_stride_per_head,
+                    w.rows()
+                ),
+            ));
         }
         let n_rows = heads * rows_per_head;
         if y.len() < (head_base + heads - 1) * y_head_stride + rows_per_head {
-            return Err(format!(
-                "enqueue_q3k_gemv_heads_pair: y.len() {} < (head_base+heads-1)*y_head_stride \
+            return Err(GpuError::shape(
+                "enqueue_q3k_gemv_heads_pair",
+                format!(
+                    "y.len() {} < (head_base+heads-1)*y_head_stride \
                  + rows_per_head = {}*{y_head_stride} + {rows_per_head}",
-                y.len(),
-                head_base + heads - 1
-            )
-            .into());
+                    y.len(),
+                    head_base + heads - 1
+                ),
+            ));
         }
         let prep = self
             .module
@@ -689,18 +723,18 @@ impl Gather {
     fn new(
         stream: &CudaStream,
         pairs: impl Iterator<Item = (usize, usize)>,
-        what: &str,
+        what: &'static str,
     ) -> Result<Gather, GpuError> {
         let (mut src, mut dst) = (Vec::new(), Vec::new());
         for (s, d) in pairs {
             if s > u32::MAX as usize || d > u32::MAX as usize {
-                return Err(format!("Gather::new {what}: index overflows u32").into());
+                return Err(GpuError::shape(what, "index overflows u32"));
             }
             src.push(s as u32);
             dst.push(d as u32);
         }
         if src.is_empty() {
-            return Err(format!("Gather::new {what}: empty table").into());
+            return Err(GpuError::shape(what, "empty table"));
         }
         Ok(Gather {
             n: src.len(),
@@ -1308,7 +1342,7 @@ fn blocks32_bytes(b: &Q8Blocks32, cols: usize) -> usize {
 /// quantization type and `k` the byte accounting needs.
 fn dev_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DevWeight, GpuError> {
     w.get(name)
-        .ok_or_else(|| format!("dev_weight: {name} not resident").into())
+        .ok_or_else(|| GpuError::tensor("dev_weight", name, "resident"))
 }
 
 /// Per-op timing of one layer chain run from [`GpuModel::profile_layer`]:
@@ -1356,18 +1390,19 @@ impl ProfRec {
         }
         let slot = &mut self.ops[i];
         if slot.0 != name {
-            return Err(format!(
-                "profile_layer: op {i} was {} on an earlier rep, now {name}",
-                slot.0
-            )
-            .into());
+            return Err(GpuError::shape(
+                "profile_layer",
+                format!("op {i} was {} on an earlier rep, now {name}", slot.0),
+            ));
         }
         if slot.1 != bytes {
-            return Err(format!(
-                "profile_layer: op {i} ({name}) touched {:?} bytes on an earlier rep, now {bytes:?}",
-                slot.1
-            )
-            .into());
+            return Err(GpuError::shape(
+                "profile_layer",
+                format!(
+                    "op {i} ({name}) touched {:?} bytes on an earlier rep, now {bytes:?}",
+                    slot.1
+                ),
+            ));
         }
         slot.2.push(us);
         Ok(())
@@ -1525,25 +1560,27 @@ impl StepProbe {
         .filter(|on| **on)
         .count();
         if seg > 1 {
-            return Err(
-                "StepProbe: one flash segment-pass lever at a time — each names the probe \
-                 entry the segment launch runs, and they are one launch"
-                    .into(),
-            );
+            return Err(GpuError::shape(
+                "StepProbe",
+                "one flash segment-pass lever at a time — each names the probe \
+                 entry the segment launch runs, and they are one launch",
+            ));
         }
         if (seg == 1 || self.flash_merge2) && crate::flash::segments_for(cache_rows) == 1 {
-            return Err(format!(
-                "StepProbe: the flash levers probe the split launch, and a {cache_rows}-row \
+            return Err(GpuError::shape(
+                "StepProbe",
+                format!(
+                    "the flash levers probe the split launch, and a {cache_rows}-row \
                  cache takes the single-block kernel — raise ctx or drop the lever"
-            )
-            .into());
+                ),
+            ));
         }
         if self.flash_merge2 && (self.skip_quant || self.split_flash_quant) {
-            return Err(
-                "StepProbe: flash_merge2 probes the q8 merge, and skip_quant / \
-                 split_flash_quant put the plain merge back in its place"
-                    .into(),
-            );
+            return Err(GpuError::shape(
+                "StepProbe",
+                "flash_merge2 probes the q8 merge, and skip_quant / \
+                 split_flash_quant put the plain merge back in its place",
+            ));
         }
         Ok(())
     }
@@ -1594,18 +1631,18 @@ impl GpuModel {
         cuts: &[usize],
     ) -> Result<GpuModel, GpuError> {
         if ctx_max == 0 {
-            return Err("GpuModel::load: ctx_max must be >= 1".into());
+            return Err(GpuError::shape("GpuModel::load", "ctx_max must be >= 1"));
         }
         let n_layers =
             gguf.block_count()
-                .ok_or("GpuModel::load: metadata key block_count missing")? as usize;
+                .ok_or(GpuError::metadata("GpuModel::load", "block_count"))? as usize;
         let mut bounds = vec![0usize];
         for &c in cuts {
             if c <= *bounds.last().unwrap_or(&0) || c >= n_layers {
-                return Err(format!(
-                    "GpuModel::load_staged: cuts must ascend strictly inside 1..{n_layers}, got {cuts:?}"
-                )
-                .into());
+                return Err(GpuError::shape(
+                    "GpuModel::load_staged",
+                    format!("cuts must ascend strictly inside 1..{n_layers}, got {cuts:?}"),
+                ));
             }
             bounds.push(c);
         }
@@ -1644,17 +1681,20 @@ impl GpuModel {
         layers: Range<usize>,
     ) -> Result<GpuModel, GpuError> {
         if ctx_max == 0 {
-            return Err("GpuModel::load_blocks: ctx_max must be >= 1".into());
+            return Err(GpuError::shape(
+                "GpuModel::load_blocks",
+                "ctx_max must be >= 1",
+            ));
         }
         let n_layers = gguf
             .block_count()
-            .ok_or("GpuModel::load_blocks: metadata key block_count missing")?
+            .ok_or(GpuError::metadata("GpuModel::load_blocks", "block_count"))?
             as usize;
         if layers.start >= layers.end || layers.end > n_layers {
-            return Err(format!(
-                "GpuModel::load_blocks: layer range {layers:?} outside 0..{n_layers}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                "GpuModel::load_blocks",
+                format!("layer range {layers:?} outside 0..{n_layers}"),
+            ));
         }
         let mla = MlaParams::read(gguf, 0)?;
         let gpu = Gpu::new()?;
@@ -1713,12 +1753,12 @@ impl GpuModel {
     pub fn load_full(gguf: &gguf::Gguf, ctx_max: usize) -> Result<GpuModel, GpuError> {
         let n_layers = gguf
             .block_count()
-            .ok_or("GpuModel::load_full: metadata key block_count missing")?
+            .ok_or(GpuError::metadata("GpuModel::load_full", "block_count"))?
             as usize;
         let mut m = GpuModel::load_blocks(gguf, ctx_max, 0..n_layers)?;
         let eps = m.mla.eps;
         let head = {
-            let (gpu, residency) = m.stage_parts("load_full")?;
+            let (gpu, residency) = m.stage_parts("GpuModel::load_full")?;
             Head::new(gpu, &residency.weights, eps)?
         };
         m.head = Some(head);
@@ -1770,7 +1810,7 @@ impl GpuModel {
     /// tokens that come out are not the model's answer.
     pub fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
         probe.check(self.ctx_max)?;
-        let (_, residency) = self.stage_parts("set_probe")?;
+        let (_, residency) = self.stage_parts("GpuModel::set_probe")?;
         residency.scratch.probe_cfg = probe;
         self.step_graph = None;
         if let Some(stage) = self.stages.first_mut() {
@@ -1789,14 +1829,19 @@ impl GpuModel {
     pub fn reset(&mut self) -> Result<(), GpuError> {
         let slots = match self.stages.first().and_then(|s| s.residency.as_ref()) {
             Some(r) => r.kv.len(),
-            None => return Err("GpuModel::reset: stage carries no residency".into()),
+            None => {
+                return Err(GpuError::state(
+                    "GpuModel::reset",
+                    "stage carries no residency",
+                ));
+            }
         };
         let zero_row = {
             let r = self.stages[0].residency.as_ref().unwrap();
             vec![0u16; r.kv[0].cols()]
         };
         for slot in 0..slots {
-            let (gpu, residency) = self.stage_parts("reset")?;
+            let (gpu, residency) = self.stage_parts("GpuModel::reset")?;
             seed_cache(gpu, &mut residency.kv[slot], &zero_row, "reset")?;
         }
         self.pos = 0;
@@ -1823,23 +1868,33 @@ impl GpuModel {
     /// Synchronizes; never inside a capture.
     pub fn seed_depth(&mut self, rows: usize) -> Result<(), GpuError> {
         if rows == 0 {
-            return Err("GpuModel::seed_depth: rows must be at least 1".into());
+            return Err(GpuError::shape(
+                "GpuModel::seed_depth",
+                "rows must be at least 1",
+            ));
         }
         if rows >= self.ctx_max {
-            return Err(format!(
-                "GpuModel::seed_depth: {rows} seeded rows leave no room for a step in the \
+            return Err(GpuError::shape(
+                "GpuModel::seed_depth",
+                format!(
+                    "{rows} seeded rows leave no room for a step in the \
                  resident cache's {} rows",
-                self.ctx_max
-            )
-            .into());
+                    self.ctx_max
+                ),
+            ));
         }
         let (slots, width) = match self.stages.first().and_then(|s| s.residency.as_ref()) {
             Some(r) => (r.kv.len(), r.kv[0].cols()),
-            None => return Err("GpuModel::seed_depth: stage carries no residency".into()),
+            None => {
+                return Err(GpuError::state(
+                    "GpuModel::seed_depth",
+                    "stage carries no residency",
+                ));
+            }
         };
         let block = seed_pattern(rows, width);
         for slot in 0..slots {
-            let (gpu, residency) = self.stage_parts("seed_depth")?;
+            let (gpu, residency) = self.stage_parts("GpuModel::seed_depth")?;
             seed_cache(gpu, &mut residency.kv[slot], &block, "seed_depth")?;
         }
         self.pos = rows as u32;
@@ -1852,12 +1907,15 @@ impl GpuModel {
     /// actually read, and a gate that asserts a prepared cache stands where a
     /// decoded prompt would needs the device side of that claim.
     pub fn device_step_params(&mut self) -> Result<(u32, u32), GpuError> {
-        let (gpu, residency) = self.stage_parts("device_step_params")?;
+        let (gpu, residency) = self.stage_parts("GpuModel::device_step_params")?;
         let stream = gpu.stream();
         let params = residency.scratch.step_params.to_host_vec(stream)?;
         match (params.get(SP_POS), params.get(SP_N_KEYS)) {
             (Some(p), Some(k)) => Ok((*p, *k)),
-            _ => Err("GpuModel::device_step_params: empty parameter buffer".into()),
+            _ => Err(GpuError::state(
+                "GpuModel::device_step_params",
+                "empty parameter buffer",
+            )),
         }
     }
 
@@ -1870,14 +1928,14 @@ impl GpuModel {
     pub fn capture_step(&mut self) -> Result<usize, GpuError> {
         let mla = self.mla.clone();
         let moe = self.moe.clone();
-        let head = self
-            .head
-            .as_mut()
-            .ok_or("GpuModel::capture_step: no output head — load with load_full")?;
+        let head = self.head.as_mut().ok_or(GpuError::state(
+            "GpuModel::capture_step",
+            "no output head — load with load_full",
+        ))?;
         let stage = self
             .stages
             .first_mut()
-            .ok_or("GpuModel::capture_step: no stage")?;
+            .ok_or(GpuError::state("GpuModel::capture_step", "no stage"))?;
         let Some(Residency {
             weights,
             kv,
@@ -1886,7 +1944,10 @@ impl GpuModel {
             step,
         }) = stage.residency.as_mut()
         else {
-            return Err("GpuModel::capture_step: stage carries no residency".into());
+            return Err(GpuError::state(
+                "GpuModel::capture_step",
+                "stage carries no residency",
+            ));
         };
         let gpu = &stage.gpu;
         let graph = gpu.capture(|_| {
@@ -1912,11 +1973,14 @@ impl GpuModel {
     fn enqueue_chain_step(&mut self) -> Result<(), GpuError> {
         let mla = self.mla.clone();
         let moe = self.moe.clone();
-        let head = self
-            .head
-            .as_mut()
-            .ok_or("GpuModel::step: no output head — load with load_full")?;
-        let stage = self.stages.first_mut().ok_or("GpuModel::step: no stage")?;
+        let head = self.head.as_mut().ok_or(GpuError::state(
+            "GpuModel::step",
+            "no output head — load with load_full",
+        ))?;
+        let stage = self
+            .stages
+            .first_mut()
+            .ok_or(GpuError::state("GpuModel::step", "no stage"))?;
         let Some(Residency {
             weights,
             kv,
@@ -1925,7 +1989,10 @@ impl GpuModel {
             step,
         }) = stage.residency.as_mut()
         else {
-            return Err("GpuModel::step: stage carries no residency".into());
+            return Err(GpuError::state(
+                "GpuModel::step",
+                "stage carries no residency",
+            ));
         };
         enqueue_chain(
             &stage.gpu,
@@ -1951,31 +2018,34 @@ impl GpuModel {
     /// generated token. [`GpuModel::reset`] rewinds.
     pub fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         if tokens.is_empty() {
-            return Err("GpuModel::step: empty token slice".into());
+            return Err(GpuError::shape("GpuModel::step", "empty token slice"));
         }
         if self.head.is_none() {
-            return Err("GpuModel::step: no output head — load with load_full".into());
+            return Err(GpuError::state(
+                "GpuModel::step",
+                "no output head — load with load_full",
+            ));
         }
         if self.stages.len() != 1 || self.stages[0].layers.start != 0 {
-            return Err(
-                "GpuModel::step: the token loop needs the single whole-model stage of \
-                 load_full"
-                    .into(),
-            );
+            return Err(GpuError::shape(
+                "GpuModel::step",
+                "the token loop needs the single whole-model stage of \
+                 load_full",
+            ));
         }
         if self.mode == StepMode::Graph && self.step_graph.is_none() {
             self.capture_step()?;
         }
         for &token in tokens {
             let pos = self.pos;
-            self.check_pos(pos, "step")?;
+            self.check_pos(pos, "GpuModel::step")?;
             self.refresh_params(token, pos)?;
             match self.mode {
                 StepMode::Eager => self.enqueue_chain_step()?,
                 StepMode::Graph => self
                     .step_graph
                     .as_ref()
-                    .ok_or("GpuModel::step: no captured chain")?
+                    .ok_or(GpuError::state("GpuModel::step", "no captured chain"))?
                     .launch(self.stages[0].gpu.stream())?,
             }
             self.pos = pos + 1;
@@ -1983,7 +2053,7 @@ impl GpuModel {
         let gpu = &self.stages[0].gpu;
         self.head
             .as_ref()
-            .ok_or("GpuModel::step: no output head")?
+            .ok_or(GpuError::state("GpuModel::step", "no output head"))?
             .token(gpu)
     }
 
@@ -1991,38 +2061,38 @@ impl GpuModel {
 
     /// The one resident stage. Every assembled path needs exactly one stage
     /// carrying residency; `what` names the caller in the error.
-    fn stage_parts(&mut self, what: &str) -> Result<(&mut Gpu, &mut Residency), GpuError> {
+    fn stage_parts(&mut self, what: &'static str) -> Result<(&mut Gpu, &mut Residency), GpuError> {
         if self.stages.len() != 1 {
-            return Err(format!(
-                "GpuModel::{what}: the assembled step needs the single stage of load_blocks"
-            )
-            .into());
+            return Err(GpuError::state(
+                what,
+                "the assembled step needs the single stage of load_blocks",
+            ));
         }
         let stage = &mut self.stages[0];
         let Some(residency) = stage.residency.as_mut() else {
-            return Err(format!(
-                "GpuModel::{what}: stage carries no residency (load_blocks fills it)"
-            )
-            .into());
+            return Err(GpuError::state(
+                what,
+                "stage carries no residency (load_blocks fills it)",
+            ));
         };
         Ok((&mut stage.gpu, residency))
     }
 
     /// The slot of layer `l` inside the resident range — the index of its KV
     /// cache and of its names.
-    fn layer_slot(&self, l: usize, what: &str) -> Result<usize, GpuError> {
+    fn layer_slot(&self, l: usize, what: &'static str) -> Result<usize, GpuError> {
         if self.stages.len() != 1 {
-            return Err(format!(
-                "GpuModel::{what}: the assembled step needs the single stage of load_blocks"
-            )
-            .into());
+            return Err(GpuError::state(
+                what,
+                "the assembled step needs the single stage of load_blocks",
+            ));
         }
         let layers = self.stages[0].layers.clone();
         if !layers.contains(&l) {
-            return Err(format!(
-                "GpuModel::{what}: layer {l} is outside the resident range {layers:?}"
-            )
-            .into());
+            return Err(GpuError::shape(
+                what,
+                format!("layer {l} is outside the resident range {layers:?}"),
+            ));
         }
         Ok(l - layers.start)
     }
@@ -2030,13 +2100,13 @@ impl GpuModel {
     /// The one stage, requiring it to hold block 0 with residency.
     fn block0_parts(&mut self) -> Result<(&mut Gpu, &mut Residency), GpuError> {
         if self.stages.len() != 1 || self.stages[0].layers.start != 0 {
-            return Err(
-                "GpuModel: the assembled block-0 step needs a stage of load_blocks starting \
-                 at layer 0"
-                    .into(),
-            );
+            return Err(GpuError::state(
+                "GpuModel::block0",
+                "the assembled block-0 step needs a stage of load_blocks starting \
+                 at layer 0",
+            ));
         }
-        self.stage_parts("block0")
+        self.stage_parts("GpuModel::block0")
     }
 
     /// Refresh every per-step device parameter for `(token, pos)`: the rope
@@ -2048,7 +2118,7 @@ impl GpuModel {
     fn refresh_params(&mut self, token: u32, pos: u32) -> Result<(), GpuError> {
         let mut cs = Vec::new();
         self.mla.rope.cache_into(pos, &mut cs);
-        let (gpu, residency) = self.stage_parts("refresh_params")?;
+        let (gpu, residency) = self.stage_parts("GpuModel::refresh_params")?;
         let stream = gpu.stream();
         let s = &mut residency.scratch;
         s.params_host.clear();
@@ -2096,8 +2166,8 @@ impl GpuModel {
     fn enqueue_layer_step(&mut self, l: usize) -> Result<(), GpuError> {
         let mla = self.mla.clone();
         let moe = self.moe.clone();
-        let slot = self.layer_slot(l, "enqueue_layer_step")?;
-        let (gpu, residency) = self.stage_parts("enqueue_layer_step")?;
+        let slot = self.layer_slot(l, "GpuModel::enqueue_layer_step")?;
+        let (gpu, residency) = self.stage_parts("GpuModel::enqueue_layer_step")?;
         let Residency {
             weights,
             kv,
@@ -2123,7 +2193,7 @@ impl GpuModel {
     /// rows `0..pos` already in the cache — this call appends row `pos`) and
     /// read every tap back. Synchronizes; gate/debug use.
     pub fn step_block0_taps(&mut self, token: u32, pos: u32) -> Result<Block0Taps, GpuError> {
-        self.check_pos(pos, "step_block0_taps")?;
+        self.check_pos(pos, "GpuModel::step_block0_taps")?;
         self.refresh_params(token, pos)?;
         self.enqueue_step()?;
         self.block0_taps()
@@ -2165,8 +2235,8 @@ impl GpuModel {
     /// Synchronizes per readback; gate/debug use.
     pub fn layer_taps(&mut self, l: usize) -> Result<LayerTaps, GpuError> {
         let mla = self.mla.clone();
-        let slot = self.layer_slot(l, "layer_taps")?;
-        let (gpu, residency) = self.stage_parts("layer_taps")?;
+        let slot = self.layer_slot(l, "GpuModel::layer_taps")?;
+        let (gpu, residency) = self.stage_parts("GpuModel::layer_taps")?;
         let stream = gpu.stream();
         let routed = residency.names[slot].routed;
         let s = &residency.scratch;
@@ -2215,15 +2285,17 @@ impl GpuModel {
     /// residual, which a lone layer has no embedding in front of to produce.
     /// Synchronizes; never inside a capture.
     pub fn set_layer_input(&mut self, x_in: &[f32]) -> Result<(), GpuError> {
-        let (gpu, residency) = self.stage_parts("set_layer_input")?;
+        let (gpu, residency) = self.stage_parts("GpuModel::set_layer_input")?;
         let s = &mut residency.scratch;
         if x_in.len() != s.dims.hidden {
-            return Err(format!(
-                "GpuModel::set_layer_input: {} values, the hidden width is {}",
-                x_in.len(),
-                s.dims.hidden
-            )
-            .into());
+            return Err(GpuError::shape(
+                "GpuModel::set_layer_input",
+                format!(
+                    "{} values, the hidden width is {}",
+                    x_in.len(),
+                    s.dims.hidden
+                ),
+            ));
         }
         s.x.copy_from_host(gpu.stream(), x_in)?;
         Ok(())
@@ -2239,7 +2311,7 @@ impl GpuModel {
         x_in: &[f32],
         pos: u32,
     ) -> Result<LayerTaps, GpuError> {
-        self.check_pos(pos, "step_layer_taps")?;
+        self.check_pos(pos, "GpuModel::step_layer_taps")?;
         self.set_layer_input(x_in)?;
         self.refresh_params(0, pos)?;
         self.enqueue_layer_step(l)?;
@@ -2254,7 +2326,7 @@ impl GpuModel {
     pub fn capture_layer(&mut self, l: usize) -> Result<usize, GpuError> {
         let mla = self.mla.clone();
         let moe = self.moe.clone();
-        let slot = self.layer_slot(l, "capture_layer")?;
+        let slot = self.layer_slot(l, "GpuModel::capture_layer")?;
         let stage = &mut self.stages[0];
         let Some(Residency {
             weights,
@@ -2264,7 +2336,10 @@ impl GpuModel {
             step,
         }) = stage.residency.as_mut()
         else {
-            return Err("GpuModel::capture_layer: stage carries no residency".into());
+            return Err(GpuError::state(
+                "GpuModel::capture_layer",
+                "stage carries no residency",
+            ));
         };
         let gpu = &stage.gpu;
         let graph = gpu.capture(|_| {
@@ -2290,8 +2365,8 @@ impl GpuModel {
     /// Refresh the step parameters for `(x_in, pos)` and replay the captured
     /// layer graph. Synchronizes.
     pub fn replay_layer(&mut self, l: usize, x_in: &[f32], pos: u32) -> Result<(), GpuError> {
-        self.check_pos(pos, "replay_layer")?;
-        self.layer_slot(l, "replay_layer")?;
+        self.check_pos(pos, "GpuModel::replay_layer")?;
+        self.layer_slot(l, "GpuModel::replay_layer")?;
         self.set_layer_input(x_in)?;
         self.refresh_params(0, pos)?;
         self.launch_graph((l, false))?;
@@ -2303,8 +2378,8 @@ impl GpuModel {
     /// cache, zeroing the rest — the seeding path the gate uses to give the
     /// step a prefix of oracle rows. Synchronizes; never inside a capture.
     pub fn seed_layer_cache(&mut self, l: usize, rows: &[u16]) -> Result<(), GpuError> {
-        let slot = self.layer_slot(l, "seed_layer_cache")?;
-        let (gpu, residency) = self.stage_parts("seed_layer_cache")?;
+        let slot = self.layer_slot(l, "GpuModel::seed_layer_cache")?;
+        let (gpu, residency) = self.stage_parts("GpuModel::seed_layer_cache")?;
         seed_cache(gpu, &mut residency.kv[slot], rows, "seed_layer_cache")
     }
 
@@ -2315,9 +2390,10 @@ impl GpuModel {
         let mla = self.mla.clone();
         let moe = self.moe.clone();
         if self.stages.len() != 1 || self.stages[0].layers.start != 0 {
-            return Err(
-                "GpuModel::capture_block0: needs a stage of load_blocks starting at layer 0".into(),
-            );
+            return Err(GpuError::state(
+                "GpuModel::capture_block0",
+                "needs a stage of load_blocks starting at layer 0",
+            ));
         }
         let stage = &mut self.stages[0];
         let Some(Residency {
@@ -2328,7 +2404,10 @@ impl GpuModel {
             step,
         }) = stage.residency.as_mut()
         else {
-            return Err("GpuModel::capture_block0: stage carries no residency".into());
+            return Err(GpuError::state(
+                "GpuModel::capture_block0",
+                "stage carries no residency",
+            ));
         };
         let gpu = &stage.gpu;
         let graph = gpu.capture(|_| {
@@ -2370,17 +2449,19 @@ impl GpuModel {
     /// (layer, embeds in front).
     fn launch_graph(&self, want: (usize, bool)) -> Result<(), GpuError> {
         let stage = &self.stages[0];
-        let graph = stage
-            .graph
-            .as_ref()
-            .ok_or("GpuModel::launch_graph: no captured graph")?;
+        let graph = stage.graph.as_ref().ok_or(GpuError::state(
+            "GpuModel::launch_graph",
+            "no captured graph",
+        ))?;
         if stage.graph_of != Some(want) {
-            return Err(format!(
-                "GpuModel::launch_graph: the captured graph is {:?} (layer, embed), the replay \
+            return Err(GpuError::shape(
+                "GpuModel::launch_graph",
+                format!(
+                    "the captured graph is {:?} (layer, embed), the replay \
                  wants {want:?}",
-                stage.graph_of
-            )
-            .into());
+                    stage.graph_of
+                ),
+            ));
         }
         graph.launch(stage.gpu.stream())
     }
@@ -2388,7 +2469,7 @@ impl GpuModel {
     /// Refresh the step parameters for `(token, pos)` and replay the
     /// captured block-0 graph. Synchronizes.
     pub fn replay_block0(&mut self, token: u32, pos: u32) -> Result<(), GpuError> {
-        self.check_pos(pos, "replay_block0")?;
+        self.check_pos(pos, "GpuModel::replay_block0")?;
         self.refresh_params(token, pos)?;
         self.launch_block0_graph()?;
         let stream = self.stages[0].gpu.stream();
@@ -2433,16 +2514,16 @@ impl GpuModel {
         pos: u32,
         reps: u32,
     ) -> Result<Vec<OpTime>, GpuError> {
-        self.check_pos(pos, "profile_layer")?;
+        self.check_pos(pos, "GpuModel::profile_layer")?;
         if reps == 0 {
-            return Err("profile_layer: reps must be >= 1".into());
+            return Err(GpuError::shape("profile_layer", "reps must be >= 1"));
         }
-        let slot = self.layer_slot(l, "profile_layer")?;
+        let slot = self.layer_slot(l, "GpuModel::profile_layer")?;
         let embed = l == 0;
         self.refresh_params(token, pos)?;
         let mla = self.mla.clone();
         let moe = self.moe.clone();
-        let (gpu, residency) = self.stage_parts("profile_layer")?;
+        let (gpu, residency) = self.stage_parts("GpuModel::profile_layer")?;
         let gpu: &Gpu = gpu;
         let stream = gpu.stream();
         let Residency {
@@ -2503,34 +2584,38 @@ impl GpuModel {
             )
         })?;
         if rec.ops.len() != probe.node_count() {
-            return Err(format!(
-                "profile_layer: {} ops observed but the same chain captures {} nodes — an op \
+            return Err(GpuError::shape(
+                "profile_layer",
+                format!(
+                    "{} ops observed but the same chain captures {} nodes — an op \
                  issued more than one launch before its tick, so its neighbours' times are \
                  mis-attributed",
-                rec.ops.len(),
-                probe.node_count()
-            )
-            .into());
+                    rec.ops.len(),
+                    probe.node_count()
+                ),
+            ));
         }
         if routed {
             let ids = match scratch.moe.as_ref() {
                 Some(m) => m.ids.to_host_vec(stream)?,
                 None => {
-                    return Err(format!(
-                        "profile_layer: layer {l} routes but the stage carries no MoE arena"
-                    )
-                    .into());
+                    return Err(GpuError::shape(
+                        "profile_layer",
+                        format!("layer {l} routes but the stage carries no MoE arena"),
+                    ));
                 }
             };
             let mut sorted = ids.clone();
             sorted.sort_unstable();
             sorted.dedup();
             if sorted.len() != ids.len() {
-                return Err(format!(
-                    "profile_layer: layer {l} routed to {ids:?} — a repeated slot makes the \
+                return Err(GpuError::shape(
+                    "profile_layer",
+                    format!(
+                        "layer {l} routed to {ids:?} — a repeated slot makes the \
                      expert ops' byte counts an overcount of the rows actually read"
-                )
-                .into());
+                    ),
+                ));
             }
         }
         Ok(rec
@@ -2553,9 +2638,9 @@ impl GpuModel {
     /// [`GpuModel::profile_block0`]; the timed window is the call itself,
     /// not the copies' stream completion.
     pub fn refresh_params_us(&mut self, token: u32, pos: u32, reps: u32) -> Result<f64, GpuError> {
-        self.check_pos(pos, "refresh_params_us")?;
+        self.check_pos(pos, "GpuModel::refresh_params_us")?;
         if reps == 0 {
-            return Err("refresh_params_us: reps must be >= 1".into());
+            return Err(GpuError::shape("refresh_params_us", "reps must be >= 1"));
         }
         for _ in 0..20 {
             self.refresh_params(token, pos)?;
@@ -2580,13 +2665,15 @@ impl GpuModel {
         seed_cache(gpu, &mut residency.kv[0], rows, "seed_block0_cache")
     }
 
-    fn check_pos(&self, pos: u32, what: &str) -> Result<(), GpuError> {
+    fn check_pos(&self, pos: u32, what: &'static str) -> Result<(), GpuError> {
         if pos as usize + 1 > self.ctx_max {
-            return Err(format!(
-                "GpuModel::{what}: pos {pos} + 1 exceeds the resident cache's {} rows",
-                self.ctx_max
-            )
-            .into());
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "pos {pos} + 1 exceeds the resident cache's {} rows",
+                    self.ctx_max
+                ),
+            ));
         }
         Ok(())
     }
@@ -2622,16 +2709,18 @@ fn seed_cache(
     gpu: &Gpu,
     cache: &mut DeviceTensor<u16>,
     rows: &[u16],
-    what: &str,
+    what: &'static str,
 ) -> Result<(), GpuError> {
     let full_len = cache.rows() * cache.cols();
     if rows.is_empty() || rows.len() > full_len || !rows.len().is_multiple_of(cache.cols()) {
-        return Err(format!(
-            "{what}: {} values are not whole {}-wide rows inside {full_len}",
-            rows.len(),
-            cache.cols()
-        )
-        .into());
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{} values are not whole {}-wide rows inside {full_len}",
+                rows.len(),
+                cache.cols()
+            ),
+        ));
     }
     let mut full = vec![0u16; full_len];
     full[..rows.len()].copy_from_slice(rows);
@@ -2648,23 +2737,27 @@ impl MoeDims {
         let hidden = f32_gain(w, &names.attn_norm)?.len();
         // The router kernel ranks a fixed 64 experts into a fixed 6 slots.
         if meta.n_expert != 64 || meta.n_used != 6 {
-            return Err(format!(
-                "MoeDims::read: the router kernel is 64 experts into 6 slots, the file says \
+            return Err(GpuError::shape(
+                "MoeDims::read",
+                format!(
+                    "the router kernel is 64 experts into 6 slots, the file says \
                  {} into {}",
-                meta.n_expert, meta.n_used
-            )
-            .into());
+                    meta.n_expert, meta.n_used
+                ),
+            ));
         }
         let kq_ty = |name: &str, want: GgmlType| -> Result<(), GpuError> {
             match w.get(name) {
                 Some(DevWeight::KQuant { ty, .. }) if *ty == want => Ok(()),
-                Some(other) => Err(format!(
-                    "MoeDims::read: {name} is resident as {} rows of k={}, want {want}",
-                    other.rows(),
-                    other.k()
-                )
-                .into()),
-                None => Err(format!("MoeDims::read: {name} not resident").into()),
+                Some(other) => Err(GpuError::shape(
+                    "MoeDims::read",
+                    format!(
+                        "{name} is resident as {} rows of k={}, want {want}",
+                        other.rows(),
+                        other.k()
+                    ),
+                )),
+                None => Err(GpuError::tensor("MoeDims::read", name, "resident")),
             }
         };
         kq_ty(&names.ffn_gate_exps, GgmlType::Q3_K)?;
@@ -2677,35 +2770,41 @@ impl MoeDims {
         match w.get(&names.ffn_down_exps) {
             Some(DevWeight::Q5_0 { .. }) => {}
             Some(_) => {
-                return Err(format!(
-                    "MoeDims::read: {} is not resident as Q5_0 — the routed down projection \
-                     runs q5_0_gemv_sel",
-                    names.ffn_down_exps
-                )
-                .into());
+                return Err(GpuError::tensor(
+                    "MoeDims::read",
+                    &names.ffn_down_exps,
+                    "resident as Q5_0 — the routed down projection runs q5_0_gemv_sel",
+                ));
             }
             None => {
-                return Err(format!("MoeDims::read: {} not resident", names.ffn_down_exps).into());
+                return Err(GpuError::tensor(
+                    "MoeDims::read",
+                    &names.ffn_down_exps,
+                    "resident",
+                ));
             }
         }
         match w.get(&names.ffn_gate_inp) {
             Some(DevWeight::F32 { .. }) => {}
             _ => {
-                return Err(format!(
-                    "MoeDims::read: {} is not resident as F32 — the router is an f32 gemv",
-                    names.ffn_gate_inp
-                )
-                .into());
+                return Err(GpuError::tensor(
+                    "MoeDims::read",
+                    &names.ffn_gate_inp,
+                    "resident as F32 — the router is an f32 gemv",
+                ));
             }
         }
         let gate_exps = kq_weight(w, &names.ffn_gate_exps)?;
         let down_exps = kq_weight(w, &names.ffn_down_exps)?;
         let shexp_ff = kq_weight(w, &names.ffn_gate_shexp)?.rows();
-        let check = |what: &str, want: usize, got: usize| -> Result<(), GpuError> {
+        let check = |what: &'static str, want: usize, got: usize| -> Result<(), GpuError> {
             if want == got {
                 Ok(())
             } else {
-                Err(format!("MoeDims::read: {what}: {want} != {got}").into())
+                Err(GpuError::shape(
+                    "MoeDims::read",
+                    format!("{what}: {want} != {got}"),
+                ))
             }
         };
         check(
@@ -2758,9 +2857,10 @@ impl LayerScratch {
         moe: Option<&MoeDims>,
         ctx_max: usize,
     ) -> Result<LayerScratch, GpuError> {
-        let first = names
-            .first()
-            .ok_or("LayerScratch::new: the stage holds no layer")?;
+        let first = names.first().ok_or(GpuError::state(
+            "LayerScratch::new",
+            "the stage holds no layer",
+        ))?;
         let hidden = f32_gain(w, &first.attn_norm)?.len();
         let q_rows = kq_weight(w, &first.attn_q)?.rows();
         let kv_width = kq_weight(w, &first.attn_kv_a_mqa)?.rows();
@@ -2773,11 +2873,14 @@ impl LayerScratch {
         let (_, qn2_d) = q8_derived(w, &first.derived)?;
         let (derived, derived_k) = (qn2_d.rows(), qn2_d.cols() * 32);
         let kv_b_rows = kq_weight(w, &first.attn_kv_b)?.rows();
-        let check = |what: &str, want: usize, got: usize| -> Result<(), GpuError> {
+        let check = |what: &'static str, want: usize, got: usize| -> Result<(), GpuError> {
             if want == got {
                 Ok(())
             } else {
-                Err(format!("LayerScratch: {what}: {want} != {got}").into())
+                Err(GpuError::shape(
+                    "LayerScratch",
+                    format!("{what}: {want} != {got}"),
+                ))
             }
         };
         check(
@@ -2802,21 +2905,25 @@ impl LayerScratch {
             mla.n_head * (mla.nope + mla.v_head),
         )?;
         if q_rows % mla.rope_dims != 0 {
-            return Err(format!(
-                "LayerScratch: rope walks 64-value columns from the buffer start; q rows \
+            return Err(GpuError::shape(
+                "LayerScratch",
+                format!(
+                    "rope walks 64-value columns from the buffer start; q rows \
                  {q_rows} are not {}-aligned",
-                mla.rope_dims
-            )
-            .into());
+                    mla.rope_dims
+                ),
+            ));
         }
         let half = mla.n_head / 2;
         if !mla.n_head.is_multiple_of(2) || half > 8 {
-            return Err(format!(
-                "LayerScratch: the half-split m = 8 quantize at the wv_b site needs an even \
+            return Err(GpuError::shape(
+                "LayerScratch",
+                format!(
+                    "the half-split m = 8 quantize at the wv_b site needs an even \
                  n_head <= 16, got {}",
-                mla.n_head
-            )
-            .into());
+                    mla.n_head
+                ),
+            ));
         }
         let (rope, latent, nope, kq_head) = (mla.rope_dims, mla.latent, mla.nope, mla.kq_head);
         let dims = Dims {
@@ -2891,7 +2998,7 @@ impl LayerScratch {
                     let col = (h * kq_head + nope) / rope;
                     (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
                 }),
-                "f_rope_lo",
+                "Gather::new f_rope_lo",
             )?,
             g_f_rope_hi: Gather::new(
                 stream,
@@ -2899,7 +3006,7 @@ impl LayerScratch {
                     let col = (h * kq_head + nope) / rope;
                     (0..rope).map(move |d| (col * rope + d, h * kv_width + d))
                 }),
-                "f_rope_hi",
+                "Gather::new f_rope_hi",
             )?,
             part_v: f32n(crate::flash::partials_v_len(mla.n_head, ctx_max))?,
             part_ms: f32n(crate::flash::partials_ms_len(mla.n_head, ctx_max))?,
@@ -2927,8 +3034,8 @@ pub(crate) fn q8_derived<'a>(
 ) -> Result<(&'a DeviceTensor<u32>, &'a DeviceTensor<f32>), GpuError> {
     match w.get(name) {
         Some(DevWeight::Q8_0Derived { qs, d, .. }) => Ok((qs, d)),
-        Some(_) => Err(format!("q8_derived: {name} is not the derived variant").into()),
-        None => Err(format!("q8_derived: {name} not resident").into()),
+        Some(_) => Err(GpuError::tensor("q8_derived", name, "the derived variant")),
+        None => Err(GpuError::tensor("q8_derived", name, "resident")),
     }
 }
 
@@ -2938,8 +3045,8 @@ pub(crate) fn kq_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DeviceTens
         Some(DevWeight::KQuant { w, .. })
         | Some(DevWeight::Q5_0 { w, .. })
         | Some(DevWeight::Q5_1 { w, .. }) => Ok(w),
-        Some(_) => Err(format!("kq_weight: {name} is not a word-plane variant").into()),
-        None => Err(format!("kq_weight: {name} not resident").into()),
+        Some(_) => Err(GpuError::tensor("kq_weight", name, "a word-plane variant")),
+        None => Err(GpuError::tensor("kq_weight", name, "resident")),
     }
 }
 
@@ -2956,8 +3063,8 @@ pub(crate) fn f32_tensor<'a>(
 ) -> Result<&'a DeviceTensor<f32>, GpuError> {
     match w.get(name) {
         Some(DevWeight::F32 { w, .. }) => Ok(w),
-        Some(_) => Err(format!("f32_tensor: {name} is not F32").into()),
-        None => Err(format!("f32_tensor: {name} not resident").into()),
+        Some(_) => Err(GpuError::tensor("f32_tensor", name, "F32")),
+        None => Err(GpuError::tensor("f32_tensor", name, "resident")),
     }
 }
 
@@ -3009,12 +3116,10 @@ fn enqueue_chain(
     head: &mut Head,
 ) -> Result<(), GpuError> {
     if names.is_empty() || names.len() != kv.len() {
-        return Err(format!(
-            "enqueue_chain: {} layers and {} caches",
-            names.len(),
-            kv.len()
-        )
-        .into());
+        return Err(GpuError::shape(
+            "enqueue_chain",
+            format!("{} layers and {} caches", names.len(), kv.len()),
+        ));
     }
     let stream = gpu.stream();
     let last = names.len() - 1;
@@ -3081,12 +3186,14 @@ fn enqueue_layer(
     }
     enqueue_attn(gpu, step, w, names, kv_l, s, mla, &mut i, obs)?;
     if names.routed {
-        let dims = moe.ok_or_else(|| -> GpuError {
-            format!(
-                "enqueue_layer: layer {} routes but the stage carries no MoE shapes",
-                names.layer
+        let dims = moe.ok_or_else(|| {
+            GpuError::shape(
+                "enqueue_layer",
+                format!(
+                    "layer {} routes but the stage carries no MoE shapes",
+                    names.layer
+                ),
             )
-            .into()
         })?;
         enqueue_ffn_moe(gpu, w, names, s, mla, dims, &mut i, obs)
     } else {
@@ -3633,12 +3740,14 @@ fn enqueue_ffn_dense(
         l_out,
         ..
     } = s;
-    let d = dense.as_mut().ok_or_else(|| -> GpuError {
-        format!(
-            "enqueue_ffn_dense: layer {} is dense but the stage carries no dense arena",
-            names.layer
+    let d = dense.as_mut().ok_or_else(|| {
+        GpuError::shape(
+            "enqueue_ffn_dense",
+            format!(
+                "layer {} is dense but the stage carries no dense arena",
+                names.layer
+            ),
         )
-        .into()
     })?;
     // The dense half has no f32 consumer of the norm: `h` takes the side
     // output and the next launch overwrites it.
@@ -3747,12 +3856,14 @@ fn enqueue_ffn_moe(
             },
         ..
     } = s;
-    let m = moe.as_mut().ok_or_else(|| -> GpuError {
-        format!(
-            "enqueue_ffn_moe: layer {} routes but the stage carries no MoE arena",
-            names.layer
+    let m = moe.as_mut().ok_or_else(|| {
+        GpuError::shape(
+            "enqueue_ffn_moe",
+            format!(
+                "layer {} routes but the stage carries no MoE arena",
+                names.layer
+            ),
         )
-        .into()
     })?;
     // 1. ffn_norm in both forms the half's consumers need, from one launch:
     //    the router eats the f32 normed vector and the experts its q8_1

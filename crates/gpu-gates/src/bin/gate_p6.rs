@@ -411,7 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  r0g: &mut DeviceBuffer<u32>,
                  r0u: &mut DeviceBuffer<u32>,
                  r0d: &mut DeviceBuffer<u32>|
-     -> Result<(), Box<dyn std::error::Error>> {
+     -> Result<(), bloomery_gpu::GpuError> {
         router.enqueue_router_topk(stream, &x_dev, m, scale, probs, ids, w)?;
         router.enqueue_expert_table(stream, ids, rows_gu, rows_dn, r0g, r0u, r0d)?;
         Ok(())

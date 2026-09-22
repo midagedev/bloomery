@@ -31,20 +31,26 @@ fn head_out_w(w: &Weights) -> Result<(&DeviceTensor<u32>, usize), GpuError> {
     match w.get("output.weight") {
         Some(DevWeight::KQuant { ty, w, k }) => {
             if *ty != GgmlType::Q6_K {
-                return Err(format!(
-                    "head_out_w: output.weight is {ty}, want Q6_K (the gemv \
+                return Err(GpuError::shape(
+                    "head_out_w",
+                    format!(
+                        "output.weight is {ty}, want Q6_K (the gemv \
                      this head launches reads Q6_K rows)"
-                )
-                .into());
+                    ),
+                ));
             }
             Ok((w, *k))
         }
-        Some(_) => Err("head_out_w: output.weight is not a K-quant word plane".into()),
-        None => Err(
-            "head_out_w: output.weight not resident — load Weights with \
-             globals"
-                .into(),
-        ),
+        Some(_) => Err(GpuError::tensor(
+            "head_out_w",
+            "output.weight",
+            "a K-quant word plane",
+        )),
+        None => Err(GpuError::tensor(
+            "head_out_w",
+            "output.weight",
+            "resident — load Weights with globals",
+        )),
     }
 }
 
@@ -79,15 +85,17 @@ impl Head {
         let hidden = head_gain(w)?.len();
         let (out_w, k) = head_out_w(w)?;
         if k != hidden {
-            return Err(format!(
-                "Head::new: output.weight rows are {k} values wide, the norm \
+            return Err(GpuError::shape(
+                "Head::new",
+                format!(
+                    "output.weight rows are {k} values wide, the norm \
                  gain is {hidden}"
-            )
-            .into());
+                ),
+            ));
         }
         let n_vocab = out_w.rows();
         if n_vocab == 0 {
-            return Err("Head::new: output.weight has no rows".into());
+            return Err(GpuError::shape("Head::new", "output.weight has no rows"));
         }
         Ok(Head {
             eps,
@@ -161,7 +169,7 @@ impl Head {
     pub fn launch(&self, gpu: &Gpu) -> Result<(), GpuError> {
         self.graph
             .as_ref()
-            .ok_or("Head::launch: no captured graph")?
+            .ok_or(GpuError::state("Head::launch", "no captured graph"))?
             .launch(gpu.stream())
     }
 
@@ -169,12 +177,10 @@ impl Head {
     /// engine stream; never inside a capture.
     pub fn set_input(&mut self, gpu: &Gpu, host: &[f32]) -> Result<(), GpuError> {
         if host.len() != self.hidden {
-            return Err(format!(
-                "Head::set_input: {} values, the head takes {}",
-                host.len(),
-                self.hidden
-            )
-            .into());
+            return Err(GpuError::shape(
+                "Head::set_input",
+                format!("{} values, the head takes {}", host.len(), self.hidden),
+            ));
         }
         self.x.copy_from_host(gpu.stream(), host)?;
         Ok(())
