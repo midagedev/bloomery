@@ -649,7 +649,7 @@ pub fn q_nope2_absorbed(
         for t in 0..q.ne1 {
             let qbase = t * q.ne0 + h * p.kq_head;
             let qrow = &q.data[qbase..qbase + p.nope];
-            qall.extend(qrow.chunks_exact(32).map(quantize_act));
+            qall.extend(qrow.as_chunks::<32>().0.iter().map(|chk| quantize_act(chk)));
         }
     }
     if let Some(t_qa) = t_qa {
@@ -1570,10 +1570,10 @@ pub fn wv_b_heads_with(
     let mut xhs: Vec<Tensor2> = (0..p.n_head)
         .map(|_| Tensor2::scratch(p.latent, n_tokens))
         .collect();
-    for h in 0..p.n_head {
+    for (h, xh) in xhs.iter_mut().enumerate() {
         for t in 0..n_tokens {
             let src = kqv_compressed.col(t * p.n_head + h);
-            xhs[h].col_mut(t).copy_from_slice(src);
+            xh.col_mut(t).copy_from_slice(src);
         }
     }
     let ws: Vec<&TensorInfo> = views.iter().collect();

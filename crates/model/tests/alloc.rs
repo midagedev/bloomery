@@ -38,17 +38,26 @@ fn count(size: usize) {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         count(l.size());
+        // SAFETY: the caller meets `alloc`'s contract for `l` (non-zero size), and
+        // `System` receives `l` unchanged.
         unsafe { System.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         count(l.size());
+        // SAFETY: the caller meets `alloc_zeroed`'s contract for `l` (non-zero size),
+        // and `System` receives `l` unchanged.
         unsafe { System.alloc_zeroed(l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
         count(new_size);
+        // SAFETY: `p` came from this allocator with layout `l` — so from `System`, as every
+        // allocating method forwards there — and the caller meets `realloc`'s contract
+        // for `new_size`; `System` receives all three unchanged.
         unsafe { System.realloc(p, l, new_size) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        // SAFETY: `p` came from this allocator with layout `l`, so from `System`, as every
+        // allocating method forwards there.
         unsafe { System.dealloc(p, l) }
     }
 }

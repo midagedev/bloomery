@@ -23,7 +23,6 @@ pub struct RefTensor {
     pub occurrence: u32,
     pub ty: String,
     pub ne: [i64; 4],
-    pub sum: f64,
     pub op: String,
 }
 
@@ -88,7 +87,6 @@ impl Oracle {
                     f[6].parse().unwrap(),
                     f[7].parse().unwrap(),
                 ],
-                sum: f[9].parse().unwrap(),
                 op: f[10].to_string(),
             };
             by_key.insert((t.name.clone(), t.occurrence), t);

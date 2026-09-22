@@ -29,11 +29,6 @@ mod oracle;
 use model::attn::block_attn_trace;
 use model::{Slot, Tensor2};
 
-fn model_path() -> String {
-    std::env::var("BLOOMERY_MODEL")
-        .unwrap_or_else(|_| "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf".into())
-}
-
 /// Oracle `ne[]` (ggml order) folded to the `Tensor2` pair: rows = ne0, columns = the
 /// product of the rest. q_rope {64,16,6}, q_nope2 {512,6,16} and kqv_compressed
 /// {512,16,6} all land here.
@@ -60,6 +55,13 @@ fn check(o: &oracle::Oracle, got: &Tensor2, name: &str, occ: u32, what: &str, to
     oracle::assert_close(&got.data, &want, tol, what);
 }
 
+/// The bound [`check_confined`] enforces, one field per term of its contract.
+struct Confinement {
+    strict: f32,
+    loose: f32,
+    max_cols: usize,
+}
+
 /// The same check, plus the shape of the deviation — for a tensor whose bound
 /// exists only to admit a tie flip.
 ///
@@ -74,10 +76,13 @@ fn check_confined(
     name: &str,
     occ: u32,
     what: &str,
-    strict: f32,
-    loose: f32,
-    max_cols: usize,
+    bound: Confinement,
 ) {
+    let Confinement {
+        strict,
+        loose,
+        max_cols,
+    } = bound;
     let (want, winf) = o.load(name, occ);
     assert_eq!(
         [got.ne0 as i64, got.ne1 as i64],
@@ -116,7 +121,7 @@ fn check_confined(
 }
 
 fn check_block(o: &oracle::Oracle, n: usize) {
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let tr = run_block(o, &g, n);
 
     // The eight contract tensors, in computation order. Occurrences verified against
@@ -168,9 +173,11 @@ fn check_block(o: &oracle::Oracle, n: usize) {
         &format!("q_nope2-{n}"),
         0,
         &format!("q_nope2-{n} (absorbed)"),
-        1e-4,
-        3e-2,
-        2,
+        Confinement {
+            strict: 1e-4,
+            loose: 3e-2,
+            max_cols: 2,
+        },
     );
     // Softmax damps the same tie-flip spikes; the exact-input companion is
     // bit-exact, so nothing here is attention arithmetic.
@@ -232,7 +239,7 @@ fn hw_attn_exact_input_stages() {
     };
 
     for blk in [0usize, 1usize] {
-        let g = gguf::Gguf::open(model_path()).unwrap();
+        let g = gguf::Gguf::open(oracle::model_path()).unwrap();
         let p = model::attn::MlaParams::read(&g, blk).unwrap();
         let wkb = g.find(&format!("blk.{blk}.attn_kv_b.weight")).unwrap();
         let n_tok = 6usize;
@@ -378,7 +385,7 @@ fn hw_attn_exact_input_stages() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_heads_fused_bit_identical() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(model_path()).unwrap();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let blk = 0usize;
     let p = model::attn::MlaParams::read(&g, blk).unwrap();
     let derived = model::derived::Derived::new(&g).unwrap();

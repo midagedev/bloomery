@@ -492,7 +492,9 @@ fn parse_ik_dot_dump(dump: &str) -> (usize, Vec<u8>, Vec<u32>) {
             (Some(hex), None, None, None) if hex.len() > 64 => {
                 let b = hex.as_bytes();
                 acol.extend(
-                    b.chunks_exact(2)
+                    b.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap()),
                 );
             }
@@ -952,7 +954,7 @@ fn hw_q_nope2_cells_bit_identical() {
     }
 
     // Alternating signs for pair cancellation in maddubs.
-    let alt = |i: usize| if i % 2 == 0 { 127 } else { -127 };
+    let alt = |i: usize| if i.is_multiple_of(2) { 127 } else { -127 };
     let whead: Vec<qdot::Q8Block> = (0..latent * nb)
         .map(|i| qdot::Q8Block {
             d: W_SCALES[i % W_SCALES.len()],

@@ -36,8 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "attn.q4k vs 27 x [2048,2048] Q4_K rows"
     );
     let w_host: Vec<u32> = w_bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     let x_m1 = read_f32(&format!("{data}/x_m1.f32"));
     let x_m8 = read_f32(&format!("{data}/x_m8.f32"));
@@ -334,8 +336,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(feature = "gpu")]
 fn read_f32(path: &str) -> Vec<f32> {
     let b = std::fs::read(path).unwrap();
-    assert!(b.len() % 4 == 0, "odd size for {path}");
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    assert!(b.len().is_multiple_of(4), "odd size for {path}");
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }

@@ -14,7 +14,7 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
         s.wrapping_mul(0x2545F4914F6CDD1D)
     };
     let mut w = vec![0u8; rows * row_bytes];
-    for c in w.chunks_exact_mut(8) {
+    for c in w.as_chunks_mut::<8>().0 {
         c.copy_from_slice(&next().to_le_bytes());
     }
     let col: Vec<f32> = (0..k)

@@ -1545,7 +1545,7 @@ fn dot_q6k_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     (t[0] + t[2]) + (t[1] + t[3])
 }
 
-//// --------------------------------------------------------- Q5_0 x Q8_2_X4
+// --------------------------------------------------------- Q5_0 x Q8_2_X4
 
 /// `HBitDequantizer` constants for unpacking high bits.
 struct Q5HBit {
