@@ -350,6 +350,21 @@ gate-threads:
 gate-qdot:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-qdot --test qdot -- --include-ignored --nocapture'
 
+# B3 engram 게이트: V4.1의 NVMe 테이블에서 매핑으로 읽은 행이 같은 오프셋의 pread와
+# 바이트 동일이고(선행 읽기를 걸어도 같고), 행 간격이 텐서를 정확히 타일링하는가.
+# 정확성 실행이라 임대는 필요 없다 — 속도는 engram-rate가 임대 안에서 잰다.
+gate-engram:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram --test engram -- --ignored --nocapture'
+
+# engram-rate 바이너리. 측정은 tools/ref/engram-rate.sh가 임대 안에서 돌린다 —
+# 이 레시피는 빌드만 한다(러너가 낡은 바이너리를 재는 것을 막는 단계).
+build-engram:
+    ./tools/box.sh 'cargo build --release -p bloomery-engram --bin engram-rate'
+
+# engram 토큰당 비용 표(팔 다섯). 기계 전역 임대를 잡으므로 리드가 조용한 시점에 친다.
+measure-engram *ARGS: build-engram
+    ./tools/box.sh 'bash tools/ref/engram-rate.sh {{ARGS}}'
+
 # 1-4 판정 게이트: 프롬프트 32개의 argmax를 ik와 대조한다. just argmax-ref가 먼저다.
 gate-prompts:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test prompts -- --ignored --nocapture'
