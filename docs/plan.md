@@ -10,6 +10,7 @@
 
 **인계(2026-09-22 저녁, 세션을 rig-log에서 이 레포로 옮기며)**
 - ~~**비행 중**~~ **파동 종료(2026-09-22 밤, 병렬 5트랙, 전부 opus, base `de8e5e7`) — 다섯 전부 ff 머지, main `2d1abc0`, lint 210 → 175, 게이트 빨강 0**: ~~`gatesc2`~~ 머지(`b64b301`): gpu-gates에 남아 있던 손 검사가 `tensor_bytes_as`로 들어가고(`real_x`의 swiglu·synth 셋, `rawx_floor`, `gate_p6`, `lib.rs::f32_tensor`), 패닉 셋이 게이트 자신의 exit 1로 바뀌었다(`exact_ref`의 1-D 뷰, `gate_p4`의 vocab 밖 토큰 id, `generate`의 값 없는 플래그 — FAIL-first 셋 전부 base에서 exit 101 확인). 기계 몫은 R23 `total_cmp`와 R17. 리드 재실행: GPU 게이트 15개 통과, e2e 두 패스 648노드·`forced_exact` 6과 4·σ 0.3641과 0.3518, lint 189 → 175. ~~`gatesd`~~ 머지(`6959482`), ~~`tools6`~~ 머지(`f7e768e`): 셸 16개가 모델·데이터 경로를 `ref-paths.sh`에서 받는다(`box.sh`는 제외 — Mac에서 돌고 아직 안 보낸 트리를 소스할 수 없다). 빈 환경에서 해석값 바이트 동일, 오버라이드 6종에서 바뀐 것은 의도한 `ncu`/`nsys` `OUTDIR` 두 줄뿐, shellcheck 16 → 14, 리드 재실행 `build-ref` rc=0에 참조 덤프 md5 4개 동일. 리드 후속(`3570abd`): 카드 UUID 둘이 `cards.sh` 한 곳으로 — `measure.sh`는 `timing-card.sh`를 소스할 수 없다(그 파일이 `CUDA_VISIBLE_DEVICES`를 타이밍 카드=A6000으로 export한다), 그래서 이름과 정책을 갈랐다. ~~`gpucast`~~ 머지(`2d1abc0`): `crates/gpu` 호스트의 좁히는 캐스트 263곳이 `launch_u32(what, name, v)?`(실패는 진입점과 인자 이름을 든 `Shape` 오류), 상수 15곳은 `X_U32` 쌍 + `const _: () = assert!`, 넷만 지역 형태를 이유와 함께 남겼다. ~~디스패치 경로라 머지 뒤 리드 A/B~~ **A/B는 유도로 대신한다(건너뛴 것이 아니다)**: 변경 클래스가 "의미 보존"이고 그 클래스가 요구하는 증명 — PTX 표 동일(`gate_p5`·`gate_p8` 54행, 리드가 base 표와 `diff`), 호스트 구조 줄 불변(648노드·eager=replay·e2e 집합 동일) — 을 다 갖췄다. 스텝의 호스트 코드 넷(`check_pos`·`refresh_params`·`step_graph.launch`·`Head::token`)이 diff 밖이라 **그래프 모드에서 이 함수들은 스텝당 0회** 돈다(`model.rs`는 `seed_depth`=로드, `dispatch.rs`는 `attn_proj`=캡처 안). eager는 계기이고 스칼라당 compare+branch 하나라 ±1 % 자 아래다. ~~`mechlint`~~ 머지(`9ec6424`): 스텝이 못 닿는 자리의 clippy 잔여 21개(`as_chunks`, `is_multiple_of`, dead code, `Confinement` 구조체 R8, `tests/alloc.rs`의 SAFETY 넷), 핫 패스 6줄은 남겼다. 리드 재실행: CPU 게이트 넷과 `gate-gpu-p0` 값 줄 동일, lint 210 → 189. 그 라운드가 덧붙인 증거: 두 트리의 릴리스 `bloomery-decode`가 함수 1024개 전부 명령 동일(`.text` 631174 B). 파일 경계가 서로 안 겹쳤다. ~~비행 중: 없다.~~ ~~`gatesc`~~ 머지(`c69642b`): 모델 텐서 전제 조건 35곳이 `lib.rs::tensor_bytes_as` 하나로 모였고(assert 패닉 exit 101 → 게이트 자신의 오류 줄 exit 1), `run()` 끝의 `exit(1)` 15곳이 `Err(checks_failed())`로 `exit_with`를 지난다. 게이트 15개 통과 출력 줄 동일(리드 재실행), FAIL-first 둘, lint 211 → 210. 워크트리·박스 디렉터리 회수. ~~워크트리는 `bloomery-a4c`만 남아 있다~~ 회수했다(브랜치 `a4c`는 origin에 있다, 박스 디렉터리도 삭제).
+- **설계(2026-09-22 밤, 사용자 요청 "모델별 구현을 나눌 시점")**: [`docs/arch-split.md`](arch-split.md) — 모델을 아는 호스트 코드 세 층(계획·사슬·탭)은 `arch/<general.architecture>/` 아래로, 커널은 형상만 알고 `crates/gpu`에 그대로, 공유 골격은 `GpuModel<B: ChainBody>` 한 벌, 바이너리는 `AnyEngine` 열거형(토큰 경로에 `dyn` 없음). 크레이트 경계는 **deepseek41 디바이스 코드에만**(cuda-oxide ICE 격리) 세우고, 그것이 되는지는 스파이크 S0가 잰다. 이관 라운드 S0·M1~M4는 「열린 라운드 카드 / M」에, **B1·B2·B4·B5는 M2 뒤에 연다**(같은 파일을 이관이 먼저 지난다). 이 라운드들은 V4.1 코드를 한 줄도 쓰지 않는다.
 - **비행 중(2026-09-22 밤, B 국면 첫 파동, 둘 다 opus, base `bc70d69`)**: `v41ops`(B0a — ik 포트·GGUF 인벤토리·공식 참조로 V4.1 op 목록 → `docs/research/v41-ops.md`, 표와 영어 메모까지; 한국어 산문은 리드가 쓴다) ‖ `engram`(B3 — `crates/engram` 신설: engram 텐서 mmap, 토큰당 48행 조회, `WILLNEED` 선행 읽기, 폴트·지연 계수기, `just gate-engram`은 pread 대조로 바이트 동일. **측정은 리드가 임대 아래서**, 라운드는 러너와 예측까지). 파일 경계는 새 문서 하나와 새 크레이트 하나라 안 겹친다(루트 `Cargo.toml` members는 engram만 만진다).
 - **A 국면의 끝 숫자(2026-09-22 밤, 리드 측정)**: A6000에서 MMA 기본값으로 깊이 표를 다시 쟀다 — 깊이 6/1024/4096에서 229.54 / 222.24 / 199.62 tok/s 대 ik 205.47 / 193.96 / 179.00 = **1.117 / 1.146 / 1.115배**, 키당 기울기 우리 0.160 µs 대 ik 0.176(파생). 깊이 4096의 역전이 사라졌다. 기록 rig-log 09-22-o. 로드맵은 "각 국면의 끝은 숫자 하나이고 그 숫자가 rig-log에 실리기 전에는 다음 국면을 열지 않는다"이므로 **다음은 B(V4.1)**다. ~~열 수 있는 첫 줄: **B0a**(아키 독해 → `docs/research/v41-ops.md`)~~ **정정(같은 밤, `v41ops` 트랙이 잡았다): B0a는 09-21에 이미 끝났다**(`d6532b7`+`fc857f9` → `docs/research/v41-ops.md`, 영문 원문 `v41-ops-report.md`, 세 포트 비교 `v41-ports.md`). 「끝난 라운드 카드」의 B0a 줄이 **완료**라고 적고 있는데 리드가 그 줄을 grep으로만 보고 열린 카드로 읽었다 — 표 잘못이 아니라 읽기 잘못이다. 지금 도는 `v41ops` 트랙은 그 요약이 안 가진 것을 만든다: **op 한 줄 = ik V4.1 포트의 노드 + 실제 GGUF 텐서 이름·형상 + 우리 커널이 일반화되는지**(→ `docs/research/v41-op-map.md`). 그와 파일 경계가 안 겹치는 것이 **B1**(배치 로더, `gpu/weights.rs`)과 **B3**(engram 신규 크레이트, 비행 중). B0b는 `e63caf3`으로 머지돼 있다. **B0c**(오라클 v3 덤프)는 RAM 250 GB와 두 카드를 쓰는 긴 박스 작업이라 착수 전에 사용자 승인이 먼저다. A5(프리필)는 로드맵대로 재기만 하고 B의 배치 결정 뒤에 손댄다.
 - **오늘 닫힌 것**: errsrc — 참값 대비 추가 오차의 원인은 활성 128값 블록(시뮬 41 → 32값 25, σ 0.378 → 0.255 = ik 수준). 사용자 결정으로 **기본값은 128 유지, 32값은 `exact_ref --act ik` 시뮬로만**(「모델 / 성능이 먼저, 정확도는 선택」). σ는 `gate-gpu-e2e`의 진단 줄이 됐다(핀 아님, 엔진 0.3518). fnsplit 머지 완료.
@@ -305,6 +306,12 @@ flowchart LR
     A3m --> A5[A5 프리필 GEMM<br/>gemm.rs]
     A3m --> Asp[A6 스텝 파라미터 1버퍼<br/>+ rope 오프셋]
   end
+  subgraph M[M. 모델 축 이관 — docs/arch-split.md]
+    S0[S0 스파이크: 크레이트 밖<br/>디바이스 코드] --> M2
+    M1[M1 model arch/deepseek2] --> M2[M2 gpu GpuModel&lt;B&gt;<br/>arch/deepseek2]
+    M4[M4 도구 프로필<br/>BLOOMERY_MODEL] --> M3
+    M2 --> M3[M3 게이트·바이너리<br/>oracle 표, AnyEngine]
+  end
   subgraph B[B. V4.1]
     B0a[B0a agy: 아키 op 목록] --> B4[B4 V4.1 op 커널 ×N]
     B0b[B0b GGUF 인벤토리 도구] --> B1[B1 expert 단위 배치 로더]
@@ -327,6 +334,9 @@ flowchart LR
     C3 --> C5[C5 교체]
     C4 --> C5
   end
+  M2 --> B1
+  M2 --> B2
+  M2 --> B4
 ```
 
 ### 열린 라운드 카드
@@ -350,7 +360,22 @@ flowchart LR
 | A5 | 프리필: m>1 활성값 다리 + IMMA GEMM 커널(m 16~512) | 새 `gpu/gemm.rs`, 새 `gate_gemm.rs`; 조립은 별도 라운드 | GLM(커널) → GLM(조립, model.rs) | 커널 밴드 + 프리필 tok/s | A3m; 커널 부분은 A2와 병렬 가능 | L |
 | A6 | 스텝 파라미터 1버퍼(pos/n_keys/token/cs를 구조체 하나, 비동기 카피) + `enqueue_rope` src/dst 오프셋(f_rope gather 2개·kvr gather 제거) | `gpu/elem.rs`, `gpu/flash.rs`, `gpu/model.rs` | GLM | gate_p8 동일 탭, 노드 26→~22, 스텝 µs(리드) | A1c; model.rs가 비는 창(A2 전 또는 A3 후) | M |
 
+#### M — 모델 축 이관(2026-09-22 밤 신설, 설계는 `docs/arch-split.md`)
+
+전부 **이동 클래스**다: 증명은 `ptx-scan` 표 동일·648노드·eager = replay·e2e 집합 동일·게이트 초록·lint 불상승이고 시간은 재지 않는다.
+파동 {S0 ‖ M1 ‖ M4} → {M2} → {M3}. 라운드마다 축 하나(R21).
+
+| id | 라운드 | 파일 경계 | 백엔드 | 게이트 | 앞 | 크기 |
+|---|---|---|---|---|---|---|
+| S0 | 스파이크: 새 크레이트의 `#[cuda_module]`이 `bloomery_gpu::cores::q3k_row_dot`을 부른다 — `cargo oxide` 빌드 여부, PTX 동일(`ptx-scan`), `.oxart` 둘이 한 바이너리에 링크, 빌드 시간 차(전·후 3회) | 새 `crates/gpu-xcrate-spike`(미머지), `cores.rs` 가시성 한 줄 | opus | 세 질문의 답 + 시간 표; 실패면 `nvlabs-ledger.md` 한 줄 먼저 | — | S |
+| M1 | `crates/model` arch 이관: `attn`·`derived`·`forward` → `arch/deepseek2/`, `kv.rs`는 슬롯 표·`KvRows`만, `Arch::detect`, `MlaParams::read`의 f32 리터럴 넷 → `gguf::arch_get_f32` | `crates/model/src/**`, `gguf/lib.rs` getter 하나, `gpu`·`gpu-gates`는 `use` 줄만 | opus | CPU 게이트 레시피 전부 동일, `gate-derived` 바이트 동일, `gate-alloc` 수 동일, lint 불상승 | — | S~M |
+| M2 | `crates/gpu` arch 이관: `GpuModel<B: ChainBody>`·`Residency<B>`, `model/*` → `arch/deepseek2/*`, `mla`·`moe` 필드는 `Body` 안, `Head` eps는 `head_eps()` | `gpu/model.rs`, `gpu/model/**` → `gpu/arch/deepseek2/**`, `lib.rs` `mod` 줄 | opus | `ptx-scan` 54행 동일, 648노드, eager = replay, e2e 두 패스 집합 동일, GPU 게이트 15개, lint 불상승 | M1, S0 | M — `model.rs` 라운드: 한 시점에 하나 |
+| M3 | 게이트·바이너리: `gpu-gates/src/oracle/deepseek2.rs`(디렉터리·매니페스트·탭 표), `DEFAULT_MODEL` → 도구 프로필, `generate`·`gate_e2e`·`bloomery-decode`가 `AnyEngine` 위에서, 모르는 아키텍처는 오류 한 줄 exit 1 | `gpu-gates/src/**`, `model/src/bin/bloomery-decode.rs` | opus | 게이트 15개 출력 줄 동일; FAIL-first: V4.1 파일을 `generate`에 준 지금의 죽는 모양 기록 → `unsupported architecture "deepseek41"` 한 줄 | M2, M4 | S |
+| M4 | 도구 프로필: `tools/ref/models/deepseek2.sh`, `ref-paths.sh`가 `BLOOMERY_MODEL`(기본 deepseek2)로 소스, 증인 블록에 모델 이름, `tools/check-arch.sh` + `just check-arch` | `tools/ref/**`, `tools/check-arch.sh`, `justfile` 한 줄 | opus | 빈 환경 해석값 바이트 동일(tools6의 방법), `build-ref` md5 동일, shellcheck 불상승 | — | S |
+
 #### B — V4.1
+
+**2026-09-22 밤: B1·B2·B4·B5는 M2 뒤에 연다** — 넷이 지나는 `gpu/model.rs`·`gpu/weights.rs`·`dispatch.rs`·`model/derived.rs`를 이관이 먼저 지난다(`docs/arch-split.md`). B0c·B3은 그 파일을 안 만지므로 순서가 바뀌지 않는다.
 
 | id | 라운드 | 파일 경계 | 백엔드 | 게이트 | 앞 | 크기 |
 |---|---|---|---|---|---|---|
