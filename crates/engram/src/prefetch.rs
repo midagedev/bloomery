@@ -12,6 +12,10 @@
 //! `unsafe`. [`Prefetcher::submit`] gives the helper the next token's ids and
 //! one free buffer; [`Prefetcher::wait`] takes the filled one back.
 //!
+//! A token may ask for fewer rows of a site than the prefetcher was sized for —
+//! a cache in front of it hands over only its misses — and a token that asks
+//! for none never reaches the helper: its `wait` returns at once.
+//!
 //! Steady state allocates nothing: the id vectors travel with the buffers and
 //! are refilled in place, and the buffers are written once at construction so
 //! that the first token's faults are the table's and not the allocator's.
@@ -42,6 +46,8 @@ struct Job {
     ids: Vec<Vec<u32>>,
     /// Sites' rows concatenated in site order.
     buf: Box<[u8]>,
+    /// The bytes of `buf` this token's rows fill; zero once a fill failed.
+    len: usize,
 }
 
 struct Filled {
@@ -65,6 +71,15 @@ pub struct HelperTimes {
     pub minor_faults: u64,
 }
 
+/// What the next [`Prefetcher::wait`] takes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InFlight {
+    /// A job on the helper.
+    Helper,
+    /// A token with no rows: nothing was sent.
+    Empty,
+}
+
 /// A helper thread reading one token ahead for its owner.
 pub struct Prefetcher {
     /// `None` only inside `drop`, which closes the channel to end the helper.
@@ -74,31 +89,37 @@ pub struct Prefetcher {
     spare: Vec<Job>,
     /// The token `wait` last took back; what `filled` lends out.
     current: Option<Job>,
+    /// The token submitted and not yet waited for, if any.
+    in_flight: Option<InFlight>,
+    /// Per site: the most rows one token may ask, and one row's bytes.
+    max_rows: Vec<usize>,
+    row_bytes: Vec<usize>,
     last: HelperTimes,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Prefetcher {
-    /// Start a helper for `engram`, sized for `rows_per_site[s]` rows of site
-    /// `s` per token.
+    /// Start a helper for `engram`, sized for at most `max_rows_per_site[s]`
+    /// rows of site `s` per token.
     ///
-    /// `rows_per_site` must name every site. The helper holds an [`Arc`] of the
-    /// table, so the mappings outlive it.
+    /// `max_rows_per_site` must name every site. The helper holds an [`Arc`] of
+    /// the table, so the mappings outlive it.
     pub fn new(
         engram: Arc<Engram>,
-        rows_per_site: &[usize],
+        max_rows_per_site: &[usize],
         mode: FillMode,
     ) -> Result<Prefetcher, EngramError> {
         let sites = engram.sites();
-        if rows_per_site.len() != sites.len() {
+        if max_rows_per_site.len() != sites.len() {
             return Err(EngramError::Prefetch(
-                "rows_per_site must have one entry per site",
+                "max_rows_per_site must have one entry per site",
             ));
         }
-        let buf_len: usize = sites
+        let row_bytes: Vec<usize> = sites.iter().map(|s| s.row_bytes() as usize).collect();
+        let buf_len: usize = max_rows_per_site
             .iter()
-            .zip(rows_per_site)
-            .map(|(s, n)| n * s.row_bytes() as usize)
+            .zip(&row_bytes)
+            .map(|(n, rb)| n * rb)
             .sum();
 
         // Written, not just allocated: `vec![0u8; n]` is lazily zero-mapped, and
@@ -106,11 +127,12 @@ impl Prefetcher {
         // and land in the token counts this module exists to separate.
         let spare: Vec<Job> = (0..2)
             .map(|_| Job {
-                ids: rows_per_site
+                ids: max_rows_per_site
                     .iter()
                     .map(|&n| Vec::with_capacity(n))
                     .collect(),
                 buf: vec![0xA5u8; buf_len].into_boxed_slice(),
+                len: 0,
             })
             .collect();
 
@@ -125,6 +147,9 @@ impl Prefetcher {
             done: done_rx,
             spare,
             current: None,
+            in_flight: None,
+            max_rows: max_rows_per_site.to_vec(),
+            row_bytes,
             last: HelperTimes::default(),
             handle: Some(handle),
         })
@@ -133,26 +158,51 @@ impl Prefetcher {
     /// Hand the helper one token's row ids and let it run.
     ///
     /// Returns as soon as the ids are copied into a free buffer — this is the
-    /// step thread's whole share of the read. There must be a free buffer: two
-    /// submits in a row without a [`Prefetcher::wait`] between them is a caller
-    /// bug, not a runtime condition.
+    /// step thread's whole share of the read. Each site may ask for any number
+    /// of rows up to the prefetcher's size for it, and a token that asks for
+    /// none is not sent at all. Two submits in a row without a
+    /// [`Prefetcher::wait`] between them is a caller bug, not a runtime
+    /// condition.
     pub fn submit(&mut self, token_ids: &[Vec<u32>]) -> Result<(), EngramError> {
+        if self.in_flight.is_some() {
+            return Err(EngramError::Prefetch(
+                "a token is already in flight; wait() first",
+            ));
+        }
+        if token_ids.len() != self.max_rows.len() {
+            return Err(EngramError::Prefetch("token has a different site count"));
+        }
+        // Checked before any copy: past its capacity an id vector would
+        // reallocate, and the buffer would be too short for the rows.
+        if token_ids
+            .iter()
+            .zip(&self.max_rows)
+            .any(|(ids, &max)| ids.len() > max)
+        {
+            return Err(EngramError::Prefetch(
+                "token asks more rows of a site than the prefetcher was sized for",
+            ));
+        }
+        if token_ids.iter().all(Vec::is_empty) {
+            self.in_flight = Some(InFlight::Empty);
+            return Ok(());
+        }
         let Some(mut job) = self.spare.pop() else {
             return Err(EngramError::Prefetch("no free buffer; wait() first"));
         };
-        if job.ids.len() != token_ids.len() {
-            self.spare.push(job);
-            return Err(EngramError::Prefetch("token has a different site count"));
-        }
-        for (dst, src) in job.ids.iter_mut().zip(token_ids) {
+        job.len = 0;
+        for ((dst, src), rb) in job.ids.iter_mut().zip(token_ids).zip(&self.row_bytes) {
             dst.clear();
             dst.extend_from_slice(src);
+            job.len += src.len() * rb;
         }
         let Some(tx) = self.jobs.as_ref() else {
             return Err(EngramError::Prefetch("helper is shutting down"));
         };
         tx.send(job)
-            .map_err(|_| EngramError::Prefetch("helper thread exited"))
+            .map_err(|_| EngramError::Prefetch("helper thread exited"))?;
+        self.in_flight = Some(InFlight::Helper);
+        Ok(())
     }
 
     /// Block until the helper has finished the token submitted before this one,
@@ -162,7 +212,26 @@ impl Prefetcher {
     /// at [`Prefetcher::last`]. Split from `filled` on purpose: the caller
     /// submits the next token while still holding these bytes, which a `wait`
     /// that returned the slice would forbid.
+    ///
+    /// A token that asked for no rows returns at once with nothing filled; the
+    /// helper's times for it are zero and its fault counts carry over. A
+    /// `wait` with nothing submitted is an error rather than a wait forever.
     pub fn wait(&mut self) -> Result<(), EngramError> {
+        let Some(kind) = self.in_flight.take() else {
+            return Err(EngramError::Prefetch("nothing in flight; submit() first"));
+        };
+        if kind == InFlight::Empty {
+            if let Some(done) = self.current.take() {
+                self.spare.push(done);
+            }
+            self.last = HelperTimes {
+                submit_ns: 0,
+                fill_ns: 0,
+                copy_ns: 0,
+                ..self.last
+            };
+            return Ok(());
+        }
         let filled = self
             .done
             .recv()
@@ -171,7 +240,11 @@ impl Prefetcher {
         if let Some(done) = self.current.take() {
             self.spare.push(done);
         }
-        self.current = Some(filled.job);
+        let mut job = filled.job;
+        if filled.err.is_some() {
+            job.len = 0;
+        }
+        self.current = Some(job);
         match filled.err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -180,9 +253,10 @@ impl Prefetcher {
 
     /// The rows of the token [`Prefetcher::wait`] last took back: every site's
     /// rows concatenated in site order, `ids.len() * row_bytes()` per site.
-    /// Empty before the first `wait`.
+    /// Empty before the first `wait`, after a token that asked for no rows, and
+    /// after a fill that failed.
     pub fn filled(&self) -> &[u8] {
-        self.current.as_ref().map_or(&[], |j| &j.buf)
+        self.current.as_ref().map_or(&[], |j| &j.buf[..j.len])
     }
 
     /// What the helper spent on that token.

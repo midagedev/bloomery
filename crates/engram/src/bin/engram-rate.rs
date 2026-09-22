@@ -1,6 +1,6 @@
 //! engram-rate — what one token's 48 engram rows cost, arm by arm.
 //!
-//! Eight arms over the same rows, so the differences are the levers and not the
+//! Nine arms over the same rows, so the differences are the levers and not the
 //! draw:
 //!
 //! | arm | what it asks |
@@ -13,6 +13,7 @@
 //! | `helper-touch` | a helper thread advises and copies; the copy takes the faults |
 //! | `helper-populate` | the same, with `MADV_POPULATE_READ` between the advise and the copy |
 //! | `helper-pipelined` | the engine's shape: submit t+1 as soon as t is taken back |
+//! | `helper-cached` | a DRAM LRU in front of the helper: the step thread copies the hits, only the misses go to the helper |
 //!
 //! Three counters decide whether an arm's label is true, and they are printed
 //! for every arm. Major faults alone cannot: `MADV_WILLNEED` puts the folio in
@@ -46,6 +47,21 @@
 //! `helper-pipelined`; at its default of 0 the arm has the shape the spec names
 //! and measures the handoff alone.
 //!
+//! The rows are [`SeededRows`] by default: uniform over the table, the
+//! zero-reuse floor. `--ids <file>` replaces them for every arm with the real
+//! hash over the first `--tokens` ids of a real stream (one sequence from a
+//! fresh context, as `engram-reuse` reads it), and it is the only plan the
+//! cached arm runs on — a cache over uniform draws would miss everything.
+//! `helper-cached` runs only when `--arms` names it.
+//!
+//! Expected shape of the cached arm. The cache starts empty and the rows cold,
+//! so the helper's rows per token are that window's own misses — what
+//! `engram-reuse --limit N` prints for the same stream at the same budget —
+//! and a token with none makes no round trip at all. The step thread's window
+//! gains the lookup and the hit copies, and keeps the submit, the wait and the
+//! completion that lands the misses; the helper's split is printed over the
+//! tokens that went to it (`trips`), in the columns of the other helper arms.
+//!
 //! **This binary does not take the machine lease.** `tools/ref/engram-rate.sh`
 //! does, and sets `BLOOMERY_ENGRAM_LEASE=1`; without it every line is stamped
 //! `[not under lease]` and is not admissible as a measurement.
@@ -55,11 +71,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use engram::cache::{RowCache, capacity_rows};
 use engram::prefetch::{FillMode, Prefetcher};
-use engram::{Engram, Faults, SeededRows, Site, faults, faults_thread, read_bytes};
+use engram::reuse::read_ids;
+use engram::{Context, Engram, Faults, Hash, SeededRows, Site, faults, faults_thread, read_bytes};
 
 const DEFAULT_DIR: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8";
-const ARMS: [&str; 8] = [
+/// The arm that needs a real stream; it runs only when `--arms` names it.
+const CACHED: &str = "helper-cached";
+const ARMS: [&str; 9] = [
     "cold-serial",
     "cold-prefetch",
     "cold-pipelined",
@@ -68,6 +88,7 @@ const ARMS: [&str; 8] = [
     "helper-touch",
     "helper-populate",
     "helper-pipelined",
+    CACHED,
 ];
 
 struct Args {
@@ -78,11 +99,13 @@ struct Args {
     arms: Vec<String>,
     cold_reset: bool,
     step_gap_us: u64,
+    ids: Option<String>,
+    cache_gib: f64,
 }
 
 fn usage() -> String {
     format!(
-        "engram-rate [--model-dir DIR] [--rows-per-token N] [--tokens N] [--seed N] [--cold-reset] [--step-gap-us N] [--arms {}]",
+        "engram-rate [--model-dir DIR] [--rows-per-token N] [--tokens N] [--seed N] [--cold-reset] [--step-gap-us N] [--ids FILE] [--cache-gib G] [--arms {}]",
         ARMS.join(",")
     )
 }
@@ -93,10 +116,17 @@ fn parse() -> Result<Args, String> {
         rows_per_token: 48,
         tokens: 2000,
         seed: 7,
-        arms: ARMS.iter().map(|s| s.to_string()).collect(),
+        arms: ARMS
+            .iter()
+            .filter(|&&s| s != CACHED)
+            .map(|s| s.to_string())
+            .collect(),
         cold_reset: false,
         step_gap_us: 0,
+        ids: None,
+        cache_gib: 4.0,
     };
+    let mut rows_per_token_given = false;
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -118,6 +148,11 @@ fn parse() -> Result<Args, String> {
                 a.rows_per_token = value
                     .parse()
                     .map_err(|e| format!("--rows-per-token: {e}"))?;
+                rows_per_token_given = true;
+            }
+            "--ids" => a.ids = Some(value.clone()),
+            "--cache-gib" => {
+                a.cache_gib = value.parse().map_err(|e| format!("--cache-gib: {e}"))?;
             }
             "--tokens" => a.tokens = value.parse().map_err(|e| format!("--tokens: {e}"))?,
             "--seed" => a.seed = value.parse().map_err(|e| format!("--seed: {e}"))?,
@@ -136,6 +171,17 @@ fn parse() -> Result<Args, String> {
     }
     if a.rows_per_token == 0 || a.tokens == 0 {
         return Err("--rows-per-token and --tokens must be positive".into());
+    }
+    if a.ids.is_some() && rows_per_token_given {
+        return Err("--ids takes the rows per token from the hash; drop --rows-per-token".into());
+    }
+    if a.arms.iter().any(|s| s == CACHED) && a.ids.is_none() {
+        return Err(format!(
+            "{CACHED} needs --ids: a cache over uniform draws misses everything"
+        ));
+    }
+    if !(a.cache_gib.is_finite() && a.cache_gib > 0.0) {
+        return Err("--cache-gib must be a positive number of GiB".into());
     }
     Ok(a)
 }
@@ -160,6 +206,25 @@ fn plan(sites: &[Site], rows_per_token: usize, tokens: usize, seed: u64) -> Vec<
                 .collect()
         })
         .collect()
+}
+
+/// Every token's row ids from the real hash over a real stream, laid out as
+/// [`plan`] lays them: `ids[t][s]`, one sequence from a fresh context.
+fn plan_from_stream(hash: &Hash, stream: &[u32]) -> Result<Vec<Vec<Vec<u32>>>, String> {
+    let mut ctx = Context::new(hash);
+    let mut plan = Vec::with_capacity(stream.len());
+    for &token in stream {
+        ctx.push(token);
+        let mut sites = Vec::with_capacity(hash.sites());
+        for site in 0..hash.sites() {
+            let mut ids = vec![0u32; hash.n_cols()];
+            hash.rows_into(site, ctx.window(), &mut ids)
+                .map_err(|e| format!("hash: {e}"))?;
+            sites.push(ids);
+        }
+        plan.push(sites);
+    }
+    Ok(plan)
 }
 
 /// Read every row of one token, touching the first and last byte so a row that
@@ -243,6 +308,21 @@ struct Helper {
     step_faults: Faults,
 }
 
+/// The cached arm's own columns.
+struct Cached {
+    gib: f64,
+    rows: usize,
+    hits: u64,
+    misses: u64,
+    /// Tokens that went to the helper: the ones with at least one miss.
+    trips: usize,
+    /// Per token, on the step thread: the lookup with its hit copies, the wait,
+    /// and the completion that lands the misses.
+    lookup: Vec<u64>,
+    wait: Vec<u64>,
+    complete: Vec<u64>,
+}
+
 struct Arm {
     /// Per-token wall time of the window the caller pays for: the whole token
     /// on the single-threaded arms, the step thread's share on the helper arms.
@@ -253,6 +333,7 @@ struct Arm {
     read_bytes: u64,
     setup_s: f64,
     helper: Option<Helper>,
+    cached: Option<Cached>,
 }
 
 /// Put the rows where this arm's label says they are.
@@ -329,6 +410,7 @@ fn run_arm(name: &str, sites: &[Site], plan: &[Vec<Vec<u32>>]) -> Result<Arm, St
         read_bytes: rb1.saturating_sub(rb0),
         setup_s,
         helper: None,
+        cached: None,
     })
 }
 
@@ -456,10 +538,141 @@ fn run_helper_arm(
                 minor: sf1.minor.saturating_sub(sf0.minor),
             },
         }),
+        cached: None,
     })
 }
 
-fn report(name: &str, a: &mut Arm, args: &Args, used_bytes: u64, leased: bool) {
+/// The cache in front of the helper. The step thread looks each token up and
+/// copies its hits out of DRAM itself; only the misses go to the helper, and a
+/// token with none never reaches it. The rows start cold on the drive and the
+/// cache starts empty, so the arm's tokens are a cold window of the stream.
+///
+/// The step thread's window is all it spends on the read — the lookup with its
+/// hit copies, the submit, the wait, and the completion that lands the misses.
+/// `--step-gap-us` spins between the submit and the wait, outside the window.
+fn run_cached_arm(
+    engram: &Arc<Engram>,
+    plan: &[Vec<Vec<u32>>],
+    cache_gib: f64,
+    cache_rows: usize,
+    step_gap_us: u64,
+) -> Result<Arm, String> {
+    let sites = engram.sites();
+    let t0 = Instant::now();
+    setup(CACHED, sites, plan);
+    let rows_per_site: Vec<usize> = plan[0].iter().map(Vec::len).collect();
+    let stride = sites[0].row_bytes() as usize;
+    assert!(
+        sites.iter().all(|s| s.row_bytes() as usize == stride),
+        "the cache's slab and the checksum fold assume one row stride for every site"
+    );
+    let mut pf = Prefetcher::new(Arc::clone(engram), &rows_per_site, FillMode::Touch)
+        .map_err(|e| format!("prefetcher: {e}"))?;
+    // Built inside the setup time: the slab and the index are written here, so
+    // the step thread's first tokens take no allocator faults.
+    let mut cache =
+        RowCache::new(cache_rows, stride, &rows_per_site).map_err(|e| format!("cache: {e}"))?;
+    let setup_s = t0.elapsed().as_secs_f64();
+
+    let mut out = vec![0xA5u8; cache.token_bytes()];
+    let mut acc = 0u64;
+    let n = plan.len();
+    let (mut total, mut submit) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let (mut lookup, mut wait, mut complete) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    let (mut h_submit, mut h_fill, mut h_copy) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    let (mut hits, mut misses) = (0u64, 0u64);
+    let ns = |from: Instant, to: Instant| to.duration_since(from).as_nanos() as u64;
+
+    let rb0 = read_bytes().map_err(|e| format!("/proc/self/io: {e}"))?;
+    let f0 = faults();
+    let sf0 = faults_thread();
+
+    for token in plan {
+        let start = Instant::now();
+        let got = cache
+            .lookup(token, &mut out)
+            .map_err(|e| format!("lookup: {e}"))?;
+        let looked = Instant::now();
+        pf.submit(cache.miss_ids())
+            .map_err(|e| format!("submit: {e}"))?;
+        let submitted = Instant::now();
+        spin_us(step_gap_us);
+        let resumed = Instant::now();
+        pf.wait().map_err(|e| format!("wait: {e}"))?;
+        let waited = Instant::now();
+        cache
+            .complete(pf.filled(), &mut out)
+            .map_err(|e| format!("complete: {e}"))?;
+        let done = Instant::now();
+
+        total.push(ns(start, submitted) + ns(resumed, done));
+        lookup.push(ns(start, looked));
+        submit.push(ns(looked, submitted));
+        wait.push(ns(resumed, waited));
+        complete.push(ns(waited, done));
+        hits += got.hits as u64;
+        misses += got.misses as u64;
+        if got.misses > 0 {
+            let times = pf.last();
+            h_submit.push(times.submit_ns);
+            h_fill.push(times.fill_ns);
+            h_copy.push(times.copy_ns);
+        }
+        fold_buffer(&out, stride, &mut acc);
+    }
+
+    let sf1 = faults_thread();
+    let f1 = faults();
+    let rb1 = read_bytes().map_err(|e| format!("/proc/self/io: {e}"))?;
+    // Cumulative on the helper, and carried over the tokens that skipped it.
+    let helper_faults = Faults {
+        major: pf.last().major_faults,
+        minor: pf.last().minor_faults,
+    };
+    println!("# {CACHED} checksum {acc:#018x}");
+
+    let trips = h_submit.len();
+    Ok(Arm {
+        total,
+        submit,
+        faults: Faults {
+            major: f1.major.saturating_sub(f0.major),
+            minor: f1.minor.saturating_sub(f0.minor),
+        },
+        read_bytes: rb1.saturating_sub(rb0),
+        setup_s,
+        helper: Some(Helper {
+            submit: h_submit,
+            fill: h_fill,
+            copy: h_copy,
+            faults: helper_faults,
+            step_faults: Faults {
+                major: sf1.major.saturating_sub(sf0.major),
+                minor: sf1.minor.saturating_sub(sf0.minor),
+            },
+        }),
+        cached: Some(Cached {
+            gib: cache_gib,
+            rows: cache.capacity(),
+            hits,
+            misses,
+            trips,
+            lookup,
+            wait,
+            complete,
+        }),
+    })
+}
+
+fn report(name: &str, a: &mut Arm, args: &Args, source: &str, used_bytes: u64, leased: bool) {
     a.total.sort_unstable();
     a.submit.sort_unstable();
     let n = a.total.len() as f64;
@@ -473,14 +686,13 @@ fn report(name: &str, a: &mut Arm, args: &Args, used_bytes: u64, leased: bool) {
     };
     let submit_p50 = p50_us(&a.submit);
     print!(
-        "arm={name} tokens={} rows/token={} seed={} \
+        "arm={name} tokens={} rows/token={} {source} \
          p50_us={:.1} p99_us={:.1} submit_p50_us={submit_p50} \
          majflt/tok={majflt:.2} minflt/tok={:.2} \
          read_bytes/tok={read_per_token:.0} used_bytes/tok={used_bytes} amp={:.1}x \
          us_per_majflt={us_per_majflt} setup_s={:.2}",
         args.tokens,
         args.rows_per_token,
-        args.seed,
         pct(&a.total, 0.5) as f64 / 1000.0,
         pct(&a.total, 0.99) as f64 / 1000.0,
         a.faults.minor as f64 / n,
@@ -508,11 +720,30 @@ fn report(name: &str, a: &mut Arm, args: &Args, used_bytes: u64, leased: bool) {
             h.faults.minor as f64 / n,
         );
     }
+    if let Some(c) = a.cached.as_mut() {
+        c.lookup.sort_unstable();
+        c.wait.sort_unstable();
+        c.complete.sort_unstable();
+        // The helper columns above are over `trips` tokens on this arm: the
+        // ones that had a miss to send.
+        print!(
+            " cache_gib={} cache_rows={} hits/tok={:.2} misses/tok={:.2} trips={} \
+             step_lookup_p50_us={} step_wait_p50_us={} step_complete_p50_us={}",
+            c.gib,
+            c.rows,
+            c.hits as f64 / n,
+            c.misses as f64 / n,
+            c.trips,
+            p50_us(&c.lookup),
+            p50_us(&c.wait),
+            p50_us(&c.complete),
+        );
+    }
     println!("{}", if leased { "" } else { "  [not under lease]" });
 }
 
 fn main() -> ExitCode {
-    let args = match parse() {
+    let mut args = match parse() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -539,16 +770,6 @@ fn main() -> ExitCode {
             s.rows() * s.row_bytes()
         );
     }
-    let used_bytes: u64 = {
-        let per_site = args.rows_per_token / sites.len();
-        let extra = args.rows_per_token % sites.len();
-        sites
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (per_site as u64 + u64::from(i < extra)) * s.row_bytes())
-            .sum()
-    };
-
     // A from-scratch reset: drop the whole table from the page cache, not just
     // the rows this run plans to read. Off by default because it evicts the
     // table for every process on the box, and because the per-arm eviction is
@@ -567,15 +788,60 @@ fn main() -> ExitCode {
         );
     }
 
-    let plan = plan(sites, args.rows_per_token, args.tokens, args.seed);
+    let (plan, source) = match &args.ids {
+        None => (
+            plan(sites, args.rows_per_token, args.tokens, args.seed),
+            format!("seed={}", args.seed),
+        ),
+        Some(path) => {
+            let stream = match read_ids(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("engram-rate: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let Some(window) = stream.get(..args.tokens) else {
+                eprintln!(
+                    "engram-rate: {path} has {} tokens, --tokens asks {}",
+                    stream.len(),
+                    args.tokens
+                );
+                return ExitCode::FAILURE;
+            };
+            match plan_from_stream(engram.hash(), window) {
+                Ok(p) => (p, format!("ids={path}")),
+                Err(e) => {
+                    eprintln!("engram-rate: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    // The plan's own shape: `--rows-per-token` shared out over the sites, or
+    // the hash's rows with `--ids`.
+    args.rows_per_token = plan[0].iter().map(Vec::len).sum();
+    let used_bytes: u64 = plan[0]
+        .iter()
+        .zip(sites)
+        .map(|(ids, s)| ids.len() as u64 * s.row_bytes())
+        .sum();
+    let cache_rows = usize::try_from(capacity_rows(
+        (args.cache_gib * (1u64 << 30) as f64) as u64,
+        sites[0].row_bytes(),
+    ))
+    .expect("a cache budget in rows fits usize on the hosts this runs on");
+
     for name in &args.arms {
-        let arm = if name.starts_with("helper") {
+        let arm = if name == CACHED {
+            run_cached_arm(&engram, &plan, args.cache_gib, cache_rows, args.step_gap_us)
+        } else if name.starts_with("helper") {
             run_helper_arm(name, &engram, &plan, args.step_gap_us)
         } else {
             run_arm(name, sites, &plan)
         };
         match arm {
-            Ok(mut arm) => report(name, &mut arm, &args, used_bytes, leased),
+            Ok(mut arm) => report(name, &mut arm, &args, &source, used_bytes, leased),
             Err(e) => {
                 eprintln!("engram-rate: arm {name}: {e}");
                 return ExitCode::FAILURE;

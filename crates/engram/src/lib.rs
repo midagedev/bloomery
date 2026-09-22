@@ -5,7 +5,9 @@
 //! [`hash`] module's, built from the GGUF metadata's own constants; the two meet
 //! at [`Site::rows_into`], whose only input is a slice of row ids.
 //! [`SeededRows`] stands in for the hash when the point is the access pattern
-//! alone — a uniform draw is the zero-reuse floor.
+//! alone — a uniform draw is the zero-reuse floor. A real stream re-asks for
+//! rows, and [`cache::RowCache`] keeps them in DRAM so that only its misses
+//! reach the disk; [`reuse::Lru`] is the simulator its hits are held to.
 //!
 //! The tables are the `engram_embd` weights of the blocks the metadata names
 //! (blk.1 and blk.14 in V4.1-Flash): Q8_0 tensors of 256 values per row —
@@ -42,8 +44,10 @@ use std::path::{Path, PathBuf};
 use gguf::{Inventory, LoadError, RawTensorInfo, inventory_of};
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 
+pub mod cache;
 pub mod hash;
 pub mod prefetch;
+pub mod reuse;
 
 pub use hash::{Context, Hash};
 
@@ -136,6 +140,22 @@ pub enum EngramError {
     RowOutOfRange { name: String, id: u32, rows: u64 },
     #[error("prefetcher: {0}")]
     Prefetch(&'static str),
+    #[error("row cache: {0}")]
+    Cache(&'static str),
+    #[error("reuse simulator: {0}")]
+    Reuse(&'static str),
+    #[error("{path}: {source}")]
+    IdsFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path}:{line}: '{text}': {source}")]
+    TokenId {
+        path: PathBuf,
+        line: usize,
+        text: String,
+        source: std::num::ParseIntError,
+    },
 }
 
 /// A byte count as `posix_fadvise` takes it. The mapping is far under

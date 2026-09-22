@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # bloomery — engram 토큰당 비용 러너(B3). 박스에서 tools/box.sh 경유로 돈다.
-# 인자는 engram-rate에 그대로 넘어간다(--tokens, --rows-per-token, --seed, --arms, --model-dir).
+# 인자는 engram-rate에 그대로 넘어간다(--tokens, --rows-per-token, --seed, --arms, --model-dir,
+# --cold-reset, --step-gap-us, --ids, --cache-gib). 목록의 정본은 `engram-rate --help`다.
 #
 # 이 측정이 재는 것은 NVMe다. 그래서 증인이 CPU 러너와 다르다: loadavg가 아니라
 # 드라이브 자체의 점유를 적는다. /sys/block/<dev>/stat의 읽기 I/O 수와 섹터 수를
