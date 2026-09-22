@@ -101,7 +101,13 @@ which made every gate exit 0 whether it passed, failed or timed out; it was
 caught in review the same evening, and a 13-gate rerun found no red hidden in
 that window. The exit code now has one owner, `tools/gate.sh`, and
 `just check-recipes` fails on a test recipe that carries `||` or a bare
-`cargo test`.)
+`cargo test`.) GPU gate binaries have the same bound through their own
+runner, `tools/gpu-gate.sh`: it takes `/root/bloomery-gate.lock`, runs the
+binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`), and
+returns the binary's exit code (124/137 timed out, 75 lock contention).
+The lock serializes every 3090 gate of every track, so one hung GPU gate
+used to stall all of them; `just check-recipes` now fails on a recipe that
+takes that lock itself.
 
 ## Derive first, measure the gap (2026-09-22)
 
@@ -195,6 +201,7 @@ first suspect is a hung gate on the box, not the agent.
     tools/ref/             C++ harnesses linking ggml: ground truth and baseline
     tools/box.sh           the only way code reaches the workstation
     tools/gate.sh          the gate runner: 900 s bound, cargo's own exit code
+    tools/gpu-gate.sh      the GPU gate runner: gate lock, 900 s bound, the binary's exit code
     docs/plan.md           stages, gates, and the machine facts they rest on
     docs/research/         sourced surveys behind the conventions here
 

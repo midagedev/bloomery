@@ -17,4 +17,12 @@ if [ -n "$raw" ]; then
   echo "$raw" >&2
   exit 1
 fi
+# GPU 게이트 락의 소유자는 tools/gpu-gate.sh 하나다. 레시피가 락을 직접 잡으면 그 줄의 바이너리는 상한 없이 돈다
+# — 매달린 GPU 게이트 하나가 락을 쥐면 그 락을 기다리는 트랙이 전부 선다.
+lock=$(grep -nE '^[^#]*bloomery-gate\.lock' "$JF" || true)
+if [ -n "$lock" ]; then
+  echo "check-recipes: a recipe takes the GPU gate lock itself — run the binary through tools/gpu-gate.sh (lock + bound + exit code):" >&2
+  echo "$lock" >&2
+  exit 1
+fi
 echo "check-recipes: ok"
