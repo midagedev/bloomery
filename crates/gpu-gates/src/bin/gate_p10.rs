@@ -558,6 +558,16 @@ struct Table<'a> {
     seed: u32,
 }
 
+/// A plain (not `_sel`) gemv's geometry: `rows` weight rows of `k` values
+/// each against `m` activation columns, so `rows * m` outputs.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy)]
+struct GemvGeom {
+    rows: usize,
+    k: usize,
+    m: usize,
+}
+
 /// One kernel-identity row set: per format, the owning kernel on the
 /// resident `DevWeight` vs a gate-style upload of the same tensor under the
 /// same `activations()` input. Returns each row's resident output bits (the
@@ -602,12 +612,7 @@ fn record(
 #[cfg(feature = "gpu")]
 fn kid_kquant_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
     let Table {
-        gguf,
-        gpu,
-        stream,
-        w,
-        seed,
-        ..
+        gguf, stream, w, ..
     } = *t;
     for (label, name) in [
         ("q3k", "blk.1.attn_q.weight"),
@@ -633,7 +638,7 @@ fn kid_kquant_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErro
             .into());
         }
         for m in [1usize, 8] {
-            let kid = kid_kquant(gpu, stream, info.ty, res, &rref, nrows, k, m, seed)?;
+            let kid = kid_kquant(t, info.ty, res, &rref, GemvGeom { rows: nrows, k, m })?;
             record(
                 rows,
                 format!("{label}_m{m}"),
@@ -650,12 +655,7 @@ fn kid_kquant_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErro
 #[cfg(feature = "gpu")]
 fn kid_q5_1_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
     let Table {
-        gguf,
-        q5,
-        stream,
-        w,
-        seed,
-        ..
+        gguf, stream, w, ..
     } = *t;
     let (info, bytes) = tensor_bytes_as(gguf, "blk.0.ffn_down.weight", GgmlType::Q5_1, None)?;
     let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
@@ -669,7 +669,7 @@ fn kid_q5_1_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError>
         return Err("run_table: blk.0.ffn_down is not Q5_1".into());
     };
     for m in [1usize, 8] {
-        let kid = kid_q5_1(q5, stream, res, &rref, nrows, k, m, seed)?;
+        let kid = kid_q5_1(t, res, &rref, GemvGeom { rows: nrows, k, m })?;
         record(
             rows,
             format!("q5_1_m{m}"),
@@ -716,7 +716,7 @@ fn kid_q5_0_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErr
     let mut act = Q8Blocks32::new(stream, k, SEL.len())?;
     q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
     let sel_dev = DeviceBuffer::from_host(stream, &SEL)?;
-    let kid = kid_q5_0_sel(q5, stream, res, &rref, &act, &sel_dev, rpe)?;
+    let kid = kid_q5_0_sel(t, res, &rref, &act, &sel_dev, rpe)?;
     record(
         rows,
         "q5_0_sel".into(),
@@ -766,7 +766,7 @@ fn kid_q3k_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErro
     gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
     stream.synchronize()?;
     let sel_dev = DeviceBuffer::from_host(stream, &SEL)?;
-    let kid = kid_q3k_sel(gpu, stream, res, &rref, &act, &sel_dev, rpe)?;
+    let kid = kid_q3k_sel(t, res, &rref, &act, &sel_dev, rpe)?;
     record(
         rows,
         "q3k_sel".into(),
@@ -780,12 +780,7 @@ fn kid_q3k_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErro
 #[cfg(feature = "gpu")]
 fn kid_f32_router_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
     let Table {
-        gguf,
-        q8f32,
-        stream,
-        w,
-        seed,
-        ..
+        gguf, stream, w, ..
     } = *t;
     let (info, bytes) = tensor_bytes_as(gguf, "blk.1.ffn_gate_inp.weight", GgmlType::F32, None)?;
     let (k, nrows) = (info.dims[0] as usize, tensor_rows(&info.dims));
@@ -801,7 +796,7 @@ fn kid_f32_router_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), Gate
         return Err("run_table: blk.1.ffn_gate_inp is not F32".into());
     };
     for m in [1usize, 8] {
-        let kid = kid_f32(q8f32, stream, res, &rref, nrows, k, m, seed)?;
+        let kid = kid_f32(t, res, &rref, GemvGeom { rows: nrows, k, m })?;
         record(
             rows,
             format!("f32_router_m{m}"),
@@ -820,12 +815,7 @@ fn kid_f32_router_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), Gate
 #[cfg(feature = "gpu")]
 fn kid_q8_derived_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateError> {
     let Table {
-        q8f32,
-        stream,
-        w,
-        derived,
-        seed,
-        ..
+        stream, w, derived, ..
     } = *t;
     let DevWeight::Q8_0Derived { qs: rqs, d: rd, .. } = w
         .get(&bloomery_gpu::weights::derived_name(1))
@@ -839,7 +829,14 @@ fn kid_q8_derived_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), Gate
     let rqs_ref = DeviceTensor::upload(stream, &qs, nrows, k / 4)?;
     let rd_ref = DeviceTensor::upload(stream, &d, nrows, k / 32)?;
     for m in [1usize, 8] {
-        let kid = kid_q8_derived(q8f32, stream, rqs, rd, &rqs_ref, &rd_ref, nrows, k, m, seed)?;
+        let kid = kid_q8_derived(
+            t,
+            rqs,
+            rd,
+            &rqs_ref,
+            &rd_ref,
+            GemvGeom { rows: nrows, k, m },
+        )?;
         record(
             rows,
             format!("q8_0_derived_m{m}"),
@@ -854,21 +851,17 @@ fn kid_q8_derived_rows(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), Gate
 /// quantized activation: (resident vs reference, resident rerun, resident
 /// output bits).
 #[cfg(feature = "gpu")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
-)]
 fn kid_kquant(
-    gpu: &Gpu,
-    stream: &CudaStream,
+    t: &Table<'_>,
     ty: GgmlType,
     res: &DeviceTensor<u32>,
     rref: &DeviceTensor<u32>,
-    nrows: usize,
-    k: usize,
-    m: usize,
-    seed: u32,
+    geom: GemvGeom,
 ) -> Result<(bool, bool, Vec<u32>), GateError> {
+    let Table {
+        gpu, stream, seed, ..
+    } = *t;
+    let GemvGeom { rows, k, m } = geom;
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_kquant: resident {}x{} vs reference {}x{}",
@@ -896,11 +889,11 @@ fn kid_kquant(
                 }),
             }
         };
-    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
     let y1v = y1.to_host_vec(stream)?;
-    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(rref, &mut y2)?;
     stream.synchronize()?;
     let y2v = y2.to_host_vec(stream)?;
@@ -917,20 +910,16 @@ fn kid_kquant(
 /// One Q5_1 gemv shape on two uploads, one shared quantized activation:
 /// returns as `kid_kquant`.
 #[cfg(feature = "gpu")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
-)]
 fn kid_q5_1(
-    q5: &Q5Kernels,
-    stream: &CudaStream,
+    t: &Table<'_>,
     res: &DeviceTensor<u32>,
     rref: &DeviceTensor<u32>,
-    nrows: usize,
-    k: usize,
-    m: usize,
-    seed: u32,
+    geom: GemvGeom,
 ) -> Result<(bool, bool, Vec<u32>), GateError> {
+    let Table {
+        q5, stream, seed, ..
+    } = *t;
+    let GemvGeom { rows, k, m } = geom;
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_q5_1: resident {}x{} vs reference {}x{}",
@@ -948,13 +937,13 @@ fn kid_q5_1(
     stream.synchronize()?;
     let run =
         |w: &DeviceTensor<u32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {
-            q5.enqueue_gemv_q5_1(stream, w, &act, 0, nrows, 0, m, y, 0)
+            q5.enqueue_gemv_q5_1(stream, w, &act, 0, rows, 0, m, y, 0)
         };
-    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
     let y1v = y1.to_host_vec(stream)?;
-    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(rref, &mut y2)?;
     stream.synchronize()?;
     let y2v = y2.to_host_vec(stream)?;
@@ -971,19 +960,15 @@ fn kid_q5_1(
 /// One Q5_0 `_sel` launch on two uploads of the expert stack: six slots
 /// read six quantized columns and select rows of the stack by `sel`.
 #[cfg(feature = "gpu")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
-)]
 fn kid_q5_0_sel(
-    q5: &Q5Kernels,
-    stream: &CudaStream,
+    t: &Table<'_>,
     res: &DeviceTensor<u32>,
     rref: &DeviceTensor<u32>,
     act: &Q8Blocks32,
     sel: &DeviceBuffer<u32>,
     rpe: usize,
 ) -> Result<(bool, bool, Vec<u32>), GateError> {
+    let Table { q5, stream, .. } = *t;
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_q5_0_sel: resident {}x{} vs reference {}x{}",
@@ -1019,19 +1004,15 @@ fn kid_q5_0_sel(
 /// One Q3_K `_sel` launch on two uploads of the expert stack (m = 1: every
 /// slot shares the one quantized column).
 #[cfg(feature = "gpu")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
-)]
 fn kid_q3k_sel(
-    gpu: &Gpu,
-    stream: &CudaStream,
+    t: &Table<'_>,
     res: &DeviceTensor<u32>,
     rref: &DeviceTensor<u32>,
     act: &Q8Act,
     sel: &DeviceBuffer<u32>,
     rpe: usize,
 ) -> Result<(bool, bool, Vec<u32>), GateError> {
+    let Table { gpu, stream, .. } = *t;
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_q3k_sel: resident {}x{} vs reference {}x{}",
@@ -1066,20 +1047,19 @@ fn kid_q3k_sel(
 
 /// One F32 gemv shape on two uploads: returns as `kid_kquant`.
 #[cfg(feature = "gpu")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
-)]
 fn kid_f32(
-    q8f32: &bloomery_gpu::q8f32::Q8F32Kernels,
-    stream: &CudaStream,
+    t: &Table<'_>,
     res: &DeviceTensor<f32>,
     rref: &DeviceTensor<f32>,
-    nrows: usize,
-    k: usize,
-    m: usize,
-    seed: u32,
+    geom: GemvGeom,
 ) -> Result<(bool, bool, Vec<u32>), GateError> {
+    let Table {
+        q8f32,
+        stream,
+        seed,
+        ..
+    } = *t;
+    let GemvGeom { rows, k, m } = geom;
     if res.rows() != rref.rows() || res.cols() != rref.cols() {
         return Err(format!(
             "kid_f32: resident {}x{} vs reference {}x{}",
@@ -1096,11 +1076,11 @@ fn kid_f32(
         |w: &DeviceTensor<f32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {
             q8f32.enqueue_f32_gemv(stream, w, &x_dev, m, y)
         };
-    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(res, &mut y1)?;
     stream.synchronize()?;
     let y1v = y1.to_host_vec(stream)?;
-    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(rref, &mut y2)?;
     stream.synchronize()?;
     let y2v = y2.to_host_vec(stream)?;
@@ -1117,22 +1097,21 @@ fn kid_f32(
 /// One Q8_0 gemv shape on two uploads of the two planes: returns as
 /// `kid_kquant`.
 #[cfg(feature = "gpu")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a gate-local kernel-identity helper threading one weight's geometry and buffers; folding them into a params struct is R8's axis"
-)]
 fn kid_q8_derived(
-    q8f32: &bloomery_gpu::q8f32::Q8F32Kernels,
-    stream: &CudaStream,
+    t: &Table<'_>,
     rqs: &DeviceTensor<u32>,
     rd: &DeviceTensor<f32>,
     qs_ref: &DeviceTensor<u32>,
     d_ref: &DeviceTensor<f32>,
-    nrows: usize,
-    k: usize,
-    m: usize,
-    seed: u32,
+    geom: GemvGeom,
 ) -> Result<(bool, bool, Vec<u32>), GateError> {
+    let Table {
+        q8f32,
+        stream,
+        seed,
+        ..
+    } = *t;
+    let GemvGeom { rows, k, m } = geom;
     if rqs.rows() != qs_ref.rows()
         || rqs.cols() != qs_ref.cols()
         || rd.rows() != d_ref.rows()
@@ -1159,11 +1138,11 @@ fn kid_q8_derived(
      -> Result<(), bloomery_gpu::GpuError> {
         q8f32.enqueue_q8_0_gemv(stream, qs, d, &x_dev, m, y)
     };
-    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y1 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(rqs, rd, &mut y1)?;
     stream.synchronize()?;
     let y1v = y1.to_host_vec(stream)?;
-    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, nrows * m)?;
+    let mut y2 = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
     run(qs_ref, d_ref, &mut y2)?;
     stream.synchronize()?;
     let y2v = y2.to_host_vec(stream)?;
