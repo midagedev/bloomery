@@ -208,15 +208,15 @@ pub(crate) const MMA_SEG_KEYS: usize = 64;
 
 /// Whether the split launch's segment pass is the tensor-core
 /// [`flash_kernels::flash_latent_mma`] rather than the per-head
-/// [`flash_kernels::flash_latent_seg`]. `BLOOMERY_FLASH_MMA=1` picks it, `0`
-/// (the default) the other. Read once, at first use: the value fixes a
+/// [`flash_kernels::flash_latent_seg`]. `BLOOMERY_FLASH_MMA=1` (the default)
+/// picks it, `0` the scalar pass. Read once, at first use: the value fixes a
 /// captured graph's grid and the segment size under it, so it must not
 /// change between capture and replay. A value that is set but unusable
 /// panics rather than falling back.
 pub fn flash_mma() -> bool {
     static MMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *MMA.get_or_init(|| match std::env::var("BLOOMERY_FLASH_MMA") {
-        Err(_) => false,
+        Err(_) => true,
         Ok(v) if v == "1" => true,
         Ok(v) if v == "0" => false,
         Ok(v) => panic!("BLOOMERY_FLASH_MMA={v} is neither `1` nor `0`"),

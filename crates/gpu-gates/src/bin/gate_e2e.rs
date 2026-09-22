@@ -134,7 +134,7 @@ const EXACT_FILE: &str = "exact-forced-32.tsv";
 /// PIN(2026-09-22): teacher-forced positions at
 /// which our argmax leaves the model's EXACT top1 (`exact-forced-32.tsv`)
 /// while the exact margin there is at least `MARGIN_FLOOR`. Derivation: the
-/// scalar segment pass (default levers) was measured on this set against
+/// scalar segment pass (`BLOOMERY_FLASH_MMA=0`) was measured on this set against
 /// the truth and left it at 41 of 1056 positions, 4 of them at or above the
 /// floor — 8/2 (exact margin 1.368), 18/31 (0.682), 21/24 (0.527), and
 /// 29/27 (1.382, where we pick ik's token and ik is the one that is wrong);
@@ -157,6 +157,11 @@ const EXACT_FILE: &str = "exact-forced-32.tsv";
 /// errsrc closed the recalibration: the cause is the 128-value activation
 /// block, which stays the default (performance first); 32-value blocks live
 /// only in `exact_ref --act ik`. The value stands.
+/// PIN(2026-09-22): the tensor-core pass, the default from this date, leaves
+/// the truth at 6 clear positions (8/2, 12/23, 23/14, 23/20, 26/17, 29/27):
+/// on the pin, with no headroom. It was not re-derived for that pass — its
+/// sigma is 0.3641 to the scalar's 0.3518, and per position it sits no
+/// farther from `exact_ref --act ours` than the scalar pass does.
 #[cfg(feature = "gpu")]
 const FORCED_PIN: usize = 6;
 

@@ -306,14 +306,16 @@ fn run() -> Result<(), GateError> {
         probe.split_moe_quant
     );
     println!(
-        "load resident_bytes={} ctx={ctx} layers={} mode={}",
+        "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} seg_keys={}",
         model.resident_bytes(),
         model.stages()[0].layers().len(),
         if mode == StepMode::Graph {
             "graph"
         } else {
             "eager"
-        }
+        },
+        bloomery_gpu::flash::flash_mma(),
+        bloomery_gpu::flash::seg_keys(),
     );
     if mode == StepMode::Graph {
         // Capture before the prompt so the node count prints once and the

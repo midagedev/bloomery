@@ -329,5 +329,8 @@ them; MUL-11 converts them to `#[cfg(feature)]` so the on-side also compiles.
 Runtime levers: `BLOOMERY_THREADS`, `BLOOMERY_SPIN` (threads),
 `BLOOMERY_PROFILE` (model::profile), `BLOOMERY_FLASH_SIMD=0` (attn, scalar
 rollback), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
-segment, a multiple of 32; an unusable value panics instead of falling back).
+segment, a multiple of 32; an unusable value panics instead of falling back),
+`BLOOMERY_FLASH_MMA=0` (gpu flash: the scalar segment pass instead of the
+tensor-core default; `just gate-gpu-e2e` runs both, and the timing binary
+prints which one it ran on its `load` line).
 Each is read once, at first use.

@@ -76,14 +76,16 @@ gate-gpu-p9:
 
 # 종단 게이트: 27층 + lm_head + argmax 전체 사슬을 ik CUDA greedy(33프롬프트 × 32스텝)와 대조하고,
 # 그래프 재생이 즉시 실행과 토큰 단위로 같은지 본다(정확성 실행, 측정 아님). 이름이 pN이 아닌 이유는
-# gate_e2e.rs 머리글 — P9·P10은 커널 꾸러미로 이미 쓰이고 있다.
+# gate_e2e.rs 머리글 — P9·P10은 커널 꾸러미로 이미 쓰이고 있다. 두 번 돈다: 기본 패스(텐서 코어 flash)와
+# `BLOOMERY_FLASH_MMA=0`(스칼라 패스). 레버가 프로세스 시작 때 한 번 읽히므로 프로세스를 가른다. 스칼라 패스
+# 쪽이 flash 단계 배가 팔(keyaxis)을 돌린다 — 기본 패스에서는 그 팔이 건너뛰어진다. ARGS는 첫 호출에만 간다.
 gate-gpu-e2e *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_e2e {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_e2e {{ARGS}} && BLOOMERY_FLASH_MMA=0 flock -w 1800 /root/bloomery-gate.lock ./target/release/gate_e2e'
 
 # 교사 강제 자의 한 위치(프롬프트 ID, 스텝 S)를 두 팔로 연다: 스칼라 팔이 덤프를 쓰고 MMA 팔이 그것과 대조해
 # 두 팔의 로짓 top-k·ik 토큰 순위·강제 스텝별 마진·층별 탭 상대 거리·라우팅 차이를 찍는다. 예: `just forced-probe 12 23`.
 forced-probe ID STEP *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && flock -w 1800 /root/bloomery-gate.lock ./target/release/forced_probe --prompt-id {{ID}} --step {{STEP}} --dump target/forced-probe/scalar {{ARGS}} && BLOOMERY_FLASH_MMA=1 flock -w 1800 /root/bloomery-gate.lock ./target/release/forced_probe --prompt-id {{ID}} --step {{STEP}} --dump target/forced-probe/mma --against target/forced-probe/scalar {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && BLOOMERY_FLASH_MMA=0 flock -w 1800 /root/bloomery-gate.lock ./target/release/forced_probe --prompt-id {{ID}} --step {{STEP}} --dump target/forced-probe/scalar {{ARGS}} && BLOOMERY_FLASH_MMA=1 flock -w 1800 /root/bloomery-gate.lock ./target/release/forced_probe --prompt-id {{ID}} --step {{STEP}} --dump target/forced-probe/mma --against target/forced-probe/scalar {{ARGS}}'
 
 # 양자화 모델의 정확한 수학(가중치는 정확히 역양자화, 활성·어텐션은 f64, q8·f16 반올림 없음)으로 교사 강제 자의
 # 한 프롬프트를 푼다: 스텝마다 정확 top1·마진·ik 토큰 격차. 두 엔진(우리, ik)이 갈리는 자리의 심판이다.
@@ -134,7 +136,7 @@ build-exact-forced:
 # exact_ref가 세 팔을 CPU 임대 아래 차례로 덤프하고(프롬프트당 팔 하나 약 1.5분), forced_probe가 그 셋과 대조한다.
 # 덤프와 exact_ref 로그는 박스 target/exact-taps/ID-STEP/. 예: `just exact-taps 12 23`.
 exact-taps ID STEP:
-    ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin exact_ref && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && D=target/exact-taps/{{ID}}-{{STEP}} && mkdir -p $D && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act f64 --dump $D/f64 > $D/f64.log && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ours --dump $D/ours > $D/ours.log && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ik --dump $D/ik > $D/ik.log && grep -H "top5" $D/f64.log $D/ours.log $D/ik.log && flock -w 1800 /root/bloomery-gate.lock ./target/release/forced_probe --prompt-id {{ID}} --step {{STEP}} --dump $D/scalar --against $D/f64,$D/ours,$D/ik'
+    ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin exact_ref && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && D=target/exact-taps/{{ID}}-{{STEP}} && mkdir -p $D && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act f64 --dump $D/f64 > $D/f64.log && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ours --dump $D/ours > $D/ours.log && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ik --dump $D/ik > $D/ik.log && grep -H "top5" $D/f64.log $D/ours.log $D/ik.log && BLOOMERY_FLASH_MMA=0 flock -w 1800 /root/bloomery-gate.lock ./target/release/forced_probe --prompt-id {{ID}} --step {{STEP}} --dump $D/scalar --against $D/f64,$D/ours,$D/ik'
 
 # 얇은 끝-끝 디코드 CLI(greedy, 토큰 하나씩, 프리필 커널 없음). `--time` 없이 토큰만 찍는 것은
 # 평범한 실행이고, `--time`은 측정이라 임대가 필요하다 — time-gpu-generate가 그쪽이다.

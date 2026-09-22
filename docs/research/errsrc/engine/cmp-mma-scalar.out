@@ -1,0 +1,44 @@
+positions: engine 1056, common with both sims 1023, truth disagreement between the gate file and the f64 logs 0
+
+scalar - truth       rms 0.3525 bias -0.0210  >2rms 48 (gauss 46.5)  >3rms 19 (gauss 2.8)  >4rms 11 (gauss 0.1)  >5rms 4 (gauss 0.0)
+mma - truth          rms 0.3672 bias -0.0253  >2rms 45 (gauss 46.5)  >3rms 21 (gauss 2.8)  >4rms 6 (gauss 0.1)  >5rms 3 (gauss 0.0)
+sim ours - truth     rms 0.3780 bias -0.0270  >2rms 41 (gauss 46.5)  >3rms 19 (gauss 2.8)  >4rms 11 (gauss 0.1)  >5rms 6 (gauss 0.0)
+scalar - sim ours    rms 0.3317 bias +0.0060  >2rms 55 (gauss 46.5)  >3rms 22 (gauss 2.8)  >4rms 9 (gauss 0.1)  >5rms 5 (gauss 0.0)
+mma - sim ours       rms 0.3098 bias +0.0017  >2rms 55 (gauss 46.5)  >3rms 17 (gauss 2.8)  >4rms 8 (gauss 0.1)  >5rms 4 (gauss 0.0)
+mma - scalar         rms 0.3211 bias -0.0042  >2rms 42 (gauss 46.5)  >3rms 19 (gauss 2.8)  >4rms 11 (gauss 0.1)  >5rms 5 (gauss 0.0)
+
+largest |mma - scalar|  (id/step: d | scalar top1 margin | mma top1 margin | truth top1 margin | sim top1 margin)
+  18/8  d=-2.881 | sc     20 3.729 | mma     20 0.848 | truth     20 3.847 | sim     20 1.588
+  21/28 d=-2.311 | sc   4183 4.470 | mma   4183 2.158 | truth   4183 3.396 | sim   4183 1.588
+   1/3  d=+2.241 | sc     15 8.543 | mma     15 10.784 | truth     15 10.362 | sim     15 10.333
+  29/22 d=+1.758 | sc     13 4.648 | mma     13 6.406 | truth     13 6.421 | sim     13 4.777
+  29/15 d=-1.674 | sc   1094 5.154 | mma   1094 3.480 | truth   1094 3.865 | sim   1094 4.657
+  17/0  d=-1.548 | sc  21715 7.938 | mma  21715 6.390 | truth  21715 7.568 | sim  21715 7.864
+  16/23 d=-1.479 | sc    276 10.532 | mma    276 9.053 | truth    276 9.716 | sim    276 9.411
+   2/26 d=-1.455 | sc     17 7.578 | mma     17 6.123 | truth     17 5.613 | sim     17 7.587
+  26/17 d=-1.363 | sc   2685 1.265 | mma    839 0.097 | truth   2685 1.302 | sim   2685 0.505
+  12/23 d=-1.333 | sc     22 0.394 | mma     16 0.939 | truth     22 1.182 | sim     22 1.844
+  21/16 d=+1.294 | sc     13 11.159 | mma     13 12.453 | truth     13 11.740 | sim     13 10.691
+  23/16 d=+1.253 | sc  38220 6.097 | mma  38220 7.349 | truth  38220 6.192 | sim  38220 6.294
+  29/13 d=+1.143 | sc   1757 5.585 | mma   1757 6.728 | truth   1757 6.148 | sim   1757 7.276
+  23/19 d=+1.132 | sc    254 1.426 | mma    254 2.558 | truth    254 1.218 | sim    254 1.654
+  29/26 d=-1.131 | sc    418 6.810 | mma    418 5.679 | truth    418 5.562 | sim    418 6.006
+
+largest |mma - sim ours|  (with scalar - sim ours at the same position)
+  12/23 d=-2.784 (scalar -1.451) | mma     16 0.939 | truth     22 1.182
+  21/16 d=+1.761 (scalar +0.467) | mma     13 12.453 | truth     13 11.740
+  29/22 d=+1.629 (scalar -0.129) | mma     13 6.406 | truth     13 6.421
+   1/19 d=-1.552 (scalar -0.604) | mma     15 4.260 | truth     15 5.019
+  17/0  d=-1.474 (scalar +0.074) | mma  21715 6.390 | truth  21715 7.568
+   2/26 d=-1.463 (scalar -0.009) | mma     17 6.123 | truth     17 5.613
+  28/25 d=+1.394 (scalar +0.727) | mma    276 1.272 | truth    276 0.167
+  16/10 d=+1.292 (scalar +1.452) | mma   2764 4.644 | truth   2764 4.149
+  32/10 d=-1.215 (scalar -1.254) | mma  29733 5.571 | truth  29733 6.284
+  21/22 d=+1.184 (scalar +0.284) | mma  49911 5.973 | truth  49911 5.272
+
+rms(mma - scalar) by step: 0:0.32 1:0.26 2:0.23 3:0.43 4:0.17 5:0.24 6:0.18 7:0.18 8:0.58 9:0.25 10:0.22 11:0.31 12:0.20 13:0.27 14:0.38 15:0.36 16:0.37 17:0.36 18:0.28 19:0.34 20:0.19 21:0.29 22:0.40 23:0.44 24:0.23 25:0.23 26:0.38 27:0.28 28:0.45 29:0.31 30:0.36
+
+rms(mma - scalar) by prompt: 0:0.16 1:0.50 2:0.35 3:0.12 4:0.20 5:0.21 6:0.17 7:0.15 8:0.26 9:0.23 10:0.42 11:0.20 12:0.38 13:0.13 14:0.22 15:0.23 16:0.46 17:0.37 18:0.61 19:0.25 20:0.21 21:0.55 22:0.26 23:0.40 24:0.12 25:0.14 26:0.34 27:0.25 28:0.36 29:0.66 30:0.23 31:0.13 32:0.20
+
+scalar: clear mismatches 3: 8/2(true m 1.37) 21/24(true m 0.53) 29/27(true m 1.38)
+mma: clear mismatches 6: 8/2(true m 1.37) 12/23(true m 1.18) 23/14(true m 0.84) 23/20(true m 0.74) 26/17(true m 1.30) 29/27(true m 1.38)
