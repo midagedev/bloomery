@@ -25,9 +25,20 @@
 # picks one. The name is the GGUF general.architecture value. What is a property of the machine
 # — BLOOMERY_DATA, and IKBIN's place inside a tree — stays here, shared by every model.
 #
+# Inside a tools/box.sh command the profile is already picked: box.sh resolves BLOOMERY_REF_MODEL
+# under one profile and exports that profile's name as BLOOMERY_REF_MODEL_PROFILE. It is the default
+# here, and a script that picks another profile is refused, because the export would not follow it:
+# the second profile's set name, tokens and lease would be applied to the first profile's file.
+#
 # SC2034: the sourcing script reads these, which shellcheck does not see in this file alone.
 # shellcheck disable=SC2034
-: "${BLOOMERY_MODEL:=deepseek2}"
+: "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"
+if [ -n "${BLOOMERY_REF_MODEL_PROFILE:-}" ] && [ "$BLOOMERY_MODEL" != "$BLOOMERY_REF_MODEL_PROFILE" ]; then
+  echo "ref-paths.sh: this command picks the profile '$BLOOMERY_MODEL', but tools/box.sh resolved" >&2
+  echo "  BLOOMERY_REF_MODEL under '$BLOOMERY_REF_MODEL_PROFILE'; pick it on the Mac side instead:" >&2
+  echo "  BLOOMERY_MODEL=$BLOOMERY_MODEL tools/box.sh '...'" >&2
+  exit 64
+fi
 __ref_paths_profile="${BASH_SOURCE[0]%/*}/models/$BLOOMERY_MODEL.sh"
 if [ ! -f "$__ref_paths_profile" ]; then
   echo "ref-paths.sh: no model profile for BLOOMERY_MODEL='$BLOOMERY_MODEL'" >&2

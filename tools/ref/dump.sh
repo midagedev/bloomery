@@ -22,6 +22,10 @@
 # $BLOOMERY_DATA/ref_cuda/. The CPU set is never touched by that run. The GPU kernels use
 # q8_1 activations like ik's CUDA path, so their band is against this set, not the CPU one.
 #
+# The profile's name is the architecture the dumper expects (--expect-arch): it reads the file's
+# header first and refuses another architecture before paging anything in, because the set name,
+# the tokens and the lease below all come from the profile, not from the file.
+#
 # REF_DUMP_LEASE=1 runs the dump under the machine-wide CPU lease, the one the measure runners
 # take, and brackets it with a witness block: wall time, bytes read from the model's block
 # device, major faults, available memory and page cache before and after. The profile of a
@@ -91,7 +95,7 @@ BUILD=$(git -C "$IK" rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" \
-  "$BIN" -m "$MODEL" --tokens "$TOKENS" -ngl "$NGL" -c "$REF_CTX" -t 32
+  "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" --tokens "$TOKENS" -ngl "$NGL" -c "$REF_CTX" -t 32
 if [ "$LEASE" = 1 ]; then witness post-dump; fi
 
 # The trailer is the dumper's completion proof; without it the staged set is not installed.

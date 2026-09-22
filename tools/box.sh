@@ -37,14 +37,20 @@ case "$CARD" in
 esac
 # The model the gates and GPU binaries open (BLOOMERY_REF_MODEL) is a property of the tool profile:
 # every command runs with it exported from tools/ref/ref-paths.sh, and an unknown profile stops the
-# command with that file's exit 64. A caller's own value wins: one set on this side is carried over,
-# one set inside the command overrides the export. BLOOMERY_MODEL is not carried — the model crate's
-# test harnesses read that name as a model path — and a profile switch inside the command does not
-# move the model the export has already fixed.
+# command with that file's exit 64. The profile is picked on this side — BLOOMERY_MODEL here, or
+# ref-paths.sh's default — and its name goes along as BLOOMERY_REF_MODEL_PROFILE, which the scripts
+# inside take as their profile; one that picks another is refused (ref-paths.sh, exit 64), since
+# the export would not follow it. BLOOMERY_MODEL itself is not exported: the model crate's test
+# harnesses read that name as a model path. A caller's own BLOOMERY_REF_MODEL wins: one set on this
+# side is carried over, one set inside the command overrides the export.
 FWD=
 if [ -n "${BLOOMERY_REF_MODEL:-}" ]; then
   FWD="export BLOOMERY_REF_MODEL=$(printf %q "$BLOOMERY_REF_MODEL") && "
 fi
-PROFILE="__m=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_REF_MODEL=\"\$__m\" && unset __m"
+MODEL_PICK=
+if [ -n "${BLOOMERY_MODEL:-}" ]; then
+  MODEL_PICK="BLOOMERY_MODEL=$(printf %q "$BLOOMERY_MODEL") && "
+fi
+PROFILE="__p=\$(${MODEL_PICK}. tools/ref/ref-paths.sh && printf %s \"\$BLOOMERY_MODEL\") && export BLOOMERY_REF_MODEL_PROFILE=\"\$__p\" && __m=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_REF_MODEL=\"\$__m\" && unset __p __m"
 ssh "$HOST" "source ~/bloomery-env.sh && export BLOOMERY_DATA=$DATA && { $PICK
 } && cd $REMOTE && $FWD$PROFILE && $*"

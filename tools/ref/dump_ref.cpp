@@ -322,8 +322,10 @@ static void report_unhandled(const dump_ctx & d) {
 }
 
 int main(int argc, char ** argv) {
-    // --tokens is ours; everything else is gpt_params. Pull it out before the parser sees it.
+    // --tokens and --expect-arch are ours; everything else is gpt_params. Pull them out
+    // before the parser sees them.
     std::vector<llama_token> tokens;
+    std::string              expect_arch;
     std::vector<char *>      passthrough;
     passthrough.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -332,12 +334,18 @@ int main(int argc, char ** argv) {
             for (char * p = strtok(list, ","); p; p = strtok(nullptr, ",")) {
                 tokens.push_back((llama_token) atoi(p));
             }
+        } else if (strcmp(argv[i], "--expect-arch") == 0 && i + 1 < argc) {
+            expect_arch = argv[++i];
         } else {
             passthrough.push_back(argv[i]);
         }
     }
     if (tokens.empty()) {
         fprintf(stderr, "dump_ref: --tokens <id,id,...> is required; this tool does not tokenize\n");
+        return 2;
+    }
+    if (expect_arch.empty()) {
+        fprintf(stderr, "dump_ref: --expect-arch <general.architecture> is required; a set is one architecture's\n");
         return 2;
     }
 
@@ -365,6 +373,26 @@ int main(int argc, char ** argv) {
                 "          old set. If you want to inspect ik's kernels under a debugger, use\n"
                 "          llama-cli or llama-eval-callback -- not this.\n");
         return 3;
+    }
+
+    // The caller's profile names the set, and it also decides whether the dump runs under the
+    // machine lease. A file of another architecture is refused here, from its header alone,
+    // before the loader pages in a single weight.
+    {
+        gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        gguf_context * g = gguf_init_from_file(params.model.c_str(), gp);
+        if (!g) {
+            fprintf(stderr, "dump_ref: cannot read the GGUF header of %s\n", params.model.c_str());
+            return 2;
+        }
+        const int         k         = gguf_find_key(g, "general.architecture");
+        const std::string file_arch = k >= 0 ? gguf_get_val_str(g, k) : "unknown";
+        gguf_free(g);
+        if (file_arch != expect_arch) {
+            fprintf(stderr, "dump_ref: %s is a %s model and this dump is for %s -- not loading it\n",
+                    params.model.c_str(), file_arch.c_str(), expect_arch.c_str());
+            return 2;
+        }
     }
 
     const char * data_dir = getenv("BLOOMERY_DATA");
