@@ -175,6 +175,11 @@ deepseek41의 `Input`은 토큰과 위치만이 아니다. 다음 토큰의 engr
   ② `blk.N.<name>` 문자열 리터럴과 `deepseek2.`·`deepseek41.` 접두 키는 `arch/`와 `tools/ref/models/` 밖에 없다.
      맨 접두 `"blk."` 하나는 이름이 아니라 GGUF 블록 규약이라 걸리지 않는다(2026-09-23 — 공유 로더의 층 번호 파싱)
   ③ `general.architecture`를 읽는 자리는 `arch/mod.rs` 하나다
+  ④ 공유 파일(`crates/*/src` 가운데 `arch/` 밖)은 아키텍처 모듈 경로(`deepseek2::`·`deepseek41::`)를 쓰지 않는다.
+     모듈을 통째로 들여오는 `use`(`… as x;`, 여러 줄 `use …::{`의 이름 한 줄)도 같다. 예외는 `Arch`를 구체 모델로
+     잇는 디스패치 지점 셋(`Deepseek2Model` 별칭, `bloomery-decode`, 오라클 표의 `for_arch`)과 게이트 하네스의 기본
+     참조 세트 하나(`ref_dir`가 `Arch`를 받기 전까지)이고, 파일과 줄 모양으로 하나씩 허용한다. `gpu-gates/src/bin/`은
+     deepseek2 게이트라 빠진다. 옛 크레이트 루트 경로(`model::attn` 등)는 재수출을 지워 컴파일러가 막는다(2026-09-23, M3c)
 - 커널 파일은 모델 이름을 모른다(결정 6) — ②가 `crates/gpu/src/*.rs`에도 걸린다.
 - 이관 라운드의 증명은 전부 「Derive first」의 **이동 클래스**다: `just ptx-scan` 표 동일(`gate_p5`·`gate_p8` 54행),
   그래프 노드 수 불변(지금 648), eager = replay, e2e 집합 동일(두 패스), CPU 게이트 레시피 전부·GPU 게이트 ~~15개~~ 16개
