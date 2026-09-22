@@ -44,6 +44,7 @@ mkdir -p "$OUTDIR"
 witness() {
   echo "--- witness $1 $(now)"
   witness_card
+  echo "    model: $MODEL_NAME"
 }
 
 # depth-gpu.sh·ncu-gpu.sh와 같은 LCG 수열.

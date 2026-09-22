@@ -14,7 +14,6 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
-IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 # BLOOMERY_AB_ENVS="K=V;K=V K2=V2": 현재 트리의 같은 바이너리를 env만 바꿔 팔로 더 넣는다
 # (바이트가 같은 레버의 A/B — 빌드 둘의 링크 배치 차이가 끼지 않는다).
 IFS=';' read -r -a envs <<< "${BLOOMERY_AB_ENVS:-}"
@@ -33,6 +32,7 @@ witness() {
   echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
   # 임대를 모르는 남의 프로세스는 이 줄에서만 보인다(다른 세션의 llama-server가 A/B를 오염시킨 적 있다).
   echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
+  echo "    model: $MODEL_NAME"
 }
 exec 9>/root/bloomery-cpu.lock
 flock -w 1800 9 || { echo "[lease] timed out" >&2; exit 75; }

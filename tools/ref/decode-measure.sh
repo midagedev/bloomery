@@ -28,6 +28,7 @@ witness() {
   # 스레드 수는 이제 결과를 바꾸는 변수다. 증인 줄에 없으면 다른 날의 행과 비교할 때
   # 무엇이 달랐는지 알 방법이 없다 — 빈 값은 "기본값(물리 코어 수)"을 뜻한다.
   echo "threads: BLOOMERY_THREADS=${BLOOMERY_THREADS:-<default>} spin=${BLOOMERY_SPIN:-<default>}"
+  echo "model: $MODEL_NAME"
   nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
   echo "lock-holder-pid: $$"
   # 임대를 모르는 남의 프로세스는 이 줄에서만 보인다.
@@ -103,7 +104,7 @@ witness post-ik
 # (기본 82.66 / -fmoe 82.22 / -rtr 83.77 / -fmoe -rtr 84.03 / 아래 조합 84.55 tok/s)
 # 가장 빠른 조합을 같은 임대 안에서 한 번 더 잰다 — "넘었다"는 말은 이 행을 상대로만 한다.
 echo
-echo "=== ik_llama.cpp, fastest measured flags (${IK_BEST_FLAGS:=-mla 3 -fa 1 -fmoe 1 -rtr 1}) ==="
+echo "=== ik_llama.cpp, fastest measured flags ($IK_BEST_FLAGS) ==="
 witness pre-ik-best
 # shellcheck disable=SC2086
 CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2 $IK_BEST_FLAGS

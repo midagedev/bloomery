@@ -34,6 +34,11 @@ fmt-check:
 check-recipes:
     ./tools/check-recipes.sh
 
+# 아키텍처 축 점검(맥, grep뿐) — docs/arch-split.md 「검사」. --allow-pending 은 ②·③을 경고로
+# 낮춘다: 이관(M1~M3) 전에는 둘이 실제로 빨강이다. M1 이 머지되면 이 플래그를 뺀다.
+check-arch:
+    bash tools/check-arch.sh --allow-pending
+
 # 주석 규약(AGENTS.md Conventions): 엔진 크레이트 src/ 주석에 이슈 번호·날짜 금지, 예외는 `PIN(날짜):`.
 check-comments:
     ./tools/check-comments.sh
@@ -392,7 +397,7 @@ gate-1-1:
     ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && bash tools/gate.sh -p bloomery-gguf -- --ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-comments fmt-check lint build-gpu build-cpu gate-1-1
+gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1
 
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.

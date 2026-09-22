@@ -12,7 +12,7 @@ BIN=target/release/bloomery-decode
 rm -rf "$OUT"; mkdir -p "$OUT"
 exec 9>/root/bloomery-cpu.lock
 flock -w 1800 9 || { echo "[lease] timed out" >&2; exit 75; }
-grep -v '^#' tools/ref/prompts.tsv | while IFS=$'\t' read -r id _text toks; do
+grep -v '^#' "$REF_PROMPTS" | while IFS=$'\t' read -r id _text toks; do
   [ -n "$toks" ] || continue
   BLOOMERY_EXPERT_LOG="$OUT/$id.experts" "$BIN" -m "$MODEL" --tokens "$toks" -n "$N" > "$OUT/$id.out" 2>&1 \
     || { echo "prompt $id failed" >&2; exit 1; }

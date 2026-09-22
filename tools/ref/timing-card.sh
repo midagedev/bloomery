@@ -44,6 +44,7 @@ witness_card() {
 witness() {
   echo "--- witness $1 $(now)"
   witness_card
+  echo "    model: ${MODEL_NAME:-?}"
 }
 
 guard_other() {

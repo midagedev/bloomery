@@ -37,6 +37,7 @@ witness() {
   echo "compute-apps-3090:"
   nvidia-smi --query-compute-apps=pid,used_memory --format=csv -i "$GPU_UUID"
   echo "loadavg: $(cat /proc/loadavg)"
+  echo "model: $MODEL_NAME"
   echo "pressure-io avg10: $(grep '^some' /proc/pressure/io | head -n 1)"
 }
 

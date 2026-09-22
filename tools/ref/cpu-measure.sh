@@ -21,6 +21,7 @@ witness() {
   echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
   nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
   echo "lock-holder-pid: $$"
+  echo "model: $MODEL_NAME"
 }
 exec 9>"$LOCK"
 echo "[lease] waiting for $LOCK ..."

@@ -37,8 +37,7 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 GEN=${BLOOMERY_REF_GEN:-0}
 BIN="$BLOOMERY_DATA/bin/argmax_ref"
-HERE=$(cd "$(dirname "$0")/../.." && pwd)
-PROMPTS=${BLOOMERY_PROMPTS:-$HERE/tools/ref/prompts.tsv}
+PROMPTS=${BLOOMERY_PROMPTS:-$REF_PROMPTS}
 STEP=()
 case $BACKEND in
   cpu)  NGL=0;  HIDE_CUDA=1; NAME=argmax-ik.tsv ;;
@@ -51,7 +50,7 @@ OUT=${BLOOMERY_ARGMAX_OUT:-$BLOOMERY_DATA/$NAME}
 # One fixed context for every file this script writes. The longest prompt is 56 and GEN is at
 # most 32, so 512 holds both; a GEN-dependent -c made the argmax file and the greedy file two
 # different run conditions, which is not a difference a consumer can reason about.
-CTX=${BLOOMERY_REF_CTX:-512}
+CTX=${BLOOMERY_REF_CTX:-$REF_CTX}
 [ -x "$BIN" ] || { echo "no argmax_ref at $BIN — run: just build-argmax" >&2; exit 2; }
 
 before=$(md5sum "$BLOOMERY_DATA/ref/MANIFEST.tsv" | cut -d' ' -f1)

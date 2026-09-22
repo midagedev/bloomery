@@ -17,7 +17,6 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
 DEPTHS=${BLOOMERY_DEPTHS:-6 1024 4096}
-IK_BEST_FLAGS=${IK_BEST_FLAGS:--mla 3 -fa 1 -fmoe 1 -rtr 1}
 trees=()
 for d in "$@" "$(basename "$PWD")"; do
   b="$HOME/repo/$d/target/release/bloomery-decode"
@@ -27,6 +26,7 @@ done
 witness() {
   echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
   echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
+  echo "    model: $MODEL_NAME"
 }
 # 깊이 d의 프롬프트: BOS(100000) 뒤에 LCG 난수 id [1000, 91000). 값은 시간에 안 걸린다 —
 # 디코드 스텝은 어떤 토큰이든 층마다 전문가 여섯과 캐시된 키 전부를 읽는다.

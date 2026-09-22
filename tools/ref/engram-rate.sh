@@ -36,6 +36,7 @@ witness() {
   echo "blockstat($DEV) read_ios/read_sectors: $(awk '{print $1, $3}' "$STAT")"
   echo "meminfo cached/free kB: $(awk '/^Cached:/{c=$2} /^MemFree:/{f=$2} END{print c, f}' /proc/meminfo)"
   echo "lock-holder-pid: $$"
+  echo "model: $MODEL_NAME"
 }
 
 exec 9>"$LOCK"

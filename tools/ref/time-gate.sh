@@ -29,6 +29,7 @@ assert_fresh_binary "$BIN" || exit $?
 witness() {
   echo "--- witness $1 $(now) ---"
   witness_card
+  echo "    model: $MODEL_NAME"
 }
 exec 9>"$LOCK"
 echo "[lease] waiting for $LOCK ..."

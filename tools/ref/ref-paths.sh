@@ -18,9 +18,22 @@
 # IK and IKBIN each keep their override: IK moves the whole tree (and IKBIN with it), IKBIN
 # alone points at a different llama-bench.
 #
+# What is a property of the model — the model file, the ik tree and flags, the prompt set, the
+# reference context, the oracle directories — lives in models/<architecture>.sh and BLOOMERY_MODEL
+# picks one. The name is the GGUF general.architecture value. What is a property of the machine
+# — BLOOMERY_DATA, and IKBIN's place inside a tree — stays here, shared by every model.
+#
 # SC2034: the sourcing script reads these, which shellcheck does not see in this file alone.
 # shellcheck disable=SC2034
-: "${IK:=/home/user/ik_llama.cpp}"
+: "${BLOOMERY_MODEL:=deepseek2}"
+__ref_paths_profile="${BASH_SOURCE[0]%/*}/models/$BLOOMERY_MODEL.sh"
+if [ ! -f "$__ref_paths_profile" ]; then
+  echo "ref-paths.sh: no model profile for BLOOMERY_MODEL='$BLOOMERY_MODEL'" >&2
+  echo "  expected $__ref_paths_profile" >&2
+  exit 64
+fi
+# shellcheck source=tools/ref/models/deepseek2.sh
+source "$__ref_paths_profile"
+unset __ref_paths_profile
 IKBIN=${IKBIN:-$IK/build/bin/llama-bench}
-MODEL=${BLOOMERY_REF_MODEL:-/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf}
 : "${BLOOMERY_DATA:=/root/bloomery-data}"

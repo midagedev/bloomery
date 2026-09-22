@@ -53,9 +53,6 @@ N=${BLOOMERY_DECODE_N:-96}
 # 안 붙인다 — --ab는 팔마다 untimed 라운드를 이미 돌리고, generate가 둘을 같이 주면 거부한다.
 WARM=${BLOOMERY_GEN_WARM:-}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
-# 3090 기준선(216.6/204.6/189.7)이 쓴 그 조합. CPU 최속 조합에서 -rtr 1만 뺀 것이고 GPU 플래그
-# 스윕은 아직 없다 — "이 플래그에서"의 숫자다.
-IK_GPU_FLAGS=${IK_GPU_FLAGS:--ngl 99 -mla 3 -fa 1 -fmoe 1}
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate}
 ARMS_SPEC=${BLOOMERY_GPU_ARMS:-6:512 ik:0 1024:1120 ik:1024 4096:4192 ik:4096}
 # 카드 핀·증인 줄·옆 카드 판정·바이너리 신선도는 러너 넷이 같은 파일에서 읽는다.
@@ -71,6 +68,7 @@ witness() {
   echo "--- witness $1 $(now)"
   witness_card
   echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
+  echo "    model: $MODEL_NAME"
 }
 
 # 깊이 d의 프롬프트: BOS(100000) 뒤에 LCG 난수 id [1000, 91000). depth-decode.sh와 같은 수열이다.

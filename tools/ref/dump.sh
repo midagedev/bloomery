@@ -26,8 +26,8 @@ set -euo pipefail
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 case $BACKEND in
-  cpu)  SET=ref;      NGL=0;  HIDE_CUDA=1 ;;
-  cuda) SET=ref_cuda; NGL=99; HIDE_CUDA=0 ;;
+  cpu)  SET=$REF_SET_CPU;  NGL=0;  HIDE_CUDA=1 ;;
+  cuda) SET=$REF_SET_CUDA; NGL=99; HIDE_CUDA=0 ;;
   *) echo "dump.sh: BLOOMERY_REF_BACKEND must be cpu or cuda, got '$BACKEND'" >&2; exit 2 ;;
 esac
 # Output-set override: the backend still picks the offload depth and CUDA visibility,
@@ -55,7 +55,7 @@ BUILD=$(git -C "$IK" rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" \
-  "$BIN" -m "$MODEL" --tokens "$TOKENS" -ngl "$NGL" -c 512 -t 32
+  "$BIN" -m "$MODEL" --tokens "$TOKENS" -ngl "$NGL" -c "$REF_CTX" -t 32
 
 # The trailer is the dumper's completion proof; without it the staged set is not installed.
 grep -q '^# complete' "$STAGE/MANIFEST.tsv" || {
