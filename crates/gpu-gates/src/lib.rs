@@ -104,6 +104,28 @@ pub fn activations(k: usize, m: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
+/// Host transcription of the device q8_1 activation quantizer, for `m`
+/// columns of `k` values: per 128-value block, d = amax/127 and q =
+/// round(x/d) clamped to ±127, returned as the reconstructed q·d values. A
+/// K-quant gemv's reference dot runs on these, so the activation
+/// quantization noise it shares with the kernel cancels and [`KERNEL_BAND`]
+/// measures the gemv arithmetic alone.
+pub fn q8_1_dequant(x: &[f32], k: usize, m: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; k * m];
+    for c in 0..m {
+        for b in 0..k / 128 {
+            let blk = &x[c * k + b * 128..c * k + b * 128 + 128];
+            let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            for (i, &v) in blk.iter().enumerate() {
+                let q = (v / d).round().clamp(-127.0, 127.0);
+                out[c * k + b * 128 + i] = q * d;
+            }
+        }
+    }
+    out
+}
+
 /// Bytes of one row of `k` values of type `ty`.
 pub fn row_bytes(ty: GgmlType, k: usize) -> Result<usize, GateError> {
     let blck = ty.blck_size().ok_or("row_bytes: unsupported type")?.max(1) as usize;
