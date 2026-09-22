@@ -9,6 +9,7 @@
 //!
 //! Gate: `crates/model/tests/ffn.rs` against the oracle.
 use crate::ModelError;
+use crate::arch::deepseek2::names;
 use crate::ops::{Tensor2, matmul_q, matmul_q_group};
 use crate::profile;
 use gguf::{Gguf, TensorInfo};
@@ -30,12 +31,12 @@ pub(crate) fn ffn_weights(
     // nothing is read, only found.
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let gate = format!("blk.{block}.ffn_gate.weight");
-    let up = format!("blk.{block}.ffn_up.weight");
-    let down = format!("blk.{block}.ffn_down.weight");
-    let gate_shexp = format!("blk.{block}.ffn_gate_shexp.weight");
-    let up_shexp = format!("blk.{block}.ffn_up_shexp.weight");
-    let down_shexp = format!("blk.{block}.ffn_down_shexp.weight");
+    let gate = names::ffn_gate(block);
+    let up = names::ffn_up(block);
+    let down = names::ffn_down(block);
+    let gate_shexp = names::ffn_gate_shexp(block);
+    let up_shexp = names::ffn_up_shexp(block);
+    let down_shexp = names::ffn_down_shexp(block);
 
     let is_shexp = gguf.find(&gate_shexp).is_some()
         || gguf.find(&up_shexp).is_some()

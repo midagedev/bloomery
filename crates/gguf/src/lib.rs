@@ -308,6 +308,33 @@ impl Gguf {
         self.value(&key).and_then(Value::as_u64)
     }
 
+    /// The full metadata key `<architecture>.<suffix>`, for the callers that
+    /// need to name a key they could not read. The bare suffix when the file
+    /// declares no architecture — every reader of such a file has already failed.
+    pub fn arch_key(&self, suffix: &str) -> String {
+        match self.architecture() {
+            Some(arch) => format!("{arch}.{suffix}"),
+            None => suffix.to_string(),
+        }
+    }
+
+    /// `<architecture>.<suffix>` as f32 — the same prefixing as
+    /// [`Gguf::arch_get_u64`], for the float hyperparameters (rms epsilon, the
+    /// rope scaling factor and log multiplier, the rope base frequency).
+    pub fn arch_get_f32(&self, suffix: &str) -> Option<f32> {
+        let arch = self.architecture()?;
+        let key = format!("{arch}.{suffix}");
+        self.value(&key).and_then(Value::as_f32)
+    }
+
+    /// `<architecture>.<suffix>` as a string — same prefixing again, for the
+    /// keys whose value is an enumeration name (`rope.scaling.type`).
+    pub fn arch_get_str(&self, suffix: &str) -> Option<&str> {
+        let arch = self.architecture()?;
+        let key = format!("{arch}.{suffix}");
+        self.value(&key).and_then(Value::as_str)
+    }
+
     /// Typed getters for the stage-1 hyperparameters (see [`Gguf::arch_get_u64`]).
     pub fn block_count(&self) -> Option<u64> {
         self.arch_get_u64("block_count")

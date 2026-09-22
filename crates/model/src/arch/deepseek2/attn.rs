@@ -21,6 +21,7 @@
 //! Contract: `x` is `[embd, n_tokens]`, `slots.len() == x.ne1`, the batch's own tokens are the
 //! KV entries (prefill); `t` attends to `u` iff `slots[u].seq == slots[t].seq && slots[u].pos <= slots[t].pos`.
 
+use super::names;
 use crate::derived::Derived;
 use crate::kv::{KvCache, KvRows};
 use crate::ops::{matmul_q, matmul_q_batch, matmul_q_group, rms_norm};
@@ -363,40 +364,40 @@ pub struct MlaParams {
 
 impl MlaParams {
     pub fn read(gguf: &Gguf, block: usize) -> Result<MlaParams, ModelError> {
+        // Every metadata key here is prefixed with the file's own
+        // `general.architecture`; the prefix is never a literal.
+        let key = |suffix: &str| gguf.arch_key(suffix);
         let need_u64 = |suffix: &str| -> Result<u64, ModelError> {
             gguf.arch_get_u64(suffix)
-                .ok_or_else(|| ModelError::MissingTensor(format!("metadata deepseek2.{suffix}")))
+                .ok_or_else(|| ModelError::MissingTensor(format!("metadata {}", key(suffix))))
         };
-        let need_f32 = |key: &str| -> Result<f32, ModelError> {
-            gguf.value(key)
-                .and_then(|v| v.as_f32())
-                .ok_or_else(|| ModelError::MissingTensor(format!("metadata {key}")))
+        let need_f32 = |suffix: &str| -> Result<f32, ModelError> {
+            gguf.arch_get_f32(suffix)
+                .ok_or_else(|| ModelError::MissingTensor(format!("metadata {}", key(suffix))))
         };
 
         let n_head = need_u64("attention.head_count")? as usize;
         let kq_head = need_u64("attention.key_length")? as usize;
         let v_head = need_u64("attention.value_length")? as usize;
         let rope_dims = need_u64("rope.dimension_count")? as usize;
-        let eps = need_f32("deepseek2.attention.layer_norm_rms_epsilon")?;
+        let eps = need_f32("attention.layer_norm_rms_epsilon")?;
 
-        let scaling = need_f32("deepseek2.rope.scaling.factor")?;
+        let scaling = need_f32("rope.scaling.factor")?;
         let ctx_orig = need_u64("rope.scaling.original_context_length")? as u32;
-        let log_mul = need_f32("deepseek2.rope.scaling.yarn_log_multiplier")?;
-        match gguf
-            .value("deepseek2.rope.scaling.type")
-            .and_then(|v| v.as_str())
-        {
+        let log_mul = need_f32("rope.scaling.yarn_log_multiplier")?;
+        match gguf.arch_get_str("rope.scaling.type") {
             Some("yarn") => {}
             other => {
                 return Err(ModelError::MissingTensor(format!(
-                    "deepseek2.rope.scaling.type: this MLA path is yarn-only, got {other:?}"
+                    "{}: this MLA path is yarn-only, got {other:?}",
+                    key("rope.scaling.type")
                 )));
             }
         }
-        let freq_base = need_f32("deepseek2.rope.freq_base")?;
+        let freq_base = need_f32("rope.freq_base")?;
 
-        let wkb = find(gguf, &format!("blk.{block}.attn_kv_b.weight"))?;
-        let wa = find(gguf, &format!("blk.{block}.attn_kv_a_mqa.weight"))?;
+        let wkb = find(gguf, &names::attn_kv_b(block))?;
+        let wa = find(gguf, &names::attn_kv_a_mqa(block))?;
         let latent = wkb.dims[0] as usize;
 
         // Derived geometry must close, or the file is not shaped like this MLA

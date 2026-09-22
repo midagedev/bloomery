@@ -29,6 +29,7 @@
 //! afterwards only ever sees `&Derived`. `size_bytes` and the decode binary
 //! print the real size, and the build is one pass, once.
 
+use super::names;
 use crate::ModelError;
 use crate::attn::{MlaParams, Q8Block, quantize_q8_0};
 use crate::head::HeadPlan;
@@ -184,9 +185,10 @@ impl Derived {
             // all: its finds and cross-checks fail here, at load, with the same
             // errors the first step used to return.
             let p = MlaParams::read(gguf, b)?;
+            let kv_b = names::attn_kv_b(b);
             let wkb = gguf
-                .find(&format!("blk.{b}.attn_kv_b.weight"))
-                .ok_or_else(|| ModelError::MissingTensor(format!("blk.{b}.attn_kv_b.weight")))?;
+                .find(&kv_b)
+                .ok_or_else(|| ModelError::MissingTensor(kv_b.clone()))?;
             let find = |name: String| -> Result<TensorInfo, ModelError> {
                 gguf.find(&name)
                     .cloned()
@@ -194,27 +196,25 @@ impl Derived {
             };
             let attn = AttnBlockPlan {
                 params: p.clone(),
-                wq: find(format!("blk.{b}.attn_q.weight"))?,
-                wa: find(format!("blk.{b}.attn_kv_a_mqa.weight"))?,
+                wq: find(names::attn_q(b))?,
+                wa: find(names::attn_kv_a_mqa(b))?,
                 wkb: wkb.clone(),
-                wo: find(format!("blk.{b}.attn_output.weight"))?,
+                wo: find(names::attn_output(b))?,
                 kv_a_norm_gain: f32_tensor(
                     gguf,
-                    gguf.find(&format!("blk.{b}.attn_kv_a_norm.weight"))
-                        .ok_or_else(|| {
-                            ModelError::MissingTensor(format!("blk.{b}.attn_kv_a_norm.weight"))
-                        })?,
+                    gguf.find(&names::attn_kv_a_norm(b))
+                        .ok_or_else(|| ModelError::MissingTensor(names::attn_kv_a_norm(b)))?,
                 )?,
                 v_up_views: crate::attn::v_up_views(wkb, &p)?,
             };
-            let gain = |suffix: &str| -> Result<Vec<f32>, ModelError> {
+            let gain = |name: String| -> Result<Vec<f32>, ModelError> {
                 f32_tensor(
                     gguf,
-                    gguf.find(&format!("blk.{b}.{suffix}"))
-                        .ok_or_else(|| ModelError::MissingTensor(format!("blk.{b}.{suffix}")))?,
+                    gguf.find(&name)
+                        .ok_or_else(|| ModelError::MissingTensor(name.clone()))?,
                 )
             };
-            let routed = gguf.find(&format!("blk.{b}.ffn_gate_inp.weight")).is_some();
+            let routed = gguf.find(&names::ffn_gate_inp(b)).is_some();
             let ffn = if routed {
                 FfnPlan::Moe(crate::moe::moe_block_plan(gguf, b, embd)?)
             } else {
@@ -229,8 +229,8 @@ impl Derived {
             blocks.push(BlockPlan {
                 attn,
                 ffn,
-                attn_gain: gain("attn_norm.weight")?,
-                ffn_gain: gain("ffn_norm.weight")?,
+                attn_gain: gain(names::attn_norm(b))?,
+                ffn_gain: gain(names::ffn_norm(b))?,
                 routed,
             });
         }
@@ -303,7 +303,7 @@ impl Derived {
         self.per_block
             .get(block)
             .and_then(|b| b.as_ref())
-            .ok_or_else(|| ModelError::MissingTensor(format!("blk.{block}.attn_kv_b.weight")))
+            .ok_or_else(|| ModelError::MissingTensor(names::attn_kv_b(block)))
     }
 }
 

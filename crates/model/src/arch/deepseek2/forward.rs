@@ -116,9 +116,7 @@ pub fn embed_with(gguf: &Gguf, w: &TensorInfo, tokens: &[u32]) -> Result<Tensor2
 /// plan reads; the 1e-4 gates on every `attn_norm-N` are the proof that it is
 /// the right one.
 pub(crate) fn rms_eps(gguf: &Gguf) -> f32 {
-    gguf.architecture()
-        .and_then(|a| gguf.value(&format!("{a}.attention.layer_norm_rms_epsilon")))
-        .and_then(gguf::Value::as_f32)
+    gguf.arch_get_f32("attention.layer_norm_rms_epsilon")
         .expect("rms eps must come from the file, never from a literal")
 }
 

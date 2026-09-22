@@ -18,10 +18,8 @@
 //!   3. **MoE dispatch is expert-bucketed.** Per-token dispatch loses from batch 2 upward and
 //!      multiplies a verification pass by k. Bucket → per-bucket matmul → inverse permutation.
 
-pub mod attn;
-pub mod derived;
+pub mod arch;
 pub mod ffn;
-pub mod forward;
 pub mod head;
 pub mod kv;
 pub mod moe;
@@ -29,6 +27,10 @@ pub mod ops;
 pub mod profile;
 
 pub use ops::Tensor2;
+
+/// The model-aware modules keep their old paths: `attn`, `derived` and `forward`
+/// are this architecture's, and every caller names them through the crate root.
+pub use arch::deepseek2::{attn, derived, forward};
 
 /// Which sequence and which position a token occupies. See decision 2 above — this pair is
 /// the KV key, and it exists from the first line so a speculative branch has somewhere to go.
@@ -42,6 +44,8 @@ pub struct Slot {
 pub enum ModelError {
     #[error("tensor {0} is not in the file")]
     MissingTensor(String),
+    #[error("unsupported architecture {0:?}")]
+    UnknownArchitecture(String),
     #[error("{what}: expected [{want_ne0}, {want_ne1}], got [{got_ne0}, {got_ne1}]")]
     Shape {
         what: &'static str,

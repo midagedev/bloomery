@@ -28,6 +28,7 @@ use std::time::Instant;
 use gguf::{Gguf, TensorInfo};
 
 use crate::ModelError;
+use crate::arch::deepseek2::names;
 use crate::ops::{GroupInput, Tensor2, matmul_q, matmul_q_group, matmul_q_group_swiglu};
 use crate::profile;
 
@@ -154,11 +155,7 @@ impl Meta {
                 got_ne1: ff,
             });
         }
-        let scale = gguf
-            .architecture()
-            .and_then(|a| gguf.value(&format!("{a}.expert_weights_scale")))
-            .and_then(|v| v.as_f32())
-            .unwrap_or(1.0);
+        let scale = gguf.arch_get_f32("expert_weights_scale").unwrap_or(1.0);
         Ok(Meta {
             n_expert,
             n_used,
@@ -177,7 +174,7 @@ fn tensor<'a>(gguf: &'a Gguf, name: &str) -> Result<&'a TensorInfo, ModelError> 
 /// over all experts, top-k by (probability desc, id asc).
 pub fn route(gguf: &Gguf, block: usize, x: &Tensor2) -> Result<Buckets, ModelError> {
     let meta = Meta::read(gguf)?;
-    let gate_inp = tensor(gguf, &format!("blk.{block}.ffn_gate_inp.weight"))?;
+    let gate_inp = tensor(gguf, &names::ffn_gate_inp(block))?;
     let (buckets, sel) = route_inner(gguf, gate_inp, x, &meta)?;
     if trace_on() {
         TRACE.with(|t| {
@@ -377,10 +374,10 @@ pub(crate) fn moe_block_plan(
     let n_expert = meta.n_expert;
     let ff = meta.ff;
 
-    let gate_inp = tensor(gguf, &format!("blk.{block}.ffn_gate_inp.weight"))?;
-    let gate_exps = tensor(gguf, &format!("blk.{block}.ffn_gate_exps.weight"))?;
-    let up_exps = tensor(gguf, &format!("blk.{block}.ffn_up_exps.weight"))?;
-    let down_exps = tensor(gguf, &format!("blk.{block}.ffn_down_exps.weight"))?;
+    let gate_inp = tensor(gguf, &names::ffn_gate_inp(block))?;
+    let gate_exps = tensor(gguf, &names::ffn_gate_exps(block))?;
+    let up_exps = tensor(gguf, &names::ffn_up_exps(block))?;
+    let down_exps = tensor(gguf, &names::ffn_down_exps(block))?;
     expect_stack(gate_exps, embd, ff, n_expert)?;
     expect_stack(up_exps, embd, ff, n_expert)?;
     expect_stack(down_exps, ff, embd, n_expert)?;
@@ -393,9 +390,9 @@ pub(crate) fn moe_block_plan(
     let up_views = views(up_exps)?;
     let down_views = views(down_exps)?;
 
-    let shexp_gate = tensor(gguf, &format!("blk.{block}.ffn_gate_shexp.weight"))?;
-    let shexp_up = tensor(gguf, &format!("blk.{block}.ffn_up_shexp.weight"))?;
-    let shexp_down = tensor(gguf, &format!("blk.{block}.ffn_down_shexp.weight"))?;
+    let shexp_gate = tensor(gguf, &names::ffn_gate_shexp(block))?;
+    let shexp_up = tensor(gguf, &names::ffn_up_shexp(block))?;
+    let shexp_down = tensor(gguf, &names::ffn_down_shexp(block))?;
     Ok(MoeBlockPlan {
         block,
         meta,
