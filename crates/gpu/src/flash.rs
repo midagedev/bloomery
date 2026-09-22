@@ -74,6 +74,7 @@
 //! They are instruments; no step ships through one.
 
 use crate::GpuError;
+use crate::launch_u32;
 use crate::q8_1_quant_vals;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -95,6 +96,9 @@ pub use model::attn::f32_to_f16_bits;
 /// thread count: one thread per latent dim. `enqueue_flash_latent` rejects
 /// any other latent width.
 pub(crate) const LATENT: usize = 512;
+/// [`LATENT`] as the `u32` block width a launch takes.
+const LATENT_U32: u32 = LATENT as u32;
+const _: () = assert!(LATENT_U32 as usize == LATENT);
 /// Keys per online-softmax tile — one warp's worth, so a tile's max and
 /// weight sum are single warp butterflies.
 pub(crate) const KEY_TILE: usize = 32;
@@ -130,6 +134,9 @@ pub(crate) const MMA_ROWS: usize = 16;
 pub(crate) const MMA_WARPS: usize = MMA_ROWS;
 /// Threads in an `flash_latent_mma` block.
 pub(crate) const MMA_BLOCK: usize = MMA_WARPS * 32;
+/// [`MMA_BLOCK`] as the `u32` block width a launch takes.
+const MMA_BLOCK_U32: u32 = MMA_BLOCK as u32;
+const _: () = assert!(MMA_BLOCK_U32 as usize == MMA_BLOCK);
 /// Keys one warp's `mma.sync` `n`-tile covers — the instruction's `n`.
 pub(crate) const MMA_NTILE: usize = 8;
 /// Warps that issue the `S = Q·Kᵀ` `mma.sync`. Four of them cover a tile's
@@ -195,6 +202,9 @@ pub(crate) const MMA_DYN_BYTES: usize = (MMA_QWORDS + MMA_KWORDS) * 4;
 /// This is the two sides agreeing: change the geometry and the build stops
 /// here rather than at a launch the driver rejects.
 const _: () = assert!(MMA_DYN_BYTES == 56064);
+/// [`MMA_DYN_BYTES`] as the `u32` dynamic shared-memory size a launch takes.
+const MMA_DYN_BYTES_U32: u32 = MMA_DYN_BYTES as u32;
+const _: () = assert!(MMA_DYN_BYTES_U32 as usize == MMA_DYN_BYTES);
 /// Floats a tile's per-head logits (then weights) take.
 pub(crate) const MMA_TILE: usize = MMA_ROWS * MMA_KEYS;
 /// Keys one segment of the tensor-core pass walks, and so [`seg_keys`]'s
@@ -2532,20 +2542,15 @@ impl FlashKernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_kv_append(LaunchConfig1D::new(
-            (m * width).div_ceil(256) as u32,
-            256,
-            0,
-        ))?;
-        self.module.kv_append(
-            stream,
-            &prep,
-            m as u32,
-            width as u32,
-            pos,
-            src,
-            cache.buf_mut(),
-        )?;
+        let what = "enqueue_kv_append";
+        let grid = launch_u32(what, "grid", (m * width).div_ceil(256))?;
+        let m = launch_u32(what, "m", m)?;
+        let width = launch_u32(what, "width", width)?;
+        let prep = self
+            .module
+            .prepare_kv_append(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module
+            .kv_append(stream, &prep, m, width, pos, src, cache.buf_mut())?;
         Ok(())
     }
 
@@ -2572,17 +2577,20 @@ impl FlashKernels {
             ));
         }
         check_append("enqueue_kv_append_pos_buf", src.len(), width, m)?;
-        let prep = self.module.prepare_kv_append_pos_buf(LaunchConfig1D::new(
-            (m * width).div_ceil(256) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_kv_append_pos_buf";
+        let grid = launch_u32(what, "grid", (m * width).div_ceil(256))?;
+        let m = launch_u32(what, "m", m)?;
+        let width = launch_u32(what, "width", width)?;
+        let rows = launch_u32(what, "rows", rows)?;
+        let prep = self
+            .module
+            .prepare_kv_append_pos_buf(LaunchConfig1D::new(grid, 256, 0))?;
         self.module.kv_append_pos_buf(
             stream,
             &prep,
-            m as u32,
-            width as u32,
-            rows as u32,
+            m,
+            width,
+            rows,
             pos_buf,
             src,
             cache.buf_mut(),
@@ -2621,19 +2629,17 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
-        let q_rows = check_flash(
-            "enqueue_flash_latent",
-            q.len(),
-            kv,
-            n_keys_buf.len(),
-            geom,
-            Some(y.len()),
-        )?;
-        let prep = self.module.prepare_flash_latent(LaunchConfig1D::new(
-            q_rows as u32,
-            LATENT as u32,
-            0,
-        ))?;
+        let what = "enqueue_flash_latent";
+        let q_rows = check_flash(what, q.len(), kv, n_keys_buf.len(), geom, Some(y.len()))?;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let rope_dims = launch_u32(what, "rope_dims", rope_dims)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let dst_rows = launch_u32(what, "kv.rows()", kv.rows())?;
+        let prep = self
+            .module
+            .prepare_flash_latent(LaunchConfig1D::new(q_rows, LATENT_U32, 0))?;
         self.module.flash_latent(
             stream,
             &prep,
@@ -2641,12 +2647,12 @@ impl FlashKernels {
             kv.buf(),
             n_keys_buf,
             scale,
-            m as u32,
-            n_heads as u32,
-            q_rows as u32,
-            rope_dims as u32,
-            latent as u32,
-            kv.rows() as u32,
+            m,
+            n_heads,
+            q_rows,
+            rope_dims,
+            latent,
+            dst_rows,
             y,
         )?;
         Ok(())
@@ -2732,19 +2738,27 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
+        let what = "enqueue_flash_latent_seg";
         let (q_rows, segs) = check_seg(
-            "enqueue_flash_latent_seg",
+            what,
             q.len(),
             kv,
             n_keys_buf.len(),
             geom,
             (part_v.len(), part_ms.len()),
         )?;
-        let prep = self.module.prepare_flash_latent_seg(LaunchConfig1D::new(
-            (q_rows * segs) as u32,
-            LATENT as u32,
-            0,
-        ))?;
+        let grid = launch_u32(what, "grid", q_rows * segs)?;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let rope_dims = launch_u32(what, "rope_dims", rope_dims)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let dst_rows = launch_u32(what, "kv.rows()", kv.rows())?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let prep = self
+            .module
+            .prepare_flash_latent_seg(LaunchConfig1D::new(grid, LATENT_U32, 0))?;
         self.module.flash_latent_seg(
             stream,
             &prep,
@@ -2752,14 +2766,14 @@ impl FlashKernels {
             kv.buf(),
             n_keys_buf,
             scale,
-            m as u32,
-            n_heads as u32,
-            q_rows as u32,
-            rope_dims as u32,
-            latent as u32,
-            kv.rows() as u32,
-            segs as u32,
-            seg_keys() as u32,
+            m,
+            n_heads,
+            q_rows,
+            rope_dims,
+            latent,
+            dst_rows,
+            segs,
+            seg_keys,
             part_v,
             part_ms,
         )?;
@@ -2800,8 +2814,9 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
+        let what = "enqueue_flash_latent_mma";
         let (q_rows, segs) = check_seg(
-            "enqueue_flash_latent_mma",
+            what,
             q.len(),
             kv,
             n_keys_buf.len(),
@@ -2828,10 +2843,19 @@ impl FlashKernels {
                 ),
             ));
         }
+        let grid = launch_u32(what, "grid", mma_groups(q_rows) * segs)?;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let rope_dims = launch_u32(what, "rope_dims", rope_dims)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let dst_rows = launch_u32(what, "kv.rows()", kv.rows())?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
         let prep = self.module.prepare_flash_latent_mma(LaunchConfig1D::new(
-            (mma_groups(q_rows) * segs) as u32,
-            MMA_BLOCK as u32,
-            MMA_DYN_BYTES as u32,
+            grid,
+            MMA_BLOCK_U32,
+            MMA_DYN_BYTES_U32,
         ))?;
         self.module.flash_latent_mma(
             stream,
@@ -2840,14 +2864,14 @@ impl FlashKernels {
             kv.buf(),
             n_keys_buf,
             scale,
-            m as u32,
-            n_heads as u32,
-            q_rows as u32,
-            rope_dims as u32,
-            latent as u32,
-            kv.rows() as u32,
-            segs as u32,
-            seg_keys() as u32,
+            m,
+            n_heads,
+            q_rows,
+            rope_dims,
+            latent,
+            dst_rows,
+            segs,
+            seg_keys,
             part_v,
             part_ms,
         )?;
@@ -2891,8 +2915,9 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
+        let what = "enqueue_flash_latent_seg_twice";
         let (q_rows, segs) = check_seg(
-            "enqueue_flash_latent_seg_twice",
+            what,
             q.len(),
             kv,
             n_keys_buf.len(),
@@ -2906,7 +2931,16 @@ impl FlashKernels {
                         launch's, and a one-segment cache runs the single-block kernel",
             ));
         }
-        let cfg = LaunchConfig1D::new((q_rows * segs) as u32, LATENT as u32, 0);
+        let cfg = LaunchConfig1D::new(launch_u32(what, "grid", q_rows * segs)?, LATENT_U32, 0);
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let rope_dims = launch_u32(what, "rope_dims", rope_dims)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let dst_rows = launch_u32(what, "kv.rows()", kv.rows())?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let shift = launch_u32(what, "shift_rows", shift)?;
         macro_rules! probe {
             ($prepare:ident, $entry:ident) => {{
                 let prep = self.module.$prepare(cfg)?;
@@ -2917,17 +2951,17 @@ impl FlashKernels {
                     kv.buf(),
                     n_keys_buf,
                     scale,
-                    m as u32,
-                    n_heads as u32,
-                    q_rows as u32,
-                    rope_dims as u32,
-                    latent as u32,
-                    kv.rows() as u32,
-                    segs as u32,
-                    seg_keys() as u32,
+                    m,
+                    n_heads,
+                    q_rows,
+                    rope_dims,
+                    latent,
+                    dst_rows,
+                    segs,
+                    seg_keys,
                     part_v,
                     part_ms,
-                    shift as u32,
+                    shift,
                     PROBE_JIG,
                 )?;
             }};
@@ -2956,7 +2990,8 @@ impl FlashKernels {
         stream: &CudaStream,
         a: FlashMergeArgs<'_>,
     ) -> Result<(), GpuError> {
-        let (q_rows, segs) = check_merge("enqueue_flash_merge", &a)?;
+        let what = "enqueue_flash_merge";
+        let (q_rows, segs) = check_merge(what, &a)?;
         let FlashMergeArgs {
             n_keys_buf,
             cache_rows,
@@ -2967,25 +3002,19 @@ impl FlashKernels {
             part_ms,
             y,
         } = a;
-        let prep = self.module.prepare_flash_merge(LaunchConfig1D::new(
-            q_rows as u32,
-            LATENT as u32,
-            0,
-        ))?;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let cache_rows = launch_u32(what, "cache_rows", cache_rows)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let prep = self
+            .module
+            .prepare_flash_merge(LaunchConfig1D::new(q_rows, LATENT_U32, 0))?;
         self.module.flash_merge(
-            stream,
-            &prep,
-            n_keys_buf,
-            m as u32,
-            n_heads as u32,
-            q_rows as u32,
-            latent as u32,
-            cache_rows as u32,
-            segs as u32,
-            seg_keys() as u32,
-            part_v,
-            part_ms,
-            y,
+            stream, &prep, n_keys_buf, m, n_heads, q_rows, latent, cache_rows, segs, seg_keys,
+            part_v, part_ms, y,
         )?;
         Ok(())
     }
@@ -3002,7 +3031,8 @@ impl FlashKernels {
         a: FlashMergeQ8Args<'_>,
     ) -> Result<(), GpuError> {
         let FlashMergeQ8Args { merge, lo, hi } = a;
-        let (q_rows, segs) = check_merge("enqueue_flash_merge_q8", &merge)?;
+        let what = "enqueue_flash_merge_q8";
+        let (q_rows, segs) = check_merge(what, &merge)?;
         let FlashMergeArgs {
             n_keys_buf,
             cache_rows,
@@ -3013,27 +3043,34 @@ impl FlashKernels {
             part_ms,
             y,
         } = merge;
-        let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge_q8", lo, hi, q_rows, latent)?;
-        let prep = self.module.prepare_flash_merge_q8(LaunchConfig1D::new(
-            q_rows as u32,
-            LATENT as u32,
-            0,
-        ))?;
+        let (m_lo, n_sb) = check_side_quant(what, lo, hi, q_rows, latent)?;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let cache_rows = launch_u32(what, "cache_rows", cache_rows)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let m_lo = launch_u32(what, "lo.m()", m_lo)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_flash_merge_q8(LaunchConfig1D::new(q_rows, LATENT_U32, 0))?;
         self.module.flash_merge_q8(
             stream,
             &prep,
             n_keys_buf,
-            m as u32,
-            n_heads as u32,
-            q_rows as u32,
-            latent as u32,
-            cache_rows as u32,
-            segs as u32,
-            seg_keys() as u32,
-            m_lo as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            n_sb.div_ceil(4) as u32,
+            m,
+            n_heads,
+            q_rows,
+            latent,
+            cache_rows,
+            segs,
+            seg_keys,
+            m_lo,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
             part_v,
             part_ms,
             y,
@@ -3067,7 +3104,8 @@ impl FlashKernels {
             hi,
             shift_segs: shift,
         } = a;
-        let (q_rows, segs) = check_merge("enqueue_flash_merge2_q8", &merge)?;
+        let what = "enqueue_flash_merge2_q8";
+        let (q_rows, segs) = check_merge(what, &merge)?;
         let FlashMergeArgs {
             n_keys_buf,
             cache_rows,
@@ -3078,27 +3116,35 @@ impl FlashKernels {
             part_ms,
             y,
         } = merge;
-        let (m_lo, n_sb) = check_side_quant("enqueue_flash_merge2_q8", lo, hi, q_rows, latent)?;
-        let prep = self.module.prepare_flash_merge2_q8(LaunchConfig1D::new(
-            q_rows as u32,
-            LATENT as u32,
-            0,
-        ))?;
+        let (m_lo, n_sb) = check_side_quant(what, lo, hi, q_rows, latent)?;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let cache_rows = launch_u32(what, "cache_rows", cache_rows)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let m_lo = launch_u32(what, "lo.m()", m_lo)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let shift = launch_u32(what, "shift_segs", shift)?;
+        let prep = self
+            .module
+            .prepare_flash_merge2_q8(LaunchConfig1D::new(q_rows, LATENT_U32, 0))?;
         self.module.flash_merge2_q8(
             stream,
             &prep,
             n_keys_buf,
-            m as u32,
-            n_heads as u32,
-            q_rows as u32,
-            latent as u32,
-            cache_rows as u32,
-            segs as u32,
-            seg_keys() as u32,
-            m_lo as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            n_sb.div_ceil(4) as u32,
+            m,
+            n_heads,
+            q_rows,
+            latent,
+            cache_rows,
+            segs,
+            seg_keys,
+            m_lo,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
             part_v,
             part_ms,
             y,
@@ -3112,7 +3158,7 @@ impl FlashKernels {
             &mut hi.q6,
             &mut hi.s8,
             &mut hi.d8,
-            shift as u32,
+            shift,
             PROBE_JIG,
         )?;
         Ok(())
@@ -3140,20 +3186,20 @@ impl FlashKernels {
             rope_dims,
             latent_dims: latent,
         } = geom;
-        let q_rows = check_flash(
-            "enqueue_flash_latent_q8",
-            q.len(),
-            kv,
-            n_keys_buf.len(),
-            geom,
-            Some(y.len()),
-        )?;
-        let (m_lo, n_sb) = check_side_quant("enqueue_flash_latent_q8", lo, hi, q_rows, latent)?;
-        let prep = self.module.prepare_flash_latent_q8(LaunchConfig1D::new(
-            q_rows as u32,
-            LATENT as u32,
-            0,
-        ))?;
+        let what = "enqueue_flash_latent_q8";
+        let q_rows = check_flash(what, q.len(), kv, n_keys_buf.len(), geom, Some(y.len()))?;
+        let (m_lo, n_sb) = check_side_quant(what, lo, hi, q_rows, latent)?;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let rope_dims = launch_u32(what, "rope_dims", rope_dims)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let dst_rows = launch_u32(what, "kv.rows()", kv.rows())?;
+        let m_lo = launch_u32(what, "lo.m()", m_lo)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_flash_latent_q8(LaunchConfig1D::new(q_rows, LATENT_U32, 0))?;
         self.module.flash_latent_q8(
             stream,
             &prep,
@@ -3161,16 +3207,16 @@ impl FlashKernels {
             kv.buf(),
             n_keys_buf,
             scale,
-            m as u32,
-            n_heads as u32,
-            q_rows as u32,
-            rope_dims as u32,
-            latent as u32,
-            kv.rows() as u32,
-            m_lo as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            n_sb.div_ceil(4) as u32,
+            m,
+            n_heads,
+            q_rows,
+            rope_dims,
+            latent,
+            dst_rows,
+            m_lo,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
             y,
             &mut lo.q3,
             &mut lo.q4,

@@ -36,7 +36,7 @@ pub use probe::{Block0Taps, LayerTaps, OpTime, StepProbe};
 use crate::head::Head;
 use crate::tensor::DeviceTensor;
 use crate::weights::Weights;
-use crate::{Gpu, GpuError, Graph};
+use crate::{Gpu, GpuError, Graph, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use dispatch::{enqueue_chain, enqueue_layer};
 use model::attn::MlaParams;
@@ -406,6 +406,7 @@ impl GpuModel {
                 ),
             ));
         }
+        let pos = launch_u32("GpuModel::seed_depth", "rows", rows)?;
         let (slots, width) = match self.stages.first().and_then(|s| s.residency.as_ref()) {
             Some(r) => match r.kv.first() {
                 Some(kv0) => (r.kv.len(), kv0.cols()),
@@ -428,7 +429,7 @@ impl GpuModel {
             let (gpu, residency) = self.stage_parts("GpuModel::seed_depth")?;
             seed_cache(gpu, &mut residency.kv[slot], &block, "seed_depth")?;
         }
-        self.pos = rows as u32;
+        self.pos = pos;
         Ok(())
     }
 

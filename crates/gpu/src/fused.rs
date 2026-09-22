@@ -7,9 +7,11 @@
 use crate::GpuError;
 use crate::cores::{q3_slot, q3k_row_dot, q4_slot, q6_slot, q8_quad};
 use crate::elem::{
-    RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree, rope_pair_core, silu_mul,
+    RMS_THREADS, RMS_THREADS_U32, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree,
+    rope_pair_core, silu_mul,
 };
 use crate::flash::f32_to_f16_bits;
+use crate::launch_u32;
 use crate::q5::{Q8Blocks32, q5_row_dot};
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -566,20 +568,24 @@ impl FusedKernels {
                 ),
             ));
         }
-        let prep =
-            self.module
-                .prepare_norm_quant(LaunchConfig1D::new(m as u32, RMS_THREADS as u32, 0))?;
+        let what = "enqueue_norm_quant";
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_norm_quant(LaunchConfig1D::new(m, RMS_THREADS_U32, 0))?;
         self.module.norm_quant(
             stream,
             &prep,
             x,
             gain,
             eps,
-            k as u32,
-            m as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            n_sb.div_ceil(4) as u32,
+            k,
+            m,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
             &mut act.q3,
             &mut act.q4,
             &mut act.q6,
@@ -678,10 +684,13 @@ impl FusedKernels {
                 "pos_buf must hold 1 u32",
             ));
         }
-        let rows = cache.rows();
+        let what = "enqueue_kv_norm_rope_append";
+        let latent = launch_u32(what, "latent", latent)?;
+        let rope = launch_u32(what, "rope", rope)?;
+        let rows = launch_u32(what, "cache.rows()", cache.rows())?;
         let prep = self
             .module
-            .prepare_kv_norm_rope_append(LaunchConfig1D::new(1, RMS_THREADS as u32, 0))?;
+            .prepare_kv_norm_rope_append(LaunchConfig1D::new(1, RMS_THREADS_U32, 0))?;
         self.module.kv_norm_rope_append(
             stream,
             &prep,
@@ -690,9 +699,9 @@ impl FusedKernels {
             cs,
             pos_buf,
             eps,
-            latent as u32,
-            rope as u32,
-            rows as u32,
+            latent,
+            rope,
+            rows,
             kv_s,
             kvr,
             cache.buf_mut(),
@@ -762,8 +771,11 @@ impl FusedKernels {
                 format!("h.len() {} < rows {n_rows}", h.len()),
             ));
         }
+        let what = "enqueue_gate_up_swiglu";
+        let n_rows = launch_u32(what, "rows", n_rows)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let prep = self.module.prepare_gate_up_swiglu_q3k(LaunchConfig1D::new(
-            n_rows.div_ceil(8) as u32,
+            n_rows.div_ceil(8),
             256,
             0,
         ))?;
@@ -774,9 +786,9 @@ impl FusedKernels {
             wu.buf(),
             &act.q3,
             &act.d8,
-            n_rows as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
+            n_rows,
+            n_sb,
+            n_sb.div_ceil(2),
             h,
         )?;
         Ok(())
@@ -827,11 +839,13 @@ impl FusedKernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_down_add_q5_1(LaunchConfig1D::new(
-            n_rows.div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_down_add_q5_1";
+        let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
+        let q_stride = launch_u32(what, "q_stride", act.q_stride())?;
+        let n_rows = launch_u32(what, "rows", n_rows)?;
+        let prep =
+            self.module
+                .prepare_down_add_q5_1(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.down_add_q5_1(
             stream,
             &prep,
@@ -840,10 +854,10 @@ impl FusedKernels {
             &act.d8,
             &act.s8,
             resid,
-            k_blocks as u32,
-            act.q_stride() as u32,
+            k_blocks,
+            q_stride,
             0,
-            n_rows as u32,
+            n_rows,
             y,
         )?;
         Ok(())

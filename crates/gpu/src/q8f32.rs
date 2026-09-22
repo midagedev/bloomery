@@ -23,6 +23,7 @@
 //! geometry. Output layout matches the K-quant gemvs: `y[r·m + c]`.
 
 use crate::GpuError;
+use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
@@ -557,19 +558,15 @@ impl Q8F32Kernels {
     ) -> Result<(), GpuError> {
         let (n_rows, k) = (w.rows(), w.cols());
         check_gemv_geometry("enqueue_f32_gemv", n_rows, k, x.len(), m, y.len())?;
-        let prep =
-            self.module
-                .prepare_f32_gemv(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
-        self.module.f32_gemv(
-            stream,
-            &prep,
-            w.buf(),
-            x,
-            n_rows as u32,
-            k as u32,
-            m as u32,
-            y,
-        )?;
+        let what = "enqueue_f32_gemv";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_f32_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+        self.module
+            .f32_gemv(stream, &prep, w.buf(), x, n_rows, k, m, y)?;
         Ok(())
     }
 
@@ -603,22 +600,15 @@ impl Q8F32Kernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_q8_0_gemv(LaunchConfig1D::new(
-            n_rows.div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
-        self.module.q8_0_gemv(
-            stream,
-            &prep,
-            qs.buf(),
-            d.buf(),
-            x,
-            n_rows as u32,
-            k as u32,
-            m as u32,
-            y,
-        )?;
+        let what = "enqueue_q8_0_gemv";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep =
+            self.module
+                .prepare_q8_0_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+        self.module
+            .q8_0_gemv(stream, &prep, qs.buf(), d.buf(), x, n_rows, k, m, y)?;
         Ok(())
     }
 }

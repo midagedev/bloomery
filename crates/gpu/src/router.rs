@@ -17,6 +17,7 @@
 
 use crate::GpuError;
 use crate::elem::argmax_take;
+use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
@@ -38,6 +39,9 @@ pub const N_USED: usize = 6;
 /// covers every shape. `gate_p6`'s `router_shape` asserts the compiled
 /// `.reqntid` against this.
 pub const ROUTER_THREADS: usize = 32;
+/// [`ROUTER_THREADS`] as the `u32` block width a launch takes.
+const ROUTER_THREADS_U32: u32 = ROUTER_THREADS as u32;
+const _: () = assert!(ROUTER_THREADS_U32 as usize == ROUTER_THREADS);
 
 // --------------------------------------------------------------- cores
 
@@ -399,11 +403,12 @@ impl RouterKernels {
                 ),
             ));
         }
+        let m = launch_u32("enqueue_router_topk", "m", m)?;
         let prep =
             self.module
-                .prepare_router_topk(LaunchConfig1D::new(1, ROUTER_THREADS as u32, 0))?;
+                .prepare_router_topk(LaunchConfig1D::new(1, ROUTER_THREADS_U32, 0))?;
         self.module
-            .router_topk(stream, &prep, x, m as u32, scale, probs, ids, weights)?;
+            .router_topk(stream, &prep, x, m, scale, probs, ids, weights)?;
         Ok(())
     }
 
@@ -427,16 +432,15 @@ impl RouterKernels {
         row0_up: &mut DeviceBuffer<u32>,
         row0_down: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        if rows_gu == 0
-            || rows_gu > u32::MAX as usize
-            || rows_dn == 0
-            || rows_dn > u32::MAX as usize
-        {
-            return Err(GpuError::shape(
-                "enqueue_expert_table",
-                format!("rows per expert must be 1..=u32::MAX, got gu={rows_gu} dn={rows_dn}"),
-            ));
-        }
+        let (rows_gu, rows_dn) = match (u32::try_from(rows_gu), u32::try_from(rows_dn)) {
+            (Ok(gu), Ok(dn)) if gu > 0 && dn > 0 => (gu, dn),
+            _ => {
+                return Err(GpuError::shape(
+                    "enqueue_expert_table",
+                    format!("rows per expert must be 1..=u32::MAX, got gu={rows_gu} dn={rows_dn}"),
+                ));
+            }
+        };
         if ids.len() < N_USED {
             return Err(GpuError::shape(
                 "enqueue_expert_table",
@@ -456,16 +460,9 @@ impl RouterKernels {
         }
         let prep =
             self.module
-                .prepare_expert_table(LaunchConfig1D::new(1, ROUTER_THREADS as u32, 0))?;
+                .prepare_expert_table(LaunchConfig1D::new(1, ROUTER_THREADS_U32, 0))?;
         self.module.expert_table(
-            stream,
-            &prep,
-            ids,
-            rows_gu as u32,
-            rows_dn as u32,
-            row0_gate,
-            row0_up,
-            row0_down,
+            stream, &prep, ids, rows_gu, rows_dn, row0_gate, row0_up, row0_down,
         )?;
         Ok(())
     }

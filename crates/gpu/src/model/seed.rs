@@ -23,7 +23,8 @@ pub(super) fn seed_pattern(rows: usize, width: usize) -> Vec<u16> {
         let sign = (s >> 24) & 1;
         let exponent = 13 + ((s >> 23) & 1);
         let mantissa = (s >> 13) & 0x3ff;
-        out.push(((sign << 15) | (exponent << 10) | mantissa) as u16);
+        let bits = (sign << 15) | (exponent << 10) | mantissa;
+        out.push(u16::try_from(bits).expect("1 sign + 5 exponent + 10 mantissa bits"));
     }
     out
 }

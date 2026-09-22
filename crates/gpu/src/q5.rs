@@ -5,6 +5,7 @@
 //! the load-time weight repack, the activation scratch and the enqueue API.
 
 use crate::GpuError;
+use crate::launch_u32;
 use crate::q8_1_quant_block;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -965,7 +966,7 @@ fn pack_q5(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<u32>, 
                 } else {
                     (((lo - 16) as u32) & 0xff, ((hi - 16) as u32) & 0xff)
                 };
-                let sh = 8 * (j % 4) as u32;
+                let sh = 8 * u32::try_from(j % 4).expect("j % 4 < 4");
                 row[wbase + 32 * (j / 4)] |= lo_b << sh;
                 row[wbase + 32 * (j / 4 + 4)] |= hi_b << sh;
             }
@@ -1010,19 +1011,23 @@ impl Q5Kernels {
             ));
         }
         let n_groups = k_blocks.div_ceil(4);
-        let prep = self.module.prepare_q5_quantize_q8(LaunchConfig1D::new(
-            (m * n_groups) as u32,
-            32,
-            0,
-        ))?;
+        let what = "enqueue_quantize_q8";
+        let grid = launch_u32(what, "grid", m * n_groups)?;
+        let m = launch_u32(what, "m", m)?;
+        let n_groups = launch_u32(what, "n_groups", n_groups)?;
+        let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
+        let q_stride = launch_u32(what, "q_stride", q_stride)?;
+        let prep = self
+            .module
+            .prepare_q5_quantize_q8(LaunchConfig1D::new(grid, 32, 0))?;
         self.module.q5_quantize_q8(
             stream,
             &prep,
             x,
-            m as u32,
-            n_groups as u32,
-            k_blocks as u32,
-            q_stride as u32,
+            m,
+            n_groups,
+            k_blocks,
+            q_stride,
             &mut act.q,
             &mut act.s8,
             &mut act.d8,
@@ -1068,22 +1073,30 @@ impl Q5Kernels {
         }
         let n_groups = k_blocks.div_ceil(4);
         let blocks = m_a * n_groups + m_b * 2 * n_sb;
+        let what = "enqueue_quantize_q8_pair";
+        let blocks = launch_u32(what, "grid", blocks)?;
+        let m_a = launch_u32(what, "a.m()", m_a)?;
+        let n_groups = launch_u32(what, "n_groups", n_groups)?;
+        let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
+        let q_stride = launch_u32(what, "q_stride", q_stride)?;
+        let m_b = launch_u32(what, "b.m()", m_b)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let prep = self
             .module
-            .prepare_q5_q8_1_quantize_pair(LaunchConfig1D::new(blocks as u32, 32, 0))?;
+            .prepare_q5_q8_1_quantize_pair(LaunchConfig1D::new(blocks, 32, 0))?;
         self.module.q5_q8_1_quantize_pair(
             stream,
             &prep,
             xa,
             xb,
-            m_a as u32,
-            n_groups as u32,
-            k_blocks as u32,
-            q_stride as u32,
-            m_b as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            n_sb.div_ceil(4) as u32,
+            m_a,
+            n_groups,
+            k_blocks,
+            q_stride,
+            m_b,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
             &mut a.q,
             &mut a.s8,
             &mut a.d8,
@@ -1155,11 +1168,17 @@ impl Q5Kernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_q5_0_gemv(LaunchConfig1D::new(
-            n_rows.div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_gemv_q5_0";
+        let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
+        let q_stride = launch_u32(what, "q_stride", act.q_stride())?;
+        let row0 = launch_u32(what, "row0", row0)?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let col0 = launch_u32(what, "col0", col0)?;
+        let m_cols = launch_u32(what, "m_cols", m_cols)?;
+        let y0 = launch_u32(what, "y0", y0)?;
+        let prep =
+            self.module
+                .prepare_q5_0_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q5_0_gemv(
             stream,
             &prep,
@@ -1167,13 +1186,13 @@ impl Q5Kernels {
             &act.q,
             &act.d8,
             &act.s8,
-            k_blocks as u32,
-            act.q_stride() as u32,
-            row0 as u32,
-            n_rows as u32,
-            col0 as u32,
-            m_cols as u32,
-            y0 as u32,
+            k_blocks,
+            q_stride,
+            row0,
+            n_rows,
+            col0,
+            m_cols,
+            y0,
             y,
         )?;
         Ok(())
@@ -1243,12 +1262,16 @@ impl Q5Kernels {
                 ),
             ));
         }
-        let n_experts = w.rows() / rows_per_expert;
-        let prep = self.module.prepare_q5_0_gemv_sel(LaunchConfig1D::new(
-            (n_slots * rows_per_expert).div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_gemv_q5_0_sel";
+        let grid = launch_u32(what, "grid", (n_slots * rows_per_expert).div_ceil(8))?;
+        let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
+        let q_stride = launch_u32(what, "q_stride", act.q_stride())?;
+        let n_experts = launch_u32(what, "n_experts", w.rows() / rows_per_expert)?;
+        let rows_per_expert = launch_u32(what, "rows_per_expert", rows_per_expert)?;
+        let n_slots = launch_u32(what, "n_slots", n_slots)?;
+        let prep = self
+            .module
+            .prepare_q5_0_gemv_sel(LaunchConfig1D::new(grid, 256, 0))?;
         self.module.q5_0_gemv_sel(
             stream,
             &prep,
@@ -1257,11 +1280,11 @@ impl Q5Kernels {
             &act.d8,
             &act.s8,
             sel,
-            k_blocks as u32,
-            act.q_stride() as u32,
-            n_experts as u32,
-            rows_per_expert as u32,
-            n_slots as u32,
+            k_blocks,
+            q_stride,
+            n_experts,
+            rows_per_expert,
+            n_slots,
             y,
         )?;
         Ok(())
@@ -1324,11 +1347,17 @@ impl Q5Kernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_q5_1_gemv(LaunchConfig1D::new(
-            n_rows.div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_gemv_q5_1";
+        let k_blocks = launch_u32(what, "k_blocks", k_blocks)?;
+        let q_stride = launch_u32(what, "q_stride", act.q_stride())?;
+        let row0 = launch_u32(what, "row0", row0)?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let col0 = launch_u32(what, "col0", col0)?;
+        let m_cols = launch_u32(what, "m_cols", m_cols)?;
+        let y0 = launch_u32(what, "y0", y0)?;
+        let prep =
+            self.module
+                .prepare_q5_1_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q5_1_gemv(
             stream,
             &prep,
@@ -1336,13 +1365,13 @@ impl Q5Kernels {
             &act.q,
             &act.d8,
             &act.s8,
-            k_blocks as u32,
-            act.q_stride() as u32,
-            row0 as u32,
-            n_rows as u32,
-            col0 as u32,
-            m_cols as u32,
-            y0 as u32,
+            k_blocks,
+            q_stride,
+            row0,
+            n_rows,
+            col0,
+            m_cols,
+            y0,
             y,
         )?;
         Ok(())

@@ -130,6 +130,19 @@ impl GpuError {
     }
 }
 
+/// `v` as the `u32` a kernel scalar or a launch dimension takes. `as` would
+/// wrap a count past `u32::MAX` into a smaller geometry the launch contract
+/// may still accept, so a value that does not fit is a `Shape` error of the
+/// entry point `what`, naming the argument `name`.
+pub(crate) fn launch_u32(
+    what: &'static str,
+    name: &'static str,
+    v: usize,
+) -> Result<u32, GpuError> {
+    u32::try_from(v)
+        .map_err(|_| GpuError::shape(what, format!("{name} = {v} does not fit the kernel's u32")))
+}
+
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1447,23 +1460,26 @@ impl Gpu {
                 ),
             ));
         }
+        let what = "enqueue_quantize_q8_1_at";
+        let grid = launch_u32(what, "grid", m * n_sb * 2)?;
+        let x0 = launch_u32(what, "x0", x0)?;
+        let m = launch_u32(what, "m", m)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
         // Prepared per call for now: the prepare step is host-only contract
         // validation, and it is exactly the kind of per-launch host cost a
         // captured graph removes. Caching per shape is P8's business.
-        let prep = self.module.prepare_q3k_quantize_q8_1(LaunchConfig1D::new(
-            (m * n_sb * 2) as u32,
-            32,
-            0,
-        ))?;
+        let prep = self
+            .module
+            .prepare_q3k_quantize_q8_1(LaunchConfig1D::new(grid, 32, 0))?;
         self.module.q3k_quantize_q8_1(
             &self.stream,
             &prep,
             x,
-            x0 as u32,
-            m as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            n_sb.div_ceil(4) as u32,
+            x0,
+            m,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
             &mut act.q3,
             &mut act.q4,
             &mut act.q6,
@@ -1506,19 +1522,25 @@ impl Gpu {
                 format!("x.len() {} < max(a0 {a0}, b0 {b0}) + m*k = {need}", x.len()),
             ));
         }
+        let what = "enqueue_quantize_q8_1_pair";
+        let grid = launch_u32(what, "grid", m * n_sb * 4)?;
+        let a0 = launch_u32(what, "a0", a0)?;
+        let b0 = launch_u32(what, "b0", b0)?;
+        let m = launch_u32(what, "m", m)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let prep = self
             .module
-            .prepare_q3k_quantize_q8_1_pair(LaunchConfig1D::new((m * n_sb * 4) as u32, 32, 0))?;
+            .prepare_q3k_quantize_q8_1_pair(LaunchConfig1D::new(grid, 32, 0))?;
         self.module.q3k_quantize_q8_1_pair(
             &self.stream,
             &prep,
             x,
-            a0 as u32,
-            b0 as u32,
-            m as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            n_sb.div_ceil(4) as u32,
+            a0,
+            b0,
+            m,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
             &mut a.q3,
             &mut a.q4,
             &mut a.q6,
@@ -1564,9 +1586,13 @@ impl Gpu {
                 format!("y.len() {} < rows*m = {}", y.len(), n_rows * m),
             ));
         }
-        let prep =
-            self.module
-                .prepare_q4k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
+        let what = "enqueue_gemv_q4k";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let m = launch_u32(what, "m", m)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_q4k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q4k_gemv(
             &self.stream,
             &prep,
@@ -1574,10 +1600,10 @@ impl Gpu {
             &act.q4,
             &act.s8,
             &act.d8,
-            n_rows as u32,
-            m as u32,
-            n_sb as u32,
-            n_sb.div_ceil(4) as u32,
+            n_rows,
+            m,
+            n_sb,
+            n_sb.div_ceil(4),
             y,
         )?;
         Ok(())
@@ -1626,19 +1652,23 @@ impl Gpu {
                 format!("y.len() {} < rows*m = {}", y.len(), n_rows * m),
             ));
         }
-        let prep =
-            self.module
-                .prepare_q3k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
+        let what = "enqueue_gemv_q3k";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let m = launch_u32(what, "m", m)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_q3k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q3k_gemv(
             &self.stream,
             &prep,
             w.buf(),
             &act.q3,
             &act.d8,
-            n_rows as u32,
-            m as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
+            n_rows,
+            m,
+            n_sb,
+            n_sb.div_ceil(2),
             y,
         )?;
         Ok(())
@@ -1726,12 +1756,15 @@ impl Gpu {
                 ),
             ));
         }
-        let n_experts = w.rows() / rows_per_expert;
-        let prep = self.module.prepare_q3k_gemv_sel(LaunchConfig1D::new(
-            (n_slots * rows_per_expert).div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_gemv_q3k_sel";
+        let grid = launch_u32(what, "grid", (n_slots * rows_per_expert).div_ceil(8))?;
+        let n_experts = launch_u32(what, "n_experts", w.rows() / rows_per_expert)?;
+        let rows_per_expert = launch_u32(what, "rows_per_expert", rows_per_expert)?;
+        let n_slots = launch_u32(what, "n_slots", n_slots)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_q3k_gemv_sel(LaunchConfig1D::new(grid, 256, 0))?;
         self.module.q3k_gemv_sel(
             &self.stream,
             &prep,
@@ -1739,11 +1772,11 @@ impl Gpu {
             &act.q3,
             &act.d8,
             sel,
-            n_experts as u32,
-            rows_per_expert as u32,
-            n_slots as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
+            n_experts,
+            rows_per_expert,
+            n_slots,
+            n_sb,
+            n_sb.div_ceil(2),
             y,
         )?;
         Ok(())
@@ -1791,19 +1824,23 @@ impl Gpu {
                 format!("y.len() {} < rows*m = {}", y.len(), n_rows * m),
             ));
         }
-        let prep =
-            self.module
-                .prepare_q6k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
+        let what = "enqueue_gemv_q6k";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let m = launch_u32(what, "m", m)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_q6k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q6k_gemv(
             &self.stream,
             &prep,
             w.buf(),
             &act.q6,
             &act.d8,
-            n_rows as u32,
-            m as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
+            n_rows,
+            m,
+            n_sb,
+            n_sb.div_ceil(2),
             y,
         )?;
         Ok(())

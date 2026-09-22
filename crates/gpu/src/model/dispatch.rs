@@ -17,7 +17,7 @@ use crate::flash::{
 use crate::head::Head;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
+use crate::{Gpu, GpuError, launch_u32};
 use cuda_core::DeviceBuffer;
 use model::attn::MlaParams;
 
@@ -238,7 +238,7 @@ fn attn_proj(
         &s.q,
         &s.cs_buf,
         rope,
-        s.dims.q_cols as u32,
+        launch_u32("enqueue_attn", "q_cols", s.dims.q_cols)?,
         1,
         &mut s.q_rope_all,
     )?;

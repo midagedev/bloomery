@@ -12,6 +12,7 @@
 //! Everything else runs the gated kernels verbatim.
 
 use crate::GpuError;
+use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
@@ -375,13 +376,12 @@ impl StepKernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_gather_pairs(LaunchConfig1D::new(
-            n.div_ceil(256) as u32,
-            256,
-            0,
-        ))?;
+        let n = launch_u32("enqueue_gather", "n", n)?;
+        let prep =
+            self.module
+                .prepare_gather_pairs(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module
-            .gather_pairs(stream, &prep, x, src_idx, dst_idx, n as u32, y)?;
+            .gather_pairs(stream, &prep, x, src_idx, dst_idx, n, y)?;
         Ok(())
     }
 
@@ -466,24 +466,30 @@ impl StepKernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_q8_0_gemv_heads(LaunchConfig1D::new(
-            n_rows.div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_q8_0_gemv_heads";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let k = launch_u32(what, "k", k)?;
+        let n_heads = launch_u32(what, "n_heads", n_heads)?;
+        let rows_per_head = launch_u32(what, "rows_per_head", rows_per_head)?;
+        let x_head_stride = launch_u32(what, "x_head_stride", x_head_stride)?;
+        let y_head_stride = launch_u32(what, "y_head_stride", y_head_stride)?;
+        let y_off = launch_u32(what, "y_off", y_off)?;
+        let prep =
+            self.module
+                .prepare_q8_0_gemv_heads(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q8_0_gemv_heads(
             stream,
             &prep,
             qs.buf(),
             d.buf(),
             x,
-            n_rows as u32,
-            k as u32,
-            n_heads as u32,
-            rows_per_head as u32,
-            x_head_stride as u32,
-            y_head_stride as u32,
-            y_off as u32,
+            n_rows,
+            k,
+            n_heads,
+            rows_per_head,
+            x_head_stride,
+            y_head_stride,
+            y_off,
             y,
         )?;
         Ok(())
@@ -523,26 +529,33 @@ impl StepKernels {
             y.len(),
         )?;
         let n_rows = heads * rows_per_head;
-        let prep = self.module.prepare_q3k_gemv_heads(LaunchConfig1D::new(
-            n_rows.div_ceil(8) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_q3k_gemv_heads";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let head_base = launch_u32(what, "head_base", head_base)?;
+        let heads = launch_u32(what, "heads", heads)?;
+        let rows_per_head = launch_u32(what, "rows_per_head", rows_per_head)?;
+        let row_stride_per_head = launch_u32(what, "row_stride_per_head", row_stride_per_head)?;
+        let row_off = launch_u32(what, "row_off", row_off)?;
+        let y_head_stride = launch_u32(what, "y_head_stride", y_head_stride)?;
+        let prep =
+            self.module
+                .prepare_q3k_gemv_heads(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q3k_gemv_heads(
             stream,
             &prep,
             w.buf(),
             &act.q3,
             &act.d8,
-            n_rows as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            head_base as u32,
-            heads as u32,
-            rows_per_head as u32,
-            row_stride_per_head as u32,
-            row_off as u32,
-            y_head_stride as u32,
+            n_rows,
+            n_sb,
+            n_sb.div_ceil(2),
+            head_base,
+            heads,
+            rows_per_head,
+            row_stride_per_head,
+            row_off,
+            y_head_stride,
             y,
         )?;
         Ok(())
@@ -588,9 +601,19 @@ impl StepKernels {
             y.len(),
         )?;
         let n_rows = heads * rows_per_head;
+        let what = "enqueue_q3k_gemv_heads_pair";
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let head_base = launch_u32(what, "head_base", head_base)?;
+        let heads = launch_u32(what, "heads", heads)?;
+        let split = launch_u32(what, "lo.m()", split)?;
+        let rows_per_head = launch_u32(what, "rows_per_head", rows_per_head)?;
+        let row_stride_per_head = launch_u32(what, "row_stride_per_head", row_stride_per_head)?;
+        let row_off = launch_u32(what, "row_off", row_off)?;
+        let y_head_stride = launch_u32(what, "y_head_stride", y_head_stride)?;
         let prep = self
             .module
-            .prepare_q3k_gemv_heads_pair(LaunchConfig1D::new(n_rows.div_ceil(8) as u32, 256, 0))?;
+            .prepare_q3k_gemv_heads_pair(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module.q3k_gemv_heads_pair(
             stream,
             &prep,
@@ -599,16 +622,16 @@ impl StepKernels {
             &lo.d8,
             &hi.q3,
             &hi.d8,
-            n_rows as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
-            head_base as u32,
-            heads as u32,
-            split as u32,
-            rows_per_head as u32,
-            row_stride_per_head as u32,
-            row_off as u32,
-            y_head_stride as u32,
+            n_rows,
+            n_sb,
+            n_sb.div_ceil(2),
+            head_base,
+            heads,
+            split,
+            rows_per_head,
+            row_stride_per_head,
+            row_off,
+            y_head_stride,
             y,
         )?;
         Ok(())

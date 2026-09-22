@@ -41,11 +41,11 @@ impl Gather {
     ) -> Result<Gather, GpuError> {
         let (mut src, mut dst) = (Vec::new(), Vec::new());
         for (s, d) in pairs {
-            if s > u32::MAX as usize || d > u32::MAX as usize {
+            let (Ok(s), Ok(d)) = (u32::try_from(s), u32::try_from(d)) else {
                 return Err(GpuError::shape(what, "index overflows u32"));
-            }
-            src.push(s as u32);
-            dst.push(d as u32);
+            };
+            src.push(s);
+            dst.push(d);
         }
         if src.is_empty() {
             return Err(GpuError::shape(what, "empty table"));

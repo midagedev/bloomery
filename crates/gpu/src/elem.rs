@@ -17,6 +17,7 @@
 
 use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale};
+use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -31,6 +32,9 @@ use std::sync::Arc;
 /// flight to cover a load's latency. `rms_norm` and the fused `norm_quant`
 /// share this geometry — their sum of squares must agree bit for bit.
 pub const RMS_THREADS: usize = 256;
+/// [`RMS_THREADS`] as the `u32` block width a launch takes.
+pub(crate) const RMS_THREADS_U32: u32 = RMS_THREADS as u32;
+const _: () = assert!(RMS_THREADS_U32 as usize == RMS_THREADS);
 /// Warps in that block, and so the width of the second-stage combine.
 pub const RMS_WARPS: usize = RMS_THREADS / 32;
 
@@ -40,6 +44,9 @@ pub const RMS_WARPS: usize = RMS_THREADS / 32;
 /// resident. The scan is strided by this width, the merge is a per-warp
 /// butterfly then a fixed ascending walk of the warp slots.
 pub const ARGMAX_THREADS: usize = 256;
+/// [`ARGMAX_THREADS`] as the `u32` block width a launch takes.
+const ARGMAX_THREADS_U32: u32 = ARGMAX_THREADS as u32;
+const _: () = assert!(ARGMAX_THREADS_U32 as usize == ARGMAX_THREADS);
 /// Warps in that block, and so the width of the argmax's final combine.
 pub const ARGMAX_WARPS: usize = ARGMAX_THREADS / 32;
 
@@ -596,13 +603,14 @@ impl ElemKernels {
                 format!("y.len() {} < 2048*{}", y.len(), ids.len()),
             ));
         }
-        let prep = self.module.prepare_embed_rows(LaunchConfig1D::new(
-            (ids.len() * 2048).div_ceil(256) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_embed_rows";
+        let grid = launch_u32(what, "grid", (ids.len() * 2048).div_ceil(256))?;
+        let n_rows = launch_u32(what, "w.rows()", w.rows())?;
+        let prep = self
+            .module
+            .prepare_embed_rows(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
-            .embed_rows(stream, &prep, w.buf(), ids, w.rows() as u32, y)?;
+            .embed_rows(stream, &prep, w.buf(), ids, n_rows, y)?;
         Ok(())
     }
 
@@ -638,11 +646,13 @@ impl ElemKernels {
                 ),
             ));
         }
-        let prep =
-            self.module
-                .prepare_rms_norm(LaunchConfig1D::new(m as u32, RMS_THREADS as u32, 0))?;
-        self.module
-            .rms_norm(stream, &prep, x, gain, eps, k as u32, m as u32, y)?;
+        let what = "enqueue_rms_norm";
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_rms_norm(LaunchConfig1D::new(m, RMS_THREADS_U32, 0))?;
+        self.module.rms_norm(stream, &prep, x, gain, eps, k, m, y)?;
         Ok(())
     }
 
@@ -688,11 +698,15 @@ impl ElemKernels {
             ));
         }
         let threads = m * n_vec as usize * (n_dims / 2);
-        let prep =
-            self.module
-                .prepare_rope(LaunchConfig1D::new(threads.div_ceil(256) as u32, 256, 0))?;
+        let what = "enqueue_rope";
+        let grid = launch_u32(what, "grid", threads.div_ceil(256))?;
+        let n_dims = launch_u32(what, "n_dims", n_dims)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_rope(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
-            .rope(stream, &prep, src, cs, n_dims as u32, n_vec, m as u32, dst)?;
+            .rope(stream, &prep, src, cs, n_dims, n_vec, m, dst)?;
         Ok(())
     }
 
@@ -717,10 +731,11 @@ impl ElemKernels {
                 ),
             ));
         }
-        let prep =
-            self.module
-                .prepare_swiglu(LaunchConfig1D::new(n.div_ceil(256) as u32, 256, 0))?;
-        self.module.swiglu(stream, &prep, gate, up, n as u32, y)?;
+        let n = launch_u32("enqueue_swiglu", "n", n)?;
+        let prep = self
+            .module
+            .prepare_swiglu(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.swiglu(stream, &prep, gate, up, n, y)?;
         Ok(())
     }
 
@@ -745,10 +760,11 @@ impl ElemKernels {
                 ),
             ));
         }
+        let n = launch_u32("enqueue_add", "n", n)?;
         let prep = self
             .module
-            .prepare_add(LaunchConfig1D::new(n.div_ceil(256) as u32, 256, 0))?;
-        self.module.add(stream, &prep, a, b, n as u32, y)?;
+            .prepare_add(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.add(stream, &prep, a, b, n, y)?;
         Ok(())
     }
 
@@ -790,13 +806,15 @@ impl ElemKernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_weighted_sum(LaunchConfig1D::new(
-            (rows * m).div_ceil(256) as u32,
-            256,
-            0,
-        ))?;
+        let what = "enqueue_weighted_sum";
+        let grid = launch_u32(what, "grid", (rows * m).div_ceil(256))?;
+        let rows = launch_u32(what, "rows", rows)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_weighted_sum(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
-            .weighted_sum(stream, &prep, down, w, rows as u32, n_exp, m as u32, y)?;
+            .weighted_sum(stream, &prep, down, w, rows, n_exp, m, y)?;
         Ok(())
     }
 
@@ -817,10 +835,11 @@ impl ElemKernels {
                 format!("n={n}, y.len() {} (need {n})", y.len()),
             ));
         }
-        let prep =
-            self.module
-                .prepare_half_decode(LaunchConfig1D::new(n.div_ceil(256) as u32, 256, 0))?;
-        self.module.half_decode(stream, &prep, bits, n as u32, y)?;
+        let n = launch_u32("enqueue_half_decode", "n", n)?;
+        let prep = self
+            .module
+            .prepare_half_decode(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.half_decode(stream, &prep, bits, n, y)?;
         Ok(())
     }
 
@@ -840,10 +859,11 @@ impl ElemKernels {
                 format!("n={n}, x.len() {}, out.len() {}", x.len(), out.len()),
             ));
         }
+        let n = launch_u32("enqueue_argmax", "n", n)?;
         let prep = self
             .module
-            .prepare_argmax(LaunchConfig1D::new(1, ARGMAX_THREADS as u32, 0))?;
-        self.module.argmax(stream, &prep, x, n as u32, out)?;
+            .prepare_argmax(LaunchConfig1D::new(1, ARGMAX_THREADS_U32, 0))?;
+        self.module.argmax(stream, &prep, x, n, out)?;
         Ok(())
     }
 }

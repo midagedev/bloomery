@@ -7,6 +7,7 @@
 use crate::GpuError;
 use crate::cores::q3k_row_dot;
 use crate::elem::{silu_mul, weighted_expert_sum};
+use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
@@ -281,14 +282,15 @@ impl MoeFusedKernels {
                 ),
             ));
         }
-        let n_experts = wg.rows() / rows_per_expert;
+        let what = "enqueue_expert_gate_up_swiglu";
+        let grid = launch_u32(what, "grid", (n_slots * rows_per_expert).div_ceil(8))?;
+        let n_experts = launch_u32(what, "n_experts", wg.rows() / rows_per_expert)?;
+        let rows_per_expert = launch_u32(what, "rows_per_expert", rows_per_expert)?;
+        let n_slots = launch_u32(what, "n_slots", n_slots)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let prep = self
             .module
-            .prepare_expert_gate_up_swiglu_q3k(LaunchConfig1D::new(
-                (n_slots * rows_per_expert).div_ceil(8) as u32,
-                256,
-                0,
-            ))?;
+            .prepare_expert_gate_up_swiglu_q3k(LaunchConfig1D::new(grid, 256, 0))?;
         self.module.expert_gate_up_swiglu_q3k(
             stream,
             &prep,
@@ -297,11 +299,11 @@ impl MoeFusedKernels {
             &act.q3,
             &act.d8,
             sel,
-            n_experts as u32,
-            rows_per_expert as u32,
-            n_slots as u32,
-            n_sb as u32,
-            n_sb.div_ceil(2) as u32,
+            n_experts,
+            rows_per_expert,
+            n_slots,
+            n_sb,
+            n_sb.div_ceil(2),
             h,
         )?;
         Ok(())
@@ -359,22 +361,14 @@ impl MoeFusedKernels {
                 ),
             ));
         }
-        let prep = self.module.prepare_moe_combine(LaunchConfig1D::new(
-            rows.div_ceil(256) as u32,
-            256,
-            0,
-        ))?;
-        self.module.moe_combine(
-            stream,
-            &prep,
-            down,
-            w,
-            shexp,
-            resid,
-            rows as u32,
-            n_slots as u32,
-            y,
-        )?;
+        let what = "enqueue_moe_combine";
+        let rows = launch_u32(what, "rows", rows)?;
+        let n_slots = launch_u32(what, "n_slots", n_slots)?;
+        let prep =
+            self.module
+                .prepare_moe_combine(LaunchConfig1D::new(rows.div_ceil(256), 256, 0))?;
+        self.module
+            .moe_combine(stream, &prep, down, w, shexp, resid, rows, n_slots, y)?;
         Ok(())
     }
 }
