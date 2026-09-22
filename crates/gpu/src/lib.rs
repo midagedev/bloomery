@@ -28,7 +28,7 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread,
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-pub(crate) mod cores;
+pub mod cores;
 pub mod elem;
 pub mod flash;
 pub mod fused;
@@ -226,7 +226,7 @@ impl From<::model::ModelError> for GpuError {
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub(crate) fn q8_1_quant_block(
+pub fn q8_1_quant_block(
     x: &[f32],
     x0: usize,
     col: usize,

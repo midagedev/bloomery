@@ -1,0 +1,26 @@
+[package]
+name = "bloomery-gpu-xcrate-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[[bin]]
+name = "gpu-xcrate-spike"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Optional on purpose, as in `gpu-spike`: with the feature off this package
+# has no edge to the device crate and carries no `#[cuda_module]`, so a plain
+# `cargo build` never reaches the embedded-bundle anchor the cargo-oxide
+# backend defines.
+bloomery-gpu = { path = "../gpu", optional = true }
+cuda-core = { workspace = true, optional = true }
+cuda-device = { workspace = true, optional = true }
+cuda-host = { workspace = true, optional = true }
+
+[features]
+gpu = ["dep:bloomery-gpu", "dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
