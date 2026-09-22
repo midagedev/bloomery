@@ -245,7 +245,7 @@ All 13 subsystem gates pass on main with real exit codes (rerun after the
 `cargo test` runs almost nothing by design, and `.config/nextest.toml` fences
 them out of the fast loop. The `just gate-*` recipes are how they run.
 
-`just lint` runs clippy **with `--features gpu`** (without it the 17 gpu-gates binaries
+`just lint` runs clippy **with `--features gpu`** (without it the GPU gpu-gates binaries
 are dummy mains and their bodies are never linted). The ratchet counter is
 `grep -c '^warning:'` on that output, which counts a warning once per target it
 appears in (an agent's unique-count will read lower — same direction, different

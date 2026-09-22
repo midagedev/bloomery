@@ -10,7 +10,7 @@ default:
     @just --list
 
 # `--features gpu`(R26): 피처 뒤에 본체가 숨은 바이너리는 그 피처를 켜야 검사된다 —
-# gpu-gates 바이너리 17개 본체가 끄면 통째로 안 보인다.
+# gpu-gates 바이너리의 GPU 본체가 끄면 통째로 안 보인다.
 # 빠른 루프: 타입 검사만, 커널은 안 만든다.
 check:
     ./tools/box.sh 'cargo check --workspace --all-targets --features gpu'
