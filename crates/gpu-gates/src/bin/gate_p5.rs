@@ -59,8 +59,8 @@ use bloomery_gpu::{DeviceTensor, Gpu};
 use bloomery_gpu_gates::RefRow;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    activations, find_ref_row, max_rel_err, open_model, ref_dir, ref_manifest, ref_tensor_of,
-    widened_f16_bits,
+    activations, bits_equal, find_ref_row, max_rel_err, open_model, ref_dir, ref_manifest,
+    ref_tensor_of, verdict, widened_f16_bits,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -184,7 +184,10 @@ fn no_local_depot(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
 /// positions, the m=TOKENS causal prefill shape, and (layer 0 only) the
 /// captured-graph checks.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "gate harness: the case's buffers are passed flat; a params struct is the R8 round"
+)]
 fn real_layer(
     man: &[RefRow],
     gpu: &Gpu,
@@ -514,7 +517,10 @@ fn real_layer(
 /// Synthetic LCG keys/queries at the 32-key block edges, every row past
 /// `n_keys` holding the f16 NaN bit pattern.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "gate harness: the case's buffers are passed flat; a params struct is the R8 round"
+)]
 fn depth_cases(
     gpu: &Gpu,
     flash: &FlashKernels,
@@ -809,7 +815,10 @@ fn edge_values(
 
 /// Flash inside a captured graph: replay must be byte-identical to eager.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "gate harness: the case's buffers are passed flat; a params struct is the R8 round"
+)]
 fn graph_check_flash(
     gpu: &Gpu,
     flash: &FlashKernels,
@@ -959,7 +968,10 @@ fn kq_scale_of(gguf: &Gguf) -> Result<f32, Box<dyn std::error::Error>> {
 /// `Σ w_i·v_i[d] / Σ w_i` cast once to f32. Query `t` of `m` attends to
 /// keys `0..n_keys − m + t + 1` (the causal prefix the kernel uses).
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "gate harness: the case's buffers are passed flat; a params struct is the R8 round"
+)]
 fn flash_f64_ref(
     q: &[f32],
     keys16: &[u16],
@@ -1012,14 +1024,4 @@ fn ik_kqv_rows(kqv: &[f32], t: usize, n_heads: usize, latent: usize) -> Vec<f32>
     (0..n_heads)
         .flat_map(|h| (0..latent).map(move |d| kqv[d + latent * h + latent * n_heads * t]))
         .collect()
-}
-
-#[cfg(feature = "gpu")]
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
-#[cfg(feature = "gpu")]
-fn verdict(pass: bool) -> &'static str {
-    if pass { "PASS" } else { "FAIL" }
 }

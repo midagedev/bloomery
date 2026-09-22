@@ -66,7 +66,7 @@ impl<T: DeviceCopy> DeviceTensor<T> {
 
 /// q8_1 activation scratch for up to `m` columns of `k` values each. One
 /// set per distinct input site: sites that read the same activation
-/// (gate·up, q·kv_a) share one (decision 2, MUL-37 on the CPU).
+/// (gate·up, q·kv_a) share one (decision 2, as the CPU engine does).
 ///
 /// `k` is a multiple of 256 with 256 <= k <= 10944 (the model's largest K,
 /// so the multiple-of-256 test caps the usable range at 10752). With

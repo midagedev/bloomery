@@ -128,8 +128,7 @@ fn data_file(name: &str) -> std::path::PathBuf {
 /// (19 + 1) + 26 × (24 + 1) + 27 + 4 = 20 + 650 + 27 + 4 = 701. Both merges
 /// carry a value-neutral rollback lever (`StepProbe::split_heads`,
 /// `split_kqvc`). Since the fmerge round the levers nest, so restoring the
-/// original 755 takes all four of them; measured at `--ctx 256` (lead,
-/// 2026-09-22): none 648, `split_heads`+`split_flash_quant` **702**,
+/// original 755 takes all four of them; measured at `--ctx 256`: none 648, `split_heads`+`split_flash_quant` **702**,
 /// plus `split_kqvc` 729, plus `split_moe_quant` **755**. The tokens are
 /// identical to the default path's at every one of those counts.
 /// `split_kqvc` alone does nothing — there is no pair launch to split until
@@ -297,10 +296,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Cross-check, ASSERTED since the ikclear round (2026-09-21). It used to
-    // be printed only, on the premise that the two files were ik runs at
-    // different context sizes (`argmax.sh` sized `-c` as `512 + GEN`) and so
-    // were not the same quantity. That premise was wrong twice over: the
+    // Cross-check, asserted. Printing it only would rest on the premise that
+    // the two files were ik runs at different context sizes (`argmax.sh`
+    // sized `-c` as `512 + GEN`) and so were not the same quantity. That
+    // premise is wrong twice over: the
     // context size makes no difference here (regenerating the greedy file at
     // -c 544 is byte-identical to -c 512), and the real cause of the skew was
     // ik widening a sequence's first graph to all 64 experts whenever it

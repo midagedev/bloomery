@@ -220,7 +220,7 @@ mod kernels {
     /// gemv lane geometry — the same bytes in the permutation that makes its format's
     /// gemv load instruction address 32 lane-consecutive words (one 128B L1
     /// line) instead of four strided clusters (four lines, four wavefronts
-    /// per load — the M>1 marginal cost MUL-8 chased; the index identity
+    /// per load — the M>1 marginal cost; the index identity
     /// p(old_slot) == new_slot is host-verified for every load site of all
     /// three formats, so the values are bit-identical to the single linear
     /// store). Q3_K goes one step further: its gemv reads the four words of
@@ -749,7 +749,7 @@ mod kernels {
                     f0 += (a as f32) * (e0 * drow * sc as f32);
                 }
                 // Columns 1..7, one launch-uniform guard per column so the
-                // work scales with m (MUL-8 amortization curve). Column c
+                // work scales with m (the amortization curve over m). Column c
                 // reads q8 words at q_col*c + qb (+32 per word) and block
                 // d8b + d8_col*c.
                 // SAFETY: guard m > c means q.len() >= (c+1)*q_col >

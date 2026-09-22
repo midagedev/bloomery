@@ -25,7 +25,7 @@ use cuda_device::dotprod::dp4a_s32;
 ///
 /// That makes the hardware convert a substitute exactly where the value
 /// cannot be a NaN, and nowhere else. `q3k_sb_decode` takes it for the Q3_K
-/// super-block scale (2026-09-21, q3kdec round): a scale read from a GGUF is
+/// super-block scale: a scale read from a GGUF is
 /// finite or the model's output is not a number, and ik reads the same field
 /// with `__half2float`. Q4_K's `d`/`dmin`, Q6_K's inline decode and
 /// `gate_p4`'s whole-space assertion still call this function, and
@@ -111,7 +111,7 @@ pub fn q6_slot(v4: u32) -> u32 {
 /// bias trick). Called eight times per iteration on the hoisted qs
 /// words instead of once per (column, word) — the per-column re-decode
 /// was half of q4k's per-column instruction count and with it twice
-/// attnstk's M>1 marginal cost (MUL-8).
+/// attnstk's M>1 marginal cost.
 #[inline(always)]
 pub(crate) fn q4k_nibble(qsw: u32, nib_sh: u32) -> u32 {
     ((((qsw >> nib_sh) & 0x0f0f0f0f) | 0x80808080).wrapping_sub(0x08080808)) ^ 0x80808080
@@ -208,8 +208,8 @@ pub fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
     let (cda, cdb) = q4k_coeff(d, dmin, sc, mi);
 
     // qs word base: 8 words from super-block word 4 + 8*(s>>1); nibble
-    // select is the sub-block parity, 0 (low) or 4 (high). Hoisted
-    // (MUL-8): the window and its SWAR decode are column-independent, so
+    // select is the sub-block parity, 0 (low) or 4 (high). Hoisted:
+    // the window and its SWAR decode are column-independent, so
     // decode once per iteration and let every column's A chain reuse the
     // registers.
     let qsk = wk + 4 + 8 * (s >> 1);
@@ -489,7 +489,7 @@ pub fn q4k_row_dot(
                 f0 += (a as f32 * cda + b as f32 * cdb) * e0;
             }
             // Columns 1..7, one launch-uniform guard per column so the
-            // work scales with m (MUL-8 amortization curve). Column c
+            // work scales with m (the amortization curve over m). Column c
             // reads q8 words at q_col*c + qb (q4k_a_chain adds 32i), the
             // s8 group at s8_col*c + s8b and block d8b + d8_col*c.
             // SAFETY: guard c+1 means m >= c+1 is launch-uniform, so the
@@ -994,7 +994,7 @@ pub fn q3k_row_dot(
                 f0 += (a as f32) * (unsafe { *d8.get_unchecked(d8b0 + d8b) } * drow);
             }
             // Columns 1..7, one launch-uniform guard per column so the
-            // work scales with m (MUL-8 amortization curve). Same shape
+            // work scales with m (the amortization curve over m). Same shape
             // as column 0 with the per-column q/d8 offsets (q stride
             // q_col u64, d8 d8_col).
             // SAFETY: guard m > c means q.len() >= (col0+c+1)*q_col >

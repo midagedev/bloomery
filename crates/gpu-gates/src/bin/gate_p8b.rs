@@ -48,7 +48,7 @@ use bloomery_gpu::model::StepProbe;
 use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    RefRow, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
+    find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
     ref_tensor_logical_in, route_ref, topk_ids_logical, verdict, widened_f16_bits,
 };
 

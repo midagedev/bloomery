@@ -640,12 +640,12 @@ fn router_shape(ok: &mut bool) -> Result<(), Box<dyn std::error::Error>> {
     /// Activation columns the general gemv body guards, one multiply-add
     /// each: the count an entry carrying *only* the starved body shows.
     const GEMV_COLS: usize = 8;
-    /// Floor on a gemv entry's `fma.`: the general body's one per column
-    /// plus the single-column body's one per hoisted chunk. A body that lost
-    /// the single-column path, or kept it without hoisting, cannot reach it.
-    /// The floor, not the exact count — the backend is free to duplicate a
-    /// body it inlines, and pinning the duplication would be pinning the
-    /// compiler rather than the shape.
+    // Floor on a gemv entry's `fma.`: the general body's one per column
+    // plus the single-column body's one per hoisted chunk. A body that lost
+    // the single-column path, or kept it without hoisting, cannot reach it.
+    // The floor, not the exact count — the backend is free to duplicate a
+    // body it inlines, and pinning the duplication would be pinning the
+    // compiler rather than the shape.
     let gemv_fma_floor = GEMV_COLS + LANE_UNROLL;
 
     let blob = std::fs::read(std::env::current_exe()?)?;
