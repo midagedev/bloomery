@@ -44,6 +44,7 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread}
 use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
 use model::attn::MlaParams;
+use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -846,6 +847,38 @@ impl DenseScratch {
     }
 }
 
+/// Element offsets into `LayerScratch::step_params`, the single buffer the
+/// per-step parameters share: the three u32 first, then the rope cos/sin
+/// table as f32 bits. The table is read element by element on the device, so
+/// four-byte alignment is all its window needs.
+const SP_TOKEN: usize = 0;
+const SP_POS: usize = 1;
+const SP_N_KEYS: usize = 2;
+const SP_CS: usize = 3;
+
+/// A non-owning window of `len` `T` over `parent`, starting at element `off`
+/// of the parent's u32 grid. The launches read it exactly as they read a
+/// buffer of its own.
+///
+/// # Safety
+///
+/// - `off * 4 + len * size_of::<T>()` must be within `parent`'s allocation,
+///   and `off * 4` must be a multiple of `align_of::<T>()`.
+/// - `parent` must outlive the window and must not be reallocated: a captured
+///   graph bakes the address in.
+unsafe fn param_view<T>(
+    parent: &DeviceBuffer<u32>,
+    off: usize,
+    len: usize,
+) -> ManuallyDrop<DeviceBuffer<T>> {
+    let ptr = parent.cu_deviceptr() + (off * size_of::<u32>()) as u64;
+    // SAFETY: the range is the caller's contract above; `parent` was allocated
+    // by `DeviceBuffer::from_host`, the synchronous allocator `from_raw_parts`
+    // assumes, and in the context cloned here. `ManuallyDrop` is what keeps the
+    // window from ever freeing an allocation it does not own.
+    ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, parent.context().clone()) })
+}
+
 /// The layer scratch arena and the device-side step parameters, sized at
 /// load for m = 1 (decision 4: nothing here is allocated per step). One
 /// arena serves every layer of a stage — layers run sequentially, so the
@@ -888,10 +921,21 @@ struct LayerScratch {
     part_ms: DeviceBuffer<f32>,
     g_f_rope_lo: Gather,
     g_f_rope_hi: Gather,
-    pos_buf: DeviceBuffer<u32>,
-    n_keys_buf: DeviceBuffer<u32>,
-    token_buf: DeviceBuffer<u32>,
-    cs_buf: DeviceBuffer<f32>,
+    /// Every per-step parameter in one allocation, laid out by the `SP_*`
+    /// constants. The four quantities used to be four buffers and four
+    /// `copy_from_host` calls per step, and each of those synchronizes the
+    /// stream; one image means one copy and one synchronization.
+    step_params: DeviceBuffer<u32>,
+    /// Host image of `step_params`, refilled in place each step so this image
+    /// adds no allocation of its own.
+    params_host: Vec<u32>,
+    /// Non-owning windows into `step_params`, one per kernel argument. The
+    /// launches take them exactly as they took the separate buffers; the
+    /// parent owns the allocation and these never free it.
+    pos_buf: ManuallyDrop<DeviceBuffer<u32>>,
+    n_keys_buf: ManuallyDrop<DeviceBuffer<u32>>,
+    token_buf: ManuallyDrop<DeviceBuffer<u32>>,
+    cs_buf: ManuallyDrop<DeviceBuffer<f32>>,
     /// Host mirror of `pos_buf`, written by the same `refresh_params` that
     /// fills the device buffers. The launches never read it: it is what the
     /// byte accounting counts the live key rows from, since the count the
@@ -923,17 +967,14 @@ impl LayerScratch {
             &self.attn_out,
             &self.ffn_inp,
             &self.l_out,
-            &self.cs_buf,
             &self.part_v,
             &self.part_ms,
         ]
         .iter()
         .map(|b| b.num_bytes())
         .sum::<usize>();
-        total += self.pos_buf.num_bytes()
-            + self.n_keys_buf.num_bytes()
-            + self.token_buf.num_bytes()
-            + self.probe_buf.num_bytes();
+        // The four parameter windows are counted once, through their parent.
+        total += self.step_params.num_bytes() + self.probe_buf.num_bytes();
         let act = |a: &Q8Act| {
             a.q3.num_bytes()
                 + a.q4.num_bytes()
@@ -1813,9 +1854,8 @@ impl GpuModel {
     pub fn device_step_params(&mut self) -> Result<(u32, u32), GpuError> {
         let (gpu, residency) = self.stage_parts("device_step_params")?;
         let stream = gpu.stream();
-        let pos = residency.scratch.pos_buf.to_host_vec(stream)?;
-        let n_keys = residency.scratch.n_keys_buf.to_host_vec(stream)?;
-        match (pos.first(), n_keys.first()) {
+        let params = residency.scratch.step_params.to_host_vec(stream)?;
+        match (params.get(SP_POS), params.get(SP_N_KEYS)) {
             (Some(p), Some(k)) => Ok((*p, *k)),
             _ => Err("GpuModel::device_step_params: empty parameter buffer".into()),
         }
@@ -2001,8 +2041,9 @@ impl GpuModel {
 
     /// Refresh every per-step device parameter for `(token, pos)`: the rope
     /// cos/sin cache (host YaRN math, one position), the token id, the KV
-    /// landing row and the live key count. Runs before an eager enqueue or a
-    /// graph replay; a captured graph reads these buffers at run time, which
+    /// landing row and the live key count. All four share `step_params`, so
+    /// the refresh is one host-to-device copy. Runs before an eager enqueue or
+    /// a graph replay; a captured graph reads that buffer at run time, which
     /// is what lets one graph serve every position.
     fn refresh_params(&mut self, token: u32, pos: u32) -> Result<(), GpuError> {
         let mut cs = Vec::new();
@@ -2010,10 +2051,13 @@ impl GpuModel {
         let (gpu, residency) = self.stage_parts("refresh_params")?;
         let stream = gpu.stream();
         let s = &mut residency.scratch;
-        s.cs_buf.copy_from_host(stream, &cs)?;
-        s.token_buf.copy_from_host(stream, &[token])?;
-        s.pos_buf.copy_from_host(stream, &[pos])?;
-        s.n_keys_buf.copy_from_host(stream, &[pos + 1])?;
+        s.params_host.clear();
+        s.params_host.push(token);
+        s.params_host.push(pos);
+        s.params_host.push(pos + 1);
+        s.params_host.extend(cs.iter().map(|v| v.to_bits()));
+        let (params, image) = (&mut s.step_params, &s.params_host);
+        params.copy_from_host(stream, image)?;
         s.pos_host = pos;
         Ok(())
     }
@@ -2803,6 +2847,23 @@ impl LayerScratch {
             }),
             None => None,
         };
+        // The step image starts where `refresh_params` would leave position 0:
+        // token 0, pos 0, one live key, a zeroed rope table.
+        let mut params_host = vec![0u32; SP_CS + rope];
+        params_host[SP_N_KEYS] = 1;
+        let step_params = DeviceBuffer::from_host(stream, &params_host)?;
+        // SAFETY: each window is inside `step_params`'s extent by the `SP_*`
+        // layout, every offset is a u32 multiple and so four-byte aligned, and
+        // `step_params` moves into the arena below, where it outlives them and
+        // is never reallocated.
+        let (cs_buf, token_buf, pos_buf, n_keys_buf) = unsafe {
+            (
+                param_view::<f32>(&step_params, SP_CS, rope),
+                param_view::<u32>(&step_params, SP_TOKEN, 1),
+                param_view::<u32>(&step_params, SP_POS, 1),
+                param_view::<u32>(&step_params, SP_N_KEYS, 1),
+            )
+        };
         Ok(LayerScratch {
             x: f32n(hidden)?,
             normed: f32n(hidden)?,
@@ -2842,10 +2903,12 @@ impl LayerScratch {
             )?,
             part_v: f32n(crate::flash::partials_v_len(mla.n_head, ctx_max))?,
             part_ms: f32n(crate::flash::partials_ms_len(mla.n_head, ctx_max))?,
-            pos_buf: DeviceBuffer::from_host(stream, &[0u32])?,
-            n_keys_buf: DeviceBuffer::from_host(stream, &[1u32])?,
-            token_buf: DeviceBuffer::from_host(stream, &[0u32])?,
-            cs_buf: f32n(rope)?,
+            step_params,
+            params_host,
+            pos_buf,
+            n_keys_buf,
+            token_buf,
+            cs_buf,
             pos_host: 0,
             probe: crate::probe::Probe::load(ctx)?,
             probe_buf: f32n(32)?,
