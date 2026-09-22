@@ -3,14 +3,16 @@
 // Opens a GGUF file, finds every distinct ggml type among its tensors, and
 // for each type dumps the dequantization of the first rows of one tensor of
 // that type, using ggml's own to_float (ggml_internal_get_type_traits):
-//   $BLOOMERY_DATA/ref/<type_name>.raw   — f32 reference rows, row-major
-//   $BLOOMERY_DATA/ref/<type_name>.meta  — tensor name, type, dims, rows, rowlen
-//   $BLOOMERY_DATA/ref/manifest.txt      — "<type_num> <type_name> <count>" per type
-// The Rust gate (crates/gguf/tests/oracle.rs) re-derives the same rows from
-// its own loader and demands max |diff| <= 1e-6 per type.
+//   <out>/<type_name>.raw   — f32 reference rows, row-major
+//   <out>/<type_name>.meta  — tensor name, type, dims, rows, rowlen
+//   <out>/manifest.txt      — "<type_num> <type_name> <count>" per type
+// <out> is $BLOOMERY_DATA/ref unless given. Type names (ggml_type_name
+// spellings: f32 bf16 q8_0 ...) keep only those types, and each one named
+// must be in the file. The Rust gate (crates/gguf/tests/oracle.rs) re-derives
+// the same rows from its own loader and compares them per type.
 //
 // Build: bash tools/ref/build-dequant.sh   (on the box, IK=/home/user/ik_llama.cpp)
-// Run:   $BLOOMERY_DATA/bin/dequant_ref [model.gguf]
+// Run:   $BLOOMERY_DATA/bin/dequant_ref [model.gguf [out_dir [type_name ...]]]
 
 #include <algorithm>
 #include <cstdint>
@@ -52,6 +54,8 @@ static std::vector<uint8_t> read_range(const char * path, int64_t off, size_t n)
 
 int main(int argc, char ** argv) {
     const char * path = argc > 1 ? argv[1] : kGgufPath;
+    const std::string out_dir = argc > 2 ? argv[2] : std::string(kDataDir) + "/ref";
+    const std::vector<std::string> only(argv + std::min(argc, 3), argv + argc);
 
     // ---- open GGUF, tensor metadata only (no_alloc), as q3k_ref.cpp does ----
     struct ggml_context * gctx = nullptr;
@@ -76,13 +80,26 @@ int main(int argc, char ** argv) {
         }
     }
 
-    std::filesystem::create_directories(std::string(kDataDir) + "/ref");
-    std::string manifest_path = std::string(kDataDir) + "/ref/manifest.txt";
+    // A filter names types the file must hold: an absent one is an error, never
+    // a dump that silently lacks it.
+    for (const std::string & want : only) {
+        auto it = std::find_if(counts.begin(), counts.end(), [&want](const std::pair<int,int> & c) {
+            return want == ggml_type_name((enum ggml_type)c.first);
+        });
+        if (it == counts.end()) fail("type " + want + " is not in " + path);
+    }
+
+    std::filesystem::create_directories(out_dir);
+    std::string manifest_path = out_dir + "/manifest.txt";
     FILE * mf = std::fopen(manifest_path.c_str(), "wb");
     if (!mf) fail("cannot open for write: " + manifest_path);
 
+    size_t written = 0;
     for (size_t k = 0; k < counts.size(); ++k) {
         const enum ggml_type type = (enum ggml_type)counts[k].first;
+        if (!only.empty() && std::find(only.begin(), only.end(), ggml_type_name(type)) == only.end()) {
+            continue;
+        }
         const int tidx = first_of_type[k];
         const char * name = gguf_get_tensor_name(gguf, tidx); // borrowed, not freed
         struct ggml_tensor * info = ggml_get_tensor(gctx, name);
@@ -116,9 +133,9 @@ int main(int argc, char ** argv) {
         }
 
         const char * tname = ggml_type_name(type);
-        write_file(std::string(kDataDir) + "/ref/" + tname + ".raw",
+        write_file(out_dir + "/" + tname + ".raw",
                    out.data(), out.size() * sizeof(float));
-        FILE * meta = std::fopen((std::string(kDataDir) + "/ref/" + tname + ".meta").c_str(), "wb");
+        FILE * meta = std::fopen((out_dir + "/" + tname + ".meta").c_str(), "wb");
         if (!meta) fail("cannot open meta for write");
         std::fprintf(meta, "tensor=%s\n", name);
         std::fprintf(meta, "type=%d %s\n", (int)type, tname);
@@ -131,10 +148,11 @@ int main(int argc, char ** argv) {
         std::fprintf(mf, "%d %s %d\n", (int)type, tname, counts[k].second);
         std::printf("%-6s tensor=%s rows=%lld rowlen=%lld row_bytes=%zu\n",
                     tname, name, (long long)rows, (long long)ne0, row_bytes);
+        ++written;
     }
     std::fclose(mf);
     gguf_free(gguf);
     ggml_free(gctx);
-    std::printf("wrote %zu types to %s/ref\n", counts.size(), kDataDir);
+    std::printf("wrote %zu types to %s\n", written, out_dir.c_str());
     return 0;
 }

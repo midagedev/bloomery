@@ -10,7 +10,8 @@
 //! tensor must be sized by this engine's `GgmlType` and sit inside the file)
 //! and [`inventory_of`] (header-only — unknown type ids are carried as
 //! numbers with ggml's size table, so files with types the engine cannot
-//! dequantize still inventory).
+//! dequantize still inventory). A model split across shards opens as a
+//! [`Split`]: one strict reader per shard, validated as one model.
 //!
 //! Format facts mirrored from the vendored ik_llama.cpp reader
 //! (`gguf_init_from_file`, ggml.c:31219-31475):
@@ -33,8 +34,9 @@ pub use quant::{
     quantize_row_q8_2_x4_roundtrip, quantize_row_q8_k_roundtrip,
 };
 
+use std::collections::HashMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use memmap2::{Mmap, MmapMut};
 
@@ -117,6 +119,28 @@ pub enum LoadError {
         off: u64,
         nbytes: u64,
         len: u64,
+    },
+    /// A shard of a split that its own open refused; the error names the shard.
+    #[error("{path}: {source}")]
+    Shard {
+        path: String,
+        source: Box<LoadError>,
+    },
+    #[error("split shard {path} is missing")]
+    MissingShard { path: String },
+    #[error("{path}: {key} {detail}")]
+    SplitKey {
+        path: String,
+        key: &'static str,
+        detail: String,
+    },
+    #[error("{path}: split.count says a split, but the name does not end in {suffix:?}")]
+    SplitName { path: String, suffix: String },
+    #[error("tensor {name:?} appears twice: in {first} and in {second}")]
+    DuplicateTensor {
+        name: String,
+        first: String,
+        second: String,
     },
 }
 
@@ -414,12 +438,224 @@ impl Gguf {
     }
 }
 
+/// The split keys llama.cpp's splitter writes into every shard
+/// (ik examples/gguf-split/gguf-split.cpp:246-248): `split.no` and
+/// `split.count` as u16, `split.tensors.count` — the whole model's count —
+/// as i32.
+const SPLIT_NO: &str = "split.no";
+const SPLIT_COUNT: &str = "split.count";
+const SPLIT_TENSORS: &str = "split.tensors.count";
+
+/// A model as one GGUF file or as llama.cpp's split set. The first shard
+/// names the set: its siblings are `<prefix>-%05d-of-%05d.gguf`
+/// (`llama_split_path`, ik src/llama.cpp:13829; the prefix is what
+/// `llama_split_prefix`, :13904, strips). The set is one model or it is
+/// refused: every shard's `split.no` is its place, every `split.count`
+/// agrees, the tensor counts sum to the first shard's `split.tensors.count`,
+/// and no tensor name appears twice — the ik loader's checks
+/// (src/llama-model-loader.cpp:361-431) plus the per-shard keys it does not
+/// read.
+///
+/// Every shard opens with the strict reader and lazily, so opening touches
+/// the headers only. Metadata is the first shard's: the splitter writes the
+/// model's keys there alone (gguf-split.cpp:242).
+pub struct Split {
+    shards: Vec<Gguf>,
+    paths: Vec<PathBuf>,
+    /// Tensor name to (shard, index in that shard's table).
+    by_name: HashMap<String, (usize, usize)>,
+}
+
+impl Split {
+    /// Open the model whose first shard is `first`. A file without
+    /// `split.count` is a one-shard model.
+    pub fn open(first: impl AsRef<Path>) -> Result<Split, LoadError> {
+        let first = first.as_ref().to_path_buf();
+        let head = open_shard(&first)?;
+        let Some(count) = head.value(SPLIT_COUNT) else {
+            return Split::assemble(vec![head], vec![first]);
+        };
+        let count = split_int(&first, SPLIT_COUNT, Some(count))?;
+        if count == 0 {
+            return Err(split_key(&first, SPLIT_COUNT, "is 0".to_string()));
+        }
+        check_place(&head, &first, 0)?;
+        let mut shards = vec![head];
+        let mut paths = vec![first];
+        if count > 1 {
+            let suffix = shard_suffix(0, count);
+            let name = paths[0].to_string_lossy().into_owned();
+            let prefix = match name.strip_suffix(&suffix) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => return Err(LoadError::SplitName { path: name, suffix }),
+            };
+            for i in 1..count {
+                let path = PathBuf::from(format!("{prefix}{}", shard_suffix(i, count)));
+                let g = open_shard(&path)?;
+                check_place(&g, &path, i)?;
+                let theirs = split_int(&path, SPLIT_COUNT, g.value(SPLIT_COUNT))?;
+                if theirs != count {
+                    let detail = format!("is {theirs}, the first shard's is {count}");
+                    return Err(split_key(&path, SPLIT_COUNT, detail));
+                }
+                shards.push(g);
+                paths.push(path);
+            }
+        }
+        let want = split_int(&paths[0], SPLIT_TENSORS, shards[0].value(SPLIT_TENSORS))?;
+        let got: u64 = shards.iter().map(|g| g.tensor_count() as u64).sum();
+        if got != want {
+            let detail = format!("is {want}, but the {count} shards hold {got} tensors");
+            return Err(split_key(&paths[0], SPLIT_TENSORS, detail));
+        }
+        Split::assemble(shards, paths)
+    }
+
+    /// Index every tensor by name, refusing a name that appears twice.
+    fn assemble(shards: Vec<Gguf>, paths: Vec<PathBuf>) -> Result<Split, LoadError> {
+        let mut by_name: HashMap<String, (usize, usize)> = HashMap::new();
+        for (s, g) in shards.iter().enumerate() {
+            for (i, t) in g.iter_tensors().enumerate() {
+                if let Some(&(first, _)) = by_name.get(&t.name) {
+                    return Err(LoadError::DuplicateTensor {
+                        name: t.name.clone(),
+                        first: paths[first].display().to_string(),
+                        second: paths[s].display().to_string(),
+                    });
+                }
+                by_name.insert(t.name.clone(), (s, i));
+            }
+        }
+        Ok(Split {
+            shards,
+            paths,
+            by_name,
+        })
+    }
+
+    /// Number of shards (1 for a single file).
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Shard `i`'s reader — the one whose [`Gguf::data`] holds its tensors.
+    pub fn shard(&self, i: usize) -> Option<&Gguf> {
+        self.shards.get(i)
+    }
+
+    /// Shard `i`'s path.
+    pub fn shard_path(&self, i: usize) -> Option<&Path> {
+        self.paths.get(i).map(PathBuf::as_path)
+    }
+
+    /// Tensors across all shards.
+    pub fn tensor_count(&self) -> usize {
+        self.by_name.len()
+    }
+
+    /// Lookup by exact tensor name: the shard that holds it and its info.
+    pub fn find(&self, name: &str) -> Option<(usize, &TensorInfo)> {
+        let &(s, i) = self.by_name.get(name)?;
+        Some((s, self.shards.get(s)?.tensor(i)?))
+    }
+
+    /// Every tensor with its shard, in shard order then file order.
+    pub fn iter_tensors(&self) -> impl Iterator<Item = (usize, &TensorInfo)> {
+        self.shards
+            .iter()
+            .enumerate()
+            .flat_map(|(s, g)| g.iter_tensors().map(move |t| (s, t)))
+    }
+
+    /// Raw metadata lookup by exact key, in the first shard.
+    pub fn value(&self, key: &str) -> Option<&Value> {
+        self.shards[0].value(key)
+    }
+
+    /// The first shard's metadata pairs, in file order.
+    pub fn iter_kv(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.shards[0].iter_kv()
+    }
+
+    /// [`Gguf::architecture`] of the first shard.
+    pub fn architecture(&self) -> Option<&str> {
+        self.shards[0].architecture()
+    }
+
+    /// [`Gguf::arch_key`] of the first shard.
+    pub fn arch_key(&self, suffix: &str) -> String {
+        self.shards[0].arch_key(suffix)
+    }
+
+    /// [`Gguf::arch_get_u64`] of the first shard.
+    pub fn arch_get_u64(&self, suffix: &str) -> Option<u64> {
+        self.shards[0].arch_get_u64(suffix)
+    }
+
+    /// [`Gguf::arch_get_f32`] of the first shard.
+    pub fn arch_get_f32(&self, suffix: &str) -> Option<f32> {
+        self.shards[0].arch_get_f32(suffix)
+    }
+
+    /// [`Gguf::arch_get_str`] of the first shard.
+    pub fn arch_get_str(&self, suffix: &str) -> Option<&str> {
+        self.shards[0].arch_get_str(suffix)
+    }
+}
+
+/// `-%05d-of-%05d.gguf` for shard `i` of `count`, the part `llama_split_path`
+/// appends to the prefix (numbered from 1).
+fn shard_suffix(i: u64, count: u64) -> String {
+    format!("-{:05}-of-{count:05}.gguf", i + 1)
+}
+
+/// The strict open of one shard, its error naming the file.
+fn open_shard(path: &Path) -> Result<Gguf, LoadError> {
+    Gguf::open(path).map_err(|e| match e {
+        LoadError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => LoadError::MissingShard {
+            path: path.display().to_string(),
+        },
+        other => LoadError::Shard {
+            path: path.display().to_string(),
+            source: Box::new(other),
+        },
+    })
+}
+
+fn split_key(path: &Path, key: &'static str, detail: String) -> LoadError {
+    LoadError::SplitKey {
+        path: path.display().to_string(),
+        key,
+        detail,
+    }
+}
+
+/// A split key's value as a count, or the error that names it.
+fn split_int(path: &Path, key: &'static str, v: Option<&Value>) -> Result<u64, LoadError> {
+    match v {
+        None => Err(split_key(path, key, "is absent".to_string())),
+        Some(v) => v
+            .as_unsigned()
+            .ok_or_else(|| split_key(path, key, format!("is {v:?}, not a count"))),
+    }
+}
+
+/// Shard `place` of its set must say so in `split.no`.
+fn check_place(g: &Gguf, path: &Path, place: u64) -> Result<(), LoadError> {
+    let no = split_int(path, SPLIT_NO, g.value(SPLIT_NO))?;
+    if no != place {
+        let detail = format!("is {no}, but the file is shard {place} of its set (from 0)");
+        return Err(split_key(path, SPLIT_NO, detail));
+    }
+    Ok(())
+}
+
 /// A header-only parse: everything the header states, nothing the engine
 /// requires. Placement, block alignment and dequantizability are NOT
 /// validated, and type ids the engine has no `GgmlType` for are carried as
 /// numbers with their size from ggml's table (or `None`). This is the
-/// inventory for files the strict reader refuses — e.g. BF16/Q8_0/MXFP4
-/// splits — where the point is to know what is in the file, not to run it.
+/// inventory for files the strict reader refuses — e.g. MXFP4 or i-quant
+/// files — where the point is to know what is in the file, not to run it.
 pub struct Inventory {
     pub version: u32,
     pub meta: Vec<(String, Value)>,
@@ -467,7 +703,7 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
 /// static_asserts in ggml-common.h, cited per entry:
 ///   * 2 `q4_0` 32/18 (ggml-common.h:166-171), 3 `q4_1` 32/20 (:173-178,
 ///     `GGML_SCALE_TYPE1` = two halves, :16),
-///   * 8 `q8_0` 32/34 (:233-238), 9 `q8_1` 32/36 (:240-244),
+///   * 9 `q8_1` 32/36 (:240-244),
 ///   * 10 `q2_K` 256/84 (:307-313), 15 `q8_K` 256/296 — ik layout, `float d;
 ///     float sum; int8_t qs[256]; int16_t bsums[16]` (:404-410); mainline
 ///     ggml's block_q8_K is 264 B (no sum/bsums), a divergence to remember if
@@ -478,7 +714,7 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
 ///     22 `iq2_s` 256/82 (:467-473), 23 `iq4_xs` 256/136 (:602-607),
 ///     29 `iq1_m` 256/56 (:534-539),
 ///   * 24 `i8` 1/1, 25 `i16` 1/2, 26 `i32` 1/4, 27 `i64` 1/8, 28 `f64` 1/8
-///     (type_traits table, ggml.c:621-652), 30 `bf16` 1/2 (ggml.c:1485),
+///     (type_traits table, ggml.c:621-652),
 ///   * 39 `mxfp4` 32/17 — one E8M0 byte + 16 nibble bytes per 32 values
 ///     (ggml-common.h:182-187).
 ///
@@ -498,7 +734,6 @@ pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
     let (name, blck, tsz) = match id {
         2 => ("q4_0", 32, 18),
         3 => ("q4_1", 32, 20),
-        8 => ("q8_0", 32, 34),
         9 => ("q8_1", 32, 36),
         10 => ("q2_K", 256, 84),
         15 => ("q8_K", 256, 296),
@@ -516,7 +751,6 @@ pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
         27 => ("i64", 1, 8),
         28 => ("f64", 1, 8),
         29 => ("iq1_m", 256, 56),
-        30 => ("bf16", 1, 2),
         39 => ("mxfp4", 32, 17),
         _ => return None,
     };
@@ -549,6 +783,19 @@ impl Value {
             Value::U32(v) => Some(*v as u64),
             Value::U64(v) => Some(*v),
             _ => None,
+        }
+    }
+
+    /// Any integer flavor, signed or not, when the value is not negative —
+    /// llama.cpp writes some counts and per-layer tables as i32
+    /// (`split.tensors.count`, `<arch>.attention.compress_ratios`).
+    pub fn as_unsigned(&self) -> Option<u64> {
+        match *self {
+            Value::I8(v) => u64::try_from(v).ok(),
+            Value::I16(v) => u64::try_from(v).ok(),
+            Value::I32(v) => u64::try_from(v).ok(),
+            Value::I64(v) => u64::try_from(v).ok(),
+            _ => self.as_u64(),
         }
     }
 
@@ -749,4 +996,201 @@ fn read_value(rd: &mut Reader<'_>, tag: u32) -> Result<Value, LoadError> {
         12 => Value::F64(f64::from_bits(rd.u64()?)),
         other => return Err(LoadError::BadValueType(other)),
     })
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::{LoadError, Split};
+    use std::path::{Path, PathBuf};
+
+    /// A metadata value as the synthetic shards carry it.
+    enum Kv {
+        U16(u16),
+        I32(i32),
+        Str(&'static str),
+    }
+
+    fn put_str(b: &mut Vec<u8>, s: &str) {
+        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        b.extend_from_slice(s.as_bytes());
+    }
+
+    /// A GGUF v3 file with `kvs` and one 4-value F32 tensor per name, 32 bytes
+    /// apart over zero data — a few hundred bytes the strict reader opens.
+    fn write_gguf(path: &Path, kvs: &[(&str, Kv)], tensors: &[&str]) {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+        for (k, v) in kvs {
+            put_str(&mut b, k);
+            match v {
+                Kv::U16(x) => {
+                    b.extend_from_slice(&2u32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                Kv::I32(x) => {
+                    b.extend_from_slice(&5u32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                Kv::Str(s) => {
+                    b.extend_from_slice(&8u32.to_le_bytes());
+                    put_str(&mut b, s);
+                }
+            }
+        }
+        for (i, name) in tensors.iter().enumerate() {
+            put_str(&mut b, name);
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&4u64.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&(32 * i as u64).to_le_bytes());
+        }
+        b.resize(b.len().div_ceil(32) * 32 + 32 * tensors.len(), 0);
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn set_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gguf-split-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn shard_path(dir: &Path, i: u16) -> PathBuf {
+        dir.join(format!("m-{:05}-of-00003.gguf", i + 1))
+    }
+
+    /// Shard `i` of a 3-shard set whose keys say `split.no = no`, `split.count
+    /// = count`, `split.tensors.count = total`; the first also names the model.
+    fn write_shard(dir: &Path, i: u16, no: u16, count: u16, total: i32, tensors: &[&str]) {
+        let mut kvs = Vec::new();
+        if i == 0 {
+            kvs.push(("general.architecture", Kv::Str("test")));
+        }
+        kvs.push(("split.no", Kv::U16(no)));
+        kvs.push(("split.tensors.count", Kv::I32(total)));
+        kvs.push(("split.count", Kv::U16(count)));
+        write_gguf(&shard_path(dir, i), &kvs, tensors);
+    }
+
+    /// A consistent set: tensors [a, b], [c], [d]. Returns the directory.
+    fn good_set(name: &str) -> PathBuf {
+        let d = set_dir(name);
+        write_shard(&d, 0, 0, 3, 4, &["a", "b"]);
+        write_shard(&d, 1, 1, 3, 4, &["c"]);
+        write_shard(&d, 2, 2, 3, 4, &["d"]);
+        d
+    }
+
+    fn refusal(dir: &Path) -> LoadError {
+        let e = match Split::open(shard_path(dir, 0)) {
+            Ok(_) => panic!("the split in {} must be refused", dir.display()),
+            Err(e) => e,
+        };
+        std::fs::remove_dir_all(dir).unwrap();
+        e
+    }
+
+    #[test]
+    fn a_consistent_split_opens_as_one_model() {
+        let d = good_set("happy");
+        let s = Split::open(shard_path(&d, 0)).unwrap();
+        assert_eq!(s.shard_count(), 3);
+        assert_eq!(s.tensor_count(), 4);
+        let order: Vec<(usize, &str)> = s
+            .iter_tensors()
+            .map(|(i, t)| (i, t.name.as_str()))
+            .collect();
+        assert_eq!(order, [(0, "a"), (0, "b"), (1, "c"), (2, "d")]);
+        let (i, t) = s.find("c").unwrap();
+        assert_eq!(i, 1);
+        assert_eq!(s.shard(i).unwrap().data(t).unwrap().len(), 16);
+        assert_eq!(s.shard_path(2).unwrap(), shard_path(&d, 2));
+        assert!(s.find("e").is_none());
+        assert_eq!(s.architecture(), Some("test"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_file_without_split_count_is_one_shard() {
+        let d = set_dir("single");
+        let p = d.join("plain.gguf");
+        write_gguf(
+            &p,
+            &[("general.architecture", Kv::Str("test"))],
+            &["a", "b"],
+        );
+        let s = Split::open(&p).unwrap();
+        assert_eq!((s.shard_count(), s.tensor_count()), (1, 2));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_missing_shard_is_named() {
+        let d = good_set("missing");
+        let gone = shard_path(&d, 1);
+        std::fs::remove_file(&gone).unwrap();
+        match refusal(&d) {
+            LoadError::MissingShard { path } => assert_eq!(path, gone.display().to_string()),
+            other => panic!("wrong refusal: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_name_in_two_shards_is_refused() {
+        let d = good_set("duplicate");
+        write_shard(&d, 2, 2, 3, 4, &["a"]);
+        match refusal(&d) {
+            LoadError::DuplicateTensor {
+                name,
+                first,
+                second,
+            } => {
+                assert_eq!(name, "a");
+                assert_eq!(first, shard_path(&d, 0).display().to_string());
+                assert_eq!(second, shard_path(&d, 2).display().to_string());
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_shard_with_another_split_count_is_refused() {
+        let d = good_set("count");
+        write_shard(&d, 1, 1, 4, 4, &["c"]);
+        match refusal(&d) {
+            LoadError::SplitKey { path, key, .. } => {
+                assert_eq!(key, "split.count");
+                assert_eq!(path, shard_path(&d, 1).display().to_string());
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+    }
+
+    #[test]
+    fn the_tensor_counts_must_sum_to_the_declared_total() {
+        let d = good_set("total");
+        write_shard(&d, 0, 0, 3, 5, &["a", "b"]);
+        match refusal(&d) {
+            LoadError::SplitKey { path, key, .. } => {
+                assert_eq!(key, "split.tensors.count");
+                assert_eq!(path, shard_path(&d, 0).display().to_string());
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_shard_out_of_place_is_refused() {
+        let d = good_set("place");
+        write_shard(&d, 2, 1, 3, 4, &["d"]);
+        match refusal(&d) {
+            LoadError::SplitKey { path, key, .. } => {
+                assert_eq!(key, "split.no");
+                assert_eq!(path, shard_path(&d, 2).display().to_string());
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+    }
 }

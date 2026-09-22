@@ -26,6 +26,7 @@ pub mod head;
 pub mod kv;
 pub mod moe;
 pub mod ops;
+pub mod placement;
 pub mod profile;
 
 pub use ops::Tensor2;

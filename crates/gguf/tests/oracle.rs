@@ -1,16 +1,20 @@
-//! Oracle gate for stage 1, round 1-1. Both tests are `hw_` (model file +
+//! Oracle gate for stage 1, round 1-1. The tests are `hw_` (model files +
 //! box) and `#[ignore]`d: `cargo nextest` is not installed on the box
-//! (checked 2026-09-19), so run them with
-//! `cargo test -p gguf -- --ignored --nocapture` via `tools/box.sh`, after
-//! `bash tools/ref/build-dequant.sh && $BLOOMERY_DATA/bin/dequant_ref`.
+//! (checked 2026-09-19), so `just gate-1-1` runs them through `tools/box.sh`
+//! after `dequant_ref` has dumped V2-Lite into `$BLOOMERY_DATA/ref` and the
+//! f32, bf16 and q8_0 tensors of V4.1's first shard into
+//! `$BLOOMERY_DATA/ref-v41`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gguf::{GgmlType, Gguf, dequant_row};
 
 const MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
+
+/// V4.1's first shard, unless `BLOOMERY_V41_MODEL` names another.
+const MODEL_V41: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
 
 fn data_dir() -> PathBuf {
     PathBuf::from(
@@ -194,6 +198,97 @@ fn hw_dequant_matches_ggml() {
     println!("per-type max |diff| (gate 1e-6):");
     for (n, d) in &worst {
         println!("  {n:6} {d:.3e}");
+    }
+}
+
+/// `<dir>/<tname>.meta`'s tensor name, row count and row length.
+fn read_meta(dir: &Path, tname: &str) -> (String, usize, usize) {
+    let meta = fs::read_to_string(dir.join(format!("{tname}.meta")))
+        .unwrap_or_else(|e| panic!("read {tname}.meta: {e}"));
+    let field = |key: &str| {
+        meta.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{tname}.meta: no {key}"))
+            .to_string()
+    };
+    let rows = field("rows=").parse().unwrap();
+    (field("tensor="), rows, field("rowlen=").parse().unwrap())
+}
+
+/// V4.1's first shard opens strictly, and each type it holds that this engine
+/// dequantizes on the host side — f32, bf16, q8_0 — reproduces ggml's
+/// `to_float` bit for bit: every one of these conversions is exact, so any
+/// difference is a bug, not rounding. Each requested type must be in the dump
+/// (a type the dump lacks fails here instead of passing with nothing
+/// compared), with ggml's tensor count for it equal to the loader's.
+#[test]
+#[ignore = "hw: needs V4.1's first shard on the box plus the oracle dump in $BLOOMERY_DATA/ref-v41"]
+fn hw_dequant_matches_ggml_v41() {
+    let path = std::env::var("BLOOMERY_V41_MODEL").unwrap_or_else(|_| MODEL_V41.to_string());
+    let g = Gguf::open(&path).unwrap_or_else(|e| panic!("strict open of {path}: {e}"));
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for t in g.iter_tensors() {
+        *counts.entry(t.ty.name().unwrap()).or_default() += 1;
+    }
+    let dir = data_dir().join("ref-v41");
+    let manifest = fs::read_to_string(dir.join("manifest.txt")).expect("read ref-v41/manifest.txt");
+    let oracle: BTreeMap<&str, (u32, usize)> = manifest
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let num: u32 = it.next().unwrap().parse().unwrap();
+            let name = it.next().unwrap();
+            let count: usize = it.next().unwrap().parse().unwrap();
+            (name, (num, count))
+        })
+        .collect();
+
+    for tname in ["f32", "bf16", "q8_0"] {
+        let &(type_num, ggml_count) = oracle
+            .get(tname)
+            .unwrap_or_else(|| panic!("{tname} is not in ref-v41/manifest.txt"));
+        let ty = GgmlType::from_u32(type_num);
+        assert_eq!(ty.name(), Some(tname), "type {type_num}: name mismatch");
+        assert_eq!(
+            counts.get(tname).copied(),
+            Some(ggml_count),
+            "{tname}: tensor count, loader vs ggml"
+        );
+        let (tensor_name, rows, rowlen) = read_meta(&dir, tname);
+        let t = g
+            .find(&tensor_name)
+            .unwrap_or_else(|| panic!("tensor {tensor_name} not found by our loader"));
+        assert_eq!(t.ty, ty, "tensor {tensor_name}: type disagreement");
+        assert_eq!(t.dims[0] as usize, rowlen, "tensor {tensor_name}: ne[0]");
+        let nvals = rows * rowlen;
+        let need = nvals / ty.blck_size().unwrap() as usize * ty.type_size().unwrap() as usize;
+        let bytes = g
+            .data(t)
+            .unwrap_or_else(|e| panic!("tensor {tensor_name}: {e}"));
+        let mut mine = vec![0.0f32; nvals];
+        dequant_row(ty, &bytes[..need], &mut mine).unwrap_or_else(|e| panic!("{tname}: {e}"));
+
+        let raw = fs::read(dir.join(format!("{tname}.raw")))
+            .unwrap_or_else(|e| panic!("read {tname}.raw: {e}"));
+        assert_eq!(raw.len(), nvals * 4, "{tname}.raw size");
+        let differ: Vec<usize> = mine
+            .iter()
+            .zip(raw.as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(_, (m, r))| m.to_bits() != u32::from_le_bytes(**r))
+            .map(|(i, _)| i)
+            .collect();
+        println!(
+            "{tname:6} tensors={ggml_count} tensor={tensor_name} rows={rows} rowlen={rowlen} values={nvals} bit_mismatches={}",
+            differ.len()
+        );
+        assert!(
+            differ.is_empty(),
+            "{tname}: {} of {nvals} values differ from ggml, first at {}",
+            differ.len(),
+            differ[0]
+        );
     }
 }
 

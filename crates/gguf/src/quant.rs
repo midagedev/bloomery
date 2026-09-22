@@ -21,7 +21,7 @@
 use std::fmt;
 
 /// GGUF v3 / ggml tensor type tags, values from `enum ggml_type`
-/// (ggml.h:391; F32=0 … Q6_K=14 seen at ggml.h:392-404).
+/// (ggml.h:391; F32=0 … Q6_K=14 at ggml.h:392-406, BF16=30 at ggml.h:422).
 ///
 /// `Unknown` carries any tag this build does not model; the loader accepts
 /// such tensors only far enough to name them, and every size/dequant entry
@@ -35,10 +35,12 @@ pub enum GgmlType {
     F16,
     Q5_0,
     Q5_1,
+    Q8_0,
     Q3_K,
     Q4_K,
     Q5_K,
     Q6_K,
+    BF16,
     Unknown(u32),
 }
 
@@ -50,10 +52,12 @@ impl GgmlType {
             1 => GgmlType::F16,
             6 => GgmlType::Q5_0,
             7 => GgmlType::Q5_1,
+            8 => GgmlType::Q8_0,
             11 => GgmlType::Q3_K,
             12 => GgmlType::Q4_K,
             13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
+            30 => GgmlType::BF16,
             other => GgmlType::Unknown(other),
         }
     }
@@ -64,41 +68,45 @@ impl GgmlType {
             GgmlType::F16 => 1,
             GgmlType::Q5_0 => 6,
             GgmlType::Q5_1 => 7,
+            GgmlType::Q8_0 => 8,
             GgmlType::Q3_K => 11,
             GgmlType::Q4_K => 12,
             GgmlType::Q5_K => 13,
             GgmlType::Q6_K => 14,
+            GgmlType::BF16 => 30,
             GgmlType::Unknown(v) => v,
         }
     }
 
     /// `ggml_type_name` string (type_traits table, ggml.c:620 — entries at
-    /// ggml.c:657/667/756/777/912/938/998). Used to name the oracle dumps
-    /// `$BLOOMERY_DATA/ref/<name>.raw`.
+    /// ggml.c:657/667/756/777/819/912/938/998/1485). Used to name the oracle
+    /// dumps `$BLOOMERY_DATA/ref/<name>.raw`.
     pub fn name(self) -> Option<&'static str> {
         match self {
             GgmlType::F32 => Some("f32"),
             GgmlType::F16 => Some("f16"),
             GgmlType::Q5_0 => Some("q5_0"),
             GgmlType::Q5_1 => Some("q5_1"),
+            GgmlType::Q8_0 => Some("q8_0"),
             GgmlType::Q3_K => Some("q3_K"),
             GgmlType::Q4_K => Some("q4_K"),
             GgmlType::Q5_K => Some("q5_K"),
             GgmlType::Q6_K => Some("q6_K"),
+            GgmlType::BF16 => Some("bf16"),
             GgmlType::Unknown(_) => None,
         }
     }
 
-    /// `blck_size` from ggml's type_traits table (ggml.c:620): F32/F16 = 1
-    /// (ggml.c:657/667), Q5_0/Q5_1 = QK5_0/QK5_1 = 32 (ggml.c:756/777,
-    /// QK5_0/QK5_1 at ggml-common.h:195/210), K-quants = QK_K = 256
-    /// (ggml.c:912/938/998, QK_K at ggml-common.h:79).
+    /// `blck_size` from ggml's type_traits table (ggml.c:620): F32/F16/BF16 = 1
+    /// (ggml.c:657/667/1485), Q5_0/Q5_1/Q8_0 = QK5_0/QK5_1/QK8_0 = 32
+    /// (ggml.c:756/777/819, QK5_0/QK5_1/QK8_0 at ggml-common.h:195/210/233),
+    /// K-quants = QK_K = 256 (ggml.c:912/938/998, QK_K at ggml-common.h:79).
     ///
     /// This match is the single owner of those numbers for the Rust side.
     pub fn blck_size(self) -> Option<u64> {
         match self {
-            GgmlType::F32 | GgmlType::F16 => Some(1),
-            GgmlType::Q5_0 | GgmlType::Q5_1 => Some(32),
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => Some(1),
+            GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => Some(32),
             GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => Some(256),
             GgmlType::Unknown(_) => None,
         }
@@ -106,17 +114,22 @@ impl GgmlType {
 
     /// `type_size` (bytes per block) from the same type_traits table:
     /// `sizeof(float)` = 4 (F32), `sizeof(ggml_fp16_t)` = 2 (F16),
+    /// `sizeof(ggml_bf16_t)` = 2 (BF16, one `uint16_t`, ggml.h:380),
     /// `sizeof(block_q5_0)` = 22, `sizeof(block_q5_1)` = 24,
-    /// `sizeof(block_q3_K)` = 110, `sizeof(block_q4_K)` = 144,
-    /// `sizeof(block_q5_K)` = 176, `sizeof(block_q6_K)` = 210 —
-    /// block layouts and static_asserts in ggml-common.h:327-332 (q3_K),
-    /// 348-353 (q4_K), 373-378 (q5_K), 388-393 (q6_K), 196-216 (q5_0/q5_1).
+    /// `sizeof(block_q8_0)` = 34, `sizeof(block_q3_K)` = 110,
+    /// `sizeof(block_q4_K)` = 144, `sizeof(block_q5_K)` = 176,
+    /// `sizeof(block_q6_K)` = 210 — block layouts and static_asserts in
+    /// ggml-common.h:327-332 (q3_K), 348-353 (q4_K), 373-378 (q5_K),
+    /// 388-393 (q6_K), 196-216 (q5_0/q5_1), 233-238 (q8_0: one f16 `d` and
+    /// 32 int8 codes).
     pub fn type_size(self) -> Option<u64> {
         match self {
             GgmlType::F32 => Some(4),
             GgmlType::F16 => Some(2),
+            GgmlType::BF16 => Some(2),
             GgmlType::Q5_0 => Some(22),
             GgmlType::Q5_1 => Some(24),
+            GgmlType::Q8_0 => Some(34),
             GgmlType::Q3_K => Some(110),
             GgmlType::Q4_K => Some(144),
             GgmlType::Q5_K => Some(176),
@@ -141,6 +154,8 @@ impl fmt::Display for GgmlType {
 pub enum QuantError {
     #[error("ggml type {0} has no reference dequantizer in this build")]
     Unsupported(GgmlType),
+    #[error("ggml type {0} has no CPU matmul in this build, so no activation format")]
+    NoActivationFormat(GgmlType),
     #[error("dequant {ty}: dst length {dst} is not a multiple of the block size {blck}")]
     UnalignedDst {
         ty: GgmlType,
@@ -199,6 +214,8 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::Q4_K => dequant_q4_k(&src[..need], dst),
         GgmlType::Q5_K => dequant_q5_k(&src[..need], dst),
         GgmlType::Q6_K => dequant_q6_k(&src[..need], dst),
+        GgmlType::Q8_0 => dequant_q8_0(&src[..need], dst),
+        GgmlType::BF16 => dequant_bf16(&src[..need], dst),
         GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
     }
     Ok(())
@@ -542,6 +559,36 @@ fn dequant_q6_k(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Port of `dequantize_row_q8_0` (ggml-quants.c:1703). Block geometry
+/// (block_q8_0, ggml-common.h:233, 34 bytes / 32 values): d f16 @0,
+/// qs int8[32] @2; `y = qs·d`.
+///
+/// An 8-bit code times the f16 scale's 11-bit significand is exact in f32,
+/// so the port matches ggml bit for bit whatever the compiler does with the
+/// multiply.
+fn dequant_q8_0(src: &[u8], dst: &mut [f32]) {
+    for (blk, out) in src
+        .as_chunks::<34>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<32>().0)
+    {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for (o, &q) in out.iter_mut().zip(&blk[2..34]) {
+            *o = q as i8 as f32 * d;
+        }
+    }
+}
+
+/// Port of `ggml_bf16_to_fp32_row` (ggml.c:445): a bf16 is the high half of
+/// an f32 (`ggml_compute_bf16_to_fp32`, ggml-impl.h:89 — the AVX2 path at
+/// ggml.c:457 is the same shift), so the conversion is exact.
+fn dequant_bf16(src: &[u8], dst: &mut [f32]) {
+    for (o, c) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+        *o = f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16);
+    }
+}
+
 /// Round-trip f32 activations through ggml's Q8_K activation quantization.
 ///
 /// ggml does not multiply K-quant weights by f32 activations. Before a
@@ -635,19 +682,26 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 }
 
 /// The activation format ggml quantizes to before a dot with this weight type, as the
-/// type-traits table defines it. `None` means the activations stay f32.
+/// type-traits table defines it. `Ok(None)` means the activations stay f32.
 ///
 /// This lives beside the two round-trip functions so the mapping has one owner: a caller
 /// that picks the activation format itself will pick it differently somewhere else, and the
 /// difference shows up as a 1e-3 numeric drift nobody can place.
-pub fn activation_format(weight: GgmlType) -> Option<ActivationFormat> {
+///
+/// A weight type no CPU matmul here takes is refused, not given a format: Q8_0 and BF16
+/// activations are Q8_2_X4 and BF16 in ggml (`vec_dot_type`, ggml.c:828-837 on this AVX2
+/// IQK build, ggml.c:1494), neither of which this engine encodes, and f32 would be a
+/// plausible wrong answer.
+pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
-        GgmlType::Q3_K => Some(ActivationFormat::Q8K),
+        GgmlType::Q3_K => Ok(Some(ActivationFormat::Q8K)),
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q5_0 | GgmlType::Q5_1 => {
-            Some(ActivationFormat::Q8_2X4)
+            Ok(Some(ActivationFormat::Q8_2X4))
         }
-        GgmlType::F32 | GgmlType::F16 => None,
-        GgmlType::Unknown(_) => None,
+        GgmlType::F32 | GgmlType::F16 => Ok(None),
+        GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::Unknown(_) => {
+            Err(QuantError::NoActivationFormat(weight))
+        }
     }
 }
 
@@ -657,13 +711,19 @@ pub enum ActivationFormat {
     Q8_2X4,
 }
 
-/// Apply whichever activation quantization `weight` implies, in place of a copy.
-pub fn quantize_activations(weight: GgmlType, x: &[f32], out: &mut [f32]) {
-    match activation_format(weight) {
+/// Apply whichever activation quantization `weight` implies, in place of a copy; a weight
+/// type [`activation_format`] refuses writes nothing.
+pub fn quantize_activations(
+    weight: GgmlType,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), QuantError> {
+    match activation_format(weight)? {
         Some(ActivationFormat::Q8K) => quantize_row_q8_k_roundtrip(x, out),
         Some(ActivationFormat::Q8_2X4) => quantize_row_q8_2_x4_roundtrip(x, out),
         None => out.copy_from_slice(x),
     }
+    Ok(())
 }
 
 /// One Q8_0 block over 32 values: f16 scale bits then 32 int8 codes (34 bytes).

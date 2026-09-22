@@ -401,7 +401,8 @@ impl SharedQuantCols {
             SharedQuantCols::F32(ptr) => {
                 // SAFETY: the disjoint-cell contract above; the cell is `k` f32s, as allocated.
                 let cell = unsafe { std::slice::from_raw_parts_mut(ptr.add(t * k), k) };
-                quantize_activations(ty, x_col, cell);
+                quantize_activations(ty, x_col, cell)
+                    .expect("the scalar arm of the fused decision refused this type before its slot was built");
             }
             SharedQuantCols::Bytes { cb, ptr } => {
                 // SAFETY: same contract; the cell is `cb` bytes, as `col_bytes` allocated.
@@ -573,6 +574,9 @@ pub fn matmul_q_group_swiglu(
         let cb = if fused {
             Some(qdot::col_bytes(ty, k))
         } else {
+            // The scalar path quantizes into the weight type's activation format;
+            // a type without one is refused here, before any column exists.
+            gguf::activation_format(ty)?;
             None
         };
         // The combine: produced by the dispatch's claimant (deferred) or
@@ -1664,6 +1668,9 @@ fn matmul_q_one(
     let cb = if fused {
         Some(qdot::col_bytes(ty, k))
     } else {
+        // The scalar path quantizes into the weight type's activation format;
+        // a type without one is refused here, before any column exists.
+        gguf::activation_format(ty)?;
         None
     };
 
@@ -1774,7 +1781,7 @@ pub(crate) fn matvec_q_local(
         if poison() {
             qbuf.fill(f32::NAN);
         }
-        quantize_activations(ty, x_col, &mut qbuf);
+        quantize_activations(ty, x_col, &mut qbuf)?;
         ROW_BUF.with(|cell| -> Result<(), crate::ModelError> {
             let mut scratch = cell.borrow_mut();
             if scratch.len() < k {
@@ -1885,6 +1892,9 @@ fn matmul_q_multi(
         let cb = if fused {
             Some(qdot::col_bytes(ty, k))
         } else {
+            // The scalar path quantizes into the weight type's activation format;
+            // a type without one is refused here, before any column exists.
+            gguf::activation_format(ty)?;
             None
         };
         // The sharing rule — one quantized buffer per DISTINCT (input,
@@ -1983,4 +1993,70 @@ fn matmul_q_multi(
         }
     }
     Ok(outs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GroupInput, Tensor2, matmul_q, matmul_q_group, matmul_q_group_swiglu, matvec_q_local,
+    };
+    use gguf::{GgmlType, Gguf};
+
+    /// A GGUF v3 file holding one `[32, 2]` tensor `w` of type `ty` over zero bytes —
+    /// the least the strict reader opens.
+    fn one_tensor_file(ty: GgmlType) -> std::path::PathBuf {
+        let rows = 2u64;
+        let bytes = ty.type_size().unwrap() * (32 / ty.blck_size().unwrap()) * rows;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // tensors
+        b.extend_from_slice(&0u64.to_le_bytes()); // metadata pairs
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.push(b'w');
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&32u64.to_le_bytes());
+        b.extend_from_slice(&rows.to_le_bytes());
+        b.extend_from_slice(&ty.as_u32().to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // offset
+        b.resize(b.len().div_ceil(32) * 32 + bytes as usize, 0);
+        let path =
+            std::env::temp_dir().join(format!("bloomery-ops-{}-{ty}.gguf", std::process::id()));
+        std::fs::write(&path, b).unwrap();
+        path
+    }
+
+    fn refusal<T>(r: Result<T, crate::ModelError>) -> String {
+        match r {
+            Ok(_) => panic!("a CPU matmul over this weight type must be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// No CPU matmul takes a Q8_0 or BF16 weight: every entry that reaches the scalar
+    /// arm of the fused decision refuses it with an error naming the type, instead of
+    /// running it against f32 activations.
+    #[test]
+    fn matmul_refuses_weight_types_without_an_activation_format() {
+        for ty in [GgmlType::Q8_0, GgmlType::BF16] {
+            let path = one_tensor_file(ty);
+            let g = Gguf::open(&path).unwrap();
+            let w = g.find("w").unwrap();
+            let x = Tensor2::zeros(32, 1);
+            let mut out = [0.0f32; 2];
+            let errors = [
+                refusal(matmul_q(&g, w, &x)),
+                refusal(matmul_q_group(&g, &[w], &[&x])),
+                refusal(matmul_q_group_swiglu(&g, &[w], &[GroupInput::Ready(&x)])),
+                refusal(matvec_q_local(&g, w, x.col(0), &mut out)),
+            ];
+            for e in &errors {
+                assert!(
+                    e.contains(&ty.to_string()),
+                    "{ty}: the refusal must name the type, got {e:?}"
+                );
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
 }

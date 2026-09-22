@@ -244,7 +244,9 @@ pub fn resident_size(ty: GgmlType, k: usize, rows: usize) -> Option<usize> {
             let row_bytes = ty.type_size()? as usize * (k / blck);
             Some(row_bytes * rows.div_ceil(4) * 4)
         }
-        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Unknown(_) => None,
+        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::Unknown(_) => {
+            None
+        }
     }
 }
 
@@ -347,10 +349,12 @@ fn upload_file_tensor(
                 k,
             })
         }
-        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Unknown(_) => Err(GpuError::shape(
-            "Weights::load",
-            format!("tensor {name} has type {} with no device format", t.ty),
-        )),
+        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::Unknown(_) => {
+            Err(GpuError::shape(
+                "Weights::load",
+                format!("tensor {name} has type {} with no device format", t.ty),
+            ))
+        }
     }
 }
 

@@ -135,7 +135,7 @@ fn hw_matmul_q_q3k_fused_dispatch() {
     let cols: Vec<Vec<f32>> = (0..x.ne1)
         .map(|t| {
             let mut q = vec![0.0f32; k];
-            gguf::quantize_activations(GgmlType::Q3_K, x.col(t), &mut q);
+            gguf::quantize_activations(GgmlType::Q3_K, x.col(t), &mut q).unwrap();
             q
         })
         .collect();
@@ -198,7 +198,7 @@ fn hw_matmul_q_q3k_fused_dispatch() {
     // Ground B' — must differ somewhere from the OLD scalar composition, or
     // the fused path never ran.
     let mut fq = vec![0.0f32; kf];
-    gguf::quantize_activations(GgmlType::Q5_1, xf.col(0), &mut fq);
+    gguf::quantize_activations(GgmlType::Q5_1, xf.col(0), &mut fq).unwrap();
     let mut frow = vec![0.0f32; kf];
     let mut fdiffs = 0usize;
     for r in 0..nf {

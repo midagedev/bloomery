@@ -353,6 +353,9 @@ gate-mt:
 gate-profile:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test profile -- --ignored --nocapture --test-threads=1'
 
+gate-placement:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test placement -- --ignored --nocapture'
+
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
 # hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다.
 gate-threads:
@@ -409,7 +412,7 @@ kvclear-probe *ARGS:
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
 gate-1-1:
-    ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && bash tools/gate.sh -p bloomery-gguf -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && "$BLOOMERY_DATA/bin/dequant_ref" "${BLOOMERY_V41_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}" "$BLOOMERY_DATA/ref-v41" f32 bf16 q8_0 && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
 gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1

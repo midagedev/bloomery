@@ -9,6 +9,7 @@ use crate::ModelError;
 use gguf::Gguf;
 
 pub mod deepseek2;
+pub mod deepseek41;
 
 /// The architectures this engine can run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
