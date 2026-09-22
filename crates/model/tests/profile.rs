@@ -27,7 +27,8 @@
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use model::forward::{argmax, forward, new_cache, step};
+use model::arch::deepseek2::derived::Derived;
+use model::arch::deepseek2::forward::{argmax, forward, new_cache, step};
 use model::profile;
 use std::time::Instant;
 
@@ -143,7 +144,7 @@ fn hw_profile_gate() {
     // is dropped — the coverage claim is about one decode step, not a mixture.
     // `Derived::new` runs unprofiled (it has no hooks), before the first step.
     let mut cache = new_cache(&g).unwrap();
-    let derived = model::derived::Derived::new(&g).unwrap();
+    let derived = Derived::new(&g).unwrap();
     let logits = step(&g, &tokens, &mut cache, &derived).unwrap();
     profile::reset();
 

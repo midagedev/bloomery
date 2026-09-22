@@ -661,10 +661,10 @@ pub fn f32_tensor(gguf: &Gguf, name: &str, want: usize) -> Result<Vec<f32>, Gate
 /// The f16 cache view's first `rows` rows as f16 bits: the dump widened
 /// the halves to f32 exactly, so rounding back recovers ik's own bits
 /// (gate_p5's local `widened_f16_bits`). The rounding is
-/// `model::attn::f32_to_f16_bits` itself — the CPU oracle's own — so a
+/// `gguf::quant::f32_to_f16_bits` itself — the CPU oracle's own — so a
 /// second transcription here cannot drift.
 pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError> {
-    use model::attn::f32_to_f16_bits;
+    use gguf::quant::f32_to_f16_bits;
 
     let path = ref_dir().join(row.file_name());
     let raw = std::fs::read(&path)

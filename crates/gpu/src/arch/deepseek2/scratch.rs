@@ -10,7 +10,7 @@ use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
-use model::attn::MlaParams;
+use model::arch::deepseek2::attn::MlaParams;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 

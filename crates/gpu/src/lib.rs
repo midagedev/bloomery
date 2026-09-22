@@ -45,7 +45,6 @@ pub mod router;
 pub(crate) mod tensor;
 pub mod weights;
 
-pub use ::model::attn::MlaParams;
 pub use engine::AnyEngine;
 pub use graph::Graph;
 pub use model::GpuModel;

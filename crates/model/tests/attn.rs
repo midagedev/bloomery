@@ -1,4 +1,4 @@
-//! Gate for `model::attn`: one block's MLA attention, end to end, against the
+//! Gate for `model::arch::deepseek2::attn`: one block's MLA attention, end to end, against the
 //! ik_llama.cpp oracle — blocks 0 and 1, every intermediate the trace holds.
 //!
 //! `hw_` prefix: needs the box (the model file and the oracle set), excluded by default.
@@ -26,7 +26,8 @@
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use model::attn::block_attn_trace;
+use model::arch::deepseek2::attn::{self, block_attn_trace};
+use model::arch::deepseek2::derived::Derived;
 use model::{Slot, Tensor2};
 
 /// Oracle `ne[]` (ggml order) folded to the `Tensor2` pair: rows = ne0, columns = the
@@ -36,12 +37,12 @@ fn folded(ne: &[i64; 4]) -> [i64; 2] {
     [ne[0], ne[1] * ne[2] * ne[3]]
 }
 
-fn run_block(o: &oracle::Oracle, g: &gguf::Gguf, n: usize) -> model::attn::AttnTrace {
+fn run_block(o: &oracle::Oracle, g: &gguf::Gguf, n: usize) -> attn::AttnTrace {
     let (xs, xinf) = o.load(&format!("attn_norm-{n}"), 0);
     let x = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
     // The dump is one prefill batch: tokens at positions 0..5, sequence 0.
     let slots: Vec<Slot> = (0..x.ne1 as u32).map(|t| Slot { seq: 0, pos: t }).collect();
-    let derived = model::derived::Derived::new(g).unwrap();
+    let derived = Derived::new(g).unwrap();
     block_attn_trace(g, n, &x, &slots, &derived).expect("block_attn_trace")
 }
 
@@ -240,7 +241,7 @@ fn hw_attn_exact_input_stages() {
 
     for blk in [0usize, 1usize] {
         let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-        let p = model::attn::MlaParams::read(&g, blk).unwrap();
+        let p = attn::MlaParams::read(&g, blk).unwrap();
         let wkb = g.find(&format!("blk.{blk}.attn_kv_b.weight")).unwrap();
         let n_tok = 6usize;
         let slots: Vec<Slot> = (0..n_tok as u32).map(|t| Slot { seq: 0, pos: t }).collect();
@@ -250,9 +251,9 @@ fn hw_attn_exact_input_stages() {
         // block sum. The Q8_0 weights come from `Derived` (byte-identical to the
         // in-place build by `tests/derived.rs`).
         let q_exact = load2(&format!("q-{blk}"), 0);
-        let derived = model::derived::Derived::new(&g).unwrap();
-        let out = model::attn::q_nope2_absorbed(derived.wk_b_all_heads(blk).unwrap(), &q_exact, &p)
-            .unwrap();
+        let derived = Derived::new(&g).unwrap();
+        let out =
+            attn::q_nope2_absorbed(derived.wk_b_all_heads(blk).unwrap(), &q_exact, &p).unwrap();
         let want = load2(&format!("q_nope2-{blk}"), 0);
         assert_eq!([out.ne0, out.ne1], [want.ne0, want.ne1], "stage A shape");
         assert!(
@@ -295,13 +296,13 @@ fn hw_attn_exact_input_stages() {
                 kvr_exact
                     .col(t)
                     .iter()
-                    .map(|&v| model::attn::f32_to_f16_bits(v)),
+                    .map(|&v| gguf::quant::f32_to_f16_bits(v)),
             );
         }
         let cache = model::kv::KvRows::new(&cache16, d_head);
         let want = load2(&format!("kqv_compressed-{blk}"), 0);
 
-        let kqv_scalar = model::attn::flash_attn_latent_scalar(
+        let kqv_scalar = attn::flash_attn_latent_scalar(
             &q_rope_exact,
             &q_nope2_exact,
             cache,
@@ -321,14 +322,7 @@ fn hw_attn_exact_input_stages() {
             "stage B scalar: attention bit-exact",
         );
 
-        let kqv = model::attn::flash_attn_latent(
-            &q_rope_exact,
-            &q_nope2_exact,
-            cache,
-            &slots,
-            &slots,
-            &p,
-        );
+        let kqv = attn::flash_attn_latent(&q_rope_exact, &q_nope2_exact, cache, &slots, &slots, &p);
         assert_eq!([kqv.ne0, kqv.ne1], [want.ne0, want.ne1], "stage B shape");
         // δ over the oracle's own (row, key) pairs, and the V spread of the
         // same rows — both from the data the legs just consumed. The FA row
@@ -342,10 +336,8 @@ fn hw_attn_exact_input_stages() {
                 qrow[p.rope_dims..].copy_from_slice(q_nope2_exact.col(h * n_tok + t));
                 for u in 0..n_tok {
                     let k = cache.row(u);
-                    delta = delta.max(
-                        (model::attn::kq_dot_simd(&qrow, k) - model::attn::kq_dot_fa4(&qrow, k))
-                            .abs(),
-                    );
+                    delta =
+                        delta.max((attn::kq_dot_simd(&qrow, k) - attn::kq_dot_fa4(&qrow, k)).abs());
                 }
             }
         }
@@ -363,7 +355,7 @@ fn hw_attn_exact_input_stages() {
 
         // C: wv_b (Q3_K view) + output projection — generic `matmul_q` order slack.
         let kqv_exact = load2(&format!("kqv_compressed-{blk}"), 0);
-        let kqv_2d = model::attn::wv_b_heads(&g, wkb, &kqv_exact, &p).unwrap();
+        let kqv_2d = attn::wv_b_heads(&g, wkb, &kqv_exact, &p).unwrap();
         let wo = g.find(&format!("blk.{blk}.attn_output.weight")).unwrap();
         let out = model::ops::matmul_q(&g, wo, &kqv_2d).unwrap();
         let want = load2(&format!("kqv_out-{blk}"), 0);
@@ -387,8 +379,8 @@ fn hw_attn_heads_fused_bit_identical() {
     let o = oracle::Oracle::open();
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let blk = 0usize;
-    let p = model::attn::MlaParams::read(&g, blk).unwrap();
-    let derived = model::derived::Derived::new(&g).unwrap();
+    let p = attn::MlaParams::read(&g, blk).unwrap();
+    let derived = Derived::new(&g).unwrap();
     let views = &derived.attn_plan(blk).unwrap().v_up_views;
     let wblocks = derived.wk_b_all_heads(blk).unwrap();
 
@@ -416,7 +408,7 @@ fn hw_attn_heads_fused_bit_identical() {
                 kvr_full
                     .col(t)
                     .iter()
-                    .map(|&v| model::attn::f32_to_f16_bits(v)),
+                    .map(|&v| gguf::quant::f32_to_f16_bits(v)),
             );
         }
         let cache = model::kv::KvRows::new(&cache16, d_head);
@@ -427,16 +419,14 @@ fn hw_attn_heads_fused_bit_identical() {
         let q_rope = first_cols(&q_rope_full, p.n_head * n_tok);
 
         // The chain the fused dispatch replaces, stage by stage.
-        let q_nope2 = model::attn::q_nope2_absorbed(wblocks, &q, &p).unwrap();
-        let kqv_compressed =
-            model::attn::flash_attn_latent(&q_rope, &q_nope2, cache, &slots, &slots, &p);
-        let kqv_2d = model::attn::wv_b_heads_with(&g, views, &kqv_compressed, &p).unwrap();
+        let q_nope2 = attn::q_nope2_absorbed(wblocks, &q, &p).unwrap();
+        let kqv_compressed = attn::flash_attn_latent(&q_rope, &q_nope2, cache, &slots, &slots, &p);
+        let kqv_2d = attn::wv_b_heads_with(&g, views, &kqv_compressed, &p).unwrap();
 
         // The fused dispatch, same inputs.
-        let (fq, fc, f2) = model::attn::attn_heads_fused(
-            &g, wblocks, &q, &q_rope, cache, &slots, &slots, views, &p,
-        )
-        .unwrap();
+        let (fq, fc, f2) =
+            attn::attn_heads_fused(&g, wblocks, &q, &q_rope, cache, &slots, &slots, views, &p)
+                .unwrap();
 
         let cmp = |name: &str, chain: &Tensor2, fused: &Tensor2| {
             assert_eq!(
@@ -507,7 +497,7 @@ fn hw_flash_simd_bands_against_scalar() {
     // count. The key count (100) crosses three whole 32-key blocks plus a
     // partial fourth (the padding break), and the first query's position
     // admits 50 keys — past the block boundary, into the M-bump rescale.
-    let p = model::attn::MlaParams {
+    let p = attn::MlaParams {
         n_head: 3,
         kq_head: 576,
         nope: 512,
@@ -516,7 +506,7 @@ fn hw_flash_simd_bands_against_scalar() {
         latent: 512,
         eps: 1e-6,
         // The rope fields are dead here — flash reads only the dims.
-        rope: model::attn::RopeParams {
+        rope: attn::RopeParams {
             n_dims: 64,
             freq_base: 1e4,
             freq_scale: 0.025,
@@ -553,7 +543,7 @@ fn hw_flash_simd_bands_against_scalar() {
     for _ in 0..n_keys {
         let start = keys16.len();
         for _ in 0..width {
-            keys16.push(model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)));
+            keys16.push(gguf::quant::f32_to_f16_bits(rng.range(-4.0, 4.0)));
         }
         for &b in &keys16[start + p.rope_dims..] {
             let v = gguf::quant::half_to_f32(b);
@@ -586,8 +576,7 @@ fn hw_flash_simd_bands_against_scalar() {
             qrow[p.rope_dims..].copy_from_slice(q_nope2.col(h * n_tok + t));
             for u in 0..n_keys {
                 let k = keys.row(u);
-                let d =
-                    (model::attn::kq_dot_simd(&qrow, k) - model::attn::kq_dot_fa4(&qrow, k)).abs();
+                let d = (attn::kq_dot_simd(&qrow, k) - attn::kq_dot_fa4(&qrow, k)).abs();
                 let band = kq_reassoc_band(&qrow, k);
                 worst_kq = worst_kq.max(d);
                 worst_band = worst_band.max(band);
@@ -605,9 +594,8 @@ fn hw_flash_simd_bands_against_scalar() {
     );
 
     // Leg 2 — the whole kernel, propagating the realized δ of leg 1.
-    let a = model::attn::flash_attn_latent(&q_rope, &q_nope2, keys, &key_slots, &q_slots, &p);
-    let b =
-        model::attn::flash_attn_latent_scalar(&q_rope, &q_nope2, keys, &key_slots, &q_slots, &p);
+    let a = attn::flash_attn_latent(&q_rope, &q_nope2, keys, &key_slots, &q_slots, &p);
+    let b = attn::flash_attn_latent_scalar(&q_rope, &q_nope2, keys, &key_slots, &q_slots, &p);
     let flash_band = 2.0 * p.kq_scale * worst_kq * n_keys as f32 * (v_hi - v_lo);
     let mut worst_flash = 0.0f32;
     for (i, (&x, &y)) in a.data.iter().zip(&b.data).enumerate() {
@@ -671,7 +659,7 @@ fn hw_flash_v_accum_avx2_matches_scalar() {
         // kernel's `break` leaves behind.
         let mut keys16: Vec<u16> = Vec::with_capacity(40 * width);
         for _ in 0..40 * width {
-            keys16.push(model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)));
+            keys16.push(gguf::quant::f32_to_f16_bits(rng.range(-4.0, 4.0)));
         }
         let keys = model::kv::KvRows::new(&keys16, width);
         // (blk, half-masked?, shape name) — the three weight shapes the row
@@ -697,13 +685,13 @@ fn hw_flash_v_accum_avx2_matches_scalar() {
             }
             let mut r_s: Vec<f32> = (0..latent).map(|_| nz(&mut rng)).collect();
             let mut r_a = r_s.clone();
-            model::attn::flash_v_accum_scalar(&w, keys, blk, rope, &mut r_s);
+            attn::flash_v_accum_scalar(&w, keys, blk, rope, &mut r_s);
             // SAFETY: the ISA check at the top owns the fn's ISA half;
             // `keys` is `rope + latent` wide, `r` is `latent` long (a
             // multiple of 8 in all three shapes), and every lane with
             // w[l] != 0 satisfies `blk + l < 40 = keys.len()` by the mask
             // construction above.
-            unsafe { model::attn::flash_v_accum_avx2(&w, keys, blk, rope, &mut r_a) };
+            unsafe { attn::flash_v_accum_avx2(&w, keys, blk, rope, &mut r_a) };
             for (d, (&a, &b)) in r_s.iter().zip(r_a.iter()).enumerate() {
                 assert_eq!(
                     a.to_bits(),
@@ -727,7 +715,7 @@ fn hw_flash_v_accum_avx2_matches_scalar() {
 /// No model file, no oracle — only the box's ISA. One struct so the re-exec
 /// child and its parent test consume the same bytes.
 struct FlashLeverFixture {
-    p: model::attn::MlaParams,
+    p: attn::MlaParams,
     q_rope: Tensor2,
     q_nope2: Tensor2,
     /// The KV rows as one flat row-major buffer, the cache's own layout.
@@ -744,7 +732,7 @@ impl FlashLeverFixture {
 }
 
 fn flash_lever_fixture() -> FlashLeverFixture {
-    let p = model::attn::MlaParams {
+    let p = attn::MlaParams {
         n_head: 2,
         kq_head: 576,
         nope: 512,
@@ -753,7 +741,7 @@ fn flash_lever_fixture() -> FlashLeverFixture {
         latent: 512,
         eps: 1e-6,
         // The rope fields are dead here — flash reads only the dims.
-        rope: model::attn::RopeParams {
+        rope: attn::RopeParams {
             n_dims: 64,
             freq_base: 1e4,
             freq_scale: 0.025,
@@ -787,7 +775,7 @@ fn flash_lever_fixture() -> FlashLeverFixture {
     let mut keys16: Vec<u16> = Vec::with_capacity(n_keys * width);
     for _ in 0..n_keys {
         for _ in 0..width {
-            keys16.push(model::attn::f32_to_f16_bits(rng.range(-4.0, 4.0)));
+            keys16.push(gguf::quant::f32_to_f16_bits(rng.range(-4.0, 4.0)));
         }
     }
     // Every query keeps at least one allowed key; the key count crosses
@@ -826,7 +814,7 @@ fn hw_flash_simd_lever_child_dump() {
     let f = flash_lever_fixture();
     // The public dispatch: with BLOOMERY_FLASH_SIMD=0 the OnceLock in
     // `flash_simd` must force the scalar row twin for the whole process.
-    let out = model::attn::flash_attn_latent(
+    let out = attn::flash_attn_latent(
         &f.q_rope,
         &f.q_nope2,
         f.keys(),
@@ -858,7 +846,7 @@ fn hw_flash_simd_lever_forces_scalar() {
 
     // The scalar oracle, in-process: the bit-exact twin the SIMD path is
     // banded against by `hw_flash_simd_bands_against_scalar`.
-    let want = model::attn::flash_attn_latent_scalar(
+    let want = attn::flash_attn_latent_scalar(
         &f.q_rope,
         &f.q_nope2,
         f.keys(),
@@ -909,7 +897,7 @@ fn hw_flash_simd_lever_forces_scalar() {
     // differing is expected — the documented kq reassociation band; it
     // being byte-identical would mean this fixture cannot tell the two row
     // twins apart, in which case the compare above proves nothing.
-    let simd = model::attn::flash_attn_latent(
+    let simd = attn::flash_attn_latent(
         &f.q_rope,
         &f.q_nope2,
         f.keys(),
@@ -997,17 +985,17 @@ fn hw_kv_prefetch_lever_child() {
     }
     let q1 = &f.q_slots[..1];
 
-    model::attn::set_kv_prefetch(Some(true));
-    let on = model::attn::flash_attn_latent(&q_rope, &q_nope2, f.keys(), &f.key_slots, q1, &f.p);
+    attn::set_kv_prefetch(Some(true));
+    let on = attn::flash_attn_latent(&q_rope, &q_nope2, f.keys(), &f.key_slots, q1, &f.p);
     assert_eq!(
-        model::attn::last_kv_prefetch(),
+        attn::last_kv_prefetch(),
         Some(true),
         "one-query row with the lever forced on must report prefetching"
     );
-    model::attn::set_kv_prefetch(Some(false));
-    let off = model::attn::flash_attn_latent(&q_rope, &q_nope2, f.keys(), &f.key_slots, q1, &f.p);
+    attn::set_kv_prefetch(Some(false));
+    let off = attn::flash_attn_latent(&q_rope, &q_nope2, f.keys(), &f.key_slots, q1, &f.p);
     assert_eq!(
-        model::attn::last_kv_prefetch(),
+        attn::last_kv_prefetch(),
         Some(false),
         "one-query row with the lever forced off must report no prefetch"
     );
@@ -1022,8 +1010,8 @@ fn hw_kv_prefetch_lever_child() {
     );
 
     // Multi-query rows (prefill) never prefetch, lever or no lever.
-    model::attn::set_kv_prefetch(Some(true));
-    let _ = model::attn::flash_attn_latent(
+    attn::set_kv_prefetch(Some(true));
+    let _ = attn::flash_attn_latent(
         &f.q_rope,
         &f.q_nope2,
         f.keys(),
@@ -1032,11 +1020,11 @@ fn hw_kv_prefetch_lever_child() {
         &f.p,
     );
     assert_eq!(
-        model::attn::last_kv_prefetch(),
+        attn::last_kv_prefetch(),
         Some(false),
         "a {n_tok}-query row must not prefetch"
     );
-    model::attn::set_kv_prefetch(None);
+    attn::set_kv_prefetch(None);
     println!(
         "kv prefetch lever: one-query on/off observed, {} values bit-identical, {n_tok}-query never prefetches",
         on.data.len()

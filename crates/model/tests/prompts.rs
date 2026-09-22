@@ -15,7 +15,7 @@
 //! oracle dumper on purpose — see `tools/ref/argmax_ref.cpp`.
 //!
 //! `hw_` prefix: needs the box, the model file and ik's answers.
-use model::forward::{argmax, forward_trace};
+use model::arch::deepseek2::forward::{argmax, forward_trace};
 
 fn model_path() -> String {
     std::env::var("BLOOMERY_MODEL")

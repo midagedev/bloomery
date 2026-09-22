@@ -13,7 +13,7 @@ use cuda_core::CudaStream;
 use gguf::quant::{GgmlType, half_to_f32};
 use gguf::{Gguf, TensorInfo};
 // The Q8_0 block `q8_0_planes` packs; the gate binaries name it through here.
-pub use model::attn::Q8Block;
+pub use gguf::quant::Q8Block;
 use std::collections::BTreeMap;
 use std::ops::Range;
 

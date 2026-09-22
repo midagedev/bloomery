@@ -28,8 +28,8 @@
 mod oracle;
 
 use model::Tensor2;
-use model::attn::{MlaParams, Q8Block, q_nope2_absorbed, quantize_q8_0};
-use model::derived::Derived;
+use model::arch::deepseek2::attn::{MlaParams, Q8Block, q_nope2_absorbed, quantize_q8_0};
+use model::arch::deepseek2::derived::Derived;
 
 /// The pre-`Derived` build, verbatim: the two loops `q_nope2_absorbed` used to
 /// run per call — dequantize the head's k-up rows of `attn_kv_b`, requant

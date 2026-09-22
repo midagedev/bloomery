@@ -29,9 +29,9 @@
 //! afterwards only ever sees `&Derived`. `size_bytes` and the decode binary
 //! print the real size, and the build is one pass, once.
 
+use super::attn::{MlaParams, Q8Block, quantize_q8_0};
 use super::names;
 use crate::ModelError;
-use crate::attn::{MlaParams, Q8Block, quantize_q8_0};
 use crate::head::HeadPlan;
 use crate::moe::MoeBlockPlan;
 use crate::ops::f32_tensor;
@@ -177,8 +177,11 @@ impl Derived {
             .ok_or_else(|| ModelError::MissingTensor("token_embd.weight".into()))?
             .clone();
         let embd = embed.dims[0] as usize;
-        let eps = crate::forward::rms_eps(gguf);
-        let head = HeadPlan::new(gguf)?;
+        let eps = super::forward::rms_eps(gguf);
+        // deepseek2 carries one architecture-wide rms eps; the file has no separate
+        // final-norm key. The 1e-4 gate on `result_norm` is the numeric proof that
+        // this key is the one the final norm runs with.
+        let head = HeadPlan::new(gguf, eps)?;
         let mut per_block = Vec::with_capacity(n_block);
         let mut blocks = Vec::with_capacity(n_block);
         for b in 0..n_block {
@@ -206,7 +209,7 @@ impl Derived {
                     gguf.find(&names::attn_kv_a_norm(b))
                         .ok_or_else(|| ModelError::MissingTensor(names::attn_kv_a_norm(b)))?,
                 )?,
-                v_up_views: crate::attn::v_up_views(wkb, &p)?,
+                v_up_views: super::attn::v_up_views(wkb, &p)?,
             };
             let gain = |name: String| -> Result<Vec<f32>, ModelError> {
                 f32_tensor(
@@ -281,7 +284,7 @@ impl Derived {
     }
 
     /// Every head's blocks for block `block`, concatenated head-major — the
-    /// slice [`q_nope2_absorbed`](crate::attn::q_nope2_absorbed) consumes.
+    /// slice [`q_nope2_absorbed`](super::attn::q_nope2_absorbed) consumes.
     pub fn wk_b_all_heads(&self, block: usize) -> Result<&[Q8Block], ModelError> {
         Ok(&self.block(block)?.blocks)
     }
@@ -315,7 +318,7 @@ impl Derived {
 /// so any "equivalent" restructuring here is a gate event, not a refactoring.
 fn build_block(gguf: &Gguf, wkb: &TensorInfo, p: &MlaParams) -> Result<BlockDerived, ModelError> {
     let bytes = gguf.data(wkb)?;
-    let row_bytes = crate::attn::wkb_row_bytes(wkb, p.latent)?;
+    let row_bytes = super::attn::wkb_row_bytes(wkb, p.latent)?;
     let nblocks = p.nope / 32;
     let span = p.latent * nblocks;
     let mut blocks = Vec::with_capacity(p.n_head * span);

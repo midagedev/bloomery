@@ -10,7 +10,8 @@
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use model::forward::{new_cache, step};
+use model::arch::deepseek2::derived::Derived;
+use model::arch::deepseek2::forward::{new_cache, step};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -97,7 +98,7 @@ const LIMIT: u64 = 660;
 fn hw_steady_step_allocations_bounded() {
     let g = gguf::Gguf::open(oracle::model_path()).unwrap();
     let mut cache = new_cache(&g).unwrap();
-    let derived = model::derived::Derived::new(&g).unwrap();
+    let derived = Derived::new(&g).unwrap();
     step(
         &g,
         &[100000, 549, 6077, 280, 7239, 317],

@@ -30,7 +30,9 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::model::{LayerTaps, StepMode};
+use bloomery_gpu::arch::deepseek2::LayerTaps;
+#[cfg(feature = "gpu")]
+use bloomery_gpu::model::StepMode;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
 #[cfg(feature = "gpu")]

@@ -21,14 +21,14 @@
 //! Contract: `x` is `[embd, n_tokens]`, `slots.len() == x.ne1`, the batch's own tokens are the
 //! KV entries (prefill); `t` attends to `u` iff `slots[u].seq == slots[t].seq && slots[u].pos <= slots[t].pos`.
 
+use super::derived::Derived;
 use super::names;
-use crate::derived::Derived;
 use crate::kv::{KvCache, KvRows};
 use crate::ops::{matmul_q, matmul_q_batch, matmul_q_group, rms_norm};
 use crate::profile;
 use crate::{ModelError, Slot, Tensor2};
 use gguf::QuantError;
-use gguf::quant::half_to_f32;
+use gguf::quant::{f32_to_f16_bits, half_to_f32};
 use gguf::{Gguf, TensorInfo};
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -477,51 +477,10 @@ impl MlaParams {
     }
 }
 
-// ------------------------------------------------------------------ f16
-
-/// f32 → f16 bits, round-to-nearest-even — `vcvtps2ph $0x0` on the reference build (AVX2 + F16C, not AVX-512). Subnormals and ties follow IEEE; NaN/inf collapse to inf (no NaN reaches the gated graph). The crate's one f16 round-trip helper: q rows, KV cache and V accumulator all round through here.
-pub fn f32_to_f16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let a = b & 0x7fff_ffff;
-    if a >= 0x7f80_0000 {
-        return sign | 0x7c00;
-    }
-    let exp = ((a >> 23) as i32) - 127;
-    let frac = a & 0x007f_ffff;
-    if exp > 15 {
-        // Past f16's finite range; unreachable in the gated graph.
-        return sign | 0x7c00;
-    }
-    if exp >= -14 {
-        // Normal f16: keep 11 significand bits; round the dropped 13 with the ties-to-even carry `v + 0x0fff + ((v >> 13) & 1)`.
-        let v = (((exp + 15) as u32) << 23) | frac;
-        let t = v + 0x0fff + ((v >> 13) & 1);
-        let h = t >> 13;
-        if h & 0x7c00 == 0x7c00 {
-            return sign | 0x7c00;
-        }
-        return sign | h as u16;
-    }
-    // Subnormal f16: value in units of 2^-24, round-to-nearest-even on the shift.
-    if exp < -25 {
-        return sign;
-    }
-    let shift = (-1 - exp) as u32;
-    let v = 0x0080_0000 | frac;
-    let half = 1u32 << (shift - 1);
-    let rem = v & ((1 << shift) - 1);
-    let mut h = v >> shift;
-    if rem > half || (rem == half && (h & 1) == 1) {
-        h += 1; // a carry into the normal range is correct IEEE behaviour
-    }
-    sign | h as u16
-}
-
 // --------------------------------------------------------------- q_nope2
 
-// `Q8Block` lives in qdot with the cell kernel; re-exported so `Derived`'s storage, the gates' `assert_eq!` and the size assertion (`tests/derived.rs`) keep compiling; field-wise equality is equality of every byte.
-pub use qdot::Q8Block;
+// `Q8Block` lives in `gguf::quant` with the other GGUF block formats; re-exported so `Derived`'s storage, the gates' `assert_eq!` and the size assertion (`tests/derived.rs`) keep compiling; field-wise equality is equality of every byte.
+pub use gguf::quant::Q8Block;
 
 /// The weight requant the reference's `wk_b` cast runs: `quantize_row_q8_0`, x86 branch
 /// (ggml-quants.c:938+) — `d = amax/127` stored f16, `id = 127/amax` (a different f32
@@ -601,7 +560,7 @@ thread_local! {
 /// `wk_b` is not in the file: the reference derives it at load (`llm_prepare_mla`,
 /// llama.cpp:3229 — k-up rows of `attn_kv_b`, dequantized, transposed, Q8_0 blocks
 /// along q_nope), a pure function of the weights, so it runs once in
-/// [`Derived`](crate::derived::Derived); this is the per-token half in staged form —
+/// [`Derived`](super::derived::Derived); this is the per-token half in staged form —
 /// the step folds it into [`attn_heads_fused`], and `tests/attn.rs` holds the two
 /// together.
 ///
@@ -1542,7 +1501,7 @@ pub(crate) fn v_up_views(wkb: &TensorInfo, p: &MlaParams) -> Result<Vec<TensorIn
 
 /// The `wv_b` gather-matmul-scatter over prebuilt views, in staged form: the step
 /// folds it into [`attn_heads_fused`], and `tests/attn.rs` holds the two together.
-/// The views come from [`Derived`](crate::derived::Derived).
+/// The views come from [`Derived`](super::derived::Derived).
 pub fn wv_b_heads_with(
     gguf: &Gguf,
     views: &[TensorInfo],

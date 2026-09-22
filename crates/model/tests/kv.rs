@@ -17,7 +17,8 @@
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use model::forward::{forward, new_cache, step};
+use model::arch::deepseek2::derived::Derived;
+use model::arch::deepseek2::forward::{forward, new_cache, step};
 
 fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(
@@ -49,7 +50,7 @@ fn hw_kv_one_shot_equals_uncached() {
 
     let plain = forward(&g, &tokens).unwrap();
     let mut cache = new_cache(&g).unwrap();
-    let derived = model::derived::Derived::new(&g).unwrap();
+    let derived = Derived::new(&g).unwrap();
     let cached = step(&g, &tokens, &mut cache, &derived).unwrap();
 
     assert_eq!(cache.len(), tokens.len(), "the cache holds the whole batch");
@@ -82,7 +83,7 @@ fn hw_kv_incremental_is_bit_exact() {
     let one_shot = forward(&g, &tokens).unwrap();
 
     let mut cache = new_cache(&g).unwrap();
-    let derived = model::derived::Derived::new(&g).unwrap();
+    let derived = Derived::new(&g).unwrap();
     step(&g, &tokens[..split], &mut cache, &derived).unwrap();
     assert_eq!(cache.len(), split, "prefill cached {split} positions");
     assert_eq!(
@@ -122,7 +123,7 @@ fn hw_kv_every_split_is_bit_exact() {
         .collect();
 
     let mut cache = new_cache(&g).unwrap();
-    let derived = model::derived::Derived::new(&g).unwrap();
+    let derived = Derived::new(&g).unwrap();
     for (i, t) in tokens.iter().enumerate() {
         let got = step(&g, &[*t], &mut cache, &derived).unwrap();
         let worst = max_abs_diff(&got.data, &refs[i]);
@@ -160,7 +161,7 @@ fn hw_kv_rows_view_is_row_major() {
         let mut flat: Vec<u16> = Vec::with_capacity(slots.len() * width);
         for t in 0..slots.len() {
             let col: Vec<u16> = (0..width)
-                .map(|e| model::attn::f32_to_f16_bits((bi * 100 + t * 10 + e) as f32))
+                .map(|e| gguf::quant::f32_to_f16_bits((bi * 100 + t * 10 + e) as f32))
                 .collect();
             flat.extend_from_slice(&col);
             want.push(col);

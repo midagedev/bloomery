@@ -25,8 +25,8 @@
 //! records witnesses — a tok/s taken while something else has the machine is not
 //! a measurement.
 use model::arch::Arch;
-use model::derived::Derived;
-use model::forward::{argmax, forward, new_cache, step};
+use model::arch::deepseek2::derived::Derived;
+use model::arch::deepseek2::forward::{argmax, forward, new_cache, step};
 use std::time::Instant;
 
 fn main() {

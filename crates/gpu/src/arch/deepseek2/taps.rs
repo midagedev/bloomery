@@ -170,7 +170,7 @@ use crate::model::probe::{Observer, check_one_node_per_tick, profile_reps};
 use crate::model::{GpuModel, OpTime};
 use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
-use model::attn::MlaParams;
+use model::arch::deepseek2::attn::MlaParams;
 
 impl GpuModel<Body> {
     /// The attention geometry read from the model file at load.

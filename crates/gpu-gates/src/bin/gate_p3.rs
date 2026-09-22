@@ -9,9 +9,9 @@
 //!
 //! The Q8_0 weights are quantized here, not read: the shared `dequant_row`
 //! has no Q8_0 arm (`GgmlType` models the file's storage types; the engine's
-//! derived Q8_0 lives in `model` as `Q8Block`), so the ggml quantize rule
+//! derived Q8_0 lives in `gguf::quant` as `Q8Block`), so the ggml quantize rule
 //! the engine's load-time requant runs and its dequantizer are transcribed
-//! below, verbatim from `model::attn`.
+//! below, verbatim from `model::arch::deepseek2::attn` and `gguf::quant`.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -204,7 +204,7 @@ fn report(ty: &str, k: usize, rows: usize, m: usize, rel: f32, bit_same: bool, b
 // ------------------------------------------------- local Q8_0 quantizer
 
 /// `f32_to_f16_bits` — IEEE round-to-nearest-even, transcribed from
-/// `model::attn` (the engine's load-time requant stores this rounding).
+/// `gguf::quant` (the engine's load-time requant stores this rounding).
 #[cfg(feature = "gpu")]
 fn f32_to_f16_bits(x: f32) -> u16 {
     let b = x.to_bits();

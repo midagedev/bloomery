@@ -9,7 +9,7 @@
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use model::forward::{argmax, embed, forward_trace};
+use model::arch::deepseek2::forward::{argmax, embed, forward_trace};
 
 fn max_abs_diff(got: &[f32], want: &[f32]) -> (f32, usize) {
     assert_eq!(

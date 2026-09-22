@@ -28,7 +28,7 @@
 #[path = "common/oracle.rs"]
 mod oracle;
 
-use model::forward::forward;
+use model::arch::deepseek2::forward::forward;
 
 /// The re-exec entry point. Not a test of its own: when `BLOOMERY_MT_CHILD_DUMP`
 /// is absent (i.e. someone ran the file directly) it returns without doing

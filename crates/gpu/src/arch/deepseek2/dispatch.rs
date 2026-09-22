@@ -20,7 +20,7 @@ use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use cuda_core::DeviceBuffer;
-use model::attn::MlaParams;
+use model::arch::deepseek2::attn::MlaParams;
 
 /// Enqueue the whole decode chain at m = 1: layer 0 with its embedding,
 /// every later layer reading the previous layer's output, then the head.
@@ -78,7 +78,7 @@ pub(super) fn enqueue_chain(
 /// layer is the first of the model, the attention half every layer shares,
 /// and the FFN half the layer's own weights select — the fused dense FFN
 /// when the layer has no router, the routed MoE half when it has one.
-/// Mirrors `model::attn::block_attn_cached` and `model::moe`'s op order with
+/// Mirrors `model::arch::deepseek2::attn::block_attn_cached` and `model::moe`'s op order with
 /// the gated kernels plus this file's gather. Asynchronous throughout —
 /// capturable as a body. A layer that does not embed reads its input
 /// residual from the resident input buffer.

@@ -28,11 +28,6 @@ pub use kernels::StepKernels;
 pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 
-// The taps are the architecture's — one span per name of ITS reference dump —
-// but the gate binaries have always found them at `bloomery_gpu::model::*`,
-// and this round moves code, not call sites.
-pub use crate::arch::deepseek2::{Block0Taps, LayerTaps};
-
 use crate::head::Head;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph};

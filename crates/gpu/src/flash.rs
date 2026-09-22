@@ -7,7 +7,7 @@
 //! softmax(scale · q·k)-weighted sum of the rows' latent tails, projected
 //! later by `attn_kv_b`'s V part (not this package).
 //!
-//! The f16 rounding reuses `model::attn::f32_to_f16_bits` itself — the one
+//! The f16 rounding reuses `gguf::quant::f32_to_f16_bits` itself — the one
 //! owner of the CPU oracle's conversion — so cache bits are equal by
 //! construction, not by transcription; the gate asserts it element for
 //! element on real `kvr-L` rows and on the IEEE edges.
@@ -90,7 +90,7 @@ use std::sync::Arc;
 
 /// The CPU oracle's f32 -> f16 conversion, reused as this module's device
 /// and host rounding so the cache bits cannot drift from the engine's.
-pub use model::attn::f32_to_f16_bits;
+pub use gguf::quant::f32_to_f16_bits;
 
 /// Latent tail this kernel family's geometry is built for, and so the block's
 /// thread count: one thread per latent dim. `enqueue_flash_latent` rejects

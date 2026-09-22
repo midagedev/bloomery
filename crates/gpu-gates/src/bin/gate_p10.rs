@@ -66,7 +66,7 @@ use gguf::Gguf;
 #[cfg(feature = "gpu")]
 use gguf::quant::{GgmlType, half_to_f32};
 #[cfg(feature = "gpu")]
-use model::derived::Derived;
+use model::arch::deepseek2::derived::Derived;
 #[cfg(feature = "gpu")]
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -470,14 +470,10 @@ fn expected_planes(
     name: &str,
     n_layers: usize,
 ) -> Result<HostPlanes, GateError> {
-    if let Some(rest) = name.strip_prefix("derived.blk.") {
-        let l: usize = rest
-            .strip_suffix(".q_nope2")
-            .and_then(|n| n.parse().ok())
+    if name.starts_with("derived.") {
+        let l = (0..n_layers)
+            .find(|&l| name == bloomery_gpu::arch::deepseek2::derived_name(l))
             .ok_or_else(|| format!("gate_p10: malformed derived name {name:?}"))?;
-        if l >= n_layers {
-            return Err(format!("gate_p10: derived layer {l} out of range").into());
-        }
         let (qs, d) = gate_q8_planes(derived.wk_b_all_heads(l)?);
         return Ok(HostPlanes::Q8(qs, d));
     }

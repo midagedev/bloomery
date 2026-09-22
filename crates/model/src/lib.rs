@@ -28,10 +28,6 @@ pub mod profile;
 
 pub use ops::Tensor2;
 
-/// The model-aware modules keep their old paths: `attn`, `derived` and `forward`
-/// are this architecture's, and every caller names them through the crate root.
-pub use arch::deepseek2::{attn, derived, forward};
-
 /// Which sequence and which position a token occupies. See decision 2 above — this pair is
 /// the KV key, and it exists from the first line so a speculative branch has somewhere to go.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

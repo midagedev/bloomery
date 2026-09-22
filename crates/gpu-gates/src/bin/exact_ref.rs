@@ -39,10 +39,10 @@
 
 use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
 use bloomery_gpu_gates::{GateError, data_dir, open_model, ref_model_path};
-use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits, half_to_f32};
 use gguf::{Gguf, TensorInfo};
+use model::arch::deepseek2::attn::MlaParams;
 use model::arch::deepseek2::names;
-use model::attn::{MlaParams, f32_to_f16_bits};
 use std::path::{Path, PathBuf};
 
 type Res<T> = Result<T, GateError>;

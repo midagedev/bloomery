@@ -19,7 +19,7 @@
 //! end. Every stage after attention is column-independent, so the two agree on the
 //! column that survives; ik's version is cheaper, ours is simpler, and 1-5 is where
 //! that trade starts to matter.
-use crate::derived::Derived;
+use super::derived::Derived;
 use crate::kv::KvCache;
 use crate::ops::{Tensor2, rms_norm};
 use crate::profile;
@@ -59,7 +59,7 @@ pub struct ForwardTrace {
 /// lookup is expected to match the oracle **exactly**, not within a tolerance.
 ///
 /// Resolves the table per call — the direct-call path; a step hands the view
-/// from [`Derived`](crate::derived::Derived) to [`embed_with`] instead.
+/// from [`Derived`](super::derived::Derived) to [`embed_with`] instead.
 pub fn embed(gguf: &Gguf, tokens: &[u32]) -> Result<Tensor2, ModelError> {
     let w = gguf
         .find("token_embd.weight")
@@ -112,9 +112,9 @@ pub fn embed_with(gguf: &Gguf, w: &TensorInfo, tokens: &[u32]) -> Result<Tensor2
     Ok(out)
 }
 
-/// The architecture-wide rms epsilon, from the file. The same key `head.rs`'s
-/// plan reads; the 1e-4 gates on every `attn_norm-N` are the proof that it is
-/// the right one.
+/// The architecture-wide rms epsilon, from the file. `Derived::new` hands the
+/// same value to the head's plan; the 1e-4 gates on every `attn_norm-N` are the
+/// proof that it is the right one.
 pub(crate) fn rms_eps(gguf: &Gguf) -> f32 {
     gguf.arch_get_f32("attention.layer_norm_rms_epsilon")
         .expect("rms eps must come from the file, never from a literal")
@@ -167,7 +167,7 @@ pub fn block_cached(
 ) -> Result<Tensor2, ModelError> {
     block_common(gguf, b, x, derived, |normed| {
         Ok(
-            crate::attn::block_attn_cached(gguf, b, normed, q_slots, cache, b, range, derived)?
+            super::attn::block_attn_cached(gguf, b, normed, q_slots, cache, b, range, derived)?
                 .kqv_out,
         )
     })
@@ -184,7 +184,7 @@ pub fn block(
     derived: &Derived,
 ) -> Result<Tensor2, ModelError> {
     block_common(gguf, b, x, derived, |normed| {
-        crate::attn::block_attn(gguf, b, normed, slots, derived)
+        super::attn::block_attn(gguf, b, normed, slots, derived)
     })
 }
 
@@ -284,7 +284,7 @@ pub fn new_cache(gguf: &Gguf) -> Result<KvCache, ModelError> {
         .block_count()
         .ok_or_else(|| ModelError::MissingTensor("metadata key block_count".into()))?
         as usize;
-    let p = crate::attn::MlaParams::read(gguf, 0)?;
+    let p = super::attn::MlaParams::read(gguf, 0)?;
     Ok(KvCache::new(n_block, p.latent + p.rope_dims))
 }
 

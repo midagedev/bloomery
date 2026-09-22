@@ -232,6 +232,51 @@ pub fn half_to_f32(bits: u16) -> f32 {
     f32::from_bits(sign | mag)
 }
 
+/// f32 → f16 bits, round-to-nearest-even — `vcvtps2ph $0x0` on the reference build (AVX2 +
+/// F16C, not AVX-512). Subnormals and ties follow IEEE; NaN/inf collapse to inf (no NaN
+/// reaches the gated graph).
+///
+/// The inverse of [`half_to_f32`]: every f16 but NaN comes back as its own bits. The
+/// engine's one f32 → f16 rounding: the CPU and GPU KV caches, the GPU tensor-core query
+/// rows and the Q8_0 requant's scales all round through here.
+pub fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let a = b & 0x7fff_ffff;
+    if a >= 0x7f80_0000 {
+        return sign | 0x7c00;
+    }
+    let exp = ((a >> 23) as i32) - 127;
+    let frac = a & 0x007f_ffff;
+    if exp > 15 {
+        // Past f16's finite range; unreachable in the gated graph.
+        return sign | 0x7c00;
+    }
+    if exp >= -14 {
+        // Normal f16: keep 11 significand bits; round the dropped 13 with the ties-to-even carry `v + 0x0fff + ((v >> 13) & 1)`.
+        let v = (((exp + 15) as u32) << 23) | frac;
+        let t = v + 0x0fff + ((v >> 13) & 1);
+        let h = t >> 13;
+        if h & 0x7c00 == 0x7c00 {
+            return sign | 0x7c00;
+        }
+        return sign | h as u16;
+    }
+    // Subnormal f16: value in units of 2^-24, round-to-nearest-even on the shift.
+    if exp < -25 {
+        return sign;
+    }
+    let shift = (-1 - exp) as u32;
+    let v = 0x0080_0000 | frac;
+    let half = 1u32 << (shift - 1);
+    let rem = v & ((1 << shift) - 1);
+    let mut h = v >> shift;
+    if rem > half || (rem == half && (h & 1) == 1) {
+        h += 1; // a carry into the normal range is correct IEEE behaviour
+    }
+    sign | h as u16
+}
+
 // ------------------------------------------------------------ legacy quants
 
 /// Port of `dequantize_row_q5_0` (ggml-quants.c:1628). Block geometry
@@ -566,4 +611,14 @@ pub fn quantize_activations(weight: GgmlType, x: &[f32], out: &mut [f32]) {
         Some(ActivationFormat::Q8_2X4) => quantize_row_q8_2_x4_roundtrip(x, out),
         None => out.copy_from_slice(x),
     }
+}
+
+/// One Q8_0 block over 32 values: f16 scale bits then 32 int8 codes (34 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Q8Block {
+    /// f16 bits of the block scale (convert with `half_to_f32`).
+    pub d: u16,
+    /// The int8 codes, `[-127, 127]`.
+    pub q: [i8; 32],
 }

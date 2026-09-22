@@ -14,8 +14,8 @@ use std::time::Instant;
 
 /// The head's load-time state: the architecture-wide eps, the decoded
 /// `output_norm.weight` gain and the `output.weight` view — everything a step
-/// re-read from the file before this existed. Built once per file by
-/// `Derived::new` and per call by [`head`].
+/// re-read from the file before this existed. Built once per file by the
+/// architecture's load-time plan and per call by [`head`].
 pub struct HeadPlan {
     pub(crate) eps: f32,
     pub(crate) gain: Vec<f32>,
@@ -23,11 +23,9 @@ pub struct HeadPlan {
 }
 
 impl HeadPlan {
-    pub fn new(gguf: &Gguf) -> Result<HeadPlan, ModelError> {
-        // deepseek2 carries one architecture-wide rms eps; the file has no separate
-        // final-norm key. The 1e-4 gate on `result_norm` is the numeric proof that
-        // this key is the one the final norm runs with.
-        let eps = crate::forward::rms_eps(gguf);
+    /// `eps` is the caller's: which metadata key the final norm runs with is the
+    /// architecture's to say.
+    pub fn new(gguf: &Gguf, eps: f32) -> Result<HeadPlan, ModelError> {
         let norm_t = gguf
             .find("output_norm.weight")
             .ok_or_else(|| ModelError::MissingTensor("output_norm.weight".into()))?;
@@ -47,9 +45,10 @@ impl HeadPlan {
 /// gate checks it against `deepseek2.vocab_size` from the file, never a literal.
 ///
 /// Resolves the head plan per call — the direct-call path; a decode step hands
-/// the plan from [`Derived`](crate::derived::Derived) to [`head_with`].
-pub fn head(gguf: &Gguf, x: &Tensor2) -> Result<Tensor2, ModelError> {
-    let plan = HeadPlan::new(gguf)?;
+/// the plan its architecture built at load to [`head_with`]. `eps` is the final
+/// norm's, as [`HeadPlan::new`] takes it.
+pub fn head(gguf: &Gguf, eps: f32, x: &Tensor2) -> Result<Tensor2, ModelError> {
+    let plan = HeadPlan::new(gguf, eps)?;
     head_with(gguf, &plan, x)
 }
 

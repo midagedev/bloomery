@@ -12,9 +12,9 @@ pub(crate) fn dev_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DevWeight
         .ok_or_else(|| GpuError::tensor("dev_weight", name, "resident"))
 }
 
-/// The resident derived q_nope2 planes named by `name` (`qs` rows x k/4
-/// code words, `d` rows x k/32 scales, rows = n_head * latent, k = nope).
-/// The name is `LayerNames::derived`, built at load.
+/// The resident derived Q8_0 planes named by `name` (`qs` rows x k/4 code
+/// words, `d` rows x k/32 scales): a weight the architecture's plan derived
+/// at load and filed under a `derived.` name.
 pub(crate) fn q8_derived<'a>(
     w: &'a Weights,
     name: &str,

@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # 아키텍처 축 점검 — 맥에서 돈다(grep뿐, 빌드 없음). docs/arch-split.md 「검사」가 정본이다.
 #
-# 세 가지를 본다:
+# 네 가지를 본다:
 #   ① arch/deepseek41/ 아래가 deepseek2 를 use 하지 않고, 그 반대도 없다.
 #   ② blk.N.<name> 문자열 리터럴과 "deepseek2. / "deepseek41. 키 접두는 crates/*/src/arch/ 와
 #      tools/ref/models/ 밖에 없다 — 커널 파일은 모델 이름을 모른다(결정 6).
 #   ③ general.architecture 를 읽는 자리는 crates/model/src/arch/mod.rs 하나다.
 #      crates/gguf 의 접근자는 저장소 쪽이라 허용한다.
+#   ④ 공유 파일(crates/*/src 가운데 arch/ 밖)은 아키텍처 모듈 경로(deepseek2:: · deepseek41::)를 쓰지 않는다.
+#      Arch 를 구체 모델로 잇는 디스패치 지점만 파일과 줄 모양으로 허용한다.
 #
-# 계약: `just check-arch`는 셋 다 엄격하게 돈다. --allow-pending(또는 CHECK_ARCH_PENDING=1)은 ②·③을
+# 계약: `just check-arch`는 넷 다 엄격하게 돈다. --allow-pending(또는 CHECK_ARCH_PENDING=1)은 ②·③을
 # 경고로 낮추는 문이다 — 이관 라운드가 한동안 둘을 빨강으로 두어야 할 때 그 라운드 안에서만 쓴다.
-# ①은 어느 모드에서도 엄격하다.
+# ①·④는 어느 모드에서도 엄격하다.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,7 +28,7 @@ fail=0
 report() { # report <번호> <설명> <위반 줄들>
   local n=$1 what=$2 hits=$3
   [ -n "$hits" ] || return 0
-  if [ "$n" != 1 ] && [ "$PENDING" = 1 ]; then
+  if [ "$n" != 1 ] && [ "$n" != 4 ] && [ "$PENDING" = 1 ]; then
     echo "warning: check-arch $n ($what) — $(printf '%s\n' "$hits" | wc -l | tr -d ' ') hit(s), pending the arch move:"
     printf '%s\n' "$hits" | sed 's/^/    /'
   else
@@ -79,6 +81,29 @@ archread=$(grep -rn 'general\.architecture' crates --include='*.rs' 2>/dev/null 
   | grep -vE '^crates/model/src/arch/mod\.rs:' \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 report 3 "general.architecture read outside crates/model/src/arch/mod.rs" "$archread"
+
+# ④ 공유 파일은 아키텍처 모듈 경로를 쓰지 않는다. 옛 크레이트 루트 경로(model::attn 등)는 지워져
+#    컴파일이 막으므로, 여기서는 컴파일러가 못 잡는 것 — 공유 파일이 `…::deepseek2::…`를 직접 적는 줄 — 만 본다.
+# 빼는 것은 ②와 같은 모양이다: arch/ 아래, gpu-gates 의 bin(deepseek2 게이트다), 주석 줄. 시험(crates/*/tests/)은
+# 훑는 범위(crates/*/src) 밖이다. 디스패치 지점은 파일과 줄 모양으로 하나씩, 이유 한 줄과 함께 허용한다.
+dispatch=(
+  # GpuModel<B>에 deepseek2 몸체를 꽂는 별칭 — AnyEngine(engine.rs)은 이 별칭으로만 deepseek2 를 부른다.
+  'crates/gpu/src/lib\.rs:[0-9]+:pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;$'
+  # CPU 디코드 바이너리: Arch::detect 로 다른 아키텍처를 거절한 뒤 deepseek2 순전파를 돈다.
+  'crates/model/src/bin/bloomery-decode\.rs:[0-9]+:use model::arch::deepseek2::'
+  # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.
+  'crates/gpu-gates/src/oracle/mod\.rs:[0-9]+:[[:space:]]*Arch::Deepseek2 => Ok\(&deepseek2::ORACLE\),$'
+  # 디스패치가 아닌 유일한 항목: 하네스의 기본 참조 세트. ref_dir 가 Arch 를 받기 전까지 남는다.
+  'crates/gpu-gates/src/lib\.rs:[0-9]+:[[:space:]]*data_dir\(\)\.join\(oracle::deepseek2::ORACLE\.cuda_set\)$'
+)
+archpath=$(grep -rnE '\b(deepseek2|deepseek41)::' crates/*/src --include='*.rs' 2>/dev/null \
+  | grep -vE '^crates/[^/]+/src/arch/' \
+  | grep -vE '^crates/gpu-gates/src/bin/' \
+  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+for d in "${dispatch[@]}"; do
+  archpath=$(printf '%s\n' "$archpath" | grep -vE "^$d" || true)
+done
+report 4 "architecture module path in a shared file, outside arch/ and the dispatch points" "$archpath"
 
 if [ "$fail" = 1 ]; then
   echo "check-arch: failed" >&2

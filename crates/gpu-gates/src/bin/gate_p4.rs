@@ -57,8 +57,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
+    use bloomery_gpu::arch::deepseek2::MlaParams;
     use bloomery_gpu::elem::{ARGMAX_THREADS, ElemKernels};
-    use bloomery_gpu::{DeviceTensor, Gpu, MlaParams};
+    use bloomery_gpu::{DeviceTensor, Gpu};
 
     // Reduction ops' band vs the f64 host reference (the package's gate rule:
     // 1e-5 for a tree-vs-serial sum); 1e-6 for the plain-op band of rope and

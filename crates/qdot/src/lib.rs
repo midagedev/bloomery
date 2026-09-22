@@ -8,7 +8,7 @@
 //! - Q6_K x Q8_2_X4: port of ik's `mul_mat_qY_K_q8_2_X4_T` (iqk_gemm_kquants.cpp:938).
 //! - Q5_0 x Q8_2_X4: port of ik's `mul_mat_qX_1_q8_2_T<Q5_0_1_Unpacker>` (iqk_gemm_legacy_quants.cpp:507).
 //! - Q5_1 x Q8_2_X4: port of ik's `mul_mat_qX_1_q8_2_T<Q5_1_Unpacker>` (iqk_gemm_legacy_quants.cpp:804).
-//! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::attn).
+//! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
 //!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108.
@@ -2087,20 +2087,15 @@ fn dot_q5f1_q82x4_emul(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
 // in the mirror's order — bit identity is algebra, not a port.
 // DOMAIN: activation codes must lie in [-127, 127]. -128 under a negative
 // weight wraps in `sign_epi8` and flips that term's sign. The producer
-// (`model::attn::quantize_act`) clamps at -127; a debug_assert re-checks here.
+// (`model::arch::deepseek2::attn::quantize_act`) clamps at -127; a debug_assert
+// re-checks here.
 // Weight codes may be -128 (|w| = 128 is a legal u8 magnitude).
 // i16: a maddubs pair peaks at 2*128*127 = 32512 <= 32767; saturation is
 // unreachable on any i8 x i8 input in this form. i32: 32 terms <= 516128.
 
-/// One Q8_0 block over 32 values: f16 scale bits then 32 int8 codes (34 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Q8Block {
-    /// f16 bits of the block scale (convert with `half_to_f32`).
-    pub d: u16,
-    /// The int8 codes, `[-127, 127]`.
-    pub q: [i8; 32],
-}
+// The weight block is a GGUF format and lives with the others in `gguf::quant`;
+// the cell kernels take it, so it keeps this crate's path too.
+pub use gguf::quant::Q8Block;
 
 /// One quantized activation block: bf16 scale as f32 and 32 int8 codes.
 #[repr(C)]

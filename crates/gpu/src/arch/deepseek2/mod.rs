@@ -21,6 +21,8 @@ mod scratch;
 mod seed;
 mod taps;
 
+/// deepseek2's MLA geometry as the CPU model reads it from the file.
+pub use model::arch::deepseek2::attn::MlaParams;
 pub use names::derived_name;
 pub use taps::{Block0Taps, LayerTaps};
 
@@ -31,8 +33,7 @@ use crate::weights::{DevWeight, Weights, q8_0_planes};
 use crate::{Gpu, GpuError};
 use cuda_core::CudaStream;
 use model::arch::Arch;
-use model::attn::MlaParams;
-use model::derived::Derived;
+use model::arch::deepseek2::derived::Derived;
 use names::LayerNames;
 use scratch::{LayerScratch, MoeDims};
 use seed::{seed_cache, seed_pattern};

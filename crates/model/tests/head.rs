@@ -82,6 +82,13 @@ fn assert_close_rel(got: &[f32], want: &[f32], what: &str) {
     );
 }
 
+/// The final norm's eps as the file carries it — `head` takes it from its caller.
+fn rms_eps(g: &gguf::Gguf) -> f32 {
+    g.value("deepseek2.attention.layer_norm_rms_epsilon")
+        .and_then(|v| v.as_f32())
+        .expect("rms eps must come from the file, never from a literal")
+}
+
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
@@ -121,7 +128,8 @@ fn hw_head_matches_oracle() {
         .arch_get_u64("vocab_size")
         .expect("vocab_size must come from the file, never a literal") as usize;
 
-    let got = head(&g, &x).unwrap();
+    let eps = rms_eps(&g);
+    let got = head(&g, eps, &x).unwrap();
 
     // Shape first: [vocab, n_tokens] — width against the file's own metadata, token
     // count carried through from the input.
@@ -137,13 +145,9 @@ fn hw_head_matches_oracle() {
     );
 
     // Stage 1, `result_norm` at 1e-4: recomputed here with this round's weights
-    // (output_norm.weight, not the ops gate's blk.0.attn_norm.weight). The eps is
-    // read independently of head's own lookup — same key, second reader.
+    // (output_norm.weight, not the ops gate's blk.0.attn_norm.weight) and the eps
+    // head was handed — the check that this key is the one the final norm runs with.
     let (norm_want, ninf) = o.load("result_norm", 0);
-    let eps = g
-        .value("deepseek2.attention.layer_norm_rms_epsilon")
-        .and_then(|v| v.as_f32())
-        .expect("rms eps must come from the file, never from a literal");
     let norm_t = g.find("output_norm.weight").unwrap();
     let gain = f32_tensor(&g, norm_t).unwrap();
     let normed = rms_norm(&x, &gain, eps);
@@ -196,7 +200,8 @@ fn hw_head_batch_is_column_independent() {
         }
     }
 
-    let wide_out = head(&g, &wide).unwrap();
+    let eps = rms_eps(&g);
+    let wide_out = head(&g, eps, &wide).unwrap();
     assert_eq!(
         (wide_out.ne0, wide_out.ne1),
         (vocab, n),
@@ -214,7 +219,7 @@ fn hw_head_batch_is_column_independent() {
     // Every column must equal the same column computed alone — bitwise, because
     // rms_norm, the Q8_K row quantization and the dot are all per-column.
     for c in 0..n {
-        let alone = head(&g, &Tensor2::from_vec(ne0, 1, wide.col(c).to_vec())).unwrap();
+        let alone = head(&g, eps, &Tensor2::from_vec(ne0, 1, wide.col(c).to_vec())).unwrap();
         assert_eq!(
             alone.data,
             wide_out.col(c),

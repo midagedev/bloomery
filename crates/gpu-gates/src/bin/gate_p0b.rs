@@ -409,7 +409,7 @@ fn run() -> Result<(), GateError> {
     // cache. Same shape of proof as above: bits, rerun, eager vs replay,
     // and the same captured graph at a second position.
     {
-        use bloomery_gpu::MlaParams;
+        use bloomery_gpu::arch::deepseek2::MlaParams;
         use bloomery_gpu::model::StepKernels;
 
         const CACHE_ROWS: usize = 64;
