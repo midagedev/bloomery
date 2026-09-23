@@ -1,0 +1,229 @@
+//! A model-free engine for the server's gates: a byte-level vocabulary plus the
+//! special strings the V4.1 chat template emits, and a bigram echo for "inference".
+//!
+//! Vocabulary: ids `0..SPECIALS.len()` are the special strings, then one id per
+//! byte. A byte id is `SPECIALS.len() + byte`, so any UTF-8 text round-trips and a
+//! multi-byte character spans several tokens (the streaming decoder must hold it).
+//!
+//! Next token: look up the most recent earlier occurrence of the last token in the
+//! whole context; the token that followed it is the prediction (logit 4), every
+//! other token that ever followed the last token gets logit 2, the rest -8. A last
+//! token never seen before predicts EOS. Deterministic, and seed-sensitive once a
+//! sampler with temperature > 0 is in the loop.
+
+use crate::engine::{Decoder, Engine, EngineError};
+
+/// Special strings, in id order. Longest-match wins on encode.
+pub const SPECIALS: [&str; 6] = [
+    "<｜begin▁of▁sentence｜>",
+    "<｜end▁of▁sentence｜>",
+    "<｜User｜>",
+    "<｜Assistant｜>",
+    "<think>",
+    "</think>",
+];
+
+const N_SPECIAL: u32 = SPECIALS.len() as u32;
+const PREDICTED: f32 = 4.0;
+const FOLLOWER: f32 = 2.0;
+const FLOOR: f32 = -8.0;
+
+/// The mock engine. `ctx_max` is chosen by the caller so the gate can hit the
+/// context limit cheaply.
+pub struct MockEngine {
+    ctx: Vec<u32>,
+    ctx_max: usize,
+}
+
+impl MockEngine {
+    /// A mock with room for `ctx_max` positions.
+    #[must_use]
+    pub fn new(ctx_max: usize) -> Self {
+        MockEngine {
+            ctx: Vec::new(),
+            ctx_max,
+        }
+    }
+
+    fn push(&mut self, id: u32) -> Result<(), EngineError> {
+        if self.ctx.len() >= self.ctx_max {
+            return Err(EngineError(format!(
+                "mock: position {} is past ctx_max {}",
+                self.ctx.len(),
+                self.ctx_max
+            )));
+        }
+        self.ctx.push(id);
+        Ok(())
+    }
+}
+
+fn token_bytes(id: u32) -> Vec<u8> {
+    match usize::try_from(id).ok().and_then(|i| SPECIALS.get(i)) {
+        Some(s) => s.as_bytes().to_vec(),
+        None => id
+            .checked_sub(N_SPECIAL)
+            .and_then(|b| u8::try_from(b).ok())
+            .map(|b| vec![b])
+            .unwrap_or_default(),
+    }
+}
+
+impl Engine for MockEngine {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let special = SPECIALS
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| bytes[i..].starts_with(s.as_bytes()))
+                .max_by_key(|(_, s)| s.len());
+            match special {
+                Some((id, s)) => {
+                    out.push(u32::try_from(id).expect("SPECIALS has six entries"));
+                    i += s.len();
+                }
+                None => {
+                    out.push(N_SPECIAL + u32::from(bytes[i]));
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        let bytes: Vec<u8> = ids.iter().flat_map(|&id| token_bytes(id)).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        Box::new(Utf8Decoder { held: Vec::new() })
+    }
+
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        ids.iter().try_for_each(|&id| self.push(id))
+    }
+
+    fn next(&mut self, last: u32, logits_out: &mut [f32]) -> Result<u32, EngineError> {
+        self.push(last)?;
+        logits_out.fill(FLOOR);
+        let n = self.ctx.len();
+        let mut predicted = self.eos();
+        let mut found = false;
+        for j in (0..n - 1).rev() {
+            if self.ctx[j] != last {
+                continue;
+            }
+            let follower = self.ctx[j + 1];
+            if let Some(slot) = usize::try_from(follower)
+                .ok()
+                .and_then(|f| logits_out.get_mut(f))
+            {
+                *slot = slot.max(FOLLOWER);
+            }
+            if !found {
+                predicted = follower;
+                found = true;
+            }
+        }
+        if let Some(slot) = usize::try_from(predicted)
+            .ok()
+            .and_then(|p| logits_out.get_mut(p))
+        {
+            *slot = PREDICTED;
+        }
+        Ok(predicted)
+    }
+
+    fn reset(&mut self) {
+        self.ctx.clear();
+    }
+
+    fn bos(&self) -> u32 {
+        0
+    }
+
+    fn eos(&self) -> u32 {
+        1
+    }
+
+    fn add_bos(&self) -> bool {
+        false
+    }
+
+    fn ctx_max(&self) -> usize {
+        self.ctx_max
+    }
+
+    fn n_vocab(&self) -> usize {
+        SPECIALS.len() + 256
+    }
+}
+
+/// Byte-accumulating decoder: emits the longest valid UTF-8 prefix it holds.
+struct Utf8Decoder {
+    held: Vec<u8>,
+}
+
+impl Decoder for Utf8Decoder {
+    fn push(&mut self, id: u32) -> Option<String> {
+        self.held.extend(token_bytes(id));
+        let valid = match std::str::from_utf8(&self.held) {
+            Ok(_) => self.held.len(),
+            Err(e) if e.error_len().is_some() => {
+                // An invalid (not merely incomplete) sequence: give up on it.
+                let s = String::from_utf8_lossy(&self.held).into_owned();
+                self.held.clear();
+                return Some(s);
+            }
+            Err(e) => e.valid_up_to(),
+        };
+        if valid == 0 {
+            return None;
+        }
+        let rest = self.held.split_off(valid);
+        let done = std::mem::replace(&mut self.held, rest);
+        String::from_utf8(done).ok()
+    }
+
+    fn flush(&mut self) -> String {
+        let s = String::from_utf8_lossy(&self.held).into_owned();
+        self.held.clear();
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_decode_round_trip_with_specials_and_multibyte() {
+        let m = MockEngine::new(64);
+        let text = "<｜User｜>héllo</think>";
+        let ids = m.encode(text);
+        assert_eq!(ids[0], 2);
+        assert_eq!(*ids.last().expect("non-empty"), 5);
+        assert_eq!(m.decode(&ids), text);
+        let mut d = m.decoder();
+        let streamed: String = ids.iter().filter_map(|&id| d.push(id)).collect();
+        assert_eq!(streamed, text);
+    }
+
+    #[test]
+    fn bigram_echo_and_eos() {
+        let mut m = MockEngine::new(64);
+        let ids = m.encode("abcab");
+        let mut logits = vec![0.0; m.n_vocab()];
+        m.prefill(&ids[..ids.len() - 1]).expect("fits");
+        let next = m.next(ids[ids.len() - 1], &mut logits).expect("fits");
+        assert_eq!(m.decode(&[next]), "c");
+        m.reset();
+        let ids = m.encode("xyz");
+        m.prefill(&ids[..2]).expect("fits");
+        assert_eq!(m.next(ids[2], &mut logits).expect("fits"), m.eos());
+    }
+}

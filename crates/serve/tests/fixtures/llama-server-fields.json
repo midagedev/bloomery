@@ -1,0 +1,11 @@
+{
+  "source": "ik_llama.cpp examples/server: README.md 'POST /completion' Response format and 'GET /slots'; server-context.cpp send_final_response/send_partial_response/get_formatted_timings; server-task.cpp result_timings::to_json",
+  "completion_final": ["content", "stop", "generation_settings", "model", "prompt", "stopped_eos", "stopped_limit", "stopped_word", "stopping_word", "timings", "tokens_cached", "tokens_evaluated", "tokens_predicted", "truncated", "id_slot"],
+  "completion_partial": ["content", "stop", "id_slot", "multimodal"],
+  "timings": ["prompt_n", "prompt_ms", "prompt_per_token_ms", "prompt_per_second", "predicted_n", "predicted_ms", "predicted_per_token_ms", "predicted_per_second", "n_ctx", "n_past"],
+  "generation_settings": ["dynatemp_exponent", "dynatemp_range", "frequency_penalty", "grammar", "ignore_eos", "logit_bias", "min_p", "mirostat", "mirostat_eta", "mirostat_tau", "model", "n_ctx", "n_keep", "n_predict", "n_probs", "penalize_nl", "penalty_prompt_tokens", "presence_penalty", "repeat_last_n", "repeat_penalty", "samplers", "seed", "stop", "stream", "temperature", "tfs_z", "top_k", "top_p", "typical_p", "use_penalty_prompt_tokens"],
+  "slot": ["id", "state", "prompt", "next_token", "task_id", "n_ctx"],
+  "slot_next_token": ["has_next_token", "n_remain", "n_decoded", "stopped_eos", "stopped_limit", "stopped_word", "stopping_word"],
+  "props": ["system_prompt", "default_generation_settings", "total_slots", "chat_template", "bos_token", "eos_token", "model_path", "n_ctx"],
+  "metrics": ["prompt_tokens_total", "prompt_seconds_total", "tokens_predicted_total", "tokens_predicted_seconds_total", "prompt_tokens_seconds", "predicted_tokens_seconds", "kv_cache_usage_ratio", "kv_cache_tokens", "requests_processing", "requests_deferred", "n_busy_slots_per_decode"]
+}
