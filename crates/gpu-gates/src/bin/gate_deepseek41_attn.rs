@@ -88,14 +88,13 @@ mod gate {
     use bloomery_gpu_gates::oracle::{Set, for_arch};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, activations, bits_equal,
-        checks_failed, find_ref_row_in, max_rel_err, ref_dir_named, ref_ints, ref_model_path,
-        ref_tensor_logical_in, verdict,
+        checks_failed, mask_bits_in, max_rel_err, no_local_depot, ref_ints, ref_model_path,
+        ref_tensor_logical_in, same_bits, verdict, widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::{GgmlType, f32_to_f16_bits, half_to_f32};
     use gguf::{Split, Value};
     use model::arch::Arch;
-    use std::io::BufRead;
 
     /// (i) on a generic layer: our transcription of ik's arithmetic against
     /// ik's own output. The transcription reproduces the sets bit for bit
@@ -133,18 +132,8 @@ mod gate {
     const IQK_BAND: f32 = 9.675e-4;
     /// The f16 NaN every cache row we did not fill holds.
     const NAN_F16: u16 = 0x7E00;
-    /// The decode-step sets, one token each after a prefill: at position 4,
-    /// at 301 with the file's list length (every compressed row a prefix)
-    /// and with lists of 64 (fused and not), and at 1,025 past a cropped
-    /// window with the file's list length (fused and not).
-    const STEP_SETS: [&str; 6] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1n_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d1_unfused_every_node",
-        "ref_deepseek41_d2_every_node",
-        "ref_deepseek41_d2_unfused_every_node",
-    ];
+    /// The f16 bits of a mask cell the query sees, `0.0` ([`mask_bits_in`]).
+    const SEEN: u16 = 0x0000;
     /// The depth cases: compressed keys visible, and the compressed source's
     /// capacity — nine segments, the eighth partial, the ninth neutral. The
     /// prefix case's stream holds `DEPTH_COMP_ROWS` rows; the selected-row
@@ -270,19 +259,10 @@ mod gate {
             )
             .into());
         }
-        let mut sets = vec![for_arch(Arch::Deepseek41)?.open(Set::Cpu)?];
-        for name in STEP_SETS {
-            let man = RefManifest::read(&ref_dir_named(name))?;
-            if man.arch.as_deref() != Some(Arch::Deepseek41.name()) {
-                return Err(format!(
-                    "{} was dumped from a {:?} model, want {}",
-                    man.dir.display(),
-                    man.arch,
-                    Arch::Deepseek41.name()
-                )
-                .into());
-            }
-            sets.push(man);
+        let oracle = for_arch(Arch::Deepseek41)?;
+        let mut sets = vec![oracle.open(Set::Cpu)?];
+        for &name in oracle.step_sets {
+            sets.push(oracle.open_named(name)?);
         }
         let infos = sets
             .iter()
@@ -293,7 +273,9 @@ mod gate {
         let gpu = Gpu::new()?;
         let kernels = AttnKernels::load(gpu.context())?;
         let stream = gpu.stream();
-        let mut ok = no_local_depot()?;
+        // Every entry compiles with no local depot: a spilled accumulator
+        // array changes no output and no band, only the time.
+        let mut ok = no_local_depot(&["ds41_attn_seg", "ds41_attn_seg_sel", "ds41_attn_merge"])?;
         let mut max = Maxima::default();
         let mut tally = [0usize; 3];
         // The prefix graph replays a batch layer that reads both sources, at
@@ -424,8 +406,8 @@ mod gate {
         // layers past them that the set does not run.
         let layers = (0..)
             .take_while(|l| {
-                let name = format!("fattn-{l}");
-                man.tensors.iter().any(|r| r.name == name)
+                man.first_named(RowKind::Tensor, &format!("fattn-{l}"))
+                    .is_some()
             })
             .count();
         if layers == 0 || layers > ratios.len() {
@@ -436,7 +418,7 @@ mod gate {
             )
             .into());
         }
-        let heads = find_ref_row_in(&man.dir, &man.tensors, "fattn-0", 0)?.ne[1];
+        let heads = man.tensor("fattn-0", 0)?.ne[1];
         let dir = man.dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let label = match dir.strip_prefix("ref_deepseek41_") {
             Some(step) => step.strip_suffix("_every_node").unwrap_or(step).to_string(),
@@ -450,43 +432,8 @@ mod gate {
             window,
             ratios: ratios[..layers].to_vec(),
             scale: 1.0 / (LATENT as f32).sqrt(),
-            threads: ik_threads(man)?,
+            threads: man.header.threads.map(usize::try_from).transpose()?,
         })
-    }
-
-    /// ik's thread count: `-t N` on the manifest's `# flags` line; `None`
-    /// when the set carries no such flag.
-    fn ik_threads(man: &RefManifest) -> Result<Option<usize>, GateError> {
-        let path = man.dir.join("MANIFEST.tsv");
-        let file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        for line in std::io::BufReader::new(file).lines() {
-            let line = line?;
-            if !line.starts_with('#') {
-                break;
-            }
-            if let Some(flags) = line.strip_prefix("# flags\t") {
-                let mut words = flags.split_whitespace();
-                while let Some(w) = words.next() {
-                    if w == "-t" {
-                        let n = words
-                            .next()
-                            .ok_or_else(|| format!("{}: -t without a count", path.display()))?;
-                        return Ok(Some(n.parse()?));
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// A tensor row, occurrence 0.
-    fn tensor<'a>(man: &'a RefManifest, name: &str) -> Result<&'a RefRow, GateError> {
-        find_ref_row_in(&man.dir, &man.tensors, name, 0)
-    }
-
-    /// An input row (a graph leaf), occurrence 0.
-    fn input<'a>(man: &'a RefManifest, name: &str) -> Result<&'a RefRow, GateError> {
-        find_ref_row_in(&man.dir, &man.inputs, name, 0)
     }
 
     /// A row's source `src` names: `src0` or `src1`.
@@ -497,61 +444,14 @@ mod gate {
             .ok_or_else(|| format!("{} names no src{which}", row.name).into())
     }
 
-    /// The values of an f16 row: its plain file holds them widened to f32,
-    /// and a contiguous row's plain file is its logical order.
-    fn f16_values(man: &RefManifest, row: &RefRow) -> Result<Vec<f32>, GateError> {
-        let path = man.dir.join(row.file_name());
-        if row.ty != "f16" || row.contig != Some(1) || row.bytes != 4 * row.count() {
-            return Err(format!(
-                "{}: {} contig {:?} with {} bytes for {} values, want a contiguous f16 row widened",
-                path.display(),
-                row.ty,
-                row.contig,
-                row.bytes,
-                row.count()
-            )
-            .into());
-        }
-        let raw = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if raw.len() as u64 != row.bytes {
-            return Err(format!(
-                "{} is {} bytes, the row says {}",
-                path.display(),
-                raw.len(),
-                row.bytes
-            )
-            .into());
-        }
-        Ok(raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect())
+    /// Row `r` of `LATENT`-value f16 rows.
+    fn row_of(bits: &[u16], r: usize) -> &[u16] {
+        &bits[r * LATENT..(r + 1) * LATENT]
     }
 
-    /// One widened row back to f16 bits; every value must be an f16
-    /// widened, which proves the bits are ik's.
-    fn f16_row(vals: &[f32], row: usize, what: &str) -> Result<Vec<u16>, GateError> {
-        vals[row * LATENT..(row + 1) * LATENT]
-            .iter()
-            .map(|&v| {
-                let b = f32_to_f16_bits(v);
-                if half_to_f32(b).to_bits() == v.to_bits() {
-                    Ok(b)
-                } else {
-                    Err(format!("{what} row {row}: {v:e} is not an f16 widened").into())
-                }
-            })
-            .collect()
-    }
-
-    /// Rows `a` of `x` and `b` of `y`, widened, carry the same bits.
-    fn same_row(x: &[f32], a: usize, y: &[f32], b: usize) -> bool {
-        bits_equal(
-            &x[a * LATENT..(a + 1) * LATENT],
-            &y[b * LATENT..(b + 1) * LATENT],
-        )
+    /// Rows `a` of `x` and `b` of `y` carry the same f16 bits.
+    fn same_row(x: &[u16], a: usize, y: &[u16], b: usize) -> bool {
+        row_of(x, a) == row_of(y, b)
     }
 
     // ------------------------------------------------------------ one layer
@@ -564,7 +464,7 @@ mod gate {
         l: usize,
     ) -> Result<LayerCase, GateError> {
         let (tokens, heads, lat) = (set.tokens as u64, set.heads as u64, LATENT as u64);
-        let fattn = tensor(man, &format!("fattn-{l}"))?;
+        let fattn = man.tensor(&format!("fattn-{l}"), 0)?;
         fattn.expect("fattn", "f32", [lat, heads, tokens, 1], "FLASH_ATTN_EXT")?;
         let q_row = query_row(man, fattn, set, l)?;
         let k = key_rows(man, fattn, set, l)?;
@@ -572,9 +472,9 @@ mod gate {
             usize::try_from(k.keys.ne[2])?,
             usize::try_from(k.raw.ne[2])?,
         );
-        let keys = f16_values(man, k.keys)?;
-        let mask = f16_values(man, k.mask)?;
-        let ring = ring_of(set, &keys, &mask, n_raw, n_kv, &k.keys.name, l)?;
+        let keys = widened_f16_rows_in(&man.dir, k.keys)?;
+        let mask = mask_bits_in(&man.dir, k.mask)?;
+        let ring = ring_of(set, &keys, &mask, n_raw, n_kv, l)?;
         let writes = raw_writes(man, set, &keys, ring.offset, l)?;
         let c = compressed(man, set, k.comp, &keys, n_raw, n_kv, l)?;
         let vis: Vec<u32> = ring
@@ -633,9 +533,9 @@ mod gate {
                 format!("fattn-{l} reads {:?}, want {q_view} (permuted)", fattn.src0).into(),
             );
         }
-        let q_row = tensor(man, &q_name)?;
+        let q_row = man.tensor(&q_name, 0)?;
         q_row.expect("q", "f32", [lat, heads, tokens, 1], "ROPE")?;
-        let v_row = tensor(man, &q_view)?;
+        let v_row = man.tensor(&q_view, 0)?;
         v_row.expect("q view", "f32", q_row.ne, "VIEW")?;
         if v_row.src0.as_deref() != Some(q_name.as_str()) || v_row.sum != q_row.sum {
             return Err(format!("{q_view} is not the whole of {q_name}").into());
@@ -673,10 +573,10 @@ mod gate {
         let k_name = k_perm
             .strip_suffix(" (permuted)")
             .ok_or_else(|| format!("fattn-{l} reads keys {k_perm}, not a permute"))?;
-        let keys = tensor(man, k_name)?;
+        let keys = man.tensor(k_name, 0)?;
         let n_kv = keys.ne[2];
         keys.expect("keys", "f16", [lat, 1, n_kv, 1], "in")?;
-        let kp_row = tensor(man, k_perm)?;
+        let kp_row = man.tensor(k_perm, 0)?;
         kp_row.expect("keys permuted", "f16", [lat, n_kv, 1, 1], "PERMUTE")?;
         if kp_row.src0.as_deref() != Some(k_name) || kp_row.sum != keys.sum {
             return Err(format!("{k_perm} is not the whole of {k_name}").into());
@@ -701,9 +601,9 @@ mod gate {
             }
             (
                 source,
-                tensor(man, raw_part)?,
-                Some(tensor(man, src(keys, 1)?)?),
-                tensor(man, &format!("{source}_kq_mask-{l}"))?,
+                man.tensor(raw_part, 0)?,
+                Some(man.tensor(src(keys, 1)?, 0)?),
+                man.tensor(&format!("{source}_kq_mask-{l}"), 0)?,
             )
         };
         raw.expect("raw keys", "f16", [lat, 1, raw.ne[2], 1], "VIEW")?;
@@ -720,7 +620,7 @@ mod gate {
             .into());
         }
         let m2i_name = format!("mask_to_idx-{l}");
-        let index_width = match man.tensors.iter().find(|r| r.name == m2i_name) {
+        let index_width = match man.first_named(RowKind::Tensor, &m2i_name) {
             None => None,
             Some(m) if m.src0.as_deref() == Some(mask.name.as_str()) => {
                 Some(usize::try_from(m.ne[0])?)
@@ -747,11 +647,7 @@ mod gate {
     /// every layer's mask starts from, cropped where the window is.
     fn raw_mask(man: &RefManifest, l: usize) -> Result<&RefRow, GateError> {
         let cropped = format!("dsv4_raw_mask_padded-{l} (view) (cont)");
-        if let Some(r) = man
-            .tensors
-            .iter()
-            .find(|r| r.name == cropped && r.occurrence == 0)
-        {
+        if let Some(r) = man.find(RowKind::Tensor, &cropped, 0) {
             return Ok(r);
         }
         let found: Vec<&RefRow> = man
@@ -779,16 +675,15 @@ mod gate {
         offset: usize,
     }
 
-    /// The ring from ik's raw rows (`keys`, of which the first `n_raw` are
-    /// raw): the offset is where the last token's visible run ends in the
-    /// dump's mask.
+    /// The ring from ik's raw rows (`keys`, f16 bits, of which the first
+    /// `n_raw` rows are raw): the offset is where the last token's visible
+    /// run ends in the dump's mask (`mask`, f16 bits).
     fn ring_of(
         set: &SetInfo,
-        keys: &[f32],
-        mask: &[f32],
+        keys: &[u16],
+        mask: &[u16],
         n_raw: usize,
         n_kv: usize,
-        what: &str,
         l: usize,
     ) -> Result<Ring, GateError> {
         let w = set.window;
@@ -796,7 +691,7 @@ mod gate {
         let last = set.tokens - 1;
         let end = (0..n_raw)
             .rev()
-            .find(|&i| mask[last * n_kv + i] == 0.0)
+            .find(|&i| mask[last * n_kv + i] == SEEN)
             .ok_or_else(|| format!("layer {l}: the last token sees no raw row"))?;
         let offset = set.pos[last].checked_sub(end).ok_or_else(|| {
             format!(
@@ -830,8 +725,7 @@ mod gate {
                     Some(_) => {}
                     None => {
                         slot_pos[slot] = Some(q);
-                        rows[slot * LATENT..(slot + 1) * LATENT]
-                            .copy_from_slice(&f16_row(keys, r, what)?);
+                        rows[slot * LATENT..(slot + 1) * LATENT].copy_from_slice(row_of(keys, r));
                     }
                 }
             }
@@ -850,12 +744,12 @@ mod gate {
     fn raw_writes(
         man: &RefManifest,
         set: &SetInfo,
-        keys: &[f32],
+        keys: &[u16],
         offset: usize,
         l: usize,
     ) -> Result<Result<(), String>, GateError> {
-        let write = tensor(man, &format!("dsv4_raw_k_write-{l}"))?;
-        let k_src = tensor(man, src(write, 0)?)?;
+        let write = man.tensor(&format!("dsv4_raw_k_write-{l}"), 0)?;
+        let k_src = man.tensor(src(write, 0)?, 0)?;
         k_src.expect(
             "K written",
             "f32",
@@ -867,8 +761,8 @@ mod gate {
             let r = p - offset;
             let same = written[t * LATENT..(t + 1) * LATENT]
                 .iter()
-                .zip(&keys[r * LATENT..(r + 1) * LATENT])
-                .all(|(&x, &k)| half_to_f32(f32_to_f16_bits(x)).to_bits() == k.to_bits());
+                .zip(row_of(keys, r))
+                .all(|(&x, &k)| f32_to_f16_bits(x) == k);
             if same {
                 Ok(())
             } else {
@@ -891,13 +785,13 @@ mod gate {
         state: Option<Result<String, String>>,
     }
 
-    /// Layer `l`'s compressed rows after ik's `n_raw` raw ones in `keys`:
-    /// gathered by the indexer's list, or a prefix.
+    /// Layer `l`'s compressed rows after ik's `n_raw` raw ones in `keys`
+    /// (f16 bits): gathered by the indexer's list, or a prefix.
     fn compressed(
         man: &RefManifest,
         set: &SetInfo,
         comp_row: Option<&RefRow>,
-        keys: &[f32],
+        keys: &[u16],
         n_raw: usize,
         n_kv: usize,
         l: usize,
@@ -912,7 +806,7 @@ mod gate {
         };
         let ratio = usize::try_from(set.ratios[l])?;
         let n_comp = |p: usize| (p + 1).checked_div(ratio).unwrap_or(0);
-        if c.op == "RESHAPE" && tensor(man, src(c, 0)?)?.op == "GET_ROWS" {
+        if c.op == "RESHAPE" && man.tensor(src(c, 0)?, 0)?.op == "GET_ROWS" {
             return selected_rows(man, set, c, keys, n_raw, n_kv, n_comp(set.pos[0]));
         }
         let lat = LATENT as u64;
@@ -933,18 +827,18 @@ mod gate {
         let height = (held.div_ceil(attn::SEG_KEYS) + 1) * attn::SEG_KEYS;
         let mut comp = vec![NAN_F16; height * LATENT];
         for j in 0..held {
-            comp[j * LATENT..(j + 1) * LATENT].copy_from_slice(&f16_row(keys, n_raw + j, &c.name)?);
+            comp[j * LATENT..(j + 1) * LATENT].copy_from_slice(row_of(keys, n_raw + j));
         }
         // A prefix read from the stream's state: operand row n_raw + j is
         // state row j, but the row this step writes.
         let state = match src(c, 0) {
-            Ok(s) if c.op == "VIEW" && man.inputs.iter().any(|r| r.name == s) => {
-                let st = input(man, s)?;
+            Ok(s) if c.op == "VIEW" && man.first_named(RowKind::Input, s).is_some() => {
+                let st = man.input(s, 0)?;
                 st.expect("stream state", "f16", [lat, st.ne[1], 1, 1], "in")?;
                 if usize::try_from(st.ne[1])? < held {
                     return Err(format!("{s} holds {} rows, {held} seen", st.ne[1]).into());
                 }
-                let sv = f16_values(man, st)?;
+                let sv = widened_f16_rows_in(&man.dir, st)?;
                 let differ: Vec<usize> = (0..held)
                     .filter(|&j| !same_row(keys, n_raw + j, &sv, j))
                     .collect();
@@ -970,13 +864,13 @@ mod gate {
         man: &RefManifest,
         set: &SetInfo,
         c: &RefRow,
-        keys: &[f32],
+        keys: &[u16],
         n_raw: usize,
         n_kv: usize,
         n_comp: usize,
     ) -> Result<Compressed, GateError> {
         let lat = LATENT as u64;
-        let g = tensor(man, src(c, 0)?)?;
+        let g = man.tensor(src(c, 0)?, 0)?;
         let k = g.ne[1];
         g.expect("gathered rows", "f16", [lat, k, 1, 1], "GET_ROWS")?;
         c.expect("selected keys", "f16", [lat, 1, k, 1], "RESHAPE")?;
@@ -995,7 +889,7 @@ mod gate {
             return Err(format!("{}: {k} rows after {n_raw} raw of {n_kv}", c.name).into());
         }
         let state_name = src(g, 0)?;
-        let st = input(man, state_name)?;
+        let st = man.input(state_name, 0)?;
         let n_state = st.ne[1];
         st.expect("stream state", "f16", [lat, n_state, 1, 1], "in")?;
         let n_state = usize::try_from(n_state)?;
@@ -1017,15 +911,15 @@ mod gate {
             )
             .into());
         }
-        let gathered = f16_values(man, g)?;
-        if !bits_equal(&keys[n_raw * LATENT..], &gathered) {
+        let gathered = widened_f16_rows_in(&man.dir, g)?;
+        if keys[n_raw * LATENT..] != gathered[..] {
             return Err(format!(
                 "the key operand's rows after the raw ones are not {}",
                 g.name
             )
             .into());
         }
-        let sv = f16_values(man, st)?;
+        let sv = widened_f16_rows_in(&man.dir, st)?;
         let differ: Vec<usize> = (0..k)
             .filter(|&j| !same_row(&sv, list[j], &gathered, j))
             .map(|j| list[j])
@@ -1033,12 +927,12 @@ mod gate {
         let count = n_comp.min(k);
         let mut comp = vec![NAN_F16; n_state * LATENT];
         for (j, &r) in list.iter().enumerate().take(count) {
-            let row = f16_row(&gathered, j, &g.name)?;
+            let row = row_of(&gathered, j);
             let dst = &mut comp[r * LATENT..(r + 1) * LATENT];
-            if dst[0] != NAN_F16 && dst != row.as_slice() {
+            if dst[0] != NAN_F16 && dst != row {
                 return Err(format!("{list_name} names row {r} twice with different rows").into());
             }
-            dst.copy_from_slice(&row);
+            dst.copy_from_slice(row);
         }
         let sel = list
             .iter()
@@ -1064,10 +958,10 @@ mod gate {
         }
     }
 
-    /// The dump's mask: token `t` sees exactly its raw run and its first
-    /// compressed keys; any value but 0 and −inf is refused.
+    /// The dump's mask (f16 bits, every cell 0 or −inf — [`mask_bits_in`]):
+    /// token `t` sees exactly its raw run and its first compressed keys.
     fn mask_matches(
-        mask: &[f32],
+        mask: &[u16],
         n_kv: usize,
         n_raw: usize,
         set: &SetInfo,
@@ -1076,10 +970,7 @@ mod gate {
     ) -> Result<(), String> {
         (0..set.tokens).try_for_each(|t| {
             let row = &mask[t * n_kv..(t + 1) * n_kv];
-            if let Some(v) = row.iter().find(|v| **v != 0.0 && **v != f32::NEG_INFINITY) {
-                return Err(format!("token {t}: mask value {v}"));
-            }
-            let dump: Vec<usize> = (0..n_kv).filter(|&i| row[i] == 0.0).collect();
+            let dump: Vec<usize> = (0..n_kv).filter(|&i| row[i] == SEEN).collect();
             let hi = set.pos[t] - ring.offset;
             let ours: Vec<usize> = (hi + 1 - ring.counts[t]..=hi)
                 .chain((0..counts[t]).map(|j| n_raw + j))
@@ -1451,14 +1342,6 @@ mod gate {
             stream.synchronize()?;
             Ok(self.y.to_host_vec(stream)?)
         }
-    }
-
-    /// Values of `a` and `b` with the same bits.
-    fn same_bits(a: &[f32], b: &[f32]) -> usize {
-        a.iter()
-            .zip(b)
-            .filter(|(x, y)| x.to_bits() == y.to_bits())
-            .count()
     }
 
     /// Values of `y` farther from `d` than `band` times `d`'s own magnitude:
@@ -1875,27 +1758,5 @@ mod gate {
             verdict(pass)
         );
         Ok(pass)
-    }
-
-    /// Every entry compiles with no local depot: a spilled accumulator
-    /// array changes no output and no band, only the time.
-    fn no_local_depot() -> Result<bool, GateError> {
-        let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
-        let modules = bloomery_gpu_gates::ptx::modules(&bundles);
-        let mut ok = true;
-        for name in ["ds41_attn_seg", "ds41_attn_seg_sel", "ds41_attn_merge"] {
-            let c = bloomery_gpu_gates::ptx::counts(&modules, name)
-                .ok_or_else(|| format!("no PTX entry {name} in this executable"))?;
-            let pass = !c.depot && c.ld_local == 0 && c.st_local == 0;
-            println!(
-                "shape kernel={name} local_depot={} ld_local={} st_local={} {}",
-                c.depot,
-                c.ld_local,
-                c.st_local,
-                verdict(pass)
-            );
-            ok &= pass;
-        }
-        Ok(ok)
     }
 }

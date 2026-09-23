@@ -4,21 +4,26 @@
 use super::Oracle;
 use model::arch::Arch;
 
+/// Step 4, at an even position, where no csa group completes.
+pub const STEP4: &str = "ref_deepseek41_step4_every_node";
+/// Step 301 with the file's top-k, where neither stream builds an indexer.
+pub const D1N: &str = "ref_deepseek41_d1n_every_node";
+/// Step 301, where a csa group completes; the window mask 512 cells wide.
+pub const D1: &str = "ref_deepseek41_d1_every_node";
+/// [`D1`] with the indexer's scores and top-k as nodes of their own.
+pub const D1_UNFUSED: &str = "ref_deepseek41_d1_unfused_every_node";
+/// Step 1,025, where a csa group completes; the window mask 1,280 cells wide.
+pub const D2: &str = "ref_deepseek41_d2_every_node";
+/// [`D2`] with the indexer's scores and top-k as nodes of their own.
+pub const D2_UNFUSED: &str = "ref_deepseek41_d2_unfused_every_node";
+
 /// The decode-step sets, each one token after a prefill run node by node
 /// under the dumped schedule (the model profile's `ref_step_variant`,
-/// `tools/ref/models/deepseek41.sh`): step4 at an even position, where no
-/// csa group completes; d1 at 301 and d2 at 1,025, where one does, the
-/// window mask 512 and 1,280 cells wide; d1 and d2 once more with the
-/// indexer's scores and top-k as nodes of their own; d1n at 301 with the
-/// file's top-k, where neither stream builds an indexer.
-pub const STEP_SETS: &[&str] = &[
-    "ref_deepseek41_step4_every_node",
-    "ref_deepseek41_d1_every_node",
-    "ref_deepseek41_d1_unfused_every_node",
-    "ref_deepseek41_d1n_every_node",
-    "ref_deepseek41_d2_every_node",
-    "ref_deepseek41_d2_unfused_every_node",
-];
+/// `tools/ref/models/deepseek41.sh`), by position. The order is part of what
+/// a gate prints: where sets tie — d1n, d1 and d1_unfused run their layers
+/// before the first compressed stream alike — a line that names the first of
+/// equal results names the set read first.
+pub const STEP_SETS: &[&str] = &[STEP4, D1N, D1, D1_UNFUSED, D2, D2_UNFUSED];
 
 pub static ORACLE: Oracle = Oracle {
     arch: Arch::Deepseek41,

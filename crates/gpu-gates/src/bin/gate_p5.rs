@@ -140,7 +140,17 @@ fn run() -> Result<(), GateError> {
     };
     ok &= depth_cases(&gpu, &flash, &case)?;
     ok &= edge_values(&flash, stream)?;
-    ok &= no_local_depot()?;
+    // This package's kernels, read off the PTX this executable embeds;
+    // `tools/ptx-scan.sh` prints the same counts for every entry without
+    // asserting any of them.
+    ok &= bloomery_gpu_gates::no_local_depot(&[
+        "flash_latent",
+        "flash_latent_seg",
+        "flash_latent_mma",
+        "flash_merge",
+        "kv_append",
+        "kv_append_pos_buf",
+    ])?;
 
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());
@@ -155,41 +165,6 @@ fn run() -> Result<(), GateError> {
          kernels compile with no local depot"
     );
     Ok(())
-}
-
-// ------------------------------------------------------------ kernel shape
-
-/// This package's kernels, asserted to carry no local depot. The device
-/// bundle is embedded in this executable as PTX text, so the check reads
-/// the PTX payload out of `/proc/self/exe` and looks inside each entry's
-/// own body — the same thing the backend would report, at no device cost
-/// and with no timing in it. The scan itself is `bloomery_gpu_gates::ptx`;
-/// `tools/ptx-scan.sh` prints the same counts for every entry without
-/// asserting any of them.
-#[cfg(feature = "gpu")]
-fn no_local_depot() -> Result<bool, GateError> {
-    let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
-    let modules = bloomery_gpu_gates::ptx::modules(&bundles);
-    let mut ok = true;
-    for name in [
-        "flash_latent",
-        "flash_latent_seg",
-        "flash_latent_mma",
-        "flash_merge",
-        "kv_append",
-        "kv_append_pos_buf",
-    ] {
-        let c = bloomery_gpu_gates::ptx::counts(&modules, name)
-            .ok_or_else(|| format!("gate_p5: no PTX entry {name} in this executable"))?;
-        let (depot, loads, stores) = (c.depot, c.ld_local, c.st_local);
-        let pass = !depot && loads == 0 && stores == 0;
-        println!(
-            "shape kernel={name} local_depot={depot} ld_local={loads} st_local={stores} {}",
-            if pass { "PASS" } else { "FAIL" }
-        );
-        ok &= pass;
-    }
-    Ok(ok)
 }
 
 // ------------------------------------------------------------ cases

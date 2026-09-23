@@ -52,15 +52,16 @@ mod gate {
     use bloomery_gpu_deepseek41::rope::{
         Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable, TailShape, ggml_rope_cache,
     };
+    use bloomery_gpu_gates::ds41_meta::RopeMeta;
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed, find_int_row,
-        max_rel_err, ref_ints_of_in, ref_model_path, ref_tensor_logical_in, verdict,
-        widened_f16_bits_in,
+        max_rel_err, max_ulps, ref_ints_of_in, ref_model_path, ref_tensor_logical_in, same_bits,
+        split_f32, verdict, widened_f16_bits_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
-    use gguf::quant::{GgmlType, f32_to_f16_bits};
-    use gguf::{Split, Value};
+    use gguf::Split;
+    use gguf::quant::f32_to_f16_bits;
     use model::arch::Arch;
 
     /// f32's unit roundoff, 2^-24.
@@ -94,81 +95,6 @@ mod gate {
     /// `f32_to_f16_bits` never writes (it rounds a NaN to infinity), so a
     /// slot still holding it was not written.
     const SENTINEL: u16 = 0xffff;
-
-    /// The file's rope and norm constants, from its metadata.
-    struct Meta {
-        n_dims: usize,
-        window: RopeSpec,
-        yarn: RopeSpec,
-        /// `attention.compress_ratios`, one per layer.
-        ratios: Vec<u64>,
-        eps: f32,
-        /// Rows of a layer's raw window ring: `attention.sliding_window`.
-        ring: usize,
-    }
-
-    impl Meta {
-        fn read(split: &Split) -> Result<Meta, GateError> {
-            let want = Arch::Deepseek41.name();
-            if split.architecture() != Some(want) {
-                return Err(format!(
-                    "the model file is {:?}, want {want} — run through `just gate-gpu-ds41-rope`, \
-                     which picks the deepseek41 profile",
-                    split.architecture()
-                )
-                .into());
-            }
-            let f = |s: &str| -> Result<f32, GateError> {
-                split
-                    .arch_get_f32(s)
-                    .ok_or_else(|| format!("metadata {} missing", split.arch_key(s)).into())
-            };
-            let u = |s: &str| -> Result<u64, GateError> {
-                split
-                    .arch_get_u64(s)
-                    .ok_or_else(|| format!("metadata {} missing", split.arch_key(s)).into())
-            };
-            let scaling = split.arch_get_str("rope.scaling.type");
-            if scaling != Some("yarn") {
-                return Err(format!("rope.scaling.type is {scaling:?}, want \"yarn\"").into());
-            }
-            let n_dims = usize::try_from(u("rope.dimension_count")?)?;
-            let n_ctx_orig = i32::try_from(u("rope.scaling.original_context_length")?)?;
-            let key = split.arch_key("attention.compress_ratios");
-            let Some(Value::Array(list)) = split.value(&key) else {
-                return Err(format!("metadata {key} is absent or not an array").into());
-            };
-            let ratios = list
-                .iter()
-                .map(|v| v.as_unsigned().ok_or_else(|| format!("{key} holds {v:?}")))
-                .collect::<Result<Vec<u64>, String>>()?;
-            Ok(Meta {
-                n_dims,
-                window: RopeSpec::window(f("rope.freq_base")?, n_dims),
-                yarn: RopeSpec::yarn(
-                    f("attention.compress_rope_freq_base")?,
-                    f("rope.scaling.factor")?,
-                    n_ctx_orig,
-                    f("rope.scaling.yarn_beta_fast")?,
-                    f("rope.scaling.yarn_beta_slow")?,
-                    n_dims,
-                ),
-                ratios,
-                eps: f("attention.layer_norm_rms_epsilon")?,
-                ring: usize::try_from(u("attention.sliding_window")?)?,
-            })
-        }
-
-        /// The rope of layer `l`'s heads: ik's `use_compress_rope` is
-        /// `compress_ratios[l] != 0`.
-        fn head_spec(&self, l: usize) -> Result<(&RopeSpec, &'static str), GateError> {
-            match self.ratios.get(l) {
-                Some(0) => Ok((&self.window, "window")),
-                Some(_) => Ok((&self.yarn, "yarn")),
-                None => Err(format!("layer {l} has no compress ratio").into()),
-            }
-        }
-    }
 
     /// What a rope row is, from its op and name. A head site carries its
     /// layer, which picks its base; the others are YaRN at every layer.
@@ -234,7 +160,7 @@ mod gate {
 
         /// The site's rope: the layer's for the heads, YaRN for the pooled
         /// rows, the index keys and the indexer query (`build_deepseek4.cpp`).
-        fn spec(self, meta: &Meta) -> Result<(&RopeSpec, &'static str), GateError> {
+        fn spec(self, meta: &RopeMeta<RopeSpec>) -> Result<(&RopeSpec, &'static str), GateError> {
             match self {
                 Site::Kv(l) | Site::Q(l) | Site::Back(l) => meta.head_spec(l),
                 Site::Pooled | Site::IndexKey | Site::IndexerQ => Ok((&meta.yarn, "yarn")),
@@ -246,13 +172,18 @@ mod gate {
     struct Cx<'a> {
         k: &'a RopeKernels,
         stream: &'a CudaStream,
-        meta: &'a Meta,
+        meta: &'a RopeMeta<RopeSpec>,
         split: &'a Split,
     }
 
     pub fn run() -> Result<(), GateError> {
         let split = Split::open(ref_model_path()?)?;
-        let meta = Meta::read(&split)?;
+        let meta = RopeMeta::read(
+            &split,
+            "gate-gpu-ds41-rope",
+            RopeSpec::window,
+            RopeSpec::yarn,
+        )?;
         let gpu = Gpu::new()?;
         let k = RopeKernels::load(gpu.context())?;
         let cx = Cx {
@@ -309,22 +240,6 @@ mod gate {
         Ok(())
     }
 
-    /// The node a reader at manifest index `at` reads as `name`: the last
-    /// tensor row of that name before it, with its index.
-    fn src_row<'a>(
-        man: &'a RefManifest,
-        at: usize,
-        name: Option<&str>,
-    ) -> Result<(usize, &'a RefRow), GateError> {
-        let name = name.ok_or("a reader row has no src column")?;
-        man.tensors[..at]
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, r)| r.name == name)
-            .ok_or_else(|| format!("no node {name:?} before manifest row {at}").into())
-    }
-
     /// A graph input's integers — positions, cache rows — from its exact
     /// twin, as the u32 the kernels take.
     fn input_u32(man: &RefManifest, name: Option<&str>) -> Result<Vec<u32>, GateError> {
@@ -334,23 +249,6 @@ mod gate {
             .into_iter()
             .map(|v| u32::try_from(v).map_err(|_| format!("{name} holds {v}").into()))
             .collect()
-    }
-
-    /// An F32 tensor of the model file, `want` values.
-    fn split_f32(split: &Split, name: &str, want: usize) -> Result<Vec<f32>, GateError> {
-        let (s, t) = split
-            .find(name)
-            .ok_or_else(|| format!("{name} is not in the model file"))?;
-        if t.ty != GgmlType::F32 || t.dims.iter().product::<u64>() != want as u64 {
-            return Err(format!("{name} is {:?} {:?}, want F32 x {want}", t.ty, t.dims).into());
-        }
-        let g = split.shard(s).ok_or("shard index out of range")?;
-        Ok(g.data(t)?
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect())
     }
 
     /// The engine's tables: `m` of `n_dims`, token `t`'s at `t·n_dims`.
@@ -392,31 +290,6 @@ mod gate {
         y
     }
 
-    /// Ulps between two finite f32, through integers ordered like the
-    /// floats they encode (`-0.0` and `+0.0` the same point).
-    fn ulps(a: f32, b: f32) -> u32 {
-        let key = |v: f32| {
-            let b = v.to_bits().cast_signed();
-            if b < 0 { i32::MIN - b } else { b }
-        };
-        key(a).abs_diff(key(b))
-    }
-
-    fn max_ulps(a: &[f32], b: &[f32]) -> u32 {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| ulps(x, y))
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn same_bits(a: &[f32], b: &[f32]) -> usize {
-        a.iter()
-            .zip(b)
-            .filter(|(x, y)| x.to_bits() == y.to_bits())
-            .count()
-    }
-
     fn list(v: &[impl ToString]) -> String {
         v.iter()
             .map(ToString::to_string)
@@ -442,7 +315,7 @@ mod gate {
             )
             .into());
         }
-        let (_, src) = src_row(man, at, row.src0.as_deref())?;
+        let (_, src) = man.last_before(at, row.src0.as_deref())?;
         if src.count() != row.count() {
             return Err(format!(
                 "{} reads {} of {} values, it has {}",
@@ -597,11 +470,11 @@ mod gate {
     impl<'a> KvChain<'a> {
         fn read(man: &'a RefManifest, at: usize) -> Result<KvChain<'a>, GateError> {
             let write = &man.tensors[at];
-            let (v_at, view) = src_row(man, at, write.src0.as_deref())?;
-            let (r_at, rope) = src_row(man, v_at, view.src0.as_deref())?;
-            let (s_at, shaped) = src_row(man, r_at, rope.src0.as_deref())?;
-            let (n_at, norm) = src_row(man, s_at, shaped.src0.as_deref())?;
-            let (_, x) = src_row(man, n_at, norm.src0.as_deref())?;
+            let (v_at, view) = man.last_before(at, write.src0.as_deref())?;
+            let (r_at, rope) = man.last_before(v_at, view.src0.as_deref())?;
+            let (s_at, shaped) = man.last_before(r_at, rope.src0.as_deref())?;
+            let (n_at, norm) = man.last_before(s_at, shaped.src0.as_deref())?;
+            let (_, x) = man.last_before(n_at, norm.src0.as_deref())?;
             let layer = rope
                 .name
                 .strip_prefix("kv_rope-")

@@ -71,24 +71,21 @@ mod gate {
     use bloomery_gpu_deepseek41::hc::{
         HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs, HcPreScratch,
     };
+    use bloomery_gpu_gates::oracle::deepseek41::{D1, D1_UNFUSED, D2, D2_UNFUSED, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
-        max_rel_err, ref_dir_named, ref_model_path, ref_tensor_of_in, tensor_bytes_as, verdict,
+        max_rel_err, max_ulps, ref_dir_named, ref_model_path, ref_tensor_of_in, tensor_bytes_as,
+        verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
     use model::arch::Arch;
 
-    /// The decode-step sets, read when present (each is T = 1).
-    const STEP_SETS: [&str; 5] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d1_unfused_every_node",
-        "ref_deepseek41_d2_every_node",
-        "ref_deepseek41_d2_unfused_every_node",
-    ];
+    /// The decode-step sets this gate reads, each when present (T = 1): the
+    /// table's (`step_sets`) but d1n.
+    const STEP_SETS: [&str; 5] = [STEP4, D1, D1_UNFUSED, D2, D2_UNFUSED];
     /// Bytes of one q3_K super-block.
     const Q3K_SB: usize = 110;
     /// Unit roundoff of f32.
@@ -693,19 +690,6 @@ mod gate {
             .fold(0.0f64, f64::max)
     }
 
-    /// The largest distance of two vectors in units in the last place.
-    fn max_ulp(a: &[f32], b: &[f32]) -> u32 {
-        let ord = |v: f32| {
-            let i = v.to_bits() as i32;
-            if i < 0 { i32::MIN - i } else { i }
-        };
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| ord(x).abs_diff(ord(y)))
-            .max()
-            .unwrap_or(0)
-    }
-
     /// `max|v| / max|of|`.
     fn rel_to(v: impl Iterator<Item = f64>, of: &[f32]) -> f64 {
         let num = v.fold(0.0f64, |m, x| m.max(x.abs()));
@@ -822,13 +806,6 @@ mod gate {
         }
     }
 
-    fn row<'m>(man: &'m RefManifest, name: &str, occ: u32) -> Result<&'m RefRow, GateError> {
-        man.tensors
-            .iter()
-            .find(|r| r.name == name && r.occurrence == occ)
-            .ok_or_else(|| format!("{name}/{occ} not in {}", man.dir.display()).into())
-    }
-
     fn src0(r: &RefRow) -> &str {
         r.src0.as_deref().unwrap_or("")
     }
@@ -855,7 +832,7 @@ mod gate {
                         format!("no HC_PRE node reads {mixes_name} with {scale_name}")
                     })?;
                 node.expect(&node.name, "f32", [24 * t, 1, 1, 1], "HC_PRE")?;
-                let mixes = row(man, &mixes_name, occ)?;
+                let mixes = man.tensor(&mixes_name, occ)?;
                 mixes.expect(&mixes_name, "f32", [24, t, 1, 1], "MUL_MAT")?;
                 if src0(mixes) != format!("blk.{layer}.hc_{sub}_fn.weight") {
                     return Err(format!(
@@ -864,21 +841,21 @@ mod gate {
                     )
                     .into());
                 }
-                let rms = row(man, &format!("hc_pre-{layer}"), occ)?;
+                let rms = man.tensor(&format!("hc_pre-{layer}"), occ)?;
                 rms.expect(&rms.name, "f32", [k, t, 1, 1], "RMS_NORM")?;
                 let s_name = src0(rms)
                     .strip_suffix(" (reshaped)")
                     .ok_or_else(|| format!("hc_pre-{layer}/{occ} reads {}", src0(rms)))?;
-                let streams = row(man, s_name, 0)?;
+                let streams = man.tensor(s_name, 0)?;
                 streams.expect(s_name, "f32", [n, 4, t, 1], "in")?;
                 let (x_name, post_name) = if occ == 0 {
                     (format!("attn_out-{layer}"), format!("hc_attn_post-{layer}"))
                 } else {
                     (format!("ffn_out-{layer}"), format!("l_out-{layer}"))
                 };
-                let x = row(man, &x_name, 0)?;
+                let x = man.tensor(&x_name, 0)?;
                 x.expect(&x_name, "f32", [n, t, 1, 1], "in")?;
-                let post = row(man, &post_name, 0)?;
+                let post = man.tensor(&post_name, 0)?;
                 post.expect(&post_name, "f32", [n, 4, t, 1], "HC_POST")?;
                 if src0(post) != x_name {
                     return Err(format!("{post_name} reads {}, not {x_name}", src0(post)).into());
@@ -892,7 +869,7 @@ mod gate {
                 };
                 let (fold, engram_next) = match fold_name {
                     Some(f) => {
-                        let r = row(man, &f, 0)?;
+                        let r = man.tensor(&f, 0)?;
                         r.expect(&f, "f32", [n, t, 1, 1], "MUL_MULTI_ADD")?;
                         let engram = format!("engram_out-{}", layer + 1);
                         if src0(r) == post_name {
@@ -928,7 +905,7 @@ mod gate {
 
     /// Tokens of a set: the third dim of `hc_init` (`[n, 4, T]`).
     fn tokens_of(man: &RefManifest) -> Result<usize, GateError> {
-        Ok(usize::try_from(row(man, "hc_init", 0)?.ne[2])?)
+        Ok(usize::try_from(man.tensor("hc_init", 0)?.ne[2])?)
     }
 
     // --------------------------------------------------------------- driver
@@ -1023,7 +1000,7 @@ mod gate {
         let hc_op = hc_op_dev.to_host_vec(stream)?;
         let op_bit = bits_equal(&hc_op, &pre_of(&mix_d, exp_ours));
         let op_dump_bit = bits_equal(&hc_op, &hc_d);
-        let op_dump_ulp = max_ulp(&hc_op, &hc_d);
+        let op_dump_ulp = max_ulps(&hc_op, &hc_d);
 
         // The crate's quantizer and unsplit gemv at K = 20480.
         let mut act = Q8Act::with_k(stream, t, k)?;
@@ -1197,14 +1174,14 @@ mod gate {
         let mut ok = true;
         for layer in 0..cx.hp.n_layers {
             let name = format!("hc_attn_pre-{layer}");
-            let r = row(man, &name, 0)?;
+            let r = man.tensor(&name, 0)?;
             let s_name = src0(r);
             if !s_name.starts_with("engram_out-") && s_name != "hc_init" {
                 continue;
             }
-            let s = load(row(man, s_name, 0)?)?;
+            let s = load(man.tensor(s_name, 0)?)?;
             let hc = if layer == 0 {
-                let init = load(row(man, "hc_pre_init", 0)?)?;
+                let init = load(man.tensor("hc_pre_init", 0)?)?;
                 let mut hc = vec![0.0f32; HC_MIX * t];
                 for (h, pre) in hc
                     .as_chunks_mut::<HC_MIX>()
@@ -1220,11 +1197,11 @@ mod gate {
             };
             ok &= check_fold(cx, set, &format!("{name}<-{s_name}"), &s, &hc, &load(r)?)?;
         }
-        let head = row(man, "hc_out", 0)?;
+        let head = man.tensor("hc_out", 0)?;
         head.expect("hc_out", "f32", [n as u64, 1, 1, 1], "MUL_MULTI_ADD")?;
         let want = load(head)?;
         let last = cx.hp.n_layers - 1;
-        let l_out = load(row(man, &format!("l_out-{last}"), 0)?)?;
+        let l_out = load(man.tensor(&format!("l_out-{last}"), 0)?)?;
         let hc_last = &ffn_hc[last][(t - 1) * HC_MIX..t * HC_MIX];
         let last_streams = &l_out[4 * n * (t - 1)..4 * n * t];
         ok &= check_fold(cx, set, "hc_out<-last_token", last_streams, hc_last, &want)?;
@@ -1393,19 +1370,16 @@ mod gate {
             scratch,
             ok: true,
         };
-        let prefill = oracle::for_arch(Arch::Deepseek41)?.open(Set::Cpu)?;
+        let table = oracle::for_arch(Arch::Deepseek41)?;
+        let prefill = table.open(Set::Cpu)?;
         check_set(&mut cx, &prefill, "prefill")?;
         check_graph(&mut cx, &prefill)?;
         for name in STEP_SETS {
-            let dir = ref_dir_named(name);
-            if !dir.join("MANIFEST.tsv").is_file() {
+            if !ref_dir_named(name).join("MANIFEST.tsv").is_file() {
                 println!("hole set={name} not on the box: its T = 1 checks did not run");
                 continue;
             }
-            let man = RefManifest::read(&dir)?;
-            if man.arch.as_deref() != Some("deepseek41") {
-                return Err(format!("{name}: arch {:?}, not deepseek41", man.arch).into());
-            }
+            let man = table.open_named(name)?;
             check_set(&mut cx, &man, name)?;
         }
         if cx.ok {

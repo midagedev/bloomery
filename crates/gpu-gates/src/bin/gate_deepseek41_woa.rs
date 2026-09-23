@@ -9,8 +9,8 @@
 //!
 //! Sites: `attn_wo_a-L` and `attn_out-L` at every layer of every set — the
 //! 5-token prefill (`Set::Cpu`, T = 5, where ik copies the permuted groups
-//! with `ggml_cont_2d`) and the decode steps [`STEP_SETS`] (T = 1, where it
-//! only reshapes them, `build_deepseek4.cpp:1430-1434`). The engine's decode
+//! with `ggml_cont_2d`) and the table's decode-step sets (`step_sets`, T = 1,
+//! where it only reshapes them, `build_deepseek4.cpp:1430-1434`). The engine's decode
 //! shape is m = 1, so a T-token site is T launches of that shape. Every
 //! input is the dump's own: `attn-L`, the ROPE_BACK output, for wo_a; the
 //! row `attn_out-L` reads for wo_b.
@@ -21,9 +21,9 @@
 //!    L+32, … in increasing order, each word in byte order; lane 0 of the
 //!    xor butterfly (`bloomery_gpu::q8f32` module doc) — bit-identical, and
 //!    a rerun bit-identical;
-//! 2. ik's rule transcribed here against the dump, bit-identical: the
-//!    activations quantized to q8_2 blocks ([`q8_2`]), then the AVX2
-//!    Q8_0 × Q8_2 dot ([`ik`]). With the two views proven against the dump's
+//! 2. ik's rule (`bloomery_gpu_gates::ik_q8_2`) against the dump,
+//!    bit-identical: the activations quantized to q8_2 blocks, then the AVX2
+//!    Q8_0 × Q8_2 dot. With the two views proven against the dump's
 //!    own view rows bit for bit — wo_a's input is the permuted groups of
 //!    `attn-L`, wo_b's the permuted `attn_wo_a-L` — this proves which rows
 //!    meet which slice of the attention output;
@@ -49,31 +49,16 @@ mod gate {
     use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{DeviceTensor, Gpu};
+    use bloomery_gpu_gates::ik_q8_2::{self, QK, folded, half_sum};
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, RefRow, bits_equal, checks_failed, max_rel_err, ref_dir_named,
-        ref_model_path, ref_tensor_logical_in, verdict,
+        GateError, RefManifest, RefRow, bits_equal, checks_failed, max_rel_err, ref_model_path,
+        ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{GgmlType, Q8Block, half_to_f32};
     use model::arch::Arch;
-
-    /// The decode-step sets: one step after a prefill run under the dumped
-    /// schedule (the `-every-node` variants of `tools/ref/models/deepseek41.sh`),
-    /// the `unfused` ones with the indexer's scores and top-k as nodes of their
-    /// own, and `d1n` at 301 with the file's top-k.
-    pub const STEP_SETS: [&str; 6] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d1_unfused_every_node",
-        "ref_deepseek41_d1n_every_node",
-        "ref_deepseek41_d2_every_node",
-        "ref_deepseek41_d2_unfused_every_node",
-    ];
-
-    /// Values per Q8_0 and q8_2 block.
-    const QK: usize = 32;
 
     /// f32's unit roundoff, 2^-24.
     const U: f64 = f32::EPSILON as f64 / 2.0;
@@ -167,82 +152,6 @@ mod gate {
         v[0]
     }
 
-    // --------------------------------------------------- ik's rule, transcribed
-
-    /// ik's q8_2 activation blocks of `x` (`quantize_row_q8_2_x4`, AVX2,
-    /// `iqk_quantize.cpp`): per 32 values `d = amax/127` rounded to bf16
-    /// (nearest even, `ggml_compute_fp32_to_bf16`), `id = 1/d` (0 when `d` is
-    /// 0), each code `x·id` rounded half to even and saturated to i8 by the
-    /// two packs. Returns the codes and the scales.
-    fn q8_2(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
-        let mut q = Vec::with_capacity(x.len());
-        let mut d = Vec::with_capacity(x.len() / QK);
-        for blk in x.as_chunks::<QK>().0 {
-            let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let bits = (amax / 127.0).to_bits();
-            let db = f32::from_bits(((bits + (0x7fff + ((bits >> 16) & 1))) >> 16) << 16);
-            let id = if db > 0.0 { 1.0 / db } else { 0.0 };
-            q.extend(
-                blk.iter()
-                    .map(|&v| (v * id).round_ties_even().clamp(-128.0, 127.0) as i8),
-            );
-            d.push(db);
-        }
-        (q, d)
-    }
-
-    /// The activation code `SignedDot` pairs with weight code `w`:
-    /// `_mm256_sign_epi8(a, w)` — `a` under a positive weight, `−a` under a
-    /// negative one, wrapping, so −128 stays −128, and 0 under a zero weight.
-    fn folded(w: i8, a: i8) -> i8 {
-        match w.signum() {
-            -1 => a.wrapping_neg(),
-            0 => 0,
-            _ => a,
-        }
-    }
-
-    /// ik's integer partial of one lane: values `16h .. 16h + 16` of weight
-    /// block `w` against activation codes `a` (the block's 32).
-    /// `maddubs(|w|, folded)` sums byte pairs into i16 with saturation — never
-    /// reached: a pair lies in [−2·128·128, 2·128·127] — and `madd` and the
-    /// lane combination of `Sum4TypeQ82S` add the rest exactly.
-    fn ik_half(w: &Q8Block, a: &[i8], h: usize) -> i32 {
-        (8 * h..8 * h + 8)
-            .map(|m| {
-                let term =
-                    |v: usize| i32::from(w.q[v].unsigned_abs()) * i32::from(folded(w.q[v], a[v]));
-                (term(2 * m) + term(2 * m + 1)).clamp(i32::from(i16::MIN), i32::from(i16::MAX))
-            })
-            .sum()
-    }
-
-    /// ik's rule on one row (`mul_mat_qX_0_q8_0_T<Q8_0_Unpacker, _,
-    /// block_q8_2>` → `AccumT<MinusType0, _, true>` with `ScaleHelperQ8_2S`,
-    /// `iqk_gemm_legacy_quants.cpp`): lane L of eight takes block `4i + L%4`
-    /// of each group of four, values `16·(L/4) ..` of it, and fuses one
-    /// multiply-add of that integer partial by the scales' product `d_w·d_x`
-    /// (exact in f32); `hsum_float_8` adds the halves lane-wise, then pairs.
-    /// The row's block count must be a multiple of four.
-    fn ik(blocks: &[Q8Block], xq: &[i8], xd: &[f32]) -> f32 {
-        let mut acc = [0.0f32; 8];
-        for i in 0..blocks.len() / 4 {
-            for (l, a) in acc.iter_mut().enumerate() {
-                let b = 4 * i + l % 4;
-                let dd = half_to_f32(blocks[b].d) * xd[b];
-                let p = ik_half(&blocks[b], &xq[b * QK..(b + 1) * QK], l / 4);
-                *a = dd.mul_add(p as f32, *a);
-            }
-        }
-        let s = [
-            acc[0] + acc[4],
-            acc[1] + acc[5],
-            acc[2] + acc[6],
-            acc[3] + acc[7],
-        ];
-        (s[0] + s[2]) + (s[1] + s[3])
-    }
-
     // ------------------------------------------------------ rows and the band
 
     /// One output row: both rules in f32, the gap between their exact
@@ -263,7 +172,7 @@ mod gate {
     /// Both rules on one row, and its band: how far our kernel may sit from
     /// ik's value. Per value v, ik multiplies the weight `w_v` by its
     /// reconstruction `x̂_v = sign(w_v)·folded_v·d_x` of the activation (the
-    /// sign fold's wrap included — [`folded`]) where ours multiplies by
+    /// sign fold's wrap included — `ik_q8_2::folded`) where ours multiplies by
     /// `x_v`, so the exact sums differ by `|Σ w_v (x_v − x̂_v)| <= Σ |w_v|·|x_v
     /// − x̂_v|`. Each side's f32 accumulation adds its roundings: ours at most
     /// `γ(k/32 + 5)` of `Σ|w_v x_v|` — k/32 multiply-adds along a lane, five
@@ -281,7 +190,7 @@ mod gate {
             let (dw, dx) = (half_to_f32(blk.d), xd[b]);
             let a = &xq[b * QK..(b + 1) * QK];
             for h in 0..2 {
-                let t = f64::from(dw * dx) * f64::from(ik_half(blk, a, h));
+                let t = f64::from(dw * dx) * f64::from(half_sum(blk, a, h));
                 ik_exact += t;
                 abs_ik += t.abs();
             }
@@ -297,7 +206,7 @@ mod gate {
         }
         RowRef {
             ours: ours(blocks, x),
-            ik: ik(blocks, xq, xd),
+            ik: ik_q8_2::dot(blocks, xq, xd),
             gap: (ours_exact - ik_exact).abs(),
             band: act + gamma(k / QK + 5) * abs_ours + gamma(k / (4 * QK) + 3) * abs_ik,
             wraps,
@@ -308,7 +217,7 @@ mod gate {
     /// window `r / rows_per_window` of `x` (`w.k` values) and its q8_2 blocks.
     fn host_rows(w: &Q8, rows_per_window: usize, x: &[f32]) -> Vec<RowRef> {
         let (k, nb) = (w.k, w.k / QK);
-        let (xq, xd) = q8_2(x);
+        let (xq, xd) = ik_q8_2::quantize(x);
         let (xq, xd) = (&xq[..], &xd[..]);
         let mut out = vec![RowRef::default(); w.rows];
         let chunk = w.rows.div_ceil(HOST_THREADS);
@@ -332,41 +241,6 @@ mod gate {
     }
 
     // --------------------------------------------------------------- the sets
-
-    /// A set by name under the data directory, its `# arch` line checked.
-    fn open_set(name: &str) -> Result<RefManifest, GateError> {
-        let man = RefManifest::read(&ref_dir_named(name))?;
-        let want = Arch::Deepseek41.name();
-        if man.arch.as_deref() != Some(want) {
-            return Err(format!("{name}: # arch is {:?}, want {want}", man.arch).into());
-        }
-        Ok(man)
-    }
-
-    /// The node row `name` (occurrence 0) and its manifest index.
-    fn node<'a>(man: &'a RefManifest, name: &str) -> Result<(usize, &'a RefRow), GateError> {
-        man.tensors
-            .iter()
-            .enumerate()
-            .find(|(_, r)| r.name == name && r.occurrence == 0)
-            .ok_or_else(|| format!("{}: no node {name:?}", man.dir.display()).into())
-    }
-
-    /// The node a reader at manifest index `at` reads as `name`: the last
-    /// tensor row of that name before it, with its index.
-    fn src_row<'a>(
-        man: &'a RefManifest,
-        at: usize,
-        name: Option<&str>,
-    ) -> Result<(usize, &'a RefRow), GateError> {
-        let name = name.ok_or("a reader row has no src column")?;
-        man.tensors[..at]
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, r)| r.name == name)
-            .ok_or_else(|| format!("no node {name:?} before manifest row {at}").into())
-    }
 
     /// A reader's src column is `want`.
     fn reads(row: &RefRow, src: Option<&str>, want: &str) -> Result<(), GateError> {
@@ -428,15 +302,15 @@ mod gate {
     ) -> Result<(Geom, SiteData), GateError> {
         let dir = &man.dir;
         let name_a = format!("attn_wo_a-{l}");
-        let (at_a, row_a) = node(man, &name_a)?;
+        let (at_a, row_a) = man.tensor_at(&name_a, 0)?;
         reads(
             row_a,
             row_a.src0.as_deref(),
             &format!("blk.{l}.attn_output_a.weight (reshaped)"),
         )?;
-        let (at_p, perm) = src_row(man, at_a, row_a.src1.as_deref())?;
-        let (at_r, resh) = src_row(man, at_p, perm.src0.as_deref())?;
-        let (_, attn_row) = src_row(man, at_r, resh.src0.as_deref())?;
+        let (at_p, perm) = man.last_before(at_a, row_a.src1.as_deref())?;
+        let (at_r, resh) = man.last_before(at_p, perm.src0.as_deref())?;
+        let (_, attn_row) = man.last_before(at_r, resh.src0.as_deref())?;
         let [hd, nh, t, one] = attn_row.ne.map(|v| v as usize);
         if one != 1 || attn_row.op != "ROPE_BACK" || attn_row.name != format!("attn-{l}") {
             return Err(format!(
@@ -479,17 +353,17 @@ mod gate {
         row_a.expect(&name_a, "f32", [n(g.rank), n(t), n(g.groups), 1], "MUL_MAT")?;
 
         let name_b = format!("attn_out-{l}");
-        let (at_b, row_b) = node(man, &name_b)?;
+        let (at_b, row_b) = man.tensor_at(&name_b, 0)?;
         reads(
             row_b,
             row_b.src0.as_deref(),
             &format!("blk.{l}.attn_output_b.weight"),
         )?;
         row_b.expect(&name_b, "f32", [n(g.embd), n(t), 1, 1], "MUL_MAT")?;
-        let (at_in, b_in) = src_row(man, at_b, row_b.src1.as_deref())?;
+        let (at_in, b_in) = man.last_before(at_b, row_b.src1.as_deref())?;
         let branch = if t == 1 { "RESHAPE" } else { "CONT" };
         b_in.expect(&name_b, "f32", [n(g.groups * g.rank), n(t), 1, 1], branch)?;
-        let (_, b_perm) = src_row(man, at_in, b_in.src0.as_deref())?;
+        let (_, b_perm) = man.last_before(at_in, b_in.src0.as_deref())?;
         b_perm.expect(&name_b, "f32", [n(g.rank), n(g.groups), n(t), 1], "PERMUTE")?;
         reads(b_perm, b_perm.src0.as_deref(), &name_a)?;
 
@@ -723,8 +597,8 @@ mod gate {
         };
         let cpu = oracle::for_arch(Arch::Deepseek41)?;
         let mut sets = vec![(cpu.set_name(Set::Cpu)?, cpu.open(Set::Cpu)?)];
-        for name in STEP_SETS {
-            sets.push((name, open_set(name)?));
+        for &name in cpu.step_sets {
+            sets.push((name, cpu.open_named(name)?));
         }
         // Every wo_a and wo_b node of every set is a site: the layers below
         // must be all of them.

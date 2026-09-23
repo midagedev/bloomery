@@ -84,11 +84,12 @@ mod gate {
     use bloomery_gpu_deepseek41::router::{
         N_EXPERT, N_USED, RouterKernels, RouterOut, sqrt_softplus,
     };
+    use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::{
-        GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, bits_equal, bytes_to_words,
-        checks_failed, find_ref_row_in, max_rel_err, q8_1_dequant, ref_dir_named, ref_ints,
-        ref_model_path, ref_tensor_of_in, row_bytes, verdict,
+        GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
+        max_rel_err, q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes,
+        topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::{
@@ -97,12 +98,10 @@ mod gate {
     use gguf::{Split, Value};
     use model::arch::Arch;
 
-    /// The decode-step sets (T = 1), gated after the 5-token prefill set.
-    const STEP_SETS: [&str; 3] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d2_every_node",
-    ];
+    /// The decode-step sets this gate reads (T = 1), after the 5-token
+    /// prefill set: of the table's (`step_sets`), the fused ones at 4, 301
+    /// and 1,025.
+    const STEP_SETS: [&str; 3] = [STEP4, D1, D2];
 
     /// f32's unit roundoff, 2^-24.
     const U: f64 = f32::EPSILON as f64 / 2.0;
@@ -263,7 +262,7 @@ mod gate {
         op: &str,
         srcs: Option<(&str, &str)>,
     ) -> Result<&'a RefRow, GateError> {
-        let r = find_ref_row_in(&set.man.dir, &set.man.tensors, name, 0)?;
+        let r = set.man.tensor(name, 0)?;
         r.expect(name, "f32", ne, op)?;
         if let Some((a, b)) = srcs
             && (r.src0.as_deref() != Some(a) || r.src1.as_deref() != Some(b))
@@ -289,10 +288,12 @@ mod gate {
     }
 
     /// The expert ids of `set` at layer `l`: the logical twin of
-    /// `ffn_moe_topk-l`, `N_USED` per token, each in `0..N_EXPERT`.
+    /// `ffn_moe_topk-l` ([`topk_ids_logical_within`]), `N_USED` per token,
+    /// each in `0..N_EXPERT`.
     fn dump_ids(set: &SetData, l: usize) -> Result<Vec<u32>, GateError> {
         let name = format!("ffn_moe_topk-{l}");
-        let ids = ref_ints(&set.man, &name, 0, RowKind::Tensor, Layout::Logical)?;
+        let row = set.man.tensor(&name, 0)?;
+        let ids = topk_ids_logical_within(&set.man, row, u32::try_from(N_EXPERT)?)?;
         if ids.len() != N_USED * set.t {
             return Err(format!(
                 "{}: {name} holds {} ids, want {}",
@@ -302,14 +303,7 @@ mod gate {
             )
             .into());
         }
-        ids.iter()
-            .map(|&v| match u32::try_from(v) {
-                Ok(id) if (id as usize) < N_EXPERT => Ok(id),
-                _ => {
-                    Err(format!("{}: {name} holds id {v}, outside 0..{N_EXPERT}", set.name).into())
-                }
-            })
-            .collect()
+        Ok(ids.into_iter().map(i32::cast_unsigned).collect())
     }
 
     /// A tensor's file bytes, its type and dims checked.
@@ -869,12 +863,10 @@ mod gate {
         let stream = cx.gpu.stream();
         let mut dv = Dev::new(stream, &cx.meta)?;
 
-        let mut sets = vec![open_set(
-            "ref_deepseek41",
-            oracle::for_arch(Arch::Deepseek41)?.open(Set::Cpu)?,
-        )?];
-        for name in STEP_SETS {
-            sets.push(open_set(name, RefManifest::read(&ref_dir_named(name))?)?);
+        let table = oracle::for_arch(Arch::Deepseek41)?;
+        let mut sets = Vec::with_capacity(1 + STEP_SETS.len());
+        for name in std::iter::once(table.set_name(Set::Cpu)?).chain(STEP_SETS) {
+            sets.push(set_data(name, table.open_named(name)?)?);
         }
 
         let mut tally = Tally::default();
@@ -923,13 +915,10 @@ mod gate {
         Ok(())
     }
 
-    /// A set, its `# arch` and token count read.
-    fn open_set(name: &'static str, man: RefManifest) -> Result<SetData, GateError> {
-        if man.arch.as_deref() != Some(Arch::Deepseek41.name()) {
-            return Err(format!("{name}: # arch is {:?}", man.arch).into());
-        }
-        let r = find_ref_row_in(&man.dir, &man.tensors, "ffn_norm-0", 0)?;
-        let t = usize::try_from(r.ne[1])?;
+    /// A set opened through the table (its `# arch` checked there), and its
+    /// token count.
+    fn set_data(name: &'static str, man: RefManifest) -> Result<SetData, GateError> {
+        let t = usize::try_from(man.tensor("ffn_norm-0", 0)?.ne[1])?;
         println!(
             "set {name}: build {:?} tokens {t} complete {:?}",
             man.build, man.complete

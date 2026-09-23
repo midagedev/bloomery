@@ -2,8 +2,8 @@
 //! (`docs/research/v41-b4-plan-report.md` §1-L) — against ik's CPU dump:
 //! `ds41_engram_key_norm` (the key side) and `ds41_engram_gate` (the query
 //! side and the stream update) at every engram layer (`engram.layer_ids`) of
-//! every set — the 5-token prefill (T = 5) and the decode steps
-//! [`STEP_SETS`] (T = 1).
+//! every set — the 5-token prefill (T = 5) and the table's decode-step sets
+//! (`step_sets`, T = 1).
 //!
 //! A site is one layer of one set. Its [`CHAIN`] nodes, from the gather of
 //! the looked-up rows to `engram_out-L`, are consecutive in the manifest
@@ -17,8 +17,8 @@
 //!    summed in f64), the products, SUM_ROWS (f64), SCALE, sgn/abs/clamp/sqrt,
 //!    the sigmoid (`1/(1 + expf(−x))` per value, libm's `expf`), the
 //!    broadcast value times the gate and the add — bit for bit; and
-//!    `engram_wkv` on ik's q8_2 activations against `engram_kv-L` within
-//!    ik's f32 accumulation bound. This proves the semantics: the key and
+//!    `engram_wkv` on ik's q8_2 activations (`bloomery_gpu_gates::ik_q8_2`)
+//!    against `engram_kv-L` within ik's f32 accumulation bound. This proves the semantics: the key and
 //!    value views, the gains per stream, the broadcast, and which activation
 //!    rule ik's projection ran.
 //! 2. The kernels on the dump's `engram_kv-L` and `l_out-(L−1)`, T tokens in
@@ -54,29 +54,16 @@ mod gate {
     use bloomery_gpu_deepseek41::engram_gate::{
         CLAMP_MIN, EngramGateKernels, GateArgs, KeyNormArgs, PER_THREAD, ROW, inv_sqrt_row,
     };
+    use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, Layout, RefManifest, RowKind, bits_equal, checks_failed,
-        max_rel_err, ref_dir_named, ref_ints, ref_model_path, ref_tensor_logical_in, verdict,
+        max_rel_err, ref_ints, ref_model_path, ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
     use gguf::{Split, TensorInfo, Value};
     use model::arch::Arch;
-
-    /// The decode-step sets: one step after a prefill run under the dumped
-    /// schedule (the `-every-node` variants of `tools/ref/models/deepseek41.sh`),
-    /// at positions 4, 301 and 1,025; the `unfused` ones build the indexer's
-    /// scores and top-k as nodes of their own, and `d1n` runs 301 with the
-    /// file's top-k — other graphs whose engram inputs differ.
-    pub const STEP_SETS: [&str; 6] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d1_unfused_every_node",
-        "ref_deepseek41_d1n_every_node",
-        "ref_deepseek41_d2_every_node",
-        "ref_deepseek41_d2_unfused_every_node",
-    ];
 
     /// Nodes of one engram site, the row gather to `engram_out-L`.
     const CHAIN: usize = 35;
@@ -158,9 +145,6 @@ mod gate {
     /// once (u); ik's is glibc's `expf`, within 0.502 ulp (its source's
     /// bound), and an ulp is at most 2u.
     const EXP_REL: f64 = (1.0 + 1.0 / 268_435_456.0 + 2.0 * 0.502) * U;
-
-    /// ik's q8_2 activation blocks: 32 values under one bf16 scale.
-    const QK: usize = 32;
 
     // ------------------------------------------------------------ metadata
 
@@ -337,8 +321,8 @@ mod gate {
 
         let cpu = oracle::for_arch(Arch::Deepseek41)?;
         let mut sets = vec![(cpu.set_name(Set::Cpu)?, cpu.open(Set::Cpu)?)];
-        for name in STEP_SETS {
-            sets.push((name, open_set(name)?));
+        for &name in cpu.step_sets {
+            sets.push((name, cpu.open_named(name)?));
         }
         let cx = Cx {
             gpu: &gpu,
@@ -386,16 +370,6 @@ mod gate {
         gpu: &'a Gpu,
         eg: &'a EngramGateKernels,
         meta: &'a Meta,
-    }
-
-    /// A set by name under the data directory, its `# arch` line checked.
-    fn open_set(name: &str) -> Result<RefManifest, GateError> {
-        let man = RefManifest::read(&ref_dir_named(name))?;
-        let want = Arch::Deepseek41.name();
-        if man.arch.as_deref() != Some(want) {
-            return Err(format!("{name}: # arch is {:?}, want {want}", man.arch).into());
-        }
-        Ok(man)
     }
 
     // ------------------------------------------------------------ the site
@@ -457,11 +431,7 @@ mod gate {
     /// loaded.
     fn site_data(man: &RefManifest, meta: &Meta, l: usize) -> Result<SiteData, GateError> {
         let out_name = format!("engram_out-{l}");
-        let e = man
-            .tensors
-            .iter()
-            .position(|r| r.name == out_name && r.occurrence == 0)
-            .ok_or_else(|| format!("{out_name} not in {}", man.dir.display()))?;
+        let (e, _) = man.tensor_at(&out_name, 0)?;
         if e + 1 < CHAIN {
             return Err(
                 format!("{out_name} sits at manifest row {e}, before a whole chain").into(),
@@ -559,11 +529,7 @@ mod gate {
             return Err(format!("{out_name}: the value view does not precede the key view").into());
         }
         let ld = |i: usize| ref_tensor_logical_in(&man.dir, &rows[i]);
-        let x_row = man.tensors[..e + 1 - CHAIN]
-            .iter()
-            .rev()
-            .find(|r| r.name == prev)
-            .ok_or_else(|| format!("{prev} before {out_name}"))?;
+        let (_, x_row) = man.last_before(e + 1 - CHAIN, Some(&prev))?;
         x_row.expect(&prev, "f32", row_shape, "in")?;
         let ints = |name: &str| ref_ints(man, name, 0, RowKind::Input, Layout::Flat);
         for which in ["k", "q"] {
@@ -1202,32 +1168,11 @@ mod gate {
         abs_ik: Vec<f64>,
     }
 
-    /// ik's q8_2 activation blocks of `x` (`quantize_row_q8_2_x4`, AVX2):
-    /// per 32 values `d = amax/127` rounded to bf16 (nearest even), `id = 1/d`
-    /// (0 when `d` is 0), each code `x·id` rounded half to even and
-    /// saturated to i8. Returns the codes and the scales.
-    fn ik_q8_2(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
-        let mut q = Vec::with_capacity(x.len());
-        let mut d = Vec::with_capacity(x.len() / QK);
-        for blk in x.as_chunks::<QK>().0 {
-            let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-            let bits = (amax / 127.0).to_bits();
-            let db = f32::from_bits(((bits + (0x7fff + ((bits >> 16) & 1))) >> 16) << 16);
-            let id = if db > 0.0 { 1.0 / db } else { 0.0 };
-            q.extend(
-                blk.iter()
-                    .map(|&v| (v * id).round_ties_even().clamp(-128.0, 127.0) as i8),
-            );
-            d.push(db);
-        }
-        (q, d)
-    }
-
     /// [`Proj`] of `x` through the q8_0 weight `w` of `rows` rows, the rows
     /// split across the host's threads.
     fn project(w: &[u8], rows: usize, x: &[f32]) -> Proj {
         let rb = x.len() / QK * 34;
-        let (qx, dx) = ik_q8_2(x);
+        let (qx, dx) = ik_q8_2::quantize(x);
         let mut p = Proj {
             ours: vec![0.0; rows],
             ik: vec![0.0; rows],
@@ -1255,14 +1200,12 @@ mod gate {
                         for (bi, (blk, xb)) in blocks.enumerate() {
                             let qb = Q8Block::from_bytes(blk);
                             let dw = half_to_f32(qb.d);
-                            let mut isum = 0i32;
-                            let codes = &qx[bi * QK..(bi + 1) * QK];
-                            for ((&qw, &xv), &qa) in qb.q.iter().zip(xb).zip(codes) {
+                            for (&qw, &xv) in qb.q.iter().zip(xb) {
                                 let t = f64::from(f32::from(qw) * dw) * f64::from(xv);
                                 so += t;
                                 sao += t.abs();
-                                isum += i32::from(qw) * i32::from(qa);
                             }
+                            let isum = ik_q8_2::block_sum(&qb, &qx[bi * QK..(bi + 1) * QK]);
                             let t = f64::from(dw) * f64::from(dx[bi]) * f64::from(isum);
                             si += t;
                             sai += t.abs();

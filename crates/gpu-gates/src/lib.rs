@@ -13,14 +13,16 @@
 //! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
 pub mod block;
+pub mod ds41_meta;
 pub mod engine;
+pub mod ik_q8_2;
 pub mod kld;
 pub mod oracle;
 pub mod prompts;
 pub mod ptx;
 
 use gguf::quant::{GgmlType, dequant_row};
-use gguf::{Gguf, TensorInfo};
+use gguf::{Gguf, Split, TensorInfo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -507,6 +509,8 @@ pub struct RefHeader {
     pub flags: Option<String>,
     /// `-c` in `# flags`: the context the dumper ran at.
     pub ctx: Option<u64>,
+    /// `-t` in `# flags`: the threads the dumper ran with.
+    pub threads: Option<u64>,
     /// `# prefill`: in a decode-step set, the tokens run before the step.
     pub prefill: Option<u32>,
     /// `# decode_pos`: in a decode-step set, the step's position.
@@ -535,11 +539,22 @@ struct RowIndex {
     ints: HashMap<String, Vec<(RowKind, u32, Layout, usize)>>,
     /// Tensor and input rows whose key an earlier row already carries.
     duplicates: usize,
+    /// Per input row, the position in `tensors` of the first tensor row the
+    /// file holds after it; `None` when no tensor row follows.
+    touchers: Vec<Option<usize>>,
 }
 
 impl RowIndex {
-    fn over(tensors: &[RefRow], inputs: &[RefRow], ints: &[IntRow]) -> RowIndex {
-        let mut ix = RowIndex::default();
+    fn over(
+        tensors: &[RefRow],
+        inputs: &[RefRow],
+        ints: &[IntRow],
+        touchers: Vec<Option<usize>>,
+    ) -> RowIndex {
+        let mut ix = RowIndex {
+            touchers,
+            ..RowIndex::default()
+        };
         for (at, r) in tensors.iter().enumerate().chain(inputs.iter().enumerate()) {
             let keys = ix.rows.entry(r.name.clone()).or_default();
             if keys
@@ -575,7 +590,8 @@ impl RefManifest {
     /// absmax file`, and `skip`/`skip-input name occurrence type reason`.
     /// Tensor names may contain spaces, so fields are split on tabs only. A
     /// row of any other kind or width is an error naming its line, and so is
-    /// a manifest with no `tensor` row. The rows are indexed here, once.
+    /// a manifest with no `tensor` row. The rows are indexed here, once,
+    /// with each input row's first toucher ([`first_touched_by`](Self::first_touched_by)).
     pub fn read(dir: &Path) -> Result<RefManifest, GateError> {
         let path = dir.join("MANIFEST.tsv");
         let text = std::fs::read_to_string(&path)
@@ -593,6 +609,9 @@ impl RefManifest {
             skipped_inputs: 0,
             index: RowIndex::default(),
         };
+        // Per input row, the tensor row that follows it in the file; the
+        // inputs no tensor row has followed yet.
+        let (mut touchers, mut pending) = (Vec::new(), Vec::new());
         for (i, line) in text.lines().enumerate() {
             let at = At(&path, i + 1);
             if line.starts_with('#') {
@@ -600,8 +619,18 @@ impl RefManifest {
             } else if !line.is_empty() {
                 let f: Vec<&str> = line.split('\t').collect();
                 match f[0] {
-                    "tensor" => man.tensors.push(parse_ref_row(RowKind::Tensor, &f, at)?),
-                    "input" => man.inputs.push(parse_ref_row(RowKind::Input, &f, at)?),
+                    "tensor" => {
+                        let row = parse_ref_row(RowKind::Tensor, &f, at)?;
+                        for p in pending.drain(..) {
+                            touchers[p] = Some(man.tensors.len());
+                        }
+                        man.tensors.push(row);
+                    }
+                    "input" => {
+                        man.inputs.push(parse_ref_row(RowKind::Input, &f, at)?);
+                        pending.push(touchers.len());
+                        touchers.push(None);
+                    }
                     "int" => man.ints.push(parse_int_row(&f, at)?),
                     "skip" | "skip-input" if f.len() != 5 => {
                         return Err(format!(
@@ -620,7 +649,7 @@ impl RefManifest {
         if man.tensors.is_empty() {
             return Err(format!("ref_manifest: no tensor rows in {}", path.display()).into());
         }
-        man.index = RowIndex::over(&man.tensors, &man.inputs, &man.ints);
+        man.index = RowIndex::over(&man.tensors, &man.inputs, &man.ints, touchers);
         Ok(man)
     }
 
@@ -663,11 +692,8 @@ impl RefManifest {
             "tokens_count" => once(&mut h.tokens_count, parse_u64(v, at)?, key, at),
             "model_file" => once(&mut h.model_file, text(), key, at),
             "flags" => {
-                let mut args = v.split_whitespace();
-                if args.by_ref().any(|a| a == "-c") {
-                    let c = args.next().unwrap_or("");
-                    h.ctx = Some(c.parse().map_err(|e| bad(&format!("-c {c:?}: {e}")))?);
-                }
+                h.ctx = flag_value(v, "-c").map_err(|e| bad(&e))?;
+                h.threads = flag_value(v, "-t").map_err(|e| bad(&e))?;
                 once(&mut h.flags, text(), key, at)
             }
             "prefill" => once(&mut h.prefill, parse_narrow(v, at)?, key, at),
@@ -688,22 +714,44 @@ impl RefManifest {
         }
     }
 
-    /// The row of kind `kind` keyed `name`/`occurrence`, through the index —
-    /// the row a scan of the file finds first — or `None` if the set has
-    /// none.
-    pub fn find(&self, kind: RowKind, name: &str, occurrence: u32) -> Option<&RefRow> {
-        let rows = match kind {
-            RowKind::Tensor => &self.tensors,
-            RowKind::Input => &self.inputs,
-        };
+    /// Where the row of kind `kind` keyed `name`/`occurrence` sits among the
+    /// rows of its kind (`tensors` or `inputs`, file order), through the
+    /// index — the row a scan of the file finds first — or `None` if the set
+    /// has none.
+    pub fn position(&self, kind: RowKind, name: &str, occurrence: u32) -> Option<usize> {
         let &(_, _, at) = self
             .index
             .rows
             .get(name)?
             .iter()
             .find(|&&(k, o, _)| k == kind && o == occurrence)?;
-        rows.get(at)
+        self.rows_of(kind)
+            .get(at)
             .filter(|r| r.name == name && r.occurrence == occurrence)
+            .map(|_| at)
+    }
+
+    /// The row of kind `kind` keyed `name`/`occurrence`, through the index —
+    /// the row a scan of the file finds first — or `None` if the set has
+    /// none.
+    pub fn find(&self, kind: RowKind, name: &str, occurrence: u32) -> Option<&RefRow> {
+        let at = self.position(kind, name, occurrence)?;
+        self.rows_of(kind).get(at)
+    }
+
+    /// The first row of kind `kind` named `name`, whatever its occurrence —
+    /// the row a scan of the file finds first. The dumper counts a name's
+    /// skipped nodes in its occurrences, so that row need not be occurrence 0.
+    pub fn first_named(&self, kind: RowKind, name: &str) -> Option<&RefRow> {
+        let at = self
+            .index
+            .rows
+            .get(name)?
+            .iter()
+            .filter(|&&(k, ..)| k == kind)
+            .map(|&(.., at)| at)
+            .min()?;
+        self.rows_of(kind).get(at).filter(|r| r.name == name)
     }
 
     /// The `tensor` row `name`/`occurrence` ([`find`](Self::find)); a set
@@ -712,21 +760,74 @@ impl RefManifest {
         self.row(RowKind::Tensor, name, occurrence)
     }
 
+    /// The `tensor` row `name`/`occurrence` with its position in `tensors`,
+    /// where a walk back through the rows before it starts
+    /// ([`last_before`](Self::last_before)); a set without it is an error
+    /// naming the set.
+    pub fn tensor_at(&self, name: &str, occurrence: u32) -> Result<(usize, &RefRow), GateError> {
+        let at = self
+            .position(RowKind::Tensor, name, occurrence)
+            .ok_or_else(|| self.missing(RowKind::Tensor, name, occurrence))?;
+        Ok((at, &self.tensors[at]))
+    }
+
     /// The `input` row `name`/`occurrence` ([`find`](Self::find)); a set
     /// without it is an error naming the set.
     pub fn input(&self, name: &str, occurrence: u32) -> Result<&RefRow, GateError> {
         self.row(RowKind::Input, name, occurrence)
     }
 
+    /// The node a reader at `tensors[at]` reads as `name`, one of its source
+    /// columns: the last tensor row of that name before it — manifest order
+    /// is execution order — with its position. An empty column is an error.
+    pub fn last_before(
+        &self,
+        at: usize,
+        name: Option<&str>,
+    ) -> Result<(usize, &RefRow), GateError> {
+        let name = name.ok_or("a reader row has no src column")?;
+        self.tensors[..at]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, r)| r.name == name)
+            .ok_or_else(|| format!("no node {name:?} before manifest row {at}").into())
+    }
+
+    /// The input rows tensor row `at` touches first, in file order. The
+    /// dumper writes a graph input right before the node that first touches
+    /// it — reads it, or writes into it as a `SET_ROWS` destination, which no
+    /// source column names — so an input's first toucher is the tensor row
+    /// that follows it in the file.
+    pub fn first_touched_by(&self, at: usize) -> Vec<&RefRow> {
+        self.inputs
+            .iter()
+            .zip(&self.index.touchers)
+            .filter(|&(_, &t)| t == Some(at))
+            .map(|(r, _)| r)
+            .collect()
+    }
+
+    fn rows_of(&self, kind: RowKind) -> &[RefRow] {
+        match kind {
+            RowKind::Tensor => &self.tensors,
+            RowKind::Input => &self.inputs,
+        }
+    }
+
     fn row(&self, kind: RowKind, name: &str, occurrence: u32) -> Result<&RefRow, GateError> {
-        self.find(kind, name, occurrence).ok_or_else(|| {
-            format!(
-                "ref_manifest: {} {name}/{occurrence} not in {}",
-                kind.as_str(),
-                self.dir.join("MANIFEST.tsv").display()
-            )
-            .into()
-        })
+        self.find(kind, name, occurrence)
+            .ok_or_else(|| self.missing(kind, name, occurrence))
+    }
+
+    /// The error a lookup of a row the set does not hold returns.
+    fn missing(&self, kind: RowKind, name: &str, occurrence: u32) -> GateError {
+        format!(
+            "ref_manifest: {} {name}/{occurrence} not in {}",
+            kind.as_str(),
+            self.dir.join("MANIFEST.tsv").display()
+        )
+        .into()
     }
 
     /// Tensor and input rows whose `(kind, name, occurrence)` an earlier row
@@ -790,6 +891,19 @@ impl std::fmt::Display for At<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.0.display(), self.1)
     }
+}
+
+/// The number after the first `flag` in a `# flags` command line; `None` when
+/// the line has no such flag.
+fn flag_value(line: &str, flag: &str) -> Result<Option<u64>, String> {
+    let mut args = line.split_whitespace();
+    if !args.by_ref().any(|a| a == flag) {
+        return Ok(None);
+    }
+    let v = args.next().unwrap_or("");
+    v.parse()
+        .map(Some)
+        .map_err(|e| format!("{flag} {v:?}: {e}"))
 }
 
 fn parse_u64(s: &str, at: At) -> Result<u64, GateError> {
@@ -1097,14 +1211,7 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
         }
         return Ok(vals);
     }
-    let plain_ok = match (row.contig, row.op.as_str()) {
-        // v2 manifest: the column decides. Pre-v2 manifest: only the op
-        // can rule out a flat VIEW read.
-        (Some(c), _) => c == 1,
-        (None, "VIEW") => false,
-        (None, _) => true,
-    };
-    if !plain_ok {
+    if !plain_is_logical(row) {
         return Err(format!(
             "ref_tensor_logical: {} is a view/non-contiguous row with no \
              logical twin in {} — the plain file is a flat read, not the tensor",
@@ -1114,6 +1221,17 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
         .into());
     }
     ref_tensor_of_in(dir, row)
+}
+
+/// Whether a row's plain file is its logical order, so a whole-tensor read
+/// of it is the tensor: a v2 manifest's `contig` column decides; on a pre-v2
+/// manifest only the op can rule out a flat VIEW read.
+fn plain_is_logical(row: &RefRow) -> bool {
+    match (row.contig, row.op.as_str()) {
+        (Some(c), _) => c == 1,
+        (None, "VIEW") => false,
+        (None, _) => true,
+    }
 }
 
 /// The `int` row twinning `(name, occurrence)` of kind `of` in `layout`,
@@ -1228,8 +1346,7 @@ pub fn ref_ints(
 
 // -------------------------------------------------- promoted gate helpers
 // Single owners of the reference-side helpers the gate bins first wrote
-// locally; the bins import them from here. `gate_p5` still carries its own
-// `verdict` and `bits_equal` — its track owns that file.
+// locally; the bins import them from here.
 
 /// The word a gate prints for one check's outcome: `PASS` or `FAIL`. The
 /// gates' tables are compared line by line across rounds, so the spelling
@@ -1244,6 +1361,62 @@ pub fn verdict(pass: bool) -> &'static str {
 /// defect can produce.
 pub fn bits_equal(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Values of `a` and `b` with the same bits, index by index over the shorter
+/// of the two.
+pub fn same_bits(a: &[f32], b: &[f32]) -> usize {
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() == y.to_bits())
+        .count()
+}
+
+/// Ulps between two finite f32, through integers ordered like the floats
+/// they encode (`-0.0` and `+0.0` the same point).
+fn ulps(a: f32, b: f32) -> u32 {
+    let key = |v: f32| {
+        let b = v.to_bits().cast_signed();
+        if b < 0 { i32::MIN - b } else { b }
+    };
+    key(a).abs_diff(key(b))
+}
+
+/// The largest distance in ulps between `a` and `b`, index by index; 0 when
+/// either is empty.
+pub fn max_ulps(a: &[f32], b: &[f32]) -> u32 {
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| ulps(x, y))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The shape check a gate runs on the device code it carries: every entry
+/// of `entries` compiles with no local depot and no local loads or stores,
+/// read off the PTX in this executable ([`ptx::current_exe_bundles`]). A
+/// spilled accumulator array changes no output and no band, only the time,
+/// so nothing else a gate checks can see it. Prints one `shape` line per
+/// entry and returns whether every one passes; an entry the executable does
+/// not carry is an error.
+pub fn no_local_depot(entries: &[&str]) -> Result<bool, GateError> {
+    let bundles = ptx::current_exe_bundles()?;
+    let modules = ptx::modules(&bundles);
+    let mut ok = true;
+    for &name in entries {
+        let c = ptx::counts(&modules, name)
+            .ok_or_else(|| format!("no PTX entry {name} in this executable"))?;
+        let pass = !c.depot && c.ld_local == 0 && c.st_local == 0;
+        println!(
+            "shape kernel={name} local_depot={} ld_local={} st_local={} {}",
+            c.depot,
+            c.ld_local,
+            c.st_local,
+            verdict(pass)
+        );
+        ok &= pass;
+    }
+    Ok(ok)
 }
 
 /// Mean microseconds per replay of graph `g`: one warm replay and a
@@ -1285,18 +1458,35 @@ pub fn view_flat(view: &[f32], base: &[f32], off: usize, what: &str) -> Result<(
     Ok(())
 }
 
-/// Host scalar router reference, transcribed from the CPU engine's routing
+/// A router reference's outputs: the probabilities `[n_expert, m]`, then the
+/// chosen ids and their weights `[n_used, m]`.
+pub type Routing = (Vec<f32>, Vec<i32>, Vec<f32>);
+
+/// The router shape [`route_ref`] takes: the V2-Lite model's 64 experts, 6
+/// used per token.
+const V2_LITE_ROUTER: (usize, usize) = (64, 6);
+
+/// [`route_ref_within`] at the V2-Lite router's shape.
+pub fn route_ref(logits: &[f32], m: usize, scale: f32) -> Result<Routing, GateError> {
+    let (n_expert, n_used) = V2_LITE_ROUTER;
+    route_ref_within(logits, m, n_expert, n_used, scale)
+}
+
+/// Host scalar router reference over `n_expert` experts, `n_used` chosen a
+/// token, transcribed from the CPU engine's routing
 /// (`model::moe::route_inner`): softmax with a serial f32 max fold, f32
 /// `exp`, f64 sum accumulated ascending, f32 divide by `sum as f32`; top-k
 /// by `(probability desc, id asc)`; weights `probs[id] * scale`. Layout
-/// ggml t-major: logits/probs `[64, m]`, ids/weights `[6, m]`. Non-finite
-/// logits are an error (gate_p6's local `route_ref` panics there).
-pub fn route_ref(
+/// ggml t-major: logits/probs `[n_expert, m]`, ids/weights `[n_used, m]`.
+/// Non-finite logits are an error.
+pub fn route_ref_within(
     logits: &[f32],
     m: usize,
+    n_expert: usize,
+    n_used: usize,
     scale: f32,
-) -> Result<(Vec<f32>, Vec<i32>, Vec<f32>), GateError> {
-    let (n, k) = (64usize, 6usize);
+) -> Result<Routing, GateError> {
+    let (n, k) = (n_expert, n_used);
     if logits.len() != n * m {
         return Err(format!("route_ref: logits.len() {} != {n}*{m}", logits.len()).into());
     }
@@ -1344,6 +1534,24 @@ pub fn f32_tensor(gguf: &Gguf, name: &str, want: usize) -> Result<Vec<f32>, Gate
         .into());
     }
     Ok(b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect())
+}
+
+/// An F32 tensor of a split model file as f32 (norm gains): its type F32
+/// and `want` values, checked — [`f32_tensor`] across shards.
+pub fn split_f32(split: &Split, name: &str, want: usize) -> Result<Vec<f32>, GateError> {
+    let (s, t) = split
+        .find(name)
+        .ok_or_else(|| format!("{name} is not in the model file"))?;
+    if t.ty != GgmlType::F32 || t.dims.iter().product::<u64>() != want as u64 {
+        return Err(format!("{name} is {:?} {:?}, want F32 x {want}", t.ty, t.dims).into());
+    }
+    let g = split.shard(s).ok_or("shard index out of range")?;
+    Ok(g.data(t)?
+        .as_chunks::<4>()
         .0
         .iter()
         .map(|c| f32::from_le_bytes(*c))
@@ -1429,12 +1637,33 @@ pub fn widened_f16_bits_in(dir: &Path, row: &RefRow, idx: &[u32]) -> Result<Vec<
     Ok(out)
 }
 
-/// The f16 bits of mask row `row` of the set at `dir`: an `f16` row whose
-/// f32 file holds every value exactly `0.0` (a cell the query sees) or
-/// `-inf` (one it does not), each mapped to that value's f16 bits (`0x0000`,
-/// `0xfc00`). Anything else — another type, a byte count that is not four a
-/// value, any other value, `-0.0` and NaN included — is an error naming the
-/// row, and for a value, the first offending one and its index.
+/// Every row of f16 row `row` of the set at `dir`, as f16 bits:
+/// [`widened_f16_bits_in`] over rows `0 .. count / ne[0]`. A whole tensor
+/// read through its plain file needs that file to be the tensor, so a row
+/// that is a view or not contiguous ([`plain_is_logical`]) is an error.
+pub fn widened_f16_rows_in(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError> {
+    if !plain_is_logical(row) {
+        return Err(format!(
+            "widened_f16_rows: {} {}/{} is a view/non-contiguous row — its plain file is a \
+             flat read, not the tensor",
+            row.kind.as_str(),
+            row.name,
+            row.occurrence
+        )
+        .into());
+    }
+    let rows = row.count().checked_div(row.ne[0]).unwrap_or(0);
+    let idx: Vec<u32> = (0..u32::try_from(rows)?).collect();
+    widened_f16_bits_in(dir, row, &idx)
+}
+
+/// The f16 bits of mask row `row` of the set at `dir`: an `f16` row, its
+/// plain file its logical order ([`plain_is_logical`]), whose f32 file holds
+/// every value exactly `0.0` (a cell the query sees) or `-inf` (one it does
+/// not), each mapped to that value's f16 bits (`0x0000`, `0xfc00`). Anything
+/// else — another type, a view or non-contiguous row, a byte count that is
+/// not four a value, any other value, `-0.0` and NaN included — is an error
+/// naming the row, and for a value, the first offending one and its index.
 pub fn mask_bits_in(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError> {
     use gguf::quant::f32_to_f16_bits;
 
@@ -1452,6 +1681,14 @@ pub fn mask_bits_in(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError> {
     };
     if row.ty != "f16" {
         return Err(format!("mask_bits: {} is {}, want an f16 mask", what(), row.ty).into());
+    }
+    if !plain_is_logical(row) {
+        return Err(format!(
+            "mask_bits: {} is a view/non-contiguous row — its plain file is a flat read, not \
+             the mask",
+            what()
+        )
+        .into());
     }
     let raw = std::fs::read(&path).map_err(|e| format!("mask_bits: {}: {e}", what()))?;
     let want = 4_u64.checked_mul(row.count());
@@ -1585,6 +1822,7 @@ mod tests {
     use super::{
         GateError, Layout, RefManifest, RowKind, find_int_row, find_ref_row_in, mask_bits_in,
         max_rel_err, topk_ids_logical_in, topk_ids_logical_within, widened_f16_bits_in,
+        widened_f16_rows_in,
     };
     use std::path::{Path, PathBuf};
 
@@ -1652,6 +1890,10 @@ mod tests {
     /// input of one name are two rows — and of a key two rows carry, the
     /// first, the row a scan in file order finds; the second is counted as a
     /// duplicate. An `int` row is found by its twin's kind and layout too.
+    /// The positional reads agree with a scan: a row's position, the first
+    /// row of a name whose first written occurrence is not 0, the last row
+    /// of a name before a reader, and an input's first toucher, the tensor
+    /// row after it.
     #[test]
     fn the_index_finds_the_row_a_scan_finds_first() -> Result<(), GateError> {
         let dir = set_dir("index")?;
@@ -1664,6 +1906,8 @@ mod tests {
                 "tensor\tx\t0\tf32\t1\t1\t1\t1\t4\t4.0\tADD",
                 "int\tp\t0\tinput\ti32\ti32\tflat\t1\t4\t7\t7\tp.0.input.i32",
                 "int\tp\t0\tinput\ti32\ti32\tlogical\t1\t4\t7\t7\tp.0.input.logical.i32",
+                "skip\ty\t0\tq8_0\tquantized",
+                "tensor\ty\t1\tf32\t1\t1\t1\t1\t4\t5.0\tADD",
             ],
         )?;
         let sum = |r: Option<&super::RefRow>| r.map(|r| r.sum);
@@ -1680,13 +1924,30 @@ mod tests {
         let twin = find_int_row(&man, "p", 0, RowKind::Input, Layout::Logical)?;
         assert_eq!(twin.file, "p.0.input.logical.i32");
         assert!(find_int_row(&man, "p", 0, RowKind::Tensor, Layout::Flat).is_err());
+
+        assert_eq!(man.position(RowKind::Tensor, "x", 1), Some(1));
+        assert_eq!(man.tensor_at("y", 1)?.0, 3);
+        assert_eq!(sum(man.first_named(RowKind::Tensor, "x")), Some(1.0));
+        assert_eq!(sum(man.first_named(RowKind::Tensor, "y")), Some(5.0));
+        assert!(man.first_named(RowKind::Input, "y").is_none());
+        assert_eq!(man.last_before(2, Some("x"))?.0, 1);
+        assert!(man.last_before(0, Some("x")).is_err());
+        assert!(man.last_before(3, None).is_err());
+        let touched = |at: usize| {
+            man.first_touched_by(at)
+                .iter()
+                .map(|r| r.sum)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(touched(2), [3.0]);
+        assert!(touched(1).is_empty() && touched(3).is_empty());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
     /// Every header line the V4.1 and V2-Lite sets carry, spelled as they
     /// spell it (long values shortened): a known key fills its field — `-c`
-    /// out of `# flags`, the step out of `# tokens` and `# decode_pos` —
+    /// and `-t` out of `# flags`, the step out of `# tokens` and `# decode_pos` —
     /// every other `#` line is kept verbatim in file order, and a known key
     /// twice or a value that does not parse is an error.
     #[test]
@@ -1740,7 +2001,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|f| f.ends_with("--no-fused-idx-topk"))
         );
-        assert_eq!(h.ctx, Some(2048));
+        assert_eq!((h.ctx, h.threads), (Some(2048), Some(32)));
         assert_eq!((h.prefill, h.decode_pos), (Some(2), Some(2)));
         assert!(h.state_inputs.is_some());
         assert_eq!(h.fused_idx_topk, Some(false));
@@ -1770,8 +2031,13 @@ mod tests {
             (None, Some("c10fbbcc"))
         );
         assert_eq!(
-            (h.model_file.as_deref(), h.flags.as_deref(), h.ctx),
-            (None, None, None)
+            (
+                h.model_file.as_deref(),
+                h.flags.as_deref(),
+                h.ctx,
+                h.threads
+            ),
+            (None, None, None, None)
         );
         assert_eq!(
             (h.prefill, h.decode_pos, h.fused_idx_topk),
@@ -1783,6 +2049,7 @@ mod tests {
         for bad in [
             "# tokens\t5,x",
             "# flags\t-m M.gguf -c",
+            "# flags\t-m M.gguf -t x -c 512",
             "# fused_idx_topk\tyes",
             "# decode_pos\t-1",
             "# build\tc10fbbcc",
@@ -1796,7 +2063,8 @@ mod tests {
 
     /// The mask reader maps `0.0` and `-inf` to their f16 bits and refuses
     /// every other value — `-0.0` and NaN too — naming the row and the first
-    /// offending value, and a row that is not f16.
+    /// offending value, a row that is not f16, and one whose plain file is
+    /// not its logical order.
     #[test]
     fn mask_bits_take_zero_and_minus_infinity_only() -> Result<(), GateError> {
         let dir = set_dir("mask")?;
@@ -1820,6 +2088,9 @@ mod tests {
         }
         let not_f16 = manifest(&dir, &[node, &row.replace("\tf16\t", "\tf32\t")])?;
         assert!(mask_bits_in(&dir, &not_f16.inputs[0]).is_err());
+        f32_file(&file, &[0.0, ninf, ninf, 0.0])?;
+        let flat = manifest(&dir, &[node, &row.replace("NONE\t1\t0", "NONE\t0\t0")])?;
+        assert!(mask_bits_in(&dir, &flat.inputs[0]).is_err());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -1827,7 +2098,8 @@ mod tests {
     /// The widened-f16 reader returns the rows asked for, in the order asked,
     /// as f16 bits, and reads no other row: a row holding a value no half
     /// widens to is refused when asked for and passes unread otherwise; a
-    /// row past the tensor is an error.
+    /// row past the tensor is an error. The whole-tensor reader asks for
+    /// every row, and refuses a row whose plain file is not its logical order.
     #[test]
     fn widened_f16_bits_read_only_the_rows_asked_for() -> Result<(), GateError> {
         let dir = set_dir("widened")?;
@@ -1847,6 +2119,18 @@ mod tests {
         assert!(widened_f16_bits_in(&dir, cache, &[3]).is_err());
         let not_f16 = manifest(&dir, &[&row.replace("\tf16\t", "\tf32\t")])?;
         assert!(widened_f16_bits_in(&dir, &not_f16.tensors[0], &[0]).is_err());
+
+        assert!(widened_f16_rows_in(&dir, cache).is_err());
+        f32_file(
+            &dir.join(cache.file_name()),
+            &[1.0, -2.0, 0.5, 0.25, 65504.0, min_normal],
+        )?;
+        assert_eq!(
+            widened_f16_rows_in(&dir, cache)?,
+            [0x3c00, 0xc000, 0x3800, 0x3400, 0x7bff, 0x0400]
+        );
+        let view = manifest(&dir, &[&row.replace("VIEW\t1\t0", "VIEW\t0\t0")])?;
+        assert!(widened_f16_rows_in(&dir, &view.tensors[0]).is_err());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

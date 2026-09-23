@@ -35,12 +35,13 @@
 //!    rules' difference: `over` counts the values outside it, beside
 //!    `ik_rel` and, off the gemv, the max ulp.
 //!
-//! Sets: the 5-token prefill (every read inside the batch) and the decode
-//! steps [`STEP_SETS`] at 4 (even: no ratio-2 group completes, the persist
-//! alone runs and nothing is written), 301 and 1,025 (a group completes and
-//! pools the slot the previous step kept). A step set's ring is the f32
-//! input of the ring's shape its first toucher takes, by file order
-//! (`docs/oracle.md`, 「상태는 input 행이다」).
+//! Sets: the 5-token prefill (every read inside the batch) and the table's
+//! decode-step sets (`step_sets`) at 4 (even: no ratio-2 group completes,
+//! the persist alone runs and nothing is written), 301 and 1,025 (a group
+//! completes and pools the slot the previous step kept). A step set's ring
+//! is the f32 input of the ring's shape its first toucher takes, by file
+//! order (`RefManifest::first_touched_by`; `docs/oracle.md`, 「상태는 input
+//! 행이다」).
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -59,7 +60,6 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::collections::HashMap;
     use std::f32::consts::FRAC_1_SQRT_2;
-    use std::path::Path;
 
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_deepseek41::compress::{
@@ -67,30 +67,19 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::index_key::{self, HT_SCALE, IndexKeyArgs, IndexKeyKernels};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
+    use bloomery_gpu_gates::ds41_meta::RopeMeta;
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
-        max_rel_err, ref_dir_named, ref_model_path, ref_tensor_logical_in, verdict,
+        max_rel_err, max_ulps, ref_model_path, ref_tensor_logical_in, same_bits, split_f32,
+        verdict, widened_f16_rows_in,
     };
     use cuda_core::DeviceBuffer;
+    use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits, half_to_f32};
-    use gguf::{Split, Value};
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::plan::{Planner, StepPlan, StreamStep};
-
-    /// The decode-step sets: one step after a prefill run under the dumped
-    /// schedule, the `unfused` ones with the indexer's scores as nodes — the
-    /// same compressor in another graph — and `d1n` at 301 with the file's
-    /// top-k.
-    pub const STEP_SETS: [&str; 6] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d1_unfused_every_node",
-        "ref_deepseek41_d1n_every_node",
-        "ref_deepseek41_d2_every_node",
-        "ref_deepseek41_d2_unfused_every_node",
-    ];
 
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
@@ -155,199 +144,6 @@ mod gate {
 
     // ------------------------------------------------------------ inputs
 
-    /// The file's rope and norm constants.
-    struct Meta {
-        n_dims: usize,
-        yarn: RopeSpec,
-        eps: f32,
-    }
-
-    impl Meta {
-        fn read(split: &Split) -> Result<Meta, GateError> {
-            let want = Arch::Deepseek41.name();
-            if split.architecture() != Some(want) {
-                return Err(format!(
-                    "the model file is {:?}, want {want} — run through `just gate-gpu-ds41-comp`",
-                    split.architecture()
-                )
-                .into());
-            }
-            let f = |s: &str| -> Result<f32, GateError> {
-                split
-                    .arch_get_f32(s)
-                    .ok_or_else(|| format!("metadata {} missing", split.arch_key(s)).into())
-            };
-            let u = |s: &str| -> Result<u64, GateError> {
-                split
-                    .arch_get_u64(s)
-                    .ok_or_else(|| format!("metadata {} missing", split.arch_key(s)).into())
-            };
-            let scaling = split.arch_get_str("rope.scaling.type");
-            if scaling != Some("yarn") {
-                return Err(format!("rope.scaling.type is {scaling:?}, want \"yarn\"").into());
-            }
-            let key = split.arch_key("attention.compress_ratios");
-            if !matches!(split.value(&key), Some(Value::Array(_))) {
-                return Err(format!("metadata {key} is absent or not an array").into());
-            }
-            let n_dims = usize::try_from(u("rope.dimension_count")?)?;
-            Ok(Meta {
-                n_dims,
-                yarn: RopeSpec::yarn(
-                    f("attention.compress_rope_freq_base")?,
-                    f("rope.scaling.factor")?,
-                    i32::try_from(u("rope.scaling.original_context_length")?)?,
-                    f("rope.scaling.yarn_beta_fast")?,
-                    f("rope.scaling.yarn_beta_slow")?,
-                    n_dims,
-                ),
-                eps: f("attention.layer_norm_rms_epsilon")?,
-            })
-        }
-    }
-
-    /// The header lines a set's step is read from.
-    struct Header {
-        /// `# tokens`: the whole sequence.
-        tokens: Vec<u32>,
-        /// `# decode_pos`: the step's position, in a decode-step set.
-        decode_pos: Option<u32>,
-        /// `-c` in `# flags`: the port's context.
-        ctx: u64,
-    }
-
-    impl Header {
-        fn read(dir: &Path) -> Result<Header, GateError> {
-            let path = dir.join("MANIFEST.tsv");
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let bad = |line: &str, e: std::num::ParseIntError| -> GateError {
-                format!("{}: {line:?}: {e}", path.display()).into()
-            };
-            let (mut tokens, mut decode_pos, mut ctx) = (Vec::new(), None, None);
-            for line in text.lines().take_while(|l| l.starts_with('#')) {
-                if let Some(v) = line.strip_prefix("# tokens\t") {
-                    tokens = v
-                        .split(',')
-                        .map(str::parse)
-                        .collect::<Result<_, _>>()
-                        .map_err(|e| bad(line, e))?;
-                } else if let Some(v) = line.strip_prefix("# decode_pos\t") {
-                    decode_pos = Some(v.parse().map_err(|e| bad(line, e))?);
-                } else if let Some(v) = line.strip_prefix("# flags\t") {
-                    let mut args = v.split_whitespace();
-                    if args.by_ref().any(|a| a == "-c") {
-                        ctx = Some(
-                            args.next()
-                                .unwrap_or("")
-                                .parse()
-                                .map_err(|e| bad(line, e))?,
-                        );
-                    }
-                }
-            }
-            let ctx = ctx.ok_or_else(|| format!("{}: no -c in # flags", path.display()))?;
-            if tokens.is_empty() {
-                return Err(format!("{} has no # tokens line", path.display()).into());
-            }
-            Ok(Header {
-                tokens,
-                decode_pos,
-                ctx,
-            })
-        }
-
-        /// The step the set holds: its first position, its tokens, the tokens
-        /// before it.
-        fn step(&self) -> Result<(u32, &[u32], &[u32]), GateError> {
-            match self.decode_pos {
-                None => Ok((0, &self.tokens[..], &[][..])),
-                Some(p) if p as usize + 1 == self.tokens.len() => {
-                    let at = p as usize;
-                    Ok((p, &self.tokens[at..], &self.tokens[..at]))
-                }
-                Some(p) => Err(format!(
-                    "# decode_pos {p} is not the last of the {} tokens",
-                    self.tokens.len()
-                )
-                .into()),
-            }
-        }
-    }
-
-    /// Each input row's first toucher, from the manifest's file order: the
-    /// dumper writes a state input right before the node that first touches
-    /// it, which may read it (a `CONCAT`) or write into it (a `SET_ROWS`
-    /// destination, in no source column).
-    struct FirstTouch(HashMap<(String, u32), (String, u32)>);
-
-    impl FirstTouch {
-        fn read(dir: &Path) -> Result<FirstTouch, GateError> {
-            let path = dir.join("MANIFEST.tsv");
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let mut pending = Vec::new();
-            let mut map = HashMap::new();
-            for line in text.lines() {
-                let f: Vec<&str> = line.split('\t').collect();
-                let occ = || -> Result<u32, GateError> {
-                    f.get(2)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| format!("{}: {line:?}", path.display()).into())
-                };
-                match f.first() {
-                    Some(&"input") => pending.push((f[1].to_string(), occ()?)),
-                    Some(&"tensor") => {
-                        let by = (f[1].to_string(), occ()?);
-                        for key in pending.drain(..) {
-                            map.insert(key, by.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(FirstTouch(map))
-        }
-
-        /// The input rows node `name`/`occ` touches first — a state and the
-        /// integer rows that index it can share a first toucher.
-        fn inputs_of<'m>(&self, man: &'m RefManifest, name: &str, occ: u32) -> Vec<&'m RefRow> {
-            man.inputs
-                .iter()
-                .filter(|r| {
-                    self.0
-                        .get(&(r.name.clone(), r.occurrence))
-                        .is_some_and(|(n, o)| n == name && *o == occ)
-                })
-                .collect()
-        }
-    }
-
-    /// A set by name under the data directory, its `# arch` line checked.
-    fn open_set(name: &str) -> Result<RefManifest, GateError> {
-        let man = RefManifest::read(&ref_dir_named(name))?;
-        let want = Arch::Deepseek41.name();
-        if man.arch.as_deref() != Some(want) {
-            return Err(format!("{name}: # arch is {:?}, want {want}", man.arch).into());
-        }
-        Ok(man)
-    }
-
-    /// The tensor row at or after nothing, before `at`, named `name`: the
-    /// last one, with its index.
-    fn last_before<'a>(
-        man: &'a RefManifest,
-        at: usize,
-        name: &str,
-    ) -> Result<(usize, &'a RefRow), GateError> {
-        man.tensors[..at]
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, r)| r.name == name)
-            .ok_or_else(|| format!("no node {name:?} before manifest row {at}").into())
-    }
-
     /// The tensor row `name`/`occ` of op `op`, with its index.
     fn node<'a>(
         man: &'a RefManifest,
@@ -355,10 +151,8 @@ mod gate {
         occ: u32,
         op: &str,
     ) -> Result<(usize, &'a RefRow), GateError> {
-        man.tensors
-            .iter()
-            .enumerate()
-            .find(|(_, r)| r.name == name && r.occurrence == occ)
+        man.tensor_at(name, occ)
+            .ok()
             .filter(|(_, r)| r.op == op)
             .ok_or_else(|| format!("no {op} node {name}/{occ}").into())
     }
@@ -372,64 +166,6 @@ mod gate {
             .rev()
             .find(|r| r.op == "VIEW" && r.ty == "f16" && r.ne == write.ne)
             .ok_or_else(|| format!("no f16 view shaped like {} before it", write.name).into())
-    }
-
-    /// Rows `0 .. rows` of an f16 row as f16 bits: the dump widened each half
-    /// to f32 exactly, so rounding back recovers ik's bits, and a value that
-    /// does not come back is an error.
-    fn f16_all(man: &RefManifest, row: &RefRow) -> Result<Vec<u16>, GateError> {
-        if row.ty != "f16" || row.bytes != 4 * row.count() {
-            return Err(format!(
-                "{}/{} is {} with {} bytes for {} values, want f16 widened to f32",
-                row.name,
-                row.occurrence,
-                row.ty,
-                row.bytes,
-                row.count()
-            )
-            .into());
-        }
-        let path = man.dir.join(row.file_name());
-        let raw = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if raw.len() as u64 != row.bytes {
-            return Err(format!(
-                "{} is {} bytes, the row says {}",
-                path.display(),
-                raw.len(),
-                row.bytes
-            )
-            .into());
-        }
-        raw.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| {
-                let v = f32::from_le_bytes(*c);
-                let h = f32_to_f16_bits(v);
-                if half_to_f32(h).to_bits() == v.to_bits() {
-                    Ok(h)
-                } else {
-                    Err(format!("{} holds {v}, not a widened f16", path.display()).into())
-                }
-            })
-            .collect()
-    }
-
-    /// An F32 tensor of the model file, `want` values.
-    fn split_f32(split: &Split, name: &str, want: usize) -> Result<Vec<f32>, GateError> {
-        let (s, t) = split
-            .find(name)
-            .ok_or_else(|| format!("{name} is not in the model file"))?;
-        if t.ty != GgmlType::F32 || t.dims.iter().product::<u64>() != want as u64 {
-            return Err(format!("{name} is {:?} {:?}, want F32 x {want}", t.ty, t.dims).into());
-        }
-        let g = split.shard(s).ok_or("shard index out of range")?;
-        Ok(g.data(t)?
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect())
     }
 
     // ------------------------------------------------------ host rules
@@ -549,7 +285,11 @@ mod gate {
     /// The YaRN table of each position, `n_dims` values apiece: ours
     /// ([`RopeTable::push`]) or ik's (ggml's recipe filling a `ne0`-value
     /// head's cache, of which the tail reads the first `n_dims`).
-    fn tables(meta: &Meta, pos: &[u32], ik_ne0: Option<usize>) -> Result<Vec<Vec<f32>>, GateError> {
+    fn tables(
+        meta: &RopeMeta<RopeSpec>,
+        pos: &[u32],
+        ik_ne0: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, GateError> {
         let ours = RopeTable::new(&meta.yarn)?;
         Ok(pos
             .iter()
@@ -646,31 +386,6 @@ mod gate {
 
     // -------------------------------------------------------- measures
 
-    /// Ulps between two finite f32, through integers ordered like the
-    /// floats they encode.
-    fn ulps(a: f32, b: f32) -> u32 {
-        let key = |v: f32| {
-            let b = v.to_bits().cast_signed();
-            if b < 0 { i32::MIN - b } else { b }
-        };
-        key(a).abs_diff(key(b))
-    }
-
-    fn max_ulps(a: &[f32], b: &[f32]) -> u32 {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| ulps(x, y))
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn same_bits(a: &[f32], b: &[f32]) -> usize {
-        a.iter()
-            .zip(b)
-            .filter(|(x, y)| x.to_bits() == y.to_bits())
-            .count()
-    }
-
     /// Values of `a` off `b` by more than their band, and the largest
     /// `|a − b| / band`.
     fn over(a: &[f32], b: &[f32], band: &[f64]) -> (usize, f64) {
@@ -720,7 +435,7 @@ mod gate {
         idx: IndexKeyKernels,
         split: Split,
         hp: Hparams,
-        meta: Meta,
+        meta: RopeMeta<RopeSpec>,
         weights: HashMap<String, Weight>,
         sites: u32,
         failed: u32,
@@ -795,7 +510,12 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let split = Split::open(ref_model_path()?)?;
-        let meta = Meta::read(&split)?;
+        let meta = RopeMeta::read(
+            &split,
+            "gate-gpu-ds41-comp",
+            RopeSpec::window,
+            RopeSpec::yarn,
+        )?;
         let hp = Hparams::read(&split)?;
         let gpu = Gpu::new()?;
         let comp = CompressKernels::load(gpu.context())?;
@@ -820,9 +540,9 @@ mod gate {
             failed: 0,
         };
         let cpu = oracle::for_arch(Arch::Deepseek41)?;
-        let mut sets = vec![(cpu.set_name(Set::Cpu)?.to_string(), cpu.open(Set::Cpu)?)];
-        for name in STEP_SETS {
-            sets.push((name.to_string(), open_set(name)?));
+        let mut sets = vec![(cpu.set_name(Set::Cpu)?, cpu.open(Set::Cpu)?)];
+        for &name in cpu.step_sets {
+            sets.push((name, cpu.open_named(name)?));
         }
         for (label, man) in &sets {
             gate_set(&mut cx, label, man)?;
@@ -862,15 +582,19 @@ mod gate {
 
     /// Plan the set's step and gate every source layer in it.
     fn gate_set(cx: &mut Cx, label: &str, man: &RefManifest) -> Result<(), GateError> {
-        let head = Header::read(&man.dir)?;
-        let (pos0, tokens, before) = head.step()?;
-        let planner = Planner::from_file(&cx.split, &cx.hp, head.ctx)?;
+        let (pos0, tokens, before) = man.step()?;
+        let ctx = man.header.ctx.ok_or_else(|| {
+            format!(
+                "{}: no -c in # flags",
+                man.dir.join("MANIFEST.tsv").display()
+            )
+        })?;
+        let planner = Planner::from_file(&cx.split, &cx.hp, ctx)?;
         if planner.stream_ratios().len() != STREAMS.len() {
             return Err(format!("the file has streams {:?}", planner.stream_ratios()).into());
         }
         let mut plan = StepPlan::default();
         planner.plan_into(tokens, pos0, before, &mut plan)?;
-        let touch = FirstTouch::read(&man.dir)?;
         let mut layers = Vec::new();
         for (at, r) in man.tensors.iter().enumerate() {
             let layer = r
@@ -888,7 +612,7 @@ mod gate {
             man.dir.display(),
             man.build.as_deref().unwrap_or("-"),
             plan.len(),
-            head.ctx,
+            ctx,
             list(&layers.iter().map(|&(_, l)| l).collect::<Vec<_>>())
         );
         for (at, layer) in layers {
@@ -911,15 +635,15 @@ mod gate {
                 )
                 .into());
             }
-            let (_, x_row) = last_before(man, at, kv_row.src1.as_deref().ok_or("no src1")?)?;
-            let ring_after = if r > 1 {
-                let (_, k) = node(
+            let (_, x_row) = man.last_before(at, kv_row.src1.as_deref())?;
+            let persist = if r > 1 {
+                let k = node(
                     man,
                     &format!("{tag}_k_state_persist-{layer}"),
                     0,
                     "SET_ROWS",
                 )?;
-                let (_, s) = node(
+                let s = node(
                     man,
                     &format!("{tag}_score_state_persist-{layer}"),
                     0,
@@ -929,29 +653,20 @@ mod gate {
             } else {
                 None
             };
-            let ring = match (ring_after, score_row) {
-                (Some((k_after, s_after)), Some(score)) => {
+            let ring_after = persist.map(|((_, k), (_, s))| (k, s));
+            let ring = match (persist, score_row) {
+                (Some(((k_after, _), (s_after, _))), Some(score)) => {
                     // The ring is the f32 input of its shape the source CONCAT
                     // touches first, or the persist when no group completes.
                     let ring_ne = [compress::WIDTH as u64, r as u64, 1, 1];
                     let is_ring = |i: &&RefRow| i.ty == "f32" && i.ne == ring_ne;
-                    let first = |concat: &str, src1: &str, persist: &RefRow| {
-                        let by_concat = man.tensors.iter().find(|t| {
+                    let first = |concat: &str, src1: &str, persist: usize| {
+                        let by_concat = man.tensors.iter().position(|t| {
                             t.op == "CONCAT" && t.name == concat && t.src1.as_deref() == Some(src1)
                         });
                         by_concat
-                            .and_then(|c| {
-                                touch
-                                    .inputs_of(man, &c.name, c.occurrence)
-                                    .into_iter()
-                                    .find(is_ring)
-                            })
-                            .or_else(|| {
-                                touch
-                                    .inputs_of(man, &persist.name, persist.occurrence)
-                                    .into_iter()
-                                    .find(is_ring)
-                            })
+                            .and_then(|c| man.first_touched_by(c).into_iter().find(is_ring))
+                            .or_else(|| man.first_touched_by(persist).into_iter().find(is_ring))
                     };
                     match (
                         first(&format!("{tag}_source_kv"), &kv_row.name, k_after),
@@ -973,7 +688,7 @@ mod gate {
                 ratio: r,
                 max_groups: t.div_ceil(r),
                 tokens: t,
-                rows: usize::try_from(head.ctx)?.div_ceil(r),
+                rows: usize::try_from(ctx)?.div_ceil(r),
             };
             let src = Source {
                 layer,
@@ -1439,8 +1154,8 @@ mod gate {
             let (at_pool, pooled) = chain?;
             let (_, normed) = node(man, &pooled.name, 1, "FUSED_RMS_NORM")?;
             let (_, roped) = node(man, &pooled.name, 2, "ROPE")?;
-            let (_, src_kv) = last_before(man, at_pool, pooled.src0.as_deref().ok_or("no src0")?)?;
-            let (_, src_sc) = last_before(man, at_pool, pooled.src1.as_deref().ok_or("no src1")?)?;
+            let (_, src_kv) = man.last_before(at_pool, pooled.src0.as_deref())?;
+            let (_, src_sc) = man.last_before(at_pool, pooled.src1.as_deref())?;
             let (at_write, write) = node(man, &format!("{tag}_k_write-{layer}"), 0, "SET_ROWS")?;
             let before = cache_before(man, at_write)?;
             let d_pool = ref_tensor_logical_in(&man.dir, pooled)?;
@@ -1514,8 +1229,8 @@ mod gate {
             }
             let norm_same = same_bits(&sim_norm, &d_norm);
             let rope_same = same_bits(&sim_rope, &d_rope);
-            let ik_after = f16_all(man, write)?;
-            let ik_before = f16_all(man, before)?;
+            let ik_after = widened_f16_rows_in(&man.dir, write)?;
+            let ik_before = widened_f16_rows_in(&man.dir, before)?;
             let lands = ik_after.len() == geom.rows * width
                 && ik_before.len() == ik_after.len()
                 && (0..geom.rows).all(|w| {
@@ -1657,10 +1372,10 @@ mod gate {
     impl<'a> IdxChain<'a> {
         fn read(man: &'a RefManifest, layer: usize, tag: &str) -> Result<IdxChain<'a>, GateError> {
             let (at_h, hada) = node(man, &format!("lid_k_new-{layer}"), 0, "HADAMARD")?;
-            let (at_r, rope) = last_before(man, at_h, hada.src0.as_deref().ok_or("no src0")?)?;
-            let (at_s, shaped) = last_before(man, at_r, rope.src0.as_deref().ok_or("no src0")?)?;
-            let (at_n, norm) = last_before(man, at_s, shaped.src0.as_deref().ok_or("no src0")?)?;
-            let (_, mm) = last_before(man, at_n, norm.src0.as_deref().ok_or("no src0")?)?;
+            let (at_r, rope) = man.last_before(at_h, hada.src0.as_deref())?;
+            let (at_s, shaped) = man.last_before(at_r, rope.src0.as_deref())?;
+            let (at_n, norm) = man.last_before(at_s, shaped.src0.as_deref())?;
+            let (_, mm) = man.last_before(at_n, norm.src0.as_deref())?;
             let (at_w, write) = node(man, &format!("lid_k_write-{layer}"), 0, "SET_ROWS")?;
             let before = cache_before(man, at_w)?;
             let want_mm = (
@@ -1809,8 +1524,8 @@ mod gate {
         let norm_same = same_bits(&sim_norm, &d_norm);
         let rope_same = same_bits(&sim_rope, &d_rope);
         let hada_same = same_bits(&sim_hada, &d_hada);
-        let ik_after = f16_all(man, ch.write)?;
-        let ik_before = f16_all(man, ch.before)?;
+        let ik_after = widened_f16_rows_in(&man.dir, ch.write)?;
+        let ik_before = widened_f16_rows_in(&man.dir, ch.before)?;
         let lands = ik_after.len() == geom.rows * w
             && ik_before.len() == ik_after.len()
             && (0..geom.rows).all(|r| {
