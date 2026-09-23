@@ -32,6 +32,19 @@
 # model whose dump pages in more than the machine can share sets it (deepseek41); for a
 # profile that leaves it unset, the environment can. Do not wrap such a run in another flock
 # on the same file: the second lock waits on the first for the full 30 minutes and ends rc 75.
+# A profile's REF_DUMP_ARGS (an array) are added to every dump of that model.
+#
+#   dump.sh             the batch set: every token in one decode, into the profile's set
+#   dump.sh <variant>   one decode step after a quiet prefill (dump_ref.cpp, --decode-step), into the
+#                       set the profile's ref_step_variant names for it, with its context, ids and
+#                       flags (models/deepseek41.sh lists them). CPU only; BLOOMERY_REF_SET still
+#                       renames the destination, BLOOMERY_REF_TOKENS is refused.
+#
+# A decode-step set never takes the name of the profile's batch sets (REF_SET_CPU, REF_SET_CUDA),
+# and the swap never replaces a set of the other kind, told apart by the `# prefill` header line
+# only a decode step writes: a gate of the batch set would read a one-token graph, a gate of the
+# step a batch one. A variant that reads its ids from a file names the file's sha256, and a file
+# that no longer has it is refused before the lease.
 set -euo pipefail
 # MODEL, BLOOMERY_DATA and IK default in ref-paths.sh (BLOOMERY_REF_MODEL, BLOOMERY_DATA and IK
 # override them).
@@ -43,12 +56,55 @@ case $BACKEND in
   cuda) SET=$REF_SET_CUDA; NGL=99; HIDE_CUDA=0 ;;
   *) echo "dump.sh: BLOOMERY_REF_BACKEND must be cpu or cuda, got '$BACKEND'" >&2; exit 2 ;;
 esac
+VARIANT=${1:-}
+CTX=$REF_CTX
+TOKENS_SHA256=
+STEP_ARGS=()
+if [ -z "$VARIANT" ]; then
+  TOKENS=${BLOOMERY_REF_TOKENS:-${REF_TOKENS:-}}
+  [ -n "$TOKENS" ] || { echo "dump.sh: the $MODEL_NAME profile sets no REF_TOKENS" >&2; exit 2; }
+  TOKEN_ARGS=(--tokens "$TOKENS")
+else
+  declare -F ref_step_variant > /dev/null ||
+    { echo "dump.sh: the $MODEL_NAME profile defines no decode-step variants" >&2; exit 2; }
+  [ "$BACKEND" = cpu ] || { echo "dump.sh: decode-step variants are CPU sets, not $BACKEND" >&2; exit 2; }
+  [ -z "${BLOOMERY_REF_TOKENS:-}" ] ||
+    { echo "dump.sh: a variant carries its own ids; unset BLOOMERY_REF_TOKENS" >&2; exit 2; }
+  ref_step_variant "$VARIANT" || { echo "dump.sh: the $MODEL_NAME profile has no variant '$VARIANT'" >&2; exit 2; }
+  SET=$STEP_SET
+  CTX=$STEP_CTX
+  if [ -n "$STEP_TOKENS_FILE" ]; then
+    [ -f "$STEP_TOKENS_FILE" ] || { echo "dump.sh: no ids file at $STEP_TOKENS_FILE" >&2; exit 2; }
+    TOKENS_SHA256=$(sha256sum "$STEP_TOKENS_FILE" | cut -d' ' -f1)
+    [ "$TOKENS_SHA256" = "$STEP_TOKENS_SHA256" ] || {
+      echo "dump.sh: $STEP_TOKENS_FILE has sha256 $TOKENS_SHA256, the $VARIANT variant names $STEP_TOKENS_SHA256" >&2
+      echo "  (the ids are what the set is of; update the profile only if the new file is meant)" >&2
+      exit 2
+    }
+    TOKEN_ARGS=(--tokens-file "$STEP_TOKENS_FILE" --tokens-count $((STEP_PREFILL + 1)))
+  else
+    n=$(tr ',' '\n' <<< "$STEP_TOKENS" | grep -c . || true)
+    [ "$n" = $((STEP_PREFILL + 1)) ] ||
+      { echo "dump.sh: the $VARIANT variant lists $n ids for a prefill of $STEP_PREFILL" >&2; exit 2; }
+    TOKEN_ARGS=(--tokens "$STEP_TOKENS")
+  fi
+  STEP_ARGS=(--decode-step "${STEP_ARGS[@]}")
+fi
 # Output-set override: the backend still picks the offload depth and CUDA visibility,
 # BLOOMERY_REF_SET only renames the destination (e.g. ref_cuda_v2), so an instrumented
 # dumper can produce a second set beside the one the gates read without touching it.
 SET=${BLOOMERY_REF_SET:-$SET}
-TOKENS=${BLOOMERY_REF_TOKENS:-${REF_TOKENS:-}}
-[ -n "$TOKENS" ] || { echo "dump.sh: the $MODEL_NAME profile sets no REF_TOKENS" >&2; exit 2; }
+case $SET in
+  bin|*/*|.*|*.staging|*.old|'') echo "dump.sh: '$SET' cannot name a set" >&2; exit 2 ;;
+esac
+if [ -n "$VARIANT" ] && { [ "$SET" = "$REF_SET_CPU" ] || [ "$SET" = "$REF_SET_CUDA" ]; }; then
+  echo "dump.sh: '$SET' is the $MODEL_NAME profile's batch set; a decode step goes into a set of its own" >&2
+  exit 2
+fi
+if [ -n "$VARIANT" ]; then
+  echo "dump.sh: $VARIANT — quiet prefill of $STEP_PREFILL, decode step at position $STEP_PREFILL, -c $CTX," \
+    "into $SET; ${TOKEN_ARGS[*]}${TOKENS_SHA256:+ (sha256 $TOKENS_SHA256)} ${STEP_ARGS[*]}"
+fi
 LEASE=${REF_DUMP_LEASE:-0}
 BIN="$BLOOMERY_DATA/bin/dump_ref"
 [ -x "$BIN" ] || { echo "no dump_ref at $BIN — run: just build-ref-dump" >&2; exit 2; }
@@ -94,8 +150,9 @@ mkdir -p "$STAGE"
 BUILD=$(git -C "$IK" rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
-BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" \
-  "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" --tokens "$TOKENS" -ngl "$NGL" -c "$REF_CTX" -t 32
+BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
+  "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" "${TOKEN_ARGS[@]}" -ngl "$NGL" -c "$CTX" -t 32 \
+    "${REF_DUMP_ARGS[@]}" "${STEP_ARGS[@]}"
 if [ "$LEASE" = 1 ]; then witness post-dump; fi
 
 # The trailer is the dumper's completion proof; without it the staged set is not installed.
@@ -108,11 +165,19 @@ grep -q '^# complete' "$STAGE/MANIFEST.tsv" || {
 # replace the set every gate of that other model reads. Compared by the basename of the
 # `# model` line, which every manifest carries.
 model_of() { awk -F'\t' '$1 == "# model" { n = split($2, p, "/"); print p[n]; exit }' "$1"; }
+kind_of() { if grep -q $'^# prefill\t' "$1"; then echo decode-step; else echo batch; fi; }
 if [ -f "$REF/MANIFEST.tsv" ]; then
   was=$(model_of "$REF/MANIFEST.tsv")
   now=$(model_of "$STAGE/MANIFEST.tsv")
   if [ "$was" != "$now" ]; then
     echo "dump.sh: $REF holds a set of $was and this dump is of $now — not replacing it" >&2
+    echo "  (the staged set stays in $STAGE; move the old set away or pick another BLOOMERY_REF_SET)" >&2
+    exit 1
+  fi
+  was=$(kind_of "$REF/MANIFEST.tsv")
+  now=$(kind_of "$STAGE/MANIFEST.tsv")
+  if [ "$was" != "$now" ]; then
+    echo "dump.sh: $REF holds a $was set and this dump is a $now set — not replacing it" >&2
     echo "  (the staged set stays in $STAGE; move the old set away or pick another BLOOMERY_REF_SET)" >&2
     exit 1
   fi
@@ -124,3 +189,7 @@ rm -rf "$REF.old"
 grep -c '^tensor' "$REF/MANIFEST.tsv" | xargs echo "reference tensors:"
 echo "graph inputs: $(grep -c $'^input\t' "$REF/MANIFEST.tsv" || true)  integer twins: $(grep -c $'^int\t' "$REF/MANIFEST.tsv" || true)"
 echo "build: $BUILD  backend: $BACKEND  set: $REF"
+if [ -n "$VARIANT" ]; then
+  echo "decode step: variant $VARIANT, prefill $STEP_PREFILL, position $STEP_PREFILL, -c $CTX;" \
+    "$(grep -c $'^skip-input\t.*\tgraph-scratch$' "$REF/MANIFEST.tsv" || true) graph-scratch leaves"
+fi

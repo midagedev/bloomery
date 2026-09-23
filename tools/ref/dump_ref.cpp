@@ -56,15 +56,49 @@
 // The tensor readers parse `tensor` rows only, so `int`, `input` and `skip-input` rows are
 // invisible to them, and the `# complete <written> <skipped>` trailer counts nodes only.
 //
+// `--decode-step` dumps one decode step instead of a batch. Every token but the last is a quiet
+// prefill: the callback wants no node, so the scheduler runs each split as one graph with the
+// fusions ik uses in serving, and nothing is written. Then the last token alone, a batch of one at
+// its position, is dumped as above, its occurrence counters starting at zero. The caches the step
+// reads hold the fused arithmetic. It rounds differently from a dumped prefill, the router's top-k
+// turns that into other expert choices, and so those caches drift from a dumped prefill's with
+// depth; the step's rows are consistent with the caches it read, and so is a gate that takes its
+// inputs from this set. `--prefill-every-node` runs the prefill under the dumped schedule instead —
+// every node asked for and computed alone, nothing written — so the caches carry a dumped
+// prefill's arithmetic.
+//
+// Those caches — KV cells, compressed rows, index keys, compressor states — are leaves the host
+// never fills and that carry no INPUT flag, so in this mode a second rule writes them as `input`
+// rows too, at their first reader, before the step can change them: a leaf that is neither a
+// weight nor in a buffer one of the step's own nodes lives in. A leaf in such a buffer is graph
+// scratch with no defined contents (a shape template), and gets a `skip-input` row instead. Such
+// a leaf's `leaf_<n>` name is its position in the graph that first named it, so the same name can
+// be a cache in one set and a template in another; the src columns say which tensor reads it.
+//
+// The header records the command line (`# flags`), and in a decode step the prefill length, the
+// decode position, the prefill's schedule and whether ik's fused indexer top-k op was on
+// (`--no-fused-idx-topk` turns it off, so its scores are nodes). `# tokens` is always the whole
+// sequence; in a decode step its last `# tokens` id is the step's `inp_tokens`.
+//
+// `--tokens-file <path>` reads the ids from a file instead, one decimal id per line, the first
+// `--tokens-count` of them; the header names the file, its sha256 (BLOOMERY_REF_TOKENS_SHA256,
+// which dump.sh computes) and the count.
+//
 // Build: tools/ref/build-dump.sh   Run: $BLOOMERY_DATA/bin/dump_ref -m <gguf> --tokens 1,2,3
 
 #include "common.h"
 #include "llama.h"
 #include "ggml.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cinttypes>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <set>
 #include <string>
@@ -84,6 +118,13 @@ struct dump_ctx {
     int                           skipped = 0;
     int                           inputs  = 0;
     int                           twins   = 0;
+    // Decode step only.
+    bool                             quiet        = false;  // the prefill: nothing written
+    bool                             quiet_every_node = false;  // ... and every node computed alone
+    bool                             state_inputs = false;  // persistent leaves are input rows too
+    std::set<ggml_backend_buffer_t>  node_bufs;             // buffers the step's own nodes live in
+    int                              state   = 0;           // leaves written as input rows by that rule
+    int                              scratch = 0;           // leaves it found to be graph scratch
 };
 
 // Tensor names carry '/' and '.' in some graphs; keep the file name a single path element.
@@ -283,19 +324,61 @@ static bool dump_one(dump_ctx * d, const ggml_tensor * t, bool input) {
     return true;
 }
 
+// A leaf the host does not fill that is not a weight: in a decode step, the persistent state the
+// step reads (a cache or a compressor state), or graph scratch — which dump_state tells apart.
+// Scheduler copies carry OUTPUT, as for graph inputs, and are left alone.
+static bool is_state_leaf(const ggml_tensor * s) {
+    return s && s->op == GGML_OP_NONE && !(s->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) &&
+           s->buffer && ggml_backend_buffer_get_usage(s->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+// A leaf in a buffer where one of the step's own nodes lives was allocated with the graph: it has no
+// contents before the graph writes them, so it gets a `skip-input` row. Any other is persistent
+// state and is written as an input row. The graph allocator places every non-view node, so the
+// first node of the step (the token embedding lookup) names that buffer before any leaf is seen;
+// a leaf seen before any such node cannot be classified, and the dump stops.
+static bool dump_state(dump_ctx * d, const ggml_tensor * s) {
+    const char * name = s->name[0] ? s->name : "(unnamed)";
+    if (d->node_bufs.empty()) {
+        fprintf(stderr, "dump_ref: leaf %s is read before any graph-allocated node — cannot tell state from scratch\n",
+                name);
+        return false;
+    }
+    if (d->node_bufs.count(s->buffer)) {
+        fprintf(d->manifest, "skip-input\t%s\t%d\t%s\tgraph-scratch\n", name, d->seen_input[name]++,
+                ggml_type_name(s->type));
+        d->scratch++;
+        return true;
+    }
+    const int inputs = d->inputs;
+    if (!dump_one(d, s, true)) return false;
+    d->state += d->inputs - inputs;  // a quantized or unhandled leaf is a skip-input row, not an input
+    return true;
+}
+
 static int on_tensor(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * d = (dump_ctx *) user_data;
+    if (d->quiet) {
+        // Fused: no node is wanted, so the scheduler runs each split as one graph and never calls
+        // back after a compute. Every node: each is wanted, computed alone, and let pass.
+        return d->quiet_every_node ? 1 : 0;
+    }
     if (d->failed) {
         // Asked: yes, so the scheduler computes this node and calls back, and that call
         // stops the graph. The set is not installed either way: main writes no trailer.
         return ask ? 1 : 0;
     }
     if (ask) {
+        if (d->state_inputs && !t->view_src && t->buffer) d->node_bufs.insert(t->buffer);
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             const ggml_tensor * s = t->src[j];
             if (s && s->op == GGML_OP_NONE && (s->flags & GGML_TENSOR_FLAG_INPUT) &&
                 !(s->flags & GGML_TENSOR_FLAG_OUTPUT) && d->inputs_done.insert(s).second &&
                 !dump_one(d, s, true)) {
+                d->failed = true;
+                break;
+            }
+            if (d->state_inputs && is_state_leaf(s) && d->inputs_done.insert(s).second && !dump_state(d, s)) {
                 d->failed = true;
                 break;
             }
@@ -321,11 +404,79 @@ static void report_unhandled(const dump_ctx & d) {
     fprintf(stderr, "dump_ref: %d tensors skipped as unhandled: %s\n", total, types.empty() ? "none" : types.c_str());
 }
 
+// One decimal token id per line, the format engram-corpus.sh writes and router_trace reads: the
+// first `count` ids, or every line for a negative count. A shorter file is an error, not a shorter
+// set — a decode step at another position is another set.
+static bool read_token_file(const std::string & path, long long count, std::vector<llama_token> & ids) {
+    std::ifstream in(path);
+    if (!in) {
+        fprintf(stderr, "dump_ref: cannot read %s\n", path.c_str());
+        return false;
+    }
+    std::string line;
+    long long   lines = 0;
+    while ((count < 0 || (long long) ids.size() < count) && std::getline(in, line)) {
+        ++lines;
+        char * end = nullptr;
+        errno = 0;
+        const long v = strtol(line.c_str(), &end, 10);
+        if (line.empty() || *end != '\0' || errno != 0 || v < 0 || v > INT32_MAX) {
+            fprintf(stderr, "dump_ref: %s:%lld is not a token id: '%s'\n", path.c_str(), lines, line.c_str());
+            return false;
+        }
+        ids.push_back((llama_token) v);
+    }
+    if (count >= 0 && (long long) ids.size() < count) {
+        fprintf(stderr, "dump_ref: %s holds %zu token ids and --tokens-count asks for %lld\n", path.c_str(),
+                ids.size(), count);
+        return false;
+    }
+    return true;
+}
+
+static double seconds_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// The quiet prefill of every token but the last, in calls of at most n_batch tokens (the most one
+// llama_decode takes), then the dumped step: the last token alone at its position.
+static int run_decode_step(llama_context * ctx, std::vector<llama_token> & tokens, dump_ctx & d) {
+    const int n_prefill = (int) tokens.size() - 1;
+    const int n_batch   = (int) llama_n_batch(ctx);
+    const auto t0 = std::chrono::steady_clock::now();
+    d.quiet = true;
+    for (int p0 = 0; p0 < n_prefill; p0 += n_batch) {
+        const int n  = std::min(n_batch, n_prefill - p0);
+        const int rc = llama_decode(ctx, llama_batch_get_one(tokens.data() + p0, n, p0, 0));
+        if (rc) {
+            fprintf(stderr, "dump_ref: the quiet prefill failed at token %d (llama_decode returned %d)\n", p0, rc);
+            return rc;
+        }
+    }
+    d.quiet = false;
+    fprintf(stderr, "dump_ref: quiet prefill of %d tokens in %.1f s\n", n_prefill, seconds_since(t0));
+    d.state_inputs = true;
+    const auto t1 = std::chrono::steady_clock::now();
+    const int rc = llama_decode(ctx, llama_batch_get_one(tokens.data() + n_prefill, 1, n_prefill, 0));
+    fprintf(stderr, "dump_ref: decode step at position %d dumped in %.1f s\n", n_prefill, seconds_since(t1));
+    return rc;
+}
+
 int main(int argc, char ** argv) {
-    // --tokens and --expect-arch are ours; everything else is gpt_params. Pull them out
+    // The whole command line for the manifest, taken before the --tokens list is split in place.
+    std::string flags;
+    for (int i = 1; i < argc; ++i) flags += (i > 1 ? " " : "") + std::string(argv[i]);
+
+    // --tokens, --tokens-file, --tokens-count, --decode-step, --prefill-every-node,
+    // --no-fused-idx-topk and --expect-arch are ours; everything else is gpt_params. Pull them out
     // before the parser sees them.
     std::vector<llama_token> tokens;
     std::string              expect_arch;
+    std::string              tokens_file;
+    long long                tokens_count = -1;
+    bool                     decode_step  = false;
+    bool                     prefill_every_node = false;
+    bool                     unfused_topk = false;
     std::vector<char *>      passthrough;
     passthrough.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
@@ -334,11 +485,35 @@ int main(int argc, char ** argv) {
             for (char * p = strtok(list, ","); p; p = strtok(nullptr, ",")) {
                 tokens.push_back((llama_token) atoi(p));
             }
+        } else if (strcmp(argv[i], "--tokens-file") == 0 && i + 1 < argc) {
+            tokens_file = argv[++i];
+        } else if (strcmp(argv[i], "--tokens-count") == 0 && i + 1 < argc) {
+            tokens_count = std::max(0LL, atoll(argv[++i]));  // 0 is refused below
+        } else if (strcmp(argv[i], "--decode-step") == 0) {
+            decode_step = true;
+        } else if (strcmp(argv[i], "--prefill-every-node") == 0) {
+            prefill_every_node = true;
+        } else if (strcmp(argv[i], "--no-fused-idx-topk") == 0) {
+            unfused_topk = true;
         } else if (strcmp(argv[i], "--expect-arch") == 0 && i + 1 < argc) {
             expect_arch = argv[++i];
         } else {
             passthrough.push_back(argv[i]);
         }
+    }
+    if (!tokens_file.empty()) {
+        if (!tokens.empty()) {
+            fprintf(stderr, "dump_ref: --tokens and --tokens-file are exclusive\n");
+            return 2;
+        }
+        if (tokens_count == 0) {
+            fprintf(stderr, "dump_ref: --tokens-count must be positive\n");
+            return 2;
+        }
+        if (!read_token_file(tokens_file, tokens_count, tokens)) return 2;
+    } else if (tokens_count >= 0) {
+        fprintf(stderr, "dump_ref: --tokens-count reads from --tokens-file; --tokens takes the list as given\n");
+        return 2;
     }
     if (tokens.empty()) {
         fprintf(stderr, "dump_ref: --tokens <id,id,...> is required; this tool does not tokenize\n");
@@ -348,12 +523,26 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "dump_ref: --expect-arch <general.architecture> is required; a set is one architecture's\n");
         return 2;
     }
+    if (decode_step && tokens.size() < 2) {
+        fprintf(stderr, "dump_ref: --decode-step needs a prefill: at least two tokens\n");
+        return 2;
+    }
+    if (prefill_every_node && !decode_step) {
+        fprintf(stderr, "dump_ref: --prefill-every-node is a --decode-step option\n");
+        return 2;
+    }
 
     gpt_params params;
     if (!gpt_params_parse((int) passthrough.size(), passthrough.data(), params)) {
         fprintf(stderr, "dump_ref: bad arguments\n");
         return 2;
     }
+    // Checked before the loader pages anything in; the context's own n_ctx is checked again below.
+    if (decode_step && params.n_ctx > 0 && tokens.size() > (size_t) params.n_ctx) {
+        fprintf(stderr, "dump_ref: %zu tokens do not fit in -c %d\n", tokens.size(), params.n_ctx);
+        return 2;
+    }
+    if (unfused_topk) params.fused_idx_topk = false;
 
     // This binary's side effect IS the oracle. Running it for any other reason -- under a
     // debugger to breakpoint into an ik kernel, say -- overwrites 1155 files that every
@@ -433,6 +622,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "dump_ref: failed to load the model\n");
         return 1;
     }
+    if (decode_step && tokens.size() > (size_t) llama_n_ctx(init.context)) {
+        fprintf(stderr, "dump_ref: %zu tokens do not fit in n_ctx %u\n", tokens.size(), llama_n_ctx(init.context));
+        return 2;
+    }
 
     // Which model this is, from the file rather than from the path: the architecture the
     // loader dispatched on, and the file's own name, which survives a moved directory.
@@ -445,11 +638,40 @@ int main(int argc, char ** argv) {
     fprintf(d.manifest, "# model_file\t%s\n", slash ? slash + 1 : params.model.c_str());
     fprintf(d.manifest, "# tokens\t");
     for (size_t i = 0; i < tokens.size(); ++i) fprintf(d.manifest, "%s%d", i ? "," : "", tokens[i]);
-    fprintf(d.manifest, "\n# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n");
+    fprintf(d.manifest, "\n# flags\t%s\n", flags.c_str());
+    if (!tokens_file.empty()) {
+        const char * sha = getenv("BLOOMERY_REF_TOKENS_SHA256");
+        fprintf(d.manifest, "# tokens_file\t%s\n", tokens_file.c_str());
+        fprintf(d.manifest, "# tokens_file_sha256\t%s\n", sha && *sha ? sha : "unknown");
+        fprintf(d.manifest, "# tokens_count\t%zu\n", tokens.size());
+    }
+    if (decode_step) {
+        const size_t n_prefill = tokens.size() - 1;
+        fprintf(d.manifest, "# prefill\t%zu\n", n_prefill);
+        fprintf(d.manifest, "# decode_pos\t%zu\n", n_prefill);
+        if (prefill_every_node) {
+            fprintf(d.manifest, "# prefill_schedule\tevery-node — each node was asked for and computed alone, the "
+                                "dumped schedule, and nothing was written: the caches the step reads carry a dumped "
+                                "prefill's arithmetic\n");
+        } else {
+            fprintf(d.manifest, "# prefill_schedule\tfused — no node was asked for, so each split ran as one graph "
+                                "with ik's serving fusions: it rounds differently from a dumped prefill, the router's "
+                                "top-k turns that into other expert choices, and the caches the step reads drift from "
+                                "a dumped prefill's with depth; this set's rows are consistent with those caches\n");
+        }
+        fprintf(d.manifest, "# state_inputs\tpersistent leaves the step reads (caches, compressor states) are "
+                            "input rows, written at their first reader before the step changes them; graph "
+                            "scratch leaves are skip-input rows\n");
+    }
+    if (decode_step || unfused_topk) fprintf(d.manifest, "# fused_idx_topk\t%d\n", params.fused_idx_topk ? 1 : 0);
+    fprintf(d.manifest, "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n");
     fprintf(d.manifest, "# int\tname\toccurrence\tof\ttype\ttwin\tlayout\tcount\tbytes\tsum\tabsmax\tfile\n");
     fprintf(d.manifest, "# input\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n");
 
-    const int rc = llama_decode(init.context, llama_batch_get_one(tokens.data(), (int) tokens.size(), 0, 0));
+    d.quiet_every_node = prefill_every_node;
+    const int rc = decode_step
+        ? run_decode_step(init.context, tokens, d)
+        : llama_decode(init.context, llama_batch_get_one(tokens.data(), (int) tokens.size(), 0, 0));
     report_unhandled(d);
     if (rc) {
         fprintf(stderr, "dump_ref: decode failed\n");
@@ -473,6 +695,10 @@ int main(int argc, char ** argv) {
     }
     printf("dump_ref: wrote %d tensors, skipped %d, %d graph inputs, %d integer twins, into %s\n",
            d.written, d.skipped, d.inputs, d.twins, d.dir.c_str());
+    if (decode_step) {
+        printf("dump_ref: decode step at position %zu: %d of the graph inputs are persistent state, %d leaves were "
+               "graph scratch\n", tokens.size() - 1, d.state, d.scratch);
+    }
     llama_free(init.context);
     llama_free_model(init.model);
     llama_backend_free();

@@ -350,9 +350,11 @@ dump-ref-cuda:
     ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
 
 # V4.1 오라클(B0c): 같은 계측기를 deepseek41 프로필로 돌려 $BLOOMERY_DATA/ref_deepseek41/에 쓴다. CPU 백엔드만
-# 쓰지만 NVMe에서 ~477 GB를 읽어 page cache를 통째로 뒤집는다 — V4.1을 읽는 트랙이 없는 틈에 리드가 친다.
-dump-ref-v41:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump.sh'
+# 쓴다. 프로필의 --defer-experts가 파일 세트 전체의 populate를 건너뛰어 그래프가 닿는 것만 읽는다(page cache가
+# 찬 상태에서 1.27 GB; 콜드 읽기량은 재지 않았다). VARIANT(step4, d1, d2와 접미사 -unfused, -every-node)는
+# 조용한 프리필 뒤 디코드 한 스텝을 자기 세트에 덤프한다 — models/deepseek41.sh.
+dump-ref-v41 *VARIANT:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
 # 오라클 세트의 정수 사본 검사(B0c): 정수 텐서마다 무손실 사본이 있고, f32 파일이 그 값의 RNE인가.
 # 인자는 세트 디렉터리(기본 $BLOOMERY_DATA/ref). V2-Lite의 ref는 v1이라 사본이 없어 빨강이다 — just gate에 넣지 않는다.

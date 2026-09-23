@@ -19,7 +19,8 @@ the two hold the same tensor. Per set it requires:
     Up to 2^24 in magnitude that is plain equality; above it, it is the cast the dumper made,
     and those elements are counted in the ok line: they are where the f32 file alone cannot
     back an exact gate;
-  - an `inp_tokens` input, when the set has one, equal to the `# tokens` header.
+  - an `inp_tokens` input, when the set has one, equal to the `# tokens` header — past its first
+    `# prefill` ids in a decode-step set, whose graph evaluated only the step.
 
 Exit 0 with one ok line per set, 1 with every failure listed. --self-test builds small sets in
 a temp directory around 2^24 and 384,006,168 (V4.1's largest engram row id) and requires green
@@ -166,9 +167,12 @@ def check_set(d: str):
     tok = values.get((("input", "inp_tokens", 0), "flat"))
     if tok is not None:
         want = [int(t) for t in header.get("tokens", "").split(",") if t]
-        if list(tok) != want:
-            fails.append(f"inp_tokens {list(tok)} != # tokens {want}")
-        tokens_note = f"inp_tokens = # tokens ({len(want)} ids)"
+        prefill = int(header.get("prefill", "0"))
+        if list(tok) != want[prefill:]:
+            fails.append(f"inp_tokens {list(tok)} != # tokens {want}" if not prefill else
+                         f"inp_tokens {list(tok)} != # tokens past the prefill of {prefill}: {want[prefill:]}")
+        tokens_note = (f"inp_tokens = # tokens ({len(want)} ids)" if not prefill else
+                       f"inp_tokens = # tokens past the prefill of {prefill} ({len(want) - prefill} of {len(want)} ids)")
     n_in = sum(1 for r in ints if r["key"][0] == "input")
     ok = (f"{len(ints)} twins ({len(ints) - n_in} of tensors, {n_in} of inputs), {elements} elements, "
           f"{above} above 2^24; {tokens_note}")
@@ -191,10 +195,12 @@ def run(dirs) -> int:
 
 # ------------------------------------------------------------------------------ self-test
 
-def write_set(d, tensors, tokens, drop_int=(), f32_patch=None):
+def write_set(d, tensors, tokens, drop_int=(), f32_patch=None, prefill=None):
     """A minimal set: tensors = [(kind, name, type, flat values, logical values or None)]."""
     lines = ["# dump_ref — check-int-twins self-test", "# model\tself-test",
              "# tokens\t" + ",".join(map(str, tokens))]
+    if prefill is not None:
+        lines.append(f"# prefill\t{prefill}")
     for kind, name, ty, flat, logical in tensors:
         stem = f"{safe_name(name)}.0" + (".input" if kind == "input" else "")
         twin = "i64" if ty == "i64" else "i32"
@@ -240,6 +246,9 @@ def self_test() -> int:
         ("missing flat twin row", {"drop_int": {("ids", "flat")}}, True),
         ("missing logical twin row", {"drop_int": {("rows64 (view)", "logical")}}, True),
         ("tokens header differs", {"tokens": [5, 7]}, True),
+        ("decode step: inp_tokens = the ids past the prefill", {"tokens": [9, 5, 6], "prefill": 1}, False),
+        ("decode step: prefill line one short", {"tokens": [9, 5, 6], "prefill": 0}, True),
+        ("decode step: prefill line missing", {"tokens": [9, 5, 6]}, True),
     ]
     for label, kw, want_red in cases:
         with tempfile.TemporaryDirectory() as d:
