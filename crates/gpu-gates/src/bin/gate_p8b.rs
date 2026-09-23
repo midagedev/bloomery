@@ -50,8 +50,8 @@ use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 use bloomery_gpu_gates::oracle::deepseek2::L_OUT_0;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    GateError, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir, ref_manifest,
-    ref_tensor_logical_in, route_ref, topk_ids_logical, verdict, widened_f16_bits,
+    GateError, RefManifest, max_rel_err, open_model, ref_dir, ref_tensor_logical_in, route_ref,
+    topk_ids_logical_in, verdict, widened_f16_bits,
 };
 
 /// The layer this gate assembles — the first MoE block of the model.
@@ -120,8 +120,7 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), GateError> {
     let mut ok = true;
     let gguf = open_model()?;
-    let man = ref_manifest()?;
-    let dir = ref_dir();
+    let man = RefManifest::read(&ref_dir())?;
     let mut model = Deepseek2Model::load_blocks(&gguf, CTX_MAX, LAYER..LAYER + 1)?;
     println!(
         "resident stage_bytes={} ctx_max={CTX_MAX} m=1 layer={LAYER}",
@@ -130,7 +129,7 @@ fn run() -> Result<(), GateError> {
 
     // The layer's input residual is the previous block's output: the dump's
     // own `l_out-0`, one column per token.
-    let lo0_row = find_ref_row_in(&dir, &man, L_OUT_0, 0)?;
+    let lo0_row = man.tensor(L_OUT_0, 0)?;
     if lo0_row.ty != "f32" || lo0_row.op != "ADD" || lo0_row.ne[1] != M_TOKENS as u64 {
         return Err(format!(
             "gate_p8b: l_out-0 is {} {} {:?}, want f32 ADD with {M_TOKENS} token columns",
@@ -139,13 +138,13 @@ fn run() -> Result<(), GateError> {
         .into());
     }
     let hidden = lo0_row.ne[0] as usize;
-    let l_out0 = ref_tensor_logical_in(&dir, lo0_row)?;
+    let l_out0 = ref_tensor_logical_in(&man.dir, lo0_row)?;
     let column = |t: usize| l_out0[t * hidden..(t + 1) * hidden].to_vec();
 
     // This layer's own cache rows for tokens 0..4, the way gate_p8 seeds
     // layer 0's: the last token's attention then reads exactly the keys ik's
     // did, and the tap table measures this step's ops alone.
-    let ik_cache = find_ref_row(&man, &format!("kv_cache-{LAYER}"), 0)?;
+    let ik_cache = man.tensor(&format!("kv_cache-{LAYER}"), 0)?;
     if ik_cache.ty != "f16" || ik_cache.op != "VIEW" || ik_cache.ne != [576, 256, 1, 1] {
         return Err(format!(
             "gate_p8b: kv_cache-{LAYER} is {} {} {:?}, want VIEW f16 [576, 256]",
@@ -206,9 +205,9 @@ fn run() -> Result<(), GateError> {
                 tap.op
             );
         }
-        let row = find_ref_row_in(&dir, &man, &tap.name(), tap.occurrence)?;
+        let row = man.tensor(&tap.name(), tap.occurrence)?;
         block::check_row(row, &tap, M_TOKENS)?;
-        let ref_all = ref_tensor_logical_in(&dir, row)?;
+        let ref_all = ref_tensor_logical_in(&man.dir, row)?;
         let per = tap.kind.per_token();
         let ref_last = &ref_all[last * per..M_TOKENS * per];
         if got.len() != per {
@@ -256,7 +255,7 @@ fn run() -> Result<(), GateError> {
 
     // ---- (b) routing: ids integer-equal to the dump AND to route_ref, in
     // rank order; weights inside the router band of route_ref.
-    let topk_row = find_ref_row(&man, &format!("ffn_moe_topk-{LAYER}"), 0)?;
+    let topk_row = man.tensor(&format!("ffn_moe_topk-{LAYER}"), 0)?;
     let n_used = taps1.moe_ids.len();
     if topk_row.ty != "i32"
         || topk_row.op != "VIEW"
@@ -268,7 +267,7 @@ fn run() -> Result<(), GateError> {
         )
         .into());
     }
-    let ik_ids = topk_ids_logical(topk_row)?;
+    let ik_ids = topk_ids_logical_in(&man, topk_row)?;
     // The router weight multiplier, read by the engine's own MoE metadata
     // reader so the gate cannot drift from what the step applies.
     let scale = model::moe::Meta::read(&gguf)?.scale;

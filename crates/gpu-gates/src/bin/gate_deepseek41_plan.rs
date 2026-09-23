@@ -1,19 +1,20 @@
 //! Gate `gate-ds41-plan`: the V4.1 host step plan (`model::arch::deepseek41::plan`) against
 //! the graph inputs of the oracle sets, bit for bit. Host only: no card, no gate lock.
 //!
-//! The sets are the table's batch set (`ref_deepseek41`, five tokens from position 0) and the
-//! decode-step sets in [`STEP_SETS`]. A set's header names its sequence (`# tokens`) and, in a
+//! The sets are the table's batch set (`ref_deepseek41`, five tokens from position 0) and its
+//! decode-step sets (`step_sets`). A set's header names its sequence (`# tokens`) and, in a
 //! decode-step set, the step's position (`# decode_pos`: the step runs the last token, the rest
-//! is its history). The planner is laid out from the file the sets were dumped from
-//! (`$BLOOMERY_REF_MODEL`, whose name must be each header's `# model_file`) at the port's
-//! context (`-c` in `# flags`; the sequence's length on a set dumped before that line), and
-//! plans the set's one step. Every input row of the set is then claimed by one check:
+//! is its history — `RefManifest::step`). The planner is laid out from the file the sets were
+//! dumped from (`$BLOOMERY_REF_MODEL`, whose name must be each header's `# model_file`) at the
+//! port's context (`-c` in `# flags`; the sequence's length on a set dumped before that line),
+//! and plans the set's one step. Every input row of the set is then claimed by one check:
 //!
 //! * the integer inputs through their exact twins (`ref_ints`, which proves each twin's file
 //!   against its row): tokens, positions, raw write cells, output ids, and per stream the
 //!   state reads and writes, the write positions and the persist sources and destinations;
 //! * the f16 masks (the raw window's and each stream's) through their f32 files, every value
-//!   exactly `0.0` or `-inf`, mapped to its f16 bits and compared with the plan's rendering;
+//!   exactly `0.0` or `-inf` (`mask_bits_in`), mapped to its f16 bits and compared with the
+//!   plan's rendering;
 //! * each engram site's row ids: the plan's n-grams through the engram crate's hash;
 //! * the engram gain ids, `0 .. hc`: the port's `get_rows` over its quantized gains, not a
 //!   step input (ours decode to f32 at load).
@@ -31,116 +32,21 @@ use std::path::Path;
 
 use bloomery_gpu_gates::oracle::{self, Set};
 use bloomery_gpu_gates::{
-    GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, exit_with, ref_dir_named,
+    GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, exit_with, mask_bits_in,
     ref_ints, ref_model_path, verdict,
 };
 use engram::Hash;
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::deepseek41::plan::{F16_HIDDEN, F16_VISIBLE, Planner, StepPlan};
+use model::arch::deepseek41::plan::{Planner, StepPlan};
 
 const NAME: &str = "gate_deepseek41_plan";
 
 /// The port's names of the compressed streams, in the planner's stream order.
 const STREAMS: [&str; 2] = ["csa", "hca"];
 
-/// The decode-step sets, each one token after a prefill run node by node (the model profile's
-/// `ref_step_variant`, `tools/ref/models/deepseek41.sh`): step4 at an even position, where no
-/// csa group completes; d1 at 301 and d2 at 1,025, where one does, the window mask 512 and
-/// 1,280 cells wide; d1 and d2 once more with the indexer's top-k unfused; d1n at 301 with the
-/// file's top-k, where neither stream builds an indexer.
-const STEP_SETS: [&str; 6] = [
-    "ref_deepseek41_step4_every_node",
-    "ref_deepseek41_d1_every_node",
-    "ref_deepseek41_d1_unfused_every_node",
-    "ref_deepseek41_d1n_every_node",
-    "ref_deepseek41_d2_every_node",
-    "ref_deepseek41_d2_unfused_every_node",
-];
-
 fn main() -> std::process::ExitCode {
     exit_with(NAME, run())
-}
-
-/// The header lines this gate reads besides what `RefManifest` holds.
-struct Header {
-    /// `# tokens`: the whole sequence.
-    tokens: Vec<u32>,
-    /// `# decode_pos`: the step's position, in a decode-step set.
-    decode_pos: Option<u32>,
-    /// `# prefill`: the tokens run before the step, in a decode-step set.
-    prefill: Option<u32>,
-    /// `# model_file`: the file the set was dumped from.
-    model_file: Option<String>,
-    /// `-c` in `# flags`: the port's context.
-    ctx: Option<u64>,
-}
-
-impl Header {
-    /// The header of the set in `dir`: the `#` lines before the first row.
-    fn read(dir: &Path) -> Result<Header, GateError> {
-        let path = dir.join("MANIFEST.tsv");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let bad = |line: &str, e: std::num::ParseIntError| -> GateError {
-            format!("{}: {line:?}: {e}", path.display()).into()
-        };
-        let mut head = Header {
-            tokens: Vec::new(),
-            decode_pos: None,
-            prefill: None,
-            model_file: None,
-            ctx: None,
-        };
-        for line in text.lines().take_while(|l| l.starts_with('#')) {
-            if let Some(v) = line.strip_prefix("# tokens\t") {
-                head.tokens = v
-                    .split(',')
-                    .map(str::parse)
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| bad(line, e))?;
-            } else if let Some(v) = line.strip_prefix("# decode_pos\t") {
-                head.decode_pos = Some(v.parse().map_err(|e| bad(line, e))?);
-            } else if let Some(v) = line.strip_prefix("# prefill\t") {
-                head.prefill = Some(v.parse().map_err(|e| bad(line, e))?);
-            } else if let Some(v) = line.strip_prefix("# model_file\t") {
-                head.model_file = Some(v.to_string());
-            } else if let Some(v) = line.strip_prefix("# flags\t") {
-                let mut args = v.split_whitespace();
-                if args.by_ref().any(|a| a == "-c") {
-                    let c = args.next().unwrap_or("");
-                    head.ctx = Some(c.parse().map_err(|e| bad(line, e))?);
-                }
-            }
-        }
-        if head.tokens.is_empty() {
-            return Err(format!("{} has no # tokens line", path.display()).into());
-        }
-        Ok(head)
-    }
-
-    /// The step the set holds: its first position, its tokens, and the tokens before it. A
-    /// decode step runs right after its prefill, so `# prefill`, where the set has it, is the
-    /// step's position.
-    fn step(&self) -> Result<(u32, &[u32], &[u32]), GateError> {
-        if let (Some(p), Some(n)) = (self.decode_pos, self.prefill)
-            && p != n
-        {
-            return Err(format!("# decode_pos {p} does not follow # prefill {n}").into());
-        }
-        match self.decode_pos {
-            None => Ok((0, &self.tokens[..], &[][..])),
-            Some(p) if p as usize + 1 == self.tokens.len() => {
-                let at = p as usize;
-                Ok((p, &self.tokens[at..], &self.tokens[..at]))
-            }
-            Some(p) => Err(format!(
-                "# decode_pos {p} is not the last of the {} tokens",
-                self.tokens.len()
-            )
-            .into()),
-        }
-    }
 }
 
 /// A step set's state input: a cache or compressor state the step reads, which the dumper writes
@@ -183,18 +89,10 @@ fn run() -> Result<(), GateError> {
     let path = ref_model_path()?;
     let split = Split::open(&path)?;
     let hash = Hash::from_gguf(&gguf::inventory_of(&path)?)?;
-    let mut sets = vec![oracle::for_arch(Arch::Deepseek41)?.open(Set::Cpu)?];
-    for name in STEP_SETS {
-        let man = RefManifest::read(&ref_dir_named(name))?;
-        if man.arch.as_deref() != Some(Arch::Deepseek41.name()) {
-            return Err(format!(
-                "{} was dumped from a {} model",
-                man.dir.display(),
-                man.arch.as_deref().unwrap_or("-")
-            )
-            .into());
-        }
-        sets.push(man);
+    let table = oracle::for_arch(Arch::Deepseek41)?;
+    let mut sets = vec![table.open(Set::Cpu)?];
+    for name in table.step_sets {
+        sets.push(table.open_named(name)?);
     }
     let mut c = Checks::default();
     for man in &sets {
@@ -219,9 +117,8 @@ fn gate_set(
     hash: &Hash,
     c: &mut Checks,
 ) -> Result<(), GateError> {
-    let head = Header::read(&man.dir)?;
     let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-    if let Some(want) = head.model_file.as_deref()
+    if let Some(want) = man.header.model_file.as_deref()
         && want != file
     {
         return Err(format!(
@@ -231,8 +128,11 @@ fn gate_set(
         )
         .into());
     }
-    let (pos0, tokens, before) = head.step()?;
-    let ctx = head.ctx.unwrap_or(head.tokens.len() as u64);
+    let (pos0, tokens, before) = man.step()?;
+    let ctx = man
+        .header
+        .ctx
+        .unwrap_or((before.len() + tokens.len()) as u64);
     let planner = Planner::from_file(split, ctx)?;
     if planner.stream_ratios().len() != STREAMS.len() {
         return Err(format!(
@@ -297,7 +197,7 @@ fn gate_set(
         if c.claimed.contains(&row.name) {
             continue;
         }
-        if head.decode_pos.is_some() && is_state(row) {
+        if man.header.decode_pos.is_some() && is_state(row) {
             *states.entry((row.ty.as_str(), row.ne)).or_default() += 1;
         } else {
             c.line(&row.name, false, "an input no check claims");
@@ -337,13 +237,6 @@ fn wide(v: &[u32]) -> Vec<i64> {
     v.iter().map(|&x| i64::from(x)).collect()
 }
 
-/// Input row `name` of the set, if it has one.
-fn input_row<'a>(man: &'a RefManifest, name: &str) -> Option<&'a RefRow> {
-    man.inputs
-        .iter()
-        .find(|r| r.name == name && r.occurrence == 0)
-}
-
 /// Where the set and the plan first differ, or that they do not.
 fn compare<T: PartialEq + std::fmt::Debug>(set: &[T], plan: &[T]) -> (bool, String) {
     if set.len() != plan.len() {
@@ -373,7 +266,7 @@ fn compare<T: PartialEq + std::fmt::Debug>(set: &[T], plan: &[T]) -> (bool, Stri
 /// Integer input `name` against `want` through its exact twin: a row of type `ty` holding
 /// `want`, or no row when `want` is empty.
 fn ints(man: &RefManifest, c: &mut Checks, name: &str, ty: &str, want: &[i64]) {
-    let (pass, what) = match input_row(man, name) {
+    let (pass, what) = match man.find(RowKind::Input, name, 0) {
         None if want.is_empty() => (true, "absent, and the plan has none".to_string()),
         None => (
             false,
@@ -391,7 +284,7 @@ fn ints(man: &RefManifest, c: &mut Checks, name: &str, ty: &str, want: &[i64]) {
 /// `inp_out_ids`: the port builds it only when fewer tokens return logits than the step runs
 /// (`llama.cpp:5836-5857`), so a set of a one-token step has none.
 fn out_ids(man: &RefManifest, c: &mut Checks, plan: &StepPlan) {
-    if plan.len() == 1 && input_row(man, "inp_out_ids").is_none() {
+    if plan.len() == 1 && man.find(RowKind::Input, "inp_out_ids", 0).is_none() {
         c.line(
             "inp_out_ids",
             true,
@@ -419,60 +312,22 @@ fn raw_mask_name(man: &RefManifest) -> Result<String, GateError> {
     }
 }
 
-/// Mask input `name` against the plan's rendering `want`: f16 bits in lines of `width`.
+/// Mask input `name` against the plan's rendering `want`: f16 bits in lines of `width`, read
+/// through the harness's mask reader.
 fn mask(man: &RefManifest, c: &mut Checks, name: &str, width: usize, want: &[u16]) {
-    let lines = want.len() / width.max(1);
-    let (pass, what) = match input_row(man, name) {
+    let ne = [width as u64, (want.len() / width.max(1)) as u64, 1, 1];
+    let (pass, what) = match man.find(RowKind::Input, name, 0) {
         None => (false, "absent from the set".to_string()),
-        Some(row) => match mask_bits(man, row, width, lines) {
-            Err(e) => (false, e),
+        Some(row) if row.ty != "f16" || row.ne != ne => (
+            false,
+            format!("is {} {:?} in the set, want f16 {ne:?}", row.ty, row.ne),
+        ),
+        Some(row) => match mask_bits_in(&man.dir, row) {
+            Err(e) => (false, e.to_string()),
             Ok(set) => compare(&set, want),
         },
     };
     c.line(name, pass, &what);
-}
-
-/// The f16 bits of mask row `row` of `width` by `lines`, from its f32 file, in which every
-/// value is exactly `0.0` or `-inf`. The harness's f32 reader refuses both an f16 row and an
-/// infinity, so the file is read here.
-fn mask_bits(
-    man: &RefManifest,
-    row: &RefRow,
-    width: usize,
-    lines: usize,
-) -> Result<Vec<u16>, String> {
-    let ne = [width as u64, lines as u64, 1, 1];
-    if row.ty != "f16" || row.ne != ne {
-        return Err(format!(
-            "is {} {:?} in the set, want f16 {ne:?}",
-            row.ty, row.ne
-        ));
-    }
-    let path = man.dir.join(row.file_name());
-    let raw = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let want = 4 * row.count();
-    if row.bytes != want || raw.len() as u64 != want {
-        return Err(format!(
-            "{} is {} bytes and its row says {}, want {want}",
-            path.display(),
-            raw.len(),
-            row.bytes
-        ));
-    }
-    raw.as_chunks::<4>()
-        .0
-        .iter()
-        .enumerate()
-        .map(|(i, b)| match u32::from_le_bytes(*b) {
-            0x0000_0000 => Ok(F16_VISIBLE),
-            0xff80_0000 => Ok(F16_HIDDEN),
-            v => Err(format!(
-                "{} holds {} at {i}, neither 0 nor -inf",
-                path.display(),
-                f32::from_bits(v)
-            )),
-        })
-        .collect()
 }
 
 /// Each engram site's row ids, hashed from the plan's n-grams by the engram crate with the

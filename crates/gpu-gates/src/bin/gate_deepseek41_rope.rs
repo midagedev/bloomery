@@ -24,8 +24,10 @@
 //!    between the two rules (at each constant).
 //!
 //! Sets: the 5-token prefill (`Set::Cpu`, its index-key chain included) and
-//! the decode steps [`STEP_SETS`] — T = 1 at positions 4, 301 and 1,025,
-//! where the ring slot wraps. Positions past those are the host unit test's
+//! the table's decode-step sets (`step_sets`; the `unfused` ones hold the same
+//! rope sites in another graph, and `d1n` turns no indexer query) — T = 1 at
+//! positions 4, 301 and 1,025, where the ring slot wraps. Positions past
+//! those are the host unit test's
 //! (`bloomery_gpu_deepseek41::rope`, `just gate-gpu-ds41-lib`). A node's
 //! input is found through its `src0`/`src1` column: the last row of that
 //! name before the reader, manifest order being execution order.
@@ -53,26 +55,13 @@ mod gate {
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed, find_int_row,
-        max_rel_err, ref_dir_named, ref_ints_of_in, ref_model_path, ref_tensor_logical_in, verdict,
+        max_rel_err, ref_ints_of_in, ref_model_path, ref_tensor_logical_in, verdict,
+        widened_f16_bits_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
-    use gguf::quant::{GgmlType, f32_to_f16_bits, half_to_f32};
+    use gguf::quant::{GgmlType, f32_to_f16_bits};
     use gguf::{Split, Value};
     use model::arch::Arch;
-
-    /// The decode-step sets: one step after a prefill run under the dumped
-    /// schedule (the `-every-node` variants of `tools/ref/models/deepseek41.sh`),
-    /// the `unfused` ones with the indexer's scores and top-k as nodes of their
-    /// own — the same rope sites in another graph — and `d1n` at 301 with the
-    /// file's top-k, where no indexer query is turned.
-    pub const STEP_SETS: [&str; 6] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d1_unfused_every_node",
-        "ref_deepseek41_d1n_every_node",
-        "ref_deepseek41_d2_every_node",
-        "ref_deepseek41_d2_unfused_every_node",
-    ];
 
     /// f32's unit roundoff, 2^-24.
     const U: f32 = f32::EPSILON / 2.0;
@@ -284,8 +273,8 @@ mod gate {
 
         let cpu = oracle::for_arch(Arch::Deepseek41)?;
         let mut sets = vec![(cpu.set_name(Set::Cpu)?, cpu.open(Set::Cpu)?)];
-        for name in STEP_SETS {
-            sets.push((name, open_set(name)?));
+        for &name in cpu.step_sets {
+            sets.push((name, cpu.open_named(name)?));
         }
 
         let (mut ropes, mut kvs, mut failed) = (0u32, 0u32, 0u32);
@@ -320,16 +309,6 @@ mod gate {
         Ok(())
     }
 
-    /// A set by name under the data directory, its `# arch` line checked.
-    fn open_set(name: &str) -> Result<RefManifest, GateError> {
-        let man = RefManifest::read(&ref_dir_named(name))?;
-        let want = Arch::Deepseek41.name();
-        if man.arch.as_deref() != Some(want) {
-            return Err(format!("{name}: # arch is {:?}, want {want}", man.arch).into());
-        }
-        Ok(man)
-    }
-
     /// The node a reader at manifest index `at` reads as `name`: the last
     /// tensor row of that name before it, with its index.
     fn src_row<'a>(
@@ -355,56 +334,6 @@ mod gate {
             .into_iter()
             .map(|v| u32::try_from(v).map_err(|_| format!("{name} holds {v}").into()))
             .collect()
-    }
-
-    /// Rows `idx` of an f16 cache row as f16 bits, row by row: the dump
-    /// widened each half to f32 exactly, so rounding back recovers ik's
-    /// bits, and a value that does not come back is an error.
-    fn f16_rows(man: &RefManifest, row: &RefRow, idx: &[u32]) -> Result<Vec<u16>, GateError> {
-        let width = row.ne[0] as usize;
-        if row.ty != "f16" || row.bytes != 4 * row.count() {
-            return Err(format!(
-                "{}/{} is {} with {} bytes for {} values, want f16 widened to f32",
-                row.name,
-                row.occurrence,
-                row.ty,
-                row.bytes,
-                row.count()
-            )
-            .into());
-        }
-        let path = man.dir.join(row.file_name());
-        let raw = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        if raw.len() as u64 != row.bytes {
-            let n = raw.len();
-            return Err(format!(
-                "{} is {n} bytes, the row says {}",
-                path.display(),
-                row.bytes
-            )
-            .into());
-        }
-        let vals = raw.as_chunks::<4>().0;
-        let mut out = Vec::with_capacity(idx.len() * width);
-        for &r in idx {
-            let r = r as usize;
-            let cells = vals.get(r * width..(r + 1) * width).ok_or_else(|| {
-                format!(
-                    "{}: row {r} is past its {} values",
-                    path.display(),
-                    vals.len()
-                )
-            })?;
-            for c in cells {
-                let v = f32::from_le_bytes(*c);
-                let h = f32_to_f16_bits(v);
-                if half_to_f32(h).to_bits() != v.to_bits() {
-                    return Err(format!("{} holds {v}, not a widened f16", path.display()).into());
-                }
-                out.push(h);
-            }
-        }
-        Ok(out)
     }
 
     /// An F32 tensor of the model file, `want` values.
@@ -730,7 +659,7 @@ mod gate {
         let view_dump = ref_tensor_logical_in(&man.dir, ch.view)?;
         let pos = input_u32(man, ch.rope.src1.as_deref())?;
         let idxs = input_u32(man, ch.write.src1.as_deref())?;
-        let ik_rows = f16_rows(man, ch.write, &idxs)?;
+        let ik_rows = widened_f16_bits_in(&man.dir, ch.write, &idxs)?;
         if pos.len() != m || idxs.len() != m || m > window {
             return Err(format!(
                 "{}: {} positions, {} cache rows for {m} tokens, ring {window}",

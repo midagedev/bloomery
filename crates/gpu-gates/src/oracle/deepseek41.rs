@@ -4,20 +4,36 @@
 use super::Oracle;
 use model::arch::Arch;
 
+/// The decode-step sets, each one token after a prefill run node by node
+/// under the dumped schedule (the model profile's `ref_step_variant`,
+/// `tools/ref/models/deepseek41.sh`): step4 at an even position, where no
+/// csa group completes; d1 at 301 and d2 at 1,025, where one does, the
+/// window mask 512 and 1,280 cells wide; d1 and d2 once more with the
+/// indexer's scores and top-k as nodes of their own; d1n at 301 with the
+/// file's top-k, where neither stream builds an indexer.
+pub const STEP_SETS: &[&str] = &[
+    "ref_deepseek41_step4_every_node",
+    "ref_deepseek41_d1_every_node",
+    "ref_deepseek41_d1_unfused_every_node",
+    "ref_deepseek41_d1n_every_node",
+    "ref_deepseek41_d2_every_node",
+    "ref_deepseek41_d2_unfused_every_node",
+];
+
 pub static ORACLE: Oracle = Oracle {
     arch: Arch::Deepseek41,
     cuda_set: None,
     cpu_set: "ref_deepseek41",
     legacy_cuda_set: None,
+    step_sets: STEP_SETS,
     taps: &[],
 };
 
 #[cfg(test)]
 mod tests {
     use crate::oracle::{Set, for_arch};
-    use crate::{RefManifest, RefRow, RowKind, ref_ints_of_in, verdict};
+    use crate::{RefManifest, RefRow, ref_ints_of_in, verdict};
     use model::arch::Arch;
-    use std::collections::HashMap;
 
     /// Rows of one kind read, with a logical twin, and failed; a row fails
     /// once however many of its checks do.
@@ -92,30 +108,22 @@ mod tests {
             read_f32_row(&man, row, &mut input, &mut fails);
         }
 
-        let rows: HashMap<(RowKind, &str, u32), &RefRow> = man
-            .tensors
-            .iter()
-            .chain(&man.inputs)
-            .map(|r| ((r.kind, r.name.as_str(), r.occurrence), r))
-            .collect();
-        let duplicates = man.tensors.len() + man.inputs.len() - rows.len();
+        let duplicates = man.duplicate_keys();
         for row in &man.ints {
             int.rows += 1;
             let checked = ref_ints_of_in(&man.dir, row)
                 .map_err(|e| e.to_string())
-                .and_then(
-                    |v| match rows.get(&(row.of, row.name.as_str(), row.occurrence)) {
-                        None => Err("it twins a row the manifest does not hold".to_string()),
-                        Some(t) if t.ty != row.ty || t.count() != v.len() as u64 => Err(format!(
-                            "the row it twins is {} x {}, the twin {} x {}",
-                            t.ty,
-                            t.count(),
-                            row.ty,
-                            v.len()
-                        )),
-                        Some(_) => Ok(()),
-                    },
-                );
+                .and_then(|v| match man.find(row.of, &row.name, row.occurrence) {
+                    None => Err("it twins a row the manifest does not hold".to_string()),
+                    Some(t) if t.ty != row.ty || t.count() != v.len() as u64 => Err(format!(
+                        "the row it twins is {} x {}, the twin {} x {}",
+                        t.ty,
+                        t.count(),
+                        row.ty,
+                        v.len()
+                    )),
+                    Some(_) => Ok(()),
+                });
             if let Err(e) = checked {
                 int.failed += 1;
                 fails.push(format!("{row}: {e}"));
@@ -156,5 +164,51 @@ mod tests {
             "hw_ds41_oracle: {} unreadable row(s), trailer ok {trailer_ok}, duplicate keys {duplicates}",
             fails.len()
         );
+    }
+
+    /// Every decode-step set of the table opens by name — its manifest
+    /// parses and names this architecture — was written by the batch set's
+    /// ik build (`# build`), and carries the step's position (`# decode_pos`).
+    #[test]
+    #[ignore = "hw: needs the V4.1 oracle sets in $BLOOMERY_DATA on the box"]
+    fn hw_ds41_oracle_step_sets_share_the_batch_build() {
+        let o = for_arch(Arch::Deepseek41).unwrap_or_else(|e| panic!("hw_ds41_oracle: {e}"));
+        let batch = o
+            .open(Set::Cpu)
+            .unwrap_or_else(|e| panic!("hw_ds41_oracle: {e}"));
+        let want = batch
+            .build
+            .as_deref()
+            .unwrap_or_else(|| panic!("hw_ds41_oracle: {} has no # build", batch.dir.display()));
+        let mut failed = 0usize;
+        for &name in o.step_sets {
+            let (pass, what) = match o.open_named(name) {
+                Err(e) => (false, e.to_string()),
+                Ok(step) => {
+                    let build = step.build.as_deref();
+                    let pos = step.header.decode_pos;
+                    (
+                        build == Some(want) && pos.is_some(),
+                        format!(
+                            "build {} (the batch set's {want}), decode_pos {}",
+                            build.unwrap_or("-"),
+                            pos.map_or_else(|| "-".to_string(), |p| p.to_string())
+                        ),
+                    )
+                }
+            };
+            failed += usize::from(!pass);
+            println!(
+                "hw_ds41_oracle: step set {name}: {what} — {}",
+                verdict(pass)
+            );
+        }
+        let pass = failed == 0 && !o.step_sets.is_empty();
+        println!(
+            "hw_ds41_oracle: {} step sets, {failed} failed — {}",
+            o.step_sets.len(),
+            verdict(pass)
+        );
+        assert!(pass, "hw_ds41_oracle: {failed} step set(s) failed");
     }
 }

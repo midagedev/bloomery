@@ -26,7 +26,7 @@
 //! materialized — `kv_compressed-L.0` is `kv_rope_compressed-L[0..]`,
 //! `k_rope-L.0` is `[latent..]`, `q_rope-L.0` is `q-L[nope..]`. The flat
 //! property is asserted before each use (`view_flat`); the kernel INPUTS
-//! are the logical tensors, read through `ref_tensor_logical` (the v2
+//! are the logical tensors, read through `load_ref_logical_in` (the v2
 //! `.logical.f32` twins).
 
 #[cfg(not(feature = "gpu"))]
@@ -38,12 +38,12 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::oracle::deepseek2::{L_OUT_0, L_OUT_1, L_OUT_26};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{GateError, RefRow};
+use bloomery_gpu_gates::{GateError, RefManifest, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    activations, bits_equal, bytes_to_words, f32_tensor, find_ref_row, load_ref, max_rel_err,
-    open_model, ref_manifest, ref_tensor_logical, ref_tensor_of, row_bytes, tensor_bytes,
-    tensor_bytes_as, verdict, view_flat,
+    activations, bits_equal, bytes_to_words, f32_tensor, load_ref_in, load_ref_logical_in,
+    max_rel_err, open_model, ref_dir, ref_tensor_of, row_bytes, tensor_bytes, tensor_bytes_as,
+    verdict, view_flat,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -76,7 +76,7 @@ fn run() -> Result<(), GateError> {
     let gpu = Gpu::new()?;
     let elem = ElemKernels::load(gpu.context())?;
     let stream = gpu.stream();
-    let man = ref_manifest()?;
+    let man = RefManifest::read(&ref_dir())?;
 
     // The one architecture-wide rms epsilon the CPU engine reads for every
     // norm (attn_norm, ffn_norm, kv_a norm, output_norm alike) — the key
@@ -140,7 +140,7 @@ fn run() -> Result<(), GateError> {
         let exact = bits_equal(&y, &y_ref);
 
         // Oracle: inp_embd (GET_ROWS of the same prompt).
-        let row = find_ref_row(&man, "inp_embd", 0)?;
+        let row = man.tensor("inp_embd", 0)?;
         row.expect("inp_embd", "f32", [2048, 6, 1, 1], "GET_ROWS")?;
         let ik = ref_tensor_of(row)?;
         let ik_rel = max_rel_err(&y, &ik)?;
@@ -191,8 +191,8 @@ fn run() -> Result<(), GateError> {
         ),
     ];
     for (label, in_name, out_name, out_occ, gain_name) in rms_chains {
-        let (in_row, x) = load_ref(&man, in_name, 0)?;
-        let out_row = find_ref_row(&man, out_name, out_occ)?;
+        let (in_row, x) = load_ref_in(&man, in_name, 0)?;
+        let out_row = man.tensor(out_name, out_occ)?;
         let k = in_row.ne[0] as usize;
         let mi = in_row.ne[1] as usize;
         in_row.expect(in_name, "f32", [k as u64, mi as u64, 1, 1], "in")?;
@@ -216,7 +216,7 @@ fn run() -> Result<(), GateError> {
     // below — so the input is the row's logical twin).
     {
         let label = "kv_compressed-1";
-        let (base_row, krc) = load_ref(&man, "kv_rope_compressed-1", 0)?;
+        let (base_row, krc) = load_ref_in(&man, "kv_rope_compressed-1", 0)?;
         let kv_w = mla.latent + mla.rope_dims;
         base_row.expect(
             "kv_rope_compressed-1",
@@ -224,11 +224,11 @@ fn run() -> Result<(), GateError> {
             [kv_w as u64, m as u64, 1, 1],
             "MUL_MAT",
         )?;
-        let (view_row, view) = load_ref(&man, label, 0)?;
+        let (view_row, view) = load_ref_in(&man, label, 0)?;
         view_row.expect(label, "f32", [mla.latent as u64, m as u64, 1, 1], "VIEW")?;
         view_flat(&view, &krc, 0, label)?;
-        let x = ref_tensor_logical(label, 0)?.1;
-        let out_row = find_ref_row(&man, label, 1)?;
+        let x = load_ref_logical_in(&man, label, 0)?.1;
+        let out_row = man.tensor(label, 1)?;
         out_row.expect(
             label,
             "f32",
@@ -276,7 +276,7 @@ fn run() -> Result<(), GateError> {
         for l in [0usize, 1, 26] {
             // The q side's base tensor, loaded for the flat-view proof.
             let q_name = format!("q-{l}");
-            let (q_row, qv) = load_ref(&man, &q_name, 0)?;
+            let (q_row, qv) = load_ref_in(&man, &q_name, 0)?;
             q_row.expect(
                 &q_name,
                 "f32",
@@ -285,13 +285,13 @@ fn run() -> Result<(), GateError> {
             )?;
             // The k side's base tensor, same proof.
             let krc_name = format!("kv_rope_compressed-{l}");
-            let (krc_row, krc) = load_ref(&man, &krc_name, 0)?;
+            let (krc_row, krc) = load_ref_in(&man, &krc_name, 0)?;
             let kv_w = mla.latent + nd;
             krc_row.expect(&krc_name, "f32", [kv_w as u64, m as u64, 1, 1], "MUL_MAT")?;
             for (what, n_vec) in [("q_rope", mla.n_head as u32), ("k_rope", 1u32)] {
                 let name = format!("{what}-{l}");
-                let (in_row, view) = load_ref(&man, &name, 0)?;
-                let out_row = find_ref_row(&man, &name, 1)?;
+                let (in_row, view) = load_ref_in(&man, &name, 0)?;
+                let out_row = man.tensor(&name, 1)?;
                 in_row.expect(&name, "f32", [nd as u64, n_vec as u64, m as u64, 1], "VIEW")?;
                 out_row.expect(&name, "f32", [nd as u64, n_vec as u64, m as u64, 1], "ROPE")?;
                 // Prove the flat-view convention: the dump equals the base
@@ -299,7 +299,7 @@ fn run() -> Result<(), GateError> {
                 // tensor fed to the kernel below.
                 let base_off = if n_vec == 1 { mla.latent } else { mla.nope };
                 view_flat(&view, if n_vec == 1 { &krc } else { &qv }, base_off, &name)?;
-                let src = ref_tensor_logical(&name, 0)?.1;
+                let src = load_ref_logical_in(&man, &name, 0)?.1;
 
                 let src_dev = DeviceBuffer::from_host(stream, &src)?;
                 let mut dst_dev = DeviceBuffer::<f32>::zeroed(stream, src.len())?;
@@ -390,9 +390,9 @@ fn run() -> Result<(), GateError> {
             (L_OUT_0, "ffn_out-0", "ffn_inp-0"),
         ];
         for (out_name, a_name, b_name) in chains {
-            let (a_row, a) = load_ref(&man, a_name, 0)?;
-            let (b_row, b) = load_ref(&man, b_name, 0)?;
-            let (out_row, out) = load_ref(&man, out_name, 0)?;
+            let (a_row, a) = load_ref_in(&man, a_name, 0)?;
+            let (b_row, b) = load_ref_in(&man, b_name, 0)?;
+            let (out_row, out) = load_ref_in(&man, out_name, 0)?;
             a_row.expect(a_name, "f32", [2048, 6, 1, 1], "in")?;
             b_row.expect(b_name, "f32", [2048, 6, 1, 1], "in")?;
             out_row.expect(out_name, "f32", [2048, 6, 1, 1], "ADD")?;
@@ -437,9 +437,9 @@ fn run() -> Result<(), GateError> {
     // [1, 6, 6] (GET_ROWS) -> ffn_moe_out-1 (MUL_MULTI_ADD); token 0 alone
     // for the m=1 shape.
     {
-        let (down_row, down) = load_ref(&man, "ffn_moe_down-1", 0)?;
-        let (w_row, wts) = load_ref(&man, "ffn_moe_weights-1", 0)?;
-        let (out_row, out) = load_ref(&man, "ffn_moe_out-1", 0)?;
+        let (down_row, down) = load_ref_in(&man, "ffn_moe_down-1", 0)?;
+        let (w_row, wts) = load_ref_in(&man, "ffn_moe_weights-1", 0)?;
+        let (out_row, out) = load_ref_in(&man, "ffn_moe_out-1", 0)?;
         down_row.expect("ffn_moe_down-1", "f32", [2048, 6, 6, 1], "MUL_MAT_ID")?;
         w_row.expect("ffn_moe_weights-1", "f32", [1, 6, 6, 1], "GET_ROWS")?;
         out_row.expect("ffn_moe_out-1", "f32", [2048, 6, 1, 1], "MUL_MULTI_ADD")?;
@@ -484,7 +484,7 @@ fn run() -> Result<(), GateError> {
 
     // ============================================================ argmax
     {
-        let (out_row, logits) = load_ref(&man, "result_output", 0)?;
+        let (out_row, logits) = load_ref_in(&man, "result_output", 0)?;
         out_row.expect("result_output", "f32", [102400, 1, 1, 1], "MUL_MAT")?;
         let host = argmax_ref(&logits);
         let x_dev = DeviceBuffer::from_host(stream, &logits)?;

@@ -22,6 +22,9 @@ pub struct Oracle {
     pub cpu_set: &'static str,
     /// The pre-v2 CUDA dump: plain files only, no logical twins.
     pub legacy_cuda_set: Option<&'static str>,
+    /// The decode-step sets: each one step after a prefill, the step's
+    /// position in its `# decode_pos`. Opened with [`Oracle::open_named`].
+    pub step_sets: &'static [&'static str],
     /// Tap names asked of a manifest by more than one gate binary. A name
     /// that only one gate reads stays in that gate.
     pub taps: &'static [&'static str],
@@ -57,6 +60,23 @@ impl Oracle {
         Ok(man)
     }
 
+    /// Open the set named `set` under the data directory — a decode-step set
+    /// of [`step_sets`](Self::step_sets), say. Its `# arch` line must name
+    /// this table's architecture: every set opened by name was dumped after
+    /// the dumper wrote that line, so one without it is not the set named.
+    pub fn open_named(&self, set: &str) -> Result<RefManifest, GateError> {
+        let man = RefManifest::read(&ref_dir_named(set))?;
+        match man.arch.as_deref() {
+            Some(a) if a == self.arch.name() => Ok(man),
+            a => Err(format!(
+                "oracle: {} has # arch {a:?}, but the {} table names it",
+                man.dir.display(),
+                self.arch.name()
+            )
+            .into()),
+        }
+    }
+
     /// `man`'s `# arch` line is this row's architecture or absent.
     fn check_arch(&self, man: &RefManifest) -> Result<(), GateError> {
         match man.arch.as_deref() {
@@ -83,24 +103,27 @@ pub fn for_arch(a: Arch) -> Result<&'static Oracle, GateError> {
 #[cfg(test)]
 mod tests {
     use super::for_arch;
-    use crate::RefManifest;
+    use crate::{GateError, RefManifest};
     use model::arch::Arch;
 
     /// A set opened through the table is of the table's architecture: a
-    /// manifest naming another is an error naming both, and one without the
-    /// `# arch` line is accepted.
+    /// manifest naming another is an error naming both. One without the
+    /// `# arch` line is accepted by `open` — a set dumped before the dumper
+    /// wrote it — and refused by `open_named`.
     #[test]
-    fn a_set_of_another_architecture_is_refused() {
+    fn a_set_of_another_architecture_is_refused() -> Result<(), GateError> {
         let man = |arch: Option<&str>| RefManifest {
             dir: "/data/set".into(),
             arch: arch.map(str::to_string),
             build: None,
             complete: None,
+            header: Default::default(),
             tensors: Vec::new(),
             inputs: Vec::new(),
             ints: Vec::new(),
             skipped_nodes: 0,
             skipped_inputs: 0,
+            index: Default::default(),
         };
         let o = for_arch(Arch::Deepseek41).unwrap();
         let err = o
@@ -113,5 +136,24 @@ mod tests {
         );
         assert!(o.check_arch(&man(Some("deepseek41"))).is_ok());
         assert!(o.check_arch(&man(None)).is_ok());
+
+        // An absolute set name is the directory itself.
+        let dir = std::env::temp_dir().join(format!("bloomery-open-named-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let set = dir.to_str().ok_or("temp dir is not UTF-8")?;
+        let open = |arch_line: &str| -> Result<RefManifest, GateError> {
+            let row = "tensor\tx\t0\tf32\t1\t1\t1\t1\t4\t0\tNONE";
+            std::fs::write(dir.join("MANIFEST.tsv"), format!("{arch_line}{row}\n"))?;
+            o.open_named(set)
+        };
+        assert!(open("# arch\tdeepseek41\n").is_ok());
+        let err = open("# arch\tdeepseek2\n").unwrap_err().to_string();
+        assert!(
+            err.contains("deepseek2") && err.contains("deepseek41"),
+            "{err}"
+        );
+        assert!(open("").is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

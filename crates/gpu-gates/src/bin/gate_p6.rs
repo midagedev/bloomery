@@ -58,8 +58,8 @@ fn run() -> Result<(), GateError> {
     use bloomery_gpu::Gpu;
     use bloomery_gpu::router::{N_EXPERT, N_USED, RouterKernels};
     use bloomery_gpu_gates::{
-        find_ref_row, max_rel_err, open_model, ref_manifest, ref_tensor_of, route_ref,
-        tensor_bytes_as, topk_ids_logical,
+        RefManifest, max_rel_err, open_model, ref_dir, ref_tensor_of, route_ref, tensor_bytes_as,
+        topk_ids_logical_in,
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::GgmlType;
@@ -74,7 +74,7 @@ fn run() -> Result<(), GateError> {
     let gpu = Gpu::new()?;
     let router = RouterKernels::load(gpu.context())?;
     let stream = gpu.stream();
-    let man = ref_manifest()?;
+    let man = RefManifest::read(&ref_dir())?;
 
     // The kernels' fixed 64/top-6 geometry, cross-checked against the file.
     let n_expert = gguf
@@ -110,7 +110,7 @@ fn run() -> Result<(), GateError> {
 
     // ---- real layers: logits from the dump, all tokens it holds.
     for l in [1usize, 13, 26] {
-        let logits_row = find_ref_row(&man, &format!("ffn_moe_logits-{l}"), 0)?;
+        let logits_row = man.tensor(&format!("ffn_moe_logits-{l}"), 0)?;
         if logits_row.ty != "f32"
             || logits_row.op != "MUL_MAT"
             || logits_row.ne[0] != N_EXPERT as u64
@@ -134,9 +134,9 @@ fn run() -> Result<(), GateError> {
         let (probs_ref, ids_ref, w_ref) = route_ref(&x_ik, m, scale)?;
 
         // The router's oracle outputs, chain-checked against the logits row.
-        let probs_row = find_ref_row(&man, &format!("ffn_moe_probs-{l}"), 0)?;
-        let weights_row = find_ref_row(&man, &format!("ffn_moe_weights-{l}"), 0)?;
-        let topk_row = find_ref_row(&man, &format!("ffn_moe_topk-{l}"), 0)?;
+        let probs_row = man.tensor(&format!("ffn_moe_probs-{l}"), 0)?;
+        let weights_row = man.tensor(&format!("ffn_moe_weights-{l}"), 0)?;
+        let topk_row = man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
         if probs_row.ty != "f32"
             || probs_row.op != "SOFT_MAX"
             || probs_row.ne != [N_EXPERT as u64, m as u64, 1, 1]
@@ -170,10 +170,10 @@ fn run() -> Result<(), GateError> {
         let ik_probs = ref_tensor_of(probs_row)?; // t-major [64, m]
         let ik_w = ref_tensor_of(weights_row)?; // t-major [6, m]
         // The topk ids are the row's LOGICAL twin: every token's top-6,
-        // each id cast to f32 by the dumper (see `topk_ids_logical`). The
+        // each id cast to f32 by the dumper (see `topk_ids_logical_in`). The
         // plain file is the flat read of the argsort parent — token 0's
         // ranking only — and is not the tensor.
-        let ik_ids = topk_ids_logical(topk_row)?;
+        let ik_ids = topk_ids_logical_in(&man, topk_row)?;
         // Per-token softmax sanity of the loaded probs (sum 1 within f32
         // rounding) — catches a layout mix-up before any comparison.
         for t in 0..m {
@@ -397,7 +397,7 @@ fn run() -> Result<(), GateError> {
     // ---- eager vs captured graph: the decode chain router -> table on
     // resident buffers (layer 13's real logits, all 6 tokens). The router's
     // ids buffer feeds the table with no host round trip — the step's shape.
-    let logits_row = find_ref_row(&man, "ffn_moe_logits-13", 0)?;
+    let logits_row = man.tensor("ffn_moe_logits-13", 0)?;
     let m = logits_row.ne[1] as usize;
     let x_ik = ref_tensor_of(logits_row)?;
     let x_dev = DeviceBuffer::from_host(stream, &to_expert_major(&x_ik, N_EXPERT, m))?;

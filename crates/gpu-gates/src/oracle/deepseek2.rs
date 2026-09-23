@@ -21,5 +21,6 @@ pub static ORACLE: Oracle = Oracle {
     cuda_set: Some(CUDA_SET),
     cpu_set: "ref",
     legacy_cuda_set: Some("ref_cuda"),
+    step_sets: &[],
     taps: &[L_OUT_0, L_OUT_1, L_OUT_26],
 };

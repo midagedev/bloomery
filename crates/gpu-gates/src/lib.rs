@@ -20,6 +20,7 @@ pub mod ptx;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Kernel gate band against the quantized-input reference.
@@ -455,9 +456,9 @@ impl std::fmt::Display for IntRow {
     }
 }
 
-/// A dump set's whole MANIFEST.tsv: the header lines the harness checks and
-/// every row the dumper writes, by kind. A gate reads it once per set and
-/// takes rows out of it.
+/// A dump set's whole MANIFEST.tsv: its header lines and every row the
+/// dumper writes, by kind, with an index over the rows. A gate reads it once
+/// per set and takes rows out of it.
 #[derive(Debug, Clone)]
 pub struct RefManifest {
     /// The set's directory; every file a row names resolves under it.
@@ -470,6 +471,8 @@ pub struct RefManifest {
     /// `# complete <written> <skipped>`: the node rows written and skipped.
     /// `None` when the trailer is missing — the dump that wrote the set died.
     pub complete: Option<(u64, u64)>,
+    /// The other header lines.
+    pub header: RefHeader,
     /// `tensor` rows (graph nodes), in file order.
     pub tensors: Vec<RefRow>,
     /// `input` rows (graph leaves), in file order.
@@ -481,10 +484,88 @@ pub struct RefManifest {
     pub skipped_nodes: u64,
     /// `skip-input` rows: the same for graph inputs.
     pub skipped_inputs: u64,
+    index: RowIndex,
+}
+
+/// The header lines of a set that [`RefManifest`] does not hold as its own
+/// fields (`# arch`, `# build`, the `# complete` trailer). A line the set
+/// does not carry leaves its field `None`.
+#[derive(Debug, Clone, Default)]
+pub struct RefHeader {
+    /// `# tokens`: the ids of the whole sequence the set was dumped for.
+    pub tokens: Option<Vec<u32>>,
+    /// `# tokens_file`: the file the dumper read the tokens from.
+    pub tokens_file: Option<String>,
+    /// `# tokens_file_sha256`: that file's digest.
+    pub tokens_file_sha256: Option<String>,
+    /// `# tokens_count`: how many of the file's tokens the dumper took.
+    pub tokens_count: Option<u64>,
+    /// `# model_file`: the name of the model file the set was dumped from.
+    pub model_file: Option<String>,
+    /// `# flags`: the dumper's command line.
+    pub flags: Option<String>,
+    /// `-c` in `# flags`: the context the dumper ran at.
+    pub ctx: Option<u64>,
+    /// `# prefill`: in a decode-step set, the tokens run before the step.
+    pub prefill: Option<u32>,
+    /// `# decode_pos`: in a decode-step set, the step's position.
+    pub decode_pos: Option<u32>,
+    /// `# state_inputs`: in a decode-step set, the dumper's note that the
+    /// persistent leaves the step reads (caches, compressor states) are
+    /// input rows, written at their first reader.
+    pub state_inputs: Option<String>,
+    /// `# fused_idx_topk`: whether the indexer's scores and top-k ran as one
+    /// op (`1`) or as nodes of their own (`0`).
+    pub fused_idx_topk: Option<bool>,
+    /// Every other `#` line, verbatim and in file order: the dumper's title,
+    /// `# model`, the column lines, and any line this parser does not know.
+    pub other: Vec<String>,
+}
+
+/// Where each row sits in its vector, keyed the way readers look rows up:
+/// by name, then `(kind, occurrence)`, and for an `int` row also its layout.
+/// Built once by [`RefManifest::read`] over the rows it parsed; of a
+/// repeated key it keeps the first row, the one a scan in file order finds.
+/// A lookup checks that the row it lands on carries the key, so an answer
+/// always comes from the rows themselves.
+#[derive(Debug, Clone, Default)]
+struct RowIndex {
+    rows: HashMap<String, Vec<(RowKind, u32, usize)>>,
+    ints: HashMap<String, Vec<(RowKind, u32, Layout, usize)>>,
+    /// Tensor and input rows whose key an earlier row already carries.
+    duplicates: usize,
+}
+
+impl RowIndex {
+    fn over(tensors: &[RefRow], inputs: &[RefRow], ints: &[IntRow]) -> RowIndex {
+        let mut ix = RowIndex::default();
+        for (at, r) in tensors.iter().enumerate().chain(inputs.iter().enumerate()) {
+            let keys = ix.rows.entry(r.name.clone()).or_default();
+            if keys
+                .iter()
+                .any(|&(k, o, _)| k == r.kind && o == r.occurrence)
+            {
+                ix.duplicates += 1;
+            } else {
+                keys.push((r.kind, r.occurrence, at));
+            }
+        }
+        for (at, r) in ints.iter().enumerate() {
+            let keys = ix.ints.entry(r.name.clone()).or_default();
+            if !keys
+                .iter()
+                .any(|&(of, o, l, _)| of == r.of && o == r.occurrence && l == r.layout)
+            {
+                keys.push((r.of, r.occurrence, r.layout, at));
+            }
+        }
+        ix
+    }
 }
 
 impl RefManifest {
-    /// Parse `dir/MANIFEST.tsv`. Header lines start with `#`; data rows are
+    /// Parse `dir/MANIFEST.tsv`. Header lines start with `#` ([`RefHeader`]
+    /// and this struct's own `arch`, `build`, `complete`); data rows are
     /// tab-separated, the kind first:
     /// `tensor`/`input name occurrence type ne0 ne1 ne2 ne3 bytes sum op`
     /// with four optional trailing fields `contig logical src0 src1` (sets
@@ -493,7 +574,7 @@ impl RefManifest {
     /// absmax file`, and `skip`/`skip-input name occurrence type reason`.
     /// Tensor names may contain spaces, so fields are split on tabs only. A
     /// row of any other kind or width is an error naming its line, and so is
-    /// a manifest with no `tensor` row.
+    /// a manifest with no `tensor` row. The rows are indexed here, once.
     pub fn read(dir: &Path) -> Result<RefManifest, GateError> {
         let path = dir.join("MANIFEST.tsv");
         let text = std::fs::read_to_string(&path)
@@ -503,26 +584,19 @@ impl RefManifest {
             arch: None,
             build: None,
             complete: None,
+            header: RefHeader::default(),
             tensors: Vec::new(),
             inputs: Vec::new(),
             ints: Vec::new(),
             skipped_nodes: 0,
             skipped_inputs: 0,
+            index: RowIndex::default(),
         };
         for (i, line) in text.lines().enumerate() {
             let at = At(&path, i + 1);
-            if let Some(v) = line.strip_prefix("# arch\t") {
-                man.arch = Some(v.to_string());
-            } else if let Some(v) = line.strip_prefix("# build\t") {
-                man.build = Some(v.to_string());
-            } else if let Some(v) = line.strip_prefix("# complete\t") {
-                let (w, s) = v
-                    .split_once('\t')
-                    .ok_or_else(|| format!("ref_manifest: {at}: trailer {line:?}"))?;
-                man.complete = Some((parse_u64(w, at)?, parse_u64(s, at)?));
-            } else if line.starts_with('#') || line.is_empty() {
-                continue;
-            } else {
+            if line.starts_with('#') {
+                man.header_line(line, at)?;
+            } else if !line.is_empty() {
                 let f: Vec<&str> = line.split('\t').collect();
                 match f[0] {
                     "tensor" => man.tensors.push(parse_ref_row(RowKind::Tensor, &f, at)?),
@@ -545,8 +619,166 @@ impl RefManifest {
         if man.tensors.is_empty() {
             return Err(format!("ref_manifest: no tensor rows in {}", path.display()).into());
         }
+        man.index = RowIndex::over(&man.tensors, &man.inputs, &man.ints);
         Ok(man)
     }
+
+    /// One `#` line. A `# <key>\t<value>` line of a key this parser knows
+    /// fills its field — a key given twice, or a value that does not parse,
+    /// is an error naming the line — and every other line is kept verbatim
+    /// in `header.other`.
+    fn header_line(&mut self, line: &str, at: At) -> Result<(), GateError> {
+        let Some((key, v)) = line.strip_prefix("# ").and_then(|h| h.split_once('\t')) else {
+            self.header.other.push(line.to_string());
+            return Ok(());
+        };
+        let bad = |e: &dyn std::fmt::Display| -> GateError {
+            format!("ref_manifest: {at}: {line:?}: {e}").into()
+        };
+        let text = || v.to_string();
+        let h = &mut self.header;
+        match key {
+            "arch" => once(&mut self.arch, text(), key, at),
+            "build" => once(&mut self.build, text(), key, at),
+            "complete" => {
+                let (w, s) = v.split_once('\t').ok_or_else(|| bad(&"not two counts"))?;
+                once(
+                    &mut self.complete,
+                    (parse_u64(w, at)?, parse_u64(s, at)?),
+                    key,
+                    at,
+                )
+            }
+            "tokens" => {
+                let ids = v
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<Vec<u32>, _>>()
+                    .map_err(|e| bad(&e))?;
+                once(&mut h.tokens, ids, key, at)
+            }
+            "tokens_file" => once(&mut h.tokens_file, text(), key, at),
+            "tokens_file_sha256" => once(&mut h.tokens_file_sha256, text(), key, at),
+            "tokens_count" => once(&mut h.tokens_count, parse_u64(v, at)?, key, at),
+            "model_file" => once(&mut h.model_file, text(), key, at),
+            "flags" => {
+                let mut args = v.split_whitespace();
+                if args.by_ref().any(|a| a == "-c") {
+                    let c = args.next().unwrap_or("");
+                    h.ctx = Some(c.parse().map_err(|e| bad(&format!("-c {c:?}: {e}")))?);
+                }
+                once(&mut h.flags, text(), key, at)
+            }
+            "prefill" => once(&mut h.prefill, parse_narrow(v, at)?, key, at),
+            "decode_pos" => once(&mut h.decode_pos, parse_narrow(v, at)?, key, at),
+            "state_inputs" => once(&mut h.state_inputs, text(), key, at),
+            "fused_idx_topk" => {
+                let fused = match v {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(bad(&"want 0 or 1")),
+                };
+                once(&mut h.fused_idx_topk, fused, key, at)
+            }
+            _ => {
+                h.other.push(line.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// The row of kind `kind` keyed `name`/`occurrence`, through the index —
+    /// the row a scan of the file finds first — or `None` if the set has
+    /// none.
+    pub fn find(&self, kind: RowKind, name: &str, occurrence: u32) -> Option<&RefRow> {
+        let rows = match kind {
+            RowKind::Tensor => &self.tensors,
+            RowKind::Input => &self.inputs,
+        };
+        let &(_, _, at) = self
+            .index
+            .rows
+            .get(name)?
+            .iter()
+            .find(|&&(k, o, _)| k == kind && o == occurrence)?;
+        rows.get(at)
+            .filter(|r| r.name == name && r.occurrence == occurrence)
+    }
+
+    /// The `tensor` row `name`/`occurrence` ([`find`](Self::find)); a set
+    /// without it is an error naming the set.
+    pub fn tensor(&self, name: &str, occurrence: u32) -> Result<&RefRow, GateError> {
+        self.row(RowKind::Tensor, name, occurrence)
+    }
+
+    /// The `input` row `name`/`occurrence` ([`find`](Self::find)); a set
+    /// without it is an error naming the set.
+    pub fn input(&self, name: &str, occurrence: u32) -> Result<&RefRow, GateError> {
+        self.row(RowKind::Input, name, occurrence)
+    }
+
+    fn row(&self, kind: RowKind, name: &str, occurrence: u32) -> Result<&RefRow, GateError> {
+        self.find(kind, name, occurrence).ok_or_else(|| {
+            format!(
+                "ref_manifest: {} {name}/{occurrence} not in {}",
+                kind.as_str(),
+                self.dir.join("MANIFEST.tsv").display()
+            )
+            .into()
+        })
+    }
+
+    /// Tensor and input rows whose `(kind, name, occurrence)` an earlier row
+    /// already carries; a lookup never lands on one of them.
+    pub fn duplicate_keys(&self) -> usize {
+        self.index.duplicates
+    }
+
+    /// The step the set holds, as its first position, its tokens and the
+    /// tokens before it: in a batch set every token of `# tokens` from
+    /// position 0; in a decode-step set the last token, at `# decode_pos`,
+    /// after the rest. A decode step runs right after its prefill, so
+    /// `# prefill`, where the set has it, is the step's position. A set with
+    /// no `# tokens`, a `# decode_pos` that is not its last token, or a
+    /// `# prefill` that differs from it is an error naming the set.
+    pub fn step(&self) -> Result<(u32, &[u32], &[u32]), GateError> {
+        let path = self.dir.join("MANIFEST.tsv");
+        let h = &self.header;
+        let tokens = h
+            .tokens
+            .as_deref()
+            .ok_or_else(|| format!("{} has no # tokens line", path.display()))?;
+        if let (Some(p), Some(n)) = (h.decode_pos, h.prefill)
+            && p != n
+        {
+            return Err(format!(
+                "{}: # decode_pos {p} does not follow # prefill {n}",
+                path.display()
+            )
+            .into());
+        }
+        match h.decode_pos {
+            None => Ok((0, tokens, &[])),
+            Some(p) if p as usize + 1 == tokens.len() => {
+                let at = p as usize;
+                Ok((p, &tokens[at..], &tokens[..at]))
+            }
+            Some(p) => Err(format!(
+                "{}: # decode_pos {p} is not the last of the {} tokens",
+                path.display(),
+                tokens.len()
+            )
+            .into()),
+        }
+    }
+}
+
+/// Fill a header field once: a second line of the same key is an error.
+fn once<T>(slot: &mut Option<T>, v: T, key: &str, at: At) -> Result<(), GateError> {
+    if slot.replace(v).is_some() {
+        return Err(format!("ref_manifest: {at}: a second # {key} line").into());
+    }
+    Ok(())
 }
 
 /// A manifest line's position, `<path>:<line>`, formatted only into an error.
@@ -682,7 +914,9 @@ pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {
     ref_manifest_in(&ref_dir())
 }
 
-/// The manifest row for `(name, occurrence)`, if the dump holds it.
+/// The manifest row for `(name, occurrence)`, if the dump holds it. A scan
+/// of the slice: a gate holding a [`RefManifest`] looks rows up through its
+/// index ([`RefManifest::tensor`]).
 pub fn find_ref_row<'a>(
     man: &'a [RefRow],
     name: &str,
@@ -703,10 +937,10 @@ pub fn find_ref_row_in<'a>(
         .find(|r| r.name == name && r.occurrence == occurrence)
         .ok_or_else(|| {
             format!(
-                "find_ref_row: {}/{} not in {}MANIFEST.tsv",
+                "find_ref_row: {}/{} not in {}",
                 name,
                 occurrence,
-                dir.display()
+                dir.join("MANIFEST.tsv").display()
             )
             .into()
         })
@@ -770,18 +1004,43 @@ pub fn ref_tensor_of_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<f32>,
     Ok(vals)
 }
 
-/// `ref_tensor_of` over `find_ref_row`: load `(name, occurrence)`'s f32
-/// file with its manifest row (dims, op, sum) for chain checking.
+/// `ref_dir()`'s `(name, occurrence)` f32 file with its manifest row (dims,
+/// op, sum) for chain checking. Reads the manifest on every call: a gate
+/// that loads more than one row holds a [`RefManifest`] and calls
+/// [`load_ref_in`].
 pub fn ref_tensor(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), GateError> {
-    load_ref(&ref_manifest()?, name, occurrence)
+    load_ref_in(&RefManifest::read(&ref_dir())?, name, occurrence)
 }
 
 /// `ref_tensor` over a manifest the caller already parsed: load
 /// `(name, occ)`'s f32 file with its manifest row. A gate that reads many
-/// tensors parses the manifest once and calls this.
+/// tensors parses the manifest once and calls this, or [`load_ref_in`] with
+/// a held [`RefManifest`].
 pub fn load_ref(man: &[RefRow], name: &str, occ: u32) -> Result<(RefRow, Vec<f32>), GateError> {
     let row = find_ref_row(man, name, occ)?;
     Ok((row.clone(), ref_tensor_of(row)?))
+}
+
+/// Tensor row `(name, occ)` of the held manifest `man`, through its index,
+/// and the row's f32 file ([`ref_tensor_of_in`]).
+pub fn load_ref_in(
+    man: &RefManifest,
+    name: &str,
+    occ: u32,
+) -> Result<(RefRow, Vec<f32>), GateError> {
+    let row = man.tensor(name, occ)?;
+    Ok((row.clone(), ref_tensor_of_in(&man.dir, row)?))
+}
+
+/// Tensor row `(name, occ)` of the held manifest `man`, through its index,
+/// and the row's LOGICAL elements ([`ref_tensor_logical_in`]).
+pub fn load_ref_logical_in(
+    man: &RefManifest,
+    name: &str,
+    occ: u32,
+) -> Result<(RefRow, Vec<f32>), GateError> {
+    let row = man.tensor(name, occ)?;
+    Ok((row.clone(), ref_tensor_logical_in(&man.dir, row)?))
 }
 
 /// The tensor's LOGICAL elements in ggml index order from `ref_dir()`: the
@@ -790,11 +1049,11 @@ pub fn load_ref(man: &[RefRow], name: &str, occ: u32) -> Result<(RefRow, Vec<f32
 /// file IS its logical order; a pre-v2 manifest without the `contig`
 /// column is accepted for non-VIEW rows only). A VIEW row without a
 /// logical twin is an error, never a silent flat read — that flat read is
-/// a different tensor than the one being asked for.
+/// a different tensor than the one being asked for. Reads the manifest on
+/// every call: a gate that loads more than one row holds a [`RefManifest`]
+/// and calls [`load_ref_logical_in`].
 pub fn ref_tensor_logical(name: &str, occurrence: u32) -> Result<(RefRow, Vec<f32>), GateError> {
-    let man = ref_manifest()?;
-    let row = find_ref_row(&man, name, occurrence)?;
-    Ok((row.clone(), ref_tensor_logical_in(&ref_dir(), row)?))
+    load_ref_logical_in(&RefManifest::read(&ref_dir())?, name, occurrence)
 }
 
 /// `ref_tensor_logical` of the set at `dir`, over a row already found.
@@ -856,7 +1115,8 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
     ref_tensor_of_in(dir, row)
 }
 
-/// The `int` row twinning `(name, occurrence)` of kind `of` in `layout`.
+/// The `int` row twinning `(name, occurrence)` of kind `of` in `layout`,
+/// through the manifest's index.
 pub fn find_int_row<'a>(
     man: &'a RefManifest,
     name: &str,
@@ -864,9 +1124,17 @@ pub fn find_int_row<'a>(
     of: RowKind,
     layout: Layout,
 ) -> Result<&'a IntRow, GateError> {
-    man.ints
-        .iter()
-        .find(|r| r.name == name && r.occurrence == occurrence && r.of == of && r.layout == layout)
+    man.index
+        .ints
+        .get(name)
+        .and_then(|keys| {
+            keys.iter()
+                .find(|&&(k, o, l, _)| k == of && o == occurrence && l == layout)
+        })
+        .and_then(|&(.., at)| man.ints.get(at))
+        .filter(|r| {
+            r.name == name && r.occurrence == occurrence && r.of == of && r.layout == layout
+        })
         .ok_or_else(|| {
             format!(
                 "find_int_row: no {} integer twin of {} {name}/{occurrence} in {}",
@@ -1081,50 +1349,156 @@ pub fn f32_tensor(gguf: &Gguf, name: &str, want: usize) -> Result<Vec<f32>, Gate
         .collect())
 }
 
-/// The f16 cache view's first `rows` rows as f16 bits: the dump widened
-/// the halves to f32 exactly, so rounding back recovers ik's own bits
-/// (gate_p5's local `widened_f16_bits`). The rounding is
-/// `gguf::quant::f32_to_f16_bits` itself — the CPU oracle's own — so a
-/// second transcription here cannot drift.
+/// [`widened_f16_bits_in`] of `ref_dir()`'s set, rows `0..rows` — the f16
+/// cache view's first `rows` rows.
 pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError> {
-    use gguf::quant::f32_to_f16_bits;
+    let idx: Vec<u32> = (0..u32::try_from(rows)?).collect();
+    widened_f16_bits_in(&ref_dir(), row, &idx)
+}
 
-    let path = ref_dir().join(row.file_name());
-    let raw = std::fs::read(&path)
-        .map_err(|e| format!("widened_f16_bits: cannot read {}: {e}", path.display()))?;
-    if raw.len() as u64 != row.bytes {
+/// Rows `idx` of f16 row `row` of the set at `dir` as f16 bits, row after
+/// row, `ne[0]` values a row. The dump widened each half to f32 exactly, so
+/// rounding back with `gguf::quant::f32_to_f16_bits` — the CPU oracle's own
+/// rounding, not a second transcription — recovers ik's bits; a value that
+/// does not widen back to itself is an error naming the row. Only the rows
+/// asked for are read from the file.
+pub fn widened_f16_bits_in(dir: &Path, row: &RefRow, idx: &[u32]) -> Result<Vec<u16>, GateError> {
+    use gguf::quant::{f32_to_f16_bits, half_to_f32};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = dir.join(row.file_name());
+    let what = || {
+        format!(
+            "{} {}/{} ({})",
+            row.kind.as_str(),
+            row.name,
+            row.occurrence,
+            path.display()
+        )
+    };
+    let count = row.count();
+    if row.ty != "f16" || 4_u64.checked_mul(count) != Some(row.bytes) {
         return Err(format!(
-            "widened_f16_bits: {} is {} bytes, manifest says {}",
-            path.display(),
-            raw.len(),
+            "widened_f16_bits: {} is {} with {} bytes for {count} values, want f16 widened to f32",
+            what(),
+            row.ty,
             row.bytes
         )
         .into());
     }
-    let width = row.ne[0] as usize;
-    let count = row.count() as usize;
-    if row.bytes != 4 * count as u64 {
+    let io =
+        |e: std::io::Error| -> GateError { format!("widened_f16_bits: {}: {e}", what()).into() };
+    let mut file = std::fs::File::open(&path).map_err(io)?;
+    let len = file.metadata().map_err(io)?.len();
+    if len != row.bytes {
         return Err(format!(
-            "widened_f16_bits: {} is {} bytes for {count} widened values",
-            path.display(),
-            raw.len()
+            "widened_f16_bits: {} is {len} bytes, the row says {}",
+            what(),
+            row.bytes
         )
         .into());
     }
-    if rows * width > count {
-        return Err(format!(
-            "widened_f16_bits: {} holds {count} values, asked for {rows} rows of {width}",
+    let width = row.ne[0];
+    let mut line = vec![0u8; 4 * usize::try_from(width)?];
+    let mut out = Vec::with_capacity(idx.len() * line.len() / 4);
+    for &r in idx {
+        let first = u64::from(r) * width;
+        if first + width > count {
+            return Err(format!(
+                "widened_f16_bits: {}: row {r} is past its {count} values",
+                what()
+            )
+            .into());
+        }
+        file.seek(SeekFrom::Start(4 * first)).map_err(io)?;
+        file.read_exact(&mut line).map_err(io)?;
+        for c in line.as_chunks::<4>().0 {
+            let v = f32::from_le_bytes(*c);
+            let h = f32_to_f16_bits(v);
+            if half_to_f32(h).to_bits() != v.to_bits() {
+                return Err(format!(
+                    "widened_f16_bits: {} holds {v} in row {r}, not a widened f16",
+                    what()
+                )
+                .into());
+            }
+            out.push(h);
+        }
+    }
+    Ok(out)
+}
+
+/// The f16 bits of mask row `row` of the set at `dir`: an `f16` row whose
+/// f32 file holds every value exactly `0.0` (a cell the query sees) or
+/// `-inf` (one it does not), each mapped to that value's f16 bits (`0x0000`,
+/// `0xfc00`). Anything else — another type, a byte count that is not four a
+/// value, any other value, `-0.0` and NaN included — is an error naming the
+/// row, and for a value, the first offending one and its index.
+pub fn mask_bits_in(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError> {
+    use gguf::quant::f32_to_f16_bits;
+
+    const ZERO: u32 = 0x0000_0000;
+    const MINUS_INF: u32 = 0xff80_0000;
+    let path = dir.join(row.file_name());
+    let what = || {
+        format!(
+            "{} {}/{} ({})",
+            row.kind.as_str(),
+            row.name,
+            row.occurrence,
             path.display()
         )
+    };
+    if row.ty != "f16" {
+        return Err(format!("mask_bits: {} is {}, want an f16 mask", what(), row.ty).into());
+    }
+    let raw = std::fs::read(&path).map_err(|e| format!("mask_bits: {}: {e}", what()))?;
+    let want = 4_u64.checked_mul(row.count());
+    if want != Some(row.bytes) || want != Some(raw.len() as u64) {
+        return Err(format!(
+            "mask_bits: {} is {} bytes and its row says {}, want 4 x {} values",
+            what(),
+            raw.len(),
+            row.bytes,
+            row.count()
+        )
         .into());
     }
-    Ok(raw
-        .as_chunks::<4>()
+    let visible = f32_to_f16_bits(f32::from_bits(ZERO));
+    let hidden = f32_to_f16_bits(f32::from_bits(MINUS_INF));
+    raw.as_chunks::<4>()
         .0
         .iter()
-        .take(rows * width)
-        .map(|c| f32_to_f16_bits(f32::from_le_bytes(*c)))
-        .collect())
+        .enumerate()
+        .map(|(i, b)| match u32::from_le_bytes(*b) {
+            ZERO => Ok(visible),
+            MINUS_INF => Ok(hidden),
+            v => Err(format!(
+                "mask_bits: {} holds {} at {i}, neither 0 nor -inf",
+                what(),
+                f32::from_bits(v)
+            )
+            .into()),
+        })
+        .collect()
+}
+
+/// The expert count the top-k readers without a bound check ids against:
+/// that of the model the V2-Lite sets were dumped from.
+const TOPK_IDS_BOUND: u32 = 64;
+
+/// [`topk_ids_logical_in`] of a row of `ref_dir()`'s manifest, which it
+/// reads on every call: a gate reading more than one row holds a
+/// [`RefManifest`] and calls [`topk_ids_logical_in`] or
+/// [`topk_ids_logical_within`].
+pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
+    topk_ids_logical_in(&RefManifest::read(&ref_dir())?, row)
+}
+
+/// [`topk_ids_logical_within`] of a row of `man`, a manifest already read,
+/// with every id in `0..64`, the V2-Lite model's expert count.
+pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, GateError> {
+    topk_ids_logical_within(man, row, TOPK_IDS_BOUND)
 }
 
 /// The topk row's ids from its LOGICAL twin: `ffn_moe_topk-L` is an i32
@@ -1134,15 +1508,14 @@ pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError
 /// For a set whose manifest has no `int` rows at all (dumped before integer
 /// twins existed) it reads the `.logical.f32` twin, each id cast to f32 by
 /// the dumper. Accepted only when the row carries a logical twin and every
-/// id is an integer in `0..64`, which rules out any stride or cast mix-up;
-/// the manifest's element-sum column describes the plain file and is not
-/// checked here. `row` is a row of `ref_dir()`'s manifest, read here.
-pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
-    topk_ids_logical_in(&RefManifest::read(&ref_dir())?, row)
-}
-
-/// [`topk_ids_logical`] of a row of `man`, a manifest already read.
-pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, GateError> {
+/// id is an integer in `0..n_expert`, which rules out any stride or cast
+/// mix-up; the manifest's element-sum column describes the plain file and
+/// is not checked here. `row` is a row of `man`.
+pub fn topk_ids_logical_within(
+    man: &RefManifest,
+    row: &RefRow,
+    n_expert: u32,
+) -> Result<Vec<i32>, GateError> {
     if row.logical != Some(1) {
         return Err(format!(
             "topk_ids_logical: {} has no logical twin — the ids need a v2 dump set",
@@ -1165,9 +1538,9 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
         return ids
             .iter()
             .map(|&v| match i32::try_from(v) {
-                Ok(id) if (0..64).contains(&id) => Ok(id),
+                Ok(id) if u32::try_from(id).is_ok_and(|e| e < n_expert) => Ok(id),
                 _ => Err(format!(
-                    "topk_ids_logical: {}/{} holds id {v}, outside 0..64",
+                    "topk_ids_logical: {}/{} holds id {v}, outside 0..{n_expert}",
                     row.name, row.occurrence
                 )
                 .into()),
@@ -1193,7 +1566,7 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
         .iter()
         .map(|c| {
             let v = f32::from_le_bytes(*c);
-            if v.fract() == 0.0 && (0.0..64.0).contains(&v) {
+            if v.fract() == 0.0 && (0.0..f64::from(n_expert)).contains(&f64::from(v)) {
                 Ok(v as i32)
             } else {
                 Err(format!(
@@ -1208,20 +1581,43 @@ pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, 
 
 #[cfg(test)]
 mod tests {
-    use super::{GateError, RefManifest, max_rel_err, topk_ids_logical_in};
+    use super::{
+        GateError, Layout, RefManifest, RowKind, find_int_row, find_ref_row_in, mask_bits_in,
+        max_rel_err, topk_ids_logical_in, topk_ids_logical_within, widened_f16_bits_in,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// A fresh directory for one test's set; tests of one process run in
+    /// parallel, so each passes its own `what`.
+    fn set_dir(what: &str) -> Result<PathBuf, GateError> {
+        let dir = std::env::temp_dir().join(format!("bloomery-{what}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// `lines` as the set's MANIFEST.tsv, read back.
+    fn manifest(dir: &Path, lines: &[&str]) -> Result<RefManifest, GateError> {
+        std::fs::write(dir.join("MANIFEST.tsv"), lines.join("\n") + "\n")?;
+        RefManifest::read(dir)
+    }
+
+    fn f32_file(path: &Path, vals: &[f32]) -> Result<(), GateError> {
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
 
     /// The top-k reader takes the exact `.logical.i32` twin when the
     /// manifest has `int` rows and the `.logical.f32` twin when it has none
     /// — the f32 file below disagrees in one id, so the result shows which
     /// file was read — and a manifest with twins but none for the row is an
-    /// error. The name has a space, so the files resolve only through the
-    /// dumper's `safe_name` rule.
+    /// error. Ids are bounded by the caller's expert count, V2-Lite's 64
+    /// where none is given. The name has a space, so the files resolve only
+    /// through the dumper's `safe_name` rule.
     #[test]
     fn topk_ids_take_the_integer_twin_when_the_set_has_twins() -> Result<(), GateError> {
-        let dir = std::env::temp_dir().join(format!("bloomery-topk-twin-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
+        let dir = set_dir("topk-twin")?;
         let ids: [i32; 4] = [3, 63, 0, 17];
-        let cast: [f32; 4] = [3.0, 63.0, 0.0, 16.0];
         let stem = "ffn_moe_topk-1_(view).0.logical";
         std::fs::write(
             dir.join(format!("{stem}.i32")),
@@ -1229,26 +1625,227 @@ mod tests {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<u8>>(),
         )?;
-        std::fs::write(
-            dir.join(format!("{stem}.f32")),
-            cast.iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )?;
+        f32_file(&dir.join(format!("{stem}.f32")), &[3.0, 63.0, 0.0, 16.0])?;
         let tensor =
             "tensor\tffn_moe_topk-1 (view)\t0\ti32\t2\t2\t1\t1\t16\t0.000000\tVIEW\t0\t1\t-\t-";
         let int = format!(
             "int\tffn_moe_topk-1 (view)\t0\ttensor\ti32\ti32\tlogical\t4\t16\t83\t63\t{stem}.i32"
         );
         let other = int.replacen("\t0\t", "\t1\t", 1);
-        let read = |rows: &[&str]| -> Result<Vec<i32>, GateError> {
-            std::fs::write(dir.join("MANIFEST.tsv"), rows.join("\n") + "\n")?;
-            let man = RefManifest::read(&dir)?;
-            topk_ids_logical_in(&man, &man.tensors[0])
-        };
-        assert_eq!(read(&[tensor, &int])?, ids);
-        assert_eq!(read(&[tensor])?, [3, 63, 0, 16]);
-        assert!(read(&[tensor, &other]).is_err());
+        let twins = manifest(&dir, &[tensor, &int])?;
+        assert_eq!(topk_ids_logical_in(&twins, &twins.tensors[0])?, ids);
+        assert!(topk_ids_logical_within(&twins, &twins.tensors[0], 63).is_err());
+        let cast = manifest(&dir, &[tensor])?;
+        assert_eq!(
+            topk_ids_logical_in(&cast, &cast.tensors[0])?,
+            [3, 63, 0, 16]
+        );
+        assert!(topk_ids_logical_within(&cast, &cast.tensors[0], 63).is_err());
+        let unmatched = manifest(&dir, &[tensor, &other])?;
+        assert!(topk_ids_logical_in(&unmatched, &unmatched.tensors[0]).is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The index finds a row by `(kind, name, occurrence)` — a tensor and an
+    /// input of one name are two rows — and of a key two rows carry, the
+    /// first, the row a scan in file order finds; the second is counted as a
+    /// duplicate. An `int` row is found by its twin's kind and layout too.
+    #[test]
+    fn the_index_finds_the_row_a_scan_finds_first() -> Result<(), GateError> {
+        let dir = set_dir("index")?;
+        let man = manifest(
+            &dir,
+            &[
+                "tensor\tx\t0\tf32\t1\t1\t1\t1\t4\t1.0\tADD",
+                "tensor\tx\t1\tf32\t1\t1\t1\t1\t4\t2.0\tADD",
+                "input\tx\t0\tf32\t1\t1\t1\t1\t4\t3.0\tNONE",
+                "tensor\tx\t0\tf32\t1\t1\t1\t1\t4\t4.0\tADD",
+                "int\tp\t0\tinput\ti32\ti32\tflat\t1\t4\t7\t7\tp.0.input.i32",
+                "int\tp\t0\tinput\ti32\ti32\tlogical\t1\t4\t7\t7\tp.0.input.logical.i32",
+            ],
+        )?;
+        let sum = |r: Option<&super::RefRow>| r.map(|r| r.sum);
+        assert_eq!(sum(man.find(RowKind::Tensor, "x", 0)), Some(1.0));
+        assert_eq!(
+            sum(man.find(RowKind::Tensor, "x", 0)),
+            Some(find_ref_row_in(&dir, &man.tensors, "x", 0)?.sum)
+        );
+        assert_eq!(man.tensor("x", 1)?.sum, 2.0);
+        assert_eq!(man.input("x", 0)?.sum, 3.0);
+        assert!(man.find(RowKind::Input, "x", 1).is_none());
+        assert!(man.tensor("y", 0).is_err());
+        assert_eq!(man.duplicate_keys(), 1);
+        let twin = find_int_row(&man, "p", 0, RowKind::Input, Layout::Logical)?;
+        assert_eq!(twin.file, "p.0.input.logical.i32");
+        assert!(find_int_row(&man, "p", 0, RowKind::Tensor, Layout::Flat).is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// Every header line the V4.1 and V2-Lite sets carry, spelled as they
+    /// spell it (long values shortened): a known key fills its field — `-c`
+    /// out of `# flags`, the step out of `# tokens` and `# decode_pos` —
+    /// every other `#` line is kept verbatim in file order, and a known key
+    /// twice or a value that does not parse is an error.
+    #[test]
+    fn header_lines_fill_their_fields_or_are_kept() -> Result<(), GateError> {
+        let dir = set_dir("header")?;
+        let title = "# dump_ref — ik_llama.cpp intermediate tensors, raw f32, little-endian";
+        let model = "# model\t/models/M/M-00001-of-00009.gguf";
+        let schedule =
+            "# prefill_schedule\tevery-node — each node was asked for and computed alone";
+        let columns = [
+            "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1",
+            "# int\tname\toccurrence\tof\ttype\ttwin\tlayout\tcount\tbytes\tsum\tabsmax\tfile",
+            "# input\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1",
+        ];
+        let row = "tensor\tinp_embd\t0\tf32\t2\t1\t1\t1\t8\t0.5\tGET_ROWS";
+        let step = [
+            title,
+            model,
+            "# build\t49ef19d0",
+            "# arch\tdeepseek41",
+            "# model_file\tM-00001-of-00009.gguf",
+            "# tokens\t5,19415,271",
+            "# flags\t-m /models/M/M-00001-of-00009.gguf --expect-arch deepseek41 --tokens-file /d/c.ids \
+             --tokens-count 3 -ngl 0 -c 2048 -t 32 --defer-experts --decode-step --no-fused-idx-topk",
+            "# tokens_file\t/d/c.ids",
+            "# tokens_file_sha256\tf7785d0f",
+            "# tokens_count\t3",
+            "# prefill\t2",
+            "# decode_pos\t2",
+            schedule,
+            "# state_inputs\tpersistent leaves the step reads are input rows",
+            "# fused_idx_topk\t0",
+            columns[0],
+            columns[1],
+            columns[2],
+            row,
+            "# complete\t1\t0",
+        ];
+        let man = manifest(&dir, &step)?;
+        let h = &man.header;
+        assert_eq!(man.arch.as_deref(), Some("deepseek41"));
+        assert_eq!(man.build.as_deref(), Some("49ef19d0"));
+        assert_eq!(man.complete, Some((1, 0)));
+        assert_eq!(h.model_file.as_deref(), Some("M-00001-of-00009.gguf"));
+        assert_eq!(h.tokens.as_deref(), Some(&[5, 19415, 271][..]));
+        assert_eq!(h.tokens_file.as_deref(), Some("/d/c.ids"));
+        assert_eq!(h.tokens_file_sha256.as_deref(), Some("f7785d0f"));
+        assert_eq!(h.tokens_count, Some(3));
+        assert!(
+            h.flags
+                .as_deref()
+                .is_some_and(|f| f.ends_with("--no-fused-idx-topk"))
+        );
+        assert_eq!(h.ctx, Some(2048));
+        assert_eq!((h.prefill, h.decode_pos), (Some(2), Some(2)));
+        assert!(h.state_inputs.is_some());
+        assert_eq!(h.fused_idx_topk, Some(false));
+        assert_eq!(
+            h.other,
+            [title, model, schedule, columns[0], columns[1], columns[2]]
+        );
+        assert_eq!(man.step()?, (2, &[271][..], &[5, 19415][..]));
+
+        // A V2-Lite set: no V4.1 line, the 11-column rows; its step is the
+        // whole sequence from position 0.
+        let v2 = manifest(
+            &dir,
+            &[
+                title,
+                "# model\t/models/small/L.gguf",
+                "# build\tc10fbbcc",
+                "# tokens\t100000,549",
+                "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top",
+                row,
+                "# complete\t1\t0",
+            ],
+        )?;
+        let h = &v2.header;
+        assert_eq!(
+            (v2.arch.as_deref(), v2.build.as_deref()),
+            (None, Some("c10fbbcc"))
+        );
+        assert_eq!(
+            (h.model_file.as_deref(), h.flags.as_deref(), h.ctx),
+            (None, None, None)
+        );
+        assert_eq!(
+            (h.prefill, h.decode_pos, h.fused_idx_topk),
+            (None, None, None)
+        );
+        assert_eq!(h.other.len(), 3);
+        assert_eq!(v2.step()?, (0, &[100000, 549][..], &[][..]));
+
+        for bad in [
+            "# tokens\t5,x",
+            "# flags\t-m M.gguf -c",
+            "# fused_idx_topk\tyes",
+            "# decode_pos\t-1",
+            "# build\tc10fbbcc",
+        ] {
+            let lines = ["# build\tc10fbbcc", bad, row];
+            assert!(manifest(&dir, &lines).is_err(), "{bad:?} parsed");
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The mask reader maps `0.0` and `-inf` to their f16 bits and refuses
+    /// every other value — `-0.0` and NaN too — naming the row and the first
+    /// offending value, and a row that is not f16.
+    #[test]
+    fn mask_bits_take_zero_and_minus_infinity_only() -> Result<(), GateError> {
+        let dir = set_dir("mask")?;
+        let node = "tensor\tx\t0\tf32\t1\t1\t1\t1\t4\t0\tNONE";
+        let row = "input\tkq_mask\t0\tf16\t2\t2\t1\t1\t16\t-inf\tNONE\t1\t0\t-\t-";
+        let man = manifest(&dir, &[node, row])?;
+        let file = dir.join(man.inputs[0].file_name());
+        let ninf = f32::NEG_INFINITY;
+        f32_file(&file, &[0.0, ninf, ninf, 0.0])?;
+        assert_eq!(
+            mask_bits_in(&dir, &man.inputs[0])?,
+            [0x0000, 0xfc00, 0xfc00, 0x0000]
+        );
+        for (bad, shown) in [(-0.0f32, "-0"), (1.0, "1"), (f32::NAN, "NaN")] {
+            f32_file(&file, &[0.0, ninf, bad, bad])?;
+            let e = mask_bits_in(&dir, &man.inputs[0]).unwrap_err().to_string();
+            assert!(
+                e.contains("kq_mask/0") && e.contains(&format!("holds {shown} at 2,")),
+                "{e}"
+            );
+        }
+        let not_f16 = manifest(&dir, &[node, &row.replace("\tf16\t", "\tf32\t")])?;
+        assert!(mask_bits_in(&dir, &not_f16.inputs[0]).is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// The widened-f16 reader returns the rows asked for, in the order asked,
+    /// as f16 bits, and reads no other row: a row holding a value no half
+    /// widens to is refused when asked for and passes unread otherwise; a
+    /// row past the tensor is an error.
+    #[test]
+    fn widened_f16_bits_read_only_the_rows_asked_for() -> Result<(), GateError> {
+        let dir = set_dir("widened")?;
+        let row = "tensor\tcache\t0\tf16\t2\t3\t1\t1\t24\t0\tVIEW\t1\t0\t-\t-";
+        let man = manifest(&dir, &[row])?;
+        let cache = &man.tensors[0];
+        let min_normal = 2.0f32.powi(-14);
+        f32_file(
+            &dir.join(cache.file_name()),
+            &[1.0, -2.0, 0.1, 0.5, 65504.0, min_normal],
+        )?;
+        assert_eq!(
+            widened_f16_bits_in(&dir, cache, &[2, 0])?,
+            [0x7bff, 0x0400, 0x3c00, 0xc000]
+        );
+        assert!(widened_f16_bits_in(&dir, cache, &[1]).is_err());
+        assert!(widened_f16_bits_in(&dir, cache, &[3]).is_err());
+        let not_f16 = manifest(&dir, &[&row.replace("\tf16\t", "\tf32\t")])?;
+        assert!(widened_f16_bits_in(&dir, &not_f16.tensors[0], &[0]).is_err());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
