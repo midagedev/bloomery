@@ -8,6 +8,9 @@
 //! `⌈ctx_max / r⌉` rows of latent plus index key in f16, and a pooling state of
 //! r latent rows in f32, twice (values and scores). The layers that read a
 //! source's stream hold none of it.
+//!
+//! The window and every layer's ratio are also what the step plan
+//! ([`super::plan`]) is laid out from; this is the one reader of those keys.
 
 use gguf::{Split, Value};
 
@@ -29,16 +32,19 @@ struct Source {
 pub struct KvLayout {
     window: u64,
     latent: u64,
+    /// Per layer: its compression ratio, 0 on a window-only layer.
+    ratios: Vec<u64>,
     /// Per layer: the stream it sources, if any.
     sources: Vec<Option<Source>>,
 }
 
 impl KvLayout {
     /// The window from `attention.sliding_window`, the latent width from
-    /// `attn_kv`'s output dim (one width on every layer), the sources from the
-    /// tensors, each source's ratio from `attention.compress_ratios` and its
-    /// index key width from `indexer.attn_k`'s output dim; a missing key or
-    /// tensor is an error naming it.
+    /// `attn_kv`'s output dim (one width on every layer), every layer's ratio
+    /// from `attention.compress_ratios` (which must cover every layer, as the
+    /// port's loader requires), the sources from the tensors and each
+    /// source's index key width from `indexer.attn_k`'s output dim; a missing
+    /// key or tensor is an error naming it.
     pub fn from_file(split: &Split) -> Result<KvLayout, PlacementError> {
         let layers = meta_usize(split, "block_count")?;
         let window = meta_u64(split, "attention.sliding_window")?;
@@ -50,6 +56,7 @@ impl KvLayout {
             });
         };
         let mut latent = None;
+        let mut layer_ratios = Vec::with_capacity(layers);
         let mut sources = Vec::with_capacity(layers);
         for l in 0..layers {
             let kv_name = format!("blk.{l}.attn_kv.weight");
@@ -61,6 +68,13 @@ impl KvLayout {
                 });
             }
             latent = Some(width);
+            let ratio = ratios.get(l).and_then(Value::as_unsigned).ok_or_else(|| {
+                PlacementError::Metadata {
+                    key: ratios_key.clone(),
+                    detail: format!("has no ratio for layer {l}"),
+                }
+            })?;
+            layer_ratios.push(ratio);
             if split
                 .find(&format!("blk.{l}.attn_compressor_kv.weight"))
                 .is_none()
@@ -68,20 +82,19 @@ impl KvLayout {
                 sources.push(None);
                 continue;
             }
-            let ratio = ratios
-                .get(l)
-                .and_then(Value::as_unsigned)
-                .filter(|&r| r > 0)
-                .ok_or_else(|| PlacementError::Metadata {
+            if ratio == 0 {
+                return Err(PlacementError::Metadata {
                     key: ratios_key.clone(),
                     detail: format!("has no ratio above 0 for layer {l}, which sources a stream"),
-                })?;
+                });
+            }
             let index_key = out_dim(split, &format!("blk.{l}.indexer.attn_k.weight"))?;
             sources.push(Some(Source { ratio, index_key }));
         }
         Ok(KvLayout {
             window,
             latent: latent.unwrap_or(0),
+            ratios: layer_ratios,
             sources,
         })
     }
@@ -92,6 +105,16 @@ impl KvLayout {
             .iter()
             .enumerate()
             .filter_map(|(l, s)| s.map(|s| (l, s.ratio)))
+    }
+
+    /// `attention.sliding_window`: the positions a token's window spans, its own included.
+    pub fn window(&self) -> u64 {
+        self.window
+    }
+
+    /// Every layer's compression ratio, 0 on a window-only layer.
+    pub fn ratios(&self) -> &[u64] {
+        &self.ratios
     }
 }
 

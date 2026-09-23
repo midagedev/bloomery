@@ -1,8 +1,10 @@
 //! `deepseek41` — DeepSeek-V4.1-Flash. The host code that knows this model; so
-//! far what placement needs: the role of every tensor (`roles`) and the KV
-//! bytes each layer holds (`kv`).
+//! far what placement needs — the role of every tensor (`roles`) and the KV
+//! bytes each layer holds (`kv`) — and the integers each step's graph reads
+//! (`plan`).
 
 pub mod kv;
+pub mod plan;
 pub mod roles;
 
 use gguf::Split;

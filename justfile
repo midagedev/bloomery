@@ -519,6 +519,10 @@ gate-gpu-gates-lib:
 gate-ds41-oracle:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_oracle --nocapture'
 
+# The V4.1 host step plan: its decode-walk unit tests, then every graph input of the V4.1 oracle sets (the batch set and the decode-step sets) against the plan, bit for bit (host only: no card, no gate lock).
+gate-ds41-plan:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && timeout --kill-after=10 900 ./target/release/gate_deepseek41_plan'
+
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
 # 들어가면 쓰레기를 낸다(upstream의 MMQ 경로, mainline이 양자화한 파일에서만). 그래서 argmax.sh가 --step-prefill(M=1 경로)로 먹인다 —
