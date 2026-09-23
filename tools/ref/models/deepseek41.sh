@@ -10,8 +10,10 @@
 #
 #   MODEL           shard 1 of the split set; the loader follows split.count from there.
 #                   BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored, as in deepseek2.sh
-#   IK              moves the whole ik tree. The default is our V4.1 port (PR #2455), the tree the
-#                   V2-Lite dumper already links; its V4.1 path has only run on the CPU (-ngl 0)
+#   IK              moves the whole ik tree. The default is our V4.1 port (PR #2455) with the index-key
+#                   fix (PR #2507) on the local branch v41/idxkey-fix, a worktree of the V2-Lite
+#                   profile's tree; its V4.1 path has only run on the CPU (-ngl 0). The two profiles'
+#                   trees differ, so dump.sh refuses a dump_ref built against the other one ([foreign-lib])
 #   REF_CTX         the one context the reference files are produced at
 #   REF_SET_CPU     ref_deepseek41 under $BLOOMERY_DATA — flat, a sibling of ref, ref_cuda and
 #                   ref_cuda_v2, because every reader resolves a set as $BLOOMERY_DATA/<one name>
@@ -33,7 +35,7 @@
 # see from this file alone.
 # shellcheck disable=SC2034
 MODEL_NAME=deepseek41
-: "${IK:=/home/user/ik_llama.cpp}"
+: "${IK:=/home/user/ik-idxkey}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_deepseek41}"

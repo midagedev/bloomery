@@ -108,6 +108,18 @@ fi
 LEASE=${REF_DUMP_LEASE:-0}
 BIN="$BLOOMERY_DATA/bin/dump_ref"
 [ -x "$BIN" ] || { echo "no dump_ref at $BIN — run: just build-ref-dump" >&2; exit 2; }
+# One dump_ref serves every profile, and the manifest's `# build` names $IK: a binary linked against
+# another ik tree would write that tree's answer under this tree's name. It must load both libraries
+# from $IK's build.
+IK_REAL=$(readlink -f "$IK")
+for lib in libllama.so libggml.so; do
+  got=$(ldd "$BIN" 2>/dev/null | awk -v l="$lib" '$1 == l { print $3 }' || true)
+  case $(readlink -f "$got" 2>/dev/null) in
+    "$IK_REAL"/build/*) ;;
+    *) echo "[foreign-lib] $BIN loads $lib from '${got:-nowhere}', not from $IK/build —" \
+         "rebuild it: IK=$IK bash tools/ref/build-dump.sh" >&2; exit 3 ;;
+  esac
+done
 
 # witness <tag>: the machine state the lease is supposed to guarantee, as one block. The device
 # is the one the model file lives on; its sector count is machine-wide, so under the lease the
@@ -147,7 +159,11 @@ mkdir -p "$STAGE"
 # reference is that build's answer and nothing else's.
 # $IK comes from ref-paths.sh, the file build-dump.sh reads too — the tree this binary was
 # linked against. Not $HOME/ik_llama.cpp: the dump runs as root and the tree is the serving user's.
-BUILD=$(git -C "$IK" rev-parse --short HEAD 2>/dev/null || echo unknown)
+# The tree belongs to the serving user and may be a worktree, so root's git needs safe.directory to
+# read it; `-dirty` marks a build from uncommitted changes.
+ikgit() { git -c safe.directory='*' -C "$IK" "$@"; }
+BUILD=$(ikgit rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+if [ "$BUILD" != unknown ] && ! ikgit diff --quiet HEAD 2>/dev/null; then BUILD="$BUILD-dirty"; fi
 
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
