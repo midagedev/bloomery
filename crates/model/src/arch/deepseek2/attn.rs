@@ -557,6 +557,10 @@ thread_local! {
     /// The serial row path's per-segment partial accumulators, one latent
     /// range per segment, per worker.
     static FLASH_PARTS: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// The tile segment kernel's per-position scores (then weights), `nh`
+    /// per position, and the segment's unmasked positions, per worker.
+    static FLASH_TILE_S: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static FLASH_TILE_ACT: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `q_nope2 = wk_b(Q8_0)ᵀ · q_nope` per head — the weight-absorption step.
@@ -759,6 +763,114 @@ fn v_expf(x: f32) -> f32 {
     }
 }
 
+/// [`v_expf`] on eight lanes: the same operations lane by lane — every
+/// `mul_add` one fused multiply-add, the bit steps exact integer ops, and the
+/// scalar's `|n| > 126` / `|n| > 192` branches taken as per-lane selects of
+/// results computed both ways — so every lane carries the scalar function's
+/// bits (`v_expf8_is_bit_identical_to_v_expf` below pins it).
+///
+/// # Safety
+/// The CPU must support AVX2+FMA; this inlines into the `#[target_feature]`
+/// kernels that call it and takes their features.
+#[inline(always)]
+unsafe fn v_expf8(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    // SAFETY: the fn contract — ISA from the caller; register-only ops.
+    unsafe {
+        use std::arch::x86_64::*;
+        let r = _mm256_set1_ps(f32::from_bits(0x4B40_0000));
+        let z = _mm256_fmadd_ps(x, _mm256_set1_ps(f32::from_bits(0x3FB8_AA3B)), r);
+        let n = _mm256_sub_ps(z, r);
+        let b = _mm256_fmadd_ps(
+            n,
+            _mm256_set1_ps(-f32::from_bits(0x35BF_BE8E)),
+            _mm256_fmadd_ps(n, _mm256_set1_ps(-f32::from_bits(0x3F31_7200)), x),
+        );
+        let e = _mm256_slli_epi32::<23>(_mm256_castps_si256(z));
+        let k = _mm256_castsi256_ps(_mm256_add_epi32(e, _mm256_set1_epi32(0x3f80_0000)));
+        let abs_n = _mm256_andnot_ps(_mm256_set1_ps(-0.0), n);
+        let c = _mm256_cmp_ps::<_CMP_GT_OQ>(abs_n, _mm256_set1_ps(126.0));
+        let u = _mm256_mul_ps(b, b);
+        let j = _mm256_fmadd_ps(
+            _mm256_fmadd_ps(
+                _mm256_fmadd_ps(
+                    _mm256_set1_ps(f32::from_bits(0x3C07_2010)),
+                    b,
+                    _mm256_set1_ps(f32::from_bits(0x3D2B_9F17)),
+                ),
+                u,
+                _mm256_fmadd_ps(
+                    _mm256_set1_ps(f32::from_bits(0x3E2A_AF33)),
+                    b,
+                    _mm256_set1_ps(f32::from_bits(0x3EFF_FEDB)),
+                ),
+            ),
+            u,
+            _mm256_mul_ps(_mm256_set1_ps(f32::from_bits(0x3F7F_FFF6)), b),
+        );
+        let fast = _mm256_fmadd_ps(j, k, k);
+        let g = _mm256_and_si256(
+            _mm256_castps_si256(_mm256_cmp_ps::<_CMP_LE_OQ>(n, _mm256_setzero_ps())),
+            _mm256_set1_epi32(0x8200_0000u32 as i32),
+        );
+        let s1 = _mm256_castsi256_ps(_mm256_add_epi32(g, _mm256_set1_epi32(0x7f00_0000)));
+        let s2 = _mm256_castsi256_ps(_mm256_sub_epi32(e, g));
+        let huge = _mm256_cmp_ps::<_CMP_GT_OQ>(abs_n, _mm256_set1_ps(192.0));
+        let slow = _mm256_blendv_ps(
+            _mm256_mul_ps(_mm256_fmadd_ps(s2, j, s2), s1),
+            _mm256_mul_ps(s1, s1),
+            huge,
+        );
+        _mm256_blendv_ps(fast, slow, c)
+    }
+}
+
+/// The documented lane tree of one 8-lane accumulator — this order is the
+/// gate: `((a0+a4) + (a1+a5)) + ((a2+a6) + (a3+a7))`, the 128-bit halves first,
+/// then lane pairs ([`kq_dot_fa4_avx2`] ends the same way).
+///
+/// # Safety
+/// The CPU must support AVX2; inlines into its `#[target_feature]` caller.
+#[inline(always)]
+unsafe fn lane_tree8(s: std::arch::x86_64::__m256) -> f32 {
+    // SAFETY: the fn contract — register-only ops.
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
+        let t = _mm_add_ps(c, _mm_movehdup_ps(c));
+        _mm_cvtss_f32(_mm_add_ps(t, _mm_movehl_ps(t, t)))
+    }
+}
+
+/// [`lane_tree8`] of eight accumulators at once, lane `i` of the result the
+/// tree of `a[i]`: the same additions in the same association (half pairs
+/// by `vperm2f128`, lane pairs by two `vhaddps` rounds), then one lane
+/// permute back to natural order.
+///
+/// # Safety
+/// The CPU must support AVX2; inlines into its `#[target_feature]` caller.
+#[inline(always)]
+unsafe fn lane_tree8x8(a: &[std::arch::x86_64::__m256; 8]) -> std::arch::x86_64::__m256 {
+    // SAFETY: the fn contract — register-only ops.
+    unsafe {
+        use std::arch::x86_64::*;
+        // p[i] = [a[2i].lo + a[2i].hi | a[2i+1].lo + a[2i+1].hi]
+        let mut p = [_mm256_setzero_ps(); 4];
+        for (i, pi) in p.iter_mut().enumerate() {
+            *pi = _mm256_add_ps(
+                _mm256_permute2f128_ps::<0x20>(a[2 * i], a[2 * i + 1]),
+                _mm256_permute2f128_ps::<0x31>(a[2 * i], a[2 * i + 1]),
+            );
+        }
+        let h1 = _mm256_hadd_ps(p[0], p[1]);
+        let h2 = _mm256_hadd_ps(p[2], p[3]);
+        // Lanes of `hadd(h1, h2)` hold the trees of a[0,2,4,6 | 1,3,5,7].
+        _mm256_permutevar8x32_ps(
+            _mm256_hadd_ps(h1, h2),
+            _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7),
+        )
+    }
+}
+
 /// The QK dot in the fa4 gemm's own lane order (`mul_mat_Qx_Qy_MxN_fa4`, iqk_gemm_floats.cpp:256): per 8-element chunk, four fused adds land in a low partial (`8i+0..3`) and four in a high partial (`8i+4..7`); the dot is the single plain add of the two. `q` stays F32 (the FA node's q is never rounded to f16); every K element is the exact f32 of its f16 cache bits.
 /// The no-AVX2 fallback and the gate's scalar leg; the AVX2 twin ([`kq_dot_simd`]) computes the same contraction in a different sum order.
 pub fn kq_dot_fa4(q: &[f32], k: &[u16]) -> f32 {
@@ -812,7 +924,34 @@ unsafe fn kq_dot_fa4_avx2(q: &[f32], k: &[u16]) -> f32 {
     }
 }
 
-/// [`kq_dot_fa4_avx2`] behind the loud-failure wrapper the gate's path comparison calls (the `dot_row_avx2` pattern from `crates/qdot`): on a CPU without the ISA, panic — no quiet fall back.
+/// The tile kernels' QK dot for one (head, key) pair, standalone: one 8-lane
+/// accumulator, `acc = fma(q[8i..], k[8i..], acc)` over the octets ascending,
+/// then [`lane_tree8`]. Every tile shape of [`flash_tile_avx2`] runs exactly
+/// this per pair, so it is what the gates' δ measures on a tiled dispatch.
+///
+/// # Safety
+/// As [`kq_dot_fa4_avx2`], with `q.len()` a multiple of 8.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn kq_dot_lane8_avx2(q: &[f32], k: &[u16]) -> f32 {
+    // SAFETY: the fn contract above — ISA from the caller, lengths validated one step up.
+    unsafe {
+        use std::arch::x86_64::*;
+        let (qp, kp) = (q.as_ptr(), k.as_ptr());
+        let mut acc = _mm256_setzero_ps();
+        for o in (0..q.len()).step_by(8) {
+            let kv = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(o) as *const __m128i));
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(qp.add(o)), kv, acc);
+        }
+        lane_tree8(acc)
+    }
+}
+
+/// The QK dot the dispatch's AVX2 row kernel runs in this process, behind the
+/// loud-failure wrapper the gates' path comparisons call (the `dot_row_avx2`
+/// pattern from `crates/qdot`): [`kq_dot_lane8_avx2`] under the head-bundle
+/// tile ([`attn_bundle`] 8, the default), [`kq_dot_fa4_avx2`] under the
+/// per-head kernel (`BLOOMERY_ATTN_BUNDLE=1`). On a CPU without the ISA,
+/// panic — no quiet fall back.
 pub fn kq_dot_simd(q: &[f32], k: &[u16]) -> f32 {
     assert!(
         std::arch::is_x86_feature_detected!("avx2")
@@ -831,7 +970,13 @@ pub fn kq_dot_simd(q: &[f32], k: &[u16]) -> f32 {
         q.len()
     );
     // SAFETY: the ISA was asserted just above and the lengths meet the panel contract.
-    unsafe { kq_dot_fa4_avx2(q, k) }
+    unsafe {
+        if attn_bundle() == 1 {
+            kq_dot_fa4_avx2(q, k)
+        } else {
+            kq_dot_lane8_avx2(q, k)
+        }
+    }
 }
 
 /// `F16::reduce_add<32>` (iqk_fa_templates.h:54-206): `((v0+v1)+v2)+v3` elementwise over the four 8-lane registers, then `hsum_float_8`. Masked lanes hold exactly `0.0` and ride through the tree without changing any rounding.
@@ -857,23 +1002,32 @@ fn lane_tree_sum(w: &[f32; 32]) -> f32 {
 ///
 /// Split-K: a row's visible keys ([`visible_end`]) are cut into
 /// [`FLASH_SEGMENTS`] fixed segments of whole 32-key blocks ([`flash_segment`]);
-/// each runs the scan above on its own and leaves `(m, S, R)`, and
-/// [`combine_segments`] merges them in a fixed order. A row of ≤ 32 keys has one
-/// segment and keeps the single-pass bits; a longer one sums in a different order
-/// than ik's (whose split depends on its thread count) — `tests/attn.rs` bands it
-/// against the single-pass plan.
+/// each runs on its own and leaves `(m, S, R)`, and [`combine_segments`] merges
+/// them in a fixed order — `tests/attn.rs` bands the split against the
+/// single-segment plan.
 ///
-/// The two inner loops take the AVX2+FMA+F16C twin [`flash_seg_avx2`] when
-/// [`flash_simd`] allows; its one numerical difference is the kq sum order, which
-/// `tests/attn.rs` bands against [`flash_attn_latent_scalar`], the twin that stays
-/// bit-exact on exact inputs.
+/// The segment kernel is the head-bundle tile ([`flash_tile_scalar`] /
+/// [`flash_tile_avx2`], [`attn_bundle`] 8, the default): two passes over the
+/// segment — the segment's max first, so the weights need no rescale — with
+/// the scan above otherwise unchanged. On a one-segment row with one block
+/// (≤ 32 keys) the scalar tile is the scan above bit for bit.
+/// `BLOOMERY_ATTN_BUNDLE=1` runs the scan itself, online, per segment
+/// ([`flash_seg_scalar`] / [`flash_seg_avx2`]); `tests/attn.rs` bands the two
+/// kernels against each other. This chain runs every row through the kernel
+/// one head at a time; the fused dispatch bundles 8 heads per split-K item,
+/// and a head's bits do not depend on its bundle.
+///
+/// Either kernel takes its AVX2+FMA+F16C twin when [`flash_simd`] allows; the
+/// twins' one numerical difference is the kq sum order, which `tests/attn.rs`
+/// bands against [`flash_attn_latent_scalar`], the twin that stays bit-exact
+/// on exact inputs.
 ///
 /// Blocks with no allowed key are skipped outright: their weights are all exactly
 /// `0.0` ([`v_expf`]) and `S += 0` / `fma(V, 0, R) = R` are exact no-ops — skipping
 /// is bit-identical to executing them, and padded cache rows never enter for the same
-/// reason. One divergence from the reference: the M-bump rescale inside a segment
-/// uses `f32::exp` where ik uses glibc `expf` — reachable only in a segment holding
-/// more than one block with allowed keys.
+/// reason. One divergence from the reference, per-head kernel only: the M-bump
+/// rescale inside a segment uses `f32::exp` where ik uses glibc `expf` —
+/// reachable only in a segment holding more than one block with allowed keys.
 pub fn flash_attn_latent(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
@@ -1041,6 +1195,30 @@ fn flash_segments() -> usize {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(n) if (1..=FLASH_SEGMENTS).contains(&n) => n,
             _ => panic!("BLOOMERY_FLASH_SEGMENTS must be 1 to {FLASH_SEGMENTS}, got {v:?}"),
+        },
+    })
+}
+
+/// Heads per tile of the segment kernel ([`flash_tile_avx2`]): a split-K item
+/// is (segment, bundle of this many heads) and walks the segment's keys once
+/// per bundle; 8 accumulators fill the tile, one per head.
+const HEAD_BUNDLE: usize = 8;
+
+/// The segment kernel the flash plan runs: [`HEAD_BUNDLE`] (the default) is
+/// the tile kernel pair [`flash_tile_scalar`] / [`flash_tile_avx2`] on every
+/// path — split-K items bundle 8 heads, every per-row path runs it with one;
+/// `BLOOMERY_ATTN_BUNDLE=1` is the per-head online kernel pair
+/// [`flash_seg_scalar`] / [`flash_seg_avx2`] everywhere, the same-binary arm
+/// the tile is banded against (`tests/attn.rs`). Read once; any value but 1
+/// or 8 panics.
+fn attn_bundle() -> usize {
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| match std::env::var("BLOOMERY_ATTN_BUNDLE") {
+        Err(_) => HEAD_BUNDLE,
+        Ok(v) => match v.trim() {
+            "1" => 1,
+            "8" => HEAD_BUNDLE,
+            other => panic!("BLOOMERY_ATTN_BUNDLE must be 1 or 8, got {other:?}"),
         },
     })
 }
@@ -1246,6 +1424,7 @@ struct RowScratch {
     d_head: usize,
     d_len: usize,
     w: [f32; 32],
+    ts: TileScratch,
 }
 
 impl RowScratch {
@@ -1269,6 +1448,7 @@ impl RowScratch {
             d_head,
             d_len,
             w: [0.0; 32],
+            ts: TileScratch::take(),
         }
     }
 
@@ -1276,6 +1456,7 @@ impl RowScratch {
         FLASH_QROW.with(|c| *c.borrow_mut() = self.qrow);
         FLASH_R.with(|c| *c.borrow_mut() = self.r);
         FLASH_PARTS.with(|c| *c.borrow_mut() = self.parts);
+        self.ts.give_back();
     }
 }
 
@@ -1321,9 +1502,14 @@ fn flash_row(
     for s in 0..used {
         let keys = flash_segment(rk.n_vis, n_seg, s);
         let r_s = &mut sc.parts[s * d_len..(s + 1) * d_len];
-        let (m, s_sum) = flash_segment_row(simd, ahead, qrow, rk, p, keys, d_off, r_s, &mut sc.w);
-        ms[s] = m;
-        ss[s] = s_sum;
+        let seg = SegOut {
+            r: r_s,
+            m: &mut ms[s..=s],
+            s: &mut ss[s..=s],
+        };
+        flash_segment_heads(
+            simd, ahead, qrow, rk, p, keys, d_off, seg, &mut sc.ts, &mut sc.w,
+        );
     }
     let r = &mut sc.r[..d_len];
     let s_tot = combine_segments(&ms[..used], &ss[..used], &sc.parts, d_len, 0, r);
@@ -1334,30 +1520,63 @@ fn flash_row(
     }
 }
 
-/// One segment of one row through the row twin `simd` selects: `R` for the
-/// latent range `d_off..d_off + r.len()` into `r`, returning `(m, S)`.
+/// One segment's partials for `nh` heads of one query: `r` holds `nh`
+/// latent ranges of `d_len = r.len() / nh`, head `h` at `h·d_len`; `m` and `s`
+/// one cell per head.
+struct SegOut<'a> {
+    r: &'a mut [f32],
+    m: &'a mut [f32],
+    s: &'a mut [f32],
+}
+
+/// One segment of `nh` heads of one query row — `qrows` holds their FA rows
+/// back to back, `seg.m.len() == nh` — through the segment kernel
+/// [`attn_bundle`] selects and the twin `simd` selects: `R` for the latent
+/// range `d_off..d_off + d_len` of each head into `seg.r`, `(m, S)` into
+/// `seg.m` / `seg.s`. Under the tile each head's bits are the same whatever
+/// `nh` is; under the per-head kernel the heads simply run one after another.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the segment kernel's operands plus the twin choice"
+    reason = "the segment kernel's operands, its scratch and the twin choice"
 )]
-fn flash_segment_row(
+fn flash_segment_heads(
     simd: bool,
     ahead: usize,
-    qrow: &[f32],
+    qrows: &[f32],
     rk: &RowKeys<'_>,
     p: &MlaParams,
     keys: Range<usize>,
     d_off: usize,
-    r: &mut [f32],
+    seg: SegOut<'_>,
+    ts: &mut TileScratch,
     w: &mut [f32; 32],
-) -> (f32, f32) {
-    if simd {
-        // SAFETY: `simd` is `flash_simd`'s verdict (ISA and panel shapes); every
-        // dispatch asserts `keys16.width() == d_head`, sizes `qrow` to `d_head`,
-        // and keeps `d_off + r.len() <= latent` with `r.len() % 8 == 0`.
-        unsafe { flash_seg_avx2(qrow, rk, p, keys, ahead, d_off, r, w) }
-    } else {
-        flash_seg_scalar(qrow, rk, p, keys, d_off, r, w)
+) {
+    let nh = seg.m.len();
+    let d_head = p.rope_dims + p.latent;
+    let d_len = seg.r.len() / nh;
+    debug_assert!(nh <= HEAD_BUNDLE && seg.s.len() == nh && qrows.len() == nh * d_head);
+    if attn_bundle() != 1 {
+        if simd {
+            // SAFETY: `simd` is `flash_simd`'s verdict (ISA and panel shapes);
+            // every dispatch asserts `keys16.width() == d_head`, sizes `qrows`
+            // to `nh·d_head`, and keeps `d_off + d_len <= latent`, `d_len % 8 == 0`.
+            unsafe { flash_tile_avx2(qrows, rk, p, keys, ahead, d_off, seg, ts) }
+        } else {
+            flash_tile_scalar(qrows, rk, p, keys, d_off, seg, ts);
+        }
+        return;
+    }
+    for h in 0..nh {
+        let qrow = &qrows[h * d_head..(h + 1) * d_head];
+        let r = &mut seg.r[h * d_len..(h + 1) * d_len];
+        let (m, s_sum) = if simd {
+            // SAFETY: as above, for one head's row and latent range.
+            unsafe { flash_seg_avx2(qrow, rk, p, keys.clone(), ahead, d_off, r, w) }
+        } else {
+            flash_seg_scalar(qrow, rk, p, keys.clone(), d_off, r, w)
+        };
+        seg.m[h] = m;
+        seg.s[h] = s_sum;
     }
 }
 
@@ -1496,8 +1715,9 @@ pub unsafe fn flash_v_accum_avx2(
     }
 }
 
-/// One segment of one query row, scalar transcription — the no-AVX2 fallback
-/// and the gates' oracle (see [`flash_attn_latent_scalar`]); the AVX2 twin
+/// One segment of one query row under the per-head kernel
+/// (`BLOOMERY_ATTN_BUNDLE=1`), scalar transcription — the no-AVX2 fallback
+/// and that kernel's oracle (see [`flash_attn_latent_scalar`]); the AVX2 twin
 /// below differs ONLY in the two vectorized inner loops.
 ///
 /// `qrow` is the row's `[q_rope ; q_nope2]`. The keys are `keys` (whole
@@ -1736,6 +1956,386 @@ unsafe fn flash_seg_avx2(
     }
 }
 
+/// A worker's recycled scratch for the tile segment kernel: per position of
+/// the segment (rows padded to whole 32-key blocks) `nh` scores, overwritten
+/// in place by the weights, and the segment's unmasked positions. Taken from
+/// the thread-locals once per chunk; only ever grown.
+struct TileScratch {
+    s: Vec<f32>,
+    act: Vec<u32>,
+}
+
+impl TileScratch {
+    fn take() -> Self {
+        TileScratch {
+            s: FLASH_TILE_S.with(|c| std::mem::take(&mut *c.borrow_mut())),
+            act: FLASH_TILE_ACT.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        }
+    }
+
+    fn give_back(self) {
+        FLASH_TILE_S.with(|c| *c.borrow_mut() = self.s);
+        FLASH_TILE_ACT.with(|c| *c.borrow_mut() = self.act);
+    }
+
+    /// The segment's unmasked positions into `act` (ascending) and `nh`
+    /// scores per padded position set to `−inf`; returns the padded row
+    /// count. The mask is the query's, so it is the same for every head.
+    fn prepare(&mut self, keys: &Range<usize>, nh: usize, rk: &RowKeys<'_>) -> usize {
+        let rows = keys.len().div_ceil(FLASH_BLOCK) * FLASH_BLOCK;
+        self.act.clear();
+        // Whole blocks at once: a push-grown list would reallocate each time
+        // the segment passes a power of two.
+        self.act.reserve(rows);
+        for u in keys.clone() {
+            let su = &rk.key_slots[u];
+            if su.seq == rk.q_slot.seq && su.pos <= rk.q_slot.pos {
+                self.act.push(u as u32);
+            }
+        }
+        if self.s.len() < rows * nh {
+            self.s.resize(rows * nh, 0.0);
+        }
+        self.s[..rows * nh].fill(f32::NEG_INFINITY);
+        rows
+    }
+}
+
+/// The tile segment kernel, scalar transcription — the no-AVX2 fallback and
+/// the gates' oracle under the tile ([`attn_bundle`] 8); the AVX2 twin below
+/// differs ONLY in the kq dot's sum order. Two passes over the segment, per
+/// head `h` of the `nh = seg.m.len()` whose FA rows `qrows` holds:
+///
+///   * scores `s_u = kq_scale · kq(q_h, k_u)` at the unmasked positions `u`
+///     (ascending); `m = max_u s_u`, exact in any order;
+///   * weights `w_u = v_expf(s_u − m)`, exactly `0.0` at a masked or padded
+///     position — no running max, so no rescale;
+///   * `S = Σ lane_tree_sum(w[block])` over the segment's 32-position blocks
+///     ascending, from `+0` — this order is the gate; a one-block segment is
+///     ik's own `S` bit for bit;
+///   * `R[d] = fma(V_u[d], w_u, R[d])` over the unmasked positions ascending,
+///     from `+0`, for `d` in the head's latent range. The skip set is the
+///     mask, the same for every head, so no head's chain depends on another's
+///     weights.
+///
+/// Every step is per head, so a head's bits do not depend on `nh` or on which
+/// heads share its bundle: the split-K dispatch (8 per item) and the per-row
+/// paths (1 per row) write the same bits. An all-masked segment leaves `(−inf,
+/// 0, zeros)`, which [`combine_segments`] skips.
+// TWIN: flash_tile_avx2 — every edit outside the kq dot must be made in both.
+fn flash_tile_scalar(
+    qrows: &[f32],
+    rk: &RowKeys<'_>,
+    p: &MlaParams,
+    keys: Range<usize>,
+    d_off: usize,
+    seg: SegOut<'_>,
+    ts: &mut TileScratch,
+) {
+    let nh = seg.m.len();
+    let d_head = p.rope_dims + p.latent;
+    let d_len = seg.r.len() / nh;
+    let ks = keys.start;
+    let rows = ts.prepare(&keys, nh, rk);
+    seg.r.fill(0.0);
+    if ts.act.is_empty() {
+        seg.m.fill(f32::NEG_INFINITY);
+        seg.s.fill(0.0);
+        return;
+    }
+    let sc = &mut ts.s[..rows * nh];
+    for &u in &ts.act {
+        let u = u as usize;
+        let krow = rk.keys16.row(u);
+        for h in 0..nh {
+            // TWIN: flash_tile_avx2 — the kq dot, the twins' one numerical
+            // difference (ik's fa4 order here, the tile's lane order there).
+            sc[(u - ks) * nh + h] =
+                p.kq_scale * kq_dot_fa4(&qrows[h * d_head..(h + 1) * d_head], krow);
+        }
+    }
+    for h in 0..nh {
+        let m = ts.act.iter().fold(f32::NEG_INFINITY, |m, &u| {
+            m.max(sc[(u as usize - ks) * nh + h])
+        });
+        seg.m[h] = m;
+        let mut s_sum = 0.0f32;
+        for blk in (0..rows).step_by(FLASH_BLOCK) {
+            let mut w = [0.0f32; 32];
+            for (l, wl) in w.iter_mut().enumerate() {
+                let x = &mut sc[(blk + l) * nh + h];
+                *wl = if *x == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    v_expf(*x - m)
+                };
+                *x = *wl;
+            }
+            s_sum += lane_tree_sum(&w);
+        }
+        seg.s[h] = s_sum;
+    }
+    for &u in &ts.act {
+        let u = u as usize;
+        let vrow = &rk.keys16.row(u)[p.rope_dims + d_off..];
+        for h in 0..nh {
+            let w = sc[(u - ks) * nh + h];
+            let rh = &mut seg.r[h * d_len..(h + 1) * d_len];
+            for (rd, &v) in rh.iter_mut().zip(vrow) {
+                *rd = half_to_f32(v).mul_add(w, *rd);
+            }
+        }
+    }
+}
+
+/// The AVX2+FMA+F16C twin of [`flash_tile_scalar`]: the same two passes and
+/// the same per-head arithmetic, the kq dot in the lane order of
+/// [`kq_dot_lane8_avx2`] (one 8-lane accumulator per (head, key), octets
+/// ascending, [`lane_tree8`]) — the twins' one numerical difference, banded
+/// in `tests/attn.rs`; [`v_expf8`] is [`v_expf`] bit for bit.
+///
+/// Two tile shapes, the same bits per head:
+///
+///   * `nh == 8` (a split-K bundle): KQ 8 heads × 1 key — one `vcvtph2ps` per
+///     key octet feeds 8 FMAs whose q operands (the bundle's rows, 18 KB)
+///     stay in L1; scores and weights key-major, a head per lane, so the max,
+///     `v_expf8`, the block trees and the `S` chain run 8 heads per
+///     instruction; V 8 heads × 1 latent octet — 8 accumulators in registers
+///     over the segment's keys, the weight broadcast from memory;
+///   * otherwise, head by head: KQ 1 head × 8 keys (8 independent FMA chains
+///     share one q load), then the weights of 32 positions at a time, then
+///     V in 8-octet latent tiles over the keys.
+///
+/// `ahead` is the KV prefetch distance: the segment's first `ahead` rows are
+/// hinted before the walk and row `u + ahead` while row `u` is dotted (the
+/// first head's walk only in the head-by-head shape), never past the
+/// segment's end.
+///
+/// `#[target_feature]` is not optional: without it the intrinsics lower to
+/// scalar emulation with no error.
+///
+/// # Safety
+/// The CPU must support AVX2+FMA+F16C and the caller must hold the contract
+/// `flash_simd` gated on: `d_head = rope_dims + latent` a multiple of 8
+/// (flash_simd: 32), `keys16.width() == d_head` (asserted at the dispatch),
+/// `keys.end <= keys16.len()`, `qrows.len() == nh·d_head`, and each head's
+/// latent range inside the latent: `d_off + d_len <= latent`, `d_len` a
+/// multiple of 8, `seg.r.len() == nh·d_len`, `nh <= 8`.
+// TWIN: flash_tile_scalar — every edit outside the kq dot must be made in both.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the segment kernel's operands, mirrored by its scalar twin"
+)]
+unsafe fn flash_tile_avx2(
+    qrows: &[f32],
+    rk: &RowKeys<'_>,
+    p: &MlaParams,
+    keys: Range<usize>,
+    ahead: usize,
+    d_off: usize,
+    seg: SegOut<'_>,
+    ts: &mut TileScratch,
+) {
+    // SAFETY: the fn contract above — ISA, row width and scratch lengths all
+    // come from the dispatch. Every key row read is an unmasked position of
+    // `keys`, so `u < keys.end <= keys16.len()`; its address is
+    // `base + u·width`, the row `keys16.row(u)` would bounds-check to; the
+    // score buffer holds `rows·nh >= keys.len()·nh` cells (`prepare`).
+    unsafe {
+        use std::arch::x86_64::*;
+        let nh = seg.m.len();
+        let d_head = p.rope_dims + p.latent;
+        let d_len = seg.r.len() / nh;
+        let ks = keys.start;
+        let rows = ts.prepare(&keys, nh, rk);
+        if ts.act.is_empty() {
+            seg.r.fill(0.0);
+            seg.m.fill(f32::NEG_INFINITY);
+            seg.s.fill(0.0);
+            return;
+        }
+        let act = &ts.act[..];
+        let sp = ts.s.as_mut_ptr();
+        let qp = qrows.as_ptr();
+        let rp = seg.r.as_mut_ptr();
+        let width = rk.keys16.width();
+        let kbase = rk.keys16.as_slice().as_ptr();
+        let row = |u: u32| kbase.add(u as usize * width);
+        let voff = p.rope_dims + d_off;
+        let scale = _mm256_set1_ps(p.kq_scale);
+        let ninf = _mm256_set1_ps(f32::NEG_INFINITY);
+        let zero = _mm256_setzero_ps();
+        // Hint one KV row's lines — a cache hint, never a value.
+        let hint = |u: usize| {
+            let base = kbase.add(u * width).cast::<u8>();
+            let mut off = 0usize;
+            while off < width * 2 {
+                // SAFETY: prefetch reads nothing; `off` stays inside the row.
+                _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
+                off += 64;
+            }
+        };
+        if ahead != 0 {
+            for u in keys.start..keys.end.min(keys.start + ahead) {
+                hint(u);
+            }
+        }
+
+        if nh == HEAD_BUNDLE {
+            // KQ, 8 heads × 1 key: scores key-major, head `h` in lane `h`.
+            for &u in act {
+                // TWIN: flash_tile_scalar — the kq dot (lane order).
+                if ahead != 0 && u as usize + ahead < keys.end {
+                    hint(u as usize + ahead);
+                }
+                let kp = row(u);
+                let mut acc = [zero; 8];
+                for o in (0..d_head).step_by(8) {
+                    let k = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(o) as *const __m128i));
+                    for (h, a) in acc.iter_mut().enumerate() {
+                        *a = _mm256_fmadd_ps(_mm256_loadu_ps(qp.add(h * d_head + o)), k, *a);
+                    }
+                }
+                let sv = _mm256_mul_ps(lane_tree8x8(&acc), scale);
+                _mm256_storeu_ps(sp.add((u as usize - ks) * 8), sv);
+            }
+            let mut m = ninf;
+            for &u in act {
+                m = _mm256_max_ps(m, _mm256_loadu_ps(sp.add((u as usize - ks) * 8)));
+            }
+            _mm256_storeu_ps(seg.m.as_mut_ptr(), m);
+            // Weights in place, then the block trees of `lane_tree_sum`, a
+            // head per lane, chained from `+0`.
+            let mut s_sum = zero;
+            for blk in (0..rows).step_by(FLASH_BLOCK) {
+                let mut c = [zero; 8];
+                for j in 0..FLASH_BLOCK {
+                    let at = sp.add((blk + j) * 8);
+                    let x = _mm256_loadu_ps(at);
+                    let w = _mm256_blendv_ps(
+                        v_expf8(_mm256_sub_ps(x, m)),
+                        zero,
+                        _mm256_cmp_ps::<_CMP_EQ_OQ>(x, ninf),
+                    );
+                    _mm256_storeu_ps(at, w);
+                    // c[l] = ((w[l] + w[8+l]) + w[16+l]) + w[24+l]
+                    c[j % 8] = if j < 8 { w } else { _mm256_add_ps(c[j % 8], w) };
+                }
+                let t0 = _mm256_add_ps(c[0], c[4]);
+                let t1 = _mm256_add_ps(c[1], c[5]);
+                let t2 = _mm256_add_ps(c[2], c[6]);
+                let t3 = _mm256_add_ps(c[3], c[7]);
+                let tree = _mm256_add_ps(_mm256_add_ps(t0, t2), _mm256_add_ps(t1, t3));
+                s_sum = _mm256_add_ps(s_sum, tree);
+            }
+            _mm256_storeu_ps(seg.s.as_mut_ptr(), s_sum);
+            // V, 8 heads × 1 latent octet, keys inner.
+            for o in (0..d_len).step_by(8) {
+                let mut acc = [zero; 8];
+                for &u in act {
+                    let v =
+                        _mm256_cvtph_ps(_mm_loadu_si128(row(u).add(voff + o) as *const __m128i));
+                    let wrow = sp.add((u as usize - ks) * 8);
+                    for (h, a) in acc.iter_mut().enumerate() {
+                        *a = _mm256_fmadd_ps(v, _mm256_set1_ps(*wrow.add(h)), *a);
+                    }
+                }
+                for (h, a) in acc.iter().enumerate() {
+                    _mm256_storeu_ps(rp.add(h * d_len + o), *a);
+                }
+            }
+            return;
+        }
+
+        let n_act = act.len();
+        for h in 0..nh {
+            // KQ, 1 head × 8 keys: a short last group repeats its last key
+            // and stores only the real ones.
+            let qh = qp.add(h * d_head);
+            for g in (0..n_act).step_by(8) {
+                let mut kp = [kbase; 8];
+                for (t, k) in kp.iter_mut().enumerate() {
+                    let u = act[(g + t).min(n_act - 1)];
+                    *k = row(u);
+                    // TWIN: flash_tile_scalar — the kq dot (lane order).
+                    if h == 0 && ahead != 0 && g + t < n_act && u as usize + ahead < keys.end {
+                        hint(u as usize + ahead);
+                    }
+                }
+                let mut acc = [zero; 8];
+                for o in (0..d_head).step_by(8) {
+                    let qv = _mm256_loadu_ps(qh.add(o));
+                    for (a, &k) in acc.iter_mut().zip(&kp) {
+                        let kv = _mm256_cvtph_ps(_mm_loadu_si128(k.add(o) as *const __m128i));
+                        *a = _mm256_fmadd_ps(qv, kv, *a);
+                    }
+                }
+                let mut sv = [0.0f32; 8];
+                _mm256_storeu_ps(sv.as_mut_ptr(), _mm256_mul_ps(lane_tree8x8(&acc), scale));
+                for (t, &x) in sv.iter().enumerate().take(n_act - g) {
+                    *sp.add((act[g + t] as usize - ks) * nh + h) = x;
+                }
+            }
+            let mut m = f32::NEG_INFINITY;
+            for &u in act {
+                m = m.max(*sp.add((u as usize - ks) * nh + h));
+            }
+            seg.m[h] = m;
+            let mv = _mm256_set1_ps(m);
+            let mut s_sum = 0.0f32;
+            for blk in (0..rows).step_by(FLASH_BLOCK) {
+                let mut w = [0.0f32; 32];
+                for (l, wl) in w.iter_mut().enumerate() {
+                    *wl = *sp.add((blk + l) * nh + h);
+                }
+                for q4 in (0..32).step_by(8) {
+                    let x = _mm256_loadu_ps(w.as_ptr().add(q4));
+                    let e = _mm256_blendv_ps(
+                        v_expf8(_mm256_sub_ps(x, mv)),
+                        zero,
+                        _mm256_cmp_ps::<_CMP_EQ_OQ>(x, ninf),
+                    );
+                    _mm256_storeu_ps(w.as_mut_ptr().add(q4), e);
+                }
+                s_sum += lane_tree_sum(&w);
+                for (l, &wl) in w.iter().enumerate() {
+                    *sp.add((blk + l) * nh + h) = wl;
+                }
+            }
+            seg.s[h] = s_sum;
+            // V, 1 head × 8 latent octets, keys inner; a latent range not a
+            // multiple of 64 ends in single octets, the same chains.
+            let rh = rp.add(h * d_len);
+            let full = d_len / 64 * 64;
+            for d0 in (0..full).step_by(64) {
+                let mut acc = [zero; 8];
+                for &u in act {
+                    let w = _mm256_set1_ps(*sp.add((u as usize - ks) * nh + h));
+                    let vp = row(u).add(voff + d0);
+                    for (t, a) in acc.iter_mut().enumerate() {
+                        let v = _mm256_cvtph_ps(_mm_loadu_si128(vp.add(t * 8) as *const __m128i));
+                        *a = _mm256_fmadd_ps(v, w, *a);
+                    }
+                }
+                for (t, a) in acc.iter().enumerate() {
+                    _mm256_storeu_ps(rh.add(d0 + t * 8), *a);
+                }
+            }
+            for d in (full..d_len).step_by(8) {
+                let mut acc = zero;
+                for &u in act {
+                    let w = _mm256_set1_ps(*sp.add((u as usize - ks) * nh + h));
+                    let v =
+                        _mm256_cvtph_ps(_mm_loadu_si128(row(u).add(voff + d) as *const __m128i));
+                    acc = _mm256_fmadd_ps(v, w, acc);
+                }
+                _mm256_storeu_ps(rh.add(d), acc);
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------- wv_b
 
 /// `wv_b` stays Q3_K in the reference (only `wk_b` is requantized), so this is a
@@ -1905,13 +2505,15 @@ thread_local! {
 ///
 /// Two dispatch shapes, one set of bits:
 ///
-///   * **one query** (a decode step) — split-K, three dispatches: (1)
-///     `q_nope2` over (head, latent half) items; (2) the flash segments over
-///     (segment, head) items, each leaving its partial `(m, S, R)`; (3) the
+///   * **one query with more than [`SPLITK_MIN_BLOCKS`] blocks** (a deep
+///     decode step) — split-K, three dispatches: (1) `q_nope2` over (head,
+///     latent half) items, which also lay out the heads' FA rows; (2) the
+///     flash segments over (segment, head group) items — a group is
+///     [`attn_bundle`] heads — each leaving its heads' partials `(m, S, R)`; (3) the
 ///     merge over (head, latent half) items, the row's last arrival running
 ///     `wv_b`. `halves` does not apply: stages 1 and 3 always split the latent
 ///     in two (when it halves into 8-value runs) and stage 2 splits the keys.
-///   * **several queries** (prefill, a batch) — one dispatch over the (token,
+///   * **several queries, or a shallow decode row** — one dispatch over the (token,
 ///     head) rows, each split into `halves` latent ranges: 1 runs each row on
 ///     one participant, 2 on two, each accumulating one half of the latent.
 ///     Each row walks its segments serially ([`flash_row`]).
@@ -2289,9 +2891,12 @@ fn heads_per_row(
 }
 
 thread_local! {
-    /// The dispatching thread's recycled split-K partials: per (row, segment)
-    /// one latent-wide `R`, and its `m` and `S`. Only ever grown; every cell
-    /// the merge reads was written by the segment dispatch of the same call.
+    /// The dispatching thread's recycled split-K partials: per (segment,
+    /// head) one latent-wide `R` (segment-major, so a bundle's heads of one
+    /// segment are contiguous), per (head, segment) its `m` and `S`, and the
+    /// heads' FA query rows. Only ever grown; every cell a stage reads was
+    /// written by an earlier stage of the same call.
+    static SPLITK_Q: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static SPLITK_R: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static SPLITK_M: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static SPLITK_S: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
@@ -2299,11 +2904,13 @@ thread_local! {
 
 /// The one-query shape: split-K in three dispatches (see [`attn_heads_split`]).
 ///
-/// Stage 2's items are (segment, head) pairs, segment-major, and a chunk
+/// Stage 2's items are (segment, head group) pairs, segment-major — a group
+/// is [`attn_bundle`] heads, the tile's bundle of 8 or one head — and a chunk
 /// takes the items whose first block falls in it by cumulative block weight:
 /// a segment of 5 blocks weighs 5, so the busiest thread holds about the mean
 /// work plus one item whatever the segment sizes are. Which thread runs an
-/// item moves no bit — each item is a whole segment of one row.
+/// item moves no bit — each item is a whole segment of its heads, and a
+/// head's bits do not depend on its group.
 fn heads_split_k(
     io: &HeadsIo<'_>,
     out: &mut HeadsOut,
@@ -2324,16 +2931,27 @@ fn heads_split_k(
     let n_vis = visible_end(io.key_slots, &io.q_slots[0]);
     let used = flash_segments_used(n_vis, n_seg);
     let n_blocks = n_vis.div_ceil(FLASH_BLOCK);
+    let group = attn_bundle();
+    let n_groups = rows_n.div_ceil(group);
+
+    // The heads' FA rows `[q_rope ; q_nope2]`, head `h` at `h·d_head`,
+    // written by stage 1 and read in place by stage 2.
+    let mut qfa = SPLITK_Q.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if qfa.len() < rows_n * d_head {
+        qfa.resize(rows_n * d_head, 0.0);
+    }
+    let qfa_ptr = crate::ops::SharedOut(qfa.as_mut_ptr());
 
     // Stage 1 — `q_nope2` over (latent part, head) items. Item `i` writes
-    // only head `i % rows_n`'s column cells of part `i / rows_n`.
+    // only head `i % rows_n`'s column cells of part `i / rows_n`, the same
+    // cells of that head's FA row, and (part 0) the row's `q_rope` cells.
     //
     // SAFETY (construction site, all three stages): the pool chunks partition
     // each stage's item space and every item writes only its own cells —
-    // stage 1 its `q_nope2` cells, stage 2 its (row, segment) partial `R`,
-    // `m` and `S`, stage 3 its `kqv_compressed` range and (last arrival) its
-    // `kqv_2d` span; each join publishes the writes before the next stage
-    // reads them.
+    // stage 1 its `q_nope2` and FA-row cells, stage 2 its (segment, head)
+    // partials `R`, `m` and `S` for its group's heads, stage 3 its
+    // `kqv_compressed` range and (last arrival) its `kqv_2d` span; each join
+    // publishes the writes before the next stage reads them.
     let qn2_ptr = crate::ops::SharedOut(out.q_nope2.data.as_mut_ptr());
     timed_dispatch(acc, parts * rows_n, |items| {
         let (mut qcol, mut cellbuf) = take_qn2_scratch(nblocks, latent);
@@ -2350,15 +2968,27 @@ fn heads_split_k(
                 j1,
                 seg,
             );
+            let fa = h * d_head + p.rope_dims + j0;
             for (jj, &v) in seg.iter().enumerate() {
-                // SAFETY: cell `h·latent + j0 + jj` is this item's own — see the construction site.
-                unsafe { qn2_ptr.write(h * latent + j0 + jj, v) };
+                // SAFETY: cell `h·latent + j0 + jj` of `q_nope2` and cell
+                // `fa + jj` of the FA rows are this item's own — see the
+                // construction site.
+                unsafe {
+                    qn2_ptr.write(h * latent + j0 + jj, v);
+                    qfa_ptr.write(fa + jj, v);
+                }
+            }
+            if part == 0 {
+                for (d, &v) in io.q_rope.col(h).iter().enumerate() {
+                    // SAFETY: head h's `q_rope` cells, written by its part 0 alone.
+                    unsafe { qfa_ptr.write(h * d_head + d, v) };
+                }
             }
         }
         give_qn2_scratch(qcol, cellbuf);
     });
 
-    // Stage 2 — the segments, over block-weighted (segment, head) items.
+    // Stage 2 — the segments, over block-weighted (segment, group) items.
     let mut pr = SPLITK_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let mut pm = SPLITK_M.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let mut ps = SPLITK_S.with(|c| std::mem::take(&mut *c.borrow_mut()));
@@ -2374,47 +3004,66 @@ fn heads_split_k(
         let pr_out = &pr_ptr;
         let pm_ptr = crate::ops::SharedOut(pm.as_mut_ptr());
         let ps_ptr = crate::ops::SharedOut(ps.as_mut_ptr());
-        let q_nope2 = &out.q_nope2;
+        let qfa_ref = &qfa[..rows_n * d_head];
         let rk = RowKeys {
             keys16: io.keys16,
             key_slots: io.key_slots,
             q_slot: &io.q_slots[0],
             n_vis,
         };
-        timed_dispatch(acc, n_blocks * rows_n, |units| {
-            let mut qrow = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
-            if qrow.len() < d_head {
-                qrow.resize(d_head, 0.0);
-            }
-            let qrow = &mut qrow;
+        timed_dispatch(acc, n_blocks * n_groups, |units| {
+            let mut ts = TileScratch::take();
             let mut w = [0.0f32; 32];
             for s in 0..used {
                 let keys = flash_segment(n_vis, n_seg, s);
                 let b0 = keys.start / FLASH_BLOCK;
                 let bs = keys.len().div_ceil(FLASH_BLOCK);
-                // Item (s, h) starts at unit `b0·rows_n + h·bs`; this chunk
+                // Item (s, g) starts at unit `b0·n_groups + g·bs`; this chunk
                 // runs the items that start inside it.
-                let base = b0 * rows_n;
-                let first = |u: usize| u.saturating_sub(base).div_ceil(bs).min(rows_n);
-                for h in first(units.start)..first(units.end) {
-                    let qr = &mut qrow[..d_head];
-                    fill_qrow(qr, io.q_rope.col(h), q_nope2.col(h));
-                    let cell = h * n_seg + s;
-                    // SAFETY: partial `R` of (h, s) is this item's own `latent`
-                    // cells — see the construction site.
+                let base = b0 * n_groups;
+                let first = |u: usize| u.saturating_sub(base).div_ceil(bs).min(n_groups);
+                for g in first(units.start)..first(units.end) {
+                    let (h0, h1) = (g * group, ((g + 1) * group).min(rows_n));
+                    let nh = h1 - h0;
+                    // SAFETY: the partial `R` cells of (s, h0..h1) — contiguous
+                    // in the segment-major layout — are this item's own; see
+                    // the construction site.
                     let r = unsafe {
-                        std::slice::from_raw_parts_mut(pr_out.0.add(cell * latent), latent)
+                        std::slice::from_raw_parts_mut(
+                            pr_out.0.add((s * rows_n + h0) * latent),
+                            nh * latent,
+                        )
                     };
-                    let (m, s_sum) =
-                        flash_segment_row(io.simd, ahead, qr, &rk, p, keys.clone(), 0, r, &mut w);
-                    // SAFETY: `m`/`S` of (h, s) are this item's own cells.
-                    unsafe {
-                        pm_ptr.write(cell, m);
-                        ps_ptr.write(cell, s_sum);
+                    let mut m = [f32::NEG_INFINITY; HEAD_BUNDLE];
+                    let mut s_sum = [0.0f32; HEAD_BUNDLE];
+                    let seg = SegOut {
+                        r,
+                        m: &mut m[..nh],
+                        s: &mut s_sum[..nh],
+                    };
+                    flash_segment_heads(
+                        io.simd,
+                        ahead,
+                        &qfa_ref[h0 * d_head..h1 * d_head],
+                        &rk,
+                        p,
+                        keys.clone(),
+                        0,
+                        seg,
+                        &mut ts,
+                        &mut w,
+                    );
+                    for (hh, h) in (h0..h1).enumerate() {
+                        let cell = h * n_seg + s;
+                        // SAFETY: `m`/`S` of (h, s) are this item's own cells.
+                        unsafe {
+                            pm_ptr.write(cell, m[hh]);
+                            ps_ptr.write(cell, s_sum[hh]);
+                        }
                     }
                 }
             }
-            FLASH_QROW.with(|c| *c.borrow_mut() = std::mem::take(qrow));
+            ts.give_back();
         });
     }
 
@@ -2442,8 +3091,8 @@ fn heads_split_k(
             let s_tot = combine_segments(
                 &pm_ref[cells.clone()],
                 &ps_ref[cells],
-                &pr_ref[h * n_seg * latent..],
-                latent,
+                &pr_ref[h * latent..],
+                rows_n * latent,
                 part * d_len,
                 r,
             );
@@ -2464,11 +3113,122 @@ fn heads_split_k(
         FLASH_R.with(|c| *c.borrow_mut() = r_buf);
     });
     ROW_MARKS.with(|c| *c.borrow_mut() = marks);
+    SPLITK_Q.with(|c| *c.borrow_mut() = qfa);
     SPLITK_R.with(|c| *c.borrow_mut() = pr);
     SPLITK_M.with(|c| *c.borrow_mut() = pm);
     SPLITK_S.with(|c| *c.borrow_mut() = ps);
     match gate.take() {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lane_tree8, lane_tree8x8, v_expf, v_expf8};
+    use std::arch::x86_64::*;
+
+    fn assert_isa() {
+        assert!(
+            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+            "the tile helpers need AVX2+FMA (the box)"
+        );
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn expf8(x: &[f32; 8]) -> [f32; 8] {
+        let mut o = [0.0f32; 8];
+        // SAFETY: the ISA is asserted by the caller; the loads and stores are the two arrays.
+        unsafe { _mm256_storeu_ps(o.as_mut_ptr(), v_expf8(_mm256_loadu_ps(x.as_ptr()))) };
+        o
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn trees(a: &[[f32; 8]; 8]) -> ([f32; 8], [f32; 8]) {
+        // SAFETY: the ISA is asserted by the caller; every load and store is one of the arrays.
+        unsafe {
+            let v: [__m256; 8] = std::array::from_fn(|i| _mm256_loadu_ps(a[i].as_ptr()));
+            let one: [f32; 8] = std::array::from_fn(|i| lane_tree8(v[i]));
+            let mut all = [0.0f32; 8];
+            _mm256_storeu_ps(all.as_mut_ptr(), lane_tree8x8(&v));
+            (one, all)
+        }
+    }
+
+    /// The softmax weights of the AVX2 tile come from `v_expf8`, the scalar
+    /// twin's from `v_expf`: the twins' only permitted difference is the kq
+    /// sum order, so the two must agree bit for bit on every input — every
+    /// 4099th f32 bit pattern (both signs, subnormals, infinities, NaN: both
+    /// NaN), a dense walk of the range the softmax feeds (`s − m ≤ 0`, down
+    /// past the `|n| > 126` and `|n| > 192` slow paths) and the edges.
+    #[test]
+    fn v_expf8_is_bit_identical_to_v_expf() {
+        assert_isa();
+        let mut xs: Vec<f32> = (0..=u32::MAX).step_by(4099).map(f32::from_bits).collect();
+        let n = 1u32 << 20;
+        xs.extend((0..n).map(|i| -150.0 + 151.0 * i as f32 / n as f32));
+        xs.extend([
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            0.0,
+            -0.0,
+            -87.33655,
+            -88.72284,
+            -103.97208,
+            -133.0,
+            -134.0,
+            88.72284,
+            89.0,
+        ]);
+        let mut checked = 0usize;
+        for c in xs.chunks(8) {
+            let mut x = [0.0f32; 8];
+            x[..c.len()].copy_from_slice(c);
+            // SAFETY: the ISA was asserted above.
+            let got = unsafe { expf8(&x) };
+            for (&xi, &gi) in x.iter().zip(&got) {
+                let want = v_expf(xi);
+                assert!(
+                    gi.to_bits() == want.to_bits() || (gi.is_nan() && want.is_nan()),
+                    "v_expf8({xi:e}) = {gi:e} ({:#010x}), v_expf = {want:e} ({:#010x})",
+                    gi.to_bits(),
+                    want.to_bits()
+                );
+                checked += 1;
+            }
+        }
+        eprintln!("v_expf8 vs v_expf: {checked} inputs bit-identical");
+    }
+
+    /// The 8×8 transposed tree the tile kernels reduce their accumulators
+    /// with is the single-accumulator tree lane for lane, bit for bit —
+    /// the claim that a head's score does not depend on the tile shape
+    /// rests on it. Random values over a wide exponent range, both signs.
+    #[test]
+    fn lane_tree8x8_matches_lane_tree8() {
+        assert_isa();
+        let mut state = 0x7a11_3e5d_0c0d_e001u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let m = ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
+            m * 2.0f32.powi(((state >> 20) % 40) as i32 - 20)
+        };
+        for trial in 0..20_000 {
+            let a: [[f32; 8]; 8] = std::array::from_fn(|_| std::array::from_fn(|_| next()));
+            // SAFETY: the ISA was asserted above.
+            let (one, all) = unsafe { trees(&a) };
+            for i in 0..8 {
+                assert_eq!(
+                    one[i].to_bits(),
+                    all[i].to_bits(),
+                    "trial {trial}, accumulator {i}: lane_tree8x8 {} vs lane_tree8 {}",
+                    all[i],
+                    one[i]
+                );
+            }
+        }
+        eprintln!("lane_tree8x8 vs lane_tree8: 20000 × 8 trees bit-identical");
     }
 }

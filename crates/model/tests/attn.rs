@@ -1580,3 +1580,184 @@ fn hw_attn_split_k_is_thread_count_invariant() {
         );
     }
 }
+
+/// The decode depths the bundle band runs at: 257 keys (9 blocks) stays on
+/// the one-dispatch shape, where every row runs the tile one head at a time;
+/// 1025 and 4097 take split-K, where an item runs it on a bundle of 8.
+const BUNDLE_CASES: [(usize, u64); 3] =
+    [(257, 0xb0d1_e001), (1025, 0xb0d1_e002), (4097, 0xb0d1_e003)];
+
+/// Every `kqv_compressed` of the bundle cases through the fused dispatch,
+/// and the realized kq-dot deviation of this process's AVX2 kernel from the
+/// scalar fa4 order over the same (head, key) pairs:
+/// `max |kq_dot_simd − kq_dot_fa4|` (`kq_dot_simd` follows the lever).
+/// Also `max|V|` over every case's cache.
+fn bundle_outputs(o: &oracle::Oracle) -> (Vec<Tensor2>, f32, f32) {
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let blk = 0usize;
+    let p = attn::MlaParams::read(&g, blk).unwrap();
+    let derived = Derived::new(&g).unwrap();
+    let views = &derived.attn_plan(blk).unwrap().v_up_views;
+    let wblocks = derived.wk_b_all_heads(blk).unwrap();
+    let d_head = p.rope_dims + p.latent;
+    let mut outs = Vec::new();
+    let mut delta = 0.0f32;
+    let mut v_max = 0.0f32;
+    for (n_keys, seed) in BUNDLE_CASES {
+        let f = decode_fixture(o, &p, n_keys, seed);
+        let cache = model::kv::KvRows::new(&f.cache16, d_head);
+        let (fq, fc, _) = attn::attn_heads_fused(
+            &g,
+            wblocks,
+            &f.q,
+            &f.q_rope,
+            cache,
+            &f.key_slots,
+            &f.q_slots,
+            views,
+            &p,
+        )
+        .unwrap();
+        for h in 0..p.n_head {
+            let mut qrow = vec![0.0f32; d_head];
+            qrow[..p.rope_dims].copy_from_slice(f.q_rope.col(h));
+            qrow[p.rope_dims..].copy_from_slice(fq.col(h));
+            for u in 0..n_keys {
+                let k = cache.row(u);
+                delta = delta.max((attn::kq_dot_simd(&qrow, k) - attn::kq_dot_fa4(&qrow, k)).abs());
+            }
+        }
+        for u in 0..n_keys {
+            for &b in &cache.row(u)[p.rope_dims..] {
+                v_max = v_max.max(gguf::quant::half_to_f32(b).abs());
+            }
+        }
+        outs.push(fc);
+    }
+    (outs, delta, v_max)
+}
+
+/// The re-exec entry point of [`hw_attn_bundle_bands_against_per_head`]:
+/// without `BLOOMERY_BUNDLE_BAND_DUMP` it does nothing.
+#[test]
+#[ignore = "hw: re-exec child of hw_attn_bundle_bands_against_per_head; standalone it is a no-op"]
+fn hw_attn_bundle_band_child() {
+    let Ok(dump) = std::env::var("BLOOMERY_BUNDLE_BAND_DUMP") else {
+        eprintln!("bundle band child: no BLOOMERY_BUNDLE_BAND_DUMP, nothing to do");
+        return;
+    };
+    let o = oracle::Oracle::open();
+    let (outs, delta, _) = bundle_outputs(&o);
+    let mut bytes: Vec<u8> = outs
+        .iter()
+        .flat_map(|t| t.data.iter().flat_map(|v| v.to_le_bytes()))
+        .collect();
+    bytes.extend(delta.to_le_bytes());
+    std::fs::write(&dump, &bytes).unwrap();
+    eprintln!("bundle band child: {} bytes dumped to {dump}", bytes.len());
+}
+
+/// The head-bundle tile (the default) against the per-head online kernel it
+/// replaced (`BLOOMERY_ATTN_BUNDLE=1`, a re-exec'd child — the lever is read
+/// once per process), through the fused decode dispatch on the oracle's
+/// decode fixture at 257, 1025 and 4097 keys: the same plan and merge, a
+/// different segment kernel. This is the float-class proof of the tile:
+/// the bit gates above compare the chain and the dispatch, which share the
+/// kernel whichever it is.
+///
+/// The band is derived. The two kernels differ in (a) the kq dot's sum
+/// order — each process measures its own kernel's realized deviation from
+/// the scalar fa4 order, so a score moves by at most `ε = kq_scale·(δ₈ +
+/// δ₁)`; a common shift of all scores cancels in the softmax, so each weight
+/// moves by a relative `e^ε − 1 ≤ 2ε` and the output, a convex combination
+/// of V, by at most `2·2ε·max|V|`; and (b) rounding — the online kernel
+/// applies up to `n_blocks` rescales per weight, the tile none, and both
+/// sum over the same `n` terms in different association: the split-K
+/// gate's `γ = (2n + 4·(n_blocks + 8))·u`, moving `R/S` by `2γ·max|V|` plus
+/// the final multiply's `u·max|V|`. A skipped or misrouted head moves its
+/// whole output — orders above the band. A child that ignored the lever
+/// would return the parent's own bytes: the test fails on that too.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_attn_bundle_bands_against_per_head() {
+    let o = oracle::Oracle::open();
+    let (tile, delta8, v_max) = bundle_outputs(&o);
+
+    let exe = std::env::current_exe().unwrap();
+    let dump =
+        std::env::temp_dir().join(format!("bloomery-bundle-band-{}.f32", std::process::id()));
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "hw_attn_bundle_band_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BLOOMERY_ATTN_BUNDLE", "1")
+        .env("BLOOMERY_BUNDLE_BAND_DUMP", &dump)
+        .output()
+        .expect("re-exec of this test binary");
+    assert!(
+        out.status.success(),
+        "bundle band child failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = std::fs::read(&dump).unwrap();
+    let _ = std::fs::remove_file(&dump);
+    let vals: Vec<f32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    let total: usize = tile.iter().map(|t| t.data.len()).sum();
+    assert_eq!(vals.len(), total + 1, "child output length");
+    let delta1 = vals[total];
+
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let p = attn::MlaParams::read(&g, 0).unwrap();
+    let u = 2.0f32.powi(-24);
+    let eps = p.kq_scale * (delta8 + delta1);
+    eprintln!(
+        "bundle band: kq dot vs fa4, tile δ₈ = {delta8:e}, per-head δ₁ = {delta1:e}, \
+         score ε = {eps:e}, max|V| {v_max}"
+    );
+    let mut at = 0usize;
+    let mut moved_total = 0usize;
+    for (got, (n_keys, _)) in tile.iter().zip(BUNDLE_CASES) {
+        let n = n_keys as f32;
+        let n_blocks = n_keys.div_ceil(32) as f32;
+        let gamma = (2.0 * n + 4.0 * (n_blocks + 8.0)) * u;
+        let band = 2.0 * (2.0 * eps + gamma) * v_max + u * v_max;
+        let want = &vals[at..at + got.data.len()];
+        at += got.data.len();
+        let mut worst = 0.0f32;
+        let mut sq = 0.0f64;
+        let mut moved = 0usize;
+        for (k, (&a, &b)) in got.data.iter().zip(want).enumerate() {
+            let d = (a - b).abs();
+            assert!(
+                d <= band,
+                "decode, {n_keys} keys: bundle 8 vs bundle 1 |diff| {d:e} at index {k} \
+                 (head {}) exceeds the derived band {band:e}",
+                k / p.latent
+            );
+            worst = worst.max(d);
+            sq += f64::from(d) * f64::from(d);
+            moved += usize::from(a.to_bits() != b.to_bits());
+        }
+        moved_total += moved;
+        let rms = (sq / got.data.len() as f64).sqrt();
+        eprintln!(
+            "bundle 8 vs bundle 1, decode, {n_keys:>4} keys  max|diff| = {worst:e}  rms {rms:.3e}  \
+             ({moved} of {} values moved; band {band:e})",
+            got.data.len()
+        );
+    }
+    assert!(
+        moved_total > 0,
+        "the bundle-1 child returned the tile's own bytes — BLOOMERY_ATTN_BUNDLE=1 did not \
+         reach the kernel, so the band above compared a thing with itself"
+    );
+}
