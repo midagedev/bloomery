@@ -459,6 +459,132 @@ fn hw_attn_heads_fused_bit_identical() {
     }
 }
 
+/// The per-row latent split of the fused dispatch (`attn_heads_split`) must
+/// produce the chain's three tensors BIT-identically at both splits — one
+/// participant per (token, head) row and two, each accumulating half the
+/// latent — at the decode shape against a cache 6, 1024 and 4096 keys deep
+/// (plus the decode token's own row), and at the 6-token prefill shape.
+/// `to_bits` on every element: the split moves calls between threads and
+/// narrows the V accumulation to a latent range, it must not move a bit.
+///
+/// The query is the oracle's token 0; the cache rows are the oracle's six
+/// `kvr` rows, cycled and scaled element-wise by 1 ± 0.25 noise — real
+/// magnitudes, so the softmax spreads over many keys and the running max
+/// bumps between blocks (the rescale path), and every row distinct, so a
+/// range reading another key's row cannot agree by accident. Key counts
+/// 7, 1025, 4097 end on a partial 32-key block.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_attn_heads_split_bit_identical() {
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let blk = 0usize;
+    let p = attn::MlaParams::read(&g, blk).unwrap();
+    let derived = Derived::new(&g).unwrap();
+    let views = &derived.attn_plan(blk).unwrap().v_up_views;
+    let wblocks = derived.wk_b_all_heads(blk).unwrap();
+
+    let load2 = |name: &str, occ: u32| -> Tensor2 {
+        let (v, inf) = o.load(name, occ);
+        Tensor2::from_vec(
+            inf.ne[0] as usize,
+            (inf.ne[1] * inf.ne[2] * inf.ne[3]) as usize,
+            v,
+        )
+    };
+    let q_full = load2(&format!("q-{blk}"), 0);
+    let q_rope_full = load2(&format!("q_rope-{blk}"), 1);
+    let kvr_full = load2(&format!("kvr-{blk}"), 0);
+    let d_head = p.rope_dims + p.latent;
+    let first_cols =
+        |src: &Tensor2, n: usize| Tensor2::from_vec(src.ne0, n, src.data[..src.ne0 * n].to_vec());
+
+    // (label, query count, cached key rows): the three decode depths, then
+    // the prefill shape — six queries over their own six rows, causal.
+    let shapes: [(&str, usize, usize); 4] = [
+        ("decode, depth 6", 1, 7),
+        ("decode, depth 1024", 1, 1025),
+        ("decode, depth 4096", 1, 4097),
+        ("prefill, 6 tokens", 6, 6),
+    ];
+    let mut rng = Lcg(0x5911_7a11_0c0d_e5ed);
+    for (label, n_tok, n_keys) in shapes {
+        let cache16: Vec<u16> = if n_tok == n_keys {
+            // The prefill rows are the oracle's own, the scratch-cache shape.
+            (0..n_keys)
+                .flat_map(|u| kvr_full.col(u).to_vec())
+                .map(gguf::quant::f32_to_f16_bits)
+                .collect()
+        } else {
+            let mut c = Vec::with_capacity(n_keys * d_head);
+            for u in 0..n_keys {
+                for &v in kvr_full.col(u % kvr_full.ne1) {
+                    c.push(gguf::quant::f32_to_f16_bits(
+                        v * (1.0 + 0.25 * rng.range(-1.0, 1.0)),
+                    ));
+                }
+            }
+            c
+        };
+        let cache = model::kv::KvRows::new(&cache16, d_head);
+        // Keys at positions 0..n_keys; a decode query is the last of them.
+        let key_slots: Vec<Slot> = (0..n_keys as u32)
+            .map(|u| Slot { seq: 0, pos: u })
+            .collect();
+        let q_slots: Vec<Slot> = if n_tok == n_keys {
+            key_slots.clone()
+        } else {
+            vec![Slot {
+                seq: 0,
+                pos: (n_keys - 1) as u32,
+            }]
+        };
+        let q = first_cols(&q_full, n_tok);
+        let q_rope = first_cols(&q_rope_full, p.n_head * n_tok);
+
+        let q_nope2 = attn::q_nope2_absorbed(wblocks, &q, &p).unwrap();
+        let kqv_compressed =
+            attn::flash_attn_latent(&q_rope, &q_nope2, cache, &key_slots, &q_slots, &p);
+        let kqv_2d = attn::wv_b_heads_with(&g, views, &kqv_compressed, &p).unwrap();
+
+        for halves in [1usize, 2] {
+            let (fq, fc, f2) = attn::attn_heads_split(
+                &g, wblocks, &q, &q_rope, cache, &key_slots, &q_slots, views, &p, halves,
+            )
+            .unwrap();
+            let cmp = |name: &str, chain: &Tensor2, split: &Tensor2| {
+                assert_eq!(
+                    (split.ne0, split.ne1),
+                    (chain.ne0, chain.ne1),
+                    "{name} shape, {label}, halves {halves}"
+                );
+                let at = chain
+                    .data
+                    .iter()
+                    .zip(&split.data)
+                    .position(|(x, y)| x.to_bits() != y.to_bits());
+                assert!(
+                    at.is_none(),
+                    "{name} ({label}, halves {halves}): split differs from the chain at \
+                     element {at:?} of {} — the split moved a bit",
+                    chain.data.len()
+                );
+            };
+            cmp("q_nope2", &q_nope2, &fq);
+            cmp("kqv_compressed", &kqv_compressed, &fc);
+            cmp("kqv_2d", &kqv_2d, &f2);
+            eprintln!(
+                "attn_heads_split, {label:<19} halves {halves}: q_nope2, kqv_compressed, kqv_2d \
+                 bit-identical to the chain ({} keys, {} + {} + {} values)",
+                n_keys,
+                fq.data.len(),
+                fc.data.len(),
+                f2.data.len()
+            );
+        }
+    }
+}
+
 /// Deterministic uniform noise for the synthetic band test — no model file,
 /// no oracle, only the box's ISA.
 struct Lcg(u64);

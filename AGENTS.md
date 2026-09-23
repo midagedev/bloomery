@@ -356,8 +356,13 @@ Compile-time levers in `q3k-cpu` are `const` values with dead branches behind
 them; MUL-11 converts them to `#[cfg(feature)]` so the on-side also compiles.
 Runtime levers: `BLOOMERY_THREADS`, `BLOOMERY_SPIN` (threads), `BLOOMERY_STEAL_BLOCKS`
 (model::ops: blocks a lane is cut into for stealing, default 4 — 2/8/16 measured no better),
-`BLOOMERY_PROFILE` (model::profile), `BLOOMERY_FLASH_SIMD=0` (attn, scalar
-rollback), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
+`BLOOMERY_PROFILE` (model::profile; `BLOOMERY_PROFILE_DEPTH=d` makes
+`profile-measure.sh` prefill depth-decode's prompt of depth d first),
+`BLOOMERY_FLASH_SIMD=0` (attn, scalar rollback), `BLOOMERY_ATTN_HALVES=2` (attn:
+each (token, head) row of the fused CPU dispatch runs on two threads, each
+accumulating half the latent — bit-identical, gated, and slower at every
+depth: both threads still stream every whole key row for the scores, so the
+default is 1), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
 segment, a multiple of 32; an unusable value panics instead of falling back),
 `BLOOMERY_FLASH_MMA=0` (gpu flash: the scalar segment pass instead of the
 tensor-core default; `just gate-gpu-e2e` runs both, and the timing binary

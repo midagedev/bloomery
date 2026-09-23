@@ -20,6 +20,12 @@ export BLOOMERY_DATA
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 TOKENS=${BLOOMERY_DECODE_TOKENS:-$REF_TOKENS}
+# BLOOMERY_PROFILE_DEPTH=d 이면 깊이 d 의 표다: depth-decode.sh 가 쓰는 lcg_prompt 를 그대로 프리필해 캐시를
+# 그 깊이로 채운 뒤 잰다. 어텐션 항은 캐시된 키 수에 선형이라 기본 프롬프트(깊이 6)의 표에서는 스텝의
+# 몇 % 로만 보이고, 깊이 4096 에서야 절반 가까이 된다 — 깊이를 안 적은 어텐션 배분은 수치가 아니다.
+if [ -n "${BLOOMERY_PROFILE_DEPTH:-}" ]; then
+  TOKENS=$(lcg_prompt "$BLOOMERY_PROFILE_DEPTH")
+fi
 # 기본이 2 스텝인 이유: 이 표가 답하는 질문은 배분이고 배분은 스텝 하나로 정해진다.
 # 스텝을 늘리면 임대만 길어진다. 평탄성은 decode-measure.sh 가 재는 다른 질문이다.
 N=${BLOOMERY_DECODE_N:-2}
