@@ -35,7 +35,7 @@ use crate::rope::rope_pair_rn;
 const LANES: u32 = 32;
 /// Values one lane owns: `PER_LANE·lane ..`, contiguous — the transform's
 /// first two stages stay in the lane, the other five are lane butterflies.
-const PER_LANE: usize = 4;
+pub(crate) const PER_LANE: usize = 4;
 /// Values of an index key (`indexer.head_size`).
 pub const WIDTH: usize = PER_LANE * LANES as usize;
 const _: () = assert!(WIDTH == 128);
@@ -112,6 +112,21 @@ fn ht_cross(b: [f32; PER_LANE], lane: u32, m: u32) -> [f32; PER_LANE] {
     } else {
         [p[0] - b[0], p[1] - b[1], p[2] - b[2], p[3] - b[3]]
     }
+}
+
+/// The transform's seven butterfly stages over a warp's [`WIDTH`] values,
+/// lane `lane` holding `PER_LANE·lane ..`: [`ht_lane`], then [`ht_cross`]
+/// at lane distances 1, 2, 4, 8, 16. The caller multiplies by
+/// [`HT_SCALE`]. Every lane of the warp calls it (a warp collective).
+#[inline(always)]
+pub(crate) fn ht_warp(n: [f32; PER_LANE], lane: u32) -> [f32; PER_LANE] {
+    let mut h = ht_lane(n);
+    let mut m = 1;
+    while m < LANES {
+        h = ht_cross(h, lane, m);
+        m <<= 1;
+    }
+    h
 }
 
 // ---------------------------------------------------------------- kernels
@@ -191,12 +206,7 @@ mod index_key_kernels {
             let (a2, a3) = rope_pair_rn(n[2], n[3], c[2], c[3]);
             n = [a0, a1, a2, a3];
         }
-        let mut h = ht_lane(n);
-        let mut m = 1;
-        while m < LANES {
-            h = ht_cross(h, lane, m);
-            m <<= 1;
-        }
+        let h = ht_warp(n, lane);
         let base = row * WIDTH + v;
         // SAFETY: base + 4 <= (row + 1)·128 <= rows·128 <= cache.len(); block
         // g owns cache row `row` (rows ascend, host-checked) and the lane its

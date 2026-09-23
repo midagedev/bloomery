@@ -1263,6 +1263,262 @@ mod bench {
         Ok(())
     }
 
+    /// The lightning indexer's two launches (`ds41_indexer_score`, then
+    /// `ds41_indexer_topk`) per emitting block, at three depths. Built only
+    /// with the `deepseek41` feature, which links the V4.1 crate; a `gpu`
+    /// build prints that they were skipped.
+    ///
+    /// Each site is one token over `n_vis` synthetic index keys (the rows the
+    /// score pass reads), the file's top-k and rope width, a random query
+    /// projection, weights and rope table. A site whose keys would stay in
+    /// L2 across a burst gets distinct key copies up to [`CYCLE_FLOOR`]; the
+    /// scratch and the list are shared, since the launches serialize.
+    ///
+    /// `--check`: the first and last copy each run once; the list must be
+    /// the `top_k` rows of the launch's own scores with the largest
+    /// order-preserving keys, ties to the lower row, in ascending order, the
+    /// histogram zero again, and the two copies' scores distinct. It prints
+    /// one digest line per copy for the scores and for the list. The scores'
+    /// agreement with ik is `gate-gpu-ds41-index`'s, not this check's.
+    ///
+    /// `--time`: per site an eager burst and a graph replay cycling the key
+    /// copies, microseconds per indexer step (two launches).
+    #[cfg(feature = "deepseek41")]
+    mod index {
+        use super::{
+            CYCLE_FLOOR, GREPS, INDEX_SOURCE, MIN_BURST, Rng, Spread, fnv1a64, time_replay,
+        };
+        use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
+        use bloomery_gpu_deepseek41::indexer::{
+            HEAD_DIM, HEADS, HIST_BINS, IndexerArgs, IndexerKernels, IndexerScratch,
+        };
+        use bloomery_gpu_gates::{GateError, verdict};
+        use cuda_core::{CudaStream, DeviceBuffer};
+        use gguf::quant::f32_to_f16_bits;
+        use std::time::Instant;
+
+        /// Visible rows of the three sites.
+        const N_VIS: [usize; 3] = [1024, 4096, 32_768];
+        /// The file's `indexer.top_k` and the query's roped values per head
+        /// (`docs/v41-inventory.md`).
+        const TOP_K: usize = 512;
+        const ROPE_DIMS: usize = 64;
+        /// Eager rounds per site.
+        const ROUNDS: usize = super::ROUNDS;
+
+        pub struct Site {
+            n_vis: usize,
+            keys: Vec<DeviceTensor<u16>>,
+            q: DeviceBuffer<f32>,
+            w: DeviceBuffer<f32>,
+            ints: DeviceBuffer<u32>,
+            tables: DeviceBuffer<u32>,
+            scratch: IndexerScratch,
+            list: DeviceBuffer<u32>,
+        }
+
+        impl Site {
+            pub fn label(&self) -> String {
+                format!("indexer_nvis{}", self.n_vis)
+            }
+
+            fn key_bytes(&self) -> u64 {
+                (self.n_vis * HEAD_DIM * 2) as u64
+            }
+
+            fn enqueue(
+                &mut self,
+                kernels: &IndexerKernels,
+                stream: &CudaStream,
+                copy: usize,
+            ) -> Result<(), GpuError> {
+                kernels.enqueue(
+                    stream,
+                    IndexerArgs {
+                        q: &self.q,
+                        w: &self.w,
+                        ints: &self.ints,
+                        n_vis_at: 0,
+                        top_k_at: 1,
+                        tables: &self.tables,
+                        rope_at: 0,
+                        rope_stride: ROPE_DIMS,
+                        keys: &self.keys[copy],
+                        tokens: 1,
+                        scratch: &mut self.scratch,
+                        list: &mut self.list,
+                        stride: TOP_K,
+                    },
+                )
+            }
+        }
+
+        pub fn load(gpu: &Gpu) -> Result<(IndexerKernels, Vec<Site>), GateError> {
+            let stream = gpu.stream();
+            let kernels = IndexerKernels::with_shape(gpu.context(), HEADS, HEAD_DIM, ROPE_DIMS)?;
+            let mut sites = Vec::with_capacity(N_VIS.len());
+            for (i, &n_vis) in N_VIS.iter().enumerate() {
+                let mut rng = Rng::new(0x1d0_0000 + i as u64);
+                let key_bytes = (n_vis * HEAD_DIM * 2) as u64;
+                let copies = usize::try_from(CYCLE_FLOOR.div_ceil(key_bytes).max(2))?;
+                let keys = (0..copies)
+                    .map(|_| {
+                        let k: Vec<u16> = (0..n_vis * HEAD_DIM)
+                            .map(|_| f32_to_f16_bits(rng.unit()))
+                            .collect();
+                        DeviceTensor::upload(stream, &k, n_vis, HEAD_DIM)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let q: Vec<f32> = (0..HEADS * HEAD_DIM).map(|_| 4.0 * rng.unit()).collect();
+                let w: Vec<f32> = (0..HEADS).map(|_| 16.0 * rng.unit()).collect();
+                let tables: Vec<u32> = (0..ROPE_DIMS / 2)
+                    .flat_map(|_| {
+                        let a = std::f32::consts::PI * rng.unit();
+                        [a.cos().to_bits(), a.sin().to_bits()]
+                    })
+                    .collect();
+                sites.push(Site {
+                    n_vis,
+                    keys,
+                    q: DeviceBuffer::from_host(stream, &q)?,
+                    w: DeviceBuffer::from_host(stream, &w)?,
+                    ints: DeviceBuffer::from_host(stream, &[u32::try_from(n_vis)?, TOP_K as u32])?,
+                    tables: DeviceBuffer::from_host(stream, &tables)?,
+                    scratch: IndexerScratch::new(stream, 1, n_vis)?,
+                    list: DeviceBuffer::zeroed(stream, TOP_K)?,
+                });
+            }
+            Ok((kernels, sites))
+        }
+
+        /// The order-preserving key of a score: `-0` made `+0`, a
+        /// negative's bits flipped whole, a non-negative's top bit set.
+        fn key_of(v: f32) -> u32 {
+            let b = v.to_bits();
+            let b = if b == 0x8000_0000 { 0 } else { b };
+            if b & 0x8000_0000 != 0 {
+                !b
+            } else {
+                b | 0x8000_0000
+            }
+        }
+
+        fn exact_top(scores: &[f32], k: usize) -> Vec<u32> {
+            let mut idx: Vec<u32> = (0..scores.len() as u32).collect();
+            idx.sort_by(|&a, &b| {
+                key_of(scores[b as usize])
+                    .cmp(&key_of(scores[a as usize]))
+                    .then(a.cmp(&b))
+            });
+            let mut top = idx[..k].to_vec();
+            top.sort_unstable();
+            top
+        }
+
+        pub fn check(
+            gpu: &Gpu,
+            kernels: &IndexerKernels,
+            site: &mut Site,
+        ) -> Result<bool, GateError> {
+            let stream = gpu.stream();
+            let copies = [0, site.keys.len() - 1];
+            let mut exact = 0usize;
+            let mut outs = Vec::with_capacity(2);
+            for &c in &copies {
+                site.enqueue(kernels, stream, c)?;
+                stream.synchronize()?;
+                let scores = site.scratch.scores.to_host_vec(stream)?;
+                let list = site.list.to_host_vec(stream)?;
+                let hist = site.scratch.hist.to_host_vec(stream)?;
+                let ok = list == exact_top(&scores, TOP_K)
+                    && hist.len() == HIST_BINS
+                    && hist.iter().all(|&h| h == 0)
+                    && scores.iter().all(|v| v.is_finite());
+                exact += usize::from(ok);
+                outs.push((c, scores, list));
+            }
+            let distinct = outs[0]
+                .1
+                .iter()
+                .zip(&outs[1].1)
+                .any(|(a, b)| a.to_bits() != b.to_bits());
+            let pass = exact == copies.len() && distinct;
+            println!(
+                "check shape={} kernel=ds41_indexer_score+ds41_indexer_topk n_vis={} top_k={TOP_K} \
+                 copies_checked={} lists_exact_top={exact}/{} copies_distinct={distinct} {}",
+                site.label(),
+                site.n_vis,
+                copies.map(|c| c.to_string()).join(","),
+                copies.len(),
+                verdict(pass)
+            );
+            for (c, scores, list) in &outs {
+                let list_f: Vec<f32> = list.iter().map(|&i| f32::from_bits(i)).collect();
+                for (what, y) in [("scores", scores), ("list", &list_f)] {
+                    println!(
+                        "digest shape={} kernel=ds41_indexer_{what} copy={c} out_rows={} fnv1a64={:#018x}",
+                        site.label(),
+                        y.len(),
+                        fnv1a64(y)
+                    );
+                }
+            }
+            Ok(pass)
+        }
+
+        /// Eager burst and graph replay of one site, microseconds per step.
+        pub fn time(gpu: &Gpu, kernels: &IndexerKernels, site: &mut Site) -> Result<(), GateError> {
+            let stream = gpu.stream();
+            let copies = site.keys.len();
+            let n = copies * MIN_BURST.div_ceil(copies);
+            for c in 0..n {
+                site.enqueue(kernels, stream, c % copies)?;
+            }
+            stream.synchronize()?;
+            let mut us = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                let t0 = Instant::now();
+                for c in 0..n {
+                    site.enqueue(kernels, stream, c % copies)?;
+                }
+                stream.synchronize()?;
+                us.push(t0.elapsed().as_secs_f64() * 1e6 / n as f64);
+            }
+            let eager = Spread::of(&us);
+            let graph = gpu
+                .capture(|_| (0..n).try_for_each(|c| site.enqueue(kernels, stream, c % copies)))?;
+            let nodes = graph.node_count();
+            if nodes != 2 * n {
+                return Err(format!(
+                    "bench_v41: {} graph has {nodes} nodes for {n} steps",
+                    site.label()
+                )
+                .into());
+            }
+            let rep = time_replay(stream, &graph, n, GREPS)?;
+            println!(
+                "bench shape={} kernel=ds41_indexer_score+ds41_indexer_topk n_vis={} top_k={TOP_K} \
+                 copies={copies} n_per_burst={n} nodes={nodes} key_bytes={} \
+                 eager_us_min={:.3} eager_us_mean={:.3} eager_us_max={:.3} \
+                 graph_us_min={:.3} graph_us_mean={:.3} graph_us_max={:.3} key_gbps={:.1} \
+                 steps_per_token={} token_graph_us={:.3}",
+                site.label(),
+                site.n_vis,
+                site.key_bytes(),
+                eager.min,
+                eager.mean,
+                eager.max,
+                rep.min,
+                rep.mean,
+                rep.max,
+                site.key_bytes() as f64 / rep.min / 1e3,
+                INDEX_SOURCE.len(),
+                rep.min * INDEX_SOURCE.len() as f64,
+            );
+            Ok(())
+        }
+    }
+
     /// Validate the table against the inventory and the placement doc, and
     /// print it with its per-token totals.
     fn print_table() -> Result<(), GateError> {
@@ -1448,6 +1704,16 @@ mod bench {
                 failed.push(s.label());
             }
         }
+        #[cfg(feature = "deepseek41")]
+        let (ix_kernels, mut ix_sites) = index::load(&gpu)?;
+        #[cfg(feature = "deepseek41")]
+        for s in &mut ix_sites {
+            if !index::check(&gpu, &ix_kernels, s)? {
+                failed.push(s.label());
+            }
+        }
+        #[cfg(not(feature = "deepseek41"))]
+        println!("v41 not_built site=indexer reason=needs_feature_deepseek41");
         if !failed.is_empty() {
             eprintln!("FAIL: check failed for: {}", failed.join(", "));
             return Err(checks_failed());
@@ -1466,6 +1732,10 @@ mod bench {
         let mut site_us = Vec::with_capacity(SITES.len());
         for (s, d) in SITES.iter().zip(devs.iter_mut()) {
             site_us.push(time_site(&gpu, &step, s, d)?.min);
+        }
+        #[cfg(feature = "deepseek41")]
+        for s in &mut ix_sites {
+            index::time(&gpu, &ix_kernels, s)?;
         }
         let touch = Probe::load(ctx)?;
         for plan in Plan::ALL {
