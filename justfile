@@ -196,7 +196,9 @@ bench-gpu-kernels *ARGS:
 
 # V4.1 한 토큰이 GPU에서 내는 gemv 사이트 21개의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다. attn_output_a는 값매김 팔
 # 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
-# 사이트마다 첫 사본과 끝 사본에서 여섯 행을 같은 바이트로 계산한 f64 참조와 대조한다. 3090, 게이트 락.
+# 사이트마다 첫 사본과 끝 사본에서 여섯 행(heads 팔은 헤드마다 첫 행을 더한다)을 같은 바이트로 계산한 f64 참조와
+# 대조하고, 사본마다 그 발사의 출력 전체에 대한 FNV-1a digest를 한 줄 찍는다 — 커널을 재편하는 라운드는 이 줄로
+# 비트 동일을 보인다. 3090, 게이트 락.
 bench-gpu-v41-check:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/gpu-gate.sh bench_v41 --check'
 
@@ -524,7 +526,7 @@ gate-1-1:
     ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && "$BLOOMERY_DATA/bin/dequant_ref" "${BLOOMERY_V41_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}" "$BLOOMERY_DATA/ref-v41" f32 bf16 q8_0 && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-gpu-gates-lib
+gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-gpu-gates-lib gate-gpu-lib
 
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.
@@ -537,10 +539,11 @@ inventory-v41:
 gate-gpu-head:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && bash tools/gpu-gate.sh gate_head_gpu'
 
-# bloomery-gpu 라이브러리의 단위 시험(호스트 전용 — 카드를 쓰지 않아 게이트 락을 잡지 않는다).
-# 디바이스 크레이트라 cargo oxide test로 돈다; tools/gate.sh --oxide가 상한과 종료 코드를 같이 쥔다.
+# bloomery-gpu 라이브러리의 단위 시험. 디바이스 크레이트라 cargo oxide test로 돌고, tools/gate.sh --oxide가 상한과
+# 종료 코드를 쥔다. hw_ 시험 하나(graph.rs — 노드 분류가 캡처한 호스트 함수를 호스트 노드로 세는지)는 3090에
+# 컨텍스트와 빈 버퍼만 잡고 커널을 돌리지 않으므로, 게이트 락 없이 --include-ignored로 함께 돈다. just gate가 부른다.
 gate-gpu-lib:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --lib -- --include-ignored'
 
 # bloomery-gpu-gates 라이브러리의 단위 시험(호스트 전용, 카드·게이트 락 없음). ptx.rs의 컨테이너 판독 계약 —
 # 8의 배수 길이 페이로드의 마지막 본문, 번들 경계, 파서가 거부한 섹션은 빈 표가 아니라 오류 — 이 여기서 돈다.
@@ -630,9 +633,11 @@ gate-gpu-p8b *ARGS:
 # PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
 # 바이너리의 cargo 피처는 `--features`로 준다(기본 gpu). V4.1 게이트 바이너리는 `--features deepseek41`.
+# 끝의 두 열(jit_regs·jit_local)은 드라이버 JIT가 실제로 잡은 값이다. oxart_jit가 모듈을 카드에 올려 읽으므로
+# 게이트 락(tools/gpu-gate.sh) 아래서 돈다.
 [arg("FEATURES", long="features")]
 ptx-scan BIN FEATURES='gpu' *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} --bin oxart_jit && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
 
 # 인자: `<엔트리> n,t,…`(분기 결정 한 줄을 따라간 경로), `<엔트리> list`(목록).
 # SASS 스캔(ptx-scan의 짝, 계측기): 첫 대기 전에 발행된 전역 로드 수를 루프마다, 그리고 한 경로를 따라 센다.

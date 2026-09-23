@@ -56,7 +56,9 @@
 //!   the offline judge. The lever that picks the flash kernel is read once
 //!   per process, so each flash arm is its own run with its own line.
 //! - (2) graph mode reproduces the eager sequence token for token on every
-//!   prompt — the eager-equals-replay arm every step gate has.
+//!   prompt — the eager-equals-replay arm every step gate has — and the
+//!   captured chain holds no host node: its node kinds, as the driver lists
+//!   them, are printed and the host count is pinned at zero.
 //! - (3) determinism: two eager runs give identical tables.
 //! - (4) every flash stage-doubling arm (`StepProbe::keyaxis_arms`) writes
 //!   the base path's tokens, on this prompt set and on a deeper prompt, at
@@ -92,6 +94,8 @@ use bloomery_gpu_gates::prompts::{
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, ref_model_path};
+#[cfg(feature = "gpu")]
+use cuda_core::sys;
 #[cfg(feature = "gpu")]
 use gguf::Split;
 
@@ -876,6 +880,26 @@ fn run() -> Result<(), GateError> {
         println!("  the chain captured {nodes} nodes, the pin is {NODES_CHAIN}");
         ok = false;
     }
+    // The chain is kernels and copies: a host node would put a CPU callback
+    // in every replay. The kinds as the driver lists them, the host count
+    // pinned at zero.
+    let kinds = model.step_graph_nodes()?;
+    let of = |k| kinds.iter().filter(|n| n.kind == k).count();
+    let host = of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST);
+    let (kernel, memcpy, memset) = (
+        of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL),
+        of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY),
+        of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET),
+    );
+    println!(
+        "graph kinds kernel={kernel} memcpy={memcpy} memset={memset} host={host} other={} \
+         host_want=0 {}",
+        kinds.len() - kernel - memcpy - memset - host,
+        if host == 0 { "ok" } else { "FAIL" }
+    );
+    if host != 0 {
+        ok = false;
+    }
     if !same {
         ok = false;
         for (i, (g, e)) in graph.iter().zip(&eager).enumerate() {
@@ -986,7 +1010,8 @@ fn run() -> Result<(), GateError> {
              every prompt or misses it only inside MARGIN_FLOOR; fed the reference's own \
              path, it leaves the model's exact answer on that path at no more than \
              FORCED_PIN positions the exact margin was clear about; graph replay equals eager \
-             token for token at the pinned node count; two eager runs are identical; every \
+             token for token at the pinned node count, none of them a host node; two eager \
+             runs are identical; every \
              flash stage-doubling arm writes the base path's tokens at that same node count; a \
              seeded cache leaves the step at the same position and key count a decoded \
              prompt does; and the two reference files agree with each other."

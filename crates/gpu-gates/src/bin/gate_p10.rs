@@ -10,10 +10,11 @@
 //!    fails the gate outright.
 //! 2. Read-back identity: EVERY uploaded tensor read back device->host
 //!    equals an independently packed host copy bit for bit — packed here
-//!    with the gates' own reference helpers (`bytes_to_words`, `pack_q5_*`,
-//!    a local transcription of the Q8_0 planes), not with the loader's
-//!    code, so a wrong packing cannot pass against itself. Compared tensor
-//!    by tensor; the whole model is never held on the host twice.
+//!    with the gates' own reference helper (`bytes_to_words`) and local
+//!    transcriptions of the Q5_0/Q5_1 words (from ggml's block layouts) and
+//!    of the Q8_0 planes, not with the loader's code, so a wrong packing
+//!    cannot pass against itself. Compared tensor by tensor; the whole model
+//!    is never held on the host twice.
 //! 3. Staging: `load(0..14)` + `load(14..n)` + globals cover exactly the
 //!    full load's names, disjointly, and their resident bytes sum to the
 //!    full load's (each dropped before the next — the card is shared).
@@ -490,8 +491,8 @@ fn expected_planes(
             let rb = row_bytes(info.ty, k)?;
             HostPlanes::Words(bytes_to_words(&bytes[..rb * rows]))
         }
-        GgmlType::Q5_0 => HostPlanes::Words(pack_q5_0(bytes, k, rows)?),
-        GgmlType::Q5_1 => HostPlanes::Words(pack_q5_1(bytes, k, rows)?),
+        GgmlType::Q5_0 => HostPlanes::Words(gate_q5_words(bytes, k, rows, false)?),
+        GgmlType::Q5_1 => HostPlanes::Words(gate_q5_words(bytes, k, rows, true)?),
         GgmlType::F32 => HostPlanes::F32(
             bytes[..rows * k * 4]
                 .chunks_exact(4)
@@ -502,6 +503,58 @@ fn expected_planes(
             return Err(format!("gate_p10: {name}: type {other} has no reference packing").into());
         }
     })
+}
+
+/// The q5 gemv weight words of `rows` rows of raw Q5_0 (`q5_1` false) or
+/// Q5_1 blocks, written here so the read-back has an anchor the loader does
+/// not share. The values come from ggml's block layout: `block_q5_0` is d
+/// (f16), qh (u32 LE), qs[16]; `block_q5_1` is d, m (f16), qh, qs[16]; value
+/// j's code is the low nibble of qs[j] (j < 16) or the high nibble of
+/// qs[j − 16], with bit j of qh as its fifth bit. The places come from the
+/// kernel's side: per row `256·⌈k/1024⌉` code words — block b's word i at
+/// `256·(b/32) + 32·i + b%32`, byte t holding the code of value 4i + t, the
+/// order `q5_quantize_q8` writes the activation words in; Q5_0 stores the
+/// code minus 16 as a signed byte, Q5_1 the code; unused words zero — then
+/// each block's d as f32 bits and, for Q5_1, each block's m.
+#[cfg(feature = "gpu")]
+fn gate_q5_words(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<u32>, GateError> {
+    let (block, qh_at, qs_at) = if q5_1 { (24, 4, 8) } else { (22, 2, 6) };
+    let kb = k / 32;
+    if k == 0 || !k.is_multiple_of(32) || bytes.len() < rows * kb * block {
+        return Err(format!(
+            "gate_q5_words: {rows} rows of k = {k} need k a positive multiple of 32 and \
+             {} bytes, got {}",
+            rows * kb * block,
+            bytes.len()
+        )
+        .into());
+    }
+    let q_stride = 256 * kb.div_ceil(32);
+    let row_words = q_stride + if q5_1 { 2 * kb } else { kb };
+    let mut out = vec![0u32; rows * row_words];
+    for (r, row) in out.chunks_exact_mut(row_words).enumerate() {
+        for b in 0..kb {
+            let blk = &bytes[(r * kb + b) * block..][..block];
+            let qh =
+                u32::from_le_bytes([blk[qh_at], blk[qh_at + 1], blk[qh_at + 2], blk[qh_at + 3]]);
+            for j in 0..32 {
+                let low = if j < 16 {
+                    blk[qs_at + j] & 0x0f
+                } else {
+                    blk[qs_at + j - 16] >> 4
+                };
+                let code = low | ((((qh >> j) & 1) as u8) << 4);
+                let byte = if q5_1 { code } else { (code as i8 - 16) as u8 };
+                row[256 * (b / 32) + 32 * (j / 4) + b % 32] |= u32::from(byte) << (8 * (j % 4));
+            }
+            row[q_stride + b] = half_to_f32(u16::from_le_bytes([blk[0], blk[1]])).to_bits();
+            if q5_1 {
+                row[q_stride + kb + b] =
+                    half_to_f32(u16::from_le_bytes([blk[2], blk[3]])).to_bits();
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The q8f32 two-plane transcription of Q8_0 blocks, written here from the

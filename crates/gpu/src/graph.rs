@@ -209,3 +209,54 @@ impl Drop for Graph {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Graph, cu};
+    use cuda_core::{CudaContext, DeviceBuffer, sys};
+    use std::ffi::c_void;
+
+    /// The host function the test graph records. The graph is never
+    /// launched, so it never runs.
+    unsafe extern "C" fn nothing(_: *mut c_void) {}
+
+    /// A structure gate pins "no host node" by counting the nodes `nodes`
+    /// reports as `CU_GRAPH_NODE_TYPE_HOST`; that count means something only
+    /// if a captured host function does come back as one. A memset and a
+    /// host function, captured: two nodes, exactly one of them a host node
+    /// carrying its sync mode.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_nodes_report_a_captured_host_function() {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let stream = ctx.new_stream().expect("a stream");
+        let mut buf = DeviceBuffer::<u32>::zeroed(&stream, 64).expect("a device buffer");
+        stream
+            .synchronize()
+            .expect("the allocation lands before capture");
+        let graph = Graph::capture(&stream, |s| {
+            buf.zero_async(s)?;
+            // SAFETY: `s` is the live stream being captured; `nothing` takes
+            // any pointer and never reads it, and the graph is never launched.
+            let rc = unsafe {
+                sys::cuLaunchHostFunc(s.cu_stream(), Some(nothing), std::ptr::null_mut())
+            };
+            cu(rc, "cuLaunchHostFunc")
+        })
+        .expect("the capture");
+        let nodes = graph.nodes().expect("the node list");
+        let host: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST)
+            .collect();
+        assert_eq!(nodes.len(), 2, "{nodes:?}");
+        assert_eq!(host.len(), 1, "{nodes:?}");
+        assert!(host[0].host_sync.is_some(), "{nodes:?}");
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET),
+            "{nodes:?}"
+        );
+    }
+}

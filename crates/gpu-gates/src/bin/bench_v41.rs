@@ -29,13 +29,17 @@
 //! device formats the engine's launchers take.
 //!
 //! `--check`: each site runs one launch on its first and last copy, and a
-//! handful of output rows are compared with an f64 host reference computed
+//! handful of output rows — for the heads launch, the first row of every
+//! head among them — are compared with an f64 host reference computed
 //! from the same bytes — `d × code` for q8_0, `gguf::quant::dequant_row` for
 //! the K-quants against the host transcription of their q8_1 activation.
 //! The band is [`KERNEL_BAND`]: accumulation rounding alone sits orders of
 //! magnitude below it, and a wrong row, scale, activation or copy lands
 //! orders of magnitude above it. A failing site is named and the run exits
-//! non-zero.
+//! non-zero. Each checked launch also prints an FNV-1a 64 digest of its
+//! whole output (`digest` lines): the reference is sampled, the digest is
+//! not, so two builds whose digest lines match wrote the same bits in every
+//! row.
 //!
 //! `--time` (lead-only, under `tools/ref/time-gate.sh`, which owns the lease,
 //! the witness blocks and the card pin): the check first, refusing to time
@@ -478,15 +482,23 @@ mod bench {
             }
         }
 
-        /// Bytes of one weight row in the device format.
-        fn device_row_bytes(&self) -> usize {
+        /// Bytes of one weight row in the device format; an error naming the
+        /// site when its k has no layout in the loader's q8_0 card format.
+        fn device_row_bytes(&self) -> Result<usize, GateError> {
             match self.kernel {
                 // The loader's q8_0 card format: k one-byte codes plus an f16
                 // scale per 32 values.
                 Kernel::Q8 | Kernel::Q8Heads => resident_size(GgmlType::Q8_0, self.k, 1)
-                    .expect("every q8_0 site's k is a multiple of 32"),
-                Kernel::F32 => 4 * self.k,
-                _ => self.file_row_bytes(),
+                    .ok_or_else(|| {
+                        format!(
+                            "bench_v41: site {}: k = {} has no q8_0 device layout",
+                            self.label(),
+                            self.k
+                        )
+                        .into()
+                    }),
+                Kernel::F32 => Ok(4 * self.k),
+                _ => Ok(self.file_row_bytes()),
             }
         }
 
@@ -502,8 +514,8 @@ mod bench {
         }
 
         /// Weight bytes one launch reads (the whole device copy).
-        fn w_bytes(&self) -> u64 {
-            (self.out_len() * self.device_row_bytes()) as u64
+        fn w_bytes(&self) -> Result<u64, GateError> {
+            Ok((self.out_len() * self.device_row_bytes()?) as u64)
         }
 
         /// File bytes of the weight rows one launch reads.
@@ -526,8 +538,8 @@ mod bench {
 
         /// What one launch addresses — weights, activation and outputs, the
         /// byte convention of `gate_p8 --bench-kernels`.
-        fn launch_bytes(&self) -> u64 {
-            self.w_bytes() + self.x_bytes() + 4 * self.out_len() as u64
+        fn launch_bytes(&self) -> Result<u64, GateError> {
+            Ok(self.w_bytes()? + self.x_bytes() + 4 * self.out_len() as u64)
         }
 
         /// File bytes of one tensor of this site: a routed stack holds all
@@ -552,9 +564,9 @@ mod bench {
 
         /// Copies on the device: the real ones, then padding up to
         /// `CYCLE_FLOOR` for the site's own timing.
-        fn copies(&self) -> usize {
-            let floor = CYCLE_FLOOR.div_ceil(self.w_bytes()) as usize;
-            self.launches().max(floor)
+        fn copies(&self) -> Result<usize, GateError> {
+            let floor = CYCLE_FLOOR.div_ceil(self.w_bytes()?) as usize;
+            Ok(self.launches().max(floor))
         }
 
         /// The row geometry the launcher and the upload need: K a multiple of
@@ -574,16 +586,16 @@ mod bench {
         }
 
         /// Device bytes the site allocates.
-        fn vram_bytes(&self) -> u64 {
+        fn vram_bytes(&self) -> Result<u64, GateError> {
             let x = if matches!(self.kernel, Kernel::Q8 | Kernel::Q8Heads | Kernel::F32) {
                 (4 * self.x_cols() * self.k) as u64
             } else {
                 self.x_bytes() * (self.x_cols() / self.launch_cols()) as u64
             };
-            self.copies() as u64 * self.w_bytes()
+            Ok(self.copies()? as u64 * self.w_bytes()?
                 + x
                 + (4 * self.groups * self.out_len()) as u64
-                + 4 * N_SLOTS as u64
+                + 4 * N_SLOTS as u64)
         }
 
         /// The weight row and activation column output `o` of a launch reads.
@@ -612,6 +624,9 @@ mod bench {
     }
 
     impl Plan {
+        /// Every plan, in the order `--time` captures them.
+        const ALL: [Plan; 3] = [Plan::Today, Plan::Batched, Plan::Heads];
+
         fn name(self) -> &'static str {
             match self {
                 Plan::Today => "today",
@@ -864,13 +879,29 @@ mod bench {
     }
 
     /// The output rows a check compares: both ends, and rows a third and
-    /// two thirds in — which for a `_sel` launch fall in different slots.
-    fn check_rows(n: usize) -> Vec<usize> {
+    /// two thirds in — which for a `_sel` launch fall in different slots —
+    /// and the first row of each of `heads` heads, so a heads launch is
+    /// checked in every activation window.
+    fn check_rows(n: usize, heads: usize) -> Vec<usize> {
         let mut v = vec![0, 1, n / 3, n / 2, 2 * n / 3 + 1, n - 1];
+        v.extend((0..heads).map(|h| h * (n / heads)));
         v.retain(|&o| o < n);
         v.sort_unstable();
         v.dedup();
         v
+    }
+
+    /// FNV-1a 64 over the little-endian bytes of the f32 bits of `y` — the
+    /// digest `gate_p1` pins, here over a launch's whole output.
+    fn fnv1a64(y: &[f32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for v in y {
+            for b in v.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
     }
 
     /// Generate, reference and upload every copy of `site` from data stream
@@ -904,12 +935,13 @@ mod bench {
         };
         let real = site.launches();
         let checked = [0, real - 1];
-        let mut w = Vec::with_capacity(site.copies());
+        let copies = site.copies()?;
+        let mut w = Vec::with_capacity(copies);
         let mut refs: Vec<Ref> = Vec::new();
-        for copy in 0..site.copies() {
+        for copy in 0..copies {
             let host = synth(site, idx, copy)?;
             if checked.contains(&copy) && !refs.iter().any(|r| r.copy == copy) {
-                let rows = check_rows(site.out_len());
+                let rows = check_rows(site.out_len(), site.heads);
                 let g = copy % site.groups;
                 let want = rows
                     .iter()
@@ -984,7 +1016,10 @@ mod bench {
     }
 
     /// One launch per checked copy, the compared rows against their
-    /// reference; prints the site's check line.
+    /// reference; prints the site's check line, then one digest line per
+    /// checked copy over the launch's whole output — the rows the check
+    /// does not compare included — so a round that re-shapes a kernel can
+    /// show every output bit unchanged by diffing these lines.
     fn check_site(
         gpu: &Gpu,
         step: &StepKernels,
@@ -995,11 +1030,13 @@ mod bench {
         let mut rels = Vec::new();
         let mut outs = Vec::new();
         let mut errors = Vec::new();
+        let mut digests = Vec::new();
         let checked: Vec<usize> = dev.refs.iter().map(|r| r.copy).collect();
         for (i, &copy) in checked.iter().enumerate() {
             launch(gpu, step, site, dev, copy)?;
             stream.synchronize()?;
             let y = dev.y[copy % site.groups].to_host_vec(stream)?;
+            digests.push((copy, y.len(), fnv1a64(&y)));
             let r = &dev.refs[i];
             let got: Vec<f32> = r.rows.iter().map(|&o| y[o]).collect();
             match max_rel_err(&got, &r.want) {
@@ -1038,6 +1075,13 @@ mod bench {
                 format!(" errors=[{}]", errors.join("; "))
             },
         );
+        for (copy, rows, digest) in digests {
+            println!(
+                "digest shape={} kernel={} copy={copy} out_rows={rows} fnv1a64={digest:#018x}",
+                site.label(),
+                site.kernel.name()
+            );
+        }
         Ok(pass)
     }
 
@@ -1133,7 +1177,7 @@ mod bench {
             .into());
         }
         let rep = time_replay(gpu.stream(), &graph, n, GREPS)?;
-        let bytes = site.launch_bytes();
+        let bytes = site.launch_bytes()?;
         println!(
             "bench shape={} kernel={} out_rows={} k={} cols={} grid={} copies={} real_copies={} \
              n_per_burst={n} nodes={nodes} w_bytes={} bytes={bytes} \
@@ -1148,7 +1192,7 @@ mod bench {
             site.grid(),
             copies,
             site.launches(),
-            site.w_bytes(),
+            site.w_bytes()?,
             eager.min,
             eager.mean,
             eager.max,
@@ -1192,8 +1236,8 @@ mod bench {
         let rep = time_replay(stream, &graph, 1, TOKEN_REPS)?;
         let (mut w_bytes, mut bytes, mut sum_us) = (0u64, 0u64, 0.0f64);
         for &(i, _) in &launches {
-            w_bytes += SITES[i].w_bytes();
-            bytes += SITES[i].launch_bytes();
+            w_bytes += SITES[i].w_bytes()?;
+            bytes += SITES[i].launch_bytes()?;
             sum_us += site_us[i];
         }
         let mut tbuf = DeviceBuffer::<f32>::zeroed(stream, 32)?;
@@ -1235,11 +1279,16 @@ mod bench {
             if s.tensor_file_bytes() != s.inventory_bytes || !s.layout_ok() {
                 bad.push(s.label());
             }
-            let token = Plan::Today.takes(s);
+            let site_w_bytes = s.w_bytes()?;
+            let plans: Vec<&str> = Plan::ALL
+                .iter()
+                .filter(|p| p.takes(s))
+                .map(|p| p.name())
+                .collect();
             println!(
                 "v41 site={} kernel={} type={} layers={} tensors={} launches_per_token={} \
-                 out_rows={} k={} cols={} grid={} w_bytes={} file_bytes={} tensor_file_bytes={} \
-                 inventory_bytes={} copies={} in_token_graph={token}",
+                 out_rows={} k={} cols={} grid={} w_bytes={site_w_bytes} file_bytes={} \
+                 tensor_file_bytes={} inventory_bytes={} copies={} in_token_graph={}",
                 s.label(),
                 s.kernel.name(),
                 s.kernel.file_type(),
@@ -1250,33 +1299,36 @@ mod bench {
                 s.k,
                 s.launch_cols(),
                 s.grid(),
-                s.w_bytes(),
                 s.launch_file_bytes(),
                 s.tensor_file_bytes(),
                 s.inventory_bytes,
-                s.copies(),
+                s.copies()?,
+                plans.join(","),
             );
-            if !token {
+            // The totals are today's token.
+            if !Plan::Today.takes(s) {
                 continue;
             }
             launches += s.launches();
             tensors += s.tensors();
             tensor_bytes += s.tensors() as u64 * s.tensor_file_bytes();
-            w_bytes += s.launches() as u64 * s.w_bytes();
+            w_bytes += s.launches() as u64 * site_w_bytes;
             file_bytes += s.launches() as u64 * s.launch_file_bytes();
             if s.kernel == Kernel::Q8 {
                 q8_tensors += s.tensors();
                 q8_file += s.launches() as u64 * s.launch_file_bytes();
-                q8_dev += s.launches() as u64 * s.w_bytes();
+                q8_dev += s.launches() as u64 * site_w_bytes;
             }
             if s.kernel.is_sel() {
                 exp_launches += s.launches();
-                exp_bytes += s.launches() as u64 * s.w_bytes();
+                exp_bytes += s.launches() as u64 * site_w_bytes;
             }
         }
         let gate_up = || SITES.iter().filter(|s| s.kernel == Kernel::Q3kSel);
         let gate_up_low_launches = gate_up().count() * EXPERT_LO;
-        let gate_up_low: u64 = gate_up().map(|s| EXPERT_LO as u64 * s.w_bytes()).sum();
+        let gate_up_low = gate_up()
+            .map(|s| Ok(EXPERT_LO as u64 * s.w_bytes()?))
+            .sum::<Result<u64, GateError>>()?;
         println!(
             "v41 token launches={launches} tensors={tensors} tensor_file_bytes={tensor_bytes} \
              w_bytes={w_bytes} file_bytes={file_bytes} \
@@ -1360,7 +1412,10 @@ mod bench {
              out_rows={HC_ROWS} k={HC_K} file_bytes={} served_by=ds41_hc_pre",
             HC_TENSORS * HC_ROWS * HC_K / 256 * 110
         );
-        let plan: u64 = SITES.iter().map(Site::vram_bytes).sum();
+        let plan = SITES
+            .iter()
+            .map(Site::vram_bytes)
+            .sum::<Result<u64, GateError>>()?;
         let (free, total) = vram(&gpu)?;
         println!(
             "v41 vram plan_bytes={plan} free_bytes={free} total_bytes={total} margin_bytes={VRAM_MARGIN}"
@@ -1413,7 +1468,7 @@ mod bench {
             site_us.push(time_site(&gpu, &step, s, d)?.min);
         }
         let touch = Probe::load(ctx)?;
-        for plan in [Plan::Today, Plan::Batched, Plan::Heads] {
+        for plan in Plan::ALL {
             time_token(&gpu, &step, plan, &mut devs, &site_us, &touch)?;
         }
         Ok(())

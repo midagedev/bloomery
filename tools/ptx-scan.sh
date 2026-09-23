@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # PTX scan — read the device code a gate binary carries, as a table. An instrument, not a gate: it
 # asserts nothing about a kernel. But a scan that could not read the kernels is a failure, not a
-# table — it exits 0 only when every PTX module came out of the container and assembled under ptxas.
+# table — it exits 0 only when every PTX module came out of the container, assembled under ptxas
+# and loaded under the driver's JIT.
 #
 # `cargo oxide` puts the bundle's PTX text into the executable's `.oxart` ELF section verbatim.
 # So a kernel's compiled shape — whether registers spilled to local (`__local_depot`), how many
@@ -30,11 +31,17 @@
 # no `fma.f32` anywhere, so counting that silently returns 0 and the kernel reads as clean — here
 # and in the gates, the `fma.` prefix is what is counted.
 #
+# An entry's body is its own text only: it ends at the next `.entry` or `.func` line, so a device
+# function's instructions never land on the entry above it. An entry that `call`s one has the
+# callee's work outside its row; the banner names such entries (`calls=NAME:N,…`) and stderr says
+# why — the same reading as bloomery_gpu_gates::ptx (`body`, `Counts::calls`).
+#
 # Usage: tools/ptx-scan.sh <binary name> [entry substring]
 #   Reads target/release/<binary> and runs the extractor on its section. The recipe
-#   (`just ptx-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds both first.
+#   (`just ptx-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds all three first.
 #   PTX_SCAN_PTXAS (default $CUDA_TOOLKIT_PATH/bin/ptxas, else /usr/local/cuda/bin/ptxas),
-#   PTX_SCAN_ARCH (default sm_86) and PTX_SCAN_EXTRACT (default target/release/oxart_ptx)
+#   PTX_SCAN_ARCH (default sm_86), PTX_SCAN_EXTRACT (default target/release/oxart_ptx) and
+#   PTX_SCAN_JIT (default oxart_jit, a target/release binary run through tools/gpu-gate.sh)
 #   override the tools.
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
@@ -45,14 +52,16 @@
 #   section=none         the binary carries no .oxart section (a host-only binary?)
 #   extract=failed       the extractor rejected the section, or is not there
 #   modules=0            the section carries no PTX payload
-#   ptxas=none           no executable ptxas, so the last four columns cannot be read
+#   ptxas=none           no executable ptxas, so the ptxas columns cannot be read
 #   ptxas-failed=modN    ptxas rejected these modules (comma-separated)
+#   jit=failed           the driver did not load every module, or the gate lock was not free
 #   ptxas-unread=NAME    ptxas assembled every module but reported nothing for these entries
+#   jit-unread=NAME      the driver loaded every module but reported nothing for these entries
 #   bytescan=failed      the byte scan itself failed
 #   rows=0               no entry, or none the entry substring matches
 # 2: a usage error.
 #
-# The last four columns come from `ptxas -v` on the same PTX, not from the byte scan:
+# The next four columns come from `ptxas -v` on the same PTX, not from the byte scan:
 #   regs   registers per thread ("Used N registers")
 #   smem   static shared memory per block, bytes (0 when ptxas prints no smem clause)
 #   spill  spill stores + spill loads, bytes, summed from the function-properties line
@@ -64,9 +73,16 @@
 # memory 128 bytes per block plus a 1 KB per-block driver reservation. Static only: dynamic
 # shared memory is a launch argument and is nowhere in the PTX, so an entry that asks for
 # some at launch is reported here as if it asked for none.
-# Two more limits of this reading: the driver JITs the embedded PTX at load, so its assembler
-# may differ from the toolkit ptxas by a register or two; and a spill in SASS is not a PTX
-# local round-trip — an entry can show ld.local/st.local here and 0 spill bytes.
+# A spill in SASS is not a PTX local round-trip — an entry can show ld.local/st.local here and 0
+# spill bytes.
+#
+# The last two columns are what the card runs. The kernels reach it as PTX and the driver JITs
+# them at load with its own compiler, which need not be the toolkit's ptxas; oxart_jit loads every
+# module the way cuda-core does (cuModuleLoadData, default JIT options) and reads, per entry:
+#   jit_regs   CU_FUNC_ATTRIBUTE_NUM_REGS — the registers a launch of the entry occupies
+#   jit_local  CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES — per-thread local memory (spill and local arrays)
+# The banner names the card and the driver's CUDA version they came from (jit-card, jit-cuda). The
+# load needs a card, so it runs under the gate lock: a scan waits while another GPU gate holds it.
 set -uo pipefail
 NAME=${1:-}
 FILTER=${2:-}
@@ -75,6 +91,7 @@ FILTER=${2:-}
 PTXAS=${PTX_SCAN_PTXAS:-${CUDA_TOOLKIT_PATH:-/usr/local/cuda}/bin/ptxas}
 ARCH=${PTX_SCAN_ARCH:-sm_86}
 EXTRACT=${PTX_SCAN_EXTRACT:-target/release/oxart_ptx}
+JIT=${PTX_SCAN_JIT:-oxart_jit}
 if [ -z "$NAME" ]; then
   echo "usage: ptx-scan.sh <gate_bin_name> [entry-substring]" >&2
   exit 2
@@ -159,14 +176,34 @@ for MOD in "${MODFILES[@]}"; do
   ' "$MOD.err" >>"$TBL"
 done
 [ -z "$FAILED" ] || fail "$SEC $TOOLS modules=$NMOD ptxas-failed=$FAILED"
+# The driver's JIT on the box's card, the same section: one `# card=… cuda_driver=…` line, then
+# `<entry>\t<regs>\t<local>\t<shared>\t<max_threads>` per entry.
+JITTBL=$MODS/jit
+if ! bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err"; then
+  echo "ptx-scan: the driver JIT ($JIT) failed: $(tail -1 "$MODS/jit.err")" >&2
+  fail "$SEC $TOOLS modules=$NMOD jit=failed"
+fi
+JITS=$(sed -n 's/^# card=\([^ ]*\) cuda_driver=\([^ ]*\)$/jit-card=\1 jit-cuda=\2/p' "$JITTBL")
+if [ -z "$JITS" ]; then
+  echo "ptx-scan: $JIT printed no card line" >&2
+  fail "$SEC $TOOLS modules=$NMOD jit=failed"
+fi
 ROWS=$MODS/rows
 UNREAD=$MODS/unread
-if ! LC_ALL=C awk -v filter="$FILTER" -v tbl="$TBL" -v unread="$UNREAD" '
+JITUNREAD=$MODS/jitunread
+CALLS=$MODS/calls
+if ! LC_ALL=C awk -v filter="$FILTER" -v tbl="$TBL" -v unread="$UNREAD" -v jit="$JITTBL" \
+  -v jitunread="$JITUNREAD" -v callsf="$CALLS" '
 BEGIN {
   while ((getline line < tbl) > 0) {
     split(line, f, "\t"); R[f[1]] = f[2]; S[f[1]] = f[3]; P[f[1]] = f[4]
   }
   close(tbl)
+  while ((getline line < jit) > 0) {
+    if (substr(line, 1, 1) == "#") continue
+    split(line, f, "\t"); JR[f[1]] = f[2]; JL[f[1]] = f[3]
+  }
+  close(jit)
 }
 # Resident blocks per SM on sm_86 from the static resources alone; see the header comment
 # for the constants and for what "static" leaves out.
@@ -185,20 +222,30 @@ function blocks(ntid, regs, smem,   wpb, rpw, lr, lw, ls, b) {
   if (16 < b) b = 16
   return b
 }
-function flush(   have) {
+function flush(   have, hj) {
   if (name == "") return
   have = (name in R)
+  hj = (name in JR)
   if (!have) print name > unread
-  if (filter == "" || index(name, filter) > 0)
-    printf "%d\t%-28s %8s %6s %9d %9d %6d %8d %6s %6s %6s %14s\n", (depot ? 0 : 1), name,
+  if (!hj) print name > jitunread
+  if (filter == "" || index(name, filter) > 0) {
+    printf "%d\t%-28s %8s %6s %9d %9d %6d %8d %6s %6s %6s %14s %8s %9s\n", (depot ? 0 : 1), name,
            (ntid == "" ? "-" : ntid), (depot ? "YES" : "no"), ldl, stl, fma, cvt,
            (have ? R[name] : "-"), (have ? S[name] : "-"), (have ? P[name] : "-"),
-           (have ? blocks(ntid, R[name], S[name]) : "-")
+           (have ? blocks(ntid, R[name], S[name]) : "-"),
+           (hj ? JR[name] : "-"), (hj ? JL[name] : "-")
+    if (calls > 0) printf "%s:%d\n", name, calls > callsf
+  }
   name = ""
 }
-function reset() { ntid = ""; depot = 0; ldl = 0; stl = 0; fma = 0; cvt = 0 }
+function reset() { ntid = ""; depot = 0; ldl = 0; stl = 0; fma = 0; cvt = 0; calls = 0 }
 function tally(line, needle,   n, s) { n = 0; s = line
   while ((i = index(s, needle)) > 0) { n++; s = substr(s, i + length(needle)) }
+  return n }
+# `call` as its own mnemonic (call, call.uni, predicated), not `.callprototype` or `// callseq`.
+# The character after a match is kept, so it cannot pass for the start of the next one.
+function tally_call(line,   n, s) { n = 0; s = line
+  while (match(s, /(^|[ \t{;])call[. \t]/)) { n++; s = substr(s, RSTART + RLENGTH - 1) }
   return n }
 # An entry body ends at the next entry or at the end of its module, never in the next module.
 FNR == 1 { flush(); reset() }
@@ -209,6 +256,9 @@ FNR == 1 { flush(); reset() }
   sub(/\(.*/, "", name)
   next
 }
+# ...and at any other declaration: a device function (`.func`, a definition or a prototype) is
+# not the entry above it, and its instructions do not belong to that entry.
+/(^|[ \t])\.(entry|func)([ \t(]|$)/ { flush(); reset(); next }
 name != "" {
   if (ntid == "" && index($0, ".reqntid ") > 0) {
     ntid = $0; sub(/.*\.reqntid /, "", ntid); sub(/[^0-9].*/, "", ntid)
@@ -218,6 +268,7 @@ name != "" {
   stl += tally($0, "st.local")
   fma += tally($0, "fma.")
   cvt += tally($0, "cvt.f32.f16")
+  calls += tally_call($0)
 }
 END { flush() }
 ' "${MODFILES[@]}" | LC_ALL=C sort -k1,1n -k2,2 | cut -f2- >"$ROWS"; then
@@ -227,12 +278,21 @@ if [ -s "$UNREAD" ]; then
   echo "ptx-scan: ptxas assembled every module but reported nothing for: $(paste -sd, "$UNREAD")" >&2
   fail "$SEC $TOOLS modules=$NMOD ptxas-unread=$(paste -sd, "$UNREAD")"
 fi
+if [ -s "$JITUNREAD" ]; then
+  echo "ptx-scan: the driver loaded every module but reported nothing for: $(paste -sd, "$JITUNREAD")" >&2
+  fail "$SEC $TOOLS modules=$NMOD $JITS jit-unread=$(paste -sd, "$JITUNREAD")"
+fi
 if [ ! -s "$ROWS" ]; then
   echo "ptx-scan: no entry${FILTER:+ name contains $FILTER}" >&2
   fail "$SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER} rows=0"
 fi
-echo "ptx-scan bin=$BIN $SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER}"
-printf '%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s\n' \
-  entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill 'blk/SM(static)'
+CALLERS=
+if [ -s "$CALLS" ]; then
+  CALLERS=$(LC_ALL=C sort "$CALLS" | paste -sd, -)
+  echo "ptx-scan: entries that call a device function — their rows count their own body, not the callee's: $CALLERS" >&2
+fi
+echo "ptx-scan bin=$BIN $SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER} $JITS${CALLERS:+ calls=$CALLERS}"
+printf '%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s %8s %9s\n' \
+  entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill 'blk/SM(static)' jit_regs jit_local
 cat "$ROWS"
 exit 0

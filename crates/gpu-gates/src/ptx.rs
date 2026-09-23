@@ -72,25 +72,58 @@ impl<'a> Module<'a> {
 
 /// The bundles of an `.oxart` section's bytes (what `objcopy -O binary
 /// --only-section=.oxart` writes), cut by oxide-artifacts' parser. An error
-/// when the parser rejects the container.
+/// when the parser rejects the container, or when a bundle carries a Cubin
+/// beside its PTX ([`ptx_is_what_loads`]).
 pub fn section_bundles(section: &[u8]) -> Result<Vec<OwnedArtifactBundle>, GateError> {
-    let bundles = oxide_artifacts::parse_artifact_section(section)
-        .map_err(|e| format!("the .oxart container does not parse: {e}"))?;
-    Ok(bundles.into_iter().map(Into::into).collect())
+    let bundles: Vec<OwnedArtifactBundle> = oxide_artifacts::parse_artifact_section(section)
+        .map_err(|e| format!("the .oxart container does not parse: {e}"))?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    ptx_is_what_loads(&bundles)?;
+    Ok(bundles)
 }
 
 /// The `.oxart` bundles of the running executable, read by oxide-artifacts'
 /// object reader — the call cuda-core's module loader makes on the same
-/// file, so a gate scans the text the driver is handed.
+/// file, so a gate scans the text the driver is handed. Refuses what
+/// [`section_bundles`] refuses.
 pub fn current_exe_bundles() -> Result<Vec<OwnedArtifactBundle>, GateError> {
     let exe = std::env::current_exe()?;
     let bytes = std::fs::read(&exe).map_err(|e| format!("read {}: {e}", exe.display()))?;
-    oxide_artifacts::read_artifact_bundles_from_object_bytes(&bytes)
-        .map_err(|e| format!("{}: the .oxart section does not parse: {e}", exe.display()).into())
+    let bundles = oxide_artifacts::read_artifact_bundles_from_object_bytes(&bytes)
+        .map_err(|e| format!("{}: the .oxart section does not parse: {e}", exe.display()))?;
+    ptx_is_what_loads(&bundles).map_err(|e| format!("{}: {e}", exe.display()))?;
+    Ok(bundles)
+}
+
+/// Err when a bundle carries a Cubin as well as a PTX payload. cuda-core's
+/// loader takes the Cubin first and never hands the driver that PTX, so a
+/// scan of it would describe code that does not run. Both bundle readers
+/// refuse through here, and they are the only way to [`modules`].
+fn ptx_is_what_loads(bundles: &[OwnedArtifactBundle]) -> Result<(), GateError> {
+    let shadowed: Vec<&str> = bundles
+        .iter()
+        .filter(|b| {
+            b.payload(ArtifactPayloadKind::Ptx).is_some()
+                && b.payload(ArtifactPayloadKind::Cubin).is_some()
+        })
+        .map(|b| b.name.as_str())
+        .collect();
+    if shadowed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "bundle(s) {shadowed:?} carry a Cubin beside the PTX: the loader runs the Cubin, \
+             so their PTX is not the device code"
+        )
+        .into())
+    }
 }
 
 /// The PTX modules of `bundles`: one per bundle that carries a PTX payload,
-/// in bundle order.
+/// in bundle order. `bundles` come from [`section_bundles`] or
+/// [`current_exe_bundles`], which refuse a bundle whose PTX a Cubin shadows.
 #[must_use]
 pub fn modules(bundles: &[OwnedArtifactBundle]) -> Vec<Module<'_>> {
     bundles
@@ -108,20 +141,65 @@ pub fn modules(bundles: &[OwnedArtifactBundle]) -> Vec<Module<'_>> {
 /// The marker every kernel's PTX declaration opens with.
 const ENTRY: &[u8] = b".visible .entry ";
 
+/// Offset of the line that holds the first `directive` (`.entry`, `.func`)
+/// of `text`, standing as its own token: whitespace or the text's start
+/// before it, whitespace or `(` after it — so `.callprototype`, a comment's
+/// `.funcs` or a name that contains the word does not match.
+fn directive_line(text: &[u8], directive: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    while let Some(off) = find(&text[at..], directive) {
+        let i = at + off;
+        let before = i == 0 || matches!(text[i - 1], b' ' | b'\t' | b'\n');
+        let after = matches!(
+            text.get(i + directive.len()),
+            Some(b' ' | b'\t' | b'\n' | b'(')
+        );
+        if before && after {
+            return Some(
+                text[..i]
+                    .iter()
+                    .rposition(|&c| c == b'\n')
+                    .map_or(0, |n| n + 1),
+            );
+        }
+        at = i + directive.len();
+    }
+    None
+}
+
 /// The PTX body of one `.visible .entry`: from just past its `name(` to the
-/// next entry's declaration, or to the end of its module for the last one.
-/// `None` when no module declares an entry of that name.
+/// line of the next declaration — the next entry, or a `.func` (a device
+/// function's definition or prototype, whose instructions are not the
+/// entry's) — or to the end of its module. `None` when no module declares
+/// an entry of that name.
 #[must_use]
 pub fn body<'a>(modules: &[Module<'a>], name: &str) -> Option<&'a [u8]> {
     let head = format!(".visible .entry {name}(");
     modules.iter().find_map(|m| {
         let start = find(m.text, head.as_bytes())? + head.len();
         let rest = &m.text[start..];
-        Some(match find(rest, ENTRY) {
-            Some(end) => &rest[..end],
-            None => rest,
-        })
+        let end = directive_line(rest, b".entry").unwrap_or(rest.len());
+        let end = directive_line(&rest[..end], b".func").unwrap_or(end);
+        Some(&rest[..end])
     })
+}
+
+/// `call` instructions in `body`: the mnemonic as its own token (`call`,
+/// `call.uni`, predicated or not), not `.callprototype` or the `// callseq`
+/// comments around a call. An entry that calls has its callee's work
+/// outside its [`body`], so every count read from that body leaves it out.
+#[must_use]
+pub fn calls(body: &[u8]) -> usize {
+    let mut n = 0;
+    let mut at = 0;
+    while let Some(off) = find(&body[at..], b"call") {
+        let i = at + off;
+        let before = i == 0 || matches!(body[i - 1], b' ' | b'\t' | b'\n' | b'{' | b';');
+        let after = matches!(body.get(i + 4), Some(b'.' | b' ' | b'\t'));
+        n += usize::from(before && after);
+        at = i + 4;
+    }
+    n
 }
 
 /// Every entry name, module by module, in the order the text declares them.
@@ -164,7 +242,9 @@ pub fn reqntid(body: &[u8]) -> Option<usize> {
 /// the backend names `__local_depot<n>`; `ld_local`/`st_local` are the
 /// traffic it costs. `fma` and `cvt_f16` are shape, not verdict: they say
 /// whether the body multiplies-and-adds in one instruction and whether it
-/// widens `f16` in hardware.
+/// widens `f16` in hardware. `calls` counts the body's `call` instructions:
+/// when it is not zero, every other count here is the entry's own body
+/// without its callees'.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Counts {
     pub name: String,
@@ -174,6 +254,7 @@ pub struct Counts {
     pub st_local: usize,
     pub fma: usize,
     pub cvt_f16: usize,
+    pub calls: usize,
 }
 
 /// Read one entry's counts out of the modules.
@@ -188,6 +269,7 @@ pub fn counts(modules: &[Module<'_>], name: &str) -> Option<Counts> {
         st_local: count(b, b"st.local"),
         fma: count(b, b"fma."),
         cvt_f16: count(b, b"cvt.f32.f16"),
+        calls: calls(b),
     })
 }
 
@@ -266,6 +348,82 @@ mod tests {
         let b = body(&ONE, "beta").expect("beta");
         assert!(find(b, b"gamma").is_none());
         assert_eq!(body(&ONE, "delta"), None);
+    }
+
+    /// An entry that calls a device function, the function's definition
+    /// between it and the next entry, and an entry with a predicated call.
+    /// The function carries every instruction a gate reads — two
+    /// multiply-adds, an f16 widen, a `clz`, local traffic — so a body that
+    /// ran on into it would hand all of them to `alpha`.
+    const WITH_FUNC: &[u8] = b"//
+.visible .entry alpha(
+  .param .u64 alpha_param_0
+)
+.reqntid 256, 1, 1
+{
+  prototype_0 : .callprototype (.param .b32 _) _ (.param .b32 _);
+  fma.rn.f32 %f1, %f2, %f3, %f4;
+  { // callseq 0, 0
+  .param .b32 retval0;
+  call.uni (retval0), helper, (param0);
+  } // callseq 0
+  ret;
+}
+.func  (.param .b32 func_retval0) helper(
+  .param .b32 helper_param_0
+)
+{
+  fma.rn.f32 %f1, %f2, %f3, %f4;
+  fma.rn.f32 %f5, %f6, %f7, %f8;
+  cvt.f32.f16 %f9, %rs1;
+  clz.b32 %r1, %r2;
+  st.local.b32 [%rd1], %r1;
+  ret;
+}
+.visible .entry beta(
+  .param .u64 beta_param_0
+)
+{
+  @%p1 call.uni helper, ();
+  ret;
+}
+";
+
+    /// A body ends at a `.func` as it ends at the next entry: the device
+    /// function's instructions are its own, not the entry's before it.
+    #[test]
+    fn body_stops_at_a_device_function() {
+        let mods = [Module {
+            bundle: "test",
+            text: WITH_FUNC,
+        }];
+        assert_eq!(entries(&mods), ["alpha", "beta"]);
+        let a = body(&mods, "alpha").expect("alpha");
+        assert!(
+            find(a, b"helper(").is_none(),
+            "alpha's body runs into the function: {:?}",
+            String::from_utf8_lossy(a)
+        );
+        let c = counts(&mods, "alpha").expect("alpha");
+        assert_eq!((c.fma, c.cvt_f16, c.st_local), (1, 0, 0));
+        assert_eq!(count(a, b"clz."), 0);
+        let b = counts(&mods, "beta").expect("beta");
+        assert_eq!((b.fma, b.cvt_f16), (0, 0));
+    }
+
+    /// A call is counted once per instruction — plain, `.uni` or predicated
+    /// — and never for the prototype or the callseq comments around it.
+    #[test]
+    fn counts_the_calls_an_entry_makes() {
+        let mods = [Module {
+            bundle: "test",
+            text: WITH_FUNC,
+        }];
+        assert_eq!(counts(&mods, "alpha").expect("alpha").calls, 1);
+        assert_eq!(counts(&mods, "beta").expect("beta").calls, 1);
+        assert_eq!(counts(&ONE, "alpha").expect("alpha").calls, 0);
+        assert_eq!(calls(b"call foo, ();\n\tcall.uni bar, ();"), 2);
+        assert_eq!(calls(b"// callseq 1\n.callprototype\n_Z6recallv"), 0);
     }
 
     #[test]
@@ -387,6 +545,36 @@ mod tests {
         let b = body(&mods, "beta").expect("beta");
         assert!(PTX8.ends_with(b));
         assert_eq!(reqntid(body(&mods, "gamma").expect("gamma")), None);
+    }
+
+    /// A bundle that carries a Cubin beside its PTX is refused: the loader
+    /// runs the Cubin, so the PTX is not the device code. A Cubin-only
+    /// bundle is no PTX module at all, and is not an error.
+    #[test]
+    fn a_bundle_whose_ptx_a_cubin_shadows_is_refused() {
+        let cubin: &[u8] = b"\x7fELF not a real cubin";
+        let both = build_artifact_blob(
+            &ArtifactBundleSpec::new("shadowed", "sm_86")
+                .with_payload(ArtifactPayloadSpec::new(
+                    ArtifactPayloadKind::Ptx,
+                    "bloomery_gpu.ptx",
+                    PTX8,
+                ))
+                .with_payload(ArtifactPayloadSpec::new(
+                    ArtifactPayloadKind::Cubin,
+                    "bloomery_gpu.cubin",
+                    cubin,
+                )),
+        )
+        .expect("a valid bundle spec");
+        let e = section_bundles(&both).expect_err("a PTX shadowed by a Cubin");
+        assert!(e.to_string().contains("shadowed"), "{e}");
+        let only = build_artifact_blob(&ArtifactBundleSpec::new("cubin", "sm_86").with_payload(
+            ArtifactPayloadSpec::new(ArtifactPayloadKind::Cubin, "bloomery_gpu.cubin", cubin),
+        ))
+        .expect("a valid bundle spec");
+        let bundles = section_bundles(&only).expect("a Cubin-only bundle");
+        assert!(modules(&bundles).is_empty());
     }
 
     /// A section the parser rejects is an error, never an empty list; a
