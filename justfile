@@ -524,11 +524,12 @@ gate-ds41-oracle:
 gate-ds41-plan:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && timeout --kill-after=10 900 ./target/release/gate_deepseek41_plan'
 
-# V4.1 rope family (tail rope, ROPE_BACK, latent K/V norm + rope + f16 ring append) against the 5-token and decode-step sets.
+# V4.1 rope 계열(머리 꼬리 rope, ROPE_BACK, 잠재 K/V의 norm·rope·f16 링 기록)을 5토큰 세트와 디코드 스텝 세트 전부에 대조한다.
+# rope 사이트는 ik와 비트 동일, K/V 행은 유도한 밴드 안이어야 한다. 게이트가 V4.1 파일의 메타데이터를 읽으므로 모델을 고정한다.
 gate-gpu-ds41-rope:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_rope && bash tools/gpu-gate.sh gate_deepseek41_rope'
 
-# Host unit tests of the V4.1 device crate (no card, no gate lock): the rope table is ggml's recipe at large positions.
+# V4.1 디바이스 크레이트의 호스트 단위 시험(카드·게이트 락 없음): 오라클 세트가 닿지 않는 큰 위치에서도 rope 표가 ggml 레시피와 같다.
 gate-gpu-ds41-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib'
 

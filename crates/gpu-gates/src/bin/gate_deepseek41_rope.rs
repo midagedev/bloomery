@@ -63,11 +63,13 @@ mod gate {
     /// The decode-step sets: one step after a prefill run under the dumped
     /// schedule (the `-every-node` variants of `tools/ref/models/deepseek41.sh`),
     /// the `unfused` ones with the indexer's scores and top-k as nodes of their
-    /// own — the same rope sites in another graph.
-    pub const STEP_SETS: [&str; 5] = [
+    /// own — the same rope sites in another graph — and `d1n` at 301 with the
+    /// file's top-k, where no indexer query is turned.
+    pub const STEP_SETS: [&str; 6] = [
         "ref_deepseek41_step4_every_node",
         "ref_deepseek41_d1_every_node",
         "ref_deepseek41_d1_unfused_every_node",
+        "ref_deepseek41_d1n_every_node",
         "ref_deepseek41_d2_every_node",
         "ref_deepseek41_d2_unfused_every_node",
     ];

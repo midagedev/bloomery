@@ -123,8 +123,10 @@ pub(crate) fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
 
 /// The partial sum of squares thread `tid` of an [`RMS_THREADS`] block owns
 /// for the row of `k` values at `base`: values `tid, tid + RMS_THREADS, …`
-/// ascending, one multiply and one add each. The norm's fixed per-thread
-/// order, shared by `rms_norm` and the fused `norm_quant`.
+/// ascending, each square added with one fused multiply-add (the device
+/// build contracts `acc + v·v`; a host transcription of this order uses
+/// `mul_add`). The norm's fixed per-thread order, shared by `rms_norm` and
+/// the fused `norm_quant`.
 ///
 /// Caller contract: `base + k <= x.len()`, `tid < RMS_THREADS`.
 #[inline(always)]
@@ -160,7 +162,10 @@ pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
 
 /// Adjacent-pair rotation of one rope pair, the reference's op order (the
 /// pairs are (2i, 2i+1), not NeoX split halves): `y0 = x0·cos − x1·sin`,
-/// `y1 = x0·sin + x1·cos`, plain multiplies.
+/// `y1 = x0·sin + x1·cos`. The device build contracts each line into one
+/// multiply and one fused multiply-add, so the result is not the host's
+/// op-by-op rounding; the gate's band owns that difference. A core that must
+/// round every op on its own uses the `_rn` intrinsics instead.
 #[inline(always)]
 pub(crate) fn rope_pair_core(x0: f32, x1: f32, c: f32, s: f32) -> (f32, f32) {
     (x0 * c - x1 * s, x0 * s + x1 * c)
