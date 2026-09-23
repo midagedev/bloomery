@@ -54,10 +54,14 @@
 //! A/B. The `load` line prints both the ask and the outcome.
 //!
 //! `BLOOMERY_STEP_STATS=1` reads, after every generated step, the host
-//! tier's counters (`HybridStats`) and the process's page faults
-//! (`getrusage`), and prints one `stat step` line per step and a
-//! `stat summary` over the steps `--warm` keeps, after the loop, as the
-//! `time` lines are. Unset, the stat path does not run: no read, no call.
+//! tier's counters (`HybridStats`), the process's page faults (`getrusage`)
+//! and the card's free device bytes (`cuMemGetInfo`), and prints one
+//! `stat step` line per step and a `stat summary` over the steps `--warm`
+//! keeps, after the loop, as the `time` lines are. The summary's
+//! `vram_free_load` is the read before the first generated step (after the
+//! load, the capture and the fed ids); a replayed step allocates nothing,
+//! so `vram_free` staying there is the expected line. Unset, the stat path
+//! does not run: no read, no call.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -444,17 +448,24 @@ mod drive {
     }
 
     /// The counters one `BLOOMERY_STEP_STATS` read takes: the host tier's
-    /// since load, and the process's page faults since start.
+    /// since load, the process's page faults since start, and the card's
+    /// free device bytes now.
     #[derive(Clone, Copy)]
     struct Probe {
         hybrid: HybridStats,
         majflt: u64,
         minflt: u64,
+        vram_free: u64,
     }
 
     impl Probe {
         fn read(m: &Deepseek41Model) -> Result<Probe, GateError> {
             let hybrid = m.body("generate_ds41")?.hybrid().stats();
+            let stage = m
+                .stages()
+                .first()
+                .ok_or("generate_ds41: the model has no stage")?;
+            let vram_free = u64::try_from(stage.gpu().mem_info()?.0)?;
             // SAFETY: `rusage` is integers only, so all-zero is a valid value,
             // and `getrusage` writes only through the pointer it is given.
             let (rc, ru) = unsafe {
@@ -469,6 +480,7 @@ mod drive {
                 hybrid,
                 majflt: u64::try_from(ru.ru_majflt)?,
                 minflt: u64::try_from(ru.ru_minflt)?,
+                vram_free,
             })
         }
     }
@@ -477,9 +489,11 @@ mod drive {
     /// before the first generated step, one after each), then the summary
     /// over the steps past `warm`. `straggle_max_us` is the worst single
     /// service since load (a maximum has no delta); `host_w2` is the step's
-    /// mean host share of routed weight squared per service.
+    /// mean host share of routed weight squared per service. `vram_free` is
+    /// the read after the step, not a delta.
     fn print_stats(probes: &[Probe], warm: usize) {
         let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
+        let mut vram_free_min = u64::MAX;
         let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
         for (k, w) in probes.windows(2).enumerate() {
             let i = k + 1;
@@ -499,12 +513,14 @@ mod drive {
             println!(
                 "stat step {i}{tag} served={served} leg_us={leg_us:.1} straggle_us={straggle_us:.1} \
                  straggle_max_us={:.1} host_slots={host_slots} host_w2={host_w2:.4} go_early={} \
-                 parks={} majflt={dmaj} minflt={dmin}",
+                 parks={} majflt={dmaj} minflt={dmin} vram_free={}",
                 q.straggle_max_ns as f64 / 1e3,
                 q.go_early - p.go_early,
-                q.parks_in_service - p.parks_in_service
+                q.parks_in_service - p.parks_in_service,
+                w[1].vram_free
             );
             if i > warm {
+                vram_free_min = vram_free_min.min(w[1].vram_free);
                 legs.push(leg_us);
                 straggle_max = straggle_max.max(straggle_us);
                 slots += host_slots;
@@ -520,9 +536,11 @@ mod drive {
         legs.sort_by(f64::total_cmp);
         println!(
             "stat summary steps={n} leg_us_mean={mean:.1} leg_us_p50={:.1} straggle_us_max={straggle_max:.1} \
-             host_slots_mean={:.1} majflt={majflt} minflt={minflt}",
+             host_slots_mean={:.1} majflt={majflt} minflt={minflt} vram_free_load={} \
+             vram_free_min={vram_free_min}",
             legs[n / 2],
-            slots as f64 / n as f64
+            slots as f64 / n as f64,
+            probes[0].vram_free
         );
     }
 }

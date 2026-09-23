@@ -16,6 +16,22 @@
 //! them. The per-matrix shape runs the same rows as one dispatch per expert
 //! matrix.
 //!
+//! The read shapes run no kernel. Per layer they issue the engine shape's two
+//! dispatches (every expert's gate and up, then every down), cut into lanes
+//! the way `ops`'s row dispatch cuts a one-column group — cumulative row
+//! bytes, one lane per pool participant — and each participant reads its
+//! lane's rows whole, with wide loads folded into a sink printed once: no
+//! stealing, no activation stage, no output. `read-mmap` reads the file
+//! mapping every other shape reads. `read-thp` reads an anonymous copy of the
+//! whole working set, made before the working set is paged in, in a mapping
+//! advised `MADV_HUGEPAGE` before its first touch, then `MADV_COLLAPSE`d for
+//! the pages a fault left small; the start-up line gives the kernel's
+//! transparent-huge-page mode, the copy's size against `MemAvailable`, and
+//! the `AnonHugePages` the copy had after the copy and after the collapse
+//! (a refused collapse is printed, not fatal). Mapping against
+//! anonymous huge pages, same bytes, same dispatches: the pair separates what
+//! the mapping costs from what the dispatch costs.
+//!
 //! Weights: `gguf::Split` over `$BLOOMERY_REF_MODEL`, mapped lazily, never
 //! copied — file-backed page-cache pages, as serving reads them. A layer's
 //! routed stacks are its three-dimensional tensors whose last dim is the
@@ -52,7 +68,9 @@
 //! for.
 
 use std::ffi::{c_int, c_void};
+use std::ops::Range;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row};
@@ -98,18 +116,39 @@ const ENGINE_DISPATCHES: usize = 2;
 
 const USAGE: &str = "usage: bench_v41_host --check
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
-  an arm is <engine|engine-sep|per-matrix>:<n_host>[x<rows>]; the default is engine:6,engine:5,engine:3,per-matrix:6
+  an arm is <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>]; the default is engine:6,engine:5,engine:3,per-matrix:6
   the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the deepseek41 profile)";
 
 // The page bookkeeping's libc calls; `std` already links libc on this target.
 unsafe extern "C" {
     fn mincore(addr: *mut c_void, length: usize, vec: *mut u8) -> c_int;
     fn madvise(addr: *mut c_void, length: usize, advice: c_int) -> c_int;
+    fn mmap(
+        addr: *mut c_void,
+        length: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: i64,
+    ) -> *mut c_void;
+    fn munmap(addr: *mut c_void, length: usize) -> c_int;
     safe fn getpagesize() -> c_int;
 }
 
 /// `MADV_WILLNEED` in the Linux UAPI (`asm-generic/mman-common.h`).
 const MADV_WILLNEED: c_int = 3;
+/// `MADV_HUGEPAGE`, same header.
+const MADV_HUGEPAGE: c_int = 14;
+/// `MADV_COLLAPSE`, same header: collapse a range into huge pages now.
+const MADV_COLLAPSE: c_int = 25;
+/// `PROT_READ | PROT_WRITE` (`asm-generic/mman-common.h`).
+const PROT_RW: c_int = 0x1 | 0x2;
+/// `MAP_PRIVATE | MAP_ANONYMOUS` (`linux/mman.h`, `asm-generic/mman-common.h`).
+const MAP_PRIVATE_ANON: c_int = 0x02 | 0x20;
+/// A transparent huge page on x86-64: one PMD entry.
+const HUGE_PAGE: usize = 2 << 20;
+/// Bytes compared at each end of every matrix when the copy is verified.
+const VERIFY_EDGE: usize = 4096;
 
 /// The hyperparameters the bench reads from the file, never from literals.
 struct Meta {
@@ -548,6 +587,363 @@ fn per_matrix_layer(
         out.up.push(u);
     }
     Ok(out)
+}
+
+/// One expert's `[gate, up, down]` bytes, as a read shape reads them.
+type ExpertBytes<'a> = [&'a [u8]; 3];
+
+/// Every layer's working set, per slot, as the file mapping holds it.
+fn mapped_bytes<'a>(layers: &[Layer<'a>]) -> Vec<Vec<ExpertBytes<'a>>> {
+    layers
+        .iter()
+        .map(|l| {
+            (0..l.experts.len())
+                .map(|s| [GATE, UP, DOWN].map(|m| l.weight(s, m).bytes()))
+                .collect()
+        })
+        .collect()
+}
+
+/// A read shape's layer: the engine shape's two dispatches — every slot's
+/// gate and up interleaved, then every down — each reading its matrices'
+/// bytes from `set` and nothing else. The tally rows carry the engine
+/// shape's kinds and bytes, so the two line up.
+fn read_layer(
+    l: &Layer<'_>,
+    set: &[ExpertBytes<'_>],
+    slots: &[usize],
+    sink: &AtomicU64,
+    tally: &mut Tally,
+) {
+    let gu: Vec<(&[u8], usize)> = slots
+        .iter()
+        .flat_map(|&s| [GATE, UP].map(|m| (set[s][m], l.weight(s, m).n())))
+        .collect();
+    let t0 = Instant::now();
+    read_group(&gu, sink);
+    tally.add("gate+up", read_bytes(&gu), t0);
+    let dn: Vec<(&[u8], usize)> = slots
+        .iter()
+        .map(|&s| (set[s][DOWN], l.weight(s, DOWN).n()))
+        .collect();
+    let t0 = Instant::now();
+    read_group(&dn, sink);
+    tally.add("down", read_bytes(&dn), t0);
+}
+
+/// Bytes a read dispatch reads.
+fn read_bytes(pairs: &[(&[u8], usize)]) -> u64 {
+    pairs.iter().map(|p| p.0.len() as u64).sum()
+}
+
+/// One pool dispatch over `pairs` (a matrix's bytes and its row count
+/// each): one lane per participant, cut by [`lane_bounds`], read whole and
+/// folded into `sink`.
+fn read_group(pairs: &[(&[u8], usize)], sink: &AtomicU64) {
+    let nlanes = threads::pool().threads();
+    let bounds = lane_bounds(pairs, nlanes);
+    threads::pool().for_each_chunk(nlanes, |lanes| {
+        let mut acc = 0u64;
+        for t in lanes {
+            acc = acc.wrapping_add(read_rows(pairs, bounds[t]..bounds[t + 1]));
+        }
+        sink.fetch_add(acc, Ordering::Relaxed);
+    });
+}
+
+/// The lane cut of `ops`'s row dispatch for a one-column group: over the
+/// pairs' concatenated rows, lane `t` starts at the first row where
+/// `nlanes` times the running byte cost reaches `t` times the total — the
+/// same closed form per pair, so a uniform group is a row-count cut.
+fn lane_bounds(pairs: &[(&[u8], usize)], nlanes: usize) -> Vec<usize> {
+    let row_cost = |p: &(&[u8], usize)| (p.0.len() / p.1.max(1)) as u64;
+    let total_rows: usize = pairs.iter().map(|p| p.1).sum();
+    let total_cost: u64 = pairs.iter().map(|p| p.1 as u64 * row_cost(p)).sum();
+    let nl = nlanes as u64;
+    let mut bounds = vec![0usize; nlanes + 1];
+    // `p` the pair the cut is in, `before` the cost ahead of it, `first` its
+    // first row.
+    let (mut p, mut before, mut first) = (0usize, 0u64, 0usize);
+    for (t, bound) in bounds.iter_mut().enumerate().take(nlanes).skip(1) {
+        let target = t as u64 * total_cost;
+        loop {
+            let Some(pair) = pairs.get(p) else {
+                *bound = total_rows;
+                break;
+            };
+            let (c, n_p) = (row_cost(pair), pair.1 as u64);
+            if c == 0 || (before + n_p * c) * nl < target {
+                before += n_p * c;
+                first += pair.1;
+                p += 1;
+                continue;
+            }
+            let need = target.saturating_sub(before * nl);
+            *bound = first + need.div_ceil(c * nl).min(n_p) as usize;
+            break;
+        }
+    }
+    bounds[nlanes] = total_rows;
+    bounds
+}
+
+/// Rows `rows` of the pairs' concatenated rows, every byte read and folded.
+fn read_rows(pairs: &[(&[u8], usize)], rows: Range<usize>) -> u64 {
+    let mut acc = 0u64;
+    let mut first = 0usize;
+    for &(bytes, n) in pairs {
+        let (lo, hi) = (rows.start.max(first), rows.end.min(first + n));
+        if lo < hi {
+            let rb = bytes.len() / n;
+            acc = acc.wrapping_add(fold_bytes(&bytes[(lo - first) * rb..(hi - first) * rb]));
+        }
+        first += n;
+    }
+    acc
+}
+
+/// Every byte of `s` read and folded into one word: eight independent 64-bit
+/// sums over 64-byte blocks, which the vectorizer turns into full-width
+/// vector loads and adds, then the tail. Not inlined, so its code can be
+/// found and read in the binary.
+#[inline(never)]
+fn fold_bytes(s: &[u8]) -> u64 {
+    let (blocks, tail) = s.as_chunks::<64>();
+    let mut acc = [0u64; 8];
+    for b in blocks {
+        let (words, _) = b.as_chunks::<8>();
+        for (a, w) in acc.iter_mut().zip(words) {
+            *a = a.wrapping_add(u64::from_ne_bytes(*w));
+        }
+    }
+    let tail = tail.iter().fold(0u64, |a, &b| a.wrapping_add(u64::from(b)));
+    acc.iter().fold(tail, |a, &w| a.wrapping_add(w))
+}
+
+/// An anonymous private mapping advised `MADV_HUGEPAGE` before its first
+/// touch, holding a copy of every layer's working set from a huge-page
+/// boundary on; unmapped on drop.
+struct ThpCopy {
+    map: *mut c_void,
+    map_len: usize,
+    /// Bytes from `map` to the first huge-page boundary, where the copy starts.
+    lead: usize,
+    len: usize,
+    /// Per layer, per working-set slot: where `[gate, up, down]` sit.
+    at: Vec<Vec<[Range<usize>; 3]>>,
+}
+
+impl ThpCopy {
+    /// Map, advise, copy every matrix of `mapped` (each from a 64-byte
+    /// boundary), verify, and print the start-up line. Refused when
+    /// `MemAvailable` cannot hold the copy and the working set's page-cache
+    /// pages both (it counts the latter as reclaimable).
+    fn make(mapped: &[Vec<ExpertBytes<'_>>]) -> Result<ThpCopy, BenchError> {
+        let mut len = 0usize;
+        let at: Vec<Vec<[Range<usize>; 3]>> = mapped
+            .iter()
+            .map(|layer| {
+                layer
+                    .iter()
+                    .map(|e| {
+                        e.map(|b| {
+                            let start = len.next_multiple_of(64);
+                            len = start + b.len();
+                            start..len
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let available = mem_available()?;
+        let need = 2 * len as u64;
+        if available < need {
+            return Err(format!(
+                "read-thp: the copy is {len} B and the working set's page-cache pages as many; \
+                 MemAvailable is {available} B, under the {need} B both take"
+            )
+            .into());
+        }
+        let map_len = len.next_multiple_of(HUGE_PAGE) + HUGE_PAGE;
+        // SAFETY: a fresh anonymous private mapping with no address hint and no
+        // file: it aliases nothing, and a failure comes back as MAP_FAILED.
+        let map = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                map_len,
+                PROT_RW,
+                MAP_PRIVATE_ANON,
+                -1,
+                0,
+            )
+        };
+        if map.addr() == usize::MAX {
+            return Err(format!("mmap {map_len} B: {}", std::io::Error::last_os_error()).into());
+        }
+        let lead = map.addr().next_multiple_of(HUGE_PAGE) - map.addr();
+        let mut copy = ThpCopy {
+            map,
+            map_len,
+            lead,
+            len,
+            at: Vec::new(),
+        };
+        // SAFETY: `lead + len` rounded up to a huge page is at most `map_len`,
+        // so the range lies inside the mapping just made; HUGEPAGE changes only
+        // how the kernel backs pages not yet touched, and none is.
+        let rc = unsafe {
+            madvise(
+                map.wrapping_byte_add(lead),
+                len.next_multiple_of(HUGE_PAGE),
+                MADV_HUGEPAGE,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("madvise(HUGEPAGE): {}", std::io::Error::last_os_error()).into());
+        }
+        let t0 = Instant::now();
+        let data = copy.data_mut();
+        for (layer, ranges) in mapped.iter().zip(&at) {
+            for (e, r) in layer.iter().zip(ranges) {
+                for (b, r) in e.iter().zip(r) {
+                    data[r.clone()].copy_from_slice(b);
+                }
+            }
+        }
+        let copy_s = t0.elapsed().as_secs_f64();
+        copy.at = at;
+        let huge_copied = anon_huge_kb()?;
+        let t0 = Instant::now();
+        // SAFETY: the range `madvise(HUGEPAGE)` took above. COLLAPSE moves the
+        // range's contents into huge pages; no byte of it changes.
+        let rc = unsafe {
+            madvise(
+                map.wrapping_byte_add(lead),
+                len.next_multiple_of(HUGE_PAGE),
+                MADV_COLLAPSE,
+            )
+        };
+        let collapse = if rc == 0 {
+            "ok".to_string()
+        } else {
+            format!("refused({})", std::io::Error::last_os_error())
+        };
+        let collapse_s = t0.elapsed().as_secs_f64();
+        let checked = copy.verify(mapped)?;
+        println!(
+            "v41host thp_copy bytes={len} mem_available={available} thp_enabled={} copy_s={copy_s:.2} \
+             anon_huge_kb_copied={huge_copied} collapse={collapse} collapse_s={collapse_s:.2} \
+             anon_huge_kb={} verified=[{checked}]",
+            thp_mode(),
+            anon_huge_kb()?
+        );
+        Ok(copy)
+    }
+
+    /// The copy's bytes.
+    fn data(&self) -> &[u8] {
+        // SAFETY: `lead..lead + len` lies inside the live mapping (see `make`);
+        // anonymous pages read as zeros until written, so every byte is
+        // initialized; the borrow of `self` keeps the mapping alive and rules
+        // out a `data_mut` borrow for as long as the slice lives.
+        unsafe { std::slice::from_raw_parts(self.map.cast::<u8>().add(self.lead), self.len) }
+    }
+
+    /// The copy's bytes, writable: the same range as `data`.
+    fn data_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `data`; the exclusive borrow of `self` makes this the only
+        // live view of the range.
+        unsafe { std::slice::from_raw_parts_mut(self.map.cast::<u8>().add(self.lead), self.len) }
+    }
+
+    /// Every layer's working set, per slot, as the copy holds it.
+    fn bytes(&self) -> Vec<Vec<ExpertBytes<'_>>> {
+        let d = self.data();
+        self.at
+            .iter()
+            .map(|l| l.iter().map(|r| r.clone().map(|r| &d[r])).collect())
+            .collect()
+    }
+
+    /// The copy against its source: the first and last [`VERIFY_EDGE`] bytes
+    /// of every matrix, and every byte of the first, middle and last layers.
+    /// Returns what it compared.
+    fn verify(&self, mapped: &[Vec<ExpertBytes<'_>>]) -> Result<String, BenchError> {
+        let whole = [0, mapped.len() / 2, mapped.len().saturating_sub(1)];
+        for (li, (src, dst)) in mapped.iter().zip(self.bytes()).enumerate() {
+            for (s, (a, b)) in src.iter().zip(&dst).enumerate() {
+                for m in [GATE, UP, DOWN] {
+                    let (a, b) = (a[m], b[m]);
+                    let e = VERIFY_EDGE.min(a.len());
+                    let same = a.len() == b.len()
+                        && if whole.contains(&li) {
+                            a == b
+                        } else {
+                            a[..e] == b[..e] && a[a.len() - e..] == b[b.len() - e..]
+                        };
+                    if !same {
+                        return Err(format!(
+                            "read-thp: the copy of layer {li} slot {s} {} differs from the file",
+                            MATRIX[m]
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(format!(
+            "{VERIFY_EDGE} B at both ends of every matrix, every byte of layers {whole:?}"
+        ))
+    }
+}
+
+impl Drop for ThpCopy {
+    fn drop(&mut self) {
+        // SAFETY: `map` and `map_len` are the mapping `make` got from mmap,
+        // unmapped here once; every slice borrowed from `self` is dead.
+        let rc = unsafe { munmap(self.map, self.map_len) };
+        if rc != 0 {
+            eprintln!("munmap: {}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes.
+fn mem_available() -> Result<u64, BenchError> {
+    let s = std::fs::read_to_string("/proc/meminfo")?;
+    let kb: u64 = s
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .ok_or("/proc/meminfo has no MemAvailable")?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()?;
+    Ok(kb * 1024)
+}
+
+/// The kernel's transparent-huge-page mode: the bracketed word of
+/// `/sys/kernel/mm/transparent_hugepage/enabled`.
+fn thp_mode() -> String {
+    std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+        .ok()
+        .and_then(|s| {
+            let (_, rest) = s.split_once('[')?;
+            Some(rest.split_once(']')?.0.to_string())
+        })
+        .unwrap_or_else(|| "unreadable".to_string())
+}
+
+/// `AnonHugePages` of `/proc/self/smaps_rollup`, in kB.
+fn anon_huge_kb() -> Result<u64, BenchError> {
+    let s = std::fs::read_to_string("/proc/self/smaps_rollup")?;
+    Ok(s.lines()
+        .find_map(|l| l.strip_prefix("AnonHugePages:"))
+        .ok_or("smaps_rollup has no AnonHugePages")?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()?)
 }
 
 /// The working set in the mappings: one byte span per expert matrix. A page
@@ -1058,30 +1454,68 @@ fn check(
     Ok(())
 }
 
+/// A timed arm's dispatch shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// The host tier's: a gate+up group and a down group per layer.
+    Engine,
+    /// With `rows > 1`: one engine-shape call per row instead of one group
+    /// over every row.
+    EngineSep,
+    /// One dispatch per expert matrix.
+    PerMatrix,
+    /// The engine shape's dispatches reading the file mapping, no kernel.
+    ReadMmap,
+    /// The same reads from the anonymous huge-page copy ([`ThpCopy`]).
+    ReadThp,
+}
+
+impl Shape {
+    const ALL: [Shape; 5] = [
+        Shape::Engine,
+        Shape::EngineSep,
+        Shape::PerMatrix,
+        Shape::ReadMmap,
+        Shape::ReadThp,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Shape::Engine => "engine",
+            Shape::EngineSep => "engine-sep",
+            Shape::PerMatrix => "per-matrix",
+            Shape::ReadMmap => "read-mmap",
+            Shape::ReadThp => "read-thp",
+        }
+    }
+
+    /// The shape runs one row per step only.
+    fn one_row(self) -> bool {
+        matches!(self, Shape::PerMatrix | Shape::ReadMmap | Shape::ReadThp)
+    }
+}
+
 /// A timed arm: the dispatch shape and the host's share of a token's experts.
 #[derive(Clone, Copy)]
 struct Arm {
-    per_matrix: bool,
+    shape: Shape,
     n_host: usize,
     /// Tokens per step (probe): each row reads its own activation column
     /// and `n_host` experts no other row of the layer reads.
     rows: usize,
-    /// With `rows > 1`: one engine-shape call per row instead of one group
-    /// over every row.
-    separate: bool,
 }
 
 impl Arm {
     fn parse(s: &str) -> Result<Arm, String> {
-        let (shape, n) = s.split_once(':').ok_or_else(|| {
-            format!("arm {s:?}: want <engine|engine-sep|per-matrix>:<n_host>[x<rows>]")
+        let (name, n) = s.split_once(':').ok_or_else(|| {
+            format!(
+                "arm {s:?}: want <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>]"
+            )
         })?;
-        let (per_matrix, separate) = match shape {
-            "engine" => (false, false),
-            "engine-sep" => (false, true),
-            "per-matrix" => (true, false),
-            other => return Err(format!("arm {s:?}: unknown shape {other:?}")),
-        };
+        let shape = Shape::ALL
+            .into_iter()
+            .find(|sh| sh.name() == name)
+            .ok_or_else(|| format!("arm {s:?}: unknown shape {name:?}"))?;
         let (n, rows) = match n.split_once('x') {
             Some((n, r)) => (
                 n,
@@ -1098,50 +1532,22 @@ impl Arm {
                 "arm {s:?}: n_host and rows must be positive, n_host x rows at most {WORKING_SET}"
             ));
         }
-        if per_matrix && rows > 1 {
-            return Err(format!("arm {s:?}: the per-matrix shape runs one row"));
+        if shape.one_row() && rows > 1 {
+            return Err(format!("arm {s:?}: the {name} shape runs one row"));
         }
         Ok(Arm {
-            per_matrix,
+            shape,
             n_host,
             rows,
-            separate,
         })
     }
 
     fn label(self) -> String {
-        let shape = match (self.per_matrix, self.separate) {
-            (true, _) => "per-matrix",
-            (false, true) => "engine-sep",
-            (false, false) => "engine",
-        };
+        let shape = self.shape.name();
         if self.rows == 1 {
             format!("{shape}:{}", self.n_host)
         } else {
             format!("{shape}:{}x{}", self.n_host, self.rows)
-        }
-    }
-
-    /// One layer: `slots` holds `rows` runs of `n_host`, row `i` reading
-    /// `xs[i]`.
-    fn run_layer(
-        self,
-        l: &Layer<'_>,
-        slots: &[usize],
-        xs: &[&Tensor2],
-        tally: &mut Tally,
-    ) -> Result<(), ModelError> {
-        if self.per_matrix {
-            per_matrix_layer(l, slots, xs[0], tally).map(drop)
-        } else if self.rows == 1 {
-            engine_layer(l, slots, xs[0], tally).map(drop)
-        } else if self.separate {
-            for (row, x) in slots.chunks_exact(self.n_host).zip(xs) {
-                engine_layer(l, row, x, tally)?;
-            }
-            Ok(())
-        } else {
-            engine_rows_layer(l, slots, xs, tally)
         }
     }
 
@@ -1155,12 +1561,10 @@ impl Arm {
 
     /// Pool dispatches one token of this arm issues, by construction.
     fn dispatches_per_token(self, layers: &[Layer<'_>]) -> usize {
-        if self.per_matrix {
-            3 * self.n_host * layers.len()
-        } else if self.separate {
-            ENGINE_DISPATCHES * self.rows * layers.len()
-        } else {
-            ENGINE_DISPATCHES * layers.len()
+        match self.shape {
+            Shape::PerMatrix => 3 * self.n_host * layers.len(),
+            Shape::EngineSep => ENGINE_DISPATCHES * self.rows * layers.len(),
+            Shape::Engine | Shape::ReadMmap | Shape::ReadThp => ENGINE_DISPATCHES * layers.len(),
         }
     }
 }
@@ -1217,12 +1621,17 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
     }
 }
 
-/// What every timed round reads: the layers, the activation columns and the
-/// working set's pages.
+/// What every timed round reads: the layers, the activation columns, the
+/// working set's pages, and the bytes the read shapes read with the sink
+/// they fold into.
 struct Bench<'a> {
     layers: Vec<Layer<'a>>,
     xs: Vec<Tensor2>,
     pages: Pages<'a>,
+    mapped: Vec<Vec<ExpertBytes<'a>>>,
+    /// Present when an arm reads the huge-page copy.
+    thp: Option<Vec<Vec<ExpertBytes<'a>>>>,
+    sink: AtomicU64,
 }
 
 /// One arm's round: the timed tokens and the page state around them.
@@ -1247,17 +1656,37 @@ impl Bench<'_> {
             .collect()
     }
 
-    /// Every layer of one token.
+    /// Every layer of one token. In layer `l`, `ids[l]` holds `rows` runs of
+    /// `n_host` slots, row `i` reading activation column `(t + l + i) % N_X`.
     fn token(
         &self,
         arm: Arm,
         ids: &[Vec<usize>],
         t: usize,
         tally: &mut Tally,
-    ) -> Result<(), ModelError> {
+    ) -> Result<(), BenchError> {
         for (l, layer) in self.layers.iter().enumerate() {
+            let slots = &ids[l];
             let xs: Vec<&Tensor2> = (0..arm.rows).map(|i| &self.xs[(t + l + i) % N_X]).collect();
-            arm.run_layer(layer, &ids[l], &xs, tally)?;
+            match arm.shape {
+                Shape::ReadMmap => read_layer(layer, &self.mapped[l], slots, &self.sink, tally),
+                Shape::ReadThp => {
+                    let set = self.thp.as_ref().ok_or("read-thp arm without a copy")?;
+                    read_layer(layer, &set[l], slots, &self.sink, tally);
+                }
+                Shape::PerMatrix => {
+                    per_matrix_layer(layer, slots, xs[0], tally)?;
+                }
+                Shape::Engine | Shape::EngineSep if arm.rows == 1 => {
+                    engine_layer(layer, slots, xs[0], tally)?;
+                }
+                Shape::EngineSep => {
+                    for (row, x) in slots.chunks_exact(arm.n_host).zip(&xs) {
+                        engine_layer(layer, row, x, tally)?;
+                    }
+                }
+                Shape::Engine => engine_rows_layer(layer, slots, &xs, tally)?,
+            }
         }
         Ok(())
     }
@@ -1385,9 +1814,18 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
                 .iter()
                 .all(|r| r.resident_before == total && r.resident_after == total && r.majflt == 0);
         let bytes = arm.bytes_per_token(&bench.layers);
+        let thp = if arm.shape == Shape::ReadThp {
+            format!(
+                " thp_enabled={} anon_huge_kb={}",
+                thp_mode(),
+                anon_huge_kb()?
+            )
+        } else {
+            String::new()
+        };
         println!(
             "summary threads={threads} arm={} rounds={} tokens={} ms_min={min:.3} ms_mean={mean:.3} round_means=[{}] \
-             gbps_mean={:.2} gbps_best={:.2} admissible={}",
+             gbps_mean={:.2} gbps_best={:.2} admissible={}{thp}",
             arm.label(),
             rs.len(),
             all.len(),
@@ -1395,6 +1833,16 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
             bytes as f64 / mean / 1e6,
             bytes as f64 / min / 1e6,
             if ok { "yes" } else { "no" }
+        );
+    }
+    if opts
+        .arms
+        .iter()
+        .any(|a| matches!(a.shape, Shape::ReadMmap | Shape::ReadThp))
+    {
+        println!(
+            "v41host read_sink={:#018x}",
+            bench.sink.load(Ordering::Relaxed)
         );
     }
     Ok(())
@@ -1441,6 +1889,16 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         threads::pool().pin_failed()
     );
     print_affinity()?;
+    let mapped = mapped_bytes(&layers);
+    // The copy is made before the working set is paged in: filling it can
+    // evict page-cache pages, and the populate below brings them back.
+    let wants_thp =
+        matches!(&mode, Mode::Time(o) if o.arms.iter().any(|a| a.shape == Shape::ReadThp));
+    let copy = if wants_thp {
+        Some(ThpCopy::make(&mapped)?)
+    } else {
+        None
+    };
     let pages = Pages::of(&layers)?;
     let total = pages.total();
     let before = pages.resident()?;
@@ -1459,6 +1917,9 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         layers,
         xs: activations(meta.embd),
         pages,
+        mapped,
+        thp: copy.as_ref().map(ThpCopy::bytes),
+        sink: AtomicU64::new(0),
     };
     match mode {
         Mode::Check => check(&bench.layers, meta.n_used, &bench.xs, true),

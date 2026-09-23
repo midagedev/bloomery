@@ -384,6 +384,7 @@ its go instead of after the card's experts and the shared expert),
 main thread floating instead of pinning it to the dispatcher's cpu slot — the
 default pins, and the `load` line prints the ask and the outcome),
 `BLOOMERY_STEP_STATS=1` (`generate_ds41`: a `stat step` line per generated
-step, host-tier `HybridStats` deltas and `getrusage` page faults, and a `stat
-summary`; unset, nothing is read).
+step, host-tier `HybridStats` deltas, `getrusage` page faults and the card's
+`cuMemGetInfo` free bytes (`vram_free`), and a `stat summary` with
+`vram_free_load` and `vram_free_min`; unset, nothing is read).
 Each is read once, at first use.
