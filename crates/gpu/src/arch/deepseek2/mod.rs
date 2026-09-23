@@ -31,7 +31,7 @@ pub use names::derived_name;
 pub use taps::{Block0Taps, LayerTaps};
 
 use crate::hybrid::{
-    Boundary, BoundaryShape, ExpertPlans, Hybrid, HybridConfig, HybridStats, SlotMap,
+    Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, HybridStats, SlotMap,
 };
 use crate::model::probe::Observer;
 use crate::model::{ChainBody, GpuModel, StepKernels, StepProbe, one_shard};
@@ -40,9 +40,10 @@ use crate::weights::{DevWeight, Weights, q8_0_planes};
 use crate::{Gpu, GpuError};
 use cuda_core::CudaStream;
 use gguf::Split;
+use model::Tensor2;
 use model::arch::Arch;
 use model::arch::deepseek2::derived::Derived;
-use model::moe::MoeBlockPlan;
+use model::moe::{HostScratch, experts_into};
 use model::placement::{
     Card, CardFormat, CardTotals, Device, Format, Host, HostTotals, Machine, ModelTensor,
     ModelTensors, Plan, Role, Row, Segment,
@@ -77,14 +78,57 @@ pub struct Body {
     scratch: LayerScratch,
     step: StepKernels,
     /// The hybrid boundary and its host tier — `None` on an all-card load.
-    hybrid: Option<Hybrid<Derived>>,
+    hybrid: Option<Hybrid<PlanHost>>,
 }
 
-/// The CPU engine's plan of every routed block is what the host tier
-/// computes from.
-impl ExpertPlans for Derived {
-    fn experts(&self, l: usize) -> Option<&MoeBlockPlan> {
-        self.block_plan(l).ok()?.moe().ok()
+/// deepseek2's host tier: the CPU engine's plan of every routed block over
+/// the one-shard file, and the scratch its calls write, made at load for the
+/// layers' widths.
+pub(crate) struct PlanHost {
+    plans: Derived,
+    file: Split,
+    scratch: HostScratch,
+}
+
+impl PlanHost {
+    /// The tier for experts that map `hidden -> ff -> hidden`. Load-time
+    /// only.
+    fn new(plans: Derived, file: Split, hidden: usize, ff: usize) -> Result<PlanHost, GpuError> {
+        if file.shard(0).is_none() {
+            return Err(GpuError::state("PlanHost::new", "the file has no shard 0"));
+        }
+        Ok(PlanHost {
+            plans,
+            file,
+            scratch: HostScratch::new(hidden, ff),
+        })
+    }
+}
+
+impl HostExperts for PlanHost {
+    fn experts_into(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let what = "Hybrid::serve";
+        let gguf = self
+            .file
+            .shard(0)
+            .ok_or(GpuError::state(what, "the file has no shard 0"))?;
+        let plan = self
+            .plans
+            .block_plan(layer)
+            .ok()
+            .and_then(|b| b.moe().ok())
+            .ok_or(GpuError::state(
+                what,
+                "a hybrid layer without an expert plan",
+            ))?;
+        experts_into(gguf, plan, x, experts, out, &mut self.scratch)?;
+        Ok(())
     }
 }
 
@@ -407,21 +451,20 @@ impl ChainBody for Body {
         let derived = Derived::new(gguf)?;
         derive_blocks(gpu.stream(), &derived, layers.clone(), w)?;
         let mut body = Body::assemble(gpu, gguf, w, layers.clone(), ctx_max, Some(cfg.n_l))?;
-        let (n_used, n_expert) =
-            body.moe
-                .as_ref()
-                .map(|m| (m.n_used, m.n_expert))
-                .ok_or(GpuError::state(
-                    what,
-                    "no resident layer routes: nothing to split",
-                ))?;
-        let shape = BoundaryShape {
-            hidden: body.scratch.dims.hidden,
-            n_used,
-        };
+        let (n_used, n_expert, ff) = body
+            .moe
+            .as_ref()
+            .map(|m| (m.n_used, m.n_expert, m.ff))
+            .ok_or(GpuError::state(
+                what,
+                "no resident layer routes: nothing to split",
+            ))?;
+        let hidden = body.scratch.dims.hidden;
+        let shape = BoundaryShape { hidden, n_used };
         let slots = SlotMap::prefix(layers.clone(), n_expert, cfg.n_l)?;
         let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, slots, cfg.overlap)?;
-        body.hybrid = Some(Hybrid::new(boundary, derived, file, layers.len())?);
+        let host = PlanHost::new(derived, file, hidden, ff)?;
+        body.hybrid = Some(Hybrid::new(boundary, host, layers.len())?);
         Ok(body)
     }
 

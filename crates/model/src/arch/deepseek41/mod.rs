@@ -4,6 +4,7 @@
 //! holds (`kv`), the path from a file to its placement plan (`place`) and the
 //! integers each step's graph reads (`plan`).
 
+pub mod host;
 pub mod hparams;
 pub mod kv;
 pub mod names;

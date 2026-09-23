@@ -211,7 +211,7 @@ fn hw_moe_touches_only_routed_experts() {
 
 /// The host tier's one-file entry is the composition it replaces: the gate/up
 /// group, the down group over the SwiGLU combines and the list-order weighted
-/// sum from zero, bit for bit — through its per-thread scratch on the first
+/// sum from zero, bit for bit — through the caller's scratch on the first
 /// call and again on a second, for a list with a negative weight and a
 /// repeated expert, and zeros for an empty list.
 #[test]
@@ -247,9 +247,10 @@ fn hw_experts_into_matches_group_composition() {
         }
     }
 
+    let mut scratch = moe::HostScratch::new(x1.ne0, plan.meta.ff);
     for call in 0..2 {
         let mut got = vec![f32::NAN; x1.ne0];
-        moe::experts_into(&g, plan, &x1, &list, &mut got).unwrap();
+        moe::experts_into(&g, plan, &x1, &list, &mut got, &mut scratch).unwrap();
         let diffs = got
             .iter()
             .zip(&want)
@@ -261,7 +262,7 @@ fn hw_experts_into_matches_group_composition() {
         );
     }
     let mut empty = vec![f32::NAN; x1.ne0];
-    moe::experts_into(&g, plan, &x1, &[], &mut empty).unwrap();
+    moe::experts_into(&g, plan, &x1, &[], &mut empty, &mut scratch).unwrap();
     assert!(
         empty.iter().all(|v| v.to_bits() == 0),
         "an empty list writes zeros"

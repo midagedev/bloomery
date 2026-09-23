@@ -8,7 +8,7 @@ use crate::flash::{
     FlashMergeQ8Args, FlashSegArgs, FlashSegTwiceArgs,
 };
 use crate::head::Head;
-use crate::hybrid::{Boundary, ExpertPlans, Hybrid};
+use crate::hybrid::{Boundary, HostExperts, Hybrid};
 use crate::model::kernels::{
     HeadsGeom, Q3kGemvHeadsArgs, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels,
 };
@@ -39,7 +39,7 @@ use model::arch::deepseek2::attn::MlaParams;
 /// `hybrid` hears of each once it is enqueued: a capture records the layer
 /// for its replays to serve, an eager chain has it served on the spot.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn enqueue_chain<P: ExpertPlans>(
+pub(super) fn enqueue_chain<H: HostExperts>(
     gpu: &Gpu,
     step: &StepKernels,
     w: &Weights,
@@ -49,7 +49,7 @@ pub(super) fn enqueue_chain<P: ExpertPlans>(
     mla: &MlaParams,
     moe: Option<&MoeDims>,
     head: &mut Head,
-    mut hybrid: Option<&mut Hybrid<P>>,
+    mut hybrid: Option<&mut Hybrid<H>>,
 ) -> Result<(), GpuError> {
     if names.is_empty() || names.len() != kv.len() {
         return Err(GpuError::shape(

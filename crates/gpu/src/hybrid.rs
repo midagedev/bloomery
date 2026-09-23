@@ -32,9 +32,11 @@
 //! with the whole pool spinning on the generation word (a pool job: a worker
 //! inside a job is not parked, and the expert dispatch that follows starts
 //! inside the spin window the job leaves it in), checks the handoff's sequence
-//! number and layer, computes the host experts with the CPU engine into the
-//! host-mapped sum and adds one to the counter. The combine reads that sum in
-//! place through the mapping.
+//! number and layer, has the architecture's host computation ([`HostExperts`])
+//! write the host experts' sum into the host-mapped page and adds one to the
+//! counter. The combine reads that sum in place through the mapping. The
+//! protocol — the words, the sequence, the service loop — is this file's
+//! alone; an architecture supplies only what one service computes.
 
 use crate::GpuError;
 use crate::graph::cu;
@@ -42,7 +44,7 @@ use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use gguf::Split;
 use model::Tensor2;
-use model::moe::{EXPERTS_INTO_MAX, MoeBlockPlan, experts_into};
+use model::moe::EXPERTS_INTO_MAX;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
@@ -560,6 +562,11 @@ pub struct Boundary {
     pub(crate) weights: ManuallyDrop<DeviceBuffer<f32>>,
     /// The host experts' weighted sum, read in place through the mapping.
     pub(crate) hsum: ManuallyDrop<DeviceBuffer<f32>>,
+    /// The region's sequence word, and the handoff's image in the page: what
+    /// a chain's own launch reads and writes in place of the copy node
+    /// ([`Boundary::handoff_target`]).
+    seq: ManuallyDrop<DeviceBuffer<u32>>,
+    image: ManuallyDrop<DeviceBuffer<u32>>,
     /// `shared expert + hsum`: the combine's shared-expert input.
     pub(crate) sum: DeviceBuffer<f32>,
     /// Which experts each layer's card stack holds; the host serves the rest.
@@ -572,6 +579,33 @@ pub struct Boundary {
     shape: BoundaryShape,
     /// Byte offset of the host sum in the page.
     hsum_off: usize,
+}
+
+/// The handoff's layout in its image: the word offsets of the sequence, the
+/// routing's ids and weights (`n_used` each) and the activation (`hidden`
+/// f32, the image's tail).
+#[derive(Clone, Copy, Debug)]
+pub struct HandoffLayout {
+    pub seq: usize,
+    pub ids: usize,
+    pub weights: usize,
+    pub x: usize,
+    pub n_used: usize,
+    pub hidden: usize,
+}
+
+/// What a chain's own handoff launch reads and writes
+/// ([`Boundary::handoff_target`]).
+pub struct HandoffTarget<'a> {
+    /// The activation the norm wrote into the region, `hidden` f32.
+    pub x: &'a DeviceBuffer<f32>,
+    /// The region's sequence word: the image carries it as it stands before
+    /// the go adds one.
+    pub seq: &'a DeviceBuffer<u32>,
+    /// The handoff's image in the host-mapped page, `layout.x + hidden`
+    /// words; the launch writes every field of it.
+    pub image: &'a mut DeviceBuffer<u32>,
+    pub layout: HandoffLayout,
 }
 
 impl Boundary {
@@ -614,11 +648,19 @@ impl Boundary {
         // the page, which moves into the boundary beside the window and is
         // freed only when the boundary drops.
         let hsum = unsafe { window::<f32>(page.dev_at(hsum_off), shape.hidden, ctx) };
+        // SAFETY: as for the ids, for the sequence's one word at SEQ_W.
+        let seq = unsafe { window::<u32>(base + 4 * SEQ_W as u64, 1, ctx) };
+        // SAFETY: the image's `words` words start at PAYLOAD_OFF, below
+        // hsum_off, inside the page, which moves into the boundary beside the
+        // window as for the sum.
+        let image = unsafe { window::<u32>(page.dev_at(PAYLOAD_OFF), words, ctx) };
         Ok(Boundary {
             normed,
             ids,
             weights,
             hsum,
+            seq,
+            image,
             sum: DeviceBuffer::<f32>::zeroed(stream, shape.hidden)?,
             slots,
             overlap,
@@ -633,6 +675,53 @@ impl Boundary {
     #[must_use]
     pub fn slots(&self) -> &SlotMap {
         &self.slots
+    }
+
+    /// Whether each layer's wait sits just before the combine (`true`) or
+    /// right after its go.
+    #[must_use]
+    pub fn overlap(&self) -> bool {
+        self.overlap
+    }
+
+    /// The handoff's activation, `hidden` f32: what the norm writes on a
+    /// hybrid layer and the host reads.
+    #[must_use]
+    pub fn normed(&self) -> &DeviceBuffer<f32> {
+        &self.normed
+    }
+
+    /// The handoff's activation, for the norm to write.
+    pub fn normed_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        &mut self.normed
+    }
+
+    /// The host experts' weighted sum, `hidden` f32 in the host-mapped page:
+    /// what a combine reads in place after the layer's wait.
+    #[must_use]
+    pub fn hsum(&self) -> &DeviceBuffer<f32> {
+        &self.hsum
+    }
+
+    /// What a chain's own launch writes the handoff through, in place of the
+    /// copy node: the activation the norm wrote into the region, the region's
+    /// sequence word, and the handoff's image in the host-mapped page with its
+    /// layout. The launch copies the sequence word, the routing and the
+    /// activation into the image; [`Boundary::enqueue_go`] follows it.
+    pub fn handoff_target(&mut self) -> HandoffTarget<'_> {
+        HandoffTarget {
+            x: &self.normed,
+            seq: &self.seq,
+            image: &mut self.image,
+            layout: HandoffLayout {
+                seq: SEQ_W,
+                ids: IDS_W,
+                weights: WTS_W,
+                x: X_W,
+                n_used: self.shape.n_used,
+                hidden: self.shape.hidden,
+            },
+        }
     }
 
     /// Words in the handoff region and in its host image.
@@ -652,9 +741,7 @@ impl Boundary {
     }
 
     /// Enqueue layer `layer`'s handoff: the region's image into the page (one
-    /// copy node), then the go batch — a system barrier (the copy lands
-    /// first), the layer into the page, a second barrier, and one added to
-    /// the generation word and to the sequence word the next handoff carries.
+    /// copy node), then the go batch ([`Boundary::enqueue_go`]).
     pub(crate) fn enqueue_out(&self, stream: &CudaStream, layer: usize) -> Result<(), GpuError> {
         let what = "Boundary::enqueue_out";
         let layer = u32::try_from(layer).map_err(|_| GpuError::shape(what, "layer passes u32"))?;
@@ -671,6 +758,22 @@ impl Boundary {
             )
         };
         cu(rc, "cuMemcpyDtoHAsync_v2 (hybrid handoff)")?;
+        self.go_batch(stream, layer)
+    }
+
+    /// Enqueue layer `layer`'s go alone, for a chain whose own launch wrote the
+    /// handoff's image ([`Boundary::handoff_target`]): a system barrier (the
+    /// image lands first), the layer into the page, a second barrier, and one
+    /// added to the generation word and to the sequence word the next handoff
+    /// carries. The host serves it once the chain says the layer is enqueued
+    /// ([`Hybrid::layer_enqueued`]).
+    pub fn enqueue_go(&self, stream: &CudaStream, layer: usize) -> Result<(), GpuError> {
+        let what = "Boundary::enqueue_go";
+        let layer = u32::try_from(layer).map_err(|_| GpuError::shape(what, "layer passes u32"))?;
+        self.go_batch(stream, layer)
+    }
+
+    fn go_batch(&self, stream: &CudaStream, layer: u32) -> Result<(), GpuError> {
         mem_batch(
             stream,
             &mut [
@@ -685,7 +788,7 @@ impl Boundary {
     }
 
     /// Enqueue the wait: until the counter is at least one, then minus one.
-    pub(crate) fn enqueue_back(&self, stream: &CudaStream) -> Result<(), GpuError> {
+    pub fn enqueue_back(&self, stream: &CudaStream) -> Result<(), GpuError> {
         let cnt = self.page.dev_at(Word::Cnt.offset());
         mem_batch(
             stream,
@@ -703,10 +806,22 @@ impl Boundary {
 
 // ------------------------------------------------------------------- host
 
-/// The CPU engine's per-layer expert plans a host tier serves from.
-pub(crate) trait ExpertPlans {
-    /// Layer `l`'s routed-expert plan; `None` for a layer without experts.
-    fn experts(&self, l: usize) -> Option<&MoeBlockPlan>;
+/// What one host service computes, supplied by the architecture: the
+/// weighted sum of the listed routed experts of layer `layer` for the
+/// activation `x` (one column of the model width), written over `out` (that
+/// width; an empty list writes zeros). The list is the handoff's host slots
+/// in slot order, at most [`EXPERTS_INTO_MAX`], each id with its routing
+/// weight. The protocol around the call — waiting for the go, checking the
+/// handoff, signalling the card, releasing it on a failure — is
+/// [`Hybrid`]'s alone.
+pub trait HostExperts {
+    fn experts_into(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+    ) -> Result<(), GpuError>;
 }
 
 /// What the host side has done since load. Counted by the decode thread
@@ -739,12 +854,11 @@ pub struct HybridStats {
     pub straggle_max_ns: u64,
 }
 
-/// The boundary and the host tier that serves it: the file the host experts
-/// are read from, the CPU engine's plans for them, and the protocol state.
-pub(crate) struct Hybrid<P> {
+/// The boundary and the host tier that serves it: the architecture's host
+/// computation and the protocol state.
+pub struct Hybrid<H> {
     pub(crate) boundary: Boundary,
-    plans: P,
-    file: Split,
+    host: H,
     /// The host's copy of a handoff's activation — one column, allocated at
     /// load.
     x: Tensor2,
@@ -760,23 +874,15 @@ pub(crate) struct Hybrid<P> {
     stats: HybridStats,
 }
 
-impl<P: ExpertPlans> Hybrid<P> {
-    /// The host tier over `boundary`: `file` holds every expert the card does
-    /// not, `plans` resolves them per layer, and `layers` bounds the chain.
-    pub(crate) fn new(
-        boundary: Boundary,
-        plans: P,
-        file: Split,
-        layers: usize,
-    ) -> Result<Hybrid<P>, GpuError> {
-        if file.shard(0).is_none() {
-            return Err(GpuError::state("Hybrid::new", "the file has no shard 0"));
-        }
+impl<H: HostExperts> Hybrid<H> {
+    /// The host tier over `boundary`: `host` computes every expert the
+    /// boundary's slot map sends to the host, and `layers` bounds the chain.
+    /// Load-time only.
+    pub fn new(boundary: Boundary, host: H, layers: usize) -> Result<Hybrid<H>, GpuError> {
         let hidden = boundary.shape.hidden;
         Ok(Hybrid {
             boundary,
-            plans,
-            file,
+            host,
             x: Tensor2::zeros(hidden, 1),
             served: 0,
             captured: Vec::with_capacity(layers),
@@ -786,13 +892,25 @@ impl<P: ExpertPlans> Hybrid<P> {
         })
     }
 
+    /// The boundary the chain enqueues its handoffs and waits on.
+    #[must_use]
+    pub fn boundary(&self) -> &Boundary {
+        &self.boundary
+    }
+
+    /// The boundary, for a chain whose launches write its handoff.
+    pub fn boundary_mut(&mut self) -> &mut Boundary {
+        &mut self.boundary
+    }
+
     /// What the host side has done since load.
-    pub(crate) fn stats(&self) -> HybridStats {
+    #[must_use]
+    pub fn stats(&self) -> HybridStats {
         self.stats
     }
 
     /// The host sum as the page holds it now: the last served layer's.
-    pub(crate) fn hsum_copy(&self) -> Result<Vec<f32>, GpuError> {
+    pub fn hsum_copy(&self) -> Result<Vec<f32>, GpuError> {
         self.boundary
             .page
             .f32_copy(self.boundary.hsum_off, self.boundary.shape.hidden)
@@ -804,7 +922,7 @@ impl<P: ExpertPlans> Hybrid<P> {
 
     /// Open a chain on `stream`: a capture records which layers its replays
     /// will ask for; an eager chain is served as it goes.
-    pub(crate) fn begin_chain(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+    pub fn begin_chain(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         self.refuse_if_poisoned("Hybrid::begin_chain")?;
         self.capturing = capturing(stream)?;
         if self.capturing {
@@ -816,7 +934,7 @@ impl<P: ExpertPlans> Hybrid<P> {
     /// Layer `layer`'s hybrid work is enqueued: a capture notes it, an eager
     /// chain serves it now, before anything more joins the stream behind its
     /// wait.
-    pub(crate) fn layer_enqueued(&mut self, layer: usize) -> Result<(), GpuError> {
+    pub fn layer_enqueued(&mut self, layer: usize) -> Result<(), GpuError> {
         if self.capturing {
             self.captured.push(layer);
             Ok(())
@@ -827,7 +945,7 @@ impl<P: ExpertPlans> Hybrid<P> {
 
     /// Serve every hybrid layer a replay of the captured chain submitted, in
     /// chain order.
-    pub(crate) fn serve_captured(&mut self) -> Result<(), GpuError> {
+    pub fn serve_captured(&mut self) -> Result<(), GpuError> {
         for i in 0..self.captured.len() {
             let layer = self.captured[i];
             self.serve(layer, i == 0)?;
@@ -945,21 +1063,13 @@ impl<P: ExpertPlans> Hybrid<P> {
                 "the activation is outside the handoff",
             ));
         }
-        let gguf = self
-            .file
-            .shard(0)
-            .ok_or(GpuError::state(what, "the file has no shard 0"))?;
-        let plan = self.plans.experts(layer).ok_or(GpuError::state(
-            what,
-            "a hybrid layer without an expert plan",
-        ))?;
         let (off, hidden) = (self.boundary.hsum_off, self.boundary.shape.hidden);
         let out = self
             .boundary
             .page
             .f32_mut(off, hidden)
             .ok_or(GpuError::state(what, "the sum is outside the page"))?;
-        experts_into(gguf, plan, &self.x, &list[..n], out)?;
+        self.host.experts_into(layer, &self.x, &list[..n], out)?;
         self.boundary
             .page
             .word(Word::Cnt)

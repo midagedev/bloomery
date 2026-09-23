@@ -97,10 +97,6 @@ thread_local! {
     /// fetched, not where the bucket table says they should be, so the structural gate
     /// measures reality. One word per 64 experts of the file.
     static TOUCHED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-
-    /// The one-file entry's [`HostScratch`]: its caller holds none, so the entry keeps
-    /// one per thread, made at the first call of a shape.
-    static HOST_SCRATCH: RefCell<Option<HostScratch>> = const { RefCell::new(None) };
 }
 
 /// Opt-in for the [`MoETrace`] capture: filling the trace vectors rides every
@@ -759,16 +755,26 @@ pub const EXPERTS_INTO_MAX: usize = 8;
 /// SwiGLU combine produced inside it. The weights are applied as given — the
 /// caller's router has already scaled them. `x` is one column of the model
 /// width and `out` holds that width; an empty list writes zeros. The
-/// dispatches write into a per-thread [`HostScratch`], made at the first
-/// call of a shape: a steady call allocates nothing.
+/// dispatches write into the caller's `scratch`, made at load for the
+/// block's widths ([`HostScratch::new`]), so a call allocates nothing.
 pub fn experts_into(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
     x: &Tensor2,
     experts: &[(u32, f32)],
     out: &mut [f32],
+    scratch: &mut HostScratch,
 ) -> Result<(), ModelError> {
     check_host_call(x, experts, out)?;
+    if !scratch.fits(x.ne0, plan.meta.ff) {
+        return Err(ModelError::Shape {
+            what: "host experts: the scratch must be made for the block's widths",
+            want_ne0: x.ne0,
+            want_ne1: plan.meta.ff,
+            got_ne0: scratch.embd,
+            got_ne1: scratch.ff,
+        });
+    }
     out.fill(0.0);
     let n = experts.len();
     if n == 0 {
@@ -788,15 +794,7 @@ pub fn experts_into(
         gu[2 * i + 1] = view(&plan.up_views, e)?;
         down[i] = view(&plan.down_views, e)?;
     }
-    HOST_SCRATCH.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        let (embd, ff) = (x.ne0, plan.meta.ff);
-        if !cell.as_ref().is_some_and(|s| s.fits(embd, ff)) {
-            *cell = Some(HostScratch::new(embd, ff));
-        }
-        let scratch = cell.as_mut().expect("made just above");
-        serve(&gu[..2 * n], &down[..n], None, x, experts, out, scratch)
-    })
+    serve(&gu[..2 * n], &down[..n], None, x, experts, out, scratch)
 }
 
 /// Expert `e`'s view in one of a block plan's per-expert view lists; an id

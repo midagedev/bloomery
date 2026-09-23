@@ -52,9 +52,9 @@ use std::path::PathBuf;
 
 use gguf::quant::half_to_f32;
 use gguf::{GgmlType, Split};
+use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
-use model::arch::deepseek41::names;
-use model::moe::{HostLayer, HostLayerSpec, HostScratch};
+use model::moe::HostScratch;
 use model::ops::{Tensor2, Weight, matmul_q_group_into};
 use model::placement::workstation;
 
@@ -355,31 +355,13 @@ fn hw_ds41_host_matches_ik_routed_sum() {
     let mut worst = Layer::default();
     let mut routed = 0;
     for l in 0..hp.n_layer {
-        let kind = &hp.layers[l];
-        if !kind.routed {
+        let Some(layer) = host::layer(&split, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
+        else {
             println!("layer={l} no routed experts");
             continue;
-        }
+        };
         routed += 1;
-        let limit = kind.swiglu_limit;
-        let (gate_name, up_name, down_name) = (
-            names::ffn_gate_exps(l),
-            names::ffn_up_exps(l),
-            names::ffn_down_exps(l),
-        );
-        let layer = HostLayer::build(
-            &split,
-            &HostLayerSpec {
-                gate: &gate_name,
-                up: &up_name,
-                down: &down_name,
-                n_expert: hp.experts.n_expert,
-                embd,
-                ff,
-                swiglu_limit: limit,
-            },
-        )
-        .unwrap_or_else(|e| panic!("layer {l}: {e}"));
+        let limit = layer.swiglu_limit();
         let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
         let ids = set.i32s_logical(&format!("ffn_moe_topk-{l}"), n_used * n_tokens);
         let ws = set.f32s(
