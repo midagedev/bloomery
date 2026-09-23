@@ -493,13 +493,88 @@ mod elem_kernels {
         static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
         static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
 
+        // SAFETY: both arrays are this block's own shared allocations; the
+        // raw form is the only way to reach them without a reference to a
+        // `static mut`.
+        let (bv, bi) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+            )
+        };
+        // SAFETY: bv and bi are this block's ARGMAX_WARPS-slot shared arrays,
+        // and x.len() >= n by the launch contract, so element i*1 + 0 of
+        // every i < n is inside x.
+        let fi = unsafe { argmax_block(x, n, 1, 0, bv, bi) };
+        if thread::threadIdx_x() == 0 {
+            // SAFETY: out.len() >= 1 by the launch contract; only thread 0
+            // writes.
+            unsafe {
+                *out.get_unchecked_mut(0) = fi;
+            }
+        }
+    }
+
+    /// [`argmax`] over each of `m` interleaved rows: block c takes row c's
+    /// `n` values `x[i·m + c]` and writes their argmax to `out[c]`, with
+    /// `argmax`'s walk, butterfly, slot order and tie rule — each row's
+    /// answer is `argmax` on that row alone. The layout is the gemvs'
+    /// `y[r·m + c]` output, so a head's m logit rows go straight in.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (x.len() >= n * m, out.len() >= m))]
+    pub fn argmax_rows(x: &[f32], n: u32, m: u32, mut out: DisjointSlice<u32>) {
+        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
+        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+
+        let c = thread::blockIdx_x();
+        if c >= m {
+            return;
+        }
+        // SAFETY: both arrays are this block's own shared allocations; the
+        // raw form is the only way to reach them without a reference to a
+        // `static mut`.
+        let (bv, bi) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+            )
+        };
+        // SAFETY: bv and bi are this block's shared arrays, and element
+        // i*m + c of every i < n is below n*m <= x.len() because c < m.
+        let fi = unsafe { argmax_block(x, n, m, c, bv, bi) };
+        if thread::threadIdx_x() == 0 {
+            // SAFETY: c < m <= out.len(); block c's thread 0 alone writes it.
+            unsafe {
+                *out.get_unchecked_mut(c as usize) = fi;
+            }
+        }
+    }
+
+    /// The argmax of `x[i·stride + col]` for `i < n`, as [`argmax`] documents
+    /// its walk, meaningful on thread 0 of the block; every thread of the
+    /// block must call it (it holds a block barrier).
+    ///
+    /// # Safety
+    ///
+    /// `bv` and `bi` are the calling block's own shared arrays of
+    /// [`ARGMAX_WARPS`] slots, and `(n - 1)·stride + col < x.len()` when `n > 0`.
+    #[inline(always)]
+    unsafe fn argmax_block(
+        x: &[f32],
+        n: u32,
+        stride: u32,
+        col: u32,
+        bv: *mut f32,
+        bi: *mut u32,
+    ) -> u32 {
         let tid = thread::threadIdx_x();
         let mut best_v = f32::NEG_INFINITY;
         let mut best_i = 0u32;
         let mut i = tid;
         while i < n {
-            // SAFETY: i < n <= x.len() by the launch contract.
-            let v = unsafe { *x.get_unchecked(i as usize) };
+            // SAFETY: i < n, so i*stride + col < x.len() by the contract.
+            let v = unsafe { *x.get_unchecked((i * stride + col) as usize) };
             if argmax_take(v, i, best_v, best_i) {
                 best_v = v;
                 best_i = i;
@@ -518,16 +593,6 @@ mod elem_kernels {
             }
             off >>= 1;
         }
-        // SAFETY: both arrays are this block's own shared allocations; the
-        // raw form is the only way to reach them without a reference to a
-        // `static mut`. Every access is below ARGMAX_WARPS and ordered by
-        // `sync_threads`.
-        let (bv, bi) = unsafe {
-            (
-                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
-                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
-            )
-        };
         if warp::lane_id() == 0 {
             // SAFETY: tid / 32 < ARGMAX_WARPS; one lane per warp writes its
             // own slot, and the pair is written together.
@@ -537,10 +602,12 @@ mod elem_kernels {
             }
         }
         thread::sync_threads();
+        let mut fi = 0u32;
         if tid == 0 {
             // SAFETY: every slot was written above and is visible past the
             // barrier; the walk stays below ARGMAX_WARPS.
-            let (mut fv, mut fi) = unsafe { (*bv.add(0), *bi.add(0)) };
+            let (mut fv, f0) = unsafe { (*bv.add(0), *bi.add(0)) };
+            fi = f0;
             let mut w = 1usize;
             while w < ARGMAX_WARPS {
                 // SAFETY: w < ARGMAX_WARPS, written above, past the barrier.
@@ -551,12 +618,8 @@ mod elem_kernels {
                 }
                 w += 1;
             }
-            // SAFETY: out.len() >= 1 by the launch contract; only thread 0
-            // writes.
-            unsafe {
-                *out.get_unchecked_mut(0) = fi;
-            }
         }
+        fi
     }
 }
 
@@ -869,6 +932,37 @@ impl ElemKernels {
             .module
             .prepare_argmax(LaunchConfig1D::new(1, ARGMAX_THREADS_U32, 0))?;
         self.module.argmax(stream, &prep, x, n, out)?;
+        Ok(())
+    }
+
+    /// Enqueue the argmax of each of `m` interleaved rows of `n` f32 — row c
+    /// is `x[i*m + c]`, the gemvs' `m`-column output layout — into `out[c]`,
+    /// each row's answer the one [`Self::enqueue_argmax`] gives that row
+    /// alone. One [`ARGMAX_THREADS`] block per row. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_argmax_rows(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        m: usize,
+        out: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        if n == 0 || m == 0 || x.len() < n * m || out.len() < m {
+            return Err(GpuError::shape(
+                "enqueue_argmax_rows",
+                format!("n={n} m={m}, x.len() {}, out.len() {}", x.len(), out.len()),
+            ));
+        }
+        let what = "enqueue_argmax_rows";
+        // The walk indexes i*m + c in u32.
+        launch_u32(what, "n*m", n * m)?;
+        let n = launch_u32(what, "n", n)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep =
+            self.module
+                .prepare_argmax_rows(LaunchConfig1D::new(m, ARGMAX_THREADS_U32, 0))?;
+        self.module.argmax_rows(stream, &prep, x, n, m, out)?;
         Ok(())
     }
 }

@@ -4,10 +4,14 @@
 //! shared q8_1 quantizer, the Q6_K gemv and `argmax` exactly as the block
 //! path launches them, so their gates are this chain's gates.
 //!
-//! m = 1 only: the decode step samples the last position, and the lm_head is
-//! the one site whose row count is the vocabulary. The input buffer is
-//! exposed mutable so the assembly round can have the last block's residual
-//! store write straight into it, and `set_input` is the gate's way in.
+//! A head carries `m` rows (1..=8), fixed at construction: the decode step
+//! samples one position (`m = 1`), a k-token step every row. Each row's
+//! normed vector, logits and token are bit for bit that row's `m = 1` head —
+//! the norm and quantizer work per row, the Q6_K gemv keeps each column's
+//! own accumulation order, and the argmax walks each row alone. The input
+//! buffer is exposed mutable so the assembly round can have the last block's
+//! residual store write straight into it, and `set_input` is the gate's way
+//! in.
 
 use crate::GpuError;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -54,10 +58,11 @@ fn head_out_w(w: &Weights) -> Result<(&DeviceTensor<u32>, usize), GpuError> {
     }
 }
 
-/// The resident output head for m = 1: input `hidden` f32, the normed vector,
-/// the q8_1 quantization of it, `n_vocab` logits and the argmax token. Every
-/// buffer is allocated at `new`; `enqueue` and a graph replay touch addresses
-/// only, so one captured graph serves every input written into `x`.
+/// The resident output head for `m` rows: input `m * hidden` f32 (row-major,
+/// one row per token), the normed rows, their q8_1 quantization, `n_vocab * m`
+/// logits (`logits[v*m + c]`, the gemv's layout) and `m` argmax tokens. Every
+/// buffer is allocated at construction; `enqueue` and a graph replay touch
+/// addresses only, so one captured graph serves every input written into `x`.
 pub struct Head {
     /// Declared FIRST: fields drop in declaration order, and a captured graph
     /// must be destroyed while every buffer it addresses is still alive
@@ -68,6 +73,7 @@ pub struct Head {
     eps: f32,
     hidden: usize,
     n_vocab: usize,
+    m: usize,
     /// The chain's input — the last block's output vector. The assembly round
     /// writes here through `input_mut`; the gate through `set_input`.
     x: DeviceBuffer<f32>,
@@ -78,9 +84,20 @@ pub struct Head {
 }
 
 impl Head {
-    /// Cross-check the two weights against each other and allocate the
-    /// scratch. Load-time only.
+    /// The decode head, `m = 1`: [`Head::with_m`] with one row.
     pub fn new(gpu: &Gpu, w: &Weights, eps: f32) -> Result<Head, GpuError> {
+        Head::with_m(gpu, w, eps, 1)
+    }
+
+    /// Cross-check the two weights against each other and allocate the
+    /// scratch for `m` rows (1..=8). Load-time only.
+    pub fn with_m(gpu: &Gpu, w: &Weights, eps: f32, m: usize) -> Result<Head, GpuError> {
+        if !(1..=8).contains(&m) {
+            return Err(GpuError::shape(
+                "Head::with_m",
+                format!("need 1 <= m <= 8, got m={m}"),
+            ));
+        }
         let stream = gpu.stream();
         let hidden = head_gain(w)?.len();
         let (out_w, k) = head_out_w(w)?;
@@ -101,11 +118,12 @@ impl Head {
             eps,
             hidden,
             n_vocab,
-            x: DeviceBuffer::zeroed(stream, hidden)?,
-            normed: DeviceBuffer::zeroed(stream, hidden)?,
-            act: Q8Act::with_k(stream, 1, hidden)?,
-            logits: DeviceBuffer::zeroed(stream, n_vocab)?,
-            token_out: DeviceBuffer::from_host(stream, &[0u32])?,
+            m,
+            x: DeviceBuffer::zeroed(stream, m * hidden)?,
+            normed: DeviceBuffer::zeroed(stream, m * hidden)?,
+            act: Q8Act::with_k(stream, m, hidden)?,
+            logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
+            token_out: DeviceBuffer::from_host(stream, &vec![0u32; m])?,
             graph: None,
         })
     }
@@ -115,9 +133,14 @@ impl Head {
         self.hidden
     }
 
-    /// The vocabulary size, the logit count the projection writes.
+    /// The vocabulary size, the logit count the projection writes per row.
     pub fn n_vocab(&self) -> usize {
         self.n_vocab
+    }
+
+    /// The rows this head was built for.
+    pub fn m(&self) -> usize {
+        self.m
     }
 
     /// Device bytes of the scratch (the weights are counted by their owner).
@@ -134,11 +157,11 @@ impl Head {
             + self.act.d8.num_bytes()
     }
 
-    /// Enqueue the whole head for the vector in `x`: rms_norm → quantize_q8_1
-    /// → gemv_q6k → argmax. Pure enqueues — no allocation, no synchronization
-    /// — so the same body is what `capture` records.
+    /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
+    /// → gemv_q6k → argmax (`argmax_rows` when `m > 1`). Pure enqueues — no
+    /// allocation, no synchronization — so the same body is what `capture`
+    /// records.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
-        assert_eq!(self.act.m(), 1, "Head: the decode head runs m = 1 only");
         let stream = gpu.stream();
         gpu.elem().enqueue_rms_norm(
             stream,
@@ -146,13 +169,23 @@ impl Head {
             head_gain(w)?,
             self.eps,
             self.hidden,
-            1,
+            self.m,
             &mut self.normed,
         )?;
         gpu.enqueue_quantize_q8_1(&self.normed, &mut self.act)?;
         gpu.enqueue_gemv_q6k(head_out_w(w)?.0, &self.act, &mut self.logits)?;
-        gpu.elem()
-            .enqueue_argmax(stream, &self.logits, self.n_vocab, &mut self.token_out)?;
+        if self.m == 1 {
+            gpu.elem()
+                .enqueue_argmax(stream, &self.logits, self.n_vocab, &mut self.token_out)?;
+        } else {
+            gpu.elem().enqueue_argmax_rows(
+                stream,
+                &self.logits,
+                self.n_vocab,
+                self.m,
+                &mut self.token_out,
+            )?;
+        }
         Ok(())
     }
 
@@ -178,10 +211,15 @@ impl Head {
     /// Write the chain's input from the host. Synchronizing copy on the
     /// engine stream; never inside a capture.
     pub fn set_input(&mut self, gpu: &Gpu, host: &[f32]) -> Result<(), GpuError> {
-        if host.len() != self.hidden {
+        if host.len() != self.m * self.hidden {
             return Err(GpuError::shape(
                 "Head::set_input",
-                format!("{} values, the head takes {}", host.len(), self.hidden),
+                format!(
+                    "{} values, the head takes {} rows of {}",
+                    host.len(),
+                    self.m,
+                    self.hidden
+                ),
             ));
         }
         self.x.copy_from_host(gpu.stream(), host)?;
@@ -195,21 +233,26 @@ impl Head {
         &mut self.x
     }
 
-    /// The normed vector of the last run (the dump's `result_norm` tap).
+    /// The normed rows of the last run (the dump's `result_norm` tap).
     /// Blocking read; gate/debug use.
     pub fn normed_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
         Ok(self.normed.to_host_vec(gpu.stream())?)
     }
 
-    /// The logits of the last run (`n_vocab` f32). Blocking read; gate/debug
-    /// use.
+    /// The logits of the last run (`n_vocab * m` f32, `[v*m + c]`). Blocking
+    /// read; gate/debug use.
     pub fn logits_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
         Ok(self.logits.to_host_vec(gpu.stream())?)
     }
 
-    /// The argmax token of the last run: a blocking read of one u32 — the
-    /// step's single synchronize-shaped retrieval.
+    /// The argmax token of the last run's first row: a blocking read — the
+    /// decode step's single synchronize-shaped retrieval.
     pub fn token(&self, gpu: &Gpu) -> Result<u32, GpuError> {
         Ok(self.token_out.to_host_vec(gpu.stream())?[0])
+    }
+
+    /// The argmax tokens of the last run, one per row. Blocking read.
+    pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
+        Ok(self.token_out.to_host_vec(gpu.stream())?)
     }
 }

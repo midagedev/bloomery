@@ -16,20 +16,28 @@
 //!   exact, so the kernels multiply by the value the reference dequantizes
 //!   with and do no f16 arithmetic.
 //!
-//! Numeric contract, both kernels: one warp owns one output row, each lane
+//! Numeric contract, every kernel here: one warp owns one output row, each lane
 //! accumulates its share of the row sequentially, one f32 multiply-add per
 //! term, and the 32 lane sums are then combined by the fixed five-step
 //! butterfly (xor 16, 8, 4, 2, 1). A lane's share:
-//! - F32, and Q8_0 at `m > 1`: the row's 32-value chunks — value index
-//!   `32·it + L` for lane L, chunks in increasing `it`, columns in increasing
-//!   order;
-//! - Q8_0 at `m = 1`, the decode shape: whole code words — words `L, L + 32,
-//!   L + 64, …` of the row in increasing order, each word's four values in
-//!   byte order.
+//! - F32, and `q8_0_gemv`'s own `m > 1` body (the launcher no longer sends
+//!   it one): the row's 32-value chunks — value index `32·it + L` for lane
+//!   L, chunks in increasing `it`, columns in increasing order;
+//! - Q8_0 at `m = 1`, the decode shape, and every column of the m-column
+//!   entries: whole code words — words `L, L + 32, L + 64, …` of the row in
+//!   increasing order, each word's four values in byte order.
 //!
 //! The combination tree is a function of (k, m) only — never of the data,
 //! the row index, or the grid geometry. Output layout matches the K-quant
-//! gemvs: `y[r·m + c]`.
+//! gemvs, `y[r·m + c]`; `q8_0_gemv_mcol` can write token-major instead
+//! ([`GemvOut`]).
+//!
+//! The launcher sends a Q8_0 gemv of `m > 1` columns to `q8_0_gemv_mcol`,
+//! not to `q8_0_gemv`'s chunk body: every lane owns the whole code words it
+//! owns at `m = 1` and keeps one sum per column, so column c of an `m`-column
+//! launch is bit for bit the `m = 1` launch of that column, and each weight
+//! word is read once for all `m` columns. `q8_0_gemv_heads_mcol` is the same
+//! body over per-head activation windows.
 
 use crate::GpuError;
 use crate::flash::half_bits_to_f32;
@@ -476,6 +484,257 @@ pub unsafe fn q8_0_lane_partial_1col(
     f
 }
 
+/// Step `s`'s code word and scale of lane `lane`'s walk — [`q8_0_step`]
+/// without the activations, for a body that reads several columns against
+/// one word.
+///
+/// # Safety
+///
+/// As [`q8_0_step`]: word `32s + lane` of the row exists, with `wq` and `wd`
+/// built as [`q8_0_lane_partials_mcol`] builds them.
+#[inline(always)]
+unsafe fn q8_0_code(qs: &[u32], d: &[u16], wq: usize, wd: usize, s: usize) -> (u32, f32) {
+    // SAFETY: word 32s + lane < k/4 by this function's contract, so the code
+    // word wq + 32s is inside the row's k/4 words and its block wd + 4s
+    // inside the row's k/32 scales, both inside qs and d by the caller
+    // contract.
+    let (q, bits) = unsafe { (*qs.get_unchecked(wq + 32 * s), *d.get_unchecked(wd + 4 * s)) };
+    (q, half_bits_to_f32(bits))
+}
+
+/// Lane `lane`'s partial sums for one Q8_0 row against `M` activation
+/// columns, column c read from base `x0 + c·x_col`. The lane's share of the
+/// row is [`q8_0_lane_partial_1col`]'s — whole code words `L, L + 32, …` in
+/// increasing order, each word's four values in byte order — and each word is
+/// loaded once and dotted against every column, one sum per column. Column
+/// c's multiply-adds are therefore the single-column body's on column c's
+/// activations, term for term and in the same order, and the partial it
+/// returns is that body's bit for bit. Columns `M..8` stay 0.0.
+///
+/// [`Q8_STEP_UNROLL`] steps' code words and scales are loaded before the
+/// first multiply-add that uses them; a column's four activation quads are
+/// loaded next to its own multiply-adds, one column after another, so the
+/// live set is the hoisted words plus one column's quads, not every column's.
+/// Leftover whole steps run one at a time and a `k` that is not a multiple
+/// of 128 ends with one word on each of the first `(k % 128) / 4` lanes. The
+/// activations are read as quads when `x0` and `x_col` leave every column
+/// 16-byte aligned, and as scalars otherwise — the same values in the same
+/// order.
+///
+/// # Safety
+///
+/// `qs.len() >= (row + 1) * k/4`, `d.len() >= (row + 1) * k/32`, `x.len() >=
+/// x0 + (M - 1) * x_col + k`, `k` a positive multiple of 32, `M` in 1..=8,
+/// `lane < 32`. The body reads `qs`, `d` and `x` unchecked within those
+/// bounds.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+pub unsafe fn q8_0_lane_partials_mcol<const M: usize>(
+    qs: &[u32],
+    d: &[u16],
+    x: &[f32],
+    k: u32,
+    row: usize,
+    x0: usize,
+    x_col: usize,
+    lane: usize,
+) -> [f32; 8] {
+    const {
+        assert!(M > 0);
+        assert!(M <= 8);
+    };
+    let k = k as usize;
+    let words = k >> 2;
+    let steps = k / Q8_STEP;
+    let wq = row * words + lane;
+    let wd = row * (k >> 5) + (lane >> 3);
+    let span = (M - 1) * x_col + k;
+    // SAFETY: x0 + (M-1)*x_col + k <= x.len() by the caller contract.
+    let xr = unsafe { x.get_unchecked(x0..x0 + span) };
+    let (mut f0, mut f1, mut f2, mut f3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let (mut f4, mut f5, mut f6, mut f7) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let Some(xq) = as_vectors::<F32x4>(xr) else {
+        // Some column not 16-byte aligned: the same walk, one word at a
+        // time, through scalar reads.
+        let mut w = lane;
+        while w < words {
+            // SAFETY: w < k/4 by the loop guard: the code word row*k/4 + w
+            // and its block row*k/32 + w/8 are inside qs and d.
+            let (q, dv) =
+                unsafe { q8_0_code(qs, d, wq - lane + w, wd - (lane >> 3) + (w >> 3), 0) };
+            macro_rules! col_scalar {
+                ($f:ident, $c:literal) => {
+                    if M > $c {
+                        let b = $c * x_col + 4 * w;
+                        // SAFETY: b + 3 < (M-1)*x_col + k = xr.len(), since
+                        // $c <= M-1 and 4w + 3 < k.
+                        let v = unsafe {
+                            F32x4::new([
+                                *xr.get_unchecked(b),
+                                *xr.get_unchecked(b + 1),
+                                *xr.get_unchecked(b + 2),
+                                *xr.get_unchecked(b + 3),
+                            ])
+                        };
+                        $f = q8_0_word_dot($f, q, dv, v);
+                    }
+                };
+            }
+            col_scalar!(f0, 0);
+            col_scalar!(f1, 1);
+            col_scalar!(f2, 2);
+            col_scalar!(f3, 3);
+            col_scalar!(f4, 4);
+            col_scalar!(f5, 5);
+            col_scalar!(f6, 6);
+            col_scalar!(f7, 7);
+            w += 32;
+        }
+        return [f0, f1, f2, f3, f4, f5, f6, f7];
+    };
+    // Quads between one column's base and the next.
+    let cq = x_col >> 2;
+    let mut s = 0usize;
+    while s + Q8_STEP_UNROLL <= steps {
+        // SAFETY: s + 4 <= steps by the loop guard, so steps s .. s + 3 are
+        // whole: each lane's word in them is below 32 * steps <= k/4.
+        let ((q0, d0), (q1, d1), (q2, d2), (q3, d3)) = unsafe {
+            (
+                q8_0_code(qs, d, wq, wd, s),
+                q8_0_code(qs, d, wq, wd, s + 1),
+                q8_0_code(qs, d, wq, wd, s + 2),
+                q8_0_code(qs, d, wq, wd, s + 3),
+            )
+        };
+        let a = lane + 32 * s;
+        macro_rules! col_trip {
+            ($f:ident, $c:literal) => {
+                if M > $c {
+                    let b = $c * cq + a;
+                    // SAFETY: quad a + 96 = word 32(s+3) + lane < k/4 of
+                    // column $c <= M-1, whose quads start at $c*cq, all
+                    // inside xq (xr.len()/4 = (M-1)*cq + k/4).
+                    let (v0, v1, v2, v3) = unsafe {
+                        (
+                            *xq.get_unchecked(b),
+                            *xq.get_unchecked(b + 32),
+                            *xq.get_unchecked(b + 64),
+                            *xq.get_unchecked(b + 96),
+                        )
+                    };
+                    $f = q8_0_word_dot($f, q0, d0, v0);
+                    $f = q8_0_word_dot($f, q1, d1, v1);
+                    $f = q8_0_word_dot($f, q2, d2, v2);
+                    $f = q8_0_word_dot($f, q3, d3, v3);
+                }
+            };
+        }
+        col_trip!(f0, 0);
+        col_trip!(f1, 1);
+        col_trip!(f2, 2);
+        col_trip!(f3, 3);
+        col_trip!(f4, 4);
+        col_trip!(f5, 5);
+        col_trip!(f6, 6);
+        col_trip!(f7, 7);
+        s += Q8_STEP_UNROLL;
+    }
+    // Whole steps left over, then the partial word: every lane's word of step
+    // `steps` exists only when 32 * steps + lane < k/4.
+    while s <= steps {
+        if s == steps && 32 * steps + lane >= words {
+            break;
+        }
+        // SAFETY: either s < steps (a whole step) or the guard above put
+        // this lane's word of step `steps` below k/4.
+        let (q0, d0) = unsafe { q8_0_code(qs, d, wq, wd, s) };
+        let a = lane + 32 * s;
+        macro_rules! col_one {
+            ($f:ident, $c:literal) => {
+                if M > $c {
+                    // SAFETY: quad a = word 32s + lane < k/4 of column $c <=
+                    // M-1, inside xq as in the trip above.
+                    let v0 = unsafe { *xq.get_unchecked($c * cq + a) };
+                    $f = q8_0_word_dot($f, q0, d0, v0);
+                }
+            };
+        }
+        col_one!(f0, 0);
+        col_one!(f1, 1);
+        col_one!(f2, 2);
+        col_one!(f3, 3);
+        col_one!(f4, 4);
+        col_one!(f5, 5);
+        col_one!(f6, 6);
+        col_one!(f7, 7);
+        s += 1;
+    }
+    [f0, f1, f2, f3, f4, f5, f6, f7]
+}
+
+/// [`q8_0_lane_partials_mcol`] for a launch-uniform `m_cols`: the body
+/// instantiated for that column count. `None` for an `m_cols` outside 1..=8,
+/// which the launchers never send.
+///
+/// # Safety
+///
+/// As [`q8_0_lane_partials_mcol`] with `M = m_cols`.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+unsafe fn q8_0_lane_partials_m(
+    qs: &[u32],
+    d: &[u16],
+    x: &[f32],
+    k: u32,
+    row: usize,
+    x0: usize,
+    x_col: usize,
+    m_cols: u32,
+    lane: usize,
+) -> Option<[f32; 8]> {
+    Some(match m_cols {
+        1 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<1>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        2 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<2>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        3 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<3>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        4 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<4>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        5 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<5>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        6 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<6>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        7 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<7>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        8 => {
+            // SAFETY: M = m_cols, so this fn's contract is the body's.
+            unsafe { q8_0_lane_partials_mcol::<8>(qs, d, x, k, row, x0, x_col, lane) }
+        }
+        _ => return None,
+    })
+}
+
 /// The row's m sums from the per-lane partials: the fixed five-step
 /// butterfly per column (`warp::reduce_sum_f32`), columns past `m_cols`
 /// left at 0.0. `m_cols` must be warp-uniform — a launch-wide constant in
@@ -518,6 +777,53 @@ pub(crate) fn gemv_lane_sums(f: [f32; 8], m_cols: u32) -> [f32; 8] {
         0.0
     };
     [s0, s1, s2, s3, s4, s5, s6, s7]
+}
+
+/// Lane 0's store of a row's `m` sums: `y[base + c·stride] = sums[c]` for
+/// `c < m`.
+///
+/// # Safety
+///
+/// `1 <= m <= 8`, every slot `base + c·stride` for `c < m` inside `y`, and no other
+/// thread of the launch writes any of them.
+#[inline(always)]
+unsafe fn store_sums(
+    y: &mut DisjointSlice<f32>,
+    base: usize,
+    stride: usize,
+    m: usize,
+    sums: &[f32; 8],
+) {
+    // One guarded store per column with a constant index: a loop over `c`
+    // would index `sums` at run time and put it in a local depot.
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = *sums;
+    // SAFETY: each store below is guarded by c < m, so its slot base +
+    // c*stride is one this fn's contract puts inside y and gives to this
+    // thread alone.
+    unsafe {
+        *y.get_unchecked_mut(base) = s0;
+        if m > 1 {
+            *y.get_unchecked_mut(base + stride) = s1;
+        }
+        if m > 2 {
+            *y.get_unchecked_mut(base + 2 * stride) = s2;
+        }
+        if m > 3 {
+            *y.get_unchecked_mut(base + 3 * stride) = s3;
+        }
+        if m > 4 {
+            *y.get_unchecked_mut(base + 4 * stride) = s4;
+        }
+        if m > 5 {
+            *y.get_unchecked_mut(base + 5 * stride) = s5;
+        }
+        if m > 6 {
+            *y.get_unchecked_mut(base + 6 * stride) = s6;
+        }
+        if m > 7 {
+            *y.get_unchecked_mut(base + 7 * stride) = s7;
+        }
+    }
 }
 
 // -------------------------------------------------------------- kernels
@@ -659,11 +965,161 @@ mod q8f32_kernels {
             }
         }
     }
+
+    /// Q8_0 gemv against f32 activations, `m_cols` in 1..=8, in the
+    /// single-column lane order ([`q8_0_lane_partials_mcol`]): column c of
+    /// `y` is bit for bit `q8_0_gemv`'s `m = 1` output on column c, and each
+    /// weight word is read once for every column. Skeleton as `q8_0_gemv`:
+    /// one warp per row, 8 rows per 256-thread block. Row r's column c lands
+    /// at `y[r·y_row + c·y_col]` — `q8_0_gemv`'s `y[r·m + c]` with `(m, 1)`,
+    /// token-major `y[c·n_rows + r]` with `(1, n_rows)`; the host picks one
+    /// of the two, so every slot has one writer.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            32 * d.len() >= n_rows * k,
+            x.len() >= m_cols * k,
+            y.len() >= (n_rows - 1) * y_row + (m_cols - 1) * y_col + 1
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn q8_0_gemv_mcol(
+        qs: &[u32],
+        d: &[u16],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        m_cols: u32,
+        y_row: u32,
+        y_col: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row < n_rows puts the row's words and scales inside qs and
+        // d (the contract's 4·qs.len() and 32·d.len() bounds), and column c
+        // at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k.
+        let Some(f) =
+            (unsafe { q8_0_lane_partials_m(qs, d, x, k, row, 0, k as usize, m_cols, lane) })
+        else {
+            return;
+        };
+        let sums = gemv_lane_sums(f, m_cols);
+        if lane == 0 {
+            // SAFETY: the slots row*y_row + c*y_col, c < m_cols <= 8, lie at
+            // or below (n_rows-1)*y_row + (m_cols-1)*y_col < y.len(), and
+            // the host's layout gives each to this row's lane 0 alone.
+            unsafe {
+                store_sums(
+                    &mut y,
+                    row * y_row as usize,
+                    y_col as usize,
+                    m_cols as usize,
+                    &sums,
+                );
+            }
+        }
+    }
+
+    /// [`q8_0_gemv_mcol`] over per-head activation windows: launch row `r`
+    /// belongs to head `h = r / rows_per_head` and dots weight row `r`
+    /// against column c's window `x[c·x_col_stride + h·x_head_stride .. +k]`,
+    /// lane 0 storing column c's sum at `y[c·y_col_stride + h·y_head_stride +
+    /// y_off + r % rows_per_head]`. At `m_cols = 1` it is
+    /// `q8_0_gemv_heads` bit for bit, and column c of an `m_cols` launch is
+    /// the `m_cols = 1` launch of that column. `n_rows` must be `n_heads *
+    /// rows_per_head`; stores are disjoint when heads and columns do not
+    /// overlap in `y` (host-validated).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_rows * k,
+            32 * d.len() >= n_rows * k,
+            x.len() >= (m_cols - 1) * x_col_stride + (n_heads - 1) * x_head_stride + k,
+            y.len() >= (m_cols - 1) * y_col_stride + (n_heads - 1) * y_head_stride + y_off + rows_per_head
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn q8_0_gemv_heads_mcol(
+        qs: &[u32],
+        d: &[u16],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        n_heads: u32,
+        rows_per_head: u32,
+        x_head_stride: u32,
+        y_head_stride: u32,
+        y_off: u32,
+        m_cols: u32,
+        x_col_stride: u32,
+        y_col_stride: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let h = row / rows_per_head as usize;
+        // As `q8_0_gemv_heads`: the contract cannot bind n_rows to
+        // n_heads*rows_per_head, so a violated divisibility stops here.
+        if h >= n_heads as usize {
+            return;
+        }
+        let j = row % rows_per_head as usize;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row < n_rows bounds the row's words and scales by the
+        // contract; h < n_heads and c < m_cols bound every column window,
+        // x0 + c*x_col_stride + k <= (m_cols-1)*x_col_stride +
+        // (n_heads-1)*x_head_stride + k <= x.len().
+        let Some(f) = (unsafe {
+            q8_0_lane_partials_m(
+                qs,
+                d,
+                x,
+                k,
+                row,
+                h * x_head_stride as usize,
+                x_col_stride as usize,
+                m_cols,
+                lane,
+            )
+        }) else {
+            return;
+        };
+        let sums = gemv_lane_sums(f, m_cols);
+        if lane == 0 {
+            let base = h * y_head_stride as usize + y_off as usize + j;
+            // SAFETY: every slot base + c*y_col_stride, c < m_cols, is inside
+            // y by the launch contract, and the host-validated strides give
+            // each (column, head, slot) its own address, owned by this row.
+            unsafe { store_sums(&mut y, base, y_col_stride as usize, m_cols as usize, &sums) };
+        }
+    }
 }
 
-/// The loaded P3 device module: `f32_gemv` and `q8_0_gemv`. Owns no context
-/// and no stream — the caller passes the engine stream (`Gpu::stream()`) per
-/// enqueue, so launches order with the rest of the step and are capturable.
+/// The loaded P3 device module: `f32_gemv`, `q8_0_gemv` and the two
+/// m-column Q8_0 entries. Owns no context and no stream — the caller passes
+/// the engine stream (`Gpu::stream()`) per enqueue, so launches order with
+/// the rest of the step and are capturable.
 pub struct Q8F32Kernels {
     module: q8f32_kernels::LoadedModule,
 }
@@ -707,8 +1163,10 @@ impl Q8F32Kernels {
     /// layout: `qs` `rows × k/4` u32 words and `d` `rows × k/32` f16 scale
     /// bits — against `m` f32 activation columns of `k = d.cols() * 32` values
     /// each (the scale buffer's width fixes k; `qs.cols()` must equal
-    /// `d.cols() * 8`). Output layout as `enqueue_f32_gemv`. Asynchronous,
-    /// allocation-free, capturable.
+    /// `d.cols() * 8`). Output layout as `enqueue_f32_gemv`. `m = 1` runs
+    /// `q8_0_gemv`, the decode shape; `m > 1` runs `q8_0_gemv_mcol`, so column
+    /// c of the output is the `m = 1` launch of column c bit for bit.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_q8_0_gemv(
         &self,
         stream: &CudaStream,
@@ -718,25 +1176,20 @@ impl Q8F32Kernels {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let n_rows = d.rows();
-        let k = d.cols() * 32;
-        check_gemv_geometry("enqueue_q8_0_gemv", n_rows, k, x.len(), m, y.len())?;
-        if qs.rows() != n_rows || qs.cols() != d.cols() * 8 {
-            return Err(GpuError::shape(
-                "enqueue_q8_0_gemv",
-                format!(
-                    "qs is {}x{}, want {}x{} (k/4 words per row, k = d.cols()*32 = {k})",
-                    qs.rows(),
-                    qs.cols(),
-                    n_rows,
-                    d.cols() * 8
-                ),
-            ));
+        if m > 1 {
+            return self.enqueue_q8_0_gemv_mcol(
+                stream,
+                Q8_0GemvMcolArgs {
+                    qs,
+                    d,
+                    x,
+                    m,
+                    out: GemvOut::RowMajor,
+                    y,
+                },
+            );
         }
-        let what = "enqueue_q8_0_gemv";
-        let n_rows = launch_u32(what, "n_rows", n_rows)?;
-        let k = launch_u32(what, "k", k)?;
-        let m = launch_u32(what, "m", m)?;
+        let (n_rows, k, m) = q8_0_launch_dims("enqueue_q8_0_gemv", qs, d, x.len(), m, y.len())?;
         let prep =
             self.module
                 .prepare_q8_0_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
@@ -744,11 +1197,239 @@ impl Q8F32Kernels {
             .q8_0_gemv(stream, &prep, qs.buf(), d.buf(), x, n_rows, k, m, y)?;
         Ok(())
     }
+
+    /// Enqueue [`Self::enqueue_q8_0_gemv`]'s product through
+    /// `q8_0_gemv_mcol` at any `m` in 1..=8 — at `m = 1` too, where the
+    /// engine launches `q8_0_gemv` instead and the two agree bit for bit —
+    /// writing `y` in `out`'s layout. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_q8_0_gemv_mcol(
+        &self,
+        stream: &CudaStream,
+        a: Q8_0GemvMcolArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let Q8_0GemvMcolArgs {
+            qs,
+            d,
+            x,
+            m,
+            out,
+            y,
+        } = a;
+        let what = "enqueue_q8_0_gemv_mcol";
+        let (n_rows, k, m) = q8_0_launch_dims(what, qs, d, x.len(), m, y.len())?;
+        let (y_row, y_col) = match out {
+            GemvOut::RowMajor => (m, 1),
+            GemvOut::TokenMajor => (1, n_rows),
+        };
+        let prep =
+            self.module
+                .prepare_q8_0_gemv_mcol(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+        self.module.q8_0_gemv_mcol(
+            stream,
+            &prep,
+            qs.buf(),
+            d.buf(),
+            x,
+            n_rows,
+            k,
+            m,
+            y_row,
+            y_col,
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the per-head Q8_0 gemv over `m` activation columns — the
+    /// `m`-column form of `StepKernels::enqueue_q8_0_gemv_heads`, the same
+    /// weight planes, head layout and checks, with column c's head `h`
+    /// reading `x[c*x_col_stride + h*x_head_stride .. +k]` and writing
+    /// `y[c*y_col_stride + h*y_head_stride + y_off + j]` for weight row
+    /// `h*rows_per_head + j`. Column c is the `m = 1` launch of that column
+    /// bit for bit, and each weight word is read once for all columns. Both
+    /// column strides must be multiples of 4 (every window starts 16-byte
+    /// aligned), and `y_col_stride` at least one column's span of heads,
+    /// `(n_heads-1)*y_head_stride + rows_per_head`, so no two columns share a
+    /// slot. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_q8_0_gemv_heads_mcol(
+        &self,
+        stream: &CudaStream,
+        a: Q8_0GemvHeadsMcolArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_q8_0_gemv_heads_mcol";
+        let Q8_0GemvHeadsMcolArgs {
+            qs,
+            d,
+            x,
+            rows_per_head,
+            x_head_stride,
+            y_head_stride,
+            y_off,
+            m,
+            x_col_stride,
+            y_col_stride,
+            y,
+        } = a;
+        let n_rows = d.rows();
+        let k = d.cols() * 32;
+        let refuse = |detail: String| Err(GpuError::shape(what, detail));
+        if n_rows == 0 || k == 0 {
+            return refuse(format!(
+                "need a non-empty weight, d is {}x{}",
+                d.rows(),
+                d.cols()
+            ));
+        }
+        if qs.rows() != n_rows || qs.cols() != d.cols() * 8 {
+            return refuse(format!(
+                "qs is {}x{}, want {}x{} (k/4 words per row, k = d.cols()*32 = {k})",
+                qs.rows(),
+                qs.cols(),
+                n_rows,
+                d.cols() * 8
+            ));
+        }
+        if !(1..=8).contains(&m) {
+            return refuse(format!("need 1 <= m <= 8, got m={m}"));
+        }
+        if rows_per_head == 0 || !n_rows.is_multiple_of(rows_per_head) {
+            return refuse(format!(
+                "n_rows={n_rows} is not a positive multiple of rows_per_head={rows_per_head}"
+            ));
+        }
+        // Off the quad grid the row body takes its scalar walk: the same sums
+        // at a quarter of the load width, which the launcher refuses.
+        if !x_head_stride.is_multiple_of(4) || !x_col_stride.is_multiple_of(4) {
+            return refuse(format!(
+                "x_head_stride={x_head_stride} and x_col_stride={x_col_stride} must be multiples \
+                 of 4: every window starts 16-byte aligned"
+            ));
+        }
+        let n_heads = n_rows / rows_per_head;
+        let heads_span = (n_heads - 1) * y_head_stride + rows_per_head;
+        if m > 1 && y_col_stride < heads_span {
+            return refuse(format!(
+                "y_col_stride={y_col_stride} < (n_heads-1)*y_head_stride + rows_per_head = \
+                 {heads_span}: two columns would share a slot"
+            ));
+        }
+        let x_need = (m - 1) * x_col_stride + (n_heads - 1) * x_head_stride + k;
+        if x.len() < x_need {
+            return refuse(format!(
+                "x.len() {} < (m-1)*x_col_stride + (n_heads-1)*x_head_stride + k = {x_need}",
+                x.len()
+            ));
+        }
+        let y_need = (m - 1) * y_col_stride + y_off + heads_span;
+        if y.len() < y_need {
+            return refuse(format!(
+                "y.len() {} < (m-1)*y_col_stride + y_off + (n_heads-1)*y_head_stride + \
+                 rows_per_head = {y_need}",
+                y.len()
+            ));
+        }
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let prep = self
+            .module
+            .prepare_q8_0_gemv_heads_mcol(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+        self.module.q8_0_gemv_heads_mcol(
+            stream,
+            &prep,
+            qs.buf(),
+            d.buf(),
+            x,
+            n_rows,
+            launch_u32(what, "k", k)?,
+            launch_u32(what, "n_heads", n_heads)?,
+            launch_u32(what, "rows_per_head", rows_per_head)?,
+            launch_u32(what, "x_head_stride", x_head_stride)?,
+            launch_u32(what, "y_head_stride", y_head_stride)?,
+            launch_u32(what, "y_off", y_off)?,
+            launch_u32(what, "m", m)?,
+            launch_u32(what, "x_col_stride", x_col_stride)?,
+            launch_u32(what, "y_col_stride", y_col_stride)?,
+            y,
+        )?;
+        Ok(())
+    }
 }
 
-/// Reject geometry the two gemvs' launch contracts do not cover: both walk
-/// the row in 32-value chunks, so k must be a positive multiple of 32, rows
-/// >= 1, and both support 1..=8 columns.
+/// Where an m-column gemv writes row r's column c.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemvOut {
+    /// `y[r·m + c]`: every gemv's layout, `m` outputs per row.
+    RowMajor,
+    /// `y[c·rows + r]`: column c's `rows` outputs together — the token-major
+    /// order the step's element ops read.
+    TokenMajor,
+}
+
+/// [`Q8F32Kernels::enqueue_q8_0_gemv_mcol`]'s arguments: the Q8_0 planes as
+/// [`Q8F32Kernels::enqueue_q8_0_gemv`] takes them, `m` activation columns
+/// (1..=8), and the output layout.
+pub struct Q8_0GemvMcolArgs<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub d: &'a DeviceTensor<u16>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub out: GemvOut,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q8F32Kernels::enqueue_q8_0_gemv_heads_mcol`]'s arguments. The strides
+/// and the offset count f32 elements, `rows_per_head` weight rows; `m` is
+/// the column count, 1..=8.
+pub struct Q8_0GemvHeadsMcolArgs<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub d: &'a DeviceTensor<u16>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub rows_per_head: usize,
+    pub x_head_stride: usize,
+    pub y_head_stride: usize,
+    pub y_off: usize,
+    pub m: usize,
+    pub x_col_stride: usize,
+    pub y_col_stride: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The two Q8_0 gemv launchers' shared checks: geometry as
+/// [`check_gemv_geometry`] with `k = d.cols() * 32`, and `qs` the matching
+/// word plane. Returns `(n_rows, k, m)` as the launch's `u32`s.
+fn q8_0_launch_dims(
+    what: &'static str,
+    qs: &DeviceTensor<u32>,
+    d: &DeviceTensor<u16>,
+    x_len: usize,
+    m: usize,
+    y_len: usize,
+) -> Result<(u32, u32, u32), GpuError> {
+    let n_rows = d.rows();
+    let k = d.cols() * 32;
+    check_gemv_geometry(what, n_rows, k, x_len, m, y_len)?;
+    if qs.rows() != n_rows || qs.cols() != d.cols() * 8 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "qs is {}x{}, want {}x{} (k/4 words per row, k = d.cols()*32 = {k})",
+                qs.rows(),
+                qs.cols(),
+                n_rows,
+                d.cols() * 8
+            ),
+        ));
+    }
+    Ok((
+        launch_u32(what, "n_rows", n_rows)?,
+        launch_u32(what, "k", k)?,
+        launch_u32(what, "m", m)?,
+    ))
+}
+
+/// Reject geometry the gemvs' launch contracts do not cover: every body
+/// walks the row in 32-value blocks, so k must be a positive multiple of 32,
+/// rows >= 1, and all support 1..=8 columns.
 fn check_gemv_geometry(
     what: &'static str,
     n_rows: usize,
@@ -786,7 +1467,7 @@ fn check_gemv_geometry(
 
 #[cfg(test)]
 mod tests {
-    use super::q8_0_lane_partial_1col;
+    use super::{q8_0_lane_partial_1col, q8_0_lane_partials_mcol};
 
     /// The single-column Q8_0 body sums every value of the row exactly once,
     /// for every k the launchers accept (a positive multiple of 32) up to two
@@ -833,6 +1514,105 @@ mod tests {
                         })
                         .sum();
                     assert_eq!(got, want as f32, "k={k} row={r} x0={x0}");
+                }
+            }
+        }
+    }
+
+    /// Column c of the m-column body is the single-column body on column c,
+    /// bit for bit, lane by lane — for every column count, every k the
+    /// launchers accept up to two hoisted trips (each tail the walk can end
+    /// in), a column stride equal to k and one past it, on the quad path and
+    /// on the unaligned scalar path. The values are not small integers: the
+    /// sums round, so a term out of order shows as different bits.
+    #[test]
+    fn q8_0_mcol_column_is_1col() {
+        let mut state = 0x2545_f491_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        for k in (32..=1024).step_by(32) {
+            let rows = 2;
+            let words = k / 4;
+            let qs: Vec<u32> = (0..rows * words).map(|_| next()).collect();
+            // f16 bits of scales in [2^-8, 2^1): exponent 7..=15, any mantissa.
+            let d: Vec<u16> = (0..rows * k / 32)
+                .map(|_| {
+                    let r = next();
+                    (((7 + (r >> 16) % 9) << 10) | (r & 0x3ff)) as u16
+                })
+                .collect();
+            for x_col in [k, k + 4] {
+                let len = 7 * x_col + k + 8;
+                let x: Vec<f32> = (0..len)
+                    .map(|_| (next() >> 8) as f32 / (1u32 << 23) as f32 - 1.0)
+                    .collect();
+                let aligned = (16 - x.as_ptr() as usize % 16) % 16 / 4;
+                for x0 in [aligned, aligned + 1] {
+                    for r in 0..rows {
+                        for lane in 0..32 {
+                            // SAFETY: qs and d hold `rows` rows of k values,
+                            // x holds x0 + 7*x_col + k (x0 <= 4 < 8), k is a
+                            // multiple of 32 and lane < 32: both bodies'
+                            // contracts for every column count up to 8.
+                            let got: [[f32; 8]; 8] = unsafe {
+                                [
+                                    q8_0_lane_partials_mcol::<1>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                    q8_0_lane_partials_mcol::<2>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                    q8_0_lane_partials_mcol::<3>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                    q8_0_lane_partials_mcol::<4>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                    q8_0_lane_partials_mcol::<5>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                    q8_0_lane_partials_mcol::<6>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                    q8_0_lane_partials_mcol::<7>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                    q8_0_lane_partials_mcol::<8>(
+                                        &qs, &d, &x, k as u32, r, x0, x_col, lane,
+                                    ),
+                                ]
+                            };
+                            for (mi, cols) in got.iter().enumerate() {
+                                for (c, &v) in cols.iter().enumerate() {
+                                    let want = if c <= mi {
+                                        // SAFETY: as above, column c's base
+                                        // x0 + c*x_col leaves k values in x.
+                                        unsafe {
+                                            q8_0_lane_partial_1col(
+                                                &qs,
+                                                &d,
+                                                &x,
+                                                k as u32,
+                                                r,
+                                                x0 + c * x_col,
+                                                lane,
+                                            )
+                                        }
+                                    } else {
+                                        0.0
+                                    };
+                                    assert_eq!(
+                                        v.to_bits(),
+                                        want.to_bits(),
+                                        "k={k} x_col={x_col} x0={x0} row={r} lane={lane} m={} col={c}",
+                                        mi + 1
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
