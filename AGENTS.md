@@ -390,6 +390,13 @@ unconditionally; a timing arm whose `time` rows cover two positions each),
 step, host-tier `HybridStats` deltas, `getrusage` page faults and the card's
 `cuMemGetInfo` free bytes (`vram_free`), and a `stat summary` with
 `vram_free_load` and `vram_free_min`; unset, nothing is read),
+`BLOOMERY_DRAFT=lookup` (`generate_ds41`: an n-gram lookup draft — `gpu-gates::draft::Lookup`,
+the n = 3→2→1 most-recent follower of `draft-accept.py`'s lookup-recent, fed the fed ids and every
+emitted token — served through `step_pair`: row A's argmax equal to the draft accepts two positions,
+else the second position is taken back and row A's token stands; a step with no proposal is a plain
+`step`; the `tokens` line is the plain run's and `just gate-gpu-ds41-draft` pins that; `time pass …
+positions=1|2 kind=…` rows and a `draft summary` line replace the `time step` rows, which
+`tools/ref/depth-ds41.sh` reads; refused together with `BLOOMERY_STEP_PAIR=1`),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
