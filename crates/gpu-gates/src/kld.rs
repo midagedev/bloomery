@@ -28,6 +28,9 @@
 //! The ids are the text's own. When a model adds a BOS, ik evaluates BOS in
 //! place of each chunk's first id and does not write that here; a runner must
 //! do the same. The V4.1 file sets `tokenizer.ggml.add_bos_token` to false.
+//!
+//! Two files of one text are compared record by record through [`Pair`] and
+//! [`compare`] (the `kld_diff` bin).
 
 use crate::GateError;
 use memmap2::Mmap;
@@ -57,7 +60,7 @@ const SCALE_ROUNDING: f64 = 1.0 + 1e-5;
 /// `nearest_int` (≤ 0.016 level, 5.9e-6 nats at the widest step); the stored
 /// scale times a level carries three relative roundings of at most 24 nats
 /// (4.3e-6). That is 1.8e-5 in all; this is it rounded up.
-const F32_SLACK: f64 = 2.5e-5;
+pub const F32_SLACK: f64 = 2.5e-5;
 
 const MAGIC: &[u8; 8] = b"_logits_";
 
@@ -85,6 +88,17 @@ impl KldBase {
     /// naming what disagrees. The records are read when asked for, not here;
     /// each checks itself ([`Record::check`]).
     pub fn open(path: &Path, want_vocab: usize) -> Result<KldBase, GateError> {
+        Self::map_checked(path, Some(want_vocab))
+    }
+
+    /// [`KldBase::open`] with the vocabulary the file's own header states:
+    /// for comparing two base files with each other ([`Pair`]), where neither
+    /// side is the model file.
+    pub fn open_own_vocab(path: &Path) -> Result<KldBase, GateError> {
+        Self::map_checked(path, None)
+    }
+
+    fn map_checked(path: &Path, want_vocab: Option<usize>) -> Result<KldBase, GateError> {
         let at = path.display();
         let file = File::open(path).map_err(|e| format!("kld: cannot open {at}: {e}"))?;
         let len = file
@@ -113,7 +127,7 @@ impl KldBase {
         };
         let (n_ctx, n_vocab, n_chunk) =
             (size(0, "n_ctx")?, size(1, "n_vocab")?, size(2, "n_chunk")?);
-        if n_vocab != want_vocab {
+        if let Some(want_vocab) = want_vocab.filter(|&w| w != n_vocab) {
             return Err(format!(
                 "kld: {at} states n_vocab {n_vocab}, but the model's vocabulary is {want_vocab}"
             )
@@ -336,6 +350,239 @@ impl Record<'_> {
     }
 }
 
+/// ik's `--kl-divergence` sums only the base entries whose log-probability,
+/// dequantized in f32, is above this many nats (`log_softmax`, the overload
+/// that reads a base record).
+pub const IK_KLD_CUT: f32 = -16.0;
+
+/// Two base files of one text, compared position by position: P is taken as
+/// the truth and Q is scored against it — the order of ik's
+/// `--kl-divergence`, whose base file is P.
+pub struct Pair<'a> {
+    p: &'a KldBase,
+    q: &'a KldBase,
+    n_chunk: usize,
+}
+
+impl<'a> Pair<'a> {
+    /// `p` and `q` over the chunks both hold: a file with more chunks is
+    /// compared on its prefix. Refuses two files whose `n_ctx` or `n_vocab`
+    /// differ, or whose ids differ anywhere in those chunks, with an error
+    /// naming the field.
+    pub fn new(p: &'a KldBase, q: &'a KldBase) -> Result<Pair<'a>, GateError> {
+        let (pa, qa) = (p.path.display(), q.path.display());
+        if p.n_ctx != q.n_ctx {
+            return Err(format!(
+                "kld: n_ctx differs: {pa} states {}, {qa} states {}",
+                p.n_ctx, q.n_ctx
+            )
+            .into());
+        }
+        if p.n_vocab != q.n_vocab {
+            return Err(format!(
+                "kld: n_vocab differs: {pa} states {}, {qa} states {}",
+                p.n_vocab, q.n_vocab
+            )
+            .into());
+        }
+        let n_chunk = p.n_chunk.min(q.n_chunk);
+        let n_ids = n_chunk * p.n_ctx;
+        if let Some(i) = (0..n_ids).find(|&i| p.tokens[i] != q.tokens[i]) {
+            return Err(format!(
+                "kld: ids differ: id {i} (chunk {}, position {}) is {} in {pa} and {} in {qa}",
+                i / p.n_ctx,
+                i % p.n_ctx,
+                p.tokens[i],
+                q.tokens[i]
+            )
+            .into());
+        }
+        Ok(Pair { p, q, n_chunk })
+    }
+
+    /// The file taken as the truth.
+    pub fn p(&self) -> &'a KldBase {
+        self.p
+    }
+
+    /// The file scored against it.
+    pub fn q(&self) -> &'a KldBase {
+        self.q
+    }
+
+    /// Chunks compared: the fewer of the two files'.
+    pub fn n_chunk(&self) -> usize {
+        self.n_chunk
+    }
+
+    /// P's and Q's records at every scored position of the compared chunks,
+    /// in file order.
+    pub fn records(&self) -> impl ExactSizeIterator<Item = (Record<'a>, Record<'a>)> + 'a {
+        let (p, q) = (self.p, self.q);
+        (0..self.n_chunk * p.scored_per_chunk()).map(move |i| (p.record_at(i), q.record_at(i)))
+    }
+}
+
+/// One scored position of a [`Pair`], compared entry by entry ([`compare`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PosDiff {
+    /// The chunk, from 0.
+    pub chunk: usize,
+    /// The position within the chunk whose logits these are.
+    pub pos: usize,
+    /// The id scored: the one at `pos + 1`.
+    pub next: u32,
+    /// KL(P‖Q) = Σ p·(ln p − ln q) over the whole vocabulary, in nats, in f64
+    /// from both records' stored levels; an entry at level 0 counts at the
+    /// value stored for it.
+    pub kld: f64,
+    /// The same sum over the entries ik's own `--kl-divergence` sums: those
+    /// P stores above [`IK_KLD_CUT`], tested in f32 as ik tests them.
+    pub kld_ik_cut: f64,
+    /// Entries in [`PosDiff::kld_ik_cut`] that Q stores at level 0, where Q's
+    /// true log-probability may be lower than stored.
+    pub cut_at_q_floor: u32,
+    /// Σ p over P's record.
+    pub p_mass: f64,
+    /// P's most likely id: the first entry at its top level, the rule ik
+    /// applies to its base record.
+    pub top_p: u32,
+    /// Q's most likely id by the same rule.
+    pub top_q: u32,
+    /// Entries at Q's top level. Above 1, the id Q's logits ranked first is
+    /// one of them and the file does not say which.
+    pub q_top_count: u32,
+    /// −ln p(next).
+    pub nll_p: f64,
+    /// −ln q(next).
+    pub nll_q: f64,
+    /// Q stores `next` at level 0: `nll_q` is then a lower bound.
+    pub q_next_at_floor: bool,
+    /// Q's step, nats per level.
+    pub q_scale: f32,
+}
+
+impl PosDiff {
+    /// How far [`PosDiff::kld_ik_cut`] can sit from the KLD ik computes at
+    /// this position from Q's fresh logits and P's record, in nats. ik takes
+    /// Q's log-probabilities in f32 from the logits; Q's record holds them
+    /// quantized, each off by at most half Q's step plus [`F32_SLACK`] (the
+    /// roundings between ik's f32 log-probability and a record's). ik's own
+    /// evaluation adds four f32 roundings per entry, two in `log p` and two in
+    /// `log p − logit + max`, of values below 128 nats while every logit is
+    /// below 64: 1.5e-5 at most, within one more [`F32_SLACK`]. Weighted by P's
+    /// mass, that is the band. An entry the cut keeps at Q's floor
+    /// ([`PosDiff::cut_at_q_floor`]) may stand for a lower log q, which only
+    /// raises ik's sum: with one, the band holds on the side where this sum
+    /// is the larger.
+    pub fn ik_kld_band(&self) -> f64 {
+        (f64::from(self.q_scale) / 2.0 + 2.0 * F32_SLACK) * self.p_mass
+    }
+
+    /// How far `nll_q` can sit from the NLL ik computes from Q's fresh
+    /// logits, in nats: half Q's step plus [`F32_SLACK`], one-sided (the
+    /// file's value can only be lower) when `next` is at Q's floor.
+    pub fn ik_nll_band(&self) -> f64 {
+        f64::from(self.q_scale) / 2.0 + F32_SLACK
+    }
+}
+
+/// The records of one scored position in P and in Q, entry by entry over the
+/// vocabulary: see [`PosDiff`]. The two are the same position of two files a
+/// [`Pair`] matched.
+pub fn compare(p: &Record<'_>, q: &Record<'_>) -> PosDiff {
+    let (sp, mp) = (f64::from(p.scale), f64::from(p.min_log_prob));
+    let (sq, mq) = (f64::from(q.scale), f64::from(q.min_log_prob));
+    let p_floor = mp.exp();
+    let (mut kld, mut cut, mut mass) = (0.0f64, 0.0f64, 0.0f64);
+    let mut cut_at_q_floor = 0u32;
+    let (mut top_p, mut best_p) = (0u32, 0u16);
+    let (mut top_q, mut best_q, mut q_top_count) = (0u32, 0u16, 0u32);
+    for (i, (a, b)) in (0u32..).zip(p.levels().zip(q.levels())) {
+        let lp = sp * f64::from(a) + mp;
+        let pa = if a == 0 { p_floor } else { lp.exp() };
+        let term = pa * (lp - (sq * f64::from(b) + mq));
+        kld += term;
+        mass += pa;
+        if p.scale * f32::from(a) + p.min_log_prob > IK_KLD_CUT {
+            cut += term;
+            cut_at_q_floor += u32::from(b == 0);
+        }
+        if a > best_p {
+            (top_p, best_p) = (i, a);
+        }
+        if b > best_q || i == 0 {
+            (top_q, best_q, q_top_count) = (i, b, 1);
+        } else if b == best_q {
+            q_top_count += 1;
+        }
+    }
+    PosDiff {
+        chunk: p.chunk,
+        pos: p.pos,
+        next: p.next,
+        kld,
+        kld_ik_cut: cut,
+        cut_at_q_floor,
+        p_mass: mass,
+        top_p,
+        top_q,
+        q_top_count,
+        nll_p: p.nll(),
+        nll_q: q.nll(),
+        q_next_at_floor: q.next_at_floor(),
+        q_scale: q.scale,
+    }
+}
+
+/// A run's result line: the last line of `tools/ref/ik-ppl.sh`'s log that
+/// opens with `ppl tag=<tag> `, read field by field (`key=value`, space
+/// separated).
+pub struct ResultLine {
+    log: PathBuf,
+    line: String,
+}
+
+impl ResultLine {
+    /// The result line of run `tag` in `log`; an error when the log has none.
+    pub fn read(log: &Path, tag: &str) -> Result<ResultLine, GateError> {
+        let raw = std::fs::read(log).map_err(|e| format!("cannot read {}: {e}", log.display()))?;
+        // ik's model-load lines carry bytes that are not UTF-8; the result
+        // line is ASCII.
+        let text = String::from_utf8_lossy(&raw);
+        let head = format!("ppl tag={tag} ");
+        let line = text
+            .lines()
+            .rev()
+            .find(|l| l.starts_with(&head))
+            .ok_or_else(|| format!("{} has no result line for {tag}", log.display()))?;
+        Ok(ResultLine {
+            log: log.to_path_buf(),
+            line: line.to_string(),
+        })
+    }
+
+    /// The text of field `key`; an error when the line has none.
+    pub fn text(&self, key: &str) -> Result<&str, GateError> {
+        self.line
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+            .ok_or_else(|| format!("{}: the result line has no {key}=", self.log.display()).into())
+    }
+
+    /// Field `key` parsed; an error naming the log and the key when it is
+    /// missing or does not parse.
+    pub fn parse<T>(&self, key: &str) -> Result<T, GateError>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        self.text(key)?
+            .parse()
+            .map_err(|e| format!("{}: {key}=: {e}", self.log.display()).into())
+    }
+}
+
 /// Positions ik scores in a chunk of `n_ctx`: `n_ctx/2 ..= n_ctx-2`.
 fn scored_per_chunk(n_ctx: usize) -> usize {
     n_ctx - 1 - n_ctx / 2
@@ -531,40 +778,16 @@ mod tests {
 
     impl RunLine {
         fn read(log: &Path, tag: &str) -> Result<RunLine, GateError> {
-            let raw =
-                std::fs::read(log).map_err(|e| format!("cannot read {}: {e}", log.display()))?;
-            // ik's model-load lines carry bytes that are not UTF-8; the
-            // result line is ASCII.
-            let text = String::from_utf8_lossy(&raw);
-            let head = format!("ppl tag={tag} ");
-            let line = text
-                .lines()
-                .rev()
-                .find(|l| l.starts_with(&head))
-                .ok_or_else(|| format!("{} has no result line for {tag}", log.display()))?;
-            let get = |k: &str| {
-                field(line, k)
-                    .ok_or_else(|| format!("{}: the result line has no {k}=", log.display()))
-            };
-            let bad = |k: &str, e: &dyn std::fmt::Display| format!("{}: {k}=: {e}", log.display());
-            let ppl_text = get("ppl")?.to_string();
+            let line = ResultLine::read(log, tag)?;
             Ok(RunLine {
-                ppl: ppl_text.parse().map_err(|e| bad("ppl", &e))?,
-                ctx: get("ctx")?.parse().map_err(|e| bad("ctx", &e))?,
-                chunks: get("chunks")?.parse().map_err(|e| bad("chunks", &e))?,
-                kld_bytes: get("kld_bytes")?
-                    .parse()
-                    .map_err(|e| bad("kld_bytes", &e))?,
-                model: get("model")?.to_string(),
-                ppl_text,
+                ppl: line.parse("ppl")?,
+                ppl_text: line.text("ppl")?.to_string(),
+                ctx: line.parse("ctx")?,
+                chunks: line.parse("chunks")?,
+                kld_bytes: line.parse("kld_bytes")?,
+                model: line.text("model")?.to_string(),
             })
         }
-    }
-
-    /// The value of `key=` among `line`'s space-separated fields.
-    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        line.split_whitespace()
-            .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
     }
 
     /// ik's quantizer for one position (`log_softmax`, the overload that
@@ -596,17 +819,149 @@ mod tests {
     /// A file of one chunk of four ids over a three-entry vocabulary — an odd
     /// one, so its record carries the pad — scored at position 2 against id 1.
     fn tiny_file(ids: [i32; 4], logits: &[f32; 3]) -> Vec<u8> {
-        let (scale, mlp, levels) = quantize(logits);
+        file_of(4, &ids, &[logits])
+    }
+
+    /// A base file in ik's layout: `ids` in chunks of `n_ctx`, then one record
+    /// per scored position, ik's quantizer applied to `rows` in file order.
+    fn file_of(n_ctx: usize, ids: &[i32], rows: &[&[f32]]) -> Vec<u8> {
+        let (n_vocab, n_chunk) = (rows[0].len(), ids.len() / n_ctx);
+        assert_eq!(rows.len(), n_chunk * scored_per_chunk(n_ctx));
         let mut b = MAGIC.to_vec();
-        for v in [4i32, 3, 1].into_iter().chain(ids) {
+        for v in [n_ctx, n_vocab, n_chunk] {
+            let v = i32::try_from(v).expect("a test file's sizes fit in i32");
             b.extend_from_slice(&v.to_le_bytes());
         }
-        b.extend_from_slice(&scale.to_le_bytes());
-        b.extend_from_slice(&mlp.to_le_bytes());
-        for q in levels.into_iter().chain([0]) {
-            b.extend_from_slice(&q.to_le_bytes());
+        for v in ids {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for row in rows {
+            let (scale, mlp, levels) = quantize(row);
+            b.extend_from_slice(&scale.to_le_bytes());
+            b.extend_from_slice(&mlp.to_le_bytes());
+            for q in levels
+                .into_iter()
+                .chain(std::iter::repeat_n(0, n_vocab % 2))
+            {
+                b.extend_from_slice(&q.to_le_bytes());
+            }
         }
         b
+    }
+
+    /// A row's log-probabilities in f64, from the logits.
+    fn log_softmax(logits: &[f32]) -> Vec<f64> {
+        let max = f64::from(logits.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        let sum: f64 = logits.iter().map(|&l| (f64::from(l) - max).exp()).sum();
+        logits
+            .iter()
+            .map(|&l| f64::from(l) - max - sum.ln())
+            .collect()
+    }
+
+    /// Two files of one text compared position by position against a KLD
+    /// known from the logits: within the band the two records' storage
+    /// derives (every entry within 24 nats of its row's maximum, so each is off
+    /// by at most half its step plus [`F32_SLACK`]); the entry P puts below
+    /// [`IK_KLD_CUT`] is the whole difference between the two sums; a tie at
+    /// Q's top level is counted and resolved to the first id; equal rows give
+    /// exactly 0, and so does a file against itself. The longer file is read
+    /// on the shorter one's chunks, and a file of another `n_ctx`, another
+    /// vocabulary or other ids is refused by name.
+    #[test]
+    fn two_files_compare_to_a_known_kld() {
+        let p_rows: [&[f32]; 6] = [
+            &[2.0, 0.5, -1.0, -3.0, -18.0],
+            &[0.5, 1.0, 0.0, -1.0, -2.0],
+            &[0.3, -0.2, 1.1, 0.4, -0.7],
+            &[0.0, 0.1, 0.2, 0.3, 0.4],
+            &[-1.0, 2.0, 0.0, 0.5, -0.5],
+            &[1.0, 0.0, -1.0, 0.0, 1.0],
+        ];
+        let q_rows: [&[f32]; 3] = [
+            &[1.5, 0.7, -0.8, -3.5, -17.0],
+            &[1.0, 1.0, 0.0, -1.0, -2.0],
+            &[0.3, -0.2, 1.1, 0.4, -0.7],
+        ];
+        let ids0 = [1, 2, 3, 4, 0, 1, 2, 3];
+        let ids = [ids0, [4, 3, 2, 1, 0, 4, 3, 2]].concat();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = std::env::temp_dir().join(format!(
+                "bloomery-kld-{}-pair-{name}.kld",
+                std::process::id()
+            ));
+            std::fs::write(&p, bytes).expect("the temp directory is writable");
+            let r = KldBase::open_own_vocab(&p);
+            let _ = std::fs::remove_file(&p);
+            r.unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        let p = write("p", &file_of(8, &ids, &p_rows));
+        let q = write("q", &file_of(8, &ids0, &q_rows));
+
+        let pair = Pair::new(&p, &q).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(pair.n_chunk(), 1);
+        let d: Vec<PosDiff> = pair.records().map(|(a, b)| compare(&a, &b)).collect();
+        assert_eq!(d.len(), 3);
+        let recs: Vec<(Record<'_>, Record<'_>)> = pair.records().collect();
+        for (k, (pr, qr)) in recs.iter().enumerate() {
+            let (lp, lq) = (log_softmax(p_rows[k]), log_softmax(q_rows[k]));
+            let ep = f64::from(pr.scale) / 2.0 + F32_SLACK;
+            let eq = f64::from(qr.scale) / 2.0 + F32_SLACK;
+            let (mut exact, mut band) = (0.0, 0.0);
+            for (a, b) in lp.iter().zip(&lq) {
+                exact += a.exp() * (a - b);
+                band += a.exp() * (ep.exp_m1() * (a - b).abs() + ep.exp() * (ep + eq));
+            }
+            assert!(
+                (d[k].kld - exact).abs() <= band,
+                "position {k}: kld {} vs exact {exact}, band {band:.3e}",
+                d[k].kld
+            );
+            assert_eq!((d[k].chunk, d[k].pos), (0, 4 + k));
+            assert_eq!(i64::from(d[k].next), i64::from(ids0[5 + k]));
+            assert!((d[k].p_mass - 1.0).abs() <= ep.exp_m1());
+        }
+        let t4 = pr_term(&recs[0], 4);
+        assert!(d[0].kld > 0.0 && d[0].kld_ik_cut != d[0].kld);
+        assert!((d[0].kld - d[0].kld_ik_cut - t4).abs() <= 1e-15);
+        assert_eq!(d[0].cut_at_q_floor, 0);
+        assert_eq!((d[1].top_p, d[1].top_q, d[1].q_top_count), (1, 0, 2));
+        assert_eq!((d[2].kld, d[2].kld_ik_cut), (0.0, 0.0));
+        assert_eq!(d[2].nll_p, d[2].nll_q);
+
+        let same = Pair::new(&p, &p).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(same.n_chunk(), 2);
+        for (a, b) in same.records() {
+            let s = compare(&a, &b);
+            assert_eq!(
+                (s.kld, s.kld_ik_cut, s.top_p, s.nll_p),
+                (0.0, 0.0, s.top_q, s.nll_q)
+            );
+        }
+
+        let refused = |other: &KldBase, word: &str| {
+            let e = Pair::new(&p, other)
+                .err()
+                .unwrap_or_else(|| panic!("{word}: paired"))
+                .to_string();
+            assert!(e.contains(word), "{word}: {e}");
+        };
+        refused(
+            &write("ctx", &tiny_file([2, 0, 1, 1], &[0.0, -1.0, -3.0])),
+            "n_ctx",
+        );
+        let row: &[f32] = &[0.0, 1.0, 2.0];
+        let small = [0, 1, 2, 0, 1, 2, 0, 1];
+        refused(&write("vocab", &file_of(8, &small, &[row; 3])), "n_vocab");
+        let mut moved = ids0;
+        moved[7] = 0;
+        refused(&write("ids", &file_of(8, &moved, &q_rows)), "ids differ");
+    }
+
+    /// Entry `i`'s term `p·(ln p − ln q)` from the stored values of a pair of
+    /// records.
+    fn pr_term((p, q): &(Record<'_>, Record<'_>), i: u32) -> f64 {
+        p.log_prob(i).exp() * (p.log_prob(i) - q.log_prob(i))
     }
 
     /// The reader decodes ik's layout — the scored position, its id, an NLL

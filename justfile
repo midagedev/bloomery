@@ -583,6 +583,11 @@ gate-gpu-ds41-woa:
 gate-gpu-ds41-attn:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_attn && bash tools/gpu-gate.sh gate_deepseek41_attn'
 
+# ik KLD 기준 파일 둘을 위치마다 비교한다(P = A, Q = B, 태그는 $BLOOMERY_DATA/ikppl 아래, 호스트만).
+# ARGS: --ubatch N(여러 번 줄 수 있다), --ik <ik-ppl --kld 태그>(ik가 찍은 요약과 밴드 안에서 맞는지).
+kld-diff A B *ARGS:
+    ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin kld_diff && bash tools/host-gate.sh kld_diff "$BLOOMERY_DATA/ikppl/{{A}}.kld" "$BLOOMERY_DATA/ikppl/{{B}}.kld" {{ARGS}}'
+
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
 # 들어가면 쓰레기를 낸다(upstream의 MMQ 경로, mainline이 양자화한 파일에서만). 그래서 argmax.sh가 --step-prefill(M=1 경로)로 먹인다 —
