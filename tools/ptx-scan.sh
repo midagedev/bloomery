@@ -22,8 +22,8 @@
 #                                     kernels and the two kv_append entries
 #   gate_p4 `norm_geometry`         — .reqntid of rms_norm and norm_quant == RMS_THREADS
 #   gate_p4 `argmax_geometry`       — .reqntid of argmax == ARGMAX_THREADS
-#   gate_p6 `router_shape`          — the fma floor and no depot for f32_gemv and q8_0_gemv, and
-#                                     .reqntid of router_topk and expert_table
+#   gate_p6 `router_shape`          — the fma floor and no depot for f32_gemv, q8_0_gemv and
+#                                     q8_0_gemv_heads, and .reqntid of router_topk and expert_table
 #   gate_p6 `q3k_half_decode_shape` — no clz and a hardware f16 convert in both Q3_K entries
 #
 # Mind the spelling: PTX writes a fused multiply-add as `fma.rn.f32` (and `fma.rm.f32`). There is
@@ -32,9 +32,10 @@
 #
 # Usage: tools/ptx-scan.sh <binary name> [entry substring]
 #   Reads target/release/<binary> and runs the extractor on its section. The recipe
-#   (`just ptx-scan <binary>`) builds both first. PTX_SCAN_PTXAS (default
-#   $CUDA_TOOLKIT_PATH/bin/ptxas, else /usr/local/cuda/bin/ptxas), PTX_SCAN_ARCH (default
-#   sm_86) and PTX_SCAN_EXTRACT (default target/release/oxart_ptx) override the tools.
+#   (`just ptx-scan <binary>`; `--features deepseek41` for a V4.1 binary) builds both first.
+#   PTX_SCAN_PTXAS (default $CUDA_TOOLKIT_PATH/bin/ptxas, else /usr/local/cuda/bin/ptxas),
+#   PTX_SCAN_ARCH (default sm_86) and PTX_SCAN_EXTRACT (default target/release/oxart_ptx)
+#   override the tools.
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
 #

@@ -12,6 +12,9 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # exports CUDA_VISIBLE_DEVICES for the timing card, which would move this runner silently.
 # shellcheck source=tools/ref/cards.sh
 source "${BASH_SOURCE[0]%/*}/cards.sh"
+# The witness fields; this runner waits for an idle 3090 instead of taking the lease.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 GPU_UUID=$GPU_3090
 
 wait_gpu() {
@@ -31,15 +34,7 @@ wait_gpu() {
   echo "[wait_gpu] proceeding after 15 min wait" >&2
 }
 
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,power.draw --format=csv
-  echo "compute-apps-3090:"
-  nvidia-smi --query-compute-apps=pid,used_memory --format=csv -i "$GPU_UUID"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "model: $MODEL_NAME"
-  echo "pressure-io avg10: $(grep '^some' /proc/pressure/io | head -n 1)"
-}
+WITNESS=(head stage0-gpus stage0-apps loadavg model pressure-io-avg10)
 
 bash tools/ref/build.sh
 export BLOOMERY_DATA

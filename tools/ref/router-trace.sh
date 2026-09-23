@@ -35,6 +35,9 @@ set -euo pipefail
 # MODEL, IK, BLOOMERY_DATA, MODEL_NAME, REF_TOKENS, REF_CTX and REF_SET_CPU come from the profile.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 ROUTER=$BLOOMERY_DATA/router
 BIN=$ROUTER/bin/router_trace
 BOUND=${BLOOMERY_ROUTER_BOUND:-1800}
@@ -91,27 +94,10 @@ LOG=$ROUTER/$NAME.log
 exec > >(tee "$LOG") 2>&1
 echo "router-trace.sh: corpus $CORPUS ($IDS, md5 $MD5) -> $ROUTER/$NAME, chunk $CHUNK, n_ctx $CTX, bound ${BOUND}s, ik $BUILD"
 
-# witness <tag>: the machine state the lease is supposed to guarantee, as one block. The device
-# is the one the model file lives on; its sector count is machine-wide, so under the lease the
-# difference between the two blocks is what this trace paged in.
-witness() {
-  local dev sectors
-  dev=$(df --output=source "$MODEL" 2>/dev/null | tail -n 1) || true
-  sectors=$(awk '{print $3}' "/sys/class/block/${dev#/dev/}/stat" 2>/dev/null || echo '?')
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) epoch $(date +%s) ---"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  echo "mem: $(grep -E '^(MemAvailable|Cached):' /proc/meminfo | tr -s ' ' | tr '\n' ' ')"
-  echo "pgmajfault: $(awk '$1 == "pgmajfault" {print $2}' /proc/vmstat)"
-  echo "read-sectors: $sectors ($dev, 512 B each)"
-  echo "lock-holder-pid: $$"
-  echo "model: $MODEL_NAME"
-}
-LOCK=/root/bloomery-cpu.lock
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min" >&2; exit 75; }
-echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+# dump.sh's witness fields: read-sectors is the model file's device, so the difference between the
+# two blocks is what this trace paged in.
+WITNESS=(head-epoch loadavg pressure-io mem pgmajfault read-sectors lock-holder model)
+lease_take
 witness pre-trace
 
 # The harness lives outside this tree's target/, where `just box-gc` looks, so the pid it runs
@@ -130,7 +116,7 @@ echo "router-trace.sh: harness under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/nu
 wait "$pid" || rc=$?
 rm -f "$PIDFILE"
 witness post-trace
-exec 9>&-
+lease_release
 if [ "$rc" != 0 ]; then
   echo "router-trace.sh: the harness exited $rc$([ "$rc" = 124 ] && echo " — cut off at ${BOUND}s") — nothing installed" >&2
   exit "$rc"

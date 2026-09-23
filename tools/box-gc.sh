@@ -20,6 +20,15 @@
 # An exe that reads "<path> (deleted)" is still a match: a rebuilt-away orphan is exactly the
 # process this is here to collect.
 #
+# The reference harnesses (dump_ref, argmax_ref, the *_ref and *_rate kernels, router_trace) are
+# built outside every track's target/, into the shared $BLOOMERY_DATA/bin and
+# $BLOOMERY_DATA/router/bin, so their exe alone says nothing about whose they are. A runner starts
+# them from its track's root (tools/box.sh cd's there), so a harness counts as this track's when its
+# exe is in one of those two directories AND its cwd is inside root: another track's harness, or
+# the lead's, has its cwd in that track's own directory and is never selected. Without
+# BLOOMERY_DATA in the environment (box-tracks.sh pipes this script over plain ssh) only target/
+# is scanned; --check still sees such a harness through its cwd.
+#
 # Killing is TERM, then up to five seconds of `kill -0` on the pids we were handed at start,
 # then KILL. Signals go to those pids and to nothing found later: a pid discovered by a
 # pattern after the fact is the class of mistake above.
@@ -31,6 +40,10 @@ case "${1:-}" in
 esac
 ROOT=${1:-$PWD}
 PREFIX="$ROOT/target"
+HARNESS=()
+if [ -n "${BLOOMERY_DATA:-}" ]; then
+  HARNESS=("$BLOOMERY_DATA/bin" "$BLOOMERY_DATA/router/bin")
+fi
 
 self=$$
 anc=" $self "
@@ -51,7 +64,7 @@ while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ]; do
   [ -n "$p" ] || break
   anc="$anc$p "
 done
-echo "box-gc: mode=$MODE prefix=$PREFIX self=$self never-candidates=[${anc# }]"
+echo "box-gc: mode=$MODE prefix=$PREFIX harness=[${HARNESS[*]}] (cwd inside $ROOT) self=$self never-candidates=[${anc# }]"
 
 pids=()
 exes=()
@@ -62,6 +75,16 @@ for d in /proc/[0-9]*; do
   case "$exe" in
     "$PREFIX"/*) pids+=("$pid"); exes+=("$exe"); continue ;;
   esac
+  harness=0
+  for h in "${HARNESS[@]}"; do
+    case "$exe" in "$h"/*) harness=1 ;; esac
+  done
+  if [ "$harness" = 1 ]; then
+    cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
+    case "$cwd" in
+      "$ROOT" | "$ROOT"/*) pids+=("$pid"); exes+=("$exe (cwd $cwd)"); continue ;;
+    esac
+  fi
   if [ "$MODE" = --check ]; then
     cwd=$(readlink "$d/cwd" 2>/dev/null) || continue
     case "$cwd" in
@@ -73,7 +96,7 @@ done
 for i in "${!pids[@]}"; do
   echo "proc ${pids[$i]} ${exes[$i]}"
 done
-echo "box-gc: found ${#pids[@]} process(es) under $PREFIX"
+echo "box-gc: found ${#pids[@]} process(es) under $PREFIX or harness dirs"
 
 if [ "${#pids[@]}" -eq 0 ]; then
   echo gc-done

@@ -287,7 +287,7 @@ measure-qdot-rate *ARGS:
 # (gate+up 묶음 하나, swiglu를 품은 down 하나)를 돌리고, 층 여덟의 expert마다 gate·up·swiglu·down 여섯 행을 같은 바이트의
 # f64 참조와 대조한다(밴드 1e-5). 층마다 샤드 지도와 작업 집합의 상주율도 찍는다.
 bench-cpu-v41-host-check:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-model --bin bench_v41_host && timeout --kill-after=10 900 ./target/release/bench_v41_host --check'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/host-gate.sh bench_v41_host --check'
 
 # 같은 벤치의 시간(리드 전용): 스레드 8·16·24·30·32마다 팔 넷(엔진 모양 n_host 6·5·3, 행렬별 디스패치 6)의 토큰당 ms·GB/s,
 # 디스패치 수, 상주율. CPU 임대·증인·낡은 바이너리 거부는 host-rate.sh가 쥔다. 조용한 틈에 돈다 — 빌드가 도는 동안 잰
@@ -549,7 +549,7 @@ gate-ds41-oracle:
 # V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, V4.1 오라클 세트(배치 세트와 디코드 스텝 세트)의
 # 그래프 입력 전부를 계획과 비트 단위로 대조한다. 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
 gate-ds41-plan:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && timeout --kill-after=10 900 ./target/release/gate_deepseek41_plan'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && bash tools/host-gate.sh gate_deepseek41_plan'
 
 # V4.1 rope 계열(머리 꼬리 rope, ROPE_BACK, 잠재 K/V의 norm·rope·f16 링 기록)을 5토큰 세트와 디코드 스텝 세트 전부에 대조한다.
 # rope 사이트는 ik와 비트 동일, K/V 행은 유도한 밴드 안이어야 한다. 게이트가 V4.1 파일의 메타데이터를 읽으므로 모델을 고정한다.
@@ -599,5 +599,20 @@ gate-gpu-p8b *ARGS:
 
 # PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
-ptx-scan BIN *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
+# The binary's cargo features: `--features deepseek41` for a V4.1 gate binary (default gpu).
+[arg("FEATURES", long="features")]
+ptx-scan BIN FEATURES='gpu' *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
+
+# SASS twin of ptx-scan: loads issued before the first wait, per loop and along one path (`<entry> n,t,…`; `<entry> list` prints the listing).
+[arg("FEATURES", long="features")]
+sass-scan BIN FEATURES='gpu' *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/sass-scan.sh {{BIN}} {{ARGS}}'
+
+# Verdict diff (Mac): run recipes in two trees and diff their output with build lines, times, pids and thread ids masked.
+verdict-diff *ARGS:
+    python3 tools/verdict-diff.py {{ARGS}}
+
+# Interleaved GPU A/B over (tree, env) arms through the timing recipes — lead-only; `run --dry-run` prints the plan.
+gpu-ab *ARGS:
+    python3 tools/gpu-ab.py {{ARGS}}

@@ -16,30 +16,19 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 export BLOOMERY_DATA
-LOCK=/root/bloomery-cpu.lock
-TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
+TOKENS=${BLOOMERY_DECODE_TOKENS:-$REF_TOKENS}
 # 기본이 2 스텝인 이유: 이 표가 답하는 질문은 배분이고 배분은 스텝 하나로 정해진다.
 # 스텝을 늘리면 임대만 길어진다. 평탄성은 decode-measure.sh 가 재는 다른 질문이다.
 N=${BLOOMERY_DECODE_N:-2}
-BIN=${BLOOMERY_DECODE_BIN:-target/release/bloomery-decode}
+BIN=${BLOOMERY_DECODE_BIN:-$DECODE_BIN}
 [ -x "$BIN" ] || { echo "no decode binary at $BIN — run: just build-decode" >&2; exit 2; }
 
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
-  echo "lock-holder-pid: $$"
-  echo "model: $MODEL_NAME"
-  # 임대를 모르는 남의 프로세스는 이 줄에서만 보인다.
-  echo "busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
-}
+WITNESS=(head loadavg pressure-cpu pressure-io gpus lock-holder model busiest)
 
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+lease_take
 
 for lvl in ${BLOOMERY_PROFILE_LEVELS:-1 2}; do
   echo

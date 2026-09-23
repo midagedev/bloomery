@@ -13,32 +13,20 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 export BLOOMERY_DATA
-LOCK=/root/bloomery-cpu.lock
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 # 오라클과 프롬프트 파일이 공유하는 id 0 = "The capital of France is".
-TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
+TOKENS=${BLOOMERY_DECODE_TOKENS:-$REF_TOKENS}
 N=${BLOOMERY_DECODE_N:-8}
-BIN=${BLOOMERY_DECODE_BIN:-target/release/bloomery-decode}
+BIN=${BLOOMERY_DECODE_BIN:-$DECODE_BIN}
 [ -x "$BIN" ] || { echo "no decode binary at $BIN — run: just build-decode" >&2; exit 2; }
 
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  # 스레드 수는 이제 결과를 바꾸는 변수다. 증인 줄에 없으면 다른 날의 행과 비교할 때
-  # 무엇이 달랐는지 알 방법이 없다 — 빈 값은 "기본값(물리 코어 수)"을 뜻한다.
-  echo "threads: BLOOMERY_THREADS=${BLOOMERY_THREADS:-<default>} spin=${BLOOMERY_SPIN:-<default>}"
-  echo "model: $MODEL_NAME"
-  nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
-  echo "lock-holder-pid: $$"
-  # 임대를 모르는 남의 프로세스는 이 줄에서만 보인다.
-  echo "busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
-}
+# The thread count changes the result, so the witness carries it: without it, a row from another
+# day could not say what differed.
+WITNESS=(head loadavg pressure-cpu pressure-io threads model gpus lock-holder busiest)
 
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+lease_take
 
 witness pre-bloomery
 "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N"

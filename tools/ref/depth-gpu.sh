@@ -59,29 +59,18 @@ ARMS_SPEC=${BLOOMERY_GPU_ARMS:-6:512 ik:0 1024:1120 ik:1024 4096:4192 ik:4096}
 # 카드 핀·증인 줄·옆 카드 판정·바이너리 신선도는 러너 넷이 같은 파일에서 읽는다.
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
-LOCK=/root/bloomery-cpu.lock
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 assert_fresh_binary "$BIN" || exit $?
 [ -x "$IKBIN" ] || { echo "no llama-bench at $IKBIN" >&2; exit 2; }
 
-# 행마다 전후로 남기는 증인. 공통 줄은 timing-card.sh가 낸다 — 여기서는 머리와 이 러너만 쓰는
-# busiest 줄을 더한다.
-witness() {
-  echo "--- witness $1 $(now)"
-  witness_card
-  echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
-  echo "    model: $MODEL_NAME"
-}
+# The witness before and after every row: the timing card's lines, then this runner's busiest line.
+WITNESS=(head-open indent card busiest model)
 
-# 깊이 d의 프롬프트: BOS(100000) 뒤에 LCG 난수 id [1000, 91000). depth-decode.sh와 같은 수열이다.
-prompt() {
-  awk -v n="$1" 'BEGIN{s=12345; printf "100000"; for(i=1;i<n;i++){s=(s*1103515245+12345)%2147483648; printf ",%d", 1000+(s%90000)}}'
-}
 med() { sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}'; }
 
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] held by pid $$ at $(now)"
+lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} ik_flags=$IK_GPU_FLAGS"
 echo "[config] arms=$ARMS_SPEC"
 echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -131,7 +120,7 @@ for r in $(seq "$ROUNDS"); do
             ;;
           *)
             dep=${a%%:*}; rest=${a#*:}; ctx=${rest%%:*}
-            toks=$(prompt "$dep"); label="lcg$env_tag"
+            toks=$(lcg_prompt "$dep"); label="lcg$env_tag"
             ;;
         esac
         n=$N; case $rest in *:*) n=${rest#*:} ;; esac

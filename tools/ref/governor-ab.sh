@@ -6,14 +6,15 @@ set -uo pipefail
 # 같은 파일이 소유한다.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-TOKENS=100000,549,6077,280,7239,317
-BIN=target/release/bloomery-decode
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
+TOKENS=$REF_TOKENS
+BIN=$DECODE_BIN
 G=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
 ORIG=$(cat "$G")
 setgov() { for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo "$1" > "$f"; done; }
 trap 'setgov "$ORIG"; echo "governor restored: $(cat $G)"' EXIT
-exec 9>/root/bloomery-cpu.lock
-flock -w 1800 9 || exit 75
+lease_take
 echo "orig governor=$ORIG load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2)"
 for r in 1 2 3; do for gov in "$ORIG" performance; do
   setgov "$gov"; sleep 2

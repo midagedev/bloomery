@@ -13,11 +13,13 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 export BLOOMERY_DATA
-LOCK=/root/bloomery-cpu.lock
 # The card pin, the witness lines and the stale-binary refusal are the same code the three
 # depth/profile runners use; this runner used to pin the 3090 by hand and print no card name.
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 NAME=${1:?usage: time-gate.sh <gate_bin_name> [extra args...]}
 shift
 ARGS=("$@")
@@ -26,15 +28,8 @@ if [ ${#ARGS[@]} -eq 0 ]; then
 fi
 BIN=target/release/$NAME
 assert_fresh_binary "$BIN" || exit $?
-witness() {
-  echo "--- witness $1 $(now) ---"
-  witness_card
-  echo "    model: $MODEL_NAME"
-}
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] held by pid $$ at $(now)"
+WITNESS=(head indent card model)
+lease_take
 witness pre
 # `|| rc=$?`, not a bare `rc=$?`: under `set -e` a non-zero gate exits the script on the
 # spot, and the post witness and the rc line never print (measured 2026-09-21 — a FAIL-first

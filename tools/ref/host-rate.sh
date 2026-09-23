@@ -15,7 +15,9 @@
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-LOCK=/root/bloomery-cpu.lock
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 BIN=target/release/bench_v41_host
 THREADS="8 16 24 30 32"
 if [ "${1:-}" = --threads ]; then
@@ -54,25 +56,9 @@ if [ -n "$newer" ]; then
 fi
 echo "[binary] $BIN sha256=$BIN_SHA mtime=$BIN_MTIME (newer than every file in its dep-info)"
 
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
-  echo "gpu-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr '\n' ';')]"
-  echo "lock-holder-pid: $$"
-  echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
-  echo "cpu-mhz min/max: $(awk '$1 == "cpu" && $2 == "MHz" { if (lo == "" || $4 < lo) lo = $4; if ($4 > hi) hi = $4 } END { print lo, hi }' /proc/cpuinfo)"
-  echo "meminfo cached/free kB: $(awk '/^Cached:/{c=$2} /^MemFree:/{f=$2} END{print c, f}' /proc/meminfo)"
-  echo "binary: $BIN sha256=$BIN_SHA"
-  echo "model: $MODEL_NAME"
-}
+WITNESS=(head loadavg pressure-cpu pressure-io gpus gpu-apps lock-holder cpu cpu-mhz-range meminfo binary model)
 
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+lease_take
 witness pre
 start=$(date +%s)
 rc=0

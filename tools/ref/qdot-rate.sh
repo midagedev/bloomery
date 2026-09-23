@@ -9,7 +9,9 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 export BLOOMERY_DATA
-LOCK=/root/bloomery-cpu.lock
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 ROUNDS=${1:-3}
 CORE=${BLOOMERY_RATE_CORE:-2}
 RUST=target/release/qdot-rate
@@ -19,22 +21,10 @@ case "$ROUNDS" in ''|*[!0-9]*|0) echo "qdot-rate.sh: rounds must be a positive i
 for n in $IK_RATES; do
   [ -x "$BLOOMERY_DATA/bin/$n" ] || { echo "no $BLOOMERY_DATA/bin/$n — run: just build-ref" >&2; exit 2; }
 done
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
-  echo "lock-holder-pid: $$"
-  echo "core: $CORE ($(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //'))"
-  echo "cpu-mhz: $(awk -v c="$CORE" '$1 == "processor" { p = $3 } $1 == "cpu" && $2 == "MHz" && p == c { print $4; exit }' /proc/cpuinfo)"
-}
+WITNESS=(head loadavg pressure-cpu pressure-io gpus lock-holder core core-mhz)
 ik_arm() { for n in $IK_RATES; do taskset -c "$CORE" "$BLOOMERY_DATA/bin/$n"; done; }
 rust_arm() { taskset -c "$CORE" "$RUST"; }
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+lease_take
 witness pre
 for r in $(seq 1 "$ROUNDS"); do
   if [ $((r % 2)) = 1 ]; then

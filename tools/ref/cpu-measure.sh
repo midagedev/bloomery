@@ -8,25 +8,16 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 export BLOOMERY_DATA
-LOCK=/root/bloomery-cpu.lock
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 # 워크스페이스로 합친 뒤 바이너리는 레포 루트 target/에 떨어진다(2026-09-19).
 # 옛 경로(crates/q3k-cpu/target)에 낡은 바이너리가 남아 있으면 그걸 재게 되므로,
 # 경로가 없으면 조용히 넘어가지 않고 죽는다.
 RUST=${BLOOMERY_CPU_RUST:-target/release/q3k-cpu}
 [ -x "$RUST" ] || { echo "no rust binary at $RUST — run: just build-cpu" >&2; exit 2; }
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
-  echo "lock-holder-pid: $$"
-  echo "model: $MODEL_NAME"
-}
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+WITNESS=(head loadavg pressure-cpu pressure-io gpus lock-holder model)
+lease_take
 witness pre-ref
 "$BLOOMERY_DATA/bin/q3k_cpu_ref"
 witness post-ref

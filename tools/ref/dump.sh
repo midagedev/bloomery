@@ -50,6 +50,9 @@ set -euo pipefail
 # override them).
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 case $BACKEND in
   cpu)  SET=$REF_SET_CPU;  NGL=0;  HIDE_CUDA=1 ;;
@@ -121,28 +124,11 @@ for lib in libllama.so libggml.so; do
   esac
 done
 
-# witness <tag>: the machine state the lease is supposed to guarantee, as one block. The device
-# is the one the model file lives on; its sector count is machine-wide, so under the lease the
-# difference between the two blocks is what this dump paged in.
-witness() {
-  local dev sectors
-  dev=$(df --output=source "$MODEL" 2>/dev/null | tail -n 1) || true
-  sectors=$(awk '{print $3}' "/sys/class/block/${dev#/dev/}/stat" 2>/dev/null || echo '?')
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) epoch $(date +%s) ---"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  echo "mem: $(grep -E '^(MemAvailable|Cached):' /proc/meminfo | tr -s ' ' | tr '\n' ' ')"
-  echo "pgmajfault: $(awk '$1 == "pgmajfault" {print $2}' /proc/vmstat)"
-  echo "read-sectors: $sectors ($dev, 512 B each)"
-  echo "lock-holder-pid: $$"
-  echo "model: $MODEL_NAME"
-}
+# The machine state the lease is supposed to guarantee: read-sectors is the model file's device, so
+# the difference between the two blocks is what this dump paged in.
+WITNESS=(head-epoch loadavg pressure-io mem pgmajfault read-sectors lock-holder model)
 if [ "$LEASE" = 1 ]; then
-  LOCK=/root/bloomery-cpu.lock
-  exec 9>"$LOCK"
-  echo "[lease] waiting for $LOCK ..."
-  flock -w 1800 9 || { echo "[lease] timed out after 30 min" >&2; exit 75; }
-  echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+  lease_take
   witness pre-dump
 fi
 

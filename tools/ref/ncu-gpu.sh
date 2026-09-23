@@ -47,10 +47,12 @@ SKIP_STEPS=${BLOOMERY_NCU_SKIP_STEPS:-1}
 # 표(재생당 런치 수)에서 읽어 넘긴다. BLOOMERY_NCU_SKIP은 절대값 덮어쓰기.
 PER_STEP=${BLOOMERY_NCU_PER_STEP:-54}
 OUTDIR=${BLOOMERY_NCU_OUT:-$BLOOMERY_DATA/ncu}
-LOCK=/root/bloomery-cpu.lock
 # 카드 핀·증인 줄·바이너리 신선도는 러너 넷이 같은 파일에서 읽는다.
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 
 # 섹션으로 묻는다(개별 메트릭 이름은 드라이버·ncu 판마다 흔들린다). 이 넷이 답하는 것:
 #   SpeedOfLight       — 이 커널이 계산에 붙었나 메모리에 붙었나, 각각 피크의 몇 %인가
@@ -76,21 +78,9 @@ assert_fresh_binary "$BIN" || exit $?
 [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
 mkdir -p "$OUTDIR"
 
-witness() {
-  echo "--- witness $1 $(now)"
-  witness_card
-  echo "    model: $MODEL_NAME"
-}
+WITNESS=(head-open indent card model)
 
-# depth-gpu.sh와 같은 LCG 수열. 두 표가 같은 프롬프트를 말해야 나란히 읽힌다.
-prompt() {
-  awk -v n="$1" 'BEGIN{s=12345; printf "100000"; for(i=1;i<n;i++){s=(s*1103515245+12345)%2147483648; printf ",%d", 1000+(s%90000)}}'
-}
-
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] held by pid $$ at $(now)"
+lease_take
 echo "[config] ncu=$($NCU --version | sed -n 3p) mode=$MODE kernels='${KERNELS}' count=$COUNT depths='$DEPTHS'"
 echo "[config] sections='$SECTIONS' out=$OUTDIR"
 witness pre
@@ -125,7 +115,7 @@ for d in $DEPTHS; do
          --graph-profiling node --launch-skip "$skip" --launch-count "$COUNT" \
          "${kern_args[@]}" "${sec_args[@]}" "${met_args[@]}" \
          --csv --log-file "$out.csv" \
-         "$BIN" --tokens "$(prompt "$d")" -n 3 --ctx "$ctx" --mode "$MODE" \
+         "$BIN" --tokens "$(lcg_prompt "$d")" -n 3 --ctx "$ctx" --mode "$MODE" \
          > "$out.txt" 2>&1
   rc=$?
   witness "post d=$d"

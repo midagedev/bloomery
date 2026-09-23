@@ -11,31 +11,25 @@ set -uo pipefail
 # 같은 파일이 소유한다.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-TOKENS=${BLOOMERY_DECODE_TOKENS:-100000,549,6077,280,7239,317}
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
+TOKENS=${BLOOMERY_DECODE_TOKENS:-$REF_TOKENS}
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
 # BLOOMERY_AB_ENVS="K=V;K=V K2=V2": 현재 트리의 같은 바이너리를 env만 바꿔 팔로 더 넣는다
 # (바이트가 같은 레버의 A/B — 빌드 둘의 링크 배치 차이가 끼지 않는다).
 IFS=';' read -r -a envs <<< "${BLOOMERY_AB_ENVS:-}"
-# 트리 이름 → 바이너리 경로. 사전 검사와 본 루프가 같은 규칙을 쓰게 하는 한 곳
-# (둘이 갈리면 "있다"고 확인한 것과 다른 파일을 잰다).
-bin_of() { echo "$HOME/repo/$1/target/release/bloomery-decode"; }
 # 현재 트리 이름: 트리 팔 목록에 자동으로 들어가고, env 팔이 도는 바이너리이기도 하다.
 here=$(basename "$PWD")
 bins=()
 for d in "$@" "$here"; do
-  b=$(bin_of "$d")
+  b=$(decode_bin "$d")
   [ -x "$b" ] || { echo "no decode binary at $b — run just build-decode in that tree" >&2; exit 2; }
   bins+=("$d")
 done
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
-  # 임대를 모르는 남의 프로세스는 이 줄에서만 보인다(다른 세션의 llama-server가 A/B를 오염시킨 적 있다).
-  echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
-  echo "    model: $MODEL_NAME"
-}
-exec 9>/root/bloomery-cpu.lock
-flock -w 1800 9 || { echo "[lease] timed out" >&2; exit 75; }
+WITNESS=(head-load indent busiest model)
+lease_take
 # 러너가 실제로 읽은 값. 맥 셸의 BLOOMERY_AB_* 는 ssh를 그냥 넘지 않는다(레시피가 실어 보낸다) —
 # 이 줄이 없으면 "env가 박스에 닿았나"를 바퀴 수를 세어 추측해야 했다.
 echo "[config] rounds=$ROUNDS n=$N trees=${bins[*]} envs=${BLOOMERY_AB_ENVS:-} ik=${BLOOMERY_AB_IK:-0}"
@@ -56,7 +50,7 @@ for r in $(seq "$ROUNDS"); do
     esac
     # env 팔의 "K=V K2=V2"를 단어로 나눠 넘긴다 — depth-gpu.sh의 arm_env와 같은 철자(글롭 전개 없음).
     read -r -a e_args <<< "$e"
-    out=$(env ${e_args[@]+"${e_args[@]}"} "$(bin_of "$d")" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
+    out=$(env ${e_args[@]+"${e_args[@]}"} "$(decode_bin "$d")" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
     toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
     pre=$(echo "$out" | grep -E '^prefill' | sed 's/.*= //')
     med=$(echo "$out" | awk '/^ +[0-9]+ +[0-9]+ +[0-9.]+ /{print $3}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')

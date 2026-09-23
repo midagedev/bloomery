@@ -6,24 +6,25 @@
 #   source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 #
 # What it owns, so that four runners cannot drift apart:
-#   the two card UUIDs and which one is the timing card; CUDA_VISIBLE_DEVICES; the witness
-#   lines every runner prints; what to do when the other card is busy; and the refusal that
-#   keeps a runner from timing a binary older than the sources it was built from.
+#   which card is the timing card; CUDA_VISIBLE_DEVICES; the timing card's witness lines (the
+#   `card` field of the witness block, which lease.sh owns); what to do when the other card is
+#   busy; and the refusal that keeps a runner from timing a binary older than its sources.
 #
 # Timed numbers are taken on the A6000 and this overrides the 3090 pin in the box env file.
 # The 3090 is the gate-and-build card. Numbers from the two cards never belong in one table,
 # which is why the first witness line names the card and its power limit.
 # shellcheck source=tools/ref/cards.sh
 source "${BASH_SOURCE[0]%/*}/cards.sh"
+# now(), the lease and the witness block. guard_other below prints a witness block on its abort path.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 TIMING_GPU=${BLOOMERY_TIMING_GPU:-$GPU_A6000}
 if [ "$TIMING_GPU" = "$GPU_3090" ]; then OTHER_GPU=$GPU_A6000; else OTHER_GPU=$GPU_3090; fi
 export CUDA_VISIBLE_DEVICES=$TIMING_GPU
 
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-
-# The witness lines shared by every runner. A caller's own witness() prints the header, calls
-# this, and appends whatever else it wants. loadavg is not the quiet-machine signal (see
-# docs/quiet-machine.md in rig-log): IO pressure and the actual process list are.
+# The timing card's witness lines: the `card` field of lease.sh's witness block. loadavg is not the
+# quiet-machine signal (see docs/quiet-machine.md in rig-log): IO pressure and the actual process
+# list are.
 witness_card() {
   echo "    timing-card: $(nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv,noheader -i "$TIMING_GPU")"
   [ -z "${BIN_SHA:-}" ] || echo "    binary: ${BIN_PATH:-?} sha256=$BIN_SHA mtime=${BIN_MTIME:-?}"
@@ -37,15 +38,10 @@ witness_card() {
 # round's gate or build: it is recorded, not obeyed — whether the timing card's numbers move
 # with load on the other card is a question this witness column will answer later, and it has
 # never been measured. BLOOMERY_OTHER_STRICT=1 aborts instead.
-# The default witness block. Every runner defines its own right after sourcing this file and
-# that definition wins; this one exists so guard_other below does not depend on the caller
-# having done so — an abort path that calls an undefined function prints nothing where the
-# record matters most.
-witness() {
-  echo "--- witness $1 $(now)"
-  witness_card
-  echo "    model: ${MODEL_NAME:-?}"
-}
+# The default witness fields. Every runner sets its own WITNESS right after sourcing this file and
+# that list wins; this one exists so guard_other below does not depend on the caller having done
+# so — an abort path that prints no witness loses the record where it matters most.
+WITNESS=(head-open indent card model)
 
 guard_other() {
   local apps

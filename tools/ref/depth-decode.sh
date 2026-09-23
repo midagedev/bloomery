@@ -14,27 +14,20 @@ set -uo pipefail
 # 같은 파일이 소유한다.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
 DEPTHS=${BLOOMERY_DEPTHS:-6 1024 4096}
 trees=()
 for d in "$@" "$(basename "$PWD")"; do
-  b="$HOME/repo/$d/target/release/bloomery-decode"
+  b=$(decode_bin "$d")
   [ -x "$b" ] || { echo "no decode binary at $b — run just build-decode in that tree" >&2; exit 2; }
   trees+=("$d")
 done
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
-  echo "    busiest: $(ps -eo comm,pcpu --sort=-pcpu --no-headers | head -n 4 | awk '{printf "%s %s%% | ", $1, $2}')"
-  echo "    model: $MODEL_NAME"
-}
-# 깊이 d의 프롬프트: BOS(100000) 뒤에 LCG 난수 id [1000, 91000). 값은 시간에 안 걸린다 —
-# 디코드 스텝은 어떤 토큰이든 층마다 전문가 여섯과 캐시된 키 전부를 읽는다.
-prompt() {
-  awk -v n="$1" 'BEGIN{s=12345; printf "100000"; for(i=1;i<n;i++){s=(s*1103515245+12345)%2147483648; printf ",%d", 1000+(s%90000)}}'
-}
-exec 9>/root/bloomery-cpu.lock
-flock -w 1800 9 || { echo "[lease] timed out" >&2; exit 75; }
+WITNESS=(head-load indent busiest model)
+lease_take
 witness pre
 # 팔 목록: 깊이마다 트리 팔("tree:<dir>:<depth>")을 세운 뒤 ik 팔 — 같은 깊이의 비교가 임대 안에서
 # 이웃하도록. 바퀴마다 한 칸씩 돈다(위치 편향 — ab-decode.sh와 같은 이유).
@@ -50,7 +43,9 @@ for r in $(seq "$ROUNDS"); do
     case $a in
       tree:*)
         rest=${a#tree:}; dir=${rest%:*}; dep=${rest##*:}
-        out=$("$HOME/repo/$dir/target/release/bloomery-decode" -m "$MODEL" --tokens "$(prompt "$dep")" -n "$N" 2>&1) || { echo "r$r $dir d=$dep FAILED" >&2; echo "$out" | tail -n 5 >&2; exit 1; }
+        # The prompt of depth d is lcg_prompt's. Its values do not reach the time: a decode step
+        # reads six experts per layer and every cached key whatever the token is.
+        out=$("$(decode_bin "$dir")" -m "$MODEL" --tokens "$(lcg_prompt "$dep")" -n "$N" 2>&1) || { echo "r$r $dir d=$dep FAILED" >&2; echo "$out" | tail -n 5 >&2; exit 1; }
         toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
         pre=$(echo "$out" | grep -E '^prefill' | sed 's/.*= //')
         [ -n "$toks" ] || { echo "r$r $dir d=$dep produced no decode line" >&2; exit 1; }

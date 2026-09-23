@@ -33,30 +33,20 @@ MODE=${BLOOMERY_NSYS_MODE:-graph}
 NGEN=${BLOOMERY_NSYS_N:-4}
 OUTDIR=${BLOOMERY_NSYS_OUT:-$BLOOMERY_DATA/nsys}
 TOP=${BLOOMERY_NSYS_TOP:-24}
-LOCK=/root/bloomery-cpu.lock
 # 카드 핀·증인 줄·바이너리 신선도는 러너 넷이 같은 파일에서 읽는다.
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 
 assert_fresh_binary "$BIN" || exit $?
 [ -x "$NSYS" ] || { echo "no nsys at $NSYS" >&2; exit 2; }
 mkdir -p "$OUTDIR"
 
-witness() {
-  echo "--- witness $1 $(now)"
-  witness_card
-  echo "    model: $MODEL_NAME"
-}
+WITNESS=(head-open indent card model)
 
-# depth-gpu.sh·ncu-gpu.sh와 같은 LCG 수열.
-prompt() {
-  awk -v n="$1" 'BEGIN{s=12345; printf "100000"; for(i=1;i<n;i++){s=(s*1103515245+12345)%2147483648; printf ",%d", 1000+(s%90000)}}'
-}
-
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] held by pid $$ at $(now)"
+lease_take
 echo "[config] nsys=$($NSYS --version) mode=$MODE n=$NGEN depths='$DEPTHS' out=$OUTDIR"
 witness pre
 
@@ -69,7 +59,7 @@ for d in $DEPTHS; do
   witness "pre d=$d"
   "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false \
           -o "$out" --force-overwrite true \
-          "$BIN" --tokens "$(prompt "$d")" -n "$NGEN" --ctx "$ctx" --mode "$MODE" \
+          "$BIN" --tokens "$(lcg_prompt "$d")" -n "$NGEN" --ctx "$ctx" --mode "$MODE" \
           > "$out.txt" 2>&1
   rc=$?
   witness "post d=$d"

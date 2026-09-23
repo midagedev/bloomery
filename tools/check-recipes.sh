@@ -25,4 +25,13 @@ if [ -n "$lock" ]; then
   echo "$lock" >&2
   exit 1
 fi
+# A host binary's bound and exit code belong to tools/host-gate.sh. A recipe that runs a
+# target/release binary behind its own `timeout` spells the bound and the timeout's exit code again,
+# and prints nothing when the bound is hit.
+bare=$(grep -nE '^[^#]*timeout[^#]*target/release/' "$JF" || true)
+if [ -n "$bare" ]; then
+  echo "check-recipes: a recipe runs a target/release binary behind its own timeout — run it through tools/host-gate.sh (bound + exit code):" >&2
+  echo "$bare" >&2
+  exit 1
+fi
 echo "check-recipes: ok"

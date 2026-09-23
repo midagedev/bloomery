@@ -33,10 +33,12 @@
 #        (default: the first three)
 set -euo pipefail
 
-IK=${IK:-/home/user/ik_llama.cpp}
+# IK and BLOOMERY_DATA default in ref-paths.sh, as in every runner here (IK and BLOOMERY_DATA override them).
+# shellcheck source=tools/ref/ref-paths.sh
+source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TOKENIZE=${TOKENIZE:-$IK/build/bin/llama-tokenize}
-DATA=${BLOOMERY_DATA:-/root/bloomery-data}
+DATA=$BLOOMERY_DATA
 V41_DIR=${BLOOMERY_V41_DIR:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8}
 
 [ -x "$TOKENIZE" ] || { echo "engram-corpus: no llama-tokenize at $TOKENIZE" >&2; exit 66; }

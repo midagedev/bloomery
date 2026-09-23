@@ -14,6 +14,9 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 export BLOOMERY_DATA
+# The lease and the witness fields.
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 
 BIN=${BLOOMERY_ENGRAM_BIN:-target/release/engram-rate}
 [ -x "$BIN" ] || { echo "no engram-rate at $BIN — run: just build-engram" >&2; exit 2; }
@@ -27,23 +30,9 @@ DEV=$(lsblk -n -o PKNAME "$SRC" 2>/dev/null | head -n1 || true)
 [ -n "$DEV" ] || DEV=$(basename "$SRC")
 STAT=/sys/block/$DEV/stat
 
-LOCK=/root/bloomery-cpu.lock
-witness() {
-  echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
-  echo "table: $DIR on $SRC (block device $DEV)"
-  echo "loadavg: $(cat /proc/loadavg)"
-  echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-  # 필드 1·3 = 완료된 읽기 I/O 수, 읽은 섹터(512 B) 수. 앞뒤 차이가 드라이브가 실제로 한 일이다.
-  echo "blockstat($DEV) read_ios/read_sectors: $(awk '{print $1, $3}' "$STAT")"
-  echo "meminfo cached/free kB: $(awk '/^Cached:/{c=$2} /^MemFree:/{f=$2} END{print c, f}' /proc/meminfo)"
-  echo "lock-holder-pid: $$"
-  echo "model: $MODEL_NAME"
-}
+WITNESS=(head table loadavg pressure-io blockstat meminfo lock-holder model)
 
-exec 9>"$LOCK"
-echo "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { echo "[lease] timed out after 30 min"; exit 75; }
-echo "[lease] acquired $(date -u +%H:%M:%SZ)"
+lease_take
 witness pre
 # 임대 안이라고 바이너리에 말해 준다 — 없으면 줄마다 [not under lease]가 찍힌다.
 BLOOMERY_ENGRAM_LEASE=1 "$BIN" --model-dir "$DIR" "$@"
