@@ -627,12 +627,14 @@ fn eat(mut h: u64, bytes: &[u8]) -> u64 {
 /// is the entry's `fma.` count: a body carrying one multiply-add per column
 /// and nothing else is the starved shape, and the single-column body
 /// (`q8f32::f32_lane_partial_1col`, the decode shape) adds `LANE_UNROLL`
-/// more, one per chunk whose load it hoists. `q8_0_gemv` shares that core
-/// and is pinned with it, because an assertion on one would not catch the
-/// other being reverted.
+/// more, one per chunk whose load it hoists. `q8_0_gemv` has the same
+/// general body and is pinned beside it on a floor of its own: its
+/// single-column body (`q8f32::q8_0_lane_partial_1col`) walks whole code
+/// words, four multiply-adds per word, so a body that hoists fewer steps
+/// than it is written for shows fewer.
 #[cfg(feature = "gpu")]
 fn router_shape() -> Result<bool, GateError> {
-    use bloomery_gpu::q8f32::LANE_UNROLL;
+    use bloomery_gpu::q8f32::{LANE_UNROLL, Q8_STEP_UNROLL};
     use bloomery_gpu::router::ROUTER_THREADS;
 
     /// Activation columns the general gemv body guards, one multiply-add
@@ -644,18 +646,39 @@ fn router_shape() -> Result<bool, GateError> {
     // The floor, not the exact count — the backend is free to duplicate a
     // body it inlines, and pinning the duplication would be pinning the
     // compiler rather than the shape.
-    let gemv_fma_floor = GEMV_COLS + LANE_UNROLL;
+    let f32_fma_floor = GEMV_COLS + LANE_UNROLL;
+    /// Words the Q8_0 single-column body spells out besides its hoisted
+    /// steps: a hoisted pair (two), a single step, the partial word of a k
+    /// not a multiple of 128, and the one-word walk of unaligned activations.
+    const Q8_OTHER_WORDS: usize = 5;
+    // The Q8_0 floor counts every word that body spells out, four
+    // multiply-adds each, on top of the general body's columns.
+    // PIN(2026-09-23): 8 + 4·(4 + 5) = 44, the word-walk body's own count;
+    // the same source with its main loop cut to one step a trip printed
+    // fma=32 and failed.
+    let q8_fma_floor = GEMV_COLS + 4 * (Q8_STEP_UNROLL + Q8_OTHER_WORDS);
 
     let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
     let modules = bloomery_gpu_gates::ptx::modules(&bundles);
     let mut ok = true;
-    for name in ["f32_gemv", "q8_0_gemv"] {
+    let floors = [
+        (
+            "f32_gemv",
+            f32_fma_floor,
+            format!("cols={GEMV_COLS} + LANE_UNROLL={LANE_UNROLL}"),
+        ),
+        (
+            "q8_0_gemv",
+            q8_fma_floor,
+            format!("cols={GEMV_COLS} + 4*(Q8_STEP_UNROLL={Q8_STEP_UNROLL} + {Q8_OTHER_WORDS})"),
+        ),
+    ];
+    for (name, floor, derivation) in floors {
         let c = bloomery_gpu_gates::ptx::counts(&modules, name)
             .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
-        let pass = c.fma >= gemv_fma_floor && !c.depot;
+        let pass = c.fma >= floor && !c.depot;
         println!(
-            "shape op={name} fma={} fma_floor={gemv_fma_floor} (cols={GEMV_COLS} + \
-             LANE_UNROLL={LANE_UNROLL}) local_depot={} {}",
+            "shape op={name} fma={} fma_floor={floor} ({derivation}) local_depot={} {}",
             c.fma,
             c.depot,
             verdict(pass)
