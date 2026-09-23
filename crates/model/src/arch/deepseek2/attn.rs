@@ -916,54 +916,80 @@ fn flash_simd(p: &MlaParams) -> bool {
         && std::arch::is_x86_feature_detected!("f16c")
 }
 
-/// `BLOOMERY_KV_PREFETCH=0` disables the AVX2 flash twin's next-row prefetch —
-/// the A/B lever that prices what the contiguous KV layout alone buys, same
-/// binary, same bytes: only the cache hint changes.
-fn kv_prefetch_env() -> bool {
-    static S: OnceLock<bool> = OnceLock::new();
-    *S.get_or_init(|| std::env::var("BLOOMERY_KV_PREFETCH").map_or(true, |v| v != "0"))
+/// How many key rows ahead the AVX2 flash twin prefetches on a decode row;
+/// 0 is off. `BLOOMERY_KV_PREFETCH_ROWS=d` sets the distance (default 16: 1
+/// leaves the stream short of what one core keeps in flight, 8 reaches it
+/// and 16 reads a little better still on the deep rows) and
+/// `BLOOMERY_KV_PREFETCH=0` turns the hint off whatever the distance says —
+/// same binary, same bytes: only the cache hint changes. Read once; a value
+/// that does not parse panics rather than falling back.
+fn kv_prefetch_rows_env() -> usize {
+    static S: OnceLock<usize> = OnceLock::new();
+    *S.get_or_init(|| {
+        if std::env::var("BLOOMERY_KV_PREFETCH").is_ok_and(|v| v == "0") {
+            return 0;
+        }
+        match std::env::var("BLOOMERY_KV_PREFETCH_ROWS") {
+            Ok(v) => v.parse().unwrap_or_else(|_| {
+                panic!("BLOOMERY_KV_PREFETCH_ROWS={v:?}: expected a row count (0 = off)")
+            }),
+            Err(_) => 16,
+        }
+    })
 }
 
-/// The in-process override the prefetch-lever tests drive: the env var is read
-/// once per process, so this is how one binary exercises both arms.
-static KV_PREFETCH_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// "No override": the distance follows the environment.
+const KV_PREFETCH_FOLLOW_ENV: usize = usize::MAX;
 
-/// Test override for the KV prefetch lever: `Some(true)` forces the prefetch,
-/// `Some(false)` disables it, `None` follows `BLOOMERY_KV_PREFETCH`.
+/// The in-process override the prefetch-lever tests drive: the env vars are
+/// read once per process, so this is how one binary exercises every arm.
+static KV_PREFETCH_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(KV_PREFETCH_FOLLOW_ENV);
+
+/// Test override for the KV prefetch distance: `Some(d)` forces `d` rows
+/// ahead (0 = off), `None` follows `BLOOMERY_KV_PREFETCH_ROWS` /
+/// `BLOOMERY_KV_PREFETCH`.
 #[doc(hidden)]
-pub fn set_kv_prefetch(mode: Option<bool>) {
+pub fn set_kv_prefetch_rows(rows: Option<usize>) {
     KV_PREFETCH_OVERRIDE.store(
-        match mode {
-            Some(true) => 1,
-            Some(false) => 2,
-            None => 0,
-        },
+        rows.unwrap_or(KV_PREFETCH_FOLLOW_ENV),
         std::sync::atomic::Ordering::Relaxed,
     );
 }
 
-/// What the AVX2 flash twin's last decode row decided: 0 = no row yet,
-/// 1 = prefetching, 2 = not. The lever tests read it; a lever whose effect
-/// is only "the gate still passes" proves nothing about the branch.
-static LAST_KV_PREFETCH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// The observable behind [`set_kv_prefetch`]: `Some(true)` if the last
-/// AVX2 flash row (any `n_tokens`) resolved to prefetching, `Some(false)`
-/// if not, `None` before any row ran.
+/// On/off form of [`set_kv_prefetch_rows`]: `Some(true)` is one row ahead,
+/// `Some(false)` is off, `None` follows the environment.
 #[doc(hidden)]
-pub fn last_kv_prefetch() -> Option<bool> {
-    match LAST_KV_PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => Some(true),
-        2 => Some(false),
-        _ => None,
-    }
+pub fn set_kv_prefetch(mode: Option<bool>) {
+    set_kv_prefetch_rows(mode.map(usize::from));
 }
 
-fn kv_prefetch() -> bool {
+/// What the AVX2 flash twin's last row decided, stored as distance + 1:
+/// 0 = no row yet, 1 = no prefetch, `d + 1` = `d` rows ahead. The lever
+/// tests read it; a lever whose effect is only "the gate still passes"
+/// proves nothing about the branch.
+static LAST_KV_PREFETCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The observable behind [`set_kv_prefetch_rows`]: the distance the last
+/// AVX2 flash row (any `n_tokens`) resolved to — `Some(0)` if it did not
+/// prefetch — or `None` before any row ran.
+#[doc(hidden)]
+pub fn last_kv_prefetch_rows() -> Option<usize> {
+    LAST_KV_PREFETCH
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .checked_sub(1)
+}
+
+/// On/off form of [`last_kv_prefetch_rows`].
+#[doc(hidden)]
+pub fn last_kv_prefetch() -> Option<bool> {
+    last_kv_prefetch_rows().map(|d| d > 0)
+}
+
+fn kv_prefetch_rows() -> usize {
     match KV_PREFETCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => kv_prefetch_env(),
+        KV_PREFETCH_FOLLOW_ENV => kv_prefetch_rows_env(),
+        d => d,
     }
 }
 
@@ -1363,11 +1389,8 @@ unsafe fn flash_row_avx2(
         // constant and the kq loop is the hot walk. Feeds only the cache
         // hint below, so no scalar twin; the observable lets a test assert
         // which arm this row actually took.
-        let prefetch = n_tokens == 1 && kv_prefetch();
-        LAST_KV_PREFETCH.store(
-            if prefetch { 1 } else { 2 },
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let ahead = if n_tokens == 1 { kv_prefetch_rows() } else { 0 };
+        LAST_KV_PREFETCH.store(ahead + 1, std::sync::atomic::Ordering::Relaxed);
         for blk in (0..key_slots.len()).step_by(32) {
             let mut s = [f32::NEG_INFINITY; 32];
             let mut smax = f32::NEG_INFINITY;
@@ -1383,19 +1406,13 @@ unsafe fn flash_row_avx2(
                 // TWIN: flash_row_scalar — every edit outside the two marked
                 // regions must be made in both. (This is the kq dot region;
                 // only the sum order may differ from the scalar oracle.)
-                // Pull the next key row's lines while this one is dotted —
-                // the kq walk streams each row exactly once. Measured on the
-                // per-row heap layout this cache carried before the one
-                // contiguous buffer: +6.3 % at depth 4096 decode, and on
-                // prefill rows the hint cost 2 % and bought nothing, so
-                // decode rows only (`n_tokens == 1`); a speculative step
-                // (`n_tokens = k`) skips it too (rig-log 09-21-e).
-                // `BLOOMERY_KV_PREFETCH=0` turns the hint off for a whole
-                // process, same binary — the lever that prices what the
-                // fixed-stride layout buys on its own. A prefetch is a cache
-                // hint, never a value — no scalar twin of this.
-                if prefetch && u + 1 < keys16.len() {
-                    let next = keys16.row(u + 1);
+                // Pull the lines of the row `ahead` keys on while this one is
+                // dotted: the kq walk streams each row exactly once. Decode
+                // rows only — on multi-query rows (prefill, a speculative
+                // step) the hint cost time and bought none. A prefetch is a
+                // cache hint, never a value — no scalar twin of this.
+                if ahead != 0 && u + ahead < keys16.len() {
+                    let next = keys16.row(u + ahead);
                     let base = next.as_ptr().cast::<u8>();
                     let mut off = 0usize;
                     while off < next.len() * 2 {

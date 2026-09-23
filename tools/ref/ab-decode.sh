@@ -15,6 +15,11 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 TOKENS=${BLOOMERY_DECODE_TOKENS:-$REF_TOKENS}
+# BLOOMERY_AB_DEPTH=d: 깊이 d의 lcg_prompt(depth-decode.sh와 같은 프롬프트)를 프리필한 뒤 잰다.
+# depth-decode.sh에는 env 팔이 없어서, 같은 바이너리의 레버를 깊이에서 재는 길이 이것이다.
+if [ -n "${BLOOMERY_AB_DEPTH:-}" ]; then
+  TOKENS=$(lcg_prompt "$BLOOMERY_AB_DEPTH")
+fi
 N=${BLOOMERY_DECODE_N:-96}
 ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
 # BLOOMERY_AB_ENVS="K=V;K=V K2=V2": 현재 트리의 같은 바이너리를 env만 바꿔 팔로 더 넣는다
@@ -32,7 +37,7 @@ WITNESS=(head-load indent busiest model)
 lease_take
 # 러너가 실제로 읽은 값. 맥 셸의 BLOOMERY_AB_* 는 ssh를 그냥 넘지 않는다(레시피가 실어 보낸다) —
 # 이 줄이 없으면 "env가 박스에 닿았나"를 바퀴 수를 세어 추측해야 했다.
-echo "[config] rounds=$ROUNDS n=$N trees=${bins[*]} envs=${BLOOMERY_AB_ENVS:-} ik=${BLOOMERY_AB_IK:-0}"
+echo "[config] rounds=$ROUNDS n=$N depth=${BLOOMERY_AB_DEPTH:-prompt} trees=${bins[*]} envs=${BLOOMERY_AB_ENVS:-} ik=${BLOOMERY_AB_IK:-0}"
 witness pre
 # 팔 목록: 트리 팔("tree:<dir>")과 env 팔("env:<K=V ...>")을 한 줄로 세우고 바퀴마다 한 칸씩
 # 돌린다. 막는 실패: 위치 편향 — 고정 순서에서는 바퀴의 첫 팔이 0.3–0.8% 느리게 나왔고

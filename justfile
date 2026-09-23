@@ -344,12 +344,13 @@ measure-sweep: build-decode
 # 원격 명령줄 앞에 K=V로 실어 보낸다. BLOOMERY_AB_ENVS는 작은따옴표로 싸서 넘기므로 값 안의
 # 작은따옴표 하나가 그 인용을 깬다 — `K=V;K2=V2` 형태(이 변수의 문법 전부)는 안전하다.
 #   BLOOMERY_AB_ROUNDS=6 BLOOMERY_AB_ENVS="BLOOMERY_SPIN=0" just ab-decode bloomery-foo
+# BLOOMERY_AB_DEPTH=d 는 깊이 d 의 프롬프트를 먼저 프리필한다(러너 머리말) — 어텐션 레버는 깊은 행에서만 보인다.
 ab-decode *DIRS: build-decode
     #!/usr/bin/env bash
     set -euo pipefail
     names=
     for d in {{DIRS}}; do names="$names $(basename "$d")"; done
-    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS} ${BLOOMERY_AB_ENVS:+BLOOMERY_AB_ENVS='$BLOOMERY_AB_ENVS'} ${BLOOMERY_AB_IK:+BLOOMERY_AB_IK=$BLOOMERY_AB_IK} bash tools/ref/ab-decode.sh$names"
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS} ${BLOOMERY_AB_DEPTH:+BLOOMERY_AB_DEPTH=$BLOOMERY_AB_DEPTH} ${BLOOMERY_AB_ENVS:+BLOOMERY_AB_ENVS='$BLOOMERY_AB_ENVS'} ${BLOOMERY_AB_IK:+BLOOMERY_AB_IK=$BLOOMERY_AB_IK} bash tools/ref/ab-decode.sh$names"
 
 measure-profile: build-decode
     ./tools/box.sh 'bash tools/ref/profile-measure.sh'

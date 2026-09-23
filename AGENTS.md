@@ -358,7 +358,8 @@ Runtime levers: `BLOOMERY_THREADS`, `BLOOMERY_SPIN` (threads), `BLOOMERY_STEAL_B
 (model::ops: blocks a lane is cut into for stealing, default 4 — 2/8/16 measured no better),
 `BLOOMERY_PROFILE` (model::profile; `BLOOMERY_PROFILE_DEPTH=d` makes
 `profile-measure.sh` prefill depth-decode's prompt of depth d first),
-`BLOOMERY_FLASH_SIMD=0` (attn, scalar rollback), `BLOOMERY_ATTN_HALVES=2` (attn:
+`BLOOMERY_FLASH_SIMD=0` (attn, scalar rollback), `BLOOMERY_KV_PREFETCH_ROWS=d` (attn: how many
+key rows ahead a decode row prefetches, default 16; `BLOOMERY_KV_PREFETCH=0` turns the hint off), `BLOOMERY_ATTN_HALVES=2` (attn:
 each (token, head) row of the fused CPU dispatch runs on two threads, each
 accumulating half the latent — bit-identical, gated, and slower at every
 depth: both threads still stream every whole key row for the scores, so the

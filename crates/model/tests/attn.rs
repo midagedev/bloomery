@@ -1047,8 +1047,8 @@ fn hw_flash_simd_lever_forces_scalar() {
 }
 
 /// The KV prefetch lever is observed, not assumed: on a one-query row the
-/// AVX2 twin reports which arm it took, the two arms are bit-identical
-/// (a prefetch is a hint, never a value), and a multi-query row never
+/// AVX2 twin reports which arm and which distance it took, every arm is
+/// bit-identical (a prefetch is a hint, never a value), and a multi-query row never
 /// prefetches whatever the lever says. The observable is process-global and
 /// every simd row writes it, so the assertions run in a fresh child process
 /// where this is the only test — the same re-exec shape as
@@ -1134,9 +1134,35 @@ fn hw_kv_prefetch_lever_child() {
         same,
         "prefetch on vs off changed a value — a hint touched arithmetic"
     );
+    assert_eq!(
+        attn::last_kv_prefetch_rows(),
+        Some(0),
+        "the off arm must report distance 0"
+    );
+
+    // The distance lever: each forced distance is the one the row reports,
+    // and none of them moves a bit. 100 keys, so every distance here issues
+    // hints inside the row.
+    let distances = [1usize, 2, 4, 8];
+    for d in distances {
+        attn::set_kv_prefetch_rows(Some(d));
+        let at_d = attn::flash_attn_latent(&q_rope, &q_nope2, f.keys(), &f.key_slots, q1, &f.p);
+        assert_eq!(
+            attn::last_kv_prefetch_rows(),
+            Some(d),
+            "one-query row with the distance forced to {d} must report {d}"
+        );
+        assert!(
+            at_d.data
+                .iter()
+                .zip(off.data.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "prefetch distance {d} vs off changed a value — a hint touched arithmetic"
+        );
+    }
 
     // Multi-query rows (prefill) never prefetch, lever or no lever.
-    attn::set_kv_prefetch(Some(true));
+    attn::set_kv_prefetch_rows(Some(4));
     let _ = attn::flash_attn_latent(
         &f.q_rope,
         &f.q_nope2,
@@ -1150,9 +1176,9 @@ fn hw_kv_prefetch_lever_child() {
         Some(false),
         "a {n_tok}-query row must not prefetch"
     );
-    attn::set_kv_prefetch(None);
+    attn::set_kv_prefetch_rows(None);
     println!(
-        "kv prefetch lever: one-query on/off observed, {} values bit-identical, {n_tok}-query never prefetches",
+        "kv prefetch lever: one-query on/off observed, distances {distances:?} observed, {} values bit-identical, {n_tok}-query never prefetches",
         on.data.len()
     );
 }
