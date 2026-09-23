@@ -36,6 +36,7 @@ pub mod flash;
 pub mod fused;
 pub(crate) mod graph;
 pub mod head;
+pub mod join_probe;
 pub mod model;
 pub mod moe_fused;
 pub mod probe;
@@ -47,7 +48,7 @@ pub(crate) mod tensor;
 pub mod weights;
 
 pub use engine::AnyEngine;
-pub use graph::Graph;
+pub use graph::{Graph, NodeInfo};
 pub use model::GpuModel;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.

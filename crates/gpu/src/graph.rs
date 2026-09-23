@@ -149,6 +149,53 @@ impl Graph {
     pub fn node_count(&self) -> usize {
         self.nodes
     }
+
+    /// Every node the capture recorded, in the order `cuGraphGetNodes`
+    /// returns them: what an enqueue with more than one graph form (a host
+    /// function with a sync mode, a stream memory operation) became.
+    pub fn nodes(&self) -> Result<Vec<NodeInfo>, GpuError> {
+        let mut handles: Vec<sys::CUgraphNode> = vec![ptr::null_mut(); self.nodes];
+        let mut n = self.nodes;
+        // SAFETY: the array holds `n` slots, the count the driver reported
+        // for this template at capture; it writes at most `n` handles.
+        let rc = unsafe { sys::cuGraphGetNodes(self.graph, handles.as_mut_ptr(), &mut n) };
+        cu(rc, "cuGraphGetNodes")?;
+        handles.truncate(n);
+        handles
+            .into_iter()
+            .map(|node| {
+                let mut kind: sys::CUgraphNodeType = 0;
+                // SAFETY: `node` is a handle of this live template.
+                let rc = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
+                cu(rc, "cuGraphNodeGetType")?;
+                let host_sync = if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST {
+                    // SAFETY: all-zero is a valid value of this plain C
+                    // struct (integers, pointers, a nullable function
+                    // pointer), which the driver then fills for `node`.
+                    let mut params: sys::CUgraphNodeParams = unsafe { std::mem::zeroed() };
+                    // SAFETY: `node` is a live host node of this template and
+                    // `params` is a writable struct of the type the call fills.
+                    let rc = unsafe { sys::cuGraphNodeGetParams(node, &mut params) };
+                    cu(rc, "cuGraphNodeGetParams")?;
+                    // SAFETY: for a host node the driver fills the `host`
+                    // member of the union.
+                    Some(unsafe { params.__bindgen_anon_1.host.syncMode })
+                } else {
+                    None
+                };
+                Ok(NodeInfo { kind, host_sync })
+            })
+            .collect()
+    }
+}
+
+/// One node of a captured graph as the driver reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeInfo {
+    /// The node's `CUgraphNodeType` (kernel, memcpy, host, batch memop, …).
+    pub kind: sys::CUgraphNodeType,
+    /// For a host node, the `CUhostTaskSyncMode` it carries.
+    pub host_sync: Option<u32>,
 }
 
 impl Drop for Graph {

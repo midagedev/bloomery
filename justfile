@@ -191,6 +191,12 @@ bench-gpu-v41-check:
 time-gpu-v41:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
 
+bench-gpu-join-check *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && flock -w 1800 /root/bloomery-gate.lock timeout --kill-after=10 900 ./target/release/bench_join --check {{ARGS}}'
+
+time-gpu-join *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/ref/time-gate.sh bench_join --time {{ARGS}}'
+
 # MoE 융합 op 8노드 대 융합 4노드의 재생 µs — 임대·증인, 리드 전용.
 time-gpu-moe:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/ref/time-gate.sh gate_moe_fused'
