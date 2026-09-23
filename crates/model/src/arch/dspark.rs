@@ -23,13 +23,11 @@
 use gguf::{GgmlType, Split, Value};
 
 use super::deepseek41::hparams::HyperConnections;
+use super::{meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
 use crate::placement::{CardFormat, PlacementError};
 
 /// ik's `LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS` (llama-hparams.h:18).
 const IK_SQRT_SOFTPLUS: u64 = 4;
-
-/// The token list whose length is the vocabulary when the file has no `vocab_size`.
-const TOKENS: &str = "tokenizer.ggml.tokens";
 
 /// The id of the mask token the draft fills a block's unknown positions with.
 const MASK_TOKEN: &str = "tokenizer.ggml.mask_token_id";
@@ -113,47 +111,47 @@ impl DraftHparams {
                 detail: format!("is {:?}, not {:?}", split.architecture(), super::DFLASH),
             });
         }
-        let n_layer = usize_of(split, "block_count")?;
-        let head_dim = usize_of(split, "attention.key_length")?;
-        let value_length = usize_of(split, "attention.value_length")?;
+        let n_layer = meta_usize(split, "block_count")?;
+        let head_dim = meta_usize(split, "attention.key_length")?;
+        let value_length = meta_usize(split, "attention.value_length")?;
         if value_length != head_dim {
             let detail = format!("is {value_length}, the key length is {head_dim}");
             return Err(metadata(split, "attention.value_length", detail));
         }
-        let rope_dims = usize_of(split, "rope.dimension_count")?;
+        let rope_dims = meta_usize(split, "rope.dimension_count")?;
         if rope_dims > head_dim {
             let detail = format!("is {rope_dims}, more than a head's {head_dim}");
             return Err(metadata(split, "rope.dimension_count", detail));
         }
         window_only(split, n_layer)?;
-        let hash = usize_of(split, "hash_layer_count")?;
+        let hash = meta_usize(split, "hash_layer_count")?;
         if hash != 0 {
             let detail = format!("is {hash}; the draft routes every layer by its scores");
             return Err(metadata(split, "hash_layer_count", detail));
         }
-        let block_size = usize_of(split, "block_size")?;
+        let block_size = meta_usize(split, "block_size")?;
         if block_size == 0 {
             return Err(metadata(split, "block_size", "is 0"));
         }
         Ok(DraftHparams {
             n_layer,
-            n_embd: usize_of(split, "embedding_length")?,
-            n_head: usize_of(split, "attention.head_count")?,
-            n_head_kv: usize_of(split, "attention.head_count_kv")?,
+            n_embd: meta_usize(split, "embedding_length")?,
+            n_head: meta_usize(split, "attention.head_count")?,
+            n_head_kv: meta_usize(split, "attention.head_count_kv")?,
             head_dim,
-            q_lora_rank: usize_of(split, "attention.q_lora_rank")?,
-            o_groups: usize_of(split, "attention.output_group_count")?,
-            o_lora_rank: usize_of(split, "attention.output_lora_rank")?,
+            q_lora_rank: meta_usize(split, "attention.q_lora_rank")?,
+            o_groups: meta_usize(split, "attention.output_group_count")?,
+            o_lora_rank: meta_usize(split, "attention.output_lora_rank")?,
             rope_dims,
-            rope_base: f32_of(split, "rope.freq_base")?,
-            window: usize_of(split, "attention.sliding_window")?,
-            rms_eps: f32_of(split, "attention.layer_norm_rms_epsilon")?,
+            rope_base: meta_f32(split, "rope.freq_base")?,
+            window: meta_usize(split, "attention.sliding_window")?,
+            rms_eps: meta_f32(split, "attention.layer_norm_rms_epsilon")?,
             n_vocab: n_vocab(split)?,
-            n_ctx_train: usize_of(split, "context_length")?,
+            n_ctx_train: meta_usize(split, "context_length")?,
             hc: HyperConnections {
-                streams: usize_of(split, "hyper_connection.count")?,
-                sinkhorn_iters: usize_of(split, "hyper_connection.sinkhorn_iterations")?,
-                eps: f32_of(split, "hyper_connection.epsilon")?,
+                streams: meta_usize(split, "hyper_connection.count")?,
+                sinkhorn_iters: meta_usize(split, "hyper_connection.sinkhorn_iterations")?,
+                eps: meta_f32(split, "hyper_connection.epsilon")?,
             },
             experts: DraftExperts::read(split)?,
             swiglu_limit: per_layer_f32(split, "swiglu_clamp_exp", n_layer)?,
@@ -174,13 +172,13 @@ impl DraftHparams {
 
 impl DraftExperts {
     fn read(split: &Split) -> Result<DraftExperts, PlacementError> {
-        let gating = u64_of(split, "expert_gating_func")?;
+        let gating = meta_u64(split, "expert_gating_func")?;
         if gating != IK_SQRT_SOFTPLUS {
             let detail = format!("is {gating}; the draft's router scores with sqrt-softplus");
             return Err(metadata(split, "expert_gating_func", detail));
         }
-        let n_expert = usize_of(split, "expert_count")?;
-        let n_used = usize_of(split, "expert_used_count")?;
+        let n_expert = meta_usize(split, "expert_count")?;
+        let n_used = meta_usize(split, "expert_used_count")?;
         if n_used == 0 || n_used > n_expert {
             let detail = format!("is {n_used}, of {n_expert} experts");
             return Err(metadata(split, "expert_used_count", detail));
@@ -193,9 +191,9 @@ impl DraftExperts {
         Ok(DraftExperts {
             n_expert,
             n_used,
-            n_shared: usize_of(split, "expert_shared_count")?,
-            ff: usize_of(split, "expert_feed_forward_length")?,
-            routed_scale: f32_of(split, "expert_weights_scale")?,
+            n_shared: meta_usize(split, "expert_shared_count")?,
+            ff: meta_usize(split, "expert_feed_forward_length")?,
+            routed_scale: meta_f32(split, "expert_weights_scale")?,
             weights_norm,
         })
     }
@@ -582,7 +580,7 @@ pub fn inventory(
 /// the draft's blocks attend their window and nothing compressed.
 fn window_only(split: &Split, n_layer: usize) -> Result<(), PlacementError> {
     let key = "attention.compress_ratios";
-    let items = arr_of(split, key)?;
+    let items = meta_arr(split, key)?;
     if items.len() < n_layer {
         let detail = format!("has {} entries for {n_layer} layers", items.len());
         return Err(metadata(split, key, detail));
@@ -600,7 +598,7 @@ fn window_only(split: &Split, n_layer: usize) -> Result<(), PlacementError> {
 
 /// The first `n_layer` entries of the per-layer float table `suffix`.
 fn per_layer_f32(split: &Split, suffix: &str, n_layer: usize) -> Result<Vec<f32>, PlacementError> {
-    let items = arr_of(split, suffix)?;
+    let items = meta_arr(split, suffix)?;
     if items.len() < n_layer {
         let detail = format!("has {} entries for {n_layer} layers", items.len());
         return Err(metadata(split, suffix, detail));
@@ -619,7 +617,7 @@ fn per_layer_f32(split: &Split, suffix: &str, n_layer: usize) -> Result<Vec<f32>
 fn target_layers(split: &Split) -> Result<Vec<usize>, PlacementError> {
     let key = "target_layers";
     let mut layers: Vec<usize> = Vec::new();
-    for (i, v) in arr_of(split, key)?.iter().enumerate() {
+    for (i, v) in meta_arr(split, key)?.iter().enumerate() {
         let l = v
             .as_unsigned()
             .and_then(|l| usize::try_from(l).ok())
@@ -659,53 +657,4 @@ fn markov_rank(split: &Split) -> Result<usize, PlacementError> {
         name,
         detail: format!("row length {} does not fit usize", t.dims[0]),
     })
-}
-
-/// The vocabulary size where ik takes it (llama-hparams.cpp:155):
-/// `vocab_size` when the file carries it, else the token list's length.
-fn n_vocab(split: &Split) -> Result<usize, PlacementError> {
-    let key = "vocab_size";
-    if split.value(&split.arch_key(key)).is_some() {
-        return usize_of(split, key);
-    }
-    match split.value(TOKENS) {
-        Some(Value::Array(tokens)) => Ok(tokens.len()),
-        _ => Err(PlacementError::Metadata {
-            key: TOKENS.to_string(),
-            detail: format!(
-                "is absent or not an array, and so is {}",
-                split.arch_key(key)
-            ),
-        }),
-    }
-}
-
-fn metadata(split: &Split, suffix: &str, detail: impl Into<String>) -> PlacementError {
-    PlacementError::Metadata {
-        key: split.arch_key(suffix),
-        detail: detail.into(),
-    }
-}
-
-fn u64_of(split: &Split, suffix: &str) -> Result<u64, PlacementError> {
-    split
-        .arch_get_u64(suffix)
-        .ok_or_else(|| metadata(split, suffix, "is absent or not an unsigned integer"))
-}
-
-fn usize_of(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
-    let v = u64_of(split, suffix)?;
-    usize::try_from(v).map_err(|_| metadata(split, suffix, format!("{v} does not fit usize")))
-}
-
-fn f32_of(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
-    split
-        .arch_get_f32(suffix)
-        .ok_or_else(|| metadata(split, suffix, "is absent or not a float"))
-}
-
-fn arr_of<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], PlacementError> {
-    split
-        .arch_get_arr(suffix)
-        .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }

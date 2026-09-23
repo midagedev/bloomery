@@ -81,7 +81,10 @@ pub fn block_attn_trace(
 }
 
 /// One block's attention against a KV cache: `q_slots` are this call's queries, the cache holds every key; new rows are appended first, so a decode step attends to its own token as well as the prefix. `cache_block` is the cache's block index — the model's `block` in a real pass, 0 in the scratch cache.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one block's input plus the cache it reads and appends to"
+)]
 pub fn block_attn_cached(
     gguf: &Gguf,
     block: usize,
@@ -2447,7 +2450,10 @@ pub fn wv_b_heads_with(
 /// the three stages are independent per row, so the two barriers the chain
 /// paid bought nothing. The three stage functions above stay `pub`: they are
 /// the oracle this path is gated against, bit for bit.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fused chain's weights, queries, keys and plan"
+)]
 pub fn attn_heads_fused(
     gguf: &Gguf,
     wblocks: &[Q8Block],

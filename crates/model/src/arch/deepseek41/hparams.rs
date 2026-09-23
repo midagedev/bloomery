@@ -13,13 +13,13 @@
 //! ik line numbers are those of the tree the V4.1 oracle sets were built from
 //! (`tools/ref/models/deepseek41.sh`'s `IK`).
 
-use gguf::{Split, Value};
+use gguf::Split;
 
-use super::{meta_u64, meta_usize, names};
+use super::names;
+use crate::arch::{
+    meta_arr, meta_bool, meta_f32, meta_str, meta_u64, meta_usize, metadata, n_vocab,
+};
 use crate::placement::PlacementError;
-
-/// The token list ik counts when the file has no `vocab_size`.
-const TOKENS: &str = "tokenizer.ggml.tokens";
 
 /// ik's `LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS` (llama-hparams.h:18).
 const IK_SQRT_SOFTPLUS: u64 = 4;
@@ -671,25 +671,6 @@ fn dense_lead(split: &Split, layers: &[LayerKind]) -> Result<usize, PlacementErr
     Ok(lead)
 }
 
-/// The vocabulary size where ik takes it (llama-hparams.cpp:155):
-/// `vocab_size` when the file carries it, else the token list's length.
-fn n_vocab(split: &Split) -> Result<usize, PlacementError> {
-    let key = "vocab_size";
-    if split.value(&split.arch_key(key)).is_some() {
-        return meta_usize(split, key);
-    }
-    match split.value(TOKENS) {
-        Some(Value::Array(tokens)) => Ok(tokens.len()),
-        _ => Err(PlacementError::Metadata {
-            key: TOKENS.to_string(),
-            detail: format!(
-                "is absent or not an array, and so is {}",
-                split.arch_key(key)
-            ),
-        }),
-    }
-}
-
 /// `attention.compress_ratios`, the first `n_layer` of them: the file also
 /// lists layers it does not carry, and ik takes the first `block_count`
 /// (llama-hparams.cpp:2115-2121).
@@ -736,43 +717,6 @@ fn per_layer_f32(split: &Split, suffix: &str, n_layer: usize) -> Result<Vec<f32>
                 .ok_or_else(|| metadata(split, suffix, format!("has no float for layer {l}")))
         })
         .collect()
-}
-
-/// The error that names `<architecture>.<suffix>`.
-fn metadata(split: &Split, suffix: &str, detail: impl Into<String>) -> PlacementError {
-    PlacementError::Metadata {
-        key: split.arch_key(suffix),
-        detail: detail.into(),
-    }
-}
-
-/// `<architecture>.<suffix>` as a float.
-fn meta_f32(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
-    split
-        .arch_get_f32(suffix)
-        .ok_or_else(|| metadata(split, suffix, "is absent or not a float"))
-}
-
-/// `<architecture>.<suffix>` as a string.
-fn meta_str<'a>(split: &'a Split, suffix: &str) -> Result<&'a str, PlacementError> {
-    split
-        .arch_get_str(suffix)
-        .ok_or_else(|| metadata(split, suffix, "is absent or not a string"))
-}
-
-/// `<architecture>.<suffix>` as a bool.
-fn meta_bool(split: &Split, suffix: &str) -> Result<bool, PlacementError> {
-    split
-        .value(&split.arch_key(suffix))
-        .and_then(Value::as_bool)
-        .ok_or_else(|| metadata(split, suffix, "is absent or not a bool"))
-}
-
-/// `<architecture>.<suffix>` as an array's items.
-fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], PlacementError> {
-    split
-        .arch_get_arr(suffix)
-        .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
 }
 
 #[cfg(test)]

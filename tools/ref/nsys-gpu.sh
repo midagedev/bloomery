@@ -58,6 +58,7 @@ for d in $DEPTHS; do
   echo "=== 깊이 $d (ctx $ctx, mode $MODE, 재생 $((d + NGEN - 1))개 기대) → $out.nsys-rep"
   witness "pre d=$d"
   "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false \
+          --sample=none --cpuctxsw=none \
           -o "$out" --force-overwrite true \
           "$BIN" --tokens "$(lcg_prompt "$d")" -n "$NGEN" --ctx "$ctx" --mode "$MODE" \
           > "$out.txt" 2>&1

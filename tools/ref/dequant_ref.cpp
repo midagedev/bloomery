@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "ggml.h"
 #include "ref_paths.h"
 
@@ -35,11 +37,16 @@ static void fail(const std::string & msg) {
     std::exit(1);
 }
 
+// Write to <path>.tmp.<pid> and rename, as mxfp4_ref.cpp and q5k_x4_ref.cpp do: a gate on another
+// track reading the shared $BLOOMERY_DATA never sees a half-written dump, and two writers never
+// share a temporary file.
 static void write_file(const std::string & path, const void * data, size_t n) {
-    FILE * f = std::fopen(path.c_str(), "wb");
-    if (!f) fail("cannot open for write: " + path);
-    if (std::fwrite(data, 1, n, f) != n) fail("short write: " + path);
-    std::fclose(f);
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    FILE * f = std::fopen(tmp.c_str(), "wb");
+    if (!f) fail("cannot open for write: " + tmp);
+    const bool wrote = std::fwrite(data, 1, n, f) == n;
+    if (std::fclose(f) != 0 || !wrote) fail("short write: " + tmp);
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) fail("cannot rename " + tmp + " to " + path);
 }
 
 static std::vector<uint8_t> read_range(const char * path, int64_t off, size_t n) {
@@ -135,16 +142,15 @@ int main(int argc, char ** argv) {
         const char * tname = ggml_type_name(type);
         write_file(out_dir + "/" + tname + ".raw",
                    out.data(), out.size() * sizeof(float));
-        FILE * meta = std::fopen((out_dir + "/" + tname + ".meta").c_str(), "wb");
-        if (!meta) fail("cannot open meta for write");
-        std::fprintf(meta, "tensor=%s\n", name);
-        std::fprintf(meta, "type=%d %s\n", (int)type, tname);
-        std::fprintf(meta, "dims=%d %lld %lld %lld %lld\n", ggml_n_dims(info),
+        char meta[1024];
+        const int meta_n = std::snprintf(meta, sizeof meta,
+                     "tensor=%s\ntype=%d %s\ndims=%d %lld %lld %lld %lld\nrows=%lld\nrowlen=%lld\n",
+                     name, (int)type, tname, ggml_n_dims(info),
                      (long long)info->ne[0], (long long)info->ne[1],
-                     (long long)info->ne[2], (long long)info->ne[3]);
-        std::fprintf(meta, "rows=%lld\n", (long long)rows);
-        std::fprintf(meta, "rowlen=%lld\n", (long long)ne0);
-        std::fclose(meta);
+                     (long long)info->ne[2], (long long)info->ne[3],
+                     (long long)rows, (long long)ne0);
+        if (meta_n < 0 || (size_t)meta_n >= sizeof meta) fail("meta does not fit its buffer: " + std::string(name));
+        write_file(out_dir + "/" + tname + ".meta", meta, (size_t)meta_n);
         std::fprintf(mf, "%d %s %d\n", (int)type, tname, counts[k].second);
         std::printf("%-6s tensor=%s rows=%lld rowlen=%lld row_bytes=%zu\n",
                     tname, name, (long long)rows, (long long)ne0, row_bytes);

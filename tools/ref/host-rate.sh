@@ -8,9 +8,10 @@
 # bloomery-decode does, so nothing here wraps the bench in taskset; the bench prints every thread's
 # cpu, core and L3 group as the kernel reports them.
 #
-# Arguments: an optional `--threads 16,32` first (the thread counts in order, default 8,16,24,30,32),
-# then the bench's own, passed on unchanged (--rounds, --seconds, --warmup, --arms; `bench_v41_host`
-# with no arguments prints them). Environment: BLOOMERY_HOST_BOUND, seconds one thread count may take
+# Arguments: an optional `--threads 16,32` anywhere (the thread counts in order, default 8,16,24,30,32),
+# and the bench's own, passed on unchanged in their order (--rounds, --seconds, --warmup, --arms;
+# `bench_v41_host` with no arguments prints them). `--parse-only` prints the parsed arguments and exits
+# 0 before any check, lease or run. Environment: BLOOMERY_HOST_BOUND, seconds one thread count may take
 # (default 600).
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
@@ -20,15 +21,26 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 BIN=target/release/bench_v41_host
 THREADS="8 16 24 30 32"
-if [ "${1:-}" = --threads ]; then
-  [ -n "${2:-}" ] || { echo "host-rate.sh: --threads needs a list, e.g. --threads 16,32" >&2; exit 64; }
-  THREADS=${2//,/ }
-  shift 2
-fi
+PARSE_ONLY=0
+BENCH_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --threads)
+      [ -n "${2:-}" ] || { echo "host-rate.sh: --threads needs a list, e.g. --threads 16,32" >&2; exit 64; }
+      THREADS=${2//,/ }
+      shift 2 ;;
+    --parse-only) PARSE_ONLY=1; shift ;;
+    *) BENCH_ARGS+=("$1"); shift ;;
+  esac
+done
 BOUND=${BLOOMERY_HOST_BOUND:-600}
 for t in $THREADS $BOUND; do
   case "$t" in ''|*[!0-9]*|0) echo "host-rate.sh: thread counts and the bound are positive integers, got '$t'" >&2; exit 64 ;; esac
 done
+if [ "$PARSE_ONLY" = 1 ]; then
+  echo "[parse] threads='$THREADS' bound=$BOUND bench-args=(${BENCH_ARGS[*]})"
+  exit 0
+fi
 [ -f Cargo.toml ] || { echo "host-rate.sh: run from the repo root" >&2; exit 2; }
 [ -x "$BIN" ] || { echo "no $BIN — run: just time-cpu-v41-host (it builds the bench first)" >&2; exit 2; }
 
@@ -65,7 +77,7 @@ rc=0
 for t in $THREADS; do
   echo "--- threads $t $(date -u +%H:%M:%SZ) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2)"
   t0=$(date +%s)
-  if ! BLOOMERY_THREADS=$t BLOOMERY_HOST_LEASE=1 timeout --kill-after=10 "$BOUND" "$BIN" --time "$@"; then
+  if ! BLOOMERY_THREADS=$t BLOOMERY_HOST_LEASE=1 timeout --kill-after=10 "$BOUND" "$BIN" --time "${BENCH_ARGS[@]}"; then
     rc=1
     echo "[threads $t] bench_v41_host failed or passed the ${BOUND} s bound — stopping the sweep" >&2
     break

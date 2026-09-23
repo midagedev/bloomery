@@ -6,7 +6,8 @@
 //! and the gates at once.
 
 use crate::ModelError;
-use gguf::{Gguf, Split};
+use crate::placement::PlacementError;
+use gguf::{Gguf, Split, Value};
 
 pub mod deepseek2;
 pub mod deepseek41;
@@ -53,6 +54,83 @@ impl Arch {
             Arch::Deepseek2 => "deepseek2",
             Arch::Deepseek41 => "deepseek41",
         }
+    }
+}
+
+// ------------------------------------------------------------ metadata keys
+//
+// The readers of `<architecture>.<suffix>` keys every architecture module
+// shares: each returns the value or the error that names the key.
+
+/// The token list ik counts when the file has no `vocab_size`.
+const TOKENS: &str = "tokenizer.ggml.tokens";
+
+/// The error that names `<architecture>.<suffix>`.
+fn metadata(split: &Split, suffix: &str, detail: impl Into<String>) -> PlacementError {
+    PlacementError::Metadata {
+        key: split.arch_key(suffix),
+        detail: detail.into(),
+    }
+}
+
+/// `<architecture>.<suffix>` as an unsigned integer.
+fn meta_u64(split: &Split, suffix: &str) -> Result<u64, PlacementError> {
+    split
+        .arch_get_u64(suffix)
+        .ok_or_else(|| metadata(split, suffix, "is absent or not an unsigned integer"))
+}
+
+/// `meta_u64` for a count that indexes memory.
+fn meta_usize(split: &Split, suffix: &str) -> Result<usize, PlacementError> {
+    let v = meta_u64(split, suffix)?;
+    usize::try_from(v).map_err(|_| metadata(split, suffix, format!("{v} does not fit usize")))
+}
+
+/// `<architecture>.<suffix>` as a float.
+fn meta_f32(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
+    split
+        .arch_get_f32(suffix)
+        .ok_or_else(|| metadata(split, suffix, "is absent or not a float"))
+}
+
+/// `<architecture>.<suffix>` as a string.
+fn meta_str<'a>(split: &'a Split, suffix: &str) -> Result<&'a str, PlacementError> {
+    split
+        .arch_get_str(suffix)
+        .ok_or_else(|| metadata(split, suffix, "is absent or not a string"))
+}
+
+/// `<architecture>.<suffix>` as a bool.
+fn meta_bool(split: &Split, suffix: &str) -> Result<bool, PlacementError> {
+    split
+        .value(&split.arch_key(suffix))
+        .and_then(Value::as_bool)
+        .ok_or_else(|| metadata(split, suffix, "is absent or not a bool"))
+}
+
+/// `<architecture>.<suffix>` as an array's items.
+fn meta_arr<'a>(split: &'a Split, suffix: &str) -> Result<&'a [Value], PlacementError> {
+    split
+        .arch_get_arr(suffix)
+        .ok_or_else(|| metadata(split, suffix, "is absent or not an array"))
+}
+
+/// The vocabulary size where ik takes it (llama-hparams.cpp:155):
+/// `vocab_size` when the file carries it, else the token list's length.
+fn n_vocab(split: &Split) -> Result<usize, PlacementError> {
+    let key = "vocab_size";
+    if split.value(&split.arch_key(key)).is_some() {
+        return meta_usize(split, key);
+    }
+    match split.value(TOKENS) {
+        Some(Value::Array(tokens)) => Ok(tokens.len()),
+        _ => Err(PlacementError::Metadata {
+            key: TOKENS.to_string(),
+            detail: format!(
+                "is absent or not an array, and so is {}",
+                split.arch_key(key)
+            ),
+        }),
     }
 }
 

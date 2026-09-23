@@ -480,7 +480,9 @@ unsafe fn v_wrap_i8(q: __m256i) -> __m256i {
 /// domain the encoders reduce.
 ///
 /// # Safety
-/// SSE3 must be available on the target.
+/// AVX (`_mm256_castps256_ps128`, `_mm256_extractf128_ps`) and SSE3
+/// (`_mm_movehdup_ps`) must be available on the target; being
+/// `#[inline(always)]`, it takes them from its caller's features.
 #[inline(always)]
 unsafe fn hmax_ps(v: __m256) -> f32 {
     unsafe {

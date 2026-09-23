@@ -461,15 +461,15 @@ fn dequant_q4_k(src: &[u8], dst: &mut [f32]) {
     {
         let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
-        let scales: &[u8; 12] = blk[4..16].try_into().unwrap();
+        let scales: [u8; 12] = std::array::from_fn(|i| blk[4 + i]);
         let qs = &blk[16..144];
 
         let mut is = 0usize;
         for j in 0..4 {
-            let (sc, mi) = get_scale_min_k4(is, scales);
+            let (sc, mi) = get_scale_min_k4(is, &scales);
             let d1 = d * sc as f32;
             let m1 = dmin * mi as f32;
-            let (sc, mi) = get_scale_min_k4(is + 1, scales);
+            let (sc, mi) = get_scale_min_k4(is + 1, &scales);
             let d2 = d * sc as f32;
             let m2 = dmin * mi as f32;
             let q = &qs[32 * j..32 * j + 32];
@@ -503,7 +503,7 @@ fn dequant_q5_k(src: &[u8], dst: &mut [f32]) {
     {
         let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
-        let scales: &[u8; 12] = blk[4..16].try_into().unwrap();
+        let scales: [u8; 12] = std::array::from_fn(|i| blk[4 + i]);
         let qh = &blk[16..48];
         let qs = &blk[48..176];
 
@@ -511,10 +511,10 @@ fn dequant_q5_k(src: &[u8], dst: &mut [f32]) {
         let mut u1 = 1u8;
         let mut u2 = 2u8;
         for j in 0..4 {
-            let (sc, mi) = get_scale_min_k4(is, scales);
+            let (sc, mi) = get_scale_min_k4(is, &scales);
             let d1 = d * sc as f32;
             let m1 = dmin * mi as f32;
-            let (sc, mi) = get_scale_min_k4(is + 1, scales);
+            let (sc, mi) = get_scale_min_k4(is + 1, &scales);
             let d2 = d * sc as f32;
             let m2 = dmin * mi as f32;
             let ql = &qs[32 * j..32 * j + 32];

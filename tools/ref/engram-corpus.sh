@@ -23,6 +23,9 @@
 #
 # The two newer sets sort under LC_ALL=C, so their file order does not depend on the box's
 # locale; the first three keep the locale sort their existing .ids files were built with.
+# That sort puts prose-all's docs/ files ahead of github-data/ on purpose (a change rebuilds the
+# .ids its numbers rest on), so its head is the prose set again: an analysis that reads only the
+# first ids of prose-all re-measures prose. For the threads, read `threads`.
 # `korean` reads the synced tree, so its text is the commit box.sh last synced — record the
 # commit next to the .ids md5 when a number rests on it.
 #
