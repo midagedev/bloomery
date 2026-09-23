@@ -499,6 +499,11 @@ gate-ds41-host:
 gate-threads:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-threads --test pool -- --include-ignored --nocapture'
 
+# 샘플러 게이트: greedy·top-k=1이 엔진 argmax와 같고, top-p·min-p·반복 벌점이 참조의 정의대로 자르고,
+# 추첨 빈도가 소프트맥스를 따르며, 같은 시드는 같은 토큰을 내고, 첫 호출 뒤 할당이 0인가. 박스 자원 불필요.
+gate-sampler:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-sampler --test sampler -- --nocapture'
+
 # 2단계 qdot 게이트: Q3_K×Q8_K 융합 커널이 현재 경로(dequant+roundtrip+f32)와
 # 1e-5 안팎에서 일치하고, 정확해(f64)에 더 가깝고, 스칼라 폴백과 비트 동일인가.
 # 순수 게이트(rejects_unaligned_k)는 #[ignore]가 아니라 --include-ignored로 같이 돈다.
@@ -555,7 +560,7 @@ gate-1-1:
     ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && "$BLOOMERY_DATA/bin/dequant_ref" "${BLOOMERY_V41_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}" "$BLOOMERY_DATA/ref-v41" f32 bf16 q8_0 && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-gpu-gates-lib gate-gpu-lib
+gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-gpu-gates-lib gate-gpu-lib gate-sampler
 
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.

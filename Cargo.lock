@@ -159,6 +159,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-sampler"
+version = "0.1.0"
+
+[[package]]
 name = "bloomery-threads"
 version = "0.1.0"
 dependencies = [
