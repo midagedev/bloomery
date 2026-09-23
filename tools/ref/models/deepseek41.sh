@@ -67,11 +67,14 @@ REF_DUMP_ARGS=(--defer-experts)
 #   step4  the oracle's five ids: a quiet prefill of 4, the step at position 4, -c 512
 #   d1     the indexer top-k overridden to 64, so the indexer, the row gather and mask_to_idx run at a
 #          short prefix: prefill 301, the step at 301 (a csa group completes there), -c 512
+#   d1n    d1 without the override: the file's top-k (512) at prefill 301, so neither kind builds an indexer
+#          (top_k >= pad256(n_vis) for csa and hca) while the window mask already hides keys older than 128 —
+#          the step set of a chain that has no indexer yet
 #   d2     the model's own top-k: prefill 1,025, the step at 1,025, -c 2048
-# d1 and d2 read the prose stream the router trace ran over (router/prose/MANIFEST.tsv names it):
+# d1, d1n and d2 read the prose stream the router trace ran over (router/prose/MANIFEST.tsv names it):
 # /root/bloomery-data/engram/corpus-prose-all.ids, 4,670,384 lines, sha256
-# f7785d0fc84a4a7e3673a220120be8c6735ab226084b2a506d16412ec64f71a0 — d1 its first 302 ids, d2 its first
-# 1,026.
+# f7785d0fc84a4a7e3673a220120be8c6735ab226084b2a506d16412ec64f71a0 — d1 and d1n its first 302 ids, d2 its
+# first 1,026.
 ref_step_variant() {
   local name=$1 unfused=0 every_node=0
   while :; do
@@ -87,12 +90,13 @@ ref_step_variant() {
     step4) STEP_SET=ref_deepseek41_step4; STEP_CTX=512;  STEP_PREFILL=4; STEP_TOKENS=$REF_TOKENS ;;
     d1)    STEP_SET=ref_deepseek41_d1;    STEP_CTX=512;  STEP_PREFILL=301
            STEP_ARGS=(--override-kv deepseek41.attention.indexer.top_k=int:64) ;;
+    d1n)   STEP_SET=ref_deepseek41_d1n;   STEP_CTX=512;  STEP_PREFILL=301 ;;
     d2)    STEP_SET=ref_deepseek41_d2;    STEP_CTX=2048; STEP_PREFILL=1025 ;;
     *)     return 1 ;;
   esac
   case $name in
-    d1|d2) STEP_TOKENS_FILE=$BLOOMERY_DATA/engram/corpus-prose-all.ids
-           STEP_TOKENS_SHA256=f7785d0fc84a4a7e3673a220120be8c6735ab226084b2a506d16412ec64f71a0 ;;
+    d1|d1n|d2) STEP_TOKENS_FILE=$BLOOMERY_DATA/engram/corpus-prose-all.ids
+               STEP_TOKENS_SHA256=f7785d0fc84a4a7e3673a220120be8c6735ab226084b2a506d16412ec64f71a0 ;;
   esac
   if [ "$unfused" = 1 ]; then
     STEP_SET=${STEP_SET}_unfused

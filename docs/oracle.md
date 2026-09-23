@@ -69,11 +69,12 @@ V4.1 세트(`ref_deepseek41`)는 토큰 `671,6102,294,8760,344`를 쓴다. BOS �
 
 - `step4` — 오라클의 다섯 id, 프리필 4, 위치 4의 스텝, `-c 512`.
 - `d1` — 프리필 301, 위치 301의 스텝(csa 그룹이 거기서 끝난다), `-c 512`. 인덱서 top-k를 64로 덮어써서(`--override-kv`) 인덱서·고른 행 모으기·`mask_to_idx`가 짧은 깊이에서 돈다. 창 자르기는 아직 없다.
+- `d1n` — d1에서 덮어쓰기만 뺀 것: 프리필 301, 위치 301의 스텝, 파일의 top-k 512, `-c 512`. 이 깊이에서는 csa·hca 모두 top_k ≥ pad256(n_vis)라 인덱서가 생기지 않는다. 대신 창 가림(128보다 오래된 키)이 깊이 301에서 돈다. 인덱서가 없는 1단계 사슬(B5 `b5attn`·`b5step`)의 스텝 세트다. 세트에는 인덱스 키 쓰기(`lid_k_new`·`lid_k_write`)와 `mask_to_idx`만 남고 `lid_top_k`·점수 노드는 없다(리드 덤프 09-23, 3,199행).
 - `d2` — 프리필 1,025, 파일의 top-k 512, `-c 2048`. 창 자르기(1,280 → 512)가 여기서 처음 나온다.
 
-d1·d2는 라우터 추적이 쓴 산문 코퍼스 `/root/bloomery-data/engram/corpus-prose-all.ids`의 앞부분을 읽고, 러너가 그 파일의 sha256을 대조한다. 접미사 둘이 한 가지씩 바꾼다. `-every-node`는 프리필을 덤프 스케줄로 돌린다. `-unfused`는 ik의 융합 `INDEXER_TOPK`를 꺼서 점수와 top-k가 노드로 나오게 한다(융합 op는 동률을 다르게 깬다).
+d1·d1n·d2는 라우터 추적이 쓴 산문 코퍼스 `/root/bloomery-data/engram/corpus-prose-all.ids`의 앞부분을 읽고, 러너가 그 파일의 sha256을 대조한다. 접미사 둘이 한 가지씩 바꾼다. `-every-node`는 프리필을 덤프 스케줄로 돌린다. `-unfused`는 ik의 융합 `INDEXER_TOPK`를 꺼서 점수와 top-k가 노드로 나오게 한다(융합 op는 동률을 다르게 깬다).
 
-**리드는 `-every-node`를 기본으로 쓴다.** 융합 프리필은 토큰 4까지 40층 중 26층의 expert 집합을 바꾸고, 층 5부터 캐시가 어긋나 `result_output`에서 0.46까지 벌어진다. every-node 프리필이면 스텝이 배치 세트의 마지막 토큰과 1,265행 전부 비트 동일하다(b4dump 측정). 공유 데이터에 있는 스텝 세트는 `ref_deepseek41_step4_every_node`(654 M), `…_d1_every_node`(719 M)와 `…_d1_unfused_every_node`, `…_d2_every_node`(1.9 G)와 `…_d2_unfused_every_node`다(`du`).
+**리드는 `-every-node`를 기본으로 쓴다.** 융합 프리필은 토큰 4까지 40층 중 26층의 expert 집합을 바꾸고, 층 5부터 캐시가 어긋나 `result_output`에서 0.46까지 벌어진다. every-node 프리필이면 스텝이 배치 세트의 마지막 토큰과 1,265행 전부 비트 동일하다(b4dump 측정). 공유 데이터에 있는 스텝 세트는 `ref_deepseek41_step4_every_node`(654 M), `…_d1_every_node`(719 M)와 `…_d1_unfused_every_node`, `…_d1n_every_node`(876 M), `…_d2_every_node`(1.9 G)와 `…_d2_unfused_every_node`다(`du`).
 
 **상태는 input 행이다.** 캐시와 압축기 상태는 INPUT 플래그가 없는 leaf라, 스텝 모드에서만 첫 독자가 물을 때 `input` 행으로 쓴다. 스텝 자신의 노드가 사는 버퍼의 leaf는 스크래치라 `skip-input … graph-scratch`가 된다. 이름은 `leaf_N`인데 N이 세트마다 달라서(step4의 `leaf_79`는 FILL 템플릿이고 d1에서는 인덱스 키 캐시다), 게이트는 상태를 이름이 아니라 그것을 읽는 노드의 `src0`/`src1` 열로 찾는다. 스텝 세트 머리에는 `# prefill`, `# decode_pos`, `# prefill_schedule`, `# state_inputs`, `# fused_idx_topk`, `# tokens_file`(과 `_sha256`·`_count`)가 붙고, 모든 세트에 `# flags`(덤퍼 인자)가 붙는다.
 
