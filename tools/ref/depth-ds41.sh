@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # V4.1 decode by depth, both engines in one lease on the timing card (run on the box, lead-only):
 # our engine (generate_ds41 --depth D --time, placement (a)) and ik (llama-bench -gp D,N at the
-# profile's IK_GPU_FLAGS), alternated arm by arm.
+# profile's IK_GPU_FLAGS, under its IK_GPU_ENV), alternated arm by arm.
 #
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/depth-ds41.sh 6 ik:6'
 #   just depth-gpu-ds41 6 ik:6 1024 ik:1024 4096 ik:4096
@@ -18,10 +18,12 @@
 #            ctx_max the plan (a) is made for, at every depth: the plan's card expert prefix depends
 #            on ctx_max, so a per-depth ctx would move experts between the card and the host.
 #   ik:<D>   ik: llama-bench -p 0 -n 0 -gp D,N -r 1 (D = 0: plain tg N). llama-bench sizes its
-#            context to D + N itself and feeds its own prompt ids, not lcg_prompt's.
-# Until the chain runs the indexer's selection, generate_ds41 refuses a run that reaches the first
-# position where an indexer layer's stream shows more rows than top_k (512 on this file), so our
-# arms stop at D + N - 1 <= 512; the arm's refusal stops the runner (rc 1).
+#            context to D + N itself and feeds its own prompt ids, not lcg_prompt's. It runs as
+#            `env $IK_GPU_ENV`: without GGML_CUDA_NO_PINNED_WEIGHTS the CPU expert overrides turn
+#            the host context into one pinned allocation larger than RAM and the load fails (the
+#            profile's IK_GPU_ENV comment).
+# Our arms run at any depth up to the plan's ctx_max (every indexer layer selects its list at every
+# position); generate_ds41 refuses only D + N - 1 > --ctx, and a refusal stops the runner (rc 1).
 #
 # Placement. Ours is plan (a): every layer and the head on the A6000, each routed layer's experts
 # [0, n_l) on the card (n_l 63-64 of 384, the budget's), the rest on the host tier — the plan line
@@ -42,8 +44,8 @@
 # (seconds one arm may run, default 900: a hung arm fails the runner with rc 124/137 instead of
 # holding the lease).
 set -uo pipefail
-# The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS); tools/box.sh exports its MODEL to our binary as
-# BLOOMERY_REF_MODEL, so both engines open one file.
+# The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_ENV); tools/box.sh exports its MODEL to our
+# binary as BLOOMERY_REF_MODEL, so both engines open one file.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 [ "$MODEL_NAME" = deepseek41 ] || {
@@ -83,7 +85,7 @@ ik_witness() { echo "    ik: $IKBIN sha256=$IK_SHA head=$IK_HEAD dirty_files=$IK
 
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
-echo "[config] ours: $BIN (placement (a), default ctx) ik: $IKBIN flags=$IK_GPU_FLAGS"
+echo "[config] ours: $BIN (placement (a), default ctx) ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 witness pre
 ik_witness
@@ -102,12 +104,12 @@ for r in $(seq "$ROUNDS"); do
         t0=$(date +%s)
         if [ "$dep" = 0 ]; then
           # shellcheck disable=SC2086
-          raw=$(timeout --kill-after=10 "$BOUND" "$IKBIN" -m "$MODEL" -p 0 -n "$N" -r 1 $IK_GPU_FLAGS 2>&1)
+          raw=$(timeout --kill-after=10 "$BOUND" env $IK_GPU_ENV "$IKBIN" -m "$MODEL" -p 0 -n "$N" -r 1 $IK_GPU_FLAGS 2>&1)
           rc=$?
           label="tg$N "
         else
           # shellcheck disable=SC2086
-          raw=$(timeout --kill-after=10 "$BOUND" "$IKBIN" -m "$MODEL" -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_GPU_FLAGS 2>&1)
+          raw=$(timeout --kill-after=10 "$BOUND" env $IK_GPU_ENV "$IKBIN" -m "$MODEL" -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_GPU_FLAGS 2>&1)
           rc=$?
           label="tg$N@pp$dep"
         fi

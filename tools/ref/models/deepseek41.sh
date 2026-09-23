@@ -39,13 +39,18 @@
 #                   ours about 202 [derived]). -t 32 is llama-bench's own default, spelled out;
 #                   --defer-experts skips the loader's MAP_POPULATE of a file set larger than the page
 #                   cache. No flag sweep has been run: these are "at these flags".
-#                   Known not to load today: with -ngl 999 the loader puts the whole host
-#                   context (the 34 layers' experts and the engram tables, about 400 GiB) in one
-#                   CUDA_Host buffer instead of the mmap branch, and the pinned allocation fails
-#                   (`ggml_cuda_host_malloc: mmap of 410412.18 MiB failed`); GGML_CUDA_NO_PINNED=1
-#                   would malloc the same bytes on a 256 GB box. `llama-perplexity -ngl 0` opens the
-#                   same file by mmap, so the split is between -ngl 0 and -ngl > 0 or in llama-bench's
-#                   own override path; until that is found depth-ds41.sh's ik arms fail at load
+#                   llama-bench's --n-cpu-moe N is a list of CPU buffer-type overrides for layers
+#                   0..N-1 (the same thing -ot "...=CPU" gives), not the loader's own ncmoe.
+#   IK_GPU_ENV      the environment of every ik launch with IK_GPU_FLAGS, as NAME=VALUE words for
+#                   `env`. GGML_CUDA_NO_PINNED_WEIGHTS=1 is load-bearing: any override to the CPU
+#                   makes ik's loader drop mmap for the whole host context
+#                   (src/llama-load-tensors.cpp, `use_mmap_buffer &= !has_buft_overrides`), and that
+#                   context — the 34 layers' experts and the engram tables, about 400 GiB — would
+#                   then be one pinned allocation, larger than RAM. With the variable the host
+#                   context stays on the file mapping, unpinned, and the staging buffers stay
+#                   pinned. GGML_CUDA_NO_PINNED=1 also keeps the mapping, but unpins the staging
+#                   buffers too. Never add GGML_CUDA_REGISTER_HOST: it would cudaHostRegister the
+#                   whole mapping.
 #
 # Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
 # this model, and every script that reads them runs under `set -u`, so such a script stops at the
@@ -58,6 +63,7 @@ MODEL_NAME=deepseek41
 : "${IK:=/home/user/ik-idxkey}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}
 : "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe 34 -t 32 --defer-experts}"
+: "${IK_GPU_ENV:=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_deepseek41}"
 : "${REF_SET_CUDA:=ref_cuda_deepseek41}"
