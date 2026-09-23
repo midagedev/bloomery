@@ -417,11 +417,13 @@ fn table_index(t: Table) -> usize {
         .expect("every table is in Table::ALL")
 }
 
-/// The piece's copy of the step words and the gather that fills it.
+/// The piece's copies of the step words, one per row, and the gather that
+/// fills them. A pass whose rows run one layer apart interleaves the rows'
+/// layers, and each layer reads its own row's words.
 struct Words {
     layout: WordsLayout,
-    /// The words; u32 fields are read through u32 views.
-    buf: DeviceBuffer<f32>,
+    /// Per row, the words; u32 fields are read through u32 views.
+    bufs: Vec<DeviceBuffer<f32>>,
     src: DeviceBuffer<u32>,
     dst: DeviceBuffer<u32>,
     pairs: usize,
@@ -430,8 +432,29 @@ struct Words {
 }
 
 impl Words {
-    fn view<T>(&self, off: usize, len: usize) -> Result<View<'_, T>, GpuError> {
-        view(&self.buf, off, len)
+    /// Row `row`'s copy with the layout.
+    fn of(&self, row: usize) -> Result<RowWords<'_>, GpuError> {
+        let buf = self.bufs.get(row).ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!("row {row} of a piece of {} rows", self.bufs.len()),
+        })?;
+        Ok(RowWords {
+            layout: &self.layout,
+            buf,
+        })
+    }
+}
+
+/// One row's copy of the step words, as one layer's launches read it.
+#[derive(Clone, Copy)]
+struct RowWords<'a> {
+    layout: &'a WordsLayout,
+    buf: &'a DeviceBuffer<f32>,
+}
+
+impl<'a> RowWords<'a> {
+    fn view<T>(&self, off: usize, len: usize) -> Result<View<'a, T>, GpuError> {
+        view(self.buf, off, len)
     }
 }
 
@@ -599,7 +622,7 @@ impl AttnChain {
     /// The piece for `layers` of the model `hp` describes, reading images of
     /// `layout` and caches sized by `planner`'s `ctx_max`: every name,
     /// layer kind, table offset and gather pair resolved, the kernels loaded
-    /// and the scratch allocated. Load-time only.
+    /// and the scratch allocated. One row of step words. Load-time only.
     pub fn new(
         gpu: &Gpu,
         hp: &Hparams,
@@ -607,7 +630,24 @@ impl AttnChain {
         layout: &ImageLayout,
         planner: &Planner,
     ) -> Result<AttnChain, GpuError> {
+        AttnChain::with_rows(gpu, hp, layers, layout, planner, 1)
+    }
+
+    /// [`AttnChain::new`] with `rows` copies of the step words, for a pass
+    /// whose rows run one layer apart. The scratch is shared: a layer's
+    /// launches consume it before the next layer of either row runs.
+    pub fn with_rows(
+        gpu: &Gpu,
+        hp: &Hparams,
+        layers: Range<usize>,
+        layout: &ImageLayout,
+        planner: &Planner,
+        rows: usize,
+    ) -> Result<AttnChain, GpuError> {
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
+        if rows == 0 {
+            return Err(refuse("a piece of no rows".to_string()));
+        }
         let dims = layout.dims();
         if dims.tokens != STEP_TOKENS || dims.rope_dims != hp.rope_dims {
             return Err(refuse(format!(
@@ -674,8 +714,11 @@ impl AttnChain {
             step: StepKernels::load(ctx)?,
         };
         let pairs = src.len();
+        let constant = constant_words(&words_layout, list_len)?;
         let words = Words {
-            buf: DeviceBuffer::from_host(stream, &constant_words(&words_layout, list_len)?)?,
+            bufs: (0..rows)
+                .map(|_| DeviceBuffer::from_host(stream, &constant))
+                .collect::<Result<Vec<_>, _>>()?,
             src: DeviceBuffer::from_host(stream, &src)?,
             dst: DeviceBuffer::from_host(stream, &dst)?,
             layout: words_layout,
@@ -811,7 +854,9 @@ impl AttnChain {
             });
         }
         let host = constant_words(&self.words.layout, top_k)?;
-        self.words.buf.copy_from_host(gpu.stream(), &host)?;
+        for buf in &mut self.words.bufs {
+            buf.copy_from_host(gpu.stream(), &host)?;
+        }
         self.top_k = top_k;
         Ok(())
     }
@@ -837,11 +882,16 @@ impl AttnChain {
             &s.y,
             &s.wo_a,
             &s.out,
-            &self.words.buf,
         ]
         .iter()
         .map(|b| b.num_bytes())
-        .sum::<usize>();
+        .sum::<usize>()
+            + self
+                .words
+                .bufs
+                .iter()
+                .map(DeviceBuffer::num_bytes)
+                .sum::<usize>();
         let source = s.source.as_ref().map_or(0, |x| {
             [&x.kv, &x.score, &x.pre, &x.key]
                 .iter()
@@ -874,12 +924,24 @@ impl AttnChain {
         &self.words.layout
     }
 
-    /// The piece's copy of the step words, as the last
+    /// Row 0's copy of the step words, as the last
     /// [`enqueue_step`](Self::enqueue_step) left it: u32 values in f32
     /// cells, at [`words_layout`](Self::words_layout)'s offsets.
     #[must_use]
     pub fn words(&self) -> &DeviceBuffer<f32> {
-        &self.words.buf
+        &self.words.bufs[0]
+    }
+
+    /// Rows of step words the piece holds.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.words.bufs.len()
+    }
+
+    /// Device bytes of one row's copy of the step words.
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
+        self.words.bufs[0].num_bytes()
     }
 
     /// The intermediate buffers of the last enqueued layer.
@@ -919,9 +981,25 @@ impl AttnChain {
     /// Enqueue the step's gather: the words the layers read, from `image`,
     /// the step image's device copy, into the piece's own. Once a step,
     /// before the layers. One launch; asynchronous, allocation-free,
-    /// capturable.
+    /// capturable. Row 0's copy.
     pub fn enqueue_step(&mut self, gpu: &Gpu, image: &DeviceBuffer<u32>) -> Result<(), GpuError> {
+        self.enqueue_step_of(gpu, image, 0)
+    }
+
+    /// [`AttnChain::enqueue_step`] into row `row`'s copy, from that row's
+    /// image.
+    pub fn enqueue_step_of(
+        &mut self,
+        gpu: &Gpu,
+        image: &DeviceBuffer<u32>,
+        row: usize,
+    ) -> Result<(), GpuError> {
         let w = &mut self.words;
+        let rows = w.bufs.len();
+        let buf = w.bufs.get_mut(row).ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!("row {row} of a piece of {rows} rows"),
+        })?;
         if image.len() != w.image_len {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -935,18 +1013,31 @@ impl AttnChain {
         let x = view::<u32, f32>(image, 0, image.len())?;
         self.kernels
             .step
-            .enqueue_gather(gpu.stream(), &x, &w.src, &w.dst, w.pairs, &mut w.buf)
+            .enqueue_gather(gpu.stream(), &x, &w.src, &w.dst, w.pairs, buf)
     }
 
     /// Enqueue layer `layer`'s attention sub-layer on `gpu`'s stream, its
     /// weights resident in `w`: the module comment's launches, reading the
     /// words the step's [`enqueue_step`](Self::enqueue_step) gathered.
-    /// Asynchronous, allocation-free, capturable.
+    /// Asynchronous, allocation-free, capturable. Row 0's words.
     pub fn enqueue_layer(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
         layer: usize,
+        io: AttnIo<'_>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_layer_of(gpu, w, layer, 0, io)
+    }
+
+    /// [`AttnChain::enqueue_layer`] reading row `row`'s words, which its
+    /// [`enqueue_step_of`](Self::enqueue_step_of) gathered.
+    pub fn enqueue_layer_of(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        layer: usize,
+        row: usize,
         io: AttnIo<'_>,
     ) -> Result<(), GpuError> {
         let lp = layer
@@ -971,7 +1062,7 @@ impl AttnChain {
             w,
             k: &self.kernels,
             d: &self.dims,
-            words: &self.words,
+            words: self.words.of(row)?,
         };
         let s = &mut self.scratch;
         let (d, k, stream, n) = (cx.d, cx.k, gpu.stream(), &lp.names);
@@ -1162,7 +1253,7 @@ struct Cx<'a> {
     w: &'a Weights,
     k: &'a Kernels,
     d: &'a Dims,
-    words: &'a Words,
+    words: RowWords<'a>,
 }
 
 /// The query path: q_a, its norm, q_b and the tail rope of every head.

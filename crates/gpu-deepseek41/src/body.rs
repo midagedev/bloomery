@@ -37,6 +37,13 @@
 //! step ([`ChainBody::decode_input`]) plans it, reads its embedding and
 //! engram rows from the file and builds its image.
 //!
+//! The pair pass ([`Body::enqueue_pair`]) runs two tokens as rows one layer
+//! apart on the same launches, so the host tier serves one row's layer while
+//! the card runs the other's: each row has its own streams, folds, image
+//! copy and lists, and each piece its own row of the buffers a layer leaves
+//! for later; the caches are shared, written by row 0 before row 1 reads
+//! them. [`Body::rollback`] takes the last position back.
+//!
 //! [`ChainBody::seed_depth`] refuses: a synthetic depth would have to fill
 //! the rings, the compressed rows, the index keys and the states
 //! consistently with each other.
@@ -44,7 +51,7 @@
 use std::ops::Range;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HOST, Hybrid, SlotMap, levers};
+use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, SlotMap, levers};
 use bloomery_gpu::model::{ChainBody, StepProbe};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
@@ -68,6 +75,10 @@ pub type Deepseek41Model = GpuModel<Body>;
 
 /// Tokens one decode step runs.
 pub const STEP_TOKENS: usize = 1;
+
+/// Rows of the pair pass ([`Body::enqueue_pair`]): tokens `t` and `t + 1`
+/// one layer apart. The one-token step runs on row 0.
+pub const PAIR_ROWS: usize = 2;
 
 /// The whole V4.1 model on this machine's placement `machine`: the file's
 /// headers read once ([`Hparams`]), its tensors classified and planned at
@@ -233,6 +244,43 @@ pub struct StepInput {
     pub pos: u32,
 }
 
+/// One row's buffers besides the layers' caches and the pieces' own: what
+/// a token's step writes and reads again later in the step.
+struct Lane {
+    /// The hyper-connection streams, ping and pong: `streams` × `n_embd` f32
+    /// each.
+    hc: [DeviceTensor<f32>; 2],
+    /// The folded input a sub-layer reads, ping and pong: `n_embd` f32 each.
+    folds: [DeviceBuffer<f32>; 2],
+    /// The row's image's device copy, which the captured chain reads.
+    params: DeviceBuffer<u32>,
+}
+
+impl Lane {
+    fn new(stream: &CudaStream, hp: &Hparams, words: usize) -> Result<Lane, GpuError> {
+        Ok(Lane {
+            hc: [
+                DeviceTensor::zeroed(stream, hp.hc.streams, hp.n_embd)?,
+                DeviceTensor::zeroed(stream, hp.hc.streams, hp.n_embd)?,
+            ],
+            folds: [
+                DeviceBuffer::zeroed(stream, hp.n_embd)?,
+                DeviceBuffer::zeroed(stream, hp.n_embd)?,
+            ],
+            params: DeviceBuffer::<u32>::zeroed(stream, words)?,
+        })
+    }
+}
+
+/// Which halves of a row's ping-pong pairs the row's next sub-layer reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct Cursor {
+    /// The streams.
+    s: usize,
+    /// The folded input.
+    f: usize,
+}
+
 /// The V4.1 chain body: see the module comment.
 pub struct Body {
     /// The layers this card runs.
@@ -240,16 +288,13 @@ pub struct Body {
     /// Per layer of `layers`, in order.
     kv: Vec<LayerKv>,
     steps: Vec<LayerStep>,
-    /// The hyper-connection streams, ping and pong: `streams` × `n_embd` f32
-    /// each.
-    hc: [DeviceTensor<f32>; 2],
-    /// The folded input a sub-layer reads, ping and pong: `n_embd` f32 each.
-    folds: [DeviceBuffer<f32>; 2],
-    /// Per indexer layer of the card, in layer order: its list.
-    lists: Vec<DeviceBuffer<u32>>,
+    /// Per row of the pair pass: its streams, folds and image copy.
+    lanes: Vec<Lane>,
+    /// Per row, per indexer layer of the card, in layer order: its list. A
+    /// row's later layers read the list its indexer layer wrote, and the
+    /// pair pass runs the other row's indexer layer between them.
+    lists: Vec<Vec<DeviceBuffer<u32>>>,
     image: StepImage,
-    /// The image's device copy, which the captured chain reads.
-    params: DeviceBuffer<u32>,
     /// The slot map's card copy: `layers.len()` rows of `n_expert` slots.
     /// The host tier holds the host copy.
     slots: DeviceTensor<u32>,
@@ -311,22 +356,27 @@ impl Body {
     }
 
     /// The buffers besides the layers' caches, by name, with their device
-    /// bytes: the pieces' scratch among them.
+    /// bytes, every row's: the pieces' scratch among them.
     #[must_use]
     pub fn step_buffers(&self) -> [(&'static str, usize); 9] {
+        let lanes = |f: fn(&Lane) -> usize| self.lanes.iter().map(f).sum::<usize>();
         [
             (
                 "hyper-connection streams",
-                self.hc.iter().map(|t| t.buf().num_bytes()).sum(),
+                lanes(|l| l.hc.iter().map(|t| t.buf().num_bytes()).sum()),
             ),
             (
                 "folded inputs",
-                self.folds.iter().map(DeviceBuffer::num_bytes).sum(),
+                lanes(|l| l.folds.iter().map(DeviceBuffer::num_bytes).sum()),
             ),
-            ("step image", self.params.num_bytes()),
+            ("step image", lanes(|l| l.params.num_bytes())),
             (
                 "selection lists",
-                self.lists.iter().map(DeviceBuffer::num_bytes).sum(),
+                self.lists
+                    .iter()
+                    .flatten()
+                    .map(DeviceBuffer::num_bytes)
+                    .sum(),
             ),
             ("slot map", self.slots.buf().num_bytes()),
             ("join buffers", self.hybrid.boundary().device_bytes()),
@@ -348,10 +398,55 @@ impl Body {
         &mut self.image
     }
 
-    /// The image's device copy, as the captured chain reads it.
+    /// Row 0's image's device copy, as the captured chain reads it.
     #[must_use]
     pub fn params(&self) -> &DeviceBuffer<u32> {
-        &self.params
+        &self.lanes[0].params
+    }
+
+    /// Row `row`'s buffers as its last step left them: the streams' and the
+    /// folds' ping-pong pairs, and its lists in indexer-layer order; `None`
+    /// for a row the body does not hold.
+    #[must_use]
+    pub fn row_buffers(&self, row: usize) -> Option<RowBuffers<'_>> {
+        let lane = self.lanes.get(row)?;
+        Some(RowBuffers {
+            streams: [lane.hc[0].buf(), lane.hc[1].buf()],
+            folds: [&lane.folds[0], &lane.folds[1]],
+            lists: self.lists.get(row)?,
+        })
+    }
+
+    /// The tokens decoded so far, one per position.
+    #[must_use]
+    pub fn history(&self) -> &[u32] {
+        &self.history
+    }
+
+    /// Device bytes of one row's own buffers — its streams, folds, image
+    /// copy and lists — and of one row of each piece's: what a second row
+    /// adds. By name.
+    #[must_use]
+    pub fn row_bytes(&self) -> [(&'static str, usize); 7] {
+        let lane = &self.lanes[0];
+        [
+            (
+                "hyper-connection streams",
+                lane.hc.iter().map(|t| t.buf().num_bytes()).sum(),
+            ),
+            (
+                "folded inputs",
+                lane.folds.iter().map(DeviceBuffer::num_bytes).sum(),
+            ),
+            ("step image", lane.params.num_bytes()),
+            (
+                "selection lists",
+                self.lists[0].iter().map(DeviceBuffer::num_bytes).sum(),
+            ),
+            ("attention step words", self.attn.row_bytes()),
+            ("ffn row", self.ffn.row_bytes()),
+            ("engram site rows", self.glue.row_bytes()),
+        ]
     }
 
     /// The slot map's card copy: `layers().len()` rows of the file's
@@ -458,14 +553,191 @@ impl Body {
         head: &mut Head,
         observe: &mut dyn FnMut(&Gpu, Seam<'_>) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
+        let mut p = self.parts();
+        p.hybrid.begin_chain(gpu.stream())?;
+        let mut cur = Cursor::default();
+        p.begin_row(gpu, 0, &mut cur)?;
+        for (i, l) in p.layers.clone().enumerate() {
+            let step = p.steps[i];
+            if p.engram(gpu, w, i, l, 0, &mut cur)? {
+                let lane = &p.lanes[0];
+                observe(
+                    gpu,
+                    Seam::Engram {
+                        layer: l,
+                        streams: lane.hc[cur.s].buf(),
+                        fold: &lane.folds[cur.f],
+                    },
+                )?;
+            }
+            p.attn(gpu, w, i, l, 0, &mut cur)?;
+            {
+                let lane = &p.lanes[0];
+                observe(
+                    gpu,
+                    Seam::Attn {
+                        layer: l,
+                        streams: lane.hc[cur.s].buf(),
+                        fold: &lane.folds[cur.f],
+                        taps: p.attn.taps(),
+                        list: match step.list {
+                            ListOf::None => None,
+                            ListOf::Reads(j) | ListOf::Writes { list: j, .. } => p.lists[0].get(j),
+                        },
+                    },
+                )?;
+            }
+            p.ffn_go(gpu, w, i, l, 0, cur)?;
+            p.ffn_join(gpu, i, l, 0, &mut cur)?;
+            let lane = &p.lanes[0];
+            observe(
+                gpu,
+                Seam::Ffn {
+                    layer: l,
+                    streams: lane.hc[cur.s].buf(),
+                    fold: step.folds.then_some(&lane.folds[cur.f]),
+                    taps: p.ffn.taps(),
+                },
+            )?;
+        }
+        p.head(gpu, w, 0, cur, head)
+    }
+
+    /// Enqueue the pair pass: rows 0 and 1 — the two tokens
+    /// [`Body::decode_pair`] planned, at `pos` and `pos + 1` — one layer
+    /// apart on the one stream, `heads[r]` taking row `r`'s logits. Per
+    /// layer `l`, each row in turn joins its layer `l − 1`, runs the engram
+    /// step where `l` carries one, its attention and its MoE sub-layer up to
+    /// the host leg's shadow; so the host serves row 0's layer `l` while the
+    /// card runs row 1's layer `l` up to its go, and row 1's while the card
+    /// runs row 0's layer `l + 1`. Row 1's attention at layer `l` reads the
+    /// cache row row 0 wrote at `l` just before it; nothing row 1 writes is
+    /// read by row 0. Every launch is the one-token step's, in the same
+    /// order within its row, so the two rows' logits and every cache, row,
+    /// key and state are bit for bit those of two steps in turn.
+    /// Asynchronous apart from the host tier's service of an eager chain.
+    pub fn enqueue_pair(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        heads: [&mut Head; PAIR_ROWS],
+    ) -> Result<(), GpuError> {
+        let mut p = self.parts();
+        if p.lanes.len() < PAIR_ROWS {
+            return Err(GpuError::State {
+                what: "deepseek41 Body::enqueue_pair",
+                missing: "a second row of buffers",
+            });
+        }
+        p.hybrid.begin_chain_of(gpu.stream(), Chain::Pair)?;
+        let mut cur = [Cursor::default(); PAIR_ROWS];
+        for (row, c) in cur.iter_mut().enumerate() {
+            p.begin_row(gpu, row, c)?;
+        }
+        let mut last = None;
+        for (i, l) in p.layers.clone().enumerate() {
+            for (row, c) in cur.iter_mut().enumerate() {
+                if let Some((j, k)) = last {
+                    p.ffn_join(gpu, j, k, row, c)?;
+                }
+                p.engram(gpu, w, i, l, row, c)?;
+                p.attn(gpu, w, i, l, row, c)?;
+                p.ffn_go(gpu, w, i, l, row, *c)?;
+            }
+            last = Some((i, l));
+        }
+        let (j, k) = last.ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_pair",
+            missing: "a layer",
+        })?;
+        for ((row, head), c) in heads.into_iter().enumerate().zip(cur.iter_mut()) {
+            p.ffn_join(gpu, j, k, row, c)?;
+            p.head(gpu, w, row, *c, head)?;
+        }
+        Ok(())
+    }
+
+    /// The pair pass's host half: the step at `pos` for `tokens[0]` into
+    /// row 0's image copy, then the step at `pos + 1` for `tokens[1]` into
+    /// row 1's — each planned after the tokens before it, the first of the
+    /// two included — with both tokens appended to the history.
+    pub fn decode_pair(
+        &mut self,
+        stream: &CudaStream,
+        tokens: [u32; PAIR_ROWS],
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        if self.lanes.len() < PAIR_ROWS {
+            return Err(GpuError::State {
+                what: "deepseek41 Body::decode_pair",
+                missing: "a second row of buffers",
+            });
+        }
+        for (row, (token, pos)) in tokens.into_iter().zip(pos..).enumerate() {
+            let input = self.decode_input(token, pos)?;
+            self.refresh_row(stream, &input, row)?;
+        }
+        Ok(())
+    }
+
+    /// Take back the tokens from position `pos` on: the next step runs at
+    /// `pos`. At most the last position can go. The caches need nothing
+    /// undone — the step at `pos` again writes its own ring slot,
+    /// compressed row and index key before anything reads them, reads no
+    /// state slot the step it replaces wrote (a compressor keeps position
+    /// `pos`'s projection in the slot of `pos`'s residue, which its group
+    /// reads only after that step's own persist), and every row, key and
+    /// list at or past `pos` lies outside what a step before it sees.
+    pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        let (to, len) = (pos as usize, self.history.len());
+        if to > len || len - to > 1 {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::rollback",
+                detail: format!(
+                    "back to position {pos} after {len} tokens: only the last position can be \
+                     taken back"
+                ),
+            });
+        }
+        self.history.truncate(to);
+        Ok(())
+    }
+
+    /// One host-to-device copy of the whole image into row `row`'s copy,
+    /// which must hold the step `input` names.
+    fn refresh_row(
+        &mut self,
+        stream: &CudaStream,
+        input: &StepInput,
+        row: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "deepseek41 Body::refresh";
+        if self.image.pos() != Some(input.pos) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "the image holds the step at {:?}, the input names {}",
+                    self.image.pos(),
+                    input.pos
+                ),
+            });
+        }
+        let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the row's buffers",
+        })?;
+        lane.params.copy_from_host(stream, self.image.words())?;
+        Ok(())
+    }
+
+    /// The body's buffers a row's launches borrow, apart from the host half.
+    fn parts(&mut self) -> Parts<'_> {
         let Body {
             layers,
             kv,
             steps,
-            hc,
-            folds,
+            lanes,
             lists,
-            params,
             slots,
             hybrid,
             attn,
@@ -473,122 +745,247 @@ impl Body {
             glue,
             ..
         } = self;
-        hybrid.begin_chain(gpu.stream())?;
-        attn.enqueue_step(gpu, params)?;
-        // `s` is the streams the next sub-layer reads, `f` its folded input.
-        let (mut s, mut f) = (0usize, 0usize);
-        {
-            let [s0, _] = &mut *hc;
-            let [f0, _] = &mut *folds;
-            glue.enqueue_embed(gpu, params, s0.buf_mut(), f0)?;
+        Parts {
+            layers,
+            kv,
+            steps,
+            lanes,
+            lists,
+            slots,
+            hybrid,
+            attn,
+            ffn,
+            glue,
         }
-        for (i, (l, step)) in layers.clone().zip(steps.iter()).enumerate() {
-            if step.engram {
-                let (streams, out) = ping(hc, s);
-                let [f0, f1] = &mut *folds;
-                glue.enqueue_engram(
-                    gpu,
-                    w,
-                    l,
-                    EngramStep {
-                        streams: streams.buf(),
-                        pre: ffn.taps().hc,
-                        out: out.buf_mut(),
-                        input: if f == 0 { f0 } else { f1 },
-                    },
-                )?;
-                s ^= 1;
-                observe(
-                    gpu,
-                    Seam::Engram {
-                        layer: l,
-                        streams: hc[s].buf(),
-                        fold: &folds[f],
-                    },
-                )?;
-            }
-            {
-                let (streams_in, streams_out) = ping(hc, s);
-                let (fold_in, fold_out) = ping(folds, f);
-                let (ring, compressed, selection) = layer_io(kv, lists, i, step)?;
-                attn.enqueue_layer(
-                    gpu,
-                    w,
-                    l,
-                    AttnIo {
-                        streams_in: streams_in.buf(),
-                        fold_in,
-                        streams_out: streams_out.buf_mut(),
-                        fold_out,
-                        ring,
-                        compressed,
-                        selection,
-                    },
-                )?;
-            }
-            s ^= 1;
-            f ^= 1;
-            observe(
-                gpu,
-                Seam::Attn {
-                    layer: l,
-                    streams: hc[s].buf(),
-                    fold: &folds[f],
-                    taps: attn.taps(),
-                    list: match step.list {
-                        ListOf::None => None,
-                        ListOf::Reads(j) | ListOf::Writes { list: j, .. } => lists.get(j),
-                    },
-                },
-            )?;
-            {
-                let (streams_in, streams_out) = ping(hc, s);
-                let (fold_in, fold_out) = ping(folds, f);
-                let mut engram_kv = step.shadow_site.map(|layer| EngramKv {
-                    glue: &mut *glue,
-                    w,
-                    params: &*params,
-                    layer,
-                });
-                let mut one: [&mut dyn ShadowWork; 1];
-                let shadow: &mut [&mut dyn ShadowWork] = match engram_kv.as_mut() {
-                    Some(job) => {
-                        one = [job as &mut dyn ShadowWork];
-                        &mut one
-                    }
-                    None => &mut [],
-                };
-                ffn.enqueue_shadowed(
-                    gpu,
-                    w,
-                    CardStacks::of(w, l)?,
-                    FfnIo {
-                        streams: streams_in.buf(),
-                        fold_in,
-                        streams_out: streams_out.buf_mut(),
-                        fold_out: step.folds.then_some(fold_out),
-                        slots: &*slots,
-                    },
-                    &mut *hybrid,
-                    l,
-                    shadow,
-                )?;
-            }
-            s ^= 1;
-            if step.folds {
-                f ^= 1;
-            }
-            observe(
-                gpu,
-                Seam::Ffn {
-                    layer: l,
-                    streams: hc[s].buf(),
-                    fold: step.folds.then_some(&folds[f]),
-                    taps: ffn.taps(),
-                },
-            )?;
+    }
+}
+
+/// Row `row`'s buffers as [`Body::row_buffers`] shows them.
+pub struct RowBuffers<'a> {
+    pub streams: [&'a DeviceBuffer<f32>; 2],
+    pub folds: [&'a DeviceBuffer<f32>; 2],
+    pub lists: &'a [DeviceBuffer<u32>],
+}
+
+/// The body's step buffers and pieces, borrowed apart from its host half:
+/// what one row's launches take.
+struct Parts<'a> {
+    layers: &'a Range<usize>,
+    kv: &'a mut [LayerKv],
+    steps: &'a [LayerStep],
+    lanes: &'a mut [Lane],
+    lists: &'a mut [Vec<DeviceBuffer<u32>>],
+    slots: &'a DeviceTensor<u32>,
+    hybrid: &'a mut Hybrid<Ds41Host>,
+    attn: &'a mut AttnChain,
+    ffn: &'a mut FfnPiece,
+    glue: &'a mut Glue,
+}
+
+impl Parts<'_> {
+    /// Row `row`'s start: the attention piece's gather of the row's step
+    /// words, then the embedding broadcast into the row's streams and layer
+    /// 0's input.
+    fn begin_row(&mut self, gpu: &Gpu, row: usize, cur: &mut Cursor) -> Result<(), GpuError> {
+        let (attn, glue) = (&mut *self.attn, &*self.glue);
+        let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_chain",
+            missing: "the row's buffers",
+        })?;
+        attn.enqueue_step_of(gpu, &lane.params, row)?;
+        let Lane { hc, folds, params } = lane;
+        let [s0, _] = hc;
+        let [f0, _] = folds;
+        glue.enqueue_embed(gpu, params, s0.buf_mut(), f0)?;
+        *cur = Cursor::default();
+        Ok(())
+    }
+
+    /// Row `row`'s engram step before layer `l` (index `i`), where the layer
+    /// carries one; whether it does.
+    fn engram(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        i: usize,
+        l: usize,
+        row: usize,
+        cur: &mut Cursor,
+    ) -> Result<bool, GpuError> {
+        if !self.steps[i].engram {
+            return Ok(false);
         }
-        glue.enqueue_head(gpu, w, hc[s].buf(), ffn.taps().hc, head)
+        let (glue, pre) = (&mut *self.glue, self.ffn.taps_of(row)?.hc);
+        let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_chain",
+            missing: "the row's buffers",
+        })?;
+        let (streams, out) = ping(&mut lane.hc, cur.s);
+        let [f0, f1] = &mut lane.folds;
+        glue.enqueue_engram_of(
+            gpu,
+            w,
+            l,
+            row,
+            EngramStep {
+                streams: streams.buf(),
+                pre,
+                out: out.buf_mut(),
+                input: if cur.f == 0 { f0 } else { f1 },
+            },
+        )?;
+        cur.s ^= 1;
+        Ok(true)
+    }
+
+    /// Row `row`'s attention sub-layer of layer `l` (index `i`).
+    fn attn(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        i: usize,
+        l: usize,
+        row: usize,
+        cur: &mut Cursor,
+    ) -> Result<(), GpuError> {
+        let step = self.steps[i];
+        let lists = self.lists.get_mut(row).ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_chain",
+            missing: "the row's lists",
+        })?;
+        let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_chain",
+            missing: "the row's buffers",
+        })?;
+        let (streams_in, streams_out) = ping(&mut lane.hc, cur.s);
+        let (fold_in, fold_out) = ping(&mut lane.folds, cur.f);
+        let (ring, compressed, selection) = layer_io(self.kv, lists, i, &step)?;
+        self.attn.enqueue_layer_of(
+            gpu,
+            w,
+            l,
+            row,
+            AttnIo {
+                streams_in: streams_in.buf(),
+                fold_in,
+                streams_out: streams_out.buf_mut(),
+                fold_out,
+                ring,
+                compressed,
+                selection,
+            },
+        )?;
+        cur.s ^= 1;
+        cur.f ^= 1;
+        Ok(())
+    }
+
+    /// Row `row`'s MoE sub-layer of layer `l` (index `i`) up to its host
+    /// leg's shadow, the token-only work of the engram site at the next
+    /// layer inside it; reads the halves `cur` names.
+    fn ffn_go(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        i: usize,
+        l: usize,
+        row: usize,
+        cur: Cursor,
+    ) -> Result<(), GpuError> {
+        let step = self.steps[i];
+        let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_chain",
+            missing: "the row's buffers",
+        })?;
+        let Lane { hc, folds, params } = lane;
+        let (streams_in, streams_out) = ping(hc, cur.s);
+        let (fold_in, fold_out) = ping(folds, cur.f);
+        let mut engram_kv = step.shadow_site.map(|layer| EngramKv {
+            glue: &mut *self.glue,
+            w,
+            params: &*params,
+            layer,
+            row,
+        });
+        let mut one: [&mut dyn ShadowWork; 1];
+        let shadow: &mut [&mut dyn ShadowWork] = match engram_kv.as_mut() {
+            Some(job) => {
+                one = [job as &mut dyn ShadowWork];
+                &mut one
+            }
+            None => &mut [],
+        };
+        self.ffn.enqueue_go_half(
+            gpu,
+            w,
+            CardStacks::of(w, l)?,
+            &FfnIo {
+                streams: streams_in.buf(),
+                fold_in,
+                streams_out: streams_out.buf_mut(),
+                fold_out: step.folds.then_some(fold_out),
+                slots: self.slots,
+            },
+            &mut *self.hybrid,
+            l,
+            row,
+            shadow,
+        )
+    }
+
+    /// Row `row`'s MoE sub-layer of layer `l` (index `i`) from its wait on,
+    /// after its [`Parts::ffn_go`] with the same cursor.
+    fn ffn_join(
+        &mut self,
+        gpu: &Gpu,
+        i: usize,
+        l: usize,
+        row: usize,
+        cur: &mut Cursor,
+    ) -> Result<(), GpuError> {
+        let step = self.steps[i];
+        let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_chain",
+            missing: "the row's buffers",
+        })?;
+        let (streams_in, streams_out) = ping(&mut lane.hc, cur.s);
+        let (fold_in, fold_out) = ping(&mut lane.folds, cur.f);
+        self.ffn.enqueue_join_half(
+            gpu,
+            FfnIo {
+                streams: streams_in.buf(),
+                fold_in,
+                streams_out: streams_out.buf_mut(),
+                fold_out: step.folds.then_some(fold_out),
+                slots: self.slots,
+            },
+            &mut *self.hybrid,
+            l,
+            row,
+        )?;
+        cur.s ^= 1;
+        if step.folds {
+            cur.f ^= 1;
+        }
+        Ok(())
+    }
+
+    /// Row `row`'s end: its streams' collapse into `head`, and the head.
+    fn head(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        row: usize,
+        cur: Cursor,
+        head: &mut Head,
+    ) -> Result<(), GpuError> {
+        let pre = self.ffn.taps_of(row)?.hc;
+        let lane = self.lanes.get(row).ok_or(GpuError::State {
+            what: "deepseek41 Body::enqueue_chain",
+            missing: "the row's buffers",
+        })?;
+        self.glue
+            .enqueue_head(gpu, w, lane.hc[cur.s].buf(), pre, head)
     }
 }
 
@@ -716,42 +1113,33 @@ impl ChainBody for Body {
         Ok(StepInput { pos })
     }
 
-    /// One host-to-device copy of the whole image, which must hold the step
-    /// `input` names.
+    /// One host-to-device copy of the whole image into row 0's copy; the
+    /// image must hold the step `input` names.
     fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
-        if self.image.pos() != Some(input.pos) {
-            return Err(GpuError::Shape {
-                what: "deepseek41 Body::refresh",
-                detail: format!(
-                    "the image holds the step at {:?}, the input names {}",
-                    self.image.pos(),
-                    input.pos
-                ),
-            });
-        }
-        self.params.copy_from_host(stream, self.image.words())?;
-        Ok(())
+        self.refresh_row(stream, input, 0)
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
         self.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))
     }
 
-    /// Every ring, compressed row, index key, compressor state, stream, fold
-    /// and list is zeroed in place — a captured chain keeps their addresses —
-    /// and the token history is emptied.
+    /// Every ring, compressed row, index key, compressor state, and every
+    /// row's streams, folds and lists are zeroed in place — a captured chain
+    /// keeps their addresses — and the token history is emptied.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         for layer in &mut self.kv {
             layer.zero(stream)?;
         }
-        for t in &mut self.hc {
-            t.buf_mut().zero_async(stream)?;
+        for lane in &mut self.lanes {
+            for t in &mut lane.hc {
+                t.buf_mut().zero_async(stream)?;
+            }
+            for f in &mut lane.folds {
+                f.zero_async(stream)?;
+            }
         }
-        for f in &mut self.folds {
-            f.zero_async(stream)?;
-        }
-        for l in &mut self.lists {
+        for l in self.lists.iter_mut().flatten() {
             l.zero_async(stream)?;
         }
         self.history.clear();
@@ -794,6 +1182,33 @@ impl ChainBody for Body {
         self.hybrid.serve_captured()
     }
 
+    fn decode_pair(
+        &mut self,
+        stream: &CudaStream,
+        tokens: [u32; 2],
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        Body::decode_pair(self, stream, tokens, pos)
+    }
+
+    fn enqueue_pair(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        heads: [&mut Head; 2],
+    ) -> Result<(), GpuError> {
+        Body::enqueue_pair(self, gpu, w, heads)
+    }
+
+    /// The host tier's share of the pair pass a replay just submitted.
+    fn serve_replay_pair(&mut self) -> Result<(), GpuError> {
+        self.hybrid.serve_captured_of(Chain::Pair)
+    }
+
+    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        Body::rollback(self, pos)
+    }
+
     /// The body of card `card`: its buffers sized from `hp` — the
     /// hyperparameters the plan was made from — at the plan's `ctx_max`, its
     /// slot map from the plan's routed segments on the card, the host tier
@@ -829,14 +1244,6 @@ impl ChainBody for Body {
             .clone()
             .map(|l| layer_kv(stream, hp, l, ctx_max))
             .collect::<Result<Vec<_>, _>>()?;
-        let hc = [
-            DeviceTensor::zeroed(stream, hp.hc.streams, hp.n_embd)?,
-            DeviceTensor::zeroed(stream, hp.hc.streams, hp.n_embd)?,
-        ];
-        let folds = [
-            DeviceBuffer::zeroed(stream, hp.n_embd)?,
-            DeviceBuffer::zeroed(stream, hp.n_embd)?,
-        ];
 
         let planner =
             Planner::from_file(&file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
@@ -851,7 +1258,9 @@ impl ChainBody for Body {
         let dims = ImageDims::of(hp, &planner, STEP_TOKENS, row_bytes);
         let (window, yarn) = rope_specs(hp)?;
         let image = StepImage::new(ImageLayout::new(dims)?, &window, &yarn)?;
-        let params = DeviceBuffer::<u32>::zeroed(stream, image.layout().words())?;
+        let lanes = (0..PAIR_ROWS)
+            .map(|_| Lane::new(stream, hp, image.layout().words()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let n_expert = hp.experts.n_expert;
         let map = SlotMap::from_rows(
@@ -861,18 +1270,24 @@ impl ChainBody for Body {
         )?;
         let slots = DeviceTensor::upload(stream, map.as_slice(), layers.len(), n_expert)?;
 
-        let attn = AttnChain::new(gpu, hp, layers.clone(), image.layout(), &planner)?;
-        let ffn = FfnPiece::new(gpu, hp, &map)?;
-        let glue = Glue::new(gpu, hp, image.layout())?;
+        let attn =
+            AttnChain::with_rows(gpu, hp, layers.clone(), image.layout(), &planner, PAIR_ROWS)?;
+        let ffn = FfnPiece::with_rows(gpu, hp, &map, PAIR_ROWS)?;
+        let glue = Glue::with_rows(gpu, hp, image.layout(), PAIR_ROWS)?;
         let steps = layer_steps(hp, &layers, &kv, &ffn, &glue)?;
-        let lists = (0..steps
+        let writers = steps
             .iter()
             .filter(|s| matches!(s.list, ListOf::Writes { .. }))
-            .count())
-            .map(|_| DeviceBuffer::zeroed(stream, STEP_TOKENS * attn.list_len()))
+            .count();
+        let lists = (0..PAIR_ROWS)
+            .map(|_| {
+                (0..writers)
+                    .map(|_| DeviceBuffer::zeroed(stream, STEP_TOKENS * attn.list_len()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let boundary = Boundary::new(
+        let boundary = Boundary::with_rows(
             gpu.context(),
             stream,
             BoundaryShape {
@@ -881,6 +1296,7 @@ impl ChainBody for Body {
             },
             map,
             levers()?.overlap,
+            PAIR_ROWS,
         )?;
         let first = file
             .shard_path(0)
@@ -892,11 +1308,9 @@ impl ChainBody for Body {
             layers,
             kv,
             steps,
-            hc,
-            folds,
+            lanes,
             lists,
             image,
-            params,
             slots,
             hybrid,
             attn,

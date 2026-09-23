@@ -41,6 +41,13 @@
 //! each layer's two stream memory-operation batches (go, wait); no copy.
 //! A caller's shadow work is its own and is not counted here.
 //!
+//! A layer is enqueued in two halves — up to the shadow work
+//! ([`FfnPiece::enqueue_go_half`]) and from the wait on
+//! ([`FfnPiece::enqueue_join_half`]) — on one row of the piece's buffers. A
+//! pass whose two rows run one layer apart puts the other row's layer
+//! between them, so every buffer a layer writes is the row's own; only
+//! HC_PRE's reduction scratch, which its own launches consume, is shared.
+//!
 //! The piece takes the resident weights at enqueue, not at [`FfnPiece::new`]:
 //! the engine keeps its weights and its chain body apart, and the body that
 //! holds this piece cannot borrow them. `new` resolves every name once; an
@@ -52,7 +59,7 @@ use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::hybrid::{Boundary, HOST, HostExperts, Hybrid, SlotMap};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, launch_u32};
-use cuda_core::{DeviceBuffer, LaunchConfig1D};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use gguf::{GgmlType, Split};
@@ -601,6 +608,64 @@ pub struct FfnTaps<'a> {
     pub hc: &'a DeviceBuffer<f32>,
 }
 
+/// One row's buffers: everything a layer's launches write, read back by its
+/// join or by a gate. A pass whose rows run one layer apart enqueues the
+/// other row's whole layer between a row's go and its join, so each row
+/// keeps its own.
+struct FfnRow {
+    act_x: Q8Act,
+    rout: RouterOut,
+    sel: DeviceBuffer<u32>,
+    h: DeviceBuffer<f32>,
+    act_h: Q8Act,
+    down: DeviceBuffer<f32>,
+    sh_h: DeviceBuffer<f32>,
+    sh_y: DeviceBuffer<f32>,
+    y: DeviceBuffer<f32>,
+    mixes: DeviceBuffer<f32>,
+    hc_out: DeviceBuffer<f32>,
+}
+
+impl FfnRow {
+    fn new(stream: &CudaStream, n_embd: usize, ff: usize) -> Result<FfnRow, GpuError> {
+        let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        Ok(FfnRow {
+            act_x: Q8Act::with_k(stream, 1, n_embd)?,
+            rout: RouterOut::new(stream)?,
+            sel: DeviceBuffer::zeroed(stream, N_USED)?,
+            h: z(N_USED * ff)?,
+            act_h: Q8Act::with_k(stream, N_USED, ff)?,
+            down: z(N_USED * n_embd)?,
+            sh_h: z(ff)?,
+            sh_y: z(n_embd)?,
+            y: z(n_embd)?,
+            mixes: z(HC_MIX)?,
+            hc_out: z(HC_MIX)?,
+        })
+    }
+
+    fn device_bytes(&self) -> usize {
+        let f32s = [
+            &self.h,
+            &self.down,
+            &self.sh_h,
+            &self.sh_y,
+            &self.y,
+            &self.mixes,
+            &self.hc_out,
+            &self.rout.logits,
+            &self.rout.probs,
+            &self.rout.weights,
+        ];
+        f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + self.sel.num_bytes()
+            + self.rout.ids.num_bytes()
+            + ROUTER_TICKET_BYTES
+            + q8act_bytes(&self.act_x)
+            + q8act_bytes(&self.act_h)
+    }
+}
+
 /// The MoE sub-layer of every layer of one slot map, built once at load.
 pub struct FfnPiece {
     fused: FusedKernels,
@@ -617,27 +682,33 @@ pub struct FfnPiece {
     hc_eps: f32,
     hc_iters: u32,
     scale: f32,
-    act_x: Q8Act,
-    rout: RouterOut,
-    sel: DeviceBuffer<u32>,
-    h: DeviceBuffer<f32>,
-    act_h: Q8Act,
-    down: DeviceBuffer<f32>,
-    sh_h: DeviceBuffer<f32>,
-    sh_y: DeviceBuffer<f32>,
-    y: DeviceBuffer<f32>,
-    mixes: DeviceBuffer<f32>,
-    hc_out: DeviceBuffer<f32>,
+    /// Per row, its buffers ([`FfnPiece::with_rows`]).
+    rows: Vec<FfnRow>,
+    /// HC_PRE's reduction scratch, which its own launches consume.
     hc_scratch: HcPreScratch,
 }
 
 impl FfnPiece {
     /// The piece for every layer of `map`, whose rows say which experts each
     /// layer's card stacks hold: names, constants, the kernels and the
-    /// piece's scratch, all resolved here. Load-time only.
+    /// piece's scratch, all resolved here. One row. Load-time only.
     pub fn new(gpu: &Gpu, hp: &Hparams, map: &SlotMap) -> Result<FfnPiece, GpuError> {
+        FfnPiece::with_rows(gpu, hp, map, 1)
+    }
+
+    /// [`FfnPiece::new`] with `rows` rows of buffers, for a pass whose rows
+    /// run one layer apart. Load-time only.
+    pub fn with_rows(
+        gpu: &Gpu,
+        hp: &Hparams,
+        map: &SlotMap,
+        rows: usize,
+    ) -> Result<FfnPiece, GpuError> {
         const WHAT: &str = "FfnPiece::new";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
+        if rows == 0 {
+            return Err(refuse("a piece of no rows".to_string()));
+        }
         let (n_embd, ff, ex) = (hp.n_embd, hp.experts.ff, &hp.experts);
         if ex.n_expert != N_EXPERT || ex.n_used != N_USED || map.n_expert() != ex.n_expert {
             return Err(refuse(format!(
@@ -688,7 +759,9 @@ impl FfnPiece {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
         let module = unsafe { ffn_kernels::load(ctx)? };
-        let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        let rows = (0..rows)
+            .map(|_| FfnRow::new(stream, n_embd, ff))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(FfnPiece {
             fused: FusedKernels::load(ctx)?,
             router: RouterKernels::load(ctx)?,
@@ -705,17 +778,7 @@ impl FfnPiece {
             hc_iters: u32::try_from(hp.hc.sinkhorn_iters)
                 .map_err(|_| refuse(format!("{} Sinkhorn rounds", hp.hc.sinkhorn_iters)))?,
             scale: ex.routed_scale,
-            act_x: Q8Act::with_k(stream, 1, n_embd)?,
-            rout: RouterOut::new(stream)?,
-            sel: DeviceBuffer::zeroed(stream, N_USED)?,
-            h: z(N_USED * ff)?,
-            act_h: Q8Act::with_k(stream, N_USED, ff)?,
-            down: z(N_USED * n_embd)?,
-            sh_h: z(ff)?,
-            sh_y: z(n_embd)?,
-            y: z(n_embd)?,
-            mixes: z(HC_MIX)?,
-            hc_out: z(HC_MIX)?,
+            rows,
             hc_scratch: HcPreScratch::new(stream, HC_STREAMS * n_embd)?,
         })
     }
@@ -741,43 +804,51 @@ impl FfnPiece {
             .map(|c| if c.n_card > 0 { 10 } else { 7 })
     }
 
-    /// Device bytes of the piece's own scratch.
+    /// Device bytes of the piece's own scratch, every row's.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
-        let f32s = [
-            &self.h,
-            &self.down,
-            &self.sh_h,
-            &self.sh_y,
-            &self.y,
-            &self.mixes,
-            &self.hc_out,
-            &self.rout.logits,
-            &self.rout.probs,
-            &self.rout.weights,
-        ];
-        f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
-            + self.sel.num_bytes()
-            + self.rout.ids.num_bytes()
-            + ROUTER_TICKET_BYTES
-            + q8act_bytes(&self.act_x)
-            + q8act_bytes(&self.act_h)
+        self.rows.iter().map(FfnRow::device_bytes).sum::<usize>()
             + hc_pre_scratch_bytes(&self.hc_scratch)
     }
 
-    /// The piece's buffers as the last enqueued layer left them.
+    /// Device bytes of one row's buffers.
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
+        self.rows.first().map_or(0, FfnRow::device_bytes)
+    }
+
+    /// Rows of buffers the piece holds.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Row 0's buffers as the last layer enqueued on it left them.
     #[must_use]
     pub fn taps(&self) -> FfnTaps<'_> {
-        FfnTaps {
-            router: &self.rout,
-            sel: &self.sel,
-            h: &self.h,
-            down: &self.down,
-            shexp_h: &self.sh_h,
-            shexp: &self.sh_y,
-            y: &self.y,
-            hc: &self.hc_out,
-        }
+        self.taps_of(0).expect("every piece holds row 0")
+    }
+
+    /// Row `row`'s buffers as the last layer enqueued on it left them.
+    pub fn taps_of(&self, row: usize) -> Result<FfnTaps<'_>, GpuError> {
+        let r = self.row(row)?;
+        Ok(FfnTaps {
+            router: &r.rout,
+            sel: &r.sel,
+            h: &r.h,
+            down: &r.down,
+            shexp_h: &r.sh_h,
+            shexp: &r.sh_y,
+            y: &r.y,
+            hc: &r.hc_out,
+        })
+    }
+
+    fn row(&self, row: usize) -> Result<&FfnRow, GpuError> {
+        self.rows.get(row).ok_or_else(|| GpuError::Shape {
+            what: ENQUEUE,
+            detail: format!("row {row} of a piece of {} rows", self.rows.len()),
+        })
     }
 
     fn cfg_of(&self, layer: usize) -> Option<&LayerCfg> {
@@ -790,7 +861,7 @@ impl FfnPiece {
     /// puts no expert there), `hybrid` the host tier, which is told the
     /// layer is enqueued last — an eager chain has it served then, a capture
     /// notes it for its replays. Asynchronous apart from that service,
-    /// allocation-free, capturable.
+    /// allocation-free, capturable. Row 0's buffers.
     pub fn enqueue<H: HostExperts>(
         &mut self,
         gpu: &Gpu,
@@ -805,7 +876,8 @@ impl FfnPiece {
 
     /// [`FfnPiece::enqueue`], with `extra` enqueued in order into the
     /// layer's host-leg shadow after the piece's own shadow work
-    /// ([`ShadowWork`]).
+    /// ([`ShadowWork`]): [`FfnPiece::enqueue_go_half`] then
+    /// [`FfnPiece::enqueue_join_half`] on row 0.
     #[allow(
         clippy::too_many_arguments,
         reason = "enqueue's arguments and the shadow work; the pieces take the shared buffers flat (rust-quality R8)"
@@ -820,41 +892,87 @@ impl FfnPiece {
         layer: usize,
         extra: &mut [&mut dyn ShadowWork],
     ) -> Result<(), GpuError> {
-        let (i, card) = self.check(layer, hybrid.boundary().slots(), &io, card)?;
+        self.enqueue_go_half(gpu, w, card, &io, hybrid, layer, 0, extra)?;
+        self.enqueue_join_half(gpu, io, hybrid, layer, 0)
+    }
+
+    /// The layer's launches up to its join, on row `row`'s buffers: the
+    /// norm, the router, the handoff into the row's image and the go — with
+    /// the overlap lever off, the wait right after it — then the piece's own
+    /// shadow work and `extra`. A pass whose rows run one layer apart
+    /// enqueues the other row's work here, before this row's
+    /// [`FfnPiece::enqueue_join_half`] of the same layer.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue's arguments, the row and the shadow work; the pieces take the shared buffers flat (rust-quality R8)"
+    )]
+    pub fn enqueue_go_half<H: HostExperts>(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        card: Option<CardStacks<'_>>,
+        io: &FfnIo<'_>,
+        hybrid: &mut Hybrid<H>,
+        layer: usize,
+        row: usize,
+        extra: &mut [&mut dyn ShadowWork],
+    ) -> Result<(), GpuError> {
+        let i = self.check_io(layer, hybrid.boundary().slots(), io, row)?;
+        let card = self.check_card(layer, i, card)?;
         let lw = LayerWeights::resolve(&self.cfg[i], w, self.hc_eps, self.hc_iters)?;
-        self.enqueue_handoff(gpu, i, &lw, &io, hybrid, layer)?;
-        self.enqueue_shadow(gpu, i, &lw, card, &io, hybrid.boundary())?;
+        self.enqueue_handoff(gpu, i, row, &lw, io, hybrid, layer)?;
+        self.enqueue_shadow(gpu, i, row, &lw, card, io, hybrid.boundary())?;
         for work in extra.iter_mut() {
             work.enqueue(gpu)?;
         }
+        Ok(())
+    }
+
+    /// The layer's rest on row `row`'s buffers, after its
+    /// [`FfnPiece::enqueue_go_half`]: the wait (with the overlap lever on),
+    /// the join, and the host tier told the row's layer is enqueued.
+    pub fn enqueue_join_half<H: HostExperts>(
+        &mut self,
+        gpu: &Gpu,
+        io: FfnIo<'_>,
+        hybrid: &mut Hybrid<H>,
+        layer: usize,
+        row: usize,
+    ) -> Result<(), GpuError> {
+        let i = self.check_io(layer, hybrid.boundary().slots(), &io, row)?;
         let boundary = hybrid.boundary();
         if boundary.overlap() {
-            boundary.enqueue_back(gpu.stream())?;
+            boundary.enqueue_back_of(gpu.stream(), row)?;
         }
-        self.enqueue_join(gpu, i, io, boundary)?;
-        hybrid.layer_enqueued(layer)
+        self.enqueue_join(gpu, i, row, io, boundary)?;
+        hybrid.row_enqueued(layer, row)
     }
 
     /// Layer `layer`'s index in the piece, once the host tier's map, the
-    /// shared buffers and the card's stacks are checked against it; the
-    /// stacks back.
-    fn check<'s>(
+    /// shared buffers and the row are checked against it.
+    fn check_io(
         &self,
         layer: usize,
         map: &SlotMap,
         io: &FfnIo<'_>,
-        card: Option<CardStacks<'s>>,
-    ) -> Result<(usize, Option<CardStacks<'s>>), GpuError> {
+        row: usize,
+    ) -> Result<usize, GpuError> {
         let refuse = |detail: String| GpuError::Shape {
             what: ENQUEUE,
             detail,
         };
-        let (n, ff) = (self.n_embd, self.ff);
+        let n = self.n_embd;
         let i = layer
             .checked_sub(self.layers.start)
             .filter(|&i| i < self.cfg.len())
             .ok_or_else(|| refuse(format!("layer {layer} is outside {:?}", self.layers)))?;
         let c = &self.cfg[i];
+        if row >= self.rows.len() {
+            return Err(refuse(format!(
+                "row {row} of a piece of {} rows",
+                self.rows.len()
+            )));
+        }
         if map.layers() != self.layers || map.on_card(layer) != c.n_card {
             return Err(refuse(format!(
                 "the host tier's map (layers {:?}, {} experts of layer {layer} on the card) is not the \
@@ -891,8 +1009,24 @@ impl FfnPiece {
                 c.fold
             )));
         }
-        let card = match (card, c.n_card) {
-            (None, 0) => None,
+        Ok(i)
+    }
+
+    /// The card's stacks for layer `layer` (index `i`), checked against the
+    /// experts its map row puts on the card; back.
+    fn check_card<'s>(
+        &self,
+        layer: usize,
+        i: usize,
+        card: Option<CardStacks<'s>>,
+    ) -> Result<Option<CardStacks<'s>>, GpuError> {
+        let refuse = |detail: String| GpuError::Shape {
+            what: ENQUEUE,
+            detail,
+        };
+        let (n, ff) = (self.n_embd, self.ff);
+        match (card, self.cfg[i].n_card) {
+            (None, 0) => Ok(None),
             (Some(s), k) if k > 0 => {
                 let (gu_words, d_words) = (110 * (n / 256) / 4, 36 * (ff / 256));
                 if s.gate.rows() != k * ff
@@ -915,24 +1049,26 @@ impl FfnPiece {
                         s.down.cols()
                     )));
                 }
-                Some(s)
+                Ok(Some(s))
             }
-            (s, k) => {
-                return Err(refuse(format!(
-                    "layer {layer}: the map puts {k} experts on the card and the stacks are {}",
-                    if s.is_some() { "given" } else { "absent" }
-                )));
-            }
-        };
-        Ok((i, card))
+            (s, k) => Err(refuse(format!(
+                "layer {layer}: the map puts {k} experts on the card and the stacks are {}",
+                if s.is_some() { "given" } else { "absent" }
+            ))),
+        }
     }
 
-    /// The norm, the router, the handoff into the page and the go — and,
-    /// with the overlap lever off, the wait right after it.
+    /// The norm, the router, the handoff into row `row`'s image and the go
+    /// — and, with the overlap lever off, the wait right after it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the layer, its row and weights, the shared buffers and the host tier (rust-quality R8)"
+    )]
     fn enqueue_handoff<H: HostExperts>(
         &mut self,
         gpu: &Gpu,
         i: usize,
+        row: usize,
         lw: &LayerWeights<'_>,
         io: &FfnIo<'_>,
         hybrid: &mut Hybrid<H>,
@@ -941,12 +1077,13 @@ impl FfnPiece {
         let stream = gpu.stream();
         let n = self.n_embd;
         let c = &self.cfg[i];
+        let r = &mut self.rows[row];
         self.fused.enqueue_norm_quant(
             stream,
             io.fold_in,
             lw.gain,
             self.rms_eps,
-            &mut self.act_x,
+            &mut r.act_x,
             hybrid.boundary_mut().normed_mut(),
         )?;
         self.router.enqueue_router(
@@ -955,10 +1092,10 @@ impl FfnPiece {
             hybrid.boundary().normed(),
             lw.bias,
             self.scale,
-            &mut self.rout,
+            &mut r.rout,
         )?;
         let what = "ds41_ffn_handoff";
-        let target = hybrid.boundary_mut().handoff_target();
+        let target = hybrid.boundary_mut().handoff_target_of(row)?;
         let lay = target.layout;
         if lay.n_used != N_USED || lay.hidden != n {
             return Err(GpuError::Shape {
@@ -976,8 +1113,8 @@ impl FfnPiece {
         self.module.ds41_ffn_handoff(
             stream,
             &prep,
-            &self.rout.ids,
-            &self.rout.weights,
+            &r.rout.ids,
+            &r.rout.weights,
             io.slots.buf(),
             launch_u32(what, "row_off", c.row_off)?,
             launch_u32(what, "n_expert", self.n_expert)?,
@@ -989,23 +1126,29 @@ impl FfnPiece {
             launch_u32(what, "wts_at", lay.weights)?,
             launch_u32(what, "x_at", lay.x)?,
             target.image,
-            &mut self.sel,
+            &mut r.sel,
         )?;
         let boundary = hybrid.boundary();
-        boundary.enqueue_go(stream, layer)?;
+        boundary.enqueue_go_of(stream, layer, row)?;
         if !boundary.overlap() {
-            boundary.enqueue_back(stream)?;
+            boundary.enqueue_back_of(stream, row)?;
         }
         Ok(())
     }
 
-    /// The piece's own work in the shadow of the host's leg: HC_PRE, the
-    /// card's routed experts, the shared expert. The caller's shadow work and,
-    /// with the overlap lever on, the wait follow it.
+    /// The piece's own work in the shadow of the host's leg, on row `row`'s
+    /// buffers: HC_PRE, the card's routed experts, the shared expert. The
+    /// caller's shadow work and, with the overlap lever on, the wait follow
+    /// it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the layer, its row, weights and stacks, and the shared buffers (rust-quality R8)"
+    )]
     fn enqueue_shadow(
         &mut self,
         gpu: &Gpu,
         i: usize,
+        row: usize,
         lw: &LayerWeights<'_>,
         card: Option<CardStacks<'_>>,
         io: &FfnIo<'_>,
@@ -1014,6 +1157,7 @@ impl FfnPiece {
         let stream = gpu.stream();
         let (n, ff) = (self.n_embd, self.ff);
         let c = &self.cfg[i];
+        let r = &mut self.rows[row];
         let pre = HcPreArgs {
             params: &lw.hc,
             x: io.streams,
@@ -1024,30 +1168,30 @@ impl FfnPiece {
             stream,
             &pre,
             &mut self.hc_scratch,
-            &mut self.mixes,
-            &mut self.hc_out,
+            &mut r.mixes,
+            &mut r.hc_out,
         )?;
         if let Some(s) = card {
             let args = ExpertGateUp {
                 wg: s.gate,
                 wu: s.up,
-                act: &self.act_x,
-                sel: &self.sel,
+                act: &r.act_x,
+                sel: &r.sel,
                 n_slots: N_USED,
                 rows_per_expert: ff,
                 limit: c.limit,
             };
             self.experts
-                .enqueue_expert_gate_up(stream, &args, &mut self.h)?;
-            gpu.enqueue_quantize_q8_1(&self.h, &mut self.act_h)?;
+                .enqueue_expert_gate_up(stream, &args, &mut r.h)?;
+            gpu.enqueue_quantize_q8_1(&r.h, &mut r.act_h)?;
             gpu.q4k_sel().enqueue_gemv_q4k_sel(
                 stream,
                 s.down,
-                &self.act_h,
-                &self.sel,
+                &r.act_h,
+                &r.sel,
                 N_USED,
                 n,
-                &mut self.down,
+                &mut r.down,
             )?;
         }
         self.experts.enqueue_shexp_gate_up(
@@ -1056,23 +1200,26 @@ impl FfnPiece {
             lw.sh_up,
             boundary.normed(),
             c.limit_shared,
-            &mut self.sh_h,
+            &mut r.sh_h,
         )?;
         gpu.q8f32()
-            .enqueue_q8_0_gemv(stream, lw.sh_qs, lw.sh_d, &self.sh_h, 1, &mut self.sh_y)?;
+            .enqueue_q8_0_gemv(stream, lw.sh_qs, lw.sh_d, &r.sh_h, 1, &mut r.sh_y)?;
         Ok(())
     }
 
-    /// The join: the combine and HC_POST in one launch, with the next fold
-    /// where the layer folds.
+    /// The join on row `row`'s buffers and host sum: the combine and HC_POST
+    /// in one launch, with the next fold where the layer folds.
     fn enqueue_join(
         &mut self,
         gpu: &Gpu,
         i: usize,
+        row: usize,
         io: FfnIo<'_>,
         boundary: &Boundary,
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
+        let hsum = boundary.hsum_of(row)?;
+        let r = &mut self.rows[row];
         let n = self.n_embd;
         let grid = launch_u32("ds41_ffn_post", "grid", n.div_ceil(POST_THREADS as usize))?;
         let cfg = LaunchConfig1D::new(grid, POST_THREADS, 0);
@@ -1084,16 +1231,16 @@ impl FfnPiece {
                 self.module.ds41_ffn_post(
                     stream,
                     &prep,
-                    &self.down,
-                    &self.rout.weights,
-                    &self.sel,
-                    boundary.hsum(),
-                    &self.sh_y,
+                    &r.down,
+                    &r.rout.weights,
+                    &r.sel,
+                    hsum,
+                    &r.sh_y,
                     io.streams,
-                    &self.hc_out,
+                    &r.hc_out,
                     rows,
                     n_card,
-                    &mut self.y,
+                    &mut r.y,
                     io.streams_out,
                     fold,
                 )?;
@@ -1103,16 +1250,16 @@ impl FfnPiece {
                 self.module.ds41_ffn_post_streams(
                     stream,
                     &prep,
-                    &self.down,
-                    &self.rout.weights,
-                    &self.sel,
-                    boundary.hsum(),
-                    &self.sh_y,
+                    &r.down,
+                    &r.rout.weights,
+                    &r.sel,
+                    hsum,
+                    &r.sh_y,
                     io.streams,
-                    &self.hc_out,
+                    &r.hc_out,
                     rows,
                     n_card,
-                    &mut self.y,
+                    &mut r.y,
                     io.streams_out,
                 )?;
             }

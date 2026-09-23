@@ -25,6 +25,13 @@
 //! and the host touches it again only after the next go, which the stream
 //! orders behind that add and a system barrier.
 //!
+//! A boundary of two rows carries a pass whose two tokens run one layer
+//! apart, so a row's go can land while the other row's wait is pending: each
+//! row has its own layer word, counter, image and sum, and the rule above
+//! holds per row, since a row's next go sits behind its own wait. The
+//! generation and sequence count every go in stream order, and the host
+//! serves in that order.
+//!
 //! The host side is the decode thread. After a graph launch it serves the
 //! captured chain's hybrid layers in order (`Hybrid::serve_captured`); an
 //! eager chain is served layer by layer as it is enqueued, so the stream never
@@ -266,25 +273,36 @@ impl SlotMap {
 enum Word {
     /// The card adds one per go; the host reads it.
     Gen,
-    /// The host adds one per layer served; the card waits for it and takes
-    /// it back.
-    Cnt,
-    /// The card writes the layer of each go; the host reads it.
-    Lyr,
+    /// The host adds one per layer of row `.0` served; the card waits for it
+    /// and takes it back.
+    Cnt(usize),
+    /// The card writes the layer of each go of row `.0`; the host reads it.
+    Lyr(usize),
 }
 
 impl Word {
     const fn offset(self) -> usize {
         match self {
             Word::Gen => 0,
-            Word::Cnt => 64,
-            Word::Lyr => 128,
+            Word::Cnt(row) => 64 + 128 * row,
+            Word::Lyr(row) => 128 + 128 * row,
         }
     }
 }
 
-/// Byte offset of the handoff's host image in the page.
-const PAYLOAD_OFF: usize = 256;
+/// Rows a boundary carries at most: tokens whose handoffs can be in flight
+/// at once, each with its own layer word, image and sum. Every flag word
+/// sits in the page's first [`PAYLOAD_OFF`] bytes.
+pub const MAX_ROWS: usize = 2;
+
+const _: () = assert!(
+    Word::Cnt(MAX_ROWS - 1).offset() + 64 <= PAYLOAD_OFF
+        && Word::Lyr(MAX_ROWS - 1).offset() + 64 <= PAYLOAD_OFF
+);
+
+/// Byte offset of row 0's handoff image in the page; row `r`'s sits
+/// [`Boundary`]'s image stride after it.
+const PAYLOAD_OFF: usize = (128 * MAX_ROWS + 64).next_multiple_of(256);
 
 /// Word offsets in the handoff region, and in its host image.
 const SEQ_W: usize = 0;
@@ -371,34 +389,32 @@ impl MappedHost {
         unsafe { &*self.host_at(w.offset()).cast::<AtomicU32>() }
     }
 
-    /// Word `i` of the handoff's host image; `None` past it.
-    fn payload_word(&self, i: usize, words: usize) -> Option<u32> {
+    /// Word `i` of the handoff image of `words` words at byte `at`; `None`
+    /// past it.
+    fn payload_word(&self, at: usize, i: usize, words: usize) -> Option<u32> {
         if i >= words {
             return None;
         }
-        // SAFETY: i < words, and the image's `words` words start at
-        // PAYLOAD_OFF inside the allocation. The copy that wrote them finished
-        // before the go the caller acquired, and none writes them again
-        // before the caller's signal.
-        Some(unsafe {
-            self.host_at(PAYLOAD_OFF + 4 * i)
-                .cast::<u32>()
-                .read_volatile()
-        })
+        // SAFETY: i < words, and an image's `words` words start at a
+        // word-aligned `at` inside the allocation (`Boundary::new` lays the
+        // images out). The write that filled them finished before the go the
+        // caller acquired, and none writes them again before the caller's
+        // signal.
+        Some(unsafe { self.host_at(at + 4 * i).cast::<u32>().read_volatile() })
     }
 
-    /// Copy `dst.len()` f32 of the handoff's host image from word `from`
-    /// into `dst`; `false` when the span passes the image's `words`.
-    fn payload_f32_into(&self, from: usize, words: usize, dst: &mut [f32]) -> bool {
+    /// Copy `dst.len()` f32 of the image of `words` words at byte `at` from
+    /// word `from` into `dst`; `false` when the span passes the image.
+    fn payload_f32_into(&self, at: usize, from: usize, words: usize, dst: &mut [f32]) -> bool {
         if from + dst.len() > words {
             return false;
         }
         // SAFETY: the span is inside the image (checked above), which is
-        // f32-aligned at PAYLOAD_OFF + 4·from; `dst` is a distinct host slice.
+        // f32-aligned at `at` + 4·from; `dst` is a distinct host slice.
         // Ordered after the go as in `payload_word`.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.host_at(PAYLOAD_OFF + 4 * from).cast::<f32>(),
+                self.host_at(at + 4 * from).cast::<f32>(),
                 dst.as_mut_ptr(),
                 dst.len(),
             );
@@ -550,23 +566,41 @@ pub struct BoundaryShape {
     pub n_used: usize,
 }
 
+/// One row's part of the host-mapped page: its handoff image and the host
+/// sum its combine reads, with their windows.
+struct RowPage {
+    /// Byte offsets of the image and of the sum in the page.
+    image_off: usize,
+    hsum_off: usize,
+    image: ManuallyDrop<DeviceBuffer<u32>>,
+    hsum: ManuallyDrop<DeviceBuffer<f32>>,
+}
+
 /// The card side of the boundary, allocated once at load (decision 4 of
 /// docs/gpu-design.md: a captured graph bakes every address in): the handoff
 /// region the router's launches write, the host-mapped page, and the sum the
 /// combine reads.
+///
+/// A boundary of several rows lets that many tokens' handoffs be in flight
+/// at once, served in go order: each row has its own layer word, image and
+/// sum in the page; the region, the generation, the counter and the
+/// sequence are shared — the region's readers of one row finish on the
+/// stream before the next row's norm writes it, and the other three count
+/// every go and service in one order.
 pub struct Boundary {
     /// Windows into `region` — what the norm and the router write in place
     /// of the MoE arena's own buffers on a hybrid layer.
     pub(crate) normed: ManuallyDrop<DeviceBuffer<f32>>,
     pub(crate) ids: ManuallyDrop<DeviceBuffer<u32>>,
     pub(crate) weights: ManuallyDrop<DeviceBuffer<f32>>,
-    /// The host experts' weighted sum, read in place through the mapping.
+    /// Row 0's host experts' weighted sum, read in place through the
+    /// mapping.
     pub(crate) hsum: ManuallyDrop<DeviceBuffer<f32>>,
-    /// The region's sequence word, and the handoff's image in the page: what
-    /// a chain's own launch reads and writes in place of the copy node
-    /// ([`Boundary::handoff_target`]).
+    /// The region's sequence word: what a chain's own launch copies into a
+    /// row's image in place of the copy node ([`Boundary::handoff_target`]).
     seq: ManuallyDrop<DeviceBuffer<u32>>,
-    image: ManuallyDrop<DeviceBuffer<u32>>,
+    /// Per row, its image and sum in the page; row 0's are the ones above.
+    pages: Vec<RowPage>,
     /// `shared expert + hsum`: the combine's shared-expert input.
     pub(crate) sum: DeviceBuffer<f32>,
     /// Which experts each layer's card stack holds; the host serves the rest.
@@ -577,8 +611,6 @@ pub struct Boundary {
     region: DeviceBuffer<u32>,
     page: MappedHost,
     shape: BoundaryShape,
-    /// Byte offset of the host sum in the page.
-    hsum_off: usize,
 }
 
 /// The handoff's layout in its image: the word offsets of the sequence, the
@@ -611,13 +643,28 @@ pub struct HandoffTarget<'a> {
 impl Boundary {
     /// Allocate the region, the page and the sum for `shape`; the host
     /// serves the experts `slots` sends to it, and `overlap` places each
-    /// layer's wait. Load-time only.
+    /// layer's wait. One row. Load-time only.
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
         shape: BoundaryShape,
         slots: SlotMap,
         overlap: bool,
+    ) -> Result<Boundary, GpuError> {
+        Boundary::with_rows(ctx, stream, shape, slots, overlap, 1)
+    }
+
+    /// [`Boundary::new`] with `rows` rows (1..=[`MAX_ROWS`]): row 0's image
+    /// and sum sit where a one-row boundary has them, the other rows' images
+    /// after it and every sum after the images, each at a 256-byte boundary.
+    /// Load-time only.
+    pub fn with_rows(
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        shape: BoundaryShape,
+        slots: SlotMap,
+        overlap: bool,
+        rows: usize,
     ) -> Result<Boundary, GpuError> {
         let what = "Boundary::new";
         if shape.hidden == 0 || shape.n_used == 0 || shape.n_used > EXPERTS_INTO_MAX {
@@ -629,10 +676,18 @@ impl Boundary {
                 ),
             ));
         }
+        if !(1..=MAX_ROWS).contains(&rows) {
+            return Err(GpuError::shape(
+                what,
+                format!("{rows} rows: a boundary carries 1..={MAX_ROWS}"),
+            ));
+        }
         let words = X_W + shape.hidden;
         let region = DeviceBuffer::<u32>::zeroed(stream, words)?;
-        let hsum_off = (PAYLOAD_OFF + 4 * words).next_multiple_of(256);
-        let page = MappedHost::new(ctx, hsum_off + 4 * shape.hidden)?;
+        let image_stride = (4 * words).next_multiple_of(256);
+        let hsum_stride = (4 * shape.hidden).next_multiple_of(256);
+        let sums_off = PAYLOAD_OFF + rows * image_stride;
+        let page = MappedHost::new(ctx, sums_off + rows * hsum_stride)?;
         let base = region.cu_deviceptr();
         // SAFETY: the ids span is n_used <= MAX_USED words at IDS_W, inside the
         // region's X_W + hidden words; `region` moves into the boundary beside
@@ -644,30 +699,65 @@ impl Boundary {
         // SAFETY: as above, for the activation's `hidden` words at X_W, the
         // region's tail.
         let normed = unsafe { window::<f32>(base + 4 * X_W as u64, shape.hidden, ctx) };
-        // SAFETY: the sum's `hidden` f32 start at a 256-aligned offset inside
-        // the page, which moves into the boundary beside the window and is
-        // freed only when the boundary drops.
-        let hsum = unsafe { window::<f32>(page.dev_at(hsum_off), shape.hidden, ctx) };
         // SAFETY: as for the ids, for the sequence's one word at SEQ_W.
         let seq = unsafe { window::<u32>(base + 4 * SEQ_W as u64, 1, ctx) };
-        // SAFETY: the image's `words` words start at PAYLOAD_OFF, below
-        // hsum_off, inside the page, which moves into the boundary beside the
-        // window as for the sum.
-        let image = unsafe { window::<u32>(page.dev_at(PAYLOAD_OFF), words, ctx) };
+        let pages = (0..rows)
+            .map(|r| {
+                let (image_off, hsum_off) =
+                    (PAYLOAD_OFF + r * image_stride, sums_off + r * hsum_stride);
+                // SAFETY: row r's image — `words` words from a 256-aligned
+                // offset — and its sum — `hidden` f32 from a 256-aligned
+                // offset — lie inside the page (sized above past the last
+                // sum), apart from each other and from every other row's;
+                // the page moves into the boundary beside the windows and is
+                // freed only when the boundary drops.
+                let (image, hsum) = unsafe {
+                    (
+                        window::<u32>(page.dev_at(image_off), words, ctx),
+                        window::<f32>(page.dev_at(hsum_off), shape.hidden, ctx),
+                    )
+                };
+                RowPage {
+                    image_off,
+                    hsum_off,
+                    image,
+                    hsum,
+                }
+            })
+            .collect::<Vec<_>>();
+        // SAFETY: row 0's sum, a second window of the span its page entry
+        // names, alive as long as the page.
+        let hsum = unsafe { window::<f32>(page.dev_at(sums_off), shape.hidden, ctx) };
         Ok(Boundary {
             normed,
             ids,
             weights,
             hsum,
             seq,
-            image,
+            pages,
             sum: DeviceBuffer::<f32>::zeroed(stream, shape.hidden)?,
             slots,
             overlap,
             region,
             page,
             shape,
-            hsum_off,
+        })
+    }
+
+    /// Rows the boundary carries.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Row `row`'s part of the page; a row the boundary does not carry is
+    /// refused.
+    fn page_of(&self, row: usize, what: &'static str) -> Result<&RowPage, GpuError> {
+        self.pages.get(row).ok_or_else(|| {
+            GpuError::shape(
+                what,
+                format!("row {row} of a boundary of {} rows", self.pages.len()),
+            )
         })
     }
 
@@ -697,22 +787,41 @@ impl Boundary {
     }
 
     /// The host experts' weighted sum, `hidden` f32 in the host-mapped page:
-    /// what a combine reads in place after the layer's wait.
+    /// what a combine reads in place after the layer's wait. Row 0's.
     #[must_use]
     pub fn hsum(&self) -> &DeviceBuffer<f32> {
         &self.hsum
+    }
+
+    /// Row `row`'s host sum ([`Boundary::hsum`]).
+    pub fn hsum_of(&self, row: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
+        Ok(&self.page_of(row, "Boundary::hsum_of")?.hsum)
     }
 
     /// What a chain's own launch writes the handoff through, in place of the
     /// copy node: the activation the norm wrote into the region, the region's
     /// sequence word, and the handoff's image in the host-mapped page with its
     /// layout. The launch copies the sequence word, the routing and the
-    /// activation into the image; [`Boundary::enqueue_go`] follows it.
+    /// activation into the image; [`Boundary::enqueue_go`] follows it. Row
+    /// 0's image.
     pub fn handoff_target(&mut self) -> HandoffTarget<'_> {
-        HandoffTarget {
+        self.handoff_target_of(0)
+            .expect("every boundary carries row 0")
+    }
+
+    /// [`Boundary::handoff_target`] into row `row`'s image.
+    pub fn handoff_target_of(&mut self, row: usize) -> Result<HandoffTarget<'_>, GpuError> {
+        let rows = self.pages.len();
+        let page = self.pages.get_mut(row).ok_or_else(|| {
+            GpuError::shape(
+                "Boundary::handoff_target_of",
+                format!("row {row} of a boundary of {rows} rows"),
+            )
+        })?;
+        Ok(HandoffTarget {
             x: &self.normed,
             seq: &self.seq,
-            image: &mut self.image,
+            image: &mut page.image,
             layout: HandoffLayout {
                 seq: SEQ_W,
                 ids: IDS_W,
@@ -721,7 +830,7 @@ impl Boundary {
                 n_used: self.shape.n_used,
                 hidden: self.shape.hidden,
             },
-        }
+        })
     }
 
     /// Words in the handoff region and in its host image.
@@ -758,7 +867,7 @@ impl Boundary {
             )
         };
         cu(rc, "cuMemcpyDtoHAsync_v2 (hybrid handoff)")?;
-        self.go_batch(stream, layer)
+        self.go_batch(stream, layer, 0)
     }
 
     /// Enqueue layer `layer`'s go alone, for a chain whose own launch wrote the
@@ -766,19 +875,30 @@ impl Boundary {
     /// image lands first), the layer into the page, a second barrier, and one
     /// added to the generation word and to the sequence word the next handoff
     /// carries. The host serves it once the chain says the layer is enqueued
-    /// ([`Hybrid::layer_enqueued`]).
+    /// ([`Hybrid::layer_enqueued`]). Row 0's go.
     pub fn enqueue_go(&self, stream: &CudaStream, layer: usize) -> Result<(), GpuError> {
-        let what = "Boundary::enqueue_go";
-        let layer = u32::try_from(layer).map_err(|_| GpuError::shape(what, "layer passes u32"))?;
-        self.go_batch(stream, layer)
+        self.enqueue_go_of(stream, layer, 0)
     }
 
-    fn go_batch(&self, stream: &CudaStream, layer: u32) -> Result<(), GpuError> {
+    /// [`Boundary::enqueue_go`] of row `row`: its layer word takes the layer.
+    pub fn enqueue_go_of(
+        &self,
+        stream: &CudaStream,
+        layer: usize,
+        row: usize,
+    ) -> Result<(), GpuError> {
+        let what = "Boundary::enqueue_go";
+        let layer = u32::try_from(layer).map_err(|_| GpuError::shape(what, "layer passes u32"))?;
+        self.page_of(row, what)?;
+        self.go_batch(stream, layer, row)
+    }
+
+    fn go_batch(&self, stream: &CudaStream, layer: u32, row: usize) -> Result<(), GpuError> {
         mem_batch(
             stream,
             &mut [
                 op_barrier_sys(),
-                op_write(self.page.dev_at(Word::Lyr.offset()), layer),
+                op_write(self.page.dev_at(Word::Lyr(row).offset()), layer),
                 op_barrier_sys(),
                 op_add(self.page.dev_at(Word::Gen.offset()), 1),
                 op_add(self.region.cu_deviceptr() + 4 * SEQ_W as u64, 1),
@@ -788,8 +908,15 @@ impl Boundary {
     }
 
     /// Enqueue the wait: until the counter is at least one, then minus one.
+    /// Row 0's.
     pub fn enqueue_back(&self, stream: &CudaStream) -> Result<(), GpuError> {
-        let cnt = self.page.dev_at(Word::Cnt.offset());
+        self.enqueue_back_of(stream, 0)
+    }
+
+    /// [`Boundary::enqueue_back`] on row `row`'s counter.
+    pub fn enqueue_back_of(&self, stream: &CudaStream, row: usize) -> Result<(), GpuError> {
+        self.page_of(row, "Boundary::enqueue_back")?;
+        let cnt = self.page.dev_at(Word::Cnt(row).offset());
         mem_batch(
             stream,
             &mut [op_wait_geq(cnt, 1), op_add(cnt, u32::MAX)],
@@ -797,10 +924,14 @@ impl Boundary {
         )
     }
 
-    /// Release every wait still pending in the stream, for good: the counter
-    /// goes far past anything a step subtracts.
+    /// Release every wait still pending in the stream, for good: every
+    /// row's counter goes far past anything a step subtracts.
     fn release(&self) {
-        self.page.word(Word::Cnt).store(RELEASE, Ordering::Release);
+        for row in 0..self.pages.len() {
+            self.page
+                .word(Word::Cnt(row))
+                .store(RELEASE, Ordering::Release);
+        }
     }
 }
 
@@ -854,6 +985,33 @@ pub struct HybridStats {
     pub straggle_max_ns: u64,
 }
 
+/// A chain the host tier serves: the one-token step, or the two-row pass
+/// whose rows run one layer apart (row `r`'s go of layer `l` and the other
+/// row's of the layer before can both be in flight).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chain {
+    Step,
+    Pair,
+}
+
+impl Chain {
+    fn index(self) -> usize {
+        match self {
+            Chain::Step => 0,
+            Chain::Pair => 1,
+        }
+    }
+
+    /// Goes of the chain that can have landed past the one being served,
+    /// plus one: the rows in flight.
+    fn in_flight(self) -> usize {
+        match self {
+            Chain::Step => 1,
+            Chain::Pair => 2,
+        }
+    }
+}
+
 /// The boundary and the host tier that serves it: the architecture's host
 /// computation and the protocol state.
 pub struct Hybrid<H> {
@@ -864,10 +1022,12 @@ pub struct Hybrid<H> {
     x: Tensor2,
     /// Services done: the sequence number the next handoff carries.
     served: u32,
-    /// The hybrid layers the last whole-chain capture recorded, in chain
-    /// order — what a replay of it asks the host to serve.
-    captured: Vec<usize>,
-    /// The chain being enqueued is a capture, not an eager step.
+    /// Per [`Chain`], the (layer, row) services its last capture recorded,
+    /// in go order — what a replay of it asks the host to serve.
+    captured: [Vec<(usize, usize)>; 2],
+    /// The chain being enqueued, and whether it is a capture, not an eager
+    /// step.
+    chain: Chain,
     capturing: bool,
     /// A service failed and released the stream; nothing is served again.
     poisoned: bool,
@@ -885,7 +1045,11 @@ impl<H: HostExperts> Hybrid<H> {
             host,
             x: Tensor2::zeros(hidden, 1),
             served: 0,
-            captured: Vec::with_capacity(layers),
+            captured: [
+                Vec::with_capacity(layers),
+                Vec::with_capacity(Chain::Pair.in_flight() * layers),
+            ],
+            chain: Chain::Step,
             capturing: false,
             poisoned: false,
             stats: HybridStats::default(),
@@ -909,46 +1073,75 @@ impl<H: HostExperts> Hybrid<H> {
         self.stats
     }
 
-    /// The host sum as the page holds it now: the last served layer's.
+    /// Row 0's host sum as the page holds it now: the last layer served
+    /// for that row.
     pub fn hsum_copy(&self) -> Result<Vec<f32>, GpuError> {
+        let what = "Hybrid::hsum_copy";
+        let off = self.boundary.page_of(0, what)?.hsum_off;
         self.boundary
             .page
-            .f32_copy(self.boundary.hsum_off, self.boundary.shape.hidden)
-            .ok_or(GpuError::state(
-                "Hybrid::hsum_copy",
-                "the sum is outside the page",
-            ))
+            .f32_copy(off, self.boundary.shape.hidden)
+            .ok_or(GpuError::state(what, "the sum is outside the page"))
     }
 
-    /// Open a chain on `stream`: a capture records which layers its replays
-    /// will ask for; an eager chain is served as it goes.
+    /// Open a one-token chain on `stream`: a capture records which layers
+    /// its replays will ask for; an eager chain is served as it goes.
     pub fn begin_chain(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.refuse_if_poisoned("Hybrid::begin_chain")?;
+        self.begin_chain_of(stream, Chain::Step)
+    }
+
+    /// [`Hybrid::begin_chain`] of `chain`; a pair needs a boundary of two
+    /// rows.
+    pub fn begin_chain_of(&mut self, stream: &CudaStream, chain: Chain) -> Result<(), GpuError> {
+        let what = "Hybrid::begin_chain";
+        self.refuse_if_poisoned(what)?;
+        if chain.in_flight() > self.boundary.rows() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a {chain:?} chain on a boundary of {} rows",
+                    self.boundary.rows()
+                ),
+            ));
+        }
+        self.chain = chain;
         self.capturing = capturing(stream)?;
         if self.capturing {
-            self.captured.clear();
+            self.captured[chain.index()].clear();
         }
         Ok(())
     }
 
     /// Layer `layer`'s hybrid work is enqueued: a capture notes it, an eager
     /// chain serves it now, before anything more joins the stream behind its
-    /// wait.
+    /// wait. Row 0's.
     pub fn layer_enqueued(&mut self, layer: usize) -> Result<(), GpuError> {
+        self.row_enqueued(layer, 0)
+    }
+
+    /// [`Hybrid::layer_enqueued`] for row `row`. The chain enqueues its
+    /// services' waits in go order, and so is served in it.
+    pub fn row_enqueued(&mut self, layer: usize, row: usize) -> Result<(), GpuError> {
         if self.capturing {
-            self.captured.push(layer);
+            self.captured[self.chain.index()].push((layer, row));
             Ok(())
         } else {
-            self.serve(layer, false)
+            self.serve(layer, row, false, self.chain)
         }
     }
 
-    /// Serve every hybrid layer a replay of the captured chain submitted, in
-    /// chain order.
+    /// Serve every hybrid layer a replay of the captured one-token chain
+    /// submitted, in chain order.
     pub fn serve_captured(&mut self) -> Result<(), GpuError> {
-        for i in 0..self.captured.len() {
-            let layer = self.captured[i];
-            self.serve(layer, i == 0)?;
+        self.serve_captured_of(Chain::Step)
+    }
+
+    /// [`Hybrid::serve_captured`] for a replay of `chain`'s capture.
+    pub fn serve_captured_of(&mut self, chain: Chain) -> Result<(), GpuError> {
+        let c = chain.index();
+        for i in 0..self.captured[c].len() {
+            let (layer, row) = self.captured[c][i];
+            self.serve(layer, row, i == 0, chain)?;
         }
         Ok(())
     }
@@ -963,13 +1156,19 @@ impl<H: HostExperts> Hybrid<H> {
         Ok(())
     }
 
-    /// Serve layer `layer`. Any failure — an error or a panic inside the host
-    /// experts — releases every pending wait first, so the stream drains
-    /// instead of hanging a later synchronize.
-    fn serve(&mut self, layer: usize, opens_replay: bool) -> Result<(), GpuError> {
+    /// Serve layer `layer` of row `row` in `chain`. Any failure — an error
+    /// or a panic inside the host experts — releases every pending wait
+    /// first, so the stream drains instead of hanging a later synchronize.
+    fn serve(
+        &mut self,
+        layer: usize,
+        row: usize,
+        opens_replay: bool,
+        chain: Chain,
+    ) -> Result<(), GpuError> {
         self.refuse_if_poisoned("Hybrid::serve")?;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.serve_one(layer, opens_replay)
+            self.serve_one(layer, row, opens_replay, chain)
         }));
         match r {
             Ok(Ok(())) => Ok(()),
@@ -986,8 +1185,18 @@ impl<H: HostExperts> Hybrid<H> {
         }
     }
 
-    fn serve_one(&mut self, layer: usize, opens_replay: bool) -> Result<(), GpuError> {
+    fn serve_one(
+        &mut self,
+        layer: usize,
+        row: usize,
+        opens_replay: bool,
+        chain: Chain,
+    ) -> Result<(), GpuError> {
         let what = "Hybrid::serve";
+        let (image_off, hsum_off) = {
+            let p = self.boundary.page_of(row, what)?;
+            (p.image_off, p.hsum_off)
+        };
         let want = self.served.wrapping_add(1);
         let generation = self.boundary.page.word(Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
@@ -1000,15 +1209,19 @@ impl<H: HostExperts> Hybrid<H> {
             self.stats.straggle_ns += straggle;
             self.stats.straggle_max_ns = self.stats.straggle_max_ns.max(straggle);
         }
-        if seen != want {
+        // The goes of the rows in flight after this one may have landed too;
+        // one past them means a wait is missing.
+        let ahead = usize::try_from(seen.wrapping_sub(want)).unwrap_or(usize::MAX);
+        if before(seen, want) || ahead >= chain.in_flight() {
             let detail = if before(seen, want) {
                 format!(
                     "the go of layer {layer} did not land in {GO_DEADLINE:?} (generation {seen}, want {want})"
                 )
             } else {
                 format!(
-                    "generation {seen} is past {want}: the card ran ahead of the host — a hybrid \
-                     layer's wait is missing"
+                    "generation {seen} is {ahead} past {want} with {} row(s) in flight: the card \
+                     ran ahead of the host — a hybrid layer's wait is missing",
+                    chain.in_flight()
                 )
             };
             return Err(GpuError::protocol(what, detail));
@@ -1016,7 +1229,7 @@ impl<H: HostExperts> Hybrid<H> {
         let t0 = Instant::now();
         let page = &self.boundary.page;
         let words = self.boundary.words();
-        let seq = page.payload_word(SEQ_W, words);
+        let seq = page.payload_word(image_off, SEQ_W, words);
         if seq != Some(self.served) {
             return Err(GpuError::protocol(
                 what,
@@ -1026,14 +1239,14 @@ impl<H: HostExperts> Hybrid<H> {
                 ),
             ));
         }
-        let lyr = page.word(Word::Lyr).load(Ordering::Acquire);
+        let lyr = page.word(Word::Lyr(row)).load(Ordering::Acquire);
         if usize::try_from(lyr).ok() != Some(layer) {
             return Err(GpuError::protocol(
                 what,
-                format!("the go is layer {lyr}'s, the host serves layer {layer}"),
+                format!("row {row}'s go is layer {lyr}'s, the host serves layer {layer}"),
             ));
         }
-        let row = self.boundary.slots.row(layer).ok_or(GpuError::state(
+        let map_row = self.boundary.slots.row(layer).ok_or(GpuError::state(
             what,
             "a hybrid layer without a slot map row",
         ))?;
@@ -1043,36 +1256,36 @@ impl<H: HostExperts> Hybrid<H> {
         let (mut n, mut w2_host, mut w2_all) = (0usize, 0.0f64, 0.0f64);
         for s in 0..self.boundary.shape.n_used {
             let (Some(id), Some(wb)) = (
-                page.payload_word(IDS_W + s, words),
-                page.payload_word(WTS_W + s, words),
+                page.payload_word(image_off, IDS_W + s, words),
+                page.payload_word(image_off, WTS_W + s, words),
             ) else {
                 return Err(GpuError::shape(what, "the routing is outside the handoff"));
             };
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
-            let slot = usize::try_from(id).ok().and_then(|id| row.get(id));
+            let slot = usize::try_from(id).ok().and_then(|id| map_row.get(id));
             if slot.is_none_or(|&slot| slot == HOST) {
                 list[n] = (id, w);
                 n += 1;
                 w2_host += f64::from(w) * f64::from(w);
             }
         }
-        if !page.payload_f32_into(X_W, words, &mut self.x.data) {
+        if !page.payload_f32_into(image_off, X_W, words, &mut self.x.data) {
             return Err(GpuError::shape(
                 what,
                 "the activation is outside the handoff",
             ));
         }
-        let (off, hidden) = (self.boundary.hsum_off, self.boundary.shape.hidden);
+        let hidden = self.boundary.shape.hidden;
         let out = self
             .boundary
             .page
-            .f32_mut(off, hidden)
+            .f32_mut(hsum_off, hidden)
             .ok_or(GpuError::state(what, "the sum is outside the page"))?;
         self.host.experts_into(layer, &self.x, &list[..n], out)?;
         self.boundary
             .page
-            .word(Word::Cnt)
+            .word(Word::Cnt(row))
             .fetch_add(1, Ordering::Release);
         self.served = want;
         let s = &mut self.stats;

@@ -652,6 +652,13 @@ gate-gpu-ds41-chain-attn:
 gate-gpu-ds41-step *ARGS='--structure --sets --select':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}}'
 
+# V4.1 어긋난 2행 패스(C4 ktok-skew): 토큰 t와 t+1을 한 층 어긋난 두 행으로 한 스트림에서 돌린 결과가 한 토큰 스텝
+# 둘과 비트까지 같은지 본다. --structure: 캡처 노드가 종류별·커널 이름별로 정확히 두 배, 배치 순서, 행마다 그늘 표.
+# --sets: step4·d1 세트 주입 뒤 두 행의 logits·스트림·접기·목록, 모든 캐시·압축기 상태·history가 eager·재생 모두 순차와
+# 같고, 롤백(t+1 거절) 뒤 다른 토큰 한 스텝이 순차와 같다. --api: 엔진 진입점(step_pair·rollback)을 그래프·eager로. 3090, 게이트 락.
+gate-gpu-ds41-skew *ARGS='--structure --sets --api':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_skew && bash tools/gpu-gate.sh gate_deepseek41_skew {{ARGS}}'
+
 # ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — step 게이트
 # --greedy의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
 ik-greedy-ds41 PROMPT='0':

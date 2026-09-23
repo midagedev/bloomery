@@ -183,6 +183,55 @@ pub trait ChainBody: Sized {
     fn serve_replay(&mut self) -> Result<(), GpuError> {
         Ok(())
     }
+
+    /// The pair pass's host half: the steps of `tokens[0]` at `pos` and
+    /// `tokens[1]` at `pos + 1`, planned in turn and written into the
+    /// buffers the captured pair reads. Never inside a capture. The default
+    /// refuses: a body without a second row has no pair pass.
+    fn decode_pair(
+        &mut self,
+        _stream: &CudaStream,
+        _tokens: [u32; 2],
+        _pos: u32,
+    ) -> Result<(), GpuError> {
+        Err(GpuError::state(
+            "ChainBody::decode_pair",
+            "this architecture has no pair pass",
+        ))
+    }
+
+    /// Enqueue the pair pass — the two tokens [`ChainBody::decode_pair`]
+    /// planned, through every resident layer and into `heads[0]` and
+    /// `heads[1]` — bit for bit two steps in turn. Asynchronous as
+    /// [`ChainBody::enqueue_chain`] is. The default refuses.
+    fn enqueue_pair(
+        &mut self,
+        _gpu: &Gpu,
+        _w: &Weights,
+        _heads: [&mut Head; 2],
+    ) -> Result<(), GpuError> {
+        Err(GpuError::state(
+            "ChainBody::enqueue_pair",
+            "this architecture has no pair pass",
+        ))
+    }
+
+    /// [`ChainBody::serve_replay`] for a replay of the captured pair pass.
+    fn serve_replay_pair(&mut self) -> Result<(), GpuError> {
+        Err(GpuError::state(
+            "ChainBody::serve_replay_pair",
+            "this architecture has no pair pass",
+        ))
+    }
+
+    /// Take back the positions from `pos` on, so the next step runs at
+    /// `pos`. The default refuses.
+    fn rollback(&mut self, _pos: u32) -> Result<(), GpuError> {
+        Err(GpuError::state(
+            "ChainBody::rollback",
+            "this architecture takes no position back",
+        ))
+    }
 }
 
 /// What a binary or a gate drives, once per token — the surface that does not
@@ -282,10 +331,16 @@ pub struct GpuModel<B: ChainBody> {
     /// it addresses is still alive — the same reason `Stage` declares its
     /// `graph` above `residency`.
     step_graph: Option<Graph>,
+    /// The pair pass ([`GpuModel::step_pair`]) captured once and replayed
+    /// per pass; declared before the heads for the same reason.
+    pair_graph: Option<Graph>,
     /// The output head — present only on a model that holds every block
     /// ([`GpuModel::load_full`]). A partial stage has no logits to take, so
     /// `step` refuses on one.
     head: Option<Head>,
+    /// The pair pass's second row's head, made at the first
+    /// [`GpuModel::step_pair`]; the first row's is `head`.
+    pair_head: Option<Head>,
     stages: Vec<Stage<B>>,
     /// KV rows the resident caches were sized for; `step` refuses to grow them.
     ctx_max: usize,
@@ -340,6 +395,8 @@ impl<B: ChainBody> GpuModel<B> {
             ctx_max,
             head: None,
             step_graph: None,
+            pair_graph: None,
+            pair_head: None,
             mode: StepMode::Graph,
             pos: 0,
         })
@@ -385,6 +442,8 @@ impl<B: ChainBody> GpuModel<B> {
             ctx_max,
             head: None,
             step_graph: None,
+            pair_graph: None,
+            pair_head: None,
             mode: StepMode::Graph,
             pos: 0,
         })
@@ -445,6 +504,8 @@ impl<B: ChainBody> GpuModel<B> {
             ctx_max,
             head: Some(head),
             step_graph: None,
+            pair_graph: None,
+            pair_head: None,
             mode: StepMode::Graph,
             pos: 0,
         })
@@ -497,6 +558,8 @@ impl<B: ChainBody> GpuModel<B> {
             ctx_max,
             head,
             step_graph: None,
+            pair_graph: None,
+            pair_head: None,
             mode: StepMode::Graph,
             pos: 0,
         })
@@ -508,10 +571,12 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// Device bytes of everything this model holds resident: the stage's
-    /// weights and body, plus the head's scratch when it has one.
+    /// weights and body, plus the heads' scratch — the pair pass's second
+    /// head once a pair has run.
     pub fn resident_bytes(&self) -> usize {
         self.stages.iter().map(Stage::resident_bytes).sum::<usize>()
             + self.head.as_ref().map_or(0, Head::resident_bytes)
+            + self.pair_head.as_ref().map_or(0, Head::resident_bytes)
     }
 
     /// The cache row the next [`GpuModel::step`] token lands in.
@@ -525,6 +590,7 @@ impl<B: ChainBody> GpuModel<B> {
     pub fn set_mode(&mut self, mode: StepMode) {
         if mode != self.mode {
             self.step_graph = None;
+            self.pair_graph = None;
         }
         self.mode = mode;
     }
@@ -539,6 +605,7 @@ impl<B: ChainBody> GpuModel<B> {
         let (_, _, body) = self.body_parts("GpuModel::set_probe")?;
         body.set_probe(probe)?;
         self.step_graph = None;
+        self.pair_graph = None;
         if let Some(stage) = self.stages.first_mut() {
             stage.graph = None;
             stage.graph_of = None;
@@ -709,6 +776,163 @@ impl<B: ChainBody> GpuModel<B> {
             .as_ref()
             .ok_or(GpuError::state("GpuModel::step", "no output head"))?
             .token(gpu)
+    }
+
+    /// Run `t` at the next position and `t1` at the one after as one pair
+    /// pass ([`ChainBody::enqueue_pair`]) and return each row's greedy next
+    /// token: after `t`, and after `t1`. Bit for bit `step(&[t])` then
+    /// `step(&[t1])`; the model stands two positions on. The first call
+    /// makes the second row's head, and in graph mode captures the pass.
+    /// A caller that does not keep `t1` takes it back with
+    /// [`GpuModel::rollback`].
+    pub fn step_pair(&mut self, t: u32, t1: u32) -> Result<[u32; 2], GpuError> {
+        const WHAT: &str = "GpuModel::step_pair";
+        if self.head.is_none() {
+            return Err(GpuError::state(
+                WHAT,
+                "no output head — load with load_full",
+            ));
+        }
+        if self.stages.len() != 1 || self.stages[0].layers.start != 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                "the token loop needs the single whole-model stage of load_full",
+            ));
+        }
+        let pos = self.pos;
+        self.check_pos(pos + 1, WHAT)?;
+        if self.pair_head.is_none() {
+            let (gpu, w, body) = self.body_parts(WHAT)?;
+            let head = Head::new(gpu, w, body.head_eps())?;
+            self.pair_head = Some(head);
+        }
+        if self.mode == StepMode::Graph && self.pair_graph.is_none() {
+            self.capture_pair()?;
+        }
+        {
+            let (gpu, _, body) = self.body_parts(WHAT)?;
+            body.decode_pair(gpu.stream(), [t, t1], pos)?;
+        }
+        match self.mode {
+            StepMode::Eager => self.enqueue_pair_step()?,
+            StepMode::Graph => {
+                self.pair_graph
+                    .as_ref()
+                    .ok_or(GpuError::state(WHAT, "no captured pair"))?
+                    .launch(self.stages[0].gpu.stream())?;
+                self.body_parts(WHAT)?.2.serve_replay_pair()?;
+            }
+        }
+        self.pos = pos + 2;
+        let gpu = &self.stages[0].gpu;
+        let [a, b] = self.pair_heads()?;
+        Ok([a.token(gpu)?, b.token(gpu)?])
+    }
+
+    /// Capture the pair pass into its own graph over the resident buffers
+    /// and return its node count. The one-token step's capture stays.
+    pub fn capture_pair(&mut self) -> Result<usize, GpuError> {
+        const WHAT: &str = "GpuModel::capture_pair";
+        let GpuModel {
+            pair_graph,
+            head,
+            pair_head,
+            stages,
+            ..
+        } = self;
+        let heads = [
+            head.as_mut()
+                .ok_or(GpuError::state(WHAT, "no output head"))?,
+            pair_head
+                .as_mut()
+                .ok_or(GpuError::state(WHAT, "no second head: step_pair makes it"))?,
+        ];
+        let stage = stages
+            .first_mut()
+            .ok_or(GpuError::state(WHAT, "no stage"))?;
+        let Some(Residency { weights, body }) = stage.residency.as_mut() else {
+            return Err(GpuError::state(WHAT, "stage carries no residency"));
+        };
+        let gpu = &stage.gpu;
+        let graph = gpu.capture(|_| body.enqueue_pair(gpu, weights, heads))?;
+        let nodes = graph.node_count();
+        *pair_graph = Some(graph);
+        Ok(nodes)
+    }
+
+    /// Every node of the captured pair pass, as the driver lists them.
+    pub fn pair_graph_nodes(&self) -> Result<Vec<NodeInfo>, GpuError> {
+        self.pair_graph
+            .as_ref()
+            .ok_or(GpuError::state(
+                "GpuModel::pair_graph_nodes",
+                "no captured pair",
+            ))?
+            .nodes()
+    }
+
+    /// Enqueue the pair pass eagerly on the engine stream.
+    fn enqueue_pair_step(&mut self) -> Result<(), GpuError> {
+        const WHAT: &str = "GpuModel::step_pair";
+        let GpuModel {
+            head,
+            pair_head,
+            stages,
+            ..
+        } = self;
+        let heads = [
+            head.as_mut()
+                .ok_or(GpuError::state(WHAT, "no output head"))?,
+            pair_head
+                .as_mut()
+                .ok_or(GpuError::state(WHAT, "no second head"))?,
+        ];
+        let stage = stages
+            .first_mut()
+            .ok_or(GpuError::state(WHAT, "no stage"))?;
+        let Some(Residency { weights, body }) = stage.residency.as_mut() else {
+            return Err(GpuError::state(WHAT, "stage carries no residency"));
+        };
+        body.enqueue_pair(&stage.gpu, weights, heads)
+    }
+
+    fn pair_heads(&self) -> Result<[&Head; 2], GpuError> {
+        const WHAT: &str = "GpuModel::pair_heads";
+        Ok([
+            self.head
+                .as_ref()
+                .ok_or(GpuError::state(WHAT, "no output head"))?,
+            self.pair_head
+                .as_ref()
+                .ok_or(GpuError::state(WHAT, "no pair pass has run"))?,
+        ])
+    }
+
+    /// Each row's logits of the last [`GpuModel::step_pair`] (`n_vocab` f32
+    /// each). Blocking read; gate/debug use.
+    pub fn pair_logits(&self) -> Result<[Vec<f32>; 2], GpuError> {
+        let gpu = &self
+            .stages
+            .first()
+            .ok_or(GpuError::state("GpuModel::pair_logits", "no stage"))?
+            .gpu;
+        let [a, b] = self.pair_heads()?;
+        Ok([a.logits_to_host(gpu)?, b.logits_to_host(gpu)?])
+    }
+
+    /// Take back the positions from `pos` on ([`ChainBody::rollback`]): the
+    /// next step runs at `pos`.
+    pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        if pos > self.pos {
+            return Err(GpuError::shape(
+                "GpuModel::rollback",
+                format!("back to position {pos} from {}", self.pos),
+            ));
+        }
+        let (_, _, body) = self.body_parts("GpuModel::rollback")?;
+        body.rollback(pos)?;
+        self.pos = pos;
+        Ok(())
     }
 
     /// The head's logits of the last `step` (`n_vocab` f32). Blocking read;

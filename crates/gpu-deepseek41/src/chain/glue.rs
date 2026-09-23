@@ -179,7 +179,7 @@ mod glue_kernels {
 // -------------------------------------------------------------- the piece
 
 /// One engram site: its layer, its weights' names, where its rows lie in the
-/// image, and the scratch its launches leave for the layer's gate.
+/// image, and per row the scratch its launches leave for the layer's gate.
 struct EngramSite {
     layer: usize,
     wkv: String,
@@ -187,6 +187,14 @@ struct EngramSite {
     gain_q: String,
     /// Image word of the site's first row.
     at: u32,
+    /// Per row ([`Glue::with_rows`]): a pass whose rows run one layer apart
+    /// enqueues the other row's token-only work between a row's and its
+    /// gate.
+    bufs: Vec<SiteRow>,
+}
+
+/// One row's scratch at a site.
+struct SiteRow {
     /// The rows dequantized: the projection's input.
     x: DeviceBuffer<f32>,
     /// `engram_wkv`'s output: `hc` keys, then the value.
@@ -195,6 +203,12 @@ struct EngramSite {
     kn: DeviceBuffer<f32>,
     /// The gates, one per stream.
     gate: DeviceBuffer<f32>,
+}
+
+impl SiteRow {
+    fn device_bytes(&self) -> usize {
+        self.x.num_bytes() + self.kv.num_bytes() + self.kn.num_bytes() + self.gate.num_bytes()
+    }
 }
 
 /// A site's scratch as the gate reads it back.
@@ -231,12 +245,14 @@ pub struct EngramKv<'a> {
     pub params: &'a DeviceBuffer<u32>,
     /// The site's layer.
     pub layer: usize,
+    /// The row whose scratch it writes.
+    pub row: usize,
 }
 
 impl ShadowWork for EngramKv<'_> {
     fn enqueue(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         self.glue
-            .enqueue_engram_kv_at(gpu, self.w, self.params, self.layer)
+            .enqueue_engram_kv_of(gpu, self.w, self.params, self.layer, self.row)
     }
 }
 
@@ -262,9 +278,23 @@ impl Glue {
     /// out by `layout`: its launch geometry, every name its launches read,
     /// and each engram site's scratch. The kernels hold a stream row of
     /// [`ROW`] values and four streams; a step runs one token, and the image
-    /// must carry each site's rows as Q8_0.
+    /// must carry each site's rows as Q8_0. One row of site scratch.
     pub fn new(gpu: &Gpu, hp: &Hparams, layout: &ImageLayout) -> Result<Glue, GpuError> {
+        Glue::with_rows(gpu, hp, layout, 1)
+    }
+
+    /// [`Glue::new`] with `rows` rows of site scratch, for a pass whose rows
+    /// run one layer apart.
+    pub fn with_rows(
+        gpu: &Gpu,
+        hp: &Hparams,
+        layout: &ImageLayout,
+        n_rows: usize,
+    ) -> Result<Glue, GpuError> {
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
+        if n_rows == 0 {
+            return Err(refuse("a piece of no rows".to_string()));
+        }
         let dims = layout.dims();
         if hp.n_embd != ROW || dims.n_embd != ROW || hp.hc.streams != HC_STREAMS {
             return Err(refuse(format!(
@@ -313,10 +343,16 @@ impl Glue {
                 gain_k: names::engram_k(layer),
                 gain_q: names::engram_q(layer),
                 at,
-                x: DeviceBuffer::zeroed(stream, rows * en.key_length)?,
-                kv: DeviceBuffer::zeroed(stream, (HC_STREAMS + 1) * ROW)?,
-                kn: DeviceBuffer::zeroed(stream, HC_STREAMS * ROW)?,
-                gate: DeviceBuffer::zeroed(stream, HC_STREAMS)?,
+                bufs: (0..n_rows)
+                    .map(|_| {
+                        Ok(SiteRow {
+                            x: DeviceBuffer::zeroed(stream, rows * en.key_length)?,
+                            kv: DeviceBuffer::zeroed(stream, (HC_STREAMS + 1) * ROW)?,
+                            kn: DeviceBuffer::zeroed(stream, HC_STREAMS * ROW)?,
+                            gate: DeviceBuffer::zeroed(stream, HC_STREAMS)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, GpuError>>()?,
             });
         }
         // SAFETY: this crate owns the embedded device bundle produced for the
@@ -342,7 +378,18 @@ impl Glue {
     pub fn device_bytes(&self) -> usize {
         self.sites
             .iter()
-            .map(|s| s.x.num_bytes() + s.kv.num_bytes() + s.kn.num_bytes() + s.gate.num_bytes())
+            .flat_map(|s| &s.bufs)
+            .map(SiteRow::device_bytes)
+            .sum()
+    }
+
+    /// Device bytes of one row's scratch, every site's.
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
+        self.sites
+            .iter()
+            .filter_map(|s| s.bufs.first())
+            .map(SiteRow::device_bytes)
             .sum()
     }
 
@@ -351,16 +398,25 @@ impl Glue {
         self.sites.iter().map(|s| s.layer)
     }
 
-    /// The scratch of the site at `layer`; `None` for a layer without one.
+    /// Row 0's scratch of the site at `layer`; `None` for a layer without
+    /// one.
     #[must_use]
     pub fn site_buffers(&self, layer: usize) -> Option<SiteBuffers<'_>> {
+        self.site_buffers_of(layer, 0)
+    }
+
+    /// Row `row`'s scratch of the site at `layer`; `None` for a layer
+    /// without one or a row the piece does not hold.
+    #[must_use]
+    pub fn site_buffers_of(&self, layer: usize, row: usize) -> Option<SiteBuffers<'_>> {
         self.sites
             .iter()
             .find(|s| s.layer == layer)
-            .map(|s| SiteBuffers {
-                rows: &s.x,
-                kv: &s.kv,
-                gate: &s.gate,
+            .and_then(|s| s.bufs.get(row))
+            .map(|b| SiteBuffers {
+                rows: &b.x,
+                kv: &b.kv,
+                gate: &b.gate,
             })
     }
 
@@ -420,7 +476,7 @@ impl Glue {
     /// Enqueue the token-only work of the engram site at `layer`: its rows
     /// from the image `params` dequantized, `engram_wkv` over them, and the
     /// key norm. Three launches, reading no stream. Asynchronous,
-    /// allocation-free, capturable.
+    /// allocation-free, capturable. Row 0's scratch.
     pub fn enqueue_engram_kv_at(
         &mut self,
         gpu: &Gpu,
@@ -428,23 +484,35 @@ impl Glue {
         params: &DeviceBuffer<u32>,
         layer: usize,
     ) -> Result<(), GpuError> {
+        self.enqueue_engram_kv_of(gpu, w, params, layer, 0)
+    }
+
+    /// [`Glue::enqueue_engram_kv_at`] into row `row`'s scratch, from that
+    /// row's image `params`.
+    pub fn enqueue_engram_kv_of(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        params: &DeviceBuffer<u32>,
+        layer: usize,
+        row: usize,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "Glue::enqueue_engram_kv_at";
         let stream = gpu.stream();
         let values = self.rows * self.key_len;
         let grid = values.div_ceil(THREADS);
-        let site = self
-            .sites
-            .iter_mut()
-            .find(|s| s.layer == layer)
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("layer {layer} carries no engram site"),
-            })?;
+        let SiteRef {
+            at,
+            wkv,
+            gain_k,
+            row: site,
+            ..
+        } = site_row(&mut self.sites, layer, row, WHAT)?;
         need(
             WHAT,
             "params",
             params.len(),
-            site.at as usize + self.rows as usize * self.row_words as usize,
+            at as usize + self.rows as usize * self.row_words as usize,
         )?;
         let prep = self
             .module
@@ -453,20 +521,20 @@ impl Glue {
             stream,
             &prep,
             params,
-            site.at,
+            at,
             self.rows,
             self.row_words,
             self.key_len,
             &mut site.x,
         )?;
-        let (qs, d) = q8_0(w, &site.wkv, site.x.len(), site.kv.len())?;
+        let (qs, d) = q8_0(w, wkv, site.x.len(), site.kv.len())?;
         gpu.q8f32()
             .enqueue_q8_0_gemv(stream, qs, d, &site.x, 1, &mut site.kv)?;
         self.engram.enqueue_key_norm(
             stream,
             KeyNormArgs {
                 kv: &site.kv,
-                gain: gain(w, &site.gain_k, HC_STREAMS * ROW)?,
+                gain: gain(w, gain_k, HC_STREAMS * ROW)?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m: 1,
@@ -480,7 +548,7 @@ impl Glue {
     /// `a.out`, then the fold of `a.out` by `a.pre` into `a.input`. Two
     /// launches. The site's token-only work ([`Glue::enqueue_engram_kv_at`])
     /// must precede it on the stream.
-    /// Asynchronous, allocation-free, capturable.
+    /// Asynchronous, allocation-free, capturable. Row 0's scratch.
     pub fn enqueue_engram(
         &mut self,
         gpu: &Gpu,
@@ -488,24 +556,32 @@ impl Glue {
         layer: usize,
         a: EngramStep<'_>,
     ) -> Result<(), GpuError> {
+        self.enqueue_engram_of(gpu, w, layer, 0, a)
+    }
+
+    /// [`Glue::enqueue_engram`] on row `row`'s scratch, which that row's
+    /// token-only work wrote.
+    pub fn enqueue_engram_of(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        layer: usize,
+        row: usize,
+        a: EngramStep<'_>,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "Glue::enqueue_engram";
         let stream = gpu.stream();
         need(WHAT, "pre", a.pre.len(), HC_MIX)?;
-        let site = self
-            .sites
-            .iter_mut()
-            .find(|s| s.layer == layer)
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("layer {layer} carries no engram site"),
-            })?;
+        let SiteRef {
+            gain_q, row: site, ..
+        } = site_row(&mut self.sites, layer, row, WHAT)?;
         self.engram.enqueue_gate(
             stream,
             GateArgs {
                 x: a.streams,
                 kn: &site.kn,
                 kv: &site.kv,
-                gain: gain(w, &site.gain_q, HC_STREAMS * ROW)?,
+                gain: gain(w, gain_q, HC_STREAMS * ROW)?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m: 1,
@@ -543,6 +619,53 @@ impl Glue {
             .enqueue_fold(gpu.stream(), streams, pre, self.n_embd, 1, head.input_mut())?;
         head.enqueue(gpu, w)
     }
+}
+
+/// The site at `layer` as one enqueue reads it: its image word, its
+/// weights' names and row `row`'s scratch.
+struct SiteRef<'s> {
+    at: u32,
+    wkv: &'s str,
+    gain_k: &'s str,
+    gain_q: &'s str,
+    row: &'s mut SiteRow,
+}
+
+/// The site at `layer` of `sites`, with row `row`'s scratch; `what` names
+/// the caller in the error for a layer without a site or a row the piece
+/// does not hold.
+fn site_row<'s>(
+    sites: &'s mut [EngramSite],
+    layer: usize,
+    row: usize,
+    what: &'static str,
+) -> Result<SiteRef<'s>, GpuError> {
+    let EngramSite {
+        at,
+        wkv,
+        gain_k,
+        gain_q,
+        bufs,
+        ..
+    } = sites
+        .iter_mut()
+        .find(|s| s.layer == layer)
+        .ok_or_else(|| GpuError::Shape {
+            what,
+            detail: format!("layer {layer} carries no engram site"),
+        })?;
+    let n = bufs.len();
+    let row = bufs.get_mut(row).ok_or_else(|| GpuError::Shape {
+        what,
+        detail: format!("row {row} of a piece of {n} rows"),
+    })?;
+    Ok(SiteRef {
+        at: *at,
+        wkv,
+        gain_k,
+        gain_q,
+        row,
+    })
 }
 
 /// Token 0's embedding row and engram rows in `layout`'s image, as image
