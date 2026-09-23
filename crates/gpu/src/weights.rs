@@ -9,10 +9,12 @@
 //! pin the uploads against independent host packings bit for bit.
 
 use crate::GpuError;
+use crate::hybrid::host_levers;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::tensor::DeviceTensor;
+use ::model::placement::host_lock::PageDrop;
 use ::model::placement::{
-    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Row, Segment, Span,
+    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment, Span,
 };
 use cuda_core::CudaStream;
 use gguf::quant::{GgmlType, dequant_row};
@@ -174,14 +176,28 @@ impl Weights {
     }
 
     /// Upload every segment `plan` puts on card `card` ([`Weights::load_rows`]
-    /// of the plan's rows).
+    /// of the plan's rows), and — unless `BLOOMERY_CARD_DONTNEED=0` — release
+    /// each uploaded segment's file pages from the page cache as soon as it
+    /// is on the card ([`PageDrop`]): the plan names every later reader of
+    /// the file, and none of them reads a card segment's bytes. Whole pages
+    /// inside the segment's bytes only, so a page shared with a host segment
+    /// or a neighbouring tensor stays; the token embedding and the engram
+    /// tables, read from the file by every step, are never released.
     pub fn load_placed(
         stream: &CudaStream,
         split: &Split,
         plan: &Plan<'_>,
         card: usize,
     ) -> Result<Weights, GpuError> {
-        Weights::load_rows(stream, split, plan.model, &plan.rows, card)
+        let mut release = host_levers()?.card_dontneed.then(|| PageDrop::new(split));
+        load_segments(
+            stream,
+            split,
+            plan.model,
+            &plan.rows,
+            card,
+            release.as_mut(),
+        )
     }
 
     /// Upload every segment of `rows` (placement rows of `model`'s tensors)
@@ -202,27 +218,7 @@ impl Weights {
         rows: &[Row],
         card: usize,
     ) -> Result<Weights, GpuError> {
-        stream.context().bind_to_thread()?;
-        let mut by_name = BTreeMap::new();
-        for row in rows {
-            let t = model.tensors.get(row.tensor).ok_or_else(|| {
-                GpuError::shape(PLACED, format!("placement row names tensor {}", row.tensor))
-            })?;
-            for seg in row
-                .segments
-                .iter()
-                .filter(|s| s.device == Device::Card(card))
-            {
-                let dw = upload_segment(stream, split, model.experts, t, seg)?;
-                if by_name.insert(t.name.clone(), dw).is_some() {
-                    return Err(placed_refusal(
-                        t,
-                        format!("has two segments on card {card}"),
-                    ));
-                }
-            }
-        }
-        Ok(Weights { by_name })
+        load_segments(stream, split, model, rows, card, None)
     }
 
     /// Upload every tensor of `split` whose name `keep` accepts, each from
@@ -344,15 +340,51 @@ fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
     GpuError::shape(PLACED, format!("tensor {}: {detail}", t.name))
 }
 
+/// [`Weights::load_rows`], releasing each uploaded segment's file pages
+/// through `release` when there is one.
+fn load_segments(
+    stream: &CudaStream,
+    split: &Split,
+    model: &ModelTensors,
+    rows: &[Row],
+    card: usize,
+    mut release: Option<&mut PageDrop<'_>>,
+) -> Result<Weights, GpuError> {
+    stream.context().bind_to_thread()?;
+    let mut by_name = BTreeMap::new();
+    for row in rows {
+        let t = model.tensors.get(row.tensor).ok_or_else(|| {
+            GpuError::shape(PLACED, format!("placement row names tensor {}", row.tensor))
+        })?;
+        for seg in row
+            .segments
+            .iter()
+            .filter(|s| s.device == Device::Card(card))
+        {
+            let dw = upload_segment(stream, split, model.experts, t, seg, release.as_deref_mut())?;
+            if by_name.insert(t.name.clone(), dw).is_some() {
+                return Err(placed_refusal(
+                    t,
+                    format!("has two segments on card {card}"),
+                ));
+            }
+        }
+    }
+    Ok(Weights { by_name })
+}
+
 /// Upload placement segment `seg` of tensor `t`, a stack of `experts` when
 /// it is one: find the tensor in `split`, confirm it is the tensor the
-/// placement was made from, and upload the rows the segment holds.
+/// placement was made from, upload the rows the segment holds, and hand
+/// their file bytes to `release` when there is one and no step reads the
+/// tensor from the file.
 fn upload_segment(
     stream: &CudaStream,
     split: &Split,
     experts: u64,
     t: &ModelTensor,
     seg: &Segment,
+    release: Option<&mut PageDrop<'_>>,
 ) -> Result<DevWeight, GpuError> {
     let Format::Card(format) = seg.format else {
         return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
@@ -390,6 +422,15 @@ fn upload_segment(
             seg.resident_bytes
         );
         return Err(placed_refusal(t, detail));
+    }
+    let read_by_steps = matches!(t.role, Role::TokenEmbedding | Role::EngramTable);
+    if let Some(release) = release.filter(|_| !read_by_steps) {
+        let base = g.data_base() + info.offset;
+        for span in &spans {
+            release
+                .release(s, base + span.bytes.start..base + span.bytes.end)
+                .map_err(|e| GpuError::plan(PLACED, e))?;
+        }
     }
     Ok(dw)
 }

@@ -29,7 +29,7 @@ pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 
 use crate::head::Head;
-use crate::hybrid::HybridConfig;
+use crate::hybrid::{HostResidency, HybridConfig, host_levers};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use cuda_core::CudaStream;
@@ -341,6 +341,11 @@ pub struct GpuModel<B: ChainBody> {
     /// The pair pass's second row's head, made at the first
     /// [`GpuModel::step_pair`]; the first row's is `head`.
     pair_head: Option<Head>,
+    /// What a placed load did to the plan's host set, and the lock over it
+    /// when one was asked for. Declared before `stages` so that it drops
+    /// first: the lock's spans are pages of the file mappings a stage's body
+    /// keeps.
+    host: Option<HostResidency>,
     stages: Vec<Stage<B>>,
     /// KV rows the resident caches were sized for; `step` refuses to grow them.
     ctx_max: usize,
@@ -397,6 +402,7 @@ impl<B: ChainBody> GpuModel<B> {
             step_graph: None,
             pair_graph: None,
             pair_head: None,
+            host: None,
             mode: StepMode::Graph,
             pos: 0,
         })
@@ -444,6 +450,7 @@ impl<B: ChainBody> GpuModel<B> {
             step_graph: None,
             pair_graph: None,
             pair_head: None,
+            host: None,
             mode: StepMode::Graph,
             pos: 0,
         })
@@ -506,6 +513,7 @@ impl<B: ChainBody> GpuModel<B> {
             step_graph: None,
             pair_graph: None,
             pair_head: None,
+            host: None,
             mode: StepMode::Graph,
             pos: 0,
         })
@@ -517,6 +525,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// derives for the card's layers, and the body over them
     /// ([`ChainBody::load_placed`]), which keeps `file` for what the plan
     /// leaves on the host; plus the output head when the card carries it.
+    /// Between the uploads and the body the plan's host set is read in and,
+    /// when asked, locked ([`HostResidency::at_load`], [`crate::hybrid::HostLevers`]),
+    /// so that no step takes the first touch of a host expert page.
     /// The caches hold the plan's `ctx_max` rows, the context its budget was
     /// made for. The card is found by its name in the plan
     /// ([`Gpu::for_card`]), never by ordinal. `meta` is what the plan was made
@@ -541,6 +552,10 @@ impl<B: ChainBody> GpuModel<B> {
         let gpu = Gpu::for_card(&spec.name)?;
         let mut weights = Weights::load_placed(gpu.stream(), &file, plan, card)?;
         B::derive(gpu.stream(), &file, layers.clone(), &mut weights)?;
+        // After the uploads, so the card's file bytes have left the page
+        // cache before the host set is read in; before the body, which
+        // takes `file`.
+        let host = HostResidency::at_load(&file, plan, |_| true, host_levers()?)?;
         let body = B::load_placed(&gpu, file, &weights, plan, card, meta)?;
         let head = if spec.head {
             Some(Head::new(&gpu, &weights, body.head_eps())?)
@@ -560,9 +575,16 @@ impl<B: ChainBody> GpuModel<B> {
             step_graph: None,
             pair_graph: None,
             pair_head: None,
+            host: Some(host),
             mode: StepMode::Graph,
             pos: 0,
         })
+    }
+
+    /// What the load did to the plan's host set — populated, locked — on a
+    /// placed load ([`GpuModel::load_placed`]); `None` on any other.
+    pub fn host_residency(&self) -> Option<&HostResidency> {
+        self.host.as_ref()
     }
 
     /// The model's stages, in layer order.

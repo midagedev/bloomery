@@ -28,11 +28,26 @@
 //!    bit with a packing of the same file bytes written here from the file
 //!    formats' definitions — not the loader's code.
 //!
-//! Host half, with `--lock` (every host segment) or `--lock-layers L0..L1`
-//! (the host segments of those layers): a `HostLock` of the plan. `VmLck` must
-//! grow by the page-rounded union of the locked ranges — derived here from the
-//! headers — exactly, and `mincore` must find every locked page resident. Lock
-//! wall time per shard and in total is printed, never asserted.
+//! Host half, after the cards, through the engine's own load step
+//! (`HostResidency::at_load` with the engine's levers, the call
+//! `GpuModel::load_placed` makes):
+//!
+//! 4. Resident host set: before anything is loaded the shard files are
+//!    dropped from the page cache (`posix_fadvise(DONTNEED)`, the pages
+//!    another process maps excepted — the count still resident is printed),
+//!    so a lazy mapping cannot pass by luck; after the host step `mincore`
+//!    must find every page of the plan's host set resident. Red with
+//!    `BLOOMERY_HOST_POPULATE=0`. `Cached` of `/proc/meminfo` before the
+//!    load, after the cards and after the host step is printed, never
+//!    asserted: with `BLOOMERY_CARD_DONTNEED` at its default the cards'
+//!    file bytes leave the page cache as they are uploaded.
+//!
+//! With `--lock` (every host segment) or `--lock-layers L0..L1` (the host
+//! segments of those layers, which narrows check 4's set too), the engine's
+//! lever `BLOOMERY_HOST_LOCK=1` must be set, and the host step locks the set:
+//! `VmLck` must grow by the page-rounded union of the locked ranges — derived
+//! here from the headers — exactly. Lock wall time per shard and in total is
+//! printed, never asserted.
 //!
 //! `--plan a|b` picks design §5's plan; b, the serving target, by default.
 
@@ -55,12 +70,13 @@ mod gate {
     use std::time::Instant;
 
     use bloomery_gpu::Gpu;
+    use bloomery_gpu::hybrid::{HostLevers, HostResidency, host_levers};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
     use cuda_core::CudaStream;
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::host_lock::{HostLock, page_bytes};
+    use model::placement::host_lock::{HostSet, PageDrop, page_bytes};
     use model::placement::{
         Card, CardFormat, CardTotals, Device, ExpertList, Format, ModelTensor, ModelTensors, Plan,
         Segment, workstation,
@@ -95,6 +111,11 @@ mod gate {
                 Lock::Layers(r) => t.layer.is_some_and(|l| r.contains(&l)),
             }
         }
+    }
+
+    /// The host segments the host step walks: `lock`'s, or every one.
+    fn keeps(lock: Option<&Lock>, t: &ModelTensor) -> bool {
+        lock.is_none_or(|l| l.keeps(t))
     }
 
     struct Args {
@@ -138,6 +159,19 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let args = parse_args()?;
+        let levers = host_levers()?;
+        if args.lock.is_some() && !levers.lock {
+            return Err(
+                "--lock and --lock-layers go through the engine's lever: set BLOOMERY_HOST_LOCK=1"
+                    .into(),
+            );
+        }
+        println!(
+            "levers: BLOOMERY_HOST_POPULATE={} BLOOMERY_HOST_LOCK={} BLOOMERY_CARD_DONTNEED={}",
+            u8::from(levers.populate),
+            u8::from(levers.lock),
+            u8::from(levers.card_dontneed)
+        );
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let inputs = PlanInputs::read(&split)?;
@@ -170,13 +204,16 @@ mod gate {
         }
 
         let cards = open_cards(&plan)?;
+        let lock = args.lock.as_ref();
+        let set = HostSet::of(&split, &plan, |t| keeps(lock, t))?;
+        evict(&split, &set)?;
+        let cached_before = meminfo_cached()?;
         let mut ok = true;
         for (c, on) in cards.iter().enumerate() {
             ok &= check_card(&split, &plan, c, on)?;
         }
-        if let Some(lock) = &args.lock {
-            ok &= check_lock(&split, &plan, lock)?;
-        }
+        let cached_cards = meminfo_cached()?;
+        ok &= check_host(&split, &plan, lock, levers, [cached_before, cached_cards])?;
         if !ok {
             return Err(checks_failed());
         }
@@ -186,9 +223,9 @@ mod gate {
              as the file's bytes{}",
             args.plan,
             if args.lock.is_some() {
-                "; the host lock is the derived page union, all resident"
+                "; the host set is resident and locked, the lock the derived page union"
             } else {
-                ""
+                "; the host set is resident"
             }
         );
         Ok(())
@@ -656,15 +693,93 @@ mod gate {
         Ok(kb.trim().parse::<u64>()? * 1024)
     }
 
-    /// The host half: lock what `lock` keeps, then check `VmLck` against the
-    /// derived page union and `mincore` over every locked page.
-    fn check_lock(split: &Split, plan: &Plan<'_>, lock: &Lock) -> Result<bool, GateError> {
+    /// `Cached` of `/proc/meminfo`, in bytes.
+    fn meminfo_cached() -> Result<u64, GateError> {
+        let info = std::fs::read_to_string("/proc/meminfo")?;
+        let kb = info
+            .lines()
+            .find_map(|l| l.strip_prefix("Cached:"))
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .ok_or("/proc/meminfo has no Cached line in kB")?;
+        Ok(kb.trim().parse::<u64>()? * 1024)
+    }
+
+    /// Check 4's precondition: every shard file out of the page cache, so the
+    /// host set is resident afterwards only if the load read it in. Pages
+    /// another process maps stay; the count left is printed.
+    fn evict(split: &Split, set: &HostSet) -> Result<(), GateError> {
+        let mut release = PageDrop::new(split);
+        for s in 0..split.shard_count() {
+            let len = split.shard(s).ok_or("shard out of range")?.mapping().len() as u64;
+            release.release(s, 0..len)?;
+        }
+        let (resident, pages) = set.resident(split)?;
+        println!(
+            "evict: the shard files' {} B advised out of the page cache; host set {resident} of \
+             {pages} pages still resident before the load (pages another process maps stay)",
+            release.bytes()
+        );
+        Ok(())
+    }
+
+    /// The host half: the engine's host step over the host segments `lock`
+    /// keeps (every one without it), then check 4 — `mincore` finds the
+    /// whole set resident — and, when the step locked, `VmLck` against the
+    /// derived page union. `cached` is `Cached` before the load and after the
+    /// cards.
+    fn check_host(
+        split: &Split,
+        plan: &Plan<'_>,
+        lock: Option<&Lock>,
+        levers: HostLevers,
+        cached: [u64; 2],
+    ) -> Result<bool, GateError> {
         let page = page_bytes();
-        let union = page_union(split, plan, lock, page)?;
-        let union_bytes = union.values().sum::<u64>() * page;
         let before = vm_lck()?;
-        let held = HostLock::lock(split, plan, |t| lock.keeps(t))?;
+        let host = HostResidency::at_load(split, plan, |t| keeps(lock, t), levers)?;
         let after = vm_lck()?;
+        let cached_host = meminfo_cached()?;
+        let set = host.set();
+        match host.populated() {
+            Some(w) => println!(
+                "host_populate={} in {:.1} s over {} shards (runtime value)",
+                w.bytes(),
+                w.wall().as_secs_f64(),
+                w.shards().len()
+            ),
+            None => println!("host_populate=off"),
+        }
+        let delta = |a: u64, b: u64| i128::from(b) - i128::from(a);
+        println!(
+            "meminfo Cached: {} B before the load, {} B after the cards ({:+} B, card_dontneed={}), \
+             {} B after the host step ({:+} B; the host set is {} B)",
+            cached[0],
+            cached[1],
+            delta(cached[0], cached[1]),
+            u8::from(levers.card_dontneed),
+            cached_host,
+            delta(cached[1], cached_host),
+            set.bytes()
+        );
+        let (resident, pages) = set.resident(split)?;
+        let four = resident == pages;
+        println!(
+            "check 4 host: {resident} of {pages} host-set pages resident after the host step \
+             ({} B): {}",
+            pages * page,
+            verdict(four)
+        );
+        if !four {
+            eprintln!(
+                "FAIL: check 4 host: {} host-set pages not resident after the load",
+                pages - resident
+            );
+        }
+        let Some(held) = host.lock() else {
+            return Ok(four);
+        };
+        let union = page_union(split, plan, lock.unwrap_or(&Lock::All), page)?;
+        let union_bytes = union.values().sum::<u64>() * page;
         for s in held.shards() {
             println!(
                 "lock shard {}: {} spans, {} B in {:.1} s (runtime value); derived union {} B",
@@ -676,25 +791,19 @@ mod gate {
             );
         }
         println!(
-            "lock: {} B over {} shards in {:.1} s (runtime value)",
+            "host_lock={} vm_lck={after} over {} shards in {:.1} s (runtime value)",
             held.bytes(),
             held.shards().len(),
             held.wall().as_secs_f64()
         );
         let grew = after.checked_sub(before);
-        let vm_ok = grew == Some(union_bytes);
+        let vm_ok = grew == Some(union_bytes) && held.bytes() == union_bytes;
         println!(
             "host VmLck: {before} B before, {after} B after the lock; the derived page-rounded union \
-             {union_bytes} B: {}",
+             {union_bytes} B, the host set {} B: {}",
+            set.bytes(),
             verdict(vm_ok)
         );
-        let (resident, pages) = held.resident()?;
-        let mc_ok = resident == pages && pages * page == union_bytes;
-        println!(
-            "host mincore: {resident} of {pages} locked pages resident ({} B locked): {}",
-            pages * page,
-            verdict(mc_ok)
-        );
-        Ok(vm_ok && mc_ok)
+        Ok(four && vm_ok)
     }
 }

@@ -52,6 +52,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use gguf::Split;
 use model::Tensor2;
 use model::moe::EXPERTS_INTO_MAX;
+use model::placement::host_lock::{HostLock, HostSet, Walk};
+use model::placement::{ModelTensor, Plan};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
@@ -135,6 +137,107 @@ impl HybridConfig {
             n_l,
             overlap: l.overlap,
         }))
+    }
+}
+
+// ------------------------------------------------------- the host set at load
+
+/// The host tier's load levers, as read from the environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostLevers {
+    /// `BLOOMERY_HOST_POPULATE`: unset or `1` reads the plan's host set into
+    /// the page cache and maps it at load; `0` leaves it to the steps' first
+    /// touches.
+    pub populate: bool,
+    /// `BLOOMERY_HOST_LOCK`: `1` locks the host set in RAM for the model's
+    /// lifetime ([`HostLock`]); unset or `0` does not.
+    pub lock: bool,
+    /// `BLOOMERY_CARD_DONTNEED`: unset or `1` releases each card segment's
+    /// file pages from the page cache once uploaded
+    /// ([`crate::weights::Weights::load_placed`]); `0` keeps them cached.
+    pub card_dontneed: bool,
+}
+
+/// The host levers, read once per process.
+pub fn host_levers() -> Result<HostLevers, GpuError> {
+    static LEVERS: OnceLock<Result<HostLevers, String>> = OnceLock::new();
+    LEVERS
+        .get_or_init(|| {
+            Ok(HostLevers {
+                populate: flag("BLOOMERY_HOST_POPULATE", true)?,
+                lock: flag("BLOOMERY_HOST_LOCK", false)?,
+                card_dontneed: flag("BLOOMERY_CARD_DONTNEED", true)?,
+            })
+        })
+        .clone()
+        .map_err(|detail| GpuError::shape("hybrid::host_levers", detail))
+}
+
+/// A `0`/`1` lever; `default` when unset.
+fn flag(name: &str, default: bool) -> Result<bool, String> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Ok(v) if v.trim() == "1" => Ok(true),
+        Ok(v) if v.trim() == "0" => Ok(false),
+        Ok(v) => Err(format!("{name}={v:?}: want 0 or 1")),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+/// What a placed load did to its plan's host set: populated it, locked it,
+/// both or neither ([`HostLevers`]). Holds the lock, when there is one, for
+/// as long as it lives; its owner keeps the split's mappings alive longer.
+pub struct HostResidency {
+    set: HostSet,
+    populate: Option<Walk>,
+    lock: Option<HostLock>,
+}
+
+impl HostResidency {
+    /// The host set of `plan` over `split` — the host segments whose tensor
+    /// `keep` selects — populated, then locked, as `levers` ask. Populating
+    /// first makes the lock a walk over resident pages.
+    pub fn at_load(
+        split: &Split,
+        plan: &Plan<'_>,
+        keep: impl Fn(&ModelTensor) -> bool,
+        levers: HostLevers,
+    ) -> Result<HostResidency, GpuError> {
+        const WHAT: &str = "HostResidency::at_load";
+        let set = HostSet::of(split, plan, keep).map_err(|e| GpuError::plan(WHAT, e))?;
+        let populate = levers
+            .populate
+            .then(|| set.populate(split))
+            .transpose()
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        let lock = levers
+            .lock
+            .then(|| HostLock::lock(split, &set))
+            .transpose()
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        Ok(HostResidency {
+            set,
+            populate,
+            lock,
+        })
+    }
+
+    /// The host set the load walked.
+    #[must_use]
+    pub fn set(&self) -> &HostSet {
+        &self.set
+    }
+
+    /// The populate walk; `None` with `BLOOMERY_HOST_POPULATE=0`.
+    #[must_use]
+    pub fn populated(&self) -> Option<&Walk> {
+        self.populate.as_ref()
+    }
+
+    /// The lock; `None` unless `BLOOMERY_HOST_LOCK=1`.
+    #[must_use]
+    pub fn lock(&self) -> Option<&HostLock> {
+        self.lock.as_ref()
     }
 }
 
