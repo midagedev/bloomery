@@ -611,9 +611,12 @@ mod gate {
                 .get(&s.t.name)
                 .ok_or_else(|| format!("{} is not resident", s.t.name))?;
             let diff = difference(&device_planes(dw, gpu.stream())?, &want);
-            let experts = s
-                .experts()
-                .map_or(String::new(), |e| format!(" experts {e}"));
+            // One run prints as itself; a hot list's scattered ids print as
+            // counts, not as every range.
+            let experts = s.experts().map_or(String::new(), |e| match e.runs().len() {
+                1 => format!(" experts {e}"),
+                n => format!(" experts {} in {n} ranges", e.len()),
+            });
             println!(
                 "check 3 {name}: {} {}{experts}, {held_rows} rows, {len} file bytes: {}",
                 s.t.name,

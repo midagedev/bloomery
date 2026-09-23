@@ -506,6 +506,12 @@ impl Body {
         ]
     }
 
+    /// The positions the caches hold: the plan's `ctx_max`, as the planner
+    /// stores it.
+    fn positions(&self) -> usize {
+        self.planner.ctx_max() as usize
+    }
+
     /// The file the body keeps for the tensors the plan leaves on the host.
     #[must_use]
     pub fn file(&self) -> &Split {
@@ -516,13 +522,13 @@ impl Body {
     /// state they leave into the buffers itself ([`Body::state_mut`]): the
     /// next [`ChainBody::decode_input`] runs at position `history.len()`.
     pub fn set_history(&mut self, history: &[u32]) -> Result<(), GpuError> {
-        if history.len() >= self.history.capacity() {
+        if history.len() >= self.positions() {
             return Err(GpuError::Shape {
                 what: "deepseek41 Body::set_history",
                 detail: format!(
                     "{} tokens leave no position of the {} the caches hold",
                     history.len(),
-                    self.history.capacity()
+                    self.positions()
                 ),
             });
         }
@@ -1097,13 +1103,13 @@ impl ChainBody for Body {
     /// A position other than the next one is refused.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
         const WHAT: &str = "deepseek41 Body::decode_input";
-        if self.history.len() != pos as usize || self.history.len() == self.history.capacity() {
+        if self.history.len() != pos as usize || self.history.len() >= self.positions() {
             return Err(GpuError::Shape {
                 what: WHAT,
                 detail: format!(
                     "a step at position {pos} after {} tokens, in caches of {} positions",
                     self.history.len(),
-                    self.history.capacity()
+                    self.positions()
                 ),
             });
         }

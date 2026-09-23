@@ -1,7 +1,9 @@
 //! The hybrid MoE boundary: the experts a layer's [`SlotMap`] puts on the
-//! card run there, the rest on the host (the V2-Lite cut is the prefix
-//! `[0, n_l)` of every MoE layer), and the handoff between the two sits
-//! inside the captured step.
+//! card run there, the rest on the host, and the handoff between the two sits
+//! inside the captured step. The prefix `[0, n_l)` of every MoE layer is the
+//! V2-Lite (deepseek2) convention ([`HybridConfig`], [`SlotMap::prefix`]); a
+//! V4.1 card holds its plan's `ExpertList` per layer — the id prefix or a hot
+//! list's ranked ids.
 //!
 //! Per hybrid layer the chain carries, after the router:
 //!
@@ -104,8 +106,9 @@ fn read_levers() -> Result<Levers, String> {
     Ok(Levers { n_l, overlap })
 }
 
-/// A hybrid load's parameters: experts `[0, n_l)` of every MoE layer on the
-/// card and the rest on the host, and where each layer's wait sits.
+/// A V2-Lite (deepseek2) hybrid load's parameters: experts `[0, n_l)` of
+/// every MoE layer on the card and the rest on the host, and where each
+/// layer's wait sits. A V4.1 load takes its card set from the plan instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HybridConfig {
     pub n_l: usize,
@@ -671,12 +674,14 @@ pub struct BoundaryShape {
 
 /// One row's part of the host-mapped page: its handoff image and the host
 /// sum its combine reads, with their windows.
-struct RowPage {
+pub(crate) struct RowPage {
     /// Byte offsets of the image and of the sum in the page.
     image_off: usize,
     hsum_off: usize,
     image: ManuallyDrop<DeviceBuffer<u32>>,
-    hsum: ManuallyDrop<DeviceBuffer<f32>>,
+    /// The row's host experts' weighted sum, read in place through the
+    /// mapping.
+    pub(crate) hsum: ManuallyDrop<DeviceBuffer<f32>>,
 }
 
 /// The card side of the boundary, allocated once at load (decision 4 of
@@ -696,14 +701,12 @@ pub struct Boundary {
     pub(crate) normed: ManuallyDrop<DeviceBuffer<f32>>,
     pub(crate) ids: ManuallyDrop<DeviceBuffer<u32>>,
     pub(crate) weights: ManuallyDrop<DeviceBuffer<f32>>,
-    /// Row 0's host experts' weighted sum, read in place through the
-    /// mapping.
-    pub(crate) hsum: ManuallyDrop<DeviceBuffer<f32>>,
     /// The region's sequence word: what a chain's own launch copies into a
     /// row's image in place of the copy node ([`Boundary::handoff_target`]).
     seq: ManuallyDrop<DeviceBuffer<u32>>,
-    /// Per row, its image and sum in the page; row 0's are the ones above.
-    pages: Vec<RowPage>,
+    /// Per row, its image and sum in the page; never empty. A one-row
+    /// chain reads row 0's sum as `pages[0].hsum`.
+    pub(crate) pages: Vec<RowPage>,
     /// `shared expert + hsum`: the combine's shared-expert input.
     pub(crate) sum: DeviceBuffer<f32>,
     /// Which experts each layer's card stack holds; the host serves the rest.
@@ -828,14 +831,10 @@ impl Boundary {
                 }
             })
             .collect::<Vec<_>>();
-        // SAFETY: row 0's sum, a second window of the span its page entry
-        // names, alive as long as the page.
-        let hsum = unsafe { window::<f32>(page.dev_at(sums_off), shape.hidden, ctx) };
         Ok(Boundary {
             normed,
             ids,
             weights,
-            hsum,
             seq,
             pages,
             sum: DeviceBuffer::<f32>::zeroed(stream, shape.hidden)?,
@@ -893,7 +892,7 @@ impl Boundary {
     /// what a combine reads in place after the layer's wait. Row 0's.
     #[must_use]
     pub fn hsum(&self) -> &DeviceBuffer<f32> {
-        &self.hsum
+        &self.pages[0].hsum
     }
 
     /// Row `row`'s host sum ([`Boundary::hsum`]).

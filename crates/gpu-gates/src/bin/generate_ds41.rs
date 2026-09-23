@@ -103,7 +103,7 @@ mod drive {
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{Machine, workstation};
+    use model::placement::{HotList, Machine, workstation};
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
                          [-n N] [--ctx C] [--place a|gate] [--mode eager|graph] \
@@ -320,14 +320,6 @@ mod drive {
         // Positions 0 .. depth − 1 are the fed ids; the N − 1 feedback steps
         // take depth .. depth + N − 2.
         let fed = depth + a.n_gen - 1;
-        if fed > a.ctx {
-            return Err(format!(
-                "depth {depth} + {} fed tokens exceed --ctx {}",
-                a.n_gen - 1,
-                a.ctx
-            )
-            .into());
-        }
         if draft && a.n_gen < 2 {
             return Err(
                 "BLOOMERY_DRAFT=lookup with -n 1 has no pass to draft: token 0 comes \
@@ -335,21 +327,32 @@ mod drive {
                     .into(),
             );
         }
-        if draft && fed + 1 > a.ctx {
+
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let ctx_max = print_plan(&inputs, a.place, a.ctx)?;
+        drop(split);
+        // The caches hold the plan's ctx_max positions, the value the model
+        // is loaded with; --ctx only asks for it.
+        if fed > ctx_max {
             return Err(format!(
-                "BLOOMERY_DRAFT=lookup: depth {depth} + {} fed tokens and the last pair's \
-                 overshoot exceed --ctx {}",
+                "depth {depth} + {} fed tokens exceed the plan's ctx_max {ctx_max} \
+                 (--ctx {})",
                 a.n_gen - 1,
                 a.ctx
             )
             .into());
         }
-
-        let path = ref_model_path()?;
-        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
-        print_plan(&inputs, a.place, a.ctx)?;
-        drop(split);
+        if draft && fed + 1 > ctx_max {
+            return Err(format!(
+                "BLOOMERY_DRAFT=lookup: depth {depth} + {} fed tokens and the last pair's \
+                 overshoot exceed the plan's ctx_max {ctx_max} (--ctx {})",
+                a.n_gen - 1,
+                a.ctx
+            )
+            .into());
+        }
 
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -416,15 +419,17 @@ mod drive {
         Ok(on)
     }
 
-    /// The plan the engine is about to load: where the experts sit.
-    fn print_plan(inputs: &PlanInputs, place: Place, ctx: usize) -> Result<(), GateError> {
+    /// The plan the engine is about to load: where the experts sit. Returns
+    /// the plan's `ctx_max`, the positions the caches are sized for.
+    fn print_plan(inputs: &PlanInputs, place: Place, ctx: usize) -> Result<usize, GateError> {
         let machine = place.machine()(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?)?;
+        let hot_list = HotList::from_env()?.map_or("none", HotList::path);
         let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
         let card = &plan.cards[0];
         println!(
             "plan place={} card={} ctx_max={} card_experts={} ({} B) host_experts={} ({} B) \
-             n_l={}..{} on {} layers card_budget={}",
+             n_l={}..{} on {} layers card_budget={} hot_list={hot_list}",
             place.name(),
             machine.cards[0].name,
             plan.ctx_max,
@@ -438,7 +443,7 @@ mod drive {
             plan.card_budget
                 .map_or_else(|| "none".to_string(), |b| b.to_string())
         );
-        Ok(())
+        Ok(usize::try_from(plan.ctx_max)?)
     }
 
     fn mode_name(mode: StepMode) -> &'static str {

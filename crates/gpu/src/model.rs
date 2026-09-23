@@ -125,7 +125,7 @@ pub trait ChainBody: Sized {
     /// The file tensors of a hybrid load of `layers` (crate::hybrid): every
     /// tensor a whole-model load uploads, except that each routed expert
     /// stack keeps only its experts `[0, n_l)` — the leading rows the `_sel`
-    /// kernels address. The default refuses: an architecture without a
+    /// kernels address; that prefix is the V2-Lite (deepseek2) convention. The default refuses: an architecture without a
     /// hybrid plan has no hybrid load.
     fn hybrid_weights(
         _stream: &CudaStream,
@@ -142,7 +142,7 @@ pub trait ChainBody: Sized {
     /// [`ChainBody::derive`] and [`ChainBody::load`] of a hybrid load in one:
     /// the derived weights filed into `w`, then the body over them, whose
     /// routed layers hand experts `[cfg.n_l, n_expert)` to a host tier that
-    /// keeps `file`. The default refuses.
+    /// keeps `file` (the V2-Lite prefix cut). The default refuses.
     fn load_hybrid(
         _gpu: &Gpu,
         _file: gguf::Split,
@@ -483,8 +483,9 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// Every block of `file` resident, plus the output head, with each MoE
-    /// layer's experts `[0, cfg.n_l)` on the card and the rest computed on
-    /// the host inside the captured step (crate::hybrid). The model keeps
+    /// layer's experts `[0, cfg.n_l)` on the card — the V2-Lite (deepseek2)
+    /// prefix cut — and the rest computed on the host inside the captured
+    /// step (crate::hybrid). The model keeps
     /// `file` for its host experts.
     pub fn load_hybrid(
         file: Split,
@@ -521,7 +522,8 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// Card `card` of `plan` resident, as one stage: the segments the plan
     /// puts on the card ([`Weights::load_placed`] — whole tensors, and each
-    /// routed stack's experts `[0, n_l)` of its layer), the weights the body
+    /// routed stack's card `ExpertList` of its layer, the id prefix or a hot
+    /// list's ranked ids), the weights the body
     /// derives for the card's layers, and the body over them
     /// ([`ChainBody::load_placed`]), which keeps `file` for what the plan
     /// leaves on the host; plus the output head when the card carries it.
@@ -958,7 +960,9 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// The head's logits of the last `step` (`n_vocab` f32). Blocking read;
-    /// gate/debug use.
+    /// gate/debug use. After [`GpuModel::step_pair`] these are row A's, the
+    /// logits after `t`: the pair pass writes row A through this same head
+    /// and row B through the pair head ([`GpuModel::pair_logits`]).
     pub fn logits(&self) -> Result<Vec<f32>, GpuError> {
         let head = self
             .head

@@ -996,7 +996,7 @@ fn enqueue_ffn_moe_hybrid(
         hybrid_wait(gpu, b, i, obs)?;
     }
     gpu.elem()
-        .enqueue_add(stream, &m.shexp, &b.hsum, hidden, &mut b.sum)?;
+        .enqueue_add(stream, &m.shexp, &b.pages[0].hsum, hidden, &mut b.sum)?;
     // The shared expert's output, the host's sum through the mapping, the
     // joined vector.
     tick(i, obs, "hybrid_add", bsum(&[Some(12 * hidden)]))?;
