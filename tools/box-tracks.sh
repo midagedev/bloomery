@@ -34,7 +34,7 @@ while read -r size dir; do
   fi
 done < <(ssh "$HOST" "cd ~/repo && du -sh ${MAIN} ${MAIN}-* 2>/dev/null")
 [ "${1:-}" = "--remove" ] || { echo "${#stale[@]} stale — rerun with --remove to delete them"; exit 0; }
-for name in "${stale[@]}"; do
+for name in ${stale[@]+"${stale[@]}"}; do  # bash 3.2 + set -u: an empty array is unbound
   case "$name" in "$MAIN"-?*) ;; *) echo "refusing odd name: $name" >&2; exit 1 ;; esac
   # 그 디렉터리에서 도는 프로세스가 있으면 지우지 않는다(돌고 있는 트랙일 수 있다). 판정은 box-gc.sh의
   # --check다: 실행 파일이 target/ 아래(테스트 바이너리)이거나 cwd가 그 안(빌드 중인 cargo·rustc — 실행
