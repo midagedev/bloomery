@@ -22,8 +22,8 @@ run      one --arm per arm, the first is the reference. TREE is a path or a dire
          --dry-run prints the arm order and the exact commands, and runs nothing.
 summary  per recipe it knows: each arm's rounds, mean, SD, and difference from the first arm with
          its 95 % interval (two-sample t, pooled SD, df = n1 + n2 - 2 — the ruler of AGENTS.md
-         "Know the ruler"). time-gpu-v41: the token graphs' us_mean (plans `today`, `wo_a_dense`)
-         and the per-site table (graph µs per launch and µs per token). time-gpu-generate: the
+         "Know the ruler"). time-gpu-v41: the token graphs' us_mean (every `token plan=` the logs
+         print, in the order they first print them) and the per-site table (graph µs per launch and µs per token). time-gpu-generate: the
          SMOKE line's p50_ms. The second form reads any logs, e.g. the lead's older ones.
 """
 import glob
@@ -117,8 +117,10 @@ def summarize(instrument, arms):
             print(row(name, xs, ref if name != data[0][0] else xs, 'ms', 4)
                   + f'  tok/s={1e3 / st.mean(xs):.2f}  p50s={[round(x, 4) for x in xs]}')
         return
-    for plan in ('today', 'wo_a_dense'):
-        have = [(n, [r['plans'][plan] for r in rs if plan in r['plans']]) for n, rs in data]
+    # The plans come from the logs: bench_v41 grows a plan whenever a round adds a token graph.
+    plans = list(dict.fromkeys(p for _, rs in data for r in rs for p in r['plans']))
+    for plan in plans:
+        have =[(n, [r['plans'][plan] for r in rs if plan in r['plans']]) for n, rs in data]
         have = [(n, xs) for n, xs in have if xs]
         if not have:
             continue
