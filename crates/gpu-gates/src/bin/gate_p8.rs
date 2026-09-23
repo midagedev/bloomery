@@ -68,9 +68,11 @@ use bloomery_gpu::model::StepProbe;
 use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapResult};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    GateError, bits_equal, find_ref_row, find_ref_row_in, max_rel_err, open_model, ref_dir,
-    ref_manifest, ref_tensor_logical_in, verdict, widened_f16_bits,
+    GateError, bits_equal, find_ref_row, find_ref_row_in, max_rel_err, ref_dir, ref_manifest,
+    ref_model_path, ref_tensor_logical_in, verdict, widened_f16_bits,
 };
+#[cfg(feature = "gpu")]
+use gguf::Split;
 
 /// The six-token prompt the CUDA dump was made for (gate_p4's constant —
 /// the same dump set), positions 0..5.
@@ -201,9 +203,9 @@ fn run() -> Result<(), GateError> {
         None => CTX_MAX,
     }
     .max(profile_ctx.unwrap_or(0) as usize);
-    let gguf = open_model()?;
+    let file = Split::open(ref_model_path()?)?;
     let man = ref_manifest()?;
-    let mut model = Deepseek2Model::load_blocks(&gguf, ctx_max, 0..profile_layer + 1)?;
+    let mut model = Deepseek2Model::load_blocks(&file, ctx_max, 0..profile_layer + 1)?;
     println!(
         "resident stage_bytes={} ctx_max={ctx_max} m=1 layers=0..{}",
         model.stages()[0].resident_bytes(),

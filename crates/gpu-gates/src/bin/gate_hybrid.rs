@@ -732,7 +732,7 @@ mod gate {
             .filter(|&l| derived.block_plan(l).is_ok_and(|b| b.routed))
             .count();
 
-        let mut a = Deepseek2Model::load_full(&gguf, CTX_MAX)?;
+        let mut a = Deepseek2Model::load_full(Split::open(ref_model_path()?)?, CTX_MAX)?;
         println!(
             "all_card resident_bytes={} layers={n_layers} routed={routed} ctx_max={CTX_MAX}",
             a.resident_bytes()

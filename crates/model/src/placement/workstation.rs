@@ -1,7 +1,8 @@
 //! This workstation's figures for a plan (`docs/v41-placement.md` §4–§5): its
 //! two cards, the host's RAM and reserves, the serving context, the two layer
-//! maps of design §5, and where the V4.1 file lies. The placement gate and the
-//! GPU load gate build their plans from here, so both check the same plan.
+//! maps of design §5 and the gate placement, and where the V4.1 file lies. The
+//! placement gate and the GPU load gates build their plans from here, so they
+//! check the same plans.
 
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -119,6 +120,19 @@ pub fn plan_b(layers: usize) -> Machine {
             card(A6000, 0..CUT, false),
             card(RTX_3090, CUT..layers, true),
         ],
+        host: host(),
+    }
+}
+
+/// The gate placement: the 3090 runs all `layers` and the head, so the V4.1
+/// body gates run on the gate card while the A6000 takes timing runs. Its
+/// expert prefixes are the largest the card's budget allows — the expert
+/// rule of [`super::plan`], on the same usable − KV − context − scratch −
+/// margin arithmetic as [`plan_a`]'s card.
+#[must_use]
+pub fn plan_gate(layers: usize) -> Machine {
+    Machine {
+        cards: vec![card(RTX_3090, 0..layers, true)],
         host: host(),
     }
 }

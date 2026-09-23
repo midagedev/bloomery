@@ -80,16 +80,20 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::Deepseek2Model;
+#[cfg(feature = "gpu")]
 use bloomery_gpu::model::{Engine, StepMode, StepProbe};
 #[cfg(feature = "gpu")]
-use bloomery_gpu::{AnyEngine, Deepseek2Model};
+use bloomery_gpu_gates::engine::AnyEngine;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{
     ExactRow, GreedyClass, GreedyRow, compare_forced, compare_forced_exact, compare_greedy,
     exact_covers, read_exact, read_greedy, sigma_forced,
 };
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{GateError, open_model};
+use bloomery_gpu_gates::{GateError, ref_model_path};
+#[cfg(feature = "gpu")]
+use gguf::Split;
 
 /// Generated tokens per prompt — the reference file's own width
 /// (`greedy-ik-cuda-32.tsv`, written with `BLOOMERY_REF_GEN=32`).
@@ -726,13 +730,18 @@ fn run() -> Result<(), GateError> {
         ok = false;
     }
 
-    let gguf = open_model()?;
+    let file = Split::open(ref_model_path()?)?;
     // `run_set` and `run_deep` need only the `Engine` surface; the rest of
     // this gate reads more (step mode, probes, graph capture, logits, the
-    // device step parameters, the stage table), so it names its arm. A
-    // second arm makes this pattern refutable, and the build then asks for
-    // that arm's path here.
-    let AnyEngine::Deepseek2(mut model) = AnyEngine::open(&gguf, CTX_MAX)?;
+    // device step parameters, the stage table), so it names its arm, and
+    // every other arm is a file this gate has no reference for.
+    let mut model = match AnyEngine::open(file, CTX_MAX)? {
+        AnyEngine::Deepseek2(m) => m,
+        #[cfg(feature = "deepseek41")]
+        AnyEngine::Deepseek41(_) => {
+            return Err("gate_e2e: the references are deepseek2's; the file is deepseek41".into());
+        }
+    };
     println!(
         "resident bytes={} ctx_max={CTX_MAX} layers=0..{} gen={GEN}",
         model.resident_bytes(),

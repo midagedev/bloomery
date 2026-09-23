@@ -967,7 +967,7 @@ fn enqueue_ffn_moe_hybrid(
     // With no expert on the card nothing writes `m.down` on a hybrid load: it
     // keeps the zeros it was allocated with, so every slot the combine reads
     // is zero without the memset.
-    let card = b.n_l > 0;
+    let card = b.slots.on_card(names.layer) > 0;
     if card {
         m.down.zero_async(stream)?;
         tick(i, obs, "hybrid_zero_down", bsum(&[Some(4 * m.down.len())]))?;

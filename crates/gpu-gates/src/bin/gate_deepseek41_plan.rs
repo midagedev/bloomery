@@ -38,6 +38,7 @@ use bloomery_gpu_gates::{
 use engram::Hash;
 use gguf::Split;
 use model::arch::Arch;
+use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 
 const NAME: &str = "gate_deepseek41_plan";
@@ -88,6 +89,7 @@ impl Checks {
 fn run() -> Result<(), GateError> {
     let path = ref_model_path()?;
     let split = Split::open(&path)?;
+    let hp = Hparams::read(&split)?;
     let hash = Hash::from_gguf(&gguf::inventory_of(&path)?)?;
     let table = oracle::for_arch(Arch::Deepseek41)?;
     let mut sets = vec![table.open(Set::Cpu)?];
@@ -96,7 +98,7 @@ fn run() -> Result<(), GateError> {
     }
     let mut c = Checks::default();
     for man in &sets {
-        gate_set(man, &path, &split, &hash, &mut c)?;
+        gate_set(man, &path, &split, &hp, &hash, &mut c)?;
     }
     let pass = c.failed == 0;
     println!(
@@ -114,6 +116,7 @@ fn gate_set(
     man: &RefManifest,
     path: &Path,
     split: &Split,
+    hp: &Hparams,
     hash: &Hash,
     c: &mut Checks,
 ) -> Result<(), GateError> {
@@ -133,7 +136,7 @@ fn gate_set(
         .header
         .ctx
         .unwrap_or((before.len() + tokens.len()) as u64);
-    let planner = Planner::from_file(split, ctx)?;
+    let planner = Planner::from_file(split, hp, ctx)?;
     if planner.stream_ratios().len() != STREAMS.len() {
         return Err(format!(
             "the file has streams of ratios {:?}; the port names {}",

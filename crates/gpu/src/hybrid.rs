@@ -1,6 +1,7 @@
-//! The hybrid MoE boundary: experts `[0, n_l)` of every MoE layer run on the
-//! card, the rest on the host, and the handoff between the two sits inside
-//! the captured step.
+//! The hybrid MoE boundary: the experts a layer's [`SlotMap`] puts on the
+//! card run there, the rest on the host (the V2-Lite cut is the prefix
+//! `[0, n_l)` of every MoE layer), and the handoff between the two sits
+//! inside the captured step.
 //!
 //! Per hybrid layer the chain carries, after the router:
 //!
@@ -37,12 +38,14 @@
 
 use crate::GpuError;
 use crate::graph::cu;
+use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
-use gguf::{Gguf, Split};
+use gguf::Split;
 use model::Tensor2;
 use model::moe::{EXPERTS_INTO_MAX, MoeBlockPlan, experts_into};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -99,17 +102,17 @@ pub struct HybridConfig {
 }
 
 impl HybridConfig {
-    /// What the levers ask of `gguf`'s model: `None` when `BLOOMERY_HYBRID_NL`
+    /// What the levers ask of `file`'s model: `None` when `BLOOMERY_HYBRID_NL`
     /// is unset or keeps every expert on the card — today's all-card path — and
     /// an error when it asks for more experts than a layer has.
-    pub fn from_levers(gguf: &Gguf) -> Result<Option<HybridConfig>, GpuError> {
+    pub fn from_levers(file: &Split) -> Result<Option<HybridConfig>, GpuError> {
         let l = levers()?;
         let Some(n_l) = l.n_l else {
             return Ok(None);
         };
         let what = "HybridConfig::from_levers";
-        let n_expert = gguf
-            .expert_count()
+        let n_expert = file
+            .arch_get_u64("expert_count")
             .ok_or(GpuError::metadata(what, "expert_count"))?;
         let n_expert = usize::try_from(n_expert)
             .map_err(|_| GpuError::shape(what, format!("expert_count {n_expert}")))?;
@@ -126,75 +129,134 @@ impl HybridConfig {
     }
 }
 
-/// The model file behind `gguf`, opened again as an owned [`Split`]: a hybrid
-/// model keeps the file for its host experts for as long as it lives, and the
-/// caller's reader is only borrowed. The mapping that starts at `gguf`'s is
-/// found in `/proc/self/maps`; the reopened file must be one shard of the same
-/// length whose header bytes equal `gguf`'s.
-pub(crate) fn reopen(gguf: &Gguf) -> Result<Split, GpuError> {
-    let what = "hybrid::reopen";
-    let base = gguf.mapping().as_ptr() as usize;
-    let maps = std::fs::read_to_string("/proc/self/maps")
-        .map_err(|e| GpuError::shape(what, format!("/proc/self/maps: {e}")))?;
-    let path = maps
-        .lines()
-        .find_map(|line| {
-            let mut f = line.split_whitespace();
-            let start = f.next()?.split('-').next()?;
-            let offset = f.nth(1)?;
-            let path = f.nth(2)?;
-            let start = usize::from_str_radix(start, 16).ok()?;
-            (start == base && u64::from_str_radix(offset, 16).ok()? == 0 && path.starts_with('/'))
-                .then(|| path.to_string())
-        })
-        .ok_or_else(|| {
-            GpuError::shape(
-                what,
-                "no file mapping starts at the reader's own: the hybrid path needs a \
-                 file-backed reader",
-            )
-        })?;
-    let split = Split::open(&path)?;
-    let same = split.shard_count() == 1
-        && split.shard(0).is_some_and(|g| {
-            let head = usize::try_from(gguf.data_base()).unwrap_or(usize::MAX);
-            g.mapping().len() == gguf.mapping().len()
-                && g.mapping().get(..head).is_some()
-                && g.mapping().get(..head) == gguf.mapping().get(..head)
-        });
-    if !same {
-        return Err(GpuError::shape(
-            what,
-            format!(
-                "{path} reopened is not the reader's file (one shard, same length, same header)"
-            ),
-        ));
+// --------------------------------------------------------------- slot map
+
+/// The slot map's entry for an expert the card does not hold: the host
+/// computes it.
+pub const HOST: u32 = u32::MAX;
+
+/// Which experts of each MoE layer the card holds, host side: per layer of
+/// `layers`, a row of `n_expert` entries, each the slot of the layer's routed
+/// stack that holds the expert or [`HOST`]. The one owner of which experts
+/// run on the host: the tier serves an id exactly when the map sends it
+/// there, and a chain that reads the map on the card uploads this one
+/// ([`SlotMap::as_slice`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotMap {
+    layers: Range<usize>,
+    n_expert: usize,
+    slots: Vec<u32>,
+    /// Per row, the experts on the card.
+    on_card: Vec<usize>,
+}
+
+impl SlotMap {
+    /// Experts `[0, n_l)` of every layer of `layers` in slots `0..n_l`, the
+    /// rest on the host.
+    pub fn prefix(layers: Range<usize>, n_expert: usize, n_l: usize) -> Result<SlotMap, GpuError> {
+        let what = "SlotMap::prefix";
+        let n = u32::try_from(n_expert)
+            .map_err(|_| GpuError::shape(what, format!("{n_expert} experts pass u32")))?;
+        let cut = u32::try_from(n_l)
+            .ok()
+            .filter(|&c| c <= n)
+            .ok_or_else(|| GpuError::shape(what, format!("{n_l} experts on the card of {n}")))?;
+        let row: Vec<u32> = (0..n).map(|e| if e < cut { e } else { HOST }).collect();
+        let slots = row.repeat(layers.len());
+        SlotMap::from_rows(layers, n_expert, slots)
     }
-    Ok(split)
+
+    /// The map from its rows: `layers.len()` rows of `n_expert` entries. The
+    /// entries of a row that are not [`HOST`] are the slots `0..k` of the
+    /// row's `k` experts on the card, each once.
+    pub fn from_rows(
+        layers: Range<usize>,
+        n_expert: usize,
+        slots: Vec<u32>,
+    ) -> Result<SlotMap, GpuError> {
+        let what = "SlotMap::from_rows";
+        if n_expert == 0 || layers.len().checked_mul(n_expert) != Some(slots.len()) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} entries for layers {layers:?} of {n_expert} experts",
+                    slots.len()
+                ),
+            ));
+        }
+        let mut on_card = Vec::with_capacity(layers.len());
+        let mut taken = vec![false; n_expert];
+        for (row, l) in slots.chunks_exact(n_expert).zip(layers.clone()) {
+            let k = row.iter().filter(|&&s| s != HOST).count();
+            taken.fill(false);
+            for &s in row.iter().filter(|&&s| s != HOST) {
+                let slot = usize::try_from(s)
+                    .ok()
+                    .filter(|&s| s < k)
+                    .and_then(|s| taken.get_mut(s))
+                    .ok_or_else(|| {
+                        GpuError::shape(
+                            what,
+                            format!(
+                                "layer {l}: slot {s}, and the row puts {k} experts on the card"
+                            ),
+                        )
+                    })?;
+                if std::mem::replace(slot, true) {
+                    return Err(GpuError::shape(
+                        what,
+                        format!("layer {l}: slot {s} holds two experts"),
+                    ));
+                }
+            }
+            on_card.push(k);
+        }
+        Ok(SlotMap {
+            layers,
+            n_expert,
+            slots,
+            on_card,
+        })
+    }
+
+    /// The layers the map has rows for.
+    #[must_use]
+    pub fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+
+    /// Entries per row: the file's experts per layer.
+    #[must_use]
+    pub fn n_expert(&self) -> usize {
+        self.n_expert
+    }
+
+    /// Every row in layer order, as a card-side copy holds it.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u32] {
+        &self.slots
+    }
+
+    /// Layer `layer`'s row; `None` for a layer the map has no row for.
+    #[must_use]
+    pub fn row(&self, layer: usize) -> Option<&[u32]> {
+        let i = layer.checked_sub(self.layers.start)?;
+        self.slots.chunks_exact(self.n_expert).nth(i)
+    }
+
+    /// The experts of layer `layer` the card holds; 0 for a layer the map has
+    /// no row for.
+    #[must_use]
+    pub fn on_card(&self, layer: usize) -> usize {
+        layer
+            .checked_sub(self.layers.start)
+            .and_then(|i| self.on_card.get(i))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 // ------------------------------------------------------ memory and windows
-
-/// A non-owning window of `len` `T` at device address `ptr` in `ctx`. The
-/// launches read it exactly as they read a buffer of their own; `ManuallyDrop`
-/// keeps it from ever freeing memory it does not own.
-///
-/// # Safety
-///
-/// - `ptr .. ptr + len * size_of::<T>()` must be memory the device reaches in
-///   `ctx` — a `cuMemAlloc` allocation or a host-mapped one — aligned for `T`.
-/// - That memory must outlive the window and stay in place: a captured graph
-///   bakes the address in.
-pub(crate) unsafe fn window<T>(
-    ptr: sys::CUdeviceptr,
-    len: usize,
-    ctx: &Arc<CudaContext>,
-) -> ManuallyDrop<DeviceBuffer<T>> {
-    // SAFETY: the range is the caller's contract. `from_raw_parts` asks for a
-    // `cuMemAlloc` pointer because its drop frees one; a window is never
-    // dropped, so the only uses left are the address and the length.
-    ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx.clone()) })
-}
 
 /// A flag word of the host-mapped page. Each has a 64-byte line of its own,
 /// so a thread spinning on one never shares a line with another.
@@ -479,18 +541,18 @@ fn before(a: u32, b: u32) -> bool {
 
 /// The shapes a boundary is cut for.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BoundaryShape {
+pub struct BoundaryShape {
     /// The model width: the normed activation, the host sum.
-    pub(crate) hidden: usize,
+    pub hidden: usize,
     /// Routed slots per token.
-    pub(crate) n_used: usize,
+    pub n_used: usize,
 }
 
 /// The card side of the boundary, allocated once at load (decision 4 of
 /// docs/gpu-design.md: a captured graph bakes every address in): the handoff
 /// region the router's launches write, the host-mapped page, and the sum the
 /// combine reads.
-pub(crate) struct Boundary {
+pub struct Boundary {
     /// Windows into `region` — what the norm and the router write in place
     /// of the MoE arena's own buffers on a hybrid layer.
     pub(crate) normed: ManuallyDrop<DeviceBuffer<f32>>,
@@ -500,8 +562,8 @@ pub(crate) struct Boundary {
     pub(crate) hsum: ManuallyDrop<DeviceBuffer<f32>>,
     /// `shared expert + hsum`: the combine's shared-expert input.
     pub(crate) sum: DeviceBuffer<f32>,
-    /// Experts `[0, n_l)` are on the card.
-    pub(crate) n_l: usize,
+    /// Which experts each layer's card stack holds; the host serves the rest.
+    pub(crate) slots: SlotMap,
     /// Whether the wait sits before the combine (`true`) or right after the
     /// go.
     pub(crate) overlap: bool,
@@ -513,12 +575,15 @@ pub(crate) struct Boundary {
 }
 
 impl Boundary {
-    /// Allocate the region, the page and the sum for `shape`. Load-time only.
-    pub(crate) fn new(
+    /// Allocate the region, the page and the sum for `shape`; the host
+    /// serves the experts `slots` sends to it, and `overlap` places each
+    /// layer's wait. Load-time only.
+    pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
         shape: BoundaryShape,
-        cfg: HybridConfig,
+        slots: SlotMap,
+        overlap: bool,
     ) -> Result<Boundary, GpuError> {
         let what = "Boundary::new";
         if shape.hidden == 0 || shape.n_used == 0 || shape.n_used > EXPERTS_INTO_MAX {
@@ -555,13 +620,19 @@ impl Boundary {
             weights,
             hsum,
             sum: DeviceBuffer::<f32>::zeroed(stream, shape.hidden)?,
-            n_l: cfg.n_l,
-            overlap: cfg.overlap,
+            slots,
+            overlap,
             region,
             page,
             shape,
             hsum_off,
         })
+    }
+
+    /// The slot map the host tier serves by.
+    #[must_use]
+    pub fn slots(&self) -> &SlotMap {
+        &self.slots
     }
 
     /// Words in the handoff region and in its host image.
@@ -576,7 +647,7 @@ impl Boundary {
 
     /// Device bytes the boundary holds: the region and the sum. The page is
     /// host memory.
-    pub(crate) fn device_bytes(&self) -> usize {
+    pub fn device_bytes(&self) -> usize {
         self.region.num_bytes() + self.sum.num_bytes()
     }
 
@@ -822,14 +893,14 @@ impl<P: ExpertPlans> Hybrid<P> {
                      layer's wait is missing"
                 )
             };
-            return Err(GpuError::shape(what, detail));
+            return Err(GpuError::protocol(what, detail));
         }
         let t0 = Instant::now();
         let page = &self.boundary.page;
         let words = self.boundary.words();
         let seq = page.payload_word(SEQ_W, words);
         if seq != Some(self.served) {
-            return Err(GpuError::shape(
+            return Err(GpuError::protocol(
                 what,
                 format!(
                     "the handoff carries sequence {seq:?}, the host is at {}: a stale handoff",
@@ -839,13 +910,17 @@ impl<P: ExpertPlans> Hybrid<P> {
         }
         let lyr = page.word(Word::Lyr).load(Ordering::Acquire);
         if usize::try_from(lyr).ok() != Some(layer) {
-            return Err(GpuError::shape(
+            return Err(GpuError::protocol(
                 what,
                 format!("the go is layer {lyr}'s, the host serves layer {layer}"),
             ));
         }
-        // The host's slots, in slot order: every routed id past the card's
-        // prefix, with its weight.
+        let row = self.boundary.slots.row(layer).ok_or(GpuError::state(
+            what,
+            "a hybrid layer without a slot map row",
+        ))?;
+        // The host's slots, in slot order: every routed id the slot map sends
+        // to the host or does not know, with its weight.
         let mut list = [(0u32, 0.0f32); EXPERTS_INTO_MAX];
         let (mut n, mut w2_host, mut w2_all) = (0usize, 0.0f64, 0.0f64);
         for s in 0..self.boundary.shape.n_used {
@@ -857,7 +932,8 @@ impl<P: ExpertPlans> Hybrid<P> {
             };
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
-            if usize::try_from(id).is_ok_and(|id| id >= self.boundary.n_l) {
+            let slot = usize::try_from(id).ok().and_then(|id| row.get(id));
+            if slot.is_none_or(|&slot| slot == HOST) {
                 list[n] = (id, w);
                 n += 1;
                 w2_host += f64::from(w) * f64::from(w);
@@ -929,4 +1005,36 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
         generation.load(Ordering::Acquire),
         end.saturating_sub(seen_at.load(Ordering::Relaxed)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HOST, SlotMap};
+
+    /// The prefix map sends to the host exactly the ids at or past `n_l`, on
+    /// every layer it has a row for, and knows no other layer.
+    #[test]
+    fn prefix_sends_the_ids_past_n_l_to_the_host() {
+        let map = SlotMap::prefix(1..4, 64, 22).expect("a prefix of 22 of 64");
+        for layer in 1..4 {
+            let row = map.row(layer).expect("a row per layer of the range");
+            for (id, &slot) in row.iter().enumerate() {
+                assert_eq!(slot == HOST, id >= 22, "layer {layer} id {id}: {slot}");
+            }
+            assert_eq!(map.on_card(layer), 22);
+        }
+        assert!(map.row(0).is_none() && map.row(4).is_none());
+        assert_eq!(map.on_card(4), 0);
+        assert!(SlotMap::prefix(0..1, 64, 65).is_err());
+    }
+
+    /// A row's card slots are `0..k` for its `k` experts on the card, each
+    /// once; any other row is refused, and so is a wrong entry count.
+    #[test]
+    fn from_rows_refuses_a_slot_twice_or_past_the_card_count() {
+        assert!(SlotMap::from_rows(0..1, 4, vec![1, HOST, 0, HOST]).is_ok());
+        assert!(SlotMap::from_rows(0..1, 4, vec![0, 0, HOST, HOST]).is_err());
+        assert!(SlotMap::from_rows(0..1, 4, vec![0, 2, HOST, HOST]).is_err());
+        assert!(SlotMap::from_rows(0..2, 4, vec![0, 1, HOST, HOST]).is_err());
+    }
 }

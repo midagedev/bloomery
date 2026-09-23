@@ -31,7 +31,6 @@ use std::sync::Arc;
 pub mod arch;
 pub mod cores;
 pub mod elem;
-pub mod engine;
 pub mod flash;
 pub mod fused;
 pub(crate) mod graph;
@@ -48,13 +47,12 @@ pub mod router;
 pub(crate) mod tensor;
 pub mod weights;
 
-pub use engine::AnyEngine;
 pub use graph::{Graph, NodeInfo};
 pub use model::GpuModel;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.
 pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;
-pub use tensor::{DeviceTensor, Q8Act};
+pub use tensor::{DeviceTensor, Q8Act, window};
 
 /// Host-side failure: context creation, module loading, device allocation,
 /// launch, capture, or copy-back.
@@ -105,6 +103,12 @@ pub enum GpuError {
     /// The file declares an architecture the model crate knows but this
     /// crate has no engine for; the string is the name the file declares.
     UnsupportedArch(String),
+    /// The card and the hybrid host tier lost step with each other: a go that
+    /// did not land in time, a card that ran ahead of the host, a handoff of
+    /// another sequence number or layer. The tier has released every pending
+    /// wait and refuses to serve again, so the model is unusable, not the
+    /// call's arguments wrong.
+    Protocol { what: &'static str, detail: String },
 }
 
 impl GpuError {
@@ -139,6 +143,15 @@ impl GpuError {
     pub(crate) fn metadata(what: &'static str, key: &'static str) -> GpuError {
         GpuError::Metadata { what, key }
     }
+
+    /// The card and the host tier `what` serves out of step, described by
+    /// `detail`.
+    pub(crate) fn protocol(what: &'static str, detail: impl Into<String>) -> GpuError {
+        GpuError::Protocol {
+            what,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// `v` as the `u32` a kernel scalar or a launch dimension takes. `as` would
@@ -167,6 +180,7 @@ impl std::fmt::Display for GpuError {
             GpuError::State { what, missing } => write!(f, "{what}: {missing}"),
             GpuError::Model(e) => write!(f, "{e}"),
             GpuError::UnsupportedArch(name) => write!(f, "unsupported architecture {name:?}"),
+            GpuError::Protocol { what, detail } => write!(f, "{what}: {detail}"),
         }
     }
 }

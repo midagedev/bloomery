@@ -76,6 +76,7 @@ mod gate {
     use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits, half_to_f32};
     use gguf::{Split, Value};
     use model::arch::Arch;
+    use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::plan::{Planner, StepPlan, StreamStep};
 
     /// The decode-step sets: one step after a prefill run under the dumped
@@ -718,6 +719,7 @@ mod gate {
         comp: CompressKernels,
         idx: IndexKeyKernels,
         split: Split,
+        hp: Hparams,
         meta: Meta,
         weights: HashMap<String, Weight>,
         sites: u32,
@@ -794,6 +796,7 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let split = Split::open(ref_model_path()?)?;
         let meta = Meta::read(&split)?;
+        let hp = Hparams::read(&split)?;
         let gpu = Gpu::new()?;
         let comp = CompressKernels::load(gpu.context())?;
         let idx = IndexKeyKernels::load(gpu.context())?;
@@ -810,6 +813,7 @@ mod gate {
             comp,
             idx,
             split,
+            hp,
             meta,
             weights: HashMap::new(),
             sites: 0,
@@ -860,7 +864,7 @@ mod gate {
     fn gate_set(cx: &mut Cx, label: &str, man: &RefManifest) -> Result<(), GateError> {
         let head = Header::read(&man.dir)?;
         let (pos0, tokens, before) = head.step()?;
-        let planner = Planner::from_file(&cx.split, head.ctx)?;
+        let planner = Planner::from_file(&cx.split, &cx.hp, head.ctx)?;
         if planner.stream_ratios().len() != STREAMS.len() {
             return Err(format!("the file has streams {:?}", planner.stream_ratios()).into());
         }

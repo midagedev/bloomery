@@ -62,9 +62,8 @@ fn role(name: &str) -> Option<(Role, Option<usize>)> {
 }
 
 /// Every tensor of `split` with its role and header facts, and the model's
-/// layer and expert counts from [`Hparams`].
-pub fn classify(split: &Split) -> Result<ModelTensors, PlacementError> {
-    let hp = Hparams::read(split)?;
+/// layer and expert counts from `hp`, the file's [`Hparams`].
+pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
     let mut tensors = Vec::with_capacity(split.tensor_count());
     let mut unclassified = Vec::new();
     for (shard, t) in split.iter_tensors() {

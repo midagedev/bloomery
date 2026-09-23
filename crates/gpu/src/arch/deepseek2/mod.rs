@@ -30,9 +30,11 @@ pub use model::arch::deepseek2::attn::MlaParams;
 pub use names::derived_name;
 pub use taps::{Block0Taps, LayerTaps};
 
-use crate::hybrid::{Boundary, BoundaryShape, ExpertPlans, Hybrid, HybridConfig, HybridStats};
+use crate::hybrid::{
+    Boundary, BoundaryShape, ExpertPlans, Hybrid, HybridConfig, HybridStats, SlotMap,
+};
 use crate::model::probe::Observer;
-use crate::model::{ChainBody, GpuModel, StepKernels, StepProbe};
+use crate::model::{ChainBody, GpuModel, StepKernels, StepProbe, one_shard};
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights, q8_0_planes};
 use crate::{Gpu, GpuError};
@@ -135,10 +137,7 @@ impl Body {
         let stream = gpu.stream();
         let mla = MlaParams::read(gguf, 0)?;
         let names: Vec<LayerNames> = layers.clone().map(|l| LayerNames::new(w, l)).collect();
-        let moe = match names.iter().find(|n| n.routed) {
-            Some(n) => Some(MoeDims::read(gguf, w, n, resident_experts)?),
-            None => None,
-        };
+        let moe = MoeDims::read(gguf, w, &names, resident_experts)?;
         let scratch = LayerScratch::new(
             gpu.context(),
             stream,
@@ -212,6 +211,7 @@ impl Body {
 
 impl ChainBody for Body {
     type Input = DecodeInput;
+    type Meta = ();
 
     fn arch() -> Arch {
         Arch::Deepseek2
@@ -225,11 +225,12 @@ impl ChainBody for Body {
     /// under [`derived_name`]. An empty range derives nothing.
     fn derive(
         stream: &CudaStream,
-        gguf: &gguf::Gguf,
+        file: &Split,
         layers: Range<usize>,
         w: &mut Weights,
     ) -> Result<(), GpuError> {
         if !layers.is_empty() {
+            let gguf = one_shard(file, "Body::derive")?;
             derive_blocks(stream, &Derived::new(gguf)?, layers, w)?;
         }
         Ok(())
@@ -237,11 +238,12 @@ impl ChainBody for Body {
 
     fn load(
         gpu: &Gpu,
-        gguf: &gguf::Gguf,
+        file: &Split,
         w: &Weights,
         layers: Range<usize>,
         ctx_max: usize,
     ) -> Result<Body, GpuError> {
+        let gguf = one_shard(file, "Body::load")?;
         Body::assemble(gpu, gguf, w, layers, ctx_max, None)
     }
 
@@ -401,25 +403,24 @@ impl ChainBody for Body {
         cfg: HybridConfig,
     ) -> Result<Body, GpuError> {
         let what = "Body::load_hybrid";
-        let gguf = file
-            .shard(0)
-            .ok_or(GpuError::state(what, "the file has no shard 0"))?;
+        let gguf = one_shard(&file, what)?;
         let derived = Derived::new(gguf)?;
         derive_blocks(gpu.stream(), &derived, layers.clone(), w)?;
         let mut body = Body::assemble(gpu, gguf, w, layers.clone(), ctx_max, Some(cfg.n_l))?;
-        let n_used = body
-            .moe
-            .as_ref()
-            .ok_or(GpuError::state(
-                what,
-                "no resident layer routes: nothing to split",
-            ))?
-            .n_used;
+        let (n_used, n_expert) =
+            body.moe
+                .as_ref()
+                .map(|m| (m.n_used, m.n_expert))
+                .ok_or(GpuError::state(
+                    what,
+                    "no resident layer routes: nothing to split",
+                ))?;
         let shape = BoundaryShape {
             hidden: body.scratch.dims.hidden,
             n_used,
         };
-        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, cfg)?;
+        let slots = SlotMap::prefix(layers.clone(), n_expert, cfg.n_l)?;
+        let boundary = Boundary::new(gpu.context(), gpu.stream(), shape, slots, cfg.overlap)?;
         body.hybrid = Some(Hybrid::new(boundary, derived, file, layers.len())?);
         Ok(body)
     }

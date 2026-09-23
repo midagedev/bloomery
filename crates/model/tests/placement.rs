@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use std::ops::Range;
 
 use gguf::{GgmlType, Split, Value};
-use model::arch::deepseek41::{kv::KvLayout, roles};
+use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
 use model::placement::{
     self, CardFormat, Device, Format, Machine, ModelTensors, Plan, Role, workstation,
 };
@@ -41,15 +41,15 @@ struct HostPin {
     headroom: i128,
 }
 
-// PIN(2026-09-23): design §5 (a)'s A6000 line after the q8_0 scale plane went f16 (planes = file bytes, 427,294,720 B less dense), the allocator's rounding a card term; n_l 63–64 on layers 2–39.
+// PIN(2026-09-23): design §5 (a)'s A6000 line after the q8_0 scale plane went f16 (planes = file bytes, 427,294,720 B less dense), the allocator's rounding a card term; n_l 63–64 on layers 2–39; KV 4,096 B less and headroom as much more since the ratio-1 source (layer 20, a group of one row) keeps no pooling state.
 const A_A6000: CardPin = CardPin {
     card: "A6000",
     dense: 8_149_379_520,
     expert_bytes: 40_490_311_680,
     experts: 2_414,
     rounding: 515_454_528,
-    kv: 110_129_152,
-    headroom: 1_083_150_336,
+    kv: 110_125_056,
+    headroom: 1_083_154_432,
     eligible: 2..40,
     n_l: (63, 64),
 };
@@ -71,15 +71,15 @@ const B_A6000: CardPin = CardPin {
     eligible: 2..20,
     n_l: (148, 149),
 };
-// PIN(2026-09-23): design §5 (b)'s 3090 line after the q8_0 scale plane went f16, the allocator's rounding a card term; n_l 57–58 on layers 20–39.
+// PIN(2026-09-23): design §5 (b)'s 3090 line after the q8_0 scale plane went f16, the allocator's rounding a card term; n_l 57–58 on layers 20–39; KV 4,096 B less and headroom as much more since the ratio-1 source (layer 20, a group of one row) keeps no pooling state.
 const B_3090: CardPin = CardPin {
     card: "3090",
     dense: 4_181_701_600,
     expert_bytes: 19_188_449_280,
     experts: 1_144,
     rounding: 250_072_096,
-    kv: 44_568_576,
-    headroom: 1_081_602_048,
+    kv: 44_564_480,
+    headroom: 1_081_606_144,
     eligible: 20..40,
     n_l: (57, 58),
 };
@@ -122,8 +122,10 @@ fn n(v: impl Into<i128>) -> String {
 fn open() -> (Split, ModelTensors, KvLayout) {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
-    let model = roles::classify(&split).unwrap_or_else(|e| panic!("classify {path}: {e}"));
-    let kv = KvLayout::from_file(&split).unwrap_or_else(|e| panic!("KV layout of {path}: {e}"));
+    let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
+    let model = roles::classify(&split, &hp).unwrap_or_else(|e| panic!("classify {path}: {e}"));
+    let kv =
+        KvLayout::from_file(&split, &hp).unwrap_or_else(|e| panic!("KV layout of {path}: {e}"));
     (split, model, kv)
 }
 

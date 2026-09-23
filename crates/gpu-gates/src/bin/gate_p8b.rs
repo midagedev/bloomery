@@ -50,9 +50,11 @@ use bloomery_gpu_gates::block::{self, BlockKind, M_TOKENS, TapKind, TapResult};
 use bloomery_gpu_gates::oracle::deepseek2::L_OUT_0;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    GateError, RefManifest, max_rel_err, open_model, ref_dir, ref_tensor_logical_in, route_ref,
+    GateError, RefManifest, max_rel_err, ref_dir, ref_model_path, ref_tensor_logical_in, route_ref,
     topk_ids_logical_in, verdict, widened_f16_bits,
 };
+#[cfg(feature = "gpu")]
+use gguf::Split;
 
 /// The layer this gate assembles — the first MoE block of the model.
 #[cfg(feature = "gpu")]
@@ -119,9 +121,12 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     let mut ok = true;
-    let gguf = open_model()?;
+    let file = Split::open(ref_model_path()?)?;
+    let gguf = file
+        .shard(0)
+        .ok_or("gate_p8b: the model file has no shard 0")?;
     let man = RefManifest::read(&ref_dir())?;
-    let mut model = Deepseek2Model::load_blocks(&gguf, CTX_MAX, LAYER..LAYER + 1)?;
+    let mut model = Deepseek2Model::load_blocks(&file, CTX_MAX, LAYER..LAYER + 1)?;
     println!(
         "resident stage_bytes={} ctx_max={CTX_MAX} m=1 layer={LAYER}",
         model.stages()[0].resident_bytes()
@@ -270,7 +275,7 @@ fn run() -> Result<(), GateError> {
     let ik_ids = topk_ids_logical_in(&man, topk_row)?;
     // The router weight multiplier, read by the engine's own MoE metadata
     // reader so the gate cannot drift from what the step applies.
-    let scale = model::moe::Meta::read(&gguf)?.scale;
+    let scale = model::moe::Meta::read(gguf)?.scale;
     let (_, ids_ref, w_ref) = route_ref(&taps1.moe_logits, 1, scale)?;
     let ours: Vec<i32> = taps1.moe_ids.iter().map(|&e| e as i32).collect();
     let ik_last = &ik_ids[last * n_used..M_TOKENS * n_used];

@@ -71,13 +71,17 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::Deepseek2Model;
+#[cfg(feature = "gpu")]
 use bloomery_gpu::model::{StepMode, StepProbe};
 #[cfg(feature = "gpu")]
-use bloomery_gpu::{AnyEngine, Deepseek2Model};
+use bloomery_gpu_gates::engine::AnyEngine;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::read_prompts;
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{GateError, open_model};
+use bloomery_gpu_gates::{GateError, ref_model_path};
+#[cfg(feature = "gpu")]
+use gguf::Split;
 
 /// ik's own decode on this model, tok/s at the depths the depth table
 /// stands at. A decode step's attention term is linear in the cached keys,
@@ -276,12 +280,17 @@ fn run() -> Result<(), GateError> {
         .into());
     }
 
-    let gguf = open_model()?;
+    let file = Split::open(ref_model_path()?)?;
     // The drive below needs more than the `Engine` surface (step mode,
-    // probe, graph capture, the stage table), so it names its arm. A second
-    // arm makes this pattern refutable, and the build then asks for that
-    // arm's path here.
-    let AnyEngine::Deepseek2(mut model) = AnyEngine::open(&gguf, ctx)?;
+    // probe, graph capture, the stage table), so it names its arm; the
+    // deepseek41 chain has none of those yet.
+    let mut model = match AnyEngine::open(file, ctx)? {
+        AnyEngine::Deepseek2(m) => m,
+        #[cfg(feature = "deepseek41")]
+        AnyEngine::Deepseek41(_) => {
+            return Err("generate: drives the deepseek2 chain; the file is deepseek41".into());
+        }
+    };
     model.set_mode(mode);
     if let Some(rounds) = flag_value("--ab")? {
         if seed_depth.is_some() {

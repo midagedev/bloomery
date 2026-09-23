@@ -29,11 +29,13 @@ fn main() {
 use bloomery_gpu_gates::oracle::deepseek2::L_OUT_1;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    GateError, bits_equal, load_ref, max_rel_err, open_model, ref_manifest, route_ref,
-    tensor_bytes, tensor_bytes_as, us_per_replay, verdict,
+    GateError, bits_equal, load_ref, max_rel_err, open_model, ref_manifest, ref_model_path,
+    route_ref, tensor_bytes, tensor_bytes_as, us_per_replay, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
+#[cfg(feature = "gpu")]
+use gguf::Split;
 #[cfg(feature = "gpu")]
 use gguf::quant::GgmlType;
 
@@ -194,7 +196,7 @@ fn run() -> Result<(), GateError> {
     // ---- resident weights: layer 1 only, as a stage holds it — the tensors
     // this block consumes, plus the block's derived weights.
     let mut wts = Weights::load(stream, &gguf, 1..2, false)?;
-    Body::derive(stream, &gguf, 1..2, &mut wts)?;
+    Body::derive(stream, &Split::open(ref_model_path()?)?, 1..2, &mut wts)?;
     fn kq<'a>(wts: &'a Weights, name: &str) -> Result<&'a DeviceTensor<u32>, GateError> {
         let Some(DevWeight::KQuant { ty, w, .. }) = wts.get(name) else {
             return Err(format!("gate_moe_fused: {name} is not a KQuant resident weight").into());

@@ -57,14 +57,14 @@ use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, KERNEL_BAND, activations, bits_equal, bytes_to_words, max_rel_err, open_model,
-    row_bytes, tensor_bytes, tensor_bytes_as, verdict,
+    ref_model_path, row_bytes, tensor_bytes, tensor_bytes_as, verdict,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::{CudaStream, DeviceBuffer};
 #[cfg(feature = "gpu")]
-use gguf::Gguf;
-#[cfg(feature = "gpu")]
 use gguf::quant::{GgmlType, half_to_f32};
+#[cfg(feature = "gpu")]
+use gguf::{Gguf, Split};
 #[cfg(feature = "gpu")]
 use model::arch::deepseek2::derived::Derived;
 #[cfg(feature = "gpu")]
@@ -88,6 +88,8 @@ fn run() -> Result<(), GateError> {
     const CUT: usize = 14;
 
     let gguf = open_model()?;
+    // The same file as the one split the architecture's derive reads.
+    let file = Split::open(ref_model_path()?)?;
     let gpu = Gpu::new()?;
     let q5 = Q5Kernels::load(gpu.context())?;
     let q8f32 = Q8F32Kernels::load(gpu.context())?;
@@ -153,7 +155,7 @@ fn run() -> Result<(), GateError> {
 
     // ------------------------------------------ 2. full load + read-back
     let mut full = Weights::load(stream, &gguf, 0..n_layers, true)?;
-    Body::derive(stream, &gguf, 0..n_layers, &mut full)?;
+    Body::derive(stream, &file, 0..n_layers, &mut full)?;
     if full.resident_bytes() as u64 != res_total + derived_total as u64 {
         eprintln!(
             "FAIL: resident totals disagree: loaded {} vs census {}",
@@ -365,7 +367,7 @@ fn run() -> Result<(), GateError> {
     let mut staged_resident = 0usize;
     for (range, globals) in [(0..CUT, false), (CUT..n_layers, false), (0..0, true)] {
         let mut w = Weights::load(stream, &gguf, range.clone(), globals)?;
-        Body::derive(stream, &gguf, range.clone(), &mut w)?;
+        Body::derive(stream, &file, range.clone(), &mut w)?;
         let names: BTreeSet<String> = w.names().map(str::to_owned).collect();
         let res = w.resident_bytes();
         println!(
@@ -408,7 +410,7 @@ fn run() -> Result<(), GateError> {
     // row below, through the derived variant.
     println!("skip q8_0 absent");
     let mut w = Weights::load(stream, &gguf, 0..2, true)?;
-    Body::derive(stream, &gguf, 0..2, &mut w)?;
+    Body::derive(stream, &file, 0..2, &mut w)?;
     let table = Table {
         gguf: &gguf,
         gpu: &gpu,

@@ -4,7 +4,30 @@
 //! replay against fixed addresses).
 
 use crate::GpuError;
-use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, sys};
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
+
+/// A non-owning window of `len` `T` at device address `ptr` in `ctx`. The
+/// launches read it exactly as they read a buffer of their own;
+/// `ManuallyDrop` keeps it from ever freeing memory it does not own.
+///
+/// # Safety
+///
+/// - `ptr .. ptr + len * size_of::<T>()` must be memory the device reaches in
+///   `ctx` — a `cuMemAlloc` allocation or a host-mapped one — aligned for `T`.
+/// - That memory must outlive the window and stay in place: a captured graph
+///   bakes the address in.
+pub unsafe fn window<T>(
+    ptr: sys::CUdeviceptr,
+    len: usize,
+    ctx: &Arc<CudaContext>,
+) -> ManuallyDrop<DeviceBuffer<T>> {
+    // SAFETY: the range is the caller's contract. `from_raw_parts` asks for a
+    // `cuMemAlloc` pointer because its drop frees one; a window is never
+    // dropped, so the only uses left are the address and the length.
+    ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx.clone()) })
+}
 
 /// A 2-D device tensor: `rows * cols` elements of `T`, row-major, uploaded
 /// once. The element type is whatever the consuming kernel loads (`u32`

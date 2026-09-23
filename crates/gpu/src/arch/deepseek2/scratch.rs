@@ -164,7 +164,7 @@ unsafe fn param_view<T>(
     let ptr = parent.cu_deviceptr() + (off * size_of::<u32>()) as u64;
     // SAFETY: the range is the caller's contract above, inside `parent`, a
     // `DeviceBuffer::from_host` allocation of the context passed here.
-    unsafe { crate::hybrid::window(ptr, len, parent.context()) }
+    unsafe { crate::tensor::window(ptr, len, parent.context()) }
 }
 
 /// The layer scratch arena and the device-side step parameters, sized at
@@ -287,18 +287,23 @@ impl LayerScratch {
 
 impl MoeDims {
     /// Read the MoE shapes from the file's metadata and cross-check them
-    /// against the resident expert stacks of `names` — the quantization
-    /// types and row counts the enqueue leans on are proven here, at load.
-    /// Each stack holds `resident_experts` experts (`None`: all of them); a
-    /// hybrid load with none on the card has no stack to check.
+    /// against every routed layer of `names` — the quantization types and row
+    /// counts the enqueue leans on are proven here, at load, for each layer the
+    /// arena serves. Each stack holds `resident_experts` experts (`None`: all
+    /// of them); a hybrid load with none on the card has no stack to check.
+    /// `None` when no layer of `names` routes.
     pub(super) fn read(
         gguf: &gguf::Gguf,
         w: &Weights,
-        names: &LayerNames,
+        names: &[LayerNames],
         resident_experts: Option<usize>,
-    ) -> Result<MoeDims, GpuError> {
+    ) -> Result<Option<MoeDims>, GpuError> {
+        let mut routed = names.iter().filter(|n| n.routed);
+        let Some(first) = routed.next() else {
+            return Ok(None);
+        };
         let meta = model::moe::Meta::read(gguf)?;
-        let hidden = f32_gain(w, &names.attn_norm)?.len();
+        let hidden = f32_gain(w, &first.attn_norm)?.len();
         let resident = resident_experts.unwrap_or(meta.n_expert);
         if resident > meta.n_expert {
             return Err(GpuError::shape(
@@ -320,41 +325,68 @@ impl MoeDims {
                 ),
             ));
         }
-        kq_ty(w, &names.ffn_gate_shexp, GgmlType::Q3_K)?;
-        kq_ty(w, &names.ffn_up_shexp, GgmlType::Q3_K)?;
-        kq_ty(w, &names.ffn_down_shexp, GgmlType::Q4_K)?;
-        if resident > 0 {
-            check_stacks(w, names, &meta, resident, hidden)?;
-        }
-        match w.get(&names.ffn_gate_inp) {
-            Some(DevWeight::F32 { .. }) => {}
-            _ => {
-                return Err(GpuError::tensor(
+        let shexp_ff = check_layer(w, first, &meta, resident, hidden)?;
+        for n in routed {
+            let ff = check_layer(w, n, &meta, resident, hidden)?;
+            if ff != shexp_ff {
+                return Err(GpuError::shape(
                     "MoeDims::read",
-                    &names.ffn_gate_inp,
-                    "resident as F32 — the router is an f32 gemv",
+                    format!(
+                        "{} has {ff} rows, the first routed layer's shared expert {shexp_ff}: \
+                         one arena serves both",
+                        n.ffn_gate_shexp
+                    ),
                 ));
             }
         }
-        let shexp_ff = kq_weight(w, &names.ffn_gate_shexp)?.rows();
-        check_rows(
-            "ffn_up_shexp rows vs ffn_gate_shexp rows",
-            kq_weight(w, &names.ffn_up_shexp)?.rows(),
-            shexp_ff,
-        )?;
-        check_rows(
-            "ffn_down_shexp rows vs hidden",
-            kq_weight(w, &names.ffn_down_shexp)?.rows(),
-            hidden,
-        )?;
-        Ok(MoeDims {
+        Ok(Some(MoeDims {
             n_expert: meta.n_expert,
             n_used: meta.n_used,
             ff: meta.ff,
             scale: meta.scale,
             shexp_ff,
-        })
+        }))
     }
+}
+
+/// The resident weights of the routed layer `names` as the enqueue reads
+/// them — the shared expert's types and rows, the router in F32, and each
+/// routed stack holding `resident` experts — and its shared expert's width.
+fn check_layer(
+    w: &Weights,
+    names: &LayerNames,
+    meta: &model::moe::Meta,
+    resident: usize,
+    hidden: usize,
+) -> Result<usize, GpuError> {
+    kq_ty(w, &names.ffn_gate_shexp, GgmlType::Q3_K)?;
+    kq_ty(w, &names.ffn_up_shexp, GgmlType::Q3_K)?;
+    kq_ty(w, &names.ffn_down_shexp, GgmlType::Q4_K)?;
+    if resident > 0 {
+        check_stacks(w, names, meta, resident, hidden)?;
+    }
+    match w.get(&names.ffn_gate_inp) {
+        Some(DevWeight::F32 { .. }) => {}
+        _ => {
+            return Err(GpuError::tensor(
+                "MoeDims::read",
+                &names.ffn_gate_inp,
+                "resident as F32 — the router is an f32 gemv",
+            ));
+        }
+    }
+    let shexp_ff = kq_weight(w, &names.ffn_gate_shexp)?.rows();
+    check_rows(
+        "ffn_up_shexp rows vs ffn_gate_shexp rows",
+        kq_weight(w, &names.ffn_up_shexp)?.rows(),
+        shexp_ff,
+    )?;
+    check_rows(
+        "ffn_down_shexp rows vs hidden",
+        kq_weight(w, &names.ffn_down_shexp)?.rows(),
+        hidden,
+    )?;
+    Ok(shexp_ff)
 }
 
 /// Err naming `what` unless `want == got`.
@@ -415,20 +447,32 @@ fn check_stacks(
             ));
         }
     }
-    check_rows(
-        "ffn_gate_exps rows vs resident experts*expert_ff",
+    let stack = |name: &str, rows: usize, per: usize| -> Result<(), GpuError> {
+        if rows == resident * per {
+            return Ok(());
+        }
+        Err(GpuError::shape(
+            "MoeDims::read",
+            format!(
+                "{name} holds {rows} rows, {resident} resident experts of {per} rows want {}",
+                resident * per
+            ),
+        ))
+    };
+    stack(
+        &names.ffn_gate_exps,
         kq_weight(w, &names.ffn_gate_exps)?.rows(),
-        resident * meta.ff,
+        meta.ff,
     )?;
-    check_rows(
-        "ffn_up_exps rows vs resident experts*expert_ff",
+    stack(
+        &names.ffn_up_exps,
         kq_weight(w, &names.ffn_up_exps)?.rows(),
-        resident * meta.ff,
+        meta.ff,
     )?;
-    check_rows(
-        "ffn_down_exps rows vs resident experts*hidden",
+    stack(
+        &names.ffn_down_exps,
         kq_weight(w, &names.ffn_down_exps)?.rows(),
-        resident * hidden,
+        hidden,
     )
 }
 

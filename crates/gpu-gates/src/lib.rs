@@ -13,6 +13,7 @@
 //! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
 pub mod block;
+pub mod engine;
 pub mod kld;
 pub mod oracle;
 pub mod prompts;

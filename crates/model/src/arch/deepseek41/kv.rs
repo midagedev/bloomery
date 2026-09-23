@@ -5,10 +5,11 @@
 //! that carries `attn_compressor_kv` sources a compressed stream (the fork's
 //! loader reads the roles off the tensors the same way,
 //! `llama.cpp-fork/src/models/deepseek41.cpp:209-247`): at ratio r it adds
-//! `⌈ctx_max / r⌉` rows of latent plus index key in f16, and a pooling state of
-//! r latent rows in f32, twice (values and scores). The layers that read a
-//! source's stream hold none of it. The window and every layer's ratio come
-//! from [`Hparams`].
+//! `⌈ctx_max / r⌉` rows of latent plus index key in f16, and, when r is above
+//! 1, a pooling state of r latent rows in f32, twice (values and scores); a
+//! ratio-1 group is its one row, so nothing pools and no state is kept. The
+//! layers that read a source's stream hold none of it. The window and every
+//! layer's ratio come from [`Hparams`].
 
 use gguf::Split;
 
@@ -36,13 +37,12 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// The window from [`Hparams::window`], the latent width from `attn_kv`'s
-    /// output dim (one width on every layer), the sources from the layers that
-    /// own a compressor, each with its stream's ratio and its index key width from
-    /// `indexer.attn_k`'s output dim; a missing key or tensor is an error
-    /// naming it.
-    pub fn from_file(split: &Split) -> Result<KvLayout, PlacementError> {
-        let hp = Hparams::read(split)?;
+    /// The window from `hp`'s [`Hparams::window`], the latent width from
+    /// `attn_kv`'s output dim (one width on every layer), the sources from the
+    /// layers that own a compressor, each with its stream's ratio and its index
+    /// key width from `indexer.attn_k`'s output dim; a missing tensor is an
+    /// error naming it.
+    pub fn from_file(split: &Split, hp: &Hparams) -> Result<KvLayout, PlacementError> {
         let mut latent = None;
         let mut sources = Vec::with_capacity(hp.n_layer);
         for (l, kind) in hp.layers.iter().enumerate() {
@@ -86,9 +86,12 @@ impl KvBytes for KvLayout {
         let window = ctx_max.min(self.window) * self.latent * F16_BYTES;
         match self.sources.get(layer).copied().flatten() {
             Some(s) => {
-                window
-                    + ctx_max.div_ceil(s.ratio) * (self.latent + s.index_key) * F16_BYTES
-                    + s.ratio * self.latent * F32_BYTES * 2
+                let state = if s.ratio > 1 {
+                    s.ratio * self.latent * F32_BYTES * 2
+                } else {
+                    0
+                };
+                window + ctx_max.div_ceil(s.ratio) * (self.latent + s.index_key) * F16_BYTES + state
             }
             None => window,
         }

@@ -36,7 +36,9 @@ use bloomery_gpu::model::StepMode;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{GateError, data_dir, open_model};
+use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
+#[cfg(feature = "gpu")]
+use gguf::Split;
 #[cfg(feature = "gpu")]
 use std::path::{Path, PathBuf};
 
@@ -167,8 +169,7 @@ fn run() -> Res<()> {
     }
     std::fs::create_dir_all(&dump)?;
 
-    let gguf = open_model()?;
-    let mut model = Deepseek2Model::load_full(&gguf, ctx)?;
+    let mut model = Deepseek2Model::load_full(Split::open(ref_model_path()?)?, ctx)?;
     model.set_mode(StepMode::Eager);
     let layers = model.stages()[0].layers();
     println!(

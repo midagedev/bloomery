@@ -14,3 +14,7 @@ cuda-host.workspace = true
 cuda-core.workspace = true
 # Shared device bodies (`bloomery_gpu::cores`) and the runtime types the launchers take.
 bloomery-gpu = { path = "../gpu" }
+# Host only: the body sizes its buffers from the file's hyperparameters and the placement plan,
+# and its step image copies the host step plan.
+bloomery-gguf = { path = "../gguf" }
+bloomery-model = { path = "../model" }

@@ -81,9 +81,8 @@ pub struct Planner {
 
 impl Planner {
     /// The planner of the model `split` holds, for caches of `ctx_max` positions: the window,
-    /// every layer's ratio and the engram n-gram length from [`Hparams`].
-    pub fn from_file(split: &Split, ctx_max: u64) -> Result<Planner, PlanError> {
-        let hp = Hparams::read(split)?;
+    /// every layer's ratio and the engram n-gram length from `hp`, the file's [`Hparams`].
+    pub fn from_file(split: &Split, hp: &Hparams, ctx_max: u64) -> Result<Planner, PlanError> {
         let window = u32::try_from(hp.window).map_err(|_| PlacementError::Metadata {
             key: split.arch_key("attention.sliding_window"),
             detail: format!("{} does not fit u32", hp.window),

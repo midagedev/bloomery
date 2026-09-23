@@ -33,7 +33,9 @@ use crate::hybrid::HybridConfig;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use cuda_core::CudaStream;
+use gguf::Split;
 use model::arch::Arch;
+use model::placement::Plan;
 use std::ops::Range;
 
 // -------------------------------------------------------------- chain body
@@ -53,6 +55,12 @@ pub trait ChainBody: Sized {
     /// plan, which is why this is a type and not two arguments.
     type Input;
 
+    /// What a placed load hands the body from the file's headers, read once
+    /// by whoever made the placement plan — deepseek41's hyperparameters, so
+    /// the plan and the body are sized from one reading. `()` for an
+    /// architecture without a placed load.
+    type Meta;
+
     /// The architecture this body is the chain of.
     fn arch() -> Arch;
 
@@ -62,7 +70,7 @@ pub trait ChainBody: Sized {
     /// so an architecture cannot forget its derived weights silently.
     fn derive(
         stream: &CudaStream,
-        gguf: &gguf::Gguf,
+        file: &Split,
         layers: Range<usize>,
         w: &mut Weights,
     ) -> Result<(), GpuError>;
@@ -72,7 +80,7 @@ pub trait ChainBody: Sized {
     /// step module.
     fn load(
         gpu: &Gpu,
-        gguf: &gguf::Gguf,
+        file: &Split,
         w: &Weights,
         layers: Range<usize>,
         ctx_max: usize,
@@ -146,6 +154,26 @@ pub trait ChainBody: Sized {
         Err(GpuError::state(
             "ChainBody::load_hybrid",
             "this architecture has no hybrid load",
+        ))
+    }
+
+    /// The body of card `card` of `plan`, over the weights the caller has
+    /// already loaded ([`Weights::load_placed`]) and derived for the card's
+    /// layers: every routed stack holds the experts the plan's segments put
+    /// on the card, and the body keeps `file` for what the plan leaves on the
+    /// host. Its caches hold the plan's `ctx_max` rows. The default refuses:
+    /// an architecture without a placement has no placed load.
+    fn load_placed(
+        _gpu: &Gpu,
+        _file: Split,
+        _w: &Weights,
+        _plan: &Plan<'_>,
+        _card: usize,
+        _meta: &Self::Meta,
+    ) -> Result<Self, GpuError> {
+        Err(GpuError::state(
+            "ChainBody::load_placed",
+            "this architecture has no placed load",
         ))
     }
 
@@ -223,6 +251,11 @@ impl<B: ChainBody> Stage<B> {
             .as_ref()
             .map_or(0, |r| r.weights.resident_bytes() + r.body.resident_bytes())
     }
+
+    /// The stage's resident weights; `None` for a metadata-only stage.
+    pub fn weights(&self) -> Option<&Weights> {
+        self.residency.as_ref().map(|r| &r.weights)
+    }
 }
 
 /// How [`GpuModel::step`] submits the chain. Both modes run the same body
@@ -264,8 +297,8 @@ pub struct GpuModel<B: ChainBody> {
 impl<B: ChainBody> GpuModel<B> {
     /// The whole model as one stage (metadata only — a resident stage comes
     /// from [`GpuModel::load_blocks`]).
-    pub fn load(gguf: &gguf::Gguf, ctx_max: usize) -> Result<GpuModel<B>, GpuError> {
-        GpuModel::load_staged(gguf, ctx_max, &[])
+    pub fn load(file: &Split, ctx_max: usize) -> Result<GpuModel<B>, GpuError> {
+        GpuModel::load_staged(file, ctx_max, &[])
     }
 
     /// Split the blocks at `cuts` (strictly ascending, each in
@@ -273,16 +306,14 @@ impl<B: ChainBody> GpuModel<B> {
     /// needs; the stages carry no residency until [`GpuModel::load_blocks`]
     /// fills one.
     pub(crate) fn load_staged(
-        gguf: &gguf::Gguf,
+        file: &Split,
         ctx_max: usize,
         cuts: &[usize],
     ) -> Result<GpuModel<B>, GpuError> {
         if ctx_max == 0 {
             return Err(GpuError::shape("GpuModel::load", "ctx_max must be >= 1"));
         }
-        let n_layers =
-            gguf.block_count()
-                .ok_or(GpuError::metadata("GpuModel::load", "block_count"))? as usize;
+        let n_layers = block_count(file, "GpuModel::load")?;
         let mut bounds = vec![0usize];
         for &c in cuts {
             if c <= *bounds.last().unwrap_or(&0) || c >= n_layers {
@@ -318,32 +349,30 @@ impl<B: ChainBody> GpuModel<B> {
     /// plus the globals in its kernels' device format, the weights the body
     /// derives from them, and the body those weights drive — its caches, its
     /// m = 1 arena and its step module. The geometry checks run at load, not
-    /// mid-step.
+    /// mid-step. The file is one shard: this is the whole-tensor upload of
+    /// [`Weights::load`], which reads one reader; a model of several shards
+    /// loads by its placement plan ([`GpuModel::load_placed`]).
     pub fn load_blocks(
-        gguf: &gguf::Gguf,
+        file: &Split,
         ctx_max: usize,
         layers: Range<usize>,
     ) -> Result<GpuModel<B>, GpuError> {
+        let what = "GpuModel::load_blocks";
         if ctx_max == 0 {
-            return Err(GpuError::shape(
-                "GpuModel::load_blocks",
-                "ctx_max must be >= 1",
-            ));
+            return Err(GpuError::shape(what, "ctx_max must be >= 1"));
         }
-        let n_layers = gguf
-            .block_count()
-            .ok_or(GpuError::metadata("GpuModel::load_blocks", "block_count"))?
-            as usize;
+        let n_layers = block_count(file, what)?;
         if layers.start >= layers.end || layers.end > n_layers {
             return Err(GpuError::shape(
-                "GpuModel::load_blocks",
+                what,
                 format!("layer range {layers:?} outside 0..{n_layers}"),
             ));
         }
+        let gguf = one_shard(file, what)?;
         let gpu = Gpu::new()?;
         let mut weights = Weights::load(gpu.stream(), gguf, layers.clone(), true)?;
-        B::derive(gpu.stream(), gguf, layers.clone(), &mut weights)?;
-        let body = B::load(&gpu, gguf, &weights, layers.clone(), ctx_max)?;
+        B::derive(gpu.stream(), file, layers.clone(), &mut weights)?;
+        let body = B::load(&gpu, file, &weights, layers.clone(), ctx_max)?;
         Ok(GpuModel {
             stages: vec![Stage {
                 gpu,
@@ -360,25 +389,23 @@ impl<B: ChainBody> GpuModel<B> {
         })
     }
 
-    /// Every block of the file resident, plus the output head: the model
+    /// Every block of `file` resident, plus the output head: the model
     /// [`GpuModel::step`] needs. `load_blocks(0..block_count)` first (so the
     /// head's `output_norm.weight` / `output.weight` arrive with the
     /// globals), then the head over those same resident weights, normalizing
     /// with the epsilon the body's plan read.
     ///
-    /// `BLOOMERY_HYBRID_NL` below the file's expert count makes this the
-    /// hybrid load of [`GpuModel::load_hybrid`] over the same file, reopened
-    /// by path (`hybrid::reopen`); unset or equal to the expert count, the
-    /// path below is taken unchanged.
-    pub fn load_full(gguf: &gguf::Gguf, ctx_max: usize) -> Result<GpuModel<B>, GpuError> {
-        if let Some(cfg) = HybridConfig::from_levers(gguf)? {
-            return GpuModel::load_hybrid(crate::hybrid::reopen(gguf)?, ctx_max, cfg);
+    /// The model takes the file: `BLOOMERY_HYBRID_NL` below the file's expert
+    /// count makes this the hybrid load of [`GpuModel::load_hybrid`], whose
+    /// host tier keeps it for the experts the card does not hold; unset or
+    /// equal to the expert count, every weight is on the card and the file is
+    /// closed once they are.
+    pub fn load_full(file: Split, ctx_max: usize) -> Result<GpuModel<B>, GpuError> {
+        if let Some(cfg) = HybridConfig::from_levers(&file)? {
+            return GpuModel::load_hybrid(file, ctx_max, cfg);
         }
-        let n_layers = gguf
-            .block_count()
-            .ok_or(GpuError::metadata("GpuModel::load_full", "block_count"))?
-            as usize;
-        let mut m = GpuModel::<B>::load_blocks(gguf, ctx_max, 0..n_layers)?;
+        let n_layers = block_count(&file, "GpuModel::load_full")?;
+        let mut m = GpuModel::<B>::load_blocks(&file, ctx_max, 0..n_layers)?;
         let head = {
             let (gpu, weights, body) = m.body_parts("GpuModel::load_full")?;
             let eps = body.head_eps();
@@ -393,7 +420,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// the host inside the captured step (crate::hybrid). The model keeps
     /// `file` for its host experts.
     pub fn load_hybrid(
-        file: gguf::Split,
+        file: Split,
         ctx_max: usize,
         cfg: HybridConfig,
     ) -> Result<GpuModel<B>, GpuError> {
@@ -401,12 +428,7 @@ impl<B: ChainBody> GpuModel<B> {
         if ctx_max == 0 {
             return Err(GpuError::shape(what, "ctx_max must be >= 1"));
         }
-        let n_layers = file
-            .shard(0)
-            .and_then(gguf::Gguf::block_count)
-            .ok_or(GpuError::metadata(what, "block_count"))?;
-        let n_layers = usize::try_from(n_layers)
-            .map_err(|_| GpuError::shape(what, format!("block_count {n_layers}")))?;
+        let n_layers = block_count(&file, what)?;
         let gpu = Gpu::new()?;
         let mut weights = B::hybrid_weights(gpu.stream(), &file, 0..n_layers, cfg.n_l)?;
         let body = B::load_hybrid(&gpu, file, &mut weights, 0..n_layers, ctx_max, cfg)?;
@@ -421,6 +443,58 @@ impl<B: ChainBody> GpuModel<B> {
             }],
             ctx_max,
             head: Some(head),
+            step_graph: None,
+            mode: StepMode::Graph,
+            pos: 0,
+        })
+    }
+
+    /// Card `card` of `plan` resident, as one stage: the segments the plan
+    /// puts on the card ([`Weights::load_placed`] — whole tensors, and each
+    /// routed stack's experts `[0, n_l)` of its layer), the weights the body
+    /// derives for the card's layers, and the body over them
+    /// ([`ChainBody::load_placed`]), which keeps `file` for what the plan
+    /// leaves on the host; plus the output head when the card carries it.
+    /// The caches hold the plan's `ctx_max` rows, the context its budget was
+    /// made for. The card is found by its name in the plan
+    /// ([`Gpu::for_card`]), never by ordinal. `meta` is what the plan was made
+    /// from.
+    pub fn load_placed(
+        file: Split,
+        plan: &Plan<'_>,
+        card: usize,
+        meta: &B::Meta,
+    ) -> Result<GpuModel<B>, GpuError> {
+        let what = "GpuModel::load_placed";
+        let spec = plan
+            .machine
+            .cards
+            .get(card)
+            .ok_or_else(|| GpuError::shape(what, format!("the plan has no card {card}")))?;
+        let ctx_max = usize::try_from(plan.ctx_max)
+            .ok()
+            .filter(|&c| c > 0)
+            .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
+        let layers = spec.layers.clone();
+        let gpu = Gpu::for_card(&spec.name)?;
+        let mut weights = Weights::load_placed(gpu.stream(), &file, plan, card)?;
+        B::derive(gpu.stream(), &file, layers.clone(), &mut weights)?;
+        let body = B::load_placed(&gpu, file, &weights, plan, card, meta)?;
+        let head = if spec.head {
+            Some(Head::new(&gpu, &weights, body.head_eps())?)
+        } else {
+            None
+        };
+        Ok(GpuModel {
+            stages: vec![Stage {
+                gpu,
+                layers,
+                graph: None,
+                graph_of: None,
+                residency: Some(Residency { weights, body }),
+            }],
+            ctx_max,
+            head,
             step_graph: None,
             mode: StepMode::Graph,
             pos: 0,
@@ -655,12 +729,10 @@ impl<B: ChainBody> GpuModel<B> {
     // --------------------------------------------- blocks are handed
 
     /// The one resident stage, split into the three things a body's chain
-    /// needs. Every assembled path needs exactly one stage carrying
+    /// needs — for the body's own instruments, in whichever crate the body
+    /// lives. Every assembled path needs exactly one stage carrying
     /// residency; `what` names the caller in the error.
-    pub(crate) fn body_parts(
-        &mut self,
-        what: &'static str,
-    ) -> Result<(&Gpu, &Weights, &mut B), GpuError> {
+    pub fn body_parts(&mut self, what: &'static str) -> Result<(&Gpu, &Weights, &mut B), GpuError> {
         if self.stages.len() != 1 {
             return Err(GpuError::state(
                 what,
@@ -678,7 +750,7 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// The one resident stage's body, for an instrument that only reads it.
-    pub(crate) fn body(&self, what: &'static str) -> Result<&B, GpuError> {
+    pub fn body(&self, what: &'static str) -> Result<&B, GpuError> {
         match self.stages.first().and_then(|s| s.residency.as_ref()) {
             Some(Residency { body, .. }) => Ok(body),
             None => Err(GpuError::state(
@@ -805,6 +877,29 @@ impl<B: ChainBody> GpuModel<B> {
             ));
         }
         Ok(())
+    }
+}
+
+/// `block_count` of `file`: the layer count.
+fn block_count(file: &Split, what: &'static str) -> Result<usize, GpuError> {
+    let n = file
+        .arch_get_u64("block_count")
+        .ok_or(GpuError::metadata(what, "block_count"))?;
+    usize::try_from(n).map_err(|_| GpuError::shape(what, format!("block_count {n}")))
+}
+
+/// The reader of `file`'s one shard, for a caller that reads a single file;
+/// a split set of several shards is refused.
+pub(crate) fn one_shard<'a>(
+    file: &'a Split,
+    what: &'static str,
+) -> Result<&'a gguf::Gguf, GpuError> {
+    match (file.shard_count(), file.shard(0)) {
+        (1, Some(g)) => Ok(g),
+        (n, _) => Err(GpuError::shape(
+            what,
+            format!("the file is {n} shards, and this reads one"),
+        )),
     }
 }
 

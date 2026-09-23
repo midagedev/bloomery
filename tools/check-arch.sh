@@ -9,6 +9,7 @@
 #      crates/gguf 의 접근자는 저장소 쪽이라 허용한다.
 #   ④ 공유 파일(crates/*/src 가운데 arch/ 밖)은 아키텍처 모듈 경로(deepseek2:: · deepseek41::)를 쓰지 않는다.
 #      Arch 를 구체 모델로 잇는 디스패치 지점만 파일과 구문(함수·타입 별칭·use 선언) 단위로 허용한다.
+#   아키텍처 자신의 크레이트(crates/gpu-<arch>/src/)는 ①②④에서 그 아키텍처의 arch/ 로 센다.
 #
 # 계약: `just check-arch`는 넷 다 엄격하게 돈다. --allow-pending(또는 CHECK_ARCH_PENDING=1)은 ②·③을
 # 경고로 낮추는 문이다 — 이관 라운드가 한동안 둘을 빨강으로 두어야 할 때 그 라운드 안에서만 쓴다.
@@ -43,7 +44,7 @@ report() { # report <번호> <설명> <위반 줄들>
 cross=
 cross_one() { # cross_one <이 아키텍처 디렉터리> <여기서 use 하면 안 되는 이름>
   local dirs hits
-  dirs=$(find crates -type d -path "*/src/arch/$1" 2>/dev/null || true)
+  dirs=$(find crates -type d \( -path "*/src/arch/$1" -o -path "crates/gpu-$1/src" \) 2>/dev/null || true)
   [ -n "$dirs" ] || return 0
   # shellcheck disable=SC2086
   hits=$(grep -rnE "^[[:space:]]*(pub )?use .*\b$2\b" $dirs --include='*.rs' || true)
@@ -64,7 +65,7 @@ report 1 "arch dirs use each other" "$cross"
 # 규칙이 막는 것은 `blk.N.<name>`이므로, 줄에서 그 리터럴을 지운 뒤에도 패턴이 남는 줄만 잡는다 —
 # `"blk.{l}.ffn_up"`·`"blk.0.attn_q"`와, 맨 접두와 이름이 한 줄에 같이 있는 줄은 그대로 걸린다.
 lits=$(grep -rnE '"blk\.|blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
-  | grep -vE '^crates/[^/]+/src/arch/' \
+  | grep -vE '^crates/([^/]+/src/arch/|gpu-(deepseek2|deepseek41)/src/)' \
   | grep -vE '^tools/ref/models/' \
   | grep -vE '^crates/[^/]+/tests/' \
   | grep -vE '^crates/gpu-gates/src/bin/' \
@@ -131,7 +132,7 @@ archpath=$({ grep -rnE '\b(deepseek2|deepseek41)::' crates/*/src --include='*.rs
                crates/*/src --include='*.rs' 2>/dev/null
              grep -rnE '^[[:space:]]*(deepseek2|deepseek41)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*$' \
                crates/*/src --include='*.rs' 2>/dev/null; } | sort -u \
-  | grep -vE '^crates/[^/]+/src/arch/' \
+  | grep -vE '^crates/([^/]+/src/arch/|gpu-(deepseek2|deepseek41)/src/)' \
   | grep -vE '^crates/gpu-gates/src/bin/' \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 outside=
