@@ -15,7 +15,8 @@
 //! [`ExpertList`]: the id prefix `[0, n_l)` by default, or the layer's `n_l`
 //! hottest ids from a hot list file ([`HotList`], the `BLOOMERY_HOT_LIST`
 //! lever). The count, and so every byte total, is the same either way; only
-//! the ids change.
+//! the ids change. A card byte budget (`BLOOMERY_CARD_BUDGET`,
+//! [`card_budget`]) caps every card's usable bytes before the rule runs.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -23,6 +24,7 @@ use std::ops::Range;
 
 use gguf::GgmlType;
 
+pub mod card_budget;
 pub mod host_lock;
 pub mod hot_list;
 pub mod workstation;
@@ -546,8 +548,8 @@ pub struct CardTotals {
     pub kv_bytes: u64,
     pub scratch_bytes: u64,
     pub context_bytes: u64,
-    /// usable − dense − experts − rounding − KV − scratch − context; the
-    /// margin is inside it.
+    /// usable − dense − experts − rounding − KV − scratch − context, usable
+    /// capped by the plan's card budget; the margin is inside it.
     pub headroom_bytes: i128,
 }
 
@@ -578,6 +580,9 @@ pub struct Plan<'a> {
     /// Per layer: how many experts its card holds (the ids are its routed
     /// stacks' card [`Segment::experts`]); the host holds the rest.
     pub n_l: Vec<u64>,
+    /// The card byte budget the plan was made under: every card planned
+    /// with `min(usable, budget)` usable bytes ([`Plan::usable_bytes`]).
+    pub card_budget: Option<u64>,
 }
 
 /// Why a placement could not be built; each variant names what it refused.
@@ -603,6 +608,25 @@ pub enum PlacementError {
     /// A hot list file that cannot serve this plan: the file and why.
     #[error("hot list {path}: {detail}")]
     HotList { path: String, detail: String },
+    /// A `BLOOMERY_CARD_BUDGET` value that is not a byte count.
+    #[error("{} {value:?}: {detail}", card_budget::LEVER)]
+    CardBudgetLever { value: String, detail: String },
+    /// A card budget below what the card needs with no expert on it.
+    #[error(
+        "card {card}: budget {budget} B is below its floor {floor} B = dense {dense} B (the \
+         allocator's granules) + KV {kv} B + context {context} B + scratch {scratch} B + margin \
+         {margin} B"
+    )]
+    CardBudgetFloor {
+        card: String,
+        budget: u64,
+        floor: u64,
+        dense: u64,
+        kv: u64,
+        context: u64,
+        scratch: u64,
+        margin: u64,
+    },
 }
 
 impl PlacementError {
@@ -1088,14 +1112,21 @@ fn footprint(
 }
 
 /// [`plan_with`] the hot list the `BLOOMERY_HOT_LIST` lever names, or the id
-/// prefix when it is unset ([`HotList::from_env`]).
+/// prefix when it is unset ([`HotList::from_env`]), and the card budget the
+/// `BLOOMERY_CARD_BUDGET` lever sets, or none ([`card_budget::from_env`]).
 pub fn plan<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
 ) -> Result<Plan<'a>, PlacementError> {
-    plan_with(model, machine, ctx_max, kv, HotList::from_env()?)
+    let hot = HotList::from_env()?;
+    plan_with(model, machine, ctx_max, kv, hot, card_budget::from_env()?)
+}
+
+/// `card`'s usable bytes under `budget`: the one place the cap is taken.
+fn capped(card: &Card, budget: Option<u64>) -> u64 {
+    budget.map_or(card.usable_bytes, |b| card.usable_bytes.min(b))
 }
 
 /// Place every tensor of `model` on `machine` for a context of `ctx_max`
@@ -1106,13 +1137,17 @@ pub fn plan<'a>(
 /// whose layers cannot keep one expert keeps none; one that cannot hold even
 /// its dense tensors shows up in [`Plan::violations`], not as an error here.
 /// The `n_l` experts of a layer are `hot`'s first `n_l` for it, or the id
-/// prefix `[0, n_l)` without `hot`.
+/// prefix `[0, n_l)` without `hot`. With `card_budget`, every card plans
+/// with `min(usable, budget)` usable bytes, and a card whose dense tensors,
+/// KV, context, scratch and margin pass that is refused
+/// ([`PlacementError::CardBudgetFloor`]).
 pub fn plan_with<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
     hot: Option<&HotList>,
+    card_budget: Option<u64>,
 ) -> Result<Plan<'a>, PlacementError> {
     if let Some(h) = hot {
         h.check_model(model)?;
@@ -1138,13 +1173,17 @@ pub fn plan_with<'a>(
             .clone()
             .map(|l| kv.layer_bytes(l, ctx_max))
             .sum();
-        let budget = i128::from(card.usable_bytes)
+        let budget = i128::from(capped(card, card_budget))
             - i128::from(kv_card)
             - i128::from(card.context_bytes)
             - i128::from(card.scratch_bytes)
             - i128::from(card.margin_bytes);
         let eligible = eligible(card, &routed, model);
         let uploads = card_uploads(model, c, &rows, &eligible)?;
+        if let Some(b) = card_budget {
+            let dense = footprint(card.granule_bytes, &uploads, &n_l)?;
+            check_floor(card, b, dense, kv_card)?;
+        }
         spread(&mut n_l, &eligible, model.experts, budget, |n| {
             footprint(card.granule_bytes, &uploads, n)
         })?;
@@ -1170,10 +1209,44 @@ pub fn plan_with<'a>(
         }
     }
     let rows: Vec<Row> = rows.into_iter().flatten().collect();
-    let routing: Vec<bool> = routed.iter().map(|s| !s.is_empty()).collect();
     Ok(totals(
-        model, machine, ctx_max, rows, &kv_bytes, n_l, &routing,
+        model,
+        machine,
+        ctx_max,
+        rows,
+        &kv_bytes,
+        n_l,
+        card_budget,
     ))
+}
+
+/// Refuse `card` under the card budget `budget` when its floor — the
+/// granules of its dense uploads `dense`, its KV `kv`, context, scratch and
+/// margin — passes the budget. A floor within a budget above the card's own
+/// usable bytes but past those shows up in [`Plan::violations`], as without
+/// a budget: the card, not the budget, is too small.
+fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), PlacementError> {
+    let floor = [
+        kv,
+        card.context_bytes,
+        card.scratch_bytes,
+        card.margin_bytes,
+    ]
+    .into_iter()
+    .try_fold(dense, u64::checked_add);
+    match floor {
+        Some(floor) if floor <= budget => Ok(()),
+        _ => Err(PlacementError::CardBudgetFloor {
+            card: card.name.clone(),
+            budget,
+            floor: floor.unwrap_or(u64::MAX),
+            dense,
+            kv,
+            context: card.context_bytes,
+            scratch: card.scratch_bytes,
+            margin: card.margin_bytes,
+        }),
+    }
 }
 
 /// The per-device sums of a finished set of rows.
@@ -1184,8 +1257,18 @@ fn totals<'a>(
     rows: Vec<Row>,
     kv_bytes: &[u64],
     n_l: Vec<u64>,
-    routing: &[bool],
+    card_budget: Option<u64>,
 ) -> Plan<'a> {
+    let mut routing = vec![false; model.layers];
+    for t in model
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::RoutedExperts)
+    {
+        if let Some(r) = t.layer.and_then(|l| routing.get_mut(l)) {
+            *r = true;
+        }
+    }
     let mut card_dense = vec![0u64; machine.cards.len()];
     let mut card_experts = vec![0u64; machine.cards.len()];
     let (mut host_experts, mut host_tables, mut nvme_bytes) = (0u64, 0u64, 0u64);
@@ -1221,7 +1304,7 @@ fn totals<'a>(
                 kv_bytes: kv_bytes[c],
                 scratch_bytes: card.scratch_bytes,
                 context_bytes: card.context_bytes,
-                headroom_bytes: i128::from(card.usable_bytes) - i128::from(used),
+                headroom_bytes: i128::from(capped(card, card_budget)) - i128::from(used),
             }
         })
         .collect();
@@ -1246,15 +1329,24 @@ fn totals<'a>(
         host,
         nvme_bytes,
         n_l,
+        card_budget,
     }
 }
 
 impl Plan<'_> {
+    /// The usable bytes `card` planned with: its own, capped by the plan's
+    /// card budget.
+    #[must_use]
+    pub fn usable_bytes(&self, card: &Card) -> u64 {
+        capped(card, self.card_budget)
+    }
+
     /// Every invariant the rows break, re-derived from the rows themselves:
     /// each tensor placed once; an expert stack's segments cover every expert
     /// once and a whole tensor is one segment; a card segment's buffers sum to
     /// its resident bytes; a card holds only what its stage uses; the granules
-    /// of its uploads + KV + scratch + context ≤ usable − margin on each card;
+    /// of its uploads + KV + scratch + context ≤ usable − margin on each card,
+    /// usable capped by the card budget;
     /// the host's tensors and reserves ≤ its usable bytes.
     pub fn violations(&self) -> Vec<Violation> {
         let (model, cards) = (self.model, &self.machine.cards);
@@ -1304,7 +1396,7 @@ impl Plan<'_> {
         out.extend(unsized_segments);
         for ((card, totals), heap) in cards.iter().zip(&self.cards).zip(&heaps) {
             let total = heap.taken + totals.kv_bytes + card.scratch_bytes + card.context_bytes;
-            let limit = card.usable_bytes.saturating_sub(card.margin_bytes);
+            let limit = self.usable_bytes(card).saturating_sub(card.margin_bytes);
             if total > limit {
                 out.push(Violation::CardOver {
                     card: card.name.clone(),

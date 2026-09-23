@@ -9,7 +9,9 @@
 //! prints the per-tensor table.
 //!
 //! A third test pins what a hot list changes: which experts a card keeps,
-//! never how many or at what bytes.
+//! never how many or at what bytes. A fourth pins what a card budget is: the
+//! card's usable bytes, so the A6000 under the 3090's budget plans the gate
+//! placement's experts, and a budget below the dense floor is refused.
 //!
 //! `hw_`: needs the V4.1 shards on the box (`just gate-placement`);
 //! `BLOOMERY_V41_MODEL` names another first shard. The plan inputs are this
@@ -22,7 +24,8 @@ use std::ops::Range;
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
 use model::placement::{
-    self, CardFormat, Device, Format, HotList, Machine, ModelTensors, Plan, Role, workstation,
+    self, CardFormat, CardTotals, Device, Format, HotList, Machine, ModelTensors, PlacementError,
+    Plan, Role, workstation,
 };
 
 /// One card's pinned totals, and the n_l band on the layers that can hold experts.
@@ -542,8 +545,9 @@ fn hw_placement_hot_list_keeps_the_counts() {
     }
     let hot = HotList::parse("synthetic", &text).expect("the synthetic list parses");
     let ctx = workstation::CTX_MAX;
-    let prefix = placement::plan_with(&model, &machine, ctx, &kv, None).expect("prefix plan");
-    let listed = placement::plan_with(&model, &machine, ctx, &kv, Some(&hot)).expect("list plan");
+    let prefix = placement::plan_with(&model, &machine, ctx, &kv, None, None).expect("prefix plan");
+    let listed =
+        placement::plan_with(&model, &machine, ctx, &kv, Some(&hot), None).expect("list plan");
     let mut bad: Vec<String> = listed
         .violations()
         .iter()
@@ -634,6 +638,151 @@ fn hw_placement_hot_list_keeps_the_counts() {
     assert!(
         bad.is_empty(),
         "hot list plan: {} failures\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+}
+
+/// A card's totals the budget must reproduce: dense, expert bytes and count,
+/// rounding, KV, headroom.
+fn card_line(t: &CardTotals) -> (u64, u64, u64, u64, u64, i128) {
+    (
+        t.dense_bytes,
+        t.expert_bytes,
+        t.experts,
+        t.rounding_bytes,
+        t.kv_bytes,
+        t.headroom_bytes,
+    )
+}
+
+/// A card budget is the card's usable bytes and nothing else: plan (a) under
+/// the 3090's usable bytes is the gate placement slot for slot — `n_l` per
+/// layer and every card total, the card's name aside; under the A6000's own
+/// usable bytes it is plan (a) unbudgeted; under 38 GiB it keeps more experts
+/// than the first and fewer than the second, and breaks no invariant. A
+/// budget below the card's floor (dense granules + KV + context + scratch +
+/// margin) is refused with that floor; at the floor it plans, keeping no
+/// expert on the card, and one byte less is refused.
+#[test]
+#[ignore = "hw: needs the V4.1 shards on the box"]
+fn hw_placement_card_budget_is_usable_bytes() {
+    let (_, model, kv) = open();
+    let ctx = workstation::CTX_MAX;
+    let a = workstation::plan_a(model.layers);
+    let gate = workstation::plan_gate(model.layers);
+    let with = |budget: Option<u64>| placement::plan_with(&model, &a, ctx, &kv, None, budget);
+    let mut bad = Vec::new();
+
+    let gate_plan = placement::plan_with(&model, &gate, ctx, &kv, None, None).expect("gate plan");
+    let b3090 = workstation::RTX_3090.usable_bytes();
+    let as_3090 = with(Some(b3090)).expect("plan (a) under the 3090's budget");
+    if as_3090.n_l != gate_plan.n_l {
+        bad.push(format!(
+            "n_l under budget {b3090}: {:?}, the gate placement's {:?}",
+            as_3090.n_l, gate_plan.n_l
+        ));
+    }
+    if card_line(&as_3090.cards[0]) != card_line(&gate_plan.cards[0]) {
+        bad.push(format!(
+            "card under budget {b3090}: (dense, experts B, experts, rounding, KV, headroom) {:?}, \
+             the gate placement's {:?}",
+            card_line(&as_3090.cards[0]),
+            card_line(&gate_plan.cards[0])
+        ));
+    }
+
+    let unbudgeted = with(None).expect("plan (a)");
+    let b_a6000 = workstation::A6000.usable_bytes();
+    let as_a6000 = with(Some(b_a6000)).expect("plan (a) under its own budget");
+    if as_a6000.n_l != unbudgeted.n_l
+        || card_line(&as_a6000.cards[0]) != card_line(&unbudgeted.cards[0])
+    {
+        bad.push(format!(
+            "plan (a) under its own usable {b_a6000} B: n_l {:?} card {:?}, unbudgeted n_l {:?} card {:?}",
+            as_a6000.n_l,
+            card_line(&as_a6000.cards[0]),
+            unbudgeted.n_l,
+            card_line(&unbudgeted.cards[0])
+        ));
+    }
+
+    let b38 = 38u64 << 30;
+    let mid = with(Some(b38)).expect("plan (a) under 38 GiB");
+    let (lo, hi) = (gate_plan.cards[0].experts, unbudgeted.cards[0].experts);
+    let got = mid.cards[0].experts;
+    if !(lo < got && got < hi) {
+        bad.push(format!(
+            "38 GiB keeps {got} experts, not strictly between the gate's {lo} and plan (a)'s {hi}"
+        ));
+    }
+    bad.extend(mid.violations().iter().map(|v| format!("38 GiB: {v}")));
+    let held: Vec<u64> = mid.n_l.iter().copied().filter(|&n| n > 0).collect();
+    println!("38 GiB n_l {:?}", mid.n_l);
+
+    let floor = match with(Some(1 << 30)) {
+        Err(PlacementError::CardBudgetFloor {
+            floor,
+            dense,
+            kv,
+            context,
+            scratch,
+            margin,
+            ..
+        }) => {
+            if floor != dense + kv + context + scratch + margin {
+                bad.push(format!(
+                    "floor {floor} is not dense {dense} + KV {kv} + context {context} + scratch \
+                     {scratch} + margin {margin}"
+                ));
+            }
+            floor
+        }
+        other => panic!(
+            "a 1 GiB budget: {:?}, not the floor refusal",
+            other.map(|p| p.n_l)
+        ),
+    };
+    match with(Some(floor)) {
+        Ok(p) => {
+            if p.n_l.iter().any(|&n| n > 0) {
+                bad.push(format!(
+                    "at the floor {floor} B the card keeps experts: {:?}",
+                    p.n_l
+                ));
+            }
+            bad.extend(
+                p.violations()
+                    .iter()
+                    .filter(|v| matches!(v, placement::Violation::CardOver { .. }))
+                    .map(|v| format!("at the floor: {v}")),
+            );
+        }
+        Err(e) => bad.push(format!("at the floor {floor} B: {e}")),
+    }
+    match with(Some(floor - 1)) {
+        Err(e @ PlacementError::CardBudgetFloor { .. }) => println!("one byte below: {e}"),
+        other => bad.push(format!(
+            "one byte below the floor {floor}: {:?}, not the floor refusal",
+            other.map(|p| p.n_l)
+        )),
+    }
+
+    println!(
+        "card budget on plan (a): {b3090} B (3090) keeps {} experts, the gate's {}; {b38} B (38 GiB) \
+         keeps {got}, n_l {}..{} on {} layers; {b_a6000} B (A6000) keeps {}, unbudgeted {hi}; floor \
+         {floor} B; {} failures",
+        as_3090.cards[0].experts,
+        gate_plan.cards[0].experts,
+        held.iter().min().copied().unwrap_or(0),
+        held.iter().max().copied().unwrap_or(0),
+        held.len(),
+        as_a6000.cards[0].experts,
+        bad.len()
+    );
+    assert!(
+        bad.is_empty(),
+        "card budget: {} failures\n  {}",
         bad.len(),
         bad.join("\n  ")
     );
