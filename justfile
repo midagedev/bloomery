@@ -198,15 +198,16 @@ bench-gpu-kernels *ARGS:
 # 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
 # 사이트마다 첫 사본과 끝 사본에서 여섯 행(heads 팔은 헤드마다 첫 행을 더한다)을 같은 바이트로 계산한 f64 참조와
 # 대조하고, 사본마다 그 발사의 출력 전체에 대한 FNV-1a digest를 한 줄 찍는다 — 커널을 재편하는 라운드는 이 줄로
-# 비트 동일을 보인다. 3090, 게이트 락.
+# 비트 동일을 보인다. 인덱서 사이트(두 런치)는 `deepseek41` 피처 뒤에 있어 그 피처로 짓는다 — `gpu`로 지으면
+# `not_built site=indexer` 한 줄만 찍고 빠진다. 3090, 게이트 락.
 bench-gpu-v41-check:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/gpu-gate.sh bench_v41 --check'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bench_v41 && bash tools/gpu-gate.sh bench_v41 --check'
 
 # 같은 벤치의 시간(리드 전용): 사이트마다 eager 버스트와 그래프 재생, 토큰 하나를 통째로 잡은 그래프 셋(오늘의
 # 묶음 attn_output_a, 밀집 등가, heads 한 번)과 노드 수가 같은 빈 그래프. 대조가 빨강이면 재지 않는다. 임대·증인·A6000 고정은
 # time-gate.sh가 쥔다.
 time-gpu-v41:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
 
 # 캡처된 그래프가 호스트 스레드에 일을 넘기고 기다리는 방식 다섯 × 결과를 받는 팔 둘의 벤치(bench_join) — 정확성 실행이다.
 # 방식은 블로킹 호스트 노드(넘기는 노드와 기다리는 노드 한 쌍, 그리고 일을 통째로 하는 노드 하나), 스핀 호스트 노드,
