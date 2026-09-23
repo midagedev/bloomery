@@ -17,10 +17,12 @@
 //!    (`CardTotals`; the gate allocates neither KV nor scratch). The plan
 //!    counts the allocator's rounding as its own term, so this holds exactly
 //!    when the context, plus whatever the load took beyond its resident bytes
-//!    and that term, fits what the plan set aside for the context. Printed:
-//!    the bytes the load asked for next to what `cuMemGetInfo` lost, the gap,
-//!    the plan's rounding term and the residue between them, the context's
-//!    cost, the allocation count and both granules.
+//!    and that term, fits what the plan set aside for the context. The residue
+//!    of that gap over the plan's rounding term must be zero: the term's rule
+//!    for small allocations is fitted to this loader's allocation list, and a
+//!    changed list would otherwise vanish into the context's slack. Printed:
+//!    the bytes the load asked for next to what `cuMemGetInfo` lost, the
+//!    context's cost, the allocation count and both granules.
 //! 3. Read-back: the first whole tensor of each card format on the card and
 //!    the first expert-prefix stack segment, read back and compared bit for
 //!    bit with a packing of the same file bytes written here from the file
@@ -334,11 +336,10 @@ mod gate {
     }
 
     /// Check 2: what the load leaves free covers the plan's headroom, KV and
-    /// scratch. The costs beside it are printed, never asserted: the plan's
-    /// usable bytes are the card's free bytes with no process on it, so the
-    /// context took usable − free after it, and check 2 holds exactly when
-    /// that, plus the residue of the load's bytes beyond its resident ones
-    /// over the plan's rounding term, fits the plan's context term.
+    /// scratch, and what the load took beyond its resident bytes is the plan's
+    /// rounding term exactly. The other costs are printed, never asserted: the
+    /// plan's usable bytes are the card's free bytes with no process on it, so
+    /// the context took usable − free after it.
     fn check_memory(card: &Card, t: &CardTotals, m: &Memory, w: &Weights) -> bool {
         let floor = t.headroom_bytes + i128::from(t.kv_bytes) + i128::from(t.scratch_bytes);
         let pass = i128::from(m.free_load) >= floor;
@@ -357,11 +358,14 @@ mod gate {
         let took = free_ctx - free_load;
         let gap = took - resident;
         let residue = gap - i128::from(t.rounding_bytes);
+        let exact = residue == 0;
         println!(
-            "  runtime values: the load asked for {resident} B resident and cuMemGetInfo lost {took} B \
+            "check 2 {} rounding: the load asked for {resident} B resident and cuMemGetInfo lost {took} B \
              across it, {gap} B beyond the request; the plan's rounding term {} B [derived], residue \
-             {residue} B",
-            t.rounding_bytes
+             {residue} B: {}",
+            card.name,
+            t.rounding_bytes,
+            verdict(exact)
         );
         let context = usable - free_ctx;
         println!(
@@ -387,7 +391,7 @@ mod gate {
              the device",
             card.granule_bytes, m.granularity
         );
-        pass
+        pass && exact
     }
 
     /// The device buffers a resident weight holds, in bytes.
