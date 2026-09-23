@@ -47,6 +47,17 @@
 //! statistics and still prints them, marked. The `SMOKE` footer carries the
 //! keys `generate`'s does (`p50_ms=`, `mean_ms=`, `warm=`), so the runners
 //! that read one read the other.
+//!
+//! The binary owns its main thread, so it pins it to the dispatcher's cpu
+//! slot (`threads::pool().pin_caller()`), as `bloomery-decode` and
+//! `bench_v41_host` do; `BLOOMERY_PIN_MAIN=0` leaves it floating, for the
+//! A/B. The `load` line prints both the ask and the outcome.
+//!
+//! `BLOOMERY_STEP_STATS=1` reads, after every generated step, the host
+//! tier's counters (`HybridStats`) and the process's page faults
+//! (`getrusage`), and prints one `stat step` line per step and a
+//! `stat summary` over the steps `--warm` keeps, after the loop, as the
+//! `time` lines are. Unset, the stat path does not run: no read, no call.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -63,6 +74,7 @@ fn main() -> std::process::ExitCode {
 mod drive {
     use std::time::Instant;
 
+    use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
@@ -277,6 +289,8 @@ mod drive {
 
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
+        let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
+        let pinned = pin_main && threads::pool().pin_caller();
         let (ids, prompt_len) = fed_ids(&a)?;
         let depth = ids.len();
         // Positions 0 .. depth − 1 are the fed ids; the N − 1 feedback steps
@@ -311,13 +325,14 @@ mod drive {
             .into());
         }
         println!(
-            "load resident_bytes={} ctx={} layers={} top_k={top_k} mode={} place={} in {:.1} s \
-             (runtime value)",
+            "load resident_bytes={} ctx={} layers={} top_k={top_k} mode={} place={} pin_main={} \
+             pinned={pinned} in {:.1} s (runtime value)",
             m.resident_bytes(),
             a.ctx,
             inputs.hp.n_layer,
             mode_name(a.mode),
             a.place.name(),
+            if pin_main { "on" } else { "off" },
             t.elapsed().as_secs_f64()
         );
         if a.mode == StepMode::Graph {
@@ -380,11 +395,20 @@ mod drive {
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(a.n_gen - 1);
         let mut tokens: Vec<u32> = Vec::with_capacity(a.n_gen);
         tokens.push(next);
+        let stats_on = std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1");
+        let mut probes: Vec<Probe> = Vec::new();
+        if stats_on {
+            probes.reserve_exact(a.n_gen);
+            probes.push(Probe::read(m)?);
+        }
         for _ in 1..a.n_gen {
             let t0 = Instant::now();
             next = m.step(&[next])?;
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             rows.push((m.pos() - 1, next, ms));
+            if stats_on {
+                probes.push(Probe::read(m)?);
+            }
         }
         let warm = a.warm.unwrap_or(0);
         for (k, (pos, tok, ms)) in rows.iter().enumerate() {
@@ -397,6 +421,9 @@ mod drive {
             }
         }
         println!("tokens {tokens:?}");
+        if stats_on {
+            print_stats(&probes, warm);
+        }
         if a.timed {
             let counted: Vec<f64> = rows[warm..].iter().map(|r| r.2).collect();
             let mut sorted = counted.clone();
@@ -414,5 +441,88 @@ mod drive {
             );
         }
         Ok(())
+    }
+
+    /// The counters one `BLOOMERY_STEP_STATS` read takes: the host tier's
+    /// since load, and the process's page faults since start.
+    #[derive(Clone, Copy)]
+    struct Probe {
+        hybrid: HybridStats,
+        majflt: u64,
+        minflt: u64,
+    }
+
+    impl Probe {
+        fn read(m: &Deepseek41Model) -> Result<Probe, GateError> {
+            let hybrid = m.body("generate_ds41")?.hybrid().stats();
+            // SAFETY: `rusage` is integers only, so all-zero is a valid value,
+            // and `getrusage` writes only through the pointer it is given.
+            let (rc, ru) = unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                let rc = libc::getrusage(libc::RUSAGE_SELF, &raw mut ru);
+                (rc, ru)
+            };
+            if rc != 0 {
+                return Err(format!("getrusage: {}", std::io::Error::last_os_error()).into());
+            }
+            Ok(Probe {
+                hybrid,
+                majflt: u64::try_from(ru.ru_majflt)?,
+                minflt: u64::try_from(ru.ru_minflt)?,
+            })
+        }
+    }
+
+    /// One line per generated step from the deltas of `probes` (one read
+    /// before the first generated step, one after each), then the summary
+    /// over the steps past `warm`. `straggle_max_us` is the worst single
+    /// service since load (a maximum has no delta); `host_w2` is the step's
+    /// mean host share of routed weight squared per service.
+    fn print_stats(probes: &[Probe], warm: usize) {
+        let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
+        let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
+        for (k, w) in probes.windows(2).enumerate() {
+            let i = k + 1;
+            let (p, q) = (&w[0].hybrid, &w[1].hybrid);
+            let served = q.served - p.served;
+            let leg_us = (q.leg_ns - p.leg_ns) as f64 / 1e3;
+            let straggle_us = (q.straggle_ns - p.straggle_ns) as f64 / 1e3;
+            let host_slots = q.host_slots - p.host_slots;
+            let host_w2 = if served == 0 {
+                0.0
+            } else {
+                (q.host_w2 - p.host_w2) / served as f64
+            };
+            let dmaj = w[1].majflt - w[0].majflt;
+            let dmin = w[1].minflt - w[0].minflt;
+            let tag = if i <= warm { " warm" } else { "" };
+            println!(
+                "stat step {i}{tag} served={served} leg_us={leg_us:.1} straggle_us={straggle_us:.1} \
+                 straggle_max_us={:.1} host_slots={host_slots} host_w2={host_w2:.4} go_early={} \
+                 parks={} majflt={dmaj} minflt={dmin}",
+                q.straggle_max_ns as f64 / 1e3,
+                q.go_early - p.go_early,
+                q.parks_in_service - p.parks_in_service
+            );
+            if i > warm {
+                legs.push(leg_us);
+                straggle_max = straggle_max.max(straggle_us);
+                slots += host_slots;
+                majflt += dmaj;
+                minflt += dmin;
+            }
+        }
+        let n = legs.len();
+        if n == 0 {
+            return;
+        }
+        let mean = legs.iter().sum::<f64>() / n as f64;
+        legs.sort_by(f64::total_cmp);
+        println!(
+            "stat summary steps={n} leg_us_mean={mean:.1} leg_us_p50={:.1} straggle_us_max={straggle_max:.1} \
+             host_slots_mean={:.1} majflt={majflt} minflt={minflt}",
+            legs[n / 2],
+            slots as f64 / n as f64
+        );
     }
 }

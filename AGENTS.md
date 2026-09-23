@@ -379,5 +379,11 @@ MoE: experts `[0, n_l)` of every routed stack stay on the card and the rest
 run on the host tier inside the captured step; unset or equal to the expert
 count is the all-card path; `just gate-gpu-hybrid` refuses to run with it
 set), `BLOOMERY_HYBRID_OVERLAP=0` (gpu hybrid: each layer's wait right after
-its go instead of after the card's experts and the shared expert).
+its go instead of after the card's experts and the shared expert),
+`BLOOMERY_PIN_MAIN=0` (`bloomery-decode`, `bench_v41_host`, `generate_ds41`: leave the
+main thread floating instead of pinning it to the dispatcher's cpu slot — the
+default pins, and the `load` line prints the ask and the outcome),
+`BLOOMERY_STEP_STATS=1` (`generate_ds41`: a `stat step` line per generated
+step, host-tier `HybridStats` deltas and `getrusage` page faults, and a `stat
+summary`; unset, nothing is read).
 Each is read once, at first use.

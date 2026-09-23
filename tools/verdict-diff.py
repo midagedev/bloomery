@@ -42,6 +42,8 @@ DROPS = [re.compile(p) for p in (
     r'^warning: ', r'^\s*= ', r'RUSTC-CODEGEN', r'^=+$', r'Running cargo build', r'Cargo build succeeded',
     r'^\s*$', r'^\./tools/box\.sh ', r'^[A-Z_]+=\S+ \./tools/box\.sh ', r'^\s*(-->|\||[0-9]+ \|)',
     r'^\s*\^',
+    # generate_ds41's BLOOMERY_STEP_STATS lines: host-tier counters and page faults, a load reading.
+    r'^stat (step|summary) ',
 )]
 # Fields that differ between two runs of the same binary, masked in place.
 MASKS = [

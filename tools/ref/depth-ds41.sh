@@ -38,6 +38,8 @@
 # experts of its CPU layers), and together they are about the page cache's size. The witness
 # prints the major fault count and the page cache before and after every arm, so an arm that paged
 # its set back in shows. BLOOMERY_GEN_WARM (generate_ds41 --warm) trims our arm's first steps.
+# With BLOOMERY_STEP_STATS=1 (BLOOMERY_BOX_ENV on the Mac side) our arm's `stat summary` line is
+# echoed with its load lines; the per-step `stat step` lines stay in the arm's output only.
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 3),
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_ARM_BOUND
@@ -143,7 +145,7 @@ for r in $(seq "$ROUNDS"); do
         fi
         smoke=$(echo "$out" | grep -E '^SMOKE ')
         [ -n "$smoke" ] || { echo "r$r ours d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-        echo "$out" | grep -E '^(plan|load|capture|fed) '
+        echo "$out" | grep -E '^(plan|load|capture|fed|stat summary) '
         p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
         mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
         warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')

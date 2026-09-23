@@ -29,7 +29,12 @@ bloomery-gpu = { path = "../gpu", optional = true }
 # compiler failure in V4.1 device code then breaks those gates' builds and no other.
 bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
 cuda-core = { workspace = true, optional = true }
+# The V4.1 decode CLI (`generate_ds41`) owns its main thread: it pins it to the dispatcher's cpu
+# slot as bloomery-decode does, and reads its own fault counts (`getrusage`) under
+# `BLOOMERY_STEP_STATS`. Reached only through the `deepseek41` feature.
+bloomery-threads = { path = "../threads", optional = true }
+libc = { workspace = true, optional = true }
 
 [features]
 gpu = ["dep:bloomery-gpu", "dep:cuda-core"]
-deepseek41 = ["gpu", "dep:bloomery-gpu-deepseek41"]
+deepseek41 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-threads", "dep:libc"]
