@@ -32,8 +32,7 @@
 
 use gguf::Split;
 
-use super::kv::KvLayout;
-use super::meta_usize;
+use super::hparams::{Hparams, LayerKind};
 use crate::placement::PlacementError;
 
 /// A mask's token lines are padded to a multiple of this (`GGML_KQ_MASK_PAD`, `ggml.h`).
@@ -81,25 +80,16 @@ pub struct Planner {
 }
 
 impl Planner {
-    /// The planner of the model `split` holds, for caches of `ctx_max` positions: the window
-    /// and every layer's ratio from [`KvLayout`], the n-gram length from
-    /// `engram.max_ngram_size`.
+    /// The planner of the model `split` holds, for caches of `ctx_max` positions: the window,
+    /// every layer's ratio and the engram n-gram length from [`Hparams`].
     pub fn from_file(split: &Split, ctx_max: u64) -> Result<Planner, PlanError> {
-        let kv = KvLayout::from_file(split)?;
-        let ngram = meta_usize(split, "engram.max_ngram_size")?;
-        let narrow = |suffix: &str, v: u64| {
-            u32::try_from(v).map_err(|_| PlacementError::Metadata {
-                key: split.arch_key(suffix),
-                detail: format!("{v} does not fit u32"),
-            })
-        };
-        let window = narrow("attention.sliding_window", kv.window())?;
-        let ratios = kv
-            .ratios()
-            .iter()
-            .map(|&r| narrow("attention.compress_ratios", r))
-            .collect::<Result<Vec<_>, _>>()?;
-        Planner::new(window, &ratios, ngram, ctx_max)
+        let hp = Hparams::read(split)?;
+        let window = u32::try_from(hp.window).map_err(|_| PlacementError::Metadata {
+            key: split.arch_key("attention.sliding_window"),
+            detail: format!("{} does not fit u32", hp.window),
+        })?;
+        let ratios: Vec<u32> = hp.layers.iter().map(LayerKind::ratio).collect();
+        Planner::new(window, &ratios, hp.engram.max_ngram, ctx_max)
     }
 
     /// The planner of explicit values: a window of `window` positions, `layer_ratios[l]` the

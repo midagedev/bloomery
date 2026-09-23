@@ -7,10 +7,8 @@
 //! `llama.cpp-fork/src/models/deepseek41.cpp:209-247`): at ratio r it adds
 //! `⌈ctx_max / r⌉` rows of latent plus index key in f16, and a pooling state of
 //! r latent rows in f32, twice (values and scores). The layers that read a
-//! source's stream hold none of it.
-//!
-//! The window and every layer's ratio come from [`Hparams`];
-//! [`KvLayout::window`] and [`KvLayout::ratios`] hand them on.
+//! source's stream hold none of it. The window and every layer's ratio come
+//! from [`Hparams`].
 
 use gguf::Split;
 
@@ -33,24 +31,19 @@ struct Source {
 pub struct KvLayout {
     window: u64,
     latent: u64,
-    /// Per layer: its compression ratio, 0 on a window-only layer.
-    ratios: Vec<u64>,
     /// Per layer: the stream it sources, if any.
     sources: Vec<Option<Source>>,
 }
 
 impl KvLayout {
     /// The window from [`Hparams::window`], the latent width from `attn_kv`'s
-    /// output dim (one width on every layer), every layer's ratio from
-    /// [`LayerKind::ratio`](super::hparams::LayerKind::ratio)
-    /// (`attention.compress_ratios` must cover every layer), the sources from
-    /// the layers that own a compressor, each with its index key width from
+    /// output dim (one width on every layer), the sources from the layers that
+    /// own a compressor, each with its stream's ratio and its index key width from
     /// `indexer.attn_k`'s output dim; a missing key or tensor is an error
     /// naming it.
     pub fn from_file(split: &Split) -> Result<KvLayout, PlacementError> {
         let hp = Hparams::read(split)?;
         let mut latent = None;
-        let mut ratios = Vec::with_capacity(hp.n_layer);
         let mut sources = Vec::with_capacity(hp.n_layer);
         for (l, kind) in hp.layers.iter().enumerate() {
             let kv_name = names::attn_kv(l);
@@ -62,7 +55,6 @@ impl KvLayout {
                 });
             }
             latent = Some(width);
-            ratios.push(u64::from(kind.ratio()));
             let Some(stream) = kind.compressor.and(kind.stream) else {
                 sources.push(None);
                 continue;
@@ -76,7 +68,6 @@ impl KvLayout {
         Ok(KvLayout {
             window: hp.window as u64,
             latent: latent.unwrap_or(0),
-            ratios,
             sources,
         })
     }
@@ -87,16 +78,6 @@ impl KvLayout {
             .iter()
             .enumerate()
             .filter_map(|(l, s)| s.map(|s| (l, s.ratio)))
-    }
-
-    /// `attention.sliding_window`: the positions a token's window spans, its own included.
-    pub fn window(&self) -> u64 {
-        self.window
-    }
-
-    /// Every layer's compression ratio, 0 on a window-only layer.
-    pub fn ratios(&self) -> &[u64] {
-        &self.ratios
     }
 }
 
