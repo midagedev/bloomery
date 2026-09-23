@@ -1254,7 +1254,6 @@ mod bench {
         let mode = mode()?;
         print_table()?;
         let gpu = Gpu::new()?;
-        let stream = gpu.stream();
         let ctx = gpu.context();
         println!(
             "v41 card={} sms={}",
