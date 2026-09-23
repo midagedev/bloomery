@@ -1328,6 +1328,22 @@ mod kernels {
     }
 }
 
+/// Device `dev`'s name, asked of the driver without a context.
+fn raw_device_name(dev: cuda_core::sys::CUdevice) -> Result<String, GpuError> {
+    let mut buf: [std::ffi::c_char; 256] = [0; 256];
+    let len = std::ffi::c_int::try_from(buf.len()).expect("256 fits a c_int");
+    // SAFETY: `buf` is a live, writable buffer of `len` bytes for the call,
+    // and the driver writes at most that many, a NUL included.
+    let rc = unsafe { cuda_core::sys::cuDeviceGetName(buf.as_mut_ptr(), len, dev) };
+    graph::cu(rc, "cuDeviceGetName")?;
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c.to_ne_bytes()[0])
+        .collect();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// A CUDA context on device 0 with this crate's device module loaded and one
 /// non-blocking stream that every launch and copy of this engine goes on.
 ///
@@ -1377,6 +1393,61 @@ impl Gpu {
             stream,
             module,
         })
+    }
+
+    /// `with_device` on the one visible CUDA device whose name contains
+    /// `name` — a placement card's name. A plan names its cards and
+    /// `CUDA_VISIBLE_DEVICES` orders them, so a card is never found by
+    /// ordinal. No device, or two, is an error that says so.
+    pub fn for_card(name: &str) -> Result<Gpu, GpuError> {
+        let n = usize::try_from(cuda_core::Device::device_count()?)
+            .map_err(|_| GpuError::shape("Gpu::for_card", "negative device count"))?;
+        let mut named = Vec::new();
+        let mut seen = Vec::with_capacity(n);
+        for ordinal in 0..n {
+            let full = raw_device_name(cuda_core::Device::raw_device(ordinal)?)?;
+            if full.contains(name) {
+                named.push(ordinal);
+            }
+            seen.push(full);
+        }
+        match named.as_slice() {
+            &[ordinal] => Gpu::with_device(ordinal),
+            _ => Err(GpuError::shape(
+                "Gpu::for_card",
+                format!(
+                    "{} visible devices are named like {name:?}, not one: {seen:?}",
+                    named.len()
+                ),
+            )),
+        }
+    }
+
+    /// The device's name as the driver reports it.
+    pub fn device_name(&self) -> Result<String, GpuError> {
+        Ok(self.ctx.device_name()?)
+    }
+
+    /// `(free, total)` device bytes of this context's device, as
+    /// `cuMemGetInfo` reports them.
+    pub fn mem_info(&self) -> Result<(usize, usize), GpuError> {
+        self.ctx.bind_to_thread()?;
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: both out-pointers are live locals for the duration of the
+        // call, and this context is current on the calling thread (bound above).
+        let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
+        graph::cu(rc, "cuMemGetInfo")?;
+        Ok((free, total))
+    }
+
+    /// The driver's minimum allocation granularity for device memory on this
+    /// device (`cuMemGetAllocationGranularity`): the page size an allocation's
+    /// physical backing is counted in.
+    pub fn allocation_granularity(&self) -> Result<usize, GpuError> {
+        self.ctx.bind_to_thread()?;
+        Ok(cuda_core::vmm::allocation_granularity(
+            self.ctx.cu_device(),
+        )?)
     }
 
     /// Q4_K gemv over expert slots selected on the device (the down shape).

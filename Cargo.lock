@@ -69,6 +69,7 @@ dependencies = [
 name = "bloomery-gguf"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memmap2",
  "thiserror",
 ]
@@ -110,6 +111,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-qdot",
  "bloomery-threads",
+ "libc",
  "thiserror",
 ]
 

@@ -16,9 +16,13 @@
 //! untouched).
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::ops::Range;
 
 use gguf::GgmlType;
+
+pub mod host_lock;
+pub mod workstation;
 
 /// What a tensor does in a decode step; the role decides its device.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -103,6 +107,9 @@ pub struct Card {
     pub scratch_bytes: u64,
     /// Kept free: the expert rule never plans into it.
     pub margin_bytes: u64,
+    /// The device allocator's granule: an allocation of this size or more
+    /// takes whole granules of its own, smaller ones share granules.
+    pub granule_bytes: NonZeroU64,
     /// The layers this card's stage runs.
     pub layers: Range<usize>,
     /// Whether this stage ends with the head.
@@ -142,19 +149,140 @@ pub enum Device {
 }
 
 /// A card's layout for a file tensor: the GPU loader's `DevWeight` formats
-/// (`crates/gpu/src/weights.rs`), with the loader's resident arithmetic.
+/// (`crates/gpu/src/weights.rs`). [`CardFormat::buffer_bytes`] is the one
+/// owner of their file → device arithmetic: the plan sums it and counts its
+/// buffers through the allocator, and the loader refuses and checks every
+/// upload by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CardFormat {
-    /// q3_K/q4_K/q6_K: the file's bytes as u32 words (weights.rs:270-313), so
-    /// resident = file bytes; the upload needs `rows % 4 == 0` and row bytes `% 4 == 0`.
+    /// q3_K/q4_K/q6_K: the rows' byte stream as u32 words, the last word
+    /// zero-padded, one row per `words / rows` words.
     KQuant,
-    /// q8_0 in two planes: per 32-value block 8 code words and one f32 scale
-    /// (weights.rs:42-51, `q8_0_planes` :379), `rows × (k + 4k/32)`.
+    /// q5_0 in the gemv's layout: per row one byte per 5-bit code in 1024-value
+    /// windows, then one f32 scale per 32-value block.
+    Q5_0,
+    /// q5_1: the q5_0 layout plus one f32 min per block.
+    Q5_1,
+    /// q8_0 in two planes: per 32-value block 8 code words and one f32 scale.
     Q8_0Planes,
-    /// f32: the file's values (weights.rs:330-351), `rows × k × 4`.
+    /// f32: the file's values.
     F32,
-    /// bf16 decoded to f32 at load, `rows × k × 4`.
+    /// bf16 decoded to f32 at load.
     Bf16AsF32,
+}
+
+impl CardFormat {
+    /// The format a file tensor of type `ty` loads in on a card; `None` when
+    /// the loader has none.
+    #[must_use]
+    pub fn of(ty: GgmlType) -> Option<CardFormat> {
+        match ty {
+            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K => Some(CardFormat::KQuant),
+            GgmlType::Q5_0 => Some(CardFormat::Q5_0),
+            GgmlType::Q5_1 => Some(CardFormat::Q5_1),
+            GgmlType::Q8_0 => Some(CardFormat::Q8_0Planes),
+            GgmlType::F32 => Some(CardFormat::F32),
+            GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
+            GgmlType::F16 | GgmlType::Q5_K | GgmlType::Unknown(_) => None,
+        }
+    }
+
+    /// The device buffers of `rows` rows of `k` values of file type `ty` in
+    /// this format, in bytes, in the order the upload allocates them: q8_0's
+    /// code plane, then its scale plane; one buffer in every other format —
+    /// the upload's own arithmetic. `None` exactly where the upload refuses: a
+    /// zero dimension, `k` off the type's block, a KQuant stream whose words
+    /// do not split evenly into `rows`, or a `ty` this format is not the
+    /// loader's format for.
+    #[must_use]
+    pub fn buffer_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<Vec<u64>> {
+        let blck = ty.blck_size()?;
+        if CardFormat::of(ty) != Some(self) || k == 0 || rows == 0 || !k.is_multiple_of(blck) {
+            return None;
+        }
+        let blocks = k / blck;
+        // The q5 code section: one byte per code, in whole 1024-value windows.
+        let window = || k.div_ceil(1024).checked_mul(1024);
+        Some(match self {
+            CardFormat::KQuant => {
+                let words = ty
+                    .type_size()?
+                    .checked_mul(blocks)?
+                    .checked_mul(rows)?
+                    .div_ceil(4);
+                let bytes = words
+                    .is_multiple_of(rows)
+                    .then_some(words)?
+                    .checked_mul(4)?;
+                vec![bytes]
+            }
+            CardFormat::Q5_0 => {
+                vec![rows.checked_mul(window()?.checked_add(blocks.checked_mul(4)?)?)?]
+            }
+            CardFormat::Q5_1 => {
+                vec![rows.checked_mul(window()?.checked_add(blocks.checked_mul(8)?)?)?]
+            }
+            CardFormat::Q8_0Planes => {
+                vec![
+                    rows.checked_mul(k)?,
+                    rows.checked_mul(blocks.checked_mul(4)?)?,
+                ]
+            }
+            CardFormat::F32 | CardFormat::Bf16AsF32 => vec![rows.checked_mul(k.checked_mul(4)?)?],
+        })
+    }
+
+    /// Device bytes of `rows` rows of `k` values of file type `ty` in this
+    /// format: the sum of its [`CardFormat::buffer_bytes`], `None` where they
+    /// are.
+    #[must_use]
+    pub fn resident_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<u64> {
+        self.buffer_bytes(ty, k, rows)?
+            .into_iter()
+            .try_fold(0u64, u64::checked_add)
+    }
+}
+
+/// Where a shared granule's next allocation may start: a multiple of this
+/// [assumed — gate ② checks only the totals it implies].
+const SMALL_ALIGN: u64 = 512;
+
+/// A card's device allocator as the plan counts it: an allocation of a
+/// granule or more takes whole granules of its own; a smaller one takes its
+/// size, rounded up to [`SMALL_ALIGN`], from the first shared granule, in
+/// allocation order, that has that much left, and opens a new shared granule
+/// when none has.
+struct Heap {
+    granule: u64,
+    /// Bytes of the granules taken so far.
+    taken: u64,
+    /// Bytes left in each shared granule, in the order they were opened.
+    left: Vec<u64>,
+}
+
+impl Heap {
+    fn new(granule: NonZeroU64) -> Heap {
+        Heap {
+            granule: granule.get(),
+            taken: 0,
+            left: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, bytes: u64) {
+        if bytes >= self.granule {
+            self.taken += bytes.div_ceil(self.granule) * self.granule;
+            return;
+        }
+        let room = bytes.next_multiple_of(SMALL_ALIGN).min(self.granule);
+        match self.left.iter_mut().find(|left| **left >= room) {
+            Some(left) => *left -= room,
+            None => {
+                self.left.push(self.granule - room);
+                self.taken += self.granule;
+            }
+        }
+    }
 }
 
 /// How a segment's bytes are laid out where it lives.
@@ -173,6 +301,8 @@ impl fmt::Display for Format {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Format::Card(CardFormat::KQuant) => "kquant",
+            Format::Card(CardFormat::Q5_0) => "q5_0",
+            Format::Card(CardFormat::Q5_1) => "q5_1",
             Format::Card(CardFormat::Q8_0Planes) => "q8_0_planes",
             Format::Card(CardFormat::F32) => "f32",
             Format::Card(CardFormat::Bf16AsF32) => "bf16_as_f32",
@@ -194,6 +324,54 @@ pub struct Segment {
     pub resident_bytes: u64,
 }
 
+/// Where a segment's piece lies in its tensor, counted from the tensor's
+/// first row and first byte in the file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Span {
+    pub rows: Range<u64>,
+    pub bytes: Range<u64>,
+}
+
+impl Segment {
+    /// The rows of `t` this segment holds — all of them, or its experts' rows
+    /// of a stack of `experts` — and the file bytes those rows take.
+    pub fn span(&self, t: &ModelTensor, experts: u64) -> Result<Span, PlacementError> {
+        let rb = row_bytes(t)?;
+        let rows = match &self.experts {
+            None => 0..rows_of(t),
+            Some(e) => {
+                let (per, _) = per_expert(t, experts)?;
+                if e.start > e.end || e.end > experts {
+                    return Err(PlacementError::tensor(
+                        t,
+                        format!("expert range {e:?} is not inside 0..{experts}"),
+                    ));
+                }
+                e.start * per..e.end * per
+            }
+        };
+        Ok(Span {
+            bytes: rows.start * rb..rows.end * rb,
+            rows,
+        })
+    }
+
+    /// The device buffers this card segment of `t` uploads, in bytes, in
+    /// upload order — [`CardFormat::buffer_bytes`] of the rows it holds — or
+    /// why they cannot be derived: a segment in no card format, a span
+    /// outside the tensor, rows the upload refuses.
+    pub fn buffer_bytes(&self, t: &ModelTensor, experts: u64) -> Result<Vec<u64>, PlacementError> {
+        let Format::Card(format) = self.format else {
+            return Err(PlacementError::tensor(
+                t,
+                format!("a segment as {} has no card buffers", self.format),
+            ));
+        };
+        let span = self.span(t, experts)?;
+        card_buffers(t, format, span.rows.end - span.rows.start)
+    }
+}
+
 /// One tensor's placement.
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -212,12 +390,17 @@ pub struct CardTotals {
     /// Resident bytes of everything on the card but the routed experts.
     pub dense_bytes: u64,
     pub expert_bytes: u64,
+    /// What the allocator takes for the card's uploads beyond their resident
+    /// bytes: their granules, counted in upload order ([`Heap`]), minus dense
+    /// and experts.
+    pub rounding_bytes: u64,
     /// Experts held, summed over the card's layers.
     pub experts: u64,
     pub kv_bytes: u64,
     pub scratch_bytes: u64,
     pub context_bytes: u64,
-    /// usable − dense − experts − KV − scratch − context; the margin is inside it.
+    /// usable − dense − experts − rounding − KV − scratch − context; the
+    /// margin is inside it.
     pub headroom_bytes: i128,
 }
 
@@ -262,6 +445,10 @@ pub enum PlacementError {
     /// The cards' layer ranges do not cover the model once, in order, with one head.
     #[error("stage map: {0}")]
     Stages(String),
+    /// The host tier's lock, or its residency query, failed: the span and the
+    /// kernel's answer.
+    #[error("host lock: {0}")]
+    Host(String),
 }
 
 impl PlacementError {
@@ -279,11 +466,12 @@ pub enum Violation {
     /// A tensor with no row, or with more than one.
     PlacedTimes { tensor: String, times: usize },
     /// Segments its role does not allow: an expert stack that does not cover
-    /// every expert exactly once, or a whole tensor in pieces.
+    /// every expert exactly once, a whole tensor in pieces, or a card segment
+    /// whose buffers cannot be derived or do not sum to its resident bytes.
     Segments { tensor: String, detail: String },
     /// A segment on a card whose stage does not run the tensor's layer or head.
     WrongCard { tensor: String, card: String },
-    /// A card whose resident bytes, KV, scratch and context pass usable − margin.
+    /// A card whose uploads' granules, KV, scratch and context pass usable − margin.
     CardOver {
         card: String,
         total: u64,
@@ -308,7 +496,7 @@ impl fmt::Display for Violation {
             }
             Violation::CardOver { card, total, limit } => write!(
                 f,
-                "card {card}: resident + KV + scratch + context = {total} B passes usable − margin = {limit} B by {} B",
+                "card {card}: resident + rounding + KV + scratch + context = {total} B passes usable − margin = {limit} B by {} B",
                 total - limit
             ),
             Violation::HostOver { total, usable } => write!(
@@ -367,25 +555,6 @@ impl Stages {
     }
 }
 
-/// The card format a tensor of this type loads in, `Ok(None)` when the loader
-/// has none (weights.rs:247-249, `resident_size`'s refusal arm).
-fn card_format(t: &ModelTensor) -> Result<Option<CardFormat>, PlacementError> {
-    match t.ty {
-        GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K => Ok(Some(CardFormat::KQuant)),
-        GgmlType::Q8_0 => Ok(Some(CardFormat::Q8_0Planes)),
-        GgmlType::F32 => Ok(Some(CardFormat::F32)),
-        GgmlType::BF16 => Ok(Some(CardFormat::Bf16AsF32)),
-        GgmlType::Q5_K | GgmlType::F16 | GgmlType::Unknown(_) => Ok(None),
-        GgmlType::Q5_0 | GgmlType::Q5_1 => Err(PlacementError::tensor(
-            t,
-            format!(
-                "type {} has a loader format this table does not model",
-                t.ty
-            ),
-        )),
-    }
-}
-
 /// Rows as the loader counts them: the product of every dim past the row width.
 fn rows_of(t: &ModelTensor) -> u64 {
     t.dims.iter().skip(1).product()
@@ -418,6 +587,82 @@ fn layer_of(t: &ModelTensor, layers: usize) -> Result<usize, PlacementError> {
     }
 }
 
+/// Device bytes of `rows` rows of `t` in `format`, or the refusal that names
+/// it: rows the upload refuses are refused, not given another formula.
+fn card_bytes(t: &ModelTensor, format: CardFormat, rows: u64) -> Result<u64, PlacementError> {
+    let k = t.dims.first().copied().unwrap_or(0);
+    format
+        .resident_bytes(t.ty, k, rows)
+        .ok_or_else(|| refused(t, format, k, rows))
+}
+
+/// The device buffers of `rows` rows of `t` in `format`, in upload order, or
+/// the refusal [`card_bytes`] gives.
+fn card_buffers(
+    t: &ModelTensor,
+    format: CardFormat,
+    rows: u64,
+) -> Result<Vec<u64>, PlacementError> {
+    let k = t.dims.first().copied().unwrap_or(0);
+    format
+        .buffer_bytes(t.ty, k, rows)
+        .ok_or_else(|| refused(t, format, k, rows))
+}
+
+fn refused(t: &ModelTensor, format: CardFormat, k: u64, rows: u64) -> PlacementError {
+    PlacementError::tensor(
+        t,
+        format!("{rows} rows of {k} values: the {format:?} upload refuses them"),
+    )
+}
+
+/// Each card's allocator after its segments' uploads, fed in the loader's
+/// order — the rows' order, which is the model's tensor order and the order
+/// `Weights::load_placed` walks — and each card segment whose buffers cannot
+/// be derived or do not sum to its resident bytes. Such a segment still
+/// counts, as one allocation of its resident bytes, so a heap never holds
+/// less than its card's resident bytes.
+fn card_heaps(model: &ModelTensors, cards: &[Card], rows: &[Row]) -> (Vec<Heap>, Vec<Violation>) {
+    let mut heaps: Vec<Heap> = cards.iter().map(|c| Heap::new(c.granule_bytes)).collect();
+    let mut bad = Vec::new();
+    for r in rows {
+        let Some(t) = model.tensors.get(r.tensor) else {
+            continue;
+        };
+        for s in &r.segments {
+            let Device::Card(c) = s.device else {
+                continue;
+            };
+            let (bufs, detail) = match s.buffer_bytes(t, model.experts) {
+                Ok(bufs) if bufs.iter().sum::<u64>() == s.resident_bytes => (bufs, None),
+                Ok(bufs) => (
+                    vec![s.resident_bytes],
+                    Some(format!(
+                        "card buffers {bufs:?} do not sum to the segment's {} resident bytes",
+                        s.resident_bytes
+                    )),
+                ),
+                Err(PlacementError::Tensor { detail, .. }) => {
+                    (vec![s.resident_bytes], Some(detail))
+                }
+                Err(e) => (vec![s.resident_bytes], Some(e.to_string())),
+            };
+            if let Some(heap) = heaps.get_mut(c) {
+                for b in bufs {
+                    heap.alloc(b);
+                }
+            }
+            if let Some(detail) = detail {
+                bad.push(Violation::Segments {
+                    tensor: t.name.clone(),
+                    detail,
+                });
+            }
+        }
+    }
+    (heaps, bad)
+}
+
 /// A card segment of `rows` rows of `t` — all of it, or an expert slice.
 fn card_segment(
     t: &ModelTensor,
@@ -425,7 +670,7 @@ fn card_segment(
     rows: u64,
     experts: Option<Range<u64>>,
 ) -> Result<Segment, PlacementError> {
-    let Some(format) = card_format(t)? else {
+    let Some(format) = CardFormat::of(t.ty) else {
         return Err(PlacementError::tensor(
             t,
             format!(
@@ -434,36 +679,12 @@ fn card_segment(
             ),
         ));
     };
-    let k = t.dims.first().copied().unwrap_or(0);
-    let rb = row_bytes(t)?;
-    let resident_bytes = match format {
-        CardFormat::KQuant => {
-            kquant_words(t, rows)?;
-            rb * rows
-        }
-        CardFormat::Q8_0Planes => rows * (k + 4 * (k / 32)),
-        CardFormat::F32 | CardFormat::Bf16AsF32 => rows * k * 4,
-    };
     Ok(Segment {
         device: Device::Card(card),
         format: Format::Card(format),
         experts,
-        resident_bytes,
+        resident_bytes: card_bytes(t, format, rows)?,
     })
-}
-
-/// The KQuant upload's condition on `rows` rows of `t`: rows and row bytes
-/// both multiples of 4, so the words split evenly per row and resident = file
-/// bytes. A tensor that breaks it is refused, not given another formula.
-fn kquant_words(t: &ModelTensor, rows: u64) -> Result<(), PlacementError> {
-    let rb = row_bytes(t)?;
-    if !rows.is_multiple_of(4) || !rb.is_multiple_of(4) {
-        return Err(PlacementError::tensor(
-            t,
-            format!("{rows} rows of {rb} B: the word upload needs both to be multiples of 4"),
-        ));
-    }
-    Ok(())
 }
 
 /// A segment that holds a tensor's file bytes where they are.
@@ -584,62 +805,130 @@ fn place_routed(
     })
 }
 
-/// A card's eligible layers with the file bytes of one expert: the layers of
-/// `card` that route, every stack of which has a card format.
-fn eligible(
-    card: &Card,
-    routed: &[Vec<usize>],
-    model: &ModelTensors,
-) -> Result<Vec<(usize, u64)>, PlacementError> {
+/// A card's eligible layers: the layers of `card` that route, every stack of
+/// which has a card format.
+fn eligible(card: &Card, routed: &[Vec<usize>], model: &ModelTensors) -> Vec<usize> {
+    card.layers
+        .clone()
+        .filter(|&l| {
+            !routed[l].is_empty()
+                && routed[l]
+                    .iter()
+                    .all(|&i| CardFormat::of(model.tensors[i].ty).is_some())
+        })
+        .collect()
+}
+
+/// The expert rule on one card, in the order of
+/// `docs/research/v41-placement/spread.py`'s `plan_spread`: one more expert at
+/// a time on the eligible layers in ascending order, cycling, while the card
+/// still fits `budget` with it and its layer is below the expert count —
+/// stopping at the first that does not. What must fit is `footprint` of the
+/// card's uploads at those counts, the allocator's rounding included, so an
+/// expert costs what its rows add to the card's granules, not its bytes. A
+/// card whose uploads pass `budget` with no experts plans none.
+fn spread(
+    n_l: &mut [u64],
+    eligible: &[usize],
+    experts: u64,
+    budget: i128,
+    footprint: impl Fn(&[u64]) -> Result<u64, PlacementError>,
+) -> Result<(), PlacementError> {
+    if eligible.is_empty() || i128::from(footprint(n_l)?) > budget {
+        return Ok(());
+    }
+    for &l in eligible.iter().cycle() {
+        if n_l[l] >= experts {
+            break;
+        }
+        n_l[l] += 1;
+        if i128::from(footprint(n_l)?) > budget {
+            n_l[l] -= 1;
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The rows one card upload holds: a whole tensor's, or a routed stack's
+/// leading experts, as many as its layer keeps.
+#[derive(Clone, Copy)]
+enum Held {
+    Rows(u64),
+    Experts { layer: usize, rows_per_expert: u64 },
+}
+
+/// Card `c`'s uploads in the loader's order — the model's tensor order, which
+/// `Weights::load_placed` walks: each whole tensor `rows` puts on the card,
+/// and each routed stack of the card's `eligible` layers.
+fn card_uploads<'m>(
+    model: &'m ModelTensors,
+    c: usize,
+    rows: &[Option<Row>],
+    eligible: &[usize],
+) -> Result<Vec<(&'m ModelTensor, CardFormat, Held)>, PlacementError> {
     let mut out = Vec::new();
-    for l in card.layers.clone() {
-        let mut on_card = !routed[l].is_empty();
-        let mut expert_bytes = 0;
-        for &i in &routed[l] {
-            let t = &model.tensors[i];
-            on_card &= card_format(t)?.is_some();
-            expert_bytes += per_expert(t, model.experts)?.1;
-        }
-        if on_card {
-            out.push((l, expert_bytes));
-        }
+    for (t, row) in model.tensors.iter().zip(rows) {
+        let (format, held) = match row {
+            Some(r) => match r.segments.as_slice() {
+                [s] if s.device == Device::Card(c) => match s.format {
+                    Format::Card(f) => (f, Held::Rows(rows_of(t))),
+                    _ => continue,
+                },
+                _ => continue,
+            },
+            None => {
+                let layer = layer_of(t, model.layers)?;
+                let Some(f) = CardFormat::of(t.ty).filter(|_| eligible.contains(&layer)) else {
+                    continue;
+                };
+                let (rows_per_expert, _) = per_expert(t, model.experts)?;
+                (
+                    f,
+                    Held::Experts {
+                        layer,
+                        rows_per_expert,
+                    },
+                )
+            }
+        };
+        out.push((t, format, held));
     }
     Ok(out)
 }
 
-/// The expert rule on one card (`docs/research/v41-placement/spread.py`,
-/// `plan_spread`): the same count on every eligible layer, then one more at a
-/// time in ascending layer order, cycling, while the next expert fits and its
-/// layer is below the expert count — stopping at the first that does not.
-/// `eligible` is (layer, bytes of one expert); a budget at or below zero plans
-/// no experts.
-fn spread(n_l: &mut [u64], eligible: &[(usize, u64)], budget: i128, experts: u64) {
-    let round: i128 = eligible.iter().map(|&(_, b)| i128::from(b)).sum();
-    if round == 0 || budget <= 0 {
-        return;
-    }
-    let per = u64::try_from((budget / round).min(i128::from(experts)))
-        .expect("a positive budget over a positive round, capped at the expert count, fits u64");
-    for &(l, _) in eligible {
-        n_l[l] = per;
-    }
-    let mut rem = budget - i128::from(per) * round;
-    for &(l, b) in eligible.iter().cycle() {
-        if n_l[l] >= experts || rem < i128::from(b) {
-            break;
+/// The bytes of the granules `uploads` take with `n_l` experts on each layer:
+/// every upload's buffers, in order, through the card's allocator ([`Heap`]).
+fn footprint(
+    granule: NonZeroU64,
+    uploads: &[(&ModelTensor, CardFormat, Held)],
+    n_l: &[u64],
+) -> Result<u64, PlacementError> {
+    let mut heap = Heap::new(granule);
+    for &(t, format, held) in uploads {
+        let rows = match held {
+            Held::Rows(rows) => rows,
+            Held::Experts {
+                layer,
+                rows_per_expert,
+            } => n_l[layer] * rows_per_expert,
+        };
+        if rows > 0 {
+            for b in card_buffers(t, format, rows)? {
+                heap.alloc(b);
+            }
         }
-        n_l[l] += 1;
-        rem -= i128::from(b);
     }
+    Ok(heap.taken)
 }
 
 /// Place every tensor of `model` on `machine` for a context of `ctx_max`
 /// tokens. Dense tensors go where their role says. Routed stacks follow the
-/// expert rule per card, over the budget usable − dense − KV − context −
-/// scratch − margin, with one expert costing its layer's routed file bytes
-/// over the expert count. A card whose layers cannot keep one expert keeps
-/// none; one that cannot hold even its dense tensors shows up in
-/// [`Plan::violations`], not as an error here.
+/// expert rule per card ([`spread`]): the granules the card's uploads take —
+/// dense tensors and expert prefixes, in upload order, through the card's
+/// allocator — within usable − KV − context − scratch − margin. A card whose
+/// layers cannot keep one expert keeps none; one that cannot hold even its
+/// dense tensors shows up in [`Plan::violations`], not as an error here.
 pub fn plan<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -650,19 +939,13 @@ pub fn plan<'a>(
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut routed: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
-        if card_format(t)? == Some(CardFormat::KQuant) {
-            kquant_words(t, rows_of(t))?;
+        if let Some(format) = CardFormat::of(t.ty) {
+            card_bytes(t, format, rows_of(t))?;
         }
         if t.role == Role::RoutedExperts {
             routed[layer_of(t, model.layers)?].push(i);
         } else {
             rows[i] = Some(place_whole(i, t, &stages, model.layers)?);
-        }
-    }
-    let mut dense = vec![0u64; machine.cards.len()];
-    for s in rows.iter().flatten().flat_map(|r| &r.segments) {
-        if let Device::Card(c) = s.device {
-            dense[c] += s.resident_bytes;
         }
     }
     let mut n_l = vec![0u64; model.layers];
@@ -674,17 +957,15 @@ pub fn plan<'a>(
             .map(|l| kv.layer_bytes(l, ctx_max))
             .sum();
         let budget = i128::from(card.usable_bytes)
-            - i128::from(dense[c])
             - i128::from(kv_card)
             - i128::from(card.context_bytes)
             - i128::from(card.scratch_bytes)
             - i128::from(card.margin_bytes);
-        spread(
-            &mut n_l,
-            &eligible(card, &routed, model)?,
-            budget,
-            model.experts,
-        );
+        let eligible = eligible(card, &routed, model);
+        let uploads = card_uploads(model, c, &rows, &eligible)?;
+        spread(&mut n_l, &eligible, model.experts, budget, |n| {
+            footprint(card.granule_bytes, &uploads, n)
+        })?;
         kv_bytes.push(kv_card);
     }
     for (l, stacks) in routed.iter().enumerate() {
@@ -726,19 +1007,21 @@ fn totals<'a>(
             }
         }
     }
+    // Rows from `card_segment` carry their buffers' sum, so no card segment
+    // here is one `violations` would report.
+    let (heaps, _) = card_heaps(model, &machine.cards, &rows);
     let cards = machine
         .cards
         .iter()
+        .zip(&heaps)
         .enumerate()
-        .map(|(c, card)| {
-            let used = card_dense[c]
-                + card_experts[c]
-                + kv_bytes[c]
-                + card.scratch_bytes
-                + card.context_bytes;
+        .map(|(c, (card, heap))| {
+            let rounding = heap.taken - (card_dense[c] + card_experts[c]);
+            let used = heap.taken + kv_bytes[c] + card.scratch_bytes + card.context_bytes;
             CardTotals {
                 dense_bytes: card_dense[c],
                 expert_bytes: card_experts[c],
+                rounding_bytes: rounding,
                 experts: card.layers.clone().map(|l| n_l[l]).sum(),
                 kv_bytes: kv_bytes[c],
                 scratch_bytes: card.scratch_bytes,
@@ -774,14 +1057,14 @@ fn totals<'a>(
 impl Plan<'_> {
     /// Every invariant the rows break, re-derived from the rows themselves:
     /// each tensor placed once; an expert stack's segments cover every expert
-    /// once and a whole tensor is one segment; a card holds only what its
-    /// stage uses; resident + KV + scratch + context ≤ usable − margin on each
-    /// card; the host's tensors and reserves ≤ its usable bytes.
+    /// once and a whole tensor is one segment; a card segment's buffers sum to
+    /// its resident bytes; a card holds only what its stage uses; the granules
+    /// of its uploads + KV + scratch + context ≤ usable − margin on each card;
+    /// the host's tensors and reserves ≤ its usable bytes.
     pub fn violations(&self) -> Vec<Violation> {
         let (model, cards) = (self.model, &self.machine.cards);
         let mut out = Vec::new();
         let mut times = vec![0usize; model.tensors.len()];
-        let mut card_resident = vec![0u64; cards.len()];
         let mut host_resident = 0u64;
         for r in &self.rows {
             let Some(t) = model.tensors.get(r.tensor) else {
@@ -802,9 +1085,6 @@ impl Plan<'_> {
                             (_, Some(l)) => card.layers.contains(&l),
                             (_, None) => false,
                         });
-                        if let Some(sum) = card_resident.get_mut(c) {
-                            *sum += s.resident_bytes;
-                        }
                         if !uses {
                             out.push(Violation::WrongCard {
                                 tensor: t.name.clone(),
@@ -825,8 +1105,10 @@ impl Plan<'_> {
                 });
             }
         }
-        for ((card, totals), &resident) in cards.iter().zip(&self.cards).zip(&card_resident) {
-            let total = resident + totals.kv_bytes + card.scratch_bytes + card.context_bytes;
+        let (heaps, unsized_segments) = card_heaps(model, cards, &self.rows);
+        out.extend(unsized_segments);
+        for ((card, totals), heap) in cards.iter().zip(&self.cards).zip(&heaps) {
+            let total = heap.taken + totals.kv_bytes + card.scratch_bytes + card.context_bytes;
             let limit = card.usable_bytes.saturating_sub(card.margin_bytes);
             if total > limit {
                 out.push(Violation::CardOver {

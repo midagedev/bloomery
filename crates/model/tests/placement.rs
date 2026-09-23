@@ -4,11 +4,14 @@
 //! (b) the A6000 on layers 0–19, the 3090 on 20–39 with the head. Each prints
 //! the per-device and per-layer summaries, then fails with the whole list of
 //! what is wrong: every `Plan::violations` entry and every pin the plan misses
-//! (device totals, expert counts and n_l, the per-type formats, the per-token
-//! read). `BLOOMERY_PLACEMENT_TABLE=1` also prints the per-tensor table.
+//! (device totals with the allocator's rounding, expert counts and n_l, the
+//! per-type formats, the per-token read). `BLOOMERY_PLACEMENT_TABLE=1` also
+//! prints the per-tensor table.
 //!
 //! `hw_`: needs the V4.1 shards on the box (`just gate-placement`);
-//! `BLOOMERY_V41_MODEL` names another first shard.
+//! `BLOOMERY_V41_MODEL` names another first shard. The plan inputs are this
+//! machine's figures in `model::placement::workstation`, which the GPU load
+//! gate (`gate_load_v41`) plans from too.
 
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -16,29 +19,8 @@ use std::ops::Range;
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::{kv::KvLayout, roles};
 use model::placement::{
-    self, Card, CardFormat, Device, Format, Host, Machine, ModelTensors, Plan, Role,
+    self, CardFormat, Device, Format, Machine, ModelTensors, Plan, Role, workstation,
 };
-
-/// V4.1's first shard, unless `BLOOMERY_V41_MODEL` names another.
-const MODEL_V41: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
-
-// Plan inputs, design §5 (§4 for the per-card reserves).
-const MIB: u64 = 1 << 20;
-/// The A6000 less its driver reserve [measured]: (49,140 − 548) MiB.
-const A6000_USABLE: u64 = (49_140 - 548) * MIB;
-/// The 3090 less its driver reserve [measured]: (24,576 − 400) MiB.
-const R3090_USABLE: u64 = (24_576 - 400) * MIB;
-/// Per card: the CUDA context and the m=1 scratch [assumed], and the margin
-/// the expert rule leaves free.
-const CONTEXT: u64 = 512 * MIB;
-const SCRATCH: u64 = 64 * MIB;
-const MARGIN: u64 = 1 << 30;
-/// The host's usable bytes, its engram row cache, and the OS and everything
-/// else [measured, `free -b`].
-const HOST_USABLE: u64 = 270_071_001_088;
-const ROW_CACHE: u64 = 4_294_967_296;
-const OS_OTHER: u64 = 6_694_629_376;
-const CTX_MAX: u64 = 32_768;
 
 /// One card's pinned totals, and the n_l band on the layers that can hold experts.
 struct CardPin {
@@ -46,6 +28,7 @@ struct CardPin {
     dense: u64,
     expert_bytes: u64,
     experts: u64,
+    rounding: u64,
     kv: u64,
     headroom: i128,
     eligible: Range<usize>,
@@ -58,50 +41,53 @@ struct HostPin {
     headroom: i128,
 }
 
-// PIN(2026-09-23): design §5 (a), the A6000 budget line; n_l 63–64 on layers 2–39 from its table.
+// PIN(2026-09-23): design §5 (a)'s A6000 line with the allocator's rounding as a card term (its rule matched gate ②'s loads to the byte); n_l 62–63 on layers 2–39.
 const A_A6000: CardPin = CardPin {
     card: "A6000",
     dense: 8_576_674_240,
-    expert_bytes: 40_574_177_280,
-    experts: 2_419,
+    expert_bytes: 40_020_664_320,
+    experts: 2_386,
+    rounding: 553_612_864,
     kv: 110_129_152,
-    headroom: 1_087_444_544,
+    headroom: 1_087_344_640,
     eligible: 2..40,
-    n_l: (63, 64),
+    n_l: (62, 63),
 };
-// PIN(2026-09-23): design §5 (a), the host budget line.
+// PIN(2026-09-23): design §5 (a)'s host line, with the experts the A6000 no longer keeps once its rounding is counted.
 const A_HOST: HostPin = HostPin {
-    expert_bytes: 218_193_408_000,
+    expert_bytes: 218_746_920_960,
     table_bytes: 1_323_827_200,
-    headroom: 39_564_169_216,
+    headroom: 39_010_656_256,
 };
-// PIN(2026-09-23): design §5 (b), the A6000 budget line; n_l 149–150 on layers 2–19.
+// PIN(2026-09-23): design §5 (b)'s A6000 line with the allocator's rounding as a card term (its rule matched gate ②'s loads to the byte); n_l 148–149 on layers 2–19.
 const B_A6000: CardPin = CardPin {
     card: "A6000",
     dense: 4_190_828_000,
-    expert_bytes: 45_002_280_960,
-    experts: 2_683,
+    expert_bytes: 44_750_684_160,
+    experts: 2_668,
+    rounding: 257_673_760,
     kv: 65_560_576,
-    headroom: 1_089_755_680,
+    headroom: 1_083_678_720,
     eligible: 2..20,
-    n_l: (149, 150),
+    n_l: (148, 149),
 };
-// PIN(2026-09-23): design §5 (b), the 3090 budget line; n_l 57–58 on layers 20–39.
+// PIN(2026-09-23): design §5 (b)'s 3090 line with the allocator's rounding as a card term (its rule matched gate ②'s loads to the byte); n_l 56–57 on layers 20–39.
 const B_3090: CardPin = CardPin {
     card: "3090",
     dense: 4_385_846_240,
-    expert_bytes: 19_238_768_640,
-    experts: 1_147,
+    expert_bytes: 18_970_398_720,
+    experts: 1_131,
+    rounding: 268_172_320,
     kv: 44_568_576,
-    headroom: 1_077_210_144,
+    headroom: 1_077_407_744,
     eligible: 20..40,
-    n_l: (57, 58),
+    n_l: (56, 57),
 };
-// PIN(2026-09-23): design §5 (b), the host budget line (token_embd as in (a)).
+// PIN(2026-09-23): design §5 (b)'s host line (token_embd as in (a)), with the experts the cards no longer keep once their rounding is counted.
 const B_HOST: HostPin = HostPin {
-    expert_bytes: 194_526_535_680,
+    expert_bytes: 195_046_502_400,
     table_bytes: 1_323_827_200,
-    headroom: 63_231_041_536,
+    headroom: 62_711_074_816,
 };
 // PIN(2026-09-23): design §5 (a), `engram_embd` ×2 on NVMe — the same in (b).
 const NVME: u64 = 208_902_215_200;
@@ -134,33 +120,11 @@ fn n(v: impl Into<i128>) -> String {
 }
 
 fn open() -> (Split, ModelTensors, KvLayout) {
-    let path = std::env::var("BLOOMERY_V41_MODEL").unwrap_or_else(|_| MODEL_V41.to_string());
+    let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let model = roles::classify(&split).unwrap_or_else(|e| panic!("classify {path}: {e}"));
     let kv = KvLayout::from_file(&split).unwrap_or_else(|e| panic!("KV layout of {path}: {e}"));
     (split, model, kv)
-}
-
-fn card(name: &str, usable_bytes: u64, layers: Range<usize>, head: bool) -> Card {
-    Card {
-        name: name.to_string(),
-        usable_bytes,
-        context_bytes: CONTEXT,
-        scratch_bytes: SCRATCH,
-        margin_bytes: MARGIN,
-        layers,
-        head,
-    }
-}
-
-fn host() -> Host {
-    Host {
-        usable_bytes: HOST_USABLE,
-        reserves: vec![
-            ("engram row cache".to_string(), ROW_CACHE),
-            ("OS and other".to_string(), OS_OTHER),
-        ],
-    }
 }
 
 /// A metadata value as the file states it; an array longer than 48 shows its
@@ -208,13 +172,14 @@ fn summary(out: &mut String, title: &str, plan: &Plan<'_>, kv: &KvLayout) {
     for (card, t) in plan.machine.cards.iter().zip(&plan.cards) {
         let _ = writeln!(
             out,
-            "  {} layers {:?}{}: dense {}  experts {} ({})  KV {}  scratch {}  context {}  headroom {}",
+            "  {} layers {:?}{}: dense {}  experts {} ({})  rounding {}  KV {}  scratch {}  context {}  headroom {}",
             card.name,
             card.layers,
             if card.head { " +head" } else { "" },
             n(t.dense_bytes),
             n(t.expert_bytes),
             n(t.experts),
+            n(t.rounding_bytes),
             n(t.kv_bytes),
             n(t.scratch_bytes),
             n(t.context_bytes),
@@ -390,6 +355,12 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
             p.expert_bytes,
         );
         pin(&mut bad, &format!("{c} experts"), t.experts, p.experts);
+        pin(
+            &mut bad,
+            &format!("{c} allocator rounding"),
+            t.rounding_bytes,
+            p.rounding,
+        );
         pin(&mut bad, &format!("{c} KV"), t.kv_bytes, p.kv);
         pin(
             &mut bad,
@@ -405,7 +376,7 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
             };
             if !(band.0..=band.1).contains(&plan.n_l[l]) {
                 bad.push(format!(
-                    "{c} layer {l}: n_l {}, the design says {}–{}",
+                    "{c} layer {l}: n_l {}, the pinned band is {}–{}",
                     plan.n_l[l], band.0, band.1
                 ));
             }
@@ -495,8 +466,8 @@ fn run(
     cards: &[CardPin],
     host: &HostPin,
 ) {
-    let plan =
-        placement::plan(model, machine, CTX_MAX, kv).unwrap_or_else(|e| panic!("{title}: {e}"));
+    let plan = placement::plan(model, machine, workstation::CTX_MAX, kv)
+        .unwrap_or_else(|e| panic!("{title}: {e}"));
     summary(&mut out, title, &plan, kv);
     if std::env::var("BLOOMERY_PLACEMENT_TABLE").is_ok_and(|v| v == "1") {
         table(&mut out, &plan);
@@ -518,10 +489,7 @@ fn hw_placement_a6000_ddr4() {
     let (split, model, kv) = open();
     let mut out = String::new();
     metadata(&mut out, &split);
-    let machine = Machine {
-        cards: vec![card("A6000", A6000_USABLE, 0..40, true)],
-        host: host(),
-    };
+    let machine = workstation::plan_a(model.layers);
     run(
         "plan (a) A6000 + DDR4",
         out,
@@ -537,13 +505,7 @@ fn hw_placement_a6000_ddr4() {
 #[ignore = "hw: needs the V4.1 shards on the box"]
 fn hw_placement_3090_a6000_cut20() {
     let (_, model, kv) = open();
-    let machine = Machine {
-        cards: vec![
-            card("A6000", A6000_USABLE, 0..20, false),
-            card("3090", R3090_USABLE, 20..40, true),
-        ],
-        host: host(),
-    };
+    let machine = workstation::plan_b(model.layers);
     run(
         "plan (b) A6000 0-19 + 3090 20-39 +head + DDR4",
         String::new(),

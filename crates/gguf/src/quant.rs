@@ -736,3 +736,19 @@ pub struct Q8Block {
     /// held to [-127, 127] (the DOMAIN note in qdot's Q8_0 x Q8_0 kernel).
     pub q: [i8; 32],
 }
+
+impl Q8Block {
+    /// The block a file's 34 bytes hold: the scale's f16 bits little-endian, then the
+    /// codes (`block_q8_0`, ggml-common.h).
+    #[must_use]
+    pub fn from_bytes(b: &[u8; 34]) -> Q8Block {
+        let mut q = [0i8; 32];
+        for (code, &byte) in q.iter_mut().zip(&b[2..]) {
+            *code = i8::from_le_bytes([byte]);
+        }
+        Q8Block {
+            d: u16::from_le_bytes([b[0], b[1]]),
+            q,
+        }
+    }
+}

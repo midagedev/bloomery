@@ -189,28 +189,38 @@ impl Gguf {
         Self::open_with(path, false)
     }
 
-    /// `open`, optionally prefaulting the whole mapping (`MAP_POPULATE`). A lazy
-    /// mapping takes a page fault on the first touch of every weight page, and
-    /// a MoE keeps meeting untouched experts for hundreds of steps; a process
-    /// that will decode pays that once here instead. Tests open lazily.
+    /// `open`, optionally prefaulting the whole mapping once the header has
+    /// passed (`MADV_POPULATE_READ`). A lazy mapping takes a page fault on the
+    /// first touch of every weight page, and a MoE keeps meeting untouched
+    /// experts for hundreds of steps; a process that will decode pays that once
+    /// here instead. Tests open lazily.
     pub fn open_with(path: impl AsRef<Path>, populate: bool) -> Result<Gguf, LoadError> {
         Self::open_backed(path, Weights::Mapped { populate })
     }
 
-    /// `open`, with the caller choosing where the bytes live.
+    /// `open`, with the caller choosing where the bytes live. The header is
+    /// parsed and every tensor validated on a lazy mapping first, so a file
+    /// that is refused costs its header's pages; only then is the mapping
+    /// populated or copied.
     pub fn open_backed(path: impl AsRef<Path>, weights: Weights) -> Result<Gguf, LoadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        let mut opts = memmap2::MmapOptions::new();
-        if weights == (Weights::Mapped { populate: true }) {
-            opts.populate();
-        }
         // SAFETY: the file is opened read-only and nothing maps it writable;
         // a concurrent truncation would surface as SIGBUS, the same contract
         // ik_llama.cpp's own mmap loader accepts.
-        let file_map = unsafe { opts.map(&file)? };
+        let file_map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let h = parse_header(&file_map, len)?;
+        let tensors = strict_tensors(h.tensors, h.data_base, len)?;
         let map = match weights {
-            Weights::Mapped { .. } => Backing::File(file_map),
+            Weights::Mapped { populate } => {
+                #[cfg(target_os = "linux")]
+                if populate {
+                    file_map.advise(memmap2::Advice::PopulateRead)?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = populate;
+                Backing::File(file_map)
+            }
             Weights::Resident { huge } => {
                 let mut anon = memmap2::MmapOptions::new().len(len as usize).map_anon()?;
                 // Before the first touch: a page faulted in small stays small
@@ -225,74 +235,14 @@ impl Gguf {
                 Backing::Anon(anon)
             }
         };
-
-        let h = parse_header(&map, len)?;
-
-        // The strict pass: every tensor must be sized by this engine's
-        // `GgmlType` and its first dim must be block-aligned.
-        let mut strict = Vec::with_capacity(h.tensors.len());
-        for t in h.tensors {
-            let ty = GgmlType::from_u32(t.type_id);
-            let blck = ty.blck_size().ok_or_else(|| LoadError::UnsupportedType {
-                name: t.name.clone(),
-                ty,
-            })?;
-            let tsz = ty.type_size().ok_or_else(|| LoadError::UnsupportedType {
-                name: t.name.clone(),
-                ty,
-            })?;
-            if t.dims[0] % blck != 0 {
-                return Err(LoadError::UnalignedRow {
-                    name: t.name,
-                    ne0: t.dims[0],
-                    blck,
-                });
-            }
-            // Missing dims are implicit 1s (ggml tensors are 4-D); the
-            // product below folds them in.
-            let nbytes = tsz * (t.dims[0] / blck) * t.dims[1..].iter().product::<u64>();
-            strict.push(TensorInfo {
-                name: t.name,
-                dims: t.dims,
-                ty,
-                offset: t.offset,
-                nbytes,
-            });
-        }
-
-        let gguf = Gguf {
+        Ok(Gguf {
             _file: file,
             map,
             meta: h.meta,
-            tensors: strict,
+            tensors,
             data_base: h.data_base,
             alignment: h.alignment,
-        };
-        // Every tensor must sit inside the file — this is the placement
-        // invariant the coverage gate re-checks per tensor.
-        for t in &gguf.tensors {
-            let end = gguf
-                .data_base
-                .checked_add(t.offset)
-                .and_then(|o| o.checked_add(t.nbytes))
-                .ok_or(LoadError::OutOfBounds {
-                    name: t.name.clone(),
-                    base: gguf.data_base,
-                    off: t.offset,
-                    nbytes: t.nbytes,
-                    len,
-                })?;
-            if end > len {
-                return Err(LoadError::OutOfBounds {
-                    name: t.name.clone(),
-                    base: gguf.data_base,
-                    off: t.offset,
-                    nbytes: t.nbytes,
-                    len,
-                });
-            }
-        }
-        Ok(gguf)
+        })
     }
 
     /// Number of metadata KV pairs.
@@ -435,6 +385,14 @@ impl Gguf {
             });
         }
         Ok(&self.map[start..end])
+    }
+
+    /// The whole mapping, file offset `o` at index `o`. Index 0 sits on a page
+    /// boundary (the kernel places a mapping on one), so a sub-slice of whole
+    /// pages is what a caller locks in RAM (`mlock`) or asks the residency of
+    /// (`mincore`); [`Gguf::data`] is one tensor's slice of it.
+    pub fn mapping(&self) -> &[u8] {
+        &self.map
     }
 }
 
@@ -824,6 +782,63 @@ fn meta_u32(meta: &[(String, Value)], key: &str) -> Option<u32> {
     }
 }
 
+/// The strict pass over a parsed header's tensors: every tensor must be sized
+/// by this engine's `GgmlType` and its first dim must be block-aligned; then
+/// every tensor must sit inside the `len`-byte file — the placement invariant
+/// the coverage gate re-checks per tensor.
+fn strict_tensors(
+    raw: Vec<RawTensorInfo>,
+    data_base: u64,
+    len: u64,
+) -> Result<Vec<TensorInfo>, LoadError> {
+    let mut strict = Vec::with_capacity(raw.len());
+    for t in raw {
+        let ty = GgmlType::from_u32(t.type_id);
+        let blck = ty.blck_size().ok_or_else(|| LoadError::UnsupportedType {
+            name: t.name.clone(),
+            ty,
+        })?;
+        let tsz = ty.type_size().ok_or_else(|| LoadError::UnsupportedType {
+            name: t.name.clone(),
+            ty,
+        })?;
+        if t.dims[0] % blck != 0 {
+            return Err(LoadError::UnalignedRow {
+                name: t.name,
+                ne0: t.dims[0],
+                blck,
+            });
+        }
+        // Missing dims are implicit 1s (ggml tensors are 4-D); the
+        // product below folds them in.
+        let nbytes = tsz * (t.dims[0] / blck) * t.dims[1..].iter().product::<u64>();
+        strict.push(TensorInfo {
+            name: t.name,
+            dims: t.dims,
+            ty,
+            offset: t.offset,
+            nbytes,
+        });
+    }
+    for t in &strict {
+        let out_of_bounds = || LoadError::OutOfBounds {
+            name: t.name.clone(),
+            base: data_base,
+            off: t.offset,
+            nbytes: t.nbytes,
+            len,
+        };
+        let end = data_base
+            .checked_add(t.offset)
+            .and_then(|o| o.checked_add(t.nbytes))
+            .ok_or_else(out_of_bounds)?;
+        if end > len {
+            return Err(out_of_bounds());
+        }
+    }
+    Ok(strict)
+}
+
 /// What [`parse_header`] returns: the file's own statement of itself.
 struct Header {
     version: u32,
@@ -1000,7 +1015,7 @@ fn read_value(rd: &mut Reader<'_>, tag: u32) -> Result<Value, LoadError> {
 
 #[cfg(test)]
 mod split_tests {
-    use super::{LoadError, Split};
+    use super::{Gguf, LoadError, Split};
     use std::path::{Path, PathBuf};
 
     /// A metadata value as the synthetic shards carry it.
@@ -1018,6 +1033,12 @@ mod split_tests {
     /// A GGUF v3 file with `kvs` and one 4-value F32 tensor per name, 32 bytes
     /// apart over zero data — a few hundred bytes the strict reader opens.
     fn write_gguf(path: &Path, kvs: &[(&str, Kv)], tensors: &[&str]) {
+        write_gguf_as(path, kvs, tensors, 0, 0);
+    }
+
+    /// [`write_gguf`] with every tensor tagged ggml type id `ty` and `extra`
+    /// more zero bytes after the tensors' data.
+    fn write_gguf_as(path: &Path, kvs: &[(&str, Kv)], tensors: &[&str], ty: u32, extra: usize) {
         let mut b = Vec::new();
         b.extend_from_slice(b"GGUF");
         b.extend_from_slice(&3u32.to_le_bytes());
@@ -1044,10 +1065,10 @@ mod split_tests {
             put_str(&mut b, name);
             b.extend_from_slice(&1u32.to_le_bytes());
             b.extend_from_slice(&4u64.to_le_bytes());
-            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
             b.extend_from_slice(&(32 * i as u64).to_le_bytes());
         }
-        b.resize(b.len().div_ceil(32) * 32 + 32 * tensors.len(), 0);
+        b.resize(b.len().div_ceil(32) * 32 + 32 * tensors.len() + extra, 0);
         std::fs::write(path, b).unwrap();
     }
 
@@ -1192,5 +1213,47 @@ mod split_tests {
             }
             other => panic!("wrong refusal: {other}"),
         }
+    }
+
+    /// Page faults the calling thread has taken, minor and major.
+    fn thread_faults() -> u64 {
+        // SAFETY: `rusage` is a C struct of integers; all-zero bytes are a value of it.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is a live, writable `rusage` for the duration of the call.
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+        assert_eq!(rc, 0, "getrusage(RUSAGE_THREAD)");
+        u64::try_from(usage.ru_minflt + usage.ru_majflt).unwrap()
+    }
+
+    /// A file refused by the strict pass costs a populating open its header's
+    /// pages, not its data's: the populate waits for the validation.
+    #[test]
+    fn a_refused_file_is_not_populated() {
+        const DATA: usize = 64 << 20;
+        let d = set_dir("populate");
+        let p = d.join("refused.gguf");
+        // Type id 99 is no `GgmlType`, so the strict pass refuses the file.
+        let kvs = [("general.architecture", Kv::Str("test"))];
+        write_gguf_as(&p, &kvs, &["a"], 99, DATA);
+        let before = thread_faults();
+        let r = Gguf::open_with(&p, true);
+        let faults = thread_faults() - before;
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(
+            matches!(r, Err(LoadError::UnsupportedType { .. })),
+            "the file must be refused by the strict pass"
+        );
+        // SAFETY: `sysconf` reads a static system value and touches no memory of ours.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let pages = u64::try_from(DATA).unwrap() / u64::try_from(page).unwrap();
+        println!(
+            "populating open of a refused file: {faults} page faults, data section {pages} pages"
+        );
+        // Fault-around maps at most 16 pages per fault, so populating the data
+        // costs at least pages/16 faults; the header alone costs a handful.
+        assert!(
+            faults < pages / 256,
+            "{faults} faults: the data section ({pages} pages) was populated before the header was refused"
+        );
     }
 }

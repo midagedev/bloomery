@@ -3,15 +3,18 @@
 //! decision 4 — format conversion is load-time work; nothing in this file
 //! runs per step). A [`Weights`] owns one contiguous block range plus,
 //! optionally, the non-block tensors, so a `Stage` loads exactly its own
-//! layers. The gate (`gate_p10`) pins the uploads against the per-gate
-//! reference packings bit for bit.
+//! layers — or, for a placed model, every segment its plan puts on one card
+//! ([`Weights::load_placed`]). The formats and their byte arithmetic are
+//! `model::placement::CardFormat`'s. The gates (`gate_p10`, `gate_load_v41`)
+//! pin the uploads against independent host packings bit for bit.
 
 use crate::GpuError;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::tensor::DeviceTensor;
+use ::model::placement::{CardFormat, Device, Format, ModelTensor, Plan, Segment};
 use cuda_core::CudaStream;
-use gguf::quant::{GgmlType, half_to_f32};
-use gguf::{Gguf, TensorInfo};
+use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+use gguf::{Gguf, Split, TensorInfo};
 // The Q8_0 block `q8_0_planes` packs; the gate binaries name it through here.
 pub use gguf::quant::Q8Block;
 use std::collections::BTreeMap;
@@ -39,12 +42,10 @@ pub enum DevWeight {
     /// Q5_1 file tensor in the `pack_q5_1` layout: `q_stride + 2·k/32` words
     /// per row. `k` is a multiple of 32.
     Q5_1 { w: DeviceTensor<u32>, k: usize },
-    /// Q8_0 in the q8f32 two-plane layout: `qs` rows × k/4 u32 words (code j
-    /// of a 32-value block in word j/4, byte j%4) and `d` rows × k/32 f32
-    /// block scales converted from the f16 storage at load. No file tensor
-    /// fills this variant today — `upload_file_tensor` has no Q8_0 arm and
-    /// refuses such a tensor — but the format is the contract the derived
-    /// variant shares.
+    /// Q8_0 file tensor in the q8f32 two-plane layout: `qs` rows × k/4 u32
+    /// words (code j of a 32-value block in word j/4, byte j%4) and `d` rows
+    /// × k/32 f32 block scales converted from the f16 storage at load. The
+    /// derived variant shares the format.
     Q8_0 {
         qs: DeviceTensor<u32>,
         d: DeviceTensor<f32>,
@@ -61,9 +62,9 @@ pub enum DevWeight {
         d: DeviceTensor<f32>,
         k: usize,
     },
-    /// F32 file tensor: rows × k f32, row-major with `k = dims[0]` (the
-    /// contiguous axis the gemv kernels dot along). 1-D norm vectors are
-    /// rows = 1.
+    /// F32 file tensor, or a BF16 one decoded to f32 at load: rows × k f32,
+    /// row-major with `k = dims[0]` (the contiguous axis the gemv kernels dot
+    /// along). 1-D norm vectors are rows = 1.
     F32 { w: DeviceTensor<f32>, k: usize },
 }
 
@@ -95,7 +96,7 @@ impl DevWeight {
 
     /// Device bytes held across all planes.
     #[must_use]
-    pub(crate) fn resident_bytes(&self) -> usize {
+    pub fn resident_bytes(&self) -> usize {
         match self {
             DevWeight::KQuant { w, .. } | DevWeight::Q5_0 { w, .. } | DevWeight::Q5_1 { w, .. } => {
                 w.buf().len() * 4
@@ -148,6 +149,45 @@ impl Weights {
             if take {
                 let dw = upload_file_tensor(stream, gguf, t)?;
                 by_name.insert(t.name.clone(), dw);
+            }
+        }
+        Ok(Weights { by_name })
+    }
+
+    /// Upload every segment `plan` puts on card `card`, from `split`, in the
+    /// segment's card format: a whole tensor, or an expert stack's experts
+    /// `[0, n_l)` — the stack's leading rows, which the `_sel` kernels
+    /// address as experts `0..n_l`. Segments on other devices are skipped.
+    /// A segment whose upload is not the plan's `resident_bytes` for it is an
+    /// error naming the tensor: plan and loader share one arithmetic, so a
+    /// difference means the plan is not a plan of this file. `stream`'s
+    /// context is made current first — allocations land in the calling
+    /// thread's current context, and a process with one context per card
+    /// must be on this card's.
+    pub fn load_placed(
+        stream: &CudaStream,
+        split: &Split,
+        plan: &Plan<'_>,
+        card: usize,
+    ) -> Result<Weights, GpuError> {
+        stream.context().bind_to_thread()?;
+        let mut by_name = BTreeMap::new();
+        for row in &plan.rows {
+            let t = plan.model.tensors.get(row.tensor).ok_or_else(|| {
+                GpuError::shape(PLACED, format!("plan row names tensor {}", row.tensor))
+            })?;
+            for seg in row
+                .segments
+                .iter()
+                .filter(|s| s.device == Device::Card(card))
+            {
+                let dw = upload_segment(stream, split, plan, t, seg)?;
+                if by_name.insert(t.name.clone(), dw).is_some() {
+                    return Err(placed_refusal(
+                        t,
+                        format!("has two segments on card {card}"),
+                    ));
+                }
             }
         }
         Ok(Weights { by_name })
@@ -226,28 +266,70 @@ fn tensor_rows(t: &TensorInfo) -> usize {
 
 /// Resident device bytes a file tensor of this type and shape takes in the
 /// formats above (`rows` as [`tensor_rows`] counts them); `None` when the
-/// type has no device format. The uploads follow the same arithmetic, so a
-/// census totals check against a loaded `Weights::resident_bytes` pins the
-/// two together.
+/// type has no device format or the shape has no layout in it. The uploads
+/// refuse and check by the same arithmetic ([`CardFormat::resident_bytes`]),
+/// so a census totals check against a loaded `Weights::resident_bytes` pins
+/// the two together.
 #[must_use]
 pub fn resident_size(ty: GgmlType, k: usize, rows: usize) -> Option<usize> {
-    let q_stride_words = |k: usize| 256 * (k / 32).div_ceil(32);
-    match ty {
-        GgmlType::F32 => Some(rows * k * 4),
-        GgmlType::Q5_0 => Some(rows * (q_stride_words(k) + k / 32) * 4),
-        GgmlType::Q5_1 => Some(rows * (q_stride_words(k) + 2 * k / 32) * 4),
-        GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K => {
-            let blck = ty.blck_size()? as usize;
-            if !k.is_multiple_of(blck) {
-                return None;
-            }
-            let row_bytes = ty.type_size()? as usize * (k / blck);
-            Some(row_bytes * rows.div_ceil(4) * 4)
-        }
-        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::Unknown(_) => {
-            None
-        }
+    let (k, rows) = (u64::try_from(k).ok()?, u64::try_from(rows).ok()?);
+    let bytes = CardFormat::of(ty)?.resident_bytes(ty, k, rows)?;
+    usize::try_from(bytes).ok()
+}
+
+/// The `what` of every refusal `Weights::load_placed` makes.
+const PLACED: &str = "Weights::load_placed";
+
+/// `load_placed`'s refusal of tensor `t`.
+fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
+    GpuError::shape(PLACED, format!("tensor {}: {detail}", t.name))
+}
+
+/// Upload plan segment `seg` of tensor `t`: find the tensor in `split`,
+/// confirm it is the tensor the plan was made from, and upload the rows the
+/// segment holds, which must lead the tensor.
+fn upload_segment(
+    stream: &CudaStream,
+    split: &Split,
+    plan: &Plan<'_>,
+    t: &ModelTensor,
+    seg: &Segment,
+) -> Result<DevWeight, GpuError> {
+    let Format::Card(format) = seg.format else {
+        return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
+    };
+    let span = seg
+        .span(t, plan.model.experts)
+        .map_err(|e| GpuError::shape(PLACED, e.to_string()))?;
+    if span.rows.start != 0 {
+        let detail = format!("rows {:?} do not lead the tensor", span.rows);
+        return Err(placed_refusal(t, detail));
     }
+    let (s, info) = split
+        .find(&t.name)
+        .ok_or_else(|| placed_refusal(t, "is not in the split".to_string()))?;
+    if s != t.shard || info.ty != t.ty || info.dims != t.dims || info.nbytes != t.file_bytes {
+        let detail = format!(
+            "the split's shard {s} {} {:?} ({} bytes) is not the plan's shard {} {} {:?} ({} bytes)",
+            info.ty, info.dims, info.nbytes, t.shard, t.ty, t.dims, t.file_bytes
+        );
+        return Err(placed_refusal(t, detail));
+    }
+    let g = split
+        .shard(s)
+        .ok_or_else(|| placed_refusal(t, format!("shard {s} is not in the split")))?;
+    let rows = usize::try_from(span.rows.end)
+        .map_err(|_| placed_refusal(t, format!("{} rows pass usize", span.rows.end)))?;
+    let dw = upload_rows(stream, PLACED, format, info, rows, g.data(info)?)?;
+    if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
+        let detail = format!(
+            "uploaded {} device bytes, the plan has {}",
+            dw.resident_bytes(),
+            seg.resident_bytes
+        );
+        return Err(placed_refusal(t, detail));
+    }
+    Ok(dw)
 }
 
 /// Pack and upload one file tensor in its kernel's device format.
@@ -256,106 +338,131 @@ fn upload_file_tensor(
     gguf: &Gguf,
     t: &TensorInfo,
 ) -> Result<DevWeight, GpuError> {
-    let name = t.name.as_str();
-    let k = t.dims[0] as usize;
-    let rows = tensor_rows(t);
-    if k == 0 || rows == 0 {
+    let Some(format) = CardFormat::of(t.ty) else {
         return Err(GpuError::shape(
             "Weights::load",
-            format!("tensor {name} has a zero dimension"),
+            format!("tensor {} has type {} with no device format", t.name, t.ty),
         ));
-    }
-    let bytes = gguf.data(t)?;
-    match t.ty {
-        GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K => {
-            let blck = t.ty.blck_size().ok_or_else(|| {
-                GpuError::shape(
-                    "Weights::load",
-                    format!("ggml type of {name} has no block size"),
-                )
-            })? as usize;
-            let rb = t.ty.type_size().ok_or_else(|| {
-                GpuError::shape(
-                    "Weights::load",
-                    format!("ggml type of {name} has no type size"),
-                )
-            })? as usize
-                * (k / blck);
-            if bytes.len() < rb * rows {
-                return Err(GpuError::shape(
-                    "Weights::load",
-                    format!(
-                        "tensor {name} holds {} bytes, rows need {}",
-                        bytes.len(),
-                        rb * rows
-                    ),
-                ));
-            }
-            // The gates' packing verbatim (gate_p1/gate_p9): the whole row
-            // span as one word stream, so the kernels' byte-offset row
-            // addressing sees contiguous rows.
-            let words = words_of(&bytes[..rb * rows]);
-            if !words.len().is_multiple_of(rows) {
-                return Err(GpuError::shape(
-                    "Weights::load",
-                    format!(
-                        "tensor {name} packs {} words not divisible by \
-                     {rows} rows — the row stream cannot be represented per row",
-                        words.len()
-                    ),
-                ));
-            }
-            Ok(DevWeight::KQuant {
+    };
+    upload_rows(
+        stream,
+        "Weights::load",
+        format,
+        t,
+        tensor_rows(t),
+        gguf.data(t)?,
+    )
+}
+
+/// Pack the first `rows` rows of file tensor `t` — all of them, or an
+/// expert stack's leading experts — from `bytes` (the tensor's file bytes,
+/// or at least those rows') in card format `format`, and upload them.
+/// Refuses exactly where [`CardFormat::resident_bytes`] has no size for the
+/// rows, and checks the upload's device bytes against that size; `what`
+/// names the caller in both errors.
+fn upload_rows(
+    stream: &CudaStream,
+    what: &'static str,
+    format: CardFormat,
+    t: &TensorInfo,
+    rows: usize,
+    bytes: &[u8],
+) -> Result<DevWeight, GpuError> {
+    let name = t.name.as_str();
+    let all_rows: u64 = t.dims[1..].iter().product();
+    let layout = (rows as u64 <= all_rows)
+        .then(|| format.resident_bytes(t.ty, t.dims[0], rows as u64))
+        .flatten()
+        .zip(usize::try_from(t.dims[0]).ok());
+    let Some((size, k)) = layout else {
+        let detail = format!(
+            "tensor {name}: {rows} of its {all_rows} rows of {} {} values have no {format:?} layout",
+            t.dims[0], t.ty
+        );
+        return Err(GpuError::shape(what, detail));
+    };
+    // File bytes per row: exact, because the reader sized the tensor from its type.
+    let need = t.nbytes / all_rows * rows as u64;
+    let Some(bytes) = usize::try_from(need).ok().and_then(|n| bytes.get(..n)) else {
+        let detail = format!(
+            "tensor {name} holds {} bytes, {rows} rows need {need}",
+            bytes.len()
+        );
+        return Err(GpuError::shape(what, detail));
+    };
+    let dw = match format {
+        // The gates' packing verbatim (gate_p1/gate_p9): the whole row span as
+        // one word stream, so the kernels' byte-offset row addressing sees
+        // contiguous rows.
+        CardFormat::KQuant => {
+            let words = words_of(bytes);
+            DevWeight::KQuant {
                 ty: t.ty,
                 w: DeviceTensor::upload(stream, &words, rows, words.len() / rows)?,
                 k,
-            })
-        }
-        GgmlType::Q5_0 => {
-            let packed = pack_q5_0(bytes, k, rows)?;
-            let cols = 256 * (k / 32).div_ceil(32) + k / 32;
-            Ok(DevWeight::Q5_0 {
-                w: DeviceTensor::upload(stream, &packed, rows, cols)?,
-                k,
-            })
-        }
-        GgmlType::Q5_1 => {
-            let packed = pack_q5_1(bytes, k, rows)?;
-            let cols = 256 * (k / 32).div_ceil(32) + 2 * k / 32;
-            Ok(DevWeight::Q5_1 {
-                w: DeviceTensor::upload(stream, &packed, rows, cols)?,
-                k,
-            })
-        }
-        GgmlType::F32 => {
-            if bytes.len() < rows * k * 4 {
-                return Err(GpuError::shape(
-                    "Weights::load",
-                    format!(
-                        "tensor {name} holds {} bytes, rows×k×4 = {}",
-                        bytes.len(),
-                        rows * k * 4
-                    ),
-                ));
             }
-            let vals: Vec<f32> = bytes[..rows * k * 4]
+        }
+        CardFormat::Q5_0 => {
+            let packed = pack_q5_0(bytes, k, rows)?;
+            let cols = packed.len() / rows;
+            DevWeight::Q5_0 {
+                w: DeviceTensor::upload(stream, &packed, rows, cols)?,
+                k,
+            }
+        }
+        CardFormat::Q5_1 => {
+            let packed = pack_q5_1(bytes, k, rows)?;
+            let cols = packed.len() / rows;
+            DevWeight::Q5_1 {
+                w: DeviceTensor::upload(stream, &packed, rows, cols)?,
+                k,
+            }
+        }
+        CardFormat::Q8_0Planes => {
+            let blocks: Vec<Q8Block> = bytes
+                .as_chunks::<34>()
+                .0
+                .iter()
+                .map(Q8Block::from_bytes)
+                .collect();
+            let (qs, d) = q8_0_planes(&blocks);
+            DevWeight::Q8_0 {
+                qs: DeviceTensor::upload(stream, &qs, rows, k / 4)?,
+                d: DeviceTensor::upload(stream, &d, rows, k / 32)?,
+                k,
+            }
+        }
+        CardFormat::F32 => {
+            let vals: Vec<f32> = bytes
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .map(|c| f32::from_le_bytes(*c))
                 .collect();
-            Ok(DevWeight::F32 {
+            DevWeight::F32 {
                 w: DeviceTensor::upload(stream, &vals, rows, k)?,
                 k,
-            })
+            }
         }
-        GgmlType::F16 | GgmlType::Q5_K | GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::Unknown(_) => {
-            Err(GpuError::shape(
-                "Weights::load",
-                format!("tensor {name} has type {} with no device format", t.ty),
-            ))
+        CardFormat::Bf16AsF32 => {
+            let mut vals = vec![0.0f32; rows * k];
+            dequant_row(t.ty, bytes, &mut vals).map_err(::model::ModelError::from)?;
+            DevWeight::F32 {
+                w: DeviceTensor::upload(stream, &vals, rows, k)?,
+                k,
+            }
         }
+    };
+    if u64::try_from(dw.resident_bytes()).ok() != Some(size) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "tensor {name}: {format:?} upload holds {} device bytes, its layout {size}",
+                dw.resident_bytes()
+            ),
+        ));
     }
+    Ok(dw)
 }
 
 /// Raw little-endian bytes as u32 words; a length not divisible by 4
