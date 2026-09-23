@@ -347,6 +347,12 @@ ab-decode *DIRS: build-decode
 measure-profile: build-decode
     ./tools/box.sh 'bash tools/ref/profile-measure.sh'
 
+# 디코드 스텝의 스레드별 perf 표(리드 전용): 임대·증인 아래, 프리필이 끝난 뒤 pid에 붙어 cpu-clock으로 뜬다.
+# `perf report --tid`는 메인 스레드의 dot 커널을 통째로 빼고 스핀만 보여 줬으므로(perf 6.8) `perf script`로 집계한다.
+# PERF_SECS(기본 2.0)·PERF_TOP·PERF_ANNOTATE·PERF_CALLERS·PERF_KEEP.
+perf-decode *ARGS: build-decode
+    ./tools/box.sh 'bash tools/ref/perf-decode.sh {{ARGS}}'
+
 # 참조 하네스(ggml에 링크하는 C++). 진실값과 기준 속도의 출처다.
 # build-qdot-ref.sh는 ik의 커널 테이블까지 링크하는 x4 하네스 열을 짓고 참조 하네스 다섯을
 # **실행까지** 한다 — gate-qdot의 hw 테스트 일곱이 읽는 $BLOOMERY_DATA/ref/의 덤프

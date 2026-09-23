@@ -1945,8 +1945,19 @@ fn steal_enabled() -> bool {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *S.get_or_init(|| std::env::var("BLOOMERY_STEAL").map_or(true, |v| v != "0"))
 }
-/// Blocks a lane is cut into.
-const STEAL_BLOCKS: usize = 4;
+/// Blocks a lane is cut into: the barrier waits for at most one block per
+/// participant once every block is claimed. `BLOOMERY_STEAL_BLOCKS` is the
+/// same-binary lever for that granularity.
+fn steal_blocks() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("BLOOMERY_STEAL_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or(4)
+    })
+}
 
 /// The unprofiled dispatch's error channel: no chunk collector, no
 /// allocation — a clean chunk touches nothing, and the mutex only locks when
@@ -2073,6 +2084,7 @@ fn run_row_pool(
     assert!(nlanes <= MAX_LANES, "row pool lanes: {nlanes} threads");
     // `BLOOMERY_STEAL=0` is the A/B lever: whole-lane blocks, home lanes only.
     let steal = steal_enabled();
+    let steal_blocks = steal_blocks();
     let lanes: [Lane; MAX_LANES] = std::array::from_fn(|t| {
         let (start, end) = if t < nlanes {
             (lane_bounds[t], lane_bounds[t + 1])
@@ -2080,7 +2092,7 @@ fn run_row_pool(
             (0, 0)
         };
         let block = if steal {
-            ((end - start) / STEAL_BLOCKS).max(1)
+            ((end - start) / steal_blocks).max(1)
         } else {
             total_rows.max(1)
         };
