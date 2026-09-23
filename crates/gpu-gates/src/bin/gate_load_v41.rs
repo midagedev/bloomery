@@ -62,7 +62,8 @@ mod gate {
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::host_lock::{HostLock, page_bytes};
     use model::placement::{
-        Card, CardFormat, CardTotals, Device, Format, ModelTensor, ModelTensors, Plan, workstation,
+        Card, CardFormat, CardTotals, Device, ExpertList, Format, ModelTensor, ModelTensors, Plan,
+        Segment, workstation,
     };
 
     /// Design §5's two plans.
@@ -391,17 +392,23 @@ mod gate {
         dw.buffer_bytes().into_iter().map(|b| b as u64).collect()
     }
 
-    /// A read-back sample: a plan tensor, its card format and the experts the
-    /// segment holds (`None` for a whole tensor).
+    /// A read-back sample: a plan tensor, its card format and its segment on
+    /// the card.
     struct Sample<'p> {
         t: &'p ModelTensor,
         format: CardFormat,
-        experts: Option<Range<u64>>,
+        seg: &'p Segment,
+    }
+
+    impl Sample<'_> {
+        fn experts(&self) -> Option<&ExpertList> {
+            self.seg.experts.as_ref()
+        }
     }
 
     /// Card `c`'s samples: the first whole tensor of each card format, in plan
-    /// order, and the first expert-prefix stack segment.
-    fn samples<'p>(plan: &Plan<'p>, c: usize) -> Vec<Sample<'p>> {
+    /// order, and the first expert stack segment.
+    fn samples<'p>(plan: &'p Plan<'p>, c: usize) -> Vec<Sample<'p>> {
         let model: &'p ModelTensors = plan.model;
         let mut out: Vec<Sample<'p>> = Vec::new();
         for row in &plan.rows {
@@ -411,17 +418,13 @@ mod gate {
                     continue;
                 };
                 // One expert segment of any format; one whole tensor per format.
-                let taken = out.iter().any(|s| match (&s.experts, &seg.experts) {
+                let taken = out.iter().any(|s| match (s.experts(), &seg.experts) {
                     (Some(_), Some(_)) => true,
                     (None, None) => s.format == format,
                     _ => false,
                 });
                 if !taken {
-                    out.push(Sample {
-                        t,
-                        format,
-                        experts: seg.experts.clone(),
-                    });
+                    out.push(Sample { t, format, seg });
                 }
             }
         }
@@ -541,23 +544,39 @@ mod gate {
                 .ok_or_else(|| format!("{} is not in the split", s.t.name))?;
             let bytes = split.shard(shard).ok_or("shard out of range")?.data(info)?;
             let rows: u64 = info.dims[1..].iter().product();
-            let held_rows = match &s.experts {
-                None => rows,
-                Some(e) => e.end * (rows / plan.model.experts),
+            let row_bytes = info.nbytes / rows;
+            // The segment's rows in slot order, from the list's ids alone.
+            let held_ranges: Vec<(u64, u64)> = match s.experts() {
+                None => vec![(0, rows)],
+                Some(e) => {
+                    let per = rows / plan.model.experts;
+                    e.ids()
+                        .iter()
+                        .map(|&id| (u64::from(id) * per, (u64::from(id) + 1) * per))
+                        .collect()
+                }
             };
-            let len = usize::try_from(info.nbytes / rows * held_rows)?;
-            let held = bytes
-                .get(..len)
-                .ok_or_else(|| format!("{} holds fewer than {len} bytes", s.t.name))?;
-            let want = host_planes(s.format, held)?;
+            let held_rows: u64 = held_ranges.iter().map(|&(a, b)| b - a).sum();
+            let mut held = Vec::new();
+            for &(ra, rb) in &held_ranges {
+                let (a, b) = (
+                    usize::try_from(ra * row_bytes)?,
+                    usize::try_from(rb * row_bytes)?,
+                );
+                let run = bytes
+                    .get(a..b)
+                    .ok_or_else(|| format!("{} holds fewer than {b} bytes", s.t.name))?;
+                held.extend_from_slice(run);
+            }
+            let len = held.len();
+            let want = host_planes(s.format, &held)?;
             let dw = w
                 .get(&s.t.name)
                 .ok_or_else(|| format!("{} is not resident", s.t.name))?;
             let diff = difference(&device_planes(dw, gpu.stream())?, &want);
             let experts = s
-                .experts
-                .as_ref()
-                .map_or(String::new(), |e| format!(" experts {e:?}"));
+                .experts()
+                .map_or(String::new(), |e| format!(" experts {e}"));
             println!(
                 "check 3 {name}: {} {}{experts}, {held_rows} rows, {len} file bytes: {}",
                 s.t.name,
@@ -595,17 +614,19 @@ mod gate {
                     .ok_or_else(|| format!("{} is not in the split", t.name))?;
                 let base =
                     split.shard(shard).ok_or("shard out of range")?.data_base() + info.offset;
-                let (a, b) = match &seg.experts {
-                    None => (0, info.nbytes),
-                    Some(e) => {
-                        let per = info.nbytes / plan.model.experts;
-                        (e.start * per, e.end * per)
-                    }
+                let per = info.nbytes / plan.model.experts;
+                let held: Vec<(u64, u64)> = match &seg.experts {
+                    None => vec![(0, info.nbytes)],
+                    Some(e) => e
+                        .ids()
+                        .iter()
+                        .map(|&id| (u64::from(id) * per, (u64::from(id) + 1) * per))
+                        .collect(),
                 };
-                spans
-                    .entry(shard)
-                    .or_default()
-                    .push(((base + a) / page, (base + b).div_ceil(page)));
+                let entry = spans.entry(shard).or_default();
+                for (a, b) in held {
+                    entry.push(((base + a) / page, (base + b).div_ceil(page)));
+                }
             }
         }
         let mut pages = BTreeMap::new();

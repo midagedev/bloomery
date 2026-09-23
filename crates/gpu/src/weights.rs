@@ -11,12 +11,15 @@
 use crate::GpuError;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::tensor::DeviceTensor;
-use ::model::placement::{CardFormat, Device, Format, ModelTensor, Plan, Segment};
+use ::model::placement::{
+    CardFormat, Device, Format, ModelTensor, ModelTensors, Plan, Row, Segment, Span,
+};
 use cuda_core::CudaStream;
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 // The Q8_0 block `q8_0_planes` packs; the gate binaries name it through here.
 pub use gguf::quant::Q8Block;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -170,34 +173,47 @@ impl Weights {
         Weights::load_where(stream, split, |name| keep.contains(name))
     }
 
-    /// Upload every segment `plan` puts on card `card`, from `split`, in the
-    /// segment's card format: a whole tensor, or an expert stack's experts
-    /// `[0, n_l)` — the stack's leading rows, which the `_sel` kernels
-    /// address as experts `0..n_l`. Segments on other devices are skipped.
-    /// A segment whose upload is not the plan's `resident_bytes` for it is an
-    /// error naming the tensor: plan and loader share one arithmetic, so a
-    /// difference means the plan is not a plan of this file. `stream`'s
-    /// context is made current first — allocations land in the calling
-    /// thread's current context, and a process with one context per card
-    /// must be on this card's.
+    /// Upload every segment `plan` puts on card `card` ([`Weights::load_rows`]
+    /// of the plan's rows).
     pub fn load_placed(
         stream: &CudaStream,
         split: &Split,
         plan: &Plan<'_>,
         card: usize,
     ) -> Result<Weights, GpuError> {
+        Weights::load_rows(stream, split, plan.model, &plan.rows, card)
+    }
+
+    /// Upload every segment of `rows` (placement rows of `model`'s tensors)
+    /// on card `card`, from `split`, in the segment's card format: a whole
+    /// tensor, or an expert stack's listed experts, their rows gathered into
+    /// one buffer in the list's order, so the `_sel` kernels address expert
+    /// `list[s]` as slot `s`. Segments on other devices are skipped; a tensor
+    /// with two segments on one card is refused. A segment whose upload is
+    /// not its `resident_bytes` is an error naming the tensor: placement and
+    /// loader share one arithmetic, so a difference means the rows are not a
+    /// placement of this file. `stream`'s context is made current first —
+    /// allocations land in the calling thread's current context, and a
+    /// process with one context per card must be on this card's.
+    pub fn load_rows(
+        stream: &CudaStream,
+        split: &Split,
+        model: &ModelTensors,
+        rows: &[Row],
+        card: usize,
+    ) -> Result<Weights, GpuError> {
         stream.context().bind_to_thread()?;
         let mut by_name = BTreeMap::new();
-        for row in &plan.rows {
-            let t = plan.model.tensors.get(row.tensor).ok_or_else(|| {
-                GpuError::shape(PLACED, format!("plan row names tensor {}", row.tensor))
+        for row in rows {
+            let t = model.tensors.get(row.tensor).ok_or_else(|| {
+                GpuError::shape(PLACED, format!("placement row names tensor {}", row.tensor))
             })?;
             for seg in row
                 .segments
                 .iter()
                 .filter(|s| s.device == Device::Card(card))
             {
-                let dw = upload_segment(stream, split, plan, t, seg)?;
+                let dw = upload_segment(stream, split, model.experts, t, seg)?;
                 if by_name.insert(t.name.clone(), dw).is_some() {
                     return Err(placed_refusal(
                         t,
@@ -328,26 +344,22 @@ fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
     GpuError::shape(PLACED, format!("tensor {}: {detail}", t.name))
 }
 
-/// Upload plan segment `seg` of tensor `t`: find the tensor in `split`,
-/// confirm it is the tensor the plan was made from, and upload the rows the
-/// segment holds, which must lead the tensor.
+/// Upload placement segment `seg` of tensor `t`, a stack of `experts` when
+/// it is one: find the tensor in `split`, confirm it is the tensor the
+/// placement was made from, and upload the rows the segment holds.
 fn upload_segment(
     stream: &CudaStream,
     split: &Split,
-    plan: &Plan<'_>,
+    experts: u64,
     t: &ModelTensor,
     seg: &Segment,
 ) -> Result<DevWeight, GpuError> {
     let Format::Card(format) = seg.format else {
         return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
     };
-    let span = seg
-        .span(t, plan.model.experts)
+    let spans = seg
+        .spans(t, experts)
         .map_err(|e| GpuError::plan(PLACED, e))?;
-    if span.rows.start != 0 {
-        let detail = format!("rows {:?} do not lead the tensor", span.rows);
-        return Err(placed_refusal(t, detail));
-    }
     let (s, info) = split
         .find(&t.name)
         .ok_or_else(|| placed_refusal(t, "is not in the split".to_string()))?;
@@ -361,9 +373,16 @@ fn upload_segment(
     let g = split
         .shard(s)
         .ok_or_else(|| placed_refusal(t, format!("shard {s} is not in the split")))?;
-    let rows = usize::try_from(span.rows.end)
-        .map_err(|_| placed_refusal(t, format!("{} rows pass usize", span.rows.end)))?;
-    let dw = upload_rows(stream, PLACED, format, info, rows, g.data(info)?)?;
+    let held: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
+    let rows =
+        usize::try_from(held).map_err(|_| placed_refusal(t, format!("{held} rows pass usize")))?;
+    let bytes = gather(g.data(info)?, &spans).ok_or_else(|| {
+        placed_refusal(
+            t,
+            format!("spans {spans:?} run past its {} file bytes", info.nbytes),
+        )
+    })?;
+    let dw = upload_rows(stream, PLACED, format, info, rows, &bytes)?;
     if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
         let detail = format!(
             "uploaded {} device bytes, the plan has {}",
@@ -373,6 +392,27 @@ fn upload_segment(
         return Err(placed_refusal(t, detail));
     }
     Ok(dw)
+}
+
+/// The file bytes of `spans` of a tensor whose bytes are `data`, one after
+/// another in span order: a borrow of `data` when the only span starts at
+/// the tensor's first byte, a gathered copy otherwise. `None` when a span
+/// runs past `data`.
+fn gather<'d>(data: &'d [u8], spans: &[Span]) -> Option<Cow<'d, [u8]>> {
+    let range = |s: &Span| -> Option<Range<usize>> {
+        Some(usize::try_from(s.bytes.start).ok()?..usize::try_from(s.bytes.end).ok()?)
+    };
+    match spans {
+        [s] if s.bytes.start == 0 => data.get(range(s)?).map(Cow::Borrowed),
+        _ => {
+            let len: u64 = spans.iter().map(|s| s.bytes.end - s.bytes.start).sum();
+            let mut out = Vec::with_capacity(usize::try_from(len).ok()?);
+            for s in spans {
+                out.extend_from_slice(data.get(range(s)?)?);
+            }
+            Some(Cow::Owned(out))
+        }
+    }
 }
 
 /// Pack and upload one file tensor in its kernel's device format.
@@ -397,9 +437,9 @@ pub fn upload_file_tensor(
     )
 }
 
-/// Pack the first `rows` rows of file tensor `t` — all of them, or an
-/// expert stack's leading experts — from `bytes` (the tensor's file bytes,
-/// or at least those rows') in card format `format`, and upload them.
+/// Pack `rows` rows of file tensor `t` — all of them, or an expert stack's
+/// listed experts, gathered — from `bytes` (those rows' file bytes, or a
+/// run starting with them) in card format `format`, and upload them.
 /// Refuses exactly where [`CardFormat::resident_bytes`] has no size for the
 /// rows, and checks the upload's device bytes against that size; `what`
 /// names the caller in both errors.

@@ -51,10 +51,10 @@ type ShardResult<'a> = (Vec<&'a [u8]>, Result<ShardLock, PlacementError>);
 
 impl<'a> HostLock<'a> {
     /// Lock the file bytes of every segment `plan` puts on the host in the
-    /// file's format whose tensor `keep` selects: an expert stack's range of
-    /// experts, or the whole tensor. Each range grows outward to whole pages,
-    /// the pages merge per shard, and one thread per shard locks them. `plan`
-    /// must be a plan of `split`'s tensors.
+    /// file's format whose tensor `keep` selects: each run of consecutive
+    /// experts of an expert stack's list, or the whole tensor. Each run grows
+    /// outward to whole pages, the pages merge per shard, and one thread per
+    /// shard locks them. `plan` must be a plan of `split`'s tensors.
     pub fn lock(
         split: &'a Split,
         plan: &Plan<'_>,
@@ -176,7 +176,6 @@ fn host_pages(
             if seg.device != Device::Host || seg.format != Format::HostFile {
                 continue;
             }
-            let span = seg.span(t, plan.model.experts)?;
             let located = split
                 .find(&t.name)
                 .and_then(|(s, info)| Some((s, info, split.shard(s)?)));
@@ -186,18 +185,20 @@ fn host_pages(
                     "is not in the split the lock maps",
                 ));
             };
-            if s != t.shard || span.bytes.end > info.nbytes {
-                return Err(PlacementError::tensor(
-                    t,
-                    format!(
-                        "the plan's shard {} and bytes {:?} are not the split's shard {s} and {} bytes",
-                        t.shard, span.bytes, info.nbytes
-                    ),
-                ));
+            for span in seg.spans(t, plan.model.experts)? {
+                if s != t.shard || span.bytes.end > info.nbytes {
+                    return Err(PlacementError::tensor(
+                        t,
+                        format!(
+                            "the plan's shard {} and bytes {:?} are not the split's shard {s} and {} bytes",
+                            t.shard, span.bytes, info.nbytes
+                        ),
+                    ));
+                }
+                let base = g.data_base() + info.offset;
+                let (a, b) = (base + span.bytes.start, base + span.bytes.end);
+                pages[s].push(a / page..b.div_ceil(page));
             }
-            let base = g.data_base() + info.offset;
-            let (a, b) = (base + span.bytes.start, base + span.bytes.end);
-            pages[s].push(a / page..b.div_ceil(page));
         }
     }
     for spans in &mut pages {

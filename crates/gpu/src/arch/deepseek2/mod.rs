@@ -44,14 +44,10 @@ use model::Tensor2;
 use model::arch::Arch;
 use model::arch::deepseek2::derived::Derived;
 use model::moe::{HostScratch, experts_into};
-use model::placement::{
-    Card, CardFormat, CardTotals, Device, Format, Host, HostTotals, Machine, ModelTensor,
-    ModelTensors, Plan, Role, Row, Segment,
-};
+use model::placement::{self, ExpertList, ModelTensor, ModelTensors, Role, Row};
 use names::LayerNames;
 use scratch::{LayerScratch, MoeDims};
 use seed::{seed_cache, seed_pattern};
-use std::num::NonZeroU64;
 use std::ops::Range;
 
 /// deepseek2's per-replay host values: the token the chain embeds and the
@@ -384,56 +380,15 @@ impl ChainBody for Body {
         n_l: usize,
     ) -> Result<Weights, GpuError> {
         let model = hybrid_tensors(file, &layers)?;
+        let n_l = u64::try_from(n_l)
+            .map_err(|_| GpuError::shape("Body::hybrid_weights", "n_l passes u64"))?;
         let rows = model
             .tensors
             .iter()
             .enumerate()
-            .map(|(i, t)| hybrid_row(i, t, model.experts, n_l))
+            .map(|(i, t)| hybrid_row(i, t, &model, n_l))
             .collect::<Result<Vec<_>, _>>()?;
-        let machine = Machine {
-            cards: vec![Card {
-                name: "hybrid load".to_string(),
-                usable_bytes: 0,
-                context_bytes: 0,
-                scratch_bytes: 0,
-                margin_bytes: 0,
-                granule_bytes: NonZeroU64::MIN,
-                layers: layers.clone(),
-                head: true,
-            }],
-            host: Host {
-                usable_bytes: 0,
-                reserves: Vec::new(),
-            },
-        };
-        let n_l_u64 = u64::try_from(n_l)
-            .map_err(|_| GpuError::shape("Body::hybrid_weights", "n_l passes u64"))?;
-        let plan = Plan {
-            model: &model,
-            machine: &machine,
-            ctx_max: 0,
-            rows,
-            cards: vec![CardTotals {
-                dense_bytes: 0,
-                expert_bytes: 0,
-                rounding_bytes: 0,
-                experts: 0,
-                kv_bytes: 0,
-                scratch_bytes: 0,
-                context_bytes: 0,
-                headroom_bytes: 0,
-            }],
-            host: HostTotals {
-                expert_bytes: 0,
-                experts: 0,
-                table_bytes: 0,
-                reserve_bytes: 0,
-                headroom_bytes: 0,
-            },
-            nvme_bytes: 0,
-            n_l: vec![n_l_u64; model.layers],
-        };
-        Weights::load_placed(stream, file, &plan, 0)
+        Weights::load_rows(stream, file, &model, &rows, 0)
     }
 
     /// One `Derived` serves both the derived weights and the host tier's
@@ -515,11 +470,11 @@ fn derive_blocks(
     Ok(())
 }
 
-// ------------------------------------------------------ the hybrid load plan
+// ------------------------------------------------------ the hybrid load rows
 //
-// A load plan, not a fit: `Weights::load_placed` reads its rows and segments
-// and checks each upload against the segment's `resident_bytes`; the roles are
-// the file's, and the totals and budgets a planner would fill stay zero.
+// Load rows, not a fit: `Weights::load_rows` reads their segments and checks
+// each upload against the segment's `resident_bytes`; the roles are the
+// file's, and no budget is planned.
 
 /// Every tensor of `file` in a block of `layers` or in no block, with its
 /// role, and the model's layer and expert counts.
@@ -560,70 +515,27 @@ fn hybrid_tensors(file: &Split, layers: &Range<usize>) -> Result<ModelTensors, G
     })
 }
 
-/// Tensor `t`'s placement: whole on card 0 in its card format, or — a
-/// routed stack — experts `[0, n_l)` on the card and the rest in the host
-/// file.
-fn hybrid_row(i: usize, t: &ModelTensor, experts: u64, n_l: usize) -> Result<Row, GpuError> {
+/// Tensor `t`'s load row: whole on card 0 in its card format, or — a routed
+/// stack of `model`'s — experts `[0, n_l)` on the card and the rest in the
+/// host file (the `_sel` kernels here read an id as its slot, so the card
+/// list is the id prefix).
+fn hybrid_row(i: usize, t: &ModelTensor, model: &ModelTensors, n_l: u64) -> Result<Row, GpuError> {
     let what = "Body::hybrid_weights";
-    let format = CardFormat::of(t.ty).ok_or_else(|| {
-        GpuError::shape(
+    if t.role != Role::RoutedExperts {
+        return placement::whole_on_card(i, t, 0).map_err(|e| GpuError::plan(what, e));
+    }
+    if t.dims.len() != 3 || n_l > model.experts {
+        return Err(GpuError::shape(
             what,
-            format!("tensor {} has type {} with no card format", t.name, t.ty),
-        )
-    })?;
-    let rows: u64 = t.dims[1..].iter().product();
-    let card = |rows: u64| -> Result<u64, GpuError> {
-        format.resident_bytes(t.ty, t.dims[0], rows).ok_or_else(|| {
-            GpuError::shape(
-                what,
-                format!("tensor {}: {rows} rows have no card layout", t.name),
-            )
-        })
-    };
-    let n_l = u64::try_from(n_l).map_err(|_| GpuError::shape(what, "n_l passes u64"))?;
-    let segments = if t.role == Role::RoutedExperts {
-        if t.dims.len() != 3 || t.dims[2] != experts || n_l > experts {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{} {:?} is not a stack of {experts} experts to split at {n_l}",
-                    t.name, t.dims
-                ),
-            ));
-        }
-        let per = rows / experts;
-        let mut segments = Vec::with_capacity(2);
-        if n_l > 0 {
-            segments.push(Segment {
-                device: Device::Card(0),
-                format: Format::Card(format),
-                experts: Some(0..n_l),
-                resident_bytes: card(n_l * per)?,
-            });
-        }
-        if n_l < experts {
-            segments.push(Segment {
-                device: Device::Host,
-                format: Format::HostFile,
-                experts: Some(n_l..experts),
-                resident_bytes: t.file_bytes / experts * (experts - n_l),
-            });
-        }
-        segments
-    } else {
-        vec![Segment {
-            device: Device::Card(0),
-            format: Format::Card(format),
-            experts: None,
-            resident_bytes: card(rows)?,
-        }]
-    };
-    Ok(Row {
-        tensor: i,
-        segments,
-        read_bytes: 0,
-        stage: 0,
-    })
+            format!(
+                "{} {:?} is not a stack of {} experts to split at {n_l}",
+                t.name, t.dims, model.experts
+            ),
+        ));
+    }
+    ExpertList::prefix(n_l)
+        .and_then(|on_card| placement::routed_row(i, t, 0, on_card, model))
+        .map_err(|e| GpuError::plan(what, e))
 }
 
 /// `Some(L)` for a `blk.L.*` name.

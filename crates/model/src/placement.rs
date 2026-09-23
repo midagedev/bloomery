@@ -10,10 +10,12 @@
 //! the classifier that feeds it does.
 //!
 //! Routed experts follow one rule ([`plan`]): the eligible layers of a card
-//! keep the same number of experts on it, give or take one, as the id prefix
-//! `[0, n_l)`, and the rest stay on the host — a prefix, so the `_sel` kernels
-//! need no remapping table (a slot whose id is past their expert count is left
-//! untouched).
+//! keep the same number of experts on it, give or take one — the count
+//! `n_l` — and the rest stay on the host. Which experts a layer keeps is an
+//! [`ExpertList`]: the id prefix `[0, n_l)` by default, or the layer's `n_l`
+//! hottest ids from a hot list file ([`HotList`], the `BLOOMERY_HOT_LIST`
+//! lever). The count, and so every byte total, is the same either way; only
+//! the ids change.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -22,7 +24,10 @@ use std::ops::Range;
 use gguf::GgmlType;
 
 pub mod host_lock;
+pub mod hot_list;
 pub mod workstation;
+
+pub use hot_list::HotList;
 
 /// What a tensor does in a decode step; the role decides its device.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -314,19 +319,146 @@ impl fmt::Display for Format {
     }
 }
 
+/// The experts of one routed stack that one segment holds: ascending ids,
+/// each once. The order is the slot order — a card segment uploads its
+/// experts' rows contiguously in this order, so expert `ids()[s]` sits in
+/// slot `s` — and every reader of a card stack (the loader's gather, the
+/// slot map) walks it the same way.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpertList(Box<[u32]>);
+
+impl ExpertList {
+    /// `ids` sorted, as a list of a stack of `experts`; refused when an id
+    /// repeats or is not below `experts`.
+    pub fn new(mut ids: Vec<u32>, experts: u64) -> Result<ExpertList, PlacementError> {
+        ids.sort_unstable();
+        if let Some(w) = ids.windows(2).find(|w| w[0] == w[1]) {
+            return Err(PlacementError::Experts(format!(
+                "expert {} is listed twice",
+                w[0]
+            )));
+        }
+        if let Some(&last) = ids.last().filter(|&&e| u64::from(e) >= experts) {
+            return Err(PlacementError::Experts(format!(
+                "expert {last} is not below the stack's {experts}"
+            )));
+        }
+        Ok(ExpertList(ids.into_boxed_slice()))
+    }
+
+    /// The experts `range` — the id prefix `0..n` is `range(0..n)`; refused
+    /// when an id does not fit `u32`.
+    pub fn range(range: Range<u64>) -> Result<ExpertList, PlacementError> {
+        let ids: Option<Vec<u32>> = range.clone().map(|e| u32::try_from(e).ok()).collect();
+        ids.map(|ids| ExpertList(ids.into_boxed_slice()))
+            .ok_or_else(|| PlacementError::Experts(format!("experts {range:?} pass u32")))
+    }
+
+    /// The id prefix `0..n`.
+    pub fn prefix(n: u64) -> Result<ExpertList, PlacementError> {
+        ExpertList::range(0..n)
+    }
+
+    /// The experts of `0..experts` not in this list.
+    pub fn complement(&self, experts: u64) -> Result<ExpertList, PlacementError> {
+        let mut out = Vec::new();
+        let mut held = self.0.iter().peekable();
+        for e in 0..experts {
+            let id = u32::try_from(e)
+                .map_err(|_| PlacementError::Experts(format!("expert {e} passes u32")))?;
+            if held.next_if_eq(&&id).is_none() {
+                out.push(id);
+            }
+        }
+        if let Some(e) = held.next() {
+            return Err(PlacementError::Experts(format!(
+                "expert {e} is not below the stack's {experts}"
+            )));
+        }
+        Ok(ExpertList(out.into_boxed_slice()))
+    }
+
+    /// The ids, ascending.
+    #[must_use]
+    pub fn ids(&self) -> &[u32] {
+        &self.0
+    }
+
+    /// How many experts the list holds.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `Some(n)` when the list is the id prefix `0..n`.
+    #[must_use]
+    pub fn as_prefix(&self) -> Option<u64> {
+        self.0
+            .iter()
+            .zip(0u32..)
+            .all(|(&e, i)| e == i)
+            .then(|| self.len())
+    }
+
+    /// The slot that holds `id` on a card segment of this list.
+    #[must_use]
+    pub fn slot_of(&self, id: u32) -> Option<usize> {
+        self.0.binary_search(&id).ok()
+    }
+
+    /// The list as ascending runs of consecutive ids, `[start, end)` each.
+    #[must_use]
+    pub fn runs(&self) -> Vec<Range<u64>> {
+        let mut runs: Vec<Range<u64>> = Vec::new();
+        for &e in self.0.iter() {
+            let e = u64::from(e);
+            match runs.last_mut() {
+                Some(r) if r.end == e => r.end = e + 1,
+                _ => runs.push(e..e + 1),
+            }
+        }
+        runs
+    }
+}
+
+impl IntoIterator for ExpertList {
+    type Item = u32;
+    type IntoIter = std::vec::IntoIter<u32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_vec().into_iter()
+    }
+}
+
+/// The runs, `start..end` each, comma-separated: a prefix prints as `0..n`.
+impl fmt::Display for ExpertList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, r) in self.runs().iter().enumerate() {
+            let sep = if i == 0 { "" } else { "," };
+            write!(f, "{sep}{}..{}", r.start, r.end)?;
+        }
+        Ok(())
+    }
+}
+
 /// One piece of a tensor on one device.
 #[derive(Clone, Debug)]
 pub struct Segment {
     pub device: Device,
     pub format: Format,
-    /// The experts `[start, end)` this piece holds; `None` for a tensor that is
-    /// not an expert stack.
-    pub experts: Option<Range<u64>>,
+    /// The experts this piece holds; `None` for a tensor that is not an
+    /// expert stack.
+    pub experts: Option<ExpertList>,
     pub resident_bytes: u64,
 }
 
-/// Where a segment's piece lies in its tensor, counted from the tensor's
-/// first row and first byte in the file.
+/// Where a run of a segment's piece lies in its tensor, counted from the
+/// tensor's first row and first byte in the file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Span {
     pub rows: Range<u64>,
@@ -334,33 +466,48 @@ pub struct Span {
 }
 
 impl Segment {
-    /// The rows of `t` this segment holds — all of them, or its experts' rows
-    /// of a stack of `experts` — and the file bytes those rows take.
-    pub fn span(&self, t: &ModelTensor, experts: u64) -> Result<Span, PlacementError> {
+    /// The rows of `t` this segment holds, as the tensor's contiguous runs
+    /// in slot order — all its rows in one run, or its experts' rows of a
+    /// stack of `experts`, one run per run of consecutive ids — and the file
+    /// bytes each run takes.
+    pub fn spans(&self, t: &ModelTensor, experts: u64) -> Result<Vec<Span>, PlacementError> {
         let rb = row_bytes(t)?;
-        let rows = match &self.experts {
-            None => 0..rows_of(t),
-            Some(e) => {
-                let (per, _) = per_expert(t, experts)?;
-                if e.start > e.end || e.end > experts {
-                    return Err(PlacementError::tensor(
-                        t,
-                        format!("expert range {e:?} is not inside 0..{experts}"),
-                    ));
-                }
-                e.start * per..e.end * per
-            }
-        };
-        Ok(Span {
+        let span = |rows: Range<u64>| Span {
             bytes: rows.start * rb..rows.end * rb,
             rows,
-        })
+        };
+        match &self.experts {
+            None => Ok(vec![span(0..rows_of(t))]),
+            Some(list) => {
+                let (per, _) = per_expert(t, experts)?;
+                if list.ids().last().is_some_and(|&e| u64::from(e) >= experts) {
+                    return Err(PlacementError::tensor(
+                        t,
+                        format!("experts {list} are not inside 0..{experts}"),
+                    ));
+                }
+                Ok(list
+                    .runs()
+                    .into_iter()
+                    .map(|r| span(r.start * per..r.end * per))
+                    .collect())
+            }
+        }
+    }
+
+    /// The rows of `t` this segment holds: the sum of its [`Segment::spans`].
+    pub fn rows(&self, t: &ModelTensor, experts: u64) -> Result<u64, PlacementError> {
+        Ok(self
+            .spans(t, experts)?
+            .iter()
+            .map(|s| s.rows.end - s.rows.start)
+            .sum())
     }
 
     /// The device buffers this card segment of `t` uploads, in bytes, in
     /// upload order — [`CardFormat::buffer_bytes`] of the rows it holds — or
-    /// why they cannot be derived: a segment in no card format, a span
-    /// outside the tensor, rows the upload refuses.
+    /// why they cannot be derived: a segment in no card format, experts
+    /// outside the stack, rows the upload refuses.
     pub fn buffer_bytes(&self, t: &ModelTensor, experts: u64) -> Result<Vec<u64>, PlacementError> {
         let Format::Card(format) = self.format else {
             return Err(PlacementError::tensor(
@@ -368,8 +515,7 @@ impl Segment {
                 format!("a segment as {} has no card buffers", self.format),
             ));
         };
-        let span = self.span(t, experts)?;
-        card_buffers(t, format, span.rows.end - span.rows.start)
+        card_buffers(t, format, self.rows(t, experts)?)
     }
 }
 
@@ -429,7 +575,8 @@ pub struct Plan<'a> {
     pub cards: Vec<CardTotals>,
     pub host: HostTotals,
     pub nvme_bytes: u64,
-    /// Per layer: its card holds experts `[0, n_l)`, the host the rest.
+    /// Per layer: how many experts its card holds (the ids are its routed
+    /// stacks' card [`Segment::experts`]); the host holds the rest.
     pub n_l: Vec<u64>,
 }
 
@@ -450,6 +597,12 @@ pub enum PlacementError {
     /// kernel's answer.
     #[error("host lock: {0}")]
     Host(String),
+    /// An expert list that is not one: a repeated id, an id past the stack.
+    #[error("expert list: {0}")]
+    Experts(String),
+    /// A hot list file that cannot serve this plan: the file and why.
+    #[error("hot list {path}: {detail}")]
+    HotList { path: String, detail: String },
 }
 
 impl PlacementError {
@@ -669,7 +822,7 @@ fn card_segment(
     t: &ModelTensor,
     card: usize,
     rows: u64,
-    experts: Option<Range<u64>>,
+    experts: Option<ExpertList>,
 ) -> Result<Segment, PlacementError> {
     let Some(format) = CardFormat::of(t.ty) else {
         return Err(PlacementError::tensor(
@@ -689,7 +842,7 @@ fn card_segment(
 }
 
 /// A segment that holds a tensor's file bytes where they are.
-fn in_place(device: Device, format: Format, experts: Option<Range<u64>>, bytes: u64) -> Segment {
+fn in_place(device: Device, format: Format, experts: Option<ExpertList>, bytes: u64) -> Segment {
     Segment {
         device,
         format,
@@ -775,33 +928,44 @@ fn per_expert(t: &ModelTensor, experts: u64) -> Result<(u64, u64), PlacementErro
     Ok((rows / experts, t.file_bytes / experts))
 }
 
-/// A routed stack of the layer whose card is `card` and keeps `n` experts:
-/// `[0, n)` on the card, `[n, experts)` on the host, an empty side omitted.
-fn place_routed(
+/// Row `i`, the routed stack `t` of a layer whose card is `card`: the experts
+/// `on_card` on the card, the rest on the host in the file, an empty side
+/// omitted. The one owner of a stack's split between card and host: the
+/// expert rule places by it, and so does a load that fixes its own split.
+pub fn routed_row(
     i: usize,
     t: &ModelTensor,
     card: usize,
-    n: u64,
+    on_card: ExpertList,
     model: &ModelTensors,
 ) -> Result<Row, PlacementError> {
     let (rows_per_expert, file_per_expert) = per_expert(t, model.experts)?;
+    let host = on_card.complement(model.experts)?;
     let mut segments = Vec::with_capacity(2);
-    if n > 0 {
-        segments.push(card_segment(t, card, n * rows_per_expert, Some(0..n))?);
+    if !on_card.is_empty() {
+        let rows = on_card.len() * rows_per_expert;
+        segments.push(card_segment(t, card, rows, Some(on_card))?);
     }
-    if n < model.experts {
-        let bytes = (model.experts - n) * file_per_expert;
-        segments.push(in_place(
-            Device::Host,
-            Format::HostFile,
-            Some(n..model.experts),
-            bytes,
-        ));
+    if !host.is_empty() {
+        let bytes = host.len() * file_per_expert;
+        segments.push(in_place(Device::Host, Format::HostFile, Some(host), bytes));
     }
     Ok(Row {
         tensor: i,
         segments,
         read_bytes: file_per_expert * model.experts_used,
+        stage: card,
+    })
+}
+
+/// Row `i`, the tensor `t` whole on card `card` in its card format, whatever
+/// its role — for a load that fixes its own split ([`routed_row`] places the
+/// routed stacks).
+pub fn whole_on_card(i: usize, t: &ModelTensor, card: usize) -> Result<Row, PlacementError> {
+    Ok(Row {
+        tensor: i,
+        segments: vec![card_segment(t, card, rows_of(t), None)?],
+        read_bytes: t.file_bytes,
         stage: card,
     })
 }
@@ -852,7 +1016,7 @@ fn spread(
 }
 
 /// The rows one card upload holds: a whole tensor's, or a routed stack's
-/// leading experts, as many as its layer keeps.
+/// experts, as many as its layer keeps.
 #[derive(Clone, Copy)]
 enum Held {
     Rows(u64),
@@ -923,19 +1087,36 @@ fn footprint(
     Ok(heap.taken)
 }
 
-/// Place every tensor of `model` on `machine` for a context of `ctx_max`
-/// tokens. Dense tensors go where their role says. Routed stacks follow the
-/// expert rule per card ([`spread`]): the granules the card's uploads take —
-/// dense tensors and expert prefixes, in upload order, through the card's
-/// allocator — within usable − KV − context − scratch − margin. A card whose
-/// layers cannot keep one expert keeps none; one that cannot hold even its
-/// dense tensors shows up in [`Plan::violations`], not as an error here.
+/// [`plan_with`] the hot list the `BLOOMERY_HOT_LIST` lever names, or the id
+/// prefix when it is unset ([`HotList::from_env`]).
 pub fn plan<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
 ) -> Result<Plan<'a>, PlacementError> {
+    plan_with(model, machine, ctx_max, kv, HotList::from_env()?)
+}
+
+/// Place every tensor of `model` on `machine` for a context of `ctx_max`
+/// tokens. Dense tensors go where their role says. Routed stacks follow the
+/// expert rule per card ([`spread`]): the granules the card's uploads take —
+/// dense tensors and each layer's `n_l` experts, in upload order, through the
+/// card's allocator — within usable − KV − context − scratch − margin. A card
+/// whose layers cannot keep one expert keeps none; one that cannot hold even
+/// its dense tensors shows up in [`Plan::violations`], not as an error here.
+/// The `n_l` experts of a layer are `hot`'s first `n_l` for it, or the id
+/// prefix `[0, n_l)` without `hot`.
+pub fn plan_with<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    ctx_max: u64,
+    kv: &dyn KvBytes,
+    hot: Option<&HotList>,
+) -> Result<Plan<'a>, PlacementError> {
+    if let Some(h) = hot {
+        h.check_model(model)?;
+    }
     let stages = Stages::new(model.layers, &machine.cards)?;
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut routed: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
@@ -970,9 +1151,22 @@ pub fn plan<'a>(
         kv_bytes.push(kv_card);
     }
     for (l, stacks) in routed.iter().enumerate() {
+        if stacks.is_empty() {
+            continue;
+        }
+        let on_card = match hot {
+            Some(h) => h.card_list(l, n_l[l], model.experts)?,
+            None => ExpertList::prefix(n_l[l])?,
+        };
         for &i in stacks {
-            let row = place_routed(i, &model.tensors[i], stages.of_layer[l], n_l[l], model)?;
-            rows[i] = Some(row);
+            let t = &model.tensors[i];
+            rows[i] = Some(routed_row(
+                i,
+                t,
+                stages.of_layer[l],
+                on_card.clone(),
+                model,
+            )?);
         }
     }
     let rows: Vec<Row> = rows.into_iter().flatten().collect();
@@ -1132,8 +1326,8 @@ impl Plan<'_> {
 }
 
 /// What is wrong with a tensor's segments, if anything: an expert stack must
-/// cover `0..experts` with non-empty, non-overlapping ranges; anything else is
-/// one segment with no range.
+/// hold every expert of `0..experts` exactly once, in non-empty lists;
+/// anything else is one segment with no list.
 fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<String> {
     if t.role != Role::RoutedExperts {
         return match segments {
@@ -1141,29 +1335,34 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
             _ => Some(format!("a whole tensor in {} segments", segments.len())),
         };
     }
-    let mut ranges = Vec::with_capacity(segments.len());
+    let Ok(n) = usize::try_from(experts) else {
+        return Some(format!("{experts} experts pass usize"));
+    };
+    let mut times = vec![0u32; n];
     for s in segments {
-        match &s.experts {
-            Some(r) if !r.is_empty() => ranges.push(r.clone()),
-            other => return Some(format!("an expert segment with range {other:?}")),
+        let Some(list) = s.experts.as_ref().filter(|l| !l.is_empty()) else {
+            return Some(format!("an expert segment with list {:?}", s.experts));
+        };
+        for &e in list.ids() {
+            match usize::try_from(e).ok().and_then(|e| times.get_mut(e)) {
+                Some(c) => *c += 1,
+                None => return Some(format!("segment experts {list} pass 0..{experts}")),
+            }
         }
     }
-    ranges.sort_by_key(|r| r.start);
-    let mut next = 0;
-    for r in &ranges {
-        if r.start > next {
-            return Some(format!(
-                "segments {ranges:?} put experts {next}..{} nowhere",
-                r.start
-            ));
-        }
-        if r.start < next {
-            return Some(format!(
-                "segments {ranges:?} put experts {}..{next} twice",
-                r.start
-            ));
-        }
-        next = r.end;
+    let lists: Vec<String> = segments
+        .iter()
+        .filter_map(|s| s.experts.as_ref().map(ToString::to_string))
+        .collect();
+    if let Some(e) = times.iter().position(|&c| c == 0) {
+        return Some(format!(
+            "segments [{}] put expert {e} nowhere",
+            lists.join("; ")
+        ));
     }
-    (next != experts).then(|| format!("segments {ranges:?} end at {next}, not at {experts}"))
+    let twice = times.iter().position(|&c| c > 1)?;
+    Some(format!(
+        "segments [{}] put expert {twice} twice",
+        lists.join("; ")
+    ))
 }

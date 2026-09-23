@@ -8,10 +8,13 @@
 //!
 //! - (i) segments: every segment the plan puts on the card is resident at the
 //!   plan's buffer bytes, nothing else is, and the total is the card's dense +
-//!   expert bytes (`gate_load_v41`'s check 1); the slot map read back from the
-//!   card holds, per layer, the plan's experts `[0, n_l)` in slots `0..n_l`
+//!   expert bytes (`gate_load_v41`'s check 1); the routed stacks hold Σ n_l ×
+//!   one expert's card bytes; the slot map read back from the card holds, per
+//!   layer, the layer's card experts in slots `0..n_l` in ascending id order
 //!   and the host mark on the rest, and equals the host copy the host tier
-//!   serves by.
+//!   serves by. The card experts are made here from their source alone — the
+//!   hot list `BLOOMERY_HOT_LIST` names (its first `n_l` ids of the layer), or
+//!   the id prefix `[0, n_l)` when it is unset — not from the plan's segments.
 //! - (ii) state: per layer, the body's window ring, compressed rows, index
 //!   keys and compressor state are `KvLayout`'s bytes for the layer, exactly.
 //! - (iii) image: at the decode-step sets' positions (4, 301 and 1,025) the
@@ -28,6 +31,11 @@
 //!   model's drop gives back everything but what its chain capture took from
 //!   the context (iv), the second load takes exactly what the first took, and
 //!   its drop gives back all of it.
+//! - (vi) slots: on every layer's routed stacks, at slots 0, n/2 and n − 1,
+//!   the stack's `_sel` gemv (`q3k_gemv_sel`, `q4k_gemv_sel`) is bit for bit
+//!   the plain gemv of an upload of just that slot's expert's rows from the
+//!   file — the contract `gate_p9`/`gate_q4k_sel` pin on a prefix, here on the
+//!   loaded stacks, so a list whose gather puts another expert in a slot fails.
 //!
 //! Before any upload the card is found by name and must have free what the
 //! plan puts on it besides the context; a short card refuses the run.
@@ -47,23 +55,27 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::collections::BTreeSet;
+    use std::collections::btree_map::Entry;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Instant;
 
-    use bloomery_gpu::Gpu;
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::weights::{DevWeight, Weights};
+    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, StepInput};
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
-    use bloomery_gpu_gates::{GateError, checks_failed, ref_dir_named, verdict};
-    use cuda_core::CudaStream;
+    use bloomery_gpu_gates::{
+        GateError, bits_equal, bytes_to_words, checks_failed, ref_dir_named, verdict,
+    };
+    use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
+    use gguf::quant::GgmlType;
     use model::arch::deepseek41::kv::KvLayout;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
-    use model::placement::{Device, KvBytes, Plan, workstation};
+    use model::placement::{CardFormat, Device, HotList, KvBytes, Plan, Role, workstation};
 
     /// The decode-step sets whose positions check (iii) builds: 4, where no
     /// csa group completes, and 301 and 1,025, where one does and the window
@@ -91,7 +103,9 @@ mod gate {
         let planner = Planner::from_file(&split, &inputs.hp, CTX_MAX)?;
         let specs = rope_specs_from_keys(&split)?;
         drop(split);
-        print_plan(&path, &plan);
+        let hot = HotList::from_env()?;
+        let lists = card_lists(&plan, hot)?;
+        print_plan(&path, &plan, hot);
 
         let card = &plan.machine.cards[0];
         let probe = Gpu::for_card(&card.name).map_err(|e| {
@@ -125,10 +139,12 @@ mod gate {
                 .weights()
                 .ok_or("the loaded stage carries no weights")?;
             ok &= check_segments(&plan, w);
+            ok &= check_expert_bytes(&plan, w);
         }
         {
-            let (gpu, _, body) = m.body_parts("gate_deepseek41_load")?;
-            ok &= check_slots(&plan, body, gpu.stream())?;
+            let (gpu, w, body) = m.body_parts("gate_deepseek41_load")?;
+            ok &= check_slots(&plan, &lists, hot.is_some(), body, gpu.stream())?;
+            ok &= check_sel(&plan, &lists, &path, gpu, w)?;
             ok &= check_state(&inputs.kv, body);
             ok &= check_image(&planner, &specs, body, gpu.stream())?;
         }
@@ -147,11 +163,15 @@ mod gate {
         }
         println!(
             "PASSED: gate_deepseek41_load — the gate plan's segments are resident at its bytes and \
-             the slot map is its expert prefix on the card and in the host tier; every layer's \
-             state is KvLayout's bytes; the step image at positions 4, 301 and 1025 reads back as \
-             the plan's integers and RopeTable's tables; the chain captures and a synthetic depth \
-             refuses; a second load takes what the first took and each drop gives back all but \
-             the context's capture"
+             the slot map is its card experts ({}) on the card and in the host tier, each slot's \
+             `_sel` gemv its expert's own; every layer's state is KvLayout's bytes; the step image \
+             at positions 4, 301 and 1025 reads back as the plan's integers and RopeTable's \
+             tables; the chain captures and a synthetic depth refuses; a second load takes what \
+             the first took and each drop gives back all but the context's capture",
+            hot.map_or("the id prefix".to_string(), |h| format!(
+                "hot list {}",
+                h.path()
+            ))
         );
         Ok(())
     }
@@ -174,7 +194,27 @@ mod gate {
         Ok(m)
     }
 
-    fn print_plan(path: &str, plan: &Plan<'_>) {
+    /// Each layer's card experts, ascending, from their source alone: the
+    /// hot list's first `n_l` ids of the layer, or `0..n_l` without one.
+    fn card_lists(plan: &Plan<'_>, hot: Option<&HotList>) -> Result<Vec<Vec<u32>>, GateError> {
+        let mut out = Vec::with_capacity(plan.model.layers);
+        for (l, &n) in plan.n_l.iter().enumerate() {
+            let n = usize::try_from(n)?;
+            let mut ids: Vec<u32> = match hot {
+                Some(h) => h
+                    .ranked(l)
+                    .get(..n)
+                    .ok_or_else(|| format!("the hot list has fewer than {n} ids on layer {l}"))?
+                    .to_vec(),
+                None => (0..u32::try_from(n)?).collect(),
+            };
+            ids.sort_unstable();
+            out.push(ids);
+        }
+        Ok(out)
+    }
+
+    fn print_plan(path: &str, plan: &Plan<'_>, hot: Option<&HotList>) {
         println!(
             "gate plan of {path}: {} layers, ctx_max {}",
             plan.model.layers, plan.ctx_max
@@ -208,6 +248,21 @@ mod gate {
             .map(|(a, b, n)| format!("layers {a}..{b} n_l {n}"))
             .collect();
         println!("  expert prefixes: {}", runs.join(", "));
+        match hot {
+            None => println!("  card experts: the id prefix (BLOOMERY_HOT_LIST unset)"),
+            Some(h) => {
+                let about: Vec<String> = h
+                    .provenance()
+                    .iter()
+                    .map(|(k, v)| format!("{k} {v}"))
+                    .collect();
+                println!(
+                    "  card experts: hot list {} ({}), each layer's first n_l",
+                    h.path(),
+                    about.join("; ")
+                );
+            }
+        }
     }
 
     /// The window-only and the compressed layers' ropes from the file's keys,
@@ -287,10 +342,62 @@ mod gate {
         bad.is_empty()
     }
 
+    /// Check (i), expert bytes: the routed stacks on the card hold Σ n_l × one
+    /// expert's card bytes (one expert's rows of each of the layer's routed
+    /// stacks), which is the plan's expert bytes and what is resident.
+    fn check_expert_bytes(plan: &Plan<'_>, w: &Weights) -> bool {
+        let name = &plan.machine.cards[0].name;
+        let experts = plan.model.experts;
+        let mut one: BTreeMap<usize, u64> = BTreeMap::new();
+        let (mut resident, mut bad) = (0u64, Vec::new());
+        for row in &plan.rows {
+            let t = &plan.model.tensors[row.tensor];
+            let (Role::RoutedExperts, Some(l)) = (t.role, t.layer) else {
+                continue;
+            };
+            let rows: u64 = t.dims.iter().skip(1).product();
+            let k = t.dims.first().copied().unwrap_or(0);
+            let bytes =
+                CardFormat::of(t.ty).and_then(|f| f.resident_bytes(t.ty, k, rows / experts));
+            match bytes {
+                Some(b) => *one.entry(l).or_default() += b,
+                None if plan.n_l[l] == 0 => {}
+                None => bad.push(format!("{}: one expert has no card layout", t.name)),
+            }
+            if row.segments.iter().any(|s| s.device == Device::Card(0)) {
+                resident += w.get(&t.name).map_or(0, |dw| dw.resident_bytes() as u64);
+            }
+        }
+        let want: u64 = one.iter().map(|(&l, &b)| plan.n_l[l] * b).sum();
+        let per: BTreeSet<u64> = one
+            .iter()
+            .filter(|&(&l, _)| plan.n_l[l] > 0)
+            .map(|(_, &b)| b)
+            .collect();
+        let planned = plan.cards[0].expert_bytes;
+        let pass = bad.is_empty() && want == planned && resident == want;
+        println!(
+            "check i {name} expert bytes: Σ n_l × {per:?} B per expert = {want} B, the plan's expert \
+             bytes {planned} B, resident routed stacks {resident} B: {}",
+            verdict(pass)
+        );
+        for b in &bad {
+            println!("FAIL: check i {name} expert bytes: {b}");
+        }
+        pass
+    }
+
     /// Check (i), slot map: read back from the card, each layer's row holds
-    /// the plan's experts `[0, n_l)` in slots `0..n_l` and [`HOST`] on the
-    /// rest, and the card copy is the host tier's copy entry for entry.
-    fn check_slots(plan: &Plan<'_>, body: &Body, stream: &CudaStream) -> Result<bool, GateError> {
+    /// the layer's card experts `lists[l]` in slots `0..n_l`, ascending, and
+    /// [`HOST`] on the rest, and the card copy is the host tier's copy entry
+    /// for entry.
+    fn check_slots(
+        plan: &Plan<'_>,
+        lists: &[Vec<u32>],
+        listed: bool,
+        body: &Body,
+        stream: &CudaStream,
+    ) -> Result<bool, GateError> {
         let name = &plan.machine.cards[0].name;
         let got = body.slots().buf().to_host_vec(stream)?;
         let n = usize::try_from(plan.model.experts)?;
@@ -312,12 +419,19 @@ mod gate {
             ));
         }
         for (row, l) in got.chunks(n).zip(layers.clone()) {
-            let n_l = usize::try_from(plan.n_l[l])?;
-            let want = |e: usize| u32::try_from(e).ok().filter(|_| e < n_l).unwrap_or(HOST);
+            let list = &lists[l];
+            let want = |e: usize| {
+                u32::try_from(e)
+                    .ok()
+                    .and_then(|e| list.binary_search(&e).ok())
+                    .and_then(|s| u32::try_from(s).ok())
+                    .unwrap_or(HOST)
+            };
             if let Some(e) = (0..row.len()).find(|&e| row[e] != want(e)) {
                 bad.push(format!(
-                    "layer {l}: expert {e} in {}, the plan's n_l {n_l} puts it in {}",
+                    "layer {l}: expert {e} in {}, the layer's {} card experts put it in {}",
                     show(row[e]),
+                    list.len(),
                     show(want(e))
                 ));
             }
@@ -336,8 +450,9 @@ mod gate {
         let planned: u64 = layers.clone().map(|l| plan.n_l[l]).sum();
         println!(
             "check i {name} slot map: {} layers x {n} experts, {on_card} on the card, the plan's \
-             prefixes hold {planned}, host copy {}: {}",
+             {} hold {planned}, host copy {}: {}",
             layers.len(),
+            if listed { "hot lists" } else { "prefixes" },
             if same { "equal" } else { "differs" },
             verdict(bad.is_empty())
         );
@@ -345,6 +460,118 @@ mod gate {
             println!("FAIL: check i {name} slot map: {b}");
         }
         Ok(bad.is_empty())
+    }
+
+    /// The activation column check (vi) dots, `k` values of a fixed pattern
+    /// in about [-1, 1], quantized to q8_1 on the card.
+    fn activation(gpu: &Gpu, k: usize) -> Result<Q8Act, GateError> {
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i * 7919 + 13) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let x_dev = DeviceBuffer::from_host(gpu.stream(), &x)?;
+        let mut act = Q8Act::with_k(gpu.stream(), 1, k)?;
+        gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+        Ok(act)
+    }
+
+    /// Check (vi): on every routed stack on the card, at slots 0, n/2 and
+    /// n − 1 of the layer's card experts `lists[l]`, the `_sel` gemv of the
+    /// resident stack is bit for bit the plain gemv of the listed expert's
+    /// rows uploaded alone from the file at `path`.
+    fn check_sel(
+        plan: &Plan<'_>,
+        lists: &[Vec<u32>],
+        path: &str,
+        gpu: &Gpu,
+        w: &Weights,
+    ) -> Result<bool, GateError> {
+        let name = &plan.machine.cards[0].name;
+        let stream = gpu.stream();
+        let split = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let mut acts: BTreeMap<usize, Q8Act> = BTreeMap::new();
+        let (mut pairs, mut layers, mut bad) = (0usize, BTreeSet::new(), Vec::new());
+        for row in &plan.rows {
+            let t = &plan.model.tensors[row.tensor];
+            let (Role::RoutedExperts, Some(l)) = (t.role, t.layer) else {
+                continue;
+            };
+            let list = &lists[l];
+            if list.is_empty() || !row.segments.iter().any(|s| s.device == Device::Card(0)) {
+                continue;
+            }
+            let Some(DevWeight::KQuant { w: stack, .. }) = w.get(&t.name) else {
+                bad.push(format!("{}: not resident as a K-quant stack", t.name));
+                continue;
+            };
+            let (shard, info) = split
+                .find(&t.name)
+                .ok_or_else(|| format!("{} is not in the split", t.name))?;
+            let data = split.shard(shard).ok_or("shard out of range")?.data(info)?;
+            let k = usize::try_from(info.dims[0])?;
+            let rows = usize::try_from(info.dims[1..].iter().product::<u64>())?;
+            let rpe = rows / usize::try_from(plan.model.experts)?;
+            let rb = usize::try_from(info.nbytes)? / rows;
+            let act: &Q8Act = match acts.entry(k) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(v) => v.insert(activation(gpu, k)?),
+            };
+            let mut slots = vec![0, list.len() / 2, list.len() - 1];
+            slots.dedup();
+            for s in slots {
+                let id = usize::try_from(list[s])?;
+                let own_bytes = data
+                    .get(id * rpe * rb..(id + 1) * rpe * rb)
+                    .ok_or_else(|| format!("{}: expert {id} runs past the file bytes", t.name))?;
+                let words = bytes_to_words(own_bytes);
+                let own = DeviceTensor::upload(stream, &words, rpe, words.len() / rpe)?;
+                let sel = DeviceBuffer::from_host(stream, &[u32::try_from(s)?])?;
+                let mut y_sel = DeviceBuffer::<f32>::zeroed(stream, rpe)?;
+                let mut y_own = DeviceBuffer::<f32>::zeroed(stream, rpe)?;
+                match info.ty {
+                    GgmlType::Q3_K => {
+                        gpu.enqueue_gemv_q3k_sel(stack, act, &sel, 1, rpe, &mut y_sel)?;
+                        gpu.enqueue_gemv_q3k(&own, act, &mut y_own)?;
+                    }
+                    GgmlType::Q4_K => {
+                        gpu.q4k_sel()
+                            .enqueue_gemv_q4k_sel(stream, stack, act, &sel, 1, rpe, &mut y_sel)?;
+                        gpu.enqueue_gemv_q4k(&own, act, &mut y_own)?;
+                    }
+                    ty => {
+                        bad.push(format!("{}: {ty} has no `_sel` gemv here", t.name));
+                        break;
+                    }
+                }
+                let (a, b) = (y_sel.to_host_vec(stream)?, y_own.to_host_vec(stream)?);
+                pairs += 1;
+                layers.insert(l);
+                if !bits_equal(&a, &b) {
+                    let r = a
+                        .iter()
+                        .zip(&b)
+                        .position(|(x, y)| x.to_bits() != y.to_bits());
+                    bad.push(format!(
+                        "layer {l} {} slot {s}: `_sel` differs from expert {id}'s own gemv first \
+                         at row {r:?}",
+                        t.name
+                    ));
+                }
+            }
+        }
+        let pass = bad.is_empty() && pairs > 0;
+        println!(
+            "check vi {name}: {pairs} (stack, slot) pairs on {} layers, slots 0, n/2 and n-1: the \
+             `_sel` gemv at each slot is its listed expert's own gemv bit for bit: {}",
+            layers.len(),
+            verdict(pass)
+        );
+        for b in bad.iter().take(12) {
+            println!("FAIL: check vi {name}: {b}");
+        }
+        if bad.len() > 12 {
+            println!("FAIL: check vi {name}: … and {} more", bad.len() - 12);
+        }
+        Ok(pass)
     }
 
     /// Check (ii): each layer's cache and compressor bytes, measured from the

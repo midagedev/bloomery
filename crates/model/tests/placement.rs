@@ -8,6 +8,9 @@
 //! per-type formats, the per-token read). `BLOOMERY_PLACEMENT_TABLE=1` also
 //! prints the per-tensor table.
 //!
+//! A third test pins what a hot list changes: which experts a card keeps,
+//! never how many or at what bytes.
+//!
 //! `hw_`: needs the V4.1 shards on the box (`just gate-placement`);
 //! `BLOOMERY_V41_MODEL` names another first shard. The plan inputs are this
 //! machine's figures in `model::placement::workstation`, which the GPU load
@@ -19,7 +22,7 @@ use std::ops::Range;
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
 use model::placement::{
-    self, CardFormat, Device, Format, Machine, ModelTensors, Plan, Role, workstation,
+    self, CardFormat, Device, Format, HotList, Machine, ModelTensors, Plan, Role, workstation,
 };
 
 /// One card's pinned totals, and the n_l band on the layers that can hold experts.
@@ -288,7 +291,7 @@ fn table(out: &mut String, plan: &Plan<'_>) {
                 s.resident_bytes,
                 s.experts
                     .as_ref()
-                    .map_or("-".to_string(), |e| format!("{}..{}", e.start, e.end)),
+                    .map_or("-".to_string(), ToString::to_string),
                 r.read_bytes,
                 plan.machine.cards[r.stage].name
             );
@@ -516,5 +519,122 @@ fn hw_placement_3090_a6000_cut20() {
         &kv,
         &[B_A6000, B_3090],
         &B_HOST,
+    );
+}
+
+/// A hot list moves which experts a card keeps, not how many: plan (a) with
+/// a scattered synthetic list — layer `l`'s rank `r` is expert
+/// `(7r + l) mod n_expert`, a permutation, so a card's experts fall in many
+/// runs — keeps the id-prefix plan's `n_l` and every device total (dense,
+/// expert bytes and count, rounding, headroom; host experts and bytes),
+/// breaks no invariant, and each routed stack's card segment is its layer's
+/// first `n_l` ranked ids, its host segment the rest.
+#[test]
+#[ignore = "hw: needs the V4.1 shards on the box"]
+fn hw_placement_hot_list_keeps_the_counts() {
+    let (_, model, kv) = open();
+    let machine = workstation::plan_a(model.layers);
+    let e = model.experts;
+    let mut text = format!("# n_expert\t{e}\n# order\trank\n");
+    for l in 0..model.layers as u64 {
+        let ids: Vec<String> = (0..e).map(|r| ((7 * r + l) % e).to_string()).collect();
+        let _ = writeln!(text, "{l}\t{}", ids.join(","));
+    }
+    let hot = HotList::parse("synthetic", &text).expect("the synthetic list parses");
+    let ctx = workstation::CTX_MAX;
+    let prefix = placement::plan_with(&model, &machine, ctx, &kv, None).expect("prefix plan");
+    let listed = placement::plan_with(&model, &machine, ctx, &kv, Some(&hot)).expect("list plan");
+    let mut bad: Vec<String> = listed
+        .violations()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if listed.n_l != prefix.n_l {
+        bad.push(format!(
+            "n_l {:?}, the prefix plan's {:?}",
+            listed.n_l, prefix.n_l
+        ));
+    }
+    for (c, (a, b)) in listed.cards.iter().zip(&prefix.cards).enumerate() {
+        let got = (
+            a.dense_bytes,
+            a.expert_bytes,
+            a.experts,
+            a.rounding_bytes,
+            a.headroom_bytes,
+        );
+        let want = (
+            b.dense_bytes,
+            b.expert_bytes,
+            b.experts,
+            b.rounding_bytes,
+            b.headroom_bytes,
+        );
+        if got != want {
+            bad.push(format!(
+                "card {c}: (dense, experts B, experts, rounding, headroom) {got:?}, prefix {want:?}"
+            ));
+        }
+    }
+    let (h, p) = (&listed.host, &prefix.host);
+    if (h.expert_bytes, h.experts, h.headroom_bytes)
+        != (p.expert_bytes, p.experts, p.headroom_bytes)
+    {
+        bad.push(format!(
+            "host (expert B, experts, headroom) ({}, {}, {}), prefix ({}, {}, {})",
+            h.expert_bytes,
+            h.experts,
+            h.headroom_bytes,
+            p.expert_bytes,
+            p.experts,
+            p.headroom_bytes
+        ));
+    }
+    let (mut stacks, mut runs) = (0usize, 0usize);
+    for r in &listed.rows {
+        let t = &listed.model.tensors[r.tensor];
+        let (Role::RoutedExperts, Some(l)) = (t.role, t.layer) else {
+            continue;
+        };
+        stacks += 1;
+        let n = usize::try_from(listed.n_l[l]).expect("n_l fits usize");
+        let mut want_card: Vec<u32> = hot.ranked(l)[..n].to_vec();
+        want_card.sort_unstable();
+        let mut card = Vec::new();
+        let mut host = Vec::new();
+        for s in &r.segments {
+            let ids = s.experts.as_ref().map_or(&[][..], |e| e.ids());
+            match s.device {
+                Device::Card(_) => {
+                    card.extend_from_slice(ids);
+                    runs += s.experts.as_ref().map_or(0, |e| e.runs().len());
+                }
+                Device::Host => host.extend_from_slice(ids),
+                _ => bad.push(format!("{}: a segment on {:?}", t.name, s.device)),
+            }
+        }
+        let mut want_host: Vec<u32> = (0..e as u32)
+            .filter(|id| want_card.binary_search(id).is_err())
+            .collect();
+        want_host.sort_unstable();
+        if card != want_card || host != want_host {
+            bad.push(format!(
+                "{}: card {} ids, host {} ids, the list's {n} and the rest",
+                t.name,
+                card.len(),
+                host.len()
+            ));
+        }
+    }
+    println!(
+        "hot list plan (a): {stacks} routed stacks, their card segments in {runs} runs; n_l, card \
+         and host totals as the prefix plan's; {} failures",
+        bad.len()
+    );
+    assert!(
+        bad.is_empty(),
+        "hot list plan: {} failures\n  {}",
+        bad.len(),
+        bad.join("\n  ")
     );
 }

@@ -389,5 +389,8 @@ unconditionally; a timing arm whose `time` rows cover two positions each),
 `BLOOMERY_STEP_STATS=1` (`generate_ds41`: a `stat step` line per generated
 step, host-tier `HybridStats` deltas, `getrusage` page faults and the card's
 `cuMemGetInfo` free bytes (`vram_free`), and a `stat summary` with
-`vram_free_load` and `vram_free_min`; unset, nothing is read).
+`vram_free_load` and `vram_free_min`; unset, nothing is read),
+`BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
+each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
+same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
 Each is read once, at first use.

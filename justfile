@@ -410,6 +410,11 @@ check-int-twins *ARGS:
 trace-router CORPUS *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
 
+# 라우터 세트들을 합쳐 층마다 뜨거운 expert를 순위대로 적은 목록(B12)을 $BLOOMERY_DATA/router/<OUT>에 쓴다. 적재는
+# BLOOMERY_HOT_LIST=<그 경로>로 이 목록의 앞 n_l개를 카드에 둔다. N은 어느 플랜의 n_l보다도 커야 한다(384 = 전체 순위).
+hotlist N='384' OUT='hotlist-384.txt' *SETS='code prose korean threads':
+    ./tools/box.sh 'D=$BLOOMERY_DATA/router && python3 tools/ref/router-hotlist.py $(for s in {{SETS}}; do printf "%s " "$D/$s"; done) --n {{N}} --out "$D/{{OUT}}"'
+
 # ik 트리 하나의 wikitext-2 퍼플렉서티(c2048, 4청크, CPU만)를 서빙하는 V4.1 파일로 CPU 임대 아래서 잰다.
 # 두 트리를 연달아 돌리면 포트의 A/B다. ARGS: --chunks N.
 # 그 밖의 ARGS: --ctx N, --batch N, --ubatch N, --kld-base(KLD 기준 파일을 쓴다), --kld <기준 태그>(그 파일에 대한 KLD) — 러너 머리글.
