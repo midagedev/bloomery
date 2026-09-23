@@ -62,6 +62,24 @@
 //! load, the capture and the fed ids); a replayed step allocates nothing,
 //! so `vram_free` staying there is the expected line. Unset, the stat path
 //! does not run: no read, no call.
+//!
+//! `BLOOMERY_DRAFT=lookup` serves an n-gram lookup draft
+//! (`bloomery_gpu_gates::draft::Lookup`, fed the fed ids and every emitted
+//! token) through the skewed two-row pass. A pass with a proposal `d` runs
+//! `step_pair(next, d)`: row A's argmax equal to `d` accepts both rows' tokens
+//! (two positions), otherwise the second position is taken back and row A's
+//! token alone is emitted (one position). A pass with no proposal is one
+//! `step`. Greedy either way, so the `tokens` line equals the plain run's;
+//! the last pass may overshoot `-n` by one, and the lines print the first
+//! `-n` tokens. The run needs `--ctx` to hold that one extra position. Its
+//! lines differ from the plain path's only where the lever is: `time pass`
+//! rows (`positions=`, `kind=plain|pair-accept|pair-reject`) instead of
+//! `time step`, a `draft summary`, and the `SMOKE` line's trailing
+//! `positions=` and `tok/s(positions)=`, the positions the kept passes
+//! advanced over their summed wall time. The pair pass's head and capture
+//! are made before the prompt by one pair at position 0 and a `reset`, as
+//! the step's capture is. `BLOOMERY_STEP_STATS` reads once per pass;
+//! `BLOOMERY_STEP_PAIR` is refused with it.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -81,6 +99,7 @@ mod drive {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
+    use bloomery_gpu_gates::draft::Lookup;
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
@@ -293,6 +312,7 @@ mod drive {
 
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
+        let draft = draft_lever()?;
         let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
         let pinned = pin_main && threads::pool().pin_caller();
         let (ids, prompt_len) = fed_ids(&a)?;
@@ -303,6 +323,22 @@ mod drive {
         if fed > a.ctx {
             return Err(format!(
                 "depth {depth} + {} fed tokens exceed --ctx {}",
+                a.n_gen - 1,
+                a.ctx
+            )
+            .into());
+        }
+        if draft && a.n_gen < 2 {
+            return Err(
+                "BLOOMERY_DRAFT=lookup with -n 1 has no pass to draft: token 0 comes \
+                        out of the prompt's own step"
+                    .into(),
+            );
+        }
+        if draft && fed + 1 > a.ctx {
+            return Err(format!(
+                "BLOOMERY_DRAFT=lookup: depth {depth} + {} fed tokens and the last pair's \
+                 overshoot exceed --ctx {}",
                 a.n_gen - 1,
                 a.ctx
             )
@@ -343,7 +379,28 @@ mod drive {
             // Captured before the prompt, so the first timed step is a replay.
             println!("capture graph_nodes={}", m.capture_step()?);
         }
-        decode(&mut m, &a, &ids, prompt_len)
+        if draft {
+            decode_draft(&mut m, &a, &ids, prompt_len)
+        } else {
+            decode(&mut m, &a, &ids, prompt_len)
+        }
+    }
+
+    /// `BLOOMERY_DRAFT`: unset is the plain path, `lookup` the served draft;
+    /// any other value is refused, and so is `BLOOMERY_STEP_PAIR=1` beside it.
+    fn draft_lever() -> Result<bool, GateError> {
+        let on = match std::env::var("BLOOMERY_DRAFT") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(v) if v == "lookup" => true,
+            Ok(v) => return Err(format!("BLOOMERY_DRAFT is lookup or unset, not {v:?}").into()),
+            Err(e) => return Err(format!("BLOOMERY_DRAFT: {e}").into()),
+        };
+        if on && std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1") {
+            return Err("BLOOMERY_DRAFT=lookup drafts every pair itself; unset \
+                        BLOOMERY_STEP_PAIR, the unconditional-accept timing arm"
+                .into());
+        }
+        Ok(on)
     }
 
     /// The plan the engine is about to load: where the experts sit.
@@ -377,6 +434,23 @@ mod drive {
         }
     }
 
+    /// Feed `ids` untimed, one real step per id, print the `fed` and
+    /// `step 0` lines, and return the first generated token.
+    fn feed(m: &mut Deepseek41Model, ids: &[u32], prompt_len: usize) -> Result<u32, GateError> {
+        let depth = ids.len();
+        let head: Vec<u32> = ids.iter().copied().take(4).collect();
+        let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
+        println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
+        let t = Instant::now();
+        let next = m.step(ids)?;
+        println!(
+            "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
+            m.pos() - 1,
+            t.elapsed().as_secs_f64()
+        );
+        Ok(next)
+    }
+
     /// Feed `ids` untimed, then the N − 1 feedback steps, timed when asked;
     /// every line after the loop.
     fn decode(
@@ -386,16 +460,7 @@ mod drive {
         prompt_len: usize,
     ) -> Result<(), GateError> {
         let depth = ids.len();
-        let head: Vec<u32> = ids.iter().copied().take(4).collect();
-        let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
-        println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
-        let t = Instant::now();
-        let mut next = m.step(ids)?;
-        println!(
-            "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
-            m.pos() - 1,
-            t.elapsed().as_secs_f64()
-        );
+        let mut next = feed(m, ids, prompt_len)?;
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(a.n_gen - 1);
         let mut tokens: Vec<u32> = Vec::with_capacity(a.n_gen);
         tokens.push(next);
@@ -454,6 +519,172 @@ mod drive {
             );
         }
         Ok(())
+    }
+
+    /// What one draft pass ran, and so how many positions it advanced.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PassKind {
+        /// No proposal: one `step`.
+        Plain,
+        /// Row A's argmax was the draft: both rows' tokens kept.
+        Accept,
+        /// Row A's argmax was not the draft: the second position taken back.
+        Reject,
+    }
+
+    impl PassKind {
+        fn name(self) -> &'static str {
+            match self {
+                PassKind::Plain => "plain",
+                PassKind::Accept => "pair-accept",
+                PassKind::Reject => "pair-reject",
+            }
+        }
+
+        fn positions(self) -> usize {
+            if self == PassKind::Accept { 2 } else { 1 }
+        }
+    }
+
+    /// `decode` under `BLOOMERY_DRAFT=lookup`: passes until `-n` tokens are
+    /// out, each timed around the proposal, the pass and the lookup's update.
+    fn decode_draft(
+        m: &mut Deepseek41Model,
+        a: &Args,
+        ids: &[u32],
+        prompt_len: usize,
+    ) -> Result<(), GateError> {
+        // The pair pass's second head and, in graph mode, its capture are
+        // made by the first pair: one here, then back to the fresh context,
+        // so no timed pass pays for them.
+        m.step_pair(ids[0], ids[0])?;
+        m.reset()?;
+        if a.mode == StepMode::Graph {
+            println!("capture pair_graph_nodes={}", m.pair_graph_nodes()?.len());
+        }
+        let depth = ids.len();
+        let first = feed(m, ids, prompt_len)?;
+        let mut next = first;
+        let mut look = Lookup::new();
+        for &t in ids {
+            look.push(t);
+        }
+        look.push(next);
+        // (position the token is the argmax after, token), past token 0.
+        let mut emitted: Vec<(u32, u32)> = Vec::with_capacity(a.n_gen);
+        let mut passes: Vec<(PassKind, f64)> = Vec::with_capacity(a.n_gen - 1);
+        let stats_on = std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1");
+        let mut probes: Vec<Probe> = Vec::new();
+        if stats_on {
+            probes.reserve_exact(a.n_gen);
+            probes.push(Probe::read(m)?);
+        }
+        while emitted.len() + 1 < a.n_gen {
+            let t0 = Instant::now();
+            let pos = m.pos();
+            let kind = match look.propose() {
+                Some(d) => {
+                    let [ta, tb] = m.step_pair(next, d)?;
+                    if ta == d {
+                        emitted.extend_from_slice(&[(pos, ta), (pos + 1, tb)]);
+                        next = tb;
+                        PassKind::Accept
+                    } else {
+                        m.rollback(m.pos() - 1)?;
+                        emitted.push((pos, ta));
+                        next = ta;
+                        PassKind::Reject
+                    }
+                }
+                None => {
+                    next = m.step(&[next])?;
+                    emitted.push((pos, next));
+                    PassKind::Plain
+                }
+            };
+            let fresh = kind.positions();
+            for &(_, t) in &emitted[emitted.len() - fresh..] {
+                look.push(t);
+            }
+            passes.push((kind, t0.elapsed().as_secs_f64() * 1e3));
+            if stats_on {
+                probes.push(Probe::read(m)?);
+            }
+        }
+        let warm = a.warm.unwrap_or(0);
+        if warm >= passes.len() {
+            return Err(format!(
+                "--warm {warm} leaves no timed pass of the {} this run took",
+                passes.len()
+            )
+            .into());
+        }
+        print_draft_rows(a, first, &emitted, &passes);
+        if stats_on {
+            print_stats(&probes, warm);
+        }
+        print_draft_summary(a, &passes, prompt_len, depth);
+        Ok(())
+    }
+
+    /// The `step` lines of the first `-n` tokens, the `time pass` rows when
+    /// timed, and the `tokens` line, capped at `-n`.
+    fn print_draft_rows(a: &Args, first: u32, emitted: &[(u32, u32)], passes: &[(PassKind, f64)]) {
+        let kept = &emitted[..a.n_gen - 1];
+        for (k, (pos, tok)) in kept.iter().enumerate() {
+            println!("step {} {pos} {tok}", k + 1);
+        }
+        if a.timed {
+            let warm = a.warm.unwrap_or(0);
+            for (k, (kind, ms)) in passes.iter().enumerate() {
+                let i = k + 1;
+                let tag = if i <= warm { " warm" } else { "" };
+                println!(
+                    "time pass {i}{tag} ms={ms:.4} positions={} kind={}",
+                    kind.positions(),
+                    kind.name()
+                );
+            }
+        }
+        let tokens: Vec<u32> = std::iter::once(first)
+            .chain(kept.iter().map(|&(_, t)| t))
+            .collect();
+        println!("tokens {tokens:?}");
+    }
+
+    /// The `draft summary` over every pass (the rate over the passes past
+    /// `--warm`), then the `SMOKE` footer when timed: `generate`'s keys over
+    /// the kept passes, then `positions=` and `tok/s(positions)=`.
+    fn print_draft_summary(a: &Args, passes: &[(PassKind, f64)], prompt_len: usize, depth: usize) {
+        let warm = a.warm.unwrap_or(0);
+        let proposals = passes.iter().filter(|p| p.0 != PassKind::Plain).count();
+        let accepts = passes.iter().filter(|p| p.0 == PassKind::Accept).count();
+        let positions: usize = passes.iter().map(|p| p.0.positions()).sum();
+        let kept = &passes[warm..];
+        let kept_positions: usize = kept.iter().map(|p| p.0.positions()).sum();
+        let kept_ms: f64 = kept.iter().map(|p| p.1).sum();
+        let rate = kept_positions as f64 * 1e3 / kept_ms;
+        println!(
+            "draft summary proposals={proposals} accepts={accepts} positions={positions} \
+             passes={} tok/s(positions)={rate:.2}",
+            passes.len()
+        );
+        if a.timed {
+            let mut sorted: Vec<f64> = kept.iter().map(|p| p.1).collect();
+            sorted.sort_by(f64::total_cmp);
+            let p50 = sorted[sorted.len() / 2];
+            let mean = kept_ms / kept.len() as f64;
+            println!(
+                "SMOKE mode={} place={} prompt_tokens={prompt_len} depth={depth} generated={} \
+                 warm={warm} steps={} p50_ms={p50:.4} mean_ms={mean:.4} tok/s(p50)={:.2} \
+                 positions={kept_positions} tok/s(positions)={rate:.2}",
+                mode_name(a.mode),
+                a.place.name(),
+                a.n_gen,
+                kept.len(),
+                1e3 / p50
+            );
+        }
     }
 
     /// The counters one `BLOOMERY_STEP_STATS` read takes: the host tier's

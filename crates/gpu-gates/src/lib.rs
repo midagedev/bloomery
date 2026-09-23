@@ -13,6 +13,7 @@
 //! judged at the block layer, not here (docs/gpu-design.md decision 3).
 
 pub mod block;
+pub mod draft;
 pub mod ds41_meta;
 pub mod engine;
 pub mod ik_norm;

@@ -686,6 +686,13 @@ run-ds41-ppl TAG:
 gen-ds41 *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/gpu-gate.sh generate_ds41 --place gate {{ARGS}}'
 
+# The served draft, bit for bit (3090, placement gate): generate_ds41 under BLOOMERY_DRAFT=lookup must emit the plain
+# run's tokens. Two prompts, both arms each, -n 64: the lcg depth-6 sequence, and the first 128 ids of the code corpus.
+# Red unless each prompt's two `tokens` lines are identical and the code prompt's draft arm proposed at least once.
+# Four loads, each its own tools/gpu-gate.sh run: the gate compares the CLI's two arms as shipped; logs in target/draft-gate/.
+gate-gpu-ds41-draft:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/draft-gate && rm -rf $D && mkdir -p $D && C=$(head -n 128 "$BLOOMERY_DATA/engram/corpus-code.ids" | paste -sd, -) && bash tools/gpu-gate.sh generate_ds41 --place gate --depth 6 -n 64 > $D/lcg-plain.log && BLOOMERY_DRAFT=lookup bash tools/gpu-gate.sh generate_ds41 --place gate --depth 6 -n 64 > $D/lcg-draft.log && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-plain.log && BLOOMERY_DRAFT=lookup bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$C" -n 64 > $D/code-draft.log && grep -h "^draft summary " $D/lcg-draft.log $D/code-draft.log && for p in lcg code; do grep "^tokens " $D/$p-plain.log > $D/$p-plain.tok && grep "^tokens " $D/$p-draft.log > $D/$p-draft.tok && echo "$p plain $(cat $D/$p-plain.tok)" && echo "$p draft $(cat $D/$p-draft.tok)" && cmp $D/$p-plain.tok $D/$p-draft.tok && echo "$p: tokens identical" ; done && cmp -s $D/lcg-plain.tok $D/lcg-draft.tok && cmp -s $D/code-plain.tok $D/code-draft.tok && grep -Eq "^draft summary proposals=[1-9]" $D/code-draft.log && echo "gate-gpu-ds41-draft: PASS"'
+
 # The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
 time-gpu-ds41 *ARGS:
