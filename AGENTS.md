@@ -397,6 +397,16 @@ else the second position is taken back and row A's token stands; a step with no 
 `step`; the `tokens` line is the plain run's and `just gate-gpu-ds41-draft` pins that; `time pass …
 positions=1|2 kind=…` rows and a `draft summary` line replace the `time step` rows, which
 `tools/ref/depth-ds41.sh` reads; refused together with `BLOOMERY_STEP_PAIR=1`),
+`BLOOMERY_HOST_POPULATE=0` (gpu placed load, default 1: do not read the plan's host set in with
+`MADV_POPULATE_READ` at load — the fresh-fault arm; the gate prints `host_populate=`; today the V4.1
+host tier reads through a second `Split::open` (`gpu-deepseek41 body.rs`), so the populate warms the
+page cache but not the step threads' page tables — the single-mapping round closes that),
+`BLOOMERY_HOST_LOCK=1` (default 0: after populating, `mlock` the host set for the model's life;
+`gate-gpu-load-v41-lock` runs with it; an `RLIMIT_MEMLOCK` refusal is an error that names the limit),
+`BLOOMERY_CARD_DONTNEED=0` (default 1: keep the file pages of uploaded card segments in the page
+cache; on, each segment's pages are dropped right after its upload, inward-rounded, `token_embd` and
+the engram table excepted — with a 196 GB host set and 48 GB of cards the machine's 264 GB does not
+hold both, measured: populate then failed residency by 846 pages),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
