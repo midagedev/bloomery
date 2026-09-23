@@ -27,11 +27,13 @@
 //!
 //! One step ([`ChainBody::enqueue_chain`]), in the order the dump's nodes
 //! fix: the attention piece's gather of the step words; the embedding
-//! broadcast into the streams and layer 0's input; each engram site's
-//! token-only work; then per layer the engram step where the layer carries a
-//! site, the attention sub-layer and the MoE sub-layer, whose HC_POST folds
-//! the next sub-layer's input except before an engram layer and after the
-//! last layer; last the streams' collapse into the head. The host half of a
+//! broadcast into the streams and layer 0's input; then per layer the engram
+//! step where the layer carries a site, the attention sub-layer and the MoE
+//! sub-layer, whose HC_POST folds the next sub-layer's input except before an
+//! engram layer and after the last layer; last the streams' collapse into the
+//! head. Each engram site's token-only work runs in the host-leg shadow of the
+//! MoE sub-layer before the site's layer: it reads the step image alone, and
+//! the site's engram step is its first reader. The host half of a
 //! step ([`ChainBody::decode_input`]) plans it, reads its embedding and
 //! engram rows from the file and builds its image.
 //!
@@ -56,8 +58,8 @@ use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::placement::{Device, Machine, Plan, Role};
 
 use crate::chain::attn::{AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo};
-use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps};
-use crate::chain::glue::{EngramStep, Glue, StepRows};
+use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps, ShadowWork};
+use crate::chain::glue::{EngramKv, EngramStep, Glue, StepRows};
 use crate::hc::HC_STREAMS;
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
@@ -185,6 +187,9 @@ struct LayerStep {
     /// The layer carries an engram site: the glue's engram step precedes its
     /// attention.
     engram: bool,
+    /// The engram site whose token-only work the layer's MoE sub-layer runs
+    /// in its host-leg shadow: the site at the next layer.
+    shadow_site: Option<usize>,
     /// Its MoE sub-layer folds the next sub-layer's input.
     folds: bool,
 }
@@ -477,7 +482,6 @@ impl Body {
             let [f0, _] = &mut *folds;
             glue.enqueue_embed(gpu, params, s0.buf_mut(), f0)?;
         }
-        glue.enqueue_engram_kv(gpu, w, params)?;
         for (i, (l, step)) in layers.clone().zip(steps.iter()).enumerate() {
             if step.engram {
                 let (streams, out) = ping(hc, s);
@@ -540,7 +544,21 @@ impl Body {
             {
                 let (streams_in, streams_out) = ping(hc, s);
                 let (fold_in, fold_out) = ping(folds, f);
-                ffn.enqueue(
+                let mut engram_kv = step.shadow_site.map(|layer| EngramKv {
+                    glue: &mut *glue,
+                    w,
+                    params: &*params,
+                    layer,
+                });
+                let mut one: [&mut dyn ShadowWork; 1];
+                let shadow: &mut [&mut dyn ShadowWork] = match engram_kv.as_mut() {
+                    Some(job) => {
+                        one = [job as &mut dyn ShadowWork];
+                        &mut one
+                    }
+                    None => &mut [],
+                };
+                ffn.enqueue_shadowed(
                     gpu,
                     w,
                     CardStacks::of(w, l)?,
@@ -553,6 +571,7 @@ impl Body {
                     },
                     &mut *hybrid,
                     l,
+                    shadow,
                 )?;
             }
             s ^= 1;
@@ -900,9 +919,10 @@ impl ChainBody for Body {
 /// indexer layer scores the keys of a layer that runs before it (or is it)
 /// and holds them; an engram step precedes exactly the layers the glue has
 /// sites at, none of them the first, whose attention input the embedding
-/// broadcast writes; and the MoE sub-layer folds the next input everywhere
-/// except before an engram layer and after the last layer, where the glue
-/// folds instead.
+/// broadcast writes, and the layer before each such site runs the site's
+/// token-only work in its MoE sub-layer's shadow; and the MoE sub-layer folds
+/// the next input everywhere except before an engram layer and after the last
+/// layer, where the glue folds instead.
 fn layer_steps(
     hp: &Hparams,
     layers: &Range<usize>,
@@ -1019,6 +1039,7 @@ fn layer_steps(
             rows,
             list,
             engram,
+            shadow_site: (l + 1 < layers.end && sites.contains(&(l + 1))).then_some(l + 1),
             folds,
         });
     }

@@ -12,7 +12,11 @@
 //!   batches per layer, nothing else; a replay of the captured step on the
 //!   step4 set's injected state, and on the d1 set's (every indexer layer
 //!   selecting), is bit-identical to an eager run of it (the logits and every
-//!   cache, compressed row, index key and compressor state).
+//!   cache, compressed row, index key and compressor state). And each
+//!   layer's host-leg shadow — the kernels between its go and its wait, read
+//!   in stream order off a capture of the engine's chain — holds exactly the
+//!   MoE piece's own shadow work and, on the layer before each engram site,
+//!   that site's token-only work; none of that work runs outside a shadow.
 //! - `--sets` (G1): the decode-step sets `step4` (position 4) and `d1n`
 //!   (position 301, no selection). The state a set's prefill left — each
 //!   layer's window ring (the last window of ik's raw cache), each
@@ -110,6 +114,7 @@ mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HostExperts;
     use bloomery_gpu::model::ChainBody;
+    use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, Seam};
     use bloomery_gpu_deepseek41::chain::attn::AttnChain;
@@ -799,9 +804,398 @@ mod gate {
             all_same &= same;
         }
 
+        let ok_shadow = {
+            let (gpu, w, body) = m.body_parts("structure")?;
+            shadow_sets(gpu, w, body, head, hp)?
+        };
+
         let (gpu, _, body) = m.body_parts("structure")?;
         piece_modules(gpu, body, hp, split)?;
-        Ok(ok_nodes && all_same)
+        Ok(ok_nodes && all_same && ok_shadow)
+    }
+
+    // --------------------------------------------------------- shadow sets
+
+    /// The MoE piece's own work in a layer's host-leg shadow, in stream
+    /// order, with card experts: HC_PRE, the routed gate·up, h's q8_1, the
+    /// routed down, the shared expert's gate·up and down.
+    const SHADOW_CARD: [&str; 6] = [
+        "ds41_hc_pre",
+        "ds41_expert_gate_up",
+        "q3k_quantize_q8_1",
+        "q4k_gemv_sel",
+        "ds41_shexp_gate_up",
+        "q8_0_gemv",
+    ];
+    /// The same without card experts.
+    const SHADOW_HOST: [&str; 3] = ["ds41_hc_pre", "ds41_shexp_gate_up", "q8_0_gemv"];
+    /// One engram site's token-only work: its rows dequantized, `engram_wkv`,
+    /// the key norm. It reads the step image and weights alone.
+    const ENGRAM_KV: [&str; 3] = ["ds41_glue_engram_rows", "q8_0_gemv", "ds41_engram_key_norm"];
+
+    /// One node of a captured step, as the driver reports it.
+    #[derive(Debug)]
+    enum StepNode {
+        Kernel(String),
+        /// A stream memory-operation batch and its operation count.
+        Memop(u32),
+        Other(String),
+    }
+
+    /// Where a node of the step sits against the layers' go and wait
+    /// batches.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Region {
+        /// Before the first layer's go.
+        Head,
+        /// Between layer `l`'s go and its wait: the host leg's shadow.
+        Shadow(usize),
+        /// After layer `l`'s wait, before the next go (or the step's end).
+        After(usize),
+        /// A go or a wait batch itself.
+        Batch,
+    }
+
+    fn drv(rc: sys::CUresult, what: &str) -> Result<(), GateError> {
+        if rc == sys::cudaError_enum_CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{what}: CUresult {rc}").into())
+        }
+    }
+
+    /// The step's nodes in stream order. The engine's own chain is captured
+    /// on its stream (the host tier sees a capture and serves nothing), and
+    /// the template is walked from its one root along its edges, then
+    /// destroyed without being instantiated: a single-stream capture is a
+    /// chain, so the walk is the enqueue order, whatever order
+    /// `cuGraphGetNodes` lists the nodes in.
+    fn step_order(
+        gpu: &Gpu,
+        w: &Weights,
+        body: &mut Body,
+        head: &mut Head,
+    ) -> Result<Vec<StepNode>, GateError> {
+        let hs = gpu.stream().cu_stream();
+        // SAFETY: `hs` is the engine's live stream, which is not capturing
+        // (every capture before this one ended).
+        let rc = unsafe {
+            sys::cuStreamBeginCapture_v2(
+                hs,
+                sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+        };
+        drv(rc, "cuStreamBeginCapture_v2")?;
+        let enqueued = body.enqueue_chain(gpu, w, head);
+        let mut graph: sys::CUgraph = std::ptr::null_mut();
+        // SAFETY: the stream is capturing (begun above); this ends it on
+        // every path and writes the template, or null, into `graph`.
+        let ended = unsafe { sys::cuStreamEndCapture(hs, &mut graph) };
+        let order = match enqueued {
+            Err(e) => Err(e.into()),
+            Ok(()) => drv(ended, "cuStreamEndCapture").and_then(|()| walk(graph)),
+        };
+        if !graph.is_null() {
+            // SAFETY: a non-null handle from the end of the capture is a
+            // template, destroyed exactly once here.
+            unsafe { sys::cuGraphDestroy(graph) };
+        }
+        order
+    }
+
+    /// `graph`'s nodes from its one root along its one-successor edges; a
+    /// template that is not a chain is refused.
+    fn walk(graph: sys::CUgraph) -> Result<Vec<StepNode>, GateError> {
+        let mut total = 0usize;
+        // SAFETY: a null array asks only for the count.
+        let rc = unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut total) };
+        drv(rc, "cuGraphGetNodes")?;
+        let mut roots = 0usize;
+        // SAFETY: a null array asks only for the count.
+        let rc = unsafe { sys::cuGraphGetRootNodes(graph, std::ptr::null_mut(), &mut roots) };
+        drv(rc, "cuGraphGetRootNodes")?;
+        if roots != 1 {
+            return Err(
+                format!("the step's graph has {roots} roots; a one-stream capture has 1").into(),
+            );
+        }
+        let mut node: sys::CUgraphNode = std::ptr::null_mut();
+        // SAFETY: one slot, the count the driver just reported.
+        let rc = unsafe { sys::cuGraphGetRootNodes(graph, &mut node, &mut roots) };
+        drv(rc, "cuGraphGetRootNodes")?;
+        let mut out = Vec::with_capacity(total);
+        loop {
+            out.push(describe(node)?);
+            let mut k = 0usize;
+            // SAFETY: `node` is a node of the live template; null arrays ask
+            // only for the count.
+            let rc = unsafe {
+                sys::cuGraphNodeGetDependentNodes_v2(
+                    node,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut k,
+                )
+            };
+            drv(rc, "cuGraphNodeGetDependentNodes_v2")?;
+            match k {
+                0 => break,
+                1 => {
+                    let mut next: sys::CUgraphNode = std::ptr::null_mut();
+                    // SAFETY: one slot, the count just reported; the edge data
+                    // is not asked for.
+                    let rc = unsafe {
+                        sys::cuGraphNodeGetDependentNodes_v2(
+                            node,
+                            &mut next,
+                            std::ptr::null_mut(),
+                            &mut k,
+                        )
+                    };
+                    drv(rc, "cuGraphNodeGetDependentNodes_v2")?;
+                    node = next;
+                }
+                _ => {
+                    return Err(format!(
+                        "node {} of the step's graph has {k} successors; a one-stream capture has one",
+                        out.len() - 1
+                    )
+                    .into());
+                }
+            }
+        }
+        if out.len() != total {
+            return Err(format!(
+                "the walk from the root reached {} of the graph's {total} nodes",
+                out.len()
+            )
+            .into());
+        }
+        Ok(out)
+    }
+
+    /// A node's kind, with its kernel's entry name or its batch's operation
+    /// count.
+    fn describe(node: sys::CUgraphNode) -> Result<StepNode, GateError> {
+        let mut kind: sys::CUgraphNodeType = 0;
+        // SAFETY: `node` is a node of a live template.
+        let rc = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
+        drv(rc, "cuGraphNodeGetType")?;
+        if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL {
+            // SAFETY: all-zero is a valid value of this plain C struct
+            // (integers and nullable pointers), which the call then fills.
+            let mut p: sys::CUDA_KERNEL_NODE_PARAMS = unsafe { std::mem::zeroed() };
+            // SAFETY: `node` is a kernel node and `p` the struct the call fills.
+            let rc = unsafe { sys::cuGraphKernelNodeGetParams_v2(node, &mut p) };
+            drv(rc, "cuGraphKernelNodeGetParams_v2")?;
+            let mut name: *const std::ffi::c_char = std::ptr::null();
+            if p.func.is_null() {
+                // SAFETY: the node launches the library kernel `p.kern`, a
+                // live handle; `name` is a local the call writes.
+                let rc = unsafe { sys::cuKernelGetName(&mut name, p.kern) };
+                drv(rc, "cuKernelGetName")?;
+            } else {
+                // SAFETY: the node launches the module function `p.func`, a
+                // live handle; `name` is a local the call writes.
+                let rc = unsafe { sys::cuFuncGetName(&mut name, p.func) };
+                drv(rc, "cuFuncGetName")?;
+            }
+            if name.is_null() {
+                return Err("a kernel node whose function has no name".into());
+            }
+            // SAFETY: the driver hands back a NUL-terminated name it owns for
+            // the function's lifetime; it is copied out at once.
+            let name = unsafe { std::ffi::CStr::from_ptr(name) };
+            Ok(StepNode::Kernel(name.to_string_lossy().into_owned()))
+        } else if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP {
+            // SAFETY: all-zero is a valid value of this plain C struct (a
+            // context, a count, a nullable array pointer, flags), which the
+            // call then fills.
+            let mut p: sys::CUDA_BATCH_MEM_OP_NODE_PARAMS = unsafe { std::mem::zeroed() };
+            // SAFETY: `node` is a batch memory-operation node and `p` the
+            // struct the call fills.
+            let rc = unsafe { sys::cuGraphBatchMemOpNodeGetParams(node, &mut p) };
+            drv(rc, "cuGraphBatchMemOpNodeGetParams")?;
+            Ok(StepNode::Memop(p.count))
+        } else {
+            Ok(StepNode::Other(bloomery_gpu_gates::nodes::kind_name(kind)))
+        }
+    }
+
+    /// Each node's region: memory-operation batch `2i` is layer `layers[i]`'s
+    /// go and `2i + 1` its wait.
+    fn regions(nodes: &[StepNode], layers: &std::ops::Range<usize>) -> Vec<Region> {
+        let mut seen = 0usize;
+        nodes
+            .iter()
+            .map(|n| {
+                if matches!(n, StepNode::Memop(_)) {
+                    seen += 1;
+                    return Region::Batch;
+                }
+                match seen {
+                    0 => Region::Head,
+                    k if k % 2 == 1 => Region::Shadow(layers.start + k / 2),
+                    k => Region::After(layers.start + k / 2 - 1),
+                }
+            })
+            .collect()
+    }
+
+    /// Q1: the kernels between each layer's go and its wait — the host leg's
+    /// shadow — are exactly the table's, in order: the MoE piece's own
+    /// ([`SHADOW_CARD`] with card experts, [`SHADOW_HOST`] without) and, on
+    /// the layer before each engram site, that site's token-only work
+    /// ([`ENGRAM_KV`]), which reads the step image alone and is first read
+    /// by the site layer's engram step. Also: no engram site's token-only
+    /// work runs outside a shadow. Needs the overlap lever on (the default):
+    /// off, each wait sits right after its go and every shadow is empty.
+    fn shadow_sets(
+        gpu: &Gpu,
+        w: &Weights,
+        body: &mut Body,
+        head: &mut Head,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        if !bloomery_gpu::hybrid::levers()?.overlap {
+            return Err(
+                "the shadow-set check needs BLOOMERY_HYBRID_OVERLAP unset or 1: with the \
+                        lever off each wait sits right after its go and no layer has a shadow"
+                    .into(),
+            );
+        }
+        let layers = body.layers();
+        let nodes = step_order(gpu, w, body, head)?;
+        let at = regions(&nodes, &layers);
+        let memops: Vec<u32> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                StepNode::Memop(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        let others: Vec<&str> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                StepNode::Other(k) => Some(k.as_str()),
+                _ => None,
+            })
+            .collect();
+        let ok_shape = memops.len() == 2 * layers.len() && others.is_empty();
+        println!(
+            "shadow: walked {} nodes from the root in one chain, {} memop batches (ops: go {:?}, \
+             wait {:?}), other [{}]: {}",
+            nodes.len(),
+            memops.len(),
+            memops
+                .iter()
+                .step_by(2)
+                .collect::<std::collections::BTreeSet<_>>(),
+            memops
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .collect::<std::collections::BTreeSet<_>>(),
+            others.join(","),
+            verdict(ok_shape)
+        );
+        if !ok_shape {
+            return Ok(false);
+        }
+
+        let sites = &hp.engram.layer_ids;
+        let mut table: Vec<(Vec<&str>, Vec<usize>, bool)> = Vec::new();
+        let mut ok_table = true;
+        for l in layers.clone() {
+            let launches = body
+                .ffn_launches(l)
+                .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
+            let mut want: Vec<&str> = if launches > 7 {
+                SHADOW_CARD.to_vec()
+            } else {
+                SHADOW_HOST.to_vec()
+            };
+            if sites.contains(&(l + 1)) {
+                want.extend(ENGRAM_KV);
+            }
+            let got: Vec<&str> = nodes
+                .iter()
+                .zip(&at)
+                .filter(|&(_, r)| *r == Region::Shadow(l))
+                .filter_map(|(n, _)| match n {
+                    StepNode::Kernel(k) => Some(k.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let same = got == want;
+            if !same {
+                println!(
+                    "shadow layer={l} got=[{}] want=[{}]: FAIL",
+                    got.join(","),
+                    want.join(",")
+                );
+            }
+            ok_table &= same;
+            match table.iter_mut().find(|e| e.0 == want) {
+                Some(e) => {
+                    e.1.push(l);
+                    e.2 &= same;
+                }
+                None => table.push((want, vec![l], same)),
+            }
+        }
+        for (want, ls, same) in &table {
+            println!(
+                "shadow set=[{}] layers={}: {}",
+                want.join(","),
+                bloomery_gpu_gates::comma_list(ls),
+                verdict(*same)
+            );
+        }
+
+        // Each engram site's token-only work, found as the three kernels in a
+        // row, and where it runs.
+        let names: Vec<Option<&str>> = nodes
+            .iter()
+            .map(|n| match n {
+                StepNode::Kernel(k) => Some(k.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut found = Vec::new();
+        for i in 0..names.len().saturating_sub(ENGRAM_KV.len() - 1) {
+            if ENGRAM_KV
+                .iter()
+                .zip(&names[i..])
+                .all(|(want, got)| *got == Some(*want))
+            {
+                found.push(at[i]);
+            }
+        }
+        let outside = found
+            .iter()
+            .filter(|r| !matches!(r, Region::Shadow(_)))
+            .count();
+        let ok_engram = found.len() == sites.len() && outside == 0;
+        println!(
+            "shadow engram token-only work: {} of {} sites found, at [{}]; kernels outside every \
+             shadow: {}: {}",
+            found.len(),
+            sites.len(),
+            found
+                .iter()
+                .map(|r| match r {
+                    Region::Head => "before the first go (critical path)".to_string(),
+                    Region::Shadow(l) => format!("layer {l}'s shadow"),
+                    Region::After(l) => format!("after layer {l}'s wait (critical path)"),
+                    Region::Batch => "a memop batch".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+            outside * ENGRAM_KV.len(),
+            verdict(ok_engram)
+        );
+        Ok(ok_table && ok_engram)
     }
 
     /// The device memory a second set of pieces takes beyond its scratch:

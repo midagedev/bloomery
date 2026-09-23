@@ -8,11 +8,13 @@
 //!   embedding row, bf16 in the step image, widened to f32 into every stream
 //!   and into layer 0's attention input. The first sub-layer's `pre` is
 //!   one-hot on stream 0, so that fold is the row itself and does not run.
-//! - [`Glue::enqueue_engram_kv`], three launches per engram site, none of
+//! - [`Glue::enqueue_engram_kv_at`], three launches per engram site, none of
 //!   which reads a stream: the site's gathered rows (Q8_0 bytes in the image)
 //!   dequantized, `engram_wkv` over them (`q8_0_gemv`, f32 activations), and
-//!   the key norm. They depend on the token alone, so the step puts them in
-//!   layer 0's host-leg shadow.
+//!   the key norm. They depend on the token alone and are first read by the
+//!   site layer's engram step, so the step hands them ([`EngramKv`]) to the
+//!   MoE sub-layer of the layer before the site, whose host-leg shadow runs
+//!   them ([`ShadowWork`]).
 //! - [`Glue::enqueue_engram`], two launches at each engram layer: the gate
 //!   over the streams the previous ffn's HC_POST left (that ffn ends with
 //!   HC_POST alone), then the fold of the gated streams that the layer's
@@ -49,6 +51,7 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::StepPlan;
 
+use crate::chain::ffn::ShadowWork;
 use crate::engram_gate::{EngramGateKernels, GateArgs, KeyNormArgs, ROW};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels};
 use crate::params::ImageLayout;
@@ -217,6 +220,26 @@ pub struct EngramStep<'a> {
     pub input: &'a mut DeviceBuffer<f32>,
 }
 
+/// The token-only work of the engram site at `layer`
+/// ([`Glue::enqueue_engram_kv_at`]) as shadow work: what the step hands the
+/// MoE sub-layer of the layer before the site.
+pub struct EngramKv<'a> {
+    pub glue: &'a mut Glue,
+    /// The resident weights.
+    pub w: &'a Weights,
+    /// The step image's device copy.
+    pub params: &'a DeviceBuffer<u32>,
+    /// The site's layer.
+    pub layer: usize,
+}
+
+impl ShadowWork for EngramKv<'_> {
+    fn enqueue(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.glue
+            .enqueue_engram_kv_at(gpu, self.w, self.params, self.layer)
+    }
+}
+
 /// The glue piece: see the module comment.
 pub struct Glue {
     module: glue_kernels::LoadedModule,
@@ -378,9 +401,8 @@ impl Glue {
         Ok(())
     }
 
-    /// Enqueue every engram site's token-only work: its rows from the image
-    /// `params` dequantized, `engram_wkv` over them, and the key norm. Three
-    /// launches a site, reading no stream. Asynchronous, allocation-free,
+    /// Enqueue every engram site's token-only work, in site order
+    /// ([`Glue::enqueue_engram_kv_at`] each). Asynchronous, allocation-free,
     /// capturable.
     pub fn enqueue_engram_kv(
         &mut self,
@@ -388,51 +410,76 @@ impl Glue {
         w: &Weights,
         params: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        const WHAT: &str = "Glue::enqueue_engram_kv";
+        for s in 0..self.sites.len() {
+            let layer = self.sites[s].layer;
+            self.enqueue_engram_kv_at(gpu, w, params, layer)?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue the token-only work of the engram site at `layer`: its rows
+    /// from the image `params` dequantized, `engram_wkv` over them, and the
+    /// key norm. Three launches, reading no stream. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_engram_kv_at(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        params: &DeviceBuffer<u32>,
+        layer: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Glue::enqueue_engram_kv_at";
         let stream = gpu.stream();
         let values = self.rows * self.key_len;
         let grid = values.div_ceil(THREADS);
-        for site in &mut self.sites {
-            need(
-                WHAT,
-                "params",
-                params.len(),
-                site.at as usize + self.rows as usize * self.row_words as usize,
-            )?;
-            let prep = self
-                .module
-                .prepare_ds41_glue_engram_rows(LaunchConfig1D::new(grid, THREADS, 0))?;
-            self.module.ds41_glue_engram_rows(
-                stream,
-                &prep,
-                params,
-                site.at,
-                self.rows,
-                self.row_words,
-                self.key_len,
-                &mut site.x,
-            )?;
-            let (qs, d) = q8_0(w, &site.wkv, site.x.len(), site.kv.len())?;
-            gpu.q8f32()
-                .enqueue_q8_0_gemv(stream, qs, d, &site.x, 1, &mut site.kv)?;
-            self.engram.enqueue_key_norm(
-                stream,
-                KeyNormArgs {
-                    kv: &site.kv,
-                    gain: gain(w, &site.gain_k, HC_STREAMS * ROW)?,
-                    eps: self.eps,
-                    hc: HC_STREAMS,
-                    m: 1,
-                    kn: &mut site.kn,
-                },
-            )?;
-        }
+        let site = self
+            .sites
+            .iter_mut()
+            .find(|s| s.layer == layer)
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("layer {layer} carries no engram site"),
+            })?;
+        need(
+            WHAT,
+            "params",
+            params.len(),
+            site.at as usize + self.rows as usize * self.row_words as usize,
+        )?;
+        let prep = self
+            .module
+            .prepare_ds41_glue_engram_rows(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.ds41_glue_engram_rows(
+            stream,
+            &prep,
+            params,
+            site.at,
+            self.rows,
+            self.row_words,
+            self.key_len,
+            &mut site.x,
+        )?;
+        let (qs, d) = q8_0(w, &site.wkv, site.x.len(), site.kv.len())?;
+        gpu.q8f32()
+            .enqueue_q8_0_gemv(stream, qs, d, &site.x, 1, &mut site.kv)?;
+        self.engram.enqueue_key_norm(
+            stream,
+            KeyNormArgs {
+                kv: &site.kv,
+                gain: gain(w, &site.gain_k, HC_STREAMS * ROW)?,
+                eps: self.eps,
+                hc: HC_STREAMS,
+                m: 1,
+                kn: &mut site.kn,
+            },
+        )?;
         Ok(())
     }
 
     /// Enqueue the engram step at `layer`: the gate over `a.streams` into
     /// `a.out`, then the fold of `a.out` by `a.pre` into `a.input`. Two
-    /// launches. [`Glue::enqueue_engram_kv`] must precede it on the stream.
+    /// launches. The site's token-only work ([`Glue::enqueue_engram_kv_at`])
+    /// must precede it on the stream.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_engram(
         &mut self,

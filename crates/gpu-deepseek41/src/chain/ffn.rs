@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! norm+Q8 → router → handoff → go → HC_PRE → [gate·up → h q8_1 → down] → shared gate·up → shared down
-//!         → wait → combine+HC_POST (+ fold)
+//!         → (the caller's shadow work) → wait → combine+HC_POST (+ fold)
 //! ```
 //!
 //! - The norm writes the f32 activation into the boundary's handoff region
@@ -25,6 +25,10 @@
 //! - HC_PRE sits after the go: its result feeds only this sub-layer's HC_POST
 //!   and the next sub-layer's fold (the lag), so it runs while the host
 //!   computes. So do the card's routed experts and the shared expert.
+//! - A caller may hand the layer more work for that shadow
+//!   ([`ShadowWork`], [`FfnPiece::enqueue_shadowed`]): it is enqueued after
+//!   the piece's own and before the wait, so the join's inputs never queue
+//!   behind it.
 //! - A layer whose slot-map row holds no card expert runs no routed launch.
 //! - One launch joins (`ds41_ffn_post`, `ds41_ffn_post_streams`): the combine
 //!   ([`combine_elem`]) of the card's slots, the host's partial sum read in
@@ -35,6 +39,7 @@
 //!
 //! Launches per layer: ten kernels with card experts, seven without, and
 //! each layer's two stream memory-operation batches (go, wait); no copy.
+//! A caller's shadow work is its own and is not counted here.
 //!
 //! The piece takes the resident weights at enqueue, not at [`FfnPiece::new`]:
 //! the engine keeps its weights and its chain body apart, and the body that
@@ -65,6 +70,16 @@ use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 
 /// What the enqueue path's errors name.
 const ENQUEUE: &str = "FfnPiece::enqueue";
+
+/// Work a caller puts in a layer's host-leg shadow besides the piece's own:
+/// enqueued on the step's stream after the layer's go and the piece's own
+/// shadow work, and before the wait when the overlap lever is on (the
+/// default; off, the wait already follows the go). It must read nothing the
+/// host tier writes for the layer and write nothing the layer's join reads.
+pub trait ShadowWork {
+    /// Enqueue the work. Asynchronous, allocation-free, capturable.
+    fn enqueue(&mut self, gpu: &Gpu) -> Result<(), GpuError>;
+}
 
 /// Threads per block of the handoff and of the combine-and-HC_POST.
 const HANDOFF_THREADS: u32 = 256;
@@ -785,11 +800,38 @@ impl FfnPiece {
         hybrid: &mut Hybrid<H>,
         layer: usize,
     ) -> Result<(), GpuError> {
+        self.enqueue_shadowed(gpu, w, card, io, hybrid, layer, &mut [])
+    }
+
+    /// [`FfnPiece::enqueue`], with `extra` enqueued in order into the
+    /// layer's host-leg shadow after the piece's own shadow work
+    /// ([`ShadowWork`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue's arguments and the shadow work; the pieces take the shared buffers flat (rust-quality R8)"
+    )]
+    pub fn enqueue_shadowed<H: HostExperts>(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        card: Option<CardStacks<'_>>,
+        io: FfnIo<'_>,
+        hybrid: &mut Hybrid<H>,
+        layer: usize,
+        extra: &mut [&mut dyn ShadowWork],
+    ) -> Result<(), GpuError> {
         let (i, card) = self.check(layer, hybrid.boundary().slots(), &io, card)?;
         let lw = LayerWeights::resolve(&self.cfg[i], w, self.hc_eps, self.hc_iters)?;
         self.enqueue_handoff(gpu, i, &lw, &io, hybrid, layer)?;
         self.enqueue_shadow(gpu, i, &lw, card, &io, hybrid.boundary())?;
-        self.enqueue_join(gpu, i, io, hybrid.boundary())?;
+        for work in extra.iter_mut() {
+            work.enqueue(gpu)?;
+        }
+        let boundary = hybrid.boundary();
+        if boundary.overlap() {
+            boundary.enqueue_back(gpu.stream())?;
+        }
+        self.enqueue_join(gpu, i, io, boundary)?;
         hybrid.layer_enqueued(layer)
     }
 
@@ -957,8 +999,9 @@ impl FfnPiece {
         Ok(())
     }
 
-    /// The shadow of the host's leg: HC_PRE, the card's routed experts, the
-    /// shared expert — and, with the overlap lever on, the wait after them.
+    /// The piece's own work in the shadow of the host's leg: HC_PRE, the
+    /// card's routed experts, the shared expert. The caller's shadow work and,
+    /// with the overlap lever on, the wait follow it.
     fn enqueue_shadow(
         &mut self,
         gpu: &Gpu,
@@ -1017,9 +1060,6 @@ impl FfnPiece {
         )?;
         gpu.q8f32()
             .enqueue_q8_0_gemv(stream, lw.sh_qs, lw.sh_d, &self.sh_h, 1, &mut self.sh_y)?;
-        if boundary.overlap() {
-            boundary.enqueue_back(stream)?;
-        }
         Ok(())
     }
 
