@@ -363,7 +363,10 @@ key rows ahead a decode row prefetches, default 16; `BLOOMERY_KV_PREFETCH=0` tur
 segment count a decode row's keys are cut into for split-K, 1–32, default 32;
 the plan depends on the visible key count alone, so any thread count writes
 the same bits; 1 is the single-pass online softmax the split is banded
-against), `BLOOMERY_ATTN_HALVES=2` (attn: on a multi-query row (prefill) each
+against), `BLOOMERY_ATTN_BUNDLE=1` (attn: the per-head online
+segment kernel instead of the default head-bundle tile, which runs 8 heads
+over a split-K segment in one key walk; the same-binary arm the tile is
+banded against; a head's bits do not depend on its bundle), `BLOOMERY_ATTN_HALVES=2` (attn: on a multi-query row (prefill) each
 (token, head) row of the fused CPU dispatch runs on two threads, each
 accumulating half the latent — bit-identical, gated, and slower: both threads
 still stream every whole key row for the scores, so the default is 1; a
