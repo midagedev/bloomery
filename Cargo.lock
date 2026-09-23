@@ -106,6 +106,7 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-model",
  "cuda-core",
+ "memmap2",
  "oxide-artifacts",
 ]
 
