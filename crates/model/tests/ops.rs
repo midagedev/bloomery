@@ -708,3 +708,162 @@ fn hw_group_swiglu_matches_caller_composition() {
     check(&x1, "ne1=1 (decode)");
     check(&xall, "ne1=6 (prefill decline)");
 }
+
+/// The `_into` entries against the allocating ones: the same pairs, the
+/// weights cut through `ShardTensor` (the file opened as a one-shard split),
+/// written into caller-held blocks, give the allocating entries' outputs and
+/// pars bit for bit — on both deferral arms, at one column and at six. A
+/// clamped combine (`GroupInput::SwigluClamp`) through either entry equals
+/// the caller composition over `qdot::swiglu_clamp` bit for bit, with the
+/// limit set where it bites on both sides of `up`.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_group_into_matches_allocating_entries() {
+    use model::ops::{GroupInput, ShardTensor, matmul_q_group, matmul_q_group_into};
+    use model::ops::{matmul_q_group_swiglu, matmul_q_group_swiglu_into};
+
+    let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let split = gguf::Split::open(oracle::model_path()).unwrap();
+    let (xs, xinf) = o.load("ffn_norm-1", 0);
+    let xall = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
+    let x1 = Tensor2::from_vec(xall.ne0, 1, xall.col(0).to_vec());
+
+    let names = [
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+    ];
+    let stacks: Vec<ShardTensor> = names
+        .iter()
+        .map(|n| ShardTensor::find(&split, n).unwrap())
+        .collect();
+    let infos: Vec<&gguf::TensorInfo> = names.iter().map(|n| g.find(n).unwrap()).collect();
+    // The allocating entries' views, sliced exactly the way moe.rs's
+    // expert_view does.
+    let view = |m: usize, e: usize| {
+        model::moe::expert_view(infos[m], e, infos[m].dims[2] as usize).unwrap()
+    };
+    let experts = [0usize, 5, 17];
+    let n = experts.len();
+    let differ = |a: &[f32], b: &[f32]| {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count()
+    };
+    let blank = |like: &[Tensor2]| -> Vec<Tensor2> {
+        like.iter()
+            .map(|t| Tensor2::from_vec(t.ne0, t.ne1, vec![f32::NAN; t.data.len()]))
+            .collect()
+    };
+    let (mut hits_hi, mut hits_lo, mut hits_silu) = (0usize, 0usize, 0usize);
+    for (x, label) in [(&x1, "ne1=1"), (&xall, "ne1=6")] {
+        for (mode, arm) in [(Some(true), "deferred"), (Some(false), "pre-pass")] {
+            model::ops::set_defer_quant(mode);
+            let gu_views: Vec<gguf::TensorInfo> = experts
+                .iter()
+                .flat_map(|&e| [view(0, e), view(1, e)])
+                .collect();
+            let gu_refs: Vec<&gguf::TensorInfo> = gu_views.iter().collect();
+            let gu_xs: Vec<&Tensor2> = vec![x; 2 * n];
+            let gu = matmul_q_group(&g, &gu_refs, &gu_xs).unwrap();
+            let gu_ws: Vec<model::ops::Weight> = experts
+                .iter()
+                .flat_map(|&e| [0, 1].map(|m| stacks[m].expert(&split, e).unwrap()))
+                .collect();
+            let mut gu_into = blank(&gu);
+            matmul_q_group_into("test", &gu_ws, &gu_xs, &mut gu_into).unwrap();
+            for p in 0..2 * n {
+                assert_eq!(
+                    differ(&gu[p].data, &gu_into[p].data),
+                    0,
+                    "gate/up pair {p} ({label}, {arm}): the _into entry must equal the allocating one"
+                );
+            }
+
+            let d_views: Vec<gguf::TensorInfo> = experts.iter().map(|&e| view(2, e)).collect();
+            let d_refs: Vec<&gguf::TensorInfo> = d_views.iter().collect();
+            let d_ws: Vec<model::ops::Weight> = experts
+                .iter()
+                .map(|&e| stacks[2].expert(&split, e).unwrap())
+                .collect();
+            let plain: Vec<GroupInput> = (0..n)
+                .map(|i| GroupInput::Swiglu(&gu[2 * i], &gu[2 * i + 1]))
+                .collect();
+            let (downs, pars) = matmul_q_group_swiglu(&g, &d_refs, &plain).unwrap();
+            let (mut d_into, mut p_into) = (blank(&downs), blank(&pars));
+            matmul_q_group_swiglu_into("test", &d_ws, &plain, &mut d_into, &mut p_into).unwrap();
+            for i in 0..n {
+                assert_eq!(
+                    differ(&pars[i].data, &p_into[i].data),
+                    0,
+                    "par {i} ({label}, {arm}): the _into entry must equal the allocating one"
+                );
+                assert_eq!(
+                    differ(&downs[i].data, &d_into[i].data),
+                    0,
+                    "down {i} ({label}, {arm}): the _into entry must equal the allocating one"
+                );
+            }
+
+            // The clamp: the median |up| as the limit, so both sides of `up`
+            // and the SiLU side cross it.
+            let mut mags: Vec<f32> = (0..n)
+                .flat_map(|i| gu[2 * i + 1].data.iter().map(|v| v.abs()))
+                .collect();
+            mags.sort_by(f32::total_cmp);
+            let limit = mags[mags.len() / 2];
+            let pars_ref: Vec<Tensor2> = (0..n)
+                .map(|i| {
+                    let (gate, up) = (&gu[2 * i], &gu[2 * i + 1]);
+                    let mut data = vec![0.0f32; gate.data.len()];
+                    qdot::swiglu_clamp(&gate.data, &up.data, limit, &mut data);
+                    for (&gv, &uv) in gate.data.iter().zip(&up.data) {
+                        hits_hi += usize::from(uv > limit);
+                        hits_lo += usize::from(uv < -limit);
+                        let s = f64::from(gv) / (1.0 + (-f64::from(gv)).exp());
+                        hits_silu += usize::from(s > f64::from(limit));
+                    }
+                    Tensor2::from_vec(gate.ne0, gate.ne1, data)
+                })
+                .collect();
+            let par_refs: Vec<&Tensor2> = pars_ref.iter().collect();
+            let downs_ref = matmul_q_group(&g, &d_refs, &par_refs).unwrap();
+            let clamped: Vec<GroupInput> = (0..n)
+                .map(|i| GroupInput::SwigluClamp(&gu[2 * i], &gu[2 * i + 1], limit))
+                .collect();
+            let (c_downs, c_pars) = matmul_q_group_swiglu(&g, &d_refs, &clamped).unwrap();
+            let (mut cd_into, mut cp_into) = (blank(&downs), blank(&pars));
+            matmul_q_group_swiglu_into("test", &d_ws, &clamped, &mut cd_into, &mut cp_into)
+                .unwrap();
+            for i in 0..n {
+                for (got, what) in [(&c_pars[i], "allocating"), (&cp_into[i], "_into")] {
+                    assert_eq!(
+                        differ(&pars_ref[i].data, &got.data),
+                        0,
+                        "clamped par {i} ({label}, {arm}, {what}): must equal qdot::swiglu_clamp"
+                    );
+                }
+                for (got, what) in [(&c_downs[i], "allocating"), (&cd_into[i], "_into")] {
+                    assert_eq!(
+                        differ(&downs_ref[i].data, &got.data),
+                        0,
+                        "clamped down {i} ({label}, {arm}, {what}): must equal the caller composition"
+                    );
+                }
+            }
+        }
+    }
+    model::ops::set_defer_quant(None);
+    assert!(
+        hits_hi > 0 && hits_lo > 0 && hits_silu > 0,
+        "the limit must bite on every side (up > L {hits_hi}, up < -L {hits_lo}, silu > L {hits_silu})"
+    );
+    eprintln!(
+        "_into == allocating entries, bit for bit: {n} experts' gate/up, down and pars, plain and clamped \
+         (up > L {hits_hi}, up < -L {hits_lo}, silu > L {hits_silu}), ne1 1 and 6, both deferral arms"
+    );
+}

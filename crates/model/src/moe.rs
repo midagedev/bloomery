@@ -7,8 +7,8 @@
 //! (`matrix_row_counts`/`matrix_rows` group rows by expert before any dot runs —
 //! ggml.c:18258).
 //!
-//! The other structural line this module holds: only routed experts are read, never all
-//! 64. `docs/research/mistralrs-prior-art.md` §4.4 measures the failure mode — mistral.rs
+//! The other structural line this module holds: only routed experts are read, never the
+//! whole stack. `docs/research/mistralrs-prior-art.md` §4.4 measures the failure mode — mistral.rs
 //! dequantizes every expert per token on x86_64 — and [`last_touched_experts`] exists so
 //! the gate can keep that out of this engine.
 //!
@@ -21,14 +21,17 @@
 //! (ggml.c:18564 for the fused op, the same call for `MUL_MAT_ID`), so the quantizer is
 //! the weight type's and nothing else. `crate::ops::matmul_q` is that single owner.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
 
-use gguf::{Gguf, TensorInfo};
+use gguf::{Gguf, Split, TensorInfo};
 
 use crate::ModelError;
-use crate::ops::{GroupInput, Tensor2, matmul_q, matmul_q_group, matmul_q_group_swiglu};
+use crate::ops::{
+    GroupInput, ShardTensor, Tensor2, Weight, matmul_q, matmul_q_group, matmul_q_group_into,
+    matmul_q_group_swiglu, matmul_q_group_swiglu_into,
+};
 use crate::profile;
 
 /// Tokens grouped by the expert they were routed to.
@@ -89,10 +92,15 @@ thread_local! {
     /// (see [`MoETrace`]).
     static TRACE: RefCell<Option<MoETrace>> = const { RefCell::new(None) };
 
-    /// Bit `e` set = expert `e`'s stacked weights were actually read by the last
-    /// `moe_ffn_with` call on this thread. Set where the bytes are fetched, not where the
-    /// bucket table says they should be, so the structural gate measures reality.
-    static TOUCHED: Cell<u64> = const { Cell::new(0) };
+    /// Bit `e % 64` of word `e / 64` set = expert `e`'s stacked weights were actually
+    /// read by the last `moe_ffn_with` call on this thread. Set where the bytes are
+    /// fetched, not where the bucket table says they should be, so the structural gate
+    /// measures reality. One word per 64 experts of the file.
+    static TOUCHED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+
+    /// The one-file entry's [`HostScratch`]: its caller holds none, so the entry keeps
+    /// one per thread, made at the first call of a shape.
+    static HOST_SCRATCH: RefCell<Option<HostScratch>> = const { RefCell::new(None) };
 }
 
 /// Opt-in for the [`MoETrace`] capture: filling the trace vectors rides every
@@ -116,11 +124,21 @@ pub fn last_trace() -> Option<MoETrace> {
     TRACE.with(|t| t.borrow().clone())
 }
 
-/// The expert mask actually dequantized by the last `moe_ffn_with` call on this
-/// thread. Zero after `route_with` alone — routing reads the router, never the
-/// expert stacks.
-pub fn last_touched_experts() -> u64 {
-    TOUCHED.with(|c| c.get())
+/// The experts actually dequantized by the last `moe_ffn_with` call on this
+/// thread, ascending. Empty after `route_with` alone — routing reads the
+/// router, never the expert stacks.
+pub fn last_touched_experts() -> Vec<usize> {
+    TOUCHED.with(|t| {
+        t.borrow()
+            .iter()
+            .enumerate()
+            .flat_map(|(w, &bits)| {
+                (0..64)
+                    .filter(move |b| (bits >> b) & 1 == 1)
+                    .map(move |b| w * 64 + b)
+            })
+            .collect()
+    })
 }
 
 /// The hyperparameters this module reads from the file, never from literals.
@@ -147,7 +165,7 @@ impl Meta {
         let n_expert = get("expert_count")? as usize;
         let n_used = get("expert_used_count")? as usize;
         let ff = get("expert_feed_forward_length")? as usize;
-        if n_expert == 0 || n_used == 0 || n_used > n_expert || ff == 0 || n_expert > 64 {
+        if n_expert == 0 || n_used == 0 || n_used > n_expert || ff == 0 {
             return Err(ModelError::Shape {
                 what: "moe metadata",
                 want_ne0: 1,
@@ -428,25 +446,36 @@ struct RoutedSums {
     down_all: Vec<f32>,
 }
 
-/// Gather each routed expert's input columns and the touched mask. An empty
-/// bucket contributes nothing — an unrouted expert's bytes are never read —
-/// and the mask is set where the weights are fetched, so it counts
-/// dequantized reality, not what the bucket table implies.
+/// Clear this thread's touched mask to one word per 64 of the file's
+/// `n_expert` experts.
+fn reset_touched(n_expert: usize) {
+    TOUCHED.with(|t| {
+        let mut t = t.borrow_mut();
+        t.clear();
+        t.resize(n_expert.div_ceil(64), 0);
+    });
+}
+
+/// Gather each routed expert's input columns and mark `touched` (one bit per
+/// expert, cleared by the caller). An empty bucket contributes nothing — an
+/// unrouted expert's bytes are never read — and the mask is set where the
+/// weights are fetched, so it counts dequantized reality, not what the
+/// bucket table implies.
 fn gather_expert_inputs(
     x: &Tensor2,
     buckets: &Buckets,
     n_expert: usize,
     lvl: u8,
-) -> (Vec<usize>, Vec<Option<Tensor2>>, u64, u64) {
+    touched: &mut [u64],
+) -> (Vec<usize>, Vec<Option<Tensor2>>, u64) {
     let t_gather = if lvl > 0 { Some(Instant::now()) } else { None };
     let mut experts: Vec<usize> = Vec::new();
     let mut xbs: Vec<Option<Tensor2>> = Vec::new();
-    let mut touched = 0u64;
     for e in 0..n_expert {
         if buckets.bucket(e).is_empty() {
             continue;
         }
-        touched |= 1 << e;
+        touched[e / 64] |= 1 << (e % 64);
         let bucket = buckets.bucket(e);
         experts.push(e);
         // A bucket that is every token in order gathers a copy of `x` — always
@@ -467,7 +496,7 @@ fn gather_expert_inputs(
     } else {
         0
     };
-    (experts, xbs, touched, gather_ns)
+    (experts, xbs, gather_ns)
 }
 
 /// Phase 1 — gate and up for every routed expert AND the shared expert, one
@@ -597,8 +626,8 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     let trace = trace_on();
 
     let t_setup = if lvl > 0 { Some(Instant::now()) } else { None };
-    TOUCHED.with(|c| c.set(0));
     let meta = &plan.meta;
+    reset_touched(meta.n_expert);
     if let Some(t_setup) = t_setup {
         setup_ns += t_setup.elapsed().as_nanos() as u64;
     }
@@ -627,8 +656,8 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
         trace_ns += t_trace1.elapsed().as_nanos() as u64;
     }
 
-    let (experts, xbs, touched, gather_ns) = gather_expert_inputs(x, &buckets, meta.n_expert, lvl);
-    TOUCHED.with(|c| c.set(touched));
+    let (experts, xbs, gather_ns) = TOUCHED
+        .with(|t| gather_expert_inputs(x, &buckets, meta.n_expert, lvl, &mut t.borrow_mut()));
 
     // The routed half and the shared half are independent math: the gate/up
     // projections of both ride one group dispatch, and so do the down
@@ -713,9 +742,10 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     Ok(out)
 }
 
-/// The most experts one [`experts_into`] call takes. Its two dispatch lists
-/// live in stack arrays of this size, so the call allocates nothing of its
-/// own.
+/// The most experts one host call takes ([`experts_into`],
+/// [`HostLayer::experts_into`]). Its dispatch lists live in stack arrays of
+/// this size and [`HostScratch`] holds this many experts' blocks, so a call
+/// allocates nothing.
 pub const EXPERTS_INTO_MAX: usize = 8;
 
 /// A given list of routed experts of ONE token, weighted and summed into
@@ -728,9 +758,9 @@ pub const EXPERTS_INTO_MAX: usize = 8;
 /// by the weight type's own activation rule), one for their downs with each
 /// SwiGLU combine produced inside it. The weights are applied as given — the
 /// caller's router has already scaled them. `x` is one column of the model
-/// width and `out` holds that width; an empty list writes zeros. Nothing is
-/// allocated here beyond what the two group dispatches allocate for their
-/// outputs.
+/// width and `out` holds that width; an empty list writes zeros. The
+/// dispatches write into a per-thread [`HostScratch`], made at the first
+/// call of a shape: a steady call allocates nothing.
 pub fn experts_into(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
@@ -738,44 +768,35 @@ pub fn experts_into(
     experts: &[(u32, f32)],
     out: &mut [f32],
 ) -> Result<(), ModelError> {
-    let n = experts.len();
-    if x.ne1 != 1 || out.len() != x.ne0 || n > EXPERTS_INTO_MAX {
-        return Err(ModelError::Shape {
-            what: "experts_into: one token, out of its width, at most EXPERTS_INTO_MAX experts",
-            want_ne0: x.ne0,
-            want_ne1: EXPERTS_INTO_MAX,
-            got_ne0: out.len(),
-            got_ne1: n,
-        });
-    }
+    check_host_call(x, experts, out)?;
     out.fill(0.0);
+    let n = experts.len();
     if n == 0 {
         return Ok(());
     }
-    // The unused tails keep a placeholder view; only the first n (2n) are passed.
-    let mut gu_ws: [&TensorInfo; 2 * EXPERTS_INTO_MAX] = [&plan.gate_inp; 2 * EXPERTS_INTO_MAX];
-    let mut down_ws: [&TensorInfo; EXPERTS_INTO_MAX] = [&plan.gate_inp; EXPERTS_INTO_MAX];
+    // The plan's views are headers of `gguf`, the one file this model has.
+    let view = |views: &[TensorInfo], e: u32| -> Result<Weight<'_>, ModelError> {
+        Weight::in_file(gguf, expert_of(views, e, plan.block)?)
+    };
+    // The unused tails keep the first expert's gate; only the first n (2n)
+    // are passed.
+    let first = view(&plan.gate_views, experts[0].0)?;
+    let mut gu = [first; 2 * EXPERTS_INTO_MAX];
+    let mut down = [first; EXPERTS_INTO_MAX];
     for (i, &(e, _)) in experts.iter().enumerate() {
-        gu_ws[2 * i] = expert_of(&plan.gate_views, e, plan.block)?;
-        gu_ws[2 * i + 1] = expert_of(&plan.up_views, e, plan.block)?;
-        down_ws[i] = expert_of(&plan.down_views, e, plan.block)?;
+        gu[2 * i] = view(&plan.gate_views, e)?;
+        gu[2 * i + 1] = view(&plan.up_views, e)?;
+        down[i] = view(&plan.down_views, e)?;
     }
-    let gu_xs: [&Tensor2; 2 * EXPERTS_INTO_MAX] = [x; 2 * EXPERTS_INTO_MAX];
-    let gu = matmul_q_group(gguf, &gu_ws[..2 * n], &gu_xs[..2 * n])?;
-    let srcs: [GroupInput<'_>; EXPERTS_INTO_MAX] = std::array::from_fn(|i| {
-        if i < n {
-            GroupInput::Swiglu(&gu[2 * i], &gu[2 * i + 1])
-        } else {
-            GroupInput::Ready(x)
+    HOST_SCRATCH.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let (embd, ff) = (x.ne0, plan.meta.ff);
+        if !cell.as_ref().is_some_and(|s| s.fits(embd, ff)) {
+            *cell = Some(HostScratch::new(embd, ff));
         }
-    });
-    let (downs, _pars) = matmul_q_group_swiglu(gguf, &down_ws[..n], &srcs[..n])?;
-    for (&(_, w), d) in experts.iter().zip(&downs) {
-        for (o, &dv) in out.iter_mut().zip(d.col(0)) {
-            *o += w * dv;
-        }
-    }
-    Ok(())
+        let scratch = cell.as_mut().expect("made just above");
+        serve(&gu[..2 * n], &down[..n], None, x, experts, out, scratch)
+    })
 }
 
 /// Expert `e`'s view in one of a block plan's per-expert view lists; an id
@@ -784,4 +805,314 @@ fn expert_of(views: &[TensorInfo], e: u32, block: usize) -> Result<&TensorInfo, 
     views
         .get(e as usize)
         .ok_or_else(|| ModelError::MissingTensor(format!("expert {e} of block {block}")))
+}
+
+/// A host call's three shape conditions, each its own error: `x` is one
+/// token, `out` holds its width, and the list fits [`EXPERTS_INTO_MAX`].
+fn check_host_call(x: &Tensor2, experts: &[(u32, f32)], out: &[f32]) -> Result<(), ModelError> {
+    if x.ne1 != 1 {
+        return Err(ModelError::Shape {
+            what: "host experts: x must be one token",
+            want_ne0: x.ne0,
+            want_ne1: 1,
+            got_ne0: x.ne0,
+            got_ne1: x.ne1,
+        });
+    }
+    if out.len() != x.ne0 {
+        return Err(ModelError::Shape {
+            what: "host experts: out must hold x's width",
+            want_ne0: x.ne0,
+            want_ne1: 1,
+            got_ne0: out.len(),
+            got_ne1: 1,
+        });
+    }
+    if experts.len() > EXPERTS_INTO_MAX {
+        return Err(ModelError::Shape {
+            what: "host experts: at most EXPERTS_INTO_MAX experts",
+            want_ne0: EXPERTS_INTO_MAX,
+            want_ne1: 1,
+            got_ne0: experts.len(),
+            got_ne1: 1,
+        });
+    }
+    Ok(())
+}
+
+/// The blocks one host call writes — the gate and up outputs, the SwiGLU
+/// combines and the down outputs of up to [`EXPERTS_INTO_MAX`] experts —
+/// made once for a layer shape and held across calls, so a call allocates
+/// nothing. After a call, [`HostScratch::gate`] and its siblings read what
+/// it computed for the list's `i`-th expert.
+pub struct HostScratch {
+    embd: usize,
+    ff: usize,
+    /// `[gate_0, up_0, gate_1, up_1, ..]`, `{ff, 1}` each.
+    gate_up: [Tensor2; 2 * EXPERTS_INTO_MAX],
+    /// The combines, `{ff, 1}` each.
+    pars: [Tensor2; EXPERTS_INTO_MAX],
+    /// The down outputs, `{embd, 1}` each.
+    downs: [Tensor2; EXPERTS_INTO_MAX],
+}
+
+impl HostScratch {
+    /// Blocks for experts that map `embd -> ff -> embd`.
+    pub fn new(embd: usize, ff: usize) -> HostScratch {
+        HostScratch {
+            embd,
+            ff,
+            gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, 1)),
+            pars: std::array::from_fn(|_| Tensor2::zeros(ff, 1)),
+            downs: std::array::from_fn(|_| Tensor2::zeros(embd, 1)),
+        }
+    }
+
+    fn fits(&self, embd: usize, ff: usize) -> bool {
+        (self.embd, self.ff) == (embd, ff)
+    }
+
+    /// The gate output of the last call's `i`-th expert.
+    pub fn gate(&self, i: usize) -> &Tensor2 {
+        &self.gate_up[2 * i]
+    }
+
+    /// The up output of the last call's `i`-th expert.
+    pub fn up(&self, i: usize) -> &Tensor2 {
+        &self.gate_up[2 * i + 1]
+    }
+
+    /// The SwiGLU combine the last call's `i`-th expert's down read.
+    pub fn par(&self, i: usize) -> &Tensor2 {
+        &self.pars[i]
+    }
+
+    /// The down output of the last call's `i`-th expert, before its weight.
+    pub fn down(&self, i: usize) -> &Tensor2 {
+        &self.downs[i]
+    }
+}
+
+/// The host leg of one token over resolved weights: `gu` holds each listed
+/// expert's gate and up interleaved, `down` its down. One group dispatch for
+/// every gate and up (`x` quantized once), one for every down with each
+/// combine — clamped when `limit` is given — produced inside it, then the
+/// weighted sum in list order into `out` (already zeroed). Profile level 1
+/// records the leg in five parts that do not overlap: `host_x_quant` (x's
+/// quantization), `host_gate_up` (the gate/up rows, per weight type),
+/// `host_h_quant` (the combines and their quantization), `host_down` (the
+/// down rows, per weight type) and `host_sum`.
+fn serve(
+    gu: &[Weight<'_>],
+    down: &[Weight<'_>],
+    limit: Option<f32>,
+    x: &Tensor2,
+    experts: &[(u32, f32)],
+    out: &mut [f32],
+    s: &mut HostScratch,
+) -> Result<(), ModelError> {
+    let n = experts.len();
+    let lvl = profile::level();
+    let xs: [&Tensor2; 2 * EXPERTS_INTO_MAX] = [x; 2 * EXPERTS_INTO_MAX];
+    let gt = matmul_q_group_into("host_gate_up", gu, &xs[..2 * n], &mut s.gate_up[..2 * n])?;
+    let srcs: [GroupInput<'_>; EXPERTS_INTO_MAX] = std::array::from_fn(|i| {
+        if i >= n {
+            return GroupInput::Ready(x);
+        }
+        let (gate, up) = (&s.gate_up[2 * i], &s.gate_up[2 * i + 1]);
+        match limit {
+            Some(limit) => GroupInput::SwigluClamp(gate, up, limit),
+            None => GroupInput::Swiglu(gate, up),
+        }
+    });
+    let dt = matmul_q_group_swiglu_into(
+        "host_down",
+        down,
+        &srcs[..n],
+        &mut s.downs[..n],
+        &mut s.pars[..n],
+    )?;
+    let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
+    for (&(_, w), d) in experts.iter().zip(&s.downs[..n]) {
+        for (o, &dv) in out.iter_mut().zip(d.col(0)) {
+            *o += w * dv;
+        }
+    }
+    if let Some(t_sum) = t_sum {
+        let sum_ns = t_sum.elapsed().as_nanos() as u64;
+        profile::record_time("host_x_quant", gt.stage_ns);
+        profile::record_time("host_h_quant", dt.stage_ns);
+        profile::record_time("host_sum", sum_ns);
+    }
+    Ok(())
+}
+
+/// What a host tier needs to serve one layer's routed experts, in the
+/// file's own terms: the three stacks' tensor names, the expert count, the
+/// widths and the routed experts' SwiGLU limit. The architecture fills it;
+/// this module reads no model's names or keys.
+pub struct HostLayerSpec<'a> {
+    pub gate: &'a str,
+    pub up: &'a str,
+    pub down: &'a str,
+    pub n_expert: usize,
+    pub embd: usize,
+    pub ff: usize,
+    /// `clamp(up, ±limit) · min(silu(gate), limit)`; at or below 1e-6 the
+    /// plain combine.
+    pub swiglu_limit: f32,
+}
+
+/// One layer's routed experts as a host tier serves them: the three stacks,
+/// each with the shard that holds it, and the SwiGLU limit. Built once at
+/// load ([`HostLayer::build`]); a call cuts its experts' matrices from the
+/// stacks, so a layer holds three headers, not one view per expert.
+pub struct HostLayer {
+    gate: ShardTensor,
+    up: ShardTensor,
+    down: ShardTensor,
+    n_expert: usize,
+    limit: f32,
+}
+
+impl HostLayer {
+    /// Find the three stacks and check them against the spec: gate and up
+    /// map `embd -> ff`, down maps `ff -> embd`, all `n_expert` deep and cut
+    /// evenly. Every shape error a call could meet is raised here, at load.
+    pub fn build(split: &Split, spec: &HostLayerSpec<'_>) -> Result<HostLayer, ModelError> {
+        let gate = ShardTensor::find(split, spec.gate)?;
+        let up = ShardTensor::find(split, spec.up)?;
+        let down = ShardTensor::find(split, spec.down)?;
+        for (t, k, n) in [
+            (&gate, spec.embd, spec.ff),
+            (&up, spec.embd, spec.ff),
+            (&down, spec.ff, spec.embd),
+        ] {
+            expect_stack(t.info(), k, n, spec.n_expert)?;
+            // The per-expert cut: `expert_view`'s check, once, here.
+            expert_view(t.info(), 0, spec.n_expert)?;
+        }
+        Ok(HostLayer {
+            gate,
+            up,
+            down,
+            n_expert: spec.n_expert,
+            limit: spec.swiglu_limit,
+        })
+    }
+
+    /// The three stacks, `[gate, up, down]`.
+    pub fn stacks(&self) -> [&ShardTensor; 3] {
+        [&self.gate, &self.up, &self.down]
+    }
+
+    pub fn n_expert(&self) -> usize {
+        self.n_expert
+    }
+
+    pub fn swiglu_limit(&self) -> f32 {
+        self.limit
+    }
+
+    /// [`experts_into`] for this layer: a given list of routed experts of
+    /// ONE token, `out = Σ_i w_i · down_{e_i}(clamp(up_{e_i}·x, ±L) ⊙
+    /// min(silu(gate_{e_i}·x), L))` in list order, each matrix read from
+    /// the shard that holds it. `scratch` is the caller's, made for this
+    /// layer's widths; after the call it holds what the call computed.
+    pub fn experts_into(
+        &self,
+        split: &Split,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+        scratch: &mut HostScratch,
+    ) -> Result<(), ModelError> {
+        check_host_call(x, experts, out)?;
+        out.fill(0.0);
+        let n = experts.len();
+        if n == 0 {
+            return Ok(());
+        }
+        // The unused tails keep the first expert's gate; only the first n
+        // (2n) are passed.
+        let first = self.gate.expert(split, experts[0].0 as usize)?;
+        let mut gu = [first; 2 * EXPERTS_INTO_MAX];
+        let mut down = [first; EXPERTS_INTO_MAX];
+        for (i, &(e, _)) in experts.iter().enumerate() {
+            let e = e as usize;
+            gu[2 * i] = self.gate.expert(split, e)?;
+            gu[2 * i + 1] = self.up.expert(split, e)?;
+            down[i] = self.down.expert(split, e)?;
+        }
+        serve(
+            &gu[..2 * n],
+            &down[..n],
+            Some(self.limit),
+            x,
+            experts,
+            out,
+            scratch,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Buckets, EXPERTS_INTO_MAX, TOUCHED, check_host_call, gather_expert_inputs,
+        last_touched_experts, reset_touched,
+    };
+    use crate::ops::Tensor2;
+
+    /// The touched mask is as wide as the expert count: ids past 63 land in
+    /// words of their own and read back ascending with the first word's.
+    #[test]
+    fn touched_mask_spans_every_expert() {
+        let n_expert = 384;
+        let routed = [0usize, 63, 64, 200, 383];
+        let mut offsets = vec![0u32; n_expert + 1];
+        for e in 0..n_expert {
+            offsets[e + 1] = offsets[e] + u32::from(routed.contains(&e));
+        }
+        let buckets = Buckets {
+            offsets,
+            order: vec![0; routed.len()],
+            weight: vec![1.0; routed.len()],
+        };
+        let x = Tensor2::zeros(4, 1);
+        reset_touched(n_expert);
+        let (experts, _, _) =
+            TOUCHED.with(|t| gather_expert_inputs(&x, &buckets, n_expert, 0, &mut t.borrow_mut()));
+        assert_eq!(experts, routed, "every routed expert is gathered");
+        assert_eq!(
+            last_touched_experts(),
+            routed,
+            "the mask records every routed id, past 63 too"
+        );
+    }
+
+    /// A host call's three shape conditions are three errors, each naming its
+    /// condition and carrying what was passed — `x`'s token count among them.
+    #[test]
+    fn host_call_shape_errors_name_their_condition() {
+        let refusal = |x: &Tensor2, n: usize, out: usize| {
+            let experts = vec![(0u32, 1.0f32); n];
+            match check_host_call(x, &experts, &vec![0.0; out]) {
+                Ok(()) => panic!("a bad host call must be refused"),
+                Err(e) => e.to_string(),
+            }
+        };
+        let (x1, x2) = (Tensor2::zeros(8, 1), Tensor2::zeros(8, 2));
+        let e = refusal(&x2, 1, 8);
+        assert!(e.contains("one token") && e.contains("got [8, 2]"), "{e}");
+        let e = refusal(&x1, 1, 7);
+        assert!(e.contains("width") && e.contains("got [7, 1]"), "{e}");
+        let e = refusal(&x1, EXPERTS_INTO_MAX + 1, 8);
+        assert!(
+            e.contains("EXPERTS_INTO_MAX")
+                && e.contains(&format!("got [{}, 1]", EXPERTS_INTO_MAX + 1)),
+            "{e}"
+        );
+        assert!(check_host_call(&x1, &[(0, 1.0); EXPERTS_INTO_MAX], &[0.0; 8]).is_ok());
+    }
 }

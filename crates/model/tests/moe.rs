@@ -85,9 +85,8 @@ fn hw_moe_router_exact() {
     oracle::assert_close(&tr.weights, &weights, 1e-4, "route -> ffn_moe_weights-1");
 
     // Routing reads the router; it must not have touched any expert stack.
-    assert_eq!(
-        moe::last_touched_experts(),
-        0,
+    assert!(
+        moe::last_touched_experts().is_empty(),
         "route dequantized expert weights"
     );
 
@@ -186,21 +185,20 @@ fn hw_moe_touches_only_routed_experts() {
     let tr = moe::last_trace().expect("moe_ffn must leave a trace");
     let touched = moe::last_touched_experts();
 
-    let mut routed_mask = 0u64;
-    for &e in &tr.ids {
-        routed_mask |= 1u64 << e as u64;
-    }
-    let n_distinct = routed_mask.count_ones() as usize;
+    let mut routed: Vec<usize> = tr.ids.iter().map(|&e| e as usize).collect();
+    routed.sort_unstable();
+    routed.dedup();
+    let n_distinct = routed.len();
 
     assert_eq!(
-        touched.count_ones() as usize,
+        touched.len(),
         n_distinct,
         "distinct experts dequantized must equal distinct experts routed to ({}), got {}",
         n_distinct,
-        touched.count_ones()
+        touched.len()
     );
     assert_eq!(
-        touched, routed_mask,
+        touched, routed,
         "dequantized an expert no token routed to — the mistral.rs x86_64 failure mode (prior-art §4.4)"
     );
     assert!(
@@ -208,5 +206,68 @@ fn hw_moe_touches_only_routed_experts() {
         "the reference batch routes to {n_distinct} of {} experts; if it ever routes to all, \
          this gate can no longer distinguish bucketed dispatch from touch-all-64",
         tr.n_expert
+    );
+}
+
+/// The host tier's one-file entry is the composition it replaces: the gate/up
+/// group, the down group over the SwiGLU combines and the list-order weighted
+/// sum from zero, bit for bit — through its per-thread scratch on the first
+/// call and again on a second, for a list with a negative weight and a
+/// repeated expert, and zeros for an empty list.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_experts_into_matches_group_composition() {
+    use model::ops::{GroupInput, matmul_q_group, matmul_q_group_swiglu};
+
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let derived = model::arch::deepseek2::derived::Derived::new(&g).unwrap();
+    let plan = derived.block_plan(1).unwrap().moe().unwrap();
+    let x = moe_input(&o);
+    let x1 = Tensor2::from_vec(x.ne0, 1, x.col(0).to_vec());
+    let list = [(3u32, 0.25f32), (17, -0.5), (60, 1.25), (3, 0.125)];
+
+    let gu_ws: Vec<&gguf::TensorInfo> = list
+        .iter()
+        .flat_map(|&(e, _)| [&plan.gate_views[e as usize], &plan.up_views[e as usize]])
+        .collect();
+    let gu = matmul_q_group(&g, &gu_ws, &vec![&x1; gu_ws.len()]).unwrap();
+    let down_ws: Vec<&gguf::TensorInfo> = list
+        .iter()
+        .map(|&(e, _)| &plan.down_views[e as usize])
+        .collect();
+    let srcs: Vec<GroupInput> = (0..list.len())
+        .map(|i| GroupInput::Swiglu(&gu[2 * i], &gu[2 * i + 1]))
+        .collect();
+    let (downs, _) = matmul_q_group_swiglu(&g, &down_ws, &srcs).unwrap();
+    let mut want = vec![0.0f32; x1.ne0];
+    for (&(_, w), d) in list.iter().zip(&downs) {
+        for (o, &dv) in want.iter_mut().zip(d.col(0)) {
+            *o += w * dv;
+        }
+    }
+
+    for call in 0..2 {
+        let mut got = vec![f32::NAN; x1.ne0];
+        moe::experts_into(&g, plan, &x1, &list, &mut got).unwrap();
+        let diffs = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            diffs, 0,
+            "call {call}: experts_into must equal the group composition bit for bit"
+        );
+    }
+    let mut empty = vec![f32::NAN; x1.ne0];
+    moe::experts_into(&g, plan, &x1, &[], &mut empty).unwrap();
+    assert!(
+        empty.iter().all(|v| v.to_bits() == 0),
+        "an empty list writes zeros"
+    );
+    eprintln!(
+        "experts_into == group composition, bit for bit: {} experts, two calls; empty list zeros",
+        list.len()
     );
 }

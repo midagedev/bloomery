@@ -5,7 +5,7 @@
 
 use crate::ffn::swiglu_timed;
 use crate::profile;
-use gguf::{GgmlType, Gguf, TensorInfo, dequant_row, quantize_activations};
+use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row, quantize_activations};
 use std::cell::RefCell;
 use std::ops::Range;
 use std::time::Instant;
@@ -481,26 +481,53 @@ pub fn matmul_q_group(
     matmul_q_multi("matmul_q_group", gguf, ws, xs)
 }
 
-/// One pair's input for [`matmul_q_group_swiglu`]: a ready activation block,
-/// or the SwiGLU pair whose combine is the input.
+/// One pair's input for [`matmul_q_group_swiglu`] and
+/// [`matmul_q_group_swiglu_into`]: a ready activation block, or the SwiGLU
+/// pair whose combine is the input.
+#[derive(Clone, Copy)]
 pub enum GroupInput<'a> {
     Ready(&'a Tensor2),
     /// (`gate`, `up`) — `silu(gate) · up` feeds the pair's weight.
     Swiglu(&'a Tensor2, &'a Tensor2),
+    /// (`gate`, `up`, `limit`) — `clamp(up, ±limit) · min(silu(gate), limit)`
+    /// feeds the pair's weight ([`qdot::swiglu_clamp`]; a limit at or below
+    /// 1e-6 clamps nothing).
+    SwigluClamp(&'a Tensor2, &'a Tensor2, f32),
+}
+
+impl<'a> GroupInput<'a> {
+    /// The block whose shape is the pair's input shape: the ready block, or
+    /// the gate the combine is made from.
+    fn shape_of(self) -> &'a Tensor2 {
+        match self {
+            GroupInput::Ready(x) => x,
+            GroupInput::Swiglu(gate, _) | GroupInput::SwigluClamp(gate, _, _) => gate,
+        }
+    }
+
+    /// The combine this input stands for — gate, up and the clamp limit — or
+    /// `None` for a ready block.
+    fn combine(self) -> Option<(&'a Tensor2, &'a Tensor2, Option<f32>)> {
+        match self {
+            GroupInput::Ready(_) => None,
+            GroupInput::Swiglu(gate, up) => Some((gate, up, None)),
+            GroupInput::SwigluClamp(gate, up, limit) => Some((gate, up, Some(limit))),
+        }
+    }
 }
 
 /// The heterogeneous group whose pairs' inputs may be SwiGLU combines:
-/// `y_i = W_i · silu(gate_i) · up_i`, one pool dispatch for every
-/// projection. For a decode group (every input one column, lever on) the
-/// dispatch's claimant produces each combine into a poisoned scratch par
-/// (`qdot::swiglu`, the exact call `ffn::swiglu` makes) and quantizes it
-/// before any row of its pair runs — the caller never serializes on the
-/// combine or the encoder. Inputs of more than one column, or
-/// `BLOOMERY_DEFER_QUANT=0`, keep today's shape: the combine runs on the
-/// caller (`ffn::swiglu`, its own profiler site) and the group takes the
-/// ordinary pre-pass.
+/// `y_i = W_i · silu(gate_i) · up_i` (clamped for a `SwigluClamp` input), one
+/// pool dispatch for every projection. For a decode group (every input one
+/// column, lever on) the dispatch's claimant produces each combine into a
+/// poisoned scratch par (`qdot::swiglu`, the exact call `ffn::swiglu` makes,
+/// or `qdot::swiglu_clamp`) and quantizes it before any row of its pair
+/// runs — the caller never serializes on the combine or the encoder. Inputs
+/// of more than one column, or `BLOOMERY_DEFER_QUANT=0`, keep today's shape:
+/// the combine runs on the caller (its own `swiglu` profiler site) and the
+/// group takes the ordinary pre-pass.
 ///
-/// Returns the outputs and the produced `par` blocks — one per `Swiglu`
+/// Returns the outputs and the produced `par` blocks — one per combine
 /// input, pair order. A `Ready` input's block is the caller's own and is
 /// not returned.
 pub fn matmul_q_group_swiglu(
@@ -508,57 +535,421 @@ pub fn matmul_q_group_swiglu(
     ws: &[&TensorInfo],
     srcs: &[GroupInput<'_>],
 ) -> Result<(Vec<Tensor2>, Vec<Tensor2>), crate::ModelError> {
-    if ws.len() != srcs.len() {
+    let (mut outs, mut pars) = (Vec::new(), Vec::new());
+    group_core(
+        Weights::File(gguf, ws),
+        Inputs::Mixed(srcs),
+        Dest::Alloc {
+            site: "matmul_q_group",
+            outs: &mut outs,
+            pars: &mut pars,
+        },
+    )?;
+    Ok((outs, pars))
+}
+
+/// A tensor of a split model together with the shard that holds its bytes.
+/// It is made only by a lookup in the split ([`ShardTensor::find`]), and the
+/// bytes a dispatch reads through it ([`ShardTensor::weight`],
+/// [`ShardTensor::expert`]) come from that shard — no caller hands a reader
+/// in, so a header cannot be paired with another shard's file. Owned: a plan
+/// holds these past the lookup.
+///
+/// ```compile_fail,E0451
+/// # fn forge(up: &model::ops::ShardTensor) -> model::ops::ShardTensor {
+/// // A handle naming another shard than the one its header came from.
+/// model::ops::ShardTensor { shard: up.shard() + 1, info: up.info().clone() }
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+pub struct ShardTensor {
+    shard: usize,
+    info: TensorInfo,
+}
+
+impl ShardTensor {
+    /// The tensor `name` and the shard the split found it in.
+    pub fn find(split: &Split, name: &str) -> Result<ShardTensor, crate::ModelError> {
+        let (shard, info) = split
+            .find(name)
+            .ok_or_else(|| crate::ModelError::MissingTensor(name.to_string()))?;
+        Ok(ShardTensor {
+            shard,
+            info: info.clone(),
+        })
+    }
+
+    pub fn info(&self) -> &TensorInfo {
+        &self.info
+    }
+
+    pub fn shard(&self) -> usize {
+        self.shard
+    }
+
+    /// The shard's reader in `split`; a handle from a split of fewer shards
+    /// is refused by name.
+    fn file<'a>(&self, split: &'a Split) -> Result<&'a Gguf, crate::ModelError> {
+        split.shard(self.shard).ok_or_else(|| {
+            crate::ModelError::MissingTensor(format!("{} (shard {})", self.info.name, self.shard))
+        })
+    }
+
+    /// The whole tensor — one or two dims — as a dispatch weight. A stacked
+    /// tensor is cut per expert by [`ShardTensor::expert`] instead.
+    pub fn weight<'a>(&self, split: &'a Split) -> Result<Weight<'a>, crate::ModelError> {
+        if self.info.dims.len() > 2 {
+            return Err(crate::ModelError::Shape {
+                what: "weight dims (a stack is cut per expert)",
+                want_ne0: 2,
+                want_ne1: 1,
+                got_ne0: self.info.dims.len(),
+                got_ne1: 1,
+            });
+        }
+        Ok(Weight {
+            ty: self.info.ty,
+            k: k_of(&self.info),
+            n: n_of(&self.info),
+            bytes: self.file(split)?.data(&self.info)?,
+        })
+    }
+
+    /// Matrix `e` of a stacked tensor `{k, n, n_expert}` as a dispatch weight:
+    /// the `e`-th of the stack's `n_expert` equal byte runs — the cut
+    /// `moe::expert_view` makes, without a header of its own.
+    pub fn expert<'a>(&self, split: &'a Split, e: usize) -> Result<Weight<'a>, crate::ModelError> {
+        let dims = &self.info.dims;
+        let n_expert = dims.get(2).copied().unwrap_or(0);
+        if dims.len() != 3 || n_expert == 0 || !self.info.nbytes.is_multiple_of(n_expert) {
+            return Err(crate::ModelError::Shape {
+                what: "expert stack",
+                want_ne0: 3,
+                want_ne1: n_expert as usize,
+                got_ne0: dims.len(),
+                got_ne1: n_expert as usize,
+            });
+        }
+        if e as u64 >= n_expert {
+            return Err(crate::ModelError::MissingTensor(format!(
+                "expert {e} of {}",
+                self.info.name
+            )));
+        }
+        let per = (self.info.nbytes / n_expert) as usize;
+        let stack = self.file(split)?.data(&self.info)?;
+        Ok(Weight {
+            ty: self.info.ty,
+            k: dims[0] as usize,
+            n: dims[1] as usize,
+            bytes: &stack[e * per..(e + 1) * per],
+        })
+    }
+}
+
+/// One weight matrix as a dispatch reads it — type, `k` × `n` and the bytes —
+/// resolved from the file that holds it. Outside this crate the only way to
+/// make one is through a [`ShardTensor`] and its split; a one-file model's
+/// own headers make one inside it. Copy and allocation-free: a host call
+/// cuts its experts' matrices per token.
+#[derive(Clone, Copy)]
+pub struct Weight<'a> {
+    ty: GgmlType,
+    k: usize,
+    n: usize,
+    bytes: &'a [u8],
+}
+
+impl<'a> Weight<'a> {
+    /// `info` read from `gguf`, which must be the file `info` came from — a
+    /// one-file model, whose headers have no other.
+    pub(crate) fn in_file(
+        gguf: &'a Gguf,
+        info: &TensorInfo,
+    ) -> Result<Weight<'a>, crate::ModelError> {
+        Ok(Weight {
+            ty: info.ty,
+            k: k_of(info),
+            n: n_of(info),
+            bytes: gguf.data(info)?,
+        })
+    }
+
+    pub fn ty(&self) -> GgmlType {
+        self.ty
+    }
+
+    /// The contracted dimension: values per row.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Rows: values per output column.
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+/// `k`, the contracted dimension of a header (0 for a header without dims).
+fn k_of(w: &TensorInfo) -> usize {
+    w.dims.first().copied().unwrap_or(0) as usize
+}
+
+/// `n`, the rows of a header (1 for a one-dim tensor).
+fn n_of(w: &TensorInfo) -> usize {
+    if w.dims.len() > 1 {
+        w.dims[1] as usize
+    } else {
+        1
+    }
+}
+
+/// What an `_into` group call cost, at profile level 1 and above (zeros when
+/// the profiler is off): its wall, and the part of it the activation stage
+/// held — the caller-side combines and pre-pass, or the longest claim pass of
+/// a deferred dispatch (a claim is one input's combine and quantization, and
+/// every row that reads that input waits for it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupTimes {
+    pub wall_ns: u64,
+    pub stage_ns: u64,
+}
+
+/// [`matmul_q_group`] into the caller's blocks: `outs[i]` must already be
+/// `{ws[i].n(), xs[i].ne1}`, and nothing is allocated for the outputs. The
+/// profiler rows go under `site`, the activation stage left out of them —
+/// the caller records it from the returned [`GroupTimes`]. The values are
+/// the allocating entry's, bit for bit (`tests/ops.rs`).
+pub fn matmul_q_group_into(
+    site: &'static str,
+    ws: &[Weight<'_>],
+    xs: &[&Tensor2],
+    outs: &mut [Tensor2],
+) -> Result<GroupTimes, crate::ModelError> {
+    group_core(
+        Weights::Resolved(ws),
+        Inputs::Ready(xs),
+        Dest::Into {
+            site,
+            outs,
+            pars: &mut [],
+        },
+    )
+}
+
+/// [`matmul_q_group_swiglu`] into the caller's blocks: `outs[i]` must be
+/// `{ws[i].n(), ne1}` and `pars[j]` `{k, ne1}` for the `j`-th combine input,
+/// pair order; each par receives its combine. Profiler rows as
+/// [`matmul_q_group_into`]'s — the combines are part of the stage.
+pub fn matmul_q_group_swiglu_into(
+    site: &'static str,
+    ws: &[Weight<'_>],
+    srcs: &[GroupInput<'_>],
+    outs: &mut [Tensor2],
+    pars: &mut [Tensor2],
+) -> Result<GroupTimes, crate::ModelError> {
+    group_core(
+        Weights::Resolved(ws),
+        Inputs::Mixed(srcs),
+        Dest::Into { site, outs, pars },
+    )
+}
+
+/// Where a group's weights come from: headers of one file and that file
+/// (the entries that take a `Gguf`), or weights already resolved from the
+/// file that holds each ([`Weight`]).
+#[derive(Clone, Copy)]
+enum Weights<'a> {
+    File(&'a Gguf, &'a [&'a TensorInfo]),
+    Resolved(&'a [Weight<'a>]),
+}
+
+impl<'a> Weights<'a> {
+    fn len(self) -> usize {
+        match self {
+            Weights::File(_, ws) => ws.len(),
+            Weights::Resolved(ws) => ws.len(),
+        }
+    }
+
+    /// Pair `i`'s type, `k` and `n` — no byte read yet, so a bad input width
+    /// is reported before a bad placement, as the single-pair call does.
+    fn shape(self, i: usize) -> (GgmlType, usize, usize) {
+        match self {
+            Weights::File(_, ws) => (ws[i].ty, k_of(ws[i]), n_of(ws[i])),
+            Weights::Resolved(ws) => (ws[i].ty, ws[i].k, ws[i].n),
+        }
+    }
+
+    fn bytes(self, i: usize) -> Result<&'a [u8], crate::ModelError> {
+        match self {
+            Weights::File(gguf, ws) => Ok(gguf.data(ws[i])?),
+            Weights::Resolved(ws) => Ok(ws[i].bytes),
+        }
+    }
+}
+
+/// A group's inputs: ready blocks only, or blocks and SwiGLU combines.
+#[derive(Clone, Copy)]
+enum Inputs<'a, 'x> {
+    /// The deferral decision is `run_group`'s, by slot.
+    Ready(&'a [&'x Tensor2]),
+    /// The decision is made before any par exists: the claimants produce the
+    /// combines only when every input is one column and the claim states
+    /// fit; otherwise the caller combines and the group takes the pre-pass.
+    Mixed(&'a [GroupInput<'x>]),
+}
+
+impl<'a, 'x> Inputs<'a, 'x> {
+    fn len(self) -> usize {
+        match self {
+            Inputs::Ready(xs) => xs.len(),
+            Inputs::Mixed(srcs) => srcs.len(),
+        }
+    }
+
+    fn get(self, i: usize) -> GroupInput<'x> {
+        match self {
+            Inputs::Ready(xs) => GroupInput::Ready(xs[i]),
+            Inputs::Mixed(srcs) => srcs[i],
+        }
+    }
+}
+
+/// Where a group's outputs and the pars of its combines go, and what its
+/// profiler rows leave out.
+enum Dest<'o> {
+    /// Fresh blocks off the pool, one per pair and one per combine, pushed
+    /// in pair order; the rows under `site` leave out the combines, which
+    /// the `swiglu` site records.
+    Alloc {
+        site: &'static str,
+        outs: &'o mut Vec<Tensor2>,
+        pars: &'o mut Vec<Tensor2>,
+    },
+    /// The caller's blocks, already shaped; the rows under `site` leave out
+    /// the activation stage, which the caller records from [`GroupTimes`].
+    Into {
+        site: &'static str,
+        outs: &'o mut [Tensor2],
+        pars: &'o mut [Tensor2],
+    },
+}
+
+/// `silu(gate) · up` into `out`, clamped when the pair carries a limit — the
+/// one call every combine makes, on a claimant or on the caller.
+fn swiglu_into(gate: &[f32], up: &[f32], limit: Option<f32>, out: &mut [f32]) {
+    match limit {
+        None => qdot::swiglu(gate, up, out),
+        Some(limit) => qdot::swiglu_clamp(gate, up, limit, out),
+    }
+}
+
+/// The allocating entry's caller-side combine: a fresh block and its time,
+/// recorded under the `swiglu` site. A plain pair is `ffn::swiglu_timed`
+/// itself; a clamped one is the same shape with the clamped call.
+fn combine_timed(gate: &Tensor2, up: &Tensor2, limit: Option<f32>) -> (Tensor2, u64) {
+    if limit.is_none() {
+        return swiglu_timed(gate, up);
+    }
+    let lvl = profile::level();
+    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
+    let mut out = Tensor2::scratch(gate.ne0, gate.ne1);
+    swiglu_into(&gate.data, &up.data, limit, &mut out.data);
+    let ns = match t_call {
+        Some(t_call) => {
+            let ns = t_call.elapsed().as_nanos() as u64;
+            profile::record_time("swiglu", ns);
+            ns
+        }
+        None => 0,
+    };
+    (out, ns)
+}
+
+/// The group engine every multi-pair entry rides: per pair the input-width
+/// check, the fused decision, the combine's par (produced by a claimant or
+/// here), the slot and the output block; then `run_group` and the profiler
+/// rows.
+fn group_core(
+    ws: Weights<'_>,
+    inputs: Inputs<'_, '_>,
+    dest: Dest<'_>,
+) -> Result<GroupTimes, crate::ModelError> {
+    let n_pairs = ws.len();
+    if n_pairs != inputs.len() {
         return Err(crate::ModelError::Shape {
             what: "matmul_q batch",
-            want_ne0: ws.len(),
-            want_ne1: ws.len(),
-            got_ne0: srcs.len(),
-            got_ne1: srcs.len(),
+            want_ne0: n_pairs,
+            want_ne1: n_pairs,
+            got_ne0: inputs.len(),
+            got_ne1: inputs.len(),
         });
     }
-    if ws.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+    if n_pairs == 0 {
+        return Ok(GroupTimes::default());
     }
-    // Profiler hook: the same row and shape as `matmul_q_group`, with the
-    // combines' time handed to the `swiglu` site instead of riding the
-    // group's wall (the no-double-count rule).
+    // Profiler hook: level 0 one compare, level 1 one `Instant` pair, level 2
+    // two more per row, none touching the arithmetic; chunks merge into one
+    // `CallAcc` per weight type, so `record` fires once per (call, type).
     let lvl = profile::level();
     let mut pacc = profile::CallAcc::new();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    // Deferral needs one column per input and the claim states inline; a
-    // wider group keeps the caller-side combine and the pre-pass.
-    let defer = defer_quant()
-        && ws.len() <= MAX_DEFER_SLOTS
-        && srcs.iter().all(|s| match s {
-            GroupInput::Ready(x) => x.ne1 == 1,
-            GroupInput::Swiglu(gate, _) => gate.ne1 == 1,
-        });
-    let n_swiglu = srcs
-        .iter()
-        .filter(|s| matches!(s, GroupInput::Swiglu(..)))
+    let n_combine = (0..n_pairs)
+        .filter(|&i| inputs.get(i).combine().is_some())
         .count();
-    // Exact capacity: the slot blocks reference these pars where they sit,
-    // so the Vec must never grow past its reservation.
-    let mut pars: Vec<Tensor2> = Vec::with_capacity(n_swiglu);
+    let defer = match inputs {
+        Inputs::Ready(_) => defer_quant(),
+        Inputs::Mixed(srcs) => {
+            defer_quant()
+                && n_pairs <= MAX_DEFER_SLOTS
+                && srcs.iter().all(|s| s.shape_of().ne1 == 1)
+        }
+    };
+    let (site, mut sink) = match dest {
+        Dest::Alloc { site, outs, pars } => {
+            // Exact capacities: a slot names its par where it sits, so the
+            // Vec must never grow past its reservation.
+            pars.reserve_exact(n_combine);
+            outs.reserve_exact(n_pairs);
+            (site, Sink::Alloc { outs, pars })
+        }
+        Dest::Into { site, outs, pars } => {
+            if outs.len() != n_pairs || pars.len() != n_combine {
+                return Err(crate::ModelError::Shape {
+                    what: "group into: one out per pair, one par per combine",
+                    want_ne0: n_pairs,
+                    want_ne1: n_combine,
+                    got_ne0: outs.len(),
+                    got_ne1: pars.len(),
+                });
+            }
+            // One base pointer for the whole call: a slot names each par
+            // through it while that par's claimant writes the cells.
+            (
+                site,
+                Sink::Into {
+                    outs,
+                    pars: pars.as_mut_ptr(),
+                },
+            )
+        }
+    };
+    let into = matches!(sink, Sink::Into { .. });
     let mut bytes: Flex<&[u8]> = Flex::new();
     let mut meta: Flex<PairMeta> = Flex::new();
     let mut slot_of: Flex<usize> = Flex::new();
     let mut slots: Flex<QuantSlot> = Flex::new();
-    let mut outs: Vec<Tensor2> = Vec::with_capacity(ws.len());
-    let mut swiglu_ns: u64 = 0;
-    for (w, src) in ws.iter().zip(srcs) {
-        let k = w.dims.first().copied().unwrap_or(0) as usize;
-        let n = if w.dims.len() > 1 {
-            w.dims[1] as usize
-        } else {
-            1
-        };
-        let ty = w.ty;
-        let xin = match src {
-            GroupInput::Ready(x) => *x,
-            GroupInput::Swiglu(gate, _) => *gate,
-        };
+    let mut caller_combine_ns: u64 = 0;
+    let mut j = 0usize;
+    for i in 0..n_pairs {
+        let (ty, k, n) = ws.shape(i);
+        let src = inputs.get(i);
+        let xin = src.shape_of();
         if xin.ne0 != k {
             return Err(crate::ModelError::Shape {
                 what: "matmul_q input",
@@ -568,8 +959,11 @@ pub fn matmul_q_group_swiglu(
                 got_ne1: xin.ne1,
             });
         }
-        let b = gguf.data(w)?;
-        // Fused path decided per pair, exactly the single-pair rule.
+        let b = ws.bytes(i)?;
+        // Fused path decided per pair, exactly the single-pair rule: qdot
+        // dots the quantized codes directly, so activations are quantized
+        // into `qdot::quantize_col`'s layout, and `k_granularity` owns the
+        // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1).
         let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
         let cb = if fused {
             Some(qdot::col_bytes(ty, k))
@@ -580,35 +974,95 @@ pub fn matmul_q_group_swiglu(
             None
         };
         // The combine: produced by the dispatch's claimant (deferred) or
-        // here on the caller (ordinary) — the same `qdot::swiglu` call
-        // either way, into a poisoned scratch par.
-        let (x, swiglu) = match src {
-            GroupInput::Ready(x) => (*x, None),
-            GroupInput::Swiglu(gate, up) => {
-                let par = if defer {
-                    Tensor2::scratch(k, xin.ne1)
-                } else {
-                    let (par, ns) = swiglu_timed(gate, up);
-                    swiglu_ns += ns;
-                    par
+        // here on the caller — the same call either way, into the pair's par.
+        let (x, swiglu) = match src.combine() {
+            None => (xin, None),
+            Some((gate, up, limit)) => {
+                if (up.ne0, up.ne1) != (gate.ne0, gate.ne1) {
+                    return Err(crate::ModelError::Shape {
+                        what: "swiglu up",
+                        want_ne0: gate.ne0,
+                        want_ne1: gate.ne1,
+                        got_ne0: up.ne0,
+                        got_ne1: up.ne1,
+                    });
+                }
+                let blk: *mut Tensor2 = match &mut sink {
+                    Sink::Alloc { pars, .. } => {
+                        let par = if defer {
+                            Tensor2::scratch(k, xin.ne1)
+                        } else {
+                            let (par, ns) = combine_timed(gate, up, limit);
+                            caller_combine_ns += ns;
+                            par
+                        };
+                        pars.push(par);
+                        pars.last_mut().expect("just pushed")
+                    }
+                    Sink::Into { pars, .. } => {
+                        // SAFETY: `j < n_combine`, the length checked above;
+                        // each index is taken once.
+                        let blk = unsafe { pars.add(j) };
+                        // SAFETY: the caller's block, lent for the call; no
+                        // slot names it yet, so this read and the combine
+                        // below are its only accesses.
+                        let (ne0, ne1, len) =
+                            unsafe { ((*blk).ne0, (*blk).ne1, (*blk).data.len()) };
+                        if (ne0, ne1, len) != (k, xin.ne1, k * xin.ne1) {
+                            return Err(crate::ModelError::Shape {
+                                what: "group into par",
+                                want_ne0: k,
+                                want_ne1: xin.ne1,
+                                got_ne0: ne0,
+                                got_ne1: ne1,
+                            });
+                        }
+                        if !defer {
+                            let t_c = if lvl > 0 { Some(Instant::now()) } else { None };
+                            // SAFETY: as the read above.
+                            swiglu_into(&gate.data, &up.data, limit, unsafe { &mut (*blk).data });
+                            if let Some(t_c) = t_c {
+                                caller_combine_ns += t_c.elapsed().as_nanos() as u64;
+                            }
+                        }
+                        blk
+                    }
                 };
-                pars.push(par);
-                let last = pars.last_mut().expect("just pushed");
+                j += 1;
                 // The cells, not the block: the claimant's `&mut` covers the
                 // heap cells only, never the header the slot table reads.
-                let write = ParWrite(last.data.as_mut_ptr(), last.data.len());
-                let par: *const Tensor2 = last;
-                // SAFETY: the Vec sits at its exact final capacity, so the
-                // block never moves; the write view goes to exactly one
-                // claimant through the slot, and no reader runs before the
-                // slot observes DONE or the dispatch joins — this shared ref
-                // only names the block for the slot table (metadata reads).
-                (unsafe { &*par }, Some((*gate, *up, write)))
+                // SAFETY: `blk` is the par just placed or checked above.
+                let write = unsafe { ParWrite((*blk).data.as_mut_ptr(), (*blk).data.len()) };
+                // SAFETY: the block never moves during the call (the Vec sits
+                // at its exact final capacity, or the caller lent it); the
+                // write view goes to exactly one claimant through the slot,
+                // and no reader runs before the slot observes DONE or the
+                // dispatch joins — this shared ref only names the block for
+                // the slot table (metadata reads).
+                let par: &Tensor2 = unsafe { &*blk };
+                (
+                    par,
+                    Some(Combine {
+                        gate,
+                        up,
+                        limit,
+                        par: write,
+                    }),
+                )
             }
         };
-        // The sharing rule among ready inputs (see `matmul_q_multi`); a
-        // SwiGLU pair's par is a fresh engine-owned block, distinct by
-        // construction, so those never share.
+        // The sharing rule — one quantized buffer per DISTINCT (input,
+        // encoding): same input block AND same fused-ness AND same activation
+        // format. Sound both ways. Sharers write identical bytes: `k` is
+        // pinned to the input's `ne0` by the check above, the encoders are
+        // pure functions of (activation format, k) — `quantize_col`'s arm
+        // and `quantize_activations` both key on the format, never the
+        // weight type — and equal format with equal `k` yields equal
+        // `col_bytes`. Non-sharers never collide: a different format or
+        // fused-ness means the encoders disagree on at least the buffer's
+        // representation, so sharing would feed one pair the other's bytes.
+        // A combine's par is a distinct block by construction, so it never
+        // shares.
         let slot = match swiglu {
             Some(..) => {
                 slots.push(QuantSlot {
@@ -647,59 +1101,114 @@ pub fn matmul_q_group_swiglu(
             row_bytes: b.len() / n,
         });
         slot_of.push(slot);
-        outs.push(Tensor2::scratch(n, xin.ne1));
+        match &mut sink {
+            Sink::Alloc { outs, .. } => outs.push(Tensor2::scratch(n, xin.ne1)),
+            Sink::Into { outs, .. } => {
+                let o = &outs[i];
+                if (o.ne0, o.ne1, o.data.len()) != (n, xin.ne1, n * xin.ne1) {
+                    return Err(crate::ModelError::Shape {
+                        what: "group into out",
+                        want_ne0: n,
+                        want_ne1: xin.ne1,
+                        got_ne0: o.ne0,
+                        got_ne1: o.ne1,
+                    });
+                }
+            }
+        }
     }
     LAST_QUANT_SLOTS.store(slots.len(), std::sync::atomic::Ordering::Relaxed);
 
+    let outs: &mut [Tensor2] = match sink {
+        Sink::Alloc { outs, .. } => outs,
+        Sink::Into { outs, .. } => outs,
+    };
     // SAFETY: the construction-site argument in `run_group`'s pair build.
-    let worker_swiglu_ns = run_group(
-        &slots, &slot_of, &bytes, &meta, &mut outs, lvl, &mut pacc, defer,
-    )?;
-    if defer && lvl > 0 && n_swiglu > 0 {
-        profile::record_time("swiglu", worker_swiglu_ns);
-    }
-    swiglu_ns += worker_swiglu_ns;
-
-    if let Some(t_call) = t_call {
-        // One row per distinct weight type the group carried, the group's
-        // wall minus what the `swiglu` site records itself.
-        let wall_ns = (t_call.elapsed().as_nanos() as u64).saturating_sub(swiglu_ns);
-        let wb_total: u64 = (0..bytes.len()).map(|i| bytes.get(i).len() as u64).sum();
-        let mut tys: Flex<(GgmlType, u64, u64, u64)> = Flex::new();
-        for i in 0..meta.len() {
-            let m = *meta.get(i);
-            let wb = bytes.get(i).len() as u64;
-            let mut j = 0;
-            while j < tys.len() && tys.get(j).0 != m.ty {
-                j += 1;
-            }
-            if j == tys.len() {
-                tys.push((m.ty, m.n as u64, m.k as u64 * m.n as u64, wb));
-            } else {
-                let e = tys.get_mut(j);
-                *e = (
-                    e.0,
-                    e.1 + m.n as u64,
-                    e.2 + m.k as u64 * m.n as u64,
-                    e.3 + wb,
-                );
-            }
+    let rt = run_group(&slots, &slot_of, &bytes, &meta, outs, lvl, &mut pacc, defer)?;
+    // What the rows leave out: the combines, which the allocating entry's
+    // `swiglu` site records; or the whole activation stage, which an `_into`
+    // caller records.
+    let left_out = if into {
+        caller_combine_ns + rt.stage_ns
+    } else {
+        if defer && lvl > 0 && n_combine > 0 {
+            profile::record_time("swiglu", rt.swiglu_ns);
         }
-        for t in 0..tys.len() {
-            let &(ty, rows, k_total, wb) = tys.get(t);
-            let share = |ns: u64| ((ns as u128 * wb as u128) / wb_total as u128) as u64;
-            profile::record(
-                "matmul_q_group",
-                ty,
-                rows,
-                k_total,
-                wb,
-                share(wall_ns),
-                &pacc.scaled(wb, wb_total),
+        caller_combine_ns + rt.swiglu_ns
+    };
+    let mut times = GroupTimes::default();
+    if let Some(t_call) = t_call {
+        let wall_ns = t_call.elapsed().as_nanos() as u64;
+        record_rows(site, &meta, &bytes, wall_ns.saturating_sub(left_out), &pacc);
+        if into {
+            times = GroupTimes {
+                wall_ns,
+                stage_ns: left_out,
+            };
+        }
+    }
+    Ok(times)
+}
+
+/// [`Dest`] inside the pair loop: the allocating entry's Vecs, or the
+/// caller's outputs and the base pointer of its pars.
+enum Sink<'o> {
+    Alloc {
+        outs: &'o mut Vec<Tensor2>,
+        pars: &'o mut Vec<Tensor2>,
+    },
+    Into {
+        outs: &'o mut [Tensor2],
+        pars: *mut Tensor2,
+    },
+}
+
+/// One profiler row per distinct weight type the group carried: rows, `k`
+/// and weight bytes exact per type; `ns` and the stage accumulators split by
+/// weight-byte share — the honest per-type statement without per-type
+/// timers. The shares sum to `ns`, so `instrumented_ns` never counts a group
+/// twice, and a single-type group records exactly the homogeneous values.
+fn record_rows(
+    site: &'static str,
+    meta: &Flex<PairMeta>,
+    bytes: &Flex<&[u8]>,
+    ns: u64,
+    pacc: &profile::CallAcc,
+) {
+    let wb_total: u64 = (0..bytes.len()).map(|i| bytes.get(i).len() as u64).sum();
+    let mut tys: Flex<(GgmlType, u64, u64, u64)> = Flex::new();
+    for i in 0..meta.len() {
+        let m = *meta.get(i);
+        let wb = bytes.get(i).len() as u64;
+        let mut j = 0;
+        while j < tys.len() && tys.get(j).0 != m.ty {
+            j += 1;
+        }
+        if j == tys.len() {
+            tys.push((m.ty, m.n as u64, m.k as u64 * m.n as u64, wb));
+        } else {
+            let e = tys.get_mut(j);
+            *e = (
+                e.0,
+                e.1 + m.n as u64,
+                e.2 + m.k as u64 * m.n as u64,
+                e.3 + wb,
             );
         }
     }
-    Ok((outs, pars))
+    for t in 0..tys.len() {
+        let &(ty, rows, k_total, wb) = tys.get(t);
+        let share = |ns: u64| ((ns as u128 * wb as u128) / wb_total as u128) as u64;
+        profile::record(
+            site,
+            ty,
+            rows,
+            k_total,
+            wb,
+            share(ns),
+            &pacc.scaled(wb, wb_total),
+        );
+    }
 }
 
 /// Pairs a group carries before its bookkeeping spills to the heap. The
@@ -1019,9 +1528,19 @@ struct QuantSlot<'a> {
     /// `qdot::col_bytes(ty, k)` on the fused path, `None` on the scalar one.
     cb: Option<usize>,
     /// The SwiGLU producer, when `x` is not a ready input: the claimer writes
-    /// `silu(gate)·up` through `par` (which aliases `x`) before quantizing
+    /// the combine through its `par` (which aliases `x`) before quantizing
     /// `x`'s columns. `None` on ready inputs — nothing writes `x`.
-    swiglu: Option<(&'a Tensor2, &'a Tensor2, ParWrite)>,
+    swiglu: Option<Combine<'a>>,
+}
+
+/// A combine slot's producer: gate, up, the clamp limit when the pair
+/// carries one, and the write view of the par block the slot's `x` names.
+#[derive(Clone, Copy)]
+struct Combine<'a> {
+    gate: &'a Tensor2,
+    up: &'a Tensor2,
+    limit: Option<f32>,
+    par: ParWrite,
 }
 
 /// The column walker both dispatch shapes ride: quantize columns `cols` of the
@@ -1142,6 +1661,9 @@ struct DeferredSlots<'a> {
     /// once on the caller after the join — the profiler's lock stays out of
     /// the workers.
     swiglu_ns: std::sync::atomic::AtomicU64,
+    /// The longest claim pass of the dispatch, from its first claim to its
+    /// end (level >= 1): the stage every row of a claimed slot waits behind.
+    claim_ns: std::sync::atomic::AtomicU64,
 }
 
 impl<'a> DeferredSlots<'a> {
@@ -1151,6 +1673,7 @@ impl<'a> DeferredSlots<'a> {
             shared,
             states: std::array::from_fn(|_| std::sync::atomic::AtomicU8::new(SLOT_TODO)),
             swiglu_ns: std::sync::atomic::AtomicU64::new(0),
+            claim_ns: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1160,6 +1683,7 @@ impl<'a> DeferredSlots<'a> {
     /// nothing — so no participant can wait on a slot whose claim is
     /// stalled behind another wait, and the wait graph stays acyclic.
     fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
+        let mut t_first: Option<Instant> = None;
         for s in 0..self.slots.len() {
             // Cheap look first: a finished or claimed slot costs a load.
             if self.states[s].load(std::sync::atomic::Ordering::Relaxed) != SLOT_TODO {
@@ -1176,8 +1700,17 @@ impl<'a> DeferredSlots<'a> {
             {
                 continue;
             }
+            if lvl >= 1 && t_first.is_none() {
+                t_first = Some(Instant::now());
+            }
             let _done = ClaimDone(&self.states[s]);
             self.produce(s, lvl, acc);
+        }
+        if let Some(t_first) = t_first {
+            self.claim_ns.fetch_max(
+                t_first.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -1187,14 +1720,14 @@ impl<'a> DeferredSlots<'a> {
     /// at level 1, the encoder at level 2.
     fn produce(&self, s: usize, lvl: u8, acc: &mut profile::CallAcc) {
         let q = self.slots.get(s);
-        if let Some((gate, up, par)) = q.swiglu {
+        if let Some(c) = q.swiglu {
             let t_s = if lvl >= 1 { Some(Instant::now()) } else { None };
-            // SAFETY: `par` aliases this slot's `x`, the par block the entry
-            // allocated and handed off here. This claimer is the block's
-            // only writer: no other participant touches it before the slot
+            // SAFETY: `c.par` aliases this slot's `x`, the par block the entry
+            // placed and handed off here. This claimer is the block's only
+            // writer: no other participant touches it before the slot
             // observes DONE, and the caller reads it only after the join.
-            let par = unsafe { std::slice::from_raw_parts_mut(par.0, par.1) };
-            qdot::swiglu(&gate.data, &up.data, par);
+            let par = unsafe { std::slice::from_raw_parts_mut(c.par.0, c.par.1) };
+            swiglu_into(&c.gate.data, &c.up.data, c.limit, par);
             if let Some(t_s) = t_s {
                 self.swiglu_ns.fetch_add(
                     t_s.elapsed().as_nanos() as u64,
@@ -1233,6 +1766,11 @@ impl<'a> DeferredSlots<'a> {
     /// pool's completion protocol orders the adds before the return).
     fn total_swiglu_ns(&self) -> u64 {
         self.swiglu_ns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The longest claim pass, read on the caller after the join.
+    fn longest_claim_ns(&self) -> u64 {
+        self.claim_ns.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1302,9 +1840,10 @@ fn quantize_slots(
 /// the shape checks here are the single owner of the deferral decision: the
 /// decode shape (every slot exactly one column) with inline claim states
 /// skips the pre-pass, and the row dispatch's participants claim the slots
-/// as their first work. Returns the SwiGLU nanoseconds the claims spent
-/// (worker-side, level >= 1 only) so the caller's profiler wall can hand
-/// them to the `swiglu` site instead of counting them twice.
+/// as their first work. Returns, at level >= 1, the SwiGLU nanoseconds the
+/// claims spent (worker-side, so the caller's profiler wall can hand them to
+/// the `swiglu` site instead of counting them twice) and the activation
+/// stage's share of the wall (the pre-pass, or the longest claim pass).
 #[allow(clippy::too_many_arguments)]
 fn run_group(
     slots: &Flex<QuantSlot<'_>>,
@@ -1315,7 +1854,7 @@ fn run_group(
     lvl: u8,
     pacc: &mut profile::CallAcc,
     want_defer: bool,
-) -> Result<u64, crate::ModelError> {
+) -> Result<RunTimes, crate::ModelError> {
     let n_slots = slots.len();
     let mut quantized: Flex<QuantCols> = Flex::new();
     for s in 0..n_slots {
@@ -1330,8 +1869,13 @@ fn run_group(
         && n_slots <= MAX_DEFER_SLOTS
         && (0..n_slots).all(|s| slots.get(s).x.ne1 == 1))
     .then(|| DeferredSlots::new(slots, &shared));
+    let mut prepass_ns = 0u64;
     if deferred.is_none() {
+        let t_q = if lvl > 0 { Some(Instant::now()) } else { None };
         quantize_slots(slots, &shared, lvl, pacc);
+        if let Some(t_q) = t_q {
+            prepass_ns = t_q.elapsed().as_nanos() as u64;
+        }
     }
     let mut pairs: Flex<PairWork> = Flex::new();
     for (i, out) in outs.iter_mut().enumerate() {
@@ -1357,7 +1901,25 @@ fn run_group(
     }
     run_row_pool(&pairs, lvl, pacc, deferred.as_ref())?;
     quantized.release_all();
-    Ok(deferred.map_or(0, |d| d.total_swiglu_ns()))
+    Ok(match deferred {
+        Some(d) => RunTimes {
+            swiglu_ns: d.total_swiglu_ns(),
+            stage_ns: d.longest_claim_ns(),
+        },
+        None => RunTimes {
+            swiglu_ns: 0,
+            stage_ns: prepass_ns,
+        },
+    })
+}
+
+/// What [`run_group`] hands back, level >= 1 only (zeros when off).
+struct RunTimes {
+    /// The claims' SwiGLU combines, summed over the claimers.
+    swiglu_ns: u64,
+    /// The activation stage's share of the wall: the pre-pass, or the
+    /// longest claim pass.
+    stage_ns: u64,
 }
 
 /// What one row of a pair costs a lane: its weight bytes once per input column
@@ -1843,155 +2405,16 @@ fn matmul_q_multi(
     ws: &[&TensorInfo],
     xs: &[&Tensor2],
 ) -> Result<Vec<Tensor2>, crate::ModelError> {
-    if ws.len() != xs.len() {
-        return Err(crate::ModelError::Shape {
-            what: "matmul_q batch",
-            want_ne0: ws.len(),
-            want_ne1: ws.len(),
-            got_ne0: xs.len(),
-            got_ne1: xs.len(),
-        });
-    }
-    if ws.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Profiler hook: level 0 one compare, level 1 one `Instant` pair, level 2
-    // two more per row, none touching the arithmetic; chunks merge into one
-    // `CallAcc` per weight type, so `record` fires once per (call, type).
-    let lvl = profile::level();
-    let mut pacc = profile::CallAcc::new();
-    let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
-    let mut bytes: Flex<&[u8]> = Flex::new();
-    let mut meta: Flex<PairMeta> = Flex::new();
-    let mut slot_of: Flex<usize> = Flex::new();
-    let mut slots: Flex<QuantSlot> = Flex::new();
-    let mut outs: Vec<Tensor2> = Vec::with_capacity(ws.len());
-    for (w, x) in ws.iter().zip(xs) {
-        let k = w.dims.first().copied().unwrap_or(0) as usize;
-        let n = if w.dims.len() > 1 {
-            w.dims[1] as usize
-        } else {
-            1
-        };
-        let ty = w.ty;
-        if x.ne0 != k {
-            return Err(crate::ModelError::Shape {
-                what: "matmul_q input",
-                want_ne0: k,
-                want_ne1: x.ne1,
-                got_ne0: x.ne0,
-                got_ne1: x.ne1,
-            });
-        }
-        let b = gguf.data(w)?;
-        // Fused path decided per pair, exactly the single-pair rule: qdot
-        // dots the quantized codes directly, so activations are quantized
-        // into `qdot::quantize_col`'s layout, and `k_granularity` owns the
-        // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1).
-        let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
-        let cb = if fused {
-            Some(qdot::col_bytes(ty, k))
-        } else {
-            // The scalar path quantizes into the weight type's activation format;
-            // a type without one is refused here, before any column exists.
-            gguf::activation_format(ty)?;
-            None
-        };
-        // The sharing rule — one quantized buffer per DISTINCT (input,
-        // encoding): same input block AND same fused-ness AND same activation
-        // format. Sound both ways. Sharers write identical bytes: `k` is
-        // pinned to the input's `ne0` by the check above, the encoders are
-        // pure functions of (activation format, k) — `quantize_col`'s arm
-        // and `quantize_activations` both key on the format, never the
-        // weight type — and equal format with equal `k` yields equal
-        // `col_bytes`. Non-sharers never collide: a different format or
-        // fused-ness means the encoders disagree on at least the buffer's
-        // representation, so sharing would feed one pair the other's bytes.
-        let slot = (0..slots.len())
-            .find(|&s| {
-                let q = slots.get(s);
-                q.swiglu.is_none()
-                    && std::ptr::eq(q.x, *x)
-                    && q.cb == cb
-                    && gguf::activation_format(q.ty) == gguf::activation_format(ty)
-            })
-            .unwrap_or_else(|| {
-                slots.push(QuantSlot {
-                    x,
-                    ty,
-                    k,
-                    cb,
-                    swiglu: None,
-                });
-                slots.len() - 1
-            });
-        bytes.push(b);
-        meta.push(PairMeta {
-            ty,
-            k,
-            n,
-            row_bytes: b.len() / n,
-        });
-        slot_of.push(slot);
-        outs.push(Tensor2::scratch(n, x.ne1));
-    }
-    LAST_QUANT_SLOTS.store(slots.len(), std::sync::atomic::Ordering::Relaxed);
-
-    // SAFETY: the construction-site argument in `run_group`'s pair build.
-    run_group(
-        &slots,
-        &slot_of,
-        &bytes,
-        &meta,
-        &mut outs,
-        lvl,
-        &mut pacc,
-        defer_quant(),
+    let (mut outs, mut pars) = (Vec::new(), Vec::new());
+    group_core(
+        Weights::File(gguf, ws),
+        Inputs::Ready(xs),
+        Dest::Alloc {
+            site,
+            outs: &mut outs,
+            pars: &mut pars,
+        },
     )?;
-
-    if let Some(t_call) = t_call {
-        // One row per distinct weight type the group carried. Rows, `k` and
-        // weight bytes are exact per type; wall and the stage accumulators
-        // split by weight-byte share — the honest per-type statement without
-        // per-type timers. The shares sum to the whole call, so
-        // `instrumented_ns` never counts a group twice, and a single-type
-        // group records exactly the homogeneous values.
-        let wall_ns = t_call.elapsed().as_nanos() as u64;
-        let wb_total: u64 = (0..bytes.len()).map(|i| bytes.get(i).len() as u64).sum();
-        let mut tys: Flex<(GgmlType, u64, u64, u64)> = Flex::new();
-        for i in 0..meta.len() {
-            let m = *meta.get(i);
-            let wb = bytes.get(i).len() as u64;
-            let mut j = 0;
-            while j < tys.len() && tys.get(j).0 != m.ty {
-                j += 1;
-            }
-            if j == tys.len() {
-                tys.push((m.ty, m.n as u64, m.k as u64 * m.n as u64, wb));
-            } else {
-                let e = tys.get_mut(j);
-                *e = (
-                    e.0,
-                    e.1 + m.n as u64,
-                    e.2 + m.k as u64 * m.n as u64,
-                    e.3 + wb,
-                );
-            }
-        }
-        for t in 0..tys.len() {
-            let &(ty, rows, k_total, wb) = tys.get(t);
-            let share = |ns: u64| ((ns as u128 * wb as u128) / wb_total as u128) as u64;
-            profile::record(
-                site,
-                ty,
-                rows,
-                k_total,
-                wb,
-                share(wall_ns),
-                &pacc.scaled(wb, wb_total),
-            );
-        }
-    }
     Ok(outs)
 }
 

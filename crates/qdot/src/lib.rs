@@ -2615,6 +2615,71 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// ik's V4.1 SwiGLU, `mul_mat_up_gate_NxM` (`ggml/src/iqk/iqk_mul_mat.cpp`
+/// :155-156 and :168-171 of the tree the V4.1 oracle was built from):
+/// `out[i] = clamp(up[i], -limit, limit) · min(silu(gate[i]), limit)`. The
+/// clamp bites on silu's output, not on the gate, and neither clamp applies
+/// when `limit <= 1e-6` — then this is [`swiglu`]. The `min`/`max` are ik's
+/// `std::min`/`std::max` operand orders: a NaN silu passes its clamp, a NaN up
+/// becomes `limit`. Silu is [`swiglu`]'s `v_silu` lanes, tail included.
+pub fn swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
+    assert!(gate.len() == up.len() && gate.len() == out.len());
+    // ik's own test, so a NaN limit clamps nothing either.
+    if limit > 1e-6 {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: the features were just detected; the slices are equal length.
+            unsafe { swiglu_clamp_avx2(gate, up, limit, out) };
+            return;
+        }
+        for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
+            let s = g / (1.0 + (-g).exp());
+            let s = if limit < s { limit } else { s };
+            let c = if u < limit { u } else { limit };
+            let c = if -limit < c { c } else { -limit };
+            *o = c * s;
+        }
+    } else {
+        swiglu(gate, up, out);
+    }
+}
+
+/// # Safety
+/// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
+/// the same length — the loads and the store share one index.
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
+    let n = gate.len();
+    let full = n / 8 * 8;
+    // `min_ps(a, b)` is `a < b ? a : b` and `max_ps(a, b)` is `a > b ? a : b`,
+    // so `min_ps(hi, s)` is `std::min(s, limit)`, `min_ps(u, hi)` is
+    // `std::min(limit, u)` and `max_ps(c, lo)` is `std::max(-limit, c)`.
+    let hi = _mm256_set1_ps(limit);
+    let lo = _mm256_set1_ps(-limit);
+    let mut i = 0;
+    while i < full {
+        // SAFETY: `i + 8 <= full <= n` for all three slices.
+        unsafe {
+            let s = _mm256_min_ps(hi, v_silu(_mm256_loadu_ps(gate.as_ptr().add(i))));
+            let c = _mm256_max_ps(_mm256_min_ps(_mm256_loadu_ps(up.as_ptr().add(i)), hi), lo);
+            _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_mul_ps(c, s));
+        }
+        i += 8;
+    }
+    if full < n {
+        let (mut gp, mut upad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+        gp[..n - full].copy_from_slice(&gate[full..]);
+        upad[..n - full].copy_from_slice(&up[full..]);
+        // SAFETY: the three arrays are eight f32 each.
+        unsafe {
+            let s = _mm256_min_ps(hi, v_silu(_mm256_loadu_ps(gp.as_ptr())));
+            let c = _mm256_max_ps(_mm256_min_ps(_mm256_loadu_ps(upad.as_ptr()), hi), lo);
+            _mm256_storeu_ps(op.as_mut_ptr(), _mm256_mul_ps(c, s));
+        }
+        out[full..].copy_from_slice(&op[..n - full]);
+    }
+}
+
 /// # Safety
 /// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
 /// the same length — the loads and the store share one index.

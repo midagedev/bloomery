@@ -456,6 +456,13 @@ gate-placement:
 gate-ds41-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::hparams --nocapture && bash tools/gate.sh --release -p bloomery-model --test ds41_meta -- --ignored --nocapture'
 
+# V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 5토큰 세트의
+# 모든 층에서 ik의 라우팅을 주입해 호스트 티어가 낸 routed 부분합을 ik의 ffn_moe_out과 도출한 밴드 안에서 대조한다
+# (플립은 따로 세고, 층마다 클램프 히트 수를 찍는다). 세트가 라우팅한 expert만 읽는다. 끝으로 크레이트 doctest —
+# ops::ShardTensor의 compile_fail(다른 샤드를 가리키는 핸들은 만들 수 없다).
+gate-ds41-host:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test ds41_host -- --ignored --nocapture && bash tools/gate.sh --release -p bloomery-model --doc'
+
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
 # hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다.
 gate-threads:

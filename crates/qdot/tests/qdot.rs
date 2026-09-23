@@ -1344,6 +1344,163 @@ fn swiglu_matches_scalar_and_is_position_independent() {
     assert_eq!(ends, [-0.0, 200.0]);
 }
 
+// ------------------------------------------------- clamped SwiGLU (V4.1)
+// The reference below is ik's rule written out again in scalar f32 from ik's
+// source, not a call into qdot: a clamp deleted from `swiglu_clamp` cannot be
+// deleted from this transcription too.
+
+/// ik's AVX2 `v_expf` (`ggml/src/iqk/iqk_utils.h:170-222`), one lane: each
+/// `_mm256_fmadd_ps`/`_mm256_fnmadd_ps` a `mul_add`, the scale `2^n` built in
+/// the exponent bits of `z`, and the two escapes for `|n| > 126` (split scale)
+/// and `|n| > 192` (overflow, underflow). The constants are ik's hex floats as
+/// bit patterns.
+fn ik_expf(x: f32) -> f32 {
+    let c = f32::from_bits;
+    let r = c(0x4B40_0000); // 0x1.8p23
+    let z = x.mul_add(c(0x3FB8_AA3B), r); // 0x1.715476p+0
+    let n = z - r;
+    // fnmadd(n, 0x1.7f7d1cp-20, fnmadd(n, 0x1.62e4p-1, x))
+    let b = (-n).mul_add(c(0x35BF_BE8E), (-n).mul_add(c(0x3F31_7200), x));
+    let e = z.to_bits() << 23;
+    let k = c(e.wrapping_add(1.0f32.to_bits()));
+    let u = b * b;
+    // fmadd(fmadd(fmadd(0x1.0e4020p-7, b, 0x1.573e2ep-5), u,
+    //             fmadd(0x1.555e66p-3, b, 0x1.fffdb6p-2)), u, 0x1.ffffecp-1 * b)
+    let j = c(0x3C07_2010)
+        .mul_add(b, c(0x3D2B_9F17))
+        .mul_add(u, c(0x3E2A_AF33).mul_add(b, c(0x3EFF_FEDB)))
+        .mul_add(u, c(0x3F7F_FFF6) * b);
+    // `_CMP_GT_OQ`: false on a NaN `n`, which takes the main path.
+    if n.abs() > 126.0 {
+        let g: u32 = if n <= 0.0 { 0x8200_0000 } else { 0 };
+        let s1 = c(g.wrapping_add(0x7F00_0000));
+        let s2 = c(e.wrapping_sub(g));
+        return if n.abs() > 192.0 {
+            s1 * s1
+        } else {
+            s2.mul_add(j, s2) * s1
+        };
+    }
+    j.mul_add(k, k)
+}
+
+/// ik's `mul_mat_up_gate_NxM` for one value (`ggml/src/iqk/iqk_mul_mat.cpp`
+/// :153-171): `tmp = silu(gate)` (`v_silu`: `x / (1 + v_expf(0 - x))`), then,
+/// when `limit > 1e-6f`, `tmp = std::min(tmp, limit)` and `result =
+/// std::max(-limit, std::min(limit, up))`; `result *= tmp`. `std::min(a, b)`
+/// is `b < a ? b : a` and `std::max(a, b)` is `a < b ? b : a`.
+fn ik_swiglu_clamp(gate: f32, up: f32, limit: f32) -> f32 {
+    let mut tmp = gate / (1.0 + ik_expf(0.0 - gate));
+    let mut result = up;
+    if limit > 1e-6 {
+        tmp = if limit < tmp { limit } else { tmp };
+        result = if result < limit { result } else { limit };
+        result = if -limit < result { result } else { -limit };
+    }
+    result * tmp
+}
+
+/// `swiglu_clamp` against the transcription, bit for bit, on inputs past the
+/// limit on every side (silu above it, up above `limit` and below `-limit`,
+/// the edges themselves, both zeros, NaN), in a vector whose length leaves an
+/// eight-lane tail; every value alone must equal its value in the block. A
+/// limit at or below 1e-6 (or NaN) clamps nothing: bit for bit `swiglu`.
+#[test]
+fn swiglu_clamp_matches_ik_rule() {
+    let gates = [
+        -200.0f32,
+        -20.0,
+        -10.5,
+        -1.2785,
+        -0.0,
+        0.0,
+        0.5,
+        2.4,
+        6.99,
+        7.001,
+        9.99,
+        10.0,
+        10.0005,
+        10.001,
+        10.5,
+        12.0,
+        30.0,
+        88.0,
+        100.0,
+        200.0,
+        f32::NAN,
+    ];
+    let ups = [
+        -1000.0f32,
+        -10.001,
+        -10.0,
+        -9.99,
+        -7.5,
+        -0.0,
+        0.0,
+        3.0,
+        7.5,
+        9.99,
+        10.0,
+        10.001,
+        50.0,
+        f32::NAN,
+    ];
+    let (gate, up): (Vec<f32>, Vec<f32>) = gates
+        .iter()
+        .flat_map(|&g| ups.iter().map(move |&u| (g, u)))
+        .unzip();
+    let n = gate.len();
+    assert_ne!(n % 8, 0, "the set must leave a tail");
+    let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+    for limit in [10.0f32, 7.0, 2.5e-6] {
+        let mut out = vec![0.0f32; n];
+        qdot::swiglu_clamp(&gate, &up, limit, &mut out);
+        let (mut silu_hi, mut up_hi, mut up_lo) = (0, 0, 0);
+        for i in 0..n {
+            let want = ik_swiglu_clamp(gate[i], up[i], limit);
+            assert!(
+                same(out[i], want),
+                "limit {limit}: gate {} up {}: got {} ({:#x}), ik's rule {want} ({:#x})",
+                gate[i],
+                up[i],
+                out[i],
+                out[i].to_bits(),
+                want.to_bits()
+            );
+            let mut one = [0.0f32];
+            qdot::swiglu_clamp(&gate[i..i + 1], &up[i..i + 1], limit, &mut one);
+            assert!(
+                same(one[0], out[i]),
+                "limit {limit}: i={i} moves with its position"
+            );
+            silu_hi += usize::from(gate[i] / (1.0 + ik_expf(0.0 - gate[i])) > limit);
+            up_hi += usize::from(up[i] > limit);
+            up_lo += usize::from(up[i] < -limit);
+        }
+        assert!(
+            silu_hi > 0 && up_hi > 0 && up_lo > 0,
+            "limit {limit}: the set must cross every side (silu > L {silu_hi}, u > L {up_hi}, u < -L {up_lo})"
+        );
+        eprintln!(
+            "swiglu_clamp limit {limit}: {n} values bit-identical to ik's rule (silu > L {silu_hi}, u > L {up_hi}, u < -L {up_lo})"
+        );
+    }
+    for limit in [1e-6f32, 0.0, -3.0, f32::NAN] {
+        let (mut got, mut plain) = (vec![0.0f32; n], vec![0.0f32; n]);
+        qdot::swiglu_clamp(&gate, &up, limit, &mut got);
+        qdot::swiglu(&gate, &up, &mut plain);
+        for i in 0..n {
+            assert!(
+                same(got[i], plain[i]),
+                "limit {limit}: gate {} up {}: a limit <= 1e-6 must clamp nothing",
+                gate[i],
+                up[i]
+            );
+        }
+    }
+}
+
 // --------------------------------------------------------- sum_sq_f64
 // The laned f64 sum against the left-to-right one: equal to f64 rounding, and
 // equal exactly once narrowed to f32 — the only form the norm consumes.

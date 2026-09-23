@@ -4,16 +4,17 @@
 //! shapes, read in place from the file's own page-cache pages. It is not a
 //! gate; the verdicts it prints guard its own measurement.
 //!
-//! Per token, every layer runs the dispatch shape `moe::moe_ffn_with` issues,
-//! over `n_host` routed experts: gate and up of every expert in one
-//! `ops::matmul_q_group`, then every down projection in one
-//! `ops::matmul_q_group_swiglu` whose inputs are the SwiGLU combines. The
+//! Per token, every layer runs the dispatch shape the host tier issues
+//! (`moe::HostLayer`), over `n_host` routed experts: gate and up of every
+//! expert in one `ops::matmul_q_group_into`, then every down projection in one
+//! `ops::matmul_q_group_swiglu_into` whose inputs are the SwiGLU combines. The
 //! shared expert is not part of the leg (q8_0, on a card in every placement
-//! plan). `matmul_q_group` reads one shard, so a layer whose gate and up
-//! stacks sit in different shards runs its gate+up group once per shard; the
-//! start-up table names those layers. A layer's output does not feed the
-//! next: in serving the card sits between them. The per-matrix shape runs
-//! the same rows as one dispatch per expert matrix.
+//! plan). Every matrix is cut from its stack's `ops::ShardTensor`, which reads
+//! the shard that holds it, so a layer whose stacks sit in different shards
+//! still runs one group of each; the start-up table names those layers. A
+//! layer's output does not feed the next: in serving the card sits between
+//! them. The per-matrix shape runs the same rows as one dispatch per expert
+//! matrix.
 //!
 //! Weights: `gguf::Split` over `$BLOOMERY_REF_MODEL`, mapped lazily, never
 //! copied — file-backed page-cache pages, as serving reads them. A layer's
@@ -57,7 +58,10 @@ use std::time::Instant;
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row};
 use model::ModelError;
 use model::moe::expert_view;
-use model::ops::{GroupInput, Tensor2, matmul_q, matmul_q_group, matmul_q_group_swiglu};
+use model::ops::{
+    GroupInput, ShardTensor, Tensor2, Weight, matmul_q, matmul_q_group_into, matmul_q_group_swiglu,
+    matmul_q_group_swiglu_into,
+};
 
 type BenchError = Box<dyn std::error::Error>;
 
@@ -88,6 +92,9 @@ const GATE: usize = 0;
 const UP: usize = 1;
 const DOWN: usize = 2;
 const MATRIX: [&str; 3] = ["gate", "up", "down"];
+/// Pool dispatches of the engine shape per layer: the gate+up group and the
+/// down group.
+const ENGINE_DISPATCHES: usize = 2;
 
 const USAGE: &str = "usage: bench_v41_host --check
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
@@ -221,11 +228,14 @@ fn find_stacks<'a>(split: &'a Split, meta: &Meta) -> Result<Vec<[Stack<'a>; 3]>,
         .collect()
 }
 
-/// One expert of a layer's working set: its id and its `[gate, up, down]`
-/// views, cut by the engine's `moe::expert_view`.
-struct Expert {
+/// One expert of a layer's working set: its id, its `[gate, up, down]` views
+/// cut by the engine's `moe::expert_view` (the per-matrix shape's), and the
+/// same matrices as dispatch weights cut from the stacks' `ShardTensor`s (the
+/// engine shape's).
+struct Expert<'a> {
     id: usize,
     views: [TensorInfo; 3],
+    weights: [Weight<'a>; 3],
 }
 
 /// One layer as the bench runs it: its stacks, the reader of each stack's
@@ -234,13 +244,18 @@ struct Layer<'a> {
     index: usize,
     stacks: [Stack<'a>; 3],
     readers: [&'a Gguf; 3],
-    experts: Vec<Expert>,
+    experts: Vec<Expert<'a>>,
 }
 
-impl Layer<'_> {
+impl<'a> Layer<'a> {
     /// Matrix `m` of working-set slot `s`.
     fn view(&self, s: usize, m: usize) -> &TensorInfo {
         &self.experts[s].views[m]
+    }
+
+    /// Matrix `m` of working-set slot `s`, as a dispatch weight.
+    fn weight(&self, s: usize, m: usize) -> Weight<'a> {
+        self.experts[s].weights[m]
     }
 
     /// File bytes one expert of this layer reads: its three matrices.
@@ -250,15 +265,10 @@ impl Layer<'_> {
             .map_or(0, |e| e.views.iter().map(|v| v.nbytes).sum())
     }
 
-    /// Gate and up in different shards: the engine shape's gate+up group
-    /// runs once per shard.
-    fn split_gate_up(&self) -> bool {
-        self.stacks[GATE].shard != self.stacks[UP].shard
-    }
-
     /// The three stacks span more than one shard.
     fn spans_shards(&self) -> bool {
-        self.split_gate_up() || self.stacks[DOWN].shard != self.stacks[GATE].shard
+        self.stacks[UP].shard != self.stacks[GATE].shard
+            || self.stacks[DOWN].shard != self.stacks[GATE].shard
     }
 }
 
@@ -273,6 +283,8 @@ fn build_layers<'a>(split: &'a Split, meta: &Meta) -> Result<Vec<Layer<'a>>, Ben
                 .ok_or_else(|| format!("layer {index}: the split has no shard {s}").into())
         };
         let readers = [reader(GATE)?, reader(UP)?, reader(DOWN)?];
+        let handle = |m: usize| ShardTensor::find(split, &stacks[m].info.name);
+        let handles = [handle(GATE)?, handle(UP)?, handle(DOWN)?];
         let ids = distinct(
             &mut Rng::new(&[KEY_SET, index as u64]),
             WORKING_SET,
@@ -281,9 +293,11 @@ fn build_layers<'a>(split: &'a Split, meta: &Meta) -> Result<Vec<Layer<'a>>, Ben
         let mut experts = Vec::with_capacity(ids.len());
         for id in ids {
             let view = |m: usize| expert_view(stacks[m].info, id, meta.n_expert);
+            let weight = |m: usize| handles[m].expert(split, id);
             experts.push(Expert {
                 id,
                 views: [view(GATE)?, view(UP)?, view(DOWN)?],
+                weights: [weight(GATE)?, weight(UP)?, weight(DOWN)?],
             });
         }
         layers.push(Layer {
@@ -403,14 +417,19 @@ impl Tally {
 }
 
 /// Weight bytes a dispatch reads.
-fn bytes_of(ws: &[&TensorInfo]) -> u64 {
-    ws.iter().map(|w| w.nbytes).sum()
+fn bytes_of(ws: &[Weight<'_>]) -> u64 {
+    ws.iter().map(|w| w.bytes().len() as u64).sum()
 }
 
-/// The engine's shape: gate and up of every expert in one group, the views
-/// interleaved per expert as `moe`'s gate/up batch lays them out (one group
-/// per shard when the two stacks sit in different shards), then one down
-/// group whose inputs are the SwiGLU combines.
+/// One output block per weight, off the pool, for an `_into` dispatch.
+fn blocks(ws: &[Weight<'_>]) -> Vec<Tensor2> {
+    ws.iter().map(|w| Tensor2::scratch(w.n(), 1)).collect()
+}
+
+/// The engine's shape: gate and up of every expert in one group, the
+/// weights interleaved per expert as the host tier lays them out, each read
+/// from its own shard, then one down group whose inputs are the SwiGLU
+/// combines.
 fn engine_layer(
     l: &Layer<'_>,
     slots: &[usize],
@@ -418,42 +437,35 @@ fn engine_layer(
     tally: &mut Tally,
 ) -> Result<LayerOut, ModelError> {
     let n = slots.len();
-    let (gate, up) = if l.split_gate_up() {
-        let xs = vec![x; n];
-        let gw: Vec<&TensorInfo> = slots.iter().map(|&s| l.view(s, GATE)).collect();
-        let uw: Vec<&TensorInfo> = slots.iter().map(|&s| l.view(s, UP)).collect();
-        let t0 = Instant::now();
-        let gate = matmul_q_group(l.readers[GATE], &gw, &xs)?;
-        tally.add("gate", bytes_of(&gw), t0);
-        let t0 = Instant::now();
-        let up = matmul_q_group(l.readers[UP], &uw, &xs)?;
-        tally.add("up", bytes_of(&uw), t0);
-        (gate, up)
-    } else {
-        let xs = vec![x; 2 * n];
-        let ws: Vec<&TensorInfo> = slots
-            .iter()
-            .flat_map(|&s| [l.view(s, GATE), l.view(s, UP)])
-            .collect();
-        let t0 = Instant::now();
-        let gu = matmul_q_group(l.readers[GATE], &ws, &xs)?;
-        tally.add("gate+up", bytes_of(&ws), t0);
-        let (mut gate, mut up) = (Vec::with_capacity(n), Vec::with_capacity(n));
-        let mut gu = gu.into_iter();
-        while let (Some(g), Some(u)) = (gu.next(), gu.next()) {
-            gate.push(g);
-            up.push(u);
-        }
-        (gate, up)
-    };
-    let dw: Vec<&TensorInfo> = slots.iter().map(|&s| l.view(s, DOWN)).collect();
+    let xs = vec![x; 2 * n];
+    let ws: Vec<Weight<'_>> = slots
+        .iter()
+        .flat_map(|&s| [l.weight(s, GATE), l.weight(s, UP)])
+        .collect();
+    let mut gu = blocks(&ws);
+    let t0 = Instant::now();
+    matmul_q_group_into("host_gate_up", &ws, &xs, &mut gu)?;
+    tally.add("gate+up", bytes_of(&ws), t0);
+    let (mut gate, mut up) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut gu = gu.into_iter();
+    while let (Some(g), Some(u)) = (gu.next(), gu.next()) {
+        gate.push(g);
+        up.push(u);
+    }
+    let dw: Vec<Weight<'_>> = slots.iter().map(|&s| l.weight(s, DOWN)).collect();
     let srcs: Vec<GroupInput<'_>> = gate
         .iter()
         .zip(&up)
         .map(|(g, u)| GroupInput::Swiglu(g, u))
         .collect();
+    let (mut down, mut par) = (
+        blocks(&dw),
+        gate.iter()
+            .map(|g| Tensor2::scratch(g.ne0, 1))
+            .collect::<Vec<_>>(),
+    );
     let t0 = Instant::now();
-    let (down, par) = matmul_q_group_swiglu(l.readers[DOWN], &dw, &srcs)?;
+    matmul_q_group_swiglu_into("host_down", &dw, &srcs, &mut down, &mut par)?;
     tally.add("down", bytes_of(&dw), t0);
     drop(srcs);
     Ok(LayerOut {
@@ -685,8 +697,8 @@ fn print_mem() -> Result<(), BenchError> {
     Ok(())
 }
 
-/// The start-up table: the file's shape, each layer's shards and types, the
-/// layers whose gate+up group splits, and the bytes each default arm reads.
+/// The start-up table: the file's shape, each layer's shards and types, and
+/// the layers whose stacks span shards.
 fn print_table(path: &str, split: &Split, meta: &Meta, layers: &[Layer<'_>]) {
     println!(
         "v41host model={path} shards={} blocks={} embd={} ff={} experts={} used={} working_set={WORKING_SET}",
@@ -709,21 +721,16 @@ fn print_table(path: &str, split: &Split, meta: &Meta, layers: &[Layer<'_>]) {
             st[DOWN].info.ty,
             st[DOWN].shard,
             l.expert_bytes(),
-            if l.split_gate_up() { 3 } else { 2 }
+            ENGINE_DISPATCHES
         );
     }
-    let split_layers: Vec<usize> = layers
-        .iter()
-        .filter(|l| l.split_gate_up())
-        .map(|l| l.index)
-        .collect();
     let spanning: Vec<usize> = layers
         .iter()
         .filter(|l| l.spans_shards())
         .map(|l| l.index)
         .collect();
     println!(
-        "v41host gate_up_split_layers={split_layers:?} (their gate+up group runs once per shard) shard_spanning_layers={spanning:?}"
+        "v41host shard_spanning_layers={spanning:?} (one gate+up group and one down group each, every matrix read from its own shard)"
     );
 }
 
@@ -1074,10 +1081,7 @@ impl Arm {
         if self.per_matrix {
             3 * self.n_host * layers.len()
         } else {
-            layers
-                .iter()
-                .map(|l| if l.split_gate_up() { 3 } else { 2 })
-                .sum()
+            ENGINE_DISPATCHES * layers.len()
         }
     }
 }
