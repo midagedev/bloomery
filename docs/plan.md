@@ -611,6 +611,12 @@ flowchart LR
 ㊶ (ktok, 원문 [`research/ktok-report.md`](research/ktok-report.md), 머지 `77eaf88` — 탐침은 `bench_v41_host` 팔 문법 `<n_host>x<rows>`·`engine-sep`로 남김, 리드 재실행 check·lint 169·fmt·recipes·comments·arch 전부 rc=0) 한 토큰 가정 지도 27행(C4 카드에 요약). 지금 할 것: **`attn.rs:701` gm≠1 거부**(비율 1 스트림 20층이 k=2에서 오늘 거부됨, S), `head.rs` m=1 assert(dspark도 막힘), `hc.rs:83` `HC_MAX_TOKENS=8`·gemv m≤8·`Q8Act` m≤8이 K_MAX 벽(스펙의 `tensor.rs:106`은 K축 한계라 틀림). 스펙 밖: `bench_v41_host.rs:425` `blocks()`가 시간 안에서 할당(XS), `ops.rs:1599` `MAX_DEFER_SLOTS` 16 초과 그룹이 호출자 결합으로(행당 +0.19 ms[유도], XS–S), `cores.rs:817` q3_K 1col = 다열 열 0 비트 핀 없음(XS 게이트).
 ㊷ (dspark, 원문 [`research/dspark-report.md`](research/dspark-report.md), 읽기 전용) 스펙 밖: `router.rs:41,44` `N_EXPERT`/`N_USED` 컴파일 상수(128/3 드래프트 불가, const generic S), `experts.rs:49` combine 슬롯 리터럴 6(S), `gguf/quant.rs:33` MXFP4(39) 없음(XS–S), `experts.rs:23` SwiGLU clamp 규칙(ik `min(silu(g),10)` 대 `model.py` `silu(min(g,10))`, g>10에서 ~5e-5) 문서 없음(XS). 3090 BW는 250 W 캡 아래 미확인(D 유도의 전제).
 
+## 공개 (사용자 09-24 "빨리 공개 수준으로 올려서 이슈화하고 싶어")
+
+- **M1 숫자 공개(이번 주)**: 실제 텍스트 헤드라인 + 드래프트 켠 값(자리 8·9), 카드 크기 곡선 24/38/41 GB(E21·E21b), ik 같은 창 비교; rig-log 글(영어 요약 + 한국어 본문) + 30초 영상(드라이브); 공개 전 스크럽(BMC·사설 주소·호스트명·bug-report 아카이브 grep); "우리가 아는 한 V4.1 Flash를 CPU expert 오프로딩으로 돌리는 유일한 Rust 엔진(커널까지 Rust)" 주장은 글 쓰는 날 mistral.rs·candle 등에서 재확인해 "as far as we know"로. 결정 대기: 라이선스(추천 Apache-2.0), M1 시점 레포 공개 여부(추천: 공개, README에 numbers first / CLI in progress).
+- **M2 돌려 볼 수 있게(~2주)**: **토크나이저**(`tok` 라운드 — GGUF vocab 바이트 BPE 인코드/디코드, 게이트 = `llama-tokenize`와 코퍼스 id 동일), `bloomery-chat` 바이너리(템플릿·샘플링·스트리밍), README(빌드 한 줄·하드웨어·모델 파일; E20으로 변환 절차 삭제 여부), 30분 soak.
+- **M3 서버/커뮤니티**: OpenAI 호환 엔드포인트 하나, 이슈 템플릿, 기여 안내.
+
 ## 타겟 프로필 (사용자 09-24 "3090 하나 혹은 두 개에 스레드리퍼 AVX2로 V4.1 Flash를 돌려볼 사람")
 
 공개 글의 헤드라인은 **타겟 독자가 가진 하드웨어의 값**이어야 한다. 지금 표는 전부 A6000(48 GB) plan (a)라 두 군데가 다르다.
