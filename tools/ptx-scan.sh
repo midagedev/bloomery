@@ -19,7 +19,7 @@
 # read from those files and from nothing else in the section.
 #
 # Asserting is the gates' job. This script only prints a table:
-#   gate_p5 `no_local_depot`        — depot, ld.local and st.local are all 0 for the four flash
+#   gate_p5 (lib `no_local_depot`)  — depot, ld.local and st.local are all 0 for the four flash
 #                                     kernels and the two kv_append entries
 #   gate_p4 `norm_geometry`         — .reqntid of rms_norm and norm_quant == RMS_THREADS
 #   gate_p4 `argmax_geometry`       — .reqntid of argmax == ARGMAX_THREADS

@@ -16,8 +16,8 @@
 //! Two root causes were found this way and both are now asserted from here:
 //! a per-lane accumulator array spilled to a local depot (round-trip per
 //! multiply-add), and a launch geometry that left one warp resident for a
-//! whole row. `gate_p5::no_local_depot` asserts the depot counts of the
-//! flash kernels; `gate_p4::norm_geometry` asserts `rms_norm`/`norm_quant`
+//! whole row. `gate_p5` asserts the depot counts of the flash kernels through
+//! [`crate::no_local_depot`]; `gate_p4::norm_geometry` asserts `rms_norm`/`norm_quant`
 //! and `argmax` against the block width their host side launches;
 //! `gate_p6` asserts the router gemvs' multiply-add floor and the Q3_K
 //! entries' hardware f16 convert.

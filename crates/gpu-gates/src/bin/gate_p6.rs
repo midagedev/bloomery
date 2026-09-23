@@ -33,7 +33,7 @@
 //!
 //! Asserted as a shape and not as a clock: `router_topk` and `expert_table`
 //! compile with no local depot and at the block width their host side
-//! launches (`router_shape`, the `gate_p5::no_local_depot` /
+//! launches (`router_shape`, the `bloomery_gpu_gates::no_local_depot` /
 //! `gate_p4::argmax_geometry` pattern). A per-thread array indexed by a
 //! data-dependent id is a register spill that no band and no bit-identity
 //! can see — it was the router's whole defect, and the assertion is what
