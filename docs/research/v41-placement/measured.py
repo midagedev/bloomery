@@ -12,9 +12,14 @@ L01 = 2 * 6 * (2 * 5_068_800 + 8_110_080)  # layers 0,1: all six experts on the 
 HOST_A, GPU_A = 3.418e9, 0.625e9            # placement (a): prefix n_l = 62-63 per layer, the allocator's rounding a card term
 # M: b2h sweep, CPU lease, T = 16..32, engine group dispatches (rig-log 09-23#v41-host-leg)
 HOST_GBPS = (127.7, 129.9)
-# A: ~500 non-gemv nodes x 0.80 us + 0.5-1.0 ms of new unfused V4.1 ops (b4plan)
-NONGEMV = (0.9, 1.4)
-KV = 0.16                    # D: KV at D = 4096, 195 GB/s (placement doc)
+# D: the B5 node table (docs/research/v41-b5-plan/nodes.py, n = 1, D = 4096). It replaced two
+# assumptions of the first re-derivation: non-gemv nodes 0.9-1.4 ms and KV 0.16 ms at 195 GB/s.
+NONGEMV = (1.59, 2.19)       # D: non-gemv nodes on the critical path, 1.89 ms, small kernels +-0.3 [A]
+ATTN = (0.50, 0.68)          # D: 64-head attention 0.39-0.57 ms (compute-bound, 131 kFLOP/key) + merge 0.11
+EXP_QUANT = 0.08             # D: the GPU experts' activation quant, 38 layers, in the host-leg shadow under R1
+HC_PRE_FFN = 0.164           # D: HC_PRE(ffn) after `go`, in the host-leg shadow
+ENGRAM_WKV = 0.508           # M: 2 x 254.2 us inside the dense graph; B5 runs it in layer 0's host-leg shadow
+LOOKUP = 0.31                # M: engram row lookup on the step thread (v41-placement.md, engram)
 JOIN = (0.7, 0.9)            # D: memop counter join, 40 layers, not hidden (b2a)
 B11B = (0.0, 0.0)            # M: B11b is in the token graph above (its prize is spent)
 B11B_SHARED = 0.0
@@ -23,19 +28,24 @@ r_sel = EXP_ALL / 1e9 / SEL_MS                    # GB per ms on the GPU `_sel` 
 dense_today, dense_woa = TOKEN_TODAY_MS - SEL_MS, TOKEN_WOA_MS - SEL_MS
 
 
-def compose(dense, host_bytes, gpu_bytes, gbps, nongemv, join, b11b):
+def compose(dense, host_bytes, gpu_bytes, gbps, nongemv, attn, join, b11b):
     host = host_bytes / 1e9 / gbps * 1e3
-    gexp = gpu_bytes / 1e9 / r_sel
-    serial = dense - b11b + gexp + nongemv + KV + join + host
-    hidden = SHARED_MS + gexp
+    gexp = gpu_bytes / 1e9 / r_sel + EXP_QUANT
+    # R1: the critical path is the dense graph without the shared expert and the engram wkv, plus
+    # the non-gemv critical nodes, attention, the joins, the lookup and the host leg.
+    r1 = dense - b11b - SHARED_MS - ENGRAM_WKV + nongemv + attn + join + LOOKUP + host
+    hidden = SHARED_MS + gexp + ENGRAM_WKV + HC_PRE_FFN
     assert host > hidden, "R1 assumes the host leg is the longer one in every layer"
-    return serial, serial - hidden, host
+    # serial: the shared and GPU experts no longer overlap the host leg; the wkv and HC_PRE(ffn)
+    # placements do not depend on R1
+    serial = r1 + SHARED_MS + gexp
+    return serial, r1, host
 
 
 def row(label, dense, host_bytes, gpu_bytes, levers):
-    lo = compose(dense, host_bytes, gpu_bytes, HOST_GBPS[0], NONGEMV[1], JOIN[1], levers[0])
-    hi = compose(dense, host_bytes, gpu_bytes, HOST_GBPS[1], NONGEMV[0], JOIN[0], levers[1])
-    mid = compose(dense, host_bytes, gpu_bytes, sum(HOST_GBPS) / 2, sum(NONGEMV) / 2,
+    lo = compose(dense, host_bytes, gpu_bytes, HOST_GBPS[0], NONGEMV[1], ATTN[1], JOIN[1], levers[0])
+    hi = compose(dense, host_bytes, gpu_bytes, HOST_GBPS[1], NONGEMV[0], ATTN[0], JOIN[0], levers[1])
+    mid = compose(dense, host_bytes, gpu_bytes, sum(HOST_GBPS) / 2, sum(NONGEMV) / 2, ATTN[0],
                   sum(JOIN) / 2, sum(levers) / 2)
     f = lambda t: 1000.0 / t
     print(f"| {label} | {mid[2]:.2f} | {f(lo[0]):.1f}–{f(hi[0]):.1f} ({f(mid[0]):.1f}) | "
