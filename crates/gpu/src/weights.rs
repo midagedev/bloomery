@@ -208,6 +208,33 @@ impl Weights {
         Ok(Weights { by_name })
     }
 
+    /// Upload every tensor of `split` whose name `keep` accepts, each from
+    /// its own shard, in the device format its kernel consumes — how a gate
+    /// makes one layer, or one piece of a step, resident from a multi-shard
+    /// file without a placement plan. As in [`Weights::load`], a kept tensor
+    /// whose type has no device format is an error naming it.
+    pub fn load_where(
+        stream: &CudaStream,
+        split: &Split,
+        mut keep: impl FnMut(&str) -> bool,
+    ) -> Result<Weights, GpuError> {
+        stream.context().bind_to_thread()?;
+        let mut by_name = BTreeMap::new();
+        for (shard, t) in split.iter_tensors() {
+            if !keep(&t.name) {
+                continue;
+            }
+            let gguf = split.shard(shard).ok_or_else(|| {
+                GpuError::shape(
+                    "Weights::load_where",
+                    format!("{} names shard {shard}, which the split lacks", t.name),
+                )
+            })?;
+            by_name.insert(t.name.clone(), upload_file_tensor(stream, gguf, t)?);
+        }
+        Ok(Weights { by_name })
+    }
+
     /// File `w` as a derived weight under `name`. The `derived.` prefix keeps
     /// it out of the file-tensor namespace: a name without it is refused, and
     /// so is a name already resident, so a derived weight never shadows a

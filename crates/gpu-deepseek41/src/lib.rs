@@ -18,6 +18,7 @@
 
 pub mod attn;
 pub mod body;
+pub mod chain;
 pub mod compress;
 pub mod engram_gate;
 pub mod experts;
