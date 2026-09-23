@@ -365,6 +365,11 @@ check-int-twins *ARGS:
 trace-router CORPUS *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
 
+# ik 트리 하나의 wikitext-2 퍼플렉서티(c2048, 4청크, CPU만)를 서빙하는 V4.1 파일로 CPU 임대 아래서 잰다.
+# 두 트리를 연달아 돌리면 포트의 A/B다. ARGS: --chunks N.
+ik-ppl TREE TAG *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/ik-ppl.sh {{TREE}} {{TAG}} {{ARGS}}'
+
 # 1단계 서브블록 게이트. 각 라운드가 자기 것 하나만 소유한다. gate-ops는 bloomery-model 라이브러리의 단위 시험도
 # 같이 돈다(--lib, --include-ignored) — 그것을 도는 레시피가 따로 없다.
 gate-ops:
