@@ -170,6 +170,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "memchr",
+ "thiserror",
+]
+
+[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -516,6 +516,12 @@ gate-qdot:
 gate-engram:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram --test engram -- --ignored --nocapture'
 
+# 토크나이저 게이트: 우리 id가 engram 코퍼스 텍스트 전부와 케이스 파일에서 두 parse 모드 모두
+# llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가. oracle.sh가 오라클 파일을 먼저 다시 쓴다
+# (어휘만 적재, 임대 없음, 1분 안).
+gate-tokenizer:
+    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --test tokenizer -- --ignored --nocapture'
+
 # engram-rate 바이너리. 측정은 tools/ref/engram-rate.sh가 임대 안에서 돌린다 —
 # 이 레시피는 빌드만 한다(러너가 낡은 바이너리를 재는 것을 막는 단계).
 build-engram:

@@ -1,0 +1,25 @@
+# Hand-picked strings for the tokenizer gate; tools/oracle.sh decodes each line with printf %b.
+Hello world
+
+  lead and trail  
+ 
+\n\n\n
+  \n\n x\r\n\ty
+line1\r\nline2\r\n
+a  b
+a  123
+x                    y
+12345 678 9 3.14159e-10, 1,000,000
+안녕하세요, 세계! 한국어 토크나이저 시험입니다.
+❤️ 👨‍👩‍👧 🎉! 👍🏽
+日本語abc カタカナ ひらがな 漢字 Ωmega café naïve Привет мир مرحبا
+~한 !한 ~~ 'hello ~x $x +y
+e\xcc\x81 a\xcc\x88 \xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87
+a\xc2\xa0b\xe3\x80\x80c\xe2\x80\x8bd
+²³ ١٢٣٤ ① ½
+fn main() {\n\tprintln!("{}", x->y);\n}
+<｜begin▁of▁sentence｜>Hi<｜end▁of▁sentence｜> <think>x</think>
+<｜User｜>질문<｜Assistant｜><think>
+a\x00b
+\xff\xfe abc \xc3
+\xc0\x80 \xed\xa0\x80 \xf0\x9f\x98

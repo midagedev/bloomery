@@ -1,0 +1,23 @@
+[package]
+name = "bloomery-tokenizer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+name = "tokenizer"
+
+[[bin]]
+name = "bloomery-tokenize"
+path = "src/bin/bloomery-tokenize.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+# Special-token partition scans the whole text once per special token, as the
+# reference does; memmem keeps that scan at memory speed.
+memchr = "=2.8.3"
+thiserror.workspace = true
