@@ -222,7 +222,8 @@ gate-gpu-p8 *ARGS:
 gate-gpu-moe:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/gpu-gate.sh gate_moe_fused'
 
-# V4.1 router and experts (B4 J, K): router, routed and shared SwiGLU, combine against our rule and the V4.1 ik dumps (5-token and decode-step sets), every layer.
+# V4.1 라우터와 전문가(B4 J·K): 라우터, 라우팅·공유 전문가의 클램프 SwiGLU, combine을 우리 규칙과 V4.1 ik 덤프
+# (5토큰 세트와 디코드 스텝 세트)에 층마다 대조한다. 클램프는 합성 입력으로 한계 너머까지 따로 본다.
 gate-gpu-ds41-moe:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_moe && bash tools/gpu-gate.sh gate_deepseek41_moe'
 
