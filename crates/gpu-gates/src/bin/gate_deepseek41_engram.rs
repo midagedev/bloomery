@@ -1,0 +1,1427 @@
+//! GPU gate for DeepSeek-V4.1's engram gate — B4 op block L
+//! (`docs/research/v41-b4-plan-report.md` §1-L) — against ik's CPU dump:
+//! `ds41_engram_key_norm` (the key side) and `ds41_engram_gate` (the query
+//! side and the stream update) at every engram layer (`engram.layer_ids`) of
+//! every set — the 5-token prefill (T = 5) and the decode steps
+//! [`STEP_SETS`] (T = 1).
+//!
+//! A site is one layer of one set. Its [`CHAIN`] nodes, from the gather of
+//! the looked-up rows to `engram_out-L`, are consecutive in the manifest
+//! (manifest order is execution order); the gate checks their ops, names and
+//! shapes and reads them by position — the anonymous views' `src` columns
+//! name no occurrence, so a name walk cannot tell the key from the query.
+//! Per site, three layers (the B4 gate form):
+//! 1. ik's rule simulated here against the dump, each node from its own
+//!    dumped inputs, then chained from `engram_kv-L` and `l_out-(L−1)` alone:
+//!    the gather at the exact integer ids, both gains, both norms (squares
+//!    summed in f64), the products, SUM_ROWS (f64), SCALE, sgn/abs/clamp/sqrt,
+//!    the sigmoid (`1/(1 + expf(−x))` per value, libm's `expf`), the
+//!    broadcast value times the gate and the add — bit for bit; and
+//!    `engram_wkv` on ik's q8_2 activations against `engram_kv-L` within
+//!    ik's f32 accumulation bound. This proves the semantics: the key and
+//!    value views, the gains per stream, the broadcast, and which activation
+//!    rule ik's projection ran.
+//! 2. The kernels on the dump's `engram_kv-L` and `l_out-(L−1)`, T tokens in
+//!    one launch: against this binary's transcription of our rule,
+//!    bit-identical, and rerun bit-identically; against the dump (`ik_rel`)
+//!    within the band the two rules' difference derives ([`bands`]).
+//! 3. The chain at the decode shape, token by token: the dump's looked-up
+//!    rows through `q8_0_gemv` (f32 activations) into both kernels — the gemv
+//!    against its f64 reference within `KERNEL_BAND`, the kernels against the
+//!    transcription on the gemv's own output, bit-identical, and against the
+//!    dump within the band that ik's q8_2 activations derive through the
+//!    score. The chain captured as one graph replays bit-identically to the
+//!    eager run.
+
+#[cfg(not(feature = "deepseek41"))]
+fn main() {
+    eprintln!(
+        "gate_deepseek41_engram: built without the `deepseek41` feature; see `just gate-gpu-ds41-engram`."
+    );
+    std::process::exit(2);
+}
+
+#[cfg(feature = "deepseek41")]
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_deepseek41_engram", gate::run())
+}
+
+#[cfg(feature = "deepseek41")]
+mod gate {
+    use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
+    use bloomery_gpu::weights::{DevWeight, upload_file_tensor};
+    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu_deepseek41::engram_gate::{
+        CLAMP_MIN, EngramGateKernels, GateArgs, KeyNormArgs, PER_THREAD, ROW, inv_sqrt_row,
+    };
+    use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::{
+        GateError, KERNEL_BAND, Layout, RefManifest, RowKind, bits_equal, checks_failed,
+        max_rel_err, ref_dir_named, ref_ints, ref_model_path, ref_tensor_logical_in, verdict,
+    };
+    use cuda_core::{CudaStream, DeviceBuffer};
+    use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
+    use gguf::{Split, TensorInfo, Value};
+    use model::arch::Arch;
+
+    /// The decode-step sets: one step after a prefill run under the dumped
+    /// schedule (the `-every-node` variants of `tools/ref/models/deepseek41.sh`),
+    /// at positions 4, 301 and 1,025; the `unfused` ones build the indexer's
+    /// scores and top-k as nodes of their own, and `d1n` runs 301 with the
+    /// file's top-k — other graphs whose engram inputs differ.
+    pub const STEP_SETS: [&str; 6] = [
+        "ref_deepseek41_step4_every_node",
+        "ref_deepseek41_d1_every_node",
+        "ref_deepseek41_d1_unfused_every_node",
+        "ref_deepseek41_d1n_every_node",
+        "ref_deepseek41_d2_every_node",
+        "ref_deepseek41_d2_unfused_every_node",
+    ];
+
+    /// Nodes of one engram site, the row gather to `engram_out-L`.
+    const CHAIN: usize = 35;
+    /// Each chain node's op, in manifest order (`ds4_build_engram`, visited
+    /// from `engram_out` source 0 first: the value's branch, then the key's,
+    /// then the query's).
+    const OPS: [&str; CHAIN] = [
+        "GET_ROWS", "RESHAPE", "MUL_MAT", "VIEW", "CONT", "RESHAPE", "REPEAT", "VIEW", "CONT",
+        "RESHAPE", "RMS_NORM", "RESHAPE", "GET_ROWS", "RESHAPE", "MUL", "RESHAPE", "CONT",
+        "RESHAPE", "RMS_NORM", "RESHAPE", "GET_ROWS", "RESHAPE", "MUL", "RESHAPE", "MUL",
+        "SUM_ROWS", "SCALE", "SGN", "ABS", "CLAMP", "SQRT", "MUL", "SIGMOID", "MUL", "ADD",
+    ];
+    // Positions in the chain of the nodes the gate reads.
+    const GATHER: usize = 0;
+    const EMBD: usize = 1;
+    const KV: usize = 2;
+    const VALUE_VIEW: usize = 3;
+    const VALUE_REP: usize = 6;
+    const KEY_VIEW: usize = 7;
+    const K_NORM: usize = 10;
+    const K_GAIN: usize = 12;
+    const KN: usize = 14;
+    const Q_CONT: usize = 16;
+    const Q_NORM: usize = 18;
+    const Q_GAIN: usize = 20;
+    const QN: usize = 22;
+    const PROD: usize = 24;
+    const SUM: usize = 25;
+    const SCALED: usize = 26;
+    const SGN: usize = 27;
+    const ABS: usize = 28;
+    const CLAMPED: usize = 29;
+    const ROOT: usize = 30;
+    const SIGNED: usize = 31;
+    const GATE: usize = 32;
+    const VG: usize = 33;
+    const OUT: usize = 34;
+    /// The chain's CONTs and RESHAPEs, each with the node whose values it
+    /// carries unchanged.
+    const COPIES: [(usize, usize); 11] = [
+        (4, VALUE_VIEW),
+        (5, VALUE_VIEW),
+        (8, KEY_VIEW),
+        (9, KEY_VIEW),
+        (11, K_NORM),
+        (13, K_GAIN),
+        (15, KN),
+        (17, Q_CONT),
+        (19, Q_NORM),
+        (21, Q_GAIN),
+        (23, QN),
+    ];
+
+    /// f32's unit roundoff, 2^-24.
+    const U: f64 = f32::EPSILON as f64 / 2.0;
+    /// f64's unit roundoff, 2^-53.
+    const U64: f64 = f64::EPSILON / 2.0;
+
+    /// Roundings on our side of a norm's sum of squares: [`PER_THREAD`] fused
+    /// multiply-adds per thread, five butterfly levels and three
+    /// `rms_warp_tree` levels. The terms are non-negative, so the sum is
+    /// within this many `u` of itself.
+    const OUR_SUM_ROUNDINGS: f64 = PER_THREAD as f64 + 5.0 + 3.0;
+
+    /// How far our norm scale and ik's can sit apart on the same row,
+    /// relative to the scale. Sums: ours within [`OUR_SUM_ROUNDINGS`]·u; ik's
+    /// rounds each square once (u) and sums in f64 (`ROW`·2^-53). Means: each
+    /// side rounds once more (2u; ours divides in f32, ik casts its f64
+    /// quotient). `+ eps` rounds each side (2u). The square root halves the
+    /// relative distance and rounds each side (2u); the reciprocal rounds
+    /// each side (2u).
+    fn scale_rel() -> f64 {
+        let means = OUR_SUM_ROUNDINGS * U + U + ROW as f64 * U64 + 2.0 * U;
+        (means + 2.0 * U) / 2.0 + 2.0 * U + 2.0 * U
+    }
+
+    /// The exponential's distance between the two rules, relative to it: ours
+    /// is the device's f64 `exp` (within one f64 ulp, 2^-28 of u) rounded
+    /// once (u); ik's is glibc's `expf`, within 0.502 ulp (its source's
+    /// bound), and an ulp is at most 2u.
+    const EXP_REL: f64 = (1.0 + 1.0 / 268_435_456.0 + 2.0 * 0.502) * U;
+
+    /// ik's q8_2 activation blocks: 32 values under one bf16 scale.
+    const QK: usize = 32;
+
+    // ------------------------------------------------------------ metadata
+
+    /// The file's engram constants.
+    struct Meta {
+        eps: f32,
+        hc: usize,
+        layers: Vec<usize>,
+        /// Values in one table row (`engram.key_length`).
+        key_len: usize,
+        /// Rows gathered per token: `(max_ngram_size − 1)·head_count`.
+        n_cols: usize,
+    }
+
+    impl Meta {
+        fn read(split: &Split) -> Result<Meta, GateError> {
+            let want = Arch::Deepseek41.name();
+            if split.architecture() != Some(want) {
+                return Err(format!(
+                    "the model file is {:?}, want {want} — run through `just gate-gpu-ds41-engram`, \
+                     which picks the deepseek41 profile",
+                    split.architecture()
+                )
+                .into());
+            }
+            let u = |s: &str| -> Result<usize, GateError> {
+                let v = split
+                    .arch_get_u64(s)
+                    .ok_or_else(|| format!("metadata {} missing", split.arch_key(s)))?;
+                Ok(usize::try_from(v)?)
+            };
+            let n_embd = u("embedding_length")?;
+            if n_embd != ROW {
+                return Err(
+                    format!("embedding_length {n_embd}, the kernels hold rows of {ROW}").into(),
+                );
+            }
+            let key = split.arch_key("engram.layer_ids");
+            let Some(Value::Array(ids)) = split.value(&key) else {
+                return Err(format!("metadata {key} missing or not an array").into());
+            };
+            let layers = ids
+                .iter()
+                .map(|v| {
+                    v.as_unsigned()
+                        .and_then(|l| usize::try_from(l).ok())
+                        .ok_or_else(|| GateError::from(format!("{key} holds {v:?}")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let max_ngram = u("engram.max_ngram_size")?;
+            if max_ngram < 2 {
+                return Err(format!("engram.max_ngram_size {max_ngram}").into());
+            }
+            Ok(Meta {
+                eps: split
+                    .arch_get_f32("attention.layer_norm_rms_epsilon")
+                    .ok_or("metadata attention.layer_norm_rms_epsilon missing")?,
+                hc: u("hyper_connection.count")?,
+                layers,
+                key_len: u("engram.key_length")?,
+                n_cols: (max_ngram - 1) * u("engram.head_count")?,
+            })
+        }
+
+        /// Values one token's gathered rows hold, the projection's input width.
+        fn k_in(&self) -> usize {
+            self.key_len * self.n_cols
+        }
+    }
+
+    /// One engram layer's weights: the projection resident on the card in
+    /// its kernel's format and as file bytes for the host references, the
+    /// row table's file bytes, and both gains widened to f32 on both sides.
+    struct LayerW<'a> {
+        l: usize,
+        wkv: DevWeight,
+        wkv_bytes: &'a [u8],
+        table: &'a [u8],
+        gk: Vec<f32>,
+        gq: Vec<f32>,
+        gk_dev: DeviceBuffer<f32>,
+        gq_dev: DeviceBuffer<f32>,
+    }
+
+    impl<'a> LayerW<'a> {
+        fn load(
+            split: &'a Split,
+            stream: &CudaStream,
+            meta: &Meta,
+            l: usize,
+        ) -> Result<LayerW<'a>, GateError> {
+            let kv_rows = (meta.hc + 1) * ROW;
+            let (s, wkv_info) = tensor(split, &format!("blk.{l}.engram_wkv.weight"))?;
+            if wkv_info.ty != GgmlType::Q8_0
+                || wkv_info.dims != [meta.k_in() as u64, kv_rows as u64]
+            {
+                return Err(format!(
+                    "blk.{l}.engram_wkv.weight is {} {:?}, want q8_0 [{}, {kv_rows}]",
+                    wkv_info.ty,
+                    wkv_info.dims,
+                    meta.k_in()
+                )
+                .into());
+            }
+            let shard = split.shard(s).ok_or("wkv shard missing")?;
+            let wkv = upload_file_tensor(stream, shard, wkv_info)?;
+            let wkv_bytes = shard.data(wkv_info)?;
+            let (ts, t_info) = tensor(split, &format!("blk.{l}.engram_embd.weight"))?;
+            if t_info.ty != GgmlType::Q8_0 || t_info.dims.first() != Some(&(meta.key_len as u64)) {
+                return Err(format!(
+                    "blk.{l}.engram_embd.weight is {} {:?}, want q8_0 [{}, ..]",
+                    t_info.ty, t_info.dims, meta.key_len
+                )
+                .into());
+            }
+            let table = split.shard(ts).ok_or("table shard missing")?.data(t_info)?;
+            let gain = |which: &str| -> Result<Vec<f32>, GateError> {
+                let name = format!("blk.{l}.engram_{which}.weight");
+                let (gs, info) = tensor(split, &name)?;
+                if info.ty != GgmlType::BF16 || info.dims != [ROW as u64, meta.hc as u64] {
+                    return Err(format!(
+                        "{name} is {} {:?}, want bf16 [{ROW}, {}]",
+                        info.ty, info.dims, meta.hc
+                    )
+                    .into());
+                }
+                let mut g = vec![0.0f32; ROW * meta.hc];
+                let bytes = split.shard(gs).ok_or("gain shard missing")?.data(info)?;
+                dequant_row(GgmlType::BF16, bytes, &mut g)?;
+                Ok(g)
+            };
+            let (gk, gq) = (gain("k")?, gain("q")?);
+            Ok(LayerW {
+                l,
+                wkv,
+                wkv_bytes,
+                table,
+                gk_dev: DeviceBuffer::from_host(stream, &gk)?,
+                gq_dev: DeviceBuffer::from_host(stream, &gq)?,
+                gk,
+                gq,
+            })
+        }
+    }
+
+    fn tensor<'a>(split: &'a Split, name: &str) -> Result<(usize, &'a TensorInfo), GateError> {
+        split
+            .find(name)
+            .ok_or_else(|| format!("tensor {name} not in the model").into())
+    }
+
+    // -------------------------------------------------------------- run
+
+    pub fn run() -> Result<(), GateError> {
+        let split = Split::open(ref_model_path()?)?;
+        let meta = Meta::read(&split)?;
+        let gpu = Gpu::new()?;
+        let eg = EngramGateKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        println!(
+            "gate_deepseek41_engram: device {} — hc {} eps {:e} layers {:?} rows/token {} x {} values",
+            gpu.device_name()?,
+            meta.hc,
+            meta.eps,
+            meta.layers,
+            meta.n_cols,
+            meta.key_len
+        );
+        let weights = meta
+            .layers
+            .iter()
+            .map(|&l| LayerW::load(&split, stream, &meta, l))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let cpu = oracle::for_arch(Arch::Deepseek41)?;
+        let mut sets = vec![(cpu.set_name(Set::Cpu)?, cpu.open(Set::Cpu)?)];
+        for name in STEP_SETS {
+            sets.push((name, open_set(name)?));
+        }
+        let cx = Cx {
+            gpu: &gpu,
+            eg: &eg,
+            meta: &meta,
+        };
+        let (mut sites, mut failed) = (0u32, 0u32);
+        for (label, man) in &sets {
+            let found = man
+                .tensors
+                .iter()
+                .filter(|r| r.op == "ADD" && r.name.starts_with("engram_out-"))
+                .count();
+            if found != weights.len() {
+                return Err(format!(
+                    "{label}: {found} engram_out rows, the file has {} engram layers",
+                    weights.len()
+                )
+                .into());
+            }
+            println!(
+                "set {label}: {} (build {})",
+                man.dir.display(),
+                man.build.as_deref().unwrap_or("-")
+            );
+            for w in &weights {
+                sites += 1;
+                failed += u32::from(!site(&cx, label, man, w)?);
+            }
+        }
+        let pass = failed == 0;
+        println!(
+            "gate_deepseek41_engram: {sites} sites across {} sets, {failed} failed — {}",
+            sets.len(),
+            verdict(pass)
+        );
+        if !pass {
+            return Err(checks_failed());
+        }
+        Ok(())
+    }
+
+    /// What every site shares.
+    struct Cx<'a> {
+        gpu: &'a Gpu,
+        eg: &'a EngramGateKernels,
+        meta: &'a Meta,
+    }
+
+    /// A set by name under the data directory, its `# arch` line checked.
+    fn open_set(name: &str) -> Result<RefManifest, GateError> {
+        let man = RefManifest::read(&ref_dir_named(name))?;
+        let want = Arch::Deepseek41.name();
+        if man.arch.as_deref() != Some(want) {
+            return Err(format!("{name}: # arch is {:?}, want {want}", man.arch).into());
+        }
+        Ok(man)
+    }
+
+    // ------------------------------------------------------------ the site
+
+    /// Every dumped value of one site the checks read, in ggml's layouts.
+    struct SiteData {
+        t: usize,
+        gather: Vec<f32>,
+        embd: Vec<f32>,
+        kv: Vec<f32>,
+        value_view: Vec<f32>,
+        value_rep: Vec<f32>,
+        key_view: Vec<f32>,
+        k_norm: Vec<f32>,
+        k_gain: Vec<f32>,
+        kn: Vec<f32>,
+        x: Vec<f32>,
+        q_cont: Vec<f32>,
+        q_norm: Vec<f32>,
+        q_gain: Vec<f32>,
+        qn: Vec<f32>,
+        prod: Vec<f32>,
+        sum: Vec<f32>,
+        scaled: Vec<f32>,
+        sgn: Vec<f32>,
+        abs: Vec<f32>,
+        clamped: Vec<f32>,
+        root: Vec<f32>,
+        signed: Vec<f32>,
+        gate: Vec<f32>,
+        vg: Vec<f32>,
+        out: Vec<f32>,
+        ids: Vec<usize>,
+        /// The [`COPIES`] rows' values, in its order.
+        copies: Vec<Vec<f32>>,
+    }
+
+    impl SiteData {
+        /// The values of chain node `i`, for the nodes [`COPIES`] names as
+        /// sources.
+        fn node(&self, i: usize) -> &[f32] {
+            match i {
+                VALUE_VIEW => &self.value_view,
+                KEY_VIEW => &self.key_view,
+                K_NORM => &self.k_norm,
+                K_GAIN => &self.k_gain,
+                KN => &self.kn,
+                Q_CONT => &self.q_cont,
+                Q_NORM => &self.q_norm,
+                Q_GAIN => &self.q_gain,
+                QN => &self.qn,
+                _ => &[],
+            }
+        }
+    }
+
+    /// The chain of layer `l` in `man`: the [`CHAIN`] tensor rows ending at
+    /// `engram_out-l`, each op, name and shape checked, and the rows it reads
+    /// loaded.
+    fn site_data(man: &RefManifest, meta: &Meta, l: usize) -> Result<SiteData, GateError> {
+        let out_name = format!("engram_out-{l}");
+        let e = man
+            .tensors
+            .iter()
+            .position(|r| r.name == out_name && r.occurrence == 0)
+            .ok_or_else(|| format!("{out_name} not in {}", man.dir.display()))?;
+        if e + 1 < CHAIN {
+            return Err(
+                format!("{out_name} sits at manifest row {e}, before a whole chain").into(),
+            );
+        }
+        let rows = &man.tensors[e + 1 - CHAIN..=e];
+        let t = usize::try_from(rows[KV].ne[1])?;
+        let (n, hc) = (ROW as u64, meta.hc as u64);
+        let (tt, kc) = (t as u64, meta.k_in() as u64);
+        let prev = format!("l_out-{}", l.checked_sub(1).ok_or("an engram layer 0")?);
+        let row_shape = [n, hc, tt, 1];
+        let flat = [n * hc, tt, 1, 1];
+        let gain_shape = [n, hc, 1, 1];
+        let gain_flat = [n * hc, 1, 1, 1];
+        let scalar = [1, hc, tt, 1];
+        let reshaped = || Some(" (reshaped)".to_string());
+        let want: [(Option<String>, [u64; 4]); CHAIN] = [
+            (None, [meta.key_len as u64, meta.n_cols as u64 * tt, 1, 1]),
+            (Some(format!("engram_embd-{l}")), [kc, tt, 1, 1]),
+            (Some(format!("engram_kv-{l}")), [n * (hc + 1), tt, 1, 1]),
+            (Some(format!("engram_kv-{l} (view)")), [n, tt, 1, 1]),
+            (Some(format!("engram_kv-{l} (view) (cont)")), [n, tt, 1, 1]),
+            (
+                Some(format!("engram_kv-{l} (view) (cont) (reshaped)")),
+                [n, 1, tt, 1],
+            ),
+            (None, row_shape),
+            (Some(format!("engram_kv-{l} (view)")), flat),
+            (Some(format!("engram_kv-{l} (view) (cont)")), flat),
+            (
+                Some(format!("engram_kv-{l} (view) (cont) (reshaped)")),
+                row_shape,
+            ),
+            (None, row_shape),
+            (reshaped(), flat),
+            (None, gain_shape),
+            (reshaped(), gain_flat),
+            (None, flat),
+            (reshaped(), row_shape),
+            (Some(format!("{prev} (cont)")), row_shape),
+            (Some(format!("{prev} (cont) (reshaped)")), row_shape),
+            (None, row_shape),
+            (reshaped(), flat),
+            (None, gain_shape),
+            (reshaped(), gain_flat),
+            (None, flat),
+            (reshaped(), row_shape),
+            (None, row_shape),
+            (None, scalar),
+            (None, scalar),
+            (None, scalar),
+            (None, scalar),
+            (Some(" (view)".to_string()), scalar),
+            (None, scalar),
+            (None, scalar),
+            (Some(format!("engram_gate-{l}")), scalar),
+            (None, row_shape),
+            (Some(out_name.clone()), row_shape),
+        ];
+        for (i, (row, (name, ne))) in rows.iter().zip(&want).enumerate() {
+            if row.op != OPS[i] || row.ne != *ne || name.as_ref().is_some_and(|w| &row.name != w) {
+                return Err(format!(
+                    "{out_name} chain row {i}: {}/{} {} {:?}, want {} {:?}{}",
+                    row.name,
+                    row.occurrence,
+                    row.op,
+                    row.ne,
+                    OPS[i],
+                    ne,
+                    name.as_ref()
+                        .map_or(String::new(), |w| format!(" named {w:?}"))
+                )
+                .into());
+            }
+        }
+        // The nodes' sources, and the value view before the key view.
+        let srcs = [
+            (GATHER, format!("blk.{l}.engram_embd.weight")),
+            (KV, format!("blk.{l}.engram_wkv.weight")),
+            (K_GAIN, format!("blk.{l}.engram_k.weight")),
+            (Q_GAIN, format!("blk.{l}.engram_q.weight")),
+            (Q_CONT, prev.clone()),
+            (OUT, prev.clone()),
+        ];
+        for (i, want) in srcs {
+            if rows[i].src0.as_deref() != Some(want.as_str()) {
+                return Err(format!(
+                    "{out_name} chain row {i} ({}): src0 {:?}, want {want:?}",
+                    rows[i].name, rows[i].src0
+                )
+                .into());
+            }
+        }
+        if rows[VALUE_VIEW].occurrence + 1 != rows[KEY_VIEW].occurrence {
+            return Err(format!("{out_name}: the value view does not precede the key view").into());
+        }
+        let ld = |i: usize| ref_tensor_logical_in(&man.dir, &rows[i]);
+        let x_row = man.tensors[..e + 1 - CHAIN]
+            .iter()
+            .rev()
+            .find(|r| r.name == prev)
+            .ok_or_else(|| format!("{prev} before {out_name}"))?;
+        x_row.expect(&prev, "f32", row_shape, "in")?;
+        let ints = |name: &str| ref_ints(man, name, 0, RowKind::Input, Layout::Flat);
+        for which in ["k", "q"] {
+            let ids = ints(&format!("engram_{which}_ids-{l}"))?;
+            if ids != (0..hc as i64).collect::<Vec<_>>() {
+                return Err(format!(
+                    "engram_{which}_ids-{l} is {ids:?}, want every stream in order"
+                )
+                .into());
+            }
+        }
+        let ids = ints(&format!("engram_rows-{l}"))?
+            .into_iter()
+            .map(|v| {
+                usize::try_from(v)
+                    .map_err(|_| GateError::from(format!("engram_rows-{l} holds {v}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() != meta.n_cols * t {
+            return Err(format!(
+                "engram_rows-{l} holds {} ids, want {}",
+                ids.len(),
+                meta.n_cols * t
+            )
+            .into());
+        }
+        Ok(SiteData {
+            t,
+            gather: ld(GATHER)?,
+            embd: ld(EMBD)?,
+            kv: ld(KV)?,
+            value_view: ld(VALUE_VIEW)?,
+            value_rep: ld(VALUE_REP)?,
+            key_view: ld(KEY_VIEW)?,
+            k_norm: ld(K_NORM)?,
+            k_gain: ld(K_GAIN)?,
+            kn: ld(KN)?,
+            x: ref_tensor_logical_in(&man.dir, x_row)?,
+            q_cont: ld(Q_CONT)?,
+            q_norm: ld(Q_NORM)?,
+            q_gain: ld(Q_GAIN)?,
+            qn: ld(QN)?,
+            prod: ld(PROD)?,
+            sum: ld(SUM)?,
+            scaled: ld(SCALED)?,
+            sgn: ld(SGN)?,
+            abs: ld(ABS)?,
+            clamped: ld(CLAMPED)?,
+            root: ld(ROOT)?,
+            signed: ld(SIGNED)?,
+            gate: ld(GATE)?,
+            vg: ld(VG)?,
+            out: ld(OUT)?,
+            ids,
+            copies: COPIES
+                .iter()
+                .map(|&(i, _)| ld(i))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// One site: layer `w.l` of set `label`. Prints its verdict lines and
+    /// returns whether every check passed.
+    fn site(cx: &Cx, label: &str, man: &RefManifest, w: &LayerW) -> Result<bool, GateError> {
+        let d = site_data(man, cx.meta, w.l)?;
+        let k_in = cx.meta.k_in();
+        let projs: Vec<Proj> = d
+            .embd
+            .chunks_exact(k_in)
+            .map(|x| project(w.wkv_bytes, (cx.meta.hc + 1) * ROW, x))
+            .collect();
+        let ik = ik_checks(&d, w, cx.meta, &projs)?;
+        let op = op_checks(cx, &d, w)?;
+        let mut chain = true;
+        for (t, p) in projs.iter().enumerate() {
+            chain &= chain_checks(cx, label, &d, w, t, p)?;
+        }
+        let pass = ik && op && chain;
+        println!(
+            "site {label} L={} T={}: ik_sim {} op {} chain {} — {}",
+            w.l,
+            d.t,
+            verdict(ik),
+            verdict(op),
+            verdict(chain),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    // ------------------------------------------------- 1. ik's rule vs the dump
+
+    /// Values of `a` bit-identical to `b`, as `hits/len`, and whether all are.
+    fn hits(a: &[f32], b: &[f32]) -> (String, bool) {
+        let n = a
+            .iter()
+            .zip(b)
+            .filter(|(x, y)| x.to_bits() == y.to_bits())
+            .count();
+        (
+            format!("{n}/{}", b.len()),
+            a.len() == b.len() && n == a.len(),
+        )
+    }
+
+    /// ik's RMS_NORM of each `ROW`-value row of `x`: every square rounded to
+    /// f32 and summed in f64 serially, the mean rounded to f32, `1.0f /
+    /// sqrtf(mean + eps)`, each value times it (`ggml.c`
+    /// `ggml_compute_forward_rms_norm_f32`).
+    fn ik_rms(x: &[f32], eps: f32) -> Vec<f32> {
+        let mut y = vec![0.0f32; x.len()];
+        for (xr, yr) in x
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .zip(y.as_chunks_mut::<ROW>().0)
+        {
+            let sum = xr.iter().fold(0.0f64, |a, &v| a + f64::from(v * v));
+            let mean = (sum / ROW as f64) as f32;
+            let scale = 1.0f32 / (mean + eps).sqrt();
+            for (o, &v) in yr.iter_mut().zip(xr) {
+                *o = v * scale;
+            }
+        }
+        y
+    }
+
+    /// `a[i] · b[i mod b.len()]` — ggml's MUL with `b` broadcast over rows.
+    fn mul_bcast(a: &[f32], b: &[f32]) -> Vec<f32> {
+        a.iter()
+            .enumerate()
+            .map(|(i, &v)| v * b[i % b.len()])
+            .collect()
+    }
+
+    /// ik's SUM_ROWS: each row's values summed in f64 serially, rounded once.
+    fn ik_sum_rows(x: &[f32], width: usize) -> Vec<f32> {
+        x.chunks_exact(width)
+            .map(|r| r.iter().fold(0.0f64, |a, &v| a + f64::from(v)) as f32)
+            .collect()
+    }
+
+    /// ggml's `sgn`: 1, −1, or 0 for zero and NaN.
+    fn ggml_sgn(v: f32) -> f32 {
+        if v > 0.0 {
+            1.0
+        } else if v < 0.0 {
+            -1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// ggml's `clamp`, the C macros `MAX(MIN(v, hi), lo)`.
+    fn ggml_clamp(v: f32, lo: f32, hi: f32) -> f32 {
+        let m = if v < hi { v } else { hi };
+        if m > lo { m } else { lo }
+    }
+
+    /// ik's SIGMOID, `ggml_vec_sigmoid_f32` row by row: `1.f / (1.f +
+    /// expf(-x))` per value, libm's `expf`.
+    fn ik_sigmoid(x: &[f32]) -> Vec<f32> {
+        x.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect()
+    }
+
+    /// A site's `kv` (`[(hc+1)·ROW, t]`) as the key rows `[ROW, hc, t]` and
+    /// the value rows `[ROW, t]`.
+    fn views(kv: &[f32], hc: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut key = Vec::with_capacity(hc * ROW * t);
+        let mut value = Vec::with_capacity(ROW * t);
+        for tok in kv.chunks_exact((hc + 1) * ROW).take(t) {
+            key.extend_from_slice(&tok[..hc * ROW]);
+            value.extend_from_slice(&tok[hc * ROW..]);
+        }
+        (key, value)
+    }
+
+    /// ik's graph from a site's `kv` and `x` to the gate and `engram_out`,
+    /// every node by the rules above.
+    fn ik_chain(kv: &[f32], x: &[f32], w: &LayerW, meta: &Meta, t: usize) -> (Vec<f32>, Vec<f32>) {
+        let hc = meta.hc;
+        let (key, value) = views(kv, hc, t);
+        let kn = mul_bcast(&ik_rms(&key, meta.eps), &w.gk);
+        let qn = mul_bcast(&ik_rms(x, meta.eps), &w.gq);
+        let prod: Vec<f32> = kn.iter().zip(&qn).map(|(&a, &b)| a * b).collect();
+        let inv = inv_sqrt_row();
+        let signed: Vec<f32> = ik_sum_rows(&prod, ROW)
+            .iter()
+            .map(|&s| {
+                let s = s * inv;
+                ggml_sgn(s) * ggml_clamp(s.abs(), CLAMP_MIN, f32::INFINITY).sqrt()
+            })
+            .collect();
+        let gate = ik_sigmoid(&signed);
+        let out = x
+            .iter()
+            .enumerate()
+            .map(|(i, &xv)| xv + value[i / (hc * ROW) * ROW + i % ROW] * gate[i / ROW])
+            .collect();
+        (gate, out)
+    }
+
+    /// Layer 1: ik's rule against the dump, node by node and chained, and the
+    /// projection on ik's q8_2 activations against `engram_kv`.
+    fn ik_checks(d: &SiteData, w: &LayerW, meta: &Meta, projs: &[Proj]) -> Result<bool, GateError> {
+        let (hc, t) = (meta.hc, d.t);
+        let mut line = Vec::new();
+        let mut all = true;
+        let mut check = |what: &str, got: &[f32], want: &[f32]| {
+            let (s, ok) = hits(got, want);
+            line.push(format!("{what}={s}"));
+            all &= ok;
+        };
+        // The gather: each id's table row, dequantized.
+        let row_bytes = meta.key_len / QK * 34;
+        let mut gathered = vec![0.0f32; d.ids.len() * meta.key_len];
+        for (&id, out) in d.ids.iter().zip(gathered.chunks_exact_mut(meta.key_len)) {
+            let b = w
+                .table
+                .get(id * row_bytes..(id + 1) * row_bytes)
+                .ok_or_else(|| format!("row id {id} is past blk.{}.engram_embd.weight", w.l))?;
+            dequant_row(GgmlType::Q8_0, b, out)?;
+        }
+        check("gather", &gathered, &d.gather);
+        check("embd", &d.embd, &d.gather);
+        let (key, value) = views(&d.kv, hc, t);
+        check("key_view", &key, &d.key_view);
+        check("value_view", &value, &d.value_view);
+        let rep: Vec<f32> = (0..t * hc * ROW)
+            .map(|i| value[i / (hc * ROW) * ROW + i % ROW])
+            .collect();
+        check("value_rep", &rep, &d.value_rep);
+        check("k_gain", &w.gk, &d.k_gain);
+        check("q_gain", &w.gq, &d.q_gain);
+        check("k_norm", &ik_rms(&d.key_view, meta.eps), &d.k_norm);
+        check("kn", &mul_bcast(&d.k_norm, &d.k_gain), &d.kn);
+        check("q_cont", &d.x, &d.q_cont);
+        check("q_norm", &ik_rms(&d.q_cont, meta.eps), &d.q_norm);
+        check("qn", &mul_bcast(&d.q_norm, &d.q_gain), &d.qn);
+        let prod: Vec<f32> = d.kn.iter().zip(&d.qn).map(|(&a, &b)| a * b).collect();
+        check("prod", &prod, &d.prod);
+        check("sum", &ik_sum_rows(&d.prod, ROW), &d.sum);
+        let inv = inv_sqrt_row();
+        let each = |x: &[f32], f: &dyn Fn(f32) -> f32| x.iter().map(|&v| f(v)).collect::<Vec<_>>();
+        check("scale", &each(&d.sum, &|s| s * inv), &d.scaled);
+        check("sgn", &each(&d.scaled, &ggml_sgn), &d.sgn);
+        check("abs", &each(&d.scaled, &f32::abs), &d.abs);
+        check(
+            "clamp",
+            &each(&d.abs, &|a| ggml_clamp(a, CLAMP_MIN, f32::INFINITY)),
+            &d.clamped,
+        );
+        check("sqrt", &each(&d.clamped, &f32::sqrt), &d.root);
+        let signed: Vec<f32> = d.sgn.iter().zip(&d.root).map(|(&s, &r)| s * r).collect();
+        check("signed", &signed, &d.signed);
+        check("gate", &ik_sigmoid(&d.signed), &d.gate);
+        let vg: Vec<f32> = d
+            .value_rep
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v * d.gate[i / ROW])
+            .collect();
+        check("vg", &vg, &d.vg);
+        let out: Vec<f32> = d.x.iter().zip(&d.vg).map(|(&a, &b)| a + b).collect();
+        check("out", &out, &d.out);
+        let (cg, co) = ik_chain(&d.kv, &d.x, w, meta, t);
+        check("chained_gate", &cg, &d.gate);
+        check("chained_out", &co, &d.out);
+        let copies = COPIES
+            .iter()
+            .zip(&d.copies)
+            .filter(|&(&(_, src), vals)| bits_equal(vals, d.node(src)))
+            .count();
+        line.push(format!("copies={copies}/{}", COPIES.len()));
+        all &= copies == COPIES.len();
+
+        // engram_wkv on ik's q8_2 activations, token by token.
+        let mut worst = 0.0f64;
+        for (p, dumped) in projs.iter().zip(d.kv.chunks_exact((hc + 1) * ROW)) {
+            for ((&got, &sim), &mag) in dumped.iter().zip(&p.ik).zip(&p.abs_ik) {
+                let dist = (f64::from(got) - sim).abs();
+                let bound = ik_gemv_rel(meta.k_in()) * mag;
+                let ratio = if dist == 0.0 {
+                    0.0
+                } else if bound > 0.0 {
+                    dist / bound
+                } else {
+                    f64::INFINITY
+                };
+                worst = worst.max(ratio);
+            }
+        }
+        all &= worst <= 1.0;
+        println!(
+            "ik_sim L={} T={t}: {} wkv_q8_2 max|kv-sim|/bound={worst:.3} {}",
+            w.l,
+            line.join(" "),
+            verdict(all)
+        );
+        Ok(all)
+    }
+
+    // ------------------------------------------------- our rule, transcribed
+
+    /// Thread `tid`'s values of a row, `tid + RMS_THREADS·c` for `c`
+    /// ascending — the order every per-thread sum below takes.
+    fn thread_values(tid: usize) -> impl Iterator<Item = usize> {
+        (0..PER_THREAD).map(move |c| tid + RMS_THREADS * c)
+    }
+
+    /// The xor butterfly `warp::reduce_sum_f32` runs (16, 8, 4, 2, 1; each
+    /// lane adds its partner to itself): lane 0's result.
+    fn butterfly32(mut v: [f32; 32]) -> f32 {
+        for off in [16, 8, 4, 2, 1] {
+            let prev = v;
+            for (l, x) in v.iter_mut().enumerate() {
+                *x = prev[l] + prev[l ^ off];
+            }
+        }
+        v[0]
+    }
+
+    /// The same butterfly in f64 (`warp::shuffle_xor_f64`).
+    fn butterfly64(mut v: [f64; 32]) -> f64 {
+        for off in [16, 8, 4, 2, 1] {
+            let prev = v;
+            for (l, x) in v.iter_mut().enumerate() {
+                *x = prev[l] + prev[l ^ off];
+            }
+        }
+        v[0]
+    }
+
+    /// Our norm scale of one row, as the kernels take it: per thread its
+    /// values' squares by fused multiply-adds in order, the butterfly per
+    /// warp, `rms_warp_tree`, `rms_scale`.
+    fn our_scale(row: &[f32], eps: f32) -> f32 {
+        let part: Vec<f32> = (0..RMS_THREADS)
+            .map(|tid| thread_values(tid).fold(0.0f32, |acc, i| row[i].mul_add(row[i], acc)))
+            .collect();
+        let mut sums = [0.0f32; RMS_WARPS];
+        for (s, lanes) in sums.iter_mut().zip(part.as_chunks::<32>().0) {
+            *s = butterfly32(*lanes);
+        }
+        rms_scale(rms_warp_tree(sums), ROW as u32, eps)
+    }
+
+    /// Our key side: `kn[(t·hc + s)·ROW + d] = (key·scale)·gain`.
+    fn our_key_norm(kv: &[f32], gk: &[f32], eps: f32, hc: usize, m: usize) -> Vec<f32> {
+        let (key, _) = views(kv, hc, m);
+        let mut kn = vec![0.0f32; key.len()];
+        let rows = key
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .zip(kn.as_chunks_mut::<ROW>().0);
+        for (b, (kr, out)) in rows.enumerate() {
+            let scale = our_scale(kr, eps);
+            let g = &gk[b % hc * ROW..(b % hc + 1) * ROW];
+            for ((o, &v), &gv) in out.iter_mut().zip(kr).zip(g) {
+                *o = (v * scale) * gv;
+            }
+        }
+        kn
+    }
+
+    /// Our gate of one stream from the f64 dot — `gate_of` in the module.
+    fn our_gate(dot: f64) -> f32 {
+        let s = (dot as f32) * inv_sqrt_row();
+        let m = ggml_sgn(s) * ggml_clamp(s.abs(), CLAMP_MIN, f32::INFINITY).sqrt();
+        let e = f64::from(-m).exp() as f32;
+        1.0 / (1.0 + e)
+    }
+
+    /// Our query side and update, `x`, `kn` and `out` `[ROW, hc, m]`: per
+    /// (token, stream) the f64 dot — per thread its products
+    /// `kn·((x·scale)·gain)` rounded to f32 and added in order, then warp 0
+    /// lane `l` adds slots `l, l + 32, …, l + 224` in order, then the f64
+    /// butterfly — the gate, and `x + value·gate`.
+    fn our_gate_update(
+        x: &[f32],
+        kn: &[f32],
+        kv: &[f32],
+        w: &LayerW,
+        eps: f32,
+        hc: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let m = x.len() / (hc * ROW);
+        let (_, value) = views(kv, hc, m);
+        let mut out = vec![0.0f32; x.len()];
+        let mut gate = vec![0.0f32; hc * m];
+        let rows = x
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .zip(kn.as_chunks::<ROW>().0)
+            .zip(out.as_chunks_mut::<ROW>().0)
+            .zip(gate.iter_mut());
+        for (b, (((xr, kr), or), gslot)) in rows.enumerate() {
+            let g = &w.gq[b % hc * ROW..(b % hc + 1) * ROW];
+            let vr = &value[b / hc * ROW..(b / hc + 1) * ROW];
+            let scale = our_scale(xr, eps);
+            let dots: Vec<f64> = (0..RMS_THREADS)
+                .map(|tid| {
+                    thread_values(tid).fold(0.0f64, |acc, i| {
+                        acc + f64::from(kr[i] * ((xr[i] * scale) * g[i]))
+                    })
+                })
+                .collect();
+            let mut lanes = [0.0f64; 32];
+            for (l, v) in lanes.iter_mut().enumerate() {
+                *v = (1..RMS_WARPS).fold(dots[l], |acc, wp| acc + dots[l + 32 * wp]);
+            }
+            let gv = our_gate(butterfly64(lanes));
+            *gslot = gv;
+            for ((o, &xv), &vv) in or.iter_mut().zip(xr).zip(vr) {
+                *o = xv + vv * gv;
+            }
+        }
+        (out, gate)
+    }
+
+    // ---------------------------------------------------------- the bands
+
+    /// One value per compared output: a largest distance, a largest
+    /// magnitude, or their ratio, the band.
+    struct Bands {
+        kn: f64,
+        gate: f64,
+        out: f64,
+    }
+
+    /// The bands of tokens `toks` of a site for our rule against ik's, each
+    /// `max|Δ| / M` with `M` the largest `|value|` ik wrote, from ik's own
+    /// values (the dump) — first order in each difference, with the cross
+    /// terms kept. `pert` bounds, per value, how far our `kv` rows sit from
+    /// ik's: `(key [hc·ROW], value [ROW])` of one token, absent when both
+    /// rules read the same `kv`.
+    ///
+    /// Per (token, stream), with `u` f32's unit roundoff:
+    /// - key norm: our scale and ik's differ by [`scale_rel`] of the scale on
+    ///   the same row. A key moved by `Bk` moves the mean square by at most
+    ///   `ε = Σ(2|k|·Bk + Bk²)/Σk²` of itself and the scale by at most
+    ///   `ρ = ε/(2(1 − ε)^1.5)` (the mean value theorem on `(1+ε)^−½`). So
+    ///   `|Δkn| <= |gain|·(Bk·sc·(1 + ρ) + |k|·sc·ρ) + (scale_rel + 4u)·|kn|`,
+    ///   the 4u the two products' roundings on each side;
+    /// - query: `|Δqn| <= (scale_rel + 4u)·|qn|`;
+    /// - product: `|Δp| <= |Δkn|·|qn| + |kn|·|Δqn| + |Δkn|·|Δqn| + 2u·|p|`;
+    /// - dot: the sum of those, plus both f64 sums' own error (`ROW`·2^-53
+    ///   of `Σ|p|` each) and one f32 rounding on each side (2u of `|dot|`);
+    /// - `s = dot·(1/√ROW)`: `c·Δdot + 2u·|s|`;
+    /// - `m`: `Δs/(2√(|s| − Δs)) + 2u·|m|` while the clamp and the sign
+    ///   cannot move, else `2√(|s| + Δs + 1e-6)`;
+    /// - gate: `σ'·Δm` with `σ'` the sigmoid's slope at the point of `[m −
+    ///   Δm, m + Δm]` nearest 0, plus the exponentials' distance
+    ///   ([`EXP_REL`], through `dg/de = −g²` and `g²·e = g(1−g)`) and the
+    ///   add's and division's roundings on each side (4u of `g`);
+    /// - `out = x + v·g`: `Bv·(g + Δg) + |v|·Δg + 2u·|v·g| + 2u·|out|`.
+    fn bands(
+        d: &SiteData,
+        w: &LayerW,
+        meta: &Meta,
+        toks: std::ops::Range<usize>,
+        pert: Option<(&[f64], &[f64])>,
+    ) -> Bands {
+        let hc = meta.hc;
+        let (key, value) = views(&d.kv, hc, d.t);
+        let (sr, c) = (scale_rel(), f64::from(inv_sqrt_row()));
+        let zero = vec![0.0f64; hc * ROW];
+        let (pk, pv) = pert.unwrap_or((&zero[..], &zero[..ROW]));
+        let mut max = Bands {
+            kn: 0.0,
+            gate: 0.0,
+            out: 0.0,
+        };
+        let mut mag = Bands {
+            kn: 0.0,
+            gate: 0.0,
+            out: 0.0,
+        };
+        for tok in toks {
+            let v = &value[tok * ROW..(tok + 1) * ROW];
+            for s in 0..hc {
+                let b = tok * hc + s;
+                let r = b * ROW..(b + 1) * ROW;
+                let (k, kn, qn) = (&key[r.clone()], &d.kn[r.clone()], &d.qn[r.clone()]);
+                let (p, out) = (&d.prod[r.clone()], &d.out[r]);
+                let (gk, bk) = (&w.gk[s * ROW..(s + 1) * ROW], &pk[s * ROW..(s + 1) * ROW]);
+                let ssq = k
+                    .iter()
+                    .fold(0.0f64, |a, &x| a + f64::from(x) * f64::from(x));
+                let sc = 1.0 / (ssq / ROW as f64 + f64::from(meta.eps)).sqrt();
+                let eps_m = k.iter().zip(bk).fold(0.0f64, |a, (&x, &e)| {
+                    a + 2.0 * f64::from(x).abs() * e + e * e
+                }) / ssq;
+                let rho = if eps_m < 1.0 {
+                    eps_m / (2.0 * (1.0 - eps_m).powf(1.5))
+                } else {
+                    f64::INFINITY
+                };
+                let (mut sum_dp, mut sum_p) = (0.0f64, 0.0f64);
+                for (i, &kv_) in k.iter().enumerate() {
+                    let knv = f64::from(kn[i]).abs();
+                    let (qv, pv_) = (f64::from(qn[i]).abs(), f64::from(p[i]).abs());
+                    let moved = bk[i] * sc * (1.0 + rho) + f64::from(kv_).abs() * sc * rho;
+                    let dk = f64::from(gk[i]).abs() * moved + (sr + 4.0 * U) * knv;
+                    let dq = (sr + 4.0 * U) * qv;
+                    sum_dp += dk * qv + knv * dq + dk * dq + 2.0 * U * pv_;
+                    sum_p += pv_;
+                    max.kn = max.kn.max(dk);
+                    mag.kn = mag.kn.max(knv);
+                }
+                let dot = f64::from(d.sum[b]).abs();
+                let ddot = sum_dp + 2.0 * ROW as f64 * U64 * sum_p + 2.0 * U * dot;
+                let sv = f64::from(d.scaled[b]).abs();
+                let ds = c * ddot + 2.0 * U * sv;
+                let m = f64::from(d.signed[b]).abs();
+                let dm = if sv - ds > f64::from(CLAMP_MIN) {
+                    ds / (2.0 * (sv - ds).sqrt()) + 2.0 * U * m
+                } else {
+                    2.0 * (sv + ds + f64::from(CLAMP_MIN)).sqrt()
+                };
+                let near0 = (m - dm).max(0.0);
+                let sig = 1.0 / (1.0 + (-near0).exp());
+                let g = f64::from(d.gate[b]);
+                let dg = sig * (1.0 - sig) * dm + EXP_REL * g * (1.0 - g) + 4.0 * U * g;
+                max.gate = max.gate.max(dg);
+                mag.gate = mag.gate.max(g.abs());
+                for ((&vi, &bvi), &o) in v.iter().zip(pv).zip(out) {
+                    let (vi, o) = (f64::from(vi).abs(), f64::from(o).abs());
+                    max.out = max
+                        .out
+                        .max(bvi * (g + dg) + vi * dg + 2.0 * U * vi * g + 2.0 * U * o);
+                    mag.out = mag.out.max(o);
+                }
+            }
+        }
+        Bands {
+            kn: max.kn / mag.kn,
+            gate: max.gate / mag.gate,
+            out: max.out / mag.out,
+        }
+    }
+
+    // ------------------------------------------------ 2. the kernels, dump in
+
+    /// The kernels on the site's dumped `kv` and streams, all T tokens in one
+    /// launch each.
+    fn op_checks(cx: &Cx, d: &SiteData, w: &LayerW) -> Result<bool, GateError> {
+        let (hc, m, eps) = (cx.meta.hc, d.t, cx.meta.eps);
+        let stream = cx.gpu.stream();
+        let kv = DeviceBuffer::from_host(stream, &d.kv)?;
+        let x = DeviceBuffer::from_host(stream, &d.x)?;
+        let run = || -> Result<[Vec<f32>; 3], GateError> {
+            let mut kn = DeviceBuffer::<f32>::zeroed(stream, hc * m * ROW)?;
+            let mut out = DeviceBuffer::<f32>::zeroed(stream, hc * m * ROW)?;
+            let mut gate = DeviceBuffer::<f32>::zeroed(stream, hc * m)?;
+            let key = KeyNormArgs {
+                kv: &kv,
+                gain: &w.gk_dev,
+                eps,
+                hc,
+                m,
+                kn: &mut kn,
+            };
+            cx.eg.enqueue_key_norm(stream, key)?;
+            let query = GateArgs {
+                x: &x,
+                kn: &kn,
+                kv: &kv,
+                gain: &w.gq_dev,
+                eps,
+                hc,
+                m,
+                out: &mut out,
+                gate: &mut gate,
+            };
+            cx.eg.enqueue_gate(stream, query)?;
+            stream.synchronize()?;
+            Ok([
+                kn.to_host_vec(stream)?,
+                gate.to_host_vec(stream)?,
+                out.to_host_vec(stream)?,
+            ])
+        };
+        let got = run()?;
+        let again = run()?;
+        let rerun = got.iter().zip(&again).all(|(a, b)| bits_equal(a, b));
+        let kn_ref = our_key_norm(&d.kv, &w.gk, eps, hc, m);
+        let (out_ref, gate_ref) = our_gate_update(&d.x, &kn_ref, &d.kv, w, eps, hc);
+        let exact = [
+            bits_equal(&got[0], &kn_ref),
+            bits_equal(&got[1], &gate_ref),
+            bits_equal(&got[2], &out_ref),
+        ];
+        let b = bands(d, w, cx.meta, 0..m, None);
+        let rel = [
+            max_rel_err(&got[0], &d.kn)?,
+            max_rel_err(&got[1], &d.gate)?,
+            max_rel_err(&got[2], &d.out)?,
+        ];
+        let within = [b.kn, b.gate, b.out]
+            .iter()
+            .zip(rel)
+            .all(|(&band, r)| f64::from(r) <= band);
+        let pass = exact.iter().all(|&e| e) && rerun && within;
+        println!(
+            "op L={} T={m}: bit_exact_host kn={} gate={} out={} bit_identical_rerun={rerun} \
+             ik_rel kn={:.3e} (band {:.3e}) gate={:.3e} (band {:.3e}) out={:.3e} (band {:.3e}) {}",
+            w.l,
+            exact[0],
+            exact[1],
+            exact[2],
+            rel[0],
+            b.kn,
+            rel[1],
+            b.gate,
+            rel[2],
+            b.out,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    // --------------------------------------------------- 3. the chain, m = 1
+
+    /// The projection of one token's gathered rows by `engram_wkv` (file
+    /// bytes), per output row: the f64 dot with the f32 activations (our
+    /// rule's exact value), with ik's q8_2 activations (the integer block
+    /// dots times both scales — ik's exact value), and the magnitudes
+    /// `Σ|w·x|` and `Σ_b|d_w·d_x·isum_b|` the accumulation bounds scale.
+    struct Proj {
+        ours: Vec<f64>,
+        ik: Vec<f64>,
+        abs_ours: Vec<f64>,
+        abs_ik: Vec<f64>,
+    }
+
+    /// ik's q8_2 activation blocks of `x` (`quantize_row_q8_2_x4`, AVX2):
+    /// per 32 values `d = amax/127` rounded to bf16 (nearest even), `id = 1/d`
+    /// (0 when `d` is 0), each code `x·id` rounded half to even and
+    /// saturated to i8. Returns the codes and the scales.
+    fn ik_q8_2(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+        let mut q = Vec::with_capacity(x.len());
+        let mut d = Vec::with_capacity(x.len() / QK);
+        for blk in x.as_chunks::<QK>().0 {
+            let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let bits = (amax / 127.0).to_bits();
+            let db = f32::from_bits(((bits + (0x7fff + ((bits >> 16) & 1))) >> 16) << 16);
+            let id = if db > 0.0 { 1.0 / db } else { 0.0 };
+            q.extend(
+                blk.iter()
+                    .map(|&v| (v * id).round_ties_even().clamp(-128.0, 127.0) as i8),
+            );
+            d.push(db);
+        }
+        (q, d)
+    }
+
+    /// [`Proj`] of `x` through the q8_0 weight `w` of `rows` rows, the rows
+    /// split across the host's threads.
+    fn project(w: &[u8], rows: usize, x: &[f32]) -> Proj {
+        let rb = x.len() / QK * 34;
+        let (qx, dx) = ik_q8_2(x);
+        let mut p = Proj {
+            ours: vec![0.0; rows],
+            ik: vec![0.0; rows],
+            abs_ours: vec![0.0; rows],
+            abs_ik: vec![0.0; rows],
+        };
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let chunk = rows.div_ceil(threads);
+        std::thread::scope(|sc| {
+            let parts = p
+                .ours
+                .chunks_mut(chunk)
+                .zip(p.ik.chunks_mut(chunk))
+                .zip(p.abs_ours.chunks_mut(chunk))
+                .zip(p.abs_ik.chunks_mut(chunk))
+                .enumerate();
+            for (ci, (((ours, ik), ao), ai)) in parts {
+                let (qx, dx) = (&qx, &dx);
+                sc.spawn(move || {
+                    let outs = ours.iter_mut().zip(ik).zip(ao).zip(ai);
+                    for (j, (((o, i), a), b)) in outs.enumerate() {
+                        let row = &w[(ci * chunk + j) * rb..(ci * chunk + j + 1) * rb];
+                        let (mut so, mut si, mut sao, mut sai) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                        let blocks = row.as_chunks::<34>().0.iter().zip(x.as_chunks::<QK>().0);
+                        for (bi, (blk, xb)) in blocks.enumerate() {
+                            let qb = Q8Block::from_bytes(blk);
+                            let dw = half_to_f32(qb.d);
+                            let mut isum = 0i32;
+                            let codes = &qx[bi * QK..(bi + 1) * QK];
+                            for ((&qw, &xv), &qa) in qb.q.iter().zip(xb).zip(codes) {
+                                let t = f64::from(f32::from(qw) * dw) * f64::from(xv);
+                                so += t;
+                                sao += t.abs();
+                                isum += i32::from(qw) * i32::from(qa);
+                            }
+                            let t = f64::from(dw) * f64::from(dx[bi]) * f64::from(isum);
+                            si += t;
+                            sai += t.abs();
+                        }
+                        (*o, *i, *a, *b) = (so, si, sao, sai);
+                    }
+                });
+            }
+        });
+        p
+    }
+
+    /// How far ik's f32 projection sits from its exact value, relative to
+    /// `Σ_b|d_w·d_x·isum_b|`: each block term rounds at most twice (the
+    /// scales' product, then the integer sum's), and a sum of `k/32` terms in
+    /// any order rounds at most `k/32 − 1` times; two more for the margin.
+    fn ik_gemv_rel(k: usize) -> f64 {
+        (k / QK + 4) as f64 * U
+    }
+
+    /// How far our `q8_0_gemv` at m = 1 sits from its exact value, relative
+    /// to `Σ|w·x|`: each lane runs one fused multiply-add per value along
+    /// its `k/32` values (the weight `q·d` is exact in f32), then five
+    /// butterfly levels.
+    fn our_gemv_rel(k: usize) -> f64 {
+        (k / 32 + 5) as f64 * U
+    }
+
+    /// The chain for token `t` of the site at the decode shape: the dump's
+    /// gathered rows through `q8_0_gemv` and both kernels; token 0 also
+    /// captures the three launches as one graph and replays it.
+    fn chain_checks(
+        cx: &Cx,
+        label: &str,
+        d: &SiteData,
+        w: &LayerW,
+        t: usize,
+        p: &Proj,
+    ) -> Result<bool, GateError> {
+        let (hc, eps, k_in) = (cx.meta.hc, cx.meta.eps, cx.meta.k_in());
+        let stream = cx.gpu.stream();
+        let emb = &d.embd[t * k_in..(t + 1) * k_in];
+        let xs = &d.x[t * hc * ROW..(t + 1) * hc * ROW];
+        // The resident projection's planes, as the owner uploaded them.
+        let DevWeight::Q8_0 { qs, d: dd, .. } = &w.wkv else {
+            return Err(format!("blk.{}.engram_wkv.weight is not resident as Q8_0", w.l).into());
+        };
+        let emb_dev = DeviceBuffer::from_host(stream, emb)?;
+        let x_dev = DeviceBuffer::from_host(stream, xs)?;
+        // kv, kn, out, gate.
+        let enqueue = |s: &CudaStream, bufs: &mut [DeviceBuffer<f32>; 4]| -> Result<(), GpuError> {
+            let [kv, kn, out, gate] = bufs;
+            cx.gpu
+                .q8f32()
+                .enqueue_q8_0_gemv(s, qs, dd, &emb_dev, 1, kv)?;
+            let key = KeyNormArgs {
+                kv: &*kv,
+                gain: &w.gk_dev,
+                eps,
+                hc,
+                m: 1,
+                kn: &mut *kn,
+            };
+            cx.eg.enqueue_key_norm(s, key)?;
+            let query = GateArgs {
+                x: &x_dev,
+                kn: &*kn,
+                kv: &*kv,
+                gain: &w.gq_dev,
+                eps,
+                hc,
+                m: 1,
+                out,
+                gate,
+            };
+            cx.eg.enqueue_gate(s, query)
+        };
+        let buffers = || -> Result<[DeviceBuffer<f32>; 4], GateError> {
+            Ok([
+                DeviceBuffer::<f32>::zeroed(stream, (hc + 1) * ROW)?,
+                DeviceBuffer::<f32>::zeroed(stream, hc * ROW)?,
+                DeviceBuffer::<f32>::zeroed(stream, hc * ROW)?,
+                DeviceBuffer::<f32>::zeroed(stream, hc)?,
+            ])
+        };
+        let host = |bufs: &[DeviceBuffer<f32>; 4]| -> Result<Vec<Vec<f32>>, GateError> {
+            bufs.iter().map(|b| Ok(b.to_host_vec(stream)?)).collect()
+        };
+        let mut eager = buffers()?;
+        enqueue(stream, &mut eager)?;
+        stream.synchronize()?;
+        let got = host(&eager)?;
+        let (kv_h, kn_h, out_h, gate_h) = (&got[0], &got[1], &got[2], &got[3]);
+
+        let kv_ref: Vec<f32> = p.ours.iter().map(|&v| v as f32).collect();
+        let gemv_rel = max_rel_err(kv_h, &kv_ref)?;
+        let kn_ref = our_key_norm(kv_h, &w.gk, eps, hc, 1);
+        let (out_ref, gate_ref) = our_gate_update(xs, &kn_ref, kv_h, w, eps, hc);
+        let exact = bits_equal(kn_h, &kn_ref)
+            && bits_equal(gate_h, &gate_ref)
+            && bits_equal(out_h, &out_ref);
+
+        // How far our kv sits from ik's: the two exact values' distance plus
+        // both sides' accumulation bounds and the f64 sums' own error.
+        let f64_sum = k_in as f64 * U64;
+        let bk: Vec<f64> = (0..(hc + 1) * ROW)
+            .map(|r| {
+                (p.ours[r] - p.ik[r]).abs()
+                    + (ik_gemv_rel(k_in) + f64_sum) * p.abs_ik[r]
+                    + (our_gemv_rel(k_in) + f64_sum) * p.abs_ours[r]
+            })
+            .collect();
+        let b = bands(
+            d,
+            w,
+            cx.meta,
+            t..t + 1,
+            Some((&bk[..hc * ROW], &bk[hc * ROW..])),
+        );
+        let rows = t * hc * ROW..(t + 1) * hc * ROW;
+        let rel = [
+            max_rel_err(kn_h, &d.kn[rows.clone()])?,
+            max_rel_err(gate_h, &d.gate[t * hc..(t + 1) * hc])?,
+            max_rel_err(out_h, &d.out[rows])?,
+        ];
+        let within = [b.kn, b.gate, b.out]
+            .iter()
+            .zip(rel)
+            .all(|(&band, r)| f64::from(r) <= band);
+        let mut pass = gemv_rel <= KERNEL_BAND && exact && within;
+        let mut replay = String::new();
+        if t == 0 {
+            let mut graphed = buffers()?;
+            let g = cx.gpu.capture(|s| enqueue(s, &mut graphed))?;
+            g.launch(stream)?;
+            stream.synchronize()?;
+            let same = host(&graphed)?
+                .iter()
+                .zip(&got)
+                .all(|(a, b)| bits_equal(a, b));
+            pass &= same && g.node_count() == 3;
+            replay = format!(
+                " graph_nodes={} replay_bit_identical={same}",
+                g.node_count()
+            );
+        }
+        println!(
+            "chain {label} L={} t={t}: gemv max_rel_err={gemv_rel:.3e} (band {KERNEL_BAND:.0e}) \
+             bit_exact_host={exact} ik_rel kn={:.3e} (band {:.3e}) gate={:.3e} (band {:.3e}) \
+             out={:.3e} (band {:.3e}){replay} {}",
+            w.l,
+            rel[0],
+            b.kn,
+            rel[1],
+            b.gate,
+            rel[2],
+            b.out,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+}

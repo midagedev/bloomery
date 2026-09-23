@@ -348,7 +348,7 @@ fn upload_segment(
 }
 
 /// Pack and upload one file tensor in its kernel's device format.
-fn upload_file_tensor(
+pub fn upload_file_tensor(
     stream: &CudaStream,
     gguf: &Gguf,
     t: &TensorInfo,
