@@ -20,16 +20,24 @@
 //!    row and a key are written;
 //! 4. the query: q_a, its norm, q_b and the tail rope;
 //! 5. the latent row: kv, then its norm, tail rope and f16 slot in the ring;
-//! 6. the attention over the window ⧺ a prefix of the stream's compressed
-//!    rows, then the inverse rope of its output;
-//! 7. wo_a, its groups in one `q8_0_gemv_heads` launch, and wo_b;
-//! 8. HC_POST and the ffn's fold in one launch.
+//! 6. on a layer that runs the indexer: the query's projection of q_a's norm,
+//!    the weights' projection of the normed input (in q8_1, quantized here on
+//!    a layer that owns no compressor), the score pass and the top-k pass,
+//!    which write the stream's list;
+//! 7. the attention over the window ⧺ the stream's compressed rows read
+//!    through the list, then the inverse rope of its output;
+//! 8. wo_a, its groups in one `q8_0_gemv_heads` launch, and wo_b;
+//! 9. HC_POST and the ffn's fold in one launch.
 //!
 //! A layer attends the rows its stream's source layer writes
-//! (`stream.kv_source`); the caller passes that layer's buffers
-//! ([`Compressed`]). The rows the indexer selects are the next phase's: the
-//! attention reads a prefix here (`selected: None`), which is every visible
-//! row wherever the visible count is at most the file's `top_k`.
+//! (`stream.kv_source`) and the list its top-k source layer selected this
+//! step (`stream.topk_source`); the caller passes that layer's buffers
+//! ([`Compressed`], [`Selection`]). The launches are the same at every
+//! depth: while the visible count is at most `top_k`, the score pass does
+//! nothing and the list is the identity `0..n_vis`, over which the
+//! selected-row attention is the prefix attention bit for bit. `top_k` is a
+//! load-time constant — the stride of the list and a word of the piece's own
+//! copy, which the indexer reads.
 //!
 //! The step's integers and rope tables come from the step image, whose
 //! layout is not the launches': the attention takes a token's window length
@@ -54,7 +62,7 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::Planner;
 
-use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
+use crate::attn::{self as attn_op, AttnArgs, AttnKernels, SelectedRows};
 use crate::body::STEP_TOKENS;
 use crate::compress::{
     self, CompGeom, CompressKernels, PoolArgs, RowsArgs, W_GROUPS, W_PERSISTS, w_persist, w_read,
@@ -65,6 +73,7 @@ use crate::hc::{
     HcPreScratch,
 };
 use crate::index_key::{self, IndexKeyArgs, IndexKeyKernels};
+use crate::indexer::{self, IndexerArgs, IndexerKernels, IndexerScratch};
 use crate::params::{ImageLayout, Table};
 use crate::rope::{KvAppendArgs, RopeKernels, TailShape};
 
@@ -108,6 +117,25 @@ pub struct AttnIo<'a> {
     /// The layer's raw window ring: `min(ctx_max, window)` latent rows in f16.
     pub ring: &'a mut DeviceTensor<u16>,
     pub compressed: Compressed<'a>,
+    pub selection: Selection<'a>,
+}
+
+/// The list a layer's attention reads its compressed rows through:
+/// [`AttnChain::list_len`] entries, of which the first `min(n_vis, top_k)`
+/// are live.
+pub enum Selection<'a> {
+    /// A window-only layer.
+    None,
+    /// A layer that attends the list its stream's top-k source layer wrote
+    /// earlier in the step.
+    Read(&'a DeviceBuffer<u32>),
+    /// A layer that runs the indexer: it scores its key source's index keys
+    /// and writes `list`. `keys` are those keys when another layer owns them;
+    /// `None` when the layer owns them, and they come in its [`SourceIo`].
+    Run {
+        keys: Option<&'a DeviceTensor<u16>>,
+        list: &'a mut DeviceBuffer<u32>,
+    },
 }
 
 /// Where the words the launches read sit in the piece's copy, in u32 words;
@@ -120,6 +148,8 @@ pub struct WordsLayout {
     pub window_vis: usize,
     /// A token's rope tables, in [`Table::ALL`] order.
     pub tables: [usize; 4],
+    /// The indexer's `top_k`: written at load, never gathered.
+    pub top_k: usize,
     /// Per stream of the plan, in its order.
     pub streams: Vec<StreamWords>,
     /// Words in the copy.
@@ -164,6 +194,20 @@ pub struct AttnTaps<'a> {
     /// On a compressor's layer: its projections, the pre-rope row and the
     /// index key's projection.
     pub source: Option<SourceTaps<'a>>,
+    /// What the last indexer layer enqueued left.
+    pub select: Option<SelectTaps<'a>>,
+}
+
+/// The indexer's buffers as the last indexer layer left them.
+pub struct SelectTaps<'a> {
+    /// The plan stream it scored.
+    pub stream: usize,
+    /// The query after its rope and transform, `HEADS · HEAD_DIM`.
+    pub q: &'a DeviceBuffer<f32>,
+    /// The scaled weights, `HEADS`.
+    pub w: &'a DeviceBuffer<f32>,
+    /// The scores of the rows below `n_vis`, on a layer that selected.
+    pub scores: &'a DeviceBuffer<f32>,
 }
 
 /// A compressor layer's intermediate buffers.
@@ -285,6 +329,7 @@ fn plan_words(
     for (at, t) in tables.iter_mut().zip(Table::ALL) {
         *at = p.field(img.table(0, t))?;
     }
+    let top_k = p.alloc(1);
     let yarn = tables[table_index(Table::YarnForward)];
     let mut streams = Vec::with_capacity(layout.streams().len());
     for (s, sl) in layout.streams().iter().enumerate() {
@@ -345,10 +390,23 @@ fn plan_words(
         pos,
         window_vis,
         tables,
+        top_k,
         streams,
         len,
     };
     Ok((words, p.src, p.dst))
+}
+
+/// The piece's copy of the step words before any gather: zero, but for the
+/// word no gather writes, `top_k`.
+fn constant_words(layout: &WordsLayout, top_k: usize) -> Result<Vec<f32>, GpuError> {
+    let k = u32::try_from(top_k).map_err(|_| GpuError::Shape {
+        what: WHAT,
+        detail: format!("a top_k of {top_k} passes u32"),
+    })?;
+    let mut host = vec![0.0f32; layout.len];
+    host[layout.top_k] = f32::from_bits(k);
+    Ok(host)
 }
 
 /// `t`'s place in [`Table::ALL`].
@@ -423,12 +481,21 @@ struct SourcePlan {
     keys: Option<(String, String)>,
 }
 
+/// The indexer a layer runs: its two projections, and whether it owns the
+/// index keys it scores.
+struct IndexerPlan {
+    q_b: String,
+    proj: String,
+    owns_keys: bool,
+}
+
 /// One layer as the piece runs it.
 struct LayerPlan {
     names: Names,
     /// The plan stream the layer attends; `None` on a window-only layer.
     stream: Option<usize>,
     source: Option<SourcePlan>,
+    indexer: Option<IndexerPlan>,
     /// Word offsets of its forward and back rope tables: YaRN on a layer
     /// with a stream, the window rope otherwise.
     forward: usize,
@@ -442,7 +509,25 @@ struct Kernels {
     attn: AttnKernels,
     comp: CompressKernels,
     key: IndexKeyKernels,
+    /// Loaded when a layer of the card runs the indexer.
+    index: Option<IndexerKernels>,
     step: StepKernels,
+}
+
+/// The indexer's scratch, present when a layer of the card runs it.
+struct SelectScratch {
+    /// The query's projection, `HEADS · HEAD_DIM` per token, and the
+    /// weights', `HEADS` per token.
+    q: DeviceBuffer<f32>,
+    w: DeviceBuffer<f32>,
+    /// The normed input in q8_1, on an indexer layer that owns no
+    /// compressor (one that does has it in [`SourceScratch::act`]).
+    act: Q8Act,
+    /// Per plan stream whose keys a layer scores: the score and top-k
+    /// passes' scratch over the stream's rows.
+    streams: Vec<Option<IndexerScratch>>,
+    /// The stream of the last indexer layer enqueued.
+    last: Option<usize>,
 }
 
 /// A compressor layer's scratch.
@@ -475,6 +560,7 @@ struct Scratch {
     out: DeviceBuffer<f32>,
     /// Present when a layer of the card owns a compressor.
     source: Option<SourceScratch>,
+    select: Option<SelectScratch>,
 }
 
 /// The attention piece of a card's layers: see the module comment.
@@ -485,6 +571,10 @@ pub struct AttnChain {
     kernels: Kernels,
     words: Words,
     scratch: Scratch,
+    /// The list's stride and the indexer's `top_k`, at most `list_len`.
+    top_k: usize,
+    /// Entries of a list per token: the file's `top_k`.
+    list_len: usize,
 }
 
 /// Device bytes of a [`Q8Act`] of `m` columns of `k`: its allocation's
@@ -560,6 +650,15 @@ impl AttnChain {
             .map(|l| layer_plan(hp, planner, &words_layout, l))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let list_len = hp.indexer.top_k;
+        let any_stream = plans.iter().any(|p| p.stream.is_some());
+        let any_indexer = plans.iter().any(|p| p.indexer.is_some());
+        if any_stream && list_len == 0 {
+            return Err(refuse(
+                "an indexer top_k of 0: a stream's rows are read through a list".to_string(),
+            ));
+        }
+
         let ctx = gpu.context();
         let stream = gpu.stream();
         let kernels = Kernels {
@@ -569,11 +668,14 @@ impl AttnChain {
             attn: AttnKernels::load(ctx)?,
             comp: CompressKernels::load(ctx)?,
             key: IndexKeyKernels::load(ctx)?,
+            index: any_indexer
+                .then(|| IndexerKernels::load(ctx, hp))
+                .transpose()?,
             step: StepKernels::load(ctx)?,
         };
         let pairs = src.len();
         let words = Words {
-            buf: DeviceBuffer::zeroed(stream, words_layout.len)?,
+            buf: DeviceBuffer::from_host(stream, &constant_words(&words_layout, list_len)?)?,
             src: DeviceBuffer::from_host(stream, &src)?,
             dst: DeviceBuffer::from_host(stream, &dst)?,
             layout: words_layout,
@@ -584,13 +686,9 @@ impl AttnChain {
         let m = STEP_TOKENS;
         let q_rows = m * hp.n_head;
         let window_rows = ctx_max.min(hp.window);
-        let comp_keys = words
-            .layout
-            .streams
-            .iter()
-            .map(|s| s.geom.rows)
-            .max()
-            .unwrap_or(0);
+        // A stream's rows are read through a list of `top_k` entries: its
+        // share of the grid, whatever the stream's height.
+        let comp_keys = if any_stream { list_len } else { 0 };
         let segs = attn_op::segments(window_rows, comp_keys);
         let gm = words
             .layout
@@ -617,6 +715,28 @@ impl AttnChain {
         } else {
             None
         };
+        let select = if any_indexer {
+            let mut streams: Vec<Option<IndexerScratch>> =
+                (0..words.layout.streams.len()).map(|_| None).collect();
+            for p in plans.iter().filter(|p| p.indexer.is_some()) {
+                let s = p
+                    .stream
+                    .ok_or_else(|| refuse("an indexer layer that attends no stream".to_string()))?;
+                if streams[s].is_none() {
+                    let rows = words.layout.streams[s].geom.rows;
+                    streams[s] = Some(IndexerScratch::new(stream, m, rows)?);
+                }
+            }
+            Some(SelectScratch {
+                q: DeviceBuffer::zeroed(stream, m * indexer::HEADS * indexer::HEAD_DIM)?,
+                w: DeviceBuffer::zeroed(stream, m * indexer::HEADS)?,
+                act: Q8Act::with_k(stream, m, hp.n_embd)?,
+                streams,
+                last: None,
+            })
+        } else {
+            None
+        };
         let scratch = Scratch {
             hc_pre: HcPreScratch::new(stream, HC_STREAMS * hp.n_embd)?,
             mixes: DeviceBuffer::zeroed(stream, HC_MIX * m)?,
@@ -633,6 +753,7 @@ impl AttnChain {
             wo_a: DeviceBuffer::zeroed(stream, m * hp.o_groups * hp.o_lora_rank)?,
             out: DeviceBuffer::zeroed(stream, m * hp.n_embd)?,
             source,
+            select,
         };
         let dims = Dims {
             n_embd: hp.n_embd,
@@ -655,7 +776,44 @@ impl AttnChain {
             kernels,
             words,
             scratch,
+            top_k: list_len,
+            list_len,
         })
+    }
+
+    /// Entries of the list a stream's layers read, per token: the file's
+    /// `top_k`. The caller allocates each list of `STEP_TOKENS` times this.
+    #[must_use]
+    pub fn list_len(&self) -> usize {
+        self.list_len
+    }
+
+    /// The indexer's `top_k` and the list's stride.
+    #[must_use]
+    pub fn top_k(&self) -> usize {
+        self.top_k
+    }
+
+    /// Select `top_k` rows instead of the file's, as ik's
+    /// `--override-kv <arch>.attention.indexer.top_k` does: at least 1, at
+    /// most [`list_len`](Self::list_len). Load-time only — one host-to-device
+    /// copy of the step words (the next [`enqueue_step`](Self::enqueue_step)
+    /// gathers the rest again); a step captured before it keeps the old
+    /// stride and must be captured again.
+    pub fn set_top_k(&mut self, gpu: &Gpu, top_k: usize) -> Result<(), GpuError> {
+        if top_k == 0 || top_k > self.list_len {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a top_k of {top_k}: at least 1 and at most the lists' {} entries",
+                    self.list_len
+                ),
+            });
+        }
+        let host = constant_words(&self.words.layout, top_k)?;
+        self.words.buf.copy_from_host(gpu.stream(), &host)?;
+        self.top_k = top_k;
+        Ok(())
     }
 
     /// Device bytes the piece holds besides the weights and the buffers it
@@ -692,8 +850,19 @@ impl AttnChain {
                 + q8act_bytes(x.act.m(), d.n_embd)
                 + q8act_bytes(x.act_pre.m(), compress::WIDTH)
         });
+        let select = s.select.as_ref().map_or(0, |x| {
+            x.q.num_bytes()
+                + x.w.num_bytes()
+                + q8act_bytes(x.act.m(), d.n_embd)
+                + x.streams
+                    .iter()
+                    .flatten()
+                    .map(IndexerScratch::device_bytes)
+                    .sum::<usize>()
+        });
         plain
             + source
+            + select
             + self.words.src.num_bytes()
             + self.words.dst.num_bytes()
             + hc_pre_bytes(s.hc_pre.k())
@@ -733,6 +902,16 @@ impl AttnChain {
                 score: &x.score,
                 pre: &x.pre,
                 key: &x.key,
+            }),
+            select: s.select.as_ref().and_then(|x| {
+                let stream = x.last?;
+                let scratch = x.streams.get(stream)?.as_ref()?;
+                Some(SelectTaps {
+                    stream,
+                    q: &scratch.q,
+                    w: &scratch.w,
+                    scores: &scratch.scores,
+                })
             }),
         }
     }
@@ -784,7 +963,9 @@ impl AttnChain {
             fold_out,
             ring,
             mut compressed,
+            selection,
         } = io;
+        let top_k = self.top_k;
         let cx = Cx {
             gpu,
             w,
@@ -892,6 +1073,53 @@ impl AttnChain {
             }
             _ => (None, cx.words.layout.window_vis),
         };
+        let list: Option<&DeviceBuffer<u32>> = match (&lp.indexer, selection, lp.stream) {
+            (None, Selection::None, None) => None,
+            (None, Selection::Read(list), Some(_)) => Some(list),
+            (Some(ip), Selection::Run { keys, list }, Some(st)) => {
+                let keys = match (ip.owns_keys, keys, &compressed) {
+                    (true, None, Compressed::Source(io)) => io.keys.as_deref(),
+                    (false, Some(keys), _) => Some(keys),
+                    _ => None,
+                }
+                .ok_or_else(|| GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "layer {layer} runs the indexer and owns its keys: {}; the caller passed \
+                         them elsewhere",
+                        ip.owns_keys
+                    ),
+                })?;
+                enqueue_indexer(
+                    &cx,
+                    lp,
+                    ip,
+                    &mut *s,
+                    IndexerIo {
+                        stream: st,
+                        keys,
+                        list: &mut *list,
+                        top_k,
+                    },
+                )?;
+                Some(&*list)
+            }
+            (ip, sel, st) => {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "layer {layer} attends stream {st:?} and runs the indexer: {}; the caller \
+                         passed {}",
+                        ip.is_some(),
+                        match sel {
+                            Selection::None => "no list",
+                            Selection::Read(_) => "a list to read",
+                            Selection::Run { .. } => "a list to write",
+                        }
+                    ),
+                });
+            }
+        };
         let vis = cx.words.view::<u32>(vis_at, 2 * m)?;
         k.attn.enqueue(
             stream,
@@ -899,10 +1127,12 @@ impl AttnChain {
                 q: &s.q,
                 window: ring,
                 compressed: rows,
-                // The indexer's lists go here on a top-k layer: the next
-                // phase's seam. A prefix is every visible row while the
-                // visible count stays at most `top_k`.
-                selected: None,
+                // A stream's rows are read through the list: while the
+                // visible count is at most `top_k`, the identity.
+                selected: list.map(|rows| SelectedRows {
+                    rows,
+                    stride: top_k,
+                }),
                 vis: &vis,
                 sinks: vector(w, &n.sinks)?,
                 scale: d.scale,
@@ -992,6 +1222,79 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
     cx.gpu
         .q8f32()
         .enqueue_q8_0_gemv(stream, qs, qd, &s.wo_a, STEP_TOKENS, &mut s.out)
+}
+
+/// What an indexer layer's selection reads and writes besides the scratch.
+struct IndexerIo<'a> {
+    /// The plan stream whose visible rows it scores.
+    stream: usize,
+    keys: &'a DeviceTensor<u16>,
+    list: &'a mut DeviceBuffer<u32>,
+    top_k: usize,
+}
+
+/// The indexer of an indexer layer, after the query path and the norm: the
+/// query's projection of q_a's norm, the weights' projection of the normed
+/// input in q8_1 (the compressor's on its layer, quantized here elsewhere),
+/// then the score and top-k passes into the list. The visible count and
+/// `top_k` are words of the piece's copy; the rope table is the layer's
+/// forward table (YaRN: the layer attends a stream).
+fn enqueue_indexer(
+    cx: &Cx<'_>,
+    lp: &LayerPlan,
+    ip: &IndexerPlan,
+    s: &mut Scratch,
+    io: IndexerIo<'_>,
+) -> Result<(), GpuError> {
+    let (d, w, gpu, stream) = (cx.d, cx.w, cx.gpu, cx.gpu.stream());
+    let m = STEP_TOKENS;
+    let refuse = |detail: &str| GpuError::Shape {
+        what: WHAT,
+        detail: detail.to_string(),
+    };
+    let kernels =
+        cx.k.index
+            .as_ref()
+            .ok_or_else(|| refuse("an indexer layer on a piece that loaded no indexer"))?;
+    let sel = s
+        .select
+        .as_mut()
+        .ok_or_else(|| refuse("an indexer layer on a piece with no indexer scratch"))?;
+    let (qs, qd) = q8_0(w, &ip.q_b)?;
+    gpu.q8f32()
+        .enqueue_q8_0_gemv(stream, qs, qd, &s.q_a_normed, m, &mut sel.q)?;
+    let act = match (lp.source.is_some(), s.source.as_ref()) {
+        (true, Some(src)) => &src.act,
+        _ => {
+            gpu.enqueue_quantize_q8_1(&s.normed, &mut sel.act)?;
+            &sel.act
+        }
+    };
+    gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, &mut sel.w)?;
+    let words = cx.words.view::<u32>(0, cx.words.layout.len)?;
+    let scratch = sel.streams[io.stream]
+        .as_mut()
+        .ok_or_else(|| refuse("an indexer layer's stream has no indexer scratch"))?;
+    kernels.enqueue(
+        stream,
+        IndexerArgs {
+            q: &sel.q,
+            w: &sel.w,
+            ints: &words,
+            n_vis_at: cx.words.layout.streams[io.stream].vis + 1,
+            top_k_at: cx.words.layout.top_k,
+            tables: &words,
+            rope_at: lp.forward,
+            rope_stride: d.rope_dims,
+            keys: io.keys,
+            tokens: m,
+            scratch,
+            list: io.list,
+            stride: io.top_k,
+        },
+    )?;
+    sel.last = Some(io.stream);
+    Ok(())
 }
 
 /// A compressor layer's own launches, after the norm left the q8_1 input:
@@ -1154,6 +1457,46 @@ fn layer_plan(
             )));
         }
     };
+    // Every layer of a stream reads the list its top-k source wrote over the
+    // same stream; an indexer layer is its own top-k source and scores the
+    // keys of a layer of its stream that owns them.
+    let of_stream = |src: usize| planner.layer_stream(src) == stream && src <= l;
+    if let Some(st) = kind.stream {
+        let ts = st.topk_source;
+        if !(of_stream(ts) && hp.layers.get(ts).is_some_and(|k| k.indexer)) {
+            return Err(refuse(format!(
+                "its list comes from layer {ts}, which runs no indexer over its stream before it"
+            )));
+        }
+    }
+    let indexer = match kind.stream {
+        Some(st) if kind.indexer => {
+            let ks = st.index_key_source;
+            if st.topk_source != l
+                || !(of_stream(ks) && hp.layers.get(ks).is_some_and(|k| k.index_keys))
+            {
+                return Err(refuse(format!(
+                    "runs the indexer as top-k source {} over the keys of layer {ks}, which owns \
+                     none of its stream",
+                    st.topk_source
+                )));
+            }
+            if ks == l && source.as_ref().is_none_or(|s| s.keys.is_none()) {
+                return Err(refuse(
+                    "scores its own index keys and writes none".to_string(),
+                ));
+            }
+            Some(IndexerPlan {
+                q_b: names::indexer_attn_q_b(l),
+                proj: names::indexer_proj(l),
+                owns_keys: ks == l,
+            })
+        }
+        None if kind.indexer => {
+            return Err(refuse("runs the indexer and attends no stream".to_string()));
+        }
+        _ => None,
+    };
     let t = |table| words.tables[table_index(table)];
     let (forward, back) = match stream {
         Some(_) => (t(Table::YarnForward), t(Table::YarnBack)),
@@ -1176,6 +1519,7 @@ fn layer_plan(
         },
         stream,
         source,
+        indexer,
         forward,
         back,
     })

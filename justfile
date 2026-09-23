@@ -640,7 +640,10 @@ gate-gpu-ds41-chain-attn:
 # 커널·메모리 연산 배치 수가 조각들이 예측한 수와 같고, step4 세트의 상태를 주입한 재생이 eager 실행과 비트까지 같다.
 # --sets: step4·d1n 세트에서 층마다 덤프의 상태를 주입해 eager 스텝 하나 — engram 행 id와 라우터 id는 정확히(근접 동률은
 # 면제), 서브층마다 스트림은 전파 밴드 안, result_output의 argmax. 3090, 게이트 락.
-gate-gpu-ds41-step *ARGS='--structure --sets':
+# --select(2단계): d1(top_k 64)·d2 세트, 인덱서 층마다 선택이 실제로 일어나는 자리 — 리스트가 그 층 점수의 정확한 top-k인지,
+# 인덱서의 쿼리·가중치가 포락선 안인지, ik 리스트와의 차이가 동률 밴드 안뿐인지; 리스트를 바꿔 끼웠을 때 어텐션이 받는
+# 영향은 포락선에 합쳐 잰다.
+gate-gpu-ds41-step *ARGS='--structure --sets --select':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}}'
 
 # ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — step 게이트

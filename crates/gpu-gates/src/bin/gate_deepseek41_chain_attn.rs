@@ -84,7 +84,7 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Gpu};
     use bloomery_gpu_deepseek41::body::STEP_TOKENS;
     use bloomery_gpu_deepseek41::chain::attn::{
-        AttnChain, AttnIo, AttnTaps, Compressed, SourceIo, WordsLayout,
+        AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, WordsLayout,
     };
     use bloomery_gpu_deepseek41::compress::StepInts;
     use bloomery_gpu_deepseek41::hc::HC_MIX;
@@ -188,13 +188,14 @@ mod gate {
     // ---------------------------------------------------------- layer kinds
 
     /// A layer as the gate reads it: the plan's stream, the file's
-    /// compressor.
+    /// compressor, whether it runs the indexer.
     #[derive(Clone, Copy, Debug)]
     struct Kind {
         stream: Option<usize>,
         /// It owns its stream's compressor: whether that pools with scores
         /// (above ratio 1), whether it owns index keys.
         source: Option<(bool, bool)>,
+        indexer: bool,
     }
 
     impl Kind {
@@ -203,6 +204,7 @@ mod gate {
             Kind {
                 stream: planner.layer_stream(l),
                 source: kind.compressor.map(|c| (c.gated, kind.index_keys)),
+                indexer: kind.indexer,
             }
         }
 
@@ -217,12 +219,18 @@ mod gate {
         /// The piece's launches for a layer of this kind (the module doc of
         /// `chain::attn`): fourteen on every layer — HC_PRE, the norm, q_a,
         /// its norm, q_b, the q rope, kv, the K/V append, the attention's two,
-        /// the inverse rope, wo_a, wo_b, HC_POST — and on a compressor's
-        /// layer its projections, the row launch and the index key's three.
+        /// the inverse rope, wo_a, wo_b, HC_POST — on a compressor's layer
+        /// its projections, the row launch and the index key's three, and on
+        /// an indexer layer its two projections, the score and top-k passes
+        /// and, without a compressor, the q8_1 of the normed input.
         fn launches(&self) -> usize {
             14 + self.source.map_or(0, |(gated, keys)| {
                 1 + usize::from(gated) + 1 + 3 * usize::from(keys)
-            })
+            }) + if self.indexer {
+                4 + usize::from(self.source.is_none())
+            } else {
+                0
+            }
         }
     }
 
@@ -375,6 +383,10 @@ mod gate {
                 set.insert(names::indexer_attn_k(l));
                 set.insert(names::indexer_k_norm(l));
             }
+        }
+        if kind.indexer {
+            set.insert(names::indexer_attn_q_b(l));
+            set.insert(names::indexer_proj(l));
         }
         set
     }
@@ -564,6 +576,9 @@ mod gate {
         rows: Option<Vec<u16>>,
         keys: Option<Vec<u16>>,
         comp_ring: Option<(Vec<f32>, Vec<f32>)>,
+        /// The compressed rows the step's token sees: the identity list's
+        /// length.
+        n_vis: usize,
         // Compared with.
         s_ref: Vec<f32>,
         x_ref: Vec<f32>,
@@ -785,6 +800,7 @@ mod gate {
             out: f32s(man, out)?,
             keys_lin,
             window_len: len,
+            n_vis: st.map_or(0, |st| st.n_visible[0] as usize),
             iqk: man.tensor(&name("mask_to_idx"), 0).is_ok(),
             fwd: set.table(fwd)?,
             back: set.table(back)?,
@@ -1484,10 +1500,12 @@ mod gate {
         streams_out: DeviceBuffer<f32>,
         fold_out: DeviceBuffer<f32>,
         ring: DeviceTensor<u16>,
-        /// Per stream: its rows, its index keys, and above ratio 1 its ring.
+        /// Per stream: its rows, its index keys, above ratio 1 its ring, and
+        /// the list its layers read the rows through.
         rows: Vec<DeviceTensor<u16>>,
         keys: Vec<DeviceTensor<u16>>,
         comp_ring: Vec<Option<(DeviceTensor<f32>, DeviceTensor<f32>)>>,
+        lists: Vec<DeviceBuffer<u32>>,
         image: DeviceBuffer<u32>,
     }
 
@@ -1497,12 +1515,15 @@ mod gate {
             hp: &Hparams,
             planner: &Planner,
             image_words: usize,
+            list_len: usize,
         ) -> Result<Bufs, GateError> {
             let ctx = planner.ctx_max() as usize;
             let mut rows = Vec::new();
             let mut keys = Vec::new();
             let mut comp_ring = Vec::new();
+            let mut lists = Vec::new();
             for &r in planner.stream_ratios() {
+                lists.push(DeviceBuffer::zeroed(stream, STEP_TOKENS * list_len)?);
                 let (r, n) = (r as usize, ctx.div_ceil(r as usize));
                 rows.push(DeviceTensor::zeroed(stream, n, hp.head_dim)?);
                 keys.push(DeviceTensor::zeroed(stream, n, hp.indexer.head_dim)?);
@@ -1524,6 +1545,7 @@ mod gate {
                 rows,
                 keys,
                 comp_ring,
+                lists,
                 image: DeviceBuffer::zeroed(stream, image_words)?,
             })
         }
@@ -1538,16 +1560,45 @@ mod gate {
                 rows,
                 keys,
                 comp_ring,
+                lists,
                 ..
             } = self;
-            let compressed = match (kind.stream, kind.source) {
-                (None, _) => Compressed::None,
-                (Some(s), None) => Compressed::Read(&rows[s]),
-                (Some(s), Some((_, has_keys))) => Compressed::Source(SourceIo {
-                    rows: &mut rows[s],
-                    keys: if has_keys { Some(&mut keys[s]) } else { None },
-                    ring: comp_ring[s].as_mut().map(|(v, sc)| (v, sc)),
-                }),
+            let Some(s) = kind.stream else {
+                return AttnIo {
+                    streams_in,
+                    fold_in,
+                    streams_out,
+                    fold_out,
+                    ring,
+                    compressed: Compressed::None,
+                    selection: Selection::None,
+                };
+            };
+            let list = &mut lists[s];
+            let (compressed, selection) = match kind.source {
+                None => (
+                    Compressed::Read(&rows[s]),
+                    if kind.indexer {
+                        Selection::Run {
+                            keys: Some(&keys[s]),
+                            list,
+                        }
+                    } else {
+                        Selection::Read(list)
+                    },
+                ),
+                Some((_, has_keys)) => (
+                    Compressed::Source(SourceIo {
+                        rows: &mut rows[s],
+                        keys: if has_keys { Some(&mut keys[s]) } else { None },
+                        ring: comp_ring[s].as_mut().map(|(v, sc)| (v, sc)),
+                    }),
+                    if kind.indexer {
+                        Selection::Run { keys: None, list }
+                    } else {
+                        Selection::Read(list)
+                    },
+                ),
             };
             AttnIo {
                 streams_in,
@@ -1556,6 +1607,7 @@ mod gate {
                 fold_out,
                 ring,
                 compressed,
+                selection,
             }
         }
 
@@ -1572,6 +1624,16 @@ mod gate {
             self.fold_in.copy_from_host(stream, &c.x_in)?;
             self.ring.buf_mut().copy_from_host(stream, &c.ring)?;
             self.image.copy_from_host(stream, words)?;
+            if let Some(s) = kind.stream {
+                // The selection of the phase's sets, where no layer selects:
+                // the identity over the visible rows. An indexer layer
+                // writes its own over it.
+                let mut list = vec![u32::MAX; self.lists[s].len()];
+                for (i, e) in list.iter_mut().take(c.n_vis).enumerate() {
+                    *e = u32::try_from(i)?;
+                }
+                self.lists[s].copy_from_host(stream, &list)?;
+            }
             if let (Some(s), Some(rows)) = (kind.stream, &c.rows) {
                 self.rows[s].buf_mut().copy_from_host(stream, rows)?;
                 if let Some(keys) = &c.keys {
@@ -1740,7 +1802,7 @@ mod gate {
         let gpu = Gpu::new()?;
         let stream = gpu.stream();
         let mut piece = AttnChain::new(&gpu, &hp, 0..hp.n_layer, &layout, &planner)?;
-        let mut bufs = Bufs::new(stream, &hp, &planner, layout.words())?;
+        let mut bufs = Bufs::new(stream, &hp, &planner, layout.words(), piece.list_len())?;
         println!(
             "gate_deepseek41_chain_attn: device {}; model {}; piece scratch {} bytes, {} step \
              words; mutation {mutation:?}; pin Z = {Z}",

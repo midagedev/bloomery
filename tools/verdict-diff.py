@@ -49,6 +49,8 @@ MASKS = [
     (re.compile(r'\b\d{2}:\d{2}:\d{2}Z?\b'), '<time>'),
     (re.compile(r'\bepoch \d+'), 'epoch <n>'),
     (re.compile(r'\b(\w*(?:_s|_ms|_us|secs|seconds))=[0-9.]+'), r'\1=<t>'),
+    # The hybrid gate's load counters, which it labels a load and not a timing: they move run to run.
+    (re.compile(r'\b(\w*_us_(?:mean|max|p\d+)|go_early|parks_in_service)=[0-9.]+'), r'\1=<n>'),
     (re.compile(r'\b\d+(\.\d+)?\s?(ns|us|µs|ms|s)\b'), r'<t>\2'),
     (re.compile(r'\b(pid|PID|lock-holder-pid)([ =:]+)\d+'), r'\1\2<pid>'),
     (re.compile(r'ThreadId\(\d+\)'), 'ThreadId(<n>)'),

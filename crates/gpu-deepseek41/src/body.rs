@@ -20,6 +20,8 @@
 //!   segments, so moving an expert between the card and the host changes
 //!   this map and not the code; the chain reads its card copy and the host
 //!   tier its host copy ([`SlotMap`]);
+//! - per layer that runs the indexer, its list: the compressed rows its
+//!   stream's layers attend this step, [`AttnChain::list_len`] entries;
 //! - the host tier ([`Hybrid`]): the join buffers and the host experts;
 //! - the three chain pieces ([`crate::chain`]) with their scratch.
 //!
@@ -53,7 +55,7 @@ use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::placement::{Device, Machine, Plan, Role};
 
-use crate::chain::attn::{AttnChain, AttnIo, Compressed, SourceIo};
+use crate::chain::attn::{AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo};
 use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps};
 use crate::chain::glue::{EngramStep, Glue, StepRows};
 use crate::hc::HC_STREAMS;
@@ -160,11 +162,26 @@ enum RowsOf {
     Source,
 }
 
+/// The list a layer's attention reads its compressed rows through.
+#[derive(Clone, Copy, Debug)]
+enum ListOf {
+    /// A window-only layer.
+    None,
+    /// The list at this index of the body's lists, which a layer earlier in
+    /// the step wrote.
+    Reads(usize),
+    /// The layer runs the indexer into the list at this index, scoring the
+    /// index keys of the layer at `keys` of the body's layers — `None` when
+    /// it owns them.
+    Writes { list: usize, keys: Option<usize> },
+}
+
 /// What one layer of the step runs besides its two sub-layers' launches,
 /// resolved at load.
 #[derive(Clone, Copy, Debug)]
 struct LayerStep {
     rows: RowsOf,
+    list: ListOf,
     /// The layer carries an engram site: the glue's engram step precedes its
     /// attention.
     engram: bool,
@@ -176,12 +193,15 @@ struct LayerStep {
 /// [`Body::enqueue_observed`] once the launches before it are enqueued:
 /// the buffers one piece just wrote. The engine's own step observes nothing.
 pub enum Seam<'a> {
-    /// Layer `layer`'s attention sub-layer: the new streams and the MoE
-    /// sub-layer's folded input.
+    /// Layer `layer`'s attention sub-layer: the new streams, the MoE
+    /// sub-layer's folded input, the piece's own buffers, and the list its
+    /// attention read the compressed rows through.
     Attn {
         layer: usize,
         streams: &'a DeviceBuffer<f32>,
         fold: &'a DeviceBuffer<f32>,
+        taps: AttnTaps<'a>,
+        list: Option<&'a DeviceBuffer<u32>>,
     },
     /// The engram step before layer `layer`'s attention: the gated streams
     /// and the attention's folded input.
@@ -220,6 +240,8 @@ pub struct Body {
     hc: [DeviceTensor<f32>; 2],
     /// The folded input a sub-layer reads, ping and pong: `n_embd` f32 each.
     folds: [DeviceBuffer<f32>; 2],
+    /// Per indexer layer of the card, in layer order: its list.
+    lists: Vec<DeviceBuffer<u32>>,
     image: StepImage,
     /// The image's device copy, which the captured chain reads.
     params: DeviceBuffer<u32>,
@@ -286,7 +308,7 @@ impl Body {
     /// The buffers besides the layers' caches, by name, with their device
     /// bytes: the pieces' scratch among them.
     #[must_use]
-    pub fn step_buffers(&self) -> [(&'static str, usize); 8] {
+    pub fn step_buffers(&self) -> [(&'static str, usize); 9] {
         [
             (
                 "hyper-connection streams",
@@ -297,6 +319,10 @@ impl Body {
                 self.folds.iter().map(DeviceBuffer::num_bytes).sum(),
             ),
             ("step image", self.params.num_bytes()),
+            (
+                "selection lists",
+                self.lists.iter().map(DeviceBuffer::num_bytes).sum(),
+            ),
             ("slot map", self.slots.buf().num_bytes()),
             ("join buffers", self.hybrid.boundary().device_bytes()),
             ("attention piece", self.attn.device_bytes()),
@@ -402,6 +428,20 @@ impl Body {
         Ok(())
     }
 
+    /// The indexer's `top_k` the step selects with.
+    #[must_use]
+    pub fn indexer_top_k(&self) -> usize {
+        self.attn.top_k()
+    }
+
+    /// Select `top_k` compressed rows per stream instead of the file's
+    /// `attention.indexer.top_k` — ik's `--override-kv` of that key: at least
+    /// 1, at most the file's. Load-time only; a step captured before it must
+    /// be captured again ([`AttnChain::set_top_k`]).
+    pub fn set_indexer_top_k(&mut self, gpu: &Gpu, top_k: usize) -> Result<(), GpuError> {
+        self.attn.set_top_k(gpu, top_k)
+    }
+
     /// Enqueue the step as [`ChainBody::enqueue_chain`] does, showing
     /// `observe` each [`Seam`] as its launches are enqueued: a gate reads the
     /// streams there after it synchronizes. Asynchronous apart from what the
@@ -419,6 +459,7 @@ impl Body {
             steps,
             hc,
             folds,
+            lists,
             params,
             slots,
             hybrid,
@@ -465,7 +506,7 @@ impl Body {
             {
                 let (streams_in, streams_out) = ping(hc, s);
                 let (fold_in, fold_out) = ping(folds, f);
-                let (ring, compressed) = layer_io(kv, i, step.rows)?;
+                let (ring, compressed, selection) = layer_io(kv, lists, i, step)?;
                 attn.enqueue_layer(
                     gpu,
                     w,
@@ -477,6 +518,7 @@ impl Body {
                         fold_out,
                         ring,
                         compressed,
+                        selection,
                     },
                 )?;
             }
@@ -488,6 +530,11 @@ impl Body {
                     layer: l,
                     streams: hc[s].buf(),
                     fold: &folds[f],
+                    taps: attn.taps(),
+                    list: match step.list {
+                        ListOf::None => None,
+                        ListOf::Reads(j) | ListOf::Writes { list: j, .. } => lists.get(j),
+                    },
                 },
             )?;
             {
@@ -526,26 +573,42 @@ impl Body {
     }
 }
 
-/// Layer `i`'s window ring and the compressed rows its attention reads, out
-/// of the body's layers `kv`.
-fn layer_io(
-    kv: &mut [LayerKv],
+/// Layer `i`'s window ring, the compressed rows its attention reads and the
+/// list it reads them through, out of the body's layers `kv` and `lists`.
+fn layer_io<'a>(
+    kv: &'a mut [LayerKv],
+    lists: &'a mut [DeviceBuffer<u32>],
     i: usize,
-    rows: RowsOf,
-) -> Result<(&mut DeviceTensor<u16>, Compressed<'_>), GpuError> {
+    step: &LayerStep,
+) -> Result<(&'a mut DeviceTensor<u16>, Compressed<'a>, Selection<'a>), GpuError> {
     let refuse = |detail: &'static str| GpuError::State {
         what: "deepseek41 Body::enqueue_chain",
         missing: detail,
     };
-    match rows {
-        RowsOf::None => Ok((&mut kv[i].ring, Compressed::None)),
+    let (before, rest) = kv.split_at_mut(i);
+    let selection = match step.list {
+        ListOf::None => Selection::None,
+        ListOf::Reads(j) => Selection::Read(lists.get(j).ok_or(refuse("the layer's list"))?),
+        ListOf::Writes { list, keys } => Selection::Run {
+            keys: keys
+                .map(|k| {
+                    before
+                        .get(k)
+                        .and_then(|b| b.keys.as_ref())
+                        .ok_or(refuse("the key source layer's index keys"))
+                })
+                .transpose()?,
+            list: lists.get_mut(list).ok_or(refuse("the layer's list"))?,
+        },
+    };
+    let (ring, compressed) = match step.rows {
+        RowsOf::None => (&mut rest[0].ring, Compressed::None),
         RowsOf::Reads(src) => {
-            let (before, rest) = kv.split_at_mut(i);
             let rows = before
                 .get(src)
                 .and_then(|k| k.rows.as_ref())
                 .ok_or(refuse("the source layer's compressed rows"))?;
-            Ok((&mut rest[0].ring, Compressed::Read(rows)))
+            (&mut rest[0].ring, Compressed::Read(rows))
         }
         RowsOf::Source => {
             let LayerKv {
@@ -554,7 +617,7 @@ fn layer_io(
                 keys,
                 values,
                 scores,
-            } = &mut kv[i];
+            } = &mut rest[0];
             let rows = rows
                 .as_mut()
                 .ok_or(refuse("the layer's own compressed rows"))?;
@@ -562,16 +625,17 @@ fn layer_io(
                 (Some(v), Some(sc)) => Some((v, sc)),
                 _ => None,
             };
-            Ok((
+            (
                 ring,
                 Compressed::Source(SourceIo {
                     rows,
                     keys: keys.as_mut(),
                     ring: state,
                 }),
-            ))
+            )
         }
-    }
+    };
+    Ok((ring, compressed, selection))
 }
 
 impl ChainBody for Body {
@@ -654,8 +718,8 @@ impl ChainBody for Body {
         self.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))
     }
 
-    /// Every ring, compressed row, index key, compressor state, stream and
-    /// fold is zeroed in place — a captured chain keeps their addresses —
+    /// Every ring, compressed row, index key, compressor state, stream, fold
+    /// and list is zeroed in place — a captured chain keeps their addresses —
     /// and the token history is emptied.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
@@ -667,6 +731,9 @@ impl ChainBody for Body {
         }
         for f in &mut self.folds {
             f.zero_async(stream)?;
+        }
+        for l in &mut self.lists {
+            l.zero_async(stream)?;
         }
         self.history.clear();
         Ok(())
@@ -779,6 +846,12 @@ impl ChainBody for Body {
         let ffn = FfnPiece::new(gpu, hp, &map)?;
         let glue = Glue::new(gpu, hp, image.layout())?;
         let steps = layer_steps(hp, &layers, &kv, &ffn, &glue)?;
+        let lists = (0..steps
+            .iter()
+            .filter(|s| matches!(s.list, ListOf::Writes { .. }))
+            .count())
+            .map(|_| DeviceBuffer::zeroed(stream, STEP_TOKENS * attn.list_len()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let boundary = Boundary::new(
             gpu.context(),
@@ -802,6 +875,7 @@ impl ChainBody for Body {
             steps,
             hc,
             folds,
+            lists,
             image,
             params,
             slots,
@@ -821,7 +895,10 @@ impl ChainBody for Body {
 
 /// What each of `layers` runs besides its two sub-layers, checked against the
 /// pieces: a reading layer's source runs before it on this card and holds
-/// compressed rows; an engram step precedes exactly the layers the glue has
+/// compressed rows; a layer of a stream reads the list of its top-k source,
+/// an indexer layer that runs before it (or is it) on this card, and an
+/// indexer layer scores the keys of a layer that runs before it (or is it)
+/// and holds them; an engram step precedes exactly the layers the glue has
 /// sites at, none of them the first, whose attention input the embedding
 /// broadcast writes; and the MoE sub-layer folds the next input everywhere
 /// except before an engram layer and after the last layer, where the glue
@@ -839,8 +916,54 @@ fn layer_steps(
     };
     let sites: Vec<usize> = glue.engram_layers().collect();
     let mut steps = Vec::with_capacity(layers.len());
+    // The list index of each indexer layer on the card, in layer order.
+    let mut writers: Vec<usize> = Vec::new();
     for (i, l) in layers.clone().enumerate() {
         let kind = &hp.layers[l];
+        let list = match kind.stream {
+            None => ListOf::None,
+            Some(st) if kind.indexer => {
+                let keys = if st.index_key_source == l {
+                    kv[i].keys.is_some().then_some(None)
+                } else {
+                    st.index_key_source
+                        .checked_sub(layers.start)
+                        .filter(|&k| k < i && kv[k].keys.is_some())
+                        .map(Some)
+                }
+                .ok_or_else(|| {
+                    refuse(
+                        l,
+                        format!(
+                            "it scores the index keys of layer {}, which does not hold them on \
+                             this card by then",
+                            st.index_key_source
+                        ),
+                    )
+                })?;
+                writers.push(l);
+                ListOf::Writes {
+                    list: writers.len() - 1,
+                    keys,
+                }
+            }
+            Some(st) => {
+                let j = writers
+                    .iter()
+                    .position(|&w| w == st.topk_source)
+                    .ok_or_else(|| {
+                        refuse(
+                            l,
+                            format!(
+                                "its list comes from layer {}, which runs no indexer before it \
+                                 on this card",
+                                st.topk_source
+                            ),
+                        )
+                    })?;
+                ListOf::Reads(j)
+            }
+        };
         let rows = match (kind.stream, kind.compressor) {
             (None, _) => RowsOf::None,
             (Some(st), Some(_)) if st.kv_source == l => RowsOf::Source,
@@ -894,6 +1017,7 @@ fn layer_steps(
         }
         steps.push(LayerStep {
             rows,
+            list,
             engram,
             folds,
         });
