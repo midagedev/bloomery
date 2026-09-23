@@ -9,10 +9,11 @@
 //! at start with its per-token totals. Every row's per-tensor file bytes must
 //! equal the inventory's, and the q8_0 rows must add up to the count and
 //! bytes of `docs/v41-placement.md` §1, or the run stops before it touches
-//! the card. Two rows are pricing arms rather than one token's work: the
-//! block-diagonal `attn_output_a` runs as the engine issues it without a
-//! batched kernel (one launch per group) and, separately, as one
-//! dense-equivalent launch over the same bytes. The routed experts run at
+//! the card. The block-diagonal `attn_output_a` has three rows, each over
+//! the same weight bytes: one launch per group (the row today's token
+//! issues), one dense-equivalent launch, and one launch of
+//! `q8_0_gemv_heads`, a head per group — each group's rows reading their own
+//! window of the attention output, the batched form. The routed experts run at
 //! `N_SLOTS` slots per launch over stacks of `N_SLOTS` experts, in the
 //! blocks whose experts can live in VRAM (blocks `0..EXPERT_LO` keep theirs
 //! on the host). The `hc_*_fn` projections are listed but not issued: the
@@ -42,8 +43,9 @@
 //! copies, in the pattern of `gate_p8 --bench-kernels`; then one captured
 //! graph of a whole token in decode order (all blocks, then the head), a
 //! second with the dense-equivalent `attn_output_a` in place of the grouped
-//! launches, and a graph of empty `touch` kernels with the token's node
-//! count as the per-node floor.
+//! launches, a third with the `q8_0_gemv_heads` launch there, and beside
+//! each a graph of empty `touch` kernels with its node count as the per-node
+//! floor.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -58,6 +60,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod bench {
+    use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
     use bloomery_gpu::probe::Probe;
     use bloomery_gpu::weights::resident_size;
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, Q8Act};
@@ -125,6 +128,9 @@ mod bench {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Kernel {
         Q8,
+        /// `q8_0_gemv_heads`: the Q8_0 row body per head, each head's rows
+        /// against their own window of the activation.
+        Q8Heads,
         F32,
         Q3k,
         Q3kSel,
@@ -136,6 +142,7 @@ mod bench {
         fn name(self) -> &'static str {
             match self {
                 Kernel::Q8 => "q8_0_gemv",
+                Kernel::Q8Heads => "q8_0_gemv_heads",
                 Kernel::F32 => "f32_gemv",
                 Kernel::Q3k => "q3k_gemv",
                 Kernel::Q3kSel => "q3k_gemv_sel",
@@ -148,7 +155,7 @@ mod bench {
         /// f32 at load).
         fn file_type(self) -> &'static str {
             match self {
-                Kernel::Q8 => "q8_0",
+                Kernel::Q8 | Kernel::Q8Heads => "q8_0",
                 Kernel::F32 => "bf16",
                 Kernel::Q3k | Kernel::Q3kSel => "q3_K",
                 Kernel::Q4kSel => "q4_K",
@@ -161,7 +168,7 @@ mod bench {
                 Kernel::Q3k | Kernel::Q3kSel => Some(GgmlType::Q3_K),
                 Kernel::Q4kSel => Some(GgmlType::Q4_K),
                 Kernel::Q6k => Some(GgmlType::Q6_K),
-                Kernel::Q8 | Kernel::F32 => None,
+                Kernel::Q8 | Kernel::Q8Heads | Kernel::F32 => None,
             }
         }
 
@@ -209,9 +216,12 @@ mod bench {
         Token,
         /// Issued by today's token: one launch per diagonal block.
         BlockDiag,
-        /// Priced only: the same bytes as one launch, what a batched kernel
-        /// would read.
+        /// Priced only: the same bytes as one dense launch, the byte floor of
+        /// a batched kernel.
         DenseEquiv,
+        /// Priced only: the same bytes as one `q8_0_gemv_heads` launch, a
+        /// head per diagonal block — the batched kernel.
+        Heads,
     }
 
     /// One gemv site of a decode token.
@@ -227,6 +237,10 @@ mod bench {
         layers: Layers,
         /// Launches per block: one per diagonal block of `attn_output_a`.
         groups: usize,
+        /// Heads of one `q8_0_gemv_heads` launch: `rows / heads` rows each,
+        /// head h reading window h (`k` values) of the activation. One for
+        /// every other kernel.
+        heads: usize,
         arm: Arm,
         /// The inventory's bytes for one tensor of this site.
         inventory_bytes: u64,
@@ -247,6 +261,7 @@ mod bench {
             k,
             layers,
             groups: 1,
+            heads: 1,
             arm: Arm::Token,
             inventory_bytes,
         }
@@ -336,6 +351,18 @@ mod bench {
                 35_651_584,
             )
         },
+        Site {
+            heads: 8,
+            arm: Arm::Heads,
+            ..site(
+                "attn_output_a",
+                Kernel::Q8Heads,
+                8192,
+                4096,
+                Layers::All,
+                35_651_584,
+            )
+        },
         site(
             "attn_output_b",
             Kernel::Q8,
@@ -415,6 +442,7 @@ mod bench {
         fn label(&self) -> String {
             match self.arm {
                 Arm::DenseEquiv => format!("{}:dense", self.name),
+                Arm::Heads => format!("{}:heads", self.name),
                 Arm::Token | Arm::BlockDiag => self.name.to_string(),
             }
         }
@@ -431,20 +459,22 @@ mod bench {
         }
 
         /// Activation columns a site holds: one per diagonal block, one per
-        /// slot for the per-slot down input, else the one shared column.
+        /// head window, one per slot for the per-slot down input, else the
+        /// one shared column.
         fn x_cols(&self) -> usize {
             match self.kernel {
                 Kernel::Q4kSel => N_SLOTS,
+                Kernel::Q8Heads => self.heads,
                 _ => self.groups,
             }
         }
 
         /// Activation columns one launch reads.
         fn launch_cols(&self) -> usize {
-            if self.kernel == Kernel::Q4kSel {
-                N_SLOTS
-            } else {
-                1
+            match self.kernel {
+                Kernel::Q4kSel => N_SLOTS,
+                Kernel::Q8Heads => self.heads,
+                _ => 1,
             }
         }
 
@@ -453,7 +483,7 @@ mod bench {
             match self.kernel {
                 // The loader's q8_0 card format: k one-byte codes plus an f16
                 // scale per 32 values.
-                Kernel::Q8 => resident_size(GgmlType::Q8_0, self.k, 1)
+                Kernel::Q8 | Kernel::Q8Heads => resident_size(GgmlType::Q8_0, self.k, 1)
                     .expect("every q8_0 site's k is a multiple of 32"),
                 Kernel::F32 => 4 * self.k,
                 _ => self.file_row_bytes(),
@@ -463,7 +493,7 @@ mod bench {
         /// Bytes of one weight row in the file.
         fn file_row_bytes(&self) -> usize {
             match self.kernel {
-                Kernel::Q8 => self.k / 32 * 34,
+                Kernel::Q8 | Kernel::Q8Heads => self.k / 32 * 34,
                 Kernel::F32 => 2 * self.k,
                 Kernel::Q3k | Kernel::Q3kSel => self.k / 256 * 110,
                 Kernel::Q4kSel => self.k / 256 * 144,
@@ -486,7 +516,7 @@ mod bench {
             let (k, m) = (self.k, self.launch_cols());
             let n_sb = k / 256;
             let per_col = match self.kernel {
-                Kernel::Q8 | Kernel::F32 => 4 * k,
+                Kernel::Q8 | Kernel::Q8Heads | Kernel::F32 => 4 * k,
                 Kernel::Q3k | Kernel::Q3kSel => 8 * 64 * n_sb.div_ceil(2) + 4 * 2 * n_sb,
                 Kernel::Q4kSel => 4 * 256 * n_sb.div_ceil(4) + 4 * 8 * n_sb + 4 * 2 * n_sb,
                 Kernel::Q6k => 4 * 128 * n_sb.div_ceil(2) + 4 * 2 * n_sb,
@@ -529,11 +559,12 @@ mod bench {
 
         /// The row geometry the launcher and the upload need: K a multiple of
         /// the f32 kernels' 32-value chunk, or of the K-quant super-block with
-        /// whole u32 words per row.
+        /// whole u32 words per row; the rows split evenly over the heads.
         fn layout_ok(&self) -> bool {
+            let rows = self.rows.is_multiple_of(self.heads);
             match self.kernel {
-                Kernel::Q8 | Kernel::F32 => self.k.is_multiple_of(32),
-                _ => self.k.is_multiple_of(256) && self.file_row_bytes().is_multiple_of(4),
+                Kernel::Q8 | Kernel::Q8Heads | Kernel::F32 => rows && self.k.is_multiple_of(32),
+                _ => rows && self.k.is_multiple_of(256) && self.file_row_bytes().is_multiple_of(4),
             }
         }
 
@@ -544,7 +575,7 @@ mod bench {
 
         /// Device bytes the site allocates.
         fn vram_bytes(&self) -> u64 {
-            let x = if matches!(self.kernel, Kernel::Q8 | Kernel::F32) {
+            let x = if matches!(self.kernel, Kernel::Q8 | Kernel::Q8Heads | Kernel::F32) {
                 (4 * self.x_cols() * self.k) as u64
             } else {
                 self.x_bytes() * (self.x_cols() / self.launch_cols()) as u64
@@ -563,6 +594,7 @@ mod bench {
                     SEL[o / self.rows] as usize * self.rows + o % self.rows,
                     o / self.rows,
                 ),
+                Kernel::Q8Heads => (o, o / (self.rows / self.heads)),
                 _ => (o, 0),
             }
         }
@@ -575,6 +607,8 @@ mod bench {
         Today,
         /// The dense-equivalent `attn_output_a` in its place.
         Batched,
+        /// The `q8_0_gemv_heads` launch in its place.
+        Heads,
     }
 
     impl Plan {
@@ -582,6 +616,7 @@ mod bench {
             match self {
                 Plan::Today => "today",
                 Plan::Batched => "wo_a_dense",
+                Plan::Heads => "wo_a_heads",
             }
         }
 
@@ -590,6 +625,7 @@ mod bench {
                 Arm::Token => true,
                 Arm::BlockDiag => self == Plan::Today,
                 Arm::DenseEquiv => self == Plan::Batched,
+                Arm::Heads => self == Plan::Heads,
             }
         }
 
@@ -623,7 +659,8 @@ mod bench {
 
     /// The activation a site's launches read.
     enum Input {
-        /// f32 columns, one buffer per diagonal block.
+        /// f32 columns, one buffer per diagonal block — for the heads kernel
+        /// one buffer holding every head's window.
         F32(Vec<DeviceBuffer<f32>>),
         /// q8_1 scratch, quantized once at load.
         Q8(Q8Act),
@@ -717,9 +754,23 @@ mod bench {
         }
     }
 
-    /// The seed of copy `copy` of site `idx`.
+    /// The seed of copy `copy` of the site whose data stream is `idx`.
     fn seed(idx: usize, copy: usize) -> u64 {
         ((idx as u64) << 32) | copy as u64
+    }
+
+    /// The data stream of site `i` of the table: the heads arm draws the
+    /// dense-equivalent arm's, so the two read the same bytes through their
+    /// two kernels; every other site draws its own, numbered in table order
+    /// with the heads arm left out.
+    fn stream_of(i: usize) -> Result<usize, GateError> {
+        match SITES[i].arm {
+            Arm::Heads => SITES
+                .iter()
+                .position(|s| s.arm == Arm::DenseEquiv)
+                .ok_or_else(|| "bench_v41: the heads arm has no dense-equivalent arm".into()),
+            _ => Ok(SITES[..i].iter().filter(|s| s.arm != Arm::Heads).count()),
+        }
     }
 
     /// Copy `copy` of `site` on the host.
@@ -727,7 +778,7 @@ mod bench {
         let mut rng = Rng::new(seed(idx, copy));
         let rows = site.out_len();
         Ok(match site.kernel {
-            Kernel::Q8 => {
+            Kernel::Q8 | Kernel::Q8Heads => {
                 let mut qs = vec![0u32; rows * site.k / 4];
                 rng.fill_words(&mut qs);
                 let d = (0..rows * site.k / 32).map(|_| rng.scale_f16()).collect();
@@ -822,8 +873,8 @@ mod bench {
         v
     }
 
-    /// Generate, reference and upload every copy of site `idx`, and its
-    /// activation, outputs and slot ids.
+    /// Generate, reference and upload every copy of `site` from data stream
+    /// `idx`, and its activation, outputs and slot ids.
     fn load_site(gpu: &Gpu, idx: usize, site: &Site) -> Result<Dev, GateError> {
         let stream = gpu.stream();
         let k = site.k;
@@ -836,6 +887,12 @@ mod bench {
                     .collect::<Result<Vec<_>, _>>()?;
                 (Input::F32(bufs), x_host)
             }
+            // One buffer holding every head's window back to back, which the
+            // launch reads at a stride of `k`.
+            Kernel::Q8Heads => (
+                Input::F32(vec![DeviceBuffer::from_host(stream, &x_host)?]),
+                x_host,
+            ),
             _ => {
                 let x_dev = DeviceBuffer::from_host(stream, &x_host)?;
                 let mut act = Q8Act::with_k(stream, site.x_cols(), k)?;
@@ -875,7 +932,13 @@ mod bench {
 
     /// Enqueue one launch of `site` on copy `copy`, through the engine's own
     /// launcher. Asynchronous and capturable.
-    fn launch(gpu: &Gpu, site: &Site, dev: &mut Dev, copy: usize) -> Result<(), GpuError> {
+    fn launch(
+        gpu: &Gpu,
+        step: &StepKernels,
+        site: &Site,
+        dev: &mut Dev,
+        copy: usize,
+    ) -> Result<(), GpuError> {
         let s = gpu.stream();
         let g = copy % site.groups;
         let Dev { w, x, sel, y, .. } = dev;
@@ -884,6 +947,20 @@ mod bench {
             (Kernel::Q8, Weight::Q8 { qs, d }, Input::F32(x), _) => {
                 gpu.q8f32().enqueue_q8_0_gemv(s, qs, d, &x[g], 1, y)
             }
+            (Kernel::Q8Heads, Weight::Q8 { qs, d }, Input::F32(x), _) => step
+                .enqueue_q8_0_gemv_heads(
+                    s,
+                    Q8_0GemvHeadsArgs {
+                        qs,
+                        d,
+                        x: &x[0],
+                        rows_per_head: site.rows / site.heads,
+                        x_head_stride: site.k,
+                        y_head_stride: site.rows / site.heads,
+                        y_off: 0,
+                        y,
+                    },
+                ),
             (Kernel::F32, Weight::F32(w), Input::F32(x), _) => {
                 gpu.q8f32().enqueue_f32_gemv(s, w, &x[g], 1, y)
             }
@@ -908,14 +985,19 @@ mod bench {
 
     /// One launch per checked copy, the compared rows against their
     /// reference; prints the site's check line.
-    fn check_site(gpu: &Gpu, site: &Site, dev: &mut Dev) -> Result<bool, GateError> {
+    fn check_site(
+        gpu: &Gpu,
+        step: &StepKernels,
+        site: &Site,
+        dev: &mut Dev,
+    ) -> Result<bool, GateError> {
         let stream = gpu.stream();
         let mut rels = Vec::new();
         let mut outs = Vec::new();
         let mut errors = Vec::new();
         let checked: Vec<usize> = dev.refs.iter().map(|r| r.copy).collect();
         for (i, &copy) in checked.iter().enumerate() {
-            launch(gpu, site, dev, copy)?;
+            launch(gpu, step, site, dev, copy)?;
             stream.synchronize()?;
             let y = dev.y[copy % site.groups].to_host_vec(stream)?;
             let r = &dev.refs[i];
@@ -979,18 +1061,24 @@ mod bench {
 
     /// `n` launches cycling the site's copies, one synchronize at the end,
     /// `ROUNDS` times after a warm burst.
-    fn time_eager(gpu: &Gpu, site: &Site, dev: &mut Dev, n: usize) -> Result<Spread, GateError> {
+    fn time_eager(
+        gpu: &Gpu,
+        step: &StepKernels,
+        site: &Site,
+        dev: &mut Dev,
+        n: usize,
+    ) -> Result<Spread, GateError> {
         let stream = gpu.stream();
         let copies = dev.w.len();
         for c in 0..n {
-            launch(gpu, site, dev, c % copies)?;
+            launch(gpu, step, site, dev, c % copies)?;
         }
         stream.synchronize()?;
         let mut us = Vec::with_capacity(ROUNDS);
         for _ in 0..ROUNDS {
             let t0 = Instant::now();
             for c in 0..n {
-                launch(gpu, site, dev, c % copies)?;
+                launch(gpu, step, site, dev, c % copies)?;
             }
             stream.synchronize()?;
             us.push(t0.elapsed().as_secs_f64() * 1e6 / n as f64);
@@ -1025,11 +1113,17 @@ mod bench {
 
     /// Eager burst and graph replay of one site; prints its bench line and
     /// returns the replay spread.
-    fn time_site(gpu: &Gpu, site: &Site, dev: &mut Dev) -> Result<Spread, GateError> {
+    fn time_site(
+        gpu: &Gpu,
+        step: &StepKernels,
+        site: &Site,
+        dev: &mut Dev,
+    ) -> Result<Spread, GateError> {
         let copies = dev.w.len();
         let n = copies * MIN_BURST.div_ceil(copies);
-        let eager = time_eager(gpu, site, dev, n)?;
-        let graph = gpu.capture(|_| (0..n).try_for_each(|c| launch(gpu, site, dev, c % copies)))?;
+        let eager = time_eager(gpu, step, site, dev, n)?;
+        let graph =
+            gpu.capture(|_| (0..n).try_for_each(|c| launch(gpu, step, site, dev, c % copies)))?;
         let nodes = graph.node_count();
         if nodes != n {
             return Err(format!(
@@ -1073,6 +1167,7 @@ mod bench {
     /// count.
     fn time_token(
         gpu: &Gpu,
+        step: &StepKernels,
         plan: Plan,
         devs: &mut [Dev],
         site_us: &[f64],
@@ -1083,7 +1178,7 @@ mod bench {
         let graph = gpu.capture(|_| {
             launches
                 .iter()
-                .try_for_each(|&(i, c)| launch(gpu, &SITES[i], &mut devs[i], c))
+                .try_for_each(|&(i, c)| launch(gpu, step, &SITES[i], &mut devs[i], c))
         })?;
         let nodes = graph.node_count();
         if nodes != launches.len() {
@@ -1280,7 +1375,7 @@ mod bench {
         let mut devs = SITES
             .iter()
             .enumerate()
-            .map(|(i, s)| load_site(&gpu, i, s))
+            .map(|(i, s)| load_site(&gpu, stream_of(i)?, s))
             .collect::<Result<Vec<_>, _>>()?;
         let (free_after, _) = vram(&gpu)?;
         println!(
@@ -1291,9 +1386,10 @@ mod bench {
             t0.elapsed().as_secs_f64()
         );
 
+        let step = StepKernels::load(ctx)?;
         let mut failed = Vec::new();
         for (s, d) in SITES.iter().zip(devs.iter_mut()) {
-            if !check_site(&gpu, s, d)? {
+            if !check_site(&gpu, &step, s, d)? {
                 failed.push(s.label());
             }
         }
@@ -1314,11 +1410,11 @@ mod bench {
         );
         let mut site_us = Vec::with_capacity(SITES.len());
         for (s, d) in SITES.iter().zip(devs.iter_mut()) {
-            site_us.push(time_site(&gpu, s, d)?.min);
+            site_us.push(time_site(&gpu, &step, s, d)?.min);
         }
         let touch = Probe::load(ctx)?;
-        for plan in [Plan::Today, Plan::Batched] {
-            time_token(&gpu, plan, &mut devs, &site_us, &touch)?;
+        for plan in [Plan::Today, Plan::Batched, Plan::Heads] {
+            time_token(&gpu, &step, plan, &mut devs, &site_us, &touch)?;
         }
         Ok(())
     }

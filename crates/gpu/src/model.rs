@@ -24,7 +24,7 @@ pub(crate) mod kernels;
 pub(crate) mod lookup;
 pub(crate) mod probe;
 
-pub use kernels::StepKernels;
+pub use kernels::{Q8_0GemvHeadsArgs, StepKernels};
 pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 

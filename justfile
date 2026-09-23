@@ -194,13 +194,14 @@ prof-gpu-p8:
 bench-gpu-kernels *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --bench-kernels {{ARGS}}'
 
-# V4.1 한 토큰이 GPU에서 내는 gemv 20개 사이트의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다.
+# V4.1 한 토큰이 GPU에서 내는 gemv 사이트 21개의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다. attn_output_a는 값매김 팔
+# 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
 # 사이트마다 첫 사본과 끝 사본에서 여섯 행을 같은 바이트로 계산한 f64 참조와 대조한다. 3090, 게이트 락.
 bench-gpu-v41-check:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/gpu-gate.sh bench_v41 --check'
 
-# 같은 벤치의 시간(리드 전용): 사이트마다 eager 버스트와 그래프 재생, 토큰 하나를 통째로 잡은 그래프 둘(오늘의
-# 묶음 attn_output_a, 밀집 등가)과 노드 수가 같은 빈 그래프. 대조가 빨강이면 재지 않는다. 임대·증인·A6000 고정은
+# 같은 벤치의 시간(리드 전용): 사이트마다 eager 버스트와 그래프 재생, 토큰 하나를 통째로 잡은 그래프 셋(오늘의
+# 묶음 attn_output_a, 밀집 등가, heads 한 번)과 노드 수가 같은 빈 그래프. 대조가 빨강이면 재지 않는다. 임대·증인·A6000 고정은
 # time-gate.sh가 쥔다.
 time-gpu-v41:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
@@ -571,6 +572,11 @@ gate-ds41-kld:
 # 스텝 세트의 engram 층(1·14)마다 우리 규칙과 ik 규칙 시뮬, 덤프에 대조한다. 토큰마다 q8_0_gemv → 키 norm → 게이트 사슬도 본다.
 gate-gpu-ds41-engram:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_engram && bash tools/gpu-gate.sh gate_deepseek41_engram'
+
+# V4.1 attn_output_a(블록 대각 여덟 그룹)를 q8_0_gemv_heads 한 번의 발사로, attn_output_b는 q8_0_gemv로 돌려 5토큰 세트와
+# 디코드 스텝 세트의 층마다 우리 규칙(비트 동일), ik 규칙 시뮬(덤프와 비트 동일), 덤프(값마다 유도한 밴드)에 대조한다.
+gate-gpu-ds41-woa:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_woa && bash tools/gpu-gate.sh gate_deepseek41_woa'
 
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이

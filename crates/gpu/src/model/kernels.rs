@@ -71,7 +71,7 @@ mod step_kernels {
 
     /// Q8_0 gemv over per-head activation slices: launch row `r` belongs to
     /// head `h = r / rows_per_head` and output slot `r % rows_per_head` of
-    /// that head; it dots weight row `r` of the derived planes against
+    /// that head; it dots weight row `r` of the Q8_0 planes against
     /// `x[h*x_head_stride .. +k]` (the gated single-column row body, the
     /// `q8_0_gemv` skeleton with one warp per row, 8 rows per 256-thread
     /// block), lane 0 storing `y[h*y_head_stride + y_off + r %
@@ -303,7 +303,7 @@ pub struct StepKernels {
 
 /// [`StepKernels::enqueue_q8_0_gemv_heads`]'s arguments. The strides and
 /// the offset count f32 elements, `rows_per_head` weight rows.
-pub(crate) struct Q8_0GemvHeadsArgs<'a> {
+pub struct Q8_0GemvHeadsArgs<'a> {
     pub qs: &'a DeviceTensor<u32>,
     pub d: &'a DeviceTensor<u16>,
     pub x: &'a DeviceBuffer<f32>,
@@ -387,9 +387,10 @@ impl StepKernels {
         Ok(())
     }
 
-    /// Enqueue the per-head Q8_0 gemv: `d.rows()` weight rows (the derived
-    /// planes, `qs`/`d` as `enqueue_q8_0_gemv` takes them, k =
-    /// `d.cols() * 32`), each dotted against its head's slice of `x` —
+    /// Enqueue the per-head Q8_0 gemv: `d.rows()` weight rows (a file
+    /// tensor's or a derived weight's planes, `qs`/`d` as
+    /// `enqueue_q8_0_gemv` takes them, k = `d.cols() * 32`), each dotted
+    /// against its head's slice of `x` —
     /// head `h` reads `x[h*x_head_stride .. +k]`, m = 1 — with lane 0
     /// writing `y[h*y_head_stride + y_off + j]` for weight row
     /// `h*rows_per_head + j`. `d.rows()` must be a multiple of
@@ -397,7 +398,7 @@ impl StepKernels {
     /// `x_head_stride` a multiple of 4, so every head's slice starts 16-byte
     /// aligned in `x` and the row body reads it in quads. Asynchronous,
     /// allocation-free, capturable.
-    pub(crate) fn enqueue_q8_0_gemv_heads(
+    pub fn enqueue_q8_0_gemv_heads(
         &self,
         stream: &CudaStream,
         a: Q8_0GemvHeadsArgs<'_>,
