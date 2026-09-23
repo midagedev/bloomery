@@ -324,7 +324,7 @@ are dummy mains and their bodies are never linted). The ratchet counter is
 appears in (an agent's unique-count will read lower — same direction, different
 ruler). 2026-09-22 night, measured: 308 before the quality rounds; 234 after
 `gpusafety`, 305 after `gatesdedup` on its own base — the merged value is re-measured
-and written here when a round lands — 221 on main `0ff785e` after the four rounds, 211 on main `48ee5c2` (after fnsplit), 210 on main `c69642b` (after gatesc), **175 on main `2d1abc0`** (after the night wave: gatesd, tools6, mechlint, gatesc2, gpucast). Of the 175, 58 are
+and written here when a round lands — 221 on main `0ff785e` after the four rounds, 211 on main `48ee5c2` (after fnsplit), 210 on main `c69642b` (after gatesc), **175 on main `2d1abc0`** (after the night wave: gatesd, tools6, mechlint, gatesc2, gpucast), 169 through the 09-23/24 waves, **168 on main `76c9ad8`** (q8dead, 2026-09-24). Of the 175, 58 are
 `undocumented_unsafe_blocks` and all 58 are in the stage-0 crates.
 `gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` — six read
 `*-ik-dot.txt`, one reads q5_K's `q5k-v41-dequant.raw`/`.meta` (q5_K comes from the V4.1
