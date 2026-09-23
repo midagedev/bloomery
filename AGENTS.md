@@ -398,9 +398,7 @@ else the second position is taken back and row A's token stands; a step with no 
 positions=1|2 kind=…` rows and a `draft summary` line replace the `time step` rows, which
 `tools/ref/depth-ds41.sh` reads; refused together with `BLOOMERY_STEP_PAIR=1`),
 `BLOOMERY_HOST_POPULATE=0` (gpu placed load, default 1: do not read the plan's host set in with
-`MADV_POPULATE_READ` at load — the fresh-fault arm; the gate prints `host_populate=`; today the V4.1
-host tier reads through a second `Split::open` (`gpu-deepseek41 body.rs`), so the populate warms the
-page cache but not the step threads' page tables — the single-mapping round closes that),
+`MADV_POPULATE_READ` at load — the fresh-fault arm; the gate prints `host_populate=` and `generate_ds41` prints `host_populate=`/`host_lock=` after its `load` line; the host tier reads the body's own mapping (one `Split` shared by `Arc`), so the populate reaches the step threads' page tables — measured on the 3090 gate placement, steps 2–63 minor faults 590,664 → 1,719 in total, the remainder engram rows),
 `BLOOMERY_HOST_LOCK=1` (default 0: after populating, `mlock` the host set for the model's life;
 `gate-gpu-load-v41-lock` runs with it; an `RLIMIT_MEMLOCK` refusal is an error that names the limit),
 `BLOOMERY_CARD_DONTNEED=0` (default 1: keep the file pages of uploaded card segments in the page
