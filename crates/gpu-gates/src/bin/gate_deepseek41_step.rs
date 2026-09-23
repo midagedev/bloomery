@@ -10,9 +10,10 @@
 //!   attention's by its kind and the MoE sub-layer's by its card experts, the
 //!   glue's per step and the attention's gather — and two memory-operation
 //!   batches per layer, nothing else; a replay of the captured step on the
-//!   step4 set's injected state, and on the d1 set's (every indexer layer
-//!   selecting), is bit-identical to an eager run of it (the logits and every
-//!   cache, compressed row, index key and compressor state). And each
+//!   step4 set's injected state, and on the d1 and d2 sets' (every indexer
+//!   layer selecting; d2 at the file's own `top_k`), is bit-identical to an
+//!   eager run of it (the logits and every cache, compressed row, index key
+//!   and compressor state). And each
 //!   layer's host-leg shadow — the kernels between its go and its wait, read
 //!   in stream order off a capture of the engine's chain — holds exactly the
 //!   MoE piece's own shadow work and, on the layer before each engram site,
@@ -774,7 +775,7 @@ mod gate {
         );
 
         let mut all_same = true;
-        for name in [STEP4, D1] {
+        for name in [STEP4, D1, D2] {
             let set = open_set(split, hp, name)?;
             let state = set_state(&set, hp)?;
             let (gpu, w, body) = m.body_parts("structure")?;

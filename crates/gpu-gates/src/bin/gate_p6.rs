@@ -622,16 +622,17 @@ fn router_shape() -> Result<bool, GateError> {
     use bloomery_gpu::q8f32::{LANE_UNROLL, Q8_STEP_UNROLL};
     use bloomery_gpu::router::ROUTER_THREADS;
 
-    /// Activation columns the general gemv body guards, one multiply-add
-    /// each: the count an entry carrying *only* the starved body shows.
-    const GEMV_COLS: usize = 8;
+    /// Activation columns `f32_gemv`'s general body guards, one multiply-add
+    /// each: the count an `f32_gemv` carrying *only* the starved body shows.
+    /// The Q8_0 entries have no general body and floor on their own words.
+    const F32_GEMV_COLS: usize = 8;
     // Floor on a gemv entry's `fma.`: the general body's one per column
     // plus the single-column body's one per hoisted chunk. A body that lost
     // the single-column path, or kept it without hoisting, cannot reach it.
     // The floor, not the exact count — the backend is free to duplicate a
     // body it inlines, and pinning the duplication would be pinning the
     // compiler rather than the shape.
-    let f32_fma_floor = GEMV_COLS + LANE_UNROLL;
+    let f32_fma_floor = F32_GEMV_COLS + LANE_UNROLL;
     /// Words the Q8_0 single-column body spells out besides its hoisted
     /// steps: a hoisted pair (two), a single step, the partial word of a k
     /// not a multiple of 128, the one word of a row of at most 128 values,
@@ -651,7 +652,7 @@ fn router_shape() -> Result<bool, GateError> {
         (
             "f32_gemv",
             f32_fma_floor,
-            format!("cols={GEMV_COLS} + LANE_UNROLL={LANE_UNROLL}"),
+            format!("cols={F32_GEMV_COLS} + LANE_UNROLL={LANE_UNROLL}"),
         ),
         (
             "q8_0_gemv",

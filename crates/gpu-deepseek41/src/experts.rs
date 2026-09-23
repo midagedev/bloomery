@@ -21,7 +21,9 @@
 //!   no clamp when `L <= 1e-6` — ik's `mul_mat_up_gate_NxM`, which clamps
 //!   `silu(g)`, not `g`. `silu(x) = x / (1 + e^(0 - x))` with the
 //!   exponential `expf_ik`, ik's AVX2 `v_expf`, which is what its CPU build
-//!   runs on every row of these shapes.
+//!   runs on every row of these shapes. DeepSeek's reference `model.py`
+//!   clamps the gate before the activation, `silu(min(g, L))`: the two agree
+//!   for `g <= L` and differ above it by at most `L - silu(L)`.
 //!
 //! The dots are ours, not ik's: q8_1 activations per 128 values for the
 //! q3_K stacks, f32 activations for q8_0, where ik quantizes to q8_K and
@@ -240,7 +242,8 @@ mod experts_kernels {
 /// ([`ExpertKernels::enqueue_expert_gate_up`]).
 pub struct ExpertGateUp<'a> {
     /// The gate stack resident on this card: `n_experts · rows_per_expert`
-    /// Q3_K rows of `110 · n_sb / 4` words, experts in id order from 0.
+    /// Q3_K rows of `110 · n_sb / 4` words, experts in the slot order of the
+    /// card's `ExpertList` (ascending ids, each once; list position = slot).
     pub wg: &'a DeviceTensor<u32>,
     /// The up stack, the same shape as `wg`.
     pub wu: &'a DeviceTensor<u32>,

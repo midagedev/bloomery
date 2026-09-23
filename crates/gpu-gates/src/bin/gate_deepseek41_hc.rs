@@ -757,12 +757,11 @@ mod gate {
         streams: &'m RefRow,
         x: &'m RefRow,
         post: &'m RefRow,
-        /// The fold of `post` by this site's `pre`, when no engram layer sits
-        /// between them.
+        /// The fold of `post` by the next sub-layer's `pre`, when that fold
+        /// reads `post` itself. `None` before an engram layer (it rewrites
+        /// `post` first) and after the last layer (the head folds): there the
+        /// boundary takes HC_POST alone and the fold is a lone launch.
         fold: Option<&'m RefRow>,
-        /// An engram layer rewrites `post` before the next sub-layer folds
-        /// it: the boundary takes HC_POST alone.
-        engram_next: bool,
     }
 
     impl Site<'_> {
@@ -832,15 +831,15 @@ mod gate {
                 } else {
                     None
                 };
-                let (fold, engram_next) = match fold_name {
+                let fold = match fold_name {
                     Some(f) => {
                         let r = man.tensor(&f, 0)?;
                         r.expect(&f, "f32", [n, t, 1, 1], "MUL_MULTI_ADD")?;
                         let engram = format!("engram_out-{}", layer + 1);
                         if src0(r) == post_name {
-                            (Some(r), false)
+                            Some(r)
                         } else if src0(r) == engram {
-                            (None, true)
+                            None
                         } else {
                             return Err(format!(
                                 "{f} reads {}, neither {post_name} nor {engram}",
@@ -849,7 +848,7 @@ mod gate {
                             .into());
                         }
                     }
-                    None => (None, false),
+                    None => None,
                 };
                 out.push(Site {
                     layer,
@@ -861,7 +860,6 @@ mod gate {
                     x,
                     post,
                     fold,
-                    engram_next,
                 });
             }
         }
@@ -1042,10 +1040,10 @@ mod gate {
         let post_dump_bit = bits_equal(&out_k, &post_d);
         let fold_dump_bit = fold_d.as_ref().is_none_or(|f| bits_equal(&fold_k, f));
 
-        let form = if site.engram_next {
-            "before-engram"
-        } else {
+        let form = if site.fold.is_some() {
             "fused"
+        } else {
+            "post-alone"
         };
         let fold_seen = site.fold.map_or("-", |f| f.name.as_str());
         let pass_post = post_ik_bit && fold_ik_bit && post_bit && post_dump_bit && fold_dump_bit;
@@ -1166,17 +1164,18 @@ mod gate {
             all.len()
         );
         // This module's launches one token of this graph takes: each
-        // boundary fused except the ones before an engram layer, whose
-        // HC_POST alone is the MoE piece's and whose fold is the lone fold.
-        // Layer 0's input fold (by the one-hot init, a copy of stream 0) is
-        // counted apart.
-        let engram = all.iter().filter(|s| s.engram_next).count();
-        let fused = all.len() - engram;
+        // boundary fused except the ones before an engram layer and after
+        // the last layer, whose HC_POST alone is the MoE piece's and whose
+        // fold is a lone fold (the head's, after the last layer). Layer 0's
+        // input fold (by the one-hot init, a copy of stream 0) is counted
+        // apart.
+        let lone = all.iter().filter(|s| s.fold.is_none()).count();
+        let fused = all.len() - lone;
         println!(
-            "nodes set={set} ds41_hc_pre={} ds41_hc_post={fused} ds41_hc_fold={engram} total={} \
+            "nodes set={set} ds41_hc_pre={} ds41_hc_post={fused} ds41_hc_fold={lone} total={} \
              (+1 layer-0 fold)",
             all.len(),
-            all.len() + fused + engram
+            all.len() + fused + lone
         );
         let mut ffn_hc = vec![Vec::new(); cx.hp.n_layers];
         let mut last_fold = Vec::new();

@@ -459,7 +459,9 @@ mod indexer_kernels {
                     }
                 }
                 if live1 {
-                    // SAFETY: as above, for row r1 < n.
+                    // SAFETY: r1 < n <= rows and 8s + 4 + c < KEY_WORDS put
+                    // both words inside row r1 of `keys`, rows·128 f16
+                    // (launch contract), device-allocated and so aligned.
                     unsafe {
                         b1[2 * s] = *kw.add(r1 * KEY_WORDS + 8 * s + c);
                         b1[2 * s + 1] = *kw.add(r1 * KEY_WORDS + 8 * s + 4 + c);
@@ -712,7 +714,9 @@ mod indexer_kernels {
         let prefix = (b1 << 11) | b2;
 
         // ---- the last eleven bits, among the keys with that prefix.
-        // SAFETY: as above.
+        // SAFETY: `fine` is FINE, FINE_BINS words of this block's shared
+        // memory; every thread reaches this call, and FINE is used by this
+        // pass alone until the next barrier pair.
         unsafe { fine_count(fine, tid) };
         let mut base = 0usize;
         while base < n {
@@ -722,7 +726,9 @@ mod indexer_kernels {
                 thread::__unroll_config::<0>();
                 let i = base + tid + TOPK_THREADS as usize * m;
                 if i < n {
-                    // SAFETY: as in the pass above.
+                    // SAFETY: i < n <= rows: sbase + i < tokens·rows <=
+                    // scores.len() (launch contract); the score pass wrote
+                    // it and is ordered before this launch.
                     kk[m] = order_key(unsafe { *scores.get_unchecked(sbase + i) });
                 }
                 m += 1;
@@ -732,7 +738,8 @@ mod indexer_kernels {
                 thread::__unroll_config::<0>();
                 let i = base + tid + TOPK_THREADS as usize * m;
                 if i < n && kk[m] >> 11 == prefix {
-                    // SAFETY: as in the pass above.
+                    // SAFETY: the bin `kk & 0x7ff` is below FINE_BINS; every
+                    // access to FINE between the barriers is atomic.
                     unsafe {
                         BlockAtomicU32::from_ptr(fine.add((kk[m] & 0x7ff) as usize))
                             .fetch_add(1, AtomicOrdering::Relaxed)
@@ -800,7 +807,8 @@ mod indexer_kernels {
         let lt = warp::lanemask_lt();
         let mut base = c0;
         while base < c1 {
-            // SAFETY: as above.
+            // SAFETY: c1 <= n <= rows, so sbase + c1 <= tokens·rows <=
+            // scores.len() (the fn's contract below).
             let kk = unsafe { lane_keys(scores, sbase, base, c1, l) };
             let mut m = 0usize;
             while m < LANE_ROWS {

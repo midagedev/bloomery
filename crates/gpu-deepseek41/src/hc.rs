@@ -541,7 +541,8 @@ mod hc_kernels {
             let mut acc = unsafe { *part.get_unchecked_mut(tt * HC_MIX + r) };
             let mut q = 1;
             while q < np {
-                // SAFETY: as the read above.
+                // SAFETY: (q*m + tt)*24 + r < 24*n_pieces*m <= part.len() as
+                // q < n_pieces; the ticket ordered every block's stores first.
                 acc += unsafe { *part.get_unchecked_mut((q * mm + tt) * HC_MIX + r) };
                 q += 1;
             }
@@ -551,11 +552,13 @@ mod hc_kernels {
             }
         } else if tid < (HC_MIX + 1) * mm {
             let tt = tid - HC_MIX * mm;
-            // SAFETY: q*m + tt < n_pieces*m <= ss.len(); ordered as above.
+            // SAFETY: q*m + tt < n_pieces*m <= ss.len(); the ticket ordered
+            // every block's stores before these reads.
             let mut acc = unsafe { *ss.get_unchecked_mut(tt) };
             let mut q = 1;
             while q < np {
-                // SAFETY: as the read above.
+                // SAFETY: q*m + tt < n_pieces*m <= ss.len() as q < n_pieces;
+                // the ticket ordered every block's stores first.
                 acc += unsafe { *ss.get_unchecked_mut(q * mm + tt) };
                 q += 1;
             }

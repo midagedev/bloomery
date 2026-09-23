@@ -368,8 +368,9 @@ mod engram_gate_kernels {
                 group(kn, xb, tid, 4),
             )
         };
-        // SAFETY: as the loads above — the same bounds for kv at vb and gain
-        // at gb.
+        // SAFETY: t < m, so vb + ROW <= m·(hc+1)·ROW bounds kv; s < hc, so
+        // gb + ROW <= hc·ROW bounds gain (launch contract); tid < RMS_THREADS,
+        // every group index is below 5.
         let (v0, v1, v2, v3, v4, g0, g1, g2, g3, g4) = unsafe {
             (
                 group(kv, vb, tid, 0),

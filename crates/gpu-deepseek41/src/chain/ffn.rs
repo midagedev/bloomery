@@ -325,9 +325,12 @@ mod ffn_kernels {
             res,
             hc,
         };
-        // SAFETY: as in `ds41_ffn_post`.
+        // SAFETY: d < rows (checked above), and the launch contract gives
+        // every length the helper's contract asks for.
         let (yv, o, _) = unsafe { combine_post_at(&a, rows, n_card, d) };
-        // SAFETY: as in `ds41_ffn_post`, without the fold.
+        // SAFETY: d < rows <= y.len() and d + 3·rows < 4·rows <= out.len(),
+        // by the launch contract; thread d is the only writer of y[d] and the
+        // four stream values at d.
         unsafe {
             *y.get_unchecked_mut(d) = yv;
             store4(&mut out, rows, d, o);

@@ -409,13 +409,22 @@ fn constant_words(layout: &WordsLayout, top_k: usize) -> Result<Vec<f32>, GpuErr
     Ok(host)
 }
 
-/// `t`'s place in [`Table::ALL`].
-fn table_index(t: Table) -> usize {
-    Table::ALL
-        .iter()
-        .position(|&a| a == t)
-        .expect("every table is in Table::ALL")
+/// `t`'s place in [`Table::ALL`]: its declaration order, which the const
+/// block below holds equal to the order of `ALL`.
+const fn table_index(t: Table) -> usize {
+    t as usize
 }
+
+const _: () = {
+    let mut i = 0;
+    while i < Table::ALL.len() {
+        assert!(
+            table_index(Table::ALL[i]) == i,
+            "Table::ALL lists the tables in declaration order"
+        );
+        i += 1;
+    }
+};
 
 /// The piece's copies of the step words, one per row, and the gather that
 /// fills them. A pass whose rows run one layer apart interleaves the rows'
@@ -683,7 +692,8 @@ impl AttnChain {
                 dims.stream_ratios
             )));
         }
-        let ctx_max = planner.ctx_max() as usize;
+        let ctx_max = usize::try_from(planner.ctx_max())
+            .map_err(|_| refuse(format!("a ctx_max of {} passes usize", planner.ctx_max())))?;
         let (words_layout, src, dst) = plan_words(layout, ctx_max)?;
         let plans = layers
             .clone()

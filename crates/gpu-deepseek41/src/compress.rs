@@ -501,7 +501,8 @@ mod comp_kernels {
                 let mut mx = [f32::NEG_INFINITY; PER_THREAD];
                 let mut k = 0;
                 while k < r {
-                    // SAFETY: as the check loop above.
+                    // SAFETY: w_read(gm, r, g, k) < 2 + gm + gm·r <= step.len()
+                    // because g < gm and k < r.
                     let s = unsafe { *step.get_unchecked(w_read(gm, r, g, k)) } as usize;
                     let sc = if s < r {
                         // SAFETY: s < ratio, so s·512 + v + 4 <= ring_score.len().
@@ -518,10 +519,12 @@ mod comp_kernels {
                 let mut acc = ([0.0f32; PER_THREAD], [0.0f32; PER_THREAD]);
                 let mut k = 0;
                 while k < r {
-                    // SAFETY: as the check loop above.
+                    // SAFETY: w_read(gm, r, g, k) < 2 + gm + gm·r <= step.len()
+                    // because g < gm and k < r.
                     let s = unsafe { *step.get_unchecked(w_read(gm, r, g, k)) } as usize;
                     let (sc, x) = if s < r {
-                        // SAFETY: as the max pass; ring_kv has the same extent.
+                        // SAFETY: s < ratio, so s·512 + v + 4 <= ring_score.len()
+                        // and ring_kv.len(), which have the same extent.
                         unsafe {
                             (
                                 load4_mut(&mut ring_score, s * WIDTH + v),
@@ -529,7 +532,8 @@ mod comp_kernels {
                             )
                         }
                     } else {
-                        // SAFETY: as the max pass; kv has the same extent.
+                        // SAFETY: s − r < m (checked), so the four values sit
+                        // below m·512 <= score.len() and kv.len().
                         unsafe {
                             (
                                 load4(score, (s - r) * WIDTH + v),
