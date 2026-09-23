@@ -599,20 +599,22 @@ gate-gpu-p8b *ARGS:
 
 # PTX 스캔(계측기, 게이트 아님): 게이트 바이너리가 싣고 있는 디바이스 코드의 엔트리별
 # 디포·로컬 왕복·블록 폭 표. 디포를 가진 엔트리가 먼저 나온다. 단언은 gate_p5/gate_p4가 한다 — 머리글 참조.
-# The binary's cargo features: `--features deepseek41` for a V4.1 gate binary (default gpu).
+# 바이너리의 cargo 피처는 `--features`로 준다(기본 gpu). V4.1 게이트 바이너리는 `--features deepseek41`.
 [arg("FEATURES", long="features")]
 ptx-scan BIN FEATURES='gpu' *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/ptx-scan.sh {{BIN}} {{ARGS}}'
 
-# SASS twin of ptx-scan: loads issued before the first wait, per loop and along one path (`<entry> n,t,…`; `<entry> list` prints the listing).
+# 인자: `<엔트리> n,t,…`(분기 결정 한 줄을 따라간 경로), `<엔트리> list`(목록).
+# SASS 스캔(ptx-scan의 짝, 계측기): 첫 대기 전에 발행된 전역 로드 수를 루프마다, 그리고 한 경로를 따라 센다.
 [arg("FEATURES", long="features")]
 sass-scan BIN FEATURES='gpu' *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features {{FEATURES}} --release --bin {{BIN}} && cargo build --release -p bloomery-gpu-gates --bin oxart_ptx && bash tools/sass-scan.sh {{BIN}} {{ARGS}}'
 
-# Verdict diff (Mac): run recipes in two trees and diff their output with build lines, times, pids and thread ids masked.
+# 판정 비교(맥에서 돈다): 두 트리에서 같은 레시피를 돌리고, 빌드 줄·시간·pid·스레드 id를 가린 뒤 출력을 비교한다.
 verdict-diff *ARGS:
     python3 tools/verdict-diff.py {{ARGS}}
 
-# Interleaved GPU A/B over (tree, env) arms through the timing recipes — lead-only; `run --dry-run` prints the plan.
+# 바퀴마다 팔 순서를 돌리고, 임대는 기존 러너가 잡는다. `run --dry-run`은 계획만 찍는다.
+# GPU A/B(리드 전용): (트리, env) 팔을 시간 레시피로 번갈아 돌리고 팔별 평균·SD·첫 팔 대비 차와 그 구간을 낸다.
 gpu-ab *ARGS:
     python3 tools/gpu-ab.py {{ARGS}}
