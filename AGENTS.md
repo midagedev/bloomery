@@ -205,6 +205,8 @@ first suspect is a hung gate on the box, not the agent.
     crates/tokenizer/      byte-level BPE from the GGUF header, bit-identical to
                            llama-tokenize (gate-tokenizer); bin bloomery-tokenize
     crates/sampler/        the sampling chain in the reference's order (gate-sampler)
+    crates/serve/          llama-server-compatible HTTP API over an Engine trait
+                           (gate-serve on a mock engine); bin bloomery-serve
     crates/q3k-gemv/       stage 0: Q3_K gemv, CUDA-Rust device code (cargo oxide only)
     crates/q3k-cpu/        stage 0: Q3_K x Q8_K gemv, AVX2 intrinsics, pinned threads
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile;
