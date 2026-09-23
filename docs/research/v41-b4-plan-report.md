@@ -111,7 +111,7 @@
    - `csa_state_kv-2`/`csa_state_score-2` MUL_MAT(q3_K [5120→512])
    - `csa_source_kv`/`_score` CONCAT(상태 `leaf_62`/`leaf_68`, 현재) [512,7], `dsv4_csa_state_read`.i32 [2,3,4,5]
    - `csa_state_compress-2`/0 DS4_COMP [512,2] → /1 norm → /2 rope → `csa_k_write-2` SET_ROWS f16 → `leaf_74` [512,256] @ `dsv4_csa_state_write`.i64 [0,1]
-   - persist: `csa_persist_kv/score-2` GET_ROWS(src [3,4]) → `csa_k_state_persist-2` SET_ROWS(dst [0,1])
+   - persist: `csa_persist_kv/score-2` GET_ROWS(src ~~[3,4]~~ [4,3] — 정정 09-23 b4plan2: dst 순서로 적으면 이렇고, plan 게이트가 비트 동일로 확인했다) → `csa_k_state_persist-2` SET_ROWS(dst [0,1])
    - 소스는 2·8·14(csa)와 20(hca, 게이트 없음, 비율 1)이다.
    - 별칭 [읽음]: 3–7은 `leaf_74`, 9–13은 `leaf_236`, 15–19는 `leaf_402`, 21–39는 `leaf_563`.
 2. **ik**.
