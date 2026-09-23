@@ -757,3 +757,9 @@ gpu-ab *ARGS:
 # 바이트를 전부 훑는다. 바이트 표를 찍는다. 대상 쪽 텐서(token_embd·output)를 읽으려고 V4.1 프로필로 돈다. 호스트 전용.
 gate-dspark-read:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gguf --lib -- quant --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_dspark_read && bash tools/host-gate.sh gate_dspark_read'
+
+# DSpark Markov 헤드 단독 초안(E6)의 오프라인 수락률 — 시간을 재지 않는 CPU 실행이고 임대를 잡지 않는다. 먼저 self-test,
+# 다음 코퍼스 스트림마다 앞 50k토큰의 acc/positions·top-2·top-4와 E5 markov1 재계산, 이전 토큰별 argmax 표의 해시와
+# 위치별 경로와의 불일치 수(0이어야 한다)를 찍는다. 목표는 코퍼스 텍스트 자체다. 인자는 bin에 그대로 간다(--tokens N).
+markov-accept *ARGS:
+    ./tools/box.sh 'cargo build --release -p bloomery-model --bin markov-accept && bash tools/host-gate.sh markov-accept --self-test && D=$BLOOMERY_DATA/engram && bash tools/host-gate.sh markov-accept /models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf $D/corpus-code.ids $D/corpus-prose.ids $D/corpus-prose-all.ids $D/corpus-korean.ids $D/corpus-threads.ids {{ARGS}}'
