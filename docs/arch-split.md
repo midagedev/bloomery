@@ -33,7 +33,7 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
 | 블록 골격 | pre-norm 잔차: `attn_norm → attn → add → ffn_norm → ffn → add` (`forward::block_common`) | 하이퍼커넥션: 스트림 4벌, `pre`로 접어 들어가고 `post`·Sinkhorn `comb`으로 섞으며 믹스는 한 서브층 늦게 소비 | **아키텍처 사슬** |
 | 어텐션 | MLA — 잠재 K, rope 꼬리 64, `wk_b` 흡수, 헤드별 `wv_b`; flash는 `[k_rope ; kv_compressed]` 576행 | MLA 아님 — 512차원 잠재 하나가 K=V, 64헤드 직접 내적, 헤드별 sink, 출력 꼬리 역-rope, 블록 대각 `wo_a`→`wo_b`; 윈도우 128행 + 고른 512행 = 최대 640행 | **아키텍처 사슬** + deepseek41 전용 커널(sink 어텐션·역-rope·그룹 출력 투영·압축기·인덱서·hc·engram 게이트) |
 | KV 토폴로지 | 층마다 `[ctx_max, 576]` f16 평면 하나(`Vec<DeviceTensor<u16>>`), 슬롯 표는 하나 | 층마다 128행 링(윈도우) + **비율 그룹 넷이 공유**하는 압축 행(2–7·8–13·14–19·20–39) + 인덱서 키 | **아키텍처 타입** — 결정 2의 `(seq, pos)` 슬롯 표는 공유, **행 저장소**만 아키텍처 것. 그룹 공유 캐시는 "층 슬롯당 버퍼 하나"로는 표현이 안 된다 — 이것이 타입이 갈리는 첫 자리다 |
-| 스텝 입력 | 토큰 id, 위치(`step_params` 1버퍼) | 토큰 id, 위치, **engram 48행(13,056 B, 한 스텝 앞서 발행)**, 압축 층의 **호스트 색인 계획**(`v41-ports.md`: 비율 기계는 그래프 분기가 아니라 스텝마다 호스트가 세우는 계획) | **아키텍처 타입** — `ChainBody::Input` |
+| 스텝 입력 | 토큰 id, 위치(`step_params` 1버퍼) | 토큰 id, 위치, **engram 48행(13,056 B, ~~한 스텝 앞서 발행~~ 현재 토큰을 안 뒤에 발행 — 행 id 해시가 현재 토큰에서 시작한다, ik `llama_set_engram_rows`의 `ctx[0]`; 정정 09-23 b5plan)**, 압축 층의 **호스트 색인 계획**(`v41-ports.md`: 비율 기계는 그래프 분기가 아니라 스텝마다 호스트가 세우는 계획) | **아키텍처 타입** — `ChainBody::Input` |
 | MoE | 라우터 softmax → top-6 → 정규화·스케일, **64 → 6 핀**(`MoeDims::read`가 전문가 수·슬롯 수·텐서별 양자화 타입을 핀) | `√softplus` + 선택 편향 → top-6 → 재정규화 ×1.5, 384 → 6, SwiGLU ±10, 합 `Σ+1e-20` | 라우터·점수는 **아키텍처 커널**; 전문가 `_sel` 본체는 형상이 같으니 **공유**되되 타입이 갈린다 — gate/up은 q3_K(있음), down은 **q5_K(커널도 디퀀트도 없다**, `quant.rs:198`, `weights.rs`의 `resident_size`·`upload_file_tensor`), shared 전문가는 q8_0(우리 융합 gate/up은 q3_K 전용); 전문가 **배치와 호스트 티어는 공유 서비스**(아래 「직교」) |
 | 헤드 | `output_norm` + `output`, eps는 `mla.eps` | 같음 + 마지막 FFN의 `pre`로 스트림을 접는 마지막 접기 | **거의 공유** — 접기는 사슬 끝에서, `Head`는 eps를 계획에서 받는다 |
 | 파생 가중치 | `wk_b`의 Q8_0 재양자화(`Derived`, 로드 시 CPU) | 알려진 것 없음(hc `comb`·층 종류별 rope 표는 후보 — B4가 정한다) | **아키텍처 계획** |
@@ -122,6 +122,8 @@ pub enum AnyEngine {
     Deepseek41(GpuModel<deepseek41::Body>),
 }
 ```
+
+**정정(2026-09-23, b5plan).** 위 스케치의 두 자리는 V4.1에서 그대로 서지 않는다. ① `derive`·`load`가 `&Gguf` 하나를 받는데, V4.1은 9샤드 `Split`을 배치 계획으로 싣는다(`Weights::load_placed`가 이미 `&Split`을 받는다). 둘 다 `&Split`을 받게 하고 V2-Lite는 1샤드 `Split`으로 연다(`Split::open`이 `split.count` 없는 파일을 1샤드로 조립한다). ② `AnyEngine`은 `crates/gpu`에 둘 수 없다 — `deepseek41::Body`는 `crates/gpu-deepseek41`에 있고 그 크레이트가 `crates/gpu`에 의존하므로 순환이다. `AnyEngine`은 두 몸체를 다 보는 쪽, gpu-gates의 피처 `deepseek41` 팔로 올린다. 둘 다 B5의 `b5load`가 한다.
 
 `GpuModel`의 골격 — 그래프 드롭 순서, 캡처 정체성 `(layer, embed)`, 모드 전환이 캡처를 버리는 규칙, `pos` 전진,
 argmax 회수 한 번 — 은 미묘한 코드 400줄이고 두 벌을 두면 AGENTS가 금하는 이중 장부다. 그래서 골격은 `B`에
