@@ -15,8 +15,10 @@
 //! dense-equivalent launch over the same bytes. The routed experts run at
 //! `N_SLOTS` slots per launch over stacks of `N_SLOTS` experts, in the
 //! blocks whose experts can live in VRAM (blocks `0..EXPERT_LO` keep theirs
-//! on the host). The `hc_*_fn` projections are listed but not issued: their
-//! K is past what `Q8Act` accepts, which the run shows by asking it.
+//! on the host). The `hc_*_fn` projections are listed but not issued: the
+//! V4.1 crate's `ds41_hc_pre` runs them split-K inside the fused HC_PRE
+//! kernel, which this `gpu`-feature bench does not link; a plain q3_K gemv
+//! at their shape would time a kernel the step never launches.
 //!
 //! Device data: one distinct synthetic copy per block, so the reads of a
 //! token miss L2 the way the real step's do. A site whose copies together
@@ -1259,19 +1261,11 @@ mod bench {
             ctx.device_name()?,
             ctx.multiprocessor_count()?
         );
-        match Q8Act::with_k(stream, 1, HC_K) {
-            Err(e) => println!(
-                "v41 not_issued site=hc_attn_fn,hc_ffn_fn type=q3_K tensors={HC_TENSORS} \
-                 out_rows={HC_ROWS} k={HC_K} file_bytes={} refused_by=[{e}]",
-                HC_TENSORS * HC_ROWS * HC_K / 256 * 110
-            ),
-            Ok(_) => {
-                return Err(format!(
-                    "bench_v41: Q8Act now takes k = {HC_K}; the hc_*_fn rows belong in the table"
-                )
-                .into());
-            }
-        }
+        println!(
+            "v41 not_issued site=hc_attn_fn,hc_ffn_fn type=q3_K tensors={HC_TENSORS} \
+             out_rows={HC_ROWS} k={HC_K} file_bytes={} served_by=ds41_hc_pre",
+            HC_TENSORS * HC_ROWS * HC_K / 256 * 110
+        );
         let plan: u64 = SITES.iter().map(Site::vram_bytes).sum();
         let (free, total) = vram(&gpu)?;
         println!(

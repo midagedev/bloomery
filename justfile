@@ -84,7 +84,8 @@ gate-gpu-p9:
 gate-gpu-q4k-sel:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_q4k_sel && bash tools/gpu-gate.sh gate_q4k_sel'
 
-# B4 hyper-connections: the chain kernel, HC_PRE, HC_POST and the folds against our rule and the V4.1 ik dumps, every sub-layer.
+# V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 우리 규칙과 V4.1 ik 덤프에 서브층마다
+# 대조한다. engram 층(1·14)의 분리 짝(HC_POST 단독 → 접기 단독)이 융합 런치와 비트 동일한지도 본다.
 gate-gpu-ds41-hc:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_hc && bash tools/gpu-gate.sh gate_deepseek41_hc'
 
