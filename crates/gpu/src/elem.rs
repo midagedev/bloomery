@@ -128,7 +128,7 @@ pub(crate) fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
 ///
 /// Caller contract: `base + k <= x.len()`, `tid < RMS_THREADS`.
 #[inline(always)]
-pub(crate) fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
+pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
     let mut acc = 0.0f32;
     let mut it = tid;
     while it < k {
@@ -144,7 +144,7 @@ pub(crate) fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f3
 /// tree `((w0+w1)+(w2+w3)) + ((w4+w5)+(w6+w7))`. This order is the gate: it
 /// is what makes the fused norm's scale equal the op path's.
 #[inline(always)]
-pub(crate) fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
+pub fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
     ((w[0] + w[1]) + (w[2] + w[3])) + ((w[4] + w[5]) + (w[6] + w[7]))
 }
 
@@ -153,7 +153,7 @@ pub(crate) fn rms_warp_tree(w: [f32; RMS_WARPS]) -> f32 {
 /// reference sums the squares in f64 serially; the device's fixed f32
 /// lane/butterfly tree moves last ulps only, which the gate's band owns.
 #[inline(always)]
-pub(crate) fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
+pub fn rms_scale(sum_sq: f32, k: u32, eps: f32) -> f32 {
     let mean = sum_sq / k as f32;
     1.0 / (mean + eps).sqrt()
 }

@@ -144,11 +144,7 @@ impl GpuError {
 /// wrap a count past `u32::MAX` into a smaller geometry the launch contract
 /// may still accept, so a value that does not fit is a `Shape` error of the
 /// entry point `what`, naming the argument `name`.
-pub(crate) fn launch_u32(
-    what: &'static str,
-    name: &'static str,
-    v: usize,
-) -> Result<u32, GpuError> {
+pub fn launch_u32(what: &'static str, name: &'static str, v: usize) -> Result<u32, GpuError> {
     u32::try_from(v)
         .map_err(|_| GpuError::shape(what, format!("{name} = {v} does not fit the kernel's u32")))
 }

@@ -524,6 +524,14 @@ gate-ds41-oracle:
 gate-ds41-plan:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && timeout --kill-after=10 900 ./target/release/gate_deepseek41_plan'
 
+# V4.1 rope family (tail rope, ROPE_BACK, latent K/V norm + rope + f16 ring append) against the 5-token and decode-step sets.
+gate-gpu-ds41-rope:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_rope && bash tools/gpu-gate.sh gate_deepseek41_rope'
+
+# Host unit tests of the V4.1 device crate (no card, no gate lock): the rope table is ggml's recipe at large positions.
+gate-gpu-ds41-lib:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib'
+
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
 # 들어가면 쓰레기를 낸다(upstream의 MMQ 경로, mainline이 양자화한 파일에서만). 그래서 argmax.sh가 --step-prefill(M=1 경로)로 먹인다 —

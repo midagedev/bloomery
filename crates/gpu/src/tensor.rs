@@ -58,7 +58,7 @@ impl<T: DeviceCopy> DeviceTensor<T> {
     }
 
     /// Writable view for `DisjointSlice<T>` / `&mut [T]` kernel parameters.
-    pub(crate) fn buf_mut(&mut self) -> &mut DeviceBuffer<T> {
+    pub fn buf_mut(&mut self) -> &mut DeviceBuffer<T> {
         &mut self.buf
     }
 }
