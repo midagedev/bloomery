@@ -94,7 +94,8 @@ dispatch=(
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.
   'crates/gpu-gates/src/oracle/mod\.rs:[0-9]+:[[:space:]]*Arch::Deepseek2 => Ok\(&deepseek2::ORACLE\),$'
   # 디스패치가 아닌 유일한 항목: 하네스의 기본 참조 세트. ref_dir 가 Arch 를 받기 전까지 남는다.
-  'crates/gpu-gates/src/lib\.rs:[0-9]+:[[:space:]]*data_dir\(\)\.join\(oracle::deepseek2::ORACLE\.cuda_set\)$'
+  'crates/gpu-gates/src/lib\.rs:[0-9]+:[[:space:]]*data_dir\(\)\.join\(oracle::deepseek2::CUDA_SET\)$'
+  'crates/gpu-gates/src/oracle/mod\.rs:[0-9]+:[[:space:]]*Arch::Deepseek41 => Ok\(&deepseek41::ORACLE\),$'
 )
 # 세 모양을 본다: 경로 안의 `deepseek2::…`, 모듈을 통째로 들여오거나 재수출하는 use 줄
 # (`use …::arch::deepseek2 as x;`, `pub use …::deepseek2;` — 뒤에 `::`가 없어 첫 모양에 안 걸린다),

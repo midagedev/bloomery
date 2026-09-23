@@ -8,7 +8,7 @@ dirs=("$ROOT"/crates/{gguf,threads,qdot,model,engram}/src)
 # GPU 크레이트도 같은 규약을 진다. 임시 스위치: CHECK_COMMENTS_GPU=0으로 끄면 옛 대상만 본다
 # (main에서 이 경로가 빨강이면 리드가 머지 순서를 정하는 동안 끄는 손잡이다).
 if [ "${CHECK_COMMENTS_GPU:-1}" != 0 ]; then
-  dirs+=("$ROOT/crates/gpu/src" "$ROOT/crates/gpu-gates/src")
+  dirs+=("$ROOT/crates/gpu/src" "$ROOT/crates/gpu-deepseek41/src" "$ROOT/crates/gpu-gates/src")
 fi
 bad=$(grep -rnE '//.*(MUL-[0-9]+|20[0-9]{2}-[0-9]{2}-[0-9]{2})' \
         "${dirs[@]}" --include='*.rs' | grep -v 'PIN(' || true)

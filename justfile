@@ -13,12 +13,14 @@ default:
 # gpu-gates 바이너리의 GPU 본체가 끄면 통째로 안 보인다.
 # 빠른 루프: 타입 검사만, 커널은 안 만든다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41'
 
-# check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26).
+# check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
+# `deepseek41`도 켠다 — 그 바이너리들은 이 피처가 있어야 컴파일된다. clippy는 디바이스 코드를 만들지 않으므로
+# V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41'
 
 # fmt는 맥에서 돈다. box.sh의 rsync가 단방향이라 박스에서 포맷하면 결과가 돌아오지
 # 않고 다음 명령에 덮여 사라진다(2026-09-19에 그렇게 한 번 날렸다). cargo fmt는 컴파일을
@@ -513,7 +515,7 @@ gate-gpu-lib:
 gate-gpu-gates-lib:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib'
 
-# Host-only (no card, no gate lock): the harness reads every row of the V4.1 oracle set ref_deepseek41.
+# V4.1 오라클 세트 ref_deepseek41의 모든 행을 하니스가 읽는지 본다. 호스트 전용이라 카드도 게이트 락도 쓰지 않는다.
 gate-ds41-oracle:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_oracle --nocapture'
 
