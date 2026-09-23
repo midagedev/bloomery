@@ -307,7 +307,7 @@ fn route_inner(
 /// The `e`-th matrix of a stacked expert tensor `{k, n, n_expert}` as a 2-D
 /// `TensorInfo` into the same mapping. `gguf.data` bounds-checks the view again, so a
 /// miscomputed slice errors instead of reading a neighbor expert.
-fn expert_view(w: &TensorInfo, e: usize, n_expert: usize) -> Result<TensorInfo, ModelError> {
+pub fn expert_view(w: &TensorInfo, e: usize, n_expert: usize) -> Result<TensorInfo, ModelError> {
     if w.dims.len() != 3
         || w.dims[2] as usize != n_expert
         || !w.nbytes.is_multiple_of(n_expert as u64)
