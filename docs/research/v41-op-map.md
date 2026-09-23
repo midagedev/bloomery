@@ -34,14 +34,14 @@ gemv는 dtype만 갈리고 그대로 일반화된다, 어텐션은 일반화되�
 - **그대로**: attn·ffn·최종 norm, 저랭크 쿼리 투영과 그 norm(1280), 쿼리 업프로젝션, 잠재 norm, shared 전문가
   잔차 add, 출력 헤드(q6_K), argmax.
 - **바뀜**: 토큰 임베딩(**bf16**, 결과를 hc 스트림 4벌로 방송), 잠재 K/V 투영(512 하나가 K이자 V, 업프로젝션 없음),
-  rope(512 헤드의 앞 64, **기준 둘** — 0·1층 θ 10k YaRN 없음, 나머지 160k YaRN×16), 윈도우 KV 추가(128행 링,
-  계획 색인), 어텐션(K=V, 헤드별 **sink**가 분모에, 키 집합 = 윈도우 128 ⧺ 고른 512), 출력 투영(8그룹 블록 대각
+  rope(512 헤드의 ~~앞~~ **꼬리** 64 — `ggml.c:21154-21155`, b4plan 측정, **기준 둘** — 0·1층 θ 10k YaRN 없음, 나머지 160k YaRN×16), 윈도우 KV 추가(~~128행 링,
+  계획 색인~~ ik는 층마다 n_ctx행 셀에 쓰고 창은 SWA 마스크가 만든다 — `llama-dsv4.cpp:376-417`, `llama.cpp:6010`), 어텐션(K=V, 헤드별 **sink**가 분모에, 키 집합 = 윈도우 128 ⧺ 고른 512), 출력 투영(8그룹 블록 대각
   `wo_a` `[4096,1024,8]` 배치 후 `wo_b`), 라우터(√softplus, 선택 전용 편향, 재정규화 ×1.5, 게이트 가중치 **bf16**),
-  라우팅 전문자(SwiGLU ±10, down이 38층 q4_K·**0·1층 q5_K**), shared 전문가(전부 **q8_0**), hc 접기(`weighted_sum`),
+  라우팅 전문자(SwiGLU ±10, down이 38층 q4_K·**0·1층 q5_K**), shared 전문가(전부 **q8_0**), hc 접기(~~`weighted_sum`~~ `GGML_OP_MUL_MULTI_ADD`의 FMA 사슬),
   hc 앞 norm(20,480 위).
 - **새 것**: `hc_pre` 믹스 헤드(24값 gemv → 아핀·시그모이드·**Sinkhorn 20회** → `pre[4]`·`post[4]`·`comb[4×4]`),
-  `hc_post` 잔차 믹스, 압축기 풀링, 인덱서 키 만들기(rope 전 잠재 → 128 → norm → rope → Hadamard), 인덱서 점수
-  (32×128, `Σ relu(q·k)·proj(x)`), top-k 512, 고른 행 모으기, 역-rope(rope 노드를 `ROPE_BACK`으로 재태그),
+  `hc_post` 잔차 믹스, 압축기 풀링, 인덱서 키 만들기(rope 전 잠재 → 128 → norm → rope → Hadamard. 참조와 이 문서는 rope 전이다. 포트 `c10fbbcc`의 그래프는 제자리 rope가 걸린 뒤의 잠재를 읽는다 — 결함이고, b4plan이 쟀다), 인덱서 점수
+  (32×128, `Σ relu(q·k)·proj(x)`), top-k 512(기본 경로는 산술과 동률 규칙이 다른 융합 `INDEXER_TOPK`, `llama.cpp:8469`), 고른 행 모으기, 역-rope(rope 노드를 `ROPE_BACK`으로 재태그),
   engram 조회, engram 게이트(부호 있는 √ 뒤 시그모이드), Hadamard.
 
 ## 위험 순위 — 우리가 더해야 하는 것
@@ -70,7 +70,7 @@ gemv는 dtype만 갈리고 그대로 일반화된다, 어텐션은 일반화되�
   티어 0개 0바이트) V4.1 그래프는 MTP 꺼짐을 단언한다. 계획의 결론은 같다(C4는 이 파일로는 못 한다), 이유가
   포트가 아니라 파일이다. 본 경로는 드래프트가 쓸 층 입력 평균만 모아 둔다.
 - **조용한 기본값**: `hyper_connection.sinkhorn_iterations`는 선택 키라 없으면 **3**(참조 20), `hyper_connection.epsilon`은
-  없으면 rms eps 1e-20(참조 1e-6)으로 떨어진다. 우리 파일이 그 키를 빠뜨렸으면 포트는 참조와 다른 산술을 돌리고
+  없으면 rms eps 1e-20(참조 1e-6)으로 떨어진다. 우리 파일에는 두 키가 다 있다(20과 1e-6, b4plan이 헤더에서 읽었다). 우리 파일이 그 키를 빠뜨렸으면 포트는 참조와 다른 산술을 돌리고
   있다. 우리 hparams 판독은 기본값을 만들지 않는다(`arch-split.md`).
 - **포트가 싣지만 이 파일이 안 쓰는 V4 기계**: 토큰 id로 라우팅하는 `ffn_gate_tid2eid`(파일에 없음), 이미지
   배치에만 읽는 `exp_probs_b_vl`(파일에는 40층 전부 있음). 둘 다 우리 디코드 그래프에 없다.
@@ -92,7 +92,7 @@ blk.1은 `…-00002-of-00009.gguf`, blk.14는 `…-00005-of-00009.gguf`. 서빙�
 ## 못 정한 것
 
 `ggml_hc_pre`·`ggml_ds4_comp`·`ggml_top_k`·`ggml_get_rows_ext`·`ggml_hadamard`의 본체는 `ggml/src`에 있어 계약만
-핀했고 산술은 읽지 않았다. `n_swa = 128`을 로더가 파일에서 읽는지 기본값인지 미확인. `skelectric`·`phylliida`는
+핀했고 산술은 읽지 않았다(뒤에 b4plan이 다섯 본체를 읽었다 — [`v41-b4-plan-report.md`](v41-b4-plan-report.md) §1). ~~`n_swa = 128`을 로더가 파일에서 읽는지 기본값인지 미확인.~~ 파일에 128이 있다(b4plan, 헤더). `skelectric`·`phylliida`는
 이 문서에서 열지 않았다.
 
 ## 계획에 남는 것

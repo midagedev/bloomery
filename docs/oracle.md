@@ -59,7 +59,7 @@ V4.1을 받으려고 덤퍼를 넓혔다. V2-Lite에서 기존 `.f32` 1155개와
 
 **체커가 있다.** `tools/ref/check-int-twins.py <세트>`는 정수 행마다 사본이 있는지, 크기·합·absmax가 다시 계산해도 같은지, f32가 사본의 RNE인지, `inp_tokens`가 `# tokens`와 같은지 본다. 아직 `just gate`에 넣지 않는다 — 실제 V2-Lite `ref`가 v1이라 구조적으로 빨강이다.
 
-V4.1 세트(`ref_deepseek41`)는 토큰 `671,6102,294,8760,344`를 쓴다. BOS 없이 다섯 개다(파일이 `tokenizer.ggml.add_bos_token=false`). engram id는 입력으로 잡힌다(`engram_rows-<층>`). 인덱서 top-k 노드는 5토큰에서 생기지 않는다 — `indexer_top_k(512) < n_kv`일 때만 빌드되는데 n_kv가 256으로 패딩되기 때문이다. top-k 탭이 필요하면 더 긴 프리필 뒤 한 스텝만 덤프하는 기능이 있어야 한다(없다). I64 경로가 처음 도는 것도 이 덤프다.
+V4.1 세트(`ref_deepseek41`)는 토큰 `671,6102,294,8760,344`를 쓴다. BOS 없이 다섯 개다(파일이 `tokenizer.ggml.add_bos_token=false`). engram id는 입력으로 잡힌다(`engram_rows-<층>`). ~~인덱서 top-k 노드는~~ 인덱서 호출 전체(쿼리·가중치·점수·top-k)와 고른 행 모으기(`get_rows_ext`)·`mask_to_idx`가 5토큰에서 생기지 않는다 — `indexer_top_k(512) < n_kv`일 때만 빌드되는데 n_kv가 256으로 패딩되기 때문이다. 그 탭은 더 긴 프리필 뒤 한 스텝만 덤프하는 기능으로 뜬다(`b4dump`가 짓는 중). 파일 이름은 텐서 이름의 `/`·`\`·공백을 `_`로 바꾼 것이다(`dump_ref.cpp`의 `safe_name`). 이 세트의 FA는 ik의 generic 경로라 V를 f16으로 누산한다(b4plan 측정). I64 경로가 처음 도는 것도 이 덤프다.
 
 실제 V2-Lite `ref`는 아직 v1이다. 다시 뜨면 교체가 같은 디렉터리에 다른 도구가 쓴 파일 17개(qdot `*-ik-dot.txt` 넷, dequant `*.raw`·`*.meta`·`manifest.txt`)를 지운다. 그 소유권을 먼저 가른다(장부 B0c 카드의 트래커 ①).
 

@@ -51,7 +51,7 @@ and they agree (§1.2).
 | heads | 64 | `num_attention_heads` | |
 | head dim | 512 | `head_dim` | `attn_q_b` `1280×32768` = 64×512 `[gguf]` |
 | KV heads | **1** | `num_key_value_heads` | one 512-latent is K *and* V: `dsv4_build_attn(…, k_all, k_all, …)` `[ik]` `build_deepseek4.cpp:1325` |
-| rope dim | 64 of 512 | `qk_rope_head_dim` | `n_rot`; `build_rope` rotates the first 64 `[ik]` `:1112` |
+| rope dim | 64 of 512 | `qk_rope_head_dim` | `n_rot`; `build_rope` rotates ~~the first 64~~ **the last 64** (`ggml.c:21154-21155`, measured by b4plan) `[ik]` `:1112` |
 | `q_lora_rank` | 1,280 | `q_lora_rank` | `attn_q_a` `5120×1280` `[gguf]` |
 | `o_lora_rank` / `o_groups` | 1,024 / 8 | `o_lora_rank`, `o_groups` | asserted against `attn_output_a/_b` shapes at load `[ik]` `llama-hparams.cpp:2201-2205` |
 | window | 128 | `sliding_window` | `n_swa` |
@@ -127,7 +127,7 @@ dtype and the shape are available; "changed" means the same kernel with a differ
 |---|---|---|---|---|
 | token embed | `embed_rows` | dtype **bf16** (we have none); result is then broadcast into 4 hc streams | `:1520-1523` | `token_embd.weight` `5120×129280` **bf16** |
 | latent K/V projection | `q8_0_gemv` | output is one 512 latent that serves as K **and** V; no up-projection at all | `:1121` | `blk.N.attn_kv.weight` `5120×512` q8_0 |
-| rope | `rope` | first 64 dims of a **512** head (we rotate a 64-dim tail of a 192-wide MLA head); **two bases in one model**, θ=10,000 no-YaRN on layers 0–1 and θ=160,000 YaRN×16 elsewhere | `:1112`, bases at `:1093-1100` | — |
+| rope | `rope` | ~~first~~ **last** 64 dims of a **512** head (corrected: `ggml.c:21154-21155`, b4plan) (we rotate a 64-dim tail of a 192-wide MLA head); **two bases in one model**, θ=10,000 no-YaRN on layers 0–1 and θ=160,000 YaRN×16 elsewhere | `:1112`, bases at `:1093-1100` | — |
 | window KV append | `kv_norm_rope_append` | a 128-row **ring**, written by plan index rather than by position | `:1216` `dsv4_raw_cpy_k` | — |
 | attention | `flash_latent*` | K and V are the same tensor; a learned per-head **sink** joins the softmax denominator; the key set is `concat(window 128, selected compressed rows)` | `:1319-1326`, `dsv4_build_attn:496-625`, sink at `:590`/`:609` | `blk.N.attn_sinks.weight` `64` f32 |
 | output projection | `q8_0_gemv` | **block-diagonal in 8 groups** then a dense second stage: `wo_a` is viewed as `[4096, 1024, 8]` and batched over groups | `:1415-1436` | `blk.N.attn_output_a.weight` `4096×8192` q8_0, `blk.N.attn_output_b.weight` `8192×5120` q8_0 |
