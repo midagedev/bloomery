@@ -75,6 +75,8 @@
 - **R25 (신설)** — **그래프 핸들은 그것이 주소를 잡은 버퍼보다 먼저 선언한다**(필드는 선언 순서로 드롭). `Head`·`GpuModel`·`Stage`가 이미 그 순서이고, 새 구조체도 같은 순서 + 한 줄 주석.
 - **R26 (신설)** — **피처 뒤에 본체가 숨은 바이너리는 그 피처를 켜고 lint한다.** `just lint`·`just check`는 `--features gpu`. 러너(`depth-gpu.sh`·`ncu-gpu.sh`·`nsys-gpu.sh`)는 바이너리를 **빌드하거나 빌드 해시를 증인에 찍는다** — 빌드하지 않은 바이너리를 재는 것은 낡은 바이너리 사고의 형태다(2026-09-22 밤 `ik_ref` 열이 그렇게 옛 값을 찍었다).
 - **R27 (신설)** — 통합 테스트가 내부 함수를 부르기 위한 `#[doc(hidden)] pub`은 금지. 인라인 유닛 테스트 또는 게이트가 관찰하는 출력으로.
+- **R28 (신설, 2026-09-23)** — **호출자가 지켜 주는 경계에 기대는 함수는 `unsafe fn`이다.** 본문이 `get_unchecked`를 쓰고 "callers keep …"을 계약으로 적은 함수는 크레이트 안에서는 `pub(crate)` 안전 함수로 남아 있지만, 크레이트 밖으로 여는 순간 `pub unsafe fn`과 `/// # Safety` 절이 된다. 호출부는 `unsafe { }`와 한 줄 `// SAFETY:`로 그 경계를 댄다. 증명은 `ptx-scan` 표 동일(이동 클래스). B4 파동에서 `q3k_sb_decode`(b4hc)와 레인 본체 둘(b4moe)이 안전한 `pub fn`으로 열렸다가 되돌아왔다. 먼저부터 `pub`이던 `cores::q3k_row_dot`도 같은 부류다.
+- **R29 (신설, 2026-09-23)** — **합 순서가 계약인 디바이스 산술은 수축까지 소스에 적는다.** cuda-oxide는 nvcc의 `--fmad=true`처럼 `a*b + c`를 FMA 하나로 합친다(`docs/upstream/nvlabs-ledger.md` 17행). 그래서 같은 식을 `*`와 `+`로 쓴 호스트 규칙과 커널이 서로 다르게 반올림한다 — b4hc의 첫 실행에서 320곳 중 319곳이 비트가 달랐다. 합칠 자리는 `mul_add`·`fma`로, 따로 반올림할 자리는 `mul_rn_f32`·`add_rn_f32`로 쓴다. 증명은 `ptx-scan`의 `fma` 열이다. 문서가 "plain multiplies"나 "no fused multiply-add"라고 적었는데 PTX가 FMA인 코어는 문서를 PTX에 맞춘다(`elem.rs`의 `weighted_sum`·`moe_combine` 본체 — b4moe 보고).
 
 **기각**: ① `flash_row_scalar`/`flash_row_avx2` 트윈의 공통 코어 추출(cpu 리뷰 1순위) — `#[target_feature]` 본체 분리 금지(AGENTS, 측정 10–13 %)와 정면 충돌. 트윈은 의도된 형태고 `TWIN` 주석이 계약이다. 남는 것은 트윈 **밖**의 소프트맥스 스캔 산술을 `#[inline(always)]` 코어로 빼되 SASS·A/B 동일을 보이는 것 — 별도 라운드, 지금 아님. ② `head.rs` 드롭 순서 결함 — 이미 그래프가 먼저다(오탐; 규칙 R25로만 받음). ③ "cuda-oxide가 구조체 인자를 못 받는다"는 리뷰어 주장은 미확인이라 R8 보강의 근거로 쓰지 않았다(ABI 이유로 충분).
 
