@@ -13,7 +13,7 @@ use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::tensor::DeviceTensor;
 use ::model::placement::{CardFormat, Device, Format, ModelTensor, Plan, Segment};
 use cuda_core::CudaStream;
-use gguf::quant::{GgmlType, dequant_row, half_to_f32};
+use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 // The Q8_0 block `q8_0_planes` packs; the gate binaries name it through here.
 pub use gguf::quant::Q8Block;
@@ -44,22 +44,22 @@ pub enum DevWeight {
     Q5_1 { w: DeviceTensor<u32>, k: usize },
     /// Q8_0 file tensor in the q8f32 two-plane layout: `qs` rows × k/4 u32
     /// words (code j of a 32-value block in word j/4, byte j%4) and `d` rows
-    /// × k/32 f32 block scales converted from the f16 storage at load. The
-    /// derived variant shares the format.
+    /// × k/32 block scales, each the block's f16 bits as the file stores
+    /// them. The derived variant shares the format.
     Q8_0 {
         qs: DeviceTensor<u32>,
-        d: DeviceTensor<f32>,
+        d: DeviceTensor<u16>,
         k: usize,
     },
     /// A derived weight — computed at load by an architecture's plan, never
     /// read from the file — in the same two planes as `Q8_0` (`qs` rows ×
-    /// k/4 words, `d` rows × k/32 scales); its row geometry is the plan's
-    /// ([`ChainBody::derive`](crate::model::ChainBody::derive)). A distinct
-    /// variant so nothing can read derived bytes as a file tensor or vice
-    /// versa.
+    /// k/4 words, `d` rows × k/32 f16 scales); its row geometry is the
+    /// plan's ([`ChainBody::derive`](crate::model::ChainBody::derive)). A
+    /// distinct variant so nothing can read derived bytes as a file tensor
+    /// or vice versa.
     Q8_0Derived {
         qs: DeviceTensor<u32>,
-        d: DeviceTensor<f32>,
+        d: DeviceTensor<u16>,
         k: usize,
     },
     /// F32 file tensor, or a BF16 one decoded to f32 at load: rows × k f32,
@@ -94,19 +94,34 @@ impl DevWeight {
         }
     }
 
-    /// Device bytes held across all planes.
+    /// The device buffers this weight holds, in bytes, in allocation order:
+    /// each buffer's element count times its element size, read from the
+    /// buffers themselves — what was allocated, never recomputed from the
+    /// format, so it is the independent side of every check against
+    /// [`CardFormat::buffer_bytes`].
     #[must_use]
-    pub fn resident_bytes(&self) -> usize {
+    pub fn buffer_bytes(&self) -> Vec<usize> {
         match self {
             DevWeight::KQuant { w, .. } | DevWeight::Q5_0 { w, .. } | DevWeight::Q5_1 { w, .. } => {
-                w.buf().len() * 4
+                vec![held(w)]
             }
             DevWeight::Q8_0 { qs, d, .. } | DevWeight::Q8_0Derived { qs, d, .. } => {
-                qs.buf().len() * 4 + d.buf().len() * 4
+                vec![held(qs), held(d)]
             }
-            DevWeight::F32 { w, .. } => w.buf().len() * 4,
+            DevWeight::F32 { w, .. } => vec![held(w)],
         }
     }
+
+    /// Device bytes held across all planes: the sum of [`DevWeight::buffer_bytes`].
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.buffer_bytes().into_iter().sum()
+    }
+}
+
+/// Bytes `t`'s buffer holds.
+fn held<T: cuda_core::DeviceCopy>(t: &DeviceTensor<T>) -> usize {
+    t.buf().len() * std::mem::size_of::<T>()
 }
 
 /// The resident weights of a layer range: every `blk.L.*` tensor with L in
@@ -480,10 +495,10 @@ fn words_of(b: &[u8]) -> Vec<u32> {
 }
 
 /// The q8f32 two-plane layout of Q8_0 blocks: per block 8 code words (code j
-/// in word j/4, byte j%4) and one f32 scale converted from the stored f16
-/// bits — the exact value the reference dequantizes with, so the device side
-/// never does f16 arithmetic.
-pub(crate) fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
+/// in word j/4, byte j%4) and the block's f16 scale bits unchanged. The
+/// kernels widen a scale with the hardware convert, and widening f16 to f32
+/// is exact, so they multiply by the same f32 the reference dequantizes with.
+pub(crate) fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
     let mut qs = Vec::with_capacity(blocks.len() * 8);
     let mut d = Vec::with_capacity(blocks.len());
     for b in blocks {
@@ -492,7 +507,7 @@ pub(crate) fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
             w[j / 4] |= u32::from(q as u8) << (8 * (j % 4));
         }
         qs.extend_from_slice(&w);
-        d.push(half_to_f32(b.d));
+        d.push(b.d);
     }
     (qs, d)
 }

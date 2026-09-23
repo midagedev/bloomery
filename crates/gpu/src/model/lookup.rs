@@ -13,12 +13,12 @@ pub(crate) fn dev_weight<'a>(w: &'a Weights, name: &str) -> Result<&'a DevWeight
 }
 
 /// The resident derived Q8_0 planes named by `name` (`qs` rows x k/4 code
-/// words, `d` rows x k/32 scales): a weight the architecture's plan derived
-/// at load and filed under a `derived.` name.
+/// words, `d` rows x k/32 f16 scales): a weight the architecture's plan
+/// derived at load and filed under a `derived.` name.
 pub(crate) fn q8_derived<'a>(
     w: &'a Weights,
     name: &str,
-) -> Result<(&'a DeviceTensor<u32>, &'a DeviceTensor<f32>), GpuError> {
+) -> Result<(&'a DeviceTensor<u32>, &'a DeviceTensor<u16>), GpuError> {
     match w.get(name) {
         Some(DevWeight::Q8_0Derived { qs, d, .. }) => Ok((qs, d)),
         Some(_) => Err(GpuError::tensor("q8_derived", name, "the derived variant")),

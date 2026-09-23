@@ -41,60 +41,60 @@ struct HostPin {
     headroom: i128,
 }
 
-// PIN(2026-09-23): design §5 (a)'s A6000 line with the allocator's rounding as a card term (its rule matched gate ②'s loads to the byte); n_l 62–63 on layers 2–39.
+// PIN(2026-09-23): design §5 (a)'s A6000 line after the q8_0 scale plane went f16 (planes = file bytes, 427,294,720 B less dense), the allocator's rounding a card term; n_l 63–64 on layers 2–39.
 const A_A6000: CardPin = CardPin {
     card: "A6000",
-    dense: 8_576_674_240,
-    expert_bytes: 40_020_664_320,
-    experts: 2_386,
-    rounding: 553_612_864,
+    dense: 8_149_379_520,
+    expert_bytes: 40_490_311_680,
+    experts: 2_414,
+    rounding: 515_454_528,
     kv: 110_129_152,
-    headroom: 1_087_344_640,
+    headroom: 1_083_150_336,
     eligible: 2..40,
-    n_l: (62, 63),
+    n_l: (63, 64),
 };
-// PIN(2026-09-23): design §5 (a)'s host line, with the experts the A6000 no longer keeps once its rounding is counted.
+// PIN(2026-09-23): design §5 (a)'s host line after the f16 scale plane: every expert the A6000 does not keep, its rounding counted.
 const A_HOST: HostPin = HostPin {
-    expert_bytes: 218_746_920_960,
+    expert_bytes: 218_277_273_600,
     table_bytes: 1_323_827_200,
-    headroom: 39_010_656_256,
+    headroom: 39_480_303_616,
 };
-// PIN(2026-09-23): design §5 (b)'s A6000 line with the allocator's rounding as a card term (its rule matched gate ②'s loads to the byte); n_l 148–149 on layers 2–19.
+// PIN(2026-09-23): design §5 (b)'s A6000 line after the q8_0 scale plane went f16, the allocator's rounding a card term; n_l 148–149 on layers 2–19.
 const B_A6000: CardPin = CardPin {
     card: "A6000",
-    dense: 4_190_828_000,
-    expert_bytes: 44_750_684_160,
-    experts: 2_668,
-    rounding: 257_673_760,
+    dense: 3_967_677_920,
+    expert_bytes: 44_951_961_600,
+    experts: 2_680,
+    rounding: 277_449_248,
     kv: 65_560_576,
-    headroom: 1_083_678_720,
+    headroom: 1_085_775_872,
     eligible: 2..20,
     n_l: (148, 149),
 };
-// PIN(2026-09-23): design §5 (b)'s 3090 line with the allocator's rounding as a card term (its rule matched gate ②'s loads to the byte); n_l 56–57 on layers 20–39.
+// PIN(2026-09-23): design §5 (b)'s 3090 line after the q8_0 scale plane went f16, the allocator's rounding a card term; n_l 57–58 on layers 20–39.
 const B_3090: CardPin = CardPin {
     card: "3090",
-    dense: 4_385_846_240,
-    expert_bytes: 18_970_398_720,
-    experts: 1_131,
-    rounding: 268_172_320,
+    dense: 4_181_701_600,
+    expert_bytes: 19_188_449_280,
+    experts: 1_144,
+    rounding: 250_072_096,
     kv: 44_568_576,
-    headroom: 1_077_407_744,
+    headroom: 1_081_602_048,
     eligible: 20..40,
-    n_l: (56, 57),
+    n_l: (57, 58),
 };
-// PIN(2026-09-23): design §5 (b)'s host line (token_embd as in (a)), with the experts the cards no longer keep once their rounding is counted.
+// PIN(2026-09-23): design §5 (b)'s host line (token_embd as in (a)) after the f16 scale plane: every expert the cards do not keep, their rounding counted.
 const B_HOST: HostPin = HostPin {
-    expert_bytes: 195_046_502_400,
+    expert_bytes: 194_627_174_400,
     table_bytes: 1_323_827_200,
-    headroom: 62_711_074_816,
+    headroom: 63_130_402_816,
 };
 // PIN(2026-09-23): design §5 (a), `engram_embd` ×2 on NVMe — the same in (b).
 const NVME: u64 = 208_902_215_200;
 // PIN(2026-09-23): design §3, the whole model placed once.
 const TENSORS: usize = 1_046;
-// PIN(2026-09-23): design §1, q8_0 outside the engram tables: tensors and plane bytes, all on cards.
-const Q8_0_CARD: (usize, u64) = (330, 7_691_304_960);
+// PIN(2026-09-23): design §1, q8_0 outside the engram tables: tensors and plane bytes, all on cards — the file's bytes, since the scale plane keeps each block's f16 bits.
+const Q8_0_CARD: (usize, u64) = (330, 7_264_010_240);
 // PIN(2026-09-23): design §1, bf16 decoded to f32 on the cards: the routers, and engram_{k,q}.
 const BF16_ROUTERS: u64 = 314_572_800;
 const BF16_ENGRAM: u64 = 327_680;

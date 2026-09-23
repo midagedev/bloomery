@@ -163,7 +163,8 @@ pub enum CardFormat {
     Q5_0,
     /// q5_1: the q5_0 layout plus one f32 min per block.
     Q5_1,
-    /// q8_0 in two planes: per 32-value block 8 code words and one f32 scale.
+    /// q8_0 in two planes: per 32-value block 8 code words and the block's
+    /// f16 scale bits as the file stores them.
     Q8_0Planes,
     /// f32: the file's values.
     F32,
@@ -225,7 +226,7 @@ impl CardFormat {
             CardFormat::Q8_0Planes => {
                 vec![
                     rows.checked_mul(k)?,
-                    rows.checked_mul(blocks.checked_mul(4)?)?,
+                    rows.checked_mul(blocks.checked_mul(2)?)?,
                 ]
             }
             CardFormat::F32 | CardFormat::Bf16AsF32 => vec![rows.checked_mul(k.checked_mul(4)?)?],

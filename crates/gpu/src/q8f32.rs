@@ -10,9 +10,11 @@
 //! load-time work):
 //! - `qs`: row-major `u32` words, 8 words per 32-value block, code `j` in
 //!   word `j/4`, byte `j%4` (little-endian), `k/4` words per row;
-//! - `d`: row-major `f32` block scales, `k/32` per row, converted from the
-//!   Q8_0 block's f16 scale at load — the exact value the reference
-//!   dequantizes with, so the device side never does f16 arithmetic.
+//! - `d`: row-major block scales, `k/32` per row, each the Q8_0 block's f16
+//!   bits as the file stores them. A lane widens the scale it loads with the
+//!   hardware convert (`flash::half_bits_to_f32`); widening f16 to f32 is
+//!   exact, so the kernels multiply by the value the reference dequantizes
+//!   with and do no f16 arithmetic.
 //!
 //! Numeric contract, both kernels: one warp owns one output row, each lane
 //! accumulates its share of the row sequentially, one f32 multiply-add per
@@ -30,6 +32,7 @@
 //! gemvs: `y[r·m + c]`.
 
 use crate::GpuError;
+use crate::flash::half_bits_to_f32;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -205,12 +208,12 @@ pub(crate) fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, la
 
 /// Lane `lane`'s partial sums for one Q8_0 row: the weight at value `kk` of
 /// `row` is `q·d` with `q` the signed code in word `qs[row·k/4 + kk/4]`,
-/// byte `kk%4`, and `d` the block scale `d[row·k/32 + kk/32]` — the same
-/// bits the reference's dequantizer produces. `x` is read from base `x0`
-/// (column c's values at `x0 + c*k .. +k`), so a caller can dot against a
-/// slice of a wider buffer without subslicing it. Accumulation order: for
-/// `m_cols > 1` as `f32_lane_partials`; for `m_cols == 1` as
-/// [`q8_0_lane_partial_1col`].
+/// byte `kk%4`, and `d` the block scale `d[row·k/32 + kk/32]` widened from
+/// its f16 bits — the same bits the reference's dequantizer produces. `x`
+/// is read from base `x0` (column c's values at `x0 + c*k .. +k`), so a
+/// caller can dot against a slice of a wider buffer without subslicing it.
+/// Accumulation order: for `m_cols > 1` as `f32_lane_partials`; for
+/// `m_cols == 1` as [`q8_0_lane_partial_1col`].
 ///
 /// Caller contract: `qs.len() >= (row + 1) * k/4`, `d.len() >= (row + 1) *
 /// k/32`, `x.len() >= x0 + m_cols * k`, `k` a positive multiple of 32,
@@ -218,7 +221,7 @@ pub(crate) fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, la
 #[inline(always)]
 pub(crate) fn q8_0_lane_partials(
     qs: &[u32],
-    d: &[f32],
+    d: &[u16],
     x: &[f32],
     k: u32,
     row: usize,
@@ -259,7 +262,7 @@ pub(crate) fn q8_0_lane_partials(
         let q = unsafe { (*qs.get_unchecked(qs_row + (kk >> 2)) >> (8 * (kk & 3))) as u8 as i8 };
         // SAFETY: it = kk/32 < k/32 <= d.len() - d_row by the caller
         // contract.
-        let wv = q as f32 * unsafe { *d.get_unchecked(d_row + it) };
+        let wv = q as f32 * half_bits_to_f32(unsafe { *d.get_unchecked(d_row + it) });
         // Column 0 (always active).
         // SAFETY: kk < k, and x0 + kk < x0 + k <= x.len() by the caller
         // contract (m_cols >= 1).
@@ -315,8 +318,8 @@ pub const Q8_STEP_UNROLL: usize = 4;
 const _: () = assert!(Q8_STEP_UNROLL == 4);
 
 /// Step `s` of lane `lane`'s walk: the lane's code word `qs[wq + 32s]`, the
-/// scale `d[wd + 4s]` of the block that word sits in, and the word's four
-/// activations, quad `lane + 32s` of `xq`.
+/// scale `d[wd + 4s]` of the block that word sits in, widened from its f16
+/// bits, and the word's four activations, quad `lane + 32s` of `xq`.
 ///
 /// # Safety
 ///
@@ -326,7 +329,7 @@ const _: () = assert!(Q8_STEP_UNROLL == 4);
 #[inline(always)]
 unsafe fn q8_0_step(
     qs: &[u32],
-    d: &[f32],
+    d: &[u16],
     xq: &[F32x4],
     wq: usize,
     wd: usize,
@@ -337,13 +340,14 @@ unsafe fn q8_0_step(
     // word wq + 32s is below row*k/4 + k/4 <= qs.len(), its block wd + 4s =
     // row*k/32 + w/8 below row*k/32 + k/32 <= d.len(), and quad w below k/4
     // = xq.len().
-    unsafe {
+    let (q, bits, v) = unsafe {
         (
             *qs.get_unchecked(wq + 32 * s),
             *d.get_unchecked(wd + 4 * s),
             *xq.get_unchecked(lane + 32 * s),
         )
-    }
+    };
+    (q, half_bits_to_f32(bits), v)
 }
 
 /// `f` plus one word's four terms, in byte order: `fma(q_j·d, x_j, f)` with
@@ -366,15 +370,17 @@ fn q8_0_word_dot(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
 /// multiply-add per term. [`Q8_STEP_UNROLL`] steps' loads are hoisted above
 /// the multiply-adds that consume them; up to three leftover steps run as a
 /// hoisted pair and a single, and a `k` that is not a multiple of 128 ends
-/// with one word on each of the first `(k % 128) / 4` lanes. The activations
-/// are read as one 16-byte quad per word when `x0` leaves them 16-byte
-/// aligned, and as four scalars otherwise — the same values in the same
-/// order, so the sum does not depend on which. Caller contract as
+/// with one word on each of the first `(k % 128) / 4` lanes. A row of at
+/// most 128 values — one word per lane at most — skips that ladder: it is
+/// the same single word, reached by one test instead of four. The
+/// activations are read as one 16-byte quad per word when `x0` leaves them
+/// 16-byte aligned, and as four scalars otherwise — the same values in the
+/// same order, so the sum does not depend on which. Caller contract as
 /// [`q8_0_lane_partials`] with `m_cols` 1.
 #[inline(always)]
 pub(crate) fn q8_0_lane_partial_1col(
     qs: &[u32],
-    d: &[f32],
+    d: &[u16],
     x: &[f32],
     k: u32,
     row: usize,
@@ -399,7 +405,7 @@ pub(crate) fn q8_0_lane_partial_1col(
             // SAFETY: w < k/4 by the loop guard, so word row*k/4 + w, its
             // block row*k/32 + w/8 and values 4w .. 4w + 3 of xr are inside
             // qs, d and xr by the caller contract.
-            let (q, dv, xv) = unsafe {
+            let (q, bits, xv) = unsafe {
                 (
                     *qs.get_unchecked(wq - lane + w),
                     *d.get_unchecked(wd - (lane >> 3) + (w >> 3)),
@@ -411,11 +417,22 @@ pub(crate) fn q8_0_lane_partial_1col(
                     ]),
                 )
             };
-            f = q8_0_word_dot(f, q, dv, xv);
+            f = q8_0_word_dot(f, q, half_bits_to_f32(bits), xv);
             w += 32;
         }
         return f;
     };
+    // At most 128 values: at most one word per lane, step 0's — the word the
+    // ladder below reaches through four tests, each its own branch region,
+    // reached here through one.
+    if words <= 32 {
+        if lane < words {
+            // SAFETY: lane < k/4 is the step helper's bound for step 0.
+            let (q0, d0, v0) = unsafe { q8_0_step(qs, d, xq, wq, wd, lane, 0) };
+            f = q8_0_word_dot(f, q0, d0, v0);
+        }
+        return f;
+    }
     let mut s = 0usize;
     while s + Q8_STEP_UNROLL <= steps {
         // SAFETY: s + 4 <= steps by the loop guard, so steps s .. s + 3 are
@@ -592,7 +609,7 @@ mod q8f32_kernels {
     )]
     pub fn q8_0_gemv(
         qs: &[u32],
-        d: &[f32],
+        d: &[u16],
         x: &[f32],
         n_rows: u32,
         k: u32,
@@ -687,16 +704,16 @@ impl Q8F32Kernels {
     }
 
     /// Enqueue `y = W · x` for a Q8_0 weight in the module doc's device
-    /// layout: `qs` `rows × k/4` u32 words and `d` `rows × k/32` f32 scales —
-    /// against `m` f32 activation columns of `k = d.cols() * 32` values each
-    /// (the scale buffer's width fixes k; `qs.cols()` must equal
+    /// layout: `qs` `rows × k/4` u32 words and `d` `rows × k/32` f16 scale
+    /// bits — against `m` f32 activation columns of `k = d.cols() * 32` values
+    /// each (the scale buffer's width fixes k; `qs.cols()` must equal
     /// `d.cols() * 8`). Output layout as `enqueue_f32_gemv`. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_q8_0_gemv(
         &self,
         stream: &CudaStream,
         qs: &DeviceTensor<u32>,
-        d: &DeviceTensor<f32>,
+        d: &DeviceTensor<u16>,
         x: &DeviceBuffer<f32>,
         m: usize,
         y: &mut DeviceBuffer<f32>,
@@ -774,13 +791,17 @@ mod tests {
     /// The single-column Q8_0 body sums every value of the row exactly once,
     /// for every k the launchers accept (a positive multiple of 32) up to two
     /// hoisted trips — every combination of trips, pair, single and partial
-    /// word — on the quad path and on the unaligned scalar path. The codes,
-    /// scales and activations are small integers, so every lane sum and the
+    /// word, and the one-word rows of at most 128 values — on the quad path
+    /// and on the unaligned scalar path. The codes, scales (f16 bits of 1, 2
+    /// and 3) and activations are small integers, so every lane sum and the
     /// total are exact in f32 whatever the order: a skipped or doubled value
     /// shows as a different integer.
     #[test]
     fn q8_0_1col_sums_each_value_once() {
         let code = |r: usize, v: usize| ((r * 131 + v * 37) % 255) as i32 - 127;
+        // Block b's scale, and its f16 bits: 1.0, 2.0 and 3.0.
+        let scale = |b: usize| (b % 3 + 1) as i64;
+        const F16_1_2_3: [u16; 3] = [0x3c00, 0x4000, 0x4200];
         for k in (32..=1024).step_by(32) {
             let rows = 3;
             let words = k / 4;
@@ -790,7 +811,7 @@ mod tests {
                     qs[r * words + v / 4] |= u32::from(code(r, v) as u8) << (8 * (v % 4));
                 }
             }
-            let d: Vec<f32> = (0..rows * k / 32).map(|b| (b % 3 + 1) as f32).collect();
+            let d: Vec<u16> = (0..rows * k / 32).map(|b| F16_1_2_3[b % 3]).collect();
             let x: Vec<f32> = (0..k + 8).map(|i| ((i * 7) % 17) as f32 - 8.0).collect();
             // The first element offset at which x is 16-byte aligned takes the
             // quad path; one past it, the scalar path.
@@ -799,7 +820,7 @@ mod tests {
                 for r in 0..rows {
                     let want: i64 = (0..k)
                         .map(|v| {
-                            i64::from(code(r, v)) * d[r * k / 32 + v / 32] as i64 * x[x0 + v] as i64
+                            i64::from(code(r, v)) * scale(r * k / 32 + v / 32) * x[x0 + v] as i64
                         })
                         .sum();
                     let got: f32 = (0..32)

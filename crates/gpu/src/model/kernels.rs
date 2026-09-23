@@ -7,7 +7,7 @@
 //! warp per output row, the row's head selecting both the activation
 //! slice it reads (an x base or a column of the quantized activation)
 //! and the output slot it writes, m = 1 through the gated row bodies
-//! (`q8f32::q8_0_lane_partials`, `cores::q3k_row_dot`) — so every dot
+//! (`q8f32::q8_0_lane_partial_1col`, `cores::q3k_row_dot`) — so every dot
 //! equals the plain gemv's on the same row and column bit for bit.
 //! Everything else runs the gated kernels verbatim.
 
@@ -25,7 +25,7 @@ use std::sync::Arc;
 mod step_kernels {
     use super::*;
     use crate::cores::q3k_row_dot;
-    use crate::q8f32::q8_0_lane_partials;
+    use crate::q8f32::q8_0_lane_partial_1col;
     use cuda_device::warp;
 
     /// `y[dst_idx[i]] = x[src_idx[i]]` for `i < n` — the f32 concat/extract
@@ -72,7 +72,7 @@ mod step_kernels {
     /// Q8_0 gemv over per-head activation slices: launch row `r` belongs to
     /// head `h = r / rows_per_head` and output slot `r % rows_per_head` of
     /// that head; it dots weight row `r` of the derived planes against
-    /// `x[h*x_head_stride .. +k]` (m = 1 through the gated row body, the
+    /// `x[h*x_head_stride .. +k]` (the gated single-column row body, the
     /// `q8_0_gemv` skeleton with one warp per row, 8 rows per 256-thread
     /// block), lane 0 storing `y[h*y_head_stride + y_off + r %
     /// rows_per_head]`. `n_rows` must be `n_heads * rows_per_head`; every
@@ -93,7 +93,7 @@ mod step_kernels {
     )]
     pub fn q8_0_gemv_heads(
         qs: &[u32],
-        d: &[f32],
+        d: &[u16],
         x: &[f32],
         n_rows: u32,
         k: u32,
@@ -118,11 +118,12 @@ mod step_kernels {
         }
         let j = row % rows_per_head as usize;
         let lane = warp::lane_id() as usize;
-        // SAFETY: the launch contract bounds the row's x window the way
-        // `q8_0_lane_partials` demands: x0 = h*x_head_stride <=
-        // (n_heads-1)*x_head_stride and x.len() >= x0 + k.
-        let f = q8_0_lane_partials(qs, d, x, k, row, h * x_head_stride as usize, 1, lane);
-        let s0 = warp::reduce_sum_f32(f[0]);
+        // The row body's caller contract: row < n_rows puts the row's words
+        // and scales inside qs and d (the contract's 4·qs.len() and 32·d.len()
+        // bounds), and h < n_heads bounds its x window, x0 = h*x_head_stride
+        // <= (n_heads-1)*x_head_stride with x.len() >= x0 + k.
+        let f = q8_0_lane_partial_1col(qs, d, x, k, row, h * x_head_stride as usize, lane);
+        let s0 = warp::reduce_sum_f32(f);
         if lane == 0 {
             // SAFETY: only lane 0 of the warp owning `row` writes; the slot
             // h*y_head_stride + y_off + j is inside y by the launch contract
@@ -303,7 +304,7 @@ pub struct StepKernels {
 /// the offset count f32 elements, `rows_per_head` weight rows.
 pub(crate) struct Q8_0GemvHeadsArgs<'a> {
     pub qs: &'a DeviceTensor<u32>,
-    pub d: &'a DeviceTensor<f32>,
+    pub d: &'a DeviceTensor<u16>,
     pub x: &'a DeviceBuffer<f32>,
     pub rows_per_head: usize,
     pub x_head_stride: usize,
@@ -391,7 +392,9 @@ impl StepKernels {
     /// head `h` reads `x[h*x_head_stride .. +k]`, m = 1 — with lane 0
     /// writing `y[h*y_head_stride + y_off + j]` for weight row
     /// `h*rows_per_head + j`. `d.rows()` must be a multiple of
-    /// `rows_per_head` (then `n_heads = d.rows() / rows_per_head`). Asynchronous,
+    /// `rows_per_head` (then `n_heads = d.rows() / rows_per_head`), and
+    /// `x_head_stride` a multiple of 4, so every head's slice starts 16-byte
+    /// aligned in `x` and the row body reads it in quads. Asynchronous,
     /// allocation-free, capturable.
     pub(crate) fn enqueue_q8_0_gemv_heads(
         &self,
@@ -440,6 +443,18 @@ impl StepKernels {
                 format!(
                     "n_rows={n_rows} is not a positive multiple of \
                  rows_per_head={rows_per_head}"
+                ),
+            ));
+        }
+        // A stride off the quad grid is not an error the kernel can see: the
+        // row body would take its scalar walk wherever a head's slice starts
+        // off the grid — the same sums at a quarter of the load width.
+        if !x_head_stride.is_multiple_of(4) {
+            return Err(GpuError::shape(
+                "enqueue_q8_0_gemv_heads",
+                format!(
+                    "x_head_stride={x_head_stride} is not a multiple of 4: a head's slice \
+                 would not start 16-byte aligned"
                 ),
             ));
         }

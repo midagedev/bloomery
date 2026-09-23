@@ -5,7 +5,7 @@
 use crate::GpuError;
 use crate::q5::Q8Blocks32;
 use crate::tensor::Q8Act;
-use crate::weights::DevWeight;
+use crate::weights::{DevWeight, resident_size};
 use cuda_core::CudaStream;
 use gguf::quant::GgmlType;
 
@@ -40,14 +40,17 @@ fn kq_row_bytes(ty: GgmlType, k: usize) -> Option<usize> {
 /// Bytes of `rows` rows of a resident weight in the layout its kernel
 /// addresses. The q5 rows are eight code words plus the block's scale
 /// (Q5_0) or scale and min (Q5_1) per 32 values — the `q_stride` window
-/// padding past the last block is allocated but never addressed.
+/// padding past the last block is allocated but never addressed. The q8_0
+/// planes are addressed whole, so theirs are the card format's own bytes.
 pub(crate) fn weight_bytes(w: &DevWeight, rows: usize) -> Option<usize> {
     let k = w.k();
     Some(match w {
         DevWeight::KQuant { ty, .. } => rows * kq_row_bytes(*ty, k)?,
         DevWeight::Q5_0 { .. } => rows * 36 * (k / 32),
         DevWeight::Q5_1 { .. } => rows * 40 * (k / 32),
-        DevWeight::Q8_0 { .. } | DevWeight::Q8_0Derived { .. } => rows * (k + 4 * (k / 32)),
+        DevWeight::Q8_0 { .. } | DevWeight::Q8_0Derived { .. } => {
+            resident_size(GgmlType::Q8_0, k, rows)?
+        }
         DevWeight::F32 { .. } => rows * k * 4,
     })
 }

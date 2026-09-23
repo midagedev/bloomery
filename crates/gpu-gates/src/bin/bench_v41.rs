@@ -57,6 +57,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod bench {
     use bloomery_gpu::probe::Probe;
+    use bloomery_gpu::weights::resident_size;
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, Q8Act};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, activations, bits_equal, bytes_to_words, checks_failed,
@@ -97,10 +98,12 @@ mod bench {
     /// and the graphs need room of their own.
     const VRAM_MARGIN: u64 = 1 << 30;
     /// `docs/v41-placement.md` §1: q8_0 tensors outside `engram_embd`, their
-    /// file bytes, and their bytes in the Q8_0 device planes.
+    /// file bytes, and their bytes in the Q8_0 device planes — the file's
+    /// bytes, since the scale plane keeps each block's f16 bits (the f16
+    /// scale plane column of §1's q8_0 row).
     const DOC_Q8_TENSORS: usize = 330;
     const DOC_Q8_FILE_BYTES: u64 = 7_264_010_240;
-    const DOC_Q8_DEVICE_BYTES: u64 = 7_691_304_960;
+    const DOC_Q8_DEVICE_BYTES: u64 = DOC_Q8_FILE_BYTES;
     /// The `hc_{attn,ffn}_fn` projections: q3_K, K = 4 streams × 5120, 24
     /// mix values per row, two per block.
     const HC_K: usize = 20_480;
@@ -446,8 +449,10 @@ mod bench {
         /// Bytes of one weight row in the device format.
         fn device_row_bytes(&self) -> usize {
             match self.kernel {
-                // k one-byte codes plus a f32 scale per 32 values.
-                Kernel::Q8 => self.k + self.k / 8,
+                // The loader's q8_0 card format: k one-byte codes plus an f16
+                // scale per 32 values.
+                Kernel::Q8 => resident_size(GgmlType::Q8_0, self.k, 1)
+                    .expect("every q8_0 site's k is a multiple of 32"),
                 Kernel::F32 => 4 * self.k,
                 _ => self.file_row_bytes(),
             }
@@ -608,7 +613,7 @@ mod bench {
     enum Weight {
         Q8 {
             qs: DeviceTensor<u32>,
-            d: DeviceTensor<f32>,
+            d: DeviceTensor<u16>,
         },
         F32(DeviceTensor<f32>),
         Words(DeviceTensor<u32>),
@@ -643,7 +648,8 @@ mod bench {
     enum Host {
         Q8 {
             qs: Vec<u32>,
-            d: Vec<f32>,
+            /// f16 bits, as the device plane holds them.
+            d: Vec<u16>,
         },
         F32(Vec<f32>),
         /// ggml block bytes, rows back to back.
@@ -722,9 +728,7 @@ mod bench {
             Kernel::Q8 => {
                 let mut qs = vec![0u32; rows * site.k / 4];
                 rng.fill_words(&mut qs);
-                let d = (0..rows * site.k / 32)
-                    .map(|_| half_to_f32(rng.scale_f16()))
-                    .collect();
+                let d = (0..rows * site.k / 32).map(|_| rng.scale_f16()).collect();
                 Host::Q8 { qs, d }
             }
             Kernel::F32 => Host::F32((0..rows * site.k).map(|_| rng.unit()).collect()),
@@ -780,7 +784,8 @@ mod bench {
             Host::Q8 { qs, d } => (0..k)
                 .map(|j| {
                     let code = (qs[row * k / 4 + j / 4] >> (8 * (j % 4))) as u8 as i8;
-                    f64::from(code) * f64::from(d[row * k / 32 + j / 32]) * f64::from(xs[j])
+                    let scale = half_to_f32(d[row * k / 32 + j / 32]);
+                    f64::from(code) * f64::from(scale) * f64::from(xs[j])
                 })
                 .sum(),
             Host::F32(w) => w[row * k..(row + 1) * k]

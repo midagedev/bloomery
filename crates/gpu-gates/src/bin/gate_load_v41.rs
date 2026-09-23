@@ -59,7 +59,6 @@ mod gate {
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
     use cuda_core::CudaStream;
     use gguf::Split;
-    use gguf::quant::half_to_f32;
     use model::arch::deepseek41::{kv::KvLayout, roles};
     use model::placement::host_lock::{HostLock, page_bytes};
     use model::placement::{
@@ -394,18 +393,12 @@ mod gate {
         pass && exact
     }
 
-    /// The device buffers a resident weight holds, in bytes.
+    /// The device buffers a resident weight holds, in bytes: measured from
+    /// the buffers themselves (`DevWeight::buffer_bytes`), never recomputed
+    /// from the format, so check 1 compares what was allocated with the
+    /// plan's arithmetic rather than that arithmetic with itself.
     fn buffers(dw: &DevWeight) -> Vec<u64> {
-        let words = |n: usize| n as u64 * 4;
-        match dw {
-            DevWeight::KQuant { w, .. } | DevWeight::Q5_0 { w, .. } | DevWeight::Q5_1 { w, .. } => {
-                vec![words(w.buf().len())]
-            }
-            DevWeight::Q8_0 { qs, d, .. } | DevWeight::Q8_0Derived { qs, d, .. } => {
-                vec![words(qs.buf().len()), words(d.buf().len())]
-            }
-            DevWeight::F32 { w, .. } => vec![words(w.buf().len())],
-        }
+        dw.buffer_bytes().into_iter().map(|b| b as u64).collect()
     }
 
     /// A read-back sample: a plan tensor, its card format and the experts the
@@ -449,14 +442,14 @@ mod gate {
     enum Planes {
         Words(Vec<u32>),
         F32(Vec<f32>),
-        Q8(Vec<u32>, Vec<f32>),
+        Q8(Vec<u32>, Vec<u16>),
     }
 
     /// The planes `format` makes of `bytes`, a run of whole rows of the file,
     /// packed from the file formats' definitions: a K-quant row stream as
-    /// little-endian words; a q8_0 block (f16 scale, 32 codes) as its scale in
-    /// f32 and its codes four to a little-endian word; f32 as is; bf16 as the
-    /// high half of an f32.
+    /// little-endian words; a q8_0 block (f16 scale, 32 codes) as its scale's
+    /// f16 bits and its codes four to a little-endian word; f32 as is; bf16 as
+    /// the high half of an f32.
     fn host_planes(format: CardFormat, bytes: &[u8]) -> Result<Planes, GateError> {
         Ok(match format {
             CardFormat::KQuant => Planes::Words(bytes_to_words(bytes)),
@@ -465,7 +458,7 @@ mod gate {
                 let mut qs = Vec::with_capacity(blocks.len() * 8);
                 let mut d = Vec::with_capacity(blocks.len());
                 for b in blocks {
-                    d.push(half_to_f32(u16::from_le_bytes([b[0], b[1]])));
+                    d.push(u16::from_le_bytes([b[0], b[1]]));
                     qs.extend(
                         b[2..]
                             .as_chunks::<4>()
@@ -534,15 +527,8 @@ mod gate {
             (Planes::F32(g), Planes::F32(w)) => {
                 (!bits_equal(g, w)).then(|| format!("{} vs {} f32 not bit-equal", g.len(), w.len()))
             }
-            (Planes::Q8(gq, gd), Planes::Q8(wq, wd)) => {
-                (gq != wq || !bits_equal(gd, wd)).then(|| {
-                    format!(
-                        "codes {} scales {}",
-                        verdict(gq == wq),
-                        verdict(bits_equal(gd, wd))
-                    )
-                })
-            }
+            (Planes::Q8(gq, gd), Planes::Q8(wq, wd)) => (gq != wq || gd != wd)
+                .then(|| format!("codes {} scales {}", verdict(gq == wq), verdict(gd == wd))),
             _ => Some("the resident variant is not the format's".to_string()),
         }
     }

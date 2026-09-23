@@ -66,19 +66,37 @@ fn run() -> Result<(), GateError> {
         all_ok &= report("f32", 2048, 64, m, rel, bit_same, BAND);
     }
 
-    // F32, synthetic shape (K=512, rows=1000): weights from the shared LCG.
-    let w_synth = bloomery_gpu_gates::activations(512 * 1000, 1, 5);
-    let w_synth_dev = DeviceTensor::upload(stream, &w_synth, 1000, 512)?;
-    for m in [1usize, 8] {
-        let x = bloomery_gpu_gates::activations(512, m, 11);
-        let y_ref = ref_f64_dot(&w_synth, 512, &x, m);
-        let (rel, bit_same) = run_f32(&kernels, stream, &w_synth_dev, 1000, m, &x, &y_ref)?;
-        all_ok &= report("f32", 512, 1000, m, rel, bit_same, BAND);
+    // F32, synthetic shapes: weights from the shared LCG. K = 512 is whole
+    // hoisted trips (`LANE_UNROLL` chunks each); 480 and 992 (15 and 31
+    // chunks) end in the single-column body's one-chunk tail, and their row
+    // counts leave the last block short.
+    for (k, rows, w_seed, x_seed) in [
+        (512usize, 1000usize, 5u32, 11u32),
+        (480, 100, 25, 27),
+        (992, 100, 29, 31),
+    ] {
+        let w_synth = bloomery_gpu_gates::activations(k * rows, 1, w_seed);
+        let w_synth_dev = DeviceTensor::upload(stream, &w_synth, rows, k)?;
+        for m in [1usize, 8] {
+            let x = bloomery_gpu_gates::activations(k, m, x_seed);
+            let y_ref = ref_f64_dot(&w_synth, k, &x, m);
+            let (rel, bit_same) = run_f32(&kernels, stream, &w_synth_dev, rows, m, &x, &y_ref)?;
+            all_ok &= report("f32", k, rows, m, rel, bit_same, BAND);
+        }
     }
 
     // Q8_0: weights quantized here from LCG rows, reference = the
-    // dequantized rows dotted in f64.
-    for (k, rows, w_seed, x_seed) in [(128usize, 3072usize, 7u32, 13u32), (2048, 64, 9, 15)] {
+    // dequantized rows dotted in f64. At m = 1 each K takes its own path
+    // through the single-column body: 128 the one-word row, 2048 whole
+    // trips of four 128-value steps, 480 (three steps and 96 values) a pair,
+    // a single and the partial word, 992 (seven steps and 96 values) a trip,
+    // a pair, a single and the partial word in one row.
+    for (k, rows, w_seed, x_seed) in [
+        (128usize, 3072usize, 7u32, 13u32),
+        (2048, 64, 9, 15),
+        (480, 100, 17, 19),
+        (992, 100, 21, 23),
+    ] {
         let src = bloomery_gpu_gates::activations(k * rows, 1, w_seed);
         let mut qs_words = Vec::with_capacity(rows * k / 4);
         let mut d_scales = Vec::with_capacity(rows * k / 32);
@@ -168,7 +186,7 @@ fn run_q8(
     kernels: &bloomery_gpu::q8f32::Q8F32Kernels,
     stream: &cuda_core::CudaStream,
     qs: &bloomery_gpu::DeviceTensor<u32>,
-    d: &bloomery_gpu::DeviceTensor<f32>,
+    d: &bloomery_gpu::DeviceTensor<u16>,
     rows: usize,
     m: usize,
     x: &[f32],
@@ -285,17 +303,18 @@ fn nearest_int(fval: f32) -> i32 {
 /// ggml `quantize_row_q8_0` x86 branch, as the engine's load-time requant
 /// runs it: `d = amax/127` stored as f16, `id = 127/amax` (a different f32
 /// than `1/d`), codes `nearest_int(v*id)` clamped to [-128, 127]. Appends
-/// one row's device layout (k/4 u32 words, k/32 f32 scales) and the
+/// one row's device layout (k/4 u32 words, k/32 f16 scale bits) and the
 /// dequantized reference row (k values of `q as f32 * scale` — the exact
-/// bits the kernel reconstructs).
+/// bits the kernel reconstructs, its scale widened from the stored f16).
 #[cfg(feature = "gpu")]
-fn quant_q8_0_row(x: &[f32], qs: &mut Vec<u32>, d: &mut Vec<f32>, deq: &mut Vec<f32>) {
+fn quant_q8_0_row(x: &[f32], qs: &mut Vec<u32>, d: &mut Vec<u16>, deq: &mut Vec<f32>) {
     for blk in x.as_chunks::<32>().0 {
         let mut amax = 0.0f32;
         for &v in blk {
             amax = amax.max(v.abs());
         }
-        let scale = half_to_f32(f32_to_f16_bits(amax / 127.0));
+        let bits = f32_to_f16_bits(amax / 127.0);
+        let scale = half_to_f32(bits);
         let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
         let mut word = [0u32; 8];
         for (j, &v) in blk.iter().enumerate() {
@@ -304,7 +323,7 @@ fn quant_q8_0_row(x: &[f32], qs: &mut Vec<u32>, d: &mut Vec<f32>, deq: &mut Vec<
             deq.push(q as f32 * scale);
         }
         qs.extend_from_slice(&word);
-        d.push(scale);
+        d.push(bits);
     }
 }
 

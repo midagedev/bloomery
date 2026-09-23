@@ -32,9 +32,9 @@
 //!    `KERNEL_BAND` — a resident plane with a wrong 2-D shape runs the
 //!    wrong k over the wrong row count and cannot pass.
 //! 7. Derived parity: layer 1's resident derived q_nope2, read back, is the
-//!    CPU crate's `Derived` blocks byte for byte (the f16 scale <-> f32
-//!    plane round trip is bijective, so plane-bits equality is block-bytes
-//!    equality).
+//!    CPU crate's `Derived` blocks byte for byte (the scale plane holds each
+//!    block's f16 bits and the code plane its codes, so plane equality is
+//!    block-bytes equality).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -124,12 +124,15 @@ fn run() -> Result<(), GateError> {
     for (ty, (c, fb, rb)) in &per_ty {
         println!("census ty={ty} tensors={c} file_bytes={fb} resident_bytes={rb}");
     }
-    // The derived q_nope2 planes are no file tensors: 36 resident bytes per
-    // Q8_0 block (8 code words + 1 f32 scale).
+    // The derived q_nope2 planes are no file tensors: the q8_0 card format's
+    // bytes at the MLA geometry, rows = n_head·latent of k = nope.
     let derived = Derived::new(&gguf)?;
-    let derived_total: usize = (0..n_layers)
-        .map(|l| derived.wk_b_all_heads(l).map(|b| b.len() * 36).unwrap_or(0))
-        .sum();
+    let mut derived_total = 0usize;
+    for l in 0..n_layers {
+        let p = &derived.block_plan(l)?.attn.params;
+        derived_total += resident_size(GgmlType::Q8_0, p.nope, p.n_head * p.latent)
+            .ok_or_else(|| format!("gate_p10: derived.blk.{l}.q_nope2 has no q8_0 layout"))?;
+    }
     println!(
         "census ty=derived_q_nope2 tensors={n_layers} file_bytes=0 resident_bytes={derived_total}"
     );
@@ -208,8 +211,8 @@ fn run() -> Result<(), GateError> {
                 let d_got = d.buf().to_host_vec(stream)?;
                 (
                     "derived_q_nope2".to_string(),
-                    qs_want.len() as u64 * 4 + d_want.len() as u64 * 4,
-                    qs_got == qs_want && bits_equal(&d_got, &d_want),
+                    (size_of_val(qs_want.as_slice()) + size_of_val(d_want.as_slice())) as u64,
+                    qs_got == qs_want && d_got == d_want,
                     None,
                 )
             }
@@ -224,8 +227,8 @@ fn run() -> Result<(), GateError> {
         e.2 &= same;
         // 5. derived parity, block level, on layer 1's read-back: ggml's
         // Q8_0 block bytes are the f16 scale bits plus the 32 codes, and
-        // both map to the planes bijectively (every f16 is exact in f32),
-        // so plane-bits equality is block-bytes equality.
+        // the planes hold both as they are, so plane equality is
+        // block-bytes equality.
         if name == bloomery_gpu::arch::deepseek2::derived_name(1) {
             let DevWeight::Q8_0Derived { qs, d, .. } = dw else {
                 return Err(format!("gate_p10: {name}: not the derived variant").into());
@@ -235,7 +238,7 @@ fn run() -> Result<(), GateError> {
             let blocks = derived.wk_b_all_heads(1)?;
             let (mut codes, mut scales) = (true, true);
             for (i, b) in blocks.iter().enumerate() {
-                scales &= d_got[i].to_bits() == half_to_f32(b.d).to_bits();
+                scales &= d_got[i] == b.d;
                 for j in 0..32 {
                     codes &= (qs_got[i * 8 + j / 4] >> (8 * (j % 4))) as u8 == b.q[j] as u8;
                 }
@@ -460,7 +463,7 @@ fn tensor_rows(dims: &[u64]) -> usize {
 enum HostPlanes {
     Words(Vec<u32>),
     F32(Vec<f32>),
-    Q8(Vec<u32>, Vec<f32>),
+    Q8(Vec<u32>, Vec<u16>),
 }
 
 #[cfg(feature = "gpu")]
@@ -501,9 +504,9 @@ fn expected_planes(
 
 /// The q8f32 two-plane transcription of Q8_0 blocks, written here from the
 /// `Q8Block` fields so the read-back has an anchor the loader does not
-/// share: code j in word j/4 byte j%4, scale = the block's f16 as f32.
+/// share: code j in word j/4 byte j%4, scale = the block's f16 bits.
 #[cfg(feature = "gpu")]
-fn gate_q8_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
+fn gate_q8_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
     let mut qs = Vec::with_capacity(blocks.len() * 8);
     let mut d = Vec::with_capacity(blocks.len());
     for b in blocks {
@@ -512,7 +515,7 @@ fn gate_q8_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<f32>) {
             w[j / 4] |= u32::from(q as u8) << (8 * (j % 4));
         }
         qs.extend_from_slice(&w);
-        d.push(half_to_f32(b.d));
+        d.push(b.d);
     }
     (qs, d)
 }
@@ -1105,9 +1108,9 @@ fn kid_f32(
 fn kid_q8_derived(
     t: &Table<'_>,
     rqs: &DeviceTensor<u32>,
-    rd: &DeviceTensor<f32>,
+    rd: &DeviceTensor<u16>,
     qs_ref: &DeviceTensor<u32>,
-    d_ref: &DeviceTensor<f32>,
+    d_ref: &DeviceTensor<u16>,
     geom: GemvGeom,
 ) -> Result<(bool, bool, Vec<u32>), GateError> {
     let Table {
@@ -1138,7 +1141,7 @@ fn kid_q8_derived(
     let x = activations(k, m, seed);
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
     let run = |qs: &DeviceTensor<u32>,
-               d: &DeviceTensor<f32>,
+               d: &DeviceTensor<u16>,
                y: &mut DeviceBuffer<f32>|
      -> Result<(), bloomery_gpu::GpuError> {
         q8f32.enqueue_q8_0_gemv(stream, qs, d, &x_dev, m, y)

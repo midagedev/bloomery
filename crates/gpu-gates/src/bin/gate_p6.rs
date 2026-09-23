@@ -631,7 +631,8 @@ fn eat(mut h: u64, bytes: &[u8]) -> u64 {
 /// general body and is pinned beside it on a floor of its own: its
 /// single-column body (`q8f32::q8_0_lane_partial_1col`) walks whole code
 /// words, four multiply-adds per word, so a body that hoists fewer steps
-/// than it is written for shows fewer.
+/// than it is written for shows fewer. `q8_0_gemv_heads` runs that
+/// single-column body alone and is pinned on the same words.
 #[cfg(feature = "gpu")]
 fn router_shape() -> Result<bool, GateError> {
     use bloomery_gpu::q8f32::{LANE_UNROLL, Q8_STEP_UNROLL};
@@ -649,14 +650,18 @@ fn router_shape() -> Result<bool, GateError> {
     let f32_fma_floor = GEMV_COLS + LANE_UNROLL;
     /// Words the Q8_0 single-column body spells out besides its hoisted
     /// steps: a hoisted pair (two), a single step, the partial word of a k
-    /// not a multiple of 128, and the one-word walk of unaligned activations.
-    const Q8_OTHER_WORDS: usize = 5;
+    /// not a multiple of 128, the one word of a row of at most 128 values,
+    /// and the one-word walk of unaligned activations.
+    const Q8_OTHER_WORDS: usize = 6;
     // The Q8_0 floor counts every word that body spells out, four
     // multiply-adds each, on top of the general body's columns.
-    // PIN(2026-09-23): 8 + 4·(4 + 5) = 44, the word-walk body's own count;
-    // the same source with its main loop cut to one step a trip printed
-    // fma=32 and failed.
+    // PIN(2026-09-23): 8 + 4·(4 + 6) = 48 with the one-word short-row path in the body; the same source without its partial word printed fma=44 and failed.
     let q8_fma_floor = GEMV_COLS + 4 * (Q8_STEP_UNROLL + Q8_OTHER_WORDS);
+    // The per-head wrapper calls the single-column body and nothing else —
+    // m = 1 is its only shape — so its floor is that body's words alone,
+    // without the general body's columns.
+    // PIN(2026-09-23): 4·(4 + 6) = 40, the heads entry's own count; the same source without the body's partial word printed fma=36 and failed.
+    let heads_fma_floor = 4 * (Q8_STEP_UNROLL + Q8_OTHER_WORDS);
 
     let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
     let modules = bloomery_gpu_gates::ptx::modules(&bundles);
@@ -671,6 +676,11 @@ fn router_shape() -> Result<bool, GateError> {
             "q8_0_gemv",
             q8_fma_floor,
             format!("cols={GEMV_COLS} + 4*(Q8_STEP_UNROLL={Q8_STEP_UNROLL} + {Q8_OTHER_WORDS})"),
+        ),
+        (
+            "q8_0_gemv_heads",
+            heads_fma_floor,
+            format!("4*(Q8_STEP_UNROLL={Q8_STEP_UNROLL} + {Q8_OTHER_WORDS})"),
         ),
     ];
     for (name, floor, derivation) in floors {
