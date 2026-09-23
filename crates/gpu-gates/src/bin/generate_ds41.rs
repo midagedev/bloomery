@@ -375,6 +375,19 @@ mod drive {
             if pin_main { "on" } else { "off" },
             t.elapsed().as_secs_f64()
         );
+        if let Some(h) = m.host_residency() {
+            match h.populated() {
+                Some(w) => println!(
+                    "host_populate={} in {:.1} s (runtime value)",
+                    w.bytes(),
+                    w.wall().as_secs_f64()
+                ),
+                None => println!("host_populate=off"),
+            }
+            if let Some(l) = h.lock() {
+                println!("host_lock={} B", l.bytes());
+            }
+        }
         if a.mode == StepMode::Graph {
             // Captured before the prompt, so the first timed step is a replay.
             println!("capture graph_nodes={}", m.capture_step()?);
@@ -411,7 +424,7 @@ mod drive {
         let card = &plan.cards[0];
         println!(
             "plan place={} card={} ctx_max={} card_experts={} ({} B) host_experts={} ({} B) \
-             n_l={}..{} on {} layers",
+             n_l={}..{} on {} layers card_budget={}",
             place.name(),
             machine.cards[0].name,
             plan.ctx_max,
@@ -421,7 +434,9 @@ mod drive {
             plan.host.expert_bytes,
             held.iter().min().copied().unwrap_or(0),
             held.iter().max().copied().unwrap_or(0),
-            held.len()
+            held.len(),
+            plan.card_budget
+                .map_or_else(|| "none".to_string(), |b| b.to_string())
         );
         Ok(())
     }

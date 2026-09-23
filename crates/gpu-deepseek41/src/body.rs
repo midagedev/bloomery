@@ -50,6 +50,7 @@
 //! consistently with each other.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, SlotMap, levers};
@@ -309,8 +310,9 @@ pub struct Body {
     rows: StepRows,
     /// The tokens decoded so far, one per position: `ctx_max` reserved.
     history: Vec<u32>,
-    /// The file, for the tensors the plan leaves on the host.
-    file: Split,
+    /// The file, for the tensors the plan leaves on the host: the one
+    /// mapping the host tier reads and the load populated.
+    file: Arc<Split>,
     eps: f32,
 }
 
@@ -1300,10 +1302,8 @@ impl ChainBody for Body {
             levers()?.overlap,
             PAIR_ROWS,
         )?;
-        let first = file
-            .shard_path(0)
-            .ok_or_else(|| refuse("the file has no shard 0".into()))?;
-        let host = Ds41Host::build(Split::open(first)?, hp, layers.clone())?;
+        let file = Arc::new(file);
+        let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone())?;
         let hybrid = Hybrid::new(boundary, host, layers.len())?;
 
         Ok(Body {

@@ -54,6 +54,7 @@
 //! enqueue looks each up and checks its format.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::hybrid::{Boundary, HOST, HostExperts, Hybrid, SlotMap};
@@ -1325,7 +1326,7 @@ fn q8act_bytes(a: &Q8Act) -> usize {
 /// stacks as [`HostLayer`] reads them from the file, and the scratch every
 /// call writes, made at load.
 pub struct Ds41Host {
-    file: Split,
+    file: Arc<Split>,
     /// Per layer of `layers`, its host view; `None` for a layer that does
     /// not route.
     layers: Vec<Option<HostLayer>>,
@@ -1335,8 +1336,15 @@ pub struct Ds41Host {
 
 impl Ds41Host {
     /// The tier for layers `layers` of `file`, whose hyperparameters are
-    /// `hp`. Load-time only: every stack is found and checked here.
-    pub fn build(file: Split, hp: &Hparams, layers: Range<usize>) -> Result<Ds41Host, GpuError> {
+    /// `hp`. Load-time only: every stack is found and checked here. A body
+    /// passes its own mapping, so the pages its load populated are the ones
+    /// the step reads.
+    pub fn build(
+        file: impl Into<Arc<Split>>,
+        hp: &Hparams,
+        layers: Range<usize>,
+    ) -> Result<Ds41Host, GpuError> {
+        let file = file.into();
         let first = layers.start;
         let views = layers
             .map(|l| host::layer(&file, hp, l))
