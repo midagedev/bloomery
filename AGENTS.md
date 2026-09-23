@@ -407,6 +407,13 @@ page cache but not the step threads' page tables — the single-mapping round cl
 cache; on, each segment's pages are dropped right after its upload, inward-rounded, `token_embd` and
 the engram table excepted — with a 196 GB host set and 48 GB of cards the machine's 264 GB does not
 hold both, measured: populate then failed residency by 846 pages),
+`BLOOMERY_ENGRAM_HELPER=0` (gpu-deepseek41 `StepRows`: the step thread reads the engram rows from
+the mapping itself instead of the helper thread, which advises every row (`WILLNEED`, one batch),
+copies them and hands them back while the step thread reads the embedding row; the helper pins to
+the SMT sibling of a pinned caller's core and floats otherwise; read once at open; with
+`BLOOMERY_STEP_STATS=1` the step line adds `eng_warm eng_cold eng_direct eng_wait_us eng_helper_us
+eng_classify_us` and the summary `eng_helper=`; cold rows 11–15× faster, all-warm rows tens of µs
+slower — the row-hit check that removes that tax is queued),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
