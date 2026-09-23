@@ -6,7 +6,8 @@
 
 use gguf::Split;
 
-use super::{meta_u64, meta_usize};
+use super::hparams::Hparams;
+use super::names;
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
 
 /// How a rule matches the part of a name after `blk.N.`.
@@ -61,11 +62,9 @@ fn role(name: &str) -> Option<(Role, Option<usize>)> {
 }
 
 /// Every tensor of `split` with its role and header facts, and the model's
-/// layer and expert counts.
+/// layer and expert counts from [`Hparams`].
 pub fn classify(split: &Split) -> Result<ModelTensors, PlacementError> {
-    let layers = meta_usize(split, "block_count")?;
-    let experts = meta_u64(split, "expert_count")?;
-    let experts_used = meta_u64(split, "expert_used_count")?;
+    let hp = Hparams::read(split)?;
     let mut tensors = Vec::with_capacity(split.tensor_count());
     let mut unclassified = Vec::new();
     for (shard, t) in split.iter_tensors() {
@@ -94,9 +93,9 @@ pub fn classify(split: &Split) -> Result<ModelTensors, PlacementError> {
     }
     Ok(ModelTensors {
         tensors,
-        layers,
-        experts,
-        experts_used,
+        layers: hp.n_layer,
+        experts: hp.experts.n_expert as u64,
+        experts_used: hp.experts.n_used as u64,
     })
 }
 
@@ -111,7 +110,7 @@ fn gathered_rows(split: &Split, t: &ModelTensor) -> Result<Option<u64>, Placemen
     match (t.role, t.layer) {
         (Role::TokenEmbedding, _) => Ok(Some(1)),
         (Role::EngramTable, Some(layer)) => {
-            let wkv = format!("blk.{layer}.engram_wkv.weight");
+            let wkv = names::engram_wkv(layer);
             let Some((_, w)) = split.find(&wkv) else {
                 return Err(refuse(format!("its layer has no {wkv}")));
             };

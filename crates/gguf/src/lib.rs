@@ -309,6 +309,17 @@ impl Gguf {
         self.value(&key).and_then(Value::as_str)
     }
 
+    /// `<architecture>.<suffix>` as an array's items — same prefixing, for the
+    /// per-layer tables (`attention.compress_ratios`, `swiglu_clamp_exp`).
+    pub fn arch_get_arr(&self, suffix: &str) -> Option<&[Value]> {
+        let arch = self.architecture()?;
+        let key = format!("{arch}.{suffix}");
+        match self.value(&key) {
+            Some(Value::Array(items)) => Some(items),
+            _ => None,
+        }
+    }
+
     /// Typed getters for the stage-1 hyperparameters (see [`Gguf::arch_get_u64`]).
     pub fn block_count(&self) -> Option<u64> {
         self.arch_get_u64("block_count")
@@ -558,6 +569,11 @@ impl Split {
     /// [`Gguf::arch_get_str`] of the first shard.
     pub fn arch_get_str(&self, suffix: &str) -> Option<&str> {
         self.shards[0].arch_get_str(suffix)
+    }
+
+    /// [`Gguf::arch_get_arr`] of the first shard.
+    pub fn arch_get_arr(&self, suffix: &str) -> Option<&[Value]> {
+        self.shards[0].arch_get_arr(suffix)
     }
 }
 

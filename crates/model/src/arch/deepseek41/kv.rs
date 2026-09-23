@@ -9,12 +9,13 @@
 //! r latent rows in f32, twice (values and scores). The layers that read a
 //! source's stream hold none of it.
 //!
-//! The window and every layer's ratio are also what the step plan
-//! ([`super::plan`]) is laid out from; this is the one reader of those keys.
+//! The window and every layer's ratio come from [`Hparams`];
+//! [`KvLayout::window`] and [`KvLayout::ratios`] hand them on.
 
-use gguf::{Split, Value};
+use gguf::Split;
 
-use super::{meta_u64, meta_usize};
+use super::hparams::Hparams;
+use super::names;
 use crate::placement::{KvBytes, PlacementError};
 
 const F16_BYTES: u64 = 2;
@@ -39,27 +40,20 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// The window from `attention.sliding_window`, the latent width from
-    /// `attn_kv`'s output dim (one width on every layer), every layer's ratio
-    /// from `attention.compress_ratios` (which must cover every layer, as the
-    /// port's loader requires), the sources from the tensors and each
-    /// source's index key width from `indexer.attn_k`'s output dim; a missing
-    /// key or tensor is an error naming it.
+    /// The window from [`Hparams::window`], the latent width from `attn_kv`'s
+    /// output dim (one width on every layer), every layer's ratio from
+    /// [`LayerKind::ratio`](super::hparams::LayerKind::ratio)
+    /// (`attention.compress_ratios` must cover every layer), the sources from
+    /// the layers that own a compressor, each with its index key width from
+    /// `indexer.attn_k`'s output dim; a missing key or tensor is an error
+    /// naming it.
     pub fn from_file(split: &Split) -> Result<KvLayout, PlacementError> {
-        let layers = meta_usize(split, "block_count")?;
-        let window = meta_u64(split, "attention.sliding_window")?;
-        let ratios_key = split.arch_key("attention.compress_ratios");
-        let Some(Value::Array(ratios)) = split.value(&ratios_key) else {
-            return Err(PlacementError::Metadata {
-                key: ratios_key,
-                detail: "is absent or not an array".to_string(),
-            });
-        };
+        let hp = Hparams::read(split)?;
         let mut latent = None;
-        let mut layer_ratios = Vec::with_capacity(layers);
-        let mut sources = Vec::with_capacity(layers);
-        for l in 0..layers {
-            let kv_name = format!("blk.{l}.attn_kv.weight");
+        let mut ratios = Vec::with_capacity(hp.n_layer);
+        let mut sources = Vec::with_capacity(hp.n_layer);
+        for (l, kind) in hp.layers.iter().enumerate() {
+            let kv_name = names::attn_kv(l);
             let width = out_dim(split, &kv_name)?;
             if let Some(first) = latent.filter(|&w| w != width) {
                 return Err(PlacementError::Tensor {
@@ -68,33 +62,21 @@ impl KvLayout {
                 });
             }
             latent = Some(width);
-            let ratio = ratios.get(l).and_then(Value::as_unsigned).ok_or_else(|| {
-                PlacementError::Metadata {
-                    key: ratios_key.clone(),
-                    detail: format!("has no ratio for layer {l}"),
-                }
-            })?;
-            layer_ratios.push(ratio);
-            if split
-                .find(&format!("blk.{l}.attn_compressor_kv.weight"))
-                .is_none()
-            {
+            ratios.push(u64::from(kind.ratio()));
+            let Some(stream) = kind.compressor.and(kind.stream) else {
                 sources.push(None);
                 continue;
-            }
-            if ratio == 0 {
-                return Err(PlacementError::Metadata {
-                    key: ratios_key.clone(),
-                    detail: format!("has no ratio above 0 for layer {l}, which sources a stream"),
-                });
-            }
-            let index_key = out_dim(split, &format!("blk.{l}.indexer.attn_k.weight"))?;
-            sources.push(Some(Source { ratio, index_key }));
+            };
+            let index_key = out_dim(split, &names::indexer_attn_k(l))?;
+            sources.push(Some(Source {
+                ratio: u64::from(stream.ratio),
+                index_key,
+            }));
         }
         Ok(KvLayout {
-            window,
+            window: hp.window as u64,
             latent: latent.unwrap_or(0),
-            ratios: layer_ratios,
+            ratios,
             sources,
         })
     }
