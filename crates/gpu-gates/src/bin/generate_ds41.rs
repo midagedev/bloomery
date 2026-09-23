@@ -405,9 +405,18 @@ mod drive {
             probes.reserve_exact(a.n_gen);
             probes.push(Probe::read(m)?);
         }
+        // `BLOOMERY_STEP_PAIR=1`: every step is one skewed two-row pass whose
+        // draft is the previous pass's row-A argmax, accepted unconditionally —
+        // a timing arm (two positions per `time` row), not a decode.
+        let pair = std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1");
+        let mut draft = next;
         for _ in 1..a.n_gen {
             let t0 = Instant::now();
-            next = m.step(&[next])?;
+            if pair {
+                [draft, next] = m.step_pair(next, draft)?;
+            } else {
+                next = m.step(&[next])?;
+            }
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             rows.push((m.pos() - 1, next, ms));
             if stats_on {
