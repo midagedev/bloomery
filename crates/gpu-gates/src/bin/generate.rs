@@ -288,7 +288,11 @@ fn run() -> Result<(), GateError> {
         AnyEngine::Deepseek2(m) => m,
         #[cfg(feature = "deepseek41")]
         AnyEngine::Deepseek41(_) => {
-            return Err("generate: drives the deepseek2 chain; the file is deepseek41".into());
+            return Err(
+                "generate: drives the deepseek2 chain; the file is deepseek41, \
+                        whose driver is generate_ds41 (just gen-ds41)"
+                    .into(),
+            );
         }
     };
     model.set_mode(mode);

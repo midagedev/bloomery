@@ -27,9 +27,29 @@
 #                   changes nothing the graph computes; the dump faults in what it touches
 #   ref_step_variant  the decode-step variants, below
 #
-# Deliberately unset: IK_BEST_FLAGS, IK_GPU_FLAGS and REF_PROMPTS. No flag sweep and no prompt set
-# exist for this model, and every script that reads them runs under `set -u`, so such a script
-# stops at the unset name instead of running ik at flags nobody measured.
+#   IK_GPU_FLAGS    ik's decode on the timing card, placed to mirror design §5 (a) (depth-ds41.sh reads
+#                   it): every layer offloaded, and the routed experts of the first 34 layers on the
+#                   CPU, the last 6 layers' whole on the card. Plan (a) keeps a prefix of every
+#                   layer's experts on the A6000 — 2,414 experts, 40,490,311,680 B
+#                   (crates/model/tests/placement.rs) — and ik moves a layer's 384 experts as one
+#                   tensor, so the closest it has is whole layers: 6 × 384 = 2,304 experts [derived, at
+#                   plan (a)'s bytes per expert]; a 7th layer does not fit beside the dense weights [derived:
+#                   7 × 6.44 GB of experts + 8.15 GB dense > the card's 48,592 MiB].
+#                   The expected host work per token is the same (about 204 routed expert products,
+#                   ours about 202 [derived]). -t 32 is llama-bench's own default, spelled out;
+#                   --defer-experts skips the loader's MAP_POPULATE of a file set larger than the page
+#                   cache. No flag sweep has been run: these are "at these flags".
+#                   Known not to load today: with -ngl 999 the loader puts the whole host
+#                   context (the 34 layers' experts and the engram tables, about 400 GiB) in one
+#                   CUDA_Host buffer instead of the mmap branch, and the pinned allocation fails
+#                   (`ggml_cuda_host_malloc: mmap of 410412.18 MiB failed`); GGML_CUDA_NO_PINNED=1
+#                   would malloc the same bytes on a 256 GB box. `llama-perplexity -ngl 0` opens the
+#                   same file by mmap, so the split is between -ngl 0 and -ngl > 0 or in llama-bench's
+#                   own override path; until that is found depth-ds41.sh's ik arms fail at load
+#
+# Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
+# this model, and every script that reads them runs under `set -u`, so such a script stops at the
+# unset name instead of running ik at flags nobody measured.
 #
 # SC2034: every name here is read by the file that sources this one, which shellcheck does not
 # see from this file alone.
@@ -37,6 +57,7 @@
 MODEL_NAME=deepseek41
 : "${IK:=/home/user/ik-idxkey}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}
+: "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe 34 -t 32 --defer-experts}"
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_deepseek41}"
 : "${REF_SET_CUDA:=ref_cuda_deepseek41}"

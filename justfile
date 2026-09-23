@@ -658,6 +658,24 @@ run-ds41-greedy PROMPT='0':
 run-ds41-ppl TAG:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_deepseek41_step --ppl {{TAG}}'
 
+# V4.1 decode CLI, functional run (no timing): generate_ds41 feeds the prompt one real step per id, then greedy
+# -n tokens, and prints them. The recipe loads the step gate's placement on the 3090 (--place gate), so its tokens
+# are comparable with run-ds41-greedy's; later arguments override it (a flag given twice takes its last value) —
+# `BLOOMERY_CARD=a6000 just gen-ds41 --place a …` loads the serving placement (a) on the A6000. 3090, gate lock.
+gen-ds41 *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/gpu-gate.sh generate_ds41 --place gate {{ARGS}}'
+
+# The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
+# around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
+time-gpu-ds41 *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
+
+# V4.1 decode by depth, both engines in one lease on the A6000 (lead-only): our arms `<D>` (generate_ds41 --depth D,
+# placement (a)) and ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS), alternated, rounds rotated.
+# tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
+depth-gpu-ds41 *ARMS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/depth-ds41.sh {{ARMS}}'
+
 # ik KLD 기준 파일 둘을 위치마다 비교한다(P = A, Q = B, 태그는 $BLOOMERY_DATA/ikppl 아래, 호스트만).
 # ARGS: --ubatch N(여러 번 줄 수 있다), --ik <ik-ppl --kld 태그>(ik가 찍은 요약과 밴드 안에서 맞는지).
 kld-diff A B *ARGS:
