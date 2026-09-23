@@ -614,9 +614,10 @@ flowchart LR
 ## 공개 (사용자 09-24 "빨리 공개 수준으로 올려서 이슈화하고 싶어")
 
 - **M1 숫자 공개(이번 주)**: 실제 텍스트 헤드라인 + 드래프트 켠 값(자리 8·9), 카드 크기 곡선 24/38/41 GB(E21·E21b), ik 같은 창 비교; rig-log 글(영어 요약 + 한국어 본문) + 30초 영상(드라이브); 공개 전 스크럽(BMC·사설 주소·호스트명·bug-report 아카이브 grep); "우리가 아는 한 V4.1 Flash를 CPU expert 오프로딩으로 돌리는 유일한 Rust 엔진(커널까지 Rust)" 주장은 글 쓰는 날 mistral.rs·candle 등에서 재확인해 "as far as we know"로. 결정 대기: 라이선스(추천 Apache-2.0), M1 시점 레포 공개 여부(추천: 공개, README에 numbers first / CLI in progress).
-- **비행 중(09-24 07:45~, M2 병렬)**: `tok`(토크나이저 크레이트, llama-tokenize 오라클 게이트) ‖ `sampler`(샘플링 크레이트, ik llama-sampling 순서) ‖ `serve`(llama-server 호환 API — `/completion`·`/v1/chat/completions`·`/tokenize`·`/detokenize`·`/props`·`/metrics`, `timings` 필드로 벤치 클라이언트(toktape 등) 호환; `Engine` 트레이트 + mock 엔진 게이트) ‖ `readme`(README·BUILD·HARDWARE·LICENSE Apache-2.0·CONTRIBUTING, 박스 0회). 남은 M2: 실제 엔진 바인딩(`GpuModel` + 토크나이저 + 샘플러 → `bloomery-serve`/`bloomery-chat` 바이너리, 넷이 착륙한 뒤 한 라운드), soak 30분.
+- **비행 중(09-24 07:45~, M2 병렬)**: `tok`(토크나이저 크레이트, llama-tokenize 오라클 게이트) ‖ `sampler`(샘플링 크레이트, ik llama-sampling 순서) ‖ `serve`(llama-server 호환 API — `/completion`·`/v1/chat/completions`·`/tokenize`·`/detokenize`·`/props`·`/metrics`, `timings` 필드로 벤치 클라이언트(toktape 등) 호환; `Engine` 트레이트 + mock 엔진 게이트) ‖ ~~`readme`~~(머지 `1f1b3dd` — README(조건 단 측정표·같은 창 ik·타겟·검증·한계·업스트림), docs/BUILD.md·HARDWARE.md·CONTRIBUTING.md 신설; 리드 정정: LICENSE는 **MIT 유지**(Apache-2.0 전환은 사용자 결정 대기, 크레이트 `license` 열 곳도 함께), 개발기 RAM 264, #1314 머지됨, 예시 토큰을 prompt0 실제 id로; 스펙 밖 처분: box.sh 헤더 13.3·roofline 링크 고침(지금), 크레이트 license 필드(라이선스 결정 뒤), rig-log engram-repack README의 없는 파일(트래커), 888/600슬롯 정의(plan 타겟 프로필에 한 줄, 아래) — 원래: README·BUILD·HARDWARE·LICENSE Apache-2.0·CONTRIBUTING, 박스 0회). 남은 M2: 실제 엔진 바인딩(`GpuModel` + 토크나이저 + 샘플러 → `bloomery-serve`/`bloomery-chat` 바이너리, 넷이 착륙한 뒤 한 라운드), soak 30분.
 - **M2 돌려 볼 수 있게(~2주)**: **토크나이저**(`tok` 라운드 — GGUF vocab 바이트 BPE 인코드/디코드, 게이트 = `llama-tokenize`와 코퍼스 id 동일), `bloomery-chat` 바이너리(템플릿·샘플링·스트리밍), README(빌드 한 줄·하드웨어·모델 파일; E20으로 변환 절차 삭제 여부), 30분 soak.
 - **M3 서버/커뮤니티**: OpenAI 호환 엔드포인트 하나, 이슈 템플릿, 기여 안내.
+- **M4 다른 모델 계열(사용자 09-24 "glm-5.3 flash나 qwen 같은 계열 모델의 지원도 추가하고 싶어"; "qwen 계열이 vram에 통짜로 들어갔을 때 llama보다 빠른 것도 증명하고 싶어")**: M2 뒤. 두 갈래 — ① 카드에 안 들어가는 큰 MoE(GLM-4.x 355B-A32B, Qwen3-235B-A22B): 호스트 티어·핫리스트·드래프트 그대로, 새로 필요한 것은 GQA 플래시 디코드(RoPE 전체·QK-norm)와 라우터 분기(softmax top-k, 공유 expert 없음). GLM-4.x는 라우터가 DeepSeek식이라 먼저. ② **카드에 통째로 들어가는 모델(Qwen3-30B-A3B, Qwen3-8B/32B dense)**: 전 카드 경로에서 llama.cpp/ik와 같은 창 비교 — 근거는 V2-Lite 전 카드 229.5 대 205.5(09-22, A6000); dense는 gemv 효율 싸움이라 폭이 좁고 그래프 캡처·런치 수·헤드 융합이 몫. 첫 단계는 조사 라운드(박스 없음): 후보 체크포인트의 GGUF `general.architecture`·hparams·라우터 식·pre-tokenizer 타입 표(GLM-5.x Flash 구조는 미확인 — 직접 읽어 확정), `arch/`에서 트레이트로 뽑을 경계(어텐션·라우터·norm), 게이트는 지금처럼 `tools/ref/` ggml 하네스 덤프. 공개 순서는 V4.1 헤드라인 먼저, 다중 모델은 그 뒤.
 
 ## 타겟 프로필 (사용자 09-24 "3090 하나 혹은 두 개에 스레드리퍼 AVX2로 V4.1 Flash를 돌려볼 사람")
 
@@ -624,7 +625,7 @@ flowchart LR
 
 | 항 | T1 기본 | T2 확장 | 우리 측정 (참고) |
 |---|---|---|---|
-| GPU | RTX 3090 24 GB ×1 — 배치 = 오늘의 `--place gate`(dense 7.66 GB + expert ~10 GB ≈ 600슬롯) | 3090 ×2 (48 GB, 두 카드 합류 경로 필요 — ㊳ 걸림돌 여섯) | A6000 48 GB plan (a), 888슬롯 |
+| GPU | RTX 3090 24 GB ×1 — 배치 = 오늘의 `--place gate`(dense 7.66 GB + expert ~10 GB ≈ 600슬롯; 슬롯 = 카드에 상주하는 routed expert 하나, 16,773,120 B) | 3090 ×2 (48 GB, 두 카드 합류 경로 필요 — ㊳ 걸림돌 여섯) | A6000 48 GB plan (a), 888슬롯 |
 | CPU | AVX2, **8채널 DDR4**(5975WX STREAM 147.7 GB/s) — 4채널이면 호스트 다리 ×2 | 같음 | 같음 |
 | RAM | **256 GB 하한**(호스트 expert 집합 196–244 GB) | 같음 | 264 GB |
 | 저장 | NVMe(engram 테이블 mmap) | 같음 | 같음 |
