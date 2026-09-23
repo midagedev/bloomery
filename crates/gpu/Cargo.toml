@@ -17,3 +17,6 @@ cuda-core.workspace = true
 # metadata readers and `Derived` are reused, and model never learns about gpu.
 bloomery-model = { path = "../model" }
 bloomery-gguf = { path = "../gguf" }
+# The pinned pool the hybrid host tier waits on and computes with (the CPU
+# engine dispatches its expert matmuls on the same pool).
+bloomery-threads = { path = "../threads" }

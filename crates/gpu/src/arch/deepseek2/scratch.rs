@@ -162,11 +162,9 @@ unsafe fn param_view<T>(
     len: usize,
 ) -> ManuallyDrop<DeviceBuffer<T>> {
     let ptr = parent.cu_deviceptr() + (off * size_of::<u32>()) as u64;
-    // SAFETY: the range is the caller's contract above; `parent` was allocated
-    // by `DeviceBuffer::from_host`, the synchronous allocator `from_raw_parts`
-    // assumes, and in the context cloned here. `ManuallyDrop` is what keeps the
-    // window from ever freeing an allocation it does not own.
-    ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, parent.context().clone()) })
+    // SAFETY: the range is the caller's contract above, inside `parent`, a
+    // `DeviceBuffer::from_host` allocation of the context passed here.
+    unsafe { crate::hybrid::window(ptr, len, parent.context()) }
 }
 
 /// The layer scratch arena and the device-side step parameters, sized at
@@ -291,13 +289,26 @@ impl MoeDims {
     /// Read the MoE shapes from the file's metadata and cross-check them
     /// against the resident expert stacks of `names` — the quantization
     /// types and row counts the enqueue leans on are proven here, at load.
+    /// Each stack holds `resident_experts` experts (`None`: all of them); a
+    /// hybrid load with none on the card has no stack to check.
     pub(super) fn read(
         gguf: &gguf::Gguf,
         w: &Weights,
         names: &LayerNames,
+        resident_experts: Option<usize>,
     ) -> Result<MoeDims, GpuError> {
         let meta = model::moe::Meta::read(gguf)?;
         let hidden = f32_gain(w, &names.attn_norm)?.len();
+        let resident = resident_experts.unwrap_or(meta.n_expert);
+        if resident > meta.n_expert {
+            return Err(GpuError::shape(
+                "MoeDims::read",
+                format!(
+                    "{resident} resident experts of the file's {}",
+                    meta.n_expert
+                ),
+            ));
+        }
         // The router kernel ranks a fixed 64 experts into a fixed 6 slots.
         if meta.n_expert != 64 || meta.n_used != 6 {
             return Err(GpuError::shape(
@@ -309,43 +320,11 @@ impl MoeDims {
                 ),
             ));
         }
-        let kq_ty = |name: &str, want: GgmlType| -> Result<(), GpuError> {
-            match w.get(name) {
-                Some(DevWeight::KQuant { ty, .. }) if *ty == want => Ok(()),
-                Some(other) => Err(GpuError::shape(
-                    "MoeDims::read",
-                    format!(
-                        "{name} is resident as {} rows of k={}, want {want}",
-                        other.rows(),
-                        other.k()
-                    ),
-                )),
-                None => Err(GpuError::tensor("MoeDims::read", name, "resident")),
-            }
-        };
-        kq_ty(&names.ffn_gate_exps, GgmlType::Q3_K)?;
-        kq_ty(&names.ffn_up_exps, GgmlType::Q3_K)?;
-        kq_ty(&names.ffn_gate_shexp, GgmlType::Q3_K)?;
-        kq_ty(&names.ffn_up_shexp, GgmlType::Q3_K)?;
-        kq_ty(&names.ffn_down_shexp, GgmlType::Q4_K)?;
-        // The routed down stack's kernel is `q5_0_gemv_sel`: a Q5_1 or a
-        // K-quant here is a different kernel, not a different constant.
-        match w.get(&names.ffn_down_exps) {
-            Some(DevWeight::Q5_0 { .. }) => {}
-            Some(_) => {
-                return Err(GpuError::tensor(
-                    "MoeDims::read",
-                    &names.ffn_down_exps,
-                    "resident as Q5_0 — the routed down projection runs q5_0_gemv_sel",
-                ));
-            }
-            None => {
-                return Err(GpuError::tensor(
-                    "MoeDims::read",
-                    &names.ffn_down_exps,
-                    "resident",
-                ));
-            }
+        kq_ty(w, &names.ffn_gate_shexp, GgmlType::Q3_K)?;
+        kq_ty(w, &names.ffn_up_shexp, GgmlType::Q3_K)?;
+        kq_ty(w, &names.ffn_down_shexp, GgmlType::Q4_K)?;
+        if resident > 0 {
+            check_stacks(w, names, &meta, resident, hidden)?;
         }
         match w.get(&names.ffn_gate_inp) {
             Some(DevWeight::F32 { .. }) => {}
@@ -357,40 +336,13 @@ impl MoeDims {
                 ));
             }
         }
-        let gate_exps = kq_weight(w, &names.ffn_gate_exps)?;
-        let down_exps = kq_weight(w, &names.ffn_down_exps)?;
         let shexp_ff = kq_weight(w, &names.ffn_gate_shexp)?.rows();
-        let check = |what: &'static str, want: usize, got: usize| -> Result<(), GpuError> {
-            if want == got {
-                Ok(())
-            } else {
-                Err(GpuError::shape(
-                    "MoeDims::read",
-                    format!("{what}: {want} != {got}"),
-                ))
-            }
-        };
-        check(
-            "ffn_gate_exps rows vs n_expert*expert_ff",
-            gate_exps.rows(),
-            meta.n_expert * meta.ff,
-        )?;
-        check(
-            "ffn_up_exps rows vs n_expert*expert_ff",
-            kq_weight(w, &names.ffn_up_exps)?.rows(),
-            meta.n_expert * meta.ff,
-        )?;
-        check(
-            "ffn_down_exps rows vs n_expert*hidden",
-            down_exps.rows(),
-            meta.n_expert * hidden,
-        )?;
-        check(
+        check_rows(
             "ffn_up_shexp rows vs ffn_gate_shexp rows",
             kq_weight(w, &names.ffn_up_shexp)?.rows(),
             shexp_ff,
         )?;
-        check(
+        check_rows(
             "ffn_down_shexp rows vs hidden",
             kq_weight(w, &names.ffn_down_shexp)?.rows(),
             hidden,
@@ -403,6 +355,81 @@ impl MoeDims {
             shexp_ff,
         })
     }
+}
+
+/// Err naming `what` unless `want == got`.
+fn check_rows(what: &'static str, want: usize, got: usize) -> Result<(), GpuError> {
+    if want == got {
+        Ok(())
+    } else {
+        Err(GpuError::shape(
+            "MoeDims::read",
+            format!("{what}: {want} != {got}"),
+        ))
+    }
+}
+
+/// Err unless `name` is resident as a K-quant of type `want`.
+fn kq_ty(w: &Weights, name: &str, want: GgmlType) -> Result<(), GpuError> {
+    match w.get(name) {
+        Some(DevWeight::KQuant { ty, .. }) if *ty == want => Ok(()),
+        Some(other) => Err(GpuError::shape(
+            "MoeDims::read",
+            format!(
+                "{name} is resident as {} rows of k={}, want {want}",
+                other.rows(),
+                other.k()
+            ),
+        )),
+        None => Err(GpuError::tensor("MoeDims::read", name, "resident")),
+    }
+}
+
+/// The routed stacks of `names` as the `_sel` kernels read them — Q3_K gate
+/// and up, a Q5_0 down (`q5_0_gemv_sel`: a Q5_1 or a K-quant here is a
+/// different kernel, not a different constant) — each holding `resident`
+/// experts' rows.
+fn check_stacks(
+    w: &Weights,
+    names: &LayerNames,
+    meta: &model::moe::Meta,
+    resident: usize,
+    hidden: usize,
+) -> Result<(), GpuError> {
+    kq_ty(w, &names.ffn_gate_exps, GgmlType::Q3_K)?;
+    kq_ty(w, &names.ffn_up_exps, GgmlType::Q3_K)?;
+    match w.get(&names.ffn_down_exps) {
+        Some(DevWeight::Q5_0 { .. }) => {}
+        Some(_) => {
+            return Err(GpuError::tensor(
+                "MoeDims::read",
+                &names.ffn_down_exps,
+                "resident as Q5_0 — the routed down projection runs q5_0_gemv_sel",
+            ));
+        }
+        None => {
+            return Err(GpuError::tensor(
+                "MoeDims::read",
+                &names.ffn_down_exps,
+                "resident",
+            ));
+        }
+    }
+    check_rows(
+        "ffn_gate_exps rows vs resident experts*expert_ff",
+        kq_weight(w, &names.ffn_gate_exps)?.rows(),
+        resident * meta.ff,
+    )?;
+    check_rows(
+        "ffn_up_exps rows vs resident experts*expert_ff",
+        kq_weight(w, &names.ffn_up_exps)?.rows(),
+        resident * meta.ff,
+    )?;
+    check_rows(
+        "ffn_down_exps rows vs resident experts*hidden",
+        kq_weight(w, &names.ffn_down_exps)?.rows(),
+        resident * hidden,
+    )
 }
 
 impl LayerScratch {

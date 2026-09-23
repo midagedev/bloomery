@@ -8,6 +8,7 @@ use crate::flash::{
     FlashMergeQ8Args, FlashSegArgs, FlashSegTwiceArgs,
 };
 use crate::head::Head;
+use crate::hybrid::{Boundary, ExpertPlans, Hybrid};
 use crate::model::kernels::{
     HeadsGeom, Q3kGemvHeadsArgs, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels,
 };
@@ -16,6 +17,7 @@ use crate::model::probe::{
     Bytes, Observer, StepProbe, act_write_bytes, blocks32_bytes, bsum, gemv_act_bytes, tick,
     weight_bytes,
 };
+use crate::q5::Q8Blocks32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
@@ -32,8 +34,12 @@ use model::arch::deepseek2::attn::MlaParams;
 /// residual in), and one arena serves every layer, so the boundary is one
 /// 8 KiB device-to-device copy per layer — a memcpy node inside the capture.
 /// The last layer copies into the head's own input buffer instead.
+///
+/// On a hybrid load every routed layer runs the hybrid MoE half, and
+/// `hybrid` hears of each once it is enqueued: a capture records the layer
+/// for its replays to serve, an eager chain has it served on the spot.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn enqueue_chain(
+pub(super) fn enqueue_chain<P: ExpertPlans>(
     gpu: &Gpu,
     step: &StepKernels,
     w: &Weights,
@@ -43,6 +49,7 @@ pub(super) fn enqueue_chain(
     mla: &MlaParams,
     moe: Option<&MoeDims>,
     head: &mut Head,
+    mut hybrid: Option<&mut Hybrid<P>>,
 ) -> Result<(), GpuError> {
     if names.is_empty() || names.len() != kv.len() {
         return Err(GpuError::shape(
@@ -51,6 +58,9 @@ pub(super) fn enqueue_chain(
         ));
     }
     let stream = gpu.stream();
+    if let Some(h) = hybrid.as_deref_mut() {
+        h.begin_chain(stream)?;
+    }
     let last = names.len() - 1;
     for slot in 0..names.len() {
         enqueue_layer(
@@ -63,12 +73,16 @@ pub(super) fn enqueue_chain(
             mla,
             moe,
             slot == 0,
+            hybrid.as_deref_mut().map(|h| &mut h.boundary),
             &mut |_, _, _| Ok(()),
         )?;
         if slot == last {
             head.input_mut().copy_from_device_async(&s.l_out, stream)?;
         } else {
             s.x.copy_from_device_async(&s.l_out, stream)?;
+        }
+        if let Some(h) = hybrid.as_deref_mut().filter(|_| names[slot].routed) {
+            h.layer_enqueued(names[slot].layer)?;
         }
     }
     head.enqueue(gpu, w)
@@ -81,7 +95,8 @@ pub(super) fn enqueue_chain(
 /// Mirrors `model::arch::deepseek2::attn::block_attn_cached` and `model::moe`'s op order with
 /// the gated kernels plus this file's gather. Asynchronous throughout —
 /// capturable as a body. A layer that does not embed reads its input
-/// residual from the resident input buffer.
+/// residual from the resident input buffer. A routed layer takes the hybrid
+/// MoE half when `hybrid` carries a boundary.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn enqueue_layer(
     gpu: &Gpu,
@@ -93,6 +108,7 @@ pub(super) fn enqueue_layer(
     mla: &MlaParams,
     moe: Option<&MoeDims>,
     embed: bool,
+    hybrid: Option<&mut Boundary>,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
     let mut i = 0usize;
@@ -124,7 +140,10 @@ pub(super) fn enqueue_layer(
                 ),
             )
         })?;
-        enqueue_ffn_moe(gpu, w, names, s, mla, dims, &mut i, obs)
+        match hybrid {
+            Some(b) => enqueue_ffn_moe_hybrid(gpu, w, names, s, mla, dims, b, &mut i, obs),
+            None => enqueue_ffn_moe(gpu, w, names, s, mla, dims, &mut i, obs),
+        }
     } else {
         enqueue_ffn_dense(gpu, w, names, s, mla, &mut i, obs)
     }
@@ -865,6 +884,57 @@ fn enqueue_ffn_moe(
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
+    let hidden = s.dims.hidden;
+    let LayerScratch {
+        ffn_inp,
+        act_ffn,
+        moe,
+        l_out,
+        probe_cfg:
+            StepProbe {
+                skip_quant,
+                split_moe_quant,
+                ..
+            },
+        ..
+    } = s;
+    let m = moe_arena(moe, names)?;
+    moe_norm_quant(gpu, w, names, mla, ffn_inp, act_ffn, &mut m.normed, i, obs)?;
+    moe_route(gpu, w, names, act_ffn, m, dims, hidden, i, obs)?;
+    moe_shexp_gate_up(gpu, w, names, act_ffn, m, dims, i, obs)?;
+    moe_quantize(gpu, m, dims, *skip_quant, *split_moe_quant, i, obs)?;
+    moe_down_combine(gpu, w, names, ffn_inp, l_out, m, dims, hidden, i, obs)
+}
+
+/// Enqueue a hybrid layer's routed MoE half (crate::hybrid): `s.ffn_inp` in,
+/// `s.l_out` out, the experts past the card's prefix computed on the host.
+///
+/// The norm and the router write the boundary's handoff instead of the
+/// arena, and the handoff goes out right behind them, so the host experts
+/// start while the card runs its own experts and the shared expert; the
+/// wait sits just before the join (right after the go with the overlap
+/// lever off). The card's expert outputs are zeroed first: a host slot's id
+/// is past the resident stack, which the `_sel` kernels leave untouched, so
+/// the combine reads zero there and never an earlier layer's output. The
+/// host's sum joins the shared expert's output in one add, and the combine
+/// keeps its grouping — `(Σ_card w·down + (shexp + hsum)) + resid`. With no
+/// expert on the card the `_sel` launches and the zeroing drop out, and the
+/// shared expert's quantization runs alone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the hybrid twin of `enqueue_ffn_moe`, taking its arguments and the boundary; the context struct is its own round (rust-quality R8)"
+)]
+fn enqueue_ffn_moe_hybrid(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    s: &mut LayerScratch,
+    mla: &MlaParams,
+    dims: &MoeDims,
+    b: &mut Boundary,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let hidden = s.dims.hidden;
     let LayerScratch {
@@ -880,7 +950,68 @@ fn enqueue_ffn_moe(
             },
         ..
     } = s;
-    let m = moe.as_mut().ok_or_else(|| {
+    let m = moe_arena(moe, names)?;
+    moe_norm_quant(gpu, w, names, mla, ffn_inp, act_ffn, &mut b.normed, i, obs)?;
+    let io = RouterIo {
+        normed: &b.normed,
+        logits: &mut m.logits,
+        probs: &mut m.probs,
+        ids: &mut b.ids,
+        weights: &mut b.weights,
+    };
+    moe_router(gpu, w, names, io, dims, hidden, i, obs)?;
+    hybrid_go(gpu, b, names.layer, i, obs)?;
+    if !b.overlap {
+        hybrid_wait(gpu, b, i, obs)?;
+    }
+    // With no expert on the card nothing writes `m.down` on a hybrid load: it
+    // keeps the zeros it was allocated with, so every slot the combine reads
+    // is zero without the memset.
+    let card = b.n_l > 0;
+    if card {
+        m.down.zero_async(stream)?;
+        tick(i, obs, "hybrid_zero_down", bsum(&[Some(4 * m.down.len())]))?;
+        moe_expert_gate_up(gpu, w, names, act_ffn, &b.ids, &mut m.h_exp, dims, i, obs)?;
+    }
+    moe_shexp_gate_up(gpu, w, names, act_ffn, m, dims, i, obs)?;
+    if card {
+        moe_quantize(gpu, m, dims, *skip_quant, *split_moe_quant, i, obs)?;
+        moe_expert_down(
+            gpu,
+            w,
+            names,
+            &m.act32_exp,
+            &b.ids,
+            &mut m.down,
+            dims,
+            hidden,
+            i,
+            obs,
+        )?;
+    } else if !*skip_quant {
+        moe_shexp_quantize(gpu, m, dims, i, obs)?;
+    }
+    moe_shexp_down(gpu, w, names, m, hidden, i, obs)?;
+    if b.overlap {
+        hybrid_wait(gpu, b, i, obs)?;
+    }
+    gpu.elem()
+        .enqueue_add(stream, &m.shexp, &b.hsum, hidden, &mut b.sum)?;
+    // The shared expert's output, the host's sum through the mapping, the
+    // joined vector.
+    tick(i, obs, "hybrid_add", bsum(&[Some(12 * hidden)]))?;
+    moe_combine(
+        gpu, &m.down, &b.weights, &b.sum, ffn_inp, l_out, dims, hidden, i, obs,
+    )
+}
+
+/// The routed arena of a layer that routes; its absence is a load mistake
+/// named with the layer.
+fn moe_arena<'a>(
+    moe: &'a mut Option<MoeScratch>,
+    names: &LayerNames,
+) -> Result<&'a mut MoeScratch, GpuError> {
+    moe.as_mut().ok_or_else(|| {
         GpuError::shape(
             "enqueue_ffn_moe",
             format!(
@@ -888,17 +1019,35 @@ fn enqueue_ffn_moe(
                 names.layer
             ),
         )
-    })?;
-    // 1. ffn_norm in both forms the half's consumers need, from one launch:
-    //    the router eats the f32 normed vector and the experts its q8_1
-    //    form.
+    })
+}
+
+/// Stage 1 of the routed FFN half: `ffn_norm` in both forms the half's
+/// consumers need, from one launch — the router eats the f32 normed vector
+/// (`normed`) and the experts its q8_1 form (`act_ffn`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_norm_quant(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    mla: &MlaParams,
+    ffn_inp: &DeviceBuffer<f32>,
+    act_ffn: &mut Q8Act,
+    normed: &mut DeviceBuffer<f32>,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    let hidden = normed.len();
     gpu.fused().enqueue_norm_quant(
-        stream,
+        gpu.stream(),
         ffn_inp,
         f32_gain(w, &names.ffn_norm)?,
         mla.eps,
         act_ffn,
-        &mut m.normed,
+        normed,
     )?;
     tick(
         i,
@@ -909,11 +1058,7 @@ fn enqueue_ffn_moe(
             Some(act_write_bytes(act_ffn, 1)),
             Some(4 * hidden),
         ]),
-    )?;
-    moe_route(gpu, w, names, act_ffn, m, dims, hidden, i, obs)?;
-    moe_shexp_gate_up(gpu, w, names, act_ffn, m, dims, i, obs)?;
-    moe_quantize(gpu, m, dims, *skip_quant, *split_moe_quant, i, obs)?;
-    moe_down_combine(gpu, w, names, ffn_inp, l_out, m, dims, hidden, i, obs)
+    )
 }
 
 /// Stages 2–6 of the routed FFN half: the router over `m.normed`, then the
@@ -933,15 +1078,60 @@ fn moe_route(
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
+    let MoeScratch {
+        normed,
+        logits,
+        probs,
+        ids,
+        weights,
+        h_exp,
+        ..
+    } = m;
+    let io = RouterIo {
+        normed,
+        logits,
+        probs,
+        ids: &mut *ids,
+        weights,
+    };
+    moe_router(gpu, w, names, io, dims, hidden, i, obs)?;
+    moe_expert_gate_up(gpu, w, names, act_ffn, ids, h_exp, dims, i, obs)
+}
+
+/// What the router's two launches read and write: the f32 normed vector,
+/// the logits and probabilities it ranks, and the ids and weights it
+/// chooses — the arena's own buffers, or a hybrid layer's handoff.
+struct RouterIo<'a> {
+    normed: &'a DeviceBuffer<f32>,
+    logits: &'a mut DeviceBuffer<f32>,
+    probs: &'a mut DeviceBuffer<f32>,
+    ids: &'a mut DeviceBuffer<u32>,
+    weights: &'a mut DeviceBuffer<f32>,
+}
+
+/// Stages 2–3 of the routed FFN half: the router, an f32 gemv over the
+/// normed vector, then softmax + top-k + scale.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_router(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    io: RouterIo<'_>,
+    dims: &MoeDims,
+    hidden: usize,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
     let stream = gpu.stream();
-    // 2-3. the router: an f32 gemv over the normed vector, then softmax +
-    //      top-k + scale. `m.ids` is the `sel` every expert launch reads.
     gpu.q8f32().enqueue_f32_gemv(
         stream,
         f32_tensor(w, &names.ffn_gate_inp)?,
-        &m.normed,
+        io.normed,
         1,
-        &mut m.logits,
+        io.logits,
     )?;
     let wr = dev_weight(w, &names.ffn_gate_inp)?;
     tick(
@@ -955,13 +1145,7 @@ fn moe_route(
         ]),
     )?;
     gpu.router().enqueue_router_topk(
-        stream,
-        &m.logits,
-        1,
-        dims.scale,
-        &mut m.probs,
-        &mut m.ids,
-        &mut m.weights,
+        stream, io.logits, 1, dims.scale, io.probs, io.ids, io.weights,
     )?;
     // The logits in; the probabilities, the chosen ids and their weights out.
     tick(
@@ -969,17 +1153,35 @@ fn moe_route(
         obs,
         "moe_router_topk",
         bsum(&[Some(8 * dims.n_expert), Some(8 * dims.n_used)]),
-    )?;
-    // 4-6. the routed experts, all six per launch through `sel`.
+    )
+}
+
+/// Stages 4–6 of the routed FFN half: the selected experts, all of them per
+/// launch through `ids` as `sel`, fused gate·up·swiglu into `h_exp`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_expert_gate_up(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    act_ffn: &Q8Act,
+    ids: &DeviceBuffer<u32>,
+    h_exp: &mut DeviceBuffer<f32>,
+    dims: &MoeDims,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
     gpu.moe_fused().enqueue_expert_gate_up_swiglu(
-        stream,
+        gpu.stream(),
         kq_weight(w, &names.ffn_gate_exps)?,
         kq_weight(w, &names.ffn_up_exps)?,
         act_ffn,
-        &m.ids,
+        ids,
         dims.n_used,
         dims.ff,
-        &mut m.h_exp,
+        h_exp,
     )?;
     // Only the selected experts' rows are read — `n_used` blocks of
     // `ff` rows out of the stack, the same count for any selection
@@ -1000,8 +1202,7 @@ fn moe_route(
             Some(4 * dims.n_used),
             Some(4 * dims.n_used * dims.ff),
         ]),
-    )?;
-    Ok(())
+    )
 }
 
 /// Stage 7 of the routed FFN half: the shared expert's gate·up·swiglu into
@@ -1083,16 +1284,7 @@ fn moe_quantize(
                     Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
                 ]),
             )?;
-            gpu.enqueue_quantize_q8_1(&m.h_sh, &mut m.act_sh)?;
-            tick(
-                i,
-                obs,
-                "shexp_quantize_q8_1",
-                bsum(&[
-                    Some(4 * dims.shexp_ff),
-                    Some(act_write_bytes(&m.act_sh, m.act_sh.m())),
-                ]),
-            )?;
+            moe_shexp_quantize(gpu, m, dims, i, obs)?;
         } else {
             gpu.q5().enqueue_quantize_q8_pair(
                 stream,
@@ -1117,6 +1309,27 @@ fn moe_quantize(
     Ok(())
 }
 
+/// The shared expert's q8_1 quantization on its own: `m.h_sh` into
+/// `m.act_sh`.
+fn moe_shexp_quantize(
+    gpu: &Gpu,
+    m: &mut MoeScratch,
+    dims: &MoeDims,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    gpu.enqueue_quantize_q8_1(&m.h_sh, &mut m.act_sh)?;
+    tick(
+        i,
+        obs,
+        "shexp_quantize_q8_1",
+        bsum(&[
+            Some(4 * dims.shexp_ff),
+            Some(act_write_bytes(&m.act_sh, m.act_sh.m())),
+        ]),
+    )
+}
+
 /// Stages 9–10 of the routed FFN half: the selected experts' and the shared
 /// expert's down projections, then the combine with the residual
 /// `ffn_inp` into `l_out`.
@@ -1136,15 +1349,50 @@ fn moe_down_combine(
     i: &mut usize,
     obs: &mut Observer<'_>,
 ) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    gpu.q5().enqueue_gemv_q5_0_sel(
-        stream,
-        kq_weight(w, &names.ffn_down_exps)?,
+    moe_expert_down(
+        gpu,
+        w,
+        names,
         &m.act32_exp,
         &m.ids,
+        &mut m.down,
+        dims,
+        hidden,
+        i,
+        obs,
+    )?;
+    moe_shexp_down(gpu, w, names, m, hidden, i, obs)?;
+    moe_combine(
+        gpu, &m.down, &m.weights, &m.shexp, ffn_inp, l_out, dims, hidden, i, obs,
+    )
+}
+
+/// Stage 9 of the routed FFN half, first part: the selected experts' down
+/// projections through `ids` as `sel`, into `down`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_expert_down(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    act32_exp: &Q8Blocks32,
+    ids: &DeviceBuffer<u32>,
+    down: &mut DeviceBuffer<f32>,
+    dims: &MoeDims,
+    hidden: usize,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    gpu.q5().enqueue_gemv_q5_0_sel(
+        gpu.stream(),
+        kq_weight(w, &names.ffn_down_exps)?,
+        act32_exp,
+        ids,
         dims.n_used,
         hidden,
-        &mut m.down,
+        down,
     )?;
     let wde = dev_weight(w, &names.ffn_down_exps)?;
     tick(
@@ -1153,13 +1401,25 @@ fn moe_down_combine(
         "moe_expert_down",
         bsum(&[
             weight_bytes(wde, dims.n_used * hidden),
-            Some(blocks32_bytes(&m.act32_exp, dims.n_used)),
+            Some(blocks32_bytes(act32_exp, dims.n_used)),
             Some(4 * dims.n_used),
             Some(4 * dims.n_used * hidden),
         ]),
-    )?;
-    // 9. the shared expert's Q4_K down projection, whose K is the shared
-    //    width (odd super-block count, which the Q4_K row geometry takes).
+    )
+}
+
+/// Stage 9 of the routed FFN half, second part: the shared expert's Q4_K
+/// down projection into `m.shexp`, whose K is the shared width (odd
+/// super-block count, which the Q4_K row geometry takes).
+fn moe_shexp_down(
+    gpu: &Gpu,
+    w: &Weights,
+    names: &LayerNames,
+    m: &mut MoeScratch,
+    hidden: usize,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
     gpu.enqueue_gemv_q4k(
         kq_weight(w, &names.ffn_down_shexp)?,
         &m.act_sh,
@@ -1175,13 +1435,32 @@ fn moe_down_combine(
             gemv_act_bytes(wds, &m.act_sh, 1),
             Some(4 * hidden),
         ]),
-    )?;
-    // 10. (Σ w·down + shexp) + resid, the dump's own grouping.
+    )
+}
+
+/// Stage 10 of the routed FFN half: `(Σ w·down + shexp) + resid` into
+/// `l_out`, the dump's own grouping.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a stage of `enqueue_ffn_moe`, taking its caller's arguments; the context struct is its own round (rust-quality R8)"
+)]
+fn moe_combine(
+    gpu: &Gpu,
+    down: &DeviceBuffer<f32>,
+    weights: &DeviceBuffer<f32>,
+    shexp: &DeviceBuffer<f32>,
+    ffn_inp: &DeviceBuffer<f32>,
+    l_out: &mut DeviceBuffer<f32>,
+    dims: &MoeDims,
+    hidden: usize,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
     gpu.moe_fused().enqueue_moe_combine(
-        stream,
-        &m.down,
-        &m.weights,
-        &m.shexp,
+        gpu.stream(),
+        down,
+        weights,
+        shexp,
         ffn_inp,
         hidden,
         dims.n_used,
@@ -1194,6 +1473,29 @@ fn moe_down_combine(
         obs,
         "moe_combine",
         bsum(&[Some(4 * dims.n_used * (hidden + 1)), Some(12 * hidden)]),
-    )?;
-    Ok(())
+    )
+}
+
+/// A hybrid layer's go: the handoff's copy node and the go batch.
+fn hybrid_go(
+    gpu: &Gpu,
+    b: &Boundary,
+    layer: usize,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    b.enqueue_out(gpu.stream(), layer)?;
+    tick(i, obs, "hybrid_handoff", bsum(&[Some(b.handoff_bytes())]))?;
+    tick(i, obs, "hybrid_go", bsum(&[Some(0)]))
+}
+
+/// A hybrid layer's wait for its host share.
+fn hybrid_wait(
+    gpu: &Gpu,
+    b: &Boundary,
+    i: &mut usize,
+    obs: &mut Observer<'_>,
+) -> Result<(), GpuError> {
+    b.enqueue_back(gpu.stream())?;
+    tick(i, obs, "hybrid_wait", bsum(&[Some(0)]))
 }

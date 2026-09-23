@@ -29,8 +29,9 @@ pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 
 use crate::head::Head;
+use crate::hybrid::HybridConfig;
 use crate::weights::Weights;
-use crate::{Gpu, GpuError, Graph};
+use crate::{Gpu, GpuError, Graph, NodeInfo};
 use cuda_core::CudaStream;
 use model::arch::Arch;
 use std::ops::Range;
@@ -112,6 +113,48 @@ pub trait ChainBody: Sized {
 
     /// Device bytes this body holds resident: caches, arena, step module.
     fn resident_bytes(&self) -> usize;
+
+    /// The file tensors of a hybrid load of `layers` (crate::hybrid): every
+    /// tensor a whole-model load uploads, except that each routed expert
+    /// stack keeps only its experts `[0, n_l)` — the leading rows the `_sel`
+    /// kernels address. The default refuses: an architecture without a
+    /// hybrid plan has no hybrid load.
+    fn hybrid_weights(
+        _stream: &CudaStream,
+        _file: &gguf::Split,
+        _layers: Range<usize>,
+        _n_l: usize,
+    ) -> Result<Weights, GpuError> {
+        Err(GpuError::state(
+            "ChainBody::hybrid_weights",
+            "this architecture has no hybrid load",
+        ))
+    }
+
+    /// [`ChainBody::derive`] and [`ChainBody::load`] of a hybrid load in one:
+    /// the derived weights filed into `w`, then the body over them, whose
+    /// routed layers hand experts `[cfg.n_l, n_expert)` to a host tier that
+    /// keeps `file`. The default refuses.
+    fn load_hybrid(
+        _gpu: &Gpu,
+        _file: gguf::Split,
+        _w: &mut Weights,
+        _layers: Range<usize>,
+        _ctx_max: usize,
+        _cfg: HybridConfig,
+    ) -> Result<Self, GpuError> {
+        Err(GpuError::state(
+            "ChainBody::load_hybrid",
+            "this architecture has no hybrid load",
+        ))
+    }
+
+    /// Serve the host's share of the chain a graph replay just submitted, in
+    /// chain order, before anything else waits on the stream. A body whose
+    /// chain holds no host work has nothing to do, which is the default.
+    fn serve_replay(&mut self) -> Result<(), GpuError> {
+        Ok(())
+    }
 }
 
 /// What a binary or a gate drives, once per token — the surface that does not
@@ -322,7 +365,15 @@ impl<B: ChainBody> GpuModel<B> {
     /// head's `output_norm.weight` / `output.weight` arrive with the
     /// globals), then the head over those same resident weights, normalizing
     /// with the epsilon the body's plan read.
+    ///
+    /// `BLOOMERY_HYBRID_NL` below the file's expert count makes this the
+    /// hybrid load of [`GpuModel::load_hybrid`] over the same file, reopened
+    /// by path (`hybrid::reopen`); unset or equal to the expert count, the
+    /// path below is taken unchanged.
     pub fn load_full(gguf: &gguf::Gguf, ctx_max: usize) -> Result<GpuModel<B>, GpuError> {
+        if let Some(cfg) = HybridConfig::from_levers(gguf)? {
+            return GpuModel::load_hybrid(crate::hybrid::reopen(gguf)?, ctx_max, cfg);
+        }
         let n_layers = gguf
             .block_count()
             .ok_or(GpuError::metadata("GpuModel::load_full", "block_count"))?
@@ -335,6 +386,45 @@ impl<B: ChainBody> GpuModel<B> {
         };
         m.head = Some(head);
         Ok(m)
+    }
+
+    /// Every block of `file` resident, plus the output head, with each MoE
+    /// layer's experts `[0, cfg.n_l)` on the card and the rest computed on
+    /// the host inside the captured step (crate::hybrid). The model keeps
+    /// `file` for its host experts.
+    pub fn load_hybrid(
+        file: gguf::Split,
+        ctx_max: usize,
+        cfg: HybridConfig,
+    ) -> Result<GpuModel<B>, GpuError> {
+        let what = "GpuModel::load_hybrid";
+        if ctx_max == 0 {
+            return Err(GpuError::shape(what, "ctx_max must be >= 1"));
+        }
+        let n_layers = file
+            .shard(0)
+            .and_then(gguf::Gguf::block_count)
+            .ok_or(GpuError::metadata(what, "block_count"))?;
+        let n_layers = usize::try_from(n_layers)
+            .map_err(|_| GpuError::shape(what, format!("block_count {n_layers}")))?;
+        let gpu = Gpu::new()?;
+        let mut weights = B::hybrid_weights(gpu.stream(), &file, 0..n_layers, cfg.n_l)?;
+        let body = B::load_hybrid(&gpu, file, &mut weights, 0..n_layers, ctx_max, cfg)?;
+        let head = Head::new(&gpu, &weights, body.head_eps())?;
+        Ok(GpuModel {
+            stages: vec![Stage {
+                gpu,
+                layers: 0..n_layers,
+                graph: None,
+                graph_of: None,
+                residency: Some(Residency { weights, body }),
+            }],
+            ctx_max,
+            head: Some(head),
+            step_graph: None,
+            mode: StepMode::Graph,
+            pos: 0,
+        })
     }
 
     /// The model's stages, in layer order.
@@ -462,6 +552,18 @@ impl<B: ChainBody> GpuModel<B> {
         Ok(nodes)
     }
 
+    /// Every node of the captured whole chain, as the driver lists them —
+    /// what a structure gate counts the kinds of.
+    pub fn step_graph_nodes(&self) -> Result<Vec<NodeInfo>, GpuError> {
+        self.step_graph
+            .as_ref()
+            .ok_or(GpuError::state(
+                "GpuModel::step_graph_nodes",
+                "no captured chain",
+            ))?
+            .nodes()
+    }
+
     /// Enqueue the whole chain eagerly on the engine stream. Pure enqueues —
     /// the same body [`GpuModel::capture_step`] records.
     fn enqueue_chain_step(&mut self) -> Result<(), GpuError> {
@@ -517,11 +619,13 @@ impl<B: ChainBody> GpuModel<B> {
             self.refresh_params(token, pos)?;
             match self.mode {
                 StepMode::Eager => self.enqueue_chain_step()?,
-                StepMode::Graph => self
-                    .step_graph
-                    .as_ref()
-                    .ok_or(GpuError::state("GpuModel::step", "no captured chain"))?
-                    .launch(self.stages[0].gpu.stream())?,
+                StepMode::Graph => {
+                    self.step_graph
+                        .as_ref()
+                        .ok_or(GpuError::state("GpuModel::step", "no captured chain"))?
+                        .launch(self.stages[0].gpu.stream())?;
+                    self.body_parts("GpuModel::step")?.2.serve_replay()?;
+                }
             }
             self.pos = pos + 1;
         }

@@ -1,0 +1,932 @@
+//! The hybrid MoE boundary: experts `[0, n_l)` of every MoE layer run on the
+//! card, the rest on the host, and the handoff between the two sits inside
+//! the captured step.
+//!
+//! Per hybrid layer the chain carries, after the router:
+//!
+//! ```text
+//! router → D2H(handoff) → go → [card experts, shared expert] → wait → add(hsum) → combine
+//! ```
+//!
+//! The handoff is one device region the router's launches write — a
+//! sequence word, the ids, the weights and the f32 normed activation — and
+//! one copy node lands it in the host-mapped page. `go` is one batch of
+//! stream memory operations: a system-scope barrier (the copy lands first),
+//! the layer's id written into the page, a second barrier, then an atomic add
+//! of one to the host-mapped generation word and to the device sequence word
+//! the next handoff carries. `wait` waits until the host-mapped counter is at
+//! least one and adds minus one. With the overlap lever off
+//! (`BLOOMERY_HYBRID_OVERLAP=0`) the wait sits right after the go instead.
+//!
+//! No word is written by the card and the host at the same time: the
+//! generation, sequence and layer words only by the card; the counter by the
+//! host between a go and its wait, and by the card after the wait passes —
+//! and the host touches it again only after the next go, which the stream
+//! orders behind that add and a system barrier.
+//!
+//! The host side is the decode thread. After a graph launch it serves the
+//! captured chain's hybrid layers in order (`Hybrid::serve_captured`); an
+//! eager chain is served layer by layer as it is enqueued, so the stream never
+//! holds more than one layer of work behind a wait. A service waits for its go
+//! with the whole pool spinning on the generation word (a pool job: a worker
+//! inside a job is not parked, and the expert dispatch that follows starts
+//! inside the spin window the job leaves it in), checks the handoff's sequence
+//! number and layer, computes the host experts with the CPU engine into the
+//! host-mapped sum and adds one to the counter. The combine reads that sum in
+//! place through the mapping.
+
+use crate::GpuError;
+use crate::graph::cu;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
+use gguf::{Gguf, Split};
+use model::Tensor2;
+use model::moe::{EXPERTS_INTO_MAX, MoeBlockPlan, experts_into};
+use std::ffi::c_void;
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+// ----------------------------------------------------------------- levers
+
+/// The hybrid path's two runtime levers, as read from the environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Levers {
+    /// `BLOOMERY_HYBRID_NL`: experts per MoE layer kept on the card; `None`
+    /// when unset.
+    pub n_l: Option<usize>,
+    /// `BLOOMERY_HYBRID_OVERLAP`: `false` (`0`) puts each hybrid layer's wait
+    /// right after its go; unset or `1` puts it just before the combine.
+    pub overlap: bool,
+}
+
+/// The levers, read once per process (a `OnceLock`: the environment is read at
+/// first use and never again).
+pub fn levers() -> Result<Levers, GpuError> {
+    static LEVERS: OnceLock<Result<Levers, String>> = OnceLock::new();
+    LEVERS
+        .get_or_init(read_levers)
+        .clone()
+        .map_err(|detail| GpuError::shape("hybrid::levers", detail))
+}
+
+fn read_levers() -> Result<Levers, String> {
+    let n_l = match std::env::var("BLOOMERY_HYBRID_NL") {
+        Ok(v) => Some(
+            v.trim()
+                .parse::<usize>()
+                .map_err(|e| format!("BLOOMERY_HYBRID_NL={v:?}: {e}"))?,
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("BLOOMERY_HYBRID_NL: {e}")),
+    };
+    let overlap = match std::env::var("BLOOMERY_HYBRID_OVERLAP") {
+        Err(std::env::VarError::NotPresent) => true,
+        Ok(v) if v.trim() == "1" => true,
+        Ok(v) if v.trim() == "0" => false,
+        Ok(v) => return Err(format!("BLOOMERY_HYBRID_OVERLAP={v:?}: want 0 or 1")),
+        Err(e) => return Err(format!("BLOOMERY_HYBRID_OVERLAP: {e}")),
+    };
+    Ok(Levers { n_l, overlap })
+}
+
+/// A hybrid load's parameters: experts `[0, n_l)` of every MoE layer on the
+/// card and the rest on the host, and where each layer's wait sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HybridConfig {
+    pub n_l: usize,
+    pub overlap: bool,
+}
+
+impl HybridConfig {
+    /// What the levers ask of `gguf`'s model: `None` when `BLOOMERY_HYBRID_NL`
+    /// is unset or keeps every expert on the card — today's all-card path — and
+    /// an error when it asks for more experts than a layer has.
+    pub fn from_levers(gguf: &Gguf) -> Result<Option<HybridConfig>, GpuError> {
+        let l = levers()?;
+        let Some(n_l) = l.n_l else {
+            return Ok(None);
+        };
+        let what = "HybridConfig::from_levers";
+        let n_expert = gguf
+            .expert_count()
+            .ok_or(GpuError::metadata(what, "expert_count"))?;
+        let n_expert = usize::try_from(n_expert)
+            .map_err(|_| GpuError::shape(what, format!("expert_count {n_expert}")))?;
+        if n_l > n_expert {
+            return Err(GpuError::shape(
+                what,
+                format!("BLOOMERY_HYBRID_NL={n_l} keeps more experts than a layer's {n_expert}"),
+            ));
+        }
+        Ok((n_l < n_expert).then_some(HybridConfig {
+            n_l,
+            overlap: l.overlap,
+        }))
+    }
+}
+
+/// The model file behind `gguf`, opened again as an owned [`Split`]: a hybrid
+/// model keeps the file for its host experts for as long as it lives, and the
+/// caller's reader is only borrowed. The mapping that starts at `gguf`'s is
+/// found in `/proc/self/maps`; the reopened file must be one shard of the same
+/// length whose header bytes equal `gguf`'s.
+pub(crate) fn reopen(gguf: &Gguf) -> Result<Split, GpuError> {
+    let what = "hybrid::reopen";
+    let base = gguf.mapping().as_ptr() as usize;
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .map_err(|e| GpuError::shape(what, format!("/proc/self/maps: {e}")))?;
+    let path = maps
+        .lines()
+        .find_map(|line| {
+            let mut f = line.split_whitespace();
+            let start = f.next()?.split('-').next()?;
+            let offset = f.nth(1)?;
+            let path = f.nth(2)?;
+            let start = usize::from_str_radix(start, 16).ok()?;
+            (start == base && u64::from_str_radix(offset, 16).ok()? == 0 && path.starts_with('/'))
+                .then(|| path.to_string())
+        })
+        .ok_or_else(|| {
+            GpuError::shape(
+                what,
+                "no file mapping starts at the reader's own: the hybrid path needs a \
+                 file-backed reader",
+            )
+        })?;
+    let split = Split::open(&path)?;
+    let same = split.shard_count() == 1
+        && split.shard(0).is_some_and(|g| {
+            let head = usize::try_from(gguf.data_base()).unwrap_or(usize::MAX);
+            g.mapping().len() == gguf.mapping().len()
+                && g.mapping().get(..head).is_some()
+                && g.mapping().get(..head) == gguf.mapping().get(..head)
+        });
+    if !same {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{path} reopened is not the reader's file (one shard, same length, same header)"
+            ),
+        ));
+    }
+    Ok(split)
+}
+
+// ------------------------------------------------------ memory and windows
+
+/// A non-owning window of `len` `T` at device address `ptr` in `ctx`. The
+/// launches read it exactly as they read a buffer of their own; `ManuallyDrop`
+/// keeps it from ever freeing memory it does not own.
+///
+/// # Safety
+///
+/// - `ptr .. ptr + len * size_of::<T>()` must be memory the device reaches in
+///   `ctx` — a `cuMemAlloc` allocation or a host-mapped one — aligned for `T`.
+/// - That memory must outlive the window and stay in place: a captured graph
+///   bakes the address in.
+pub(crate) unsafe fn window<T>(
+    ptr: sys::CUdeviceptr,
+    len: usize,
+    ctx: &Arc<CudaContext>,
+) -> ManuallyDrop<DeviceBuffer<T>> {
+    // SAFETY: the range is the caller's contract. `from_raw_parts` asks for a
+    // `cuMemAlloc` pointer because its drop frees one; a window is never
+    // dropped, so the only uses left are the address and the length.
+    ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx.clone()) })
+}
+
+/// A flag word of the host-mapped page. Each has a 64-byte line of its own,
+/// so a thread spinning on one never shares a line with another.
+#[derive(Clone, Copy)]
+enum Word {
+    /// The card adds one per go; the host reads it.
+    Gen,
+    /// The host adds one per layer served; the card waits for it and takes
+    /// it back.
+    Cnt,
+    /// The card writes the layer of each go; the host reads it.
+    Lyr,
+}
+
+impl Word {
+    const fn offset(self) -> usize {
+        match self {
+            Word::Gen => 0,
+            Word::Cnt => 64,
+            Word::Lyr => 128,
+        }
+    }
+}
+
+/// Byte offset of the handoff's host image in the page.
+const PAYLOAD_OFF: usize = 256;
+
+/// Word offsets in the handoff region, and in its host image.
+const SEQ_W: usize = 0;
+const IDS_W: usize = 16;
+const WTS_W: usize = 32;
+const X_W: usize = 64;
+
+/// The widest routing a handoff holds: ids and weights each have the 16
+/// words before the next field.
+const MAX_USED: usize = WTS_W - IDS_W;
+
+const _: () = assert!(X_W - WTS_W >= MAX_USED && MAX_USED >= EXPERTS_INTO_MAX);
+
+/// What the counter is set to when a service fails: every wait still pending
+/// in the stream passes, so a failed step drains instead of hanging.
+const RELEASE: u32 = 1 << 30;
+
+/// How long a service waits for its go before it gives up and releases the
+/// stream.
+const GO_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Spins between two clock reads while waiting for a go.
+const DEADLINE_POLL: u32 = 1 << 12;
+
+/// Pinned host memory mapped into the device's address space
+/// (`cuMemHostAlloc` with `DEVICEMAP`): the host reaches it at `host`,
+/// kernels, copies and stream memory operations at `dev`. Zeroed at
+/// allocation, freed on drop.
+struct MappedHost {
+    host: *mut u8,
+    dev: sys::CUdeviceptr,
+    bytes: usize,
+}
+
+// SAFETY: the allocation is owned by this value alone and freed once, in its
+// drop; the host pointer is plain process memory any thread may reach, and
+// every access to it goes through `&self`/`&mut self` methods below.
+unsafe impl Send for MappedHost {}
+
+impl MappedHost {
+    fn new(ctx: &Arc<CudaContext>, bytes: usize) -> Result<MappedHost, GpuError> {
+        ctx.bind_to_thread()?;
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the context is current on this thread (bound above) and
+        // `host` is a live local the call writes.
+        let rc = unsafe { sys::cuMemHostAlloc(&mut host, bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP) };
+        cu(rc, "cuMemHostAlloc")?;
+        let mut dev: sys::CUdeviceptr = 0;
+        // SAFETY: `host` is the mapped allocation just made; the flags must be 0.
+        let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0) };
+        if let Err(e) = cu(rc, "cuMemHostGetDevicePointer_v2") {
+            // SAFETY: `host` came from cuMemHostAlloc and is freed once, here.
+            unsafe { sys::cuMemFreeHost(host) };
+            return Err(e);
+        }
+        // SAFETY: the allocation holds `bytes` writable bytes and nothing else
+        // references it yet.
+        unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
+        Ok(MappedHost {
+            host: host.cast(),
+            dev,
+            bytes,
+        })
+    }
+
+    /// The device address of byte `off`, which the layout keeps inside the
+    /// allocation.
+    fn dev_at(&self, off: usize) -> sys::CUdeviceptr {
+        self.dev + off as u64
+    }
+
+    /// The host address of byte `off`. Computing it touches nothing; each
+    /// access below proves its own span.
+    fn host_at(&self, off: usize) -> *mut u8 {
+        self.host.wrapping_add(off)
+    }
+
+    /// Flag word `w`, as an atomic.
+    fn word(&self, w: Word) -> &AtomicU32 {
+        // SAFETY: every `Word` offset is a 4-aligned byte inside the first
+        // PAYLOAD_OFF bytes of the allocation (`Boundary::new` sizes it past
+        // them); `AtomicU32` has `u32`'s layout, and the host reaches a flag
+        // word only through this view.
+        unsafe { &*self.host_at(w.offset()).cast::<AtomicU32>() }
+    }
+
+    /// Word `i` of the handoff's host image; `None` past it.
+    fn payload_word(&self, i: usize, words: usize) -> Option<u32> {
+        if i >= words {
+            return None;
+        }
+        // SAFETY: i < words, and the image's `words` words start at
+        // PAYLOAD_OFF inside the allocation. The copy that wrote them finished
+        // before the go the caller acquired, and none writes them again
+        // before the caller's signal.
+        Some(unsafe {
+            self.host_at(PAYLOAD_OFF + 4 * i)
+                .cast::<u32>()
+                .read_volatile()
+        })
+    }
+
+    /// Copy `dst.len()` f32 of the handoff's host image from word `from`
+    /// into `dst`; `false` when the span passes the image's `words`.
+    fn payload_f32_into(&self, from: usize, words: usize, dst: &mut [f32]) -> bool {
+        if from + dst.len() > words {
+            return false;
+        }
+        // SAFETY: the span is inside the image (checked above), which is
+        // f32-aligned at PAYLOAD_OFF + 4·from; `dst` is a distinct host slice.
+        // Ordered after the go as in `payload_word`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.host_at(PAYLOAD_OFF + 4 * from).cast::<f32>(),
+                dst.as_mut_ptr(),
+                dst.len(),
+            );
+        }
+        true
+    }
+
+    /// The `len` f32 at byte `off`, for the host to write. The caller holds
+    /// the page mutably, and the card reads the span only between a wait and
+    /// the next go — never while the host writes it.
+    fn f32_mut(&mut self, off: usize, len: usize) -> Option<&mut [f32]> {
+        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
+            return None;
+        }
+        // SAFETY: the span is inside the allocation and 4-aligned (checked
+        // above); `&mut self` makes it the only host reference.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.host_at(off).cast::<f32>(), len) })
+    }
+
+    /// A copy of the `len` f32 at byte `off`, when inside the allocation.
+    fn f32_copy(&self, off: usize, len: usize) -> Option<Vec<f32>> {
+        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
+            return None;
+        }
+        let mut out = vec![0.0f32; len];
+        // SAFETY: the span is inside the allocation and 4-aligned (checked
+        // above); `out` is a distinct host buffer of `len` f32.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.host_at(off).cast::<f32>(), out.as_mut_ptr(), len);
+        }
+        Some(out)
+    }
+}
+
+impl Drop for MappedHost {
+    fn drop(&mut self) {
+        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here —
+        // after every graph that names it, since the graphs are declared
+        // before the body that owns this page. A failure on the drop path is
+        // unreportable and ignored.
+        unsafe { sys::cuMemFreeHost(self.host.cast()) };
+    }
+}
+
+// ------------------------------------------------------ stream memory ops
+
+/// An all-zero batch operation.
+fn op_zero() -> sys::CUstreamBatchMemOpParams {
+    // SAFETY: every member of the union is a plain C struct of integers, so
+    // all-zero bytes are a valid value.
+    unsafe { std::mem::zeroed() }
+}
+
+/// Wait until the u32 at `addr` is at least `value`.
+fn op_wait_geq(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.waitValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WAIT_VALUE_32,
+        address: addr,
+        __bindgen_anon_1:
+            sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st__bindgen_ty_1 {
+                value,
+            },
+        flags: sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
+        alias: 0,
+    };
+    p
+}
+
+/// Write `value` to the u32 at `addr`.
+fn op_write(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.writeValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WRITE_VALUE_32,
+        address: addr,
+        __bindgen_anon_1:
+            sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st__bindgen_ty_1 {
+                value,
+            },
+        flags: sys::CUstreamWriteValue_flags_enum_CU_STREAM_WRITE_VALUE_DEFAULT,
+        alias: 0,
+    };
+    p
+}
+
+/// A system-scope memory barrier: everything the stream wrote before it is
+/// visible system-wide before anything after it.
+fn op_barrier_sys() -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.memoryBarrier = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpMemoryBarrierParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_BARRIER,
+        flags: sys::CUstreamMemoryBarrier_flags_enum_CU_STREAM_MEMORY_BARRIER_TYPE_SYS,
+    };
+    p
+}
+
+/// Atomic reduction `*addr += value` on a u32 (wrapping).
+fn op_add(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpParams {
+    let mut p = op_zero();
+    p.atomicReduction = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpAtomicReductionParams_st {
+        operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_ATOMIC_REDUCTION,
+        flags: 0,
+        reductionOp: sys::CUstreamAtomicReductionOpType_enum_CU_STREAM_ATOMIC_REDUCTION_OP_ADD,
+        dataType: sys::CUstreamAtomicReductionDataType_enum_CU_STREAM_ATOMIC_REDUCTION_UNSIGNED_32,
+        address: addr,
+        value: u64::from(value),
+        alias: 0,
+    };
+    p
+}
+
+/// Enqueue `ops` on `stream` as one batch of stream memory operations — one
+/// graph node when captured.
+fn mem_batch(
+    stream: &CudaStream,
+    ops: &mut [sys::CUstreamBatchMemOpParams],
+    what: &'static str,
+) -> Result<(), GpuError> {
+    let n = u32::try_from(ops.len()).map_err(|_| GpuError::shape(what, "batch too long"))?;
+    // SAFETY: `ops` is a live array of `n` initialized operations the driver
+    // reads during the call (a capture copies them into the node); the flags
+    // must be 0.
+    let rc = unsafe { sys::cuStreamBatchMemOp_v2(stream.cu_stream(), n, ops.as_mut_ptr(), 0) };
+    cu(rc, what)
+}
+
+/// Whether `stream` is recording a capture right now.
+fn capturing(stream: &CudaStream) -> Result<bool, GpuError> {
+    let mut status: sys::CUstreamCaptureStatus = 0;
+    // SAFETY: the stream is live and `status` is a local the call writes.
+    let rc = unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut status) };
+    cu(rc, "cuStreamIsCapturing")?;
+    Ok(status != sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE)
+}
+
+/// Serial-number order on a wrapping u32: `a` comes strictly before `b`.
+fn before(a: u32, b: u32) -> bool {
+    a != b && b.wrapping_sub(a) < 1 << 31
+}
+
+// --------------------------------------------------------------- boundary
+
+/// The shapes a boundary is cut for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoundaryShape {
+    /// The model width: the normed activation, the host sum.
+    pub(crate) hidden: usize,
+    /// Routed slots per token.
+    pub(crate) n_used: usize,
+}
+
+/// The card side of the boundary, allocated once at load (decision 4 of
+/// docs/gpu-design.md: a captured graph bakes every address in): the handoff
+/// region the router's launches write, the host-mapped page, and the sum the
+/// combine reads.
+pub(crate) struct Boundary {
+    /// Windows into `region` — what the norm and the router write in place
+    /// of the MoE arena's own buffers on a hybrid layer.
+    pub(crate) normed: ManuallyDrop<DeviceBuffer<f32>>,
+    pub(crate) ids: ManuallyDrop<DeviceBuffer<u32>>,
+    pub(crate) weights: ManuallyDrop<DeviceBuffer<f32>>,
+    /// The host experts' weighted sum, read in place through the mapping.
+    pub(crate) hsum: ManuallyDrop<DeviceBuffer<f32>>,
+    /// `shared expert + hsum`: the combine's shared-expert input.
+    pub(crate) sum: DeviceBuffer<f32>,
+    /// Experts `[0, n_l)` are on the card.
+    pub(crate) n_l: usize,
+    /// Whether the wait sits before the combine (`true`) or right after the
+    /// go.
+    pub(crate) overlap: bool,
+    region: DeviceBuffer<u32>,
+    page: MappedHost,
+    shape: BoundaryShape,
+    /// Byte offset of the host sum in the page.
+    hsum_off: usize,
+}
+
+impl Boundary {
+    /// Allocate the region, the page and the sum for `shape`. Load-time only.
+    pub(crate) fn new(
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        shape: BoundaryShape,
+        cfg: HybridConfig,
+    ) -> Result<Boundary, GpuError> {
+        let what = "Boundary::new";
+        if shape.hidden == 0 || shape.n_used == 0 || shape.n_used > EXPERTS_INTO_MAX {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "hidden {} and {} routed slots: the handoff carries 1..={EXPERTS_INTO_MAX} slots",
+                    shape.hidden, shape.n_used
+                ),
+            ));
+        }
+        let words = X_W + shape.hidden;
+        let region = DeviceBuffer::<u32>::zeroed(stream, words)?;
+        let hsum_off = (PAYLOAD_OFF + 4 * words).next_multiple_of(256);
+        let page = MappedHost::new(ctx, hsum_off + 4 * shape.hidden)?;
+        let base = region.cu_deviceptr();
+        // SAFETY: the ids span is n_used <= MAX_USED words at IDS_W, inside the
+        // region's X_W + hidden words; `region` moves into the boundary beside
+        // the window (a move of the handle, not of the allocation), where it
+        // outlives it and is never reallocated.
+        let ids = unsafe { window::<u32>(base + 4 * IDS_W as u64, shape.n_used, ctx) };
+        // SAFETY: as above, for the weights' n_used words at WTS_W.
+        let weights = unsafe { window::<f32>(base + 4 * WTS_W as u64, shape.n_used, ctx) };
+        // SAFETY: as above, for the activation's `hidden` words at X_W, the
+        // region's tail.
+        let normed = unsafe { window::<f32>(base + 4 * X_W as u64, shape.hidden, ctx) };
+        // SAFETY: the sum's `hidden` f32 start at a 256-aligned offset inside
+        // the page, which moves into the boundary beside the window and is
+        // freed only when the boundary drops.
+        let hsum = unsafe { window::<f32>(page.dev_at(hsum_off), shape.hidden, ctx) };
+        Ok(Boundary {
+            normed,
+            ids,
+            weights,
+            hsum,
+            sum: DeviceBuffer::<f32>::zeroed(stream, shape.hidden)?,
+            n_l: cfg.n_l,
+            overlap: cfg.overlap,
+            region,
+            page,
+            shape,
+            hsum_off,
+        })
+    }
+
+    /// Words in the handoff region and in its host image.
+    fn words(&self) -> usize {
+        X_W + self.shape.hidden
+    }
+
+    /// Bytes the handoff's copy node moves.
+    pub(crate) fn handoff_bytes(&self) -> usize {
+        4 * self.words()
+    }
+
+    /// Device bytes the boundary holds: the region and the sum. The page is
+    /// host memory.
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.region.num_bytes() + self.sum.num_bytes()
+    }
+
+    /// Enqueue layer `layer`'s handoff: the region's image into the page (one
+    /// copy node), then the go batch — a system barrier (the copy lands
+    /// first), the layer into the page, a second barrier, and one added to
+    /// the generation word and to the sequence word the next handoff carries.
+    pub(crate) fn enqueue_out(&self, stream: &CudaStream, layer: usize) -> Result<(), GpuError> {
+        let what = "Boundary::enqueue_out";
+        let layer = u32::try_from(layer).map_err(|_| GpuError::shape(what, "layer passes u32"))?;
+        let bytes = self.handoff_bytes();
+        // SAFETY: the page holds the region's image of `bytes` bytes at
+        // PAYLOAD_OFF (sized so in `new`); both allocations live as long as
+        // the boundary, which outlives every graph that captured this copy.
+        let rc = unsafe {
+            sys::cuMemcpyDtoHAsync_v2(
+                self.page.host_at(PAYLOAD_OFF).cast(),
+                self.region.cu_deviceptr(),
+                bytes,
+                stream.cu_stream(),
+            )
+        };
+        cu(rc, "cuMemcpyDtoHAsync_v2 (hybrid handoff)")?;
+        mem_batch(
+            stream,
+            &mut [
+                op_barrier_sys(),
+                op_write(self.page.dev_at(Word::Lyr.offset()), layer),
+                op_barrier_sys(),
+                op_add(self.page.dev_at(Word::Gen.offset()), 1),
+                op_add(self.region.cu_deviceptr() + 4 * SEQ_W as u64, 1),
+            ],
+            "cuStreamBatchMemOp_v2 (hybrid go)",
+        )
+    }
+
+    /// Enqueue the wait: until the counter is at least one, then minus one.
+    pub(crate) fn enqueue_back(&self, stream: &CudaStream) -> Result<(), GpuError> {
+        let cnt = self.page.dev_at(Word::Cnt.offset());
+        mem_batch(
+            stream,
+            &mut [op_wait_geq(cnt, 1), op_add(cnt, u32::MAX)],
+            "cuStreamBatchMemOp_v2 (hybrid wait)",
+        )
+    }
+
+    /// Release every wait still pending in the stream, for good: the counter
+    /// goes far past anything a step subtracts.
+    fn release(&self) {
+        self.page.word(Word::Cnt).store(RELEASE, Ordering::Release);
+    }
+}
+
+// ------------------------------------------------------------------- host
+
+/// The CPU engine's per-layer expert plans a host tier serves from.
+pub(crate) trait ExpertPlans {
+    /// Layer `l`'s routed-expert plan; `None` for a layer without experts.
+    fn experts(&self, l: usize) -> Option<&MoeBlockPlan>;
+}
+
+/// What the host side has done since load. Counted by the decode thread
+/// alone; nothing here takes a lock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HybridStats {
+    /// Layers served.
+    pub served: u64,
+    /// Services whose go had already landed when the host began to wait for
+    /// it — the card was waiting on the host.
+    pub go_early: u64,
+    /// Of those, the ones that opened a replay: the go of the chain's first
+    /// hybrid layer landed before the launch returned to the host.
+    pub go_early_first: u64,
+    /// Host slots computed, summed over services.
+    pub host_slots: u64,
+    /// The host's share of each service's routed weight squared,
+    /// `Σ_host w² / Σ_all w²`, summed over services.
+    pub host_w2: f64,
+    /// Host wall time from the go seen to the signal, summed (ns).
+    pub leg_ns: u64,
+    /// Pool workers that parked between the start of a service's wait and
+    /// its signal, summed.
+    pub parks_in_service: u64,
+    /// Time from the decode thread seeing a go to the last pool thread
+    /// leaving the wait — what a worker that was not spinning when the go
+    /// landed (parked, or preempted) adds before the experts start. Summed
+    /// and worst, over services whose go was not already there (ns).
+    pub straggle_ns: u64,
+    pub straggle_max_ns: u64,
+}
+
+/// The boundary and the host tier that serves it: the file the host experts
+/// are read from, the CPU engine's plans for them, and the protocol state.
+pub(crate) struct Hybrid<P> {
+    pub(crate) boundary: Boundary,
+    plans: P,
+    file: Split,
+    /// The host's copy of a handoff's activation — one column, allocated at
+    /// load.
+    x: Tensor2,
+    /// Services done: the sequence number the next handoff carries.
+    served: u32,
+    /// The hybrid layers the last whole-chain capture recorded, in chain
+    /// order — what a replay of it asks the host to serve.
+    captured: Vec<usize>,
+    /// The chain being enqueued is a capture, not an eager step.
+    capturing: bool,
+    /// A service failed and released the stream; nothing is served again.
+    poisoned: bool,
+    stats: HybridStats,
+}
+
+impl<P: ExpertPlans> Hybrid<P> {
+    /// The host tier over `boundary`: `file` holds every expert the card does
+    /// not, `plans` resolves them per layer, and `layers` bounds the chain.
+    pub(crate) fn new(
+        boundary: Boundary,
+        plans: P,
+        file: Split,
+        layers: usize,
+    ) -> Result<Hybrid<P>, GpuError> {
+        if file.shard(0).is_none() {
+            return Err(GpuError::state("Hybrid::new", "the file has no shard 0"));
+        }
+        let hidden = boundary.shape.hidden;
+        Ok(Hybrid {
+            boundary,
+            plans,
+            file,
+            x: Tensor2::zeros(hidden, 1),
+            served: 0,
+            captured: Vec::with_capacity(layers),
+            capturing: false,
+            poisoned: false,
+            stats: HybridStats::default(),
+        })
+    }
+
+    /// What the host side has done since load.
+    pub(crate) fn stats(&self) -> HybridStats {
+        self.stats
+    }
+
+    /// The host sum as the page holds it now: the last served layer's.
+    pub(crate) fn hsum_copy(&self) -> Result<Vec<f32>, GpuError> {
+        self.boundary
+            .page
+            .f32_copy(self.boundary.hsum_off, self.boundary.shape.hidden)
+            .ok_or(GpuError::state(
+                "Hybrid::hsum_copy",
+                "the sum is outside the page",
+            ))
+    }
+
+    /// Open a chain on `stream`: a capture records which layers its replays
+    /// will ask for; an eager chain is served as it goes.
+    pub(crate) fn begin_chain(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.refuse_if_poisoned("Hybrid::begin_chain")?;
+        self.capturing = capturing(stream)?;
+        if self.capturing {
+            self.captured.clear();
+        }
+        Ok(())
+    }
+
+    /// Layer `layer`'s hybrid work is enqueued: a capture notes it, an eager
+    /// chain serves it now, before anything more joins the stream behind its
+    /// wait.
+    pub(crate) fn layer_enqueued(&mut self, layer: usize) -> Result<(), GpuError> {
+        if self.capturing {
+            self.captured.push(layer);
+            Ok(())
+        } else {
+            self.serve(layer, false)
+        }
+    }
+
+    /// Serve every hybrid layer a replay of the captured chain submitted, in
+    /// chain order.
+    pub(crate) fn serve_captured(&mut self) -> Result<(), GpuError> {
+        for i in 0..self.captured.len() {
+            let layer = self.captured[i];
+            self.serve(layer, i == 0)?;
+        }
+        Ok(())
+    }
+
+    fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
+        if self.poisoned {
+            return Err(GpuError::state(
+                what,
+                "an earlier hybrid service failed and released the stream",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Serve layer `layer`. Any failure — an error or a panic inside the host
+    /// experts — releases every pending wait first, so the stream drains
+    /// instead of hanging a later synchronize.
+    fn serve(&mut self, layer: usize, opens_replay: bool) -> Result<(), GpuError> {
+        self.refuse_if_poisoned("Hybrid::serve")?;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.serve_one(layer, opens_replay)
+        }));
+        match r {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.poisoned = true;
+                self.boundary.release();
+                Err(e)
+            }
+            Err(p) => {
+                self.poisoned = true;
+                self.boundary.release();
+                std::panic::resume_unwind(p)
+            }
+        }
+    }
+
+    fn serve_one(&mut self, layer: usize, opens_replay: bool) -> Result<(), GpuError> {
+        let what = "Hybrid::serve";
+        let want = self.served.wrapping_add(1);
+        let generation = self.boundary.page.word(Word::Gen);
+        let early = !before(generation.load(Ordering::Acquire), want);
+        let parks = threads::pool().stats().worker_parks;
+        let (seen, straggle) = wait_go(generation, want, Instant::now() + GO_DEADLINE);
+        if early {
+            self.stats.go_early += 1;
+            self.stats.go_early_first += u64::from(opens_replay);
+        } else {
+            self.stats.straggle_ns += straggle;
+            self.stats.straggle_max_ns = self.stats.straggle_max_ns.max(straggle);
+        }
+        if seen != want {
+            let detail = if before(seen, want) {
+                format!(
+                    "the go of layer {layer} did not land in {GO_DEADLINE:?} (generation {seen}, want {want})"
+                )
+            } else {
+                format!(
+                    "generation {seen} is past {want}: the card ran ahead of the host — a hybrid \
+                     layer's wait is missing"
+                )
+            };
+            return Err(GpuError::shape(what, detail));
+        }
+        let t0 = Instant::now();
+        let page = &self.boundary.page;
+        let words = self.boundary.words();
+        let seq = page.payload_word(SEQ_W, words);
+        if seq != Some(self.served) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the handoff carries sequence {seq:?}, the host is at {}: a stale handoff",
+                    self.served
+                ),
+            ));
+        }
+        let lyr = page.word(Word::Lyr).load(Ordering::Acquire);
+        if usize::try_from(lyr).ok() != Some(layer) {
+            return Err(GpuError::shape(
+                what,
+                format!("the go is layer {lyr}'s, the host serves layer {layer}"),
+            ));
+        }
+        // The host's slots, in slot order: every routed id past the card's
+        // prefix, with its weight.
+        let mut list = [(0u32, 0.0f32); EXPERTS_INTO_MAX];
+        let (mut n, mut w2_host, mut w2_all) = (0usize, 0.0f64, 0.0f64);
+        for s in 0..self.boundary.shape.n_used {
+            let (Some(id), Some(wb)) = (
+                page.payload_word(IDS_W + s, words),
+                page.payload_word(WTS_W + s, words),
+            ) else {
+                return Err(GpuError::shape(what, "the routing is outside the handoff"));
+            };
+            let w = f32::from_bits(wb);
+            w2_all += f64::from(w) * f64::from(w);
+            if usize::try_from(id).is_ok_and(|id| id >= self.boundary.n_l) {
+                list[n] = (id, w);
+                n += 1;
+                w2_host += f64::from(w) * f64::from(w);
+            }
+        }
+        if !page.payload_f32_into(X_W, words, &mut self.x.data) {
+            return Err(GpuError::shape(
+                what,
+                "the activation is outside the handoff",
+            ));
+        }
+        let gguf = self
+            .file
+            .shard(0)
+            .ok_or(GpuError::state(what, "the file has no shard 0"))?;
+        let plan = self.plans.experts(layer).ok_or(GpuError::state(
+            what,
+            "a hybrid layer without an expert plan",
+        ))?;
+        let (off, hidden) = (self.boundary.hsum_off, self.boundary.shape.hidden);
+        let out = self
+            .boundary
+            .page
+            .f32_mut(off, hidden)
+            .ok_or(GpuError::state(what, "the sum is outside the page"))?;
+        experts_into(gguf, plan, &self.x, &list[..n], out)?;
+        self.boundary
+            .page
+            .word(Word::Cnt)
+            .fetch_add(1, Ordering::Release);
+        self.served = want;
+        let s = &mut self.stats;
+        s.served += 1;
+        s.host_slots += n as u64;
+        s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
+        s.leg_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        s.parks_in_service += threads::pool().stats().worker_parks.saturating_sub(parks);
+        Ok(())
+    }
+}
+
+/// Wait until the generation word has reached `want` or `deadline` has
+/// passed, with every pool thread spinning on it — a pool job, so no worker
+/// is parked when the go lands and the dispatch that follows starts inside
+/// the spin window this job leaves them in. Returns the word as last read,
+/// and the nanoseconds from the calling thread seeing it to the job's end
+/// (the calling thread runs the last chunk and alone writes that stamp).
+fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
+    let pool = threads::pool();
+    let caller = pool.threads() - 1;
+    let base = Instant::now();
+    let seen_at = AtomicU64::new(0);
+    pool.for_each_chunk(pool.threads(), |chunk| {
+        let mut spins = 0u32;
+        while before(generation.load(Ordering::Acquire), want) {
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(DEADLINE_POLL) && Instant::now() > deadline {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        if chunk.start == caller {
+            let ns = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            seen_at.store(ns, Ordering::Relaxed);
+        }
+    });
+    let end = u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    (
+        generation.load(Ordering::Acquire),
+        end.saturating_sub(seen_at.load(Ordering::Relaxed)),
+    )
+}

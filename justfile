@@ -92,6 +92,10 @@ gate-gpu-q4k-sel:
 gate-gpu-e2e *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && bash tools/gpu-gate.sh gate_e2e {{ARGS}} && BLOOMERY_FLASH_MMA=0 bash tools/gpu-gate.sh gate_e2e'
 
+# The hybrid MoE boundary gate: V2-Lite at n_l 32 and 0 (experts past n_l on the host) against the all-card model.
+gate-gpu-hybrid *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_hybrid && bash tools/gpu-gate.sh gate_hybrid {{ARGS}}'
+
 # 교사 강제 자의 한 위치(프롬프트 ID, 스텝 S)를 두 팔로 연다: 스칼라 팔이 덤프를 쓰고 MMA 팔이 그것과 대조해
 # 두 팔의 로짓 top-k·ik 토큰 순위·강제 스텝별 마진·층별 탭 상대 거리·라우팅 차이를 찍는다. 예: `just forced-probe 12 23`.
 forced-probe ID STEP *ARGS:

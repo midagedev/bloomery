@@ -712,3 +712,76 @@ pub fn moe_ffn_with(gguf: &Gguf, plan: &MoeBlockPlan, x: &Tensor2) -> Result<Ten
     }
     Ok(out)
 }
+
+/// The most experts one [`experts_into`] call takes. Its two dispatch lists
+/// live in stack arrays of this size, so the call allocates nothing of its
+/// own.
+pub const EXPERTS_INTO_MAX: usize = 8;
+
+/// A given list of routed experts of ONE token, weighted and summed into
+/// `out`: `out = Σ_i w_i · down_{e_i}(silu(gate_{e_i}·x) ⊙ (up_{e_i}·x))`,
+/// accumulated in list order.
+///
+/// The host tier of a hybrid engine calls this for the experts its card does
+/// not hold. It is the decode shape of [`moe_ffn_with`]'s routed half: one
+/// group dispatch for every listed expert's gate and up (`x` quantized once,
+/// by the weight type's own activation rule), one for their downs with each
+/// SwiGLU combine produced inside it. The weights are applied as given — the
+/// caller's router has already scaled them. `x` is one column of the model
+/// width and `out` holds that width; an empty list writes zeros. Nothing is
+/// allocated here beyond what the two group dispatches allocate for their
+/// outputs.
+pub fn experts_into(
+    gguf: &Gguf,
+    plan: &MoeBlockPlan,
+    x: &Tensor2,
+    experts: &[(u32, f32)],
+    out: &mut [f32],
+) -> Result<(), ModelError> {
+    let n = experts.len();
+    if x.ne1 != 1 || out.len() != x.ne0 || n > EXPERTS_INTO_MAX {
+        return Err(ModelError::Shape {
+            what: "experts_into: one token, out of its width, at most EXPERTS_INTO_MAX experts",
+            want_ne0: x.ne0,
+            want_ne1: EXPERTS_INTO_MAX,
+            got_ne0: out.len(),
+            got_ne1: n,
+        });
+    }
+    out.fill(0.0);
+    if n == 0 {
+        return Ok(());
+    }
+    // The unused tails keep a placeholder view; only the first n (2n) are passed.
+    let mut gu_ws: [&TensorInfo; 2 * EXPERTS_INTO_MAX] = [&plan.gate_inp; 2 * EXPERTS_INTO_MAX];
+    let mut down_ws: [&TensorInfo; EXPERTS_INTO_MAX] = [&plan.gate_inp; EXPERTS_INTO_MAX];
+    for (i, &(e, _)) in experts.iter().enumerate() {
+        gu_ws[2 * i] = expert_of(&plan.gate_views, e, plan.block)?;
+        gu_ws[2 * i + 1] = expert_of(&plan.up_views, e, plan.block)?;
+        down_ws[i] = expert_of(&plan.down_views, e, plan.block)?;
+    }
+    let gu_xs: [&Tensor2; 2 * EXPERTS_INTO_MAX] = [x; 2 * EXPERTS_INTO_MAX];
+    let gu = matmul_q_group(gguf, &gu_ws[..2 * n], &gu_xs[..2 * n])?;
+    let srcs: [GroupInput<'_>; EXPERTS_INTO_MAX] = std::array::from_fn(|i| {
+        if i < n {
+            GroupInput::Swiglu(&gu[2 * i], &gu[2 * i + 1])
+        } else {
+            GroupInput::Ready(x)
+        }
+    });
+    let (downs, _pars) = matmul_q_group_swiglu(gguf, &down_ws[..n], &srcs[..n])?;
+    for (&(_, w), d) in experts.iter().zip(&downs) {
+        for (o, &dv) in out.iter_mut().zip(d.col(0)) {
+            *o += w * dv;
+        }
+    }
+    Ok(())
+}
+
+/// Expert `e`'s view in one of a block plan's per-expert view lists; an id
+/// past the list is the caller's error, named with the block.
+fn expert_of(views: &[TensorInfo], e: u32, block: usize) -> Result<&TensorInfo, ModelError> {
+    views
+        .get(e as usize)
+        .ok_or_else(|| ModelError::MissingTensor(format!("expert {e} of block {block}")))
+}

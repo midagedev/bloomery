@@ -80,6 +80,7 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-model",
+ "bloomery-threads",
  "cuda-core",
  "cuda-device",
  "cuda-host",
