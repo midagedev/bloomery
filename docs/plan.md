@@ -446,7 +446,7 @@ flowchart LR
 ⑥ **카드 몫**(그 카드를 열 때 스펙에 넣는다 — B2의 V4.1 선행 셋과 B5의 Q5_K 게이트는 이미 카드에 있다)
 - B1c: 작은 할당이 적재 순서 탓에 완전 패킹보다 25–52 MB를 더 쓴다. KV와 scratch도 같은 `Heap`에 태운다.
 - B2: V4.1 선행 셋(`moe.rs:150` n_expert > 64, `ops.rs:476` 샤드 동일성, `qdot::swiglu` 클램프). `build-qdot-ref.sh:40`에 ik Q3_K 짝 하네스가 없어 호스트 바이트의 60 %(q3_K gate/up)에 ik 기준이 없다(S). 4 KiB 페이지 캐시의 TLB 비용 상한 0.8 ms/토큰[유도].
-- B3: GDS는 버린다(09-23 낮) — `gdscheck -p`(GDS 1.15.1.6)에서 NVMe·NVMe P2PDMA가 둘 다 Unsupported이고 compat 모드뿐이다(nvidia-fs 커널 모듈이 없다). 쓰려면 커널 모듈 설치(사용자 승인 항목)가 먼저이고, 4 KiB 단위·페이지 캐시 우회라 B3e와 상충한다. A6000의 DMA-BUF `mmap`(속성 152 = 1, 측정)은 CPU가 VRAM에 직접 쓰는 경로 후보다.
+- B3: GDS — nvidia-fs를 설치했다(09-23 11:52, 사용자 승인 "할수 있는건 다해보자"; `nvidia-fs-dkms` 2.30.2, 새 패키지 하나·업그레이드 0·제거 0, DKMS가 6.8.0-139에 빌드, `modprobe nvidia_fs`). 그래도 `gdscheck -p`의 NVMe와 NVMe P2PDMA는 Unsupported이고(`use_pci_p2pdma: true` 사본으로도), 두 카드는 "supports GDS"다 — A6000 BAR1 65,536 MiB, 3090 256 MiB. 남은 걸림돌은 IOMMU 번역 모드다(그룹 72개 전부 `DMA-FQ`, `iommu: Default domain type: Translated`; gdscheck가 on/pt에서 동작을 보장하지 않는다고 경고한다). 다음 단계는 커널 파라미터 `iommu=pt`와 재부팅이라 사용자 판단이다. 값은 engram 행 직접 읽기 정도다 — 호스트 expert는 CPU가 RAM에서 128 GB/s로 도는 편이 NVMe 스트리밍보다 훨씬 빠르다[유도]. A6000의 DMA-BUF `mmap`(속성 152 = 1, 측정)은 CPU가 VRAM에 직접 쓰는 경로 후보다.
 - B4 op 라운드: `tensor.rs:106` `Q8Act` 상한은 b4-hc, `bench_v41`의 `q8_0_gemv_heads` 사이트는 b4-woa.
 - B5: Q5_K의 모델 수준 게이트. ik와 VRAM을 비교할 때는 ik 포크 KV의 의심 항 넷을 차이로 읽는다(장부, b1a 트리아지).
 - C3·C4: `q8f32.rs`의 m > 1 일반 몸통은 1col이 대체한 굶는 모양 그대로다. 배치·추측 디코드가 m > 1을 부르게 되면 이것이 먼저다(M).
