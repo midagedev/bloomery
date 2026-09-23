@@ -84,6 +84,10 @@ gate-gpu-p9:
 gate-gpu-q4k-sel:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_q4k_sel && bash tools/gpu-gate.sh gate_q4k_sel'
 
+# B4 hyper-connections: the chain kernel, HC_PRE, HC_POST and the folds against our rule and the V4.1 ik dumps, every sub-layer.
+gate-gpu-ds41-hc:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_hc && bash tools/gpu-gate.sh gate_deepseek41_hc'
+
 # 종단 게이트: 27층 + lm_head + argmax 전체 사슬을 ik CUDA greedy(33프롬프트 × 32스텝)와 대조하고,
 # 그래프 재생이 즉시 실행과 토큰 단위로 같은지 본다(정확성 실행, 측정 아님). 이름이 pN이 아닌 이유는
 # gate_e2e.rs 머리글 — P9·P10은 커널 꾸러미로 이미 쓰이고 있다. 두 번 돈다: 기본 패스(텐서 코어 flash)와

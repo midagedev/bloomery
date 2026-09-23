@@ -63,12 +63,18 @@ impl<T: DeviceCopy> DeviceTensor<T> {
     }
 }
 
+/// The largest K a [`Q8Act`] takes: the widest K-quant input of the models
+/// this engine runs — DeepSeek-V4.1's `hc_{attn,ffn}_fn` read all four
+/// residual streams, 4 × 5120 values.
+pub(crate) const Q8ACT_MAX_K: usize = 20_480;
+
 /// q8_1 activation scratch for up to `m` columns of `k` values each. One
 /// set per distinct input site: sites that read the same activation
 /// (gate·up, q·kv_a) share one (decision 2, as the CPU engine does).
 ///
-/// `k` is a multiple of 256 with 256 <= k <= 10944 (the model's largest K,
-/// so the multiple-of-256 test caps the usable range at 10752). With
+/// `k` is a multiple of 256 with 256 <= k <= [`Q8ACT_MAX_K`]. The cap is a
+/// sanity bound, not a layout limit: no kernel stages a K-sized array, and
+/// every index the layout computes stays far inside u32 at the cap. With
 /// n_sb = k/256 super-blocks per row, buffer sizes in elements per column
 /// are: q3 `64 * ceil(n_sb/2)` u64, q4 `256 * ceil(n_sb/4)` u32,
 /// q6 `128 * ceil(n_sb/2)` u32, s8 `8 * n_sb` i32, d8 `2 * n_sb` f32.
@@ -103,10 +109,10 @@ impl Q8Act {
                 format!("1 <= m <= 8, got {m}"),
             ));
         }
-        if !k.is_multiple_of(256) || !(256..=10944).contains(&k) {
+        if !k.is_multiple_of(256) || !(256..=Q8ACT_MAX_K).contains(&k) {
             return Err(GpuError::shape(
                 "Q8Act::with_k",
-                format!("k must be a multiple of 256 in 256..=10944, got {k}"),
+                format!("k must be a multiple of 256 in 256..={Q8ACT_MAX_K}, got {k}"),
             ));
         }
         let n_sb = k / 256;

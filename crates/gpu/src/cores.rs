@@ -72,7 +72,7 @@ pub(crate) fn funnel16(lo: u32, hi: u32) -> u32 {
 /// warp): the packed little-endian byte word, and the lane-local signed
 /// quad sum the s8 butterfly starts from.
 #[inline(always)]
-pub(crate) fn q8_quad(v: [f32; 4], d: f32) -> (u32, i32) {
+pub fn q8_quad(v: [f32; 4], d: f32) -> (u32, i32) {
     let q0 = ((v[0] / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
     let q1 = ((v[1] / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
     let q2 = ((v[2] / d).round().clamp(-127.0, 127.0) as i32 as u32) & 0xff;
@@ -675,7 +675,7 @@ pub(crate) fn q3k_dequant(vl: u32, vh1: u32) -> [u32; 4] {
 /// each scaled in int by its sub-block scale so one f32 FMA per column
 /// carries both shared scales.
 #[inline(always)]
-pub(crate) fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32 {
+pub fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32 {
     dp4a_s32(vi[0], w01 as u32, 0) * sc[0]
         + dp4a_s32(vi[1], (w01 >> 32) as u32, 0) * sc[1]
         + dp4a_s32(vi[2], w23 as u32, 0) * sc[2]
@@ -689,10 +689,12 @@ pub(crate) fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32
 /// [`q3k_row_dot`]. The whole decode lives here so the single-column body
 /// and the m-column body cannot drift apart.
 ///
-/// SAFETY: callers keep the super-block at `base` inside a row whose
-/// ceil(bytes/4) words are all in `w`.
+/// # Safety
+///
+/// Callers keep the super-block at `base` inside a row whose ceil(bytes/4)
+/// words are all in `w`.
 #[inline(always)]
-pub(crate) fn q3k_sb_decode(
+pub unsafe fn q3k_sb_decode(
     w: &[u32],
     base: usize,
     w16: usize,
@@ -797,7 +799,7 @@ fn q3k_iter_term(
     let sbp = ((it << 1) | half as u32) as usize;
     // SAFETY: `base` is this super-block's byte offset inside the row by this
     // fn's contract, so its window stays in the row.
-    let (vi, sc, drow) = q3k_sb_decode(w, base, w16, s0);
+    let (vi, sc, drow) = unsafe { q3k_sb_decode(w, base, w16, s0) };
     let qb = 64 * it as usize + lane;
     let d8b = 2 * sbp + d8_base;
     // SAFETY: qb0 + qb < (col0+1)*64*iters, the column's u64 slots, by the
@@ -966,7 +968,8 @@ pub fn q3k_row_dot(
             // `q3k_row_dot_1col`.
             // SAFETY: row_abs is inside w by this fn's contract and sbp <
             // n_sb, so the super-block's window stays in the row.
-            let (vi, sc, drow) = q3k_sb_decode(w, row_abs * row_bytes + sbp * 110, w16, s0);
+            let (vi, sc, drow) =
+                unsafe { q3k_sb_decode(w, row_abs * row_bytes + sbp * 110, w16, s0) };
 
             // q8_1 words in the q3 u64 pairing: field pair (2p, 2p+1)
             // of column c lives in u64 slot q_col*c + 64it + 32p + lane
