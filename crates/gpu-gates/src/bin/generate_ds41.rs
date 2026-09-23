@@ -31,10 +31,11 @@
 //! runner feeds. There is no synthetic depth: `seed_depth` refuses on this
 //! body.
 //!
-//! A run that would feed a position where an indexer layer's stream shows
-//! more rows than the file's `top_k` is refused before anything loads: the
-//! attention reads a prefix of the visible rows, which is the model's
-//! answer only while every visible row fits in `top_k`.
+//! Any depth up to `--ctx` runs: every indexer layer selects its stream's
+//! list at every position (the identity while the visible rows fit in
+//! `top_k`, the indexer's top-k after). The run selects with the file's
+//! `top_k`, the model's own; the load line prints it, and a body that
+//! loaded with another is refused before the first step.
 //!
 //! `--time` is a MEASUREMENT and belongs under the machine-wide lease
 //! (`tools/ref/time-gate.sh generate_ds41 … --time`,
@@ -66,7 +67,6 @@ mod drive {
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use gguf::Split;
-    use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{Machine, workstation};
 
@@ -275,21 +275,6 @@ mod drive {
         Ok((ids, prompt_len))
     }
 
-    /// The first position at which an indexer layer's stream shows more rows
-    /// than `top_k`: `⌊(pos + 1) / ratio⌋ > top_k` from `(top_k + 1)·ratio −
-    /// 1` on. Returns it with the layer and the ratio.
-    fn first_selected(hp: &Hparams) -> Option<(usize, usize, u32)> {
-        hp.layers
-            .iter()
-            .enumerate()
-            .filter(|(_, k)| k.indexer)
-            .filter_map(|(l, k)| {
-                k.stream
-                    .map(|s| ((hp.indexer.top_k + 1) * s.ratio as usize - 1, l, s.ratio))
-            })
-            .min()
-    }
-
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
         let (ids, prompt_len) = fed_ids(&a)?;
@@ -309,19 +294,6 @@ mod drive {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        if let Some((p, l, r)) = first_selected(&inputs.hp)
-            && fed > p
-        {
-            return Err(format!(
-                "this run feeds positions 0..={}, and from position {p} layer {l}'s indexer \
-                 (a ratio-{r} stream) has more than top_k {} rows to choose from; the chain \
-                 attends a prefix of them, not the indexer's selection, so a step there is \
-                 not the model's. Refused before loading.",
-                fed - 1,
-                inputs.hp.indexer.top_k
-            )
-            .into());
-        }
         print_plan(&inputs, a.place, a.ctx)?;
         drop(split);
 
@@ -329,8 +301,18 @@ mod drive {
         let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let mut m = body::open(file, a.place.machine(), a.ctx)?;
         m.set_mode(a.mode);
+        let top_k = m.body("generate_ds41")?.indexer_top_k();
+        if top_k != inputs.hp.indexer.top_k {
+            return Err(format!(
+                "the body selects {top_k} rows per stream, the file's top_k is {}: a step \
+                 past that many visible rows would not be the model's",
+                inputs.hp.indexer.top_k
+            )
+            .into());
+        }
         println!(
-            "load resident_bytes={} ctx={} layers={} mode={} place={} in {:.1} s (runtime value)",
+            "load resident_bytes={} ctx={} layers={} top_k={top_k} mode={} place={} in {:.1} s \
+             (runtime value)",
             m.resident_bytes(),
             a.ctx,
             inputs.hp.n_layer,
