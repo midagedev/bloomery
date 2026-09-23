@@ -149,13 +149,17 @@ for r in $(seq "$ROUNDS"); do
         p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
         mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
         warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
-        series=$(echo "$out" | awk '/^time step /{sub(/.*ms=/,""); print}')
+        # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
+        # and the `draft summary` line carries the positions-per-second rate the verdict reads.
+        series=$(echo "$out" | awk '/^time (step|pass) /{sub(/.*ms=/,""); sub(/ .*/,""); print}')
+        draft=$(echo "$out" | grep -E '^draft summary ' | sed -n 's/.*proposals=\([0-9]*\) accepts=\([0-9]*\) positions=\([0-9]*\) passes=\([0-9]*\) tok\/s(positions)=\([0-9.]*\).*/p=\1\/\4 q=\2\/\1 positions=\3 tok\/s(positions)=\5/p')
         h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
         t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
         uniq_tok=$(echo "$out" | awk '/^step /{print $4}' | sort -u | wc -l | tr -d ' ')
         tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
         tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-        echo "ROW r$r ours d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | wall $((t1 - t0))s"
+        echo "ROW r$r ours d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft} | wall $((t1 - t0))s"
+        if [ -n "$draft" ]; then tps_mean=${draft##*tok/s(positions)=}; fi
         sums+=("ours d=$dep n=$N|$tps_mean|$tps_p50")
         ;;
     esac
