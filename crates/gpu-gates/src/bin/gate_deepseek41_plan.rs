@@ -47,11 +47,13 @@ const STREAMS: [&str; 2] = ["csa", "hca"];
 /// The decode-step sets, each one token after a prefill run node by node (the model profile's
 /// `ref_step_variant`, `tools/ref/models/deepseek41.sh`): step4 at an even position, where no
 /// csa group completes; d1 at 301 and d2 at 1,025, where one does, the window mask 512 and
-/// 1,280 cells wide; d1 and d2 once more with the indexer's top-k unfused.
-const STEP_SETS: [&str; 5] = [
+/// 1,280 cells wide; d1 and d2 once more with the indexer's top-k unfused; d1n at 301 with the
+/// file's top-k, where neither stream builds an indexer.
+const STEP_SETS: [&str; 6] = [
     "ref_deepseek41_step4_every_node",
     "ref_deepseek41_d1_every_node",
     "ref_deepseek41_d1_unfused_every_node",
+    "ref_deepseek41_d1n_every_node",
     "ref_deepseek41_d2_every_node",
     "ref_deepseek41_d2_unfused_every_node",
 ];

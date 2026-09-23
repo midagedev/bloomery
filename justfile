@@ -519,7 +519,8 @@ gate-gpu-gates-lib:
 gate-ds41-oracle:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_oracle --nocapture'
 
-# The V4.1 host step plan: its decode-walk unit tests, then every graph input of the V4.1 oracle sets (the batch set and the decode-step sets) against the plan, bit for bit (host only: no card, no gate lock).
+# V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, V4.1 오라클 세트(배치 세트와 디코드 스텝 세트)의
+# 그래프 입력 전부를 계획과 비트 단위로 대조한다. 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
 gate-ds41-plan:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && timeout --kill-after=10 900 ./target/release/gate_deepseek41_plan'
 
