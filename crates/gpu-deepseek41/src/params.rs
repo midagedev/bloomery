@@ -279,8 +279,36 @@ impl ImageLayout {
         4 * self.words
     }
 
-    fn table_at(&self, t: usize, table: Table) -> usize {
+    /// Word of token `t`'s rope table `table`.
+    #[must_use]
+    pub fn table_at(&self, t: usize, table: Table) -> usize {
         self.rope_at + (t * Table::ALL.len() + table.index()) * self.dims.rope_dims
+    }
+
+    /// Word of token `t`'s id; its position, ring slot and window length
+    /// follow it.
+    #[must_use]
+    pub fn token_at(&self, t: usize) -> usize {
+        TOKEN_WORDS * t
+    }
+
+    /// Word of stream `s`'s visible counts, one per token; `None` past the
+    /// streams.
+    #[must_use]
+    pub fn n_visible_at(&self, s: usize) -> Option<usize> {
+        self.streams.get(s).map(StreamLayout::n_visible_at)
+    }
+
+    /// Word of token `t`'s embedding row.
+    #[must_use]
+    pub fn embd_at(&self, t: usize) -> usize {
+        self.embd_at + t * self.dims.n_embd / 2
+    }
+
+    /// Word of token `t`'s engram rows.
+    #[must_use]
+    pub fn engram_at(&self, t: usize) -> usize {
+        self.engram_at + t * self.engram_words
     }
 
     /// `words` — an image of this layout, a host copy or one read back from
@@ -723,6 +751,38 @@ mod tests {
         let window = RopeSpec::window(10_000.0, ROPE_DIMS);
         let yarn = RopeSpec::yarn(160_000.0, 16.0, 65_536, 32.0, 1.0, ROPE_DIMS);
         StepImage::new(layout, &window, &yarn).expect("the test ropes make tables")
+    }
+
+    /// Each offset accessor names the word the view reads the same field at,
+    /// for every token of a two-token image: an image whose every word holds
+    /// its own index shows it.
+    #[test]
+    fn offsets_are_the_views() {
+        let img = image(2);
+        let layout = img.layout();
+        let probe: Vec<u32> = (0..u32::try_from(layout.words()).expect("u32 words")).collect();
+        let view = layout.view(&probe).expect("a view");
+        let at = |w: u32| w as usize;
+        for t in 0..2 {
+            assert_eq!(at(view.token(t).token), layout.token_at(t), "token {t}");
+            assert_eq!(at(view.embd(t)[0]), layout.embd_at(t), "embd {t}");
+            assert_eq!(at(view.engram(t)[0]), layout.engram_at(t), "engram {t}");
+            for table in Table::ALL {
+                assert_eq!(
+                    at(view.table(t, table)[0]),
+                    layout.table_at(t, table),
+                    "{table:?} {t}"
+                );
+            }
+        }
+        for s in 0..layout.streams().len() {
+            assert_eq!(
+                Some(at(view.stream(s).n_visible[0])),
+                layout.n_visible_at(s),
+                "stream {s}"
+            );
+        }
+        assert_eq!(layout.n_visible_at(layout.streams().len()), None);
     }
 
     /// The ring append gives each token of a step its own slot only when the

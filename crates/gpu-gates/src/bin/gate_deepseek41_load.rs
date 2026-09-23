@@ -22,10 +22,12 @@
 //!   made here from the file's keys as the rope gate makes them, and a row
 //!   table of a group the step does not complete is zero; the rows come back
 //!   in the layout's packing.
-//! - (iv) refusals: capturing the chain and seeding a depth both refuse.
-//! - (v) reload: a probe context holds the card across two loads; each
-//!   model's drop gives back everything its load took, and the second load
-//!   takes exactly what the first took.
+//! - (iv) the chain captures (its node count is the step gate's), and
+//!   seeding a depth refuses.
+//! - (v) reload: a probe context holds the card across two loads; the first
+//!   model's drop gives back everything but what its chain capture took from
+//!   the context (iv), the second load takes exactly what the first took, and
+//!   its drop gives back all of it.
 //!
 //! Before any upload the card is found by name and must have free what the
 //! plan puts on it besides the context; a short card refuses the run.
@@ -130,14 +132,15 @@ mod gate {
             ok &= check_state(&inputs.kv, body);
             ok &= check_image(&planner, &specs, body, gpu.stream())?;
         }
-        ok &= check_refusals(&mut m);
+        let (refusals_ok, captured) = check_refusals(&mut m, &probe)?;
+        ok &= refusals_ok;
         drop(m);
         let free2 = free(&probe)?;
         let m = load(&path, 2)?;
         let free3 = free(&probe)?;
         drop(m);
         let free4 = free(&probe)?;
-        ok &= check_reload([free0, free1, free2, free3, free4]);
+        ok &= check_reload([free0, free1, free2, free3, free4], captured);
 
         if !ok {
             return Err(checks_failed());
@@ -146,8 +149,9 @@ mod gate {
             "PASSED: gate_deepseek41_load — the gate plan's segments are resident at its bytes and \
              the slot map is its expert prefix on the card and in the host tier; every layer's \
              state is KvLayout's bytes; the step image at positions 4, 301 and 1025 reads back as \
-             the plan's integers and RopeTable's tables; the chain and a synthetic depth refuse; a \
-             second load takes what the first took and each drop gives it back"
+             the plan's integers and RopeTable's tables; the chain captures and a synthetic depth \
+             refuses; a second load takes what the first took and each drop gives back all but \
+             the context's capture"
         );
         Ok(())
     }
@@ -632,19 +636,23 @@ mod gate {
         )
     }
 
-    /// Check (iv): the chain and a synthetic depth refuse.
-    fn check_refusals(m: &mut Deepseek41Model) -> bool {
+    /// Check (iv): the chain captures and a synthetic depth refuses. Returns
+    /// the device bytes the context's first capture took: the driver keeps
+    /// them for the context, not the model, and check (v) counts them out.
+    fn check_refusals(m: &mut Deepseek41Model, probe: &Gpu) -> Result<(bool, u64), GateError> {
         let describe = |r: &Result<String, String>| match r {
             Ok(v) => format!("accepted ({v})"),
             Err(e) => format!("refused: {e}"),
         };
+        let before = free(probe)?;
         let chain = m
             .capture_step()
             .map(|n| format!("{n} nodes"))
             .map_err(|e| e.to_string());
-        let chain_ok = matches!(&chain, Err(e) if e.contains("not assembled"));
+        let captured = before.saturating_sub(free(probe)?);
+        let chain_ok = chain.is_ok();
         println!(
-            "check iv: capturing the chain — {}: {}",
+            "check iv: capturing the chain — {} (the capture took {captured} B of the context): {}",
             describe(&chain),
             verdict(chain_ok)
         );
@@ -658,17 +666,27 @@ mod gate {
             describe(&seed),
             verdict(seed_ok)
         );
-        chain_ok && seed_ok
+        Ok((chain_ok && seed_ok, captured))
     }
 
     /// Check (v): the card's free bytes before the first load, after it,
-    /// after its drop, after the second load and after its drop.
-    fn check_reload([before, first, dropped, second, end]: [u64; 5]) -> bool {
+    /// after its drop, after the second load and after its drop. The first
+    /// model's drop leaves exactly `captured` behind — what its chain capture
+    /// took from the context (check iv) — and the second cycle, which
+    /// captures nothing, leaves nothing.
+    /// PIN(2026-09-23): the first capture in a context takes 8 MiB the model's
+    /// drop does not return and a second capture takes 0 (measured in the
+    /// b5step round); before the chain captured, the pin was "every drop
+    /// returns everything".
+    fn check_reload([before, first, dropped, second, end]: [u64; 5], captured: u64) -> bool {
         let took = |a: u64, b: u64| i128::from(a) - i128::from(b);
-        let pass = dropped == before && second == first && end == before;
+        let pass = took(before, dropped) == i128::from(captured)
+            && took(dropped, second) == took(before, first)
+            && end == dropped;
         println!(
             "check v: free {before} B before, {first} after load 1 (took {}), {dropped} after its drop \
-             (gave back {}), {second} after load 2 (took {}), {end} after its drop (gave back {}): {}",
+             (gave back {}; the capture's {captured} B stay with the context), {second} after load 2 \
+             (took {}), {end} after its drop (gave back {}): {}",
             took(before, first),
             took(dropped, first),
             took(dropped, second),
@@ -677,11 +695,11 @@ mod gate {
         );
         if !pass {
             println!(
-                "FAIL: check v: the first drop left {} B taken, the second load took {} B more than \
-                 the first, the second drop left {} B taken",
-                took(before, dropped),
+                "FAIL: check v: the first drop left {} B taken besides the capture's {captured}, the \
+                 second load took {} B more than the first, the second drop left {} B taken",
+                took(before, dropped) - i128::from(captured),
                 took(dropped, second) - took(before, first),
-                took(before, end)
+                took(dropped, end)
             );
         }
         pass

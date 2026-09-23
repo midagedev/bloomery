@@ -636,6 +636,28 @@ gate-gpu-ds41-attn:
 gate-gpu-ds41-chain-attn:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_attn && bash tools/gpu-gate.sh gate_deepseek41_chain_attn'
 
+# 조립된 V4.1 스텝(B5 1단계, pos < 512·선택 없음)을 게이트 배치로 엔진 입구를 거쳐 돌린다. --structure: 캡처된 스텝의
+# 커널·메모리 연산 배치 수가 조각들이 예측한 수와 같고, step4 세트의 상태를 주입한 재생이 eager 실행과 비트까지 같다.
+# --sets: step4·d1n 세트에서 층마다 덤프의 상태를 주입해 eager 스텝 하나 — engram 행 id와 라우터 id는 정확히(근접 동률은
+# 면제), 서브층마다 스트림은 전파 밴드 안, result_output의 argmax. 3090, 게이트 락.
+gate-gpu-ds41-step *ARGS='--structure --sets':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}}'
+
+# ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — step 게이트
+# --greedy의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
+ik-greedy-ds41 PROMPT='0':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'PROMPT={{PROMPT}} bash tools/ref/ik-greedy.sh'
+
+# G3: 엔진 자신의 스텝으로 prompts.tsv 행 PROMPT에서 64토큰 greedy, ik-greedy-ds41의 파일과 대조(첫 불일치에서 우리
+# margin < 1.5면 통과). 정상 상태 스텝의 allocator 호출·페이지 폴트 수를 옆에 찍는다.
+run-ds41-greedy PROMPT='0':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step --greedy {{PROMPT}}'
+
+# G4: ik의 KLD 기준 파일 TAG($BLOOMERY_DATA/ikppl/TAG.kld)에 대한 우리 NLL·KLD·top-1 — 청크마다 리셋하고 id마다 엔진
+# 스텝 하나. 512 × 16청크는 약 8,200스텝이라 한도를 28분으로 올린다. 빨강은 Δ_PPL > +1.5 %.
+run-ds41-ppl TAG:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_deepseek41_step --ppl {{TAG}}'
+
 # ik KLD 기준 파일 둘을 위치마다 비교한다(P = A, Q = B, 태그는 $BLOOMERY_DATA/ikppl 아래, 호스트만).
 # ARGS: --ubatch N(여러 번 줄 수 있다), --ik <ik-ppl --kld 태그>(ik가 찍은 요약과 밴드 안에서 맞는지).
 kld-diff A B *ARGS:
@@ -644,8 +666,8 @@ kld-diff A B *ARGS:
 # V4.1 본체를 게이트 배치(모든 층과 헤드, 예산 안에서 가장 큰 expert 접두)대로 엔진 입구를 거쳐 3090에 두 번 올린다.
 # 세그먼트는 계획의 바이트대로, 슬롯 맵은 그 접두대로 올라가야 하고(카드 사본과 호스트 티어 사본이 같아야 한다), 층마다
 # 상태는 KvLayout의 바이트와 같아야 한다. 위치 4·301·1025의 스텝 이미지를 되읽어 계획의 정수·RopeTable의 표와 맞춘다.
-# 체인과 합성 깊이는 거부돼야 하고, 두 번째 적재는 첫 번째와 같은 양을 가져가야 한다. 측정이 아니라 정확성 실행이다
-# (파일 중 카드 몫을 두 번 읽는다).
+# 체인은 캡처돼야 하고(노드 수는 step 게이트의 몫) 합성 깊이는 거부돼야 한다. 두 번째 적재는 첫 번째와 같은 양을 가져가고,
+# 드롭은 컨텍스트의 첫 캡처가 쥔 몫만 빼고 전부 돌려줘야 한다. 측정이 아니라 정확성 실행이다(파일 중 카드 몫을 두 번 읽는다).
 gate-ds41-load:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_load && bash tools/gpu-gate.sh gate_deepseek41_load'
 

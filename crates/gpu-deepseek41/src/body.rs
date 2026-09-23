@@ -11,27 +11,36 @@
 //!   latest latent projections in f32, values and scores (a ratio-1 group is
 //!   its one row: nothing pools); per layer that owns index keys, as many
 //!   rows of index key in f16;
-//! - the hyper-connection streams as a ping-pong pair, so each sub-layer reads
-//!   one and writes the other and no copy node sits between layers;
+//! - the hyper-connection streams and the folded input as ping-pong pairs, so
+//!   each sub-layer reads one and writes the other and no copy node sits
+//!   between sub-layers;
 //! - the device copy of the step image ([`crate::params`]);
 //! - the slot map: per layer and expert id, the slot of the card's routed
 //!   stack that holds the expert, or [`HOST`] — filled from the plan's
 //!   segments, so moving an expert between the card and the host changes
 //!   this map and not the code; the chain reads its card copy and the host
 //!   tier its host copy ([`SlotMap`]);
-//! - the join buffers of the host tier ([`Boundary`]).
+//! - the host tier ([`Hybrid`]): the join buffers and the host experts;
+//! - the three chain pieces ([`crate::chain`]) with their scratch.
 //!
-//! The chain is not assembled: [`ChainBody::enqueue_chain`] refuses, and so
-//! does [`ChainBody::seed_depth`] — a synthetic depth would have to fill the
-//! rings, the compressed rows, the index keys and the states consistently
-//! with each other. The step's host input needs the engram row lookup, which
-//! the chain's assembly brings, so [`ChainBody::decode_input`] refuses too;
-//! [`Body::image_mut`] builds an image from a plan and rows a caller holds.
+//! One step ([`ChainBody::enqueue_chain`]), in the order the dump's nodes
+//! fix: the attention piece's gather of the step words; the embedding
+//! broadcast into the streams and layer 0's input; each engram site's
+//! token-only work; then per layer the engram step where the layer carries a
+//! site, the attention sub-layer and the MoE sub-layer, whose HC_POST folds
+//! the next sub-layer's input except before an engram layer and after the
+//! last layer; last the streams' collapse into the head. The host half of a
+//! step ([`ChainBody::decode_input`]) plans it, reads its embedding and
+//! engram rows from the file and builds its image.
+//!
+//! [`ChainBody::seed_depth`] refuses: a synthetic depth would have to fill
+//! the rings, the compressed rows, the index keys and the states
+//! consistently with each other.
 
 use std::ops::Range;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HOST, SlotMap};
+use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HOST, Hybrid, SlotMap, levers};
 use bloomery_gpu::model::{ChainBody, StepProbe};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
@@ -41,9 +50,13 @@ use model::arch::Arch;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
-use model::arch::deepseek41::plan::Planner;
+use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::placement::{Device, Machine, Plan, Role};
 
+use crate::chain::attn::{AttnChain, AttnIo, Compressed, SourceIo};
+use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps};
+use crate::chain::glue::{EngramStep, Glue, StepRows};
+use crate::hc::HC_STREAMS;
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
 /// The V4.1 engine: the shared skeleton over this body.
@@ -125,6 +138,68 @@ impl LayerKv {
     }
 }
 
+/// One layer's cache and compressor buffers, for a caller that writes a
+/// state into them itself ([`Body::state_mut`]).
+pub struct StateMut<'a> {
+    pub ring: &'a mut DeviceTensor<u16>,
+    pub rows: Option<&'a mut DeviceTensor<u16>>,
+    pub keys: Option<&'a mut DeviceTensor<u16>>,
+    pub values: Option<&'a mut DeviceTensor<f32>>,
+    pub scores: Option<&'a mut DeviceTensor<f32>>,
+}
+
+/// The compressed rows a layer's attention reads.
+#[derive(Clone, Copy, Debug)]
+enum RowsOf {
+    /// A window-only layer.
+    None,
+    /// The rows of the layer at this index of the body's layers, which runs
+    /// earlier in the step.
+    Reads(usize),
+    /// Its own compressor's.
+    Source,
+}
+
+/// What one layer of the step runs besides its two sub-layers' launches,
+/// resolved at load.
+#[derive(Clone, Copy, Debug)]
+struct LayerStep {
+    rows: RowsOf,
+    /// The layer carries an engram site: the glue's engram step precedes its
+    /// attention.
+    engram: bool,
+    /// Its MoE sub-layer folds the next sub-layer's input.
+    folds: bool,
+}
+
+/// A point of the step, shown to an observer of
+/// [`Body::enqueue_observed`] once the launches before it are enqueued:
+/// the buffers one piece just wrote. The engine's own step observes nothing.
+pub enum Seam<'a> {
+    /// Layer `layer`'s attention sub-layer: the new streams and the MoE
+    /// sub-layer's folded input.
+    Attn {
+        layer: usize,
+        streams: &'a DeviceBuffer<f32>,
+        fold: &'a DeviceBuffer<f32>,
+    },
+    /// The engram step before layer `layer`'s attention: the gated streams
+    /// and the attention's folded input.
+    Engram {
+        layer: usize,
+        streams: &'a DeviceBuffer<f32>,
+        fold: &'a DeviceBuffer<f32>,
+    },
+    /// Layer `layer`'s MoE sub-layer: the new streams, the next sub-layer's
+    /// folded input where the layer folds, and the piece's own buffers.
+    Ffn {
+        layer: usize,
+        streams: &'a DeviceBuffer<f32>,
+        fold: Option<&'a DeviceBuffer<f32>>,
+        taps: FfnTaps<'a>,
+    },
+}
+
 /// The per-step input the body refreshes the card with: the step whose
 /// image was built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,19 +214,37 @@ pub struct Body {
     layers: Range<usize>,
     /// Per layer of `layers`, in order.
     kv: Vec<LayerKv>,
+    steps: Vec<LayerStep>,
     /// The hyper-connection streams, ping and pong: `streams` × `n_embd` f32
     /// each.
     hc: [DeviceTensor<f32>; 2],
+    /// The folded input a sub-layer reads, ping and pong: `n_embd` f32 each.
+    folds: [DeviceBuffer<f32>; 2],
     image: StepImage,
     /// The image's device copy, which the captured chain reads.
     params: DeviceBuffer<u32>,
     /// The slot map's card copy: `layers.len()` rows of `n_expert` slots.
-    /// The boundary holds the host copy.
+    /// The host tier holds the host copy.
     slots: DeviceTensor<u32>,
-    boundary: Boundary,
+    hybrid: Hybrid<Ds41Host>,
+    attn: AttnChain,
+    ffn: FfnPiece,
+    glue: Glue,
+    /// The step's host half: its plan, its rows and the tokens before it.
+    planner: Planner,
+    plan: StepPlan,
+    rows: StepRows,
+    /// The tokens decoded so far, one per position: `ctx_max` reserved.
+    history: Vec<u32>,
     /// The file, for the tensors the plan leaves on the host.
     file: Split,
     eps: f32,
+}
+
+/// `pair[read]` to read and the other to write.
+fn ping<T>(pair: &mut [T; 2], read: usize) -> (&T, &mut T) {
+    let [a, b] = pair;
+    if read == 0 { (&*a, b) } else { (&*b, a) }
 }
 
 impl Body {
@@ -177,18 +270,38 @@ impl Body {
             .map(|b| b.iter().map(|&(_, n)| n).sum())
     }
 
+    /// Layer `layer`'s cache and compressor buffers, for a caller that writes
+    /// a state into them itself; `None` for a layer this card does not run.
+    pub fn state_mut(&mut self, layer: usize) -> Option<StateMut<'_>> {
+        let i = layer.checked_sub(self.layers.start)?;
+        self.kv.get_mut(i).map(|k| StateMut {
+            ring: &mut k.ring,
+            rows: k.rows.as_mut(),
+            keys: k.keys.as_mut(),
+            values: k.values.as_mut(),
+            scores: k.scores.as_mut(),
+        })
+    }
+
     /// The buffers besides the layers' caches, by name, with their device
-    /// bytes.
+    /// bytes: the pieces' scratch among them.
     #[must_use]
-    pub fn step_buffers(&self) -> [(&'static str, usize); 4] {
+    pub fn step_buffers(&self) -> [(&'static str, usize); 8] {
         [
             (
                 "hyper-connection streams",
                 self.hc.iter().map(|t| t.buf().num_bytes()).sum(),
             ),
+            (
+                "folded inputs",
+                self.folds.iter().map(DeviceBuffer::num_bytes).sum(),
+            ),
             ("step image", self.params.num_bytes()),
             ("slot map", self.slots.buf().num_bytes()),
-            ("join buffers", self.boundary.device_bytes()),
+            ("join buffers", self.hybrid.boundary().device_bytes()),
+            ("attention piece", self.attn.device_bytes()),
+            ("ffn piece", self.ffn.device_bytes()),
+            ("glue piece", self.glue.device_bytes()),
         ]
     }
 
@@ -221,13 +334,243 @@ impl Body {
     /// The slot map's host copy, which the host tier serves by.
     #[must_use]
     pub fn slot_map(&self) -> &SlotMap {
-        self.boundary.slots()
+        self.hybrid.boundary().slots()
+    }
+
+    /// The host tier: the boundary and what it has served.
+    #[must_use]
+    pub fn hybrid(&self) -> &Hybrid<Ds41Host> {
+        &self.hybrid
+    }
+
+    /// The rows the last [`ChainBody::decode_input`] read for its step.
+    #[must_use]
+    pub fn step_rows(&self) -> &StepRows {
+        &self.rows
+    }
+
+    /// The step plan the last [`ChainBody::decode_input`] made.
+    #[must_use]
+    pub fn step_plan(&self) -> &StepPlan {
+        &self.plan
+    }
+
+    /// The layers whose attention an engram step precedes, in order.
+    pub fn engram_layers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.glue.engram_layers()
+    }
+
+    /// Kernel launches layer `layer`'s MoE sub-layer enqueues, besides its
+    /// two memory-operation batches ([`FfnPiece::launches`]).
+    #[must_use]
+    pub fn ffn_launches(&self, layer: usize) -> Option<usize> {
+        self.ffn.launches(layer)
+    }
+
+    /// Device bytes of the three pieces' own scratch: attention, MoE, glue.
+    #[must_use]
+    pub fn piece_bytes(&self) -> [usize; 3] {
+        [
+            self.attn.device_bytes(),
+            self.ffn.device_bytes(),
+            self.glue.device_bytes(),
+        ]
     }
 
     /// The file the body keeps for the tensors the plan leaves on the host.
     #[must_use]
     pub fn file(&self) -> &Split {
         &self.file
+    }
+
+    /// The tokens before the next step, for a caller that has written the
+    /// state they leave into the buffers itself ([`Body::state_mut`]): the
+    /// next [`ChainBody::decode_input`] runs at position `history.len()`.
+    pub fn set_history(&mut self, history: &[u32]) -> Result<(), GpuError> {
+        if history.len() >= self.history.capacity() {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::set_history",
+                detail: format!(
+                    "{} tokens leave no position of the {} the caches hold",
+                    history.len(),
+                    self.history.capacity()
+                ),
+            });
+        }
+        self.history.clear();
+        self.history.extend_from_slice(history);
+        Ok(())
+    }
+
+    /// Enqueue the step as [`ChainBody::enqueue_chain`] does, showing
+    /// `observe` each [`Seam`] as its launches are enqueued: a gate reads the
+    /// streams there after it synchronizes. Asynchronous apart from what the
+    /// observer does and the host tier's service of an eager chain.
+    pub fn enqueue_observed(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        observe: &mut dyn FnMut(&Gpu, Seam<'_>) -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
+        let Body {
+            layers,
+            kv,
+            steps,
+            hc,
+            folds,
+            params,
+            slots,
+            hybrid,
+            attn,
+            ffn,
+            glue,
+            ..
+        } = self;
+        hybrid.begin_chain(gpu.stream())?;
+        attn.enqueue_step(gpu, params)?;
+        // `s` is the streams the next sub-layer reads, `f` its folded input.
+        let (mut s, mut f) = (0usize, 0usize);
+        {
+            let [s0, _] = &mut *hc;
+            let [f0, _] = &mut *folds;
+            glue.enqueue_embed(gpu, params, s0.buf_mut(), f0)?;
+        }
+        glue.enqueue_engram_kv(gpu, w, params)?;
+        for (i, (l, step)) in layers.clone().zip(steps.iter()).enumerate() {
+            if step.engram {
+                let (streams, out) = ping(hc, s);
+                let [f0, f1] = &mut *folds;
+                glue.enqueue_engram(
+                    gpu,
+                    w,
+                    l,
+                    EngramStep {
+                        streams: streams.buf(),
+                        pre: ffn.taps().hc,
+                        out: out.buf_mut(),
+                        input: if f == 0 { f0 } else { f1 },
+                    },
+                )?;
+                s ^= 1;
+                observe(
+                    gpu,
+                    Seam::Engram {
+                        layer: l,
+                        streams: hc[s].buf(),
+                        fold: &folds[f],
+                    },
+                )?;
+            }
+            {
+                let (streams_in, streams_out) = ping(hc, s);
+                let (fold_in, fold_out) = ping(folds, f);
+                let (ring, compressed) = layer_io(kv, i, step.rows)?;
+                attn.enqueue_layer(
+                    gpu,
+                    w,
+                    l,
+                    AttnIo {
+                        streams_in: streams_in.buf(),
+                        fold_in,
+                        streams_out: streams_out.buf_mut(),
+                        fold_out,
+                        ring,
+                        compressed,
+                    },
+                )?;
+            }
+            s ^= 1;
+            f ^= 1;
+            observe(
+                gpu,
+                Seam::Attn {
+                    layer: l,
+                    streams: hc[s].buf(),
+                    fold: &folds[f],
+                },
+            )?;
+            {
+                let (streams_in, streams_out) = ping(hc, s);
+                let (fold_in, fold_out) = ping(folds, f);
+                ffn.enqueue(
+                    gpu,
+                    w,
+                    CardStacks::of(w, l)?,
+                    FfnIo {
+                        streams: streams_in.buf(),
+                        fold_in,
+                        streams_out: streams_out.buf_mut(),
+                        fold_out: step.folds.then_some(fold_out),
+                        slots: &*slots,
+                    },
+                    &mut *hybrid,
+                    l,
+                )?;
+            }
+            s ^= 1;
+            if step.folds {
+                f ^= 1;
+            }
+            observe(
+                gpu,
+                Seam::Ffn {
+                    layer: l,
+                    streams: hc[s].buf(),
+                    fold: step.folds.then_some(&folds[f]),
+                    taps: ffn.taps(),
+                },
+            )?;
+        }
+        glue.enqueue_head(gpu, w, hc[s].buf(), ffn.taps().hc, head)
+    }
+}
+
+/// Layer `i`'s window ring and the compressed rows its attention reads, out
+/// of the body's layers `kv`.
+fn layer_io(
+    kv: &mut [LayerKv],
+    i: usize,
+    rows: RowsOf,
+) -> Result<(&mut DeviceTensor<u16>, Compressed<'_>), GpuError> {
+    let refuse = |detail: &'static str| GpuError::State {
+        what: "deepseek41 Body::enqueue_chain",
+        missing: detail,
+    };
+    match rows {
+        RowsOf::None => Ok((&mut kv[i].ring, Compressed::None)),
+        RowsOf::Reads(src) => {
+            let (before, rest) = kv.split_at_mut(i);
+            let rows = before
+                .get(src)
+                .and_then(|k| k.rows.as_ref())
+                .ok_or(refuse("the source layer's compressed rows"))?;
+            Ok((&mut rest[0].ring, Compressed::Read(rows)))
+        }
+        RowsOf::Source => {
+            let LayerKv {
+                ring,
+                rows,
+                keys,
+                values,
+                scores,
+            } = &mut kv[i];
+            let rows = rows
+                .as_mut()
+                .ok_or(refuse("the layer's own compressed rows"))?;
+            let state = match (values.as_mut(), scores.as_mut()) {
+                (Some(v), Some(sc)) => Some((v, sc)),
+                _ => None,
+            };
+            Ok((
+                ring,
+                Compressed::Source(SourceIo {
+                    rows,
+                    keys: keys.as_mut(),
+                    ring: state,
+                }),
+            ))
+        }
     }
 }
 
@@ -265,11 +608,29 @@ impl ChainBody for Body {
         })
     }
 
-    fn decode_input(&mut self, _token: u32, _pos: u32) -> Result<StepInput, GpuError> {
-        Err(GpuError::State {
-            what: "deepseek41 Body::decode_input",
-            missing: "the engram row lookup: the chain is not assembled",
-        })
+    /// The step at `pos` after the tokens decoded so far: its plan, its
+    /// embedding row and engram rows read from the file on this thread, and
+    /// its image built. A position other than the next one is refused.
+    fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
+        const WHAT: &str = "deepseek41 Body::decode_input";
+        if self.history.len() != pos as usize || self.history.len() == self.history.capacity() {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a step at position {pos} after {} tokens, in caches of {} positions",
+                    self.history.len(),
+                    self.history.capacity()
+                ),
+            });
+        }
+        self.planner
+            .plan_into(&[token], pos, &self.history, &mut self.plan)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        self.rows.fill(&self.file, &self.plan)?;
+        self.image
+            .build(&self.plan, self.rows.embd(), self.rows.engram())?;
+        self.history.push(token);
+        Ok(StepInput { pos })
     }
 
     /// One host-to-device copy of the whole image, which must hold the step
@@ -289,20 +650,13 @@ impl ChainBody for Body {
         Ok(())
     }
 
-    fn enqueue_chain(
-        &mut self,
-        _gpu: &Gpu,
-        _w: &Weights,
-        _head: &mut Head,
-    ) -> Result<(), GpuError> {
-        Err(GpuError::State {
-            what: "deepseek41 Body::enqueue_chain",
-            missing: "the chain is not assembled",
-        })
+    fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+        self.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))
     }
 
-    /// Every ring, compressed row, index key, compressor state and stream is
-    /// zeroed in place: a captured chain keeps their addresses.
+    /// Every ring, compressed row, index key, compressor state, stream and
+    /// fold is zeroed in place — a captured chain keeps their addresses —
+    /// and the token history is emptied.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         for layer in &mut self.kv {
@@ -311,6 +665,10 @@ impl ChainBody for Body {
         for t in &mut self.hc {
             t.buf_mut().zero_async(stream)?;
         }
+        for f in &mut self.folds {
+            f.zero_async(stream)?;
+        }
+        self.history.clear();
         Ok(())
     }
 
@@ -325,7 +683,7 @@ impl ChainBody for Body {
     fn set_probe(&mut self, _probe: StepProbe) -> Result<(), GpuError> {
         Err(GpuError::State {
             what: "deepseek41 Body::set_probe",
-            missing: "the node-price probe: the chain is not assembled",
+            missing: "the node-price probe: V4.1 has none",
         })
     }
 
@@ -345,9 +703,15 @@ impl ChainBody for Body {
         caches + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
     }
 
+    /// The host tier's share of the chain a replay just submitted.
+    fn serve_replay(&mut self) -> Result<(), GpuError> {
+        self.hybrid.serve_captured()
+    }
+
     /// The body of card `card`: its buffers sized from `hp` — the
-    /// hyperparameters the plan was made from — at the plan's `ctx_max`, and
-    /// its slot map from the plan's routed segments on the card.
+    /// hyperparameters the plan was made from — at the plan's `ctx_max`, its
+    /// slot map from the plan's routed segments on the card, the host tier
+    /// over the file, and the three pieces.
     fn load_placed(
         gpu: &Gpu,
         file: Split,
@@ -383,10 +747,22 @@ impl ChainBody for Body {
             DeviceTensor::zeroed(stream, hp.hc.streams, hp.n_embd)?,
             DeviceTensor::zeroed(stream, hp.hc.streams, hp.n_embd)?,
         ];
+        let folds = [
+            DeviceBuffer::zeroed(stream, hp.n_embd)?,
+            DeviceBuffer::zeroed(stream, hp.n_embd)?,
+        ];
 
         let planner =
             Planner::from_file(&file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
-        let dims = ImageDims::of(hp, &planner, STEP_TOKENS, engram_row_bytes(&file, hp)?);
+        let row_bytes = engram_row_bytes(&file, hp)?;
+        let rows = StepRows::open(&file, hp, STEP_TOKENS)?;
+        if rows.row_bytes() != row_bytes {
+            return Err(refuse(format!(
+                "the engram tables' rows are {row_bytes} bytes, the step's host half reads {}",
+                rows.row_bytes()
+            )));
+        }
+        let dims = ImageDims::of(hp, &planner, STEP_TOKENS, row_bytes);
         let (window, yarn) = rope_specs(hp)?;
         let image = StepImage::new(ImageLayout::new(dims)?, &window, &yarn)?;
         let params = DeviceBuffer::<u32>::zeroed(stream, image.layout().words())?;
@@ -399,8 +775,11 @@ impl ChainBody for Body {
         )?;
         let slots = DeviceTensor::upload(stream, map.as_slice(), layers.len(), n_expert)?;
 
-        // The boundary keeps the map's host copy; the wait sits before the
-        // combine.
+        let attn = AttnChain::new(gpu, hp, layers.clone(), image.layout(), &planner)?;
+        let ffn = FfnPiece::new(gpu, hp, &map)?;
+        let glue = Glue::new(gpu, hp, image.layout())?;
+        let steps = layer_steps(hp, &layers, &kv, &ffn, &glue)?;
+
         let boundary = Boundary::new(
             gpu.context(),
             stream,
@@ -409,21 +788,123 @@ impl ChainBody for Body {
                 n_used: hp.experts.n_used,
             },
             map,
-            true,
+            levers()?.overlap,
         )?;
+        let first = file
+            .shard_path(0)
+            .ok_or_else(|| refuse("the file has no shard 0".into()))?;
+        let host = Ds41Host::build(Split::open(first)?, hp, layers.clone())?;
+        let hybrid = Hybrid::new(boundary, host, layers.len())?;
 
         Ok(Body {
             layers,
             kv,
+            steps,
             hc,
+            folds,
             image,
             params,
             slots,
-            boundary,
+            hybrid,
+            attn,
+            ffn,
+            glue,
+            planner,
+            plan: StepPlan::default(),
+            rows,
+            history: Vec::with_capacity(ctx_max),
             file,
             eps: hp.rms_eps,
         })
     }
+}
+
+/// What each of `layers` runs besides its two sub-layers, checked against the
+/// pieces: a reading layer's source runs before it on this card and holds
+/// compressed rows; an engram step precedes exactly the layers the glue has
+/// sites at, none of them the first, whose attention input the embedding
+/// broadcast writes; and the MoE sub-layer folds the next input everywhere
+/// except before an engram layer and after the last layer, where the glue
+/// folds instead.
+fn layer_steps(
+    hp: &Hparams,
+    layers: &Range<usize>,
+    kv: &[LayerKv],
+    ffn: &FfnPiece,
+    glue: &Glue,
+) -> Result<Vec<LayerStep>, GpuError> {
+    let refuse = |l: usize, detail: String| GpuError::Shape {
+        what: "deepseek41 Body::load_placed",
+        detail: format!("layer {l}: {detail}"),
+    };
+    let sites: Vec<usize> = glue.engram_layers().collect();
+    let mut steps = Vec::with_capacity(layers.len());
+    for (i, l) in layers.clone().enumerate() {
+        let kind = &hp.layers[l];
+        let rows = match (kind.stream, kind.compressor) {
+            (None, _) => RowsOf::None,
+            (Some(st), Some(_)) if st.kv_source == l => RowsOf::Source,
+            (Some(st), None) => {
+                let src = st
+                    .kv_source
+                    .checked_sub(layers.start)
+                    .filter(|&s| s < i && kv[s].rows.is_some())
+                    .ok_or_else(|| {
+                        refuse(
+                            l,
+                            format!(
+                                "its rows come from layer {}, which does not run before it on \
+                                 this card with a compressor",
+                                st.kv_source
+                            ),
+                        )
+                    })?;
+                RowsOf::Reads(src)
+            }
+            (Some(st), Some(_)) => {
+                return Err(refuse(
+                    l,
+                    format!("owns a compressor and reads layer {}'s rows", st.kv_source),
+                ));
+            }
+        };
+        let engram = sites.contains(&l);
+        if engram && i == 0 {
+            return Err(refuse(
+                l,
+                "an engram site on the first layer: its input is the embedding row".to_string(),
+            ));
+        }
+        let folds = ffn
+            .folds(l)
+            .ok_or_else(|| refuse(l, "the ffn piece does not run it".to_string()))?;
+        let into_glue = l + 1 == layers.end || sites.contains(&(l + 1));
+        if folds == into_glue {
+            return Err(refuse(
+                l,
+                format!(
+                    "the ffn piece folds: {folds}; the next sub-layer is {}",
+                    if into_glue {
+                        "the glue's"
+                    } else {
+                        "an attention with no engram step"
+                    }
+                ),
+            ));
+        }
+        steps.push(LayerStep {
+            rows,
+            engram,
+            folds,
+        });
+    }
+    if hp.hc.streams != HC_STREAMS {
+        return Err(GpuError::Shape {
+            what: "deepseek41 Body::load_placed",
+            detail: format!("{} streams; the chain runs {HC_STREAMS}", hp.hc.streams),
+        });
+    }
+    Ok(steps)
 }
 
 /// Layer `l`'s buffers at `ctx_max` positions: its window ring; its
@@ -558,8 +1039,10 @@ fn plan_slots(
 }
 
 /// Bytes of one engram table row: every site's table holds rows of
-/// `engram.key_length` values, all in one format.
-fn engram_row_bytes(file: &Split, hp: &Hparams) -> Result<usize, GpuError> {
+/// `engram.key_length` values, all in one format. The one owner of the
+/// figure: the step image is laid out by it, and the step's host half must
+/// read rows of it.
+pub fn engram_row_bytes(file: &Split, hp: &Hparams) -> Result<usize, GpuError> {
     let refuse = |detail: String| GpuError::Shape {
         what: "deepseek41 engram_row_bytes",
         detail,
