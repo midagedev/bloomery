@@ -1,7 +1,7 @@
 //! The V4.1 model file's rope and norm constants, as the gates of the ops
 //! that turn and normalize rows read them from its metadata.
 
-use crate::GateError;
+use crate::{GateError, expect_arch};
 use gguf::{Split, Value};
 use model::arch::Arch;
 
@@ -24,28 +24,21 @@ pub struct RopeMeta<S> {
 }
 
 impl<S> RopeMeta<S> {
-    /// The constants of `split`, which must be a V4.1 file; `recipe` is the
-    /// `just` recipe the error for any other file names. The ropes are built
-    /// by `window` and `yarn` — `RopeSpec::window` and `RopeSpec::yarn`, whose
-    /// argument orders these are. They come in as arguments because this
-    /// crate does not name the V4.1 device crate: named here, it would be
-    /// linked, device bundle and all, into every gate built with the
-    /// feature, the ones that launch none of its kernels too.
+    /// The constants of `split`, which must be a V4.1 file ([`expect_arch`]);
+    /// `recipe` is the `just` recipe the error for any other file names. The
+    /// ropes are built by `window` and `yarn` — `RopeSpec::window` and
+    /// `RopeSpec::yarn`, whose argument orders these are. They come in as
+    /// arguments because this library's source does not name the V4.1 device
+    /// crate: named here, it would be linked, device bundle and all, into
+    /// every gate built with the feature, the ones that launch none of its
+    /// kernels too.
     pub fn read(
         split: &Split,
         recipe: &str,
         window: fn(f32, usize) -> S,
         yarn: fn(f32, f32, i32, f32, f32, usize) -> S,
     ) -> Result<RopeMeta<S>, GateError> {
-        let want = Arch::Deepseek41.name();
-        if split.architecture() != Some(want) {
-            return Err(format!(
-                "the model file is {:?}, want {want} — run through `just {recipe}`, \
-                 which picks the deepseek41 profile",
-                split.architecture()
-            )
-            .into());
-        }
+        expect_arch(split, Arch::Deepseek41, recipe)?;
         let f = |s: &str| -> Result<f32, GateError> {
             split
                 .arch_get_f32(s)

@@ -84,17 +84,17 @@ mod gate {
     use bloomery_gpu_deepseek41::router::{
         N_EXPERT, N_USED, RouterKernels, RouterOut, sqrt_softplus,
     };
+    use bloomery_gpu_gates::ik_q8_2;
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
-        max_rel_err, q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes,
+        max_rel_err, open_split, q8_1_dequant, ref_tensor_of_in, row_bytes,
         topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
-    use gguf::quant::{
-        GgmlType, dequant_row, quantize_activations, quantize_row_q8_2_x4_roundtrip,
-    };
+    use gguf::quant::{GgmlType, dequant_row, quantize_activations};
     use gguf::{Split, Value};
     use model::arch::Arch;
 
@@ -102,9 +102,6 @@ mod gate {
     /// prefill set: of the table's (`step_sets`), the fused ones at 4, 301
     /// and 1,025.
     const STEP_SETS: [&str; 3] = [STEP4, D1, D2];
-
-    /// f32's unit roundoff, 2^-24.
-    const U: f64 = f32::EPSILON as f64 / 2.0;
 
     /// Roundings on one term's path through one of our dots over `k` values:
     /// at most one per value a lane reads (the f32 and q8_0 bodies round once
@@ -187,15 +184,6 @@ mod gate {
 
     impl Meta {
         fn read(split: &Split) -> Result<Meta, GateError> {
-            let want = Arch::Deepseek41.name();
-            if split.architecture() != Some(want) {
-                return Err(format!(
-                    "the model file is {:?}, want {want} — run through `just \
-                     gate-gpu-ds41-moe`, which picks the deepseek41 profile",
-                    split.architecture()
-                )
-                .into());
-            }
             let u = |s: &str| -> Result<u64, GateError> {
                 split
                     .arch_get_u64(s)
@@ -836,7 +824,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let split = Split::open(ref_model_path()?)?;
+        let split = open_split(Arch::Deepseek41, "gate-gpu-ds41-moe")?;
         let meta = Meta::read(&split)?;
         let gpu = Gpu::new()?;
         let router = RouterKernels::load(gpu.context())?;
@@ -1193,8 +1181,7 @@ mod gate {
             h_exact &= bits_equal(&hk, &h_host);
             let (cs, cu, cl) = crossings(&g_op, &u_op, limit);
             hits = [hits[0] + cs, hits[1] + cu, hits[2] + cl];
-            let mut xi = vec![0.0f32; k];
-            quantize_row_q8_2_x4_roundtrip(xt, &mut xi);
+            let xi = ik_q8_2::reconstruct(xt);
             let gs = row_stats(&ly.sh_gate, xt, &xi)?;
             let us = row_stats(&ly.sh_up, xt, &xi)?;
             let g64: Vec<f32> = gs.iter().map(|s| s.ours as f32).collect();
@@ -1206,8 +1193,7 @@ mod gate {
             h3 = h3.max(b);
             h_ik = h_ik.max(rel(&hk, ht));
 
-            let mut hi = vec![0.0f32; ff];
-            quantize_row_q8_2_x4_roundtrip(ht, &mut hi);
+            let hi = ik_q8_2::reconstruct(ht);
             let ds = row_stats(&ly.sh_down, ht, &hi)?;
             let (a, b, c) = dot_cmp(&yk, yt, &ds, no_f, ni_f)?;
             y_rel = y_rel.max(a);

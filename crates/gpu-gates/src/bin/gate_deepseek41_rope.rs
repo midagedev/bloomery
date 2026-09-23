@@ -53,19 +53,18 @@ mod gate {
         Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable, TailShape, ggml_rope_cache,
     };
     use bloomery_gpu_gates::ds41_meta::RopeMeta;
+    use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::rounding::{U_F32, butterfly};
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed, find_int_row,
-        max_rel_err, max_ulps, ref_ints_of_in, ref_model_path, ref_tensor_logical_in, same_bits,
-        split_f32, verdict, widened_f16_bits_in,
+        GateError, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed, comma_list,
+        find_int_row, max_rel_err, max_ulps, ref_ints_of_in, ref_model_path, ref_tensor_logical_in,
+        same_bits, split_f32, verdict, widened_f16_bits_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::f32_to_f16_bits;
     use model::arch::Arch;
-
-    /// f32's unit roundoff, 2^-24.
-    const U: f32 = f32::EPSILON / 2.0;
 
     /// Band for the K/V row against ik's `kv_rope-L`, as `max|Δ| / M` with
     /// `M` the largest `|value|` ik wrote. The two rules differ in the norm's
@@ -83,7 +82,7 @@ mod gate {
     /// `|y0·c| + |y1·s| <= |(y0, y1)|` because `c² + s² = 1` — the norm of
     /// the turned pair, at most `√2·M`. A value moves by at most
     /// `(17·√2 + 2)·u < 27u` of `M`.
-    const KV_BAND: f32 = 27.0 * U;
+    const KV_BAND: f32 = 27.0 * U_F32;
 
     /// Band for a tail rope against the dump, in ulps per value. Our table
     /// is ik's recipe on the same libm and both turns are unfused, so the
@@ -290,13 +289,6 @@ mod gate {
         y
     }
 
-    fn list(v: &[impl ToString]) -> String {
-        v.iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
     /// One tail-rope site: the row at manifest index `at` of `man`.
     fn rope_site(
         cx: &Cx,
@@ -395,7 +387,7 @@ mod gate {
              ik_sim_same={sim_same}/{n} ik_sim_max_ulp={sim_ulps} head_kept={head_kept} same={same}/{n} \
              max_ulp={ulp} (band {ROPE_ULP_BAND}) ik_rel={ik_rel:.3e} {}",
             site.kind(),
-            list(&pos),
+            comma_list(&pos),
             verdict(pass)
         );
         Ok(pass)
@@ -428,28 +420,11 @@ mod gate {
         }
         let mut warps = [0.0f32; RMS_WARPS];
         for (w, lanes) in warps.iter_mut().zip(part.as_chunks::<32>().0) {
-            let mut v = *lanes;
-            for off in [16, 8, 4, 2, 1] {
-                let prev = v;
-                for (l, s) in v.iter_mut().enumerate() {
-                    *s = prev[l] + prev[l ^ off];
-                }
-            }
-            *w = v[0];
+            *w = butterfly(*lanes);
         }
         let k = u32::try_from(x.len())?;
         let scale = rms_scale(rms_warp_tree(warps), k, eps);
         Ok(x.iter().zip(gain).map(|(&v, &g)| (scale * g) * v).collect())
-    }
-
-    /// ik's `FUSED_RMS_NORM` of one row (`ggml_compute_forward_fused_rms_norm_f32`):
-    /// f32 squares summed serially in f64, the mean rounded to f32, then
-    /// `1/sqrtf(mean + eps)` and `(scale · c) · x`.
-    fn norm_ik(x: &[f32], gain: &[f32], eps: f32) -> Vec<f32> {
-        let sum = x.iter().fold(0.0f64, |a, &v| a + f64::from(v * v));
-        let mean = (sum / x.len() as f64) as f32;
-        let scale = 1.0 / (mean + eps).sqrt();
-        x.iter().zip(gain).map(|(&v, &g)| (scale * g) * v).collect()
     }
 
     /// One layer's K/V chain in a set, read back from the manifest from the
@@ -577,7 +552,7 @@ mod gate {
         // the kv_rope-L rope site.
         let mut sim_norm = Vec::with_capacity(m * width);
         for row in x.chunks(width) {
-            sim_norm.extend(norm_ik(row, &gain, cx.meta.eps));
+            sim_norm.extend(ik_norm::fused(row, &gain, cx.meta.eps));
         }
         let n = m * width;
         let norm_same = same_bits(&sim_norm, &norm_dump);
@@ -624,9 +599,9 @@ mod gate {
              ik_rel={ik_rel:.3e} (band {KV_BAND:.3e}) f32_same={f32_same}/{n} f16_same={f16_same}/{n} \
              append_on_equal_inputs={append_on_equal} {}",
             ch.layer,
-            list(&pos),
-            list(&slots),
-            list(&idxs),
+            comma_list(&pos),
+            comma_list(&slots),
+            comma_list(&idxs),
             verdict(pass)
         );
         Ok(pass)

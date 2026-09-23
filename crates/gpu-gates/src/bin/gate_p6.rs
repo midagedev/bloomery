@@ -46,7 +46,7 @@ fn main() {
 }
 
 #[cfg(feature = "gpu")]
-use bloomery_gpu_gates::{GateError, verdict};
+use bloomery_gpu_gates::{Fnv1a64, GateError, ptx_shapes, verdict};
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -581,27 +581,11 @@ fn finite_logits(logits: &[f32]) -> Vec<f32> {
 /// the one line that says a kernel reshape moved no bit.
 #[cfg(feature = "gpu")]
 fn digest(probs: &[f32], ids: &[u32], weights: &[f32]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for v in probs {
-        h = eat(h, &v.to_bits().to_le_bytes());
-    }
-    for v in ids {
-        h = eat(h, &v.to_le_bytes());
-    }
-    for v in weights {
-        h = eat(h, &v.to_bits().to_le_bytes());
-    }
-    h
-}
-
-/// One FNV-1a 64 step per byte.
-#[cfg(feature = "gpu")]
-fn eat(mut h: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    Fnv1a64::default()
+        .f32s(probs)
+        .u32s(ids)
+        .f32s(weights)
+        .value()
 }
 
 /// The router kernels' compiled shape, asserted from the PTX the executable
@@ -663,9 +647,6 @@ fn router_shape() -> Result<bool, GateError> {
     // PIN(2026-09-23): 4·(4 + 6) = 40, the heads entry's own count; the same source without the body's partial word printed fma=36 and failed.
     let heads_fma_floor = 4 * (Q8_STEP_UNROLL + Q8_OTHER_WORDS);
 
-    let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
-    let modules = bloomery_gpu_gates::ptx::modules(&bundles);
-    let mut ok = true;
     let floors = [
         (
             "f32_gemv",
@@ -683,35 +664,32 @@ fn router_shape() -> Result<bool, GateError> {
             format!("4*(Q8_STEP_UNROLL={Q8_STEP_UNROLL} + {Q8_OTHER_WORDS})"),
         ),
     ];
-    for (name, floor, derivation) in floors {
-        let c = bloomery_gpu_gates::ptx::counts(&modules, name)
-            .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
-        let pass = c.fma >= floor && !c.depot;
-        println!(
-            "shape op={name} fma={} fma_floor={floor} ({derivation}) local_depot={} {}",
-            c.fma,
-            c.depot,
-            verdict(pass)
-        );
-        ok &= pass;
-    }
-    for name in ["router_topk", "expert_table"] {
-        let c = bloomery_gpu_gates::ptx::counts(&modules, name)
-            .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
+    let mut ok = ptx_shapes(&floors.each_ref().map(|f| f.0), |c, _| {
+        let (_, floor, derivation) = floors
+            .iter()
+            .find(|f| f.0 == c.name)
+            .ok_or_else(|| format!("gate_p6: {} has no fma floor", c.name))?;
+        Ok((
+            c.fma >= *floor && !c.depot,
+            format!(
+                "shape op={} fma={} fma_floor={floor} ({derivation}) local_depot={}",
+                c.name, c.fma, c.depot
+            ),
+        ))
+    })?;
+    ok &= ptx_shapes(&["router_topk", "expert_table"], |c, _| {
         let ntid = c
             .reqntid
-            .ok_or_else(|| format!("gate_p6: PTX entry {name} declares no .reqntid"))?;
-        let pass = !c.depot && c.ld_local == 0 && c.st_local == 0 && ntid == ROUTER_THREADS;
-        println!(
-            "shape op={name} local_depot={} ld_local={} st_local={} block_reqntid={ntid} \
-             ROUTER_THREADS={ROUTER_THREADS} {}",
-            c.depot,
-            c.ld_local,
-            c.st_local,
-            verdict(pass)
-        );
-        ok &= pass;
-    }
+            .ok_or_else(|| format!("gate_p6: PTX entry {} declares no .reqntid", c.name))?;
+        Ok((
+            !c.depot && c.ld_local == 0 && c.st_local == 0 && ntid == ROUTER_THREADS,
+            format!(
+                "shape op={} local_depot={} ld_local={} st_local={} block_reqntid={ntid} \
+                 ROUTER_THREADS={ROUTER_THREADS}",
+                c.name, c.depot, c.ld_local, c.st_local
+            ),
+        ))
+    })?;
     Ok(ok)
 }
 
@@ -736,36 +714,29 @@ fn router_shape() -> Result<bool, GateError> {
 /// goes — while the control arm and every bit-identity gate stay green.
 #[cfg(feature = "gpu")]
 fn q3k_half_decode_shape() -> Result<bool, GateError> {
-    let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
-    let modules = bloomery_gpu_gates::ptx::modules(&bundles);
-    let mut ok = true;
-    let counts = |name: &str| -> Result<(usize, usize), GateError> {
-        let b = bloomery_gpu_gates::ptx::body(&modules, name)
-            .ok_or_else(|| format!("gate_p6: no PTX entry {name} in this executable"))?;
+    use bloomery_gpu_gates::ptx::count;
+
+    let mut ok = ptx_shapes(&["q3k_gemv", "q3k_gemv_sel"], |c, body| {
+        let clz = count(body, b"clz.");
         Ok((
-            bloomery_gpu_gates::ptx::count(b, b"clz."),
-            bloomery_gpu_gates::ptx::count(b, b"cvt.f32.f16"),
+            clz == 0 && c.cvt_f16 >= 1,
+            format!(
+                "shape op={} clz={clz} want=0 cvt_f32_f16={} want>=1",
+                c.name, c.cvt_f16
+            ),
         ))
-    };
-    for name in ["q3k_gemv", "q3k_gemv_sel"] {
-        let (clz, cvt) = counts(name)?;
-        let pass = clz == 0 && cvt >= 1;
-        println!(
-            "shape op={name} clz={clz} want=0 cvt_f32_f16={cvt} want>=1 {}",
-            verdict(pass)
-        );
-        ok &= pass;
-    }
-    for name in ["q4k_gemv", "q6k_gemv"] {
-        let (clz, cvt) = counts(name)?;
-        let pass = clz >= 1;
-        println!(
-            "shape op={name} clz={clz} want>=1 (software half decode, control) \
-             cvt_f32_f16={cvt} {}",
-            verdict(pass)
-        );
-        ok &= pass;
-    }
+    })?;
+    ok &= ptx_shapes(&["q4k_gemv", "q6k_gemv"], |c, body| {
+        let clz = count(body, b"clz.");
+        Ok((
+            clz >= 1,
+            format!(
+                "shape op={} clz={clz} want>=1 (software half decode, control) \
+                 cvt_f32_f16={}",
+                c.name, c.cvt_f16
+            ),
+        ))
+    })?;
     Ok(ok)
 }
 

@@ -89,8 +89,8 @@ mod gate {
     use bloomery_gpu_gates::oracle::{Set, for_arch};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, activations, bits_equal,
-        checks_failed, mask_bits_in, max_rel_err, no_local_depot, ref_ints, ref_model_path,
-        ref_tensor_logical_in, same_bits, verdict, widened_f16_rows_in,
+        checks_failed, mask_bits_in, max_rel_err, no_local_depot, open_split, ref_ints,
+        ref_model_path, ref_tensor_logical_in, same_bits, verdict, widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::{GgmlType, f32_to_f16_bits, half_to_f32};
@@ -260,16 +260,7 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let model = ref_model_path()?;
-        let split = Split::open(&model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        if split.architecture() != Some(Arch::Deepseek41.name()) {
-            return Err(format!(
-                "{} is a {:?} model, want {}",
-                model.display(),
-                split.architecture(),
-                Arch::Deepseek41.name()
-            )
-            .into());
-        }
+        let split = open_split(Arch::Deepseek41, "gate-gpu-ds41-attn")?;
         let oracle = for_arch(Arch::Deepseek41)?;
         let mut sets = vec![oracle.open(Set::Cpu)?];
         for &name in oracle.step_sets {
@@ -664,21 +655,14 @@ mod gate {
     }
 
     /// The raw-window mask ik reads on a layer without a stream: the input
-    /// every layer's mask starts from, cropped where the window is.
+    /// every layer's mask starts from — named after the last layer's
+    /// callback, so found by its prefix — cropped where the window is.
     fn raw_mask(man: &RefManifest, l: usize) -> Result<&RefRow, GateError> {
         let cropped = format!("dsv4_raw_mask_padded-{l} (view) (cont)");
         if let Some(r) = man.find(RowKind::Tensor, &cropped, 0) {
             return Ok(r);
         }
-        let found: Vec<&RefRow> = man
-            .inputs
-            .iter()
-            .filter(|r| r.name.starts_with("dsv4_raw_mask_padded") && r.occurrence == 0)
-            .collect();
-        match found[..] {
-            [r] => Ok(r),
-            _ => Err(format!("{} raw mask inputs in the set, want one", found.len()).into()),
-        }
+        man.only_with_prefix(RowKind::Input, "dsv4_raw_mask_padded")
     }
 
     /// Our window ring and where its rows came from.

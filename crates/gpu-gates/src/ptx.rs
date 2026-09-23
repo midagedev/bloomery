@@ -20,7 +20,8 @@
 //! [`crate::no_local_depot`]; `gate_p4::norm_geometry` asserts `rms_norm`/`norm_quant`
 //! and `argmax` against the block width their host side launches;
 //! `gate_p6` asserts the router gemvs' multiply-add floor and the Q3_K
-//! entries' hardware f16 convert.
+//! entries' hardware f16 convert. Each walks its entries through
+//! [`crate::ptx_shapes`].
 //!
 //! Spelling matters more than it looks: PTX writes a fused multiply-add as
 //! `fma.rn.f32` (and `fma.rm.f32`), never `fma.f32`, so [`Counts::fma`]
@@ -72,35 +73,31 @@ impl<'a> Module<'a> {
 
 /// The bundles of an `.oxart` section's bytes (what `objcopy -O binary
 /// --only-section=.oxart` writes), cut by oxide-artifacts' parser. An error
-/// when the parser rejects the container, or when a bundle carries a Cubin
-/// beside its PTX ([`ptx_is_what_loads`]).
+/// when the parser rejects the container.
 pub fn section_bundles(section: &[u8]) -> Result<Vec<OwnedArtifactBundle>, GateError> {
-    let bundles: Vec<OwnedArtifactBundle> = oxide_artifacts::parse_artifact_section(section)
+    Ok(oxide_artifacts::parse_artifact_section(section)
         .map_err(|e| format!("the .oxart container does not parse: {e}"))?
         .into_iter()
         .map(Into::into)
-        .collect();
-    ptx_is_what_loads(&bundles)?;
-    Ok(bundles)
+        .collect())
 }
 
 /// The `.oxart` bundles of the running executable, read by oxide-artifacts'
 /// object reader — the call cuda-core's module loader makes on the same
-/// file, so a gate scans the text the driver is handed. Refuses what
-/// [`section_bundles`] refuses.
+/// file, so a gate scans the text the driver is handed.
 pub fn current_exe_bundles() -> Result<Vec<OwnedArtifactBundle>, GateError> {
     let exe = std::env::current_exe()?;
     let bytes = std::fs::read(&exe).map_err(|e| format!("read {}: {e}", exe.display()))?;
-    let bundles = oxide_artifacts::read_artifact_bundles_from_object_bytes(&bytes)
-        .map_err(|e| format!("{}: the .oxart section does not parse: {e}", exe.display()))?;
-    ptx_is_what_loads(&bundles).map_err(|e| format!("{}: {e}", exe.display()))?;
-    Ok(bundles)
+    Ok(
+        oxide_artifacts::read_artifact_bundles_from_object_bytes(&bytes)
+            .map_err(|e| format!("{}: the .oxart section does not parse: {e}", exe.display()))?,
+    )
 }
 
 /// Err when a bundle carries a Cubin as well as a PTX payload. cuda-core's
 /// loader takes the Cubin first and never hands the driver that PTX, so a
-/// scan of it would describe code that does not run. Both bundle readers
-/// refuse through here, and they are the only way to [`modules`].
+/// scan of it would describe code that does not run. [`modules`] refuses
+/// through here, and it is the only way to a [`Module`].
 fn ptx_is_what_loads(bundles: &[OwnedArtifactBundle]) -> Result<(), GateError> {
     let shadowed: Vec<&str> = bundles
         .iter()
@@ -121,12 +118,12 @@ fn ptx_is_what_loads(bundles: &[OwnedArtifactBundle]) -> Result<(), GateError> {
     }
 }
 
-/// The PTX modules of `bundles`: one per bundle that carries a PTX payload,
-/// in bundle order. `bundles` come from [`section_bundles`] or
-/// [`current_exe_bundles`], which refuse a bundle whose PTX a Cubin shadows.
-#[must_use]
-pub fn modules(bundles: &[OwnedArtifactBundle]) -> Vec<Module<'_>> {
-    bundles
+/// The PTX modules of `bundles` ([`section_bundles`], [`current_exe_bundles`]):
+/// one per bundle that carries a PTX payload, in bundle order. An error when
+/// a bundle carries a Cubin beside its PTX ([`ptx_is_what_loads`]).
+pub fn modules(bundles: &[OwnedArtifactBundle]) -> Result<Vec<Module<'_>>, GateError> {
+    ptx_is_what_loads(bundles)?;
+    Ok(bundles
         .iter()
         .filter_map(|b| {
             let text = b.payload(ArtifactPayloadKind::Ptx)?;
@@ -135,7 +132,7 @@ pub fn modules(bundles: &[OwnedArtifactBundle]) -> Vec<Module<'_>> {
                 text,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// The marker every kernel's PTX declaration opens with.
@@ -257,20 +254,27 @@ pub struct Counts {
     pub calls: usize,
 }
 
+impl Counts {
+    /// The counts of entry `name` whose [`body`] is `b`.
+    #[must_use]
+    pub fn of(name: &str, b: &[u8]) -> Counts {
+        Counts {
+            name: name.to_string(),
+            reqntid: reqntid(b),
+            depot: find(b, b"__local_depot").is_some(),
+            ld_local: count(b, b"ld.local"),
+            st_local: count(b, b"st.local"),
+            fma: count(b, b"fma."),
+            cvt_f16: count(b, b"cvt.f32.f16"),
+            calls: calls(b),
+        }
+    }
+}
+
 /// Read one entry's counts out of the modules.
 #[must_use]
 pub fn counts(modules: &[Module<'_>], name: &str) -> Option<Counts> {
-    let b = body(modules, name)?;
-    Some(Counts {
-        name: name.to_string(),
-        reqntid: reqntid(b),
-        depot: find(b, b"__local_depot").is_some(),
-        ld_local: count(b, b"ld.local"),
-        st_local: count(b, b"st.local"),
-        fma: count(b, b"fma."),
-        cvt_f16: count(b, b"cvt.f32.f16"),
-        calls: calls(b),
-    })
+    body(modules, name).map(|b| Counts::of(name, b))
 }
 
 /// Every entry of the modules, sorted so the ones carrying a local depot
@@ -516,7 +520,7 @@ mod tests {
             "a NUL follows the payload: not the case under test"
         );
         let bundles = section_bundles(&blob).expect("the container parses");
-        let mods = modules(&bundles);
+        let mods = modules(&bundles).expect("no Cubin shadows the PTX");
         assert_eq!(mods.len(), 1);
         assert_eq!((mods[0].bundle(), mods[0].text()), ("bloomery-gpu", PTX8));
         assert_eq!(entries(&mods), ["alpha", "beta"]);
@@ -538,7 +542,7 @@ mod tests {
         let mut section = bundle_blob("first", PTX8, &["alpha", "beta"]);
         section.extend_from_slice(&bundle_blob("second", gamma, &["gamma"]));
         let bundles = section_bundles(&section).expect("both blobs parse");
-        let mods = modules(&bundles);
+        let mods = modules(&bundles).expect("no Cubin shadows the PTX");
         let names: Vec<&str> = mods.iter().map(Module::bundle).collect();
         assert_eq!(names, ["first", "second"]);
         assert_eq!(entries(&mods), ["alpha", "beta", "gamma"]);
@@ -547,9 +551,10 @@ mod tests {
         assert_eq!(reqntid(body(&mods, "gamma").expect("gamma")), None);
     }
 
-    /// A bundle that carries a Cubin beside its PTX is refused: the loader
-    /// runs the Cubin, so the PTX is not the device code. A Cubin-only
-    /// bundle is no PTX module at all, and is not an error.
+    /// A bundle that carries a Cubin beside its PTX is refused where the
+    /// modules are cut: the loader runs the Cubin, so the PTX is not the
+    /// device code. A Cubin-only bundle is no PTX module at all, and is not an
+    /// error.
     #[test]
     fn a_bundle_whose_ptx_a_cubin_shadows_is_refused() {
         let cubin: &[u8] = b"\x7fELF not a real cubin";
@@ -567,14 +572,15 @@ mod tests {
                 )),
         )
         .expect("a valid bundle spec");
-        let e = section_bundles(&both).expect_err("a PTX shadowed by a Cubin");
+        let bundles = section_bundles(&both).expect("the container parses");
+        let e = modules(&bundles).expect_err("a PTX shadowed by a Cubin");
         assert!(e.to_string().contains("shadowed"), "{e}");
         let only = build_artifact_blob(&ArtifactBundleSpec::new("cubin", "sm_86").with_payload(
             ArtifactPayloadSpec::new(ArtifactPayloadKind::Cubin, "bloomery_gpu.cubin", cubin),
         ))
         .expect("a valid bundle spec");
         let bundles = section_bundles(&only).expect("a Cubin-only bundle");
-        assert!(modules(&bundles).is_empty());
+        assert!(modules(&bundles).expect("no PTX to shadow").is_empty());
     }
 
     /// A section the parser rejects is an error, never an empty list; a
@@ -585,6 +591,6 @@ mod tests {
         assert!(section_bundles(&blob[..blob.len() - 8]).is_err());
         assert!(section_bundles(b"not an oxide-artifacts container at all").is_err());
         let empty = section_bundles(&[0u8; 32]).expect("zero padding parses");
-        assert!(modules(&empty).is_empty());
+        assert!(modules(&empty).expect("no bundle to refuse").is_empty());
     }
 }

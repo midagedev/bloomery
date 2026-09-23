@@ -42,7 +42,7 @@ fn run() -> Result<(), bloomery_gpu_gates::GateError> {
     let bytes = std::fs::read(&section).map_err(|e| format!("read {}: {e}", section.display()))?;
     let bundles =
         ptx::section_bundles(&bytes).map_err(|e| format!("{}: {e}", section.display()))?;
-    let modules = ptx::modules(&bundles);
+    let modules = ptx::modules(&bundles).map_err(|e| format!("{}: {e}", section.display()))?;
     if modules.is_empty() {
         return Err(format!("{}: no PTX module in the section", section.display()).into());
     }

@@ -68,11 +68,13 @@ mod gate {
     use bloomery_gpu_deepseek41::index_key::{self, HT_SCALE, IndexKeyArgs, IndexKeyKernels};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
     use bloomery_gpu_gates::ds41_meta::RopeMeta;
+    use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::rounding::{U_F32, butterfly, gamma};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
-        max_rel_err, max_ulps, ref_model_path, ref_tensor_logical_in, same_bits, split_f32,
-        verdict, widened_f16_rows_in,
+        comma_list, max_rel_err, max_ulps, ref_model_path, ref_tensor_logical_in, same_bits,
+        split_f32, verdict, widened_f16_rows_in,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
@@ -83,9 +85,6 @@ mod gate {
 
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
-
-    /// f32's unit roundoff, 2^-24.
-    const U: f32 = f32::EPSILON / 2.0;
 
     /// What the gate fills a cache with before a launch: an f16 NaN, which
     /// `f32_to_f16_bits` never writes (it rounds a NaN to infinity), so a
@@ -100,7 +99,7 @@ mod gate {
     /// Relative distance of the two `expf`s: the device's is within 2 ulp
     /// of `e^x` (CUDA's documented bound), glibc's within 0.502 ulp, and one
     /// ulp is at most `2u` of the value — together under `6u`.
-    const EXP_REL: f32 = 6.0 * U;
+    const EXP_REL: f32 = 6.0 * U_F32;
 
     /// Units of `u · A` two DS4_COMP results of `r` rows may differ by, `A`
     /// the largest `|kv|` pooled into the value. The weights differ by
@@ -109,7 +108,7 @@ mod gate {
     /// (`<= r·u·Σw·A`), its sum (`<= (r − 1)u·Σw`, a relative `(r − 1)u` on
     /// `|y| <= A`) and its division (`u·A`) — `2r·u·A` a side.
     fn pool_units(r: usize) -> f32 {
-        2.0 * (EXP_REL / U) + 4.0 * r as f32
+        2.0 * (EXP_REL / U_F32) + 4.0 * r as f32
     }
 
     /// Units of `u · |n|` two norms of the same 512-value row differ by, ours
@@ -133,14 +132,6 @@ mod gate {
     /// `14u` of the output's together), and the final multiply once more
     /// (`2u`). A value moves by at most the 2-norm of the whole difference.
     const IDX_L2_UNITS: f32 = 14.5 + 4.0 * std::f32::consts::SQRT_2 + 14.0 + 2.0;
-
-    /// `γ(n) = n·u / (1 − n·u)`: the relative bound of a sum whose every
-    /// term passes through at most `n` roundings, on the sum of the terms'
-    /// magnitudes.
-    fn gamma(n: usize) -> f64 {
-        let nu = n as f64 * f64::from(U);
-        nu / (1.0 - nu)
-    }
 
     // ------------------------------------------------------------ inputs
 
@@ -193,20 +184,6 @@ mod gate {
             .collect()
     }
 
-    /// The butterfly `warp::reduce_sum_f32` runs over 32 lane values (xor
-    /// 16, 8, 4, 2, 1, own + partner): lane 0's result.
-    fn butterfly(lanes: &[f32]) -> f32 {
-        let mut v = [0.0f32; 32];
-        v.copy_from_slice(lanes);
-        for off in [16, 8, 4, 2, 1] {
-            let prev = v;
-            for (l, s) in v.iter_mut().enumerate() {
-                *s = prev[l] + prev[l ^ off];
-            }
-        }
-        v[0]
-    }
-
     /// Our norm of one row as the kernels compute it: each thread's (lane's)
     /// four values squared and summed by fused multiply-adds from `+0`, the
     /// warp butterfly, the warp sums as `(w0 + w1) + (w2 + w3)` (512 values:
@@ -220,7 +197,10 @@ mod gate {
             .iter()
             .map(|c| c.iter().fold(0.0f32, |a, &v| v.mul_add(v, a)))
             .collect();
-        let warps: Vec<f32> = part.chunks(32).map(butterfly).collect();
+        let warps: Vec<f32> = part
+            .chunks(32)
+            .map(|lanes| butterfly(<[f32; 32]>::try_from(lanes).expect("a row is whole warps")))
+            .collect();
         let sum = match warps.as_slice() {
             [w] => *w,
             [w0, w1, w2, w3] => (w0 + w1) + (w2 + w3),
@@ -229,15 +209,6 @@ mod gate {
         let mean = sum / x.len() as f32;
         let scale = 1.0 / (mean + eps).sqrt();
         Ok(x.iter().zip(gain).map(|(&v, &g)| (scale * g) * v).collect())
-    }
-
-    /// ik's `FUSED_RMS_NORM` of one row: f32 squares summed serially in f64,
-    /// the mean rounded to f32, `1/sqrtf(mean + eps)`, then `(scale · c) · x`.
-    fn norm_ik(x: &[f32], gain: &[f32], eps: f32) -> Vec<f32> {
-        let sum = x.iter().fold(0.0f64, |a, &v| a + f64::from(v * v));
-        let mean = (sum / x.len() as f64) as f32;
-        let scale = 1.0 / (mean + eps).sqrt();
-        x.iter().zip(gain).map(|(&v, &g)| (scale * g) * v).collect()
     }
 
     /// The tail rope of one row: its last `cs.len()` values turned in pairs
@@ -399,13 +370,6 @@ mod gate {
                     w.max(d / bd.max(f64::MIN_POSITIVE)),
                 )
             })
-    }
-
-    fn list(v: &[impl ToString]) -> String {
-        v.iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
     }
 
     fn norm2(v: &[f32]) -> f64 {
@@ -613,7 +577,7 @@ mod gate {
             man.build.as_deref().unwrap_or("-"),
             plan.len(),
             ctx,
-            list(&layers.iter().map(|&(_, l)| l).collect::<Vec<_>>())
+            comma_list(&layers.iter().map(|&(_, l)| l).collect::<Vec<_>>())
         );
         for (at, layer) in layers {
             let s = planner
@@ -1224,7 +1188,11 @@ mod gate {
             let mut sim_rope = Vec::with_capacity(groups * width);
             let ik_tab = tables(&cx.meta, &st.write_pos, Some(width))?;
             for g in 0..groups {
-                sim_norm.extend(norm_ik(&d_pool[g * width..(g + 1) * width], &gain, eps));
+                sim_norm.extend(ik_norm::fused(
+                    &d_pool[g * width..(g + 1) * width],
+                    &gain,
+                    eps,
+                ));
                 sim_rope.extend(rotate(&d_norm[g * width..(g + 1) * width], &ik_tab[g]));
             }
             let norm_same = same_bits(&sim_norm, &d_norm);
@@ -1268,15 +1236,14 @@ mod gate {
             for g in 0..groups {
                 let y = &d_pool[g * width..(g + 1) * width];
                 let nrm = &d_norm[g * width..(g + 1) * width];
-                let sum = y.iter().fold(0.0f64, |a, &v| a + f64::from(v * v));
-                let scale = 1.0 / ((sum / width as f64) as f32 + eps).sqrt();
+                let scale = ik_norm::scale(y, eps);
                 let dy: Vec<f64> = spread[g * width..(g + 1) * width]
                     .iter()
                     .map(|&a| {
                         if r == 1 {
                             0.0
                         } else {
-                            f64::from(pool_units(r) * U) * f64::from(a)
+                            f64::from(pool_units(r) * U_F32) * f64::from(a)
                         }
                     })
                     .collect();
@@ -1284,7 +1251,7 @@ mod gate {
                 for i in 0..width {
                     band.push(
                         f64::from((scale * gain[i]).abs()) * dy[i]
-                            + (f64::from(NORM512_UNITS * U) + rho) * f64::from(nrm[i].abs()),
+                            + (f64::from(NORM512_UNITS * U_F32) + rho) * f64::from(nrm[i].abs()),
                     );
                 }
             }
@@ -1328,8 +1295,8 @@ mod gate {
             dump_ok &= ours_keeps;
             notes.push(format!(
                 "kept={}->{} ik_ring_after_is_persist={ik_keeps} ring_after_equals_ik={ours_keeps}",
-                list(&st.persist_src),
-                list(&kept)
+                comma_list(&st.persist_src),
+                comma_list(&kept)
             ));
         }
         let pass = rule_ok && sim_ok && dump_ok;
@@ -1340,9 +1307,9 @@ mod gate {
              unwritten_rows_sentinel={untouched} ring_exact={ring_exact} bit_identical_rerun={rerun} {} {}",
             geom.max_groups,
             geom.rows,
-            list(&st.write_pos),
-            list(&written),
-            list(&st.state_read),
+            comma_list(&st.write_pos),
+            comma_list(&written),
+            comma_list(&st.state_read),
             if groups == 0 {
                 "no group"
             } else if r == 1 {
@@ -1515,7 +1482,7 @@ mod gate {
         );
         let mut scale_is = true;
         for g in 0..groups {
-            sim_norm.extend(norm_ik(&d_mm[g * w..(g + 1) * w], &gain, eps));
+            sim_norm.extend(ik_norm::fused(&d_mm[g * w..(g + 1) * w], &gain, eps));
             sim_rope.extend(rotate(&d_norm[g * w..(g + 1) * w], &ik_tab[g]));
             let mut v = d_rope[g * w..(g + 1) * w].to_vec();
             scale_is &= fast_ht(&mut v).to_bits() == HT_SCALE.to_bits();
@@ -1548,7 +1515,7 @@ mod gate {
         // wherever the f32 values are.
         let mut band = Vec::with_capacity(n);
         for g in 0..groups {
-            let b = f64::from(IDX_L2_UNITS * U) * norm2(&d_hada[g * w..(g + 1) * w]);
+            let b = f64::from(IDX_L2_UNITS * U_F32) * norm2(&d_hada[g * w..(g + 1) * w]);
             band.extend(std::iter::repeat_n(b, w));
         }
         let (k_over, k_worst) = over(&host, &d_hada, &band);
@@ -1574,8 +1541,8 @@ mod gate {
              f16_equal_on_equal_f32={on_equal} {}",
             geom.max_groups,
             geom.rows,
-            list(&st.write_pos),
-            list(&written),
+            comma_list(&st.write_pos),
+            comma_list(&written),
             verdict(pass)
         );
         Ok(pass)

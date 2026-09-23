@@ -54,11 +54,13 @@ mod gate {
     use bloomery_gpu_deepseek41::engram_gate::{
         CLAMP_MIN, EngramGateKernels, GateArgs, KeyNormArgs, PER_THREAD, ROW, inv_sqrt_row,
     };
+    use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::rounding::{U, U64, butterfly};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, Layout, RefManifest, RowKind, bits_equal, checks_failed,
-        max_rel_err, ref_ints, ref_model_path, ref_tensor_logical_in, verdict,
+        max_rel_err, open_split, ref_ints, ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
@@ -117,11 +119,6 @@ mod gate {
         (23, QN),
     ];
 
-    /// f32's unit roundoff, 2^-24.
-    const U: f64 = f32::EPSILON as f64 / 2.0;
-    /// f64's unit roundoff, 2^-53.
-    const U64: f64 = f64::EPSILON / 2.0;
-
     /// Roundings on our side of a norm's sum of squares: [`PER_THREAD`] fused
     /// multiply-adds per thread, five butterfly levels and three
     /// `rms_warp_tree` levels. The terms are non-negative, so the sum is
@@ -161,15 +158,6 @@ mod gate {
 
     impl Meta {
         fn read(split: &Split) -> Result<Meta, GateError> {
-            let want = Arch::Deepseek41.name();
-            if split.architecture() != Some(want) {
-                return Err(format!(
-                    "the model file is {:?}, want {want} — run through `just gate-gpu-ds41-engram`, \
-                     which picks the deepseek41 profile",
-                    split.architecture()
-                )
-                .into());
-            }
             let u = |s: &str| -> Result<usize, GateError> {
                 let v = split
                     .arch_get_u64(s)
@@ -299,7 +287,7 @@ mod gate {
     // -------------------------------------------------------------- run
 
     pub fn run() -> Result<(), GateError> {
-        let split = Split::open(ref_model_path()?)?;
+        let split = open_split(Arch::Deepseek41, "gate-gpu-ds41-engram")?;
         let meta = Meta::read(&split)?;
         let gpu = Gpu::new()?;
         let eg = EngramGateKernels::load(gpu.context())?;
@@ -635,10 +623,8 @@ mod gate {
         )
     }
 
-    /// ik's RMS_NORM of each `ROW`-value row of `x`: every square rounded to
-    /// f32 and summed in f64 serially, the mean rounded to f32, `1.0f /
-    /// sqrtf(mean + eps)`, each value times it (`ggml.c`
-    /// `ggml_compute_forward_rms_norm_f32`).
+    /// ik's RMS_NORM of each `ROW`-value row of `x`: each value times the
+    /// row's [`ik_norm::scale`].
     fn ik_rms(x: &[f32], eps: f32) -> Vec<f32> {
         let mut y = vec![0.0f32; x.len()];
         for (xr, yr) in x
@@ -647,9 +633,7 @@ mod gate {
             .iter()
             .zip(y.as_chunks_mut::<ROW>().0)
         {
-            let sum = xr.iter().fold(0.0f64, |a, &v| a + f64::from(v * v));
-            let mean = (sum / ROW as f64) as f32;
-            let scale = 1.0f32 / (mean + eps).sqrt();
+            let scale = ik_norm::scale(xr, eps);
             for (o, &v) in yr.iter_mut().zip(xr) {
                 *o = v * scale;
             }
@@ -840,29 +824,6 @@ mod gate {
         (0..PER_THREAD).map(move |c| tid + RMS_THREADS * c)
     }
 
-    /// The xor butterfly `warp::reduce_sum_f32` runs (16, 8, 4, 2, 1; each
-    /// lane adds its partner to itself): lane 0's result.
-    fn butterfly32(mut v: [f32; 32]) -> f32 {
-        for off in [16, 8, 4, 2, 1] {
-            let prev = v;
-            for (l, x) in v.iter_mut().enumerate() {
-                *x = prev[l] + prev[l ^ off];
-            }
-        }
-        v[0]
-    }
-
-    /// The same butterfly in f64 (`warp::shuffle_xor_f64`).
-    fn butterfly64(mut v: [f64; 32]) -> f64 {
-        for off in [16, 8, 4, 2, 1] {
-            let prev = v;
-            for (l, x) in v.iter_mut().enumerate() {
-                *x = prev[l] + prev[l ^ off];
-            }
-        }
-        v[0]
-    }
-
     /// Our norm scale of one row, as the kernels take it: per thread its
     /// values' squares by fused multiply-adds in order, the butterfly per
     /// warp, `rms_warp_tree`, `rms_scale`.
@@ -872,7 +833,7 @@ mod gate {
             .collect();
         let mut sums = [0.0f32; RMS_WARPS];
         for (s, lanes) in sums.iter_mut().zip(part.as_chunks::<32>().0) {
-            *s = butterfly32(*lanes);
+            *s = butterfly(*lanes);
         }
         rms_scale(rms_warp_tree(sums), ROW as u32, eps)
     }
@@ -943,7 +904,7 @@ mod gate {
             for (l, v) in lanes.iter_mut().enumerate() {
                 *v = (1..RMS_WARPS).fold(dots[l], |acc, wp| acc + dots[l + 32 * wp]);
             }
-            let gv = our_gate(butterfly64(lanes));
+            let gv = our_gate(butterfly(lanes));
             *gslot = gv;
             for ((o, &xv), &vv) in or.iter_mut().zip(xr).zip(vr) {
                 *o = xv + vv * gv;

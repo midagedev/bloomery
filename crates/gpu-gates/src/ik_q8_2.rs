@@ -32,6 +32,21 @@ pub fn quantize(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
     (q, d)
 }
 
+/// The values ik's q8_2 blocks of `x` ([`quantize`]) stand for, `code · d`
+/// each — what a gate bounds ik's dot through. Exact in f32: a code of at
+/// most eight bits times a bf16 scale. A zero code gives `+0.0`, never
+/// `-0.0`, since the codes are integers. `x` is whole blocks.
+pub fn reconstruct(x: &[f32]) -> Vec<f32> {
+    assert!(x.len().is_multiple_of(QK), "q8_2 blocks are {QK} values");
+    let (q, d) = quantize(x);
+    q.as_chunks::<QK>()
+        .0
+        .iter()
+        .zip(d)
+        .flat_map(|(blk, s)| blk.iter().map(move |&c| f32::from(c) * s))
+        .collect()
+}
+
 /// The activation code `SignedDot` pairs with weight code `w`:
 /// `_mm256_sign_epi8(a, w)` — `a` under a positive weight, `−a` under a
 /// negative one, wrapping, so −128 stays −128, and 0 under a zero weight.

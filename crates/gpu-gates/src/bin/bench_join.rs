@@ -81,6 +81,7 @@ fn main() -> std::process::ExitCode {
 mod bench {
     use bloomery_gpu::join_probe::{self as jp, JoinProbe};
     use bloomery_gpu::{Gpu, GpuError, Graph, NodeInfo};
+    use bloomery_gpu_gates::nodes::kind_name;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::{CudaStream, DeviceBuffer, DriverError, sys};
     use std::ffi::c_void;
@@ -1098,41 +1099,12 @@ mod bench {
         }
     }
 
-    /// The driver's names for the node types a join graph can hold.
-    const NODE_KINDS: [(sys::CUgraphNodeType, &str); 7] = [
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL,
-            "kernel",
-        ),
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY,
-            "memcpy",
-        ),
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET,
-            "memset",
-        ),
-        (sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST, "host"),
-        (sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_EMPTY, "empty"),
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_WAIT_EVENT,
-            "wait_event",
-        ),
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP,
-            "batch_mem_op",
-        ),
-    ];
-
     /// `kernel,memcpy,host(spinwait),…` for a node list.
     fn kinds(nodes: &[NodeInfo]) -> String {
         nodes
             .iter()
             .map(|n| {
-                let kind = NODE_KINDS
-                    .iter()
-                    .find(|k| k.0 == n.kind)
-                    .map_or_else(|| format!("type{}", n.kind), |k| k.1.to_string());
+                let kind = kind_name(n.kind);
                 match n.host_sync {
                     Some(sys::CU_HOST_TASK_BLOCKING) => format!("{kind}(blocking)"),
                     Some(sys::CU_HOST_TASK_SPINWAIT) => format!("{kind}(spinwait)"),

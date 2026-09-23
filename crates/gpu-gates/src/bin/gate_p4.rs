@@ -42,8 +42,8 @@ use bloomery_gpu_gates::{GateError, RefManifest, RefRow};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     activations, bits_equal, bytes_to_words, f32_tensor, load_ref_in, load_ref_logical_in,
-    max_rel_err, open_model, ref_dir, ref_tensor_of, row_bytes, tensor_bytes, tensor_bytes_as,
-    verdict, view_flat,
+    max_rel_err, open_model, ptx_shapes, ref_dir, ref_tensor_of, row_bytes, tensor_bytes,
+    tensor_bytes_as, verdict, view_flat,
 };
 #[cfg(feature = "gpu")]
 use cuda_core::DeviceBuffer;
@@ -759,21 +759,20 @@ fn norm_geometry() -> Result<bool, GateError> {
     /// Every `k` a decode step norms: the hidden width and the MLA latent.
     const NORM_K: [usize; 2] = [2048, 512];
 
-    let bundles = bloomery_gpu_gates::ptx::current_exe_bundles()?;
-    let modules = bloomery_gpu_gates::ptx::modules(&bundles);
-    let mut ok = true;
     let shaped = RMS_THREADS % 32 == 0 && RMS_THREADS <= 1024 && RMS_WARPS == RMS_THREADS / 32;
     // Both norms share the sum of squares, so both must share its block.
-    for name in ["rms_norm", "norm_quant"] {
-        let ntid = entry_reqntid(&modules, name)
-            .ok_or_else(|| format!("gate_p4: no PTX entry {name} with a .reqntid"))?;
-        let pass = ntid == RMS_THREADS;
-        println!(
-            "shape op={name} geometry block_reqntid={ntid} RMS_THREADS={RMS_THREADS} {}",
-            if pass { "PASS" } else { "FAIL" }
-        );
-        ok &= pass;
-    }
+    let mut ok = ptx_shapes(&["rms_norm", "norm_quant"], |c, _| {
+        let ntid = c
+            .reqntid
+            .ok_or_else(|| format!("gate_p4: PTX entry {} declares no .reqntid", c.name))?;
+        Ok((
+            ntid == RMS_THREADS,
+            format!(
+                "shape op={} geometry block_reqntid={ntid} RMS_THREADS={RMS_THREADS}",
+                c.name
+            ),
+        ))
+    })?;
     for k in NORM_K {
         let trips = k.div_ceil(RMS_THREADS);
         let pass = shaped && trips <= NORM_MAX_TRIPS;
@@ -784,7 +783,7 @@ fn norm_geometry() -> Result<bool, GateError> {
         );
         ok &= pass;
     }
-    ok &= argmax_geometry(&modules)?;
+    ok &= argmax_geometry()?;
     Ok(ok)
 }
 
@@ -796,7 +795,7 @@ fn norm_geometry() -> Result<bool, GateError> {
 /// drift apart; `ARGMAX_MIN_WARPS` is the residency the shape has to buy,
 /// and the trip count is what the stride actually costs at the head's width.
 #[cfg(feature = "gpu")]
-fn argmax_geometry(modules: &[bloomery_gpu_gates::ptx::Module<'_>]) -> Result<bool, GateError> {
+fn argmax_geometry() -> Result<bool, GateError> {
     use bloomery_gpu::elem::{ARGMAX_THREADS, ARGMAX_WARPS};
 
     /// Warps the argmax block must keep resident — one warp was the defect.
@@ -804,30 +803,25 @@ fn argmax_geometry(modules: &[bloomery_gpu_gates::ptx::Module<'_>]) -> Result<bo
     /// The head's vocabulary: the one vector a decode step argmaxes.
     const ARGMAX_N: usize = 102_400;
 
-    let ntid =
-        entry_reqntid(modules, "argmax").ok_or("gate_p4: no PTX entry argmax with a .reqntid")?;
-    let trips = ARGMAX_N.div_ceil(ARGMAX_THREADS);
-    let pass = ntid == ARGMAX_THREADS
-        && ARGMAX_THREADS % 32 == 0
-        && ARGMAX_THREADS <= 1024
-        && ARGMAX_WARPS == ARGMAX_THREADS / 32
-        && ARGMAX_WARPS >= ARGMAX_MIN_WARPS;
-    println!(
-        "shape op=argmax geometry block_reqntid={ntid} ARGMAX_THREADS={ARGMAX_THREADS} \
-         warps={ARGMAX_WARPS} min_warps={ARGMAX_MIN_WARPS} n={ARGMAX_N} \
-         trips_per_thread={trips} {}",
-        if pass { "PASS" } else { "FAIL" }
-    );
-    Ok(pass)
-}
-
-/// The `x` of one PTX entry's `.reqntid x, y, z` — the block width the device
-/// code was compiled for. The device bundle rides in this executable as PTX
-/// text, so the whole check is a scan of the PTX payload `/proc/self/exe`
-/// carries (`bloomery_gpu_gates::ptx`).
-#[cfg(feature = "gpu")]
-fn entry_reqntid(modules: &[bloomery_gpu_gates::ptx::Module<'_>], name: &str) -> Option<usize> {
-    bloomery_gpu_gates::ptx::body(modules, name).and_then(bloomery_gpu_gates::ptx::reqntid)
+    ptx_shapes(&["argmax"], |c, _| {
+        let ntid = c
+            .reqntid
+            .ok_or("gate_p4: PTX entry argmax declares no .reqntid")?;
+        let trips = ARGMAX_N.div_ceil(ARGMAX_THREADS);
+        let pass = ntid == ARGMAX_THREADS
+            && ARGMAX_THREADS % 32 == 0
+            && ARGMAX_THREADS <= 1024
+            && ARGMAX_WARPS == ARGMAX_THREADS / 32
+            && ARGMAX_WARPS >= ARGMAX_MIN_WARPS;
+        Ok((
+            pass,
+            format!(
+                "shape op=argmax geometry block_reqntid={ntid} ARGMAX_THREADS={ARGMAX_THREADS} \
+                 warps={ARGMAX_WARPS} min_warps={ARGMAX_MIN_WARPS} n={ARGMAX_N} \
+                 trips_per_thread={trips}"
+            ),
+        ))
+    })
 }
 
 /// One rms_norm case: run the kernel twice on `x`, assert against the host

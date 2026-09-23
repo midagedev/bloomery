@@ -26,7 +26,8 @@ fn run() -> Result<(), GateError> {
     let bytes = std::fs::read(&section).map_err(|e| format!("read {}: {e}", section.display()))?;
     let bundles =
         ptx::section_bundles(&bytes).map_err(|e| format!("{}: {e}", section.display()))?;
-    for (n, m) in (1_usize..).zip(ptx::modules(&bundles)) {
+    let modules = ptx::modules(&bundles).map_err(|e| format!("{}: {e}", section.display()))?;
+    for (n, m) in (1_usize..).zip(modules) {
         let path = dir.join(format!("mod{n}.ptx"));
         std::fs::write(&path, m.text()).map_err(|e| format!("write {}: {e}", path.display()))?;
         println!("mod{n} bundle={} bytes={}", m.bundle(), m.text().len());

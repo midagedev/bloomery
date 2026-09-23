@@ -15,14 +15,19 @@
 pub mod block;
 pub mod ds41_meta;
 pub mod engine;
+pub mod ik_norm;
 pub mod ik_q8_2;
 pub mod kld;
+#[cfg(feature = "gpu")]
+pub mod nodes;
 pub mod oracle;
 pub mod prompts;
 pub mod ptx;
+pub mod rounding;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
+use model::arch::Arch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -92,6 +97,31 @@ pub fn data_dir() -> PathBuf {
 
 pub fn open_model() -> Result<Gguf, GateError> {
     Ok(Gguf::open(ref_model_path()?)?)
+}
+
+/// The model file ([`ref_model_path`]) as a split, proven to be of
+/// architecture `arch` ([`expect_arch`]); `recipe` is the `just` recipe the
+/// error for any other file names.
+pub fn open_split(arch: Arch, recipe: &str) -> Result<Split, GateError> {
+    let path = ref_model_path()?;
+    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    expect_arch(&split, arch, recipe)?;
+    Ok(split)
+}
+
+/// Err unless `split` is a model file of architecture `arch`. The error names
+/// `recipe`, the `just` recipe that picks `arch`'s model profile.
+pub fn expect_arch(split: &Split, arch: Arch, recipe: &str) -> Result<(), GateError> {
+    let want = arch.name();
+    if split.architecture() != Some(want) {
+        return Err(format!(
+            "the model file is {:?}, want {want} — run through `just {recipe}`, \
+             which picks the {want} profile",
+            split.architecture()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// `m` activation columns of `k` f32 each, concatenated. A fixed LCG mapped
@@ -754,6 +784,32 @@ impl RefManifest {
         self.rows_of(kind).get(at).filter(|r| r.name == name)
     }
 
+    /// The one row of kind `kind` whose name opens with `prefix`, whatever
+    /// its occurrence: the row of a tensor the graph names after the last of
+    /// several callers (`dsv4_raw_mask_padded-<layer>`), which a reader cannot
+    /// name in advance. No such row, or more than one, is an error naming the
+    /// rows found and the set.
+    pub fn only_with_prefix(&self, kind: RowKind, prefix: &str) -> Result<&RefRow, GateError> {
+        let found: Vec<&RefRow> = self
+            .rows_of(kind)
+            .iter()
+            .filter(|r| r.name.starts_with(prefix))
+            .collect();
+        match found[..] {
+            [r] => Ok(r),
+            _ => Err(format!(
+                "ref_manifest: want one {} row named {prefix}…, {} has {:?}",
+                kind.as_str(),
+                self.dir.join("MANIFEST.tsv").display(),
+                found
+                    .iter()
+                    .map(|r| format!("{}/{}", r.name, r.occurrence))
+                    .collect::<Vec<_>>()
+            )
+            .into()),
+        }
+    }
+
     /// The `tensor` row `name`/`occurrence` ([`find`](Self::find)); a set
     /// without it is an error naming the set.
     pub fn tensor(&self, name: &str, occurrence: u32) -> Result<&RefRow, GateError> {
@@ -1355,6 +1411,58 @@ pub fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
 }
 
+/// The values of `v` with a comma between each two — how a gate's line
+/// prints a list of positions, rows or slots.
+pub fn comma_list(v: &[impl ToString]) -> String {
+    v.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// FNV-1a 64 over bytes fed in order: the digest a gate prints over a
+/// kernel's output bits, and `gate_p1` pins, so a change that must move no
+/// bit is read against one line. [`Default`] is the digest of no bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct Fnv1a64(u64);
+
+impl Default for Fnv1a64 {
+    fn default() -> Fnv1a64 {
+        Fnv1a64(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fnv1a64 {
+    /// The digest continued over `bytes`.
+    #[must_use]
+    pub fn bytes(mut self, bytes: &[u8]) -> Fnv1a64 {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self
+    }
+
+    /// The digest continued over the bits of each value, little-endian.
+    #[must_use]
+    pub fn f32s(self, v: &[f32]) -> Fnv1a64 {
+        v.iter()
+            .fold(self, |h, x| h.bytes(&x.to_bits().to_le_bytes()))
+    }
+
+    /// The digest continued over each value, little-endian.
+    #[must_use]
+    pub fn u32s(self, v: &[u32]) -> Fnv1a64 {
+        v.iter().fold(self, |h, x| h.bytes(&x.to_le_bytes()))
+    }
+
+    /// The digest's value.
+    #[must_use]
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
 /// Same length and the same bits at every index — the bit-identity contract
 /// the fusion, rerun and replay checks assert. Not `==`: that calls `-0.0`
 /// equal to `0.0` and two NaNs unequal, and both are differences a fusion
@@ -1392,31 +1500,45 @@ pub fn max_ulps(a: &[f32], b: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
-/// The shape check a gate runs on the device code it carries: every entry
-/// of `entries` compiles with no local depot and no local loads or stores,
-/// read off the PTX in this executable ([`ptx::current_exe_bundles`]). A
-/// spilled accumulator array changes no output and no band, only the time,
-/// so nothing else a gate checks can see it. Prints one `shape` line per
-/// entry and returns whether every one passes; an entry the executable does
-/// not carry is an error.
-pub fn no_local_depot(entries: &[&str]) -> Result<bool, GateError> {
+/// The shape checks a gate runs on the device code it carries, read off the
+/// PTX in this executable ([`ptx::current_exe_bundles`]): each entry of
+/// `entries` goes to `judge` with its [`ptx::Counts`] and its [`ptx::body`],
+/// and `judge` returns whether the entry passes and the line that says why,
+/// printed here with the verdict after it. A spilled accumulator array or a
+/// block width the host does not launch changes no output and no band, only
+/// the time, so nothing else a gate checks can see it. Returns whether every
+/// entry passed; an entry the executable does not carry is an error, and so
+/// is an error `judge` returns.
+pub fn ptx_shapes(
+    entries: &[&str],
+    mut judge: impl FnMut(&ptx::Counts, &[u8]) -> Result<(bool, String), GateError>,
+) -> Result<bool, GateError> {
     let bundles = ptx::current_exe_bundles()?;
-    let modules = ptx::modules(&bundles);
+    let modules = ptx::modules(&bundles)?;
     let mut ok = true;
     for &name in entries {
-        let c = ptx::counts(&modules, name)
+        let body = ptx::body(&modules, name)
             .ok_or_else(|| format!("no PTX entry {name} in this executable"))?;
-        let pass = !c.depot && c.ld_local == 0 && c.st_local == 0;
-        println!(
-            "shape kernel={name} local_depot={} ld_local={} st_local={} {}",
-            c.depot,
-            c.ld_local,
-            c.st_local,
-            verdict(pass)
-        );
+        let (pass, line) = judge(&ptx::Counts::of(name, body), body)?;
+        println!("{line} {}", verdict(pass));
         ok &= pass;
     }
     Ok(ok)
+}
+
+/// [`ptx_shapes`] with one judge: every entry of `entries` compiles with no
+/// local depot and no local loads or stores. Prints one `shape` line per
+/// entry.
+pub fn no_local_depot(entries: &[&str]) -> Result<bool, GateError> {
+    ptx_shapes(entries, |c, _| {
+        Ok((
+            !c.depot && c.ld_local == 0 && c.st_local == 0,
+            format!(
+                "shape kernel={} local_depot={} ld_local={} st_local={}",
+                c.name, c.depot, c.ld_local, c.st_local
+            ),
+        ))
+    })
 }
 
 /// Mean microseconds per replay of graph `g`: one warm replay and a
@@ -1462,14 +1584,16 @@ pub fn view_flat(view: &[f32], base: &[f32], off: usize, what: &str) -> Result<(
 /// chosen ids and their weights `[n_used, m]`.
 pub type Routing = (Vec<f32>, Vec<i32>, Vec<f32>);
 
-/// The router shape [`route_ref`] takes: the V2-Lite model's 64 experts, 6
-/// used per token.
-const V2_LITE_ROUTER: (usize, usize) = (64, 6);
+/// The V2-Lite model's router: 64 experts, 6 used per token. [`route_ref`]
+/// routes at this shape, and the top-k readers without a bound check ids
+/// against its expert count — that of the model the V2-Lite sets were dumped
+/// from.
+const V2_LITE_ROUTER: (u32, usize) = (64, 6);
 
 /// [`route_ref_within`] at the V2-Lite router's shape.
 pub fn route_ref(logits: &[f32], m: usize, scale: f32) -> Result<Routing, GateError> {
     let (n_expert, n_used) = V2_LITE_ROUTER;
-    route_ref_within(logits, m, n_expert, n_used, scale)
+    route_ref_within(logits, m, usize::try_from(n_expert)?, n_used, scale)
 }
 
 /// Host scalar router reference over `n_expert` experts, `n_used` chosen a
@@ -1570,7 +1694,9 @@ pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError
 /// rounding back with `gguf::quant::f32_to_f16_bits` — the CPU oracle's own
 /// rounding, not a second transcription — recovers ik's bits; a value that
 /// does not widen back to itself is an error naming the row. Only the rows
-/// asked for are read from the file.
+/// asked for are read from the file. The rows are read from the plain file,
+/// so it must be the tensor: a row that is a view or not contiguous
+/// ([`plain_is_logical`]) is an error.
 pub fn widened_f16_bits_in(dir: &Path, row: &RefRow, idx: &[u32]) -> Result<Vec<u16>, GateError> {
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
     use std::io::{Read, Seek, SeekFrom};
@@ -1592,6 +1718,14 @@ pub fn widened_f16_bits_in(dir: &Path, row: &RefRow, idx: &[u32]) -> Result<Vec<
             what(),
             row.ty,
             row.bytes
+        )
+        .into());
+    }
+    if !plain_is_logical(row) {
+        return Err(format!(
+            "widened_f16_bits: {} is a view/non-contiguous row — its plain file is a flat \
+             read, not the tensor",
+            what()
         )
         .into());
     }
@@ -1638,20 +1772,9 @@ pub fn widened_f16_bits_in(dir: &Path, row: &RefRow, idx: &[u32]) -> Result<Vec<
 }
 
 /// Every row of f16 row `row` of the set at `dir`, as f16 bits:
-/// [`widened_f16_bits_in`] over rows `0 .. count / ne[0]`. A whole tensor
-/// read through its plain file needs that file to be the tensor, so a row
-/// that is a view or not contiguous ([`plain_is_logical`]) is an error.
+/// [`widened_f16_bits_in`] over rows `0 .. count / ne[0]`, which refuses a
+/// row whose plain file is not the tensor.
 pub fn widened_f16_rows_in(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError> {
-    if !plain_is_logical(row) {
-        return Err(format!(
-            "widened_f16_rows: {} {}/{} is a view/non-contiguous row — its plain file is a \
-             flat read, not the tensor",
-            row.kind.as_str(),
-            row.name,
-            row.occurrence
-        )
-        .into());
-    }
     let rows = row.count().checked_div(row.ne[0]).unwrap_or(0);
     let idx: Vec<u32> = (0..u32::try_from(rows)?).collect();
     widened_f16_bits_in(dir, row, &idx)
@@ -1721,10 +1844,6 @@ pub fn mask_bits_in(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError> {
         .collect()
 }
 
-/// The expert count the top-k readers without a bound check ids against:
-/// that of the model the V2-Lite sets were dumped from.
-const TOPK_IDS_BOUND: u32 = 64;
-
 /// [`topk_ids_logical_in`] of a row of `ref_dir()`'s manifest, which it
 /// reads on every call: a gate reading more than one row holds a
 /// [`RefManifest`] and calls [`topk_ids_logical_in`] or
@@ -1734,9 +1853,9 @@ pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
 }
 
 /// [`topk_ids_logical_within`] of a row of `man`, a manifest already read,
-/// with every id in `0..64`, the V2-Lite model's expert count.
+/// with every id below the V2-Lite model's expert count.
 pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, GateError> {
-    topk_ids_logical_within(man, row, TOPK_IDS_BOUND)
+    topk_ids_logical_within(man, row, V2_LITE_ROUTER.0)
 }
 
 /// The topk row's ids from its LOGICAL twin: `ffn_moe_topk-L` is an i32
@@ -1893,7 +2012,8 @@ mod tests {
     /// The positional reads agree with a scan: a row's position, the first
     /// row of a name whose first written occurrence is not 0, the last row
     /// of a name before a reader, and an input's first toucher, the tensor
-    /// row after it.
+    /// row after it. A name prefix finds its one row, and more than one or
+    /// none is an error.
     #[test]
     fn the_index_finds_the_row_a_scan_finds_first() -> Result<(), GateError> {
         let dir = set_dir("index")?;
@@ -1941,6 +2061,11 @@ mod tests {
         };
         assert_eq!(touched(2), [3.0]);
         assert!(touched(1).is_empty() && touched(3).is_empty());
+
+        assert_eq!(man.only_with_prefix(RowKind::Input, "x")?.sum, 3.0);
+        assert_eq!(man.only_with_prefix(RowKind::Tensor, "y")?.sum, 5.0);
+        assert!(man.only_with_prefix(RowKind::Tensor, "x").is_err());
+        assert!(man.only_with_prefix(RowKind::Input, "y").is_err());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2099,7 +2224,7 @@ mod tests {
     /// as f16 bits, and reads no other row: a row holding a value no half
     /// widens to is refused when asked for and passes unread otherwise; a
     /// row past the tensor is an error. The whole-tensor reader asks for
-    /// every row, and refuses a row whose plain file is not its logical order.
+    /// every row. Both refuse a row whose plain file is not its logical order.
     #[test]
     fn widened_f16_bits_read_only_the_rows_asked_for() -> Result<(), GateError> {
         let dir = set_dir("widened")?;
@@ -2131,6 +2256,7 @@ mod tests {
         );
         let view = manifest(&dir, &[&row.replace("VIEW\t1\t0", "VIEW\t0\t0")])?;
         assert!(widened_f16_rows_in(&dir, &view.tensors[0]).is_err());
+        assert!(widened_f16_bits_in(&dir, &view.tensors[0], &[0]).is_err());
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

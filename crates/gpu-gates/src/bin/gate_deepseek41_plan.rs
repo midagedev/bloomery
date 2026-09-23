@@ -177,7 +177,12 @@ fn gate_set(
     out_ids(man, c, &plan);
     let mut bits = Vec::new();
     plan.raw_mask_into(&mut bits);
-    mask(man, c, &raw_mask_name(man)?, plan.raw_n_kv, &bits);
+    // The port's one raw mask carries the name the last layer's callback gave
+    // it (`dsv4_raw_mask_padded-<layer>`), so it is found by its prefix.
+    let raw_mask = &man
+        .only_with_prefix(RowKind::Input, "dsv4_raw_mask_padded")?
+        .name;
+    mask(man, c, raw_mask, plan.raw_n_kv, &bits);
     for (st, name) in plan.streams.iter().zip(STREAMS) {
         let input = |what: &str| format!("dsv4_{name}_{what}");
         let rows = st
@@ -296,23 +301,6 @@ fn out_ids(man: &RefManifest, c: &mut Checks, plan: &StepPlan) {
         return;
     }
     ints(man, c, "inp_out_ids", "i32", &wide(&plan.out_ids));
-}
-
-/// The raw window mask's input: the port's one mask tensor carries the name the last layer's
-/// callback gave it (`dsv4_raw_mask_padded-<layer>`), so it is found by its stem.
-fn raw_mask_name(man: &RefManifest) -> Result<String, GateError> {
-    let names: Vec<&str> = man
-        .inputs
-        .iter()
-        .filter(|r| r.name.starts_with("dsv4_raw_mask_padded"))
-        .map(|r| r.name.as_str())
-        .collect();
-    match names.as_slice() {
-        [one] => Ok((*one).to_string()),
-        _ => Err(
-            format!("want one dsv4_raw_mask_padded-<layer> input, the set has {names:?}").into(),
-        ),
-    }
 }
 
 /// Mask input `name` against the plan's rendering `want`: f16 bits in lines of `width`, read

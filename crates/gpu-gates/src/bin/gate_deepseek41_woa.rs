@@ -51,8 +51,9 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Gpu};
     use bloomery_gpu_gates::ik_q8_2::{self, QK, folded, half_sum};
     use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::rounding::{butterfly, gamma};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, RefRow, bits_equal, checks_failed, max_rel_err, ref_model_path,
+        GateError, RefManifest, RefRow, bits_equal, checks_failed, max_rel_err, open_split,
         ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -60,18 +61,8 @@ mod gate {
     use gguf::quant::{GgmlType, Q8Block, half_to_f32};
     use model::arch::Arch;
 
-    /// f32's unit roundoff, 2^-24.
-    const U: f64 = f32::EPSILON as f64 / 2.0;
-
     /// Host threads for the two rules' transcriptions.
     const HOST_THREADS: usize = 16;
-
-    /// `γ(n) = n·u / (1 − n·u)`: the relative bound on a term that went
-    /// through `n` roundings of its partial sums.
-    fn gamma(n: usize) -> f64 {
-        let nu = n as f64 * U;
-        nu / (1.0 - nu)
-    }
 
     /// A Q8_0 weight twice: the file's blocks for the host rules, and the
     /// q8f32 device planes the kernels read.
@@ -140,18 +131,6 @@ mod gate {
         butterfly(lanes)
     }
 
-    /// The xor butterfly `warp::reduce_sum_f32` runs (16, 8, 4, 2, 1; each
-    /// lane adds its partner to itself): lane 0's result.
-    fn butterfly(mut v: [f32; 32]) -> f32 {
-        for off in [16, 8, 4, 2, 1] {
-            let p = v;
-            for (l, s) in v.iter_mut().enumerate() {
-                *s = p[l] + p[l ^ off];
-            }
-        }
-        v[0]
-    }
-
     // ------------------------------------------------------ rows and the band
 
     /// One output row: both rules in f32, the gap between their exact
@@ -164,9 +143,6 @@ mod gate {
         /// by at most 2^-53 of it — below every printed digit).
         gap: f64,
         band: f64,
-        /// Terms where ik's sign fold wraps: activation code −128 under a
-        /// negative weight code.
-        wraps: u32,
     }
 
     /// Both rules on one row, and its band: how far our kernel may sit from
@@ -185,7 +161,6 @@ mod gate {
         let k = x.len();
         let (mut ours_exact, mut ik_exact) = (0.0f64, 0.0f64);
         let (mut abs_ours, mut abs_ik, mut act) = (0.0f64, 0.0f64, 0.0f64);
-        let mut wraps = 0u32;
         for (b, blk) in blocks.iter().enumerate() {
             let (dw, dx) = (half_to_f32(blk.d), xd[b]);
             let a = &xq[b * QK..(b + 1) * QK];
@@ -201,7 +176,6 @@ mod gate {
                 abs_ours += (wv * xv).abs();
                 let xh = f64::from(c.signum()) * f64::from(folded(c, a[j])) * f64::from(dx);
                 act += wv.abs() * (xv - xh).abs();
-                wraps += u32::from(c < 0 && a[j] == i8::MIN);
             }
         }
         RowRef {
@@ -209,7 +183,6 @@ mod gate {
             ik: ik_q8_2::dot(blocks, xq, xd),
             gap: (ours_exact - ik_exact).abs(),
             band: act + gamma(k / QK + 5) * abs_ours + gamma(k / (4 * QK) + 3) * abs_ik,
-            wraps,
         }
     }
 
@@ -417,8 +390,6 @@ mod gate {
         max_dump: f64,
         max_gap: f64,
         max_band: f64,
-        /// ik's sign-fold wraps over the site ([`RowRef::wraps`]).
-        wraps: u32,
         kernel: Vec<f32>,
         dump: Vec<f32>,
     }
@@ -447,7 +418,6 @@ mod gate {
             max_dump: 0.0,
             max_gap: 0.0,
             max_band: 0.0,
-            wraps: 0,
             kernel: Vec::with_capacity(dump.len()),
             dump: dump.to_vec(),
         };
@@ -467,7 +437,6 @@ mod gate {
                 tl.max_dump = tl.max_dump.max(f64::from(ik_val).abs());
                 tl.max_gap = tl.max_gap.max(r.gap);
                 tl.max_band = tl.max_band.max(r.band);
-                tl.wraps += r.wraps;
             }
             tl.kernel.extend(y);
         }
@@ -490,7 +459,7 @@ mod gate {
             && tl.over_band == 0;
         println!(
             "site set={label} L={l} op={op} T={t} values={} kernel_vs_ours_bits={}/{} rerun_bit_identical={} \
-             ik_sim_vs_dump_bits={}/{} ik_sign_fold_wraps={} input_view_bit_identical={view} ik_rel={ik_rel} \
+             ik_sim_vs_dump_bits={}/{} input_view_bit_identical={view} ik_rel={ik_rel} \
              gap_rel={:.3e} band_rel={:.3e} over_band={} max_dev_over_band={:.3} {}",
             tl.values,
             tl.kernel_ours,
@@ -498,7 +467,6 @@ mod gate {
             tl.rerun,
             tl.ik_dump,
             tl.values,
-            tl.wraps,
             tl.max_gap / tl.max_dump,
             tl.max_band / tl.max_dump,
             tl.over_band,
@@ -573,16 +541,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let split = Split::open(ref_model_path()?)?;
-        let want = Arch::Deepseek41.name();
-        if split.architecture() != Some(want) {
-            return Err(format!(
-                "the model file is {:?}, want {want} — run through `just gate-gpu-ds41-woa`, \
-                 which picks the deepseek41 profile",
-                split.architecture()
-            )
-            .into());
-        }
+        let split = open_split(Arch::Deepseek41, "gate-gpu-ds41-woa")?;
         let layers = usize::try_from(
             split
                 .arch_get_u64("block_count")

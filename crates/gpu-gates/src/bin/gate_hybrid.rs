@@ -65,6 +65,7 @@ mod gate {
     use bloomery_gpu::hybrid::{HybridConfig, levers};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Deepseek2Model, NodeInfo};
+    use bloomery_gpu_gates::nodes::{count_kinds, kind_name};
     use bloomery_gpu_gates::prompts::{GreedyRow, PromptRow, read_greedy, read_prompts};
     use bloomery_gpu_gates::{
         GateError, bits_equal, checks_failed, data_dir, open_model, q8_1_dequant, ref_model_path,
@@ -136,23 +137,11 @@ mod gate {
     const FORCED_FILE: &str = "greedy-ik-cuda-32.tsv";
 
     /// `CUgraphNodeType` values the boundary adds, and the kernel kind.
-    const KINDS: [(sys::CUgraphNodeType, &str); 4] = [
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL,
-            "kernel",
-        ),
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY,
-            "memcpy",
-        ),
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET,
-            "memset",
-        ),
-        (
-            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP,
-            "batch_mem_op",
-        ),
+    const KINDS: [sys::CUgraphNodeType; 4] = [
+        sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL,
+        sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY,
+        sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET,
+        sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP,
     ];
 
     /// Node counts by kind, in `KINDS` order, and every other kind together.
@@ -168,21 +157,14 @@ mod gate {
     }
 
     fn kinds(nodes: &[NodeInfo]) -> Kinds {
-        let mut c = [0i64; 4];
-        let mut other = 0i64;
-        for n in nodes {
-            match KINDS.iter().position(|(k, _)| *k == n.kind) {
-                Some(i) => c[i] += 1,
-                None => other += 1,
-            }
-        }
-        (c, other)
+        let (c, other) = count_kinds(nodes, KINDS);
+        (c.map(|n| n as i64), other as i64)
     }
 
     fn fmt_kinds(c: &[i64; 4], other: i64) -> String {
         let mut s = String::new();
-        for ((_, name), n) in KINDS.iter().zip(c) {
-            s.push_str(&format!("{name}={n} "));
+        for (&kind, n) in KINDS.iter().zip(c) {
+            s.push_str(&format!("{}={n} ", kind_name(kind)));
         }
         s.push_str(&format!("other={other}"));
         s

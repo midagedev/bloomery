@@ -71,8 +71,10 @@ mod gate {
     use bloomery_gpu_deepseek41::hc::{
         HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs, HcPreScratch,
     };
+    use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1_UNFUSED, D2, D2_UNFUSED, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::rounding::{U64, butterfly, gamma};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
         max_rel_err, max_ulps, ref_dir_named, ref_model_path, ref_tensor_of_in, tensor_bytes_as,
@@ -88,17 +90,6 @@ mod gate {
     const STEP_SETS: [&str; 5] = [STEP4, D1, D1_UNFUSED, D2, D2_UNFUSED];
     /// Bytes of one q3_K super-block.
     const Q3K_SB: usize = 110;
-    /// Unit roundoff of f32.
-    const U: f64 = 1.0 / (1u32 << 24) as f64;
-    /// Unit roundoff of f64.
-    const U64: f64 = f64::EPSILON / 2.0;
-
-    /// `gamma_n = n u / (1 - n u)`: the relative bound on a result that went
-    /// through `n` f32 roundings in sequence.
-    fn gamma(n: usize) -> f64 {
-        let nu = n as f64 * U;
-        nu / (1.0 - nu)
-    }
 
     /// The file's hyper-connection hyperparameters.
     struct Hp {
@@ -142,15 +133,6 @@ mod gate {
     }
 
     // ------------------------------------------------------------ ik's rules
-
-    /// ik's RMS_NORM scale of one row (`ggml_compute_forward_rms_norm_f32`):
-    /// the f32 squares summed in f64 in index order, the mean rounded to f32,
-    /// `1/sqrtf(mean + eps)`.
-    fn rms_scale_ik(x: &[f32], eps: f32) -> f32 {
-        let sum = x.iter().fold(0.0f64, |a, &v| a + f64::from(v * v));
-        let mean = (sum / x.len() as f64) as f32;
-        1.0 / (mean + eps).sqrt()
-    }
 
     /// ik's q8_K of `x` (`iqk_quantize_row_q8_K`, the AVX2 path the box
     /// runs): per 256 values `d = amax/127` and the codes
@@ -426,19 +408,6 @@ mod gate {
         (q, d)
     }
 
-    /// `warp::reduce_sum_f32`: lane `l` adds lane `l ^ s` for s = 16, 8, 4,
-    /// 2, 1; lane 0's value.
-    fn butterfly(v: [f32; 32]) -> f32 {
-        let mut a = v;
-        for s in [16, 8, 4, 2, 1] {
-            let b = a;
-            for (l, al) in a.iter_mut().enumerate() {
-                *al = b[l] + b[l ^ s];
-            }
-        }
-        a[0]
-    }
-
     /// One site's chain by our rule for `t` tokens of raw streams: the
     /// unscaled split-K sums `[t][24]`, the scaled mixes `[t][24]`, and the
     /// q8_1 codes and block scales it quantized the streams to.
@@ -595,7 +564,7 @@ mod gate {
         let mut pred = vec![0.0f64; t * HC_MIX];
         let mut bound = vec![0.0f64; t * HC_MIX];
         for tt in 0..t {
-            let s = f64::from(rms_scale_ik(&dump.x[tt * k..(tt + 1) * k], dump.rms_eps));
+            let s = f64::from(ik_norm::scale(&dump.x[tt * k..(tt + 1) * k], dump.rms_eps));
             let (qk, dk) = q8k_ik(&dump.xn[tt * k..(tt + 1) * k]);
             let ours: Vec<f64> = (tt * k..(tt + 1) * k)
                 .map(|j| f64::from(ch.q8[j]) * f64::from(ch.d8[j / 128]))
@@ -947,7 +916,7 @@ mod gate {
         let rms_h: Vec<f32> = streams
             .chunks_exact(k)
             .flat_map(|c| {
-                let s = rms_scale_ik(c, hp.rms_eps);
+                let s = ik_norm::scale(c, hp.rms_eps);
                 c.iter().map(move |&v| v * s)
             })
             .collect();

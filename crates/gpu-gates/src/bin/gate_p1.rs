@@ -30,8 +30,8 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_gates::{
-        KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, ref_gemv, row_bytes,
-        tensor_bytes_as,
+        Fnv1a64, KERNEL_BAND, activations, bytes_to_words, max_rel_err, open_model, ref_gemv,
+        row_bytes, tensor_bytes_as,
     };
     use cuda_core::DeviceBuffer;
     use gguf::quant::GgmlType;
@@ -172,7 +172,7 @@ fn run() -> Result<(), GateError> {
             // i.e. the q8_1 activation-quantization noise of this design.
             let y_exact = ref_gemv(ty, &bytes[..rb * rows], k, rows, &x, m)?;
             let exact_ref_err = max_rel_err(&y1, &y_exact)?;
-            let hash = fnv1a64_f32(&y1);
+            let hash = Fnv1a64::default().f32s(&y1).value();
             println!(
                 "shape {name:<16} T={ty:?} K={k} rows={rows} m={m} max_rel_err={rel:.3e} exact_ref_err={exact_ref_err:.3e} bit_identical_rerun={bit_same} fnv1a64={hash:#018x}"
             );
@@ -229,17 +229,4 @@ fn q8_1_dequant(x: &[f32], k: usize, m: usize) -> Vec<f32> {
         }
     }
     out
-}
-
-/// FNV-1a 64 over the LE bytes of the f32 bits of `y`.
-#[cfg(feature = "gpu")]
-fn fnv1a64_f32(y: &[f32]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for v in y {
-        for b in v.to_bits().to_le_bytes() {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    h
 }

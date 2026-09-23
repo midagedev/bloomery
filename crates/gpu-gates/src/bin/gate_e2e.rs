@@ -88,6 +88,8 @@ use bloomery_gpu::model::{Engine, StepMode, StepProbe};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::engine::AnyEngine;
 #[cfg(feature = "gpu")]
+use bloomery_gpu_gates::nodes::count_kinds;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::prompts::{
     ExactRow, GreedyClass, GreedyRow, compare_forced, compare_forced_exact, compare_greedy,
     exact_covers, read_exact, read_greedy, sigma_forced,
@@ -883,18 +885,18 @@ fn run() -> Result<(), GateError> {
     // The chain is kernels and copies: a host node would put a CPU callback
     // in every replay. The kinds as the driver lists them, the host count
     // pinned at zero.
-    let kinds = model.step_graph_nodes()?;
-    let of = |k| kinds.iter().filter(|n| n.kind == k).count();
-    let host = of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST);
-    let (kernel, memcpy, memset) = (
-        of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL),
-        of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY),
-        of(sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET),
+    let ([kernel, memcpy, memset, host], other) = count_kinds(
+        &model.step_graph_nodes()?,
+        [
+            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL,
+            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY,
+            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMSET,
+            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST,
+        ],
     );
     println!(
-        "graph kinds kernel={kernel} memcpy={memcpy} memset={memset} host={host} other={} \
+        "graph kinds kernel={kernel} memcpy={memcpy} memset={memset} host={host} other={other} \
          host_want=0 {}",
-        kinds.len() - kernel - memcpy - memset - host,
         if host == 0 { "ok" } else { "FAIL" }
     );
     if host != 0 {
