@@ -98,7 +98,7 @@ const ENGINE_DISPATCHES: usize = 2;
 
 const USAGE: &str = "usage: bench_v41_host --check
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
-  an arm is <engine|per-matrix>:<n_host>; the default is engine:6,engine:5,engine:3,per-matrix:6
+  an arm is <engine|engine-sep|per-matrix>:<n_host>[x<rows>]; the default is engine:6,engine:5,engine:3,per-matrix:6
   the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the deepseek41 profile)";
 
 // The page bookkeeping's libc calls; `std` already links libc on this target.
@@ -474,6 +474,45 @@ fn engine_layer(
         down,
         par,
     })
+}
+
+/// Probe shape for a k-token step: `xs.len()` rows, row `i` owning the
+/// `slots.len() / xs.len()` slots `slots[i * n..(i + 1) * n]` and reading
+/// `xs[i]`. Every row's gate and up in one group, every row's down in one
+/// group — the dispatches a tier that takes k tokens per call would issue.
+fn engine_rows_layer(
+    l: &Layer<'_>,
+    slots: &[usize],
+    xs: &[&Tensor2],
+    tally: &mut Tally,
+) -> Result<(), ModelError> {
+    let per_row = slots.len() / xs.len();
+    let xin: Vec<&Tensor2> = (0..slots.len())
+        .flat_map(|j| [xs[j / per_row]; 2])
+        .collect();
+    let ws: Vec<Weight<'_>> = slots
+        .iter()
+        .flat_map(|&s| [l.weight(s, GATE), l.weight(s, UP)])
+        .collect();
+    let mut gu = blocks(&ws);
+    let t0 = Instant::now();
+    matmul_q_group_into("host_gate_up", &ws, &xin, &mut gu)?;
+    tally.add("gate+up", bytes_of(&ws), t0);
+    let dw: Vec<Weight<'_>> = slots.iter().map(|&s| l.weight(s, DOWN)).collect();
+    let (pairs, _) = gu.as_chunks::<2>();
+    let srcs: Vec<GroupInput<'_>> = pairs
+        .iter()
+        .map(|[g, u]| GroupInput::Swiglu(g, u))
+        .collect();
+    let mut down = blocks(&dw);
+    let mut par: Vec<Tensor2> = pairs
+        .iter()
+        .map(|[g, _]| Tensor2::scratch(g.ne0, 1))
+        .collect();
+    let t0 = Instant::now();
+    matmul_q_group_swiglu_into("host_down", &dw, &srcs, &mut down, &mut par)?;
+    tally.add("down", bytes_of(&dw), t0);
+    Ok(())
 }
 
 /// One dispatch per expert matrix: gate and up through `ops::matmul_q`, down
@@ -1024,47 +1063,85 @@ fn check(
 struct Arm {
     per_matrix: bool,
     n_host: usize,
+    /// Tokens per step (probe): each row reads its own activation column
+    /// and `n_host` experts no other row of the layer reads.
+    rows: usize,
+    /// With `rows > 1`: one engine-shape call per row instead of one group
+    /// over every row.
+    separate: bool,
 }
 
 impl Arm {
     fn parse(s: &str) -> Result<Arm, String> {
-        let (shape, n) = s
-            .split_once(':')
-            .ok_or_else(|| format!("arm {s:?}: want <engine|per-matrix>:<n_host>"))?;
-        let per_matrix = match shape {
-            "engine" => false,
-            "per-matrix" => true,
+        let (shape, n) = s.split_once(':').ok_or_else(|| {
+            format!("arm {s:?}: want <engine|engine-sep|per-matrix>:<n_host>[x<rows>]")
+        })?;
+        let (per_matrix, separate) = match shape {
+            "engine" => (false, false),
+            "engine-sep" => (false, true),
+            "per-matrix" => (true, false),
             other => return Err(format!("arm {s:?}: unknown shape {other:?}")),
+        };
+        let (n, rows) = match n.split_once('x') {
+            Some((n, r)) => (
+                n,
+                r.parse::<usize>()
+                    .map_err(|_| format!("arm {s:?}: rows {r:?} is not a count"))?,
+            ),
+            None => (n, 1),
         };
         let n_host: usize = n
             .parse()
             .map_err(|_| format!("arm {s:?}: n_host {n:?} is not a count"))?;
-        if n_host == 0 || n_host > WORKING_SET {
-            return Err(format!("arm {s:?}: n_host must be 1..={WORKING_SET}"));
+        if n_host == 0 || rows == 0 || n_host * rows > WORKING_SET {
+            return Err(format!(
+                "arm {s:?}: n_host and rows must be positive, n_host x rows at most {WORKING_SET}"
+            ));
         }
-        Ok(Arm { per_matrix, n_host })
+        if per_matrix && rows > 1 {
+            return Err(format!("arm {s:?}: the per-matrix shape runs one row"));
+        }
+        Ok(Arm {
+            per_matrix,
+            n_host,
+            rows,
+            separate,
+        })
     }
 
     fn label(self) -> String {
-        let shape = if self.per_matrix {
-            "per-matrix"
-        } else {
-            "engine"
+        let shape = match (self.per_matrix, self.separate) {
+            (true, _) => "per-matrix",
+            (false, true) => "engine-sep",
+            (false, false) => "engine",
         };
-        format!("{shape}:{}", self.n_host)
+        if self.rows == 1 {
+            format!("{shape}:{}", self.n_host)
+        } else {
+            format!("{shape}:{}x{}", self.n_host, self.rows)
+        }
     }
 
+    /// One layer: `slots` holds `rows` runs of `n_host`, row `i` reading
+    /// `xs[i]`.
     fn run_layer(
         self,
         l: &Layer<'_>,
         slots: &[usize],
-        x: &Tensor2,
+        xs: &[&Tensor2],
         tally: &mut Tally,
-    ) -> Result<LayerOut, ModelError> {
+    ) -> Result<(), ModelError> {
         if self.per_matrix {
-            per_matrix_layer(l, slots, x, tally)
+            per_matrix_layer(l, slots, xs[0], tally).map(drop)
+        } else if self.rows == 1 {
+            engine_layer(l, slots, xs[0], tally).map(drop)
+        } else if self.separate {
+            for (row, x) in slots.chunks_exact(self.n_host).zip(xs) {
+                engine_layer(l, row, x, tally)?;
+            }
+            Ok(())
         } else {
-            engine_layer(l, slots, x, tally)
+            engine_rows_layer(l, slots, xs, tally)
         }
     }
 
@@ -1072,7 +1149,7 @@ impl Arm {
     fn bytes_per_token(self, layers: &[Layer<'_>]) -> u64 {
         layers
             .iter()
-            .map(|l| self.n_host as u64 * l.expert_bytes())
+            .map(|l| (self.n_host * self.rows) as u64 * l.expert_bytes())
             .sum()
     }
 
@@ -1080,6 +1157,8 @@ impl Arm {
     fn dispatches_per_token(self, layers: &[Layer<'_>]) -> usize {
         if self.per_matrix {
             3 * self.n_host * layers.len()
+        } else if self.separate {
+            ENGINE_DISPATCHES * self.rows * layers.len()
         } else {
             ENGINE_DISPATCHES * layers.len()
         }
@@ -1177,7 +1256,8 @@ impl Bench<'_> {
         tally: &mut Tally,
     ) -> Result<(), ModelError> {
         for (l, layer) in self.layers.iter().enumerate() {
-            arm.run_layer(layer, &ids[l], &self.xs[(t + l) % N_X], tally)?;
+            let xs: Vec<&Tensor2> = (0..arm.rows).map(|i| &self.xs[(t + l + i) % N_X]).collect();
+            arm.run_layer(layer, &ids[l], &xs, tally)?;
         }
         Ok(())
     }
@@ -1196,7 +1276,7 @@ impl Bench<'_> {
         let mut scratch = Tally::default();
         let mut warm_ms = Vec::with_capacity(warmup);
         for t in 0..warmup {
-            let ids = self.draw(arm.n_host, round, t);
+            let ids = self.draw(arm.n_host * arm.rows, round, t);
             let t0 = Instant::now();
             self.token(arm, &ids, t, &mut scratch)?;
             warm_ms.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -1211,7 +1291,7 @@ impl Bench<'_> {
         let (min0, maj0) = faults()?;
         let d0 = threads::pool().stats().dispatches;
         for t in warmup..warmup + tokens {
-            let ids = self.draw(arm.n_host, round, t);
+            let ids = self.draw(arm.n_host * arm.rows, round, t);
             let t0 = Instant::now();
             self.token(arm, &ids, t, &mut tally)?;
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
