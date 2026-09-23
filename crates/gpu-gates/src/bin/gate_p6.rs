@@ -611,12 +611,12 @@ fn digest(probs: &[f32], ids: &[u32], weights: &[f32]) -> u64 {
 /// is the entry's `fma.` count: a body carrying one multiply-add per column
 /// and nothing else is the starved shape, and the single-column body
 /// (`q8f32::f32_lane_partial_1col`, the decode shape) adds `LANE_UNROLL`
-/// more, one per chunk whose load it hoists. `q8_0_gemv` has the same
-/// general body and is pinned beside it on a floor of its own: its
-/// single-column body (`q8f32::q8_0_lane_partial_1col`) walks whole code
-/// words, four multiply-adds per word, so a body that hoists fewer steps
-/// than it is written for shows fewer. `q8_0_gemv_heads` runs that
-/// single-column body alone and is pinned on the same words.
+/// more, one per chunk whose load it hoists. `q8_0_gemv` is pinned beside
+/// it on a floor of its own: it runs only the single-column body
+/// (`q8f32::q8_0_lane_partial_1col`), which walks whole code words, four
+/// multiply-adds per word, so a body that hoists fewer steps than it is
+/// written for shows fewer. `q8_0_gemv_heads` runs that same body and is
+/// pinned on the same words.
 #[cfg(feature = "gpu")]
 fn router_shape() -> Result<bool, GateError> {
     use bloomery_gpu::q8f32::{LANE_UNROLL, Q8_STEP_UNROLL};
@@ -638,9 +638,9 @@ fn router_shape() -> Result<bool, GateError> {
     /// and the one-word walk of unaligned activations.
     const Q8_OTHER_WORDS: usize = 6;
     // The Q8_0 floor counts every word that body spells out, four
-    // multiply-adds each, on top of the general body's columns.
-    // PIN(2026-09-23): 8 + 4·(4 + 6) = 48 with the one-word short-row path in the body; the same source without its partial word printed fma=44 and failed.
-    let q8_fma_floor = GEMV_COLS + 4 * (Q8_STEP_UNROLL + Q8_OTHER_WORDS);
+    // multiply-adds each; `q8_0_gemv` carries no general body.
+    // PIN(2026-09-24): 48 → 40 — the chunk-lane m > 1 columns left q8_0_gemv (dsm)
+    let q8_fma_floor = 4 * (Q8_STEP_UNROLL + Q8_OTHER_WORDS);
     // The per-head wrapper calls the single-column body and nothing else —
     // m = 1 is its only shape — so its floor is that body's words alone,
     // without the general body's columns.
@@ -656,7 +656,7 @@ fn router_shape() -> Result<bool, GateError> {
         (
             "q8_0_gemv",
             q8_fma_floor,
-            format!("cols={GEMV_COLS} + 4*(Q8_STEP_UNROLL={Q8_STEP_UNROLL} + {Q8_OTHER_WORDS})"),
+            format!("4*(Q8_STEP_UNROLL={Q8_STEP_UNROLL} + {Q8_OTHER_WORDS})"),
         ),
         (
             "q8_0_gemv_heads",

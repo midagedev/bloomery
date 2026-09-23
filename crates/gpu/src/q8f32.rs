@@ -20,11 +20,10 @@
 //! accumulates its share of the row sequentially, one f32 multiply-add per
 //! term, and the 32 lane sums are then combined by the fixed five-step
 //! butterfly (xor 16, 8, 4, 2, 1). A lane's share:
-//! - F32, and `q8_0_gemv`'s own `m > 1` body (the launcher no longer sends
-//!   it one): the row's 32-value chunks — value index `32·it + L` for lane
-//!   L, chunks in increasing `it`, columns in increasing order;
-//! - Q8_0 at `m = 1`, the decode shape, and every column of the m-column
-//!   entries: whole code words — words `L, L + 32, L + 64, …` of the row in
+//! - F32: the row's 32-value chunks — value index `32·it + L` for lane L,
+//!   chunks in increasing `it`, columns in increasing order;
+//! - Q8_0 (`q8_0_gemv`, the single-column decode shape, and every column of
+//!   the m-column entries): whole code words — words `L, L + 32, L + 64, …` of the row in
 //!   increasing order, each word's four values in byte order.
 //!
 //! The combination tree is a function of (k, m) only — never of the data,
@@ -32,9 +31,9 @@
 //! gemvs, `y[r·m + c]`; `q8_0_gemv_mcol` can write token-major instead
 //! ([`GemvOut`]).
 //!
-//! The launcher sends a Q8_0 gemv of `m > 1` columns to `q8_0_gemv_mcol`,
-//! not to `q8_0_gemv`'s chunk body: every lane owns the whole code words it
-//! owns at `m = 1` and keeps one sum per column, so column c of an `m`-column
+//! `q8_0_gemv` takes one column only; the launcher sends a Q8_0 gemv of
+//! `m > 1` columns to `q8_0_gemv_mcol`, where every lane owns the whole code
+//! words it owns at `m = 1` and keeps one sum per column, so column c of an `m`-column
 //! launch is bit for bit the `m = 1` launch of that column, and each weight
 //! word is read once for all `m` columns. `q8_0_gemv_heads_mcol` is the same
 //! body over per-head activation windows.
@@ -214,95 +213,6 @@ pub unsafe fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, la
     f
 }
 
-/// Lane `lane`'s partial sums for one Q8_0 row: the weight at value `kk` of
-/// `row` is `q·d` with `q` the signed code in word `qs[row·k/4 + kk/4]`,
-/// byte `kk%4`, and `d` the block scale `d[row·k/32 + kk/32]` widened from
-/// its f16 bits — the same bits the reference's dequantizer produces. `x`
-/// is read from base `x0` (column c's values at `x0 + c*k .. +k`), so a
-/// caller can dot against a slice of a wider buffer without subslicing it.
-/// Accumulation order: for `m_cols > 1` as `f32_lane_partials`; for
-/// `m_cols == 1` as [`q8_0_lane_partial_1col`].
-///
-/// Caller contract: `qs.len() >= (row + 1) * k/4`, `d.len() >= (row + 1) *
-/// k/32`, `x.len() >= x0 + m_cols * k`, `k` a positive multiple of 32,
-/// `m_cols` in 1..=8, `lane < 32`.
-#[inline(always)]
-pub(crate) fn q8_0_lane_partials(
-    qs: &[u32],
-    d: &[u16],
-    x: &[f32],
-    k: u32,
-    row: usize,
-    x0: usize,
-    m_cols: u32,
-    lane: usize,
-) -> [f32; 8] {
-    // One column is the decode shape and gets a body of its own: whole code
-    // words per lane, loads hoisted. See `q8_0_lane_partial_1col`.
-    if m_cols == 1 {
-        // SAFETY: with m_cols 1 this function's caller contract is the
-        // callee's safety contract.
-        let f0 = unsafe { q8_0_lane_partial_1col(qs, d, x, k, row, x0, lane) };
-        return [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-    }
-    let k = k as usize;
-    let qs_row = row * (k >> 2);
-    let d_row = row * (k >> 5);
-    let mut f0 = 0.0f32;
-    let mut f1 = 0.0f32;
-    let mut f2 = 0.0f32;
-    let mut f3 = 0.0f32;
-    let mut f4 = 0.0f32;
-    let mut f5 = 0.0f32;
-    let mut f6 = 0.0f32;
-    let mut f7 = 0.0f32;
-    let mut it = 0usize;
-    while it < k >> 5 {
-        let kk = it * 32 + lane;
-        // SAFETY: kk < k, so word kk/4 < k/4 <= qs.len() - qs_row by the
-        // caller contract.
-        let q = unsafe { (*qs.get_unchecked(qs_row + (kk >> 2)) >> (8 * (kk & 3))) as u8 as i8 };
-        // SAFETY: it = kk/32 < k/32 <= d.len() - d_row by the caller
-        // contract.
-        let wv = q as f32 * half_bits_to_f32(unsafe { *d.get_unchecked(d_row + it) });
-        // Column 0 (always active).
-        // SAFETY: kk < k, and x0 + kk < x0 + k <= x.len() by the caller
-        // contract (m_cols >= 1).
-        f0 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + kk) }, f0);
-        // Columns 1..7, one launch-uniform guard per column.
-        if m_cols > 1 {
-            // SAFETY: m_cols > 1 => x.len() >= x0 + 2*k > x0 + k + kk.
-            f1 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + k + kk) }, f1);
-        }
-        if m_cols > 2 {
-            // SAFETY: m_cols > 2 => x.len() >= x0 + 3*k > x0 + 2*k + kk.
-            f2 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 2 * k + kk) }, f2);
-        }
-        if m_cols > 3 {
-            // SAFETY: m_cols > 3 => x.len() >= x0 + 4*k > x0 + 3*k + kk.
-            f3 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 3 * k + kk) }, f3);
-        }
-        if m_cols > 4 {
-            // SAFETY: m_cols > 4 => x.len() >= x0 + 5*k > x0 + 4*k + kk.
-            f4 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 4 * k + kk) }, f4);
-        }
-        if m_cols > 5 {
-            // SAFETY: m_cols > 5 => x.len() >= x0 + 6*k > x0 + 5*k + kk.
-            f5 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 5 * k + kk) }, f5);
-        }
-        if m_cols > 6 {
-            // SAFETY: m_cols > 6 => x.len() >= x0 + 7*k > x0 + 6*k + kk.
-            f6 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 6 * k + kk) }, f6);
-        }
-        if m_cols > 7 {
-            // SAFETY: m_cols > 7 => x.len() >= x0 + 8*k > x0 + 7*k + kk.
-            f7 = f32::mul_add(wv, unsafe { *x.get_unchecked(x0 + 7 * k + kk) }, f7);
-        }
-        it += 1;
-    }
-    [f0, f1, f2, f3, f4, f5, f6, f7]
-}
-
 /// Values one step of the single-column Q8_0 body covers: each of the 32
 /// lanes takes one whole code word — four consecutive values of one block —
 /// so a step is 32 consecutive words, 128 values, four blocks, and the warp's
@@ -365,8 +275,12 @@ fn q8_0_word_dot(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
 }
 
 /// Lane `lane`'s partial sum for one Q8_0 row against a single activation
-/// column. The weight decode is [`q8_0_lane_partials`]'s; the lane's share of
-/// the row is not: lane L owns whole code words — words `L, L + 32, L + 64,
+/// column. The weight at value `kk` of `row` is `q·d`, with `q` the signed
+/// code in word `qs[row·k/4 + kk/4]`, byte `kk%4`, and `d` the block scale
+/// `d[row·k/32 + kk/32]` widened from its f16 bits — the same bits the
+/// reference's dequantizer produces. `x` is read from base `x0`, so a caller
+/// can dot against a slice of a wider buffer without subslicing it. Lane L
+/// owns whole code words — words `L, L + 32, L + 64,
 /// …` below `k/4`, word `w` holding values `4w .. 4w + 3` — and accumulates
 /// them in increasing order, each word's four values in byte order, one f32
 /// multiply-add per term. [`Q8_STEP_UNROLL`] steps' loads are hoisted above
@@ -381,8 +295,8 @@ fn q8_0_word_dot(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
 ///
 /// # Safety
 ///
-/// The caller contract of [`q8_0_lane_partials`] with `m_cols` 1: `qs.len()
-/// >= (row + 1) * k/4`, `d.len() >= (row + 1) * k/32`, `x.len() >= x0 + k`,
+/// `qs.len() >= (row + 1) * k/4`, `d.len() >= (row + 1) * k/32`, `x.len() >=
+/// x0 + k`,
 /// `k` a positive multiple of 32, `lane < 32`. The body reads `qs`, `d` and
 /// `x` unchecked within those bounds.
 #[inline(always)]
@@ -862,45 +776,21 @@ mod q8f32_kernels {
         }
         let lane = warp::lane_id() as usize;
         let sums = gemv_lane_sums(f32_lane_partials(w, x, k, row, m_cols, lane), m_cols);
-        let m = m_cols as usize;
         if lane == 0 {
-            // SAFETY: only lane 0 of the warp owning `row` writes, exactly
-            // the m live slots of y[row*m .. row*m + m]; y.len() >=
-            // n_rows * m_cols by the launch contract and the guards bound
-            // every store by m.
-            unsafe {
-                let b = row * m;
-                *y.get_unchecked_mut(b) = sums[0];
-                if m > 1 {
-                    *y.get_unchecked_mut(b + 1) = sums[1];
-                }
-                if m > 2 {
-                    *y.get_unchecked_mut(b + 2) = sums[2];
-                }
-                if m > 3 {
-                    *y.get_unchecked_mut(b + 3) = sums[3];
-                }
-                if m > 4 {
-                    *y.get_unchecked_mut(b + 4) = sums[4];
-                }
-                if m > 5 {
-                    *y.get_unchecked_mut(b + 5) = sums[5];
-                }
-                if m > 6 {
-                    *y.get_unchecked_mut(b + 6) = sums[6];
-                }
-                if m > 7 {
-                    *y.get_unchecked_mut(b + 7) = sums[7];
-                }
-            }
+            // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
+            // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
+            // launch contract's bound; only lane 0 of the row's warp writes
+            // them.
+            unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
         }
     }
 
-    /// Q8_0 gemv against f32 activations, M <= 8: same skeleton and output
-    /// layout as `f32_gemv`, weights decoded per the module doc's device
-    /// layout. `k` a multiple of 32 (host-validated; the contract binds the
-    /// word and scale buffers through `k`: 4·qs.len() and 32·d.len() cover
-    /// `n_rows * k` values exactly when 32 | k).
+    /// Q8_0 gemv against one f32 activation column, `y[r] = Σ_k' w[r, k'] ·
+    /// x[k']`, the decode shape: `f32_gemv`'s skeleton, weights decoded per
+    /// the module doc's device layout, each lane's share of the row walked by
+    /// [`q8_0_lane_partial_1col`]. `k` a multiple of 32 (host-validated; the
+    /// contract binds the word and scale buffers through `k`: 4·qs.len() and
+    /// 32·d.len() cover `n_rows * k` values exactly when 32 | k).
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -909,8 +799,8 @@ mod q8f32_kernels {
         requires = (
             4 * qs.len() >= n_rows * k,
             32 * d.len() >= n_rows * k,
-            x.len() >= m_cols * k,
-            y.len() >= n_rows * m_cols
+            x.len() >= k,
+            y.len() >= n_rows
         )
     )]
     pub fn q8_0_gemv(
@@ -919,7 +809,6 @@ mod q8f32_kernels {
         x: &[f32],
         n_rows: u32,
         k: u32,
-        m_cols: u32,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -928,41 +817,15 @@ mod q8f32_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        let sums = gemv_lane_sums(
-            q8_0_lane_partials(qs, d, x, k, row, 0, m_cols, lane),
-            m_cols,
-        );
-        let m = m_cols as usize;
+        // SAFETY: row < n_rows puts the row's words and scales inside qs and
+        // d (the contract's 4·qs.len() and 32·d.len() bounds), and x.len() >= k
+        // is the one column the body reads from x0 = 0.
+        let f = unsafe { q8_0_lane_partial_1col(qs, d, x, k, row, 0, lane) };
+        let s = warp::reduce_sum_f32(f);
         if lane == 0 {
-            // SAFETY: row < n_rows, so the m = m_cols slots written below lie
-            // in row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(),
-            // the launch contract's bound; only lane 0 of the row's warp
-            // writes them.
-            unsafe {
-                let b = row * m;
-                *y.get_unchecked_mut(b) = sums[0];
-                if m > 1 {
-                    *y.get_unchecked_mut(b + 1) = sums[1];
-                }
-                if m > 2 {
-                    *y.get_unchecked_mut(b + 2) = sums[2];
-                }
-                if m > 3 {
-                    *y.get_unchecked_mut(b + 3) = sums[3];
-                }
-                if m > 4 {
-                    *y.get_unchecked_mut(b + 4) = sums[4];
-                }
-                if m > 5 {
-                    *y.get_unchecked_mut(b + 5) = sums[5];
-                }
-                if m > 6 {
-                    *y.get_unchecked_mut(b + 6) = sums[6];
-                }
-                if m > 7 {
-                    *y.get_unchecked_mut(b + 7) = sums[7];
-                }
-            }
+            // SAFETY: row < n_rows <= y.len() by the launch contract, and only
+            // lane 0 of the row's warp writes slot row.
+            unsafe { *y.get_unchecked_mut(row) = s };
         }
     }
 
@@ -1189,12 +1052,12 @@ impl Q8F32Kernels {
                 },
             );
         }
-        let (n_rows, k, m) = q8_0_launch_dims("enqueue_q8_0_gemv", qs, d, x.len(), m, y.len())?;
+        let (n_rows, k, _) = q8_0_launch_dims("enqueue_q8_0_gemv", qs, d, x.len(), m, y.len())?;
         let prep =
             self.module
                 .prepare_q8_0_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
         self.module
-            .q8_0_gemv(stream, &prep, qs.buf(), d.buf(), x, n_rows, k, m, y)?;
+            .q8_0_gemv(stream, &prep, qs.buf(), d.buf(), x, n_rows, k, y)?;
         Ok(())
     }
 

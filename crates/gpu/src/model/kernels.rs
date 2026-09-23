@@ -78,7 +78,10 @@ mod step_kernels {
     /// rows_per_head]`. `n_rows` must be `n_heads * rows_per_head`; every
     /// store is disjoint because each (head, slot) pair belongs to exactly
     /// one row.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
