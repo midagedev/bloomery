@@ -25,8 +25,9 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
   and `llm.service` is inactive and disabled — so a compute process on either
   card that is not one of our rounds is a surprise to investigate, not a tenant
   to yield to. **Timed numbers are taken on the A6000** (user, 2026-09-22 —
-  the 3090 fell off the bus twice that day under load, Xid 79 at 01:51 and
-  21:38 UTC; the timing runners `tools/ref/depth-gpu.sh`, `nsys-gpu.sh`,
+  the 3090 fell off the bus twice that day under load, Xid 79 at ~~01:51 and
+  21:38 UTC~~ 01:51 and 06:38 KST (16:51 and 21:38 UTC on 09-21; the kernel
+  journal, read 2026-09-23); the timing runners `tools/ref/depth-gpu.sh`, `nsys-gpu.sh`,
   `ncu-gpu.sh` pin it through `TIMING_GPU`, override with
   `BLOOMERY_TIMING_GPU`, and every witness block opens with the card name and
   power limit). The ik baselines are re-measured there; **3090 numbers from
