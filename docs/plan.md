@@ -427,11 +427,13 @@ flowchart LR
 - `common/oracle.rs`에서 `common/model.rs`를 떼어 낸다 — 남은 dead-code 13줄 대부분의 출처다(S). `oracle.rs`의 매니페스트 위치 인덱스 파싱에 헤더 핀이 없다(S, b4infra의 리더를 먼저 본다). 테스트 전용 GGUF 작성기가 세 벌이다(`gguf/tests/inventory.rs:25`, `lib.rs` `split_tests`, `model/tests/ops.rs` `one_tensor_file`; R14, S).
 - `activation_format(F16)`은 `Ok(None)`인데 ggml F16의 `vec_dot_type`은 F16이라 거부가 맞다(XS).
 - `check-arch.sh:66`(②)과 `:102`(④)가 `crates/model/src/bin`을 공유 파일로 본다(S). 신선도 규칙이 둘이다 — `timing-card.sh:75` `assert_fresh_binary`는 트리 전체를 `-newer`로, `host-rate.sh`는 dep-info를 본다(하나로, S).
+- 하니스(`crates/gpu-gates/src/lib.rs`, b4infra 항목 6): `ref_tensor`·`ref_tensor_logical`(`:774`·`:793`)이 부를 때마다 매니페스트를 다시 파싱하고 `gate_p4`가 층 루프 안에서 그것을 부른다(S). `topk_ids_logical`도 같다 — 호출자가 `RefManifest`를 들고 `_in`을 부르게(XS). 조회가 선형 스캔이다 — `(kind, name, occ)` 색인 한 번(S, V4.1 40층 op 게이트와 스텝 세트에서 커진다). `widened_f16_bits`는 파일 전체를 읽는다(XS). `:1167`의 `0..64`는 V2-Lite expert 수라 V4.1(384)에서 못 쓴다 — 상한을 인자로(XS). `:705` 오류 문구에 경로 구분자가 없다(XS). `safe_name` 규칙의 주인이 언어별로 셋이다(`dump_ref.cpp`, `check-int-twins.py`, `dump_stem`; 공유 픽스처 하나로, S). `check-arch` 허용 목록이 줄 철자에 묶여 필드 타입만 바꿔도 빨강이 된다(S). `crates/model/tests/common/oracle.rs:65`가 `# tokens`는 읽고 `# prefill`은 모른다(XS).
 
 ② **도구 라운드**(셸만 만지므로 ①과 병렬)
 - 셸 사본: `box.sh:17`에 데이터 경로 기본값의 마지막 셸 사본이 있다(맥에서 돌아 트리를 소스할 수 없으니 `check-recipes.sh`가 두 값을 대조한다, S). LCG `prompt()` awk가 러너 넷에 복사돼 있다(S). `IK_BEST_FLAGS`가 세 곳, 토큰 수열이 네 곳에 있다(S). `bloomery-decode` 경로를 손으로 조립하는 곳이 셋이다(`depth-decode.sh`에는 `bin_of()`가 없다, XS). `witness()` 정의 14곳을 공용 `lease.sh`로(S–M). `engram-corpus.sh:27-30`이 `ref-paths.sh`를 소싱하지 않는다(XS).
 - `box-gc.sh:30`의 `PREFIX="$ROOT/target"`은 `$BLOOMERY_DATA/bin`과 `router/bin`의 ref 하네스 고아를 보지 못한다(S).
 - 상설 도구로 올릴 것 셋: base/after 판정 비교 스크립트(시간·스레드 id·pid를 가리고 정렬해 비교 — 세션 스크래치 `m3c/run-set.sh`·`compare.sh`, S), b11의 `sass_inflight.py`(지표는 "첫 대기 전에 발행된 LDG 수"; ptx-scan의 짝, S), 두 트리를 번갈아 재는 GPU A/B(리드의 b11b ABAB `lead-b11b/ab.sh` — `time-gpu-*`를 두 트리에서 팔마다 임대를 잡고 번갈아 돈다, S).
+- 덤퍼(b4dump·ikfix 항목 6): 연속 텐서의 logical 사본이 flat 파일과 같은 바이트다 — 세트 바이트의 35–40 %(`dump_ref.cpp:289`, `!contig`로만, S). 스텝 모드가 전체 캐시를 세 벌 쓴다(쓰기 대상 VIEW, SET_ROWS 출력, 상태 입력 — D1의 30 %, S–M). f16·bf16을 f32로 넓혀 쓴다(D1에서 569 MB → 285 MB 가능, 형식을 아는 리더가 필요, S–M). 융합·비융합 두 팔이 적재와 프리필을 두 번 한다(M). `--tokens`가 `atoi`라 검증이 없다(`:485-486`, XS). `ref-build-common.sh:33,39`의 링크가 RUNPATH라 `LD_LIBRARY_PATH`가 다른 ik를 가리키면 조용히 그쪽을 싣는다 — `-Wl,--disable-new-dtags` 한 줄(XS; 덤퍼 쪽은 `dump.sh`의 `[foreign-lib]`가 막는다). 박스 `user`의 ccache `base_dir`이 비어 ik 워크트리마다 콜드 빌드다(적중 1.41 %, 머신 설정이라 사용자 판단, XS).
 
 ③ **GPU 게이트 보강 라운드**(한 라운드; 증명은 ptx-scan 표 동일과 게이트 추가)
 - `gate_p6`에 `q8_0_gemv_heads` 행을 둔다(바닥 36, XS). `gate_p3`에 m = 1, K = 480 모양을 넣는다(쌍·단일·부분 워드를 한 행에서, XS). `bench_v41.rs`의 check 줄을 사본마다 전 행 FNV digest로 바꾼다(커널을 재편하는 라운드의 비트 동일 증거가 20사이트 전 행을 덮는다, S).
@@ -469,10 +471,12 @@ flowchart LR
 - `just fmt`가 맥의 Homebrew rustfmt(1.9.0)를 쓸 수 있다 — 고정 nightly는 1.10.0이다(판정은 박스 fmt-check가 하므로 맥 편의의 문제, 확인 필요, XS). `engram-corpus.sh:48-52`의 정렬이 박스 로케일을 따른다(`LC_ALL=C`로 고정하면 코퍼스 파일이 바뀌어 거기 기댄 수치를 재핀해야 한다, XS).
 
 ⑩ **#2455 결함 클래스의 구조적 봉쇄**: 제자리 연산 별칭 검사기(`tools/`, S) — 제자리 op가 덮은 버퍼를 나중에 읽는 노드를 찾는다. 매니페스트 src 열의 occurrence가 선행이다(`dump_ref.cpp:272`).
+  ikfix가 잰 것: 지금 매니페스트로는 이 부류를 기계적으로 못 가린다(이름 기반 sweep이 네 투영 노드를 옛 세트에서도 0개 잡았다 — 투영의 src1 이름이 rope 출력의 이름과 같다). 행마다 데이터 주소(또는 버퍼 오프셋)와 `ggml_nbytes`, src 전부를 `이름#occurrence`로, `view_of`가 있으면 오프라인 검사로 잡힌다(규칙: src의 바이트가 그 src 행 뒤·소비자 행 앞에 다른 행에게 덮였고 루트가 리프가 아니다; 덤퍼 20–30줄 + 파이썬 60–80줄). `fattn`의 src[5]인 `mask_to_idx`도 src2–src5 열이 없어 안 보인다(덤퍼 약 5줄 + 리더 폭, S).
 
 ⑪ **문서(XS)**: `docs/oracle.md:52`에 한 문장 — 덤퍼의 노드 콜백은 전부 ik의 비융합 CPU 경로이고 `argmax_ref.cpp`는 `cb_eval`이 없어 융합 경로를 타므로, 두 기준이 동점 근처에서 갈릴 수 있다. rig-log `docs/v41-serving.md:174`의 "ik KV 셀에 토큰 id가 없다"는 `c10fbbcc`에서 낡았다(`llama-context.h:55`의 `tok`).
 
 ⑫ **업스트림 후보**(제출 전에 FAIL-first): Nsight Compute 2026.2.1의 `derived__local_spilling_requests_pct`는 분자와 분모가 같은 합이라, 스필이 하나라도 있으면 100 %로 읽힌다(코드 독해뿐 — 스필하는 커널을 두 판에서 잰다). ik의 `fused_idx_topk` — 확인했다(09-23 낮, 박스의 ik 트리): `common/common.h:433`의 기본값은 true(ik #2165, `79454044`)인데 주석은 "off by default; opt-in via -fidx"이고, CLI에는 켜는 `-fidx`/`--fused-indexer-topk`만 있어 끌 방법이 없다(`common/common.cpp:1938`; 도움말은 실제 값을 찍어 "enabled"로 나온다). `src/llama-cparams.h:47`은 false라 주석과 맞는다. 우리 포트가 넣은 줄이 아니라 업스트림 줄이다(origin에 있다). 제출 전에 최신 main을 다시 본다(박스 fetch는 09-10). 끄는 플래그가 없다는 것은 융합과 비융합의 동률 처리가 다를 때(b4plan) 사용자가 비교할 수단이 없다는 뜻이다. skelectric 포트의 같은 제자리 패턴(`build_deepseek4.cpp:898-906`, 재지 않음 — 알림만).
+- ik 쪽 추가(코드 독해뿐, 제출 전 FAIL-first): `ggml-alloc.c`의 할당 순회에서 "리프가 아닌 중간 텐서에 in-place 쓰기가 일어나는데 루트에 아직 처리 안 된 자식이 있다"를 env로 켜서 경고(약 20줄, 모든 모델에 걸린다 — #2507 부류의 구조적 봉쇄). `build_deepseek4.cpp:113-121` `dsv4_append_zero_row`가 0행을 실제 행 × 0(또는 0배 −inf 바이어스)으로 만든다 — 그 행에 inf·NaN이 있으면 NaN(`ggml_fill`로 약 2줄). `INDEXER_TOPK` op에 이름이 없고 `:1321`이 `:1354`의 이름(`comp_kv_getrows`)을 `csa_k`로 덮는다(XS).
 
 ## 측정 프로토콜 치트시트
 
