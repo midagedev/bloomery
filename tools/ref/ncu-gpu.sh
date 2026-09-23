@@ -23,7 +23,10 @@ set -uo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate}
-NCU=${NCU:-/usr/local/cuda/bin/ncu}
+# ncu는 판을 이름으로 고정한다. /usr/local/cuda/bin/ncu(13.0 래퍼)는 /opt/nvidia/nsight-compute에서 가장 새 판을
+# 고르므로, 13.3을 설치한 뒤로는 2026.2.1이 돌았다. 그 판의 "Local Memory Spilling Requests"는 공유 메모리 스필을
+# 따로 센다(새 "Shared Memory Spilling Requests" 행). 이전 표와 같은 뜻으로 읽으려고 2025.3.1에 둔다.
+NCU=${NCU:-/opt/nvidia/nsight-compute/2025.3.1/ncu}
 DEPTHS=${BLOOMERY_NCU_DEPTHS:-6 4096}
 # 어느 커널을 볼 것인가. 정규식이고, 비우면 전부(느리다 — 스텝당 648노드다).
 KERNELS=${BLOOMERY_NCU_KERNELS:-flash}

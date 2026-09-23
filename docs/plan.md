@@ -11,7 +11,7 @@
 - **비행 중(파동 10의 둘째 묶음, 전부 opus)**: 10:50 `b4infra`(V4.1 디바이스 크레이트 `crates/gpu-deepseek41`와 계획한 op 모듈 전부. 하니스가 V4.1 세트를 통째로 읽게 한다 — 파일 이름 규칙의 소유자 하나, 정수 사본 리더, `# arch` 검사, 오라클 표 행) ‖ 10:50 `b4dump`(덤퍼가 조용한 프리필 뒤 디코드 한 스텝을 덤프한다. `--tokens-file`, 인덱서 top-k 비융합, `--defer-experts`, D1/D2 프로필; 5토큰 세트는 바이트 동일이어야 한다) ‖ 10:50 `ikfix`(#2455의 인덱스 키 결함을 따로 둔 ik 트리 `/home/user/ik-idxkey`에서 고치고 오라클로 증명, PPL 러너) ‖ 11:07 `b2b`(V2-Lite로 하이브리드 경계 — 호스트 매핑 버퍼, 캡처된 그래프 안의 memop 카운터 합류, 라우터 직후 호스트 expert와 GPU의 shared·상주 expert 겹침; 레버 `BLOOMERY_HYBRID_NL`·`BLOOMERY_HYBRID_OVERLAP`, 새 게이트 `gate_hybrid`).
 - **다음(리드)**: b4infra 머지 → B4 둘째 파동 {`b4hc` ‖ `b4rope` ‖ `b4attn` ‖ `b4moe`}와 `b4plan2`(CPU만), 자리가 나면 `b4woa`·`b4engram`(스펙은 세션 스크래치 `wave-m3/spec-b4*.md`). ikfix 보고 → PPL 전후(리드, 각 30분 안쪽)와 rig-log, b4dump 머지 뒤 고친 ik로 5토큰 오라클을 다시 뜨고 D1/D2로 잇는다. PR #2455에 쓰는 것은 사용자 승인 뒤다. b2b 보고 → A6000에서 하이브리드 n_l과 겹침 켬/끔 A/B(리드), 새 레버를 AGENTS.md 런타임 레버에 적는다. b4infra·b4dump 머지 뒤 테스트 env 라운드와 도구 라운드(「GPU 선 트리아지」 ①·②). 조용한 틈에 engram 임대 측정과 `measure-qdot-rate`.
 - **결정(사용자 위임, 09-23 아침 — "작업속도와 성능개선에 긍정적인 방향으로")**: ① 머지 파동마다 푸시한다. ② ik의 13.3 재빌드는 ik 트리가 움직일 때 한 번에 한다(그때까지 컴파일러는 비대칭 — ik는 ptxas 13.0 AOT, 우리는 R615 JIT). ③ 3090도 서빙에 쓴다 — (b)가 서빙 목표, (a)는 대비 배치. ctx_max는 32k. 호스트 expert RAM은 서빙할 때만 잠근다. 라우터 id 추적은 승인됐다. ④ V4.1 디바이스 코드는 `crates/gpu-deepseek41`, 엔트리 접두는 `ds41_`. ⑤ #2455는 (a)안 — 따로 둔 ik 트리에서 고치고, 리드가 PPL 전후를 잰 뒤 오라클을 다시 뜬다.
-- **툴체인**: 박스는 CUDA 13.3(`~/bloomery-env.sh`)이고 ik는 13.0에 고정했다. 드라이버 JIT는 PTX `.version` 9.4까지 받지만 LLVM(= cuda-oxide·nightly 핀)은 옮기지 않는다 — 다시 볼 조건은 장부. ncu 러너는 2026.2.1을 돈다(「GPU 선 트리아지」 ⑦).
+- **툴체인**: 박스는 CUDA 13.3(`~/bloomery-env.sh`)이고 ik는 13.0에 고정했다. 드라이버 JIT는 PTX `.version` 9.4까지 받지만 LLVM(= cuda-oxide·nightly 핀)은 옮기지 않는다 — 다시 볼 조건은 장부. ncu 러너는 2025.3.1에 이름으로 고정했다(「GPU 선 트리아지」 ⑦).
 - **열린 결정 후보**: 스칼라 세그먼트 패스(와 그것만 재는 keyaxis 계기 8개)를 지울지 — 「성능이 먼저」는 엔진이 경로 하나만 싣는다고 했다.
 
 ### GPU 선
@@ -452,7 +452,7 @@ flowchart LR
 - C3·C4: `q8f32.rs`의 m > 1 일반 몸통은 1col이 대체한 굶는 모양 그대로다. 배치·추측 디코드가 m > 1을 부르게 되면 이것이 먼저다(M).
 - 다음에 `weights.rs`를 만지는 라운드: `gate_load_v41.rs`의 `buffers()`를 `DevWeight::buffer_bytes`로(R14, XS).
 
-⑦ **계기**: ncu 러너가 2026.2.1을 돈다. 그 판의 "Local Memory Spilling Requests"는 공유 메모리 스필을 세지 않는다 — 판을 2025.3.1에 고정하거나, 새 판을 표로 삼고 "Shared Memory Spilling Requests"를 `KEEP`에 더한다(XS, 첫 ncu 표 전에). `~/bloomery-env.sh`에 `CUDA_OXIDE_LIBDEVICE`를 이름으로 적는다(XS — 커널에 닿는 유일한 툴킷 입력이다).
+⑦ **계기** — 닫힘(09-23 낮): ncu 러너를 2025.3.1에 이름으로 고정했다(`tools/ref/ncu-gpu.sh` — 13.0 래퍼는 `/opt/nvidia/nsight-compute`에서 가장 새 판을 골라 2026.2.1을 돌렸다). libdevice는 `cargo oxide doctor`가 `CUDA_TOOLKIT_PATH` 아래의 13.3 파일(`/usr/local/cuda-13.3/nvvm/libdevice/libdevice.10.bc`)로 잡는다 — 이름은 이미 툴킷 루트 변수에 있으므로 따로 두지 않는다(13.0과 13.3의 libdevice는 서로 다른 파일이지만 `.oxart`는 두 툴킷에서 같았다).
 
 ⑧ **코드 모양**(트래커행, 기계 라운드 묶음)
 - R8 호스트 런처 잔여: allow로 가린 여덟(`fused.rs:612`, `moe_fused.rs:201`·`:321`, `q5.rs:1118`·`:1297`, `router.rs:365`·`:423`, `q4k_sel.rs`)과 allow 없는 넷(`q5.rs:1213`, `elem.rs:620`·`:665`·`:776`)을 `*Args`로(ptx-scan 동일이 증명, S–M). kernel-entry allow가 빠진 엔트리 여섯(`lib.rs:425`·`:612`·`:765`·`:1138`, `q5.rs:391`, `flash.rs:424`; lint −6, XS).
