@@ -105,20 +105,20 @@ Fix (XS): make `resident_size` use the upload's own arithmetic, and return `None
 - Compressed rows and 128-dim index keys are owned by layers 2, 8, 14 and 20. Layers 3–7 alias 2, 9–13 alias 8, 15–19 alias 14, and 21–39 alias 20.
 - Top-k ids are issued by layers 2, 8, 14, 20, 24, 28, 32 and 36. The layers after each issuer reuse its ids until the next issuer.
 
-**Size.** Allocated at ctx_max C [d, f16]: `5,242,880 + 3·⌈C/2⌉·1,280 + C·1,280 + 28,672` B. The last term is the compressor state rings.
+**Size.** Allocated at ctx_max C [d, f16]: ~~`5,242,880 + 3·⌈C/2⌉·1,280 + C·1,280 + 28,672`~~ `5,242,880 + 3·⌈C/2⌉·1,280 + C·1,280 + 24,576` B. The last term is the compressor state rings. The ratio-1 source (layer 20) pools nothing and keeps no state (corrected 2026-09-23, b5load: every occupancy row below is 4,096 B less).
 
 | depth D | KV occupied (all layers) | KV read per token |
 |---:|---:|---:|
-| 6 | 293,632 | 433,920 |
-| 1,024 | 8,548,352 | 26,869,760 |
-| 4,096 | 18,378,752 | 31,981,568 |
-| 32,768 | 110,129,152 | 79,691,776 |
-| 1,048,576 | 3,360,714,752 | 1,769,996,288 |
+| 6 | ~~293,632~~ 289,536 | 433,920 |
+| 1,024 | ~~8,548,352~~ 8,544,256 | 26,869,760 |
+| 4,096 | ~~18,378,752~~ 18,374,656 | 31,981,568 |
+| 32,768 | ~~110,129,152~~ 110,125,056 | 79,691,776 |
+| 1,048,576 | ~~3,360,714,752~~ 3,360,710,656 | 1,769,996,288 |
 
 - The read per token is: layers 2–39 read (128 + min(visible, 512)) × 1,024 B; layers 0–1 read the window only; the indexer scans 1,664 B per cached token.
 - 1,048,576 is the reference config's `max_position_embeddings` (`v41-ops-report.md:44`), not the GGUF header, which was not read (see report §3).
 - At 1M depth the indexer scan is about 9 ms per token at 195 GB/s [d]. That depth becomes indexer-bound.
-- In (b), at ctx 32k: A6000 layers 0–19 hold 65,560,576 B and 3090 layers 20–39 hold 44,568,576 B. At 1M: 2.02 GB and 1.34 GB.
+- In (b), at ctx 32k: A6000 layers 0–19 hold 65,560,576 B and 3090 layers 20–39 hold ~~44,568,576~~ 44,564,480 B. At 1M: 2.02 GB and 1.34 GB.
 
 **Scratch, context, reserve:**
 - m=1 scratch: **64 MiB per card [asm]**. V2-Lite's one-layer stage measured 351,988 B [d]. The prefill arena is not determined: mainline's compute buffer at `-ub 512` was 4.3 GB and 2.4 GB [m, rig-log `configs/v41-serve.sh:28-29`, mainline].
@@ -157,7 +157,7 @@ Fix (XS): make `resident_size` use the upload's own arithmetic, and return `None
 | NVMe | `engram_embd` ×2 | 208.902 | 0.000013 | 0–0.31 on the step thread |
 
 Budget:
-- **A6000:** 50,952,404,992 [m: (49,140 − 548) MiB] − 8,576,674,240 dense − 40,574,177,280 experts − 110,129,152 KV − 67,108,864 scratch − 536,870,912 context = **1,087,444,544 headroom**.
+- **A6000:** 50,952,404,992 [m: (49,140 − 548) MiB] − 8,576,674,240 dense − 40,574,177,280 experts − ~~110,129,152~~ 110,125,056 KV − 67,108,864 scratch − 536,870,912 context = **~~1,087,444,544~~ 1,087,448,640 headroom**.
 - **Host:** 270,071,001,088 [m: `free -b`] − 218,193,408,000 experts − 1,323,827,200 `token_embd` − 4,294,967,296 B3e cache − 6,694,629,376 OS and other [m, `free -b` "used", as a proxy] = **39,564,169,216**.
 
 Host experts should be served from the mmap of the shard files and locked, not copied. The reason is eviction: without the lock, engram's 51 pages per token push expert pages out of the page cache, and each refault costs 92 µs [m: rig-log 09-22-p].
@@ -179,7 +179,7 @@ The link size is 4 × 5120 × 4 + 16 = 81,936 B (`v41-ops-report.md:213`: "block
 
 Budget:
 - **A6000:** 50,952,404,992 − 4,190,828,000 − 45,002,280,960 − 65,560,576 − 67,108,864 − 536,870,912 = **1,089,755,680**.
-- **3090:** 25,350,373,376 [m: (24,576 − 400) MiB] − 4,385,846,240 − 19,238,768,640 − 44,568,576 − 67,108,864 − 536,870,912 = **1,077,210,144**.
+- **3090:** 25,350,373,376 [m: (24,576 − 400) MiB] − 4,385,846,240 − 19,238,768,640 − ~~44,568,576~~ 44,564,480 − 67,108,864 − 536,870,912 = **~~1,077,210,144~~ 1,077,214,240**.
 - **Host:** **63,231,041,536**.
 
 **(b′) 3090 as an experts-only tier hanging off the host tier.** Dense weights stay on the A6000, the 3090 holds 23.58 GB of experts, and no stage cut is needed. It is 3 % below (b) with R1 and 6 % below (b) serial. This matters for A2-2, because it means A2-2's stage cut is not required to use the 3090.

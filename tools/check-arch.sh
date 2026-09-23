@@ -95,7 +95,7 @@ report 3 "general.architecture read outside crates/model/src/arch/mod.rs" "$arch
 # added — and a path anywhere else in the same file still fails. A construct that is renamed or
 # moved allows nothing, so its hits fail until the entry follows it.
 dispatch=(
-  # GpuModel<B>에 deepseek2 몸체를 꽂는 별칭 — AnyEngine(engine.rs)은 이 별칭으로만 deepseek2 를 부른다.
+  # GpuModel<B>에 deepseek2 몸체를 꽂는 별칭 — AnyEngine(crates/gpu-gates/src/engine.rs)은 이 별칭으로만 deepseek2 를 부른다.
   'crates/gpu/src/lib.rs type Deepseek2Model'
   # CPU 디코드 바이너리: Arch::detect 로 다른 아키텍처를 거절한 뒤 deepseek2 순전파를 돈다.
   'crates/model/src/bin/bloomery-decode.rs use'
