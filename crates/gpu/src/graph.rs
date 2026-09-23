@@ -7,9 +7,9 @@
 //! bloomery-side wrapper and the shape of the cutile-rs contribution
 //! (`docs/upstream/nvlabs-ledger.md` #3).
 //!
-//! Why graphs at all: ik's 3090 decode on this model measured +10.6% with
-//! CUDA graphs on vs `GGML_CUDA_DISABLE_GRAPHS=1` (docs/gpu-design.md §미정),
-//! so replay is the common starting line, not an optimization to earn later.
+//! Why graphs at all: the reference engine's decode on this model is faster
+//! with CUDA graphs on than with them disabled (docs/gpu-design.md §미정), so
+//! replay is the common starting line, not an optimization to earn later.
 
 use crate::GpuError;
 use cuda_core::{CudaStream, DriverError, sys};
