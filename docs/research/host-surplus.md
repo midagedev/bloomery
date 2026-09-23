@@ -142,7 +142,7 @@ MoE-Infinity·ProMoE 계열을 기각한 것과 정확히 같은 판정이다.
 head, [llama.cpp docs](https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md)).
 즉 드래프트 비용 ≈ **드래프트 순전파 1회**이지 k회가 아니다. 드래프트 파일은
 10.9 GB MXFP4 MoE(roofline)이므로 패스당 드래프트 비용은 활성 바이트에 비례하는데,
-그 활성 비율은 우리 숫자로 잰 적이 없다 — **측정 필요**(아래).
+~~그 활성 비율은 우리 숫자로 잰 적이 없다 — **측정 필요**(아래).~~ 2026-09-24 선 그음: rig-log 09-19가 ik에서 D = 10.32 ms(k에 평평)로 쟀다(`dspark-cost.md`).
 
 **CPU 배치는 남이 이미 하는 일이다.** llama.cpp는 드래프트 모델의 디바이스 지정
 (`--spec-draft-device, -devd`)에 더해 CPU 스케줄 파라미터 제족(`--spec-draft-threads`,
