@@ -202,6 +202,9 @@ first suspect is a hung gate on the box, not the agent.
     crates/model/          the engine: ops (matmul_q), attn (MLA, flash), ffn,
                            moe, head, forward, kv, derived, profile; bin
                            bloomery-decode; tests/ are the gates
+    crates/tokenizer/      byte-level BPE from the GGUF header, bit-identical to
+                           llama-tokenize (gate-tokenizer); bin bloomery-tokenize
+    crates/sampler/        the sampling chain in the reference's order (gate-sampler)
     crates/q3k-gemv/       stage 0: Q3_K gemv, CUDA-Rust device code (cargo oxide only)
     crates/q3k-cpu/        stage 0: Q3_K x Q8_K gemv, AVX2 intrinsics, pinned threads
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile;
