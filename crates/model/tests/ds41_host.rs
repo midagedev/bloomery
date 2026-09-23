@@ -1,5 +1,5 @@
 //! V4.1 host expert tier gate. For every layer of the 5-token oracle set
-//! `ref_deepseek41` (`# build 49ef19d0`, ik on the CPU), the host tier
+//! `ref_deepseek41` (`# build db517b69`, ik on the CPU), the host tier
 //! (`moe::HostLayer`) serves each token's routed experts with ik's own routing
 //! injected — the ids of `ffn_moe_topk-L` (its logical twin; the flat one is
 //! the view's raw memory) and the weights of `ffn_moe_weights_scaled-L`, the
@@ -60,7 +60,9 @@ use model::placement::workstation;
 
 /// The oracle set and the ik tree it was dumped from.
 const SET: &str = "ref_deepseek41";
-const BUILD: &str = "49ef19d0";
+// PIN(2026-09-23): the sink-fixed oracle tree; this set's bytes are those
+// 49ef19d0 dumped, since the fixed branch does not run in a 5-token prefill.
+const BUILD: &str = "db517b69";
 
 /// f32's unit roundoff.
 const U: f64 = 1.0 / 16_777_216.0;
