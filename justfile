@@ -92,7 +92,8 @@ gate-gpu-q4k-sel:
 gate-gpu-e2e *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_e2e && bash tools/gpu-gate.sh gate_e2e {{ARGS}} && BLOOMERY_FLASH_MMA=0 bash tools/gpu-gate.sh gate_e2e'
 
-# The hybrid MoE boundary gate: V2-Lite at n_l 32 and 0 (experts past n_l on the host) against the all-card model.
+# 하이브리드 MoE 경계 게이트: V2-Lite를 n_l 32와 0(n_l 밖 expert는 호스트)으로 올려 전부 카드인 모델과 대조한다.
+# 캡처 노드 수, eager = 재생, 층별 카드 슬롯 비트 동일·호스트 합 밴드, argmax 뒤집힘 밴드, 겹침 레버는 순서만 바꾸는지.
 gate-gpu-hybrid *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_hybrid && bash tools/gpu-gate.sh gate_hybrid {{ARGS}}'
 

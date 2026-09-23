@@ -352,5 +352,10 @@ rollback), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flas
 segment, a multiple of 32; an unusable value panics instead of falling back),
 `BLOOMERY_FLASH_MMA=0` (gpu flash: the scalar segment pass instead of the
 tensor-core default; `just gate-gpu-e2e` runs both, and the timing binary
-prints which one it ran on its `load` line).
+prints which one it ran on its `load` line), `BLOOMERY_HYBRID_NL` (gpu hybrid
+MoE: experts `[0, n_l)` of every routed stack stay on the card and the rest
+run on the host tier inside the captured step; unset or equal to the expert
+count is the all-card path; `just gate-gpu-hybrid` refuses to run with it
+set), `BLOOMERY_HYBRID_OVERLAP=0` (gpu hybrid: each layer's wait right after
+its go instead of after the card's experts and the shared expert).
 Each is read once, at first use.
