@@ -230,3 +230,9 @@
 `/private/tmp/claude-501/-Users-hckim-repo-bloomery/e5714b41-3850-42be-a722-79e1f225c3b5/scratchpad/improvement-spots.md`
 
 git 상태와 박스는 건드리지 않았습니다.
+
+
+## 처분 기록 (리드)
+
+- 2026-09-24 06:50 **fixae 머지 `3a69ddb`**: 행 11·27·83·148(A), 25·142·154·162(E) 닫힘. 리드 재실행 check·lint 168·fmt·recipes·gate-dspark-read·gate-ds41-meta·gate-qdot·gate-1-1 전부 rc=0. 스펙 밖 하나 더 고침: `deepseek41/mod.rs`의 헬퍼 둘(스펙의 `hparams.rs:8-38`이 오기). fixae가 새로 본 것(트래커에 추가, XS 넷·S 하나): `dequant_ref.cpp` manifest.txt 비원자적 쓰기; `build-dequant.sh:10`과 형제가 공유 `$REF_BIN` 바이너리를 제자리에서 덮어씀(두 트랙 동시 gate-1-1이면 반쯤 쓰인 실행 파일, S); `IK_SQRT_SOFTPLUS` 상수 두 곳 중복; `fail()` 경로가 `.tmp.<pid>`를 안 지움; `justfile:369` `build-ref`가 이름과 달리 dequant_ref를 안 지음.
+- 리드 문서 10건: `387501b`(행 2·9·52·58·59·66·74·112·151). 행 159(`one_tensor_file` 경로)는 plan.md에 그 문자열이 없어 확인 불가 — DROP.
