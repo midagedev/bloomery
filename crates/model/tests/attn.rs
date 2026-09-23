@@ -1182,3 +1182,401 @@ fn hw_kv_prefetch_lever_child() {
         on.data.len()
     );
 }
+
+/// One shape of the split-K band fixture: synthetic queries and keys at the
+/// real MLA row width, positions `0..n_keys` in one sequence.
+struct SplitKCase {
+    label: &'static str,
+    q_rope: Tensor2,
+    q_nope2: Tensor2,
+    keys16: Vec<u16>,
+    key_slots: Vec<Slot>,
+    q_slots: Vec<Slot>,
+    v_max: f32,
+}
+
+/// The synthetic MLA shape the split-K band test runs at (576-wide rows,
+/// 512 latent, three heads). The rope fields are dead — flash reads only
+/// the dims.
+fn split_k_params() -> attn::MlaParams {
+    attn::MlaParams {
+        n_head: 3,
+        kq_head: 576,
+        nope: 512,
+        rope_dims: 64,
+        v_head: 128,
+        latent: 512,
+        eps: 1e-6,
+        rope: attn::RopeParams {
+            n_dims: 64,
+            freq_base: 1e4,
+            freq_scale: 0.025,
+            ext_factor: 1.0,
+            mscale_param: 0.7,
+            corr_dims: [10.0, 23.0],
+            theta_scale: 0.8,
+        },
+        kq_scale: 0.078,
+    }
+}
+
+/// The band fixture, deterministic so the re-exec child and its parent
+/// consume the same bytes: a decode query over 1025 and 4097 keys (33 and 129
+/// blocks — uneven segments, the last block partial) and a four-query causal
+/// batch over 1100 keys whose rows see 1, 40, 700 and 1100 of them (one
+/// segment, two, many). Small queries keep the softmax spread over many keys,
+/// so every segment carries weight and the running max bumps.
+fn split_k_cases(p: &attn::MlaParams) -> Vec<SplitKCase> {
+    let mut rng = Lcg(0x5911_7a11_ba5e_0001);
+    let width = p.rope_dims + p.latent;
+    let shapes: [(&'static str, usize, &[u32]); 3] = [
+        ("decode, 1025 keys", 1025, &[1024]),
+        ("decode, 4097 keys", 4097, &[4096]),
+        ("4 queries, 1100 keys", 1100, &[0, 39, 699, 1099]),
+    ];
+    shapes
+        .iter()
+        .map(|&(label, n_keys, qpos)| {
+            let n_tok = qpos.len();
+            let mut q_rope = Tensor2::zeros(p.rope_dims, p.n_head * n_tok);
+            let mut q_nope2 = Tensor2::zeros(p.latent, p.n_head * n_tok);
+            for t in 0..n_tok {
+                for h in 0..p.n_head {
+                    for v in q_rope.col_mut(t * p.n_head + h).iter_mut() {
+                        *v = rng.range(-0.3, 0.3);
+                    }
+                    for v in q_nope2.col_mut(h * n_tok + t).iter_mut() {
+                        *v = rng.range(-0.3, 0.3);
+                    }
+                }
+            }
+            let mut keys16: Vec<u16> = Vec::with_capacity(n_keys * width);
+            let mut v_max = 0.0f32;
+            for _ in 0..n_keys {
+                let start = keys16.len();
+                for _ in 0..width {
+                    keys16.push(gguf::quant::f32_to_f16_bits(rng.range(-4.0, 4.0)));
+                }
+                for &b in &keys16[start + p.rope_dims..] {
+                    v_max = v_max.max(gguf::quant::half_to_f32(b).abs());
+                }
+            }
+            SplitKCase {
+                label,
+                q_rope,
+                q_nope2,
+                keys16,
+                key_slots: (0..n_keys as u32)
+                    .map(|u| Slot { seq: 0, pos: u })
+                    .collect(),
+                q_slots: qpos.iter().map(|&pos| Slot { seq: 0, pos }).collect(),
+                v_max,
+            }
+        })
+        .collect()
+}
+
+/// Both row twins on every case, in order: the dispatch leg, then the scalar.
+fn split_k_outputs(p: &attn::MlaParams, cases: &[SplitKCase]) -> Vec<Tensor2> {
+    let width = p.rope_dims + p.latent;
+    let mut outs = Vec::new();
+    for c in cases {
+        let keys = model::kv::KvRows::new(&c.keys16, width);
+        outs.push(attn::flash_attn_latent(
+            &c.q_rope,
+            &c.q_nope2,
+            keys,
+            &c.key_slots,
+            &c.q_slots,
+            p,
+        ));
+        outs.push(attn::flash_attn_latent_scalar(
+            &c.q_rope,
+            &c.q_nope2,
+            keys,
+            &c.key_slots,
+            &c.q_slots,
+            p,
+        ));
+    }
+    outs
+}
+
+/// The re-exec entry point of [`hw_flash_split_k_bands_against_one_segment`]:
+/// without `BLOOMERY_SPLITK_BAND_DUMP` it does nothing.
+#[test]
+#[ignore = "hw: re-exec child of hw_flash_split_k_bands_against_one_segment; standalone it is a no-op"]
+fn hw_flash_split_k_band_child() {
+    let Ok(dump) = std::env::var("BLOOMERY_SPLITK_BAND_DUMP") else {
+        eprintln!("split-K band child: no BLOOMERY_SPLITK_BAND_DUMP, nothing to do");
+        return;
+    };
+    let p = split_k_params();
+    let outs = split_k_outputs(&p, &split_k_cases(&p));
+    let bytes: Vec<u8> = outs
+        .iter()
+        .flat_map(|t| t.data.iter().flat_map(|v| v.to_le_bytes()))
+        .collect();
+    std::fs::write(&dump, &bytes).unwrap();
+    eprintln!("split-K band child: {} bytes dumped to {dump}", bytes.len());
+}
+
+/// Split-K against the single-pass online softmax it replaced, on synthetic
+/// data (no model file): the same row twins, the same scores bit for bit (the
+/// kq dot per key is untouched), only the plan differs — the default
+/// segments merged by `combine_segments` in this process, one segment in a
+/// re-exec'd child run with `BLOOMERY_FLASH_SEGMENTS=1` (the lever is read
+/// once per process). This is the gate on the merge itself: the chain and
+/// the fused dispatch share it, so their bit identity cannot catch a wrong
+/// merge, and the oracle's 6-token rows have one segment, where the merge is
+/// the identity.
+///
+/// The band is the textbook reassociation bound, derived, with `u = 2⁻²⁴`:
+/// both plans sum `S` and every `R[d]` over the same `n` weighted terms in
+/// different association, each rounding at most `u` of a running partial no
+/// larger than `Σ w·|V|` (`n·u` per path); each weight carries at most
+/// `n_blocks` rescale factors in one plan and a segment's rescales plus one
+/// merge factor in the other, each off by at most `2u` (exp + multiply) plus
+/// `v_expf`'s few ulp (`8` rescales of slack for both). So `R` and `S` each move
+/// by at most `γ = (2n + 4·(n_blocks + 8))·u` relative to `Σ w·|V|` and `Σ w`,
+/// and `R/S` by at most `2γ·max|V|` plus the final multiply's `u`. A dropped or
+/// misweighted segment moves the output by about its weight share times the V
+/// spread — orders above this band. A child that ignored the lever would
+/// return the parent's own bytes: the test fails on that too.
+#[test]
+#[ignore = "hw: needs AVX2+FMA+F16C (the box); synthetic data, no model file"]
+fn hw_flash_split_k_bands_against_one_segment() {
+    let p = split_k_params();
+    let cases = split_k_cases(&p);
+    let split = split_k_outputs(&p, &cases);
+
+    let exe = std::env::current_exe().unwrap();
+    let dump =
+        std::env::temp_dir().join(format!("bloomery-splitk-band-{}.f32", std::process::id()));
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "hw_flash_split_k_band_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BLOOMERY_FLASH_SEGMENTS", "1")
+        .env("BLOOMERY_SPLITK_BAND_DUMP", &dump)
+        .output()
+        .expect("re-exec of this test binary");
+    assert!(
+        out.status.success(),
+        "split-K band child failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let raw = std::fs::read(&dump).unwrap();
+    let _ = std::fs::remove_file(&dump);
+    let one: Vec<f32> = raw
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    let total: usize = split.iter().map(|t| t.data.len()).sum();
+    assert_eq!(one.len(), total, "child output length");
+
+    let u = 2.0f32.powi(-24);
+    let mut at = 0usize;
+    let mut moved_total = 0usize;
+    for (i, got) in split.iter().enumerate() {
+        let c = &cases[i / 2];
+        let leg = if i % 2 == 0 { "dispatch" } else { "scalar" };
+        let n = c.key_slots.len() as f32;
+        let n_blocks = c.key_slots.len().div_ceil(32) as f32;
+        let gamma = (2.0 * n + 4.0 * (n_blocks + 8.0)) * u;
+        let band = 2.0 * gamma * c.v_max + u * c.v_max;
+        let want = &one[at..at + got.data.len()];
+        at += got.data.len();
+        let mut worst = 0.0f32;
+        let mut sq = 0.0f64;
+        let mut moved = 0usize;
+        for (k, (&a, &b)) in got.data.iter().zip(want).enumerate() {
+            let d = (a - b).abs();
+            assert!(
+                d <= band,
+                "{} ({leg}): split-K vs one segment |diff| {d:e} at index {k} exceeds the \
+                 reassociation band {band:e}",
+                c.label
+            );
+            worst = worst.max(d);
+            sq += f64::from(d) * f64::from(d);
+            moved += usize::from(a.to_bits() != b.to_bits());
+        }
+        moved_total += moved;
+        let rms = (sq / got.data.len() as f64).sqrt();
+        eprintln!(
+            "split-K vs one segment, {:<21} {leg:<8} max|diff| = {worst:e}  rms {rms:.3e}  \
+             ({moved} of {} values moved; max|V| {}, band {band:e})",
+            c.label,
+            got.data.len(),
+            c.v_max
+        );
+    }
+    assert!(
+        moved_total > 0,
+        "the one-segment child returned the split's own bytes — BLOOMERY_FLASH_SEGMENTS=1 \
+         did not reach the plan, so the band above compared a thing with itself"
+    );
+}
+
+/// The oracle's decode-shaped fixture at `n_keys` cached keys (the query is
+/// the last): the oracle's token-0 `q`/`q_rope`, the six `kvr` rows cycled and
+/// scaled element-wise by 1 ± 0.25 noise — the recipe of
+/// `hw_attn_heads_split_bit_identical`.
+struct DecodeFixture {
+    q: Tensor2,
+    q_rope: Tensor2,
+    cache16: Vec<u16>,
+    key_slots: Vec<Slot>,
+    q_slots: Vec<Slot>,
+}
+
+fn decode_fixture(
+    o: &oracle::Oracle,
+    p: &attn::MlaParams,
+    n_keys: usize,
+    seed: u64,
+) -> DecodeFixture {
+    let blk = 0usize;
+    let load2 = |name: &str, occ: u32| -> Tensor2 {
+        let (v, inf) = o.load(name, occ);
+        Tensor2::from_vec(
+            inf.ne[0] as usize,
+            (inf.ne[1] * inf.ne[2] * inf.ne[3]) as usize,
+            v,
+        )
+    };
+    let q_full = load2(&format!("q-{blk}"), 0);
+    let q_rope_full = load2(&format!("q_rope-{blk}"), 1);
+    let kvr_full = load2(&format!("kvr-{blk}"), 0);
+    let first_cols =
+        |src: &Tensor2, n: usize| Tensor2::from_vec(src.ne0, n, src.data[..src.ne0 * n].to_vec());
+    let mut rng = Lcg(seed);
+    let mut cache16 = Vec::with_capacity(n_keys * (p.rope_dims + p.latent));
+    for u in 0..n_keys {
+        for &v in kvr_full.col(u % kvr_full.ne1) {
+            cache16.push(gguf::quant::f32_to_f16_bits(
+                v * (1.0 + 0.25 * rng.range(-1.0, 1.0)),
+            ));
+        }
+    }
+    DecodeFixture {
+        q: first_cols(&q_full, 1),
+        q_rope: first_cols(&q_rope_full, p.n_head),
+        cache16,
+        key_slots: (0..n_keys as u32)
+            .map(|u| Slot { seq: 0, pos: u })
+            .collect(),
+        q_slots: vec![Slot {
+            seq: 0,
+            pos: (n_keys - 1) as u32,
+        }],
+    }
+}
+
+/// The re-exec entry point of [`hw_attn_split_k_is_thread_count_invariant`]:
+/// without `BLOOMERY_SPLITK_CHILD_DUMP` it does nothing.
+#[test]
+#[ignore = "hw: re-exec child of hw_attn_split_k_is_thread_count_invariant; standalone it is a no-op"]
+fn hw_attn_split_k_threads_child() {
+    let Ok(dump) = std::env::var("BLOOMERY_SPLITK_CHILD_DUMP") else {
+        eprintln!("split-K child: no BLOOMERY_SPLITK_CHILD_DUMP, nothing to do");
+        return;
+    };
+    let o = oracle::Oracle::open();
+    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let blk = 0usize;
+    let p = attn::MlaParams::read(&g, blk).unwrap();
+    let derived = Derived::new(&g).unwrap();
+    let views = &derived.attn_plan(blk).unwrap().v_up_views;
+    let wblocks = derived.wk_b_all_heads(blk).unwrap();
+    let mut bytes: Vec<u8> = Vec::new();
+    for (n_keys, seed) in [(1025usize, 0x7e11_0001u64), (4097, 0x7e11_0002)] {
+        let f = decode_fixture(&o, &p, n_keys, seed);
+        let cache = model::kv::KvRows::new(&f.cache16, p.rope_dims + p.latent);
+        let (fq, fc, f2) = attn::attn_heads_fused(
+            &g,
+            wblocks,
+            &f.q,
+            &f.q_rope,
+            cache,
+            &f.key_slots,
+            &f.q_slots,
+            views,
+            &p,
+        )
+        .unwrap();
+        let chain = attn::flash_attn_latent(&f.q_rope, &fq, cache, &f.key_slots, &f.q_slots, &p);
+        for t in [&fq, &fc, &f2, &chain] {
+            bytes.extend(t.data.iter().flat_map(|v| v.to_le_bytes()));
+        }
+    }
+    std::fs::write(&dump, &bytes).unwrap();
+    eprintln!(
+        "split-K child: {} bytes with threads::pool().threads() = {} dumped to {dump}",
+        bytes.len(),
+        threads::pool().threads()
+    );
+}
+
+/// The split-K plan must not depend on the thread count, not by one bit:
+/// children at `BLOOMERY_THREADS` 1, 32 and 3 run the fused decode dispatch
+/// (and the chain's flash) at 1025 and 4097 cached keys and dump every output
+/// byte; the parent compares them. `tests/mt.rs` cannot see this — its prompt
+/// is six tokens, one 32-key block, one segment. The children's pool sizes are
+/// printed as evidence, the `tests/mt.rs` pattern.
+#[test]
+#[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
+fn hw_attn_split_k_is_thread_count_invariant() {
+    let exe = std::env::current_exe().unwrap();
+    let run = |threads_env: &str| -> Vec<u8> {
+        let dump = std::env::temp_dir().join(format!(
+            "bloomery-splitk-child-{}-t{threads_env}.bin",
+            std::process::id()
+        ));
+        let out = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "hw_attn_split_k_threads_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BLOOMERY_SPLITK_CHILD_DUMP", &dump)
+            .env("BLOOMERY_THREADS", threads_env)
+            .output()
+            .expect("re-exec of this test binary");
+        assert!(
+            out.status.success(),
+            "child at BLOOMERY_THREADS={threads_env} failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        let bytes = std::fs::read(&dump).unwrap();
+        let _ = std::fs::remove_file(&dump);
+        bytes
+    };
+    let one = run("1");
+    for other in ["32", "3"] {
+        let got = run(other);
+        let at = one.iter().zip(&got).position(|(a, b)| a != b);
+        assert!(
+            got.len() == one.len() && at.is_none(),
+            "split-K outputs differ between BLOOMERY_THREADS=1 and ={other}: first differing \
+             byte at {at:?} of {} (lengths {} vs {})",
+            one.len(),
+            one.len(),
+            got.len()
+        );
+        eprintln!(
+            "split-K decode, threads=1 vs threads={other:<3} byte-identical ({} bytes)",
+            one.len()
+        );
+    }
+}

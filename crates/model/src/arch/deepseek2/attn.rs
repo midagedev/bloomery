@@ -31,6 +31,7 @@ use gguf::QuantError;
 use gguf::quant::{f32_to_f16_bits, half_to_f32};
 use gguf::{Gguf, TensorInfo};
 use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -553,6 +554,9 @@ thread_local! {
     /// thread — sliced to the exact `d_head`/`latent` the row kernels index.
     static FLASH_QROW: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static FLASH_R: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// The serial row path's per-segment partial accumulators, one latent
+    /// range per segment, per worker.
+    static FLASH_PARTS: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `q_nope2 = wk_b(Q8_0)ᵀ · q_nope` per head — the weight-absorption step.
@@ -851,7 +855,15 @@ fn lane_tree_sum(w: &[f32; 32]) -> f32 {
 ///   * V accumulation in an f32 FMA chain (`accumulate_qkv`), keys ascending;
 ///   * final row = `R · (1/S)`, one plain multiply per element.
 ///
-/// The two inner loops take the AVX2+FMA+F16C twin [`flash_row_avx2`] when
+/// Split-K: a row's visible keys ([`visible_end`]) are cut into
+/// [`FLASH_SEGMENTS`] fixed segments of whole 32-key blocks ([`flash_segment`]);
+/// each runs the scan above on its own and leaves `(m, S, R)`, and
+/// [`combine_segments`] merges them in a fixed order. A row of ≤ 32 keys has one
+/// segment and keeps the single-pass bits; a longer one sums in a different order
+/// than ik's (whose split depends on its thread count) — `tests/attn.rs` bands it
+/// against the single-pass plan.
+///
+/// The two inner loops take the AVX2+FMA+F16C twin [`flash_seg_avx2`] when
 /// [`flash_simd`] allows; its one numerical difference is the kq sum order, which
 /// `tests/attn.rs` bands against [`flash_attn_latent_scalar`], the twin that stays
 /// bit-exact on exact inputs.
@@ -859,9 +871,9 @@ fn lane_tree_sum(w: &[f32; 32]) -> f32 {
 /// Blocks with no allowed key are skipped outright: their weights are all exactly
 /// `0.0` ([`v_expf`]) and `S += 0` / `fma(V, 0, R) = R` are exact no-ops — skipping
 /// is bit-identical to executing them, and padded cache rows never enter for the same
-/// reason. One divergence, outside the gated regime: the M-bump rescale uses glibc
-/// `expf` in the reference and `f32::exp` here — reachable only above 32 allowed keys,
-/// which a 6-token prefill cannot.
+/// reason. One divergence from the reference: the M-bump rescale inside a segment
+/// uses `f32::exp` where ik uses glibc `expf` — reachable only in a segment holding
+/// more than one block with allowed keys.
 pub fn flash_attn_latent(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
@@ -878,6 +890,7 @@ pub fn flash_attn_latent(
         q_slots,
         p,
         flash_simd(p),
+        flash_segments(),
     )
 }
 
@@ -893,7 +906,16 @@ pub fn flash_attn_latent_scalar(
     q_slots: &[Slot],
     p: &MlaParams,
 ) -> Tensor2 {
-    flash_attn_latent_impl(q_rope, q_nope2, keys16, key_slots, q_slots, p, false)
+    flash_attn_latent_impl(
+        q_rope,
+        q_nope2,
+        keys16,
+        key_slots,
+        q_slots,
+        p,
+        false,
+        flash_segments(),
+    )
 }
 
 /// Whether [`flash_attn_latent`]'s row kernel takes the AVX2+FMA+F16C twin: the CPU
@@ -964,15 +986,15 @@ pub fn set_kv_prefetch(mode: Option<bool>) {
     set_kv_prefetch_rows(mode.map(usize::from));
 }
 
-/// What the AVX2 flash twin's last row decided, stored as distance + 1:
-/// 0 = no row yet, 1 = no prefetch, `d + 1` = `d` rows ahead. The lever
+/// What the last AVX2 flash dispatch decided, stored as distance + 1:
+/// 0 = no dispatch yet, 1 = no prefetch, `d + 1` = `d` rows ahead. The lever
 /// tests read it; a lever whose effect is only "the gate still passes"
 /// proves nothing about the branch.
 static LAST_KV_PREFETCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The observable behind [`set_kv_prefetch_rows`]: the distance the last
-/// AVX2 flash row (any `n_tokens`) resolved to — `Some(0)` if it did not
-/// prefetch — or `None` before any row ran.
+/// AVX2 flash dispatch (any `n_tokens`) resolved to — `Some(0)` if it did
+/// not prefetch — or `None` before any ran.
 #[doc(hidden)]
 pub fn last_kv_prefetch_rows() -> Option<usize> {
     LAST_KV_PREFETCH
@@ -993,9 +1015,110 @@ fn kv_prefetch_rows() -> usize {
     }
 }
 
+/// Keys per flash block: the online-softmax step of the row kernels (ik's
+/// `k_step`). Segment boundaries fall on multiples of it.
+const FLASH_BLOCK: usize = 32;
+
+/// How many fixed segments one query row's keys are cut into (split-K), and
+/// the most [`flash_segments`] admits. Never the thread count: the plan — and
+/// with it every bit of the output — depends on the row's visible key count
+/// alone.
+const FLASH_SEGMENTS: usize = 32;
+
+/// A decode row with at most this many 32-key blocks stays on the
+/// one-dispatch shape ([`heads_per_row`]); above it the split-K shape
+/// ([`heads_split_k`]) pays for its two extra dispatches.
+const SPLITK_MIN_BLOCKS: usize = 16;
+
+/// The segment count the flash plan runs at: [`FLASH_SEGMENTS`] unless
+/// `BLOOMERY_FLASH_SEGMENTS=n` (1 to 32; read once; any other value panics) —
+/// the same-binary lever for the split: 1 is the single-pass online softmax,
+/// the plan the split is banded against (`tests/attn.rs`).
+fn flash_segments() -> usize {
+    static S: OnceLock<usize> = OnceLock::new();
+    *S.get_or_init(|| match std::env::var("BLOOMERY_FLASH_SEGMENTS") {
+        Err(_) => FLASH_SEGMENTS,
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if (1..=FLASH_SEGMENTS).contains(&n) => n,
+            _ => panic!("BLOOMERY_FLASH_SEGMENTS must be 1 to {FLASH_SEGMENTS}, got {v:?}"),
+        },
+    })
+}
+
+/// One past the last key the query in `q` may attend to, 0 if it sees none.
+/// Every key at or past it is masked, so walking `0..visible_end` instead of
+/// the whole cache changes no value; the plan is cut over this length, not
+/// the cache length, so a prefill row and the decode step at the same
+/// position cut the same segments (the KV cache changes nothing). A decode
+/// query is the cache's last row, so the scan stops at once.
+fn visible_end(key_slots: &[Slot], q: &Slot) -> usize {
+    key_slots
+        .iter()
+        .rposition(|k| k.seq == q.seq && k.pos <= q.pos)
+        .map_or(0, |u| u + 1)
+}
+
+/// The number of non-empty segments of an `n_vis`-key row: one per 32-key
+/// block up to `n_seg`. The non-empty ones are always the first
+/// (`threads::chunk_bounds` hands the extra blocks to the lowest indices).
+fn flash_segments_used(n_vis: usize, n_seg: usize) -> usize {
+    n_vis.div_ceil(FLASH_BLOCK).min(n_seg)
+}
+
+/// Segment `s` of `n_seg` over `0..n_vis`: whole 32-key blocks, split by
+/// `threads::chunk_bounds` over the block count, the last one clipped to
+/// `n_vis`. A pure function of `(n_vis, n_seg, s)`.
+fn flash_segment(n_vis: usize, n_seg: usize, s: usize) -> Range<usize> {
+    let (b0, b1) = threads::chunk_bounds(n_vis.div_ceil(FLASH_BLOCK), n_seg, s);
+    b0 * FLASH_BLOCK..(b1 * FLASH_BLOCK).min(n_vis)
+}
+
+/// The fixed-order merge of a row's segment partials into `r`, returning `S`:
+/// `M* = max m_s`; for `s` ascending, `α = v_expf(m_s − M*)`, `S = fma(α,
+/// S_s, S)`, `r[d] = fma(α, R_s[d], r[d])`. A segment with `m_s = −inf` saw no
+/// allowed key and is skipped (its partial is never read — it may hold
+/// anything). Segment `s`'s `R` range is `parts[s·stride + off ..][..r.len()]`.
+///
+/// One segment merges to itself bit for bit: `α = v_expf(0) = 1`, `fma(1, x,
+/// +0) = x`, and no partial is ever `−0` (every chain starts at `+0` and
+/// round-to-nearest never sums to `−0`), so a row of ≤ 32 keys keeps the
+/// single-pass kernel's exact bits. Each element's chain is its own, so a
+/// latent range merges to the bits the whole row has there.
+fn combine_segments(
+    ms: &[f32],
+    ss: &[f32],
+    parts: &[f32],
+    stride: usize,
+    off: usize,
+    r: &mut [f32],
+) -> f32 {
+    let m_star = ms.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    r.fill(0.0);
+    let mut s_tot = 0.0f32;
+    if m_star == f32::NEG_INFINITY {
+        return s_tot;
+    }
+    for (s, (&m, &s_s)) in ms.iter().zip(ss).enumerate() {
+        if m == f32::NEG_INFINITY {
+            continue;
+        }
+        let a = v_expf(m - m_star);
+        s_tot = a.mul_add(s_s, s_tot);
+        let part = &parts[s * stride + off..][..r.len()];
+        for (rd, &x) in r.iter_mut().zip(part) {
+            *rd = a.mul_add(x, *rd);
+        }
+    }
+    s_tot
+}
+
 /// The single owner of the row split both dispatch legs ride; `simd` is decided once
 /// per call. The row twins share the whole skeleton and differ only in the two
 /// vectorized inner loops (kq dot, V accumulation) — keep them in lockstep.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the chain's inputs plus the two plan levers"
+)]
 fn flash_attn_latent_impl(
     q_rope: &Tensor2,
     q_nope2: &Tensor2,
@@ -1004,6 +1127,7 @@ fn flash_attn_latent_impl(
     q_slots: &[Slot],
     p: &MlaParams,
     simd: bool,
+    n_seg: usize,
 ) -> Tensor2 {
     // Profiler hook: level-1 timer over the whole kernel. Shape statement: `rows` the
     // (token, head) query rows, `k` the keys·d_head dot work, `weight_bytes` the f16
@@ -1029,10 +1153,11 @@ fn flash_attn_latent_impl(
         "flash_attn_latent: KV rows must be rope+latent = {d_head} wide, cache width is {}",
         keys16.width()
     );
+    let ahead = kv_prefetch_for(n_tokens, simd);
 
     // The (token, head) query rows are fully independent — each walks the KV cache
-    // and writes its own contiguous `latent`-wide slice of `out`, the same row-split
-    // argument `matmul_q` rides.
+    // segment by segment, merges its partials and writes its own contiguous
+    // `latent`-wide slice of `out`, the same row-split argument `matmul_q` rides.
     //
     // SAFETY (construction site): every participant computes rows inside its own
     // chunk and writes only cells `row * latent .. (row + 1) * latent` of `out.data`
@@ -1041,39 +1166,36 @@ fn flash_attn_latent_impl(
     let out_ptr = crate::ops::SharedOut(out.data.as_mut_ptr());
     let latent = p.latent;
     threads::pool().for_each_chunk(n_tokens * p.n_head, |rows| {
-        // Per-worker scratch, one set per participant, sized exactly as the
-        // serial version had them — recycled across dispatches. The exact-length
-        // slices are load-bearing: the row kernels walk the whole `qrow` slice
-        // against `d_head`-wide key rows.
-        let mut qrow_buf = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        if qrow_buf.len() < d_head {
-            qrow_buf.resize(d_head, 0.0);
-        }
-        if r_buf.len() < latent {
-            r_buf.resize(latent, 0.0);
-        }
-        let qrow = &mut qrow_buf[..d_head];
-        let r = &mut r_buf[..latent];
-        let mut w = [0.0f32; 32];
+        let mut sc = RowScratch::take(d_head, latent, latent, n_seg);
+        let mut vis = (usize::MAX, 0usize);
         for row in rows {
-            let qn2 = q_nope2.col((row % p.n_head) * n_tokens + row / p.n_head);
-            if simd {
-                // SAFETY: `flash_simd` checked ISA and panel shapes; the row-width assert above and the scratch sizing complete the contract.
-                unsafe {
-                    flash_row_avx2(
-                        q_rope, qn2, keys16, key_slots, q_slots, p, row, 0, qrow, r, &mut w,
-                        &out_ptr,
-                    )
-                };
-            } else {
-                flash_row_scalar(
-                    q_rope, qn2, keys16, key_slots, q_slots, p, row, 0, qrow, r, &mut w, &out_ptr,
-                );
+            let t = row / p.n_head;
+            let h = row % p.n_head;
+            if vis.0 != t {
+                vis = (t, visible_end(key_slots, &q_slots[t]));
             }
+            let qn2 = q_nope2.col(h * n_tokens + t);
+            let rk = RowKeys {
+                keys16,
+                key_slots,
+                q_slot: &q_slots[t],
+                n_vis: vis.1,
+            };
+            flash_row(
+                simd,
+                ahead,
+                q_rope.col(t * p.n_head + h),
+                qn2,
+                &rk,
+                p,
+                n_seg,
+                0,
+                &mut sc,
+                row * latent,
+                &out_ptr,
+            );
         }
-        FLASH_QROW.with(|c| *c.borrow_mut() = qrow_buf);
-        FLASH_R.with(|c| *c.borrow_mut() = r_buf);
+        sc.give_back();
     });
     if let Some(t_call) = t_call {
         let acc = profile::CallAcc::new();
@@ -1088,6 +1210,155 @@ fn flash_attn_latent_impl(
         );
     }
     out
+}
+
+/// The prefetch distance a flash dispatch of `n_tokens` queries runs at, and
+/// its record for [`last_kv_prefetch_rows`]: decode rows only (one query) and
+/// only the AVX2 twin prefetches. Decided once per dispatch, not per row — the
+/// lever is a process-wide constant, and a per-row store bounced one shared
+/// line between every worker.
+fn kv_prefetch_for(n_tokens: usize, simd: bool) -> usize {
+    if !simd {
+        return 0;
+    }
+    let ahead = if n_tokens == 1 { kv_prefetch_rows() } else { 0 };
+    LAST_KV_PREFETCH.store(ahead + 1, std::sync::atomic::Ordering::Relaxed);
+    ahead
+}
+
+/// What one query row reads besides its own q: the cache, its slots, the
+/// query's slot and the row's plan length ([`visible_end`]).
+struct RowKeys<'a> {
+    keys16: KvRows<'a>,
+    key_slots: &'a [Slot],
+    q_slot: &'a Slot,
+    n_vis: usize,
+}
+
+/// A worker's recycled scratch for the serial row path: the FA query row, the
+/// merged accumulator, and one partial accumulator per segment. Taken from
+/// the thread-locals once per chunk and handed back after it; every element
+/// is rewritten before it is read.
+struct RowScratch {
+    qrow: Vec<f32>,
+    r: Vec<f32>,
+    parts: Vec<f32>,
+    d_head: usize,
+    d_len: usize,
+    w: [f32; 32],
+}
+
+impl RowScratch {
+    fn take(d_head: usize, latent: usize, d_len: usize, n_seg: usize) -> Self {
+        let mut qrow = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let mut r = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let mut parts = FLASH_PARTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if qrow.len() < d_head {
+            qrow.resize(d_head, 0.0);
+        }
+        if r.len() < latent {
+            r.resize(latent, 0.0);
+        }
+        if parts.len() < n_seg * d_len {
+            parts.resize(n_seg * d_len, 0.0);
+        }
+        RowScratch {
+            qrow,
+            r,
+            parts,
+            d_head,
+            d_len,
+            w: [0.0; 32],
+        }
+    }
+
+    fn give_back(self) {
+        FLASH_QROW.with(|c| *c.borrow_mut() = self.qrow);
+        FLASH_R.with(|c| *c.borrow_mut() = self.r);
+        FLASH_PARTS.with(|c| *c.borrow_mut() = self.parts);
+    }
+}
+
+/// The FA row `[q_rope ; q_nope2]`, F32, never rounded.
+fn fill_qrow(qrow: &mut [f32], q_rope_col: &[f32], qn2: &[f32]) {
+    let (rope, nope) = qrow.split_at_mut(q_rope_col.len());
+    rope.copy_from_slice(q_rope_col);
+    nope.copy_from_slice(qn2);
+}
+
+/// One query row of the flash kernel, serially: every non-empty segment of
+/// the row's plan through the segment twin, then [`combine_segments`], then
+/// `R · (1/S)` into `out[out_base + d_off ..][..d_len]`. `d_off`/`d_len`
+/// (`sc.d_len`) pick a latent range; every step on `R` is per element, so a
+/// range carries the bits the whole latent has there. The split-K dispatch
+/// in [`attn_heads_split`] computes the same segments on different threads
+/// and the same merge, so it writes the same bits.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a row's inputs, its plan and its output cells"
+)]
+fn flash_row(
+    simd: bool,
+    ahead: usize,
+    q_rope_col: &[f32],
+    qn2: &[f32],
+    rk: &RowKeys<'_>,
+    p: &MlaParams,
+    n_seg: usize,
+    d_off: usize,
+    sc: &mut RowScratch,
+    out_base: usize,
+    out: &crate::ops::SharedOut,
+) {
+    let qrow = &mut sc.qrow[..sc.d_head];
+    fill_qrow(qrow, q_rope_col, qn2);
+    let d_len = sc.d_len;
+    let used = flash_segments_used(rk.n_vis, n_seg);
+    let mut ms = [f32::NEG_INFINITY; FLASH_SEGMENTS];
+    let mut ss = [0.0f32; FLASH_SEGMENTS];
+    // `flash_segments` caps the plan at the arrays' length.
+    debug_assert!(used <= FLASH_SEGMENTS);
+    for s in 0..used {
+        let keys = flash_segment(rk.n_vis, n_seg, s);
+        let r_s = &mut sc.parts[s * d_len..(s + 1) * d_len];
+        let (m, s_sum) = flash_segment_row(simd, ahead, qrow, rk, p, keys, d_off, r_s, &mut sc.w);
+        ms[s] = m;
+        ss[s] = s_sum;
+    }
+    let r = &mut sc.r[..d_len];
+    let s_tot = combine_segments(&ms[..used], &ss[..used], &sc.parts, d_len, 0, r);
+    let s_inv = if s_tot > 0.0 { 1.0 / s_tot } else { 0.0 };
+    for (d, &v) in r.iter().enumerate() {
+        // SAFETY: cell `out_base + d_off + d` belongs to this row's latent range alone — see the construction site at the dispatch.
+        unsafe { out.write(out_base + d_off + d, s_inv * v) };
+    }
+}
+
+/// One segment of one row through the row twin `simd` selects: `R` for the
+/// latent range `d_off..d_off + r.len()` into `r`, returning `(m, S)`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the segment kernel's operands plus the twin choice"
+)]
+fn flash_segment_row(
+    simd: bool,
+    ahead: usize,
+    qrow: &[f32],
+    rk: &RowKeys<'_>,
+    p: &MlaParams,
+    keys: Range<usize>,
+    d_off: usize,
+    r: &mut [f32],
+    w: &mut [f32; 32],
+) -> (f32, f32) {
+    if simd {
+        // SAFETY: `simd` is `flash_simd`'s verdict (ISA and panel shapes); every
+        // dispatch asserts `keys16.width() == d_head`, sizes `qrow` to `d_head`,
+        // and keeps `d_off + r.len() <= latent` with `r.len() % 8 == 0`.
+        unsafe { flash_seg_avx2(qrow, rk, p, keys, ahead, d_off, r, w) }
+    } else {
+        flash_seg_scalar(qrow, rk, p, keys, d_off, r, w)
+    }
 }
 
 /// Scalar twin: `r[d] = fma(V[blk+l][v_off + d], w[l], r[d])` for lanes `l`
@@ -1225,57 +1496,50 @@ pub unsafe fn flash_v_accum_avx2(
     }
 }
 
-/// The per-row body of the flash kernel, scalar transcription — the no-AVX2
-/// fallback and the gates' oracle (see [`flash_attn_latent_scalar`]); the
-/// AVX2 twin below differs ONLY in the two vectorized inner loops.
+/// One segment of one query row, scalar transcription — the no-AVX2 fallback
+/// and the gates' oracle (see [`flash_attn_latent_scalar`]); the AVX2 twin
+/// below differs ONLY in the two vectorized inner loops.
 ///
-/// `qn2` is the row's `q_nope2` column. The scores and the softmax scan always
-/// run over the whole `[q_rope ; q_nope2]` row; `r` holds the latent range
-/// `d_off..d_off + r.len()` and only that range is accumulated and written —
-/// every step on `r` is per element, so a range carries the same bits the
-/// whole latent carries there.
-#[allow(clippy::too_many_arguments)]
-fn flash_row_scalar(
-    q_rope: &Tensor2,
-    qn2: &[f32],
-    keys16: KvRows<'_>,
-    key_slots: &[Slot],
-    q_slots: &[Slot],
+/// `qrow` is the row's `[q_rope ; q_nope2]`. The keys are `keys` (whole
+/// 32-key blocks from a block boundary, the last one possibly short), walked
+/// with the online M/S scan exactly as a whole row was: the scores and the
+/// softmax always run over the whole `d_head` row; `r` holds the latent range
+/// `d_off..d_off + r.len()` and only that range is accumulated. Returns the
+/// segment's `(m, S)`; `r` is left unnormalized for [`combine_segments`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the segment kernel's operands, mirrored by its AVX2 twin"
+)]
+fn flash_seg_scalar(
+    qrow: &[f32],
+    rk: &RowKeys<'_>,
     p: &MlaParams,
-    row: usize,
+    keys: Range<usize>,
     d_off: usize,
-    qrow: &mut [f32],
     r: &mut [f32],
     w: &mut [f32; 32],
-    out: &crate::ops::SharedOut,
-) {
-    let latent = p.latent;
-    let t = row / p.n_head;
-    let h = row % p.n_head;
-    // The FA row: [q_rope ; q_nope2], F32, never rounded.
-    qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
-    qrow[p.rope_dims..].copy_from_slice(qn2);
-
+) -> (f32, f32) {
+    let (keys16, key_slots, q) = (rk.keys16, rk.key_slots, rk.q_slot);
     let mut m = f32::NEG_INFINITY;
     let mut s_sum = 0.0f32;
     r.fill(0.0);
-    for blk in (0..key_slots.len()).step_by(32) {
+    for blk in keys.clone().step_by(FLASH_BLOCK) {
         let mut s = [f32::NEG_INFINITY; 32];
         let mut smax = f32::NEG_INFINITY;
         for (l, sl) in s.iter_mut().enumerate() {
             let u = blk + l;
-            let su = match key_slots.get(u) {
-                Some(su) => su,
-                None => break, // past the cache: padding, weight exactly 0
-            };
-            if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
+            if u >= keys.end {
+                break; // past the segment: weight exactly 0
+            }
+            let su = &key_slots[u];
+            if su.seq != q.seq || su.pos > q.pos {
                 continue; // the -inf half of the causal mask
             }
-            // TWIN: flash_row_avx2 — every edit outside the two marked
+            // TWIN: flash_seg_avx2 — every edit outside the two marked
             // regions must be made in both. (This is the kq dot region; the
             // scalar form is the bit-exact oracle. The AVX2 twin also
-            // prefetches the next KV row inside this region — a cache hint
-            // touches no value, so it has no scalar counterpart.)
+            // prefetches KV rows inside this region — a cache hint touches
+            // no value, so it has no scalar counterpart.)
             let kq = kq_dot_fa4(qrow, keys16.row(u));
             *sl = p.kq_scale * kq;
             smax = smax.max(*sl);
@@ -1313,21 +1577,16 @@ fn flash_row_scalar(
             2 => r.fill(0.0),
             _ => {}
         }
-        // TWIN: flash_row_avx2 — every edit outside the two marked regions
+        // TWIN: flash_seg_avx2 — every edit outside the two marked regions
         // must be made in both. (This is the V accumulation region; the
         // arithmetic lives in the split-out twin pair above.)
         flash_v_accum_scalar(w, keys16, blk, p.rope_dims + d_off, r);
     }
-
-    let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
-    for (d, &v) in r.iter().enumerate() {
-        // SAFETY: cell `row * latent + d_off + d` belongs to this row's latent range alone — see the construction site at the dispatch.
-        unsafe { out.write(row * latent + d_off + d, s_inv * v) };
-    }
+    (m, s_sum)
 }
 
-/// The AVX2+FMA+F16C twin of [`flash_row_scalar`]: same skeleton, same softmax /
-/// `v_expf` / online M/S scan / row split; the two inner loops vectorized:
+/// The AVX2+FMA+F16C twin of [`flash_seg_scalar`]: same skeleton, same softmax /
+/// `v_expf` / online M/S scan / latent range; the two inner loops vectorized:
 ///
 ///   * the kq dot — [`kq_dot_fa4_avx2`]: only the SUM ORDER changes (fa4
 ///     two-partial chain → lane groups); the twins' one numerical difference,
@@ -1339,6 +1598,11 @@ fn flash_row_scalar(
 ///     is nothing: each output element's FMA chain still descends key order
 ///     exactly as the scalar wrote it, so given the same weights this stage
 ///     is bit-identical to the scalar twin.
+///
+/// `ahead` is the KV prefetch distance ([`kv_prefetch_for`]; 0 = none): the
+/// first `ahead` rows of the segment are hinted before the walk and row
+/// `u + ahead` while row `u` is dotted, never past the segment's end — the
+/// rows after it are another segment's.
 ///
 /// `#[target_feature]` is not optional: without it the intrinsics lower to scalar
 /// emulation with no error. The split-out helpers are the kq dot, at the scalar
@@ -1352,75 +1616,69 @@ fn flash_row_scalar(
 /// `latent` a multiple of 8, `keys16.width() == d_head` (asserted at the
 /// dispatch) — the unchecked row loads index through `keys16.row(u)`, whose
 /// checked bounds and fixed stride are the whole guarantee — `qrow` sized
-/// `d_head`, `qn2` sized `latent`, and `r` a latent range: `d_off + r.len()
-/// <= latent`, `r.len()` a multiple of 8.
+/// `d_head`, `keys.end <= keys16.len()`, and `r` a latent range: `d_off +
+/// r.len() <= latent`, `r.len()` a multiple of 8.
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn flash_row_avx2(
-    q_rope: &Tensor2,
-    qn2: &[f32],
-    keys16: KvRows<'_>,
-    key_slots: &[Slot],
-    q_slots: &[Slot],
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the segment kernel's operands, mirrored by its scalar twin"
+)]
+unsafe fn flash_seg_avx2(
+    qrow: &[f32],
+    rk: &RowKeys<'_>,
     p: &MlaParams,
-    row: usize,
+    keys: Range<usize>,
+    ahead: usize,
     d_off: usize,
-    qrow: &mut [f32],
     r: &mut [f32],
     w: &mut [f32; 32],
-    out: &crate::ops::SharedOut,
-) {
+) -> (f32, f32) {
     // SAFETY: the fn contract above — ISA, row width and scratch lengths all
     // come from the dispatch; offsets stay inside those bounds.
     unsafe {
         use std::arch::x86_64::*;
-        let latent = p.latent;
-        let n_tokens = q_slots.len();
-        let t = row / p.n_head;
-        let h = row % p.n_head;
-        // The FA row: [q_rope ; q_nope2], F32, never rounded.
-        qrow[..p.rope_dims].copy_from_slice(q_rope.col(t * p.n_head + h));
-        qrow[p.rope_dims..].copy_from_slice(qn2);
-
+        let (keys16, key_slots, q) = (rk.keys16, rk.key_slots, rk.q_slot);
         let mut m = f32::NEG_INFINITY;
         let mut s_sum = 0.0f32;
         r.fill(0.0);
-        // Decided once per row, not per key: the lever is a process-wide
-        // constant and the kq loop is the hot walk. Feeds only the cache
-        // hint below, so no scalar twin; the observable lets a test assert
-        // which arm this row actually took.
-        let ahead = if n_tokens == 1 { kv_prefetch_rows() } else { 0 };
-        LAST_KV_PREFETCH.store(ahead + 1, std::sync::atomic::Ordering::Relaxed);
-        for blk in (0..key_slots.len()).step_by(32) {
+        // Hint one KV row's lines — a cache hint, never a value.
+        let hint = |u: usize| {
+            let next = keys16.row(u);
+            let base = next.as_ptr().cast::<u8>();
+            let mut off = 0usize;
+            while off < next.len() * 2 {
+                // SAFETY: prefetch reads nothing; `off` stays inside the
+                // row's own `len() * 2` bytes.
+                _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
+                off += 64;
+            }
+        };
+        if ahead != 0 {
+            for u in keys.start..keys.end.min(keys.start + ahead) {
+                hint(u);
+            }
+        }
+        for blk in keys.clone().step_by(FLASH_BLOCK) {
             let mut s = [f32::NEG_INFINITY; 32];
             let mut smax = f32::NEG_INFINITY;
             for (l, sl) in s.iter_mut().enumerate() {
                 let u = blk + l;
-                let su = match key_slots.get(u) {
-                    Some(su) => su,
-                    None => break, // past the cache: padding, weight exactly 0
-                };
-                if su.seq != q_slots[t].seq || su.pos > q_slots[t].pos {
+                if u >= keys.end {
+                    break; // past the segment: weight exactly 0
+                }
+                let su = &key_slots[u];
+                if su.seq != q.seq || su.pos > q.pos {
                     continue; // the -inf half of the causal mask
                 }
-                // TWIN: flash_row_scalar — every edit outside the two marked
+                // TWIN: flash_seg_scalar — every edit outside the two marked
                 // regions must be made in both. (This is the kq dot region;
                 // only the sum order may differ from the scalar oracle.)
                 // Pull the lines of the row `ahead` keys on while this one is
-                // dotted: the kq walk streams each row exactly once. Decode
-                // rows only — on multi-query rows (prefill, a speculative
-                // step) the hint cost time and bought none. A prefetch is a
-                // cache hint, never a value — no scalar twin of this.
-                if ahead != 0 && u + ahead < keys16.len() {
-                    let next = keys16.row(u + ahead);
-                    let base = next.as_ptr().cast::<u8>();
-                    let mut off = 0usize;
-                    while off < next.len() * 2 {
-                        // SAFETY: prefetch reads nothing; `off` stays inside
-                        // the row's own `len() * 2` bytes.
-                        _mm_prefetch::<_MM_HINT_T0>(base.add(off) as *const i8);
-                        off += 64;
-                    }
+                // dotted: the kq walk streams each row exactly once per
+                // segment pass. A prefetch is a cache hint, never a value —
+                // no scalar twin of this.
+                if ahead != 0 && u + ahead < keys.end {
+                    hint(u + ahead);
                 }
                 // SAFETY: plus the fn contract: `keys16.row(u)` is
                 // bounds-checked and its width is `d_head` (asserted at the
@@ -1462,24 +1720,19 @@ unsafe fn flash_row_avx2(
                 2 => r.fill(0.0),
                 _ => {}
             }
-            // TWIN: flash_row_scalar — every edit outside the two marked
+            // TWIN: flash_seg_scalar — every edit outside the two marked
             // regions must be made in both. (This is the V accumulation
             // region; given the same weights it is bit-identical to the
             // scalar form — only the kq region may differ.)
             // SAFETY: the fn contract plus the mask above: every lane left
-            // out of the active list is causally masked or past the cache
-            // end, so `blk + l < keys16.len()` holds for each lane read; the
-            // dispatch asserted `keys16.width() == rope_dims + latent` and
-            // keeps `d_off + r.len() <= latent`, and `r.len() % 8 == 0`
-            // (`flash_simd` gated `latent % 8`, the split `latent % 16`).
+            // out of the active list is causally masked or past the segment
+            // end, so `blk + l < keys.end <= keys16.len()` holds for each lane
+            // read; the dispatch asserted `keys16.width() == rope_dims +
+            // latent` and keeps `d_off + r.len() <= latent`, and `r.len() % 8
+            // == 0` (`flash_simd` gated `latent % 8`, the split `latent % 16`).
             flash_v_accum_avx2(w, keys16, blk, p.rope_dims + d_off, r);
         }
-
-        let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
-        for (d, &v) in r.iter().enumerate() {
-            // SAFETY: cell `row * latent + d_off + d` belongs to this row's latent range alone — see the construction site at the dispatch.
-            out.write(row * latent + d_off + d, s_inv * v);
-        }
+        (m, s_sum)
     }
 }
 
@@ -1647,33 +1900,46 @@ thread_local! {
     static ROW_MARKS: RefCell<Vec<RowMark>> = const { RefCell::new(Vec::new()) };
 }
 
-/// [`attn_heads_fused`] with the per-row split given: `halves` 1 runs each
-/// (token, head) row on one participant, 2 runs it on two, each accumulating
-/// one half of the latent. `pub` so the gate can pin both splits against the
-/// chain at any depth in one process.
+/// [`attn_heads_fused`] with the multi-query row split given. `pub` so the
+/// gate can pin every shape against the chain at any depth in one process.
+///
+/// Two dispatch shapes, one set of bits:
+///
+///   * **one query** (a decode step) — split-K, three dispatches: (1)
+///     `q_nope2` over (head, latent half) items; (2) the flash segments over
+///     (segment, head) items, each leaving its partial `(m, S, R)`; (3) the
+///     merge over (head, latent half) items, the row's last arrival running
+///     `wv_b`. `halves` does not apply: stages 1 and 3 always split the latent
+///     in two (when it halves into 8-value runs) and stage 2 splits the keys.
+///   * **several queries** (prefill, a batch) — one dispatch over the (token,
+///     head) rows, each split into `halves` latent ranges: 1 runs each row on
+///     one participant, 2 on two, each accumulating one half of the latent.
+///     Each row walks its segments serially ([`flash_row`]).
 ///
 /// Bit identity with the chain `q_nope2_absorbed` → `flash_attn_latent` →
 /// `wv_b_heads_with` (`hw_attn_heads_fused_bit_identical`,
 /// `hw_attn_heads_split_bit_identical`): every `quantize_act`,
-/// `q_nope2_cells`, flash-row and `quantize_col`/`dot_row` call receives
-/// exactly the bytes it receives in the chain, so only WHICH thread makes
-/// each call changes:
+/// `q_nope2_cells`, flash-segment, merge and `quantize_col`/`dot_row` call
+/// receives exactly the bytes it receives in the chain, so only WHICH thread
+/// makes each call changes:
 ///
-///   * (a) both participants of a row quantize the same `q_nope` slice and
-///     run the same whole-column `q_nope2_cells`, so both hold the same
-///     column; participant 0 alone publishes it;
-///   * (b) both walk every key with the same `[q_rope ; q_nope2]` row, the
-///     same kq dot and the same softmax scan, so the per-key weights, `M`,
-///     `S` and the rescales are the same bits in both; each accumulates only
-///     its latent range, and every step on the accumulator (fill, rescale,
-///     the per-element FMA chain in key order, `s_inv·v`) is per element;
+///   * (a) every `q_nope2` cell is computed from its own weight blocks and the
+///     column's quantized blocks, whatever range the call covers;
+///   * (b) a segment's scan is a function of the FA row, its key range and
+///     the latent range it accumulates — the chain runs the same segments of
+///     the same plan ([`flash_segment`] over [`visible_end`]); every step on
+///     the accumulator (fill, rescale, the per-element FMA chain in key
+///     order, the merge, `s_inv·v`) is per element;
 ///   * (c) the row's last participant to finish runs `wv_b` on the whole
 ///     `kqv_compressed` row — the gathered input the chain's batch copies.
 ///
 /// The two index conventions are the chain's own: `q_nope2` columns are
 /// head-major (`h·ne1 + t`), `kqv_compressed` rows and `kqv_2d` head spans
 /// are token-major (`t·n_head + h`).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fused chain's inputs plus the multi-query split"
+)]
 pub fn attn_heads_split(
     gguf: &Gguf,
     wblocks: &[Q8Block],
@@ -1690,7 +1956,8 @@ pub fn attn_heads_split(
     // walks three differently-shaped weight reads (derived Q8_0 blocks, F16
     // KV rows, Q3_K v_up views), and no single rows/k/weight-bytes triple
     // would be honest for all three. The wall is the statement; the span
-    // columns carry the dispatch wall and its busiest chunk (chunk skew).
+    // columns carry the dispatch walls and their busiest chunks, summed over
+    // the call's dispatches (chunk skew).
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let nblocks = p.nope / 32;
@@ -1730,18 +1997,134 @@ pub fn attn_heads_split(
         p.latent
     );
 
-    let mut q_nope2 = Tensor2::scratch(p.latent, p.n_head * ne1);
-    let mut kqv_compressed = Tensor2::scratch(p.latent, ne1 * p.n_head);
-    let mut kqv_2d = Tensor2::scratch(p.n_head * p.v_head, ne1);
-    // The row twin is decided once per call, exactly as `flash_attn_latent` does.
-    let simd = flash_simd(p);
-    let rows_n = ne1 * p.n_head;
-    let d_len = p.latent / halves;
+    let mut out = HeadsOut {
+        q_nope2: Tensor2::scratch(p.latent, p.n_head * ne1),
+        kqv_compressed: Tensor2::scratch(p.latent, ne1 * p.n_head),
+        kqv_2d: Tensor2::scratch(p.n_head * p.v_head, ne1),
+    };
+    let io = HeadsIo {
+        gguf,
+        wblocks,
+        q,
+        q_rope,
+        keys16,
+        key_slots,
+        q_slots,
+        views,
+        p,
+        // The row twin is decided once per call, exactly as `flash_attn_latent` does.
+        simd: flash_simd(p),
+    };
+    let mut acc = profile::CallAcc::new();
+    // A decode row splits its keys across the pool only once it has more
+    // than `SPLITK_MIN_BLOCKS` blocks: below that the two extra dispatches
+    // cost more than the split buys, and the one-dispatch shape runs the
+    // same plan and the same merge, so the bits are the same either way.
+    let split =
+        ne1 == 1 && visible_end(key_slots, &q_slots[0]).div_ceil(FLASH_BLOCK) > SPLITK_MIN_BLOCKS;
+    let res = if split {
+        heads_split_k(&io, &mut out, &mut acc)
+    } else {
+        heads_per_row(&io, &mut out, halves, &mut acc)
+    };
+    res?;
+    if let Some(t_call) = t_call {
+        profile::record(
+            "attn_heads",
+            gguf::GgmlType::Unknown(0),
+            0,
+            0,
+            0,
+            t_call.elapsed().as_nanos() as u64,
+            &acc,
+        );
+    }
+    Ok((out.q_nope2, out.kqv_compressed, out.kqv_2d))
+}
 
-    // Arrival counters, one per row, zeroed before the dispatch publishes
-    // them; a whole row (halves 1) needs none.
+/// The inputs every attention-heads dispatch reads.
+struct HeadsIo<'a> {
+    gguf: &'a Gguf,
+    wblocks: &'a [Q8Block],
+    q: &'a Tensor2,
+    q_rope: &'a Tensor2,
+    keys16: KvRows<'a>,
+    key_slots: &'a [Slot],
+    q_slots: &'a [Slot],
+    views: &'a [TensorInfo],
+    p: &'a MlaParams,
+    simd: bool,
+}
+
+/// The three tensors the chain produces.
+struct HeadsOut {
+    q_nope2: Tensor2,
+    kqv_compressed: Tensor2,
+    kqv_2d: Tensor2,
+}
+
+/// A profiled dispatch's wall and busiest chunk, folded into `acc`: `f` runs
+/// on the pool over `0..n`; only a profiled call pays for the collector.
+fn timed_dispatch<F>(acc: &mut profile::CallAcc, n: usize, f: F)
+where
+    F: Fn(std::ops::Range<usize>) + Sync,
+{
+    if profile::level() == 0 {
+        threads::pool().for_each_chunk(n, f);
+        return;
+    }
+    let busy = profile::ChunkSlots::<u64>::new();
+    let t_span = Instant::now();
+    threads::pool().for_each_chunk(n, |items| {
+        let t_busy = Instant::now();
+        f(items);
+        busy.push(t_busy.elapsed().as_nanos() as u64);
+    });
+    let span_ns = t_span.elapsed().as_nanos() as u64;
+    acc.add_span(span_ns, busy.into_vec().into_iter().max().unwrap_or(0));
+}
+
+/// Quantize head `h`'s `q_nope` slice of token `t` into `qcol` — the same
+/// `quantize_act` blocks the chain quantizes on its caller thread.
+fn quantize_q_nope(q: &Tensor2, p: &MlaParams, t: usize, h: usize, qcol: &mut [ActBlock]) {
+    let qbase = t * q.ne0 + h * p.kq_head;
+    let qnope = &q.data[qbase..qbase + p.nope];
+    for (b, chk) in qnope.as_chunks::<32>().0.iter().enumerate() {
+        qcol[b] = quantize_act(chk);
+    }
+}
+
+/// A worker's `quantize_act` column and `q_nope2` cell buffer, taken from the
+/// thread-locals for one chunk (every element rewritten before it is read).
+fn take_qn2_scratch(nblocks: usize, latent: usize) -> (Vec<ActBlock>, Vec<f32>) {
+    let mut qcol = QALL.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let mut cellbuf = CELL_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if qcol.len() < nblocks {
+        qcol.resize(
+            nblocks,
+            ActBlock {
+                d: 0.0,
+                q: [0i8; 32],
+            },
+        );
+    }
+    if cellbuf.len() < latent {
+        cellbuf.resize(latent, 0.0);
+    }
+    (qcol, cellbuf)
+}
+
+fn give_qn2_scratch(qcol: Vec<ActBlock>, cellbuf: Vec<f32>) {
+    QALL.with(|c| *c.borrow_mut() = qcol);
+    CELL_BUF.with(|c| *c.borrow_mut() = cellbuf);
+}
+
+/// The arrival counters for the `wv_b` handoff, one per row, zeroed before
+/// the dispatch publishes them — only when a row has more than one
+/// participant; a whole row needs none.
+fn take_row_marks(rows_n: usize, parts: usize) -> Vec<RowMark> {
     let mut marks = ROW_MARKS.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    if halves > 1 {
+    if parts > 1 {
         if marks.len() < rows_n {
             marks.resize_with(rows_n, || RowMark(std::sync::atomic::AtomicU32::new(0)));
         }
@@ -1749,12 +2132,71 @@ pub fn attn_heads_split(
             m.0.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    marks
+}
+
+/// Whether this arrival is row `row`'s last of `parts`: of two arrivals the
+/// one that sees 1 is the last; the AcqRel count makes the partner's range
+/// visible before the caller reads it.
+fn last_arrival(marks: &[RowMark], row: usize, parts: usize) -> bool {
+    parts == 1
+        || marks[row]
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+}
+
+/// Head `h`'s `wv_b` leg for token `t`: the same one-column `matmul_q` bytes
+/// the chain's batch computes — its gathered input is a copy of this exact
+/// `kqv_compressed` row, and a copy quantizes to the same bytes.
+///
+/// # Safety
+/// `kv2` points at `kqv_2d`, the span `t·ne0 + h·v_head .. +v_head` is this
+/// row's own and no other thread touches it during the call.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the leg's inputs and its output cell span"
+)]
+unsafe fn wv_b_leg(
+    io: &HeadsIo<'_>,
+    kqv_row: &[f32],
+    kv2: &crate::ops::SharedOut,
+    kv2_ne0: usize,
+    t: usize,
+    h: usize,
+) -> Result<(), ModelError> {
+    let v_head = io.p.v_head;
+    // SAFETY: the fn contract — this row's own span of `kqv_2d` column `t`.
+    let out_col =
+        unsafe { std::slice::from_raw_parts_mut(kv2.0.add(t * kv2_ne0 + h * v_head), v_head) };
+    crate::ops::matvec_q_local(io.gguf, &io.views[h], kqv_row, out_col)
+}
+
+/// The multi-query shape: one dispatch over (latent range, row) items, each
+/// running (a) its column's `q_nope2`, (b) the row's segments serially and
+/// their merge over its latent range, (c) `wv_b` if it is the row's last
+/// arrival.
+fn heads_per_row(
+    io: &HeadsIo<'_>,
+    out: &mut HeadsOut,
+    halves: usize,
+    acc: &mut profile::CallAcc,
+) -> Result<(), ModelError> {
+    let p = io.p;
+    let ne1 = io.q_slots.len();
+    let nblocks = p.nope / 32;
+    let span = p.latent * nblocks;
+    let latent = p.latent;
+    let d_head = p.rope_dims + latent;
+    let rows_n = ne1 * p.n_head;
+    let d_len = latent / halves;
+    let ahead = kv_prefetch_for(ne1, io.simd);
+    let n_seg = flash_segments();
+    let marks = take_row_marks(rows_n, halves);
     let marks_ref = &marks[..];
 
     // Item `i` is row `i % rows_n`, latent range `i / rows_n` — the two
-    // ranges of a row sit `rows_n` items apart, which on a decode step puts
-    // them on chunks `c` and `c + n_head`, pinned to the same CCD, where the
-    // row's weights and key rows can be shared through its L3.
+    // ranges of a row sit `rows_n` items apart.
     //
     // Item (half, row) writes only: `q_nope2` column `h·ne1 + t` (half 0
     // alone), `kqv_compressed` cells `row·latent + half·d_len ..+d_len`, and —
@@ -1768,170 +2210,265 @@ pub fn attn_heads_split(
     // the last), and the join publishes every write before any tensor is
     // read. The stage-(c) read goes through a shared reference into cells
     // both writers finished before the counter handed the row over.
-    let qn2_ptr = crate::ops::SharedOut(q_nope2.data.as_mut_ptr());
-    let kc_ptr = crate::ops::SharedOut(kqv_compressed.data.as_mut_ptr());
-    let kv2_ptr = crate::ops::SharedOut(kqv_2d.data.as_mut_ptr());
-    // The matvec wants a real `&mut` span, so this one's base is dereferenced
-    // in the closure (`kv2.0.add(..)`) — through this `&SharedOut` local, so
-    // the closure captures the wrapper (Sync) and not the raw-pointer field
-    // (not Sync); the method calls below get that for free from `&self`.
+    let qn2_ptr = crate::ops::SharedOut(out.q_nope2.data.as_mut_ptr());
+    let kc_ptr = crate::ops::SharedOut(out.kqv_compressed.data.as_mut_ptr());
+    let kv2_ptr = crate::ops::SharedOut(out.kqv_2d.data.as_mut_ptr());
     let kv2 = &kv2_ptr;
+    let kv2_ne0 = out.kqv_2d.ne0;
+    let kqv_compressed = &out.kqv_compressed;
     // The matvec is the one fallible stage; lowest-row-first precedence, the
     // `run_row_pool` error-channel pattern.
     let gate = crate::ops::ErrGate::new();
-    let latent = p.latent;
-    let v_head = p.v_head;
-    let kv2_ne0 = kqv_2d.ne0;
-    // Only a profiled dispatch pays for the chunk collector.
-    let busy = if lvl > 0 {
-        Some(profile::ChunkSlots::<u64>::new())
-    } else {
-        None
-    };
-    let t_span = if lvl > 0 { Some(Instant::now()) } else { None };
-    threads::pool().for_each_chunk(halves * rows_n, |items| {
-        let t_busy = if lvl > 0 { Some(Instant::now()) } else { None };
-        // Per-worker scratch, recycled across dispatches: the four
-        // thread-locals the three stages use separately, taken once per
-        // chunk and returned even when a row error breaks the loop early.
-        // Every element is rewritten before it is read.
-        let mut qcol = QALL.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut cellbuf = CELL_BUF.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut qrow_buf = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        if qcol.len() < nblocks {
-            qcol.resize(
-                nblocks,
-                ActBlock {
-                    d: 0.0,
-                    q: [0i8; 32],
-                },
-            );
-        }
-        if cellbuf.len() < latent {
-            cellbuf.resize(latent, 0.0);
-        }
-        if qrow_buf.len() < d_head {
-            qrow_buf.resize(d_head, 0.0);
-        }
-        if r_buf.len() < latent {
-            r_buf.resize(latent, 0.0);
-        }
-        let qrow = &mut qrow_buf[..d_head];
-        let r = &mut r_buf[..d_len];
-        let seg = &mut cellbuf[..latent];
-        let mut w = [0.0f32; 32];
+    timed_dispatch(acc, halves * rows_n, |items| {
+        let (mut qcol, mut cellbuf) = take_qn2_scratch(nblocks, latent);
+        let mut sc = RowScratch::take(d_head, latent, d_len, n_seg);
+        let mut vis = (usize::MAX, 0usize);
         for item in items {
             let half = item / rows_n;
             let row = item % rows_n;
             let t = row / p.n_head;
             let h = row % p.n_head;
-            // (a) `q_nope2` column `h·ne1 + t`: the same `quantize_act`
-            // blocks the chain quantizes on the caller, quantized by this
-            // item's worker; `q_nope2_cells` computes each cell from its own
-            // weight blocks and the column's blocks, so the whole-column
-            // call and the chain's segmented pool call agree bit for bit.
-            let qbase = t * q.ne0 + h * p.kq_head;
-            let qnope = &q.data[qbase..qbase + p.nope];
-            for (b, chk) in qnope.as_chunks::<32>().0.iter().enumerate() {
-                qcol[b] = quantize_act(chk);
-            }
-            let whead = &wblocks[h * span..(h + 1) * span];
-            qdot::q_nope2_cells(whead, &qcol[..nblocks], 0, latent, seg);
+            // (a) `q_nope2` column `h·ne1 + t`, the whole column.
+            quantize_q_nope(io.q, p, t, h, &mut qcol);
+            let seg = &mut cellbuf[..latent];
+            qdot::q_nope2_cells(
+                &io.wblocks[h * span..(h + 1) * span],
+                &qcol[..nblocks],
+                0,
+                latent,
+                seg,
+            );
             if half == 0 {
                 for (j, &v) in seg.iter().enumerate() {
                     // SAFETY: cell `(h·ne1 + t)·latent + j` is this row's own, written by its half 0 alone — see the construction site.
                     unsafe { qn2_ptr.write((h * ne1 + t) * latent + j, v) };
                 }
             }
-            // (b) the flash row over this item's latent range, fed the
-            // column (a) left in this worker's own `seg`.
-            if simd {
-                // SAFETY: `flash_simd` checked ISA and panel shapes; the row-width assert above, the range split assert and the scratch sizing complete the contract.
-                unsafe {
-                    flash_row_avx2(
-                        q_rope,
-                        seg,
-                        keys16,
-                        key_slots,
-                        q_slots,
-                        p,
-                        row,
-                        half * d_len,
-                        qrow,
-                        r,
-                        &mut w,
-                        &kc_ptr,
-                    )
-                };
-            } else {
-                flash_row_scalar(
-                    q_rope,
-                    seg,
-                    keys16,
-                    key_slots,
-                    q_slots,
-                    p,
-                    row,
-                    half * d_len,
-                    qrow,
-                    r,
-                    &mut w,
-                    &kc_ptr,
-                );
+            // (b) the row's segments and their merge over this item's latent
+            // range, fed the column (a) left in `seg`.
+            if vis.0 != t {
+                vis = (t, visible_end(io.key_slots, &io.q_slots[t]));
             }
-            // (c) head h's `wv_b` leg, run by the row's last arrival: the
-            // same one-column `matmul_q` bytes the chain's batch computes —
-            // its gathered input is a copy of this exact column, and a copy
-            // quantizes to the same bytes. The AcqRel count makes the
-            // partner's range visible before the read; of two arrivals the
-            // one that sees 1 is the last.
-            let last = halves == 1
-                || marks_ref[row]
-                    .0
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                    == 1;
-            if !last {
+            let rk = RowKeys {
+                keys16: io.keys16,
+                key_slots: io.key_slots,
+                q_slot: &io.q_slots[t],
+                n_vis: vis.1,
+            };
+            flash_row(
+                io.simd,
+                ahead,
+                io.q_rope.col(t * p.n_head + h),
+                seg,
+                &rk,
+                p,
+                n_seg,
+                half * d_len,
+                &mut sc,
+                row * latent,
+                &kc_ptr,
+            );
+            // (c) head h's `wv_b` leg, run by the row's last arrival.
+            if !last_arrival(marks_ref, row, halves) {
                 continue;
             }
-            // SAFETY: `t·kv2_ne0 + h·v_head .. +v_head` is this row's own span of `kqv_2d` column `t`, written by its last arrival alone — see the construction site.
-            let out_col = unsafe {
-                std::slice::from_raw_parts_mut(kv2.0.add(t * kv2_ne0 + h * v_head), v_head)
-            };
-            if let Err(e) =
-                crate::ops::matvec_q_local(gguf, &views[h], kqv_compressed.col(row), out_col)
-            {
+            // SAFETY: the row's own span, written by its last arrival alone — see the construction site.
+            if let Err(e) = unsafe { wv_b_leg(io, kqv_compressed.col(row), kv2, kv2_ne0, t, h) } {
                 gate.offer(row, e);
                 break;
             }
         }
-        QALL.with(|c| *c.borrow_mut() = qcol);
-        CELL_BUF.with(|c| *c.borrow_mut() = cellbuf);
-        FLASH_QROW.with(|c| *c.borrow_mut() = qrow_buf);
-        FLASH_R.with(|c| *c.borrow_mut() = r_buf);
-        if let (Some(t_busy), Some(busy)) = (t_busy, &busy) {
-            busy.push(t_busy.elapsed().as_nanos() as u64);
-        }
+        give_qn2_scratch(qcol, cellbuf);
+        sc.give_back();
     });
-    let span_ns = t_span.map(|t| t.elapsed().as_nanos() as u64);
     ROW_MARKS.with(|c| *c.borrow_mut() = marks);
-    if let Some(e) = gate.take() {
-        return Err(e);
+    match gate.take() {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    if let Some(t_call) = t_call {
-        let mut acc = profile::CallAcc::new();
-        if let (Some(span_ns), Some(busy)) = (span_ns, busy) {
-            acc.add_span(span_ns, busy.into_vec().into_iter().max().unwrap_or(0));
+}
+
+thread_local! {
+    /// The dispatching thread's recycled split-K partials: per (row, segment)
+    /// one latent-wide `R`, and its `m` and `S`. Only ever grown; every cell
+    /// the merge reads was written by the segment dispatch of the same call.
+    static SPLITK_R: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static SPLITK_M: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static SPLITK_S: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The one-query shape: split-K in three dispatches (see [`attn_heads_split`]).
+///
+/// Stage 2's items are (segment, head) pairs, segment-major, and a chunk
+/// takes the items whose first block falls in it by cumulative block weight:
+/// a segment of 5 blocks weighs 5, so the busiest thread holds about the mean
+/// work plus one item whatever the segment sizes are. Which thread runs an
+/// item moves no bit — each item is a whole segment of one row.
+fn heads_split_k(
+    io: &HeadsIo<'_>,
+    out: &mut HeadsOut,
+    acc: &mut profile::CallAcc,
+) -> Result<(), ModelError> {
+    let p = io.p;
+    let nblocks = p.nope / 32;
+    let span = p.latent * nblocks;
+    let latent = p.latent;
+    let d_head = p.rope_dims + latent;
+    let rows_n = p.n_head;
+    // Stages 1 and 3 split each head's latent in two when the halves are
+    // 8-value runs (the AVX2 V twin's contract).
+    let parts = if latent.is_multiple_of(16) { 2 } else { 1 };
+    let d_len = latent / parts;
+    let ahead = kv_prefetch_for(1, io.simd);
+    let n_seg = flash_segments();
+    let n_vis = visible_end(io.key_slots, &io.q_slots[0]);
+    let used = flash_segments_used(n_vis, n_seg);
+    let n_blocks = n_vis.div_ceil(FLASH_BLOCK);
+
+    // Stage 1 — `q_nope2` over (latent part, head) items. Item `i` writes
+    // only head `i % rows_n`'s column cells of part `i / rows_n`.
+    //
+    // SAFETY (construction site, all three stages): the pool chunks partition
+    // each stage's item space and every item writes only its own cells —
+    // stage 1 its `q_nope2` cells, stage 2 its (row, segment) partial `R`,
+    // `m` and `S`, stage 3 its `kqv_compressed` range and (last arrival) its
+    // `kqv_2d` span; each join publishes the writes before the next stage
+    // reads them.
+    let qn2_ptr = crate::ops::SharedOut(out.q_nope2.data.as_mut_ptr());
+    timed_dispatch(acc, parts * rows_n, |items| {
+        let (mut qcol, mut cellbuf) = take_qn2_scratch(nblocks, latent);
+        for item in items {
+            let part = item / rows_n;
+            let h = item % rows_n;
+            quantize_q_nope(io.q, p, 0, h, &mut qcol);
+            let (j0, j1) = (part * d_len, (part + 1) * d_len);
+            let seg = &mut cellbuf[..d_len];
+            qdot::q_nope2_cells(
+                &io.wblocks[h * span..(h + 1) * span],
+                &qcol[..nblocks],
+                j0,
+                j1,
+                seg,
+            );
+            for (jj, &v) in seg.iter().enumerate() {
+                // SAFETY: cell `h·latent + j0 + jj` is this item's own — see the construction site.
+                unsafe { qn2_ptr.write(h * latent + j0 + jj, v) };
+            }
         }
-        profile::record(
-            "attn_heads",
-            gguf::GgmlType::Unknown(0),
-            0,
-            0,
-            0,
-            t_call.elapsed().as_nanos() as u64,
-            &acc,
-        );
+        give_qn2_scratch(qcol, cellbuf);
+    });
+
+    // Stage 2 — the segments, over block-weighted (segment, head) items.
+    let mut pr = SPLITK_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let mut pm = SPLITK_M.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let mut ps = SPLITK_S.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if pr.len() < rows_n * n_seg * latent {
+        pr.resize(rows_n * n_seg * latent, 0.0);
     }
-    Ok((q_nope2, kqv_compressed, kqv_2d))
+    if pm.len() < rows_n * n_seg {
+        pm.resize(rows_n * n_seg, 0.0);
+        ps.resize(rows_n * n_seg, 0.0);
+    }
+    {
+        let pr_ptr = crate::ops::SharedOut(pr.as_mut_ptr());
+        let pr_out = &pr_ptr;
+        let pm_ptr = crate::ops::SharedOut(pm.as_mut_ptr());
+        let ps_ptr = crate::ops::SharedOut(ps.as_mut_ptr());
+        let q_nope2 = &out.q_nope2;
+        let rk = RowKeys {
+            keys16: io.keys16,
+            key_slots: io.key_slots,
+            q_slot: &io.q_slots[0],
+            n_vis,
+        };
+        timed_dispatch(acc, n_blocks * rows_n, |units| {
+            let mut qrow = FLASH_QROW.with(|c| std::mem::take(&mut *c.borrow_mut()));
+            if qrow.len() < d_head {
+                qrow.resize(d_head, 0.0);
+            }
+            let qrow = &mut qrow;
+            let mut w = [0.0f32; 32];
+            for s in 0..used {
+                let keys = flash_segment(n_vis, n_seg, s);
+                let b0 = keys.start / FLASH_BLOCK;
+                let bs = keys.len().div_ceil(FLASH_BLOCK);
+                // Item (s, h) starts at unit `b0·rows_n + h·bs`; this chunk
+                // runs the items that start inside it.
+                let base = b0 * rows_n;
+                let first = |u: usize| u.saturating_sub(base).div_ceil(bs).min(rows_n);
+                for h in first(units.start)..first(units.end) {
+                    let qr = &mut qrow[..d_head];
+                    fill_qrow(qr, io.q_rope.col(h), q_nope2.col(h));
+                    let cell = h * n_seg + s;
+                    // SAFETY: partial `R` of (h, s) is this item's own `latent`
+                    // cells — see the construction site.
+                    let r = unsafe {
+                        std::slice::from_raw_parts_mut(pr_out.0.add(cell * latent), latent)
+                    };
+                    let (m, s_sum) =
+                        flash_segment_row(io.simd, ahead, qr, &rk, p, keys.clone(), 0, r, &mut w);
+                    // SAFETY: `m`/`S` of (h, s) are this item's own cells.
+                    unsafe {
+                        pm_ptr.write(cell, m);
+                        ps_ptr.write(cell, s_sum);
+                    }
+                }
+            }
+            FLASH_QROW.with(|c| *c.borrow_mut() = std::mem::take(qrow));
+        });
+    }
+
+    // Stage 3 — the merge over (latent part, head) items, then `wv_b` by the
+    // head's last arrival.
+    let marks = take_row_marks(rows_n, parts);
+    let marks_ref = &marks[..];
+    let kc_ptr = crate::ops::SharedOut(out.kqv_compressed.data.as_mut_ptr());
+    let kv2_ptr = crate::ops::SharedOut(out.kqv_2d.data.as_mut_ptr());
+    let kv2 = &kv2_ptr;
+    let kv2_ne0 = out.kqv_2d.ne0;
+    let kqv_compressed = &out.kqv_compressed;
+    let (pr_ref, pm_ref, ps_ref) = (&pr[..], &pm[..], &ps[..]);
+    let gate = crate::ops::ErrGate::new();
+    timed_dispatch(acc, parts * rows_n, |items| {
+        let mut r_buf = FLASH_R.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if r_buf.len() < d_len {
+            r_buf.resize(d_len, 0.0);
+        }
+        for item in items {
+            let part = item / rows_n;
+            let h = item % rows_n;
+            let cells = h * n_seg..h * n_seg + used;
+            let r = &mut r_buf[..d_len];
+            let s_tot = combine_segments(
+                &pm_ref[cells.clone()],
+                &ps_ref[cells],
+                &pr_ref[h * n_seg * latent..],
+                latent,
+                part * d_len,
+                r,
+            );
+            let s_inv = if s_tot > 0.0 { 1.0 / s_tot } else { 0.0 };
+            for (d, &v) in r.iter().enumerate() {
+                // SAFETY: cell `h·latent + part·d_len + d` is this item's own — see the construction site.
+                unsafe { kc_ptr.write(h * latent + part * d_len + d, s_inv * v) };
+            }
+            if !last_arrival(marks_ref, h, parts) {
+                continue;
+            }
+            // SAFETY: head h's own span, written by its last arrival alone — see the construction site.
+            if let Err(e) = unsafe { wv_b_leg(io, kqv_compressed.col(h), kv2, kv2_ne0, 0, h) } {
+                gate.offer(h, e);
+                break;
+            }
+        }
+        FLASH_R.with(|c| *c.borrow_mut() = r_buf);
+    });
+    ROW_MARKS.with(|c| *c.borrow_mut() = marks);
+    SPLITK_R.with(|c| *c.borrow_mut() = pr);
+    SPLITK_M.with(|c| *c.borrow_mut() = pm);
+    SPLITK_S.with(|c| *c.borrow_mut() = ps);
+    match gate.take() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }

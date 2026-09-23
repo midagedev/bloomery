@@ -359,11 +359,15 @@ Runtime levers: `BLOOMERY_THREADS`, `BLOOMERY_SPIN` (threads), `BLOOMERY_STEAL_B
 `BLOOMERY_PROFILE` (model::profile; `BLOOMERY_PROFILE_DEPTH=d` makes
 `profile-measure.sh` prefill depth-decode's prompt of depth d first),
 `BLOOMERY_FLASH_SIMD=0` (attn, scalar rollback), `BLOOMERY_KV_PREFETCH_ROWS=d` (attn: how many
-key rows ahead a decode row prefetches, default 16; `BLOOMERY_KV_PREFETCH=0` turns the hint off), `BLOOMERY_ATTN_HALVES=2` (attn:
-each (token, head) row of the fused CPU dispatch runs on two threads, each
-accumulating half the latent — bit-identical, gated, and slower at every
-depth: both threads still stream every whole key row for the scores, so the
-default is 1), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
+key rows ahead a decode row prefetches, default 16; `BLOOMERY_KV_PREFETCH=0` turns the hint off), `BLOOMERY_FLASH_SEGMENTS=n` (attn: the fixed
+segment count a decode row's keys are cut into for split-K, 1–32, default 32;
+the plan depends on the visible key count alone, so any thread count writes
+the same bits; 1 is the single-pass online softmax the split is banded
+against), `BLOOMERY_ATTN_HALVES=2` (attn: on a multi-query row (prefill) each
+(token, head) row of the fused CPU dispatch runs on two threads, each
+accumulating half the latent — bit-identical, gated, and slower: both threads
+still stream every whole key row for the scores, so the default is 1; a
+decode row takes the split-K path and ignores it), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
 segment, a multiple of 32; an unusable value panics instead of falling back),
 `BLOOMERY_FLASH_MMA=0` (gpu flash: the scalar segment pass instead of the
 tensor-core default; `just gate-gpu-e2e` runs both, and the timing binary
