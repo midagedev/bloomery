@@ -12,13 +12,12 @@
 //!   q5_K down (layers 0 and 1) is the host tier's in every plan;
 //! - `shared`: `ds41_shexp_gate_up` for `ffn_up_gate` and `q8_0_gemv` for
 //!   `ffn_shexp`, every layer;
-//! - `combine`: `ds41_moe_combine` for `ffn_moe_out` and `ffn_out`, every
-//!   layer.
+//!
+//! PIN(2026-09-24): removed — the `combine` site and the combine launch of the layer graph pinned `ds41_moe_combine`, which the engine never runs (its combine is `ds41_ffn_post`'s, pinned by the MoE chain gate against `ffn_out`); the kernel is gone.
 //!
 //! Every kernel reads its node's own input from the dump: `ffn_norm`, the
-//! dump's expert ids, `ffn_moe_gate_par` for the routed down, `ffn_up_gate`
-//! for the shared down, `ffn_moe_down` and the dump's weights for the
-//! combine. The routed and shared lines count where the clamp bites on the
+//! dump's expert ids, `ffn_moe_gate_par` for the routed down and
+//! `ffn_up_gate` for the shared down. The routed and shared lines count where the clamp bites on the
 //! op path's dots (`clamp_hits`: `silu(g) > L` / `u > L` / `u < -L`); where
 //! it does, the dump checks the clamp as well.
 //!
@@ -26,18 +25,17 @@
 //! 1. **kernel vs the host transcription of our rule** — bit-identical where
 //!    the host runs the rule itself: the SwiGLU on the op-path kernels' dots
 //!    (`q3k_gemv_sel`, `q8_0_gemv`: the same bodies and warp tree), the
-//!    selection and the weights from the kernel's own scores, the combine;
+//!    selection and the weights from the kernel's own scores;
 //!    each dot within `KERNEL_BAND` of its f64 value; the router's logits
 //!    bit-identical to `f32_gemv`'s; the scores within the distance of the
 //!    device's `expf`/`logf` from the host's (`softplus_err`); every kernel
 //!    rerun bit-identical.
 //! 2. **ik's rule on the host vs the dump** — the semantics: the scores from
 //!    the dump's logits with the host's libm (ik's own), the bias, the
-//!    selection, the f64 sum, the division and the scale, the combine and
-//!    the final add, all bit for bit; each dot within ik's own accumulation
-//!    bound around its f64 value.
+//!    selection, the f64 sum, the division and the scale, all bit for bit;
+//!    each dot within ik's own accumulation bound around its f64 value.
 //! 3. **kernel vs the dump**, per value, in the band the two rules' difference
-//!    gives: the ids exact, the combine bit-identical.
+//!    gives: the ids exact.
 //!
 //! The bands. Each output row of a dot is computed here in f64 twice, from
 //! the dump's input: with our rule's activations (q8_1 per 128 values for
@@ -61,7 +59,7 @@
 //! statement; the clamp crossed on `silu(g)`, on `u > L` and on `u < -L`,
 //! and `L = 0` (no clamp), routed and shared, against the host and against
 //! the clamp's statement in f64 (`stated_ratio`); an out-of-range expert id;
-//! one layer's eight launches captured as a graph and replayed.
+//! one layer's seven launches captured as a graph and replayed.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -646,21 +644,6 @@ mod gate {
         out
     }
 
-    /// The combine, our rule and ik's: slot 0's product, then fused
-    /// multiply-adds in slot order, then `+ shexp`.
-    fn combine_host(down: &[f32], w: &[f32], shexp: &[f32]) -> Vec<f32> {
-        let rows = shexp.len();
-        (0..rows)
-            .map(|d| {
-                let mut acc = down[d] * w[0];
-                for (j, &wj) in w.iter().enumerate().take(N_USED).skip(1) {
-                    acc = down[j * rows + d].mul_add(wj, acc);
-                }
-                acc + shexp[d]
-            })
-            .collect()
-    }
-
     /// Device scratch, allocated once.
     struct Dev {
         x: DeviceBuffer<f32>,
@@ -678,12 +661,6 @@ mod gate {
         sh: DeviceBuffer<f32>,
         shin: DeviceBuffer<f32>,
         sy: DeviceBuffer<f32>,
-        cd: DeviceBuffer<f32>,
-        cw: DeviceBuffer<f32>,
-        cs: DeviceBuffer<f32>,
-        negz: DeviceBuffer<f32>,
-        y0: DeviceBuffer<f32>,
-        y1: DeviceBuffer<f32>,
     }
 
     impl Dev {
@@ -705,12 +682,6 @@ mod gate {
                 sh: z(m.n_ff)?,
                 shin: z(m.n_ff)?,
                 sy: z(m.n_embd)?,
-                cd: z(N_USED * m.n_embd)?,
-                cw: z(N_USED)?,
-                cs: z(m.n_embd)?,
-                negz: DeviceBuffer::from_host(stream, &vec![-0.0f32; m.n_embd])?,
-                y0: z(m.n_embd)?,
-                y1: z(m.n_embd)?,
             })
         }
     }
@@ -866,7 +837,6 @@ mod gate {
             for set in &sets {
                 tally.add(router_site(&cx, &ly, set, &mut dv)?);
                 tally.add(shared_site(&cx, &ly, set, &mut dv)?);
-                tally.add(combine_site(&cx, set, l, &mut dv)?);
             }
             if ly.down_ty == GgmlType::Q4_K {
                 let (pass, extra) = routed_layer(&cx, &ly, &sets, &mut dv, first_routed)?;
@@ -1219,69 +1189,6 @@ mod gate {
             hits[0],
             hits[1],
             hits[2],
-            verdict(pass)
-        );
-        Ok(pass)
-    }
-
-    /// The combine at one layer of one set, from the dump's inputs.
-    fn combine_site(cx: &Cx, set: &SetData, l: usize, dv: &mut Dev) -> Result<bool, GateError> {
-        let stream = cx.gpu.stream();
-        let (k, t) = (cx.meta.n_embd, set.t);
-        let (k64, t64, nu64) = (k as u64, t as u64, N_USED as u64);
-        let (moe, sh, down, ws) = (
-            format!("ffn_moe_out-{l}"),
-            format!("ffn_shexp-{l}"),
-            format!("ffn_moe_down-{l}"),
-            format!("ffn_moe_weights_scaled-{l}"),
-        );
-        let down_d = dump(set, &down, [k64, nu64, t64, 1], "MUL_MAT_ID", None)?;
-        let w_d = dump(set, &ws, [1, nu64, t64, 1], "SCALE", None)?;
-        let moe_d = dump(
-            set,
-            &moe,
-            [k64, t64, 1, 1],
-            "MUL_MULTI_ADD",
-            Some((&down, &ws)),
-        )?;
-        let sh_d = dump(set, &sh, [k64, t64, 1, 1], "MUL_MAT", None)?;
-        let out_d = dump(
-            set,
-            &format!("ffn_out-{l}"),
-            [k64, t64, 1, 1],
-            "ADD",
-            Some((&moe, &sh)),
-        )?;
-        let negz = vec![-0.0f32; k];
-        let (mut ok1, mut ok2, mut ok3, mut rerun) = (true, true, true, true);
-        for tt in 0..t {
-            let dt = &down_d[tt * N_USED * k..(tt + 1) * N_USED * k];
-            let wt = &w_d[tt * N_USED..(tt + 1) * N_USED];
-            let st = &sh_d[tt * k..(tt + 1) * k];
-            let mt = &moe_d[tt * k..(tt + 1) * k];
-            let ot = &out_d[tt * k..(tt + 1) * k];
-            dv.cd.copy_from_host(stream, dt)?;
-            dv.cw.copy_from_host(stream, wt)?;
-            dv.cs.copy_from_host(stream, st)?;
-            cx.experts
-                .enqueue_moe_combine(stream, &dv.cd, &dv.cw, &dv.negz, k, &mut dv.y0)?;
-            cx.experts
-                .enqueue_moe_combine(stream, &dv.cd, &dv.cw, &dv.cs, k, &mut dv.y1)?;
-            let (y0, y1) = (dv.y0.to_host_vec(stream)?, dv.y1.to_host_vec(stream)?);
-            cx.experts
-                .enqueue_moe_combine(stream, &dv.cd, &dv.cw, &dv.cs, k, &mut dv.y1)?;
-            rerun &= bits_equal(&y1, &dv.y1.to_host_vec(stream)?);
-            let (h0, h1) = (combine_host(dt, wt, &negz), combine_host(dt, wt, st));
-            ok1 &= bits_equal(&y0, &h0) && bits_equal(&y1, &h1);
-            let sum: Vec<f32> = mt.iter().zip(st).map(|(&a, &b)| a + b).collect();
-            ok2 &= bits_equal(&h0, mt) && bits_equal(&sum, ot);
-            ok3 &= bits_equal(&y0, mt) && bits_equal(&y1, ot);
-        }
-        let pass = ok1 && ok2 && ok3 && rerun;
-        println!(
-            "combine set={} layer={l} tokens={t} kernel_eq_host={ok1} | ik_rule_bits={ok2} | \
-             moe_out_and_ffn_out_eq_dump={ok3} rerun={rerun} {}",
-            set.name,
             verdict(pass)
         );
         Ok(pass)
@@ -1850,12 +1757,11 @@ mod gate {
         Ok(pass)
     }
 
-    /// Enqueue one layer's eight launches for the token in `dv.x`: the router,
+    /// Enqueue one layer's seven launches for the token in `dv.x`: the router,
     /// the q8_1 of `x`, the routed gate·up·SwiGLU, the q8_1 of `h`, the
-    /// routed down, the shared gate·up·SwiGLU, the shared down, the combine
-    /// (on the router's weights). The routed slots read `sel` (the dump's
-    /// ids in the compact stack), not the router's ids: the gate's stacks
-    /// hold only the experts the sets use.
+    /// routed down, the shared gate·up·SwiGLU, the shared down. The routed
+    /// slots read `sel` (the dump's ids in the compact stack), not the
+    /// router's ids: the gate's stacks hold only the experts the sets use.
     fn layer_chain(
         cx: &Cx,
         dv: &mut Dev,
@@ -1906,8 +1812,6 @@ mod gate {
         cx.gpu
             .q8f32()
             .enqueue_q8_0_gemv(stream, qs, d, &dv.sh, 1, &mut dv.sy)?;
-        cx.experts
-            .enqueue_moe_combine(stream, &dv.d6, &dv.rout.weights, &dv.sy, k, &mut dv.y1)?;
         Ok(())
     }
 
@@ -1929,11 +1833,10 @@ mod gate {
             dv.d6.to_host_vec(stream)?,
             dv.sh.to_host_vec(stream)?,
             dv.sy.to_host_vec(stream)?,
-            dv.y1.to_host_vec(stream)?,
         ])
     }
 
-    /// One layer's eight launches captured and replayed twice: eight graph
+    /// One layer's seven launches captured and replayed twice: seven graph
     /// nodes, each replay's outputs bit-identical to the eager run's, and the
     /// router's ticket count back at zero after each.
     fn graph(
@@ -1944,7 +1847,8 @@ mod gate {
         sel: &[u32],
         x: &[f32],
     ) -> Result<bool, GateError> {
-        const NODES: usize = 8;
+        // PIN(2026-09-24): 8 → 7 — the layer chain's combine launch left with `ds41_moe_combine`.
+        const NODES: usize = 7;
         let stream = cx.gpu.stream();
         let sel = DeviceBuffer::from_host(stream, sel)?;
         dv.x.copy_from_host(stream, x)?;

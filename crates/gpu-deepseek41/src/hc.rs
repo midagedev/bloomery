@@ -35,8 +35,6 @@
 //!    same way; `scale = 1 / sqrt(squares / K + rms_eps)`, `mix = raw * scale`.
 //! 5. HC_PRE per token on one warp ([`hc_pre_lane`]).
 //!
-//! `ds41_hc_pre_mix` — step 5 alone from given mixes.
-//!
 //! `ds41_hc_post` — HC_POST and the next sub-layer's input fold per value
 //! `d` of token `t`, with the fused multiply-adds where ik's build puts them:
 //! `o_i = fma(x, post_i, comb[0][i] * r_0)`, then `o_i = fma(comb[j][i], r_j,
@@ -44,11 +42,6 @@
 //! y)`. The fold's weights are the same HC_PRE's `pre` (the lag: a sub-layer's
 //! input is folded by the previous sub-layer's HC_PRE). After the last layer
 //! the fold of the last token is the head's input.
-//!
-//! `ds41_hc_post_streams` — HC_POST alone, the same rule, for the boundary
-//! before an engram layer: engram rewrites the four streams before the next
-//! sub-layer folds them, so that fold is `ds41_hc_fold`'s, on engram's
-//! streams.
 //!
 //! `ds41_hc_fold` — the fold alone.
 
@@ -69,7 +62,7 @@ pub const HC_MIX: usize = 24;
 const _: () = assert!(HC_MIX == 2 * HC_STREAMS + HC_STREAMS * HC_STREAMS);
 /// Values of K one `ds41_hc_pre` block owns: one q3_K row-walk iteration.
 pub const HC_PIECE: usize = 512;
-/// Threads of a `ds41_hc_pre` block and of a `ds41_hc_pre_mix` block.
+/// Threads of a `ds41_hc_pre` block.
 pub(crate) const HC_PRE_THREADS: usize = 256;
 const HC_PRE_THREADS_U32: u32 = HC_PRE_THREADS as u32;
 const _: () = assert!(HC_PRE_THREADS_U32 as usize == HC_PRE_THREADS);
@@ -606,67 +599,6 @@ mod hc_kernels {
         }
     }
 
-    /// HC_PRE alone for `m` tokens from their [`HC_MIX`] mix values each —
-    /// step 5 of `ds41_hc_pre` on given mixes, one warp per token.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            mixes.len() >= 24 * m,
-            scale.len() >= 3,
-            base.len() >= 24,
-            hc.len() >= 24 * m
-        )
-    )]
-    pub fn ds41_hc_pre_mix(
-        mixes: &[f32],
-        scale: &[f32],
-        base: &[f32],
-        m: u32,
-        hc_eps: f32,
-        iters: u32,
-        mut hc: DisjointSlice<f32>,
-    ) {
-        let t = thread::index_1d().get() / 32;
-        if t >= m as usize {
-            return;
-        }
-        let lane = warp::lane_id() as usize;
-        // SAFETY: scale.len() >= 3 by the launch contract.
-        let sc = unsafe {
-            [
-                *scale.get_unchecked(0),
-                *scale.get_unchecked(1),
-                *scale.get_unchecked(2),
-            ]
-        };
-        let (mv, bv) = if lane < HC_MIX {
-            // SAFETY: t*24 + lane < 24m <= mixes.len(); lane < 24 <=
-            // base.len().
-            unsafe {
-                (
-                    *mixes.get_unchecked(t * HC_MIX + lane),
-                    *base.get_unchecked(lane),
-                )
-            }
-        } else {
-            (0.0, 0.0)
-        };
-        let y = hc_pre_lane(mv, lane as u32, sc, bv, hc_eps, iters);
-        if lane < HC_MIX {
-            // SAFETY: t*24 + lane < 24m <= hc.len(); one lane per slot.
-            unsafe {
-                *hc.get_unchecked_mut(t * HC_MIX + lane) = y;
-            }
-        }
-    }
-
     /// HC_POST and the next input fold, one thread per value `d` of token
     /// `t`: `x` the sub-layer output (`n` per token), `res` the streams it
     /// read (`4n` per token), `hc` the sub-layer's HC_PRE result; writes the
@@ -711,40 +643,6 @@ mod hc_kernels {
         unsafe {
             *fold.get_unchecked_mut(i) = hc_fold_elem(o, pre);
         }
-    }
-
-    /// HC_POST alone: `ds41_hc_post` without the fold, for the boundary
-    /// before an engram layer.
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            x.len() >= n * m,
-            res.len() >= 4 * n * m,
-            hc.len() >= 24 * m,
-            out.len() >= 4 * n * m
-        )
-    )]
-    pub fn ds41_hc_post_streams(
-        x: &[f32],
-        res: &[f32],
-        hc: &[f32],
-        n: u32,
-        m: u32,
-        mut out: DisjointSlice<f32>,
-    ) {
-        let (n, m) = (n as usize, m as usize);
-        let i = thread::index_1d().get();
-        if i >= n * m {
-            return;
-        }
-        // SAFETY: i < n*m, and the launch contract gives the lengths.
-        let (o, _) = unsafe { hc_post_at(x, res, hc, n, i) };
-        // SAFETY: i < n*m, out.len() >= 4nm by the launch contract, and the
-        // thread owns value i.
-        unsafe { store_streams(&mut out, n, i, o) };
     }
 
     /// The fold alone: `y[t][d]` from the four streams of `s` at `d` and the
@@ -944,52 +842,6 @@ impl HcKernels {
         Ok(())
     }
 
-    /// Enqueue HC_PRE alone (`ds41_hc_pre_mix`) for `tokens` tokens of given
-    /// `mixes` ([`HC_MIX`] per token) into `hc` — the chain's step 5. Only
-    /// the scales, offsets, eps and iterations of `p` are read.
-    /// Asynchronous, allocation-free, capturable.
-    pub fn enqueue_pre_mix(
-        &self,
-        stream: &CudaStream,
-        p: &HcParams<'_>,
-        mixes: &DeviceBuffer<f32>,
-        tokens: usize,
-        hc: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let what = "HcKernels::enqueue_pre_mix";
-        let m = tokens;
-        if m == 0
-            || mixes.len() < HC_MIX * m
-            || hc.len() < HC_MIX * m
-            || p.scale.len() < 3
-            || p.base.len() < HC_MIX
-            || p.iters == 0
-        {
-            return Err(GpuError::Shape {
-                what,
-                detail: format!(
-                    "tokens = {m}, mixes.len() {} / hc.len() {} (need {}), scale.len() {} (need 3), base.len() {} (need {HC_MIX}), iters {}",
-                    mixes.len(),
-                    hc.len(),
-                    HC_MIX * m,
-                    p.scale.len(),
-                    p.base.len(),
-                    p.iters
-                ),
-            });
-        }
-        let grid = launch_u32(what, "grid", m.div_ceil(HC_PRE_WARPS))?;
-        let m = launch_u32(what, "tokens", m)?;
-        let prep = self.module.prepare_ds41_hc_pre_mix(LaunchConfig1D::new(
-            grid,
-            HC_PRE_THREADS_U32,
-            0,
-        ))?;
-        self.module
-            .ds41_hc_pre_mix(stream, &prep, mixes, p.scale, p.base, m, p.eps, p.iters, hc)?;
-        Ok(())
-    }
-
     /// Enqueue HC_POST and the next input fold (`ds41_hc_post`): `out` takes
     /// the new streams (`4 * n_embd` per token), `fold` their fold by the
     /// same HC_PRE's `pre` (`n_embd` per token). Asynchronous,
@@ -1002,32 +854,12 @@ impl HcKernels {
         fold: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "HcKernels::enqueue_post";
-        let (grid, n, m) = post_launch(what, a, out.len(), Some(fold.len()))?;
+        let (grid, n, m) = post_launch(what, a, out.len(), fold.len())?;
         let prep =
             self.module
                 .prepare_ds41_hc_post(LaunchConfig1D::new(grid, HC_ELEM_THREADS_U32, 0))?;
         self.module
             .ds41_hc_post(stream, &prep, a.x, a.res, a.hc, n, m, out, fold)?;
-        Ok(())
-    }
-
-    /// Enqueue HC_POST alone (`ds41_hc_post_streams`): `out` takes the new
-    /// streams (`4 * n_embd` per token) and nothing is folded — the form of
-    /// the boundary before an engram layer. Asynchronous, allocation-free,
-    /// capturable.
-    pub fn enqueue_post_streams(
-        &self,
-        stream: &CudaStream,
-        a: &HcPostArgs<'_>,
-        out: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let what = "HcKernels::enqueue_post_streams";
-        let (grid, n, m) = post_launch(what, a, out.len(), None)?;
-        let prep = self
-            .module
-            .prepare_ds41_hc_post_streams(LaunchConfig1D::new(grid, HC_ELEM_THREADS_U32, 0))?;
-        self.module
-            .ds41_hc_post_streams(stream, &prep, a.x, a.res, a.hc, n, m, out)?;
         Ok(())
     }
 
@@ -1075,12 +907,12 @@ impl HcKernels {
 }
 
 /// An HC_POST launch's grid, `n_embd` and tokens, after checking `a`, the
-/// output streams' length and, for the fused entry, the fold's.
+/// output streams' length and the fold's.
 fn post_launch(
     what: &'static str,
     a: &HcPostArgs<'_>,
     out_len: usize,
-    fold_len: Option<usize>,
+    fold_len: usize,
 ) -> Result<(u32, u32, u32), GpuError> {
     let (n, m) = (a.n_embd, a.tokens);
     if n == 0
@@ -1089,12 +921,12 @@ fn post_launch(
         || a.res.len() < HC_STREAMS * n * m
         || a.hc.len() < HC_MIX * m
         || out_len < HC_STREAMS * n * m
-        || fold_len.is_some_and(|f| f < n * m)
+        || fold_len < n * m
     {
         return Err(GpuError::Shape {
             what,
             detail: format!(
-                "n_embd = {n}, tokens = {m}: x {} res {} hc {} out {out_len} fold {fold_len:?}",
+                "n_embd = {n}, tokens = {m}: x {} res {} hc {} out {out_len} fold {fold_len}",
                 a.x.len(),
                 a.res.len(),
                 a.hc.len()

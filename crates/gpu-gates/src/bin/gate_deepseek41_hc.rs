@@ -1,8 +1,10 @@
 //! GPU gate for the DeepSeek-V4.1 hyper-connections
 //! (`bloomery_gpu_deepseek41::hc`): the chain RMS + split-K q3_K gemv +
-//! HC_PRE, HC_PRE alone, HC_POST with the next input fold, and the fold
-//! alone, at every sub-layer the V4.1 oracle sets hold — the 5-token prefill
-//! set (T = 5) and the decode-step sets (T = 1).
+//! HC_PRE, HC_POST with the next input fold, and the fold alone, at every
+//! sub-layer the V4.1 oracle sets hold — the 5-token prefill set (T = 5) and
+//! the decode-step sets (T = 1).
+//!
+//! PIN(2026-09-24): removed — the engine never runs `ds41_hc_pre_mix` (HC_PRE alone) or `ds41_hc_post_streams` (HC_POST alone); the kernels are gone with their checks.
 //!
 //! Three comparisons per op, the `gate_p4` form:
 //! 1. **Kernel vs the host transcription of our rule** — bit-identical, and
@@ -14,9 +16,7 @@
 //!    streams (the lag), the output layout, where the multiply-adds fuse.
 //!    ik's `exp` is glibc's `expf` (the host's `f32::exp`).
 //! 3. **Kernel vs the dump** — HC_POST and the folds bit-identical (our rule
-//!    is ik's there). HC_PRE from the dump's mixes is not a check: our `exp`
-//!    is not ik's `expf`, so its distance from the dump is printed in ulp.
-//!    The chain differs from ik's by rule: our gemv reads the raw streams
+//!    is ik's there). The chain differs from ik's by rule: our gemv reads the raw streams
 //!    quantized to q8_1 per 128 values and scales its result, ik's reads the
 //!    normalized streams quantized to q8_K per 256. That difference is
 //!    predicted per (token, row) in exact arithmetic from the dump's own
@@ -39,12 +39,9 @@
 //! unsplit `q3k_gemv` must agree with the split-K sum within `KERNEL_BAND`
 //! (a different sum order).
 //!
-//! Both forms of a boundary: HC_POST with the next input fold in one launch,
-//! and HC_POST alone followed by the fold alone — the pair the chain runs
-//! before an engram layer, whose streams are rewritten between the two. At
-//! every site the pair must equal the fused launch bit for bit; the fold
-//! alone is also checked on engram's own streams (`engram_out`) against the
-//! dump.
+//! The fold alone is also checked on engram's own streams (`engram_out`)
+//! against the dump: before an engram layer the chain's MoE sub-layer ends
+//! with HC_POST alone and the glue folds the gated streams.
 //!
 //! Holes, named: the T = 1 paths (ik's own HC_POST branch for one token)
 //! come only from the decode-step sets, read when they are on the box and
@@ -77,8 +74,7 @@ mod gate {
     use bloomery_gpu_gates::rounding::{U64, butterfly, gamma};
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
-        max_rel_err, max_ulps, ref_dir_named, ref_model_path, ref_tensor_of_in, tensor_bytes_as,
-        verdict,
+        max_rel_err, ref_dir_named, ref_model_path, ref_tensor_of_in, tensor_bytes_as, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -960,17 +956,6 @@ mod gate {
         let mix_bit = bits_equal(&mix_k, &ch.mixes);
         let hc_bit = bits_equal(&hc_k, &pre_of(&ch.mixes, exp_ours));
 
-        // HC_PRE alone on the dump's mixes: our rule, and the dump itself.
-        let mix_d_dev = DeviceBuffer::from_host(stream, &mix_d)?;
-        let mut hc_op_dev = DeviceBuffer::<f32>::zeroed(stream, HC_MIX * t)?;
-        cx.hck
-            .enqueue_pre_mix(stream, &p, &mix_d_dev, t, &mut hc_op_dev)?;
-        stream.synchronize()?;
-        let hc_op = hc_op_dev.to_host_vec(stream)?;
-        let op_bit = bits_equal(&hc_op, &pre_of(&mix_d, exp_ours));
-        let op_dump_bit = bits_equal(&hc_op, &hc_d);
-        let op_dump_ulp = max_ulps(&hc_op, &hc_d);
-
         // The crate's quantizer and unsplit gemv at K = 20480.
         let mut act = Q8Act::with_k(stream, t, k)?;
         cx.gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
@@ -1015,15 +1000,14 @@ mod gate {
             && mix_bit
             && hc_bit
             && rerun
-            && op_bit
             && q8_bit
             && unsplit_rel <= KERNEL_BAND
             && mix_ratio <= 1.0
             && hc_ratio <= 1.0;
         println!(
             "hc_pre set={set} L={} sub={} T={t} ik_rms_bit={rms_bit} ik_hc_pre_bit={pre_ik_bit} \
-             kernel_mix_bit={mix_bit} kernel_hc_bit={hc_bit} rerun_bit={rerun} op_bit={op_bit} \
-             op_vs_dump_bit={op_dump_bit} op_vs_dump_ulp={op_dump_ulp} q8act_bit={q8_bit} unsplit_rel={unsplit_rel:.3e} \
+             kernel_mix_bit={mix_bit} kernel_hc_bit={hc_bit} rerun_bit={rerun} \
+             q8act_bit={q8_bit} unsplit_rel={unsplit_rel:.3e} \
              mix_rel={mix_rel:.3e} rule_rel={rule_rel:.3e} mix_gap_ratio={mix_ratio:.3e} \
              logit_err={logit_err:.3e} hc_gap_ratio={hc_ratio:.3e} {}",
             site.layer,
@@ -1058,30 +1042,17 @@ mod gate {
         let post_dump_bit = bits_equal(&out_k, &post_d);
         let fold_dump_bit = fold_d.as_ref().is_none_or(|f| bits_equal(&fold_k, f));
 
-        // The split form: HC_POST alone, then the fold alone, equal to the
-        // fused launch. Before an engram layer it is the form the chain runs.
-        let mut split_out_dev = DeviceBuffer::<f32>::zeroed(stream, 4 * n * t)?;
-        let mut split_fold_dev = DeviceBuffer::<f32>::zeroed(stream, n * t)?;
-        cx.hck
-            .enqueue_post_streams(stream, &pa, &mut split_out_dev)?;
-        cx.hck
-            .enqueue_fold(stream, &split_out_dev, &hc_d_dev, n, t, &mut split_fold_dev)?;
-        stream.synchronize()?;
-        let split_bit = bits_equal(&split_out_dev.to_host_vec(stream)?, &out_k)
-            && bits_equal(&split_fold_dev.to_host_vec(stream)?, &fold_k);
         let form = if site.engram_next {
-            "post_streams"
+            "before-engram"
         } else {
             "fused"
         };
         let fold_seen = site.fold.map_or("-", |f| f.name.as_str());
-        let pass_post =
-            post_ik_bit && fold_ik_bit && post_bit && post_dump_bit && fold_dump_bit && split_bit;
+        let pass_post = post_ik_bit && fold_ik_bit && post_bit && post_dump_bit && fold_dump_bit;
         println!(
             "hc_post set={set} L={} sub={} T={t} form={form} fold_node={fold_seen} \
              ik_post_bit={post_ik_bit} ik_fold_bit={fold_ik_bit} kernel_bit={post_bit} \
-             post_vs_dump_bit={post_dump_bit} fold_vs_dump_bit={fold_dump_bit} \
-             split_eq_fused_bit={split_bit} {}",
+             post_vs_dump_bit={post_dump_bit} fold_vs_dump_bit={fold_dump_bit} {}",
             site.layer,
             site.sub(),
             verdict(pass_post)
@@ -1194,18 +1165,18 @@ mod gate {
             man.build.as_deref().unwrap_or("-"),
             all.len()
         );
-        // The launches one token of this graph takes, both ways: each
-        // boundary fused except the ones before an engram layer, and every
-        // boundary split. Layer 0's input fold (by the one-hot init, a copy
-        // of stream 0) is counted apart.
+        // This module's launches one token of this graph takes: each
+        // boundary fused except the ones before an engram layer, whose
+        // HC_POST alone is the MoE piece's and whose fold is the lone fold.
+        // Layer 0's input fold (by the one-hot init, a copy of stream 0) is
+        // counted apart.
         let engram = all.iter().filter(|s| s.engram_next).count();
         let fused = all.len() - engram;
         println!(
-            "nodes set={set} ds41_hc_pre={} ds41_hc_post={fused} ds41_hc_post_streams={engram} \
-             ds41_hc_fold={engram} total={} (+1 layer-0 fold); all split: total={} (+1)",
+            "nodes set={set} ds41_hc_pre={} ds41_hc_post={fused} ds41_hc_fold={engram} total={} \
+             (+1 layer-0 fold)",
             all.len(),
-            all.len() + fused + 2 * engram,
-            3 * all.len()
+            all.len() + fused + engram
         );
         let mut ffn_hc = vec![Vec::new(); cx.hp.n_layers];
         let mut last_fold = Vec::new();
@@ -1354,8 +1325,8 @@ mod gate {
         if cx.ok {
             println!(
                 "PASSED: gate_deepseek41_hc — chain, HC_PRE, HC_POST and folds bit-identical to \
-                 our rule; HC_POST and folds bit-identical to ik's dump, the split pair to the \
-                 fused launch; the chain inside its predicted gap"
+                 our rule; HC_POST and folds bit-identical to ik's dump; the chain inside its \
+                 predicted gap"
             );
             Ok(())
         } else {

@@ -1,7 +1,7 @@
 //! Expert FFNs: SwiGLU with its ±10 clamp, for the routed experts and for
 //! the shared expert, whose weights are q8_0.
 //!
-//! Three kernels, the decode shape (one token per launch):
+//! Two kernels, the decode shape (one token per launch):
 //! - `ds41_expert_gate_up`: the routed experts' gate·up·SwiGLU in one launch
 //!   — the addressing of `moe_fused`'s `expert_gate_up_swiglu_q3k` (a warp
 //!   per output row, weight row `sel[slot]·rows + row` of both stacks),
@@ -13,8 +13,6 @@
 //!   against f32 activations: `q8f32::q8_0_lane_partial_1col` twice with the
 //!   warp tree (each dot bit for bit `q8_0_gemv`'s at m = 1), then
 //!   [`swiglu_clamp`]. The down projection after it is `q8_0_gemv`.
-//! - `ds41_moe_combine`: the routed slots' down outputs weighted and summed,
-//!   plus the shared expert's.
 //!
 //! Numeric contract, where it is ik's CPU rule op for op (the gate holds each
 //! kernel to this module's host functions, bit for bit):
@@ -24,15 +22,11 @@
 //!   `silu(g)`, not `g`. `silu(x) = x / (1 + e^(0 - x))` with the
 //!   exponential `expf_ik`, ik's AVX2 `v_expf`, which is what its CPU build
 //!   runs on every row of these shapes.
-//! - Combine, per output value: `y = down_0 · w_0`, then `y = fma(down_j,
-//!   w_j, y)` for slots 1 to 5 in order (ik's `MUL_MULTI_ADD`, whose `+=` its
-//!   compiler contracts), then `y + shexp`.
 //!
 //! The dots are ours, not ik's: q8_1 activations per 128 values for the
 //! q3_K stacks, f32 activations for q8_0, where ik quantizes to q8_K and
 //! q8_2 — the gate derives its band against ik's dump from that difference.
 
-use crate::router::N_USED;
 use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::q8f32::q8_0_lane_partial_1col;
 use bloomery_gpu::weights::DevWeight;
@@ -44,9 +38,6 @@ use std::sync::Arc;
 
 /// Threads per block of every kernel here: eight warps.
 const BLOCK: u32 = 256;
-
-// The combine's launch contract spells the slot count as a literal.
-const _: () = assert!(N_USED == 6);
 
 /// ik's AVX2 `v_expf` (`iqk_utils.h`), one lane, op for op: `x` split as
 /// `n·ln2 + b` by the `0x1.8p23` shift (two fused multiply-adds for `b`), a
@@ -243,54 +234,6 @@ mod experts_kernels {
             unsafe { *h.get_unchecked_mut(row) = v };
         }
     }
-
-    /// The expert combine for one token, one thread per output value `d`:
-    /// `acc = down[d]·w[0]`, then `acc = fma(down[j·rows + d], w[j], acc)`
-    /// for slots 1 to 5 in order, then `y[d] = acc + shexp[d]` (the module
-    /// doc's contract). `down` is slot-major, six slots of `rows` values,
-    /// `w` the router's six weights.
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            down.len() >= 6 * rows,
-            w.len() >= 6,
-            shexp.len() >= rows,
-            y.len() >= rows
-        )
-    )]
-    pub fn ds41_moe_combine(
-        down: &[f32],
-        w: &[f32],
-        shexp: &[f32],
-        rows: u32,
-        mut y: DisjointSlice<f32>,
-    ) {
-        let d = thread::index_1d().get();
-        if d >= rows as usize {
-            return;
-        }
-        let rows = rows as usize;
-        // SAFETY: d < rows, so index d < 6·rows <= down.len(), and index 0 <
-        // 6 <= w.len(), by the launch contract.
-        let (v, wv) = unsafe { (*down.get_unchecked(d), *w.get_unchecked(0)) };
-        let mut acc = v * wv;
-        let mut j = 1usize;
-        while j < N_USED {
-            // SAFETY: j < 6 and d < rows, so j·rows + d < 6·rows <=
-            // down.len() and j < 6 <= w.len(), by the launch contract.
-            let (v, wv) = unsafe { (*down.get_unchecked(j * rows + d), *w.get_unchecked(j)) };
-            acc = f32::mul_add(v, wv, acc);
-            j += 1;
-        }
-        // SAFETY: d < rows <= shexp.len() by the launch contract.
-        let s = unsafe { *shexp.get_unchecked(d) };
-        // SAFETY: d < rows <= y.len() by the launch contract; thread d is
-        // y[d]'s only writer.
-        unsafe { *y.get_unchecked_mut(d) = acc + s };
-    }
 }
 
 /// One token's routed gate·up·SwiGLU launch
@@ -475,49 +418,6 @@ impl ExpertKernels {
             limit,
             h,
         )?;
-        Ok(())
-    }
-
-    /// Enqueue the expert combine for one token: `down` holds the six
-    /// slots' down projections (`6 · rows` f32, slot-major), `w` the six
-    /// router weights, `shexp` and `y` `rows` f32 each. Asynchronous,
-    /// allocation-free, capturable.
-    pub fn enqueue_moe_combine(
-        &self,
-        stream: &CudaStream,
-        down: &DeviceBuffer<f32>,
-        w: &DeviceBuffer<f32>,
-        shexp: &DeviceBuffer<f32>,
-        rows: usize,
-        y: &mut DeviceBuffer<f32>,
-    ) -> Result<(), GpuError> {
-        let what = "enqueue_moe_combine";
-        if rows == 0
-            || down.len() < N_USED * rows
-            || w.len() < N_USED
-            || shexp.len() < rows
-            || y.len() < rows
-        {
-            return Err(GpuError::Shape {
-                what,
-                detail: format!(
-                    "rows {rows} needs down.len() {} >= {}, w.len() {} >= {N_USED}, \
-                     shexp.len() {} and y.len() {} >= rows",
-                    down.len(),
-                    N_USED * rows,
-                    w.len(),
-                    shexp.len(),
-                    y.len()
-                ),
-            });
-        }
-        let grid = launch_u32(what, "grid", rows.div_ceil(BLOCK as usize))?;
-        let rows = launch_u32(what, "rows", rows)?;
-        let prep = self
-            .module
-            .prepare_ds41_moe_combine(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module
-            .ds41_moe_combine(stream, &prep, down, w, shexp, rows, y)?;
         Ok(())
     }
 }
