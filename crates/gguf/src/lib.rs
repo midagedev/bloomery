@@ -628,7 +628,7 @@ fn check_place(g: &Gguf, path: &Path, place: u64) -> Result<(), LoadError> {
 /// requires. Placement, block alignment and dequantizability are NOT
 /// validated, and type ids the engine has no `GgmlType` for are carried as
 /// numbers with their size from ggml's table (or `None`). This is the
-/// inventory for files the strict reader refuses — e.g. MXFP4 or i-quant
+/// inventory for files the strict reader refuses — e.g. i-quant or q4_0
 /// files — where the point is to know what is in the file, not to run it.
 pub struct Inventory {
     pub version: u32,
@@ -688,9 +688,7 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
 ///     22 `iq2_s` 256/82 (:467-473), 23 `iq4_xs` 256/136 (:602-607),
 ///     29 `iq1_m` 256/56 (:534-539),
 ///   * 24 `i8` 1/1, 25 `i16` 1/2, 26 `i32` 1/4, 27 `i64` 1/8, 28 `f64` 1/8
-///     (type_traits table, ggml.c:621-652),
-///   * 39 `mxfp4` 32/17 — one E8M0 byte + 16 nibble bytes per 32 values
-///     (ggml-common.h:182-187).
+///     (type_traits table, ggml.c:621-652).
 ///
 /// The engine's own numbers stay owned by `GgmlType::blck_size`/`type_size`
 /// for the ids it models; ids absent from both return `None` and inventory
@@ -725,7 +723,6 @@ pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
         27 => ("i64", 1, 8),
         28 => ("f64", 1, 8),
         29 => ("iq1_m", 256, 56),
-        39 => ("mxfp4", 32, 17),
         _ => return None,
     };
     Some((name, blck, tsz))

@@ -6,10 +6,20 @@
 //! and the gates at once.
 
 use crate::ModelError;
-use gguf::Gguf;
+use gguf::{Gguf, Split};
 
 pub mod deepseek2;
 pub mod deepseek41;
+pub mod dspark;
+
+/// The architecture string of the DSpark draft file ([`dspark`]). It is not an
+/// [`Arch`]: the draft is read beside a V4.1 model, never run as a model.
+pub const DFLASH: &str = "dflash";
+
+/// Whether `split` declares the draft's architecture.
+pub fn is_dflash(split: &Split) -> bool {
+    split.architecture() == Some(DFLASH)
+}
 
 /// The architectures this engine can run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

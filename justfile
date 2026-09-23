@@ -739,3 +739,9 @@ verdict-diff *ARGS:
 # GPU A/B(리드 전용): (트리, env) 팔을 시간 레시피로 번갈아 돌리고 팔별 평균·SD·첫 팔 대비 차와 그 구간을 낸다.
 gpu-ab *ARGS:
     python3 tools/gpu-ab.py {{ARGS}}
+
+# DSpark 드래프트 파일 읽기: MXFP4 디코드 단위 시험(스케일 바이트 256개 × 코드 16개 전부)을 돈 뒤, 엄격한 리더로
+# 드래프트를 열어 hparams·텐서 표·바이트 타일링을 보고, mxfp4_ref 덤프(just build-ref)와 비트 대조하고, 전문가 스케일
+# 바이트를 전부 훑는다. 바이트 표를 찍는다. 대상 쪽 텐서(token_embd·output)를 읽으려고 V4.1 프로필로 돈다. 호스트 전용.
+gate-dspark-read:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gguf --lib -- quant --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_dspark_read && bash tools/host-gate.sh gate_dspark_read'

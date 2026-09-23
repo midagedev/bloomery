@@ -17,11 +17,18 @@
 //! 24 significant bits, so every product is exact, the single add or
 //! subtract is the only rounding, and the fused and unfused forms agree.
 //! A type whose product rounds would need the mirror to match the oracle.
+//!
+//! MXFP4 is not in the vendored checkout's `ggml-quants.c`: its
+//! `dequantize_row_mxfp4` lives in ik's `ggml/src/iqk/iqk_quantize.cpp:4233`,
+//! and is the `to_float` of `[GGML_TYPE_MXFP4]` (ggml.c:1311). Its one
+//! multiply, a power of two times an int8 of magnitude at most 12, is exact
+//! (the subnormal scales included), so no fusion question arises.
 
 use std::fmt;
 
 /// GGUF v3 / ggml tensor type tags, values from `enum ggml_type`
-/// (ggml.h:391; F32=0 … Q6_K=14 at ggml.h:392-406, BF16=30 at ggml.h:422).
+/// (ggml.h:391; F32=0 … Q6_K=14 at ggml.h:392-406, BF16=30 at ggml.h:422,
+/// MXFP4=39 at ggml.h:427).
 ///
 /// `Unknown` carries any tag this build does not model; the loader accepts
 /// such tensors only far enough to name them, and every size/dequant entry
@@ -41,6 +48,7 @@ pub enum GgmlType {
     Q5_K,
     Q6_K,
     BF16,
+    MXFP4,
     Unknown(u32),
 }
 
@@ -58,6 +66,7 @@ impl GgmlType {
             13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
             30 => GgmlType::BF16,
+            39 => GgmlType::MXFP4,
             other => GgmlType::Unknown(other),
         }
     }
@@ -74,12 +83,14 @@ impl GgmlType {
             GgmlType::Q5_K => 13,
             GgmlType::Q6_K => 14,
             GgmlType::BF16 => 30,
+            GgmlType::MXFP4 => 39,
             GgmlType::Unknown(v) => v,
         }
     }
 
     /// `ggml_type_name` string (type_traits table, ggml.c:620 — entries at
-    /// ggml.c:657/667/756/777/819/912/938/998/1485). Used to name the oracle
+    /// ggml.c:657/667/756/777/819/912/938/998/1485, mxfp4 at ggml.c:1307).
+    /// Used to name the oracle
     /// dumps `$BLOOMERY_DATA/ref/<name>.raw`.
     pub fn name(self) -> Option<&'static str> {
         match self {
@@ -93,6 +104,7 @@ impl GgmlType {
             GgmlType::Q5_K => Some("q5_K"),
             GgmlType::Q6_K => Some("q6_K"),
             GgmlType::BF16 => Some("bf16"),
+            GgmlType::MXFP4 => Some("mxfp4"),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -100,13 +112,14 @@ impl GgmlType {
     /// `blck_size` from ggml's type_traits table (ggml.c:620): F32/F16/BF16 = 1
     /// (ggml.c:657/667/1485), Q5_0/Q5_1/Q8_0 = QK5_0/QK5_1/QK8_0 = 32
     /// (ggml.c:756/777/819, QK5_0/QK5_1/QK8_0 at ggml-common.h:195/210/233),
-    /// K-quants = QK_K = 256 (ggml.c:912/938/998, QK_K at ggml-common.h:79).
+    /// K-quants = QK_K = 256 (ggml.c:912/938/998, QK_K at ggml-common.h:79),
+    /// MXFP4 = QK_MXFP4 = 32 (ggml.c:1308, ggml-common.h:182).
     ///
     /// This match is the single owner of those numbers for the Rust side.
     pub fn blck_size(self) -> Option<u64> {
         match self {
             GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => Some(1),
-            GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => Some(32),
+            GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::MXFP4 => Some(32),
             GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => Some(256),
             GgmlType::Unknown(_) => None,
         }
@@ -121,7 +134,8 @@ impl GgmlType {
     /// `sizeof(block_q6_K)` = 210 — block layouts and static_asserts in
     /// ggml-common.h:327-332 (q3_K), 348-353 (q4_K), 373-378 (q5_K),
     /// 388-393 (q6_K), 196-216 (q5_0/q5_1), 233-238 (q8_0: one f16 `d` and
-    /// 32 int8 codes).
+    /// 32 int8 codes), `sizeof(block_mxfp4)` = 17 (ggml-common.h:183-187: one
+    /// E8M0 byte `e`, then 16 bytes of 4-bit codes).
     pub fn type_size(self) -> Option<u64> {
         match self {
             GgmlType::F32 => Some(4),
@@ -134,6 +148,7 @@ impl GgmlType {
             GgmlType::Q4_K => Some(144),
             GgmlType::Q5_K => Some(176),
             GgmlType::Q6_K => Some(210),
+            GgmlType::MXFP4 => Some(17),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -216,6 +231,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::Q6_K => dequant_q6_k(&src[..need], dst),
         GgmlType::Q8_0 => dequant_q8_0(&src[..need], dst),
         GgmlType::BF16 => dequant_bf16(&src[..need], dst),
+        GgmlType::MXFP4 => dequant_mxfp4(&src[..need], dst),
         GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
     }
     Ok(())
@@ -589,6 +605,50 @@ fn dequant_bf16(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+// ------------------------------------------------------------------- MXFP4
+
+/// The E2M1 code values doubled, `kvalues_mxfp4` (ggml-common.h:2250-2252):
+/// codes 0-7 are 0, 0.5, 1, 1.5, 2, 3, 4, 6 times two, 8-15 the same negated.
+pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// The block scale of an MXFP4 block, `ggml_e8m0_to_fp32_half` (ggml-impl.h:40-45):
+/// `x >= 2 ? (x - 1) << 23 : {0x00200000, 0x00400000}[x]` as f32 bits, which is
+/// 2^(E-128) for every E — the E8M0 scale 2^(E-127) halved, the half that the
+/// doubled code table puts back. E = 0 and 1 are the two subnormal scales; E = 255
+/// is 2^127, not NaN (ggml's decode does not special-case it).
+#[inline]
+#[must_use]
+pub fn e8m0_to_f32_half(e: u8) -> f32 {
+    let bits = if e >= 2 {
+        u32::from(e - 1) << 23
+    } else if e == 1 {
+        0x0040_0000
+    } else {
+        0x0020_0000
+    };
+    f32::from_bits(bits)
+}
+
+/// Port of `dequantize_row_mxfp4` (iqk_quantize.cpp:4233). Block geometry
+/// (block_mxfp4, ggml-common.h:183, 17 bytes / 32 values): E8M0 scale `e` @0,
+/// qs[16] @1; value j (j < 16) is the low nibble of qs[j], value j+16 the high
+/// nibble, each `d * kvalues_mxfp4[code]` with `d` = [`e8m0_to_f32_half`]`(e)`.
+fn dequant_mxfp4(src: &[u8], dst: &mut [f32]) {
+    for (blk, out) in src
+        .as_chunks::<17>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<32>().0)
+    {
+        let d = e8m0_to_f32_half(blk[0]);
+        let (lo, hi) = out.split_at_mut(16);
+        for (j, &q) in blk[1..].iter().enumerate() {
+            lo[j] = d * f32::from(KVALUES_MXFP4[usize::from(q & 0x0f)]);
+            hi[j] = d * f32::from(KVALUES_MXFP4[usize::from(q >> 4)]);
+        }
+    }
+}
+
 /// Round-trip f32 activations through ggml's Q8_K activation quantization.
 ///
 /// ggml does not multiply K-quant weights by f32 activations. Before a
@@ -691,7 +751,8 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// A weight type no CPU matmul here takes is refused, not given a format: Q8_0 and BF16
 /// activations are Q8_2_X4 and BF16 in ggml (`vec_dot_type`, ggml.c:828-837 on this AVX2
 /// IQK build, ggml.c:1494), neither of which this engine encodes, and f32 would be a
-/// plausible wrong answer.
+/// plausible wrong answer. MXFP4's is Q8_2_X4 on AVX2 (ggml.c:1316), but no CPU MXFP4
+/// matmul exists here, so it is refused the same way.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
         GgmlType::Q3_K => Ok(Some(ActivationFormat::Q8K)),
@@ -699,7 +760,7 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
             Ok(Some(ActivationFormat::Q8_2X4))
         }
         GgmlType::F32 | GgmlType::F16 => Ok(None),
-        GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::Unknown(_) => {
+        GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::MXFP4 | GgmlType::Unknown(_) => {
             Err(QuantError::NoActivationFormat(weight))
         }
     }
@@ -749,6 +810,57 @@ impl Q8Block {
         Q8Block {
             d: u16::from_le_bytes([b[0], b[1]]),
             q,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GgmlType, dequant_row};
+
+    /// An E2M1 code (sign, two exponent bits, one mantissa bit) as the OCP
+    /// microscaling spec defines it, from its bits and not from ggml's table:
+    /// 0 and 0.5 below exponent 1, `(1 + m/2) · 2^(e-1)` above. The one
+    /// departure is ggml's: its table maps code 8, the spec's −0, to +0.
+    fn e2m1(code: u8) -> f64 {
+        let (e, m) = (i32::from((code >> 1) & 3), f64::from(code & 1));
+        let mag = if e == 0 {
+            m * 0.5
+        } else {
+            (1.0 + m * 0.5) * 2f64.powi(e - 1)
+        };
+        if code & 8 != 0 && mag != 0.0 {
+            -mag
+        } else {
+            mag
+        }
+    }
+
+    /// MXFP4 over its whole domain: every scale byte E, every code in both
+    /// nibbles, decodes to `e2m1(code) · 2^(E−127)`, computed in f64 from the
+    /// spec's definitions. Every such value is an f32 (subnormals at E = 0 and
+    /// 1 included, 6 · 2^128 = inf), so the comparison is on bits.
+    #[test]
+    fn mxfp4_decodes_every_scale_and_code() {
+        let mut src = Vec::with_capacity(256 * 17);
+        for e in 0..=255u8 {
+            src.push(e);
+            // Low nibble j, high nibble 15 − j: each block holds every code twice.
+            src.extend((0..16u8).map(|j| j | ((15 - j) << 4)));
+        }
+        let mut dst = vec![0.0f32; 256 * 32];
+        dequant_row(GgmlType::MXFP4, &src, &mut dst).unwrap();
+        for (e, out) in dst.as_chunks::<32>().0.iter().enumerate() {
+            let scale = 2f64.powi(e as i32 - 127);
+            for (i, &got) in out.iter().enumerate() {
+                let code = if i < 16 { i } else { 15 - (i - 16) } as u8;
+                let want = (e2m1(code) * scale) as f32;
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "E {e} value {i} (code {code}): got {got:e}, want {want:e}"
+                );
+            }
         }
     }
 }

@@ -54,13 +54,13 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 /// The contract this crate exists for: a tensor whose ggml type the engine
-/// has no size for (MXFP4, id 39 — ggml.h:427) inventories with a size from
+/// has no size for (q4_0, id 2 — ggml.h:394) inventories with a size from
 /// ggml's table while `Gguf::open` refuses the file outright.
 #[test]
 fn inventory_carries_what_the_strict_reader_refuses() {
-    let p = tmp("mxfp4.gguf");
-    // dims 32x4: one 17-byte block per row, four rows.
-    write_gguf(&p, &[("blk.0.attn_q.weight", &[32, 4], 39)], 68);
+    let p = tmp("q4_0.gguf");
+    // dims 32x4: one 18-byte block per row, four rows.
+    write_gguf(&p, &[("blk.0.attn_q.weight", &[32, 4], 2)], 72);
 
     let inv = inventory_of(&p).expect("inventory");
     assert_eq!(inv.version, 3);
@@ -68,13 +68,13 @@ fn inventory_carries_what_the_strict_reader_refuses() {
     let t = &inv.tensors[0];
     assert_eq!(t.name, "blk.0.attn_q.weight");
     assert_eq!(t.dims, vec![32, 4]);
-    assert_eq!(t.type_id, 39);
-    assert_eq!(t.nbytes, Some(68));
+    assert_eq!(t.type_id, 2);
+    assert_eq!(t.nbytes, Some(72));
 
     match Gguf::open(&p) {
-        Err(LoadError::UnsupportedType { ty, .. }) => assert_eq!(ty, GgmlType::Unknown(39)),
+        Err(LoadError::UnsupportedType { ty, .. }) => assert_eq!(ty, GgmlType::Unknown(2)),
         Err(other) => panic!("strict open refused with the wrong error: {other}"),
-        Ok(_) => panic!("strict open must refuse MXFP4"),
+        Ok(_) => panic!("strict open must refuse q4_0"),
     }
 }
 

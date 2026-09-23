@@ -184,7 +184,7 @@ impl CardFormat {
             GgmlType::Q8_0 => Some(CardFormat::Q8_0Planes),
             GgmlType::F32 => Some(CardFormat::F32),
             GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
-            GgmlType::F16 | GgmlType::Q5_K | GgmlType::Unknown(_) => None,
+            GgmlType::F16 | GgmlType::Q5_K | GgmlType::MXFP4 | GgmlType::Unknown(_) => None,
         }
     }
 

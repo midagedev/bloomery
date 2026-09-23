@@ -17,6 +17,10 @@
 # tensor), and also dumps ggml's to_float of that tensor's first rows
 # (q5k-v41-dequant.raw/.meta) for gate-qdot's dequant test.
 #
+# mxfp4_ref links libggml alone and dumps ggml's to_float of the first rows of one MXFP4 expert
+# tensor of the DSpark draft (BLOOMERY_DSPARK_MODEL, default the tl37 file) to
+# mxfp4-dspark-dequant.raw/.meta for gate-dspark-read; the .meta names the ik tree and commit.
+#
 # The five *_rate harnesses are built but NOT run: each is a timed kernel-rate
 # bench over a synthetic shape, and a measurement belongs to a quiet machine and
 # a lease, never to a build recipe. Building them here is what keeps them
@@ -34,6 +38,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
 OUT=${Q3K_OUT:-$REF_BIN}
 Q5K_MODEL=${BLOOMERY_Q5K_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}
+DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
 DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref"
@@ -55,7 +60,14 @@ for name in $DUMPERS; do
   esac
 done
 
+GGML_BUILD="$IK@$(git -c safe.directory='*' -C "$IK" rev-parse --short=8 HEAD 2>/dev/null || echo unknown-commit)"
+ref_cxx -DREF_GGML_BUILD="\"$GGML_BUILD\"" -o "$OUT/mxfp4_ref" "$HERE/tools/ref/mxfp4_ref.cpp" \
+  "${REF_GGML_INC[@]}" "${REF_GGML_LINK[@]}"
+echo "built $OUT/mxfp4_ref"
+BLOOMERY_DATA="$BLOOMERY_DATA" "$OUT/mxfp4_ref" "$DSPARK_MODEL"
+
 ls -l "$BLOOMERY_DATA"/ref/q4k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q6k-x4-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q5f0-ik-dot.txt "$BLOOMERY_DATA"/ref/q5f1-ik-dot.txt \
       "$BLOOMERY_DATA"/ref/q5k-x4-ik-dot.txt "$BLOOMERY_DATA"/ref/q5k-v41-dequant.raw \
-      "$BLOOMERY_DATA"/ref/q5k-v41-dequant.meta
+      "$BLOOMERY_DATA"/ref/q5k-v41-dequant.meta \
+      "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.raw "$BLOOMERY_DATA"/ref/mxfp4-dspark-dequant.meta
