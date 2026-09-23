@@ -11,9 +11,11 @@ default:
 
 # `--features gpu`(R26): 피처 뒤에 본체가 숨은 바이너리는 그 피처를 켜야 검사된다 —
 # gpu-gates 바이너리의 GPU 본체가 끄면 통째로 안 보인다.
-# 빠른 루프: 타입 검사만, 커널은 안 만든다.
+# 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
+# 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
     ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-gpu-gates/deepseek41'
+    ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
 # `deepseek41`도 켠다 — 그 바이너리들은 이 피처가 있어야 컴파일된다. clippy는 디바이스 코드를 만들지 않으므로

@@ -54,7 +54,11 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
     just check        # cargo check --workspace --all-targets — also the step that
                       # refreshes Cargo.lock after a dependency edit — `cargo oxide
                       # build` does not rewrite the lock (lock md5 unchanged
-                      # across oxide builds in the gates-v2 round)
+                      # across oxide builds in the gates-v2 round). box.sh syncs one
+                      # way, so the recipe ends with tools/lock-back.sh, which copies
+                      # the box's rewritten lock into this tree: commit it with the
+                      # edit, or every sync restores the old lock and the timing
+                      # runners refuse their binaries as stale (rc 3)
     just lint         # cargo clippy --workspace; contract is 0 errors
                       # FAIL-first on the box: `box.sh` syncs by content checksum
                       # and does NOT carry the Mac's mtimes, so a changed file
