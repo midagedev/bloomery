@@ -1,8 +1,8 @@
 //! Gate `gate-dspark-read`: the DSpark draft file through the strict reader. Host only: no card,
 //! no gate lock.
 //!
-//! - (i) open: the strict reader opens the draft (`$BLOOMERY_DSPARK_MODEL`, default the `tl37`
-//!   file), MXFP4 experts included.
+//! - (i) open: the strict reader opens the draft (`$BLOOMERY_DSPARK_MODEL`, which the recipe
+//!   exports from the V4.1 profile's `DSPARK_MODEL`), MXFP4 experts included.
 //! - (ii) hparams: `DraftHparams::read` takes every key, and the values this port is built for
 //!   hold (`EXPECT`).
 //! - (iii) tensors: every tensor `dspark::tensors` names is in the file with its shape and type,
@@ -29,11 +29,6 @@ use gguf::{Gguf, Split};
 use model::arch::dspark::{self, Borrow, DraftHparams, DraftInventory, Group};
 
 const NAME: &str = "gate_dspark_read";
-
-/// The draft file when `$BLOOMERY_DSPARK_MODEL` is unset: the copy whose `target_layers` names
-/// the layers whose attention input the reference captures.
-const DEFAULT_DRAFT: &str =
-    "/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf";
 
 /// The harness dump (`tools/ref/mxfp4_ref.cpp`) under `$BLOOMERY_DATA/ref/`.
 const DUMP: &str = "mxfp4-dspark-dequant";
@@ -87,7 +82,11 @@ impl Checks {
 fn run() -> Result<(), GateError> {
     let path = std::env::var_os("BLOOMERY_DSPARK_MODEL")
         .filter(|p| !p.is_empty())
-        .map_or_else(|| PathBuf::from(DEFAULT_DRAFT), PathBuf::from);
+        .map(PathBuf::from)
+        .ok_or(
+            "BLOOMERY_DSPARK_MODEL unset — run through `just gate-dspark-read`, which exports it \
+             from the V4.1 profile's DSPARK_MODEL",
+        )?;
     let mut c = Checks::default();
 
     let draft = Split::open(&path)?;

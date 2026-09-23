@@ -10,6 +10,9 @@
 #
 #   MODEL           shard 1 of the split set; the loader follows split.count from there.
 #                   BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored, as in deepseek2.sh
+#   DSPARK_MODEL    the DSpark draft: the copy whose target_layers names the layers whose attention
+#                   input the reference captures. BLOOMERY_DSPARK_MODEL moves it. gate-dspark-read
+#                   exports it to the gate under that name; markov-accept passes it as the draft argument
 #   IK              moves the whole ik tree. The default is our V4.1 port (PR #2455) with the index-key
 #                   fix (PR #2507) on the local branch v41/idxkey-fix, a worktree of the V2-Lite
 #                   profile's tree; its V4.1 path has only run on the CPU (-ngl 0). The two profiles'
@@ -62,8 +65,9 @@
 MODEL_NAME=deepseek41
 : "${IK:=/home/user/ik-idxkey}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}
+DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 : "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe 34 -t 32 --defer-experts}"
-: "${IK_GPU_ENV:=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
+: "${IK_GPU_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_deepseek41}"
 : "${REF_SET_CUDA:=ref_cuda_deepseek41}"

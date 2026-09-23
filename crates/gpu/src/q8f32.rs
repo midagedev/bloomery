@@ -1052,7 +1052,7 @@ impl Q8F32Kernels {
                 },
             );
         }
-        let (n_rows, k, _) = q8_0_launch_dims("enqueue_q8_0_gemv", qs, d, x.len(), m, y.len())?;
+        let (n_rows, k) = q8_0_launch_dims("enqueue_q8_0_gemv", qs, d, x.len(), m, y.len())?;
         let prep =
             self.module
                 .prepare_q8_0_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
@@ -1080,7 +1080,8 @@ impl Q8F32Kernels {
             y,
         } = a;
         let what = "enqueue_q8_0_gemv_mcol";
-        let (n_rows, k, m) = q8_0_launch_dims(what, qs, d, x.len(), m, y.len())?;
+        let (n_rows, k) = q8_0_launch_dims(what, qs, d, x.len(), m, y.len())?;
+        let m = launch_u32(what, "m", m)?;
         let (y_row, y_col) = match out {
             GemvOut::RowMajor => (m, 1),
             GemvOut::TokenMajor => (1, n_rows),
@@ -1259,7 +1260,8 @@ pub struct Q8_0GemvHeadsMcolArgs<'a> {
 
 /// The two Q8_0 gemv launchers' shared checks: geometry as
 /// [`check_gemv_geometry`] with `k = d.cols() * 32`, and `qs` the matching
-/// word plane. Returns `(n_rows, k, m)` as the launch's `u32`s.
+/// word plane. Returns `(n_rows, k)` as the launch's `u32`s; `m` is checked
+/// here but converted only by the launcher that passes it on.
 fn q8_0_launch_dims(
     what: &'static str,
     qs: &DeviceTensor<u32>,
@@ -1267,7 +1269,7 @@ fn q8_0_launch_dims(
     x_len: usize,
     m: usize,
     y_len: usize,
-) -> Result<(u32, u32, u32), GpuError> {
+) -> Result<(u32, u32), GpuError> {
     let n_rows = d.rows();
     let k = d.cols() * 32;
     check_gemv_geometry(what, n_rows, k, x_len, m, y_len)?;
@@ -1286,7 +1288,6 @@ fn q8_0_launch_dims(
     Ok((
         launch_u32(what, "n_rows", n_rows)?,
         launch_u32(what, "k", k)?,
-        launch_u32(what, "m", m)?,
     ))
 }
 

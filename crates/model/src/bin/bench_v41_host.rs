@@ -460,59 +460,51 @@ fn bytes_of(ws: &[Weight<'_>]) -> u64 {
     ws.iter().map(|w| w.bytes().len() as u64).sum()
 }
 
-/// One output block per weight, off the pool, for an `_into` dispatch.
-fn blocks(ws: &[Weight<'_>]) -> Vec<Tensor2> {
-    ws.iter().map(|w| Tensor2::scratch(w.n(), 1)).collect()
+/// The engine shapes' output blocks, taken once and reused by every token
+/// so no timed token takes a block: `gu` holds gate and up interleaved per
+/// expert, `down` and `par` one block per expert. Sized for `slots` experts;
+/// a layer with fewer uses the prefix. Every cell a dispatch reads is one it
+/// wrote in the same token.
+struct Blocks {
+    gu: Vec<Tensor2>,
+    down: Vec<Tensor2>,
+    par: Vec<Tensor2>,
+}
+
+impl Blocks {
+    /// Blocks for `slots` experts of `layers`, whose matrices must all have
+    /// the first layer's row counts.
+    fn new(layers: &[Layer<'_>], slots: usize) -> Result<Blocks, BenchError> {
+        let first = layers.first().ok_or("no layers")?;
+        let rows = |l: &Layer<'_>| [GATE, UP, DOWN].map(|m| l.weight(0, m).n());
+        let [n_gate, n_up, n_down] = rows(first);
+        if n_gate != n_up || layers.iter().any(|l| rows(l) != [n_gate, n_up, n_down]) {
+            return Err("expert matrices differ in row count across layers".into());
+        }
+        let take = |n: usize, count: usize| (0..count).map(|_| Tensor2::scratch(n, 1)).collect();
+        Ok(Blocks {
+            gu: take(n_gate, 2 * slots),
+            down: take(n_down, slots),
+            par: take(n_gate, slots),
+        })
+    }
 }
 
 /// The engine's shape: gate and up of every expert in one group, the
 /// weights interleaved per expert as the host tier lays them out, each read
 /// from its own shard, then one down group whose inputs are the SwiGLU
 /// combines.
+///
+/// Its outputs land in the prefix of `b`: gate and up of expert `i` in
+/// `b.gu[2i]` and `b.gu[2i + 1]`, down and combine in `b.down[i]`, `b.par[i]`.
 fn engine_layer(
     l: &Layer<'_>,
     slots: &[usize],
     x: &Tensor2,
+    b: &mut Blocks,
     tally: &mut Tally,
-) -> Result<LayerOut, ModelError> {
-    let n = slots.len();
-    let xs = vec![x; 2 * n];
-    let ws: Vec<Weight<'_>> = slots
-        .iter()
-        .flat_map(|&s| [l.weight(s, GATE), l.weight(s, UP)])
-        .collect();
-    let mut gu = blocks(&ws);
-    let t0 = Instant::now();
-    matmul_q_group_into("host_gate_up", &ws, &xs, &mut gu)?;
-    tally.add("gate+up", bytes_of(&ws), t0);
-    let (mut gate, mut up) = (Vec::with_capacity(n), Vec::with_capacity(n));
-    let mut gu = gu.into_iter();
-    while let (Some(g), Some(u)) = (gu.next(), gu.next()) {
-        gate.push(g);
-        up.push(u);
-    }
-    let dw: Vec<Weight<'_>> = slots.iter().map(|&s| l.weight(s, DOWN)).collect();
-    let srcs: Vec<GroupInput<'_>> = gate
-        .iter()
-        .zip(&up)
-        .map(|(g, u)| GroupInput::Swiglu(g, u))
-        .collect();
-    let (mut down, mut par) = (
-        blocks(&dw),
-        gate.iter()
-            .map(|g| Tensor2::scratch(g.ne0, 1))
-            .collect::<Vec<_>>(),
-    );
-    let t0 = Instant::now();
-    matmul_q_group_swiglu_into("host_down", &dw, &srcs, &mut down, &mut par)?;
-    tally.add("down", bytes_of(&dw), t0);
-    drop(srcs);
-    Ok(LayerOut {
-        gate,
-        up,
-        down,
-        par,
-    })
+) -> Result<(), ModelError> {
+    engine_rows_layer(l, slots, &[x], b, tally)
 }
 
 /// Probe shape for a k-token step: `xs.len()` rows, row `i` owning the
@@ -523,8 +515,10 @@ fn engine_rows_layer(
     l: &Layer<'_>,
     slots: &[usize],
     xs: &[&Tensor2],
+    b: &mut Blocks,
     tally: &mut Tally,
 ) -> Result<(), ModelError> {
+    let n = slots.len();
     let per_row = slots.len() / xs.len();
     let xin: Vec<&Tensor2> = (0..slots.len())
         .flat_map(|j| [xs[j / per_row]; 2])
@@ -533,23 +527,17 @@ fn engine_rows_layer(
         .iter()
         .flat_map(|&s| [l.weight(s, GATE), l.weight(s, UP)])
         .collect();
-    let mut gu = blocks(&ws);
     let t0 = Instant::now();
-    matmul_q_group_into("host_gate_up", &ws, &xin, &mut gu)?;
+    matmul_q_group_into("host_gate_up", &ws, &xin, &mut b.gu[..2 * n])?;
     tally.add("gate+up", bytes_of(&ws), t0);
     let dw: Vec<Weight<'_>> = slots.iter().map(|&s| l.weight(s, DOWN)).collect();
-    let (pairs, _) = gu.as_chunks::<2>();
+    let (pairs, _) = b.gu[..2 * n].as_chunks::<2>();
     let srcs: Vec<GroupInput<'_>> = pairs
         .iter()
         .map(|[g, u]| GroupInput::Swiglu(g, u))
         .collect();
-    let mut down = blocks(&dw);
-    let mut par: Vec<Tensor2> = pairs
-        .iter()
-        .map(|[g, _]| Tensor2::scratch(g.ne0, 1))
-        .collect();
     let t0 = Instant::now();
-    matmul_q_group_swiglu_into("host_down", &dw, &srcs, &mut down, &mut par)?;
+    matmul_q_group_swiglu_into("host_down", &dw, &srcs, &mut b.down[..n], &mut b.par[..n])?;
     tally.add("down", bytes_of(&dw), t0);
     Ok(())
 }
@@ -1386,20 +1374,21 @@ fn check_layer(
     x: &Tensor2,
 ) -> Result<(), BenchError> {
     let mut tally = Tally::default();
-    let out = engine_layer(l, slots, x, &mut tally)?;
+    let n = slots.len();
+    let mut b = Blocks::new(std::slice::from_ref(l), n)?;
+    engine_layer(l, slots, x, &mut b, &mut tally)?;
     let pm = per_matrix_layer(l, slots, x, &mut tally)?;
-    let pairs = [
-        (&out.gate, &pm.gate),
-        (&out.up, &pm.up),
-        (&out.down, &pm.down),
-        (&out.par, &pm.par),
-    ];
-    let same = pairs.iter().all(|(a, b)| {
+    let gate: Vec<&Tensor2> = b.gu.iter().step_by(2).collect();
+    let up: Vec<&Tensor2> = b.gu.iter().skip(1).step_by(2).collect();
+    let ours = [gate, up, b.down.iter().collect(), b.par.iter().collect()];
+    let theirs = [&pm.gate, &pm.up, &pm.down, &pm.par];
+    let same = ours.iter().zip(theirs).all(|(a, b)| {
         a.len() == b.len()
             && a.iter()
                 .zip(b.iter())
                 .all(|(a, b)| bits_equal(&a.data, &b.data))
     });
+    let [gate, up, down, par] = ours;
     let line = format!(
         "check layer={} shape=per-matrix experts={} outputs_bits_equal_engine={same}",
         l.index,
@@ -1409,11 +1398,11 @@ fn check_layer(
     let act_gate = kernel_activation(l.view(slots[0], GATE).ty, &x.data)?;
     let act_up = kernel_activation(l.view(slots[0], UP).ty, &x.data)?;
     for (i, &s) in slots.iter().enumerate() {
-        check_weight(c, l, s, GATE, &out.gate[i], &act_gate)?;
-        check_weight(c, l, s, UP, &out.up[i], &act_up)?;
-        check_swiglu(c, l, s, &out.gate[i], &out.up[i], &out.par[i]);
-        let act_down = kernel_activation(l.view(s, DOWN).ty, &out.par[i].data)?;
-        check_weight(c, l, s, DOWN, &out.down[i], &act_down)?;
+        check_weight(c, l, s, GATE, gate[i], &act_gate)?;
+        check_weight(c, l, s, UP, up[i], &act_up)?;
+        check_swiglu(c, l, s, gate[i], up[i], par[i]);
+        let act_down = kernel_activation(l.view(s, DOWN).ty, &par[i].data)?;
+        check_weight(c, l, s, DOWN, down[i], &act_down)?;
     }
     Ok(())
 }
@@ -1663,6 +1652,7 @@ impl Bench<'_> {
         arm: Arm,
         ids: &[Vec<usize>],
         t: usize,
+        b: &mut Blocks,
         tally: &mut Tally,
     ) -> Result<(), BenchError> {
         for (l, layer) in self.layers.iter().enumerate() {
@@ -1678,14 +1668,14 @@ impl Bench<'_> {
                     per_matrix_layer(layer, slots, xs[0], tally)?;
                 }
                 Shape::Engine | Shape::EngineSep if arm.rows == 1 => {
-                    engine_layer(layer, slots, xs[0], tally)?;
+                    engine_layer(layer, slots, xs[0], b, tally)?;
                 }
                 Shape::EngineSep => {
                     for (row, x) in slots.chunks_exact(arm.n_host).zip(&xs) {
-                        engine_layer(layer, row, x, tally)?;
+                        engine_layer(layer, row, x, b, tally)?;
                     }
                 }
-                Shape::Engine => engine_rows_layer(layer, slots, &xs, tally)?,
+                Shape::Engine => engine_rows_layer(layer, slots, &xs, b, tally)?,
             }
         }
         Ok(())
@@ -1702,12 +1692,13 @@ impl Bench<'_> {
         tokens: Option<usize>,
         target_ms: f64,
     ) -> Result<ArmRound, BenchError> {
+        let mut blocks = Blocks::new(&self.layers, arm.n_host * arm.rows)?;
         let mut scratch = Tally::default();
         let mut warm_ms = Vec::with_capacity(warmup);
         for t in 0..warmup {
             let ids = self.draw(arm.n_host * arm.rows, round, t);
             let t0 = Instant::now();
-            self.token(arm, &ids, t, &mut scratch)?;
+            self.token(arm, &ids, t, &mut blocks, &mut scratch)?;
             warm_ms.push(t0.elapsed().as_secs_f64() * 1e3);
         }
         let paced = &warm_ms[usize::from(warm_ms.len() > 1)..];
@@ -1722,7 +1713,7 @@ impl Bench<'_> {
         for t in warmup..warmup + tokens {
             let ids = self.draw(arm.n_host * arm.rows, round, t);
             let t0 = Instant::now();
-            self.token(arm, &ids, t, &mut tally)?;
+            self.token(arm, &ids, t, &mut blocks, &mut tally)?;
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
         }
         let d1 = threads::pool().stats().dispatches;

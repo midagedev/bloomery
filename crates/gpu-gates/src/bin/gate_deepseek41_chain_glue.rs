@@ -332,7 +332,9 @@ mod gate {
         b: &mut Bufs,
     ) -> Result<(), GpuError> {
         glue.enqueue_embed(gpu, &b.params, &mut b.streams, &mut b.input)?;
-        glue.enqueue_engram_kv(gpu, w, &b.params)?;
+        for s in &b.sites {
+            glue.enqueue_engram_kv_at(gpu, w, &b.params, s.layer)?;
+        }
         for s in &mut b.sites {
             let step = EngramStep {
                 streams: &s.streams,

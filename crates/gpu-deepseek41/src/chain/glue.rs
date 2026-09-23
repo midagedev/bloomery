@@ -463,22 +463,6 @@ impl Glue {
         Ok(())
     }
 
-    /// Enqueue every engram site's token-only work, in site order
-    /// ([`Glue::enqueue_engram_kv_at`] each). Asynchronous, allocation-free,
-    /// capturable.
-    pub fn enqueue_engram_kv(
-        &mut self,
-        gpu: &Gpu,
-        w: &Weights,
-        params: &DeviceBuffer<u32>,
-    ) -> Result<(), GpuError> {
-        for s in 0..self.sites.len() {
-            let layer = self.sites[s].layer;
-            self.enqueue_engram_kv_at(gpu, w, params, layer)?;
-        }
-        Ok(())
-    }
-
     /// Enqueue the token-only work of the engram site at `layer`: its rows
     /// from the image `params` dequantized, `engram_wkv` over them, and the
     /// key norm. Three launches, reading no stream. Asynchronous,

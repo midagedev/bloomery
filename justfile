@@ -352,8 +352,11 @@ ab-decode *DIRS: build-decode
     for d in {{DIRS}}; do names="$names $(basename "$d")"; done
     ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS} ${BLOOMERY_AB_DEPTH:+BLOOMERY_AB_DEPTH=$BLOOMERY_AB_DEPTH} ${BLOOMERY_AB_ENVS:+BLOOMERY_AB_ENVS='$BLOOMERY_AB_ENVS'} ${BLOOMERY_AB_IK:+BLOOMERY_AB_IK=$BLOOMERY_AB_IK} bash tools/ref/ab-decode.sh$names"
 
+# The Mac shell's BLOOMERY_PROFILE_DEPTH and BLOOMERY_PROFILE_LEVELS ride in front of the remote command, as in
+# ab-decode; lever env goes through BLOOMERY_BOX_ENV:
+#   BLOOMERY_BOX_ENV="BLOOMERY_FLASH_SEGMENTS=8" BLOOMERY_PROFILE_DEPTH=1024 just measure-profile
 measure-profile: build-decode
-    ./tools/box.sh 'bash tools/ref/profile-measure.sh'
+    ./tools/box.sh "${BLOOMERY_PROFILE_DEPTH:+BLOOMERY_PROFILE_DEPTH=$BLOOMERY_PROFILE_DEPTH} ${BLOOMERY_PROFILE_LEVELS:+BLOOMERY_PROFILE_LEVELS='$BLOOMERY_PROFILE_LEVELS'} bash tools/ref/profile-measure.sh"
 
 # 디코드 스텝의 스레드별 perf 표(리드 전용): 임대·증인 아래, 프리필이 끝난 뒤 pid에 붙어 cpu-clock으로 뜬다.
 # `perf report --tid`는 메인 스레드의 dot 커널을 통째로 빼고 스핀만 보여 줬으므로(perf 6.8) `perf script`로 집계한다.
@@ -701,8 +704,9 @@ time-gpu-ds41 *ARGS:
 # V4.1 decode by depth, both engines in one lease on the A6000 (lead-only): our arms `<D>` (generate_ds41 --depth D,
 # placement (a)) and ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS), alternated, rounds rotated.
 # tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
+# With no ours arm (every arm `ik:<D>`) generate_ds41 is not built; no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/depth-ds41.sh {{ARMS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in ik:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
 
 # V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록.
 nsys-gpu-ds41 *DEPTHS:
@@ -768,10 +772,10 @@ gpu-ab *ARGS:
 # 드래프트를 열어 hparams·텐서 표·바이트 타일링을 보고, mxfp4_ref 덤프(just build-ref)와 비트 대조하고, 전문가 스케일
 # 바이트를 전부 훑는다. 바이트 표를 찍는다. 대상 쪽 텐서(token_embd·output)를 읽으려고 V4.1 프로필로 돈다. 호스트 전용.
 gate-dspark-read:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gguf --lib -- quant --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_dspark_read && bash tools/host-gate.sh gate_dspark_read'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gguf --lib -- quant --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_dspark_read && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/host-gate.sh gate_dspark_read'
 
 # DSpark Markov 헤드 단독 초안(E6)의 오프라인 수락률 — 시간을 재지 않는 CPU 실행이고 임대를 잡지 않는다. 먼저 self-test,
 # 다음 코퍼스 스트림마다 앞 50k토큰의 acc/positions·top-2·top-4와 E5 markov1 재계산, 이전 토큰별 argmax 표의 해시와
 # 위치별 경로와의 불일치 수(0이어야 한다)를 찍는다. 목표는 코퍼스 텍스트 자체다. 인자는 bin에 그대로 간다(--tokens N).
 markov-accept *ARGS:
-    ./tools/box.sh 'cargo build --release -p bloomery-model --bin markov-accept && bash tools/host-gate.sh markov-accept --self-test && D=$BLOOMERY_DATA/engram && bash tools/host-gate.sh markov-accept /models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf $D/corpus-code.ids $D/corpus-prose.ids $D/corpus-prose-all.ids $D/corpus-korean.ids $D/corpus-threads.ids {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-model --bin markov-accept && bash tools/host-gate.sh markov-accept --self-test && S=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && D=$BLOOMERY_DATA/engram && bash tools/host-gate.sh markov-accept "$S" $D/corpus-code.ids $D/corpus-prose.ids $D/corpus-prose-all.ids $D/corpus-korean.ids $D/corpus-threads.ids {{ARGS}}'

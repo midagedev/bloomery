@@ -32,10 +32,11 @@
 //!   [`Site::copy_rows`] and [`prefetch::Prefetcher`] exist: the helper thread
 //!   advises, faults and copies, and the step thread gets one memcpy.
 //!
-//! The strict reader ([`gguf::Gguf`]) refuses these shards: the engine has no
-//! `GgmlType` for Q8_0-as-a-weight yet. So the header comes from
-//! [`gguf::inventory_of`], which parses headers only, and this crate owns the
-//! mapping.
+//! The header comes from [`gguf::inventory_of`], which parses headers only and
+//! never populates a mapping, and this crate maps each shard itself so the
+//! mapping can be `MADV_RANDOM`. The strict reader ([`gguf::Gguf`]) sizes
+//! Q8_0 as well; this crate does not go through it, since the header and its
+//! own mapping are all it needs.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -65,7 +66,11 @@ fn site_name(layer_id: u32) -> String {
 
 /// Every `*.gguf` of a split set, in name order.
 fn shards_in(dir: &Path) -> Result<Vec<PathBuf>, EngramError> {
-    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)?
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|source| EngramError::ShardDir {
+            path: dir.to_path_buf(),
+            source,
+        })?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
         .collect();
@@ -75,8 +80,23 @@ fn shards_in(dir: &Path) -> Result<Vec<PathBuf>, EngramError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngramError {
+    /// An IO error with no file behind it: spawning the prefetch helper
+    /// thread is the only producer. File and mapping errors carry their
+    /// context in [`EngramError::SiteIo`] and [`EngramError::ShardDir`].
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{name} in {path}: {op}: {source}")]
+    SiteIo {
+        name: String,
+        path: PathBuf,
+        op: &'static str,
+        source: std::io::Error,
+    },
+    #[error("listing shards in {path}: {source}")]
+    ShardDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("gguf header: {0}")]
     Header(#[from] LoadError),
     #[error("no shard carries the engram metadata; looked for {0}")]
@@ -237,15 +257,23 @@ impl Site {
         // never is on the platforms this crate builds for.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
 
-        let file = File::open(path)?;
+        let io = |op: &'static str| {
+            move |source| EngramError::SiteIo {
+                name: t.name.clone(),
+                path: path.to_path_buf(),
+                op,
+                source,
+            }
+        };
+        let file = File::open(path).map_err(io("open"))?;
         // SAFETY: the file is opened read-only and nothing maps it writable; a
         // concurrent truncation would surface as SIGBUS, the same contract
         // `gguf::Gguf::open_backed` and ik_llama.cpp's own loader accept.
-        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let map = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(io("mmap"))?;
         // Random: `do_sync_mmap_readahead` returns early on VM_RAND_READ, so each
         // fault reads one page instead of 128 KiB around it. Every row of this
         // table is somewhere else; read-around would be 32x the bytes for nothing.
-        map.advise(Advice::Random)?;
+        map.advise(Advice::Random).map_err(io("madvise(RANDOM)"))?;
 
         Ok(Site {
             name: t.name.clone(),
@@ -337,11 +365,13 @@ impl Site {
             }
             // `advise_range` rounds the start down to a page and the kernel
             // rounds the length up, so a row that straddles advises both pages.
-            self.map.advise_range(
-                Advice::WillNeed,
-                self.file_offset(id) as usize,
-                self.row_bytes as usize,
-            )?;
+            self.map
+                .advise_range(
+                    Advice::WillNeed,
+                    self.file_offset(id) as usize,
+                    self.row_bytes as usize,
+                )
+                .map_err(|e| self.io_err("madvise(WILLNEED)", e))?;
         }
         Ok(())
     }
@@ -365,7 +395,9 @@ impl Site {
                 });
             }
             let (first, span) = self.page_span(self.file_offset(id), self.row_bytes);
-            self.map.advise_range(Advice::PopulateRead, first, span)?;
+            self.map
+                .advise_range(Advice::PopulateRead, first, span)
+                .map_err(|e| self.io_err("madvise(POPULATE_READ)", e))?;
         }
         Ok(())
     }
@@ -407,7 +439,7 @@ impl Site {
                     )
                 };
                 if rc != 0 {
-                    return Err(EngramError::Io(std::io::Error::last_os_error()));
+                    return Err(self.io_err("mincore", std::io::Error::last_os_error()));
                 }
                 all = vec[..len.div_ceil(page)].iter().all(|b| b & 1 == 1);
                 at += len;
@@ -490,6 +522,16 @@ impl Site {
         (first as usize, (end - first) as usize)
     }
 
+    /// `source` from `op` on this table, with the table's name and file.
+    fn io_err(&self, op: &'static str, source: std::io::Error) -> EngramError {
+        EngramError::SiteIo {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            op,
+            source,
+        }
+    }
+
     fn evict_range(&self, at: u64, len: u64) -> Result<(), EngramError> {
         let (first, span) = self.page_span(at, len);
 
@@ -500,7 +542,8 @@ impl Site {
         // anonymous.
         unsafe {
             self.map
-                .unchecked_advise_range(UncheckedAdvice::DontNeed, first, span)?;
+                .unchecked_advise_range(UncheckedAdvice::DontNeed, first, span)
+                .map_err(|e| self.io_err("madvise(DONTNEED)", e))?;
         }
         // SAFETY: the descriptor is this file's own and `self` outlives the call.
         let rc = unsafe {
@@ -512,7 +555,10 @@ impl Site {
             )
         };
         if rc != 0 {
-            return Err(EngramError::Io(std::io::Error::from_raw_os_error(rc)));
+            return Err(self.io_err(
+                "posix_fadvise(DONTNEED)",
+                std::io::Error::from_raw_os_error(rc),
+            ));
         }
         Ok(())
     }

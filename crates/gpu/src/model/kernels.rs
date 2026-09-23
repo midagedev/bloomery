@@ -78,10 +78,6 @@ mod step_kernels {
     /// rows_per_head]`. `n_rows` must be `n_heads * rows_per_head`; every
     /// store is disjoint because each (head, slot) pair belongs to exactly
     /// one row.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
-    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -93,6 +89,10 @@ mod step_kernels {
             x.len() >= (n_heads - 1) * x_head_stride + k,
             y.len() >= (n_heads - 1) * y_head_stride + y_off + rows_per_head
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
     pub fn q8_0_gemv_heads(
         qs: &[u32],
@@ -150,7 +150,6 @@ mod step_kernels {
     /// `(head_base + heads) * row_stride_per_head` — the bound the launch
     /// contract puts on `w`. Stores are disjoint: each (head, slot) pair
     /// belongs to exactly one row.
-    #[allow(clippy::too_many_arguments)]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -162,6 +161,10 @@ mod step_kernels {
             d8.len() >= heads * 2 * n_sb,
             y.len() >= (head_base + heads - 1) * y_head_stride + rows_per_head
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
     pub fn q3k_gemv_heads(
         w: &[u32],
@@ -223,7 +226,6 @@ mod step_kernels {
     /// `q3k_row_dot` still sees a full warp. Every row's loads, accumulation
     /// order and store are the ones the two-launch form runs, so the outputs
     /// agree bit for bit.
-    #[allow(clippy::too_many_arguments)]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -237,6 +239,10 @@ mod step_kernels {
             d8_hi.len() >= (heads - split) * 2 * n_sb,
             y.len() >= (head_base + heads - 1) * y_head_stride + rows_per_head
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
     pub fn q3k_gemv_heads_pair(
         w: &[u32],

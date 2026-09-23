@@ -1375,7 +1375,8 @@ fn raw_device_name(dev: cuda_core::sys::CUdevice) -> Result<String, GpuError> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// A CUDA context on device 0 with this crate's device module loaded and one
+/// A CUDA context on one device ([`Gpu::new`]: device 0; [`Gpu::for_card`]: the
+/// card a name picks) with this crate's device module loaded and one
 /// non-blocking stream that every launch and copy of this engine goes on.
 ///
 /// The stream is a real `cuStreamCreate` stream, not the legacy default: the
