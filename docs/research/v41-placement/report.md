@@ -54,7 +54,7 @@ The file → resident formula for each `DevWeight` format (`crates/gpu/src/weigh
 | q3_K | 179 | 155,738,992,640 | KQuant | KQuant | = file | — |
 | q4_K | 38 | 96,825,507,840 | KQuant | KQuant (`_sel` missing, §6) | = file | — |
 | q6_K | 1 | 542,976,000 | KQuant | KQuant | = file | — |
-| q8_0, non-engram | 330 | 7,264,010,240 | **refused** at `gguf/src/lib.rs:212-219` (tag 8 → `Unknown`), then `weights.rs:253/356` | Q8_0 planes, read by `q8_0_gemv` (`q8f32.rs:467`, f32 activations, M ≤ 8) | 7,691,304,960 (+427,294,720) | f16 scale plane: = file (kernel change) |
+| q8_0, non-engram | 330 | 7,264,010,240 | **refused** at `gguf/src/lib.rs:212-219` (tag 8 → `Unknown`), then `weights.rs:253/356` | Q8_0 planes, read by `q8_0_gemv` (`q8f32.rs:467`, f32 activations, M ≤ 8) | ~~7,691,304,960 (+427,294,720)~~ 7,264,010,240 (= file, b11c) | ~~f16 scale plane: = file (kernel change)~~ done (b11c) |
 | q8_0, `engram_embd` | 2 | 208,902,215,200 | same | never on a GPU; rows are gathered | — | — |
 | bf16 | 45 | 1,481,277,440 | **refused** at `lib.rs:212` (tag 30) | decode to F32, read by `f32_gemv` (`q8f32.rs:402`) | router 314,572,800; `engram_{k,q}` 327,680; `token_embd` on the host | bf16 variant of `f32_gemv`: = file |
 | q5_K | 2 | 6,228,541,440 | **refused**: `quant.rs:198` (no dequant), `weights.rs:253/356` | Q5_1 layout. Values are exact (d·sc and dmin·m fit in f32), but `q5_1_gemv` has no `_sel` form, so no kernel exists for routed use | 14,344,519,680 (2.30×) | native q5_K kernel (missing): = file; f32: 36,238,786,560 |
