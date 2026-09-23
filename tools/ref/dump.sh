@@ -97,6 +97,12 @@ fi
 # BLOOMERY_REF_SET only renames the destination (e.g. ref_cuda_v2), so an instrumented
 # dumper can produce a second set beside the one the gates read without touching it.
 SET=${BLOOMERY_REF_SET:-$SET}
+# REF_THREADS is ik's -t (default 32); any other count joins the set name as _t<N>, so no reader takes it for 32.
+THREADS=${REF_THREADS:-32}
+case $THREADS in
+  ''|*[!0-9]*|0*) echo "dump.sh: REF_THREADS must be a positive integer, got '$THREADS'" >&2; exit 2 ;;
+esac
+if [ "$THREADS" != 32 ]; then SET=${SET}_t$THREADS; fi
 case $SET in
   bin|*/*|.*|*.staging|*.old|'') echo "dump.sh: '$SET' cannot name a set" >&2; exit 2 ;;
 esac
@@ -153,7 +159,7 @@ if [ "$BUILD" != unknown ] && ! ikgit diff --quiet HEAD 2>/dev/null; then BUILD=
 
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
-  "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" "${TOKEN_ARGS[@]}" -ngl "$NGL" -c "$CTX" -t 32 \
+  "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" "${TOKEN_ARGS[@]}" -ngl "$NGL" -c "$CTX" -t "$THREADS" \
     "${REF_DUMP_ARGS[@]}" "${STEP_ARGS[@]}"
 if [ "$LEASE" = 1 ]; then witness post-dump; fi
 
@@ -190,7 +196,7 @@ mv "$STAGE" "$REF"
 rm -rf "$REF.old"
 grep -c '^tensor' "$REF/MANIFEST.tsv" | xargs echo "reference tensors:"
 echo "graph inputs: $(grep -c $'^input\t' "$REF/MANIFEST.tsv" || true)  integer twins: $(grep -c $'^int\t' "$REF/MANIFEST.tsv" || true)"
-echo "build: $BUILD  backend: $BACKEND  set: $REF"
+echo "build: $BUILD  backend: $BACKEND  threads: $THREADS  set: $REF"
 if [ -n "$VARIANT" ]; then
   echo "decode step: variant $VARIANT, prefill $STEP_PREFILL, position $STEP_PREFILL, -c $CTX;" \
     "$(grep -c $'^skip-input\t.*\tgraph-scratch$' "$REF/MANIFEST.tsv" || true) graph-scratch leaves"
