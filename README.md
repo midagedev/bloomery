@@ -1,73 +1,98 @@
 # bloomery
 
-An LLM inference engine for one workstation, written to learn what the machine can actually do. Rust host, CUDA kernels written in Rust ([cuda-oxide](https://github.com/NVlabs/cuda-oxide), later [cutile-rs](https://github.com/NVlabs/cutile-rs)), AVX2 kernels for the CPU expert tier. The target model is DeepSeek-V4.1-Flash; the stepping stone everything was first built and gated on is DeepSeek-V2-Lite-Chat Q3_K_M (8.1 GB, MLA attention, 64-expert MoE).
+A Rust inference engine for DeepSeek-V4.1-Flash on one workstation. The host code is Rust, the GPU kernels are CUDA written in Rust ([cuda-oxide](https://github.com/NVlabs/cuda-oxide)), and the CPU expert kernels are AVX2 Rust.
 
-The machine: Threadripper PRO 5975WX (32 cores), 256 GB DDR4, RTX A6000 48 GB, RTX 3090 24 GB. Since 2026-09-22 every timed GPU number is taken on the A6000 (the 3090 dropped off the bus twice under load that day); the 3090 builds and runs the gates. Numbers from the two cards never share a table.
+V4.1-Flash does not fit on one consumer card, so the engine splits every decode step across the machine:
 
-Every claim in this repository is a measurement, and the measurements live in [rig-log](https://github.com/midagedev/rig-log) with the command lines that produced them. Stages and pass criteria are in [`docs/plan.md`](docs/plan.md); the GPU design and its decisions in [`docs/gpu-design.md`](docs/gpu-design.md). Both are written in Korean.
+- **MoE experts are split between the card and the host.** Routed layers keep a set of their experts on the GPU. The rest run on an AVX2 host tier inside the same captured CUDA graph step. Which experts stay on the card can come from a router-frequency list (`BLOOMERY_HOT_LIST`).
+- **engram rows come from NVMe.** V4.1's lookup table is about 195 GiB, so it stays in a memory-mapped file. Each token reads 48 rows of 272 bytes. A helper thread advises every row to the kernel first, then copies them.
+- **A skewed two-row pass.** Two positions run one layer apart in one step, so the card's dense work hides behind the host leg. It is the verification pass for speculative decoding.
+- **An n-gram lookup draft** (`BLOOMERY_DRAFT=lookup`) proposes the next token from the text seen so far. Greedy output is the same with and without it; a gate checks that token for token.
 
-## What runs today
+## Status
 
-**V2-Lite on the GPU.** The whole decode step runs on one card as one captured CUDA graph: gemv kernels for every weight type the model uses (Q3_K, Q4_K, Q6_K, Q5_0, Q5_1, Q8_0, F32), a q8_1 activation quantizer, rms_norm, rope, embedding, MLA latent attention on tensor cores with an in-place KV append, the top-k router, and a fused MoE step that reads expert ids from a device buffer so the captured graph replays under new routing. The end-to-end gate runs the whole chain — 27 layers, the output head and the argmax — against ik_llama.cpp's CUDA greedy decode on 33 prompts × 32 steps. Decode against ik_llama.cpp on the A6000 (300 W), both engines alternating in one lease, three rounds, 96 tokens each (2026-09-22, [rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-22-o-the-depth-table-on-the-new-default-and-the-reversal-is-gone.md)):
+**Numbers first. The text CLI and the server are in progress.** Today the engine takes token ids and returns token ids (`generate_ds41`, see [`docs/BUILD.md`](docs/BUILD.md)). The tokenizer, a chat binary with sampling and streaming, and an OpenAI-compatible endpoint are the next milestones.
 
-| Context depth | bloomery | ik_llama.cpp | Ratio |
+As far as we know (2026-09-24), this is the only Rust engine that runs DeepSeek-V4.1-Flash with CPU expert offloading, with the GPU kernels also written in Rust. If you know of another one, please open an issue.
+
+## Measured numbers
+
+Decode on the RTX A6000 (48 GB), placement plan (a), the router-ranked hot list on the card, per-step instrumentation off, `n = 96`, one fresh process per arm. ik_llama.cpp ran in the same lease window with its closest placement (`llama-bench -gp 6,96`, `-ncmoe 34 --defer-experts`: six whole layers on the card, about the same host work per token, not the same expert set). Source: rig-log [2026-09-24, hot-list placement](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#hot-list-placement-and-real-text-prompt).
+
+| Depth | bloomery step p50 | bloomery tok/s (p50) | ik_llama.cpp tok/s |
 |---:|---:|---:|---:|
-| 6 | 229.5 tok/s | 205.5 tok/s | 1.12× |
-| 1024 | 222.2 tok/s | 194.0 tok/s | 1.15× |
-| 4096 | 199.6 tok/s | 179.0 tok/s | 1.12× |
+| 6 | 35.16 / 35.40 ms | 28.35 | 19.40 / 20.08 |
+| 4096 | 34.33 / 34.38 ms | 29.10 | not measured in this window |
 
-A prompt still goes through the decode graph one token at a time; the prefill GEMM path is not written yet. Part of each layer's experts can run on the CPU tier inside the captured step (`BLOOMERY_HYBRID_NL`), a rehearsal for V4.1's host experts. It is gated against the all-card run, and its timing waits for a quiet-machine measurement.
+Two rounds each, shown as `round 1 / round 2`. The ratio at depth 6 is about 1.4× [derived from the table].
 
-**V2-Lite on the CPU.** A full forward pass with a KV cache on a 32-thread pool. The quantized dot products are fused int8 AVX2 kernels for Q3_K, Q4_K, Q5_0, Q5_1 and Q6_K, written against ik_llama.cpp's `iqk_mul_mat` kernels as the reference: the activation encoders are byte-identical to ik's, the kernels agree to 1 ULP on the same rows, and the engine's logits are bit-identical across thread counts. On one core, the four with a counterpart in ik are 2–14 % slower than ik's own (Q3_K has none to compare with; 2026-09-23). Decode against ik_llama.cpp's fastest flag set, the two engines alternating in one lease (2026-09-21): at short context (6–100 tokens) 86.0 vs 84.1 tok/s, ours ahead in 6 of 6 rounds; at 1024 tokens of context 71.3 vs 77.9; at 4096, 45.7 vs 64.4. Short-context decode is bandwidth-bound on this host (the saturation study is [`docs/RESULTS-mul35-saturation.md`](docs/RESULTS-mul35-saturation.md)); the depth gap is the attention key scan, which reads the shared MLA key rows once per head, and is the open CPU item.
+Read these numbers with their conditions:
 
-**DeepSeek-V4.1-Flash (in progress).** The reference is ik_llama.cpp's V4.1 support, which is our port ([ik_llama.cpp#2455](https://github.com/ikawrakow/ik_llama.cpp/pull/2455), merged 2026-09-21); tensors dumped from its CPU backend are the oracle. V4.1's own operations are GPU kernels in `crates/gpu-deepseek41`, each gated against those dumps: rope, the router and experts with the SwiGLU clamp, the engram key norm and gate, the hyper-connections, the block-diagonal `wo_a`, attention over the prefix and over indexer-selected rows with sinks, the KV compressor and the index keys. The indexer's scoring and top-k are not on the GPU yet, and the step is not assembled: this engine has not produced a V4.1 token. What is measured so far are the legs of one token:
+- **The prompt is synthetic.** The depth prompt is a fixed pseudo-random id sequence, and its output collapses into a few repeating tokens. With a 4096-token prose prompt the step was 42.59 ms against 38.41 ms for the synthetic prompt (prefix placement, instrumentation on, same window). Expect real text to be about 10 % slower [derived from those two]. Of the extra 4.2 ms, 0.9 ms is the host leg; the rest is cold engram rows (major faults).
+- **The card is an A6000, not a 3090.** A single-3090 run (placement `gate`) has not been timed yet. The target profile and what it is expected to cost are in [`docs/HARDWARE.md`](docs/HARDWARE.md).
+- **No draft is on.** The skewed two-row pass costs 1.21–1.29 plain steps (A6000, depth 6), so a draft wins once it is accepted more than 21–29 % of the time [derived from that ratio]. The served lookup draft has not been timed yet.
 
-- The GPU matrix-vector products of one decode token, as one captured graph on the A6000 with synthetic weights and every routed expert on the card (a ceiling, not a step): 24.66 ms, then 19.005 ms after four kernel rounds (2026-09-23).
-- The CPU expert leg on the real file: 129.9 GB/s at 16 threads and no higher at 32, which is 31.1 ms per token with six host experts in every routed layer (4.04 GB; 2026-09-23).
-- engram, the 195 GiB lookup table that stays on NVMe: 48 scattered 272-byte rows per token take 4.69 ms (median, cold) as demand page faults and 0.31 ms when each row's read-ahead is issued a token early (2026-09-22).
+The host tier's bandwidth sets the step. On the same day the host expert leg read 135–137 GB/s at 32 threads: 24.89 ms for 3.37 GB per token in a bench with five host experts per routed layer ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#v41-host-tier-k-rows)).
 
-## How it is checked
+## Target hardware
 
-Each stage has a `just gate-*` recipe that exits non-zero on failure. The oracle is ik_llama.cpp: intermediate tensors dumped from its CPU backend for the CPU path and for V4.1, and from its CUDA backend for the V2-Lite GPU path, compared per tensor. Bands are derived from the two engines' rounding rules or pinned from measurement, and they are not relaxed: a threshold change carries a dated note with its derivation, and every gate has been shown to fail on the defect it guards before the fix went in.
+| | Minimum | Extended |
+|---|---|---|
+| GPU | RTX 3090 24 GB ×1 (sm_86) | RTX 3090 ×2 (the two-card path is not built yet) |
+| CPU | AVX2, 8 DDR4 channels | same |
+| RAM | 256 GB | same |
+| Storage | NVMe for the engram table | same |
 
-A round opens with a prediction — the value and its band, derived from the cost and error models in [`docs/plan.md`](docs/plan.md) — and the measurement checks it. When the two disagree, the wrong term of the model is the finding.
+The development machine is a Threadripper PRO 5975WX (32 cores, 8 DDR4 channels, 264 GB) with an RTX A6000 and an RTX 3090. Details and costs are in [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
-Timing runs only on a quiet machine under a lease file, with the machine state recorded next to each number. The protocol is in rig-log's [`docs/quiet-machine.md`](https://github.com/midagedev/rig-log/blob/main/docs/quiet-machine.md).
+## How it is verified
 
-## Layout
+- **Oracle sets against ik_llama.cpp.** Intermediate tensors are dumped from ik_llama.cpp's CPU backend for V4.1 and compared per tensor and per layer. Integer outputs (engram row ids, router top-6 ids, indexer top-k lists) must match exactly, except where two candidates are within a tie band. Float outputs must stay inside bands derived from the two engines' rounding rules.
+- **Bit gates.** A captured graph replay must equal the eager run bit for bit. The skewed two-row pass must equal two single steps bit for bit, and so must a rollback. Node and launch counts are pinned at build time.
+- **PPL and KLD.** With the hot list, wikitext-2 at 2048 context, 4 chunks, 3090: PPL 1.9003 (bloomery) against 1.8989 (ik_llama.cpp CPU), KLD 0.00601 ± 0.00028, same top token 97.87 % ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#hot-list-ppl-kld)).
+- **A gate is shown to fail** on the defect it guards before the fix goes in. Bands are not relaxed to make a gate pass.
 
-```
-crates/gguf            GGUF reader (split files too) and dequantizers (bit-exact against ggml for the six V2-Lite types)
-crates/model           the model: attention, MoE and the host expert tier, forward pass, KV cache, profiling; V4.1's hyperparameters and tensor names
-crates/qdot            fused AVX2 int8 kernels and their encoders
-crates/threads         the resident worker pool
-crates/engram          V4.1's NVMe-resident lookup table: the IO path, the row hash, the row cache
-crates/gpu             the CUDA Rust kernels, the V2-Lite device model, graph capture, the hybrid MoE boundary
-crates/gpu-deepseek41  V4.1's own GPU kernels (entry points prefixed ds41_)
-crates/gpu-gates       GPU gate binaries, benches and the reference dump loader
-docs/                  plan, design decisions, result ledgers, research notes
-tools/                 box runner, gate runners, timing runners, reference dumpers
-```
+Timing runs only on a quiet machine, under a machine-wide lease, with a witness block around every timed region. The protocol is rig-log's [`docs/quiet-machine.md`](https://github.com/midagedev/rig-log/blob/main/docs/quiet-machine.md).
 
-`crates/q3k-cpu`, `q3k-gemv`, `gpu-spike` and `oxide-ice-unroll` are the spikes and reproducers that preceded the crates above; they are kept because their numbers are cited.
+## Limits
 
-## References
+- **sm_86 only.** Every kernel is built and gated for Ampere (`--arch sm_86`). Other architectures are not tested.
+- **A pinned nightly.** The toolchain is `nightly-2026-08-28`, pinned together with a cuda-oxide git revision. It moves only when the cuda-oxide pin moves.
+- **Measured on an A6000.** Timed numbers come from one card in one machine. The placement plans name the cards they run on (`A6000`, `3090`).
+- **One machine.** The tooling (`tools/box.sh`) assumes a Mac editor and one Linux workstation. [`docs/BUILD.md`](docs/BUILD.md) says what to run on your own host instead.
+- **Greedy only, one token per step.** There is no batched prefill yet, so a prompt is fed one step per token.
 
-The kernels were written by reading ggml's k-quant code: the Q3_K block geometry, the Q8 activation quantization and the AVX2 integer dot-product chains come from there, and accuracy is still defined against ggml's output. Where an algorithm was taken, the source comment points at the original file and line — the usual form for a Rust port, as in [candle](https://github.com/huggingface/candle)'s `k_quants.rs`. Baseline speeds are measured with [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) on the same machine. Both are MIT.
+## Build
+
+See [`docs/BUILD.md`](docs/BUILD.md). In one line: a Linux x86-64 host with AVX2, CUDA 13.3, LLVM 21 and `cargo-oxide`, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41`.
+
+## More
+
+- Measurements with their command lines: [rig-log](https://github.com/midagedev/rig-log), under `log/`.
+- Plan, stages and cost models: [`docs/plan.md`](docs/plan.md). GPU design: [`docs/gpu-design.md`](docs/gpu-design.md). Placement: [`docs/v41-placement.md`](docs/v41-placement.md). These are written in Korean.
+- The working contract for contributors and agents: [`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+The engine started on DeepSeek-V2-Lite-Chat Q3_K_M, and that path still runs and is gated. On the A6000 (300 W), V2-Lite decode ran at 229.5 tok/s against ik_llama.cpp's 205.5 at depth 6, and 199.6 against 179.0 at depth 4096 (2026-09-22, [rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-22-o-the-depth-table-on-the-new-default-and-the-reversal-is-gone.md)).
 
 ## Upstream
 
-What this work needed from its reference and its toolchain went upstream; each fix carries a case that fails before the patch:
+What this work needed from its reference and its toolchain went upstream:
 
-- ik_llama.cpp [#2455](https://github.com/ikawrakow/ik_llama.cpp/pull/2455) — DeepSeek-V4.1 support (the oracle above), merged 2026-09-21
-- ik_llama.cpp [#2493](https://github.com/ikawrakow/ik_llama.cpp/pull/2493) — the derived MLA weights allocated with the backend's padded size (V2-Lite prompt processing on CUDA turned to garbage once a ubatch held 9 or more tokens), merged 2026-09-21
-- ik_llama.cpp [#2501](https://github.com/ikawrakow/ik_llama.cpp/pull/2501) — an element count instead of bytes for the flash-attention fixup pool, merged 2026-09-22
-- ik_llama.cpp [#2508](https://github.com/ikawrakow/ik_llama.cpp/pull/2508) — `-no-fidx` to turn off the fused indexer top-k, merged 2026-09-23
-- ik_llama.cpp [#2507](https://github.com/ikawrakow/ik_llama.cpp/pull/2507) — V4.1 index keys from the pre-RoPE compressed latent, as the reference model does; open — the maintainer measured a higher perplexity at 4096 context, and the cause is being reproduced
-- cuda-oxide [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314) — the constant folder crashed on a shift whose amount has a different integer width (`u32 << usize` after `#[unroll]`); open, rebased and extended with tests by the maintainer
+- ik_llama.cpp [#2455](https://github.com/ikawrakow/ik_llama.cpp/pull/2455): DeepSeek-V4.1 support, the oracle above. Merged 2026-09-21.
+- ik_llama.cpp [#2493](https://github.com/ikawrakow/ik_llama.cpp/pull/2493): padded allocation for the derived MLA weights. Merged 2026-09-21.
+- ik_llama.cpp [#2501](https://github.com/ikawrakow/ik_llama.cpp/pull/2501): an element count instead of bytes for the flash-attention fixup pool. Merged 2026-09-22.
+- ik_llama.cpp [#2508](https://github.com/ikawrakow/ik_llama.cpp/pull/2508): `-no-fidx` to turn off the fused indexer top-k. Merged 2026-09-23.
+- ik_llama.cpp [#2507](https://github.com/ikawrakow/ik_llama.cpp/pull/2507): V4.1 index keys from the pre-RoPE compressed latent. Open.
+- cuda-oxide [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314): a constant-folder crash on a shift with mixed integer widths. Merged 2026-09-23.
 
-Toolchain candidates not filed yet are in [`docs/upstream/nvlabs-ledger.md`](docs/upstream/nvlabs-ledger.md); the full list, with the ones from before this repository, is rig-log's [`docs/upstream-contributions.md`](https://github.com/midagedev/rig-log/blob/main/docs/upstream-contributions.md).
+Toolchain issues not filed yet are in [`docs/upstream/nvlabs-ledger.md`](docs/upstream/nvlabs-ledger.md).
+
+## References and credits
+
+The kernels were written by reading ggml's k-quant code and ik_llama.cpp's `iqk_mul_mat` kernels, and accuracy is defined against their output. Where an algorithm was taken, the source comment points at the original file. Both projects are MIT. Baseline speeds are measured with [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) on the same machine.
+
+AI assistants helped write the code and the documentation in this repository. Every number here was measured on the machine by the runners in `tools/ref/`.
 
 ## License
 
-MIT, see `LICENSE`.
+MIT, see [`LICENSE`](LICENSE).

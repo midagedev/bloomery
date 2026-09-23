@@ -207,7 +207,7 @@ expert 바이트를 패스당 한 번이 아니라 **토큰마다** 읽고 있�
 > 같은 expert 가중치를 한 번만 읽게 하는 것뿐이다.~~
 
 **2026-09-19 선 그음 — 아래 "이것을 닫는 단일 측정"을 실제로 돌렸고, 이 문단이 틀렸다.**
-rig-log [WKS-36](https://github.com/midagedev/rig-log/blob/main/log/2026-09-19-verification-does-not-amortise.md)이
+rig-log [WKS-36](https://github.com/midagedev/rig-log/blob/main/log/2026-09-19.md)이
 `n_max` 0·1·2·3을 같은 프롬프트 여덟으로 재서:
 
 | 팔 | 토큰/패스 | ms/패스 | 1토큰 패스 대비 |
