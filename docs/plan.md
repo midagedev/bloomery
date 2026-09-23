@@ -614,6 +614,7 @@ flowchart LR
 ## 공개 (사용자 09-24 "빨리 공개 수준으로 올려서 이슈화하고 싶어")
 
 - **M1 숫자 공개(이번 주)**: 실제 텍스트 헤드라인 + 드래프트 켠 값(자리 8·9), 카드 크기 곡선 24/38/41 GB(E21·E21b), ik 같은 창 비교; rig-log 글(영어 요약 + 한국어 본문) + 30초 영상(드라이브); 공개 전 스크럽(BMC·사설 주소·호스트명·bug-report 아카이브 grep); "우리가 아는 한 V4.1 Flash를 CPU expert 오프로딩으로 돌리는 유일한 Rust 엔진(커널까지 Rust)" 주장은 글 쓰는 날 mistral.rs·candle 등에서 재확인해 "as far as we know"로. 결정 대기: 라이선스(추천 Apache-2.0), M1 시점 레포 공개 여부(추천: 공개, README에 numbers first / CLI in progress).
+- **비행 중(09-24 07:45~, M2 병렬)**: `tok`(토크나이저 크레이트, llama-tokenize 오라클 게이트) ‖ `sampler`(샘플링 크레이트, ik llama-sampling 순서) ‖ `serve`(llama-server 호환 API — `/completion`·`/v1/chat/completions`·`/tokenize`·`/detokenize`·`/props`·`/metrics`, `timings` 필드로 벤치 클라이언트(toktape 등) 호환; `Engine` 트레이트 + mock 엔진 게이트) ‖ `readme`(README·BUILD·HARDWARE·LICENSE Apache-2.0·CONTRIBUTING, 박스 0회). 남은 M2: 실제 엔진 바인딩(`GpuModel` + 토크나이저 + 샘플러 → `bloomery-serve`/`bloomery-chat` 바이너리, 넷이 착륙한 뒤 한 라운드), soak 30분.
 - **M2 돌려 볼 수 있게(~2주)**: **토크나이저**(`tok` 라운드 — GGUF vocab 바이트 BPE 인코드/디코드, 게이트 = `llama-tokenize`와 코퍼스 id 동일), `bloomery-chat` 바이너리(템플릿·샘플링·스트리밍), README(빌드 한 줄·하드웨어·모델 파일; E20으로 변환 절차 삭제 여부), 30분 soak.
 - **M3 서버/커뮤니티**: OpenAI 호환 엔드포인트 하나, 이슈 템플릿, 기여 안내.
 
