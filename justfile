@@ -220,6 +220,13 @@ bench-gpu-join-check *ARGS:
 time-gpu-join *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/ref/time-gate.sh bench_join --time {{ARGS}}'
 
+# 유휴 상태 A/B(리드 전용): 가장 깊은 cpuidle 상태(이 박스의 C2, 깨는 데 18 µs)를 모든 CPU에서 켠 팔과 끈 팔을
+# 한 임대 안에서 번갈아 잰다. 명령은 A6000에 고정돼 라운드마다 팔 순서를 바꿔 돌고, 원래 값은 모든 종료 경로에서
+# 되돌린다. 예: `just cstate-ab 6 env BLOOMERY_HYBRID_NL=32 target/release/generate -n 64 --time`,
+# `just cstate-ab 3 target/release/bench_join --time`.
+cstate-ab ROUNDS *CMD:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate --bin bench_join && bash tools/ref/cstate-ab.sh {{ROUNDS}} {{CMD}}'
+
 # MoE 융합 op 8노드 대 융합 4노드의 재생 µs — 임대·증인, 리드 전용.
 time-gpu-moe:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/ref/time-gate.sh gate_moe_fused'
