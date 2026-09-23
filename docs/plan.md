@@ -598,6 +598,8 @@ flowchart LR
 ㉟ (cpu5) ~~`tools/ref/depth-decode.sh:24`가 경로를 받으면 rc=2 — `basename` 한 줄. XS.~~ 닫힘(리드, 09-24 03:2x). 2단계 KQ0 DRAM 스트림(32스레드 동시)을 두 묶음 교차 + prefetch로 펴기[유도, 미측정]. M.
 ㊱ (b5prof) `hybrid.rs:948` 합류 0이 매 스텝 ~1 ms 더 — 스텝 사이 풀 park/첫 go 대기 의심(nsys에 호스트 타임라인이 없어 미확정; NVTX 범위를 `generate_ds41`에 넣으면 갈린다, S). 층당 겹침 70–150 µs 대 다리 690 µs — wait 앞으로 당길 카드 일(다음 층 attention)이 있는지 구조 조사(M). `nsys-gpu.sh`(V2-Lite)는 CPU 샘플링을 안 끄고 ctx d+128 고정(XS).
 
+㊲ (auditbudget, 원문 [`research/v41-audit-budget-report.md`](research/v41-audit-budget-report.md)) 토큰 39.4 ms가 항 안에 다 들어간다(모델 40.1, 0.7 과대). **카드 없음 행 둘**: ① 호스트 다리 128.8 대 기계 읽기 147.7 GB/s의 3.39 ms — 층당 깨움·디스패치 고정비인지 4 KiB 페이지 워크(상한 0.8 ms)인지 원인 축소(b5prof 층별 갭 + `bench_v41_host` + 워커 dTLB 카운터, 한 임대). ② `body.rs:480` `enqueue_engram_kv`가 층 루프 앞 단일 스트림에 있어 wkv 0.33 GB가 임계에 있다 — 0층 그늘로 옮기면 **−0.48 ms**(이동 클래스, S) — **다음 GPU 라운드 후보 1순위(작고 확실)**. 천장[유도]: B12+B8+임계 레버 32.2–35.4 tok/s, attn_output q4_K까지 34.7–38.4, 물리 바닥 32–38. **깊이 역전 1.3 ms**: 4096 행은 lcg 퇴화 출력(distinct 3)이라 engram·expert 집합이 반복된다 — 헤드라인 25.4가 퇴화 몫인지 실제 텍스트 프롬프트로 교차 측정(b5time2, ~15분) 전까지 25.4는 조건을 단다. 트리아지 정리: ⑤ shared gate+up 한 런치(이미 `experts.rs:407`), ⑥ combine→HC_POST(이미 `enqueue_join`), ⑥ 라우터 D2H 제거(이미 handoff가 이미지에 씀), ⑤ q8_0 스케일 f16(B11c) — 넷 닫힘; ⑤ b4hc 경계 융합은 attn 경계만(−0.08, ffn 쪽은 이미 그늘), ⑥ HC_PRE 갈래는 −0.10. 노드 1,110 대 모델 1,068의 +42는 G2 예측표 갱신(XS). k토큰: 평범한 k=1은 오늘 진다(24.7), B12 뒤 손익분기; **층 스큐 k=1은 오늘 29.0(D=3)/25.9(D=10), B12 뒤 38–42/33–36** — 리드 유도(30.3/49.2)를 슬롯 단위 max와 채움 1.1 ms·핸드셰이크 1.6 ms로 정정. 스큐가 필요로 하는 것 다섯: 행마다 scratch 사본, **인덱서 리스트 행마다**(t+1의 2층이 리스트를 덮어쓸 때 t의 3–7층이 읽는다), 층당 핸드오프 슬롯 둘(memop 80→160), 노드 ~2배, 되감기(engram 문맥·history). 스큐 팔은 m>1 gemv가 필요 없다.
+
 ## 측정 프로토콜 치트시트
 
 ```
