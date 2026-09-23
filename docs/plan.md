@@ -595,7 +595,7 @@ flowchart LR
 
 ㉝ (cpu5) `attn.rs` `flash_segment`: 블록 경계 + 8묶음에서 세그먼트 0만 블록이 하나 더 많을 때의 불균형(4097키 1.24배, 1025키 1.94배 — 1024에서 이득이 0인 원인). 경계를 키 단위(최소 32)로 고르게 자르면 3 %·1.25배[유도]. 계획 변경이라 split-K 밴드 게이트가 다시 판정. M.
 ㉞ (cpu5) `heads_split_k`의 `SPLITK_R` 세그먼트 우선 배치 — 병합이 한 헤드의 부분합을 32 KB 간격으로 읽어 bundle 1 팔이 base보다 +0.1 ms. 헤드 우선으로 되돌리는 패치가 `scratchpad/cpu5/headmajor.py`에 있고 적용 전 측정 1회. S.
-㉟ (cpu5) `tools/ref/depth-decode.sh:24`가 경로를 받으면 rc=2 — `basename` 한 줄. XS. 2단계 KQ0 DRAM 스트림(32스레드 동시)을 두 묶음 교차 + prefetch로 펴기[유도, 미측정]. M.
+㉟ (cpu5) ~~`tools/ref/depth-decode.sh:24`가 경로를 받으면 rc=2 — `basename` 한 줄. XS.~~ 닫힘(리드, 09-24 03:2x). 2단계 KQ0 DRAM 스트림(32스레드 동시)을 두 묶음 교차 + prefetch로 펴기[유도, 미측정]. M.
 ㊱ (b5prof) `hybrid.rs:948` 합류 0이 매 스텝 ~1 ms 더 — 스텝 사이 풀 park/첫 go 대기 의심(nsys에 호스트 타임라인이 없어 미확정; NVTX 범위를 `generate_ds41`에 넣으면 갈린다, S). 층당 겹침 70–150 µs 대 다리 690 µs — wait 앞으로 당길 카드 일(다음 층 attention)이 있는지 구조 조사(M). `nsys-gpu.sh`(V2-Lite)는 CPU 샘플링을 안 끄고 ctx d+128 고정(XS).
 
 ## 측정 프로토콜 치트시트

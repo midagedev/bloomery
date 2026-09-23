@@ -22,6 +22,8 @@ ROUNDS=${BLOOMERY_AB_ROUNDS:-3}
 DEPTHS=${BLOOMERY_DEPTHS:-6 1024 4096}
 trees=()
 for d in "$@" "$(basename "$PWD")"; do
+  # A tree is named by its remote directory; a path given by mistake is reduced to that name.
+  d=$(basename "$d")
   b=$(decode_bin "$d")
   [ -x "$b" ] || { echo "no decode binary at $b — run just build-decode in that tree" >&2; exit 2; }
   trees+=("$d")
