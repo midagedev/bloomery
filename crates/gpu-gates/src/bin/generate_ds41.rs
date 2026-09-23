@@ -688,11 +688,14 @@ mod drive {
     }
 
     /// The counters one `BLOOMERY_STEP_STATS` read takes: the host tier's
-    /// since load, the process's page faults since start, and the card's
-    /// free device bytes now.
+    /// since load, the engram rows' since load, the process's page faults
+    /// since start, and the card's free device bytes now; and where the
+    /// engram rows' helper runs (`None` off, `Some(None)` floating).
     #[derive(Clone, Copy)]
     struct Probe {
         hybrid: HybridStats,
+        eng: bloomery_gpu_deepseek41::chain::glue::EngramStats,
+        eng_helper: Option<Option<usize>>,
         majflt: u64,
         minflt: u64,
         vram_free: u64,
@@ -700,7 +703,10 @@ mod drive {
 
     impl Probe {
         fn read(m: &Deepseek41Model) -> Result<Probe, GateError> {
-            let hybrid = m.body("generate_ds41")?.hybrid().stats();
+            let body = m.body("generate_ds41")?;
+            let hybrid = body.hybrid().stats();
+            let eng = body.step_rows().engram_stats();
+            let eng_helper = body.step_rows().helper_cpu();
             let stage = m
                 .stages()
                 .first()
@@ -718,6 +724,8 @@ mod drive {
             }
             Ok(Probe {
                 hybrid,
+                eng,
+                eng_helper,
                 majflt: u64::try_from(ru.ru_majflt)?,
                 minflt: u64::try_from(ru.ru_minflt)?,
                 vram_free,
@@ -730,9 +738,18 @@ mod drive {
     /// over the steps past `warm`. `straggle_max_us` is the worst single
     /// service since load (a maximum has no delta); `host_w2` is the step's
     /// mean host share of routed weight squared per service. `vram_free` is
-    /// the read after the step, not a delta.
+    /// the read after the step, not a delta. `eng_warm`/`eng_cold` are the
+    /// step's engram rows found in the page cache or not before the read,
+    /// `eng_direct` the ones the step thread read itself (the helper off),
+    /// `eng_wait_us` the step thread's time in the engram read (the wait on
+    /// the helper, or the direct copy), `eng_helper_us` the helper's own and
+    /// `eng_classify_us` the time the warm/cold count itself took (inside
+    /// `eng_wait_us` with the helper on, outside it off).
     fn print_stats(probes: &[Probe], warm: usize) {
         let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
+        let mut waits: Vec<f64> = Vec::with_capacity(probes.len());
+        let (mut eng_warm, mut eng_cold, mut eng_direct) = (0_u64, 0_u64, 0_u64);
+        let (mut eng_helper_ns, mut eng_classify_ns) = (0_u64, 0_u64);
         let mut vram_free_min = u64::MAX;
         let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
         for (k, w) in probes.windows(2).enumerate() {
@@ -749,17 +766,31 @@ mod drive {
             };
             let dmaj = w[1].majflt - w[0].majflt;
             let dmin = w[1].minflt - w[0].minflt;
+            let (e, f) = (&w[0].eng, &w[1].eng);
+            let (ew, ec, ed) = (f.warm - e.warm, f.cold - e.cold, f.direct - e.direct);
+            let wait_us = (f.wait_ns - e.wait_ns) as f64 / 1e3;
+            let helper_ns = f.helper_ns - e.helper_ns;
+            let classify_ns = f.classify_ns - e.classify_ns;
             let tag = if i <= warm { " warm" } else { "" };
             println!(
                 "stat step {i}{tag} served={served} leg_us={leg_us:.1} straggle_us={straggle_us:.1} \
                  straggle_max_us={:.1} host_slots={host_slots} host_w2={host_w2:.4} go_early={} \
-                 parks={} majflt={dmaj} minflt={dmin} vram_free={}",
+                 parks={} majflt={dmaj} minflt={dmin} vram_free={} eng_warm={ew} eng_cold={ec} \
+                 eng_direct={ed} eng_wait_us={wait_us:.1} eng_helper_us={:.1} eng_classify_us={:.1}",
                 q.straggle_max_ns as f64 / 1e3,
                 q.go_early - p.go_early,
                 q.parks_in_service - p.parks_in_service,
-                w[1].vram_free
+                w[1].vram_free,
+                helper_ns as f64 / 1e3,
+                classify_ns as f64 / 1e3
             );
             if i > warm {
+                waits.push(wait_us);
+                eng_warm += ew;
+                eng_cold += ec;
+                eng_direct += ed;
+                eng_helper_ns += helper_ns;
+                eng_classify_ns += classify_ns;
                 vram_free_min = vram_free_min.min(w[1].vram_free);
                 legs.push(leg_us);
                 straggle_max = straggle_max.max(straggle_us);
@@ -774,13 +805,27 @@ mod drive {
         }
         let mean = legs.iter().sum::<f64>() / n as f64;
         legs.sort_by(f64::total_cmp);
+        let wait_mean = waits.iter().sum::<f64>() / n as f64;
+        waits.sort_by(f64::total_cmp);
+        let helper = match probes[0].eng_helper {
+            None => "off".to_string(),
+            Some(None) => "floating".to_string(),
+            Some(Some(cpu)) => format!("cpu{cpu}"),
+        };
         println!(
             "stat summary steps={n} leg_us_mean={mean:.1} leg_us_p50={:.1} straggle_us_max={straggle_max:.1} \
              host_slots_mean={:.1} majflt={majflt} minflt={minflt} vram_free_load={} \
-             vram_free_min={vram_free_min}",
+             vram_free_min={vram_free_min} eng_helper={helper} eng_warm={eng_warm} \
+             eng_cold={eng_cold} eng_direct={eng_direct} eng_wait_us_mean={wait_mean:.1} \
+             eng_wait_us_p50={:.1} eng_wait_us_max={:.1} eng_helper_us_mean={:.1} \
+             eng_classify_us_mean={:.1}",
             legs[n / 2],
             slots as f64 / n as f64,
-            probes[0].vram_free
+            probes[0].vram_free,
+            waits[n / 2],
+            waits[n - 1],
+            eng_helper_ns as f64 / 1e3 / n as f64,
+            eng_classify_ns as f64 / 1e3 / n as f64
         );
     }
 }

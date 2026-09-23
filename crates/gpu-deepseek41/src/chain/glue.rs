@@ -25,7 +25,9 @@
 //!
 //! [`StepRows`] is the host half: the rows a step's image carries — each
 //! token's embedding row from the file, and each site's rows, hashed from the
-//! token's n-gram by the engram crate and copied out of the site's table.
+//! token's n-gram by the engram crate and read out of the site's table by a
+//! helper thread ([`RowsLevers::helper`]), so the calling thread never touches
+//! the table's mapping.
 //!
 //! Numbers: the bf16 widening and the rows' dequantization (an f16 scale
 //! times an 8-bit code) are exact; everything else is an op this piece
@@ -37,6 +39,9 @@
 //! resolved at `new`; an enqueue looks the names up (at capture, once per
 //! graph) and allocates nothing.
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use bloomery_gpu::head::Head;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, launch_u32};
@@ -45,6 +50,7 @@ use cuda_device::convert::{cvt_f32_f16x2_hi, cvt_f32_f16x2_lo, cvt_f32x2_bf16x2}
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use engram::Engram;
+use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
 use gguf::quant::GgmlType;
 use gguf::{Split, TensorInfo};
 use model::arch::deepseek41::hparams::Hparams;
@@ -747,15 +753,66 @@ fn need(what: &'static str, name: &str, len: usize, want: usize) -> Result<(), G
 
 // ---------------------------------------------------------- the host half
 
+/// The levers of [`StepRows`], read once when it opens
+/// ([`RowsLevers::from_env`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowsLevers {
+    /// The engram rows are read by a helper thread: the calling thread hashes
+    /// the ids, hands them over, reads the embedding row meanwhile and waits.
+    /// Off (`BLOOMERY_ENGRAM_HELPER=0`), the calling thread reads them itself.
+    pub helper: bool,
+    /// Keep [`EngramStats`] (`BLOOMERY_STEP_STATS=1`). Off, a fill reads no
+    /// clock and makes no classifying syscall.
+    pub stats: bool,
+}
+
+impl RowsLevers {
+    /// The levers from the environment.
+    #[must_use]
+    pub fn from_env() -> RowsLevers {
+        RowsLevers {
+            helper: !std::env::var("BLOOMERY_ENGRAM_HELPER").is_ok_and(|v| v == "0"),
+            stats: std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1"),
+        }
+    }
+}
+
+/// What the fills since [`StepRows`] opened read, when it keeps stats
+/// ([`RowsLevers::stats`]); all zero otherwise. A row is warm when every page
+/// of it was in the page cache before the read, cold otherwise
+/// ([`engram::Site::resident_rows`]); both are counted on either path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngramStats {
+    pub warm: u64,
+    pub cold: u64,
+    /// Rows the calling thread read itself: the direct path's.
+    pub direct: u64,
+    /// The calling thread's time in the engram read: the wait on the helper,
+    /// or the direct path's copy.
+    pub wait_ns: u64,
+    /// The helper's own time on the rows it served: advise, fill and copy.
+    pub helper_ns: u64,
+    /// The classification's time ([`engram::Site::resident_rows`]): on the
+    /// helper before its advise, so inside `wait_ns`, or on the calling thread
+    /// before the direct copy, outside it. The stats' own tax.
+    pub classify_ns: u64,
+}
+
 /// The rows one step's image carries ([`crate::params::StepImage::build`]'s
 /// `embd` and `engram`), for a step of a fixed token count. A token's
 /// embedding row is the file's `token_embd` row, bf16. A site's rows are the
 /// ones the engram crate's hash names for the token's n-gram — the plan's
 /// window mapped as the port maps it: the current token, then each older one
-/// up to the first missing, the pad id from there on — copied out of the
-/// site's table on the calling thread.
+/// up to the first missing, the pad id from there on — read out of the
+/// site's table by the helper ([`Prefetcher`], advise every row first, then
+/// copy), or on the calling thread with the helper off. Either way the bytes
+/// are the table's.
 pub struct StepRows {
-    engram: Engram,
+    engram: Arc<Engram>,
+    /// The helper, when [`RowsLevers::helper`] is on.
+    helper: Option<Prefetcher>,
+    /// Kept when [`RowsLevers::stats`] is on.
+    stats: Option<EngramStats>,
     /// `token_embd`'s shard and header.
     embd: (usize, TensorInfo),
     n_embd: usize,
@@ -776,7 +833,23 @@ impl StepRows {
     /// hyperparameters are `hp`: the embedding table checked, the engram
     /// tables opened (headers only) and checked against `hp`, and every
     /// buffer a fill writes allocated.
+    ///
+    /// The levers come from the environment ([`RowsLevers::from_env`]); a
+    /// helper is pinned to the SMT sibling of the calling thread's core when
+    /// that thread is pinned ([`caller_sibling`]) — the caller is the pool's
+    /// dispatcher, which waits while the helper reads, so that core is idle
+    /// then and no worker's core is shared — and floats otherwise.
     pub fn open(file: &Split, hp: &Hparams, tokens: usize) -> Result<StepRows, GpuError> {
+        StepRows::open_with(file, hp, tokens, RowsLevers::from_env())
+    }
+
+    /// [`StepRows::open`] with the levers named.
+    pub fn open_with(
+        file: &Split,
+        hp: &Hparams,
+        tokens: usize,
+        levers: RowsLevers,
+    ) -> Result<StepRows, GpuError> {
         const WHAT: &str = "StepRows::open";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
         let name = names::token_embd();
@@ -825,7 +898,25 @@ impl StepRows {
         }
         let n_cols = hash.n_cols();
         let sites = engram.sites().len();
+        let engram = Arc::new(engram);
+        let helper = levers
+            .helper
+            .then(|| {
+                Prefetcher::with_options(
+                    Arc::clone(&engram),
+                    &vec![n_cols; sites],
+                    HelperOptions {
+                        mode: FillMode::Touch,
+                        cpu: caller_sibling(),
+                        classify: levers.stats,
+                    },
+                )
+            })
+            .transpose()
+            .map_err(|e| GpuError::plan(WHAT, e))?;
         Ok(StepRows {
+            helper,
+            stats: levers.stats.then(EngramStats::default),
             embd: (shard, info.clone()),
             n_embd: hp.n_embd,
             n_vocab: hp.n_vocab,
@@ -859,45 +950,22 @@ impl StepRows {
                 self.tokens
             )));
         }
-        let (shard, info) = &self.embd;
-        let table = file
-            .shard(*shard)
-            .ok_or_else(|| refuse(format!("the file has no shard {shard}")))?
-            .data(info)?;
-        let row = 2 * self.n_embd;
-        for (&token, dst) in plan
-            .tokens
-            .iter()
-            .zip(self.embd_rows.chunks_exact_mut(self.n_embd))
-        {
-            let t = token as usize;
-            let bytes = (t < self.n_vocab)
-                .then(|| table.get(t * row..(t + 1) * row))
-                .flatten()
-                .ok_or_else(|| {
-                    refuse(format!(
-                        "token {token}: no row of {} in a table of {} rows, {} bytes",
-                        self.n_embd,
-                        self.n_vocab,
-                        table.len()
-                    ))
-                })?;
-            for (v, b) in dst.iter_mut().zip(bytes.as_chunks::<2>().0) {
-                *v = u16::from_le_bytes(*b);
-            }
+        if self.helper.is_none() {
+            embd_rows_into(
+                &self.embd,
+                [self.n_embd, self.n_vocab],
+                &mut self.embd_rows,
+                file,
+                plan,
+            )?;
         }
-        let hash = self.engram.hash();
         let site_bytes = self.n_cols * self.row_bytes;
         let token_ids = self.engram.sites().len() * self.n_cols;
-        for ((window, ids), bytes) in plan
-            .engram_window
-            .chunks_exact(n_gram)
-            .zip(self.ids.chunks_exact_mut(token_ids))
-            .zip(
-                self.engram_rows
-                    .chunks_exact_mut(token_ids * self.row_bytes),
-            )
-        {
+        for (k, window) in plan.engram_window.chunks_exact(n_gram).enumerate() {
+            let ids = &mut self.ids[k * token_ids..][..token_ids];
+            let bytes = &mut self.engram_rows[k * token_ids * self.row_bytes..]
+                [..token_ids * self.row_bytes];
+            let hash = self.engram.hash();
             let mut blocked = false;
             for (slot, &token) in self.ctx.iter_mut().zip(window) {
                 blocked |= token.is_none();
@@ -906,21 +974,99 @@ impl StepRows {
                     _ => hash.pad_id(),
                 };
             }
-            for (s, ((site, ids), out)) in self
-                .engram
-                .sites()
-                .iter()
-                .zip(ids.chunks_exact_mut(self.n_cols))
-                .zip(bytes.chunks_exact_mut(site_bytes))
-                .enumerate()
-            {
-                hash.rows_into(s, &self.ctx, ids)
+            for (s, site_ids) in ids.chunks_exact_mut(self.n_cols).enumerate() {
+                hash.rows_into(s, &self.ctx, site_ids)
                     .map_err(|e| GpuError::plan(WHAT, e))?;
-                site.copy_rows(ids, out)
-                    .map_err(|e| GpuError::plan(WHAT, e))?;
+            }
+            match self.helper.as_mut() {
+                Some(helper) => {
+                    helper
+                        .submit(ids.chunks_exact(self.n_cols))
+                        .map_err(|e| GpuError::plan(WHAT, e))?;
+                    // Only the first token overlaps the embedding rows; a
+                    // step of one token, the engine's, is all of it.
+                    if k == 0 {
+                        let embd = embd_rows_into(
+                            &self.embd,
+                            [self.n_embd, self.n_vocab],
+                            &mut self.embd_rows,
+                            file,
+                            plan,
+                        );
+                        // The helper holds a job: take it back before an
+                        // error leaves, or the next fill's submit is refused.
+                        if let Err(e) = embd {
+                            let _ = helper.wait();
+                            return Err(e);
+                        }
+                    }
+                    let t0 = self.stats.map(|_| Instant::now());
+                    helper.wait().map_err(|e| GpuError::plan(WHAT, e))?;
+                    let wait_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
+                    let filled = helper.filled();
+                    if filled.len() != bytes.len() {
+                        return Err(refuse(format!(
+                            "the helper filled {} bytes of a token's {}",
+                            filled.len(),
+                            bytes.len()
+                        )));
+                    }
+                    bytes.copy_from_slice(filled);
+                    if let Some(st) = self.stats.as_mut() {
+                        let t = helper.last();
+                        st.warm += t.resident_rows;
+                        st.cold += t.rows - t.resident_rows;
+                        st.wait_ns += wait_ns;
+                        st.helper_ns += t.submit_ns + t.fill_ns + t.copy_ns;
+                        st.classify_ns += t.classify_ns;
+                    }
+                }
+                None => {
+                    for ((site, site_ids), out) in self
+                        .engram
+                        .sites()
+                        .iter()
+                        .zip(ids.chunks_exact(self.n_cols))
+                        .zip(bytes.chunks_exact_mut(site_bytes))
+                    {
+                        let t0 = match self.stats.as_mut() {
+                            Some(st) => {
+                                let tc = Instant::now();
+                                let warm = site
+                                    .resident_rows(site_ids)
+                                    .map_err(|e| GpuError::plan(WHAT, e))?;
+                                st.classify_ns += tc.elapsed().as_nanos() as u64;
+                                st.warm += warm;
+                                st.cold += site_ids.len() as u64 - warm;
+                                st.direct += site_ids.len() as u64;
+                                Some(Instant::now())
+                            }
+                            None => None,
+                        };
+                        site.copy_rows(site_ids, out)
+                            .map_err(|e| GpuError::plan(WHAT, e))?;
+                        if let (Some(st), Some(t0)) = (self.stats.as_mut(), t0) {
+                            st.wait_ns += t0.elapsed().as_nanos() as u64;
+                        }
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// What the fills since open read; all zero unless the rows keep stats
+    /// ([`RowsLevers::stats`]).
+    #[must_use]
+    pub fn engram_stats(&self) -> EngramStats {
+        self.stats.unwrap_or_default()
+    }
+
+    /// Whether a helper reads the engram rows, and the cpu it is pinned to:
+    /// `None` with the helper off, `Some(None)` for a floating helper.
+    #[must_use]
+    pub fn helper_cpu(&self) -> Option<Option<usize>> {
+        self.helper.as_ref().map(Prefetcher::pinned_cpu)
     }
 
     /// The step's embedding rows, `tokens · n_embd` bf16 bits.
@@ -941,4 +1087,40 @@ impl StepRows {
         let sites = self.engram.sites().len();
         &self.ids[(token * sites + site) * self.n_cols..][..self.n_cols]
     }
+}
+
+/// Every token's embedding row of `plan` into `out` (`n_embd` bf16 bits a
+/// token), from `file`'s `token_embd` of `[n_embd, n_vocab]` at `embd` (its
+/// shard and header).
+fn embd_rows_into(
+    embd: &(usize, TensorInfo),
+    [n_embd, n_vocab]: [usize; 2],
+    out: &mut [u16],
+    file: &Split,
+    plan: &StepPlan,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "StepRows::fill";
+    let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
+    let (shard, info) = embd;
+    let table = file
+        .shard(*shard)
+        .ok_or_else(|| refuse(format!("the file has no shard {shard}")))?
+        .data(info)?;
+    let row = 2 * n_embd;
+    for (&token, dst) in plan.tokens.iter().zip(out.chunks_exact_mut(n_embd)) {
+        let t = token as usize;
+        let bytes = (t < n_vocab)
+            .then(|| table.get(t * row..(t + 1) * row))
+            .flatten()
+            .ok_or_else(|| {
+                refuse(format!(
+                    "token {token}: no row of {n_embd} in a table of {n_vocab} rows, {} bytes",
+                    table.len()
+                ))
+            })?;
+        for (v, b) in dst.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *v = u16::from_le_bytes(*b);
+        }
+    }
+    Ok(())
 }

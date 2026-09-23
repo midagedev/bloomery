@@ -19,6 +19,12 @@
 //! Steady state allocates nothing: the id vectors travel with the buffers and
 //! are refilled in place, and the buffers are written once at construction so
 //! that the first token's faults are the table's and not the allocator's.
+//!
+//! Where the helper runs is the owner's call ([`HelperOptions::cpu`]): a
+//! helper that shares a core with a pool worker slows the worker's chunk by
+//! more than the read it saves. [`caller_sibling`] names the one slot that is
+//! free by construction for an owner that blocks on [`Prefetcher::wait`]: the
+//! SMT sibling of the owner's own pinned core, idle while the owner waits.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -26,6 +32,30 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::{Engram, EngramError, faults_thread};
+
+/// How [`Prefetcher::with_options`] starts its helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelperOptions {
+    pub mode: FillMode,
+    /// The logical cpu the helper pins itself to; `None` leaves it floating.
+    pub cpu: Option<usize>,
+    /// Count per token the rows whose pages were all in the page cache before
+    /// the advise ([`crate::Site::resident_rows`], one `mincore` per row).
+    /// Off, the helper makes no such call.
+    pub classify: bool,
+}
+
+impl HelperOptions {
+    /// A floating helper that classifies nothing.
+    #[must_use]
+    pub fn of(mode: FillMode) -> HelperOptions {
+        HelperOptions {
+            mode,
+            cpu: None,
+            classify: false,
+        }
+    }
+}
 
 /// What the helper does between advising the rows and copying them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +99,14 @@ pub struct HelperTimes {
     pub copy_ns: u64,
     pub major_faults: u64,
     pub minor_faults: u64,
+    /// Rows the token asked for.
+    pub rows: u64,
+    /// Of those, the rows already in the page cache before the advise; zero
+    /// unless the helper classifies ([`HelperOptions::classify`]).
+    pub resident_rows: u64,
+    /// The classification's own time, before `submit_ns`; zero unless the
+    /// helper classifies.
+    pub classify_ns: u64,
 }
 
 /// What the next [`Prefetcher::wait`] takes back.
@@ -95,6 +133,8 @@ pub struct Prefetcher {
     max_rows: Vec<usize>,
     row_bytes: Vec<usize>,
     last: HelperTimes,
+    /// The cpu the helper pinned itself to, if it was asked to and could.
+    cpu: Option<usize>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -108,6 +148,18 @@ impl Prefetcher {
         engram: Arc<Engram>,
         max_rows_per_site: &[usize],
         mode: FillMode,
+    ) -> Result<Prefetcher, EngramError> {
+        Prefetcher::with_options(engram, max_rows_per_site, HelperOptions::of(mode))
+    }
+
+    /// [`Prefetcher::new`] with the helper's cpu and classification named.
+    /// Returns once the helper has pinned itself (or failed to: a container
+    /// may refuse, and the helper then floats — [`Prefetcher::pinned_cpu`]
+    /// says which).
+    pub fn with_options(
+        engram: Arc<Engram>,
+        max_rows_per_site: &[usize],
+        options: HelperOptions,
     ) -> Result<Prefetcher, EngramError> {
         let sites = engram.sites();
         if max_rows_per_site.len() != sites.len() {
@@ -138,9 +190,20 @@ impl Prefetcher {
 
         let (job_tx, job_rx) = channel::<Job>();
         let (done_tx, done_rx) = channel::<Filled>();
+        let (pin_tx, pin_rx) = channel::<Option<usize>>();
         let handle = std::thread::Builder::new()
             .name("engram-prefetch".into())
-            .spawn(move || helper(&engram, mode, &job_rx, &done_tx))?;
+            .spawn(move || {
+                let pinned = options.cpu.filter(|&c| pin_to(c));
+                // The owner waits on this before its first submit; a closed
+                // receiver means it already gave up, and the jobs channel
+                // tells the loop the same.
+                let _ = pin_tx.send(pinned);
+                helper(&engram, options, &job_rx, &done_tx);
+            })?;
+        let cpu = pin_rx
+            .recv()
+            .map_err(|_| EngramError::Prefetch("helper thread exited at start"))?;
 
         Ok(Prefetcher {
             jobs: Some(job_tx),
@@ -151,8 +214,15 @@ impl Prefetcher {
             max_rows: max_rows_per_site.to_vec(),
             row_bytes,
             last: HelperTimes::default(),
+            cpu,
             handle: Some(handle),
         })
+    }
+
+    /// The cpu the helper runs pinned to; `None` when it floats.
+    #[must_use]
+    pub fn pinned_cpu(&self) -> Option<usize> {
+        self.cpu
     }
 
     /// Hand the helper one token's row ids and let it run.
@@ -162,41 +232,58 @@ impl Prefetcher {
     /// of rows up to the prefetcher's size for it, and a token that asks for
     /// none is not sent at all. Two submits in a row without a
     /// [`Prefetcher::wait`] between them is a caller bug, not a runtime
-    /// condition.
-    pub fn submit(&mut self, token_ids: &[Vec<u32>]) -> Result<(), EngramError> {
+    /// condition. `token_ids` yields one id list per site, in site order.
+    pub fn submit<S: AsRef<[u32]>>(
+        &mut self,
+        token_ids: impl IntoIterator<Item = S>,
+    ) -> Result<(), EngramError> {
         if self.in_flight.is_some() {
             return Err(EngramError::Prefetch(
                 "a token is already in flight; wait() first",
             ));
         }
-        if token_ids.len() != self.max_rows.len() {
-            return Err(EngramError::Prefetch("token has a different site count"));
-        }
-        // Checked before any copy: past its capacity an id vector would
-        // reallocate, and the buffer would be too short for the rows.
-        if token_ids
-            .iter()
-            .zip(&self.max_rows)
-            .any(|(ids, &max)| ids.len() > max)
-        {
-            return Err(EngramError::Prefetch(
-                "token asks more rows of a site than the prefetcher was sized for",
-            ));
-        }
-        if token_ids.iter().all(Vec::is_empty) {
-            self.in_flight = Some(InFlight::Empty);
-            return Ok(());
-        }
         let Some(mut job) = self.spare.pop() else {
             return Err(EngramError::Prefetch("no free buffer; wait() first"));
         };
         job.len = 0;
-        for ((dst, src), rb) in job.ids.iter_mut().zip(token_ids).zip(&self.row_bytes) {
-            dst.clear();
-            dst.extend_from_slice(src);
-            job.len += src.len() * rb;
+        let mut sites = 0usize;
+        let mut refused = None;
+        for (i, src) in token_ids.into_iter().enumerate() {
+            let src = src.as_ref();
+            sites = i + 1;
+            // Checked before the copy: past its capacity an id vector would
+            // reallocate, and the buffer would be too short for the rows.
+            match (job.ids.get_mut(i), self.max_rows.get(i)) {
+                (Some(dst), Some(&max)) if src.len() <= max => {
+                    dst.clear();
+                    dst.extend_from_slice(src);
+                    job.len += src.len() * self.row_bytes[i];
+                }
+                (Some(_), Some(_)) => {
+                    refused =
+                        Some("token asks more rows of a site than the prefetcher was sized for");
+                    break;
+                }
+                _ => {
+                    refused = Some("token has a different site count");
+                    break;
+                }
+            }
+        }
+        if refused.is_none() && sites != self.max_rows.len() {
+            refused = Some("token has a different site count");
+        }
+        if let Some(why) = refused {
+            self.spare.push(job);
+            return Err(EngramError::Prefetch(why));
+        }
+        if job.len == 0 {
+            self.spare.push(job);
+            self.in_flight = Some(InFlight::Empty);
+            return Ok(());
         }
         let Some(tx) = self.jobs.as_ref() else {
+            self.spare.push(job);
             return Err(EngramError::Prefetch("helper is shutting down"));
         };
         tx.send(job)
@@ -228,6 +315,9 @@ impl Prefetcher {
                 submit_ns: 0,
                 fill_ns: 0,
                 copy_ns: 0,
+                rows: 0,
+                resident_rows: 0,
+                classify_ns: 0,
                 ..self.last
             };
             return Ok(());
@@ -282,15 +372,37 @@ impl Drop for Prefetcher {
 /// Errors travel back with the buffer rather than ending the helper: the owner
 /// is blocked in `wait` and has to be told, and the next token may well be
 /// fine.
-fn helper(engram: &Engram, mode: FillMode, jobs: &Receiver<Job>, done: &Sender<Filled>) {
+fn helper(engram: &Engram, options: HelperOptions, jobs: &Receiver<Job>, done: &Sender<Filled>) {
+    let HelperOptions { mode, classify, .. } = options;
     let base = faults_thread();
     let sites = engram.sites();
     while let Ok(mut job) = jobs.recv() {
         let mut err = None;
+        let rows: u64 = job.ids.iter().map(|ids| ids.len() as u64).sum();
+
+        // Before the advise: afterwards every row's folio is in the cache,
+        // its read in flight, and would count as resident.
+        let (mut resident_rows, mut classify_ns) = (0u64, 0u64);
+        if classify {
+            let tc = Instant::now();
+            for (site, ids) in sites.iter().zip(&job.ids) {
+                match site.resident_rows(ids) {
+                    Ok(n) => resident_rows += n,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            classify_ns = tc.elapsed().as_nanos() as u64;
+        }
 
         // WILLNEED over every row: one batch at the drive's queue depth.
         let t0 = Instant::now();
         for (site, ids) in sites.iter().zip(&job.ids) {
+            if err.is_some() {
+                break;
+            }
             if let Err(e) = site.prefetch(ids) {
                 err = Some(e);
                 break;
@@ -336,9 +448,68 @@ fn helper(engram: &Engram, mode: FillMode, jobs: &Receiver<Job>, done: &Sender<F
             copy_ns,
             major_faults: now.major.saturating_sub(base.major),
             minor_faults: now.minor.saturating_sub(base.minor),
+            rows,
+            resident_rows,
+            classify_ns,
         };
         if done.send(Filled { job, err, times }).is_err() {
             break;
         }
+    }
+}
+
+/// The SMT sibling of the core the calling thread is pinned to, if the
+/// thread's affinity is exactly one cpu and that core has a sibling
+/// (`/sys/devices/system/cpu/cpu<c>/topology/thread_siblings_list`). `None`
+/// for a floating caller or a core without SMT: the helper then floats too.
+#[must_use]
+pub fn caller_sibling() -> Option<usize> {
+    // SAFETY: `set` is a zeroed cpu_set_t that `sched_getaffinity` fills with
+    // the matching size, and `CPU_ISSET` only reads it.
+    let set = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return None;
+        }
+        set
+    };
+    let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    // SAFETY: `c < max`, the set's own bit count.
+    let mut on = (0..max).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) });
+    let (Some(cpu), None) = (on.next(), on.next()) else {
+        return None;
+    };
+    let list = std::fs::read_to_string(format!(
+        "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+    ))
+    .ok()?;
+    cpu_list(&list).find(|&c| c != cpu)
+}
+
+/// The cpus of a sysfs cpu list (`0,32`, `0-1`, `0-3,8`); a malformed entry
+/// ends the list.
+fn cpu_list(text: &str) -> impl Iterator<Item = usize> + '_ {
+    text.trim()
+        .split(',')
+        .map_while(|part| match part.split_once('-') {
+            Some((a, b)) => Some(a.parse::<usize>().ok()?..=b.parse::<usize>().ok()?),
+            None => part.parse::<usize>().ok().map(|c| c..=c),
+        })
+        .flatten()
+}
+
+/// Pin the calling thread to one logical cpu; false when the kernel refuses
+/// (a container, a cpu outside the process's set).
+fn pin_to(cpu: usize) -> bool {
+    if cpu >= 8 * std::mem::size_of::<libc::cpu_set_t>() {
+        return false;
+    }
+    // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET` with
+    // an index inside it, and `sched_setaffinity` reads it with the matching
+    // size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
     }
 }

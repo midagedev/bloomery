@@ -32,6 +32,12 @@
 //!    dump within the band that ik's q8_2 activations derive through the
 //!    score. The chain captured as one graph replays bit-identically to the
 //!    eager run.
+//!
+//! Apart from the sites, the host half's two row paths ([`gate::helper_rows`]):
+//! the engram rows the step's helper thread reads and the ones the calling
+//! thread reads itself are the same bytes under the same ids, step by step
+//! over a synthetic token stream of `HELPER_STEPS` steps — each step's rows
+//! are the ones it waited for, not the other buffer of the helper's pair.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -51,6 +57,7 @@ mod gate {
     use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
     use bloomery_gpu::weights::{DevWeight, upload_file_tensor};
     use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu_deepseek41::chain::glue::{RowsLevers, StepRows};
     use bloomery_gpu_deepseek41::engram_gate::{
         CLAMP_MIN, EngramGateKernels, GateArgs, KeyNormArgs, PER_THREAD, ROW, inv_sqrt_row,
     };
@@ -66,6 +73,8 @@ mod gate {
     use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
     use gguf::{Split, TensorInfo, Value};
     use model::arch::Arch;
+    use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::plan::{Planner, StepPlan};
 
     /// Nodes of one engram site, the row gather to `engram_out-L`.
     const CHAIN: usize = 35;
@@ -341,16 +350,96 @@ mod gate {
                 failed += u32::from(!site(&cx, label, man, w)?);
             }
         }
-        let pass = failed == 0;
+        let rows_pass = helper_rows(&split)?;
+        let pass = failed == 0 && rows_pass;
         println!(
-            "gate_deepseek41_engram: {sites} sites across {} sets, {failed} failed — {}",
+            "gate_deepseek41_engram: {sites} sites across {} sets, {failed} failed; host rows \
+             helper = direct {} — {}",
             sets.len(),
+            verdict(rows_pass),
             verdict(pass)
         );
         if !pass {
             return Err(checks_failed());
         }
         Ok(())
+    }
+
+    /// Steps of the synthetic stream [`helper_rows`] walks.
+    const HELPER_STEPS: usize = 256;
+
+    /// The host half's rows two ways over one synthetic token stream: a
+    /// [`StepRows`] whose helper thread reads the engram rows (keeping stats,
+    /// so the classifying path runs too) and one that reads them on this
+    /// thread, both filled from the same plan at every step; per step the
+    /// ids of every site and the engram bytes must be equal. The stream
+    /// repeats earlier tokens often, so n-grams recur and rows come back warm,
+    /// and draws the rest over the whole vocabulary.
+    pub(super) fn helper_rows(split: &Split) -> Result<bool, GateError> {
+        let hp = Hparams::read(split)?;
+        let planner = Planner::from_file(split, &hp, HELPER_STEPS as u64)?;
+        let mut helper = StepRows::open_with(
+            split,
+            &hp,
+            1,
+            RowsLevers {
+                helper: true,
+                stats: true,
+            },
+        )?;
+        let mut direct = StepRows::open_with(
+            split,
+            &hp,
+            1,
+            RowsLevers {
+                helper: false,
+                stats: false,
+            },
+        )?;
+        let sites = hp.engram.layer_ids.len();
+        let mut plan = StepPlan::default();
+        let mut history: Vec<u32> = Vec::with_capacity(HELPER_STEPS);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let (mut bad_bytes, mut bad_ids, mut first_bad) = (0usize, 0usize, None);
+        for pos in 0..HELPER_STEPS {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let draw = (state >> 33) as usize;
+            let token = match history.len() {
+                n if n > 0 && draw.is_multiple_of(3) => history[draw / 3 % n],
+                _ => (draw % hp.n_vocab) as u32,
+            };
+            planner.plan_into(&[token], pos as u32, &history, &mut plan)?;
+            helper.fill(split, &plan)?;
+            direct.fill(split, &plan)?;
+            let ids_eq = (0..sites).all(|s| helper.ids(0, s) == direct.ids(0, s));
+            let bytes_eq = helper.engram() == direct.engram() && helper.embd() == direct.embd();
+            bad_ids += usize::from(!ids_eq);
+            bad_bytes += usize::from(!bytes_eq);
+            if (!ids_eq || !bytes_eq) && first_bad.is_none() {
+                first_bad = Some(pos);
+            }
+            history.push(token);
+        }
+        let st = helper.engram_stats();
+        let pass =
+            helper.helper_cpu().is_some() && bad_ids == 0 && bad_bytes == 0 && st.direct == 0;
+        println!(
+            "host rows: {HELPER_STEPS} steps x {sites} sites, helper {} vs direct: ids differ at {bad_ids} \
+             steps, bytes at {bad_bytes} (first {first_bad:?}); helper rows warm {} cold {} \
+             direct {}: {}",
+            match helper.helper_cpu() {
+                None => "off".to_string(),
+                Some(None) => "floating".to_string(),
+                Some(Some(c)) => format!("on cpu{c}"),
+            },
+            st.warm,
+            st.cold,
+            st.direct,
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// What every site shares.

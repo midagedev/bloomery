@@ -35,7 +35,8 @@
 //! MoE sub-layer before the site's layer: it reads the step image alone, and
 //! the site's engram step is its first reader. The host half of a
 //! step ([`ChainBody::decode_input`]) plans it, reads its embedding and
-//! engram rows from the file and builds its image.
+//! engram rows from the file (the engram rows on a helper thread,
+//! [`StepRows`]) and builds its image.
 //!
 //! The pair pass ([`Body::enqueue_pair`]) runs two tokens as rows one layer
 //! apart on the same launches, so the host tier serves one row's layer while
@@ -1089,8 +1090,9 @@ impl ChainBody for Body {
     }
 
     /// The step at `pos` after the tokens decoded so far: its plan, its
-    /// embedding row and engram rows read from the file on this thread, and
-    /// its image built. A position other than the next one is refused.
+    /// embedding row read from the file on this thread and its engram rows by
+    /// the rows' helper meanwhile ([`StepRows::fill`]), and its image built.
+    /// A position other than the next one is refused.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
         const WHAT: &str = "deepseek41 Body::decode_input";
         if self.history.len() != pos as usize || self.history.len() == self.history.capacity() {

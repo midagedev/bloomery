@@ -370,6 +370,53 @@ impl Site {
         Ok(())
     }
 
+    /// How many rows of `ids` have every page in the page cache right now
+    /// (`mincore`, one call per row). A diagnostic: it answers "would this row
+    /// have been a device read", and costs a syscall per row whether or not.
+    ///
+    /// `mincore` reports the page cache of a file mapping only to a caller that
+    /// owns the file or could write it (root on the box does); anyone else
+    /// sees only the pages this process has mapped, so a cached-but-unmapped
+    /// row reads as not resident.
+    pub fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError> {
+        const CHUNK: usize = 8;
+        let mut resident = 0u64;
+        for &id in ids {
+            if u64::from(id) >= self.rows {
+                return Err(EngramError::RowOutOfRange {
+                    name: self.name.clone(),
+                    id,
+                    rows: self.rows,
+                });
+            }
+            let (first, span) = self.page_span(self.file_offset(id), self.row_bytes);
+            let page = self.page as usize;
+            let mut all = true;
+            let mut at = first;
+            while all && at < first + span {
+                let len = (first + span - at).min(CHUNK * page);
+                let mut vec = [0u8; CHUNK];
+                // SAFETY: `at..at + len` is page-aligned and inside the live
+                // mapping (`page_span` clamps to it), and `vec` holds one byte
+                // for each of the at most `CHUNK` pages of that range.
+                let rc = unsafe {
+                    libc::mincore(
+                        self.map.as_ptr().add(at).cast_mut().cast(),
+                        len,
+                        vec.as_mut_ptr(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(EngramError::Io(std::io::Error::last_os_error()));
+                }
+                all = vec[..len.div_ceil(page)].iter().all(|b| b & 1 == 1);
+                at += len;
+            }
+            resident += u64::from(all);
+        }
+        Ok(resident)
+    }
+
     /// Every row of `ids`, in order, **copied** into `out`.
     ///
     /// `out.len()` must be exactly `ids.len() * row_bytes()`. The reads go
