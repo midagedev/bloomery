@@ -13,10 +13,13 @@ pub const L_OUT_1: &str = "l_out-1";
 /// The last block's output residual — the output head's input.
 pub const L_OUT_26: &str = "l_out-26";
 
+/// The CUDA set, the one [`crate::ref_dir`] resolves to by default.
+pub const CUDA_SET: &str = "ref_cuda_v2";
+
 pub static ORACLE: Oracle = Oracle {
     arch: Arch::Deepseek2,
-    cuda_set: "ref_cuda_v2",
+    cuda_set: Some(CUDA_SET),
     cpu_set: "ref",
-    legacy_cuda_set: "ref_cuda",
+    legacy_cuda_set: Some("ref_cuda"),
     taps: &[L_OUT_0, L_OUT_1, L_OUT_26],
 };

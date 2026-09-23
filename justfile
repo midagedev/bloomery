@@ -513,6 +513,10 @@ gate-gpu-lib:
 gate-gpu-gates-lib:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib'
 
+# Host-only (no card, no gate lock): the harness reads every row of the V4.1 oracle set ref_deepseek41.
+gate-ds41-oracle:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_oracle --nocapture'
+
 # ik의 CUDA 답(프롬프트 33개의 다음 토큰): GPU 엔진 종단 게이트의 참조. 카드 선택과 오프로드
 # 깊이는 dump.sh와 같다(박스 env의 3090 핀, -ngl 99). ik의 CUDA는 ubatch 하나에 9토큰 이상이
 # 들어가면 쓰레기를 낸다(upstream의 MMQ 경로, mainline이 양자화한 파일에서만). 그래서 argmax.sh가 --step-prefill(M=1 경로)로 먹인다 —

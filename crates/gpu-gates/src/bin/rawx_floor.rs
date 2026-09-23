@@ -20,10 +20,10 @@
 
 use std::path::Path;
 
-use bloomery_gpu_gates::oracle::deepseek2::ORACLE;
+use bloomery_gpu_gates::oracle::{Set, deepseek2::ORACLE};
 use bloomery_gpu_gates::{
-    GateError, activations, max_rel_err, open_model, ref_dir_named, ref_gemv, ref_model_path,
-    row_bytes, tensor_bytes_as,
+    FileElem, GateError, Layout, RowKind, activations, dump_file_name, max_rel_err, open_model,
+    ref_dir_named, ref_gemv, ref_model_path, row_bytes, tensor_bytes_as,
 };
 use gguf::Gguf;
 use gguf::quant::GgmlType;
@@ -130,7 +130,13 @@ fn sites() -> Vec<Site> {
             v.push(Site {
                 name,
                 layer: Some(layer),
-                x_file: format!("{stem}-{layer}.0.f32"),
+                x_file: dump_file_name(
+                    &format!("{stem}-{layer}"),
+                    0,
+                    RowKind::Tensor,
+                    Layout::Flat,
+                    FileElem::F32,
+                ),
                 tensor: tensor(layer as usize),
                 ty,
                 k,
@@ -143,7 +149,13 @@ fn sites() -> Vec<Site> {
     v.push(Site {
         name: "lm_head",
         layer: None,
-        x_file: "result_norm.0.f32".to_string(),
+        x_file: dump_file_name(
+            "result_norm",
+            0,
+            RowKind::Tensor,
+            Layout::Flat,
+            FileElem::F32,
+        ),
         tensor: "output.weight".to_string(),
         ty: GgmlType::Q6_K,
         k: 2048,
@@ -162,7 +174,7 @@ fn run() -> Result<(), GateError> {
     let model = ref_model_path()?;
     // Pinned to the pre-v2 set, not steered by the environment the way
     // `ref_dir()` is (which resolves to the table's v2 CUDA set).
-    let dir = ref_dir_named(ORACLE.legacy_cuda_set);
+    let dir = ref_dir_named(ORACLE.set_name(Set::LegacyCuda)?);
     let gguf = open_model()?;
     println!("rawx_floor: model {}", model.display());
     println!("rawx_floor: activations dir {}", dir.display());

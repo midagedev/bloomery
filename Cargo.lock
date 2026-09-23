@@ -86,11 +86,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-gpu-deepseek41"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gpu",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+]
+
+[[package]]
 name = "bloomery-gpu-gates"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
+ "bloomery-gpu-deepseek41",
  "bloomery-model",
  "cuda-core",
  "oxide-artifacts",

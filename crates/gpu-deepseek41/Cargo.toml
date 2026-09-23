@@ -1,0 +1,16 @@
+[package]
+name = "bloomery-gpu-deepseek41"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+cuda-device.workspace = true
+cuda-host.workspace = true
+cuda-core.workspace = true
+# Shared device bodies (`bloomery_gpu::cores`) and the runtime types the launchers take.
+bloomery-gpu = { path = "../gpu" }

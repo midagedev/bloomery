@@ -20,7 +20,9 @@ oxide-artifacts = { workspace = true, features = ["object-read"] }
 # has no edge to the device crate, so plain cargo never resolves the
 # embedded-bundle anchor symbol.
 bloomery-gpu = { path = "../gpu", optional = true }
+# The V4.1 device crate, optional for the same reason; its op gates reach it through this edge.
+bloomery-gpu-deepseek41 = { path = "../gpu-deepseek41", optional = true }
 cuda-core = { workspace = true, optional = true }
 
 [features]
-gpu = ["dep:bloomery-gpu", "dep:cuda-core"]
+gpu = ["dep:bloomery-gpu", "dep:bloomery-gpu-deepseek41", "dep:cuda-core"]

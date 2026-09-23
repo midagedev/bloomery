@@ -19,7 +19,7 @@ pub mod ptx;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, TensorInfo};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Kernel gate band against the quantized-input reference.
 /// PIN(2026-09-21): tightened 1e-2 -> 1e-5. Measured worst on the landed
@@ -247,7 +247,110 @@ pub fn bytes_to_words(b: &[u8]) -> Vec<u32> {
 
 // ------------------------------------------------------- ik CUDA dump
 
-/// One `tensor` row of the CUDA oracle dump's MANIFEST.tsv. `ne` is
+/// Which kind of manifest row a file belongs to: a graph node (`tensor`) or
+/// a graph leaf the host fills before the graph runs (`input` — token ids,
+/// positions, masks, engram row ids). The two are separate occurrence
+/// namespaces, and an input's files carry `.input` in their names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowKind {
+    Tensor,
+    Input,
+}
+
+impl RowKind {
+    /// The manifest's spelling: `tensor` or `input`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RowKind::Tensor => "tensor",
+            RowKind::Input => "input",
+        }
+    }
+}
+
+/// The element order of a set file: `Flat` is the tensor's memory read
+/// contiguously from its data pointer (the plain file), `Logical` its
+/// elements in ggml index order through its own strides (the twin every
+/// view or non-contiguous row also gets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Layout {
+    Flat,
+    Logical,
+}
+
+impl Layout {
+    /// The manifest's spelling: `flat` or `logical`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Layout::Flat => "flat",
+            Layout::Logical => "logical",
+        }
+    }
+}
+
+/// What a set file holds per element: the f32 conversion every row has, or
+/// an integer twin's lossless width (i8, i16 and i32 widen to `I32`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileElem {
+    F32,
+    I32,
+    I64,
+}
+
+impl FileElem {
+    /// The file-name extension, also the manifest's spelling of a twin.
+    pub fn ext(self) -> &'static str {
+        match self {
+            FileElem::F32 => "f32",
+            FileElem::I32 => "i32",
+            FileElem::I64 => "i64",
+        }
+    }
+
+    /// Bytes per element.
+    pub fn width(self) -> u64 {
+        match self {
+            FileElem::F32 | FileElem::I32 => 4,
+            FileElem::I64 => 8,
+        }
+    }
+}
+
+/// A manifest name as the stem of its files: every `/`, `\` and space
+/// becomes `_`, which keeps the name one path element. This is `safe_name`
+/// in `tools/ref/dump_ref.cpp`. The manifest keeps the raw name, so a file
+/// name formed from a row goes through [`dump_file_name`], which calls this.
+pub fn dump_stem(name: &str) -> String {
+    name.replace(['/', '\\', ' '], "_")
+}
+
+/// The name the dumper gives a set file:
+/// `<stem>.<occurrence>[.input][.logical].<ext>` — `.input` on a graph
+/// input's files, `.logical` on a logical twin, `ext` from `elem` (`f32`, or
+/// an integer twin's `i32`/`i64`), and the stem from [`dump_stem`]. Every set
+/// file name this crate reads is formed here.
+pub fn dump_file_name(
+    name: &str,
+    occurrence: u32,
+    of: RowKind,
+    layout: Layout,
+    elem: FileElem,
+) -> String {
+    let input = match of {
+        RowKind::Tensor => "",
+        RowKind::Input => ".input",
+    };
+    let logical = match layout {
+        Layout::Flat => "",
+        Layout::Logical => ".logical",
+    };
+    format!(
+        "{}.{occurrence}{input}{logical}.{}",
+        dump_stem(name),
+        elem.ext()
+    )
+}
+
+/// One `tensor` or `input` row of a dump set's MANIFEST.tsv. `ne` is
 /// ne0..ne3 as written: ne0 is the contiguous dimension (values of an
 /// activation, rows of a MUL_MAT output); `sum` is the dumper's element
 /// sum, usable to prove a VIEW row carries the same bytes as its base.
@@ -255,6 +358,7 @@ pub fn bytes_to_words(b: &[u8]) -> Vec<u32> {
 /// `src0`, `src1`); `None` on a set written before they existed.
 #[derive(Debug, Clone)]
 pub struct RefRow {
+    pub kind: RowKind,
     pub name: String,
     pub occurrence: u32,
     pub ty: String,
@@ -274,9 +378,27 @@ impl RefRow {
         self.ne.iter().product()
     }
 
-    /// The dump file's name: `<name>.<occurrence>.f32`.
+    /// The plain file's name ([`dump_file_name`]): the flat f32 read.
     pub fn file_name(&self) -> String {
-        format!("{}.{}.f32", self.name, self.occurrence)
+        dump_file_name(
+            &self.name,
+            self.occurrence,
+            self.kind,
+            Layout::Flat,
+            FileElem::F32,
+        )
+    }
+
+    /// The logical twin's file name, a file that exists when `logical` is
+    /// `Some(1)`.
+    pub fn logical_file_name(&self) -> String {
+        dump_file_name(
+            &self.name,
+            self.occurrence,
+            self.kind,
+            Layout::Logical,
+            FileElem::F32,
+        )
     }
 
     /// Prove this row's type, dims and op — the chain check every consumer
@@ -295,10 +417,234 @@ impl RefRow {
     }
 }
 
+/// One `int` row: the lossless twin of an integer tensor's f32 file of the
+/// same layout, raw little-endian in the same element order. `sum` is the
+/// exact element sum (wrapping 64-bit, printed signed), `absmax` the largest
+/// magnitude, `file` the name the dumper wrote.
+#[derive(Debug, Clone)]
+pub struct IntRow {
+    pub name: String,
+    pub occurrence: u32,
+    /// The kind of the row this file twins.
+    pub of: RowKind,
+    /// The twinned tensor's ggml type (`i8`, `i16`, `i32` or `i64`).
+    pub ty: String,
+    /// `I32` (i8, i16 and i32 widened) or `I64`; the parser admits no `F32`.
+    pub twin: FileElem,
+    pub layout: Layout,
+    pub count: u64,
+    pub bytes: u64,
+    pub sum: i64,
+    pub absmax: u64,
+    pub file: String,
+}
+
+/// `int <of> <name>/<occurrence> <layout> (<file>)` — how errors name a row.
+impl std::fmt::Display for IntRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "int {} {}/{} {} ({})",
+            self.of.as_str(),
+            self.name,
+            self.occurrence,
+            self.layout.as_str(),
+            self.file
+        )
+    }
+}
+
+/// A dump set's whole MANIFEST.tsv: the header lines the harness checks and
+/// every row the dumper writes, by kind. A gate reads it once per set and
+/// takes rows out of it.
+#[derive(Debug, Clone)]
+pub struct RefManifest {
+    /// The set's directory; every file a row names resolves under it.
+    pub dir: PathBuf,
+    /// `# arch`, the model's `general.architecture`. `None` on a set dumped
+    /// before the dumper wrote the line.
+    pub arch: Option<String>,
+    /// `# build`, the ik build that wrote the set.
+    pub build: Option<String>,
+    /// `# complete <written> <skipped>`: the node rows written and skipped.
+    /// `None` when the trailer is missing — the dump that wrote the set died.
+    pub complete: Option<(u64, u64)>,
+    /// `tensor` rows (graph nodes), in file order.
+    pub tensors: Vec<RefRow>,
+    /// `input` rows (graph leaves), in file order.
+    pub inputs: Vec<RefRow>,
+    /// `int` rows, one per integer twin file, in file order.
+    pub ints: Vec<IntRow>,
+    /// `skip` rows: nodes written to no file (quantized, unhandled type,
+    /// unallocated).
+    pub skipped_nodes: u64,
+    /// `skip-input` rows: the same for graph inputs.
+    pub skipped_inputs: u64,
+}
+
+impl RefManifest {
+    /// Parse `dir/MANIFEST.tsv`. Header lines start with `#`; data rows are
+    /// tab-separated, the kind first:
+    /// `tensor`/`input name occurrence type ne0 ne1 ne2 ne3 bytes sum op`
+    /// with four optional trailing fields `contig logical src0 src1` (sets
+    /// written before the v2 columns carry the 11-field width and parse to
+    /// `None`s), `int name occurrence of type twin layout count bytes sum
+    /// absmax file`, and `skip`/`skip-input name occurrence type reason`.
+    /// Tensor names may contain spaces, so fields are split on tabs only. A
+    /// row of any other kind or width is an error naming its line, and so is
+    /// a manifest with no `tensor` row.
+    pub fn read(dir: &Path) -> Result<RefManifest, GateError> {
+        let path = dir.join("MANIFEST.tsv");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("ref_manifest: cannot read {}: {e}", path.display()))?;
+        let mut man = RefManifest {
+            dir: dir.to_path_buf(),
+            arch: None,
+            build: None,
+            complete: None,
+            tensors: Vec::new(),
+            inputs: Vec::new(),
+            ints: Vec::new(),
+            skipped_nodes: 0,
+            skipped_inputs: 0,
+        };
+        for (i, line) in text.lines().enumerate() {
+            let at = At(&path, i + 1);
+            if let Some(v) = line.strip_prefix("# arch\t") {
+                man.arch = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("# build\t") {
+                man.build = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("# complete\t") {
+                let (w, s) = v
+                    .split_once('\t')
+                    .ok_or_else(|| format!("ref_manifest: {at}: trailer {line:?}"))?;
+                man.complete = Some((parse_u64(w, at)?, parse_u64(s, at)?));
+            } else if line.starts_with('#') || line.is_empty() {
+                continue;
+            } else {
+                let f: Vec<&str> = line.split('\t').collect();
+                match f[0] {
+                    "tensor" => man.tensors.push(parse_ref_row(RowKind::Tensor, &f, at)?),
+                    "input" => man.inputs.push(parse_ref_row(RowKind::Input, &f, at)?),
+                    "int" => man.ints.push(parse_int_row(&f, at)?),
+                    "skip" | "skip-input" if f.len() != 5 => {
+                        return Err(format!(
+                            "ref_manifest: {at}: {} row has {} fields, want 5",
+                            f[0],
+                            f.len()
+                        )
+                        .into());
+                    }
+                    "skip" => man.skipped_nodes += 1,
+                    "skip-input" => man.skipped_inputs += 1,
+                    k => return Err(format!("ref_manifest: {at}: unknown row kind {k:?}").into()),
+                }
+            }
+        }
+        if man.tensors.is_empty() {
+            return Err(format!("ref_manifest: no tensor rows in {}", path.display()).into());
+        }
+        Ok(man)
+    }
+}
+
+/// A manifest line's position, `<path>:<line>`, formatted only into an error.
+#[derive(Clone, Copy)]
+struct At<'a>(&'a Path, usize);
+
+impl std::fmt::Display for At<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.0.display(), self.1)
+    }
+}
+
+fn parse_u64(s: &str, at: At) -> Result<u64, GateError> {
+    s.parse::<u64>()
+        .map_err(|e| format!("ref_manifest: {at}: {s:?}: {e}").into())
+}
+
+fn parse_narrow<T: TryFrom<u64>>(s: &str, at: At) -> Result<T, GateError> {
+    T::try_from(parse_u64(s, at)?)
+        .map_err(|_| format!("ref_manifest: {at}: {s:?} is out of range").into())
+}
+
+/// A `tensor` or `input` row, 11 or 15 fields (the kind is `f[0]`).
+fn parse_ref_row(kind: RowKind, f: &[&str], at: At) -> Result<RefRow, GateError> {
+    if f.len() != 11 && f.len() != 15 {
+        return Err(format!(
+            "ref_manifest: {at}: {} row has {} fields, want 11 or 15",
+            kind.as_str(),
+            f.len()
+        )
+        .into());
+    }
+    let ne = |i: usize| parse_u64(f[i], at);
+    Ok(RefRow {
+        kind,
+        name: f[1].to_string(),
+        occurrence: parse_narrow(f[2], at)?,
+        ty: f[3].to_string(),
+        ne: [ne(4)?, ne(5)?, ne(6)?, ne(7)?],
+        bytes: parse_u64(f[8], at)?,
+        sum: f[9]
+            .parse::<f64>()
+            .map_err(|e| format!("ref_manifest: {at}: {:?}: {e}", f[9]))?,
+        op: f[10].to_string(),
+        contig: f.get(11).map(|s| parse_narrow(s, at)).transpose()?,
+        logical: f.get(12).map(|s| parse_narrow(s, at)).transpose()?,
+        src0: f.get(13).map(|s| s.to_string()),
+        src1: f.get(14).map(|s| s.to_string()),
+    })
+}
+
+/// An `int` row, 12 fields.
+fn parse_int_row(f: &[&str], at: At) -> Result<IntRow, GateError> {
+    if f.len() != 12 {
+        return Err(format!(
+            "ref_manifest: {at}: int row has {} fields, want 12",
+            f.len()
+        )
+        .into());
+    }
+    let bad = |col: &str, v: &str| -> GateError {
+        format!("ref_manifest: {at}: int row {col} {v:?}").into()
+    };
+    let of = match f[3] {
+        "tensor" => RowKind::Tensor,
+        "input" => RowKind::Input,
+        v => return Err(bad("of", v)),
+    };
+    let twin = match f[5] {
+        "i32" => FileElem::I32,
+        "i64" => FileElem::I64,
+        v => return Err(bad("twin", v)),
+    };
+    let layout = match f[6] {
+        "flat" => Layout::Flat,
+        "logical" => Layout::Logical,
+        v => return Err(bad("layout", v)),
+    };
+    Ok(IntRow {
+        name: f[1].to_string(),
+        occurrence: parse_narrow(f[2], at)?,
+        of,
+        ty: f[4].to_string(),
+        twin,
+        layout,
+        count: parse_u64(f[7], at)?,
+        bytes: parse_u64(f[8], at)?,
+        sum: f[9]
+            .parse::<i64>()
+            .map_err(|e| format!("ref_manifest: {at}: {:?}: {e}", f[9]))?,
+        absmax: parse_u64(f[10], at)?,
+        file: f[11].to_string(),
+    })
+}
+
 /// Directory of the ik CUDA oracle dump (docs/gpu-design.md decision 3):
 /// `$BLOOMERY_REF_CUDA` if set (an absolute path), else the set named by
 /// `$BLOOMERY_REF_SET`, else the deepseek2 table's CUDA set
-/// ([`oracle::deepseek2::ORACLE`]) under [`data_dir`]. Read-only for every
+/// ([`oracle::deepseek2::CUDA_SET`]) under [`data_dir`]. Read-only for every
 /// caller. `BLOOMERY_REF_SET` is how a gate points itself at the pre-v2
 /// `ref_cuda` (plain files only, no logical twins) or the CPU `ref` without
 /// a code change.
@@ -309,7 +655,7 @@ pub fn ref_dir() -> PathBuf {
     if let Ok(s) = std::env::var("BLOOMERY_REF_SET") {
         return ref_dir_named(&s);
     }
-    data_dir().join(oracle::deepseek2::ORACLE.cuda_set)
+    data_dir().join(oracle::deepseek2::CUDA_SET)
 }
 
 /// A named dump set's directory: an absolute `set` is the directory
@@ -324,57 +670,10 @@ pub fn ref_dir_named(set: &str) -> PathBuf {
     data_dir().join(set)
 }
 
-/// Parse the MANIFEST.tsv of the set at `dir`. Header lines start with
-/// `#`; data rows are tab-separated
-/// `tensor name occurrence type ne0 ne1 ne2 ne3 bytes sum op`
-/// with four optional trailing fields `contig logical src0 src1` —
-/// sets written before the v2 columns carry the 11-field width and parse
-/// to `None`s. Tensor names may contain spaces, so fields are split on
-/// tabs only.
+/// The `tensor` rows of the set at `dir` ([`RefManifest::read`]) — the
+/// rows the node readers below look names up in.
 pub fn ref_manifest_in(dir: &std::path::Path) -> Result<Vec<RefRow>, GateError> {
-    let path = dir.join("MANIFEST.tsv");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("ref_manifest: cannot read {}: {e}", path.display()))?;
-    let mut rows = Vec::new();
-    for line in text.lines() {
-        if line.starts_with('#') || !line.starts_with("tensor\t") {
-            continue;
-        }
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 11 && f.len() != 15 {
-            return Err(format!(
-                "ref_manifest: {}: row has {} fields, want 11 or 15: {line}",
-                path.display(),
-                f.len()
-            )
-            .into());
-        }
-        let uparse = |s: &str| -> Result<u64, GateError> {
-            s.parse::<u64>()
-                .map_err(|e| format!("ref_manifest: {}: {s:?}: {e}", path.display()).into())
-        };
-        let fparse = |s: &str| -> Result<f64, GateError> {
-            s.parse::<f64>()
-                .map_err(|e| format!("ref_manifest: {}: {s:?}: {e}", path.display()).into())
-        };
-        rows.push(RefRow {
-            name: f[1].to_string(),
-            occurrence: uparse(f[2])? as u32,
-            ty: f[3].to_string(),
-            ne: [uparse(f[4])?, uparse(f[5])?, uparse(f[6])?, uparse(f[7])?],
-            bytes: uparse(f[8])?,
-            sum: fparse(f[9])?,
-            op: f[10].to_string(),
-            contig: f.get(11).map(|s| uparse(s)).transpose()?.map(|v| v as u8),
-            logical: f.get(12).map(|s| uparse(s)).transpose()?.map(|v| v as u8),
-            src0: f.get(13).map(|s| s.to_string()),
-            src1: f.get(14).map(|s| s.to_string()),
-        });
-    }
-    if rows.is_empty() {
-        return Err(format!("ref_manifest: no tensor rows in {}", path.display()).into());
-    }
-    Ok(rows)
+    Ok(RefManifest::read(dir)?.tensors)
 }
 
 /// `ref_manifest_in` of `ref_dir()`.
@@ -507,7 +806,7 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
             )
             .into());
         }
-        let path = dir.join(format!("{}.{}.logical.f32", row.name, row.occurrence));
+        let path = dir.join(row.logical_file_name());
         let expect = 4_u64
             .checked_mul(row.count())
             .ok_or("ref_tensor_logical: element count overflows")?;
@@ -554,6 +853,107 @@ pub fn ref_tensor_logical_in(dir: &std::path::Path, row: &RefRow) -> Result<Vec<
         .into());
     }
     ref_tensor_of_in(dir, row)
+}
+
+/// The `int` row twinning `(name, occurrence)` of kind `of` in `layout`.
+pub fn find_int_row<'a>(
+    man: &'a RefManifest,
+    name: &str,
+    occurrence: u32,
+    of: RowKind,
+    layout: Layout,
+) -> Result<&'a IntRow, GateError> {
+    man.ints
+        .iter()
+        .find(|r| r.name == name && r.occurrence == occurrence && r.of == of && r.layout == layout)
+        .ok_or_else(|| {
+            format!(
+                "find_int_row: no {} integer twin of {} {name}/{occurrence} in {}",
+                layout.as_str(),
+                of.as_str(),
+                man.dir.join("MANIFEST.tsv").display()
+            )
+            .into()
+        })
+}
+
+/// The exact integers of int row `row` of the set at `dir`, widened to
+/// i64, read from its `file` after proving that file is the one the row
+/// describes: `file` is the name [`dump_file_name`] gives the row (the
+/// dumper and this crate share one naming rule), `bytes` is `count`
+/// elements of the twin's width and the file's length, and the `sum`
+/// (wrapping) and `absmax` recomputed from the values equal the row's. A
+/// wrong file, offset or width fails here, naming the row.
+pub fn ref_ints_of_in(dir: &Path, row: &IntRow) -> Result<Vec<i64>, GateError> {
+    let want = dump_file_name(&row.name, row.occurrence, row.of, row.layout, row.twin);
+    if row.file != want {
+        return Err(format!("ref_ints: {row}: the dumper names this row's file {want}").into());
+    }
+    let expect = row
+        .count
+        .checked_mul(row.twin.width())
+        .ok_or_else(|| format!("ref_ints: {row}: element count overflows"))?;
+    if row.bytes != expect {
+        return Err(format!(
+            "ref_ints: {row}: bytes {} != count {} x {}",
+            row.bytes,
+            row.count,
+            row.twin.width()
+        )
+        .into());
+    }
+    let path = dir.join(&row.file);
+    let raw = std::fs::read(&path)
+        .map_err(|e| format!("ref_ints: {row}: cannot read {}: {e}", path.display()))?;
+    if raw.len() as u64 != row.bytes {
+        return Err(format!(
+            "ref_ints: {row}: {} is {} bytes, the row says {}",
+            path.display(),
+            raw.len(),
+            row.bytes
+        )
+        .into());
+    }
+    let vals: Vec<i64> = match row.twin {
+        FileElem::I32 => raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i64::from(i32::from_le_bytes(*c)))
+            .collect(),
+        FileElem::I64 => raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
+            .collect(),
+        FileElem::F32 => return Err(format!("ref_ints: {row}: not an integer twin").into()),
+    };
+    let sum = vals
+        .iter()
+        .fold(0u64, |a, &v| a.wrapping_add(v.cast_unsigned()))
+        .cast_signed();
+    let absmax = vals.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+    if sum != row.sum || absmax != row.absmax {
+        return Err(format!(
+            "ref_ints: {row}: the file sums to {sum} with absmax {absmax}, the row says {} and {}",
+            row.sum, row.absmax
+        )
+        .into());
+    }
+    Ok(vals)
+}
+
+/// The exact integers of `(name, occurrence)`'s twin of kind `of` in
+/// `layout`: [`find_int_row`] in `man`, then [`ref_ints_of_in`].
+pub fn ref_ints(
+    man: &RefManifest,
+    name: &str,
+    occurrence: u32,
+    of: RowKind,
+    layout: Layout,
+) -> Result<Vec<i64>, GateError> {
+    ref_ints_of_in(&man.dir, find_int_row(man, name, occurrence, of, layout)?)
 }
 
 // -------------------------------------------------- promoted gate helpers
@@ -728,12 +1128,20 @@ pub fn widened_f16_bits(row: &RefRow, rows: usize) -> Result<Vec<u16>, GateError
 
 /// The topk row's ids from its LOGICAL twin: `ffn_moe_topk-L` is an i32
 /// VIEW of the argsort output whose plain file is the flat parent read
-/// (token 0's ranking only), so the ids of every token live in the
-/// `.logical.f32` twin, each cast to f32 by the dumper. Accepted only when
-/// the row carries a twin and every value is integral in `0..64`, which
-/// rules out any stride or cast mix-up; the manifest's element-sum column
-/// describes the plain file and is not checked here.
+/// (token 0's ranking only), so the ids of every token live in the logical
+/// twin, read exact from its `.logical.i32` integer twin ([`ref_ints`]).
+/// For a set whose manifest has no `int` rows at all (dumped before integer
+/// twins existed) it reads the `.logical.f32` twin, each id cast to f32 by
+/// the dumper. Accepted only when the row carries a logical twin and every
+/// id is an integer in `0..64`, which rules out any stride or cast mix-up;
+/// the manifest's element-sum column describes the plain file and is not
+/// checked here. `row` is a row of `ref_dir()`'s manifest, read here.
 pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
+    topk_ids_logical_in(&RefManifest::read(&ref_dir())?, row)
+}
+
+/// [`topk_ids_logical`] of a row of `man`, a manifest already read.
+pub fn topk_ids_logical_in(man: &RefManifest, row: &RefRow) -> Result<Vec<i32>, GateError> {
     if row.logical != Some(1) {
         return Err(format!(
             "topk_ids_logical: {} has no logical twin — the ids need a v2 dump set",
@@ -741,7 +1149,31 @@ pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
         )
         .into());
     }
-    let path = ref_dir().join(format!("{}.{}.logical.f32", row.name, row.occurrence));
+    if !man.ints.is_empty() {
+        let ids = ref_ints(man, &row.name, row.occurrence, row.kind, Layout::Logical)?;
+        if ids.len() as u64 != row.count() {
+            return Err(format!(
+                "topk_ids_logical: {}/{} has {} elements, its integer twin {}",
+                row.name,
+                row.occurrence,
+                row.count(),
+                ids.len()
+            )
+            .into());
+        }
+        return ids
+            .iter()
+            .map(|&v| match i32::try_from(v) {
+                Ok(id) if (0..64).contains(&id) => Ok(id),
+                _ => Err(format!(
+                    "topk_ids_logical: {}/{} holds id {v}, outside 0..64",
+                    row.name, row.occurrence
+                )
+                .into()),
+            })
+            .collect();
+    }
+    let path = man.dir.join(row.logical_file_name());
     let raw = std::fs::read(&path)
         .map_err(|e| format!("topk_ids_logical: cannot read {}: {e}", path.display()))?;
     let expect = 4_u64
@@ -775,7 +1207,50 @@ pub fn topk_ids_logical(row: &RefRow) -> Result<Vec<i32>, GateError> {
 
 #[cfg(test)]
 mod tests {
-    use super::max_rel_err;
+    use super::{GateError, RefManifest, max_rel_err, topk_ids_logical_in};
+
+    /// The top-k reader takes the exact `.logical.i32` twin when the
+    /// manifest has `int` rows and the `.logical.f32` twin when it has none
+    /// — the f32 file below disagrees in one id, so the result shows which
+    /// file was read — and a manifest with twins but none for the row is an
+    /// error. The name has a space, so the files resolve only through the
+    /// dumper's `safe_name` rule.
+    #[test]
+    fn topk_ids_take_the_integer_twin_when_the_set_has_twins() -> Result<(), GateError> {
+        let dir = std::env::temp_dir().join(format!("bloomery-topk-twin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let ids: [i32; 4] = [3, 63, 0, 17];
+        let cast: [f32; 4] = [3.0, 63.0, 0.0, 16.0];
+        let stem = "ffn_moe_topk-1_(view).0.logical";
+        std::fs::write(
+            dir.join(format!("{stem}.i32")),
+            ids.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )?;
+        std::fs::write(
+            dir.join(format!("{stem}.f32")),
+            cast.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )?;
+        let tensor =
+            "tensor\tffn_moe_topk-1 (view)\t0\ti32\t2\t2\t1\t1\t16\t0.000000\tVIEW\t0\t1\t-\t-";
+        let int = format!(
+            "int\tffn_moe_topk-1 (view)\t0\ttensor\ti32\ti32\tlogical\t4\t16\t83\t63\t{stem}.i32"
+        );
+        let other = int.replacen("\t0\t", "\t1\t", 1);
+        let read = |rows: &[&str]| -> Result<Vec<i32>, GateError> {
+            std::fs::write(dir.join("MANIFEST.tsv"), rows.join("\n") + "\n")?;
+            let man = RefManifest::read(&dir)?;
+            topk_ids_logical_in(&man, &man.tensors[0])
+        };
+        assert_eq!(read(&[tensor, &int])?, ids);
+        assert_eq!(read(&[tensor])?, [3, 63, 0, 16]);
+        assert!(read(&[tensor, &other]).is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 
     /// `f32::max` drops NaN, so a fold alone scores an all-NaN output as 0.
     #[test]
