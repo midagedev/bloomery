@@ -471,7 +471,7 @@ flowchart LR
 
 ⑪ **문서(XS)**: `docs/oracle.md:52`에 한 문장 — 덤퍼의 노드 콜백은 전부 ik의 비융합 CPU 경로이고 `argmax_ref.cpp`는 `cb_eval`이 없어 융합 경로를 타므로, 두 기준이 동점 근처에서 갈릴 수 있다. rig-log `docs/v41-serving.md:174`의 "ik KV 셀에 토큰 id가 없다"는 `c10fbbcc`에서 낡았다(`llama-context.h:55`의 `tok`).
 
-⑫ **업스트림 후보**(제출 전에 FAIL-first): Nsight Compute 2026.2.1의 `derived__local_spilling_requests_pct`는 분자와 분모가 같은 합이라, 스필이 하나라도 있으면 100 %로 읽힌다(코드 독해뿐 — 스필하는 커널을 두 판에서 잰다). ik `llama-cparams.h:47`·`common/common.h:433`의 "off by default" 주석이 실제 기본값 true와 어긋난다(우리 포트가 넣은 줄인지 먼저 본다). skelectric 포트의 같은 제자리 패턴(`build_deepseek4.cpp:898-906`, 재지 않음 — 알림만).
+⑫ **업스트림 후보**(제출 전에 FAIL-first): Nsight Compute 2026.2.1의 `derived__local_spilling_requests_pct`는 분자와 분모가 같은 합이라, 스필이 하나라도 있으면 100 %로 읽힌다(코드 독해뿐 — 스필하는 커널을 두 판에서 잰다). ik의 `fused_idx_topk` — 확인했다(09-23 낮, 박스의 ik 트리): `common/common.h:433`의 기본값은 true(ik #2165, `79454044`)인데 주석은 "off by default; opt-in via -fidx"이고, CLI에는 켜는 `-fidx`/`--fused-indexer-topk`만 있어 끌 방법이 없다(`common/common.cpp:1938`; 도움말은 실제 값을 찍어 "enabled"로 나온다). `src/llama-cparams.h:47`은 false라 주석과 맞는다. 우리 포트가 넣은 줄이 아니라 업스트림 줄이다(origin에 있다). 제출 전에 최신 main을 다시 본다(박스 fetch는 09-10). 끄는 플래그가 없다는 것은 융합과 비융합의 동률 처리가 다를 때(b4plan) 사용자가 비교할 수단이 없다는 뜻이다. skelectric 포트의 같은 제자리 패턴(`build_deepseek4.cpp:898-906`, 재지 않음 — 알림만).
 
 ## 측정 프로토콜 치트시트
 
