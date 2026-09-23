@@ -6,7 +6,7 @@ bloomery is built for one kind of machine: one or two RTX 3090 cards, an AVX2 ho
 
 | | T1, the minimum | T2, extended | The development machine |
 |---|---|---|---|
-| GPU | RTX 3090 24 GB ×1, placement `gate`: dense weights 7.66 GB plus about 10 GB of experts | RTX 3090 ×2, 48 GB. Needs a two-card path that is not built yet | RTX A6000 48 GB, placement (a): 2,414 routed experts, 40.5 GB, on the card |
+| GPU | RTX 3090 24 GB ×1, placement `gate`: dense weights 7.66 GB plus 888 experts, 14.9 GB | RTX 3090 ×2, 48 GB. Needs a two-card path that is not built yet | RTX A6000 48 GB, placement (a): 2,414 routed experts, 40.5 GB, on the card |
 | CPU | AVX2, 8 DDR4 channels | same | Threadripper PRO 5975WX, 32 cores, 8 × DDR4-3600 |
 | RAM | 256 GB | same | 264 GB |
 | Storage | NVMe, for the engram table | same | NVMe |
