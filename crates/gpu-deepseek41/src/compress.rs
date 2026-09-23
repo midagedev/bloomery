@@ -67,7 +67,7 @@ const _: () = assert!(WIDTH == 512 && WARPS == 4);
 /// Word of the step buffer: the groups the step completes.
 pub(crate) const W_GROUPS: usize = 0;
 /// Word of the step buffer: the ring slots the step keeps.
-const W_PERSISTS: usize = 1;
+pub(crate) const W_PERSISTS: usize = 1;
 
 /// Word of group `g`'s compressed row.
 pub(crate) const fn w_row(g: usize) -> usize {
@@ -76,12 +76,12 @@ pub(crate) const fn w_row(g: usize) -> usize {
 
 /// Word of group `g`'s `k`-th pooled projection: below `ratio` a ring slot,
 /// from `ratio` on the step's token `index − ratio`.
-const fn w_read(max_groups: usize, ratio: usize, g: usize, k: usize) -> usize {
+pub(crate) const fn w_read(max_groups: usize, ratio: usize, g: usize, k: usize) -> usize {
     2 + max_groups + g * ratio + k
 }
 
 /// Word of the `j`-th kept token (a batch index); its slot is `ratio` words on.
-const fn w_persist(max_groups: usize, ratio: usize, j: usize) -> usize {
+pub(crate) const fn w_persist(max_groups: usize, ratio: usize, j: usize) -> usize {
     2 + max_groups * (1 + ratio) + j
 }
 

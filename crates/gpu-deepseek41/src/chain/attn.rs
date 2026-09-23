@@ -2,3 +2,1316 @@
 //! paths, the compressor and the index keys where the layer owns them, the
 //! attention over the window and the compressed rows, the output projection
 //! and HC_POST with the next fold. See [`super`] for the piece contract.
+//!
+//! One [`AttnChain`] serves every layer of a card: what a layer launches
+//! follows from its kind ([`LayerKind`] and the plan's stream of its ratio),
+//! never from its number, and the scratch between the launches is shared,
+//! since the layers run one after another on one stream. Per layer:
+//!
+//! 1. HC_PRE of the streams the sub-layer reads — the `pre`, `post` and
+//!    `comb` that HC_POST and the ffn's fold take. The body reads the fold
+//!    the previous sub-layer left, never this HC_PRE's (the lag);
+//! 2. the attention norm of that fold, with its q8_1 form on a layer that
+//!    owns a compressor, whose q3_K projections read it;
+//! 3. on a compressor's layer: its kv projection (and its gate projection
+//!    above ratio 1), the pooled row — or, at ratio 1, the token's row — with
+//!    its norm, rope and f16 cache row, then the index key of the pre-rope
+//!    row. These run every step; the image's group count decides whether a
+//!    row and a key are written;
+//! 4. the query: q_a, its norm, q_b and the tail rope;
+//! 5. the latent row: kv, then its norm, tail rope and f16 slot in the ring;
+//! 6. the attention over the window ⧺ a prefix of the stream's compressed
+//!    rows, then the inverse rope of its output;
+//! 7. wo_a, its groups in one `q8_0_gemv_heads` launch, and wo_b;
+//! 8. HC_POST and the ffn's fold in one launch.
+//!
+//! A layer attends the rows its stream's source layer writes
+//! (`stream.kv_source`); the caller passes that layer's buffers
+//! ([`Compressed`]). The rows the indexer selects are the next phase's: the
+//! attention reads a prefix here (`selected: None`), which is every visible
+//! row wherever the visible count is at most the file's `top_k`.
+//!
+//! The step's integers and rope tables come from the step image, whose
+//! layout is not the launches': the attention takes a token's window length
+//! and compressed count as one pair, the compressor its [`CompGeom`] words.
+//! [`AttnChain::enqueue_step`] gathers them once a step, one
+//! `StepKernels::enqueue_gather` launch, into the piece's own words in the
+//! layouts the launches read ([`WordsLayout`]); every layer then reads
+//! windows of those words. The gather's pairs are fixed at load from the
+//! image's layout.
+
+use std::marker::PhantomData;
+use std::mem::{ManuallyDrop, size_of};
+use std::ops::{Deref, Range};
+
+use bloomery_gpu::fused::FusedKernels;
+use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
+use bloomery_gpu::weights::{DevWeight, Weights};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, window};
+use cuda_core::DeviceBuffer;
+use gguf::quant::GgmlType;
+use model::arch::deepseek41::hparams::Hparams;
+use model::arch::deepseek41::names;
+use model::arch::deepseek41::plan::Planner;
+
+use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
+use crate::body::STEP_TOKENS;
+use crate::compress::{
+    self, CompGeom, CompressKernels, PoolArgs, RowsArgs, W_GROUPS, W_PERSISTS, w_persist, w_read,
+    w_row,
+};
+use crate::hc::{
+    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs,
+    HcPreScratch,
+};
+use crate::index_key::{self, IndexKeyArgs, IndexKeyKernels};
+use crate::params::{ImageLayout, Table};
+use crate::rope::{KvAppendArgs, RopeKernels, TailShape};
+
+const WHAT: &str = "deepseek41 AttnChain";
+
+/// The compressed rows a layer's attention reads, and what it writes.
+pub enum Compressed<'a> {
+    /// A window-only layer: no stream.
+    None,
+    /// A layer that attends a stream another layer's compressor writes: the
+    /// rows of `stream.kv_source`, as they stand after that layer ran.
+    Read(&'a DeviceTensor<u16>),
+    /// A layer that owns its stream's compressor.
+    Source(SourceIo<'a>),
+}
+
+/// A compressor's buffers: written this step, and the rows read by the same
+/// layer's attention.
+pub struct SourceIo<'a> {
+    /// The stream's compressed rows, `⌈ctx_max / ratio⌉` of the latent width.
+    pub rows: &'a mut DeviceTensor<u16>,
+    /// The index keys, on a layer that owns them: as many rows of the index
+    /// key width.
+    pub keys: Option<&'a mut DeviceTensor<u16>>,
+    /// Above ratio 1, the compressor's ring: the `ratio` latest projections,
+    /// values and scores.
+    pub ring: Option<(&'a mut DeviceTensor<f32>, &'a mut DeviceTensor<f32>)>,
+}
+
+/// The buffers one layer's attention sub-layer shares with the rest of the
+/// step.
+pub struct AttnIo<'a> {
+    /// The hyper-connection streams the sub-layer reads: `streams · n_embd`.
+    pub streams_in: &'a DeviceBuffer<f32>,
+    /// The folded input the previous sub-layer left: `n_embd`.
+    pub fold_in: &'a DeviceBuffer<f32>,
+    /// The streams after HC_POST.
+    pub streams_out: &'a mut DeviceBuffer<f32>,
+    /// The ffn's folded input.
+    pub fold_out: &'a mut DeviceBuffer<f32>,
+    /// The layer's raw window ring: `min(ctx_max, window)` latent rows in f16.
+    pub ring: &'a mut DeviceTensor<u16>,
+    pub compressed: Compressed<'a>,
+}
+
+/// Where the words the launches read sit in the piece's copy, in u32 words;
+/// fixed at load, like the image's own layout.
+#[derive(Clone, Debug)]
+pub struct WordsLayout {
+    /// Token 0's position: the ring append's.
+    pub pos: usize,
+    /// A window-only layer's attention counts: the window length, then 0.
+    pub window_vis: usize,
+    /// A token's rope tables, in [`Table::ALL`] order.
+    pub tables: [usize; 4],
+    /// Per stream of the plan, in its order.
+    pub streams: Vec<StreamWords>,
+    /// Words in the copy.
+    pub len: usize,
+}
+
+/// One stream's words in the piece's copy.
+#[derive(Clone, Debug)]
+pub struct StreamWords {
+    /// The geometry its compressor launches with.
+    pub geom: CompGeom,
+    /// Its layers' attention counts: the window length, then the compressed
+    /// rows visible.
+    pub vis: usize,
+    /// The compressor's step words, [`CompGeom::words`] of them.
+    pub step: usize,
+    /// The compressor's rope tables: a row table per group slot above ratio
+    /// 1, the token's YaRN table at ratio 1.
+    pub cs: usize,
+}
+
+/// The piece's intermediate buffers, as the last enqueued layer left them —
+/// scratch that the next layer overwrites; what a gate reads node by node.
+pub struct AttnTaps<'a> {
+    /// HC_PRE's result: `pre`, `post`, then `comb` row-major.
+    pub hc: &'a DeviceBuffer<f32>,
+    /// The attention norm of the folded input.
+    pub normed: &'a DeviceBuffer<f32>,
+    /// q_a, then its norm.
+    pub q_a: &'a DeviceBuffer<f32>,
+    pub q_a_normed: &'a DeviceBuffer<f32>,
+    /// The query heads after the tail rope.
+    pub q: &'a DeviceBuffer<f32>,
+    /// The latent projection, and the row normed and roped in f32.
+    pub kv: &'a DeviceBuffer<f32>,
+    pub kv_row: &'a DeviceBuffer<f32>,
+    /// The attention output after the inverse rope.
+    pub y: &'a DeviceBuffer<f32>,
+    /// wo_a's output, group `g` at `g · o_lora_rank`, and wo_b's.
+    pub wo_a: &'a DeviceBuffer<f32>,
+    pub out: &'a DeviceBuffer<f32>,
+    /// On a compressor's layer: its projections, the pre-rope row and the
+    /// index key's projection.
+    pub source: Option<SourceTaps<'a>>,
+}
+
+/// A compressor layer's intermediate buffers.
+pub struct SourceTaps<'a> {
+    pub kv: &'a DeviceBuffer<f32>,
+    pub score: &'a DeviceBuffer<f32>,
+    pub pre: &'a DeviceBuffer<f32>,
+    pub key: &'a DeviceBuffer<f32>,
+}
+
+/// `len` values of `T` at word `off` of a buffer, read by the launches as a
+/// buffer of their own. It borrows that buffer, which therefore outlives it
+/// and stays in place; dropping it frees nothing.
+struct View<'a, T> {
+    buf: ManuallyDrop<DeviceBuffer<T>>,
+    _parent: PhantomData<&'a ()>,
+}
+
+impl<T> Deref for View<'_, T> {
+    type Target = DeviceBuffer<T>;
+
+    fn deref(&self) -> &DeviceBuffer<T> {
+        &self.buf
+    }
+}
+
+impl<T> Drop for View<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: `buf` is taken once, here, and never read again.
+        let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
+        // The window owns no memory: its raw parts are dropped, the context
+        // handle with them, and nothing is freed.
+        drop(buf.into_raw_parts());
+    }
+}
+
+/// A [`View`] of `len` `T` from word `off` of `parent`, both one word wide.
+fn view<P, T>(parent: &DeviceBuffer<P>, off: usize, len: usize) -> Result<View<'_, T>, GpuError> {
+    const { assert!(size_of::<P>() == 4 && size_of::<T>() == 4) };
+    let refuse = || GpuError::Shape {
+        what: WHAT,
+        detail: format!(
+            "a view of {len} words at {off} in a buffer of {}",
+            parent.len()
+        ),
+    };
+    if len == 0 || off.checked_add(len).is_none_or(|end| end > parent.len()) {
+        return Err(refuse());
+    }
+    let bytes = u64::try_from(off * size_of::<P>()).map_err(|_| refuse())?;
+    // SAFETY: the words lie inside `parent`'s allocation (checked above) and
+    // start on a word boundary, which is `T`'s; `parent` is borrowed for the
+    // view's lifetime, so it outlives the view and stays in place.
+    let buf = unsafe { window::<T>(parent.cu_deviceptr() + bytes, len, parent.context()) };
+    Ok(View {
+        buf,
+        _parent: PhantomData,
+    })
+}
+
+/// The gather's pairs while they are laid out: image word → the piece's word.
+#[derive(Default)]
+struct Pairs {
+    src: Vec<u32>,
+    dst: Vec<u32>,
+    len: usize,
+}
+
+impl Pairs {
+    /// `n` words of the copy, from a four-word boundary.
+    fn alloc(&mut self, n: usize) -> usize {
+        let at = self.len.next_multiple_of(4);
+        self.len = at + n;
+        at
+    }
+
+    fn copy(&mut self, from: u32, to: usize) -> Result<(), GpuError> {
+        let to = u32::try_from(to).map_err(|_| GpuError::Shape {
+            what: WHAT,
+            detail: format!("word {to} of the step words passes u32"),
+        })?;
+        self.src.push(from);
+        self.dst.push(to);
+        Ok(())
+    }
+
+    /// A field of the copy that takes the image words `from`, in order.
+    fn field(&mut self, from: &[u32]) -> Result<usize, GpuError> {
+        let at = self.alloc(from.len());
+        for (i, &w) in from.iter().enumerate() {
+            self.copy(w, at + i)?;
+        }
+        Ok(at)
+    }
+}
+
+/// The gather's pairs and the copy's layout for images of `layout`, streams
+/// of caches sized for `ctx_max` positions. An image whose every word holds
+/// its own index, read through the layout's view, names each field's
+/// offsets; the image layout keeps its offset arithmetic to itself.
+fn plan_words(
+    layout: &ImageLayout,
+    ctx_max: usize,
+) -> Result<(WordsLayout, Vec<u32>, Vec<u32>), GpuError> {
+    let n = u32::try_from(layout.words()).map_err(|_| GpuError::Shape {
+        what: WHAT,
+        detail: format!("an image of {} words", layout.words()),
+    })?;
+    let probe: Vec<u32> = (0..n).collect();
+    let img = layout.view(&probe)?;
+    let dims = layout.dims();
+    let nd = dims.rope_dims;
+    let mut p = Pairs::default();
+    let tok = img.token(0);
+    let pos = p.field(&[tok.pos])?;
+    let window_vis = p.alloc(2);
+    p.copy(tok.len, window_vis)?;
+    let mut tables = [0; 4];
+    for (at, t) in tables.iter_mut().zip(Table::ALL) {
+        *at = p.field(img.table(0, t))?;
+    }
+    let yarn = tables[table_index(Table::YarnForward)];
+    let mut streams = Vec::with_capacity(layout.streams().len());
+    for (s, sl) in layout.streams().iter().enumerate() {
+        let f = img.stream(s);
+        let (r, gm) = (sl.ratio as usize, sl.group_slots);
+        let geom = CompGeom {
+            ratio: r,
+            max_groups: gm,
+            tokens: dims.tokens,
+            rows: ctx_max.div_ceil(r),
+        };
+        let vis = p.alloc(2);
+        p.copy(tok.len, vis)?;
+        p.copy(f.n_visible[0], vis + 1)?;
+        let step = p.alloc(geom.words());
+        p.copy(f.groups, step + W_GROUPS)?;
+        for (g, &w) in f.state_write.iter().enumerate() {
+            p.copy(w, step + w_row(g))?;
+        }
+        for (i, &w) in f.state_read.iter().enumerate() {
+            p.copy(w, step + w_read(gm, r, 0, 0) + i)?;
+        }
+        // A ratio-1 stream keeps no ring: `CompGeom::pack` drops its kept
+        // tokens, and so does the copy.
+        if r > 1 {
+            p.copy(f.persists, step + W_PERSISTS)?;
+            for (j, &w) in f.persist_src.iter().enumerate() {
+                p.copy(w, step + w_persist(gm, r, j))?;
+            }
+            for (j, &w) in f.persist_dst.iter().enumerate() {
+                p.copy(w, step + w_persist(gm, r, r + j))?;
+            }
+        }
+        let cs = if r > 1 {
+            let at = p.alloc(gm * nd);
+            for g in 0..gm {
+                let t = img.row_table(s, g).ok_or_else(|| GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("stream {s} of ratio {r} has no row table {g}"),
+                })?;
+                for (j, &w) in t.iter().enumerate() {
+                    p.copy(w, at + g * nd + j)?;
+                }
+            }
+            at
+        } else {
+            yarn
+        };
+        streams.push(StreamWords {
+            geom,
+            vis,
+            step,
+            cs,
+        });
+    }
+    let len = p.len.next_multiple_of(4);
+    let words = WordsLayout {
+        pos,
+        window_vis,
+        tables,
+        streams,
+        len,
+    };
+    Ok((words, p.src, p.dst))
+}
+
+/// `t`'s place in [`Table::ALL`].
+fn table_index(t: Table) -> usize {
+    Table::ALL
+        .iter()
+        .position(|&a| a == t)
+        .expect("every table is in Table::ALL")
+}
+
+/// The piece's copy of the step words and the gather that fills it.
+struct Words {
+    layout: WordsLayout,
+    /// The words; u32 fields are read through u32 views.
+    buf: DeviceBuffer<f32>,
+    src: DeviceBuffer<u32>,
+    dst: DeviceBuffer<u32>,
+    pairs: usize,
+    /// Words of the image the pairs index.
+    image_len: usize,
+}
+
+impl Words {
+    fn view<T>(&self, off: usize, len: usize) -> Result<View<'_, T>, GpuError> {
+        view(&self.buf, off, len)
+    }
+}
+
+/// The sizes every layer launches with.
+struct Dims {
+    n_embd: usize,
+    n_head: usize,
+    head_dim: usize,
+    q_lora_rank: usize,
+    o_lora_rank: usize,
+    /// wo_a's row width: one group's heads.
+    group_k: usize,
+    rope_dims: usize,
+    /// `attention.layer_norm_rms_epsilon`.
+    eps: f32,
+    hc_eps: f32,
+    hc_iters: u32,
+    /// The softmax scale, `1 / sqrt(head_dim)`.
+    scale: f32,
+}
+
+/// The weight names of one layer's attention, built at load.
+struct Names {
+    hc_fn: String,
+    hc_scale: String,
+    hc_base: String,
+    norm: String,
+    q_a: String,
+    q_a_norm: String,
+    q_b: String,
+    kv: String,
+    kv_norm: String,
+    sinks: String,
+    out_a: String,
+    out_b: String,
+}
+
+/// The compressor a layer owns.
+struct SourcePlan {
+    /// The plan stream it writes.
+    stream: usize,
+    kv: String,
+    /// Its gate projection, above ratio 1.
+    gate: Option<String>,
+    norm: String,
+    /// The index key's projection and norm, on a layer that owns index keys.
+    keys: Option<(String, String)>,
+}
+
+/// One layer as the piece runs it.
+struct LayerPlan {
+    names: Names,
+    /// The plan stream the layer attends; `None` on a window-only layer.
+    stream: Option<usize>,
+    source: Option<SourcePlan>,
+    /// Word offsets of its forward and back rope tables: YaRN on a layer
+    /// with a stream, the window rope otherwise.
+    forward: usize,
+    back: usize,
+}
+
+struct Kernels {
+    hc: HcKernels,
+    fused: FusedKernels,
+    rope: RopeKernels,
+    attn: AttnKernels,
+    comp: CompressKernels,
+    key: IndexKeyKernels,
+    step: StepKernels,
+}
+
+/// A compressor layer's scratch.
+struct SourceScratch {
+    /// The normed input in q8_1, which the q3_K projections read.
+    act: Q8Act,
+    kv: DeviceBuffer<f32>,
+    score: DeviceBuffer<f32>,
+    /// The pooled row, normed, before the rope: the index key's input.
+    pre: DeviceBuffer<f32>,
+    act_pre: Q8Act,
+    key: DeviceBuffer<f32>,
+}
+
+struct Scratch {
+    hc_pre: HcPreScratch,
+    mixes: DeviceBuffer<f32>,
+    hc: DeviceBuffer<f32>,
+    normed: DeviceBuffer<f32>,
+    q_a: DeviceBuffer<f32>,
+    q_a_normed: DeviceBuffer<f32>,
+    q: DeviceBuffer<f32>,
+    kv: DeviceBuffer<f32>,
+    /// The latent row in f32, which the append writes beside the ring.
+    kv_row: DeviceBuffer<f32>,
+    part_v: DeviceBuffer<f32>,
+    part_ms: DeviceBuffer<f32>,
+    y: DeviceBuffer<f32>,
+    wo_a: DeviceBuffer<f32>,
+    out: DeviceBuffer<f32>,
+    /// Present when a layer of the card owns a compressor.
+    source: Option<SourceScratch>,
+}
+
+/// The attention piece of a card's layers: see the module comment.
+pub struct AttnChain {
+    layers: Range<usize>,
+    plans: Vec<LayerPlan>,
+    dims: Dims,
+    kernels: Kernels,
+    words: Words,
+    scratch: Scratch,
+}
+
+/// Device bytes of a [`Q8Act`] of `m` columns of `k`: its allocation's
+/// formula (`Q8Act::with_k`), which exposes no size of its own.
+fn q8act_bytes(m: usize, k: usize) -> usize {
+    let n_sb = k / 256;
+    m * (64 * n_sb.div_ceil(2) * size_of::<u64>()
+        + 256 * n_sb.div_ceil(4) * 4
+        + 128 * n_sb.div_ceil(2) * 4
+        + 8 * n_sb * 4
+        + 2 * n_sb * 4)
+}
+
+/// Device bytes of an [`HcPreScratch`] for inputs of `k` values: its
+/// allocation's formula, which exposes no size of its own.
+fn hc_pre_bytes(k: usize) -> usize {
+    let n_pieces = k / HC_PIECE;
+    4 * (HC_MIX * n_pieces * HC_MAX_TOKENS + n_pieces * HC_MAX_TOKENS + 1)
+}
+
+impl AttnChain {
+    /// The piece for `layers` of the model `hp` describes, reading images of
+    /// `layout` and caches sized by `planner`'s `ctx_max`: every name,
+    /// layer kind, table offset and gather pair resolved, the kernels loaded
+    /// and the scratch allocated. Load-time only.
+    pub fn new(
+        gpu: &Gpu,
+        hp: &Hparams,
+        layers: Range<usize>,
+        layout: &ImageLayout,
+        planner: &Planner,
+    ) -> Result<AttnChain, GpuError> {
+        let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
+        let dims = layout.dims();
+        if dims.tokens != STEP_TOKENS || dims.rope_dims != hp.rope_dims {
+            return Err(refuse(format!(
+                "an image of {} tokens and {} rope values; the chain runs {STEP_TOKENS} token and \
+                 the file's {}",
+                dims.tokens, dims.rope_dims, hp.rope_dims
+            )));
+        }
+        if hp.head_dim != attn_op::LATENT
+            || hp.head_dim != compress::WIDTH
+            || hp.indexer.head_dim != index_key::WIDTH
+            || hp.hc.streams != HC_STREAMS
+            || hp.o_groups == 0
+            || !(hp.n_head * hp.head_dim).is_multiple_of(hp.o_groups)
+        {
+            return Err(refuse(format!(
+                "latent {}, index key {}, {} streams and {} output groups over {} heads: the ops \
+                 run a latent of {}, keys of {}, {HC_STREAMS} streams and whole groups",
+                hp.head_dim,
+                hp.indexer.head_dim,
+                hp.hc.streams,
+                hp.o_groups,
+                hp.n_head,
+                attn_op::LATENT,
+                index_key::WIDTH
+            )));
+        }
+        if layers.end > hp.n_layer || planner.stream_ratios() != dims.stream_ratios.as_slice() {
+            return Err(refuse(format!(
+                "layers {layers:?} of {}, streams {:?} planned and {:?} in the image",
+                hp.n_layer,
+                planner.stream_ratios(),
+                dims.stream_ratios
+            )));
+        }
+        let ctx_max = planner.ctx_max() as usize;
+        let (words_layout, src, dst) = plan_words(layout, ctx_max)?;
+        let plans = layers
+            .clone()
+            .map(|l| layer_plan(hp, planner, &words_layout, l))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let ctx = gpu.context();
+        let stream = gpu.stream();
+        let kernels = Kernels {
+            hc: HcKernels::load(ctx)?,
+            fused: FusedKernels::load(ctx)?,
+            rope: RopeKernels::load(ctx)?,
+            attn: AttnKernels::load(ctx)?,
+            comp: CompressKernels::load(ctx)?,
+            key: IndexKeyKernels::load(ctx)?,
+            step: StepKernels::load(ctx)?,
+        };
+        let pairs = src.len();
+        let words = Words {
+            buf: DeviceBuffer::zeroed(stream, words_layout.len)?,
+            src: DeviceBuffer::from_host(stream, &src)?,
+            dst: DeviceBuffer::from_host(stream, &dst)?,
+            layout: words_layout,
+            pairs,
+            image_len: layout.words(),
+        };
+
+        let m = STEP_TOKENS;
+        let q_rows = m * hp.n_head;
+        let window_rows = ctx_max.min(hp.window);
+        let comp_keys = words
+            .layout
+            .streams
+            .iter()
+            .map(|s| s.geom.rows)
+            .max()
+            .unwrap_or(0);
+        let segs = attn_op::segments(window_rows, comp_keys);
+        let gm = words
+            .layout
+            .streams
+            .iter()
+            .map(|s| s.geom.max_groups)
+            .max()
+            .unwrap_or(1);
+        let source = if plans.iter().any(|p| p.source.is_some()) {
+            if gm != 1 {
+                return Err(refuse(format!(
+                    "a step that completes up to {gm} groups: the index key reads its \
+                     projections token-major, which the q3_K gemv writes only for one"
+                )));
+            }
+            Some(SourceScratch {
+                act: Q8Act::with_k(stream, m, hp.n_embd)?,
+                kv: DeviceBuffer::zeroed(stream, m * compress::WIDTH)?,
+                score: DeviceBuffer::zeroed(stream, m * compress::WIDTH)?,
+                pre: DeviceBuffer::zeroed(stream, gm * compress::WIDTH)?,
+                act_pre: Q8Act::with_k(stream, gm, compress::WIDTH)?,
+                key: DeviceBuffer::zeroed(stream, gm * index_key::WIDTH)?,
+            })
+        } else {
+            None
+        };
+        let scratch = Scratch {
+            hc_pre: HcPreScratch::new(stream, HC_STREAMS * hp.n_embd)?,
+            mixes: DeviceBuffer::zeroed(stream, HC_MIX * m)?,
+            hc: DeviceBuffer::zeroed(stream, HC_MIX * m)?,
+            normed: DeviceBuffer::zeroed(stream, m * hp.n_embd)?,
+            q_a: DeviceBuffer::zeroed(stream, m * hp.q_lora_rank)?,
+            q_a_normed: DeviceBuffer::zeroed(stream, m * hp.q_lora_rank)?,
+            q: DeviceBuffer::zeroed(stream, q_rows * hp.head_dim)?,
+            kv: DeviceBuffer::zeroed(stream, m * hp.head_dim)?,
+            kv_row: DeviceBuffer::zeroed(stream, m * hp.head_dim)?,
+            part_v: DeviceBuffer::zeroed(stream, attn_op::partials_v_len(q_rows, segs))?,
+            part_ms: DeviceBuffer::zeroed(stream, attn_op::partials_ms_len(q_rows, segs))?,
+            y: DeviceBuffer::zeroed(stream, q_rows * hp.head_dim)?,
+            wo_a: DeviceBuffer::zeroed(stream, m * hp.o_groups * hp.o_lora_rank)?,
+            out: DeviceBuffer::zeroed(stream, m * hp.n_embd)?,
+            source,
+        };
+        let dims = Dims {
+            n_embd: hp.n_embd,
+            n_head: hp.n_head,
+            head_dim: hp.head_dim,
+            q_lora_rank: hp.q_lora_rank,
+            o_lora_rank: hp.o_lora_rank,
+            group_k: hp.n_head * hp.head_dim / hp.o_groups,
+            rope_dims: hp.rope_dims,
+            eps: hp.rms_eps,
+            hc_eps: hp.hc.eps,
+            hc_iters: u32::try_from(hp.hc.sinkhorn_iters)
+                .map_err(|_| refuse(format!("{} Sinkhorn iterations", hp.hc.sinkhorn_iters)))?,
+            scale: 1.0 / (hp.head_dim as f32).sqrt(),
+        };
+        Ok(AttnChain {
+            layers,
+            plans,
+            dims,
+            kernels,
+            words,
+            scratch,
+        })
+    }
+
+    /// Device bytes the piece holds besides the weights and the buffers it
+    /// is passed: its scratch, its copy of the step words and the gather's
+    /// pairs.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        let s = &self.scratch;
+        let d = &self.dims;
+        let plain = [
+            &s.mixes,
+            &s.hc,
+            &s.normed,
+            &s.q_a,
+            &s.q_a_normed,
+            &s.q,
+            &s.kv,
+            &s.kv_row,
+            &s.part_v,
+            &s.part_ms,
+            &s.y,
+            &s.wo_a,
+            &s.out,
+            &self.words.buf,
+        ]
+        .iter()
+        .map(|b| b.num_bytes())
+        .sum::<usize>();
+        let source = s.source.as_ref().map_or(0, |x| {
+            [&x.kv, &x.score, &x.pre, &x.key]
+                .iter()
+                .map(|b| b.num_bytes())
+                .sum::<usize>()
+                + q8act_bytes(x.act.m(), d.n_embd)
+                + q8act_bytes(x.act_pre.m(), compress::WIDTH)
+        });
+        plain
+            + source
+            + self.words.src.num_bytes()
+            + self.words.dst.num_bytes()
+            + hc_pre_bytes(s.hc_pre.k())
+    }
+
+    /// Where the step words sit in the piece's copy.
+    #[must_use]
+    pub fn words_layout(&self) -> &WordsLayout {
+        &self.words.layout
+    }
+
+    /// The piece's copy of the step words, as the last
+    /// [`enqueue_step`](Self::enqueue_step) left it: u32 values in f32
+    /// cells, at [`words_layout`](Self::words_layout)'s offsets.
+    #[must_use]
+    pub fn words(&self) -> &DeviceBuffer<f32> {
+        &self.words.buf
+    }
+
+    /// The intermediate buffers of the last enqueued layer.
+    #[must_use]
+    pub fn taps(&self) -> AttnTaps<'_> {
+        let s = &self.scratch;
+        AttnTaps {
+            hc: &s.hc,
+            normed: &s.normed,
+            q_a: &s.q_a,
+            q_a_normed: &s.q_a_normed,
+            q: &s.q,
+            kv: &s.kv,
+            kv_row: &s.kv_row,
+            y: &s.y,
+            wo_a: &s.wo_a,
+            out: &s.out,
+            source: s.source.as_ref().map(|x| SourceTaps {
+                kv: &x.kv,
+                score: &x.score,
+                pre: &x.pre,
+                key: &x.key,
+            }),
+        }
+    }
+
+    /// Enqueue the step's gather: the words the layers read, from `image`,
+    /// the step image's device copy, into the piece's own. Once a step,
+    /// before the layers. One launch; asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_step(&mut self, gpu: &Gpu, image: &DeviceBuffer<u32>) -> Result<(), GpuError> {
+        let w = &mut self.words;
+        if image.len() != w.image_len {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "an image of {} words; the gather was laid out for {}",
+                    image.len(),
+                    w.image_len
+                ),
+            });
+        }
+        let x = view::<u32, f32>(image, 0, image.len())?;
+        self.kernels
+            .step
+            .enqueue_gather(gpu.stream(), &x, &w.src, &w.dst, w.pairs, &mut w.buf)
+    }
+
+    /// Enqueue layer `layer`'s attention sub-layer on `gpu`'s stream, its
+    /// weights resident in `w`: the module comment's launches, reading the
+    /// words the step's [`enqueue_step`](Self::enqueue_step) gathered.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_layer(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        layer: usize,
+        io: AttnIo<'_>,
+    ) -> Result<(), GpuError> {
+        let lp = layer
+            .checked_sub(self.layers.start)
+            .and_then(|i| self.plans.get(i))
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("layer {layer} is not one of {:?}", self.layers),
+            })?;
+        let AttnIo {
+            streams_in,
+            fold_in,
+            streams_out,
+            fold_out,
+            ring,
+            mut compressed,
+        } = io;
+        let cx = Cx {
+            gpu,
+            w,
+            k: &self.kernels,
+            d: &self.dims,
+            words: &self.words,
+        };
+        let s = &mut self.scratch;
+        let (d, k, stream, n) = (cx.d, cx.k, gpu.stream(), &lp.names);
+        let m = STEP_TOKENS;
+
+        let params = HcParams {
+            w: q3_k(w, &n.hc_fn)?,
+            scale: vector(w, &n.hc_scale)?,
+            base: vector(w, &n.hc_base)?,
+            eps: d.hc_eps,
+            iters: d.hc_iters,
+        };
+        let pre = HcPreArgs {
+            params: &params,
+            x: streams_in,
+            tokens: m,
+            rms_eps: d.eps,
+        };
+        k.hc.enqueue_pre(stream, &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
+
+        let passed = match &compressed {
+            Compressed::None => "no compressed rows",
+            Compressed::Read(_) => "rows to read",
+            Compressed::Source(_) => "a compressor's buffers",
+        };
+        let gain = vector(w, &n.norm)?;
+        match (&lp.source, &mut compressed, s.source.as_mut()) {
+            (Some(sp), Compressed::Source(io), Some(src)) => {
+                k.fused.enqueue_norm_quant(
+                    stream,
+                    fold_in,
+                    gain,
+                    d.eps,
+                    &mut src.act,
+                    &mut s.normed,
+                )?;
+                enqueue_source(&cx, sp, src, io)?;
+            }
+            (None, Compressed::Read(_), _) if lp.stream.is_some() => {
+                gpu.elem().enqueue_rms_norm(
+                    stream,
+                    fold_in,
+                    gain,
+                    d.eps,
+                    d.n_embd,
+                    m,
+                    &mut s.normed,
+                )?;
+            }
+            (None, Compressed::None, _) if lp.stream.is_none() => {
+                gpu.elem().enqueue_rms_norm(
+                    stream,
+                    fold_in,
+                    gain,
+                    d.eps,
+                    d.n_embd,
+                    m,
+                    &mut s.normed,
+                )?;
+            }
+            _ => {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "layer {layer} attends stream {:?} and owns a compressor: {}; the caller \
+                         passed {passed}",
+                        lp.stream,
+                        lp.source.is_some(),
+                    ),
+                });
+            }
+        }
+
+        enqueue_query(&cx, lp, s)?;
+        let pos = cx.words.view::<u32>(cx.words.layout.pos, m)?;
+        let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
+        let (qs, qd) = q8_0(w, &n.kv)?;
+        gpu.q8f32()
+            .enqueue_q8_0_gemv(stream, qs, qd, &s.normed, m, &mut s.kv)?;
+        k.rope.enqueue_kv_norm_rope_append(
+            stream,
+            KvAppendArgs {
+                kv: &s.kv,
+                gain: vector(w, &n.kv_norm)?,
+                cs: &table,
+                pos: &pos,
+                eps: d.eps,
+                n_dims: d.rope_dims,
+                m,
+                out: &mut s.kv_row,
+                cache: &mut *ring,
+            },
+        )?;
+
+        let (rows, vis_at) = match (&compressed, lp.stream) {
+            (Compressed::Read(rows), Some(st)) => (Some(*rows), cx.words.layout.streams[st].vis),
+            (Compressed::Source(io), Some(st)) => {
+                (Some(&*io.rows), cx.words.layout.streams[st].vis)
+            }
+            _ => (None, cx.words.layout.window_vis),
+        };
+        let vis = cx.words.view::<u32>(vis_at, 2 * m)?;
+        k.attn.enqueue(
+            stream,
+            AttnArgs {
+                q: &s.q,
+                window: ring,
+                compressed: rows,
+                // The indexer's lists go here on a top-k layer: the next
+                // phase's seam. A prefix is every visible row while the
+                // visible count stays at most `top_k`.
+                selected: None,
+                vis: &vis,
+                sinks: vector(w, &n.sinks)?,
+                scale: d.scale,
+                tokens: m,
+                heads: d.n_head,
+                part_v: &mut s.part_v,
+                part_ms: &mut s.part_ms,
+                y: &mut s.y,
+            },
+        )?;
+        enqueue_output(&cx, lp, s)?;
+
+        let post = HcPostArgs {
+            x: &s.out,
+            res: streams_in,
+            hc: &s.hc,
+            n_embd: d.n_embd,
+            tokens: m,
+        };
+        k.hc.enqueue_post(stream, &post, streams_out, fold_out)
+    }
+}
+
+/// What every launch of one layer reads besides its scratch.
+struct Cx<'a> {
+    gpu: &'a Gpu,
+    w: &'a Weights,
+    k: &'a Kernels,
+    d: &'a Dims,
+    words: &'a Words,
+}
+
+/// The query path: q_a, its norm, q_b and the tail rope of every head.
+fn enqueue_query(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), GpuError> {
+    let (d, w, n, stream) = (cx.d, cx.w, &lp.names, cx.gpu.stream());
+    let m = STEP_TOKENS;
+    let q8 = cx.gpu.q8f32();
+    let (qs, qd) = q8_0(w, &n.q_a)?;
+    q8.enqueue_q8_0_gemv(stream, qs, qd, &s.normed, m, &mut s.q_a)?;
+    cx.gpu.elem().enqueue_rms_norm(
+        stream,
+        &s.q_a,
+        vector(w, &n.q_a_norm)?,
+        d.eps,
+        d.q_lora_rank,
+        m,
+        &mut s.q_a_normed,
+    )?;
+    let (qs, qd) = q8_0(w, &n.q_b)?;
+    q8.enqueue_q8_0_gemv(stream, qs, qd, &s.q_a_normed, m, &mut s.q)?;
+    let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
+    cx.k.rope
+        .enqueue_rope_tail(stream, &mut s.q, &table, heads(d))
+}
+
+/// Every query head of the step's token, its tail turned.
+fn heads(d: &Dims) -> TailShape {
+    TailShape {
+        width: d.head_dim,
+        n_dims: d.rope_dims,
+        n_vec: d.n_head,
+        m: STEP_TOKENS,
+    }
+}
+
+/// The attention output's inverse rope, wo_a and wo_b.
+fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), GpuError> {
+    let (d, w, n, stream) = (cx.d, cx.w, &lp.names, cx.gpu.stream());
+    let table = cx.words.view::<f32>(lp.back, STEP_TOKENS * d.rope_dims)?;
+    cx.k.rope
+        .enqueue_rope_tail(stream, &mut s.y, &table, heads(d))?;
+    let (qs, qd) = q8_0(w, &n.out_a)?;
+    cx.k.step.enqueue_q8_0_gemv_heads(
+        stream,
+        Q8_0GemvHeadsArgs {
+            qs,
+            d: qd,
+            x: &s.y,
+            rows_per_head: d.o_lora_rank,
+            x_head_stride: d.group_k,
+            y_head_stride: d.o_lora_rank,
+            y_off: 0,
+            y: &mut s.wo_a,
+        },
+    )?;
+    let (qs, qd) = q8_0(w, &n.out_b)?;
+    cx.gpu
+        .q8f32()
+        .enqueue_q8_0_gemv(stream, qs, qd, &s.wo_a, STEP_TOKENS, &mut s.out)
+}
+
+/// A compressor layer's own launches, after the norm left the q8_1 input:
+/// the projections, the pooled (or ratio-1) row into the cache, then the
+/// index key.
+fn enqueue_source(
+    cx: &Cx<'_>,
+    sp: &SourcePlan,
+    src: &mut SourceScratch,
+    io: &mut SourceIo<'_>,
+) -> Result<(), GpuError> {
+    let (d, w, gpu, stream) = (cx.d, cx.w, cx.gpu, cx.gpu.stream());
+    let sw = &cx.words.layout.streams[sp.stream];
+    let step = cx.words.view::<u32>(sw.step, sw.geom.words())?;
+    let cs = cx
+        .words
+        .view::<f32>(sw.cs, sw.geom.max_groups * d.rope_dims)?;
+    let gain = vector(w, &sp.norm)?;
+    gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, &src.act, &mut src.kv)?;
+    match (&sp.gate, io.ring.as_mut()) {
+        (Some(gate), Some((values, scores))) => {
+            gpu.enqueue_gemv_q3k(q3_k(w, gate)?, &src.act, &mut src.score)?;
+            cx.k.comp.enqueue_pool(
+                stream,
+                PoolArgs {
+                    geom: sw.geom,
+                    step: &step,
+                    kv: &src.kv,
+                    score: &src.score,
+                    gain,
+                    cs: &cs,
+                    eps: d.eps,
+                    n_dims: d.rope_dims,
+                    ring_kv: values.buf_mut(),
+                    ring_score: scores.buf_mut(),
+                    pre: &mut src.pre,
+                    cache: &mut *io.rows,
+                },
+            )?;
+        }
+        (None, None) => {
+            cx.k.comp.enqueue_rows(
+                stream,
+                RowsArgs {
+                    geom: sw.geom,
+                    step: &step,
+                    kv: &src.kv,
+                    gain,
+                    cs: &cs,
+                    eps: d.eps,
+                    n_dims: d.rope_dims,
+                    pre: &mut src.pre,
+                    cache: &mut *io.rows,
+                },
+            )?;
+        }
+        (gate, ring) => {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a compressor of ratio {} with a gate {} and a ring passed {}",
+                    sw.geom.ratio,
+                    gate.is_some(),
+                    ring.is_some()
+                ),
+            });
+        }
+    }
+    match (&sp.keys, io.keys.as_deref_mut()) {
+        (Some((proj, norm)), Some(keys)) => {
+            gpu.enqueue_quantize_q8_1(&src.pre, &mut src.act_pre)?;
+            gpu.enqueue_gemv_q3k(q3_k(w, proj)?, &src.act_pre, &mut src.key)?;
+            cx.k.key.enqueue_index_key(
+                stream,
+                IndexKeyArgs {
+                    geom: sw.geom,
+                    step: &step,
+                    k: &src.key,
+                    gain: vector(w, norm)?,
+                    cs: &cs,
+                    eps: d.eps,
+                    n_dims: d.rope_dims,
+                    cache: keys,
+                },
+            )
+        }
+        (None, None) => Ok(()),
+        (keys, passed) => Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a layer that owns index keys: {}; the caller passed a key cache: {}",
+                keys.is_some(),
+                passed.is_some()
+            ),
+        }),
+    }
+}
+
+/// Layer `l` as the piece runs it: its names, its stream and its
+/// compressor, checked against the plan and the file's layer table.
+fn layer_plan(
+    hp: &Hparams,
+    planner: &Planner,
+    words: &WordsLayout,
+    l: usize,
+) -> Result<LayerPlan, GpuError> {
+    let refuse = |detail: String| GpuError::Shape {
+        what: WHAT,
+        detail: format!("layer {l}: {detail}"),
+    };
+    let kind = hp
+        .layers
+        .get(l)
+        .ok_or_else(|| refuse(format!("the file has {} layers", hp.layers.len())))?;
+    let stream = planner.layer_stream(l);
+    if stream.is_some() != kind.stream.is_some() {
+        return Err(refuse(format!(
+            "the plan reads stream {stream:?}, the layer table {:?}",
+            kind.stream
+        )));
+    }
+    if let Some(st) = kind.stream {
+        let reads = hp.layers.get(st.kv_source).and_then(|k| k.compressor);
+        if reads.is_none() || planner.layer_stream(st.kv_source) != stream {
+            return Err(refuse(format!(
+                "its rows come from layer {}, which owns no compressor of its stream",
+                st.kv_source
+            )));
+        }
+    }
+    let source = match (kind.compressor, kind.stream, stream) {
+        (None, ..) if kind.index_keys => {
+            return Err(refuse(
+                "index keys without a compressor: the key projects the compressor's pre-rope row"
+                    .to_string(),
+            ));
+        }
+        (None, ..) => None,
+        (Some(c), Some(st), Some(s)) if st.kv_source == l => {
+            let ratio = words.streams[s].geom.ratio;
+            if c.gated != (ratio > 1) {
+                return Err(refuse(format!(
+                    "a compressor of ratio {ratio} with a gate: {}",
+                    c.gated
+                )));
+            }
+            Some(SourcePlan {
+                stream: s,
+                kv: names::attn_compressor_kv(l),
+                gate: c.gated.then(|| names::attn_compressor_gate(l)),
+                norm: names::attn_compressor_norm(l),
+                keys: kind
+                    .index_keys
+                    .then(|| (names::indexer_attn_k(l), names::indexer_k_norm(l))),
+            })
+        }
+        (Some(_), st, _) => {
+            return Err(refuse(format!(
+                "owns a compressor but attends {st:?}: a compressor writes its own layer's stream"
+            )));
+        }
+    };
+    let t = |table| words.tables[table_index(table)];
+    let (forward, back) = match stream {
+        Some(_) => (t(Table::YarnForward), t(Table::YarnBack)),
+        None => (t(Table::WindowForward), t(Table::WindowBack)),
+    };
+    Ok(LayerPlan {
+        names: Names {
+            hc_fn: names::hc_attn_fn(l),
+            hc_scale: names::hc_attn_scale(l),
+            hc_base: names::hc_attn_base(l),
+            norm: names::attn_norm(l),
+            q_a: names::attn_q_a(l),
+            q_a_norm: names::attn_q_a_norm(l),
+            q_b: names::attn_q_b(l),
+            kv: names::attn_kv(l),
+            kv_norm: names::attn_kv_a_norm(l),
+            sinks: names::attn_sinks(l),
+            out_a: names::attn_output_a(l),
+            out_b: names::attn_output_b(l),
+        },
+        stream,
+        source,
+        forward,
+        back,
+    })
+}
+
+/// Q8_0 weight `name`'s code and scale planes.
+fn q8_0<'w>(
+    w: &'w Weights,
+    name: &str,
+) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
+    match w.get(name) {
+        Some(DevWeight::Q8_0 { qs, d, .. }) => Ok((qs, d)),
+        _ => Err(missing(name, "resident as Q8_0")),
+    }
+}
+
+/// Q3_K weight `name`'s row stream.
+fn q3_k<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuError> {
+    match w.get(name) {
+        Some(DevWeight::KQuant {
+            ty: GgmlType::Q3_K,
+            w,
+            ..
+        }) => Ok(w),
+        _ => Err(missing(name, "resident as Q3_K")),
+    }
+}
+
+/// F32 vector `name`: a gain, the sinks, HC_PRE's scales or offsets.
+fn vector<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceBuffer<f32>, GpuError> {
+    match w.get(name) {
+        Some(DevWeight::F32 { w, .. }) => Ok(w.buf()),
+        _ => Err(missing(name, "resident as F32")),
+    }
+}
+
+fn missing(name: &str, need: &'static str) -> GpuError {
+    GpuError::Tensor {
+        what: WHAT,
+        name: name.to_string(),
+        need,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compress::StepInts;
+    use crate::params::{ImageDims, StepImage};
+    use crate::rope::RopeSpec;
+    use model::arch::deepseek41::plan::StepPlan;
+
+    const WINDOW: u32 = 128;
+    const CTX: u64 = 4096;
+    const ROPE_DIMS: usize = 64;
+
+    /// The gather's pairs applied on the host to the image of every position
+    /// through two windows and past the ratios' residues give, per stream,
+    /// the attention's pair `[window length, visible rows]` and exactly the
+    /// words `CompGeom::pack` writes from the same plan; the window-only pair
+    /// and the tables are the image's.
+    #[test]
+    fn gathered_words_are_the_launch_layouts() {
+        let ratios = [0, 0, 2, 2, 1, 1];
+        let planner = Planner::new(WINDOW, &ratios, 4, CTX).expect("a planner");
+        let layout = ImageLayout::new(ImageDims {
+            tokens: 1,
+            window: WINDOW,
+            stream_ratios: planner.stream_ratios().to_vec(),
+            rope_dims: ROPE_DIMS,
+            n_embd: 8,
+            engram_bytes: 6,
+        })
+        .expect("a layout");
+        let (words, src, dst) = plan_words(&layout, CTX as usize).expect("the pairs");
+        let window = RopeSpec::window(10_000.0, ROPE_DIMS);
+        let yarn = RopeSpec::yarn(160_000.0, 16.0, 65_536, 32.0, 1.0, ROPE_DIMS);
+        let mut image = StepImage::new(layout.clone(), &window, &yarn).expect("an image");
+        let mut plan = StepPlan::default();
+        let history: Vec<u32> = (0..600).map(|t| t * 7 % 1000).collect();
+        for pos in [0u32, 1, 2, 3, 4, 126, 127, 128, 129, 300, 301, 511, 512] {
+            let at = pos as usize;
+            planner
+                .plan_into(&history[at..=at], pos, &history[..at], &mut plan)
+                .expect("a plan");
+            image
+                .build(&plan, &[0u16; 8], &[0u8; 6])
+                .expect("an image of the plan");
+            let mut got = vec![0u32; words.len];
+            for (&s, &d) in src.iter().zip(&dst) {
+                got[d as usize] = image.words()[s as usize];
+            }
+            let len = pos.min(WINDOW - 1) + 1;
+            assert_eq!(got[words.pos], pos, "position at {pos}");
+            assert_eq!(
+                got[words.window_vis..][..2],
+                [len, 0],
+                "window pair at {pos}"
+            );
+            let img = layout.view(image.words()).expect("a view");
+            for (t, &at) in Table::ALL.iter().zip(&words.tables) {
+                assert_eq!(&got[at..][..ROPE_DIMS], img.table(0, *t), "{t:?} at {pos}");
+            }
+            for (s, (sw, st)) in words.streams.iter().zip(&plan.streams).enumerate() {
+                assert_eq!(
+                    got[sw.vis..][..2],
+                    [len, st.n_visible[0]],
+                    "stream {s} pair at {pos}"
+                );
+                let mut packed = vec![0u32; sw.geom.words()];
+                sw.geom
+                    .pack(
+                        &StepInts {
+                            write_row: &st.state_write,
+                            read: &st.state_read,
+                            persist_src: &st.persist_src,
+                            persist_dst: &st.persist_dst,
+                        },
+                        &mut packed,
+                    )
+                    .expect("the plan packs");
+                assert_eq!(
+                    &got[sw.step..][..packed.len()],
+                    &packed[..],
+                    "stream {s} step words at {pos}"
+                );
+                let cs = &got[sw.cs..][..ROPE_DIMS];
+                match img.row_table(s, 0) {
+                    Some(t) => assert_eq!(cs, t, "stream {s} row table at {pos}"),
+                    None => assert_eq!(
+                        cs,
+                        img.table(0, Table::YarnForward),
+                        "stream {s} ratio-1 table at {pos}"
+                    ),
+                }
+            }
+        }
+    }
+}
