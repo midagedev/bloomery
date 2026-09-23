@@ -39,10 +39,10 @@ use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::deepseek41::hparams::Hparams;
-use model::arch::deepseek41::kv::KvLayout;
+use model::arch::deepseek41::names;
+use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::Planner;
-use model::arch::deepseek41::{names, roles};
-use model::placement::{self, Device, Machine, Plan, Role};
+use model::placement::{Device, Machine, Plan, Role};
 
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
@@ -64,28 +64,21 @@ pub fn open(
     ctx_max: usize,
 ) -> Result<Deepseek41Model, GpuError> {
     const WHAT: &str = "deepseek41 body::open";
-    let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
-    let hp = Hparams::read(&file).map_err(|e| refuse(e.to_string()))?;
-    let model = roles::classify(&file, &hp).map_err(|e| refuse(e.to_string()))?;
-    let kv = KvLayout::from_file(&file, &hp).map_err(|e| refuse(e.to_string()))?;
-    let machine = machine(model.layers);
+    let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+    let machine = machine(inputs.model.layers);
     if machine.cards.len() != 1 {
-        return Err(refuse(format!(
-            "the placement puts the layers on {} cards; the chain runs on one",
-            machine.cards.len()
-        )));
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the placement puts the layers on {} cards; the chain runs on one",
+                machine.cards.len()
+            ),
+        });
     }
-    let plan = placement::plan(&model, &machine, ctx_max as u64, &kv)
-        .map_err(|e| refuse(e.to_string()))?;
-    let broken = plan.violations();
-    if !broken.is_empty() {
-        let list: Vec<String> = broken.iter().map(ToString::to_string).collect();
-        return Err(refuse(format!(
-            "the plan breaks its invariants: {}",
-            list.join("; ")
-        )));
-    }
-    GpuModel::load_placed(file, &plan, 0, &hp)
+    let plan = inputs
+        .plan(&machine, ctx_max as u64)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+    GpuModel::load_placed(file, &plan, 0, &inputs.hp)
 }
 
 /// One layer's cache and compressor state.
@@ -392,7 +385,7 @@ impl ChainBody for Body {
         ];
 
         let planner =
-            Planner::from_file(&file, hp, plan.ctx_max).map_err(|e| refuse(e.to_string()))?;
+            Planner::from_file(&file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
         let dims = ImageDims::of(hp, &planner, STEP_TOKENS, engram_row_bytes(&file, hp)?);
         let (window, yarn) = rope_specs(hp)?;
         let image = StepImage::new(ImageLayout::new(dims)?, &window, &yarn)?;

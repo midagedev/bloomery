@@ -41,9 +41,11 @@ use bloomery_gpu_gates::block::{self, Bands, BlockKind, M_TOKENS, TapKind, TapRe
 use bloomery_gpu_gates::oracle::deepseek2::L_OUT_26;
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
-    GateError, bits_equal, find_ref_row, open_model, ref_dir, ref_manifest, ref_tensor_logical_in,
-    verdict,
+    GateError, bits_equal, find_ref_row, ref_dir, ref_manifest, ref_model_path,
+    ref_tensor_logical_in, verdict,
 };
+#[cfg(feature = "gpu")]
+use gguf::Split;
 
 /// The oracle's own greedy token for the prompt the dump sets were made with
 /// (`gate_block`'s pin: both of ik's backends argmax here). Re-proved here so
@@ -78,7 +80,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     let mut ok = true;
-    let gguf = open_model()?;
+    let file = Split::open(ref_model_path()?)?;
     let man = ref_manifest()?;
     let dir = ref_dir();
 
@@ -97,14 +99,14 @@ fn run() -> Result<(), GateError> {
 
     // The architecture-wide rms eps, read here independently of the caller
     // that hands it to Head (the CPU head gate's second-reader pattern).
-    let eps = gguf
+    let eps = file
         .arch_get_f32("attention.layer_norm_rms_epsilon")
         .ok_or("gate_head_gpu: rms eps key missing or not f32")?;
 
     let gpu = Gpu::new()?;
     // Globals only: the head reads no block tensors and no derived weights,
     // so nothing is derived after the load.
-    let w = Weights::load(gpu.stream(), &gguf, 0..0, true)?;
+    let w = Weights::load(gpu.stream(), &file, 0..0, true)?;
     let mut head = Head::new(&gpu, &w, eps)?;
     println!(
         "resident head_scratch_bytes={} hidden={} n_vocab={} m=1 input=l_out-26/0",

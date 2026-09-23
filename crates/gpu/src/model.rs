@@ -349,9 +349,10 @@ impl<B: ChainBody> GpuModel<B> {
     /// plus the globals in its kernels' device format, the weights the body
     /// derives from them, and the body those weights drive — its caches, its
     /// m = 1 arena and its step module. The geometry checks run at load, not
-    /// mid-step. The file is one shard: this is the whole-tensor upload of
-    /// [`Weights::load`], which reads one reader; a model of several shards
-    /// loads by its placement plan ([`GpuModel::load_placed`]).
+    /// mid-step. The file is one shard, refused otherwise before anything is
+    /// uploaded: this is the whole-tensor upload of [`Weights::load`], and a
+    /// model of several shards loads by its placement plan
+    /// ([`GpuModel::load_placed`]).
     pub fn load_blocks(
         file: &Split,
         ctx_max: usize,
@@ -368,9 +369,9 @@ impl<B: ChainBody> GpuModel<B> {
                 format!("layer range {layers:?} outside 0..{n_layers}"),
             ));
         }
-        let gguf = one_shard(file, what)?;
+        one_shard(file, what)?;
         let gpu = Gpu::new()?;
-        let mut weights = Weights::load(gpu.stream(), gguf, layers.clone(), true)?;
+        let mut weights = Weights::load(gpu.stream(), file, layers.clone(), true)?;
         B::derive(gpu.stream(), file, layers.clone(), &mut weights)?;
         let body = B::load(&gpu, file, &weights, layers.clone(), ctx_max)?;
         Ok(GpuModel {

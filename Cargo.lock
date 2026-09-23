@@ -90,6 +90,7 @@ dependencies = [
 name = "bloomery-gpu-deepseek41"
 version = "0.1.0"
 dependencies = [
+ "bloomery-engram",
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-model",

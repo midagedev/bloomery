@@ -18,3 +18,5 @@ bloomery-gpu = { path = "../gpu" }
 # and its step image copies the host step plan.
 bloomery-gguf = { path = "../gguf" }
 bloomery-model = { path = "../model" }
+# Host only: the glue's host half reads each token's engram rows through the engram tables.
+bloomery-engram = { path = "../engram" }

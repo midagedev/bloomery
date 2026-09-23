@@ -595,6 +595,13 @@ gate-ds41-kld:
 gate-gpu-ds41-engram:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_engram && bash tools/gpu-gate.sh gate_deepseek41_engram'
 
+# The V4.1 glue piece (chain G1) on the step4 and d1n sets: the host engram row ids against the dump's int rows,
+# the embedding broadcast bit for bit, each engram site's step within the band b4engram's pins propagate, and
+# the head end (hc_out bit for bit, the logits against their predicted gap, the argmax); one captured graph
+# replayed per set against the eager run, with its node count.
+gate-gpu-ds41-chain-glue:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_glue && bash tools/gpu-gate.sh gate_deepseek41_chain_glue'
+
 # V4.1 attn_output_a(블록 대각 여덟 그룹)를 q8_0_gemv_heads 한 번의 발사로, attn_output_b는 q8_0_gemv로 돌려 5토큰 세트와
 # 디코드 스텝 세트의 층마다 우리 규칙(비트 동일), ik 규칙 시뮬(덤프와 비트 동일), 덤프(값마다 유도한 밴드)에 대조한다.
 gate-gpu-ds41-woa:

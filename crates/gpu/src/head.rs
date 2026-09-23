@@ -188,9 +188,10 @@ impl Head {
         Ok(())
     }
 
-    /// The chain's input buffer — the assembly round's write target, so the
-    /// last block's residual add lands directly in the head.
-    pub(crate) fn input_mut(&mut self) -> &mut DeviceBuffer<f32> {
+    /// The chain's input buffer — the write target of the step's last launch
+    /// before the head, so that launch's output lands directly in the head.
+    /// Public because an architecture crate's chain writes it too.
+    pub fn input_mut(&mut self) -> &mut DeviceBuffer<f32> {
         &mut self.x
     }
 

@@ -59,11 +59,10 @@ mod gate {
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
     use cuda_core::CudaStream;
     use gguf::Split;
-    use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
+    use model::arch::deepseek41::place::PlanInputs;
     use model::placement::host_lock::{HostLock, page_bytes};
     use model::placement::{
-        self, Card, CardFormat, CardTotals, Device, Format, ModelTensor, ModelTensors, Plan,
-        workstation,
+        Card, CardFormat, CardTotals, Device, Format, ModelTensor, ModelTensors, Plan, workstation,
     };
 
     /// Design §5's two plans.
@@ -140,27 +139,17 @@ mod gate {
         let args = parse_args()?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let hp = Hparams::read(&split)?;
-        let model = roles::classify(&split, &hp)?;
-        let kv = KvLayout::from_file(&split, &hp)?;
+        let inputs = PlanInputs::read(&split)?;
         let machine = match args.plan {
-            PlanId::A => workstation::plan_a(model.layers),
-            PlanId::B => workstation::plan_b(model.layers),
+            PlanId::A => workstation::plan_a(inputs.model.layers),
+            PlanId::B => workstation::plan_b(inputs.model.layers),
         };
-        let plan = placement::plan(&model, &machine, workstation::CTX_MAX, &kv)?;
-        let violations = plan.violations();
-        if !violations.is_empty() {
-            let list: Vec<String> = violations.iter().map(ToString::to_string).collect();
-            return Err(format!(
-                "plan ({}) breaks its invariants: {}",
-                args.plan,
-                list.join("; ")
-            )
-            .into());
-        }
+        let plan = inputs
+            .plan(&machine, workstation::CTX_MAX)
+            .map_err(|e| format!("plan ({}): {e}", args.plan))?;
         println!(
             "plan ({}) of {path}: {} layers, ctx_max {}",
-            args.plan, model.layers, plan.ctx_max
+            args.plan, plan.model.layers, plan.ctx_max
         );
         for (card, t) in plan.machine.cards.iter().zip(&plan.cards) {
             println!(

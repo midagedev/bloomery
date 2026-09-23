@@ -58,11 +58,10 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed, ref_dir_named, verdict};
     use cuda_core::CudaStream;
     use gguf::Split;
-    use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::kv::KvLayout;
+    use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
-    use model::arch::deepseek41::roles;
-    use model::placement::{self, Device, KvBytes, Plan, workstation};
+    use model::placement::{Device, KvBytes, Plan, workstation};
 
     /// The decode-step sets whose positions check (iii) builds: 4, where no
     /// csa group completes, and 301 and 1,025, where one does and the window
@@ -82,17 +81,12 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let hp = Hparams::read(&split)?;
-        let model = roles::classify(&split, &hp)?;
-        let kv = KvLayout::from_file(&split, &hp)?;
-        let machine = workstation::plan_gate(model.layers);
-        let plan = placement::plan(&model, &machine, CTX_MAX, &kv)?;
-        let broken = plan.violations();
-        if !broken.is_empty() {
-            let list: Vec<String> = broken.iter().map(ToString::to_string).collect();
-            return Err(format!("the gate plan breaks its invariants: {}", list.join("; ")).into());
-        }
-        let planner = Planner::from_file(&split, &hp, CTX_MAX)?;
+        let inputs = PlanInputs::read(&split)?;
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let plan = inputs
+            .plan(&machine, CTX_MAX)
+            .map_err(|e| format!("the gate plan: {e}"))?;
+        let planner = Planner::from_file(&split, &inputs.hp, CTX_MAX)?;
         let specs = rope_specs_from_keys(&split)?;
         drop(split);
         print_plan(&path, &plan);
@@ -133,7 +127,7 @@ mod gate {
         {
             let (gpu, _, body) = m.body_parts("gate_deepseek41_load")?;
             ok &= check_slots(&plan, body, gpu.stream())?;
-            ok &= check_state(&kv, body);
+            ok &= check_state(&inputs.kv, body);
             ok &= check_image(&planner, &specs, body, gpu.stream())?;
         }
         ok &= check_refusals(&mut m);

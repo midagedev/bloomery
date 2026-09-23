@@ -17,7 +17,7 @@ use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
 // The Q8_0 block `q8_0_planes` packs; the gate binaries name it through here.
 pub use gguf::quant::Q8Block;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 /// One resident weight in the format its kernel loads. A new meaning gets a
@@ -134,39 +134,40 @@ pub struct Weights {
 
 impl Weights {
     /// Upload the tensors of `layers` (and the non-block tensors when
-    /// `globals`) in the device format each kernel consumes. Packs and
-    /// uploads tensor by tensor, so at most one host packing of one tensor
-    /// is alive at a time. A tensor whose type has no device format is an
-    /// error naming the tensor and type — never a silent skip. File tensors
-    /// only: what an architecture derives from them is filed afterwards,
-    /// through `Weights::insert_derived`.
+    /// `globals`) of `split` in the device format each kernel consumes: the
+    /// names are chosen first — a `blk.` name without a layer number is an
+    /// error before anything is uploaded — and [`Weights::load_where`]
+    /// uploads them, each from its own shard. A tensor whose type has no
+    /// device format is an error naming the tensor and type — never a silent
+    /// skip. File tensors only: what an architecture derives from them is
+    /// filed afterwards, through `Weights::insert_derived`.
     pub fn load(
         stream: &CudaStream,
-        gguf: &Gguf,
+        split: &Split,
         layers: Range<usize>,
         globals: bool,
     ) -> Result<Weights, GpuError> {
-        let n_layers =
-            gguf.block_count()
-                .ok_or(GpuError::metadata("Weights::load", "block_count"))? as usize;
+        let n_layers = split
+            .arch_get_u64("block_count")
+            .ok_or(GpuError::metadata("Weights::load", "block_count"))?
+            as usize;
         if layers.start > layers.end || layers.end > n_layers {
             return Err(GpuError::shape(
                 "Weights::load",
                 format!("layer range {layers:?} outside 0..{n_layers}"),
             ));
         }
-        let mut by_name = BTreeMap::new();
-        for t in gguf.iter_tensors() {
+        let mut keep = BTreeSet::new();
+        for (_, t) in split.iter_tensors() {
             let take = match block_index(&t.name)? {
                 Some(l) => layers.contains(&l),
                 None => globals,
             };
             if take {
-                let dw = upload_file_tensor(stream, gguf, t)?;
-                by_name.insert(t.name.clone(), dw);
+                keep.insert(t.name.as_str());
             }
         }
-        Ok(Weights { by_name })
+        Weights::load_where(stream, split, |name| keep.contains(name))
     }
 
     /// Upload every segment `plan` puts on card `card`, from `split`, in the
@@ -209,10 +210,10 @@ impl Weights {
     }
 
     /// Upload every tensor of `split` whose name `keep` accepts, each from
-    /// its own shard, in the device format its kernel consumes — how a gate
-    /// makes one layer, or one piece of a step, resident from a multi-shard
-    /// file without a placement plan. As in [`Weights::load`], a kept tensor
-    /// whose type has no device format is an error naming it.
+    /// its own shard, in the device format its kernel consumes — the one
+    /// uploader of a file without a placement plan: [`Weights::load`]'s layer
+    /// range, or the one layer or one piece of a step a gate makes resident.
+    /// A kept tensor whose type has no device format is an error naming it.
     pub fn load_where(
         stream: &CudaStream,
         split: &Split,
@@ -342,7 +343,7 @@ fn upload_segment(
     };
     let span = seg
         .span(t, plan.model.experts)
-        .map_err(|e| GpuError::shape(PLACED, e.to_string()))?;
+        .map_err(|e| GpuError::plan(PLACED, e))?;
     if span.rows.start != 0 {
         let detail = format!("rows {:?} do not lead the tensor", span.rows);
         return Err(placed_refusal(t, detail));

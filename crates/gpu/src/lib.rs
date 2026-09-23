@@ -100,6 +100,13 @@ pub enum GpuError {
     },
     /// Planning, metadata or dequantization carried up from the model crate.
     Model(Box<::model::ModelError>),
+    /// The host's plan for the card was refused — its placement, a step's
+    /// plan, a step's host rows — by `what`. `source` is the planner's own
+    /// error, whatever crate made it, so the chain keeps it.
+    Plan {
+        what: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// The file declares an architecture the model crate knows but this
     /// crate has no engine for; the string is the name the file declares.
     UnsupportedArch(String),
@@ -152,6 +159,17 @@ impl GpuError {
             detail: detail.into(),
         }
     }
+
+    /// A host plan `what` asked for, refused with `source`.
+    pub fn plan(
+        what: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> GpuError {
+        GpuError::Plan {
+            what,
+            source: source.into(),
+        }
+    }
 }
 
 /// `v` as the `u32` a kernel scalar or a launch dimension takes. `as` would
@@ -179,6 +197,7 @@ impl std::fmt::Display for GpuError {
             GpuError::Tensor { what, name, need } => write!(f, "{what}: {name} is not {need}"),
             GpuError::State { what, missing } => write!(f, "{what}: {missing}"),
             GpuError::Model(e) => write!(f, "{e}"),
+            GpuError::Plan { what, source } => write!(f, "{what}: {source}"),
             GpuError::UnsupportedArch(name) => write!(f, "unsupported architecture {name:?}"),
             GpuError::Protocol { what, detail } => write!(f, "{what}: {detail}"),
         }
@@ -193,6 +212,7 @@ impl std::error::Error for GpuError {
             GpuError::Launch(e) => Some(&**e),
             GpuError::Load(e) => Some(&**e),
             GpuError::Model(e) => Some(&**e),
+            GpuError::Plan { source, .. } => Some(&**source),
             _ => None,
         }
     }

@@ -195,8 +195,9 @@ fn run() -> Result<(), GateError> {
 
     // ---- resident weights: layer 1 only, as a stage holds it — the tensors
     // this block consumes, plus the block's derived weights.
-    let mut wts = Weights::load(stream, &gguf, 1..2, false)?;
-    Body::derive(stream, &Split::open(ref_model_path()?)?, 1..2, &mut wts)?;
+    let file = Split::open(ref_model_path()?)?;
+    let mut wts = Weights::load(stream, &file, 1..2, false)?;
+    Body::derive(stream, &file, 1..2, &mut wts)?;
     fn kq<'a>(wts: &'a Weights, name: &str) -> Result<&'a DeviceTensor<u32>, GateError> {
         let Some(DevWeight::KQuant { ty, w, .. }) = wts.get(name) else {
             return Err(format!("gate_moe_fused: {name} is not a KQuant resident weight").into());

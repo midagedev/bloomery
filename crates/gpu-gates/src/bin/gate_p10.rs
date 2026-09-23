@@ -155,7 +155,7 @@ fn run() -> Result<(), GateError> {
     }
 
     // ------------------------------------------ 2. full load + read-back
-    let mut full = Weights::load(stream, &gguf, 0..n_layers, true)?;
+    let mut full = Weights::load(stream, &file, 0..n_layers, true)?;
     Body::derive(stream, &file, 0..n_layers, &mut full)?;
     if full.resident_bytes() as u64 != res_total + derived_total as u64 {
         eprintln!(
@@ -367,7 +367,7 @@ fn run() -> Result<(), GateError> {
     let mut staged: BTreeSet<String> = BTreeSet::new();
     let mut staged_resident = 0usize;
     for (range, globals) in [(0..CUT, false), (CUT..n_layers, false), (0..0, true)] {
-        let mut w = Weights::load(stream, &gguf, range.clone(), globals)?;
+        let mut w = Weights::load(stream, &file, range.clone(), globals)?;
         Body::derive(stream, &file, range.clone(), &mut w)?;
         let names: BTreeSet<String> = w.names().map(str::to_owned).collect();
         let res = w.resident_bytes();
@@ -410,7 +410,7 @@ fn run() -> Result<(), GateError> {
     // arm and refuses such a file at open. The q8f32 format still runs, one
     // row below, through the derived variant.
     println!("skip q8_0 absent");
-    let mut w = Weights::load(stream, &gguf, 0..2, true)?;
+    let mut w = Weights::load(stream, &file, 0..2, true)?;
     Body::derive(stream, &file, 0..2, &mut w)?;
     let table = Table {
         gguf: &gguf,
