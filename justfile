@@ -191,9 +191,15 @@ bench-gpu-v41-check:
 time-gpu-v41:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
 
+# 캡처된 그래프가 호스트 스레드에 일을 넘기고 기다리는 방식 다섯 × 결과를 받는 팔 둘의 벤치(bench_join) — 정확성 실행이다.
+# 방식은 블로킹 호스트 노드(넘기는 노드와 기다리는 노드 한 쌍, 그리고 일을 통째로 하는 노드 하나), 스핀 호스트 노드,
+# 스트림 memop, memop 원자 축소다. 팔은 H2D와 호스트 매핑 메모리 직접 읽기다. 재생마다 순번이 바뀌고, 소비 커널이
+# 그 재생의 호스트 값만 읽었는지 전부 대조한다. 캡처가 받아들였는지도 방식마다 찍는다. 3090, 게이트 락.
 bench-gpu-join-check *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && flock -w 1800 /root/bloomery-gate.lock timeout --kill-after=10 900 ./target/release/bench_join --check {{ARGS}}'
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/gpu-gate.sh bench_join --check {{ARGS}}'
 
+# 같은 벤치의 시간(리드 전용): 방식·팔마다 일이 없는 왕복(P 끝 → C 시작, `%globaltimer`), 호스트 일·GPU 일 격자에서 겹친
+# 몫, 스핀하는 쪽이 태우는 CPU. 임대·증인·A6000 고정은 time-gate.sh가 쥔다.
 time-gpu-join *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/ref/time-gate.sh bench_join --time {{ARGS}}'
 
