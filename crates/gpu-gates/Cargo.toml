@@ -18,6 +18,9 @@ bloomery-model = { path = "../model" }
 # The `.oxart` container's own reader, host-only. `ptx` takes PTX text only as the payloads
 # it cuts; `object-read` is the ELF path cuda-core's module loader takes on the same file.
 oxide-artifacts = { workspace = true, features = ["object-read"] }
+# The KLD base reader (`kld.rs`) maps ik's base file, a gigabyte at the stock size, instead of
+# reading it into memory: the workspace's memmap2, the copy gguf maps the model file with.
+memmap2.workspace = true
 # Optional for the same reason as gpu-spike: with the feature off this package
 # has no edge to the device crate, so plain cargo never resolves the
 # embedded-bundle anchor symbol.
