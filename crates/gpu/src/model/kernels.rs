@@ -118,11 +118,12 @@ mod step_kernels {
         }
         let j = row % rows_per_head as usize;
         let lane = warp::lane_id() as usize;
-        // The row body's caller contract: row < n_rows puts the row's words
+        // SAFETY: the row body's contract: row < n_rows puts the row's words
         // and scales inside qs and d (the contract's 4·qs.len() and 32·d.len()
         // bounds), and h < n_heads bounds its x window, x0 = h*x_head_stride
         // <= (n_heads-1)*x_head_stride with x.len() >= x0 + k.
-        let f = q8_0_lane_partial_1col(qs, d, x, k, row, h * x_head_stride as usize, lane);
+        let f =
+            unsafe { q8_0_lane_partial_1col(qs, d, x, k, row, h * x_head_stride as usize, lane) };
         let s0 = warp::reduce_sum_f32(f);
         if lane == 0 {
             // SAFETY: only lane 0 of the warp owning `row` writes; the slot

@@ -121,7 +121,7 @@ impl Q8Act {
         })
     }
 
-    pub(crate) fn m(&self) -> usize {
+    pub fn m(&self) -> usize {
         self.m
     }
 
@@ -132,7 +132,22 @@ impl Q8Act {
     /// Super-blocks per row (k/256) — the row geometry every K-quant gemv
     /// of this engine launches with.
     #[must_use]
-    pub(crate) fn n_sb(&self) -> usize {
+    pub fn n_sb(&self) -> usize {
         self.k / 256
+    }
+
+    /// The codes `cores::q3k_row_dot` reads: `64 * ceil(n_sb/2)` u64 per
+    /// column in the quantizer's pair permutation, for a Q3_K kernel outside
+    /// this crate.
+    #[must_use]
+    pub fn q3(&self) -> &DeviceBuffer<u64> {
+        &self.q3
+    }
+
+    /// The block scales that go with [`Q8Act::q3`]: `2 * n_sb` f32 per
+    /// column.
+    #[must_use]
+    pub fn d8(&self) -> &DeviceBuffer<f32> {
+        &self.d8
     }
 }

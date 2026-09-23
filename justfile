@@ -222,6 +222,10 @@ gate-gpu-p8 *ARGS:
 gate-gpu-moe:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/gpu-gate.sh gate_moe_fused'
 
+# V4.1 router and experts (B4 J, K): router, routed and shared SwiGLU, combine against our rule and the V4.1 ik dumps (5-token and decode-step sets), every layer.
+gate-gpu-ds41-moe:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_moe && bash tools/gpu-gate.sh gate_deepseek41_moe'
+
 # P7 뒤 절반: 블록·종단 게이트 하네스의 자기 검증(호스트 전용 — 두 오라클 사이의 알려진 거리를 재현해야 한다).
 gate-gpu-block:
     ./tools/box.sh 'cargo run --release -p bloomery-gpu-gates --bin gate_block'

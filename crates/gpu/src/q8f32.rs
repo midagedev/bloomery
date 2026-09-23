@@ -68,16 +68,10 @@ pub(crate) fn f32_lane_partials(
     // multiply-add sits behind its own branch and the lane can have only
     // that chunk's load in flight. See `f32_lane_partial_1col`.
     if m_cols == 1 {
-        return [
-            f32_lane_partial_1col(w, x, k, row, lane),
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ];
+        // SAFETY: with m_cols 1 this function's caller contract is the
+        // callee's safety contract.
+        let f0 = unsafe { f32_lane_partial_1col(w, x, k, row, lane) };
+        return [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     }
     let k = k as usize;
     let w_row = row * k;
@@ -149,9 +143,15 @@ const _: () = assert!(LANE_UNROLL == 8);
 /// column: `Σ_it fma(w[row·k + 32·it + lane], x[32·it + lane])`, accumulated
 /// sequentially in `it` — [`f32_lane_partials`]'s column 0, in the same order,
 /// with [`LANE_UNROLL`] chunks' loads hoisted above the multiply-adds that
-/// consume them. Caller contract as [`f32_lane_partials`] with `m_cols` 1.
+/// consume them.
+///
+/// # Safety
+///
+/// The caller contract of [`f32_lane_partials`] with `m_cols` 1: `w.len() >=
+/// (row + 1) * k`, `x.len() >= k`, `k` a positive multiple of 32, `lane <
+/// 32`. The body reads `w` and `x` unchecked within those bounds.
 #[inline(always)]
-pub(crate) fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, lane: usize) -> f32 {
+pub unsafe fn f32_lane_partial_1col(w: &[f32], x: &[f32], k: u32, row: usize, lane: usize) -> f32 {
     let k = k as usize;
     let w_row = row * k;
     let iters = k >> 5;
@@ -232,16 +232,10 @@ pub(crate) fn q8_0_lane_partials(
     // One column is the decode shape and gets a body of its own: whole code
     // words per lane, loads hoisted. See `q8_0_lane_partial_1col`.
     if m_cols == 1 {
-        return [
-            q8_0_lane_partial_1col(qs, d, x, k, row, x0, lane),
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ];
+        // SAFETY: with m_cols 1 this function's caller contract is the
+        // callee's safety contract.
+        let f0 = unsafe { q8_0_lane_partial_1col(qs, d, x, k, row, x0, lane) };
+        return [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     }
     let k = k as usize;
     let qs_row = row * (k >> 2);
@@ -375,10 +369,16 @@ fn q8_0_word_dot(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
 /// the same single word, reached by one test instead of four. The
 /// activations are read as one 16-byte quad per word when `x0` leaves them
 /// 16-byte aligned, and as four scalars otherwise — the same values in the
-/// same order, so the sum does not depend on which. Caller contract as
-/// [`q8_0_lane_partials`] with `m_cols` 1.
+/// same order, so the sum does not depend on which.
+///
+/// # Safety
+///
+/// The caller contract of [`q8_0_lane_partials`] with `m_cols` 1: `qs.len()
+/// >= (row + 1) * k/4`, `d.len() >= (row + 1) * k/32`, `x.len() >= x0 + k`,
+/// `k` a positive multiple of 32, `lane < 32`. The body reads `qs`, `d` and
+/// `x` unchecked within those bounds.
 #[inline(always)]
-pub(crate) fn q8_0_lane_partial_1col(
+pub unsafe fn q8_0_lane_partial_1col(
     qs: &[u32],
     d: &[u16],
     x: &[f32],
@@ -824,7 +824,13 @@ mod tests {
                         })
                         .sum();
                     let got: f32 = (0..32)
-                        .map(|lane| q8_0_lane_partial_1col(&qs, &d, &x, k as u32, r, x0, lane))
+                        .map(|lane| {
+                            // SAFETY: qs and d hold `rows` whole rows of k
+                            // values, x holds k + 8 >= x0 + k (x0 <= 4), k is
+                            // a multiple of 32 and lane < 32: the body's
+                            // contract for r < rows.
+                            unsafe { q8_0_lane_partial_1col(&qs, &d, &x, k as u32, r, x0, lane) }
+                        })
                         .sum();
                     assert_eq!(got, want as f32, "k={k} row={r} x0={x0}");
                 }

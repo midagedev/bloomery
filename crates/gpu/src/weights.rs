@@ -498,7 +498,7 @@ fn words_of(b: &[u8]) -> Vec<u32> {
 /// in word j/4, byte j%4) and the block's f16 scale bits unchanged. The
 /// kernels widen a scale with the hardware convert, and widening f16 to f32
 /// is exact, so they multiply by the same f32 the reference dequantizes with.
-pub(crate) fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
+pub fn q8_0_planes(blocks: &[Q8Block]) -> (Vec<u32>, Vec<u16>) {
     let mut qs = Vec::with_capacity(blocks.len() * 8);
     let mut d = Vec::with_capacity(blocks.len());
     for b in blocks {
