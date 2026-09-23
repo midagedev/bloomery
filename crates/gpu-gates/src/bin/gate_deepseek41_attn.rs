@@ -25,13 +25,14 @@
 //! ik attends by one of two CPU paths, and the dump says which. The generic
 //! flash attention rounds the query to f16 and keeps the value sum in f16.
 //! The iqk kernels, taken where the graph builds their key index
-//! (`mask_to_idx-L`), keep the query in f32 and sum in f32; on their T = 1
-//! index branch each thread hands its run of heads the sinks of the first
-//! heads (`iqk_flash_attn.cpp`, the `neq1 == 1` branch passes `sinks`
-//! without the run's offset), so on such a layer the dump is the attention
-//! of those sinks, and the layer's rules and launches take them
-//! ([`ik_index_sinks`]). The model's own sinks are proven on the generic
-//! layers and the depth cases. Three distances per layer, all asserted:
+//! (`mask_to_idx-L`), keep the query in f32 and sum in f32. On their T = 1
+//! index branch the builds in [`T1_SINK_DEFECT_BUILDS`] hand each thread's
+//! run of heads the sinks of the first heads (`iqk_flash_attn.cpp`, the
+//! `neq1 == 1` branch passes `sinks` without the run's offset), so on such a
+//! layer of such a set the dump is the attention of those sinks, and the
+//! layer's rules and launches take them ([`ik_index_sinks`]); every other
+//! build folds each head's own sink there. Three distances per layer, all
+//! asserted:
 //! - (i) ik's arithmetic simulated here over ik's key order vs `fattn-L`.
 //!   On a generic layer, bit for bit: the f16 dot's fixed lane tree, the
 //!   value sum rounded to f16 at every key, glibc's `expf`, the sink folded
@@ -145,6 +146,12 @@ mod gate {
     /// The selected-row depth case's visible entry that names a row past
     /// the stream, which the kernel reads as the stream's last row.
     const DEPTH_PAST_ENTRY: usize = 100;
+    /// The ik builds, by `# build` (the part before any `-`), whose T = 1
+    /// index branch hands each thread's run of heads the sinks of the first
+    /// heads. A set from any other build is held to each head's own sink, so
+    /// an unlisted build with that branch reddens its iqk layers instead of
+    /// passing them.
+    const T1_SINK_DEFECT_BUILDS: &[&str] = &["c10fbbcc", "49ef19d0"];
 
     /// What a whole set shares: its shape, positions and the model's
     /// attention parameters.
@@ -163,6 +170,8 @@ mod gate {
         scale: f32,
         /// ik's threads, `-t` on the set's `# flags` line.
         threads: Option<usize>,
+        /// The set's build is one of [`T1_SINK_DEFECT_BUILDS`].
+        t1_first_sinks: bool,
     }
 
     /// Which of ik's CPU flash attention paths a layer took.
@@ -174,7 +183,9 @@ mod gate {
         /// head's own sink.
         Iqk,
         /// The iqk kernels on the index path's T = 1 branch, where a head
-        /// folds the sink [`ik_index_sinks`] gives it.
+        /// folds its own sink — or, in a set of a
+        /// [`T1_SINK_DEFECT_BUILDS`] build, the sink [`ik_index_sinks`]
+        /// gives it.
         IqkT1,
     }
 
@@ -213,8 +224,8 @@ mod gate {
         /// `blk.L.attn_sinks.weight`: the model's sink per head.
         model_sinks: Vec<f32>,
         /// The sink per head ik folded, which this layer's rules and
-        /// launches take: the model's, or on [`IkPath::IqkT1`] the index
-        /// branch's.
+        /// launches take: the model's, or on [`IkPath::IqkT1`] in a set of
+        /// a [`T1_SINK_DEFECT_BUILDS`] build the index branch's.
         sinks: Vec<f32>,
         /// `fattn-L`, `[token][head][LATENT]` f32.
         dump: Vec<f32>,
@@ -287,7 +298,7 @@ mod gate {
         for (s, (man, set)) in sets.iter().zip(&infos).enumerate() {
             println!(
                 "gate_deepseek41_attn: set {} ({}, build {}), tokens {} at positions {:?}, heads {}, \
-                 window {}, scale {:e}, ik threads {:?}",
+                 window {}, scale {:e}, ik threads {:?}, T = 1 index branch sinks {}",
                 set.label,
                 man.dir.display(),
                 man.build.as_deref().unwrap_or("-"),
@@ -296,7 +307,12 @@ mod gate {
                 set.heads,
                 set.window,
                 set.scale,
-                set.threads
+                set.threads,
+                if set.t1_first_sinks {
+                    "the first heads'"
+                } else {
+                    "each head's own"
+                }
             );
             for l in 0..set.ratios.len() {
                 let case = layer_case(man, &split, set, l)?;
@@ -433,6 +449,10 @@ mod gate {
             ratios: ratios[..layers].to_vec(),
             scale: 1.0 / (LATENT as f32).sqrt(),
             threads: man.header.threads.map(usize::try_from).transpose()?,
+            t1_first_sinks: man
+                .build
+                .as_deref()
+                .is_some_and(|b| T1_SINK_DEFECT_BUILDS.contains(&b.split('-').next().unwrap_or(b))),
         })
     }
 
@@ -491,7 +511,7 @@ mod gate {
             Some(_) => IkPath::Iqk,
         };
         let model_sinks = sinks_of(split, l, set.heads)?;
-        let sinks = if path == IkPath::IqkT1 {
+        let sinks = if path == IkPath::IqkT1 && set.t1_first_sinks {
             let threads = set.threads.ok_or_else(|| {
                 format!("layer {l}: ik's T = 1 index branch, but no -t in # flags")
             })?;
