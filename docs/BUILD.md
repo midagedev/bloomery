@@ -99,6 +99,10 @@ The placement plans are built from this machine's two cards and its RAM (`crates
 
 The default placement is `a`. The output has a `load` line (thread pinning, the indexer's `top_k`) and a `tokens` line with the generated ids.
 
+### HTTP server (`bloomery-serve`)
+
+Today the server runs on a mock engine; the binding to the real engine is the next round. `bloomery-serve --host 127.0.0.1 --port 8080 [--model first.gguf]` speaks llama-server's API: `POST /v1/chat/completions`, `/completion`, `/tokenize`, `/detokenize`, `/apply-template`, and `GET /v1/models`, `/health`, `/props`, `/slots`, `/metrics`, with llama-server's field names and defaults. The chat prompt is rendered from the GGUF's `tokenizer.chat_template` (`--model` reads the header only). There is one slot: a second generation, and any tokenize call, waits until the first finishes; `/health`, `/props`, `/slots` and `/metrics` answer at once. Streams: `/v1/chat/completions` ends with `data: [DONE]`; `/completion` ends with a chunk carrying `"stop": true` and `timings`, and no `[DONE]`, as llama-server does. `cache_prompt` is accepted and ignored (every request evaluates its whole prompt); `n_probs` is refused (400). `timings` are the server's wall clock around engine calls, for bench clients; they are not the project's measured numbers, which come only from the lease runners.
+
 ### The levers that matter
 
 | Variable | Effect |
