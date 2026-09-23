@@ -52,6 +52,24 @@ lease_take() {
   echo "[lease] waiting for $LEASE_LOCK ..."
   flock -w 1800 9 || { echo "[lease] timed out after 30 min" >&2; exit 75; }
   echo "[lease] held by pid $$ at $(now)"
+  lease_netdata
+}
+
+# netdata-lease-gate.service (rig-log configs/) freezes netdata while this lease is held; it polls,
+# so wait up to 2 s for the freeze and print the state. `running` on this line means the run was
+# measured with netdata's collectors live (its GPU collector queries both cards every 2 s).
+lease_netdata() {
+  local i s
+  if ! systemctl is-active --quiet netdata.service 2> /dev/null; then
+    echo "[lease] netdata: not active"
+    return 0
+  fi
+  for ((i = 0; i < 20; i++)); do
+    s=$(systemctl show -p FreezerState --value netdata.service 2> /dev/null || true)
+    [ "$s" = frozen ] && break
+    sleep 0.1
+  done
+  echo "[lease] netdata: ${s:-unknown}"
 }
 
 lease_release() { exec 9>&-; }

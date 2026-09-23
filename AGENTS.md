@@ -16,7 +16,10 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
 - **Never hand-run a benchmark.** Measurements belong to `tools/ref/measure.sh`
   (GPU) and `tools/ref/cpu-measure.sh` (CPU). They own the quiet-machine
   protocol: a machine-wide lock, GPU-idle wait, and witness blocks around every
-  timed region. A number produced outside them is not admissible.
+  timed region. A number produced outside them is not admissible. While the
+  lock is held, `netdata-lease-gate.service` (source in rig-log `configs/`)
+  freezes netdata, whose GPU collector queries both cards every 2 s;
+  `lease_take` prints its state.
 - **Both cards are ours** (user, 2026-09-22: "gpu 2개 다 쓰기로 했으니"). Nothing
   else holds the A6000 any more — the nightly vocoder training ended 2026-09-21
   and `llm.service` is inactive and disabled — so a compute process on either
@@ -29,7 +32,7 @@ Stages and gates live in `docs/plan.md`. This file is the working contract.
   power limit). The ik baselines are re-measured there; **3090 numbers from
   before that date and A6000 numbers never share a table**. The 3090 is the
   gate-and-build card: `tools/box.sh` defaults to it (the box env pin), it is
-  capped at 300 W by a systemd oneshot (`gpu-power-limit.service`), and a
+  capped at 250 W by a systemd oneshot (`gpu-power-limit.service`), and a
   compute process on it does not stop a timing run — the runner records it as
   `[other-busy]` (abort with `BLOOMERY_OTHER_STRICT=1`). `BLOOMERY_CARD=a6000|
   both tools/box.sh …` still exists for functional runs on the A6000 and
