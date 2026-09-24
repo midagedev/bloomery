@@ -105,4 +105,4 @@ AI assistants helped write the code and the documentation in this repository. Ev
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). `crates/oxide-ice-unroll`, a compiler-bug reproducer kept out of the workspace, carries NVIDIA's Apache-2.0 headers.
+MIT, see [`LICENSE`](LICENSE). `crates/oxide-ice-unroll`, a compiler-bug reproducer kept out of the workspace, carries NVIDIA's Apache-2.0 headers. Third-party notices, including the ggml authors' MIT notice for the generated tokenizer table, are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
