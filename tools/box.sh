@@ -13,7 +13,9 @@ ssh "$HOST" "mkdir -p $REMOTE"
 # 시각은 싣지 않는다(-t 없음) — 바뀐 파일은 내용 체크섬(-c)으로 고르고, 박스에 닿은 파일의 mtime은 박스 시계의 "지금"이 된다.
 # 맥의 mtime을 그대로 실으면 cargo가 낡은 바이너리를 내준다: 박스 시계가 맥보다 앞서 있어(실측 4.1초) 복원 직후의 touch조차
 # 직전 빌드 산출물보다 과거로 찍힌다(변이 바이너리가 두 번 그대로 돌았다).
-rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ "$HERE"/ "$HOST:$REMOTE/"
+# 원격 루트의 *.ptx는 cargo oxide가 빌드 중에 쓰는 산출물이다 — 같은 원격 디렉터리에서 빌드가 도는 사이 다른 box.sh 호출의
+# --delete가 그것을 지우면 빌드가 rc 101로 죽는다(dspark-q3k 라운드에서 한 번). 맥 트리에는 없으니 삭제 대상에서 뺀다.
+rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' "$HERE"/ "$HOST:$REMOTE/"
 # 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
 # CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). 두 카드 다 우리 것이다(야간 학습은
 # 2026-09-21에 끝났고 llm.service는 꺼져 있다). 그래도 그 카드에 이미 컴퓨트 프로세스가 있으면 — 우리 다른
