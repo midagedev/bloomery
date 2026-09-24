@@ -4,10 +4,18 @@
 //!     bloomery-tokenize -m <gguf> (-p <text> | -f <file> | --stdin)
 //!                       [--ids] [--no-bos] [--no-parse-special] [--show-count]
 //!     bloomery-tokenize -m <gguf> --info
+//!     bloomery-tokenize -m <gguf> --decode (-p <ids> | -f <file> | --stdin)
 //!
 //! `--info` prints every vocabulary metadata key the loader read, and the
 //! derived vocabulary facts, instead of tokenizing. `--log-disable` is
 //! accepted and does nothing (this binary logs nothing).
+//!
+//! `--decode` reads token ids instead of text — decimal numbers separated by
+//! anything else (`llama-tokenize --ids` output, one id per line, a comma
+//! list) — and writes the concatenated pieces as raw bytes, special tokens
+//! rendered as their text, so that `-f` of the output tokenizes back to the
+//! same ids wherever the tokenizer round-trips. An id outside the vocabulary
+//! is an error.
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -22,6 +30,7 @@ struct Args {
     no_parse_special: bool,
     show_count: bool,
     info: bool,
+    decode: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -33,6 +42,7 @@ fn parse() -> Result<Args, String> {
         no_parse_special: false,
         show_count: false,
         info: false,
+        decode: false,
     };
     let mut sources = 0;
     let mut it = std::env::args_os().skip(1);
@@ -69,6 +79,7 @@ fn parse() -> Result<Args, String> {
             "--show-count" => a.show_count = true,
             "--log-disable" => {}
             "--info" => a.info = true,
+            "--decode" => a.decode = true,
             _ => return Err(format!("unknown option '{arg}'")),
         }
     }
@@ -77,6 +88,9 @@ fn parse() -> Result<Args, String> {
     }
     if sources > 1 {
         return Err("--stdin, --file and --prompt are mutually exclusive".into());
+    }
+    if a.decode && a.info {
+        return Err("--decode and --info are mutually exclusive".into());
     }
     if sources == 0 && !a.info {
         return Err("must specify one of: --stdin, --file or --prompt".into());
@@ -152,6 +166,15 @@ fn main() -> ExitCode {
     let mut out = std::io::BufWriter::new(stdout.lock());
     let written = if args.info {
         info(&tok, &mut out)
+    } else if args.decode {
+        let ids = match parse_ids(args.prompt.as_deref().unwrap_or_default(), tok.n_vocab()) {
+            Ok(ids) => ids,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        out.write_all(&tok.decode_bytes(&ids, true))
     } else {
         let prompt = args.prompt.as_deref().unwrap_or_default();
         // As `llama-tokenize`: one flag decides BOS and EOS together.
@@ -166,6 +189,22 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Every run of ASCII digits in `text` is one id; everything else separates.
+fn parse_ids(text: &[u8], n_vocab: usize) -> Result<Vec<u32>, String> {
+    text.split(|b| !b.is_ascii_digit())
+        .filter(|run| !run.is_empty())
+        .map(|run| {
+            let s = std::str::from_utf8(run).unwrap_or_default();
+            match s.parse::<u32>() {
+                Ok(id) if (id as usize) < n_vocab => Ok(id),
+                _ => Err(format!(
+                    "id {s} is outside the vocabulary (n_vocab {n_vocab})"
+                )),
+            }
+        })
+        .collect()
 }
 
 fn print_ids(

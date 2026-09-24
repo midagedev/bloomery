@@ -793,6 +793,12 @@ gate-gpu-ds41-serve:
 time-gpu-ds41 *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
 
+# ik's V4.1 decode on the first 512 ids of corpus-<CORPUS>.ids, plain or with the DSpark draft, under the lease on
+# the A6000 (lead-only): the ik twin of `just time-gpu-ds41 --tokens <those ids> -n N`. tools/ref/ik-draft.sh's header
+# has the prompt round-trip checks, ik's command line and the summary line. Example: `just time-ik-draft prose 96 dspark`.
+time-ik-draft CORPUS N ARM="dspark":
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} {{ARM}}'
+
 # V4.1 decode by depth, both engines in one lease on the A6000 (lead-only): our arms `<D>` (generate_ds41 --depth D,
 # placement (a)) and ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS), alternated, rounds rotated.
 # tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
