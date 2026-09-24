@@ -64,7 +64,9 @@ report 1 "arch dirs use each other" "$cross"
 # 두는 GGUF 규약이고, 공유 로더가 층 번호를 파싱하는 자리(gpu/weights.rs 의 block_index)가 그것을 쓴다.
 # 규칙이 막는 것은 `blk.N.<name>`이므로, 줄에서 그 리터럴을 지운 뒤에도 패턴이 남는 줄만 잡는다 —
 # `"blk.{l}.ffn_up"`·`"blk.0.attn_q"`와, 맨 접두와 이름이 한 줄에 같이 있는 줄은 그대로 걸린다.
-lits=$(grep -rnE '"blk\.|blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
+# `blk.{` 앞에 `.`나 소문자가 붙은 이름(비전 탑의 `v.blk.{n}.…`)은 다른 탑의 이름공간이라 이 규칙의 대상이
+# 아니다 — 그 표는 어차피 그 크레이트의 arch/ 아래에 있다.
+lits=$(grep -rnE '"blk\.|(^|[^.a-z])blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
   | grep -vE '^crates/([^/]+/src/arch/|gpu-(deepseek2|deepseek41)/src/)' \
   | grep -vE '^tools/ref/models/' \
   | grep -vE '^crates/[^/]+/tests/' \
@@ -73,7 +75,7 @@ lits=$(grep -rnE '"blk\.|blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --
   | grep -vE '^crates/gguf/src/bin/' \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
   | awk '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
-           if (body ~ /"blk\.|blk\.[{]|"deepseek2\.|"deepseek41\./) print }' || true)
+           if (body ~ /"blk\.|(^|[^.a-z])blk\.[{]|"deepseek2\.|"deepseek41\./) print }' || true)
 report 2 "model-aware string literals outside arch/" "$lits"
 
 # ③ general.architecture 는 한 곳에서만 읽는다.

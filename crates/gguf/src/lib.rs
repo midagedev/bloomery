@@ -672,33 +672,25 @@ pub fn inventory_of(path: impl AsRef<Path>) -> Result<Inventory, LoadError> {
     })
 }
 
-/// ggml's `(type_name, blck_size, type_size)` for type ids this engine's
-/// [`GgmlType`] does not model. Ids are `enum ggml_type` values (ik_llama.cpp
-/// ggml.h:391-427); block sizes and byte sizes are the block structs'
-/// static_asserts in ggml-common.h, cited per entry:
-///   * 2 `q4_0` 32/18 (ggml-common.h:166-171), 3 `q4_1` 32/20 (:173-178,
+/// ggml's `(type_name, blck_size, type_size)` for a type id: the engine's
+/// own numbers ([`GgmlType::blck_size`], [`GgmlType::type_size`], which cite
+/// their block structs) for every id [`GgmlType`] names, and a table here for
+/// the four ids ggml defines that the enum leaves [`GgmlType::Unknown`]. Ids
+/// are `enum ggml_type` values (ik_llama.cpp ggml.h:391-427); block sizes and
+/// byte sizes are the block structs' static_asserts in ggml-common.h (ik
+/// `c10fbbcc`), cited per entry from `typedef` to `static_assert`:
+///   * 2 `q4_0` 32/18 (ggml-common.h:167-171), 3 `q4_1` 32/20 (:174-178,
 ///     `GGML_SCALE_TYPE1` = two halves, :16),
-///   * 9 `q8_1` 32/36 (:240-244),
-///   * 10 `q2_K` 256/84 (:307-313), 15 `q8_K` 256/296 — ik layout, `float d;
-///     float sum; int8_t qs[256]; int16_t bsums[16]` (:404-410); mainline
-///     ggml's block_q8_K is 264 B (no sum/bsums), a divergence to remember if
-///     a q8_K file's byte sums ever disagree with its size,
-///   * 16 `iq2_xxs` 256/66 (:436-442), 17 `iq2_xs` 256/74 (:452-457),
-///     18 `iq3_xxs` 256/98 (:485-491), 19 `iq1_s` 256/50 (:521-526),
-///     20 `iq4_nl` 32/18 (:585-589), 21 `iq3_s` 256/110 (:498-510),
-///     22 `iq2_s` 256/82 (:467-473), 23 `iq4_xs` 256/136 (:602-607),
-///     29 `iq1_m` 256/56 (:534-539),
-///   * 24 `i8` 1/1, 25 `i16` 1/2, 26 `i32` 1/4, 27 `i64` 1/8, 28 `f64` 1/8
-///     (type_traits table, ggml.c:621-652).
+///   * 9 `q8_1` 32/36 (:241-245),
+///   * 15 `q8_K` 256/296 — ik layout, `float d; float sum; int8_t qs[256];
+///     int16_t bsums[16]` (:405-411); mainline ggml's block_q8_K is 264 B (no
+///     sum/bsums), a divergence to remember if a q8_K file's byte sums ever
+///     disagree with its size.
 ///
-/// The engine's own numbers stay owned by `GgmlType::blck_size`/`type_size`
-/// for the ids it models; ids absent from both return `None` and inventory
-/// with unknown size.
+/// Every other id returns `None` and inventories with unknown size.
 pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
     let ty = GgmlType::from_u32(id);
     if let Some(name) = ty.name() {
-        // An id `GgmlType` names is one it sizes; the engine's own numbers
-        // stay the owner for these.
         return ty
             .blck_size()
             .zip(ty.type_size())
@@ -708,22 +700,7 @@ pub fn ggml_type_info(id: u32) -> Option<(&'static str, u64, u64)> {
         2 => ("q4_0", 32, 18),
         3 => ("q4_1", 32, 20),
         9 => ("q8_1", 32, 36),
-        10 => ("q2_K", 256, 84),
         15 => ("q8_K", 256, 296),
-        16 => ("iq2_xxs", 256, 66),
-        17 => ("iq2_xs", 256, 74),
-        18 => ("iq3_xxs", 256, 98),
-        19 => ("iq1_s", 256, 50),
-        20 => ("iq4_nl", 32, 18),
-        21 => ("iq3_s", 256, 110),
-        22 => ("iq2_s", 256, 82),
-        23 => ("iq4_xs", 256, 136),
-        24 => ("i8", 1, 1),
-        25 => ("i16", 1, 2),
-        26 => ("i32", 1, 4),
-        27 => ("i64", 1, 8),
-        28 => ("f64", 1, 8),
-        29 => ("iq1_m", 256, 56),
         _ => return None,
     };
     Some((name, blck, tsz))

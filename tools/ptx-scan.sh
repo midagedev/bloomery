@@ -49,7 +49,7 @@
 # After the table, a second block: a `ptx-scan-md5:` line, then `<entry> <md5> <lines>` per row of
 # the table (the same filter), by name ascending. The md5 is of the entry's normalized body and
 # `lines` its line count: the instruction stream with comments, whitespace runs, register numbers,
-# block-label numbers, `__shared_mem_N`/`__local_depotN` numbers and the entry's own name taken out
+# block-label numbers, `__shared_mem_N`/`__local_depotN`/`__device_global_N` numbers and the entry's own name taken out
 # (the rule table is in crates/gpu-gates/src/ptx.rs, `normalize`; the extractor writes the text).
 # The table counts instructions; this block sees their order and operands, so a rewrite that keeps
 # every count (predicated selects turned into branches, a `stacksave` appearing) changes a digest.

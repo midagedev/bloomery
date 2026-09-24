@@ -252,7 +252,7 @@ impl GgmlType {
     /// `sizeof(block_q8_0)` = 34, `sizeof(block_q2_K)` = 84, `sizeof(block_q3_K)` = 110,
     /// `sizeof(block_q4_K)` = 144, `sizeof(block_q5_K)` = 176,
     /// `sizeof(block_q6_K)` = 210 — block layouts and static_asserts in
-    /// ggml-common.h:309-314 (q2_K), 327-332 (q3_K), 348-353 (q4_K), 373-378 (q5_K),
+    /// ggml-common.h:309-314 (q2_K), 327-332 (q3_K), 348-353 (q4_K), 367-373 (q5_K),
     /// 388-393 (q6_K), 196-216 (q5_0/q5_1), 233-238 (q8_0: one f16 `d` and
     /// 32 int8 codes), `sizeof(block_mxfp4)` = 17 (ggml-common.h:183-187: one
     /// E8M0 byte `e`, then 16 bytes of 4-bit codes); the block structs'

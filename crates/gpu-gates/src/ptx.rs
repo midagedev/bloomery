@@ -45,6 +45,7 @@
 //! | `%r<143>` (a register declaration)     | `%r<N>`                    |
 //! | `$L__BB54_3` (a block label)           | `$L`                       |
 //! | `__shared_mem_7`, `__local_depot2`     | `__shared_mem_`, `__local_depot` |
+//! | `__device_global_3`                    | `__device_global_`         |
 //! | the entry's own name, `<name>_param_3` | `ENTRY`, `ENTRY_param_3`   |
 //! | anything else                          | kept byte for byte         |
 //!
@@ -324,7 +325,7 @@ pub fn scan(modules: &[Module<'_>]) -> Vec<Counts> {
 const REG_CLASSES: &[&[u8]] = &[b"r", b"rd", b"rs", b"f", b"fd", b"p", b"h", b"hh", b"rq"];
 
 /// Generated symbols that carry a number with no meaning of its own.
-const NUMBERED_STEMS: &[&[u8]] = &[b"__shared_mem_", b"__local_depot"];
+const NUMBERED_STEMS: &[&[u8]] = &[b"__shared_mem_", b"__local_depot", b"__device_global_"];
 
 /// A character of a PTX identifier (or of the alphanumeric run of a number).
 fn is_ident(c: u8) -> bool {
@@ -868,6 +869,13 @@ $L__BB11_7:
         assert_eq!(
             normalize("a", b"$L__BB1_x: __local_depot7 __local_depotx\n"),
             b"$L__BB1_x: __local_depot __local_depotx\n"
+        );
+        assert_eq!(
+            normalize(
+                "a",
+                b"ld.global.nc.u64 %rd1, [__device_global_3+8], __device_globalx;\n"
+            ),
+            b"ld.global.nc.u64 %rd, [__device_global_+8], __device_globalx;\n"
         );
     }
 }

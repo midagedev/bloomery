@@ -17,6 +17,9 @@ wildcards = "deny"
 # 워크스페이스 멤버끼리는 버전 없는 path 의존으로 묶이고, 멤버는 전부 publish = false다. 이 설정이
 # 풀어 주는 것은 정확히 그 경우뿐이다 — crates.io·git 의존의 와일드카드는 여전히 막힌다.
 allow-wildcard-paths = true
+skip = [
+  { crate = "miniz_oxide@0.8.9", reason = "png 0.18.1 (pinned by crates/vision) takes miniz_oxide 0.8 directly and 0.9 through flate2; only a png release that moves to 0.9 joins them" },
+]
 
 [sources]
 unknown-registry = "deny"

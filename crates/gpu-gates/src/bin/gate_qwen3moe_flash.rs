@@ -59,10 +59,13 @@ mod gate {
     use bloomery_gpu_gates::qwen3moe::{f16_logical_bits, step_sets};
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
-        GateError, bits_equal, checks_failed, mask_bits_in, ref_tensor_logical_in, verdict,
+        GateError, bits_equal, checks_failed, mask_bits_in, open_split, ref_tensor_logical_in,
+        verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::quant::half_to_f32;
+    use model::arch::Arch;
+    use model::arch::qwen3moe::hparams::Hparams;
 
     /// An f16 NaN the padded rows are overwritten with.
     const NAN16: u16 = 0x7e00;
@@ -207,10 +210,20 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let split = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-flash")?;
+        let hp = Hparams::read(&split)?;
+        if hp.head_dim != HEAD {
+            return Err(format!(
+                "the kernel attends over {HEAD}-value heads; the file's heads are {}",
+                hp.head_dim
+            )
+            .into());
+        }
+        // ik's `kq_scale`: one over the square root of the file's head width.
+        let scale = 1.0f32 / (hp.head_dim as f32).sqrt();
         let gpu = Gpu::new()?;
         let k = FlashGqaKernels::load(gpu.context())?;
         let stream = gpu.stream();
-        let scale = 1.0f32 / (HEAD as f32).sqrt();
         println!(
             "gate_qwen3moe_flash: device {} — head {HEAD}, group {GROUP}, {SEG_KEYS}-key segments, scale {scale:e}",
             gpu.device_name()?
