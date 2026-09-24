@@ -5,10 +5,11 @@
 //! numbers:
 //!
 //! - per layer, the raw window ring: `min(ctx_max, window)` latent rows in
-//!   f16, the row of cell `c` in slot `c % window`, and its shadow: `ctx_max`
-//!   rows of the same f16 bits, the row of cell `c` in row `c`, written by the
-//!   same append and read only when a cut restores the ring
-//!   ([`Body::rollback`]);
+//!   f16, the row of cell `c` in slot `c % window`;
+//! - the rings' shadows, in page-locked host memory the card writes at its
+//!   host address ([`Shadows`]): per layer `ctx_max` rows of the same f16
+//!   bits, the row of cell `c` in row `c`, written by the same append and
+//!   read only when a cut restores the ring ([`Body::rollback`]);
 //! - per layer that owns a compressor, its compressed rows (`⌈ctx_max /
 //!   ratio⌉` latent rows in f16) and, above ratio 1, its state: the `ratio`
 //!   latest latent projections in f32, values and scores (a ratio-1 group is
@@ -53,6 +54,7 @@
 //! the rings, the compressed rows, the index keys and the states
 //! consistently with each other.
 
+use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -61,7 +63,7 @@ use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, SlotMap
 use bloomery_gpu::model::{ChainBody, StepProbe};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, window};
-use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::deepseek41::hparams::Hparams;
@@ -119,8 +121,6 @@ pub fn open(
 struct LayerKv {
     /// The raw window ring.
     ring: DeviceTensor<u16>,
-    /// The ring's shadow: one row per position, `ctx_max` rows.
-    shadow: DeviceTensor<u16>,
     /// The compressed rows of the stream the layer's compressor writes.
     rows: Option<DeviceTensor<u16>>,
     /// The index keys the layer owns.
@@ -149,53 +149,6 @@ impl LayerKv {
         ]
     }
 
-    /// The shadow's device bytes: placement's `KvBytes::shadow_bytes`.
-    fn shadow_bytes(&self) -> usize {
-        self.shadow.buf().num_bytes()
-    }
-
-    /// Copy the shadow rows of `positions` into their ring slots, on
-    /// `stream`: device-to-device, at most two copies (one where the slots
-    /// wrap). `positions` ends at most at the shadow's rows and spans at most
-    /// the ring's.
-    fn restore(&mut self, stream: &CudaStream, positions: Range<usize>) -> Result<(), GpuError> {
-        let (slots, width) = (self.ring.rows(), self.ring.cols());
-        if positions.end > self.shadow.rows() || positions.len() > slots || width == 0 {
-            return Err(GpuError::Shape {
-                what: "deepseek41 Body::rollback",
-                detail: format!(
-                    "a restore of positions {positions:?}: a shadow of {} rows, a ring of {slots}",
-                    self.shadow.rows()
-                ),
-            });
-        }
-        let bytes = |rows: usize| -> Result<u64, GpuError> {
-            u64::try_from(rows * width * size_of::<u16>()).map_err(|_| GpuError::Shape {
-                what: "deepseek41 Body::rollback",
-                detail: format!("{rows} rows pass u64 bytes"),
-            })
-        };
-        let mut q = positions.start;
-        while q < positions.end {
-            let slot = q % slots;
-            let n = (positions.end - q).min(slots - slot);
-            let src_at = self.shadow.buf().cu_deviceptr() + bytes(q)?;
-            let dst_at = self.ring.buf().cu_deviceptr() + bytes(slot)?;
-            // SAFETY: rows q .. q + n lie in the shadow (q + n <= positions.end
-            // <= shadow.rows(), checked above) and slots slot .. slot + n in the
-            // ring (n <= slots − slot); both are this layer's own allocations,
-            // borrowed for the copy, and the windows are never dropped.
-            let src = unsafe { window::<u16>(src_at, n * width, self.shadow.buf().context()) };
-            // SAFETY: as for `src`; the ring window is the only handle the copy
-            // writes through, and the stream orders it after every step that
-            // wrote either buffer.
-            let mut dst = unsafe { window::<u16>(dst_at, n * width, self.ring.buf().context()) };
-            dst.copy_from_device_async(&src, stream)?;
-            q += n;
-        }
-        Ok(())
-    }
-
     fn zero(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         self.ring.buf_mut().zero_async(stream)?;
         for t in [&mut self.rows, &mut self.keys].into_iter().flatten() {
@@ -206,6 +159,223 @@ impl LayerKv {
         }
         Ok(())
     }
+}
+
+/// The ring shadows of the card's layers, in one page-locked host allocation
+/// (`cuMemAllocHost`): layer `i` of the card holds `rows` rows of the ring's
+/// width from row `i · rows` on, the row of position `p` in its row `p`. The
+/// card reaches page-locked host memory at its host address under unified
+/// addressing, which the load checks and without which it refuses — the
+/// shadows never move to card memory instead — so the append writes a
+/// layer's rows through a window over them ([`Shadows::layer_mut`]) and no
+/// card memory holds them. A cut copies the rows it needs back into the ring,
+/// host to device ([`Shadows::restore`]).
+struct Shadows {
+    /// Per layer, a window over its rows of `host`: they free nothing, and
+    /// the drop gives them back.
+    windows: Vec<ManuallyDrop<DeviceTensor<u16>>>,
+    host: PinnedHostBuffer<u16>,
+    rows: usize,
+    width: usize,
+    /// The card's `CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING`, as the load read it.
+    unified_addressing: i32,
+}
+
+/// Where the ring shadows live ([`Body::shadow_host`]): one page-locked host
+/// allocation the card reaches at its host address.
+#[derive(Clone, Copy, Debug)]
+pub struct ShadowHost {
+    /// Every layer's shadow, in bytes.
+    pub bytes: usize,
+    /// The card's `CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING` at load: 1, or the
+    /// load was refused.
+    pub unified_addressing: i32,
+}
+
+impl Shadows {
+    /// `layers` zeroed shadows of `rows` rows of `width` for `gpu`'s card, or
+    /// the refusal: a card without unified addressing, or an allocation the
+    /// card reaches at an address other than its host address.
+    fn new(gpu: &Gpu, layers: usize, rows: usize, width: usize) -> Result<Shadows, GpuError> {
+        const WHAT: &str = "deepseek41 Body::load_placed";
+        let ctx = gpu.context();
+        let mut unified_addressing = 0;
+        // SAFETY: the call writes the live local `unified_addressing`; the
+        // device is the context's own.
+        let rc = unsafe {
+            sys::cuDeviceGetAttribute(
+                &mut unified_addressing,
+                sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
+                ctx.cu_device(),
+            )
+        };
+        rc.result().map_err(|source| GpuError::Driver {
+            op: Some("cuDeviceGetAttribute(UNIFIED_ADDRESSING)"),
+            source,
+        })?;
+        if unified_addressing != 1 {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "unified addressing on the card: the ring shadows are page-locked host \
+                          memory the append writes at its host address",
+            });
+        }
+        let len = layers
+            .checked_mul(rows)
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("{layers} ring shadows of {rows} rows of {width} pass usize"),
+            })?;
+        let host =
+            PinnedHostBuffer::<u16>::zeroed(ctx, len).map_err(|source| GpuError::Driver {
+                op: Some("cuMemAllocHost (the ring shadows)"),
+                source,
+            })?;
+        let base = if host.is_empty() {
+            0
+        } else {
+            host_address(&host)?
+        };
+        let windows = (0..layers)
+            .map(|i| {
+                let at = u64::try_from(i * rows * width * size_of::<u16>()).map_err(|_| {
+                    GpuError::Shape {
+                        what: WHAT,
+                        detail: format!("ring shadow {i} starts past u64 bytes"),
+                    }
+                })?;
+                // SAFETY: the window spans rows i·rows .. (i + 1)·rows of the
+                // allocation's layers·rows (i < layers), which the card reaches
+                // from `base` on; the allocation lives in the same value as the
+                // window, and the drop gives the window back before it frees
+                // the allocation.
+                Ok(unsafe { DeviceTensor::window(base + at, rows, width, ctx) })
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        Ok(Shadows {
+            windows,
+            host,
+            rows,
+            width,
+            unified_addressing,
+        })
+    }
+
+    /// Layer `i`'s shadow, the tensor the append writes.
+    fn layer_mut(&mut self, i: usize) -> Option<&mut DeviceTensor<u16>> {
+        self.windows.get_mut(i).map(|w| &mut **w)
+    }
+
+    /// Bytes of one layer's shadow.
+    fn layer_bytes(&self) -> usize {
+        self.rows * self.width * size_of::<u16>()
+    }
+
+    /// Copy layer `i`'s shadow rows of `positions` into their slots of
+    /// `ring`, host to device on `stream`: at most two copies (one where the
+    /// slots wrap). `positions` ends at most at the shadow's rows and spans at
+    /// most the ring's. The rows are the append's stores to host memory; a
+    /// kernel's stores are complete when it completes, and the stream starts
+    /// the copy only after every launch enqueued before it, so the copy reads
+    /// what every earlier step wrote.
+    fn restore(
+        &self,
+        i: usize,
+        ring: &mut DeviceTensor<u16>,
+        stream: &CudaStream,
+        positions: Range<usize>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "deepseek41 Body::rollback";
+        let (slots, width) = (ring.rows(), ring.cols());
+        let layer = self.rows * self.width;
+        let shadow = self
+            .host
+            .get(i * layer..(i + 1) * layer)
+            .filter(|_| {
+                width == self.width
+                    && width > 0
+                    && positions.end <= self.rows
+                    && positions.len() <= slots
+            })
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a restore of positions {positions:?} into shadow {i}: shadows of {} rows of \
+                     {}, {} of them; a ring of {slots} rows of {width}",
+                    self.rows,
+                    self.width,
+                    self.windows.len()
+                ),
+            })?;
+        let bytes = |rows: usize| -> Result<u64, GpuError> {
+            u64::try_from(rows * width * size_of::<u16>()).map_err(|_| GpuError::Shape {
+                what: WHAT,
+                detail: format!("{rows} rows pass u64 bytes"),
+            })
+        };
+        let mut q = positions.start;
+        while q < positions.end {
+            let slot = q % slots;
+            let n = (positions.end - q).min(slots - slot);
+            let at = ring.buf().cu_deviceptr() + bytes(slot)?;
+            // SAFETY: slots slot .. slot + n lie in the ring (n <= slots − slot),
+            // the layer's own allocation, borrowed mutably for the copy; the
+            // window is given back below.
+            let mut dst = unsafe { window::<u16>(at, n * width, ring.buf().context()) };
+            let src = &shadow[q * width..(q + n) * width];
+            // SAFETY: `src` is page-locked memory `self` owns, which the host
+            // never writes; the refresh that enqueues the copy synchronizes the
+            // stream before it returns (the image upload), and the drop waits
+            // for the context before it frees the allocation, so the copy
+            // completes while `src` lives.
+            let copied = unsafe { dst.copy_from_host_async_unchecked(stream, src) };
+            drop(ManuallyDrop::into_inner(dst).into_raw_parts());
+            copied?;
+            q += n;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Shadows {
+    fn drop(&mut self) {
+        // The appends write the allocation and a restore reads it, both in
+        // stream order: the context finishes that work before `host` frees
+        // it. A failure on the drop path is unreportable; the context records
+        // it.
+        let ctx = self.host.context();
+        ctx.record_err(ctx.synchronize());
+        for w in self.windows.drain(..) {
+            DeviceTensor::release(w);
+        }
+    }
+}
+
+/// The address the card reaches the page-locked allocation `host` at: its
+/// host address, which unified addressing makes it; any other is refused.
+fn host_address(host: &PinnedHostBuffer<u16>) -> Result<sys::CUdeviceptr, GpuError> {
+    let at = host.as_ptr();
+    let mut dev: sys::CUdeviceptr = 0;
+    // SAFETY: `at` is a live page-locked allocation of the context its
+    // allocation bound to this thread; the call writes the live local `dev`,
+    // and the flags must be 0.
+    let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, at.cast_mut().cast(), 0) };
+    rc.result().map_err(|source| GpuError::Driver {
+        op: Some("cuMemHostGetDevicePointer_v2 (the ring shadows)"),
+        source,
+    })?;
+    if u64::try_from(at.addr()).ok() != Some(dev) {
+        return Err(GpuError::Shape {
+            what: "deepseek41 Body::load_placed",
+            detail: format!(
+                "the card reaches the ring shadows' page-locked allocation at {dev:#x}, not at its \
+                 host address {:#x}",
+                at.addr()
+            ),
+        });
+    }
+    Ok(dev)
 }
 
 /// One layer's cache and compressor buffers, for a caller that writes a
@@ -342,6 +512,8 @@ pub struct Body {
     layers: Range<usize>,
     /// Per layer of `layers`, in order.
     kv: Vec<LayerKv>,
+    /// Every layer's ring shadow, in page-locked host memory.
+    shadows: Shadows,
     steps: Vec<LayerStep>,
     /// Per row of the pair pass: its streams, folds and image copy.
     lanes: Vec<Lane>,
@@ -408,12 +580,23 @@ impl Body {
             .map(|b| b.iter().map(|&(_, n)| n).sum())
     }
 
-    /// Layer `layer`'s ring shadow bytes — the figure `KvLayout::shadow_bytes`
-    /// plans for the layer; `None` for a layer this card does not run.
+    /// Layer `layer`'s ring shadow bytes, in page-locked host memory — the
+    /// figure `KvLayout::shadow_bytes` plans for the layer; `None` for a
+    /// layer this card does not run.
     #[must_use]
     pub fn shadow_bytes(&self, layer: usize) -> Option<usize> {
         let i = layer.checked_sub(self.layers.start)?;
-        self.kv.get(i).map(LayerKv::shadow_bytes)
+        self.kv.get(i).map(|_| self.shadows.layer_bytes())
+    }
+
+    /// Where the ring shadows live: the page-locked host allocation's bytes
+    /// and the card's unified addressing, as the load checked it.
+    #[must_use]
+    pub fn shadow_host(&self) -> ShadowHost {
+        ShadowHost {
+            bytes: self.shadows.host.num_bytes(),
+            unified_addressing: self.shadows.unified_addressing,
+        }
     }
 
     /// Layer `layer`'s cache and compressor buffers, for a caller that writes
@@ -808,9 +991,9 @@ impl Body {
     /// `pos`, and the step there and every step after it write what they
     /// did before, bit for bit. `pos` must be a point [`Body::keep_point`]
     /// grants. The ring slots the step at `pos` reads that hold later rows
-    /// are restored from the shadow by the next refresh, on the engine
-    /// stream and outside any graph (this call has no stream); nothing else
-    /// on the device is touched.
+    /// are restored from the shadow by the next refresh, host to device on
+    /// the engine stream and outside any graph (this call has no stream);
+    /// nothing else on the device is touched.
     pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
         let (to, len) = (pos as usize, self.history.len());
         let kept = self.keep_point(to);
@@ -853,8 +1036,9 @@ impl Body {
         let pos = input.pos as usize;
         if self.restore {
             for run in self.holds.stale_runs(pos) {
-                for layer in &mut self.kv {
-                    layer.restore(stream, run.clone())?;
+                for (i, layer) in self.kv.iter_mut().enumerate() {
+                    self.shadows
+                        .restore(i, &mut layer.ring, stream, run.clone())?;
                 }
                 run.for_each(|q| self.holds.ring_wrote(q));
             }
@@ -874,6 +1058,7 @@ impl Body {
         let Body {
             layers,
             kv,
+            shadows,
             steps,
             lanes,
             lists,
@@ -887,6 +1072,7 @@ impl Body {
         Parts {
             layers,
             kv,
+            shadows,
             steps,
             lanes,
             lists,
@@ -911,6 +1097,7 @@ pub struct RowBuffers<'a> {
 struct Parts<'a> {
     layers: &'a Range<usize>,
     kv: &'a mut [LayerKv],
+    shadows: &'a mut Shadows,
     steps: &'a [LayerStep],
     lanes: &'a mut [Lane],
     lists: &'a mut [Vec<DeviceBuffer<u32>>],
@@ -1003,7 +1190,7 @@ impl Parts<'_> {
             shadow,
             compressed,
             selection,
-        } = layer_io(self.kv, lists, i, &step)?;
+        } = layer_io(self.kv, self.shadows, lists, i, &step)?;
         self.attn.enqueue_layer_of(
             gpu,
             w,
@@ -1134,10 +1321,12 @@ impl Parts<'_> {
     }
 }
 
-/// Layer `i`'s window ring, the compressed rows its attention reads and the
-/// list it reads them through, out of the body's layers `kv` and `lists`.
+/// Layer `i`'s window ring and its shadow, the compressed rows its attention
+/// reads and the list it reads them through, out of the body's layers `kv`,
+/// `shadows` and `lists`.
 fn layer_io<'a>(
     kv: &'a mut [LayerKv],
+    shadows: &'a mut Shadows,
     lists: &'a mut [DeviceBuffer<u32>],
     i: usize,
     step: &LayerStep,
@@ -1164,12 +1353,14 @@ fn layer_io<'a>(
     };
     let LayerKv {
         ring,
-        shadow,
         rows,
         keys,
         values,
         scores,
     } = rest.first_mut().ok_or(refuse("the layer's cache"))?;
+    let shadow = shadows
+        .layer_mut(i)
+        .ok_or(refuse("the layer's ring shadow"))?;
     let compressed = match step.rows {
         RowsOf::None => Compressed::None,
         RowsOf::Reads(src) => {
@@ -1411,11 +1602,13 @@ impl ChainBody for Body {
         self.eps
     }
 
+    /// The ring shadows are page-locked host memory, not counted here
+    /// ([`Body::shadow_host`]).
     fn resident_bytes(&self) -> usize {
         let caches: usize = self
             .kv
             .iter()
-            .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>() + l.shadow_bytes())
+            .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>())
             .sum();
         caches + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
     }
@@ -1487,6 +1680,7 @@ impl ChainBody for Body {
             .clone()
             .map(|l| layer_kv(stream, hp, l, ctx_max))
             .collect::<Result<Vec<_>, _>>()?;
+        let shadows = Shadows::new(gpu, layers.len(), ctx_max, hp.head_dim)?;
 
         let planner =
             Planner::from_file(&file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
@@ -1552,6 +1746,7 @@ impl ChainBody for Body {
         Ok(Body {
             layers,
             kv,
+            shadows,
             steps,
             lanes,
             lists,
@@ -1714,8 +1909,7 @@ fn layer_steps(
     Ok(steps)
 }
 
-/// Layer `l`'s buffers at `ctx_max` positions: its window ring and the
-/// ring's shadow, `ctx_max` rows of the ring's width; its
+/// Layer `l`'s buffers at `ctx_max` positions: its window ring; its
 /// compressed rows when it owns a compressor, and its state when that
 /// compressor's ratio is above 1; its index keys when it owns them. A
 /// compressor or index keys on a layer that attends no stream have no ratio
@@ -1740,7 +1934,6 @@ fn layer_kv(
             })
     };
     let ring = DeviceTensor::zeroed(stream, ctx_max.min(hp.window), latent)?;
-    let shadow = DeviceTensor::zeroed(stream, ctx_max, latent)?;
     let (rows, values, scores) = match kind.compressor {
         Some(_) => {
             let r = ratio()?;
@@ -1768,7 +1961,6 @@ fn layer_kv(
     };
     Ok(LayerKv {
         ring,
-        shadow,
         rows,
         keys,
         values,

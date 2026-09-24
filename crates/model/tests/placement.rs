@@ -41,10 +41,7 @@ struct CardPin {
     expert_bytes: u64,
     experts: u64,
     rounding: u64,
-    /// The cache and the ring shadow, and the shadow alone: `ctx_max` rows of
-    /// the latent width in f16 per layer.
     kv: u64,
-    shadow: u64,
     headroom: i128,
     eligible: Range<usize>,
     n_l: (u64, u64),
@@ -53,59 +50,61 @@ struct CardPin {
 struct HostPin {
     expert_bytes: u64,
     table_bytes: u64,
+    /// The cards' ring shadows, page-locked: `ctx_max` rows of the latent
+    /// width in f16 per layer.
+    shadow: u64,
     headroom: i128,
 }
 
-// PIN(2026-09-24): design §5 (a)'s A6000 line with the window ring's shadow in the KV term (40 layers × 32,768 positions × 1,024 B = 1,342,177,280 B): 80 experts fewer (2,414 → 2,334), n_l 61–62 on layers 2–39 (was 63–64), rounding and headroom as the new expert set leaves them.
+// PIN(2026-09-24): design §5 (a)'s A6000 line with the window ring's shadow in page-locked host memory: the card's KV term is the cache alone again, so the line is the one before the shadow — 2,414 experts, n_l 63–64 on layers 2–39.
 const A_A6000: CardPin = CardPin {
     card: "A6000",
     dense: 8_149_379_520,
-    expert_bytes: 39_148_462_080,
-    experts: 2_334,
-    rounding: 523_515_456,
-    kv: 1_452_302_336,
-    shadow: 1_342_177_280,
-    headroom: 1_074_765_824,
+    expert_bytes: 40_490_311_680,
+    experts: 2_414,
+    rounding: 515_454_528,
+    kv: 110_125_056,
+    headroom: 1_083_154_432,
     eligible: 2..40,
-    n_l: (61, 62),
+    n_l: (63, 64),
 };
-// PIN(2026-09-24): design §5 (a)'s host line: the 80 experts the A6000 gave up for the ring shadow come to the host.
+// PIN(2026-09-24): design §5 (a)'s host line: every expert the A6000 does not keep, and the 40 layers' ring shadows page-locked (40 × 32,768 positions × 1,024 B = 1,342,177,280 B), the headroom that much below the line before the shadow.
 const A_HOST: HostPin = HostPin {
-    expert_bytes: 219_619_123_200,
+    expert_bytes: 218_277_273_600,
     table_bytes: 1_323_827_200,
-    headroom: 38_138_454_016,
+    shadow: 1_342_177_280,
+    headroom: 38_138_126_336,
 };
-// PIN(2026-09-24): design §5 (b)'s A6000 line with the ring shadow of its 20 layers in the KV term (671,088,640 B): 39 experts fewer (2,680 → 2,641), n_l 146–147 on layers 2–19 (was 148–149).
+// PIN(2026-09-24): design §5 (b)'s A6000 line with the ring shadows on the host: the line before the shadow — 2,680 experts, n_l 148–149 on layers 2–19.
 const B_A6000: CardPin = CardPin {
     card: "A6000",
     dense: 3_967_677_920,
-    expert_bytes: 44_297_809_920,
-    experts: 2_641,
-    rounding: 260_512_288,
-    kv: 736_649_216,
-    shadow: 671_088_640,
+    expert_bytes: 44_951_961_600,
+    experts: 2_680,
+    rounding: 277_449_248,
+    kv: 65_560_576,
     headroom: 1_085_775_872,
     eligible: 2..20,
-    n_l: (146, 147),
+    n_l: (148, 149),
 };
-// PIN(2026-09-24): design §5 (b)'s 3090 line with the ring shadow of its 20 layers in the KV term (671,088,640 B): 40 experts fewer (1,144 → 1,104), n_l 55–56 on layers 20–39 (was 57–58).
+// PIN(2026-09-24): design §5 (b)'s 3090 line with the ring shadows on the host: the line before the shadow — 1,144 experts, n_l 57–58 on layers 20–39.
 const B_3090: CardPin = CardPin {
     card: "3090",
     dense: 4_181_701_600,
-    expert_bytes: 18_517_524_480,
-    experts: 1_104,
-    rounding: 249_908_256,
-    kv: 715_653_120,
-    shadow: 671_088_640,
+    expert_bytes: 19_188_449_280,
+    experts: 1_144,
+    rounding: 250_072_096,
+    kv: 44_564_480,
     headroom: 1_081_606_144,
     eligible: 20..40,
-    n_l: (55, 56),
+    n_l: (57, 58),
 };
-// PIN(2026-09-24): design §5 (b)'s host line: the 79 experts the cards gave up for the ring shadow come to the host.
+// PIN(2026-09-24): design §5 (b)'s host line (token_embd as in (a)): every expert the cards do not keep, and both cards' ring shadows page-locked (2 × 20 layers × 32,768 × 1,024 B), the headroom that much below the line before the shadow.
 const B_HOST: HostPin = HostPin {
-    expert_bytes: 195_952_250_880,
+    expert_bytes: 194_627_174_400,
     table_bytes: 1_323_827_200,
-    headroom: 61_805_326_336,
+    shadow: 1_342_177_280,
+    headroom: 61_788_225_536,
 };
 // PIN(2026-09-23): design §5 (a), `engram_embd` ×2 on NVMe — the same in (b).
 const NVME: u64 = 208_902_215_200;
@@ -192,7 +191,7 @@ fn summary(out: &mut String, title: &str, plan: &Plan<'_>, kv: &KvLayout) {
     for (card, t) in plan.machine.cards.iter().zip(&plan.cards) {
         let _ = writeln!(
             out,
-            "  {} layers {:?}{}: dense {}  experts {} ({})  rounding {}  KV {} (shadow {})  scratch {}  context {}  headroom {}",
+            "  {} layers {:?}{}: dense {}  experts {} ({})  rounding {}  KV {}  scratch {}  context {}  headroom {}",
             card.name,
             card.layers,
             if card.head { " +head" } else { "" },
@@ -201,7 +200,6 @@ fn summary(out: &mut String, title: &str, plan: &Plan<'_>, kv: &KvLayout) {
             n(t.experts),
             n(t.rounding_bytes),
             n(t.kv_bytes),
-            n(t.shadow_bytes),
             n(t.scratch_bytes),
             n(t.context_bytes),
             n(t.headroom_bytes)
@@ -210,10 +208,11 @@ fn summary(out: &mut String, title: &str, plan: &Plan<'_>, kv: &KvLayout) {
     let h = &plan.host;
     let _ = writeln!(
         out,
-        "  host: experts {} ({})  tables {}  reserves {}  headroom {}",
+        "  host: experts {} ({})  tables {}  ring shadows {}  reserves {}  headroom {}",
         n(h.expert_bytes),
         n(h.experts),
         n(h.table_bytes),
+        n(h.shadow_bytes),
         n(h.reserve_bytes),
         n(h.headroom_bytes)
     );
@@ -385,12 +384,6 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
         pin(&mut bad, &format!("{c} KV"), t.kv_bytes, p.kv);
         pin(
             &mut bad,
-            &format!("{c} KV ring shadow"),
-            t.shadow_bytes,
-            p.shadow,
-        );
-        pin(
-            &mut bad,
             &format!("{c} headroom"),
             t.headroom_bytes,
             p.headroom,
@@ -422,6 +415,7 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
         h.table_bytes,
         host.table_bytes,
     );
+    pin(&mut bad, "host ring shadows", h.shadow_bytes, host.shadow);
     pin(&mut bad, "host headroom", h.headroom_bytes, host.headroom);
     pin(&mut bad, "nvme (engram_embd)", plan.nvme_bytes, NVME);
 

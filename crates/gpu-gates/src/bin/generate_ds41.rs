@@ -22,7 +22,11 @@
 //! layer's expert prefix the budget allows on the card, the rest on the host
 //! tier) and the one the timing runners use; `gate` is the step gate's
 //! (`workstation::plan_gate`, the same on the 3090). The card is found by
-//! name, so the box's card pin decides which placements can load.
+//! name, so the box's card pin decides which placements can load. The ring
+//! shadows are page-locked host memory: the `plan` line prints the plan's
+//! figure (`host_shadow=`), the `load` line the allocation
+//! (`shadow=host <bytes>`) and the card's unified addressing the load
+//! checked; `resident_bytes` counts device bytes only.
 //!
 //! `--depth D` stands the run at depth D before its first generated token:
 //! the prompt, then the depth tables' sequence (`lcg_prompt` in
@@ -381,6 +385,7 @@ mod drive {
         let mut m = body::open(file, a.place.machine(), a.ctx)?;
         m.set_mode(a.mode);
         let top_k = m.body("generate_ds41")?.indexer_top_k();
+        let shadow = m.body("generate_ds41")?.shadow_host();
         if top_k != inputs.hp.indexer.top_k {
             return Err(format!(
                 "the body selects {top_k} rows per stream, the file's top_k is {}: a step \
@@ -390,9 +395,11 @@ mod drive {
             .into());
         }
         println!(
-            "load resident_bytes={} ctx={} layers={} top_k={top_k} mode={} place={} pin_main={} \
-             pinned={pinned} in {:.1} s (runtime value)",
+            "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
+             top_k={top_k} mode={} place={} pin_main={} pinned={pinned} in {:.1} s (runtime value)",
             m.resident_bytes(),
+            shadow.bytes,
+            shadow.unified_addressing,
             a.ctx,
             inputs.hp.n_layer,
             mode_name(a.mode),
@@ -601,7 +608,7 @@ mod drive {
         let card = &plan.cards[0];
         println!(
             "plan place={} card={} ctx_max={} card_experts={} ({} B) host_experts={} ({} B) \
-             n_l={}..{} on {} layers card_budget={} hot_list={hot_list}",
+             host_shadow={} B n_l={}..{} on {} layers card_budget={} hot_list={hot_list}",
             place.name(),
             machine.cards[0].name,
             plan.ctx_max,
@@ -609,6 +616,7 @@ mod drive {
             card.expert_bytes,
             plan.host.experts,
             plan.host.expert_bytes,
+            plan.host.shadow_bytes,
             held.iter().min().copied().unwrap_or(0),
             held.iter().max().copied().unwrap_or(0),
             held.len(),

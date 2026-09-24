@@ -12,8 +12,9 @@
 //! layer's ratio come from [`Hparams`].
 //!
 //! Beside the cache ([`KvBytes::shadow_bytes`]), every layer keeps a shadow of
-//! its window ring: `ctx_max` latent rows in f16, one per position, from which
-//! a cut of the cache restores the ring rows later positions overwrote.
+//! its window ring in page-locked host memory: `ctx_max` latent rows in f16,
+//! one per position, from which a cut of the cache restores the ring rows
+//! later positions overwrote. The plan counts it on the host, not on the card.
 
 use gguf::Split;
 

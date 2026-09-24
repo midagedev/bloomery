@@ -202,6 +202,17 @@ mod gate {
                 t.headroom_bytes
             );
         }
+        let h = &plan.host;
+        println!(
+            "  host: experts {} ({}) tables {} ring shadows {} (page-locked; this gate allocates \
+             none) reserves {} headroom {}",
+            h.expert_bytes,
+            h.experts,
+            h.table_bytes,
+            h.shadow_bytes,
+            h.reserve_bytes,
+            h.headroom_bytes
+        );
 
         let cards = open_cards(&plan)?;
         let lock = args.lock.as_ref();

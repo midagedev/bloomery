@@ -158,9 +158,11 @@ pub struct Machine {
 /// An architecture's KV cache size: the bytes `layer` holds at `ctx_max` tokens.
 pub trait KvBytes {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64;
-    /// Bytes beside the cache that `layer` holds so the cache can be cut back:
-    /// a copy of a ring that overwrites its rows. The plan counts them in the
-    /// card's KV term. The default is none.
+    /// Bytes beside the cache that `layer` keeps so the cache can be cut back:
+    /// a copy of a ring that overwrites its rows, in page-locked host memory
+    /// the card writes. The plan counts them on the host
+    /// ([`HostTotals::shadow_bytes`]), not in the card's KV term. The default
+    /// is none.
     fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         let _ = (layer, ctx_max);
         0
@@ -612,10 +614,8 @@ pub struct CardTotals {
     pub rounding_bytes: u64,
     /// Experts held, summed over the card's layers.
     pub experts: u64,
-    /// The cache and its shadow ([`KvBytes`]).
+    /// The cache ([`KvBytes::layer_bytes`]).
     pub kv_bytes: u64,
-    /// The shadow's part of `kv_bytes`.
-    pub shadow_bytes: u64,
     pub scratch_bytes: u64,
     pub context_bytes: u64,
     /// usable − dense − experts − rounding − KV − scratch − context, usable
@@ -630,8 +630,10 @@ pub struct HostTotals {
     pub experts: u64,
     /// Row-gathered tables held on the host.
     pub table_bytes: u64,
+    /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
+    pub shadow_bytes: u64,
     pub reserve_bytes: u64,
-    /// usable − experts − tables − reserves.
+    /// usable − experts − tables − shadows − reserves.
     pub headroom_bytes: i128,
 }
 
@@ -734,7 +736,8 @@ pub enum Violation {
         total: u64,
         limit: u64,
     },
-    /// The host's tensors and reserves pass its usable bytes.
+    /// The host's tensors, the cards' ring shadows and the reserves pass its
+    /// usable bytes.
     HostOver { total: u64, usable: u64 },
 }
 
@@ -758,7 +761,7 @@ impl fmt::Display for Violation {
             ),
             Violation::HostOver { total, usable } => write!(
                 f,
-                "host: tensors + reserves = {total} B pass usable {usable} B by {} B",
+                "host: tensors + ring shadows + reserves = {total} B pass usable {usable} B by {} B",
                 total - usable
             ),
         }
@@ -1285,8 +1288,7 @@ pub fn plan_with<'a>(
             .layers
             .clone()
             .map(|l| kv.layer_bytes(l, ctx_max))
-            .sum::<u64>()
-            + shadow;
+            .sum();
         let budget = i128::from(capped(card, card_budget))
             - i128::from(kv_card)
             - i128::from(card.context_bytes)
@@ -1363,7 +1365,8 @@ fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), Plac
     }
 }
 
-/// The per-device sums of a finished set of rows.
+/// The per-device sums of a finished set of rows; `kv_bytes` is, per card,
+/// its layers' cache and their ring shadows, which the host holds.
 fn totals<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1409,7 +1412,7 @@ fn totals<'a>(
         .enumerate()
         .map(|(c, (card, heap))| {
             let rounding = heap.taken - (card_dense[c] + card_experts[c]);
-            let (kv, shadow) = kv_bytes[c];
+            let (kv, _) = kv_bytes[c];
             let used = heap.taken + kv + card.scratch_bytes + card.context_bytes;
             CardTotals {
                 dense_bytes: card_dense[c],
@@ -1417,7 +1420,6 @@ fn totals<'a>(
                 rounding_bytes: rounding,
                 experts: card.layers.clone().map(|l| n_l[l]).sum(),
                 kv_bytes: kv,
-                shadow_bytes: shadow,
                 scratch_bytes: card.scratch_bytes,
                 context_bytes: card.context_bytes,
                 headroom_bytes: i128::from(capped(card, card_budget)) - i128::from(used),
@@ -1425,6 +1427,7 @@ fn totals<'a>(
         })
         .collect();
     let reserve_bytes: u64 = machine.host.reserves.iter().map(|(_, b)| b).sum();
+    let shadow_bytes: u64 = kv_bytes.iter().map(|&(_, shadow)| shadow).sum();
     let host = HostTotals {
         expert_bytes: host_experts,
         experts: (0..model.layers)
@@ -1432,9 +1435,10 @@ fn totals<'a>(
             .map(|l| model.experts - n_l[l])
             .sum(),
         table_bytes: host_tables,
+        shadow_bytes,
         reserve_bytes,
         headroom_bytes: i128::from(machine.host.usable_bytes)
-            - i128::from(host_experts + host_tables + reserve_bytes),
+            - i128::from(host_experts + host_tables + shadow_bytes + reserve_bytes),
     };
     Plan {
         model,
@@ -1463,7 +1467,8 @@ impl Plan<'_> {
     /// its resident bytes; a card holds only what its stage uses; the granules
     /// of its uploads + KV + scratch + context ≤ usable − margin on each card,
     /// usable capped by the card budget;
-    /// the host's tensors and reserves ≤ its usable bytes.
+    /// the host's tensors, the cards' ring shadows and the reserves ≤ its
+    /// usable bytes.
     pub fn violations(&self) -> Vec<Violation> {
         let (model, cards) = (self.model, &self.machine.cards);
         let mut out = Vec::new();
@@ -1523,7 +1528,9 @@ impl Plan<'_> {
             }
         }
         let host = &self.machine.host;
-        let total = host_resident + host.reserves.iter().map(|(_, b)| b).sum::<u64>();
+        let total = host_resident
+            + self.host.shadow_bytes
+            + host.reserves.iter().map(|(_, b)| b).sum::<u64>();
         if total > host.usable_bytes {
             out.push(Violation::HostOver {
                 total,

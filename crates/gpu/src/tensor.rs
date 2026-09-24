@@ -64,6 +64,34 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         Ok(DeviceTensor { buf, rows, cols })
     }
 
+    /// A `rows × cols` tensor over memory it does not own, for a launcher
+    /// that takes a tensor: [`window`] with a shape. Give it back with
+    /// [`DeviceTensor::release`].
+    ///
+    /// # Safety
+    ///
+    /// [`window`]'s contract, for the `rows * cols` `T` at `ptr`.
+    pub unsafe fn window(
+        ptr: sys::CUdeviceptr,
+        rows: usize,
+        cols: usize,
+        ctx: &Arc<CudaContext>,
+    ) -> ManuallyDrop<DeviceTensor<T>> {
+        // SAFETY: the span is the caller's, under `window`'s contract.
+        let buf = unsafe { window::<T>(ptr, rows * cols, ctx) };
+        ManuallyDrop::new(DeviceTensor {
+            buf: ManuallyDrop::into_inner(buf),
+            rows,
+            cols,
+        })
+    }
+
+    /// Give back a [`DeviceTensor::window`]: its handle on the context is
+    /// dropped and no memory is freed.
+    pub fn release(t: ManuallyDrop<DeviceTensor<T>>) {
+        drop(ManuallyDrop::into_inner(t).buf.into_raw_parts());
+    }
+
     /// Row count.
     pub fn rows(&self) -> usize {
         self.rows

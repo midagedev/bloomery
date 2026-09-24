@@ -16,7 +16,9 @@
 //!   hot list `BLOOMERY_HOT_LIST` names (its first `n_l` ids of the layer), or
 //!   the id prefix `[0, n_l)` when it is unset — not from the plan's segments.
 //! - (ii) state: per layer, the body's window ring, compressed rows, index
-//!   keys and compressor state are `KvLayout`'s bytes for the layer, exactly.
+//!   keys and compressor state are `KvLayout`'s bytes for the layer, exactly;
+//!   its ring shadow is `KvLayout`'s shadow bytes, and the page-locked host
+//!   allocation that holds the shadows is the plan's host shadow term.
 //! - (iii) image: at the decode-step sets' positions (4, 301 and 1,025) the
 //!   host plan's step, with an embedding row and engram rows of a known
 //!   pattern, is built into the step image, uploaded by the body's refresh
@@ -29,8 +31,9 @@
 //!   seeding a depth refuses.
 //! - (v) reload: a probe context holds the card across two loads; the first
 //!   model's drop gives back everything but what its chain capture took from
-//!   the context (iv), the second load takes exactly what the first took, and
-//!   its drop gives back all of it.
+//!   the context (iv) and, when the body held page-locked shadows, the one
+//!   2 MiB mapping granule that capture keeps; the second load takes what the
+//!   first took less that granule, and its drop gives back all of it.
 //! - (vi) slots: on every layer's routed stacks, at slots 0, n/2 and n − 1,
 //!   the stack's `_sel` gemv (`q3k_gemv_sel`, `q4k_gemv_sel`) is bit for bit
 //!   the plain gemv of an upload of just that slot's expert's rows from the
@@ -92,6 +95,10 @@ mod gate {
     /// The serving context: the plan's and both loads'.
     const CTX_MAX: u64 = workstation::CTX_MAX;
 
+    /// The device granule a page-locked allocation of the shadows' size takes
+    /// from the card (check v).
+    const PINNED_GRANULE: i128 = 2 << 20;
+
     pub fn run() -> Result<(), GateError> {
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
@@ -134,6 +141,7 @@ mod gate {
         let mut m = load(&path, 1)?;
         let free1 = free(&probe)?;
         let mut ok = true;
+        let shadow_host;
         {
             let w = m.stages()[0]
                 .weights()
@@ -145,7 +153,8 @@ mod gate {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_load")?;
             ok &= check_slots(&plan, &lists, hot.is_some(), body, gpu.stream())?;
             ok &= check_sel(&plan, &lists, &path, gpu, w)?;
-            ok &= check_state(&inputs.kv, body);
+            ok &= check_state(&inputs.kv, &plan, body);
+            shadow_host = body.shadow_host().bytes;
             ok &= check_image(&planner, &specs, body, gpu.stream())?;
         }
         let (refusals_ok, captured) = check_refusals(&mut m, &probe)?;
@@ -156,7 +165,7 @@ mod gate {
         let free3 = free(&probe)?;
         drop(m);
         let free4 = free(&probe)?;
-        ok &= check_reload([free0, free1, free2, free3, free4], captured);
+        ok &= check_reload([free0, free1, free2, free3, free4], captured, shadow_host);
 
         if !ok {
             return Err(checks_failed());
@@ -167,7 +176,8 @@ mod gate {
              `_sel` gemv its expert's own; every layer's state is KvLayout's bytes; the step image \
              at positions 4, 301 and 1025 reads back as the plan's integers and RopeTable's \
              tables; the chain captures and a synthetic depth refuses; a second load takes what \
-             the first took and each drop gives back all but the context's capture",
+             the first took and each drop gives back all but the context's capture (and the \
+             page-locked shadows' granule it keeps)",
             hot.map_or("the id prefix".to_string(), |h| format!(
                 "hot list {}",
                 h.path()
@@ -575,9 +585,11 @@ mod gate {
     }
 
     /// Check (ii): each layer's cache and compressor bytes, measured from the
-    /// body's buffers, are `KvLayout`'s for the layer.
-    fn check_state(kv: &KvLayout, body: &Body) -> bool {
-        let mut ok = true;
+    /// body's buffers, are `KvLayout`'s for the layer; each layer's ring
+    /// shadow is `KvLayout`'s shadow bytes, and the host allocation holding
+    /// them all is the plan's host shadow term.
+    fn check_state(kv: &KvLayout, plan: &Plan, body: &Body) -> bool {
+        let mut ok = check_shadows(kv, plan, body);
         let (mut got_all, mut want_all) = (0u64, 0u64);
         let mut per_buffer: Vec<(&str, u64)> = Vec::new();
         for l in body.layers() {
@@ -634,6 +646,39 @@ mod gate {
             body.resident_bytes()
         );
         ok
+    }
+
+    /// Check (ii)'s shadow half: per layer, the body's shadow bytes against
+    /// `KvLayout`'s, and the page-locked allocation against the plan's host
+    /// term.
+    fn check_shadows(kv: &KvLayout, plan: &Plan, body: &Body) -> bool {
+        let mut bad: Vec<String> = Vec::new();
+        let mut want_all = 0u64;
+        for l in body.layers() {
+            let want = kv.shadow_bytes(l, CTX_MAX);
+            want_all += want;
+            match body.shadow_bytes(l) {
+                Some(got) if got as u64 == want => {}
+                got => bad.push(format!("layer {l}: body {got:?} B, KvLayout {want} B")),
+            }
+        }
+        let host = body.shadow_host();
+        let host_ok = host.bytes as u64 == plan.host.shadow_bytes && host.bytes as u64 == want_all;
+        let pass = bad.is_empty() && host_ok;
+        println!(
+            "check ii shadows: {} layers at {} B each per KvLayout, {want_all} B; the page-locked \
+             allocation {} B (unified_addressing={}), the plan's host term {} B: {}",
+            body.layers().len(),
+            kv.shadow_bytes(body.layers().start, CTX_MAX),
+            host.bytes,
+            host.unified_addressing,
+            plan.host.shadow_bytes,
+            verdict(pass)
+        );
+        for b in &bad {
+            println!("FAIL: check ii shadows {b}");
+        }
+        pass
     }
 
     /// The step a decode-step set holds: its sequence (`# tokens`) and the
@@ -905,10 +950,24 @@ mod gate {
     /// drop does not return and a second capture takes 0 (measured in the
     /// b5step round); before the chain captured, the pin was "every drop
     /// returns everything".
-    fn check_reload([before, first, dropped, second, end]: [u64; 5], captured: u64) -> bool {
+    /// PIN(2026-09-24): a page-locked allocation of the shadows' size takes one
+    /// 2 MiB device granule, and a device allocation made after it and alive
+    /// past its free keeps that granule (probe `pinprobe2.py`, shadowhost
+    /// round): with shadows and a capture, the first drop leaves the capture
+    /// plus exactly that granule, and the second load finds it mapped.
+    fn check_reload(
+        [before, first, dropped, second, end]: [u64; 5],
+        captured: u64,
+        shadow_host: usize,
+    ) -> bool {
         let took = |a: u64, b: u64| i128::from(a) - i128::from(b);
-        let pass = took(before, dropped) == i128::from(captured)
-            && took(dropped, second) == took(before, first)
+        let granule: i128 = if shadow_host > 0 && captured > 0 {
+            PINNED_GRANULE
+        } else {
+            0
+        };
+        let pass = took(before, dropped) == i128::from(captured) + granule
+            && took(dropped, second) == took(before, first) - granule
             && end == dropped;
         println!(
             "check v: free {before} B before, {first} after load 1 (took {}), {dropped} after its drop \
@@ -922,10 +981,12 @@ mod gate {
         );
         if !pass {
             println!(
-                "FAIL: check v: the first drop left {} B taken besides the capture's {captured}, the \
-                 second load took {} B more than the first, the second drop left {} B taken",
+                "FAIL: check v: the first drop left {} B taken besides the capture's {captured} \
+                 (allowed {granule}: the shadows' {shadow_host} B page-locked), the second load \
+                 took {} B more than the first (allowed {}), the second drop left {} B taken",
                 took(before, dropped) - i128::from(captured),
                 took(dropped, second) - took(before, first),
+                -granule,
                 took(dropped, end)
             );
         }
