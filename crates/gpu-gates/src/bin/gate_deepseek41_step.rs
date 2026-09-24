@@ -106,7 +106,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_shadow.rs"]
+mod shadow;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
+    use crate::shadow;
     use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,9 +134,9 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, data_dir, ds41_meta,
-        ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32, topk_ids_logical_within,
-        verdict, widened_f16_rows_in,
+        GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, data_dir, ref_ints,
+        ref_tensor_logical_in, ref_tensor_of_in, split_f32, topk_ids_logical_within, verdict,
+        widened_f16_rows_in,
     };
     use cuda_core::sys;
     use gguf::quant::half_to_f32;
@@ -1054,9 +1059,9 @@ mod gate {
 
     /// Q1: the kernels between each layer's go and its wait — the host leg's
     /// shadow — are exactly the table's, in order: the MoE piece's own
-    /// ([`ds41_meta::shadow_kernels`], with card experts or without) and, on
+    /// ([`shadow::shadow_kernels`], with card experts or without) and, on
     /// the layer before each engram site, that site's token-only work
-    /// ([`ds41_meta::engram_kv_kernels`]), which reads the step image alone and is first read
+    /// ([`shadow::engram_kv_kernels`]), which reads the step image alone and is first read
     /// by the site layer's engram step. Also: no engram site's token-only
     /// work runs outside a shadow. Needs the overlap lever on (the default):
     /// off, each wait sits right after its go and every shadow is empty.
@@ -1117,7 +1122,7 @@ mod gate {
         let sites = &hp.engram.layer_ids;
         let mut kv_lists: Vec<Vec<&str>> = Vec::new();
         for &site in sites {
-            let k = ds41_meta::engram_kv_kernels(split, site)?;
+            let k = shadow::engram_kv_kernels(split, site)?;
             if !kv_lists.contains(&k) {
                 kv_lists.push(k);
             }
@@ -1128,9 +1133,9 @@ mod gate {
             let launches = body
                 .ffn_launches(l)
                 .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-            let mut want = ds41_meta::shadow_kernels(split, l, launches > 7)?;
+            let mut want = shadow::shadow_kernels(split, l, launches > 7)?;
             if sites.contains(&(l + 1)) {
-                want.extend(ds41_meta::engram_kv_kernels(split, l + 1)?);
+                want.extend(shadow::engram_kv_kernels(split, l + 1)?);
             }
             let got: Vec<&str> = nodes
                 .iter()

@@ -63,7 +63,12 @@ fn main() -> std::process::ExitCode {
 mod finite;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_shadow.rs"]
+mod shadow;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
+    use crate::shadow;
     use std::collections::BTreeMap;
 
     use bloomery_gpu::head::Head;
@@ -74,8 +79,7 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, ds41_meta, ref_tensor_of_in, verdict,
-        widened_f16_rows_in,
+        GateError, RefManifest, checks_failed, ref_tensor_of_in, verdict, widened_f16_rows_in,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -947,7 +951,7 @@ mod gate {
     }
 
     /// The shadow tables are the step gate's, from the file's types
-    /// ([`ds41_meta::shadow_kernels`], [`ds41_meta::engram_kv_kernels`]).
+    /// ([`shadow::shadow_kernels`], [`shadow::engram_kv_kernels`]).
     fn structure(
         m: &mut Deepseek41Model,
         heads: &mut [Head; PAIR_ROWS],
@@ -1077,9 +1081,9 @@ mod gate {
             let launches = body
                 .ffn_launches(l)
                 .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-            let mut want = ds41_meta::shadow_kernels(split, l, launches > 7)?;
+            let mut want = shadow::shadow_kernels(split, l, launches > 7)?;
             if sites.contains(&(l + 1)) {
-                want.extend(ds41_meta::engram_kv_kernels(split, l + 1)?);
+                want.extend(shadow::engram_kv_kernels(split, l + 1)?);
             }
             // Row 0's first go has no wait of row 1 behind it: row 1's layer
             // 0 up to its go runs there too, in the same host leg's shadow.
@@ -1106,7 +1110,7 @@ mod gate {
             .collect();
         let mut kv_lists: Vec<Vec<&str>> = Vec::new();
         for &site in sites {
-            let k = ds41_meta::engram_kv_kernels(split, site)?;
+            let k = shadow::engram_kv_kernels(split, site)?;
             if !kv_lists.contains(&k) {
                 kv_lists.push(k);
             }
