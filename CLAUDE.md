@@ -17,7 +17,7 @@ Mac에서는 `/opt/homebrew/bin/gadak`을 쓴다(PATH의 dev 빌드는 미러 �
 ## 위임
 
 ~~구현 라운드는 `outsource` 스킬로 내보낸다.~~ 2026-09-22부터 위임은 opus 서브에이전트(Agent 도구, `model:"opus"` 명시)다.
-라운드 운영(열린 카드·파동·트리아지)은 `docs/plan.md`의 「라운드 운영」, 예측·증명 규칙은 `AGENTS.md`의
+라운드 운영(파동)은 `docs/plan.md`의 「라운드 운영」, 열린 항목(카드·트리아지)은 `docs/plan-triage.md`, 예측·증명 규칙은 `AGENTS.md`의
 "Derive first, measure the gap"이 정본이다. 워크트리를 트랙마다 따로 주고, 스펙에는
 `AGENTS.md`의 해당 조항을 복사해 넣는다 — 위임받는 모델이 그 파일을 읽는다고 가정하지 않는다.
 게이트는 위임 결과를 받은 뒤 리드가 자기 소유로 다시 돌린다. 커밋·푸시는 리드 전용이다.

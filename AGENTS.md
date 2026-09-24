@@ -2,7 +2,7 @@
 
 An LLM inference engine for one workstation: Rust host, CUDA-Rust kernels
 (cuda-oxide today, cutile-rs later), AVX2 kernels for the CPU expert tier.
-Stages and gates live in `docs/plan.md`. This file is the working contract.
+The plan lives in `docs/plan.md`. This file is the working contract.
 
 ## Never
 
@@ -215,7 +215,8 @@ first suspect is a hung gate on the box, not the agent.
     tools/box.sh           the only way code reaches the workstation
     tools/gate.sh          the gate runner: 900 s bound, cargo's own exit code
     tools/gpu-gate.sh      the GPU gate runner: gate lock, 900 s bound, the binary's exit code
-    docs/plan.md           stages, gates, and the machine facts they rest on
+    docs/plan.md           what is live: state, waves, cost model, release
+    docs/facts.md          machine, model file and toolchain facts the plan rests on
     docs/plan-triage.md    open items, grouped by the round that takes them
     docs/plan-ledger.md    what is closed, moved verbatim out of plan.md
     docs/research/         sourced surveys behind the conventions here
