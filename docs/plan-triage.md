@@ -50,10 +50,15 @@
 ## 사용자 결정 대기
 
 - ~~LICENSE(MIT 유지 vs Apache-2.0, crate `license` 12개 함께)~~ MIT 유지로 결정(2026-09-25; 옮겨 온 코드 전부 MIT, Apache-2.0은 의존성 cuda-oxide·cuda-core뿐, notices에 cuda-core 항목 추가) · 공개 시점(M1 숫자만 vs M2와 함께).
-- 시팅 10의 승인(위) · 혼합 파일 삭제 시점.
-- ~~Expert Deferral(손실 기법) 켤지~~ 결정(2026-09-25): 무손실 레버(dsloop·union 계열)가 소진된 뒤 재검토하고, 같은 임대 A/B(A6000, 산문 512)에서 tok/s 이득이 **5 % 이상**이면 **옵트인 레버**(기본 off, 정확도 게이트 동반)로 넣는다; 5 % 아래면 닫는다 · 다운로드 둘(EAGLE-3 체크포인트 lmsys SpecForge-Nex 0.2B, Qwen3 IQ4_XS) · DFlash 대상(Coder-30B-A3B에 얹기 vs 드래프터 학습) · V4 R0 전체 덤프(128 GB 페이지인)와 `v4time`(각 > 30분).
-- 3090을 expert 전용 카드로(N4, +13…+20 %[유도], 설계 카드) · CPU head 묶음 타일(㉖, float 순서 M–L).
-- 박스 `user`의 ccache `base_dir`(ik 워크트리마다 콜드 빌드, 적중 1.41 %).
+- ~~시팅 10의 승인(위) · 혼합 파일 삭제 시점.~~ 결정(2026-09-25, 리드 추천대로): 시팅 10 **승인** — 파동 22 착륙 뒤 빌더가 없는 밤 자리에 CPU 잡 셋(`ik-greedy-ds41`, `ik-ppl`, `build-ref-dump-draft`)을 한 자리로; 재생성된 셋으로 `gate-gpu-dspark-graph`·greedy·ppl 게이트가 공개 파일에서 녹색이 된 커밋 뒤에 혼합 파일·`MIXED`·그 오라클 세트를 지운다.
+- ~~Expert Deferral(손실 기법) 켤지~~ 결정(2026-09-25): 무손실 레버(dsloop·union 계열)가 소진된 뒤 재검토하고, 같은 임대 A/B(A6000, 산문 512)에서 tok/s 이득이 **5 % 이상**이면 **옵트인 레버**(기본 off, 정확도 게이트 동반)로 넣는다; 5 % 아래면 닫는다.
+- ~~다운로드 둘(EAGLE-3 체크포인트 lmsys SpecForge-Nex 0.2B, Qwen3 IQ4_XS)~~ 결정(2026-09-25): EAGLE-3 0.2B는 **받는다**(작고, qwen3spec ④와 "투기 대 투기" 공개 비교의 재료); Qwen3-30B-A3B IQ4_XS는 **IQ 커널이 착륙한 뒤**(시팅 D → IQ 라운드) — 커널 작업의 재료는 박스에 있는 Coder-Next IQ4_XS로 충분하다.
+- ~~DFlash 대상(Coder-30B-A3B에 얹기 vs 드래프터 학습)~~ 결정(2026-09-25): **Coder-30B-A3B의 공개 드래프터에 얹는다**(코드 τ 6.4–8.1); 드래프터 학습은 열지 않는다(학습 파이프라인 없음, 주 단위).
+- ~~V4 R0 전체 덤프(128 GB 페이지인)와 `v4time`(각 > 30분)~~ 결정(2026-09-25): 둘 다 **승인**, 밤 자리 하나씩 — R0 덤프는 시팅 10·E21 뒤, `v4time`은 v4meta 사슬(v4card·v4comp·v4hc·v4idx·v4body)이 착륙한 뒤.
+- ~~3090을 expert 전용 카드로(N4, +13…+20 %[유도], 설계 카드) · CPU head 묶음 타일(㉖, float 순서 M–L).~~ 결정(2026-09-25): N4는 **파동 23의 설계 라운드**(코드 없음, A2-2의 2스테이지 분할과 한 카드 — 남은 유도 이득 중 가장 크다); ㉖은 **보류**(float 순서 변경, CPU 티어는 V4.1 카드 경로의 임계가 아님 — 카드로 남긴다).
+- ~~박스 `user`의 ccache `base_dir`(ik 워크트리마다 콜드 빌드, 적중 1.41 %).~~ 넣음(2026-09-25): `/home/user/.config/ccache/ccache.conf`에 `base_dir = /home/user`, `max_size = 20G`(넣기 전 적중 9.10 %, 805/8842); 다음 ik 워크트리 빌드에서 적중률을 한 번 읽는다.
+
+남은 사용자 결정: **공개 시점**(M1 숫자만 vs M2와 함께)뿐.
 
 ## 열린 항목 — 받을 라운드별
 
