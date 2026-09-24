@@ -30,8 +30,9 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    GroupInput, ShardTensor, Tensor2, Weight, matmul_q, matmul_q_group, matmul_q_group_into,
-    matmul_q_group_swiglu, matmul_q_group_swiglu_into,
+    DEFER_MAX_COLS, GroupInput, ShardTensor, Tensor2, Weight, matmul_q, matmul_q_group,
+    matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
+    matmul_q_group_swiglu_into,
 };
 use crate::profile;
 
@@ -946,6 +947,332 @@ fn serve(
     Ok(())
 }
 
+/// The most token columns one union call takes ([`experts_union_into`],
+/// [`HostLayer::experts_union_into`]).
+pub const UNION_MAX_COLS: usize = 8;
+
+/// The most distinct experts one union call serves: six columns of six
+/// routed experts each, none shared. [`UnionScratch`] holds this many
+/// experts' down outputs.
+pub const UNION_MAX: usize = 36;
+
+/// Distinct experts per dispatch pair of a union call: their gate and up
+/// fill the group bookkeeping's inline block and their downs fit the claim
+/// table, so a chunk allocates nothing and keeps the deferred claim. A call
+/// over `u` distinct experts issues `2 · ceil(u / UNION_CHUNK)` dispatches.
+pub const UNION_CHUNK: usize = EXPERTS_INTO_MAX;
+
+// A union call's slots are at most its column count wide, and the entry
+// claims slots only that wide.
+const _: () = assert!(UNION_MAX_COLS <= DEFER_MAX_COLS);
+
+/// A union call's plan: the distinct experts in ascending id, and per expert
+/// the columns that list it, ascending, each once.
+struct UnionPlan {
+    ids: [u32; UNION_MAX],
+    n: usize,
+    cols: [[usize; UNION_MAX_COLS]; UNION_MAX],
+    n_cols: [usize; UNION_MAX],
+}
+
+impl UnionPlan {
+    /// The plan of `lists`, or the named error of a list past
+    /// [`EXPERTS_INTO_MAX`] or a union past [`UNION_MAX`].
+    fn of(lists: &[&[(u32, f32)]]) -> Result<UnionPlan, ModelError> {
+        let mut all = [0u32; UNION_MAX_COLS * EXPERTS_INTO_MAX];
+        let mut len = 0;
+        for list in lists {
+            if list.len() > EXPERTS_INTO_MAX {
+                return Err(ModelError::Shape {
+                    what: "host union: at most EXPERTS_INTO_MAX experts per column",
+                    want_ne0: EXPERTS_INTO_MAX,
+                    want_ne1: 1,
+                    got_ne0: list.len(),
+                    got_ne1: 1,
+                });
+            }
+            for &(e, _) in *list {
+                all[len] = e;
+                len += 1;
+            }
+        }
+        let all = &mut all[..len];
+        all.sort_unstable();
+        let mut plan = UnionPlan {
+            ids: [0; UNION_MAX],
+            n: 0,
+            cols: [[0; UNION_MAX_COLS]; UNION_MAX],
+            n_cols: [0; UNION_MAX],
+        };
+        let mut distinct = 0;
+        for (i, &e) in all.iter().enumerate() {
+            if i > 0 && all[i - 1] == e {
+                continue;
+            }
+            if distinct < UNION_MAX {
+                plan.ids[distinct] = e;
+            }
+            distinct += 1;
+        }
+        if distinct > UNION_MAX {
+            return Err(ModelError::Shape {
+                what: "host union: at most UNION_MAX distinct experts",
+                want_ne0: UNION_MAX,
+                want_ne1: lists.len(),
+                got_ne0: distinct,
+                got_ne1: lists.len(),
+            });
+        }
+        plan.n = distinct;
+        for (j, list) in lists.iter().enumerate() {
+            for &(e, _) in *list {
+                let d = plan.slot(e);
+                let m = plan.n_cols[d];
+                // Columns arrive ascending, so a repeat within one list is
+                // the last one pushed.
+                if m == 0 || plan.cols[d][m - 1] != j {
+                    plan.cols[d][m] = j;
+                    plan.n_cols[d] = m + 1;
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// The distinct index of an expert the lists name.
+    fn slot(&self, e: u32) -> usize {
+        self.ids[..self.n]
+            .binary_search(&e)
+            .expect("every listed expert is in the union")
+    }
+
+    /// The columns that list distinct expert `d`.
+    fn cols(&self, d: usize) -> &[usize] {
+        &self.cols[d][..self.n_cols[d]]
+    }
+}
+
+/// The blocks a union call writes, made once for a layer shape and held
+/// across calls, so a call allocates nothing: the gate, up and combine
+/// blocks of one chunk of [`UNION_CHUNK`] experts, reused chunk after chunk,
+/// and the down output of every distinct expert, kept until the list-order
+/// sums at the end. Every block holds [`UNION_MAX_COLS`] columns and a call
+/// narrows it in place to the columns that list its expert.
+pub struct UnionScratch {
+    embd: usize,
+    ff: usize,
+    /// `[gate_0, up_0, gate_1, up_1, ..]` of the chunk, `{ff, m}` each.
+    gate_up: [Tensor2; 2 * UNION_CHUNK],
+    /// The chunk's combines, `{ff, m}` each.
+    pars: [Tensor2; UNION_CHUNK],
+    /// Every distinct expert's down output, ascending id, `{embd, m}` each.
+    downs: [Tensor2; UNION_MAX],
+}
+
+impl UnionScratch {
+    /// Blocks for experts that map `embd -> ff -> embd`.
+    pub fn new(embd: usize, ff: usize) -> UnionScratch {
+        UnionScratch {
+            embd,
+            ff,
+            gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, UNION_MAX_COLS)),
+            pars: std::array::from_fn(|_| Tensor2::zeros(ff, UNION_MAX_COLS)),
+            downs: std::array::from_fn(|_| Tensor2::zeros(embd, UNION_MAX_COLS)),
+        }
+    }
+}
+
+/// The union call's shape conditions, each its own error: at most
+/// [`UNION_MAX_COLS`] columns, one list per column of `x`, `out` holding
+/// every column's width, and the scratch made for the block's widths.
+fn check_union_call(
+    x: &Tensor2,
+    lists: &[&[(u32, f32)]],
+    out: &[f32],
+    ff: usize,
+    scratch: &UnionScratch,
+) -> Result<(), ModelError> {
+    if x.ne1 > UNION_MAX_COLS {
+        return Err(ModelError::Shape {
+            what: "host union: at most UNION_MAX_COLS columns",
+            want_ne0: x.ne0,
+            want_ne1: UNION_MAX_COLS,
+            got_ne0: x.ne0,
+            got_ne1: x.ne1,
+        });
+    }
+    if x.ne1 != lists.len() {
+        return Err(ModelError::Shape {
+            what: "host union: x must have one column per list",
+            want_ne0: x.ne0,
+            want_ne1: lists.len(),
+            got_ne0: x.ne0,
+            got_ne1: x.ne1,
+        });
+    }
+    if out.len() != x.ne0 * x.ne1 {
+        return Err(ModelError::Shape {
+            what: "host union: out must hold every column's width",
+            want_ne0: x.ne0,
+            want_ne1: x.ne1,
+            got_ne0: out.len(),
+            got_ne1: 1,
+        });
+    }
+    if (scratch.embd, scratch.ff) != (x.ne0, ff) {
+        return Err(ModelError::Shape {
+            what: "host union: the scratch must be made for the block's widths",
+            want_ne0: x.ne0,
+            want_ne1: ff,
+            got_ne0: scratch.embd,
+            got_ne1: scratch.ff,
+        });
+    }
+    Ok(())
+}
+
+/// The host leg of `k` tokens over the union of their experts: column `j`
+/// of `out` (`out[j·embd..(j+1)·embd]`) is exactly what [`serve`] writes for
+/// column `j` of `x` and `lists[j]`, bit for bit. The distinct experts, in
+/// ascending id, run in chunks of [`UNION_CHUNK`]: one group dispatch for the
+/// chunk's gates and ups, each pair over the columns that list its expert
+/// ([`GroupInput::Cols`] of the one `x`: every column quantized alone, by the
+/// weight type's rule, as the one-column call quantizes it), then one for
+/// their downs over those columns' combines. Each weight row is read once
+/// per call and dotted with the same `dot_row` against each listed column.
+/// The downs of every chunk are kept, and each column's sum runs last, in
+/// that column's list order from zero — the order its one-column call adds
+/// in. `resolve` gives an expert's `[gate, up, down]`; `lists` has been
+/// checked against `x`, `out` and the scratch.
+fn serve_union<'w>(
+    resolve: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+    limit: Option<f32>,
+    x: &Tensor2,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    s: &mut UnionScratch,
+) -> Result<(), ModelError> {
+    let plan = UnionPlan::of(lists)?;
+    let lvl = profile::level();
+    let (mut x_ns, mut h_ns) = (0u64, 0u64);
+    let n_chunks = plan.n.div_ceil(UNION_CHUNK);
+    let per = if n_chunks == 0 {
+        0
+    } else {
+        plan.n.div_ceil(n_chunks)
+    };
+    for c in 0..n_chunks {
+        let (a, b) = (c * per, ((c + 1) * per).min(plan.n));
+        let n = b - a;
+        // The unused tails keep the chunk's first expert's gate; only the
+        // first n (2n) are passed.
+        let first = resolve(plan.ids[a])?[0];
+        let mut gu = [first; 2 * UNION_CHUNK];
+        let mut down = [first; UNION_CHUNK];
+        let mut srcs: [GroupInput<'_>; 2 * UNION_CHUNK] =
+            [GroupInput::Cols(x, &[]); 2 * UNION_CHUNK];
+        for i in 0..n {
+            let d = a + i;
+            let [g, u, dw] = resolve(plan.ids[d])?;
+            gu[2 * i] = g;
+            gu[2 * i + 1] = u;
+            down[i] = dw;
+            let cols = plan.cols(d);
+            srcs[2 * i] = GroupInput::Cols(x, cols);
+            srcs[2 * i + 1] = GroupInput::Cols(x, cols);
+            s.gate_up[2 * i].set_cols(cols.len());
+            s.gate_up[2 * i + 1].set_cols(cols.len());
+            s.pars[i].set_cols(cols.len());
+            s.downs[d].set_cols(cols.len());
+        }
+        let gt = matmul_q_group_cols_into(
+            "host_gate_up",
+            &gu[..2 * n],
+            &srcs[..2 * n],
+            &mut s.gate_up[..2 * n],
+            &mut [],
+        )?;
+        let combines: [GroupInput<'_>; UNION_CHUNK] = std::array::from_fn(|i| {
+            if i >= n {
+                return GroupInput::Ready(x);
+            }
+            let (gate, up) = (&s.gate_up[2 * i], &s.gate_up[2 * i + 1]);
+            match limit {
+                Some(limit) => GroupInput::SwigluClamp(gate, up, limit),
+                None => GroupInput::Swiglu(gate, up),
+            }
+        });
+        let dt = matmul_q_group_cols_into(
+            "host_down",
+            &down[..n],
+            &combines[..n],
+            &mut s.downs[a..b],
+            &mut s.pars[..n],
+        )?;
+        x_ns += gt.stage_ns;
+        h_ns += dt.stage_ns;
+    }
+    let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
+    let embd = x.ne0;
+    for (j, list) in lists.iter().enumerate() {
+        let o = &mut out[j * embd..(j + 1) * embd];
+        o.fill(0.0);
+        for &(e, w) in *list {
+            let d = plan.slot(e);
+            let t = plan
+                .cols(d)
+                .binary_search(&j)
+                .expect("a listing column is in its expert's columns");
+            for (o, &dv) in o.iter_mut().zip(s.downs[d].col(t)) {
+                *o += w * dv;
+            }
+        }
+    }
+    if let Some(t_sum) = t_sum {
+        profile::record_time("host_x_quant", x_ns);
+        profile::record_time("host_h_quant", h_ns);
+        profile::record_time("host_sum", t_sum.elapsed().as_nanos() as u64);
+    }
+    Ok(())
+}
+
+/// [`experts_into`] for up to [`UNION_MAX_COLS`] tokens at once: column `j`
+/// of `x` with its routed list `lists[j]` into `out[j·embd..(j+1)·embd]`,
+/// equal to `experts_into(x_j, lists[j])` bit for bit, while each distinct
+/// expert's matrices are read once for every column that lists it (see
+/// [`serve_union`]). A list holds at most [`EXPERTS_INTO_MAX`] experts, the
+/// union at most [`UNION_MAX`]; each bound, a list count other than `x`'s
+/// columns and an `out` of another length are named errors. The dispatches
+/// write into the caller's `scratch`, made at load for the block's widths
+/// ([`UnionScratch::new`]), so a call allocates nothing.
+pub fn experts_union_into(
+    gguf: &Gguf,
+    plan: &MoeBlockPlan,
+    x: &Tensor2,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    scratch: &mut UnionScratch,
+) -> Result<(), ModelError> {
+    check_union_call(x, lists, out, plan.meta.ff, scratch)?;
+    let view = |views: &[TensorInfo], e: u32| -> Result<Weight<'_>, ModelError> {
+        Weight::in_file(gguf, expert_of(views, e, plan.block)?)
+    };
+    serve_union(
+        |e| {
+            Ok([
+                view(&plan.gate_views, e)?,
+                view(&plan.up_views, e)?,
+                view(&plan.down_views, e)?,
+            ])
+        },
+        None,
+        x,
+        lists,
+        out,
+        scratch,
+    )
+}
+
 /// What a host tier needs to serve one layer's routed experts, in the
 /// file's own terms: the three stacks' tensor names, the expert count, the
 /// widths and the routed experts' SwiGLU limit. The architecture fills it;
@@ -1077,6 +1404,36 @@ impl HostLayer {
             Some(self.limit),
             x,
             experts,
+            out,
+            scratch,
+        )
+    }
+
+    /// [`experts_union_into`] for this layer: up to [`UNION_MAX_COLS`]
+    /// tokens, column `j` of `out` equal to [`HostLayer::experts_into`] of
+    /// column `j` of `x` and `lists[j]` bit for bit, each distinct expert's
+    /// matrices read once per call from the shard that holds them.
+    pub fn experts_union_into(
+        &self,
+        split: &Split,
+        x: &Tensor2,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        scratch: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
+        check_union_call(x, lists, out, self.gate.info().dims[1] as usize, scratch)?;
+        serve_union(
+            |e| {
+                let e = e as usize;
+                Ok([
+                    self.gate.expert(split, e)?,
+                    self.up.expert(split, e)?,
+                    self.down.expert(split, e)?,
+                ])
+            },
+            Some(self.limit),
+            x,
+            lists,
             out,
             scratch,
         )

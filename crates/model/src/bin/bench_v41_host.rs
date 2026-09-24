@@ -56,7 +56,11 @@
 //! produced must equal `qdot::swiglu` over the gate and up outputs bit for
 //! bit and sit within the band of an f64 SiLU, and the per-matrix shape must
 //! reproduce the engine shape's outputs bit for bit. A miss names the layer,
-//! the expert and the matrix, and the run exits non-zero.
+//! the expert and the matrix, and the run exits non-zero. On the same layers
+//! the union shape runs two rows — the checked token's experts, and the same
+//! set shifted by one with one expert of its own — and each row's output
+//! must equal, bit for bit, the list-order sum of the engine shape's downs
+//! for that row at the union shape's weights.
 //!
 //! `--time` (lead-only, under `tools/ref/host-rate.sh`, which owns the lease,
 //! the witnesses and the thread sweep): the check first, refusing to time if
@@ -75,6 +79,16 @@
 //! pass do and every drawn expert is read by at least one row. The dispatches
 //! still stream every row's slots; `union_bytes_per_token` is the file bytes
 //! a pass that read each distinct expert once would read.
+//!
+//! The `union` shape is that pass: per layer one
+//! `moe::HostLayer::experts_union_into` over the `rows` columns and their
+//! lists (each row's `n_host` working-set experts at weight `1 / n_host`),
+//! which reads each distinct expert once and ends in every column's weighted
+//! sum. Its layers are built with a SwiGLU limit of 0, which clamps nothing,
+//! so its combine is the plain one the other shapes run. The call is timed
+//! whole, as one `union` dispatch entry whose bytes are the layer's distinct
+//! experts; its pool dispatches are `2 · ceil(union / moe::UNION_CHUNK)` per
+//! layer.
 
 use std::ffi::{c_int, c_void};
 use std::ops::Range;
@@ -84,7 +98,10 @@ use std::time::Instant;
 
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row};
 use model::ModelError;
-use model::moe::expert_view;
+use model::moe::{
+    EXPERTS_INTO_MAX, HostLayer, HostLayerSpec, UNION_CHUNK, UNION_MAX_COLS, UnionScratch,
+    expert_view,
+};
 use model::ops::{
     GroupInput, ShardTensor, Tensor2, Weight, matmul_q, matmul_q_group_into, matmul_q_group_swiglu,
     matmul_q_group_swiglu_into,
@@ -126,7 +143,8 @@ const ENGINE_DISPATCHES: usize = 2;
 const USAGE: &str = "usage: bench_v41_host --check
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
        bench_v41_host --time ... [--union R]
-  an arm is <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]; the default is engine:6,engine:5,engine:3,per-matrix:6
+  an arm is <engine|engine-sep|union|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]; the default is engine:6,engine:5,engine:3,per-matrix:6
+  union: one union call per layer over the rows (rows <= 8, n_host <= 8)
   u<r> (or --union R for every multi-row arm without its own): the rows share experts, the layer's distinct experts
   are round(r x n_host x rows), 1/rows <= r <= 1
   the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the deepseek41 profile)";
@@ -481,6 +499,36 @@ struct Blocks {
     gu: Vec<Tensor2>,
     down: Vec<Tensor2>,
     par: Vec<Tensor2>,
+    /// The union shape's, `None` for the others.
+    union: Option<UnionBlocks>,
+}
+
+/// The union shape's blocks, made before the round's first token: activation
+/// block `o` holds the `rows` columns `(o + i) % N_X` a token reads at offset
+/// `o`, then the call's scratch and its `embd × rows` output.
+struct UnionBlocks {
+    xs: Vec<Tensor2>,
+    scratch: UnionScratch,
+    out: Vec<f32>,
+}
+
+impl UnionBlocks {
+    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize) -> UnionBlocks {
+        let xs = (0..N_X)
+            .map(|o| {
+                let mut data = Vec::with_capacity(embd * rows);
+                for i in 0..rows {
+                    data.extend_from_slice(&xs[(o + i) % N_X].data);
+                }
+                Tensor2::from_vec(embd, rows, data)
+            })
+            .collect();
+        UnionBlocks {
+            xs,
+            scratch: UnionScratch::new(embd, ff),
+            out: vec![0.0; embd * rows],
+        }
+    }
 }
 
 impl Blocks {
@@ -498,8 +546,39 @@ impl Blocks {
             gu: take(n_gate, 2 * slots),
             down: take(n_down, slots),
             par: take(n_gate, slots),
+            union: None,
         })
     }
+}
+
+/// The union shape: one `HostLayer::experts_union_into` over the token's
+/// rows, row `i` listing its `n_host` slots' experts at weight `1 / n_host`.
+/// Tallied whole, under the bytes of the layer's distinct experts.
+#[allow(clippy::too_many_arguments)]
+fn union_layer(
+    host: &HostLayer,
+    split: &Split,
+    l: &Layer<'_>,
+    slots: &[usize],
+    n_host: usize,
+    distinct: usize,
+    u: &mut UnionBlocks,
+    x: usize,
+    tally: &mut Tally,
+) -> Result<(), ModelError> {
+    let w = 1.0 / n_host as f32;
+    let mut buf = [[(0u32, 0.0f32); EXPERTS_INTO_MAX]; UNION_MAX_COLS];
+    for (row, run) in buf.iter_mut().zip(slots.chunks_exact(n_host)) {
+        for (entry, &s) in row.iter_mut().zip(run) {
+            *entry = (l.experts[s].id as u32, w);
+        }
+    }
+    let lists: [&[(u32, f32)]; UNION_MAX_COLS] = std::array::from_fn(|i| &buf[i][..n_host]);
+    let rows = slots.len() / n_host;
+    let t0 = Instant::now();
+    host.experts_union_into(split, &u.xs[x], &lists[..rows], &mut u.out, &mut u.scratch)?;
+    tally.add("union", distinct as u64 * l.expert_bytes(), t0);
+    Ok(())
 }
 
 /// The engine's shape: gate and up of every expert in one group, the
@@ -1379,6 +1458,54 @@ fn check_swiglu(
 
 /// The check of one layer for one token: both shapes' outputs bit-equal,
 /// then every expert's gate, up, combine and down.
+/// The union shape against the engine shape on layer `l`: two rows over
+/// `xs[li % N_X]` and the next column, row 0 listing `slots`, row 1 the same
+/// set shifted by one with one working-set expert neither lists. Each row's
+/// output must equal the list-order sum from zero of the engine shape's downs
+/// for that row, at weight `1 / n`, bit for bit.
+fn check_union(
+    c: &mut Checks,
+    l: &Layer<'_>,
+    host: &HostLayer,
+    split: &Split,
+    slots: &[usize],
+    xs: &[Tensor2],
+) -> Result<(), BenchError> {
+    let n = slots.len();
+    let extra = (0..WORKING_SET)
+        .find(|s| !slots.contains(s))
+        .ok_or("the working set holds no expert outside the checked token's")?;
+    let mut rows: Vec<usize> = slots.to_vec();
+    rows.extend(slots[1..].iter().copied());
+    rows.push(extra);
+    let embd = xs[0].ne0;
+    let ff = l.weight(0, GATE).n();
+    let mut u = UnionBlocks::new(xs, 2, embd, ff);
+    let x0 = l.index % N_X;
+    let mut tally = Tally::default();
+    union_layer(host, split, l, &rows, n, n + 1, &mut u, x0, &mut tally)?;
+    let w = 1.0 / n as f32;
+    let mut same = true;
+    for (i, run) in rows.chunks_exact(n).enumerate() {
+        let mut b = Blocks::new(std::slice::from_ref(l), n)?;
+        engine_layer(l, run, &xs[(x0 + i) % N_X], &mut b, &mut tally)?;
+        let mut want = vec![0.0f32; embd];
+        for d in &b.down[..n] {
+            for (o, &dv) in want.iter_mut().zip(d.col(0)) {
+                *o += w * dv;
+            }
+        }
+        same &= bits_equal(&u.out[i * embd..(i + 1) * embd], &want);
+    }
+    let line = format!(
+        "check layer={} shape=union rows=2 experts={n} distinct={} outputs_bits_equal_engine_sum={same}",
+        l.index,
+        n + 1
+    );
+    c.record(format!("layer {} union", l.index), &line, same);
+    Ok(())
+}
+
 fn check_layer(
     c: &mut Checks,
     l: &Layer<'_>,
@@ -1420,12 +1547,8 @@ fn check_layer(
 }
 
 /// The whole check (see the module doc); `Ok` only when every site passed.
-fn check(
-    layers: &[Layer<'_>],
-    n_host: usize,
-    xs: &[Tensor2],
-    verbose: bool,
-) -> Result<(), BenchError> {
+fn check(bench: &Bench<'_>, n_host: usize, verbose: bool) -> Result<(), BenchError> {
+    let (layers, xs) = (&bench.layers, &bench.xs);
     let last = layers.len().saturating_sub(1);
     let covered: Vec<usize> = layers
         .iter()
@@ -1441,6 +1564,11 @@ fn check(
     for &li in &covered {
         let slots = distinct(&mut Rng::new(&[KEY_CHECK, li as u64]), n_host, WORKING_SET);
         check_layer(&mut c, &layers[li], &slots, &xs[li % N_X])?;
+        let host = bench
+            .hosts
+            .get(li)
+            .ok_or("no host layer to check the union shape")?;
+        check_union(&mut c, &layers[li], host, bench.split, &slots, xs)?;
     }
     println!(
         "check layers={covered:?} experts_per_layer={n_host} sites={} failed={} worst_rel_err={:.3e} band={BAND:e}",
@@ -1463,6 +1591,9 @@ enum Shape {
     /// With `rows > 1`: one engine-shape call per row instead of one group
     /// over every row.
     EngineSep,
+    /// One union call per layer over every row: each distinct expert read
+    /// once, every column's weighted sum at the end.
+    Union,
     /// One dispatch per expert matrix.
     PerMatrix,
     /// The engine shape's dispatches reading the file mapping, no kernel.
@@ -1472,9 +1603,10 @@ enum Shape {
 }
 
 impl Shape {
-    const ALL: [Shape; 5] = [
+    const ALL: [Shape; 6] = [
         Shape::Engine,
         Shape::EngineSep,
+        Shape::Union,
         Shape::PerMatrix,
         Shape::ReadMmap,
         Shape::ReadThp,
@@ -1484,6 +1616,7 @@ impl Shape {
         match self {
             Shape::Engine => "engine",
             Shape::EngineSep => "engine-sep",
+            Shape::Union => "union",
             Shape::PerMatrix => "per-matrix",
             Shape::ReadMmap => "read-mmap",
             Shape::ReadThp => "read-thp",
@@ -1517,7 +1650,7 @@ impl Arm {
     fn parse(s: &str, union: Option<f64>) -> Result<Arm, String> {
         let (name, n) = s.split_once(':').ok_or_else(|| {
             format!(
-                "arm {s:?}: want <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]"
+                "arm {s:?}: want <engine|engine-sep|union|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]"
             )
         })?;
         let shape = Shape::ALL
@@ -1551,6 +1684,11 @@ impl Arm {
         }
         if shape.one_row() && rows > 1 {
             return Err(format!("arm {s:?}: the {name} shape runs one row"));
+        }
+        if shape == Shape::Union && (rows > UNION_MAX_COLS || n_host > EXPERTS_INTO_MAX) {
+            return Err(format!(
+                "arm {s:?}: a union call takes at most {UNION_MAX_COLS} rows of {EXPERTS_INTO_MAX} experts"
+            ));
         }
         let slots = n_host * rows;
         let ratio = if rows > 1 { own.or(union) } else { None };
@@ -1591,8 +1729,12 @@ impl Arm {
     }
 
     /// File bytes one token of this arm's dispatches stream: every row's
-    /// slots, a shared expert once per row that reads it.
+    /// slots, a shared expert once per row that reads it — except the union
+    /// shape, which streams each distinct expert once.
     fn bytes_per_token(self, layers: &[Layer<'_>]) -> u64 {
+        if self.shape == Shape::Union {
+            return self.union_bytes_per_token(layers);
+        }
         layers
             .iter()
             .map(|l| (self.n_host * self.rows) as u64 * l.expert_bytes())
@@ -1613,6 +1755,7 @@ impl Arm {
         match self.shape {
             Shape::PerMatrix => 3 * self.n_host * layers.len(),
             Shape::EngineSep => ENGINE_DISPATCHES * self.rows * layers.len(),
+            Shape::Union => ENGINE_DISPATCHES * self.union.div_ceil(UNION_CHUNK) * layers.len(),
             Shape::Engine | Shape::ReadMmap | Shape::ReadThp => ENGINE_DISPATCHES * layers.len(),
         }
     }
@@ -1679,7 +1822,10 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
 /// working set's pages, and the bytes the read shapes read with the sink
 /// they fold into.
 struct Bench<'a> {
+    split: &'a Split,
     layers: Vec<Layer<'a>>,
+    /// Every layer as the host tier's `HostLayer`, SwiGLU limit 0.
+    hosts: Vec<HostLayer>,
     xs: Vec<Tensor2>,
     pages: Pages<'a>,
     mapped: Vec<Vec<ExpertBytes<'a>>>,
@@ -1745,6 +1891,14 @@ impl Bench<'_> {
                     }
                 }
                 Shape::Engine => engine_rows_layer(layer, slots, &xs, b, tally)?,
+                Shape::Union => {
+                    let u = b.union.as_mut().ok_or("union arm without its blocks")?;
+                    let host = self.hosts.get(l).ok_or("union arm without host layers")?;
+                    let x = (t + l) % N_X;
+                    union_layer(
+                        host, self.split, layer, slots, arm.n_host, arm.union, u, x, tally,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1762,6 +1916,11 @@ impl Bench<'_> {
         target_ms: f64,
     ) -> Result<ArmRound, BenchError> {
         let mut blocks = Blocks::new(&self.layers, arm.n_host * arm.rows)?;
+        if arm.shape == Shape::Union {
+            let embd = self.xs.first().ok_or("no activation columns")?.ne0;
+            let ff = self.layers.first().ok_or("no layers")?.weight(0, GATE).n();
+            blocks.union = Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff));
+        }
         let mut scratch = Tally::default();
         let mut warm_ms = Vec::with_capacity(warmup);
         for t in 0..warmup {
@@ -1911,6 +2070,30 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
     Ok(())
 }
 
+/// Every layer as a `HostLayer` over the same stacks, SwiGLU limit 0 (the
+/// plain combine the other shapes run).
+fn host_layers(
+    split: &Split,
+    meta: &Meta,
+    layers: &[Layer<'_>],
+) -> Result<Vec<HostLayer>, BenchError> {
+    layers
+        .iter()
+        .map(|l| {
+            let spec = HostLayerSpec {
+                gate: &l.stacks[GATE].info.name,
+                up: &l.stacks[UP].info.name,
+                down: &l.stacks[DOWN].info.name,
+                n_expert: meta.n_expert,
+                embd: meta.embd,
+                ff: meta.ff,
+                swiglu_limit: 0.0,
+            };
+            Ok(HostLayer::build(split, &spec)?)
+        })
+        .collect()
+}
+
 /// The model file: `$BLOOMERY_REF_MODEL`, which tools/box.sh exports from the
 /// model profile (empty counts as unset).
 fn model_path() -> Result<String, BenchError> {
@@ -1976,8 +2159,11 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         after as f64 * 100.0 / total as f64
     );
     print_mem()?;
+    let hosts = host_layers(&split, &meta, &layers)?;
     let bench = Bench {
+        split: &split,
         layers,
+        hosts,
         xs: activations(meta.embd),
         pages,
         mapped,
@@ -1985,7 +2171,7 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         sink: AtomicU64::new(0),
     };
     match mode {
-        Mode::Check => check(&bench.layers, meta.n_used, &bench.xs, true),
+        Mode::Check => check(&bench, meta.n_used, true),
         Mode::Time(opts) => {
             let lease = std::env::var("BLOOMERY_HOST_LEASE").is_ok_and(|v| v == "1");
             if !lease {
@@ -1993,7 +2179,7 @@ fn run(mode: Mode) -> Result<(), BenchError> {
                     "[not under lease] — run through tools/ref/host-rate.sh; these numbers are not admissible"
                 );
             }
-            check(&bench.layers, meta.n_used, &bench.xs, false)?;
+            check(&bench, meta.n_used, false)?;
             time(&bench, &opts, lease)
         }
     }

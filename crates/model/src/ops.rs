@@ -211,6 +211,23 @@ impl Tensor2 {
     pub fn col_mut(&mut self, i: usize) -> &mut [f32] {
         &mut self.data[i * self.ne0..(i + 1) * self.ne0]
     }
+
+    /// Give the block `ne1` columns of its `ne0` in place, inside the capacity
+    /// it was made with, so a block made once for its widest use serves
+    /// narrower calls without a take. Cells past the old length are stale
+    /// zeros (NaN under `BLOOMERY_POISON`); the caller writes every cell it
+    /// reads. Growing past the capacity would allocate and panics instead.
+    pub(crate) fn set_cols(&mut self, ne1: usize) {
+        let n = self.ne0 * ne1;
+        assert!(
+            n <= self.data.capacity(),
+            "Tensor2::set_cols: {ne1} columns of {} past the block's capacity {}",
+            self.ne0,
+            self.data.capacity()
+        );
+        self.data.resize(n, if poison() { f32::NAN } else { 0.0 });
+        self.ne1 = ne1;
+    }
 }
 
 /// An f32 tensor straight from the file — norm gains, router biases, anything the quantizer left alone; the crate's one little-endian byte walk.
@@ -482,11 +499,18 @@ pub fn matmul_q_group(
 }
 
 /// One pair's input for [`matmul_q_group_swiglu`] and
-/// [`matmul_q_group_swiglu_into`]: a ready activation block, or the SwiGLU
-/// pair whose combine is the input.
+/// [`matmul_q_group_swiglu_into`]: a ready activation block, some of a ready
+/// block's columns, or the SwiGLU pair whose combine is the input.
 #[derive(Clone, Copy)]
 pub enum GroupInput<'a> {
     Ready(&'a Tensor2),
+    /// (`x`, `cols`) — the pair's output column `t` is its weight times
+    /// column `cols[t]` of `x`. `x` is quantized once, whole, like a ready
+    /// block, and every pair that reads it shares that one quantization; a
+    /// column past `x` is refused by name. The row loop dots each weight row
+    /// against the listed columns only, so pairs of one expert over
+    /// different token subsets read the weight once each.
+    Cols(&'a Tensor2, &'a [usize]),
     /// (`gate`, `up`) — `silu(gate) · up` feeds the pair's weight.
     Swiglu(&'a Tensor2, &'a Tensor2),
     /// (`gate`, `up`, `limit`) — `clamp(up, ±limit) · min(silu(gate), limit)`
@@ -500,16 +524,30 @@ impl<'a> GroupInput<'a> {
     /// the gate the combine is made from.
     fn shape_of(self) -> &'a Tensor2 {
         match self {
-            GroupInput::Ready(x) => x,
+            GroupInput::Ready(x) | GroupInput::Cols(x, _) => x,
             GroupInput::Swiglu(gate, _) | GroupInput::SwigluClamp(gate, _, _) => gate,
         }
+    }
+
+    /// The column map of a [`GroupInput::Cols`] input; `None` reads every
+    /// column in order.
+    fn cols(self) -> Option<&'a [usize]> {
+        match self {
+            GroupInput::Cols(_, cols) => Some(cols),
+            _ => None,
+        }
+    }
+
+    /// The columns the pair's output has.
+    fn out_cols(self) -> usize {
+        self.cols().map_or(self.shape_of().ne1, <[usize]>::len)
     }
 
     /// The combine this input stands for — gate, up and the clamp limit — or
     /// `None` for a ready block.
     fn combine(self) -> Option<(&'a Tensor2, &'a Tensor2, Option<f32>)> {
         match self {
-            GroupInput::Ready(_) => None,
+            GroupInput::Ready(_) | GroupInput::Cols(..) => None,
             GroupInput::Swiglu(gate, up) => Some((gate, up, None)),
             GroupInput::SwigluClamp(gate, up, limit) => Some((gate, up, Some(limit))),
         }
@@ -528,8 +566,8 @@ impl<'a> GroupInput<'a> {
 /// group takes the ordinary pre-pass.
 ///
 /// Returns the outputs and the produced `par` blocks — one per combine
-/// input, pair order. A `Ready` input's block is the caller's own and is
-/// not returned.
+/// input, pair order. A `Ready` or `Cols` input's block is the caller's own
+/// and is not returned.
 pub fn matmul_q_group_swiglu(
     gguf: &Gguf,
     ws: &[&TensorInfo],
@@ -544,6 +582,7 @@ pub fn matmul_q_group_swiglu(
             outs: &mut outs,
             pars: &mut pars,
         },
+        1,
     )?;
     Ok((outs, pars))
 }
@@ -738,6 +777,7 @@ pub fn matmul_q_group_into(
             outs,
             pars: &mut [],
         },
+        1,
     )
 }
 
@@ -756,6 +796,37 @@ pub fn matmul_q_group_swiglu_into(
         Weights::Resolved(ws),
         Inputs::Mixed(srcs),
         Dest::Into { site, outs, pars },
+        1,
+    )
+}
+
+/// The most columns a slot of [`matmul_q_group_cols_into`] may carry and
+/// still be claimed inside the dispatch: a claim quantizes (and combines)
+/// the whole slot, so this bounds how long a row waits on one.
+pub const DEFER_MAX_COLS: usize = 8;
+
+/// [`matmul_q_group_swiglu_into`] for the few-column shape — a union of
+/// experts over up to [`DEFER_MAX_COLS`] tokens, its inputs
+/// [`GroupInput::Cols`] of one block or combines of a few columns each.
+/// With the deferral lever on, a slot of up to that many columns is claimed
+/// whole by one participant of the row dispatch (its combine, then each of
+/// its columns quantized on its own) instead of the caller combining and the
+/// pool pre-quantizing. The other entries keep the claim to one-column slots,
+/// so a prefill group of a few tokens runs as before. Values are the
+/// pre-pass arm's, bit for bit: only who runs the combine and the encoder
+/// changes.
+pub fn matmul_q_group_cols_into(
+    site: &'static str,
+    ws: &[Weight<'_>],
+    srcs: &[GroupInput<'_>],
+    outs: &mut [Tensor2],
+    pars: &mut [Tensor2],
+) -> Result<GroupTimes, crate::ModelError> {
+    group_core(
+        Weights::Resolved(ws),
+        Inputs::Mixed(srcs),
+        Dest::Into { site, outs, pars },
+        DEFER_MAX_COLS,
     )
 }
 
@@ -874,11 +945,13 @@ fn combine_timed(gate: &Tensor2, up: &Tensor2, limit: Option<f32>) -> (Tensor2, 
 /// The group engine every multi-pair entry rides: per pair the input-width
 /// check, the fused decision, the combine's par (produced by a claimant or
 /// here), the slot and the output block; then `run_group` and the profiler
-/// rows.
+/// rows. `defer_cols` is the widest slot the deferred claim may take: 1 for
+/// every entry but [`matmul_q_group_cols_into`].
 fn group_core(
     ws: Weights<'_>,
     inputs: Inputs<'_, '_>,
     dest: Dest<'_>,
+    defer_cols: usize,
 ) -> Result<GroupTimes, crate::ModelError> {
     let n_pairs = ws.len();
     if n_pairs != inputs.len() {
@@ -907,7 +980,7 @@ fn group_core(
         Inputs::Mixed(srcs) => {
             defer_quant()
                 && n_pairs <= MAX_DEFER_SLOTS
-                && srcs.iter().all(|s| s.shape_of().ne1 == 1)
+                && srcs.iter().all(|s| s.shape_of().ne1 <= defer_cols)
         }
     };
     let (site, mut sink) = match dest {
@@ -943,6 +1016,7 @@ fn group_core(
     let mut bytes: Flex<&[u8]> = Flex::new();
     let mut meta: Flex<PairMeta> = Flex::new();
     let mut slot_of: Flex<usize> = Flex::new();
+    let mut cols_of: Flex<Option<&[usize]>> = Flex::new();
     let mut slots: Flex<QuantSlot> = Flex::new();
     let mut caller_combine_ns: u64 = 0;
     let mut j = 0usize;
@@ -959,12 +1033,25 @@ fn group_core(
                 got_ne1: xin.ne1,
             });
         }
+        if let Some(&c) = src
+            .cols()
+            .and_then(|cols| cols.iter().find(|&&c| c >= xin.ne1))
+        {
+            return Err(crate::ModelError::Shape {
+                what: "group cols: a listed column past the block",
+                want_ne0: k,
+                want_ne1: xin.ne1,
+                got_ne0: k,
+                got_ne1: c,
+            });
+        }
+        let out_cols = src.out_cols();
         let b = ws.bytes(i)?;
         // Fused path decided per pair, exactly the single-pair rule: qdot
         // dots the quantized codes directly, so activations are quantized
-        // into `qdot::quantize_col`'s layout, and `k_granularity` owns the
+        // into `qdot::quantize_col`'s layout, and `qdot::fuses` owns the
         // per-type block contract (256 for the K-quants, 32 for Q5_0/Q5_1).
-        let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
+        let fused = qdot::fuses(ty, k);
         let cb = if fused {
             Some(qdot::col_bytes(ty, k))
         } else {
@@ -1101,15 +1188,16 @@ fn group_core(
             row_bytes: b.len() / n,
         });
         slot_of.push(slot);
+        cols_of.push(src.cols());
         match &mut sink {
-            Sink::Alloc { outs, .. } => outs.push(Tensor2::scratch(n, xin.ne1)),
+            Sink::Alloc { outs, .. } => outs.push(Tensor2::scratch(n, out_cols)),
             Sink::Into { outs, .. } => {
                 let o = &outs[i];
-                if (o.ne0, o.ne1, o.data.len()) != (n, xin.ne1, n * xin.ne1) {
+                if (o.ne0, o.ne1, o.data.len()) != (n, out_cols, n * out_cols) {
                     return Err(crate::ModelError::Shape {
                         what: "group into out",
                         want_ne0: n,
-                        want_ne1: xin.ne1,
+                        want_ne1: out_cols,
                         got_ne0: o.ne0,
                         got_ne1: o.ne1,
                     });
@@ -1124,7 +1212,19 @@ fn group_core(
         Sink::Into { outs, .. } => outs,
     };
     // SAFETY: the construction-site argument in `run_group`'s pair build.
-    let rt = run_group(&slots, &slot_of, &bytes, &meta, outs, lvl, &mut pacc, defer)?;
+    let rt = run_group(
+        &slots,
+        &PairMap {
+            slot_of: &slot_of,
+            cols_of: &cols_of,
+        },
+        &bytes,
+        &meta,
+        outs,
+        lvl,
+        &mut pacc,
+        defer.then_some(defer_cols),
+    )?;
     // What the rows leave out: the combines, which the allocating entry's
     // `swiglu` site records; or the whole activation stage, which an `_into`
     // caller records.
@@ -1305,6 +1405,11 @@ struct PairWork<'a> {
     /// Scalar-path f32 round trip; null on the fused path. Same raw-parts
     /// contract as `fused_cols`.
     q_f32: *const f32,
+    /// The slot's columns — what `fused_cols` / `q_f32` hold.
+    src_ne1: usize,
+    /// Output column `t` reads slot column `cols[t]`; `None` is `t` itself.
+    cols: Option<&'a [usize]>,
+    /// Output columns.
     ne1: usize,
     out: SharedOut,
     /// The slot whose columns this pair reads, and the claim table when
@@ -1335,15 +1440,17 @@ struct PairMeta {
 impl<'a> PairWork<'a> {
     /// The one construction path both dispatch shapes ride; the SAFETY
     /// argument for the output pointer lives at the callers, where the split
-    /// is decided.
+    /// is decided. `src` is the slot's write view, its column count and the
+    /// pair's column map.
     fn new(
         out: &mut Tensor2,
         bytes: &'a [u8],
-        q: SharedQuantCols,
+        src: (SharedQuantCols, usize, Option<&'a [usize]>),
         m: PairMeta,
         slot: usize,
         defer: Option<&'a DeferredSlots<'a>>,
     ) -> PairWork<'a> {
+        let (q, src_ne1, cols) = src;
         let out_ptr = SharedOut(out.data.as_mut_ptr());
         let (fused_cols, q_f32) = match q {
             SharedQuantCols::Bytes { cb, ptr } => (Some((cb, ptr as *const u8)), std::ptr::null()),
@@ -1357,10 +1464,21 @@ impl<'a> PairWork<'a> {
             row_bytes: m.row_bytes,
             fused_cols,
             q_f32,
+            src_ne1,
+            cols,
             ne1: out.ne1,
             out: out_ptr,
             slot,
             defer,
+        }
+    }
+
+    /// The slot column output column `t` reads.
+    #[inline(always)]
+    fn col(&self, t: usize) -> usize {
+        match self.cols {
+            Some(cols) => cols[t],
+            None => t,
         }
     }
 
@@ -1378,10 +1496,10 @@ impl<'a> PairWork<'a> {
             defer.wait_ready(self.slot);
         }
         if let Some((cb, aptr)) = self.fused_cols {
-            // SAFETY: the slot's buffer is `ne1 * cb` bytes as allocated,
+            // SAFETY: the slot's buffer is `src_ne1 * cb` bytes as allocated,
             // and its writes are ordered before this read — the pre-pass
             // join, or the DONE store the wait above just observed.
-            let acol = unsafe { std::slice::from_raw_parts(aptr, self.ne1 * cb) };
+            let acol = unsafe { std::slice::from_raw_parts(aptr, self.src_ne1 * cb) };
             // Fused rows: `qdot::dot_row` dots the weight bytes and the
             // quantized column directly — no f32 row, ROW_BUF untouched;
             // `add_dequant_w` stays 0 (the dequant is in the dot timer).
@@ -1389,7 +1507,8 @@ impl<'a> PairWork<'a> {
                 let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
                 let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                 for t in 0..self.ne1 {
-                    let v = qdot::dot_row(ty, src, &acol[t * cb..(t + 1) * cb], k)?;
+                    let c = self.col(t);
+                    let v = qdot::dot_row(ty, src, &acol[c * cb..(c + 1) * cb], k)?;
                     // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
                     unsafe { self.out.write(t * n + r, v) };
                 }
@@ -1399,9 +1518,9 @@ impl<'a> PairWork<'a> {
             }
             Ok(())
         } else {
-            // SAFETY: `k * ne1` f32s as allocated, ordered before this read
-            // exactly as the fused arm above.
-            let q_f32 = unsafe { std::slice::from_raw_parts(self.q_f32, k * self.ne1) };
+            // SAFETY: `k * src_ne1` f32s as allocated, ordered before this
+            // read exactly as the fused arm above.
+            let q_f32 = unsafe { std::slice::from_raw_parts(self.q_f32, k * self.src_ne1) };
             ROW_BUF.with(|cell| {
                 let mut scratch = cell.borrow_mut();
                 if scratch.len() < k {
@@ -1415,7 +1534,8 @@ impl<'a> PairWork<'a> {
                     if ty == GgmlType::F32 && qdot::dot_f32(src, &q_f32[..k]).is_some() {
                         let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                         for t in 0..self.ne1 {
-                            let xc = &q_f32[t * k..(t + 1) * k];
+                            let c = self.col(t);
+                            let xc = &q_f32[c * k..(c + 1) * k];
                             let v = qdot::dot_f32(src, xc).expect("support is per (cpu, k)");
                             // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
                             unsafe { self.out.write(t * n + r, v) };
@@ -1441,7 +1561,8 @@ impl<'a> PairWork<'a> {
                     }
                     let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
                     for t in 0..self.ne1 {
-                        let xc = &q_f32[t * k..(t + 1) * k];
+                        let c = self.col(t);
+                        let xc = &q_f32[c * k..(c + 1) * k];
                         let mut a = 0.0f32;
                         for i in 0..k {
                             a += row[i] * xc[i];
@@ -1650,9 +1771,10 @@ impl Drop for ClaimDone<'_> {
 }
 
 /// The claim table of a deferred dispatch: the slot list, the shared write
-/// views, and one state per slot. The decode shape carries exactly one
-/// column per slot, so a claim is one SwiGLU combine at most plus one
-/// encoder call over one column, and every wait is bounded by exactly that.
+/// views, and one state per slot. The decode shape carries one column per
+/// slot ([`matmul_q_group_cols_into`] at most [`DEFER_MAX_COLS`]), so a
+/// claim is one SwiGLU combine at most plus one encoder call per column,
+/// and every wait is bounded by exactly that.
 struct DeferredSlots<'a> {
     slots: &'a Flex<QuantSlot<'a>>,
     shared: &'a Flex<SharedQuantCols>,
@@ -1715,11 +1837,12 @@ impl<'a> DeferredSlots<'a> {
     }
 
     /// Produce and quantize claimed slot `s` — the exact calls the inline
-    /// pre-pass and `ffn::swiglu` make today, whole column; only WHICH
-    /// thread runs them changes. Timers match those call sites: the combine
-    /// at level 1, the encoder at level 2.
+    /// pre-pass and `ffn::swiglu` make today, whole columns, one encoder
+    /// call per column; only WHICH thread runs them changes. Timers match
+    /// those call sites: the combine at level 1, the encoder at level 2.
     fn produce(&self, s: usize, lvl: u8, acc: &mut profile::CallAcc) {
         let q = self.slots.get(s);
+        let ne1 = q.x.ne1;
         if let Some(c) = q.swiglu {
             let t_s = if lvl >= 1 { Some(Instant::now()) } else { None };
             // SAFETY: `c.par` aliases this slot's `x`, the par block the entry
@@ -1735,18 +1858,26 @@ impl<'a> DeferredSlots<'a> {
                 );
             }
             let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
-            // SAFETY: column 0 is this claimer's exclusively (the
-            // compare-exchange above); the par block was written by this
-            // same thread just above.
-            unsafe { self.shared.get(s).quantize_into(q.ty, q.k, &par[..q.k], 0) };
+            for t in 0..ne1 {
+                // SAFETY: every column of the slot is this claimer's
+                // exclusively (the compare-exchange above); the par block
+                // was written by this same thread just above.
+                unsafe {
+                    self.shared
+                        .get(s)
+                        .quantize_into(q.ty, q.k, &par[t * q.k..(t + 1) * q.k], t);
+                }
+            }
             if let Some(t_q) = t_q {
                 acc.add_quant_act(t_q.elapsed().as_nanos() as u64);
             }
         } else {
             let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
-            // SAFETY: column 0 is this claimer's exclusively (the
-            // compare-exchange above).
-            unsafe { self.shared.get(s).quantize_into(q.ty, q.k, q.x.col(0), 0) };
+            for t in 0..ne1 {
+                // SAFETY: every column of the slot is this claimer's
+                // exclusively (the compare-exchange above).
+                unsafe { self.shared.get(s).quantize_into(q.ty, q.k, q.x.col(t), t) };
+            }
             if let Some(t_q) = t_q {
                 acc.add_quant_act(t_q.elapsed().as_nanos() as u64);
             }
@@ -1754,8 +1885,8 @@ impl<'a> DeferredSlots<'a> {
     }
 
     /// Block until slot `s` is quantized. Bounded: the claimer is a
-    /// participant already inside this dispatch, and a slot is one column of
-    /// production and quantization.
+    /// participant already inside this dispatch, and a slot is at most
+    /// [`DEFER_MAX_COLS`] columns of production and quantization.
     fn wait_ready(&self, s: usize) {
         while self.states[s].load(std::sync::atomic::Ordering::Acquire) != SLOT_DONE {
             std::hint::spin_loop();
@@ -1779,7 +1910,8 @@ impl<'a> DeferredSlots<'a> {
 /// (inline for the small counts below), chunk-straddling slots handled
 /// segment-wise. The decode shape does not come through here while the
 /// deferral lever is on (see [`run_group`]); `BLOOMERY_DEFER_QUANT=0` and
-/// multi-column inputs do.
+/// multi-column inputs do (past [`DEFER_MAX_COLS`] for
+/// [`matmul_q_group_cols_into`]).
 ///
 /// Bit identity: each column is a pure function of its own input, and the
 /// split partitions the output cells; splitting WITHIN a column would need
@@ -1834,26 +1966,34 @@ fn quantize_slots(
     }
 }
 
+/// Which slot each pair reads, and the columns of it (`None`: all, in order).
+struct PairMap<'m, 'c> {
+    slot_of: &'m Flex<usize>,
+    cols_of: &'m Flex<Option<&'c [usize]>>,
+}
+
 /// Quantize `slots` and run every pair's rows over one pool dispatch — the
-/// engine all three entry shapes ride. `want_defer` is the caller's lever
-/// reading ([`defer_quant`], or the entry's own shape-constrained variant);
-/// the shape checks here are the single owner of the deferral decision: the
-/// decode shape (every slot exactly one column) with inline claim states
-/// skips the pre-pass, and the row dispatch's participants claim the slots
-/// as their first work. Returns, at level >= 1, the SwiGLU nanoseconds the
-/// claims spent (worker-side, so the caller's profiler wall can hand them to
-/// the `swiglu` site instead of counting them twice) and the activation
-/// stage's share of the wall (the pre-pass, or the longest claim pass).
+/// engine all three entry shapes ride. `defer_cols` is the caller's lever
+/// reading ([`defer_quant`], or the entry's own shape-constrained variant)
+/// with the widest slot the entry lets a claim take; the shape checks here
+/// are the single owner of the deferral decision: the decode shape (every
+/// slot one column — or, for [`matmul_q_group_cols_into`], at most
+/// [`DEFER_MAX_COLS`]) with inline claim states skips the pre-pass, and the
+/// row dispatch's participants claim the slots as their first work. Returns,
+/// at level >= 1, the SwiGLU nanoseconds the claims spent (worker-side, so
+/// the caller's profiler wall can hand them to the `swiglu` site instead of
+/// counting them twice) and the activation stage's share of the wall (the
+/// pre-pass, or the longest claim pass).
 #[allow(clippy::too_many_arguments)]
 fn run_group(
     slots: &Flex<QuantSlot<'_>>,
-    slot_of: &Flex<usize>,
+    map: &PairMap<'_, '_>,
     bytes: &Flex<&[u8]>,
     meta: &Flex<PairMeta>,
     outs: &mut [Tensor2],
     lvl: u8,
     pacc: &mut profile::CallAcc,
-    want_defer: bool,
+    defer_cols: Option<usize>,
 ) -> Result<RunTimes, crate::ModelError> {
     let n_slots = slots.len();
     let mut quantized: Flex<QuantCols> = Flex::new();
@@ -1864,11 +2004,13 @@ fn run_group(
     for s in 0..n_slots {
         shared.push(quantized.get_mut(s).shared());
     }
-    let deferred = (want_defer
-        && n_slots > 0
-        && n_slots <= MAX_DEFER_SLOTS
-        && (0..n_slots).all(|s| slots.get(s).x.ne1 == 1))
-    .then(|| DeferredSlots::new(slots, &shared));
+    let deferred = defer_cols
+        .filter(|&w| {
+            n_slots > 0
+                && n_slots <= MAX_DEFER_SLOTS
+                && (0..n_slots).all(|s| slots.get(s).x.ne1 <= w)
+        })
+        .map(|_| DeferredSlots::new(slots, &shared));
     let mut prepass_ns = 0u64;
     if deferred.is_none() {
         let t_q = if lvl > 0 { Some(Instant::now()) } else { None };
@@ -1889,13 +2031,16 @@ fn run_group(
         // the columns are complete before any row runs; on the deferred arm
         // a participant forms the slice only after the slot's state observes
         // DONE (the claim's release store), which orders the claimer's
-        // writes before its read.
+        // writes before its read. A column-mapped pair reads only the
+        // slot's columns its map names, each checked against the slot's
+        // width at the entry.
+        let s = *map.slot_of.get(i);
         pairs.push(PairWork::new(
             out,
             bytes.get(i),
-            *shared.get(*slot_of.get(i)),
+            (*shared.get(s), slots.get(s).x.ne1, *map.cols_of.get(i)),
             *meta.get(i),
-            *slot_of.get(i),
+            s,
             deferred.as_ref(),
         ));
     }
@@ -2238,7 +2383,7 @@ fn matmul_q_one(
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let bytes = gguf.data(w)?;
     let row_bytes = bytes.len() / n;
-    let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
+    let fused = qdot::fuses(ty, k);
     let cb = if fused {
         Some(qdot::col_bytes(ty, k))
     } else {
@@ -2258,6 +2403,8 @@ fn matmul_q_one(
     });
     let mut slot_of: Flex<usize> = Flex::new();
     slot_of.push(0);
+    let mut cols_of: Flex<Option<&[usize]>> = Flex::new();
+    cols_of.push(None);
     let mut bytes_f: Flex<&[u8]> = Flex::new();
     bytes_f.push(bytes);
     let mut meta: Flex<PairMeta> = Flex::new();
@@ -2272,13 +2419,16 @@ fn matmul_q_one(
     // one pair, the whole row split, the join publishes the writes.
     run_group(
         &slots,
-        &slot_of,
+        &PairMap {
+            slot_of: &slot_of,
+            cols_of: &cols_of,
+        },
         &bytes_f,
         &meta,
         std::slice::from_mut(&mut out),
         lvl,
         &mut pacc,
-        defer_quant(),
+        defer_quant().then_some(1),
     )?;
 
     if let Some(t_call) = t_call {
@@ -2336,7 +2486,7 @@ pub(crate) fn matvec_q_local(
     }
     let bytes = gguf.data(w)?;
     let row_bytes = bytes.len() / n;
-    let fused = qdot::supports(ty) && k.is_multiple_of(qdot::k_granularity(ty));
+    let fused = qdot::fuses(ty, k);
     if fused {
         // The QuantCols::new contract: recycled byte buffer, poisoned under
         // BLOOMERY_POISON, one `quantize_col` writing the whole column.
@@ -2426,6 +2576,7 @@ fn matmul_q_multi(
             outs: &mut outs,
             pars: &mut pars,
         },
+        1,
     )?;
     Ok(outs)
 }
@@ -2493,5 +2644,37 @@ mod tests {
             }
             std::fs::remove_file(&path).unwrap();
         }
+    }
+
+    /// A column-mapped input's output has one column per listed column, a
+    /// repeat included, and a listed column past the block is refused by
+    /// name before any byte is read — never clamped to the last column.
+    #[test]
+    fn cols_input_shapes_its_output_and_refuses_a_column_past_the_block() {
+        let path = one_tensor_file(GgmlType::F32);
+        let g = Gguf::open(&path).unwrap();
+        let w = g.find("w").unwrap();
+        let x = Tensor2::zeros(32, 2);
+        let (outs, pars) =
+            matmul_q_group_swiglu(&g, &[w], &[GroupInput::Cols(&x, &[1, 0, 1])]).unwrap();
+        assert_eq!(
+            (outs[0].ne0, outs[0].ne1),
+            (2, 3),
+            "one output column per listed column"
+        );
+        assert!(
+            pars.is_empty(),
+            "a column-mapped input is the caller's block"
+        );
+        let e = refusal(matmul_q_group_swiglu(
+            &g,
+            &[w],
+            &[GroupInput::Cols(&x, &[0, 2])],
+        ));
+        assert!(
+            e.contains("past the block") && e.contains("got [32, 2]"),
+            "the refusal names the column, got {e:?}"
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 }
