@@ -671,8 +671,9 @@ inventory-v41:
 gate-gpu-head:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_head_gpu && bash tools/gpu-gate.sh gate_head_gpu'
 
-# m열 커널(q8_0·q8_0 heads·q3_K·q6_K·헤드 argmax): m열 런치의 열 c가 그 열 하나를 m = 1로 쏜 결과와 비트 동일한지를
-# V4.1 실제 행에서 m = 1..8 전부 본다 — k토큰 스텝이 k개 순차 스텝과 비트 동일하려면 이것이 서야 한다.
+# m열 커널(q8_0·q8_0 heads·K-quant q3_K·q4_K·q5_K·q6_K·블록 대각 heads·공유 expert gate·up·헤드 argmax): m열 런치의 열 c가
+# 그 열 하나를 m = 1로 쏜 결과와 비트 동일한지를 파일의 형식으로 고른 V4.1 실제 행과 합성 K(≤ 8192)에서 m = 1..8 전부
+# 본다 — k토큰 스텝이 k개 순차 스텝과 비트 동일하려면 이것이 서야 한다.
 gate-gpu-mcol:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_mcol && bash tools/gpu-gate.sh gate_mcol'
 
