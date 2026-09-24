@@ -44,6 +44,9 @@ pub enum Role {
     FfnNorm,
     /// The shared expert: on the layer's card.
     SharedExpert,
+    /// A dense FFN's gate, up and down (a layer without a router): on the
+    /// layer's card.
+    DenseFfn,
     /// Engram weights every token reads in full: on the layer's card.
     EngramDense,
     /// An engram table: on NVMe, a few rows gathered per token.
@@ -54,8 +57,13 @@ pub enum Role {
     TokenEmbedding,
     /// The output head and its norm: on the head card.
     Head,
-    /// In the file, never read by text decode.
+    /// In the file, never read by text decode: a tensor of the decode graph's
+    /// own layers that no step reads.
     Unread,
+    /// In the file, never loaded: weights of a graph this engine does not run
+    /// (a multi-token-prediction head's `nextn.*`, `*.mtp.*`). Its layer, if
+    /// any, may lie past the model's layers; no stage is asked for it.
+    Unused,
 }
 
 impl fmt::Display for Role {
@@ -66,12 +74,14 @@ impl fmt::Display for Role {
             Role::Router => "router",
             Role::FfnNorm => "ffn_norm",
             Role::SharedExpert => "shexp",
+            Role::DenseFfn => "dense_ffn",
             Role::EngramDense => "engram_dense",
             Role::EngramTable => "engram_table",
             Role::RoutedExperts => "routed",
             Role::TokenEmbedding => "token_embd",
             Role::Head => "head",
             Role::Unread => "unread",
+            Role::Unused => "unused",
         })
     }
 }
@@ -181,7 +191,10 @@ pub enum CardFormat {
 
 impl CardFormat {
     /// The format a file tensor of type `ty` loads in on a card; `None` when
-    /// the loader has none.
+    /// the loader has none. `None` is not a refusal by itself: a routed stack
+    /// of such a type stays on the host, and a tensor its role puts on a card
+    /// is refused by the plan with [`PlacementError::NoCardFormat`]. Every
+    /// type is listed by name, so a new [`GgmlType`] must be decided here.
     #[must_use]
     pub fn of(ty: GgmlType) -> Option<CardFormat> {
         match ty {
@@ -191,7 +204,26 @@ impl CardFormat {
             GgmlType::Q8_0 => Some(CardFormat::Q8_0Planes),
             GgmlType::F32 => Some(CardFormat::F32),
             GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
-            GgmlType::F16 | GgmlType::Q5_K | GgmlType::MXFP4 | GgmlType::Unknown(_) => None,
+            GgmlType::F16
+            | GgmlType::Q5_K
+            | GgmlType::MXFP4
+            | GgmlType::IQ2_XXS
+            | GgmlType::IQ2_XS
+            | GgmlType::IQ3_XXS
+            | GgmlType::IQ1_S
+            | GgmlType::IQ4_NL
+            | GgmlType::IQ3_S
+            | GgmlType::IQ2_S
+            | GgmlType::IQ4_XS
+            | GgmlType::I8
+            | GgmlType::I16
+            | GgmlType::I32
+            | GgmlType::I64
+            | GgmlType::F64
+            | GgmlType::IQ1_M
+            | GgmlType::TQ1_0
+            | GgmlType::TQ2_0
+            | GgmlType::Unknown(_) => None,
         }
     }
 
@@ -595,6 +627,15 @@ pub enum PlacementError {
     Metadata { key: String, detail: String },
     #[error("tensor {name}: {detail}")]
     Tensor { name: String, detail: String },
+    /// A tensor its role puts on a card, of a type no card format loads.
+    #[error(
+        "tensor {name}: type {ty} has no device format, but its role ({role}) puts it on a card"
+    )]
+    NoCardFormat {
+        name: String,
+        ty: GgmlType,
+        role: Role,
+    },
     /// The cards' layer ranges do not cover the model once, in order, with one head.
     #[error("stage map: {0}")]
     Stages(String),
@@ -723,11 +764,12 @@ impl Stages {
     }
 
     /// The card whose stage uses `t`: its layer's, the head's for the head,
-    /// the first stage's for a model-level tensor.
+    /// the first stage's for a model-level tensor and for one never loaded
+    /// ([`Role::Unused`], whose layer need not be one the model runs).
     fn stage_of(&self, t: &ModelTensor, layers: usize) -> Result<usize, PlacementError> {
         match (t.role, t.layer) {
             (Role::Head, _) => Ok(self.head),
-            (_, None) => Ok(self.of_layer[0]),
+            (Role::Unused, _) | (_, None) => Ok(self.of_layer[0]),
             (_, Some(_)) => Ok(self.of_layer[layer_of(t, layers)?]),
         }
     }
@@ -849,13 +891,11 @@ fn card_segment(
     experts: Option<ExpertList>,
 ) -> Result<Segment, PlacementError> {
     let Some(format) = CardFormat::of(t.ty) else {
-        return Err(PlacementError::tensor(
-            t,
-            format!(
-                "type {} has no device format, but its role puts it on a card",
-                t.ty
-            ),
-        ));
+        return Err(PlacementError::NoCardFormat {
+            name: t.name.clone(),
+            ty: t.ty,
+            role: t.role,
+        });
     };
     Ok(Segment {
         device: Device::Card(card),
@@ -889,6 +929,7 @@ fn place_whole(
         | Role::Router
         | Role::FfnNorm
         | Role::SharedExpert
+        | Role::DenseFfn
         | Role::EngramDense => {
             layer_of(t, layers)?;
             (card_segment(t, stage, rows_of(t), None)?, t.file_bytes)
@@ -905,7 +946,7 @@ fn place_whole(
                 gathered(t)?,
             )
         }
-        Role::Unread => (in_place(Device::Unused, Format::Unused, None, 0), 0),
+        Role::Unread | Role::Unused => (in_place(Device::Unused, Format::Unused, None, 0), 0),
         Role::RoutedExperts => {
             return Err(PlacementError::tensor(
                 t,
@@ -1156,7 +1197,8 @@ pub fn plan_with<'a>(
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut routed: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
-        if let Some(format) = CardFormat::of(t.ty) {
+        // A never-loaded tensor's shape is nothing a card must take.
+        if let Some(format) = CardFormat::of(t.ty).filter(|_| t.role != Role::Unused) {
             card_bytes(t, format, rows_of(t))?;
         }
         if t.role == Role::RoutedExperts {

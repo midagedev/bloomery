@@ -27,12 +27,21 @@
 use std::fmt;
 
 /// GGUF v3 / ggml tensor type tags, values from `enum ggml_type`
-/// (ggml.h:391; F32=0 … Q6_K=14 at ggml.h:392-406, BF16=30 at ggml.h:422,
-/// MXFP4=39 at ggml.h:427).
+/// (ggml.h:391; F32=0 … Q6_K=14 at ggml.h:392-406, IQ2_XXS=16 … IQ4_XS=23
+/// at ggml.h:408-415, I8=24 … F64=28 at ggml.h:416-420, IQ1_M=29 at
+/// ggml.h:421, BF16=30 at ggml.h:422, MXFP4=39 at ggml.h:427).
 ///
-/// `Unknown` carries any tag this build does not model; the loader accepts
-/// such tensors only far enough to name them, and every size/dequant entry
-/// point rejects them with an error.
+/// TQ1_0=34 and TQ2_0=35 are mainline ggml's (llama.cpp `930e2fa59`,
+/// ggml.h:424-425); the ik tree leaves 34 and 35 unassigned, so no id means
+/// two things.
+///
+/// A named type is one this build can size ([`GgmlType::blck_size`],
+/// [`GgmlType::type_size`]); whether it can decode it is a separate question
+/// ([`GgmlType::has_dequant`]). `Unknown` carries every other tag: the ids
+/// the enum does not name (q4_0, q4_1, q8_1, q2_K, q8_K among them), the
+/// slots ggml removed (4, 5, 31-33, 36-38) and the ids past the table. The
+/// loader accepts such tensors only far enough to name them, and every
+/// size/dequant entry point rejects them with an error.
 // Variant names mirror ggml's type names verbatim (Q3_K, not Q3K), the way
 // libc-style bindings keep the C spelling.
 #[allow(non_camel_case_types)]
@@ -49,6 +58,22 @@ pub enum GgmlType {
     Q6_K,
     BF16,
     MXFP4,
+    IQ2_XXS,
+    IQ2_XS,
+    IQ3_XXS,
+    IQ1_S,
+    IQ4_NL,
+    IQ3_S,
+    IQ2_S,
+    IQ4_XS,
+    I8,
+    I16,
+    I32,
+    I64,
+    F64,
+    IQ1_M,
+    TQ1_0,
+    TQ2_0,
     Unknown(u32),
 }
 
@@ -65,7 +90,23 @@ impl GgmlType {
             12 => GgmlType::Q4_K,
             13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
+            16 => GgmlType::IQ2_XXS,
+            17 => GgmlType::IQ2_XS,
+            18 => GgmlType::IQ3_XXS,
+            19 => GgmlType::IQ1_S,
+            20 => GgmlType::IQ4_NL,
+            21 => GgmlType::IQ3_S,
+            22 => GgmlType::IQ2_S,
+            23 => GgmlType::IQ4_XS,
+            24 => GgmlType::I8,
+            25 => GgmlType::I16,
+            26 => GgmlType::I32,
+            27 => GgmlType::I64,
+            28 => GgmlType::F64,
+            29 => GgmlType::IQ1_M,
             30 => GgmlType::BF16,
+            34 => GgmlType::TQ1_0,
+            35 => GgmlType::TQ2_0,
             39 => GgmlType::MXFP4,
             other => GgmlType::Unknown(other),
         }
@@ -82,14 +123,32 @@ impl GgmlType {
             GgmlType::Q4_K => 12,
             GgmlType::Q5_K => 13,
             GgmlType::Q6_K => 14,
+            GgmlType::IQ2_XXS => 16,
+            GgmlType::IQ2_XS => 17,
+            GgmlType::IQ3_XXS => 18,
+            GgmlType::IQ1_S => 19,
+            GgmlType::IQ4_NL => 20,
+            GgmlType::IQ3_S => 21,
+            GgmlType::IQ2_S => 22,
+            GgmlType::IQ4_XS => 23,
+            GgmlType::I8 => 24,
+            GgmlType::I16 => 25,
+            GgmlType::I32 => 26,
+            GgmlType::I64 => 27,
+            GgmlType::F64 => 28,
+            GgmlType::IQ1_M => 29,
             GgmlType::BF16 => 30,
+            GgmlType::TQ1_0 => 34,
+            GgmlType::TQ2_0 => 35,
             GgmlType::MXFP4 => 39,
             GgmlType::Unknown(v) => v,
         }
     }
 
     /// `ggml_type_name` string (type_traits table, ggml.c:620 — entries at
-    /// ggml.c:657/667/756/777/819/912/938/998/1485, mxfp4 at ggml.c:1307).
+    /// ggml.c:657/667/756/777/819/912/938/998/1485, mxfp4 at ggml.c:1307;
+    /// i8…f64 at ggml.c:621-649, the i-quants at ggml.c:1055-1293; tq1_0 and
+    /// tq2_0 from mainline's table, llama.cpp ggml.c:912/920).
     /// Used to name the oracle
     /// dumps `$BLOOMERY_DATA/ref/<name>.raw`.
     pub fn name(self) -> Option<&'static str> {
@@ -105,6 +164,22 @@ impl GgmlType {
             GgmlType::Q6_K => Some("q6_K"),
             GgmlType::BF16 => Some("bf16"),
             GgmlType::MXFP4 => Some("mxfp4"),
+            GgmlType::IQ2_XXS => Some("iq2_xxs"),
+            GgmlType::IQ2_XS => Some("iq2_xs"),
+            GgmlType::IQ3_XXS => Some("iq3_xxs"),
+            GgmlType::IQ1_S => Some("iq1_s"),
+            GgmlType::IQ4_NL => Some("iq4_nl"),
+            GgmlType::IQ3_S => Some("iq3_s"),
+            GgmlType::IQ2_S => Some("iq2_s"),
+            GgmlType::IQ4_XS => Some("iq4_xs"),
+            GgmlType::I8 => Some("i8"),
+            GgmlType::I16 => Some("i16"),
+            GgmlType::I32 => Some("i32"),
+            GgmlType::I64 => Some("i64"),
+            GgmlType::F64 => Some("f64"),
+            GgmlType::IQ1_M => Some("iq1_m"),
+            GgmlType::TQ1_0 => Some("tq1_0"),
+            GgmlType::TQ2_0 => Some("tq2_0"),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -113,14 +188,41 @@ impl GgmlType {
     /// (ggml.c:657/667/1485), Q5_0/Q5_1/Q8_0 = QK5_0/QK5_1/QK8_0 = 32
     /// (ggml.c:756/777/819, QK5_0/QK5_1/QK8_0 at ggml-common.h:195/210/233),
     /// K-quants = QK_K = 256 (ggml.c:912/938/998, QK_K at ggml-common.h:79),
-    /// MXFP4 = QK_MXFP4 = 32 (ggml.c:1308, ggml-common.h:182).
+    /// MXFP4 = QK_MXFP4 = 32 (ggml.c:1308, ggml-common.h:182); the integer
+    /// types and F64 = 1 (ggml.c:621-649), IQ4_NL = QK4_NL = 32 (ggml.c:1276),
+    /// the other i-quants and TQ1_0/TQ2_0 = QK_K = 256 (ggml.c:1055-1293,
+    /// mainline ggml.c:912/920).
     ///
     /// This match is the single owner of those numbers for the Rust side.
     pub fn blck_size(self) -> Option<u64> {
         match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => Some(1),
-            GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::MXFP4 => Some(32),
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => Some(256),
+            GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::BF16
+            | GgmlType::I8
+            | GgmlType::I16
+            | GgmlType::I32
+            | GgmlType::I64
+            | GgmlType::F64 => Some(1),
+            GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::Q8_0
+            | GgmlType::MXFP4
+            | GgmlType::IQ4_NL => Some(32),
+            GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::IQ2_XXS
+            | GgmlType::IQ2_XS
+            | GgmlType::IQ3_XXS
+            | GgmlType::IQ1_S
+            | GgmlType::IQ3_S
+            | GgmlType::IQ2_S
+            | GgmlType::IQ4_XS
+            | GgmlType::IQ1_M
+            | GgmlType::TQ1_0
+            | GgmlType::TQ2_0 => Some(256),
             GgmlType::Unknown(_) => None,
         }
     }
@@ -135,7 +237,13 @@ impl GgmlType {
     /// ggml-common.h:327-332 (q3_K), 348-353 (q4_K), 373-378 (q5_K),
     /// 388-393 (q6_K), 196-216 (q5_0/q5_1), 233-238 (q8_0: one f16 `d` and
     /// 32 int8 codes), `sizeof(block_mxfp4)` = 17 (ggml-common.h:183-187: one
-    /// E8M0 byte `e`, then 16 bytes of 4-bit codes).
+    /// E8M0 byte `e`, then 16 bytes of 4-bit codes); the block structs'
+    /// static_asserts in ggml-common.h give `sizeof(block_iq2_xxs)` = 66 (:443),
+    /// `block_iq2_xs` = 74 (:458), `block_iq2_s` = 82 (:474), `block_iq3_xxs`
+    /// = 98 (:492), `block_iq3_s` = 110 (:510), `block_iq1_s` = 50 (:526),
+    /// `block_iq1_m` = 56 (:540), `block_iq4_nl` = 18 (:590), `block_iq4_xs` =
+    /// 136 (:608), and mainline's `block_tq1_0` = 54 (:281), `block_tq2_0` =
+    /// 66 (:288); I8/I16/I32/I64/F64 are their C scalars, 1/2/4/8/8.
     pub fn type_size(self) -> Option<u64> {
         match self {
             GgmlType::F32 => Some(4),
@@ -149,7 +257,60 @@ impl GgmlType {
             GgmlType::Q5_K => Some(176),
             GgmlType::Q6_K => Some(210),
             GgmlType::MXFP4 => Some(17),
+            GgmlType::IQ2_XXS => Some(66),
+            GgmlType::IQ2_XS => Some(74),
+            GgmlType::IQ3_XXS => Some(98),
+            GgmlType::IQ1_S => Some(50),
+            GgmlType::IQ4_NL => Some(18),
+            GgmlType::IQ3_S => Some(110),
+            GgmlType::IQ2_S => Some(82),
+            GgmlType::IQ4_XS => Some(136),
+            GgmlType::I8 => Some(1),
+            GgmlType::I16 => Some(2),
+            GgmlType::I32 => Some(4),
+            GgmlType::I64 => Some(8),
+            GgmlType::F64 => Some(8),
+            GgmlType::IQ1_M => Some(56),
+            GgmlType::TQ1_0 => Some(54),
+            GgmlType::TQ2_0 => Some(66),
             GgmlType::Unknown(_) => None,
+        }
+    }
+
+    /// Whether [`dequant_row`] decodes this type. A named type it does not
+    /// decode is sized — a file holding it opens, and its bytes can be moved —
+    /// but every decode of it is [`QuantError::Unsupported`].
+    #[must_use]
+    pub fn has_dequant(self) -> bool {
+        match self {
+            GgmlType::F32
+            | GgmlType::F16
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::Q8_0
+            | GgmlType::Q3_K
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::BF16
+            | GgmlType::MXFP4 => true,
+            GgmlType::IQ2_XXS
+            | GgmlType::IQ2_XS
+            | GgmlType::IQ3_XXS
+            | GgmlType::IQ1_S
+            | GgmlType::IQ4_NL
+            | GgmlType::IQ3_S
+            | GgmlType::IQ2_S
+            | GgmlType::IQ4_XS
+            | GgmlType::I8
+            | GgmlType::I16
+            | GgmlType::I32
+            | GgmlType::I64
+            | GgmlType::F64
+            | GgmlType::IQ1_M
+            | GgmlType::TQ1_0
+            | GgmlType::TQ2_0
+            | GgmlType::Unknown(_) => false,
         }
     }
 }
@@ -193,6 +354,9 @@ pub enum QuantError {
 /// Scalar on purpose — this is what the oracle gate compares against ggml's
 /// `to_float`, so the arithmetic shape mirrors the C source exactly.
 pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), QuantError> {
+    if !ty.has_dequant() {
+        return Err(QuantError::Unsupported(ty));
+    }
     let blck = ty.blck_size().ok_or(QuantError::Unsupported(ty))?.max(1) as usize;
     let tsz = ty.type_size().ok_or(QuantError::Unsupported(ty))? as usize;
     if !dst.len().is_multiple_of(blck) {
@@ -232,7 +396,23 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::Q8_0 => dequant_q8_0(&src[..need], dst),
         GgmlType::BF16 => dequant_bf16(&src[..need], dst),
         GgmlType::MXFP4 => dequant_mxfp4(&src[..need], dst),
-        GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
+        GgmlType::IQ2_XXS
+        | GgmlType::IQ2_XS
+        | GgmlType::IQ3_XXS
+        | GgmlType::IQ1_S
+        | GgmlType::IQ4_NL
+        | GgmlType::IQ3_S
+        | GgmlType::IQ2_S
+        | GgmlType::IQ4_XS
+        | GgmlType::I8
+        | GgmlType::I16
+        | GgmlType::I32
+        | GgmlType::I64
+        | GgmlType::F64
+        | GgmlType::IQ1_M
+        | GgmlType::TQ1_0
+        | GgmlType::TQ2_0
+        | GgmlType::Unknown(_) => return Err(QuantError::Unsupported(ty)),
     }
     Ok(())
 }
@@ -752,7 +932,8 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// activations are Q8_2_X4 and BF16 in ggml (`vec_dot_type`, ggml.c:828-837 on this AVX2
 /// IQK build, ggml.c:1494), neither of which this engine encodes, and f32 would be a
 /// plausible wrong answer. MXFP4's is Q8_2_X4 on AVX2 (ggml.c:1316), but no CPU MXFP4
-/// matmul exists here, so it is refused the same way.
+/// matmul exists here, so it is refused the same way, as is every type [`dequant_row`]
+/// does not decode.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
         GgmlType::Q3_K => Ok(Some(ActivationFormat::Q8K)),
@@ -760,9 +941,26 @@ pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, Q
             Ok(Some(ActivationFormat::Q8_2X4))
         }
         GgmlType::F32 | GgmlType::F16 => Ok(None),
-        GgmlType::Q8_0 | GgmlType::BF16 | GgmlType::MXFP4 | GgmlType::Unknown(_) => {
-            Err(QuantError::NoActivationFormat(weight))
-        }
+        GgmlType::Q8_0
+        | GgmlType::BF16
+        | GgmlType::MXFP4
+        | GgmlType::IQ2_XXS
+        | GgmlType::IQ2_XS
+        | GgmlType::IQ3_XXS
+        | GgmlType::IQ1_S
+        | GgmlType::IQ4_NL
+        | GgmlType::IQ3_S
+        | GgmlType::IQ2_S
+        | GgmlType::IQ4_XS
+        | GgmlType::I8
+        | GgmlType::I16
+        | GgmlType::I32
+        | GgmlType::I64
+        | GgmlType::F64
+        | GgmlType::IQ1_M
+        | GgmlType::TQ1_0
+        | GgmlType::TQ2_0
+        | GgmlType::Unknown(_) => Err(QuantError::NoActivationFormat(weight)),
     }
 }
 
@@ -816,7 +1014,106 @@ impl Q8Block {
 
 #[cfg(test)]
 mod tests {
-    use super::{GgmlType, dequant_row};
+    use super::{GgmlType, QuantError, activation_format, dequant_row};
+
+    /// `(id, ggml_type_name, ggml_blck_size, ggml_type_size)` for every id
+    /// [`GgmlType`] names, as the compiled libraries answer: ik_llama.cpp
+    /// `c10fbbcc` (`build/ggml/src/libggml.so`) and, for tq1_0/tq2_0, which
+    /// the ik table does not have, mainline llama.cpp `930e2fa59`
+    /// (`build/bin/libggml-base.so`). The two libraries agree on every other
+    /// row here.
+    const GGML_TABLE: &[(u32, &str, u64, u64)] = &[
+        (0, "f32", 1, 4),
+        (1, "f16", 1, 2),
+        (6, "q5_0", 32, 22),
+        (7, "q5_1", 32, 24),
+        (8, "q8_0", 32, 34),
+        (11, "q3_K", 256, 110),
+        (12, "q4_K", 256, 144),
+        (13, "q5_K", 256, 176),
+        (14, "q6_K", 256, 210),
+        (16, "iq2_xxs", 256, 66),
+        (17, "iq2_xs", 256, 74),
+        (18, "iq3_xxs", 256, 98),
+        (19, "iq1_s", 256, 50),
+        (20, "iq4_nl", 32, 18),
+        (21, "iq3_s", 256, 110),
+        (22, "iq2_s", 256, 82),
+        (23, "iq4_xs", 256, 136),
+        (24, "i8", 1, 1),
+        (25, "i16", 1, 2),
+        (26, "i32", 1, 4),
+        (27, "i64", 1, 8),
+        (28, "f64", 1, 8),
+        (29, "iq1_m", 256, 56),
+        (30, "bf16", 1, 2),
+        (34, "tq1_0", 256, 54),
+        (35, "tq2_0", 256, 66),
+        (39, "mxfp4", 32, 17),
+    ];
+
+    /// Ids the enum leaves `Unknown`: types it does not name yet (q4_0, q4_1,
+    /// q8_1, q2_K, q8_K), slots ggml removed (4, 5, 31-33, 36-38; ik reuses
+    /// 31-33 and 36 for repacked and BitNet types mainline does not have),
+    /// and the first ids past both tables.
+    const UNKNOWN_IDS: &[u32] = &[
+        2, 3, 4, 5, 9, 10, 15, 31, 32, 33, 36, 37, 38, 40, 41, 42, 99,
+    ];
+
+    /// Every named id round-trips through the enum and carries ggml's name,
+    /// block size and block bytes; every other id stays `Unknown` with no
+    /// name or size.
+    #[test]
+    fn every_named_type_matches_ggml_table() {
+        for &(id, name, blck, bytes) in GGML_TABLE {
+            let ty = GgmlType::from_u32(id);
+            assert!(
+                !matches!(ty, GgmlType::Unknown(_)),
+                "id {id} ({name}) is not named"
+            );
+            assert_eq!(ty.as_u32(), id, "{name}: id round trip");
+            assert_eq!(ty.name(), Some(name), "id {id}: name");
+            assert_eq!(ty.to_string(), name, "id {id}: Display");
+            assert_eq!(ty.blck_size(), Some(blck), "{name}: block size");
+            assert_eq!(ty.type_size(), Some(bytes), "{name}: block bytes");
+        }
+        for &id in UNKNOWN_IDS {
+            let ty = GgmlType::from_u32(id);
+            assert_eq!(ty, GgmlType::Unknown(id), "id {id}");
+            assert_eq!(ty.as_u32(), id);
+            assert_eq!(
+                (ty.name(), ty.blck_size(), ty.type_size()),
+                (None, None, None)
+            );
+            assert_eq!(ty.to_string(), format!("ggml-type-{id}"));
+        }
+    }
+
+    /// A type the reference dequantizer does not decode is refused by name,
+    /// whatever the lengths it is handed, and has no activation format.
+    #[test]
+    fn undecoded_types_are_refused_by_name() {
+        for &(id, name, blck, bytes) in GGML_TABLE {
+            let ty = GgmlType::from_u32(id);
+            if ty.has_dequant() {
+                continue;
+            }
+            let src = vec![0u8; bytes as usize];
+            let mut dst = vec![0.0f32; blck as usize];
+            let e = dequant_row(ty, &src, &mut dst).expect_err(name);
+            assert_eq!(e, QuantError::Unsupported(ty));
+            assert!(e.to_string().contains(name), "{e}");
+            assert_eq!(
+                dequant_row(ty, &[], &mut [0.0; 3]),
+                Err(QuantError::Unsupported(ty)),
+                "{name}: refused before any length check"
+            );
+            assert_eq!(
+                activation_format(ty),
+                Err(QuantError::NoActivationFormat(ty))
+            );
+        }
+    }
 
     /// An E2M1 code (sign, two exponent bits, one mantissa bit) as the OCP
     /// microscaling spec defines it, from its bits and not from ggml's table:

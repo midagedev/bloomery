@@ -13,6 +13,12 @@
 //! card's usable bytes, so the A6000 under the 3090's budget plans the gate
 //! placement's experts, and a budget below the dense floor is refused.
 //!
+//! Two synthetic contracts need no file and run in the fast loop: a tensor
+//! its role puts on a card, of a type with no card format, is refused by
+//! name, while a routed stack of such a type stays on the host; a dense FFN
+//! sits on its layer's card and a never-loaded tensor is placed nowhere,
+//! even with a layer past the model's.
+//!
 //! `hw_`: needs the V4.1 shards on the box (`just gate-placement`);
 //! `BLOOMERY_V41_MODEL` names another first shard. The plan inputs are this
 //! machine's figures in `model::placement::workstation`, which the GPU load
@@ -24,8 +30,8 @@ use std::ops::Range;
 use gguf::{GgmlType, Split, Value};
 use model::arch::deepseek41::{hparams::Hparams, kv::KvLayout, roles};
 use model::placement::{
-    self, CardFormat, CardTotals, Device, Format, HotList, Machine, ModelTensors, PlacementError,
-    Plan, Role, workstation,
+    self, CardFormat, CardTotals, Device, Format, HotList, KvBytes, Machine, ModelTensor,
+    ModelTensors, PlacementError, Plan, Role, workstation,
 };
 
 /// One card's pinned totals, and the n_l band on the layers that can hold experts.
@@ -786,4 +792,157 @@ fn hw_placement_card_budget_is_usable_bytes() {
         bad.len(),
         bad.join("\n  ")
     );
+}
+
+/// No KV cache: the synthetic models' cards hold only their tensors.
+struct NoKv;
+
+impl KvBytes for NoKv {
+    fn layer_bytes(&self, _layer: usize, _ctx_max: u64) -> u64 {
+        0
+    }
+}
+
+/// A tensor of layer `layer` (or model-level) with `rows` rows of 256 values
+/// of type `ty`, sized by ggml's block table.
+fn synthetic(
+    name: &str,
+    layer: Option<usize>,
+    role: Role,
+    ty: GgmlType,
+    rows: &[u64],
+) -> ModelTensor {
+    let mut dims = vec![256];
+    dims.extend_from_slice(rows);
+    let blocks = 256 / ty.blck_size().expect("a sized type");
+    let file_bytes = ty.type_size().expect("a sized type") * blocks * rows.iter().product::<u64>();
+    ModelTensor {
+        name: name.to_string(),
+        shard: 0,
+        layer,
+        role,
+        ty,
+        dims,
+        file_bytes,
+        gathered_rows: (role == Role::TokenEmbedding).then_some(1),
+    }
+}
+
+/// One layer of 8 experts, 2 used, with the given tensors besides the
+/// embedding and the head.
+fn synthetic_model(mut layer: Vec<ModelTensor>) -> ModelTensors {
+    let mut tensors = vec![synthetic(
+        "token_embd.weight",
+        None,
+        Role::TokenEmbedding,
+        GgmlType::Q8_0,
+        &[16],
+    )];
+    tensors.append(&mut layer);
+    tensors.push(synthetic(
+        "output.weight",
+        None,
+        Role::Head,
+        GgmlType::Q8_0,
+        &[16],
+    ));
+    ModelTensors {
+        tensors,
+        layers: 1,
+        experts: 8,
+        experts_used: 2,
+    }
+}
+
+/// A required card tensor without a card format is refused with its name,
+/// type and role; a routed stack of the same type is not refused — the plan
+/// keeps every expert of it on the host.
+#[test]
+fn card_tensor_without_card_format_is_refused_by_name() {
+    let machine = workstation::plan_a(1);
+    let q5k_attn = synthetic_model(vec![synthetic(
+        "blk.0.attn_q_b.weight",
+        Some(0),
+        Role::Attention,
+        GgmlType::Q5_K,
+        &[4],
+    )]);
+    match placement::plan_with(&q5k_attn, &machine, 4096, &NoKv, None, None) {
+        Err(e @ PlacementError::NoCardFormat { .. }) => {
+            let PlacementError::NoCardFormat { name, ty, role } = &e else {
+                unreachable!()
+            };
+            assert_eq!(
+                (name.as_str(), *ty, *role),
+                ("blk.0.attn_q_b.weight", GgmlType::Q5_K, Role::Attention)
+            );
+            let text = e.to_string();
+            assert!(
+                text.contains("blk.0.attn_q_b.weight") && text.contains("q5_K"),
+                "{text}"
+            );
+        }
+        Err(e) => panic!("refused with the wrong error: {e}"),
+        Ok(_) => panic!("a q5_K attention tensor was placed on a card"),
+    }
+
+    let q5k_stack = synthetic_model(vec![synthetic(
+        "blk.0.ffn_down_exps.weight",
+        Some(0),
+        Role::RoutedExperts,
+        GgmlType::Q5_K,
+        &[4, 8],
+    )]);
+    let plan = placement::plan_with(&q5k_stack, &machine, 4096, &NoKv, None, None)
+        .expect("a q5_K routed stack plans, on the host");
+    assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+    assert_eq!(plan.n_l, vec![0]);
+    let row = &plan.rows[1];
+    assert!(
+        matches!(row.segments.as_slice(), [s] if s.device == Device::Host && s.format == Format::HostFile),
+        "{:?}",
+        row.segments
+    );
+}
+
+/// A dense FFN is placed like attention, whole on its layer's card; a
+/// never-loaded tensor has one segment nowhere, reads nothing, and may
+/// carry a layer past the model's and a shape no card upload takes (16 rows
+/// of one q6_K block do not split into the KQuant words).
+#[test]
+fn dense_ffn_on_card_and_unused_nowhere() {
+    let machine = workstation::plan_a(1);
+    let model = synthetic_model(vec![
+        synthetic(
+            "blk.0.ffn_up.weight",
+            Some(0),
+            Role::DenseFfn,
+            GgmlType::Q4_K,
+            &[4],
+        ),
+        synthetic(
+            "blk.1.nextn.eh_proj.weight",
+            Some(1),
+            Role::Unused,
+            GgmlType::Q6_K,
+            &[16],
+        ),
+    ]);
+    let plan = placement::plan_with(&model, &machine, 4096, &NoKv, None, None)
+        .expect("a dense FFN and an MTP head plan");
+    assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+    let dense = &plan.rows[1];
+    assert!(
+        matches!(dense.segments.as_slice(), [s] if s.device == Device::Card(0) && s.format == Format::Card(CardFormat::KQuant)),
+        "{:?}",
+        dense.segments
+    );
+    assert_eq!(dense.read_bytes, model.tensors[1].file_bytes);
+    let unused = &plan.rows[2];
+    assert!(
+        matches!(unused.segments.as_slice(), [s] if s.device == Device::Unused && s.format == Format::Unused && s.resident_bytes == 0),
+        "{:?}",
+        unused.segments
+    );
+    assert_eq!(unused.read_bytes, 0);
 }

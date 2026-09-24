@@ -1,8 +1,11 @@
 //! The role of every tensor in a DeepSeek-V4.1 file, by name: the model-level
 //! names first, then the per-layer rules in order, the first match winning —
-//! the rule list of `docs/research/v41-placement/derive.py` `role()`. A name
-//! no rule matches fails the file with every such name listed; there is no
-//! catch-all role.
+//! the rule list of `docs/research/v41-placement/derive.py` `role()`, after
+//! the never-loaded names ([`Role::Unused`]: a multi-token-prediction head's
+//! `nextn.*` and `*.mtp.*`). A name no rule matches fails the file with every
+//! such name listed; there is no catch-all role. V4.1 has no dense FFN, so
+//! no rule gives [`Role::DenseFfn`]: a dense `ffn_{gate,up,down}` here is a
+//! file this classifier refuses.
 
 use gguf::Split;
 
@@ -28,9 +31,13 @@ impl Pattern {
     }
 }
 
-/// The per-layer rules; order matters (`engram_embd` before `engram_`,
+/// The per-layer rules; order matters (the never-loaded heads first, so none
+/// of their tensors takes a decode role; `engram_embd` before `engram_`,
 /// `exp_probs_b.` before `exp_probs_b_vl`, the shared expert before `_exps`).
 const LAYER_RULES: &[(Pattern, Role)] = &[
+    (Pattern::Prefix("nextn."), Role::Unused),
+    (Pattern::Prefix("mtp."), Role::Unused),
+    (Pattern::Contains(".mtp."), Role::Unused),
     (Pattern::Prefix("engram_embd"), Role::EngramTable),
     (Pattern::Prefix("engram_"), Role::EngramDense),
     (Pattern::Prefix("hc_"), Role::HyperConnection),
@@ -47,6 +54,9 @@ const LAYER_RULES: &[(Pattern, Role)] = &[
 /// A tensor's role and layer by its name; `None` when no rule matches. The
 /// per-layer rules apply to `blk.N.` names only.
 fn role(name: &str) -> Option<(Role, Option<usize>)> {
+    if name.starts_with("mtp.") || (!name.starts_with("blk.") && name.contains(".mtp.")) {
+        return Some((Role::Unused, None));
+    }
     if name.starts_with("token_embd") {
         return Some((Role::TokenEmbedding, None));
     }
@@ -124,5 +134,40 @@ fn gathered_rows(split: &Split, t: &ModelTensor) -> Result<Option<u64>, Placemen
         }
         (Role::EngramTable, None) => Err(refuse("an engram table outside a layer".to_string())),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role;
+    use crate::placement::Role;
+
+    /// A multi-token-prediction head's tensors are never loaded, whatever
+    /// their layer and whatever decode name follows the prefix; a name no rule
+    /// knows gets no role, so `classify` lists it.
+    #[test]
+    fn mtp_heads_are_unused_and_unknown_names_have_no_role() {
+        for (name, layer) in [
+            ("blk.43.nextn.eh_proj.weight", Some(43)),
+            ("blk.43.nextn.hc_head_down.weight", Some(43)),
+            ("blk.43.nextn.ffn_up_exps.weight", Some(43)),
+            ("blk.2.mtp.attn_q.weight", Some(2)),
+            ("blk.2.ffn.mtp.proj.weight", Some(2)),
+            ("mtp.0.eh_proj.weight", None),
+            ("model.mtp.norm.weight", None),
+        ] {
+            assert_eq!(role(name), Some((Role::Unused, layer)), "{name}");
+        }
+        assert_eq!(
+            role("blk.0.exp_probs_b.bias"),
+            Some((Role::Router, Some(0)))
+        );
+        for name in [
+            "blk.0.ffn_up.weight",
+            "blk.0.post_attention_norm.weight",
+            "rope_freqs.weight",
+        ] {
+            assert_eq!(role(name), None, "{name}");
+        }
     }
 }
