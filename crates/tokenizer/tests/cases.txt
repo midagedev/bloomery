@@ -27,3 +27,8 @@ It's we're they've I'm you'll he'd IT'S WE'RE THEY'VE I'M YOU'LL HE'D 'S 'x don'
 <|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nOK<|im_end|><|endoftext|>
 (foo) [bar] {baz} x=y; a+b !! ?! ... -- 3.5% $12
 'Sorry 'Tis 'Mom 'Dad 'REady 'VEry 'LLama 'sorry 'tis 'really rock'N'roll 'Should 'Mother 'Data 'Record 'Venus 'Library 'Talk 'Sure 'Text 'Model 'Dear 'Leave 'Rest 'System 'Most 'Define
+ `~/` directory
+~/
+ ~/foo
+a~b
+x ~= y; `~/.cargo`; a~~b

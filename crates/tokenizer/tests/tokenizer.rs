@@ -94,28 +94,36 @@ fn read_ids(path: &Path) -> Vec<u32> {
         .collect()
 }
 
-/// `Err` with the first difference, its position and both sides' pieces.
+/// `Err` with the first difference: its position in ids and in the text's
+/// bytes, the differing ids' pieces, and both sides' ids around it with the
+/// text each window decodes to. A length difference with an equal prefix is
+/// reported the same way, at the shorter side's end.
 fn compare(tok: &Tokenizer, ours: &[u32], oracle: &[u32]) -> Result<(), String> {
-    let piece = |id: u32| String::from_utf8_lossy(tok.piece(id, true)).into_owned();
-    match ours.iter().zip(oracle).position(|(a, b)| a != b) {
-        Some(i) => {
-            let from = i.saturating_sub(4);
-            Err(format!(
-                "first mismatch at {i}: ours {} {:?}, reference {} {:?}; reference context {:?}",
-                ours[i],
-                piece(ours[i]),
-                oracle[i],
-                piece(oracle[i]),
-                tok.decode(&oracle[from..(i + 4).min(oracle.len())])
-            ))
-        }
-        None if ours.len() != oracle.len() => Err(format!(
-            "lengths differ: ours {}, reference {} (equal up to the shorter)",
-            ours.len(),
-            oracle.len()
-        )),
-        None => Ok(()),
-    }
+    let i = match ours.iter().zip(oracle).position(|(a, b)| a != b) {
+        Some(i) => i,
+        None if ours.len() != oracle.len() => ours.len().min(oracle.len()),
+        None => return Ok(()),
+    };
+    let piece = |ids: &[u32]| match ids.get(i) {
+        Some(&id) => format!("{id} {:?}", String::from_utf8_lossy(tok.piece(id, true))),
+        None => "(end)".into(),
+    };
+    let (from, to) = (i.saturating_sub(4), i + 4);
+    let window = |ids: &[u32]| {
+        let w = &ids[from.min(ids.len())..to.min(ids.len())];
+        format!("{w:?} {:?}", tok.decode(w))
+    };
+    Err(format!(
+        "first difference at id {i} (byte {} of the reference's decode; ours {} ids, reference {}): \
+         ours {}, reference {}\n    ids {from}..{to} ours      {}\n    ids {from}..{to} reference {}",
+        tok.decode_bytes(&oracle[..i], true).len(),
+        ours.len(),
+        oracle.len(),
+        piece(ours),
+        piece(oracle),
+        window(ours),
+        window(oracle),
+    ))
 }
 
 /// Decode `ids` one at a time through the streaming decoder.

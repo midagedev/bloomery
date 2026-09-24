@@ -18,9 +18,10 @@
 //! pieces of their own. Regexes 1 and 3 name Unicode categories, so they run
 //! on the collapsed text (one byte per codepoint, see [`crate::unicode::collapse`])
 //! with each `\p{X}` rewritten as "its collapsed byte, plus the ASCII members
-//! the reference lists for X". Those ASCII lists are the reference's own
-//! (`k_ucat_map`), not Unicode's: `~` is in neither P nor S. Regex 2 names no
-//! category and runs on the codepoints themselves.
+//! the reference lists for X" (`k_ucat_map`). Those lists are Unicode's
+//! general categories below 0x80: P is `!-#%-*,-/:-;?-@[-]_{}` and S is
+//! `` $+<=>^`|~ ``, `~` included (Sm). Regex 2 names no category and runs on the
+//! codepoints themselves.
 //!
 //! The matchers below are those three regexes under ECMAScript semantics
 //! (leftmost start, alternatives in order, greedy quantifiers that back off),
@@ -77,8 +78,8 @@ fn is_punct(c: u8) -> bool {
 }
 
 fn is_symbol(c: u8) -> bool {
-    // `$+<=>^`|`
-    c == SYMBOL || matches!(c, 0x24 | 0x2B | 0x3C..=0x3E | 0x5E | 0x60 | 0x7C)
+    // `$+<=>^`|~`
+    c == SYMBOL || matches!(c, 0x24 | 0x2B | 0x3C..=0x3E | 0x5E | 0x60 | 0x7C | 0x7E)
 }
 
 fn is_letter_or_mark(c: u8) -> bool {

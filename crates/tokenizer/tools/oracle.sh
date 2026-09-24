@@ -37,7 +37,9 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 # IK (the text trees) and BLOOMERY_DATA default as in every runner here.
 # shellcheck source=tools/ref/ref-paths.sh
 source "$ROOT/tools/ref/ref-paths.sh"
-TOKENIZE=${TOKENIZE:-/home/user/ik-idxkey/build/bin/llama-tokenize}
+# ik with its k_ucat_map listing `~` as a symbol, as mainline and HF do; back to the V4.1 profile's ik
+# tree once that tree carries the same list.
+TOKENIZE=${TOKENIZE:-/home/user/ik-tilde/build/bin/llama-tokenize}
 # The V4.1 file set: the deepseek41 profile's choice, exported by tools/box.sh.
 V41_DIR=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
 
@@ -48,6 +50,13 @@ if [ -n "${TOKENIZER_VOCAB:-}" ]; then
 else
   SHARD=$(find "$V41_DIR" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
   [ -n "$SHARD" ] || { echo "oracle: no first shard under $V41_DIR" >&2; exit 66; }
+  # The reference's `~` is a symbol, so `~/` is one word and one id; a tree whose `~` is in neither
+  # P nor S returns [96, 17].
+  probe=$(CUDA_VISIBLE_DEVICES= "$TOKENIZE" -m "$SHARD" -p '~/' --ids --log-disable)
+  [ "$probe" = '[71520]' ] || {
+    echo "oracle: $TOKENIZE tokenizes '~/' as $probe on $SHARD, not [71520]: its \`~\` is not a symbol" >&2
+    exit 65
+  }
 fi
 SET=${TOKENIZER_SET:-tokenizer}
 case $SET in
