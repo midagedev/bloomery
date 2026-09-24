@@ -4,14 +4,16 @@
 //!
 //! One launch per token, the decode shape: the router's logit gemv with the
 //! rest of the chain fused into it. The gemv is `q8f32::f32_gemv`'s m = 1 row
-//! body — one warp per expert row, `f32_lane_partial_1col` and the fixed
-//! butterfly — so the logits are bit for bit that kernel's. The warp that owns
-//! a row also scores it ([`sqrt_softplus`]). The selection needs every
-//! expert's score, so it runs in the block that finishes last: each block
-//! publishes its rows (a fence, then one atomic ticket per block), and the
-//! block that draws the last ticket reads all scores back, adds the selection
-//! bias, picks the top six, writes the weights, and puts the ticket count back
-//! to zero for the next launch or graph replay.
+//! in its accumulation order — one warp per expert row, the lane walk
+//! `f32_lane_partial_1col_w32` (`f32_lane_partial_1col`'s sum with 32
+//! chunks' loads in flight) and the fixed butterfly — so the logits are bit
+//! for bit that kernel's. The warp that owns a row also scores it
+//! ([`sqrt_softplus`]). The selection needs every expert's score, so it runs
+//! in the block that finishes last: each block publishes its rows (a fence,
+//! then one atomic ticket per block), and the block that draws the last
+//! ticket reads all scores back, adds the selection bias, picks the top six,
+//! writes the weights, and puts the ticket count back to zero for the next
+//! launch or graph replay.
 //!
 //! Numeric contract — ik's CPU rule for this architecture, node for node
 //! (`SQRT_SOFTPLUS`, `ADD`, `ARGSORT`, `GET_ROWS`, `SUM_ROWS`, `DIV`,
@@ -28,7 +30,7 @@
 //!   leaves every other sum's bits alone), each score divided by it in f32,
 //!   then multiplied by `expert_weights_scale` in f32.
 
-use bloomery_gpu::q8f32::f32_lane_partial_1col;
+use bloomery_gpu::q8f32::f32_lane_partial_1col_w32;
 /// ik's expert score in f32; the gates' host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
 use bloomery_gpu::route_core::{renorm_divisor, take};
@@ -48,8 +50,9 @@ pub const N_EXPERT: usize = 384;
 /// Experts each token routes to (`expert_used_count`).
 pub const N_USED: usize = 6;
 
-/// Threads per router block, eight warps, one expert row per warp.
-const ROUTER_THREADS: usize = 256;
+/// Threads per router block, four warps, one expert row per warp: 96 blocks,
+/// so every SM of the card holds a row's walk.
+const ROUTER_THREADS: usize = 128;
 const ROUTER_THREADS_U32: u32 = ROUTER_THREADS as u32;
 const ROWS_PER_BLOCK: usize = ROUTER_THREADS / 32;
 
@@ -57,6 +60,8 @@ const ROWS_PER_BLOCK: usize = ROUTER_THREADS / 32;
 const PER_LANE: usize = N_EXPERT / 32;
 
 const _: () = assert!(ROUTER_THREADS_U32 as usize == ROUTER_THREADS);
+// The entry's `launch_bounds` and `launch_contract` block are literals.
+const _: () = assert!(ROUTER_THREADS == 128);
 const _: () = assert!(N_EXPERT.is_multiple_of(32) && N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
 // The selecting lane keeps its taken entries as bits of one u32.
 const _: () = assert!(PER_LANE <= 32);
@@ -72,8 +77,8 @@ mod router_kernels {
     /// order. `done[0]` is the block ticket count: zero before the launch,
     /// zero again after it.
     ///
-    /// Grid `n_expert / 8` blocks of [`ROUTER_THREADS`]; warp `r % 8` of
-    /// block `r / 8` owns row `r`. After its rows every thread fences and the
+    /// Grid `n_expert / 4` blocks of [`ROUTER_THREADS`]; warp `r % 4` of
+    /// block `r / 4` owns row `r`. After its rows every thread fences and the
     /// block meets at a barrier, so the rows are visible device-wide before
     /// thread 0 draws the block's ticket. The block that draws the last
     /// ticket copies every score into shared memory (coherent loads — its L1
@@ -88,10 +93,10 @@ mod router_kernels {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(128)]
     #[launch_contract(
         domain = 1,
-        block = (256, 1, 1),
+        block = (128, 1, 1),
         requires = (
             n_expert == 384,
             w.len() >= n_expert * k,
@@ -126,11 +131,11 @@ mod router_kernels {
         let lane = warp::lane_id() as usize;
         let row = thread::blockIdx_x() as usize * ROWS_PER_BLOCK + tid / 32;
         if row < n_expert as usize {
-            // `f32_gemv`'s m = 1 row: the same body and the same tree.
+            // `f32_gemv`'s m = 1 row: the same sum order and the same tree.
             // SAFETY: row < n_expert, so w.len() >= n_expert * k >= (row + 1) *
             // k, and x.len() >= k, by the launch contract; the launcher
             // passes k a positive multiple of 32; lane < 32.
-            let partial = unsafe { f32_lane_partial_1col(w, x, k, row, lane) };
+            let partial = unsafe { f32_lane_partial_1col_w32(w, x, k, row, lane) };
             let logit = warp::reduce_sum_f32(partial);
             if lane == 0 {
                 // SAFETY: row < n_expert <= logits.len() by the launch
@@ -185,10 +190,12 @@ mod router_kernels {
             // contract.
             let b = unsafe { *bias.get_unchecked(e) };
             // SAFETY: block-shared, e < N_EXPERT; thread `tid` writes entries
-            // tid + 256·i only, before the barrier that publishes them.
+            // tid + ROUTER_THREADS·i only, before the barrier that publishes
+            // them.
             unsafe { *score.add(e) = p };
             // SAFETY: block-shared, e < N_EXPERT; thread `tid` writes entries
-            // tid + 256·i only, before the barrier that publishes them.
+            // tid + ROUTER_THREADS·i only, before the barrier that publishes
+            // them.
             unsafe { *sel_v.add(e) = p + b };
             e += ROUTER_THREADS;
         }

@@ -3,7 +3,8 @@
 //!
 //! Kernels, in the order a layer runs them:
 //! - `dflash_router`: `ds41_router`'s body with this model's constants — the
-//!   `f32_gemv` m = 1 row per expert, [`sqrt_softplus`], the selection bias,
+//!   `f32_gemv` m = 1 row per expert in its accumulation order (the lane walk
+//!   `f32_lane_partial_1col_w32`), [`sqrt_softplus`], the selection bias,
 //!   three rounds of the butterfly argmax under `take::<true>` (an equal
 //!   value goes to the larger id), the weights from the unbiased scores. One
 //!   token per launch; token `tok` reads `x[tok·k ..]` and writes its logits,
@@ -43,7 +44,7 @@
 
 use crate::experts::swiglu_clamp;
 use bloomery_gpu::mxfp4::{self, Planes, lane_partials};
-use bloomery_gpu::q8f32::f32_lane_partial_1col;
+use bloomery_gpu::q8f32::f32_lane_partial_1col_w32;
 /// ik's expert score in f32; the gate's host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
 use bloomery_gpu::route_core::{renorm_divisor, take};
@@ -70,8 +71,8 @@ pub const MAX_TOKENS: usize = 8;
 /// Threads per block of the expert kernels: eight warps, a row each.
 const BLOCK: u32 = 256;
 
-/// Threads per router block, eight warps, one expert row per warp.
-const ROUTER_THREADS: usize = 256;
+/// Threads per router block, four warps, one expert row per warp.
+const ROUTER_THREADS: usize = 128;
 const ROUTER_THREADS_U32: u32 = ROUTER_THREADS as u32;
 const ROWS_PER_BLOCK: usize = ROUTER_THREADS / 32;
 
@@ -79,6 +80,8 @@ const ROWS_PER_BLOCK: usize = ROUTER_THREADS / 32;
 const PER_LANE: usize = N_EXPERT / 32;
 
 const _: () = assert!(ROUTER_THREADS_U32 as usize == ROUTER_THREADS);
+// The router entry's `launch_bounds` and `launch_contract` block are literals.
+const _: () = assert!(ROUTER_THREADS == 128);
 const _: () = assert!(N_EXPERT.is_multiple_of(32) && N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
 // The selecting lane keeps its taken entries as bits of one u32.
 const _: () = assert!(PER_LANE <= 32);
@@ -463,10 +466,10 @@ mod dflash_kernels {
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(128)]
     #[launch_contract(
         domain = 1,
-        block = (256, 1, 1),
+        block = (128, 1, 1),
         requires = (
             n_expert == 128,
             w.len() >= n_expert * k,
@@ -508,11 +511,11 @@ mod dflash_kernels {
             let x0 = tok as usize * k as usize;
             // SAFETY: x.len() >= tok·k + k = x0 + k by the launch contract.
             let xt = unsafe { x.get_unchecked(x0..x0 + k as usize) };
-            // `f32_gemv`'s m = 1 row: the same body and the same tree.
+            // `f32_gemv`'s m = 1 row: the same sum order and the same tree.
             // SAFETY: row < n_expert, so w.len() >= n_expert * k >= (row + 1) *
             // k, and xt.len() = k, by the launch contract; the launcher
             // passes k a positive multiple of 32; lane < 32.
-            let partial = unsafe { f32_lane_partial_1col(w, xt, k, row, lane) };
+            let partial = unsafe { f32_lane_partial_1col_w32(w, xt, k, row, lane) };
             let logit = warp::reduce_sum_f32(partial);
             if lane == 0 {
                 // SAFETY: e0 + row < tok·n_expert + n_expert <= logits.len()
@@ -567,10 +570,12 @@ mod dflash_kernels {
             // contract.
             let b = unsafe { *bias.get_unchecked(e) };
             // SAFETY: block-shared, e < N_EXPERT; thread `tid` writes entries
-            // tid + 256·i only, before the barrier that publishes them.
+            // tid + ROUTER_THREADS·i only, before the barrier that publishes
+            // them.
             unsafe { *score.add(e) = p };
             // SAFETY: block-shared, e < N_EXPERT; thread `tid` writes entries
-            // tid + 256·i only, before the barrier that publishes them.
+            // tid + ROUTER_THREADS·i only, before the barrier that publishes
+            // them.
             unsafe { *sel_v.add(e) = p + b };
             e += ROUTER_THREADS;
         }
