@@ -258,3 +258,13 @@
 - **`q4k_gemv` 여러 열 경로는 K = 4096에서 열마다 1열 launch와 비트가 다르다**(col 0 1037/2048, max|d| 4.77e-7; K 2048은 같음) — `cores.rs:384` 문서의 "bit for bit" 주장이 거짓이다. 추정 원인은 누산 모양 차이(FMA 축약, 미확인). V4.1 밀집은 전부 m = 1이라 지금 걸리는 곳은 없다(plainfile 확인). 원인 규명 + 누산 통일 + 게이트 한 줄(M).
 - 곁가지: 3c(combine + 다음 층 norm_quant)는 `fused.rs:88` `norm_quant`에 코어가 없어 막힘(M, −0.1…−0.15 ms); `q6k_gemv` 행 코어 없음(`lib.rs:805`, Q6_K v를 qkv에 못 합침, M); `Q8Act` m ≤ 8이 프리필 패스를 막는다(`tensor.rs:120`, S–M); decode refresh의 동기 `copy_from_host`(`body.rs:372`, S–M); seg 패스가 n_kv·segs 블록을 전부 띄운다(`flash_gqa.rs:227`, ctx 32k에서 −0.1 ms, M); **serve의 `Generator::prefill`이 qwen3moe `prefill`을 안 쓴다**(`bind.rs:292` — 프롬프트 2–3× [유도], S–M); `gate_deepseek41_step.rs:2190, 2418`의 `top2`/`ppl`이 `kld`와 중복(S).
 - `GpuModel::run_rows`(model.rs, 덧붙이기 35줄)는 리드가 받았다.
+
+## 합집합 서비스 설계 카드 (unionsvc 보고, 2026-09-24 — 원문 세션 스크래치 `unionsvc-report.md`)
+
+- **호스트 쪽은 오늘 커널로 충분하다 [유도]**: 합집합은 곱셈 수(Σ m = 630)를 안 바꾸고 바이트만 × 0.753 — 곱셈/바이트 1.33배. 연산 천장 Q3_K 349 GB/s(단일 코어 10.9 × 32), Q4_K 496 GB/s라 DRAM 135 GB/s 대비 1.6–2.8배가 남는다. m열 디코드 1회 커널(ik 모양)은 필요 없다. 슬롯 16.77 MB = 0.124 ms.
+- **모양**: 오늘 행별 6행 630슬롯 78.1 ms / A lockstep 1 × 6열 474슬롯 58.9–63.0 ms / **B 두 그룹 skew 2 × 3열 535슬롯 66.3–66.9 ms**. 6행 패스도 skew가 된다 — 단위가 그룹이다.
+- **그러나 패스 시간은 카드가 정한다**: 오늘 카드는 행마다 한 토큰 런치라 C(6) ≈ 78–97 ms — 호스트 78 ms와 같거나 길다. 합집합의 20 ms는 패스에 안 보인다. **순서가 바뀐다: 검증 패스의 카드 m행 밀집(가중치 1회 읽기, m ≤ 8 K-quant gemv — 열마다 1열과 비트 동일이어야 skew 게이트가 선다, qwen3perf가 찾은 K 4096 여러 열 비트 틈) → 그 뒤 합집합.** 카드가 m행이 되면 B가 A를 이긴다(A는 카드 전·후처리 ~6 ms+를 직렬로 노출).
+- **비트 동일은 가능하다**: 내적은 같은 `dot_row`, 열 양자화는 열별 순함수(`ops.rs:392`), 합은 **열마다 슬롯 순서**(`moe.rs:937-941`) — expert 순서 scatter(`moe.rs:531-574`, 프리필)나 ik의 fma 누적을 그대로 옮기면 깨진다.
+- **라운드 둘(합쳐 L)**: `unionhost`(M — `experts_union_into`, defer를 다열 슬롯으로(`ops.rs:906-911`, `MAX_DEFER_SLOTS`/`GROUP_INLINE` 16), 호스트 hw 게이트(열마다 `experts_into`와 비트 동일, FAIL-first 둘), bench `union` 팔) → `uniongroup`(M — `hybrid.rs` 레인 × 열, `body.rs` `enqueue_groups`, skew 게이트 (lanes, cols) 일반화, (2, 1) = 오늘 Pair). dsloop 첫 팔은 오늘 행별 skew를 6행으로 넓힌 것(합집합 0). `unionhost`는 먼저 해도 손해 없다.
+- 결정 측정: bench `union` 팔(S) — 토큰당 ms ≈ union_bytes / 135 GB/s ± 5 %. 1.15배 넘게 느리면 결합 몫(defer) 먼저.
+- 정정: mistral.rs의 expert 묶음은 aarch64 전용, exllamav3 "K ≤ 8"은 비트 폭이고 행 상한은 `MAX_M = 4`.
