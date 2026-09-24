@@ -15,31 +15,39 @@ V4.1-Flash does not fit on one consumer card, so each decode step is split acros
 
 ## Status
 
-**It runs today, but only on a local model file.** The V4.1 engine loads a local mix of the public `Q3_K_M` GGUF: attention, shared experts and the engram tables in Q8_0, the token embedding in BF16 ([`docs/BUILD.md`](docs/BUILD.md#the-model-file)). The GPU dense path reads only Q8_0, so the public `Q3_K_M` file does not load yet. Support for the public file is the current work, and it comes before a download-and-run release.
+**It runs today on the public `Q3_K_M` GGUF** (`BLOOMERY_V41_MODEL` names its first shard; the default is still a local mix of the same file with attention, shared experts and the engram tables in Q8_0 and the token embedding in BF16 — [`docs/BUILD.md`](docs/BUILD.md#the-model-file)). On the public file the step, the skewed pass, the load, the lookup draft, chat and the server pass their gates. Seven per-op reference gates still check only Q8_0 weights and are being ported; the default moves to the public file when they pass.
 
-On that file you can run `generate_ds41` (token ids in, greedy ids out), `bloomery-chat` (text in, streamed text out, sampled or greedy) and `bloomery-serve-ds41` (llama-server's HTTP API with streaming, prompt-prefix reuse, reasoning and tool calls; one request at a time). The tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
+On either file you can run `generate_ds41` (token ids in, greedy ids out), `bloomery-chat` (text in, streamed text out, sampled or greedy) and `bloomery-serve-ds41` (llama-server's HTTP API with streaming, prompt-prefix reuse, reasoning and tool calls; one request at a time). The tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
 
-In progress: the public `Q3_K_M` file; a timed run on one RTX 3090; a DSpark speculative draft; Qwen3-30B-A3B on one card.
+In progress: the per-op gates on the public file; a timed run on one RTX 3090; a DSpark speculative draft; Qwen3-30B-A3B on one card.
 
 As far as we know (2026-09-24), this is the only Rust engine that runs DeepSeek-V4.1-Flash with CPU expert offloading, with the GPU kernels also written in Rust. If you know of another one, please open an issue.
 
 ## Measured numbers
 
-Decode on the RTX A6000 (48 GB), placement plan (a): every layer and the head on the card, 2,414 routed experts on the card picked by the router-ranked hot list, the rest on the host. Instrumentation off, `n = 96`, one fresh process per arm. **Both engines read the local Q8_0 mix above**, not the public file.
+Decode on the RTX A6000 (48 GB), placement plan (a): every layer and the head on the card, routed experts on the card picked by the router-ranked hot list, the rest on the host. Instrumentation off, `n = 96`, one fresh process per arm, two rounds each shown as `round 1 / round 2`.
 
-ik_llama.cpp ran in the same lease window, built from #2455 plus the draft #2507 (below), as `GGML_CUDA_NO_PINNED_WEIGHTS=1 llama-bench -ngl 999 --n-cpu-moe 34 -t 32 --defer-experts -gp 6,96`: six whole layers on the card, about the same host work per token [derived] but not the same experts. No flag sweep was run for ik.
+**The public `Q3_K_M` file.** The card keeps 2,668 routed experts (its dense tensors are Q3_K and Q4_K, so more expert bytes fit).
+
+| Depth | bloomery step p50 | bloomery tok/s (mean) |
+|---:|---:|---:|
+| 6 | 29.03 / 28.76 ms | 34.66 |
+| 4096 | 30.90 / 30.81 ms | 32.34 |
+
+Source: rig-log [2026-09-24, public Q3_K_M file](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#public-q3km-first-timing). ik_llama.cpp ran in the same window but its flags were sized for the mixed file and its two rounds differed by 43 %, so there is no cross-engine ratio on this file yet.
+
+**The local mix, against ik_llama.cpp.** The card keeps 2,414 routed experts. ik_llama.cpp ran in the same lease window, built from #2455 plus the draft #2507 (below), as `GGML_CUDA_NO_PINNED_WEIGHTS=1 llama-bench -ngl 999 --n-cpu-moe 34 -t 32 --defer-experts -gp 6,96`: six whole layers on the card, about the same host work per token [derived] but not the same experts. No flag sweep was run for ik.
 
 | Depth | bloomery step p50 | bloomery tok/s (p50) | ik_llama.cpp tok/s |
 |---:|---:|---:|---:|
 | 6 | 35.16 / 35.40 ms | 28.35 | 19.40 / 20.08 |
 | 4096 | 34.33 / 34.38 ms | 29.10 | not measured in this window |
 
-Two rounds each, shown as `round 1 / round 2`. The ratio at depth 6 is about 1.4× [derived from the table]. Source: rig-log [2026-09-24, hot-list placement](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#hot-list-placement-and-real-text-prompt).
+The ratio at depth 6 is about 1.4× [derived from the table]. Source: rig-log [2026-09-24, hot-list placement](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#hot-list-placement-and-real-text-prompt).
 
 Read these numbers with their conditions:
 
 - **No draft on either side.** ik_llama.cpp has a DSpark speculative draft for V4.1, which neither arm here ran. Ours is being built; the fair row is draft against draft.
-- **The model file is the local mix.** The public file's dense tensors are Q3_K, about 40 % of the mix's dense bytes, so the card's part of the step should shrink [derived]. The host tier's routed experts are the same in both files. Public-file numbers will be measured again.
 - **The prompt is synthetic.** The depth prompt is a fixed pseudo-random id sequence, and its output collapses into a few repeating tokens. With a 4096-token prose prompt the step was 42.59 ms against 38.41 ms for the synthetic prompt (instrumentation on). Expect real text to be about 10 % slower [derived from those two]; most of the difference is cold engram rows.
 - **The card is an A6000, not a 3090.** A single-3090 run (placement `gate`) has not been timed yet.
 - **The skewed pass has a break-even.** It costs 1.21–1.29 plain steps (A6000, depth 6), so a draft wins once more than 21–29 % of its tokens are accepted [derived from that ratio].
@@ -68,7 +76,7 @@ Timing runs only on a quiet machine, under a machine-wide lease, with a witness 
 
 ## Limits
 
-- **The public `Q3_K_M` file does not load yet** (see Status).
+- **The public `Q3_K_M` file is not the default yet**: seven per-op reference gates still check only Q8_0 weights (see Status).
 - **sm_86 only.** Every kernel is built and gated for Ampere (`--arch sm_86`). Other architectures are not tested.
 - **A pinned nightly.** The toolchain is `nightly-2026-08-28`, pinned together with a cuda-oxide git revision.
 - **One machine.** Timed numbers come from one A6000 in one workstation. The tooling (`tools/box.sh`) assumes a Mac editor and that workstation; [`docs/BUILD.md`](docs/BUILD.md) says what to run on your own host.
