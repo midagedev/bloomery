@@ -9,20 +9,26 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use serde_json::Value;
-use serve::{MockEngine, Server, ServerConfig};
+use serve::{Engine, FATAL_LINGER, MockEngine, Server, ServerConfig};
 
 pub const V41_TEMPLATE: &str = include_str!("../fixtures/v41-chat-template.jinja");
 pub const FIELDS: &str = include_str!("../fixtures/llama-server-fields.json");
 
 /// Starts a server on the mock engine (context `ctx`) and the V4.1 template.
 pub fn start(ctx: usize) -> SocketAddr {
+    start_with(Box::new(MockEngine::new(ctx)))
+}
+
+/// Starts a server on `engine` and the V4.1 template.
+pub fn start_with(engine: Box<dyn Engine>) -> SocketAddr {
     let config = ServerConfig {
         model_alias: "mock".to_owned(),
         model_path: "mock.gguf".to_owned(),
         chat_template: V41_TEMPLATE.to_owned(),
         sampler: None,
+        fatal_linger: FATAL_LINGER,
     };
-    let server = Server::bind("127.0.0.1:0", Box::new(MockEngine::new(ctx)), config).expect("bind");
+    let server = Server::bind("127.0.0.1:0", engine, config).expect("bind");
     server.spawn().expect("spawn")
 }
 

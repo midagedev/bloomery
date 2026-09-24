@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, EngineError, Sampler, SamplerFactory, SamplingParams};
+use crate::engine::{Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Tokenizer};
 use crate::stop::StopScan;
 
 /// Request knobs after parsing, llama-server defaults filled in.
@@ -90,6 +90,8 @@ impl StopKind {
 /// A finished generation.
 pub(crate) struct Outcome {
     pub content: String,
+    /// Every generated id, the end-of-generation one included.
+    pub tokens: Vec<u32>,
     pub stop: StopKind,
     pub stopping_word: String,
     pub truncated: bool,
@@ -117,6 +119,11 @@ fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+/// The logits buffer the engine fills, or `None` on a greedy request (empty buffer).
+fn out(logits: &mut [f32]) -> Option<&mut [f32]> {
+    (!logits.is_empty()).then_some(logits)
+}
+
 fn choose(sampler: &mut Option<Sampler>, greedy: u32, logits: &[f32], history: &[u32]) -> u32 {
     match sampler {
         Some(s) => s(logits, history),
@@ -126,9 +133,11 @@ fn choose(sampler: &mut Option<Sampler>, greedy: u32, logits: &[f32], history: &
 
 /// Runs one request on a reset engine. `ids` is non-empty and shorter than the context.
 /// `timings` in the returned outcome are filled even when the sink failed midway
-/// (the caller's counters still see the work done).
+/// (the caller's counters still see the work done). A greedy request never asks the
+/// engine for its logits.
 pub(crate) fn generate(
     engine: &mut dyn Engine,
+    vocab: &dyn Tokenizer,
     factory: &SamplerFactory,
     ids: &[u32],
     p: &GenParams,
@@ -137,11 +146,19 @@ pub(crate) fn generate(
 ) -> Result<Outcome, GenError> {
     let n = ids.len();
     let ctx_max = engine.ctx_max();
-    engine.reset();
+    let mut sampler = (p.sampling.temperature > 0.0).then(|| factory(&p.sampling));
+    let mut logits = vec![
+        0.0f32;
+        if sampler.is_some() {
+            vocab.n_vocab()
+        } else {
+            0
+        }
+    ];
+    engine.reset()?;
     let t0 = Instant::now();
     engine.prefill(&ids[..n - 1])?;
-    let mut logits = vec![0.0f32; engine.n_vocab()];
-    let greedy = engine.next(ids[n - 1], &mut logits)?;
+    let greedy = engine.next(ids[n - 1], out(&mut logits))?;
     let tim = timings_out;
     *tim = Timings {
         prompt_n: n,
@@ -154,11 +171,10 @@ pub(crate) fn generate(
     if p.return_progress {
         sink(Event::Prompt(tim))?;
     }
-    let mut sampler = (p.sampling.temperature > 0.0).then(|| factory(&p.sampling));
     let budget = usize::try_from(p.n_predict).unwrap_or(usize::MAX);
-    let eos = engine.eos();
+    let eos = vocab.eos();
     let mut scan = StopScan::new(p.stop.clone());
-    let mut dec = engine.decoder();
+    let mut dec = vocab.decoder();
     let mut generated: Vec<u32> = Vec::new();
     let mut stop = StopKind::Limit;
     let mut stopping_word = String::new();
@@ -192,7 +208,7 @@ pub(crate) fn generate(
                 truncated = true;
                 break;
             }
-            let g = engine.next(tok, &mut logits)?;
+            let g = engine.next(tok, out(&mut logits))?;
             tim.n_past = n + generated.len();
             tok = choose(&mut sampler, g, &logits, &generated);
         }
@@ -214,6 +230,7 @@ pub(crate) fn generate(
     tim.predicted_ms = ms_since(t1);
     Ok(Outcome {
         content: scan.text().to_owned(),
+        tokens: generated,
         stop,
         stopping_word,
         truncated,

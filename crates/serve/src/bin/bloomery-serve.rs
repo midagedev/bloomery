@@ -2,15 +2,18 @@
 //!
 //!   bloomery-serve [--host 127.0.0.1] [--port 8080] [--model <first.gguf>]
 //!                  [--chat-template-file <path>] [--alias <name>] [--ctx-size <n>]
-//!                  [--print-template]
+//!                  [--print-template] [--mock-fail-at <k>]
 //!
 //! `--model` reads `tokenizer.chat_template` and `general.name` from the GGUF
 //! header only; the engine is always the mock here. The binding to the GPU
-//! model is a separate, feature-gated binary.
+//! model is a separate, feature-gated binary (`bloomery-serve-ds41`).
+//!
+//! `--mock-fail-at k` makes the mock's `k`-th `next` an engine error: the crash
+//! path's gate. The process then prints the crash block and exits 70.
 
 use std::process::ExitCode;
 
-use serve::{MockEngine, Server, ServerConfig};
+use serve::{FATAL_LINGER, MockEngine, ServeError, Server, ServerConfig};
 
 /// Used when neither `--model` nor `--chat-template-file` gives one.
 const FALLBACK_TEMPLATE: &str = "{{- bos_token -}}{%- for m in messages -%}<|{{ m['role'] }}|>{{ m['content'] or '' }}\n{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
@@ -23,6 +26,7 @@ struct Args {
     alias: Option<String>,
     ctx: usize,
     print_template: bool,
+    fail_at: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -34,6 +38,7 @@ fn parse_args() -> Result<Args, String> {
         alias: None,
         ctx: 4096,
         print_template: false,
+        fail_at: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -48,9 +53,13 @@ fn parse_args() -> Result<Args, String> {
                 a.ctx = val()?.parse().map_err(|e| format!("--ctx-size: {e}"))?
             }
             "--print-template" => a.print_template = true,
+            "--mock-fail-at" => {
+                a.fail_at = Some(val()?.parse().map_err(|e| format!("--mock-fail-at: {e}"))?)
+            }
             "--help" | "-h" => {
                 return Err("usage: bloomery-serve [--host H] [--port P] [--model GGUF] \
-                            [--chat-template-file PATH] [--alias NAME] [--ctx-size N] [--print-template]"
+                            [--chat-template-file PATH] [--alias NAME] [--ctx-size N] [--print-template] \
+                            [--mock-fail-at K]"
                     .to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
@@ -106,12 +115,13 @@ fn main() -> ExitCode {
         model_path: args.model.clone().unwrap_or_else(|| "mock".to_owned()),
         chat_template: template,
         sampler: None,
+        fatal_linger: FATAL_LINGER,
     };
-    let server = match Server::bind(
-        (args.host.as_str(), args.port),
-        Box::new(MockEngine::new(args.ctx)),
-        config,
-    ) {
+    let engine = match args.fail_at {
+        Some(k) => MockEngine::failing_at(args.ctx, k),
+        None => MockEngine::new(args.ctx),
+    };
+    let server = match Server::bind((args.host.as_str(), args.port), Box::new(engine), config) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
@@ -122,11 +132,11 @@ fn main() -> ExitCode {
         Ok(addr) => eprintln!("bloomery-serve: mock engine, listening on http://{addr}"),
         Err(e) => eprintln!("bloomery-serve: {e}"),
     }
-    match server.run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("bloomery-serve: {e}");
-            ExitCode::from(1)
-        }
+    let e = server.run();
+    eprintln!("bloomery-serve: {e}");
+    match e {
+        // EX_SOFTWARE: the engine, not the listener, ended the run.
+        ServeError::Engine(_) => ExitCode::from(70),
+        ServeError::Io(_) | ServeError::Template(_) => ExitCode::from(1),
     }
 }

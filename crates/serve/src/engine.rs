@@ -1,13 +1,20 @@
 //! The engine contract the server drives, and the sampler hook it calls.
 //!
-//! The server owns one `Engine` behind a mutex (one slot). A request is:
-//! `reset`, `prefill(ids[..n-1])`, then `next(ids[n-1])` yields the first generated
-//! token and every later `next(prev)` the one after it. `tokens_evaluated` and
-//! `prompt_n` still count the whole prompt, `ids.len()`.
+//! The server owns one `Engine` behind a mutex (one slot) and the engine's
+//! [`Tokenizer`] outside it: `/tokenize`, `/detokenize` and prompt encoding never
+//! wait for a generation. A request is: `reset`, `prefill(ids[..n-1])`, then
+//! `next(ids[n-1])` yields the first generated token and every later `next(prev)`
+//! the one after it. `tokens_evaluated` and `prompt_n` still count the whole
+//! prompt, `ids.len()`.
+//!
+//! Any `EngineError` is fatal to the server: the request that met it gets a 500,
+//! `/health` answers 503, and [`crate::Server::run`] returns the error so the
+//! process exits instead of serving an engine in an unknown state.
 
 use std::sync::Arc;
 
-/// A failure inside the engine (a device error, a context overflow it detected itself).
+/// A failure inside the engine (a device error, a context overflow it detected
+/// itself, a NaN in the logits).
 #[derive(Debug, thiserror::Error)]
 #[error("engine: {0}")]
 pub struct EngineError(pub String);
@@ -21,35 +28,46 @@ pub trait Decoder: Send {
     fn flush(&mut self) -> String;
 }
 
-/// What the server needs from a model plus its tokenizer.
+/// The vocabulary side of a model. Shared by every connection thread, so it
+/// takes `&self` only and is read without the engine lock.
 ///
 /// `encode` must parse special-token strings the way llama.cpp does with
 /// `parse_special = true`: a rendered chat prompt carries the BOS string, the role
 /// markers and the think tags as text, and a plain BPE pass would split them.
-pub trait Engine: Send {
+pub trait Tokenizer: Send + Sync {
     /// Text to token ids, special-token strings mapped to their ids. Adds no BOS.
     fn encode(&self, text: &str) -> Vec<u32>;
     /// Token ids to text, special tokens rendered as their strings.
     fn decode(&self, ids: &[u32]) -> String;
     /// A fresh streaming decoder.
     fn decoder(&self) -> Box<dyn Decoder>;
-    /// Evaluates `ids` from the current position without producing a token.
-    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError>;
-    /// Evaluates `last`, writes the next position's logits into `logits_out`
-    /// (length `n_vocab`) and returns their argmax.
-    fn next(&mut self, last: u32, logits_out: &mut [f32]) -> Result<u32, EngineError>;
-    /// Drops the whole cache; the next `prefill` starts at position 0.
-    fn reset(&mut self);
     /// Beginning-of-sequence token id.
     fn bos(&self) -> u32;
     /// End-of-generation token id.
     fn eos(&self) -> u32;
     /// Whether a text prompt on `/completion` gets a BOS prepended (GGUF `add_bos_token`).
     fn add_bos(&self) -> bool;
+    /// Vocabulary size, which is also the logit vector length.
+    fn n_vocab(&self) -> usize;
+}
+
+/// What the server needs from a model.
+pub trait Engine: Send {
+    /// The vocabulary, taken once when the server binds.
+    fn tokenizer(&self) -> Arc<dyn Tokenizer>;
+    /// Evaluates `ids` from the current position without producing a token.
+    /// An empty slice is a no-op.
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError>;
+    /// Evaluates `last` and returns the argmax of the next position's logits.
+    /// With `Some(out)` (length `n_vocab`) it also writes those logits; a
+    /// greedy request passes `None` and the engine may skip reading them.
+    fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError>;
+    /// Drops the whole cache; the next `prefill` starts at position 0.
+    fn reset(&mut self) -> Result<(), EngineError>;
     /// Positions the cache holds.
     fn ctx_max(&self) -> usize;
-    /// Logit vector length.
-    fn n_vocab(&self) -> usize;
+    /// What a crash report names besides the error: the device, the position.
+    fn describe(&self) -> String;
 }
 
 /// The sampling knobs a request carries, llama-server names and defaults.

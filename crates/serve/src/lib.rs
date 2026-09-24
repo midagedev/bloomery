@@ -14,7 +14,9 @@ pub mod sampling;
 mod stop;
 pub mod template;
 
-pub use api::{ServeError, Server, ServerConfig};
-pub use engine::{Decoder, Engine, EngineError, Sampler, SamplerFactory, SamplingParams};
-pub use mock::MockEngine;
+pub use api::{EngineFailure, FATAL_LINGER, ServeError, Server, ServerConfig};
+pub use engine::{
+    Decoder, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Tokenizer,
+};
+pub use mock::{MockEngine, MockTokenizer};
 pub use template::{ChatTemplate, TemplateError};

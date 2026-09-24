@@ -534,3 +534,212 @@ fn hw_metrics_kv_cache_usage_ratio() {
         "n_past / ctx_max"
     );
 }
+
+/// The mock engine with a latch in `next`: the first `next` after `arm` blocks
+/// until `release`, and says so through `entered`.
+struct Held {
+    inner: serve::MockEngine,
+    latch: std::sync::Arc<Latch>,
+}
+
+#[derive(Default)]
+struct Latch {
+    state: std::sync::Mutex<(bool, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl Latch {
+    fn wait_entered(&self, bound: std::time::Duration) -> bool {
+        let g = self.state.lock().expect("latch");
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, bound, |s| !s.0)
+            .expect("latch");
+        g.0
+    }
+
+    fn release(&self) {
+        self.state.lock().expect("latch").1 = true;
+        self.cv.notify_all();
+    }
+}
+
+impl serve::Engine for Held {
+    fn tokenizer(&self) -> std::sync::Arc<dyn serve::Tokenizer> {
+        self.inner.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), serve::EngineError> {
+        self.inner.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, serve::EngineError> {
+        let mut g = self.latch.state.lock().expect("latch");
+        g.0 = true;
+        self.latch.cv.notify_all();
+        while !g.1 {
+            g = self.latch.cv.wait(g).expect("latch");
+        }
+        drop(g);
+        self.inner.next(last, out)
+    }
+    fn reset(&mut self) -> Result<(), serve::EngineError> {
+        self.inner.reset()
+    }
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_tokenize_answers_while_a_generation_holds_the_engine() {
+    let latch = std::sync::Arc::new(Latch::default());
+    let engine = Held {
+        inner: serve::MockEngine::new(4096),
+        latch: latch.clone(),
+    };
+    let addr = common::start_with(Box::new(engine));
+    let gen_thread =
+        std::thread::spawn(move || post(addr, "/v1/chat/completions", &chat_body(json!({}))));
+    assert!(
+        latch.wait_entered(std::time::Duration::from_secs(10)),
+        "the generation never reached the engine"
+    );
+    assert_eq!(get(addr, "/health").json()["slots_processing"], 1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(post(addr, "/tokenize", &json!({"content": "<｜User｜>hi"})));
+    });
+    let r = rx.recv_timeout(std::time::Duration::from_secs(5));
+    latch.release();
+    let r = r.expect("/tokenize waited on the engine lock while a generation held it");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["tokens"], json!([2, 110, 111]));
+    let done = gen_thread.join().expect("generation thread");
+    assert_eq!(done.json()["choices"][0]["message"]["content"], "abc");
+}
+
+/// A spawned server, killed and reaped if the test panics before it exits.
+struct Reaped(std::process::Child);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Starts `bloomery-serve --mock-fail-at k` on a free port; returns the child,
+/// its address and a channel of its stderr lines.
+fn spawn_failing(
+    k: usize,
+) -> (
+    Reaped,
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<String>,
+) {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"))
+        .args(["--port", "0", "--mock-fail-at", &k.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn bloomery-serve");
+    let err = child.stderr.take().expect("stderr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let first = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("bloomery-serve printed no address");
+    let addr = first
+        .rsplit_once("http://")
+        .and_then(|(_, a)| a.parse().ok())
+        .unwrap_or_else(|| panic!("no address in {first:?}"));
+    (Reaped(child), addr, rx)
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_engine_error_is_500_then_503_then_exit() {
+    // Next #1 answers the prompt's last token; #2, the first generated token's
+    // step, fails.
+    let (mut served, addr, stderr) = spawn_failing(2);
+    let child = &mut served.0;
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcab", "n_predict": 8, "temperature": 0}),
+    );
+    assert_eq!(r.status, 500, "{}", r.body);
+    let msg = r.json()["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(msg.contains("injected failure at next #2"), "{msg}");
+    let h = get(addr, "/health");
+    assert_eq!(h.status, 503, "{}", h.body);
+    assert_eq!(h.json()["status"], "error");
+    assert!(
+        h.json()["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("injected failure")),
+        "{}",
+        h.body
+    );
+    let again = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "ab", "n_predict": 1}),
+    );
+    assert_eq!(again.status, 503, "{}", again.body);
+    let t0 = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().expect("try_wait") {
+            break s;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(20),
+            "bloomery-serve kept serving a failed engine for 20 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(70), "{status:?}");
+    // The reader thread ends at the child's EOF, so this ends too.
+    let block: Vec<String> = stderr.iter().collect();
+    let block = block.join("\n");
+    assert!(block.contains("the engine failed"), "{block}");
+    assert!(block.contains("  engine: mock position=5"), "{block}");
+    assert!(
+        block.contains("  error: engine: mock: injected failure at next #2"),
+        "{block}"
+    );
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_completion_return_tokens() {
+    let addr = start(4096);
+    let body = |extra: Value| {
+        let mut b = json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0});
+        if let (Value::Object(b), Value::Object(e)) = (&mut b, extra) {
+            b.extend(e);
+        }
+        b
+    };
+    let v = post(addr, "/completion", &body(json!({"return_tokens": true}))).json();
+    // "a b c a b" in the mock's byte ids (six specials, then byte + 6).
+    assert_eq!(v["tokens"], json!([103, 104, 105, 103, 104]), "{v}");
+    assert_eq!(v["content"], "abcab");
+    let v = post(addr, "/completion", &body(json!({}))).json();
+    assert!(v.get("tokens").is_none(), "{v}");
+}

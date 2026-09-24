@@ -10,8 +10,13 @@
 //! other token that ever followed the last token gets logit 2, the rest -8. A last
 //! token never seen before predicts EOS. Deterministic, and seed-sensitive once a
 //! sampler with temperature > 0 is in the loop.
+//!
+//! [`MockEngine::failing_at`] makes the `k`-th `next` of the engine's life an
+//! error, for the crash-path gate.
 
-use crate::engine::{Decoder, Engine, EngineError};
+use std::sync::Arc;
+
+use crate::engine::{Decoder, Engine, EngineError, Tokenizer};
 
 /// Special strings, in id order. Longest-match wins on encode.
 pub const SPECIALS: [&str; 6] = [
@@ -33,6 +38,9 @@ const FLOOR: f32 = -8.0;
 pub struct MockEngine {
     ctx: Vec<u32>,
     ctx_max: usize,
+    tok: Arc<MockTokenizer>,
+    nexts: usize,
+    fail_at: Option<usize>,
 }
 
 impl MockEngine {
@@ -42,6 +50,19 @@ impl MockEngine {
         MockEngine {
             ctx: Vec::new(),
             ctx_max,
+            tok: Arc::new(MockTokenizer),
+            nexts: 0,
+            fail_at: None,
+        }
+    }
+
+    /// A mock whose `k`-th call to `next` (counted from 1 over its whole life)
+    /// fails with an `EngineError`.
+    #[must_use]
+    pub fn failing_at(ctx_max: usize, k: usize) -> Self {
+        MockEngine {
+            fail_at: Some(k),
+            ..MockEngine::new(ctx_max)
         }
     }
 
@@ -69,7 +90,10 @@ fn token_bytes(id: u32) -> Vec<u8> {
     }
 }
 
-impl Engine for MockEngine {
+/// The mock's vocabulary (see the module header).
+pub struct MockTokenizer;
+
+impl Tokenizer for MockTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         let bytes = text.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
@@ -103,45 +127,6 @@ impl Engine for MockEngine {
         Box::new(Utf8Decoder { held: Vec::new() })
     }
 
-    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
-        ids.iter().try_for_each(|&id| self.push(id))
-    }
-
-    fn next(&mut self, last: u32, logits_out: &mut [f32]) -> Result<u32, EngineError> {
-        self.push(last)?;
-        logits_out.fill(FLOOR);
-        let n = self.ctx.len();
-        let mut predicted = self.eos();
-        let mut found = false;
-        for j in (0..n - 1).rev() {
-            if self.ctx[j] != last {
-                continue;
-            }
-            let follower = self.ctx[j + 1];
-            if let Some(slot) = usize::try_from(follower)
-                .ok()
-                .and_then(|f| logits_out.get_mut(f))
-            {
-                *slot = slot.max(FOLLOWER);
-            }
-            if !found {
-                predicted = follower;
-                found = true;
-            }
-        }
-        if let Some(slot) = usize::try_from(predicted)
-            .ok()
-            .and_then(|p| logits_out.get_mut(p))
-        {
-            *slot = PREDICTED;
-        }
-        Ok(predicted)
-    }
-
-    fn reset(&mut self) {
-        self.ctx.clear();
-    }
-
     fn bos(&self) -> u32 {
         0
     }
@@ -154,12 +139,71 @@ impl Engine for MockEngine {
         false
     }
 
+    fn n_vocab(&self) -> usize {
+        SPECIALS.len() + 256
+    }
+}
+
+impl Engine for MockEngine {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        self.tok.clone()
+    }
+
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        ids.iter().try_for_each(|&id| self.push(id))
+    }
+
+    fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.nexts += 1;
+        if self.fail_at == Some(self.nexts) {
+            return Err(EngineError(format!(
+                "mock: injected failure at next #{} (position {})",
+                self.nexts,
+                self.ctx.len()
+            )));
+        }
+        self.push(last)?;
+        let mut logits = logits_out;
+        if let Some(l) = logits.as_deref_mut() {
+            l.fill(FLOOR);
+        }
+        let mut raise = |id: u32, v: f32| {
+            if let Some(slot) = logits
+                .as_deref_mut()
+                .and_then(|l| l.get_mut(usize::try_from(id).ok()?))
+            {
+                *slot = slot.max(v);
+            }
+        };
+        let n = self.ctx.len();
+        let mut predicted = MockTokenizer.eos();
+        let mut found = false;
+        for j in (0..n - 1).rev() {
+            if self.ctx[j] != last {
+                continue;
+            }
+            let follower = self.ctx[j + 1];
+            raise(follower, FOLLOWER);
+            if !found {
+                predicted = follower;
+                found = true;
+            }
+        }
+        raise(predicted, PREDICTED);
+        Ok(predicted)
+    }
+
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.ctx.clear();
+        Ok(())
+    }
+
     fn ctx_max(&self) -> usize {
         self.ctx_max
     }
 
-    fn n_vocab(&self) -> usize {
-        SPECIALS.len() + 256
+    fn describe(&self) -> String {
+        format!("mock position={}", self.ctx.len())
     }
 }
 
@@ -202,7 +246,7 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip_with_specials_and_multibyte() {
-        let m = MockEngine::new(64);
+        let m = MockTokenizer;
         let text = "<｜User｜>héllo</think>";
         let ids = m.encode(text);
         assert_eq!(ids[0], 2);
@@ -216,14 +260,16 @@ mod tests {
     #[test]
     fn bigram_echo_and_eos() {
         let mut m = MockEngine::new(64);
-        let ids = m.encode("abcab");
-        let mut logits = vec![0.0; m.n_vocab()];
+        let t = MockTokenizer;
+        let ids = t.encode("abcab");
+        let mut logits = vec![0.0; t.n_vocab()];
         m.prefill(&ids[..ids.len() - 1]).expect("fits");
-        let next = m.next(ids[ids.len() - 1], &mut logits).expect("fits");
-        assert_eq!(m.decode(&[next]), "c");
-        m.reset();
-        let ids = m.encode("xyz");
+        let next = m.next(ids[ids.len() - 1], Some(&mut logits)).expect("fits");
+        assert_eq!(t.decode(&[next]), "c");
+        assert_eq!(logits[next as usize], PREDICTED);
+        m.reset().expect("mock reset");
+        let ids = t.encode("xyz");
         m.prefill(&ids[..2]).expect("fits");
-        assert_eq!(m.next(ids[2], &mut logits).expect("fits"), m.eos());
+        assert_eq!(m.next(ids[2], None).expect("fits"), t.eos());
     }
 }

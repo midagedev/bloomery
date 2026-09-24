@@ -109,12 +109,14 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-model",
  "bloomery-sampler",
+ "bloomery-serve",
  "bloomery-threads",
  "bloomery-tokenizer",
  "cuda-core",
  "libc",
  "memmap2",
  "oxide-artifacts",
+ "serde_json",
 ]
 
 [[package]]

@@ -2,19 +2,26 @@
 //! llama-server (ik_llama.cpp `examples/server`) so its clients work unchanged.
 //!
 //! One slot: the engine sits behind a mutex and a second generation waits for
-//! the first. `/health`, `/props`, `/slots`, `/metrics` and `/v1/models` never
-//! take that mutex.
+//! the first. `/health`, `/props`, `/slots`, `/metrics`, `/v1/models` and the
+//! tokenizer endpoints never take that mutex.
+//!
+//! An engine error is fatal: the request that met it gets a 500 carrying the
+//! engine's message, every later generation and `/health` a 503 with the reason,
+//! and after [`ServerConfig::fatal_linger`] [`Server::run`] returns
+//! [`ServeError::Engine`] so the process exits instead of holding the port with a
+//! dead engine behind it.
 
+use std::fmt;
 use std::io::{self, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
-use crate::engine::{Engine, SamplerFactory, SamplingParams};
+use crate::engine::{Engine, SamplerFactory, SamplingParams, Tokenizer};
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Timings};
 use crate::http::{self, EventStream, Request};
 use crate::sampling;
@@ -30,6 +37,33 @@ pub struct ServerConfig {
     pub chat_template: String,
     /// Per-request sampler builder; `None` uses [`sampling::reference_factory`].
     pub sampler: Option<SamplerFactory>,
+    /// How long `/health` keeps answering 503 after an engine error before
+    /// [`Server::run`] returns.
+    pub fatal_linger: Duration,
+}
+
+/// The default [`ServerConfig::fatal_linger`]: long enough for a client or a
+/// supervisor to read the 503, short enough that the port frees promptly.
+pub const FATAL_LINGER: Duration = Duration::from_secs(2);
+
+/// An engine error that ended the server: the error and what the engine said
+/// about itself when it happened. Its `Display` is the crash block.
+#[derive(Debug, Clone)]
+pub struct EngineFailure {
+    /// [`Engine::describe`] at the failure.
+    pub engine: String,
+    /// The engine's message.
+    pub error: String,
+}
+
+impl fmt::Display for EngineFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the engine failed; the server stops instead of serving it\n  engine: {}\n  error: {}",
+            self.engine, self.error
+        )
+    }
 }
 
 /// Why the server could not start.
@@ -39,12 +73,21 @@ pub enum ServeError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Template(#[from] TemplateError),
+    #[error("{0}")]
+    Engine(EngineFailure),
+}
+
+/// Why the accept loop ended.
+enum End {
+    Io(io::Error),
+    Engine(EngineFailure),
 }
 
 /// A bound, not yet running server.
 pub struct Server {
     listener: TcpListener,
     state: Arc<State>,
+    ended: mpsc::Receiver<End>,
 }
 
 impl Server {
@@ -56,14 +99,20 @@ impl Server {
     ) -> Result<Self, ServeError> {
         let template = ChatTemplate::parse(&config.chat_template)?;
         let listener = TcpListener::bind(addr)?;
+        let tok = engine.tokenizer();
         let info = ModelInfo {
-            n_vocab: engine.n_vocab(),
+            n_vocab: tok.n_vocab(),
             ctx_max: engine.ctx_max(),
-            bos_text: engine.decode(&[engine.bos()]),
-            eos_text: engine.decode(&[engine.eos()]),
+            bos_text: tok.decode(&[tok.bos()]),
+            eos_text: tok.decode(&[tok.eos()]),
         };
+        let (end_tx, ended) = mpsc::channel();
         let state = State {
             engine: Mutex::new(engine),
+            tok,
+            fatal: Mutex::new(None),
+            end: end_tx,
+            fatal_linger: config.fatal_linger,
             template,
             alias: config.model_alias,
             model_path: config.model_path,
@@ -79,6 +128,7 @@ impl Server {
         Ok(Server {
             listener,
             state: Arc::new(state),
+            ended,
         })
     }
 
@@ -87,14 +137,38 @@ impl Server {
         self.listener.local_addr()
     }
 
-    /// Accepts connections until the listener fails; one thread each.
-    pub fn run(self) -> io::Result<()> {
-        for conn in self.listener.incoming() {
-            let stream = conn?;
-            let state = Arc::clone(&self.state);
-            thread::spawn(move || serve_conn(&state, stream));
+    /// Accepts connections, one thread each, until the listener fails or the
+    /// engine does, and returns why.
+    pub fn run(self) -> ServeError {
+        let Server {
+            listener,
+            state,
+            ended,
+        } = self;
+        let accept_state = Arc::clone(&state);
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(stream) => {
+                        let state = Arc::clone(&accept_state);
+                        thread::spawn(move || serve_conn(&state, stream));
+                    }
+                    Err(e) => {
+                        let _ = accept_state.end.send(End::Io(e));
+                        return;
+                    }
+                }
+            }
+        });
+        match ended.recv() {
+            Ok(End::Io(e)) => ServeError::Io(e),
+            Ok(End::Engine(f)) => {
+                thread::sleep(state.fatal_linger);
+                ServeError::Engine(f)
+            }
+            // `state` holds a sender, so the channel cannot close while we wait.
+            Err(mpsc::RecvError) => ServeError::Io(io::Error::other("accept loop vanished")),
         }
-        Ok(())
     }
 
     /// Runs the accept loop on a background thread and returns the address.
@@ -137,6 +211,12 @@ struct SlotView {
 
 struct State {
     engine: Mutex<Box<dyn Engine>>,
+    /// The engine's vocabulary, read without the engine lock.
+    tok: Arc<dyn Tokenizer>,
+    /// Set by the request that met an engine error; the reason `/health` gives.
+    fatal: Mutex<Option<String>>,
+    end: mpsc::Sender<End>,
+    fatal_linger: Duration,
     template: ChatTemplate,
     alias: String,
     model_path: String,
@@ -466,6 +546,12 @@ fn default_params() -> GenParams {
 // ---------------------------------------------------------------- read-only endpoints
 
 fn health(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    if let Some(reason) = relock(&state.fatal).clone() {
+        let mut v = error_body(503, "unavailable_error", &reason);
+        v["status"] = json!("error");
+        v["reason"] = json!(reason);
+        return send_json(w, req, 503, &v);
+    }
     let busy = state.busy.load(Ordering::SeqCst);
     let v = json!({
         "status": if busy { "no slot available" } else { "ok" },
@@ -667,15 +753,15 @@ fn tokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
     let content = b.get("content").and_then(Value::as_str).unwrap_or("");
     let add_special = get_b(b, "add_special").unwrap_or(false);
     let with_pieces = get_b(b, "with_pieces").unwrap_or(false);
-    let e = state.engine();
+    let t = &*state.tok;
     let mut ids = Vec::new();
-    if add_special && e.add_bos() {
-        ids.push(e.bos());
+    if add_special && t.add_bos() {
+        ids.push(t.bos());
     }
-    ids.extend(e.encode(content));
+    ids.extend(t.encode(content));
     let tokens: Vec<Value> = if with_pieces {
         ids.iter()
-            .map(|&id| json!({ "id": id, "piece": e.decode(&[id]) }))
+            .map(|&id| json!({ "id": id, "piece": t.decode(&[id]) }))
             .collect()
     } else {
         ids.iter().map(|&id| json!(id)).collect()
@@ -688,7 +774,7 @@ fn detokenize(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> 
         None => Vec::new(),
         Some(v) => token_ids(state, v)?,
     };
-    Ok(json!({ "content": state.engine().decode(&ids) }))
+    Ok(json!({ "content": state.tok.decode(&ids) }))
 }
 
 fn token_ids(state: &State, v: &Value) -> Result<Vec<u32>, ApiError> {
@@ -765,17 +851,35 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
 
 // ---------------------------------------------------------------- generation endpoints
 
-/// Holds the slot for one generation: busy flag, slot view, counters.
+/// Holds the slot for one generation: busy flag, slot view, counters. Dropped
+/// after the response is written; an engine failure it met is signalled then.
 struct Run<'a> {
     state: &'a State,
     engine: MutexGuard<'a, Box<dyn Engine>>,
+    failure: Option<EngineFailure>,
+}
+
+fn dead_engine(reason: &str) -> ApiError {
+    ApiError {
+        code: 503,
+        kind: "unavailable_error",
+        message: format!("the engine failed and the server is stopping: {reason}"),
+    }
 }
 
 impl<'a> Run<'a> {
-    fn begin(state: &'a State) -> Self {
+    /// Waits for the slot; refuses once the engine has failed.
+    fn begin(state: &'a State) -> Result<Self, ApiError> {
         let engine = state.engine();
+        if let Some(reason) = relock(&state.fatal).as_deref() {
+            return Err(dead_engine(reason));
+        }
         state.busy.store(true, Ordering::SeqCst);
-        Run { state, engine }
+        Ok(Run {
+            state,
+            engine,
+            failure: None,
+        })
     }
 
     /// Validates the prompt and runs the loop, then books the counters.
@@ -812,6 +916,7 @@ impl<'a> Run<'a> {
         let mut tim = Timings::default();
         let r = genloop::generate(
             &mut **self.engine,
+            &*self.state.tok,
             &self.state.sampler,
             ids,
             p,
@@ -819,6 +924,14 @@ impl<'a> Run<'a> {
             &mut tim,
         );
         self.book(&tim, r.as_ref().ok());
+        if let Err(GenError::Engine(e)) = &r {
+            let f = EngineFailure {
+                engine: self.engine.describe(),
+                error: e.to_string(),
+            };
+            *relock(&self.state.fatal) = Some(f.error.clone());
+            self.failure = Some(f);
+        }
         Ok(r)
     }
 
@@ -848,16 +961,16 @@ impl<'a> Run<'a> {
 impl Drop for Run<'_> {
     fn drop(&mut self) {
         self.state.busy.store(false, Ordering::SeqCst);
+        if let Some(f) = self.failure.take() {
+            let _ = self.state.end.send(End::Engine(f));
+        }
     }
 }
 
 /// The prompt of `/completion`: text (BOS per `add_bos_token`), an id array, or a
 /// mixed array whose strings are tokenized in place.
-fn completion_prompt(
-    state: &State,
-    e: &dyn Engine,
-    v: Option<&Value>,
-) -> Result<Vec<u32>, ApiError> {
+fn completion_prompt(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError> {
+    let e = &*state.tok;
     match v {
         Some(Value::String(s)) => {
             let mut ids = Vec::new();
@@ -884,8 +997,16 @@ fn completion_prompt(
     }
 }
 
-fn completion_final(state: &State, o: &Outcome, p: &GenParams, prompt: &Value) -> Value {
-    json!({
+/// The last `/completion` object. `tokens` (the generated ids, the
+/// end-of-generation one included) is llama.cpp's `return_tokens` field.
+fn completion_final(
+    state: &State,
+    o: &Outcome,
+    p: &GenParams,
+    prompt: &Value,
+    return_tokens: bool,
+) -> Value {
+    let mut v = json!({
         "content": if p.stream { "" } else { o.content.as_str() },
         "generated_text": o.content,
         "id_slot": 0,
@@ -903,7 +1024,11 @@ fn completion_final(state: &State, o: &Outcome, p: &GenParams, prompt: &Value) -
         "stop_type": o.stop.as_str(),
         "tokens_cached": o.timings.n_past,
         "timings": o.timings.to_json(),
-    })
+    });
+    if return_tokens {
+        v["tokens"] = json!(o.tokens);
+    }
+    v
 }
 
 fn sse(s: &mut EventStream<'_>, v: &Value) -> io::Result<()> {
@@ -924,9 +1049,13 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
-    let mut run = Run::begin(state);
-    let ids = match completion_prompt(state, &**run.engine, b.get("prompt")) {
+    let ids = match completion_prompt(state, b.get("prompt")) {
         Ok(ids) => ids,
+        Err(e) => return send_error(w, req, &e),
+    };
+    let return_tokens = get_b(&b, "return_tokens").unwrap_or(false);
+    let mut run = match Run::begin(state) {
+        Ok(r) => r,
         Err(e) => return send_error(w, req, &e),
     };
     let prompt = b.get("prompt").cloned().unwrap_or(Value::Null);
@@ -934,7 +1063,12 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         return match run.go(&ids, prompt.clone(), &p, &mut |_| Ok(())) {
             Err(e) => send_error(w, req, &e),
             Ok(Err(e)) => send_error(w, req, &engine_error(&e)),
-            Ok(Ok(o)) => send_json(w, req, 200, &completion_final(state, &o, &p, &prompt)),
+            Ok(Ok(o)) => send_json(
+                w,
+                req,
+                200,
+                &completion_final(state, &o, &p, &prompt, return_tokens),
+            ),
         };
     }
     let mut stream: Option<EventStream<'_>> = None;
@@ -969,7 +1103,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         run.go(&ids, prompt.clone(), &p, &mut sink)
     };
     finish_stream(req, stream, w_opt, r, |s, o| {
-        sse(s, &completion_final(state, o, &p, &prompt))
+        sse(s, &completion_final(state, o, &p, &prompt, return_tokens))
     })
 }
 
@@ -1060,8 +1194,11 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .and_then(Value::as_str)
             .map_or_else(|| state.alias.clone(), str::to_owned),
     };
-    let mut run = Run::begin(state);
-    let ids = run.engine.encode(&text);
+    let ids = state.tok.encode(&text);
+    let mut run = match Run::begin(state) {
+        Ok(r) => r,
+        Err(e) => return send_error(w, req, &e),
+    };
     let prompt = Value::String(text);
     if !p.stream {
         return match run.go(&ids, prompt, &p, &mut |_| Ok(())) {
