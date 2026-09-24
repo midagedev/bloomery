@@ -624,18 +624,75 @@ mod kernels {
     /// chains). 16 dp4a cover 32 values — twice Q3_K's density, inherent to
     /// the nibble-sibling layout.
     ///
-    /// Q4_K (K = 256*n_sb values, n_sb super-blocks per row) times q8_1
-    /// activations, M <= 8. One warp per row, guarded scalar accumulators.
-    /// The warp covers FOUR super-blocks per iteration (lane L owns the
-    /// 32-value sub-block s = L&7 of super-block 4*it + L>>3), so the row
-    /// takes iters = ceil(n_sb/4) iterations; when n_sb is not a multiple
-    /// of 4 the last iteration's high octets have no super-block and their
-    /// lanes contribute nothing (no warp-collective op lives in the loop).
-    /// Each lane keeps its whole sub-block local: the min-offset B chain
-    /// reduces to one s8 group-sum load per column (the quantize kernel
-    /// precomputed the exact integer the per-column dp4a(0x01010101) chain
-    /// accumulated), and the qs window is decoded once per iteration into
-    /// vi[8] instead of once per column.
+    /// Q4_K (K = 256*n_sb values, n_sb super-blocks per row) times ONE
+    /// q8_1 activation column — the decode shape; `q4k_gemv_mcol` takes
+    /// 1..=8. One warp per row. The warp covers FOUR super-blocks per
+    /// iteration (lane L owns the 32-value sub-block s = L&7 of super-block
+    /// 4*it + L>>3), so the row takes iters = ceil(n_sb/4) iterations; when
+    /// n_sb is not a multiple of 4 the last iteration's high octets have no
+    /// super-block and their lanes contribute nothing (no warp-collective op
+    /// lives in the loop). Each lane keeps its whole sub-block local: the
+    /// min-offset B chain reduces to one s8 group-sum load (the quantize
+    /// kernel precomputed the exact integer the dp4a(0x01010101) chain
+    /// accumulated). The per-row body is `cores::q4k_row_dot_1col`.
+    ///
+    /// The column count is not a parameter: registers are allocated per
+    /// entry, and an entry holding both walks is given more than either
+    /// needs alone, so the decode shape would run below the occupancy its
+    /// own walk allows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_rows * 36 * n_sb,
+            q.len() >= 256 * iters,
+            s8.len() >= 8 * n_sb,
+            d8.len() >= 2 * n_sb,
+            y.len() >= n_rows
+        )
+    )]
+    pub fn q4k_gemv(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let f0 = q4k_row_dot_1col(w, q, s8, d8, n_sb as usize, iters, row, 0, lane);
+        let s0 = warp::reduce_sum_f32(f0);
+        if lane == 0 {
+            // SAFETY: only lane 0 writes; warp `row` owns y[row].
+            unsafe {
+                *y.get_unchecked_mut(row) = s0;
+            }
+        }
+    }
+
+    /// `q4k_gemv` over `m_cols` (1..=8) q8_1 activation columns, `y[r·m +
+    /// c]`: one warp per row, the qs window decoded once per iteration into
+    /// vi[8] for every column, guarded scalar accumulators. The per-row body
+    /// is `cores::q4k_row_dot`, whose column c is `q4k_row_dot_1col` on that
+    /// column bit for bit — so column c here is the `q4k_gemv` launch of
+    /// column c.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -646,10 +703,12 @@ mod kernels {
             q.len() >= m_cols * 256 * iters,
             s8.len() >= m_cols * 8 * n_sb,
             d8.len() >= m_cols * 2 * n_sb,
-            y.len() >= n_rows * m_cols
+            y.len() >= n_rows * m_cols,
+            m_cols >= 1,
+            m_cols <= 8
         )
     )]
-    pub fn q4k_gemv(
+    pub fn q4k_gemv_mcol(
         w: &[u32],
         q: &[u32],
         s8: &[i32],
@@ -667,27 +726,6 @@ mod kernels {
         }
         let lane = warp::lane_id() as usize;
         let m = m_cols as usize;
-        // One column takes the single-column body directly. Reached through
-        // the array-returning `cores::q4k_row_dot`, its `m_cols == 1` early
-        // return hands back seven constant zeros that the caller's m > 1
-        // reduction still merges, and the backend keeps them as copies in the
-        // walk — a launch-uniform column count is the one thing that lets the
-        // entry pick the body instead.
-        if m == 1 {
-            let f0 = q4k_row_dot_1col(w, q, s8, d8, n_sb as usize, iters, row, 0, lane);
-            let s0 = warp::reduce_sum_f32(f0);
-            if lane == 0 {
-                // SAFETY: only lane 0 writes; warp `row` owns y[row].
-                unsafe {
-                    *y.get_unchecked_mut(row) = s0;
-                }
-            }
-            return;
-        }
-        // The per-row body (lane constants, the four-super-block iteration
-        // with the hoisted SWAR nibble decode, the guarded column chains) is
-        // `cores::q4k_row_dot`, so a fused kernel reusing it agrees with this
-        // one bit for bit.
         let f = q4k_row_dot(
             w,
             q,
@@ -701,71 +739,72 @@ mod kernels {
             lane,
         );
 
-        // Warp-uniform reduction (m is a launch-wide constant, and > 1 here).
-        // Column c's reduction runs only when m > c; every lane takes the same
-        // branch, so the shuffles stay warp-collective, and the tail scales
-        // with m exactly like the column bodies above.
+        // Warp-uniform reduction (m is a launch-wide constant). Column c's
+        // reduction runs only when m > c; every lane takes the same branch,
+        // so the shuffles stay warp-collective.
         let s0 = warp::reduce_sum_f32(f[0]);
-        {
-            let s1 = warp::reduce_sum_f32(f[1]);
-            let s2 = if m > 2 {
-                warp::reduce_sum_f32(f[2])
-            } else {
-                0.0
-            };
-            let s3 = if m > 3 {
-                warp::reduce_sum_f32(f[3])
-            } else {
-                0.0
-            };
-            let s4 = if m > 4 {
-                warp::reduce_sum_f32(f[4])
-            } else {
-                0.0
-            };
-            let s5 = if m > 5 {
-                warp::reduce_sum_f32(f[5])
-            } else {
-                0.0
-            };
-            let s6 = if m > 6 {
-                warp::reduce_sum_f32(f[6])
-            } else {
-                0.0
-            };
-            let s7 = if m > 7 {
-                warp::reduce_sum_f32(f[7])
-            } else {
-                0.0
-            };
-            if lane == 0 {
-                // SAFETY: only lane 0 of each warp writes the disjoint
-                // segment y[row*m .. row*m+m]: store c is guarded by m > c,
-                // so exactly the first m slots of the row are touched.
-                unsafe {
-                    let b = row * m;
-                    *y.get_unchecked_mut(b) = s0;
-                    if m > 1 {
-                        *y.get_unchecked_mut(b + 1) = s1;
-                    }
-                    if m > 2 {
-                        *y.get_unchecked_mut(b + 2) = s2;
-                    }
-                    if m > 3 {
-                        *y.get_unchecked_mut(b + 3) = s3;
-                    }
-                    if m > 4 {
-                        *y.get_unchecked_mut(b + 4) = s4;
-                    }
-                    if m > 5 {
-                        *y.get_unchecked_mut(b + 5) = s5;
-                    }
-                    if m > 6 {
-                        *y.get_unchecked_mut(b + 6) = s6;
-                    }
-                    if m > 7 {
-                        *y.get_unchecked_mut(b + 7) = s7;
-                    }
+        let s1 = if m > 1 {
+            warp::reduce_sum_f32(f[1])
+        } else {
+            0.0
+        };
+        let s2 = if m > 2 {
+            warp::reduce_sum_f32(f[2])
+        } else {
+            0.0
+        };
+        let s3 = if m > 3 {
+            warp::reduce_sum_f32(f[3])
+        } else {
+            0.0
+        };
+        let s4 = if m > 4 {
+            warp::reduce_sum_f32(f[4])
+        } else {
+            0.0
+        };
+        let s5 = if m > 5 {
+            warp::reduce_sum_f32(f[5])
+        } else {
+            0.0
+        };
+        let s6 = if m > 6 {
+            warp::reduce_sum_f32(f[6])
+        } else {
+            0.0
+        };
+        let s7 = if m > 7 {
+            warp::reduce_sum_f32(f[7])
+        } else {
+            0.0
+        };
+        if lane == 0 {
+            // SAFETY: only lane 0 of each warp writes the disjoint segment
+            // y[row*m .. row*m+m]: store c is guarded by m > c, so exactly
+            // the first m slots of the row are touched.
+            unsafe {
+                let b = row * m;
+                *y.get_unchecked_mut(b) = s0;
+                if m > 1 {
+                    *y.get_unchecked_mut(b + 1) = s1;
+                }
+                if m > 2 {
+                    *y.get_unchecked_mut(b + 2) = s2;
+                }
+                if m > 3 {
+                    *y.get_unchecked_mut(b + 3) = s3;
+                }
+                if m > 4 {
+                    *y.get_unchecked_mut(b + 4) = s4;
+                }
+                if m > 5 {
+                    *y.get_unchecked_mut(b + 5) = s5;
+                }
+                if m > 6 {
+                    *y.get_unchecked_mut(b + 6) = s6;
+                }
+                if m > 7 {
+                    *y.get_unchecked_mut(b + 7) = s7;
                 }
             }
         }
@@ -1718,24 +1757,41 @@ impl Gpu {
         }
         let what = "enqueue_gemv_q4k";
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
-        let m = launch_u32(what, "m", m)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_q4k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
-        self.module.q4k_gemv(
-            &self.stream,
-            &prep,
-            w.buf(),
-            &act.q4,
-            &act.s8,
-            &act.d8,
-            n_rows,
-            m,
-            n_sb,
-            n_sb.div_ceil(4),
-            y,
-        )?;
+        let cfg = LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0);
+        // One column is the decode entry; more go to the m-column entry,
+        // whose column c is the decode entry's launch of column c.
+        if m == 1 {
+            let prep = self.module.prepare_q4k_gemv(cfg)?;
+            self.module.q4k_gemv(
+                &self.stream,
+                &prep,
+                w.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                n_rows,
+                n_sb,
+                n_sb.div_ceil(4),
+                y,
+            )?;
+        } else {
+            let m = launch_u32(what, "m", m)?;
+            let prep = self.module.prepare_q4k_gemv_mcol(cfg)?;
+            self.module.q4k_gemv_mcol(
+                &self.stream,
+                &prep,
+                w.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                n_rows,
+                m,
+                n_sb,
+                n_sb.div_ceil(4),
+                y,
+            )?;
+        }
         Ok(())
     }
 

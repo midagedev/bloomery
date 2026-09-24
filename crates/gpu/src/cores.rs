@@ -12,6 +12,7 @@
 
 use cuda_device::convert::cvt_f32_f16x2_lo;
 use cuda_device::dotprod::dp4a_s32;
+use cuda_device::float::{add_rn_f32, fma_rn_f32, mul_rn_f32};
 
 // ---- shared ----
 
@@ -179,6 +180,34 @@ pub(crate) fn q4k_coeff(d: f32, dmin: f32, sc: i32, mi: i32) -> (f32, f32) {
     (cda, cdb)
 }
 
+/// One sub-block's dot before its q8_1 block scale, as the m-column walk
+/// forms it: fma(cda, A, cdb·B), the B product rounded first — the
+/// contraction the backend gives [`q4k_row_dot_1col`]'s `a*cda + b*cdb`.
+#[inline(always)]
+pub(crate) fn q4k_sub_value(a: i32, b: i32, cda: f32, cdb: f32) -> f32 {
+    fma_rn_f32(cda, a as f32, mul_rn_f32(cdb, b as f32))
+}
+
+/// One step of the m-column Q4_K walk's accumulator: `f + round(e·x)` when
+/// `split`, else `fma(e, x, f)`, every operation spelled. This is the
+/// rounding [`q4k_row_dot_1col`]'s `+=` compiles to: in each pair of
+/// iterations `2j, 2j + 1` of its guard-free prefix (`2j + 2 <= n_sb / 4`)
+/// the first term's product and its add sit in different basic blocks —
+/// the second super-block's decode branches between them — so they stay
+/// two rounded operations, while the pair's second term and each term of
+/// the guarded tail contract to one fused multiply-add. The m-column walk splits
+/// exactly those terms, so column c of an m-column launch is the
+/// one-column launch of that column bit for bit; `gate_mcol` pins it on
+/// every K the step runs.
+#[inline(always)]
+pub(crate) fn q4k_acc(f: f32, x: f32, e: f32, split: bool) -> f32 {
+    if split {
+        add_rn_f32(f, mul_rn_f32(e, x))
+    } else {
+        fma_rn_f32(e, x, f)
+    }
+}
+
 /// Everything one Q4_K super-block yields before a column is named: the
 /// eight SWAR-decoded qs words every column's A chain reuses, and the two
 /// chain coefficients of this lane's sub-block. `wk` is the super-block's
@@ -287,6 +316,11 @@ fn q4k_iter_term(
 /// Q3_K has no such constant on purpose: the same lever measured flat on
 /// its walk, so [`q3k_row_dot_1col`] keeps one iteration per pass. The two
 /// walks load alike per weight — what differs is which one was waiting.
+///
+/// The pair is also the unit of the walk's rounding ([`q4k_acc`]), so this
+/// is a numeric constant as well as a scheduling one: another value is
+/// another sum order, every Q4_K bit pin moves with it, and the m-column
+/// walk must follow.
 pub(crate) const Q4K_ITER_UNROLL: u32 = 2;
 
 /// One row's Q4_K dot product against a single activation column —
@@ -375,14 +409,238 @@ pub(crate) fn q4k_row_dot_1col(
     f0
 }
 
+/// One column's share of an m-column Q4_K iteration: its A chain against
+/// the q8 window at `qb`, its B sum at `s8b` and its block scale at `d8b`,
+/// as the sub-block value and scale [`q4k_acc`] folds.
+///
+/// # Safety
+///
+/// `qb + 224 < q.len()`, `s8b < s8.len()`, `d8b < d8.len()`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+unsafe fn q4k_col_term(
+    vi: &[u32; 8],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    qb: usize,
+    s8b: usize,
+    d8b: usize,
+    cda: f32,
+    cdb: f32,
+) -> (f32, f32) {
+    let a = q4k_a_chain(vi, q, qb);
+    // SAFETY: both indices are inside their buffers by this fn's contract.
+    let (b, e) = unsafe { (*s8.get_unchecked(s8b), *d8.get_unchecked(d8b)) };
+    (q4k_sub_value(a, b, cda, cdb), e)
+}
+
+/// One iteration of the m-column Q4_K walk: super-block `4*it + grp`'s
+/// column-independent decode ([`q4k_sb_decode`]) once, then each live
+/// column's A chain, B sum and block scale folded into that column's
+/// accumulator by [`q4k_acc`] with `split`. `f` is the eight accumulators
+/// in and out; columns past `m` pass through untouched.
+///
+/// SAFETY: callers guarantee `4 * it + grp < n_sb` and the buffer lengths
+/// of [`q4k_row_dot`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+fn q4k_iter_cols(
+    w: &[u32],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    n_sb: usize,
+    it: u32,
+    row_abs: usize,
+    col0: usize,
+    m: usize,
+    lane: usize,
+    split: bool,
+    f: [f32; 8],
+) -> [f32; 8] {
+    let [
+        mut f0,
+        mut f1,
+        mut f2,
+        mut f3,
+        mut f4,
+        mut f5,
+        mut f6,
+        mut f7,
+    ] = f;
+    let q_col = 256 * n_sb.div_ceil(4); // q8 words per column
+    let s8_col = 8 * n_sb; // 32-value groups per column
+    let d8_col = 2 * n_sb; // 128-value blocks per column
+    let s = lane & 7; // sub-block within the super-block
+    let grp = lane >> 3; // super-block within this iteration (0..4)
+    let sbp = 4 * it as usize + grp;
+    // The super-block's column-independent decode — the eight hoisted qs
+    // words and the chain coefficients — is `q4k_sb_decode`, shared with
+    // `q4k_row_dot_1col`.
+    // SAFETY: sbp < n_sb by this fn's contract, so the super-block's words
+    // wk..wk+35 are inside row `row_abs` of `w`.
+    let (vi, cda, cdb) = q4k_sb_decode(w, row_abs * 36 * n_sb + 36 * sbp, s);
+
+    // This lane's q8 words in the q4 permutation: word i of column c lives
+    // at q_col*c + 256it + 32i + lane (host-verified identity with the
+    // value-order slot the linear layout used). The B-chain group of
+    // (it, lane) is 32it + lane: 32 consecutive i32 across the warp, one
+    // 128B line. This lane's fields all sit in q8_1 block 2*sbp + s/4.
+    let qb = col0 * q_col + 256 * it as usize + lane;
+    let s8b = col0 * s8_col + 32 * it as usize + lane;
+    let d8b = col0 * d8_col + 2 * sbp + (s >> 2);
+
+    // Column c: its A chain at q word qb + c*q_col (q4k_a_chain adds 32i),
+    // its B sum at s8b + c*s8_col, its block scale at d8b + c*d8_col. Column
+    // 0 is always live; columns 1..7 each behind one launch-uniform guard, so
+    // the work scales with m and the branch never diverges within a warp.
+    // SAFETY: for every call, column c < m <= m_cols of the walk's contract, so
+    // q.len() >= (col0+c+1)*q_col > qb + c*q_col + 224 (within quad group g
+    // the largest word is 256g + 255), s8.len() >= (col0+c+1)*s8_col >
+    // s8b + c*s8_col and d8.len() >= (col0+c+1)*d8_col > d8b + c*d8_col, the
+    // last two because sbp < n_sb.
+    let (x, e) = unsafe { q4k_col_term(&vi, q, s8, d8, qb, s8b, d8b, cda, cdb) };
+    f0 = q4k_acc(f0, x, e, split);
+    if m > 1 {
+        // SAFETY: as column 0, at c = 1.
+        let (x, e) = unsafe {
+            q4k_col_term(
+                &vi,
+                q,
+                s8,
+                d8,
+                qb + q_col,
+                s8b + s8_col,
+                d8b + d8_col,
+                cda,
+                cdb,
+            )
+        };
+        f1 = q4k_acc(f1, x, e, split);
+    }
+    if m > 2 {
+        // SAFETY: as column 0, at c = 2.
+        let (x, e) = unsafe {
+            q4k_col_term(
+                &vi,
+                q,
+                s8,
+                d8,
+                qb + 2 * q_col,
+                s8b + 2 * s8_col,
+                d8b + 2 * d8_col,
+                cda,
+                cdb,
+            )
+        };
+        f2 = q4k_acc(f2, x, e, split);
+    }
+    if m > 3 {
+        // SAFETY: as column 0, at c = 3.
+        let (x, e) = unsafe {
+            q4k_col_term(
+                &vi,
+                q,
+                s8,
+                d8,
+                qb + 3 * q_col,
+                s8b + 3 * s8_col,
+                d8b + 3 * d8_col,
+                cda,
+                cdb,
+            )
+        };
+        f3 = q4k_acc(f3, x, e, split);
+    }
+    if m > 4 {
+        // SAFETY: as column 0, at c = 4.
+        let (x, e) = unsafe {
+            q4k_col_term(
+                &vi,
+                q,
+                s8,
+                d8,
+                qb + 4 * q_col,
+                s8b + 4 * s8_col,
+                d8b + 4 * d8_col,
+                cda,
+                cdb,
+            )
+        };
+        f4 = q4k_acc(f4, x, e, split);
+    }
+    if m > 5 {
+        // SAFETY: as column 0, at c = 5.
+        let (x, e) = unsafe {
+            q4k_col_term(
+                &vi,
+                q,
+                s8,
+                d8,
+                qb + 5 * q_col,
+                s8b + 5 * s8_col,
+                d8b + 5 * d8_col,
+                cda,
+                cdb,
+            )
+        };
+        f5 = q4k_acc(f5, x, e, split);
+    }
+    if m > 6 {
+        // SAFETY: as column 0, at c = 6.
+        let (x, e) = unsafe {
+            q4k_col_term(
+                &vi,
+                q,
+                s8,
+                d8,
+                qb + 6 * q_col,
+                s8b + 6 * s8_col,
+                d8b + 6 * d8_col,
+                cda,
+                cdb,
+            )
+        };
+        f6 = q4k_acc(f6, x, e, split);
+    }
+    if m > 7 {
+        // SAFETY: as column 0, at c = 7.
+        let (x, e) = unsafe {
+            q4k_col_term(
+                &vi,
+                q,
+                s8,
+                d8,
+                qb + 7 * q_col,
+                s8b + 7 * s8_col,
+                d8b + 7 * d8_col,
+                cda,
+                cdb,
+            )
+        };
+        f7 = q4k_acc(f7, x, e, split);
+    }
+    [f0, f1, f2, f3, f4, f5, f6, f7]
+}
+
 /// One row's Q4_K dot products with `m_cols` (1..=8) activation columns,
 /// pre-reduction: lane `lane` of the row's warp walks `iters`
 /// four-super-block iterations keeping per-column partial sums in scalars
-/// (the qs window decoded once per iteration and shared by every column —
-/// the per-op gemv's own shape), and the CALLER reduces the returned
-/// partials across the warp. The body is `q4k_gemv`'s, so a fused kernel
-/// that calls this one agrees with the per-op gemv bit for bit by
-/// construction.
+/// (the qs window decoded once per iteration and shared by every column),
+/// and the CALLER reduces the returned partials across the warp.
+///
+/// Every column runs [`q4k_row_dot_1col`]'s walk: the same iterations in
+/// the same order, each term formed by [`q4k_sub_value`] and folded by
+/// [`q4k_acc`] with that walk's rounding. So column c of an m-column call
+/// is the single-column call on that column bit for bit, and each weight
+/// word is read once for all `m` columns.
 ///
 /// Buffer layouts as `q4k_gemv` (see the Q4_K packing recap there): `w`
 /// holds rows of `36 * n_sb` u32 words (row `row_abs` based at word
@@ -428,164 +686,27 @@ pub(crate) fn q4k_row_dot(
             0.0,
         ];
     }
-    let m = m_cols;
-    let row_words = 36 * n_sb; // 144 B per super-block
-    let q_col = 256 * iters as usize; // q8 words per column
-    let s8_col = 8 * n_sb; // 32-value groups per column
-    let d8_col = 2 * n_sb; // 128-value blocks per column
-
-    let s = lane & 7; // sub-block within the super-block
-    let grp = lane >> 3; // super-block within this iteration (0..4)
-
-    // Scalar accumulators (launch-uniform m keeps them in registers).
-    let mut f0 = 0.0f32;
-    let mut f1 = 0.0f32;
-    let mut f2 = 0.0f32;
-    let mut f3 = 0.0f32;
-    let mut f4 = 0.0f32;
-    let mut f5 = 0.0f32;
-    let mut f6 = 0.0f32;
-    let mut f7 = 0.0f32;
-
-    let qb0 = col0 * q_col;
-    let s8b0 = col0 * s8_col;
-    let d8b0 = col0 * d8_col;
-
+    let grp = lane >> 3; // super-block within an iteration (0..4)
+    let full = (n_sb / 4) as u32;
+    let mut f = [0.0f32; 8];
     let mut it: u32 = 0;
     while it < iters {
-        let sbp = 4 * it as usize + grp;
         // The sbp guard makes a partial final iteration safe: guarded
-        // lanes load nothing of w/q/s8/d8. It is always true when n_sb
-        // is a multiple of 4.
-        if sbp < n_sb {
-            // The super-block's column-independent decode — the eight
-            // hoisted qs words and the chain coefficients — is
-            // `q4k_sb_decode`, shared with `q4k_row_dot_1col`.
-            // SAFETY: sbp < n_sb, so the super-block's words wk..wk+35 are
-            // inside row `row_abs` of `w` by this fn's contract.
-            let (vi, cda, cdb) = q4k_sb_decode(w, row_abs * row_words + 36 * sbp, s);
-
-            // This lane's q8 words in the q4 permutation: word i of
-            // column c lives at q_col*c + 256it + 32i + lane
-            // (host-verified identity with the value-order slot the
-            // linear layout used). The B-chain group of (it, lane) is
-            // 32it + lane: 32 consecutive i32 across the warp, one 128B
-            // line.
-            let qb = 256 * it as usize + lane;
-            let s8b = 32 * it as usize + lane;
-            // This lane's fields all sit in q8_1 block 2*sbp + s/4.
-            let d8b = 2 * sbp + (s >> 2);
-
-            // Column 0 (always active).
-            {
-                let a = q4k_a_chain(&vi, q, qb0 + qb);
-                // SAFETY: the sbp guard keeps s8b < s8_col and
-                // d8b < d8_col; s8.len() >= (col0+1)*s8_col and d8.len() >=
-                // (col0+1)*d8_col by the contract (m >= 1).
-                let b = unsafe { *s8.get_unchecked(s8b0 + s8b) };
-                // SAFETY: d8b < d8_col by the sbp guard, so d8b0 + d8b <
-                // (col0+1)*d8_col <= d8.len() by the contract (m >= 1).
-                let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
-                f0 += (a as f32 * cda + b as f32 * cdb) * e0;
-            }
-            // Columns 1..7, one launch-uniform guard per column so the
-            // work scales with m (the amortization curve over m). Column c
-            // reads q8 words at q_col*c + qb (q4k_a_chain adds 32i), the
-            // s8 group at s8_col*c + s8b and block d8b + d8_col*c.
-            // SAFETY: guard c+1 means m >= c+1 is launch-uniform, so the
-            // buffer lengths ((col0+m)*q_col / *s8_col / *d8_col) cover
-            // every offset below and the branch never diverges within a
-            // warp.
-            if m > 1 {
-                // q.len() >= (col0+2)*q_col > qb0 + 1*q_col + qb + 224
-                // by the same guard, which is `q4k_a_chain`'s contract.
-                let a = q4k_a_chain(&vi, q, qb0 + q_col + qb);
-                // SAFETY: m > 1 => s8.len() >= (col0+2)*s8_col >
-                // s8b0 + 1*s8_col + s8b.
-                let b = unsafe { *s8.get_unchecked(s8b0 + s8_col + s8b) };
-                // SAFETY: m > 1 => d8.len() >= (col0+2)*d8_col >
-                // d8b0 + d8b + 1*d8_col.
-                let e1 = unsafe { *d8.get_unchecked(d8b0 + d8b + d8_col) };
-                f1 += (a as f32 * cda + b as f32 * cdb) * e1;
-            }
-            if m > 2 {
-                // q.len() >= (col0+3)*q_col > qb0 + 2*q_col + qb + 224
-                // by the same guard, which is `q4k_a_chain`'s contract.
-                let a = q4k_a_chain(&vi, q, qb0 + 2 * q_col + qb);
-                // SAFETY: m > 2 => s8.len() >= (col0+3)*s8_col >
-                // s8b0 + 2*s8_col + s8b.
-                let b = unsafe { *s8.get_unchecked(s8b0 + 2 * s8_col + s8b) };
-                // SAFETY: m > 2 => d8.len() >= (col0+3)*d8_col >
-                // d8b0 + d8b + 2*d8_col.
-                let e2 = unsafe { *d8.get_unchecked(d8b0 + d8b + 2 * d8_col) };
-                f2 += (a as f32 * cda + b as f32 * cdb) * e2;
-            }
-            if m > 3 {
-                // q.len() >= (col0+4)*q_col > qb0 + 3*q_col + qb + 224
-                // by the same guard, which is `q4k_a_chain`'s contract.
-                let a = q4k_a_chain(&vi, q, qb0 + 3 * q_col + qb);
-                // SAFETY: m > 3 => s8.len() >= (col0+4)*s8_col >
-                // s8b0 + 3*s8_col + s8b.
-                let b = unsafe { *s8.get_unchecked(s8b0 + 3 * s8_col + s8b) };
-                // SAFETY: m > 3 => d8.len() >= (col0+4)*d8_col >
-                // d8b0 + d8b + 3*d8_col.
-                let e3 = unsafe { *d8.get_unchecked(d8b0 + d8b + 3 * d8_col) };
-                f3 += (a as f32 * cda + b as f32 * cdb) * e3;
-            }
-            if m > 4 {
-                // q.len() >= (col0+5)*q_col > qb0 + 4*q_col + qb + 224
-                // by the same guard, which is `q4k_a_chain`'s contract.
-                let a = q4k_a_chain(&vi, q, qb0 + 4 * q_col + qb);
-                // SAFETY: m > 4 => s8.len() >= (col0+5)*s8_col >
-                // s8b0 + 4*s8_col + s8b.
-                let b = unsafe { *s8.get_unchecked(s8b0 + 4 * s8_col + s8b) };
-                // SAFETY: m > 4 => d8.len() >= (col0+5)*d8_col >
-                // d8b0 + d8b + 4*d8_col.
-                let e4 = unsafe { *d8.get_unchecked(d8b0 + d8b + 4 * d8_col) };
-                f4 += (a as f32 * cda + b as f32 * cdb) * e4;
-            }
-            if m > 5 {
-                // q.len() >= (col0+6)*q_col > qb0 + 5*q_col + qb + 224
-                // by the same guard, which is `q4k_a_chain`'s contract.
-                let a = q4k_a_chain(&vi, q, qb0 + 5 * q_col + qb);
-                // SAFETY: m > 5 => s8.len() >= (col0+6)*s8_col >
-                // s8b0 + 5*s8_col + s8b.
-                let b = unsafe { *s8.get_unchecked(s8b0 + 5 * s8_col + s8b) };
-                // SAFETY: m > 5 => d8.len() >= (col0+6)*d8_col >
-                // d8b0 + d8b + 5*d8_col.
-                let e5 = unsafe { *d8.get_unchecked(d8b0 + d8b + 5 * d8_col) };
-                f5 += (a as f32 * cda + b as f32 * cdb) * e5;
-            }
-            if m > 6 {
-                // q.len() >= (col0+7)*q_col > qb0 + 6*q_col + qb + 224
-                // by the same guard, which is `q4k_a_chain`'s contract.
-                let a = q4k_a_chain(&vi, q, qb0 + 6 * q_col + qb);
-                // SAFETY: m > 6 => s8.len() >= (col0+7)*s8_col >
-                // s8b0 + 6*s8_col + s8b.
-                let b = unsafe { *s8.get_unchecked(s8b0 + 6 * s8_col + s8b) };
-                // SAFETY: m > 6 => d8.len() >= (col0+7)*d8_col >
-                // d8b0 + d8b + 6*d8_col.
-                let e6 = unsafe { *d8.get_unchecked(d8b0 + d8b + 6 * d8_col) };
-                f6 += (a as f32 * cda + b as f32 * cdb) * e6;
-            }
-            if m > 7 {
-                // q.len() >= (col0+8)*q_col > qb0 + 7*q_col + qb + 224
-                // by the same guard, which is `q4k_a_chain`'s contract.
-                let a = q4k_a_chain(&vi, q, qb0 + 7 * q_col + qb);
-                // SAFETY: m > 7 => s8.len() >= (col0+8)*s8_col >
-                // s8b0 + 7*s8_col + s8b.
-                let b = unsafe { *s8.get_unchecked(s8b0 + 7 * s8_col + s8b) };
-                // SAFETY: m > 7 => d8.len() >= (col0+8)*d8_col >
-                // d8b0 + d8b + 7*d8_col.
-                let e7 = unsafe { *d8.get_unchecked(d8b0 + d8b + 7 * d8_col) };
-                f7 += (a as f32 * cda + b as f32 * cdb) * e7;
-            }
+        // lanes load nothing of w/q/s8/d8. It is always true when n_sb is
+        // a multiple of 4.
+        if 4 * it as usize + grp < n_sb {
+            // `q4k_row_dot_1col`'s rounding (`q4k_acc`): the first
+            // iteration of each pair of the guard-free prefix splits.
+            let split = it & 1 == 0 && it + Q4K_ITER_UNROLL <= full;
+            // SAFETY: the guard is this call's `4*it + grp < n_sb`; the
+            // buffer lengths are this fn's contract.
+            f = q4k_iter_cols(
+                w, q, s8, d8, n_sb, it, row_abs, col0, m_cols, lane, split, f,
+            );
         }
-
         it += 1;
     }
-
-    [f0, f1, f2, f3, f4, f5, f6, f7]
+    f
 }
 
 // ---- Q3_K ----
@@ -682,6 +803,16 @@ pub fn q3k_chain(vi: &[u32; 4], w01: u64, w23: u64, sc: &[i32; 4]) -> i32 {
         + dp4a_s32(vi[3], (w23 >> 32) as u32, 0) * sc[3]
 }
 
+/// One step of a Q3_K row walk's accumulator: `fma(e·drow, a, f)`, the
+/// scale product rounded first — the integer chain `a` against the q8_1
+/// block scale `e` and the super-block scale `drow`. Both Q3_K walks fold
+/// every term here, with each operation spelled, so their sums cannot be
+/// contracted differently.
+#[inline(always)]
+pub(crate) fn q3k_acc(f: f32, a: i32, e: f32, drow: f32) -> f32 {
+    fma_rn_f32(mul_rn_f32(e, drow), a as f32, f)
+}
+
 /// Everything one Q3_K super-block yields before a column is named: this
 /// lane's four dequantized weight quads, the four sub-block scales its
 /// integer chain scales by, and the super-block scale. `base` is the
@@ -769,8 +900,8 @@ pub unsafe fn q3k_sb_decode(
 
 /// One iteration's term of a single-column Q3_K row walk: the super-block
 /// `sbp`'s decode, this lane's integer chain against column `col0`'s q8
-/// pair slots, and the two shared scales, as the one value the walk adds to
-/// its accumulator. Every load the iteration makes is in here, and none of
+/// pair slots, and the two shared scales, as the three values [`q3k_acc`]
+/// folds into the walk's accumulator. Every load the iteration makes is in here, and none of
 /// the walk's accumulation is — which is what lets the walk issue several
 /// iterations' loads before the first add.
 ///
@@ -795,7 +926,7 @@ fn q3k_iter_term(
     s0: usize,
     d8_base: usize,
     lane: usize,
-) -> f32 {
+) -> (i32, f32, f32) {
     let sbp = ((it << 1) | half as u32) as usize;
     // SAFETY: `base` is this super-block's byte offset inside the row by this
     // fn's contract, so its window stays in the row.
@@ -811,7 +942,7 @@ fn q3k_iter_term(
     let a = q3k_chain(&vi, w01, w23, &sc);
     // SAFETY: d8b0 + d8b < (col0+1)*2*n_sb by sbp < n_sb and the contract.
     let e0 = unsafe { *d8.get_unchecked(d8b0 + d8b) };
-    (a as f32) * (e0 * drow)
+    (a, e0, drow)
 }
 
 /// One row's Q3_K dot product against a single activation column —
@@ -869,7 +1000,9 @@ pub(crate) fn q3k_row_dot_1col(
         if sbp < n_sb {
             // SAFETY: the guard is this term's `sbp < n_sb` precondition, and
             // `base` is that super-block's byte offset in row `row_abs`.
-            f0 += q3k_iter_term(w, q, d8, base, it, qb0, d8b0, w16, half, s0, d8_base, lane);
+            let (a, e, drow) =
+                q3k_iter_term(w, q, d8, base, it, qb0, d8b0, w16, half, s0, d8_base, lane);
+            f0 = q3k_acc(f0, a, e, drow);
         }
 
         base += 220;
@@ -893,6 +1026,10 @@ pub(crate) fn q3k_row_dot_1col(
 /// quantizer's pair permutation, `d8` holds per column `2 * n_sb` block
 /// scales. Column c reads `(col0 + c)` of each.
 ///
+/// Every column folds the same terms in the same order through the same
+/// [`q3k_acc`] as [`q3k_row_dot_1col`], so column c of an m-column call is
+/// the single-column call on that column bit for bit.
+///
 /// SAFETY: callers guarantee `4 * w.len() >= (row_abs + 1) * 110 * n_sb`
 /// (every funneled window of the row stays inside its ceil(words)-per-row
 /// span), `q.len() >= (col0 + m_cols) * 64 * iters`, `d8.len() >= (col0 +
@@ -911,6 +1048,34 @@ pub fn q3k_row_dot(
     iters: u32,
     row_abs: usize,
     col0: usize,
+    m_cols: usize,
+    lane: usize,
+) -> [f32; 8] {
+    q3k_row_dot_cols(w, q, d8, n_sb, iters, row_abs, col0, 1, m_cols, lane)
+}
+
+/// [`q3k_row_dot`] over columns `col_stride` apart: column c reads column
+/// `col0 + c * col_stride` of `q` and `d8` — the block diagonal's shape at
+/// m tokens, where a group's windows of consecutive tokens are `groups`
+/// columns apart. `col_stride` 1 is `q3k_row_dot`.
+///
+/// SAFETY: as [`q3k_row_dot`], with `q.len() >= (col0 + (m_cols - 1) *
+/// col_stride + 1) * 64 * iters` and `d8.len() >= (col0 + (m_cols - 1) *
+/// col_stride + 1) * 2 * n_sb`, `col_stride >= 1`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub fn q3k_row_dot_cols(
+    w: &[u32],
+    q: &[u64],
+    d8: &[f32],
+    n_sb: usize,
+    iters: u32,
+    row_abs: usize,
+    col0: usize,
+    col_stride: usize,
     m_cols: usize,
     lane: usize,
 ) -> [f32; 8] {
@@ -933,6 +1098,9 @@ pub fn q3k_row_dot(
     let row_bytes = 110 * n_sb;
     let q_col = 64 * iters as usize; // q8 u64 slots per column
     let d8_col = 2 * n_sb; // 128-value blocks per column
+    // From one used column to the next: `col_stride` columns.
+    let q_step = col_stride * q_col;
+    let d8_step = col_stride * d8_col;
 
     // Per-lane constants: this lane's qs word within the super-block and
     // the derived scale/d8 bases (see the Q3_K packing comment at
@@ -972,7 +1140,7 @@ pub fn q3k_row_dot(
                 unsafe { q3k_sb_decode(w, row_abs * row_bytes + sbp * 110, w16, s0) };
 
             // q8_1 words in the q3 u64 pairing: field pair (2p, 2p+1)
-            // of column c lives in u64 slot q_col*c + 64it + 32p + lane
+            // of column c lives in u64 slot qb0 + q_step*c + 64it + 32p + lane
             // — lo is field 2p, hi is 2p+1. Two u64 loads per iteration
             // instead of four u32 loads: same bytes and wavefronts, half
             // the load-issue count.
@@ -999,98 +1167,99 @@ pub fn q3k_row_dot(
                 let a = q3k_chain(&vi, w01, w23, &sc);
                 // SAFETY: d8b0 + d8b < (col0+1)*d8_col <= d8.len() by the sbp
                 // guard and the contract (m >= 1).
-                f0 += (a as f32) * (unsafe { *d8.get_unchecked(d8b0 + d8b) } * drow);
+                f0 = q3k_acc(f0, a, unsafe { *d8.get_unchecked(d8b0 + d8b) }, drow);
             }
             // Columns 1..7, one launch-uniform guard per column so the
             // work scales with m (the amortization curve over m). Same shape
-            // as column 0 with the per-column q/d8 offsets (q stride
-            // q_col u64, d8 d8_col).
-            // SAFETY: guard m > c means q.len() >= (col0+c+1)*q_col >
-            // qb0 + c*q_col + qb + 32 and d8.len() >= (col0+c+1)*d8_col >
-            // d8b0 + c*d8_col + d8b, launch-uniform.
+            // as column 0 with the per-column q/d8 offsets (q step q_step
+            // u64, d8 d8_step).
+            // SAFETY: guard m > c means q.len() >= (col0+c*col_stride+1)*
+            // q_col > qb0 + c*q_step + qb + 32 and d8.len() >=
+            // (col0+c*col_stride+1)*d8_col > d8b0 + c*d8_step + d8b,
+            // launch-uniform.
             if m > 1 {
-                let cb = qb0 + q_col + qb;
-                let d8c = d8b0 + d8_col + d8b;
-                // SAFETY: m > 1 => q.len() >= (col0+2)*q_col > cb + 32,
+                let cb = qb0 + q_step + qb;
+                let d8c = d8b0 + d8_step + d8b;
+                // SAFETY: m > 1 => q.len() >= (col0+col_stride+1)*q_col > cb + 32,
                 // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
                 // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
-                // SAFETY: m > 1 => d8.len() >= (col0+2)*d8_col > d8c.
-                f1 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
+                // SAFETY: m > 1 => d8.len() >= (col0+col_stride+1)*d8_col > d8c.
+                f1 = q3k_acc(f1, a, unsafe { *d8.get_unchecked(d8c) }, drow);
             }
             if m > 2 {
-                let cb = qb0 + 2 * q_col + qb;
-                let d8c = d8b0 + 2 * d8_col + d8b;
-                // SAFETY: m > 2 => q.len() >= (col0+3)*q_col > cb + 32,
+                let cb = qb0 + 2 * q_step + qb;
+                let d8c = d8b0 + 2 * d8_step + d8b;
+                // SAFETY: m > 2 => q.len() >= (col0+2*col_stride+1)*q_col > cb + 32,
                 // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
                 // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
-                // SAFETY: m > 2 => d8.len() >= (col0+3)*d8_col > d8c.
-                f2 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
+                // SAFETY: m > 2 => d8.len() >= (col0+2*col_stride+1)*d8_col > d8c.
+                f2 = q3k_acc(f2, a, unsafe { *d8.get_unchecked(d8c) }, drow);
             }
             if m > 3 {
-                let cb = qb0 + 3 * q_col + qb;
-                let d8c = d8b0 + 3 * d8_col + d8b;
-                // SAFETY: m > 3 => q.len() >= (col0+4)*q_col > cb + 32,
+                let cb = qb0 + 3 * q_step + qb;
+                let d8c = d8b0 + 3 * d8_step + d8b;
+                // SAFETY: m > 3 => q.len() >= (col0+3*col_stride+1)*q_col > cb + 32,
                 // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
                 // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
-                // SAFETY: m > 3 => d8.len() >= (col0+4)*d8_col > d8c.
-                f3 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
+                // SAFETY: m > 3 => d8.len() >= (col0+3*col_stride+1)*d8_col > d8c.
+                f3 = q3k_acc(f3, a, unsafe { *d8.get_unchecked(d8c) }, drow);
             }
             if m > 4 {
-                let cb = qb0 + 4 * q_col + qb;
-                let d8c = d8b0 + 4 * d8_col + d8b;
-                // SAFETY: m > 4 => q.len() >= (col0+5)*q_col > cb + 32,
+                let cb = qb0 + 4 * q_step + qb;
+                let d8c = d8b0 + 4 * d8_step + d8b;
+                // SAFETY: m > 4 => q.len() >= (col0+4*col_stride+1)*q_col > cb + 32,
                 // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
                 // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
-                // SAFETY: m > 4 => d8.len() >= (col0+5)*d8_col > d8c.
-                f4 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
+                // SAFETY: m > 4 => d8.len() >= (col0+4*col_stride+1)*d8_col > d8c.
+                f4 = q3k_acc(f4, a, unsafe { *d8.get_unchecked(d8c) }, drow);
             }
             if m > 5 {
-                let cb = qb0 + 5 * q_col + qb;
-                let d8c = d8b0 + 5 * d8_col + d8b;
-                // SAFETY: m > 5 => q.len() >= (col0+6)*q_col > cb + 32,
+                let cb = qb0 + 5 * q_step + qb;
+                let d8c = d8b0 + 5 * d8_step + d8b;
+                // SAFETY: m > 5 => q.len() >= (col0+5*col_stride+1)*q_col > cb + 32,
                 // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
                 // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
-                // SAFETY: m > 5 => d8.len() >= (col0+6)*d8_col > d8c.
-                f5 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
+                // SAFETY: m > 5 => d8.len() >= (col0+5*col_stride+1)*d8_col > d8c.
+                f5 = q3k_acc(f5, a, unsafe { *d8.get_unchecked(d8c) }, drow);
             }
             if m > 6 {
-                let cb = qb0 + 6 * q_col + qb;
-                let d8c = d8b0 + 6 * d8_col + d8b;
-                // SAFETY: m > 6 => q.len() >= (col0+7)*q_col > cb + 32,
+                let cb = qb0 + 6 * q_step + qb;
+                let d8c = d8b0 + 6 * d8_step + d8b;
+                // SAFETY: m > 6 => q.len() >= (col0+6*col_stride+1)*q_col > cb + 32,
                 // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
                 // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
-                // SAFETY: m > 6 => d8.len() >= (col0+7)*d8_col > d8c.
-                f6 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
+                // SAFETY: m > 6 => d8.len() >= (col0+6*col_stride+1)*d8_col > d8c.
+                f6 = q3k_acc(f6, a, unsafe { *d8.get_unchecked(d8c) }, drow);
             }
             if m > 7 {
-                let cb = qb0 + 7 * q_col + qb;
-                let d8c = d8b0 + 7 * d8_col + d8b;
-                // SAFETY: m > 7 => q.len() >= (col0+8)*q_col > cb + 32,
+                let cb = qb0 + 7 * q_step + qb;
+                let d8c = d8b0 + 7 * d8_step + d8b;
+                // SAFETY: m > 7 => q.len() >= (col0+7*col_stride+1)*q_col > cb + 32,
                 // so both u64 slots of the pair are inside the column.
                 let w01 = unsafe { *q.get_unchecked(cb) };
                 // SAFETY: the second slot of that same pair.
                 let w23 = unsafe { *q.get_unchecked(cb + 32) };
                 let a = q3k_chain(&vi, w01, w23, &sc);
-                // SAFETY: m > 7 => d8.len() >= (col0+8)*d8_col > d8c.
-                f7 += (a as f32) * (unsafe { *d8.get_unchecked(d8c) } * drow);
+                // SAFETY: m > 7 => d8.len() >= (col0+7*col_stride+1)*d8_col > d8c.
+                f7 = q3k_acc(f7, a, unsafe { *d8.get_unchecked(d8c) }, drow);
             }
         }
 

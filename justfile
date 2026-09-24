@@ -674,7 +674,7 @@ gate-gpu-head:
 # m열 커널(q8_0·q8_0 heads·q3_K·q6_K·헤드 argmax): m열 런치의 열 c가 그 열 하나를 m = 1로 쏜 결과와 비트 동일한지를
 # V4.1 실제 행에서 m = 1..8 전부 본다 — k토큰 스텝이 k개 순차 스텝과 비트 동일하려면 이것이 서야 한다.
 gate-gpu-mcol:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_mcol && bash tools/gpu-gate.sh gate_mcol'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_mcol && bash tools/gpu-gate.sh gate_mcol'
 
 # bloomery-gpu 라이브러리의 단위 시험. 디바이스 크레이트라 cargo oxide test로 돌고, tools/gate.sh --oxide가 상한과
 # 종료 코드를 쥔다. hw_ 시험 하나(graph.rs — 노드 분류가 캡처한 호스트 함수를 호스트 노드로 세는지)는 3090에

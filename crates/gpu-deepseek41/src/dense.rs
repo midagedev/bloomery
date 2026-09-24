@@ -31,8 +31,18 @@
 //! `fma(q, d·sc, −(dmin·m))` with the two products rounded first
 //! (`dequant_q5_k`'s op order), and `acc = fma(value, x, acc)` from 0. The
 //! 32 lane sums then go through `warp::reduce_sum_f32`.
+//!
+//! m columns (the k-token pass): every kernel here has an m-column twin
+//! (`_mcol`, m in 1..=8) whose column c is its one-column launch on column c
+//! alone, bit for bit — the weights decoded once per row step for all m
+//! columns, each column folded in the one-column order (`cores::q3k_row_dot`'s
+//! contract; the Q5_K accumulators one per column in the order above). The
+//! launchers send m = 1 to the one-column kernel. Output layouts: the plain
+//! projections `y[r·m + c]` (the K-quant gemvs' layout, [`DenseKernels::enqueue_m`]);
+//! the block diagonal and the shared expert token-major, `y[c·rows + r]`, the
+//! m columns the next projection quantizes.
 
-use bloomery_gpu::cores::q3k_row_dot;
+use bloomery_gpu::cores::{q3k_row_dot, q3k_row_dot_cols};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -89,6 +99,45 @@ unsafe fn scale_min(w: &[u32], sc: usize, j: usize) -> (u32, u32) {
     }
 }
 
+/// Lane `lane`'s two values of sub-block pair `j` (0..4) of the Q5_K
+/// super-block at word `base` — values `64j + lane` and `64j + 32 + lane`,
+/// dequantized in the module's op order from the super-block scales `d`,
+/// `dmin` and the lane's high-bit byte `qh`.
+///
+/// # Safety
+///
+/// `base + 44 <= w.len()`, `lane < 32`, `j < 4`.
+#[inline(always)]
+unsafe fn q5k_values(
+    w: &[u32],
+    base: usize,
+    j: usize,
+    lane: usize,
+    d: f32,
+    dmin: f32,
+    qh: u32,
+) -> (f32, f32) {
+    // SAFETY: the scale words base+1 .. base+4 and the low-nibble byte 32j +
+    // lane of the 128 from word base + 12 are inside the super-block.
+    let ((sc1, m1), (sc2, m2), ql) = unsafe {
+        (
+            scale_min(w, base + 1, 2 * j),
+            scale_min(w, base + 1, 2 * j + 1),
+            byte(w, base + 12, 32 * j + lane),
+        )
+    };
+    let d1 = mul_rn_f32(d, sc1 as f32);
+    let n1 = mul_rn_f32(dmin, m1 as f32);
+    let d2 = mul_rn_f32(d, sc2 as f32);
+    let n2 = mul_rn_f32(dmin, m2 as f32);
+    let q1 = (ql & 0x0f) + 16 * ((qh >> (2 * j)) & 1);
+    let q2 = (ql >> 4) + 16 * ((qh >> (2 * j + 1)) & 1);
+    (
+        fma_rn_f32(q1 as f32, d1, -n1),
+        fma_rn_f32(q2 as f32, d2, -n2),
+    )
+}
+
 /// Lane `lane`'s partial sum of Q5_K row `row` (`n_sb` super-blocks, word
 /// aligned: 176 bytes each) against the f32 column `x`, in the module's
 /// contract order.
@@ -108,24 +157,8 @@ unsafe fn q5k_lane_partial(w: &[u32], x: &[f32], n_sb: usize, row: usize, lane: 
         let (d, dmin) = (cvt_f32_f16x2_lo(dm), cvt_f32_f16x2_hi(dm));
         let mut j = 0usize;
         while j < 4 {
-            // SAFETY: the scale words base+1 .. base+4 and the low-nibble
-            // byte 32j + lane of the 128 from word base + 12 are inside the
-            // super-block.
-            let ((sc1, m1), (sc2, m2), ql) = unsafe {
-                (
-                    scale_min(w, base + 1, 2 * j),
-                    scale_min(w, base + 1, 2 * j + 1),
-                    byte(w, base + 12, 32 * j + lane),
-                )
-            };
-            let d1 = mul_rn_f32(d, sc1 as f32);
-            let n1 = mul_rn_f32(dmin, m1 as f32);
-            let d2 = mul_rn_f32(d, sc2 as f32);
-            let n2 = mul_rn_f32(dmin, m2 as f32);
-            let q1 = (ql & 0x0f) + 16 * ((qh >> (2 * j)) & 1);
-            let q2 = (ql >> 4) + 16 * ((qh >> (2 * j + 1)) & 1);
-            let v1 = fma_rn_f32(q1 as f32, d1, -n1);
-            let v2 = fma_rn_f32(q2 as f32, d2, -n2);
+            // SAFETY: the super-block is inside `w` (above), lane < 32, j < 4.
+            let (v1, v2) = unsafe { q5k_values(w, base, j, lane, d, dmin, qh) };
             let at = 256 * sb + 64 * j + lane;
             // SAFETY: at + 32 < 256 · n_sb <= x.len() by this function's
             // contract.
@@ -137,6 +170,171 @@ unsafe fn q5k_lane_partial(w: &[u32], x: &[f32], n_sb: usize, row: usize, lane: 
         sb += 1;
     }
     acc
+}
+
+/// One column's step of the m-column Q5_K walk: `acc` folds the pair `v1`,
+/// `v2` against that column's values `at` and `at + 32`, the order
+/// [`q5k_lane_partial`] folds them in.
+///
+/// # Safety
+///
+/// `at + 32 < x.len()`.
+#[inline(always)]
+unsafe fn q5k_col_step(acc: f32, v1: f32, v2: f32, x: &[f32], at: usize) -> f32 {
+    // SAFETY: both indices are inside `x` by this function's contract.
+    let (x1, x2) = unsafe { (*x.get_unchecked(at), *x.get_unchecked(at + 32)) };
+    fma_rn_f32(v2, x2, fma_rn_f32(v1, x1, acc))
+}
+
+/// Lane `lane`'s partial sums of Q5_K row `row` against `m` f32 columns of
+/// `256 · n_sb` values (column c at `x[c·k ..]`): each value decoded once
+/// and folded into every column's accumulator in [`q5k_lane_partial`]'s
+/// order, so column c is that function on column c alone. Columns past `m`
+/// stay 0.0.
+///
+/// # Safety
+///
+/// `w.len() >= (row + 1) · 44 · n_sb`, `x.len() >= m · 256 · n_sb`, `m` in
+/// 1..=8, `lane < 32`.
+#[inline(always)]
+unsafe fn q5k_lane_partials(
+    w: &[u32],
+    x: &[f32],
+    n_sb: usize,
+    row: usize,
+    m: usize,
+    lane: usize,
+) -> [f32; 8] {
+    let k = 256 * n_sb;
+    let [
+        mut a0,
+        mut a1,
+        mut a2,
+        mut a3,
+        mut a4,
+        mut a5,
+        mut a6,
+        mut a7,
+    ] = [0.0f32; 8];
+    let mut sb = 0usize;
+    while sb < n_sb {
+        let base = (row * n_sb + sb) * Q5K_WORDS;
+        // SAFETY: base + 44 <= w.len() for sb < n_sb by this function's
+        // contract; every word read below is one of those 44.
+        let (dm, qh) = unsafe { (*w.get_unchecked(base), byte(w, base + 4, lane)) };
+        let (d, dmin) = (cvt_f32_f16x2_lo(dm), cvt_f32_f16x2_hi(dm));
+        let mut j = 0usize;
+        while j < 4 {
+            // SAFETY: the super-block is inside `w` (above), lane < 32, j < 4.
+            let (v1, v2) = unsafe { q5k_values(w, base, j, lane, d, dmin, qh) };
+            let at = 256 * sb + 64 * j + lane;
+            // SAFETY: every column c < m reads c·k + at + 32 < (c + 1)·k <=
+            // m·k <= x.len() by this function's contract; the guards are
+            // launch-uniform, so no warp diverges on them.
+            unsafe {
+                a0 = q5k_col_step(a0, v1, v2, x, at);
+                if m > 1 {
+                    a1 = q5k_col_step(a1, v1, v2, x, k + at);
+                }
+                if m > 2 {
+                    a2 = q5k_col_step(a2, v1, v2, x, 2 * k + at);
+                }
+                if m > 3 {
+                    a3 = q5k_col_step(a3, v1, v2, x, 3 * k + at);
+                }
+                if m > 4 {
+                    a4 = q5k_col_step(a4, v1, v2, x, 4 * k + at);
+                }
+                if m > 5 {
+                    a5 = q5k_col_step(a5, v1, v2, x, 5 * k + at);
+                }
+                if m > 6 {
+                    a6 = q5k_col_step(a6, v1, v2, x, 6 * k + at);
+                }
+                if m > 7 {
+                    a7 = q5k_col_step(a7, v1, v2, x, 7 * k + at);
+                }
+            }
+            j += 1;
+        }
+        sb += 1;
+    }
+    [a0, a1, a2, a3, a4, a5, a6, a7]
+}
+
+/// The row's m sums from the per-lane partials: `warp::reduce_sum_f32` per
+/// column, the one-column kernels' tree, columns past `m` left at 0.0. `m`
+/// must be warp-uniform — a launch-wide constant in every caller.
+#[inline(always)]
+fn col_sums(f: [f32; 8], m: usize) -> [f32; 8] {
+    let mut s = [0.0f32; 8];
+    s[0] = warp::reduce_sum_f32(f[0]);
+    if m > 1 {
+        s[1] = warp::reduce_sum_f32(f[1]);
+    }
+    if m > 2 {
+        s[2] = warp::reduce_sum_f32(f[2]);
+    }
+    if m > 3 {
+        s[3] = warp::reduce_sum_f32(f[3]);
+    }
+    if m > 4 {
+        s[4] = warp::reduce_sum_f32(f[4]);
+    }
+    if m > 5 {
+        s[5] = warp::reduce_sum_f32(f[5]);
+    }
+    if m > 6 {
+        s[6] = warp::reduce_sum_f32(f[6]);
+    }
+    if m > 7 {
+        s[7] = warp::reduce_sum_f32(f[7]);
+    }
+    s
+}
+
+/// Lane 0's store of a row's `m` values: `y[base + c·stride] = v[c]` for
+/// `c < m`, one guarded store per column with a constant index (a loop over
+/// `c` would index `v` at run time and put it in a local depot).
+///
+/// # Safety
+///
+/// `1 <= m <= 8`, every slot `base + c·stride` for `c < m` inside `y`, and
+/// no other thread of the launch writes any of them.
+#[inline(always)]
+unsafe fn store_cols(
+    y: &mut DisjointSlice<f32>,
+    base: usize,
+    stride: usize,
+    m: usize,
+    v: [f32; 8],
+) {
+    // SAFETY: each store is guarded by c < m, so its slot is one this fn's
+    // contract puts inside y and gives to this thread alone.
+    unsafe {
+        *y.get_unchecked_mut(base) = v[0];
+        if m > 1 {
+            *y.get_unchecked_mut(base + stride) = v[1];
+        }
+        if m > 2 {
+            *y.get_unchecked_mut(base + 2 * stride) = v[2];
+        }
+        if m > 3 {
+            *y.get_unchecked_mut(base + 3 * stride) = v[3];
+        }
+        if m > 4 {
+            *y.get_unchecked_mut(base + 4 * stride) = v[4];
+        }
+        if m > 5 {
+            *y.get_unchecked_mut(base + 5 * stride) = v[5];
+        }
+        if m > 6 {
+            *y.get_unchecked_mut(base + 6 * stride) = v[6];
+        }
+        if m > 7 {
+            *y.get_unchecked_mut(base + 7 * stride) = v[7];
+        }
+    }
 }
 
 #[cuda_module]
@@ -178,6 +376,49 @@ mod dense_kernels {
             // SAFETY: row < n_rows <= y.len(); lane 0 of the row's warp is
             // its only writer.
             unsafe { *y.get_unchecked_mut(row) = s };
+        }
+    }
+
+    /// `ds41_q5k_gemv_f32` over `m_cols` (1..=8) f32 columns of `256·n_sb`
+    /// values, `x[c·k ..]`: `y[r·m + c]`, column c bit for bit the
+    /// one-column launch on that column.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_rows * 44 * n_sb,
+            x.len() >= m_cols * 256 * n_sb,
+            y.len() >= n_rows * m_cols,
+            m_cols >= 1,
+            m_cols <= 8
+        )
+    )]
+    pub fn ds41_q5k_gemv_f32_mcol(
+        w: &[u32],
+        x: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        m_cols: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let m = m_cols as usize;
+        // SAFETY: row < n_rows puts the row's words inside w, x holds m
+        // columns of 256·n_sb values and 1 <= m <= 8, by the launch
+        // contract; lane < 32.
+        let f = unsafe { q5k_lane_partials(w, x, n_sb as usize, row, m, lane) };
+        let s = col_sums(f, m);
+        if lane == 0 {
+            // SAFETY: slots row·m + c for c < m are inside y (y.len() >=
+            // n_rows·m) and belong to this row's warp alone.
+            unsafe { store_cols(&mut y, row * m, 1, m, s) };
         }
     }
 
@@ -233,6 +474,75 @@ mod dense_kernels {
         }
     }
 
+    /// `ds41_q3k_gemv_heads` for `m_cols` (1..=8) tokens: the activation
+    /// holds `m_cols · groups` q8_1 columns, token t's group g at column
+    /// `t·groups + g`, and row r of group g dots its group's column of every
+    /// token (`cores::q3k_row_dot_cols`, stride `groups`). Token-major
+    /// output, `y[t·n_rows + r]`; token t bit for bit the one-token launch
+    /// on that token's `groups` columns.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 110 * n_sb,
+            q.len() >= m_cols * groups * 64 * iters,
+            d8.len() >= m_cols * groups * 2 * n_sb,
+            groups * rows_per_head >= n_rows,
+            y.len() >= m_cols * n_rows,
+            m_cols >= 1,
+            m_cols <= 8
+        )
+    )]
+    pub fn ds41_q3k_gemv_heads_mcol(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        rows_per_head: u32,
+        groups: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let g = row / rows_per_head as usize;
+        // The second test is the contract's, warp-uniform like the first.
+        if row >= n_rows as usize || g >= groups as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let m = m_cols as usize;
+        // q3k_row_dot_cols's contract: the row inside w, and column g +
+        // (m-1)·groups (< m·groups) inside q and d8, all by the launch
+        // contract; every lane of the warp calls it.
+        let f = q3k_row_dot_cols(
+            w,
+            q,
+            d8,
+            n_sb as usize,
+            iters,
+            row,
+            g,
+            groups as usize,
+            m,
+            lane,
+        );
+        let s = col_sums(f, m);
+        if lane == 0 {
+            // SAFETY: slots t·n_rows + row for t < m are inside y (y.len()
+            // >= m·n_rows) and belong to this row's warp alone.
+            unsafe { store_cols(&mut y, row, n_rows as usize, m, s) };
+        }
+    }
+
     /// The shared expert's gate·up·SwiGLU for one token, Q3_K weights: row
     /// `r` (a warp per row) dots gate row `r` and up row `r` against the one
     /// q8_1 column, reduces each with the warp tree and stores
@@ -280,6 +590,69 @@ mod dense_kernels {
             // SAFETY: row < n_rows <= h.len(); lane 0 of the row's warp is
             // its only writer.
             unsafe { *h.get_unchecked_mut(row) = v };
+        }
+    }
+
+    /// `ds41_shexp_gate_up_q3k` for `m_cols` (1..=8) tokens: both Q3_K dots
+    /// against each of the m q8_1 columns, token-major output
+    /// `h[t·n_rows + r]`; token t bit for bit the one-token launch on its
+    /// column.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * wg.len() >= n_rows * 110 * n_sb,
+            4 * wu.len() >= n_rows * 110 * n_sb,
+            q.len() >= m_cols * 64 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            h.len() >= m_cols * n_rows,
+            m_cols >= 1,
+            m_cols <= 8
+        )
+    )]
+    pub fn ds41_shexp_gate_up_q3k_mcol(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        limit: f32,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let m = m_cols as usize;
+        let fg = q3k_row_dot(wg, q, d8, n_sb as usize, iters, row, 0, m, lane);
+        let fu = q3k_row_dot(wu, q, d8, n_sb as usize, iters, row, 0, m, lane);
+        let g = col_sums(fg, m);
+        let u = col_sums(fu, m);
+        if lane == 0 {
+            let v = [
+                swiglu_clamp(g[0], u[0], limit),
+                swiglu_clamp(g[1], u[1], limit),
+                swiglu_clamp(g[2], u[2], limit),
+                swiglu_clamp(g[3], u[3], limit),
+                swiglu_clamp(g[4], u[4], limit),
+                swiglu_clamp(g[5], u[5], limit),
+                swiglu_clamp(g[6], u[6], limit),
+                swiglu_clamp(g[7], u[7], limit),
+            ];
+            // SAFETY: slots t·n_rows + row for t < m are inside h (h.len()
+            // >= m·n_rows) and belong to this row's warp alone.
+            unsafe { store_cols(&mut h, row, n_rows as usize, m, v) };
         }
     }
 }
@@ -373,28 +746,52 @@ impl DenseKernels {
         act: Option<&Q8Act>,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        self.enqueue_m(gpu, d, x, act, 1, y)
+    }
+
+    /// Enqueue `y = W · x` for `m` (1..=8) tokens: `x` their f32 inputs, `m`
+    /// columns of the projection's K values, `act` those inputs' q8_1 form
+    /// (`m` columns) when `d` reads one, `y` row-major, `y[r·m + c]`.
+    /// Column c is the one-token enqueue on token c bit for bit, whatever
+    /// the format. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_m(
+        &self,
+        gpu: &Gpu,
+        d: Dense<'_>,
+        x: &DeviceBuffer<f32>,
+        act: Option<&Q8Act>,
+        m: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
         let stream = gpu.stream();
-        let act = || {
-            act.ok_or_else(|| GpuError::Shape {
+        let act = || match act {
+            Some(a) if a.m() == m => Ok(a),
+            Some(a) => Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a q8_1 input of {} columns for {m} tokens", a.m()),
+            }),
+            None => Err(GpuError::Shape {
                 what: WHAT,
                 detail: "a K-quant projection without its input's q8_1 form".to_string(),
-            })
+            }),
         };
         match d {
-            Dense::Q8_0 { qs, d } => gpu.q8f32().enqueue_q8_0_gemv(stream, qs, d, x, 1, y),
+            Dense::Q8_0 { qs, d } => gpu.q8f32().enqueue_q8_0_gemv(stream, qs, d, x, m, y),
             Dense::Q3K(w) => gpu.enqueue_gemv_q3k(w, act()?, y),
             Dense::Q4K(w) => gpu.enqueue_gemv_q4k(w, act()?, y),
-            Dense::Q5K(w) => self.enqueue_q5k(stream, w, x, y),
+            Dense::Q5K(w) => self.enqueue_q5k(stream, w, x, m, y),
         }
     }
 
     /// Enqueue the Q5_K f32-activation gemv of `w` (rows of whole
-    /// super-blocks, word aligned) over the one column `x`.
+    /// super-blocks, word aligned) over the `m` columns of `x`, `y[r·m + c]`:
+    /// the one-column kernel at `m` 1, its m-column twin otherwise.
     fn enqueue_q5k(
         &self,
         stream: &CudaStream,
         w: &DeviceTensor<u32>,
         x: &DeviceBuffer<f32>,
+        m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "DenseKernels::enqueue_q5k";
@@ -409,25 +806,32 @@ impl DenseKernels {
             });
         }
         let n_sb = w.cols() / Q5K_WORDS;
-        if x.len() < 256 * n_sb || y.len() < n_rows {
+        if !(1..=8).contains(&m) || x.len() < m * 256 * n_sb || y.len() < n_rows * m {
             return Err(GpuError::Shape {
                 what,
                 detail: format!(
-                    "x.len() {} < {} or y.len() {} < {n_rows}",
+                    "m {m} (1..=8), x.len() {} < {} or y.len() {} < {}",
                     x.len(),
-                    256 * n_sb,
-                    y.len()
+                    m * 256 * n_sb,
+                    y.len(),
+                    n_rows * m
                 ),
             });
         }
         let grid = launch_u32(what, "grid", n_rows.div_ceil(8))?;
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_ds41_q5k_gemv_f32(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module
-            .ds41_q5k_gemv_f32(stream, &prep, w.buf(), x, n_rows, n_sb, y)?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        if m == 1 {
+            let prep = self.module.prepare_ds41_q5k_gemv_f32(cfg)?;
+            self.module
+                .ds41_q5k_gemv_f32(stream, &prep, w.buf(), x, n_rows, n_sb, y)?;
+        } else {
+            let m = launch_u32(what, "m", m)?;
+            let prep = self.module.prepare_ds41_q5k_gemv_f32_mcol(cfg)?;
+            self.module
+                .ds41_q5k_gemv_f32_mcol(stream, &prep, w.buf(), x, n_rows, n_sb, m, y)?;
+        }
         Ok(())
     }
 
@@ -486,9 +890,97 @@ impl DenseKernels {
         Ok(())
     }
 
-    /// Enqueue the shared expert's gate·up·SwiGLU for one token from Q3_K
-    /// `gate` and `up` (the same rows of `act.n_sb()` super-blocks) and the
-    /// token's q8_1 column `act`; `h` takes one f32 per row. Asynchronous,
+    /// Enqueue the block diagonal of Q3_K weight `a.w` for `a.m` (1..=8)
+    /// tokens ([`Q3kHeadsMcolArgs`]): row `r` of group `g = r /
+    /// rows_per_head` against column `t·groups + g` of the activation for
+    /// every token t, token-major into `a.y`. Token t is
+    /// [`DenseKernels::enqueue_q3k_heads`] on that token's `groups` columns,
+    /// bit for bit; one token is that kernel. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_q3k_heads_mcol(
+        &self,
+        stream: &CudaStream,
+        a: Q3kHeadsMcolArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "DenseKernels::enqueue_q3k_heads_mcol";
+        let (n_rows, groups, n_sb, m) = (a.w.rows(), a.groups, a.n_sb, a.m);
+        if a.rows_per_head == 0 || n_rows != groups * a.rows_per_head || !(1..=8).contains(&m) {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{n_rows} rows are not {groups} groups of {}, or m {m} is not in 1..=8",
+                    a.rows_per_head
+                ),
+            });
+        }
+        kquant_rows(what, a.w, 110, n_sb)?;
+        let cols = m * groups;
+        if a.q3.len() < cols * 64 * n_sb.div_ceil(2)
+            || a.d8.len() < cols * 2 * n_sb
+            || a.y.len() < m * n_rows
+        {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{cols} q8_1 columns of {n_sb} super-blocks want {} code and {} scale \
+                     slots, got {} and {}; y wants {}, got {}",
+                    cols * 64 * n_sb.div_ceil(2),
+                    cols * 2 * n_sb,
+                    a.q3.len(),
+                    a.d8.len(),
+                    m * n_rows,
+                    a.y.len()
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", n_rows.div_ceil(8))?;
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let rows_per_head = launch_u32(what, "rows_per_head", a.rows_per_head)?;
+        let groups = launch_u32(what, "groups", groups)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        if m == 1 {
+            let prep = self.module.prepare_ds41_q3k_gemv_heads(cfg)?;
+            self.module.ds41_q3k_gemv_heads(
+                stream,
+                &prep,
+                a.w.buf(),
+                a.q3,
+                a.d8,
+                n_rows,
+                rows_per_head,
+                groups,
+                n_sb,
+                n_sb.div_ceil(2),
+                a.y,
+            )?;
+        } else {
+            let m = launch_u32(what, "m", m)?;
+            let prep = self.module.prepare_ds41_q3k_gemv_heads_mcol(cfg)?;
+            self.module.ds41_q3k_gemv_heads_mcol(
+                stream,
+                &prep,
+                a.w.buf(),
+                a.q3,
+                a.d8,
+                n_rows,
+                rows_per_head,
+                groups,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                a.y,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue the shared expert's gate·up·SwiGLU for `act.m()` (1..=8)
+    /// tokens from Q3_K `gate` and `up` (the same rows of `act.n_sb()`
+    /// super-blocks) and the tokens' q8_1 columns `act`; `h` takes one f32
+    /// per row and token, token-major (`h[t·rows + r]`). At one token this
+    /// is the one-token kernel; at more, its m-column twin, token t bit for
+    /// bit the one-token launch on its column. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_shexp_gate_up_q3k(
         &self,
@@ -500,15 +992,13 @@ impl DenseKernels {
         h: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "DenseKernels::enqueue_shexp_gate_up_q3k";
-        let (n_rows, n_sb) = (gate.rows(), act.n_sb());
-        if act.m() != 1 || up.rows() != n_rows || h.len() < n_rows {
+        let (n_rows, n_sb, m) = (gate.rows(), act.n_sb(), act.m());
+        if up.rows() != n_rows || h.len() < m * n_rows {
             return Err(GpuError::Shape {
                 what,
                 detail: format!(
-                    "one q8_1 column, gate and up of one height and h of it: m {}, gate {} \
-                     rows, up {}, h.len() {}",
-                    act.m(),
-                    n_rows,
+                    "gate and up of one height and h of m of it: m {m}, gate {n_rows} rows, \
+                     up {}, h.len() {}",
                     up.rows(),
                     h.len()
                 ),
@@ -519,24 +1009,62 @@ impl DenseKernels {
         let grid = launch_u32(what, "grid", n_rows.div_ceil(8))?;
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_ds41_shexp_gate_up_q3k(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module.ds41_shexp_gate_up_q3k(
-            stream,
-            &prep,
-            gate.buf(),
-            up.buf(),
-            act.q3(),
-            act.d8(),
-            n_rows,
-            n_sb,
-            n_sb.div_ceil(2),
-            limit,
-            h,
-        )?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        if m == 1 {
+            let prep = self.module.prepare_ds41_shexp_gate_up_q3k(cfg)?;
+            self.module.ds41_shexp_gate_up_q3k(
+                stream,
+                &prep,
+                gate.buf(),
+                up.buf(),
+                act.q3(),
+                act.d8(),
+                n_rows,
+                n_sb,
+                n_sb.div_ceil(2),
+                limit,
+                h,
+            )?;
+        } else {
+            let m = launch_u32(what, "m", m)?;
+            let prep = self.module.prepare_ds41_shexp_gate_up_q3k_mcol(cfg)?;
+            self.module.ds41_shexp_gate_up_q3k_mcol(
+                stream,
+                &prep,
+                gate.buf(),
+                up.buf(),
+                act.q3(),
+                act.d8(),
+                n_rows,
+                m,
+                n_sb,
+                n_sb.div_ceil(2),
+                limit,
+                h,
+            )?;
+        }
         Ok(())
     }
+}
+
+/// Arguments of [`DenseKernels::enqueue_q3k_heads_mcol`].
+pub struct Q3kHeadsMcolArgs<'a> {
+    /// The Q3_K block-diagonal weight, `groups · rows_per_head` rows.
+    pub w: &'a DeviceTensor<u32>,
+    /// The activation's codes, `m · groups` q8_1 columns of `n_sb`
+    /// super-blocks in [`Q8Act::q3`]'s per-column layout, token t's group g
+    /// at column `t·groups + g`. The quantizer is column-local, so these are
+    /// the bytes of the m one-token activations laid end to end.
+    pub q3: &'a DeviceBuffer<u64>,
+    /// The activation's block scales, in [`Q8Act::d8`]'s per-column layout.
+    pub d8: &'a DeviceBuffer<f32>,
+    pub n_sb: usize,
+    pub groups: usize,
+    pub rows_per_head: usize,
+    /// Tokens, 1..=8.
+    pub m: usize,
+    /// `m · rows` outputs, token-major.
+    pub y: &'a mut DeviceBuffer<f32>,
 }
 
 /// Refuse a K-quant tensor whose rows are not `n_sb` super-blocks of
