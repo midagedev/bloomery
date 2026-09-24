@@ -43,6 +43,7 @@ pub mod probe;
 pub mod q4k_sel;
 pub mod q5;
 pub mod q8f32;
+pub mod route_core;
 pub mod router;
 pub(crate) mod tensor;
 pub mod weights;

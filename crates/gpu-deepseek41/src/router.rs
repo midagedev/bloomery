@@ -27,6 +27,9 @@
 //!   architecture), then multiplied by `expert_weights_scale` in f32.
 
 use bloomery_gpu::q8f32::f32_lane_partial_1col;
+/// ik's expert score in f32; the gates' host side simulates the device with it.
+pub use bloomery_gpu::route_core::sqrt_softplus;
+use bloomery_gpu::route_core::take;
 use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
@@ -56,24 +59,6 @@ const _: () = assert!(N_EXPERT.is_multiple_of(32) && N_EXPERT.is_multiple_of(ROW
 // The selecting lane keeps its taken entries as bits of one u32.
 const _: () = assert!(PER_LANE <= 32);
 
-/// ik's expert score in f32: `sqrt(x > 20 ? x : ln(1 + e^x))`. One function
-/// for both sides: on the device `exp`/`ln` are CUDA's libdevice, on the host
-/// the system libm — ik's own, which is what the gate's host side simulates.
-#[inline(always)]
-pub fn sqrt_softplus(x: f32) -> f32 {
-    let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
-    sp.sqrt()
-}
-
-/// Whether candidate `(v, i)` beats the running best `(best_v, best_i)` in
-/// the selection order: a greater value, or an equal value at a LARGER index.
-/// A total order on finite values, so any fixed reduction over it picks the
-/// same winner; a NaN candidate never wins (both comparisons are false).
-#[inline(always)]
-pub(crate) fn route_take(v: f32, i: u32, best_v: f32, best_i: u32) -> bool {
-    v > best_v || (v == best_v && i > best_i)
-}
-
 #[cuda_module]
 mod router_kernels {
     use super::*;
@@ -92,10 +77,10 @@ mod router_kernels {
     /// ticket copies every score into shared memory (coherent loads — its L1
     /// never held those lines, and a volatile load does not ask it), adds the
     /// bias, and its warp 0 runs six rounds of a butterfly argmax under
-    /// [`route_take`]: lane `L` scans experts `L + 32 j` that no earlier
-    /// round took, the butterfly merges the lanes, and the winning lane marks
-    /// its entry taken. Lane 0 writes the ids, then the weights from the
-    /// six scores, and puts `done[0]` back to zero.
+    /// [`take`]`::<true>` (ties to the larger id): lane `L` scans experts
+    /// `L + 32 j` that no earlier round took, the butterfly merges the lanes,
+    /// and the winning lane marks its entry taken. Lane 0 writes the ids,
+    /// then the weights from the six scores, and puts `done[0]` back to zero.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -220,7 +205,7 @@ mod router_kernels {
                         // SAFETY: block-shared, ej < 32·PER_LANE = N_EXPERT,
                         // written before the barrier above.
                         let v = unsafe { *sel_v.add(ej) };
-                        if route_take(v, ej as u32, bv, bi) {
+                        if take::<true>(v, ej as u32, bv, bi) {
                             bv = v;
                             bi = ej as u32;
                         }
@@ -230,7 +215,7 @@ mod router_kernels {
                 let mut off = 16u32;
                 while off > 0 {
                     let (ov, oi) = (warp::shuffle_xor_f32(bv, off), warp::shuffle_xor(bi, off));
-                    if route_take(ov, oi, bv, bi) {
+                    if take::<true>(ov, oi, bv, bi) {
                         bv = ov;
                         bi = oi;
                     }

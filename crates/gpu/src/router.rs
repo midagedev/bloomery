@@ -16,8 +16,8 @@
 //! `x[e * m + t]` (expert e of token t) — the router gemv's `y` as produced.
 
 use crate::GpuError;
-use crate::elem::argmax_take;
 use crate::launch_u32;
+use crate::route_core::take;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
@@ -158,12 +158,12 @@ mod router_kernels {
             thread::sync_threads();
             // Pass 4 over the warp. Lane L owns experts L and L+32, read once
             // — the six selections differ only by the `taken` mask.
-            // `argmax_take` is the total order (probability descending, id
+            // `take::<false>` is the total order (probability descending, id
             // ascending) that the serial scan's strict `>` over ascending
             // experts realizes, so no regrouping can move a tie, and its
             // `(-inf, 0)` seed is the serial scan's seed, so a token no
             // comparison ever wins answers expert 0 on both paths. A NaN
-            // probability never enters the reduction: `argmax_take` takes a
+            // probability never enters the reduction: `take::<false>` takes a
             // candidate only on `>` or `==`, both false for NaN, so no lane's
             // running best is ever NaN and the merge only ever sees numbers.
             let lane = warp::lane_id() as usize;
@@ -176,18 +176,18 @@ mod router_kernels {
             while s < N_USED {
                 let mut bv = f32::NEG_INFINITY;
                 let mut bi = 0u32;
-                if (taken >> e0) & 1 == 0 && argmax_take(p0, e0 as u32, bv, bi) {
+                if (taken >> e0) & 1 == 0 && take::<false>(p0, e0 as u32, bv, bi) {
                     bv = p0;
                     bi = e0 as u32;
                 }
-                if (taken >> e1) & 1 == 0 && argmax_take(p1, e1 as u32, bv, bi) {
+                if (taken >> e1) & 1 == 0 && take::<false>(p1, e1 as u32, bv, bi) {
                     bv = p1;
                     bi = e1 as u32;
                 }
                 let mut off = 16u32;
                 while off > 0 {
                     let (ov, oi) = (warp::shuffle_xor_f32(bv, off), warp::shuffle_xor(bi, off));
-                    if argmax_take(ov, oi, bv, bi) {
+                    if take::<false>(ov, oi, bv, bi) {
                         bv = ov;
                         bi = oi;
                     }
