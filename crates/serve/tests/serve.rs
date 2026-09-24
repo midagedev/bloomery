@@ -418,3 +418,119 @@ fn hw_two_requests_share_the_slot() {
         assert_eq!(v["choices"][0]["message"]["content"], "abc");
     }
 }
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_unsupported_fields_are_refused() {
+    let addr = start(4096);
+    let refused = [
+        ("response_format", json!({"type": "json_object"})),
+        ("json_schema", json!({"type": "object"})),
+        ("grammar", json!("root ::= \"a\"")),
+        ("logprobs", json!(true)),
+        ("top_logprobs", json!(2)),
+        ("n", json!(2)),
+        (
+            "tools",
+            json!([{"type": "function", "function": {"name": "f"}}]),
+        ),
+        ("tool_choice", json!("required")),
+    ];
+    for (field, value) in refused {
+        for path in ["/completion", "/v1/chat/completions"] {
+            let mut b = chat_body(json!({}));
+            b["prompt"] = json!("ab");
+            b[field] = value.clone();
+            let r = post(addr, path, &b);
+            assert_eq!(r.status, 400, "{path} {field}: {}", r.body);
+            let e = &r.json()["error"];
+            assert_eq!(e["type"], "invalid_request_error", "{path} {field}: {e}");
+            assert!(
+                e["message"].as_str().is_some_and(|m| m.contains(field)),
+                "{path} {field}: the message must name the field: {e}"
+            );
+        }
+    }
+    let neutral = [
+        ("response_format", json!({"type": "text"})),
+        ("json_schema", Value::Null),
+        ("grammar", json!("")),
+        ("logprobs", json!(false)),
+        ("top_logprobs", json!(0)),
+        ("n", json!(1)),
+        ("tools", json!([])),
+        ("tool_choice", json!("none")),
+        ("cache_prompt", json!(true)),
+    ];
+    for (field, value) in neutral {
+        let mut b = chat_body(json!({}));
+        b[field] = value;
+        let r = post(addr, "/v1/chat/completions", &b);
+        assert_eq!(r.status, 200, "{field}: {}", r.body);
+    }
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_models_created_is_process_start() {
+    let addr = start(4096);
+    // Cross a second boundary so a per-call clock cannot equal the start time.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let start_unix: u64 = get(addr, "/metrics")
+        .header("Process-Start-Time-Unix")
+        .and_then(|v| v.parse().ok())
+        .expect("Process-Start-Time-Unix header");
+    let a = get(addr, "/v1/models").json()["data"][0]["created"].clone();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let b = get(addr, "/v1/models").json()["data"][0]["created"].clone();
+    assert_eq!(a, b, "two calls, same created");
+    assert_eq!(a, start_unix, "created is the process start");
+}
+
+fn metric(body: &str, k: &str) -> f64 {
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("llamacpp:{k} ")))
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("no value for {k}:\n{body}"))
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_metrics_throughput_survives_scrapes() {
+    let addr = start(4096);
+    post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0}),
+    );
+    let first = get(addr, "/metrics").body;
+    let second = get(addr, "/metrics").body;
+    for k in ["prompt_tokens_seconds", "predicted_tokens_seconds"] {
+        let (a, b) = (metric(&first, k), metric(&second, k));
+        assert!(a > 0.0 && a.is_finite(), "{k} first scrape: {a}");
+        assert_eq!(a, b, "{k}: a scrape must not reset the gauge");
+    }
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_metrics_kv_cache_usage_ratio() {
+    let ctx = 4096;
+    let addr = start(ctx);
+    let idle = get(addr, "/metrics").body;
+    assert_eq!(metric(&idle, "kv_cache_usage_ratio"), 0.0);
+    // Six prompt tokens and five generated: the mock's cache holds ten positions
+    // (the last generated token is never evaluated).
+    post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0}),
+    );
+    let body = get(addr, "/metrics").body;
+    assert_eq!(metric(&body, "kv_cache_tokens"), 10.0);
+    assert_eq!(
+        metric(&body, "kv_cache_usage_ratio"),
+        10.0 / ctx as f64,
+        "n_past / ctx_max"
+    );
+}

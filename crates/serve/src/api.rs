@@ -120,11 +120,6 @@ struct Stats {
     t_predicted_ms_total: f64,
     n_decode_total: u64,
     n_busy_slots_total: u64,
-    // Since the last /metrics read, for the throughput gauges (llama-server's bucket).
-    bucket_prompt_n: u64,
-    bucket_prompt_ms: f64,
-    bucket_predicted_n: u64,
-    bucket_predicted_ms: f64,
 }
 
 #[derive(Default)]
@@ -343,10 +338,45 @@ fn stop_list(v: Option<&Value>) -> Vec<String> {
 
 /// Knobs shared by both generation endpoints. `n_predict` wins over the OpenAI names.
 /// `cache_prompt` is accepted and ignored: every request resets the engine and
-/// evaluates its whole prompt (`timings.cache_n` is always 0). Unknown fields are ignored.
+/// evaluates its whole prompt (`timings.cache_n` is always 0).
+///
+/// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
+/// `n_probs > 0`, `response_format` other than `{"type":"text"}`, `json_schema`, a
+/// non-empty `grammar`, `logprobs: true`, `top_logprobs > 0`, `n > 1`, non-empty
+/// `tools` (the model would answer in raw DSML the server cannot parse) and
+/// `tool_choice` other than `"none"`. `null` counts as absent. Other unknown fields
+/// are ignored.
 fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiError> {
-    if get_i(o, "n_probs").is_some_and(|n| n > 0) {
-        return Err(invalid("n_probs is not supported by this server"));
+    let set = |k: &str| o.get(k).filter(|v| !v.is_null());
+    let refused = [
+        ("n_probs", get_i(o, "n_probs").is_some_and(|n| n > 0)),
+        (
+            "response_format",
+            set("response_format")
+                .is_some_and(|v| v.get("type").and_then(Value::as_str) != Some("text")),
+        ),
+        ("json_schema", set("json_schema").is_some()),
+        (
+            "grammar",
+            set("grammar").is_some_and(|v| v.as_str() != Some("")),
+        ),
+        ("logprobs", get_b(o, "logprobs") == Some(true)),
+        (
+            "top_logprobs",
+            get_i(o, "top_logprobs").is_some_and(|n| n > 0),
+        ),
+        ("n", get_i(o, "n").is_some_and(|n| n > 1)),
+        (
+            "tools",
+            set("tools").is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty())),
+        ),
+        (
+            "tool_choice",
+            set("tool_choice").is_some_and(|v| v.as_str() != Some("none")),
+        ),
+    ];
+    if let Some((field, _)) = refused.iter().find(|(_, hit)| *hit) {
+        return Err(invalid(format!("{field} is not supported by this server")));
     }
     let d = SamplingParams::default();
     let seed = match get_i(o, "seed") {
@@ -456,7 +486,7 @@ fn models(state: &State) -> Value {
         "data": [{
             "id": state.alias,
             "object": "model",
-            "created": unix_now(),
+            "created": state.start_unix,
             "owned_by": "bloomery",
             "meta": { "n_vocab": state.info.n_vocab, "n_ctx_train": state.info.ctx_max },
             "max_model_len": state.info.ctx_max,
@@ -516,9 +546,23 @@ fn slots(state: &State) -> Value {
 fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let busy = state.busy.load(Ordering::SeqCst);
     let deferred = state.waiting.load(Ordering::SeqCst);
+    let n_past = relock(&state.slot).n_past;
+    let kv_ratio = if state.info.ctx_max > 0 {
+        n_past as f64 / state.info.ctx_max as f64
+    } else {
+        0.0
+    };
     let text = {
-        let mut s = relock(&state.stats);
-        let rate = |n: u64, ms: f64| if n > 0 { 1e3 / ms * n as f64 } else { 0.0 };
+        let s = relock(&state.stats);
+        // Throughput since start: the ratio of the matching `*_total` counters, so a
+        // scrape never changes it and any other window is `rate()` on those counters.
+        let rate = |n: u64, ms: f64| {
+            if n > 0 && ms > 0.0 {
+                1e3 / ms * n as f64
+            } else {
+                0.0
+            }
+        };
         let per_decode = if s.n_decode_total > 0 {
             s.n_busy_slots_total as f64 / s.n_decode_total as f64
         } else {
@@ -565,25 +609,25 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "gauge",
                 "prompt_tokens_seconds",
                 "Average prompt throughput in tokens/s.",
-                rate(s.bucket_prompt_n, s.bucket_prompt_ms).to_string(),
+                rate(s.n_prompt_total, s.t_prompt_ms_total).to_string(),
             ),
             (
                 "gauge",
                 "predicted_tokens_seconds",
                 "Average generation throughput in tokens/s.",
-                rate(s.bucket_predicted_n, s.bucket_predicted_ms).to_string(),
+                rate(s.n_predicted_total, s.t_predicted_ms_total).to_string(),
             ),
             (
                 "gauge",
                 "kv_cache_usage_ratio",
                 "KV-cache usage. 1 means 100 percent usage.",
-                "0".to_owned(),
+                kv_ratio.to_string(),
             ),
             (
                 "gauge",
                 "kv_cache_tokens",
                 "KV-cache tokens.",
-                relock(&state.slot).n_past.to_string(),
+                n_past.to_string(),
             ),
             (
                 "gauge",
@@ -598,10 +642,6 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 deferred.to_string(),
             ),
         ];
-        s.bucket_prompt_n = 0;
-        s.bucket_prompt_ms = 0.0;
-        s.bucket_predicted_n = 0;
-        s.bucket_predicted_ms = 0.0;
         let mut out = String::new();
         for (kind, name, help, value) in rows {
             out.push_str(&format!(
@@ -792,10 +832,6 @@ impl<'a> Run<'a> {
         let decodes = if pn > 0 { 1 + dn.saturating_sub(1) } else { 0 };
         s.n_decode_total += decodes;
         s.n_busy_slots_total += decodes;
-        s.bucket_prompt_n += pn;
-        s.bucket_prompt_ms += t.prompt_ms;
-        s.bucket_predicted_n += dn;
-        s.bucket_predicted_ms += t.predicted_ms;
         drop(s);
         let mut v = relock(&self.state.slot);
         v.n_past = t.n_past;
