@@ -44,10 +44,13 @@ Reference trees read: llama.cpp `master` at `d2e54583c7452353eb35d40431281f6ee98
    [G11, ik-ds4:1589-1593]. Our `walk_streams` would refuse this file at "no layer carries
    `indexer.attn_k`" (`crates/model/src/arch/deepseek41/hparams.rs:549-556`).
 4. **Weight formats decide the order more than any hyperparameter.** The card refuses Q5_K, F16 and
-   MXFP4 (`crates/model/src/placement.rs:186-194`), the GGUF reader parses I32 and every IQ type as
-   `Unknown` (`crates/gguf/src/quant.rs:57-71`), the host tier has no MXFP4 or IQ dot
+   MXFP4 (`crates/model/src/placement.rs:230-250`, `CardFormat::of`), ~~the GGUF reader parses I32 and every IQ type as
+   `Unknown` (`crates/gguf/src/quant.rs:57-71`)~~ (corrected 2026-09-24: the reader names I32 and the IQ
+   types since `seamc`, `crates/gguf/src/quant.rs:62-122`), the host tier has no MXFP4 or IQ dot
    (`crates/qdot/src/lib.rs:1-12`), and the card has routed `_sel` gemv for Q3_K, Q4_K and Q5_0 only
-   (`q3k_gemv_sel`, `q4k_gemv_sel`, `q5_0_gemv_sel` in `crates/gpu/src`). Of the published files
+   (`q3k_gemv_sel`, `q4k_gemv_sel`, `q5_0_gemv_sel` in `crates/gpu/src`) — plus, since the DSpark
+   draft, an MXFP4 gate·up/down pair fixed at 128 experts / 3 used
+   (`crates/gpu-deepseek41/src/experts_mxfp4.rs`) that the placement does not yet route to. Of the published files
    read here, only the Qwen3 files (Q4_K + Q6_K) sit inside today's set on both tiers except for a
    Q6_K routed `_sel` on the card. The large new MoE files (GLM-5.3-Flash, Qwen3.8-Flash-Next, V4
    Flash) publish their experts as MXFP4, IQ3_XXS, IQ4_XS or IQ4_NL [§3 table C].
@@ -165,7 +168,7 @@ Files skipped: `unsloth/Qwen3.8-Flash-Next-GGUF` "Q4_K_M" is `MTP/mtp-Qwen3.8-Fl
 | roles → placement | `arch/deepseek41/roles.rs:33-45`, `placement.rs:36-59` | no catch-all role; no dense-FFN role (V4.1 has none); no rule for `nextn.*` |
 | KV accounting | `placement.rs:143` (`KvBytes`), `arch/deepseek41/kv.rs` | one impl per arch |
 | card weight formats | `placement.rs:186-194` | Q3_K/Q4_K/Q6_K, Q5_0, Q5_1, Q8_0, F32, BF16→F32; refuses F16, Q5_K, MXFP4 |
-| card routed gemv | `crates/gpu/src` `q3k_gemv_sel`, `q4k_sel.rs` `q4k_gemv_sel`, `q5.rs` `q5_0_gemv_sel`; V4.1 fused `ds41_expert_gate_up` (q3_K) | no Q5_K / Q6_K / Q8_0 / MXFP4 routed kernel |
+| card routed gemv | `crates/gpu/src` `q3k_gemv_sel`, `q4k_sel.rs` `q4k_gemv_sel`, `q5.rs` `q5_0_gemv_sel`; V4.1 fused `ds41_expert_gate_up` (q3_K) | no Q5_K / Q6_K / Q8_0 routed kernel; MXFP4 only as the DSpark draft's 128/3 pair (`gpu-deepseek41/src/experts_mxfp4.rs`) |
 | host tier dots | `crates/qdot/src/lib.rs:1-12` | Q3_K×Q8_K; Q4_K/Q5_K/Q6_K/Q5_0/Q5_1×Q8_2_X4; Q8_0 cells |
 | host tier service | `crates/gpu/src/hybrid.rs:1051` (`HostExperts`), `chain/ffn.rs:1327` (`Ds41Host`), `crates/model/src/moe.rs:952` (`HostLayerSpec`) | protocol shared; one `HostExperts` impl per arch |
 | V2-Lite router | `crates/gpu/src/router.rs:1-33` | softmax, `N_EXPERT 64`, `N_USED 6` consts, ties to the smaller id |
