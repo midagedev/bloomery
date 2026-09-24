@@ -2,11 +2,16 @@
 //! resident arena. No allocation, no synchronization, no host round trip —
 //! so this is both the eager body and what the capture records. One layer
 //! body serves both passes: the decode step is its one-row instance, the
-//! prompt prefill the same launches at `m` rows.
+//! prompt prefill its `m`-row instance. At one row three launch seams are
+//! folded — the attention rows' q8_1 into the output projection, the FFN
+//! norm into the router, the SwiGLU rows' q8_1 into gate·up — each fused
+//! launch writing the bytes of the pair it replaces, so a one-row prefill
+//! pass and a multi-row one leave the same state.
 
 use super::body::{Body, Kernels, Kq, LayerNames};
 use super::experts::{CombineArgs, GateUpArgs};
-use super::proj::{OResidArgs, QkvArgs};
+use super::head_argmax::HeadArgmaxState;
+use super::proj::{OResidArgs, OResidQuantArgs, QkvArgs};
 use super::router::N_USED;
 use super::scratch::{Arena, Io, KvPlanes};
 use crate::flash_gqa::{GqaArgs, HEAD};
@@ -55,7 +60,25 @@ pub(super) fn enqueue_chain(
             t.rows[slot].copy_from_device_async(src, stream)?;
         }
     }
-    head.enqueue(gpu, w)
+    enqueue_head(gpu, w, &b.k, &mut b.head_state, head)
+}
+
+/// Enqueue the one-row head: its norm and quantization, then the Q6_K
+/// projection with the argmax folded in (`head_argmax`) in place of the
+/// shared head's gemv and `argmax_fault` — the same logits and the same
+/// (token, fault word) readback.
+fn enqueue_head(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &Kernels,
+    state: &mut HeadArgmaxState,
+    head: &mut Head,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    head.enqueue_with_tail(gpu, w, |act, out_w, fault, logits, out| {
+        k.head
+            .enqueue(stream, out_w, act, fault, logits, state, out)
+    })
 }
 
 /// Enqueue layer `slot`'s step, embedding the token into `x` in front when
@@ -107,6 +130,7 @@ pub(super) fn enqueue_prefill_pass(
         names,
         kv,
         k,
+        head_state,
         mma,
         prefill,
         ..
@@ -133,7 +157,7 @@ pub(super) fn enqueue_prefill_pass(
         Some(head) => {
             head.input_mut()
                 .copy_from_device_async(&s.x_rows[m - 1], gpu.stream())?;
-            head.enqueue(gpu, w)
+            enqueue_head(gpu, w, k, head_state, head)
         }
         None => Ok(()),
     }
@@ -192,7 +216,8 @@ fn layer(
 
 /// The attention half: `x` in, `ffn_inp = x + attn_output(attn(x))` out —
 /// q, k and v in one launch (a Q6_K v in its own), the output projection
-/// with the residual add in its store.
+/// with the residual add in its store, at one token with the q8_1 of its
+/// input in the same launch (`enqueue_o_resid_quant`).
 fn attention(
     c: &Ctx<'_>,
     kv: &mut KvPlanes,
@@ -273,11 +298,24 @@ fn attention(
         },
         c.mma,
     )?;
+    let wo = kq_weight(w, &n.attn_output)?;
+    if m == 1 {
+        return k.proj.enqueue_o_resid_quant(
+            stream,
+            OResidQuantArgs {
+                w: wo,
+                attn: &s.attn,
+                x: &s.x,
+                y: &mut s.ffn_inp,
+            },
+            gpu.unlabelled_sink(),
+        );
+    }
     gpu.enqueue_quantize_q8_1(&s.attn, &mut s.act_attn[i])?;
     k.proj.enqueue_o_resid(
         stream,
         OResidArgs {
-            w: kq_weight(w, &n.attn_output)?,
+            w: wo,
             act: &s.act_attn[i],
             x: &s.x,
             y: &mut s.ffn_inp,
@@ -288,7 +326,10 @@ fn attention(
 /// The routed FFN half: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
 /// down_s(swiglu(gate_s, up_s))` over each token's eight experts out, into
 /// `out` (`None`: into `x`). The down `_sel` takes one token's slots per
-/// launch.
+/// launch. At one token the norm runs inside the router's launch
+/// (`enqueue_norm_fused`, `norm_quant`'s bytes) and the down's q8_1 input
+/// inside the gate·up's (`enqueue_gate_up_quant`); at more, `norm_quant` and
+/// the `m`-token router, and a quantizer launch per token.
 fn ffn(
     c: &Ctx<'_>,
     s: &mut Arena,
@@ -299,37 +340,60 @@ fn ffn(
     let stream = gpu.stream();
     let d = s.dims;
     let i = m - 1;
-    gpu.fused().enqueue_norm_quant(
-        stream,
-        &s.ffn_inp,
-        f32_gain(w, &n.ffn_norm)?,
-        c.eps,
-        &mut s.act_ffn[i],
-        &mut s.normed,
-        gpu.unlabelled_sink(),
-    )?;
-    k.router.enqueue_fused(
-        stream,
-        f32_tensor(w, &n.ffn_gate_inp)?,
-        &s.normed,
-        m,
-        &mut s.route,
-    )?;
-    k.experts.enqueue_gate_up(
-        stream,
-        GateUpArgs {
-            wg: kq_weight(w, &n.ffn_gate_exps)?,
-            wu: kq_weight(w, &n.ffn_up_exps)?,
-            act: &s.act_ffn[i],
-            sel: &s.route.ids,
-            n_slots: m * N_USED,
-            rows_per_expert: d.ff,
-            h: &mut s.h,
-        },
-    )?;
+    if m == 1 {
+        k.router.enqueue_norm_fused(
+            stream,
+            f32_tensor(w, &n.ffn_gate_inp)?,
+            &s.ffn_inp,
+            f32_gain(w, &n.ffn_norm)?,
+            c.eps,
+            &mut s.act_ffn[i],
+            gpu.unlabelled_sink(),
+            &mut s.route,
+        )?;
+    } else {
+        gpu.fused().enqueue_norm_quant(
+            stream,
+            &s.ffn_inp,
+            f32_gain(w, &n.ffn_norm)?,
+            c.eps,
+            &mut s.act_ffn[i],
+            &mut s.normed,
+            gpu.unlabelled_sink(),
+        )?;
+        k.router.enqueue_fused(
+            stream,
+            f32_tensor(w, &n.ffn_gate_inp)?,
+            &s.normed,
+            m,
+            &mut s.route,
+        )?;
+    }
+    let gate_up = GateUpArgs {
+        wg: kq_weight(w, &n.ffn_gate_exps)?,
+        wu: kq_weight(w, &n.ffn_up_exps)?,
+        act: &s.act_ffn[i],
+        sel: &s.route.ids,
+        n_slots: m * N_USED,
+        rows_per_expert: d.ff,
+        h: &mut s.h,
+    };
+    if m == 1 {
+        k.experts.enqueue_gate_up_quant(
+            stream,
+            gate_up,
+            &mut s.act_h,
+            &mut s.gate_up_tickets,
+            gpu.unlabelled_sink(),
+        )?;
+    } else {
+        k.experts.enqueue_gate_up(stream, gate_up)?;
+    }
     let wd = kq_weight(w, &n.ffn_down_exps)?;
     for t in 0..m {
-        gpu.enqueue_quantize_q8_1_at(&s.h, t * N_USED * d.ff, &mut s.act_h)?;
+        if m > 1 {
+            gpu.enqueue_quantize_q8_1_at(&s.h, t * N_USED * d.ff, &mut s.act_h)?;
+        }
         match n.down_ty {
             Kq::Q4K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
                 stream,

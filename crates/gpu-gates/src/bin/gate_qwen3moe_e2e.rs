@@ -100,15 +100,19 @@ mod gate {
     /// (`PROMPTS` prompts of at most `MAX_TOKENS` ids) plus `GEN` with room.
     const CTX: usize = 256;
 
-    /// The captured step's node count, derived before the chain was built:
-    /// the embedding row, 13 nodes per layer (attention norm+quant, q·k·v,
-    /// QK-norm+rope+append, flash segment pass, flash merge, q8_1 of the
-    /// attention rows, attn_output with the residual, FFN norm+quant, the
-    /// router gemv with the routing, gate·up·SwiGLU, q8_1 of the SwiGLU rows,
-    /// down, combine into the next layer's input), one more on each of the
-    /// 24 layers whose value projection is Q6_K (its own gemv), and the
-    /// head's four (norm, q8_1, Q6_K gemv, argmax): 1 + 24·13 + 24·14 + 4.
-    const NODES_CHAIN: usize = 653;
+    /// PIN(2026-09-25): the captured step's node count, derived before the
+    /// chain was built: the embedding row, 10 nodes per layer (attention
+    /// norm+quant, q·k·v, QK-norm+rope+append, flash segment pass, flash
+    /// merge, attn_output with the q8_1 of its input and the residual, the
+    /// FFN norm with the router gemv and the routing, gate·up·SwiGLU with the
+    /// q8_1 of its rows, down, combine into the next layer's input), one more
+    /// on each of the 24 layers whose value projection is Q6_K (its own
+    /// gemv), and the head's three (norm, q8_1, the Q6_K gemv with the argmax
+    /// folded in): 1 + 24·10 + 24·11 + 3. Was 653: the head's gemv and
+    /// argmax were two launches, the attention rows' q8_1 ran in its own
+    /// launch before attn_output, the FFN norm_quant in its own before the
+    /// router, and the SwiGLU rows' q8_1 in its own after gate·up.
+    const NODES_CHAIN: usize = 508;
 
     /// Memcpy nodes in the captured step: the residual crosses no layer
     /// boundary as a copy.

@@ -19,7 +19,7 @@
 //! token.
 
 use crate::GpuError;
-use crate::fault::{Fault, LAYER_HEAD};
+use crate::fault::{Fault, FaultSink, LAYER_HEAD};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, Graph};
@@ -201,6 +201,49 @@ impl Head {
             )?;
         }
         Ok(())
+    }
+
+    /// Enqueue the head with its projection and argmax handed to `tail`, for
+    /// an architecture whose chain folds the two into one launch: the same
+    /// rms_norm and q8_1 quantization [`Head::enqueue`] runs, then `tail(act,
+    /// out_w, fault, logits, token_out)` over the quantized rows, the Q6_K
+    /// lm_head, the head's fault sink and the two outputs the readbacks read
+    /// (`logits` as `logits_to_host` takes them, `token_out` as the `m` tokens
+    /// then the fault word). `tail` must write both as `enqueue`'s gemv and
+    /// argmax do; [`Head::token`] and [`Head::logits_to_host`] are unchanged.
+    /// Pure enqueues, so the same body is what a capture records.
+    pub(crate) fn enqueue_with_tail<F>(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        tail: F,
+    ) -> Result<(), GpuError>
+    where
+        F: FnOnce(
+            &Q8Act,
+            &DeviceTensor<u32>,
+            FaultSink,
+            &mut DeviceBuffer<f32>,
+            &mut DeviceBuffer<u32>,
+        ) -> Result<(), GpuError>,
+    {
+        gpu.elem().enqueue_rms_norm(
+            gpu.stream(),
+            &self.x,
+            head_gain(w)?,
+            self.eps,
+            self.hidden,
+            self.m,
+            &mut self.normed,
+        )?;
+        gpu.enqueue_quantize_q8_1_head(&self.normed, &mut self.act)?;
+        tail(
+            &self.act,
+            head_out_w(w)?.0,
+            gpu.fault_sink(LAYER_HEAD),
+            &mut self.logits,
+            &mut self.token_out,
+        )
     }
 
     /// Capture `enqueue` over the resident buffers into this head's graph and

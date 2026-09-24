@@ -2,10 +2,13 @@
 //! probability, and their weights renormalized to sum to one
 //! (`norm_topk_prob`).
 //!
-//! Two entries share one warp-level routing body, [`route_warp`]:
-//! `qwen3moe_router_fused`, the engine's — the router's logit gemv with the
-//! routing fused into it, one launch for up to [`MAX_TOKENS`] tokens — and
-//! `qwen3moe_router`, the routing alone over one token's given logits. The
+//! Three entries share one warp-level routing body, [`route_warp`]:
+//! `qwen3moe_router_fused` — the router's logit gemv with the routing fused
+//! into it, one launch for up to [`MAX_TOKENS`] tokens; `qwen3moe_router_norm`,
+//! the chain's at one token — the same launch with `fused::norm_quant` run
+//! in every block first (its q8_1 bytes out, its normed row kept in shared
+//! memory for the gemv); and `qwen3moe_router`, the routing alone over one
+//! token's given logits. The
 //! fused gemv is `q8f32::f32_gemv`'s row body — one warp per expert row,
 //! `f32_lane_partials`' sum (at one token the same sum through
 //! `f32_lane_partial_1col_w32`, which keeps 32 chunks' loads in flight) and
@@ -28,9 +31,12 @@
 //! - the chosen probabilities summed in f64 in slot order, the sum rounded
 //!   once to f32, each weight the f32 divide of its probability by it.
 
+use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
+use crate::fault::{FaultSink, FaultSite, quad_finite};
+use crate::q8_1_quant_vals;
 use crate::q8f32::{f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums};
 use crate::route_core::take;
-use crate::tensor::DeviceTensor;
+use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
@@ -67,6 +73,18 @@ const P_LEN: usize = MAX_TOKENS * N_EXPERT;
 const SLOT_LEN: usize = MAX_TOKENS * N_USED;
 
 const _: () = assert!(FUSED_THREADS_U32 as usize == FUSED_THREADS);
+// The norm-fused entry runs `norm_quant`'s sum of squares on its whole
+// block: the same threads, loads and tree as the norm's first RMS_THREADS.
+const _: () = assert!(FUSED_THREADS == RMS_THREADS && FUSED_WARPS == RMS_WARPS);
+
+/// The widest row the norm-fused entry normalizes into shared memory: the
+/// qwen3moe hidden width.
+pub const NORM_K: usize = 2048;
+// `qwen3moe_router_norm`'s launch contract spells the bound out.
+const _: () = assert!(NORM_K == 2048);
+// Block `g` quantizes the row's 128-value group `g`, so every group needs a
+// block.
+const _: () = assert!(NORM_K / 128 <= N_EXPERT);
 // The routing warp's lanes hold four logits each, as named scalars.
 const _: () = assert!(PER_LANE == 4);
 // The routing block has a warp for every token.
@@ -200,6 +218,95 @@ unsafe fn route_warp(
             unsafe { *weights.get_unchecked_mut(t * N_USED + s) = *slot_p.add(s) / sum };
             s += 1;
         }
+    }
+}
+
+/// The fused entries' tail, after each block's rows are stored: every thread
+/// fences and the block meets at a barrier, so its rows are visible
+/// device-wide before thread 0 draws the block's ticket; the block that draws
+/// the last ticket returns the count to zero, and its warp `t < m` reads
+/// token `t`'s logits back (volatile loads: this block's L1 never held other
+/// blocks' rows, and a volatile load does not ask it) and runs
+/// [`route_warp`].
+///
+/// # Safety
+///
+/// Every thread of the block calls it, converged, with the same arguments;
+/// `last`, `p` and `slot_p` point to 1, `MAX_TOKENS · N_EXPERT` and
+/// `MAX_TOKENS · N_USED` entries of the block's shared memory that nothing
+/// else in the block touches from here on; `1 <= m <= MAX_TOKENS <=
+/// FUSED_WARPS`; `logits`, `probs` hold `128 · m` and `ids`, `weights` `8 ·
+/// m` entries, and `done[0]` is this launch's ticket count, zero before it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+unsafe fn publish_route(
+    m: usize,
+    last: *mut u32,
+    p: *mut f32,
+    slot_p: *mut f32,
+    logits: &mut DisjointSlice<f32>,
+    probs: &mut DisjointSlice<f32>,
+    ids: &mut DisjointSlice<u32>,
+    weights: &mut DisjointSlice<f32>,
+    done: &mut DisjointSlice<u32>,
+) {
+    threadfence();
+    thread::sync_threads();
+
+    let tid = thread::threadIdx_x() as usize;
+    let wi = tid / 32;
+    let lane = warp::lane_id() as usize;
+    let ticket = done.as_mut_ptr();
+    if tid == 0 {
+        // SAFETY: `ticket` is done[0] (this fn's contract); every access to
+        // it is atomic.
+        let count = unsafe { DeviceAtomicU32::from_ptr(ticket) };
+        let is_last = count.fetch_add(1, AtomicOrdering::AcqRel) + 1 == thread::gridDim_x();
+        if is_last {
+            // Every block has drawn its ticket.
+            count.store(0, AtomicOrdering::Relaxed);
+        }
+        // SAFETY: block-shared, one element, written before the barrier
+        // that publishes it.
+        unsafe { *last = u32::from(is_last) };
+    }
+    thread::sync_threads();
+    // SAFETY: block-shared, one element, written by thread 0 before the
+    // barrier above.
+    if unsafe { *last } == 0 || wi >= m {
+        return;
+    }
+
+    // The last block, warp `wi` routing token `wi`: every block's rows are
+    // published.
+    let base = wi * N_EXPERT;
+    let lp = logits.as_mut_ptr();
+    // SAFETY: base + lane + 96 < m·128 <= logits.len() (this fn's contract).
+    let v = unsafe {
+        (
+            core::ptr::read_volatile(lp.add(base + lane)),
+            core::ptr::read_volatile(lp.add(base + lane + 32)),
+            core::ptr::read_volatile(lp.add(base + lane + 64)),
+            core::ptr::read_volatile(lp.add(base + lane + 96)),
+        )
+    };
+    // SAFETY: wi < m <= MAX_TOKENS, so token wi's N_EXPERT and N_USED
+    // entries are inside `p` and `slot_p` and no other warp's; the whole warp
+    // is here (`wi` is warp-uniform), converged past the barrier; its slots
+    // are inside probs, ids and weights (this fn's contract).
+    unsafe {
+        route_warp(
+            v,
+            p.add(base),
+            slot_p.add(wi * N_USED),
+            wi,
+            probs,
+            ids,
+            weights,
+        );
     }
 }
 
@@ -371,57 +478,227 @@ mod qwen3moe_router_kernels {
                 unsafe { store_cols(&mut logits, row, N_EXPERT, m, &sums) };
             }
         }
-        threadfence();
-        thread::sync_threads();
+        // SAFETY: LAST, P and SLOT_P are this block's own shared
+        // allocations of 1, P_LEN and SLOT_LEN entries (the raw form reaches
+        // each `static mut` without a reference), untouched until here; every
+        // thread arrives converged with the launch's arguments; 1 <= m <= 8
+        // and the output lengths are the launch contract's; `done[0]` is zero
+        // before the launch.
+        unsafe {
+            publish_route(
+                m,
+                SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                SharedArray::as_raw_mut_ptr(&raw mut P),
+                SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
+                &mut logits,
+                &mut probs,
+                &mut ids,
+                &mut weights,
+                &mut done,
+            );
+        }
+    }
 
-        // SAFETY: block-shared, one element; the raw form reaches the
-        // `static mut` without a reference.
-        let last = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LAST) };
-        let ticket = done.as_mut_ptr();
-        if tid == 0 {
-            // SAFETY: `ticket` is done[0], inside `done` by the launch
-            // contract; every access to it is atomic.
-            let count = unsafe { DeviceAtomicU32::from_ptr(ticket) };
-            let is_last = count.fetch_add(1, AtomicOrdering::AcqRel) + 1 == thread::gridDim_x();
-            if is_last {
-                // Every block has drawn its ticket.
-                count.store(0, AtomicOrdering::Relaxed);
-            }
-            // SAFETY: block-shared, one element, written before the barrier
-            // that publishes it.
-            unsafe { *last = u32::from(is_last) };
+    /// The FFN norm and the router of one token in one launch: `x` the
+    /// token's FFN input residual (`k` values), `gain` the norm's gain, `w`
+    /// the router weight ([`N_EXPERT`] rows of `k` f32). Writes the q8_1 of
+    /// the normed row into `q3 … d8` (the experts' input, one column) and the
+    /// router's outputs as `qwen3moe_router_fused` at one token.
+    ///
+    /// Every block (256 threads) first runs `fused::norm_quant` on the row
+    /// with the same cores in the same order: phase A is its sum of squares
+    /// on the block's 256 threads (`rms_partial_sq`, the warp butterfly,
+    /// `rms_warp_tree`, `rms_scale`), phase B its per-128-value geometry,
+    /// warp `w` taking groups `w, w + 8, …`, each lane the normalized
+    /// `(scale · gain) · x` of four consecutive values — kept in shared
+    /// memory, and in block `g` for group `g` also quantized with
+    /// `q8_1_quant_vals` (`norm_quant`'s tail, factored) and checked as
+    /// `norm_quant` checks it: a non-finite normalized value or a scale that
+    /// is not positive raises [`FaultSite::NormQuant`] on `fault`. So the
+    /// q8_1 bytes are `norm_quant`'s, each group written by one block, and
+    /// every block holds the normed row `norm_quant` stores in `y`. Then warp
+    /// 0 of block `r` computes row `r`'s logit from that shared row with the
+    /// fused entry's one-token body, and the ticket and the routing follow
+    /// ([`publish_route`]). `k` a multiple of 128 and at most [`NORM_K`]
+    /// (host-checked).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            k <= 2048,
+            w.len() >= 128 * k,
+            x.len() >= k,
+            gain.len() >= k,
+            q3.len() >= 64 * half_it,
+            q4.len() >= 256 * quad_it,
+            q6.len() >= 128 * half_it,
+            s8.len() >= 8 * n_sb,
+            d8.len() >= 2 * n_sb,
+            logits.len() >= 128,
+            probs.len() >= 128,
+            ids.len() >= 8,
+            weights.len() >= 8,
+            done.len() >= 1
+        )
+    )]
+    pub fn qwen3moe_router_norm(
+        w: &[f32],
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        k: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        mut logits: DisjointSlice<f32>,
+        mut probs: DisjointSlice<f32>,
+        mut ids: DisjointSlice<u32>,
+        mut weights: DisjointSlice<f32>,
+        mut done: DisjointSlice<u32>,
+        fault: FaultSink,
+    ) {
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+        static mut NORMED: SharedArray<f32, NORM_K> = SharedArray::UNINIT;
+        static mut P: SharedArray<f32, P_LEN> = SharedArray::UNINIT;
+        static mut SLOT_P: SharedArray<f32, SLOT_LEN> = SharedArray::UNINIT;
+        static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let wi = tid / 32;
+        let row = thread::blockIdx_x() as usize;
+        let k = k as usize;
+        let n_sb = n_sb as usize;
+
+        // Phase A: `norm_quant`'s sum of squares on this block's threads.
+        // SAFETY: WSUM is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every access is below RMS_WARPS and ordered by `sync_threads`.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        // tid < RMS_THREADS: the block is RMS_THREADS wide (the const
+        // assert beside FUSED_THREADS); x.len() >= k by the launch contract.
+        let part = warp::reduce_sum_f32(rms_partial_sq(x, 0, k, tid));
+        if lane == 0 {
+            // SAFETY: wi < RMS_WARPS; one lane per warp writes its slot.
+            unsafe { *ws.add(wi) = part };
         }
         thread::sync_threads();
-        // SAFETY: block-shared, one element, written by thread 0 before the
-        // barrier above.
-        if unsafe { *last } == 0 || wi >= m {
-            return;
-        }
-
-        // The last block, warp `wi` routing token `wi`: every block's rows
-        // are published.
-        let base = wi * N_EXPERT;
-        let lp = logits.as_mut_ptr();
-        // SAFETY: base + lane + 96 < m·128 <= logits.len() (launch contract).
-        let v = unsafe {
-            (
-                core::ptr::read_volatile(lp.add(base + lane)),
-                core::ptr::read_volatile(lp.add(base + lane + 32)),
-                core::ptr::read_volatile(lp.add(base + lane + 64)),
-                core::ptr::read_volatile(lp.add(base + lane + 96)),
-            )
+        // SAFETY: every slot was written above and is visible past the
+        // barrier.
+        let sums = unsafe {
+            [
+                *ws.add(0),
+                *ws.add(1),
+                *ws.add(2),
+                *ws.add(3),
+                *ws.add(4),
+                *ws.add(5),
+                *ws.add(6),
+                *ws.add(7),
+            ]
         };
-        // SAFETY: block-shared, P_LEN = MAX_TOKENS·N_EXPERT entries and wi <
-        // m <= MAX_TOKENS: the token's N_EXPERT entries; the raw form reaches
-        // the `static mut` without a reference.
-        let p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut P).add(base) };
-        // SAFETY: block-shared, SLOT_LEN = MAX_TOKENS·N_USED entries: the
-        // token's N_USED entries, as above.
-        let slot_p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SLOT_P).add(wi * N_USED) };
-        // SAFETY: the whole warp is here (`wi` is warp-uniform), converged
-        // past the barrier; `p` and `slot_p` are token wi's alone; its slots
-        // are inside probs, ids and weights by the launch contract (wi < m).
-        unsafe { route_warp(v, p, slot_p, wi, &mut probs, &mut ids, &mut weights) };
+        let scale = rms_scale(rms_warp_tree(sums), k as u32, eps);
+
+        // Phase B: `norm_quant`'s per-group values into the shared row, and
+        // group `row`'s q8_1 in this block. The group index is warp-uniform,
+        // so the quantizer's collectives see a full warp.
+        // SAFETY: NORMED is this block's own shared allocation of NORM_K
+        // entries, the raw form as above; each entry below k <= NORM_K is
+        // written by exactly one lane before the barrier that publishes it.
+        let nr = unsafe { SharedArray::as_raw_mut_ptr(&raw mut NORMED) };
+        let mut b = wi;
+        while b < k / 128 {
+            let vb = 128 * b + 4 * lane;
+            // SAFETY: vb + 3 < k <= x.len(), gain.len() by the launch
+            // contract.
+            let (v0, v1, v2, v3, gn0, gn1, gn2, gn3) = unsafe {
+                (
+                    *x.get_unchecked(vb),
+                    *x.get_unchecked(vb + 1),
+                    *x.get_unchecked(vb + 2),
+                    *x.get_unchecked(vb + 3),
+                    *gain.get_unchecked(vb),
+                    *gain.get_unchecked(vb + 1),
+                    *gain.get_unchecked(vb + 2),
+                    *gain.get_unchecked(vb + 3),
+                )
+            };
+            // `norm_quant`'s (and `elem::rms_norm`'s) store expression.
+            let nv = [
+                (scale * gn0) * v0,
+                (scale * gn1) * v1,
+                (scale * gn2) * v2,
+                (scale * gn3) * v3,
+            ];
+            // SAFETY: vb + 3 < k <= NORM_K; this lane owns the four entries.
+            unsafe {
+                *nr.add(vb) = nv[0];
+                *nr.add(vb + 1) = nv[1];
+                *nr.add(vb + 2) = nv[2];
+                *nr.add(vb + 3) = nv[3];
+            }
+            if b == row {
+                if !(quad_finite(nv) & (scale > 0.0)) {
+                    fault.raise(FaultSite::NormQuant);
+                }
+                // SAFETY: one column (col 0 < 1), b < k/128 = 2·n_sb (the
+                // host passes n_sb = k/256), the output bounds are the launch
+                // contract's, the whole warp is here with the same `b`, and
+                // `nv` holds values 128·b + 4·lane .. +3 of the column.
+                unsafe {
+                    q8_1_quant_vals(
+                        nv, 0, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
+                        &mut d8,
+                    );
+                }
+            }
+            b += FUSED_WARPS;
+        }
+        thread::sync_threads();
+
+        if wi == 0 && row < N_EXPERT {
+            // SAFETY: the shared row's k entries were written before the
+            // barrier above and nothing writes them from here on.
+            let xs = unsafe { core::slice::from_raw_parts(nr.cast_const(), k) };
+            // SAFETY: row < N_EXPERT, so w.len() >= 128·k >= (row + 1)·k,
+            // and xs holds k values; the launcher passes k a positive
+            // multiple of 128; lane < 32.
+            let f0 = unsafe { f32_lane_partial_1col_w32(w, xs, k as u32, row, lane) };
+            let sums = gemv_lane_sums([f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1);
+            if lane == 0 {
+                // SAFETY: row < N_EXPERT <= logits.len() (launch contract);
+                // lane 0 of the row's warp is the slot's only writer.
+                unsafe { store_cols(&mut logits, row, N_EXPERT, 1, &sums) };
+            }
+        }
+        // SAFETY: as in `qwen3moe_router_fused`, at one token: LAST, P and
+        // SLOT_P are this block's own and untouched until here, every thread
+        // arrives converged, the output lengths are the launch contract's and
+        // `done[0]` is zero before the launch.
+        unsafe {
+            publish_route(
+                1,
+                SharedArray::as_raw_mut_ptr(&raw mut LAST),
+                SharedArray::as_raw_mut_ptr(&raw mut P),
+                SharedArray::as_raw_mut_ptr(&raw mut SLOT_P),
+                &mut logits,
+                &mut probs,
+                &mut ids,
+                &mut weights,
+                &mut done,
+            );
+        }
     }
 }
 
@@ -581,6 +858,84 @@ impl RouterKernels {
             &mut out.ids,
             &mut out.weights,
             &mut out.done,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the FFN norm and the router of one token in one launch
+    /// (`qwen3moe_router_norm`): `x` the token's FFN input residual, `gain`
+    /// the norm's gain (`w.cols()` values each), `eps` its epsilon; the q8_1
+    /// of the normed row into `act` (one column of `w.cols()`) — the bytes
+    /// `fused::norm_quant` writes — and the routing into `out`'s first token,
+    /// as [`RouterKernels::enqueue_fused`] at one token. `fault` takes the
+    /// norm's raise. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher over the norm's and the router's buffers, the shape of the kernel's arguments"
+    )]
+    pub fn enqueue_norm_fused(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        gain: &DeviceBuffer<f32>,
+        eps: f32,
+        act: &mut Q8Act,
+        fault: FaultSink,
+        out: &mut RouterOut,
+    ) -> Result<(), GpuError> {
+        let what = "qwen3moe::router::enqueue_norm_fused";
+        let k = w.cols();
+        if w.rows() != N_EXPERT || k == 0 || !k.is_multiple_of(128) || k > NORM_K {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "router weight is {} x {k}, want {N_EXPERT} rows of a positive multiple of 128 up to {NORM_K}",
+                    w.rows()
+                ),
+            ));
+        }
+        if act.m() != 1 || act.k() != k || x.len() < k || gain.len() < k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "one column of {k}: act {} x {}, x.len() {}, gain.len() {}",
+                    act.m(),
+                    act.k(),
+                    x.len(),
+                    gain.len()
+                ),
+            ));
+        }
+        let n_sb = act.n_sb();
+        let k = launch_u32(what, "k", k)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let grid = launch_u32(what, "grid", N_EXPERT)?;
+        let prep = self
+            .module
+            .prepare_qwen3moe_router_norm(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+        self.module.qwen3moe_router_norm(
+            stream,
+            &prep,
+            w.buf(),
+            x,
+            gain,
+            eps,
+            k,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
+            &mut act.q3,
+            &mut act.q4,
+            &mut act.q6,
+            &mut act.s8,
+            &mut act.d8,
+            &mut out.logits,
+            &mut out.probs,
+            &mut out.ids,
+            &mut out.weights,
+            &mut out.done,
+            fault,
         )?;
         Ok(())
     }

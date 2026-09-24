@@ -5,6 +5,7 @@
 
 use super::dispatch;
 use super::experts::ExpertKernels;
+use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
 use super::prefill::Prefill;
 use super::proj::ProjKernels;
 use super::router::{N_EXPERT, N_USED, RouterKernels};
@@ -63,6 +64,8 @@ pub(super) struct Kernels {
     pub(super) router: RouterKernels,
     pub(super) experts: ExpertKernels,
     pub(super) q6_sel: Q6kSelKernels,
+    /// The head's Q6_K projection with the argmax folded in.
+    pub(super) head: HeadArgmaxKernels,
 }
 
 /// qwen3moe's per-replay host values: the token the chain embeds and the
@@ -83,6 +86,9 @@ pub struct Body {
     /// The prompt prefill's arena, made at the first prefill.
     pub(super) prefill: Option<Prefill>,
     pub(super) k: Kernels,
+    /// The fused head argmax's key and ticket, back at their seeds after
+    /// every launch.
+    pub(super) head_state: HeadArgmaxState,
     pub(super) rope: RopeTable,
     /// The host rope row `refresh` fills, reused every step.
     cs_host: Vec<f32>,
@@ -336,6 +342,7 @@ impl ChainBody for Body {
             router: RouterKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
             q6_sel: Q6kSelKernels::load(ctx)?,
+            head: HeadArgmaxKernels::load(ctx)?,
         };
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
@@ -346,6 +353,7 @@ impl ChainBody for Body {
             names,
             kv,
             k,
+            head_state: HeadArgmaxState::new(stream)?,
             rope,
             cs_host: Vec::with_capacity(HEAD),
             mma: gqa_mma(),
@@ -428,6 +436,7 @@ impl ChainBody for Body {
         self.kv.iter().map(KvPlanes::bytes).sum::<usize>()
             + self.s.bytes()
             + self.sp.buf.num_bytes()
+            + self.head_state.bytes()
             + self.prefill.as_ref().map_or(0, Prefill::bytes)
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
     }

@@ -5,6 +5,7 @@
 //! load, the prefill's at the first prefill; nothing here is allocated per
 //! step.
 
+use super::experts::GroupTickets;
 use super::router::{N_USED, RouterOut};
 use crate::GpuError;
 use crate::flash_gqa::{HEAD, partials_ms_len, partials_v_len};
@@ -83,8 +84,9 @@ pub(super) struct Arena {
     pub(super) act_attn: Vec<Q8Act>,
     /// The FFN's input residual: `x` plus the attention output.
     pub(super) ffn_inp: DeviceBuffer<f32>,
-    /// q8_1 of the FFN-normed rows: the router reads their f32 twin
-    /// `normed`, the experts' gate·up this.
+    /// q8_1 of the FFN-normed rows, the experts' gate·up input. At more
+    /// than one row the router reads their f32 twin `normed`; at one row the
+    /// router's launch writes these and keeps the normed row to itself.
     pub(super) act_ffn: Vec<Q8Act>,
     pub(super) route: RouterOut,
     /// Token `t`'s eight ids, `route.ids[t · N_USED ..]`: its down's selector.
@@ -93,6 +95,9 @@ pub(super) struct Arena {
     pub(super) h: DeviceBuffer<f32>,
     /// q8_1 of one token's `h`, one column per slot.
     pub(super) act_h: Q8Act,
+    /// The one-token gate·up's ticket counts, one per 128-value group of a
+    /// token's `h`.
+    pub(super) gate_up_tickets: GroupTickets,
     /// The down outputs, per token slot-major `N_USED · hidden`.
     pub(super) down: DeviceBuffer<f32>,
     /// Token `t`'s down rows.
@@ -253,6 +258,7 @@ impl Arena {
             ids,
             h: f(rows * N_USED * d.ff)?,
             act_h: Q8Act::with_k(stream, N_USED, d.ff)?,
+            gate_up_tickets: GroupTickets::new(stream, (N_USED * d.ff).div_ceil(128))?,
             down,
             down_rows,
             dims: d,
@@ -289,6 +295,7 @@ impl Arena {
         bufs.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.v_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.route.bytes()
+            + self.gate_up_tickets.bytes()
             + acts.map(act_bytes).sum::<usize>()
     }
 }

@@ -41,6 +41,16 @@
 //! `t`, attending over its own live count, spread from one key to all of
 //! them — bit for bit the [`ROWS`] one-row launches of those rows and
 //! counts.
+//!
+//! And the attention output projection of one token with the q8_1 of its
+//! input folded in (`proj::qwen3moe_o_resid_quant_q4k`, the chain's at
+//! m = 1) against the two launches it replaces — `enqueue_quantize_q8_1` on
+//! the flash output, then `qwen3moe_o_resid_q4k` — on layers 0, 23 and 47:
+//! every token of the prefill set's `fa-L (reshaped)` as the input, its
+//! `l_out-L` row as the residual, `attn_output.L` the weight; the outputs
+//! BIT-EQUAL. A NaN in the input raises the fault word on both paths, the
+//! same word. As a captured graph: one node, two replays bit-identical to
+//! the eager launch.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -57,21 +67,24 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::Gpu;
+    use bloomery_gpu::arch::qwen3moe::proj::{OResidArgs, OResidQuantArgs, ProjKernels};
     use bloomery_gpu::flash_gqa::{
         FlashGqaKernels, GROUP, GqaArgs, HEAD, KEY_TILE, SEG_KEYS, partials_ms_len, partials_v_len,
         segments_for,
     };
-    use bloomery_gpu_gates::qwen3moe::{f16_logical_bits, step_sets};
+    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu_gates::qwen3moe::{f16_logical_bits, sets, step_sets};
     use bloomery_gpu_gates::rounding::{U, gamma};
     use bloomery_gpu_gates::{
-        GateError, bits_equal, checks_failed, mask_bits_in, open_split, ref_tensor_logical_in,
-        verdict,
+        GateError, bits_equal, bytes_to_words, checks_failed, mask_bits_in, open_model, open_split,
+        ref_tensor_logical_in, tensor_bytes_as, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
+    use gguf::quant::GgmlType;
     use gguf::quant::half_to_f32;
     use model::arch::Arch;
     use model::arch::qwen3moe::hparams::Hparams;
+    use model::arch::qwen3moe::names;
 
     /// An f16 NaN the padded rows are overwritten with.
     const NAN16: u16 = 0x7e00;
@@ -485,10 +498,161 @@ mod gate {
             );
             ok &= set_ok;
         }
+        ok &= o_resid_quant(&gpu)?;
         println!("gate_qwen3moe_flash: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
         }
         Ok(())
+    }
+
+    // ------------------------------------ the output projection's q8_1 fold
+
+    /// The two launches the fused output projection replaces, on one token.
+    fn o_resid_split(
+        gpu: &Gpu,
+        pk: &ProjKernels,
+        w: &DeviceTensor<u32>,
+        attn: &DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+    ) -> Result<Vec<f32>, GateError> {
+        let stream = gpu.stream();
+        let mut act = Q8Act::with_k(stream, 1, attn.len())?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, w.rows())?;
+        gpu.enqueue_quantize_q8_1(attn, &mut act)?;
+        pk.enqueue_o_resid(
+            stream,
+            OResidArgs {
+                w,
+                act: &act,
+                x,
+                y: &mut y,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    }
+
+    /// The fused output projection on one token.
+    fn o_resid_fused(
+        gpu: &Gpu,
+        pk: &ProjKernels,
+        w: &DeviceTensor<u32>,
+        attn: &DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+    ) -> Result<Vec<f32>, GateError> {
+        let stream = gpu.stream();
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, w.rows())?;
+        pk.enqueue_o_resid_quant(
+            stream,
+            OResidQuantArgs {
+                w,
+                attn,
+                x,
+                y: &mut y,
+            },
+            gpu.unlabelled_sink(),
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    }
+
+    fn o_resid_quant(gpu: &Gpu) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let gguf = open_model()?;
+        let pk = ProjKernels::load(gpu.context())?;
+        let all = sets()?;
+        let man = &all.first().ok_or("no oracle set")?.1;
+        let mut ok = true;
+        let mut last = None;
+        for l in [0usize, 23, 47] {
+            let (info, b) = tensor_bytes_as(&gguf, &names::attn_output(l), GgmlType::Q4_K, None)?;
+            let (k, rows) = (info.dims[0] as usize, info.dims[1] as usize);
+            let w = DeviceTensor::upload(stream, &bytes_to_words(b), rows, b.len() / 4 / rows)?;
+            let fa =
+                ref_tensor_logical_in(&man.dir, man.tensor(&format!("fa-{l} (reshaped)"), 0)?)?;
+            let xs = ref_tensor_logical_in(&man.dir, man.tensor(&format!("l_out-{l}"), 0)?)?;
+            if fa.len() % k != 0 || xs.len() % rows != 0 {
+                return Err(format!(
+                    "layer {l}: fa {} values for rows of {k}, l_out {} for rows of {rows}",
+                    fa.len(),
+                    xs.len()
+                )
+                .into());
+            }
+            let m = (fa.len() / k).min(xs.len() / rows);
+            let mut same = 0usize;
+            for t in 0..m {
+                let attn = DeviceBuffer::from_host(stream, &fa[t * k..(t + 1) * k])?;
+                let x = DeviceBuffer::from_host(stream, &xs[t * rows..(t + 1) * rows])?;
+                let eq = bits_equal(
+                    &o_resid_fused(gpu, &pk, &w, &attn, &x)?,
+                    &o_resid_split(gpu, &pk, &w, &attn, &x)?,
+                );
+                same += usize::from(eq);
+                if !eq {
+                    println!("o_resid_quant layer={l} t={t}: not bit-identical FAIL");
+                }
+            }
+            let pass = m > 0 && same == m;
+            println!(
+                "o_resid_quant layer={l} K={k} rows={rows} vs quantize_q8_1+o_resid: {same}/{m} tokens \
+                 bit-identical {}",
+                verdict(pass)
+            );
+            ok &= pass;
+            last = Some((w, fa[..k].to_vec(), xs[..rows].to_vec()));
+        }
+        let (w, fa0, x0) = last.ok_or("no layer ran")?;
+        let x = DeviceBuffer::from_host(stream, &x0)?;
+
+        // A NaN in the input: both paths raise, the same word.
+        let mut fan = fa0.clone();
+        fan[1000] = f32::NAN;
+        let attn_n = DeviceBuffer::from_host(stream, &fan)?;
+        gpu.clear_fault()?;
+        o_resid_split(gpu, &pk, &w, &attn_n, &x)?;
+        let f_split = gpu.fault()?;
+        gpu.clear_fault()?;
+        o_resid_fused(gpu, &pk, &w, &attn_n, &x)?;
+        let f_fused = gpu.fault()?;
+        gpu.clear_fault()?;
+        let pass = f_split.is_some() && f_split == f_fused;
+        println!(
+            "o_resid_quant nan-input: split fault={f_split:?} fused fault={f_fused:?} (want raised, equal) {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        // The graph: one node, two replays equal to the eager launch.
+        let attn = DeviceBuffer::from_host(stream, &fa0)?;
+        let eager = o_resid_fused(gpu, &pk, &w, &attn, &x)?;
+        let mut yg = DeviceBuffer::<f32>::zeroed(stream, w.rows())?;
+        let graph = gpu.capture(|s| {
+            pk.enqueue_o_resid_quant(
+                s,
+                OResidQuantArgs {
+                    w: &w,
+                    attn: &attn,
+                    x: &x,
+                    y: &mut yg,
+                },
+                gpu.unlabelled_sink(),
+            )
+        })?;
+        let mut replays_ok = true;
+        for _ in 0..2 {
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            replays_ok &= bits_equal(&yg.to_host_vec(stream)?, &eager);
+        }
+        let nodes = graph.node_count();
+        drop(graph);
+        let pass = replays_ok && nodes == 1;
+        println!(
+            "graph op=qwen3moe_o_resid_quant_q4k two_replays_bit_identical={replays_ok} graph_nodes={nodes} {}",
+            verdict(pass)
+        );
+        Ok(ok && pass)
     }
 }
