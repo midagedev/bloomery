@@ -16,7 +16,13 @@
 //!   b4engram's chain check derives against `engram_out-L` ([`bands`] with
 //!   the projection's bound, both copied from `gate_deepseek41_engram`); the
 //!   fold sits within that band carried through the fold against
-//!   `hc_attn_pre-L`.
+//!   `hc_attn_pre-L`. The file's type of `engram_wkv` picks the projection's
+//!   rules (`bloomery_gpu_gates::act_rule`): under Q3_K our kv also sits
+//!   within `KERNEL_BAND` of the exact dot of our q8_1 values
+//!   (`kv_vs_ours_rel`), ik's q8_K dot equals `engram_kv-L` bit for bit
+//!   (`wkv_q3k_dot`), and the projection's bound is
+//!   `act_rule::q3k_shared_input_bound`; any other type than Q8_0 or Q3_K is
+//!   refused at load with the tensor named.
 //! - (iii) The head end, `l_out-(last)` and the last ffn's HC_PRE result
 //!   injected: `hc_out` bit for bit (our fold is ik's rule on the same
 //!   inputs); each logit's gap from `result_output` against its prediction
@@ -29,8 +35,9 @@
 //! - Structure: every glue launch of one step captured as one graph. Per set,
 //!   the set's inputs are written into the captured buffers, the outputs
 //!   cleared, and the graph replayed: bit-identical to that set's eager run.
-//!   The node count equals the prediction, `1 + 3·sites + 2·sites + 5`, all
-//!   kernels.
+//!   The node count equals the prediction, `1 + Σ kv + 2·sites + 5`, all
+//!   kernels, `kv` a site's token-only launches: 3, one more (the rows' q8_1
+//!   form) under a K-quant `engram_wkv`.
 //!
 //! Distances a pin does not own (the projection's, the gates', the norm's)
 //! print as diagnostics.
@@ -59,20 +66,23 @@ mod gate {
     use bloomery_gpu_deepseek41::engram_gate::{CLAMP_MIN, PER_THREAD, ROW, inv_sqrt_row};
     use bloomery_gpu_deepseek41::hc::{HC_MIX, HC_STREAMS};
     use bloomery_gpu_deepseek41::params::{ImageDims, ImageLayout, StepImage, rope_specs};
+    use bloomery_gpu_gates::act_rule::{self, Q3kWeight};
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::oracle;
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed, max_rel_err,
-        ref_ints, ref_model_path, ref_tensor_logical_in, ref_tensor_of_in, verdict,
+        GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, bits_equal, checks_failed,
+        max_rel_err, ref_ints, ref_model_path, ref_tensor_logical_in, ref_tensor_of_in, verdict,
     };
-    use cuda_core::{DeviceBuffer, sys};
+    use cuda_core::{CudaStream, DeviceBuffer, sys};
     use gguf::Split;
     use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
+    use model::arch::deepseek41::roles;
+    use model::placement;
 
     /// The sets this gate reads: the decode steps without a selection.
     const SETS: [&str; 2] = [STEP4, D1N];
@@ -127,7 +137,7 @@ mod gate {
         for &l in sites {
             keep.extend([names::engram_wkv(l), names::engram_k(l), names::engram_q(l)]);
         }
-        let w = Weights::load_where(stream, &split, |name| keep.contains(name))?;
+        let w = load_kept(stream, &split, &hp, &keep)?;
         let resident = w.names().count();
         if resident != keep.len() {
             return Err(
@@ -241,9 +251,11 @@ mod gate {
             .filter(|k| k.kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL)
             .count();
         // The prediction: the embedding broadcast; per site the rows, `engram_wkv`
-        // and the key norm, then the gate and the fold; the hc_out fold and the
-        // head's norm, q8_1, Q6_K gemv and argmax.
-        let want = 1 + 3 * sites.len() + 2 * sites.len() + 5;
+        // (after the rows' q8_1 form under a K-quant) and the key norm, then the
+        // gate and the fold; the hc_out fold and the head's norm, q8_1, Q6_K gemv
+        // and argmax.
+        let kv: usize = site_w.iter().map(|w| 2 + w.wkv.launches()).sum();
+        let want = 1 + kv + 2 * sites.len() + 5;
         for (set, (inputs, eager)) in sets.iter().zip(&runs) {
             inputs.write(&gpu, &mut bufs)?;
             bufs.clear(&gpu, &mut head)?;
@@ -274,6 +286,27 @@ mod gate {
         } else {
             Err(checks_failed())
         }
+    }
+
+    /// The tensors `keep` names, each whole on card 0 in the format the
+    /// engine's placed load gives its role (`CardFormat::of_role`: an engram
+    /// gain in a K-quant is decoded to f32 at load, the form the piece reads
+    /// its gains in). `Weights::load_where` takes the type's format alone.
+    fn load_kept(
+        stream: &CudaStream,
+        split: &Split,
+        hp: &Hparams,
+        keep: &BTreeSet<String>,
+    ) -> Result<Weights, GateError> {
+        let model = roles::classify(split, hp)?;
+        let rows = model
+            .tensors
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| keep.contains(&t.name))
+            .map(|(i, t)| placement::whole_on_card(i, t, 0))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Weights::load_rows(stream, split, &model, &rows, 0)?)
     }
 
     /// One decode-step set with its host plan.
@@ -650,12 +683,32 @@ mod gate {
         })
     }
 
-    /// One engram site's file weights on the host: the projection's bytes
-    /// and the key gains widened to f32.
+    /// One engram site's file weights on the host: the projection in the
+    /// file's type and the key gains widened to f32.
     struct SiteW {
         l: usize,
-        wkv: Vec<u8>,
+        wkv: Wkv,
         gk: Vec<f32>,
+    }
+
+    /// `engram_wkv` on the host, by the file's type: each side's rule
+    /// follows from it.
+    enum Wkv {
+        /// The file's bytes, for [`project`].
+        Q8(Vec<u8>),
+        /// The host form of `act_rule`'s Q3_K walks.
+        Q3(Q3kWeight),
+    }
+
+    impl Wkv {
+        /// The projection's launches at m = 1: the gemv, after the rows'
+        /// q8_1 form under a K-quant.
+        fn launches(&self) -> usize {
+            match self {
+                Wkv::Q8(_) => 1,
+                Wkv::Q3(_) => 2,
+            }
+        }
     }
 
     /// A file tensor's bytes and type.
@@ -669,21 +722,35 @@ mod gate {
 
     impl SiteW {
         fn load(split: &Split, l: usize) -> Result<SiteW, GateError> {
-            let (wkv, ty) = file_bytes(split, &names::engram_wkv(l))?;
-            if ty != GgmlType::Q8_0 {
-                return Err(format!("blk.{l}.engram_wkv.weight is {ty}, want q8_0").into());
-            }
+            let name = names::engram_wkv(l);
+            let (bytes, ty) = file_bytes(split, &name)?;
+            let wkv = match ty {
+                GgmlType::Q8_0 => Wkv::Q8(bytes.to_vec()),
+                GgmlType::Q3_K => {
+                    let (_, info) = split
+                        .find(&name)
+                        .ok_or_else(|| format!("{name} is not in the file"))?;
+                    let &[k, rows] = info.dims.as_slice() else {
+                        return Err(
+                            format!("{name} has dims {:?}, want [K, rows]", info.dims).into()
+                        );
+                    };
+                    let host = Q3kWeight::new(bytes, usize::try_from(k)?, usize::try_from(rows)?)
+                        .map_err(|e| format!("{name}: {e}"))?;
+                    Wkv::Q3(host)
+                }
+                _ => return Err(format!("{name} is {ty}, want q8_0 or q3_K").into()),
+            };
+            // Widened to f32 as the card's load widens it: bf16 exactly, a
+            // K-quant by `dequant_row`, the values ik's GET_ROWS of the gain
+            // reads.
             let (gk_bytes, ty) = file_bytes(split, &names::engram_k(l))?;
-            if ty != GgmlType::BF16 {
-                return Err(format!("blk.{l}.engram_k.weight is {ty}, want bf16").into());
+            if !matches!(ty, GgmlType::BF16 | GgmlType::Q3_K) {
+                return Err(format!("blk.{l}.engram_k.weight is {ty}, want bf16 or q3_K").into());
             }
             let mut gk = vec![0.0f32; HC_STREAMS * ROW];
-            dequant_row(GgmlType::BF16, gk_bytes, &mut gk)?;
-            Ok(SiteW {
-                l,
-                wkv: wkv.to_vec(),
-                gk,
-            })
+            dequant_row(ty, gk_bytes, &mut gk)?;
+            Ok(SiteW { l, wkv, gk })
         }
     }
 
@@ -700,21 +767,49 @@ mod gate {
         let rows_bit = bits_equal(&o.rows, &d.embd);
 
         // The band b4engram's chain check derives: how far our kv sits from
-        // ik's, the two exact values' distance plus both sides' accumulation
-        // bounds and the f64 sums' own error, carried through the gate.
+        // ik's, carried through the gate. Q8_0: the two exact values' distance
+        // plus both sides' accumulation bounds and the f64 sums' own error.
+        // Q3_K: act_rule::q3k_shared_input_bound, whose kernel term the
+        // `kv_vs_ours_rel` pin below proves on this run.
         let k_in = d.embd.len();
-        let p = project(&w.wkv, (hc + 1) * n, &d.embd);
-        let f64_sum = k_in as f64 * U64;
-        let bk: Vec<f64> = (0..(hc + 1) * n)
-            .map(|r| {
-                (p.ours[r] - p.ik[r]).abs()
-                    + (ik_gemv_rel(k_in) + f64_sum) * p.abs_ik[r]
-                    + (our_gemv_rel(k_in) + f64_sum) * p.abs_ours[r]
-            })
-            .collect();
+        let (bk, q3) = match &w.wkv {
+            Wkv::Q8(bytes) => {
+                let p = project(bytes, (hc + 1) * n, &d.embd);
+                let f64_sum = k_in as f64 * U64;
+                let bk: Vec<f64> = (0..(hc + 1) * n)
+                    .map(|r| {
+                        (p.ours[r] - p.ik[r]).abs()
+                            + (ik_gemv_rel(k_in) + f64_sum) * p.abs_ik[r]
+                            + (our_gemv_rel(k_in) + f64_sum) * p.abs_ours[r]
+                    })
+                    .collect();
+                (bk, None)
+            }
+            Wkv::Q3(host) => {
+                let rows = act_rule::q3k_rows(host, &d.embd, host.rows);
+                let ours: Vec<f32> = rows.iter().map(|r| r.ours as f32).collect();
+                let ik = act_rule::ik_q3k_rows(host, &d.embd, host.rows);
+                let kv_ours = rel(&o.kv, &ours);
+                let same = ik
+                    .iter()
+                    .zip(&d.kv)
+                    .filter(|(a, b)| a.to_bits() == b.to_bits())
+                    .count();
+                let ok = kv_ours <= f64::from(KERNEL_BAND) && same == d.kv.len();
+                let field = format!(
+                    " kv_vs_ours_rel={kv_ours:.3e} (band {KERNEL_BAND:.0e}) wkv_q3k_dot={same}/{}",
+                    d.kv.len()
+                );
+                (
+                    act_rule::q3k_shared_input_bound(&rows, k_in),
+                    Some((field, ok)),
+                )
+            }
+        };
         let b = bands(&d, &w.gk, hp.rms_eps, hc, &bk[..hc * n], &bk[hc * n..]);
         let out_rel = rel(&o.out, &d.out);
-        let out_ok = out_rel <= b.out;
+        // A band that is not a number passes nothing.
+        let out_ok = b.out.is_finite() && out_rel <= b.out;
 
         // The fold: both sides fold by the same rule and the same `pre`, so
         // the gap is the streams' gap through `pre` plus each side's four
@@ -736,9 +831,10 @@ mod gate {
         let fold_ok = fold_ratio <= 1.0;
 
         let (kv_rel, gate_rel) = (rel(&o.kv, &d.kv), rel(&o.gate, &d.gate));
-        let pass = rows_bit && out_ok && fold_ok;
+        let (q3_field, q3_ok) = q3.unwrap_or((String::new(), true));
+        let pass = rows_bit && out_ok && fold_ok && q3_ok;
         println!(
-            "engram set={} L={}: rows==engram_embd_bit={rows_bit} out ik_rel={out_rel:.3e} \
+            "engram set={} L={}: rows==engram_embd_bit={rows_bit}{q3_field} out ik_rel={out_rel:.3e} \
              (band {:.3e}) fold max|gap|/bound={fold_ratio:.3e} — diag kv_rel={kv_rel:.3e} \
              gate_rel={gate_rel:.3e} (band {:.3e}) {}",
             set.name,

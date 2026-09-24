@@ -33,6 +33,16 @@
 //!    score. The chain captured as one graph replays bit-identically to the
 //!    eager run.
 //!
+//! The file's types pick the rules (`bloomery_gpu_gates::act_rule`): the
+//! table's rows are Q8_0 or Q3_K, dequantized either way, and so are the
+//! two gains (bf16 or Q3_K, widened to f32 as the card's load widens them); a Q8_0
+//! `engram_wkv` runs the rule above, a Q3_K one ik's q8_K activations and its
+//! AVX2 Q3_K dot — bit for bit against `engram_kv-L` in layer 1 — and in the
+//! chain the rows' q8_1 form and `q3k_gemv` (`dense::DenseKernels`), within
+//! `KERNEL_BAND` of the exact dot of our q8_1 values, a four-node graph, its
+//! kv's distance from ik's from `act_rule::q3k_shared_input_bound`. Any
+//! other type is refused at load with the tensor named.
+//!
 //! Apart from the sites, the host half's two row paths ([`gate::helper_rows`]):
 //! the engram rows the step's helper thread reads and the ones the calling
 //! thread reads itself are the same bytes under the same ids, step by step
@@ -56,11 +66,13 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
     use bloomery_gpu::weights::{DevWeight, upload_file_tensor};
-    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
     use bloomery_gpu_deepseek41::chain::glue::{RowsLevers, StepRows};
+    use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::engram_gate::{
         CLAMP_MIN, EngramGateKernels, GateArgs, KeyNormArgs, PER_THREAD, ROW, inv_sqrt_row,
     };
+    use bloomery_gpu_gates::act_rule::{self, Q3kRow, Q3kWeight};
     use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -212,18 +224,57 @@ mod gate {
         }
     }
 
-    /// One engram layer's weights: the projection resident on the card in
-    /// its kernel's format and as file bytes for the host references, the
-    /// row table's file bytes, and both gains widened to f32 on both sides.
+    /// One engram layer's weights: the projection in the file's type
+    /// ([`Wkv`]), the row table's file bytes and type, and both gains widened
+    /// to f32 on both sides.
     struct LayerW<'a> {
         l: usize,
-        wkv: DevWeight,
-        wkv_bytes: &'a [u8],
+        wkv: Wkv<'a>,
         table: &'a [u8],
+        table_ty: GgmlType,
         gk: Vec<f32>,
         gq: Vec<f32>,
         gk_dev: DeviceBuffer<f32>,
         gq_dev: DeviceBuffer<f32>,
+    }
+
+    /// `engram_wkv` twice, in the file's type: resident as the loader packs
+    /// it (`upload_file_tensor`) and on the host as both rules read it.
+    enum Wkv<'a> {
+        /// The q8f32 planes, and the file's bytes for [`project`].
+        Q8 {
+            qs: DeviceTensor<u32>,
+            d: DeviceTensor<u16>,
+            bytes: &'a [u8],
+        },
+        /// The K-quant words, and the host form of `act_rule`'s Q3_K walks.
+        Q3 {
+            dev: DeviceTensor<u32>,
+            host: Q3kWeight,
+        },
+    }
+
+    impl Wkv<'_> {
+        /// Launches of the projection at m = 1: the gemv, after the rows'
+        /// q8_1 form under a K-quant.
+        fn launches(&self) -> usize {
+            match self {
+                Wkv::Q8 { .. } => 1,
+                Wkv::Q3 { .. } => 2,
+            }
+        }
+    }
+
+    /// Bytes of one table row of `key_len` values in `ty`: Q8_0 or Q3_K,
+    /// the two types the card reads rows of.
+    fn table_row_bytes(ty: GgmlType, key_len: usize) -> Option<usize> {
+        match ty {
+            GgmlType::Q8_0 if key_len.is_multiple_of(QK) => Some(key_len / QK * 34),
+            GgmlType::Q3_K if key_len.is_multiple_of(act_rule::QK_K) => {
+                Some(key_len / act_rule::QK_K * act_rule::Q3K_BYTES)
+            }
+            _ => None,
+        }
     }
 
     impl<'a> LayerW<'a> {
@@ -234,12 +285,13 @@ mod gate {
             l: usize,
         ) -> Result<LayerW<'a>, GateError> {
             let kv_rows = (meta.hc + 1) * ROW;
-            let (s, wkv_info) = tensor(split, &format!("blk.{l}.engram_wkv.weight"))?;
-            if wkv_info.ty != GgmlType::Q8_0
+            let name = format!("blk.{l}.engram_wkv.weight");
+            let (s, wkv_info) = tensor(split, &name)?;
+            if !matches!(wkv_info.ty, GgmlType::Q8_0 | GgmlType::Q3_K)
                 || wkv_info.dims != [meta.k_in() as u64, kv_rows as u64]
             {
                 return Err(format!(
-                    "blk.{l}.engram_wkv.weight is {} {:?}, want q8_0 [{}, {kv_rows}]",
+                    "{name} is {} {:?}, want q8_0 or q3_K [{}, {kv_rows}]",
                     wkv_info.ty,
                     wkv_info.dims,
                     meta.k_in()
@@ -247,38 +299,55 @@ mod gate {
                 .into());
             }
             let shard = split.shard(s).ok_or("wkv shard missing")?;
-            let wkv = upload_file_tensor(stream, shard, wkv_info)?;
-            let wkv_bytes = shard.data(wkv_info)?;
+            let bytes = shard.data(wkv_info)?;
+            let wkv = match upload_file_tensor(stream, shard, wkv_info)? {
+                DevWeight::Q8_0 { qs, d, .. } if wkv_info.ty == GgmlType::Q8_0 => {
+                    Wkv::Q8 { qs, d, bytes }
+                }
+                DevWeight::KQuant { w, .. } if wkv_info.ty == GgmlType::Q3_K => Wkv::Q3 {
+                    dev: w,
+                    host: Q3kWeight::new(bytes, meta.k_in(), kv_rows)
+                        .map_err(|e| format!("{name}: {e}"))?,
+                },
+                _ => return Err(format!("{name}: the loader packed it in another form").into()),
+            };
             let (ts, t_info) = tensor(split, &format!("blk.{l}.engram_embd.weight"))?;
-            if t_info.ty != GgmlType::Q8_0 || t_info.dims.first() != Some(&(meta.key_len as u64)) {
+            if table_row_bytes(t_info.ty, meta.key_len).is_none()
+                || t_info.dims.first() != Some(&(meta.key_len as u64))
+            {
                 return Err(format!(
-                    "blk.{l}.engram_embd.weight is {} {:?}, want q8_0 [{}, ..]",
+                    "blk.{l}.engram_embd.weight is {} {:?}, want q8_0 or q3_K [{}, ..]",
                     t_info.ty, t_info.dims, meta.key_len
                 )
                 .into());
             }
             let table = split.shard(ts).ok_or("table shard missing")?.data(t_info)?;
+            // Both gains widened to f32 as the card's load widens them (bf16
+            // exactly, a K-quant by `dequant_row`); layer 1 pins them against
+            // ik's GET_ROWS of the gain.
             let gain = |which: &str| -> Result<Vec<f32>, GateError> {
                 let name = format!("blk.{l}.engram_{which}.weight");
                 let (gs, info) = tensor(split, &name)?;
-                if info.ty != GgmlType::BF16 || info.dims != [ROW as u64, meta.hc as u64] {
+                if !matches!(info.ty, GgmlType::BF16 | GgmlType::Q3_K)
+                    || info.dims != [ROW as u64, meta.hc as u64]
+                {
                     return Err(format!(
-                        "{name} is {} {:?}, want bf16 [{ROW}, {}]",
+                        "{name} is {} {:?}, want bf16 or q3_K [{ROW}, {}]",
                         info.ty, info.dims, meta.hc
                     )
                     .into());
                 }
                 let mut g = vec![0.0f32; ROW * meta.hc];
                 let bytes = split.shard(gs).ok_or("gain shard missing")?.data(info)?;
-                dequant_row(GgmlType::BF16, bytes, &mut g)?;
+                dequant_row(info.ty, bytes, &mut g)?;
                 Ok(g)
             };
             let (gk, gq) = (gain("k")?, gain("q")?);
             Ok(LayerW {
                 l,
                 wkv,
-                wkv_bytes,
                 table,
+                table_ty: t_info.ty,
                 gk_dev: DeviceBuffer::from_host(stream, &gk)?,
                 gq_dev: DeviceBuffer::from_host(stream, &gq)?,
                 gk,
@@ -300,6 +369,7 @@ mod gate {
         let meta = Meta::read(&split)?;
         let gpu = Gpu::new()?;
         let eg = EngramGateKernels::load(gpu.context())?;
+        let dense = DenseKernels::load(gpu.context())?;
         let stream = gpu.stream();
         println!(
             "gate_deepseek41_engram: device {} — hc {} eps {:e} layers {:?} rows/token {} x {} values",
@@ -324,6 +394,7 @@ mod gate {
         let cx = Cx {
             gpu: &gpu,
             eg: &eg,
+            dense: &dense,
             meta: &meta,
         };
         let (mut sites, mut failed) = (0u32, 0u32);
@@ -446,6 +517,7 @@ mod gate {
     struct Cx<'a> {
         gpu: &'a Gpu,
         eg: &'a EngramGateKernels,
+        dense: &'a DenseKernels,
         meta: &'a Meta,
     }
 
@@ -673,10 +745,10 @@ mod gate {
     fn site(cx: &Cx, label: &str, man: &RefManifest, w: &LayerW) -> Result<bool, GateError> {
         let d = site_data(man, cx.meta, w.l)?;
         let k_in = cx.meta.k_in();
-        let projs: Vec<Proj> = d
+        let projs: Vec<TokProj> = d
             .embd
             .chunks_exact(k_in)
-            .map(|x| project(w.wkv_bytes, (cx.meta.hc + 1) * ROW, x))
+            .map(|x| TokProj::of(&w.wkv, (cx.meta.hc + 1) * ROW, x))
             .collect();
         let ik = ik_checks(&d, w, cx.meta, &projs)?;
         let op = op_checks(cx, &d, w)?;
@@ -806,8 +878,15 @@ mod gate {
     }
 
     /// Layer 1: ik's rule against the dump, node by node and chained, and the
-    /// projection on ik's q8_2 activations against `engram_kv`.
-    fn ik_checks(d: &SiteData, w: &LayerW, meta: &Meta, projs: &[Proj]) -> Result<bool, GateError> {
+    /// projection by ik's rule for the weight's type against `engram_kv`:
+    /// under Q8_0 its q8_2 activations within ik's f32 accumulation bound,
+    /// under Q3_K its q8_K activations and AVX2 dot bit for bit.
+    fn ik_checks(
+        d: &SiteData,
+        w: &LayerW,
+        meta: &Meta,
+        projs: &[TokProj],
+    ) -> Result<bool, GateError> {
         let (hc, t) = (meta.hc, d.t);
         let mut line = Vec::new();
         let mut all = true;
@@ -817,14 +896,15 @@ mod gate {
             all &= ok;
         };
         // The gather: each id's table row, dequantized.
-        let row_bytes = meta.key_len / QK * 34;
+        let row_bytes = table_row_bytes(w.table_ty, meta.key_len)
+            .ok_or_else(|| format!("blk.{}.engram_embd.weight: no row size", w.l))?;
         let mut gathered = vec![0.0f32; d.ids.len() * meta.key_len];
         for (&id, out) in d.ids.iter().zip(gathered.chunks_exact_mut(meta.key_len)) {
             let b = w
                 .table
                 .get(id * row_bytes..(id + 1) * row_bytes)
                 .ok_or_else(|| format!("row id {id} is past blk.{}.engram_embd.weight", w.l))?;
-            dequant_row(GgmlType::Q8_0, b, out)?;
+            dequant_row(w.table_ty, b, out)?;
         }
         check("gather", &gathered, &d.gather);
         check("embd", &d.embd, &d.gather);
@@ -879,30 +959,61 @@ mod gate {
         line.push(format!("copies={copies}/{}", COPIES.len()));
         all &= copies == COPIES.len();
 
-        // engram_wkv on ik's q8_2 activations, token by token.
-        let mut worst = 0.0f64;
-        for (p, dumped) in projs.iter().zip(d.kv.chunks_exact((hc + 1) * ROW)) {
-            for ((&got, &sim), &mag) in dumped.iter().zip(&p.ik).zip(&p.abs_ik) {
-                let dist = (f64::from(got) - sim).abs();
-                let bound = ik_gemv_rel(meta.k_in()) * mag;
-                let ratio = if dist == 0.0 {
-                    0.0
-                } else if bound > 0.0 {
-                    dist / bound
-                } else {
-                    f64::INFINITY
-                };
-                worst = worst.max(ratio);
-            }
-        }
-        all &= worst <= 1.0;
+        // engram_wkv by ik's rule, token by token.
+        let (wkv, wkv_ok) = ik_wkv(projs, &d.kv, (hc + 1) * ROW, meta.k_in());
+        all &= wkv_ok;
         println!(
-            "ik_sim L={} T={t}: {} wkv_q8_2 max|kv-sim|/bound={worst:.3} {}",
+            "ik_sim L={} T={t}: {} {wkv} {}",
             w.l,
             line.join(" "),
             verdict(all)
         );
         Ok(all)
+    }
+
+    /// Each token's `engram_kv` row (`width` values of `kv`) against ik's
+    /// projection of the token's rows: under Q8_0 within [`ik_gemv_rel`] of
+    /// the q8_2 dot's exact value, under Q3_K equal to [`dot_q3k`]'s value
+    /// bit for bit. The printed field and whether it holds.
+    ///
+    /// [`dot_q3k`]: act_rule::dot_q3k
+    fn ik_wkv(projs: &[TokProj], kv: &[f32], width: usize, k_in: usize) -> (String, bool) {
+        let (mut worst, mut same, mut n, mut q3) = (0.0f64, 0usize, 0usize, false);
+        for (p, dumped) in projs.iter().zip(kv.chunks_exact(width)) {
+            match p {
+                TokProj::Q8(p) => {
+                    for ((&got, &sim), &mag) in dumped.iter().zip(&p.ik).zip(&p.abs_ik) {
+                        let dist = (f64::from(got) - sim).abs();
+                        let bound = ik_gemv_rel(k_in) * mag;
+                        let ratio = if dist == 0.0 {
+                            0.0
+                        } else if bound > 0.0 {
+                            dist / bound
+                        } else {
+                            f64::INFINITY
+                        };
+                        worst = worst.max(ratio);
+                    }
+                }
+                TokProj::Q3 { ik, .. } => {
+                    q3 = true;
+                    n += dumped.len();
+                    same += dumped
+                        .iter()
+                        .zip(ik)
+                        .filter(|(a, b)| a.to_bits() == b.to_bits())
+                        .count();
+                }
+            }
+        }
+        if q3 {
+            (format!("wkv_q3k_dot={same}/{n}"), same == n)
+        } else {
+            (
+                format!("wkv_q8_2 max|kv-sim|/bound={worst:.3}"),
+                worst <= 1.0,
+            )
+        }
     }
 
     // ------------------------------------------------- our rule, transcribed
@@ -1181,10 +1292,11 @@ mod gate {
             max_rel_err(&got[1], &d.gate)?,
             max_rel_err(&got[2], &d.out)?,
         ];
+        // A band that is not a number passes nothing.
         let within = [b.kn, b.gate, b.out]
             .iter()
             .zip(rel)
-            .all(|(&band, r)| f64::from(r) <= band);
+            .all(|(&band, r)| band.is_finite() && f64::from(r) <= band);
         let pass = exact.iter().all(|&e| e) && rerun && within;
         println!(
             "op L={} T={m}: bit_exact_host kn={} gate={} out={} bit_identical_rerun={rerun} \
@@ -1268,6 +1380,61 @@ mod gate {
         p
     }
 
+    /// One token's projection by `engram_wkv` on the host, by the weight's
+    /// type.
+    enum TokProj {
+        /// [`Proj`].
+        Q8(Proj),
+        /// Per row, both rules' exact values and ik's dot band
+        /// (`act_rule::q3k_rows`), and ik's dot itself
+        /// (`act_rule::ik_q3k_rows`).
+        Q3 { rows: Vec<Q3kRow>, ik: Vec<f32> },
+    }
+
+    impl TokProj {
+        /// The projection of `x`, one token's gathered rows, onto `rows`
+        /// rows.
+        fn of(w: &Wkv, rows: usize, x: &[f32]) -> TokProj {
+            match w {
+                Wkv::Q8 { bytes, .. } => TokProj::Q8(project(bytes, rows, x)),
+                Wkv::Q3 { host, .. } => TokProj::Q3 {
+                    rows: act_rule::q3k_rows(host, x, rows),
+                    ik: act_rule::ik_q3k_rows(host, x, rows),
+                },
+            }
+        }
+
+        /// Our rule's exact value of each row, rounded to f32: the gemv's
+        /// reference.
+        fn ours(&self) -> Vec<f32> {
+            match self {
+                TokProj::Q8(p) => p.ours.iter().map(|&v| v as f32).collect(),
+                TokProj::Q3 { rows, .. } => rows.iter().map(|r| r.ours as f32).collect(),
+            }
+        }
+
+        /// Per row, how far our kv may sit from ik's, `k_in` values a row.
+        /// Q8_0: the two exact values' distance plus both sides'
+        /// accumulation bounds and the f64 sums' own error. Q3_K:
+        /// `act_rule::q3k_shared_input_bound`, whose kernel term the gemv's
+        /// `KERNEL_BAND` pin proves on the same run.
+        fn gap_bound(&self, k_in: usize) -> Vec<f64> {
+            match self {
+                TokProj::Q8(p) => {
+                    let f64_sum = k_in as f64 * U64;
+                    (0..p.ours.len())
+                        .map(|r| {
+                            (p.ours[r] - p.ik[r]).abs()
+                                + (ik_gemv_rel(k_in) + f64_sum) * p.abs_ik[r]
+                                + (our_gemv_rel(k_in) + f64_sum) * p.abs_ours[r]
+                        })
+                        .collect()
+                }
+                TokProj::Q3 { rows, .. } => act_rule::q3k_shared_input_bound(rows, k_in),
+            }
+        }
+    }
+
     /// How far ik's f32 projection sits from its exact value, relative to
     /// `Σ_b|d_w·d_x·isum_b|`: each block term rounds at most twice (the
     /// scales' product, then the integer sum's), and a sum of `k/32` terms in
@@ -1293,46 +1460,70 @@ mod gate {
         d: &SiteData,
         w: &LayerW,
         t: usize,
-        p: &Proj,
+        p: &TokProj,
     ) -> Result<bool, GateError> {
         let (hc, eps, k_in) = (cx.meta.hc, cx.meta.eps, cx.meta.k_in());
         let stream = cx.gpu.stream();
         let emb = &d.embd[t * k_in..(t + 1) * k_in];
         let xs = &d.x[t * hc * ROW..(t + 1) * hc * ROW];
-        // The resident projection's planes, as the owner uploaded them.
-        let DevWeight::Q8_0 { qs, d: dd, .. } = &w.wkv else {
-            return Err(format!("blk.{}.engram_wkv.weight is not resident as Q8_0", w.l).into());
-        };
         let emb_dev = DeviceBuffer::from_host(stream, emb)?;
         let x_dev = DeviceBuffer::from_host(stream, xs)?;
-        // kv, kn, out, gate.
-        let enqueue = |s: &CudaStream, bufs: &mut [DeviceBuffer<f32>; 4]| -> Result<(), GpuError> {
-            let [kv, kn, out, gate] = bufs;
-            cx.gpu
-                .q8f32()
-                .enqueue_q8_0_gemv(s, qs, dd, &emb_dev, 1, kv)?;
-            let key = KeyNormArgs {
-                kv: &*kv,
-                gain: &w.gk_dev,
-                eps,
-                hc,
-                m: 1,
-                kn: &mut *kn,
-            };
-            cx.eg.enqueue_key_norm(s, key)?;
-            let query = GateArgs {
-                x: &x_dev,
-                kn: &*kn,
-                kv: &*kv,
-                gain: &w.gq_dev,
-                eps,
-                hc,
-                m: 1,
-                out,
-                gate,
-            };
-            cx.eg.enqueue_gate(s, query)
+        // The resident projection, with the rows' q8_1 scratch under a
+        // K-quant, allocated before the capture.
+        enum Gemv<'w> {
+            Q8 {
+                qs: &'w DeviceTensor<u32>,
+                d: &'w DeviceTensor<u16>,
+            },
+            Q3 {
+                weight: &'w DeviceTensor<u32>,
+                act: Box<Q8Act>,
+            },
+        }
+        let mut gemv = match &w.wkv {
+            Wkv::Q8 { qs, d, .. } => Gemv::Q8 { qs, d },
+            Wkv::Q3 { dev, .. } => Gemv::Q3 {
+                weight: dev,
+                act: Box::new(Q8Act::with_k(stream, 1, k_in)?),
+            },
         };
+        // kv, kn, out, gate.
+        let mut enqueue =
+            |s: &CudaStream, bufs: &mut [DeviceBuffer<f32>; 4]| -> Result<(), GpuError> {
+                let [kv, kn, out, gate] = bufs;
+                match &mut gemv {
+                    Gemv::Q8 { qs, d } => cx
+                        .gpu
+                        .q8f32()
+                        .enqueue_q8_0_gemv(s, qs, d, &emb_dev, 1, kv)?,
+                    Gemv::Q3 { weight, act } => {
+                        cx.gpu.enqueue_quantize_q8_1(&emb_dev, act)?;
+                        cx.dense
+                            .enqueue(cx.gpu, Dense::Q3K(weight), &emb_dev, Some(&**act), kv)?;
+                    }
+                }
+                let key = KeyNormArgs {
+                    kv: &*kv,
+                    gain: &w.gk_dev,
+                    eps,
+                    hc,
+                    m: 1,
+                    kn: &mut *kn,
+                };
+                cx.eg.enqueue_key_norm(s, key)?;
+                let query = GateArgs {
+                    x: &x_dev,
+                    kn: &*kn,
+                    kv: &*kv,
+                    gain: &w.gq_dev,
+                    eps,
+                    hc,
+                    m: 1,
+                    out,
+                    gate,
+                };
+                cx.eg.enqueue_gate(s, query)
+            };
         let buffers = || -> Result<[DeviceBuffer<f32>; 4], GateError> {
             Ok([
                 DeviceBuffer::<f32>::zeroed(stream, (hc + 1) * ROW)?,
@@ -1350,7 +1541,7 @@ mod gate {
         let got = host(&eager)?;
         let (kv_h, kn_h, out_h, gate_h) = (&got[0], &got[1], &got[2], &got[3]);
 
-        let kv_ref: Vec<f32> = p.ours.iter().map(|&v| v as f32).collect();
+        let kv_ref = p.ours();
         let gemv_rel = max_rel_err(kv_h, &kv_ref)?;
         let kn_ref = our_key_norm(kv_h, &w.gk, eps, hc, 1);
         let (out_ref, gate_ref) = our_gate_update(xs, &kn_ref, kv_h, w, eps, hc);
@@ -1358,16 +1549,8 @@ mod gate {
             && bits_equal(gate_h, &gate_ref)
             && bits_equal(out_h, &out_ref);
 
-        // How far our kv sits from ik's: the two exact values' distance plus
-        // both sides' accumulation bounds and the f64 sums' own error.
-        let f64_sum = k_in as f64 * U64;
-        let bk: Vec<f64> = (0..(hc + 1) * ROW)
-            .map(|r| {
-                (p.ours[r] - p.ik[r]).abs()
-                    + (ik_gemv_rel(k_in) + f64_sum) * p.abs_ik[r]
-                    + (our_gemv_rel(k_in) + f64_sum) * p.abs_ours[r]
-            })
-            .collect();
+        // How far our kv sits from ik's.
+        let bk = p.gap_bound(k_in);
         let b = bands(
             d,
             w,
@@ -1381,10 +1564,11 @@ mod gate {
             max_rel_err(gate_h, &d.gate[t * hc..(t + 1) * hc])?,
             max_rel_err(out_h, &d.out[rows])?,
         ];
+        // A band that is not a number passes nothing.
         let within = [b.kn, b.gate, b.out]
             .iter()
             .zip(rel)
-            .all(|(&band, r)| f64::from(r) <= band);
+            .all(|(&band, r)| band.is_finite() && f64::from(r) <= band);
         let mut pass = gemv_rel <= KERNEL_BAND && exact && within;
         let mut replay = String::new();
         if t == 0 {
@@ -1396,7 +1580,9 @@ mod gate {
                 .iter()
                 .zip(&got)
                 .all(|(a, b)| bits_equal(a, b));
-            pass &= same && g.node_count() == 3;
+            // The gemv (after the rows' q8_1 form under a K-quant), the key
+            // norm and the gate.
+            pass &= same && g.node_count() == w.wkv.launches() + 2;
             replay = format!(
                 " graph_nodes={} replay_bit_identical={same}",
                 g.node_count()

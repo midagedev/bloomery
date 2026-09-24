@@ -495,6 +495,39 @@ pub fn ik_q3k_rows(w: &Q3kWeight, x: &[f32], rows_per_window: usize) -> Vec<f32>
     out
 }
 
+// ---- opg-glueeng ----
+
+/// Per row of [`q3k_rows`] (`k` values a row), how far our kernel's output
+/// may sit from ik's dot ([`dot_q3k`]) when both sides project the same
+/// input, as a gate that pins our kernel within [`crate::KERNEL_BAND`] of
+/// the rows' `ours` (as f32, relative to their largest) proves on that run:
+/// - the two exact values' distance `|ours − ik|`, computed, in place of
+///   [`Q3kRow::band`]'s worst case of the two roundings;
+/// - ik's dot within [`Q3kRow::ik_band`] of `ik`;
+/// - our kernel within `KERNEL_BAND·max|fl(ours)|` of `fl(ours)`, and
+///   `fl(ours)` within `u·|ours|` of `ours`;
+/// - the two f64 sums behind `ours` and `ik`, each `k` products rounded
+///   once and added, within `γ₆₄(2k)` of `Σ|w·x̂|`: ik's side is under
+///   `mag = ik_band/γ(2·n_sb + 4)` (each `|w| = |d·sc|·|q| ≤ |d·sc|·(q + 8)`),
+///   ours under `mag + qd` (`|x̂o| ≤ |x̂i| + |x̂o − x| + |x̂i − x|`, `qd` the
+///   band's rounding term).
+#[must_use]
+pub fn q3k_shared_input_bound(rows: &[Q3kRow], k: usize) -> Vec<f64> {
+    use crate::rounding::{U, U64, gamma};
+    let big = rows.iter().fold(0.0f64, |a, r| a.max(r.ours.abs()));
+    let kernel = f64::from(crate::KERNEL_BAND) * big * (1.0 + U);
+    let g_ik = gamma(2 * (k / QK_K) + 4);
+    let n64 = 2.0 * k as f64 * U64;
+    let g64 = n64 / (1.0 - n64);
+    rows.iter()
+        .map(|r| {
+            let mag = r.ik_band / g_ik;
+            let qd = (r.band - r.ik_band - f64::from(crate::KERNEL_BAND) * big).max(0.0);
+            (r.ours - r.ik).abs() + r.ik_band + kernel + U * r.ours.abs() + g64 * (2.0 * mag + qd)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Act, QK_K, dot_q3k, q3k_scales, quantize_q8_k};
