@@ -1,8 +1,15 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo.svg" width="128" alt="bloomery">
+  </picture>
+</p>
+
 # bloomery
 
-DeepSeek-V4.1-Flash on one workstation: one GPU, an AVX2 host, and kernels written in Rust.
+Hybrid GPU + CPU inference for mixture-of-experts models, written in Rust down to the CUDA kernels.
 
-bloomery is an inference engine for one machine: an RTX 3090-class card, an AVX2 CPU with eight memory channels, 256 GB of RAM and an NVMe drive. The host code is Rust, the GPU kernels are CUDA written in Rust ([cuda-oxide](https://github.com/NVlabs/cuda-oxide)), and the CPU expert kernels are AVX2 Rust. It is for people with that kind of workstation who want to run a model that does not fit on their card.
+bloomery runs mixture-of-experts models that do not fit on one GPU. Each routed layer keeps as many of its experts on the card as fit, and the rest run on the CPU inside the same decode step. The host code is Rust, the GPU kernels are CUDA written in Rust ([cuda-oxide](https://github.com/NVlabs/cuda-oxide)), and the CPU expert kernels are AVX2 Rust. Today it runs DeepSeek-V4.1-Flash on one GPU with an eight-channel CPU and 256 GB of RAM (see [Target hardware](#target-hardware)).
 
 ## What it does
 
