@@ -851,3 +851,14 @@ gate-gpu-dspark-experts:
 # 위치별 경로와의 불일치 수(0이어야 한다)를 찍는다. 목표는 코퍼스 텍스트 자체다. 인자는 bin에 그대로 간다(--tokens N).
 markov-accept *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-model --bin markov-accept && bash tools/host-gate.sh markov-accept --self-test && S=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && D=$BLOOMERY_DATA/engram && bash tools/host-gate.sh markov-accept "$S" $D/corpus-code.ids $D/corpus-prose.ids $D/corpus-prose-all.ids $D/corpus-korean.ids $D/corpus-threads.ids {{ARGS}}'
+
+# V4.1 비전 오라클(V0): 공식 체크포인트의 image_processor.py·vision.py를 박스 torch로 3090에서(게이트 락 아래)
+# tools/ref/vision/images/에 돌려 $BLOOMERY_DATA/ref-vision/deepseek41v/에 쓴다. 두 번 돌려 바이트 동일할 때만 설치하고,
+# MANIFEST에 리비전·샤드 sha256·torch·Pillow·카드·mmproj를 적는다.
+dump-ref-vision:
+    ./tools/box.sh 'bash tools/ref/vision/dump-vision.sh'
+
+# V4.1 비전 호스트 게이트(V1): 리사이즈 플랜과 패드 기하, 패드된 u8 이미지와 bf16 패치(리샘플 유무 모두 비트 동일),
+# 스팬 id·타입을 그 세트와 대조하고, mmproj 헤더의 hparams와 모든 텐서의 이름을 검사한다.
+gate-vision:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-vision --lib --test vision -- --include-ignored --nocapture'

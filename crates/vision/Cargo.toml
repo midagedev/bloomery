@@ -1,0 +1,19 @@
+[package]
+name = "bloomery-vision"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+name = "vision"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+# PNG decode only. Pinned exactly: the preprocessing gate is bit-exact against the reference's
+# decoded pixels, so the decoder is part of what it proves.
+png = "=0.18.1"
+thiserror = { workspace = true }
