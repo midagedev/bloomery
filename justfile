@@ -541,8 +541,34 @@ gate-gpu-qwen3moe-down:
 gate-gpu-qwen3moe-flash:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && bash tools/gpu-gate.sh gate_qwen3moe_flash'
 
+# qwen3moe 체인 커널 셋(3090): Q4_K 임베딩 행(dequant_row·ik inp_embd와 비트 동일), expert gate·up·SwiGLU `_sel`
+# (ffn_moe_gate_par 대조), combine(routed_out 대조).
+gate-gpu-qwen3moe-experts:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_experts && bash tools/gpu-gate.sh gate_qwen3moe_experts'
+
 gate-gpu-qwen3moe-kernels:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_qknorm --bin gate_qwen3moe_rope --bin gate_qwen3moe_router --bin gate_qwen3moe_down --bin gate_qwen3moe_flash && bash tools/gpu-gate.sh gate_qwen3moe_qknorm && bash tools/gpu-gate.sh gate_qwen3moe_rope && bash tools/gpu-gate.sh gate_qwen3moe_router && bash tools/gpu-gate.sh gate_qwen3moe_down && bash tools/gpu-gate.sh gate_qwen3moe_flash'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_qknorm --bin gate_qwen3moe_rope --bin gate_qwen3moe_router --bin gate_qwen3moe_down --bin gate_qwen3moe_flash --bin gate_qwen3moe_experts && bash tools/gpu-gate.sh gate_qwen3moe_qknorm && bash tools/gpu-gate.sh gate_qwen3moe_rope && bash tools/gpu-gate.sh gate_qwen3moe_router && bash tools/gpu-gate.sh gate_qwen3moe_down && bash tools/gpu-gate.sh gate_qwen3moe_flash && bash tools/gpu-gate.sh gate_qwen3moe_experts'
+
+# qwen3moe 전 체인 게이트(3090 한 장): 노드 수 핀, 층별 teacher-forced·자유 주행 l_out 대조, greedy(ik-greedy-qwen3moe의
+# 파일), graph = eager. 플래시 패스는 프로세스마다 한 번 읽으므로 MMA 기본과 스칼라(BLOOMERY_GQA_MMA=0)를 따로 돈다.
+gate-gpu-qwen3moe-e2e:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && bash tools/gpu-gate.sh gate_qwen3moe_e2e && BLOOMERY_GQA_MMA=0 bash tools/gpu-gate.sh gate_qwen3moe_e2e'
+
+# ik CPU의 greedy 연속(프롬프트 0–7, 32토큰)을 $BLOOMERY_DATA/qwen3moe/greedy/에. 프롬프트마다 CPU 임대를 잡는다.
+ik-greedy-qwen3moe:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'for p in 0 1 2 3 4 5 6 7; do GEN=32 PROMPT=$p bash tools/ref/ik-greedy.sh || exit $?; done'
+
+# ik KLD 기준 파일 TAG에 대한 qwen3moe 체인의 NLL·KLD·top-1(출력만, 판정 없음).
+run-qwen3moe-ppl TAG:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_qwen3moe_e2e --ppl {{TAG}}'
+
+# ik-ppl을 qwen3moe 파일에(MODEL을 프로필 값으로 넘긴다). ARGS는 ik-ppl.sh 머리글.
+ik-ppl-qwen3moe TREE TAG *ARGS:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'MODEL=$BLOOMERY_REF_MODEL bash tools/ref/ik-ppl.sh {{TREE}} {{TAG}} {{ARGS}}'
+
+# qwen3moe 생성 CLI(3090): --prompt 텍스트 또는 --tokens id 목록, -n, --ctx, --mode, --time.
+gen-qwen3moe *ARGS:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && bash tools/gpu-gate.sh generate_qwen3moe {{ARGS}}'
 
 # V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 5토큰 세트의
 # 모든 층에서 ik의 라우팅을 주입해 호스트 티어가 낸 routed 부분합을 ik의 ffn_moe_out과 도출한 밴드 안에서 대조한다
@@ -576,8 +602,11 @@ gate-engram:
 # 토크나이저 게이트: 우리 id가 engram 코퍼스 텍스트 전부와 케이스 파일에서 두 parse 모드 모두
 # llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가 — V4.1 어휘(deepseek-v3)와 qwen3moe 어휘(qwen2) 둘 다.
 # oracle.sh가 어휘마다 오라클 파일을 먼저 다시 쓴다(어휘만 적재, 임대 없음, 1분 안).
+# qwen3moe 어휘의 참조는 /home/user/ik-tokref(ik-idxkey와 같은 커밋 + ik#2520 tolower 수정)의 llama-tokenize로 뜬다 —
+# ik의 unicode_tolower는 정렬되지 않은 표에 lower_bound를 써서 (?i:'re) 같은 축약이 어긋나고, 그 경로는 qwen2 정규식만 탄다.
+# #2520이 ik에 들어가면 기본 트리로 되돌린다.
 gate-tokenizer:
-    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
+    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙, V4.1 채팅 템플릿 렌더링. 박스 자원 불필요.
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml -- --include-ignored --nocapture'

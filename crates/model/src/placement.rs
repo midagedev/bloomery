@@ -53,7 +53,8 @@ pub enum Role {
     EngramTable,
     /// A routed expert stack: split by the expert rule between the layer's card and the host.
     RoutedExperts,
-    /// The token embedding: on the host, one row gathered per token.
+    /// The token embedding: on the host, one row gathered per token — or
+    /// whole on the first card when the plan's [`Card::token_embedding`] says so.
     TokenEmbedding,
     /// The output head and its norm: on the head card.
     Head,
@@ -131,6 +132,11 @@ pub struct Card {
     pub layers: Range<usize>,
     /// Whether this stage ends with the head.
     pub head: bool,
+    /// Whether this card holds the token embedding table whole — a plan of
+    /// the whole model on its cards. Only the card that runs layer 0 may;
+    /// on every other plan the table stays on the host, one row gathered per
+    /// token.
+    pub token_embedding: bool,
 }
 
 /// The host tier: its usable bytes and what is set aside before any tensor.
@@ -759,10 +765,12 @@ impl fmt::Display for Violation {
     }
 }
 
-/// Which card runs each layer, and which ends with the head.
+/// Which card runs each layer, which ends with the head, and which holds
+/// the token embedding when one does.
 struct Stages {
     of_layer: Vec<usize>,
     head: usize,
+    embedding: Option<usize>,
 }
 
 impl Stages {
@@ -792,7 +800,30 @@ impl Stages {
                 heads.len()
             )));
         };
-        Ok(Stages { of_layer, head })
+        let embeds: Vec<usize> = (0..cards.len())
+            .filter(|&c| cards[c].token_embedding)
+            .collect();
+        let embedding = match embeds.as_slice() {
+            [] => None,
+            &[c] if of_layer.first() == Some(&c) => Some(c),
+            &[c] => {
+                return Err(PlacementError::Stages(format!(
+                    "card {} holds the token embedding but does not run layer 0",
+                    cards[c].name
+                )));
+            }
+            many => {
+                return Err(PlacementError::Stages(format!(
+                    "{} cards hold the token embedding, not one",
+                    many.len()
+                )));
+            }
+        };
+        Ok(Stages {
+            of_layer,
+            head,
+            embedding,
+        })
     }
 
     /// The card whose stage uses `t`: its layer's, the head's for the head,
@@ -967,10 +998,13 @@ fn place_whole(
             (card_segment(t, stage, rows_of(t), None)?, t.file_bytes)
         }
         Role::Head => (card_segment(t, stage, rows_of(t), None)?, t.file_bytes),
-        Role::TokenEmbedding => (
-            in_place(Device::Host, Format::HostFile, None, t.file_bytes),
-            gathered(t)?,
-        ),
+        Role::TokenEmbedding => match stages.embedding {
+            Some(card) => (card_segment(t, card, rows_of(t), None)?, gathered(t)?),
+            None => (
+                in_place(Device::Host, Format::HostFile, None, t.file_bytes),
+                gathered(t)?,
+            ),
+        },
         Role::EngramTable => {
             layer_of(t, layers)?;
             (
@@ -1451,6 +1485,7 @@ impl Plan<'_> {
                     Device::Card(c) => {
                         let uses = cards.get(c).is_some_and(|card| match (t.role, t.layer) {
                             (Role::Head, _) => card.head,
+                            (Role::TokenEmbedding, _) => card.token_embedding,
                             (_, Some(l)) => card.layers.contains(&l),
                             (_, None) => false,
                         });

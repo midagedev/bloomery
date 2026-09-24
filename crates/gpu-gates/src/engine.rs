@@ -13,7 +13,7 @@
 #![cfg(feature = "gpu")]
 
 use bloomery_gpu::model::Engine;
-use bloomery_gpu::{Deepseek2Model, GpuError};
+use bloomery_gpu::{Deepseek2Model, GpuError, Qwen3moeModel};
 use gguf::Split;
 use model::arch::Arch;
 
@@ -24,6 +24,7 @@ use model::arch::Arch;
 /// destructuring `let` over this enum name the new case.
 pub enum AnyEngine {
     Deepseek2(Deepseek2Model),
+    Qwen3moe(Qwen3moeModel),
     #[cfg(feature = "deepseek41")]
     Deepseek41(bloomery_gpu_deepseek41::body::Deepseek41Model),
 }
@@ -32,8 +33,9 @@ impl AnyEngine {
     /// Detect `file`'s architecture, then load that architecture's whole
     /// chain and output head with a `ctx`-row cache: deepseek2 through
     /// `load_full` (every weight on the card, or the hybrid load its levers
-    /// ask for), deepseek41 by this workstation's serving placement (design
-    /// §5 (a), `workstation::plan_a`). The engine takes the file.
+    /// ask for), qwen3moe through `load_full` (the whole model on one card),
+    /// deepseek41 by this workstation's serving placement (design §5 (a),
+    /// `workstation::plan_a`). The engine takes the file.
     pub fn open(file: Split, ctx: usize) -> Result<AnyEngine, GpuError> {
         let head = file.shard(0).ok_or(GpuError::State {
             what: "AnyEngine::open",
@@ -49,7 +51,7 @@ impl AnyEngine {
             )?)),
             #[cfg(not(feature = "deepseek41"))]
             a @ Arch::Deepseek41 => Err(GpuError::UnsupportedArch(a.name().to_string())),
-            a @ Arch::Qwen3moe => Err(GpuError::UnsupportedArch(a.name().to_string())),
+            Arch::Qwen3moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::load_full(file, ctx)?)),
         }
     }
 }
@@ -58,6 +60,7 @@ impl Engine for AnyEngine {
     fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         match self {
             AnyEngine::Deepseek2(m) => m.step(tokens),
+            AnyEngine::Qwen3moe(m) => m.step(tokens),
             #[cfg(feature = "deepseek41")]
             AnyEngine::Deepseek41(m) => m.step(tokens),
         }
@@ -66,6 +69,7 @@ impl Engine for AnyEngine {
     fn reset(&mut self) -> Result<(), GpuError> {
         match self {
             AnyEngine::Deepseek2(m) => m.reset(),
+            AnyEngine::Qwen3moe(m) => m.reset(),
             #[cfg(feature = "deepseek41")]
             AnyEngine::Deepseek41(m) => m.reset(),
         }
@@ -74,6 +78,7 @@ impl Engine for AnyEngine {
     fn seed_depth(&mut self, rows: usize) -> Result<(), GpuError> {
         match self {
             AnyEngine::Deepseek2(m) => m.seed_depth(rows),
+            AnyEngine::Qwen3moe(m) => m.seed_depth(rows),
             #[cfg(feature = "deepseek41")]
             AnyEngine::Deepseek41(m) => m.seed_depth(rows),
         }
@@ -82,6 +87,7 @@ impl Engine for AnyEngine {
     fn pos(&self) -> u32 {
         match self {
             AnyEngine::Deepseek2(m) => m.pos(),
+            AnyEngine::Qwen3moe(m) => m.pos(),
             #[cfg(feature = "deepseek41")]
             AnyEngine::Deepseek41(m) => m.pos(),
         }
@@ -90,6 +96,7 @@ impl Engine for AnyEngine {
     fn resident_bytes(&self) -> usize {
         match self {
             AnyEngine::Deepseek2(m) => m.resident_bytes(),
+            AnyEngine::Qwen3moe(m) => m.resident_bytes(),
             #[cfg(feature = "deepseek41")]
             AnyEngine::Deepseek41(m) => m.resident_bytes(),
         }
@@ -98,6 +105,7 @@ impl Engine for AnyEngine {
     fn arch(&self) -> Arch {
         match self {
             AnyEngine::Deepseek2(m) => m.arch(),
+            AnyEngine::Qwen3moe(m) => m.arch(),
             #[cfg(feature = "deepseek41")]
             AnyEngine::Deepseek41(m) => m.arch(),
         }

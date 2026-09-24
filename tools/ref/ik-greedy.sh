@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# ik-greedy.sh — ik_llama.cpp's greedy continuation of one prompt on the V4.1 file, CPU only, one token per
-# llama_decode (-b 1's path), under the machine-wide CPU lease: the reference of the V4.1 step gate's
-# --greedy (G3, crates/gpu-gates/src/bin/gate_deepseek41_step.rs).
+# ik-greedy.sh — ik_llama.cpp's greedy continuation of one prompt on the V4.1 file (or the qwen3moe one),
+# CPU only, one token per llama_decode (-b 1's path), under the machine-wide CPU lease: the reference of the
+# V4.1 step gate's --greedy (G3, crates/gpu-gates/src/bin/gate_deepseek41_step.rs) and of the qwen3moe e2e
+# gate's greedy arm (crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs).
 #
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/ik-greedy.sh'
 #   just ik-greedy-ds41 [PROMPT]
+#   just ik-greedy-qwen3moe          (prompts 0-7, the e2e gate's set)
+#
+# The profile picks the directories: deepseek41 writes under $BLOOMERY_DATA/greedy-ds41 and builds into
+# bin/deepseek41, qwen3moe under $BLOOMERY_DATA/qwen3moe/greedy and bin/qwen3moe. The file names below are
+# the V4.1 ones; qwen3moe's are the same names in its own directory.
 #
 # The prompt is tools/ref/prompts.tsv's row PROMPT (default 0), whose ids there are the V2-Lite tokenizer's.
 # This runner takes its text and reads it with the V4.1 file's own tokenizer (llama-tokenize from the
@@ -25,10 +31,12 @@
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
-[ "$MODEL_NAME" = deepseek41 ] || {
-  echo "ik-greedy.sh: the profile is $MODEL_NAME — pick deepseek41 on the Mac side (BLOOMERY_MODEL=deepseek41)" >&2
-  exit 64
-}
+case $MODEL_NAME in
+  deepseek41) OUTDIR_NAME=greedy-ds41 ;;
+  qwen3moe)   OUTDIR_NAME=qwen3moe/greedy ;;
+  *) echo "ik-greedy.sh: the profile is $MODEL_NAME — pick deepseek41 or qwen3moe on the Mac side (BLOOMERY_MODEL=...)" >&2
+     exit 64 ;;
+esac
 GEN=${GEN:-64}
 PROMPT=${PROMPT:-0}
 BOUND=${IK_GREEDY_BOUND:-900}
@@ -37,8 +45,8 @@ for n in "$GEN" "$BOUND"; do
 done
 case $PROMPT in ''|*[!0-9]*) echo "ik-greedy.sh: PROMPT is a row id, got '$PROMPT'" >&2; exit 64 ;; esac
 HERE=$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)
-OUTDIR=$BLOOMERY_DATA/greedy-ds41
-BINDIR=$BLOOMERY_DATA/bin/deepseek41
+OUTDIR=$BLOOMERY_DATA/$OUTDIR_NAME
+BINDIR=$BLOOMERY_DATA/bin/$MODEL_NAME
 BIN=$BINDIR/argmax_ref
 TOK=$IK/build/bin/llama-tokenize
 mkdir -p "$OUTDIR" "$BINDIR"

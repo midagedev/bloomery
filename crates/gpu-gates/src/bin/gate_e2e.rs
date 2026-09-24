@@ -743,6 +743,9 @@ fn run() -> Result<(), GateError> {
     // every other arm is a file this gate has no reference for.
     let mut model = match AnyEngine::open(file, CTX_MAX)? {
         AnyEngine::Deepseek2(m) => m,
+        AnyEngine::Qwen3moe(_) => {
+            return Err("gate_e2e: the references are deepseek2's; the file is qwen3moe".into());
+        }
         #[cfg(feature = "deepseek41")]
         AnyEngine::Deepseek41(_) => {
             return Err("gate_e2e: the references are deepseek2's; the file is deepseek41".into());

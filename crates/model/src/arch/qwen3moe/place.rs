@@ -4,15 +4,27 @@
 //! ([`KvLayout`]) are read once ([`PlanInputs::read`]); then the shared
 //! placement and its invariants ([`PlanInputs::plan`]); then, for a plan that
 //! is meant to hold the whole model on its cards, that every routed expert is
-//! on one ([`PlanInputs::whole`]). The token embedding is a row-gathered table
-//! and stays on the host by the shared rule; one row of it is read per token.
+//! on one ([`PlanInputs::whole`]). The machine a whole plan is made for is
+//! [`one_card`]: the gate card runs every layer and the head and holds the
+//! token embedding table too, so nothing of the model stays on the host.
 
 use gguf::Split;
 
 use super::hparams::Hparams;
 use super::kv::KvLayout;
 use super::roles;
-use crate::placement::{self, Machine, ModelTensors, PlacementError, Plan, Violation};
+use crate::placement::{self, Machine, ModelTensors, PlacementError, Plan, Violation, workstation};
+
+/// The whole model on one 24 GB card: [`workstation::plan_gate`] (the 3090
+/// runs all `layers` and the head) with the token embedding on that card.
+#[must_use]
+pub fn one_card(layers: usize) -> Machine {
+    let mut m = workstation::plan_gate(layers);
+    for c in &mut m.cards {
+        c.token_embedding = true;
+    }
+    m
+}
 
 /// What a plan of a Qwen3-MoE file is made from, read from its headers.
 #[derive(Debug)]

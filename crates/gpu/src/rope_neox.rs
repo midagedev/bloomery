@@ -18,10 +18,9 @@
 //!   the scale `1 / sqrt(mean + eps)` in f32, each op rounded on its own;
 //! - the normalized value `(scale · gain) · x`;
 //! - the turn through [`neox_pair`]: `y0 = fma(x0, c, −(x1·s))`,
-//!   `y1 = fma(x0, s, x1·c)`, the inner products rounded on their own — the
-//!   form ik's CPU build's NEOX loop computes (measured against its dumps:
-//!   its source writes `x0·c − x1·s` and `x0·s + x1·c`, and the compiled
-//!   loop rounds as this form does), so on the same normalized values the
+//!   `y1 = fma(x0, s, x1·c)`, the inner products rounded on their own —
+//!   the rounding ik's compiled CPU NEOX loop produces (its source writes
+//!   `x0·c − x1·s` and `x0·s + x1·c`), so on the same normalized values the
 //!   turn is ik's bit for bit;
 //! - the cache rows rounded once to f16, to nearest even.
 //!

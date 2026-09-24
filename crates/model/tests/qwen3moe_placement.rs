@@ -1,8 +1,9 @@
 //! Qwen3-MoE placement gate: the whole model on one 24 GB card. The file's
-//! plan on the gate placement (`workstation::plan_gate`: the 3090 runs every
-//! layer and the head) at the serving context keeps every routed expert of
-//! every layer on the card, breaks no invariant, and its byte totals are the
-//! sums of the tensors' device bytes recomputed from the header alone.
+//! plan on `place::one_card` (the 3090 runs every layer and the head and
+//! holds the token embedding) at the serving context keeps every routed
+//! expert of every layer on the card and nothing on the host, breaks no
+//! invariant, and its byte totals are the sums of the tensors' device bytes
+//! recomputed from the header alone.
 //!
 //! The same plan under card budgets pins where "whole" stops: at exactly the
 //! bytes the whole plan takes (its granules + KV + scratch + context +
@@ -13,8 +14,8 @@
 //! picks the qwen3moe tool profile). Headers only: no tensor bytes, no GPU.
 
 use gguf::Split;
-use model::arch::qwen3moe::place::{PlaceError, PlanInputs};
-use model::placement::{CardFormat, Device, PlacementError, Role, workstation};
+use model::arch::qwen3moe::place::{PlaceError, PlanInputs, one_card};
+use model::placement::{CardFormat, Device, PlacementError, workstation};
 
 fn inputs() -> PlanInputs {
     let path = std::env::var("BLOOMERY_REF_MODEL").unwrap_or_else(|_| {
@@ -30,7 +31,7 @@ fn inputs() -> PlanInputs {
 fn hw_qwen3moe_whole_on_the_3090() {
     let inp = inputs();
     let (hp, model) = (&inp.hp, &inp.model);
-    let machine = workstation::plan_gate(hp.n_layer);
+    let machine = one_card(hp.n_layer);
     let ctx = workstation::CTX_MAX;
     let plan = inp
         .plan_with(&machine, ctx, None)
@@ -40,13 +41,9 @@ fn hw_qwen3moe_whole_on_the_3090() {
     let spec = &machine.cards[0];
 
     // Every tensor's device bytes from the header alone: the card format's
-    // arithmetic over its dims, and the token embedding's file bytes on the host.
-    let (mut card_bytes, mut host_bytes) = (0u64, 0u64);
+    // arithmetic over its dims, the token embedding's included.
+    let mut card_bytes = 0u64;
     for t in &model.tensors {
-        if t.role == Role::TokenEmbedding {
-            host_bytes += t.file_bytes;
-            continue;
-        }
         let format = CardFormat::of(t.ty).unwrap_or_else(|| panic!("{}: no card format", t.name));
         let rows: u64 = t.dims.iter().skip(1).product();
         card_bytes += format
@@ -106,11 +103,7 @@ fn hw_qwen3moe_whole_on_the_3090() {
         model.experts * hp.n_layer as u64,
     );
     check("host experts", plan.host.experts, 0);
-    check(
-        "host tables = token_embd file bytes",
-        plan.host.table_bytes,
-        host_bytes,
-    );
+    check("host tables", plan.host.table_bytes, 0);
     check("KV = layers·ctx·2·kv_heads·head·f16", card.kv_bytes, kv);
     check("headroom ≥ 0", u64::from(card.headroom_bytes >= 0), 1);
 

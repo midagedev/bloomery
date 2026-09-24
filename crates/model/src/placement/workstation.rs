@@ -87,6 +87,7 @@ fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
         granule_bytes: GRANULE,
         layers,
         head,
+        token_embedding: false,
     }
 }
 

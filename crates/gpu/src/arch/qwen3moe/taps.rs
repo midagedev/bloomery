@@ -1,0 +1,102 @@
+//! The instruments a gate drives on the qwen3moe chain: one layer run on its
+//! own from a given input (the teacher-forced arm), and the per-layer copies
+//! of `l_out` the whole chain leaves when asked.
+
+use super::body::Body;
+use super::dispatch;
+use crate::GpuError;
+use crate::model::{GpuModel, StepMode};
+
+/// What one layer's run leaves, read back.
+pub struct LayerRun {
+    /// The attention residual: the FFN half's input.
+    pub ffn_inp: Vec<f32>,
+    /// The router's ids, in slot order.
+    pub ids: Vec<u32>,
+    /// The layer's output residual.
+    pub l_out: Vec<f32>,
+}
+
+impl GpuModel<Body> {
+    /// Run layer `l` eagerly from input residual `x_in` at `pos` (rows
+    /// `0..pos` already in that layer's planes — this call appends row
+    /// `pos`) and read it back. Synchronizes; gate use.
+    pub fn step_layer(&mut self, l: usize, x_in: &[f32], pos: u32) -> Result<LayerRun, GpuError> {
+        let what = "qwen3moe::step_layer";
+        self.check_pos(pos, what)?;
+        let slot = self.layer_slot(l, what)?;
+        self.refresh_params(0, pos)?;
+        let (gpu, w, body) = self.body_parts(what)?;
+        let stream = gpu.stream();
+        if x_in.len() != body.s.x.len() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "x_in has {} values, the residual {}",
+                    x_in.len(),
+                    body.s.x.len()
+                ),
+            ));
+        }
+        body.s.x.copy_from_host(stream, x_in)?;
+        dispatch::enqueue_layer(gpu, w, body, slot, false)?;
+        let s = &body.s;
+        Ok(LayerRun {
+            ffn_inp: s.ffn_inp.to_host_vec(stream)?,
+            ids: s.route.ids.to_host_vec(stream)?,
+            l_out: s.l_out.to_host_vec(stream)?,
+        })
+    }
+
+    /// Run layer `l`'s FFN half alone eagerly from its input residual
+    /// `ffn_inp` and read it back (`ffn_inp` echoes the input). Synchronizes;
+    /// gate use.
+    pub fn step_ffn(&mut self, l: usize, ffn_inp: &[f32]) -> Result<LayerRun, GpuError> {
+        let what = "qwen3moe::step_ffn";
+        let slot = self.layer_slot(l, what)?;
+        let (gpu, w, body) = self.body_parts(what)?;
+        let stream = gpu.stream();
+        if ffn_inp.len() != body.s.ffn_inp.len() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "ffn_inp has {} values, the residual {}",
+                    ffn_inp.len(),
+                    body.s.ffn_inp.len()
+                ),
+            ));
+        }
+        body.s.ffn_inp.copy_from_host(stream, ffn_inp)?;
+        dispatch::enqueue_ffn(gpu, w, body, slot)?;
+        let s = &body.s;
+        Ok(LayerRun {
+            ffn_inp: s.ffn_inp.to_host_vec(stream)?,
+            ids: s.route.ids.to_host_vec(stream)?,
+            l_out: s.l_out.to_host_vec(stream)?,
+        })
+    }
+
+    /// Keep (or stop keeping) a copy of every layer's `l_out` after each
+    /// layer of the chain. Switches the model to eager mode: the copies are
+    /// read by [`GpuModel::layer_taps`] after an eager step.
+    pub fn set_layer_taps(&mut self, on: bool) -> Result<(), GpuError> {
+        self.set_mode(StepMode::Eager);
+        let (gpu, _, body) = self.body_parts("qwen3moe::set_layer_taps")?;
+        body.set_taps(gpu.stream(), on)
+    }
+
+    /// Every layer's `l_out` from the last step, layer by layer.
+    pub fn layer_taps(&mut self) -> Result<Vec<Vec<f32>>, GpuError> {
+        let what = "qwen3moe::layer_taps";
+        let (gpu, _, body) = self.body_parts(what)?;
+        let t = body
+            .taps
+            .as_ref()
+            .ok_or(GpuError::state(what, "layer taps are off (set_layer_taps)"))?;
+        let all = t.buf.to_host_vec(gpu.stream())?;
+        Ok(all
+            .chunks(body.s.dims.hidden)
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
+}

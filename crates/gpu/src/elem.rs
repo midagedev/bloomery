@@ -12,11 +12,12 @@
 //! v`, the layout of the reference dump's `q_rope`/`k_rope` views);
 //! `weighted_sum` on `[rows, n_exp, m]` down-projections with `[n_exp, m]`
 //! weights; the embedding table is Q3_K rows of 2048 values (880 bytes = 220
-//! u32 words each). Extents are launch arguments, never buffer lengths:
-//! scratch buffers may be larger than the shape in flight.
+//! u32 words each) or Q4_K rows of whole super-blocks (36 words each).
+//! Extents are launch arguments, never buffer lengths: scratch buffers may
+//! be larger than the shape in flight.
 
 use crate::GpuError;
-use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale};
+use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale, q4k_scale_min};
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -119,6 +120,43 @@ pub(crate) fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
         (aw3 >> 16) as u16
     };
     (half_to_f32(d_bits) * sc as f32) * ((qv as i32 - hv) as f32)
+}
+
+/// The f32 value of Q4_K weight `v` (0..256) of the super-block at word
+/// `wk` of `w`, in the reference dequantizer's op order: sub-block `2j + h`
+/// (`j = v / 64`, `h` the nibble half) takes `d1 = d · sc`, `m1 = dmin · m`
+/// from `get_scale_min_k4`, and the value is `q · d1 − m1` for its 4-bit code
+/// `q` (low nibble of qs byte `32j + v % 32` for `h = 0`, high for `h = 1`).
+/// `q · d1` holds at most 21 significant bits, so it is exact in f32 and a
+/// fused or unfused subtraction rounds alike: a correct caller is
+/// bit-identical to `gguf::quant::dequant_row` on the same row bytes.
+///
+/// Caller contract: `wk + 36 <= w.len()` (the super-block's 36 words), `v < 256`.
+#[inline(always)]
+pub(crate) fn q4k_embed_value(w: &[u32], wk: usize, v: usize) -> f32 {
+    let j = v >> 6;
+    let h = (v >> 5) & 1;
+    let l = v & 31;
+    let qb = 32 * j + l;
+    // SAFETY: every index is wk + 0..=35 (qb < 128, so 4 + qb/4 <= 35),
+    // inside `w` by the caller contract.
+    let (w0, w1, w2, w3, qw) = unsafe {
+        (
+            *w.get_unchecked(wk),
+            *w.get_unchecked(wk + 1),
+            *w.get_unchecked(wk + 2),
+            *w.get_unchecked(wk + 3),
+            *w.get_unchecked(wk + 4 + (qb >> 2)),
+        )
+    };
+    let byte = (qw >> (8 * (qb & 3) as u32)) & 0xff;
+    let q = if h == 0 { byte & 0x0f } else { byte >> 4 };
+    let (sc, mi) = q4k_scale_min(2 * j + h, w1, w2, w3);
+    let d = half_to_f32((w0 & 0xffff) as u16);
+    let dmin = half_to_f32((w0 >> 16) as u16);
+    let d1 = d * sc as f32;
+    let m1 = dmin * mi as f32;
+    q as f32 * d1 - m1
 }
 
 /// The partial sum of squares thread `tid` of an [`RMS_THREADS`] block owns
@@ -255,6 +293,46 @@ mod elem_kernels {
         // can sit 2 mod 4; the core funnels both alignments.
         let v = q3k_embed_value(w, id * 880 + ((k >> 8) * 110), k & 255);
         // SAFETY: i < ids.len() * 2048 <= y.len() by the launch contract.
+        unsafe {
+            *y.get_unchecked_mut(i) = v;
+        }
+    }
+
+    /// Dequantize `ids.len()` rows of the Q4_K embedding table `w` (`36 ·
+    /// n_sb` u32 words per row, `256 · n_sb` values) into `y`, token-major,
+    /// one thread per value through [`q4k_embed_value`]. Q4_K rows are whole
+    /// words, so no funnel is needed. An id past the table's `n_rows` rows
+    /// reads row 0, as `embed_rows` does.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= 36 * n_sb * n_rows,
+            y.len() >= 256 * n_sb * ids.len()
+        )
+    )]
+    pub fn embed_rows_q4k(
+        w: &[u32],
+        ids: &[u32],
+        n_rows: u32,
+        n_sb: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let width = 256 * n_sb as usize;
+        if i >= ids.len() * width {
+            return;
+        }
+        let t = i / width;
+        let k = i % width;
+        // SAFETY: t < ids.len() by the guard.
+        let id = unsafe { *ids.get_unchecked(t) };
+        let id = (if id < n_rows { id } else { 0 }) as usize;
+        let wk = (id * n_sb as usize + (k >> 8)) * 36;
+        let v = q4k_embed_value(w, wk, k & 255);
+        // SAFETY: i < ids.len() * width <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = v;
         }
@@ -679,6 +757,50 @@ impl ElemKernels {
             .prepare_embed_rows(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
             .embed_rows(stream, &prep, w.buf(), ids, n_rows, y)?;
+        Ok(())
+    }
+
+    /// Enqueue the Q4_K embedding lookup: `ids` (device-resident token ids)
+    /// each select one row of `w` (`36 · n_sb` u32 words per row, `256 ·
+    /// n_sb` values, `n_sb = w.cols() / 36`), dequantized into `y`
+    /// token-major. Bit-identical to `gguf::quant::dequant_row` on the same
+    /// row bytes. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_embed_rows_q4k(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        ids: &DeviceBuffer<u32>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_embed_rows_q4k";
+        if w.rows() == 0 || w.cols() == 0 || !w.cols().is_multiple_of(36) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a Q4_K table is 36 words per super-block per row, got {}x{}",
+                    w.rows(),
+                    w.cols()
+                ),
+            ));
+        }
+        let n_sb = w.cols() / 36;
+        if ids.is_empty() {
+            return Err(GpuError::shape(what, "empty ids"));
+        }
+        if y.len() < 256 * n_sb * ids.len() {
+            return Err(GpuError::shape(
+                what,
+                format!("y.len() {} < {}*{}", y.len(), 256 * n_sb, ids.len()),
+            ));
+        }
+        let grid = launch_u32(what, "grid", (ids.len() * 256 * n_sb).div_ceil(256))?;
+        let n_rows = launch_u32(what, "w.rows()", w.rows())?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_embed_rows_q4k(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module
+            .embed_rows_q4k(stream, &prep, w.buf(), ids, n_rows, n_sb, y)?;
         Ok(())
     }
 

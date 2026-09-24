@@ -34,8 +34,8 @@ cuda-core = { workspace = true, optional = true }
 # `BLOOMERY_STEP_STATS`. Reached only through the `deepseek41` feature.
 bloomery-threads = { path = "../threads", optional = true }
 libc = { workspace = true, optional = true }
-# `bloomery-chat`: text in through the file's own vocabulary, a sampled or greedy
-# choice over the head's logits, text out. Reached only through the `deepseek41` feature.
+# Text in and out through the file's own vocabulary: `bloomery-chat` (the `deepseek41`
+# feature) and `generate_qwen3moe --prompt` (the `gpu` feature). Host only.
 bloomery-tokenizer = { path = "../tokenizer", optional = true }
 bloomery-sampler = { path = "../sampler", optional = true }
 # `bloomery-serve-ds41`: the HTTP server's `Engine` over the V4.1 generator (`bind`), and its gate
@@ -49,7 +49,7 @@ bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
 bloomery-vision = { path = "../vision", optional = true }
 
 [features]
-gpu = ["dep:bloomery-gpu", "dep:cuda-core"]
+gpu = ["dep:bloomery-gpu", "dep:cuda-core", "dep:bloomery-tokenizer"]
 deepseek41 = [
     "gpu",
     "dep:bloomery-gpu-deepseek41",

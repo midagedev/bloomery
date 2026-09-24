@@ -286,6 +286,13 @@ fn run() -> Result<(), GateError> {
     // deepseek41 chain has none of those yet.
     let mut model = match AnyEngine::open(file, ctx)? {
         AnyEngine::Deepseek2(m) => m,
+        AnyEngine::Qwen3moe(_) => {
+            return Err(
+                "generate: drives the deepseek2 chain; the file is qwen3moe, \
+                        whose driver is generate_qwen3moe (just gen-qwen3moe)"
+                    .into(),
+            );
+        }
         #[cfg(feature = "deepseek41")]
         AnyEngine::Deepseek41(_) => {
             return Err(

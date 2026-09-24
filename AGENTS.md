@@ -379,7 +379,10 @@ decode row takes the split-K path and ignores it), `BLOOMERY_GATE_BOUND` (tools/
 segment, a multiple of 32; an unusable value panics instead of falling back),
 `BLOOMERY_FLASH_MMA=0` (gpu flash: the scalar segment pass instead of the
 tensor-core default; `just gate-gpu-e2e` runs both, and the timing binary
-prints which one it ran on its `load` line), `BLOOMERY_HYBRID_NL` (gpu hybrid
+prints which one it ran on its `load` line), `BLOOMERY_GQA_MMA=0` (qwen3moe
+GQA flash: the scalar segment pass instead of the tensor-core default, its
+banded twin; `just gate-gpu-qwen3moe-e2e` runs both and the `load` line
+prints which one ran), `BLOOMERY_HYBRID_NL` (gpu hybrid
 MoE: experts `[0, n_l)` of every routed stack stay on the card and the rest
 run on the host tier inside the captured step; unset or equal to the expert
 count is the all-card path; `just gate-gpu-hybrid` refuses to run with it
