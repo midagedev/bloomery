@@ -972,6 +972,34 @@ pub(crate) fn q3k_row_dot_1col(
     col0: usize,
     lane: usize,
 ) -> f32 {
+    q3k_row_dot_1col_span(w, q, d8, n_sb, iters, row_abs, col0, lane, 0, iters)
+}
+
+/// [`q3k_row_dot_1col`] over the iterations `it0..it1` only: the lane folds
+/// that range's terms from zero, in the same order and through the same
+/// [`q3k_acc`] as the whole walk, so `0..iters` is [`q3k_row_dot_1col`]. A
+/// split-K caller reduces each range's partials across its warp and adds the
+/// ranges' sums in range order.
+///
+/// Caller contract as [`q3k_row_dot`] with `m_cols` 1, and `it0 <= it1 <=
+/// iters`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) fn q3k_row_dot_1col_span(
+    w: &[u32],
+    q: &[u64],
+    d8: &[f32],
+    n_sb: usize,
+    iters: u32,
+    row_abs: usize,
+    col0: usize,
+    lane: usize,
+    it0: u32,
+    it1: u32,
+) -> f32 {
     let q_col = 64 * iters as usize; // q8 u64 slots per column
     let d8_col = 2 * n_sb; // 128-value blocks per column
 
@@ -992,12 +1020,15 @@ pub(crate) fn q3k_row_dot_1col(
     // what stops the backend from reducing it.
     let mut base = row_abs * 110 * n_sb + half * 110;
 
+    // The walk starts at iteration 0 and skips to `it0` through the guard
+    // rather than starting there: at `it0` 0 the guard folds away and the
+    // loop is the whole walk's own, instruction for instruction.
     let mut it: u32 = 0;
-    while it < iters {
+    while it < it1 {
         let sbp = ((it << 1) | half as u32) as usize;
         // As `q3k_row_dot`: the guard makes a partial final iteration safe
         // and is always true when n_sb is even.
-        if sbp < n_sb {
+        if it >= it0 && sbp < n_sb {
             // SAFETY: the guard is this term's `sbp < n_sb` precondition, and
             // `base` is that super-block's byte offset in row `row_abs`.
             let (a, e, drow) =
@@ -1079,12 +1110,42 @@ pub fn q3k_row_dot_cols(
     m_cols: usize,
     lane: usize,
 ) -> [f32; 8] {
+    q3k_row_dot_cols_span(
+        w, q, d8, n_sb, iters, row_abs, col0, col_stride, m_cols, lane, 0, iters,
+    )
+}
+
+/// [`q3k_row_dot_cols`] over the iterations `it0..it1` only, every column
+/// folded from zero over that range as [`q3k_row_dot_1col_span`] folds
+/// column 0 — so column c of an m-column span is the single-column span on
+/// that column bit for bit, and `0..iters` is [`q3k_row_dot_cols`].
+///
+/// SAFETY: as [`q3k_row_dot_cols`], and `it0 <= it1 <= iters`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) fn q3k_row_dot_cols_span(
+    w: &[u32],
+    q: &[u64],
+    d8: &[f32],
+    n_sb: usize,
+    iters: u32,
+    row_abs: usize,
+    col0: usize,
+    col_stride: usize,
+    m_cols: usize,
+    lane: usize,
+    it0: u32,
+    it1: u32,
+) -> [f32; 8] {
     // One column is the decode shape, and it gets a body of its own: the
     // guards below are runtime tests, so in this walk each iteration's work
     // sits behind its own branch. See `q3k_row_dot_1col`.
     if m_cols == 1 {
         return [
-            q3k_row_dot_1col(w, q, d8, n_sb, iters, row_abs, col0, lane),
+            q3k_row_dot_1col_span(w, q, d8, n_sb, iters, row_abs, col0, lane, it0, it1),
             0.0,
             0.0,
             0.0,
@@ -1124,12 +1185,14 @@ pub fn q3k_row_dot_cols(
     let qb0 = col0 * q_col;
     let d8b0 = col0 * d8_col;
 
+    // From iteration 0, skipping to `it0` through the guard, as
+    // `q3k_row_dot_1col_span`.
     let mut it: u32 = 0;
-    while it < iters {
+    while it < it1 {
         let sbp = ((it << 1) | half as u32) as usize;
         // The sbp guard makes a partial final iteration safe; always
         // true when n_sb is even.
-        if sbp < n_sb {
+        if it >= it0 && sbp < n_sb {
             // The super-block's column-independent decode — the lane's
             // four dequantized quads, its sub-block scales and the
             // super-block scale — is `q3k_sb_decode`, shared with

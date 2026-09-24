@@ -24,7 +24,9 @@
 )]
 
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -198,6 +200,64 @@ impl GpuError {
 pub fn launch_u32(what: &'static str, name: &'static str, v: usize) -> Result<u32, GpuError> {
     u32::try_from(v)
         .map_err(|_| GpuError::shape(what, format!("{name} = {v} does not fit the kernel's u32")))
+}
+
+/// Split width [`Q3K_SPLIT_WIDTH`] and the walk length
+/// [`Q3K_SPLIT_MIN_ITERS`] from which a Q3_K row is split: split-K pays only
+/// where a launch ends on a long, mostly empty last wave of long walks; a
+/// grid of many waves, or one already at the bandwidth floor, only gains the
+/// combine's cost. The default width is 1 — no launch is split and every
+/// bit is the unsplit kernel's; the split is the `BLOOMERY_Q3K_SPLIT=2` arm
+/// of a same-binary A/B, since on V4.1 only `wo_b` qualifies and its
+/// predicted gain sits under the ruler's resolution while the changed sum
+/// order moves the greedy trajectory.
+pub const Q3K_SPLIT_WIDTH: usize = 1;
+/// See [`Q3K_SPLIT_WIDTH`].
+pub const Q3K_SPLIT_MIN_ITERS: usize = 16;
+
+/// Warps [`Gpu::enqueue_gemv_q3k`] splits a Q3_K row of `n_sb` super-blocks
+/// across: the width W when the row walk has at least T two-super-block
+/// iterations and W divides them (equal shares), else 1 — the unsplit
+/// `q3k_gemv`. A function of `n_sb` alone, never of the row or column count:
+/// a joined launch, a gate's row-capped upload and an m-column pass must
+/// write each row the bits its own one-column launch writes, and the split
+/// width is part of those bits.
+///
+/// W and T default to [`Q3K_SPLIT_WIDTH`] and [`Q3K_SPLIT_MIN_ITERS`];
+/// `BLOOMERY_Q3K_SPLIT=1|2|4|8` sets W (1 keeps every launch unsplit) and
+/// `BLOOMERY_Q3K_SPLIT_ITERS=<T>` sets T, for same-binary A/B arms. Read
+/// once, at first use: the width fixes a captured graph's grid and its bits.
+/// A value that is set but unusable panics rather than falling back.
+pub fn q3k_splits(n_sb: usize) -> usize {
+    let (width, min_iters) = q3k_split_rule();
+    let iters = n_sb.div_ceil(2);
+    if width > 1 && iters >= min_iters && iters.is_multiple_of(width) {
+        width
+    } else {
+        1
+    }
+}
+
+/// The `(W, T)` of [`q3k_splits`], read once.
+fn q3k_split_rule() -> (usize, usize) {
+    static RULE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| {
+        let width = match std::env::var("BLOOMERY_Q3K_SPLIT") {
+            Err(_) => Q3K_SPLIT_WIDTH,
+            Ok(v) => match v.parse::<usize>() {
+                Ok(n @ (1 | 2 | 4 | 8)) => n,
+                _ => panic!("BLOOMERY_Q3K_SPLIT={v} is not 1, 2, 4 or 8"),
+            },
+        };
+        let min_iters = match std::env::var("BLOOMERY_Q3K_SPLIT_ITERS") {
+            Err(_) => Q3K_SPLIT_MIN_ITERS,
+            Ok(v) => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => n,
+                _ => panic!("BLOOMERY_Q3K_SPLIT_ITERS={v} is not a positive iteration count"),
+            },
+        };
+        (width, min_iters)
+    })
 }
 
 impl std::fmt::Display for GpuError {
@@ -436,9 +496,48 @@ pub(crate) unsafe fn q8_1_quant_vals(
 mod kernels {
     use super::*;
     use crate::cores::{
-        funnel16, half_to_f32, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot, q4k_row_dot_1col,
-        q6k_chain, q6k_dequant, q6k_sub_scale,
+        funnel16, half_to_f32, q3k_row_dot, q3k_row_dot_1col, q3k_row_dot_1col_span,
+        q3k_row_dot_cols_span, q4k_row_dot, q4k_row_dot_1col, q6k_chain, q6k_dequant,
+        q6k_sub_scale,
     };
+
+    /// Global thread `g`'s warp in its block, the row that warp serves and
+    /// its split index, for the split-K Q3_K entries: `1 << split_shift` warps
+    /// to a row, consecutive warps, the row's split 0 first.
+    #[inline(always)]
+    fn q3k_split_warp(g: usize, split_shift: u32) -> (usize, usize, u32) {
+        let warp_of = (g % 256) / 32;
+        let sh = split_shift as usize;
+        let row = ((g / 256) << (3 - sh)) + (warp_of >> sh);
+        (warp_of, row, (warp_of & ((1 << sh) - 1)) as u32)
+    }
+
+    /// The split-K fold: the `1 << split_shift` warp sums of one row and one
+    /// column, at `slots[first + s * stride]` for split s, added in split
+    /// order, `((s_0 + s_1) + s_2) + …`, one plain f32 add each. This order is
+    /// the gate.
+    ///
+    /// # Safety
+    ///
+    /// Every `slots.add(first + s * stride)` for `s < 1 << split_shift` is a
+    /// written shared slot the caller's barrier has made visible.
+    #[inline(always)]
+    unsafe fn q3k_split_fold(
+        slots: *const f32,
+        first: usize,
+        stride: usize,
+        split_shift: u32,
+    ) -> f32 {
+        // SAFETY: split 0's slot, by this fn's contract.
+        let mut acc = unsafe { *slots.add(first) };
+        let mut s = 1usize;
+        while s < (1usize << split_shift) {
+            // SAFETY: split s's slot, by this fn's contract.
+            acc += unsafe { *slots.add(first + s * stride) };
+            s += 1;
+        }
+        acc
+    }
 
     // Q3_K packing recap (decode verified against ggml's
     // `dequantize_row_q3_K` in the round-1 kernel at 1e-7):
@@ -1366,6 +1465,213 @@ mod kernels {
             }
         }
     }
+    /// `q3k_gemv` at m = 1 with K split across warps: `1 << split_shift` (2,
+    /// 4 or 8) warps share a row, `8 >> split_shift` rows to a 256-thread
+    /// block, and warp `s` of a row walks the iterations `[s * iters >>
+    /// split_shift, (s + 1) * iters >> split_shift)` in the row walk's own
+    /// per-lane order (`cores::q3k_row_dot_1col_span`). Each warp reduces its
+    /// partial with `q3k_gemv`'s shuffle sum, lane 0 parks it in shared
+    /// memory, and past the block barrier lane 0 of the row's split-0 warp
+    /// adds the splits' sums in split order ([`q3k_split_fold`]). No atomics
+    /// and no scratch: a row's bits are a function of its inputs, `n_sb` and
+    /// the split width alone — not of the grid or the row count. Width 1 is
+    /// `q3k_gemv`, whose single fold this does not reproduce;
+    /// `enqueue_gemv_q3k` owns the choice (`q3k_splits`). The m-column shape
+    /// is [`q3k_gemv_split_mcol`], a separate entry so its column chains do
+    /// not set this one's register count.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes its arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 110 * n_sb,
+            q.len() >= 64 * iters,
+            d8.len() >= 2 * n_sb,
+            y.len() >= n_rows,
+            split_shift >= 1,
+            split_shift <= 3
+        )
+    )]
+    pub fn q3k_gemv_split(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        n_sb: u32,
+        iters: u32,
+        split_shift: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        // One reduced partial per warp.
+        static mut PART: SharedArray<f32, 8> = SharedArray::UNINIT;
+
+        let (warp_of, row, split) = q3k_split_warp(thread::index_1d().get(), split_shift);
+        // Warp-uniform: a warp past the last row walks nothing but still
+        // reaches the barrier below.
+        let live = row < n_rows as usize;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: PART is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every index is a warp index < 8, and the barrier orders each warp's
+        // store before the reads.
+        let part = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PART) };
+        if live {
+            let it0 = (split * iters) >> split_shift;
+            let it1 = ((split + 1) * iters) >> split_shift;
+            let f0 = q3k_row_dot_1col_span(w, q, d8, n_sb as usize, iters, row, 0, lane, it0, it1);
+            let s0 = warp::reduce_sum_f32(f0);
+            if lane == 0 {
+                // SAFETY: warp_of < 8; one lane per warp writes its own slot.
+                unsafe {
+                    *part.add(warp_of) = s0;
+                }
+            }
+        }
+        thread::sync_threads();
+        if live && split == 0 && lane == 0 {
+            // SAFETY: slots warp_of .. warp_of + (1 << split_shift) are this
+            // row's warps, all < 8 and written before the barrier.
+            let v = unsafe { q3k_split_fold(part, warp_of, 1, split_shift) };
+            // SAFETY: only this lane writes y[row], row < n_rows <= y.len().
+            unsafe {
+                *y.get_unchecked_mut(row) = v;
+            }
+        }
+    }
+
+    /// [`q3k_gemv_split`] with `m_cols` (2..=8) activation columns: the same
+    /// geometry, every column folded over each warp's range by
+    /// `cores::q3k_row_dot_cols_span` — which is the single-column span on
+    /// that column bit for bit — reduced per column, parked in shared memory
+    /// and added in split order by the same [`q3k_split_fold`]. So column c
+    /// of an m-column launch is [`q3k_gemv_split`] on column c.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes its arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_rows * 110 * n_sb,
+            q.len() >= m_cols * 64 * iters,
+            d8.len() >= m_cols * 2 * n_sb,
+            y.len() >= n_rows * m_cols,
+            m_cols <= 8,
+            split_shift >= 1,
+            split_shift <= 3
+        )
+    )]
+    pub fn q3k_gemv_split_mcol(
+        w: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        n_rows: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        split_shift: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        // One reduced partial per (warp, column): 8 warps x 8 columns.
+        static mut PART: SharedArray<f32, 64> = SharedArray::UNINIT;
+
+        let (warp_of, row, split) = q3k_split_warp(thread::index_1d().get(), split_shift);
+        // Warp-uniform: a warp past the last row walks nothing but still
+        // reaches the barrier below.
+        let live = row < n_rows as usize;
+        let lane = warp::lane_id() as usize;
+        let m = m_cols as usize;
+        // SAFETY: PART is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every index is `warp_of * 8 + c` with warp_of < 8 and c < 8, and
+        // the barrier orders each warp's stores before the reads.
+        let part = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PART) };
+        if live {
+            let it0 = (split * iters) >> split_shift;
+            let it1 = ((split + 1) * iters) >> split_shift;
+            let f =
+                q3k_row_dot_cols_span(w, q, d8, n_sb as usize, iters, row, 0, 1, m, lane, it0, it1);
+            // Column c's reduction runs only when m > c; `m` is launch-wide,
+            // so every lane takes the same branch and the shuffles stay
+            // warp-collective.
+            let s0 = warp::reduce_sum_f32(f[0]);
+            let s1 = if m > 1 {
+                warp::reduce_sum_f32(f[1])
+            } else {
+                0.0
+            };
+            let s2 = if m > 2 {
+                warp::reduce_sum_f32(f[2])
+            } else {
+                0.0
+            };
+            let s3 = if m > 3 {
+                warp::reduce_sum_f32(f[3])
+            } else {
+                0.0
+            };
+            let s4 = if m > 4 {
+                warp::reduce_sum_f32(f[4])
+            } else {
+                0.0
+            };
+            let s5 = if m > 5 {
+                warp::reduce_sum_f32(f[5])
+            } else {
+                0.0
+            };
+            let s6 = if m > 6 {
+                warp::reduce_sum_f32(f[6])
+            } else {
+                0.0
+            };
+            let s7 = if m > 7 {
+                warp::reduce_sum_f32(f[7])
+            } else {
+                0.0
+            };
+            if lane == 0 {
+                let b = warp_of * 8;
+                // SAFETY: b + 7 < 64; one lane per warp writes its own eight
+                // slots (those past m are never read).
+                unsafe {
+                    *part.add(b) = s0;
+                    *part.add(b + 1) = s1;
+                    *part.add(b + 2) = s2;
+                    *part.add(b + 3) = s3;
+                    *part.add(b + 4) = s4;
+                    *part.add(b + 5) = s5;
+                    *part.add(b + 6) = s6;
+                    *part.add(b + 7) = s7;
+                }
+            }
+        }
+        thread::sync_threads();
+        if live && split == 0 && lane == 0 {
+            let b = row * m;
+            let mut c = 0usize;
+            while c < m {
+                // SAFETY: the row's warps' slots (warp_of + s) * 8 + c, all
+                // < 64 and written before the barrier.
+                let v = unsafe { q3k_split_fold(part.add(c), warp_of * 8, 8, split_shift) };
+                // SAFETY: only this lane writes y[row*m .. row*m+m], and
+                // row < n_rows with y.len() >= n_rows*m by the contract.
+                unsafe {
+                    *y.get_unchecked_mut(b + c) = v;
+                }
+                c += 1;
+            }
+        }
+    }
+
     /// Q3_K gemv over expert slots selected on the device (the MoE decode
     /// shape): one launch computes `n_slots` experts of a resident flat
     /// stack — `n_experts * rows_per_expert` rows of `110 * n_sb` bytes —
@@ -1967,8 +2273,9 @@ impl Gpu {
     /// `110 * n_sb / 4` words a row for even n_sb; an odd n_sb starts every
     /// other row on a half word, which the row walk's byte addressing reads)
     /// — against the quantized activations in `act`, which supply K. `y`
-    /// holds `rows * m` f32, row-major with `m` outputs per row.
-    /// Asynchronous, allocation-free, capturable.
+    /// holds `rows * m` f32, row-major with `m` outputs per row. The launch
+    /// is `q3k_gemv`, or `q3k_gemv_split` (`_mcol` at m > 1) when
+    /// [`q3k_splits`] splits rows of this K. Asynchronous, allocation-free, capturable.
     pub fn enqueue_gemv_q3k(
         &self,
         w: &DeviceTensor<u32>,
@@ -1998,22 +2305,60 @@ impl Gpu {
         let what = "enqueue_gemv_q3k";
         let n_rows = launch_u32(what, "n_rows", n_rows)?;
         let m = launch_u32(what, "m", m)?;
+        let splits = q3k_splits(n_sb);
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_q3k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
-        self.module.q3k_gemv(
-            &self.stream,
-            &prep,
-            w.buf(),
-            &act.q3,
-            &act.d8,
-            n_rows,
-            m,
-            n_sb,
-            n_sb.div_ceil(2),
-            y,
-        )?;
+        let iters = n_sb.div_ceil(2);
+        if splits == 1 {
+            let prep =
+                self.module
+                    .prepare_q3k_gemv(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+            self.module.q3k_gemv(
+                &self.stream,
+                &prep,
+                w.buf(),
+                &act.q3,
+                &act.d8,
+                n_rows,
+                m,
+                n_sb,
+                iters,
+                y,
+            )?;
+        } else {
+            let split_shift = splits.trailing_zeros();
+            let rows_per_block = launch_u32(what, "rows_per_block", 8 / splits)?;
+            let grid = LaunchConfig1D::new(n_rows.div_ceil(rows_per_block), 256, 0);
+            if m == 1 {
+                let prep = self.module.prepare_q3k_gemv_split(grid)?;
+                self.module.q3k_gemv_split(
+                    &self.stream,
+                    &prep,
+                    w.buf(),
+                    &act.q3,
+                    &act.d8,
+                    n_rows,
+                    n_sb,
+                    iters,
+                    split_shift,
+                    y,
+                )?;
+            } else {
+                let prep = self.module.prepare_q3k_gemv_split_mcol(grid)?;
+                self.module.q3k_gemv_split_mcol(
+                    &self.stream,
+                    &prep,
+                    w.buf(),
+                    &act.q3,
+                    &act.d8,
+                    n_rows,
+                    m,
+                    n_sb,
+                    iters,
+                    split_shift,
+                    y,
+                )?;
+            }
+        }
         Ok(())
     }
 

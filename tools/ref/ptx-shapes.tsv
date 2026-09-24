@@ -96,6 +96,8 @@ generate_ds41   q3k_gemv                                0          0
 generate_ds41   q3k_gemv_heads                          0          0
 generate_ds41   q3k_gemv_heads_pair                     0          0
 generate_ds41   q3k_gemv_sel                            0          0
+generate_ds41   q3k_gemv_split                          0          0
+generate_ds41   q3k_gemv_split_mcol                     0          0
 generate_ds41   q3k_quantize_q8_1                       0          0
 generate_ds41   q3k_quantize_q8_1_pair                  0          0
 generate_ds41   q4k_gemv                                0          0
@@ -180,6 +182,8 @@ gate_e2e        q3k_gemv                                0          0
 gate_e2e        q3k_gemv_heads                          0          0
 gate_e2e        q3k_gemv_heads_pair                     0          0
 gate_e2e        q3k_gemv_sel                            0          0
+gate_e2e        q3k_gemv_split                          0          0
+gate_e2e        q3k_gemv_split_mcol                     0          0
 gate_e2e        q3k_quantize_q8_1                       0          0
 gate_e2e        q3k_quantize_q8_1_pair                  0          0
 gate_e2e        q4k_gemv                                0          0

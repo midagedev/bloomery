@@ -463,6 +463,14 @@ the A6000 under the 3090's usable bytes plans the gate placement slot for slot, 
 a 38 GB card is emulated for timing; a budget below the card's floor (dense granules + KV + context +
 scratch + margin) is refused with each term; `M`/`G` are binary units; `generate_ds41` prints it as
 `card_budget=` on the plan line),
+`BLOOMERY_Q3K_SPLIT=1|2|4|8` (gpu `enqueue_gemv_q3k`, default 1: the split-K width for a
+Q3_K row whose walk has at least `BLOOMERY_Q3K_SPLIT_ITERS` (default 16) two-super-block
+iterations that the width divides — on V4.1 only `wo_b`, K = 8192 — through `q3k_gemv_split`
+(`_mcol` at m > 1); a function of `n_sb` alone so a joined launch, a row-capped upload and an
+m-column pass write the same bits; the default is unsplit and bit-identical to the plain kernel,
+and 2 is the same-binary A/B arm — the split's fold order moves the greedy trajectory, so it is
+not a default until a lease A/B resolves its predicted −60…−150 µs per step; an unusable value
+panics by name),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
