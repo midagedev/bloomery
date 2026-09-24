@@ -11,6 +11,18 @@ Hybrid GPU + CPU inference for mixture-of-experts models, written in Rust down t
 
 bloomery runs mixture-of-experts models that do not fit on one GPU. Each routed layer keeps as many of its experts on the card as fit, and the rest run on the CPU inside the same decode step. The host code is Rust, the GPU kernels are CUDA written in Rust ([cuda-oxide](https://github.com/NVlabs/cuda-oxide)), and the CPU expert kernels are AVX2 Rust. Today it runs DeepSeek-V4.1-Flash on one GPU with an eight-channel CPU and 256 GB of RAM (see [Target hardware](#target-hardware)).
 
+## Models
+
+The files below are the ones the gates and the numbers use; each is byte-identical (sha256) to the upload linked.
+
+| Model | File | Runs as | Checked by |
+|---|---|---|---|
+| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | [`Q3_K_M`, 9 shards](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | one GPU + CPU experts: `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | step, skewed pass, load, draft, chat and server gates; per-op reference gates (being ported from the Q8_0 mix) |
+| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | the whole model on one GPU: `generate_qwen3moe` | per-kernel gates and an end-to-end gate (greedy tokens, PPL/KLD against the reference) |
+| [DeepSeek-V2-Lite-Chat](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat) | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU (`bloomery-decode`) and GPU | the engine's first model; every subsystem gate |
+
+In progress: [DeepSeek-V4-Flash-0731](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF), and the [DSpark draft](https://huggingface.co/JigSawPT/DeepSeek-V4.1-Flash-DSpark-GGUF) for V4.1 speculative decoding.
+
 ## What it does
 
 V4.1-Flash does not fit on one consumer card, so each decode step is split across the machine:
