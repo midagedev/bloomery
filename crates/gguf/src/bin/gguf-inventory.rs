@@ -177,6 +177,17 @@ fn type_str(id: u32) -> String {
     }
 }
 
+/// Whether the engine's `GgmlType` names type `id` at all.
+fn in_engine_type(id: u32) -> bool {
+    !matches!(GgmlType::from_u32(id), GgmlType::Unknown(_))
+}
+
+/// Whether the crate can decode type `id` to f32: the check `dequant_row`
+/// itself makes before it dispatches.
+fn has_decoder(id: u32) -> bool {
+    GgmlType::from_u32(id).has_dequant()
+}
+
 fn main() -> ExitCode {
     let mut md_path: Option<String> = None;
     let mut paths: Vec<String> = Vec::new();
@@ -379,21 +390,21 @@ fn main() -> ExitCode {
 
     out.push_str("types:\n");
     for (id, (count, bytes, unknown)) in &types {
-        let lacks = matches!(GgmlType::from_u32(*id), GgmlType::Unknown(_));
         out.push_str(&format!(
-            "  #{id:<3} {:<9} x{:<5} {:>15} bytes{}{}\n",
+            "  #{id:<3} {:<9} x{:<5} {:>15} bytes  dequant {:<3}{}{}\n",
             type_str(*id),
             count,
             commas(*bytes),
+            if has_decoder(*id) { "yes" } else { "no" },
             if *unknown > 0 {
                 format!(" (+{unknown} unknown size)")
             } else {
                 String::new()
             },
-            if lacks {
-                "  [absent from GgmlType]"
-            } else {
+            if in_engine_type(*id) {
                 ""
+            } else {
+                "  [absent from GgmlType]"
             },
         ));
     }
@@ -582,18 +593,20 @@ fn main() -> ExitCode {
         ));
 
         m.push_str("## types\n\n");
-        m.push_str("| id | type | tensors | bytes | unknown_size | in engine GgmlType |\n");
-        m.push_str("|---|---|---:|---:|---:|---|\n");
+        m.push_str(
+            "| id | type | tensors | bytes | unknown_size | in engine GgmlType | dequant |\n",
+        );
+        m.push_str("|---|---|---:|---:|---:|---|---|\n");
         for (id, (count, bytes, unknown)) in &types {
-            let lacks = matches!(GgmlType::from_u32(*id), GgmlType::Unknown(_));
             m.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
                 id,
                 type_str(*id),
                 count,
                 commas(*bytes),
                 unknown,
-                if lacks { "no" } else { "yes" },
+                if in_engine_type(*id) { "yes" } else { "no" },
+                if has_decoder(*id) { "yes" } else { "no" },
             ));
         }
 
@@ -716,4 +729,65 @@ fn main() -> ExitCode {
         eprintln!("markdown written to {md}");
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_decoder, in_engine_type};
+    use gguf::quant::{GgmlType, dequant_row};
+
+    /// V4.1's first shard, unless `BLOOMERY_V41_MODEL` names another.
+    const MODEL_V41: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
+    /// The type ids V4.1's first shard carries that the crate decodes.
+    const V41_DECODABLE: usize = 6;
+
+    /// The `dequant` column is the dispatch's own answer: every id in ggml's
+    /// range reads `yes` exactly when `dequant_row` decodes one block of it.
+    #[test]
+    fn dequant_column_is_what_dequant_row_accepts() {
+        let wrong: Vec<String> = (0..64u32)
+            .filter_map(|id| {
+                let ty = GgmlType::from_u32(id);
+                let blck = ty.blck_size().map_or(1, |b| b.max(1)) as usize;
+                let tsz = ty.type_size().unwrap_or(1) as usize;
+                let decodes = dequant_row(ty, &vec![0u8; tsz], &mut vec![0.0f32; blck]).is_ok();
+                (decodes != has_decoder(id)).then(|| {
+                    format!(
+                        "#{id} {ty}: dequant_row {decodes}, column {}",
+                        has_decoder(id)
+                    )
+                })
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// V4.1's first shard header: how many of its type ids the crate decodes.
+    #[test]
+    #[ignore = "reads the V4.1 first shard's header on the box"]
+    fn hw_v41_shard_decodable_types() {
+        let path = std::env::var("BLOOMERY_V41_MODEL").unwrap_or_else(|_| MODEL_V41.to_string());
+        let inv = gguf::inventory_of(std::path::Path::new(&path))
+            .unwrap_or_else(|e| panic!("inventory of {path}: {e}"));
+        let ids: std::collections::BTreeSet<u32> = inv.tensors.iter().map(|t| t.type_id).collect();
+        let rows: Vec<String> = ids
+            .iter()
+            .map(|&id| {
+                format!(
+                    "#{id} {} engine={} dequant={}",
+                    GgmlType::from_u32(id),
+                    in_engine_type(id),
+                    has_decoder(id)
+                )
+            })
+            .collect();
+        println!("v41 shard types: {}", rows.join("; "));
+        let decodable = ids.iter().filter(|&&id| has_decoder(id)).count();
+        assert_eq!(
+            decodable,
+            V41_DECODABLE,
+            "decodable type ids on {path} ({} ids)",
+            ids.len()
+        );
+    }
 }

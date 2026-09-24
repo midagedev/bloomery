@@ -796,4 +796,22 @@ mod tests {
             }
         }
     }
+
+    /// A broken table that reaches the engine is `ModelError::Metadata` naming
+    /// the ratios key, with the walk's own text.
+    #[test]
+    fn a_broken_table_is_a_model_metadata_error() {
+        let (carries, mut ratios) = served();
+        ratios[1] = 2;
+        let Err(e) = walk_streams(RATIOS_KEY, &carries, &ratios) else {
+            panic!("a ratio of 2 at layer 1 walked");
+        };
+        let text = e.to_string();
+        let m = crate::ModelError::from(e);
+        assert_eq!(m.to_string(), text, "the conversion keeps the walk's text");
+        assert!(
+            matches!(&m, crate::ModelError::Metadata { key, .. } if key == RATIOS_KEY),
+            "expected ModelError::Metadata for the ratios key, got {m:?}"
+        );
+    }
 }

@@ -41,6 +41,7 @@ mod gate {
     use bloomery_gpu_deepseek41::markov::{
         MARKOV_RANK, MARKOV_ROW_WORDS, MarkovKernels, MarkovWeights,
     };
+    use bloomery_gpu_gates::hc_host::{self, exp_ours, hc_pre_f32};
     use bloomery_gpu_gates::rounding::butterfly;
     use bloomery_gpu_gates::{
         GateError, bits_equal, bytes_to_words, checks_failed, data_dir, dump_stem, verdict,
@@ -59,6 +60,8 @@ mod gate {
     const CORPUS_IDS: usize = 64;
     /// Rows of the chained Markov check (the dsref set's block width).
     const CHAIN: usize = 3;
+    // The host rule's layout is the kernel's.
+    const _: () = assert!(hc_host::HC_MIX == HC_MIX);
 
     // ------------------------------------------------------------ the file
 
@@ -127,60 +130,6 @@ mod gate {
 
     // ---------------------------------------------- HC_PRE, the host rule
 
-    /// `crate::hc`'s `hc_pre_lane` on the host (the V4.1 HC gate's
-    /// transcription with `exp` in f64 rounded to f32): pre, post, comb.
-    fn hc_pre_host(mix: &[f32], sc: [f32; 3], base: &[f32], eps: f32, iters: u32) -> [f32; HC_MIX] {
-        let exp = |x: f32| f64::from(x).exp() as f32;
-        let sigmoid = |i: usize, s: f32| 1.0f32 / (1.0 + exp(-mix[i].mul_add(s, base[i])));
-        let mut out = [0.0f32; HC_MIX];
-        for i in 0..4 {
-            out[i] = sigmoid(i, sc[0]) + eps;
-            out[4 + i] = 2.0 * sigmoid(4 + i, sc[1]);
-        }
-        let mut m = [0.0f32; 16];
-        for (k, mk) in m.iter_mut().enumerate() {
-            *mk = mix[8 + k].mul_add(sc[2], base[8 + k]);
-        }
-        for row in m.as_chunks_mut::<4>().0 {
-            let mut mx = row[0];
-            for &x in &row[1..] {
-                mx = if mx > x { mx } else { x };
-            }
-            let mut sum = 0.0f32;
-            for v in row.iter_mut() {
-                *v = exp(*v - mx);
-                sum += *v;
-            }
-            for v in row.iter_mut() {
-                *v = *v / sum + eps;
-            }
-        }
-        let col = |m: &mut [f32; 16]| {
-            let mut s = [eps; 4];
-            for (c, sc) in s.iter_mut().enumerate() {
-                *sc = (((*sc + m[c]) + m[4 + c]) + m[8 + c]) + m[12 + c];
-            }
-            for (k, v) in m.iter_mut().enumerate() {
-                *v /= s[k % 4];
-            }
-        };
-        let row = |m: &mut [f32; 16]| {
-            for r in m.as_chunks_mut::<4>().0 {
-                let s = (((eps + r[0]) + r[1]) + r[2]) + r[3];
-                for v in r.iter_mut() {
-                    *v /= s;
-                }
-            }
-        };
-        col(&mut m);
-        for _ in 1..iters {
-            row(&mut m);
-            col(&mut m);
-        }
-        out[8..].copy_from_slice(&m);
-        out
-    }
-
     /// One lane's `f32_gemv` partial: `x[32*it + lane] * w[32*it + lane]` by
     /// `mul_add` from 0, `it` ascending.
     fn gemv_lane(w: &[f32], x: &[f32], lane: usize) -> f32 {
@@ -223,7 +172,7 @@ mod gate {
                     butterfly(std::array::from_fn(|lane| gemv_lane(w, xt, lane))) * scale
                 })
                 .collect();
-            hc.extend(hc_pre_host(&mix, sc, &p.base, eps, iters));
+            hc.extend(hc_pre_f32(&mix, sc, &p.base, eps, iters, exp_ours));
             mixes.extend(mix);
         }
         (mixes, hc)
@@ -660,12 +609,13 @@ mod gate {
                 let iters = u32::try_from(cx.hp.hc.sinkhorn_iters)?;
                 let own: Vec<f32> = (0..t)
                     .flat_map(|tt| {
-                        hc_pre_host(
+                        hc_pre_f32(
                             &im[tt * 24..tt * 24 + 24],
                             [attn.scale[0], attn.scale[1], attn.scale[2]],
                             &attn.base,
                             cx.hp.hc.eps,
                             iters,
+                            exp_ours,
                         )
                     })
                     .collect();

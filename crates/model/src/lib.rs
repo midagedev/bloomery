@@ -59,4 +59,24 @@ pub enum ModelError {
     Quant(#[from] gguf::QuantError),
     #[error(transparent)]
     Qdot(#[from] qdot::QdotError),
+    /// A metadata key the file lacks, holds in the wrong type, or sets to a
+    /// value this engine does not run: the full key and why.
+    #[error("metadata {key}: {detail}")]
+    Metadata { key: String, detail: String },
+    /// A refusal of the placement layer that is not a metadata key's.
+    #[error(transparent)]
+    Placement(placement::PlacementError),
+}
+
+/// A hyperparameter reader's metadata refusal stays a metadata error; every
+/// other placement refusal keeps its own variant and text.
+impl From<placement::PlacementError> for ModelError {
+    fn from(e: placement::PlacementError) -> ModelError {
+        match e {
+            placement::PlacementError::Metadata { key, detail } => {
+                ModelError::Metadata { key, detail }
+            }
+            other => ModelError::Placement(other),
+        }
+    }
 }

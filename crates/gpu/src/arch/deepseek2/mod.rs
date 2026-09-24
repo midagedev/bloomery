@@ -483,18 +483,18 @@ fn derive_blocks(
 // file's, and no budget is planned.
 
 /// Every tensor of `file` in a block of `layers` or in no block, with its
-/// role, and the model's layer and expert counts.
+/// role, and the model's layer and expert counts as [`Hparams`] reads them.
 fn hybrid_tensors(file: &Split, layers: &Range<usize>) -> Result<ModelTensors, GpuError> {
     let what = "Body::hybrid_weights";
     let g = file
         .shard(0)
         .ok_or(GpuError::state(what, "the file has no shard 0"))?;
-    let count = |v: Option<u64>, key: &'static str| -> Result<u64, GpuError> {
-        v.ok_or(GpuError::metadata(what, key))
+    let hp = Hparams::read(g).map_err(|e| GpuError::plan(what, e))?;
+    let as_u64 = |n: usize, key: &str| {
+        u64::try_from(n).map_err(|_| GpuError::shape(what, format!("{key} {n} passes u64")))
     };
-    let n_layers = count(g.block_count(), "block_count")?;
-    let experts = count(g.expert_count(), "expert_count")?;
-    let experts_used = count(g.arch_get_u64("expert_used_count"), "expert_used_count")?;
+    let experts = as_u64(hp.experts.n_expert, "expert_count")?;
+    let experts_used = as_u64(hp.experts.n_used, "expert_used_count")?;
     let mut tensors = Vec::new();
     for (shard, t) in file.iter_tensors() {
         let layer = block_of(&t.name);
@@ -514,8 +514,7 @@ fn hybrid_tensors(file: &Split, layers: &Range<usize>) -> Result<ModelTensors, G
     }
     Ok(ModelTensors {
         tensors,
-        layers: usize::try_from(n_layers)
-            .map_err(|_| GpuError::shape(what, format!("block_count {n_layers}")))?,
+        layers: hp.n_layer,
         experts,
         experts_used,
     })

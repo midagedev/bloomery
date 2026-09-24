@@ -68,6 +68,7 @@ mod gate {
     use bloomery_gpu_deepseek41::hc::{
         HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs, HcPreScratch,
     };
+    use bloomery_gpu_gates::hc_host::{self, exp_ik, exp_ours, hc_pre_f32};
     use bloomery_gpu_gates::ik_norm;
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1_UNFUSED, D2, D2_UNFUSED, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -86,6 +87,8 @@ mod gate {
     const STEP_SETS: [&str; 5] = [STEP4, D1, D1_UNFUSED, D2, D2_UNFUSED];
     /// Bytes of one q3_K super-block.
     const Q3K_SB: usize = 110;
+    // The host rule's layout is the kernels'.
+    const _: () = assert!(hc_host::HC_STREAMS == HC_STREAMS && hc_host::HC_MIX == HC_MIX);
 
     /// The file's hyper-connection hyperparameters.
     struct Hp {
@@ -150,84 +153,6 @@ mod gate {
             d.push(amax / 127.0);
         }
         (q, d)
-    }
-
-    /// Divide every comb entry of a row by `eps` plus the row, the sum in
-    /// column order.
-    fn row_norm(m: &mut [f32; 16], eps: f32) {
-        for row in m.as_chunks_mut::<4>().0 {
-            let s = (((eps + row[0]) + row[1]) + row[2]) + row[3];
-            for v in row.iter_mut() {
-                *v /= s;
-            }
-        }
-    }
-
-    /// Divide every comb entry of a column by `eps` plus the column, the sum
-    /// in row order.
-    fn col_norm(m: &mut [f32; 16], eps: f32) {
-        let mut s = [eps; 4];
-        for (c, sc) in s.iter_mut().enumerate() {
-            *sc = (((*sc + m[c]) + m[4 + c]) + m[8 + c]) + m[12 + c];
-        }
-        for (k, v) in m.iter_mut().enumerate() {
-            *v /= s[k % 4];
-        }
-    }
-
-    /// HC_PRE of one token (`ggml_compute_forward_hc_pre_f32`, the affine as
-    /// the fused multiply-add ik's build makes of it) with `exp` supplied:
-    /// glibc's `expf` is ik's, f64 rounded is ours. Output in the kernel's
-    /// layout: pre, post, comb.
-    fn hc_pre_f32(
-        mix: &[f32],
-        sc: [f32; 3],
-        base: &[f32],
-        eps: f32,
-        iters: u32,
-        exp: fn(f32) -> f32,
-    ) -> [f32; HC_MIX] {
-        let sigmoid = |i: usize, s: f32| 1.0f32 / (1.0 + exp(-mix[i].mul_add(s, base[i])));
-        let mut out = [0.0f32; HC_MIX];
-        let (head, comb) = out.split_at_mut(2 * HC_STREAMS);
-        let (pre, post) = head.split_at_mut(HC_STREAMS);
-        for (i, (p, q)) in pre.iter_mut().zip(post.iter_mut()).enumerate() {
-            *p = sigmoid(i, sc[0]) + eps;
-            *q = 2.0 * sigmoid(HC_STREAMS + i, sc[1]);
-        }
-        let mut m = [0.0f32; 16];
-        for (k, mk) in m.iter_mut().enumerate() {
-            *mk = mix[8 + k].mul_add(sc[2], base[8 + k]);
-        }
-        for row in m.as_chunks_mut::<4>().0 {
-            let mut mx = row[0];
-            for &x in &row[1..] {
-                mx = if mx > x { mx } else { x };
-            }
-            let mut sum = 0.0f32;
-            for v in row.iter_mut() {
-                *v = exp(*v - mx);
-                sum += *v;
-            }
-            for v in row.iter_mut() {
-                *v = *v / sum + eps;
-            }
-        }
-        col_norm(&mut m, eps);
-        for _ in 1..iters {
-            row_norm(&mut m, eps);
-            col_norm(&mut m, eps);
-        }
-        comb.copy_from_slice(&m);
-        out
-    }
-
-    fn exp_ik(x: f32) -> f32 {
-        x.exp()
-    }
-
-    fn exp_ours(x: f32) -> f32 {
-        f64::from(x).exp() as f32
     }
 
     /// HC_PRE in f64 throughout: the reference the chain's bound is carried

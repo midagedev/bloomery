@@ -394,4 +394,24 @@ mod tests {
             .collect();
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
+
+    /// A refusal that reaches the engine is `ModelError::Metadata`, naming the
+    /// key, with the reader's own text.
+    #[test]
+    fn a_refusal_is_a_model_metadata_error() {
+        let e = Hparams::from_meta(&with("attention.q_lora_rank", Value::U32(768)))
+            .expect_err("q_lora_rank is refused");
+        let text = e.to_string();
+        let m = crate::ModelError::from(e);
+        assert_eq!(
+            m.to_string(),
+            text,
+            "the conversion keeps the reader's text"
+        );
+        assert!(
+            matches!(&m, crate::ModelError::Metadata { key, .. }
+                if key == "deepseek2.attention.q_lora_rank"),
+            "expected ModelError::Metadata for q_lora_rank, got {m:?}"
+        );
+    }
 }

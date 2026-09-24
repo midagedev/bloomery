@@ -121,14 +121,43 @@ BIN="$BLOOMERY_DATA/bin/dump_ref"
 # another ik tree would write that tree's answer under this tree's name. It must load both libraries
 # from $IK's build.
 IK_REAL=$(readlink -f "$IK")
+LIBS=()
 for lib in libllama.so libggml.so; do
   got=$(ldd "$BIN" 2>/dev/null | awk -v l="$lib" '$1 == l { print $3 }' || true)
   case $(readlink -f "$got" 2>/dev/null) in
-    "$IK_REAL"/build/*) ;;
+    "$IK_REAL"/build/*) LIBS+=("$(readlink -f "$got")") ;;
     *) echo "[foreign-lib] $BIN loads $lib from '${got:-nowhere}', not from $IK/build —" \
          "rebuild it: IK=$IK bash tools/ref/build-dump.sh" >&2; exit 3 ;;
   esac
 done
+# The binary must be this tree's dump_ref.cpp, and no older than the ik libraries it loads. The
+# source is compared by the sha256 build-dump.sh records beside the binary, not by mtime: tools/box.sh
+# gives every file it transfers the box's own "now", so a fresh track tree is newer than any binary.
+# timing-card.sh's assert_fresh_binary is not reused: it compares against crates/ sources, which
+# dump_ref is not built from. Same wording and rc 3 as that refusal.
+SRC="${BASH_SOURCE[0]%/*}/dump_ref.cpp"
+BUILD_REC="$BIN.build"
+BIN_SHA=$(sha256sum "$BIN" | cut -c1-12)
+BIN_MTIME=$(date -u -r "$BIN" +%Y-%m-%dT%H:%M:%SZ)
+SRC_SHA=$(sha256sum "$SRC" | cut -d' ' -f1)
+REC_SHA=$(awk '$1 == "source_sha256" { print $2 }' "$BUILD_REC" 2>/dev/null || true)
+stale=()
+if [ -z "$REC_SHA" ]; then
+  stale+=("$SRC: no build record at $BUILD_REC")
+elif [ "$REC_SHA" != "$SRC_SHA" ]; then
+  stale+=("$SRC (sha256 ${SRC_SHA:0:12}; the binary was built from ${REC_SHA:0:12})")
+fi
+for lib in "${LIBS[@]}"; do
+  if [ "$lib" -nt "$BIN" ]; then stale+=("$lib (mtime $(date -u -r "$lib" +%Y-%m-%dT%H:%M:%SZ))"); fi
+done
+if [ ${#stale[@]} -gt 0 ]; then
+  echo "[stale-binary] $BIN (sha256 $BIN_SHA, mtime $BIN_MTIME) is older than its sources:" >&2
+  printf '    %s\n' "${stale[@]}" >&2
+  echo "    rebuild it with IK=$IK bash tools/ref/build-dump.sh (just build-ref-dump) and rerun; a set" \
+    "dumped by this one would be a wrong answer, not a missing one." >&2
+  exit 3
+fi
+echo "[binary] $BIN sha256=$BIN_SHA mtime=$BIN_MTIME (dump_ref.cpp sha256 ${SRC_SHA:0:12})"
 
 # The machine state the lease is supposed to guarantee: read-sectors is the model file's device, so
 # the difference between the two blocks is what this dump paged in.
