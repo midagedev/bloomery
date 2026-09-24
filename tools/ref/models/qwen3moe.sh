@@ -21,9 +21,20 @@
 #                   the whole 18.6 GB file. Not overridable from here.
 #   ref_step_variant  the decode-step variants, below
 #
-# Deliberately unset: IK_BEST_FLAGS, IK_GPU_FLAGS and REF_PROMPTS. No flag sweep and no prompt set
-# exist for this model yet, and every script that reads them runs under `set -u`, so such a script
-# stops at the unset name instead of running ik at flags nobody measured.
+#   IK_GPU_FLAGS    ik's decode with the whole model on the timing card, the `ik:<D>` arms of
+#                   depth-qwen3moe.sh
+#   IK_GPU_DEFAULT_FLAGS  the same at llama-bench's defaults, the `ikdef:<D>` arms: the two merges
+#                   in IK_GPU_FLAGS are opt-in, and the interleaved pair says which set is faster
+#   LCPP            the mainline llama.cpp tree the `lcpp:<D>` arms run; LCPPBIN moves its llama-bench
+#                   alone, as IKBIN does ik's
+#   LCPP_GPU_FLAGS  mainline's decode with the whole model on the timing card, the `lcpp:<D>` arms.
+#                   Both flag sets are chosen by reading each tree's CLI and docs; no flag sweep has
+#                   been run, so a row is "at these flags". depth-qwen3moe.sh's header gives each
+#                   flag's reason and the flags left out.
+#
+# Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
+# this model yet, and every script that reads them runs under `set -u`, so such a script stops at
+# the unset name instead of running ik at flags nobody measured.
 #
 # SC2034: every name here is read by the file that sources this one, which shellcheck does not
 # see from this file alone.
@@ -40,6 +51,11 @@ MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4
 # Changing them invalidates the whole set.
 REF_TOKENS=785,6722,315,9625,374
 REF_DUMP_LEASE=1
+: "${IK_GPU_FLAGS:=-ngl 99 -fa 1 -fmoe 1 -mqkv 1 -muge 1}"
+: "${IK_GPU_DEFAULT_FLAGS:=-ngl 99}"
+: "${LCPP:=/home/user/llama.cpp-v41}"
+: "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+: "${LCPP_GPU_FLAGS:=-ngl 99 -fa on}"
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-qwen3moe <variant>`): one decode step
 # dumped after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh
