@@ -310,7 +310,7 @@
 
 | id | 무엇 (path) | 실측 | 이득[유도] | 클래스 · 증명 | 크기 | 처분 |
 |---|---|---|---|---|---|---|
-| R1 | 라우터 `router.rs:125-143`·`q8f32.rs:170-194` — 행마다 warp 하나, lane당 8원소 펼침 → k=5120 직렬 20반복, f32 상주(bf16의 2배) | 21.56 µs × 40 = 862 µs, 전부 임계, 365 GB/s | 적재 폭 32 + 4-warp 96블록: ~8 µs → −0.4…−0.55 ms. bf16 상주는 이득 대부분이 폭에서 오므로 뒤 | 비트 동일(bf16→f32 정확, FMA 순서 그대로) · 라우터 게이트 핀, `sass-scan` 첫 대기 전 LDG ≥ 32, A/B 1회. `f32_lane_partial_1col`은 V2-Lite `f32_gemv`와 공유 — 넓은 형제를 두거나 V2-Lite 핀이 서는 것을 증명. 32 w + 32 x는 누산기 전 64 regs — ptxas 점유율을 스펙에 | S | **`ds41router`** (M2 `dflash_router` 사본 `experts_mxfp4.rs:482-650`을 같이, A3·N1 동봉) |
+| R1 | 라우터 `router.rs:125-143`·`q8f32.rs:170-194` — 행마다 warp 하나, lane당 8원소 펼침 → k=5120 직렬 20반복, f32 상주(bf16의 2배) | 21.56 µs × 40 = 862 µs, 전부 임계, 365 GB/s | 적재 폭 32 + 4-warp 96블록: ~~~8 µs → −0.4…−0.55 ms~~ 정정(ds41router, 09-24 밤): 8 µs는 f32 7.86 MB의 바이트 바닥(10.2 µs @768 GB/s) 아래다; ptxas가 32적재 묶음을 ~24깊이 창으로 바꿔 lane당 동시 ~12청크 → ~15 µs, **−0.26 ms[유도]**. 다음은 bf16 상주(B8) 또는 벡터 적재+셔플 | 비트 동일(bf16→f32 정확, FMA 순서 그대로) · 라우터 게이트 핀, `sass-scan` 첫 대기 전 LDG ≥ 32, A/B 1회. `f32_lane_partial_1col`은 V2-Lite `f32_gemv`와 공유 — 넓은 형제를 두거나 V2-Lite 핀이 서는 것을 증명. 32 w + 32 x는 누산기 전 64 regs — ptxas 점유율을 스펙에 | S | ~~**`ds41router`**~~ 머지(`dd5422b`; M2 `dflash_router` 같이, N1은 분석만 → `loudnan`). A/B는 시팅 4 |
 | D1 | 같은 q8_1 활성을 읽는 투영이 따로 직렬 런치 `chain/attn.rs:1153-1154,1232,1390`(q_a·kv K=5120), `:1573,1576`(compressor kv·gate), `:1530`(proj), `:1414/:1521`(indexer q_b) | kv 6.29 µs(사슬), compressor 7런치, proj 5.90, idx q_b 6.58 | kv −252 µs, compressor −43, proj −47, idx q_b −26 → **−0.33…−0.37 ms**; 합친 q_a+kv 1792행 3.94 MB ≈ 7.5 µs(대역 바닥 5.85) | 런치 수 · 행마다 같은 코어·같은 행이라 비트 동일. 적재 때 행 연결(전부 Q3_K, 행 2200 B 정렬 유지) + y 창. **Q3_K에만** — 혼합 파일의 Q8_0 attention 경로는 그대로(op 게이트 7개가 거기서 돈다); chain_attn의 형식별 런치 수 핀은 날짜 달아 재핀; 노드 수 핀 재핀, e2e 토큰 동일, A/B 1회 | S | **`ds41dense`** (dskq 머지 뒤 — 같은 파일) |
 | D2 | `norm_quant` 1블록 `fused.rs:125,155-241,577` — phase A L2 왕복 5, phase B 워프당 5 | 층당 셋 × 40 = 746 µs, 전부 handoff 앞(임계); K=5120 7.33 µs 대 K=1280 3.71(바이트 4배에 시간 2배 → 왕복에 묶임) | ① phase A 적재 20개 전부 먼저 ② phase B 5블록 적재 먼저(또는 smem 20 KB) ③ 1024스레드, phase A는 앞 256만 → 7.3 → ~3.5, 3.7 → ~2.3 µs = **−0.36 ms**. 왕복 0.35–0.5 µs는 가정(**suspect**) | 적재 순서만 → 비트 동일 · `rms_norm`↔`norm_quant` 게이트 + A/B. **먼저** `clock64` 도장이나 두 배 탐침으로 왕복 값 | S | `ds41dense` |
 | D5 | argmax 256스레드 1블록 `elem.rs:47,641-700,1055` — 스레드당 505개 strided L2 적재 ~109 ns | 55.09 µs/스텝(V2-Lite 42.73 = 400 × 107 ns가 같은 기울기) | 1024스레드 −40 µs(Qwen3 −48); 여러 블록/헤드 융합 −51…−62 | `argmax_take` 전순서 → 비트 동일 · `gate_p4 argmax_geometry` | XS | `ds41dense` (D13 주석 `elem.rs:42` 102,400 → 모델별도 함께) |
@@ -322,7 +322,7 @@
 | A2 | V4.1 flash 과소 채움 `attn.rs:57,84,560-562` — grid가 W(128)·목록 stride(512)로 40블록 고정, 126 regs × 512 → SM당 1블록, 84 SM 중 40 (GQA식 죽은 세그먼트 낭비는 **없다**) | seg_sel 깊이 6 10.9 µs, ~1024 16.2 | V4.1 전용 SEG 32 → 80블록 한 wave → −0.12…−0.16 ms, **깊이 ≥ ~1024에서만**(6은 0) | float 순서(세그먼트 경계) · 오차 모델 + e2e 핀; `flash.rs` 공유 상수와 분리 | S | 깊이 시팅 뒤 카드 |
 | D7 | attention 쪽 양자화 런치 둘이 층마다 노출 — heads 입력(grid 256, 2.15 µs), wo_b 입력(grid 64, 2.24) | 176 µs/스텝 | wo_b 입력을 heads 커널의 128행 묶음별 마지막 블록 티켓으로 −90, heads 입력을 attn_merge 에필로그로 −86 | 같은 양자화기 몸통 → 비트 동일, 런치 수 | M | 카드 |
 | X1 | handoff 별도 런치 `chain/ffn.rs:164-215` | 3.66 × 40 = 146 µs 임계 | norm이 매핑 페이지에도 x를 쓰고 라우터 마지막 블록이 ids·sel·seq를 쓰면 −40런치 ≈ −0.1…−0.15 ms | = ㊵ P4 | S | ㊵ P4(수치 보탬) |
-| A3 | `flash.rs:505-513` `let src_row = $row;`가 단어 루프 안 → `ds41_attn_seg_sel`이 sel을 key 행마다 8번 재적재하고 매번 기다림(sass 첫 대기 전 LDG 1 대 접두 16) | 블록당 ≤ 0.3 µs | ~−10–20 µs/스텝 | 옮기기 · `ptx-scan`·`sass-scan` | XS | `ds41router`에 동봉 |
+| A3 | `flash.rs:505-513` `let src_row = $row;`가 단어 루프 안 → `ds41_attn_seg_sel`이 sel을 key 행마다 8번 재적재하고 매번 기다림(sass 첫 대기 전 LDG 1 대 접두 16) | 블록당 ≤ 0.3 µs | ~−10–20 µs/스텝 | 옮기기 · `ptx-scan`·`sass-scan` | XS | ~~`ds41router`에 동봉~~ 구현됐으나 **보류**(브랜치 `ds41router-a3`, `181e2f6`): 루프 LDG 32 → 18, 의존 왕복 16 → 2은 예측대로인데 regs 126 → 128(512스레드 상한)에 ptxas 스필 8 B가 생겼다(STL/LDL 한 쌍, 타일 루프 밖). `spill` 열을 읽는 게이트가 없어 main에 조용한 스필을 올리지 않는다 — 라우터 A/B의 셋째 팔(깊이 1024·4096에서 판정)로, 이기면 `_sel` 스필 래칫(`PIN`)과 함께 머지 |
 | Qm | merge의 load-branch-load 사슬이 두 곳 더: `flash.rs:2013-2030` `merge_row`(V2-Lite), `gpu-deepseek41/src/attn.rs:394-411`(V4.1) — qwen3deep이 GQA에서 고친 것과 같은 패턴 | — | V4.1은 세그먼트 수에 비례(깊이 6에서 작음) | 적재 순서만 → 비트 동일 | S | `ds41hcbranch`에 동봉 |
 | E1 | 카드 `_sel`(gate·up 37 µs, down 28)은 살아 있는 카드 슬롯 k에 비례(k=1.74 평균, 한계 13.6 µs/expert = **745 GB/s**, down 632) — k_card ≤ 4에서 노출 틈 ≥ 98 µs(494 중 490) | 그늘 | ≈ 0 (k ≥ 5인 4/494만) | **손대지 말 것**. 카드 몫이 커지면(3090 DSpark) 슬롯 압축 목록 + live 행 grid-stride −3…−5 µs/런치 | S | 보류 |
 | D8·D9·E2 | shexp gate·up 두 walk 차례로(`dense.rs:274-275`, 556 GB/s), Q5_K f32 gemv 바이트별 u32 적재(344 GB/s), Q4_K 9 SB 셋째 반복(`cores.rs:334-373`) | 그늘 | ≈ 0 지금 (E2는 Qwen3 전 카드 down에서 임계 — 미측정) | — | S | 카드; E2는 Qwen3 `qwen3bw`에 |
@@ -341,6 +341,23 @@
 **라운드 순서**: `ds41router`(router.rs·q8f32.rs·experts_mxfp4.rs 라우터·flash.rs A3 — dskq와 겹치지 않음, 바로) ‖ `ds41join`(측정) → dskq 머지 뒤 `ds41dense` → `ds41hcbranch` → D3/D4 카드(float 순서). 박스 동시 ≤ 4.
 
 **사용자 판단 대기**(깨어나면): ① Expert Deferral — 손실 있는 기법이라 켜는 것은 사용자 결정 ② 다운로드 둘 — EAGLE-3 체크포인트, Qwen3 IQ4_XS 파일 ③ DFlash 대상 — Coder-30B-A3B에 얹기 vs 드래프터 학습 ④ V4 R0 전체 덤프(128 GB 페이지인)와 `v4time`(각 > 30분) 승인.
+
+## 라우터 폭 (ds41router 보고, 2026-09-24 밤 — `dd5422b`; A3는 `181e2f6`, 브랜치 `ds41router-a3`; 예측 파일 사본 세션 스크래치 `wave-m4/ds41router-predict.txt`)
+
+R1을 넣었다: `f32_lane_partial_1col_w32`(32청크 적재를 먼저, 같은 fma 합 같은 순서, 32 → 8 → 1 꼬리)로 `ds41_router`(그리드 48 → 96)와
+`dflash_router`(16 → 32)가 걷고, 블록은 128스레드다. ptx-scan은 두 엔트리만 바뀌었고 라우터·moe·chain_ffn·dspark·step·skew·long·e2e 게이트가
+전부 초록이다(리드 재실행은 아래). **예측이 틀린 항**: 레지스터 74–80 예측 대 실측 38, 첫 대기 전 LDG 64 예측(스펙 하한 32) 대 실측 24 —
+PTX에는 `ld.global` 64개 뒤 `fma` 32개가 그대로인데 ptxas가 ~24깊이 슬라이딩 창으로 재배열했다(24×LDG, 그 뒤 FFMA마다 LDG 1–2). 그래서
+lane당 동시 청크는 32가 아니라 ~12이고, 재유도는 발사당 ~15 µs(gemv 13.3 + 선택 꼬리), **−0.26 ms/스텝[유도]**(스펙 −0.4…−0.55). 스펙의
+8 µs는 f32 가중치 7.86 MB의 바이트 바닥(10.2 µs @768) 아래였다 — 다음 라우터 레버는 bf16 상주(B8)나, 비트를 지키는 벡터 적재 + 셔플
+재분배로 ptxas 창을 넘는 발행 깊이(L). 「커널 리뷰 넷」의 "45 = router + dense" 합은 dense가 착륙하면 다시 더한다.
+
+`sass-scan`의 두 하한(첫 대기 전 ≥ 32, A3 ≥ 8)은 계측기 값이라 게이트로 걸지 않았다; A3의 ≥ 8은 gather라 구조적으로 못 닿는다(워드 적재가
+인덱스 적재를 기다린다 — 실측 2). 남긴 것(보고만): `_w32`의 8폭 꼬리가 `f32_lane_partial_1col` 본체 사본(R14, `#[inline(always)]` 공통
+꼬리로, M); `dflash_router`가 `ds41_router` 본체 사본(R14, const generic 코어, M — nanmoe도 같은 항); `launch_bounds`/`launch_contract` 블록
+리터럴이 다른 커널에서 상수와 안 묶임(S, grep 라운드); **ptx-scan `spill`/`jit_local` 열을 읽는 게이트가 없다**(`gpu-gates lib.rs:1559`
+`no_local_depot`는 PTX만 — 이번 스필을 어느 게이트도 못 봤다, S → `loudnan`에 동봉); `tools/sass-scan.sh` 부분 문자열 필터(`ds41_attn_seg`가
+`_sel`까지, XS); `flash.rs:860` 인자 11/7(R8, 기존).
 
 ## 토크나이저 `~` (tokfix 보고, 2026-09-24 — `3ef2c8a`; ik PR #2528 열림)
 
