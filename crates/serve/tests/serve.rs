@@ -461,7 +461,6 @@ fn hw_unsupported_fields_are_refused() {
         ),
         ("tool_choice", json!("none")),
         ("tool_choice", json!("auto")),
-        ("cache_prompt", json!(true)),
     ];
     for (field, value) in neutral {
         let mut b = chat_body(json!({}));
@@ -536,11 +535,24 @@ fn hw_metrics_kv_cache_usage_ratio() {
     );
 }
 
-/// The mock engine with a latch in `next`: the first `next` after `arm` blocks
-/// until `release`, and says so through `entered`.
+/// The mock engine with a latch in `next`: its `at`-th `next` and every later one
+/// block until `release`, and the first of them says so through `entered`.
 struct Held {
     inner: serve::MockEngine,
     latch: std::sync::Arc<Latch>,
+    at: usize,
+    calls: usize,
+}
+
+impl Held {
+    fn new(ctx: usize, at: usize, latch: std::sync::Arc<Latch>) -> Held {
+        Held {
+            inner: serve::MockEngine::new(ctx),
+            latch,
+            at,
+            calls: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -573,13 +585,15 @@ impl serve::Engine for Held {
         self.inner.prefill(ids)
     }
     fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, serve::EngineError> {
-        let mut g = self.latch.state.lock().expect("latch");
-        g.0 = true;
-        self.latch.cv.notify_all();
-        while !g.1 {
-            g = self.latch.cv.wait(g).expect("latch");
+        self.calls += 1;
+        if self.calls >= self.at {
+            let mut g = self.latch.state.lock().expect("latch");
+            g.0 = true;
+            self.latch.cv.notify_all();
+            while !g.1 {
+                g = self.latch.cv.wait(g).expect("latch");
+            }
         }
-        drop(g);
         self.inner.next(last, out)
     }
     fn reset(&mut self) -> Result<(), serve::EngineError> {
@@ -597,10 +611,7 @@ impl serve::Engine for Held {
 #[ignore = "gate: just gate-serve"]
 fn hw_tokenize_answers_while_a_generation_holds_the_engine() {
     let latch = std::sync::Arc::new(Latch::default());
-    let engine = Held {
-        inner: serve::MockEngine::new(4096),
-        latch: latch.clone(),
-    };
+    let engine = Held::new(4096, 1, latch.clone());
     let addr = common::start_with(Box::new(engine));
     let gen_thread =
         std::thread::spawn(move || post(addr, "/v1/chat/completions", &chat_body(json!({}))));
@@ -743,4 +754,275 @@ fn hw_completion_return_tokens() {
     assert_eq!(v["content"], "abcab");
     let v = post(addr, "/completion", &body(json!({}))).json();
     assert!(v.get("tokens").is_none(), "{v}");
+}
+
+/// Feeds `ids` from the engine's position (`prefill` of all but the last, `next`
+/// of the last) and returns `count` greedy ids.
+fn greedy(e: &mut dyn serve::Engine, ids: &[u32], count: usize) -> Vec<u32> {
+    let (last, rest) = ids.split_last().expect("ids to feed");
+    e.prefill(rest).expect("prefill");
+    let mut tok = e.next(*last, None).expect("next");
+    let mut out = vec![tok];
+    while out.len() < count {
+        tok = e.next(tok, None).expect("next");
+        out.push(tok);
+    }
+    out
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_cut_then_prefill_equals_one_prefill() {
+    use serve::{Engine, MockEngine, MockTokenizer, Tokenizer};
+    let t = MockTokenizer;
+    let prompt = t.encode("abcab");
+    let k = 3;
+    let mut one = MockEngine::new(64);
+    let want = greedy(&mut one, &prompt, 6);
+    // Past `k` the cache holds a different tail; without the cut it changes the output.
+    let mut over = prompt[..k].to_vec();
+    over.extend(t.encode("bz"));
+    let mut stale = MockEngine::new(64);
+    stale.prefill(&over).expect("prefill");
+    assert_ne!(
+        greedy(&mut stale, &prompt[k..], 6),
+        want,
+        "the stale tail must matter, or this gate proves nothing"
+    );
+    let mut split = MockEngine::new(64);
+    split.prefill(&over).expect("prefill");
+    assert_eq!(split.keepable(k), k);
+    split.cut(k).expect("cut");
+    assert_eq!(
+        greedy(&mut split, &prompt[k..], 6),
+        want,
+        "prefill(P[..k] + tail); cut(k); prefill(P[k..]) against prefill(P)"
+    );
+}
+
+/// The mock engine without `cut`: the trait's defaults.
+struct NoCut(serve::MockEngine);
+
+impl serve::Engine for NoCut {
+    fn tokenizer(&self) -> std::sync::Arc<dyn serve::Tokenizer> {
+        self.0.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), serve::EngineError> {
+        self.0.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, serve::EngineError> {
+        self.0.next(last, out)
+    }
+    fn reset(&mut self) -> Result<(), serve::EngineError> {
+        self.0.reset()
+    }
+    fn ctx_max(&self) -> usize {
+        self.0.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_cache_prompt_reuses_the_common_prefix() {
+    // A leaves "abcabc" + "abca" in the cache (its last generated id is never fed);
+    // B shares "abcabcab" with it.
+    let a = json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0});
+    let b = |extra: Value| {
+        let mut v =
+            json!({"prompt": "abcabcabb", "n_predict": 4, "temperature": 0, "return_tokens": true});
+        if let (Value::Object(v), Value::Object(e)) = (&mut v, extra) {
+            v.extend(e);
+        }
+        v
+    };
+    let fresh = post(start(4096), "/completion", &b(json!({}))).json();
+    assert_eq!(fresh["timings"]["cache_n"], 0, "{fresh}");
+
+    let addr = start(4096);
+    post(addr, "/completion", &a);
+    let warm = post(addr, "/completion", &b(json!({}))).json();
+    assert_eq!(warm["timings"]["cache_n"], 8, "{warm}");
+    assert_eq!(warm["timings"]["prompt_n"], 9, "{warm}");
+    assert_eq!(
+        warm["tokens"], fresh["tokens"],
+        "warm {warm}\nfresh {fresh}"
+    );
+    assert_eq!(warm["content"], fresh["content"]);
+
+    post(addr, "/completion", &a);
+    let off = post(addr, "/completion", &b(json!({"cache_prompt": false}))).json();
+    assert_eq!(off["timings"]["cache_n"], 0, "{off}");
+    assert_eq!(off["tokens"], fresh["tokens"]);
+
+    // An engine without `cut` resets every request instead of failing.
+    let plain = common::start_with(Box::new(NoCut(serve::MockEngine::new(4096))));
+    post(plain, "/completion", &a);
+    let r = post(plain, "/completion", &b(json!({})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["timings"]["cache_n"], 0);
+    assert_eq!(r.json()["tokens"], fresh["tokens"]);
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_ignore_eos_does_not_outlive_its_request() {
+    let addr = start(4096);
+    // "z" was never seen, so the mock predicts EOS at once; ignore_eos runs on.
+    let held = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "xyz", "ignore_eos": true, "n_predict": 4, "temperature": 0}),
+    )
+    .json();
+    assert_eq!(held["tokens_predicted"], 4, "{held}");
+    assert_eq!(held["stopped_limit"], true, "{held}");
+    let plain = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "xyz", "temperature": 0}),
+    )
+    .json();
+    assert_eq!(plain["generation_settings"]["ignore_eos"], false, "{plain}");
+    assert_eq!(plain["stopped_eos"], true, "{plain}");
+    assert_eq!(plain["tokens_predicted"], 1, "{plain}");
+    assert_eq!(plain["content"], "", "{plain}");
+    assert_eq!(plain["timings"]["cache_n"], 2, "{plain}");
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_streams_report_cache_n() {
+    let addr = start(4096);
+    post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0}),
+    );
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcabcabb", "n_predict": 4, "temperature": 0, "stream": true, "return_progress": true}),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    let chunks: Vec<Value> = r
+        .events()
+        .iter()
+        .map(|e| serde_json::from_str(e).expect("chunk JSON"))
+        .collect();
+    let progress = chunks
+        .iter()
+        .find_map(|c| c.get("prompt_progress"))
+        .expect("a prompt_progress chunk");
+    assert_eq!(progress["cache"], 8, "{progress}");
+    let last = chunks.last().expect("chunks");
+    assert_eq!(last["timings"]["cache_n"], 8, "{last}");
+
+    // The same chat twice: the second keeps all of its prompt but the last token
+    // (15 ids; the first left them and "abc" in the cache).
+    let mut streamed = chat_body(json!({"stream": true}));
+    post(addr, "/v1/chat/completions", &streamed);
+    streamed["stream_options"] = json!({"include_usage": true});
+    let r = post(addr, "/v1/chat/completions", &streamed);
+    let ev = r.events();
+    let last: Value = serde_json::from_str(&ev[ev.len() - 2]).expect("usage chunk");
+    assert_eq!(last["timings"]["cache_n"], 14, "{last}");
+    assert_eq!(last["timings"]["prompt_n"], 15, "{last}");
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_non_integer_number_is_refused() {
+    let addr = start(4096);
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "ab", "n_predict": 2.5}),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    let e = &r.json()["error"];
+    assert_eq!(e["type"], "invalid_request_error", "{e}");
+    assert!(
+        e["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("n_predict")),
+        "{e}"
+    );
+    let whole = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcabc", "n_predict": 2.0, "temperature": 0}),
+    );
+    assert_eq!(whole.status, 200, "{}", whole.body);
+    assert_eq!(whole.json()["tokens_predicted"], 2);
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_stop_with_a_non_string_is_refused() {
+    let addr = start(4096);
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "ab", "stop": ["a", 3]}),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    let e = &r.json()["error"];
+    assert_eq!(e["type"], "invalid_request_error", "{e}");
+    assert!(
+        e["message"].as_str().is_some_and(|m| m.contains("stop")),
+        "{e}"
+    );
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slots_n_remain_during_a_run() {
+    let latch = std::sync::Arc::new(Latch::default());
+    // Next #1 answers the prompt, #2 feeds the first generated token; #3 waits
+    // with two generated.
+    let addr = common::start_with(Box::new(Held::new(4096, 3, latch.clone())));
+    let gen_thread = std::thread::spawn(move || {
+        post(
+            addr,
+            "/completion",
+            &json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0}),
+        )
+    });
+    assert!(
+        latch.wait_entered(std::time::Duration::from_secs(10)),
+        "the generation never reached next #3"
+    );
+    let s = get(addr, "/slots").json();
+    latch.release();
+    let t = &s[0]["next_token"];
+    assert_eq!(t["n_decoded"], 2, "{s}");
+    assert_eq!(t["n_remain"], 3, "{s}");
+    assert_eq!(t["has_next_token"], true, "{s}");
+    let done = gen_thread.join().expect("generation thread");
+    assert_eq!(done.json()["tokens_predicted"], 5);
+    let after = get(addr, "/slots").json();
+    assert_eq!(after[0]["next_token"]["n_remain"], -1, "{after}");
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_metrics_n_decode_total() {
+    let addr = start(4096);
+    // Five generated: the prompt's decode gives the first, four more give the rest.
+    post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0}),
+    );
+    assert_eq!(metric(&get(addr, "/metrics").body, "n_decode_total"), 5.0);
+    // None generated: the prompt is still decoded once.
+    post(
+        addr,
+        "/completion",
+        &json!({"prompt": "abcabc", "n_predict": 0, "temperature": 0}),
+    );
+    assert_eq!(metric(&get(addr, "/metrics").body, "n_decode_total"), 6.0);
 }

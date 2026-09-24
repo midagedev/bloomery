@@ -2,10 +2,12 @@
 //!
 //! The server owns one `Engine` behind a mutex (one slot) and the engine's
 //! [`Tokenizer`] outside it: `/tokenize`, `/detokenize` and prompt encoding never
-//! wait for a generation. A request is: `reset`, `prefill(ids[..n-1])`, then
-//! `next(ids[n-1])` yields the first generated token and every later `next(prev)`
-//! the one after it. `tokens_evaluated` and `prompt_n` still count the whole
-//! prompt, `ids.len()`.
+//! wait for a generation. A request keeps the longest prefix `k` of its ids the
+//! cache already holds and the engine can keep ([`Engine::keepable`]): `cut(k)`,
+//! or `reset` when `k` is 0; then `prefill(ids[k..n-1])`, and `next(ids[n-1])`
+//! yields the first generated token and every later `next(prev)` the one after
+//! it. `tokens_evaluated` and `prompt_n` still count the whole prompt,
+//! `ids.len()`; `timings.cache_n` is `k`.
 //!
 //! Any `EngineError` is fatal to the server: the request that met it gets a 500,
 //! `/health` answers 503, and [`crate::Server::run`] returns the error so the
@@ -64,6 +66,19 @@ pub trait Engine: Send {
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError>;
     /// Drops the whole cache; the next `prefill` starts at position 0.
     fn reset(&mut self) -> Result<(), EngineError>;
+    /// The longest prefix, at most `n` positions, of what the cache holds now
+    /// that [`Engine::cut`] can keep. The default is 0: the caller resets
+    /// instead, so an engine without `cut` never has it called.
+    fn keepable(&self, n: usize) -> usize {
+        let _ = n;
+        0
+    }
+    /// Keeps positions `[0, n)` and drops the rest; the next `prefill`
+    /// continues at `n`. Called only with an `n` [`Engine::keepable`] granted.
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        let _ = n;
+        Err(EngineError("cut is not supported".to_owned()))
+    }
     /// Positions the cache holds.
     fn ctx_max(&self) -> usize;
     /// What a crash report names besides the error: the device, the position.

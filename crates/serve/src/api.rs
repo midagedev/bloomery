@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 
 use crate::dsml::{ChatParser, Message, ToolCall};
 use crate::engine::{Engine, SamplerFactory, SamplingParams, Tokenizer};
-use crate::genloop::{self, Event, GenError, GenParams, Outcome, Timings};
+use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings};
 use crate::http::{self, EventStream, Request};
 use crate::reasoning::ReasoningFormat;
 use crate::sampling;
@@ -110,7 +110,7 @@ impl Server {
         };
         let (end_tx, ended) = mpsc::channel();
         let state = State {
-            engine: Mutex::new(engine),
+            slot_engine: Mutex::new(Slot::new(engine)),
             tok,
             fatal: Mutex::new(None),
             end: end_tx,
@@ -203,6 +203,8 @@ struct SlotView {
     id_task: u64,
     prompt: Value,
     settings: Value,
+    /// The running request's `n_predict` (`-1` unbounded).
+    n_predict: i64,
     n_past: usize,
     n_decoded: usize,
     stopped_eos: bool,
@@ -212,7 +214,8 @@ struct SlotView {
 }
 
 struct State {
-    engine: Mutex<Box<dyn Engine>>,
+    /// The engine and the ids its cache holds, under one lock.
+    slot_engine: Mutex<Slot>,
     /// The engine's vocabulary, read without the engine lock.
     tok: Arc<dyn Tokenizer>,
     /// Set by the request that met an engine error; the reason `/health` gives.
@@ -238,9 +241,9 @@ fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl State {
     /// Waits for the one slot (counted in `requests_deferred` while waiting).
-    fn engine(&self) -> MutexGuard<'_, Box<dyn Engine>> {
+    fn engine(&self) -> MutexGuard<'_, Slot> {
         self.waiting.fetch_add(1, Ordering::SeqCst);
-        let g = relock(&self.engine);
+        let g = relock(&self.slot_engine);
         self.waiting.fetch_sub(1, Ordering::SeqCst);
         g
     }
@@ -398,29 +401,48 @@ fn get_f(o: &Map<String, Value>, k: &str) -> Option<f64> {
     o.get(k).and_then(Value::as_f64)
 }
 
-fn get_i(o: &Map<String, Value>, k: &str) -> Option<i64> {
-    o.get(k)
-        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+/// An integer field. Absent, `null` or not a number is `None`; a number that is
+/// not an integer (`2.5`, or past `i64`) is a 400 naming the field, where
+/// llama-server would truncate it. An integer-valued float (`2.0`) passes.
+fn get_i(o: &Map<String, Value>, k: &str) -> Result<Option<i64>, ApiError> {
+    let Some(v) = o.get(k).filter(|v| v.is_number()) else {
+        return Ok(None);
+    };
+    if let Some(i) = v.as_i64() {
+        return Ok(Some(i));
+    }
+    match v.as_f64() {
+        Some(f) if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 => {
+            Ok(Some(f as i64))
+        }
+        _ => Err(invalid(format!("{k} must be an integer, not {v}"))),
+    }
 }
 
 fn get_b(o: &Map<String, Value>, k: &str) -> Option<bool> {
     o.get(k).and_then(Value::as_bool)
 }
 
-fn stop_list(v: Option<&Value>) -> Vec<String> {
+/// `stop` as a string or an array of strings; an array element that is not a
+/// string is a 400 naming the field.
+fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
     match v {
-        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
         Some(Value::Array(a)) => a
             .iter()
-            .filter_map(|x| x.as_str().map(str::to_owned))
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid(format!("stop must hold strings, not {x}")))
+            })
             .collect(),
-        _ => Vec::new(),
+        _ => Ok(Vec::new()),
     }
 }
 
 /// Knobs shared by both generation endpoints. `n_predict` wins over the OpenAI names.
-/// `cache_prompt` is accepted and ignored: every request resets the engine and
-/// evaluates its whole prompt (`timings.cache_n` is always 0).
+/// `cache_prompt` (default `true`, as llama-server) keeps the longest prefix the
+/// engine's cache already holds; `false` resets it first.
 ///
 /// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
 /// `n_probs > 0`, `response_format` other than `{"type":"text"}`, `json_schema`, a
@@ -431,7 +453,7 @@ fn stop_list(v: Option<&Value>) -> Vec<String> {
 fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiError> {
     let set = |k: &str| o.get(k).filter(|v| !v.is_null());
     let refused = [
-        ("n_probs", get_i(o, "n_probs").is_some_and(|n| n > 0)),
+        ("n_probs", get_i(o, "n_probs")?.is_some_and(|n| n > 0)),
         (
             "response_format",
             set("response_format")
@@ -445,9 +467,9 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         ("logprobs", get_b(o, "logprobs") == Some(true)),
         (
             "top_logprobs",
-            get_i(o, "top_logprobs").is_some_and(|n| n > 0),
+            get_i(o, "top_logprobs")?.is_some_and(|n| n > 0),
         ),
-        ("n", get_i(o, "n").is_some_and(|n| n > 1)),
+        ("n", get_i(o, "n")?.is_some_and(|n| n > 1)),
         (
             "tool_choice",
             set("tool_choice").is_some_and(|v| !matches!(v.as_str(), Some("none" | "auto"))),
@@ -457,24 +479,25 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         return Err(invalid(format!("{field} is not supported by this server")));
     }
     let d = SamplingParams::default();
-    let seed = match get_i(o, "seed") {
+    let seed = match get_i(o, "seed")? {
         Some(s) if s >= 0 => s as u64,
         _ => mix(state.next_id() ^ unix_now().rotate_left(17)) & u64::from(u32::MAX),
     };
-    let n_predict = get_i(o, "n_predict")
-        .or_else(|| get_i(o, "max_tokens"))
-        .or_else(|| get_i(o, "max_completion_tokens"))
+    let n_predict = get_i(o, "n_predict")?
+        .or(get_i(o, "max_tokens")?)
+        .or(get_i(o, "max_completion_tokens")?)
         .unwrap_or(-1);
+    let top_k = get_i(o, "top_k")?;
     Ok(GenParams {
         n_predict: if n_predict < 0 { -1 } else { n_predict },
         sampling: SamplingParams {
             temperature: get_f(o, "temperature").map_or(d.temperature, |t| t as f32),
-            top_k: get_i(o, "top_k").map_or(d.top_k, |k| i32::try_from(k).unwrap_or(i32::MAX)),
+            top_k: top_k.map_or(d.top_k, |k| i32::try_from(k).unwrap_or(i32::MAX)),
             top_p: get_f(o, "top_p").map_or(d.top_p, |t| t as f32),
             min_p: get_f(o, "min_p").map_or(d.min_p, |t| t as f32),
             seed,
         },
-        stop: stop_list(o.get("stop")),
+        stop: stop_list(o.get("stop"))?,
         ignore_eos: get_b(o, "ignore_eos").unwrap_or(false),
         stream: get_b(o, "stream").unwrap_or(false),
         timings_per_token: get_b(o, "timings_per_token").unwrap_or(false),
@@ -484,6 +507,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .and_then(|s| s.get("include_usage"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        cache_prompt: get_b(o, "cache_prompt").unwrap_or(true),
     })
 }
 
@@ -538,6 +562,7 @@ fn default_params() -> GenParams {
         timings_per_token: false,
         return_progress: false,
         include_usage: false,
+        cache_prompt: true,
     }
 }
 
@@ -599,6 +624,13 @@ fn props(state: &State) -> Value {
 fn slots(state: &State) -> Value {
     let busy = state.busy.load(Ordering::SeqCst);
     let s = relock(&state.slot);
+    // llama-server's count of tokens left: only a bounded request that is running has one.
+    let n_remain = if busy && s.n_predict >= 0 {
+        let done = i64::try_from(s.n_decoded).unwrap_or(i64::MAX);
+        s.n_predict.saturating_sub(done).max(0)
+    } else {
+        -1
+    };
     let mut v = match &s.settings {
         Value::Object(_) => s.settings.clone(),
         _ => generation_settings(state, &default_params()),
@@ -615,7 +647,7 @@ fn slots(state: &State) -> Value {
             "next_token".into(),
             json!({
                 "has_next_token": busy,
-                "n_remain": -1,
+                "n_remain": n_remain,
                 "n_decoded": s.n_decoded,
                 "stopped_eos": s.stopped_eos,
                 "stopped_word": s.stopped_word,
@@ -853,7 +885,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
 /// after the response is written; an engine failure it met is signalled then.
 struct Run<'a> {
     state: &'a State,
-    engine: MutexGuard<'a, Box<dyn Engine>>,
+    engine: MutexGuard<'a, Slot>,
     failure: Option<EngineFailure>,
 }
 
@@ -908,23 +940,30 @@ impl<'a> Run<'a> {
                 id_task: self.state.next_id(),
                 prompt,
                 settings: generation_settings(self.state, p),
+                n_predict: p.n_predict,
                 ..SlotView::default()
             };
         }
+        let state = self.state;
+        let mut tick = |t: &Timings| {
+            let mut v = relock(&state.slot);
+            v.n_decoded = t.predicted_n;
+            v.n_past = t.n_past;
+        };
         let mut tim = Timings::default();
         let r = genloop::generate(
-            &mut **self.engine,
-            &*self.state.tok,
+            &mut self.engine,
             &self.state.sampler,
             ids,
             p,
             sink,
+            &mut tick,
             &mut tim,
         );
         self.book(&tim, r.as_ref().ok());
         if let Err(GenError::Engine(e)) = &r {
             let f = EngineFailure {
-                engine: self.engine.describe(),
+                engine: self.engine.engine.describe(),
                 error: e.to_string(),
             };
             *relock(&self.state.fatal) = Some(f.error.clone());
@@ -940,7 +979,13 @@ impl<'a> Run<'a> {
         s.t_prompt_ms_total += t.prompt_ms;
         s.n_predicted_total += dn;
         s.t_predicted_ms_total += t.predicted_ms;
-        let decodes = if pn > 0 { 1 + dn.saturating_sub(1) } else { 0 };
+        // llama_decode calls: one for the prompt, whose logits give the first
+        // generated token, then one per later token (the last is never fed back).
+        let decodes = match (pn, dn) {
+            (0, _) => 0,
+            (_, 0) => 1,
+            (_, d) => d,
+        };
         s.n_decode_total += decodes;
         s.n_busy_slots_total += decodes;
         drop(s);
@@ -1106,7 +1151,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
 }
 
 fn progress(t: &Timings) -> Value {
-    json!({ "total": t.prompt_n, "cache": 0, "processed": t.prompt_n, "time_ms": t.prompt_ms })
+    json!({ "total": t.prompt_n, "cache": t.cache_n, "processed": t.prompt_n, "time_ms": t.prompt_ms })
 }
 
 /// Ends a stream: validation errors before the first byte go out as a plain

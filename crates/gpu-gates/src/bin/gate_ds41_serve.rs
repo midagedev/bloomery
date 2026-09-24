@@ -15,7 +15,11 @@
 //!   `data: [DONE]`;
 //! - `/tokenize` of `--prompt` is `--ids`;
 //! - the same `/completion` after those requests gives the same ids (the
-//!   engine's reset between requests leaves nothing behind).
+//!   engine's reset between requests leaves nothing behind);
+//! - prefix reuse (`cache_prompt`, default true): `--ids` then `--ids` plus
+//!   its 8 greedy ids (`ignore_eos`) keeps every cached position (`timings.cache_n`), and a
+//!   prompt that leaves the last cached position out takes that one back;
+//!   each gives the greedy ids of the same prompt with `cache_prompt: false`.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
@@ -48,6 +52,9 @@ mod gate {
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
     const N_PREDICT: usize = 16;
+    /// Greedy ids of each prefix-reuse request, run past the end-of-generation id
+    /// (`ignore_eos`) so every one of them is compared.
+    const REUSE_PREDICT: usize = 8;
     const CHAT: &str = "What is the capital of France? Answer in one word.";
 
     struct Args {
@@ -298,9 +305,71 @@ mod gate {
         check(&mut ok, "tokenize_is_the_ids", tok == a.ids);
 
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
-        let again = ids_of(&json_of("/completion", st, &body)?["tokens"]);
-        println!("completion again {again:?}");
-        check(&mut ok, "completion_after_reset_identical", again == first);
+        let again = json_of("/completion", st, &body)?;
+        println!(
+            "completion again {:?} cache_n={}",
+            ids_of(&again["tokens"]),
+            again["timings"]["cache_n"]
+        );
+        check(
+            &mut ok,
+            "completion_after_reset_identical",
+            ids_of(&again["tokens"]) == first,
+        );
+
+        let reuse = |prompt: &[u32], cache: bool| -> Result<(Vec<u32>, Value), GateError> {
+            let body = json!({
+                "prompt": prompt, "n_predict": REUSE_PREDICT, "temperature": 0,
+                "ignore_eos": true, "return_tokens": true, "cache_prompt": cache,
+            });
+            let (st, body) = curl(&url("/completion"), Some(&body), false)?;
+            let v = json_of("/completion", st, &body)?;
+            let ids = ids_of(&v["tokens"]);
+            println!(
+                "reuse prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
+                prompt.len(),
+                v["timings"]["cache_n"]
+            );
+            Ok((ids, v["timings"]["cache_n"].clone()))
+        };
+        let (g1, _) = reuse(&a.ids, false)?;
+        let cont: Vec<u32> = a.ids.iter().chain(&g1).copied().collect();
+        let (g2, c2) = reuse(&cont, true)?;
+        let (g3, c3) = reuse(&cont, false)?;
+        let full = g1.len() == REUSE_PREDICT && g3.len() == REUSE_PREDICT;
+        check(&mut ok, "reuse_fixture_ran_to_n_predict", full);
+        // The cache held the prompt and all but the last of g1: every position is kept.
+        check(
+            &mut ok,
+            "reuse_continuation_cache_n",
+            c2 == json!(cont.len() - 1),
+        );
+        check(
+            &mut ok,
+            "reuse_continuation_ids_are_fresh",
+            g2 == g3 && c3 == json!(0),
+        );
+        if full {
+            // The cache holds `cont` and g3[..7]; this prompt shares all of it but the
+            // last, so the engine takes that one position back.
+            let last = g3[REUSE_PREDICT - 2];
+            let alt = if a.ids[0] != last { a.ids[0] } else { a.ids[1] };
+            let mut back = cont.clone();
+            back.extend(&g3[..REUSE_PREDICT - 2]);
+            back.push(alt);
+            let (g4, c4) = reuse(&back, true)?;
+            let (g5, c5) = reuse(&back, false)?;
+            check(
+                &mut ok,
+                "reuse_rollback_cache_n",
+                c4 == json!(back.len() - 1),
+            );
+            check(
+                &mut ok,
+                "reuse_rollback_ids_are_fresh",
+                g4 == g5 && c5 == json!(0),
+            );
+        }
 
         println!("server stopped: {}", served.stop()?);
         if ok {

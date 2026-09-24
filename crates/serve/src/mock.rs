@@ -9,7 +9,9 @@
 //! whole context; the token that followed it is the prediction (logit 4), every
 //! other token that ever followed the last token gets logit 2, the rest -8. A last
 //! token never seen before predicts EOS. Deterministic, and seed-sensitive once a
-//! sampler with temperature > 0 is in the loop.
+//! sampler with temperature > 0 is in the loop. The prediction reads the whole
+//! context, so a stale position a `cut` failed to drop changes what comes out.
+//! `cut` keeps any prefix.
 //!
 //! [`MockEngine::failing_at`] makes the `k`-th `next` of the engine's life an
 //! error, for the crash-path gate.
@@ -195,6 +197,21 @@ impl Engine for MockEngine {
 
     fn reset(&mut self) -> Result<(), EngineError> {
         self.ctx.clear();
+        Ok(())
+    }
+
+    fn keepable(&self, n: usize) -> usize {
+        n.min(self.ctx.len())
+    }
+
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        if n > self.ctx.len() {
+            return Err(EngineError(format!(
+                "mock: cut to {n} with {} positions held",
+                self.ctx.len()
+            )));
+        }
+        self.ctx.truncate(n);
         Ok(())
     }
 

@@ -9,6 +9,10 @@
 //! that opened them, so every step runs on that thread and the engine is a
 //! handle that sends it commands. The opener comes in as a closure because
 //! this library does not name a device crate (see [`crate::generate`]).
+//!
+//! A request's cached prefix is kept only when it reaches the last position
+//! the cache holds or the one before it ([`Ds41Engine`]'s `keepable`); any
+//! shorter prefix is a reset.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -159,8 +163,13 @@ pub fn sampler_factory() -> SamplerFactory {
 /// What the engine thread is asked to do.
 enum Cmd {
     Prefill(Vec<u32>),
-    Next { last: u32, logits: bool },
+    Next {
+        last: u32,
+        logits: bool,
+    },
     Reset,
+    /// Take back the positions from this one on.
+    Rollback(u32),
 }
 
 /// Its answer: the argmax and the logits of a `Next`, and the position it
@@ -290,6 +299,11 @@ fn serve_cmd<B: ChainBody>(
             .reset()
             .map(|()| (0, None))
             .map_err(|e| format!("reset at position {at}: {e}")),
+        Cmd::Rollback(pos) => g
+            .model_mut()
+            .rollback(pos)
+            .map(|()| (0, None))
+            .map_err(|e| format!("rollback to position {pos} from {at}: {e}")),
     }
 }
 
@@ -323,6 +337,36 @@ impl Engine for Ds41Engine {
 
     fn reset(&mut self) -> Result<(), EngineError> {
         self.call(Cmd::Reset).map(|_| ())
+    }
+
+    /// The whole cache, or all of it but the last position. The raw window
+    /// is a ring: the row of position `c` lives in slot `c % window`, and the
+    /// step at `n` reads the rows of `max(0, n + 1 − window) ..= n − 1`.
+    /// Once the cache has held `m > max(window, n + 1)` positions, the first
+    /// of those slots holds a later position's row, and no re-step brings the
+    /// old row back (its own window was overwritten the same way). A
+    /// compressor's state ring (slot `p % ratio`) loses its group's earlier
+    /// positions the same way. The body's rollback takes back exactly the
+    /// last position; a prefix of a cache that never wrapped its ring is not
+    /// granted either.
+    fn keepable(&self, n: usize) -> usize {
+        let n = n.min(self.pos);
+        if n + 1 >= self.pos { n } else { 0 }
+    }
+
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        if n == self.pos {
+            return Ok(());
+        }
+        if n + 1 != self.pos {
+            return Err(EngineError(format!(
+                "cut to position {n} from {}: only the last position can be taken back",
+                self.pos
+            )));
+        }
+        let pos =
+            u32::try_from(n).map_err(|_| EngineError(format!("cut to position {n}: past u32")))?;
+        self.call(Cmd::Rollback(pos)).map(|_| ())
     }
 
     fn ctx_max(&self) -> usize {

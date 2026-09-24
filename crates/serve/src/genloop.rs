@@ -8,6 +8,7 @@
 //! spans `predicted_n - 1` decode steps.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -27,6 +28,8 @@ pub(crate) struct GenParams {
     pub timings_per_token: bool,
     pub return_progress: bool,
     pub include_usage: bool,
+    /// Keep the longest cached prefix of the prompt (llama-server's default `true`).
+    pub cache_prompt: bool,
 }
 
 /// llama-server's `timings` object, as the server clocked it.
@@ -38,6 +41,8 @@ pub(crate) struct Timings {
     pub predicted_ms: f64,
     pub n_ctx: usize,
     pub n_past: usize,
+    /// Prompt positions kept from the previous request instead of evaluated.
+    pub cache_n: usize,
 }
 
 impl Timings {
@@ -56,7 +61,7 @@ impl Timings {
             "predicted_per_second": 1e3 / self.predicted_ms * dn,
             "n_ctx": self.n_ctx,
             "n_past": self.n_past,
-            "cache_n": 0,
+            "cache_n": self.cache_n,
         })
     }
 }
@@ -131,21 +136,86 @@ fn choose(sampler: &mut Option<Sampler>, greedy: u32, logits: &[f32], history: &
     }
 }
 
-/// Runs one request on a reset engine. `ids` is non-empty and shorter than the context.
+/// The one slot: the engine and the ids its cache holds, one per position.
+pub(crate) struct Slot {
+    pub engine: Box<dyn Engine>,
+    vocab: Arc<dyn Tokenizer>,
+    /// Every id the engine has evaluated since its last reset, in order. The
+    /// last generated id of a request is not in it: it is never fed back.
+    held: Vec<u32>,
+}
+
+impl Slot {
+    pub(crate) fn new(engine: Box<dyn Engine>) -> Slot {
+        Slot {
+            vocab: engine.tokenizer(),
+            engine,
+            held: Vec::new(),
+        }
+    }
+
+    /// Brings the cache to the longest prefix of `ids` it can keep, leaving at
+    /// least the last id for `next`, and returns that length. `want` false
+    /// (`cache_prompt: false`) always resets. While an engine call is in flight
+    /// `held` is empty, so a failed call leaves no claim about the cache.
+    fn reuse(&mut self, ids: &[u32], want: bool) -> Result<usize, EngineError> {
+        let common = if want {
+            self.held
+                .iter()
+                .zip(ids)
+                .take_while(|(a, b)| a == b)
+                .count()
+        } else {
+            0
+        };
+        let ask = common.min(ids.len() - 1);
+        let k = self.engine.keepable(ask).min(ask);
+        let held = std::mem::take(&mut self.held);
+        if k == 0 {
+            self.engine.reset()?;
+        } else if k < held.len() {
+            self.engine.cut(k)?;
+        }
+        self.held = held;
+        self.held.truncate(k);
+        Ok(k)
+    }
+
+    /// `prefill` that books what it fed.
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        let held = std::mem::take(&mut self.held);
+        self.engine.prefill(ids)?;
+        self.held = held;
+        self.held.extend_from_slice(ids);
+        Ok(())
+    }
+
+    /// `next` that books what it fed.
+    fn next(&mut self, last: u32, logits: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        let held = std::mem::take(&mut self.held);
+        let g = self.engine.next(last, logits)?;
+        self.held = held;
+        self.held.push(last);
+        Ok(g)
+    }
+}
+
+/// Runs one request on the slot. `ids` is non-empty and shorter than the context.
 /// `timings` in the returned outcome are filled even when the sink failed midway
 /// (the caller's counters still see the work done). A greedy request never asks the
-/// engine for its logits.
+/// engine for its logits. `tick` sees the timings after every generated token.
 pub(crate) fn generate(
-    engine: &mut dyn Engine,
-    vocab: &dyn Tokenizer,
+    slot: &mut Slot,
     factory: &SamplerFactory,
     ids: &[u32],
     p: &GenParams,
     sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+    tick: &mut dyn FnMut(&Timings),
     timings_out: &mut Timings,
 ) -> Result<Outcome, GenError> {
     let n = ids.len();
-    let ctx_max = engine.ctx_max();
+    let ctx_max = slot.engine.ctx_max();
+    let vocab = Arc::clone(&slot.vocab);
     let mut sampler = (p.sampling.temperature > 0.0).then(|| factory(&p.sampling));
     let mut logits = vec![
         0.0f32;
@@ -155,16 +225,17 @@ pub(crate) fn generate(
             0
         }
     ];
-    engine.reset()?;
+    let cache_n = slot.reuse(ids, p.cache_prompt)?;
     let t0 = Instant::now();
-    engine.prefill(&ids[..n - 1])?;
-    let greedy = engine.next(ids[n - 1], out(&mut logits))?;
+    slot.prefill(&ids[cache_n..n - 1])?;
+    let greedy = slot.next(ids[n - 1], out(&mut logits))?;
     let tim = timings_out;
     *tim = Timings {
         prompt_n: n,
         prompt_ms: ms_since(t0),
         n_ctx: ctx_max,
         n_past: n,
+        cache_n,
         ..Timings::default()
     };
     let t1 = Instant::now();
@@ -185,6 +256,7 @@ pub(crate) fn generate(
             generated.push(tok);
             tim.predicted_n = generated.len();
             tim.predicted_ms = ms_since(t1);
+            tick(tim);
             if tok == eos && !p.ignore_eos {
                 stop = StopKind::Eos;
                 break;
@@ -208,7 +280,7 @@ pub(crate) fn generate(
                 truncated = true;
                 break;
             }
-            let g = engine.next(tok, out(&mut logits))?;
+            let g = slot.next(tok, out(&mut logits))?;
             tim.n_past = n + generated.len();
             tok = choose(&mut sampler, g, &logits, &generated);
         }
