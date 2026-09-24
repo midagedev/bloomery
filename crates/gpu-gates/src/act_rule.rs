@@ -285,6 +285,216 @@ pub fn dot_q3k(row: &[u8], a: &Q8K, sb0: usize) -> f32 {
     (s[0] + s[2]) + (s[1] + s[3])
 }
 
+// ---- opg-woaidx ----
+
+/// Host threads for the row walks below.
+const ROW_THREADS: usize = 16;
+
+/// A Q3_K weight on the host as both sides' rules read it: the file's rows
+/// (for [`dot_q3k`]), the dequantized values (exact in f32), and per value
+/// the pair ([`q3k_fields`]) the dot's magnitude is read from.
+pub struct Q3kWeight {
+    /// Values per row.
+    pub k: usize,
+    pub rows: usize,
+    /// Row-major, `k / QK_K` super-blocks of [`Q3K_BYTES`] per row.
+    pub bytes: Vec<u8>,
+    /// Row-major.
+    pub deq: Vec<f32>,
+    /// Row-major, one per value.
+    pub fields: Vec<(f32, i8)>,
+}
+
+impl Q3kWeight {
+    /// `rows` rows of `k` values from `bytes`, the tensor's data. Refused
+    /// unless `k` is whole super-blocks, `bytes` is exactly the rows, and the
+    /// field walk gives every weight `dequant_row` gives.
+    pub fn new(bytes: &[u8], k: usize, rows: usize) -> Result<Q3kWeight, String> {
+        if k == 0 || !k.is_multiple_of(QK_K) {
+            return Err(format!("Q3_K K={k}: not whole super-blocks"));
+        }
+        let row_bytes = k / QK_K * Q3K_BYTES;
+        if bytes.len() != rows * row_bytes {
+            return Err(format!(
+                "Q3_K: {} bytes for {rows} rows of {k} values",
+                bytes.len()
+            ));
+        }
+        let mut deq = vec![0.0f32; rows * k];
+        for (r, out) in deq.chunks_mut(k).enumerate() {
+            gguf::quant::dequant_row(
+                GgmlType::Q3_K,
+                &bytes[r * row_bytes..(r + 1) * row_bytes],
+                out,
+            )
+            .map_err(|e| format!("Q3_K row {r}: {e}"))?;
+        }
+        let fields = q3k_fields(bytes);
+        let exact = deq
+            .iter()
+            .zip(&fields)
+            .all(|(&w, &(s, q))| w.abs().to_bits() == (s * f32::from(q)).abs().to_bits());
+        if !exact {
+            return Err("Q3_K: the field walk disagrees with dequant_row".to_string());
+        }
+        Ok(Q3kWeight {
+            k,
+            rows,
+            bytes: bytes.to_vec(),
+            deq,
+            fields,
+        })
+    }
+
+    /// Row `r`'s bytes.
+    #[must_use]
+    pub fn row(&self, r: usize) -> &[u8] {
+        let n = self.k / QK_K * Q3K_BYTES;
+        &self.bytes[r * n..(r + 1) * n]
+    }
+}
+
+/// Per value of Q3_K super-blocks, in value order: the sub-block's
+/// `|d · sc|` ([`q3k_scales`], rounded once in f32 as `dequantize_row_q3_K`
+/// rounds it) and the signed code `q = u − 4 ∈ [−4, 3]`, so the weight is
+/// `±|d·sc|·q` and ik's dot adds the `u = q + 4` and `−4` parts apart.
+#[must_use]
+pub fn q3k_fields(row: &[u8]) -> Vec<(f32, i8)> {
+    let mut out = Vec::with_capacity(row.len() / Q3K_BYTES * QK_K);
+    for blk in row.as_chunks::<Q3K_BYTES>().0 {
+        let d = half_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
+        let sc = q3k_scales(blk[96..108].try_into().expect("twelve scale bytes"));
+        for v in 0..QK_K {
+            let (j, l, m) = (v / 128, (v % 128) / 32, v % 32);
+            let q2 = (blk[32 + 32 * j + m] >> (2 * l)) & 3;
+            let h = (blk[m] >> (4 * j + l)) & 1;
+            let dl = (d * sc[v / 16] as f32).abs();
+            out.push((dl, (q2 | (h << 2)) as i8 - 4));
+        }
+    }
+    out
+}
+
+/// Our q8_1 activation (`cores::q8_quad`) of `x`, whole blocks of
+/// [`Q8_1_BLOCK`]: per block `d = amax/127` (1 for an all-zero block),
+/// `q = round(x/d)` half away from zero, clamped to ±127 — each value's
+/// `q·d` exact in f64.
+#[must_use]
+pub fn q8_1_exact(x: &[f32]) -> Vec<f64> {
+    x.chunks(Q8_1_BLOCK)
+        .flat_map(|b| {
+            let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            b.iter()
+                .map(move |&v| f64::from((v / d).round().clamp(-127.0, 127.0)) * f64::from(d))
+        })
+        .collect()
+}
+
+/// ik's q8_K activation of `x` ([`quantize_q8_k`]) — each value's `q·d`
+/// exact in f64.
+#[must_use]
+pub fn q8k_exact(x: &[f32]) -> Vec<f64> {
+    let a = quantize_q8_k(x);
+    a.q.iter()
+        .enumerate()
+        .map(|(c, &q)| f64::from(q) * f64::from(a.d[c / QK_K]))
+        .collect()
+}
+
+/// One Q3_K row against one input window, both rules exact in f64 and the
+/// bands around them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Q3kRow {
+    /// The row against our q8_1 values ([`q8_1_exact`]).
+    pub ours: f64,
+    /// The row against ik's q8_K values ([`q8k_exact`]).
+    pub ik: f64,
+    /// How far ik's AVX2 dot ([`dot_q3k`]) may sit from `ik`: `γ(2·n_sb + 4)`
+    /// of the magnitudes it sums — per super-block the `u` part and the `−4`
+    /// part each enter a lane by one fused multiply-add after one rounded
+    /// scale product, and eight lanes meet in a three-level sum.
+    pub ik_band: f64,
+    /// How far our kernel may sit from ik's dot: the two activations'
+    /// distances to `x` weighted by `|w|` (each within half its own step of
+    /// `x`), `ik_band`, and the gemv's [`crate::KERNEL_BAND`] of the rows'
+    /// largest `|ours|` — the kernel against the exact dot of its own q8_1
+    /// values, the band `gate_p1` pins.
+    pub band: f64,
+}
+
+/// [`Q3kRow`] for every row of `w`, row `r` against window
+/// `r / rows_per_window` of `x` (`w.k` values each). The kernel band's
+/// largest `|ours|` is over all the rows.
+#[must_use]
+pub fn q3k_rows(w: &Q3kWeight, x: &[f32], rows_per_window: usize) -> Vec<Q3kRow> {
+    let k = w.k;
+    let xo = q8_1_exact(x);
+    let xi = q8k_exact(x);
+    let (xo, xi) = (&xo[..], &xi[..]);
+    let n_sb = k / QK_K;
+    let mut rows = vec![Q3kRow::default(); w.rows];
+    let chunk = w.rows.div_ceil(ROW_THREADS).max(1);
+    std::thread::scope(|s| {
+        for (c, part) in rows.chunks_mut(chunk).enumerate() {
+            s.spawn(move || {
+                for (i, o) in part.iter_mut().enumerate() {
+                    let j = c * chunk + i;
+                    let x0 = j / rows_per_window * k;
+                    let (wr, fr) = (&w.deq[j * k..(j + 1) * k], &w.fields[j * k..(j + 1) * k]);
+                    let (mut so, mut si, mut mag, mut qd) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                    for (((&wv, &(sc, q)), (&a, &b)), &xv) in wr
+                        .iter()
+                        .zip(fr)
+                        .zip(xo[x0..x0 + k].iter().zip(&xi[x0..x0 + k]))
+                        .zip(&x[x0..x0 + k])
+                    {
+                        let wv = f64::from(wv);
+                        so += wv * a;
+                        si += wv * b;
+                        mag += f64::from(sc) * b.abs() * (f64::from(q + 4) + 4.0);
+                        qd += wv.abs() * ((a - f64::from(xv)).abs() + (b - f64::from(xv)).abs());
+                    }
+                    let ik_band = crate::rounding::gamma(2 * n_sb + 4) * mag;
+                    *o = Q3kRow {
+                        ours: so,
+                        ik: si,
+                        ik_band,
+                        band: qd + ik_band,
+                    };
+                }
+            });
+        }
+    });
+    let big = rows.iter().fold(0.0f64, |a, r| a.max(r.ours.abs()));
+    for r in &mut rows {
+        r.band += f64::from(crate::KERNEL_BAND) * big;
+    }
+    rows
+}
+
+/// ik's output of every row of `w`, row `r` against window
+/// `r / rows_per_window` of `x` (`w.k` values each): the q8_K blocks of `x`
+/// ([`quantize_q8_k`]), then [`dot_q3k`] from the window's first block.
+#[must_use]
+pub fn ik_q3k_rows(w: &Q3kWeight, x: &[f32], rows_per_window: usize) -> Vec<f32> {
+    let a = quantize_q8_k(x);
+    let (a, sb) = (&a, w.k / QK_K);
+    let mut out = vec![0.0f32; w.rows];
+    let chunk = w.rows.div_ceil(ROW_THREADS).max(1);
+    std::thread::scope(|s| {
+        for (c, part) in out.chunks_mut(chunk).enumerate() {
+            s.spawn(move || {
+                for (i, o) in part.iter_mut().enumerate() {
+                    let r = c * chunk + i;
+                    *o = dot_q3k(w.row(r), a, r / rows_per_window * sb);
+                }
+            });
+        }
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Act, QK_K, dot_q3k, q3k_scales, quantize_q8_k};

@@ -6,7 +6,8 @@
 //! bucket top-k, `lid_top_k`) and unfused (`lid_kq`, `lid_score`,
 //! `lid_score_masked` and an argsort), gets two launches of the op:
 //!
-//! - run A, the engine's path: our q8_0 gemv of the dump's `qr_norm-L` (f32
+//! - run A, the engine's path: our gemv of the dump's `qr_norm-L` in the
+//!   file's type of `attn_q_b` (q8_0 on f32 activations, or q3_K on q8_1
 //!   activations) and our q3_K gemv of its `attn_norm-L` (q8_1 activations)
 //!   feed the indexer;
 //! - run B, ik's projections: the dump's `lid_q-L` and `lid_weights-L` feed
@@ -17,12 +18,16 @@
 //!   against this binary's transcription of our rope and transform on its own
 //!   gemv output and of the scale, bit for bit, and against the dump
 //!   (`lid_q_hadamard`, the `SCALE` node) within a band derived from each
-//!   gemv's distance to ik's ([`q8_rows`], [`q3k_rows`]) carried through the
-//!   rope and the transform ([`query_band`]). Run B's bit for bit against the
-//!   dump: our table, pairs and transform are ik's op for op. ik's rule is
-//!   simulated as well: its q8_2 dot against `lid_q` and its rope and
-//!   transform against `indexer_q` and `lid_q_hadamard` bit for bit, its
-//!   q3_K dot within its lanes' roundings of `lid_weights`.
+//!   gemv's distance to ik's ([`q8_rows`], `act_rule::q3k_rows`) carried
+//!   through the rope and the transform ([`query_band`]); a q3_K query gemv
+//!   also by itself, each row against the exact dot of our q8_1 values
+//!   within `KERNEL_BAND` and against `lid_q` within its row's band. Run B's
+//!   bit for bit against the dump: our table, pairs and transform are ik's
+//!   op for op.
+//!   ik's rule is simulated as well: its dot against `lid_q` (q8_2 under a
+//!   q8_0 `attn_q_b`, `act_rule::dot_q3k` on q8_K under a q3_K one) and its
+//!   rope and transform against `indexer_q` and `lid_q_hadamard` bit for bit,
+//!   its q3_K dot of `proj` within its lanes' roundings of `lid_weights`.
 //! - (ii) the scores of both runs against our rule ([`rule`]) within the
 //!   tensor-core band; run B's against the unfused dump's `lid_score` within
 //!   that band, our split's representation error and ik's own band.
@@ -68,7 +73,7 @@ mod gate {
     use std::collections::HashMap;
     use std::f32::consts::FRAC_1_SQRT_2;
 
-    use bloomery_gpu::weights::q8_0_planes;
+    use bloomery_gpu::weights::{DevWeight, q8_0_planes, upload_file_tensor};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT, SelectedRows};
     use bloomery_gpu_deepseek41::index_key::HT_SCALE;
@@ -77,17 +82,18 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::params::rope_specs;
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
+    use bloomery_gpu_gates::act_rule::{self, Q3kWeight};
     use bloomery_gpu_gates::ik_q8_2::{self, QK, folded, half_sum};
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1_UNFUSED, D1N, D2, D2_UNFUSED};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, activations, bits_equal,
-        bytes_to_words, checks_failed, max_rel_err, no_local_depot, ref_ints, ref_model_path,
+        checks_failed, max_rel_err, no_local_depot, ref_ints, ref_model_path,
         ref_tensor_logical_in, verdict, widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
-    use gguf::quant::{GgmlType, Q8Block, dequant_row, f32_to_f16_bits, half_to_f32};
+    use gguf::quant::{GgmlType, Q8Block, f32_to_f16_bits, half_to_f32};
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
@@ -202,15 +208,11 @@ mod gate {
         })
     }
 
-    /// A q3_K weight on the device and on the host.
+    /// A q3_K weight on the host as both rules read it, and on the device
+    /// in the loader's own packing (`upload_file_tensor`).
     struct Q3 {
-        k: usize,
-        rows: usize,
+        host: Q3kWeight,
         dev: DeviceTensor<u32>,
-        /// The dequantized rows, exact in f32, row-major.
-        deq: Vec<f32>,
-        /// Per weight, as ik's dot splits it ([`q3k_fields`]).
-        fields: Vec<(f32, i8)>,
     }
 
     fn load_q3(split: &Split, stream: &CudaStream, name: &str) -> Result<Q3, GateError> {
@@ -221,84 +223,15 @@ mod gate {
             return Err(format!("{name} has dims {:?}, want [K, rows]", t.dims).into());
         };
         let (k, rows) = (usize::try_from(k)?, usize::try_from(rows)?);
-        if t.ty != GgmlType::Q3_K || !k.is_multiple_of(512) {
-            return Err(format!(
-                "{name} is {:?} K={k}, want q3_K with K a multiple of 512",
-                t.ty
-            )
-            .into());
+        if t.ty != GgmlType::Q3_K {
+            return Err(format!("{name} is {:?} K={k}, want q3_K", t.ty).into());
         }
-        let bytes = split.shard(s).ok_or("shard index out of range")?.data(t)?;
-        let row_bytes = k / 256 * 110;
-        let mut deq = vec![0.0f32; rows * k];
-        for (r, out) in deq.chunks_mut(k).enumerate() {
-            dequant_row(
-                GgmlType::Q3_K,
-                &bytes[r * row_bytes..(r + 1) * row_bytes],
-                out,
-            )?;
-        }
-        let fields = q3k_fields(bytes);
-        let exact = deq
-            .iter()
-            .zip(&fields)
-            .all(|(&w, &(s, q))| w.abs().to_bits() == (s * f32::from(q)).abs().to_bits());
-        if !exact {
-            return Err(format!("{name}: the q3_K field walk disagrees with dequant_row").into());
-        }
-        let words = bytes_to_words(bytes);
-        let dev = DeviceTensor::upload(stream, &words, rows, row_bytes / 4)?;
-        Ok(Q3 {
-            k,
-            rows,
-            dev,
-            deq,
-            fields,
-        })
-    }
-
-    /// A q3_K row as ik's AVX2 dot sees it: per weight the sub-block's
-    /// `|d · (scale − 32)|` and its 3-bit value `q ∈ [−4, 3]`
-    /// (`gguf::quant`'s `dequant_q3_k` walk), so the weight is `±that · q`
-    /// and the dot adds `(q + 4)` and `−4` parts separately.
-    fn q3k_fields(row: &[u8]) -> Vec<(f32, i8)> {
-        const KMASK1: u32 = 0x0303_0303;
-        const KMASK2: u32 = 0x0f0f_0f0f;
-        let mut out = Vec::with_capacity(row.len() / 110 * 256);
-        for blk in row.as_chunks::<110>().0 {
-            let (hm, qs) = (&blk[0..32], &blk[32..96]);
-            let d_all = half_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
-            let mut aux = [0u32; 4];
-            for (i, a) in aux.iter_mut().take(3).enumerate() {
-                let s = &blk[96 + 4 * i..100 + 4 * i];
-                *a = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-            }
-            let tmp = aux[2];
-            aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
-            aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
-            aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
-            aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
-            let scales: [i8; 16] = core::array::from_fn(|i| aux[i / 4].to_le_bytes()[i % 4] as i8);
-            let (mut is, mut m) = (0usize, 1u8);
-            for half in 0..2 {
-                let q = &qs[32 * half..32 * half + 32];
-                let mut shift = 0u32;
-                for _field in 0..4 {
-                    for half16 in 0..2 {
-                        let dl = (d_all * (i32::from(scales[is]) - 32) as f32).abs();
-                        is += 1;
-                        for l in 0..16 {
-                            let qv = ((q[16 * half16 + l] >> shift) & 3) as i8;
-                            let hv = if hm[16 * half16 + l] & m != 0 { 0 } else { 4 };
-                            out.push((dl, qv - hv));
-                        }
-                    }
-                    shift += 2;
-                    m <<= 1;
-                }
-            }
-        }
-        out
+        let shard = split.shard(s).ok_or("shard index out of range")?;
+        let host = Q3kWeight::new(shard.data(t)?, k, rows).map_err(|e| format!("{name}: {e}"))?;
+        let DevWeight::KQuant { w: dev, .. } = upload_file_tensor(stream, shard, t)? else {
+            return Err(format!("{name}: the loader did not pack it as a K-quant").into());
+        };
+        Ok(Q3 { host, dev })
     }
 
     // ----------------------------------------------------------- gemv bands
@@ -359,86 +292,6 @@ mod gate {
             }
         });
         out
-    }
-
-    /// Our q8_1 activation (`cores::q8_quad`) of one column: per 128-value
-    /// block `d = amax/127` (1 for an all-zero block), `q = round(x/d)` half
-    /// away from zero, clamped to ±127 — each value's exact `q·d`.
-    fn q8_1_exact(x: &[f32]) -> Vec<f64> {
-        x.chunks(128)
-            .flat_map(|b| {
-                let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                b.iter()
-                    .map(move |&v| f64::from((v / d).round().clamp(-127.0, 127.0)) * f64::from(d))
-            })
-            .collect()
-    }
-
-    /// ik's q8_K activation as its AVX2 build quantizes it
-    /// (`iqk_quantize_row_q8_K`): per 256-value block `d = max|x| / 127`,
-    /// `q = rne(x · (127 / max|x|))` (the product rounded to f32 first), all
-    /// zero for an all-zero block — each value's exact `q·d`.
-    fn q8k_exact(x: &[f32]) -> Vec<f64> {
-        x.chunks(256)
-            .flat_map(|b| {
-                let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                let d = amax / 127.0;
-                let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-                b.iter().map(move |&v| {
-                    let q = (id * v).round_ties_even().clamp(-128.0, 127.0);
-                    f64::from(q) * f64::from(d)
-                })
-            })
-            .collect()
-    }
-
-    /// One q3_K row of one column: ik's dot of its q8_K values (exact in
-    /// f64); the band of ik's AVX2 kernel around it, `γ(2·n_sb + 4)` of the
-    /// magnitudes it sums (per super-block the `(q + 4)` part and the `−4`
-    /// part each enter a lane accumulator by one fused multiply-add after one
-    /// rounded scale product, and eight lanes meet in a three-level sum); and
-    /// the bound on our gemv's distance to the dump: the two activations'
-    /// distances to `x` weighted by `|w|` (each within half its own step of
-    /// `x`), ik's band, and our gemv's `KERNEL_BAND` of the largest row
-    /// against the exact dot of its own q8_1 values.
-    struct Q3Row {
-        ik: f64,
-        ik_band: f64,
-        band: f64,
-    }
-
-    fn q3k_rows(w: &Q3, x: &[f32]) -> Vec<Q3Row> {
-        let k = w.k;
-        let xo = q8_1_exact(x);
-        let xi = q8k_exact(x);
-        let n_sb = k / 256;
-        let mut rows = Vec::with_capacity(w.rows);
-        let mut big = 0.0f64;
-        for j in 0..w.rows {
-            let (wr, fr) = (&w.deq[j * k..(j + 1) * k], &w.fields[j * k..(j + 1) * k]);
-            let (mut so, mut si, mut mag, mut qd) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-            for (((&wv, &(sc, q)), (&a, &b)), &xv) in
-                wr.iter().zip(fr).zip(xo.iter().zip(&xi)).zip(x)
-            {
-                let wv = f64::from(wv);
-                so += wv * a;
-                si += wv * b;
-                mag += f64::from(sc) * b.abs() * (f64::from(q + 4) + 4.0);
-                qd += wv.abs() * ((a - f64::from(xv)).abs() + (b - f64::from(xv)).abs());
-            }
-            big = big.max(so.abs());
-            let ik_band = gamma(2 * n_sb + 4) * mag;
-            rows.push(Q3Row {
-                ik: si,
-                ik_band,
-                band: qd + ik_band,
-            });
-        }
-        for r in &mut rows {
-            r.band += f64::from(KERNEL_BAND) * big;
-        }
-        rows
     }
 
     // ------------------------------------------------------ query rules
@@ -887,6 +740,37 @@ mod gate {
             }
             Ok(())
         }
+
+        /// `name` in the file's type: q8_0 or q3_K, the two whose rules the
+        /// gate transcribes; any other is refused with the tensor named.
+        fn ensure_q8_or_q3(&mut self, name: &str) -> Result<(), GateError> {
+            let (_, t) = self
+                .split
+                .find(name)
+                .ok_or_else(|| format!("{name} is not in the model file"))?;
+            match t.ty {
+                GgmlType::Q8_0 => self.ensure_q8(name),
+                GgmlType::Q3_K => self.ensure_q3(name),
+                ty => Err(format!(
+                    "{name} is {ty:?} {:?}, want Q8_0 or Q3_K: the gate has no rule for it",
+                    t.dims
+                )
+                .into()),
+            }
+        }
+    }
+
+    /// Our q3_K gemv of one column `x` at m = 1: its q8_1 form, then
+    /// `q3k_gemv` — the engine's dense path for a q3_K projection.
+    fn q3k_gemv(cx: &Cx, w: &Q3, x: &[f32]) -> Result<Vec<f32>, GateError> {
+        let stream = cx.gpu.stream();
+        let x_dev = DeviceBuffer::from_host(stream, x)?;
+        let mut act = Q8Act::with_k(stream, 1, w.host.k)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, w.host.rows)?;
+        cx.gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+        cx.gpu.enqueue_gemv_q3k(&w.dev, &act, &mut y)?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -1170,13 +1054,17 @@ mod gate {
         let tables_same = bits_equal(&cs, &cs_ik);
         let scale = cx.kernels.scale();
 
-        // Run A's gemvs, and ik's rules for them.
-        cx.ensure_q8(&q_name)?;
+        // Run A's gemvs, and ik's rules for them: the query's in the file's
+        // type of attn_q_b, each row's band and ik's value. A q3_K query
+        // gemv is also pinned by itself, per row: against the exact dot of
+        // our q8_1 values within KERNEL_BAND (gate_p1's form), and against
+        // the dump within its row's band — through the rope and the
+        // transform a row's defect is diluted by the other rows' bands.
+        cx.ensure_q8_or_q3(&q_name)?;
         cx.ensure_q3(&w_name)?;
         let cx = &*cx;
-        let q8 = &cx.q8[&q_name];
-        let q8r = q8_rows(q8, &x_q);
-        let q_raw_a = {
+        let (q_raw_a, dl, q_ik, q_dot, q_gemv) = if let Some(q8) = cx.q8.get(&q_name) {
+            let q8r = q8_rows(q8, &x_q);
             let stream = cx.gpu.stream();
             let x_dev = DeviceBuffer::from_host(stream, &x_q)?;
             let mut y = DeviceBuffer::<f32>::zeroed(stream, q8.rows)?;
@@ -1184,20 +1072,32 @@ mod gate {
                 .q8f32()
                 .enqueue_q8_0_gemv(stream, &q8.qs, &q8.d, &x_dev, 1, &mut y)?;
             stream.synchronize()?;
-            y.to_host_vec(stream)?
+            let dl: Vec<f64> = q8r.iter().map(|r| r.band).collect();
+            let ik: Vec<f32> = q8r.iter().map(|r| r.ik).collect();
+            (y.to_host_vec(stream)?, dl, ik, "q8_2_dot", None)
+        } else {
+            let q3 = &cx.q3[&q_name];
+            let rows = act_rule::q3k_rows(&q3.host, &x_q, q3.host.rows);
+            let ik = act_rule::ik_q3k_rows(&q3.host, &x_q, q3.host.rows);
+            let y = q3k_gemv(cx, q3, &x_q)?;
+            let ours: Vec<f32> = rows.iter().map(|r| r.ours as f32).collect();
+            let rel = max_rel_err(&y, &ours).unwrap_or(f32::INFINITY);
+            let over = y
+                .iter()
+                .zip(&d_q)
+                .zip(&rows)
+                .filter(|&((&g, &v), r)| outside((f64::from(g) - f64::from(v)).abs(), r.band))
+                .count();
+            let dl = rows.iter().map(|r| r.band).collect();
+            (y, dl, ik, "q3k_dot", Some((rel, over)))
         };
+        let q_gemv_ok = q_gemv.is_none_or(|(rel, over)| rel <= KERNEL_BAND && over == 0);
+        let q_gemv_line = q_gemv.map_or_else(String::new, |(rel, over)| {
+            format!(" q_gemv_vs_ours_rel={rel:.3e} q_gemv_over={over}/{nq}")
+        });
         let q3 = &cx.q3[&w_name];
-        let q3r = q3k_rows(q3, &x_w);
-        let w_raw_a = {
-            let stream = cx.gpu.stream();
-            let x_dev = DeviceBuffer::from_host(stream, &x_w)?;
-            let mut act = Q8Act::with_k(stream, 1, q3.k)?;
-            let mut y = DeviceBuffer::<f32>::zeroed(stream, q3.rows)?;
-            cx.gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
-            cx.gpu.enqueue_gemv_q3k(&q3.dev, &act, &mut y)?;
-            stream.synchronize()?;
-            y.to_host_vec(stream)?
-        };
+        let q3r = act_rule::q3k_rows(&q3.host, &x_w, q3.host.rows);
+        let w_raw_a = q3k_gemv(cx, q3, &x_w)?;
         if q_raw_a.len() != nq || w_raw_a.len() != HEADS {
             return Err(format!(
                 "layer {l}: the projections are {} and {} wide",
@@ -1223,10 +1123,10 @@ mod gate {
         let host_w: Vec<f32> = w_raw_a.iter().map(|&v| v * scale).collect();
         let w_rule = bits_equal(&a.w, &host_w);
         // Layer 2: ik's rules against the dump.
-        let ik_q_same = q8r
+        let ik_q_same = q_ik
             .iter()
             .zip(&d_q)
-            .filter(|(r, v)| r.ik.to_bits() == v.to_bits())
+            .filter(|(r, v)| r.to_bits() == v.to_bits())
             .count();
         let ik_rope_same = d_q
             .chunks(HEAD_DIM)
@@ -1253,7 +1153,6 @@ mod gate {
             .zip(&d_scaled)
             .all(|(&v, &s)| (v * scale).to_bits() == s.to_bits());
         // Layer 3: run A against the dump.
-        let dl: Vec<f64> = q8r.iter().map(|r| r.band).collect();
         let qb = query_band(&q_raw_a, &dl, &cs);
         let (mut q_over, mut q_worst) = (0usize, 0.0f64);
         for (i, (&x, &y)) in a.q.iter().zip(&d_hada).enumerate() {
@@ -1274,6 +1173,7 @@ mod gate {
         let q_b = bits_equal(&b.q, &d_hada);
         let w_b = bits_equal(&b.w, &d_scaled);
         let i_ok = q_rule
+            && q_gemv_ok
             && w_rule
             && ik_q_same == nq
             && ik_rope_same == HEADS
@@ -1354,9 +1254,9 @@ mod gate {
         let pass = i_ok && ii_ok && iii_ok && hist && rerun;
         println!(
             "layer set={label} layer={l} n_vis={n_vis} rows={rows} top_k={k} — (i) A:q_rule_bits={q_rule} \
-             w_rule_bits={w_rule} q_over={q_over}/{nq} q_worst={q_worst:.3} q_rel={q_rel:.2e} \
+             w_rule_bits={w_rule}{q_gemv_line} q_over={q_over}/{nq} q_worst={q_worst:.3} q_rel={q_rel:.2e} \
              w_over={w_over}/{HEADS} w_worst={w_worst:.3} B:q_is_ik={q_b} w_is_ik={w_b} ik_sim: \
-             q8_2_dot={ik_q_same}/{nq} rope={ik_rope_same}/{HEADS} hadamard={ik_hada_same}/{HEADS} \
+             {q_dot}={ik_q_same}/{nq} rope={ik_rope_same}/{HEADS} hadamard={ik_hada_same}/{HEADS} \
              ht_scale={ht_scale_is} q3k_over={ik_w_over}/{HEADS} scale_bits={ik_scale} \
              table_is_ggml={tables_same} — (ii){ii_line} — (iii) B_vs_rule_off={dev_off} \
              ik_vs_rule_off={ik_off} tie_band_rows={band_rows} B_vs_ik_symdiff={symdiff} \

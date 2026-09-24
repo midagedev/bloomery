@@ -3,9 +3,12 @@
 //! `attn_output_a` is block-diagonal: group g multiplies weight rows
 //! `g·rank ..` with its slice of the attention output, heads
 //! `g·(n_head/groups) ..` (`build_deepseek4.cpp:1414-1428`). The engine runs
-//! all groups as ONE launch of `q8_0_gemv_heads`, a head per group: x window
-//! `g·group_k`, output span `g·rank`. That output order is the order
-//! `attn_output_b` reads, so wo_b is one plain `q8_0_gemv` on it.
+//! all groups as ONE launch, a head per group: `q8_0_gemv_heads` (x window
+//! `g·group_k`, output span `g·rank`) for a Q8_0 weight, and for a Q3_K one
+//! `ds41_q3k_gemv_heads` over a q8_1 activation of one column per group
+//! (`dense::DenseKernels::enqueue_q3k_heads`). That output order is the
+//! order `attn_output_b` reads, so wo_b is one plain gemv on it: `q8_0_gemv`,
+//! or `q3k_gemv` on its q8_1 form (`dense::DenseKernels::enqueue`).
 //!
 //! Sites: `attn_wo_a-L` and `attn_out-L` at every layer of every set — the
 //! 5-token prefill (`Set::Cpu`, T = 5, where ik copies the permuted groups
@@ -13,23 +16,32 @@
 //! where it only reshapes them, `build_deepseek4.cpp:1430-1434`). The engine's decode
 //! shape is m = 1, so a T-token site is T launches of that shape. Every
 //! input is the dump's own: `attn-L`, the ROPE_BACK output, for wo_a; the
-//! row `attn_out-L` reads for wo_b.
+//! row `attn_out-L` reads for wo_b. The file's type of each weight picks
+//! both sides' rules (`act_rule`); a type other than Q8_0 or Q3_K is refused
+//! at load with the tensor named.
 //!
 //! Per site, the B4 gate form:
-//! 1. the kernel against this binary's transcription of our rule — f32
-//!    activations; lane L fuses a multiply-add per value of code words L,
-//!    L+32, … in increasing order, each word in byte order; lane 0 of the
-//!    xor butterfly (`bloomery_gpu::q8f32` module doc) — bit-identical, and
-//!    a rerun bit-identical;
-//! 2. ik's rule (`bloomery_gpu_gates::ik_q8_2`) against the dump,
-//!    bit-identical: the activations quantized to q8_2 blocks, then the AVX2
-//!    Q8_0 × Q8_2 dot. With the two views proven against the dump's
-//!    own view rows bit for bit — wo_a's input is the permuted groups of
-//!    `attn-L`, wo_b's the permuted `attn_wo_a-L` — this proves which rows
-//!    meet which slice of the attention output;
+//! 1. the kernel against this binary's transcription of our rule, and a
+//!    rerun bit-identical. Q8_0: f32 activations; lane L fuses a
+//!    multiply-add per value of code words L, L+32, … in increasing order,
+//!    each word in byte order; lane 0 of the xor butterfly
+//!    (`bloomery_gpu::q8f32` module doc) — bit-identical. Q3_K: the exact
+//!    dot of the dequantized row with our q8_1 values
+//!    (`act_rule::q3k_rows`), within `KERNEL_BAND` of the largest output
+//!    (`gate_p1`'s form);
+//! 2. ik's rule against the dump, bit-identical. Q8_0: the activations
+//!    quantized to q8_2 blocks, then the AVX2 Q8_0 × Q8_2 dot
+//!    (`bloomery_gpu_gates::ik_q8_2`). Q3_K: q8_K blocks, then the AVX2
+//!    Q3_K × q8_K dot (`act_rule::quantize_q8_k`, `act_rule::dot_q3k`),
+//!    wo_a's row of group g from q8_K block `g·group_k/256` on. With the two
+//!    views proven against the dump's own view rows bit for bit — wo_a's
+//!    input is the permuted groups of `attn-L`, wo_b's the permuted
+//!    `attn_wo_a-L` — this proves which rows meet which slice of the
+//!    attention output;
 //! 3. the kernel against the dump: `ik_rel` printed, and every value inside
-//!    its own band ([`row_ref`]), the two rules' distance bounded through
-//!    ik's reconstruction of the activations, which layer 2 proves.
+//!    its own band ([`row_ref`] for Q8_0, `act_rule::q3k_rows` for Q3_K),
+//!    the two rules' distance bounded through ik's reconstruction of the
+//!    activations, which layer 2 proves.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -47,14 +59,16 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
-    use bloomery_gpu::weights::q8_0_planes;
-    use bloomery_gpu::{DeviceTensor, Gpu};
+    use bloomery_gpu::weights::{DevWeight, q8_0_planes, upload_file_tensor};
+    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
+    use bloomery_gpu_gates::act_rule::{self, Q3kWeight};
     use bloomery_gpu_gates::ik_q8_2::{self, QK, folded, half_sum};
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::rounding::{butterfly, gamma};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, RefRow, bits_equal, checks_failed, max_rel_err, open_split,
-        ref_tensor_logical_in, verdict,
+        GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, checks_failed, max_rel_err,
+        open_split, ref_tensor_logical_in, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -74,6 +88,67 @@ mod gate {
         rows: usize,
         qs: DeviceTensor<u32>,
         d: DeviceTensor<u16>,
+    }
+
+    /// A Q3_K weight twice: the host form both rules read, and the words the
+    /// loader uploads (`upload_file_tensor`, the engine's own packing).
+    struct Q3 {
+        host: Q3kWeight,
+        dev: DeviceTensor<u32>,
+    }
+
+    /// A projection's weight in the file's type: each side's rule follows
+    /// from it.
+    enum W {
+        Q8(Q8),
+        Q3(Q3),
+    }
+
+    impl W {
+        /// Values per row.
+        fn k(&self) -> usize {
+            match self {
+                W::Q8(w) => w.k,
+                W::Q3(w) => w.host.k,
+            }
+        }
+
+        fn rows(&self) -> usize {
+            match self {
+                W::Q8(w) => w.rows,
+                W::Q3(w) => w.host.rows,
+            }
+        }
+    }
+
+    /// Weight `name` of the model file, `[k, rows]` in ggml order: Q8_0 or
+    /// Q3_K, the two types whose rules the gate transcribes; any other is
+    /// refused with the tensor named.
+    fn load_w(split: &Split, stream: &CudaStream, name: &str) -> Result<W, GateError> {
+        let (s, t) = split
+            .find(name)
+            .ok_or_else(|| format!("{name} is not in the model file"))?;
+        match t.ty {
+            GgmlType::Q8_0 => return Ok(W::Q8(load_q8(split, stream, name)?)),
+            GgmlType::Q3_K => {}
+            ty => {
+                return Err(format!(
+                    "{name} is {ty:?} {:?}, want Q8_0 or Q3_K: the gate has no rule for it",
+                    t.dims
+                )
+                .into());
+            }
+        }
+        let &[k, rows] = t.dims.as_slice() else {
+            return Err(format!("{name} has dims {:?}, want [K, rows]", t.dims).into());
+        };
+        let (k, rows) = (usize::try_from(k)?, usize::try_from(rows)?);
+        let shard = split.shard(s).ok_or("shard index out of range")?;
+        let host = Q3kWeight::new(shard.data(t)?, k, rows).map_err(|e| format!("{name}: {e}"))?;
+        let DevWeight::KQuant { w: dev, .. } = upload_file_tensor(stream, shard, t)? else {
+            return Err(format!("{name}: the loader did not pack it as a K-quant").into());
+        };
+        Ok(W::Q3(Q3 { host, dev }))
     }
 
     /// Q8_0 tensor `name` of the model file, `[k, rows]` in ggml order, and
@@ -137,6 +212,8 @@ mod gate {
     /// values, and the band.
     #[derive(Clone, Copy, Default)]
     struct RowRef {
+        /// Q8_0: our rule's f32 value, which the kernel meets bit for bit;
+        /// Q3_K: the exact dot with our q8_1 values, rounded to f32 once.
         ours: f32,
         ik: f32,
         /// `|ours − ik|` in exact arithmetic (f64, whose sums round each term
@@ -213,6 +290,23 @@ mod gate {
         out
     }
 
+    /// Every row of a Q3_K weight against one token: ik's dot
+    /// (`act_rule::ik_q3k_rows`) and the exact rules and band of
+    /// `act_rule::q3k_rows`, row r reading window `r / rows_per_window`.
+    fn host_rows_q3k(w: &Q3kWeight, rows_per_window: usize, x: &[f32]) -> Vec<RowRef> {
+        let ik = act_rule::ik_q3k_rows(w, x, rows_per_window);
+        act_rule::q3k_rows(w, x, rows_per_window)
+            .iter()
+            .zip(ik)
+            .map(|(r, ik)| RowRef {
+                ours: r.ours as f32,
+                ik,
+                gap: (r.ours - r.ik).abs(),
+                band: r.band,
+            })
+            .collect()
+    }
+
     // --------------------------------------------------------------- the sets
 
     /// A reader's src column is `want`.
@@ -267,12 +361,7 @@ mod gate {
     /// Read layer `l` of `man`: the chain `attn-L` → reshape → permute →
     /// `attn_wo_a-L` → permute → cont (T > 1) or reshape (T = 1) →
     /// `attn_out-L`, each row's op, shape and src checked.
-    fn site_data(
-        man: &RefManifest,
-        l: usize,
-        a: &Q8,
-        b: &Q8,
-    ) -> Result<(Geom, SiteData), GateError> {
+    fn site_data(man: &RefManifest, l: usize, a: &W, b: &W) -> Result<(Geom, SiteData), GateError> {
         let dir = &man.dir;
         let name_a = format!("attn_wo_a-{l}");
         let (at_a, row_a) = man.tensor_at(&name_a, 0)?;
@@ -293,23 +382,23 @@ mod gate {
             .into());
         }
         let width = hd * nh;
-        if a.k == 0
-            || !width.is_multiple_of(a.k)
-            || !a.rows.is_multiple_of(width / a.k)
-            || b.k != a.rows
+        let (a_k, a_rows, b_k, b_rows) = (a.k(), a.rows(), b.k(), b.rows());
+        if a_k == 0
+            || !width.is_multiple_of(a_k)
+            || !a_rows.is_multiple_of(width / a_k)
+            || b_k != a_rows
         {
             return Err(format!(
-                "layer {l}: attention width {width}, wo_a [{}, {}], wo_b [{}, {}] do not group",
-                a.k, a.rows, b.k, b.rows
+                "layer {l}: attention width {width}, wo_a [{a_k}, {a_rows}], wo_b [{b_k}, {b_rows}] do not group"
             )
             .into());
         }
         let g = Geom {
             width,
-            group_k: a.k,
-            groups: width / a.k,
-            rank: a.rows / (width / a.k),
-            embd: b.rows,
+            group_k: a_k,
+            groups: width / a_k,
+            rank: a_rows / (width / a_k),
+            embd: b_rows,
         };
         resh.expect(
             &name_a,
@@ -382,6 +471,9 @@ mod gate {
     struct Tally {
         values: usize,
         kernel_ours: usize,
+        /// Q3_K: the largest `max_rel_err` of a token's kernel output against
+        /// our exact rule.
+        ours_rel: f32,
         rerun: bool,
         ik_dump: usize,
         over_band: usize,
@@ -401,16 +493,18 @@ mod gate {
     /// one token's input, `rows_per_window` places each weight row's window
     /// in it, and `dump` holds ik's outputs in the kernel's order.
     fn compare(
-        w: &Q8,
+        w: &W,
         rows_per_window: usize,
         inputs: &[f32],
         dump: &[f32],
         launch: &mut Launch<'_>,
     ) -> Result<Tally, GateError> {
-        let width = inputs.len() / (dump.len() / w.rows);
+        let rows = w.rows();
+        let width = inputs.len() / (dump.len() / rows);
         let mut tl = Tally {
             values: 0,
             kernel_ours: 0,
+            ours_rel: 0.0,
             rerun: true,
             ik_dump: 0,
             over_band: 0,
@@ -421,10 +515,20 @@ mod gate {
             kernel: Vec::with_capacity(dump.len()),
             dump: dump.to_vec(),
         };
-        for (x, want) in inputs.chunks_exact(width).zip(dump.chunks_exact(w.rows)) {
+        for (x, want) in inputs.chunks_exact(width).zip(dump.chunks_exact(rows)) {
             let y = launch(x)?;
             tl.rerun &= bits_equal(&y, &launch(x)?);
-            let refs = host_rows(w, rows_per_window, x);
+            let refs = match w {
+                W::Q8(w) => host_rows(w, rows_per_window, x),
+                W::Q3(w) => {
+                    let refs = host_rows_q3k(&w.host, rows_per_window, x);
+                    let ours: Vec<f32> = refs.iter().map(|r| r.ours).collect();
+                    tl.ours_rel = tl
+                        .ours_rel
+                        .max(max_rel_err(&y, &ours).unwrap_or(f32::INFINITY));
+                    refs
+                }
+            };
             for ((&got, &ik_val), r) in y.iter().zip(want).zip(&refs) {
                 tl.values += 1;
                 tl.kernel_ours += usize::from(got.to_bits() == r.ours.to_bits());
@@ -445,24 +549,36 @@ mod gate {
 
     /// Print one site's verdict line; true when it passes. A kernel output
     /// that is not finite (a slot left at the NaN fill) prints as the error
-    /// `max_rel_err` names and fails the site.
-    fn report(label: &str, l: usize, op: &str, t: usize, view: bool, tl: &Tally) -> bool {
+    /// `max_rel_err` names and fails the site. Layer 1 is bit for bit under
+    /// a Q8_0 weight and within [`KERNEL_BAND`] under a Q3_K one, whose op
+    /// prints with the type.
+    fn report(label: &str, l: usize, op: &str, t: usize, view: bool, w: &W, tl: &Tally) -> bool {
         let rel = max_rel_err(&tl.kernel, &tl.dump);
         let ik_rel = rel
             .as_ref()
             .map_or_else(|e| format!("[{e}]"), |e| format!("{e:.3e}"));
+        let (op, layer1, ours_ok) = match w {
+            W::Q8(_) => (
+                op.to_string(),
+                format!("kernel_vs_ours_bits={}/{}", tl.kernel_ours, tl.values),
+                tl.kernel_ours == tl.values,
+            ),
+            W::Q3(_) => (
+                format!("{op}[Q3_K]"),
+                format!("kernel_vs_ours_rel={:.3e}", tl.ours_rel),
+                tl.ours_rel <= KERNEL_BAND,
+            ),
+        };
         let pass = rel.is_ok()
-            && tl.kernel_ours == tl.values
+            && ours_ok
             && tl.rerun
             && tl.ik_dump == tl.values
             && view
             && tl.over_band == 0;
         println!(
-            "site set={label} L={l} op={op} T={t} values={} kernel_vs_ours_bits={}/{} rerun_bit_identical={} \
+            "site set={label} L={l} op={op} T={t} values={} {layer1} rerun_bit_identical={} \
              ik_sim_vs_dump_bits={}/{} input_view_bit_identical={view} ik_rel={ik_rel} \
              gap_rel={:.3e} band_rel={:.3e} over_band={} max_dev_over_band={:.3} {}",
-            tl.values,
-            tl.kernel_ours,
             tl.values,
             tl.rerun,
             tl.ik_dump,
@@ -480,38 +596,59 @@ mod gate {
     struct Cx<'a> {
         gpu: &'a Gpu,
         step: &'a StepKernels,
+        dense: &'a DenseKernels,
         stream: &'a CudaStream,
     }
 
-    /// wo_a of token `x` through `q8_0_gemv_heads`: a head per group. The
-    /// output starts as NaN, so a slot the kernel skips fails the bit check.
-    fn run_wo_a(cx: &Cx, w: &Q8, g: Geom, x: &[f32]) -> Result<Vec<f32>, GateError> {
+    /// wo_a of token `x`, a head per group: `q8_0_gemv_heads` under a Q8_0
+    /// weight, the q8_1 form of `x` as one column per group and
+    /// `ds41_q3k_gemv_heads` under a Q3_K one. The output starts as NaN, so a
+    /// slot the kernel skips fails the checks.
+    fn run_wo_a(cx: &Cx, w: &W, g: Geom, x: &[f32]) -> Result<Vec<f32>, GateError> {
         let x_dev = DeviceBuffer::from_host(cx.stream, x)?;
         let mut y = DeviceBuffer::from_host(cx.stream, &vec![f32::NAN; g.groups * g.rank])?;
-        cx.step.enqueue_q8_0_gemv_heads(
-            cx.stream,
-            Q8_0GemvHeadsArgs {
-                qs: &w.qs,
-                d: &w.d,
-                x: &x_dev,
-                rows_per_head: g.rank,
-                x_head_stride: g.group_k,
-                y_head_stride: g.rank,
-                y_off: 0,
-                y: &mut y,
-            },
-        )?;
+        match w {
+            W::Q8(w) => cx.step.enqueue_q8_0_gemv_heads(
+                cx.stream,
+                Q8_0GemvHeadsArgs {
+                    qs: &w.qs,
+                    d: &w.d,
+                    x: &x_dev,
+                    rows_per_head: g.rank,
+                    x_head_stride: g.group_k,
+                    y_head_stride: g.rank,
+                    y_off: 0,
+                    y: &mut y,
+                },
+            )?,
+            W::Q3(w) => {
+                let mut act = Q8Act::with_k(cx.stream, g.groups, g.group_k)?;
+                cx.gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+                cx.dense
+                    .enqueue_q3k_heads(cx.stream, &w.dev, &act, g.rank, &mut y)?;
+            }
+        }
         cx.stream.synchronize()?;
         Ok(y.to_host_vec(cx.stream)?)
     }
 
-    /// wo_b of token `x` through `q8_0_gemv` at m = 1, NaN-filled as above.
-    fn run_wo_b(cx: &Cx, w: &Q8, x: &[f32]) -> Result<Vec<f32>, GateError> {
+    /// wo_b of token `x` at m = 1, NaN-filled as above: `q8_0_gemv`, or the
+    /// engine's dense dispatch of a Q3_K weight on the q8_1 form of `x`.
+    fn run_wo_b(cx: &Cx, w: &W, x: &[f32]) -> Result<Vec<f32>, GateError> {
         let x_dev = DeviceBuffer::from_host(cx.stream, x)?;
-        let mut y = DeviceBuffer::from_host(cx.stream, &vec![f32::NAN; w.rows])?;
-        cx.gpu
-            .q8f32()
-            .enqueue_q8_0_gemv(cx.stream, &w.qs, &w.d, &x_dev, 1, &mut y)?;
+        let mut y = DeviceBuffer::from_host(cx.stream, &vec![f32::NAN; w.rows()])?;
+        match w {
+            W::Q8(w) => cx
+                .gpu
+                .q8f32()
+                .enqueue_q8_0_gemv(cx.stream, &w.qs, &w.d, &x_dev, 1, &mut y)?,
+            W::Q3(w) => {
+                let mut act = Q8Act::with_k(cx.stream, 1, w.host.k)?;
+                cx.gpu.enqueue_quantize_q8_1(&x_dev, &mut act)?;
+                cx.dense
+                    .enqueue(cx.gpu, Dense::Q3K(&w.dev), &x_dev, Some(&act), &mut y)?;
+            }
+        }
         cx.stream.synchronize()?;
         Ok(y.to_host_vec(cx.stream)?)
     }
@@ -522,22 +659,40 @@ mod gate {
         label: &str,
         man: &RefManifest,
         l: usize,
-        a: &Q8,
-        b: &Q8,
+        a: &W,
+        b: &W,
     ) -> Result<u32, GateError> {
         let (g, d) = site_data(man, l, a, b)?;
         let tl_a = compare(a, g.rank, &d.attn, &d.wo_a, &mut |x| run_wo_a(cx, a, g, x))?;
-        let pass_a = report(label, l, "wo_a", d.t, d.view_a, &tl_a);
-        let tl_b = compare(b, b.rows, &d.wo_b_in, &d.wo_b, &mut |x| run_wo_b(cx, b, x))?;
+        let pass_a = report(label, l, "wo_a", d.t, d.view_a, a, &tl_a);
+        let tl_b = compare(b, b.rows(), &d.wo_b_in, &d.wo_b, &mut |x| {
+            run_wo_b(cx, b, x)
+        })?;
         let pass_b = report(
             label,
             l,
             &format!("wo_b({})", d.branch),
             d.t,
             d.view_b,
+            b,
             &tl_b,
         );
         Ok(u32::from(!pass_a) + u32::from(!pass_b))
+    }
+
+    /// The kernels the file's types of `names` run on, for the header:
+    /// `q8` under Q8_0, `q3` under Q3_K, both joined when the file mixes them.
+    fn kernels_for(split: &Split, names: &[String], q8: &str, q3: &str) -> String {
+        let has = |ty| {
+            names
+                .iter()
+                .any(|n| split.find(n).is_some_and(|(_, t)| t.ty == ty))
+        };
+        match (has(GgmlType::Q8_0), has(GgmlType::Q3_K)) {
+            (true, true) => format!("{q8} and {q3}"),
+            (false, true) => q3.to_string(),
+            _ => q8.to_string(),
+        }
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -549,9 +704,11 @@ mod gate {
         )?;
         let gpu = Gpu::new()?;
         let step = StepKernels::load(gpu.context())?;
+        let dense = DenseKernels::load(gpu.context())?;
         let cx = Cx {
             gpu: &gpu,
             step: &step,
+            dense: &dense,
             stream: gpu.stream(),
         };
         let cpu = oracle::for_arch(Arch::Deepseek41)?;
@@ -586,23 +743,40 @@ mod gate {
                 man.build.as_deref().unwrap_or("-")
             );
         }
+        let names = |w: &str| -> Vec<String> {
+            (0..layers)
+                .map(|l| format!("blk.{l}.attn_output_{w}.weight"))
+                .collect()
+        };
         println!(
-            "gate_deepseek41_woa: device {} — {layers} layers x {} sets, wo_a through q8_0_gemv_heads, \
-             wo_b through q8_0_gemv, m = 1 per token",
+            "gate_deepseek41_woa: device {} — {layers} layers x {} sets, wo_a through {}, \
+             wo_b through {}, m = 1 per token",
             gpu.device_name()?,
-            sets.len()
+            sets.len(),
+            kernels_for(
+                &split,
+                &names("a"),
+                "q8_0_gemv_heads",
+                "ds41_q3k_gemv_heads"
+            ),
+            kernels_for(&split, &names("b"), "q8_0_gemv", "q3k_gemv"),
         );
 
         let (mut sites, mut failed) = (0u32, 0u32);
         for l in 0..layers {
-            let a = load_q8(&split, cx.stream, &format!("blk.{l}.attn_output_a.weight"))?;
-            let b = load_q8(&split, cx.stream, &format!("blk.{l}.attn_output_b.weight"))?;
-            if !(a.k / QK).is_multiple_of(4) || !(b.k / QK).is_multiple_of(4) {
-                return Err(format!(
-                    "layer {l}: ik's x4 path needs a block count divisible by 4, rows are {} and {} values",
-                    a.k, b.k
-                )
-                .into());
+            let a = load_w(&split, cx.stream, &format!("blk.{l}.attn_output_a.weight"))?;
+            let b = load_w(&split, cx.stream, &format!("blk.{l}.attn_output_b.weight"))?;
+            for w in [&a, &b] {
+                if let W::Q8(q) = w
+                    && !(q.k / QK).is_multiple_of(4)
+                {
+                    return Err(format!(
+                        "layer {l}: ik's x4 path needs a block count divisible by 4, rows are {} and {} values",
+                        a.k(),
+                        b.k()
+                    )
+                    .into());
+                }
             }
             for (label, man) in &sets {
                 sites += 2;
