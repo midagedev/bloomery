@@ -29,7 +29,14 @@
 //! - **structure**: the layer's launches captured into a graph, replayed at
 //!   both sets' inputs (the image and every buffer rewritten between
 //!   replays) bit-identical to the eager runs, and the graph's node count the
-//!   layer kind's launches plus the step's gather.
+//!   layer kind's launches plus the step's gather;
+//! - **rule**, on a layer whose projections are Q3_K: ik's q8_K × Q3_K dot
+//!   (`act_rule`) on ik's own inputs gives each projection's output in the
+//!   dump bit for bit — the codes the deviation reads ik's rounding from.
+//!
+//! The five projections (q_a, q_b, kv, wo_a, wo_b) are Q8_0 or Q3_K — the
+//! file's format picks each side's rule; any other format is refused at load
+//! with the tensor named.
 //!
 //! The deviation. The piece's ops and ik's differ by rule, not by
 //! composition: ik quantizes the activations of every quantized matmul
@@ -38,8 +45,10 @@
 //! attention's own rule differs by the B4 attention gate's band. Those are
 //! the rule differences the B4 gates pinned, in the form that composes: the
 //! rounding error of every quantized input — exact for ik's q8_2
-//! (`ik_q8_2`, the sign fold's wrap included), `d²/12` a value for the
-//! q8_K and q8_1 blocks — taken as independent across values and carried to
+//! (`ik_q8_2`, the sign fold's wrap included) and for ik's q8_K at a Q3_K
+//! projection (`act_rule::Rule::input_var`, read from ik's own input), `d²/12`
+//! a value for our q8_1 and for the q8_K of HC_PRE and the compressor, whose
+//! inputs differ between the sides — taken as independent across values and carried to
 //! the outputs to first order: exactly through every linear map (`Σ W²·var`),
 //! through a norm by its gain over its RMS, through a rope as the rotation
 //! of the variances, through the attention by its Jacobian at ik's queries,
@@ -90,6 +99,7 @@ mod gate {
     use bloomery_gpu_deepseek41::hc::HC_MIX;
     use bloomery_gpu_deepseek41::index_key::HT_SCALE;
     use bloomery_gpu_deepseek41::params::{ImageDims, ImageLayout, StepImage, Table, rope_specs};
+    use bloomery_gpu_gates::act_rule::{self, Q3K_BYTES, QK_K, Rule, q8_var};
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
@@ -188,7 +198,8 @@ mod gate {
     // ---------------------------------------------------------- layer kinds
 
     /// A layer as the gate reads it: the plan's stream, the file's
-    /// compressor, whether it runs the indexer.
+    /// compressor, whether it runs the indexer, and which of its projections
+    /// read a q8_1 input.
     #[derive(Clone, Copy, Debug)]
     struct Kind {
         stream: Option<usize>,
@@ -196,16 +207,46 @@ mod gate {
         /// (above ratio 1), whether it owns index keys.
         source: Option<(bool, bool)>,
         indexer: bool,
+        quant: Quant,
+    }
+
+    /// Where a layer's projections read q8_1 (a K-quant weight,
+    /// `Dense::reads_q8_1`): q_a or kv (the norm leaves the normed input's
+    /// q8_1 form, which an indexer without a compressor then reuses), wo_a
+    /// (its groups' input quantized first) and wo_b (wo_a's output quantized
+    /// first).
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Quant {
+        normed: bool,
+        heads: bool,
+        wo_a: bool,
+    }
+
+    impl Quant {
+        fn of(split: &Split, l: usize) -> Result<Quant, GateError> {
+            let q8_1 = |name: String| -> Result<bool, GateError> {
+                let (_, t) = split
+                    .find(&name)
+                    .ok_or_else(|| format!("{name} is not in the model file"))?;
+                Ok(matches!(t.ty, GgmlType::Q3_K | GgmlType::Q4_K))
+            };
+            Ok(Quant {
+                normed: q8_1(names::attn_q_a(l))? || q8_1(names::attn_kv(l))?,
+                heads: q8_1(names::attn_output_a(l))?,
+                wo_a: q8_1(names::attn_output_b(l))?,
+            })
+        }
     }
 
     impl Kind {
-        fn of(hp: &Hparams, planner: &Planner, l: usize) -> Kind {
+        fn of(hp: &Hparams, planner: &Planner, split: &Split, l: usize) -> Result<Kind, GateError> {
             let kind = &hp.layers[l];
-            Kind {
+            Ok(Kind {
                 stream: planner.layer_stream(l),
                 source: kind.compressor.map(|c| (c.gated, kind.index_keys)),
                 indexer: kind.indexer,
-            }
+                quant: Quant::of(split, l)?,
+            })
         }
 
         fn name(&self) -> String {
@@ -219,18 +260,24 @@ mod gate {
         /// The piece's launches for a layer of this kind (the module doc of
         /// `chain::attn`): fourteen on every layer — HC_PRE, the norm, q_a,
         /// its norm, q_b, the q rope, kv, the K/V append, the attention's two,
-        /// the inverse rope, wo_a, wo_b, HC_POST — on a compressor's layer
-        /// its projections, the row launch and the index key's three, and on
-        /// an indexer layer its two projections, the score and top-k passes
-        /// and, without a compressor, the q8_1 of the normed input.
+        /// the inverse rope, wo_a, wo_b, HC_POST — plus the q8_1 of wo_a's
+        /// input and of wo_b's where those read one (a norm that leaves a
+        /// q8_1 form stays one launch); on a compressor's layer its
+        /// projections, the row launch and the index key's three, and on an
+        /// indexer layer its two projections, the score and top-k passes and,
+        /// without a compressor and without the norm's q8_1 form, the q8_1 of
+        /// the normed input.
         fn launches(&self) -> usize {
-            14 + self.source.map_or(0, |(gated, keys)| {
-                1 + usize::from(gated) + 1 + 3 * usize::from(keys)
-            }) + if self.indexer {
-                4 + usize::from(self.source.is_none())
-            } else {
-                0
-            }
+            14 + usize::from(self.quant.heads)
+                + usize::from(self.quant.wo_a)
+                + self.source.map_or(0, |(gated, keys)| {
+                    1 + usize::from(gated) + 1 + 3 * usize::from(keys)
+                })
+                + if self.indexer {
+                    4 + usize::from(self.source.is_none() && !self.quant.normed)
+                } else {
+                    0
+                }
         }
     }
 
@@ -267,6 +314,72 @@ mod gate {
         Ok(HostQ8 { blocks, k, rows })
     }
 
+    /// A Q3_K weight's raw rows, for ik's dot and, dequantized row by row,
+    /// the deviation.
+    struct HostQ3k {
+        bytes: Vec<u8>,
+        k: usize,
+        rows: usize,
+    }
+
+    impl HostQ3k {
+        fn row(&self, r: usize) -> &[u8] {
+            let n = self.k / QK_K * Q3K_BYTES;
+            &self.bytes[r * n..(r + 1) * n]
+        }
+    }
+
+    /// A projection's weight in the file's format: the rule of each side
+    /// follows from it.
+    enum HostW {
+        Q8(HostQ8),
+        Q3k(HostQ3k),
+    }
+
+    impl HostW {
+        fn rows(&self) -> usize {
+            match self {
+                HostW::Q8(w) => w.rows,
+                HostW::Q3k(w) => w.rows,
+            }
+        }
+    }
+
+    /// Projection weight `name`: Q8_0 or Q3_K, the two formats whose rules
+    /// the gate simulates; any other is refused with the tensor named.
+    fn host_w(split: &Split, name: &str) -> Result<HostW, GateError> {
+        let (s, t) = split
+            .find(name)
+            .ok_or_else(|| format!("{name} is not in the model file"))?;
+        match t.ty {
+            GgmlType::Q8_0 => return Ok(HostW::Q8(host_q8(split, name)?)),
+            GgmlType::Q3_K => {}
+            ty => {
+                return Err(format!(
+                    "{name} is {ty:?} {:?}, want Q8_0 or Q3_K: the gate has no rule for it",
+                    t.dims
+                )
+                .into());
+            }
+        }
+        let &[k, rows] = t.dims.as_slice() else {
+            return Err(format!("{name} has dims {:?}, want [K, rows]", t.dims).into());
+        };
+        let (k, rows) = (usize::try_from(k)?, usize::try_from(rows)?);
+        if !k.is_multiple_of(QK_K) {
+            return Err(format!("{name} is Q3_K K={k}, not whole super-blocks").into());
+        }
+        let bytes = split.shard(s).ok_or("shard index out of range")?.data(t)?;
+        if bytes.len() != rows * k / QK_K * Q3K_BYTES {
+            return Err(format!("{name}: {} bytes for {rows} rows of {k}", bytes.len()).into());
+        }
+        Ok(HostW::Q3k(HostQ3k {
+            bytes: bytes.to_vec(),
+            k,
+            rows,
+        }))
+    }
+
     /// A q3_K weight dequantized, row-major, with its row width.
     fn host_q3k(split: &Split, name: &str) -> Result<(Vec<f32>, usize), GateError> {
         let (s, t) = split
@@ -294,11 +407,11 @@ mod gate {
 
     /// One layer's weights on the host, for the deviation.
     struct HostWeights {
-        q_a: HostQ8,
-        q_b: HostQ8,
-        kv: HostQ8,
-        out_a: HostQ8,
-        out_b: HostQ8,
+        q_a: HostW,
+        q_b: HostW,
+        kv: HostW,
+        out_a: HostW,
+        out_b: HostW,
         q_a_norm: Vec<f32>,
         kv_norm: Vec<f32>,
         sinks: Vec<f32>,
@@ -338,11 +451,11 @@ mod gate {
                 }),
             };
             Ok(HostWeights {
-                q_a: host_q8(split, &names::attn_q_a(l))?,
-                q_b: host_q8(split, &names::attn_q_b(l))?,
-                kv: host_q8(split, &names::attn_kv(l))?,
-                out_a: host_q8(split, &names::attn_output_a(l))?,
-                out_b: host_q8(split, &names::attn_output_b(l))?,
+                q_a: host_w(split, &names::attn_q_a(l))?,
+                q_b: host_w(split, &names::attn_q_b(l))?,
+                kv: host_w(split, &names::attn_kv(l))?,
+                out_a: host_w(split, &names::attn_output_a(l))?,
+                out_b: host_w(split, &names::attn_output_b(l))?,
                 q_a_norm: split_f32(split, &names::attn_q_a_norm(l), hp.q_lora_rank)?,
                 kv_norm: split_f32(split, &names::attn_kv_a_norm(l), hp.head_dim)?,
                 sinks: split_f32(split, &names::attn_sinks(l), hp.n_head)?,
@@ -596,6 +709,9 @@ mod gate {
         attn_norm: Vec<f32>,
         qr: Vec<f32>,
         qr_norm: Vec<f32>,
+        /// q_b's output, where the set has it: what ik's rule on a Q3_K
+        /// q_b is checked against.
+        q_b: Option<Vec<f32>>,
         q_rope: Vec<f32>,
         kv_b: Vec<f32>,
         kv_rope: Vec<f32>,
@@ -791,6 +907,10 @@ mod gate {
             attn_norm: f32s(man, an_row)?,
             qr: f32s(man, node(man, &name("qr"), "MUL_MAT")?.1)?,
             qr_norm: f32s(man, node(man, &name("qr_norm"), "FUSED_RMS_NORM")?.1)?,
+            q_b: node(man, &name("q_b"), "MUL_MAT")
+                .ok()
+                .map(|(_, r)| f32s(man, r))
+                .transpose()?,
             q_rope: f32s(man, node(man, &name("q_rope"), "ROPE")?.1)?,
             kv_b: f32s(man, node(man, &name("kv_b"), "MUL_MAT")?.1)?,
             kv_rope: f32s(man, node(man, &name("kv_rope"), "ROPE")?.1)?,
@@ -953,18 +1073,6 @@ mod gate {
             .collect()
     }
 
-    /// The variance of a q8 quantizer's rounding of each value of `x`,
-    /// blocks of `block` values with `d = amax / 127`: `d² / 12`.
-    fn q8_var(x: &[f32], block: usize) -> Vec<f64> {
-        x.chunks(block)
-            .flat_map(|b| {
-                let amax = b.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                let d = f64::from(amax) / 127.0;
-                std::iter::repeat_n(d * d / 12.0, b.len())
-            })
-            .collect()
-    }
-
     fn add(a: &[f64], b: &[f64]) -> Vec<f64> {
         a.iter().zip(b).map(|(x, y)| x + y).collect()
     }
@@ -998,6 +1106,47 @@ mod gate {
             }
         });
         out
+    }
+
+    /// `Σ_c W_rc² (var_c + in_c)` per row of a Q3_K weight, each row
+    /// dequantized as `dequant_row` does it; row `r` reads the input window
+    /// `r / rows_per_window` (`w.k` values each).
+    fn var_q3k(w: &HostQ3k, var: &[f64], input: &[f64], rows_per_window: usize) -> Vec<f64> {
+        let mut out = vec![0.0f64; w.rows];
+        let chunk = w.rows.div_ceil(THREADS);
+        std::thread::scope(|s| {
+            for (c, part) in out.chunks_mut(chunk).enumerate() {
+                s.spawn(move || {
+                    let mut row = vec![0.0f32; w.k];
+                    for (i, o) in part.iter_mut().enumerate() {
+                        let r = c * chunk + i;
+                        let x0 = r / rows_per_window * w.k;
+                        dequant_row(GgmlType::Q3_K, w.row(r), &mut row)
+                            .expect("a Q3_K row of whole super-blocks decodes");
+                        *o = row
+                            .iter()
+                            .enumerate()
+                            .map(|(j, &v)| f64::from(v).powi(2) * (var[x0 + j] + input[x0 + j]))
+                            .sum();
+                    }
+                });
+            }
+        });
+        out
+    }
+
+    /// A projection's output variances from its input's: `var` carried from
+    /// upstream, `x` ik's input (the dump's node), each side's rounding of
+    /// it by the weight's rule — Q8_0: ik's q8_2 exactly under each weight
+    /// code's sign, ours f32; Q3_K: [`Rule::input_var`].
+    fn var_w(w: &HostW, var: &[f64], x: &[f32], rows_per_window: usize) -> Vec<f64> {
+        match w {
+            HostW::Q8(w) => var_q8(w, var, &q8_2_err(x), rows_per_window),
+            HostW::Q3k(w) => {
+                let rule = Rule::of(GgmlType::Q3_K).expect("Q3_K has a rule");
+                var_q3k(w, var, &rule.input_var(x), rows_per_window)
+            }
+        }
     }
 
     /// `Σ_c W_rc² var_c` per row of a dense weight, `k` values a row.
@@ -1284,17 +1433,16 @@ mod gate {
     )]
     fn sigma(c: &Case, hw: &HostWeights, hp: &Hparams, kind: &Kind) -> Sigma {
         let (width, eps, n) = (hp.head_dim, hp.rms_eps, hp.n_embd);
-        let e_x = q8_2_err(&c.attn_norm);
         let zeros = vec![0.0f64; n];
 
         // The query.
-        let v_qa = var_q8(&hw.q_a, &zeros, &e_x, hw.q_a.rows);
+        let v_qa = var_w(&hw.q_a, &zeros, &c.attn_norm, hw.q_a.rows());
         let v_qn = norm_var(&v_qa, &c.qr, &hw.q_a_norm, eps);
-        let mut v_q = var_q8(&hw.q_b, &v_qn, &q8_2_err(&c.qr_norm), hw.q_b.rows);
+        let mut v_q = var_w(&hw.q_b, &v_qn, &c.qr_norm, hw.q_b.rows());
         rope_var(&mut v_q, width, &c.fwd);
 
         // The step's latent row.
-        let v_kv = var_q8(&hw.kv, &zeros, &e_x, hw.kv.rows);
+        let v_kv = var_w(&hw.kv, &zeros, &c.attn_norm, hw.kv.rows());
         let mut ring = norm_var(&v_kv, &c.kv_b, &hw.kv_norm, eps);
         rope_var(&mut ring, width, &c.fwd);
         for (v, &h) in ring.iter_mut().zip(&c.ring_row) {
@@ -1384,8 +1532,8 @@ mod gate {
             rule,
         });
         rope_var(&mut v_o, width, &c.back);
-        let v_u = var_q8(&hw.out_a, &v_o, &q8_2_err(&c.attn), hp.o_lora_rank);
-        let out = var_q8(&hw.out_b, &v_u, &q8_2_err(&c.wo_a), hw.out_b.rows);
+        let v_u = var_w(&hw.out_a, &v_o, &c.attn, hp.o_lora_rank);
+        let out = var_w(&hw.out_b, &v_u, &c.wo_a, hw.out_b.rows());
 
         // HC_POST and the fold, with HC_PRE's covariance.
         let cov = hc_cov(c, hw, hp);
@@ -1899,7 +2047,7 @@ mod gate {
     ) -> Result<(), GateError> {
         let (gpu, hp) = (cx.gpu, cx.hp);
         let stream = gpu.stream();
-        let kind = Kind::of(hp, cx.planner, l);
+        let kind = Kind::of(hp, cx.planner, cx.split, l)?;
         let keep = resident_names(l, &kind);
         let w = Weights::load_where(stream, cx.split, |n| keep.contains(n))?;
         let hw = HostWeights::load(cx.split, hp, l, &kind)?;
@@ -1913,7 +2061,8 @@ mod gate {
             stream.synchronize()?;
             let got = bufs.read(stream, &kind)?;
             let sig = sigma(&c, &hw, hp, &kind);
-            pins(cx, set, l, &kind, &c, &got, &sig, tally)?;
+            let worst = pins(cx, set, l, &kind, &c, &got, &sig, tally)?;
+            rule_check(&c, &hw, hp, set, l, worst, tally)?;
             nodes(stream, &piece.taps(), &c, &sig, set, l)?;
             eager.push(got);
             cases.push(c);
@@ -1954,7 +2103,8 @@ mod gate {
         Ok(())
     }
 
-    /// The value pins and the bit-identical ones of one layer in one set.
+    /// The value pins and the bit-identical ones of one layer in one set;
+    /// returns the largest deviation any value pin measured.
     #[allow(
         clippy::too_many_arguments,
         reason = "one layer's case, outputs and deviation, and where to count them"
@@ -1968,7 +2118,7 @@ mod gate {
         got: &Outputs,
         sig: &Sigma,
         tally: &mut Tally,
-    ) -> Result<(), GateError> {
+    ) -> Result<f64, GateError> {
         let hp = cx.hp;
         let width = hp.head_dim;
         let n = hp.n_embd;
@@ -1982,6 +2132,7 @@ mod gate {
         let zs_x = zs(&got.fold, &c.x_ref, &sig.fold, Some(&sig.fold_floor));
         let streams_ok = zs_s.max <= Z;
         let fold_ok = zs_x.max <= Z;
+        let mut worst = zs_s.max.max(zs_x.max);
 
         // The ring: the step's slot against ik's row, the rest as injected.
         let rows = c.ring.len() / width;
@@ -1992,6 +2143,7 @@ mod gate {
             .filter(|&r| r != slot)
             .all(|r| got.ring[r * width..(r + 1) * width] == c.ring[r * width..(r + 1) * width]);
         let ring_ok = zs_r.max <= Z && ring_same;
+        worst = worst.max(zs_r.max);
 
         let mut line = format!(
             "chain {tag} kind={} pos={} window={}: streams z_max={:.2} at [{}][{}] z_rms={:.2} {} | \
@@ -2036,6 +2188,7 @@ mod gate {
                     None,
                 );
                 ok &= z.max <= Z;
+                worst = worst.max(z.max);
                 desc += &format!(" row {w} z_max={:.2}", z.max);
                 if let (true, Some(ik_key), Some(v_key), Some(keys_out)) =
                     (has_keys, ik_key, &sig.key, &got.keys)
@@ -2048,6 +2201,7 @@ mod gate {
                         None,
                     );
                     ok &= zk.max <= Z;
+                    worst = worst.max(zk.max);
                     desc += &format!(" key z_max={:.2}", zk.max);
                 }
             } else if c.written.is_some() {
@@ -2095,13 +2249,89 @@ mod gate {
                     }
                 }
                 ok &= zmax <= Z && others;
+                worst = worst.max(zmax);
                 desc += &format!(" ring kept {kept:?} z_max={zmax:.2} others_as_injected={others}");
             }
             line += &format!("{desc} {}", verdict(ok));
             tally.check(ok, format!("{tag} {} compressor", STREAMS[s]));
         }
         println!("{line}");
+        Ok(worst)
+    }
+
+    /// One projection as [`rule_check`] reads it: its name, weight, ik's
+    /// input, ik's output where the set has it, and rows per input window.
+    type Site<'a> = (&'a str, &'a HostW, &'a [f32], Option<&'a [f32]>, usize);
+
+    /// ik's rule on the layer's Q3_K projections against the dump, bit for
+    /// bit: every output ik's dot ([`act_rule::dot_q3k`]) of the weight row
+    /// with the q8_K blocks of ik's own input — the codes the deviation's ik
+    /// term is read from. A layer with no Q3_K projection prints nothing.
+    fn rule_check(
+        c: &Case,
+        hw: &HostWeights,
+        hp: &Hparams,
+        set: &SetRun,
+        l: usize,
+        worst: f64,
+        tally: &mut Tally,
+    ) -> Result<(), GateError> {
+        let sites: [Site<'_>; 5] = [
+            ("q_a", &hw.q_a, &c.attn_norm, Some(&c.qr), hw.q_a.rows()),
+            ("kv", &hw.kv, &c.attn_norm, Some(&c.kv_b), hw.kv.rows()),
+            ("q_b", &hw.q_b, &c.qr_norm, c.q_b.as_deref(), hw.q_b.rows()),
+            ("wo_a", &hw.out_a, &c.attn, Some(&c.wo_a), hp.o_lora_rank),
+            ("wo_b", &hw.out_b, &c.wo_a, Some(&c.out), hw.out_b.rows()),
+        ];
+        let mut parts = Vec::new();
+        let mut pass = true;
+        for (tag, w, x, want, rows_per_window) in sites {
+            let HostW::Q3k(w) = w else { continue };
+            let want =
+                want.ok_or_else(|| format!("layer {l}: no {tag} node in set {}", set.label))?;
+            let got = ik_q3k_rows(w, x, rows_per_window);
+            let same = got
+                .iter()
+                .zip(want)
+                .filter(|(a, b)| a.to_bits() == b.to_bits())
+                .count();
+            pass &= got.len() == want.len() && same == want.len();
+            parts.push(format!("{tag} {same}/{}", want.len()));
+        }
+        if parts.is_empty() {
+            return Ok(());
+        }
+        println!(
+            "    rule layer={l} set={}: ik's q8_K x Q3_K dot on ik's inputs, bit-identical \
+             outputs {}; largest value-pin z/Z {:.3} — {}",
+            set.label,
+            parts.join(" "),
+            worst / Z,
+            verdict(pass)
+        );
+        tally.check(pass, format!("layer {l} {} ik rule", set.label));
         Ok(())
+    }
+
+    /// ik's output of every row of `w`, row `r` against window
+    /// `r / rows_per_window` of `x` (`w.k` values each): its q8_K blocks,
+    /// then [`act_rule::dot_q3k`].
+    fn ik_q3k_rows(w: &HostQ3k, x: &[f32], rows_per_window: usize) -> Vec<f32> {
+        let a = act_rule::quantize_q8_k(x);
+        let (a, sb) = (&a, w.k / QK_K);
+        let mut out = vec![0.0f32; w.rows];
+        let chunk = w.rows.div_ceil(THREADS);
+        std::thread::scope(|s| {
+            for (c, part) in out.chunks_mut(chunk).enumerate() {
+                s.spawn(move || {
+                    for (i, o) in part.iter_mut().enumerate() {
+                        let r = c * chunk + i;
+                        *o = act_rule::dot_q3k(w.row(r), a, r / rows_per_window * sb);
+                    }
+                });
+            }
+        });
+        out
     }
 
     /// The node-by-node distances and the output's predicted and measured
