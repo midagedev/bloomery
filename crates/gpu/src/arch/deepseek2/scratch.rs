@@ -2,6 +2,7 @@
 //! parameter image, and the weight names and MoE shapes they are sized from.
 
 use super::names::LayerNames;
+use super::pins;
 use crate::GpuError;
 use crate::model::StepProbe;
 use crate::model::lookup::{f32_gain, kq_weight, q8_derived};
@@ -11,6 +12,7 @@ use crate::weights::{DevWeight, Weights};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use model::arch::deepseek2::attn::MlaParams;
+use model::arch::deepseek2::hparams::Hparams;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
@@ -59,7 +61,7 @@ impl Gather {
     }
 }
 
-/// The MoE shapes of this model, read from the file's metadata and from the
+/// The MoE shapes of this model, from the file's hyperparameters and the
 /// resident expert stacks — never literals. Present only when the stage
 /// holds a routed layer.
 #[derive(Clone)]
@@ -286,14 +288,16 @@ impl LayerScratch {
 }
 
 impl MoeDims {
-    /// Read the MoE shapes from the file's metadata and cross-check them
-    /// against every routed layer of `names` — the quantization types and row
-    /// counts the enqueue leans on are proven here, at load, for each layer the
-    /// arena serves. Each stack holds `resident_experts` experts (`None`: all
-    /// of them); a hybrid load with none on the card has no stack to check.
-    /// `None` when no layer of `names` routes.
+    /// Take the MoE shapes from `hp` and cross-check them against every
+    /// routed layer of `names` — the quantization types and row counts the
+    /// enqueue leans on are proven here, at load, for each layer the arena
+    /// serves, and the expert counts against the router kernel's. Each stack
+    /// holds `resident_experts` experts (`None`: all of them); a hybrid load
+    /// with none on the card has no stack to check. `None` when no layer of
+    /// `names` routes.
     pub(super) fn read(
         gguf: &gguf::Gguf,
+        hp: &Hparams,
         w: &Weights,
         names: &[LayerNames],
         resident_experts: Option<usize>,
@@ -302,32 +306,19 @@ impl MoeDims {
         let Some(first) = routed.next() else {
             return Ok(None);
         };
-        let meta = model::moe::Meta::read(gguf)?;
+        let e = &hp.experts;
         let hidden = f32_gain(w, &first.attn_norm)?.len();
-        let resident = resident_experts.unwrap_or(meta.n_expert);
-        if resident > meta.n_expert {
+        let resident = resident_experts.unwrap_or(e.n_expert);
+        if resident > e.n_expert {
             return Err(GpuError::shape(
                 "MoeDims::read",
-                format!(
-                    "{resident} resident experts of the file's {}",
-                    meta.n_expert
-                ),
+                format!("{resident} resident experts of the file's {}", e.n_expert),
             ));
         }
-        // The router kernel ranks a fixed 64 experts into a fixed 6 slots.
-        if meta.n_expert != 64 || meta.n_used != 6 {
-            return Err(GpuError::shape(
-                "MoeDims::read",
-                format!(
-                    "the router kernel is 64 experts into 6 slots, the file says \
-                 {} into {}",
-                    meta.n_expert, meta.n_used
-                ),
-            ));
-        }
-        let shexp_ff = check_layer(w, first, &meta, resident, hidden)?;
+        pins::router(hp, &|s| gguf.arch_key(s))?;
+        let shexp_ff = check_layer(w, first, e.ff, resident, hidden)?;
         for n in routed {
-            let ff = check_layer(w, n, &meta, resident, hidden)?;
+            let ff = check_layer(w, n, e.ff, resident, hidden)?;
             if ff != shexp_ff {
                 return Err(GpuError::shape(
                     "MoeDims::read",
@@ -340,10 +331,10 @@ impl MoeDims {
             }
         }
         Ok(Some(MoeDims {
-            n_expert: meta.n_expert,
-            n_used: meta.n_used,
-            ff: meta.ff,
-            scale: meta.scale,
+            n_expert: e.n_expert,
+            n_used: e.n_used,
+            ff: e.ff,
+            scale: e.scale,
             shexp_ff,
         }))
     }
@@ -351,11 +342,12 @@ impl MoeDims {
 
 /// The resident weights of the routed layer `names` as the enqueue reads
 /// them — the shared expert's types and rows, the router in F32, and each
-/// routed stack holding `resident` experts — and its shared expert's width.
+/// routed stack holding `resident` experts of `ff` rows — and its shared
+/// expert's width.
 fn check_layer(
     w: &Weights,
     names: &LayerNames,
-    meta: &model::moe::Meta,
+    ff: usize,
     resident: usize,
     hidden: usize,
 ) -> Result<usize, GpuError> {
@@ -363,7 +355,7 @@ fn check_layer(
     kq_ty(w, &names.ffn_up_shexp, GgmlType::Q3_K)?;
     kq_ty(w, &names.ffn_down_shexp, GgmlType::Q4_K)?;
     if resident > 0 {
-        check_stacks(w, names, meta, resident, hidden)?;
+        check_stacks(w, names, ff, resident, hidden)?;
     }
     match w.get(&names.ffn_gate_inp) {
         Some(DevWeight::F32 { .. }) => {}
@@ -420,11 +412,11 @@ fn kq_ty(w: &Weights, name: &str, want: GgmlType) -> Result<(), GpuError> {
 /// The routed stacks of `names` as the `_sel` kernels read them — Q3_K gate
 /// and up, a Q5_0 down (`q5_0_gemv_sel`: a Q5_1 or a K-quant here is a
 /// different kernel, not a different constant) — each holding `resident`
-/// experts' rows.
+/// experts' rows, `ff` per expert in gate and up.
 fn check_stacks(
     w: &Weights,
     names: &LayerNames,
-    meta: &model::moe::Meta,
+    ff: usize,
     resident: usize,
     hidden: usize,
 ) -> Result<(), GpuError> {
@@ -462,12 +454,12 @@ fn check_stacks(
     stack(
         &names.ffn_gate_exps,
         kq_weight(w, &names.ffn_gate_exps)?.rows(),
-        meta.ff,
+        ff,
     )?;
     stack(
         &names.ffn_up_exps,
         kq_weight(w, &names.ffn_up_exps)?.rows(),
-        meta.ff,
+        ff,
     )?;
     stack(
         &names.ffn_down_exps,

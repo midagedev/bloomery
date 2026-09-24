@@ -30,6 +30,7 @@
 //! print the real size, and the build is one pass, once.
 
 use super::attn::{MlaParams, Q8Block, quantize_q8_0};
+use super::hparams::Hparams;
 use super::names;
 use crate::ModelError;
 use crate::head::HeadPlan;
@@ -68,6 +69,8 @@ struct BlockDerived {
 /// The tensors are byte-identical clones of what `Gguf::find` returned, so
 /// `gguf.data`'s per-read bounds check keeps guarding them.
 pub struct Plan {
+    /// The file's hyperparameters, read and refused before anything else.
+    pub hparams: Hparams,
     pub blocks: Vec<BlockPlan>,
     pub head: HeadPlan,
     /// The architecture-wide rms epsilon (`forward::rms_eps`'s key).
@@ -168,6 +171,9 @@ impl Derived {
     /// metadata reads and view builds; after this returns, the struct is
     /// read-only for the life of the model.
     pub fn new(gguf: &Gguf) -> Result<Derived, ModelError> {
+        // `ModelError` has no metadata variant; the refusal's own text names
+        // the key and the value, as `MlaParams::read`'s rope refusal does.
+        let hparams = Hparams::read(gguf).map_err(|e| ModelError::MissingTensor(e.to_string()))?;
         let n_block = gguf
             .block_count()
             .ok_or_else(|| ModelError::MissingTensor("metadata key block_count".into()))?
@@ -239,6 +245,7 @@ impl Derived {
             });
         }
         let plan = Plan {
+            hparams,
             blocks,
             head,
             eps,

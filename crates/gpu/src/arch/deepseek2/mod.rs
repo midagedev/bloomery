@@ -21,6 +21,7 @@
 
 mod dispatch;
 mod names;
+mod pins;
 mod scratch;
 mod seed;
 mod taps;
@@ -43,6 +44,7 @@ use gguf::Split;
 use model::Tensor2;
 use model::arch::Arch;
 use model::arch::deepseek2::derived::Derived;
+use model::arch::deepseek2::hparams::Hparams;
 use model::moe::{HostScratch, experts_into};
 use model::placement::{self, ExpertList, ModelTensor, ModelTensors, Role, Row};
 use names::LayerNames;
@@ -165,7 +167,9 @@ impl Body {
 
     /// Everything [`ChainBody::load`] builds over the resident weights, with
     /// the routed stacks holding `resident_experts` experts each (`None`:
-    /// all of them). No hybrid tier yet.
+    /// all of them). No hybrid tier yet. The file's hyperparameters are read
+    /// here, once per load, and every value the kernels were not built for is
+    /// refused before anything is allocated.
     fn assemble(
         gpu: &Gpu,
         gguf: &gguf::Gguf,
@@ -175,9 +179,11 @@ impl Body {
         resident_experts: Option<usize>,
     ) -> Result<Body, GpuError> {
         let stream = gpu.stream();
+        let hp = Hparams::read(gguf).map_err(|e| GpuError::plan("Body::load", e))?;
         let mla = MlaParams::read(gguf, 0)?;
+        pins::attention(&hp, mla.latent, &|s| gguf.arch_key(s))?;
         let names: Vec<LayerNames> = layers.clone().map(|l| LayerNames::new(w, l)).collect();
-        let moe = MoeDims::read(gguf, w, &names, resident_experts)?;
+        let moe = MoeDims::read(gguf, &hp, w, &names, resident_experts)?;
         let scratch = LayerScratch::new(
             gpu.context(),
             stream,
