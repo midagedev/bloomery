@@ -190,6 +190,13 @@ pub enum CardFormat {
     F32,
     /// bf16 decoded to f32 at load.
     Bf16AsF32,
+    /// bf16 as the file stores it, two values to a little-endian u32 word
+    /// (value `2j` in the low half of word `j`), for a kernel that widens on
+    /// the card. No file type loads in it by [`CardFormat::of`]: a reader
+    /// picks it for its own tensors (the DSpark draft's Markov weights and
+    /// the target embedding rows it reads), and uploads it itself; the GPU
+    /// loader's `Weights` refuses it.
+    Bf16Raw,
 }
 
 impl CardFormat {
@@ -240,7 +247,7 @@ impl CardFormat {
     #[must_use]
     pub fn buffer_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<Vec<u64>> {
         let blck = ty.blck_size()?;
-        if CardFormat::of(ty) != Some(self) || k == 0 || rows == 0 || !k.is_multiple_of(blck) {
+        if !self.holds(ty) || k == 0 || rows == 0 || !k.is_multiple_of(blck) {
             return None;
         }
         let blocks = k / blck;
@@ -268,7 +275,22 @@ impl CardFormat {
                 ]
             }
             CardFormat::F32 | CardFormat::Bf16AsF32 => vec![rows.checked_mul(k.checked_mul(4)?)?],
+            CardFormat::Bf16Raw => {
+                // Whole words per row: a row never shares a word with the next.
+                if !k.is_multiple_of(2) {
+                    return None;
+                }
+                vec![rows.checked_mul(k.checked_mul(2)?)?]
+            }
         })
+    }
+
+    /// A file tensor of type `ty` can be laid out in this format: the
+    /// format [`CardFormat::of`] names for `ty`, or [`CardFormat::Bf16Raw`]
+    /// for bf16, which only a reader that picks it uses.
+    #[must_use]
+    pub fn holds(self, ty: GgmlType) -> bool {
+        CardFormat::of(ty) == Some(self) || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
     }
 
     /// Device bytes of `rows` rows of `k` values of file type `ty` in this
@@ -345,6 +367,7 @@ impl fmt::Display for Format {
             Format::Card(CardFormat::Q8_0Planes) => "q8_0_planes",
             Format::Card(CardFormat::F32) => "f32",
             Format::Card(CardFormat::Bf16AsF32) => "bf16_as_f32",
+            Format::Card(CardFormat::Bf16Raw) => "bf16_raw",
             Format::HostFile => "host_file",
             Format::NvmeFile => "nvme_file",
             Format::Unused => "unused",

@@ -570,6 +570,13 @@ fn upload_rows(
                 k,
             }
         }
+        CardFormat::Bf16Raw => {
+            let detail = format!(
+                "tensor {name}: {format:?} has no resident weight here; the reader that picks it \
+                 uploads its words itself"
+            );
+            return Err(GpuError::shape(what, detail));
+        }
         CardFormat::Bf16AsF32 => {
             let mut vals = vec![0.0f32; rows * k];
             dequant_row(t.ty, bytes, &mut vals).map_err(::model::ModelError::from)?;

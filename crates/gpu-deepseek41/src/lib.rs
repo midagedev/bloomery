@@ -21,6 +21,7 @@ pub mod attn;
 pub mod body;
 pub mod chain;
 pub mod compress;
+pub mod draft;
 pub mod engram_gate;
 pub mod experts;
 pub mod experts_mxfp4;

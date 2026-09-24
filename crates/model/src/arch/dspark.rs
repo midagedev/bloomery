@@ -411,6 +411,20 @@ pub fn tensors(hp: &DraftHparams) -> Vec<DraftTensor> {
     out
 }
 
+/// The card format the draft loads `t` in: the Markov weights as the
+/// file's bf16 words ([`CardFormat::Bf16Raw`] — the Markov kernel widens them
+/// on the card), every other type by the GPU loader's rule
+/// ([`CardFormat::of`]: the router's bf16 gate widened to f32 at load).
+/// `None` for MXFP4, whose stacks load in `bloomery_gpu::mxfp4`'s two-plane
+/// layout at the file's bytes, and for a type with no card format.
+#[must_use]
+pub fn card_format(t: &DraftTensor) -> Option<CardFormat> {
+    match (t.group, t.ty) {
+        (Group::Markov, GgmlType::BF16) => Some(CardFormat::Bf16Raw),
+        (_, ty) => CardFormat::of(ty),
+    }
+}
+
 /// How the draft uses a tensor of the target's file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Borrow {
@@ -430,6 +444,20 @@ pub struct Borrowed {
     pub borrow: Borrow,
 }
 
+impl Borrowed {
+    /// The format the draft's card holds this tensor's bytes in: a row
+    /// source's bf16 rows as the file's words ([`CardFormat::Bf16Raw`], one
+    /// row uploaded per use and widened on the card), a copied tensor by the
+    /// loader's rule.
+    #[must_use]
+    pub fn card_format(&self) -> Option<CardFormat> {
+        match (self.borrow, self.ty) {
+            (Borrow::RowSource, GgmlType::BF16) => Some(CardFormat::Bf16Raw),
+            _ => CardFormat::of(self.ty),
+        }
+    }
+}
+
 /// One tensor the draft reads, against what the file holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
@@ -446,17 +474,17 @@ impl Row {
             .is_some_and(|(d, ty, _)| *d == self.want.dims && *ty == self.want.ty)
     }
 
-    /// Its bytes on the draft's card. Every type but MXFP4 goes by the GPU
-    /// loader's own rule ([`CardFormat`]: bf16 widened to f32, the rest at the
-    /// file's size); MXFP4 has no card format there yet and counts at its file
-    /// bytes, the native layout its kernels would read. `None` when the file
-    /// does not hold the tensor as stated.
+    /// Its bytes on the draft's card, in [`card_format`]'s format: the
+    /// Markov weights at the file's bf16 size, the router gate widened to
+    /// f32, the rest at the file's size; MXFP4 counts at its file bytes, which
+    /// its two-plane card layout keeps. `None` when the file does not hold the
+    /// tensor as stated.
     pub fn card_bytes(&self) -> Option<u64> {
         if !self.holds() {
             return None;
         }
         let (dims, ty, bytes) = self.found.as_ref()?;
-        match CardFormat::of(*ty) {
+        match card_format(&self.want) {
             None if *ty == GgmlType::MXFP4 => Some(*bytes),
             None => None,
             Some(f) => f.resident_bytes(*ty, dims[0], dims[1..].iter().product()),

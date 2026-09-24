@@ -515,7 +515,7 @@ mod gate {
                     .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
                     .collect(),
             ),
-            CardFormat::Q5_0 | CardFormat::Q5_1 => {
+            CardFormat::Q5_0 | CardFormat::Q5_1 | CardFormat::Bf16Raw => {
                 return Err(format!("no host packing of {format:?} here: V4.1 has none").into());
             }
         })
