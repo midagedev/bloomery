@@ -430,10 +430,6 @@ fn hw_unsupported_fields_are_refused() {
         ("logprobs", json!(true)),
         ("top_logprobs", json!(2)),
         ("n", json!(2)),
-        (
-            "tools",
-            json!([{"type": "function", "function": {"name": "f"}}]),
-        ),
         ("tool_choice", json!("required")),
     ];
     for (field, value) in refused {
@@ -459,7 +455,12 @@ fn hw_unsupported_fields_are_refused() {
         ("top_logprobs", json!(0)),
         ("n", json!(1)),
         ("tools", json!([])),
+        (
+            "tools",
+            json!([{"type": "function", "function": {"name": "f"}}]),
+        ),
         ("tool_choice", json!("none")),
+        ("tool_choice", json!("auto")),
         ("cache_prompt", json!(true)),
     ];
     for (field, value) in neutral {

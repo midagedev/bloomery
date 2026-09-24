@@ -21,9 +21,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
+use crate::dsml::{ChatParser, Message, ToolCall};
 use crate::engine::{Engine, SamplerFactory, SamplingParams, Tokenizer};
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Timings};
 use crate::http::{self, EventStream, Request};
+use crate::reasoning::ReasoningFormat;
 use crate::sampling;
 use crate::template::{ChatTemplate, TemplateError};
 
@@ -422,9 +424,9 @@ fn stop_list(v: Option<&Value>) -> Vec<String> {
 ///
 /// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
 /// `n_probs > 0`, `response_format` other than `{"type":"text"}`, `json_schema`, a
-/// non-empty `grammar`, `logprobs: true`, `top_logprobs > 0`, `n > 1`, non-empty
-/// `tools` (the model would answer in raw DSML the server cannot parse) and
-/// `tool_choice` other than `"none"`. `null` counts as absent. Other unknown fields
+/// non-empty `grammar`, `logprobs: true`, `top_logprobs > 0`, `n > 1`, and
+/// `tool_choice` other than `"none"` or `"auto"` (nothing forces a call without a
+/// grammar). `null` counts as absent. Other unknown fields
 /// are ignored.
 fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiError> {
     let set = |k: &str| o.get(k).filter(|v| !v.is_null());
@@ -447,12 +449,8 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         ),
         ("n", get_i(o, "n").is_some_and(|n| n > 1)),
         (
-            "tools",
-            set("tools").is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty())),
-        ),
-        (
             "tool_choice",
-            set("tool_choice").is_some_and(|v| v.as_str() != Some("none")),
+            set("tool_choice").is_some_and(|v| !matches!(v.as_str(), Some("none" | "auto"))),
         ),
     ];
     if let Some((field, _)) = refused.iter().find(|(_, hit)| *hit) {
@@ -1156,6 +1154,39 @@ struct ChatIds {
 }
 
 impl ChatIds {
+    /// `call_<index>_<request nonce>`: unique per call and per request, the same
+    /// in every chunk that names the call.
+    fn call_id(&self, index: usize) -> String {
+        let nonce = self.id.strip_prefix("chatcmpl-").unwrap_or(&self.id);
+        format!("call_{index}_{}", nonce.get(..16).unwrap_or(nonce))
+    }
+
+    fn tool_call(&self, c: &ToolCall) -> Value {
+        json!({
+            "id": self.call_id(c.index),
+            "type": "function",
+            "function": { "name": c.name, "arguments": c.arguments },
+        })
+    }
+
+    /// The stream deltas for one parser step, in llama-server's order: reasoning,
+    /// content, then one delta per tool call.
+    fn deltas(&self, d: &Message) -> Vec<Value> {
+        let mut out = Vec::new();
+        if !d.reasoning.is_empty() {
+            out.push(json!({ "reasoning_content": d.reasoning }));
+        }
+        if !d.content.is_empty() {
+            out.push(json!({ "content": d.content }));
+        }
+        for c in &d.calls {
+            let mut call = self.tool_call(c);
+            call["index"] = json!(c.index);
+            out.push(json!({ "tool_calls": [call] }));
+        }
+        out
+    }
+
     fn chunk(&self, choices: Value) -> Value {
         json!({
             "choices": choices,
@@ -1165,6 +1196,24 @@ impl ChatIds {
             "object": "chat.completion.chunk",
         })
     }
+}
+
+/// OpenAI `finish_reason`: `tool_calls` when a call parsed and the generation
+/// ended on EOS or a stop word (llama-server's rule).
+fn chat_finish_reason(o: &Outcome, m: &Message) -> &'static str {
+    match o.stop.finish_reason() {
+        "stop" if !m.calls.is_empty() => "tool_calls",
+        r => r,
+    }
+}
+
+/// Whether the output is scanned for DSML: non-empty `tools` and a `tool_choice`
+/// other than `"none"` (the template still sees the tools with `"none"`).
+fn parses_tools(b: &Map<String, Value>) -> bool {
+    b.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+        && b.get("tool_choice").and_then(Value::as_str) != Some("none")
 }
 
 fn usage(o: &Outcome) -> Value {
@@ -1179,10 +1228,11 @@ fn usage(o: &Outcome) -> Value {
 fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = body(req).and_then(|b| {
         let p = gen_params(state, &b)?;
+        let format = ReasoningFormat::from_request(b.get("reasoning_format")).map_err(invalid)?;
         let text = render_chat(state, &b)?;
-        Ok((b, p, text))
+        Ok((b, p, format, text))
     });
-    let (b, p, text) = match parsed {
+    let (b, p, format, text) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
@@ -1195,6 +1245,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .map_or_else(|| state.alias.clone(), str::to_owned),
     };
     let ids = state.tok.encode(&text);
+    let mut parser = ChatParser::new(&text, format, parses_tools(&b));
     let mut run = match Run::begin(state) {
         Ok(r) => r,
         Err(e) => return send_error(w, req, &e),
@@ -1204,7 +1255,11 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         return match run.go(&ids, prompt, &p, &mut |_| Ok(())) {
             Err(e) => send_error(w, req, &e),
             Ok(Err(e)) => send_error(w, req, &engine_error(&e)),
-            Ok(Ok(o)) => send_json(w, req, 200, &chat_final(&ids_meta, &o)),
+            Ok(Ok(o)) => {
+                let _ = parser.push(&o.content);
+                let _ = parser.finish();
+                send_json(w, req, 200, &chat_final(&ids_meta, &o, parser.message()))
+            }
         };
     }
     let mut stream: Option<EventStream<'_>> = None;
@@ -1238,13 +1293,16 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                     sse(s, &v)
                 }
                 Event::Text(text, t) => {
-                    let mut v = meta.chunk(json!([{
-                        "finish_reason": null, "index": 0, "delta": { "content": text },
-                    }]));
-                    if tpt {
-                        v["timings"] = t.to_json();
+                    for delta in meta.deltas(&parser.push(text)) {
+                        let mut v = meta.chunk(json!([{
+                            "finish_reason": null, "index": 0, "delta": delta,
+                        }]));
+                        if tpt {
+                            v["timings"] = t.to_json();
+                        }
+                        sse(s, &v)?;
                     }
-                    sse(s, &v)
+                    Ok(())
                 }
             }
         };
@@ -1262,8 +1320,14 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }])),
             )?;
         }
+        for delta in ids_meta.deltas(&parser.finish()) {
+            sse(
+                s,
+                &ids_meta.chunk(json!([{ "finish_reason": null, "index": 0, "delta": delta }])),
+            )?;
+        }
         let mut last = ids_meta.chunk(json!([{
-            "finish_reason": o.stop.finish_reason(), "index": 0, "delta": {},
+            "finish_reason": chat_finish_reason(o, parser.message()), "index": 0, "delta": {},
         }]));
         if include_usage {
             sse(s, &last)?;
@@ -1276,12 +1340,21 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     })
 }
 
-fn chat_final(meta: &ChatIds, o: &Outcome) -> Value {
+/// The non-stream response. `reasoning_content` and `tool_calls` appear only when
+/// non-empty, as llama-server writes them.
+fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
+    let mut message = json!({ "role": "assistant", "content": m.content });
+    if !m.reasoning.is_empty() {
+        message["reasoning_content"] = json!(m.reasoning);
+    }
+    if !m.calls.is_empty() {
+        message["tool_calls"] = m.calls.iter().map(|c| meta.tool_call(c)).collect();
+    }
     json!({
         "choices": [{
-            "finish_reason": o.stop.finish_reason(),
+            "finish_reason": chat_finish_reason(o, m),
             "index": 0,
-            "message": { "role": "assistant", "content": o.content },
+            "message": message,
         }],
         "created": meta.created,
         "model": meta.model,

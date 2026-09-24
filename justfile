@@ -533,7 +533,7 @@ gate-tokenizer:
     ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --test tokenizer -- --ignored --nocapture'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙, V4.1 채팅 템플릿 렌더링. 박스 자원 불필요.
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml -- --include-ignored --nocapture'
 
 # engram-rate 바이너리. 측정은 tools/ref/engram-rate.sh가 임대 안에서 돌린다 —
 # 이 레시피는 빌드만 한다(러너가 낡은 바이너리를 재는 것을 막는 단계).

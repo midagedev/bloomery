@@ -207,6 +207,77 @@ impl Engine for MockEngine {
     }
 }
 
+/// An engine that answers every prompt with the same text, then EOS: the model
+/// output a parser gate scripts. Tokens are [`MockTokenizer`]'s, so the special
+/// strings are single ids and everything else goes byte by byte.
+pub struct ScriptedEngine {
+    script: Vec<u32>,
+    at: usize,
+    pos: usize,
+    ctx_max: usize,
+}
+
+impl ScriptedEngine {
+    /// An engine whose every generation is `text` followed by EOS.
+    #[must_use]
+    pub fn new(ctx_max: usize, text: &str) -> Self {
+        ScriptedEngine {
+            script: MockTokenizer.encode(text),
+            at: 0,
+            pos: 0,
+            ctx_max,
+        }
+    }
+}
+
+impl Engine for ScriptedEngine {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        Arc::new(MockTokenizer)
+    }
+
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.pos += ids.len();
+        Ok(())
+    }
+
+    fn next(&mut self, _last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        if self.pos >= self.ctx_max {
+            return Err(EngineError(format!(
+                "scripted: position {} is past ctx_max {}",
+                self.pos, self.ctx_max
+            )));
+        }
+        self.pos += 1;
+        let id = self
+            .script
+            .get(self.at)
+            .copied()
+            .unwrap_or(MockTokenizer.eos());
+        self.at += 1;
+        if let Some(l) = logits_out {
+            l.fill(FLOOR);
+            if let Some(slot) = usize::try_from(id).ok().and_then(|i| l.get_mut(i)) {
+                *slot = PREDICTED;
+            }
+        }
+        Ok(id)
+    }
+
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.at = 0;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn ctx_max(&self) -> usize {
+        self.ctx_max
+    }
+
+    fn describe(&self) -> String {
+        format!("scripted position={}", self.pos)
+    }
+}
+
 /// Byte-accumulating decoder: emits the longest valid UTF-8 prefix it holds.
 struct Utf8Decoder {
     held: Vec<u8>,

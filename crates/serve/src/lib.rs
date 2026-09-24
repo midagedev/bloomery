@@ -6,10 +6,12 @@
 //! stream framing are llama-server's; see `api` for the one-slot model.
 
 mod api;
+pub mod dsml;
 pub mod engine;
 mod genloop;
 mod http;
 pub mod mock;
+pub mod reasoning;
 pub mod sampling;
 mod stop;
 pub mod template;
@@ -18,5 +20,5 @@ pub use api::{EngineFailure, FATAL_LINGER, ServeError, Server, ServerConfig};
 pub use engine::{
     Decoder, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Tokenizer,
 };
-pub use mock::{MockEngine, MockTokenizer};
+pub use mock::{MockEngine, MockTokenizer, ScriptedEngine};
 pub use template::{ChatTemplate, TemplateError};
