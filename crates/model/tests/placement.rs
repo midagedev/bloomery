@@ -120,59 +120,58 @@ const READ_TOTAL: u64 = 12_035_196_096;
 const READ_DENSE: u64 = 7_991_939_520;
 // PIN(2026-09-24): the mixed file has no q5_K outside the routed stacks, so none on a card.
 const Q5_K_CARD: (usize, u64) = (0, 0);
-// PIN(2026-09-24): the gate placement (`plan_gate`, the 3090 alone) keeps 809 experts, as plan (a) under the 3090's usable bytes.
-const GATE_EXPERTS: u64 = 809;
+// PIN(2026-09-24): the gate placement (`plan_gate`, the 3090 alone) keeps 888 experts, as plan (a) under the 3090's usable bytes; re-taken on top of the host ring shadow.
+const GATE_EXPERTS: u64 = 888;
 
-// PIN(2026-09-24): the public Q3_K_M file, plan (a)'s A6000 line: attention and the shared experts in q3_K/q4_K instead of q8_0 leave 4,258,054,144 dense bytes fewer, and the card keeps 253 experts more (2,587), n_l 68–69.
+// PIN(2026-09-24): the public Q3_K_M file, plan (a)'s A6000 line, re-taken on top of the host ring shadow: attention and the shared experts in q3_K/q4_K instead of q8_0 leave 4,258,054,144 dense bytes fewer, and the card keeps 254 experts more (2,668), n_l 70–71.
 const PUB_A_A6000: CardPin = CardPin {
     card: "A6000",
     dense: 3_891_325_376,
-    expert_bytes: 43_392_061_440,
-    experts: 2_587,
-    rounding: 525_387_328,
-    kv: 1_452_302_336,
-    shadow: 1_342_177_280,
-    headroom: 1_087_348_736,
+    expert_bytes: 44_750_684_160,
+    experts: 2_668,
+    rounding: 515_233_344,
+    kv: 110_125_056,
+    headroom: 1_081_057_280,
     eligible: 2..40,
-    n_l: (68, 69),
+    n_l: (70, 71),
 };
-// PIN(2026-09-24): the public file, plan (a)'s host line: 253 experts fewer, and token_embd in q3_K (284,416,000 B) instead of bf16.
+// PIN(2026-09-24): the public file, plan (a)'s host line, re-taken on top of the host ring shadow: 254 experts fewer, token_embd in q3_K (284,416,000 B) instead of bf16, the same ring shadows.
 const PUB_A_HOST: HostPin = HostPin {
-    expert_bytes: 215_375_523_840,
+    expert_bytes: 214_016_901_120,
     table_bytes: 284_416_000,
-    headroom: 43_421_464_576,
+    shadow: 1_342_177_280,
+    headroom: 43_437_910_016,
 };
-// PIN(2026-09-24): the public file, plan (b)'s A6000 line: 133 experts more (2,774), n_l 154–155 on layers 2–19.
+// PIN(2026-09-24): the public file, plan (b)'s A6000 line, re-taken on top of the host ring shadow: 134 experts more (2,814), n_l 156–157 on layers 2–19.
 const PUB_B_A6000: CardPin = CardPin {
     card: "A6000",
     dense: 1_743_902_176,
-    expert_bytes: 46_528_634_880,
-    experts: 2_774,
-    rounding: 263_948_832,
-    kv: 736_649_216,
-    shadow: 671_088_640,
-    headroom: 1_075_290_112,
+    expert_bytes: 47_199_559_680,
+    experts: 2_814,
+    rounding: 255_724_064,
+    kv: 65_560_576,
+    headroom: 1_083_678_720,
     eligible: 2..20,
-    n_l: (154, 155),
+    n_l: (156, 157),
 };
-// PIN(2026-09-24): the public file, plan (b)'s 3090 line: 121 experts more (1,225), n_l 61–62 on layers 20–39.
+// PIN(2026-09-24): the public file, plan (b)'s 3090 line, re-taken on top of the host ring shadow: 121 experts more (1,265), n_l 63–64 on layers 20–39.
 const PUB_B_3090: CardPin = CardPin {
     card: "3090",
     dense: 2_147_423_200,
-    expert_bytes: 20_547_072_000,
-    experts: 1_225,
-    rounding: 258_833_440,
-    kv: 715_653_120,
-    shadow: 671_088_640,
+    expert_bytes: 21_217_996_800,
+    experts: 1_265,
+    rounding: 258_997_280,
+    kv: 44_564_480,
     headroom: 1_077_411_840,
     eligible: 20..40,
-    n_l: (61, 62),
+    n_l: (63, 64),
 };
-// PIN(2026-09-24): the public file, plan (b)'s host line.
+// PIN(2026-09-24): the public file, plan (b)'s host line, re-taken on top of the host ring shadow.
 const PUB_B_HOST: HostPin = HostPin {
-    expert_bytes: 191_691_878_400,
+    expert_bytes: 190_350_028_800,
     table_bytes: 284_416_000,
-    headroom: 67_105_110_016,
+    shadow: 1_342_177_280,
+    headroom: 67_104_782_336,
 };
 
 /// One file's pins: the mixed file's are the consts above without a prefix,
@@ -221,8 +220,8 @@ const PUBLIC: FilePins = FilePins {
     // PIN(2026-09-24): the public file's bytes one token reads: all, and dense.
     read_total: 7_774_310_520,
     read_dense: 3_731_061_720,
-    // PIN(2026-09-24): the public file's gate placement keeps 1,065 experts.
-    gate_experts: 1_065,
+    // PIN(2026-09-24): the public file's gate placement keeps 1,146 experts; re-taken on top of the host ring shadow.
+    gate_experts: 1_146,
 };
 
 /// The pins of the file this run opens ([`workstation::model_v41`]).
