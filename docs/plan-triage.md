@@ -226,3 +226,12 @@
 - **N5 ik V4.1 최고 플래그를 찾은 적이 없다** — 공개 비교의 공정성. E21 자리에 ik 플래그 세트 3–4개(~20분).
 - **N6 E21 예측**: 3090 gate, 공개 파일, 33–38 tok/s.
 - 보고가 짚은 낡은 곳(XS): plan 「지금」 DSpark 유도의 합집합 가정, E19의 r = 1.21·1.29 채점(목록 뒤 1.52), ktok 판정 문장의 "겹치지 않게" 조건, `dsread-report.md:99` 드래프트의 BF16 token_embd 가정(공개 파일은 Q3_K — dsgraphc·dsloop가 본다), `v41-placement.md:361` 300 W, `gpu-design.md:9·37` "A6000 금지", attention 전부 Q8_0 서술(혼합 기준), 64개 목록은 n_l > 64에서 (a)를 거부.
+
+## 검증 패스의 호스트 합집합 서비스 (union6 보고, 2026-09-24 — `051d51e`; 받을 라운드: dsloop 앞의 설계 카드 M)
+
+- **잰 것**(라우터 추적 네 코퍼스, 혼합 파일, 뜨거운 목록 in-sample): 연속 k위치의 호스트 (층, expert) 합집합 ÷ 행별 슬롯 합 = k 2 0.90 · k 3 0.85 · k 4 0.81 · **k 6 0.753**(pooled; p10–p90 0.68–0.83), leave-one-out 목록 0.63–0.73, id 접두 0.61. 위치마다 독립 라우팅이면 0.93–0.95라 틀린 항은 독립 가정이다 — 연속 위치는 같은 expert로 간다. 플랜 유도의 0.85보다 겹침이 크다.
+- **오늘 경로는 그 겹침에서 얻는 것이 0이다**: (층, 행)마다 `serve_one` → `experts_into` 한 번(`hybrid.rs:1248`, `:1409`), 한 호출 한 열(`moe.rs:811` `ne1 != 1`), `EXPERTS_INTO_MAX = 8`, `MAX_ROWS = 2`. ik(`ggml.c` `mmid_row_mapping` → `iqk_mul_mat_moe`), exllamav3(`moe_mul1.cpp` "group token assignments by expert", K ≤ 8), mistral.rs(candle `repack.rs`, 32쌍 이상은 expert 버킷) 셋 다 expert별로 묶는다.
+- **값 [유도]**: 6행 패스 630슬롯 → 합집합 474, 슬롯당 0.13 ms로 ~20 ms/패스. 플랜 유도(535)보다 +8 ms 싸다. pairsvc의 기각(m = 2, φ 0.15–0.26 대 손익분기 0.72)은 다른 점이다.
+- **먼저 잴 것(리드, 임대 ~8분)**: `just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms engine:3,engine:3x4,engine:3x4u0.75,engine-sep:3x4u0.75,engine:3x3` — 오늘 행별 호출이 두 번째 읽기를 L3에서 받는지(`3x4u0.75` 대 `3x4`), 합집합 서비스의 바이트 대리값(`3x3`).
+- **필요한 것(M)**: handoff에 k 활성 열, `EXPERTS_INTO_MAX` ≥ 합집합(k 6에서 최대 36), distinct expert마다 m = k 열 커널(`ops.rs:410` `quantize_col`은 이미 열별), 행별 가중 scatter, `MAX_ROWS ≥ 6`과 층마다 모든 행의 go를 기다리는 동기화 — 어긋난 2행 설계와 부딪힌다.
+- 곁가지(보고): `bench_v41_host.rs:1612` `dispatches_per_token`이 16쌍 defer spill을 모델링하지 않는다(S); `hotlist-384.txt`는 in-sample이라 LOO에서 행당 호스트 슬롯 +19–56 — 목록 학습·평가 분리(S, E17과 겹침).
