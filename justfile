@@ -604,7 +604,8 @@ gate-engram:
 # oracle.sh가 어휘마다 오라클 파일을 먼저 다시 쓴다(어휘만 적재, 임대 없음, 1분 안).
 # qwen3moe 어휘의 참조는 /home/user/ik-tokref(ik-idxkey와 같은 커밋 + ik#2520 tolower 수정)의 llama-tokenize로 뜬다 —
 # ik의 unicode_tolower는 정렬되지 않은 표에 lower_bound를 써서 (?i:'re) 같은 축약이 어긋나고, 그 경로는 qwen2 정규식만 탄다.
-# #2520이 ik에 들어가면 기본 트리로 되돌린다.
+# #2520이 ik에 들어가면 기본 트리로 되돌린다. V4.1 어휘의 참조도 곁가지 트리다: oracle.sh의 기본 TOKENIZE는 /home/user/ik-tilde
+# (ik main + `~`를 S에 넣는 한 줄, ik#2528)이고, 참조의 `~/`가 [71520]이 아니면 거부한다 — #2528이 들어가면 되돌린다.
 gate-tokenizer:
     ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙, V4.1 채팅 템플릿 렌더링. 박스 자원 불필요.

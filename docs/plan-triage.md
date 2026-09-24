@@ -341,3 +341,15 @@
 **라운드 순서**: `ds41router`(router.rs·q8f32.rs·experts_mxfp4.rs 라우터·flash.rs A3 — dskq와 겹치지 않음, 바로) ‖ `ds41join`(측정) → dskq 머지 뒤 `ds41dense` → `ds41hcbranch` → D3/D4 카드(float 순서). 박스 동시 ≤ 4.
 
 **사용자 판단 대기**(깨어나면): ① Expert Deferral — 손실 있는 기법이라 켜는 것은 사용자 결정 ② 다운로드 둘 — EAGLE-3 체크포인트, Qwen3 IQ4_XS 파일 ③ DFlash 대상 — Coder-30B-A3B에 얹기 vs 드래프터 학습 ④ V4 R0 전체 덤프(128 GB 페이지인)와 `v4time`(각 > 30분) 승인.
+
+## 토크나이저 `~` (tokfix 보고, 2026-09-24 — `3ef2c8a`; ik PR #2528 열림)
+
+`~`가 S에 들어가 `~/`가 한 id(71520)다. 수정된 토크나이저로 재면 engram 코퍼스 id는 code 778,951 → 778,925, prose 75,268 → 75,249,
+korean 266,143 → 265,648, prose-all 4,670,384 → 4,669,737, threads 4,515,000 → 4,514,374이고 다섯 코퍼스 모두 ik-tilde와 파일 전체가 같다.
+`corpus-*.ids`는 **재생성하지 않았다** — 뜨거운 목록·타이밍이 그 id를 먹는다. 걸려 있는 것: `tools/ref/ik-draft.sh:174-180` check 1은 코퍼스
+첫 512 id를 각 팔의 `llama-tokenize`로 되돌려 재는데, 지금 코퍼스로는 mainline(`lcpp` 팔, 수정된 트리)이 rc 65로 막히고[코드 읽기, 미실행],
+재생성하면 반대로 미수정 `ik-idxkey` 팔이 막힌다. 순서는 리드가 정한다: ① ik-idxkey 옆에 수정 한 줄을 얹은 새 트리(`ik-idxkey-tilde`, 제자리
+재빌드 금지)를 V4.1 프로파일의 IK로 → ② 코퍼스·뜨거운 목록 재생성(한 시팅, 타이밍 기준선이 바뀐다는 것을 rig-log에) → ③ lcpp 프롬프트 쌍둥이.
+남긴 것(XS): `tools/ref/engram-corpus.sh:43` 기본 TOKENIZE가 미수정 트리라 재생성하면 결함이 다시 구워진다 — oracle.sh와 같은 `~/` 가드;
+`tools/ref/ik-greedy.sh:51` 프롬프트를 미수정 ik로 토큰화; oracle.sh MANIFEST에 프로브 결과 한 줄. mistral.rs·exllamav3는 HF tokenizers를
+쓰므로 처음부터 mainline과 같았다(`gguf_tokenizer.rs:49`, `tokenizer.py:50`).
