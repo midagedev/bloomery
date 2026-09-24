@@ -402,6 +402,16 @@ dump-ref-cuda:
 dump-ref-v41 *VARIANT:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
+# DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
+# dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
+build-ref-dump-draft:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/build-dump-draft.sh'
+
+# draft를 켠 greedy 디코드에서 draft 컨텍스트의 노드 전부를 $BLOOMERY_DATA/ref-draft/<세트>/에 쓴다(코드 코퍼스 64 + 32 위치,
+# 블록 폭 3). 3090 게이트 락 + CPU 임대; 세트는 staging 뒤 `# complete` 트레일러가 있을 때만 설치된다.
+dump-ref-draft:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump-draft.sh'
+
 # 오라클 세트의 정수 사본 검사(B0c): 정수 텐서마다 무손실 사본이 있고, f32 파일이 그 값의 RNE인가.
 # 인자는 세트 디렉터리(기본 $BLOOMERY_DATA/ref). V2-Lite의 ref는 v1이라 사본이 없어 빨강이다 — just gate에 넣지 않는다.
 check-int-twins *ARGS:
