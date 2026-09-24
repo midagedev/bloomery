@@ -8,13 +8,13 @@
 
 **2026-09-24 오후 — 목표는 "커뮤니티 공개"(사용자 09:35).** 이 절과 아래 「오케스트레이션 플랜」이 현재 상태의 정본이다. 한 줄에 담기지 않는 라운드 원문은 장부로 옮긴다 — 오늘 오전까지의 원문은 장부 「「지금」·「오케스트레이션 플랜」에서 옮긴 것 (2026-09-24 오후)」. main은 머지 파동마다 푸시한다.
 
-- **헤드라인(측정, A6000, 뜨거운 목록, prose/code, n 96)**: 우리 **34.3 / 34.5 tok/s**, ik plain 17.5 / 18.2, ik + DSpark(n_max 5, `--temp 0`) 32.1 / 29.4(자리 11·13). 패스 하나는 ik의 1.8–1.9배 빠르지만 ik는 DSpark로 거의 따라온다 — **우리 DSpark(dsgraph B → C → dsloop)가 공개 필수 경로다.** 24 GB 흉내(`BLOOMERY_CARD_BUDGET=24G`) 30.35(자리 12). **3090 실측은 아직 없다**(E21, shadowhost 뒤).
+- **헤드라인(측정, A6000, 뜨거운 목록, prose/code, n 96, 혼합 파일 `attnQ8`)**: 우리 **34.3 / 34.5 tok/s**, ik plain 17.5 / 18.2, ik + DSpark(n_max 5, `--temp 0`) 32.1 / 29.4(자리 11·13). 패스 하나는 ik의 1.8–1.9배 빠르지만 ik는 DSpark로 거의 따라온다 — **우리 DSpark(dsgraph B → C → dsloop)가 공개 필수 경로다.** 24 GB 흉내(`BLOOMERY_CARD_BUDGET=24G`) 30.35(자리 12). **3090 실측은 아직 없다**(E21, shadowhost 뒤).
 - **DSpark를 붙이면 [유도]**: 48 GB급(A6000, 3090 두 장) ~45–50 tok/s = ik + DSpark의 1.4–1.5배. 3090 한 장은 +7 %(~32)에 그친다 — 8.5 GB 드래프트가 카드 전문가 자리를 먹고, 우리 검증 패스는 행마다 호스트 전문가를 따로 읽는다(행 사이 전문가 겹침 φ 0.15–0.26). 레버 후보: 드래프트 가중치 양자화, 두 장이면 드래프트를 둘째 카드로. 잴 것: ik + DSpark의 3090 값(E21에 넣는다), 온도 > 0의 수락률.
-- **공개를 막는 것**: ① **`nanmoe`** — 3090 gate 배치(카드 전문가 809)에서 V4.1 greedy가 생성 309번째부터 토큰 0만 낸다. 34층 MoE 출력이 비유한 값이 되는데 로짓은 유한해서 서버 검사에 안 걸린다. 원래 있던 결함(prefix2가 기준 트리 `47e36b5`에서 재현), 스펙 `spec-nanmoe.md` ② **`shadowhost`** — prefix2의 링 섀도(ctx 32k에서 1,342,177,280 B)가 VRAM에 있어 카드 전문가가 3090 gate 888 → 809, A6000 (a) 2,414 → 2,334로 준다. 고정 호스트 메모리로 옮긴다(append 커널은 그대로), 스펙 `spec-shadowhost.md` ③ E21 3090 실측 ④ 우리 DSpark ⑤ 사용자 결정(아래).
+- **공개를 막는 것**: ① **`nanmoe`** — 3090 gate 배치(카드 전문가 809)에서 V4.1 greedy가 생성 309번째부터 토큰 0만 낸다. 34층 MoE 출력이 비유한 값이 되는데 로짓은 유한해서 서버 검사에 안 걸린다. 원래 있던 결함(prefix2가 기준 트리 `47e36b5`에서 재현), 스펙 `spec-nanmoe.md` ② **`shadowhost`** — prefix2의 링 섀도(ctx 32k에서 1,342,177,280 B)가 VRAM에 있어 카드 전문가가 3090 gate 888 → 809, A6000 (a) 2,414 → 2,334로 준다. 고정 호스트 메모리로 옮긴다(append 커널은 그대로), 스펙 `spec-shadowhost.md` ③ **`plainfile`** — 사용자 결정(09-24 14:30, 아래)으로 V4.1 파일은 공개 `Q3_K_M` 하나다. 우리 카드 밀집 경로가 Q8_0 전용이라 K-quant 밀집 gemv(m ≤ 8)·engram Q3_K 행 읽기가 필요하고, V4.1 오라클 세트가 전부 혼합 파일에서 떠졌으므로 공개 파일로 다시 뜨고 밴드·배치 핀을 다시 잡는다; 스펙 `spec-plainfile.md` ④ E21 3090 실측 — **공개 파일로 잰다**(plainfile 뒤) ⑤ 우리 DSpark ⑥ 사용자 결정(아래).
 - **이 머지부터 배치가 바뀐다**: ctx 32k의 3090 gate 배치는 카드 전문가 809, A6000 (a)는 2,334다(prefix2). 이 뒤의 측정 행은 섀도 조건을 적고, 888·2,414 행과 한 표에 두지 않는다 — shadowhost가 착륙하면 원래 수로 돌아간다.
 - **비행 중**: `dsgraphb`(DSpark B — 블록 패스·헤드·Markov) ‖ `nanmoe` ‖ `shadowhost` ‖ `propsengine`(toktape `/props` engine 객체 + 템플릿 슬라이스 문법).
 - **오늘 오후 착륙**: viskern `4abc188`(비전 V2 인코더 — 자유 실행 탭은 참조 자기 민감도의 K=2배로 판정) ‖ prefix2 `5fdfe11`(깊은 prefix 자르기: 두 번째 채팅 턴이 캐시 32 id를 전부 재사용) ‖ qwen3 3단계 `a2ec74b`(전 카드 체인 — 노드 869 = 예측, greedy 8개 중 ik와 갈라짐 0, PPL +0.058 %; `AnyEngine::Qwen3moe` arm은 리드가 붙였다).
-- **사용자 결정 대기**: LICENSE(MIT 유지 vs Apache-2.0) · 공개 시점(M1 숫자 먼저 vs M2와 함께) · 밀집 가중치 재양자화(attnQ8 → Q6_K/Q4_K — 카드 커널 시간의 55 %가 q8_0 gemv, 스텝 29 ms 중 −3–5 ms [유도], E26).
+- **사용자 결정 대기**: LICENSE(리드 추천: MIT 유지 — 옮겨 오는 코드가 전부 MIT이고 Apache-2.0은 의존성 cuda-oxide뿐) · 공개 시점(리드 추천: 레포와 숫자를 같이 — nanmoe 수정과 공개 파일 E21 뒤). ~~밀집 가중치 재양자화(attnQ8 → Q6_K/Q4_K)~~ **결정됨(사용자 09-24 14:30 "이거 버리자 그때 명확한 이득 없었어")**: 혼합 파일을 버리고 공개 `Q3_K_M`(324 GB) 그대로 쓴다. 공개 파일의 밀집은 Q3_K라 바이트가 혼합의 약 40 %다 → 카드 −4–5 ms/스텝[유도], 카드 전문가 자리 증가, 다운로드 121 GB 적음; 정확도 차이는 잰 적이 없다(plainfile이 ik와 맞춘다). 혼합 파일은 공개 파일 오라클로 모든 ds41 게이트가 초록이 될 때까지 `/models`에 둔다.
 - **ik PR(사용자 09-24 "가장 유효한 거 하나만")**: 열린 것은 [#2520](https://github.com/ikawrakow/ik_llama.cpp/pull/2520)(tolower) 하나다. [#2522](https://github.com/ikawrakow/ik_llama.cpp/pull/2522)(DSpark 로더)는 V4 드래프트 회귀 실행 전까지, [#2507](https://github.com/ikawrakow/ik_llama.cpp/pull/2507)(idxkey)은 PPL이 오르는 까닭을 알 때까지 드래프트다.
 - **토크나이저 참조**: qwen3moe 어휘의 참조 id는 `/home/user/ik-tokref`(`db517b69` + #2520 커밋 `93191627`, `llama-tokenize`만 빌드)로 뜬다. `gate-tokenizer`의 qwen3moe 빨강(`'RE`)은 참조 쪽 결함이었다.
 
@@ -63,7 +63,7 @@
 
 | M | 된 것 | 다음 | 막는 것 |
 |---|---|---|---|
-| **M1 숫자 공개** | A6000 헤드라인(「지금」), 카드 크기 곡선 24/38/41 GB(자리 12), 카드 쪽 분해(E26) | E21: 3090 실측 — 우리·ik·ik + DSpark 같은 창, 온도 > 0 수락률; rig-log 글 + 30초 영상(사용자 승인 뒤) | `nanmoe`, `shadowhost` |
+| **M1 숫자 공개** | A6000 헤드라인(「지금」), 카드 크기 곡선 24/38/41 GB(자리 12), 카드 쪽 분해(E26) | E21: 3090 실측(공개 `Q3_K_M`) — 우리·ik·ik + DSpark 같은 창, 온도 > 0 수락률; rig-log 글 + 30초 영상(사용자 승인 뒤) | `nanmoe`, `shadowhost`, `plainfile` |
 | **M2 돌려 볼 수 있게** | `bloomery-serve-ds41`·`bloomery-chat`·README·BUILD.md(`4afdd65`) | BUILD.md에 prefix 재사용 두 문장(prefix2 보고의 영문 초안) | LICENSE·공개 시점(사용자) |
 | **DFlash(DSpark)** | 커널 `dshc`·`dsmx`, A 적재·KV `4b963af` | B `dsgraphb`(비행) → C(w마다 그래프, `DraftBody`) → `dsloop`(수락 루프) | — |
 | M3 서버 pain | ① prefix 재사용(`47e36b5` + prefix2), ③ reasoning/DSML(`7f68981`) | `propsengine`(비행), ⑧ 슬롯 save/restore(`slots`) | — |
@@ -76,8 +76,8 @@
 
 | 파동 | 병렬 | 리드가 그 사이 | 닫는 조건 |
 |---|---|---|---|
-| **18 (09-24 14:00~)** | `dsgraphb` ‖ `nanmoe` ‖ `shadowhost` ‖ `propsengine` | prefix2·qwen3 3단계 머지, plan 정리, 토크나이저 참조 트리 | nanmoe·shadowhost 머지 → E21 자리 |
-| 19 | `dsgraphc` ‖ `visinj` ‖ `linear` 1단계 ‖ qwen3 타이밍 레시피 | E21(3090, 30분 자리), qwen3 같은 창 A/B | dsgraph C 머지 |
+| **18 (09-24 14:00~)** | `dsgraphb` ‖ `nanmoe` ‖ `shadowhost` ‖ `propsengine` ‖ `qwen3time` ‖ `qwen3perf` ‖ `plantidy`(조사) → `plainfile`(자리가 나면) | prefix2·qwen3 3단계 머지, plan 정리, 토크나이저 참조 트리 | nanmoe·shadowhost 머지 → E21 자리 |
+| 19 | `plainfile`(계속) ‖ `dsgraphc` ‖ `visinj` ‖ `linear` 1단계 | E28 qwen3 같은 창 A/B, E21(공개 파일, plainfile 뒤) | plainfile·dsgraph C 머지 |
 | 20 | `dsloop` ‖ `slots` ‖ `glm53` | DSpark tok/s(A6000 (a)·3090 gate), M1 글 | dsloop 머지 |
 
 ### 리드 직렬 지점과 규칙(이 파동들에 적용)
@@ -92,7 +92,7 @@
 
 - **LICENSE**: MIT 유지 vs Apache-2.0(crate `license` 필드 12개도 함께).
 - **공개 시점**: M1 숫자만 먼저(rig-log 글) vs M2와 함께(레포 공개).
-- **밀집 가중치 재양자화**: `attnQ8` 파일의 밀집 Q8_0 → Q6_K/Q4_K(E26: 카드 커널 시간 18.2 ms의 55 %가 q8_0 gemv와 헤드, −3–5 ms [유도]); 정확도 변화는 PPL/KLD로 따로 잰다.
+- ~~**밀집 가중치 재양자화**: `attnQ8` 파일의 밀집 Q8_0 → Q6_K/Q4_K~~ **결정됨(사용자 09-24 14:30)**: 혼합 파일을 버리고 공개 `Q3_K_M` 그대로 — 「지금」의 ③.
 - 정해진 것(원문은 장부): 3090 T1 측정 E21 승인 · GLM-5.3-Flash 파일 = UD-Q2_K_XL(받음, sha 확인) · 비전은 M5로 V4.1 먼저.
 
 ## 모델 — 먼저 유도하고, 측정은 유도가 빗나갈 때만 (2026-09-22)
@@ -687,7 +687,7 @@ flowchart LR
 | E19 | **lookup 드래프트 게이트, 오프라인**(사용자 09-24 Jev 질문 → [`research/jev-placement.md`](research/jev-placement.md)): `draft-accept.py` 확장 — 일치 길이 n=1/2/3/≥4·출현 횟수별 수락률, 정책 넷(항상 쌍 / n≥k / 로지스틱 / 오라클)을 Σ(1+수락)/Σ(쌍 r, 아니면 1)로 r=1.21·1.29 채점, 네 코퍼스 + E5b greedy 출력 | 오라클−항상쌍 < 2 %면 게이트 버림; n≥k가 오라클 1점 안이면 규칙 채택 → 같은 임대 A/B. 외부 분류기(Jev 계열, 최속 5.3 ms)는 토큰 단위로 못 씀 | 오프라인 수 분 | 라운드(S) | E5b |
 | E21b | **카드 크기별 tok/s 곡선(A6000에서 T1·T2 상한 재현)**(사용자 09-24 승인): 배치에 바이트 예산 레버 `BLOOMERY_CARD_BUDGET=<bytes>`(층당 n_l을 예산에서 — `budget` 라운드, XS–S) → 24 GB(=3090 ×1, 지금 gate 배치) / 38 GB(=3090 ×2 상한: dense 7.66 한 번 + 카드마다 여유 1.3, 두 카드 합류 비용은 안 들어감) / 41 GB(A6000 풀) 세 점, 뜨거운 목록, 코드·산문 프롬프트, 같은 임대. 3090 ×3(expert ~60 GB)은 A6000으로 재현 불가 | 공개 글의 "카드 크기별" 표; T2 실측과의 틈 = 두 카드 경로 라운드의 예산 | 임대 ~25분 | 리드 + `budget` 라운드 | budget |
 | E21 | **T1 실측: 3090 단일 배치의 tok/s** — `BLOOMERY_TIMING_GPU=<3090>` `--place gate` + `BLOOMERY_HOT_LIST`, 깊이 6/4096, 코드·산문 512토큰 프롬프트, `-n 96`, 2바퀴(A6000 고정 규칙의 예외 — **사용자 승인 09-24**) | 공개 글 헤드라인 = 타겟 카드의 값; ~~예측[유도]: 슬롯 888→~600이면 호스트 슬롯 +30 %, 스텝 ~+7–8 ms → 22–24 tok/s(드래프트 없이)~~ 정정(budget 라운드): 카드 슬롯은 2,414→888(−63 %)이고, 호스트 슬롯/토큰 증가분은 E11의 `host_slots` 실측(목록 배치, plan (a))에서 gate 배치의 카드 적중률로 다시 유도해야 한다 — 유도 전에는 예측 없음 | 임대 ~20분 | 리드 | 사용자 승인 |
-| E20 | **plain Q3_K_M 대 서빙 혼합 파일**(사용자 09-24 "굳이 이런 거 없이 쓰고 싶은데 이득이 큰가"): 고친 ik(`db517b69`)로 두 파일 PPL c2048×4(각 ~15분, 2.2355는 결함 시점 값이라 무효), 우리 엔진이 plain 파일을 적재·게이트(attention 텐서가 Q3_K/Q4_K — Q8_0 경로 밖) 통과하는지, 통과하면 같은 창 tok/s | PPL 차이가 작고 엔진이 plain을 받으면 혼합을 버리고 공개 GGUF 그대로(공개 절차 단순화) | 임대 ~35분(2자리) | 리드 | 파동 15 착륙 |
+| E20 | ~~**plain Q3_K_M 대 서빙 혼합 파일**(사용자 09-24 "굳이 이런 거 없이 쓰고 싶은데 이득이 큰가"): 고친 ik(`db517b69`)로 두 파일 PPL c2048×4(각 ~15분, 2.2355는 결함 시점 값이라 무효), 우리 엔진이 plain 파일을 적재·게이트(attention 텐서가 Q3_K/Q4_K — Q8_0 경로 밖) 통과하는지, 통과하면 같은 창 tok/s~~ **결정됨 — 실험 없이(사용자 09-24 14:30 "이거 버리자 그때 명확한 이득 없었어")**: 공개 `Q3_K_M` 그대로. 남은 것은 판정이 아니라 확인이다 — `plainfile`이 공개 파일에서 우리 대 ik PPL/KLD를 맞춘다 | ~~PPL 차이가 작고 엔진이 plain을 받으면 혼합을 버리고 공개 GGUF 그대로(공개 절차 단순화)~~ | 임대 ~35분(2자리) | 리드 | 파동 15 착륙 |
 | E17 | **뜨거운 목록의 프롬프트 의존**(사용자 09-24 "빈도순위는 프롬프트마다 많이 달라지는 거 아니니"): 코퍼스별(code·prose·threads·korean, + 혼합) 층별 순위표를 `router-hotlist.py`로 각각 뽑고, A 목록의 앞 n_l개로 B 스트림을 돌렸을 때의 바이트 가중 적중률 행렬(4×4 + 혼합 열) **+ 접두 열: 문서 앞 N=64/256/1024 토큰의 라우터 선택으로 만든 순위가 나머지에서 얻는 적중**(jev-placement: 프리필 통계가 분류기를 대신하는지 — N=256이 in-domain 57.6–73.5에 닿으면 E18은 분류기 없이) — 오프라인, 박스 CPU ~수 분, 임대 없음 | 정적 목록 하나로 충분한지, 아니면 E18을 열지(적중 격차 > 10 %p면 연다) | ~10분 | 리드/라운드(S) | — |
 | E18 | (E17 뒤) **프롬프트 적응 배치**: 프리필의 라우팅 통계로 카드 상주 expert를 요청마다 교체 — 슬롯 맵은 디바이스 표라 같은 개수 교체는 재캡처 없음(`chain/ffn.rs:509`), H2D 26.2 GB/s로 expert 0.64 ms, 층당 4개 97 ms·8개 195 ms[유도], 상한 이득 3.0–9.9 ms/스텝, 프리필에 숨고 ≤189토큰에 회수; 미확인: 호스트 티어 사본 라이브 교체, 디코드와 겹친 H2D가 호스트 다리를 늦추는 몫 — 설계 카드부터 | 요청 단위 서빙에서 목록 이득을 프롬프트 무관하게 | 카드 | — | E17 |
 | E14 | 0층 bridge 2.1–2.7 ms(nsys, 판정 아님) 원인 — 계획 0.85의 2.5–3배; 0층 전부 호스트 Q5_K 6 expert | 스텝 최대 exposed 항 | E1과 한 임대(STEP_STATS leg_us 층별은 없음 → nsys 층별) | 리드 | — |
@@ -740,6 +740,19 @@ cargo build --release -p bloomery-qdot --bin qdot-rate-mt && .../qdot-rate-mt   
 어떤 기법이든 "루프라인의 어느 항을 얼마나 줄이는가"로 환원되지 않으면 설계 입력이 아니다.
 
 ## 이 모델에 실제로 들어 있는 것 (2026-09-19 GGUF 헤더 직접 파싱)
+
+**V4.1 Flash 공개 `Q3_K_M`(2026-09-24 `gguf-inventory`, 9 샤드, 텐서 1,046개)** — 2026-09-24부터 V4.1의 유일한 파일(사용자 결정). 아래 V2-Lite 표와 다른 모델이다.
+
+| ggml 타입 | 개수 | 바이트 | 어디 |
+|---|---:|---:|---|
+| Q3_K (11) | 476 | 243,240,856,540 | attention 전부(`attn_q_a`·`attn_q_b`·`attn_kv`·`attn_output_a/b`), 공유 전문가 gate·up, `hc_*_fn`, `token_embd`(284,416,000), engram 표 둘(`blk.1`·`blk.14`의 `engram_embd` 256×~3.84억 행, 합 84.6 GB)과 `engram_wkv`, 라우팅 전문가 gate·up |
+| Q4_K (12) | 76 | 97,077,657,600 | 38개 층의 `ffn_down_exps`·`ffn_down_shexp`[바이트로 유도: down_exps 2,548,039,680 B × 38 + 공유 down 6,635,520 B × 38 = 97,077,657,600 B, 인벤토리 합과 같다] |
+| Q5_K (13) | 4 | 6,244,761,600 | 두 층(0층 포함)의 `ffn_down_exps`·`ffn_down_shexp` — 라우팅 전문가 형식은 혼합 파일과 같다(우리 엔진이 이미 읽는다) |
+| Q6_K (14) | 1 | 542,976,000 | `output.weight` |
+| BF16 (30) | 40 | 157,286,400 | 층마다 `ffn_gate_inp` |
+| F32 (0) | 449 | 2,097,600 | norm, sink, HC base/scale, `exp_probs_b(_vl)` |
+
+밀집(토큰마다 읽는 것, `token_embd`·engram 제외) 3,595,917,760 B = 3.35 GiB. 버린 혼합 파일(`…-engramQ8-tokembdBF16-attnQ8`, 445 GB)은 같은 텐서가 attention·공유 전문가 Q8_0, `token_embd` BF16(1.32 GB), engram Q8_0(209 GB)이었다 — 09-13~16에 품질을 보려고 만든 것이고(rig-log `docs/v41-experiment-plan.md`), 형식상 필요해서가 아니었다.
 
 DeepSeek-V2-Lite-Chat Q3_K_M, GGUF v3, 텐서 377개, 블록 27개(블록 0은 dense, 1~26이 MoE),
 expert 64개 중 6개 사용, 임베딩 2048, 헤드 16.
