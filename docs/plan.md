@@ -64,6 +64,7 @@
 | **DFlash** | 어긋난 k=1 검증 + DSpark 드래프트(3090 상주) | `dshc`(비행 중) → `dsmx`(seamb 뒤) → `dsgraph`(둘 뒤) → `dsloop` | 자리 10: D·tok/s(A6000 (a)와 3090 gate), G-d4 수락률 |
 | seam | 새 모델이 공유할 구조 | `seamb`(비행 중); seamc·seama 착륙 | 머지 |
 | M3 서버/커뮤니티 | pain 쇼트리스트 ①(prefix 재사용, L) ③(reasoning/DSML tool call, M) ⑧(슬롯 save/restore, M), 이슈 템플릿, 기여 안내 | `prefix` → `dsml` → `slots` | 템플릿·안내는 리드 |
+| **M5 비전** | V4.1 Flash·GLM-5.3-Flash의 이미지 입력(인코더 + 프로젝터 + 임베딩 주입 + `image_url` 파트) | `visionres`(조사, 비행 중) → 보고 뒤 결정 | 순서·범위 결정 |
 | M4 모델 계열 | Qwen3-30B-A3B 전 카드 → dense → GLM-4.7-Flash → 235B 호스트 → V4 Flash → 선형 | `qwen3`(L, 장기 — 파동을 넘겨 산다) → ~~`glm47`~~ **`glm53`**(GLM-5.3-Flash: 사용자 09-24 "할 거면 5.3 Flash" — HF 다운로드 3.8M 대 4.7-Flash 1.8M; 아키텍처 `glm5next`(ik 지원)가 V4.1 계열이다: HC mult 4, 인덱서 top-2048, MLA, sigmoid noaux_tc 288/8+1 공유, MTP 1층, 320B/활성 18B → 우리 V4.1 경로를 거의 그대로 탄다. **파일 결정 대기**: 09-15의 UD-Q4_K_XL 186 GiB는 박스에서 지워졌고 exl3만 남았다) → `qwen3host` → `ds4` → `linear` | 모델별 ik 덤프 세트, PPL/KLD, 같은 창 A/B(ik·llama.cpp·PR #83) |
 
 ### 파동 (빌더 5개 이상 — 사용자 지시 09-24 10:16 "한번에 다섯 개 이상"; 측정은 증인으로 거른다)
@@ -92,7 +93,8 @@
 - **LICENSE**: MIT 유지 vs Apache-2.0(crate `license` 필드 12개도 함께).
 - **공개 시점**: M1 숫자만 먼저(rig-log 글) vs M2와 함께(레포 공개).
 - 3090 T1 측정(E21)은 승인됨.
-- **GLM-5.3-Flash 파일**: 다시 받을지(UD-Q4_K_XL 186 GiB ≈ 1시간, 또는 UD-Q3_K_XL 137 GB ≈ 45분 — V4.1 Q3_K_M과 같은 급), 어느 양자화로.
+- ~~**GLM-5.3-Flash 파일**: 다시 받을지, 어느 양자화로.~~ 결정됨(사용자 09-24 10:50): **DGX Spark에 드는 크기** — unsloth `UD-Q2_K_XL` 101.3 GiB(K-quant만, 우리 디코더가 있는 형식; IQ3_XXS 112 GiB는 IQ 형식이라 제외, Q3_K_XL 137 GiB는 128 GB를 넘는다). 박스 `/models/GLM-5.3-Flash-UD-Q2_K_XL/`로 받는 중(10:32~, 4 샤드, 첫 샤드 9.4 MB는 메타데이터 전용 샤드).
+- **비전 입력**(사용자 09-24 "V4.1 Flash에 비전도 있다"): V4.1 Flash는 image-text-to-text(원 레포 `inference/vision.py`), unsloth GGUF에는 mmproj가 없다; GLM-5.3-Flash GGUF에는 `mmproj-BF16.gguf`가 있다. 조사 라운드 `visionres`(opus, 박스 없음, 10:52 발사, 스펙 `spec-visionres.md`) — 인코더·참조(`mtmd`) 지원 상태·우리 엔진에 필요한 것·이미지당 비용 유도·순서 추천. 구현은 M4 뒤 별도 마일스톤(**M5 비전**)으로 두고 보고를 받은 뒤 줄을 긋는다.
 
 ## 모델 — 먼저 유도하고, 측정은 유도가 빗나갈 때만 (2026-09-22)
 
