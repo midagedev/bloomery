@@ -75,9 +75,17 @@ const _: () = assert!(HC_ROWS_PER_WARP * HC_PRE_WARPS == HC_MIX && HC_ROWS_PER_W
 /// warp for HC_PRE and a thread per partial sum.
 pub const HC_MAX_TOKENS: usize = 8;
 const _: () = assert!(HC_MAX_TOKENS <= HC_PRE_WARPS);
-const _: () = assert!((HC_MIX + 1) * HC_MAX_TOKENS <= HC_PRE_THREADS);
+/// The finishing block's first squares thread: token `t`'s squares are
+/// summed by thread `HC_SS_THREAD + t`, in the last warp, so the sum does
+/// not run behind the partial sums of threads `0..24m` in their warps.
+const HC_SS_THREAD: usize = HC_PRE_THREADS - 32;
+const _: () = assert!(HC_MIX * HC_MAX_TOKENS <= HC_SS_THREAD);
+const _: () = assert!(HC_SS_THREAD + HC_MAX_TOKENS <= HC_PRE_THREADS);
 /// The finishing block's shared mix slots: one per (token, row).
 const HC_MIX_SLOTS: usize = HC_MIX * HC_MAX_TOKENS;
+/// Pieces a finishing sum loads ahead of its adds: the V4.1 width's 40
+/// pieces in one round.
+const HC_FIN_BATCH: usize = 40;
 /// Threads of the element-wise entries.
 pub(crate) const HC_ELEM_THREADS: usize = 256;
 const HC_ELEM_THREADS_U32: u32 = HC_ELEM_THREADS as u32;
@@ -339,6 +347,41 @@ unsafe fn store_streams(out: &mut DisjointSlice<f32>, n: usize, i: usize, o: [f3
     }
 }
 
+/// The sum `buf[off] + buf[off + stride] + …` of `n` terms in ascending
+/// order, the first term taken as it is; [`HC_FIN_BATCH`] loads are issued
+/// ahead of their adds.
+///
+/// SAFETY: `off + (n - 1) * stride < buf.len()`, and every store to those
+/// slots is ordered before these reads.
+#[inline(always)]
+unsafe fn column_sum(buf: &mut DisjointSlice<f32>, off: usize, stride: usize, n: usize) -> f32 {
+    let mut acc = 0.0f32;
+    let mut q = 0usize;
+    while q < n {
+        let mut v = [0.0f32; HC_FIN_BATCH];
+        let mut j = 0usize;
+        while j < HC_FIN_BATCH {
+            cuda_device::thread::__unroll_config::<0>();
+            if q + j < n {
+                // SAFETY: off + (q + j) * stride <= off + (n - 1) * stride <
+                // buf.len() by this fn's contract.
+                v[j] = unsafe { *buf.get_unchecked_mut(off + (q + j) * stride) };
+            }
+            j += 1;
+        }
+        let mut j = 0usize;
+        while j < HC_FIN_BATCH {
+            cuda_device::thread::__unroll_config::<0>();
+            if q + j < n {
+                acc = if q + j == 0 { v[j] } else { acc + v[j] };
+            }
+            j += 1;
+        }
+        q += HC_FIN_BATCH;
+    }
+    acc
+}
+
 // ---------------------------------------------------------------- kernels
 
 #[cuda_module]
@@ -523,7 +566,8 @@ mod hc_kernels {
         }
 
         // The finishing block. Threads 0..24m sum one (token, row) partial
-        // each, threads 24m..25m one token's squares.
+        // each, threads HC_SS_THREAD..+m one token's squares, each over the
+        // pieces in ascending order.
         // SAFETY: MIX and SCL are this block's own shared allocations; each
         // slot below is written by one thread before the barrier that
         // publishes it (24m <= 192, m <= 8 by the contract).
@@ -534,34 +578,20 @@ mod hc_kernels {
             )
         };
         if tid < HC_MIX * mm {
-            let (tt, r) = (tid / HC_MIX, tid % HC_MIX);
-            // SAFETY: (q*m + tt)*24 + r < 24*n_pieces*m <= part.len() for
-            // every q < n_pieces; the ticket ordered every block's stores
-            // before these reads, and no thread writes `part` again.
-            let mut acc = unsafe { *part.get_unchecked_mut(tt * HC_MIX + r) };
-            let mut q = 1;
-            while q < np {
-                // SAFETY: (q*m + tt)*24 + r < 24*n_pieces*m <= part.len() as
-                // q < n_pieces; the ticket ordered every block's stores first.
-                acc += unsafe { *part.get_unchecked_mut((q * mm + tt) * HC_MIX + r) };
-                q += 1;
-            }
+            // SAFETY: piece q's slot (q*m + t)*24 + r = q*24m + tid <
+            // 24*n_pieces*m <= part.len() for every q < n_pieces; the ticket
+            // ordered every block's stores before these reads, and no thread
+            // writes `part` again.
+            let acc = unsafe { column_sum(&mut part, tid, HC_MIX * mm, np) };
             // SAFETY: tid < 24m <= 192, this thread's own slot.
             unsafe {
                 *mix_s.add(tid) = acc;
             }
-        } else if tid < (HC_MIX + 1) * mm {
-            let tt = tid - HC_MIX * mm;
-            // SAFETY: q*m + tt < n_pieces*m <= ss.len(); the ticket ordered
-            // every block's stores before these reads.
-            let mut acc = unsafe { *ss.get_unchecked_mut(tt) };
-            let mut q = 1;
-            while q < np {
-                // SAFETY: q*m + tt < n_pieces*m <= ss.len() as q < n_pieces;
-                // the ticket ordered every block's stores first.
-                acc += unsafe { *ss.get_unchecked_mut(q * mm + tt) };
-                q += 1;
-            }
+        } else if (HC_SS_THREAD..HC_SS_THREAD + mm).contains(&tid) {
+            let tt = tid - HC_SS_THREAD;
+            // SAFETY: q*m + tt < n_pieces*m <= ss.len() for every q <
+            // n_pieces; the ticket ordered every block's stores first.
+            let acc = unsafe { column_sum(&mut ss, tt, mm, np) };
             let mean = acc / k as f32;
             // SAFETY: tt < m <= 8, this thread's own slot.
             unsafe {

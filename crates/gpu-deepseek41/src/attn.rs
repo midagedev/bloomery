@@ -58,6 +58,9 @@ const _: () = assert!(BLOCK_U32 as usize == MMA_BLOCK);
 /// Keys one segment block walks — the V2-Lite tensor-core pass's segment,
 /// a multiple of the walk's tile.
 pub const SEG_KEYS: usize = MMA_SEG_KEYS;
+/// Segments whose partials the merge loads as one batch before it folds
+/// them.
+const MERGE_BATCH: usize = 16;
 const _: () = assert!(SEG_KEYS.is_multiple_of(MMA_KEYS));
 
 /// The key tile's byte offset in the segment block's dynamic shared memory:
@@ -360,7 +363,9 @@ mod attn_kernels {
     /// folding the row's segments by [`online_fold`] in ascending order —
     /// the window's, then the compressed rows' — and then the head's sink
     /// as one more partial `(sink, 1, 0)`. A neutral partial (`Σ exp == 0`)
-    /// is skipped, so a segment the token does not reach is never read.
+    /// is skipped, so a segment the token does not reach is never folded.
+    /// The partials are loaded [`MERGE_BATCH`] segments at a time ahead of
+    /// their folds; the folds and their order are the one-at-a-time walk's.
     #[kernel]
     #[launch_bounds(512)]
     #[launch_contract(
@@ -393,22 +398,36 @@ mod attn_kernels {
         let mut acc = 0.0f32;
         let mut seg = 0usize;
         while seg < n_seg {
-            let idx = row * n_seg + seg;
-            // SAFETY: idx < q_rows * segs, so both slots are inside part_ms
-            // (launch contract).
-            let (mj, sj) = unsafe {
-                (
-                    *part_ms.get_unchecked(2 * idx),
-                    *part_ms.get_unchecked(2 * idx + 1),
-                )
-            };
-            if sj != 0.0 {
-                // SAFETY: sj != 0 => this segment wrote its partials, and
-                // idx * LATENT + tid < q_rows * segs * LATENT.
-                let vj = unsafe { *part_v.get_unchecked(idx * LATENT + tid) };
-                (mx, s, acc) = online_fold(mx, s, acc, mj, sj, vj);
+            // The batch's loads are issued ahead of its folds, so the walk
+            // does not wait on memory twice per segment.
+            let mut ms = [0.0f32; 2 * MERGE_BATCH];
+            let mut vs = [0.0f32; MERGE_BATCH];
+            let mut i = 0usize;
+            #[unroll]
+            while i < MERGE_BATCH {
+                if seg + i < n_seg {
+                    let idx = row * n_seg + seg + i;
+                    // SAFETY: idx < q_rows * segs, so both slots are inside
+                    // part_ms, and idx * LATENT + tid < q_rows * segs *
+                    // LATENT <= part_v.len() (launch contract). A neutral
+                    // segment's value slot is loaded and not folded.
+                    unsafe {
+                        ms[2 * i] = *part_ms.get_unchecked(2 * idx);
+                        ms[2 * i + 1] = *part_ms.get_unchecked(2 * idx + 1);
+                        vs[i] = *part_v.get_unchecked(idx * LATENT + tid);
+                    }
+                }
+                i += 1;
             }
-            seg += 1;
+            let mut i = 0usize;
+            #[unroll]
+            while i < MERGE_BATCH {
+                if seg + i < n_seg && ms[2 * i + 1] != 0.0 {
+                    (mx, s, acc) = online_fold(mx, s, acc, ms[2 * i], ms[2 * i + 1], vs[i]);
+                }
+                i += 1;
+            }
+            seg += MERGE_BATCH;
         }
         // SAFETY: row % n_heads < n_heads <= sinks.len() (launch contract).
         let sink = unsafe { *sinks.get_unchecked(row % n_heads as usize) };

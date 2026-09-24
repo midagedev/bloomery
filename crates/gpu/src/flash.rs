@@ -1983,7 +1983,9 @@ mod flash_kernels {
     /// One query row's fold over its segments' partials, the standard
     /// online-softmax rescale in ascending segment order — the shared body
     /// of [`flash_merge`] and [`flash_merge_q8`], so the two cannot drift.
-    /// Returns this thread's final latent value.
+    /// Returns this thread's final latent value. The partials are loaded
+    /// sixteen segments at a time ahead of their folds; the folds and their
+    /// order are the one-at-a-time walk's.
     ///
     /// `TWICE` is false in every shipped entry. The probe twin sets it and
     /// the fold runs a second time over the same partials, entered `shift`
@@ -2009,6 +2011,9 @@ mod flash_kernels {
         shift: usize,
         jig: f32,
     ) -> f32 {
+        // Segments whose partials the fold loads as one batch before it
+        // folds them.
+        const MERGE_BATCH: usize = 16;
         let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
         let n_seg = limit.div_ceil(seg_keys as usize).min(segs as usize);
         let mut mx = f32::NEG_INFINITY;
@@ -2016,22 +2021,36 @@ mod flash_kernels {
         let mut acc = 0.0f32;
         let mut seg = 0usize;
         while seg < n_seg {
-            let idx = row * segs as usize + seg;
-            // SAFETY: idx < q_rows * segs, so both slots are inside part_ms
-            // (caller's contract).
-            let (mj, sj) = unsafe {
-                (
-                    *part_ms.get_unchecked(2 * idx),
-                    *part_ms.get_unchecked(2 * idx + 1),
-                )
-            };
-            if sj != 0.0 {
-                // SAFETY: sj != 0 => this segment wrote its partials, and
-                // idx * lat + tid < q_rows * segs * latent.
-                let vj = unsafe { *part_v.get_unchecked(idx * lat + tid) };
-                (mx, s_sum, acc) = online_fold(mx, s_sum, acc, mj, sj, vj);
+            // The batch's loads are issued ahead of its folds, so the walk
+            // does not wait on memory twice per segment.
+            let mut ms = [0.0f32; 2 * MERGE_BATCH];
+            let mut vs = [0.0f32; MERGE_BATCH];
+            let mut i = 0usize;
+            while i < MERGE_BATCH {
+                cuda_device::thread::__unroll_config::<0>();
+                if seg + i < n_seg {
+                    let idx = row * segs as usize + seg + i;
+                    // SAFETY: idx < q_rows * segs, so both slots are inside
+                    // part_ms, and idx * lat + tid < q_rows * segs * latent
+                    // (caller's contract). A neutral segment's value slot is
+                    // loaded and not folded.
+                    unsafe {
+                        ms[2 * i] = *part_ms.get_unchecked(2 * idx);
+                        ms[2 * i + 1] = *part_ms.get_unchecked(2 * idx + 1);
+                        vs[i] = *part_v.get_unchecked(idx * lat + tid);
+                    }
+                }
+                i += 1;
             }
-            seg += 1;
+            let mut i = 0usize;
+            while i < MERGE_BATCH {
+                cuda_device::thread::__unroll_config::<0>();
+                if seg + i < n_seg && ms[2 * i + 1] != 0.0 {
+                    (mx, s_sum, acc) = online_fold(mx, s_sum, acc, ms[2 * i], ms[2 * i + 1], vs[i]);
+                }
+                i += 1;
+            }
+            seg += MERGE_BATCH;
         }
         if TWICE {
             // The same fold over the same partials, entered `shift`
