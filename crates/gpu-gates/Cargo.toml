@@ -42,6 +42,11 @@ bloomery-sampler = { path = "../sampler", optional = true }
 # `gate_ds41_serve`, which reads the server's JSON. Reached only through the `deepseek41` feature.
 bloomery-serve = { path = "../serve", optional = true }
 serde_json = { version = "=1.0.151", optional = true }
+# The V4.1 image encoder on the card and its host crate, reached only through the `vision` feature
+# (`gate_vision_encoder`): a compiler failure in the encoder's device code breaks that gate's build
+# and no other.
+bloomery-gpu-vision = { path = "../gpu-vision", optional = true }
+bloomery-vision = { path = "../vision", optional = true }
 
 [features]
 gpu = ["dep:bloomery-gpu", "dep:cuda-core"]
@@ -55,6 +60,7 @@ deepseek41 = [
     "dep:bloomery-serve",
     "dep:serde_json",
 ]
+vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
 
 [[bin]]
 name = "bloomery-chat"

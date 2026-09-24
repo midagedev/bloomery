@@ -113,11 +113,13 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-gpu-vision",
  "bloomery-model",
  "bloomery-sampler",
  "bloomery-serve",
  "bloomery-threads",
  "bloomery-tokenizer",
+ "bloomery-vision",
  "cuda-core",
  "libc",
  "memmap2",
@@ -131,6 +133,18 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gpu",
  "cuda-core",
+]
+
+[[package]]
+name = "bloomery-gpu-vision"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-vision",
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
 ]
 
 [[package]]

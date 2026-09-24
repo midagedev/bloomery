@@ -6,11 +6,35 @@ deepseek-ai/DeepSeek-V4.1-Flash, on the files under --images, and writes one set
 
   <image>.rgb.u8        [best_h, best_w, 3] u8  the resized and padded image load_image normalizes
   <image>.patches.bf16  [n_vit, 588] bf16       load_image's patch tensor (c, py, px inside a patch)
+  <image>.embed.bf16    [n_vit, 1024] bf16      patch embedding (PatchEmbed.proj) — the input of block 0; the ViT
+                                                adds no position here, its 2D RoPE turns q and k inside each block
+  <image>.blk<i>.bf16   [n_vit, 1024] bf16      the residual stream after block i: blocks 0, 1, 15 and 31, and every
+                                                block of the full-tap image (FULL_TAP_IMAGE)
   <image>.vit.bf16      [n_vit, 1024] bf16      ViT output after its final RMSNorm
   <image>.aligner.bf16  [n_llm_h * n_llm_w, 5120] bf16  aligner rows in reading order
   <image>.types.i32     [n_tokens] i32          image_token_types (IMAGE_START 0, IMAGE 1, NEW_LINE 2, END 3)
   <image>.ids.i32       [n_tokens] i32          the span's input_ids: image_token_id at every position
   delims.bf16           [3, 5120] bf16          image_start, image_end, image_newline as merge casts them
+
+The full-tap image also gets block 0 op by op and the aligner's two linears, each the output of one
+module of vision.py (a forward hook; a pre-hook for a module's input), so a gate that fails on block 0
+names the op:
+  <image>.blk0.norm1.bf16 [n_vit, 1024]   Block.norm1                <image>.blk0.qkv.bf16  [n_vit, 3072]  Attention.wqkv
+  <image>.blk0.qrot.bf16  [n_vit, 1024]   q after apply_rotary       <image>.blk0.krot.bf16 [n_vit, 1024]  k after it
+  <image>.blk0.sdpa.bf16  [n_vit, 1024]   the input of Attention.wo  <image>.blk0.attn.bf16 [n_vit, 1024]  Attention
+  <image>.blk0.norm2.bf16 [n_vit, 1024]   Block.norm2                <image>.blk0.w1.bf16   [n_vit, 5632]  MLP.w1
+  <image>.blk0.act.bf16   [n_vit, 2816]   the input of MLP.w2        <image>.blk0.mlp.bf16  [n_vit, 1024]  MLP
+  <image>.aligner.w1.bf16 [n_llm, 5120]   Aligner.w1                 <image>.aligner.h.bf16 [n_llm, 5120]  input of Aligner.w2
+qrot and krot are recomputed from the qkv tap by vision.py's own get_vision_cos_sin and apply_rotary on
+the same tensors, which is the computation Attention.forward runs.
+
+MANIFEST also records, for the full-tap image, how the reference rounds (the premise of the gates'
+bands): `# sdpa` names every SDPA backend that reproduces the unrestricted call's output bit for bit on
+block 0 (and those that refuse the 3-D call), and each `# probe` row counts the values of one op's
+output that differ from the exactly rounded result of the same inputs — the op computed in float64 on
+the card, rounded to bf16 to nearest even in float64 — with the largest distance in bf16 steps. `# sensitivity` rows run the reference against itself with
+one-ulp noise in the full-tap image's patch embedding (SENSITIVITY_RATE of its values), per tap: how
+far the network itself carries a difference of the size a correct kernel makes at its first op.
   plans.tsv             the resize plan and the pad geometry of the images and of a table of sizes
   MANIFEST.tsv          where the set came from, one row per image and per file, `# complete` last
 
@@ -53,6 +77,16 @@ SYSTEM_PACKAGES = "/usr/lib/python3/dist-packages"
 
 # Sizes whose plan is dumped besides the images': both collapse branches of solve_resize_ratio, the
 # min-pixels upscale, a multiple of 14 and its neighbours, the budget edge, common camera sizes.
+# The blocks whose output every image dumps, and the image that dumps every block plus block 0 op by op.
+TAP_BLOCKS = (0, 1, 15, 31)
+FULL_TAP_IMAGE = "grad-448"
+# The fraction of patch-embedding values whose last mantissa bit the sensitivity probe flips: the
+# fraction a correct kernel's patch GEMM differs from torch's in, measured.
+SENSITIVITY_RATE = 1.5e-4
+# The full-tap image's op-level taps, in file order.
+SUB_TAPS = ("blk0.norm1", "blk0.qkv", "blk0.qrot", "blk0.krot", "blk0.sdpa", "blk0.attn", "blk0.norm2",
+            "blk0.w1", "blk0.act", "blk0.mlp", "aligner.w1", "aligner.h")
+
 SIZES = [
     (1, 1), (13, 13), (14, 14), (15, 15), (448, 448), (543, 543), (544, 544), (545, 545),
     (546, 546), (547, 547), (1035, 1035), (1036, 1036), (1037, 1037), (800, 600), (1920, 1080),
@@ -74,6 +108,136 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def attach_taps(vit, aligner, full):
+    """Forward hooks that keep a copy of each tapped tensor; returns (store, handles)."""
+    store = {}
+    handles = []
+
+    def out_hook(name):
+        def hook(_mod, _args, out):
+            store[name] = out.detach().clone()
+        return hook
+
+    def in_hook(name):
+        def hook(_mod, args):
+            store[name] = args[0].detach().clone()
+        return hook
+
+    handles.append(vit.patch_embed.register_forward_hook(out_hook("embed")))
+    for i, blk in enumerate(vit.blocks):
+        if full or i in TAP_BLOCKS:
+            handles.append(blk.register_forward_hook(out_hook(f"blk{i}")))
+    handles.append(vit.norm.register_forward_hook(out_hook("vit")))
+    if full:
+        b0 = vit.blocks[0]
+        handles += [
+            b0.norm1.register_forward_hook(out_hook("blk0.norm1")),
+            b0.attn.wqkv.register_forward_hook(out_hook("blk0.qkv")),
+            b0.attn.wo.register_forward_pre_hook(in_hook("blk0.sdpa")),
+            b0.attn.register_forward_hook(out_hook("blk0.attn")),
+            b0.norm2.register_forward_hook(out_hook("blk0.norm2")),
+            b0.mlp.w1.register_forward_hook(out_hook("blk0.w1")),
+            b0.mlp.w2.register_forward_pre_hook(in_hook("blk0.act")),
+            b0.mlp.register_forward_hook(out_hook("blk0.mlp")),
+            aligner.w1.register_forward_pre_hook(in_hook("aligner.x")),
+            aligner.w1.register_forward_hook(out_hook("aligner.w1")),
+            aligner.w2.register_forward_pre_hook(in_hook("aligner.h")),
+            aligner.w2.register_forward_hook(out_hook("aligner.out")),
+        ]
+    return store, handles
+
+
+def bf16_steps(np, got, exact):
+    """Per value, |got - round_bf16(exact)| in bf16 steps at the exact value's binade (float64)."""
+    exact = exact.astype(np.float64)
+    _, e = np.frexp(exact)
+    step = np.ldexp(1.0, e - 8)  # 8 significant bits
+    rounded = np.rint(exact / step) * step
+    return np.abs(got.astype(np.float64) - rounded) / step
+
+
+def probe_rows(np, torch, F, vit, aligner, store, patches, eps):
+    """How the reference rounds, on the full-tap image: which SDPA backend ran, and per op the values
+    that differ from the exactly rounded result of the op's own (bf16) inputs."""
+    rows = []
+    b0 = vit.blocks[0]
+    n = patches.shape[0]
+    f64 = torch.float64
+
+    def row(op, k, got, exact):
+        g = got.float().cpu().numpy()
+        steps = bf16_steps(np, g, exact.cpu().numpy())
+        rows.append((op, k, g.size, int((steps > 0).sum()), f"{float(steps.max()):g}"))
+
+    def linear(mod, x):
+        y = x.to(f64) @ mod.weight.to(f64).T
+        return y + mod.bias.to(f64) if mod.bias is not None else y
+
+    def rms(mod, x):
+        x = x.to(f64)
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * mod.weight.to(f64)
+
+    row("patch_embed", patches.flatten(1).shape[1], store["embed"], linear(vit.patch_embed.proj, patches.flatten(1)))
+    row("blk0.norm1", 1024, store["blk0.norm1"], rms(b0.norm1, store["embed"]))
+    row("blk0.wqkv", 1024, store["blk0.qkv"], linear(b0.attn.wqkv, store["blk0.norm1"]))
+    q = store["blk0.qrot"].view(n, 16, 64).transpose(0, 1)
+    k = store["blk0.krot"].view(n, 16, 64).transpose(0, 1)
+    v = store["blk0.qkv"].chunk(3, dim=-1)[2].reshape(n, 16, 64).transpose(0, 1)
+    s = (q.to(f64) @ k.to(f64).transpose(1, 2)) * 64 ** -0.5
+    o = (torch.softmax(s, dim=-1) @ v.to(f64)).transpose(0, 1).reshape(n, -1)
+    row("blk0.sdpa", n, store["blk0.sdpa"], o)
+    row("blk0.wo", 1024, store["blk0.attn"], linear(b0.attn.wo, store["blk0.sdpa"]))
+    row("blk0.norm2", 1024, store["blk0.norm2"], rms(b0.norm2, store["embed"] + store["blk0.attn"]))
+    row("blk0.w1", 1024, store["blk0.w1"], linear(b0.mlp.w1, store["blk0.norm2"]))
+    g, u = store["blk0.w1"].to(f64).chunk(2, dim=-1)
+    row("blk0.silu_mul", 1, store["blk0.act"], g * torch.sigmoid(g) * u)
+    row("blk0.w2", 2816, store["blk0.mlp"], linear(b0.mlp.w2, store["blk0.act"]))
+    row("aligner.w1", 9216, store["aligner.w1"], linear(aligner.w1, store["aligner.x"]))
+    row("aligner.gelu", 1, store["aligner.h"], F.gelu(store["aligner.w1"].to(f64)))
+    row("aligner.w2", 5120, store["aligner.out"], linear(aligner.w2, store["aligner.h"]))
+
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    base = F.scaled_dot_product_attention(q, k, v)
+    sdpa = []
+    for name in ("MATH", "FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION"):
+        try:
+            with sdpa_kernel(getattr(SDPBackend, name)):
+                out = F.scaled_dot_product_attention(q, k, v)
+            same = torch.equal(out.view(torch.int16), base.view(torch.int16))
+            sdpa.append(f"{name.lower()} {'same' if same else 'differs'}")
+        except RuntimeError:
+            sdpa.append(f"{name.lower()} refused")
+    return rows, sdpa
+
+
+def tap_stats(torch, got, ref):
+    """max|d|/max|ref|, rms(d)/rms(ref) and the fraction of values that differ, of two bf16 tensors."""
+    g, r = got.double(), ref.double()
+    d = (g - r).abs()
+    return (float(d.max() / r.abs().max()), float((d.square().sum() / r.square().sum()).sqrt()),
+            float((got.view(torch.int16) != ref.view(torch.int16)).double().mean()))
+
+
+def sensitivity_rows(torch, vision, vit, aligner, store, n_h, n_w, rate):
+    """The reference's own amplification of one-ulp noise: the patch embedding with the last
+    mantissa bit of a fraction `rate` of its values flipped (a fixed CPU generator picks them), run
+    through the official blocks, final norm and aligner, each tap against the unperturbed run."""
+    g = torch.Generator().manual_seed(0)
+    embed = store["embed"]
+    mask = (torch.rand(tuple(embed.shape), generator=g, device="cpu", dtype=torch.float32) < rate).to(embed.device)
+    bits = embed.view(torch.int16)
+    x = torch.where(mask, bits ^ 1, bits).view(torch.bfloat16)
+    rows = [("embed", *tap_stats(torch, x, embed))]
+    cos, sin = vision.get_vision_cos_sin(n_h, n_w, vit.rope_dim, vit.rope_theta)
+    for i, blk in enumerate(vit.blocks):
+        x = blk(x, cos, sin)
+        rows.append((f"blk{i}", *tap_stats(torch, x, store[f"blk{i}"])))
+    feats = vit.norm(x)
+    rows.append(("vit", *tap_stats(torch, feats, store["vit"])))
+    rows.append(("aligner", *tap_stats(torch, aligner(feats, n_h, n_w), store["aligner.out"])))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, type=Path)
@@ -89,6 +253,7 @@ def main():
     import numpy as np
     import PIL
     import torch
+    import torch.nn.functional as F
     from PIL import Image, ImageOps
     from safetensors import safe_open
 
@@ -158,6 +323,7 @@ def main():
 
     plan_rows = []
     image_rows = []
+    probes, sdpa, sens = None, None, None
     for path in sorted(a.images.glob("*.png")):
         stem = path.stem
         raw = path.read_bytes()
@@ -180,14 +346,36 @@ def main():
         types = ip.image_token_types(n_llm_h, n_llm_w)
         n_tok = types.numel()
         assert n_tok == ip.num_image_tokens(n_llm_h, n_llm_w)
+        full = stem == FULL_TAP_IMAGE
+        store, handles = attach_taps(vit, aligner, full)
         with torch.inference_mode():
             feats = vit(patches.to(dev), n_vit_h, n_vit_w)
             rows = aligner(feats, n_vit_h, n_vit_w)
+            for h_ in handles:
+                h_.remove()
+            if full:
+                cos, sin = vision.get_vision_cos_sin(n_vit_h, n_vit_w, vit.rope_dim, vit.rope_theta)
+                n_q = n_vit_h * n_vit_w
+                heads, hd = args.vision_n_heads, args.vision_dim // args.vision_n_heads
+                q, k, _ = store["blk0.qkv"].chunk(3, dim=-1)
+                store["blk0.qrot"] = vision.apply_rotary(q.reshape(n_q, heads, hd), cos, sin).reshape(n_q, -1)
+                store["blk0.krot"] = vision.apply_rotary(k.reshape(n_q, heads, hd), cos, sin).reshape(n_q, -1)
+                probes, sdpa = probe_rows(np, torch, F, vit, aligner, store, patches.to(dev),
+                                          vit.blocks[0].norm1.eps)
+                sens = sensitivity_rows(torch, vision, vit, aligner, store, n_vit_h, n_vit_w, SENSITIVITY_RATE)
         assert tuple(feats.shape) == (n_vit_h * n_vit_w, args.vision_dim), feats.shape
         assert tuple(rows.shape) == (n_llm_h * n_llm_w, args.dim), rows.shape
         n_vit = n_vit_h * n_vit_w
         write(f"{stem}.rgb.u8", "rgb", rgb.astype(np.uint8), "u8", (best_h, best_w, 3))
         write(f"{stem}.patches.bf16", "patches", bf16_bytes(patches.reshape(n_vit, -1)), "bf16", (n_vit, 3 * p * p))
+        write(f"{stem}.embed.bf16", "embed", bf16_bytes(store["embed"]), "bf16", (n_vit, args.vision_dim))
+        for i in range(args.vision_n_layers):
+            if f"blk{i}" in store:
+                write(f"{stem}.blk{i}.bf16", f"blk{i}", bf16_bytes(store[f"blk{i}"]), "bf16", (n_vit, args.vision_dim))
+        if full:
+            for tap in SUB_TAPS:
+                t = store[tap]
+                write(f"{stem}.{tap}.bf16", tap, bf16_bytes(t), "bf16", tuple(t.shape))
         write(f"{stem}.vit.bf16", "vit", bf16_bytes(feats), "bf16", (n_vit, args.vision_dim))
         write(f"{stem}.aligner.bf16", "aligner", bf16_bytes(rows), "bf16", (n_llm_h * n_llm_w, args.dim))
         write(f"{stem}.types.i32", "types", types.cpu().numpy().astype("<i4"), "i32", (n_tok,))
@@ -199,6 +387,8 @@ def main():
         plan_rows.append(("image", w, h, n_llm_h, n_llm_w, best_h, best_w, n_tok, *geo))
     if not image_rows:
         sys.exit(f"dump_vision: no *.png under {a.images}")
+    if probes is None:
+        sys.exit(f"dump_vision: no {FULL_TAP_IMAGE}.png under {a.images}, the full-tap image")
 
     for w, h in SIZES:
         n_llm_h, n_llm_w, best_h, best_w = ip.plan_image_grid(w, h, args)
@@ -226,6 +416,16 @@ def main():
         f.write(f"# delims\timage_start image_end image_newline\tcheckpoint {delim_dtype}\n")
         f.write(f"# mmproj\t{a.mmproj}\tsha256\t{mmproj_sha}\n")
         f.write(f"# image_token_id\t{args.image_token_id}\n")
+        f.write(f"# taps\tblocks {' '.join(map(str, TAP_BLOCKS))} of every image; every block and "
+                f"{' '.join(SUB_TAPS)} of {FULL_TAP_IMAGE}\n")
+        f.write(f"# sdpa\t{FULL_TAP_IMAGE} block 0, backends against the unrestricted call\t" + "\t".join(sdpa) + "\n")
+        f.write(f"# sensitivity columns\ttap max_rel rms_rel differ\tthe reference against itself with the last "
+                f"mantissa bit of {SENSITIVITY_RATE:g} of {FULL_TAP_IMAGE}'s patch embedding flipped\n")
+        for r in sens:
+            f.write("# sensitivity\t" + r[0] + "\t" + "\t".join(f"{v:.3e}" for v in r[1:]) + "\n")
+        f.write("# probe columns\top K values differ_from_exact_rounding max_bf16_steps\n")
+        for r in probes:
+            f.write("# probe\t" + "\t".join(map(str, r)) + "\n")
         f.write("# image columns\tname sha256 w h best_w best_h n_vit_h n_vit_w n_llm_h n_llm_w n_tokens "
                 "resized_w resized_h off_x off_y\n")
         for r in image_rows:

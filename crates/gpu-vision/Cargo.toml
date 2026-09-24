@@ -1,0 +1,21 @@
+[package]
+name = "bloomery-gpu-vision"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+cuda-device.workspace = true
+cuda-host.workspace = true
+cuda-core.workspace = true
+# The runtime types the launchers take and return (`GpuError`, `launch_u32`); no device code of
+# that crate is called from here, so its bundle is not linked into a binary through this one.
+bloomery-gpu = { path = "../gpu" }
+# Host only: the encoder file (an mmproj GGUF) and its tensor bytes.
+bloomery-gguf = { path = "../gguf" }
+# Host only: the encoder's hyperparameters, tensor names and patch tensor (V1).
+bloomery-vision = { path = "../vision" }
