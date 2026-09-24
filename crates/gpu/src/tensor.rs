@@ -5,7 +5,7 @@
 
 use crate::GpuError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, sys};
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, size_of};
 use std::sync::Arc;
 
 /// A non-owning window of `len` `T` at device address `ptr` in `ctx`. The
@@ -27,6 +27,80 @@ pub unsafe fn window<T>(
     // `cuMemAlloc` pointer because its drop frees one; a window is never
     // dropped, so the only uses left are the address and the length.
     ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx.clone()) })
+}
+
+/// One device allocation cut into `N` consecutive parts, each of which the
+/// launches read and write as a buffer of its own, while a launch handed the
+/// whole writes every part at once — a gemv over row-concatenated weights
+/// fills each projection's output in place. The parts are [`window`]s into
+/// the whole, which this type owns: they live exactly as long as it does
+/// and free nothing.
+pub struct PartedBuffer<T, const N: usize> {
+    parts: [ManuallyDrop<DeviceBuffer<T>>; N],
+    whole: DeviceBuffer<T>,
+}
+
+impl<T: DeviceCopy, const N: usize> PartedBuffer<T, N> {
+    /// A zero-filled allocation of `lens` summed, part `i` the `lens[i]`
+    /// elements after the parts before it. Load-time only.
+    pub fn zeroed(stream: &CudaStream, lens: [usize; N]) -> Result<Self, GpuError> {
+        let refuse = || GpuError::shape("PartedBuffer::zeroed", format!("parts {lens:?}"));
+        // Each part's byte offset, and the total in elements.
+        let mut offs = [0u64; N];
+        let mut total = 0usize;
+        for (off, &len) in offs.iter_mut().zip(&lens) {
+            let bytes = total.checked_mul(size_of::<T>()).ok_or_else(refuse)?;
+            *off = u64::try_from(bytes).map_err(|_| refuse())?;
+            total = total.checked_add(len).ok_or_else(refuse)?;
+        }
+        let whole = DeviceBuffer::<T>::zeroed(stream, total)?;
+        let base = whole.cu_deviceptr();
+        let mut i = 0;
+        let parts = lens.map(|len| {
+            let off = offs[i];
+            i += 1;
+            // SAFETY: the part spans `len` elements from byte `off` of `whole`,
+            // inside its `total` (the sum of `lens`); `whole` is a `cuMemAlloc`
+            // allocation aligned for `T`, owned by `self` and freed after the
+            // windows, which free nothing.
+            unsafe { window::<T>(base + off, len, whole.context()) }
+        });
+        Ok(PartedBuffer { parts, whole })
+    }
+}
+
+impl<T, const N: usize> PartedBuffer<T, N> {
+    /// The whole allocation, every part in order.
+    pub fn whole(&self) -> &DeviceBuffer<T> {
+        &self.whole
+    }
+
+    /// The whole allocation, for a launch that writes every part.
+    pub fn whole_mut(&mut self) -> &mut DeviceBuffer<T> {
+        &mut self.whole
+    }
+
+    /// Part `i` (`i < N`).
+    pub fn part(&self, i: usize) -> &DeviceBuffer<T> {
+        &self.parts[i]
+    }
+
+    /// Part `i` (`i < N`), for a launch that writes it alone.
+    pub fn part_mut(&mut self, i: usize) -> &mut DeviceBuffer<T> {
+        &mut self.parts[i]
+    }
+}
+
+impl<T, const N: usize> Drop for PartedBuffer<T, N> {
+    fn drop(&mut self) {
+        for part in &mut self.parts {
+            // SAFETY: each window is taken once, here, and never read again;
+            // its raw parts are dropped (the context handle with them) and no
+            // memory is freed — `whole` frees the allocation after this.
+            let buf = unsafe { ManuallyDrop::take(part) };
+            drop(buf.into_raw_parts());
+        }
+    }
 }
 
 /// A 2-D device tensor: `rows * cols` elements of `T`, row-major, uploaded

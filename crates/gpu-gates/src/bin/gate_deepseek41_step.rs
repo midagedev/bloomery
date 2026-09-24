@@ -701,8 +701,9 @@ mod gate {
     /// experts, seven without, one more for a q8_1 shared down projection);
     /// the glue's (the broadcast, three and two per engram site and one more
     /// for the looked-up rows' q8_1 when wkv is a K-quant, the collapse and
-    /// the head's four) and the gather. The types come from `split`. Printed
-    /// as the table G2 pins.
+    /// the head's four) and the gather — less one launch for each projection
+    /// a Q3_K row join folds into another's (`join_projections`). The types
+    /// come from `split`. Printed as the table G2 pins.
     fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<(usize, usize), GateError> {
         let ty = |name: String| {
             split
@@ -725,7 +726,21 @@ mod gate {
                 .compressor
                 .filter(|_| k.stream.is_some_and(|s| s.kv_source == l));
             let normed_q8_1 = q8_1(ty(names::attn_q_a(l))?) || q8_1(ty(names::attn_kv(l))?);
-            let attn = 14
+            // PIN(2026-09-24): `join_projections` folds each group of Q3_K projections of one
+            // activation into one launch (ds41dense): kv and the indexer's weights into q_a's,
+            // the indexer's query into q_b's, a gated compressor's gate into its kv.
+            let q3k = |name: String| ty(name).map(|t| t == GgmlType::Q3_K);
+            let proj_q3k = !k.indexer || q3k(names::indexer_proj(l))?;
+            let join_qkv = q3k(names::attn_q_a(l))? && q3k(names::attn_kv(l))? && proj_q3k;
+            let join_query =
+                k.indexer && q3k(names::attn_q_b(l))? && q3k(names::indexer_attn_q_b(l))?;
+            let join_kv_gate = own.is_some_and(|c| c.gated)
+                && q3k(names::attn_compressor_kv(l))?
+                && q3k(names::attn_compressor_gate(l))?;
+            let folded = usize::from(join_qkv) * (1 + usize::from(k.indexer))
+                + usize::from(join_query)
+                + usize::from(join_kv_gate);
+            let attn = 14 - folded
                 + own.map_or(0, |c| 1 + if c.gated { 2 } else { 1 })
                 + if k.index_keys { 3 } else { 0 }
                 + match (k.indexer, own) {

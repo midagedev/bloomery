@@ -61,7 +61,7 @@ pub use model::GpuModel;
 pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;
 /// The qwen3moe engine: the whole model on one card.
 pub type Qwen3moeModel = GpuModel<arch::qwen3moe::Body>;
-pub use tensor::{DeviceTensor, Q8Act, window};
+pub use tensor::{DeviceTensor, PartedBuffer, Q8Act, window};
 
 /// Host-side failure: context creation, module loading, device allocation,
 /// launch, capture, or copy-back.

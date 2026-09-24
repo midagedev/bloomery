@@ -72,7 +72,9 @@ use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::placement::{Device, Machine, Plan, Role};
 
-use crate::chain::attn::{AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo};
+use crate::chain::attn::{
+    AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
+};
 use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps, ShadowWork};
 use crate::chain::glue::{EngramKv, EngramStep, Glue, StepRows};
 use crate::hc::HC_STREAMS;
@@ -1492,15 +1494,17 @@ impl ChainBody for Body {
         Arch::Deepseek41
     }
 
-    /// V4.1 derives no weights at load: every tensor its chain reads is a
-    /// file tensor in its card format.
+    /// V4.1 derives no new values at load: it moves the attention's Q3_K
+    /// projections that read one activation into row joins
+    /// ([`join_projections`]), one launch per join.
     fn derive(
-        _stream: &CudaStream,
-        _file: &Split,
-        _layers: Range<usize>,
-        _w: &mut Weights,
+        stream: &CudaStream,
+        file: &Split,
+        layers: Range<usize>,
+        w: &mut Weights,
     ) -> Result<(), GpuError> {
-        Ok(())
+        let hp = Hparams::read(file).map_err(|e| GpuError::plan("deepseek41 Body::derive", e))?;
+        join_projections(stream, &hp, layers, w)
     }
 
     /// V4.1 loads by its placement plan ([`ChainBody::load_placed`]); a load

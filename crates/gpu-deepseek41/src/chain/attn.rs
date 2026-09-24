@@ -34,6 +34,16 @@
 //!    input's q8_1 form first when it is a K-quant);
 //! 9. HC_POST and the ffn's fold in one launch.
 //!
+//! Projections that read the same q8_1 activation run as one launch where
+//! [`join_projections`] joined their Q3_K rows at load: q_a, kv and the
+//! indexer's weights projection, launched before step 4 (steps 4, 5 and 6
+//! then launch none of theirs); q_b with the indexer's query projection in
+//! step 4; a gated compressor's kv and gate in step 3. The launch is the
+//! same `q3k_gemv` over the same rows — each output row the bits its own
+//! tensor's launch writes — into one buffer of which each projection's
+//! output is a part ([`PartedBuffer`]). Any other format keeps the separate
+//! launches.
+//!
 //! A layer attends the rows its stream's source layer writes
 //! (`stream.kv_source`) and the list its top-k source layer selected this
 //! step (`stream.topk_source`); the caller passes that layer's buffers
@@ -60,8 +70,8 @@ use std::ops::{Deref, Range};
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, window};
-use cuda_core::DeviceBuffer;
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, PartedBuffer, Q8Act, window};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
@@ -508,6 +518,13 @@ struct Names {
     sinks: String,
     out_a: String,
     out_b: String,
+    /// The derived row join of q_a, kv (and on an indexer layer the
+    /// indexer's weights projection) that [`join_projections`] files when
+    /// they are Q3_K.
+    qkv: String,
+    /// The derived row join of q_b and, on an indexer layer, the indexer's
+    /// query projection.
+    q: String,
 }
 
 /// The compressor a layer owns.
@@ -517,6 +534,8 @@ struct SourcePlan {
     kv: String,
     /// Its gate projection, above ratio 1.
     gate: Option<String>,
+    /// The derived row join of kv and the gate, above ratio 1.
+    kv_gate: String,
     norm: String,
     /// The index key's projection and norm, on a layer that owns index keys.
     keys: Option<(String, String)>,
@@ -556,12 +575,9 @@ struct Kernels {
     dense: DenseKernels,
 }
 
-/// The indexer's scratch, present when a layer of the card runs it.
+/// The indexer's scratch, present when a layer of the card runs it. Its
+/// projections' outputs are parts of the piece's ([`INDEX_W`], [`INDEX_Q`]).
 struct SelectScratch {
-    /// The query's projection, `HEADS · HEAD_DIM` per token, and the
-    /// weights', `HEADS` per token.
-    q: DeviceBuffer<f32>,
-    w: DeviceBuffer<f32>,
     /// The normed input in q8_1, on an indexer layer that owns no
     /// compressor (one that does has it in [`SourceScratch::act`]).
     act: Q8Act,
@@ -576,8 +592,9 @@ struct SelectScratch {
 struct SourceScratch {
     /// The normed input in q8_1, which the q3_K projections read.
     act: Q8Act,
-    kv: DeviceBuffer<f32>,
-    score: DeviceBuffer<f32>,
+    /// The kv projection ([`COMP_KV`]) and the gate's ([`COMP_SCORE`]), one
+    /// allocation: a joined launch writes both.
+    proj: PartedBuffer<f32, 2>,
     /// The pooled row, normed, before the rope: the index key's input.
     pre: DeviceBuffer<f32>,
     act_pre: Q8Act,
@@ -589,10 +606,15 @@ struct Scratch {
     mixes: DeviceBuffer<f32>,
     hc: DeviceBuffer<f32>,
     normed: DeviceBuffer<f32>,
-    q_a: DeviceBuffer<f32>,
+    /// q_a ([`Q_A`]), the latent projection ([`KV`]) and the indexer's
+    /// weights projection ([`INDEX_W`], empty on a card without an indexer
+    /// layer): the projections of the normed input, one allocation, which a
+    /// joined launch writes whole.
+    qkv: PartedBuffer<f32, 3>,
     q_a_normed: DeviceBuffer<f32>,
-    q: DeviceBuffer<f32>,
-    kv: DeviceBuffer<f32>,
+    /// The query heads ([`Q`]) and the indexer's query ([`INDEX_Q`], empty
+    /// on a card without an indexer layer): the projections of q_a's norm.
+    q: PartedBuffer<f32, 2>,
     /// The latent row in f32, which the append writes beside the ring.
     kv_row: DeviceBuffer<f32>,
     part_v: DeviceBuffer<f32>,
@@ -608,6 +630,17 @@ struct Scratch {
     source: Option<SourceScratch>,
     select: Option<SelectScratch>,
 }
+
+/// The parts of [`Scratch::qkv`], in row order of its join.
+const Q_A: usize = 0;
+const KV: usize = 1;
+const INDEX_W: usize = 2;
+/// The parts of [`Scratch::q`].
+const Q: usize = 0;
+const INDEX_Q: usize = 1;
+/// The parts of [`SourceScratch::proj`].
+const COMP_KV: usize = 0;
+const COMP_SCORE: usize = 1;
 
 /// [`Scratch::acts`].
 struct Acts {
@@ -793,8 +826,7 @@ impl AttnChain {
             }
             Some(SourceScratch {
                 act: Q8Act::with_k(stream, m, hp.n_embd)?,
-                kv: DeviceBuffer::zeroed(stream, m * compress::WIDTH)?,
-                score: DeviceBuffer::zeroed(stream, m * compress::WIDTH)?,
+                proj: PartedBuffer::zeroed(stream, [m * compress::WIDTH; 2])?,
                 pre: DeviceBuffer::zeroed(stream, gm * compress::WIDTH)?,
                 act_pre: Q8Act::with_k(stream, gm, compress::WIDTH)?,
                 key: DeviceBuffer::zeroed(stream, gm * index_key::WIDTH)?,
@@ -815,8 +847,6 @@ impl AttnChain {
                 }
             }
             Some(SelectScratch {
-                q: DeviceBuffer::zeroed(stream, m * indexer::HEADS * indexer::HEAD_DIM)?,
-                w: DeviceBuffer::zeroed(stream, m * indexer::HEADS)?,
                 act: Q8Act::with_k(stream, m, hp.n_embd)?,
                 streams,
                 last: None,
@@ -824,15 +854,30 @@ impl AttnChain {
         } else {
             None
         };
+        // The indexer's parts of the joined outputs: a token's on a card
+        // with an indexer layer, none otherwise.
+        let index_rows = if any_indexer { m } else { 0 };
         let scratch = Scratch {
             hc_pre: HcPreScratch::new(stream, HC_STREAMS * hp.n_embd)?,
             mixes: DeviceBuffer::zeroed(stream, HC_MIX * m)?,
             hc: DeviceBuffer::zeroed(stream, HC_MIX * m)?,
             normed: DeviceBuffer::zeroed(stream, m * hp.n_embd)?,
-            q_a: DeviceBuffer::zeroed(stream, m * hp.q_lora_rank)?,
+            qkv: PartedBuffer::zeroed(
+                stream,
+                [
+                    m * hp.q_lora_rank,
+                    m * hp.head_dim,
+                    index_rows * indexer::HEADS,
+                ],
+            )?,
             q_a_normed: DeviceBuffer::zeroed(stream, m * hp.q_lora_rank)?,
-            q: DeviceBuffer::zeroed(stream, q_rows * hp.head_dim)?,
-            kv: DeviceBuffer::zeroed(stream, m * hp.head_dim)?,
+            q: PartedBuffer::zeroed(
+                stream,
+                [
+                    q_rows * hp.head_dim,
+                    index_rows * indexer::HEADS * indexer::HEAD_DIM,
+                ],
+            )?,
             kv_row: DeviceBuffer::zeroed(stream, m * hp.head_dim)?,
             part_v: DeviceBuffer::zeroed(stream, attn_op::partials_v_len(q_rows, segs))?,
             part_ms: DeviceBuffer::zeroed(stream, attn_op::partials_ms_len(q_rows, segs))?,
@@ -926,10 +971,9 @@ impl AttnChain {
             &s.mixes,
             &s.hc,
             &s.normed,
-            &s.q_a,
+            s.qkv.whole(),
             &s.q_a_normed,
-            &s.q,
-            &s.kv,
+            s.q.whole(),
             &s.kv_row,
             &s.part_v,
             &s.part_ms,
@@ -947,7 +991,7 @@ impl AttnChain {
                 .map(DeviceBuffer::num_bytes)
                 .sum::<usize>();
         let source = s.source.as_ref().map_or(0, |x| {
-            [&x.kv, &x.score, &x.pre, &x.key]
+            [x.proj.whole(), &x.pre, &x.key]
                 .iter()
                 .map(|b| b.num_bytes())
                 .sum::<usize>()
@@ -955,9 +999,7 @@ impl AttnChain {
                 + q8act_bytes(x.act_pre.m(), compress::WIDTH)
         });
         let select = s.select.as_ref().map_or(0, |x| {
-            x.q.num_bytes()
-                + x.w.num_bytes()
-                + q8act_bytes(x.act.m(), d.n_embd)
+            q8act_bytes(x.act.m(), d.n_embd)
                 + x.streams
                     .iter()
                     .flatten()
@@ -1011,17 +1053,17 @@ impl AttnChain {
         AttnTaps {
             hc: &s.hc,
             normed: &s.normed,
-            q_a: &s.q_a,
+            q_a: s.qkv.part(Q_A),
             q_a_normed: &s.q_a_normed,
-            q: &s.q,
-            kv: &s.kv,
+            q: s.q.part(Q),
+            kv: s.qkv.part(KV),
             kv_row: &s.kv_row,
             y: &s.y,
             wo_a: &s.wo_a,
             out: &s.out,
             source: s.source.as_ref().map(|x| SourceTaps {
-                kv: &x.kv,
-                score: &x.score,
+                kv: x.proj.part(COMP_KV),
+                score: x.proj.part(COMP_SCORE),
                 pre: &x.pre,
                 key: &x.key,
             }),
@@ -1150,9 +1192,8 @@ impl AttnChain {
             Compressed::Source(_) => "a compressor's buffers",
         };
         let gain = vector(w, &n.norm)?;
-        let q_a = Dense::of(w, &n.q_a, d.n_embd, d.q_lora_rank)?;
-        let kv = Dense::of(w, &n.kv, d.n_embd, d.head_dim)?;
-        let quantized = q_a.reads_q8_1() || kv.reads_q8_1();
+        let qkv = Qkv::of(w, lp, d)?;
+        let quantized = qkv.reads_q8_1();
         let normed_act = match (&lp.source, &mut compressed, s.source.as_mut()) {
             (Some(sp), Compressed::Source(io), Some(src)) => {
                 k.fused.enqueue_norm_quant(
@@ -1225,15 +1266,30 @@ impl AttnChain {
             }
         };
 
+        let act = normed_act_of(&s.source, &s.acts, normed_act);
+        let q_a = match qkv {
+            Qkv::Joint(t) => {
+                let act = act.ok_or_else(|| GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("layer {layer}: a joined q_a·kv without the normed q8_1"),
+                })?;
+                gpu.enqueue_gemv_q3k(t, act, s.qkv.whole_mut())?;
+                None
+            }
+            Qkv::Parts { q_a, .. } => Some(q_a),
+        };
         enqueue_query(&cx, lp, s, q_a, normed_act)?;
         let pos = cx.words.view::<u32>(cx.words.layout.pos, m)?;
         let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
-        let act = normed_act_of(&s.source, &s.acts, normed_act);
-        k.dense.enqueue(gpu, kv, &s.normed, act, &mut s.kv)?;
+        if let Qkv::Parts { kv, .. } = qkv {
+            let act = normed_act_of(&s.source, &s.acts, normed_act);
+            k.dense
+                .enqueue(gpu, kv, &s.normed, act, s.qkv.part_mut(KV))?;
+        }
         k.rope.enqueue_kv_norm_rope_append(
             stream,
             KvAppendArgs {
-                kv: &s.kv,
+                kv: s.qkv.part(KV),
                 gain: vector(w, &n.kv_norm)?,
                 cs: &table,
                 pos: &pos,
@@ -1276,6 +1332,10 @@ impl AttnChain {
                     ip,
                     &mut *s,
                     normed_act,
+                    Joined {
+                        weights: matches!(qkv, Qkv::Joint(_)),
+                        query: joint_q3k(w, &n.q)?.is_some(),
+                    },
                     IndexerIo {
                         stream: st,
                         keys,
@@ -1305,7 +1365,7 @@ impl AttnChain {
         k.attn.enqueue(
             stream,
             AttnArgs {
-                q: &s.q,
+                q: s.q.part(Q),
                 window: ring,
                 compressed: rows,
                 // A stream's rows are read through the list: while the
@@ -1360,39 +1420,31 @@ fn normed_act_of<'a>(
     }
 }
 
-/// The query path: q_a, its norm, q_b and the tail rope of every head. q_a's
-/// norm leaves its q8_1 form too when q_b, or the layer's indexer query,
-/// reads one.
+/// The query path: q_a (unless the joined launch of the normed input's
+/// projections wrote it — `q_a` is `None` then), its norm, q_b (joined with
+/// the indexer's query projection when [`join_projections`] filed that) and
+/// the tail rope of every head. q_a's norm leaves its q8_1 form too when
+/// q_b, or the layer's indexer query, reads one.
 fn enqueue_query(
     cx: &Cx<'_>,
     lp: &LayerPlan,
     s: &mut Scratch,
-    q_a: Dense<'_>,
+    q_a: Option<Dense<'_>>,
     normed_act: NormedAct,
 ) -> Result<(), GpuError> {
     let (d, w, n, stream) = (cx.d, cx.w, &lp.names, cx.gpu.stream());
     let m = STEP_TOKENS;
-    let q_b = Dense::of(w, &n.q_b, d.q_lora_rank, d.n_head * d.head_dim)?;
-    let index_q = lp
-        .indexer
-        .as_ref()
-        .map(|ip| {
-            Dense::of(
-                w,
-                &ip.q_b,
-                d.q_lora_rank,
-                indexer::HEADS * indexer::HEAD_DIM,
-            )
-        })
-        .transpose()?;
-    let act = normed_act_of(&s.source, &s.acts, normed_act);
-    cx.k.dense
-        .enqueue(cx.gpu, q_a, &s.normed, act, &mut s.q_a)?;
+    let query = Query::of(w, lp, d)?;
+    if let Some(q_a) = q_a {
+        let act = normed_act_of(&s.source, &s.acts, normed_act);
+        cx.k.dense
+            .enqueue(cx.gpu, q_a, &s.normed, act, s.qkv.part_mut(Q_A))?;
+    }
     let gain = vector(w, &n.q_a_norm)?;
-    if q_b.reads_q8_1() || index_q.is_some_and(|q| q.reads_q8_1()) {
+    if query.reads_q8_1() {
         cx.k.fused.enqueue_norm_quant(
             stream,
-            &s.q_a,
+            s.qkv.part(Q_A),
             gain,
             d.eps,
             &mut s.acts.q_a,
@@ -1401,7 +1453,7 @@ fn enqueue_query(
     } else {
         cx.gpu.elem().enqueue_rms_norm(
             stream,
-            &s.q_a,
+            s.qkv.part(Q_A),
             gain,
             d.eps,
             d.q_lora_rank,
@@ -1409,12 +1461,17 @@ fn enqueue_query(
             &mut s.q_a_normed,
         )?;
     }
-    let act = q_b.reads_q8_1().then_some(&s.acts.q_a);
-    cx.k.dense
-        .enqueue(cx.gpu, q_b, &s.q_a_normed, act, &mut s.q)?;
+    match query {
+        Query::Joint(t) => cx.gpu.enqueue_gemv_q3k(t, &s.acts.q_a, s.q.whole_mut())?,
+        Query::Parts { q_b, .. } => {
+            let act = q_b.reads_q8_1().then_some(&s.acts.q_a);
+            cx.k.dense
+                .enqueue(cx.gpu, q_b, &s.q_a_normed, act, s.q.part_mut(Q))?;
+        }
+    }
     let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
     cx.k.rope
-        .enqueue_rope_tail(stream, &mut s.q, &table, heads(d))
+        .enqueue_rope_tail(stream, s.q.part_mut(Q), &table, heads(d))
 }
 
 /// Every query head of the step's token, its tail turned.
@@ -1482,10 +1539,20 @@ struct IndexerIo<'a> {
     top_k: usize,
 }
 
+/// Which of an indexer layer's projections a joined launch already wrote.
+#[derive(Clone, Copy)]
+struct Joined {
+    /// The weights' projection, with q_a and kv.
+    weights: bool,
+    /// The query's projection, with q_b.
+    query: bool,
+}
+
 /// The indexer of an indexer layer, after the query path and the norm: the
 /// query's projection of q_a's norm, the weights' projection of the normed
-/// input in q8_1 (the compressor's on its layer, quantized here elsewhere),
-/// then the score and top-k passes into the list. The visible count and
+/// input in q8_1 (the compressor's on its layer, quantized here elsewhere)
+/// — each unless `joined` says a joined launch wrote it — then the score and
+/// top-k passes into the list. The visible count and
 /// `top_k` are words of the piece's copy; the rope table is the layer's
 /// forward table (YaRN: the layer attends a stream).
 fn enqueue_indexer(
@@ -1494,6 +1561,7 @@ fn enqueue_indexer(
     ip: &IndexerPlan,
     s: &mut Scratch,
     normed_act: NormedAct,
+    joined: Joined,
     io: IndexerIo<'_>,
 ) -> Result<(), GpuError> {
     let (d, w, gpu, stream) = (cx.d, cx.w, cx.gpu, cx.gpu.stream());
@@ -1510,24 +1578,28 @@ fn enqueue_indexer(
         .select
         .as_mut()
         .ok_or_else(|| refuse("an indexer layer on a piece with no indexer scratch"))?;
-    let q_b = Dense::of(
-        w,
-        &ip.q_b,
-        d.q_lora_rank,
-        indexer::HEADS * indexer::HEAD_DIM,
-    )?;
-    let q_act = q_b.reads_q8_1().then_some(&s.acts.q_a);
-    cx.k.dense
-        .enqueue(gpu, q_b, &s.q_a_normed, q_act, &mut sel.q)?;
-    let act = match (lp.source.is_some(), s.source.as_ref(), normed_act) {
-        (true, Some(src), _) => &src.act,
-        (_, _, NormedAct::Own) => &s.acts.normed,
-        _ => {
-            gpu.enqueue_quantize_q8_1(&s.normed, &mut sel.act)?;
-            &sel.act
-        }
-    };
-    gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, &mut sel.w)?;
+    if !joined.query {
+        let q_b = Dense::of(
+            w,
+            &ip.q_b,
+            d.q_lora_rank,
+            indexer::HEADS * indexer::HEAD_DIM,
+        )?;
+        let q_act = q_b.reads_q8_1().then_some(&s.acts.q_a);
+        cx.k.dense
+            .enqueue(gpu, q_b, &s.q_a_normed, q_act, s.q.part_mut(INDEX_Q))?;
+    }
+    if !joined.weights {
+        let act = match (lp.source.is_some(), s.source.as_ref(), normed_act) {
+            (true, Some(src), _) => &src.act,
+            (_, _, NormedAct::Own) => &s.acts.normed,
+            _ => {
+                gpu.enqueue_quantize_q8_1(&s.normed, &mut sel.act)?;
+                &sel.act
+            }
+        };
+        gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, s.qkv.part_mut(INDEX_W))?;
+    }
     let words = cx.words.view::<u32>(0, cx.words.layout.len)?;
     let scratch = sel.streams[io.stream]
         .as_mut()
@@ -1535,8 +1607,8 @@ fn enqueue_indexer(
     kernels.enqueue(
         stream,
         IndexerArgs {
-            q: &sel.q,
-            w: &sel.w,
+            q: s.q.part(INDEX_Q),
+            w: s.qkv.part(INDEX_W),
             ints: &words,
             n_vis_at: cx.words.layout.streams[io.stream].vis + 1,
             top_k_at: cx.words.layout.top_k,
@@ -1555,8 +1627,9 @@ fn enqueue_indexer(
 }
 
 /// A compressor layer's own launches, after the norm left the q8_1 input:
-/// the projections, the pooled (or ratio-1) row into the cache, then the
-/// index key.
+/// the projections (kv and the gate in one launch when [`join_projections`]
+/// joined them), the pooled (or ratio-1) row into the cache, then the index
+/// key.
 fn enqueue_source(
     cx: &Cx<'_>,
     sp: &SourcePlan,
@@ -1570,17 +1643,35 @@ fn enqueue_source(
         .words
         .view::<f32>(sw.cs, sw.geom.max_groups * d.rope_dims)?;
     let gain = vector(w, &sp.norm)?;
-    gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, &src.act, &mut src.kv)?;
     match (&sp.gate, io.ring.as_mut()) {
         (Some(gate), Some((values, scores))) => {
-            gpu.enqueue_gemv_q3k(q3_k(w, gate)?, &src.act, &mut src.score)?;
+            match joint_q3k(w, &sp.kv_gate)? {
+                Some(t) if t.rows() == 2 * compress::WIDTH => {
+                    gpu.enqueue_gemv_q3k(t, &src.act, src.proj.whole_mut())?;
+                }
+                Some(t) => {
+                    return Err(GpuError::Shape {
+                        what: WHAT,
+                        detail: format!(
+                            "{} is {} rows; kv and the gate are {} each",
+                            sp.kv_gate,
+                            t.rows(),
+                            compress::WIDTH
+                        ),
+                    });
+                }
+                None => {
+                    gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, &src.act, src.proj.part_mut(COMP_KV))?;
+                    gpu.enqueue_gemv_q3k(q3_k(w, gate)?, &src.act, src.proj.part_mut(COMP_SCORE))?;
+                }
+            }
             cx.k.comp.enqueue_pool(
                 stream,
                 PoolArgs {
                     geom: sw.geom,
                     step: &step,
-                    kv: &src.kv,
-                    score: &src.score,
+                    kv: src.proj.part(COMP_KV),
+                    score: src.proj.part(COMP_SCORE),
                     gain,
                     cs: &cs,
                     eps: d.eps,
@@ -1593,12 +1684,13 @@ fn enqueue_source(
             )?;
         }
         (None, None) => {
+            gpu.enqueue_gemv_q3k(q3_k(w, &sp.kv)?, &src.act, src.proj.part_mut(COMP_KV))?;
             cx.k.comp.enqueue_rows(
                 stream,
                 RowsArgs {
                     geom: sw.geom,
                     step: &step,
-                    kv: &src.kv,
+                    kv: src.proj.part(COMP_KV),
                     gain,
                     cs: &cs,
                     eps: d.eps,
@@ -1702,6 +1794,7 @@ fn layer_plan(
                 stream: s,
                 kv: names::attn_compressor_kv(l),
                 gate: c.gated.then(|| names::attn_compressor_gate(l)),
+                kv_gate: joint_name(l, JOINT_KV_GATE),
                 norm: names::attn_compressor_norm(l),
                 keys: kind
                     .index_keys
@@ -1773,6 +1866,8 @@ fn layer_plan(
             sinks: names::attn_sinks(l),
             out_a: names::attn_output_a(l),
             out_b: names::attn_output_b(l),
+            qkv: joint_name(l, JOINT_QKV),
+            q: joint_name(l, JOINT_Q),
         },
         stream,
         source,
@@ -1780,6 +1875,194 @@ fn layer_plan(
         forward,
         back,
     })
+}
+
+/// The derived names [`join_projections`] files layer `l`'s row joins
+/// under: `derived.blk.<l>.<what>`.
+fn joint_name(l: usize, what: &str) -> String {
+    format!("derived.blk.{l}.{what}")
+}
+
+/// q_a, kv and, on an indexer layer, the indexer's weights projection.
+const JOINT_QKV: &str = "attn_q_a+kv+indexer.proj";
+/// q_b and, on an indexer layer, the indexer's query projection.
+const JOINT_Q: &str = "attn_q_b+indexer.attn_q_b";
+/// A gated compressor's kv and gate projections.
+const JOINT_KV_GATE: &str = "attn_compressor_kv+gate";
+
+/// For layers `layers` of the model `hp` describes, move each group of
+/// projections that read the same q8_1 activation into one row stream
+/// ([`Weights::join_rows`]), so the chain runs the group as one `q3k_gemv`
+/// launch — each row the same kernel on the same bits, only its index moved:
+///
+/// - q_a, kv and, on an indexer layer, the indexer's weights projection
+///   (the normed input);
+/// - on an indexer layer, q_b and the indexer's query projection (q_a's
+///   norm);
+/// - a gated compressor's kv and gate projections (its normed input).
+///
+/// A group is joined only when every member is resident as Q3_K; any other
+/// format keeps its separate launches. Load-time only.
+pub fn join_projections(
+    stream: &CudaStream,
+    hp: &Hparams,
+    layers: Range<usize>,
+    w: &mut Weights,
+) -> Result<(), GpuError> {
+    let is_q3k = |w: &Weights, name: &str| {
+        matches!(
+            w.get(name),
+            Some(DevWeight::KQuant {
+                ty: GgmlType::Q3_K,
+                ..
+            })
+        )
+    };
+    for l in layers {
+        let kind = hp.layers.get(l).ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!("layer {l} of a file of {} layers", hp.layers.len()),
+        })?;
+        let indexer = kind.indexer && kind.stream.is_some();
+        let owns_gated = kind.compressor.is_some_and(|c| c.gated)
+            && kind.stream.is_some_and(|st| st.kv_source == l);
+        let mut groups: Vec<(Vec<String>, &str)> = Vec::with_capacity(3);
+        let mut qkv = vec![names::attn_q_a(l), names::attn_kv(l)];
+        if indexer {
+            qkv.push(names::indexer_proj(l));
+            groups.push((
+                vec![names::attn_q_b(l), names::indexer_attn_q_b(l)],
+                JOINT_Q,
+            ));
+        }
+        groups.push((qkv, JOINT_QKV));
+        if owns_gated {
+            groups.push((
+                vec![names::attn_compressor_kv(l), names::attn_compressor_gate(l)],
+                JOINT_KV_GATE,
+            ));
+        }
+        for (parts, what) in groups {
+            if parts.iter().all(|p| is_q3k(w, p)) {
+                let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+                w.join_rows(stream, &parts, joint_name(l, what))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A layer's projections of the normed input as resident: one joined Q3_K
+/// row stream, or q_a and kv in their own formats.
+#[derive(Clone, Copy)]
+enum Qkv<'w> {
+    Joint(&'w DeviceTensor<u32>),
+    Parts { q_a: Dense<'w>, kv: Dense<'w> },
+}
+
+impl<'w> Qkv<'w> {
+    /// Layer `lp`'s: the join when resident — refused unless its rows are
+    /// q_a's, kv's and, on an indexer layer, the indexer weights' — else the
+    /// two projections.
+    fn of(w: &'w Weights, lp: &LayerPlan, d: &Dims) -> Result<Qkv<'w>, GpuError> {
+        let n = &lp.names;
+        let index = if lp.indexer.is_some() {
+            indexer::HEADS
+        } else {
+            0
+        };
+        match joint_q3k(w, &n.qkv)? {
+            Some(t) if t.rows() == d.q_lora_rank + d.head_dim + index => Ok(Qkv::Joint(t)),
+            Some(t) => Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "{} is {} rows; q_a, kv and the indexer's weights are {}, {} and {index}",
+                    n.qkv,
+                    t.rows(),
+                    d.q_lora_rank,
+                    d.head_dim
+                ),
+            }),
+            None => Ok(Qkv::Parts {
+                q_a: Dense::of(w, &n.q_a, d.n_embd, d.q_lora_rank)?,
+                kv: Dense::of(w, &n.kv, d.n_embd, d.head_dim)?,
+            }),
+        }
+    }
+
+    /// Whether the projections read the normed input in q8_1.
+    fn reads_q8_1(&self) -> bool {
+        match self {
+            Qkv::Joint(_) => true,
+            Qkv::Parts { q_a, kv } => q_a.reads_q8_1() || kv.reads_q8_1(),
+        }
+    }
+}
+
+/// A layer's projections of q_a's norm as resident: one joined Q3_K row
+/// stream, or q_b and, on an indexer layer, the indexer's query in their own
+/// formats.
+#[derive(Clone, Copy)]
+enum Query<'w> {
+    Joint(&'w DeviceTensor<u32>),
+    Parts {
+        q_b: Dense<'w>,
+        index_q: Option<Dense<'w>>,
+    },
+}
+
+impl<'w> Query<'w> {
+    /// Layer `lp`'s: the join when resident — refused unless its rows are
+    /// q_b's and the indexer query's — else the projections.
+    fn of(w: &'w Weights, lp: &LayerPlan, d: &Dims) -> Result<Query<'w>, GpuError> {
+        let n = &lp.names;
+        let q_rows = d.n_head * d.head_dim;
+        let index_rows = indexer::HEADS * indexer::HEAD_DIM;
+        match (joint_q3k(w, &n.q)?, &lp.indexer) {
+            (Some(t), Some(_)) if t.rows() == q_rows + index_rows => Ok(Query::Joint(t)),
+            (Some(t), _) => Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "{} is {} rows on a layer that runs the indexer: {}; q_b and the indexer's \
+                     query are {q_rows} and {index_rows}",
+                    n.q,
+                    t.rows(),
+                    lp.indexer.is_some()
+                ),
+            }),
+            (None, ip) => Ok(Query::Parts {
+                q_b: Dense::of(w, &n.q_b, d.q_lora_rank, q_rows)?,
+                index_q: ip
+                    .as_ref()
+                    .map(|ip| Dense::of(w, &ip.q_b, d.q_lora_rank, index_rows))
+                    .transpose()?,
+            }),
+        }
+    }
+
+    /// Whether q_a's norm leaves its q8_1 form for them.
+    fn reads_q8_1(&self) -> bool {
+        match self {
+            Query::Joint(_) => true,
+            Query::Parts { q_b, index_q } => {
+                q_b.reads_q8_1() || index_q.is_some_and(|q| q.reads_q8_1())
+            }
+        }
+    }
+}
+
+/// The derived row join `name` when [`join_projections`] filed it; refused
+/// when the name holds anything but a Q3_K row stream.
+fn joint_q3k<'w>(w: &'w Weights, name: &str) -> Result<Option<&'w DeviceTensor<u32>>, GpuError> {
+    match w.get(name) {
+        None => Ok(None),
+        Some(DevWeight::KQuant {
+            ty: GgmlType::Q3_K,
+            w,
+            ..
+        }) => Ok(Some(w)),
+        Some(_) => Err(missing(name, "a Q3_K row join")),
+    }
 }
 
 /// Q3_K weight `name`'s row stream.

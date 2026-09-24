@@ -39,15 +39,19 @@ const _: () = assert!(RMS_THREADS_U32 as usize == RMS_THREADS);
 /// Warps in that block, and so the width of the second-stage combine.
 pub const RMS_WARPS: usize = RMS_THREADS / 32;
 
-/// Threads the argmax gives one vector. Same reason as [`RMS_THREADS`] and
-/// the same shape: the head's row is 102,400 logits, so one warp over the
-/// whole vector is 3,200 dependent loads per lane with a single warp
-/// resident. The scan is strided by this width, the merge is a per-warp
-/// butterfly then a fixed ascending walk of the warp slots.
-pub const ARGMAX_THREADS: usize = 256;
+/// Threads the argmax gives one vector: a whole block's worth, since the
+/// scan is a latency chain — each thread's strided loads (the head's row is
+/// the vocabulary: V2-Lite's 102,400, V4.1's 129,280, Qwen3's 151,936
+/// logits) wait on one another, and more threads mean fewer loads each. The
+/// scan is strided by this width, the merge is a per-warp butterfly then a
+/// fixed ascending walk of the warp slots. `argmax` and `argmax_rows`
+/// declare the same width in their launch contracts.
+pub const ARGMAX_THREADS: usize = 1024;
 /// [`ARGMAX_THREADS`] as the `u32` block width a launch takes.
 const ARGMAX_THREADS_U32: u32 = ARGMAX_THREADS as u32;
 const _: () = assert!(ARGMAX_THREADS_U32 as usize == ARGMAX_THREADS);
+// The kernels' `launch_bounds` and `launch_contract` spell the width out.
+const _: () = assert!(ARGMAX_THREADS == 1024);
 /// Warps in that block, and so the width of the argmax's final combine.
 pub const ARGMAX_WARPS: usize = ARGMAX_THREADS / 32;
 
@@ -164,13 +168,52 @@ pub(crate) fn q4k_embed_value(w: &[u32], wk: usize, v: usize) -> f32 {
 /// ascending, each square added with one fused multiply-add (the device
 /// build contracts `acc + v·v`; a host transcription of this order uses
 /// `mul_add`). The norm's fixed per-thread order, shared by `rms_norm` and
-/// the fused `norm_quant`.
+/// the fused norms. While `RMS_BATCH` strides remain, they are read as one
+/// batch — every load issued before the batch is folded, one round trip for
+/// the lot — and the rest one stride at a time. Only the loads move; the
+/// fold is the same squares in the same order.
 ///
 /// Caller contract: `base + k <= x.len()`, `tid < RMS_THREADS`.
 #[inline(always)]
 pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
     let mut acc = 0.0f32;
     let mut it = tid;
+    while it + (RMS_BATCH - 1) * RMS_THREADS < k {
+        // Value `it + j·RMS_THREADS` of the batch.
+        macro_rules! load {
+            ($j:literal) => {
+                // SAFETY: it + j·RMS_THREADS <= it + (RMS_BATCH − 1)·RMS_THREADS
+                // < k (the loop condition), and base + k <= x.len() by the
+                // caller contract.
+                unsafe { *x.get_unchecked(base + it + $j * RMS_THREADS) }
+            };
+        }
+        let (v0, v1, v2, v3, v4) = (load!(0), load!(1), load!(2), load!(3), load!(4));
+        let (v5, v6, v7, v8, v9) = (load!(5), load!(6), load!(7), load!(8), load!(9));
+        let (v10, v11, v12, v13, v14) = (load!(10), load!(11), load!(12), load!(13), load!(14));
+        let (v15, v16, v17, v18, v19) = (load!(15), load!(16), load!(17), load!(18), load!(19));
+        acc += v0 * v0;
+        acc += v1 * v1;
+        acc += v2 * v2;
+        acc += v3 * v3;
+        acc += v4 * v4;
+        acc += v5 * v5;
+        acc += v6 * v6;
+        acc += v7 * v7;
+        acc += v8 * v8;
+        acc += v9 * v9;
+        acc += v10 * v10;
+        acc += v11 * v11;
+        acc += v12 * v12;
+        acc += v13 * v13;
+        acc += v14 * v14;
+        acc += v15 * v15;
+        acc += v16 * v16;
+        acc += v17 * v17;
+        acc += v18 * v18;
+        acc += v19 * v19;
+        it += RMS_BATCH * RMS_THREADS;
+    }
     while it < k {
         // SAFETY: it < k and base + k <= x.len() by the caller contract.
         let v = unsafe { *x.get_unchecked(base + it) };
@@ -179,6 +222,14 @@ pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
     }
     acc
 }
+
+/// Strides of a row [`rms_partial_sq`] reads as one batch: a V4.1 hidden
+/// row's whole share per thread (5120 values over 256 threads). The batch's
+/// values are named one by one (named scalars, not an array indexed in a
+/// loop, which is placed in a local depot).
+const RMS_BATCH: usize = 20;
+// `rms_partial_sq` names the batch's loads one by one.
+const _: () = assert!(RMS_BATCH == 20);
 
 /// The row's sum of squares from its [`RMS_WARPS`] warp sums, in the fixed
 /// tree `((w0+w1)+(w2+w3)) + ((w4+w5)+(w6+w7))`. This order is the gate: it
@@ -565,8 +616,8 @@ mod elem_kernels {
     /// u32); the step reads it back once. Inputs are finite — the gate's
     /// loader rejects anything else.
     #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (x.len() >= n, out.len() >= 1))]
+    #[launch_bounds(1024)]
+    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n, out.len() >= 1))]
     pub fn argmax(x: &[f32], n: u32, mut out: DisjointSlice<u32>) {
         static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
         static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
@@ -599,8 +650,8 @@ mod elem_kernels {
     /// answer is `argmax` on that row alone. The layout is the gemvs'
     /// `y[r·m + c]` output, so a head's m logit rows go straight in.
     #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (x.len() >= n * m, out.len() >= m))]
+    #[launch_bounds(1024)]
+    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n * m, out.len() >= m))]
     pub fn argmax_rows(x: &[f32], n: u32, m: u32, mut out: DisjointSlice<u32>) {
         static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
         static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;

@@ -753,6 +753,7 @@ fn run() -> Result<(), GateError> {
 #[cfg(feature = "gpu")]
 fn norm_geometry() -> Result<bool, GateError> {
     use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS};
+    use bloomery_gpu::fused::NORM_QUANT_THREADS;
 
     /// Loads deep a norm's row may be per thread.
     const NORM_MAX_TRIPS: usize = 8;
@@ -760,15 +761,22 @@ fn norm_geometry() -> Result<bool, GateError> {
     const NORM_K: [usize; 2] = [2048, 512];
 
     let shaped = RMS_THREADS % 32 == 0 && RMS_THREADS <= 1024 && RMS_WARPS == RMS_THREADS / 32;
-    // Both norms share the sum of squares, so both must share its block.
+    // Both norms share the sum of squares on RMS_THREADS threads; norm_quant's
+    // block is wider, its quantizer dealt over every warp.
+    // PIN(2026-09-24): norm_quant's block is NORM_QUANT_THREADS, its sum on the first RMS_THREADS (ds41dense).
     let mut ok = ptx_shapes(&["rms_norm", "norm_quant"], |c, _| {
         let ntid = c
             .reqntid
             .ok_or_else(|| format!("gate_p4: PTX entry {} declares no .reqntid", c.name))?;
+        let want = if c.name == "norm_quant" {
+            NORM_QUANT_THREADS
+        } else {
+            RMS_THREADS
+        };
         Ok((
-            ntid == RMS_THREADS,
+            ntid == want && (RMS_THREADS..=1024).contains(&want),
             format!(
-                "shape op={} geometry block_reqntid={ntid} RMS_THREADS={RMS_THREADS}",
+                "shape op={} geometry block_reqntid={ntid} want={want} RMS_THREADS={RMS_THREADS}",
                 c.name
             ),
         ))

@@ -93,7 +93,7 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Gpu};
     use bloomery_gpu_deepseek41::body::STEP_TOKENS;
     use bloomery_gpu_deepseek41::chain::attn::{
-        AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, WordsLayout,
+        AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, WordsLayout, join_projections,
     };
     use bloomery_gpu_deepseek41::compress::StepInts;
     use bloomery_gpu_deepseek41::hc::HC_MIX;
@@ -208,6 +208,38 @@ mod gate {
         source: Option<(bool, bool)>,
         indexer: bool,
         quant: Quant,
+        joins: Joins,
+    }
+
+    /// Which of a layer's projection groups `join_projections` joins into
+    /// one launch: every member Q3_K in the file.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Joins {
+        /// q_a, kv and, on an indexer layer, the indexer's weights projection.
+        qkv: bool,
+        /// On an indexer layer, q_b and the indexer's query projection.
+        query: bool,
+        /// A gated compressor's kv and gate.
+        kv_gate: bool,
+    }
+
+    impl Joins {
+        fn of(split: &Split, l: usize, indexer: bool, gated: bool) -> Result<Joins, GateError> {
+            let q3k = |name: String| -> Result<bool, GateError> {
+                let (_, t) = split
+                    .find(&name)
+                    .ok_or_else(|| format!("{name} is not in the model file"))?;
+                Ok(t.ty == GgmlType::Q3_K)
+            };
+            let proj = !indexer || q3k(names::indexer_proj(l))?;
+            Ok(Joins {
+                qkv: q3k(names::attn_q_a(l))? && q3k(names::attn_kv(l))? && proj,
+                query: indexer && q3k(names::attn_q_b(l))? && q3k(names::indexer_attn_q_b(l))?,
+                kv_gate: gated
+                    && q3k(names::attn_compressor_kv(l))?
+                    && q3k(names::attn_compressor_gate(l))?,
+            })
+        }
     }
 
     /// Where a layer's projections read q8_1 (a K-quant weight,
@@ -241,11 +273,13 @@ mod gate {
     impl Kind {
         fn of(hp: &Hparams, planner: &Planner, split: &Split, l: usize) -> Result<Kind, GateError> {
             let kind = &hp.layers[l];
+            let gated = kind.compressor.is_some_and(|c| c.gated);
             Ok(Kind {
                 stream: planner.layer_stream(l),
                 source: kind.compressor.map(|c| (c.gated, kind.index_keys)),
                 indexer: kind.indexer,
                 quant: Quant::of(split, l)?,
+                joins: Joins::of(split, l, kind.indexer, gated)?,
             })
         }
 
@@ -266,9 +300,17 @@ mod gate {
         /// projections, the row launch and the index key's three, and on an
         /// indexer layer its two projections, the score and top-k passes and,
         /// without a compressor and without the norm's q8_1 form, the q8_1 of
-        /// the normed input.
+        /// the normed input — less one launch per member a join
+        /// folds into another: kv (and the indexer's weights projection) into
+        /// q_a's, the indexer's query into q_b's, the gate into the
+        /// compressor's kv.
+        // PIN(2026-09-24): the joins of `join_projections` (ds41dense) fold launches into others.
         fn launches(&self) -> usize {
-            14 + usize::from(self.quant.heads)
+            let folded = usize::from(self.joins.qkv) * (1 + usize::from(self.indexer))
+                + usize::from(self.joins.query)
+                + usize::from(self.joins.kv_gate);
+            14 - folded
+                + usize::from(self.quant.heads)
                 + usize::from(self.quant.wo_a)
                 + self.source.map_or(0, |(gated, keys)| {
                     1 + usize::from(gated) + 1 + 3 * usize::from(keys)
@@ -2049,7 +2091,8 @@ mod gate {
         let stream = gpu.stream();
         let kind = Kind::of(hp, cx.planner, cx.split, l)?;
         let keep = resident_names(l, &kind);
-        let w = Weights::load_where(stream, cx.split, |n| keep.contains(n))?;
+        let mut w = Weights::load_where(stream, cx.split, |n| keep.contains(n))?;
+        join_projections(stream, hp, l..l + 1, &mut w)?;
         let hw = HostWeights::load(cx.split, hp, l, &kind)?;
         let mut eager = Vec::with_capacity(sets.len());
         let mut cases = Vec::with_capacity(sets.len());
