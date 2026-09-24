@@ -605,9 +605,10 @@ gate-qdot:
 
 # B3 engram 게이트: V4.1의 NVMe 테이블에서 매핑으로 읽은 행이 같은 오프셋의 pread와
 # 바이트 동일이고(선행 읽기를 걸어도 같고), 행 간격이 텐서를 정확히 타일링하는가.
-# 정확성 실행이라 임대는 필요 없다 — 속도는 engram-rate가 임대 안에서 잰다.
+# 정확성 실행이라 임대는 필요 없다 — 속도는 engram-rate가 임대 안에서 잰다. --lib은 prefetch의 helper 배치
+# 단위 테스트(한 cpu 마스크를 물려받은 float helper가 마스크를 넓히는가)를 같은 게이트에 넣는다.
 gate-engram:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram --test engram -- --ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram --lib --test engram -- --include-ignored --nocapture'
 
 # 토크나이저 게이트: 우리 id가 engram 코퍼스 텍스트 전부와 케이스 파일에서 두 parse 모드 모두
 # llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가 — V4.1 어휘(deepseek-v3)와 qwen3moe 어휘(qwen2) 둘 다.

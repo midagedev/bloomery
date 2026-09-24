@@ -238,3 +238,28 @@ git 상태와 박스는 건드리지 않았습니다.
 - 리드 문서 10건: `387501b`(행 2·9·52·58·59·66·74·112·151). 행 159(`one_tensor_file` 경로)는 plan.md에 그 문자열이 없어 확인 불가 — DROP.
 - 2026-09-24 07:15 **fixcd 머지 `48c672e`**: 행 42·167·169·175(C), 20·33·166(D) 닫힘. 리드 재실행 check·lint 168·fmt·recipes·gate-gpu-ds41-hc·ds41-step·chain-attn 전부 rc=0, ptx-scan 표 md5 동일. 스펙과 다른 결과 둘: 175는 "차이 없음"이 아니라 `model.py`가 `silu(min(g,L))`, 우리(ik)는 `min(silu(g),L)` — 한 줄 문서; 33은 hc 게이트가 마지막 층(39)의 헤드 fold를 단독 fold로 세게 됨(`ds41_hc_post` 78→77, `fold` 2→3, total 160 불변 — 엔진 런치와 일치, 게이트 분류 정정). fixcd가 새로 본 것(트래커 XS 넷): `experts.rs:252` `sel` 문서("expert ids"→슬롯 자리), `params.rs:81` `Table::index`와 `chain/attn.rs::table_index` 중복(한 주인으로), plan ㊷의 clamp 차이 ~5e-5는 상대값(절대 상한 L=10에서 ~4.5e-4[유도]), `model.py:845`는 `swiglu_limit > 0`일 때만 clamp(우리는 L ≤ 1e-6 건너뜀).
 - 2026-09-24 07:40 **fixbh 머지 `386ea8c`**: 행 15·19·22·157(B), 32·155·156(H-engpre), 73·125·126·134(H-just), 177, 69 닫힘(13). 리드 재실행 check·lint 168·fmt·recipes·chain-glue·engram·dspark-read·p6·mcol·bench-cpu-v41-host-check 전부 rc=0, ptx-scan 표 md5 동일. **자 변경**: `bench_v41_host`의 블록 할당이 토큰 타이머 밖으로 나가 `BW_host` 표는 전후를 같은 행에 두지 않는다(머지 뒤 재핀 자리 필요); `distinct_tokens`는 step 0 제외(N−1). fixbh가 새로 본 것(트래커 XS 5·S 1): `prefetch.rs:203` spawn `?`의 문맥 없는 Io; `build-qdot-ref.sh:41` DSpark 경로 리터럴 중복(deepseek2 프로필 아래라 못 읽음); `bench_v41_host` `token()`/`engine_rows_layer`의 층별 Vec 할당 5종(S); `engine_layer` 한 줄 래퍼; `glue.rs:490` 오류 라벨 이름 틀림; `box.sh:66` `BLOOMERY_BOX_ENV` 공백 값 불가(헤더에 명시). 남은 H: 45·89(hybrid.rs — load2 뒤), 44·121(load2 소유 파일), 46·91·122(generate_ds41.rs·model.rs — load2 뒤).
+
+## 2026-09-25 추가 — fixup3(`9e72c80`)가 닫은 DO-NOW 16건
+
+표의 DO-NOW(A·B·C·D·E) 가운데 리드가 09-25 새벽 스펙 `spec-fixup3.md`로 묶어 보낸 16건이다. 15건 닫힘, 1건 절반.
+
+| # | 자리 | 처분 |
+|---|---|---|
+| 1 | `crates/model/tests/ds41_host.rs` 라우팅 id `as u32` | 닫음 — `u32::try_from` + 이름 붙은 panic |
+| 2 | `gpu/src/model/launcher.rs` `ARM_SPIN`·sibling 테스트 | 닫음 — `ARM_YIELD`, 테스트는 마스크 안 SMT 짝 cpu를 고르고 없으면 SKIP |
+| 3 | `tools/ref/depth-ds41.sh:149` `head=?` | 닫음 — 러너가 선 트리는 `head=<BLOOMERY_GIT_COMMIT>(box.sh) dirty_files=?`; 남의 트리는 `head=? dirty_files=?`(빌린 커밋을 찍지 않는다) |
+| 4 | `depth-ds41.sh` CPU 경합 | 닫음 — `lease.sh` `guard_cpu`(단일 소유자), 행 끝 ` [cpu-busy]`, `BLOOMERY_OTHER_STRICT=1` rc 75; 문턱 50 %는 고른 값 |
+| 5 | `MERGE_BATCH` 세 벌 | 닫음 — `gpu::flash::MERGE_BATCH` 하나, ptx-scan 116행 동일 |
+| 6 | `qdot/tests/qdot.rs:1-5` 머리말 | 닫음 |
+| 7 | `tools/ref/*_rate.cpp` 채움 바이트 | 닫음 — 일곱 하네스가 `qdot-rate`와 같은 바이트 |
+| 8 | `oracle/deepseek41.rs` 세트 이름 `_plain` | 닫음 — 실제로 연 세트 이름을 찍는다 |
+| 9 | `glue.rs:1095`·`prefetch.rs:466` float helper의 한 cpu 마스크 | 닫음 — `prefetch.rs` `place_helper`가 마스크를 넓히거나 이름 붙여 거부(FAIL-first rc 101 → 0); `glue.rs`는 고칠 것이 없었다 |
+| 10 | serve·chat load 줄 `host_shadow=` | 닫음 |
+| 11 | `generate_ds41.rs` 이중 open | 절반 — `Split::open`은 한 번; `PlanInputs::read` 둘째는 `body.rs:105`(ds41hcbranch 소유) → gpuq1 |
+| 12 | `GREEDY_MARGIN` 중복 | 닫음 — gpu-gates lib 상수 하나 |
+| 13 | `dump.sh` `.staging` 잔류 | 닫음 — 트랩이 트레일러 없는 `.staging`을 지우고 알린다 |
+| 14 | `engram-corpus.sh`·`ik-greedy.sh` `~/` 가드 | 닫음 — `[71520]` 탐침, rc 65; 리드가 기본 tokenizer를 oracle.sh처럼 `ik-tilde`로 |
+| 15 | `gguf-inventory.rs` 열 이름 | 닫음 — "roofline.md hand count, V4.1 mixed file" |
+| 16 | `qdot/src/lib.rs` q8_K `v_wrap_i8` 탐침 | 닫음(초록) — `hw_q8k_codes_at_subnormal_scales`: f32 iscale이 \|y\| < 127.5를 지키므로 wrap 도달 불가, 테스트가 증명 |
+
+라운드가 새로 보고한 지점 여덟은 `plan-triage.md` 「도구」·「받을 라운드별」에 올렸다.
