@@ -28,7 +28,7 @@ if [ ${#ARGS[@]} -eq 0 ]; then
 fi
 BIN=target/release/$NAME
 assert_fresh_binary "$BIN" || exit $?
-WITNESS=(head indent card model)
+WITNESS=(head indent card busiest model)
 lease_take
 witness pre
 # `|| rc=$?`, not a bare `rc=$?`: under `set -e` a non-zero gate exits the script on the
