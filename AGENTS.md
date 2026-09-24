@@ -86,6 +86,8 @@ The plan lives in `docs/plan.md`. This file is the working contract.
     just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
                       # ops attn ffn moe head forward kv derived mt profile
                       # alloc threads qdot engram prompts placement 1-1
+    just gate-ptx-spill  # compile-time ratchet: every PTX entry's spill/jit_local bytes
+                      # against tools/ref/ptx-shapes.tsv (a new kernel must be pinned)
     just box-gc       # kill orphan processes under this track's remote dir
     just box-tracks   # remote track dirs vs local worktrees; --remove deletes stale ones
 
@@ -234,7 +236,12 @@ first suspect is a hung gate on the box, not the agent.
   row. When a fix offers "both paths give the same defined output" against "a
   named error", take the error, even when it costs an API change. A device
   kernel that cannot panic writes a flag the host checks at the next sync and
-  turns into the same named error.
+  turns into the same named error. That flag is the fault word
+  (`crates/gpu/src/fault.rs`): one `u32` per `Gpu`, `(layer << 8) | site` by atomic
+  min, copied next to the token by the head's argmax so the step's readback carries
+  it for free; `Head::tokens` returns `GpuError::Fault`, and the model stays
+  `Poisoned` until `reset`. A kernel that meets undefined input raises it and keeps
+  its memory accesses defined; it never writes a plausible value.
 - Correctness is defined against ggml, not against intuition: kernels must match
   its output within the relative-error band recorded in each crate's RESULTS file.
 - **GPU-stage toolchain defects and gaps (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go
