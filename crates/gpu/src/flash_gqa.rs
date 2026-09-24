@@ -89,6 +89,9 @@ const _: () = assert!(KEY_TILE == 4 * MMA_NTILE && HEAD.is_multiple_of(2 * MMA_K
 
 /// Merge threads per head: one per dim.
 const MERGE_THREADS: u32 = HEAD as u32;
+/// Segments whose partials the merge loads as one batch before it folds
+/// them.
+const MERGE_BATCH: usize = 16;
 
 /// Whether [`FlashGqaKernels::enqueue`] runs the tensor-core segment pass
 /// ([`flash_gqa_kernels::gqa_flash_seg_mma`]) rather than the f32 scalar one
@@ -492,18 +495,30 @@ mod flash_gqa_kernels {
         };
 
         // The query tile: warp `w` rounds row t's head `w`'s 64 value pairs,
-        // two per lane, and writes the zero rows `8 + w`.
+        // two per lane, and writes the zero rows `8 + w`. Each pair is one
+        // 8-byte load, and the loads come before the roundings.
         let qb = (t * n_head + kh * GROUP + w) * HEAD;
+        let q64 = q.as_ptr() as *const u64;
+        let mut raw = [0u64; 2];
         let mut i = 0usize;
+        #[unroll]
+        while i < 2 {
+            // SAFETY: qb is a multiple of HEAD, so word (qb + 2·wd)/2 holds
+            // values qb + 2·wd and + 1, with qb + 2·wd + 1 < (t·n_head +
+            // kh·GROUP + w + 1)·HEAD <= m·n_kv·1024 <= q.len(); the buffer
+            // starts 8-byte aligned (a device allocation).
+            unsafe { raw[i] = *q64.add(qb / 2 + lane + 32 * i) };
+            i += 1;
+        }
+        let mut i = 0usize;
+        #[unroll]
         while i < 2 {
             let wd = lane + 32 * i;
-            // SAFETY: qb + 2·wd + 1 < (t·n_head + kh·GROUP + w + 1)·HEAD <=
-            // m·n_kv·1024 <= q.len(); the tile words w·MMA_ROW_W + wd and
-            // (8 + w)·MMA_ROW_W + wd are inside QT (wd < 64 < MMA_ROW_W,
-            // 8 + w < MMA_ROWS).
+            let lo16 = f32_to_f16_bits(f32::from_bits(raw[i] as u32)) as u32;
+            let hi16 = f32_to_f16_bits(f32::from_bits((raw[i] >> 32) as u32)) as u32;
+            // SAFETY: the tile words w·MMA_ROW_W + wd and (8 + w)·MMA_ROW_W +
+            // wd are inside QT (wd < 64 < MMA_ROW_W, 8 + w < MMA_ROWS).
             unsafe {
-                let lo16 = f32_to_f16_bits(*q.get_unchecked(qb + 2 * wd)) as u32;
-                let hi16 = f32_to_f16_bits(*q.get_unchecked(qb + 2 * wd + 1)) as u32;
                 *qt.add(w * MMA_ROW_W + wd) = lo16 | (hi16 << 16);
                 *qt.add((GROUP + w) * MMA_ROW_W + wd) = 0;
             }
@@ -633,10 +648,12 @@ mod flash_gqa_kernels {
     /// partials of the segments that hold its keys — the first
     /// `ceil(n_keys / seg_keys)` of `segs`, with `n_keys = n_keys_buf[t]`
     /// clamped to `ctx` as the segment pass clamps it — in ascending order
-    /// through `online_fold`, skipping a neutral one before its values are
-    /// read, and writes `y[(t·n_head + h)·HEAD + d] = r · (1/s)`, thread `d`
-    /// owning dim `d`. A segment past the row's last live one holds the
-    /// neutral partial and is never read.
+    /// through `online_fold`, skipping one whose `Σ exp` is zero, and writes
+    /// `y[(t·n_head + h)·HEAD + d] = r · (1/s)`, thread `d` owning dim `d`.
+    /// The partials are loaded [`MERGE_BATCH`] segments at a time ahead of
+    /// their folds; the folds and their order are the one-at-a-time walk's.
+    /// A segment past the row's last live one holds the neutral partial and
+    /// is never read.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -681,20 +698,35 @@ mod flash_gqa_kernels {
         let mut acc = 0.0f32;
         let mut j = 0usize;
         while j < live {
-            let idx = b * n_seg + j;
-            // SAFETY: idx < m·n_head·segs: both slots inside part_ms.
-            let (mj, sj) = unsafe {
-                (
-                    *part_ms.get_unchecked(2 * idx),
-                    *part_ms.get_unchecked(2 * idx + 1),
-                )
-            };
-            if sj != 0.0 {
-                // SAFETY: idx·HEAD + d < m·n_head·segs·HEAD <= part_v.len().
-                let vj = unsafe { *part_v.get_unchecked(idx * HEAD + d) };
-                (mx, s, acc) = online_fold(mx, s, acc, mj, sj, vj);
+            // The batch's loads are issued ahead of its folds, so the walk
+            // does not wait on memory twice per segment.
+            let mut ms = [0.0f32; 2 * MERGE_BATCH];
+            let mut vs = [0.0f32; MERGE_BATCH];
+            let mut i = 0usize;
+            #[unroll]
+            while i < MERGE_BATCH {
+                if j + i < live {
+                    let idx = b * n_seg + j + i;
+                    // SAFETY: idx < m·n_head·segs: both slots inside part_ms,
+                    // and idx·HEAD + d < m·n_head·segs·HEAD <= part_v.len().
+                    // A live segment wrote all three.
+                    unsafe {
+                        ms[2 * i] = *part_ms.get_unchecked(2 * idx);
+                        ms[2 * i + 1] = *part_ms.get_unchecked(2 * idx + 1);
+                        vs[i] = *part_v.get_unchecked(idx * HEAD + d);
+                    }
+                }
+                i += 1;
             }
-            j += 1;
+            let mut i = 0usize;
+            #[unroll]
+            while i < MERGE_BATCH {
+                if j + i < live && ms[2 * i + 1] != 0.0 {
+                    (mx, s, acc) = online_fold(mx, s, acc, ms[2 * i], ms[2 * i + 1], vs[i]);
+                }
+                i += 1;
+            }
+            j += MERGE_BATCH;
         }
         // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
         unsafe { *y.get_unchecked_mut(b * HEAD + d) = acc * (1.0 / s) };
