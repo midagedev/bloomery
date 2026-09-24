@@ -216,6 +216,8 @@ first suspect is a hung gate on the box, not the agent.
     tools/gate.sh          the gate runner: 900 s bound, cargo's own exit code
     tools/gpu-gate.sh      the GPU gate runner: gate lock, 900 s bound, the binary's exit code
     docs/plan.md           stages, gates, and the machine facts they rest on
+    docs/plan-triage.md    open items, grouped by the round that takes them
+    docs/plan-ledger.md    what is closed, moved verbatim out of plan.md
     docs/research/         sourced surveys behind the conventions here
 
 ## Conventions
