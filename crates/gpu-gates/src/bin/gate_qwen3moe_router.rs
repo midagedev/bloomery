@@ -1,0 +1,266 @@
+//! GPU gate for the qwen3moe router (`arch::qwen3moe::router`): softmax
+//! over 128 experts, the top 8, and the weights renormalized
+//! (`norm_topk_prob`), one token per launch.
+//!
+//! Against the host rule (`route_ref_within` at 128/8 — the serial max fold,
+//! f32 `exp`, the f64 ascending sum, the f32 divide, ties to the smaller id
+//! — then the chosen probabilities summed in f64 in slot order and each
+//! divided by the f32 sum): ids EXACT, probabilities and weights within
+//! [`BAND`] (the device `exp` and the host's differ in their last ulps;
+//! everything else is mirrored op for op), and a rerun bit-identical.
+//! Against ik, on every token of every layer of every set (`ffn_moe_logits-L`
+//! in): the ids EQUAL `ffn_moe_topk-L` (its logical twin, every token's
+//! eight in rank order); the weights' distance to `ffn_moe_weights_norm-L`
+//! is printed, not asserted.
+//!
+//! Constructed ties pin the tie rule where the dump cannot: all 128 logits
+//! equal; an eighth place shared by three experts, two of them in one lane
+//! of the selecting warp; a first place shared across lanes. And the
+//! router as a captured graph: one node, the replay bit-identical to the
+//! eager launch.
+
+#[cfg(not(feature = "gpu"))]
+fn main() {
+    eprintln!(
+        "gate_qwen3moe_router: built without the `gpu` feature; see `just gate-gpu-qwen3moe-router`."
+    );
+    std::process::exit(2);
+}
+
+#[cfg(feature = "gpu")]
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_qwen3moe_router", gate::run())
+}
+
+#[cfg(feature = "gpu")]
+mod gate {
+    use bloomery_gpu::Gpu;
+    use bloomery_gpu::arch::qwen3moe::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
+    use bloomery_gpu_gates::qwen3moe::sets;
+    use bloomery_gpu_gates::{
+        GateError, bits_equal, checks_failed, open_split, ref_tensor_logical_in, route_ref_within,
+        topk_ids_logical_within, verdict,
+    };
+    use cuda_core::{CudaStream, DeviceBuffer};
+    use model::arch::Arch;
+    use model::arch::qwen3moe::hparams::{Hparams, Score};
+
+    /// Probabilities and weights against the host rule, absolute: both are
+    /// in [0, 1] and the only divergence is `exp`'s last ulps.
+    const BAND: f32 = 1e-6;
+
+    /// One launch's results.
+    struct Routed {
+        probs: Vec<f32>,
+        ids: Vec<u32>,
+        weights: Vec<f32>,
+    }
+
+    fn route(
+        k: &RouterKernels,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        out: &mut RouterOut,
+    ) -> Result<Routed, GateError> {
+        k.enqueue(stream, x, out)?;
+        stream.synchronize()?;
+        Ok(Routed {
+            probs: out.probs.to_host_vec(stream)?,
+            ids: out.ids.to_host_vec(stream)?,
+            weights: out.weights.to_host_vec(stream)?,
+        })
+    }
+
+    /// The host rule for one token: probabilities, ids and renormalized
+    /// weights.
+    fn host(logits: &[f32]) -> Result<Routed, GateError> {
+        let (probs, ids, w) = route_ref_within(logits, 1, N_EXPERT, N_USED, 1.0)?;
+        let sum = w.iter().fold(0.0f64, |a, &v| a + f64::from(v)) as f32;
+        Ok(Routed {
+            probs,
+            ids: ids.into_iter().map(|i| i as u32).collect(),
+            weights: w.iter().map(|&v| v / sum).collect(),
+        })
+    }
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    pub fn run() -> Result<(), GateError> {
+        let split = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-router")?;
+        let hp = Hparams::read(&split)?;
+        let e = hp.experts;
+        if e.n_expert != N_EXPERT
+            || e.n_used != N_USED
+            || e.score != Score::Softmax
+            || !e.weights_norm
+        {
+            return Err(format!(
+                "the file routes {:?}; the kernel is softmax, {N_USED} of {N_EXPERT}, renormalized",
+                e
+            )
+            .into());
+        }
+        let gpu = Gpu::new()?;
+        let k = RouterKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let mut out = RouterOut::new(stream)?;
+        println!("gate_qwen3moe_router: device {}", gpu.device_name()?);
+        let mut ok = true;
+
+        // ---- every token of every layer of every set.
+        let (mut tokens, mut ik_mismatch, mut worst_w, mut worst_p, mut worst_ik) =
+            (0usize, 0usize, 0.0f32, 0.0f32, 0.0f32);
+        for (label, man) in sets()? {
+            let mut set_ok = true;
+            for layer in 0..hp.n_layer {
+                let lrow = man.tensor(&format!("ffn_moe_logits-{layer}"), 0)?;
+                let trow = man.tensor(&format!("ffn_moe_topk-{layer}"), 0)?;
+                let wrow = man.tensor(&format!("ffn_moe_weights_norm-{layer}"), 0)?;
+                let logits = ref_tensor_logical_in(&man.dir, lrow)?;
+                let ik_ids = topk_ids_logical_within(&man, trow, N_EXPERT as u32)?;
+                let ik_w = ref_tensor_logical_in(&man.dir, wrow)?;
+                let m = lrow.ne[1] as usize;
+                if lrow.ne[0] as usize != N_EXPERT
+                    || ik_ids.len() != N_USED * m
+                    || ik_w.len() != N_USED * m
+                {
+                    return Err(format!(
+                        "{label} layer {layer}: logits {:?}, {} ids, {} weights",
+                        lrow.ne,
+                        ik_ids.len(),
+                        ik_w.len()
+                    )
+                    .into());
+                }
+                for t in 0..m {
+                    let lt = &logits[t * N_EXPERT..(t + 1) * N_EXPERT];
+                    let x = DeviceBuffer::from_host(stream, lt)?;
+                    let a = route(&k, stream, &x, &mut out)?;
+                    let b = route(&k, stream, &x, &mut out)?;
+                    let h = host(lt)?;
+                    let rerun = bits_equal(&a.probs, &b.probs)
+                        && a.ids == b.ids
+                        && bits_equal(&a.weights, &b.weights);
+                    let ids_exact = a.ids == h.ids;
+                    let (pe, we) = (max_abs(&a.probs, &h.probs), max_abs(&a.weights, &h.weights));
+                    let want: Vec<u32> = ik_ids[t * N_USED..(t + 1) * N_USED]
+                        .iter()
+                        .map(|&i| i as u32)
+                        .collect();
+                    let ik_same = a.ids == want;
+                    let ik_rel = a
+                        .weights
+                        .iter()
+                        .zip(&ik_w[t * N_USED..(t + 1) * N_USED])
+                        .fold(0.0f32, |m, (x, y)| {
+                            m.max((x - y).abs() / y.abs().max(f32::MIN_POSITIVE))
+                        });
+                    let pass = rerun && ids_exact && pe <= BAND && we <= BAND && ik_same;
+                    tokens += 1;
+                    ik_mismatch += usize::from(!ik_same);
+                    worst_p = worst_p.max(pe);
+                    worst_w = worst_w.max(we);
+                    worst_ik = worst_ik.max(ik_rel);
+                    if !pass {
+                        set_ok = false;
+                        println!(
+                            "router set={label} layer={layer} t={t} ids={:?} host={:?} ik={want:?} \
+                             probs_err={pe:.3e} weights_err={we:.3e} rerun={rerun} FAIL",
+                            a.ids, h.ids
+                        );
+                    }
+                }
+            }
+            println!(
+                "router set={label}: {} layers, ids = host and = ik on every token: {set_ok}",
+                hp.n_layer
+            );
+            ok &= set_ok;
+        }
+        println!(
+            "router real: {tokens} tokens, ik_ids_mismatch={ik_mismatch}/{tokens} probs_err={worst_p:.3e} \
+             weights_err={worst_w:.3e} (band {BAND:.0e}) ik_weights_rel={worst_ik:.3e} (printed, not pinned) {}",
+            verdict(ok)
+        );
+
+        // ---- constructed ties.
+        let mut cases: Vec<(&str, Vec<f32>, &[u32])> = Vec::new();
+        cases.push(("all-equal", vec![0.5; N_EXPERT], &[0, 1, 2, 3, 4, 5, 6, 7]));
+        let mut l = vec![-4.0f32; N_EXPERT];
+        for (i, &e) in [100usize, 90, 64, 33, 5, 127, 70].iter().enumerate() {
+            l[e] = 3.0 - 0.25 * i as f32;
+        }
+        for e in [96usize, 32, 1] {
+            l[e] = 1.0;
+        }
+        cases.push((
+            "eighth-shared-by-96-32-1",
+            l,
+            &[100, 90, 64, 33, 5, 127, 70, 1],
+        ));
+        let mut l = vec![-4.0f32; N_EXPERT];
+        for (i, e) in (40..47).enumerate() {
+            l[e] = 1.0 - 0.1 * i as f32;
+        }
+        l[127] = 2.0;
+        l[31] = 2.0;
+        cases.push((
+            "first-shared-by-127-31",
+            l,
+            &[31, 127, 40, 41, 42, 43, 44, 45],
+        ));
+        for (name, logits, want) in &cases {
+            let x = DeviceBuffer::from_host(stream, logits)?;
+            let a = route(&k, stream, &x, &mut out)?;
+            let h = host(logits)?;
+            let pass = a.ids == *want && h.ids == *want && max_abs(&a.weights, &h.weights) <= BAND;
+            println!(
+                "tie case={name} ids={:?} host={:?} want={want:?} {}",
+                a.ids,
+                h.ids,
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // ---- the router as a captured graph.
+        let man = &sets()?[0].1;
+        let lrow = man.tensor("ffn_moe_logits-13", 0)?;
+        let logits = ref_tensor_logical_in(&man.dir, lrow)?;
+        let x = DeviceBuffer::from_host(stream, &logits[..N_EXPERT])?;
+        let eager = route(&k, stream, &x, &mut out)?;
+        out.probs.zero_async(stream)?;
+        out.ids.zero_async(stream)?;
+        out.weights.zero_async(stream)?;
+        stream.synchronize()?;
+        let graph = gpu.capture(|s| k.enqueue(s, &x, &mut out))?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let replay = Routed {
+            probs: out.probs.to_host_vec(stream)?,
+            ids: out.ids.to_host_vec(stream)?,
+            weights: out.weights.to_host_vec(stream)?,
+        };
+        let identical = bits_equal(&eager.probs, &replay.probs)
+            && eager.ids == replay.ids
+            && bits_equal(&eager.weights, &replay.weights);
+        let nodes = graph.node_count();
+        let pass = identical && nodes == 1;
+        println!(
+            "graph op=qwen3moe_router src=ffn_moe_logits-13 eager_vs_graph_bit_identical={identical} \
+             graph_nodes={nodes} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        println!("gate_qwen3moe_router: {}", verdict(ok));
+        if !ok {
+            return Err(checks_failed());
+        }
+        Ok(())
+    }
+}

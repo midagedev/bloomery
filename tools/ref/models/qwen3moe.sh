@@ -49,6 +49,12 @@ REF_DUMP_LEASE=1
 # `-every-node` runs the prefill under the dumped schedule instead of the fused one
 # (--prefill-every-node), so the caches the step reads carry a dumped prefill's arithmetic.
 #   step4  the oracle's five ids: a quiet prefill of 4, the step at position 4, -c 512
+#   d1k    a quiet prefill of 1,024 ids of prose, the step at position 1,024, -c 2048
+#   d4k    a quiet prefill of 4,096 ids of prose, the step at position 4,096, -c 4608
+# The prose of d1k and d4k is $BLOOMERY_DATA/qwen3moe/corpus-prose.ids: the tokenizer oracle's
+# `prose.nps.ids` under this model's vocabulary (ik's docs/**/*.md and README.md, --no-parse-special,
+# one id per line), copied out of tokenizer-qwen3moe/ so a rerun of that oracle on a moved ik tree
+# cannot change the ids a set is of; the sha256 below is the check.
 ref_step_variant() {
   local name=$1 every_node=0
   case $name in
@@ -57,8 +63,14 @@ ref_step_variant() {
   STEP_TOKENS='' STEP_TOKENS_FILE='' STEP_TOKENS_SHA256=''
   STEP_ARGS=()
   case $name in
-    step4) STEP_SET=ref_qwen3moe_step4; STEP_CTX=512; STEP_PREFILL=4; STEP_TOKENS=$REF_TOKENS ;;
+    step4) STEP_SET=ref_qwen3moe_step4; STEP_CTX=512;  STEP_PREFILL=4; STEP_TOKENS=$REF_TOKENS ;;
+    d1k)   STEP_SET=ref_qwen3moe_d1k;   STEP_CTX=2048; STEP_PREFILL=1024 ;;
+    d4k)   STEP_SET=ref_qwen3moe_d4k;   STEP_CTX=4608; STEP_PREFILL=4096 ;;
     *)     return 1 ;;
+  esac
+  case $name in
+    d1k|d4k) STEP_TOKENS_FILE=$BLOOMERY_DATA/qwen3moe/corpus-prose.ids
+             STEP_TOKENS_SHA256=9444bc5b4e2a7c5f4caac4f1aa7b6ef8e945b114fdecac52aca36a1de4e76cf6 ;;
   esac
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node

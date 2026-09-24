@@ -403,7 +403,8 @@ dump-ref-v41 *VARIANT:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
 # qwen3moe(Qwen3-30B-A3B-2507) 오라클: 같은 계측기를 qwen3moe 프로필로 돌려 $BLOOMERY_DATA/ref_qwen3moe/에 쓴다(CPU,
-# 5토큰). VARIANT(step4와 접미사 -every-node)는 조용한 프리필 뒤 디코드 한 스텝을 자기 세트에 덤프한다 — models/qwen3moe.sh.
+# 5토큰). VARIANT(step4, d1k, d4k와 접미사 -every-node)는 조용한 프리필 뒤 디코드 한 스텝을 자기 세트에 덤프한다 —
+# models/qwen3moe.sh. d1k·d4k는 $BLOOMERY_DATA/qwen3moe/corpus-prose.ids의 앞 1,025·4,097개 id를 읽는다(sha256 고정).
 dump-ref-qwen3moe *VARIANT:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
@@ -516,6 +517,27 @@ gate-qwen3moe-meta:
 # 바이트, 전체 계획의 바이트 예산에서 whole, 1바이트 모자라면 not whole, 무-expert 바닥 아래면 거부. 헤더만.
 gate-qwen3moe-placement:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test qwen3moe_placement -- --ignored --nocapture'
+
+# qwen3moe 커널 게이트(3090, ik CPU 덤프 네 세트: 5토큰 프리필, 깊이 4·1,024·4,096의 디코드 스텝). 헤드별 QK RMS 노름,
+# NEOX 로프와 K/V 캐시 쓰기(한 런치), 소프트맥스 라우터 128/8과 재정규화, 다운 `_sel`(Q6_K 새 커널, Q4_K 기존 커널),
+# GQA 플래시 디코드(스칼라·텐서 코어 두 패스). 레시피마다 바이너리 하나, 마지막 것은 다섯을 한 번에 짓고 차례로 돈다.
+gate-gpu-qwen3moe-qknorm:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_qknorm && bash tools/gpu-gate.sh gate_qwen3moe_qknorm'
+
+gate-gpu-qwen3moe-rope:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_rope && bash tools/gpu-gate.sh gate_qwen3moe_rope'
+
+gate-gpu-qwen3moe-router:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_router && bash tools/gpu-gate.sh gate_qwen3moe_router'
+
+gate-gpu-qwen3moe-down:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && bash tools/gpu-gate.sh gate_qwen3moe_down'
+
+gate-gpu-qwen3moe-flash:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && bash tools/gpu-gate.sh gate_qwen3moe_flash'
+
+gate-gpu-qwen3moe-kernels:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_qknorm --bin gate_qwen3moe_rope --bin gate_qwen3moe_router --bin gate_qwen3moe_down --bin gate_qwen3moe_flash && bash tools/gpu-gate.sh gate_qwen3moe_qknorm && bash tools/gpu-gate.sh gate_qwen3moe_rope && bash tools/gpu-gate.sh gate_qwen3moe_router && bash tools/gpu-gate.sh gate_qwen3moe_down && bash tools/gpu-gate.sh gate_qwen3moe_flash'
 
 # V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 5토큰 세트의
 # 모든 층에서 ik의 라우팅을 주입해 호스트 티어가 낸 routed 부분합을 ik의 ffn_moe_out과 도출한 밴드 안에서 대조한다

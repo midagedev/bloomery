@@ -12,3 +12,4 @@
 //! the gates at once.
 
 pub mod deepseek2;
+pub mod qwen3moe;
