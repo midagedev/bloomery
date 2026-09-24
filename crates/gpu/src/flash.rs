@@ -497,15 +497,17 @@ macro_rules! mma_segment_walk {
                 let $key = blk + row;
                 let live = $key < $hi_max;
                 let mut raw = [0u32; $width / 64];
+                // The caller's row expression, once per key, asked only below
+                // `hi`, and outside the unsafe block: a gathering source's
+                // index load is its own unsafe operation, with its own
+                // SAFETY, and the row's word loads wait on one index load,
+                // not one each.
+                let src_row: usize = if live { $row } else { 0 };
                 let mut i = 0usize;
                 while i < const { $width / 64 } {
                     ::cuda_device::thread::__unroll_config::<{ 0 }>();
                     let ww = lane + i * 32;
                     if live {
-                        // The caller's row expression stays outside the
-                        // unsafe block: a gathering source's index load is
-                        // its own unsafe operation, with its own SAFETY.
-                        let src_row: usize = $row;
                         // SAFETY: key < hi, so `src_row` names a row of the
                         // source, and 2 * ww < width puts the load inside
                         // it (the caller's contract).
