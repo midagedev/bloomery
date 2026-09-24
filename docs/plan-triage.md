@@ -271,7 +271,7 @@
 
 ## 공개 파일 1단계 뒤 (plainfile·plainpin 보고, 2026-09-24 — `78fbe2a`, `50c6806`, `675e09f`)
 
-- **op 게이트 7개가 공개 파일을 형식에서 거부한다**(chain_glue·chain_attn·chain_ffn·engram·woa·moe·index — 첫 줄은 모두 `… is q3_K/Q3_K/q5_K, want q8_0`). 각자 ik의 Q8_0×Q8_2 규칙 전사와 밴드 유도를 품고 있어, q3_K×q8_K(ik CPU) 대 q3_K×q8_1(우리) 규칙을 새로 전사하고 밴드를 3요건으로 다시 유도해야 한다. 그때까지 새 커널(heads, q5k, shexp_q3k, 홀수 n_sb q_b, q3k 행·임베딩)은 step 게이트의 every-node envelope(비율 최대 1.041, 핀 1.5)와 argmax 일치로만 덮인다. **opgate1**(공유 K-quant 반올림 규칙 + chain_attn을 본보기로) → 나머지 여섯을 한 파동에 3–4개씩.
+- **op 게이트 7개가 공개 파일을 형식에서 거부한다**(chain_glue·chain_attn·chain_ffn·engram·woa·moe·index — 첫 줄은 모두 `… is q3_K/Q3_K/q5_K, want q8_0`). 각자 ik의 Q8_0×Q8_2 규칙 전사와 밴드 유도를 품고 있어, q3_K×q8_K(ik CPU) 대 q3_K×q8_1(우리) 규칙을 새로 전사하고 밴드를 3요건으로 다시 유도해야 한다. 그때까지 새 커널(heads, q5k, shexp_q3k, 홀수 n_sb q_b, q3k 행·임베딩)은 step 게이트의 every-node envelope(비율 최대 1.041, 핀 1.5)와 argmax 일치로만 덮인다. **opgate1**(공유 K-quant 반올림 규칙 + chain_attn을 본보기로) → 나머지 여섯을 한 파동에 3–4개씩. **진행(09-24 밤)**: chain_attn `ed79667`, woa·index `0fb9b37`(index 게이트의 사각 — 심은 q_b 결함이 쿼리 밴드를 통과해 행 단위 핀을 더함), chain_ffn·moe `efb3350`(ik q8_2×Q4_K/Q5_K 점곱 전사, 규칙 핀 비트 동일). 남은 것은 chain_glue·engram(`opg-glueeng`)이고, 그 뒤 공개 파일을 기본값으로 뒤집는다.
 - **`gate-ds41-host`가 공개 파일에서 빨강**: `crates/model/tests/ds41_host.rs:81` `CLAMP_LAYERS = [38, 39]`는 혼합 세트가 라우팅 클램프에 닿는다는 커버리지 핀이고, 공개 세트는 40층 전부 `clamp_hits 0`(밴드는 전부 PASS). 빈 목록 핀은 커버리지 축소라 받지 않는다 — 합성 클램프 입력으로 파일과 무관하게 세우는 쪽(S–M).
 - `gate_mcol`이 V4.1을 파일 선택대로 열어 공개 파일에서는 Q8_0 사이트가 없어 거부될 것[유도] — 사이트를 타입별로(수십 줄).
 - `gate-qdot`의 q5_K 덤프는 혼합 파일에서 뜬 그대로다(두 파일의 q5_K 라우팅 텐서는 같은 형식, 바이트 동일은 안 쟀다).
