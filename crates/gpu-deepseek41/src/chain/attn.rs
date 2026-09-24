@@ -1903,10 +1903,18 @@ const JOINT_Q: &str = "attn_q_b+indexer.attn_q_b";
 /// A gated compressor's kv and gate projections.
 const JOINT_KV_GATE: &str = "attn_compressor_kv+gate";
 
-/// For layers `layers` of the model `hp` describes, move each group of
-/// projections that read the same q8_1 activation into one row stream
-/// ([`Weights::join_rows`]), so the chain runs the group as one `q3k_gemv`
-/// launch — each row the same kernel on the same bits, only its index moved:
+/// One row join [`join_projections`] makes on a layer: the derived name it
+/// is filed under and its parts in row order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinGroup {
+    /// The derived weight's name (`derived.blk.<l>.<what>`).
+    pub joint: String,
+    /// The file tensors whose rows the join concatenates, in that order.
+    pub parts: Vec<String>,
+}
+
+/// The row joins layer `l` of the model `hp` describes would carry — the
+/// one owner of which projections read one activation together:
 ///
 /// - q_a, kv and, on an indexer layer, the indexer's weights projection
 ///   (the normed input);
@@ -1914,8 +1922,45 @@ const JOINT_KV_GATE: &str = "attn_compressor_kv+gate";
 ///   norm);
 /// - a gated compressor's kv and gate projections (its normed input).
 ///
-/// A group is joined only when every member is resident as Q3_K; any other
-/// format keeps its separate launches. Load-time only.
+/// [`join_projections`] joins a group when every part is resident as Q3_K;
+/// a gate that reads the plan against the resident weights folds the same
+/// groups.
+pub fn join_groups(hp: &Hparams, l: usize) -> Result<Vec<JoinGroup>, GpuError> {
+    let kind = hp.layers.get(l).ok_or_else(|| GpuError::Shape {
+        what: WHAT,
+        detail: format!("layer {l} of a file of {} layers", hp.layers.len()),
+    })?;
+    let indexer = kind.indexer && kind.stream.is_some();
+    let owns_gated =
+        kind.compressor.is_some_and(|c| c.gated) && kind.stream.is_some_and(|st| st.kv_source == l);
+    let mut groups = Vec::with_capacity(3);
+    let mut qkv = vec![names::attn_q_a(l), names::attn_kv(l)];
+    if indexer {
+        qkv.push(names::indexer_proj(l));
+        groups.push(JoinGroup {
+            joint: joint_name(l, JOINT_Q),
+            parts: vec![names::attn_q_b(l), names::indexer_attn_q_b(l)],
+        });
+    }
+    groups.push(JoinGroup {
+        joint: joint_name(l, JOINT_QKV),
+        parts: qkv,
+    });
+    if owns_gated {
+        groups.push(JoinGroup {
+            joint: joint_name(l, JOINT_KV_GATE),
+            parts: vec![names::attn_compressor_kv(l), names::attn_compressor_gate(l)],
+        });
+    }
+    Ok(groups)
+}
+
+/// For layers `layers` of the model `hp` describes, move each group of
+/// projections that read the same q8_1 activation ([`join_groups`]) into one
+/// row stream ([`Weights::join_rows`]), so the chain runs the group as one
+/// `q3k_gemv` launch — each row the same kernel on the same bits, only its
+/// index moved. A group is joined only when every member is resident as
+/// Q3_K; any other format keeps its separate launches. Load-time only.
 pub fn join_projections(
     stream: &CudaStream,
     hp: &Hparams,
@@ -1932,33 +1977,10 @@ pub fn join_projections(
         )
     };
     for l in layers {
-        let kind = hp.layers.get(l).ok_or_else(|| GpuError::Shape {
-            what: WHAT,
-            detail: format!("layer {l} of a file of {} layers", hp.layers.len()),
-        })?;
-        let indexer = kind.indexer && kind.stream.is_some();
-        let owns_gated = kind.compressor.is_some_and(|c| c.gated)
-            && kind.stream.is_some_and(|st| st.kv_source == l);
-        let mut groups: Vec<(Vec<String>, &str)> = Vec::with_capacity(3);
-        let mut qkv = vec![names::attn_q_a(l), names::attn_kv(l)];
-        if indexer {
-            qkv.push(names::indexer_proj(l));
-            groups.push((
-                vec![names::attn_q_b(l), names::indexer_attn_q_b(l)],
-                JOINT_Q,
-            ));
-        }
-        groups.push((qkv, JOINT_QKV));
-        if owns_gated {
-            groups.push((
-                vec![names::attn_compressor_kv(l), names::attn_compressor_gate(l)],
-                JOINT_KV_GATE,
-            ));
-        }
-        for (parts, what) in groups {
-            if parts.iter().all(|p| is_q3k(w, p)) {
-                let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-                w.join_rows(stream, &parts, joint_name(l, what))?;
+        for g in join_groups(hp, l)? {
+            if g.parts.iter().all(|p| is_q3k(w, p)) {
+                let parts: Vec<&str> = g.parts.iter().map(String::as_str).collect();
+                w.join_rows(stream, &parts, g.joint)?;
             }
         }
     }

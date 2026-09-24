@@ -67,6 +67,7 @@ mod gate {
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, StepInput};
+    use bloomery_gpu_deepseek41::chain::attn::join_groups;
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu_gates::{
@@ -75,6 +76,7 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::GgmlType;
+    use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::kv::KvLayout;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
@@ -146,7 +148,7 @@ mod gate {
             let w = m.stages()[0]
                 .weights()
                 .ok_or("the loaded stage carries no weights")?;
-            ok &= check_segments(&plan, w);
+            ok &= check_segments(&plan, w, &inputs.hp);
             ok &= check_expert_bytes(&plan, w);
         }
         {
@@ -309,28 +311,69 @@ mod gate {
     }
 
     /// Check (i), segments: each segment on the card holds the plan's buffers
-    /// for it, nothing else is resident, and the total is the card's dense +
-    /// expert bytes.
-    fn check_segments(plan: &Plan<'_>, w: &Weights) -> bool {
+    /// for it — or, for a projection the load joined into a row stream
+    /// (`join_groups`), the joint holds the sum of its parts' segments — nothing
+    /// else is resident, and the total is the card's dense + expert bytes.
+    fn check_segments(plan: &Plan<'_>, w: &Weights, hp: &Hparams) -> bool {
         let name = &plan.machine.cards[0].name;
         let (mut segments, mut planned, mut bad) = (0usize, BTreeSet::new(), Vec::new());
+        // Every part's joint, and every joint's parts, over the file's layers.
+        let (mut joint_of, mut parts_of) = (BTreeMap::new(), BTreeMap::new());
+        for l in 0..hp.layers.len() {
+            match join_groups(hp, l) {
+                Ok(groups) => {
+                    for g in groups {
+                        for p in &g.parts {
+                            joint_of.insert(p.clone(), g.joint.clone());
+                        }
+                        parts_of.insert(g.joint, g.parts);
+                    }
+                }
+                Err(e) => bad.push(format!("layer {l}: {e}")),
+            }
+        }
+        // The bytes the plan gives the parts of each resident joint.
+        let mut joint_want: BTreeMap<&str, u64> = BTreeMap::new();
         for row in &plan.rows {
             let t = &plan.model.tensors[row.tensor];
             for seg in row.segments.iter().filter(|s| s.device == Device::Card(0)) {
                 segments += 1;
                 planned.insert(t.name.as_str());
                 let want = seg.buffer_bytes(t, plan.model.experts);
-                match (w.get(&t.name).map(buffers), want) {
-                    (Some(got), Ok(want)) if got == want => {}
-                    (Some(got), want) => bad.push(format!(
+                let joint = joint_of.get(&t.name).filter(|j| w.get(j).is_some());
+                match (w.get(&t.name).map(buffers), want, joint) {
+                    (Some(got), Ok(want), _) if got == want => {}
+                    (Some(got), want, _) => bad.push(format!(
                         "{}: buffers {got:?} B resident, the plan's segment {want:?}",
                         t.name
                     )),
-                    (None, _) => bad.push(format!("{}: not resident", t.name)),
+                    (None, Ok(want), Some(j)) => {
+                        *joint_want.entry(j.as_str()).or_default() += want.iter().sum::<u64>();
+                    }
+                    (None, Err(e), Some(_)) => {
+                        bad.push(format!("{}: the plan's segment: {e}", t.name));
+                    }
+                    (None, _, None) => bad.push(format!("{}: not resident", t.name)),
                 }
             }
         }
-        for n in w.names().filter(|n| !planned.contains(n)) {
+        for (j, want) in &joint_want {
+            let got: u64 = w.get(j).map(buffers).unwrap_or_default().iter().sum();
+            if got != *want {
+                bad.push(format!(
+                    "{j}: {got} B resident, its parts' segments {want} B"
+                ));
+            }
+            if let Some(unplanned) = parts_of[*j].iter().find(|p| !planned.contains(p.as_str())) {
+                bad.push(format!(
+                    "{j}: resident, and its part {unplanned} has no segment here"
+                ));
+            }
+        }
+        for n in w
+            .names()
+            .filter(|n| !planned.contains(n) && !joint_want.contains_key(n))
+        {
             bad.push(format!(
                 "{n}: resident, and the plan has no segment of it here"
             ));
