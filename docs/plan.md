@@ -31,7 +31,7 @@
 | 파동 | 병렬 | 리드가 그 사이 | 닫는 조건 |
 |---|---|---|---|
 | **21 (09-25 04:10~)** | `dspark-q3k` ‖ `ds41hcbranch` ‖ `unionhost` → `ds41splitk` ‖ `qwen3route` ‖ `fixup3` | plan 정리(이 판), E21, `spec-dsloop`, spots-triage 표 | dspark-q3k·hcbranch 머지 → dsloop 자리 |
-| 22 | `dsloop` ‖ `uniongroup` ‖ `qwen3fuse` ‖ `load3` ‖ `gpuq1` ‖ `slots` | 시팅 B·C·D, A3 리베이스 A/B, 시팅 10(승인 뒤) | dsloop 머지 → DSpark tok/s |
+| 22 | `dsloop` ‖ `qwen3fuse` ‖ `load3` ‖ `slots` (07:20 발사, base `ac250bb`; uniongroup·gpuq1은 body.rs·chain/ffn.rs 충돌로 23으로) | 시팅 B·C·D, A3 리베이스 A/B, 시팅 10(승인 뒤) | dsloop 머지 → DSpark tok/s |
 | 23 | `v4meta` ‖ `qwen3bw` ‖ `linear` ‖ `visinj` ‖ `glm53` ‖ 하니스 기계 라운드 | M1 글·영상, E28 재측정 | — |
 
 ### 리드 직렬 지점과 규칙
