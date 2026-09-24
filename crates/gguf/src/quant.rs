@@ -1059,8 +1059,8 @@ pub fn quantize_row_q8_k_roundtrip(x: &[f32], out: &mut [f32]) {
 ///
 /// | weight | activation |
 /// |---|---|
-/// | Q3_K | `Q8_K` |
-/// | Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q8_0 | `Q8_2_X4` |
+/// | Q3_K, IQ3_XXS | `Q8_K` |
+/// | Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q8_0, MXFP4 | `Q8_2_X4` |
 /// | F32, F16 | none |
 ///
 /// Using Q8_K for all of them is wrong by ~1e-3 on the Q5_1 down projection; the
@@ -1106,27 +1106,31 @@ pub fn quantize_row_q8_2_x4_roundtrip(x: &[f32], out: &mut [f32]) {
 /// that picks the activation format itself will pick it differently somewhere else, and the
 /// difference shows up as a 1e-3 numeric drift nobody can place.
 ///
+/// MXFP4 takes Q8_2_X4 (ggml.c:1316 on this AVX2 IQK build; ik's
+/// `iqk_set_kernels_legacy_quants` pairs it with `mul_mat_qX_1_q8_2_T`) and IQ3_XXS takes
+/// Q8_K (ggml.c:1116; `iqk_set_kernels_iquants` refuses any other activation type).
+///
 /// A weight type no CPU matmul here takes is refused, not given a format: Q8_0 and BF16
 /// activations are Q8_2_X4 and BF16 in ggml (`vec_dot_type`, ggml.c:828-837 on this AVX2
 /// IQK build, ggml.c:1494), neither of which this engine encodes, and f32 would be a
-/// plausible wrong answer. MXFP4's is Q8_2_X4 on AVX2 (ggml.c:1316), but no CPU MXFP4
-/// matmul exists here, so it is refused the same way, as is every type [`dequant_row`]
-/// does not decode. Q2_K and the i-quants take Q8_K in ggml (ggml.c:895, :1090, :1116,
-/// :1302) and have no CPU matmul here either.
+/// plausible wrong answer. So is every type [`dequant_row`] does not decode. Q2_K and the
+/// other i-quants take Q8_K in ggml (ggml.c:895, :1090, :1302) and have no CPU matmul here
+/// either.
 pub fn activation_format(weight: GgmlType) -> Result<Option<ActivationFormat>, QuantError> {
     match weight {
-        GgmlType::Q3_K => Ok(Some(ActivationFormat::Q8K)),
-        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q5_0 | GgmlType::Q5_1 => {
-            Ok(Some(ActivationFormat::Q8_2X4))
-        }
+        GgmlType::Q3_K | GgmlType::IQ3_XXS => Ok(Some(ActivationFormat::Q8K)),
+        GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K
+        | GgmlType::Q5_0
+        | GgmlType::Q5_1
+        | GgmlType::MXFP4 => Ok(Some(ActivationFormat::Q8_2X4)),
         GgmlType::F32 | GgmlType::F16 => Ok(None),
         GgmlType::Q8_0
         | GgmlType::BF16
-        | GgmlType::MXFP4
         | GgmlType::Q2_K
         | GgmlType::IQ2_XXS
         | GgmlType::IQ2_XS
-        | GgmlType::IQ3_XXS
         | GgmlType::IQ1_S
         | GgmlType::IQ4_NL
         | GgmlType::IQ3_S

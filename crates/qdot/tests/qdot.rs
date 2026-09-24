@@ -484,10 +484,49 @@ fn rejects_unaligned_k() {
         dot_row(GgmlType::Q5_K, &wrow5k, &acol5k, 2304).unwrap(),
         0.0
     );
+    // IQ3_XXS pairs q8_K with 98 weight bytes per 256 values (k = 4096, the V4 gate/up rows).
+    assert_eq!(col_bytes(GgmlType::IQ3_XXS, 4096), 296 * 16);
+    let wrow3x = vec![0u8; 98 * 16];
+    let acol3x = vec![0u8; 296 * 16];
+    assert!(matches!(
+        dot_row(GgmlType::IQ3_XXS, &wrow3x, &acol3x, 4096 + 32),
+        Err(QdotError::UnalignedK { k: 4128, gran: 256 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ3_XXS, &wrow3x[..98 * 16 - 1], &acol3x, 4096),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::IQ3_XXS, &wrow3x, &acol3x[..296 * 16 - 1], 4096),
+        Err(QdotError::ShortActivationCol { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::IQ3_XXS, &wrow3x, &acol3x, 4096).unwrap(),
+        0.0
+    );
+    // MXFP4 uses 32-value blocks (17 bytes per 32 values) and q8_2 tails past the x4 groups.
+    assert_eq!(col_bytes(GgmlType::MXFP4, 2048), 144 * 16);
+    assert_eq!(col_bytes(GgmlType::MXFP4, 160), 144 + 36);
+    let wrowmx = vec![0u8; 17 * 64];
+    let acolmx = vec![0u8; 144 * 16];
+    assert!(matches!(
+        dot_row(GgmlType::MXFP4, &wrowmx, &acolmx, 100),
+        Err(QdotError::UnalignedK { k: 100, gran: 32 })
+    ));
+    assert!(matches!(
+        dot_row(GgmlType::MXFP4, &wrowmx[..17 * 64 - 1], &acolmx, 2048),
+        Err(QdotError::ShortWeightRow { .. })
+    ));
+    assert_eq!(
+        dot_row(GgmlType::MXFP4, &wrowmx, &acolmx, 2048).unwrap(),
+        0.0
+    );
     // Supported type table check.
     assert!(!supports(GgmlType::F16));
     assert!(supports(GgmlType::Q5_K));
     assert!(supports(GgmlType::Q5_1));
+    assert!(supports(GgmlType::IQ3_XXS));
+    assert!(supports(GgmlType::MXFP4));
 }
 
 /// `col_bytes` panics on unaligned k.
@@ -1094,6 +1133,207 @@ fn hw_q5k_dequant_matches_ggml() {
     assert!(
         global_rel <= 1e-5,
         "kernel vs f64 dot of ggml's dequantized rows: global rel {global_rel:.3e} > 1e-5"
+    );
+}
+
+// ------------------------------------------- IQ3_XXS x Q8_K and MXFP4 x Q8_2_X4
+// The V4-Flash routed-expert formats. The reference model carries neither; the V4-Flash
+// file's first data shard holds blk.0.ffn_gate_exps.weight (IQ3_XXS, k = 4096) and
+// blk.0.ffn_down_exps.weight (MXFP4, k = 2048). Its tensors are found through the
+// header-only inventory and their rows read at `data_base + offset`, as the Q5_K case does.
+// Gate A: the AVX2 kernel equals its mirror bit for bit on the tensor's first rows. Gate B:
+// on ik's own column the kernel is within 1 ULP of ik's kernel on all 64 dumped rows
+// (tools/ref/iq3xxs_ref.cpp, tools/ref/mxfp4_x4_ref.cpp). MXFP4 also carries gate 0, the
+// encoder against ik's quantize_row_q8_2_x4; IQ3_XXS cannot: ik's AVX2 q8_K encoder codes
+// from the unsigned max (d > 0 always) where ours mirrors ggml's signed-extreme reference,
+// so the bytes differ while the products agree.
+
+/// The V4-Flash shard the two gates and their harnesses read; `BLOOMERY_V4_MODEL`
+/// overrides it (tools/ref/build-qdot-ref.sh reads the same variable, same default).
+fn v4_model() -> String {
+    std::env::var("BLOOMERY_V4_MODEL").unwrap_or_else(|_| {
+        "/models/DeepSeek-V4-Flash-0731-UD-Q3_K_M/DeepSeek-V4-Flash-0731-UD-Q3_K_M-00002-of-00004.gguf"
+            .into()
+    })
+}
+
+/// The first `ty` tensor of the V4-Flash shard with an aligned k — the scan its
+/// harness does — with its first rows and the column `quantize_col` codes from
+/// the first k values of the attn_norm-0 dump (the column the harness codes).
+struct V4Case {
+    ty: GgmlType,
+    name: String,
+    k: usize,
+    row_bytes: usize,
+    bytes: Vec<u8>,
+    acol: Vec<u8>,
+}
+
+impl V4Case {
+    fn load(ty: GgmlType, rows: usize) -> V4Case {
+        use std::os::unix::fs::FileExt;
+        let (gran, block): (usize, usize) = match ty {
+            GgmlType::IQ3_XXS => (256, 98),
+            GgmlType::MXFP4 => (32, 17),
+            _ => panic!("no V4 case for {ty:?}"),
+        };
+        let path = v4_model();
+        let inv = gguf::inventory_of(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let t = inv
+            .tensors
+            .iter()
+            .find(|t| t.type_id == ty.as_u32() && t.dims[0].is_multiple_of(gran as u64))
+            .unwrap_or_else(|| panic!("{path} carries no aligned {ty:?} tensor"));
+        let k = t.dims[0] as usize;
+        let n = t.dims[1..].iter().product::<u64>() as usize;
+        let row_bytes = block * k / gran;
+        assert_eq!(t.nbytes, Some((n * row_bytes) as u64), "{}: bytes", t.name);
+        assert!(
+            n >= rows,
+            "{}: only {n} rows, the gate needs {rows}",
+            t.name
+        );
+        let mut bytes = vec![0u8; rows * row_bytes];
+        std::fs::File::open(&path)
+            .and_then(|f| f.read_exact_at(&mut bytes, inv.data_base + t.offset))
+            .unwrap_or_else(|e| panic!("{path}: read {}: {e}", t.name));
+        let xs = oracle_f32("attn_norm-0", 2048 * 6)[..k].to_vec();
+        let mut acol = vec![0u8; col_bytes(ty, k)];
+        quantize_col(ty, &xs, &mut acol);
+        V4Case {
+            ty,
+            name: t.name.clone(),
+            k,
+            row_bytes,
+            bytes,
+            acol,
+        }
+    }
+
+    fn row(&self, r: usize) -> &[u8] {
+        &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes]
+    }
+
+    /// ik's dump for this tensor: its activation bytes and its 64 row results.
+    fn ik_dump(&self, file: &str) -> (Vec<u8>, Vec<u32>) {
+        let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+        let dump = std::fs::read_to_string(format!("{base}/ref/{file}"))
+            .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
+        let name = dump
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or_default();
+        assert_eq!(
+            name, self.name,
+            "the dump and this scan must land on the same tensor"
+        );
+        let (dump_k, ik_acol, want) = parse_ik_dot_dump(&dump);
+        assert_eq!(dump_k, self.k, "{file}: k");
+        assert_eq!(
+            ik_acol.len(),
+            self.acol.len(),
+            "ik's column must size-match ours"
+        );
+        (ik_acol, want)
+    }
+
+    /// Gate A: the AVX2 kernel and its mirror agree bit for bit on `ROWS` rows.
+    fn gate_a(&self) {
+        assert!(
+            supports(self.ty),
+            "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+        );
+        for r in 0..ROWS {
+            let a = dot_row_avx2(self.ty, self.row(r), &self.acol, self.k).unwrap();
+            let b = dot_row_scalar(self.ty, self.row(r), &self.acol, self.k).unwrap();
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "row {r}: kernel {a:e} (bits {:#x}) and mirror {b:e} (bits {:#x}) must be bit-identical",
+                a.to_bits(),
+                b.to_bits()
+            );
+        }
+        eprintln!(
+            "{:?} gate A: {ROWS} rows bit-identical (kernel vs mirror, {}, k = {})",
+            self.ty, self.name, self.k
+        );
+    }
+
+    /// Gate B: on ik's column, every dumped row within 1 ULP of ik's kernel.
+    fn gate_b(&self, file: &str, ik_kernel: &str) {
+        let (ik_acol, want) = self.ik_dump(file);
+        assert!(want.len() >= 64, "dump needs 64 rows");
+        let mut worst = 0i64;
+        let mut exact = 0usize;
+        for (r, &w) in want.iter().take(64).enumerate() {
+            let got = dot_row(self.ty, self.row(r), &ik_acol, self.k).unwrap();
+            let ulp = (got.to_bits() as i64 - w as i64).abs();
+            assert!(
+                ulp <= 1,
+                "row {r}: ours {got:.9e} vs ik {}: {ulp} ULP apart",
+                f32::from_bits(w)
+            );
+            worst = worst.max(ulp);
+            exact += usize::from(ulp == 0);
+        }
+        eprintln!(
+            "{:?} gate B: 64 rows within 1 ULP of ik's {ik_kernel} (on ik's own activations, {}): \
+             max {worst} ULP, {exact}/64 rows at 0 ULP",
+            self.ty, self.name
+        );
+    }
+}
+
+/// IQ3_XXS gate A: kernel vs mirror on the V4-Flash gate stack.
+#[test]
+#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+fn hw_iq3xxs_kernel_matches_mirror() {
+    V4Case::load(GgmlType::IQ3_XXS, ROWS).gate_a();
+}
+
+/// IQ3_XXS gate B: within 1 ULP of ik's `mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ3XXS, 1>`.
+#[test]
+#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+fn hw_iq3xxs_kernel_predicts_ik() {
+    V4Case::load(GgmlType::IQ3_XXS, 64).gate_b(
+        "iq3xxs-ik-dot.txt",
+        "mul_mat_qX_K_q8_K_IQ_N<DequantizerIQ3XXS, 1>",
+    );
+}
+
+/// MXFP4 gate 0: `quantize_col` codes the column byte for byte as ik's `quantize_row_q8_2_x4`.
+#[test]
+#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+fn hw_mxfp4_encoder_matches_ik() {
+    let c = V4Case::load(GgmlType::MXFP4, 1);
+    let (ik_acol, _) = c.ik_dump("mxfp4-x4-ik-dot.txt");
+    for (i, (a, b)) in ik_acol.iter().zip(&c.acol).enumerate() {
+        assert_eq!(a, b, "encoder byte {i}: ik {a:02x} vs ours {b:02x}");
+    }
+    eprintln!(
+        "MXFP4 gate 0: {} encoder bytes bit-identical to ik's quantize_row_q8_2_x4 ({}, k = {})",
+        c.acol.len(),
+        c.name,
+        c.k
+    );
+}
+
+/// MXFP4 gate A: kernel vs mirror on the V4-Flash down stack.
+#[test]
+#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+fn hw_mxfp4_kernel_matches_mirror() {
+    V4Case::load(GgmlType::MXFP4, ROWS).gate_a();
+}
+
+/// MXFP4 gate B: within 1 ULP of ik's `mul_mat_qX_1_q8_2_T<MXFP4_Unpacker, 1>`.
+#[test]
+#[ignore = "hw: needs the box, the V4-Flash shard and $BLOOMERY_DATA/ref"]
+fn hw_mxfp4_kernel_predicts_ik() {
+    V4Case::load(GgmlType::MXFP4, 64).gate_b(
+        "mxfp4-x4-ik-dot.txt",
+        "mul_mat_qX_1_q8_2_T<MXFP4_Unpacker, 1>",
     );
 }
 
@@ -1983,4 +2223,82 @@ fn quantize_col_subnormal_tiny_scales() {
         out4[4..].iter().all(|&b| b == 0),
         "inf/NaN products must quantize to 0 codes and 0 sums"
     );
+}
+
+/// NaN and inf in a block: the AVX2 encoders give the scalar mirrors' bytes.
+/// The scalar max skips NaN (`>` in q8_K, `f32::max` in q8_2), so a NaN value
+/// never sets a block's scale and codes to what its product extracts to. The
+/// cases are the ones a lane-wise max gets wrong: an all-NaN block, a NaN that
+/// is the last value of its lane (the lane ends NaN), and a NaN between a
+/// lane's block maximum and a later, smaller value of the same lane (the NaN
+/// drops the maximum from that lane). One +inf block rides along.
+#[test]
+fn quantize_col_nan_and_inf_bit_identical() {
+    require_quantizer_avx2();
+    let base = |k: usize| -> Vec<f32> { (0..k).map(|i| ((i % 29) as f32 - 14.0) / 16.0).collect() };
+    // (type, k, block width the encoder scans for its max)
+    for (w, k, blk) in [
+        (GgmlType::Q3_K, 512, 256),
+        (GgmlType::Q4_K, 256, 32),
+        (GgmlType::Q5_0, 160, 32),
+    ] {
+        let mut all_nan = base(k);
+        all_nan[..blk].fill(f32::NAN);
+        assert_col_bit_identical(w, &all_nan);
+
+        let mut last_in_lane = base(k);
+        last_in_lane[blk - 3] = f32::NAN;
+        assert_col_bit_identical(w, &last_in_lane);
+
+        // Lane 5 of the block: the maximum at group 0, NaN at group 1, a
+        // smaller finite value at every later group.
+        let mut dropped_max = base(k);
+        dropped_max[5] = 40.0;
+        dropped_max[8 + 5] = f32::NAN;
+        assert_col_bit_identical(w, &dropped_max);
+
+        let mut inf = base(k);
+        inf[blk / 2] = f32::INFINITY;
+        assert_col_bit_identical(w, &inf);
+    }
+}
+
+/// Every f16 block scale through the kernels and their mirrors: the kernels decode
+/// scales with F16C, the mirrors with `half_to_f32`, and the two converters must agree
+/// on every f16 but a NaN (whose payload F16C may quiet) — subnormal and extreme scales
+/// included, which real rows rarely carry. One block per type, the scale fields swept
+/// over all 65,536 bit patterns, the rest fixed pseudo-random bytes.
+#[test]
+fn f16_scales_bit_identical_kernel_vs_mirror() {
+    let mut rng = Lcg(0x00F1_6C5C_A1E5);
+    // (type, block bytes, offsets of its f16 scale fields)
+    for (w, block, fields) in [
+        (GgmlType::Q3_K, 110usize, &[108usize][..]),
+        (GgmlType::Q4_K, 144, &[0, 2][..]),
+        (GgmlType::Q5_K, 176, &[0, 2][..]),
+        (GgmlType::Q6_K, 210, &[208][..]),
+        (GgmlType::IQ3_XXS, 98, &[0][..]),
+    ] {
+        assert!(supports(w), "{w:?}: this CPU lacks the kernel's ISA");
+        let mut row: Vec<u8> = (0..block).map(|_| rng.next_u32() as u8).collect();
+        let x: Vec<f32> = (0..256).map(|_| rng.unit()).collect();
+        let mut acol = vec![0u8; col_bytes(w, 256)];
+        quantize_col(w, &x, &mut acol);
+        for h in 0..=u16::MAX {
+            if (h >> 10) & 0x1f == 0x1f && h & 0x3ff != 0 {
+                continue; // NaN: only the payload may differ
+            }
+            for &f in fields {
+                row[f..f + 2].copy_from_slice(&h.to_le_bytes());
+            }
+            let a = dot_row_avx2(w, &row, &acol, 256).unwrap();
+            let b = dot_row_scalar(w, &row, &acol, 256).unwrap();
+            assert!(
+                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                "{w:?} scale {h:#06x}: kernel {a:e} (bits {:#x}) vs mirror {b:e} (bits {:#x})",
+                a.to_bits(),
+                b.to_bits()
+            );
+        }
+    }
 }

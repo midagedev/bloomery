@@ -2047,6 +2047,7 @@ fn run_row_pool(
     // the owner still streams its rows contiguously. A row's value does not
     // depend on who computes it.
     let nlanes = threads::pool().threads();
+    assert!(nlanes <= MAX_LANES, "row pool lanes: {nlanes} threads");
     let mut lane_bounds = [0usize; MAX_LANES + 1];
     {
         let total_cost: u64 = (0..npairs)
@@ -2081,7 +2082,6 @@ fn run_row_pool(
         }
         lane_bounds[nlanes] = total_rows;
     }
-    assert!(nlanes <= MAX_LANES, "row pool lanes: {nlanes} threads");
     // `BLOOMERY_STEAL=0` is the A/B lever: whole-lane blocks, home lanes only.
     let steal = steal_enabled();
     let steal_blocks = steal_blocks();

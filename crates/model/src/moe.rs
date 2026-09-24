@@ -23,9 +23,10 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
-use gguf::{Gguf, Split, TensorInfo};
+use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
@@ -961,6 +962,29 @@ pub struct HostLayerSpec<'a> {
     pub swiglu_limit: f32,
 }
 
+/// The host tier's matmul path for each (weight type, row width) it serves,
+/// printed once per process when a layer first brings it in:
+/// `load host_tier type=iq3_xxs k=4096 path=fused` — qdot's fused kernel — or
+/// `path=dequant_row`, the slow path that decodes the row to f32 before the dot.
+/// The decision is [`qdot::fuses`], the one the matmul dispatch makes, so no run
+/// measures the slow path without saying so at load.
+fn announce_paths(stacks: &[(GgmlType, usize)]) {
+    static SEEN: Mutex<Vec<(GgmlType, usize)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+    for &(ty, k) in stacks {
+        if seen.contains(&(ty, k)) {
+            continue;
+        }
+        seen.push((ty, k));
+        let path = if qdot::fuses(ty, k) {
+            "fused"
+        } else {
+            "dequant_row"
+        };
+        eprintln!("load host_tier type={ty} k={k} path={path}");
+    }
+}
+
 /// One layer's routed experts as a host tier serves them: the three stacks,
 /// each with the shard that holds it, and the SwiGLU limit. Built once at
 /// load ([`HostLayer::build`]); a call cuts its experts' matrices from the
@@ -990,6 +1014,11 @@ impl HostLayer {
             // The per-expert cut: `expert_view`'s check, once, here.
             expert_view(t.info(), 0, spec.n_expert)?;
         }
+        announce_paths(&[
+            (gate.info().ty, spec.embd),
+            (up.info().ty, spec.embd),
+            (down.info().ty, spec.ff),
+        ]);
         Ok(HostLayer {
             gate,
             up,

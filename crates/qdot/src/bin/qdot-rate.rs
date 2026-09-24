@@ -17,6 +17,13 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
     for c in w.as_chunks_mut::<8>().0 {
         c.copy_from_slice(&next().to_le_bytes());
     }
+    // Every MXFP4 block's E8M0 byte into 112..127, as mxfp4_x4_rate.cpp does: raw bytes
+    // give e = 0 or 1, a subnormal f32 scale, in 2 blocks of 256 on average.
+    if ty == GgmlType::MXFP4 {
+        for b in w.as_chunks_mut::<17>().0 {
+            b[0] = 0x70 | (b[0] & 0x0f);
+        }
+    }
     let col: Vec<f32> = (0..k)
         .map(|i| (((i as i64 % 31) as f32) - 15.0) / 16.0)
         .collect();
@@ -57,4 +64,8 @@ fn main() {
     bench(GgmlType::Q5_1, 10944, (10944 / 32) * 24, rows);
     // V4.1 ffn_down_exps shape (layers 0 and 1): k = 2304 (9 x 176 B = 1584 B/row).
     bench(GgmlType::Q5_K, 2304, (2304 / 256) * 176, rows);
+    // V4-Flash ffn_gate/up_exps shape: k = 4096 (16 x 98 B = 1568 B/row).
+    bench(GgmlType::IQ3_XXS, 4096, (4096 / 256) * 98, rows);
+    // V4-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
+    bench(GgmlType::MXFP4, 2048, (2048 / 32) * 17, rows);
 }
