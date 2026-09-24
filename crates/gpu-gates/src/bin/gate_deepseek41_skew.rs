@@ -14,7 +14,11 @@
 //!   lists, and the history. Then (iv) the pair pass, the rollback of
 //!   position `p + 1`, and one step of another token `t2` (the runner-up
 //!   after `t`) against the steps `t`, `t2` in turn, bit for bit on the
-//!   same buffers.
+//!   same buffers; (v) the pair pass and a cut of both its positions, granted
+//!   exactly where the ring slots the step at `p` reads still hold their rows
+//!   (`step4`: the ring never wrapped) and refused where a restore would need
+//!   a shadow row of the injected history (`d1`), then `t`, `t2` against the
+//!   same two steps.
 //! - `--structure`: the pair pass captured holds, per node kind and per
 //!   kernel name, exactly twice the one-token step's capture, and nothing
 //!   else; its memory-operation batches come in the pass's order (both rows'
@@ -30,7 +34,16 @@
 //!   mode: `step_pair(t, t1)` after the set's prompt against `step(t)`,
 //!   `step(t1)`, and `step_pair` + `rollback` + `step(t2)` against `step(t)`,
 //!   `step(t2)`: logits and tokens bit for bit, the two captured graphs
-//!   (one-token and pair) replayed in one process.
+//!   (one-token and pair) replayed in one process. Then deep cuts: from a
+//!   reset, `m = 4·W + 7` positions (`d1`'s ids, then greedy ids, at `d1`'s
+//!   `top_k` so the indexer selects; a run whose logits repeat or stop being
+//!   finite fails, naming the first layer where it died), the
+//!   last one eagerly with every layer's `l_out` read; then cuts to `m − 2`,
+//!   `m − W`, `W/2` and 0 (each rounded down by `Body::keep_point`), each
+//!   followed by the taken-back tokens again: every re-fed position's argmax
+//!   and logits, the last position's `l_out` of every layer, and every
+//!   layer's caches and compressor state afterwards equal the uninterrupted
+//!   run's, bit for bit.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -53,7 +66,7 @@ mod gate {
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{Gpu, GpuError};
-    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS};
+    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, Seam};
     use bloomery_gpu_gates::oracle::deepseek41::{D1, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
@@ -158,6 +171,7 @@ mod gate {
         }
         if args.api {
             pass &= api(&mut m, &split, &hp)?;
+            pass &= cuts(&mut m, &mut heads[0], &split, &hp)?;
         }
         if !pass {
             return Err(checks_failed());
@@ -711,18 +725,45 @@ mod gate {
                 format!(" — {}", d.join(", "))
             }
         );
-        // The rollback's other arm: r = 1 needs nothing undone, which (ii)
-        // pins; a rollback of two positions is refused.
+        // (v) Both pair positions taken back. PIN(2026-09-24): a cut past the
+        // last position was refused outright until the ring gained its shadow;
+        // now it is granted where the ring slots the step at p reads hold
+        // their rows (step4: position 4, the ring never wrapped) and refused
+        // where it would restore one from a shadow row of the injected
+        // history (d1: rows 173 and 174, which positions 301 and 302 overwrote).
+        let grant = name == STEP4;
         inject(gpu, body, &set, &state)?;
         body.decode_pair(gpu.stream(), [t, t1], p)?;
-        let refused = body.rollback(p).is_err();
+        body.enqueue_pair(gpu, w, [&mut *ha, &mut *hb])?;
+        gpu.stream().synchronize()?;
+        let kept = body.keep_point(p as usize);
+        let granted = body.rollback(p).is_ok();
+        let ok_cut2 = if granted {
+            one_step(gpu, w, body, ha, t, p)?;
+            one_step(gpu, w, body, ha, t2, p + 1)?;
+            let row = row_out(gpu, body, 0, ha)?;
+            let caches = caches(gpu, body, hp.n_layer)?;
+            let mut d = diff_rows("row 0", &ref_row, &row);
+            d.extend(diff_caches(&ref_caches, &caches));
+            if !d.is_empty() {
+                println!("FAIL: set {name} pair + rollback({p}): {}", d.join(", "));
+            }
+            d.is_empty()
+        } else {
+            true
+        };
+        let ok_grant = granted == grant && (kept == p as usize) == grant;
         println!(
-            "set {name} rollback of both pair positions refused: {}",
-            verdict(refused)
+            "set {name} rollback of both pair positions ({p} after {}): keep_point {kept}, {} \
+             (pinned {}); then step(t) + step(t2) == step(t) + step(t2): {}",
+            p + 2,
+            if granted { "granted" } else { "refused" },
+            if grant { "granted" } else { "refused" },
+            verdict(ok_grant && ok_cut2)
         );
 
         body.set_indexer_top_k(gpu, hp.indexer.top_k)?;
-        Ok(ok_eager && ok_replay && ok_rollback && refused)
+        Ok(ok_eager && ok_replay && ok_rollback && ok_grant && ok_cut2)
     }
 
     // ------------------------------------------------------------ structure
@@ -1155,6 +1196,251 @@ mod gate {
             all &= ok_pair && ok_rb;
         }
         m.set_mode(StepMode::Graph);
+        Ok(all)
+    }
+    // ----------------------------------------------------------------- cuts
+
+    /// FNV-1a over 32-bit words: one number per tap a run keeps.
+    fn digest(words: &[u32]) -> u64 {
+        words.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &w| {
+            (h ^ u64::from(w)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// The digest [`logits_digest`] gives logits that hold a NaN or an
+    /// infinity.
+    fn nonfinite_mark() -> u64 {
+        u64::MAX
+    }
+
+    /// A logits row's digest, or [`nonfinite_mark`] when a value is not
+    /// finite.
+    fn logits_digest(logits: &[u32]) -> u64 {
+        if logits.iter().all(|&b| f32::from_bits(b).is_finite()) {
+            digest(logits)
+        } else {
+            nonfinite_mark()
+        }
+    }
+
+    /// What the last position of a run leaves: its argmax, its logits and
+    /// every layer's `l_out` (the streams after the MoE sub-layer), digested.
+    #[derive(PartialEq, Debug)]
+    struct LastStep {
+        token: u32,
+        logits: u64,
+        l_out: Vec<u64>,
+        /// The first seam whose streams hold a NaN or an infinity: its layer
+        /// and sub-layer.
+        first_nonfinite: Option<(usize, &'static str)>,
+    }
+
+    /// The step of `token` at `pos` on the body, eagerly, every layer's
+    /// `l_out` read at its seam.
+    fn observed_step(
+        m: &mut Deepseek41Model,
+        head: &mut Head,
+        token: u32,
+        pos: u32,
+    ) -> Result<LastStep, GateError> {
+        let (gpu, w, body) = m.body_parts("cuts")?;
+        let input = body.decode_input(token, pos)?;
+        body.refresh(gpu.stream(), &input)?;
+        let mut l_out = Vec::new();
+        let mut first_nonfinite = None;
+        body.enqueue_observed(gpu, w, head, &mut |gpu, seam| {
+            let (layer, what, streams) = match seam {
+                Seam::Engram { layer, streams, .. } => (layer, "engram", streams),
+                Seam::Attn { layer, streams, .. } => (layer, "attention", streams),
+                Seam::Ffn { layer, streams, .. } => (layer, "moe", streams),
+            };
+            gpu.stream().synchronize()?;
+            let v = bits(streams.to_host_vec(gpu.stream())?);
+            if first_nonfinite.is_none() && !v.iter().all(|&b| f32::from_bits(b).is_finite()) {
+                first_nonfinite = Some((layer, what));
+            }
+            if what == "moe" {
+                l_out.push(digest(&v));
+            }
+            Ok(())
+        })?;
+        gpu.stream().synchronize()?;
+        let logits = bits(head.logits_to_host(gpu)?);
+        Ok(LastStep {
+            token: top2(&logits).0,
+            logits: logits_digest(&logits),
+            l_out,
+            first_nonfinite,
+        })
+    }
+
+    /// Feed `tokens[from..]` through the engine in graph mode, all but the
+    /// last one step at a time and the last as [`observed_step`]: each
+    /// position's argmax and logits digest, and the last step.
+    fn feed(
+        m: &mut Deepseek41Model,
+        head: &mut Head,
+        tokens: &[u32],
+        from: usize,
+    ) -> Result<(Vec<(u32, u64)>, LastStep), GateError> {
+        let (&last, body) = tokens.split_last().ok_or("no tokens to feed")?;
+        let mut seen = Vec::with_capacity(tokens.len() - from);
+        for &t in &body[from..] {
+            let a = m.step(&[t])?;
+            seen.push((a, logits_digest(&bits(m.logits()?))));
+        }
+        let pos = u32::try_from(tokens.len() - 1)?;
+        Ok((seen, observed_step(m, head, last, pos)?))
+    }
+
+    /// The deep cuts ([`Body::keep_point`], [`Body::rollback`]) from a reset,
+    /// through the engine's entry in graph mode.
+    fn cuts(
+        m: &mut Deepseek41Model,
+        head: &mut Head,
+        split: &Split,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        // The d1 set's ids of text, then greedy ids, at d1's top_k, so every
+        // indexer layer selects once its stream holds more rows than that.
+        let set = open_set(split, hp, D1)?;
+        let w = hp.window;
+        let total = 4 * w + 7;
+        m.set_mode(StepMode::Graph);
+        {
+            let (gpu, _, body) = m.body_parts("cuts")?;
+            body.set_indexer_top_k(gpu, set.top_k)?;
+        }
+        m.reset()?;
+        // The uninterrupted run: the set's prompt and token, then greedy ids.
+        let mut tokens = set.before.clone();
+        tokens.push(set.token);
+        let mut first = Vec::with_capacity(total);
+        for &t in &tokens[..tokens.len() - 1] {
+            let a = m.step(&[t])?;
+            first.push((a, logits_digest(&bits(m.logits()?))));
+        }
+        while tokens.len() < total {
+            let a = m.step(&[*tokens.last().ok_or("no tokens")?])?;
+            first.push((a, logits_digest(&bits(m.logits()?))));
+            tokens.push(a);
+        }
+        let pos = u32::try_from(total - 1)?;
+        let last = observed_step(m, head, tokens[total - 1], pos)?;
+        let whole = {
+            let (gpu, _, body) = m.body_parts("cuts")?;
+            caches(gpu, body, hp.n_layer)?
+        };
+        let distinct = {
+            let mut d: Vec<u64> = first.iter().map(|&(_, h)| h).collect();
+            d.sort_unstable();
+            d.dedup();
+            d.len()
+        };
+        // Two positions with the same logits bits are a dead run (a NaN
+        // spreads to every later step alike), and a cut into it compares
+        // nothing.
+        let repeat = first
+            .iter()
+            .enumerate()
+            .find_map(|(i, x)| first[..i].iter().position(|y| y.1 == x.1).map(|j| (j, i)));
+        let dead = first.iter().position(|&(_, h)| h == nonfinite_mark());
+        println!(
+            "cuts: the run's first non-finite logits at {dead:?}, first repeated logits at {repeat:?}; \
+             tokens {:?} .. {:?}",
+            &tokens[..12],
+            &tokens[total - 12..]
+        );
+        if let Some((j, i)) = repeat.or(dead.map(|p| (p, p))) {
+            // Where the run dies: the two positions' streams layer by layer.
+            m.reset()?;
+            for &t in &tokens[..j] {
+                m.step(&[t])?;
+            }
+            let a = observed_step(m, head, tokens[j], u32::try_from(j)?)?;
+            m.rollback(u32::try_from(j)?)?;
+            m.step(&[tokens[j]])?;
+            for &t in &tokens[j + 1..i] {
+                m.step(&[t])?;
+            }
+            let b = observed_step(m, head, tokens[i], u32::try_from(i)?)?;
+            let same = a.l_out.iter().zip(&b.l_out).position(|(x, y)| x == y);
+            println!(
+                "FAIL: cuts: the uninterrupted run dies: positions {j} and {i} (tokens {} and {}) \
+                 leave the same l_out from layer {same:?} on; first non-finite streams {:?} and \
+                 {:?}",
+                tokens[j], tokens[i], a.first_nonfinite, b.first_nonfinite
+            );
+            let (gpu, _, body) = m.body_parts("cuts")?;
+            body.set_indexer_top_k(gpu, hp.indexer.top_k)?;
+            return Ok(false);
+        }
+        println!(
+            "cuts: {total} positions (window {w}, top_k {}): the set's {} prompt ids, then greedy; \
+             {distinct} distinct logits over the first {} positions; the last step reads {} l_out \
+             taps",
+            set.top_k,
+            set.before.len() + 1,
+            first.len(),
+            last.l_out.len()
+        );
+        let ratios: Vec<usize> = Planner::from_file(split, hp, CTX_MAX)?
+            .stream_ratios()
+            .iter()
+            .map(|&r| r as usize)
+            .collect();
+        let mut all = !last.l_out.is_empty() && dead.is_none() && repeat.is_none();
+        for n in [total - 2, total - w, w / 2, 0] {
+            let (kept, stale) = {
+                let (_, _, body) = m.body_parts("cuts")?;
+                (body.keep_point(n), body.history().len())
+            };
+            let want = (0..=n)
+                .rev()
+                .find(|k| ratios.iter().all(|&r| r == 0 || k % r == 0))
+                .unwrap_or(0);
+            m.rollback(u32::try_from(kept)?)?;
+            let (again, last_again) = feed(m, head, &tokens, kept)?;
+            let whole_again = {
+                let (gpu, _, body) = m.body_parts("cuts")?;
+                caches(gpu, body, hp.n_layer)?
+            };
+            let steps = again.as_slice() == &first[kept..];
+            let pairs = || again.iter().zip(&first[kept..]);
+            let tokens_off = pairs().filter(|(a, b)| a.0 != b.0).count();
+            let logits_off = pairs().filter(|(a, b)| a.1 != b.1).count();
+            let bad_at = pairs().position(|(a, b)| a != b).map(|i| kept + i);
+            let d = diff_caches(&whole, &whole_again);
+            let ok = kept == want && steps && last_again == last && d.is_empty();
+            println!(
+                "cuts: cut to {n} from {stale} kept {kept} (rounded down to every ratio \
+                 {ratios:?}: {want}); positions {kept}..{} again: argmax and logits {}{}, the \
+                 last step's token, logits and {} l_out taps {}, caches and compressor state {}: \
+                 {}",
+                total - 1,
+                if steps {
+                    "equal".to_string()
+                } else {
+                    format!("differ ({tokens_off} argmax, {logits_off} logits)")
+                },
+                bad_at.map_or(String::new(), |p| format!(" (first at {p})")),
+                last_again.l_out.len(),
+                if last_again == last {
+                    "equal"
+                } else {
+                    "differ"
+                },
+                if d.is_empty() {
+                    "equal".to_string()
+                } else {
+                    d.join(", ")
+                },
+                verdict(ok)
+            );
+            all &= ok;
+        }
+        let (gpu, _, body) = m.body_parts("cuts")?;
+        body.set_indexer_top_k(gpu, hp.indexer.top_k)?;
         Ok(all)
     }
 }

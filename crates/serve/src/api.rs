@@ -1056,7 +1056,7 @@ fn completion_final(
         "stop": true,
         "model": state.alias,
         "tokens_predicted": o.timings.predicted_n,
-        "tokens_evaluated": o.timings.prompt_n,
+        "tokens_evaluated": o.timings.n_prompt,
         "generation_settings": generation_settings(state, p),
         "prompt": prompt,
         "truncated": o.truncated,
@@ -1151,7 +1151,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
 }
 
 fn progress(t: &Timings) -> Value {
-    json!({ "total": t.prompt_n, "cache": t.cache_n, "processed": t.prompt_n, "time_ms": t.prompt_ms })
+    json!({ "total": t.n_prompt, "cache": t.cache_n, "processed": t.n_prompt, "time_ms": t.prompt_ms })
 }
 
 /// Ends a stream: validation errors before the first byte go out as a plain
@@ -1264,9 +1264,9 @@ fn parses_tools(b: &Map<String, Value>) -> bool {
 fn usage(o: &Outcome) -> Value {
     json!({
         "completion_tokens": o.timings.predicted_n,
-        "prompt_tokens": o.timings.prompt_n,
-        "total_tokens": o.timings.predicted_n + o.timings.prompt_n,
-        "prompt_tokens_details": { "cached_tokens": 0 },
+        "prompt_tokens": o.timings.n_prompt,
+        "total_tokens": o.timings.predicted_n + o.timings.n_prompt,
+        "prompt_tokens_details": { "cached_tokens": o.timings.cache_n },
     })
 }
 

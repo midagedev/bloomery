@@ -527,14 +527,19 @@ const GOLDEN_STREAM: &str = concat!(
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_no_tools_format_none_is_byte_identical() {
-    let addr = start(4096);
+    // Each request on a fresh slot, as the goldens were recorded: a second
+    // request on the same slot keeps its cached prefix (`cached_tokens`).
     for format in [json!({"reasoning_format": "none"}), json!({})] {
-        let r = post(addr, "/v1/chat/completions", &chat_body(format.clone()));
+        let r = post(
+            start(4096),
+            "/v1/chat/completions",
+            &chat_body(format.clone()),
+        );
         assert_eq!(mask(&r.body), GOLDEN, "{format}");
         let mut b = chat_body(format.clone());
         b["stream"] = json!(true);
         b["stream_options"] = json!({"include_usage": true});
-        let r = post(addr, "/v1/chat/completions", &b);
+        let r = post(start(4096), "/v1/chat/completions", &b);
         assert_eq!(mask(&r.body), GOLDEN_STREAM, "{format}");
     }
 }

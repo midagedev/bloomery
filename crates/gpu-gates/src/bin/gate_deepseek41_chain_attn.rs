@@ -1500,6 +1500,9 @@ mod gate {
         streams_out: DeviceBuffer<f32>,
         fold_out: DeviceBuffer<f32>,
         ring: DeviceTensor<u16>,
+        /// The ring's shadow, which the append writes and this gate does not
+        /// read.
+        shadow: DeviceTensor<u16>,
         /// Per stream: its rows, its index keys, above ratio 1 its ring, and
         /// the list its layers read the rows through.
         rows: Vec<DeviceTensor<u16>>,
@@ -1542,6 +1545,7 @@ mod gate {
                 streams_out: DeviceBuffer::zeroed(stream, 4 * hp.n_embd)?,
                 fold_out: DeviceBuffer::zeroed(stream, hp.n_embd)?,
                 ring: DeviceTensor::zeroed(stream, ctx.min(hp.window), hp.head_dim)?,
+                shadow: DeviceTensor::zeroed(stream, ctx, hp.head_dim)?,
                 rows,
                 keys,
                 comp_ring,
@@ -1557,6 +1561,7 @@ mod gate {
                 streams_out,
                 fold_out,
                 ring,
+                shadow,
                 rows,
                 keys,
                 comp_ring,
@@ -1570,6 +1575,7 @@ mod gate {
                     streams_out,
                     fold_out,
                     ring,
+                    shadow,
                     compressed: Compressed::None,
                     selection: Selection::None,
                 };
@@ -1606,6 +1612,7 @@ mod gate {
                 streams_out,
                 fold_out,
                 ring,
+                shadow,
                 compressed,
                 selection,
             }

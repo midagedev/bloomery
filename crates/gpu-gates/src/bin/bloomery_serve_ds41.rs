@@ -143,6 +143,7 @@ mod drive {
                     &mut std::io::stderr(),
                 )
             },
+            |m: &Deepseek41Model, n| m.body("bloomery-serve-ds41").map_or(0, |b| b.keep_point(n)),
             vocab,
             card,
         )?;

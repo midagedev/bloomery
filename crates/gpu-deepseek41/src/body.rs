@@ -5,7 +5,10 @@
 //! numbers:
 //!
 //! - per layer, the raw window ring: `min(ctx_max, window)` latent rows in
-//!   f16, the row of cell `c` in slot `c % window`;
+//!   f16, the row of cell `c` in slot `c % window`, and its shadow: `ctx_max`
+//!   rows of the same f16 bits, the row of cell `c` in row `c`, written by the
+//!   same append and read only when a cut restores the ring
+//!   ([`Body::rollback`]);
 //! - per layer that owns a compressor, its compressed rows (`⌈ctx_max /
 //!   ratio⌉` latent rows in f16) and, above ratio 1, its state: the `ratio`
 //!   latest latent projections in f32, values and scores (a ratio-1 group is
@@ -43,7 +46,8 @@
 //! the card runs the other's: each row has its own streams, folds, image
 //! copy and lists, and each piece its own row of the buffers a layer leaves
 //! for later; the caches are shared, written by row 0 before row 1 reads
-//! them. [`Body::rollback`] takes the last position back.
+//! them. [`Body::rollback`] cuts the positions back to any point
+//! [`Body::keep_point`] grants.
 //!
 //! [`ChainBody::seed_depth`] refuses: a synthetic depth would have to fill
 //! the rings, the compressed rows, the index keys and the states
@@ -56,7 +60,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, SlotMap, levers};
 use bloomery_gpu::model::{ChainBody, StepProbe};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, window};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use gguf::Split;
 use model::arch::Arch;
@@ -115,6 +119,8 @@ pub fn open(
 struct LayerKv {
     /// The raw window ring.
     ring: DeviceTensor<u16>,
+    /// The ring's shadow: one row per position, `ctx_max` rows.
+    shadow: DeviceTensor<u16>,
     /// The compressed rows of the stream the layer's compressor writes.
     rows: Option<DeviceTensor<u16>>,
     /// The index keys the layer owns.
@@ -141,6 +147,53 @@ impl LayerKv {
             ("state values", bytes_of(self.values.as_ref())),
             ("state scores", bytes_of(self.scores.as_ref())),
         ]
+    }
+
+    /// The shadow's device bytes: placement's `KvBytes::shadow_bytes`.
+    fn shadow_bytes(&self) -> usize {
+        self.shadow.buf().num_bytes()
+    }
+
+    /// Copy the shadow rows of `positions` into their ring slots, on
+    /// `stream`: device-to-device, at most two copies (one where the slots
+    /// wrap). `positions` ends at most at the shadow's rows and spans at most
+    /// the ring's.
+    fn restore(&mut self, stream: &CudaStream, positions: Range<usize>) -> Result<(), GpuError> {
+        let (slots, width) = (self.ring.rows(), self.ring.cols());
+        if positions.end > self.shadow.rows() || positions.len() > slots || width == 0 {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::rollback",
+                detail: format!(
+                    "a restore of positions {positions:?}: a shadow of {} rows, a ring of {slots}",
+                    self.shadow.rows()
+                ),
+            });
+        }
+        let bytes = |rows: usize| -> Result<u64, GpuError> {
+            u64::try_from(rows * width * size_of::<u16>()).map_err(|_| GpuError::Shape {
+                what: "deepseek41 Body::rollback",
+                detail: format!("{rows} rows pass u64 bytes"),
+            })
+        };
+        let mut q = positions.start;
+        while q < positions.end {
+            let slot = q % slots;
+            let n = (positions.end - q).min(slots - slot);
+            let src_at = self.shadow.buf().cu_deviceptr() + bytes(q)?;
+            let dst_at = self.ring.buf().cu_deviceptr() + bytes(slot)?;
+            // SAFETY: rows q .. q + n lie in the shadow (q + n <= positions.end
+            // <= shadow.rows(), checked above) and slots slot .. slot + n in the
+            // ring (n <= slots − slot); both are this layer's own allocations,
+            // borrowed for the copy, and the windows are never dropped.
+            let src = unsafe { window::<u16>(src_at, n * width, self.shadow.buf().context()) };
+            // SAFETY: as for `src`; the ring window is the only handle the copy
+            // writes through, and the stream orders it after every step that
+            // wrote either buffer.
+            let mut dst = unsafe { window::<u16>(dst_at, n * width, self.ring.buf().context()) };
+            dst.copy_from_device_async(&src, stream)?;
+            q += n;
+        }
+        Ok(())
     }
 
     fn zero(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
@@ -310,6 +363,16 @@ pub struct Body {
     rows: StepRows,
     /// The tokens decoded so far, one per position: `ctx_max` reserved.
     history: Vec<u32>,
+    /// Which position's row each ring slot and each compressor state slot
+    /// holds, as the steps refreshed since the last known state left them.
+    holds: Holds,
+    /// The first position whose shadow row a step of the current history
+    /// wrote: rows below it hold nothing a cut may restore (a caller wrote
+    /// the caches itself, [`Body::set_history`]).
+    shadow_from: usize,
+    /// A cut left ring slots the next step reads holding other positions'
+    /// rows: the next refresh restores them before the step runs.
+    restore: bool,
     /// The file, for the tensors the plan leaves on the host: the one
     /// mapping the host tier reads and the load populated.
     file: Arc<Split>,
@@ -343,6 +406,14 @@ impl Body {
     pub fn state_bytes(&self, layer: usize) -> Option<usize> {
         self.state_buffers(layer)
             .map(|b| b.iter().map(|&(_, n)| n).sum())
+    }
+
+    /// Layer `layer`'s ring shadow bytes — the figure `KvLayout::shadow_bytes`
+    /// plans for the layer; `None` for a layer this card does not run.
+    #[must_use]
+    pub fn shadow_bytes(&self, layer: usize) -> Option<usize> {
+        let i = layer.checked_sub(self.layers.start)?;
+        self.kv.get(i).map(LayerKv::shadow_bytes)
     }
 
     /// Layer `layer`'s cache and compressor buffers, for a caller that writes
@@ -520,7 +591,9 @@ impl Body {
 
     /// The tokens before the next step, for a caller that has written the
     /// state they leave into the buffers itself ([`Body::state_mut`]): the
-    /// next [`ChainBody::decode_input`] runs at position `history.len()`.
+    /// next [`ChainBody::decode_input`] runs at position `history.len()`. The
+    /// ring shadow holds none of those positions, so no cut reaches a ring
+    /// row below them.
     pub fn set_history(&mut self, history: &[u32]) -> Result<(), GpuError> {
         if history.len() >= self.positions() {
             return Err(GpuError::Shape {
@@ -534,6 +607,9 @@ impl Body {
         }
         self.history.clear();
         self.history.extend_from_slice(history);
+        self.holds.known(history.len());
+        self.shadow_from = history.len();
+        self.restore = false;
         Ok(())
     }
 
@@ -689,26 +765,69 @@ impl Body {
         Ok(())
     }
 
+    /// The longest prefix of at most `n` positions the caches can be cut back
+    /// to ([`Body::rollback`]): every position when `n` reaches them all, 0
+    /// when nothing shorter can be kept.
+    ///
+    /// - A compressed stream of ratio `r` keeps its state ring in slot `p %
+    ///   r`, and the group of positions `g .. g + r` (`g` a multiple of `r`)
+    ///   reads the ring's rows of the positions before the step that
+    ///   completes it. A cut to `n` inside a group (`g < n`) needs those of
+    ///   `g .. n`, and a later step of the same residue may have overwritten
+    ///   them. So `n` is rounded down until, for every ratio, it starts a
+    ///   group or the state ring still holds `g .. n` ([`Holds`]). With
+    ///   V4.1's ratios 2 and 1 after a plain run of `len` positions: `n` is
+    ///   kept when it is even or `len − 1`, else `n − 1`.
+    /// - The raw window ring: the step at `n` reads the rows of `n + 1 −
+    ///   slots ..= n − 1`; the slots of those that hold another position's
+    ///   row ([`Holds::stale`]) are restored from the shadow, which holds the
+    ///   rows of positions from `shadow_from` on. A cut that needs a row below
+    ///   that keeps nothing.
+    /// - Compressed rows, index keys and lists are indexed by position and
+    ///   written by the step that completes them, and a step reads only the
+    ///   ones below its own position, so whatever stands at or past the cut
+    ///   is never read before it is written again. The engram history is the
+    ///   token history, truncated.
+    #[must_use]
+    pub fn keep_point(&self, n: usize) -> usize {
+        let len = self.history.len();
+        if n >= len {
+            return len;
+        }
+        let mut k = n;
+        while k > 0 && !self.holds.state_keeps(k) {
+            k -= 1;
+        }
+        if self.holds.stale(k).any(|q| q < self.shadow_from) {
+            return 0;
+        }
+        k
+    }
+
     /// Take back the tokens from position `pos` on: the next step runs at
-    /// `pos`. At most the last position can go. The caches need nothing
-    /// undone — the step at `pos` again writes its own ring slot,
-    /// compressed row and index key before anything reads them, reads no
-    /// state slot the step it replaces wrote (a compressor keeps position
-    /// `pos`'s projection in the slot of `pos`'s residue, which its group
-    /// reads only after that step's own persist), and every row, key and
-    /// list at or past `pos` lies outside what a step before it sees.
+    /// `pos`, and the step there and every step after it write what they
+    /// did before, bit for bit. `pos` must be a point [`Body::keep_point`]
+    /// grants. The ring slots the step at `pos` reads that hold later rows
+    /// are restored from the shadow by the next refresh, on the engine
+    /// stream and outside any graph (this call has no stream); nothing else
+    /// on the device is touched.
     pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
         let (to, len) = (pos as usize, self.history.len());
-        if to > len || len - to > 1 {
+        let kept = self.keep_point(to);
+        if to > len || kept != to {
             return Err(GpuError::Shape {
                 what: "deepseek41 Body::rollback",
                 detail: format!(
-                    "back to position {pos} after {len} tokens: only the last position can be \
-                     taken back"
+                    "back to position {pos} after {len} tokens: the caches can be cut back to \
+                     {kept} at most there (see Body::keep_point)"
                 ),
             });
         }
-        self.history.truncate(to);
+        if to < len {
+            self.history.truncate(to);
+            self.shadow_from = self.shadow_from.min(to);
+            self.restore = self.holds.stale(to).next().is_some();
+        }
         Ok(())
     }
 
@@ -731,6 +850,17 @@ impl Body {
                 ),
             });
         }
+        let pos = input.pos as usize;
+        if self.restore {
+            for run in self.holds.stale_runs(pos) {
+                for layer in &mut self.kv {
+                    layer.restore(stream, run.clone())?;
+                }
+                run.for_each(|q| self.holds.ring_wrote(q));
+            }
+            self.restore = false;
+        }
+        self.holds.wrote(pos);
         let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
             what: WHAT,
             missing: "the row's buffers",
@@ -868,7 +998,12 @@ impl Parts<'_> {
         })?;
         let (streams_in, streams_out) = ping(&mut lane.hc, cur.s);
         let (fold_in, fold_out) = ping(&mut lane.folds, cur.f);
-        let (ring, compressed, selection) = layer_io(self.kv, lists, i, &step)?;
+        let LayerIo {
+            ring,
+            shadow,
+            compressed,
+            selection,
+        } = layer_io(self.kv, lists, i, &step)?;
         self.attn.enqueue_layer_of(
             gpu,
             w,
@@ -880,6 +1015,7 @@ impl Parts<'_> {
                 streams_out: streams_out.buf_mut(),
                 fold_out,
                 ring,
+                shadow,
                 compressed,
                 selection,
             },
@@ -1005,7 +1141,7 @@ fn layer_io<'a>(
     lists: &'a mut [DeviceBuffer<u32>],
     i: usize,
     step: &LayerStep,
-) -> Result<(&'a mut DeviceTensor<u16>, Compressed<'a>, Selection<'a>), GpuError> {
+) -> Result<LayerIo<'a>, GpuError> {
     let refuse = |detail: &'static str| GpuError::State {
         what: "deepseek41 Body::enqueue_chain",
         missing: detail,
@@ -1026,23 +1162,24 @@ fn layer_io<'a>(
             list: lists.get_mut(list).ok_or(refuse("the layer's list"))?,
         },
     };
-    let (ring, compressed) = match step.rows {
-        RowsOf::None => (&mut rest[0].ring, Compressed::None),
+    let LayerKv {
+        ring,
+        shadow,
+        rows,
+        keys,
+        values,
+        scores,
+    } = rest.first_mut().ok_or(refuse("the layer's cache"))?;
+    let compressed = match step.rows {
+        RowsOf::None => Compressed::None,
         RowsOf::Reads(src) => {
             let rows = before
                 .get(src)
                 .and_then(|k| k.rows.as_ref())
                 .ok_or(refuse("the source layer's compressed rows"))?;
-            (&mut rest[0].ring, Compressed::Read(rows))
+            Compressed::Read(rows)
         }
         RowsOf::Source => {
-            let LayerKv {
-                ring,
-                rows,
-                keys,
-                values,
-                scores,
-            } = &mut rest[0];
             let rows = rows
                 .as_mut()
                 .ok_or(refuse("the layer's own compressed rows"))?;
@@ -1050,17 +1187,110 @@ fn layer_io<'a>(
                 (Some(v), Some(sc)) => Some((v, sc)),
                 _ => None,
             };
-            (
-                ring,
-                Compressed::Source(SourceIo {
-                    rows,
-                    keys: keys.as_mut(),
-                    ring: state,
-                }),
-            )
+            Compressed::Source(SourceIo {
+                rows,
+                keys: keys.as_mut(),
+                ring: state,
+            })
         }
     };
-    Ok((ring, compressed, selection))
+    Ok(LayerIo {
+        ring,
+        shadow,
+        compressed,
+        selection,
+    })
+}
+
+/// The host's record of which position's row each cache slot that a later
+/// position overwrites holds — the raw window ring's `slots` and each
+/// compressed stream's state ring of `ratio` — every layer alike, since every
+/// step writes every layer's slots. [`Body::keep_point`] reads it.
+struct Holds {
+    ring: Vec<Option<usize>>,
+    /// Per stream of the plan, above ratio 1: its ratio and its slots.
+    states: Vec<(usize, Vec<Option<usize>>)>,
+}
+
+impl Holds {
+    fn new(slots: usize, ratios: &[u32]) -> Holds {
+        Holds {
+            ring: vec![None; slots],
+            states: ratios
+                .iter()
+                .map(|&r| r as usize)
+                .filter(|&r| r > 1)
+                .map(|r| (r, vec![None; r]))
+                .collect(),
+        }
+    }
+
+    /// The caches as a run of `len` positions from a reset leaves them.
+    fn known(&mut self, len: usize) {
+        self.ring.fill(None);
+        for (_, s) in &mut self.states {
+            s.fill(None);
+        }
+        let back = self
+            .states
+            .iter()
+            .map(|&(r, _)| r)
+            .fold(self.ring.len(), usize::max);
+        for q in len.saturating_sub(back)..len {
+            self.wrote(q);
+        }
+    }
+
+    /// The step at `p` writes its ring slot and its state slots.
+    fn wrote(&mut self, p: usize) {
+        self.ring_wrote(p);
+        for (r, s) in &mut self.states {
+            s[p % *r] = Some(p);
+        }
+    }
+
+    fn ring_wrote(&mut self, p: usize) {
+        let n = self.ring.len();
+        if n > 0 {
+            self.ring[p % n] = Some(p);
+        }
+    }
+
+    /// Whether every state ring still holds the positions the group of `n`
+    /// reads from it: those of `g .. n`, `g` the group's start.
+    fn state_keeps(&self, n: usize) -> bool {
+        self.states.iter().all(|(r, s)| {
+            let g = n - n % r;
+            (g..n).all(|q| s[q % r] == Some(q))
+        })
+    }
+
+    /// The positions the step at `n` reads from the ring, `n + 1 − slots ..=
+    /// n − 1`, whose slot holds another position's row.
+    fn stale(&self, n: usize) -> impl Iterator<Item = usize> + '_ {
+        let slots = self.ring.len();
+        ((n + 1).saturating_sub(slots)..n).filter(move |&q| self.ring[q % slots] != Some(q))
+    }
+
+    /// [`Holds::stale`] as runs of consecutive positions.
+    fn stale_runs(&self, n: usize) -> Vec<Range<usize>> {
+        let mut runs: Vec<Range<usize>> = Vec::new();
+        for q in self.stale(n) {
+            match runs.last_mut() {
+                Some(r) if r.end == q => r.end = q + 1,
+                _ => runs.push(q..q + 1),
+            }
+        }
+        runs
+    }
+}
+
+/// A layer's caches as [`layer_io`] lends them to its attention.
+struct LayerIo<'a> {
+    ring: &'a mut DeviceTensor<u16>,
+    shadow: &'a mut DeviceTensor<u16>,
+    compressed: Compressed<'a>,
+    selection: Selection<'a>,
 }
 
 impl ChainBody for Body {
@@ -1135,7 +1365,8 @@ impl ChainBody for Body {
 
     /// Every ring, compressed row, index key, compressor state, and every
     /// row's streams, folds and lists are zeroed in place — a captured chain
-    /// keeps their addresses — and the token history is emptied.
+    /// keeps their addresses — and the token history is emptied. The ring
+    /// shadows are not: a cut reads only shadow rows a step since wrote.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         for layer in &mut self.kv {
@@ -1153,6 +1384,9 @@ impl ChainBody for Body {
             l.zero_async(stream)?;
         }
         self.history.clear();
+        self.holds.known(0);
+        self.shadow_from = 0;
+        self.restore = false;
         Ok(())
     }
 
@@ -1181,8 +1415,7 @@ impl ChainBody for Body {
         let caches: usize = self
             .kv
             .iter()
-            .flat_map(|l| l.buffers())
-            .map(|(_, n)| n)
+            .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>() + l.shadow_bytes())
             .sum();
         caches + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
     }
@@ -1311,6 +1544,10 @@ impl ChainBody for Body {
         let file = Arc::new(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone())?;
         let hybrid = Hybrid::new(boundary, host, layers.len())?;
+        let holds = Holds::new(
+            kv.first().map_or(0, |k| k.ring.rows()),
+            planner.stream_ratios(),
+        );
 
         Ok(Body {
             layers,
@@ -1328,6 +1565,9 @@ impl ChainBody for Body {
             plan: StepPlan::default(),
             rows,
             history: Vec::with_capacity(ctx_max),
+            holds,
+            shadow_from: 0,
+            restore: false,
             file,
             eps: hp.rms_eps,
         })
@@ -1474,7 +1714,8 @@ fn layer_steps(
     Ok(steps)
 }
 
-/// Layer `l`'s buffers at `ctx_max` positions: its window ring; its
+/// Layer `l`'s buffers at `ctx_max` positions: its window ring and the
+/// ring's shadow, `ctx_max` rows of the ring's width; its
 /// compressed rows when it owns a compressor, and its state when that
 /// compressor's ratio is above 1; its index keys when it owns them. A
 /// compressor or index keys on a layer that attends no stream have no ratio
@@ -1499,6 +1740,7 @@ fn layer_kv(
             })
     };
     let ring = DeviceTensor::zeroed(stream, ctx_max.min(hp.window), latent)?;
+    let shadow = DeviceTensor::zeroed(stream, ctx_max, latent)?;
     let (rows, values, scores) = match kind.compressor {
         Some(_) => {
             let r = ratio()?;
@@ -1526,6 +1768,7 @@ fn layer_kv(
     };
     Ok(LayerKv {
         ring,
+        shadow,
         rows,
         keys,
         values,

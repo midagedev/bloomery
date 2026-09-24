@@ -6,8 +6,10 @@
 //! cache already holds and the engine can keep ([`Engine::keepable`]): `cut(k)`,
 //! or `reset` when `k` is 0; then `prefill(ids[k..n-1])`, and `next(ids[n-1])`
 //! yields the first generated token and every later `next(prev)` the one after
-//! it. `tokens_evaluated` and `prompt_n` still count the whole prompt,
-//! `ids.len()`; `timings.cache_n` is `k`.
+//! it. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` are
+//! `k`, `timings.prompt_n` is the `n − k` ids evaluated, and
+//! `tokens_evaluated` and `usage.prompt_tokens` count the whole prompt, `n`, as
+//! llama-server's do.
 //!
 //! Any `EngineError` is fatal to the server: the request that met it gets a 500,
 //! `/health` answers 503, and [`crate::Server::run`] returns the error so the

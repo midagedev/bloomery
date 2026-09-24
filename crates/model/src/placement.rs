@@ -152,6 +152,13 @@ pub struct Machine {
 /// An architecture's KV cache size: the bytes `layer` holds at `ctx_max` tokens.
 pub trait KvBytes {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64;
+    /// Bytes beside the cache that `layer` holds so the cache can be cut back:
+    /// a copy of a ring that overwrites its rows. The plan counts them in the
+    /// card's KV term. The default is none.
+    fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        let _ = (layer, ctx_max);
+        0
+    }
 }
 
 /// Where a segment lives.
@@ -599,7 +606,10 @@ pub struct CardTotals {
     pub rounding_bytes: u64,
     /// Experts held, summed over the card's layers.
     pub experts: u64,
+    /// The cache and its shadow ([`KvBytes`]).
     pub kv_bytes: u64,
+    /// The shadow's part of `kv_bytes`.
+    pub shadow_bytes: u64,
     pub scratch_bytes: u64,
     pub context_bytes: u64,
     /// usable − dense − experts − rounding − KV − scratch − context, usable
@@ -1232,11 +1242,17 @@ pub fn plan_with<'a>(
     let mut n_l = vec![0u64; model.layers];
     let mut kv_bytes = Vec::with_capacity(machine.cards.len());
     for (c, card) in machine.cards.iter().enumerate() {
+        let shadow: u64 = card
+            .layers
+            .clone()
+            .map(|l| kv.shadow_bytes(l, ctx_max))
+            .sum();
         let kv_card: u64 = card
             .layers
             .clone()
             .map(|l| kv.layer_bytes(l, ctx_max))
-            .sum();
+            .sum::<u64>()
+            + shadow;
         let budget = i128::from(capped(card, card_budget))
             - i128::from(kv_card)
             - i128::from(card.context_bytes)
@@ -1251,7 +1267,7 @@ pub fn plan_with<'a>(
         spread(&mut n_l, &eligible, model.experts, budget, |n| {
             footprint(card.granule_bytes, &uploads, n)
         })?;
-        kv_bytes.push(kv_card);
+        kv_bytes.push((kv_card, shadow));
     }
     for (l, stacks) in routed.iter().enumerate() {
         if stacks.is_empty() {
@@ -1319,7 +1335,7 @@ fn totals<'a>(
     machine: &'a Machine,
     ctx_max: u64,
     rows: Vec<Row>,
-    kv_bytes: &[u64],
+    kv_bytes: &[(u64, u64)],
     n_l: Vec<u64>,
     card_budget: Option<u64>,
 ) -> Plan<'a> {
@@ -1359,13 +1375,15 @@ fn totals<'a>(
         .enumerate()
         .map(|(c, (card, heap))| {
             let rounding = heap.taken - (card_dense[c] + card_experts[c]);
-            let used = heap.taken + kv_bytes[c] + card.scratch_bytes + card.context_bytes;
+            let (kv, shadow) = kv_bytes[c];
+            let used = heap.taken + kv + card.scratch_bytes + card.context_bytes;
             CardTotals {
                 dense_bytes: card_dense[c],
                 expert_bytes: card_experts[c],
                 rounding_bytes: rounding,
                 experts: card.layers.clone().map(|l| n_l[l]).sum(),
-                kv_bytes: kv_bytes[c],
+                kv_bytes: kv,
+                shadow_bytes: shadow,
                 scratch_bytes: card.scratch_bytes,
                 context_bytes: card.context_bytes,
                 headroom_bytes: i128::from(capped(card, card_budget)) - i128::from(used),

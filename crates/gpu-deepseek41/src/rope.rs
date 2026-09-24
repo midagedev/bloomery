@@ -12,8 +12,9 @@
 //!   heads, the attention output (with a [`Direction::Back`] table), the
 //!   pooled compressed rows, the index keys and the indexer query;
 //! - [`RopeKernels::enqueue_kv_norm_rope_append`] is a token's latent K/V row
-//!   in one launch: its norm, its tail rope, the row in f32 and its f16 slot
-//!   in the layer's raw window ring.
+//!   in one launch: its norm, its tail rope, the row in f32, its f16 slot
+//!   in the layer's raw window ring and the same f16 row at its position in
+//!   the layer's shadow of that ring.
 //!
 //! Numeric contract: the table is ggml's recipe as ik's CPU build compiles it
 //! ([`ggml_rope_cache`]), and every rotation rounds each product and each sum
@@ -104,12 +105,14 @@ mod rope_kernels {
     /// `n_dims` values by token `t`'s table through `rope_pair_rn`. The row
     /// is stored in f32 at `out[t·width ..]` and rounded once to f16
     /// (`f32_to_f16_bits`, round to nearest even) into slot `pos[t] %
-    /// window` of the ring `cache` (`window` rows of `width`). `width` a
-    /// positive multiple of 32, `n_dims` even and at most `width` and
+    /// window` of the ring `cache` (`window` rows of `width`), and the same
+    /// bits into row `pos[t]` of `shadow` (`rows` rows of `width`, one per
+    /// position; a position at or past `rows` writes no shadow row). `width`
+    /// a positive multiple of 32, `n_dims` even and at most `width` and
     /// `2·RMS_THREADS` (host-checked); the tokens of one launch land in
     /// distinct slots (host-checked as `m <= window` — the caller's
-    /// positions are consecutive). The token guard is block-uniform, so no
-    /// barrier and no warp collective is skipped.
+    /// positions are consecutive). The token guard and the shadow guard are
+    /// block-uniform, so no barrier and no warp collective is skipped.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -125,7 +128,8 @@ mod rope_kernels {
             cs.len() >= m * n_dims,
             pos.len() >= m,
             out.len() >= m * width,
-            cache.len() >= window * width
+            cache.len() >= window * width,
+            shadow.len() >= rows * width
         )
     )]
     pub fn ds41_kv_norm_rope_append(
@@ -137,9 +141,11 @@ mod rope_kernels {
         width: u32,
         n_dims: u32,
         window: u32,
+        rows: u32,
         m: u32,
         mut out: DisjointSlice<f32>,
         mut cache: DisjointSlice<u16>,
+        mut shadow: DisjointSlice<u16>,
     ) {
         static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
 
@@ -183,8 +189,11 @@ mod rope_kernels {
         let scale = rms_scale(rms_warp_tree(sums), width, eps);
 
         // SAFETY: t < m <= pos.len() by the launch contract.
-        let slot = (unsafe { *pos.get_unchecked(t) } % window) as usize;
+        let p = unsafe { *pos.get_unchecked(t) };
+        let slot = (p % window) as usize;
         let crow = slot * k;
+        let shadowed = p < rows;
+        let srow = p as usize * k;
 
         // The values before the tail: normalized, stored twice.
         let mut it = tid;
@@ -193,10 +202,19 @@ mod rope_kernels {
             // and the kv read and out write as base + it < m·width; the
             // cache slot is crow + it < (slot + 1)·width <= window·width <=
             // cache.len() because slot < window. One thread per value.
-            unsafe {
+            let h = unsafe {
                 let nv = (scale * *gain.get_unchecked(it)) * *kv.get_unchecked(base + it);
                 *out.get_unchecked_mut(base + it) = nv;
-                *cache.get_unchecked_mut(crow + it) = f32_to_f16_bits(nv);
+                let h = f32_to_f16_bits(nv);
+                *cache.get_unchecked_mut(crow + it) = h;
+                h
+            };
+            if shadowed {
+                // SAFETY: p < rows, so srow + it < (p + 1)·width <= rows·width
+                // <= shadow.len() by the contract. One thread per value.
+                unsafe {
+                    *shadow.get_unchecked_mut(srow + it) = h;
+                }
             }
             it += RMS_THREADS;
         }
@@ -217,14 +235,24 @@ mod rope_kernels {
                 )
             };
             let (y0, y1) = rope_pair_rn(n0, n1, c, s);
+            let (h0, h1) = (f32_to_f16_bits(y0), f32_to_f16_bits(y1));
             // SAFETY: the out positions are the kv positions above, inside
             // m·width; the cache positions crow + j + 1 < (slot + 1)·width <=
             // cache.len(). This thread owns the pair.
             unsafe {
                 *out.get_unchecked_mut(base + j) = y0;
                 *out.get_unchecked_mut(base + j + 1) = y1;
-                *cache.get_unchecked_mut(crow + j) = f32_to_f16_bits(y0);
-                *cache.get_unchecked_mut(crow + j + 1) = f32_to_f16_bits(y1);
+                *cache.get_unchecked_mut(crow + j) = h0;
+                *cache.get_unchecked_mut(crow + j + 1) = h1;
+            }
+            if shadowed {
+                // SAFETY: p < rows, so srow + j + 1 < (p + 1)·width <=
+                // rows·width <= shadow.len() by the contract. This thread owns
+                // the pair.
+                unsafe {
+                    *shadow.get_unchecked_mut(srow + j) = h0;
+                    *shadow.get_unchecked_mut(srow + j + 1) = h1;
+                }
             }
         }
     }
@@ -245,8 +273,9 @@ pub struct TailShape {
 /// [`RopeKernels::enqueue_kv_norm_rope_append`]'s arguments. `kv` holds `m`
 /// rows of the ring's width (the `kv_b` projection, token-major), `gain` the
 /// row's norm weights, `cs` `m` tables of `n_dims` ([`RopeTable::push`]),
-/// `pos` the `m` positions on the device; `out` takes the rows in f32 and
-/// `cache` is the layer's raw window ring, `window` rows of `width` f16.
+/// `pos` the `m` positions on the device; `out` takes the rows in f32,
+/// `cache` is the layer's raw window ring, `window` rows of `width` f16, and
+/// `shadow` its shadow, one row of `width` f16 per position.
 pub struct KvAppendArgs<'a> {
     pub kv: &'a DeviceBuffer<f32>,
     pub gain: &'a DeviceBuffer<f32>,
@@ -257,6 +286,7 @@ pub struct KvAppendArgs<'a> {
     pub m: usize,
     pub out: &'a mut DeviceBuffer<f32>,
     pub cache: &'a mut DeviceTensor<u16>,
+    pub shadow: &'a mut DeviceTensor<u16>,
 }
 
 /// The loaded rope module. Owns no stream: each enqueue takes the engine
@@ -337,9 +367,10 @@ impl RopeKernels {
 
     /// Enqueue the latent K/V rows of `args.m` tokens: norm, tail rope, the
     /// f32 rows into `out` and each row's f16 into ring slot `pos % window`
-    /// (`window = cache.rows()`, `width = cache.cols()`). `m <= window`, so
-    /// consecutive positions land in distinct slots. Asynchronous,
-    /// allocation-free, capturable.
+    /// (`window = cache.rows()`, `width = cache.cols()`) and into shadow row
+    /// `pos` (`shadow` of the ring's width). `m <= window`, so consecutive
+    /// positions land in distinct slots. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_kv_norm_rope_append(
         &self,
         stream: &CudaStream,
@@ -356,8 +387,18 @@ impl RopeKernels {
             m,
             out,
             cache,
+            shadow,
         } = args;
         let (window, width) = (cache.rows(), cache.cols());
+        if shadow.cols() != width {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "the shadow's rows are {} wide, the ring's {width}",
+                    shadow.cols()
+                ),
+            });
+        }
         if width == 0 || !width.is_multiple_of(32) {
             return Err(GpuError::Shape {
                 what,
@@ -409,6 +450,7 @@ impl RopeKernels {
         let width = launch_u32(what, "width", width)?;
         let n_dims = launch_u32(what, "n_dims", n_dims)?;
         let window = launch_u32(what, "window", window)?;
+        let rows = launch_u32(what, "rows", shadow.rows())?;
         let m = launch_u32(what, "m", m)?;
         let prep = self
             .module
@@ -424,9 +466,11 @@ impl RopeKernels {
             width,
             n_dims,
             window,
+            rows,
             m,
             out,
             cache.buf_mut(),
+            shadow.buf_mut(),
         )?;
         Ok(())
     }

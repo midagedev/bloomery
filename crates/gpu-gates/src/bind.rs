@@ -10,14 +10,15 @@
 //! handle that sends it commands. The opener comes in as a closure because
 //! this library does not name a device crate (see [`crate::generate`]).
 //!
-//! A request's cached prefix is kept only when it reaches the last position
-//! the cache holds or the one before it ([`Ds41Engine`]'s `keepable`); any
-//! shorter prefix is a reset.
+//! How long a prefix of the cache can be kept is the body's rule, which the
+//! opener hands in beside the model ([`Ds41Engine::spawn`]'s `keep`) and the
+//! engine thread answers ([`Ds41Engine`]'s `keepable`).
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
+use bloomery_gpu::GpuModel;
 use bloomery_gpu::model::ChainBody;
 use sampler::{Sampler, SamplerParams};
 use serve::{Decoder, Engine, EngineError, SamplerFactory, SamplingParams, Tokenizer};
@@ -170,10 +171,13 @@ enum Cmd {
     Reset,
     /// Take back the positions from this one on.
     Rollback(u32),
+    /// The longest prefix of at most this many positions a rollback keeps.
+    Keep(usize),
 }
 
-/// Its answer: the argmax and the logits of a `Next`, and the position it
-/// stands at afterwards (the position it failed at, on an error).
+/// Its answer: the argmax and the logits of a `Next` (the kept length of a
+/// `Keep`), and the position it stands at afterwards (the position it failed
+/// at, on an error).
 struct Reply {
     result: Result<(u32, Option<Vec<f32>>), String>,
     pos: usize,
@@ -192,12 +196,20 @@ pub struct Ds41Engine {
 
 impl Ds41Engine {
     /// Start the engine thread, open the model on it with `open` (which
-    /// writes the load lines), and wait until it is loaded. `card` names the
+    /// writes the load lines), and wait until it is loaded. `keep` is the
+    /// body's rule for `keepable`: the longest prefix of at most `n` positions
+    /// the model's rollback keeps, from where it stands. `card` names the
     /// device in a crash report.
-    pub fn spawn<B, F>(open: F, vocab: Arc<Vocab>, card: String) -> Result<Ds41Engine, GateError>
+    pub fn spawn<B, F, K>(
+        open: F,
+        keep: K,
+        vocab: Arc<Vocab>,
+        card: String,
+    ) -> Result<Ds41Engine, GateError>
     where
         B: ChainBody + 'static,
         F: FnOnce() -> Result<Generator<B>, GateError> + Send + 'static,
+        K: Fn(&GpuModel<B>, usize) -> usize + Send + 'static,
     {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
@@ -217,7 +229,12 @@ impl Ds41Engine {
                     return;
                 }
                 for cmd in cmds {
-                    let result = serve_cmd(&mut g, cmd, n_vocab);
+                    let result = match cmd {
+                        Cmd::Keep(n) => u32::try_from(keep(g.model(), n))
+                            .map(|k| (k, None))
+                            .map_err(|_| format!("a kept prefix of at most {n} passes u32")),
+                        cmd => serve_cmd(&mut g, cmd, n_vocab),
+                    };
                     if replies
                         .send(Reply {
                             result,
@@ -246,16 +263,20 @@ impl Ds41Engine {
     }
 
     fn call(&mut self, cmd: Cmd) -> Result<(u32, Option<Vec<f32>>), EngineError> {
+        let reply = self.ask(cmd)?;
+        self.pos = reply.pos;
+        reply.result.map_err(EngineError)
+    }
+
+    /// One command and its reply, the position left to the caller.
+    fn ask(&self, cmd: Cmd) -> Result<Reply, EngineError> {
         let sent = self.tx.as_ref().map(|tx| tx.send(cmd));
         if !matches!(sent, Some(Ok(()))) {
             return Err(EngineError("the engine thread is gone".to_owned()));
         }
-        let reply = self
-            .rx
+        self.rx
             .recv()
-            .map_err(|_| EngineError("the engine thread ended mid-call".to_owned()))?;
-        self.pos = reply.pos;
-        reply.result.map_err(EngineError)
+            .map_err(|_| EngineError("the engine thread ended mid-call".to_owned()))
     }
 }
 
@@ -304,6 +325,9 @@ fn serve_cmd<B: ChainBody>(
             .rollback(pos)
             .map(|()| (0, None))
             .map_err(|e| format!("rollback to position {pos} from {at}: {e}")),
+        Cmd::Keep(n) => Err(format!(
+            "a keep query of {n} reached the step loop; the engine thread answers it"
+        )),
     }
 }
 
@@ -339,30 +363,20 @@ impl Engine for Ds41Engine {
         self.call(Cmd::Reset).map(|_| ())
     }
 
-    /// The whole cache, or all of it but the last position. The raw window
-    /// is a ring: the row of position `c` lives in slot `c % window`, and the
-    /// step at `n` reads the rows of `max(0, n + 1 − window) ..= n − 1`.
-    /// Once the cache has held `m > max(window, n + 1)` positions, the first
-    /// of those slots holds a later position's row, and no re-step brings the
-    /// old row back (its own window was overwritten the same way). A
-    /// compressor's state ring (slot `p % ratio`) loses its group's earlier
-    /// positions the same way. The body's rollback takes back exactly the
-    /// last position; a prefix of a cache that never wrapped its ring is not
-    /// granted either.
+    /// The body's rule, asked on the engine thread (`spawn`'s `keep`). A
+    /// thread that does not answer grants nothing: the caller resets, and the
+    /// next call reports the thread.
     fn keepable(&self, n: usize) -> usize {
         let n = n.min(self.pos);
-        if n + 1 >= self.pos { n } else { 0 }
+        match self.ask(Cmd::Keep(n)).map(|r| r.result) {
+            Ok(Ok((k, _))) => (k as usize).min(n),
+            _ => 0,
+        }
     }
 
     fn cut(&mut self, n: usize) -> Result<(), EngineError> {
         if n == self.pos {
             return Ok(());
-        }
-        if n + 1 != self.pos {
-            return Err(EngineError(format!(
-                "cut to position {n} from {}: only the last position can be taken back",
-                self.pos
-            )));
         }
         let pos =
             u32::try_from(n).map_err(|_| EngineError(format!("cut to position {n}: past u32")))?;

@@ -35,6 +35,8 @@ pub const GROUP: usize = 8;
 /// the row of position `p` in slot `p % window`.
 pub struct DraftRings {
     rings: Vec<DeviceTensor<u16>>,
+    /// The append's shadow: no rows, so nothing is written beside the rings.
+    none: DeviceTensor<u16>,
 }
 
 impl DraftRings {
@@ -43,7 +45,8 @@ impl DraftRings {
         let rings = (0..hp.n_layer)
             .map(|_| DeviceTensor::zeroed(stream, hp.window, hp.head_dim))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(DraftRings { rings })
+        let none = DeviceTensor::zeroed(stream, 0, hp.head_dim)?;
+        Ok(DraftRings { rings, none })
     }
 
     /// Layer `l`'s ring.
@@ -333,6 +336,7 @@ impl KvAppend {
                         m: g.rows,
                         out: &mut g.out[l],
                         cache: ring,
+                        shadow: &mut rings.none,
                     },
                 )?;
             }

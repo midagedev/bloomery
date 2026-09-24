@@ -35,6 +35,8 @@ pub(crate) struct GenParams {
 /// llama-server's `timings` object, as the server clocked it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Timings {
+    /// Prompt tokens evaluated by this request: the prompt less what the
+    /// cache kept (`cache_n`).
     pub prompt_n: usize,
     pub prompt_ms: f64,
     pub predicted_n: usize,
@@ -43,6 +45,9 @@ pub(crate) struct Timings {
     pub n_past: usize,
     /// Prompt positions kept from the previous request instead of evaluated.
     pub cache_n: usize,
+    /// The whole prompt, kept and evaluated (llama-server's `n_prompt_tokens`;
+    /// not a `timings` field).
+    pub n_prompt: usize,
 }
 
 impl Timings {
@@ -231,11 +236,12 @@ pub(crate) fn generate(
     let greedy = slot.next(ids[n - 1], out(&mut logits))?;
     let tim = timings_out;
     *tim = Timings {
-        prompt_n: n,
+        prompt_n: n - cache_n,
         prompt_ms: ms_since(t0),
         n_ctx: ctx_max,
         n_past: n,
         cache_n,
+        n_prompt: n,
         ..Timings::default()
     };
     let t1 = Instant::now();

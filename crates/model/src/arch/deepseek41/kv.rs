@@ -10,6 +10,10 @@
 //! ratio-1 group is its one row, so nothing pools and no state is kept. The
 //! layers that read a source's stream hold none of it. The window and every
 //! layer's ratio come from [`Hparams`].
+//!
+//! Beside the cache ([`KvBytes::shadow_bytes`]), every layer keeps a shadow of
+//! its window ring: `ctx_max` latent rows in f16, one per position, from which
+//! a cut of the cache restores the ring rows later positions overwrote.
 
 use gguf::Split;
 
@@ -95,6 +99,10 @@ impl KvBytes for KvLayout {
             }
             None => window,
         }
+    }
+
+    fn shadow_bytes(&self, _layer: usize, ctx_max: u64) -> u64 {
+        ctx_max * self.latent * F16_BYTES
     }
 }
 

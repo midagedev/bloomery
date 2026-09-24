@@ -627,6 +627,9 @@ mod gate {
         let mut out = DeviceBuffer::<f32>::zeroed(cx.stream, m * width)?;
         let mut cache =
             DeviceTensor::upload(cx.stream, &vec![SENTINEL; window * width], window, width)?;
+        // The ring's shadow, which this gate does not read: one row, so the
+        // append writes position 0's row there and skips every later one.
+        let mut shadow = DeviceTensor::zeroed(cx.stream, 1, width)?;
         cx.k.enqueue_kv_norm_rope_append(
             cx.stream,
             KvAppendArgs {
@@ -639,6 +642,7 @@ mod gate {
                 m,
                 out: &mut out,
                 cache: &mut cache,
+                shadow: &mut shadow,
             },
         )?;
         cx.stream.synchronize()?;

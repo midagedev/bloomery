@@ -15,11 +15,20 @@
 //!   `data: [DONE]`;
 //! - `/tokenize` of `--prompt` is `--ids`;
 //! - the same `/completion` after those requests gives the same ids (the
-//!   engine's reset between requests leaves nothing behind);
+//!   engine's reset between requests leaves nothing behind), and once more
+//!   right after itself it keeps `n − 1` positions of its `n`, rounded down by
+//!   the body's cut rule (`Body::keep_point`: to a multiple of every
+//!   compression ratio), with the same ids;
 //! - prefix reuse (`cache_prompt`, default true): `--ids` then `--ids` plus
 //!   its 8 greedy ids (`ignore_eos`) keeps every cached position (`timings.cache_n`), and a
 //!   prompt that leaves the last cached position out takes that one back;
-//!   each gives the greedy ids of the same prompt with `cache_prompt: false`.
+//!   each gives the greedy ids of the same prompt with `cache_prompt: false`,
+//!   and `timings.prompt_n` is the ids evaluated, the prompt less `cache_n`;
+//! - a two-turn chat: turn 2 (turn 1's message, its answer, a new message)
+//!   keeps the rendered prefix it shares with what turn 1 left in the cache,
+//!   rounded down by the same rule, answers as with `cache_prompt: false`, and
+//!   reports `usage.prompt_tokens` as the whole prompt and
+//!   `usage.prompt_tokens_details.cached_tokens` as `timings.cache_n`.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
@@ -45,6 +54,10 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use gguf::Split;
+    use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::plan::Planner;
+    use model::placement::workstation;
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>";
@@ -56,6 +69,42 @@ mod gate {
     /// (`ignore_eos`) so every one of them is compared.
     const REUSE_PREDICT: usize = 8;
     const CHAT: &str = "What is the capital of France? Answer in one word.";
+    /// The two-turn chat's messages and its answers' length.
+    const TURN1: &str = "Name three primary colors.";
+    const TURN2: &str = "Which of them is the color of the sky?";
+    const TURN_PREDICT: usize = 24;
+
+    /// The positions the engine keeps of at most `ask` when it holds `held`
+    /// after a plain run: all of them from `held − 1` on, else `ask` rounded
+    /// down to a multiple of every compression ratio (`Body::keep_point` on a
+    /// cache whose state slots hold the latest positions).
+    fn kept(ask: usize, held: usize, ratios: &[usize]) -> usize {
+        if ask + 1 >= held {
+            return ask.min(held);
+        }
+        (0..=ask)
+            .rev()
+            .find(|k| ratios.iter().all(|&r| r == 0 || k % r == 0))
+            .unwrap_or(0)
+    }
+
+    /// The file's compression ratios, from its headers.
+    fn file_ratios() -> Result<Vec<usize>, GateError> {
+        let path = workstation::model_v41();
+        let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        let hp = Hparams::read(&split)?;
+        let planner = Planner::from_file(&split, &hp, workstation::CTX_MAX)?;
+        Ok(planner
+            .stream_ratios()
+            .iter()
+            .map(|&r| r as usize)
+            .collect())
+    }
+
+    /// The length of the common prefix of `a` and `b`.
+    fn common(a: &[u32], b: &[u32]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
 
     struct Args {
         gen_log: PathBuf,
@@ -201,6 +250,111 @@ mod gate {
         Err(format!("the server did not listen within {POLLS} polls").into())
     }
 
+    /// The rendered ids of a chat's `messages`, through the server's own
+    /// template and tokenizer.
+    fn rendered(url: &dyn Fn(&str) -> String, messages: &Value) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(
+            &url("/apply-template"),
+            Some(&json!({"messages": messages})),
+            false,
+        )?;
+        let text = json_of("/apply-template", st, &body)?["prompt"]
+            .as_str()
+            .ok_or("/apply-template gave no prompt")?
+            .to_owned();
+        let (st, body) = curl(&url("/tokenize"), Some(&json!({"content": text})), false)?;
+        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
+    }
+
+    /// A real two-turn chat at temperature 0: turn 2 keeps what it shares
+    /// with the cache turn 1 left, and answers as it does from a reset.
+    fn two_turns(url: &dyn Fn(&str) -> String, ratios: &[usize]) -> Result<bool, GateError> {
+        let chat = |messages: &Value, cache: bool| -> Result<Value, GateError> {
+            let body = json!({
+                "messages": messages, "temperature": 0, "max_tokens": TURN_PREDICT,
+                "cache_prompt": cache,
+            });
+            let (st, body) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+            json_of("/v1/chat/completions", st, &body)
+        };
+        let turn1 = json!([{"role": "user", "content": TURN1}]);
+        let p1 = rendered(url, &turn1)?;
+        // Turn 1's greedy ids, as a completion of its rendered ids.
+        let (st, body) = curl(
+            &url("/completion"),
+            Some(&json!({
+                "prompt": p1, "n_predict": TURN_PREDICT, "temperature": 0,
+                "return_tokens": true, "cache_prompt": false,
+            })),
+            false,
+        )?;
+        let g1 = ids_of(&json_of("/completion", st, &body)?["tokens"]);
+        let r1 = chat(&turn1, true)?;
+        let answer = r1["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        let same_turn1 = r1["usage"]["completion_tokens"] == json!(g1.len());
+        let mut turn2 = turn1.clone();
+        if let Value::Array(m) = &mut turn2 {
+            m.push(json!({"role": "assistant", "content": answer}));
+            m.push(json!({"role": "user", "content": TURN2}));
+        }
+        let p2 = rendered(url, &turn2)?;
+        let held: Vec<u32> = p1
+            .iter()
+            .chain(&g1[..g1.len().saturating_sub(1)])
+            .copied()
+            .collect();
+        let shared = common(&held, &p2);
+        let want = kept(shared.min(p2.len() - 1), held.len(), ratios);
+        let warm = chat(&turn2, true)?;
+        let fresh = chat(&turn2, false)?;
+        let (t, u) = (&warm["timings"], &warm["usage"]);
+        println!(
+            "chat turn 1: {} rendered ids, {} greedy ids {g1:?}, answer {answer:?}, cache_n={}",
+            p1.len(),
+            g1.len(),
+            r1["timings"]["cache_n"]
+        );
+        println!(
+            "chat turn 2: {} rendered ids; the cache held {} ids, {shared} of them shared \
+             (turn 1's prompt {}); kept {want}: cache_n={} prompt_n={} usage={}",
+            p2.len(),
+            held.len(),
+            p1.len(),
+            t["cache_n"],
+            t["prompt_n"],
+            u
+        );
+        println!(
+            "chat turn 2 cache_prompt=false: cache_n={} message {}",
+            fresh["timings"]["cache_n"], fresh["choices"][0]["message"]
+        );
+        let mut ok = true;
+        check(&mut ok, "chat_turn1_is_its_completion", same_turn1);
+        check(
+            &mut ok,
+            "chat_turn2_cache_n",
+            want > p1.len() && t["cache_n"] == json!(want),
+        );
+        check(
+            &mut ok,
+            "chat_turn2_counts",
+            t["prompt_n"] == json!(p2.len() - want)
+                && u["prompt_tokens"] == json!(p2.len())
+                && u["prompt_tokens_details"]["cached_tokens"] == json!(want),
+        );
+        check(
+            &mut ok,
+            "chat_turn2_answer_is_fresh",
+            warm["choices"][0]["message"] == fresh["choices"][0]["message"]
+                && warm["usage"]["completion_tokens"] == fresh["usage"]["completion_tokens"]
+                && fresh["timings"]["cache_n"] == json!(0),
+        );
+        Ok(ok)
+    }
+
     fn check(ok: &mut bool, name: &str, pass: bool) {
         println!("check {name}: {}", verdict(pass));
         *ok &= pass;
@@ -209,6 +363,8 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
         let reference = gen_tokens(&a.gen_log)?;
+        let ratios = file_ratios()?;
+        println!("compression ratios {ratios:?}");
         std::fs::create_dir_all(&a.dir)?;
         let exe = std::env::current_exe()?.with_file_name("bloomery-serve-ds41");
         let err_log = a.dir.join("server.err");
@@ -316,6 +472,31 @@ mod gate {
             "completion_after_reset_identical",
             ids_of(&again["tokens"]) == first,
         );
+        // Right after itself: the cache holds the prompt and all but the last
+        // generated id, and the prompt keeps n − 1 of its n ids at most.
+        let held = a.ids.len() + ids_of(&again["tokens"]).len() - 1;
+        let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
+        let repeat = json_of("/completion", st, &body)?;
+        let want = kept(a.ids.len() - 1, held, &ratios);
+        println!(
+            "completion repeated {:?} cache_n={} prompt_n={} (n {}, cache held {held}, kept {want})",
+            ids_of(&repeat["tokens"]),
+            repeat["timings"]["cache_n"],
+            repeat["timings"]["prompt_n"],
+            a.ids.len()
+        );
+        check(
+            &mut ok,
+            "repeat_cache_n",
+            want > 0
+                && repeat["timings"]["cache_n"] == json!(want)
+                && repeat["timings"]["prompt_n"] == json!(a.ids.len() - want),
+        );
+        check(
+            &mut ok,
+            "repeat_ids_identical",
+            ids_of(&repeat["tokens"]) == first,
+        );
 
         let reuse = |prompt: &[u32], cache: bool| -> Result<(Vec<u32>, Value), GateError> {
             let body = json!({
@@ -325,12 +506,31 @@ mod gate {
             let (st, body) = curl(&url("/completion"), Some(&body), false)?;
             let v = json_of("/completion", st, &body)?;
             let ids = ids_of(&v["tokens"]);
+            let t = &v["timings"];
             println!(
-                "reuse prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
+                "reuse prompt {} ids cache_prompt={cache}: cache_n={} prompt_n={} tokens {ids:?}",
                 prompt.len(),
-                v["timings"]["cache_n"]
+                t["cache_n"],
+                t["prompt_n"]
             );
-            Ok((ids, v["timings"]["cache_n"].clone()))
+            let counted = t["cache_n"]
+                .as_u64()
+                .zip(t["prompt_n"].as_u64())
+                .is_some_and(|(c, n)| c + n == prompt.len() as u64);
+            if !counted {
+                println!(
+                    "FAIL: prompt_n + cache_n is not the prompt's {} ids",
+                    prompt.len()
+                );
+            }
+            Ok((
+                ids,
+                if counted {
+                    t["cache_n"].clone()
+                } else {
+                    Value::Null
+                },
+            ))
         };
         let (g1, _) = reuse(&a.ids, false)?;
         let cont: Vec<u32> = a.ids.iter().chain(&g1).copied().collect();
@@ -370,6 +570,8 @@ mod gate {
                 g4 == g5 && c5 == json!(0),
             );
         }
+
+        ok &= two_turns(&url, &ratios)?;
 
         println!("server stopped: {}", served.stop()?);
         if ok {

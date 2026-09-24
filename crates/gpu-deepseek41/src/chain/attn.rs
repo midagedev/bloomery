@@ -19,7 +19,8 @@
 //!    row. These run every step; the image's group count decides whether a
 //!    row and a key are written;
 //! 4. the query: q_a, its norm, q_b and the tail rope;
-//! 5. the latent row: kv, then its norm, tail rope and f16 slot in the ring;
+//! 5. the latent row: kv, then its norm, tail rope, f16 slot in the ring and
+//!    f16 row in the ring's shadow;
 //! 6. on a layer that runs the indexer: the query's projection of q_a's norm,
 //!    the weights' projection of the normed input (in q8_1, quantized here on
 //!    a layer that owns no compressor), the score pass and the top-k pass,
@@ -116,6 +117,9 @@ pub struct AttnIo<'a> {
     pub fold_out: &'a mut DeviceBuffer<f32>,
     /// The layer's raw window ring: `min(ctx_max, window)` latent rows in f16.
     pub ring: &'a mut DeviceTensor<u16>,
+    /// The ring's shadow: `ctx_max` latent rows in f16, one per position. The
+    /// append writes it; nothing in the step reads it.
+    pub shadow: &'a mut DeviceTensor<u16>,
     pub compressed: Compressed<'a>,
     pub selection: Selection<'a>,
 }
@@ -1063,6 +1067,7 @@ impl AttnChain {
             streams_out,
             fold_out,
             ring,
+            shadow,
             mut compressed,
             selection,
         } = io;
@@ -1164,6 +1169,7 @@ impl AttnChain {
                 m,
                 out: &mut s.kv_row,
                 cache: &mut *ring,
+                shadow,
             },
         )?;
 

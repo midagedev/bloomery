@@ -845,7 +845,10 @@ fn hw_cache_prompt_reuses_the_common_prefix() {
     post(addr, "/completion", &a);
     let warm = post(addr, "/completion", &b(json!({}))).json();
     assert_eq!(warm["timings"]["cache_n"], 8, "{warm}");
-    assert_eq!(warm["timings"]["prompt_n"], 9, "{warm}");
+    // llama-server's counts: `prompt_n` is the ids evaluated, `tokens_evaluated`
+    // the whole prompt.
+    assert_eq!(warm["timings"]["prompt_n"], 1, "{warm}");
+    assert_eq!(warm["tokens_evaluated"], 9, "{warm}");
     assert_eq!(
         warm["tokens"], fresh["tokens"],
         "warm {warm}\nfresh {fresh}"
@@ -917,8 +920,11 @@ fn hw_streams_report_cache_n() {
         .find_map(|c| c.get("prompt_progress"))
         .expect("a prompt_progress chunk");
     assert_eq!(progress["cache"], 8, "{progress}");
+    assert_eq!(progress["total"], 9, "{progress}");
+    assert_eq!(progress["processed"], 9, "{progress}");
     let last = chunks.last().expect("chunks");
     assert_eq!(last["timings"]["cache_n"], 8, "{last}");
+    assert_eq!(last["timings"]["prompt_n"], 1, "{last}");
 
     // The same chat twice: the second keeps all of its prompt but the last token
     // (15 ids; the first left them and "abc" in the cache).
@@ -929,7 +935,109 @@ fn hw_streams_report_cache_n() {
     let ev = r.events();
     let last: Value = serde_json::from_str(&ev[ev.len() - 2]).expect("usage chunk");
     assert_eq!(last["timings"]["cache_n"], 14, "{last}");
-    assert_eq!(last["timings"]["prompt_n"], 15, "{last}");
+    assert_eq!(last["timings"]["prompt_n"], 1, "{last}");
+    assert_eq!(last["usage"]["prompt_tokens"], 15, "{last}");
+    assert_eq!(
+        last["usage"]["prompt_tokens_details"]["cached_tokens"], 14,
+        "{last}"
+    );
+    assert_eq!(last["usage"]["total_tokens"], 19, "{last}");
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_same_prompt_keeps_all_but_its_last_id() {
+    let addr = start(4096);
+    let body = json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0, "return_tokens": true});
+    let first = post(addr, "/completion", &body).json();
+    assert_eq!(first["timings"]["cache_n"], 0, "{first}");
+    assert_eq!(first["timings"]["prompt_n"], 6, "{first}");
+    // The cache holds the prompt and four generated ids; the prompt's last id
+    // is evaluated again for its logits.
+    let again = post(addr, "/completion", &body).json();
+    assert_eq!(again["timings"]["cache_n"], 5, "{again}");
+    assert_eq!(again["timings"]["prompt_n"], 1, "{again}");
+    assert_eq!(again["tokens_evaluated"], 6, "{again}");
+    assert_eq!(again["tokens"], first["tokens"], "{again}\n{first}");
+}
+
+/// The mock engine under a cut rule like V4.1's (`Body::keep_point` with
+/// ratios 2 and 1): all positions from `held − 1` on, else an even count.
+struct Rounding {
+    inner: serve::MockEngine,
+    held: usize,
+}
+
+impl serve::Engine for Rounding {
+    fn tokenizer(&self) -> std::sync::Arc<dyn serve::Tokenizer> {
+        self.inner.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), serve::EngineError> {
+        self.inner.prefill(ids)?;
+        self.held += ids.len();
+        Ok(())
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, serve::EngineError> {
+        let g = self.inner.next(last, out)?;
+        self.held += 1;
+        Ok(g)
+    }
+    fn reset(&mut self) -> Result<(), serve::EngineError> {
+        self.held = 0;
+        self.inner.reset()
+    }
+    fn keepable(&self, n: usize) -> usize {
+        let n = n.min(self.held);
+        if n + 1 >= self.held { n } else { n - n % 2 }
+    }
+    fn cut(&mut self, n: usize) -> Result<(), serve::EngineError> {
+        if self.keepable(n) != n {
+            return Err(serve::EngineError(format!(
+                "cut to {n} of {}: not a kept point",
+                self.held
+            )));
+        }
+        self.held = n;
+        self.inner.cut(n)
+    }
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_cache_n_is_what_the_engine_keeps() {
+    // A leaves "abcabc" + "abca" (10 ids); B shares its first 7 and is 8 long.
+    let a = json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0});
+    let b = json!({"prompt": "abcabcaz", "n_predict": 4, "temperature": 0, "return_tokens": true});
+    let fresh = post(start(4096), "/completion", &b).json();
+    let rounding = || {
+        common::start_with(Box::new(Rounding {
+            inner: serve::MockEngine::new(4096),
+            held: 0,
+        }))
+    };
+    let addr = rounding();
+    post(addr, "/completion", &a);
+    let warm = post(addr, "/completion", &b).json();
+    assert_eq!(warm["timings"]["cache_n"], 6, "{warm}");
+    assert_eq!(warm["timings"]["prompt_n"], 2, "{warm}");
+    assert_eq!(warm["tokens"], fresh["tokens"], "{warm}\n{fresh}");
+    // The same engine keeps an odd count where it is all but the last held id.
+    let c =
+        json!({"prompt": "abcabcabca", "n_predict": 2, "temperature": 0, "return_tokens": true});
+    let addr = rounding();
+    post(addr, "/completion", &a);
+    let tail = post(addr, "/completion", &c).json();
+    assert_eq!(tail["timings"]["cache_n"], 9, "{tail}");
+    assert_eq!(
+        tail["tokens"],
+        post(start(4096), "/completion", &c).json()["tokens"]
+    );
 }
 
 #[test]
