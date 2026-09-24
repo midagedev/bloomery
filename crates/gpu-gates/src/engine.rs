@@ -49,6 +49,7 @@ impl AnyEngine {
             )?)),
             #[cfg(not(feature = "deepseek41"))]
             a @ Arch::Deepseek41 => Err(GpuError::UnsupportedArch(a.name().to_string())),
+            a @ Arch::Qwen3moe => Err(GpuError::UnsupportedArch(a.name().to_string())),
         }
     }
 }

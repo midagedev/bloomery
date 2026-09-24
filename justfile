@@ -402,6 +402,16 @@ dump-ref-cuda:
 dump-ref-v41 *VARIANT:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
+# qwen3moe(Qwen3-30B-A3B-2507) 오라클: 같은 계측기를 qwen3moe 프로필로 돌려 $BLOOMERY_DATA/ref_qwen3moe/에 쓴다(CPU,
+# 5토큰). VARIANT(step4와 접미사 -every-node)는 조용한 프리필 뒤 디코드 한 스텝을 자기 세트에 덤프한다 — models/qwen3moe.sh.
+dump-ref-qwen3moe *VARIANT:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
+
+# 같은 5토큰의 ik CUDA 덤프(-ngl 99, box env가 핀한 3090)를 $BLOOMERY_DATA/ref_cuda_qwen3moe/에. 가중치 17.5 GiB가 카드에
+# 올라가므로 3090에 다른 프로세스가 없을 때 친다.
+dump-ref-qwen3moe-cuda:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'BLOOMERY_REF_BACKEND=cuda bash tools/ref/dump.sh'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:
@@ -497,6 +507,16 @@ gate-placement:
 gate-ds41-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::hparams --nocapture && bash tools/gate.sh --release -p bloomery-model --test ds41_meta -- --ignored --nocapture'
 
+# qwen3moe 메타 게이트: 하이퍼파라미터 거부 단위 시험(합성 헤더) 뒤, arch/qwen3moe가 파일에서 읽은 값을 ik 그래프
+# (ref_qwen3moe 매니페스트의 노드 형상·op)와 헤더에 대조하고, 텐서 전부가 역할과 허용 타입을 갖는지 본다. 헤더만, 초 단위.
+gate-qwen3moe-meta:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen3moe --nocapture && bash tools/gate.sh --release -p bloomery-model --test qwen3moe_meta -- --ignored --nocapture'
+
+# qwen3moe 배치 게이트: 3090 한 장에 전부(ctx 32768) — 모든 expert가 카드에, 계획 바이트 = 헤더에서 다시 센 상주
+# 바이트, 전체 계획의 바이트 예산에서 whole, 1바이트 모자라면 not whole, 무-expert 바닥 아래면 거부. 헤더만.
+gate-qwen3moe-placement:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test qwen3moe_placement -- --ignored --nocapture'
+
 # V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 5토큰 세트의
 # 모든 층에서 ik의 라우팅을 주입해 호스트 티어가 낸 routed 부분합을 ik의 ffn_moe_out과 도출한 밴드 안에서 대조한다
 # (플립은 따로 세고, 층마다 클램프 히트 수를 찍는다). 세트가 라우팅한 expert만 읽는다. 끝으로 크레이트 doctest —
@@ -527,10 +547,10 @@ gate-engram:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-engram --test engram -- --ignored --nocapture'
 
 # 토크나이저 게이트: 우리 id가 engram 코퍼스 텍스트 전부와 케이스 파일에서 두 parse 모드 모두
-# llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가. oracle.sh가 오라클 파일을 먼저 다시 쓴다
-# (어휘만 적재, 임대 없음, 1분 안).
+# llama-tokenize와 같고, 참조 id가 원문으로 되돌아오는가 — V4.1 어휘(deepseek-v3)와 qwen3moe 어휘(qwen2) 둘 다.
+# oracle.sh가 어휘마다 오라클 파일을 먼저 다시 쓴다(어휘만 적재, 임대 없음, 1분 안).
 gate-tokenizer:
-    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --test tokenizer -- --ignored --nocapture'
+    ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙, V4.1 채팅 템플릿 렌더링. 박스 자원 불필요.
 gate-serve:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml -- --include-ignored --nocapture'

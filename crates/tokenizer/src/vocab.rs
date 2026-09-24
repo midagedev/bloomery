@@ -8,6 +8,7 @@ use std::path::Path;
 use gguf::Value;
 
 use crate::Error;
+use crate::pretok::Pre;
 
 /// Token attributes, the reference's `llama_token_attr` bits.
 pub mod attr {
@@ -31,11 +32,6 @@ fn attr_of_type(t: i64) -> u32 {
         _ => 0,
     }
 }
-
-/// Pre-tokenizer names whose regex set and flags are the ones this crate
-/// implements: byte-level encoding, merges always applied, spaces not
-/// cleaned, no BOS unless the file asks for it.
-const PRE: [&str; 3] = ["deepseek-v3", "hunyuan-dense", "joyai-llm"];
 
 /// Token texts the reference recognises by name, per role, in its order.
 const EOT_NAMES: &[&str] = &[
@@ -141,6 +137,8 @@ pub(crate) struct Vocab {
     pub(crate) token_to_id: HashMap<String, u32>,
     pub(crate) merges: Vec<String>,
     pub(crate) pre: String,
+    /// The pre-tokenizer `pre` names.
+    pub(crate) pretok: Pre,
     pub(crate) specials: Specials,
     pub(crate) add_bos: bool,
     pub(crate) add_eos: bool,
@@ -240,10 +238,13 @@ impl Vocab {
         if model != "gpt2" {
             return Err(Error::UnsupportedModel(model.to_string()));
         }
+        // The names `Pre` runs share the rest of the reference's per-name
+        // flags: byte-level encoding, merges always applied, spaces not
+        // cleaned, no BOS unless the file asks for it.
         let pre = m.str("tokenizer.ggml.pre")?.unwrap_or("");
-        if !PRE.contains(&pre) {
+        let Some(pretok) = Pre::of(pre) else {
             return Err(Error::UnsupportedPre(pre.to_string()));
-        }
+        };
         let merges = m
             .strings("tokenizer.ggml.merges")?
             .ok_or(Error::Missing("tokenizer.ggml.merges"))?;
@@ -319,6 +320,7 @@ impl Vocab {
             token_to_id,
             merges,
             pre: pre.to_string(),
+            pretok,
             specials: sp,
             add_bos,
             add_eos,

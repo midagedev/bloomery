@@ -172,8 +172,11 @@ pub enum Device {
 /// upload by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CardFormat {
-    /// q3_K/q4_K/q6_K: the rows' byte stream as u32 words, the last word
-    /// zero-padded, one row per `words / rows` words.
+    /// q3_K/q4_K/q6_K: the rows' byte stream as u32 words, zero-padded at
+    /// its end to `rows · ceil(words / rows)` words. The kernels address a
+    /// row by its byte offset in the stream, so a row need not start on a
+    /// word (q6_K at k = 768 is 630 bytes); the padding only makes the
+    /// buffer a whole number of words per row.
     KQuant,
     /// q5_0 in the gemv's layout: per row one byte per 5-bit code in 1024-value
     /// windows, then one f32 scale per 32-value block.
@@ -231,9 +234,8 @@ impl CardFormat {
     /// this format, in bytes, in the order the upload allocates them: q8_0's
     /// code plane, then its scale plane; one buffer in every other format —
     /// the upload's own arithmetic. `None` exactly where the upload refuses: a
-    /// zero dimension, `k` off the type's block, a KQuant stream whose words
-    /// do not split evenly into `rows`, or a `ty` this format is not the
-    /// loader's format for.
+    /// zero dimension, `k` off the type's block, or a `ty` this format is not
+    /// the loader's format for.
     #[must_use]
     pub fn buffer_bytes(self, ty: GgmlType, k: u64, rows: u64) -> Option<Vec<u64>> {
         let blck = ty.blck_size()?;
@@ -250,11 +252,7 @@ impl CardFormat {
                     .checked_mul(blocks)?
                     .checked_mul(rows)?
                     .div_ceil(4);
-                let bytes = words
-                    .is_multiple_of(rows)
-                    .then_some(words)?
-                    .checked_mul(4)?;
-                vec![bytes]
+                vec![words.div_ceil(rows).checked_mul(rows)?.checked_mul(4)?]
             }
             CardFormat::Q5_0 => {
                 vec![rows.checked_mul(window()?.checked_add(blocks.checked_mul(4)?)?)?]

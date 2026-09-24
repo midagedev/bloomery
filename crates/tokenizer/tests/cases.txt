@@ -23,3 +23,7 @@ fn main() {\n\tprintln!("{}", x->y);\n}
 a\x00b
 \xff\xfe abc \xc3
 \xc0\x80 \xed\xa0\x80 \xf0\x9f\x98
+It's we're they've I'm you'll he'd IT'S WE'RE THEY'VE I'M YOU'LL HE'D 'S 'x don't
+<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nOK<|im_end|><|endoftext|>
+(foo) [bar] {baz} x=y; a+b !! ?! ... -- 3.5% $12
+'Sorry 'Tis 'Mom 'Dad 'REady 'VEry 'LLama 'sorry 'tis 'really rock'N'roll 'Should 'Mother 'Data 'Record 'Venus 'Library 'Talk 'Sure 'Text 'Model 'Dear 'Leave 'Rest 'System 'Most 'Define

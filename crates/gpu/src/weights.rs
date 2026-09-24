@@ -30,9 +30,10 @@ use std::ops::Range;
 /// travel as a file tensor.
 pub enum DevWeight {
     /// Q3_K/Q4_K/Q6_K file tensor: the raw row stream as little-endian u32
-    /// words, the final word zero-padded when the stream is not 4-aligned —
-    /// the kernels address rows by BYTE offset (`row * row_bytes`), so the
-    /// words are the flat stream, never per-row padded. A 3-D expert stack
+    /// words, zero-padded at its end to a whole number of words per row
+    /// (`CardFormat::KQuant`) — the kernels address rows by BYTE offset
+    /// (`row * row_bytes`), so the words are the flat stream, never per-row
+    /// padded. A 3-D expert stack
     /// stays one flat tensor of `dims[1]·dims[2]` rows: the `_sel` kernels
     /// address expert e as rows `e·R .. (e+1)·R`, which is the same flat
     /// layout. `k` is a multiple of 256; row bytes are `type_size · k/256`.
@@ -519,7 +520,8 @@ fn upload_rows(
         // one word stream, so the kernels' byte-offset row addressing sees
         // contiguous rows.
         CardFormat::KQuant => {
-            let words = words_of(bytes);
+            let mut words = words_of(bytes);
+            words.resize(words.len().div_ceil(rows) * rows, 0);
             DevWeight::KQuant {
                 ty: t.ty,
                 w: DeviceTensor::upload(stream, &words, rows, words.len() / rows)?,

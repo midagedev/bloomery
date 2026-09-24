@@ -12,6 +12,7 @@ use gguf::{Gguf, Split, Value};
 pub mod deepseek2;
 pub mod deepseek41;
 pub mod dspark;
+pub mod qwen3moe;
 
 /// The architecture string of the DSpark draft file ([`dspark`]). It is not an
 /// [`Arch`]: the draft is read beside a V4.1 model, never run as a model.
@@ -27,6 +28,7 @@ pub fn is_dflash(split: &Split) -> bool {
 pub enum Arch {
     Deepseek2,
     Deepseek41,
+    Qwen3moe,
 }
 
 impl Arch {
@@ -44,6 +46,7 @@ impl Arch {
         match name {
             "deepseek2" => Ok(Arch::Deepseek2),
             "deepseek41" => Ok(Arch::Deepseek41),
+            "qwen3moe" => Ok(Arch::Qwen3moe),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -53,6 +56,7 @@ impl Arch {
         match self {
             Arch::Deepseek2 => "deepseek2",
             Arch::Deepseek41 => "deepseek41",
+            Arch::Qwen3moe => "qwen3moe",
         }
     }
 }
@@ -134,13 +138,86 @@ fn n_vocab(split: &Split) -> Result<usize, PlacementError> {
     }
 }
 
+/// Header-only GGUF files for the architecture modules' unit tests: the
+/// refusals of a hyperparameter reader are tested against a file, through the
+/// same `Split` the engine reads, not against a second table type.
+#[cfg(test)]
+pub(crate) mod synthetic {
+    use std::path::PathBuf;
+
+    /// A metadata value, as the GGUF type it is written as.
+    pub(crate) enum V {
+        U32(u32),
+        F32(f32),
+        Str(&'static str),
+        Bool(bool),
+    }
+
+    fn string(b: &mut Vec<u8>, x: &str) {
+        b.extend_from_slice(&(x.len() as u64).to_le_bytes());
+        b.extend_from_slice(x.as_bytes());
+    }
+
+    /// A file declaring architecture `arch`, with a two-token vocabulary, the
+    /// keys `kv` under the `<arch>.` prefix, and one 1-value F32 tensor per
+    /// name of `tensors`; written to a temp path named after `tag`.
+    pub(crate) fn header(tag: &str, arch: &str, kv: &[(&str, V)], tensors: &[String]) -> PathBuf {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        b.extend_from_slice(&(kv.len() as u64 + 2).to_le_bytes());
+        string(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        string(&mut b, arch);
+        string(&mut b, super::TOKENS);
+        b.extend_from_slice(&9u32.to_le_bytes());
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&2u64.to_le_bytes());
+        string(&mut b, "a");
+        string(&mut b, "b");
+        for (k, v) in kv {
+            string(&mut b, &format!("{arch}.{k}"));
+            match v {
+                V::U32(x) => {
+                    b.extend_from_slice(&4u32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                V::F32(x) => {
+                    b.extend_from_slice(&6u32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                V::Str(x) => {
+                    b.extend_from_slice(&8u32.to_le_bytes());
+                    string(&mut b, x);
+                }
+                V::Bool(x) => {
+                    b.extend_from_slice(&7u32.to_le_bytes());
+                    b.push(u8::from(*x));
+                }
+            }
+        }
+        for (i, name) in tensors.iter().enumerate() {
+            string(&mut b, name);
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes()); // F32
+            b.extend_from_slice(&(32 * i as u64).to_le_bytes());
+        }
+        b.resize(b.len().div_ceil(32) * 32 + 32 * tensors.len(), 0);
+        let path = std::env::temp_dir().join(format!("bloomery-{}-{tag}.gguf", std::process::id()));
+        std::fs::write(&path, b).expect("write the synthetic header");
+        path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Arch;
 
     #[test]
     fn known_names_round_trip() {
-        for a in [Arch::Deepseek2, Arch::Deepseek41] {
+        for a in [Arch::Deepseek2, Arch::Deepseek41, Arch::Qwen3moe] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }
     }

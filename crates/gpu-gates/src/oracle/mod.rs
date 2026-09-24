@@ -6,6 +6,7 @@
 
 pub mod deepseek2;
 pub mod deepseek41;
+pub mod qwen3moe;
 
 use crate::{GateError, RefManifest, ref_dir_named};
 use model::arch::Arch;
@@ -97,6 +98,7 @@ pub fn for_arch(a: Arch) -> Result<&'static Oracle, GateError> {
     match a {
         Arch::Deepseek2 => Ok(&deepseek2::ORACLE),
         Arch::Deepseek41 => Ok(&deepseek41::ORACLE),
+        Arch::Qwen3moe => Ok(&qwen3moe::ORACLE),
     }
 }
 

@@ -24,7 +24,12 @@
 #   cases/<nn>.{txt,ids,nps.ids}
 #   MANIFEST.tsv         the tokenizer binary, the vocabulary file, and each set's md5s and counts
 #
+# The vocabulary is V4.1's first shard unless TOKENIZER_VOCAB names another GGUF file; its sets go
+# under $BLOOMERY_DATA/$TOKENIZER_SET (default `tokenizer`, V4.1's), so each vocabulary keeps a set
+# of its own — the swap at the end replaces the whole directory.
+#
 # Usage: bash crates/tokenizer/tools/oracle.sh
+#        TOKENIZER_VOCAB=/models/…/file.gguf TOKENIZER_SET=tokenizer-qwen3moe bash crates/tokenizer/tools/oracle.sh
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -36,10 +41,19 @@ TOKENIZE=${TOKENIZE:-/home/user/ik-idxkey/build/bin/llama-tokenize}
 V41_DIR=${BLOOMERY_V41_DIR:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8}
 
 [ -x "$TOKENIZE" ] || { echo "oracle: no llama-tokenize at $TOKENIZE" >&2; exit 66; }
-SHARD=$(find "$V41_DIR" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
-[ -n "$SHARD" ] || { echo "oracle: no first shard under $V41_DIR" >&2; exit 66; }
+if [ -n "${TOKENIZER_VOCAB:-}" ]; then
+  SHARD=$TOKENIZER_VOCAB
+  [ -f "$SHARD" ] || { echo "oracle: no vocabulary file at $SHARD" >&2; exit 66; }
+else
+  SHARD=$(find "$V41_DIR" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
+  [ -n "$SHARD" ] || { echo "oracle: no first shard under $V41_DIR" >&2; exit 66; }
+fi
+SET=${TOKENIZER_SET:-tokenizer}
+case $SET in
+  ''|*/*|.*) echo "oracle: '$SET' cannot name a set" >&2; exit 64 ;;
+esac
 
-OUT=$BLOOMERY_DATA/tokenizer
+OUT=$BLOOMERY_DATA/$SET
 rm -rf "$OUT.new"
 mkdir -p "$OUT.new/cases"
 

@@ -36,7 +36,7 @@ pub enum Error {
     WrongType(&'static str),
     #[error("tokenizer model {0:?} is not supported (only gpt2)")]
     UnsupportedModel(String),
-    #[error("pre-tokenizer {0:?} is not supported (deepseek-v3, hunyuan-dense, joyai-llm)")]
+    #[error("pre-tokenizer {0:?} is not supported (deepseek-v3, hunyuan-dense, joyai-llm, qwen2)")]
     UnsupportedPre(String),
     #[error("tokenizer.ggml.token_type has {types} entries for {tokens} tokens")]
     TokenTypesShort { types: usize, tokens: usize },
@@ -113,7 +113,7 @@ impl Tokenizer {
                 Frag::Text { start, len } => {
                     unicode::decode_lenient(&text[start..start + len], &mut cpts);
                     let mut at = 0;
-                    for &n in pretok::split(&cpts, &mut pre) {
+                    for &n in pretok::split(self.vocab.pretok, &cpts, &mut pre) {
                         word.clear();
                         for &cpt in &cpts[at..at + n] {
                             unicode::encode_cpt(cpt, &mut word);

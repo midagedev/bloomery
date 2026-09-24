@@ -1,5 +1,8 @@
-//! The pre-tokenizer of the `deepseek-v3` / `hunyuan-dense` / `joyai-llm`
-//! vocabularies, as the reference runs it.
+//! The pre-tokenizers of the vocabularies this crate runs, as the reference
+//! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
+//! `joyai-llm`) and [`Pre::Qwen2`] (`qwen2`).
+//!
+//! ## deepseek-v3
 //!
 //! The reference applies three regexes in turn (`llm_tokenizer_bpe`):
 //!
@@ -22,6 +25,23 @@
 //! The matchers below are those three regexes under ECMAScript semantics
 //! (leftmost start, alternatives in order, greedy quantifiers that back off),
 //! written out by hand; none of them can match the empty string.
+//!
+//! ## qwen2
+//!
+//! One regex, `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|
+//! \p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`, which the reference does not
+//! run as a regex: `unicode_regex_split_custom_qwen2` is a hand-written
+//! splitter that reads the codepoints' flags from its Unicode tables. It
+//! differs from a regex engine in one place that matters: a position no
+//! alternative matches becomes a one-codepoint piece, so every position is
+//! consumed. [`split_qwen2`] is that function line for line. The flags it
+//! reads — letter, number, whitespace — are exactly what the collapsed byte
+//! keeps: below 0x80 the reference's tables agree with the ASCII classes
+//! used here, and above it a letter collapses to its own byte, a number to
+//! its own, whitespace to 0x0B. The contraction test lowercases the next
+//! codepoint with the reference's `unicode_tolower`; the only codepoints that
+//! table maps onto `s t m d r v e l` are their ASCII capitals, so ASCII
+//! lowercasing is the same test.
 
 use crate::unicode::collapse;
 
@@ -176,11 +196,47 @@ pub(crate) struct Scratch {
     b: Vec<usize>,
 }
 
-/// Split one text fragment, given as codepoints, into pre-tokenizer words;
-/// returns each word's length in codepoints, in order.
-pub(crate) fn split<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+/// A vocabulary's pre-tokenizer, from `tokenizer.ggml.pre`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pre {
+    /// `deepseek-v3`, `hunyuan-dense`, `joyai-llm`: three regexes in turn.
+    DeepseekV3,
+    /// `qwen2`: the reference's hand-written splitter.
+    Qwen2,
+}
+
+impl Pre {
+    /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
+    pub(crate) const NAMES: [(&'static str, Pre); 4] = [
+        ("deepseek-v3", Pre::DeepseekV3),
+        ("hunyuan-dense", Pre::DeepseekV3),
+        ("joyai-llm", Pre::DeepseekV3),
+        ("qwen2", Pre::Qwen2),
+    ];
+
+    /// The pre-tokenizer `name` stands for; `None` for one this crate does
+    /// not run.
+    pub(crate) fn of(name: &str) -> Option<Pre> {
+        Pre::NAMES.iter().find(|(n, _)| *n == name).map(|&(_, p)| p)
+    }
+}
+
+/// Split one text fragment, given as codepoints, into pre-tokenizer words
+/// under `pre`; returns each word's length in codepoints, in order.
+pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     s.collapsed.extend(cpts.iter().map(|&cp| collapse(cp)));
+    match pre {
+        Pre::DeepseekV3 => split_deepseek_v3(cpts, s),
+        Pre::Qwen2 => {
+            split_qwen2(cpts, &s.collapsed, &mut s.b);
+            &s.b
+        }
+    }
+}
+
+/// [`split`] for [`Pre::DeepseekV3`]: the three regexes in turn.
+fn split_deepseek_v3<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     let c = &s.collapsed;
 
     s.a.clear();
@@ -193,4 +249,158 @@ pub(crate) fn split<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     });
     resplit(&s.a, &mut s.b, |i, hi| match_word(c, i, hi));
     &s.b
+}
+
+/// `unicode_regex_split_custom_qwen2` over one fragment: `cpts` its
+/// codepoints, `c` their collapsed bytes; the words' lengths go to `out`.
+/// Each branch is the reference's, in its order, and names the alternative
+/// it stands for.
+fn split_qwen2(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
+    out.clear();
+    let end = cpts.len();
+    let letter = |p: usize| p < end && is_letter(c[p]);
+    let number = |p: usize| p < end && is_number(c[p]);
+    let space = |p: usize| p < end && is_space(c[p]);
+    // `[^\s\p{L}\p{N}]` with the reference's "has a flag": true inside the
+    // fragment, false past its end.
+    let other = |p: usize| p < end && !is_space(c[p]) && !is_letter(c[p]) && !is_number(c[p]);
+    let lower = |p: usize| {
+        cpts.get(p).map(|&x| {
+            if (0x41..=0x5A).contains(&x) {
+                x + 0x20
+            } else {
+                x
+            }
+        })
+    };
+    let (mut pos, mut prev) = (0usize, 0usize);
+    let mut word = |to: usize, prev: &mut usize| {
+        if to > *prev {
+            out.push(to - *prev);
+        }
+        *prev = to;
+    };
+    while pos < end {
+        let cpt = cpts[pos];
+        // `(?i:'s|'t|'re|'ve|'m|'ll|'d)`
+        if cpt == u32::from(b'\'') && pos + 1 < end {
+            let next = lower(pos + 1);
+            if b"stmd".iter().any(|&x| next == Some(u32::from(x))) {
+                pos += 2;
+                word(pos, &mut prev);
+                continue;
+            }
+            if pos + 2 < end {
+                let pair = (next, lower(pos + 2));
+                let is = |a: u8, b: u8| pair == (Some(u32::from(a)), Some(u32::from(b)));
+                if is(b'r', b'e') || is(b'v', b'e') || is(b'l', b'l') {
+                    pos += 3;
+                    word(pos, &mut prev);
+                    continue;
+                }
+            }
+        }
+        // `[^\r\n\p{L}\p{N}]?\p{L}+`
+        if !is_newline(c[pos]) && !number(pos) && (letter(pos) || letter(pos + 1)) {
+            pos += 1;
+            while letter(pos) {
+                pos += 1;
+            }
+            word(pos, &mut prev);
+            continue;
+        }
+        // `\p{N}`
+        if number(pos) {
+            pos += 1;
+            word(pos, &mut prev);
+            continue;
+        }
+        // `<space>?[^\s\p{L}\p{N}]+[\r\n]*`: a space counts only when what
+        // follows it is such a codepoint or the fragment's end.
+        let lead = cpt == u32::from(b' ');
+        let at = if lead { pos + 1 } else { pos };
+        if at >= end || other(at) {
+            pos = at;
+            while other(pos) {
+                pos += 1;
+            }
+            while pos < end && is_newline(c[pos]) {
+                pos += 1;
+            }
+            word(pos, &mut prev);
+            continue;
+        }
+        let mut n = 0;
+        let mut last_newline = None;
+        while space(pos + n) {
+            if is_newline(c[pos + n]) {
+                last_newline = Some(pos + n + 1);
+            }
+            n += 1;
+        }
+        // `\s*[\r\n]+`
+        if let Some(to) = last_newline {
+            pos = to;
+            word(pos, &mut prev);
+            continue;
+        }
+        // `\s+(?!\S)`: all but the last of a run that does not end the fragment.
+        if n > 1 && pos + n < end {
+            pos += n - 1;
+            word(pos, &mut prev);
+            continue;
+        }
+        // `\s+`
+        if n > 0 {
+            pos += n;
+            word(pos, &mut prev);
+            continue;
+        }
+        // No alternative: one codepoint.
+        pos += 1;
+        word(pos, &mut prev);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pre, Scratch, split};
+
+    fn words(pre: Pre, text: &str) -> Vec<String> {
+        let cpts: Vec<u32> = text.chars().map(u32::from).collect();
+        let mut s = Scratch::default();
+        let mut at = 0;
+        split(pre, &cpts, &mut s)
+            .iter()
+            .map(|&n| {
+                let w: String = text.chars().skip(at).take(n).collect();
+                at += n;
+                w
+            })
+            .collect()
+    }
+
+    /// The qwen2 splitter's alternatives, one case each, as its reference
+    /// function splits them: contractions case-blind, one digit per word, a
+    /// leading space or symbol taken by a word, a space kept before
+    /// punctuation, whitespace runs backing off before a word.
+    #[test]
+    fn qwen2_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            ("it's", &["it", "'s"]),
+            ("IT'S", &["IT", "'S"]),
+            ("we'RE", &["we", "'RE"]),
+            ("1234", &["1", "2", "3", "4"]),
+            (" 12", &[" ", "1", "2"]),
+            ("a  b", &["a", " ", " b"]),
+            ("hello\n\nworld", &["hello", "\n\n", "world"]),
+            ("x = y;", &["x", " =", " y", ";"]),
+            ("end ", &["end", " "]),
+            ("(foo)", &["(foo", ")"]),
+            ("Ünïcödé тест", &["Ünïcödé", " тест"]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::Qwen2, text), want, "{text:?}");
+        }
+    }
 }
