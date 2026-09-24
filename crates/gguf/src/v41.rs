@@ -10,10 +10,10 @@
 //! so the two owners name one file. [`DEFAULT`] is what a process started
 //! outside `box.sh` opens.
 //!
-//! Two files exist: the public `Q3_K_M` set ([`PUBLIC`]) and the mixed one
-//! ([`MIXED`]: attention and shared experts Q8_0, `token_embd` BF16, engram
-//! Q8_0). The oracle sets dumped from the public file carry the name suffix
-//! [`PUBLIC_SET_SUFFIX`]; the mixed file's sets carry none.
+//! Two files exist: the public `Q3_K_M` set ([`PUBLIC`]), the default, and
+//! the mixed one ([`MIXED`]: attention and shared experts Q8_0, `token_embd`
+//! BF16, engram Q8_0). The oracle sets dumped from the public file carry the
+//! name suffix [`PUBLIC_SET_SUFFIX`]; the mixed file's sets carry none.
 
 use std::path::PathBuf;
 
@@ -28,7 +28,7 @@ pub const PUBLIC: &str =
     "/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
 
 /// The file opened when [`ENV`] is unset or empty.
-pub const DEFAULT: &str = MIXED;
+pub const DEFAULT: &str = PUBLIC;
 
 /// The oracle set name suffix of the public file's sets.
 pub const PUBLIC_SET_SUFFIX: &str = "_plain";
@@ -72,13 +72,15 @@ pub fn set(base: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIXED, PUBLIC, PUBLIC_SET_SUFFIX, set_suffix_of};
+    use super::{DEFAULT, MIXED, PUBLIC, PUBLIC_SET_SUFFIX, set_suffix_of};
 
     /// The public file's sets carry the suffix, the mixed file's none: the
-    /// mixed sets keep the names they were dumped under.
+    /// mixed sets keep the names they were dumped under. The default is the
+    /// public file, so an unset variable opens the suffixed sets.
     #[test]
     fn set_suffix_follows_the_file() {
         assert_eq!(set_suffix_of(PUBLIC), PUBLIC_SET_SUFFIX);
         assert_eq!(set_suffix_of(MIXED), "");
+        assert_eq!(set_suffix_of(DEFAULT), PUBLIC_SET_SUFFIX);
     }
 }

@@ -42,19 +42,13 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 
 ## The model file
 
-The engine is developed against one GGUF set in 9 shards:
+The engine runs the published Q3_K_M upload as it is, one GGUF set in 9 shards:
 
 ```
-DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
+DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
 ```
 
-It is the published Q3_K_M upload with these tensors replaced:
-
-- the engram tables in Q8_0 (209.2 GB, about 195 GiB), from the uploader's Q8_0 build,
-- the attention and shared expert tensors in Q8_0, from the same build,
-- the token embedding in BF16.
-
-The routed experts stay as in the Q3_K_M upload (Q3_K, Q4_K, Q5_K). The engine's GPU attention path reads Q8_0, so a plain Q3_K_M file, whose attention tensors are Q3_K, is not known to load yet. The mix is being retired: support for the plain file is the current work, and this section will then describe that file only.
+Every tensor keeps the upload's type: the attention, shared expert and engram tensors and the token embedding are K-quants like the routed experts (Q3_K, Q4_K, Q5_K; the output head Q6_K), and each kernel is picked by the type the file gives the tensor (`docs/facts.md` has the type table). The maintainers' gates run on this file by default. A second set, the same upload with the attention and shared expert tensors and the engram tables in Q8_0 and the token embedding in BF16, is the file the engine was first developed against; its reference dumps are kept and `BLOOMERY_V41_MODEL` still selects it; the engine does not need it.
 
 Point the engine at shard 1; the loader follows the split count from there:
 

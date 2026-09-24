@@ -6,9 +6,15 @@
 //! node ik's `MUL_MULTI_ADD` reads — and its partial sum is compared with
 //! `ffn_moe_out-L`, the weighted expert sum before the shared expert joins
 //! (`ffn_out-L = ffn_moe_out-L + ffn_shexp-L`). Every layer is in it: 0 and 1
-//! (down q5_K), the shard-crossing 7, 14, 27 and 34, and 38 and 39, where the
-//! routed SwiGLU clamps. Each layer prints its line: the three stages against
-//! their bands, the flips, and the clamp hits.
+//! (down q5_K) and the shard-crossing 7, 14, 27 and 34 among them. Each layer
+//! prints its line: the three stages against their bands, the flips, and the
+//! clamp hits the set's routing reaches — which layers those are is the file's.
+//!
+//! The routed clamp is crossed on purpose, on any file: each layer's experts
+//! for token 0 run again on its row scaled by the power of two that brings the
+//! largest gate, up and −up to twice the limit, so `silu(g) > L`, `u > L` and
+//! `u < −L` all occur; every slot's combine must be `qdot::swiglu_clamp`'s bits
+//! on the same dots and the clamp's f64 statement within [`COMBINE_EVAL`].
 //!
 //! `hw_`: needs the V4.1 shards and the oracle set on the box
 //! (`just gate-ds41-host`); `BLOOMERY_V41_MODEL` names another first shard.
@@ -54,7 +60,7 @@ use gguf::quant::half_to_f32;
 use gguf::{GgmlType, Split};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
-use model::moe::HostScratch;
+use model::moe::{HostLayer, HostScratch};
 use model::ops::{Tensor2, Weight, matmul_q_group_into};
 use model::placement::workstation;
 
@@ -76,9 +82,14 @@ const Q3K_LEAF_OURS: f64 = 128.0;
 const Q3K_LEAF_IK: f64 = 352.0;
 /// The largest 6-bit scale or min of a q4_K/q5_K sub-block.
 const KQ_SCALE_MAX: f64 = 63.0;
-/// The layers where the device round counted routed clamp hits on this set;
-/// the gate must see them too, or it does not exercise the clamp.
-const CLAMP_LAYERS: [usize; 2] = [38, 39];
+/// The clamped combine's relative error against its f64 statement: `v_silu`
+/// within [`SILU_EVAL`], the clamps exact (they move no value further than
+/// their input moved), then one product rounding.
+const COMBINE_EVAL: f64 = SILU_EVAL + U + SILU_EVAL * U;
+/// Half the spacing of f32's subnormals, 2^-150: a product that lands below
+/// `f32::MIN_POSITIVE` rounds by at most this much, whatever its relative
+/// error.
+const HALF_SUBNORMAL: f64 = f32::from_bits(1) as f64 / 2.0;
 
 /// `n·u / (1 − n·u)`: the relative bound of `n` roundings.
 fn gamma(n: f64) -> f64 {
@@ -333,6 +344,107 @@ fn ratio(got: f64, want: f64, band: f64) -> f64 {
     if r.is_nan() { f64::INFINITY } else { r }
 }
 
+/// `x·σ(x)` in f64.
+fn silu64(g: f64) -> f64 {
+    g / (1.0 + (-g).exp())
+}
+
+/// The smallest power of two `c` with `c·v >= target`, or 1 when `v` is not
+/// positive: a row whose dots never reach that side keeps its crossings at 0
+/// and [`synthetic_clamp`] fails by name.
+fn pow2_reaching(v: f32, target: f32) -> f32 {
+    if v.is_nan() || v <= 0.0 {
+        return 1.0;
+    }
+    let mut c = 1.0f32;
+    while c * v < target && c < 1e30 {
+        c *= 2.0;
+    }
+    c
+}
+
+/// Every slot's gate and up dots of the last call, slot after slot.
+fn slot_dots(scratch: &HostScratch, n: usize) -> (Vec<f32>, Vec<f32>) {
+    let (mut g, mut u) = (Vec::new(), Vec::new());
+    for s in 0..n {
+        g.extend_from_slice(&scratch.gate(s).data);
+        u.extend_from_slice(&scratch.up(s).data);
+    }
+    (g, u)
+}
+
+/// The routed clamp crossed on purpose (module doc): layer `l`'s experts for
+/// `list` on `x` scaled by a power of two — exact through the q8_K
+/// quantization, so the dots scale with it — until the largest gate, up and
+/// −up reach twice the limit. Every slot's combine must equal
+/// `qdot::swiglu_clamp` on its own dots bit for bit and the f64 statement
+/// `clamp(u, ±L) · min(silu(g), L)` within [`COMBINE_EVAL`] and
+/// [`HALF_SUBNORMAL`]; where `e^-g`, within its 4u, can pass `f32::MAX`,
+/// `v_silu` may flush to -0, so there the value itself is the band. All three
+/// crossings must occur. Prints its line and returns the verdict.
+fn synthetic_clamp(
+    layer: &HostLayer,
+    split: &Split,
+    l: usize,
+    x: &[f32],
+    list: &[(u32, f32)],
+    scratch: &mut HostScratch,
+) -> bool {
+    let limit = layer.swiglu_limit();
+    let ff = scratch.gate(0).data.len();
+    let mut out = vec![0.0f32; x.len()];
+    let mut run = |xs: Vec<f32>, scratch: &mut HostScratch| {
+        let t = Tensor2::from_vec(xs.len(), 1, xs);
+        layer
+            .experts_into(split, &t, list, &mut out, scratch)
+            .unwrap_or_else(|e| panic!("layer {l} synthetic clamp: {e}"));
+    };
+    run(x.to_vec(), scratch);
+    let (g1, u1) = slot_dots(scratch, list.len());
+    let top = |v: &[f32], sign: f32| v.iter().fold(0.0f32, |m, &a| m.max(sign * a));
+    let c = [top(&g1, 1.0), top(&u1, 1.0), top(&u1, -1.0)]
+        .iter()
+        .map(|&v| pow2_reaching(v, 2.0 * limit))
+        .fold(1.0f32, f32::max);
+    run(x.iter().map(|&v| v * c).collect(), scratch);
+    let (g, u) = slot_dots(scratch, list.len());
+    let lim = f64::from(limit);
+    let (mut bits_equal, mut stated) = (true, 0.0f64);
+    let (mut silu_hi, mut up_hi, mut up_lo) = (0usize, 0usize, 0usize);
+    for s in 0..list.len() {
+        let (gs, us) = (&g[s * ff..(s + 1) * ff], &u[s * ff..(s + 1) * ff]);
+        let h = &scratch.par(s).data;
+        let mut want = vec![f32::NAN; ff];
+        qdot::swiglu_clamp(gs, us, limit, &mut want);
+        bits_equal &= h.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits());
+        for ((&hv, &gv), &uv) in h.iter().zip(gs).zip(us) {
+            let (gd, ud) = (f64::from(gv), f64::from(uv));
+            let sj = silu64(gd);
+            silu_hi += usize::from(sj > lim);
+            up_hi += usize::from(ud > lim);
+            up_lo += usize::from(ud < -lim);
+            let e = sj.min(lim) * ud.clamp(-lim, lim);
+            let flush = (-gd).exp() * (1.0 + 4.0 * U) >= f64::from(f32::MAX);
+            let rel = if flush {
+                1.0 + COMBINE_EVAL
+            } else {
+                COMBINE_EVAL
+            };
+            if f64::from(hv) != e {
+                stated = stated.max(ratio(f64::from(hv), e, rel * e.abs() + HALF_SUBNORMAL));
+            }
+        }
+    }
+    let pass = bits_equal && stated <= 1.0 && silu_hi > 0 && up_hi > 0 && up_lo > 0;
+    println!(
+        "clamp_synthetic layer={l} slots={} x_scale={c} limit={limit} silu>L={silu_hi} u>L={up_hi} \
+         u<-L={up_lo} par_eq_swiglu_clamp={bits_equal} stated_ratio={stated:.3} {}",
+        list.len(),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
+
 #[test]
 #[ignore = "hw: needs the box, the V4.1 shards and $BLOOMERY_DATA/ref_deepseek41"]
 fn hw_ds41_host_matches_ik_routed_sum() {
@@ -361,6 +473,8 @@ fn hw_ds41_host_matches_ik_routed_sum() {
     let (e_gu, e_down) = (gamma(n_dot(embd)), gamma(n_dot(ff)));
     let g3 = gamma(3.0);
     let mut failed: Vec<usize> = Vec::new();
+    let mut clamp_failed: Vec<usize> = Vec::new();
+    let mut clamped = 0;
     let mut worst = Layer::default();
     let mut routed = 0;
     for l in 0..hp.n_layer {
@@ -526,11 +640,20 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         worst.up_hi += st.up_hi;
         worst.up_lo += st.up_lo;
         worst.visible += st.visible;
-        if CLAMP_LAYERS.contains(&l) {
-            assert!(
-                st.silu_hi + st.up_hi + st.up_lo > 0,
-                "layer {l}: the set must reach the routed clamp here"
-            );
+        if limit > 1e-6 {
+            clamped += 1;
+            let list: Vec<(u32, f32)> = (0..n_used)
+                .map(|s| {
+                    let e = u32::try_from(ids[s])
+                        .unwrap_or_else(|_| panic!("layer {l}: routed id {} is negative", ids[s]));
+                    (e, ws[s])
+                })
+                .collect();
+            if !synthetic_clamp(&layer, &split, l, &x_all[..embd], &list, &mut scratch) {
+                clamp_failed.push(l);
+            }
+        } else {
+            println!("clamp_synthetic layer={l} limit={limit} no routed clamp");
         }
     }
     println!(
@@ -545,9 +668,16 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         worst.up_lo,
         worst.visible
     );
-    assert!(failed.is_empty(), "layers outside the band: {failed:?}");
+    assert!(
+        clamped > 0,
+        "no routed layer carries a SwiGLU limit above 1e-6: the clamp is not exercised"
+    );
+    assert!(
+        failed.is_empty() && clamp_failed.is_empty(),
+        "layers outside the band: {failed:?}; layers where the crossed clamp does not hold: {clamp_failed:?}"
+    );
     println!(
         "PASSED: ds41_host — the host tier's routed partial sum equals ik's ffn_moe_out on every layer \
-         within the derived band, flips counted"
+         within the derived band, flips counted; the routed clamp crossed on all three sides on {clamped} layers"
     );
 }

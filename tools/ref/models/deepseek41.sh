@@ -9,12 +9,12 @@
 # and the oracle set at once.
 #
 #   V41_MODEL       the V4.1 file this tree runs, shard 1 of the split set: BLOOMERY_V41_MODEL, else the
-#                   default below. The one shell owner of the path (gguf::v41 is the Rust one, with the
+#                   default below, V41_PUBLIC. The one shell owner of the path (gguf::v41 is the Rust one, with the
 #                   same default): tools/box.sh sources this file in every box command, whatever profile
 #                   the command picked, and exports V41_MODEL and V41_DIR as BLOOMERY_V41_MODEL and
 #                   BLOOMERY_V41_DIR, so a script or a test under another profile opens the same file.
-#                   Two files exist: V41_MIXED (attention and shared experts Q8_0, token_embd BF16,
-#                   engram Q8_0) and V41_PUBLIC, the public Q3_K_M set
+#                   Two files exist: V41_PUBLIC, the public Q3_K_M set and the default, and V41_MIXED
+#                   (attention and shared experts Q8_0, token_embd BF16, engram Q8_0)
 #   V41_DIR         the directory of V41_MODEL, where every shard lies
 #   V41_SET_SUFFIX  what the oracle set names below carry for the file V41_MODEL names: _plain for
 #                   V41_PUBLIC, nothing for any other file (the mixed file's sets keep their names). A set
@@ -41,16 +41,31 @@
 #                   changes nothing the graph computes; the dump faults in what it touches
 #   ref_step_variant  the decode-step variants, below
 #
+#   IK_NCMOE        how many leading layers keep their routed experts on the host in IK_GPU_FLAGS
+#                   (--n-cpu-moe), sized per file exactly as LCPP_NCMOE is, from MODEL: 33 when it is
+#                   V41_PUBLIC, else 34 [derived, LCPP_NCMOE's arithmetic below; no ik load has been run at
+#                   33]. The arithmetic carries over because ik places the same tensors: token_embd and
+#                   the engram tables (engram_embd) are made in the host input context
+#                   (src/llama-load-tensors.cpp:3326, 3468 at db517b69), engram_wkv/k/q and every other
+#                   tensor in the split context, so the card dense bytes and the per-layer expert bytes
+#                   are mainline's for each file. ik needs no -nopo twin: its CUDA backend offloads a
+#                   MUL_MAT_ID only when ubatch × used experts >= GGML_CUDA_MIN_BATCH_OFFLOAD (32, the
+#                   build's CMakeCache) × 384 experts (ggml/src/ggml-cuda.cu:5215-5227), and llama-bench's
+#                   default ubatch 512 gives 3,072 < 12,288, so no host expert tensor is copied into the
+#                   compute buffer and the 2,713 MiB left at 33 on V41_PUBLIC are what mainline has
+#                   [derived]. BLOOMERY_IK_NCMOE (ik-draft.sh) replaces it for one run.
 #   IK_GPU_FLAGS    ik's decode on the timing card, placed to mirror design §5 (a) (depth-ds41.sh reads
-#                   it): every layer offloaded, and the routed experts of the first 34 layers on the
-#                   CPU, the last 6 layers' whole on the card. Plan (a) keeps a prefix of every
-#                   layer's experts on the A6000 — 2,414 experts, 40,490,311,680 B
-#                   (crates/model/tests/placement.rs) — and ik moves a layer's 384 experts as one
-#                   tensor, so the closest it has is whole layers: 6 × 384 = 2,304 experts [derived, at
-#                   plan (a)'s bytes per expert]; a 7th layer does not fit beside the dense weights [derived:
-#                   7 × 6.44 GB of experts + 8.15 GB dense > the card's 48,592 MiB].
-#                   The expected host work per token is the same (about 204 routed expert products,
-#                   ours about 202 [derived]). -t 32 is llama-bench's own default, spelled out;
+#                   it): every layer offloaded, and the routed experts of the first IK_NCMOE layers on the
+#                   CPU, the rest of the layers' whole on the card. Plan (a) keeps a prefix of every
+#                   layer's experts on the A6000, and ik moves a layer's 384 experts as one tensor, so
+#                   the closest it has is whole layers. V41_PUBLIC: plan (a)'s 2,668 card experts are
+#                   6.95 layers' worth, 33 keeps 7 (LCPP_NCMOE below). V41_MIXED: plan (a)'s 2,414
+#                   experts, 40,490,311,680 B (crates/model/tests/placement.rs), are 6.29 layers' worth,
+#                   34 keeps 6 × 384 = 2,304 experts [derived, at plan (a)'s bytes per expert]; a 7th
+#                   layer does not fit beside the dense weights [derived: 7 × 6.44 GB of experts + 8.15 GB
+#                   dense > the card's 48,592 MiB].
+#                   On the mixed file the expected host work per token is the same (about 204 routed
+#                   expert products, ours about 202 [derived]). -t 32 is llama-bench's own default, spelled out;
 #                   --defer-experts skips the loader's MAP_POPULATE of a file set larger than the page
 #                   cache. No flag sweep has been run: these are "at these flags".
 #                   llama-bench's --n-cpu-moe N is a list of CPU buffer-type overrides for layers
@@ -59,7 +74,7 @@
 #                   `env`. GGML_CUDA_NO_PINNED_WEIGHTS=1 is load-bearing: any override to the CPU
 #                   makes ik's loader drop mmap for the whole host context
 #                   (src/llama-load-tensors.cpp, `use_mmap_buffer &= !has_buft_overrides`), and that
-#                   context — the 34 layers' experts and the engram tables, about 400 GiB — would
+#                   context — the IK_NCMOE layers' experts and the engram tables, hundreds of GiB — would
 #                   then be one pinned allocation, larger than RAM. With the variable the host
 #                   context stays on the file mapping, unpinned, and the staging buffers stay
 #                   pinned. GGML_CUDA_NO_PINNED=1 also keeps the mapping, but unpins the staging
@@ -133,16 +148,17 @@ MODEL_NAME=deepseek41
 : "${IK:=/home/user/ik-idxkey}"
 V41_MIXED=/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
 V41_PUBLIC=/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
-V41_MODEL=${BLOOMERY_V41_MODEL:-$V41_MIXED}
+V41_MODEL=${BLOOMERY_V41_MODEL:-$V41_PUBLIC}
 V41_DIR=${V41_MODEL%/*}
 V41_SET_SUFFIX=
 [ "$V41_MODEL" != "$V41_PUBLIC" ] || V41_SET_SUFFIX=_plain
 MODEL=${BLOOMERY_REF_MODEL:-$V41_MODEL}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
-: "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe 34 -t 32 --defer-experts}"
 : "${IK_GPU_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
 : "${LCPP:=/home/user/llama.cpp-v41}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+if [ "$MODEL" = "$V41_PUBLIC" ]; then : "${IK_NCMOE:=33}"; else : "${IK_NCMOE:=34}"; fi
+: "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe $IK_NCMOE -t 32 --defer-experts}"
 if [ "$MODEL" = "$V41_PUBLIC" ]; then : "${LCPP_NCMOE:=33}"; else : "${LCPP_NCMOE:=34}"; fi
 : "${LCPP_GPU_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 -nopo 1}"
 : "${LCPP_CLI_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 --no-op-offload -fit off}"
