@@ -130,7 +130,10 @@ fn hw_coverage() {
 }
 
 /// Per type: re-dequantize the oracle's rows from our own mmap slice and
-/// compare against ggml's to_float. Gate: max |diff| <= 1e-6 for every type.
+/// compare against ggml's to_float bit for bit. Every one of these decodes is
+/// exact in f32 (quant.rs's module doc), so a difference of any size is a bug.
+/// Every type is compared before the verdict, so a red names each type that
+/// differs and how many values.
 #[test]
 #[ignore = "hw: needs the model on the box plus the oracle dump in $BLOOMERY_DATA"]
 fn hw_dequant_matches_ggml() {
@@ -138,7 +141,7 @@ fn hw_dequant_matches_ggml() {
     let dir = data_dir().join("ref");
     let manifest = fs::read_to_string(dir.join("manifest.txt")).expect("read ref/manifest.txt");
 
-    let mut worst: Vec<(String, f64)> = Vec::new();
+    let mut worst: Vec<(String, f64, usize)> = Vec::new();
     for line in manifest.lines().filter(|l| !l.trim().is_empty()) {
         let mut it = line.split_whitespace();
         let type_num: u32 = it.next().unwrap().parse().unwrap();
@@ -182,24 +185,24 @@ fn hw_dequant_matches_ggml() {
         let raw = fs::read(dir.join(format!("{tname}.raw")))
             .unwrap_or_else(|e| panic!("read {tname}.raw: {e}"));
         assert_eq!(raw.len(), nvals * 4, "{tname}.raw size");
-        let mut maxd = 0.0f64;
+        let (mut maxd, mut differ) = (0.0f64, 0usize);
         for (m, r) in mine.iter().zip(raw.as_chunks::<4>().0) {
-            let r = f32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+            let r = f32::from_le_bytes(*r);
             maxd = maxd.max((*m - r).abs() as f64);
+            differ += usize::from(m.to_bits() != r.to_bits());
         }
         println!(
-            "{tname:6} tensor={tensor_name} rows={rows} rowlen={rowlen} max_abs_diff={maxd:.3e}"
+            "{tname:6} tensor={tensor_name} rows={rows} rowlen={rowlen} values={nvals} bit_mismatches={differ} max_abs_diff={maxd:.3e}"
         );
-        assert!(
-            maxd <= 1e-6,
-            "{tname}: max abs diff {maxd:.3e} exceeds the 1e-6 gate"
-        );
-        worst.push((tname.to_string(), maxd));
+        worst.push((tname.to_string(), maxd, differ));
     }
-    println!("per-type max |diff| (gate 1e-6):");
-    for (n, d) in &worst {
-        println!("  {n:6} {d:.3e}");
+    // PIN(2026-09-24): bit identity; was max |diff| <= 1e-6, which a one-ulp error passed.
+    println!("per-type bit mismatches (gate 0):");
+    for (n, d, k) in &worst {
+        println!("  {n:6} {k} (max |diff| {d:.3e})");
     }
+    let red: Vec<_> = worst.iter().filter(|w| w.2 != 0).collect();
+    assert!(red.is_empty(), "values differ from ggml: {red:?}");
 }
 
 /// `<dir>/<tname>.meta`'s tensor name, row count and row length.

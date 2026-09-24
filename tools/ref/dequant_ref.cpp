@@ -89,11 +89,6 @@ static std::vector<size_t> scale_offsets(enum ggml_type t) {
 }
 
 static int synthetic(const std::string & out_dir) {
-    // ggml_init fills the f16 -> f32 table that GGML_FP16_TO_FP32 reads on this build; the
-    // model path gets it from gguf_init_from_file's context, this path makes its own.
-    struct ggml_init_params ip = {1024, nullptr, true};
-    struct ggml_context * ctx = ggml_init(ip);
-    if (!ctx) fail("ggml_init failed");
     const enum ggml_type types[] = {GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS};
     std::filesystem::create_directories(out_dir);
     std::string manifest;
@@ -157,7 +152,6 @@ static int synthetic(const std::string & out_dir) {
                     (long long)kSynthLen, row_bytes);
     }
     ggml_quantize_free();
-    ggml_free(ctx);
     write_file(out_dir + "/manifest.txt", manifest.data(), manifest.size());
     std::printf("wrote %zu synthetic types to %s\n", std::size(types), out_dir.c_str());
     return 0;
@@ -174,8 +168,15 @@ static std::vector<uint8_t> read_range(const char * path, int64_t off, size_t n)
 }
 
 int main(int argc, char ** argv) {
+    // ggml_init fills the f16 -> f32 table GGML_FP16_TO_FP32 reads on this build. Both paths
+    // take it from this context, so neither depends on another call making one first.
+    struct ggml_init_params ip = {1024, nullptr, true};
+    struct ggml_context * init_ctx = ggml_init(ip);
+    if (!init_ctx) fail("ggml_init failed");
     if (argc > 1 && std::string(argv[1]) == "--synthetic") {
-        return synthetic(argc > 2 ? argv[2] : std::string(kDataDir) + "/ref-synth");
+        const int rc = synthetic(argc > 2 ? argv[2] : std::string(kDataDir) + "/ref-synth");
+        ggml_free(init_ctx);
+        return rc;
     }
     const char * path = argc > 1 ? argv[1] : kGgufPath;
     const std::string out_dir = argc > 2 ? argv[2] : std::string(kDataDir) + "/ref";
@@ -277,5 +278,6 @@ int main(int argc, char ** argv) {
     gguf_free(gguf);
     ggml_free(gctx);
     std::printf("wrote %zu types to %s\n", written, out_dir.c_str());
+    ggml_free(init_ctx);
     return 0;
 }

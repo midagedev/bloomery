@@ -37,6 +37,7 @@ pub mod fused;
 pub(crate) mod graph;
 pub mod head;
 pub mod hybrid;
+pub mod iq;
 pub mod join_probe;
 pub mod model;
 pub mod moe_fused;
