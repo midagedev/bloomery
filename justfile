@@ -856,8 +856,16 @@ depth-gpu-ds41 *ARMS:
 # Qwen3-30B-A3B 전 카드 디코드를 깊이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(프롬프트를 실제 D스텝으로 먹임), ik `ik:<D>`(-gp D,96, 프로필
 # 플래그)·`ikdef:<D>`(llama-bench 기본값), mainline `lcpp:<D>`(-d D)를 바퀴마다 순서를 돌려 번갈아 재고, 깊이마다 ours/각 참조 비율을 찍는다.
 # 팔·플래그 근거·뺀 플래그는 tools/ref/depth-qwen3moe.sh 머리에. 우리 팔이 없으면 generate_qwen3moe를 빌드하지 않는다; 인자 없으면 6 ik:6 lcpp:6.
+# mistral.rs arms: `mrs:<D>` (mistralrs bench --depth D, PagedAttention pool at the cache height) and `mrspa0:<D>` (--paged-attn off).
+# Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 the runner prints the command lines and exits before the lease, and nothing is built.
 depth-gpu-qwen3moe *ARMS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in ik:*|ikdef:*|lcpp:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+
+# Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
+# depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
+# header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
+nsys-gpu-qwen3moe *DEPTHS:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
 
 # V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록.
 nsys-gpu-ds41 *DEPTHS:

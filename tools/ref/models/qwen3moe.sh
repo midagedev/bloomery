@@ -32,6 +32,10 @@
 #                   Both flag sets are chosen by reading each tree's CLI and docs; no flag sweep has
 #                   been run, so a row is "at these flags". depth-qwen3moe.sh's header gives each
 #                   flag's reason and the flags left out.
+#   MRS             the mistral.rs tree the `mrs:<D>` and `mrspa0:<D>` arms run (its release build);
+#                   MRSBIN moves its `mistralrs` binary alone
+#   MRS_FLAGS       `mistralrs bench` options every mrs arm adds to the per-arm ones (depth, lengths,
+#                   iterations, the cache height); read from its --help and src/commands/bench.rs
 #
 # Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
 # this model yet, and every script that reads them runs under `set -u`, so such a script stops at
@@ -57,6 +61,9 @@ REF_DUMP_LEASE=1
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
 : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on}"
+: "${MRS:=/home/user/mistral.rs}"
+: "${MRSBIN:=$MRS/target/release/mistralrs}"
+: "${MRS_FLAGS:=--format gguf}"
 
 # Decode-step variants, `dump.sh <variant>` (`just dump-ref-qwen3moe <variant>`): one decode step
 # dumped after a quiet prefill (dump_ref.cpp, --decode-step), each into a set of its own — dump.sh

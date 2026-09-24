@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Qwen3-30B-A3B decode by depth with the whole model on the timing card, three engines in one lease
-# (run on the box, lead-only): our engine (generate_qwen3moe --time), ik (llama-bench -gp D,N) and
-# mainline llama.cpp (llama-bench -d D), alternated arm by arm.
+# Qwen3-30B-A3B decode by depth with the whole model on the timing card, four engines in one lease
+# (run on the box, lead-only): our engine (generate_qwen3moe --time), ik (llama-bench -gp D,N),
+# mainline llama.cpp (llama-bench -d D) and mistral.rs (mistralrs bench --depth D), alternated arm
+# by arm.
 #
 #   BLOOMERY_MODEL=qwen3moe tools/box.sh 'bash tools/ref/depth-qwen3moe.sh 6 ik:6 lcpp:6'
 #   just depth-gpu-qwen3moe 6 ik:6 ikdef:6 lcpp:6 1024 ik:1024 ikdef:1024 lcpp:1024 4096 ik:4096 ikdef:4096 lcpp:4096
+#   just depth-gpu-qwen3moe 6 lcpp:6 mrs:6 4096 lcpp:4096 mrs:4096
+#   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-qwen3moe 6 lcpp:6 mrs:6    # the command lines, no lease, no load
 #
 # depth-ds41.sh's shape, and it blocks the same failure: a ratio read at one depth and quoted as
 # "decode is faster" — a step's attention term grows with the cached keys, so the depth goes into
@@ -13,13 +16,14 @@
 # Arms, in lease order (the order rotates by one slot each round — the position bias ab-decode.sh
 # names):
 #   <D>       ours, D >= 1: generate_qwen3moe --tokens <lcg_prompt D> -n N --ctx C --time. The D
-#             fed ids are D real decode steps, untimed (lease.sh's lcg_prompt: 100000, then ids in
-#             [1000, 91000), all inside this vocabulary); generated token 0 comes out of the last
-#             of them and the N - 1 steps after it are timed. C is D + N rounded up to 256: both
+#             fed ids are prefilled untimed, eight positions per pass (Qwen3moeModel::prefill; the
+#             `step 0` line names the passes), from lease.sh's lcg_prompt: 100000, then ids in
+#             [1000, 91000), all inside this vocabulary; generated token 0 comes out of the last
+#             pass and the N - 1 steps after it are timed. C is D + N rounded up to 256: both
 #             llama-benches size n_ctx to D + N for this test and pad it to 256 under flash
 #             attention (ik: GGML_PAD(n_ctx, llama_kv_cache::get_padding(flash_attn)) in
-#             src/llama.cpp; mainline: GGML_PAD(n_ctx, 256) in src/llama-context.cpp), so the three
-#             caches have one height.
+#             src/llama.cpp; mainline: GGML_PAD(n_ctx, 256) in src/llama-context.cpp), so the
+#             caches have one height (mistral.rs: below).
 #             Our flash grid is fixed by C (flash_gqa::segments_for), so C goes into the row.
 #             BLOOMERY_GEN_CTX fixes C for every ours arm instead, e.g. at a serving height.
 #   ik:<D>    ik: llama-bench -p 0 -n 0 -gp D,N -r 1 $IK_GPU_FLAGS (D = 0: plain tg N). The D-token
@@ -30,13 +34,33 @@
 #   lcpp:<D>  mainline: llama-bench -p 0 -n N -d D -r 1 $LCPP_GPU_FLAGS (D = 0: plain tg N).
 #             Mainline has no -gp; -d prefills D tokens before its clock starts. Its label is
 #             `tgN @ dD`, ik's `tgN@ppD`.
-# Both references feed std::rand() ids, prefill and steps alike; ours feeds its greedy
-# continuation, which is why our row carries distinct_tokens. Every arm is one process — a model
-# load, one prefill, N steps — and the three engines open the one file.
+#   mrs:<D>   mistral.rs, D >= 1: mistralrs bench -f <MODEL> --prompt-len 0 --gen-len N --depth D
+#             --iterations 1 --warmup 1 --max-seq-len C --pa-context-len C+32 $MRS_FLAGS. One request
+#             of D prompt ids with greedy sampling and EOS stop off; its clock (mistralrs-cli
+#             src/commands/bench.rs, recv_measurement) runs from the first streamed token to the
+#             last, over N - 1 intervals, so the timed tokens sit at the positions ours times. The
+#             warmup is one whole discarded request, as llama-bench's own warmup run is.
+#             --pa-context-len sizes the PagedAttention pool (on by default on CUDA) to the
+#             other engines' cache height C instead of 90 % of the free memory: the pool keeps
+#             one 32-token block back, so C + 32 leaves C usable. --max-seq-len C is the
+#             automatic device mapper's length, which only places layers. The weights stay in
+#             the file's quantized types; activations are bf16 (`DType selected`) and so is the
+#             pool (`KV cache type`) — load lines echoed with the row. mistral.rs
+#             refuses --depth 0 with a decode length (bench.rs run_bench), so D = 0 is refused here.
+#             Its row reads the `Decode (N tokens @ dD)` row of the bench's table (T/s, one decimal).
+#   mrspa0:<D> the same with --paged-attn off in place of --pa-context-len: mistral.rs's own KV
+#             cache and attention path, interleaved with mrs:<D>, says which is its faster set.
+#             That cache is sized by mistral.rs, not by C: this arm is outside the one-height
+#             statement above.
+# ik and mainline feed std::rand() ids, prefill and steps alike; mistral.rs feeds prompt ids 1000 +
+# (start + i) mod 2048 and then its greedy continuation; ours feeds its greedy continuation, which
+# is why our row carries distinct_tokens. Every arm is one process — a model load, the prefill, N
+# steps (mistral.rs: its warmup request, then the timed one) — and the four engines open the one
+# file.
 #
-# Flags. All three arms hold every layer, the output head and an f16 K/V cache on the card
-# (llama-bench's -ctk/-ctv default is f16; ours keeps f16 planes), so a step reads the same weight
-# and cache bytes in each. The input embedding differs: both references keep it on the host and
+# Flags. The ours, ik and lcpp arms hold every layer, the output head and an f16 K/V cache on the
+# card (llama-bench's -ctk/-ctv default is f16; ours keeps f16 planes), so a step reads the same
+# weight and cache bytes in each. The input embedding differs: both references keep it on the host and
 # copy one row to the card per step (ik: buft_input in src/llama.cpp; mainline: dev_input in
 # src/llama-model.cpp), ours gathers it on the card. The references' flag sets are the profile's
 # (models/qwen3moe.sh), chosen by reading each tree's CLI, docs and loader; no flag sweep has been
@@ -67,10 +91,19 @@
 #         threads, as above); -b, -ub (the untimed prefill); -ctk/-ctv (as above). Mainline has
 #         no fused-MoE or merge flag: CUDA graphs and op fusion are build options, on in this
 #         build (GGML_CUDA_GRAPHS=ON in the tree's CMakeCache.txt).
+#   mrs   --format gguf  the file's format, spelled out (the suffix would pick it)
+#         left out: a subcommand (bench's own options take the model; `auto` is the default path);
+#         -n/--device-layers and --topology (one visible card, automatic mapping puts every layer
+#         on it); --isq, --quant, --dtype (another computation, or the file's own types); --cpu;
+#         --pa-block-size, --pa-cache-type (their defaults: 32 tokens, the compute dtype); --seed
+#         (greedy sampling); --max-batch-size (one sequence). The binary does not print its cargo
+#         features; the witness records its sha256, tree and version, and the load lines where
+#         its layers and cache went.
 #
-# The trees are the profile's IK and LCPP. The witness prints each binary's sha256 with its tree's
-# HEAD and dirty count, and each reference row the binary's own `build:` line — a tree can move
-# after its binary was built — and the device llama-bench opened.
+# The trees are the profile's IK, LCPP and MRS. The witness prints each binary's sha256 with its
+# tree's HEAD and dirty count, and each reference row the binary's own `build:` line (mistral.rs:
+# its --version line) — a tree can move after its binary was built — and the device llama-bench
+# opened.
 #
 # Paging. The witness prints the page cache and the major fault count before and after every arm:
 # the file is 18.6 GB, and another round's host set can evict it between two arms.
@@ -80,13 +113,15 @@
 # runner with rc 75 and no summary (guard_timing below).
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 4),
-# BLOOMERY_GEN_WARM (generate_qwen3moe --warm), BLOOMERY_GEN_CTX (above), BLOOMERY_GEN_BIN
-# (default target/release/generate_qwen3moe), BLOOMERY_ARM_BOUND (seconds one arm may run,
-# default 900: a hung arm fails the runner with rc 124/137 instead of holding the lease).
+# BLOOMERY_GEN_WARM (generate_qwen3moe --warm), BLOOMERY_GEN_CTX (above; mrs arms take the same C),
+# BLOOMERY_GEN_BIN (default target/release/generate_qwen3moe), BLOOMERY_ARM_BOUND (seconds one arm
+# may run, default 900: a hung arm fails the runner with rc 124/137 instead of holding the lease),
+# BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree lines and the rotation, then
+# exit 0 before the lease: nothing is loaded and nothing is timed).
 set -uo pipefail
-# The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, LCPP, LCPPBIN, LCPP_GPU_FLAGS);
-# tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so the three engines open
-# one file.
+# The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_DEFAULT_FLAGS, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
+# MRS, MRSBIN, MRS_FLAGS); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so
+# the four engines open one file.
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 [ "$MODEL_NAME" = qwen3moe ] || {
@@ -99,21 +134,27 @@ ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_qwen3moe}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 GEN_CTX=${BLOOMERY_GEN_CTX:-}
+DRY=${BLOOMERY_DRY:-}
 case $GEN_CTX in
   *[!0-9]* | 0) echo "depth-qwen3moe.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
 esac
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6 lcpp:6)
-ours=0 ik=0 lcpp=0
+ours=0 ik=0 lcpp=0 mrs=0
 for a in "${ARMS[@]}"; do
-  case $a in
-    ik:*) dep=${a#ik:}; ik=1 ;;
-    ikdef:*) dep=${a#ikdef:}; ik=1 ;;
-    lcpp:*) dep=${a#lcpp:}; lcpp=1 ;;
-    *) dep=$a; ours=1 ;;
+  eng=${a%%:*}
+  [ "$eng" != "$a" ] || eng=ours
+  case $eng in
+    ours) ours=1 ;;
+    ik | ikdef) ik=1 ;;
+    lcpp) lcpp=1 ;;
+    mrs | mrspa0) mrs=1 ;;
+    *) eng=bad ;;
   esac
-  case $dep in
-    '' | *[!0-9]*) echo "depth-qwen3moe.sh: arm '$a' is <D>, ik:<D>, ikdef:<D> or lcpp:<D>" >&2; exit 64 ;;
+  dep=${a#*:}
+  case $eng:$dep in
+    bad:* | *: | *:*[!0-9]*) echo "depth-qwen3moe.sh: arm '$a' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, mrs:<D> or mrspa0:<D>" >&2; exit 64 ;;
+    mrs:0 | mrspa0:0) echo "depth-qwen3moe.sh: arm '$a': mistral.rs refuses --depth 0 with a decode length" >&2; exit 64 ;;
   esac
   # Our prompt is one argument of D ids of up to six characters each; the kernel caps one
   # argument at 128 KiB.
@@ -129,10 +170,12 @@ source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 # Each engine's binary matters only to its own arms: a reference-only run neither builds ours (the
-# recipe skips the build) nor reads it, so its freshness is not asked.
-if [ "$ours" = 1 ]; then assert_fresh_binary "$BIN" || exit $?; fi
+# recipe skips the build) nor reads it, so its freshness is not asked. A dry run asks nothing of
+# our binary: it prints the command line it would run.
+if [ "$ours" = 1 ] && [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?; fi
 if [ "$ik" = 1 ]; then [ -x "$IKBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $IKBIN" >&2; exit 2; }; fi
 if [ "$lcpp" = 1 ]; then [ -x "$LCPPBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $LCPPBIN" >&2; exit 2; }; fi
+if [ "$mrs" = 1 ]; then [ -x "$MRSBIN" ] || { echo "depth-qwen3moe.sh: no mistralrs at $MRSBIN" >&2; exit 2; }; fi
 CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 # A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
 # status` from rewriting the index of a tree this root process does not own.
@@ -143,13 +186,20 @@ tree_line() {
   dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
   echo "$bin sha256=$sha head=$head dirty_files=$dirty"
 }
-IK_LINE='' LCPP_LINE=''
+IK_LINE='' LCPP_LINE='' MRS_LINE='' MRS_VERSION=''
 [ "$ik" = 0 ] || IK_LINE=$(tree_line "$IKBIN" "$IK")
 # shellcheck disable=SC2153 # LCPP is the profile's, which shellcheck does not follow
 [ "$lcpp" = 0 ] || LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP")
+if [ "$mrs" = 1 ]; then
+  # shellcheck disable=SC2153 # MRS is the profile's, as LCPP
+  MRS_LINE=$(tree_line "$MRSBIN" "$MRS")
+  MRS_VERSION=$("$MRSBIN" --version 2>&1 | head -n 1)
+  MRS_LINE="$MRS_LINE version=${MRS_VERSION:-?}"
+fi
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
   [ -z "$LCPP_LINE" ] || echo "    lcpp: $LCPP_LINE"
+  [ -z "$MRS_LINE" ] || echo "    mrs: $MRS_LINE"
 }
 
 # The witness before and after every row: the timing card's lines (with our binary), the busiest
@@ -180,51 +230,119 @@ guard_timing() {
   exit 75
 }
 
-# One reference arm: its llama-bench on its flags, the row, and the sum.
+# ref_cmd <engine> <depth>: the reference arm's binary, arguments and row label, into REF_BIN,
+# REF_ARGS and REF_LABEL. The flags are word-split on purpose: the profile keeps them as one string.
+ref_cmd() {
+  local eng=$1 dep=$2 flags ctx
+  case $eng in
+    ik | ikdef)
+      REF_BIN=$IKBIN flags=$IK_GPU_FLAGS
+      [ "$eng" = ik ] || flags=$IK_GPU_DEFAULT_FLAGS
+      if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n 0 -gp "$dep,$N"); REF_LABEL="tg$N@pp$dep |"; fi
+      # shellcheck disable=SC2206
+      REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
+      ;;
+    lcpp)
+      REF_BIN=$LCPPBIN flags=$LCPP_GPU_FLAGS
+      if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n "$N" -d "$dep"); REF_LABEL="tg$N @ d$dep |"; fi
+      # shellcheck disable=SC2206
+      REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
+      ;;
+    mrs | mrspa0)
+      REF_BIN=$MRSBIN flags=$MRS_FLAGS
+      ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
+      # shellcheck disable=SC2206
+      REF_ARGS=(bench $flags -f "$MODEL" --prompt-len 0 --gen-len "$N" --depth "$dep" --iterations 1 --warmup 1 --max-seq-len "$ctx")
+      # The pool holds (blocks - 1) whole 32-token blocks of the context asked for (the scheduler keeps
+      # one back: paged_attention/mod.rs, available_context_tokens), so one block more than C.
+      if [ "$eng" = mrs ]; then REF_ARGS+=(--pa-context-len "$((ctx + 32))"); else REF_ARGS+=(--paged-attn off); fi
+      REF_LABEL="Decode ($N tokens @ d$dep)"
+      ;;
+  esac
+}
+
+# ref_val <engine> <label>: the arm's tok/s from its output on stdin. llama-bench prints a markdown
+# table (`| … | t/s ± sd |`); mistralrs bench a box-drawn one (`│ Decode (N tokens @ dD) ┆ T/s ± sd
+# ┆ … ms TPOT │`) whose first `<number> ± ` is the T/s cell. Its log lines carry ANSI colour codes.
+ref_val() {
+  case $1 in
+    mrs | mrspa0) sed 's/\x1b\[[0-9;]*m//g' | grep -F "$2" | grep -oE '[0-9][0-9.]* ± ' | head -n 1 | sed 's/ ± //' ;;
+    *) grep -F "$2" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g' ;;
+  esac
+}
+
+# One reference arm: its binary on its flags, the row, and the sum.
 # ref_arm <engine> <depth> <round>
 ref_arm() {
-  local eng=$1 dep=$2 r=$3 bin flags raw rc label val build dev t0 t1 fail
-  local -a cmd
-  if [ "$eng" != lcpp ]; then
-    bin=$IKBIN flags=$IK_GPU_FLAGS
-    [ "$eng" = ik ] || flags=$IK_GPU_DEFAULT_FLAGS
-    if [ "$dep" = 0 ]; then cmd=(-p 0 -n "$N"); label="tg$N |"; else cmd=(-p 0 -n 0 -gp "$dep,$N"); label="tg$N@pp$dep |"; fi
-  else
-    bin=$LCPPBIN flags=$LCPP_GPU_FLAGS
-    if [ "$dep" = 0 ]; then cmd=(-p 0 -n "$N"); label="tg$N |"; else cmd=(-p 0 -n "$N" -d "$dep"); label="tg$N @ d$dep |"; fi
-  fi
+  local eng=$1 dep=$2 r=$3 raw rc val build dev t0 t1 fail
+  ref_cmd "$eng" "$dep"
   witness "pre r$r $eng d=$dep"
   ref_witness
   t0=$(date +%s)
-  # shellcheck disable=SC2086
-  raw=$(timeout --kill-after=10 "$BOUND" "$bin" -m "$MODEL" "${cmd[@]}" -r 1 $flags 2>&1)
+  raw=$(timeout --kill-after=10 "$BOUND" "$REF_BIN" "${REF_ARGS[@]}" 2>&1)
   rc=$?
   t1=$(date +%s)
   witness "post r$r $eng d=$dep"
-  val=$(echo "$raw" | grep -F "$label" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
+  val=$(echo "$raw" | ref_val "$eng" "$REF_LABEL")
   if [ $rc -ne 0 ] || [ -z "$val" ]; then
     # The whole output goes to a file: the loader's reason for a failed load is many lines
     # above the tail.
     fail=${TMPDIR:-/tmp}/depth-qwen3moe-$eng-d$dep-r$r.log
     echo "$raw" > "$fail"
-    echo "r$r $eng d=$dep produced no '${label% |}' row (rc $rc); full output: $fail" >&2
+    echo "r$r $eng d=$dep produced no '${REF_LABEL% |}' row (rc $rc); full output: $fail" >&2
     echo "$raw" | tail -n 20 >&2
     exit 1
   fi
-  # The reference's own table, header and row: its columns name every setting it ran with that
-  # differs from its defaults, so the log shows which flags took.
-  echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
-  build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
-  dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
+  case $eng in
+    mrs | mrspa0)
+      # The load lines that say what ran (weight dtype, layer placement, the KV cache and its
+      # length, the decode graphs, the tree), then the bench's own table.
+      echo "$raw" | sed 's/\x1b\[[0-9;]*m//g' | grep -E 'DType selected|Layers [0-9]+-[0-9]+: |PagedAttention (KV cache type|with block)|CUDA decode graphs|git revision' \
+        | sed 's/^[^ ]* *INFO [^ ]* //' | sed "s/^/    $eng load /"
+      echo "$raw" | sed 's/\x1b\[[0-9;]*m//g' | grep -E '^│' | sed "s/^/    $eng table /"
+      build=$MRS_VERSION
+      dev=$(echo "$raw" | sed 's/\x1b\[[0-9;]*m//g' | sed -n 's/.*Layers \([0-9]*-[0-9]*: .*\)$/layers \1/p' | head -n 1)
+      ;;
+    *)
+      # The reference's own table, header and row: its columns name every setting it ran with that
+      # differs from its defaults, so the log shows which flags took.
+      echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
+      build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
+      dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
+      ;;
+  esac
   echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s"
   sums+=("$eng|$dep|$r|$val|")
 }
+
+if [ -n "$DRY" ]; then
+  echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+  ref_witness | sed 's/^   /[dry]/'
+  for a in "${ARMS[@]}"; do
+    eng=${a%%:*}
+    dep=${a#*:}
+    if [ "$eng" = "$a" ]; then
+      ctx=${GEN_CTX:-$(((a + N + 255) / 256 * 256))}
+      echo "[dry] $a: timeout --kill-after=10 $BOUND $BIN --tokens <lcg_prompt $a> -n $N --ctx $ctx --time${WARM:+ --warm $WARM}"
+    else
+      ref_cmd "$eng" "$dep"
+      echo "[dry] $a: timeout --kill-after=10 $BOUND $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'"
+    fi
+  done
+  for r in $(seq "$ROUNDS"); do
+    order=()
+    for i in $(seq 0 $((${#ARMS[@]} - 1))); do order+=("${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}"); done
+    echo "[dry] round $r order: ${order[*]}"
+  done
+  exit 0
+fi
 
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS ikdef flags=$IK_GPU_DEFAULT_FLAGS"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS"
+echo "[config] mrs: $MRSBIN flags=$MRS_FLAGS (mrs: --pa-context-len C, mrspa0: --paged-attn off)"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 witness pre
 ref_witness
@@ -238,9 +356,7 @@ for r in $(seq "$ROUNDS"); do
     guard_other
     guard_timing
     case $a in
-      ik:*) ref_arm ik "${a#ik:}" "$r" ;;
-      ikdef:*) ref_arm ikdef "${a#ikdef:}" "$r" ;;
-      lcpp:*) ref_arm lcpp "${a#lcpp:}" "$r" ;;
+      *:*) ref_arm "${a%%:*}" "${a#*:}" "$r" ;;
       *)
         dep=$a
         ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
@@ -278,28 +394,29 @@ for r in $(seq "$ROUNDS"); do
 done
 echo
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
-echo "    llama-bench's own mean over the N steps — the cross-engine ratio reads these. The p50"
-echo "    column is ours only. ==="
+echo "    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)"
+echo "    — the cross-engine ratio reads these. The p50 column is ours only. ==="
 printf '%s\n' "${sums[@]}" | awk -F'|' '{
   k = $1 " d=" $2; s[k] += $4; n[k]++; if ($5 != "") { sp[k] += $5; np[k]++ }
   if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
 } END { for (k in s) {
   spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
-  printf "mean %-12s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : ""), n[k] } }' | sort
+  printf "mean %-14s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : ""), n[k] } }' | sort
 echo
 echo "=== ours / reference per depth: each round's ratio of the pair measured in that round (arms"
 echo "    that ran more than once in a round are averaged first), their mean with its 95 % interval"
 echo "    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ==="
-deps=$(printf '%s\n' "${ARMS[@]}" | sed 's/^[a-z]*://' | sort -un | tr '\n' ' ')
-printf '%s\n' "${sums[@]}" | awk -F'|' -v deps="$deps" -v rounds="$ROUNDS" '{
+deps=$(printf '%s\n' "${ARMS[@]}" | sed 's/^[a-z0-9]*://' | sort -un | tr '\n' ' ')
+refs=$(printf '%s\n' "${ARMS[@]}" | sed -n 's/^\([a-z0-9]*\):.*/\1/p' | sort -u | tr '\n' ' ')
+printf '%s\n' "${sums[@]}" | awk -F'|' -v deps="$deps" -v refs="$refs" -v rounds="$ROUNDS" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
 } END {
   split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086", t, " ")
   nd = split(deps, d, " ")
-  split("ik ikdef lcpp", refs, " ")
-  for (i = 1; i <= nd; i++) for (j = 1; j <= 3; j++) {
-    ref = refs[j]
+  nr = split(refs, rf, " ")
+  for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
+    ref = rf[j]
     if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
     c = 0; m = 0; list = ""
     for (r = 1; r <= rounds; r++) {
@@ -312,7 +429,7 @@ printf '%s\n' "${sums[@]}" | awk -F'|' -v deps="$deps" -v rounds="$ROUNDS" '{
     m /= c; ss = 0
     for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
     ci = (c > 1) ? sprintf("± %.4f", ((c - 1 <= 20) ? t[c - 1] : 2.0) * sqrt(ss / (c - 1)) / sqrt(c)) : "(one round: no interval)"
-    printf "ratio d=%-5s ours/%-5s  mean %.4f %s (n=%d)  of means %.4f  per round:%s\n", d[i], ref, m, ci, c, (as["ours" SUBSEP d[i]] / an["ours" SUBSEP d[i]]) / (as[ref SUBSEP d[i]] / an[ref SUBSEP d[i]]), list
+    printf "ratio d=%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s\n", d[i], ref, m, ci, c, (as["ours" SUBSEP d[i]] / an["ours" SUBSEP d[i]]) / (as[ref SUBSEP d[i]] / an[ref SUBSEP d[i]]), list
   }
 }'
 witness post
