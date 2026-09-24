@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GPU 게이트 러너 — 박스에서, box.sh가 들어간 원격 디렉터리에서 돈다. 레시피가 방금 지은
-# target/release/<이름>을 게이트 락(/root/bloomery-gate.lock) 아래에서 상한과 함께 돌리고, 그 종료 코드를
+# target/release/<이름>을 카드의 게이트 락 아래에서 상한과 함께 돌리고, 그 종료 코드를
 # 그대로 돌려준다. 이름 뒤의 인자는 바이너리에 그대로 붙는다.
 #   ./tools/box.sh 'cargo oxide build … --bin gate_p3 && bash tools/gpu-gate.sh gate_p3'
 #
@@ -11,7 +11,7 @@
 #
 # 종료 코드: 게이트의 것 그대로. 124 = 상한에서 TERM으로 끝남, 137 = TERM을 무시해 --kill-after의 KILL로
 # 끝남, 75 = 30분 안에 락을 못 잡음(경쟁이지 게이트 실패가 아니다), 64 = 사용법, 2 = 바이너리 없음.
-# 환경: BLOOMERY_GATE_BOUND(초, 기본 900 — tools/gate.sh와 같은 레버).
+# 환경: BLOOMERY_GATE_BOUND(초, 기본 900 — tools/gate.sh와 같은 레버), BLOOMERY_GATE_CARD(아래 카드 고르기).
 set -uo pipefail
 NAME=${1:-}
 [ -n "$NAME" ] || { echo "usage: gpu-gate.sh <target/release binary> [args...]" >&2; exit 64; }
@@ -22,11 +22,44 @@ case "$BOUND" in
 esac
 EXE=./target/release/$NAME
 [ -x "$EXE" ] || { echo "gpu-gate.sh: no $EXE — the recipe builds it before calling this" >&2; exit 2; }
+# 카드 고르기. 락은 카드마다 하나: 3090은 예전 경로 그대로(돌고 있는 트랙의 옛 사본이 그 경로를 잡는다),
+# A6000은 새 파일. BLOOMERY_GATE_CARD=3090(기본 — 예전과 같다) | a6000 | any. any는 A6000을 먼저 본다 —
+# V4.1 `--place gate` 게이트는 3090에서만 돌 수 있으니 떠도는 게이트가 3090을 비워 두는 편이 낫다. A6000은
+# 타이밍 임대(/root/bloomery-cpu.lock)가 잡혀 있거나 그 카드에 컴퓨트 프로세스가 있으면 건너뛴다.
+CARD=${BLOOMERY_GATE_CARD:-3090}
+case "$CARD" in
+  3090 | a6000 | any) ;;
+  *) echo "gpu-gate.sh: BLOOMERY_GATE_CARD is 3090, a6000 or any, got '$CARD'" >&2; exit 64 ;;
+esac
+uuid_of() { nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "$1" | cut -d, -f1 | head -1; }
+a6000_idle() {
+  local u; u=$(uuid_of A6000); [ -n "$u" ] || return 1
+  ! nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | grep -q "$u"
+}
 exec 9>/root/bloomery-gate.lock
-if ! flock -w 1800 9; then
-  echo "gpu-gate.sh: the gate lock was not free within 30 min — contention, not a red gate" >&2
+exec 8>/root/bloomery-gate-a6000.lock
+take_a6000() { flock -n 8 || return 1; if [ "$CARD" = any ] && ! { flock -n /root/bloomery-cpu.lock true && a6000_idle; }; then flock -u 8; return 1; fi; GOT=a6000; }
+take_3090() { flock -n 9 || return 1; GOT=3090; }
+GOT=
+for ((waited = 0; waited <= 1800; waited += 5)); do
+  case "$CARD" in
+    3090) take_3090 ;;
+    a6000) take_a6000 ;;
+    any) take_a6000 || take_3090 ;;
+  esac
+  [ -n "$GOT" ] && break
+  sleep 5
+done
+if [ -z "$GOT" ]; then
+  echo "gpu-gate.sh: no gate lock ($CARD) was free within 30 min — contention, not a red gate" >&2
   exit 75
 fi
+if [ "$GOT" = a6000 ] || [ "$CARD" = any ]; then
+  U=$(uuid_of "$([ "$GOT" = a6000 ] && echo A6000 || echo 3090)")
+  [ -n "$U" ] || { echo "gpu-gate.sh: the $GOT lookup failed" >&2; exit 75; }
+  export CUDA_VISIBLE_DEVICES=$U
+fi
+echo "gpu-gate.sh: $NAME on the $GOT (asked $CARD)" >&2
 timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 rc=$?
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then

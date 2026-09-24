@@ -110,12 +110,16 @@ caught in review the same evening, and a 13-gate rerun found no red hidden in
 that window. The exit code now has one owner, `tools/gate.sh`, and
 `just check-recipes` fails on a test recipe that carries `||` or a bare
 `cargo test`.) GPU gate binaries have the same bound through their own
-runner, `tools/gpu-gate.sh`: it takes `/root/bloomery-gate.lock`, runs the
+runner, `tools/gpu-gate.sh`: it takes a card's gate lock, runs the
 binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`), and
 returns the binary's exit code (124/137 timed out, 75 lock contention).
-The lock serializes every 3090 gate of every track, so one hung GPU gate
-used to stall all of them; `just check-recipes` now fails on a recipe that
-takes that lock itself.
+There is one lock per card: `/root/bloomery-gate.lock` (the 3090) and
+`/root/bloomery-gate-a6000.lock`. `BLOOMERY_GATE_CARD=3090|a6000|any`
+picks (default `3090`); `any` takes an idle A6000 when no timing lease is
+held, else the 3090, so a gate that names no card does not queue behind a
+V4.1 `--place gate` gate, which can only run on the 3090. Pass it through
+`BLOOMERY_BOX_ENV`. One hung GPU gate used to stall every track through the
+single lock; `just check-recipes` fails on a recipe that takes a lock itself.
 
 ## Derive first, measure the gap (2026-09-22)
 
