@@ -75,5 +75,9 @@ for kv in ${box_env[@]+"${box_env[@]}"}; do
   esac
   ENVS="${ENVS}export $name=$(printf %q "${kv#*=}") && "
 done
+# serve의 build.rs가 `/props`의 version에 새기는 커밋. 박스 사본에는 .git이 없어서(rsync가 뺀다) 여기서 넘긴다.
+# 이 트리에 커밋에 없는 변경이 있으면 `-dirty`를 붙인다 — 그 바이너리는 그 커밋의 것이 아니다.
+COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+[ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 ssh "$HOST" "source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $FWD$PROFILE && $DATA && $ENVS$*"
+} && cd $REMOTE && $FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT && $ENVS$*"

@@ -165,3 +165,14 @@
 
 ㊶ (ktok, 원문 [`research/ktok-report.md`](research/ktok-report.md), 머지 `77eaf88` — 탐침은 `bench_v41_host` 팔 문법 `<n_host>x<rows>`·`engine-sep`로 남김, 리드 재실행 check·lint 169·fmt·recipes·comments·arch 전부 rc=0) 한 토큰 가정 지도 27행(C4 카드에 요약). 지금 할 것: **`attn.rs:701` gm≠1 거부**(비율 1 스트림 20층이 k=2에서 오늘 거부됨, S), `head.rs` m=1 assert(dspark도 막힘), `hc.rs:83` `HC_MAX_TOKENS=8`·gemv m≤8·`Q8Act` m≤8이 K_MAX 벽(스펙의 `tensor.rs:106`은 K축 한계라 틀림). 스펙 밖: `bench_v41_host.rs:425` `blocks()`가 시간 안에서 할당(XS), `ops.rs:1599` `MAX_DEFER_SLOTS` 16 초과 그룹이 호출자 결합으로(행당 +0.19 ms[유도], XS–S), `cores.rs:817` q3_K 1col = 다열 열 0 비트 핀 없음(XS 게이트).
 ㊷ (dspark, 원문 [`research/dspark-report.md`](research/dspark-report.md), 읽기 전용) 스펙 밖: `router.rs:41,44` `N_EXPERT`/`N_USED` 컴파일 상수(128/3 드래프트 불가, const generic S), `experts.rs:49` combine 슬롯 리터럴 6(S), `gguf/quant.rs:33` MXFP4(39) 없음(XS–S), `experts.rs:23` SwiGLU clamp 규칙(ik `min(silu(g),10)` 대 `model.py` `silu(min(g,10))`, g>10에서 ~5e-5) 문서 없음(XS). 3090 BW는 250 W 캡 아래 미확인(D 유도의 전제).
+
+## serve 템플릿·`/props` (propsengine 보고, 2026-09-24 — 받을 라운드: 템플릿 정리 하나로 묶는다)
+
+- `crates/serve/src/template.rs:1334` 필터 인자를 버리고(`_args`) `:1124`는 메서드 kwargs를 버린다 — `tojson(indent=2)`, `split(',', maxsplit=1)`이 조용히 다른 결과를 낸다(S).
+- `template.rs:846` `render_py`가 리스트를 JSON(`["b"]`)으로 찍는다. Python `str()`은 `['b']`(S).
+- `template.rs:16-18` 키를 정렬 순서로 낸다(`preserve_order` 없음) — Qwen3 tools 분기의 `tool | tojson`이 jinja2와 갈릴 수 있다(M).
+- `split()`/`strip()`의 공백 판정이 Rust White_Space라 Python의 U+001C–U+001F와 다르다(XS).
+- `crates/gpu-gates/src/bind.rs` `class_of`가 EngramDense를 `ngram`으로 보낸다 — toktape는 ngram을 "안 읽힘"으로 센다(`internal/bandwidth/split.go:121`). `active_bytes_per_token`을 `Row::read_bytes`(`crates/model/src/placement.rs:592`) 장치별 합으로 보낼 때 같이 고친다(S).
+- `/props` `engine.args`는 argv 그대로다 — 비밀을 싣는 플래그(`--api-key` 류)가 생기면 그 값을 가린다.
+- `gate_ds41_serve.rs:472` `check(ok: &mut bool…)`는 R24 패턴(기존 코드, S).
+- 업스트림 후보(MUL-7, 코드 독해만 — 가설): ik `common/jinja/value.cpp:92-105`·`runtime.cpp:771-773`은 음수 step 슬라이스에서 start/stop을 무시하거나 0/len으로 채워 `a[2::-1]`·`a[4:1:-2]`를 틀리게 렌더한다. mainline `930e2fa59`는 기본값만 고쳤고 `a[-10::-1]`·`a[3:-1:-1]`이 남는다. FAIL-first는 test-jinja 케이스 하나(각 S). ik PR은 하나만 열어 둔다는 사용자 지시(09-24)가 있어 mainline 먼저.
