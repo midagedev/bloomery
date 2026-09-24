@@ -13,8 +13,20 @@
 //
 // Build: bash tools/ref/build-dequant.sh   (on the box, IK=/home/user/ik_llama.cpp)
 // Run:   $BLOOMERY_DATA/bin/dequant_ref [model.gguf [out_dir [type_name ...]]]
+//        $BLOOMERY_DATA/bin/dequant_ref --synthetic [out_dir]
+//
+// --synthetic covers the types no model file on the box holds (q2_K, iq2_xs,
+// iq3_xxs, iq4_xs): per type, kSynthQuant rows of kSynthLen pseudo-random
+// values quantized by ggml itself (ggml_quantize_chunk with a synthetic
+// importance matrix, as the community files are made), then kSynthRandom rows
+// whose code bytes are random and whose f16 scales are set to finite values,
+// so every grid index and sign pattern is decoded. <out> defaults to
+// $BLOOMERY_DATA/ref-synth and gets, per type, <type>.blocks (the quantized
+// bytes), <type>.raw (ggml's to_float of them), <type>.meta, and manifest.txt.
 
 #include <algorithm>
+#include <cmath>
+#include <iterator>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +61,108 @@ static void write_file(const std::string & path, const void * data, size_t n) {
     if (std::rename(tmp.c_str(), path.c_str()) != 0) fail("cannot rename " + tmp + " to " + path);
 }
 
+// The synthetic set: fixed seed, fixed shapes, so a rerun writes the same bytes.
+static const int64_t kSynthLen = 4096;   // values per row: 16 blocks of 256
+static const int64_t kSynthQuant = 64;   // rows quantized by ggml
+static const int64_t kSynthRandom = 16;  // rows of random codes
+static const uint64_t kSynthSeed = 0x1a2b3c4d5e6f7788ull;
+
+struct Lcg {
+    uint64_t s;
+    uint32_t next() {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return (uint32_t)(s >> 32);
+    }
+    float unit() { return (next() >> 8) * (1.0f / 16777216.0f); } // [0, 1)
+};
+
+// The byte offsets of the f16 scales inside one block, set finite in the random rows.
+static std::vector<size_t> scale_offsets(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q2_K:    return {80, 82};
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ4_XS:  return {0};
+        default: fail("no synthetic layout for this type");
+    }
+    return {};
+}
+
+static int synthetic(const std::string & out_dir) {
+    // ggml_init fills the f16 -> f32 table that GGML_FP16_TO_FP32 reads on this build; the
+    // model path gets it from gguf_init_from_file's context, this path makes its own.
+    struct ggml_init_params ip = {1024, nullptr, true};
+    struct ggml_context * ctx = ggml_init(ip);
+    if (!ctx) fail("ggml_init failed");
+    const enum ggml_type types[] = {GGML_TYPE_Q2_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS};
+    std::filesystem::create_directories(out_dir);
+    std::string manifest;
+    for (const enum ggml_type type : types) {
+        Lcg rng{kSynthSeed ^ (uint64_t)type};
+        const int64_t rows = kSynthQuant + kSynthRandom;
+        const size_t row_bytes = ggml_row_size(type, kSynthLen);
+
+        // Rows of roughly Gaussian values (sum of four uniforms) with a per-row
+        // scale over two decades and one outlier per 256, and an importance
+        // matrix of positive weights shared by every row.
+        std::vector<float> x((size_t)(kSynthQuant * kSynthLen));
+        for (int64_t r = 0; r < kSynthQuant; ++r) {
+            const float scale = 0.01f * std::pow(100.0f, rng.unit());
+            for (int64_t j = 0; j < kSynthLen; ++j) {
+                float g = rng.unit() + rng.unit() + rng.unit() + rng.unit() - 2.0f;
+                if (j % 256 == 17) g *= 6.0f;
+                x[(size_t)(r * kSynthLen + j)] = scale * g;
+            }
+        }
+        std::vector<float> imatrix((size_t)kSynthLen);
+        for (float & w : imatrix) w = 0.25f + rng.unit();
+
+        std::vector<uint8_t> blocks((size_t)rows * row_bytes);
+        ggml_quantize_init(type);
+        const size_t wrote = ggml_quantize_chunk(type, x.data(), blocks.data(), 0, kSynthQuant, kSynthLen,
+                                                 imatrix.data(), nullptr);
+        if (wrote != (size_t)kSynthQuant * row_bytes) fail("ggml_quantize_chunk wrote a different size");
+
+        // Random-code rows: every byte random, then each f16 scale replaced by a
+        // finite positive half in [2^-10, 2^-2).
+        const size_t bsz = ggml_type_size(type);
+        for (size_t i = (size_t)kSynthQuant * row_bytes; i < blocks.size(); ++i) blocks[i] = (uint8_t)rng.next();
+        for (size_t b = (size_t)kSynthQuant * row_bytes; b < blocks.size(); b += bsz) {
+            for (size_t off : scale_offsets(type)) {
+                const ggml_fp16_t h = ggml_fp32_to_fp16(std::ldexp(1.0f + rng.unit(), -10 + (int)(rng.next() % 8)));
+                std::memcpy(&blocks[b + off], &h, sizeof h);
+            }
+        }
+
+        std::vector<float> out((size_t)(rows * kSynthLen));
+        ggml_type_traits_t traits = ggml_internal_get_type_traits(type);
+        if (!traits.to_float) fail("no to_float for this type");
+        for (int64_t r = 0; r < rows; ++r) {
+            traits.to_float(blocks.data() + (size_t)r * row_bytes, out.data() + (size_t)(r * kSynthLen), kSynthLen);
+        }
+
+        const char * tname = ggml_type_name(type);
+        write_file(out_dir + "/" + tname + ".blocks", blocks.data(), blocks.size());
+        write_file(out_dir + "/" + tname + ".raw", out.data(), out.size() * sizeof(float));
+        char meta[512];
+        const int meta_n = std::snprintf(meta, sizeof meta,
+                     "type=%d %s\nrows=%lld\nrowlen=%lld\nquantized_rows=%lld\nrandom_rows=%lld\nseed=%llu\n",
+                     (int)type, tname, (long long)rows, (long long)kSynthLen, (long long)kSynthQuant,
+                     (long long)kSynthRandom, (unsigned long long)kSynthSeed);
+        if (meta_n < 0 || (size_t)meta_n >= sizeof meta) fail("synthetic meta does not fit its buffer");
+        write_file(out_dir + "/" + tname + ".meta", meta, (size_t)meta_n);
+        manifest += std::to_string((int)type) + " " + tname + " " + std::to_string(rows) + "\n";
+        std::printf("%-8s synthetic rows=%lld (%lld quantized + %lld random) rowlen=%lld row_bytes=%zu\n",
+                    tname, (long long)rows, (long long)kSynthQuant, (long long)kSynthRandom,
+                    (long long)kSynthLen, row_bytes);
+    }
+    ggml_quantize_free();
+    ggml_free(ctx);
+    write_file(out_dir + "/manifest.txt", manifest.data(), manifest.size());
+    std::printf("wrote %zu synthetic types to %s\n", std::size(types), out_dir.c_str());
+    return 0;
+}
+
 static std::vector<uint8_t> read_range(const char * path, int64_t off, size_t n) {
     FILE * f = std::fopen(path, "rb");
     if (!f) fail(std::string("cannot open: ") + path);
@@ -60,6 +174,9 @@ static std::vector<uint8_t> read_range(const char * path, int64_t off, size_t n)
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--synthetic") {
+        return synthetic(argc > 2 ? argv[2] : std::string(kDataDir) + "/ref-synth");
+    }
     const char * path = argc > 1 ? argv[1] : kGgufPath;
     const std::string out_dir = argc > 2 ? argv[2] : std::string(kDataDir) + "/ref";
     const std::vector<std::string> only(argv + std::min(argc, 3), argv + argc);

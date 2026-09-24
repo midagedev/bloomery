@@ -210,6 +210,7 @@ impl CardFormat {
             GgmlType::F16
             | GgmlType::Q5_K
             | GgmlType::MXFP4
+            | GgmlType::Q2_K
             | GgmlType::IQ2_XXS
             | GgmlType::IQ2_XS
             | GgmlType::IQ3_XXS

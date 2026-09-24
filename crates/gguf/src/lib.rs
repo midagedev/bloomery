@@ -27,6 +27,7 @@
 //! Errors, not panics: every file-derived value is bounds-checked — a
 //! truncated or hostile file yields [`LoadError`].
 
+pub mod iq_tables;
 pub mod quant;
 
 pub use quant::{

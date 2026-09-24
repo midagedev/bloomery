@@ -595,8 +595,11 @@ kvclear-probe *ARGS:
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
 # 덤프는 둘이다: V2-Lite의 여섯 타입은 $BLOOMERY_DATA/ref에, V4.1 첫 샤드의 f32·bf16·q8_0은
 # $BLOOMERY_DATA/ref-v41에. --include-ignored라 split 리더와 인벤토리의 평범한 테스트도 같이 돈다.
+# 박스의 모델 파일에 없는 q2_K·iq2_xs·iq3_xxs·iq4_xs는 --synthetic이 ggml로 양자화한 행과 무작위 코드 행을
+# $BLOOMERY_DATA/ref-synth에 덤프하고, i-quant 코드북(iq_tables.rs)은 gen-iq-tables.py --check가 ik 헤더에서
+# 다시 뽑아 커밋된 파일과 바이트로 대조한다.
 gate-1-1:
-    ./tools/box.sh 'bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && "$BLOOMERY_DATA/bin/dequant_ref" "${BLOOMERY_V41_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}" "$BLOOMERY_DATA/ref-v41" f32 bf16 q8_0 && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
+    ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && "$BLOOMERY_DATA/bin/dequant_ref" "${BLOOMERY_V41_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}" "$BLOOMERY_DATA/ref-v41" f32 bf16 q8_0 && "$BLOOMERY_DATA/bin/dequant_ref" --synthetic && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
 gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-gpu-gates-lib gate-gpu-lib gate-sampler

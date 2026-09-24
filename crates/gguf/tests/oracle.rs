@@ -3,7 +3,8 @@
 //! (checked 2026-09-19), so `just gate-1-1` runs them through `tools/box.sh`
 //! after `dequant_ref` has dumped V2-Lite into `$BLOOMERY_DATA/ref` and the
 //! f32, bf16 and q8_0 tensors of V4.1's first shard into
-//! `$BLOOMERY_DATA/ref-v41`.
+//! `$BLOOMERY_DATA/ref-v41`, and its synthetic q2_K and i-quant rows into
+//! `$BLOOMERY_DATA/ref-synth`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -312,4 +313,128 @@ fn hw_resident_copy_is_the_file() {
             );
         }
     }
+}
+
+/// The types no model file on the box holds — q2_K, iq2_xs, iq3_xxs, iq4_xs —
+/// from `dequant_ref --synthetic`: ggml-quantized rows plus rows of random
+/// codes, decoded by our `dequant_row` and compared with ggml's `to_float` bit
+/// for bit. Every product in these decodes is exact (quant.rs's
+/// `iq_products_are_exact`), so any difference is a bug, not rounding. The
+/// dump must hold exactly these four types; the codebook coverage the rows
+/// reached is printed, and a set that misses a grid entry is refused.
+#[test]
+#[ignore = "hw: needs the synthetic oracle dump in $BLOOMERY_DATA/ref-synth"]
+fn hw_dequant_matches_ggml_synthetic() {
+    let dir = data_dir().join("ref-synth");
+    let manifest =
+        fs::read_to_string(dir.join("manifest.txt")).expect("read ref-synth/manifest.txt");
+    let mut seen: Vec<&str> = Vec::new();
+    let mut red: Vec<String> = Vec::new();
+    for line in manifest.lines().filter(|l| !l.trim().is_empty()) {
+        let mut it = line.split_whitespace();
+        let type_num: u32 = it.next().unwrap().parse().unwrap();
+        let tname = it.next().unwrap();
+        let ty = GgmlType::from_u32(type_num);
+        assert_eq!(ty.name(), Some(tname), "type {type_num}: name mismatch");
+        seen.push(tname);
+
+        let meta = fs::read_to_string(dir.join(format!("{tname}.meta")))
+            .unwrap_or_else(|e| panic!("read {tname}.meta: {e}"));
+        let field = |key: &str| -> usize {
+            meta.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .unwrap_or_else(|| panic!("{tname}.meta: no {key}"))
+                .parse()
+                .unwrap()
+        };
+        let (rows, rowlen, quantized) =
+            (field("rows="), field("rowlen="), field("quantized_rows="));
+        let blck = ty.blck_size().unwrap() as usize;
+        let row_bytes = rowlen / blck * ty.type_size().unwrap() as usize;
+        let blocks = fs::read(dir.join(format!("{tname}.blocks")))
+            .unwrap_or_else(|e| panic!("read {tname}.blocks: {e}"));
+        assert_eq!(blocks.len(), rows * row_bytes, "{tname}.blocks size");
+        let raw = fs::read(dir.join(format!("{tname}.raw")))
+            .unwrap_or_else(|e| panic!("read {tname}.raw: {e}"));
+        assert_eq!(raw.len(), rows * rowlen * 4, "{tname}.raw size");
+
+        let mut mine = vec![0.0f32; rows * rowlen];
+        dequant_row(ty, &blocks, &mut mine).unwrap_or_else(|e| panic!("{tname}: {e}"));
+        let differ: Vec<usize> = mine
+            .iter()
+            .zip(raw.as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(_, (m, r))| m.to_bits() != u32::from_le_bytes(**r))
+            .map(|(i, _)| i)
+            .collect();
+        let in_quantized = differ.iter().filter(|&&i| i < quantized * rowlen).count();
+        let coverage = codebook_coverage(ty, &blocks);
+        println!(
+            "{tname:8} rows={rows} (quantized {quantized}) rowlen={rowlen} values={} bit_mismatches={} (quantized rows {in_quantized}) {coverage}",
+            mine.len(),
+            differ.len()
+        );
+        if let Some(&i) = differ.first() {
+            red.push(format!(
+                "{tname}: {} of {} values differ from ggml, first at {i} (ours {:e}, ggml {:e})",
+                differ.len(),
+                mine.len(),
+                mine[i],
+                f32::from_le_bytes(raw.as_chunks::<4>().0[i])
+            ));
+        }
+    }
+    assert!(red.is_empty(), "{}", red.join("\n"));
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        ["iq2_xs", "iq3_xxs", "iq4_xs", "q2_K"],
+        "ref-synth type set"
+    );
+}
+
+/// How many of a codebook's entries the blocks index, as `grid a/b signs c/d`;
+/// panics when a grid or sign entry is never reached (the random rows are
+/// there so that every one is). Types without a codebook report nothing.
+fn codebook_coverage(ty: GgmlType, blocks: &[u8]) -> String {
+    let (grid, signs): (Vec<usize>, Vec<usize>) = match ty {
+        GgmlType::IQ2_XS => blocks
+            .as_chunks::<74>()
+            .0
+            .iter()
+            .flat_map(|b| {
+                b[2..66]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|q| u16::from_le_bytes(*q))
+            })
+            .map(|q| (usize::from(q & 511), usize::from(q >> 9)))
+            .unzip(),
+        GgmlType::IQ3_XXS => {
+            let blks = blocks.as_chunks::<98>().0;
+            let grid = blks
+                .iter()
+                .flat_map(|b| b[2..66].iter().map(|&i| usize::from(i)))
+                .collect();
+            let signs = blks
+                .iter()
+                .flat_map(|b| {
+                    b[66..98]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|w| u32::from_le_bytes(*w))
+                })
+                .flat_map(|w| (0..4).map(move |l| ((w >> (7 * l)) & 127) as usize))
+                .collect();
+            (grid, signs)
+        }
+        _ => return String::new(),
+    };
+    let n_grid = if ty == GgmlType::IQ2_XS { 512 } else { 256 };
+    let distinct = |v: &[usize]| v.iter().collect::<HashSet<_>>().len();
+    let (g, s) = (distinct(&grid), distinct(&signs));
+    assert_eq!((g, s), (n_grid, 128), "{ty}: codebook entries reached");
+    format!("grid {g}/{n_grid} signs {s}/128")
 }
