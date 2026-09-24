@@ -55,6 +55,11 @@ impl DraftRings {
         self.rings.get(l)
     }
 
+    /// Layer `l`'s ring, writable: the gate's way to seat an oracle's rows.
+    pub fn ring_mut(&mut self, l: usize) -> Option<&mut DeviceTensor<u16>> {
+        self.rings.get_mut(l)
+    }
+
     /// Device bytes of every ring.
     #[must_use]
     pub fn device_bytes(&self) -> usize {

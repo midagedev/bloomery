@@ -917,6 +917,12 @@ gate-gpu-dspark-experts:
 gate-gpu-dspark-kv:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_kv && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_dspark_kv'
 
+# DSpark 드래프트의 블록 패스와 헤드를 ik가 떨군 dsref 세트와 대조한다. ik 규칙 arm(블록 인과 마스크, SwiGLU clamp 없음 —
+# ik 드래프트가 도는 방식)은 블록 0–2의 모든 탭을 유도 밴드로 판정하고, 엔진이 도는 기준 규칙(model.py) arm은 두 규칙이
+# 갈리지 않는 행만 판정한다. 블록마다 draft_argmax, w=5 비트 동일, 캡처 노드 수 = 커널 목록(72 + 8w). 수락 수는 찍기만 한다.
+gate-gpu-dspark-graph:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_graph && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_dspark_graph'
+
 # DSpark Markov 헤드 단독 초안(E6)의 오프라인 수락률 — 시간을 재지 않는 CPU 실행이고 임대를 잡지 않는다. 먼저 self-test,
 # 다음 코퍼스 스트림마다 앞 50k토큰의 acc/positions·top-2·top-4와 E5 markov1 재계산, 이전 토큰별 argmax 표의 해시와
 # 위치별 경로와의 불일치 수(0이어야 한다)를 찍는다. 목표는 코퍼스 텍스트 자체다. 인자는 bin에 그대로 간다(--tokens N).

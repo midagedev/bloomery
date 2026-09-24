@@ -376,6 +376,13 @@ impl DraftWeights {
         &self.head
     }
 
+    /// Draft tensor `name` as the GPU loader holds it; `None` for a tensor
+    /// the loader does not hold (the MXFP4 stacks, the Markov words).
+    #[must_use]
+    pub(crate) fn dense(&self, name: &str) -> Option<&DevWeight> {
+        self.dense.get(name)
+    }
+
     /// The Q8_0 planes of draft tensor `name`, `rows` rows of `k` values.
     pub fn q8(
         &self,
@@ -424,7 +431,12 @@ impl DraftWeights {
 }
 
 /// Row `id` of the bf16 embedding `name` of `split`, `k` values: its file bytes.
-fn embedding_row<'a>(split: &'a Split, name: &str, k: u64, id: u32) -> Result<&'a [u8], GpuError> {
+pub(super) fn embedding_row<'a>(
+    split: &'a Split,
+    name: &str,
+    k: u64,
+    id: u32,
+) -> Result<&'a [u8], GpuError> {
     let bytes = file_bytes(split, name)?;
     let row = usize::try_from(2 * k).map_err(|_| GpuError::Shape {
         what: WHAT,
