@@ -10,8 +10,9 @@
 //! layout, `logits[v · m + c]`, which is `ds41_markov`'s.
 //!
 //! The Markov loop is `m` serial steps ([`MarkovKernels::enqueue_step`]):
-//! row 0's previous token is the block's first id (`id_last`), row `c`'s the
-//! argmax the step before wrote. The last step's argmax buffer holds the
+//! row 0's previous token is the block's first id (`id_last`, read from the
+//! device, where the pass's staging put it), row `c`'s the argmax the step
+//! before wrote. The last step's argmax buffer holds the
 //! block's proposal, so the head adds no argmax of its own.
 
 use bloomery_gpu::weights::DevWeight;
@@ -34,8 +35,6 @@ pub struct DraftHead {
     logits: DeviceBuffer<f32>,
     /// Each row's argmax; after the loop, the block's proposal.
     tok: DeviceBuffer<u32>,
-    /// The block's first id, row 0's previous token.
-    first: DeviceBuffer<u32>,
     markov: MarkovKernels,
     n_embd: usize,
     n_vocab: usize,
@@ -73,7 +72,6 @@ impl DraftHead {
             acts,
             logits: DeviceBuffer::zeroed(s, max_width * n_vocab)?,
             tok: DeviceBuffer::zeroed(s, max_width)?,
-            first: DeviceBuffer::zeroed(s, 1)?,
             markov: MarkovKernels::load(gpu.context())?,
             n_embd: hp.n_embd,
             n_vocab,
@@ -85,12 +83,6 @@ impl DraftHead {
     #[must_use]
     pub fn n_vocab(&self) -> usize {
         self.n_vocab
-    }
-
-    /// Write the block's first id. A synchronizing copy; never inside a
-    /// capture.
-    pub fn stage(&mut self, stream: &CudaStream, id_last: u32) -> Result<(), GpuError> {
-        Ok(self.first.copy_from_host(stream, &[id_last])?)
     }
 
     /// Refuse a width the head holds no scratch for.
@@ -128,13 +120,15 @@ impl DraftHead {
         gpu.enqueue_gemv_q6k(projection(w)?, act, &mut self.logits)
     }
 
-    /// Enqueue the Markov loop over the `m` rows' logits: `m` steps of two
-    /// launches. Asynchronous, allocation-free, capturable.
+    /// Enqueue the Markov loop over the `m` rows' logits, row 0's previous
+    /// token `first[0]`: `m` steps of two launches. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_markov(
         &mut self,
         gpu: &Gpu,
         w: &DraftWeights,
         m: usize,
+        first: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         self.check(m)?;
         let (w1, w2) = w.markov();
@@ -144,7 +138,7 @@ impl DraftHead {
                 gpu.stream(),
                 gpu.elem(),
                 &mw,
-                &self.first,
+                first,
                 &mut self.tok,
                 m,
                 row,

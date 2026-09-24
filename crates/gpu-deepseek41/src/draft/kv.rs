@@ -17,13 +17,20 @@
 //! oracle set's own pair. Every gemv column is the `m = 1` launch of that
 //! column bit for bit (`q8f32`'s contract), so how rows are grouped changes
 //! no bit.
+//!
+//! Every group's inputs — feature rows, rope tables, slots — sit in one
+//! pinned image, copied to the card in one transfer by [`KvAppend::stage`]
+//! ([`Inbox`]); the launches read only device memory, so an append of up
+//! to [`GROUP`] rows captures ([`KvAppend::capture`]) and replays after any
+//! stage of that many rows.
 
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::dspark::{DraftHparams, names};
 
 use super::load::DraftWeights;
+use super::stage::{Inbox, put_f32};
 use crate::rope::{Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable};
 
 const WHAT: &str = "draft::kv";
@@ -75,10 +82,9 @@ impl DraftRings {
     }
 }
 
-/// One group's buffers: up to [`GROUP`] positions.
+/// One group's buffers: up to [`GROUP`] positions. Its inputs are in the
+/// append's image ([`Layout`]).
 struct Group {
-    /// The feature rows, token-major.
-    feat: DeviceBuffer<f32>,
     /// `fc · feat`, token-major.
     fc: DeviceBuffer<f32>,
     /// `main_x`, token-major.
@@ -86,17 +92,61 @@ struct Group {
     /// Per layer, `attn_kv · main_x` and the normed, turned row.
     kv: Vec<DeviceBuffer<f32>>,
     out: Vec<DeviceBuffer<f32>>,
-    /// Each row's ring slot (the kernel takes it modulo the window).
-    slots: DeviceBuffer<u32>,
-    /// Each row's rope table, [`RopeTable::push`]'s layout.
-    cs: DeviceBuffer<f32>,
     /// Rows the last [`KvAppend::stage`] wrote.
     rows: usize,
+}
+
+/// Where group `g`'s inputs sit in the append's image, in words: from
+/// `g · words`, each row's ring slot (the kernel takes it modulo the
+/// window), each row's rope table ([`RopeTable::push`]'s layout) and the
+/// feature rows (token-major), room for [`GROUP`] rows of each. The feature
+/// rows come last, so the copy of an append stops after its last row
+/// ([`Layout::used`]).
+#[derive(Clone, Copy)]
+struct Layout {
+    slots: usize,
+    cs: usize,
+    feat: usize,
+    features: usize,
+    words: usize,
+}
+
+impl Layout {
+    fn of(features: usize, rope_dims: usize) -> Layout {
+        let slots = 0;
+        let cs = slots + GROUP;
+        let feat = cs + GROUP * rope_dims;
+        Layout {
+            slots,
+            cs,
+            feat,
+            features,
+            words: feat + GROUP * features,
+        }
+    }
+
+    /// Words of the image an append of `n` rows reads: every full group,
+    /// then the last group up to its last feature row.
+    fn used(&self, n: usize) -> usize {
+        let (full, rest) = (n / GROUP, n % GROUP);
+        full * self.words
+            + if rest == 0 {
+                0
+            } else {
+                self.feat + rest * self.features
+            }
+    }
 }
 
 /// The feature-to-KV graph's buffers and constants. See the module comment.
 pub struct KvAppend {
     groups: Vec<Group>,
+    /// Every group's inputs, one copy an append.
+    inbox: Inbox,
+    layout: Layout,
+    /// The rope table of the row being staged; kept to stage without
+    /// allocating.
+    cs: Vec<f32>,
     table: RopeTable,
     rope: RopeKernels,
     features: usize,
@@ -123,19 +173,20 @@ impl KvAppend {
         let groups = (0..n_groups)
             .map(|_| {
                 Ok(Group {
-                    feat: DeviceBuffer::zeroed(s, GROUP * features)?,
                     fc: DeviceBuffer::zeroed(s, GROUP * hp.n_embd)?,
                     main: DeviceBuffer::zeroed(s, GROUP * hp.n_embd)?,
                     kv: per_layer(hp.head_dim)?,
                     out: per_layer(hp.head_dim)?,
-                    slots: DeviceBuffer::zeroed(s, GROUP)?,
-                    cs: DeviceBuffer::zeroed(s, GROUP * hp.rope_dims)?,
                     rows: 0,
                 })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
+        let layout = Layout::of(features, hp.rope_dims);
         Ok(KvAppend {
             groups,
+            inbox: Inbox::new(gpu, n_groups * layout.words)?,
+            layout,
+            cs: Vec::with_capacity(GROUP * hp.rope_dims),
             table: RopeTable::new(&RopeSpec::window(hp.rope_base, hp.rope_dims))?,
             rope: RopeKernels::load(gpu.context())?,
             features,
@@ -160,29 +211,30 @@ impl KvAppend {
         self.features
     }
 
-    /// Device bytes of the buffers.
+    /// Device bytes of the buffers, the image's device side included.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
-        self.groups
-            .iter()
-            .map(|g| {
-                g.feat.num_bytes()
-                    + g.fc.num_bytes()
-                    + g.main.num_bytes()
-                    + g.kv
-                        .iter()
-                        .chain(&g.out)
-                        .map(DeviceBuffer::num_bytes)
-                        .sum::<usize>()
-                    + g.slots.num_bytes()
-                    + g.cs.num_bytes()
-            })
-            .sum()
+        4 * self.groups.len() * self.layout.words
+            + self
+                .groups
+                .iter()
+                .map(|g| {
+                    g.fc.num_bytes()
+                        + g.main.num_bytes()
+                        + g.kv
+                            .iter()
+                            .chain(&g.out)
+                            .map(DeviceBuffer::num_bytes)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
-    /// Write the inputs of `n = feats.len() / features()` positions: row `i`
-    /// takes ring slot `first_slot + i` and rope position `first_pos + i`.
-    /// Synchronizing copies on the engine stream; never inside a capture.
+    /// Write the inputs of `n = feats.len() / features()` positions into the
+    /// image — row `i` takes ring slot `first_slot + i` and rope position
+    /// `first_pos + i` — and enqueue its one copy to the card on `stream`.
+    /// Asynchronous, except that it waits for the previous append's copy to
+    /// have read the image; never inside a capture.
     pub fn stage(
         &mut self,
         stream: &CudaStream,
@@ -202,31 +254,33 @@ impl KvAppend {
                 ),
             });
         }
+        let (lay, f) = (self.layout, self.features);
+        let host = self.inbox.host_mut()?;
         for (gi, g) in self.groups.iter_mut().enumerate() {
             let r0 = gi * GROUP;
             g.rows = n.saturating_sub(r0).min(GROUP);
             if g.rows == 0 {
                 continue;
             }
-            g.feat.copy_from_host(
-                stream,
-                &padded(
-                    &feats[r0 * self.features..(r0 + g.rows) * self.features],
-                    GROUP * self.features,
-                ),
-            )?;
-            let mut cs = Vec::with_capacity(GROUP * self.rope_dims);
-            let mut slots = vec![0u32; GROUP];
-            for (i, slot) in slots.iter_mut().take(g.rows).enumerate() {
+            let img = &mut host[gi * lay.words..(gi + 1) * lay.words];
+            let (slots, rest) = img.split_at_mut(lay.cs);
+            let (cs, feat) = rest.split_at_mut(lay.feat - lay.cs);
+            // Only the rows staged are copied and read.
+            put_f32(&mut feat[..g.rows * f], &feats[r0 * f..(r0 + g.rows) * f]);
+            self.cs.clear();
+            for (i, slot) in slots.iter_mut().enumerate() {
+                if i >= g.rows {
+                    *slot = 0;
+                    continue;
+                }
                 let off = (r0 + i) as u32;
                 self.table
-                    .push(first_pos + off, Direction::Forward, &mut cs);
+                    .push(first_pos + off, Direction::Forward, &mut self.cs);
                 *slot = first_slot + off;
             }
-            cs.resize(GROUP * self.rope_dims, 0.0);
-            g.cs.copy_from_host(stream, &cs)?;
-            g.slots.copy_from_host(stream, &slots)?;
+            put_f32(cs, &self.cs);
         }
+        self.inbox.upload(stream, lay.used(n))?;
         self.staged = n;
         Ok(n)
     }
@@ -274,13 +328,22 @@ impl KvAppend {
         let s = gpu.stream();
         let (qs, d) = w.q8(&names::fc(), self.features, self.n_embd)?;
         let gain = w.gain(&names::enc_output_norm(), self.n_embd)?;
-        for g in self.groups.iter_mut().filter(|g| g.rows > 0) {
+        let lay = self.layout;
+        for (gi, g) in self
+            .groups
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, g)| g.rows > 0)
+        {
+            let feat = self
+                .inbox
+                .f32s(gi * lay.words + lay.feat, GROUP * self.features)?;
             gpu.q8f32().enqueue_q8_0_gemv_mcol(
                 s,
                 Q8_0GemvMcolArgs {
                     qs,
                     d,
-                    x: &g.feat,
+                    x: &feat,
                     m: g.rows,
                     out: GemvOut::TokenMajor,
                     y: &mut g.fc,
@@ -314,10 +377,19 @@ impl KvAppend {
                 detail: format!("{} rings for {} layers", rings.rings.len(), self.n_layer),
             });
         }
+        let lay = self.layout;
         for (l, ring) in rings.rings.iter_mut().enumerate() {
             let (qs, d) = w.q8(&names::attn_kv(l), self.n_embd, self.head_dim)?;
             let gain = w.gain(&names::attn_kv_a_norm(l), self.head_dim)?;
-            for g in self.groups.iter_mut().filter(|g| g.rows > 0) {
+            for (gi, g) in self
+                .groups
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, g)| g.rows > 0)
+            {
+                let at = gi * lay.words;
+                let cs = self.inbox.f32s(at + lay.cs, GROUP * self.rope_dims)?;
+                let slots = self.inbox.u32s(at + lay.slots, GROUP)?;
                 gpu.q8f32().enqueue_q8_0_gemv_mcol(
                     s,
                     Q8_0GemvMcolArgs {
@@ -334,8 +406,8 @@ impl KvAppend {
                     KvAppendArgs {
                         kv: &g.kv[l],
                         gain,
-                        cs: &g.cs,
-                        pos: &g.slots,
+                        cs: &cs,
+                        pos: &slots,
                         eps: self.eps,
                         n_dims: self.rope_dims,
                         m: g.rows,
@@ -347,6 +419,38 @@ impl KvAppend {
             }
         }
         Ok(())
+    }
+
+    /// Capture the append of `n` rows (`1..=GROUP`, one group) into `rings`:
+    /// [`KvAppend::enqueue`] with the staging left out, so a replay after
+    /// any [`KvAppend::stage`] of `n` rows is that append. The graph names
+    /// these buffers, `w` and `rings`: the caller keeps all three alive and
+    /// in place while it holds the graph. Leaves the append staged as `n`
+    /// rows of whatever the image holds. Load-time only.
+    pub fn capture(
+        &mut self,
+        gpu: &Gpu,
+        w: &DraftWeights,
+        rings: &mut DraftRings,
+        n: usize,
+    ) -> Result<Graph, GpuError> {
+        if !(1..=GROUP).contains(&n) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a capture of {n} rows; 1..={GROUP}"),
+            });
+        }
+        for (gi, g) in self.groups.iter_mut().enumerate() {
+            g.rows = if gi == 0 { n } else { 0 };
+        }
+        self.staged = n;
+        gpu.capture(|_| self.enqueue(gpu, w, rings))
+    }
+
+    /// Rows the last [`KvAppend::stage`] wrote.
+    #[must_use]
+    pub fn staged(&self) -> usize {
+        self.staged
     }
 
     /// Kernel launches one [`KvAppend::enqueue`] of `n` rows makes.

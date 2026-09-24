@@ -74,7 +74,7 @@ const Q8_0_BYTES: usize = 34;
 // ---------------------------------------------------------------- kernels
 
 #[cuda_module]
-mod glue_kernels {
+pub(crate) mod glue_kernels {
     use super::*;
 
     /// The embedding broadcast: thread `i` widens image word `at + i` — two

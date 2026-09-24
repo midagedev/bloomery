@@ -27,42 +27,87 @@
 //!
 //! # Contract for the target loop
 //!
-//! [`DraftBody::append`] takes the features of the positions the target
-//! committed, in order, at most a window at a time; [`DraftBody::propose`]
-//! takes the last accepted token and a width `w` in `1..=block::MAX_WIDTH`
-//! and returns `w` proposed ids, the first for the position after the
-//! accepted token; [`DraftBody::reset`] starts a new sequence. A rejected
-//! proposal leaves nothing behind: only appended features enter the rings.
-//! The width is the caller's choice and a pinned value where it is
-//! measured; the draft has no default.
+//! One sequence, in this order:
 //!
-//! The target verifies a proposal as its two-row pass does today
-//! (`bloomery_gpu::hybrid::Chain::Pair`), generalised to `w + 1` rows served
-//! one after another per layer. A merged multi-row host expert kernel is
-//! ruled out — two rows' routed experts overlap far below that kernel's
-//! break-even (measured; rig-log holds the numbers) — so the target's
-//! `moe.rs` keeps its one-row expert service (`ne1 == 1`) and its
-//! `EXPERTS_INTO_MAX`.
+//! 1. [`DraftBody::reset`] — zeroed rings, no committed position.
+//! 2. [`DraftBody::append`] of the prompt's features, positions `0 .. P`
+//!    in order (at most a window a call; more than [`kv::GROUP`] rows in one
+//!    call run eager, once a sequence).
+//! 3. [`DraftBody::propose`]`(id_last, w)`: `id_last` is the token at
+//!    position [`DraftBody::committed`] — after the prompt, the token the
+//!    target sampled from its last row, which the target has not run yet —
+//!    and `w` in `1..=block::MAX_WIDTH` is the caller's pinned width (the
+//!    draft has no default). Returns `w` ids, the first for the position
+//!    after `id_last`.
+//! 4. The target's verify pass over `[id_last, ids…]` at positions
+//!    `committed ..= committed + w`: `w + 1` rows served one after another
+//!    per layer, as its two-row pass (`bloomery_gpu::hybrid::Chain::Pair`)
+//!    does today: the target's `moe.rs` serves each row's host experts on
+//!    its own (`ne1 == 1`, `EXPERTS_INTO_MAX`). Consecutive rows share many
+//!    of those experts, so a service that reads each distinct expert once
+//!    per layer is an open design on the target side; the draft's contract
+//!    does not depend on it.
+//! 5. [`DraftBody::append`] of the features of the `k + 1` positions the
+//!    verify pass accepted — `id_last` and the `k` leading ids that matched
+//!    — then step 3 with the target's next token as `id_last`.
+//!
+//! A rejected proposal leaves nothing behind: only appended features enter
+//! the rings. Every call enqueues on the engine stream; `append` returns
+//! without waiting, and `propose` returns once its ids are on the host, so
+//! a step costs the draft one host wait.
+//!
+//! # Submission
+//!
+//! [`DraftBody::new`] captures, once at load, one graph per width
+//! `1..=block::MAX_WIDTH` of the whole block pass (widening, three layers,
+//! head, Markov loop and its argmax) and one per row count
+//! `1..=kv::GROUP` of the append. A call writes its inputs into a pinned
+//! image, copies it to the card in one transfer right before the replay
+//! (outside the graph, so the graphs hold kernels only and the copy's
+//! source never enters one), and replays. The graphs are captured under
+//! [`Rule::Reference`], the engine's rule: its clamp limits are launch
+//! scalars, so an ik-rule pass runs eager ([`Submit::Eager`], the gates'
+//! twin of every call).
 
 pub mod block;
 pub mod head;
 pub mod kv;
 pub mod load;
+mod stage;
 
 use std::sync::Arc;
 
-use bloomery_gpu::{Gpu, GpuError};
+use bloomery_gpu::{Gpu, GpuError, Graph};
 use gguf::Split;
 
 use block::{BlockInput, BlockPass, MAX_WIDTH, Rule, embedding_row};
-use kv::{DraftRings, KvAppend};
+use kv::{DraftRings, GROUP, KvAppend};
 use load::DraftWeights;
 
 const WHAT: &str = "draft::DraftBody";
 
-/// The draft for one sequence: its weights, its rings and the positions
-/// committed so far. See the module comment's contract.
+/// How a [`DraftBody`] call reaches the card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Submit {
+    /// Every launch enqueued one by one: the gates' twin of a replay.
+    Eager,
+    /// A replay of the graph captured at load for the call's shape.
+    Graph,
+}
+
+/// The graphs [`DraftBody::new`] captures.
+struct Graphs {
+    /// The block pass of `m` rows at `m - 1`.
+    pass: Vec<Graph>,
+    /// The append of `n` rows at `n - 1`.
+    append: Vec<Graph>,
+}
+
+/// The draft for one sequence: its weights, its rings, the captured passes
+/// and the positions committed so far. See the module comment.
 pub struct DraftBody {
+    /// Declared first: dropped before the weights and buffers they name.
+    graphs: Graphs,
     w: DraftWeights,
     rings: DraftRings,
     kv: KvAppend,
@@ -74,12 +119,36 @@ pub struct DraftBody {
 }
 
 impl DraftBody {
-    /// Rings, append buffers and the block pass over `w`. Load-time only.
+    /// Rings, append buffers, the block pass over `w`, and every graph.
+    /// Load-time only.
     pub fn new(gpu: &Gpu, w: DraftWeights, target: Arc<Split>) -> Result<DraftBody, GpuError> {
-        let rings = DraftRings::new(gpu.stream(), w.hp())?;
-        let kv = KvAppend::new(gpu, w.hp())?;
-        let pass = BlockPass::new(gpu, &w)?;
+        let mut rings = DraftRings::new(gpu.stream(), w.hp())?;
+        let mut kv = KvAppend::new(gpu, w.hp())?;
+        let mut pass = BlockPass::new(gpu, &w)?;
+        let counted = |g: Graph, launches: usize| {
+            if g.node_count() == launches {
+                Ok(g)
+            } else {
+                Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "a capture of {} nodes for {launches} launches",
+                        g.node_count()
+                    ),
+                })
+            }
+        };
+        let pass_graphs = (1..=MAX_WIDTH)
+            .map(|m| counted(pass.capture(gpu, &w, &rings, m)?, pass.launches(m)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let append = (1..=GROUP)
+            .map(|n| counted(kv.capture(gpu, &w, &mut rings, n)?, kv.launches(n)))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(DraftBody {
+            graphs: Graphs {
+                pass: pass_graphs,
+                append,
+            },
             w,
             rings,
             kv,
@@ -91,15 +160,27 @@ impl DraftBody {
 
     /// Append the features of the next committed positions (`feats.len()`
     /// a multiple of the feature width, at most a window of rows): each at
-    /// its own position and ring slot. Returns the rows appended. Runs to
-    /// completion on the engine stream.
+    /// its own position and ring slot. Returns the rows appended. Enqueues
+    /// on the engine stream and returns without waiting.
     pub fn append(&mut self, gpu: &Gpu, feats: &[f32]) -> Result<usize, GpuError> {
+        self.append_as(gpu, feats, Submit::Graph)
+    }
+
+    /// [`DraftBody::append`], submitted as `submit` says. An append of more
+    /// than [`GROUP`] rows has no graph and runs eager either way.
+    pub fn append_as(
+        &mut self,
+        gpu: &Gpu,
+        feats: &[f32],
+        submit: Submit,
+    ) -> Result<usize, GpuError> {
         let p = self.committed;
         let window = u32::try_from(self.w.hp().window).map_err(|_| GpuError::State {
             what: WHAT,
             missing: "a window that fits a u32",
         })?;
-        let n = self.kv.stage(gpu.stream(), feats, p % window, p)?;
+        let s = gpu.stream();
+        let n = self.kv.stage(s, feats, p % window, p)?;
         let next = u32::try_from(n)
             .ok()
             .and_then(|n| p.checked_add(n))
@@ -107,25 +188,33 @@ impl DraftBody {
                 what: WHAT,
                 missing: "a next position that fits a u32",
             })?;
-        self.kv.enqueue(gpu, &self.w, &mut self.rings)?;
-        gpu.stream().synchronize()?;
+        match (submit, self.graphs.append.get(n - 1)) {
+            (Submit::Graph, Some(g)) => g.launch(s)?,
+            _ => self.kv.enqueue(gpu, &self.w, &mut self.rings)?,
+        }
         self.committed = next;
         Ok(n)
     }
 
     /// Propose `width` ids after `id_last`, the token at position
-    /// [`DraftBody::committed`]. Runs to completion on the engine stream.
+    /// [`DraftBody::committed`], under the reference rule. Blocks until the
+    /// ids are on the host.
     pub fn propose(&mut self, gpu: &Gpu, id_last: u32, width: usize) -> Result<Vec<u32>, GpuError> {
+        self.propose_as(gpu, id_last, width, Submit::Graph)
+    }
+
+    /// [`DraftBody::propose`], submitted as `submit` says.
+    pub fn propose_as(
+        &mut self,
+        gpu: &Gpu,
+        id_last: u32,
+        width: usize,
+        submit: Submit,
+    ) -> Result<Vec<u32>, GpuError> {
         if self.committed == 0 {
             return Err(GpuError::State {
                 what: WHAT,
                 missing: "a committed position before the first block",
-            });
-        }
-        if !(1..=MAX_WIDTH).contains(&width) {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("width {width}; 1..={MAX_WIDTH}"),
             });
         }
         let hp = self.w.hp();
@@ -138,10 +227,36 @@ impl DraftBody {
             ring_rows: (self.committed as usize).min(hp.window),
             rule: Rule::Reference,
         };
-        self.pass.stage(gpu.stream(), &input)?;
-        self.pass.enqueue(gpu, &self.w, &self.rings)?;
-        let ids = self.pass.tokens(gpu.stream())?;
-        Ok(ids)
+        run_block(
+            gpu,
+            &mut self.pass,
+            &self.graphs,
+            &self.w,
+            &self.rings,
+            &input,
+            submit,
+        )
+    }
+
+    /// One block pass over `input` as it is — its own positions, ring rows
+    /// and rule — against the rings as they are: the gates' way to feed an
+    /// oracle set's block. A graph replay takes [`Rule::Reference`] only.
+    /// Blocks until the ids are on the host.
+    pub fn block(
+        &mut self,
+        gpu: &Gpu,
+        input: &BlockInput<'_>,
+        submit: Submit,
+    ) -> Result<Vec<u32>, GpuError> {
+        run_block(
+            gpu,
+            &mut self.pass,
+            &self.graphs,
+            &self.w,
+            &self.rings,
+            input,
+            submit,
+        )
     }
 
     /// Forget the sequence: zeroed rings, no committed position.
@@ -169,4 +284,78 @@ impl DraftBody {
     pub fn pass(&self) -> &BlockPass {
         &self.pass
     }
+
+    /// The rings.
+    #[must_use]
+    pub fn rings(&self) -> &DraftRings {
+        &self.rings
+    }
+
+    /// The rings, writable: the gates' way to seat an oracle's rows. The
+    /// graphs read them in place, so a replay sees what is seated.
+    pub fn rings_mut(&mut self) -> &mut DraftRings {
+        &mut self.rings
+    }
+
+    /// The captured pass of `m` rows.
+    #[must_use]
+    pub fn pass_graph(&self, m: usize) -> Option<&Graph> {
+        m.checked_sub(1).and_then(|i| self.graphs.pass.get(i))
+    }
+
+    /// The captured append of `n` rows.
+    #[must_use]
+    pub fn append_graph(&self, n: usize) -> Option<&Graph> {
+        n.checked_sub(1).and_then(|i| self.graphs.append.get(i))
+    }
+
+    /// Kernel launches a block pass of `m` rows makes.
+    #[must_use]
+    pub fn pass_launches(&self, m: usize) -> usize {
+        self.pass.launches(m)
+    }
+
+    /// Kernel launches an append of `n` rows makes.
+    #[must_use]
+    pub fn append_launches(&self, n: usize) -> usize {
+        self.kv.launches(n)
+    }
+}
+
+/// Stage `input`, run its pass as `submit` says, read its ids.
+fn run_block(
+    gpu: &Gpu,
+    pass: &mut BlockPass,
+    graphs: &Graphs,
+    w: &DraftWeights,
+    rings: &DraftRings,
+    input: &BlockInput<'_>,
+    submit: Submit,
+) -> Result<Vec<u32>, GpuError> {
+    let s = gpu.stream();
+    let graph = match submit {
+        Submit::Eager => None,
+        Submit::Graph if input.rule != Rule::Reference => {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "the reference rule for a graph pass (ik's rule runs eager)",
+            });
+        }
+        Submit::Graph => Some(
+            input
+                .width
+                .checked_sub(1)
+                .and_then(|i| graphs.pass.get(i))
+                .ok_or_else(|| GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("width {}; 1..={MAX_WIDTH}", input.width),
+                })?,
+        ),
+    };
+    pass.stage(s, input)?;
+    match graph {
+        Some(g) => g.launch(s)?,
+        None => pass.enqueue(gpu, w, rings)?,
+    }
+    pass.tokens(s)
 }

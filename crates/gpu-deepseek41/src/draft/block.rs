@@ -4,10 +4,14 @@
 //!
 //! Input. Each row's embedding is the target's `token_embd` row (bf16,
 //! widened exactly), copied into all four hyper-connection streams; layer
-//! 0's folded input is stream 0 (the one-hot initial `pre`). Both are built
-//! on the host and copied in by [`BlockPass::stage`], with each row's rope
-//! tables, its visible counts and the head's first id — the pass itself
-//! reads only device memory.
+//! 0's folded input is stream 0 (the one-hot initial `pre`). Rows `1..` are
+//! the mask token's, the same every block: they are written once, at load.
+//! Row 0 is `id_last`'s: [`BlockPass::stage`] writes its bf16 words, each
+//! row's rope tables, the visible counts and the head's first id into one
+//! pinned image and copies it in one transfer ([`Inbox`]), and the pass's
+//! first launch widens the row on the card (`ds41_glue_embed`, the target
+//! step's own broadcast). The pass itself reads only device memory, so a
+//! captured pass replays against the same image every block.
 //!
 //! Per layer, `m = w` rows per launch:
 //!
@@ -31,20 +35,16 @@
 //! 11. HC_POST and the next fold.
 //!
 //! After the last layer its fold is the head's input ([`DraftHead`]).
-//! Launches per pass: `(14 + 9 + 2m)` per layer, the head's three and its
-//! Markov loop's `2m` ([`BlockPass::launches`]).
+//! Launches per pass: the widening, `(14 + 9 + 2m)` per layer, the head's
+//! three and its Markov loop's `2m` ([`BlockPass::launches`]).
 //!
 //! Every buffer is per layer and allocated at load, so a pass leaves each
 //! layer's intermediates in place for the gate to read, and a captured pass
 //! replays against fixed addresses.
 
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::ops::{Deref, DerefMut};
-
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, window};
-use cuda_core::{CudaStream, DeviceBuffer};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, launch_u32};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use gguf::Split;
 use model::arch::deepseek41::names as target_names;
 use model::arch::dspark::{DraftHparams, names};
@@ -52,7 +52,9 @@ use model::arch::dspark::{DraftHparams, names};
 use super::head::DraftHead;
 use super::kv::DraftRings;
 use super::load::DraftWeights;
+use super::stage::{Inbox, put_f32, view, view_mut};
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
+use crate::chain::glue::glue_kernels;
 use crate::experts::ExpertKernels;
 use crate::experts_mxfp4::{
     DownArgs, DraftExpertKernels, DraftRouterOut, GateUpArgs, MxAct, N_EXPERT, N_USED, RouterArgs,
@@ -111,54 +113,6 @@ fn widen(row: &[u8]) -> Vec<f32> {
         .iter()
         .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
         .collect()
-}
-
-/// A non-owning window of an f32 buffer, borrowed for its lifetime.
-struct View<'a> {
-    buf: ManuallyDrop<DeviceBuffer<f32>>,
-    _parent: PhantomData<&'a DeviceBuffer<f32>>,
-}
-
-impl Deref for View<'_> {
-    type Target = DeviceBuffer<f32>;
-    fn deref(&self) -> &DeviceBuffer<f32> {
-        &self.buf
-    }
-}
-
-impl DerefMut for View<'_> {
-    fn deref_mut(&mut self) -> &mut DeviceBuffer<f32> {
-        &mut self.buf
-    }
-}
-
-/// `len` values of `parent` from `off`. The launches read and write a view
-/// as a buffer of its own; a mutable view needs `parent` exclusively, which
-/// the `&mut` borrow gives.
-fn view(parent: &DeviceBuffer<f32>, off: usize, len: usize) -> Result<View<'_>, GpuError> {
-    if len == 0 || off.checked_add(len).is_none_or(|end| end > parent.len()) {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!("a view of {len} at {off} in {} values", parent.len()),
-        });
-    }
-    let bytes = u64::try_from(off * 4).map_err(|_| GpuError::Shape {
-        what: WHAT,
-        detail: format!("offset {off}"),
-    })?;
-    // SAFETY: `off .. off + len` lies inside `parent`'s allocation (checked
-    // above) at an f32 boundary; `parent` is borrowed for the view's
-    // lifetime, so the memory outlives it and stays in place.
-    let buf = unsafe { window::<f32>(parent.cu_deviceptr() + bytes, len, parent.context()) };
-    Ok(View {
-        buf,
-        _parent: PhantomData,
-    })
-}
-
-/// [`view`] of a buffer the caller holds exclusively.
-fn view_mut(parent: &mut DeviceBuffer<f32>, off: usize, len: usize) -> Result<View<'_>, GpuError> {
-    view(parent, off, len)
 }
 
 /// One layer's buffers, every one for [`MAX_WIDTH`] rows.
@@ -327,6 +281,7 @@ impl LayerBufs {
 
 /// The loaded modules the pass launches.
 struct Kernels {
+    embed: glue_kernels::LoadedModule,
     attn: AttnKernels,
     rope: RopeKernels,
     hc: HcKernels,
@@ -633,8 +588,8 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
         0.0
     };
     for t in 0..m {
-        let x = view(&b.normed_f, t * d.n_embd, d.n_embd)?;
-        let mut h = view_mut(&mut b.sh_h, t * d.ff_shared, d.ff_shared)?;
+        let x = view::<f32, _>(&b.normed_f, t * d.n_embd, d.n_embd)?;
+        let mut h = view_mut::<f32, _>(&mut b.sh_h, t * d.ff_shared, d.ff_shared)?;
         cx.k.experts
             .enqueue_shexp_gate_up(s, gate, up, &x, limit_sh, &mut h)?;
     }
@@ -660,6 +615,75 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
     )
 }
 
+/// Where [`enqueue_embed`] reads the row: word `at` of `params`, `n_embd`
+/// bf16.
+struct Embed<'a> {
+    params: &'a DeviceBuffer<u32>,
+    at: usize,
+    n_embd: usize,
+}
+
+/// Row 0 of layer 0's streams and fold from the image's bf16 row: one
+/// launch.
+fn enqueue_embed(
+    gpu: &Gpu,
+    module: &glue_kernels::LoadedModule,
+    e: &Embed<'_>,
+    streams0: &mut DeviceBuffer<f32>,
+    fold0: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let n = e.n_embd;
+    let half = launch_u32(WHAT, "half a row", n / 2)?;
+    let mut streams = view_mut::<f32, _>(streams0, 0, HC_STREAMS * n)?;
+    let mut input = view_mut::<f32, _>(fold0, 0, n)?;
+    let prep = module.prepare_ds41_glue_embed(LaunchConfig1D::new(half.div_ceil(256), 256, 0))?;
+    module.ds41_glue_embed(
+        gpu.stream(),
+        &prep,
+        e.params,
+        launch_u32(WHAT, "the row's word", e.at)?,
+        half,
+        launch_u32(WHAT, "streams", HC_STREAMS)?,
+        &mut streams,
+        &mut input,
+    )?;
+    Ok(())
+}
+
+/// Where each per-block input sits in the pass's [`Inbox`], in words.
+#[derive(Clone, Copy)]
+struct Image {
+    /// `id_last`'s embedding row, two bf16 a word, the low half first.
+    row: usize,
+    /// Each row's rope table, forward then back, [`MAX_WIDTH`] rows of
+    /// `rope_dims` f32 each.
+    fwd: usize,
+    back: usize,
+    /// Per row `t`: `vis[2t]` ring rows, `vis[2t + 1]` block rows.
+    vis: usize,
+    /// The head's first id.
+    first: usize,
+    words: usize,
+}
+
+impl Image {
+    fn of(d: &Dims) -> Image {
+        let row = 0;
+        let fwd = row + d.n_embd / 2;
+        let back = fwd + MAX_WIDTH * d.rope_dims;
+        let vis = back + MAX_WIDTH * d.rope_dims;
+        let first = vis + 2 * MAX_WIDTH;
+        Image {
+            row,
+            fwd,
+            back,
+            vis,
+            first,
+            words: first + 1,
+        }
+    }
+}
+
 /// The block pass's buffers and constants. See the module comment.
 pub struct BlockPass {
     layers: Vec<LayerBufs>,
@@ -667,20 +691,22 @@ pub struct BlockPass {
     k: Kernels,
     d: Dims,
     table: RopeTable,
-    /// The mask token's embedding row, widened.
-    mask: Vec<f32>,
-    /// Layer 0's streams and fold, as [`BlockPass::stage`] wrote them.
+    /// Layer 0's streams and fold: row 0 widened by each pass, the mask
+    /// token's rows after it written at load.
     streams0: DeviceBuffer<f32>,
     fold0: DeviceBuffer<f32>,
-    cs_fwd: DeviceBuffer<f32>,
-    cs_back: DeviceBuffer<f32>,
-    /// Per row `t`: `vis[2t]` ring rows, `vis[2t + 1]` block rows.
-    vis: DeviceBuffer<u32>,
+    /// Every per-block input, one copy a block ([`Image`]).
+    inbox: Inbox,
+    image: Image,
     /// Row `t`'s slot in the block buffer: `t`.
     slots: DeviceBuffer<u32>,
     /// The concat plan's route, `0 .. 3 · MAX_WIDTH`; a pass of `m` rows
     /// reads its first `3m`.
     route: DeviceBuffer<u32>,
+    /// The rope tables of the block being staged; kept to stage without
+    /// allocating.
+    fwd: Vec<f32>,
+    back: Vec<f32>,
     /// Rows the last [`BlockPass::stage`] wrote; 0 before the first.
     width: usize,
     /// The rule the last stage wrote.
@@ -697,13 +723,34 @@ impl BlockPass {
         let ctx = gpu.context();
         let mask_words = w.mask_row().buf().to_host_vec(s)?;
         let mask_bytes: Vec<u8> = mask_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mask = widen(&mask_bytes);
+        if mask.len() != d.n_embd {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a mask row of {} values; rows of {}", mask.len(), d.n_embd),
+            });
+        }
         let b = MAX_WIDTH;
+        let n = d.n_embd;
+        let mut streams0 = vec![0.0f32; HC_STREAMS * n];
+        let mut fold0 = vec![0.0f32; n];
+        for _ in 1..b {
+            for _ in 0..HC_STREAMS {
+                streams0.extend_from_slice(&mask);
+            }
+            fold0.extend_from_slice(&mask);
+        }
+        let image = Image::of(&d);
+        // SAFETY: this crate owns the embedded device bundle produced for
+        // `glue_kernels`; the launcher checks its launch contract.
+        let embed = unsafe { glue_kernels::load(ctx)? };
         Ok(BlockPass {
             layers: (0..hp.n_layer)
                 .map(|_| LayerBufs::new(s, &d))
                 .collect::<Result<_, _>>()?,
             head: DraftHead::new(gpu, w, b)?,
             k: Kernels {
+                embed,
                 attn: AttnKernels::load(ctx)?,
                 rope: RopeKernels::load(ctx)?,
                 hc: HcKernels::load(ctx)?,
@@ -712,34 +759,35 @@ impl BlockPass {
                 experts: ExpertKernels::load(ctx)?,
             },
             table: RopeTable::new(&RopeSpec::window(hp.rope_base, hp.rope_dims))?,
-            mask: widen(&mask_bytes),
-            streams0: DeviceBuffer::zeroed(s, b * HC_STREAMS * d.n_embd)?,
-            fold0: DeviceBuffer::zeroed(s, b * d.n_embd)?,
-            cs_fwd: DeviceBuffer::zeroed(s, b * d.rope_dims)?,
-            cs_back: DeviceBuffer::zeroed(s, b * d.rope_dims)?,
-            vis: DeviceBuffer::zeroed(s, 2 * b)?,
+            streams0: DeviceBuffer::from_host(s, &streams0)?,
+            fold0: DeviceBuffer::from_host(s, &fold0)?,
+            inbox: Inbox::new(gpu, image.words)?,
+            image,
             slots: DeviceBuffer::from_host(s, &(0u32..).take(b).collect::<Vec<_>>())?,
             route: DeviceBuffer::from_host(s, &concat_route(b))?,
+            fwd: Vec::with_capacity(b * d.rope_dims),
+            back: Vec::with_capacity(b * d.rope_dims),
             width: 0,
             rule: Rule::Reference,
             d,
         })
     }
 
-    /// Write one block's inputs: layer 0's streams and fold, the rope
-    /// tables, the visible counts, the head's first id. Synchronizing copies
-    /// on the engine stream; never inside a capture.
+    /// Write one block's inputs — `id_last`'s row, the rope tables, the
+    /// visible counts, the head's first id — into the pinned image and
+    /// enqueue its one copy to the card on `stream`. Asynchronous, except
+    /// that it waits for the previous block's copy to have read the image;
+    /// never inside a capture.
     pub fn stage(&mut self, stream: &CudaStream, input: &BlockInput<'_>) -> Result<(), GpuError> {
         let (m, n) = (input.width, self.d.n_embd);
         let shape = |detail: String| GpuError::Shape { what: WHAT, detail };
         if !(1..=MAX_WIDTH).contains(&m) {
             return Err(shape(format!("a block of {m} rows; 1..={MAX_WIDTH}")));
         }
-        if input.row.len() != 2 * n || self.mask.len() != n {
+        if input.row.len() != 2 * n {
             return Err(shape(format!(
-                "an embedding row of {} bytes and a mask row of {} values; rows of {n}",
-                input.row.len(),
-                self.mask.len()
+                "an embedding row of {} bytes; rows of {n} bf16",
+                input.row.len()
             )));
         }
         if input.ring_rows == 0 || input.ring_rows > self.d.window {
@@ -748,51 +796,49 @@ impl BlockPass {
                 input.ring_rows, self.d.window
             )));
         }
-        let first = widen(input.row);
-        let b = MAX_WIDTH;
-        let mut streams = Vec::with_capacity(b * HC_STREAMS * n);
-        let mut fold = Vec::with_capacity(b * n);
-        for t in 0..m {
-            let e = if t == 0 { &first } else { &self.mask };
-            for _ in 0..HC_STREAMS {
-                streams.extend_from_slice(e);
-            }
-            fold.extend_from_slice(e);
-        }
-        streams.resize(b * HC_STREAMS * n, 0.0);
-        fold.resize(b * n, 0.0);
         let count = |v: usize| u32::try_from(v).map_err(|_| shape(format!("a count of {v}")));
         let (rows, ring_rows) = (count(m)?, count(input.ring_rows)?);
-        let (mut fwd, mut back) = (Vec::new(), Vec::new());
-        let mut vis = vec![0u32; 2 * b];
-        for (t, v) in (0..rows).zip(vis.as_chunks_mut::<2>().0) {
+        self.fwd.clear();
+        self.back.clear();
+        for t in 0..rows {
             let pos = input
                 .first_pos
                 .checked_add(t)
                 .ok_or_else(|| shape(format!("position {} + {t}", input.first_pos)))?;
-            self.table.push(pos, Direction::Forward, &mut fwd);
-            self.table.push(pos, Direction::Back, &mut back);
-            v[0] = ring_rows;
-            v[1] = match input.rule {
-                Rule::Reference => rows,
-                Rule::Ik => t + 1,
+            self.table.push(pos, Direction::Forward, &mut self.fwd);
+            self.table.push(pos, Direction::Back, &mut self.back);
+        }
+        let im = self.image;
+        let host = self.inbox.host_mut()?;
+        for (d, b) in host[im.row..im.fwd]
+            .iter_mut()
+            .zip(input.row.as_chunks::<4>().0)
+        {
+            *d = u32::from_le_bytes(*b);
+        }
+        put_f32(&mut host[im.fwd..im.back], &self.fwd);
+        put_f32(&mut host[im.back..im.vis], &self.back);
+        for (t, v) in (0..MAX_WIDTH).zip(host[im.vis..im.first].as_chunks_mut::<2>().0) {
+            *v = if t < m {
+                let block = match input.rule {
+                    Rule::Reference => rows,
+                    Rule::Ik => count(t + 1)?,
+                };
+                [ring_rows, block]
+            } else {
+                [0, 0]
             };
         }
-        fwd.resize(b * self.d.rope_dims, 0.0);
-        back.resize(b * self.d.rope_dims, 0.0);
-        self.streams0.copy_from_host(stream, &streams)?;
-        self.fold0.copy_from_host(stream, &fold)?;
-        self.cs_fwd.copy_from_host(stream, &fwd)?;
-        self.cs_back.copy_from_host(stream, &back)?;
-        self.vis.copy_from_host(stream, &vis)?;
-        self.head.stage(stream, input.id_last)?;
+        host[im.first] = input.id_last;
+        self.inbox.upload(stream, im.words)?;
         self.width = m;
         self.rule = input.rule;
         Ok(())
     }
 
-    /// Enqueue every layer and the head's logits over the staged block,
-    /// reading `rings`. Asynchronous, allocation-free, capturable.
+    /// Enqueue the widening of row 0, every layer and the head's logits
+    /// over the staged block, reading `rings`. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_body(
         &mut self,
         gpu: &Gpu,
@@ -806,15 +852,31 @@ impl BlockPass {
                 missing: "a staged block",
             });
         }
+        let (d, im) = (self.d, self.image);
+        let params = self.inbox.u32s(0, im.words)?;
+        enqueue_embed(
+            gpu,
+            &self.k.embed,
+            &Embed {
+                params: &params,
+                at: im.row,
+                n_embd: d.n_embd,
+            },
+            &mut self.streams0,
+            &mut self.fold0,
+        )?;
+        let cs_fwd = self.inbox.f32s(im.fwd, MAX_WIDTH * d.rope_dims)?;
+        let cs_back = self.inbox.f32s(im.back, MAX_WIDTH * d.rope_dims)?;
+        let vis = self.inbox.u32s(im.vis, 2 * MAX_WIDTH)?;
         let cx = Cx {
             gpu,
             w,
             k: &self.k,
             d: &self.d,
             m,
-            cs_fwd: &self.cs_fwd,
-            cs_back: &self.cs_back,
-            vis: &self.vis,
+            cs_fwd: &cs_fwd,
+            cs_back: &cs_back,
+            vis: &vis,
             slots: &self.slots,
             route: &self.route,
             clamp: self.rule == Rule::Reference,
@@ -843,7 +905,8 @@ impl BlockPass {
     /// Enqueue the head's Markov loop over the logits the body left.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_markov(&mut self, gpu: &Gpu, w: &DraftWeights) -> Result<(), GpuError> {
-        self.head.enqueue_markov(gpu, w, self.width)
+        let first = self.inbox.u32s(self.image.first, 1)?;
+        self.head.enqueue_markov(gpu, w, self.width, &first)
     }
 
     /// [`BlockPass::enqueue_body`] then [`BlockPass::enqueue_markov`].
@@ -857,11 +920,36 @@ impl BlockPass {
         self.enqueue_markov(gpu, w)
     }
 
-    /// Kernel launches one pass of `m` rows makes: per layer the attention
-    /// sub-layer's 14 and the ffn's `9 + 2m`, then the head's.
+    /// Capture the whole pass of `m` rows under [`Rule::Reference`] over
+    /// `rings`: [`BlockPass::enqueue`] with the staging left out, so a
+    /// replay after any [`BlockPass::stage`] of `m` rows under that rule is
+    /// that block's pass. The graph names this pass's buffers, `w` and
+    /// `rings`: the caller keeps all three alive and in place while it holds
+    /// the graph. Leaves the pass staged as `m` rows of whatever the image
+    /// holds. Load-time only.
+    pub fn capture(
+        &mut self,
+        gpu: &Gpu,
+        w: &DraftWeights,
+        rings: &DraftRings,
+        m: usize,
+    ) -> Result<Graph, GpuError> {
+        if !(1..=MAX_WIDTH).contains(&m) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a capture of {m} rows; 1..={MAX_WIDTH}"),
+            });
+        }
+        self.width = m;
+        self.rule = Rule::Reference;
+        gpu.capture(|_| self.enqueue(gpu, w, rings))
+    }
+
+    /// Kernel launches one pass of `m` rows makes: the widening, per layer
+    /// the attention sub-layer's 14 and the ffn's `9 + 2m`, then the head's.
     #[must_use]
     pub fn launches(&self, m: usize) -> usize {
-        self.layers.len() * (14 + 9 + 2 * m)
+        1 + self.layers.len() * (14 + 9 + 2 * m)
             + DraftHead::LOGIT_LAUNCHES
             + DraftHead::markov_launches(m)
     }
@@ -872,7 +960,13 @@ impl BlockPass {
         self.width
     }
 
-    /// Layer 0's staged streams.
+    /// The rule the last stage wrote.
+    #[must_use]
+    pub fn rule(&self) -> Rule {
+        self.rule
+    }
+
+    /// Layer 0's streams as the last pass left them.
     #[must_use]
     pub fn streams0(&self) -> &DeviceBuffer<f32> {
         &self.streams0

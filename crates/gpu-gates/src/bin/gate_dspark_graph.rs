@@ -70,15 +70,28 @@
 //! and under ik's mask rows 0–2 bit-identical to the `w = 3` pass (no kernel
 //! reads a row it is not given; the first rows see the same keys); under the
 //! reference rule row 0 sees every block row, so it changes with `w`
-//! (printed). The launches a pass makes, counted in a capture, equal
-//! `BlockPass::launches`. The accept count each arm's ids would give against
-//! the set's target tokens, all twelve blocks, next to ik's — and
-//! `DraftBody`'s own, which appends the set's features at the reference
-//! positions: printed, not pinned.
+//! (printed). The accept count each arm's ids would give against the set's
+//! target tokens, all twelve blocks, next to ik's — and `DraftBody`'s own,
+//! which appends the set's features at the reference positions: printed,
+//! not pinned.
+//!
+//! Graphs. The launches a pass of each width `1..=5` makes, counted in the
+//! gate's own capture and in the graph `DraftBody` captured at load, equal
+//! `BlockPass::launches` and the pinned `73 + 8w`; each append graph
+//! (`1..=GROUP` rows) holds its eight launches; every node is a kernel. Then,
+//! on `DraftBody`'s own pass and rings under the reference rule: for blocks
+//! 0–2 and every width, the replay and then the eager twin leave every tap
+//! bit-identical (the replay first, so one that did not re-read its inputs
+//! would read the previous call's); blocks 0–2 in a row through the `w = 3`
+//! graph equal the judged eager passes of the gate's own pass above; and
+//! `DraftBody` over the whole set through its graphs gives the ids and the
+//! rings of its eager twin after every block.
 //!
 //! FAIL-first: swapping the attention's two sources in `draft/block.rs` (the
 //! ring as the second source, the block rows as the first) turns this gate
-//! red from layer 0's attention on.
+//! red from layer 0's attention on; a graph replay that does not restage its
+//! inputs (`draft/mod.rs`'s `run_block` staging for the eager arm only)
+//! turns the graph rows red.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -98,13 +111,13 @@ mod gate {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use bloomery_gpu::Gpu;
-    use bloomery_gpu_deepseek41::draft::DraftBody;
+    use bloomery_gpu::{Gpu, Graph};
     use bloomery_gpu_deepseek41::draft::block::{
-        BlockInput, BlockPass, LayerBufs, Rule, embedding_row,
+        BlockInput, BlockPass, LayerBufs, MAX_WIDTH, Rule, embedding_row,
     };
-    use bloomery_gpu_deepseek41::draft::kv::DraftRings;
+    use bloomery_gpu_deepseek41::draft::kv::{DraftRings, GROUP};
     use bloomery_gpu_deepseek41::draft::load::DraftWeights;
+    use bloomery_gpu_deepseek41::draft::{DraftBody, Submit};
     use bloomery_gpu_gates::{
         GateError, checks_failed, data_dir, dump_stem, ref_model_path, verdict,
     };
@@ -122,6 +135,13 @@ mod gate {
     const SET_WIDTH: usize = 3;
     /// The synthetic block's width.
     const WIDE: usize = 5;
+    /// Kernel nodes of the captured block pass of `w` rows, `w = 1..=5`:
+    /// the widening, three layers of `23 + 2w`, the head's three and the
+    /// Markov loop's `2w` — `73 + 8w`.
+    const PASS_NODES: [usize; MAX_WIDTH] = [81, 89, 97, 105, 113];
+    /// Kernel nodes of the captured append of `n <= GROUP` rows: `fc`, its
+    /// norm, and per layer `attn_kv` and the append.
+    const APPEND_NODES: usize = 8;
     /// The band's allowance over the unit-gain prediction.
     const BAND_GAIN: f64 = 8.0;
     /// The least band: f32 sums in another order, `expf` against `expf`.
@@ -1362,30 +1382,51 @@ mod gate {
                 .collect::<Result<_, GateError>>()?,
         };
 
-        // Launches, counted in a capture of one pass per width.
+        // Launches: the gate's own capture of one pass per width, and the
+        // graphs DraftBody captured at load — every node a kernel.
         let b0 = block_set(&set, &hp, 0)?;
         let row0 = embedding_row(&target, hp.n_embd, b0.id_last)?;
         seat(&gpu, &hp, &b0, &mut rings)?;
-        for m in [1usize, SET_WIDTH, WIDE] {
-            pass.stage(s, &input(&b0, row0, m, Rule::Reference))?;
-            let graph = gpu.capture(|_| pass.enqueue(&gpu, w, &rings))?;
-            let nodes = graph.node_count();
-            let body = gpu
-                .capture(|_| pass.enqueue_body(&gpu, w, &rings))?
-                .node_count();
-            let markov = gpu.capture(|_| pass.enqueue_markov(&gpu, w))?.node_count();
-            println!("{NAME}: launches w={m}: body {body} nodes, Markov loop {markov} nodes");
-            let pass_ok = nodes == pass.launches(m);
+        for m in 1..=MAX_WIDTH {
+            let nodes = pass.capture(&gpu, w, &rings, m)?.node_count();
+            let g = body.pass_graph(m).ok_or("a pass graph per width")?;
+            let kernels = all_kernels(g)?;
+            let pass_ok = nodes == PASS_NODES[m - 1]
+                && pass.launches(m) == PASS_NODES[m - 1]
+                && g.node_count() == PASS_NODES[m - 1]
+                && body.pass_launches(m) == PASS_NODES[m - 1]
+                && kernels;
             println!(
-                "{NAME}: launches w={m}: captured {nodes} nodes, BlockPass::launches {} {}",
+                "{NAME}: launches w={m}: gate capture {nodes} nodes, DraftBody graph {} nodes (all kernel nodes {kernels}), \
+                 BlockPass::launches {}, pinned {} {}",
+                g.node_count(),
                 pass.launches(m),
+                PASS_NODES[m - 1],
                 verdict(pass_ok)
             );
             ok &= pass_ok;
         }
+        for n in 1..=GROUP {
+            let g = body
+                .append_graph(n)
+                .ok_or("an append graph per row count")?;
+            let kernels = all_kernels(g)?;
+            let append_ok = g.node_count() == APPEND_NODES
+                && body.append_launches(n) == APPEND_NODES
+                && kernels;
+            println!(
+                "{NAME}: launches append n={n}: DraftBody graph {} nodes (all kernel nodes {kernels}), \
+                 KvAppend::launches {}, pinned {APPEND_NODES} {}",
+                g.node_count(),
+                body.append_launches(n),
+                verdict(append_ok)
+            );
+            ok &= append_ok;
+        }
 
         // Every tap, both arms, blocks 0-2; argmax and accept counts, every block.
         let mut accept = Vec::new();
+        let mut eager_ref = Vec::new();
         for b in set.blocks() {
             let bs = block_set(&set, &hp, b)?;
             let row = embedding_row(&target, hp.n_embd, bs.id_last)?;
@@ -1409,6 +1450,9 @@ mod gate {
                 if TAP_BLOCKS.contains(&b) {
                     let (pass_ok, _, _) = judge_block(&cx, arm, &bs, &o)?;
                     ok &= pass_ok;
+                    if arm == Arm::Reference {
+                        eager_ref.push((b, after_of(&o, hp.n_layer, bs.width)));
+                    }
                 } else if arm == Arm::IkMask {
                     let ik_tok = set.i32s(set.find(b, "block", "draft_argmax", 0)?, "")?;
                     let res = set.f32s(set.find(b, "block", "result_output", 0)?)?;
@@ -1492,23 +1536,100 @@ mod gate {
             ok &= pass_ok;
         }
 
-        // DraftBody over the set: the set's features appended at the reference positions.
         drop(rings);
         drop(pass);
-        let mut body_accept = Vec::new();
+
+        // Graph = eager on DraftBody's own pass and rings: blocks 0-2 of
+        // the set at every width, the replay first — a replay that did not
+        // re-read its inputs would read the previous call's — then the
+        // eager twin, every tap the whole pass leaves, bit for bit.
+        for b in TAP_BLOCKS {
+            let bs = block_set(&set, &hp, b)?;
+            let row = embedding_row(&target, hp.n_embd, bs.id_last)?;
+            seat(&gpu, &hp, &bs, body.rings_mut())?;
+            for m in 1..=MAX_WIDTH {
+                let inp = input(&bs, row, m, Rule::Reference);
+                let ids = body.block(&gpu, &inp, Submit::Graph)?;
+                let replay = read_after(&gpu, body.pass(), hp.n_layer, m)?;
+                body.block(&gpu, &inp, Submit::Eager)?;
+                let eager = read_after(&gpu, body.pass(), hp.n_layer, m)?;
+                let off = first_difference(&replay, &eager);
+                println!(
+                    "{NAME}: graph = eager b{b} w={m}: ids {ids:?} (eager {:?}); {} taps; {} {}",
+                    eager.tokens,
+                    replay.taps.len(),
+                    off.as_deref()
+                        .map_or("bit-identical".to_string(), |t| format!(
+                            "first difference {t}"
+                        )),
+                    verdict(off.is_none())
+                );
+                ok &= off.is_none();
+            }
+        }
+
+        // Three consecutive blocks through the w = 3 graph against phase B's
+        // eager passes above (the gate's own pass, the reference rule).
+        for (b, eager) in &eager_ref {
+            let bs = block_set(&set, &hp, *b)?;
+            let row = embedding_row(&target, hp.n_embd, bs.id_last)?;
+            seat(&gpu, &hp, &bs, body.rings_mut())?;
+            body.block(
+                &gpu,
+                &input(&bs, row, bs.width, Rule::Reference),
+                Submit::Graph,
+            )?;
+            let replay = read_after(&gpu, body.pass(), hp.n_layer, bs.width)?;
+            let off = first_difference(&replay, eager);
+            println!(
+                "{NAME}: graph b{b} w={} = the judged eager pass: ids {:?} (eager {:?}); {} taps; {} {}",
+                bs.width,
+                replay.tokens,
+                eager.tokens,
+                replay.taps.len(),
+                off.as_deref()
+                    .map_or("bit-identical".to_string(), |t| format!(
+                        "first difference {t}"
+                    )),
+                verdict(off.is_none())
+            );
+            ok &= off.is_none();
+        }
+
+        // DraftBody over the set: the set's features appended at the
+        // reference positions, every block's proposal — eager, then through
+        // the graphs, the ids and the rings after each block bit for bit.
+        let mut eager_run = Vec::new();
         body.reset(&gpu)?;
         for b in set.blocks() {
             let bs = block_set(&set, &hp, b)?;
-            body.append(&gpu, &bs.feats)?;
+            body.append_as(&gpu, &bs.feats, Submit::Eager)?;
+            let ids = body.propose_as(&gpu, bs.id_last, bs.width, Submit::Eager)?;
+            eager_run.push((ids, ring_bits(&gpu, body.rings(), hp.n_layer)?));
+        }
+        let mut body_accept = Vec::new();
+        body.reset(&gpu)?;
+        for (b, (e_ids, e_rings)) in set.blocks().into_iter().zip(&eager_run) {
+            let bs = block_set(&set, &hp, b)?;
+            let n = body.append(&gpu, &bs.feats)?;
             let v = set.verify_of(b)?;
             let ids = body.propose(&gpu, bs.id_last, bs.width)?;
+            let same = ids == *e_ids && ring_bits(&gpu, body.rings(), hp.n_layer)? == *e_rings;
             let a = accepted(&ids, v.targets());
             println!(
-                "{NAME}: DraftBody b{b} committed {} ids {ids:?} target {:?}: accept {a} (ik {})",
+                "{NAME}: DraftBody b{b} appended {n} ({}) committed {} ids {ids:?} target {:?}: accept {a} (ik {}); \
+                 ids and rings = the eager run {same} {}",
+                if n <= GROUP {
+                    "graph"
+                } else {
+                    "eager: no graph"
+                },
                 body.committed(),
                 v.targets(),
-                v.accepted
+                v.accepted,
+                verdict(same)
             );
+            ok &= same;
             body_accept.push(a);
         }
 
@@ -1532,12 +1653,173 @@ mod gate {
         if ok {
             println!(
                 "PASSED: {NAME} — the block pass and head against the dsref set: every tap of blocks 0-2 within its band under ik's rule, \
-                 the rows on ik's path under the reference rule, draft_argmax on every block, launches = the kernel list, w=5 bit-identical where it must be"
+                 the rows on ik's path under the reference rule, draft_argmax on every block, launches = the kernel list, w=5 bit-identical where it must be; \
+                 the captured passes and appends = their pinned node counts, graph = eager per block and width, blocks 0-2 through the graph = the judged eager passes, \
+                 DraftBody through the graphs = its eager twin"
             );
             Ok(())
         } else {
             Err(checks_failed())
         }
+    }
+
+    /// Whether every node of `g` is a kernel launch.
+    fn all_kernels(g: &Graph) -> Result<bool, GateError> {
+        Ok(g.nodes()?
+            .iter()
+            .all(|n| n.kind == cuda_core::sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL))
+    }
+
+    /// Every tap a whole pass leaves readable after its Markov loop, as
+    /// bits, each cut to the rows of the pass.
+    struct After {
+        taps: Vec<(String, Vec<u32>)>,
+        tokens: Vec<u32>,
+    }
+
+    /// The first `m` of [`MAX_WIDTH`] token-major rows of `v`, as bits.
+    fn cut(v: &[f32], m: usize) -> Vec<u32> {
+        v[..v.len() / MAX_WIDTH * m]
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    }
+
+    fn layer_cut(l: usize, t: &LayerTaps, m: usize) -> Vec<(String, Vec<u32>)> {
+        let rows = [
+            ("mix_a", &t.mix_a),
+            ("hc_a", &t.hc_a),
+            ("normed", &t.normed),
+            ("kv", &t.kv),
+            ("kv_row", &t.kv_row),
+            ("q_a", &t.q_a),
+            ("q_a_n", &t.q_a_n),
+            ("q", &t.q),
+            ("y", &t.y),
+            ("wo_a", &t.wo_a),
+            ("out_a", &t.out_a),
+            ("streams_a", &t.streams_a),
+            ("fold_a", &t.fold_a),
+            ("mix_f", &t.mix_f),
+            ("hc_f", &t.hc_f),
+            ("normed_f", &t.normed_f),
+            ("router logits", &t.logits),
+            ("router probs", &t.probs),
+            ("router weights", &t.weights),
+            ("moe", &t.moe),
+            ("sh_h", &t.sh_h),
+            ("sh_y", &t.sh_y),
+            ("ffn_out", &t.ffn_out),
+            ("streams_f", &t.streams_f),
+            ("fold_f", &t.fold_f),
+        ];
+        let mut out: Vec<(String, Vec<u32>)> = rows
+            .iter()
+            .map(|(name, v)| (format!("L{l} {name}"), cut(v, m)))
+            .collect();
+        out.push((
+            format!("L{l} router ids"),
+            t.ids[..t.ids.len() / MAX_WIDTH * m].to_vec(),
+        ));
+        // Slot-major over `3m` slots, then token-major: the first `3m · m`
+        // rows of `3 · MAX_WIDTH · MAX_WIDTH`.
+        out.push((
+            format!("L{l} h"),
+            t.h[..t.h.len() / (MAX_WIDTH * MAX_WIDTH) * m * m]
+                .iter()
+                .map(|x| x.to_bits())
+                .collect(),
+        ));
+        out
+    }
+
+    fn after_parts(
+        streams0: &[f32],
+        layers: &[LayerTaps],
+        head_normed: &[f32],
+        result: &[Vec<f32>],
+        tokens: &[u32],
+        m: usize,
+    ) -> After {
+        let mut taps = vec![("streams0".to_string(), cut(streams0, m))];
+        for (l, t) in layers.iter().enumerate() {
+            taps.extend(layer_cut(l, t, m));
+        }
+        taps.push((
+            "head norm".to_string(),
+            head_normed.iter().map(|x| x.to_bits()).collect(),
+        ));
+        taps.push(("result_output".to_string(), bits(result).concat()));
+        After {
+            taps,
+            tokens: tokens.to_vec(),
+        }
+    }
+
+    /// [`After`] of an eager [`run_pass`]; its head norm and logits are
+    /// already `m` rows.
+    fn after_of(o: &Ours, n_layer: usize, m: usize) -> After {
+        after_parts(
+            &o.streams0,
+            &o.layers[..n_layer],
+            &o.head_normed,
+            &o.result,
+            &o.tokens,
+            m,
+        )
+    }
+
+    /// [`After`] of the pass `pass` last ran, `m` rows.
+    fn read_after(
+        gpu: &Gpu,
+        pass: &BlockPass,
+        n_layer: usize,
+        m: usize,
+    ) -> Result<After, GateError> {
+        let s = gpu.stream();
+        let layers = (0..n_layer)
+            .map(|l| read_layer(gpu, pass.layer(l).ok_or("a layer")?))
+            .collect::<Result<Vec<_>, _>>()?;
+        let n_vocab = pass.head().n_vocab();
+        Ok(after_parts(
+            &pass.streams0().to_host_vec(s)?,
+            &layers,
+            &pass.head().normed_to_host(s, m)?,
+            &rows_of(&pass.head().logits_to_host(s, m)?, m, n_vocab),
+            &pass.tokens(s)?,
+            m,
+        ))
+    }
+
+    /// The first tap (or the ids) where `a` and `b` differ; `None` when
+    /// every one is bit-identical.
+    fn first_difference(a: &After, b: &After) -> Option<String> {
+        if a.taps.len() != b.taps.len() {
+            return Some(format!("{} taps against {}", a.taps.len(), b.taps.len()));
+        }
+        a.taps
+            .iter()
+            .zip(&b.taps)
+            .find(|(x, y)| x.0 != y.0 || x.1 != y.1)
+            .map(|(x, _)| x.0.clone())
+            .or_else(|| (a.tokens != b.tokens).then(|| "the ids".to_string()))
+    }
+
+    /// Every ring, f16 bits.
+    fn ring_bits(
+        gpu: &Gpu,
+        rings: &DraftRings,
+        n_layer: usize,
+    ) -> Result<Vec<Vec<u16>>, GateError> {
+        (0..n_layer)
+            .map(|l| {
+                Ok(rings
+                    .ring(l)
+                    .ok_or("a ring")?
+                    .buf()
+                    .to_host_vec(gpu.stream())?)
+            })
+            .collect()
     }
 
     /// Walk a block's taps for their prediction only, printing nothing:
