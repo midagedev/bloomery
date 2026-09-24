@@ -250,3 +250,11 @@
 - **공개 파일의 token_embd(Q3_K)**: 드래프트는 로드에서 이름으로 거부한다(조용한 오답 없음, 코드 독해). 고침은 S–M ~50–60줄 — `dspark.rs:455` `card_format`에 Q3_K 행 소스, 행 폭을 타입에 맞추고, 넓히기 런치를 Q3_K 행 디퀀트로(일반 n_sb Q3_K `embed_rows` 커널이 없다, `elem.rs:733`은 k 2048 고정). 타깃도 같은 가정(`chain/glue.rs:847` `want bf16`) — **plainfile과 묶는다.** dsref 세트는 bf16 임베딩으로 떴으니 다시 뜬다.
 - 곁가지: router·shexp gate_up이 행마다 한 런치(`experts_mxfp4.rs:1044`, `experts.rs:353`) — m행 판이면 w 5에서 24노드 → 6, ~15 µs [유도] (M); `ds41_glue_embed` 런처 두 벌(R14, S); `append`가 기다리지 않아 비동기 오류가 다음 `propose`에서 드러난다(디버그 레버 후보); prefill append(n > 8)는 eager.
 - 설계: mistral.rs와 같은 모양(폭별 사전 캡처 + 영구 텐서 복사, `speculative/target.rs:192`). exllamav3는 커널 노드 인자 갱신(`graph.cu:182`), ik는 매번 캡처 + `cudaGraphExecUpdate`.
+
+## Qwen3 성능 (qwen3perf 보고, 2026-09-24 — `3c00e39`)
+
+- 그래프 869 → 653노드(층당 18 → 13·14, exllamav3 ~13), 배치 프리필 m ≤ 8(토큰·마지막 로짓 = 한 토큰 경로 비트 동일), greedy 덤프 64개 md5 = base. Δ는 전부 [유도]: 레버 1–4 스텝당 −0.5…−1.0 ms, 프리필 2.1–3×. **리드가 E28(`just depth-gpu-qwen3moe`, 우리·ik·ikdef·mainline `llama.cpp-mainline` 53ed051ce)로 잰다.**
+- **점유율 변화**: `qwen3moe_gate_up_swiglu_q4k` regs 40 → 48, blk/SM 6 → 5(`slot / slots_per_col` 나눗셈 추정) — 표의 occupancy 부류라 timed A/B 1회가 필요하다. m = 1 분기로 되돌릴 수 있다(`experts.rs:55`, S).
+- **`q4k_gemv` 여러 열 경로는 K = 4096에서 열마다 1열 launch와 비트가 다르다**(col 0 1037/2048, max|d| 4.77e-7; K 2048은 같음) — `cores.rs:384` 문서의 "bit for bit" 주장이 거짓이다. 추정 원인은 누산 모양 차이(FMA 축약, 미확인). V4.1 밀집은 전부 m = 1이라 지금 걸리는 곳은 없다(plainfile 확인). 원인 규명 + 누산 통일 + 게이트 한 줄(M).
+- 곁가지: 3c(combine + 다음 층 norm_quant)는 `fused.rs:88` `norm_quant`에 코어가 없어 막힘(M, −0.1…−0.15 ms); `q6k_gemv` 행 코어 없음(`lib.rs:805`, Q6_K v를 qkv에 못 합침, M); `Q8Act` m ≤ 8이 프리필 패스를 막는다(`tensor.rs:120`, S–M); decode refresh의 동기 `copy_from_host`(`body.rs:372`, S–M); seg 패스가 n_kv·segs 블록을 전부 띄운다(`flash_gqa.rs:227`, ctx 32k에서 −0.1 ms, M); **serve의 `Generator::prefill`이 qwen3moe `prefill`을 안 쓴다**(`bind.rs:292` — 프롬프트 2–3× [유도], S–M); `gate_deepseek41_step.rs:2190, 2418`의 `top2`/`ppl`이 `kld`와 중복(S).
+- `GpuModel::run_rows`(model.rs, 덧붙이기 35줄)는 리드가 받았다.
