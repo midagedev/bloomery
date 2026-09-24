@@ -46,7 +46,17 @@
 # Output puts entries that have a depot first, then by name ascending — a depot is the defect and
 # the rest is context.
 #
-# Exit status. 0: a banner line, the header, one row per entry. 1: the scan failed — the banner line
+# After the table, a second block: a `ptx-scan-md5:` line, then `<entry> <md5> <lines>` per row of
+# the table (the same filter), by name ascending. The md5 is of the entry's normalized body and
+# `lines` its line count: the instruction stream with comments, whitespace runs, register numbers,
+# block-label numbers, `__shared_mem_N`/`__local_depotN` numbers and the entry's own name taken out
+# (the rule table is in crates/gpu-gates/src/ptx.rs, `normalize`; the extractor writes the text).
+# The table counts instructions; this block sees their order and operands, so a rewrite that keeps
+# every count (predicated selects turned into branches, a `stacksave` appearing) changes a digest.
+# Compare the two blocks separately: the table is what the columns measure, the digest is whether
+# the entry's code is the same code.
+#
+# Exit status. 0: a banner line, the header, one row per entry, the digest block. 1: the scan failed — the banner line
 # on stdout ends in `scan=failed`, names what failed, and no rows follow; the detail is on stderr:
 #   missing              no target/release/<binary>
 #   section=none         the binary carries no .oxart section (a host-only binary?)
@@ -59,6 +69,7 @@
 #   jit-unread=NAME      the driver loaded every module but reported nothing for these entries
 #   bytescan=failed      the byte scan itself failed
 #   rows=0               no entry, or none the entry substring matches
+#   digest-unread=NAME   the extractor wrote no normalized body for these entries
 # 2: a usage error.
 #
 # The next four columns come from `ptxas -v` on the same PTX, not from the byte scan:
@@ -120,7 +131,7 @@ if [ ! -x "$EXTRACT" ]; then
   echo "ptx-scan: no extractor $EXTRACT — cargo build --release -p bloomery-gpu-gates --bin oxart_ptx" >&2
   fail "$SEC extract=failed"
 fi
-if ! "$EXTRACT" "$PTX" "$MODS" >"$MODS/list"; then
+if ! "$EXTRACT" --norm "$PTX" "$MODS" >"$MODS/list"; then
   fail "$SEC extract=failed"
 fi
 sed 's/^/ptx-scan: /' "$MODS/list" >&2
@@ -286,6 +297,21 @@ if [ ! -s "$ROWS" ]; then
   echo "ptx-scan: no entry${FILTER:+ name contains $FILTER}" >&2
   fail "$SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER} rows=0"
 fi
+# One digest line per row, read before the banner: a scan whose digests could not be taken fails.
+DIGESTS=$MODS/digests
+: >"$DIGESTS"
+NODIGEST=
+for E in $(awk '{print $1}' "$ROWS" | LC_ALL=C sort); do
+  if [ ! -f "$MODS/norm/$E" ]; then
+    NODIGEST=${NODIGEST:+$NODIGEST,}$E
+    continue
+  fi
+  printf '%s %s %s\n' "$E" "$(md5sum <"$MODS/norm/$E" | cut -d' ' -f1)" "$(wc -l <"$MODS/norm/$E" | tr -d ' ')" >>"$DIGESTS"
+done
+if [ -n "$NODIGEST" ]; then
+  echo "ptx-scan: the extractor wrote no normalized body for: $NODIGEST" >&2
+  fail "$SEC $TOOLS modules=$NMOD $JITS digest-unread=$NODIGEST"
+fi
 CALLERS=
 if [ -s "$CALLS" ]; then
   CALLERS=$(LC_ALL=C sort "$CALLS" | paste -sd, -)
@@ -295,4 +321,6 @@ echo "ptx-scan bin=$BIN $SEC $TOOLS modules=$NMOD${FILTER:+ filter=$FILTER} $JIT
 printf '%-28s %8s %6s %9s %9s %6s %8s %6s %6s %6s %14s %8s %9s\n' \
   entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill 'blk/SM(static)' jit_regs jit_local
 cat "$ROWS"
+echo "ptx-scan-md5:"
+cat "$DIGESTS"
 exit 0

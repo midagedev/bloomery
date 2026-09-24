@@ -27,6 +27,35 @@
 //! `fma.rn.f32` (and `fma.rm.f32`), never `fma.f32`, so [`Counts::fma`]
 //! counts the `fma.` prefix. A needle that matches nothing returns zero and
 //! reads exactly like a clean kernel.
+//!
+//! The counts see the instructions an entry carries, not their order or
+//! their operands: predicated selects rewritten into branches, or a
+//! `stacksave` appearing, can leave every count equal. [`normalize`] is the
+//! entry's whole instruction stream with only the names the backend numbers
+//! freely taken out, so two bodies that differ in anything else normalize
+//! differently; `tools/ptx-scan.sh` prints the md5 of each entry's
+//! normalized text. The rules, applied to the entry's [`body`] line by line:
+//!
+//! | input                                  | normalized                 |
+//! |----------------------------------------|----------------------------|
+//! | `// …` to the end of the line          | removed                    |
+//! | a run of spaces and tabs               | one space; none at the ends|
+//! | a line left empty                      | removed                    |
+//! | `%r12` `%rd7` `%f3` `%p1` (a register) | `%r` `%rd` `%f` `%p`       |
+//! | `%r<143>` (a register declaration)     | `%r<N>`                    |
+//! | `$L__BB54_3` (a block label)           | `$L`                       |
+//! | `__shared_mem_7`, `__local_depot2`     | `__shared_mem_`, `__local_depot` |
+//! | the entry's own name, `<name>_param_3` | `ENTRY`, `ENTRY_param_3`   |
+//! | anything else                          | kept byte for byte         |
+//!
+//! Registers are the classes `%r %rd %rs %f %fd %p %h %hh %rq`; a special
+//! register (`%tid.x`, `%clock64`) is kept. Opcodes with their type
+//! suffixes, immediates (`0fFF800000`), operand order and instruction order
+//! are kept. A name is replaced only as a whole token, so `add.s64` and
+//! `alpha2` are not touched while normalizing `alpha`. What the digest does
+//! not see: which register or label is which (a permuted operand pair of two
+//! `%r` operands, or a branch retargeted to another label), and the body of
+//! a device function the entry calls, which lies outside its [`body`].
 
 use crate::GateError;
 use oxide_artifacts::{ArtifactPayloadKind, OwnedArtifactBundle};
@@ -288,6 +317,127 @@ pub fn scan(modules: &[Module<'_>]) -> Vec<Counts> {
     let mut out: Vec<Counts> = names.iter().filter_map(|n| counts(modules, n)).collect();
     out.sort_by(|a, b| b.depot.cmp(&a.depot).then_with(|| a.name.cmp(&b.name)));
     out
+}
+
+/// The register classes the backend numbers: `%<class><n>` and the
+/// declaration `%<class><<count>>`.
+const REG_CLASSES: &[&[u8]] = &[b"r", b"rd", b"rs", b"f", b"fd", b"p", b"h", b"hh", b"rq"];
+
+/// Generated symbols that carry a number with no meaning of its own.
+const NUMBERED_STEMS: &[&[u8]] = &[b"__shared_mem_", b"__local_depot"];
+
+/// A character of a PTX identifier (or of the alphanumeric run of a number).
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// The text of entry `name`'s [`body`] with the freely numbered names taken
+/// out — the table in this module's comment. Every kept line ends in `\n`.
+#[must_use]
+pub fn normalize(name: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    for raw in body.split(|&c| c == b'\n') {
+        let code = find(raw, b"//").map_or(raw, |i| &raw[..i]);
+        let start = out.len();
+        normalize_line(name.as_bytes(), code, &mut out);
+        if out.len() > start {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// One line with its comment already cut off: whitespace runs to one space,
+/// registers and symbols through [`register`] and [`symbol`].
+fn normalize_line(name: &[u8], line: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
+    let mut space = false;
+    let mut i = 0;
+    while i < line.len() {
+        let c = line[i];
+        if matches!(c, b' ' | b'\t' | b'\r') {
+            space = true;
+            i += 1;
+            continue;
+        }
+        if space && out.len() > start {
+            out.push(b' ');
+        }
+        space = false;
+        if c == b'%' {
+            i = register(line, i, out);
+        } else if is_ident(c) && (i == 0 || !is_ident(line[i - 1])) {
+            let end = i + line[i..].iter().take_while(|&&b| is_ident(b)).count();
+            symbol(name, &line[i..end], out);
+            i = end;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+}
+
+/// The `%` at `line[at]`: a numbered register of a [`REG_CLASSES`] class
+/// becomes its class, a declaration's count becomes `N`, anything else
+/// (a special register) is kept. Returns the offset past what was read.
+fn register(line: &[u8], at: usize, out: &mut Vec<u8>) -> usize {
+    let letters = line[at + 1..]
+        .iter()
+        .take_while(|b| b.is_ascii_lowercase())
+        .count();
+    let class_end = at + 1 + letters;
+    out.extend_from_slice(&line[at..class_end]);
+    if !REG_CLASSES.contains(&&line[at + 1..class_end]) {
+        return class_end;
+    }
+    let digits = line[class_end..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    let after = class_end + digits;
+    if digits > 0 && line.get(after).is_none_or(|&c| !is_ident(c)) {
+        return after;
+    }
+    if line.get(class_end) == Some(&b'<') {
+        let count = line[class_end + 1..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let close = class_end + 1 + count;
+        if count > 0 && line.get(close) == Some(&b'>') {
+            out.extend_from_slice(b"<N>");
+            return close + 1;
+        }
+    }
+    class_end
+}
+
+/// One whole identifier token: a block label, a numbered generated symbol,
+/// or the entry's own name is replaced; any other token is kept.
+fn symbol(name: &[u8], tok: &[u8], out: &mut Vec<u8>) {
+    let numbered = |rest: &[u8]| !rest.is_empty() && rest.iter().all(u8::is_ascii_digit);
+    if let Some(rest) = tok.strip_prefix(b"$L__BB".as_slice())
+        && rest.split(|&c| c == b'_').all(numbered)
+    {
+        out.extend_from_slice(b"$L");
+        return;
+    }
+    for stem in NUMBERED_STEMS {
+        if tok.strip_prefix(*stem).is_some_and(numbered) {
+            out.extend_from_slice(stem);
+            return;
+        }
+    }
+    if tok == name {
+        out.extend_from_slice(b"ENTRY");
+    } else if let Some(rest) = tok.strip_prefix(name)
+        && rest.starts_with(b"_param_")
+    {
+        out.extend_from_slice(b"ENTRY");
+        out.extend_from_slice(rest);
+    } else {
+        out.extend_from_slice(tok);
+    }
 }
 
 #[cfg(test)]
@@ -592,5 +742,132 @@ mod tests {
         assert!(section_bundles(b"not an oxide-artifacts container at all").is_err());
         let empty = section_bundles(&[0u8; 32]).expect("zero padding parses");
         assert!(modules(&empty).expect("no bundle to refuse").is_empty());
+    }
+
+    /// A 20-line entry body shaped like the backend's: parameters, register
+    /// declarations, a predicated branch, labels, shared memory, a special
+    /// register and a hex-float immediate.
+    const NORM_A: &[u8] = b"
+	.param .u64 .ptr .align 4 alpha_param_0,
+	.param .u32 alpha_param_1
+)
+.reqntid 32, 1, 1                       // @alpha
+{
+	.reg .pred 	%p<4>;
+	.reg .b32 	%r<9>;
+	.reg .b64 	%rd<5>;
+
+// %bb.0:                               // %entry
+	ld.param.b64 	%rd1, [alpha_param_0];
+	mov.u32 	%r1, %tid.x;
+	setp.ne.b32 	%p1, %r1, 0;
+	@%p1 bra 	$L__BB3_2;
+	mov.b32 	%r2, 0fFF800000;
+	st.shared.b32 	[__shared_mem_4], %r2;
+$L__BB3_2:                              // %exit
+	add.s64 	%rd2, %rd1, 4;
+	ret;
+}
+";
+
+    /// `NORM_A` as another build emits it: every register, label and shared
+    /// symbol renumbered, the entry renamed, comments and spacing changed.
+    const NORM_A_RENUMBERED: &[u8] = b"
+    .param .u64 .ptr .align 4 beta_param_0,
+    .param .u32 beta_param_1
+)
+.reqntid 32, 1, 1
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<9>;
+    .reg .b64 %rd<5>;
+    ld.param.b64 %rd7, [beta_param_0];    // renamed
+    mov.u32 %r5, %tid.x;
+
+    setp.ne.b32 %p3, %r5, 0;
+    @%p3 bra $L__BB11_7;
+    mov.b32 %r6, 0fFF800000;
+    st.shared.b32 [__shared_mem_19], %r6;
+$L__BB11_7:
+    add.s64 %rd8, %rd7, 4;
+    ret;
+}
+";
+
+    /// Renumbering and renaming leave the normalized text — and so its md5
+    /// — unchanged; the text is the stream with only the numbers gone.
+    #[test]
+    fn normalize_ignores_renumbering() {
+        let a = normalize("alpha", NORM_A);
+        assert_eq!(a, normalize("beta", NORM_A_RENUMBERED));
+        let text = String::from_utf8(a).expect("ascii");
+        assert_eq!(text.lines().count(), 18, "{text}");
+        for kept in [
+            "ld.param.b64 %rd, [ENTRY_param_0];",
+            "mov.u32 %r, %tid.x;",
+            "@%p bra $L;",
+            "mov.b32 %r, 0fFF800000;",
+            "st.shared.b32 [__shared_mem_], %r;",
+            "$L:",
+            "add.s64 %rd, %rd, 4;",
+            ".reg .b64 %rd<N>;",
+            ".reqntid 32, 1, 1",
+        ] {
+            assert!(
+                text.lines().any(|l| l == kept),
+                "no line {kept:?} in\n{text}"
+            );
+        }
+    }
+
+    /// Any change that is not a number the backend picks freely changes the
+    /// normalized text: an opcode, an immediate, operand order, instruction
+    /// order, a special register, the block width.
+    #[test]
+    fn normalize_sees_every_other_change() {
+        let a = normalize("alpha", NORM_A);
+        let src = std::str::from_utf8(NORM_A).expect("ascii");
+        for (from, to) in [
+            ("setp.ne.b32", "setp.eq.b32"),
+            ("add.s64", "add.u64"),
+            ("0fFF800000", "0f7F800000"),
+            ("%rd1, 4;", "%rd1, 8;"),
+            ("%r1, 0;", "0, %r1;"),
+            ("%tid.x", "%tid.y"),
+            (".reqntid 32", ".reqntid 64"),
+            ("alpha_param_0]", "alpha_param_1]"),
+            ("\tret;", "\texit;"),
+        ] {
+            assert!(src.contains(from), "{from:?} is not in the body");
+            let changed = normalize("alpha", src.replacen(from, to, 1).as_bytes());
+            assert_ne!(a, changed, "{from:?} -> {to:?} normalized the same");
+        }
+        let swapped = src.replacen(
+            "\tmov.u32 \t%r1, %tid.x;\n\tsetp.ne.b32 \t%p1, %r1, 0;\n",
+            "\tsetp.ne.b32 \t%p1, %r1, 0;\n\tmov.u32 \t%r1, %tid.x;\n",
+            1,
+        );
+        assert_ne!(swapped, src, "the swap must apply");
+        assert_ne!(a, normalize("alpha", swapped.as_bytes()));
+    }
+
+    /// Only whole tokens are rewritten: a longer name that starts with the
+    /// entry's, a special register that ends in digits, and a register class
+    /// outside the list stay as they are.
+    #[test]
+    fn normalize_rewrites_whole_tokens_only() {
+        let n = normalize(
+            "alpha",
+            b"call alpha2, (alpha_x);\nmov.u64 %rd1, %clock64;\n%q3;\n",
+        );
+        assert_eq!(
+            std::str::from_utf8(&n).expect("ascii"),
+            "call alpha2, (alpha_x);\nmov.u64 %rd, %clock64;\n%q3;\n"
+        );
+        assert_eq!(normalize("alpha", b"  // only a comment\n\n\t\n"), b"");
+        assert_eq!(
+            normalize("a", b"$L__BB1_x: __local_depot7 __local_depotx\n"),
+            b"$L__BB1_x: __local_depot __local_depotx\n"
+        );
     }
 }
