@@ -176,3 +176,8 @@
 - `/props` `engine.args`는 argv 그대로다 — 비밀을 싣는 플래그(`--api-key` 류)가 생기면 그 값을 가린다.
 - `gate_ds41_serve.rs:472` `check(ok: &mut bool…)`는 R24 패턴(기존 코드, S).
 - 업스트림 후보(MUL-7, 코드 독해만 — 가설): ik `common/jinja/value.cpp:92-105`·`runtime.cpp:771-773`은 음수 step 슬라이스에서 start/stop을 무시하거나 0/len으로 채워 `a[2::-1]`·`a[4:1:-2]`를 틀리게 렌더한다. mainline `930e2fa59`는 기본값만 고쳤고 `a[-10::-1]`·`a[3:-1:-1]`이 남는다. FAIL-first는 test-jinja 케이스 하나(각 S). ik PR은 하나만 열어 둔다는 사용자 지시(09-24)가 있어 mainline 먼저.
+
+## 두 카드 게이트 (2026-09-24)
+
+- V4.1 `--place gate` 게이트는 배치가 카드 이름 "3090"을 박고 있어 `BLOOMERY_GATE_CARD=any`로도 3090에서만 돈다. A6000에서 `BLOOMERY_CARD_BUDGET`(3090의 usable 바이트)으로 같은 배치를 슬롯 단위로 흉내 내면 이 게이트들도 두 카드로 나뉜다 — 게이트가 핀하는 대상이 바뀌므로 `nanmoe`(그 배치의 결함) 착륙 뒤에 연다(S–M).
+- 레시피별 카드 태그(`any`로 떠도 되는 게이트: V2-Lite e2e·p6·chain-ffn, qwen3moe, vision, kv, dspark-kv)는 파동이 착륙한 뒤 justfile에서 한 번에 단다(지금은 `BLOOMERY_BOX_ENV`로 넘긴다).
