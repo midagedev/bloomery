@@ -187,7 +187,10 @@ mod tests {
         let err = open("# arch\tdeepseek41\n# model\t/models/other/x.gguf\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("/models/other/x.gguf") && err.contains(&runs), "{err}");
+        assert!(
+            err.contains("/models/other/x.gguf") && err.contains(&runs),
+            "{err}"
+        );
         assert!(open("# arch\tdeepseek41\n").is_err());
         assert!(open("").is_err());
         std::fs::remove_dir_all(&dir)?;
