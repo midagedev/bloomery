@@ -2,14 +2,16 @@
 # 아키텍처 축 점검 — 맥에서 돈다(grep뿐, 빌드 없음). docs/arch-split.md 「검사」가 정본이다.
 #
 # 네 가지를 본다:
-#   ① arch/deepseek41/ 아래가 deepseek2 를 use 하지 않고, 그 반대도 없다.
-#   ② blk.N.<name> 문자열 리터럴과 "deepseek2. / "deepseek41. 키 접두는 crates/*/src/arch/ 와
+#   ① 아키텍처 디렉터리끼리 서로를 use 하지 않는다.
+#   ② blk.N.<name> 문자열 리터럴과 "<아키텍처>. 키 접두는 crates/*/src/arch/ 와
 #      tools/ref/models/ 밖에 없다 — 커널 파일은 모델 이름을 모른다(결정 6).
 #   ③ general.architecture 를 읽는 자리는 crates/model/src/arch/mod.rs 하나다.
 #      crates/gguf 의 접근자는 저장소 쪽이라 허용한다.
-#   ④ 공유 파일(crates/*/src 가운데 arch/ 밖)은 아키텍처 모듈 경로(deepseek2:: · deepseek41::)를 쓰지 않는다.
+#   ④ 공유 파일(crates/*/src 가운데 arch/ 밖)은 아키텍처 모듈 경로(deepseek2:: · qwen3moe:: …)를 쓰지 않는다.
 #      Arch 를 구체 모델로 잇는 디스패치 지점만 파일과 구문(함수·타입 별칭·use 선언) 단위로 허용한다.
 #   아키텍처 자신의 크레이트(crates/gpu-<arch>/src/)는 ①②④에서 그 아키텍처의 arch/ 로 센다.
+#   아키텍처 목록은 손으로 적지 않는다: crates/*/src/arch/ 아래 디렉터리 이름이 목록이다. 새 아키텍처는
+#   디렉터리가 생기는 순간 넷 모두의 대상이 된다.
 #
 # 계약: `just check-arch`는 넷 다 엄격하게 돈다. --allow-pending(또는 CHECK_ARCH_PENDING=1)은 ②·③을
 # 경고로 낮추는 문이다 — 이관 라운드가 한동안 둘을 빨강으로 두어야 할 때 그 라운드 안에서만 쓴다.
@@ -24,6 +26,14 @@ for a in "$@"; do
     *) echo "check-arch: unknown argument '$a' (only --allow-pending)" >&2; exit 2 ;;
   esac
 done
+
+# 아키텍처 이름들: crates/*/src/arch/<name>/ 디렉터리.
+ARCHES=$(find crates -mindepth 4 -maxdepth 4 -type d -path 'crates/*/src/arch/*' 2>/dev/null \
+  | sed 's|.*/||' | sort -u | tr '\n' ' ')
+[ -n "$ARCHES" ] || { echo "check-arch: no crates/*/src/arch/<name>/ directory found" >&2; exit 2; }
+ALT=$(printf '%s' "$ARCHES" | sed 's/ *$//; s/ /|/g')         # deepseek2|deepseek41|…
+KEYS=$(printf '"%s\\.|' $ARCHES | sed 's/|$//')               # "deepseek2\.|"deepseek41\.|…
+OWN="^crates/([^/]+/src/arch/|gpu-($ALT)/src/)"
 
 fail=0
 report() { # report <번호> <설명> <위반 줄들>
@@ -50,8 +60,11 @@ cross_one() { # cross_one <이 아키텍처 디렉터리> <여기서 use 하면 
   hits=$(grep -rnE "^[[:space:]]*(pub )?use .*\b$2\b" $dirs --include='*.rs' || true)
   [ -z "$hits" ] || cross="${cross:+$cross$'\n'}$hits"
 }
-cross_one deepseek41 deepseek2
-cross_one deepseek2 deepseek41
+for a in $ARCHES; do
+  for b in $ARCHES; do
+    [ "$a" = "$b" ] || cross_one "$a" "$b"
+  done
+done
 report 1 "arch dirs use each other" "$cross"
 
 # ② 모델을 아는 문자열은 arch/ 와 도구 프로필 안에만.
@@ -66,16 +79,16 @@ report 1 "arch dirs use each other" "$cross"
 # `"blk.{l}.ffn_up"`·`"blk.0.attn_q"`와, 맨 접두와 이름이 한 줄에 같이 있는 줄은 그대로 걸린다.
 # `blk.{` 앞에 `.`나 소문자가 붙은 이름(비전 탑의 `v.blk.{n}.…`)은 다른 탑의 이름공간이라 이 규칙의 대상이
 # 아니다 — 그 표는 어차피 그 크레이트의 arch/ 아래에 있다.
-lits=$(grep -rnE '"blk\.|(^|[^.a-z])blk\.\{|"deepseek2\.|"deepseek41\.' crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
-  | grep -vE '^crates/([^/]+/src/arch/|gpu-(deepseek2|deepseek41)/src/)' \
+lits=$(grep -rnE "\"blk\\.|(^|[^.a-z])blk\\.\\{|$KEYS" crates tools/ref --include='*.rs' --include='*.sh' 2>/dev/null \
+  | grep -vE "$OWN" \
   | grep -vE '^tools/ref/models/' \
   | grep -vE '^crates/[^/]+/tests/' \
   | grep -vE '^crates/gpu-gates/src/bin/' \
   | grep -vE '^crates/engram/' \
   | grep -vE '^crates/gguf/src/bin/' \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
-  | awk '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
-           if (body ~ /"blk\.|(^|[^.a-z])blk\.[{]|"deepseek2\.|"deepseek41\./) print }' || true)
+  | awk -v keys="$KEYS" '{ body = $0; sub(/^[^:]*:[0-9]+:/, "", body); gsub(/"blk\."/, "", body)
+           if (body ~ /"blk\.|(^|[^.a-z])blk\.[{]/ || body ~ keys) print }' || true)
 report 2 "model-aware string literals outside arch/" "$lits"
 
 # ③ general.architecture 는 한 곳에서만 읽는다.
@@ -99,6 +112,10 @@ report 3 "general.architecture read outside crates/model/src/arch/mod.rs" "$arch
 dispatch=(
   # GpuModel<B>에 deepseek2 몸체를 꽂는 별칭 — AnyEngine(crates/gpu-gates/src/engine.rs)은 이 별칭으로만 deepseek2 를 부른다.
   'crates/gpu/src/lib.rs type Deepseek2Model'
+  # 같은 모양의 qwen3moe 별칭 — AnyEngine 은 이 별칭으로만 qwen3moe 를 부른다.
+  'crates/gpu/src/lib.rs type Qwen3moeModel'
+  # gpu-vision 은 deepseek41v 탑 자신의 크레이트다(이름이 gpu-<arch> 가 아닐 뿐) — 인코더가 그 탑의 이름표를 읽는다.
+  'crates/gpu-vision/src/encoder.rs use'
   # CPU 디코드 바이너리: Arch::detect 로 다른 아키텍처를 거절한 뒤 deepseek2 순전파를 돈다.
   'crates/model/src/bin/bloomery-decode.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.
@@ -129,12 +146,12 @@ done)
 # 세 모양을 본다: 경로 안의 `deepseek2::…`, 모듈을 통째로 들여오거나 재수출하는 use 줄
 # (`use …::arch::deepseek2 as x;`, `pub use …::deepseek2;` — 뒤에 `::`가 없어 첫 모양에 안 걸린다),
 # 그리고 rustfmt가 여러 줄로 나눈 `use …::{`의 한 줄에 모듈 이름만 남은 것(`    deepseek2,`).
-archpath=$({ grep -rnE '\b(deepseek2|deepseek41)::' crates/*/src --include='*.rs' 2>/dev/null
-             grep -rnE '^[[:space:]]*(pub(\([a-z]+\))?[[:space:]]+)?use[[:space:]][^;]*\b(deepseek2|deepseek41)\b' \
+archpath=$({ grep -rnE "\\b($ALT)::" crates/*/src --include='*.rs' 2>/dev/null
+             grep -rnE "^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?use[[:space:]][^;]*\\b($ALT)\\b" \
                crates/*/src --include='*.rs' 2>/dev/null
-             grep -rnE '^[[:space:]]*(deepseek2|deepseek41)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*$' \
+             grep -rnE "^[[:space:]]*($ALT)([[:space:]]+as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*)?,?[[:space:]]*\$" \
                crates/*/src --include='*.rs' 2>/dev/null; } | sort -u \
-  | grep -vE '^crates/([^/]+/src/arch/|gpu-(deepseek2|deepseek41)/src/)' \
+  | grep -vE "$OWN" \
   | grep -vE '^crates/gpu-gates/src/bin/' \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 outside=
