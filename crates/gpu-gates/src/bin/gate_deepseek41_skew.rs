@@ -76,12 +76,12 @@ mod gate {
     use bloomery_gpu::weights::Weights;
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, Seam};
+    use bloomery_gpu_gates::nodes::{StepNode, capture_order};
     use bloomery_gpu_gates::oracle::deepseek41::{D1, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, ref_tensor_of_in, verdict, widened_f16_rows_in,
     };
-    use cuda_core::sys;
     use gguf::Split;
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
@@ -767,172 +767,13 @@ mod gate {
 
     // ------------------------------------------------------------ structure
 
-    fn drv(rc: sys::CUresult, what: &str) -> Result<(), GateError> {
-        if rc == sys::cudaError_enum_CUDA_SUCCESS {
-            Ok(())
-        } else {
-            Err(format!("{what}: CUresult {rc}").into())
-        }
-    }
-
-    /// One node of a captured chain, as the driver reports it.
-    #[derive(Debug)]
-    enum StepNode {
-        Kernel(String),
-        /// A stream memory-operation batch and its operation count.
-        Memop(u32),
-        Other(String),
-    }
-
-    /// The nodes `enqueue` records on the engine stream, in stream order:
-    /// the template walked from its one root along its edges, then
-    /// destroyed without being instantiated (the step gate's `step_order`).
+    /// The nodes `enqueue` records on the engine stream, in enqueue order
+    /// ([`capture_order`], the step gate's `step_graph`).
     fn chain_order(
         gpu: &Gpu,
         enqueue: impl FnOnce() -> Result<(), GpuError>,
     ) -> Result<Vec<StepNode>, GateError> {
-        let hs = gpu.stream().cu_stream();
-        // SAFETY: `hs` is the engine's live stream, which is not capturing
-        // (every capture before this one ended).
-        let rc = unsafe {
-            sys::cuStreamBeginCapture_v2(
-                hs,
-                sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-        };
-        drv(rc, "cuStreamBeginCapture_v2")?;
-        let enqueued = enqueue();
-        let mut graph: sys::CUgraph = std::ptr::null_mut();
-        // SAFETY: the stream is capturing (begun above); this ends it on
-        // every path and writes the template, or null, into `graph`.
-        let ended = unsafe { sys::cuStreamEndCapture(hs, &mut graph) };
-        let order = match enqueued {
-            Err(e) => Err(e.into()),
-            Ok(()) => drv(ended, "cuStreamEndCapture").and_then(|()| walk(graph)),
-        };
-        if !graph.is_null() {
-            // SAFETY: a non-null handle from the end of the capture is a
-            // template, destroyed exactly once here.
-            unsafe { sys::cuGraphDestroy(graph) };
-        }
-        order
-    }
-
-    /// `graph`'s nodes from its one root along its one-successor edges; a
-    /// template that is not a chain is refused.
-    fn walk(graph: sys::CUgraph) -> Result<Vec<StepNode>, GateError> {
-        let mut total = 0usize;
-        // SAFETY: a null array asks only for the count.
-        let rc = unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut total) };
-        drv(rc, "cuGraphGetNodes")?;
-        let mut roots = 0usize;
-        // SAFETY: a null array asks only for the count.
-        let rc = unsafe { sys::cuGraphGetRootNodes(graph, std::ptr::null_mut(), &mut roots) };
-        drv(rc, "cuGraphGetRootNodes")?;
-        if roots != 1 {
-            return Err(format!("the graph has {roots} roots; a one-stream capture has 1").into());
-        }
-        let mut node: sys::CUgraphNode = std::ptr::null_mut();
-        // SAFETY: one slot, the count the driver just reported.
-        let rc = unsafe { sys::cuGraphGetRootNodes(graph, &mut node, &mut roots) };
-        drv(rc, "cuGraphGetRootNodes")?;
-        let mut out = Vec::with_capacity(total);
-        loop {
-            out.push(describe(node)?);
-            let mut k = 0usize;
-            // SAFETY: `node` is a node of the live template; null arrays ask
-            // only for the count.
-            let rc = unsafe {
-                sys::cuGraphNodeGetDependentNodes_v2(
-                    node,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut k,
-                )
-            };
-            drv(rc, "cuGraphNodeGetDependentNodes_v2")?;
-            match k {
-                0 => break,
-                1 => {
-                    let mut next: sys::CUgraphNode = std::ptr::null_mut();
-                    // SAFETY: one slot, the count just reported; the edge data
-                    // is not asked for.
-                    let rc = unsafe {
-                        sys::cuGraphNodeGetDependentNodes_v2(
-                            node,
-                            &mut next,
-                            std::ptr::null_mut(),
-                            &mut k,
-                        )
-                    };
-                    drv(rc, "cuGraphNodeGetDependentNodes_v2")?;
-                    node = next;
-                }
-                _ => {
-                    return Err(format!(
-                        "node {} of the graph has {k} successors; a one-stream capture has one",
-                        out.len() - 1
-                    )
-                    .into());
-                }
-            }
-        }
-        if out.len() != total {
-            return Err(format!(
-                "the walk from the root reached {} of the graph's {total} nodes",
-                out.len()
-            )
-            .into());
-        }
-        Ok(out)
-    }
-
-    /// A node's kind, with its kernel's entry name or its batch's operation
-    /// count (the step gate's `describe`).
-    fn describe(node: sys::CUgraphNode) -> Result<StepNode, GateError> {
-        let mut kind: sys::CUgraphNodeType = 0;
-        // SAFETY: `node` is a node of a live template.
-        let rc = unsafe { sys::cuGraphNodeGetType(node, &mut kind) };
-        drv(rc, "cuGraphNodeGetType")?;
-        if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL {
-            // SAFETY: all-zero is a valid value of this plain C struct
-            // (integers and nullable pointers), which the call then fills.
-            let mut p: sys::CUDA_KERNEL_NODE_PARAMS = unsafe { std::mem::zeroed() };
-            // SAFETY: `node` is a kernel node and `p` the struct the call fills.
-            let rc = unsafe { sys::cuGraphKernelNodeGetParams_v2(node, &mut p) };
-            drv(rc, "cuGraphKernelNodeGetParams_v2")?;
-            let mut name: *const std::ffi::c_char = std::ptr::null();
-            if p.func.is_null() {
-                // SAFETY: the node launches the library kernel `p.kern`, a
-                // live handle; `name` is a local the call writes.
-                let rc = unsafe { sys::cuKernelGetName(&mut name, p.kern) };
-                drv(rc, "cuKernelGetName")?;
-            } else {
-                // SAFETY: the node launches the module function `p.func`, a
-                // live handle; `name` is a local the call writes.
-                let rc = unsafe { sys::cuFuncGetName(&mut name, p.func) };
-                drv(rc, "cuFuncGetName")?;
-            }
-            if name.is_null() {
-                return Err("a kernel node whose function has no name".into());
-            }
-            // SAFETY: the driver hands back a NUL-terminated name it owns for
-            // the function's lifetime; it is copied out at once.
-            let name = unsafe { std::ffi::CStr::from_ptr(name) };
-            Ok(StepNode::Kernel(name.to_string_lossy().into_owned()))
-        } else if kind == sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP {
-            // SAFETY: all-zero is a valid value of this plain C struct (a
-            // context, a count, a nullable array pointer, flags), which the
-            // call then fills.
-            let mut p: sys::CUDA_BATCH_MEM_OP_NODE_PARAMS = unsafe { std::mem::zeroed() };
-            // SAFETY: `node` is a batch memory-operation node and `p` the
-            // struct the call fills.
-            let rc = unsafe { sys::cuGraphBatchMemOpNodeGetParams(node, &mut p) };
-            drv(rc, "cuGraphBatchMemOpNodeGetParams")?;
-            Ok(StepNode::Memop(p.count))
-        } else {
-            Ok(StepNode::Other(bloomery_gpu_gates::nodes::kind_name(kind)))
-        }
+        Ok(capture_order(gpu.stream(), enqueue)?.nodes)
     }
 
     /// Per kernel name its count, the memop batches and the other nodes'

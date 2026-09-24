@@ -12,8 +12,9 @@
 //! replay is the common starting line, not an optimization to earn later.
 
 use crate::GpuError;
-use cuda_core::{CudaStream, DriverError, sys};
+use cuda_core::{CudaContext, CudaEvent, CudaStream, DriverError, sys};
 use std::ptr;
+use std::sync::Arc;
 
 /// Map a driver result to `GpuError::Driver`, tagged with the driver entry
 /// point we called. `DriverError` carries the code and asks the driver for
@@ -213,6 +214,85 @@ pub(crate) unsafe fn launch_exec(
 ) -> Result<(), GpuError> {
     // SAFETY: the caller's contract above.
     cu(unsafe { sys::cuGraphLaunch(exec, stream) }, "cuGraphLaunch")
+}
+
+/// A second stream that work can run on beside the stream it forks from,
+/// captured or eager alike: [`Branch::fork`] makes the branch wait for
+/// everything enqueued on the main stream so far, and [`Forked::join`] makes
+/// the main stream wait for everything enqueued on the branch since.
+///
+/// Inside a capture on the main stream the fork's wait pulls the branch into
+/// the same capture, so the branch's work becomes a parallel path of the
+/// graph — an edge from the fork point and one into the join point, no node
+/// of its own. Outside a capture the same two event waits order the eager
+/// run. The stream and both events are made once, at load: `fork` and `join`
+/// only record and wait, which are capturable and allocate nothing.
+pub struct Branch {
+    stream: Arc<CudaStream>,
+    forked: CudaEvent,
+    joined: CudaEvent,
+}
+
+impl Branch {
+    /// A branch of streams of `ctx`. Load-time only.
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Branch, GpuError> {
+        Ok(Branch {
+            stream: ctx.new_stream()?,
+            forked: ctx.new_event(None)?,
+            joined: ctx.new_event(None)?,
+        })
+    }
+
+    /// Start the branch after everything enqueued on `main` so far. The
+    /// branch's work goes on [`Forked::stream`]; the fork must be joined
+    /// before `main`'s next reader of that work is enqueued.
+    pub fn fork<'a>(&'a self, main: &'a CudaStream) -> Result<Forked<'a>, GpuError> {
+        self.forked.record(main)?;
+        self.stream.wait(&self.forked)?;
+        Ok(Forked {
+            branch: self,
+            main,
+            open: true,
+        })
+    }
+}
+
+/// A [`Branch`] forked from a main stream and not joined yet.
+///
+/// Dropped without [`Forked::join`] (an early error return between the two),
+/// it joins anyway and ignores the driver's answer: the error already on its
+/// way out is the one reported, and a capture is never left with a branch
+/// its end would refuse as unjoined.
+#[must_use = "a fork is joined before its work is read"]
+pub struct Forked<'a> {
+    branch: &'a Branch,
+    main: &'a CudaStream,
+    open: bool,
+}
+
+impl Forked<'_> {
+    /// The branch stream the forked work is enqueued on.
+    #[must_use]
+    pub fn stream(&self) -> &CudaStream {
+        &self.branch.stream
+    }
+
+    /// Make the main stream wait for everything enqueued on the branch.
+    pub fn join(mut self) -> Result<(), GpuError> {
+        self.open = false;
+        self.branch.joined.record(&self.branch.stream)?;
+        self.main.wait(&self.branch.joined)?;
+        Ok(())
+    }
+}
+
+impl Drop for Forked<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.branch.joined.record(&self.branch.stream);
+            let _ = self.main.wait(&self.branch.joined);
+        }
+    }
 }
 
 /// One node of a captured graph as the driver reports it.

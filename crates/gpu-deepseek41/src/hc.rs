@@ -732,10 +732,11 @@ mod hc_kernels {
 
 // ---------------------------------------------------------------- host
 
-/// Scratch of one `ds41_hc_pre` site: the per-block partial sums and the
-/// ticket counter. Launches on one stream never overlap, so one scratch
-/// serves every site of a step; the counter is zero at allocation and every
-/// completed launch leaves it zero.
+/// Scratch of `ds41_hc_pre` launches: the per-block partial sums and the
+/// ticket counter. Two launches that may run at the same time need two
+/// scratches; launches ordered one after another (on one stream, or on a
+/// branch joined before the next one forks) share one. The counter is zero
+/// at allocation and every completed launch leaves it zero.
 pub struct HcPreScratch {
     part: DeviceBuffer<f32>,
     ss: DeviceBuffer<f32>,

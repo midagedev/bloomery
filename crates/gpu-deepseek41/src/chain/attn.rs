@@ -10,7 +10,9 @@
 //!
 //! 1. HC_PRE of the streams the sub-layer reads — the `pre`, `post` and
 //!    `comb` that HC_POST and the ffn's fold take. The body reads the fold
-//!    the previous sub-layer left, never this HC_PRE's (the lag);
+//!    the previous sub-layer left, never this HC_PRE's (the lag), so HC_PRE
+//!    runs on the piece's [`Branch`] beside steps 2–8, forked from the
+//!    sub-layer's start and joined right before HC_POST;
 //! 2. the attention norm of that fold, with its q8_1 form on a layer that
 //!    owns a compressor, whose q3_K projections read it, or whose q_a and kv
 //!    are K-quants ([`crate::dense`]);
@@ -70,7 +72,7 @@ use std::ops::{Deref, Range};
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, PartedBuffer, Q8Act, window};
+use bloomery_gpu::{Branch, DeviceTensor, FaultSink, Gpu, GpuError, PartedBuffer, Q8Act, window};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::hparams::Hparams;
@@ -669,6 +671,10 @@ pub struct AttnChain {
     kernels: Kernels,
     words: Words,
     scratch: Scratch,
+    /// The stream HC_PRE runs on beside the sub-layer's body. One for the
+    /// piece: every fork is joined before the layer's HC_POST, so HC_PRE of
+    /// two layers (or rows) never overlap and share [`Scratch::hc_pre`].
+    branch: Branch,
     /// The list's stride and the indexer's `top_k`, at most `list_len`.
     top_k: usize,
     /// Entries of a list per token: the file's `top_k`.
@@ -918,6 +924,7 @@ impl AttnChain {
             kernels,
             words,
             scratch,
+            branch: Branch::new(ctx)?,
             top_k: list_len,
             list_len,
         })
@@ -1171,6 +1178,7 @@ impl AttnChain {
         };
         let s = &mut self.scratch;
         let (d, k, stream, n) = (cx.d, cx.k, gpu.stream(), &lp.names);
+        let branch = &self.branch;
         let m = STEP_TOKENS;
 
         let params = HcParams {
@@ -1187,7 +1195,9 @@ impl AttnChain {
             rms_eps: d.eps,
             fault: cx.fault,
         };
-        k.hc.enqueue_pre(stream, &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
+        // Only HC_POST reads what HC_PRE writes: it runs beside steps 2–8.
+        let fork = branch.fork(stream)?;
+        k.hc.enqueue_pre(fork.stream(), &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
 
         let passed = match &compressed {
             Compressed::None => "no compressed rows",
@@ -1392,6 +1402,7 @@ impl AttnChain {
             },
         )?;
         enqueue_output(&cx, lp, s)?;
+        fork.join()?;
 
         let post = HcPostArgs {
             x: &s.out,
