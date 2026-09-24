@@ -14,6 +14,10 @@
 //! [`Score`] names the element-wise score functions. Softmax is not one — it
 //! needs all of a token's logits — and stays in its wrapper's own pass.
 //! [`Sigmoid`] is compiled but no kernel routes with it yet.
+//!
+//! A weight stage that renormalizes its selected scores divides by
+//! [`renorm_divisor`] of their sum: the one guard every such stage and its
+//! host simulation share.
 
 use crate::elem::argmax_take;
 
@@ -32,6 +36,21 @@ pub trait Score {
 pub fn sqrt_softplus(x: f32) -> f32 {
     let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
     sp.sqrt()
+}
+
+/// The divisor a weight stage renormalizes its selected scores by: their f32
+/// sum plus `1e-20`, the guard exllamav3 (`routing.cu`), mistral.rs
+/// (`deepseek2.rs`, `deepseek3.rs`) and ik's MoE graph for some other
+/// architectures put on this division; ik divides V4's by the bare sum. A
+/// [`sqrt_softplus`] score is exactly 0 below a logit of about −16.6, where
+/// `1 + e^x` rounds to 1, so a token whose selected scores all sit there
+/// divided 0 by 0. The addend is under half an ulp of every sum from 2^-42
+/// up, and a nonzero [`sqrt_softplus`] score is at least
+/// `sqrt(ln(1 + 2^-23))` ≈ 3.45e-4: every nonzero sum keeps its bits, and an
+/// all-zero selection weighs 0.
+#[inline(always)]
+pub fn renorm_divisor(sum: f32) -> f32 {
+    sum + 1e-20
 }
 
 /// `1 / (1 + e^-x)` in f32, the scalar form of ggml's `ggml_vec_sigmoid_f32`.

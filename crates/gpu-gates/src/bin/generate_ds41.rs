@@ -80,6 +80,20 @@
 //! are made before the prompt by one pair at position 0 and a `reset`, as
 //! the step's capture is. `BLOOMERY_STEP_STATS` reads once per pass;
 //! `BLOOMERY_STEP_PAIR` is refused with it.
+//!
+//! `BLOOMERY_CHECK_FINITE=1` runs every position the run steps — the fed ids
+//! and each generated token — first through the finite probe
+//! (`shared/ds41_finite.rs`): the position's step eagerly, outside the graph,
+//! each sub-layer's streams read where it wrote them; then the position is
+//! taken back and the token stepped through the engine as without the lever,
+//! so the `tokens` line is the plain run's. After the loop, a `stat finite
+//! step` line per generated step (`ok`, or the non-finite seams, the first
+//! one's `(layer, site)` and, at a MoE seam, its routing and buffers), a line
+//! per fed position that is not `ok`, and a `stat finite summary`. A position
+//! whose eager argmax differs from the engine's token says so. Refused with
+//! `--time`, `BLOOMERY_DRAFT`, `BLOOMERY_STEP_PAIR` and `BLOOMERY_STEP_STATS`
+//! (its host-tier counters would count the probe's step too). Unset, the
+//! probe does not run.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -93,9 +107,14 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_finite.rs"]
+mod finite;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
     use std::time::Instant;
 
+    use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
@@ -104,6 +123,8 @@ mod drive {
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{HotList, Machine, workstation};
+
+    use crate::finite;
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
                          [-n N] [--ctx C] [--place a|gate] [--mode eager|graph] \
@@ -313,6 +334,7 @@ mod drive {
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
         let draft = draft_lever()?;
+        let check_finite = finite_lever(&a, draft)?;
         let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
         let pinned = pin_main && threads::pool().pin_caller();
         let (ids, prompt_len) = fed_ids(&a)?;
@@ -395,11 +417,161 @@ mod drive {
             // Captured before the prompt, so the first timed step is a replay.
             println!("capture graph_nodes={}", m.capture_step()?);
         }
+        let mut check = if check_finite {
+            let (gpu, w, _) = m.body_parts("generate_ds41")?;
+            let head = Head::new(gpu, w, inputs.hp.rms_eps)?;
+            println!(
+                "check_finite=on: every position observed eagerly, taken back, then stepped \
+                 through the engine"
+            );
+            Some(FiniteCheck {
+                head,
+                rows: Vec::with_capacity(fed + 1),
+            })
+        } else {
+            None
+        };
         if draft {
             decode_draft(&mut m, &a, &ids, prompt_len)
         } else {
-            decode(&mut m, &a, &ids, prompt_len)
+            decode(&mut m, &a, &ids, prompt_len, check.as_mut())
         }
+    }
+
+    /// `BLOOMERY_CHECK_FINITE`: unset or `0` is off, `1` on; any other value
+    /// is refused, and so is the lever beside `--time`, the draft, the pair
+    /// arm and the step stats.
+    fn finite_lever(a: &Args, draft: bool) -> Result<bool, GateError> {
+        let on = match std::env::var("BLOOMERY_CHECK_FINITE") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(v) if v == "0" => false,
+            Ok(v) if v == "1" => true,
+            Ok(v) => {
+                return Err(format!("BLOOMERY_CHECK_FINITE is 1, 0 or unset, not {v:?}").into());
+            }
+            Err(e) => return Err(format!("BLOOMERY_CHECK_FINITE: {e}").into()),
+        };
+        let beside = [
+            (
+                a.timed,
+                "--time: the probe's eager step would sit between two timed steps",
+            ),
+            (
+                draft,
+                "BLOOMERY_DRAFT=lookup: the probe reads one-row steps",
+            ),
+            (
+                std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1"),
+                "BLOOMERY_STEP_PAIR=1: the probe reads one-row steps",
+            ),
+            (
+                std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1"),
+                "BLOOMERY_STEP_STATS=1: the host tier's counters would count the probe's step too",
+            ),
+        ];
+        match beside.iter().find(|(set, _)| on && *set) {
+            Some((_, why)) => Err(format!("BLOOMERY_CHECK_FINITE=1 is refused with {why}").into()),
+            None => Ok(on),
+        }
+    }
+
+    /// The finite probe's own head and what each checked position read.
+    struct FiniteCheck {
+        head: Head,
+        rows: Vec<FiniteRow>,
+    }
+
+    /// One checked position: the probe's reading of it and the engine's
+    /// token after it.
+    struct FiniteRow {
+        pos: u32,
+        observed: finite::Observed,
+        stepped: u32,
+    }
+
+    impl FiniteRow {
+        /// The probe's reading, and the eager argmax where it is not the
+        /// engine's token.
+        fn describe(&self) -> String {
+            let o = &self.observed;
+            let mut line = o.describe();
+            if o.token() != self.stepped {
+                line.push_str(&format!(
+                    " eager_differs: observed {} engine {}",
+                    o.token(),
+                    self.stepped
+                ));
+            }
+            line
+        }
+    }
+
+    /// One position through the probe, then the engine: `tok`'s step at the
+    /// model's position observed eagerly, the position taken back, and `tok`
+    /// stepped through the engine, whose token comes back.
+    fn checked_step(
+        m: &mut Deepseek41Model,
+        c: &mut FiniteCheck,
+        tok: u32,
+    ) -> Result<u32, GateError> {
+        let pos = m.pos();
+        let observed = finite::observed_step(m, &mut c.head, tok, pos, &mut |_, _, _| Ok(()))?;
+        m.rollback(pos)?;
+        let stepped = m.step(&[tok])?;
+        c.rows.push(FiniteRow {
+            pos,
+            observed,
+            stepped,
+        });
+        Ok(stepped)
+    }
+
+    /// The `stat finite` lines: one per generated step (the rows past the
+    /// `fed` fed positions), one per fed position that is not `ok`, and the
+    /// summary.
+    fn print_finite(c: &FiniteCheck, fed: usize) {
+        for (k, r) in c.rows.iter().enumerate() {
+            if k < fed {
+                if r.observed.first_nonfinite().is_some() || r.observed.token() != r.stepped {
+                    println!("stat finite fed pos {} {}", r.pos, r.describe());
+                }
+            } else {
+                println!(
+                    "stat finite step {} pos {} {}",
+                    k + 1 - fed,
+                    r.pos,
+                    r.describe()
+                );
+            }
+        }
+        let bad: Vec<&FiniteRow> = c
+            .rows
+            .iter()
+            .filter(|r| r.observed.first_nonfinite().is_some())
+            .collect();
+        let differs = c
+            .rows
+            .iter()
+            .filter(|r| r.observed.token() != r.stepped)
+            .count();
+        let first = bad.first().map_or_else(
+            || "none".to_string(),
+            |r| {
+                format!(
+                    "pos {} {}",
+                    r.pos,
+                    r.observed
+                        .first_nonfinite()
+                        .map_or_else(String::new, finite::site_name)
+                )
+            },
+        );
+        println!(
+            "stat finite summary positions={} nonfinite_positions={} first={first} \
+             eager_differs={differs}",
+            c.rows.len(),
+            bad.len()
+        );
     }
 
     /// `BLOOMERY_DRAFT`: unset is the plain path, `lookup` the served draft;
@@ -454,15 +626,30 @@ mod drive {
         }
     }
 
-    /// Feed `ids` untimed, one real step per id, print the `fed` and
-    /// `step 0` lines, and return the first generated token.
-    fn feed(m: &mut Deepseek41Model, ids: &[u32], prompt_len: usize) -> Result<u32, GateError> {
+    /// Feed `ids` untimed, one real step per id — each through the finite
+    /// probe first under `check` — print the `fed` and `step 0` lines, and
+    /// return the first generated token.
+    fn feed(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        prompt_len: usize,
+        check: Option<&mut FiniteCheck>,
+    ) -> Result<u32, GateError> {
         let depth = ids.len();
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
         println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
         let t = Instant::now();
-        let next = m.step(ids)?;
+        let next = match check {
+            None => m.step(ids)?,
+            Some(c) => {
+                let mut next = 0;
+                for &id in ids {
+                    next = checked_step(m, c, id)?;
+                }
+                next
+            }
+        };
         println!(
             "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
             m.pos() - 1,
@@ -478,9 +665,10 @@ mod drive {
         a: &Args,
         ids: &[u32],
         prompt_len: usize,
+        mut check: Option<&mut FiniteCheck>,
     ) -> Result<(), GateError> {
         let depth = ids.len();
-        let mut next = feed(m, ids, prompt_len)?;
+        let mut next = feed(m, ids, prompt_len, check.as_deref_mut())?;
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(a.n_gen - 1);
         let mut tokens: Vec<u32> = Vec::with_capacity(a.n_gen);
         tokens.push(next);
@@ -502,6 +690,8 @@ mod drive {
             let t0 = Instant::now();
             if pair {
                 [draft, next] = m.step_pair(next, draft)?;
+            } else if let Some(c) = check.as_deref_mut() {
+                next = checked_step(m, c, next)?;
             } else {
                 next = m.step(&[next])?;
             }
@@ -524,6 +714,9 @@ mod drive {
         println!("tokens {tokens:?}");
         if stats_on {
             print_stats(&probes, warm);
+        }
+        if let Some(c) = check {
+            print_finite(c, depth);
         }
         if a.timed {
             let counted: Vec<f64> = rows[warm..].iter().map(|r| r.2).collect();
@@ -586,7 +779,7 @@ mod drive {
             println!("capture pair_graph_nodes={}", m.pair_graph_nodes()?.len());
         }
         let depth = ids.len();
-        let first = feed(m, ids, prompt_len)?;
+        let first = feed(m, ids, prompt_len, None)?;
         let mut next = first;
         let mut look = Lookup::new();
         for &t in ids {

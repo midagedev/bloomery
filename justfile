@@ -770,6 +770,14 @@ gate-gpu-ds41-step *ARGS='--structure --sets --select':
 gate-gpu-ds41-skew *ARGS='--structure --sets --api':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_skew && bash tools/gpu-gate.sh gate_deepseek41_skew {{ARGS}}'
 
+# V4.1 long greedy runs on the gate placement, every position through the finite probe before the engine steps it:
+# --free, prompt row 0 then 330 greedy tokens; --trigger, the prompt plus the 311 fed ids whose last position selects
+# six layer-34 experts that all score 0, then 16 greedy tokens (no flag runs both). Red on a non-finite stream at any
+# seam, a run of 8 equal generated tokens, an eager argmax that is not the engine's token, or a first difference with
+# ik's greedy ids where our margin is not below 1.5. 3090, gate lock.
+gate-gpu-ds41-long *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && bash tools/gpu-gate.sh gate_deepseek41_long {{ARGS}}'
+
 # ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — step 게이트
 # --greedy의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
 ik-greedy-ds41 PROMPT='0':

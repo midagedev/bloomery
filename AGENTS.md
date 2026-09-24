@@ -406,6 +406,12 @@ text collapses into repetition, so its host-tier routing numbers are timing shap
 step, host-tier `HybridStats` deltas, `getrusage` page faults and the card's
 `cuMemGetInfo` free bytes (`vram_free`), and a `stat summary` with
 `vram_free_load` and `vram_free_min`; unset, nothing is read),
+`BLOOMERY_CHECK_FINITE=1` (`generate_ds41`: every position is first stepped eagerly outside the
+graph with each sub-layer's streams read back (`shared/ds41_finite.rs`, the probe
+`gate-gpu-ds41-long` runs), then taken back and stepped through the engine, and a `stat finite` line
+per generated step names the first non-finite `(layer, site)` — at a MoE seam its routing and first
+non-finite buffer — or `ok`, then a `stat finite summary`; refused beside `--time`,
+`BLOOMERY_DRAFT`, `BLOOMERY_STEP_PAIR=1` and `BLOOMERY_STEP_STATS=1`; unset, nothing is read),
 `BLOOMERY_DRAFT=lookup` (`generate_ds41`: an n-gram lookup draft — `gpu-gates::draft::Lookup`,
 the n = 3→2→1 most-recent follower of `draft-accept.py`'s lookup-recent, fed the fed ids and every
 emitted token — served through `step_pair`: row A's argmax equal to the draft accepts two positions,

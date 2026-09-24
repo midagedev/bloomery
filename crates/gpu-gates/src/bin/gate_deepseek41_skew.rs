@@ -59,6 +59,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_finite.rs"]
+mod finite;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::BTreeMap;
 
@@ -79,6 +83,8 @@ mod gate {
     use model::arch::deepseek41::names;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
     use model::placement::workstation;
+
+    use crate::finite;
 
     /// The sets the pair pass runs on: one whose lists are the identity and
     /// one whose indexer layers select.
@@ -1232,45 +1238,32 @@ mod gate {
         l_out: Vec<u64>,
         /// The first seam whose streams hold a NaN or an infinity: its layer
         /// and sub-layer.
-        first_nonfinite: Option<(usize, &'static str)>,
+        first_nonfinite: Option<finite::Site>,
+        /// Where the streams are not finite, the probe's reading of them.
+        fault: Option<String>,
     }
 
     /// The step of `token` at `pos` on the body, eagerly, every layer's
-    /// `l_out` read at its seam.
+    /// `l_out` read at its seam ([`finite::observed_step`]).
     fn observed_step(
         m: &mut Deepseek41Model,
         head: &mut Head,
         token: u32,
         pos: u32,
     ) -> Result<LastStep, GateError> {
-        let (gpu, w, body) = m.body_parts("cuts")?;
-        let input = body.decode_input(token, pos)?;
-        body.refresh(gpu.stream(), &input)?;
         let mut l_out = Vec::new();
-        let mut first_nonfinite = None;
-        body.enqueue_observed(gpu, w, head, &mut |gpu, seam| {
-            let (layer, what, streams) = match seam {
-                Seam::Engram { layer, streams, .. } => (layer, "engram", streams),
-                Seam::Attn { layer, streams, .. } => (layer, "attention", streams),
-                Seam::Ffn { layer, streams, .. } => (layer, "moe", streams),
-            };
-            gpu.stream().synchronize()?;
-            let v = bits(streams.to_host_vec(gpu.stream())?);
-            if first_nonfinite.is_none() && !v.iter().all(|&b| f32::from_bits(b).is_finite()) {
-                first_nonfinite = Some((layer, what));
-            }
-            if what == "moe" {
-                l_out.push(digest(&v));
+        let o = finite::observed_step(m, head, token, pos, &mut |_, seam, v| {
+            if let Seam::Ffn { .. } = seam {
+                l_out.push(digest(&v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()));
             }
             Ok(())
         })?;
-        gpu.stream().synchronize()?;
-        let logits = bits(head.logits_to_host(gpu)?);
         Ok(LastStep {
-            token: top2(&logits).0,
-            logits: logits_digest(&logits),
+            token: o.token(),
+            logits: logits_digest(&o.logits),
             l_out,
-            first_nonfinite,
+            first_nonfinite: o.first_nonfinite(),
+            fault: o.first_nonfinite().map(|_| o.describe()),
         })
     }
 
@@ -1371,6 +1364,11 @@ mod gate {
                  {:?}",
                 tokens[j], tokens[i], a.first_nonfinite, b.first_nonfinite
             );
+            for (p, f) in [(j, &a.fault), (i, &b.fault)] {
+                if let Some(f) = f {
+                    println!("  position {p}: {f}");
+                }
+            }
             let (gpu, _, body) = m.body_parts("cuts")?;
             body.set_indexer_top_k(gpu, hp.indexer.top_k)?;
             return Ok(false);

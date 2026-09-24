@@ -55,11 +55,12 @@
 //!
 //! Synthetic checks: router ties planted where the selection treats them
 //! differently (one lane, adjacent lanes, the two ends, three ways, the
-//! 6th/7th boundary, all equal, the bias deciding), against the rule's
-//! statement; the clamp crossed on `silu(g)`, on `u > L` and on `u < -L`,
-//! and `L = 0` (no clamp), routed and shared, against the host and against
-//! the clamp's statement in f64 (`stated_ratio`); an out-of-range expert id;
-//! one layer's seven launches captured as a graph and replayed.
+//! 6th/7th boundary, all equal, the bias deciding, every score 0), against
+//! the rule's statement, the weights finite; the clamp crossed on `silu(g)`,
+//! on `u > L` and on `u < -L`, and `L = 0` (no clamp), routed and shared,
+//! against the host and against the clamp's statement in f64
+//! (`stated_ratio`); an out-of-range expert id; one layer's seven launches
+//! captured as a graph and replayed.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -76,6 +77,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
+    use bloomery_gpu::route_core::renorm_divisor;
     use bloomery_gpu::weights::{DevWeight, Q8Block, q8_0_planes};
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels, silu_ik, swiglu_clamp};
@@ -617,8 +619,8 @@ mod gate {
     }
 
     /// ik's weights from the scores `p` at `ids`: gathered, summed in f64 in
-    /// slot order and narrowed, each divided by the sum, then scaled. Returns
-    /// (scaled, sum, divided).
+    /// slot order and narrowed, each divided by the sum's [`renorm_divisor`],
+    /// then scaled. Returns (scaled, sum, divided).
     fn weights_rule(p: &[f32], ids: &[u32], scale: f32) -> ([f32; N_USED], f32, [f32; N_USED]) {
         let mut g = [0.0f32; N_USED];
         for (o, &i) in g.iter_mut().zip(ids) {
@@ -629,7 +631,8 @@ mod gate {
             sum += f64::from(v);
         }
         let sum = sum as f32;
-        let norm = g.map(|v| v / sum);
+        let div = renorm_divisor(sum);
+        let norm = g.map(|v| v / div);
         (norm.map(|v| v * scale), sum, norm)
     }
 
@@ -1876,7 +1879,10 @@ mod gate {
 
     /// The router's selection on planted ties (a K = 32 router whose logits
     /// are its first weight column against a one-hot input), against the
-    /// rule's statement and the host's selection from the kernel's scores.
+    /// rule's statement and the host's selection from the kernel's scores;
+    /// the weights finite in every case, `all_underflow` too, whose every
+    /// score is 0 (a logit of −30 is below the −16.6 where `1 + e^x` rounds
+    /// to 1).
     fn router_ties(cx: &Cx, dv: &mut Dev) -> Result<bool, GateError> {
         const K: usize = 32;
         let stream = cx.gpu.stream();
@@ -1925,6 +1931,7 @@ mod gate {
             ),
             ("all_equal", vec![1.0; N_EXPERT], zero.clone()),
             ("bias_decides", vec![1.0; N_EXPERT], bias_decides),
+            ("all_underflow", vec![-30.0; N_EXPERT], zero.clone()),
         ];
         let mut x = vec![0.0f32; K];
         x[0] = 1.0;
@@ -1956,15 +1963,17 @@ mod gate {
             let host = select(&biased)?;
             let (w_host, _, _) = weights_rule(&pk, &ids_k, scale);
             let logits_exact = bits_equal(&lk, &logits);
+            let finite = wk.iter().all(|w| w.is_finite());
             let tickets = dv.rout.tickets(stream)?;
             let pass = ids_k.as_slice() == stated.as_slice()
                 && ids_k.as_slice() == host.as_slice()
                 && bits_equal(&wk, &w_host)
+                && finite
                 && logits_exact
                 && tickets == 0;
             println!(
-                "ties case={name} ids={ids_k:?} stated={stated:?} host={host:?} weights_exact={} logits_exact={logits_exact} \
-                 tickets={tickets} {}",
+                "ties case={name} ids={ids_k:?} stated={stated:?} host={host:?} weights_exact={} weights_finite={finite} \
+                 logits_exact={logits_exact} tickets={tickets} {}",
                 bits_equal(&wk, &w_host),
                 verdict(pass)
             );

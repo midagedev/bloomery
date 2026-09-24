@@ -46,7 +46,7 @@ use bloomery_gpu::mxfp4::{self, Planes, lane_partials};
 use bloomery_gpu::q8f32::f32_lane_partial_1col;
 /// ik's expert score in f32; the gate's host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
-use bloomery_gpu::route_core::take;
+use bloomery_gpu::route_core::{renorm_divisor, take};
 use bloomery_gpu::{DeviceTensor, GpuError, launch_u32, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
@@ -453,8 +453,9 @@ mod dflash_kernels {
     /// `x[tok·k ..]`, the selection bias in `bias`. Writes `logits` and
     /// `probs` (the score) at `tok · N_EXPERT + e` for every expert, and
     /// `ids`/`weights` at `tok · N_USED + s` for the slots in rank order;
-    /// the weights are `score / sum · scale` with `norm != 0` and `score ·
-    /// scale` without. `done[0]` is the block ticket count: zero before the
+    /// the weights are `score / sum · scale` with `norm != 0`, the sum
+    /// guarded by [`renorm_divisor`], and `score · scale` without.
+    /// `done[0]` is the block ticket count: zero before the
     /// launch, zero again after it. The body is `ds41_router`'s (its doc
     /// states the ticket protocol and the selection).
     #[allow(
@@ -630,7 +631,7 @@ mod dflash_kernels {
                     sum += f64::from(unsafe { *slot_p.add(s) });
                     s += 1;
                 }
-                let sum = sum as f32;
+                let sum = renorm_divisor(sum as f32);
                 let mut s = 0usize;
                 while s < N_USED {
                     // SAFETY: block-shared, s < N_USED, this lane's own write.

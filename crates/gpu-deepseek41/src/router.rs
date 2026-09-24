@@ -23,13 +23,15 @@
 //!   descending) — ik sorts `(value, index)` pairs with `std::greater`, so an
 //!   equal value goes to the LARGER expert id;
 //! - weights: the six unbiased scores in slot order summed in f64, the sum
-//!   narrowed to f32, each score divided by it in f32 (no epsilon for this
-//!   architecture), then multiplied by `expert_weights_scale` in f32.
+//!   narrowed to f32 and guarded ([`renorm_divisor`]: ik divides by the bare
+//!   sum, which is 0 when every selected score underflowed, and the guard
+//!   leaves every other sum's bits alone), each score divided by it in f32,
+//!   then multiplied by `expert_weights_scale` in f32.
 
 use bloomery_gpu::q8f32::f32_lane_partial_1col;
 /// ik's expert score in f32; the gates' host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
-use bloomery_gpu::route_core::take;
+use bloomery_gpu::route_core::{renorm_divisor, take};
 use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
@@ -247,7 +249,7 @@ mod router_kernels {
                     sum += f64::from(unsafe { *slot_p.add(s) });
                     s += 1;
                 }
-                let sum = sum as f32;
+                let sum = renorm_divisor(sum as f32);
                 let mut s = 0usize;
                 while s < N_USED {
                     // SAFETY: block-shared, s < N_USED, this lane's own write.

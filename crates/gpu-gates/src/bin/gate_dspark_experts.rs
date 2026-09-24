@@ -21,7 +21,8 @@
 //!    weights equal the host rule on the kernel's scores bit for bit (the
 //!    scores themselves are CUDA's `expf`/`logf` against the host libm and
 //!    are printed in ulps), the tickets return to zero. Then planted ties,
-//!    where the larger id must win.
+//!    where the larger id must win, and a row whose every score is 0, whose
+//!    weights must still be finite.
 //! 4. **Oracle diagnostics, no pin**: the dsref set `code64_n32_w3`, block 0
 //!    layer 0 — our router and experts on ik's FFN input against ik's
 //!    logits, top-3, weights, SwiGLU rows, per-slot down rows and combine.
@@ -61,6 +62,7 @@ mod gate {
     use std::path::{Path, PathBuf};
 
     use bloomery_gpu::mxfp4::{BLOCK_BYTES, BLOCK_VALUES, lane_partial_host};
+    use bloomery_gpu::route_core::renorm_divisor;
     use bloomery_gpu::{DeviceTensor, Gpu};
     use bloomery_gpu_deepseek41::experts::swiglu_clamp;
     use bloomery_gpu_deepseek41::experts_mxfp4::{
@@ -600,12 +602,13 @@ mod gate {
     }
 
     /// The weights rule on scores `p` at `ids`: summed in f64 in slot order
-    /// and narrowed, each divided by the sum when `norm`, then scaled.
+    /// and narrowed, each divided by the sum's [`renorm_divisor`] when
+    /// `norm`, then scaled.
     fn weights_rule(p: &[f32], ids: &[u32], scale: f32, norm: bool) -> Vec<f32> {
         let g: Vec<f32> = ids.iter().map(|&i| p[i as usize]).collect();
-        let sum = g.iter().fold(0.0f64, |s, &v| s + f64::from(v)) as f32;
+        let div = renorm_divisor(g.iter().fold(0.0f64, |s, &v| s + f64::from(v)) as f32);
         g.iter()
-            .map(|&v| (if norm { v / sum } else { v }) * scale)
+            .map(|&v| (if norm { v / div } else { v }) * scale)
             .collect()
     }
 
@@ -713,7 +716,10 @@ mod gate {
     }
 
     /// Planted ties: logit `v_e` in column 0 of a 32-wide weight, `x = e_0`,
-    /// so every logit is exact; equal logits must go to the larger id.
+    /// so every logit is exact; equal logits must go to the larger id, and
+    /// the weights are finite in every case, `all_underflow` too, whose every
+    /// score is 0 (a logit of −30 is below the −16.6 where `1 + e^x` rounds
+    /// to 1).
     fn check_ties(cx: &Ctx<'_>, r: &Router) -> Result<bool, GateError> {
         const K: usize = 32;
         let s = cx.gpu.stream();
@@ -753,6 +759,7 @@ mod gate {
             ),
             ("all_equal", vec![1.0; N_EXPERT], zero.clone()),
             ("bias_decides", vec![1.0; N_EXPERT], bias_decides),
+            ("all_underflow", vec![-30.0; N_EXPERT], zero.clone()),
         ];
         let mut x = vec![0.0f32; K];
         x[0] = 1.0;
@@ -774,10 +781,16 @@ mod gate {
             let biased: Vec<f32> = pk.iter().zip(&bias).map(|(&p, &b)| p + b).collect();
             let host = top3(&biased, f32::total_cmp);
             let w_ok = bits_equal(&wk, &weights_rule(&pk, &ids, r.scale, r.norm));
-            let pass =
-                ids == stated && ids == host && w_ok && bits_equal(&lk, &logits) && tickets == 0;
+            let finite = wk.iter().all(|w| w.is_finite());
+            let pass = ids == stated
+                && ids == host
+                && w_ok
+                && finite
+                && bits_equal(&lk, &logits)
+                && tickets == 0;
             println!(
-                "ties case={name} ids={ids:?} stated={stated:?} host={host:?} weights_exact={w_ok} tickets={tickets} {}",
+                "ties case={name} ids={ids:?} stated={stated:?} host={host:?} weights_exact={w_ok} \
+                 weights_finite={finite} tickets={tickets} {}",
                 verdict(pass)
             );
             all &= pass;
