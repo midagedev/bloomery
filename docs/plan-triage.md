@@ -268,3 +268,15 @@
 - **라운드 둘(합쳐 L)**: `unionhost`(M — `experts_union_into`, defer를 다열 슬롯으로(`ops.rs:906-911`, `MAX_DEFER_SLOTS`/`GROUP_INLINE` 16), 호스트 hw 게이트(열마다 `experts_into`와 비트 동일, FAIL-first 둘), bench `union` 팔) → `uniongroup`(M — `hybrid.rs` 레인 × 열, `body.rs` `enqueue_groups`, skew 게이트 (lanes, cols) 일반화, (2, 1) = 오늘 Pair). dsloop 첫 팔은 오늘 행별 skew를 6행으로 넓힌 것(합집합 0). `unionhost`는 먼저 해도 손해 없다.
 - 결정 측정: bench `union` 팔(S) — 토큰당 ms ≈ union_bytes / 135 GB/s ± 5 %. 1.15배 넘게 느리면 결합 몫(defer) 먼저.
 - 정정: mistral.rs의 expert 묶음은 aarch64 전용, exllamav3 "K ≤ 8"은 비트 폭이고 행 상한은 `MAX_M = 4`.
+
+## 공개 파일 1단계 뒤 (plainfile·plainpin 보고, 2026-09-24 — `78fbe2a`, `50c6806`, `675e09f`)
+
+- **op 게이트 7개가 공개 파일을 형식에서 거부한다**(chain_glue·chain_attn·chain_ffn·engram·woa·moe·index — 첫 줄은 모두 `… is q3_K/Q3_K/q5_K, want q8_0`). 각자 ik의 Q8_0×Q8_2 규칙 전사와 밴드 유도를 품고 있어, q3_K×q8_K(ik CPU) 대 q3_K×q8_1(우리) 규칙을 새로 전사하고 밴드를 3요건으로 다시 유도해야 한다. 그때까지 새 커널(heads, q5k, shexp_q3k, 홀수 n_sb q_b, q3k 행·임베딩)은 step 게이트의 every-node envelope(비율 최대 1.041, 핀 1.5)와 argmax 일치로만 덮인다. **opgate1**(공유 K-quant 반올림 규칙 + chain_attn을 본보기로) → 나머지 여섯을 한 파동에 3–4개씩.
+- **`gate-ds41-host`가 공개 파일에서 빨강**: `crates/model/tests/ds41_host.rs:81` `CLAMP_LAYERS = [38, 39]`는 혼합 세트가 라우팅 클램프에 닿는다는 커버리지 핀이고, 공개 세트는 40층 전부 `clamp_hits 0`(밴드는 전부 PASS). 빈 목록 핀은 커버리지 축소라 받지 않는다 — 합성 클램프 입력으로 파일과 무관하게 세우는 쪽(S–M).
+- `gate_mcol`이 V4.1을 파일 선택대로 열어 공개 파일에서는 Q8_0 사이트가 없어 거부될 것[유도] — 사이트를 타입별로(수십 줄).
+- `gate-qdot`의 q5_K 덤프는 혼합 파일에서 뜬 그대로다(두 파일의 q5_K 라우팅 텐서는 같은 형식, 바이트 동일은 안 쟀다).
+- Q5_K 밀집(0·1층 shexp down 둘)은 f32 활성화 한 열 커널이다. mistral.rs는 q8_1로 읽는다(`mmvq_gguf.cu:409`) — 텐서 둘이라 효과 미미, 약 80줄.
+- 공개 파일 드래프트의 token_embd(Q3_K) — dsgraphc 카드 그대로 남았다(타깃은 plainfile에서 풀렸다).
+- 산문·주석 셋: `justfile:652-653` 한국어 주석(공개 파일이면 `ref-v41_plain`), `docs/BUILD.md:48` 혼합 경로 리터럴, `experts.rs` 문서의 "whose weights are q8_0".
+- placement 핀: 공개 파일 핀이 `PUB_*` const와 `PUBLIC` 리터럴로 흩어져 있다(파일별로 한곳에, ~40줄); 카드 예산 38 GiB 행만 정확값이 아니라 "사이" 검사다(정확값 핀 후보, S).
+- shadow 검사가 커널 이름 문자열에 기대는 것 — 이름 소유를 디바이스 크레이트 상수로(약 30줄).
