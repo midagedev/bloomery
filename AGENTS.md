@@ -403,6 +403,14 @@ run on the host tier inside the captured step; unset or equal to the expert
 count is the all-card path; `just gate-gpu-hybrid` refuses to run with it
 set), `BLOOMERY_HYBRID_OVERLAP=0` (gpu hybrid: each layer's wait right after
 its go instead of after the card's experts and the shared expert),
+`BLOOMERY_LAUNCH_THREAD=1` (gpu `GpuModel`, read at open, default off: the step's
+`cuGraphLaunch` runs on a `Launcher` thread and the decode thread goes straight into the
+first host service's wait; a pinned opener puts it on the SMT sibling of its cpu and a core
+without one is refused by name; a failed launch reaches every waiting service and returns as
+the launch's error; `generate_ds41` prints `launch_thread=on launch_cpu=<n>|float` on its
+`load` line and, with `BLOOMERY_STEP_STATS=1`, `go_early_first launch_us first_serve_lag_us
+launch_wake_us` per step; moves no bit — the depth runner's `<D>@BLOOMERY_LAUNCH_THREAD=1`
+arm is its same-binary A/B),
 `BLOOMERY_PIN_MAIN=0` (`bloomery-decode`, `bench_v41_host`, `generate_ds41`: leave the
 main thread floating instead of pinning it to the dispatcher's cpu slot — the
 default pins, and the `load` line prints the ask and the outcome),
