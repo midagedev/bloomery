@@ -605,6 +605,12 @@ impl serve::Engine for Held {
     fn describe(&self) -> String {
         self.inner.describe()
     }
+    fn save_state(
+        &self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<serve::SavedState, serve::StateError> {
+        self.inner.save_state(out)
+    }
 }
 
 #[test]
@@ -1202,4 +1208,322 @@ fn hw_qwen3_template_renders_as_jinja2() {
         assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
         assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
     }
+}
+
+/// What request A leaves in the cache and request B shares with it (see
+/// `hw_cache_prompt_reuses_the_common_prefix`): A holds 10 ids, B's first 8 are
+/// among them.
+fn slot_a() -> Value {
+    json!({"prompt": "abcabc", "n_predict": 5, "temperature": 0})
+}
+
+fn slot_b() -> Value {
+    json!({"prompt": "abcabcabb", "n_predict": 4, "temperature": 0, "return_tokens": true})
+}
+
+fn slot_post(addr: std::net::SocketAddr, action: &str, filename: &str) -> common::Reply {
+    post(
+        addr,
+        &format!("/slots/0?action={action}"),
+        &json!({ "filename": filename }),
+    )
+}
+
+fn erase(addr: std::net::SocketAddr) -> common::Reply {
+    call(addr, "POST", "/slots/0?action=erase", None)
+}
+
+fn kv_tokens(addr: std::net::SocketAddr) -> f64 {
+    metric(&get(addr, "/metrics").body, "kv_cache_tokens")
+}
+
+/// The files in `dir`, sorted.
+fn listing(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Save, erase, restore: llama-server's response objects, the file's bytes, and
+/// a restored slot that serves the next request from the restored cache, in the
+/// same server and in a second one reading the same directory.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slot_save_erase_restore_round_trip() {
+    let dir = common::fresh_dir("round-trip");
+    let fresh = post(start(4096), "/completion", &slot_b()).json();
+    assert_eq!(fresh["timings"]["cache_n"], 0, "{fresh}");
+    let addr = common::start_slots(Box::new(serve::MockEngine::new(4096)), &dir);
+    post(addr, "/completion", &slot_a());
+
+    let r = slot_post(addr, "save", "a.bin");
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    // Derived: a 24-byte header and 10 ids, then the mock's 16-byte head and 10 ids.
+    assert_eq!(v["id_slot"], 0, "{v}");
+    assert_eq!(v["filename"], "a.bin", "{v}");
+    assert_eq!(v["n_saved"], 10, "{v}");
+    assert_eq!(v["n_written"], 120, "{v}");
+    assert!(v["timings"]["save_ms"].is_f64(), "{v}");
+    let on_disk = std::fs::metadata(dir.join("a.bin")).expect("a.bin").len();
+    assert_eq!(on_disk, 120, "the file's bytes against n_written");
+    assert_eq!(listing(&dir), ["a.bin"], "a partial file was left behind");
+
+    let r = erase(addr);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json(), json!({"id_slot": 0, "n_erased": 10}));
+    assert_eq!(kv_tokens(addr), 0.0);
+    let cold = post(addr, "/completion", &slot_b()).json();
+    assert_eq!(
+        cold["timings"]["cache_n"], 0,
+        "erase kept the cache: {cold}"
+    );
+    assert_eq!(cold["tokens"], fresh["tokens"]);
+    // B leaves its 9 prompt ids and 3 of its 4 generated ones.
+    assert_eq!(erase(addr).json()["n_erased"], 12);
+
+    let r = slot_post(addr, "restore", "a.bin");
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    assert_eq!(v["id_slot"], 0, "{v}");
+    assert_eq!(v["filename"], "a.bin", "{v}");
+    assert_eq!(v["n_restored"], 10, "{v}");
+    assert_eq!(v["n_read"], 120, "{v}");
+    assert!(v["timings"]["restore_ms"].is_f64(), "{v}");
+    let warm = post(addr, "/completion", &slot_b()).json();
+    assert_eq!(
+        warm["timings"]["cache_n"], 8,
+        "the restored slot must serve B's shared prefix: {warm}"
+    );
+    assert_eq!(warm["timings"]["prompt_n"], 1, "{warm}");
+    assert_eq!(
+        warm["tokens"], fresh["tokens"],
+        "warm {warm}\nfresh {fresh}"
+    );
+
+    let other = common::start_slots(Box::new(serve::MockEngine::new(4096)), &dir);
+    let r = slot_post(other, "restore", "a.bin");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["n_restored"], 10);
+    assert_eq!(kv_tokens(other), 10.0);
+    let warm = post(other, "/completion", &slot_b()).json();
+    assert_eq!(warm["timings"]["cache_n"], 8, "{warm}");
+    assert_eq!(
+        warm["tokens"], fresh["tokens"],
+        "warm {warm}\nfresh {fresh}"
+    );
+    common::drop_dir(&dir);
+}
+
+fn assert_error(r: &common::Reply, status: u16, kind: &str, part: &str) {
+    assert_eq!(r.status, status, "{}", r.body);
+    let e = &r.json()["error"];
+    assert_eq!(e["code"], status, "{e}");
+    assert_eq!(e["type"], kind, "{e}");
+    assert!(
+        e["message"].as_str().is_some_and(|m| m.contains(part)),
+        "`{part}` not in {e}"
+    );
+}
+
+/// Every refusal of a slot action, each by name: the server keeps serving and,
+/// where the file was refused before the engine read it, keeps its cache.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slot_action_errors() {
+    let bad = |addr, path: &str, body: Option<&str>| call(addr, "POST", path, body);
+    // No --slot-save-path: llama-server's 501.
+    let plain = start(4096);
+    let r = slot_post(plain, "save", "a.bin");
+    assert_error(&r, 501, "not_supported_error", "`--slot-save-path`");
+
+    let dir = common::fresh_dir("errors");
+    let addr = common::start_slots(Box::new(serve::MockEngine::new(4096)), &dir);
+    let e400 = "invalid_request_error";
+    assert_error(
+        &bad(addr, "/slots/x?action=erase", None),
+        400,
+        e400,
+        "Invalid slot ID",
+    );
+    assert_error(
+        &slot_post_at(addr, 1, "save", "a.bin"),
+        400,
+        e400,
+        "Invalid slot ID",
+    );
+    assert_error(
+        &bad(addr, "/slots/0?action=frob", None),
+        400,
+        e400,
+        "Invalid action",
+    );
+    assert_error(&bad(addr, "/slots/0", None), 400, e400, "Invalid action");
+    assert_error(
+        &bad(addr, "/slots/0?action=save", Some("{}")),
+        400,
+        e400,
+        "filename",
+    );
+    assert_error(
+        &bad(addr, "/slots/0?action=save", Some(r#"{"filename": 3}"#)),
+        400,
+        e400,
+        "filename",
+    );
+    for name in ["sub/a.bin", "../a.bin", "a\\b", ".."] {
+        assert_error(
+            &slot_post(addr, "save", name),
+            400,
+            e400,
+            "Invalid filename",
+        );
+    }
+    assert_error(
+        &slot_post(addr, "restore", "none.bin"),
+        400,
+        e400,
+        "Unable to restore slot",
+    );
+    assert!(listing(&dir).is_empty(), "{:?}", listing(&dir));
+
+    // A file this server did not write: refused before the engine reads, so
+    // the cache A left serves B.
+    post(addr, "/completion", &slot_a());
+    assert_eq!(slot_post(addr, "save", "v.bin").status, 200);
+    let good = std::fs::read(dir.join("v.bin")).expect("v.bin");
+    let patched = |name: &str, at: usize, bytes: &[u8]| {
+        let mut f = good.clone();
+        f[at..at + bytes.len()].copy_from_slice(bytes);
+        std::fs::write(dir.join(name), f).expect("write");
+    };
+    patched("v99.bin", 8, &99u32.to_le_bytes());
+    assert_error(
+        &slot_post(addr, "restore", "v99.bin"),
+        400,
+        e400,
+        "slot file version 99",
+    );
+    patched("magic.bin", 0, b"X");
+    assert_error(
+        &slot_post(addr, "restore", "magic.bin"),
+        400,
+        e400,
+        "not a slot file",
+    );
+    std::fs::write(dir.join("short.bin"), &good[..30]).expect("write");
+    assert_error(
+        &slot_post(addr, "restore", "short.bin"),
+        400,
+        e400,
+        "Unable to restore slot",
+    );
+    assert_eq!(
+        kv_tokens(addr),
+        10.0,
+        "a refused header must leave the cache"
+    );
+    let kept = post(addr, "/completion", &slot_b()).json();
+    assert_eq!(kept["timings"]["cache_n"], 8, "{kept}");
+
+    // The engine's part refused: the engine read, so the cache is reset.
+    post(addr, "/completion", &slot_a());
+    patched("mocktag.bin", 64, b"X");
+    assert_error(
+        &slot_post(addr, "restore", "mocktag.bin"),
+        400,
+        e400,
+        "mock state",
+    );
+    assert_eq!(
+        kv_tokens(addr),
+        0.0,
+        "a refused engine state must empty the slot"
+    );
+    let reset = post(addr, "/completion", &slot_b()).json();
+    assert_eq!(reset["timings"]["cache_n"], 0, "{reset}");
+    let mut long = good.clone();
+    long.push(0);
+    std::fs::write(dir.join("long.bin"), long).expect("write");
+    assert_error(
+        &slot_post(addr, "restore", "long.bin"),
+        400,
+        e400,
+        "runs on past",
+    );
+
+    // An engine with the trait's defaults refuses by name and keeps serving.
+    let unsupported = common::start_slots(Box::new(NoCut(serve::MockEngine::new(4096))), &dir);
+    post(unsupported, "/completion", &slot_a());
+    let before = listing(&dir);
+    let r = slot_post(unsupported, "save", "u.bin");
+    assert_error(
+        &r,
+        501,
+        "not_supported_error",
+        "does not support slot save/restore",
+    );
+    assert_eq!(listing(&dir), before, "a refused save left a file");
+    let r = slot_post(unsupported, "restore", "v.bin");
+    assert_error(
+        &r,
+        501,
+        "not_supported_error",
+        "does not support slot save/restore",
+    );
+    assert_eq!(get(unsupported, "/health").status, 200);
+    assert_eq!(erase(unsupported).json()["n_erased"], 10);
+
+    // The flag names a directory that must exist.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"))
+        .args(["--port", "0", "--slot-save-path"])
+        .arg(dir.join("missing"))
+        .output()
+        .expect("run bloomery-serve");
+    assert_eq!(out.status.code(), Some(64), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a directory"), "{err}");
+    common::drop_dir(&dir);
+}
+
+fn slot_post_at(
+    addr: std::net::SocketAddr,
+    id: i64,
+    action: &str,
+    filename: &str,
+) -> common::Reply {
+    post(
+        addr,
+        &format!("/slots/{id}?action={action}"),
+        &json!({ "filename": filename }),
+    )
+}
+
+/// A slot action while a request runs on the slot is a 503; once it is done the
+/// same action goes through.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slot_action_on_a_busy_slot_is_503() {
+    let dir = common::fresh_dir("busy");
+    let latch = std::sync::Arc::new(Latch::default());
+    let addr = common::start_slots(Box::new(Held::new(4096, 3, latch.clone())), &dir);
+    let gen_thread = std::thread::spawn(move || post(addr, "/completion", &slot_a()));
+    assert!(
+        latch.wait_entered(std::time::Duration::from_secs(10)),
+        "the generation never reached next #3"
+    );
+    let save = slot_post(addr, "save", "busy.bin");
+    let wipe = erase(addr);
+    latch.release();
+    assert_error(&save, 503, "unavailable_error", "processing a request");
+    assert_error(&wipe, 503, "unavailable_error", "processing a request");
+    assert_eq!(gen_thread.join().expect("generation").status, 200);
+    assert!(listing(&dir).is_empty(), "{:?}", listing(&dir));
+    let r = slot_post(addr, "save", "busy.bin");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["n_saved"], 10);
+    common::drop_dir(&dir);
 }

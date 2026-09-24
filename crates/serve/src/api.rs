@@ -10,26 +10,34 @@
 //! and after [`ServerConfig::fatal_linger`] [`Server::run`] returns
 //! [`ServeError::Engine`] so the process exits instead of holding the port with a
 //! dead engine behind it.
+//!
+//! `POST /slots/0?action=save|restore|erase` answers as llama-server's handlers
+//! do, with one difference: an action on a slot that is running a request is a
+//! 503 at once where llama-server defers it until the slot is free. Save and
+//! restore take `{"filename": "<base name>"}` under
+//! [`ServerConfig::slot_save_path`]; the file is [`crate::slotfile`]'s.
 
 use std::fmt;
 use std::io::{self, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
 use crate::dsml::{ChatParser, Message, ToolCall};
 use crate::engine::{
-    DraftProps, Engine, EngineProps, ModelProps, PlacementProps, SamplerFactory, SamplingParams,
-    Tokenizer,
+    DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
+    SamplingParams, StateError, Tokenizer,
 };
-use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings};
+use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::http::{self, EventStream, Request};
 use crate::reasoning::ReasoningFormat;
 use crate::sampling;
+use crate::slotfile;
 use crate::template::{ChatTemplate, TemplateError};
 
 /// What the server says about itself and how it samples.
@@ -45,6 +53,10 @@ pub struct ServerConfig {
     /// How long `/health` keeps answering 503 after an engine error before
     /// [`Server::run`] returns.
     pub fatal_linger: Duration,
+    /// The directory slot saves go to and restores read from
+    /// (`--slot-save-path`); it must exist. `None` answers every slot action
+    /// with 501.
+    pub slot_save_path: Option<PathBuf>,
 }
 
 /// The default [`ServerConfig::fatal_linger`]: long enough for a client or a
@@ -80,6 +92,8 @@ pub enum ServeError {
     Template(#[from] TemplateError),
     #[error("{0}")]
     Engine(EngineFailure),
+    #[error("--slot-save-path {}: not a directory", .0.display())]
+    SlotSavePath(PathBuf),
 }
 
 /// Why the accept loop ended.
@@ -103,6 +117,9 @@ impl Server {
         config: ServerConfig,
     ) -> Result<Self, ServeError> {
         let template = ChatTemplate::parse(&config.chat_template)?;
+        if let Some(dir) = config.slot_save_path.as_ref().filter(|d| !d.is_dir()) {
+            return Err(ServeError::SlotSavePath(dir.clone()));
+        }
         let listener = TcpListener::bind(addr)?;
         let tok = engine.tokenizer();
         let engine_props = engine_object(&engine.props_engine());
@@ -123,6 +140,7 @@ impl Server {
             alias: config.model_alias,
             model_path: config.model_path,
             engine_props,
+            slot_save_path: config.slot_save_path,
             sampler: config.sampler.unwrap_or_else(sampling::reference_factory),
             info,
             busy: AtomicBool::new(false),
@@ -232,6 +250,8 @@ struct State {
     model_path: String,
     /// `/props`' `engine` object, built when the server binds.
     engine_props: Value,
+    /// Where slot files live; `None` refuses slot actions.
+    slot_save_path: Option<PathBuf>,
     sampler: SamplerFactory,
     info: ModelInfo,
     busy: AtomicBool,
@@ -360,6 +380,9 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("GET", "/props") => Ok(props(state)),
         ("GET", "/slots") => Ok(slots(state)),
         ("GET", "/metrics") => return metrics(state, req, w),
+        ("POST", p) if p.starts_with("/slots/") => {
+            return slot_action(state, req, w, &p["/slots/".len()..]);
+        }
         ("POST", "/completion" | "/completions") => return completion(state, req, w),
         ("POST", "/v1/chat/completions" | "/chat/completions") => return chat(state, req, w),
         ("POST", "/tokenize") => body(req).and_then(|b| tokenize(state, &b)),
@@ -1000,7 +1023,26 @@ fn dead_engine(reason: &str) -> ApiError {
 impl<'a> Run<'a> {
     /// Waits for the slot; refuses once the engine has failed.
     fn begin(state: &'a State) -> Result<Self, ApiError> {
-        let engine = state.engine();
+        Self::hold(state, state.engine())
+    }
+
+    /// Takes the slot if it is free: a request running on it is a 503.
+    fn try_begin(state: &'a State) -> Result<Self, ApiError> {
+        let engine = match state.slot_engine.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Err(ApiError {
+                    code: 503,
+                    kind: "unavailable_error",
+                    message: "slot 0 is processing a request".to_owned(),
+                });
+            }
+        };
+        Self::hold(state, engine)
+    }
+
+    fn hold(state: &'a State, engine: MutexGuard<'a, Slot>) -> Result<Self, ApiError> {
         if let Some(reason) = relock(&state.fatal).as_deref() {
             return Err(dead_engine(reason));
         }
@@ -1010,6 +1052,17 @@ impl<'a> Run<'a> {
             engine,
             failure: None,
         })
+    }
+
+    /// Records an engine failure: every later request and `/health` see it, and
+    /// the server ends once this run's response is out.
+    fn fail(&mut self, e: &EngineError) {
+        let f = EngineFailure {
+            engine: self.engine.engine.describe(),
+            error: e.to_string(),
+        };
+        *relock(&self.state.fatal) = Some(f.error.clone());
+        self.failure = Some(f);
     }
 
     /// Validates the prompt and runs the loop, then books the counters.
@@ -1062,12 +1115,7 @@ impl<'a> Run<'a> {
         );
         self.book(&tim, r.as_ref().ok());
         if let Err(GenError::Engine(e)) = &r {
-            let f = EngineFailure {
-                engine: self.engine.engine.describe(),
-                error: e.to_string(),
-            };
-            *relock(&self.state.fatal) = Some(f.error.clone());
-            self.failure = Some(f);
+            self.fail(e);
         }
         Ok(r)
     }
@@ -1106,6 +1154,150 @@ impl Drop for Run<'_> {
         self.state.busy.store(false, Ordering::SeqCst);
         if let Some(f) = self.failure.take() {
             let _ = self.state.end.send(End::Engine(f));
+        }
+    }
+}
+
+// ---------------------------------------------------------------- slot actions
+
+enum SlotAction {
+    Save(String),
+    Restore(String),
+    Erase,
+}
+
+/// `POST /slots/{id}?action=…`, checked in llama-server's order: a save
+/// directory, an integer id, the action, the file name, then that the id is the
+/// one slot's; last the slot itself, which must be free.
+fn slot_action(state: &State, req: &Request, w: &mut TcpStream, id: &str) -> io::Result<bool> {
+    let Some(dir) = state.slot_save_path.as_deref() else {
+        return send_error(
+            w,
+            req,
+            &ApiError {
+                code: 501,
+                kind: "not_supported_error",
+                message: "This server does not support slots action. Start it with \
+                          `--slot-save-path`"
+                    .to_owned(),
+            },
+        );
+    };
+    let parsed = slot_request(req, id);
+    let action = match parsed {
+        Ok(a) => a,
+        Err(e) => return send_error(w, req, &e),
+    };
+    let mut run = match Run::try_begin(state) {
+        Ok(r) => r,
+        Err(e) => return send_error(w, req, &e),
+    };
+    match run.slot(dir, action) {
+        Ok(v) => send_json(w, req, 200, &v),
+        Err(e) => send_error(w, req, &e),
+    }
+}
+
+/// The action and its file name; every refusal is a 400.
+fn slot_request(req: &Request, id: &str) -> Result<SlotAction, ApiError> {
+    let id: i64 = id.parse().map_err(|_| invalid("Invalid slot ID"))?;
+    let action = req.query_value("action").unwrap_or_default();
+    let filename = || -> Result<String, ApiError> {
+        let b = body(req)?;
+        let f = b
+            .get("filename")
+            .ok_or_else(|| invalid("'filename' is required"))?
+            .as_str()
+            .ok_or_else(|| invalid("'filename' must be a string"))?;
+        if !slotfile::valid_filename(f) {
+            return Err(invalid("Invalid filename"));
+        }
+        Ok(f.to_owned())
+    };
+    let a = match action {
+        "save" => SlotAction::Save(filename()?),
+        "restore" => SlotAction::Restore(filename()?),
+        "erase" => SlotAction::Erase,
+        _ => return Err(invalid("Invalid action")),
+    };
+    if id != 0 {
+        return Err(invalid("Invalid slot ID"));
+    }
+    Ok(a)
+}
+
+impl Run<'_> {
+    /// Runs a slot action and answers with llama-server's object for it.
+    fn slot(&mut self, dir: &Path, action: SlotAction) -> Result<Value, ApiError> {
+        let t0 = Instant::now();
+        match action {
+            SlotAction::Erase => match self.engine.erase() {
+                Ok(n) => {
+                    relock(&self.state.slot).n_past = 0;
+                    Ok(json!({ "id_slot": 0, "n_erased": n }))
+                }
+                Err(e) => {
+                    self.fail(&e);
+                    Err(engine_error(&e))
+                }
+            },
+            SlotAction::Save(f) => match self.engine.save(&dir.join(&f)) {
+                Ok((n, bytes)) => Ok(json!({
+                    "id_slot": 0,
+                    "filename": f,
+                    "n_saved": n,
+                    "n_written": bytes,
+                    "timings": { "save_ms": ms_since(t0) },
+                })),
+                Err(e) => Err(self.state_error(e, "Unable to save slot", 500, "server_error")),
+            },
+            SlotAction::Restore(f) => {
+                let r = self.engine.restore(&dir.join(&f));
+                // A restore that failed may have emptied the cache.
+                relock(&self.state.slot).n_past = self.engine.held_len();
+                match r {
+                    Ok((n, bytes)) => Ok(json!({
+                        "id_slot": 0,
+                        "filename": f,
+                        "n_restored": n,
+                        "n_read": bytes,
+                        "timings": { "restore_ms": ms_since(t0) },
+                    })),
+                    Err(e) => Err(self.state_error(
+                        e,
+                        "Unable to restore slot",
+                        400,
+                        "invalid_request_error",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// A refused engine is a 501, a failed one fatal (500), anything else
+    /// `code` with `what` before the reason.
+    fn state_error(
+        &mut self,
+        e: StateError,
+        what: &str,
+        code: u16,
+        kind: &'static str,
+    ) -> ApiError {
+        match e {
+            StateError::Unsupported(_) => ApiError {
+                code: 501,
+                kind: "not_supported_error",
+                message: e.to_string(),
+            },
+            StateError::Engine(e) => {
+                self.fail(&e);
+                engine_error(&e)
+            }
+            StateError::Format(_) | StateError::Io(_) => ApiError {
+                code,
+                kind,
+                message: format!("{what}: {e}"),
+            },
         }
     }
 }
@@ -1178,7 +1370,8 @@ fn sse(s: &mut EventStream<'_>, v: &Value) -> io::Result<()> {
     s.send(format!("data: {v}\n\n").as_bytes())
 }
 
-fn engine_error(e: &GenError) -> ApiError {
+/// A 500 carrying `e`'s message.
+fn engine_error(e: &dyn fmt::Display) -> ApiError {
     ApiError {
         code: 500,
         kind: "server_error",

@@ -14,8 +14,17 @@
 //! Any `EngineError` is fatal to the server: the request that met it gets a 500,
 //! `/health` answers 503, and [`crate::Server::run`] returns the error so the
 //! process exits instead of serving an engine in an unknown state.
+//!
+//! Slot persistence (`POST /slots/0?action=save|restore|erase`): the server owns
+//! the file, its header and the slot's ids, and hands the engine the stream
+//! after them ([`Engine::save_state`], [`Engine::restore_state`]); the engine's
+//! bytes run to the end of the file. Erase needs no engine call: it is
+//! [`Engine::reset`] and the slot forgetting its ids. The defaults refuse with
+//! [`StateError::Unsupported`], which is not fatal: the server answers 501 and
+//! keeps serving.
 
 use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 /// A failure inside the engine (a device error, a context overflow it detected
@@ -23,6 +32,34 @@ use std::sync::Arc;
 #[derive(Debug, thiserror::Error)]
 #[error("engine: {0}")]
 pub struct EngineError(pub String);
+
+/// Why a save or a restore of the slot's cache failed. Only
+/// [`StateError::Engine`] is fatal to the server; the others are the request's.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    /// The engine cannot snapshot its cache; it read and wrote nothing.
+    #[error("this engine does not support {0}")]
+    Unsupported(&'static str),
+    /// The file is not a state this server and engine can take: its tag, its
+    /// version, a count or an id is out of what they accept.
+    #[error("{0}")]
+    Format(String),
+    /// Reading or writing the file failed (a short file reads as `UnexpectedEof`).
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    /// The engine failed mid-call.
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+}
+
+/// What a save wrote or a restore read of the engine's part of a slot file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedState {
+    /// The positions the state covers: every position the cache holds.
+    pub n_tokens: usize,
+    /// The bytes the engine wrote or read.
+    pub n_bytes: u64,
+}
 
 /// Streaming detokenizer: holds bytes of an incomplete UTF-8 sequence until the
 /// token that completes it arrives.
@@ -90,6 +127,23 @@ pub trait Engine: Send {
     /// the server binds. The default reports nothing: every key is left out.
     fn props_engine(&self) -> EngineProps {
         EngineProps::default()
+    }
+    /// Writes the whole cache to `out`, from position 0 to what it holds, in a
+    /// form [`Engine::restore_state`] reads back; the cache is unchanged. The
+    /// returned `n_bytes` is what went to `out`. The default writes nothing
+    /// and refuses.
+    fn save_state(&self, out: &mut dyn Write) -> Result<SavedState, StateError> {
+        let _ = out;
+        Err(StateError::Unsupported("slot save/restore"))
+    }
+    /// Replaces the cache with the state `input` carries, which runs to its end;
+    /// the next `prefill` continues after the returned `n_tokens`. An engine
+    /// that refuses a state it has started to read leaves its cache in no
+    /// defined state: the server resets it. The default reads nothing and
+    /// refuses, the cache untouched.
+    fn restore_state(&mut self, input: &mut dyn Read) -> Result<SavedState, StateError> {
+        let _ = input;
+        Err(StateError::Unsupported("slot save/restore"))
     }
 }
 

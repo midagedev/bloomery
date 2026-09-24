@@ -7,13 +7,18 @@
 //! out, and the predicted phase runs from there to the end, so `predicted_ms`
 //! spans `predicted_n - 1` decode steps.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Tokenizer};
+use crate::engine::{
+    Engine, EngineError, Sampler, SamplerFactory, SamplingParams, StateError, Tokenizer,
+};
+use crate::slotfile::{self, Counting};
 use crate::stop::StopScan;
 
 /// Request knobs after parsing, llama-server defaults filled in.
@@ -125,7 +130,7 @@ pub(crate) enum GenError {
     Client(#[from] io::Error),
 }
 
-fn ms_since(t: Instant) -> f64 {
+pub(crate) fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
@@ -203,6 +208,115 @@ impl Slot {
         self.held.push(last);
         Ok(g)
     }
+
+    /// Positions the cache holds.
+    pub(crate) fn held_len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Writes the slot to `path` ([`slotfile`]'s layout): the file is written
+    /// beside it under a temporary name and renamed over it only once complete,
+    /// so a failed save leaves any earlier file at `path` as it was. The cache
+    /// is unchanged. Returns the positions saved and the file's bytes.
+    pub(crate) fn save(&self, path: &Path) -> Result<(usize, u64), StateError> {
+        let partial = partial_path(path);
+        let r = self.save_to(&partial).and_then(|bytes| {
+            std::fs::rename(&partial, path)
+                .map(|()| bytes)
+                .map_err(StateError::from)
+        });
+        if r.is_err() {
+            // The save's error is the answer; a partial file left behind is
+            // named as one and never read.
+            let _ = std::fs::remove_file(&partial);
+        }
+        r.map(|bytes| (self.held.len(), bytes))
+    }
+
+    fn save_to(&self, partial: &Path) -> Result<u64, StateError> {
+        let mut w = Counting::new(BufWriter::new(File::create(partial)?));
+        slotfile::write_header(&mut w, self.vocab.n_vocab(), &self.held)?;
+        let head = w.bytes;
+        let saved = self.engine.save_state(&mut w)?;
+        if saved.n_tokens != self.held.len() || saved.n_bytes != w.bytes - head {
+            return Err(StateError::Format(format!(
+                "the engine saved {} positions in {} bytes; the slot holds {} positions and {} \
+                 bytes reached the file",
+                saved.n_tokens,
+                saved.n_bytes,
+                self.held.len(),
+                w.bytes - head
+            )));
+        }
+        w.flush()?;
+        let file = w
+            .inner
+            .into_inner()
+            .map_err(io::IntoInnerError::into_error)?;
+        file.sync_all()?;
+        Ok(w.bytes)
+    }
+
+    /// Replaces the cache with the slot saved in `path`. A file refused before
+    /// the engine reads its part (unreadable, another tag, version or
+    /// vocabulary, a count past the context, an id past the vocabulary) and an
+    /// engine that does not restore leave the cache as it was; once the engine
+    /// has read, any failure resets it and the slot holds nothing. Returns the
+    /// positions restored and the file's bytes.
+    pub(crate) fn restore(&mut self, path: &Path) -> Result<(usize, u64), StateError> {
+        let mut r = Counting::new(BufReader::new(File::open(path)?));
+        let ids = slotfile::read_header(&mut r, self.vocab.n_vocab(), self.engine.ctx_max())?;
+        let head = r.bytes;
+        let held = std::mem::take(&mut self.held);
+        let restored = match self.engine.restore_state(&mut r) {
+            Ok(s) => s,
+            Err(StateError::Unsupported(what)) => {
+                self.held = held;
+                return Err(StateError::Unsupported(what));
+            }
+            Err(e @ StateError::Engine(_)) => return Err(e),
+            Err(e) => {
+                self.engine.reset()?;
+                return Err(e);
+            }
+        };
+        let read = r.bytes - head;
+        let trailing = r.read(&mut [0u8; 1]);
+        let mismatch = match trailing {
+            Err(e) => Some(format!("reading past the engine's state: {e}")),
+            Ok(n) if n > 0 => Some(format!(
+                "the engine read {read} bytes and the file runs on past them"
+            )),
+            Ok(_) if restored.n_tokens != ids.len() || restored.n_bytes != read => Some(format!(
+                "the engine restored {} positions from {} bytes; the file holds {} positions and \
+                 the engine read {read} bytes",
+                restored.n_tokens,
+                restored.n_bytes,
+                ids.len()
+            )),
+            Ok(_) => None,
+        };
+        if let Some(m) = mismatch {
+            self.engine.reset()?;
+            return Err(StateError::Format(m));
+        }
+        let n = ids.len();
+        self.held = ids;
+        Ok((n, r.bytes))
+    }
+
+    /// Drops the whole cache and the ids it held; returns how many it held.
+    pub(crate) fn erase(&mut self) -> Result<usize, EngineError> {
+        let held = std::mem::take(&mut self.held);
+        self.engine.reset()?;
+        Ok(held.len())
+    }
+}
+
+/// Where a save to `path` is written before it is renamed there: a name of
+/// this process that no slot file can take (a slot file name has no `:`).
+fn partial_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(".bloomery-slot-{}:partial", std::process::id()))
 }
 
 /// Runs one request on the slot. `ids` is non-empty and shorter than the context.

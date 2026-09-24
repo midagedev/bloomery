@@ -15,10 +15,15 @@
 //!
 //! [`MockEngine::failing_at`] makes the `k`-th `next` of the engine's life an
 //! error, for the crash-path gate.
+//!
+//! Its saved state is its context: [`MOCK_STATE`], a u32 version, a u64 count
+//! and the ids, little-endian.
 
+use std::io::{Read, Write};
 use std::sync::Arc;
 
-use crate::engine::{Decoder, Engine, EngineError, EngineProps, Tokenizer};
+use crate::engine::{Decoder, Engine, EngineError, EngineProps, SavedState, StateError, Tokenizer};
+use crate::slotfile;
 
 /// Special strings, in id order. Longest-match wins on encode.
 pub const SPECIALS: [&str; 6] = [
@@ -31,6 +36,12 @@ pub const SPECIALS: [&str; 6] = [
 ];
 
 const N_SPECIAL: u32 = SPECIALS.len() as u32;
+
+/// The first bytes of the mock's state in a slot file.
+const MOCK_STATE: [u8; 4] = *b"MOCK";
+const MOCK_STATE_VERSION: u32 = 1;
+/// The tag, the version and the count.
+const MOCK_STATE_HEAD: u64 = 16;
 const PREDICTED: f32 = 4.0;
 const FOLLOWER: f32 = 2.0;
 const FLOOR: f32 = -8.0;
@@ -229,6 +240,47 @@ impl Engine for MockEngine {
             version_note: Some("mock".to_owned()),
             ..EngineProps::default()
         }
+    }
+
+    fn save_state(&self, out: &mut dyn Write) -> Result<SavedState, StateError> {
+        let n = u64::try_from(self.ctx.len()).expect("a context length fits u64");
+        out.write_all(&MOCK_STATE)?;
+        slotfile::write_u32(out, MOCK_STATE_VERSION)?;
+        slotfile::write_u64(out, n)?;
+        slotfile::write_ids(out, &self.ctx)?;
+        Ok(SavedState {
+            n_tokens: self.ctx.len(),
+            n_bytes: MOCK_STATE_HEAD + 4 * n,
+        })
+    }
+
+    /// Reads the whole state before it replaces the context: a refused state
+    /// leaves the context as it was.
+    fn restore_state(&mut self, input: &mut dyn Read) -> Result<SavedState, StateError> {
+        let mut tag = [0u8; 4];
+        input.read_exact(&mut tag)?;
+        let version = slotfile::read_u32(input)?;
+        if tag != MOCK_STATE || version != MOCK_STATE_VERSION {
+            return Err(StateError::Format(format!(
+                "mock state {tag:02x?} version {version}; the mock reads {MOCK_STATE:02x?} version \
+                 {MOCK_STATE_VERSION}"
+            )));
+        }
+        let n = slotfile::read_u64(input)?;
+        let n = usize::try_from(n)
+            .ok()
+            .filter(|&n| n <= self.ctx_max)
+            .ok_or_else(|| {
+                StateError::Format(format!(
+                    "mock state of {n} positions; ctx_max is {}",
+                    self.ctx_max
+                ))
+            })?;
+        self.ctx = slotfile::read_ids(input, n, MockTokenizer.n_vocab())?;
+        Ok(SavedState {
+            n_tokens: n,
+            n_bytes: MOCK_STATE_HEAD + 4 * n as u64,
+        })
     }
 }
 

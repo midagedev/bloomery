@@ -6,6 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -27,16 +28,48 @@ pub fn start_with(engine: Box<dyn Engine>) -> SocketAddr {
 /// Starts a server on `engine` and the chat template `template`; a template
 /// the parser refuses panics with the parser's error.
 pub fn start_templated(engine: Box<dyn Engine>, template: &str) -> SocketAddr {
+    start_configured(engine, template, None)
+}
+
+/// Starts a server on `engine` and the V4.1 template that saves and restores
+/// slots in `dir`.
+pub fn start_slots(engine: Box<dyn Engine>, dir: &Path) -> SocketAddr {
+    start_configured(engine, V41_TEMPLATE, Some(dir.to_path_buf()))
+}
+
+fn start_configured(
+    engine: Box<dyn Engine>,
+    template: &str,
+    slot_save_path: Option<PathBuf>,
+) -> SocketAddr {
     let config = ServerConfig {
         model_alias: "mock".to_owned(),
         model_path: "mock.gguf".to_owned(),
         chat_template: template.to_owned(),
         sampler: None,
         fatal_linger: FATAL_LINGER,
+        slot_save_path,
     };
     let server =
         Server::bind("127.0.0.1:0", engine, config).unwrap_or_else(|e| panic!("bind: {e}"));
     server.spawn().expect("spawn")
+}
+
+/// A fresh, empty directory under the system temp dir, named for `test` and
+/// this process, so gates running in parallel never share one.
+pub fn fresh_dir(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("bloomery-serve-{}-{test}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    }
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    dir
+}
+
+/// Removes a [`fresh_dir`] once its gate passed; a failed gate leaves it for
+/// reading.
+pub fn drop_dir(dir: &Path) {
+    std::fs::remove_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
 }
 
 pub struct Reply {

@@ -35,6 +35,15 @@ impl Request {
             .split('&')
             .any(|kv| kv.split('=').next() == Some(key))
     }
+
+    /// The value of the first `key=value` in the query string, as written
+    /// (no percent-decoding); `key` with no `=` reads as the empty value.
+    pub(crate) fn query_value(&self, key: &str) -> Option<&str> {
+        self.query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (k == key).then_some(v)
+        })
+    }
 }
 
 fn bad(msg: &str) -> io::Error {

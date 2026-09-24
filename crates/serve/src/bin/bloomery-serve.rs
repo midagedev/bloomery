@@ -2,7 +2,7 @@
 //!
 //!   bloomery-serve [--host 127.0.0.1] [--port 8080] [--model <first.gguf>]
 //!                  [--chat-template-file <path>] [--alias <name>] [--ctx-size <n>]
-//!                  [--print-template] [--mock-fail-at <k>]
+//!                  [--print-template] [--mock-fail-at <k>] [--slot-save-path <dir>]
 //!
 //! `--model` reads `tokenizer.chat_template` and `general.name` from the GGUF
 //! header only; the engine is always the mock here. The binding to the GPU
@@ -10,7 +10,11 @@
 //!
 //! `--mock-fail-at k` makes the mock's `k`-th `next` an engine error: the crash
 //! path's gate. The process then prints the crash block and exits 70.
+//!
+//! `--slot-save-path dir` enables `POST /slots/0?action=save|restore` on files
+//! in `dir`, which must exist (the process exits 64 otherwise).
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use serve::{FATAL_LINGER, MockEngine, ServeError, Server, ServerConfig};
@@ -27,6 +31,7 @@ struct Args {
     ctx: usize,
     print_template: bool,
     fail_at: Option<usize>,
+    slot_save_path: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -39,6 +44,7 @@ fn parse_args() -> Result<Args, String> {
         ctx: 4096,
         print_template: false,
         fail_at: None,
+        slot_save_path: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -56,10 +62,11 @@ fn parse_args() -> Result<Args, String> {
             "--mock-fail-at" => {
                 a.fail_at = Some(val()?.parse().map_err(|e| format!("--mock-fail-at: {e}"))?)
             }
+            "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(val()?)),
             "--help" | "-h" => {
                 return Err("usage: bloomery-serve [--host H] [--port P] [--model GGUF] \
                             [--chat-template-file PATH] [--alias NAME] [--ctx-size N] [--print-template] \
-                            [--mock-fail-at K]"
+                            [--mock-fail-at K] [--slot-save-path DIR]"
                     .to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
@@ -116,6 +123,7 @@ fn main() -> ExitCode {
         chat_template: template,
         sampler: None,
         fatal_linger: FATAL_LINGER,
+        slot_save_path: args.slot_save_path,
     };
     let engine = match args.fail_at {
         Some(k) => MockEngine::failing_at(args.ctx, k),
@@ -123,6 +131,10 @@ fn main() -> ExitCode {
     };
     let server = match Server::bind((args.host.as_str(), args.port), Box::new(engine), config) {
         Ok(s) => s,
+        Err(e @ ServeError::SlotSavePath(_)) => {
+            eprintln!("{e}");
+            return ExitCode::from(64);
+        }
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(1);
@@ -137,6 +149,8 @@ fn main() -> ExitCode {
     match e {
         // EX_SOFTWARE: the engine, not the listener, ended the run.
         ServeError::Engine(_) => ExitCode::from(70),
-        ServeError::Io(_) | ServeError::Template(_) => ExitCode::from(1),
+        ServeError::Io(_) | ServeError::Template(_) | ServeError::SlotSavePath(_) => {
+            ExitCode::from(1)
+        }
     }
 }

@@ -173,6 +173,7 @@ mod drive {
             chat_template: template,
             sampler: Some(sampler_factory()),
             fatal_linger: FATAL_LINGER,
+            slot_save_path: None,
         };
         let server = Server::bind((a.host.as_str(), a.port), Box::new(engine), config)?;
         eprintln!(
