@@ -79,6 +79,7 @@
 | **18 (09-24 14:00~)** | `dsgraphb` ‖ `nanmoe` ‖ `shadowhost` ‖ `propsengine` ‖ `qwen3time` ‖ `qwen3perf` ‖ `plantidy`(조사) → `plainfile`(자리가 나면) | prefix2·qwen3 3단계 머지, plan 정리, 토크나이저 참조 트리 | nanmoe·shadowhost 머지 → E21 자리 |
 | 19 | `plainfile`(계속) ‖ `dsgraphc` ‖ `visinj` ‖ `linear` 1단계 | E28 qwen3 같은 창 A/B, E21(공개 파일, plainfile 뒤) | plainfile·dsgraph C 머지 |
 | 20 | `dsloop` ‖ `slots` ‖ `glm53` | DSpark tok/s(A6000 (a)·3090 gate), M1 글 | dsloop 머지 |
+| **21 (09-25 04:10~)** | `dspark-q3k`(공개 파일 Q3_K `token_embd`를 드래프트가 읽음 — dsloop의 선행) ‖ `ds41hcbranch`(A1) ‖ `unionhost`(합집합 호스트 서비스) → 시차 뒤 `ds41splitk`(D3/D4) ‖ `qwen3route`(K1·K4·K5) ‖ `fixup3`(트래커 16건). 19·20의 `visinj`·`linear`·`slots`·`glm53`은 뒤로 — 09-24 밤 커널 리뷰가 임계 경로에서 −1…−3 ms를 찾았고 목표 순서 ①(타겟 카드 숫자)·③(DSpark)이 ④(모델)보다 앞이다; `plainfile`은 `pubflip`(`d771085`)으로, `dsgraphc`는 `11ce715`로 착륙 | 시팅 A 기록(rig-log 09-25), E21(3090·공개 파일·lcpp·ik·ik+DSpark·N5 플래그 세트 — 빌더 틈에, B·C·D보다 먼저), `spec-dsloop`(dspark-q3k 착륙 시 발사), spots-triage 표 갱신 | dspark-q3k·hcbranch 머지 → dsloop 자리 |
 
 ### 리드 직렬 지점과 규칙(이 파동들에 적용)
 
