@@ -66,6 +66,62 @@
 #                   buffers too. Never add GGML_CUDA_REGISTER_HOST: it would cudaHostRegister the
 #                   whole mapping.
 #
+#   LCPP            the mainline llama.cpp tree the `lcpp:<D>` arms of depth-ds41.sh and the `lcpp` arm
+#                   of ik-draft.sh run: the V4.1 port's branch (ggml-org/llama.cpp PR #28696,
+#                   runtime/deepseek41). LCPPBIN moves its llama-bench alone, as IKBIN does ik's
+#   LCPP_NCMOE      how many leading layers keep their routed experts on the host (--n-cpu-moe),
+#                   sized per file for the A6000 from MODEL: 33 when it is V41_PUBLIC, else 34 (the
+#                   mixed file's value) [all derived, from each file's header and the card's
+#                   memory.total, 49,140 MiB; no load has been run at these flags]. Both files:
+#                   layer experts, layers 0-1 7,007,109,120 B (down Q5_K), layers 2-39
+#                   6,440,878,080 B (down Q4_K). Card dense is every other tensor but token_embd
+#                   (the input embedding stays on the host) and the engram tables (the port marks
+#                   them TENSOR_READ_LAZY, a host buffer).
+#                   V41_PUBLIC: card dense 3,595,917,760 B.
+#                     Plan (a)'s card experts on this file: card_experts=2668 (44,750,684,160 B),
+#                     6.95 layers' worth. 33 keeps layers 33-39 on the card, 7 × 6,440,878,080 =
+#                     45,086,146,560 B (+0.75 % of plan (a)'s bytes; host share of routed work
+#                     33/40 = 0.825 against plan (a)'s 1 − 2668/15360 = 0.826).
+#                     Card total at 33: 48,682,064,320 B = 46,427 MiB of 49,140 MiB, 2,713 MiB left
+#                     for the CUDA context, the KV cache (at most 40 layers × ctx × 512 × f16 — the
+#                     port passes one tensor as K and V — 170 MiB at ctx 4,352) and the compute
+#                     buffers. At 32 the experts alone are 8 × 6,440,878,080 = 51,527,024,640 B,
+#                     the card's whole 49,140 MiB: it does not load.
+#                   V41_MIXED: card dense 7,657,593,280 B (token_embd BF16 1,323,827,200 B stays on
+#                     the host). Plan (a)'s 2,414 card experts (IK_GPU_FLAGS above) are 6.29 layers'
+#                     worth; 34 keeps 6 layers, 38,645,268,480 B, card total 46,302,861,760 B =
+#                     44,158 MiB (4,982 MiB left). At 33 the total is 52,743,739,840 B, more than
+#                     the card: it does not load.
+#   LCPP_GPU_FLAGS  llama-bench's flags for the `lcpp:<D>` arms (tools/llama-bench/llama-bench.cpp's
+#                   spellings):
+#                   -ngl 999          every layer and the output head on the card
+#                   --n-cpu-moe N     LCPP_NCMOE; llama-bench turns it into CPU buffer overrides of
+#                                     blk.<i>.ffn_(up|down|gate|gate_up)_(ch|)exps, i < N
+#                                     (common/common.h LLM_FFN_EXPS_REGEX), the ik arm's form
+#                   -fa on            flash attention (the CUDA kernel has the 512/512 head); auto
+#                                     is the default
+#                   -t 32             the host's cores (llama-bench's default is
+#                                     common_cpu_get_num_math()), spelled out as in IK_GPU_FLAGS
+#                   -nopo 1           no op offload. Off by default, a host-resident weight of an
+#                                     op with a batch >= 32 is copied to the card per ubatch
+#                                     (ggml-cuda.cu device_offload_op), so the compute buffer
+#                                     reserved at ubatch 512 must hold a layer's expert tensors
+#                                     (up to 3,114,270,720 B each) — more than the 2,713 MiB
+#                                     left at 33 on V41_PUBLIC [derived]. A decode step is batch 1 and never
+#                                     offloads: only the untimed -d prefill runs on the host
+#                                     instead.
+#                   No IK_GPU_ENV twin: mainline keeps the host context on the file mapping with
+#                   buffer overrides (src/llama-model.cpp: use_mmap_buffer is always true).
+#                   No --defer-experts twin either: the loader WILLNEEDs every non-lazy range
+#                   (src/llama-mmap.cpp), 262,653,755,588 B of V41_PUBLIC (267,754,842,272 B of V41_MIXED)
+#                   on a 270 GB machine — the witness's
+#                   page cache and pgmajfault lines show what it costs.
+#   LCPP_CLI_FLAGS  the same placement in common/arg.cpp's spellings, for llama-completion (the
+#                   `lcpp` arm of ik-draft.sh): --no-op-offload for -nopo 1, and -fit off —
+#                   common's default fit pass would otherwise adjust the arguments not given
+#   LCPP_NCMOE_SWEEP  the --n-cpu-moe values the sweep arms `lcpp<K>:<D>` take (depth-ds41.sh):
+#                   LCPP_NCMOE and the two above it; below it the file does not load (above)
+#
 # Deliberately unset: IK_BEST_FLAGS and REF_PROMPTS. No CPU flag sweep and no prompt set exist for
 # this model, and every script that reads them runs under `set -u`, so such a script stops at the
 # unset name instead of running ik at flags nobody measured.
@@ -85,6 +141,12 @@ MODEL=${BLOOMERY_REF_MODEL:-$V41_MODEL}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 : "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe 34 -t 32 --defer-experts}"
 : "${IK_GPU_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
+: "${LCPP:=/home/user/llama.cpp-v41}"
+: "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+if [ "$MODEL" = "$V41_PUBLIC" ]; then : "${LCPP_NCMOE:=33}"; else : "${LCPP_NCMOE:=34}"; fi
+: "${LCPP_GPU_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 -nopo 1}"
+: "${LCPP_CLI_FLAGS:=-ngl 999 --n-cpu-moe $LCPP_NCMOE -fa on -t 32 --no-op-offload -fit off}"
+: "${LCPP_NCMOE_SWEEP:=$LCPP_NCMOE $((LCPP_NCMOE + 1)) $((LCPP_NCMOE + 2))}"
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_deepseek41$V41_SET_SUFFIX}"
 : "${REF_SET_CUDA:=ref_cuda_deepseek41$V41_SET_SUFFIX}"

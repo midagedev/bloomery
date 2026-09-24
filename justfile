@@ -837,12 +837,20 @@ time-gpu-ds41 *ARGS:
 time-ik-draft CORPUS N ARM="dspark":
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} {{ARM}}'
 
-# V4.1 decode by depth, both engines in one lease on the A6000 (lead-only): our arms `<D>` (generate_ds41 --depth D,
-# placement (a)) and ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS), alternated, rounds rotated.
-# tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
-# With no ours arm (every arm `ik:<D>`) generate_ds41 is not built; no arms means the runner's default (6 ik:6), which builds.
+# mainline llama.cpp(V4.1 포트, 프로필의 LCPP)로 같은 corpus-<CORPUS>.ids 첫 512 id 프롬프트를 A6000에서 임대 안에 디코드한다(리드 전용):
+# `just time-gpu-ds41 --tokens <그 id> -n N`의 mainline 쌍둥이, llama-completion에 LCPP_CLI_FLAGS. 프롬프트 왕복 검사 둘과 요약 줄은
+# tools/ref/ik-draft.sh의 lcpp 팔 그대로다. 예: `just time-lcpp-prompt prose 96`.
+time-lcpp-prompt CORPUS N:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} lcpp'
+
+# V4.1 decode by depth, three engines in one lease on the A6000 (lead-only): our arms `<D>` (generate_ds41 --depth D,
+# placement (a)), ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS) and mainline's `lcpp:<D>`
+# (llama-bench -d D at LCPP_GPU_FLAGS; `lcpp<K>:<D>` sweeps --n-cpu-moe K), alternated, rounds rotated, with per-depth
+# ours/reference ratios. tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
+# With no ours arm generate_ds41 is not built, nor under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 (the command lines, no lease);
+# no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in ik:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
 
 # Qwen3-30B-A3B 전 카드 디코드를 깊이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(프롬프트를 실제 D스텝으로 먹임), ik `ik:<D>`(-gp D,96, 프로필
 # 플래그)·`ikdef:<D>`(llama-bench 기본값), mainline `lcpp:<D>`(-d D)를 바퀴마다 순서를 돌려 번갈아 재고, 깊이마다 ours/각 참조 비율을 찍는다.
