@@ -50,7 +50,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::arch::qwen3moe::experts::{ExpertKernels, GateUpArgs};
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
-    use bloomery_gpu_gates::qwen3moe::sets;
+    use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
         GateError, Layout, RowKind, bits_equal, bytes_to_words, checks_failed, ik_q8_2, open_model,
@@ -94,41 +94,6 @@ mod gate {
         gpu.enqueue_quantize_q8_1(&xd, &mut act)?;
         gpu.stream().synchronize()?;
         Ok(act)
-    }
-
-    /// A Q4_K row's values split as `w = d1·q − m1`: the scale term `d1·q`
-    /// and the min term `m1` of each value (`dequantize_row_q4_K`'s factors,
-    /// every product exact in f32).
-    fn q4k_parts(row: &[u8], dq: &mut Vec<f32>, mn: &mut Vec<f32>) {
-        use gguf::quant::half_to_f32;
-        dq.clear();
-        mn.clear();
-        for blk in row.as_chunks::<144>().0 {
-            let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-            let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
-            let sc = &blk[4..16];
-            let scale_min = |j: usize| -> (f32, f32) {
-                let (s, m) = if j < 4 {
-                    (sc[j] & 63, sc[j + 4] & 63)
-                } else {
-                    (
-                        (sc[j + 4] & 0x0f) | ((sc[j - 4] >> 6) << 4),
-                        (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4),
-                    )
-                };
-                (d * f32::from(s), dmin * f32::from(m))
-            };
-            for j in 0..4 {
-                let q = &blk[16 + 32 * j..16 + 32 * j + 32];
-                for (half, shift) in [(0usize, 0u8), (1, 4)] {
-                    let (d1, m1) = scale_min(2 * j + half);
-                    for &b in q {
-                        dq.push(f32::from((b >> shift) & 0x0f) * d1);
-                        mn.push(m1);
-                    }
-                }
-            }
-        }
     }
 
     fn silu64(g: f64) -> f64 {

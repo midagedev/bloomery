@@ -2,14 +2,15 @@
 //! the argmax — on one card, against ik's CPU oracle and its greedy answers.
 //!
 //! Every prompt runs from position 0 (`GpuModel::reset`), its tokens fed one
-//! position at a time through the decode path: this chain has no prefill
-//! kernel, and the greedy reference was written the same way
-//! (`argmax_ref --step-prefill`).
+//! position at a time through the decode path — the greedy reference was
+//! written the same way (`argmax_ref --step-prefill`) — and then again
+//! through the prompt prefill (`Qwen3moeModel::prefill`), which must leave
+//! the same answer bit for bit.
 //!
 //! What is asserted:
-//! - (s) structure: the captured step holds [`NODES_CHAIN`] nodes, 48 of
-//!   them memcpy (the residual crossing each layer boundary) and none a host
-//!   node.
+//! - (s) structure: the captured step holds [`NODES_CHAIN`] nodes, none of
+//!   them a memcpy (the combine writes the next layer's input in place) or
+//!   a host node.
 //! - (f) teacher-forced, per layer: each layer run alone on ik's own input
 //!   row (`inp_embd` for layer 0, `l_out-(L−1)` after) at each of the
 //!   oracle's five positions. The attention half against ik's `attn_out-L`
@@ -32,9 +33,20 @@
 //!   V2-Lite gate's criterion; later divergences and near ties are printed.
 //! - (r) graph replay equals the eager body: the same prompts in eager mode
 //!   give the same tokens, and the last step's logits are bit-identical.
+//! - (p) prefill equals the one-token path: the same prompts prefilled
+//!   (up to `MAX_TOKENS` positions per pass), then the same greedy steps,
+//!   give the same tokens and bit-identical last logits; so do the prompts'
+//!   concatenation (several passes) against its own one-token run, whole
+//!   and in two calls split at [`SPLIT`], the second starting at a position
+//!   that is not a pass boundary.
 //!
 //! The flash pass is read once per process (`BLOOMERY_GQA_MMA`), so each
 //! pass is its own run; the `load` line names it.
+//!
+//! `--dump DIR` also writes each greedy prompt's tokens (u32 LE) and last
+//! logits (f32 LE) of the graph, the eager and the prefilled pass as raw
+//! files under DIR (`p{i}-{graph,eager,prefill}.{tokens,logits}`), for a
+//! byte comparison across builds (`md5sum DIR/*`).
 //!
 //! `--ppl TAG` instead scores the chain against ik's KL-divergence base file
 //! `$BLOOMERY_DATA/ikppl/TAG.kld` (`tools/ref/ik-ppl.sh --kld-base`): chunk by
@@ -57,41 +69,50 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::Qwen3moeModel;
+    use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::kld::KldBase;
+    use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
-    use bloomery_gpu_gates::prompts::{GreedyClass, compare_greedy, read_greedy, read_prompts};
+    use bloomery_gpu_gates::prompts::{
+        GreedyClass, PromptRow, compare_greedy, read_greedy, read_prompts,
+    };
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, checks_failed, data_dir, ik_q8_2, open_split,
         q8_1_dequant, ref_ints, ref_tensor_logical_in, topk_ids_logical_within, verdict,
     };
     use cuda_core::sys;
     use model::arch::Arch;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     /// Generated tokens per prompt: the greedy files' width.
     const GEN: usize = 32;
 
+    /// Where the split prefill of the concatenated prompts cuts them: inside
+    /// the first pass, so the second call starts off a pass boundary.
+    const SPLIT: usize = 5;
+
     /// Prompts of the greedy arm: rows `0..PROMPTS` of `tools/ref/prompts.tsv`.
     const PROMPTS: usize = 8;
 
-    /// Cache rows: the oracle's five tokens, and the longest greedy prompt
-    /// plus `GEN` with room.
+    /// Cache rows: the oracle's five tokens, and the prompts' concatenation
+    /// (`PROMPTS` prompts of at most `MAX_TOKENS` ids) plus `GEN` with room.
     const CTX: usize = 256;
 
     /// The captured step's node count, derived before the chain was built:
-    /// the embedding row, 18 nodes per layer (attention norm+quant, q, k, v,
+    /// the embedding row, 13 nodes per layer (attention norm+quant, q·k·v,
     /// QK-norm+rope+append, flash segment pass, flash merge, q8_1 of the
-    /// attention rows, attn_output, the residual add, FFN norm+quant, the
-    /// router gemv, the router, gate·up·SwiGLU, q8_1 of the SwiGLU rows,
-    /// down, combine, the residual copy) and the head's four (norm, q8_1,
-    /// Q6_K gemv, argmax): 1 + 48·18 + 4.
-    const NODES_CHAIN: usize = 869;
+    /// attention rows, attn_output with the residual, FFN norm+quant, the
+    /// router gemv with the routing, gate·up·SwiGLU, q8_1 of the SwiGLU rows,
+    /// down, combine into the next layer's input), one more on each of the
+    /// 24 layers whose value projection is Q6_K (its own gemv), and the
+    /// head's four (norm, q8_1, Q6_K gemv, argmax): 1 + 24·13 + 24·14 + 4.
+    const NODES_CHAIN: usize = 653;
 
-    /// The layer boundaries' residual copies in the captured step.
-    const MEMCPY_CHAIN: usize = 48;
+    /// Memcpy nodes in the captured step: the residual crosses no layer
+    /// boundary as a copy.
+    const MEMCPY_CHAIN: usize = 0;
 
     /// PIN(2026-09-24): the teacher-forced bound on each half's error ratio
     /// — its relative error over the relative distance between the two
@@ -159,6 +180,12 @@ mod gate {
             let tag = args.get(i + 1).ok_or("--ppl needs a tag")?;
             return ppl(tag);
         }
+        let dump = match args.iter().position(|a| a == "--dump") {
+            Some(i) => Some(PathBuf::from(
+                args.get(i + 1).ok_or("--dump needs a directory")?,
+            )),
+            None => None,
+        };
         let mut m = open(CTX, StepMode::Graph)?;
         let mut ok = true;
         ok &= structure(&mut m)?;
@@ -166,7 +193,7 @@ mod gate {
         let man = o.open(Set::Cpu)?;
         ok &= forced(&mut m, &man)?;
         ok &= free(&mut m, &man)?;
-        ok &= greedy(&mut m)?;
+        ok &= greedy(&mut m, dump.as_deref())?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
@@ -457,7 +484,24 @@ mod gate {
         Ok((out, m.logits()?))
     }
 
-    fn greedy(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+    /// One prompt's greedy tokens and last logits as raw little-endian files
+    /// under `dir` (`--dump`).
+    fn dump(
+        dir: &Path,
+        tag: &str,
+        p: usize,
+        toks: &[u32],
+        logits: &[f32],
+    ) -> Result<(), GateError> {
+        std::fs::create_dir_all(dir)?;
+        let t: Vec<u8> = toks.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let l: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join(format!("p{p}-{tag}.tokens")), t)?;
+        std::fs::write(dir.join(format!("p{p}-{tag}.logits")), l)?;
+        Ok(())
+    }
+
+    fn greedy(m: &mut Qwen3moeModel, dump_dir: Option<&Path>) -> Result<bool, GateError> {
         let dir = greedy_dir();
         let mut prompts = Vec::new();
         let mut reference = Vec::new();
@@ -481,8 +525,11 @@ mod gate {
         let mut graph = Vec::with_capacity(PROMPTS);
         let mut graph_logits = Vec::with_capacity(PROMPTS);
         m.set_mode(StepMode::Graph);
-        for p in &prompts {
+        for (i, p) in prompts.iter().enumerate() {
             let (toks, logits) = continue_greedy(m, &p.tokens)?;
+            if let Some(dir) = dump_dir {
+                dump(dir, "graph", i, &toks, &logits)?;
+            }
             graph.push(toks);
             graph_logits.push(logits);
         }
@@ -490,6 +537,9 @@ mod gate {
         let mut replay_ok = true;
         for (i, p) in prompts.iter().enumerate() {
             let (toks, logits) = continue_greedy(m, &p.tokens)?;
+            if let Some(dir) = dump_dir {
+                dump(dir, "eager", i, &toks, &logits)?;
+            }
             let same_t = toks == graph[i];
             let same_l = logits
                 .iter()
@@ -529,24 +579,118 @@ mod gate {
             rep.n_diverged,
             verdict(greedy_ok)
         );
-        Ok(replay_ok && greedy_ok)
+        let prefill_ok = prefilled(m, &prompts, &graph, &graph_logits, dump_dir)?;
+        Ok(replay_ok && greedy_ok && prefill_ok)
+    }
+
+    // ------------------------------------------------------------ (p) prefill
+
+    /// Our greedy continuation of `ids` prefilled — whole, or in two calls
+    /// cut at `cut` — then stepped: `GEN` tokens and the last step's logits.
+    fn continue_prefilled(
+        m: &mut Qwen3moeModel,
+        ids: &[u32],
+        cut: Option<usize>,
+    ) -> Result<(Vec<u32>, Vec<f32>), GateError> {
+        m.reset()?;
+        let mut out = Vec::with_capacity(GEN);
+        let mut next = match cut {
+            Some(c) => {
+                m.prefill(&ids[..c])?;
+                m.prefill(&ids[c..])?
+            }
+            None => m.prefill(ids)?,
+        };
+        out.push(next);
+        for _ in 1..GEN {
+            next = m.step(&[next])?;
+            out.push(next);
+        }
+        Ok((out, m.logits()?))
+    }
+
+    fn prefilled(
+        m: &mut Qwen3moeModel,
+        prompts: &[PromptRow],
+        graph: &[Vec<u32>],
+        graph_logits: &[Vec<f32>],
+        dump_dir: Option<&Path>,
+    ) -> Result<bool, GateError> {
+        m.set_mode(StepMode::Graph);
+        let mut ok = true;
+        let mut passes = 0usize;
+        let same = |toks: &[u32], logits: &[f32], i: usize| {
+            toks == graph[i]
+                && logits.len() == graph_logits[i].len()
+                && logits
+                    .iter()
+                    .zip(&graph_logits[i])
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        for (i, p) in prompts.iter().enumerate() {
+            let (toks, logits) = continue_prefilled(m, &p.tokens, None)?;
+            if let Some(dir) = dump_dir {
+                dump(dir, "prefill", i, &toks, &logits)?;
+            }
+            passes += Qwen3moeModel::prefill_passes(p.tokens.len());
+            if !same(&toks, &logits, i) {
+                ok = false;
+                println!(
+                    "prefill prompt {} ({} ids): tokens or last logits differ from the one-token path FAIL",
+                    p.id,
+                    p.tokens.len()
+                );
+            }
+        }
+        // Every prompt fits one pass, so the multi-pass walk runs on their
+        // concatenation, against its own one-token run.
+        let long: Vec<u32> = prompts
+            .iter()
+            .flat_map(|p| p.tokens.iter().copied())
+            .collect();
+        let (step_toks, step_logits) = continue_greedy(m, &long)?;
+        let same_long = |(toks, logits): &(Vec<u32>, Vec<f32>)| {
+            *toks == step_toks
+                && logits.len() == step_logits.len()
+                && logits
+                    .iter()
+                    .zip(&step_logits)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        let whole_ok = same_long(&continue_prefilled(m, &long, None)?);
+        let split_ok = same_long(&continue_prefilled(m, &long, Some(SPLIT))?);
+        println!(
+            "prefill: {PROMPTS} prompts in {passes} passes of up to {MAX_TOKENS} positions, then \
+             {GEN}-token greedy steps: tokens and last logits = the one-token path's bit for bit \
+             {}; their {}-id concatenation in {} passes: {}; prefilled as {SPLIT} + {} ids: {}",
+            verdict(ok),
+            long.len(),
+            Qwen3moeModel::prefill_passes(long.len()),
+            verdict(whole_ok),
+            long.len() - SPLIT,
+            verdict(split_ok)
+        );
+        Ok(ok && whole_ok && split_ok)
     }
 
     // ------------------------------------------------------------- ppl
 
-    /// The top two of `v` by (value desc, id asc): ids and values.
-    fn top2(v: &[f32]) -> (usize, f32, usize, f32) {
-        let ahead = |a: usize, b: usize| v[a] > v[b] || (v[a] == v[b] && a < b);
-        let (mut best, mut second) = (0usize, usize::MAX);
-        for i in 1..v.len() {
-            if ahead(i, best) {
-                second = best;
-                best = i;
-            } else if second == usize::MAX || ahead(i, second) {
-                second = i;
-            }
+    /// The chain as the PPL scorer's model.
+    struct Scored<'a>(&'a mut Qwen3moeModel);
+
+    impl PplModel for Scored<'_> {
+        fn reset(&mut self) -> Result<(), GateError> {
+            Ok(self.0.reset()?)
         }
-        (best, v[best], second, v[second])
+
+        fn step(&mut self, token: u32) -> Result<(), GateError> {
+            self.0.step(&[token])?;
+            Ok(())
+        }
+
+        fn logits(&mut self) -> Result<Vec<f32>, GateError> {
+            Ok(self.0.logits()?)
+        }
     }
 
     fn ppl(tag: &str) -> Result<(), GateError> {
@@ -570,90 +714,24 @@ mod gate {
             )
             .into());
         }
-        let t = Instant::now();
-        let (mut n, mut sd, mut sd2) = (0usize, 0.0f64, 0.0f64);
-        let (mut nll_o, mut nll_i, mut kld, mut kld2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        let (mut same_top, mut dm2) = (0usize, 0.0f64);
-        let mut lq = vec![0.0f64; n_vocab];
-        for c in 0..base.n_chunk() {
-            let toks = base
-                .chunk_tokens(c)
-                .ok_or_else(|| format!("chunk {c} has no ids"))?
-                .to_vec();
-            m.reset()?;
-            for pos in 0..base.n_ctx() - 1 {
-                m.step(&toks[pos..=pos])?;
-                let Some(rec) = base.record(c, pos) else {
-                    continue;
-                };
-                let logits = m.logits()?;
-                if logits.len() != n_vocab {
-                    return Err(format!("{} logits, the vocabulary {n_vocab}", logits.len()).into());
-                }
-                let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
-                let lse = f64::from(mx)
-                    + logits
-                        .iter()
-                        .map(|&v| (f64::from(v) - f64::from(mx)).exp())
-                        .sum::<f64>()
-                        .ln();
-                for (q, &v) in lq.iter_mut().zip(&logits) {
-                    *q = f64::from(v) - lse;
-                }
-                let no = -lq[rec.next as usize];
-                let ni = rec.nll();
-                let d = no - ni;
-                n += 1;
-                sd += d;
-                sd2 += d * d;
-                nll_o += no;
-                nll_i += ni;
-                let mut k = 0.0f64;
-                let (mut top_i, mut best_i, mut second_i) =
-                    (0usize, f64::NEG_INFINITY, f64::NEG_INFINITY);
-                for (i, lp) in rec.log_probs().enumerate() {
-                    let lp = f64::from(lp);
-                    k += lp.exp() * (lp - lq[i]);
-                    if lp > best_i {
-                        second_i = best_i;
-                        (top_i, best_i) = (i, lp);
-                    } else if lp > second_i {
-                        second_i = lp;
-                    }
-                }
-                kld += k;
-                kld2 += k * k;
-                let (a, av, _, bv) = top2(&logits);
-                same_top += usize::from(a == top_i);
-                let dm = f64::from(av - bv) - (best_i - second_i);
-                dm2 += dm * dm;
-            }
-            let nf = n as f64;
-            println!(
-                "ppl chunk {c}: {n} positions, mean d {:+.5}, ppl ours {:.4} ik {:.4}, {:.0} s",
-                sd / nf,
-                (nll_o / nf).exp(),
-                (nll_i / nf).exp(),
-                t.elapsed().as_secs_f64()
-            );
-        }
-        let nf = n as f64;
-        let mean = sd / nf;
-        let var = (sd2 / nf - mean * mean).max(0.0) * nf / (nf - 1.0);
-        let se = (var / nf).sqrt();
-        let kmean = kld / nf;
-        let kse = ((kld2 / nf - kmean * kmean).max(0.0) / (nf - 1.0)).sqrt();
+        let s = score_ppl(&base, &mut Scored(&mut m))?;
+        let nf = s.n as f64;
         println!(
-            "ppl: {n} positions; PPL ours {:.4} ik {:.4}; d = NLL_ours − NLL_ik mean {mean:+.5} ± \
-             {se:.5} (SE), sd(d) {:.4}; Δ_PPL {:+.3} %; KLD(ik‖ours) {kmean:.5} ± {kse:.5}; same top \
+            "ppl: {} positions; PPL ours {:.4} ik {:.4}; d = NLL_ours − NLL_ik mean {:+.5} ± \
+             {:.5} (SE), sd(d) {:.4}; Δ_PPL {:+.3} %; KLD(ik‖ours) {:.5} ± {:.5}; same top \
              {:.2} %; σ_rel (rms of margin ours − ik) {:.4}; {:.0} s (printed, not judged)",
-            (nll_o / nf).exp(),
-            (nll_i / nf).exp(),
-            var.sqrt(),
-            100.0 * (mean.exp() - 1.0),
-            100.0 * same_top as f64 / nf,
-            (dm2 / nf).sqrt(),
-            t.elapsed().as_secs_f64()
+            s.n,
+            s.ppl_ours,
+            s.ppl_ik,
+            s.mean_d,
+            s.se_d,
+            s.sd_d,
+            100.0 * s.dppl(),
+            s.kld,
+            s.kld_se,
+            100.0 * s.same_top as f64 / nf,
+            s.sigma_rel,
+            s.secs
         );
         Ok(())
     }

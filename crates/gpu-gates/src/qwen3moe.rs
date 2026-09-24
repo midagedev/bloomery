@@ -1,7 +1,8 @@
 //! What the qwen3moe kernel gates share: the oracle sets they walk, the
-//! reader for ik's f16 cache views, and the host transcriptions of our
-//! per-head norm and NEOX turn (`bloomery_gpu::rope_neox`'s numeric
-//! contract). Host code only.
+//! reader for ik's f16 cache views, the host transcriptions of our per-head
+//! norm and NEOX turn (`bloomery_gpu::rope_neox`'s numeric contract), and a
+//! Q4_K row's scale and min terms, which the expert gates' rounding bounds
+//! are taken on. Host code only.
 
 use crate::oracle::{self, Set};
 use crate::{GateError, RefManifest, RefRow, widened_f16_rows_in};
@@ -29,6 +30,41 @@ pub fn step_sets() -> Result<Vec<(&'static str, RefManifest)>, GateError> {
         .iter()
         .map(|&name| Ok((name, o.open_named(name)?)))
         .collect()
+}
+
+/// A Q4_K row's values split as `w = d1·q − m1`: the scale term `d1·q`
+/// and the min term `m1` of each value (`dequantize_row_q4_K`'s factors,
+/// every product exact in f32), into `dq` and `mn`.
+pub fn q4k_parts(row: &[u8], dq: &mut Vec<f32>, mn: &mut Vec<f32>) {
+    use gguf::quant::half_to_f32;
+    dq.clear();
+    mn.clear();
+    for blk in row.as_chunks::<144>().0 {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let sc = &blk[4..16];
+        let scale_min = |j: usize| -> (f32, f32) {
+            let (s, m) = if j < 4 {
+                (sc[j] & 63, sc[j + 4] & 63)
+            } else {
+                (
+                    (sc[j + 4] & 0x0f) | ((sc[j - 4] >> 6) << 4),
+                    (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4),
+                )
+            };
+            (d * f32::from(s), dmin * f32::from(m))
+        };
+        for j in 0..4 {
+            let q = &blk[16 + 32 * j..16 + 32 * j + 32];
+            for (half, shift) in [(0usize, 0u8), (1, 4)] {
+                let (d1, m1) = scale_min(2 * j + half);
+                for &b in q {
+                    dq.push(f32::from((b >> shift) & 0x0f) * d1);
+                    mn.push(m1);
+                }
+            }
+        }
+    }
 }
 
 /// The f16 bits of f16 row `row` of the set at `dir` in its LOGICAL order:

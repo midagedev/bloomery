@@ -5,8 +5,10 @@
 
 use super::dispatch;
 use super::experts::ExpertKernels;
+use super::prefill::Prefill;
+use super::proj::ProjKernels;
 use super::router::{N_EXPERT, N_USED, RouterKernels};
-use super::scratch::{Arena, Dims, KvPlanes, SP_CS, SP_N_KEYS, SP_POS, SP_TOKEN};
+use super::scratch::{Arena, Dims, KvPlanes, SP_CS, SP_N_KEYS, SP_POS, SP_TOKEN, StepParams};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, gqa_mma};
 use crate::head::Head;
 use crate::model::{ChainBody, StepProbe};
@@ -55,6 +57,7 @@ pub(super) struct LayerNames {
 
 /// The kernels the chain launches beyond the crate's shared modules.
 pub(super) struct Kernels {
+    pub(super) proj: ProjKernels,
     pub(super) neox: RopeNeoxKernels,
     pub(super) flash: FlashGqaKernels,
     pub(super) router: RouterKernels,
@@ -74,20 +77,24 @@ pub struct Body {
     pub(super) hp: Hparams,
     pub(super) names: Vec<LayerNames>,
     pub(super) kv: Vec<KvPlanes>,
+    /// The decode step's one-row arena and its parameter image.
     pub(super) s: Arena,
+    pub(super) sp: StepParams,
+    /// The prompt prefill's arena, made at the first prefill.
+    pub(super) prefill: Option<Prefill>,
     pub(super) k: Kernels,
-    rope: RopeTable,
+    pub(super) rope: RopeTable,
     /// The host rope row `refresh` fills, reused every step.
     cs_host: Vec<f32>,
     /// The flash pass this process runs ([`gqa_mma`]), read once at load.
     pub(super) mma: bool,
-    /// The per-layer `l_out` copies an instrument asked for
+    /// The per-layer output copies an instrument asked for
     /// ([`Body::set_taps`]).
     pub(super) taps: Option<TapRows>,
 }
 
 /// One `hidden` row per layer and a window onto each, the copy target of
-/// that layer's `l_out`.
+/// that layer's output residual.
 pub(super) struct TapRows {
     pub(super) buf: DeviceBuffer<f32>,
     pub(super) rows: Vec<ManuallyDrop<DeviceBuffer<f32>>>,
@@ -231,8 +238,8 @@ impl LayerNames {
 }
 
 impl Body {
-    /// Keep a copy of every layer's `l_out` after each layer of the chain
-    /// (`on`), or stop. The copies are one memcpy node per layer in a
+    /// Keep a copy of every layer's output residual after each layer of the
+    /// chain (`on`), or stop. The copies are one memcpy node per layer in a
     /// capture; the gates read them in eager mode. Load-time allocation.
     pub(super) fn set_taps(&mut self, stream: &CudaStream, on: bool) -> Result<(), GpuError> {
         self.taps = None;
@@ -323,6 +330,7 @@ impl ChainBody for Body {
             .collect::<Result<Vec<_>, _>>()?;
         let ctx = gpu.context();
         let k = Kernels {
+            proj: ProjKernels::load(ctx)?,
             neox: RopeNeoxKernels::load(ctx)?,
             flash: FlashGqaKernels::load(ctx)?,
             router: RouterKernels::load(ctx)?,
@@ -331,7 +339,9 @@ impl ChainBody for Body {
         };
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
-            s: Arena::new(stream, dims)?,
+            s: Arena::new(stream, dims, 1)?,
+            sp: StepParams::new(stream)?,
+            prefill: None,
             hp,
             names,
             kv,
@@ -351,17 +361,15 @@ impl ChainBody for Body {
     /// one host-to-device copy.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         let DecodeInput { token, pos } = *input;
-        let s = &mut self.s;
-        s.params_host.truncate(SP_CS);
-        s.params_host[SP_TOKEN] = token;
-        s.params_host[SP_POS] = pos;
-        s.params_host[SP_N_KEYS] = pos + 1;
+        let sp = &mut self.sp;
+        sp.host.truncate(SP_CS);
+        sp.host[SP_TOKEN] = token;
+        sp.host[SP_POS] = pos;
+        sp.host[SP_N_KEYS] = pos + 1;
         self.cs_host.clear();
         self.rope.push(pos, Direction::Forward, &mut self.cs_host);
-        s.params_host
-            .extend(self.cs_host.iter().map(|v| v.to_bits()));
-        let (params, image) = (&mut s.step_params, &s.params_host);
-        params.copy_from_host(stream, image)?;
+        sp.host.extend(self.cs_host.iter().map(|v| v.to_bits()));
+        sp.buf.copy_from_host(stream, &sp.host)?;
         Ok(())
     }
 
@@ -419,6 +427,8 @@ impl ChainBody for Body {
     fn resident_bytes(&self) -> usize {
         self.kv.iter().map(KvPlanes::bytes).sum::<usize>()
             + self.s.bytes()
+            + self.sp.buf.num_bytes()
+            + self.prefill.as_ref().map_or(0, Prefill::bytes)
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
     }
 }

@@ -10,20 +10,22 @@
 //! (`tokenizer`, no BOS: the file sets `add_bos_token` false; no
 //! chat template) and prints the generated text after the ids.
 //!
-//! The prompt is fed one real step per token (this chain has no prefill
-//! kernel); the argmax after its last token is generated token 0, and
-//! `N − 1` feedback steps follow. Lines: `prompt_ids`, `load` (with the
-//! flash pass: `flash_mma=`), `capture graph_nodes=` in graph mode,
-//! `step 0 pos tok`, then per feedback step `step i pos tok` (and `time
-//! step i ms=` under `--time`), all written after the loop; then
+//! The prompt is prefilled (`Qwen3moeModel::prefill`: up to eight positions
+//! per pass, the same cache rows and answer as one step per token); the
+//! argmax after its last token is generated token 0, and `N − 1` feedback
+//! steps follow. Lines: `prompt_ids`, `load` (with the flash pass:
+//! `flash_mma=`), `capture graph_nodes=` in graph mode, `step 0 pos tok`
+//! (with the passes the prompt took: `prefill_steps=`), then per feedback
+//! step `step i pos tok` (and `time step i ms=` under `--time`), all written
+//! after the loop; then
 //! `tokens [..]`, `text` for a `--prompt` run, and under `--time` the
 //! `SMOKE` footer with `generate`'s keys (`p50_ms=`, `mean_ms=`, `warm=`,
 //! `tok/s(p50)=`).
 //!
 //! `--seed-depth D` stands the model at depth D: `seed_depth(D − 1)` fills
-//! the caches with a pattern, and one literal token (id 0) is fed through
-//! the ordinary path, so the timed steps run at the positions a D-token
-//! prompt leaves. The tokens it prints are meaningless; only the timing is.
+//! the caches with a pattern, and one literal token (id 0) is prefilled
+//! after them, so the timed steps run at the positions a D-token prompt
+//! leaves. The tokens it prints are meaningless; only the timing is.
 //!
 //! `--time` is a MEASUREMENT and belongs under the machine-wide lease
 //! (`tools/ref/time-gate.sh`), never at a bare prompt. The cache's
@@ -133,11 +135,12 @@ mod cli {
             println!("seed rows={} pos={}", d - 1, m.pos());
         }
         let t = Instant::now();
-        let mut next = m.step(&ids)?;
+        let mut next = m.prefill(&ids)?;
         println!(
-            "step 0 {} {next} (the {} fed steps in {:.2} s, runtime value)",
+            "step 0 {} {next} (the {} prompt ids in prefill_steps={} passes, {:.2} s, runtime value)",
             m.pos() - 1,
             ids.len(),
+            Qwen3moeModel::prefill_passes(ids.len()),
             t.elapsed().as_secs_f64()
         );
         let mut tokens_out = Vec::with_capacity(n_gen);

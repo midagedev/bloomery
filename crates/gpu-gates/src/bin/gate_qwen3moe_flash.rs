@@ -35,6 +35,12 @@
 //! its bound (the check that this model of ik is right), ours within the sum
 //! of both of ik's `fa-L`; a rerun bit-identical; padded cache rows set to
 //! NaN change no bit; the captured graph (two nodes) replays bit-identical.
+//!
+//! And the prefill shape, on each set's layer 0 in both passes: one launch of
+//! [`ROWS`] query rows — row `t` the step's query with its heads rotated by
+//! `t`, attending over its own live count, spread from one key to all of
+//! them — bit for bit the [`ROWS`] one-row launches of those rows and
+//! counts.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -70,6 +76,9 @@ mod gate {
     /// An f16 NaN the padded rows are overwritten with.
     const NAN16: u16 = 0x7e00;
 
+    /// Query rows of the prefill-shape check: the prefill's pass width.
+    const ROWS: usize = 8;
+
     /// One layer's inputs on the card.
     struct Inputs {
         q: DeviceBuffer<f32>,
@@ -78,30 +87,39 @@ mod gate {
         n_keys: DeviceBuffer<u32>,
     }
 
-    /// One launch into fresh scratch, read back.
-    fn run_once(
-        k: &FlashGqaKernels,
-        stream: &CudaStream,
-        inp: &Inputs,
+    /// The launch geometry every run of a layer shares.
+    struct Geom {
         scale: f32,
         n_kv: usize,
         ctx: usize,
+    }
+
+    /// One launch of `m` query rows (`q` and `n_keys` hold `m` each) over
+    /// the cache planes, into fresh scratch, read back.
+    fn run_once(
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        q: &DeviceBuffer<f32>,
+        n_keys: &DeviceBuffer<u32>,
+        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        g: &Geom,
         mma: bool,
     ) -> Result<Vec<f32>, GateError> {
-        let n_head = n_kv * GROUP;
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_head, ctx))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_head, ctx))?;
-        let mut y = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
+        let (n_head, m) = (g.n_kv * GROUP, n_keys.len());
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(m, n_head, g.ctx))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head, g.ctx))?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD)?;
         k.enqueue_pass(
             stream,
             GqaArgs {
-                q: &inp.q,
-                kc: &inp.kc,
-                vc: &inp.vc,
-                n_keys: &inp.n_keys,
-                scale,
-                n_kv,
-                ctx,
+                q,
+                kc,
+                vc,
+                n_keys,
+                scale: g.scale,
+                n_kv: g.n_kv,
+                ctx: g.ctx,
+                m,
                 part_v: &mut pv,
                 part_ms: &mut pms,
                 y: &mut y,
@@ -110,6 +128,60 @@ mod gate {
         )?;
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
+    }
+
+    /// The prefill shape (module doc): one launch of [`ROWS`] rows against
+    /// each row's one-row launch. Returns whether every row matched.
+    fn rows_check(
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        q: &[f32],
+        inp: &Inputs,
+        live: usize,
+        g: &Geom,
+        mma: bool,
+    ) -> Result<bool, GateError> {
+        let n_head = g.n_kv * GROUP;
+        let rows: Vec<Vec<f32>> = (0..ROWS)
+            .map(|t| {
+                (0..n_head)
+                    .flat_map(|h| q[((h + t) % n_head) * HEAD..][..HEAD].iter().copied())
+                    .collect()
+            })
+            .collect();
+        let limits: Vec<u32> = (0..ROWS)
+            .map(|t| u32::try_from(1 + t * (live - 1) / (ROWS - 1)))
+            .collect::<Result<_, _>>()?;
+        let cache = (&inp.kc, &inp.vc);
+        let all = run_once(
+            k,
+            stream,
+            &DeviceBuffer::from_host(stream, &rows.concat())?,
+            &DeviceBuffer::from_host(stream, &limits)?,
+            cache,
+            g,
+            mma,
+        )?;
+        let mut same = true;
+        for (t, row) in rows.iter().enumerate() {
+            let one = run_once(
+                k,
+                stream,
+                &DeviceBuffer::from_host(stream, row)?,
+                &DeviceBuffer::from_host(stream, &limits[t..=t])?,
+                cache,
+                g,
+                mma,
+            )?;
+            same &= bits_equal(&all[t * n_head * HEAD..(t + 1) * n_head * HEAD], &one);
+        }
+        println!(
+            "rows pass={} m={ROWS} keys={limits:?} ctx={}: each row = its one-row launch bit for bit {}",
+            if mma { "mma" } else { "scalar" },
+            g.ctx,
+            verdict(same)
+        );
+        Ok(same)
     }
 
     /// The exact attention of one head in f64, and each side's bound.
@@ -296,11 +368,14 @@ mod gate {
                     })
                     .collect();
                 let mx_ik = want.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let g = Geom { scale, n_kv, ctx };
                 let mut ys = Vec::new();
                 for (pass, mma) in [false, true].into_iter().enumerate() {
-                    let y = run_once(&k, stream, &inp, scale, n_kv, ctx, mma)?;
-                    let y2 = run_once(&k, stream, &inp, scale, n_kv, ctx, mma)?;
-                    let y_nan = run_once(&k, stream, &inp_nan, scale, n_kv, ctx, mma)?;
+                    let run =
+                        |i: &Inputs| run_once(&k, stream, &i.q, &i.n_keys, (&i.kc, &i.vc), &g, mma);
+                    let y = run(&inp)?;
+                    let y2 = run(&inp)?;
+                    let y_nan = run(&inp_nan)?;
                     let rerun = bits_equal(&y, &y2);
                     let nan_same = bits_equal(&y, &y_nan);
                     let mut layer_ok = rerun && nan_same;
@@ -332,15 +407,18 @@ mod gate {
                         );
                     }
                     set_ok &= layer_ok;
+                    if l == 0 {
+                        set_ok &= rows_check(&k, stream, &q, &inp, live, &g, mma)?;
+                    }
                     ys.push(y);
                 }
 
                 if !graph_done {
                     for (pass, mma) in [false, true].into_iter().enumerate() {
                         let mut pv =
-                            DeviceBuffer::<f32>::zeroed(stream, partials_v_len(n_head, ctx))?;
+                            DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head, ctx))?;
                         let mut pms =
-                            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(n_head, ctx))?;
+                            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head, ctx))?;
                         let mut yg = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
                         let graph = gpu.capture(|s| {
                             k.enqueue_pass(
@@ -353,6 +431,7 @@ mod gate {
                                     scale,
                                     n_kv,
                                     ctx,
+                                    m: 1,
                                     part_v: &mut pv,
                                     part_ms: &mut pms,
                                     y: &mut yg,

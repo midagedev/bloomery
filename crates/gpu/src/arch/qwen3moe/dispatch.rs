@@ -1,24 +1,40 @@
-//! Launch order: the chain and one layer, enqueued asynchronously against
-//! the resident arena. No allocation, no synchronization, no host round
-//! trip — so this is both the eager body and what the capture records.
+//! Launch order: the chain and one layer, enqueued asynchronously against a
+//! resident arena. No allocation, no synchronization, no host round trip —
+//! so this is both the eager body and what the capture records. One layer
+//! body serves both passes: the decode step is its one-row instance, the
+//! prompt prefill the same launches at `m` rows.
 
-use super::body::{Body, Kq, LayerNames};
-use super::experts::GateUpArgs;
+use super::body::{Body, Kernels, Kq, LayerNames};
+use super::experts::{CombineArgs, GateUpArgs};
+use super::proj::{OResidArgs, QkvArgs};
 use super::router::N_USED;
-use super::scratch::{Arena, KvPlanes};
+use super::scratch::{Arena, Io, KvPlanes};
 use crate::flash_gqa::{GqaArgs, HEAD};
 use crate::head::Head;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::rope_neox::NeoxArgs;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
+use cuda_core::DeviceBuffer;
 use model::arch::qwen3moe::names::token_embd;
+
+/// What every launch of one layer reads besides the arena and the cache:
+/// the engine, the weights, the layer's names, the kernels, the flash pass
+/// and the norm epsilon.
+struct Ctx<'a> {
+    gpu: &'a Gpu,
+    w: &'a Weights,
+    n: &'a LayerNames,
+    k: &'a Kernels,
+    mma: bool,
+    eps: f32,
+}
 
 /// Enqueue the whole decode chain at m = 1: layer 0 with its embedding,
 /// every later layer reading the previous layer's output, then the head.
-/// The residual crosses a layer boundary as one device copy (`l_out` into
-/// `x`, a memcpy node in the capture); the last layer copies into the
-/// head's input instead.
+/// The combine writes a layer's output where the next reader takes it — the
+/// arena's `x` for the next layer, the head's input after the last — so no
+/// copy crosses a layer boundary.
 pub(super) fn enqueue_chain(
     gpu: &Gpu,
     w: &Weights,
@@ -28,83 +44,197 @@ pub(super) fn enqueue_chain(
     let stream = gpu.stream();
     let last = b.names.len() - 1;
     for slot in 0..b.names.len() {
-        enqueue_layer(gpu, w, b, slot, slot == 0)?;
+        let out = (slot == last).then(|| head.input_mut());
+        enqueue_layer(gpu, w, b, slot, slot == 0, out)?;
         if let Some(t) = b.taps.as_mut() {
-            t.rows[slot].copy_from_device_async(&b.s.l_out, stream)?;
-        }
-        if slot == last {
-            head.input_mut()
-                .copy_from_device_async(&b.s.l_out, stream)?;
-        } else {
-            b.s.x.copy_from_device_async(&b.s.l_out, stream)?;
+            let src: &DeviceBuffer<f32> = if slot == last {
+                head.input_mut()
+            } else {
+                &b.s.x
+            };
+            t.rows[slot].copy_from_device_async(src, stream)?;
         }
     }
     head.enqueue(gpu, w)
 }
 
 /// Enqueue layer `slot`'s step, embedding the token into `x` in front when
-/// `embed`; `x` in, `l_out` out, the step's K/V row appended to the layer's
-/// planes.
+/// `embed`; `x` in, the output residual into `out` (`None`: back into `x`),
+/// the step's K/V row appended to the layer's planes.
 pub(super) fn enqueue_layer(
     gpu: &Gpu,
     w: &Weights,
     b: &mut Body,
     slot: usize,
     embed: bool,
+    out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
     let Body {
         hp,
         names,
         kv,
         s,
+        sp,
         k,
         mma,
         ..
     } = b;
-    let n = &names[slot];
+    let c = Ctx {
+        gpu,
+        w,
+        n: &names[slot],
+        k,
+        mma: *mma,
+        eps: hp.rms_eps,
+    };
+    layer(&c, &mut kv[slot], s, &sp.io(), 1, embed, out)
+}
+
+/// Enqueue prefill pass `chunk` of `m` tokens (the prompt's tokens `chunk ·
+/// MAX_TOKENS ..`) over the prefill arena: every layer at `m` rows, the
+/// combine leaving each layer's output in `x`, and with `head`, the last
+/// token's row copied into the head's input and the head after it.
+pub(super) fn enqueue_prefill_pass(
+    gpu: &Gpu,
+    w: &Weights,
+    b: &mut Body,
+    chunk: usize,
+    m: usize,
+    head: Option<&mut Head>,
+) -> Result<(), GpuError> {
+    let Body {
+        hp,
+        names,
+        kv,
+        k,
+        mma,
+        prefill,
+        ..
+    } = b;
+    let pf = prefill.as_mut().ok_or(GpuError::state(
+        "qwen3moe::enqueue_prefill_pass",
+        "no prefill arena",
+    ))?;
+    let win = pf.windows(chunk, m)?;
+    let io = win.io();
+    let s = &mut pf.a;
+    for (slot, (n, kv)) in names.iter().zip(kv.iter_mut()).enumerate() {
+        let c = Ctx {
+            gpu,
+            w,
+            n,
+            k,
+            mma: *mma,
+            eps: hp.rms_eps,
+        };
+        layer(&c, kv, s, &io, m, slot == 0, None)?;
+    }
+    match head {
+        Some(head) => {
+            head.input_mut()
+                .copy_from_device_async(&s.x_rows[m - 1], gpu.stream())?;
+            head.enqueue(gpu, w)
+        }
+        None => Ok(()),
+    }
+}
+
+/// Enqueue layer `slot`'s FFN half alone: `ffn_inp` in, the output residual
+/// into `x`.
+pub(super) fn enqueue_ffn(
+    gpu: &Gpu,
+    w: &Weights,
+    b: &mut Body,
+    slot: usize,
+) -> Result<(), GpuError> {
+    let Body {
+        hp,
+        names,
+        s,
+        k,
+        mma,
+        ..
+    } = b;
+    let c = Ctx {
+        gpu,
+        w,
+        n: &names[slot],
+        k,
+        mma: *mma,
+        eps: hp.rms_eps,
+    };
+    ffn(&c, s, 1, None)
+}
+
+/// One layer at `m` rows: the embedding rows into `x` in front when
+/// `embed`, the attention half, then the FFN half into `out` (`None`: back
+/// into `x`).
+fn layer(
+    c: &Ctx<'_>,
+    kv: &mut KvPlanes,
+    s: &mut Arena,
+    io: &Io<'_>,
+    m: usize,
+    embed: bool,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
     if embed {
-        gpu.elem().enqueue_embed_rows_q4k(
-            gpu.stream(),
-            kq_weight(w, &token_embd())?,
-            &s.token_buf,
+        c.gpu.elem().enqueue_embed_rows_q4k(
+            c.gpu.stream(),
+            kq_weight(c.w, &token_embd())?,
+            io.tokens,
             &mut s.x,
         )?;
     }
-    attention(gpu, w, n, &mut kv[slot], s, k, *mma, hp.rms_eps)?;
-    ffn(gpu, w, n, s, k, hp.rms_eps)
+    attention(c, kv, s, io, m)?;
+    ffn(c, s, m, out)
 }
 
-/// The attention half: `x` in, `ffn_inp = x + attn_output(attn(x))` out.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a stage of `enqueue_layer`, taking its caller's arguments (rust-quality R8)"
-)]
+/// The attention half: `x` in, `ffn_inp = x + attn_output(attn(x))` out —
+/// q, k and v in one launch (a Q6_K v in its own), the output projection
+/// with the residual add in its store.
 fn attention(
-    gpu: &Gpu,
-    w: &Weights,
-    n: &LayerNames,
+    c: &Ctx<'_>,
     kv: &mut KvPlanes,
     s: &mut Arena,
-    k: &super::body::Kernels,
-    mma: bool,
-    eps: f32,
+    io: &Io<'_>,
+    m: usize,
 ) -> Result<(), GpuError> {
+    let (gpu, w, n, k) = (c.gpu, c.w, c.n, c.k);
     let stream = gpu.stream();
     let d = s.dims;
+    let i = m - 1;
     gpu.fused().enqueue_norm_quant(
         stream,
         &s.x,
         f32_gain(w, &n.attn_norm)?,
-        eps,
-        &mut s.act_x,
+        c.eps,
+        &mut s.act_x[i],
         &mut s.normed,
     )?;
-    gpu.enqueue_gemv_q4k(kq_weight(w, &n.attn_q)?, &s.act_x, &mut s.q)?;
-    gpu.enqueue_gemv_q4k(kq_weight(w, &n.attn_k)?, &s.act_x, &mut s.k)?;
     let wv = kq_weight(w, &n.attn_v)?;
-    match n.v_ty {
-        Kq::Q4K => gpu.enqueue_gemv_q4k(wv, &s.act_x, &mut s.v)?,
-        Kq::Q6K => gpu.enqueue_gemv_q6k(wv, &s.act_x, &mut s.v)?,
+    let (off_k, off_v) = s.qkv_offsets();
+    k.proj.enqueue_qkv(
+        stream,
+        QkvArgs {
+            wq: kq_weight(w, &n.attn_q)?,
+            wk: kq_weight(w, &n.attn_k)?,
+            wv: (n.v_ty == Kq::Q4K).then_some(wv),
+            act: &s.act_x[i],
+            y: &mut s.qkv,
+            off_k,
+            off_v,
+        },
+    )?;
+    if n.v_ty == Kq::Q6K {
+        match s.v_cols.as_mut().filter(|_| m > 1) {
+            Some(cols) => {
+                gpu.enqueue_gemv_q6k(wv, &s.act_x[i], cols)?;
+                k.proj
+                    .enqueue_token_major(stream, cols, d.n_kv * HEAD, m, &mut s.v)?;
+            }
+            None => gpu.enqueue_gemv_q6k(wv, &s.act_x[i], &mut s.v)?,
+        }
     }
     k.neox.enqueue_head_norm_neox_append(
         stream,
@@ -114,13 +244,13 @@ fn attention(
             v: &s.v,
             gq: f32_gain(w, &n.attn_q_norm)?,
             gk: f32_gain(w, &n.attn_k_norm)?,
-            cs: &s.cs_buf,
-            pos: &s.pos_buf,
-            eps,
+            cs: io.cs,
+            pos: io.pos,
+            eps: c.eps,
             n_head: d.n_head,
             n_kv: d.n_kv,
             ctx: d.ctx,
-            m: 1,
+            m,
             cache_k: &mut kv.k,
             cache_v: &mut kv.v,
         },
@@ -131,103 +261,108 @@ fn attention(
             q: &s.q,
             kc: &kv.k,
             vc: &kv.v,
-            n_keys: &s.n_keys_buf,
+            n_keys: io.n_keys,
             scale: 1.0 / (HEAD as f32).sqrt(),
             n_kv: d.n_kv,
             ctx: d.ctx,
+            m,
             part_v: &mut s.part_v,
             part_ms: &mut s.part_ms,
             y: &mut s.attn,
         },
-        mma,
+        c.mma,
     )?;
-    gpu.enqueue_quantize_q8_1(&s.attn, &mut s.act_attn)?;
-    gpu.enqueue_gemv_q4k(kq_weight(w, &n.attn_output)?, &s.act_attn, &mut s.attn_out)?;
-    gpu.elem()
-        .enqueue_add(stream, &s.attn_out, &s.x, d.hidden, &mut s.ffn_inp)
+    gpu.enqueue_quantize_q8_1(&s.attn, &mut s.act_attn[i])?;
+    k.proj.enqueue_o_resid(
+        stream,
+        OResidArgs {
+            w: kq_weight(w, &n.attn_output)?,
+            act: &s.act_attn[i],
+            x: &s.x,
+            y: &mut s.ffn_inp,
+        },
+    )
 }
 
-/// Enqueue layer `slot`'s FFN half alone: `ffn_inp` in, `l_out` out.
-pub(super) fn enqueue_ffn(
-    gpu: &Gpu,
-    w: &Weights,
-    b: &mut Body,
-    slot: usize,
-) -> Result<(), GpuError> {
-    let Body {
-        hp, names, s, k, ..
-    } = b;
-    ffn(gpu, w, &names[slot], s, k, hp.rms_eps)
-}
-
-/// The routed FFN half: `ffn_inp` in, `l_out = ffn_inp + Σ_s w_s ·
-/// down_s(swiglu(gate_s, up_s))` out over the router's eight experts.
+/// The routed FFN half: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
+/// down_s(swiglu(gate_s, up_s))` over each token's eight experts out, into
+/// `out` (`None`: into `x`). The down `_sel` takes one token's slots per
+/// launch.
 fn ffn(
-    gpu: &Gpu,
-    w: &Weights,
-    n: &LayerNames,
+    c: &Ctx<'_>,
     s: &mut Arena,
-    k: &super::body::Kernels,
-    eps: f32,
+    m: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
+    let (gpu, w, n, k) = (c.gpu, c.w, c.n, c.k);
     let stream = gpu.stream();
     let d = s.dims;
+    let i = m - 1;
     gpu.fused().enqueue_norm_quant(
         stream,
         &s.ffn_inp,
         f32_gain(w, &n.ffn_norm)?,
-        eps,
-        &mut s.act_ffn,
+        c.eps,
+        &mut s.act_ffn[i],
         &mut s.normed,
     )?;
-    gpu.q8f32().enqueue_f32_gemv(
+    k.router.enqueue_fused(
         stream,
         f32_tensor(w, &n.ffn_gate_inp)?,
         &s.normed,
-        1,
-        &mut s.logits,
+        m,
+        &mut s.route,
     )?;
-    k.router.enqueue(stream, &s.logits, &mut s.route)?;
     k.experts.enqueue_gate_up(
         stream,
         GateUpArgs {
             wg: kq_weight(w, &n.ffn_gate_exps)?,
             wu: kq_weight(w, &n.ffn_up_exps)?,
-            act: &s.act_ffn,
+            act: &s.act_ffn[i],
             sel: &s.route.ids,
-            n_slots: N_USED,
+            n_slots: m * N_USED,
             rows_per_expert: d.ff,
             h: &mut s.h,
         },
     )?;
-    gpu.enqueue_quantize_q8_1(&s.h, &mut s.act_h)?;
     let wd = kq_weight(w, &n.ffn_down_exps)?;
-    match n.down_ty {
-        Kq::Q4K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
-            stream,
-            wd,
-            &s.act_h,
-            &s.route.ids,
-            N_USED,
-            d.hidden,
-            &mut s.down,
-        )?,
-        Kq::Q6K => k.q6_sel.enqueue_gemv_q6k_sel(
-            stream,
-            wd,
-            &s.act_h,
-            &s.route.ids,
-            N_USED,
-            d.hidden,
-            &mut s.down,
-        )?,
+    for t in 0..m {
+        gpu.enqueue_quantize_q8_1_at(&s.h, t * N_USED * d.ff, &mut s.act_h)?;
+        match n.down_ty {
+            Kq::Q4K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
+                stream,
+                wd,
+                &s.act_h,
+                &s.ids[t],
+                N_USED,
+                d.hidden,
+                &mut s.down_rows[t],
+            )?,
+            Kq::Q6K => k.q6_sel.enqueue_gemv_q6k_sel(
+                stream,
+                wd,
+                &s.act_h,
+                &s.ids[t],
+                N_USED,
+                d.hidden,
+                &mut s.down_rows[t],
+            )?,
+        }
     }
-    k.experts.enqueue_combine(
+    let y = match out {
+        Some(y) => y,
+        None => &mut s.x,
+    };
+    k.experts.enqueue_combine_tokens(
         stream,
-        &s.down,
-        &s.route.weights,
-        &s.ffn_inp,
-        N_USED,
-        &mut s.l_out,
+        CombineArgs {
+            down: &s.down,
+            w: &s.route.weights,
+            resid: &s.ffn_inp,
+            rows: d.hidden,
+            n_slots: N_USED,
+            m,
+            y,
+        },
     )
 }

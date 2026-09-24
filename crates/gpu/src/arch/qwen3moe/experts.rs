@@ -5,17 +5,21 @@
 //! the residual and nothing else.
 //!
 //! The gate·up kernel is `moe_fused::expert_gate_up_swiglu_q3k`'s shape over
-//! Q4_K rows: one warp per output row, thread row `n = slot · rows_per_expert
-//! + r` reading weight row `sel[slot] · rows_per_expert + r` of both stacks,
-//! each dotted against the one quantized activation column by
-//! `cores::q4k_row_dot_1col` (the m = 1 body of `q4k_gemv`), reduced by the
-//! fixed warp tree, then `elem::silu_mul`. So slot `s` of `h` is bit for bit
-//! `silu(q4k_gemv(gate_e)) · q4k_gemv(up_e)` for `e = sel[s]`.
+//! Q4_K rows: one warp per output row, thread row
+//! `n = slot · rows_per_expert + r` reading weight row
+//! `sel[slot] · rows_per_expert + r` of both stacks, each dotted against its
+//! slot's quantized activation column by
+//! `cores::q4k_row_dot_1col` (the m = 1 body of `q4k_gemv`, which picks the
+//! column by its base offset), reduced by the fixed warp tree, then
+//! `elem::silu_mul`. Slot `s` reads column `s / slots_per_col`: one column
+//! for every slot of a token, a token's run of slots per column over several
+//! tokens. So slot `s` of `h` is bit for bit `silu(q4k_gemv(gate_e)) ·
+//! q4k_gemv(up_e)` for `e = sel[s]` on that column alone.
 //!
-//! The combine, one thread per output value `d`: `y[d] =
-//! elem::weighted_expert_sum(down, w, d) + resid[d]` — the slot-ascending
-//! weighted sum, then one add, the grouping of the reference's
-//! `routed_out + ffn_inp`.
+//! The combine, one thread per output value `d` of token `t`: `y[t · rows +
+//! d] = elem::weighted_expert_sum(down, w, t, d) + resid[t · rows + d]` — the
+//! slot-ascending weighted sum, then one add, the grouping of the
+//! reference's `routed_out + ffn_inp`.
 
 use crate::GpuError;
 use crate::cores::q4k_row_dot_1col;
@@ -31,10 +35,11 @@ use std::sync::Arc;
 mod qwen3moe_expert_kernels {
     use super::*;
 
-    /// The routed experts' gate·up·SwiGLU in one launch (module doc). An id
-    /// `>= n_experts` cannot be refused by the host (it lives in device
-    /// memory): the slot's warps return before their first weight load —
-    /// warp-uniform — leaving that slot of `h` untouched.
+    /// The routed experts' gate·up·SwiGLU in one launch (module doc): slot
+    /// `s` against column `s / slots_per_col` of the `m_cols`-column
+    /// activation. An id `>= n_experts` cannot be refused by the host (it
+    /// lives in device memory): the slot's warps return before their first
+    /// weight load — warp-uniform — leaving that slot of `h` untouched.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -47,9 +52,11 @@ mod qwen3moe_expert_kernels {
         requires = (
             wg.len() >= n_experts * rows_per_expert * 36 * n_sb,
             wu.len() >= n_experts * rows_per_expert * 36 * n_sb,
-            q.len() >= 256 * iters,
-            s8.len() >= 8 * n_sb,
-            d8.len() >= 2 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
             sel.len() >= n_slots,
             h.len() >= n_slots * rows_per_expert
         )
@@ -64,6 +71,8 @@ mod qwen3moe_expert_kernels {
         n_experts: u32,
         rows_per_expert: u32,
         n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
         n_sb: u32,
         iters: u32,
         mut h: DisjointSlice<f32>,
@@ -82,13 +91,17 @@ mod qwen3moe_expert_kernels {
             return;
         }
         let row_abs = id * rows_per_expert as usize + row % rows_per_expert as usize;
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let col = slot / slots_per_col as usize;
         let lane = warp::lane_id() as usize;
         // The core's caller contract, from the launch contract: row_abs <
-        // n_experts · rows_per_expert rows of both stacks, column 0 of the
-        // one-column activation, iters = ceil(n_sb/4) from the host, and all
-        // 32 lanes of the warp are here (both returns are warp-uniform).
-        let fg = q4k_row_dot_1col(wg, q, s8, d8, n_sb as usize, iters, row_abs, 0, lane);
-        let fu = q4k_row_dot_1col(wu, q, s8, d8, n_sb as usize, iters, row_abs, 0, lane);
+        // n_experts · rows_per_expert rows of both stacks, column col <
+        // m_cols (slot < n_slots <= m_cols · slots_per_col), iters =
+        // ceil(n_sb/4) from the host, and all 32 lanes of the warp are here
+        // (both returns are warp-uniform).
+        let fg = q4k_row_dot_1col(wg, q, s8, d8, n_sb as usize, iters, row_abs, col, lane);
+        let fu = q4k_row_dot_1col(wu, q, s8, d8, n_sb as usize, iters, row_abs, col, lane);
         let g = warp::reduce_sum_f32(fg);
         let u = warp::reduce_sum_f32(fu);
         if lane == 0 {
@@ -100,19 +113,20 @@ mod qwen3moe_expert_kernels {
         }
     }
 
-    /// The combine, one thread per output value (module doc). `down` is the
-    /// down `_sel` output (slot-major, `n_slots · rows`), `w` the router's
-    /// per-slot weights.
+    /// The combine of `m` tokens, one thread per output value (module doc).
+    /// `down` is the down `_sel` output (per token slot-major, `m · n_slots
+    /// · rows`), `w` the router's per-slot weights (`m · n_slots`), `resid`
+    /// and `y` token-major.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            down.len() >= rows * n_slots,
-            w.len() >= n_slots,
-            resid.len() >= rows,
-            y.len() >= rows
+            down.len() >= rows * n_slots * m,
+            w.len() >= n_slots * m,
+            resid.len() >= rows * m,
+            y.len() >= rows * m
         )
     )]
     pub fn qwen3moe_combine(
@@ -121,18 +135,21 @@ mod qwen3moe_expert_kernels {
         resid: &[f32],
         rows: u32,
         n_slots: u32,
+        m: u32,
         mut y: DisjointSlice<f32>,
     ) {
-        let d = thread::index_1d().get();
-        if d >= rows as usize {
+        let i = thread::index_1d().get();
+        let rows_u = rows as usize;
+        if i >= rows_u * m as usize {
             return;
         }
-        let acc = weighted_expert_sum(down, w, rows, n_slots, 0, d);
-        // SAFETY: d < rows bounds the resid read and the y store by the
+        let t = i / rows_u;
+        let acc = weighted_expert_sum(down, w, rows, n_slots, t, i - t * rows_u);
+        // SAFETY: i < rows·m bounds the resid read and the y store by the
         // launch contract.
         unsafe {
-            let r = *resid.get_unchecked(d);
-            *y.get_unchecked_mut(d) = acc + r;
+            let r = *resid.get_unchecked(i);
+            *y.get_unchecked_mut(i) = acc + r;
         }
     }
 }
@@ -151,6 +168,20 @@ pub struct GateUpArgs<'a> {
     pub h: &'a mut DeviceBuffer<f32>,
 }
 
+/// [`ExpertKernels::enqueue_combine_tokens`]'s arguments: the down outputs
+/// (per token slot-major), the router weights, the residual and the output
+/// (token-major), `rows` values per token, `n_slots` slots per token, `m`
+/// tokens.
+pub struct CombineArgs<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub resid: &'a DeviceBuffer<f32>,
+    pub rows: usize,
+    pub n_slots: usize,
+    pub m: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
 pub struct ExpertKernels {
     module: qwen3moe_expert_kernels::LoadedModule,
@@ -167,8 +198,10 @@ impl ExpertKernels {
 
     /// Enqueue the selected experts' gate·up·SwiGLU: slot `s` writes
     /// `h[s · rows_per_expert ..][..rows_per_expert]` as `silu(gate row) ·
-    /// up row` of expert `sel[s]`, every slot dotting the one quantized
-    /// column of `act`. Asynchronous, allocation-free, capturable.
+    /// up row` of expert `sel[s]`, dotting column `s / (n_slots / act.m())`
+    /// of `act` — its one column, or at `m` columns each token's
+    /// `n_slots / m` slots its own. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_gate_up(&self, stream: &CudaStream, a: GateUpArgs<'_>) -> Result<(), GpuError> {
         let what = "qwen3moe::enqueue_gate_up";
         let GateUpArgs {
@@ -180,11 +213,11 @@ impl ExpertKernels {
             rows_per_expert,
             h,
         } = a;
-        let n_sb = act.n_sb();
-        if act.m() != 1 {
+        let (n_sb, m) = (act.n_sb(), act.m());
+        if n_slots == 0 || !n_slots.is_multiple_of(m) {
             return Err(GpuError::shape(
                 what,
-                format!("one shared input column, got act.m() = {}", act.m()),
+                format!("{n_slots} slots do not split over act.m() = {m} columns"),
             ));
         }
         if wg.cols() != 36 * n_sb || wu.cols() != 36 * n_sb {
@@ -228,7 +261,9 @@ impl ExpertKernels {
         let grid = launch_u32(what, "grid", (n_slots * rows_per_expert).div_ceil(8))?;
         let n_experts = launch_u32(what, "n_experts", wg.rows() / rows_per_expert)?;
         let rows_per_expert = launch_u32(what, "rows_per_expert", rows_per_expert)?;
+        let slots_per_col = launch_u32(what, "slots_per_col", n_slots / m)?;
         let n_slots = launch_u32(what, "n_slots", n_slots)?;
+        let m = launch_u32(what, "m", m)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let prep = self
             .module
@@ -245,6 +280,8 @@ impl ExpertKernels {
             n_experts,
             rows_per_expert,
             n_slots,
+            m,
+            slots_per_col,
             n_sb,
             n_sb.div_ceil(4),
             h,
@@ -252,9 +289,9 @@ impl ExpertKernels {
         Ok(())
     }
 
-    /// Enqueue `y[d] = Σ_s w[s] · down[s · rows + d] + resid[d]` over `rows`
-    /// values and `n_slots` slots (module doc). Asynchronous,
-    /// allocation-free, capturable.
+    /// Enqueue `y[d] = Σ_s w[s] · down[s · rows + d] + resid[d]` over `rows
+    /// = resid.len()` values and `n_slots` slots (module doc): one token.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_combine(
         &self,
         stream: &CudaStream,
@@ -264,33 +301,67 @@ impl ExpertKernels {
         n_slots: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        self.enqueue_combine_tokens(
+            stream,
+            CombineArgs {
+                down,
+                w,
+                resid,
+                rows: resid.len(),
+                n_slots,
+                m: 1,
+                y,
+            },
+        )
+    }
+
+    /// Enqueue the combine of `a.m` tokens (module doc): token `t`'s `rows`
+    /// values from its `n_slots` down rows and weights. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_combine_tokens(
+        &self,
+        stream: &CudaStream,
+        a: CombineArgs<'_>,
+    ) -> Result<(), GpuError> {
         let what = "qwen3moe::enqueue_combine";
-        let rows = resid.len();
+        let CombineArgs {
+            down,
+            w,
+            resid,
+            rows,
+            n_slots,
+            m,
+            y,
+        } = a;
         if rows == 0
             || n_slots == 0
-            || down.len() < rows * n_slots
-            || w.len() < n_slots
-            || y.len() < rows
+            || m == 0
+            || down.len() < rows * n_slots * m
+            || w.len() < n_slots * m
+            || resid.len() < rows * m
+            || y.len() < rows * m
         {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "rows {rows} (resid), n_slots {n_slots}: down.len() {} w.len() {} y.len() {}",
+                    "rows {rows}, n_slots {n_slots}, m {m}: down.len() {} w.len() {} resid.len() \
+                     {} y.len() {}",
                     down.len(),
                     w.len(),
+                    resid.len(),
                     y.len()
                 ),
             ));
         }
+        let grid = launch_u32(what, "grid", (rows * m).div_ceil(256))?;
         let rows = launch_u32(what, "rows", rows)?;
         let n_slots = launch_u32(what, "n_slots", n_slots)?;
-        let prep = self.module.prepare_qwen3moe_combine(LaunchConfig1D::new(
-            rows.div_ceil(256),
-            256,
-            0,
-        ))?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_qwen3moe_combine(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
-            .qwen3moe_combine(stream, &prep, down, w, resid, rows, n_slots, y)?;
+            .qwen3moe_combine(stream, &prep, down, w, resid, rows, n_slots, m, y)?;
         Ok(())
     }
 }

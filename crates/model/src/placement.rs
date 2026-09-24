@@ -1582,3 +1582,59 @@ fn segment_shape(t: &ModelTensor, segments: &[Segment], experts: u64) -> Option<
         lists.join("; ")
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A card running `layers`, with the head and the token embedding as
+    /// given; its byte figures play no part in the stage map.
+    fn card(name: &str, layers: Range<usize>, head: bool, token_embedding: bool) -> Card {
+        Card {
+            name: name.to_string(),
+            usable_bytes: 0,
+            context_bytes: 0,
+            scratch_bytes: 0,
+            margin_bytes: 0,
+            granule_bytes: NonZeroU64::MIN,
+            layers,
+            head,
+            token_embedding,
+        }
+    }
+
+    /// The stage map's token-embedding rule: none, or the one card that runs
+    /// layer 0; a card that does not run it, or a second card, is refused.
+    #[test]
+    fn token_embedding_is_the_layer_0_card_alone() {
+        let map = |embed: [bool; 2]| {
+            Stages::new(
+                8,
+                &[
+                    card("card0", 0..5, false, embed[0]),
+                    card("card1", 5..8, true, embed[1]),
+                ],
+            )
+        };
+        let refused = |embed: [bool; 2]| match map(embed) {
+            Err(PlacementError::Stages(msg)) => msg,
+            Err(e) => panic!("{embed:?}: {e}, want a stage-map refusal"),
+            Ok(_) => panic!("{embed:?}: the stage map was accepted"),
+        };
+        let held = |embed: [bool; 2]| {
+            map(embed)
+                .unwrap_or_else(|e| panic!("{embed:?}: {e}"))
+                .embedding
+        };
+        assert_eq!(held([false, false]), None);
+        assert_eq!(held([true, false]), Some(0));
+        assert_eq!(
+            refused([false, true]),
+            "card card1 holds the token embedding but does not run layer 0"
+        );
+        assert_eq!(
+            refused([true, true]),
+            "2 cards hold the token embedding, not one"
+        );
+    }
+}

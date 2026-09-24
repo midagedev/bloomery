@@ -1129,6 +1129,41 @@ impl<B: ChainBody> GpuModel<B> {
         }
         Ok(())
     }
+
+    /// Run `n` positions as one eager pass the body enqueues itself — `pass`
+    /// gets the stage's parts, the output head and the first position — and
+    /// stand `n` positions on. When `pass` reports that it enqueued the
+    /// head, return the head's token (a blocking read).
+    pub(crate) fn run_rows(
+        &mut self,
+        n: usize,
+        what: &'static str,
+        pass: impl FnOnce(&Gpu, &Weights, &mut B, &mut Head, u32) -> Result<bool, GpuError>,
+    ) -> Result<Option<u32>, GpuError> {
+        if n == 0 || self.stages.len() != 1 || self.stages[0].layers.start != 0 {
+            return Err(GpuError::shape(
+                what,
+                "a pass needs positions and the single whole-model stage",
+            ));
+        }
+        let (pos, n) = (self.pos, crate::launch_u32(what, "positions", n)?);
+        self.check_pos(pos + n - 1, what)?;
+        let GpuModel { head, stages, .. } = self;
+        let head = head
+            .as_mut()
+            .ok_or(GpuError::state(what, "no output head"))?;
+        let Stage { gpu, residency, .. } = &mut stages[0];
+        let Some(Residency { weights, body }) = residency.as_mut() else {
+            return Err(GpuError::state(what, "stage carries no residency"));
+        };
+        let token = if pass(gpu, weights, body, head, pos)? {
+            Some(head.token(gpu)?)
+        } else {
+            None
+        };
+        self.pos = pos + n;
+        Ok(token)
+    }
 }
 
 /// `block_count` of `file`: the layer count.

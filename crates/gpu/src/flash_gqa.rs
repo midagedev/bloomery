@@ -1,15 +1,20 @@
-//! Grouped-query flash attention for one decode position: [`GROUP`] query
-//! heads share one key/value head of [`HEAD`] values, and the cache is a
-//! pair of f16 planes, `[n_kv][ctx][HEAD]` each (the layout
-//! `rope_neox::head_norm_neox_append` writes). The segment + merge shape of
-//! `flash.rs`: the key range is cut into `seg_keys`-key segments, block
-//! `(segment, kv head)` walks its segment for all the group's query heads at
-//! once — one warp per query head over one staging of the K and V tiles —
-//! and writes per head the softmax partials `(max, Σ exp, Σ exp·V)`; the
-//! merge folds a head's segments in ascending order. The segment count
-//! comes from the cache height, so a captured graph's grid is fixed; a
-//! segment wholly past the live key count writes the neutral partial
-//! (`m = −inf`, `s = 0`) and reads no key row.
+//! Grouped-query flash attention for `m` query rows — one decode position,
+//! or the consecutive positions of a prompt chunk: [`GROUP`] query heads
+//! share one key/value head of [`HEAD`] values, and the cache is a pair of
+//! f16 planes, `[n_kv][ctx][HEAD]` each (the layout
+//! `rope_neox::head_norm_neox_append` writes). Row `t` sees the keys below
+//! its own live count `n_keys[t]` — the causal limit of its position. The
+//! segment + merge shape of `flash.rs`: the key range is cut into
+//! `seg_keys`-key segments, block `(segment, kv head, row)` walks its
+//! segment for all the group's query heads of that row at once — one warp
+//! per query head over one staging of the K and V tiles — and writes per
+//! head the softmax partials `(max, Σ exp, Σ exp·V)`; the merge folds a
+//! head's live segments in ascending order. A row's arithmetic does not
+//! depend on `m` or on the other rows: one row is the one-position launch.
+//! The segment count comes from the cache height, so a captured graph's
+//! grid is fixed; a segment wholly past its row's live count writes the
+//! neutral partial (`m = −inf`, `s = 0`) and reads no key row, and the merge
+//! stops at the row's last live segment.
 //!
 //! Reduction structure, the fixed contract of this kernel (reruns and
 //! replays are bit-identical; bit identity with the reference is not
@@ -26,7 +31,7 @@
 //!   a bump;
 //! - lane `l` accumulates dims `4l .. 4l + 3` over a tile's keys ascending,
 //!   one fused multiply-add per key;
-//! - the merge: `flash::online_fold` over the segments ascending, then
+//! - the merge: `flash::online_fold` over the live segments ascending, then
 //!   `r · (1/s)`.
 //!
 //! Two segment passes share everything after the scores (`fold_tile`) and
@@ -107,17 +112,17 @@ pub fn segments_for(ctx: usize) -> usize {
     ctx.max(1).div_ceil(SEG_KEYS)
 }
 
-/// The `Σ exp·V` partials' length for `n_head` query heads over a `ctx`-row
-/// cache.
+/// The `Σ exp·V` partials' length for `m` rows of `n_head` query heads over
+/// a `ctx`-row cache.
 #[must_use]
-pub fn partials_v_len(n_head: usize, ctx: usize) -> usize {
-    n_head * segments_for(ctx) * HEAD
+pub fn partials_v_len(m: usize, n_head: usize, ctx: usize) -> usize {
+    m * n_head * segments_for(ctx) * HEAD
 }
 
 /// The `(max, Σ exp)` partials' length.
 #[must_use]
-pub fn partials_ms_len(n_head: usize, ctx: usize) -> usize {
-    n_head * segments_for(ctx) * 2
+pub fn partials_ms_len(m: usize, n_head: usize, ctx: usize) -> usize {
+    m * n_head * segments_for(ctx) * 2
 }
 
 /// One tile's online-softmax step for warp `w`'s head, lane `lane` holding
@@ -198,11 +203,13 @@ unsafe fn fold_tile(
 mod flash_gqa_kernels {
     use super::*;
 
-    /// The segment pass. Block `b = seg·n_kv + kh` walks keys `[seg ·
-    /// seg_keys, min((seg + 1)·seg_keys, n_keys))` of key head `kh` for query
-    /// heads `kh·GROUP ..`; warp `w` is query head `h = kh·GROUP + w`, whose
-    /// partials land at index `h·segs + seg`. `n_keys` is `n_keys_buf[0]`,
-    /// clamped to `ctx`.
+    /// The segment pass. Block `b = (seg·n_kv + kh)·m + t` walks keys
+    /// `[seg · seg_keys, min((seg + 1)·seg_keys, n_keys))` of key head `kh`
+    /// for row `t`'s query heads `kh·GROUP ..`; warp `w` is query head `h =
+    /// kh·GROUP + w`, whose partials land at index `(t·n_head + h)·segs +
+    /// seg`. `n_keys` is `n_keys_buf[t]`, clamped to `ctx`. The rows of one
+    /// segment are neighbouring blocks, so they read its key rows while they
+    /// are in L2.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -213,12 +220,12 @@ mod flash_gqa_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            n_keys_buf.len() >= 1,
-            q.len() >= n_kv * 8 * 128,
+            n_keys_buf.len() >= m,
+            q.len() >= m * n_kv * 8 * 128,
             kc.len() >= n_kv * ctx * 128,
             vc.len() >= n_kv * ctx * 128,
-            part_v.len() >= n_kv * 8 * segs * 128,
-            part_ms.len() >= n_kv * 8 * segs * 2
+            part_v.len() >= m * n_kv * 8 * segs * 128,
+            part_ms.len() >= m * n_kv * 8 * segs * 2
         )
     )]
     pub fn gqa_flash_seg(
@@ -231,6 +238,7 @@ mod flash_gqa_kernels {
         ctx: u32,
         segs: u32,
         seg_keys: u32,
+        m: u32,
         mut part_v: DisjointSlice<f32>,
         mut part_ms: DisjointSlice<f32>,
     ) {
@@ -242,23 +250,27 @@ mod flash_gqa_kernels {
         let b = thread::blockIdx_x() as usize;
         let nkv = n_kv as usize;
         let n_seg = segs as usize;
-        if b >= nkv * n_seg {
+        let rows = m as usize;
+        if b >= rows * nkv * n_seg {
             return; // block-uniform
         }
-        let seg = b / nkv;
-        let kh = b - seg * nkv;
+        let t = b % rows;
+        let sk = b / rows;
+        let seg = sk / nkv;
+        let kh = sk - seg * nkv;
         let tid = thread::threadIdx_x() as usize;
         let w = tid / 32;
         let lane = warp::lane_id() as usize;
+        let n_head = nkv * GROUP;
         let h = kh * GROUP + w;
-        let idx = h * n_seg + seg;
+        let idx = (t * n_head + h) * n_seg + seg;
         let ctx = ctx as usize;
-        // SAFETY: n_keys_buf.len() >= 1 by the launch contract.
-        let limit = (unsafe { *n_keys_buf.get_unchecked(0) } as usize).min(ctx);
+        // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
+        let limit = (unsafe { *n_keys_buf.get_unchecked(t) } as usize).min(ctx);
         let lo = seg * seg_keys as usize;
         if lo >= limit {
             if lane == 0 {
-                // SAFETY: idx < n_kv·GROUP·segs, both slots inside part_ms.
+                // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
                 unsafe {
                     *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
                     *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
@@ -282,13 +294,13 @@ mod flash_gqa_kernels {
             )
         };
 
-        // The group's query rows: thread `tid` stages values 4·tid .. +3 of
+        // Row t's group query rows: thread `tid` stages values 4·tid .. +3 of
         // the group's 1024.
-        let qb = kh * GROUP * HEAD;
+        let qb = (t * n_head + kh * GROUP) * HEAD;
         let mut i = 0usize;
         while i < 4 {
-            // SAFETY: qb + 4·tid + i < (kh + 1)·1024 <= q.len(); the shared
-            // index 4·tid + i < GROUP·HEAD.
+            // SAFETY: qb + 4·tid + i < (t·n_head + (kh + 1)·GROUP)·HEAD <=
+            // m·n_kv·1024 <= q.len(); the shared index 4·tid + i < GROUP·HEAD.
             unsafe { *qs.add(4 * tid + i) = *q.get_unchecked(qb + 4 * tid + i) };
             i += 1;
         }
@@ -365,7 +377,7 @@ mod flash_gqa_kernels {
             t0 += KEY_TILE;
         }
 
-        // SAFETY: idx < n_kv·GROUP·segs; the four dims 4·lane .. +3 of the
+        // SAFETY: idx < m·n_kv·GROUP·segs; the four dims 4·lane .. +3 of the
         // partial row are this lane's alone, and lane 0 writes (m, s).
         unsafe {
             let o = idx * HEAD + 4 * lane;
@@ -405,12 +417,12 @@ mod flash_gqa_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            n_keys_buf.len() >= 1,
-            q.len() >= n_kv * 8 * 128,
+            n_keys_buf.len() >= m,
+            q.len() >= m * n_kv * 8 * 128,
             kc.len() >= n_kv * ctx * 128,
             vc.len() >= n_kv * ctx * 128,
-            part_v.len() >= n_kv * 8 * segs * 128,
-            part_ms.len() >= n_kv * 8 * segs * 2
+            part_v.len() >= m * n_kv * 8 * segs * 128,
+            part_ms.len() >= m * n_kv * 8 * segs * 2
         )
     )]
     pub fn gqa_flash_seg_mma(
@@ -423,6 +435,7 @@ mod flash_gqa_kernels {
         ctx: u32,
         segs: u32,
         seg_keys: u32,
+        m: u32,
         mut part_v: DisjointSlice<f32>,
         mut part_ms: DisjointSlice<f32>,
     ) {
@@ -434,23 +447,27 @@ mod flash_gqa_kernels {
         let b = thread::blockIdx_x() as usize;
         let nkv = n_kv as usize;
         let n_seg = segs as usize;
-        if b >= nkv * n_seg {
+        let rows = m as usize;
+        if b >= rows * nkv * n_seg {
             return; // block-uniform
         }
-        let seg = b / nkv;
-        let kh = b - seg * nkv;
+        let t = b % rows;
+        let sk = b / rows;
+        let seg = sk / nkv;
+        let kh = sk - seg * nkv;
         let tid = thread::threadIdx_x() as usize;
         let w = tid / 32;
         let lane = warp::lane_id() as usize;
+        let n_head = nkv * GROUP;
         let h = kh * GROUP + w;
-        let idx = h * n_seg + seg;
+        let idx = (t * n_head + h) * n_seg + seg;
         let ctx = ctx as usize;
-        // SAFETY: n_keys_buf.len() >= 1 by the launch contract.
-        let limit = (unsafe { *n_keys_buf.get_unchecked(0) } as usize).min(ctx);
+        // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
+        let limit = (unsafe { *n_keys_buf.get_unchecked(t) } as usize).min(ctx);
         let lo = seg * seg_keys as usize;
         if lo >= limit {
             if lane == 0 {
-                // SAFETY: idx < n_kv·GROUP·segs, both slots inside part_ms.
+                // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
                 unsafe {
                     *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
                     *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
@@ -474,15 +491,16 @@ mod flash_gqa_kernels {
             )
         };
 
-        // The query tile: warp `w` rounds head `w`'s 64 value pairs, two per
-        // lane, and writes the zero rows `8 + w`.
-        let qb = (kh * GROUP + w) * HEAD;
+        // The query tile: warp `w` rounds row t's head `w`'s 64 value pairs,
+        // two per lane, and writes the zero rows `8 + w`.
+        let qb = (t * n_head + kh * GROUP + w) * HEAD;
         let mut i = 0usize;
         while i < 2 {
             let wd = lane + 32 * i;
-            // SAFETY: qb + 2·wd + 1 < (kh·GROUP + w + 1)·HEAD <= q.len(); the
-            // tile words w·MMA_ROW_W + wd and (8 + w)·MMA_ROW_W + wd are
-            // inside QT (wd < 64 < MMA_ROW_W, 8 + w < MMA_ROWS).
+            // SAFETY: qb + 2·wd + 1 < (t·n_head + kh·GROUP + w + 1)·HEAD <=
+            // m·n_kv·1024 <= q.len(); the tile words w·MMA_ROW_W + wd and
+            // (8 + w)·MMA_ROW_W + wd are inside QT (wd < 64 < MMA_ROW_W,
+            // 8 + w < MMA_ROWS).
             unsafe {
                 let lo16 = f32_to_f16_bits(*q.get_unchecked(qb + 2 * wd)) as u32;
                 let hi16 = f32_to_f16_bits(*q.get_unchecked(qb + 2 * wd + 1)) as u32;
@@ -611,41 +629,60 @@ mod flash_gqa_kernels {
         }
     }
 
-    /// The merge: block `h` folds query head `h`'s `segs` partials in
-    /// ascending order through `online_fold`, skipping a neutral one before
-    /// its values are read, and writes `y[h·HEAD + d] = r · (1/s)`, thread
-    /// `d` owning dim `d`.
+    /// The merge: block `b = t·n_head + h` folds row `t`'s query head `h`'s
+    /// partials of the segments that hold its keys — the first
+    /// `ceil(n_keys / seg_keys)` of `segs`, with `n_keys = n_keys_buf[t]`
+    /// clamped to `ctx` as the segment pass clamps it — in ascending order
+    /// through `online_fold`, skipping a neutral one before its values are
+    /// read, and writes `y[(t·n_head + h)·HEAD + d] = r · (1/s)`, thread `d`
+    /// owning dim `d`. A segment past the row's last live one holds the
+    /// neutral partial and is never read.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
     #[kernel]
     #[launch_bounds(128)]
     #[launch_contract(
         domain = 1,
         block = (128, 1, 1),
         requires = (
-            part_v.len() >= n_head * segs * 128,
-            part_ms.len() >= n_head * segs * 2,
-            y.len() >= n_head * 128
+            n_keys_buf.len() >= m,
+            part_v.len() >= m * n_head * segs * 128,
+            part_ms.len() >= m * n_head * segs * 2,
+            y.len() >= m * n_head * 128
         )
     )]
     pub fn gqa_flash_merge(
         part_v: &[f32],
         part_ms: &[f32],
+        n_keys_buf: &[u32],
         n_head: u32,
+        ctx: u32,
         segs: u32,
+        seg_keys: u32,
+        m: u32,
         mut y: DisjointSlice<f32>,
     ) {
-        let h = thread::blockIdx_x() as usize;
-        if h >= n_head as usize {
+        let b = thread::blockIdx_x() as usize;
+        let nh = n_head as usize;
+        if b >= m as usize * nh {
             return; // block-uniform
         }
+        let t = b / nh;
         let d = thread::threadIdx_x() as usize;
         let n_seg = segs as usize;
+        // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
+        let limit = (unsafe { *n_keys_buf.get_unchecked(t) } as usize).min(ctx as usize);
+        let sk = seg_keys as usize;
+        let live = limit.div_ceil(sk).min(n_seg);
         let mut mx = f32::NEG_INFINITY;
         let mut s = 0.0f32;
         let mut acc = 0.0f32;
         let mut j = 0usize;
-        while j < n_seg {
-            let idx = h * n_seg + j;
-            // SAFETY: idx < n_head·segs: both slots inside part_ms.
+        while j < live {
+            let idx = b * n_seg + j;
+            // SAFETY: idx < m·n_head·segs: both slots inside part_ms.
             let (mj, sj) = unsafe {
                 (
                     *part_ms.get_unchecked(2 * idx),
@@ -653,21 +690,22 @@ mod flash_gqa_kernels {
                 )
             };
             if sj != 0.0 {
-                // SAFETY: idx·HEAD + d < n_head·segs·HEAD <= part_v.len().
+                // SAFETY: idx·HEAD + d < m·n_head·segs·HEAD <= part_v.len().
                 let vj = unsafe { *part_v.get_unchecked(idx * HEAD + d) };
                 (mx, s, acc) = online_fold(mx, s, acc, mj, sj, vj);
             }
             j += 1;
         }
-        // SAFETY: h·HEAD + d < n_head·HEAD <= y.len(); thread d owns it.
-        unsafe { *y.get_unchecked_mut(h * HEAD + d) = acc * (1.0 / s) };
+        // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
+        unsafe { *y.get_unchecked_mut(b * HEAD + d) = acc * (1.0 / s) };
     }
 }
 
-/// [`FlashGqaKernels::enqueue`]'s arguments: one position's `n_kv · GROUP`
-/// query rows (roped, unscaled), the layer's two planes of `n_kv · ctx`
-/// rows, the live key count on the device, the partials scratch
-/// ([`partials_v_len`], [`partials_ms_len`]) and the output rows.
+/// [`FlashGqaKernels::enqueue`]'s arguments: `m` rows of `n_kv · GROUP`
+/// query heads (roped, unscaled, token-major), the layer's two planes of
+/// `n_kv · ctx` rows, each row's live key count on the device (`m` of them),
+/// the partials scratch ([`partials_v_len`], [`partials_ms_len`] of `m`
+/// rows) and the output rows, token-major.
 pub struct GqaArgs<'a> {
     pub q: &'a DeviceBuffer<f32>,
     pub kc: &'a DeviceBuffer<u16>,
@@ -676,6 +714,7 @@ pub struct GqaArgs<'a> {
     pub scale: f32,
     pub n_kv: usize,
     pub ctx: usize,
+    pub m: usize,
     pub part_v: &'a mut DeviceBuffer<f32>,
     pub part_ms: &'a mut DeviceBuffer<f32>,
     pub y: &'a mut DeviceBuffer<f32>,
@@ -695,15 +734,15 @@ impl FlashGqaKernels {
         Ok(FlashGqaKernels { module })
     }
 
-    /// Enqueue one position's attention through the pass [`gqa_mma`]
-    /// names. Two launches. Asynchronous, allocation-free, capturable.
+    /// Enqueue `m` rows' attention through the pass [`gqa_mma`] names. Two
+    /// launches. Asynchronous, allocation-free, capturable.
     pub fn enqueue(&self, stream: &CudaStream, args: GqaArgs<'_>) -> Result<(), GpuError> {
         self.enqueue_pass(stream, args, gqa_mma())
     }
 
-    /// Enqueue one position's attention: the segment pass (`n_kv ·
+    /// Enqueue `m` rows' attention: the segment pass (`m · n_kv ·
     /// segments_for(ctx)` blocks; the tensor-core one when `mma`) and the
-    /// merge (`n_kv · GROUP` blocks). Two launches. Asynchronous,
+    /// merge (`m · n_kv · GROUP` blocks). Two launches. Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_pass(
         &self,
@@ -720,26 +759,27 @@ impl FlashGqaKernels {
             scale,
             n_kv,
             ctx,
+            m,
             part_v,
             part_ms,
             y,
         } = args;
-        if n_kv == 0 || ctx == 0 {
+        if n_kv == 0 || ctx == 0 || m == 0 {
             return Err(GpuError::shape(
                 what,
-                format!("need n_kv >= 1 and ctx >= 1, got n_kv={n_kv} ctx={ctx}"),
+                format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
             ));
         }
         let n_head = n_kv * GROUP;
         let segs = segments_for(ctx);
         let lens = [
-            ("q", q.len(), n_head * HEAD),
+            ("q", q.len(), m * n_head * HEAD),
             ("kc", kc.len(), n_kv * ctx * HEAD),
             ("vc", vc.len(), n_kv * ctx * HEAD),
-            ("n_keys", n_keys.len(), 1),
-            ("part_v", part_v.len(), partials_v_len(n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(n_head, ctx)),
-            ("y", y.len(), n_head * HEAD),
+            ("n_keys", n_keys.len(), m),
+            ("part_v", part_v.len(), partials_v_len(m, n_head, ctx)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("y", y.len(), m * n_head * HEAD),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
             return Err(GpuError::shape(
@@ -747,29 +787,36 @@ impl FlashGqaKernels {
                 format!("{name}.len() {got} < {need}"),
             ));
         }
-        let grid = launch_u32(what, "grid", n_kv * segs)?;
+        let grid = launch_u32(what, "grid", m * n_kv * segs)?;
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
         let heads = launch_u32(what, "n_head", n_head)?;
         let n_kv = launch_u32(what, "n_kv", n_kv)?;
         let ctx = launch_u32(what, "ctx", ctx)?;
         let segs = launch_u32(what, "segs", segs)?;
         let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", m)?;
         let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
         if mma {
             let prep = self.module.prepare_gqa_flash_seg_mma(cfg)?;
             self.module.gqa_flash_seg_mma(
-                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, part_v, part_ms,
+                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
+                part_ms,
             )?;
         } else {
             let prep = self.module.prepare_gqa_flash_seg(cfg)?;
             self.module.gqa_flash_seg(
-                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, part_v, part_ms,
+                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
+                part_ms,
             )?;
         }
-        let prep =
-            self.module
-                .prepare_gqa_flash_merge(LaunchConfig1D::new(heads, MERGE_THREADS, 0))?;
-        self.module
-            .gqa_flash_merge(stream, &prep, part_v, part_ms, heads, segs, y)?;
+        let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
+            merge_grid,
+            MERGE_THREADS,
+            0,
+        ))?;
+        self.module.gqa_flash_merge(
+            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, y,
+        )?;
         Ok(())
     }
 }

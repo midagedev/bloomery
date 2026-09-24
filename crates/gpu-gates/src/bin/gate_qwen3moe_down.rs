@@ -16,12 +16,15 @@
 //!    `ffn_moe_topk-L` as `sel`. ik's rule simulated (the f64 dot of the
 //!    dequantized rows with ik's q8_2 reconstruction of each column,
 //!    `ik_q8_2::reconstruct`) against the dump within `F32_TERMS` roundings
-//!    of `Σ|w·x̂|` per output — which proves rows, experts and columns on
-//!    ik's own values. Then ours against ik: the difference the two
-//!    activation quantizations predict, `Σ w·(x̂_ours − x̂_ik)` computed
+//!    of the dot's magnitude per output — which proves rows, experts and
+//!    columns on ik's own values. Then ours against ik: the difference the
+//!    two activation quantizations predict, `Σ w·(x̂_ours − x̂_ik)` computed
 //!    exactly, must match the measured difference within both sides'
-//!    rounding (`F32_TERMS` of `Σ|w·x̂|` each). The plain relative distance
-//!    to ik is printed.
+//!    rounding (`F32_TERMS` of each side's magnitude). The magnitude is
+//!    `Σ|w·x̂|` for a Q6_K stack and `Σ(|d1·q·x̂| + |m1·x̂|)` for a Q4_K one,
+//!    whose dots sum the scale and min terms apart (the gate·up gate's
+//!    bound; the split must reproduce the dequantized row bit for bit). The
+//!    plain relative distance to ik is printed.
 //!
 //! And the kernel as a captured graph: one node, the replay equal to the
 //! eager launch.
@@ -44,7 +47,7 @@ mod gate {
     use bloomery_gpu::q4k_sel::Q4kSelKernels;
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
-    use bloomery_gpu_gates::qwen3moe::sets;
+    use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, activations, bits_equal, bytes_to_words, checks_failed, ik_q8_2,
@@ -161,6 +164,8 @@ mod gate {
         let sets = sets()?;
         let (mut n_tok, mut worst_k, mut worst_sim, mut worst_pred, mut worst_ik) =
             (0usize, 0.0f64, 0.0f64, 0.0f64, 0.0f32);
+        let (mut widen, mut parts_bad) = (0.0f64, 0usize);
+        let (mut dq, mut mn) = (Vec::new(), Vec::new());
         let mut layers = 0usize;
         loop {
             let name = names::ffn_down_exps(layers);
@@ -229,15 +234,31 @@ mod gate {
                         for r in 0..rpe {
                             let wr = &bytes[(e * rpe + r) * rb..(e * rpe + r + 1) * rb];
                             dequant_row(info.ty, wr, &mut row)?;
-                            let (mut dot_o, mut dot_i, mut abs_o, mut abs_i) =
-                                (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                            let q4 = info.ty == GgmlType::Q4_K;
+                            if q4 {
+                                q4k_parts(wr, &mut dq, &mut mn);
+                            }
+                            let (mut dot_o, mut dot_i, mut abs_o, mut abs_i, mut plain) =
+                                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
                             for i in 0..k {
                                 let w = f64::from(row[i]);
+                                let mag = if q4 {
+                                    if (dq[i] - mn[i]).to_bits() != row[i].to_bits() {
+                                        parts_bad += 1;
+                                    }
+                                    f64::from(dq[i]).abs() + f64::from(mn[i]).abs()
+                                } else {
+                                    w.abs()
+                                };
                                 let (a, b) = (f64::from(xo[s * k + i]), f64::from(xi[s * k + i]));
                                 dot_o += w * a;
                                 dot_i += w * b;
-                                abs_o += (w * a).abs();
-                                abs_i += (w * b).abs();
+                                abs_o += mag * a.abs();
+                                abs_i += mag * b.abs();
+                                plain += (w * a).abs();
+                            }
+                            if q4 {
+                                widen = widen.max(abs_o / plain.max(f64::MIN_POSITIVE));
                             }
                             let o = f64::from(ours[s * rpe + r]);
                             let iv = f64::from(ik[s * rpe + r]);
@@ -282,6 +303,13 @@ mod gate {
              predicted quantization difference at {worst_pred:.3} of both bounds; plain ours vs ik rel={worst_ik:.3e} \
              (printed)"
         );
+        let parts_ok = parts_bad == 0;
+        println!(
+            "down tap Q4_K magnitude: Σ(|d1·q·x̂| + |m1·x̂|) over Σ|w·x̂| per output at most {widen:.3} \
+             (printed); the split off the dequantized row on {parts_bad} values (want 0) {}",
+            verdict(parts_ok)
+        );
+        ok &= parts_ok;
         println!("gate_qwen3moe_down: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

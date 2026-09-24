@@ -1,6 +1,6 @@
 //! The instruments a gate drives on the qwen3moe chain: one layer run on its
 //! own from a given input (the teacher-forced arm), and the per-layer copies
-//! of `l_out` the whole chain leaves when asked.
+//! of the output residual the whole chain leaves when asked.
 
 use super::body::Body;
 use super::dispatch;
@@ -39,12 +39,12 @@ impl GpuModel<Body> {
             ));
         }
         body.s.x.copy_from_host(stream, x_in)?;
-        dispatch::enqueue_layer(gpu, w, body, slot, false)?;
+        dispatch::enqueue_layer(gpu, w, body, slot, false, None)?;
         let s = &body.s;
         Ok(LayerRun {
             ffn_inp: s.ffn_inp.to_host_vec(stream)?,
             ids: s.route.ids.to_host_vec(stream)?,
-            l_out: s.l_out.to_host_vec(stream)?,
+            l_out: s.x.to_host_vec(stream)?,
         })
     }
 
@@ -72,12 +72,12 @@ impl GpuModel<Body> {
         Ok(LayerRun {
             ffn_inp: s.ffn_inp.to_host_vec(stream)?,
             ids: s.route.ids.to_host_vec(stream)?,
-            l_out: s.l_out.to_host_vec(stream)?,
+            l_out: s.x.to_host_vec(stream)?,
         })
     }
 
-    /// Keep (or stop keeping) a copy of every layer's `l_out` after each
-    /// layer of the chain. Switches the model to eager mode: the copies are
+    /// Keep (or stop keeping) a copy of every layer's output residual after
+    /// each layer of the chain. Switches the model to eager mode: the copies are
     /// read by [`GpuModel::layer_taps`] after an eager step.
     pub fn set_layer_taps(&mut self, on: bool) -> Result<(), GpuError> {
         self.set_mode(StepMode::Eager);
@@ -85,7 +85,7 @@ impl GpuModel<Body> {
         body.set_taps(gpu.stream(), on)
     }
 
-    /// Every layer's `l_out` from the last step, layer by layer.
+    /// Every layer's output residual from the last step, layer by layer.
     pub fn layer_taps(&mut self) -> Result<Vec<Vec<f32>>, GpuError> {
         let what = "qwen3moe::layer_taps";
         let (gpu, _, body) = self.body_parts(what)?;

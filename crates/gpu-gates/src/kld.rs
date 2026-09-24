@@ -535,6 +535,155 @@ pub fn compare(p: &Record<'_>, q: &Record<'_>) -> PosDiff {
     }
 }
 
+/// The model side of an engine-against-ik perplexity run over a
+/// [`KldBase`]: back to position 0, one id fed at the next position, and the
+/// logits that step left, one per vocabulary entry.
+pub trait PplModel {
+    fn reset(&mut self) -> Result<(), GateError>;
+    fn step(&mut self, token: u32) -> Result<(), GateError>;
+    fn logits(&mut self) -> Result<Vec<f32>, GateError>;
+}
+
+/// What [`score_ppl`] measured over every scored position of a base.
+pub struct PplScore {
+    /// Positions scored.
+    pub n: usize,
+    /// The engine's perplexity and ik's over those positions.
+    pub ppl_ours: f64,
+    pub ppl_ik: f64,
+    /// `d = NLL_ours − NLL_ik` per position: its mean, the mean's standard
+    /// error, and its standard deviation.
+    pub mean_d: f64,
+    pub se_d: f64,
+    pub sd_d: f64,
+    /// KLD(ik‖ours) per position: its mean and the mean's standard error.
+    pub kld: f64,
+    pub kld_se: f64,
+    /// Positions whose top id is ik's.
+    pub same_top: usize,
+    /// The rms over positions of the engine's top1 − top2 logit margin minus
+    /// ik's log-probability margin.
+    pub sigma_rel: f64,
+    /// Wall seconds of the run.
+    pub secs: f64,
+}
+
+impl PplScore {
+    /// The relative perplexity change, `exp(mean d) − 1`.
+    pub fn dppl(&self) -> f64 {
+        self.mean_d.exp() - 1.0
+    }
+}
+
+/// The top two of `v` by (value desc, id asc): ids and values.
+pub fn top2(v: &[f32]) -> (usize, f32, usize, f32) {
+    let ahead = |a: usize, b: usize| v[a] > v[b] || (v[a] == v[b] && a < b);
+    let (mut best, mut second) = (0usize, usize::MAX);
+    for i in 1..v.len() {
+        if ahead(i, best) {
+            second = best;
+            best = i;
+        } else if second == usize::MAX || ahead(i, second) {
+            second = i;
+        }
+    }
+    (best, v[best], second, v[second])
+}
+
+/// Score `m` against `base`: every chunk from position 0, its ids fed one
+/// position at a time as ik evaluated them, and at each position ik recorded:
+/// the engine's NLL of the next id (log-softmax in f64), KLD(ik‖ours) over the
+/// vocabulary, the top id and the top-two margin against the record's. Prints
+/// a line per chunk. An engine whose logits are not one per vocabulary entry
+/// of the base is an error.
+pub fn score_ppl(base: &KldBase, m: &mut impl PplModel) -> Result<PplScore, GateError> {
+    let n_vocab = base.n_vocab();
+    let t = std::time::Instant::now();
+    let (mut n, mut sd, mut sd2) = (0usize, 0.0f64, 0.0f64);
+    let (mut nll_o, mut nll_i, mut kld, mut kld2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut same_top, mut dm2) = (0usize, 0.0f64);
+    let mut lq = vec![0.0f64; n_vocab];
+    for c in 0..base.n_chunk() {
+        let toks = base
+            .chunk_tokens(c)
+            .ok_or_else(|| format!("chunk {c} has no ids"))?
+            .to_vec();
+        m.reset()?;
+        for (pos, &tok) in toks.iter().enumerate().take(base.n_ctx() - 1) {
+            m.step(tok)?;
+            let Some(rec) = base.record(c, pos) else {
+                continue;
+            };
+            let logits = m.logits()?;
+            if logits.len() != n_vocab {
+                return Err(format!("{} logits, the vocabulary {n_vocab}", logits.len()).into());
+            }
+            let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+            let lse = f64::from(mx)
+                + logits
+                    .iter()
+                    .map(|&v| (f64::from(v) - f64::from(mx)).exp())
+                    .sum::<f64>()
+                    .ln();
+            for (q, &v) in lq.iter_mut().zip(&logits) {
+                *q = f64::from(v) - lse;
+            }
+            let no = -lq[rec.next as usize];
+            let ni = rec.nll();
+            let d = no - ni;
+            n += 1;
+            sd += d;
+            sd2 += d * d;
+            nll_o += no;
+            nll_i += ni;
+            let mut k = 0.0f64;
+            let (mut top_i, mut best_i, mut second_i) =
+                (0usize, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for (i, lp) in rec.log_probs().enumerate() {
+                let lp = f64::from(lp);
+                k += lp.exp() * (lp - lq[i]);
+                if lp > best_i {
+                    second_i = best_i;
+                    (top_i, best_i) = (i, lp);
+                } else if lp > second_i {
+                    second_i = lp;
+                }
+            }
+            kld += k;
+            kld2 += k * k;
+            let (a, av, _, bv) = top2(&logits);
+            same_top += usize::from(a == top_i);
+            let dm = f64::from(av - bv) - (best_i - second_i);
+            dm2 += dm * dm;
+        }
+        let nf = n as f64;
+        println!(
+            "ppl chunk {c}: {n} positions, mean d {:+.5}, ppl ours {:.4} ik {:.4}, {:.0} s",
+            sd / nf,
+            (nll_o / nf).exp(),
+            (nll_i / nf).exp(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let nf = n as f64;
+    let mean = sd / nf;
+    let var = (sd2 / nf - mean * mean).max(0.0) * nf / (nf - 1.0);
+    let kmean = kld / nf;
+    Ok(PplScore {
+        n,
+        ppl_ours: (nll_o / nf).exp(),
+        ppl_ik: (nll_i / nf).exp(),
+        mean_d: mean,
+        se_d: (var / nf).sqrt(),
+        sd_d: var.sqrt(),
+        kld: kmean,
+        kld_se: ((kld2 / nf - kmean * kmean).max(0.0) / (nf - 1.0)).sqrt(),
+        same_top,
+        sigma_rel: (dm2 / nf).sqrt(),
+        secs: t.elapsed().as_secs_f64(),
+    })
+}
+
 /// A run's result line: the last line of `tools/ref/ik-ppl.sh`'s log that
 /// opens with `ppl tag=<tag> `, read field by field (`key=value`, space
 /// separated).
