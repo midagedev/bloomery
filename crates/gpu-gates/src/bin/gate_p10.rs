@@ -777,7 +777,7 @@ fn kid_q5_0_sel_row(t: &Table<'_>, rows: &mut Vec<KidRow>) -> Result<(), GateErr
     let x = activations(k, SEL.len(), seed);
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
     let mut act = Q8Blocks32::new(stream, k, SEL.len())?;
-    q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act, t.gpu.unlabelled_sink())?;
     let sel_dev = DeviceBuffer::from_host(stream, &SEL)?;
     let kid = kid_q5_0_sel(t, res, &rref, &act, &sel_dev, rpe)?;
     record(
@@ -996,7 +996,7 @@ fn kid_q5_1(
     let x = activations(k, m, seed);
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
     let mut act = Q8Blocks32::new(stream, k, m)?;
-    q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act, t.gpu.unlabelled_sink())?;
     stream.synchronize()?;
     let run =
         |w: &DeviceTensor<u32>, y: &mut DeviceBuffer<f32>| -> Result<(), bloomery_gpu::GpuError> {

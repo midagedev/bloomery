@@ -1043,6 +1043,7 @@ mod gate {
             hp.rms_eps,
             &mut op.act_x,
             &mut op.x,
+            gpu.layer_sink(l)?,
         )?;
         op.router.enqueue_router(
             stream,
@@ -1051,6 +1052,7 @@ mod gate {
             f32_buf(w, &names::exp_probs_b(l))?,
             hp.experts.routed_scale,
             &mut op.rout,
+            gpu.layer_sink(l)?,
         )?;
         let ids = op.rout.ids.to_host_vec(stream)?;
         let weights = op.rout.weights.to_host_vec(stream)?;
@@ -1133,6 +1135,7 @@ mod gate {
             x: streams,
             tokens: 1,
             rms_eps: hp.rms_eps,
+            fault: gpu.layer_sink(l)?,
         };
         op.hc.enqueue_pre(
             stream,

@@ -48,7 +48,7 @@ use bloomery_gpu::q8f32::f32_lane_partial_1col_w32;
 /// ik's expert score in f32; the gate's host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
 use bloomery_gpu::route_core::{renorm_divisor, take};
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32, q8_1_quant_block};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::vector::{U32x4, as_vectors};
@@ -143,7 +143,8 @@ mod dflash_kernels {
 
     /// q8_1 activations for `m_cols` columns of `256 · n_sb` values at base
     /// `x0`: `q3k_quantize_q8_1`'s body — one warp per 128-value block, the
-    /// engine's rule and its five buffers — without `Q8Act`'s column cap.
+    /// engine's rule and its five buffers, a non-finite value raising
+    /// [`FaultSite::QuantColumn`] on `fault` — without `Q8Act`'s column cap.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -174,6 +175,7 @@ mod dflash_kernels {
         mut q6: DisjointSlice<u32>,
         mut s8: DisjointSlice<i32>,
         mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         let blk = thread::index_1d().get() / 32;
         let n_sb = n_sb as usize;
@@ -199,6 +201,8 @@ mod dflash_kernels {
             &mut q6,
             &mut s8,
             &mut d8,
+            fault,
+            FaultSite::QuantColumn,
         );
     }
 
@@ -496,6 +500,7 @@ mod dflash_kernels {
         mut ids: DisjointSlice<u32>,
         mut weights: DisjointSlice<f32>,
         mut done: DisjointSlice<u32>,
+        fault: FaultSink,
     ) {
         static mut SCORE: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
         static mut SEL_V: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
@@ -616,6 +621,12 @@ mod dflash_kernels {
                     taken |= 1 << (bi as usize / 32);
                 }
                 if lane == 0 {
+                    // The winner of every round is warp-uniform; a winner
+                    // that is not finite means fewer finite candidates than
+                    // slots (`crate::router`'s rule), and lane 0 raises.
+                    if !bv.is_finite() {
+                        fault.raise(FaultSite::Router);
+                    }
                     // SAFETY: block-shared, bi < N_EXPERT (every candidate is
                     // one of a lane's own entries), written before the barrier.
                     let p = unsafe { *score.add(bi as usize) };
@@ -642,9 +653,13 @@ mod dflash_kernels {
                     // SAFETY: block-shared, s < N_USED, this lane's own write.
                     let p = unsafe { *slot_p.add(s) };
                     let v = if norm != 0 { p / sum } else { p };
+                    let wt = v * scale;
+                    if !wt.is_finite() {
+                        fault.raise(FaultSite::Router);
+                    }
                     // SAFETY: s0 + s < 3·tok + 3 <= weights.len() by the launch
                     // contract; lane 0 is the only writer.
-                    unsafe { *weights.get_unchecked_mut(s0 + s) = v * scale };
+                    unsafe { *weights.get_unchecked_mut(s0 + s) = wt };
                     s += 1;
                 }
                 // SAFETY: `ticket` is done[0], inside `done` by the launch
@@ -824,6 +839,8 @@ pub struct RouterArgs<'a> {
     pub norm: bool,
     /// The token's row in the output.
     pub tok: usize,
+    /// Where a selection the router cannot make is raised.
+    pub fault: FaultSink,
 }
 
 /// One gate·up·SwiGLU launch ([`DraftExpertKernels::enqueue_gate_up`]).
@@ -872,13 +889,14 @@ impl DraftExpertKernels {
     }
 
     /// Enqueue the q8_1 quantization of `act.n_cols()` columns of
-    /// `act.k()` values, `x` column-major (`x[c · k + i]`). Asynchronous,
-    /// allocation-free, capturable.
+    /// `act.k()` values, `x` column-major (`x[c · k + i]`); a non-finite
+    /// value raises `fault`. Asynchronous, allocation-free, capturable.
     pub fn enqueue_quantize(
         &self,
         stream: &CudaStream,
         x: &DeviceBuffer<f32>,
         act: &mut MxAct,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let what = "DraftExpertKernels::enqueue_quantize";
         let (n_cols, k) = (act.n_cols, act.k);
@@ -907,6 +925,7 @@ impl DraftExpertKernels {
             &mut act.q6,
             &mut act.s8,
             &mut act.d8,
+            fault,
         )?;
         Ok(())
     }
@@ -1092,6 +1111,7 @@ impl DraftExpertKernels {
             &mut out.ids,
             &mut out.weights,
             &mut out.done,
+            a.fault,
         )?;
         Ok(())
     }

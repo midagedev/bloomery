@@ -1398,6 +1398,7 @@ mod gate {
                         selected: selected.then_some(SelectedRows {
                             rows: &launch.list,
                             stride,
+                            fault: cx.gpu.unlabelled_sink(),
                         }),
                         vis: &vis,
                         sinks: &sinks_dev,

@@ -5,6 +5,7 @@
 //! the load-time weight repack, the activation scratch and the enqueue API.
 
 use crate::GpuError;
+use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::launch_u32;
 use crate::q8_1_quant_block;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -279,7 +280,8 @@ pub(crate) fn q5_row_dot(
 /// the block's scale and byte sum are 1-2-4 xor butterflies inside that
 /// octet — masks that never cross an octet, so a partial last group is safe.
 /// Lanes past the last block read the final block's values (full-warp
-/// shuffles, in bounds) and store nothing.
+/// shuffles, in bounds) and store nothing. A lane that reads a non-finite
+/// value raises [`FaultSite::Q5Quant`] on `fault`; the stores are unchanged.
 ///
 /// Lives outside the `#[cuda_module]` for the reason the cores above do: a
 /// device-callable body shared by two kernels. It takes the module's
@@ -304,6 +306,7 @@ pub(crate) unsafe fn q5_quant_group(
     q: &mut DisjointSlice<u32>,
     s8: &mut DisjointSlice<i32>,
     d8: &mut DisjointSlice<f32>,
+    fault: FaultSink,
 ) {
     let oct = lane >> 3; // block within the group (0..4)
     let i = lane & 7; // word within the block (0..8)
@@ -323,6 +326,9 @@ pub(crate) unsafe fn q5_quant_group(
             *x.get_unchecked(base + 3),
         )
     };
+    if !quad_finite([v0, v1, v2, v3]) {
+        fault.raise(FaultSite::Q5Quant);
+    }
     // Octet amax (masks 1, 2, 4 stay inside the octet).
     let lmax = v0.abs().max(v1.abs()).max(v2.abs()).max(v3.abs());
     let mut amax = lmax;
@@ -397,6 +403,7 @@ mod q5_kernels {
         mut q: DisjointSlice<u32>,
         mut s8: DisjointSlice<i32>,
         mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         // One 32-thread block per four 32-value quant blocks: grp is the
         // GROUP index (global tid / 32), not the thread id.
@@ -413,7 +420,7 @@ mod q5_kernels {
         // preconditions, and the group index is warp-uniform.
         unsafe {
             q5_quant_group(
-                x, col, g, k_blocks, q_stride, lane, &mut q, &mut s8, &mut d8,
+                x, col, g, k_blocks, q_stride, lane, &mut q, &mut s8, &mut d8, fault,
             )
         }
     }
@@ -471,6 +478,7 @@ mod q5_kernels {
         mut q6b: DisjointSlice<u32>,
         mut s8b: DisjointSlice<i32>,
         mut d8b: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         let blk = thread::index_1d().get() / 32;
         let total_a = m_a as usize * n_groups as usize;
@@ -488,14 +496,27 @@ mod q5_kernels {
             if blk < total_a {
                 let (col, g) = (blk / n_groups as usize, blk % n_groups as usize);
                 q5_quant_group(
-                    xa, col, g, k_blocks, q_stride, lane, &mut qa, &mut s8a, &mut d8a,
+                    xa, col, g, k_blocks, q_stride, lane, &mut qa, &mut s8a, &mut d8a, fault,
                 );
             } else {
                 let k = blk - total_a;
                 let (col, b) = (k / (2 * n_sb), k % (2 * n_sb));
                 q8_1_quant_block(
-                    xb, 0, col, b, n_sb, half_it, quad_it, lane, &mut q3b, &mut q4b, &mut q6b,
-                    &mut s8b, &mut d8b,
+                    xb,
+                    0,
+                    col,
+                    b,
+                    n_sb,
+                    half_it,
+                    quad_it,
+                    lane,
+                    &mut q3b,
+                    &mut q4b,
+                    &mut q6b,
+                    &mut s8b,
+                    &mut d8b,
+                    fault,
+                    FaultSite::QuantColumn,
                 );
             }
         }
@@ -992,12 +1013,13 @@ impl Q5Kernels {
     }
 
     /// Enqueue the q8 quantization of `x` — `act.m()` columns of `act.k()`
-    /// f32, concatenated — into `act`.
+    /// f32, concatenated — into `act`. A non-finite value raises `fault`.
     pub fn enqueue_quantize_q8(
         &self,
         stream: &CudaStream,
         x: &DeviceBuffer<f32>,
         act: &mut Q8Blocks32,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let (m, k_blocks, q_stride) = (act.m(), act.k() / 32, act.q_stride());
         if x.len() < m * k_blocks * 32 {
@@ -1031,6 +1053,7 @@ impl Q5Kernels {
             &mut act.q,
             &mut act.s8,
             &mut act.d8,
+            fault,
         )?;
         Ok(())
     }
@@ -1040,6 +1063,8 @@ impl Q5Kernels {
     /// The bytes are the ones `enqueue_quantize_q8(xa, a)` and
     /// `Gpu::enqueue_quantize_q8_1(xb, b)` write, so the two sources must
     /// not alias and the caller must have enqueued both producers first.
+    /// A non-finite value in either raises `fault` (the q5 arm as
+    /// [`FaultSite::Q5Quant`], the q8_1 arm as [`FaultSite::QuantColumn`]).
     /// Asynchronous, allocation-free, capturable.
     pub(crate) fn enqueue_quantize_q8_pair(
         &self,
@@ -1048,6 +1073,7 @@ impl Q5Kernels {
         a: &mut Q8Blocks32,
         xb: &DeviceBuffer<f32>,
         b: &mut crate::tensor::Q8Act,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let (m_a, k_blocks, q_stride) = (a.m(), a.k() / 32, a.q_stride());
         if xa.len() < m_a * k_blocks * 32 {
@@ -1105,6 +1131,7 @@ impl Q5Kernels {
             &mut b.q6,
             &mut b.s8,
             &mut b.d8,
+            fault,
         )?;
         Ok(())
     }

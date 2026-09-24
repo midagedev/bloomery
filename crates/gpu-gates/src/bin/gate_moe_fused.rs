@@ -323,7 +323,8 @@ fn run() -> Result<(), GateError> {
         gpu.enqueue_gemv_q3k_sel(wu, act, sel, n_used, ff, up_y)?;
         gpu.elem()
             .enqueue_swiglu(stream, gate_y, up_y, n_used * ff, h_op)?;
-        gpu.q5().enqueue_quantize_q8(stream, h_op, act32_op)?;
+        gpu.q5()
+            .enqueue_quantize_q8(stream, h_op, act32_op, gpu.unlabelled_sink())?;
         gpu.q5()
             .enqueue_gemv_q5_0_sel(stream, wd, act32_op, sel, n_used, rows, down_op)?;
         gpu.elem()
@@ -360,7 +361,8 @@ fn run() -> Result<(), GateError> {
         y_fu: &mut DeviceBuffer<f32>,
     ) -> Result<(), bloomery_gpu::GpuError> {
         moe.enqueue_expert_gate_up_swiglu(stream, wg, wu, act, sel, n_used, ff, h_fu)?;
-        gpu.q5().enqueue_quantize_q8(stream, h_fu, act32_fu)?;
+        gpu.q5()
+            .enqueue_quantize_q8(stream, h_fu, act32_fu, gpu.unlabelled_sink())?;
         gpu.q5()
             .enqueue_gemv_q5_0_sel(stream, wd, act32_fu, sel, n_used, rows, down_fu)?;
         moe.enqueue_moe_combine(

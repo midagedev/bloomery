@@ -18,6 +18,7 @@
 
 use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale, q4k_scale_min};
+use crate::fault::FaultSink;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -680,6 +681,88 @@ mod elem_kernels {
         }
     }
 
+    /// [`argmax`], and the fault word next to the token: thread 0 writes the
+    /// index to `out[0]` and the word as it stands to `out[1]`, so the head's
+    /// one readback carries both. Every launch before this one on the stream
+    /// has finished raising, so the copy is the step's whole fault.
+    #[kernel]
+    #[launch_bounds(1024)]
+    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n, out.len() >= 2))]
+    pub fn argmax_fault(x: &[f32], n: u32, fault: FaultSink, mut out: DisjointSlice<u32>) {
+        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
+        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+
+        // SAFETY: both arrays are this block's own shared allocations; the
+        // raw form is the only way to reach them without a reference to a
+        // `static mut`.
+        let (bv, bi) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+            )
+        };
+        // SAFETY: bv and bi are this block's ARGMAX_WARPS-slot shared arrays,
+        // and x.len() >= n by the launch contract, so element i*1 + 0 of
+        // every i < n is inside x.
+        let fi = unsafe { argmax_block(x, n, 1, 0, bv, bi) };
+        if thread::threadIdx_x() == 0 {
+            let word = fault.read();
+            // SAFETY: out.len() >= 2 by the launch contract; only thread 0
+            // writes.
+            unsafe {
+                *out.get_unchecked_mut(0) = fi;
+                *out.get_unchecked_mut(1) = word;
+            }
+        }
+    }
+
+    /// [`argmax_rows`], and the fault word after the tokens: block 0's
+    /// thread 0 also writes the word to `out[m]`, as [`argmax_fault`] does.
+    #[kernel]
+    #[launch_bounds(1024)]
+    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n * m, out.len() >= m + 1))]
+    pub fn argmax_rows_fault(
+        x: &[f32],
+        n: u32,
+        m: u32,
+        fault: FaultSink,
+        mut out: DisjointSlice<u32>,
+    ) {
+        static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
+        static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+
+        let c = thread::blockIdx_x();
+        if c >= m {
+            return;
+        }
+        // SAFETY: both arrays are this block's own shared allocations; the
+        // raw form is the only way to reach them without a reference to a
+        // `static mut`.
+        let (bv, bi) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_V),
+                SharedArray::as_raw_mut_ptr(&raw mut BEST_I),
+            )
+        };
+        // SAFETY: bv and bi are this block's shared arrays, and element
+        // i*m + c of every i < n is below n*m <= x.len() because c < m.
+        let fi = unsafe { argmax_block(x, n, m, c, bv, bi) };
+        if thread::threadIdx_x() == 0 {
+            // SAFETY: c < m < out.len(); block c's thread 0 alone writes it.
+            unsafe {
+                *out.get_unchecked_mut(c as usize) = fi;
+            }
+            if c == 0 {
+                let word = fault.read();
+                // SAFETY: m < out.len() by the launch contract; block 0's
+                // thread 0 alone writes it.
+                unsafe {
+                    *out.get_unchecked_mut(m as usize) = word;
+                }
+            }
+        }
+    }
+
     /// The argmax of `x[i·stride + col]` for `i < n`, as [`argmax`] documents
     /// its walk, meaningful on thread 0 of the block; every thread of the
     /// block must call it (it holds a block barrier).
@@ -1136,6 +1219,69 @@ impl ElemKernels {
             self.module
                 .prepare_argmax_rows(LaunchConfig1D::new(m, ARGMAX_THREADS_U32, 0))?;
         self.module.argmax_rows(stream, &prep, x, n, m, out)?;
+        Ok(())
+    }
+
+    /// [`Self::enqueue_argmax`] into `out[0]` with the fault word `fault`
+    /// addresses copied to `out[1]` — the head's readback of token and fault
+    /// in one copy. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_argmax_fault(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        fault: FaultSink,
+        out: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        if n == 0 || x.len() < n || out.len() < 2 {
+            return Err(GpuError::shape(
+                "enqueue_argmax_fault",
+                format!(
+                    "n={n}, x.len() {}, out.len() {} (need 2)",
+                    x.len(),
+                    out.len()
+                ),
+            ));
+        }
+        let n = launch_u32("enqueue_argmax_fault", "n", n)?;
+        let prep =
+            self.module
+                .prepare_argmax_fault(LaunchConfig1D::new(1, ARGMAX_THREADS_U32, 0))?;
+        self.module.argmax_fault(stream, &prep, x, n, fault, out)?;
+        Ok(())
+    }
+
+    /// [`Self::enqueue_argmax_rows`] into `out[..m]` with the fault word
+    /// copied to `out[m]`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_argmax_rows_fault(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        m: usize,
+        fault: FaultSink,
+        out: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_argmax_rows_fault";
+        if n == 0 || m == 0 || x.len() < n * m || out.len() < m + 1 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "n={n} m={m}, x.len() {}, out.len() {} (need m+1)",
+                    x.len(),
+                    out.len()
+                ),
+            ));
+        }
+        // The walk indexes i*m + c in u32.
+        launch_u32(what, "n*m", n * m)?;
+        let n = launch_u32(what, "n", n)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep =
+            self.module
+                .prepare_argmax_rows_fault(LaunchConfig1D::new(m, ARGMAX_THREADS_U32, 0))?;
+        self.module
+            .argmax_rows_fault(stream, &prep, x, n, m, fault, out)?;
         Ok(())
     }
 }

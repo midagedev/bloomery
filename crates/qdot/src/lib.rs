@@ -514,9 +514,9 @@ unsafe fn v_nearest_int(y: __m256) -> __m256i {
     }
 }
 
-/// Reduce lanes to the `as i8` wrap range [-128, 127]. In-domain codes never
-/// reach the wrap (|iscale * v| and |v * id| stay under 127.5 before
-/// rounding); the ±inf/NaN products of an overflowing scale extract to
+/// Reduce lanes to the `as i8` wrap range [-128, 127] — the q8_K encoder's.
+/// In-domain codes never reach the wrap (|iscale * v| stays under 127.5
+/// before rounding); the ±inf/NaN products of an overflowing scale extract to
 /// -2^22, whose low byte the scalar cast drops to 0 — the wrap reproduces
 /// that, where a saturating pack alone would emit -128.
 ///
@@ -918,6 +918,21 @@ fn bf16_bits_to_f32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
+/// The q8_2 block's code multiplier from its bf16 scale bits: `1/d`, and 0
+/// where `d` is 0 or `1/d` overflows (a block whose scale is at or below
+/// about 2^-128 flushes to zero codes and a zero sum). Codes are `nearest_int(v
+/// * id)` saturated to i8, the sum over the unsaturated ints, which is ik's
+/// x86 rule (`_mm256_cvtps_epi32` then the saturating packs): with a normal
+/// `d` the bf16 round-down is at most 2^-8 relative and every code stays in
+/// ±127, but a subnormal `d` keeps fewer bits and `v * id` reaches 128 —
+/// saturated to 127, not wrapped to -128 (`hw_q82_codes_at_bf16_round_down`).
+#[inline(always)]
+fn q82_inverse(t: u16) -> f32 {
+    let d = bf16_bits_to_f32(t);
+    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+    if id.is_finite() { id } else { 0.0 }
+}
+
 /// Quantizes activations into Q8_2_X4 column layout.
 ///
 /// Leftover blocks past 128-multiples are stored as standard 36-byte block_q8_2.
@@ -937,15 +952,14 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
                 amax = amax.max(v.abs());
             }
             let t = fp32_to_bf16_bits(amax / 127.0);
-            let d = bf16_bits_to_f32(t);
             group[2 * ir..2 * ir + 2].copy_from_slice(&t.to_le_bytes());
-            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let id = q82_inverse(t);
             let qs = &mut group[16 + 32 * ir..16 + 32 * ir + 32];
             let mut isum = 0i32;
             for (m, &v) in xb.iter().enumerate() {
-                let q = nearest_int(v * id) as i8;
-                qs[m] = q as u8;
-                isum += q as i32;
+                let q = nearest_int(v * id);
+                qs[m] = q.clamp(-128, 127) as i8 as u8;
+                isum += q;
             }
             group[8 + 2 * ir..8 + 2 * ir + 2].copy_from_slice(&(isum as i16).to_le_bytes());
         }
@@ -960,15 +974,14 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
             amax = amax.max(v.abs());
         }
         let b = fp32_to_bf16_bits(amax / 127.0);
-        let d = bf16_bits_to_f32(b);
         tb[0..2].copy_from_slice(&b.to_le_bytes());
-        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let id = q82_inverse(b);
         let qs = &mut tb[4..36];
         let mut isum = 0i32;
         for (m, &v) in xb.iter().enumerate() {
-            let q = nearest_int(v * id) as i8;
-            qs[m] = q as u8;
-            isum += q as i32;
+            let q = nearest_int(v * id);
+            qs[m] = q.clamp(-128, 127) as i8 as u8;
+            isum += q;
         }
         tb[2..4].copy_from_slice(&(isum as i16).to_le_bytes());
     }
@@ -976,11 +989,10 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
 
 /// One 32-value block of the q8_2 family: (codes, bf16 d bits, i16 isum),
 /// byte-identical to the scalar loops in `quantize_q82x4_col`. `v * id` is a
-/// plain multiply (no FMA); codes carry no clamp — the scalar's bare `as i8`
-/// and the wrap-then-pack here agree because bf16's round-down is at most
-/// 2^-8 relative, keeping |v * id| < 127.5 before rounding, while the
-/// ±inf/NaN products of an overflowing id wrap to 0 through
-/// [`v_nearest_int`] + [`v_wrap_i8`].
+/// plain multiply (no FMA); `id` is [`q82_inverse`]'s, so every product is
+/// finite and [`v_nearest_int`] exact; the codes are the saturating packs of
+/// the unsaturated ints — the scalar's clamp — and the sum is over those
+/// ints, as the scalar's.
 ///
 /// # Safety
 /// AVX2 must be available on the target; `x` is the fixed 32-value block.
@@ -1006,18 +1018,16 @@ unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
         }
         // The bf16 scale round-trip stays scalar: one conversion per block.
         let t = fp32_to_bf16_bits(amax / 127.0);
-        let d = bf16_bits_to_f32(t);
-        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-        let idv = _mm256_set1_ps(id);
+        let idv = _mm256_set1_ps(q82_inverse(t));
         let mut qi = [_mm256_setzero_si256(); 4];
         for (j, q) in qi.iter_mut().enumerate() {
             // SAFETY: 8-lane load at 8*j <= 24, inside the block.
             let v = _mm256_loadu_ps(x.as_ptr().add(8 * j));
             let y = _mm256_mul_ps(v, idv);
-            *q = v_wrap_i8(v_nearest_int(y));
+            *q = v_nearest_int(y);
         }
-        // In-order i32 -> i8: two packs plus the 32-lane fixup; lanes are
-        // already in i8 range, so the saturating packs are identity.
+        // In-order i32 -> i8: two saturating packs plus the 32-lane fixup;
+        // the saturation is the scalar's clamp.
         let p0 = _mm256_packs_epi32(qi[0], qi[1]);
         let p1 = _mm256_packs_epi32(qi[2], qi[3]);
         let c = _mm256_packs_epi16(p0, p1);
@@ -1025,7 +1035,7 @@ unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
         let mut codes = [0u8; 32];
         // SAFETY: 32-byte store into the local 32-byte array.
         _mm256_storeu_si256(codes.as_mut_ptr() as *mut __m256i, c);
-        // i32 sum of the 32 wrapped codes; exact in any order at these
+        // i32 sum of the 32 unsaturated ints; exact in any order at these
         // magnitudes, then the scalar's `as i16`.
         let isum = hsum_i32(_mm256_add_epi32(
             _mm256_add_epi32(qi[0], qi[1]),

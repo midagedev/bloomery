@@ -2327,3 +2327,163 @@ fn f16_scales_bit_identical_kernel_vs_mirror() {
         }
     }
 }
+
+// ------------------------------------------------ q8_2 code range (bf16 scale)
+
+/// ik's x86 q8_2_x4 rule for one 32-value block (`quantize_row_q8_1_x4_T` with
+/// `block_q8_2`): `d = bf16(amax / 127)` rounded to nearest even, `id = 1/d`
+/// (0 when `d` is 0), each code `round_half_even(v * id)` converted to i32 and
+/// packed to i8 with signed saturation (`_mm256_packs_epi32/16`), the sum the
+/// unsaturated i32 codes' taken to i16. `None` where `1/d` overflows, which ik
+/// turns into integer-indefinite codes and this crate's encoders flush to zero.
+fn ik_q82_block(x: &[f32]) -> Option<([i8; 32], u16, i16)> {
+    let amax = x.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    let u = (amax / 127.0).to_bits();
+    let t = (u.wrapping_add(0x7fff + ((u >> 16) & 1)) >> 16) as u16;
+    let d = f32::from_bits(u32::from(t) << 16);
+    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+    if !id.is_finite() {
+        return None;
+    }
+    let mut codes = [0i8; 32];
+    let mut isum = 0i32;
+    for (c, &v) in codes.iter_mut().zip(x) {
+        let q = (v * id).round_ties_even() as i32;
+        *c = q.clamp(-128, 127) as i8;
+        isum = isum.wrapping_add(q);
+    }
+    Some((codes, t, isum as i16))
+}
+
+/// The q8_2 encoders' bytes for one column, split per block: (codes, d bits,
+/// isum), the x4 groups' layout (d at 2i, isum at 8 + 2i, codes at 16 + 32i)
+/// then the 36-byte tail blocks'.
+fn q82_blocks(col: &[u8], n_blocks: usize) -> Vec<([i8; 32], u16, i16)> {
+    const STRIDE: usize = 144;
+    const TAIL: usize = 36;
+    let nb4 = 4 * (n_blocks / 4);
+    let le16 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+    let codes = |b: &[u8]| std::array::from_fn(|i| b[i] as i8);
+    (0..n_blocks)
+        .map(|b| {
+            if b < nb4 {
+                let (g, ir) = (&col[b / 4 * STRIDE..], b % 4);
+                (
+                    codes(&g[16 + 32 * ir..]),
+                    le16(&g[2 * ir..]),
+                    le16(&g[8 + 2 * ir..]) as i16,
+                )
+            } else {
+                let tb = &col[nb4 / 4 * STRIDE + (b - nb4) * TAIL..];
+                (codes(&tb[4..]), le16(tb), le16(&tb[2..]) as i16)
+            }
+        })
+        .collect()
+}
+
+/// The q8_2 encoders (scalar and AVX2) against ik's rule where the bf16 scale
+/// rounds down hardest. For a normal scale the round-down is at most 2^-8
+/// relative — at a binade's bottom with a tie, `amax = 127·(1 + 2^-8)·2^e`,
+/// `d = 2^e` and `amax·id = 127.49609375` — so every code stays in ±127: the
+/// wrap the scalar's `as i8` would do is unreachable there, swept over every
+/// exponent a normal scale takes. Below that, where `amax / 127` is a
+/// subnormal (`amax < 127·2^-126`), bf16 keeps fewer bits: at `2^-127` the
+/// round-down reaches 2^-7, `amax·id` reaches 127.99 and rounds to 128, which
+/// ik saturates to 127 — the encoders must too, not wrap it to -128. Where
+/// `1/d` overflows (`amax/127` at or below about `2^-128`) the encoders flush
+/// the block to zero codes and a zero sum (ik's integer-indefinite codes carry
+/// no value either); that regime is asserted as the flush.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_q82_codes_at_bf16_round_down() {
+    assert!(
+        supports(GgmlType::Q5_0),
+        "the gate compares the AVX2 encoder with the scalar one; this CPU has no AVX2"
+    );
+    // Normal scales: the tie at every binade bottom, then a dense random
+    // sweep of amax values.
+    let mut normal: Vec<f32> = (-126..=120)
+        .map(|e| 127.0 * (1.0 + 2f32.powi(-8)) * 2f32.powi(e))
+        .collect();
+    let mut s = 0x1234_5678u32;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    for _ in 0..4000 {
+        // Random exponent in the normal-scale range, random mantissa.
+        let e = (next() % 246) as i32 - 126;
+        let m = 1.0 + (next() >> 8) as f32 / (1u32 << 24) as f32;
+        normal.push(127.0 * m * 2f32.powi(e));
+    }
+    // Subnormal scales with a finite inverse: amax / 127 in [2^-127, 2^-126).
+    let lo = 2f32.powi(-127);
+    let mut subnormal = vec![127.0 * lo * (1.0 + 2f32.powi(-7))];
+    for _ in 0..2000 {
+        let f = (next() >> 8) as f32 / (1u32 << 24) as f32;
+        subnormal.push(127.0 * lo * (1.0 + f));
+    }
+    // Overflowing inverses.
+    let flush: Vec<f32> = [2f32.powi(-128), 2f32.powi(-130), 2f32.powi(-133)]
+        .iter()
+        .map(|&a| 127.0 * a)
+        .collect();
+
+    // Each amax becomes one block: ±amax at the ends, fractions between.
+    let block = |amax: f32| -> [f32; 32] {
+        std::array::from_fn(|i| match i {
+            0 => amax,
+            1 => -amax,
+            2 => 0.0,
+            _ => amax * ((i as f32 - 16.0) / 16.5),
+        })
+    };
+    let mut checked = [0usize; 3];
+    let mut max_code = 0i32;
+    for (regime, amaxes) in [&normal, &subnormal, &flush].into_iter().enumerate() {
+        for chunk in amaxes.chunks(5) {
+            // Five blocks: one x4 group and one tail block (Q5_0's columns
+            // are whole 32-value blocks; its activation is the same q8_2_x4
+            // encoder as Q4_K's).
+            let x: Vec<f32> = chunk.iter().flat_map(|&a| block(a)).collect();
+            let k = x.len();
+            let mut avx = vec![0u8; col_bytes(GgmlType::Q5_0, k)];
+            let mut sca = vec![0u8; col_bytes(GgmlType::Q5_0, k)];
+            quantize_col(GgmlType::Q5_0, &x, &mut avx);
+            quantize_col_scalar(GgmlType::Q5_0, &x, &mut sca);
+            assert_eq!(
+                avx, sca,
+                "regime {regime}: AVX2 and scalar bytes differ at {chunk:?}"
+            );
+            for (b, got) in q82_blocks(&avx, chunk.len()).into_iter().enumerate() {
+                let xb = &x[32 * b..32 * b + 32];
+                match (regime, ik_q82_block(xb)) {
+                    (2, None) => {
+                        assert!(
+                            got.0.iter().all(|&c| c == 0) && got.2 == 0,
+                            "amax {:e}: an overflowing inverse must flush the block, got {got:?}",
+                            chunk[b]
+                        );
+                    }
+                    (_, Some(want)) => {
+                        assert_eq!(got, want, "regime {regime}: amax {:e}", chunk[b]);
+                        if regime == 0 {
+                            let m = got.0.iter().map(|&c| i32::from(c).abs()).max().unwrap_or(0);
+                            assert!(m <= 127, "amax {:e}: code {m} past 127", chunk[b]);
+                            max_code = max_code.max(m);
+                        }
+                    }
+                    (r, None) => panic!("regime {r}: amax {:e} overflows its inverse", chunk[b]),
+                }
+                checked[regime] += 1;
+            }
+        }
+    }
+    println!(
+        "q8_2 code range: {} normal-scale blocks (max |code| {max_code}), {} subnormal-scale blocks \
+         saturated as ik's, {} overflowing-inverse blocks flushed; AVX2 bytes == scalar bytes",
+        checked[0], checked[1], checked[2]
+    );
+}

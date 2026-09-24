@@ -12,8 +12,14 @@
 //! buffer is exposed mutable so the assembly round can have the last block's
 //! residual store write straight into it, and `set_input` is the gate's way
 //! in.
+//!
+//! The argmax also carries the card's fault word (crate::fault) out: the
+//! readback buffer holds the `m` tokens and then the word, one copy, and a
+//! raised word turns the readback into [`GpuError::Fault`] instead of a
+//! token.
 
 use crate::GpuError;
+use crate::fault::{Fault, LAYER_HEAD};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, Graph};
@@ -80,6 +86,7 @@ pub struct Head {
     normed: DeviceBuffer<f32>,
     act: Q8Act,
     logits: DeviceBuffer<f32>,
+    /// The `m` argmax tokens, then the fault word as the argmax found it.
     token_out: DeviceBuffer<u32>,
 }
 
@@ -123,7 +130,7 @@ impl Head {
             normed: DeviceBuffer::zeroed(stream, m * hidden)?,
             act: Q8Act::with_k(stream, m, hidden)?,
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
-            token_out: DeviceBuffer::from_host(stream, &vec![0u32; m])?,
+            token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 1])?,
             graph: None,
         })
     }
@@ -158,9 +165,9 @@ impl Head {
     }
 
     /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
-    /// → gemv_q6k → argmax (`argmax_rows` when `m > 1`). Pure enqueues — no
-    /// allocation, no synchronization — so the same body is what `capture`
-    /// records.
+    /// → gemv_q6k → argmax (`argmax_rows` when `m > 1`), the argmax copying
+    /// the fault word after the tokens. Pure enqueues — no allocation, no
+    /// synchronization — so the same body is what `capture` records.
     pub fn enqueue(&mut self, gpu: &Gpu, w: &Weights) -> Result<(), GpuError> {
         let stream = gpu.stream();
         gpu.elem().enqueue_rms_norm(
@@ -172,17 +179,24 @@ impl Head {
             self.m,
             &mut self.normed,
         )?;
-        gpu.enqueue_quantize_q8_1(&self.normed, &mut self.act)?;
+        gpu.enqueue_quantize_q8_1_head(&self.normed, &mut self.act)?;
         gpu.enqueue_gemv_q6k(head_out_w(w)?.0, &self.act, &mut self.logits)?;
+        let fault = gpu.fault_sink(LAYER_HEAD);
         if self.m == 1 {
-            gpu.elem()
-                .enqueue_argmax(stream, &self.logits, self.n_vocab, &mut self.token_out)?;
+            gpu.elem().enqueue_argmax_fault(
+                stream,
+                &self.logits,
+                self.n_vocab,
+                fault,
+                &mut self.token_out,
+            )?;
         } else {
-            gpu.elem().enqueue_argmax_rows(
+            gpu.elem().enqueue_argmax_rows_fault(
                 stream,
                 &self.logits,
                 self.n_vocab,
                 self.m,
+                fault,
                 &mut self.token_out,
             )?;
         }
@@ -246,13 +260,26 @@ impl Head {
     }
 
     /// The argmax token of the last run's first row: a blocking read — the
-    /// decode step's single synchronize-shaped retrieval.
+    /// decode step's single synchronize-shaped retrieval. A fault raised by
+    /// any launch before the argmax is [`GpuError::Fault`], not a token.
     pub fn token(&self, gpu: &Gpu) -> Result<u32, GpuError> {
-        Ok(self.token_out.to_host_vec(gpu.stream())?[0])
+        Ok(self.tokens(gpu)?[0])
     }
 
-    /// The argmax tokens of the last run, one per row. Blocking read.
+    /// The argmax tokens of the last run, one per row. Blocking read; a
+    /// raised fault word is [`GpuError::Fault`], as [`Head::token`].
     pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
-        Ok(self.token_out.to_host_vec(gpu.stream())?)
+        let mut out = self.token_out.to_host_vec(gpu.stream())?;
+        let word = out.pop().ok_or(GpuError::state(
+            "Head::tokens",
+            "the readback buffer holds no fault word",
+        ))?;
+        if let Some(fault) = Fault::from_word(word) {
+            return Err(GpuError::Fault {
+                what: "Head::tokens",
+                fault,
+            });
+        }
+        Ok(out)
     }
 }

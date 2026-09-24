@@ -31,6 +31,7 @@ use std::sync::Arc;
 pub mod arch;
 pub mod cores;
 pub mod elem;
+pub mod fault;
 pub mod flash;
 pub mod flash_gqa;
 pub mod fused;
@@ -54,6 +55,7 @@ pub mod router;
 pub(crate) mod tensor;
 pub mod weights;
 
+pub use fault::{FAULT_NONE, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
 pub use graph::{Graph, NodeInfo};
 pub use model::GpuModel;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
@@ -125,6 +127,14 @@ pub enum GpuError {
     /// wait and refuses to serve again, so the model is unusable, not the
     /// call's arguments wrong.
     Protocol { what: &'static str, detail: String },
+    /// A kernel raised the card's fault word (crate::fault): an input it has
+    /// no defined answer for, at `fault`'s layer and site. The step that
+    /// read it back returned no token, and the state it wrote — caches,
+    /// rings — holds what the fault condemned.
+    Fault { what: &'static str, fault: Fault },
+    /// A model refused a step because an earlier step raised `fault`; its
+    /// state is condemned until a `reset`.
+    Poisoned { what: &'static str, fault: Fault },
 }
 
 impl GpuError {
@@ -209,6 +219,12 @@ impl std::fmt::Display for GpuError {
             GpuError::Plan { what, source } => write!(f, "{what}: {source}"),
             GpuError::UnsupportedArch(name) => write!(f, "unsupported architecture {name:?}"),
             GpuError::Protocol { what, detail } => write!(f, "{what}: {detail}"),
+            GpuError::Fault { what, fault } => write!(f, "{what}: device fault at {fault}"),
+            GpuError::Poisoned { what, fault } => write!(
+                f,
+                "{what}: the model is poisoned by an earlier device fault at {fault}; reset() \
+                 clears it"
+            ),
         }
     }
 }
@@ -268,6 +284,12 @@ impl From<::model::ModelError> for GpuError {
 /// device-callable body. It is not in `cores` because its stores need the
 /// module's `DisjointSlice` outputs, which no core takes.
 ///
+/// A block holding a non-finite value has no q8_1 form (its NaN lanes would
+/// round to code 0 and nothing downstream could tell): the lane that holds
+/// one raises `site` on `fault`, and the block is still stored — the codes
+/// of a finite block are what they always were, and a faulted step is
+/// refused before anything reads them.
+///
 /// SAFETY: the caller guarantees `col < m_cols`, `b < 2 * n_sb`, the launch
 /// contract's bounds on `x` at base `x0` and on the five outputs, and that
 /// all 32 lanes of one warp enter with the same `(col, b)` — the collectives
@@ -291,6 +313,8 @@ pub fn q8_1_quant_block(
     q6: &mut DisjointSlice<u32>,
     s8: &mut DisjointSlice<i32>,
     d8: &mut DisjointSlice<f32>,
+    fault: FaultSink,
+    site: FaultSite,
 ) {
     // Lane covers the four consecutive values 4*lane .. 4*lane+3 of the
     // block; the warp max over the four per-lane maxima is the block amax
@@ -307,6 +331,9 @@ pub fn q8_1_quant_block(
             *x.get_unchecked(base + 3),
         ]
     };
+    if !crate::fault::quad_finite(v) {
+        fault.raise(site);
+    }
     // SAFETY: this fn's own contract gives `col < m_cols`, `b < 2*n_sb`, the
     // output bounds and the warp-uniform `(col, b)` that
     // [`q8_1_quant_vals`] requires, and `v` holds exactly its values
@@ -474,6 +501,7 @@ mod kernels {
         mut q6: DisjointSlice<u32>,
         mut s8: DisjointSlice<i32>,
         mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         // One 32-thread block per 128-value quant block: blk is the BLOCK
         // index (global tid / 32), not the thread id.
@@ -504,6 +532,8 @@ mod kernels {
             &mut q6,
             &mut s8,
             &mut d8,
+            fault,
+            FaultSite::QuantColumn,
         );
     }
 
@@ -558,6 +588,7 @@ mod kernels {
         mut q6b: DisjointSlice<u32>,
         mut s8b: DisjointSlice<i32>,
         mut d8b: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         let blk = thread::index_1d().get() / 32;
         let n_sb = n_sb as usize;
@@ -587,6 +618,8 @@ mod kernels {
                 &mut q6a,
                 &mut s8a,
                 &mut d8a,
+                fault,
+                FaultSite::QuantColumn,
             );
         } else {
             let k = blk - total;
@@ -605,6 +638,8 @@ mod kernels {
                 &mut q6b,
                 &mut s8b,
                 &mut d8b,
+                fault,
+                FaultSite::QuantColumn,
             );
         }
     }
@@ -1442,7 +1477,18 @@ pub struct Gpu {
     router: router::RouterKernels,
     fused: fused::FusedKernels,
     moe_fused: moe_fused::MoeFusedKernels,
+    /// The fault word (crate::fault): the allocation's first u32,
+    /// [`FAULT_NONE`] while clean. Every launch on this context's stream that
+    /// can refuse its input carries a [`FaultSink`] over it.
+    fault: DeviceBuffer<u32>,
 }
+
+/// The fault word's allocation, in u32s: one whole 2 MiB allocation granule.
+/// A smaller allocation would open, before any model loads, the shared
+/// granule a load's small buffers are planned into (`model::placement`'s
+/// heap), and every card's planned rounding would be one granule off what the
+/// load then takes.
+const FAULT_ALLOC_WORDS: usize = (2 << 20) / 4;
 
 impl Gpu {
     /// `with_device(0)`: under the box environment device 0 is the dev card.
@@ -1469,10 +1515,95 @@ impl Gpu {
             router: router::RouterKernels::load(&ctx)?,
             fused: fused::FusedKernels::load(&ctx)?,
             moe_fused: moe_fused::MoeFusedKernels::load(&ctx)?,
+            fault: DeviceBuffer::from_host(&stream, &vec![FAULT_NONE; FAULT_ALLOC_WORDS])?,
             ctx,
             stream,
             module,
         })
+    }
+
+    /// The sink a launch of `layer` raises into: this context's fault word.
+    /// [`LAYER_HEAD`] for the output head, [`LAYER_NONE`] for a launch no
+    /// layer owns; a model layer comes through [`Gpu::layer_sink`], which
+    /// checks that the word can carry it.
+    #[must_use]
+    pub(crate) fn fault_sink(&self, layer: u32) -> FaultSink {
+        // SAFETY: the word is this Gpu's own device allocation, alive as long
+        // as the Gpu — whose stream every launch carrying the sink runs on,
+        // and which outlives every graph captured there (a graph drops
+        // before the buffers it addresses).
+        unsafe { FaultSink::new(self.fault.cu_deviceptr() as *mut u32, layer) }
+    }
+
+    /// The sink of a launch no layer owns — a gate's direct launch: its
+    /// fault reads as [`LAYER_NONE`].
+    #[must_use]
+    pub fn unlabelled_sink(&self) -> FaultSink {
+        self.fault_sink(LAYER_NONE)
+    }
+
+    /// [`Gpu::fault_sink`] for model layer `layer`: a layer index the word
+    /// cannot carry (at or past [`LAYER_HEAD`]) is refused, not wrapped into
+    /// another layer's code.
+    pub fn layer_sink(&self, layer: usize) -> Result<FaultSink, GpuError> {
+        match u32::try_from(layer) {
+            Ok(l) if l < LAYER_HEAD => Ok(self.fault_sink(l)),
+            _ => Err(GpuError::shape(
+                "Gpu::layer_sink",
+                format!("layer {layer} does not fit the fault word (layers below {LAYER_HEAD})"),
+            )),
+        }
+    }
+
+    /// The fault the word holds, if any: a blocking read on the engine
+    /// stream, so it sees every launch enqueued before it.
+    pub fn fault(&self) -> Result<Option<Fault>, GpuError> {
+        self.ctx.bind_to_thread()?;
+        let mut word = FAULT_NONE;
+        // SAFETY: the source is the word, the first u32 of this Gpu's own
+        // live allocation; the destination is `word`, four bytes that outlive
+        // the copy because the stream is synchronized before it goes out of
+        // scope; this context is current on the calling thread (bound above).
+        let rc = unsafe {
+            cuda_core::sys::cuMemcpyDtoHAsync_v2(
+                (&raw mut word).cast(),
+                self.fault.cu_deviceptr(),
+                std::mem::size_of::<u32>(),
+                self.stream.cu_stream(),
+            )
+        };
+        graph::cu(rc, "cuMemcpyDtoHAsync_v2 (fault word)")?;
+        self.stream.synchronize()?;
+        Ok(Fault::from_word(word))
+    }
+
+    /// Put the word back to [`FAULT_NONE`], in stream order: every launch
+    /// enqueued before this may still raise into the word it clears, every
+    /// launch after it starts clean. Never inside a capture.
+    pub fn clear_fault(&self) -> Result<(), GpuError> {
+        self.ctx.bind_to_thread()?;
+        // SAFETY: the word is one u32 of this Gpu's own live allocation, the
+        // stream handle is this Gpu's engine stream, and this context is
+        // current on the calling thread (bound above); the memset is ordered
+        // on that stream like every launch that touches the word.
+        let rc = unsafe {
+            cuda_core::sys::cuMemsetD32Async(
+                self.fault.cu_deviceptr(),
+                FAULT_NONE,
+                1,
+                self.stream.cu_stream(),
+            )
+        };
+        graph::cu(rc, "cuMemsetD32Async")?;
+        Ok(())
+    }
+
+    /// [`Gpu::fault`], then [`Gpu::clear_fault`]: what a gate that planted
+    /// a fault reads, leaving the word clean for its next case.
+    pub fn take_fault(&self) -> Result<Option<Fault>, GpuError> {
+        let f = self.fault()?;
+        self.clear_fault()?;
+        Ok(f)
     }
 
     /// `with_device` on the one visible CUDA device whose name contains
@@ -1601,7 +1732,29 @@ impl Gpu {
         x: &DeviceBuffer<f32>,
         act: &mut Q8Act,
     ) -> Result<(), GpuError> {
-        self.enqueue_quantize_q8_1_at(x, 0, act)
+        self.quantize_q8_1_at(x, 0, act, self.unlabelled_sink())
+    }
+
+    /// [`Gpu::enqueue_quantize_q8_1`] for a launch of model layer `layer`:
+    /// a non-finite value raises the fault word with that layer.
+    pub fn enqueue_quantize_q8_1_layer(
+        &self,
+        x: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+        layer: usize,
+    ) -> Result<(), GpuError> {
+        let sink = self.layer_sink(layer)?;
+        self.quantize_q8_1_at(x, 0, act, sink)
+    }
+
+    /// The head's quantization: [`Gpu::enqueue_quantize_q8_1`] raising with
+    /// [`LAYER_HEAD`].
+    pub(crate) fn enqueue_quantize_q8_1_head(
+        &self,
+        x: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        self.quantize_q8_1_at(x, 0, act, self.fault_sink(LAYER_HEAD))
     }
 
     /// Enqueue the q8_1 quantization of `x[x0 .. x0 + m*k]` (`m = act.m()`
@@ -1614,6 +1767,17 @@ impl Gpu {
         x: &DeviceBuffer<f32>,
         x0: usize,
         act: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        self.quantize_q8_1_at(x, x0, act, self.unlabelled_sink())
+    }
+
+    /// The one launcher of `q3k_quantize_q8_1`, raising into `fault`.
+    fn quantize_q8_1_at(
+        &self,
+        x: &DeviceBuffer<f32>,
+        x0: usize,
+        act: &mut Q8Act,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let m = act.m();
         let n_sb = act.n_sb();
@@ -1654,6 +1818,7 @@ impl Gpu {
             &mut act.q6,
             &mut act.s8,
             &mut act.d8,
+            fault,
         )?;
         Ok(())
     }
@@ -1720,6 +1885,7 @@ impl Gpu {
             &mut b.q6,
             &mut b.s8,
             &mut b.d8,
+            self.unlabelled_sink(),
         )?;
         Ok(())
     }

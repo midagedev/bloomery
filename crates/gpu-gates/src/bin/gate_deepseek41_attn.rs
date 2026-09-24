@@ -61,8 +61,11 @@
 //! counts or the lists); a depth case per compressed source that the sets
 //! cannot reach — a full ring and compressed keys over many segments, the
 //! last one partial, and for the selected rows list entries past the count
-//! that name NaN rows and one entry past the stream — against our rule with
-//! the model's sinks; and every entry compiled with no local depot. Every
+//! that name NaN rows — against our rule with the model's sinks; the same
+//! selected list with one visible entry naming the row just past the stream,
+//! which the kernel must refuse by raising its fault (`FaultSite::AttnSel`),
+//! not read as a plausible row; and every entry compiled with no local
+//! depot. Every
 //! partial and output buffer is NaN before each launch, so a slot a kernel
 //! fails to write is caught too.
 //!
@@ -84,7 +87,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE};
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT, SelectedRows};
     use bloomery_gpu_gates::oracle::{Set, for_arch};
     use bloomery_gpu_gates::{
@@ -143,8 +146,8 @@ mod gate {
     const DEPTH_COMP_VISIBLE: usize = 8 * attn::SEG_KEYS - 7;
     const DEPTH_COMP_ROWS: usize = 9 * attn::SEG_KEYS;
     const DEPTH_SEL_STRIDE: usize = 8 * attn::SEG_KEYS + 5;
-    /// The selected-row depth case's visible entry that names a row past
-    /// the stream, which the kernel reads as the stream's last row.
+    /// The visible entry the past-stream case plants: it names row
+    /// `DEPTH_COMP_ROWS`, the first row past the stream.
     const DEPTH_PAST_ENTRY: usize = 100;
     /// The ik builds, by `# build` (the part before any `-`), whose T = 1
     /// index branch hands each thread's run of heads the sinks of the first
@@ -307,7 +310,14 @@ mod gate {
             );
             for l in 0..set.ratios.len() {
                 let case = layer_case(man, &split, set, l)?;
-                let (pass, t1) = check_layer(&kernels, stream, set, &case, &mut max)?;
+                let (pass, t1) = check_layer(
+                    &kernels,
+                    stream,
+                    gpu.unlabelled_sink(),
+                    set,
+                    &case,
+                    &mut max,
+                )?;
                 ok &= pass;
                 tally[0] += 1;
                 tally[1] += usize::from(case.path != IkPath::Generic);
@@ -333,12 +343,27 @@ mod gate {
             return Err("no layer of a batch set reads a compressed stream".into());
         };
         ok &= graph_replay(&gpu, &kernels, &infos[gs], &case, &t1)?;
-        ok &= depth_case(&kernels, stream, &infos[gs], &case, &mut max)?;
+        ok &= depth_case(
+            &kernels,
+            stream,
+            gpu.unlabelled_sink(),
+            &infos[gs],
+            &case,
+            &mut max,
+        )?;
         let Some((ss, sel_case)) = sel_layer else {
             return Err("no layer of a decode-step set reads selected rows".into());
         };
         ok &= sel_graph_replay(&gpu, &kernels, &infos[ss], &sel_case)?;
-        ok &= sel_depth_case(&kernels, stream, &infos[ss], &sel_case, &mut max)?;
+        ok &= sel_depth_case(
+            &kernels,
+            stream,
+            gpu.unlabelled_sink(),
+            &infos[ss],
+            &sel_case,
+            &mut max,
+        )?;
+        ok &= sel_past_stream_case(&kernels, &gpu, &infos[ss], &sel_case)?;
 
         let (g, i) = (&max.generic, &max.iqk);
         println!(
@@ -1056,7 +1081,11 @@ mod gate {
         if let Some(c) = comp {
             let height = c.len() / LATENT;
             for j in 0..count {
-                let r = sel.map_or(j, |(s, k)| (s[t * k + j] as usize).min(height - 1));
+                let r = sel.map_or(j, |(s, k)| s[t * k + j] as usize);
+                assert!(
+                    r < height,
+                    "keys_of: entry {r} names no row of a stream of {height}"
+                );
                 keys.push(&c[r * LATENT..(r + 1) * LATENT]);
             }
         }
@@ -1255,10 +1284,12 @@ mod gate {
         part_v: DeviceBuffer<f32>,
         part_ms: DeviceBuffer<f32>,
         y: DeviceBuffer<f32>,
+        /// Where the selected-row entry raises a list entry past the stream.
+        fault: FaultSink,
     }
 
     impl Launch {
-        fn new(stream: &CudaStream, i: &Inputs<'_>) -> Result<Launch, GateError> {
+        fn new(stream: &CudaStream, i: &Inputs<'_>, fault: FaultSink) -> Result<Launch, GateError> {
             let heads = i.sinks.len();
             let comp = i
                 .comp
@@ -1292,6 +1323,7 @@ mod gate {
                     &vec![f32::NAN; attn::partials_ms_len(rows, segs)],
                 )?,
                 y: DeviceBuffer::from_host(stream, &vec![f32::NAN; rows * LATENT])?,
+                fault,
             })
         }
 
@@ -1321,6 +1353,7 @@ mod gate {
                     selected: self.sel.as_ref().map(|(rows, stride)| SelectedRows {
                         rows,
                         stride: *stride,
+                        fault: self.fault,
                     }),
                     vis: &self.vis,
                     sinks: &self.sinks,
@@ -1401,6 +1434,7 @@ mod gate {
     fn t1_runs(
         kernels: &AttnKernels,
         stream: &CudaStream,
+        fault: FaultSink,
         set: &SetInfo,
         case: &LayerCase,
         y: &[f32],
@@ -1410,7 +1444,7 @@ mod gate {
         let mut same = true;
         if set.tokens > 1 {
             for t in 0..set.tokens {
-                let y1 = Launch::new(stream, &case.inputs(set, t, 1))?
+                let y1 = Launch::new(stream, &case.inputs(set, t, 1), fault)?
                     .run(kernels, stream, set.scale)?;
                 same &= bits_equal(&y1, &y[t * per_token..(t + 1) * per_token]);
                 t1.push(y1);
@@ -1425,6 +1459,7 @@ mod gate {
     fn check_layer(
         kernels: &AttnKernels,
         stream: &CudaStream,
+        fault: FaultSink,
         set: &SetInfo,
         case: &LayerCase,
         max: &mut Maxima,
@@ -1434,10 +1469,10 @@ mod gate {
             IkPath::Generic => (IK_SIM_BAND, IK_BAND),
             IkPath::Iqk | IkPath::IqkT1 => (IQK_SIM_BAND, IQK_BAND),
         };
-        let mut launch = Launch::new(stream, &case.inputs(set, 0, set.tokens))?;
+        let mut launch = Launch::new(stream, &case.inputs(set, 0, set.tokens), fault)?;
         let y = launch.run(kernels, stream, set.scale)?;
         let rerun = bits_equal(&y, &launch.run(kernels, stream, set.scale)?);
-        let (t1_same, t1) = t1_runs(kernels, stream, set, case, &y)?;
+        let (t1_same, t1) = t1_runs(kernels, stream, fault, set, case, &y)?;
 
         let sim_rel = max_rel_err(&ik_sim, &case.dump)?;
         let rule_rel = max_rel_err(&ours, &ik_sim)?;
@@ -1524,7 +1559,7 @@ mod gate {
     ) -> Result<bool, GateError> {
         let stream = gpu.stream();
         let per_token = set.heads * LATENT;
-        let mut launch = Launch::new(stream, &case.inputs(set, 0, 1))?;
+        let mut launch = Launch::new(stream, &case.inputs(set, 0, 1), gpu.unlabelled_sink())?;
         let graph = gpu.capture(|_s| launch.enqueue(kernels, stream, set.scale))?;
         let mut same = 0;
         for (t, want) in t1.iter().enumerate() {
@@ -1585,7 +1620,7 @@ mod gate {
             (list.clone(), 0),
         ];
         let base = case.inputs(set, 0, 1);
-        let mut launch = Launch::new(stream, &base)?;
+        let mut launch = Launch::new(stream, &base, gpu.unlabelled_sink())?;
         let graph = gpu.capture(|_s| launch.enqueue(kernels, stream, set.scale))?;
         let mut same = 0;
         for (l, c) in &variants {
@@ -1597,6 +1632,7 @@ mod gate {
                     vis: &vis,
                     ..base
                 },
+                gpu.unlabelled_sink(),
             )?
             .run(kernels, stream, set.scale)?;
             let (sel_buf, _) = launch
@@ -1647,6 +1683,7 @@ mod gate {
     fn depth_case(
         kernels: &AttnKernels,
         stream: &CudaStream,
+        fault: FaultSink,
         set: &SetInfo,
         case: &LayerCase,
         max: &mut Maxima,
@@ -1679,7 +1716,7 @@ mod gate {
             tokens: 1,
             window: w,
         };
-        let mut launch = Launch::new(stream, &inputs)?;
+        let mut launch = Launch::new(stream, &inputs, fault)?;
         let y = launch.run(kernels, stream, set.scale)?;
         let rerun = bits_equal(&y, &launch.run(kernels, stream, set.scale)?);
         let kernel_rel = max_rel_err(&y, &ours)?;
@@ -1699,34 +1736,24 @@ mod gate {
     /// a full ring and a list of many segments, its visible entries a
     /// scrambled set of stream rows, the last visible segment partial and
     /// one more wholly past the count; the entries past the count name rows
-    /// no visible entry names, which hold NaN, and one visible entry names a
-    /// row past the stream, which the kernel reads as the stream's last row.
-    /// Synthetic rows, `case`'s last query and the model's sinks, against
-    /// our rule, plus a rerun.
+    /// no visible entry names, which hold NaN. Synthetic rows, `case`'s last
+    /// query and the model's sinks, against our rule, plus a rerun.
+    ///
+    /// PIN(2026-09-24): no silent failure — a list entry past the stream is
+    /// refused, not clamped; this case kept its numeric pin with every entry
+    /// in the stream, and the planted entry moved to [`sel_past_stream_case`].
     fn sel_depth_case(
         kernels: &AttnKernels,
         stream: &CudaStream,
+        fault: FaultSink,
         set: &SetInfo,
         case: &LayerCase,
         max: &mut Maxima,
     ) -> Result<bool, GateError> {
         let w = set.window;
         let (q, ring) = depth_ring(set, case);
-        // A bijection of the stream's rows but the last, scrambled.
+        let (list, comp) = depth_list(None)?;
         let rows = DEPTH_COMP_ROWS;
-        let mut list: Vec<u32> = (0..DEPTH_SEL_STRIDE)
-            .map(|j| u32::try_from((j * 7919 + 13) % (rows - 1)))
-            .collect::<Result<_, _>>()?;
-        list[DEPTH_PAST_ENTRY] = u32::try_from(rows + 5)?;
-        let data: Vec<u16> = activations(LATENT, rows, 11)
-            .into_iter()
-            .map(f32_to_f16_bits)
-            .collect();
-        let mut comp = vec![NAN_F16; rows * LATENT];
-        for &r in &list[..DEPTH_COMP_VISIBLE] {
-            let r = (r as usize).min(rows - 1);
-            comp[r * LATENT..(r + 1) * LATENT].copy_from_slice(&data[r * LATENT..(r + 1) * LATENT]);
-        }
         let vis = [u32::try_from(w)?, u32::try_from(DEPTH_COMP_VISIBLE)?];
         let (ring_w, comp_w) = (widen(&ring), widen(&comp));
         let sel = Some((&list[..], DEPTH_SEL_STRIDE));
@@ -1747,7 +1774,7 @@ mod gate {
             tokens: 1,
             window: w,
         };
-        let mut launch = Launch::new(stream, &inputs)?;
+        let mut launch = Launch::new(stream, &inputs, fault)?;
         let y = launch.run(kernels, stream, set.scale)?;
         let rerun = bits_equal(&y, &launch.run(kernels, stream, set.scale)?);
         let kernel_rel = max_rel_err(&y, &ours)?;
@@ -1755,10 +1782,107 @@ mod gate {
         let pass = kernel_rel <= KERNEL_BAND && rerun;
         println!(
             "depth keys=sel/{DEPTH_SEL_STRIDE} window_rows={w}/{w} comp_rows={DEPTH_COMP_VISIBLE}/{rows} \
-             unused_entries={} past_stream_entries=1 segments={} kernel_rel={kernel_rel:.2e} rerun={} {}",
+             unused_entries={} past_stream_entries=0 segments={} kernel_rel={kernel_rel:.2e} rerun={} {}",
             DEPTH_SEL_STRIDE - DEPTH_COMP_VISIBLE,
             attn::segments(w, DEPTH_SEL_STRIDE),
             if rerun { "bit-identical" } else { "DIFFERS" },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The depth case's list — a bijection of the stream's rows but the
+    /// last, scrambled, visible entry [`DEPTH_PAST_ENTRY`] replaced by
+    /// `planted` when given — and its stream: the rows the visible entries
+    /// name hold synthetic values, every other row NaN.
+    fn depth_list(planted: Option<u32>) -> Result<(Vec<u32>, Vec<u16>), GateError> {
+        let rows = DEPTH_COMP_ROWS;
+        let mut list: Vec<u32> = (0..DEPTH_SEL_STRIDE)
+            .map(|j| u32::try_from((j * 7919 + 13) % (rows - 1)))
+            .collect::<Result<_, _>>()?;
+        if let Some(r) = planted {
+            list[DEPTH_PAST_ENTRY] = r;
+        }
+        let data: Vec<u16> = activations(LATENT, rows, 11)
+            .into_iter()
+            .map(f32_to_f16_bits)
+            .collect();
+        let mut comp = vec![NAN_F16; rows * LATENT];
+        for &r in &list[..DEPTH_COMP_VISIBLE] {
+            let r = r as usize;
+            if r < rows {
+                comp[r * LATENT..(r + 1) * LATENT]
+                    .copy_from_slice(&data[r * LATENT..(r + 1) * LATENT]);
+            }
+        }
+        Ok((list, comp))
+    }
+
+    /// The depth case's list with visible entry [`DEPTH_PAST_ENTRY`] naming
+    /// row `DEPTH_COMP_ROWS` — the first row past the stream. The kernel
+    /// must raise [`FaultSite::AttnSel`] on the launch's sink, and the word,
+    /// read back and cleared, must name exactly that. The output is printed
+    /// against the host's rule with the entry read as the stream's last row
+    /// (what the kernel used to do), over a stream whose every row holds
+    /// values — evidence, not a contract: the step that reads this fault
+    /// back is refused.
+    fn sel_past_stream_case(
+        kernels: &AttnKernels,
+        gpu: &Gpu,
+        set: &SetInfo,
+        case: &LayerCase,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let w = set.window;
+        let (q, ring) = depth_ring(set, case);
+        let rows = DEPTH_COMP_ROWS;
+        let (list, _) = depth_list(Some(u32::try_from(rows)?))?;
+        let vis = [u32::try_from(w)?, u32::try_from(DEPTH_COMP_VISIBLE)?];
+        let mut clamped = list.clone();
+        clamped[DEPTH_PAST_ENTRY] = u32::try_from(rows - 1)?;
+        // Every row holds values here, so whichever row a kernel reads for the
+        // planted entry, the output stays finite and comparable.
+        let comp_clamped: Vec<u16> = activations(LATENT, rows, 11)
+            .into_iter()
+            .map(f32_to_f16_bits)
+            .collect();
+        let (ring_w, comp_w) = (widen(&ring), widen(&comp_clamped));
+        let last_row = rule_all(
+            our_rule,
+            q,
+            &walk_keys(
+                &ring_w,
+                Some(&comp_w),
+                Some((&clamped[..], DEPTH_SEL_STRIDE)),
+                &vis,
+            ),
+            &case.model_sinks,
+            set.scale,
+        );
+        let inputs = Inputs {
+            q,
+            ring: &ring,
+            comp: Some(&comp_clamped),
+            sel: Some((&list[..], DEPTH_SEL_STRIDE)),
+            vis: &vis,
+            sinks: &case.model_sinks,
+            tokens: 1,
+            window: w,
+        };
+        gpu.clear_fault()?;
+        let y =
+            Launch::new(stream, &inputs, gpu.unlabelled_sink())?.run(kernels, stream, set.scale)?;
+        let got = gpu.take_fault()?;
+        let want = Fault {
+            layer: LAYER_NONE,
+            code: FaultSite::AttnSel as u32,
+        };
+        let pass = got == Some(want);
+        println!(
+            "depth keys=sel/{DEPTH_SEL_STRIDE} past_stream_entry={rows} (comp_rows {rows}) \
+             rel_to_last_row_rule={:.2e} want=attn_sel got={} {}",
+            max_rel_err(&y, &last_row)?,
+            got.map_or("none".to_string(), |f| f.to_string()),
             verdict(pass)
         );
         Ok(pass)

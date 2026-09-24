@@ -1463,7 +1463,19 @@ impl<H: HostExperts> Hybrid<H> {
             .page
             .f32_mut(hsum_off, hidden)
             .ok_or(GpuError::state(what, "the sum is outside the page"))?;
-        self.host.experts_into(layer, &self.x, &list[..n], out)?;
+        // A non-finite handoff activation is undefined input the card has
+        // already refused: the norm that wrote it tests every value it
+        // writes and raised its fault, which the step's readback turns into
+        // the named error. The host sum carries the NaN on instead of the
+        // host encoders panicking first, so that error, with its layer and
+        // site, is the one the caller sees.
+        // A fold, not `all`: no early exit, so the test vectorizes.
+        let finite = self.x.data.iter().fold(true, |ok, v| ok & v.is_finite());
+        if finite {
+            self.host.experts_into(layer, &self.x, &list[..n], out)?;
+        } else {
+            out.fill(f32::NAN);
+        }
         self.boundary
             .page
             .word(Word::Cnt(row))

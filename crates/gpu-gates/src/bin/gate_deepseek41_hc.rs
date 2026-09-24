@@ -43,6 +43,10 @@
 //! against the dump: before an engram layer the chain's MoE sub-layer ends
 //! with HC_POST alone and the glue folds the gated streams.
 //!
+//! The fault word (`bloomery_gpu::fault`): the chain's in-register q8_1 of
+//! the streams has no form for a non-finite value, so a planted NaN in one
+//! stream value must raise `FaultSite::HcQuant` rather than round to code 0.
+//!
 //! Holes, named: the T = 1 paths (ik's own HC_POST branch for one token)
 //! come only from the decode-step sets, read when they are on the box and
 //! named when they are not; `ds41_hc_pre` takes at most 8 tokens a launch,
@@ -64,7 +68,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::fused::readback_q8act;
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_deepseek41::hc::{
         HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs, HcPreScratch,
     };
@@ -863,6 +867,7 @@ mod gate {
             x: &x_dev,
             tokens: t,
             rms_eps: hp.rms_eps,
+            fault: cx.gpu.unlabelled_sink(),
         };
         let mut mixes_dev = DeviceBuffer::<f32>::zeroed(stream, HC_MIX * t)?;
         let mut hc_dev = DeviceBuffer::<f32>::zeroed(stream, HC_MIX * t)?;
@@ -1165,6 +1170,7 @@ mod gate {
             x: &x_dev,
             tokens: t,
             rms_eps: hp.rms_eps,
+            fault: cx.gpu.unlabelled_sink(),
         };
         let mut bufs = StepBufs {
             mixes: DeviceBuffer::zeroed(stream, HC_MIX * t)?,
@@ -1211,6 +1217,55 @@ mod gate {
         Ok(())
     }
 
+    /// A site's streams with one value NaN through `ds41_hc_pre`: the word,
+    /// read back and cleared, must name [`FaultSite::HcQuant`] with no
+    /// layer; the clean streams before it must leave the word clean.
+    fn check_nan(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
+        let (hp, stream) = (cx.hp, cx.gpu.stream());
+        let t = tokens_of(man)?;
+        let all = sites(man, hp, t as u64)?;
+        let site = all.get(4).ok_or("fewer than five sites")?;
+        let params = site_params(cx.split, stream, site.layer, site.sub(), hp.k())?;
+        let clean = cx.gpu.take_fault()?;
+        let mut streams = ref_tensor_of_in(&man.dir, site.streams)?;
+        streams[777] = f32::NAN;
+        let x_dev = DeviceBuffer::from_host(stream, &streams)?;
+        let p = HcParams {
+            w: &params.w_dev,
+            scale: &params.scale_dev,
+            base: &params.base_dev,
+            eps: hp.eps,
+            iters: hp.iters,
+        };
+        let a = HcPreArgs {
+            params: &p,
+            x: &x_dev,
+            tokens: t,
+            rms_eps: hp.rms_eps,
+            fault: cx.gpu.unlabelled_sink(),
+        };
+        let mut mixes = DeviceBuffer::<f32>::zeroed(stream, HC_MIX * t)?;
+        let mut hc = DeviceBuffer::<f32>::zeroed(stream, HC_MIX * t)?;
+        cx.hck
+            .enqueue_pre(stream, &a, &mut cx.scratch, &mut mixes, &mut hc)?;
+        let got = cx.gpu.take_fault()?;
+        let want = Fault {
+            layer: LAYER_NONE,
+            code: FaultSite::HcQuant as u32,
+        };
+        let pass = clean.is_none() && got == Some(want);
+        println!(
+            "fault site=L{}{} T={t} value 777 NaN: before={} want=hc_quant got={} {}",
+            site.layer,
+            site.sub(),
+            clean.map_or("none".to_string(), |f| f.to_string()),
+            got.map_or("none".to_string(), |f| f.to_string()),
+            verdict(pass)
+        );
+        cx.ok &= pass;
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
         let split = Split::open(ref_model_path()?)?;
         let hp = Hp::read(&split)?;
@@ -1238,6 +1293,7 @@ mod gate {
         let prefill = table.open(Set::Cpu)?;
         check_set(&mut cx, &prefill, "prefill")?;
         check_graph(&mut cx, &prefill)?;
+        check_nan(&mut cx, &prefill)?;
         for name in STEP_SETS {
             if !ref_dir_named(name).join("MANIFEST.tsv").is_file() {
                 println!("hole set={name} not on the box: its T = 1 checks did not run");

@@ -46,7 +46,8 @@
 //! `ds41_hc_fold` — the fold alone.
 
 use bloomery_gpu::cores::{q3k_chain, q3k_sb_decode, q8_quad};
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::fault::quad_finite;
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
@@ -396,7 +397,9 @@ mod hc_kernels {
     /// runs HC_PRE with one warp per token, and puts the ticket back to 0 for
     /// the next launch. `ctr` must hold 0 when the launch starts (zeroed at
     /// allocation, and every launch that completes leaves it 0). The launch
-    /// has exactly `n_pieces` blocks.
+    /// has exactly `n_pieces` blocks. A lane whose sixteen values are not
+    /// all finite raises [`FaultSite::HcQuant`] on `fault`: its q8_1 form
+    /// would be code 0 where the NaN was.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -436,6 +439,7 @@ mod hc_kernels {
         mut ctr: DisjointSlice<u32>,
         mut mixes: DisjointSlice<f32>,
         mut hc: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         static mut LAST: SharedArray<u32, 1> = SharedArray::UNINIT;
         static mut MIX: SharedArray<f32, HC_MIX_SLOTS> = SharedArray::UNINIT;
@@ -494,6 +498,13 @@ mod hc_kernels {
                     *x.get_unchecked(xb + 99),
                 ]
             };
+            if !(quad_finite([v[0], v[1], v[2], v[3]])
+                & quad_finite([v[4], v[5], v[6], v[7]])
+                & quad_finite([v[8], v[9], v[10], v[11]])
+                & quad_finite([v[12], v[13], v[14], v[15]]))
+            {
+                fault.raise(FaultSite::HcQuant);
+            }
             // The block amax: the eight lanes that differ in bits 0..2 hold
             // the block's 128 values.
             let mut am = abs_max16(&v);
@@ -784,6 +795,8 @@ pub struct HcPreArgs<'a> {
     pub tokens: usize,
     /// `attention.layer_norm_rms_epsilon`.
     pub rms_eps: f32,
+    /// Where a non-finite stream value is raised (the launch's layer).
+    pub fault: FaultSink,
 }
 
 /// The inputs of one `ds41_hc_post` launch.
@@ -871,6 +884,7 @@ impl HcKernels {
             &mut scratch.ctr,
             mixes,
             hc,
+            a.fault,
         )?;
         Ok(())
     }

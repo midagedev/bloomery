@@ -724,7 +724,7 @@ impl Glue {
         }
         let wkv = Dense::of(w, wkv, site.x.len(), site.kv.len())?;
         let act = if wkv.reads_q8_1() {
-            gpu.enqueue_quantize_q8_1(&site.x, &mut site.act)?;
+            gpu.enqueue_quantize_q8_1_layer(&site.x, &mut site.act, layer)?;
             Some(&site.act)
         } else {
             None

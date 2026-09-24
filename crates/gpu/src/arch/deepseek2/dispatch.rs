@@ -212,6 +212,7 @@ fn attn_proj(
         mla.eps,
         &mut s.act_q,
         &mut s.normed,
+        gpu.layer_sink(names.layer)?,
     )?;
     // x and the gain in, the five q8_1 planes and the f32 vector out.
     tick(
@@ -801,6 +802,7 @@ fn enqueue_ffn_dense(
         mla.eps,
         act_ffn,
         &mut d.h,
+        gpu.layer_sink(names.layer)?,
     )?;
     tick(
         i,
@@ -835,7 +837,8 @@ fn enqueue_ffn_dense(
             Some(4 * wg.rows()),
         ]),
     )?;
-    gpu.q5().enqueue_quantize_q8(stream, &d.h, &mut d.act32)?;
+    gpu.q5()
+        .enqueue_quantize_q8(stream, &d.h, &mut d.act32, gpu.layer_sink(names.layer)?)?;
     tick(
         i,
         obs,
@@ -1048,6 +1051,7 @@ fn moe_norm_quant(
         mla.eps,
         act_ffn,
         normed,
+        gpu.layer_sink(names.layer)?,
     )?;
     tick(
         i,
@@ -1273,8 +1277,12 @@ fn moe_quantize(
     //    because they share work.
     if !skip_quant {
         if split_moe_quant {
-            gpu.q5()
-                .enqueue_quantize_q8(stream, &m.h_exp, &mut m.act32_exp)?;
+            gpu.q5().enqueue_quantize_q8(
+                stream,
+                &m.h_exp,
+                &mut m.act32_exp,
+                gpu.unlabelled_sink(),
+            )?;
             tick(
                 i,
                 obs,
@@ -1292,6 +1300,7 @@ fn moe_quantize(
                 &mut m.act32_exp,
                 &m.h_sh,
                 &mut m.act_sh,
+                gpu.unlabelled_sink(),
             )?;
             tick(
                 i,

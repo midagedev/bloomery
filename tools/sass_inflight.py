@@ -26,10 +26,11 @@ Two readings per entry:
          taken.
 Decisions are per entry and per run: pick them from the listing (`list`) for the shape in question.
 
-usage: sass_inflight.py [--filter SUBSTR] [--decisions t,n,...|list] [--banner TEXT] FILE...
+usage: sass_inflight.py [--filter SUBSTR [--exact]] [--decisions t,n,...|list] [--banner TEXT] FILE...
 A FILE is a cuobjdump listing ("Function : <name>" sections) or a condensed one ("<addr> <op>" per
 line, one entry named after the file). Exit status: 0 with rows, 1 when no entry was read or none
-matches the filter, 2 on a usage error.
+matches the filter, 2 on a usage error. With --exact the filter is a whole entry name instead of a
+substring.
 """
 import os
 import re
@@ -198,11 +199,13 @@ def hexa(a):
 
 
 def main(argv):
-    filt, decisions, banner, files = '', None, None, []
+    filt, exact, decisions, banner, files = '', False, None, None, []
     it = iter(argv)
     for arg in it:
         if arg == '--filter':
             filt = next(it, '')
+        elif arg == '--exact':
+            exact = True
         elif arg == '--decisions':
             decisions = next(it, '')
         elif arg == '--banner':
@@ -226,12 +229,17 @@ def main(argv):
     entries = {}
     for f in files:
         entries.update(read(f))
-    rows = [(name, ins) for name, ins in sorted(entries.items()) if ins and filt in name]
+    if exact and not filt:
+        print('sass_inflight: --exact needs --filter NAME', file=sys.stderr)
+        return 2
+    rows = [(name, ins) for name, ins in sorted(entries.items())
+            if ins and (name == filt if exact else filt in name)]
     if banner:
-        print(banner + (f' filter={filt}' if filt else '') + f' path={decisions or "fall-through"}')
+        print(banner + (f' filter={filt}' if filt else '') + (' exact' if exact else '')
+              + f' path={decisions or "fall-through"}')
     if not rows:
-        print(f'sass_inflight: no entry{" contains " + filt if filt else ""} in {len(entries)} read',
-              file=sys.stderr)
+        how = (" is " if exact else " contains ") + filt if filt else ""
+        print(f'sass_inflight: no entry{how} in {len(entries)} read', file=sys.stderr)
         return 1
     if listing:
         for name, ins in rows:

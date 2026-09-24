@@ -10,6 +10,7 @@ use crate::elem::{
     RMS_THREADS, RMS_THREADS_U32, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree,
     rope_pair_core, silu_mul,
 };
+use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::flash::f32_to_f16_bits;
 use crate::launch_u32;
 use crate::q5::{Q8Blocks32, q5_row_dot};
@@ -81,6 +82,11 @@ mod fused_kernels {
     /// quantizer consumes, so it holds `elem::rms_norm`'s store bit for bit.
     /// The attention norm's tap and the MoE router read it; a site with no
     /// f32 consumer passes a buffer it is about to overwrite anyway.
+    ///
+    /// A column whose normalized values are not all finite, or whose scale
+    /// is not positive (a sum of squares that overflowed), has no q8_1 form:
+    /// a lane that sees it raises [`FaultSite::NormQuant`] on `fault`, and
+    /// the stores go ahead unchanged.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -116,6 +122,7 @@ mod fused_kernels {
         mut s8: DisjointSlice<i32>,
         mut d8: DisjointSlice<f32>,
         mut y: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         // One NORM_QUANT_THREADS block per column: t is the COLUMN index (the
         // block index), not the thread id.
@@ -206,6 +213,9 @@ mod fused_kernels {
                 *y.get_unchecked_mut(vb + 1) = nv1;
                 *y.get_unchecked_mut(vb + 2) = nv2;
                 *y.get_unchecked_mut(vb + 3) = nv3;
+            }
+            if !(quad_finite([nv0, nv1, nv2, nv3]) & (scale > 0.0)) {
+                fault.raise(FaultSite::NormQuant);
             }
             let amax = warp::reduce_max_f32(nv0.abs().max(nv1.abs()).max(nv2.abs()).max(nv3.abs()));
             let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
@@ -558,7 +568,12 @@ impl FusedKernels {
     /// `act.m() * act.k()` f32; a caller with no f32 consumer passes a
     /// buffer of that width it overwrites later in the chain. `act.k()`
     /// must be a multiple of 128 (every `Q8Act` k is a multiple of 256).
+    /// A non-finite normalized value raises `fault` (the launch's layer).
     /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launcher's inputs are the kernel's; a fault sink joined the six"
+    )]
     pub fn enqueue_norm_quant(
         &self,
         stream: &CudaStream,
@@ -567,6 +582,7 @@ impl FusedKernels {
         eps: f32,
         act: &mut Q8Act,
         y: &mut DeviceBuffer<f32>,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let (m, k, n_sb) = (act.m(), act.k(), act.n_sb());
         if k % 128 != 0 {
@@ -615,6 +631,7 @@ impl FusedKernels {
             &mut act.s8,
             &mut act.d8,
             y,
+            fault,
         )?;
         Ok(())
     }

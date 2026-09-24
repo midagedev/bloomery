@@ -30,6 +30,7 @@ pub use launcher::LaunchStats;
 pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 
+use crate::fault::Fault;
 use crate::head::Head;
 use crate::hybrid::{Chain, HostResidency, HybridConfig, host_levers};
 use crate::weights::Weights;
@@ -360,6 +361,9 @@ pub struct GpuModel<B: ChainBody> {
     mode: StepMode,
     /// The cache row the next `step` token lands in.
     pos: u32,
+    /// The fault a step read back (crate::fault): the caches and rings hold
+    /// what it condemned, so every later step refuses until `reset`.
+    poisoned: Option<Fault>,
 }
 
 impl<B: ChainBody> GpuModel<B> {
@@ -415,6 +419,7 @@ impl<B: ChainBody> GpuModel<B> {
             launch_stats: LaunchStats::default(),
             mode: StepMode::Graph,
             pos: 0,
+            poisoned: None,
         })
     }
 
@@ -466,6 +471,7 @@ impl<B: ChainBody> GpuModel<B> {
             launch_stats: LaunchStats::default(),
             mode: StepMode::Graph,
             pos: 0,
+            poisoned: None,
         })
     }
 
@@ -533,6 +539,7 @@ impl<B: ChainBody> GpuModel<B> {
             launch_stats: LaunchStats::default(),
             mode: StepMode::Graph,
             pos: 0,
+            poisoned: None,
         })
     }
 
@@ -599,6 +606,7 @@ impl<B: ChainBody> GpuModel<B> {
             launch_stats: LaunchStats::default(),
             mode: StepMode::Graph,
             pos: 0,
+            poisoned: None,
         })
     }
 
@@ -679,6 +687,9 @@ impl<B: ChainBody> GpuModel<B> {
         // The body owns its row store, so it owns what "empty" means there.
         let (gpu, _, body) = self.body_parts("GpuModel::reset")?;
         body.reset(gpu)?;
+        // Empty caches hold nothing a fault condemned.
+        gpu.clear_fault()?;
+        self.poisoned = None;
         self.pos = 0;
         Ok(())
     }
@@ -795,6 +806,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// continuation is `step(&prompt)` followed by one `step(&[tok])` per
     /// generated token. [`GpuModel::reset`] rewinds.
     pub fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
+        self.refuse_if_poisoned("GpuModel::step")?;
         if tokens.is_empty() {
             return Err(GpuError::shape("GpuModel::step", "empty token slice"));
         }
@@ -826,10 +838,35 @@ impl<B: ChainBody> GpuModel<B> {
             self.pos = pos + 1;
         }
         let gpu = &self.stages[0].gpu;
-        self.head
+        let token = self
+            .head
             .as_ref()
             .ok_or(GpuError::state("GpuModel::step", "no output head"))?
-            .token(gpu)
+            .token(gpu);
+        self.note_fault(token)
+    }
+
+    /// A step on a poisoned model is refused, naming the fault.
+    fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
+        match self.poisoned {
+            Some(fault) => Err(GpuError::Poisoned { what, fault }),
+            None => Ok(()),
+        }
+    }
+
+    /// Pass a readback through, remembering a fault it carries: the state
+    /// the faulted step wrote poisons every later step.
+    fn note_fault<T>(&mut self, r: Result<T, GpuError>) -> Result<T, GpuError> {
+        if let Err(GpuError::Fault { fault, .. }) = &r {
+            self.poisoned = Some(*fault);
+        }
+        r
+    }
+
+    /// The fault that poisons this model, if a step has read one back.
+    #[must_use]
+    pub fn poisoned(&self) -> Option<Fault> {
+        self.poisoned
     }
 
     /// Run `t` at the next position and `t1` at the one after as one pair
@@ -841,6 +878,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// [`GpuModel::rollback`].
     pub fn step_pair(&mut self, t: u32, t1: u32) -> Result<[u32; 2], GpuError> {
         const WHAT: &str = "GpuModel::step_pair";
+        self.refuse_if_poisoned(WHAT)?;
         if self.head.is_none() {
             return Err(GpuError::state(
                 WHAT,
@@ -875,7 +913,8 @@ impl<B: ChainBody> GpuModel<B> {
         self.pos = pos + 2;
         let gpu = &self.stages[0].gpu;
         let [a, b] = self.pair_heads()?;
-        Ok([a.token(gpu)?, b.token(gpu)?])
+        let tokens = a.token(gpu).and_then(|ta| Ok([ta, b.token(gpu)?]));
+        self.note_fault(tokens)
     }
 
     /// Wake the launch thread, if any, ahead of a graph replay's refresh.
@@ -1210,6 +1249,7 @@ impl<B: ChainBody> GpuModel<B> {
         what: &'static str,
         pass: impl FnOnce(&Gpu, &Weights, &mut B, &mut Head, u32) -> Result<bool, GpuError>,
     ) -> Result<Option<u32>, GpuError> {
+        self.refuse_if_poisoned(what)?;
         if n == 0 || self.stages.len() != 1 || self.stages[0].layers.start != 0 {
             return Err(GpuError::shape(
                 what,
@@ -1227,10 +1267,12 @@ impl<B: ChainBody> GpuModel<B> {
             return Err(GpuError::state(what, "stage carries no residency"));
         };
         let token = if pass(gpu, weights, body, head, pos)? {
-            Some(head.token(gpu)?)
+            Some(head.token(gpu))
         } else {
             None
-        };
+        }
+        .transpose();
+        let token = self.note_fault(token)?;
         self.pos = pos + n;
         Ok(token)
     }

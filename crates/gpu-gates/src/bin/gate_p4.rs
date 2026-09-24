@@ -811,10 +811,11 @@ fn argmax_geometry() -> Result<bool, GateError> {
     /// The head's vocabulary: the one vector a decode step argmaxes.
     const ARGMAX_N: usize = 102_400;
 
-    ptx_shapes(&["argmax"], |c, _| {
+    // Every head argmax entry: the step's head runs the `_fault` pair.
+    ptx_shapes(&["argmax", "argmax_fault", "argmax_rows_fault"], |c, _| {
         let ntid = c
             .reqntid
-            .ok_or("gate_p4: PTX entry argmax declares no .reqntid")?;
+            .ok_or_else(|| format!("gate_p4: PTX entry {} declares no .reqntid", c.name))?;
         let trips = ARGMAX_N.div_ceil(ARGMAX_THREADS);
         let pass = ntid == ARGMAX_THREADS
             && ARGMAX_THREADS % 32 == 0
@@ -824,9 +825,10 @@ fn argmax_geometry() -> Result<bool, GateError> {
         Ok((
             pass,
             format!(
-                "shape op=argmax geometry block_reqntid={ntid} ARGMAX_THREADS={ARGMAX_THREADS} \
+                "shape op={} geometry block_reqntid={ntid} ARGMAX_THREADS={ARGMAX_THREADS} \
                  warps={ARGMAX_WARPS} min_warps={ARGMAX_MIN_WARPS} n={ARGMAX_N} \
-                 trips_per_thread={trips}"
+                 trips_per_thread={trips}",
+                c.name
             ),
         ))
     })

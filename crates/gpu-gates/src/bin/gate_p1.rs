@@ -11,6 +11,12 @@
 //! an FNV-1a 64 hash of the output bytes pinned to the verbatim stage-0
 //! port, so generalization and the cores extraction are proven to change
 //! no K=2048 bit.
+//!
+//! And the quantizers' refusal (`bloomery_gpu::fault`): a column holding a
+//! non-finite value has no q8 form, so `q3k_quantize_q8_1`, `norm_quant` and
+//! the Q5 path's 32-value quantizer each raise the fault word at their own
+//! site instead of rounding the value to code 0 — planted NaN and inf lanes,
+//! the word read back and cleared per case; the pinned shapes leave it clean.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -197,14 +203,142 @@ fn run() -> Result<(), GateError> {
         }
     }
 
+    all_ok &= quant_faults(&gpu, &gguf)?;
+
     if !all_ok {
         return Err(bloomery_gpu_gates::checks_failed());
     }
     println!(
         "PASSED: gate_p1 K-quant gemvs within {KERNEL_BAND} of the q8_1 reference, \
-         reruns bit-identical, pins matched"
+         reruns bit-identical, pins matched, every planted non-finite lane raised its \
+         quantizer's fault"
     );
     Ok(())
+}
+
+/// The quantizers' fault contract on planted input. The pinned shapes above
+/// ran on finite activations, so the word must still be clean; then per case
+/// the planted column goes through one quantizer, and the word read back
+/// (and cleared) must name that quantizer's site with no layer. The
+/// `silent_zero` column is the evidence of what the codes alone say: the
+/// q3_K gemv of the planted column against the same column with the planted
+/// lanes set to 0.0 — equal bits mean the non-finite lane became code 0 and
+/// nothing downstream could tell. Printed, not asserted: the codes of a
+/// faulted column are not a contract.
+#[cfg(feature = "gpu")]
+fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, GateError> {
+    use bloomery_gpu::fused::FusedKernels;
+    use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, LAYER_NONE, Q8Act};
+    use bloomery_gpu_gates::{
+        activations, bits_equal, bytes_to_words, row_bytes, tensor_bytes_as, verdict,
+    };
+    use cuda_core::DeviceBuffer;
+    use gguf::quant::GgmlType;
+
+    const K: usize = 2048;
+    const ROWS: usize = 256;
+    const LANE: usize = 37;
+    let stream = gpu.stream();
+    let clean = gpu.fault()?;
+    println!(
+        "fault case=after_shapes want=none got={} {}",
+        clean.map_or("none".to_string(), |f| f.to_string()),
+        verdict(clean.is_none())
+    );
+    let mut ok = clean.is_none();
+    gpu.clear_fault()?;
+
+    let (_, bytes) = tensor_bytes_as(gguf, "blk.1.attn_q.weight", GgmlType::Q3_K, None)?;
+    let rb = row_bytes(GgmlType::Q3_K, K)?;
+    let words = bytes_to_words(&bytes[..rb * ROWS]);
+    let w = DeviceTensor::upload(stream, &words, ROWS, words.len() / ROWS)?;
+    let gemv = |x: &[f32], act: &mut Q8Act| -> Result<Vec<f32>, GateError> {
+        let x_dev = DeviceBuffer::from_host(stream, x)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, ROWS)?;
+        gpu.enqueue_quantize_q8_1(&x_dev, act)?;
+        gpu.enqueue_gemv_q3k(&w, act, &mut y)?;
+        Ok(y.to_host_vec(stream)?)
+    };
+    let want = |site: FaultSite| Fault {
+        layer: LAYER_NONE,
+        code: site as u32,
+    };
+    let base = activations(K, 1, 1);
+    let planted = |lanes: std::ops::Range<usize>, v: f32| {
+        let mut x = base.clone();
+        let mut z = base.clone();
+        for i in lanes {
+            x[i] = v;
+            z[i] = 0.0;
+        }
+        (x, z)
+    };
+    let mut act = Q8Act::with_k(stream, 1, K)?;
+    for (name, (x, z)) in [
+        ("nan_lane", planted(LANE..LANE + 1, f32::NAN)),
+        ("inf_lane", planted(LANE..LANE + 1, f32::INFINITY)),
+        ("nan_block", planted(0..128, f32::NAN)),
+    ] {
+        let y_bad = gemv(&x, &mut act)?;
+        let got = gpu.take_fault()?;
+        let y_zero = gemv(&z, &mut act)?;
+        let after = gpu.take_fault()?;
+        let pass = got == Some(want(FaultSite::QuantColumn)) && after.is_none();
+        println!(
+            "fault case={name} entry=q3k_quantize_q8_1 want=quant_column got={} zero_lane_clean={} \
+             silent_zero={} {}",
+            got.map_or("none".to_string(), |f| f.to_string()),
+            after.is_none(),
+            bits_equal(&y_bad, &y_zero),
+            verdict(pass)
+        );
+        ok &= pass;
+    }
+
+    // norm_quant: one NaN lane makes the column's sum of squares NaN, so
+    // every normalized value is NaN and every code 0 — the whole column
+    // quantizes to zeros.
+    let fused = FusedKernels::load(gpu.context())?;
+    let gain = DeviceBuffer::from_host(stream, &vec![1.0f32; K])?;
+    let (x, _) = planted(LANE..LANE + 1, f32::NAN);
+    let x_dev = DeviceBuffer::from_host(stream, &x)?;
+    let mut normed = DeviceBuffer::<f32>::zeroed(stream, K)?;
+    let mut y = DeviceBuffer::<f32>::zeroed(stream, ROWS)?;
+    fused.enqueue_norm_quant(
+        stream,
+        &x_dev,
+        &gain,
+        1e-6,
+        &mut act,
+        &mut normed,
+        gpu.unlabelled_sink(),
+    )?;
+    gpu.enqueue_gemv_q3k(&w, &act, &mut y)?;
+    let y = y.to_host_vec(stream)?;
+    let got = gpu.take_fault()?;
+    let pass = got == Some(want(FaultSite::NormQuant));
+    println!(
+        "fault case=nan_lane entry=norm_quant want=norm_quant got={} gemv_all_zero={} {}",
+        got.map_or("none".to_string(), |f| f.to_string()),
+        y.iter().all(|&v| v == 0.0),
+        verdict(pass)
+    );
+    ok &= pass;
+
+    // The Q5 path's 32-value quantizer, the same planted lane.
+    let q5 = Q5Kernels::load(gpu.context())?;
+    let mut act32 = Q8Blocks32::new(stream, K, 1)?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act32, gpu.unlabelled_sink())?;
+    let got = gpu.take_fault()?;
+    let pass = got == Some(want(FaultSite::Q5Quant));
+    println!(
+        "fault case=nan_lane entry=q5_quantize_q8 want=q5_quant got={} {}",
+        got.map_or("none".to_string(), |f| f.to_string()),
+        verdict(pass)
+    );
+    ok &= pass;
+    Ok(ok)
 }
 
 /// Host transcription of the device quantizer's activation treatment: per

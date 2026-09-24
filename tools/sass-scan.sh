@@ -5,7 +5,11 @@
 # assembles each module with ptxas for the card's arch, disassembles the cubin with cuobjdump, and
 # hands the listings to tools/sass_inflight.py, whose header says what is counted and how.
 #
-# Usage: tools/sass-scan.sh <binary name> [entry substring [decisions]]
+# Usage: tools/sass-scan.sh [--exact] <binary name> [entry substring [decisions]]
+#   --exact    the entry argument is a whole name, not a substring (`ds41_attn_seg` alone, not also
+#              `ds41_attn_seg_sel`); it may stand anywhere among the arguments. Through the recipe it
+#              goes after `--`, or just reads it as a recipe option:
+#              `just sass-scan --features deepseek41 <binary> -- --exact <entry>`.
 #   decisions  the path's conditional branches in order, t (taken) or n (not taken), comma-separated,
 #              e.g. n,t,t,n; without them the path falls through every conditional branch. `list`
 #              instead prints the matching entries' listings (<addr> <instruction>) to pick them from.
@@ -19,11 +23,17 @@
 # Exit status: 0 with rows; 1 when the scan failed (the banner ends in `scan=failed` and names what),
 # or no entry matches; 2 on a usage error.
 set -uo pipefail
-NAME=${1:-}
-FILTER=${2:-}
-DECISIONS=${3:-}
-if [ -z "$NAME" ] || [ $# -gt 3 ]; then
-  echo "usage: sass-scan.sh <binary name> [entry substring [decisions|list]]" >&2
+EXACT=
+POS=()
+for a in "$@"; do
+  if [ "$a" = --exact ]; then EXACT=1; else POS+=("$a"); fi
+done
+NAME=${POS[0]:-}
+FILTER=${POS[1]:-}
+DECISIONS=${POS[2]:-}
+if [ -z "$NAME" ] || [ ${#POS[@]} -gt 3 ] || { [ -n "$EXACT" ] && [ -z "$FILTER" ]; }; then
+  echo "usage: sass-scan.sh [--exact] <binary name> [entry substring [decisions|list]]" >&2
+  echo "       (--exact needs the entry argument)" >&2
   exit 2
 fi
 TOOLKIT=${CUDA_TOOLKIT_PATH:-/usr/local/cuda}
@@ -57,6 +67,7 @@ done
 VER=$("$PTXAS" --version 2>/dev/null | sed -n 's/.*, V\([0-9][0-9.]*\)$/\1/p')
 ARGS=(--banner "sass-scan bin=$BIN ptxas=$PTXAS ptxas-version=${VER:-unknown} arch=$ARCH modules=$NMOD")
 [ -z "$FILTER" ] || ARGS+=(--filter "$FILTER")
+[ -z "$EXACT" ] || ARGS+=(--exact)
 [ -z "$DECISIONS" ] || ARGS+=(--decisions "$DECISIONS")
 MODS=()
 for ((i = 1; i <= NMOD; i++)); do MODS+=("$TMP/mod$i.sass"); done

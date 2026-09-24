@@ -35,7 +35,7 @@
 use bloomery_gpu::flash::{
     MMA_BLOCK, MMA_KEYS, MMA_ROWS, MMA_SEG_KEYS, MMA_TILE, mma_dyn_bytes, mma_qwords, online_fold,
 };
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, DynamicSharedArray, SharedArray, kernel, launch_bounds, launch_contract, thread,
@@ -62,6 +62,8 @@ pub const SEG_KEYS: usize = MMA_SEG_KEYS;
 /// them.
 const MERGE_BATCH: usize = 16;
 const _: () = assert!(SEG_KEYS.is_multiple_of(MMA_KEYS));
+// `segment_pass!`'s `check` gives each key of a segment its own thread.
+const _: () = assert!(SEG_KEYS <= MMA_BLOCK);
 
 /// The key tile's byte offset in the segment block's dynamic shared memory:
 /// the query tile comes first.
@@ -109,7 +111,10 @@ pub fn partials_ms_len(q_rows: usize, segs: usize) -> usize {
 /// ring row; compressed key `key` of token `t` reads row `comp_row` of
 /// `comp`. `comp_keys` is the compressed source's key capacity — the grid's
 /// share and the bound on every count. `comp_row` is evaluated only for a
-/// key below the token's limit, `min(count, comp_keys)`.
+/// key below the token's limit, `min(count, comp_keys)`. `check` runs once
+/// per compressed key of the block's segment, one key per thread, before the
+/// walk and with no barrier: the refusals of `comp_row`'s inputs live there,
+/// so nothing they hold is live across the walk.
 macro_rules! segment_pass {
     (
         q: $q:ident,
@@ -125,7 +130,8 @@ macro_rules! segment_pass {
         segs: $segs:ident,
         part_v: $part_v:ident,
         part_ms: $part_ms:ident,
-        comp_row: |$t:ident, $key:ident| $comp_row:expr $(,)?
+        comp_row: |$t:ident, $key:ident| $comp_row:expr,
+        check: |$ckey:ident| $check:block $(,)?
     ) => {{
         // Per head, the tile's scaled logits and then its weights.
         static mut KLOG: SharedArray<f32, MMA_TILE> = SharedArray::UNINIT;
@@ -173,6 +179,11 @@ macro_rules! segment_pass {
             return; // block-uniform, and no key row of this segment is read
         }
         let hi_max = (lo + SEG_KEYS).min(limit);
+        // SEG_KEYS <= the block's threads, so one pass covers the segment.
+        if !window && lo + tid < hi_max {
+            let $ckey = lo + tid;
+            $check
+        }
 
         // The group's query rows and the tile's key rows as f16, both in the
         // block's dynamic shared memory: the query tile first, the key tile
@@ -289,6 +300,7 @@ mod attn_kernels {
             part_v: part_v,
             part_ms: part_ms,
             comp_row: |t, key| key,
+            check: |_key| {},
         }
     }
 
@@ -297,7 +309,10 @@ mod attn_kernels {
     /// stream row `sel[t * sel_stride + key]` in place — the list's order is
     /// the key order. `sel_stride` is each token's list capacity, the
     /// compressed source's share of the grid. A list entry past the stream
-    /// reads the stream's last row: a wrong row, never a read outside it.
+    /// names no row: it raises [`FaultSite::AttnSel`] on `fault` before the
+    /// walk, and the key stages row 0 so the access stays inside the stream
+    /// — the step that reads the fault back is refused, so no value built
+    /// on it is used.
     #[kernel]
     #[launch_bounds(512)]
     #[launch_contract(
@@ -335,6 +350,7 @@ mod attn_kernels {
         segs: u32,
         mut part_v: DisjointSlice<f32>,
         mut part_ms: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         segment_pass! {
             q: q,
@@ -354,7 +370,16 @@ mod attn_kernels {
                 // SAFETY: t < tokens and key < min(count, sel_stride) put
                 // the load inside sel (launch contract).
                 let r = unsafe { *sel.get_unchecked(t * sel_stride as usize + key) } as usize;
-                r.min(comp_rows as usize - 1)
+                // `check` has raised for an entry past the stream; row 0
+                // keeps the access inside it.
+                if r < comp_rows as usize { r } else { 0 }
+            },
+            check: |key| {
+                // SAFETY: as `comp_row`'s load, for the same (t, key).
+                let r = unsafe { *sel.get_unchecked(t * sel_stride as usize + key) };
+                if r >= comp_rows {
+                    fault.raise(FaultSite::AttnSel);
+                }
             },
         }
     }
@@ -457,6 +482,8 @@ pub struct SelectedRows<'a> {
     /// Entries per token: each token's list capacity, and the compressed
     /// source's share of the grid.
     pub stride: usize,
+    /// Where an entry past the stream is raised (the launch's layer).
+    pub fault: FaultSink,
 }
 
 /// One attention launch's inputs and outputs. Rows are `tokens * heads`
@@ -628,6 +655,7 @@ impl AttnKernels {
                     segs,
                     &mut *part_v,
                     &mut *part_ms,
+                    s.fault,
                 )?;
             }
         }

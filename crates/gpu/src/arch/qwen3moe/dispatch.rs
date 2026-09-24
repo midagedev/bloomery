@@ -211,6 +211,7 @@ fn attention(
         c.eps,
         &mut s.act_x[i],
         &mut s.normed,
+        gpu.unlabelled_sink(),
     )?;
     let wv = kq_weight(w, &n.attn_v)?;
     let (off_k, off_v) = s.qkv_offsets();
@@ -305,6 +306,7 @@ fn ffn(
         c.eps,
         &mut s.act_ffn[i],
         &mut s.normed,
+        gpu.unlabelled_sink(),
     )?;
     k.router.enqueue_fused(
         stream,

@@ -234,7 +234,7 @@ fn run() -> Result<(), GateError> {
     let x5 = activations(k5, N_SLOTS, SEED_Q5);
     let x5_dev = DeviceBuffer::from_host(stream, &x5)?;
     let mut act5 = Q8Blocks32::new(stream, k5, N_SLOTS)?;
-    q5.enqueue_quantize_q8(stream, &x5_dev, &mut act5)?;
+    q5.enqueue_quantize_q8(stream, &x5_dev, &mut act5, gpu.unlabelled_sink())?;
     stream.synchronize()?;
 
     for (tag, sel) in [("a", &SEL_A), ("b", &SEL_B)] {

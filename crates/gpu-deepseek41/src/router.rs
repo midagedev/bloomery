@@ -29,12 +29,19 @@
 //!   sum, which is 0 when every selected score underflowed, and the guard
 //!   leaves every other sum's bits alone), each score divided by it in f32,
 //!   then multiplied by `expert_weights_scale` in f32.
+//!
+//! No silent selection: a legitimate selection value is finite or NaN, never
+//! −inf, so a round whose winner is not finite means fewer finite candidates
+//! than slots (a NaN score cannot be taken), and a weight that is not finite
+//! has no meaning either. Both raise [`FaultSite::Router`] on the launch's
+//! fault sink; the ids and weights written stay what the rounds left, and the
+//! step that reads the fault back is refused before anything uses them.
 
 use bloomery_gpu::q8f32::f32_lane_partial_1col_w32;
 /// ik's expert score in f32; the gates' host side simulates the device with it.
 pub use bloomery_gpu::route_core::sqrt_softplus;
 use bloomery_gpu::route_core::{renorm_divisor, take};
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
@@ -88,6 +95,8 @@ mod router_kernels {
     /// `L + 32 j` that no earlier round took, the butterfly merges the lanes,
     /// and the winning lane marks its entry taken. Lane 0 writes the ids,
     /// then the weights from the six scores, and puts `done[0]` back to zero.
+    /// A round whose winner is not finite, or a weight that is not, raises
+    /// [`FaultSite::Router`] on `fault`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -121,6 +130,7 @@ mod router_kernels {
         mut ids: DisjointSlice<u32>,
         mut weights: DisjointSlice<f32>,
         mut done: DisjointSlice<u32>,
+        fault: FaultSink,
     ) {
         static mut SCORE: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
         static mut SEL_V: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
@@ -236,6 +246,11 @@ mod router_kernels {
                     taken |= 1 << (bi as usize / 32);
                 }
                 if lane == 0 {
+                    // The winner of every round is warp-uniform; lane 0
+                    // alone raises for the warp.
+                    if !bv.is_finite() {
+                        fault.raise(FaultSite::Router);
+                    }
                     // SAFETY: block-shared, bi < N_EXPERT (every candidate is
                     // one of a lane's own entries), written before the barrier.
                     let p = unsafe { *score.add(bi as usize) };
@@ -261,9 +276,13 @@ mod router_kernels {
                 while s < N_USED {
                     // SAFETY: block-shared, s < N_USED, this lane's own write.
                     let p = unsafe { *slot_p.add(s) };
+                    let wt = p / sum * scale;
+                    if !wt.is_finite() {
+                        fault.raise(FaultSite::Router);
+                    }
                     // SAFETY: s < N_USED <= weights.len() by the launch
                     // contract; lane 0 is the only writer.
-                    unsafe { *weights.get_unchecked_mut(s) = p / sum * scale };
+                    unsafe { *weights.get_unchecked_mut(s) = wt };
                     s += 1;
                 }
                 // SAFETY: `ticket` is done[0], inside `done` by the launch
@@ -325,8 +344,13 @@ impl RouterKernels {
     /// Enqueue the router for one token: `w` the router weight as f32
     /// ([`N_EXPERT`] rows of `k`, `k` a positive multiple of 32), `x` the
     /// token's `k` activations, `bias` the [`N_EXPERT`] selection biases,
-    /// `scale` the file's `expert_weights_scale`; results into `out`.
+    /// `scale` the file's `expert_weights_scale`; results into `out`. A
+    /// selection it cannot make raises `fault` (the launch's layer).
     /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launcher's inputs are the kernel's; a fault sink joined the six"
+    )]
     pub fn enqueue_router(
         &self,
         stream: &CudaStream,
@@ -335,6 +359,7 @@ impl RouterKernels {
         bias: &DeviceBuffer<f32>,
         scale: f32,
         out: &mut RouterOut,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let what = "enqueue_router";
         let shape = |detail: String| GpuError::Shape { what, detail };
@@ -372,6 +397,7 @@ impl RouterKernels {
             &mut out.ids,
             &mut out.weights,
             &mut out.done,
+            fault,
         )?;
         Ok(())
     }

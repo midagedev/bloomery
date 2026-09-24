@@ -18,6 +18,12 @@
 //!   in stream order off a capture of the engine's chain — holds exactly the
 //!   MoE piece's own shadow work and, on the layer before each engram site,
 //!   that site's token-only work; none of that work runs outside a shadow.
+//!   And the engine refuses a step it cannot answer (`bloomery_gpu::fault`):
+//!   after a three-token prompt, layer 0's first window-ring row is set to
+//!   NaN, so the next step's layer-0 attention reads a NaN key. The engine's
+//!   `step` must return the fault at layer 0 instead of a token, the step
+//!   after it must refuse as poisoned naming the same fault, and a `reset`
+//!   must clear both — the prompt then answers the token it answered before.
 //! - `--sets` (G1): the decode-step sets `step4` (position 4) and `d1n`
 //!   (position 301, no selection). The state a set's prefill left — each
 //!   layer's window ring (the last window of ik's raw cache), each
@@ -317,6 +323,7 @@ mod gate {
         let mut pass = true;
         if args.structure {
             pass &= structure(&mut m, &mut head, &split, &hp)?;
+            pass &= fault_case(&mut m)?;
         }
         if args.sets {
             pass &= sets(&mut m, &mut head, &split, &hp, &SETS)?;
@@ -335,6 +342,56 @@ mod gate {
         }
         println!("PASSED: gate_deepseek41_step");
         Ok(())
+    }
+
+    // ----------------------------------------------------------- the fault
+
+    /// The engine's step on a condemned state (the module doc's fault case).
+    fn fault_case(m: &mut Deepseek41Model) -> Result<bool, GateError> {
+        const PROMPT: [u32; 3] = [1, 2, 3];
+        m.reset()?;
+        let tok = m.step(&PROMPT)?;
+        {
+            let (gpu, _, body) = m.body_parts("gate_deepseek41_step fault")?;
+            let stream = gpu.stream();
+            let ring = body
+                .state_mut(0)
+                .ok_or("the body does not run layer 0")?
+                .ring;
+            let width = ring.cols();
+            let mut host = ring.buf().to_host_vec(stream)?;
+            host[..width].fill(NAN16);
+            ring.buf_mut().copy_from_host(stream, &host)?;
+        }
+        let first = m.step(&[tok]);
+        let poisoned = m.poisoned();
+        let second = m.step(&[tok]);
+        m.reset()?;
+        let again = m.step(&PROMPT)?;
+        let faulted = match &first {
+            Err(GpuError::Fault { fault, .. }) => Some(*fault),
+            _ => None,
+        };
+        let refused = match (&second, faulted) {
+            (Err(GpuError::Poisoned { fault, .. }), Some(f)) => *fault == f,
+            _ => false,
+        };
+        let describe = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        let pass = faulted.is_some_and(|f| f.layer == 0 && f.site().is_some())
+            && poisoned == faulted
+            && refused
+            && again == tok
+            && m.poisoned().is_none();
+        println!(
+            "fault nan_key layer=0: step {}; next {}; after reset token {again} (before {tok}) {}",
+            describe(&first),
+            describe(&second),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     // ------------------------------------------------------- the set's state

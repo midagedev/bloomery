@@ -350,7 +350,8 @@ mod gate {
         let n_slots = p.sel.len();
         let xd = DeviceBuffer::from_host(s, x)?;
         let mut act_x = MxAct::new(s, p.m, k)?;
-        cx.dk.enqueue_quantize(s, &xd, &mut act_x)?;
+        cx.dk
+            .enqueue_quantize(s, &xd, &mut act_x, cx.gpu.unlabelled_sink())?;
         let sel = DeviceBuffer::from_host(s, &p.sel)?;
         let route = DeviceBuffer::from_host(s, &p.route)?;
         let wts = DeviceBuffer::from_host(s, &p.wts)?;
@@ -366,7 +367,8 @@ mod gate {
         };
         cx.dk.enqueue_gate_up(s, &a, &mut h)?;
         let mut act_h = MxAct::new(s, n_slots * p.m, ff)?;
-        cx.dk.enqueue_quantize(s, &h, &mut act_h)?;
+        cx.dk
+            .enqueue_quantize(s, &h, &mut act_h, cx.gpu.unlabelled_sink())?;
         let mut out = DeviceBuffer::<f32>::zeroed(s, p.m * n)?;
         let d = DownArgs {
             down: &cx.down.dev,
@@ -401,7 +403,8 @@ mod gate {
         let n_slots = p.sel.len();
         let hd = DeviceBuffer::from_host(s, h)?;
         let mut act_h = MxAct::new(s, n_slots * p.m, ff)?;
-        cx.dk.enqueue_quantize(s, &hd, &mut act_h)?;
+        cx.dk
+            .enqueue_quantize(s, &hd, &mut act_h, cx.gpu.unlabelled_sink())?;
         let sel = DeviceBuffer::from_host(s, &p.sel)?;
         let route = DeviceBuffer::from_host(s, &p.route)?;
         let wts = DeviceBuffer::from_host(s, &p.wts)?;
@@ -639,6 +642,7 @@ mod gate {
                 scale: r.scale,
                 norm: r.norm,
                 tok,
+                fault: cx.gpu.unlabelled_sink(),
             };
             cx.dk.enqueue_router(s, &a, &mut out)?;
         }

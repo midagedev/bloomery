@@ -1099,6 +1099,7 @@ impl FfnPiece {
         let n = self.n_embd;
         let c = &self.cfg[i];
         let r = &mut self.rows[row];
+        let fault = gpu.layer_sink(layer)?;
         self.fused.enqueue_norm_quant(
             stream,
             io.fold_in,
@@ -1106,6 +1107,7 @@ impl FfnPiece {
             self.rms_eps,
             &mut r.act_x,
             hybrid.boundary_mut().normed_mut(),
+            fault,
         )?;
         self.router.enqueue_router(
             stream,
@@ -1114,6 +1116,7 @@ impl FfnPiece {
             lw.bias,
             self.scale,
             &mut r.rout,
+            fault,
         )?;
         let what = "ds41_ffn_handoff";
         let target = hybrid.boundary_mut().handoff_target_of(row)?;
@@ -1177,6 +1180,7 @@ impl FfnPiece {
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let (n, ff) = (self.n_embd, self.ff);
+        let layer = self.layers.start + i;
         let c = &self.cfg[i];
         let r = &mut self.rows[row];
         let pre = HcPreArgs {
@@ -1184,6 +1188,7 @@ impl FfnPiece {
             x: io.streams,
             tokens: 1,
             rms_eps: self.rms_eps,
+            fault: gpu.layer_sink(layer)?,
         };
         self.hc.enqueue_pre(
             stream,
@@ -1204,7 +1209,7 @@ impl FfnPiece {
             };
             self.experts
                 .enqueue_expert_gate_up(stream, &args, &mut r.h)?;
-            gpu.enqueue_quantize_q8_1(&r.h, &mut r.act_h)?;
+            gpu.enqueue_quantize_q8_1_layer(&r.h, &mut r.act_h, layer)?;
             gpu.q4k_sel().enqueue_gemv_q4k_sel(
                 stream,
                 s.down,
@@ -1251,7 +1256,7 @@ impl FfnPiece {
             ));
         }
         let act = if lw.sh_down.reads_q8_1() {
-            gpu.enqueue_quantize_q8_1(&r.sh_h, &mut r.act_sh)?;
+            gpu.enqueue_quantize_q8_1_layer(&r.sh_h, &mut r.act_sh, layer)?;
             Some(&r.act_sh)
         } else {
             None

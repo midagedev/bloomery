@@ -80,7 +80,7 @@ fn run() -> Result<(), GateError> {
             let x_dev = DeviceBuffer::from_host(stream, &x)?;
             let mut act = Q8Blocks32::new(stream, k0, m)?;
             let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows0 * m)?;
-            q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+            q5.enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;
             q5.enqueue_gemv_q5_0(
                 stream,
                 &w_dev,
@@ -131,7 +131,7 @@ fn run() -> Result<(), GateError> {
     const SENT: f32 = 1.0e30;
     let x_dev = DeviceBuffer::from_host(stream, &x8)?;
     let mut act = Q8Blocks32::new(stream, k0, 8)?;
-    q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;
     let (col0, y0) = (3usize, 2 * rows0);
     let mut y_dev = DeviceBuffer::from_host(stream, &vec![SENT; 4 * rows0])?;
     q5.enqueue_gemv_q5_0(
@@ -186,7 +186,7 @@ fn run() -> Result<(), GateError> {
         let x_dev = DeviceBuffer::from_host(stream, &x)?;
         let mut act = Q8Blocks32::new(stream, k1, m)?;
         let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows1 * m)?;
-        q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+        q5.enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;
         q5.enqueue_gemv_q5_1(stream, &w1_dev, &act, 0, rows1, 0, m, &mut y_dev, 0)?;
         stream.synchronize()?;
         let y = y_dev.to_host_vec(stream)?;
@@ -214,7 +214,7 @@ fn run() -> Result<(), GateError> {
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
     let mut act = Q8Blocks32::new(stream, k1, 8)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows1 * 8)?;
-    q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;
     q5.enqueue_gemv_q5_1(stream, &w1_dev, &act, 0, rows1, 0, 8, &mut y_dev, 0)?;
     stream.synchronize()?;
     let y_eager = y_dev.to_host_vec(stream)?;
@@ -222,7 +222,7 @@ fn run() -> Result<(), GateError> {
     y_dev.zero_async(stream)?;
     stream.synchronize()?;
     let graph = gpu.capture(|_s| {
-        q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+        q5.enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;
         q5.enqueue_gemv_q5_1(stream, &w1_dev, &act, 0, rows1, 0, 8, &mut y_dev, 0)
     })?;
     graph.launch(stream)?;

@@ -70,7 +70,7 @@ use std::ops::{Deref, Range};
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, PartedBuffer, Q8Act, window};
+use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, PartedBuffer, Q8Act, window};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::hparams::Hparams;
@@ -1166,6 +1166,8 @@ impl AttnChain {
             k: &self.kernels,
             d: &self.dims,
             words: self.words.of(row)?,
+            layer,
+            fault: gpu.layer_sink(layer)?,
         };
         let s = &mut self.scratch;
         let (d, k, stream, n) = (cx.d, cx.k, gpu.stream(), &lp.names);
@@ -1183,6 +1185,7 @@ impl AttnChain {
             x: streams_in,
             tokens: m,
             rms_eps: d.eps,
+            fault: cx.fault,
         };
         k.hc.enqueue_pre(stream, &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
 
@@ -1203,6 +1206,7 @@ impl AttnChain {
                     d.eps,
                     &mut src.act,
                     &mut s.normed,
+                    cx.fault,
                 )?;
                 enqueue_source(&cx, sp, src, io)?;
                 NormedAct::Source
@@ -1215,6 +1219,7 @@ impl AttnChain {
                     d.eps,
                     &mut s.acts.normed,
                     &mut s.normed,
+                    cx.fault,
                 )?;
                 NormedAct::Own
             }
@@ -1226,6 +1231,7 @@ impl AttnChain {
                     d.eps,
                     &mut s.acts.normed,
                     &mut s.normed,
+                    cx.fault,
                 )?;
                 NormedAct::Own
             }
@@ -1373,6 +1379,7 @@ impl AttnChain {
                 selected: list.map(|rows| SelectedRows {
                     rows,
                     stride: top_k,
+                    fault: cx.fault,
                 }),
                 vis: &vis,
                 sinks: vector(w, &n.sinks)?,
@@ -1404,6 +1411,9 @@ struct Cx<'a> {
     k: &'a Kernels,
     d: &'a Dims,
     words: RowWords<'a>,
+    /// The model layer the launches belong to, and its fault sink.
+    layer: usize,
+    fault: FaultSink,
 }
 
 /// The normed input's q8_1 form where `at` says it is: the compressor's
@@ -1449,6 +1459,7 @@ fn enqueue_query(
             d.eps,
             &mut s.acts.q_a,
             &mut s.q_a_normed,
+            cx.fault,
         )?;
     } else {
         cx.gpu.elem().enqueue_rms_norm(
@@ -1508,7 +1519,8 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
         Dense::Q3K(wa) => {
             // The groups' windows of the heads are the columns of one q8_1
             // activation of `groups` columns.
-            cx.gpu.enqueue_quantize_q8_1(&s.y, &mut s.acts.heads)?;
+            cx.gpu
+                .enqueue_quantize_q8_1_layer(&s.y, &mut s.acts.heads, cx.layer)?;
             cx.k.dense
                 .enqueue_q3k_heads(stream, wa, &s.acts.heads, d.o_lora_rank, &mut s.wo_a)?;
         }
@@ -1522,7 +1534,8 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
     }
     let out_b = Dense::of(w, &n.out_b, groups * d.o_lora_rank, d.n_embd)?;
     let act = if out_b.reads_q8_1() {
-        cx.gpu.enqueue_quantize_q8_1(&s.wo_a, &mut s.acts.wo_a)?;
+        cx.gpu
+            .enqueue_quantize_q8_1_layer(&s.wo_a, &mut s.acts.wo_a, cx.layer)?;
         Some(&s.acts.wo_a)
     } else {
         None
@@ -1594,7 +1607,7 @@ fn enqueue_indexer(
             (true, Some(src), _) => &src.act,
             (_, _, NormedAct::Own) => &s.acts.normed,
             _ => {
-                gpu.enqueue_quantize_q8_1(&s.normed, &mut sel.act)?;
+                gpu.enqueue_quantize_q8_1_layer(&s.normed, &mut sel.act, cx.layer)?;
                 &sel.act
             }
         };
@@ -1714,7 +1727,7 @@ fn enqueue_source(
     }
     match (&sp.keys, io.keys.as_deref_mut()) {
         (Some((proj, norm)), Some(keys)) => {
-            gpu.enqueue_quantize_q8_1(&src.pre, &mut src.act_pre)?;
+            gpu.enqueue_quantize_q8_1_layer(&src.pre, &mut src.act_pre, cx.layer)?;
             gpu.enqueue_gemv_q3k(q3_k(w, proj)?, &src.act_pre, &mut src.key)?;
             cx.k.key.enqueue_index_key(
                 stream,

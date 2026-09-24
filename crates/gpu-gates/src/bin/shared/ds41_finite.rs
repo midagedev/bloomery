@@ -5,12 +5,13 @@
 //! them, every seam whose streams hold a NaN or an infinity named, and at the
 //! first such MoE seam every buffer the sub-layer wrote, in launch order.
 //!
-//! The logits alone cannot see this. A q8_1 quantizer takes its scale from
-//! the block's `max(|v|)` and falls back to 1 when that is not above 0 — a
-//! NaN is not — and a NaN code converts to 0: the head's quantized input is
-//! then all zeros, every logit is 0, and the argmax is id 0. The residual
-//! streams keep the NaN from the seam where it appeared to the last layer,
-//! so the streams are where it shows.
+//! The engine's step already refuses such a position by name: the card's
+//! quantizers and routers raise the fault word (`bloomery_gpu::fault`) and
+//! the head's readback turns it into `GpuError::Fault`, naming the first
+//! layer and kernel family that met the value. This probe says more: the
+//! seam — which sub-layer's streams first held it — and at a MoE seam the
+//! buffer. The residual streams keep the NaN from the seam where it appeared
+//! to the last layer, so the streams are where it shows.
 //!
 //! It sits beside the bins, each including it with `#[path]`, not in the
 //! gpu-gates library: it names the V4.1 device crate, and a crate the library

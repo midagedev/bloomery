@@ -27,7 +27,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q5::Q5Kernels;
 #[cfg(feature = "gpu")]
-use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, RefRow};
 #[cfg(feature = "gpu")]
@@ -237,8 +237,25 @@ fn run() -> Result<(), GateError> {
         1,
         SEED,
     )?;
-    synth_q5_1_site(&q5, &gguf, stream, "ffn_down_dense0_synth", 6, SEED)?;
-    synth_q5_0_site(&q5, &gguf, stream, "ffn_down_exps_e0_synth", 0, 6, SEED)?;
+    synth_q5_1_site(
+        &q5,
+        &gguf,
+        stream,
+        "ffn_down_dense0_synth",
+        6,
+        SEED,
+        gpu.unlabelled_sink(),
+    )?;
+    synth_q5_0_site(
+        &q5,
+        &gguf,
+        stream,
+        "ffn_down_exps_e0_synth",
+        0,
+        6,
+        SEED,
+        gpu.unlabelled_sink(),
+    )?;
 
     // ---- summary: per family the max and median of each column over the
     // real lines.
@@ -600,6 +617,7 @@ fn synth_q5_1_site(
     site: &str,
     m: usize,
     seed: u32,
+    fault: FaultSink,
 ) -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
 
@@ -624,7 +642,7 @@ fn synth_q5_1_site(
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
     let mut act = Q8Blocks32::new(stream, k, m)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
-    q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act, fault)?;
     q5.enqueue_gemv_q5_1(stream, &w_dev, &act, 0, rows, 0, m, &mut y_dev, 0)?;
     stream.synchronize()?;
     let y = y_dev.to_host_vec(stream)?;
@@ -643,6 +661,10 @@ fn synth_q5_1_site(
 /// (`blk.1.ffn_down_exps.weight`, K=1408), reached by `row0` like the P2
 /// gate — the family's real input is a MUL_MAT_ID aggregate this round.
 #[cfg(feature = "gpu")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a gate-local measurement site threading the tensor, geometry and fault sink it drives; folding them into a params struct is R8's axis"
+)]
 fn synth_q5_0_site(
     q5: &Q5Kernels,
     gguf: &Gguf,
@@ -651,6 +673,7 @@ fn synth_q5_0_site(
     expert: usize,
     m: usize,
     seed: u32,
+    fault: FaultSink,
 ) -> Result<(), GateError> {
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_0};
 
@@ -678,7 +701,7 @@ fn synth_q5_0_site(
     let x_dev = DeviceBuffer::from_host(stream, &x)?;
     let mut act = Q8Blocks32::new(stream, k, m)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, rows * m)?;
-    q5.enqueue_quantize_q8(stream, &x_dev, &mut act)?;
+    q5.enqueue_quantize_q8(stream, &x_dev, &mut act, fault)?;
     q5.enqueue_gemv_q5_0(
         stream,
         &w_dev,

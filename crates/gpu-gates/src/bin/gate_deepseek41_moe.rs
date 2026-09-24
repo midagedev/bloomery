@@ -65,7 +65,10 @@
 //! Synthetic checks: router ties planted where the selection treats them
 //! differently (one lane, adjacent lanes, the two ends, three ways, the
 //! 6th/7th boundary, all equal, the bias deciding, every score 0), against
-//! the rule's statement, the weights finite; the clamp crossed on `silu(g)`,
+//! the rule's statement, the weights finite; weight rows NaN in all but four
+//! experts, where six slots cannot be filled and the router must raise its
+//! fault (`FaultSite::Router`) rather than fill the last two with expert 0;
+//! the clamp crossed on `silu(g)`,
 //! on `u > L` and on `u < -L`, and `L = 0` (no clamp), routed and shared,
 //! against the host and against the clamp's statement in f64
 //! (`stated_ratio`); an out-of-range expert id; one layer's seven launches
@@ -89,7 +92,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::route_core::renorm_divisor;
     use bloomery_gpu::weights::{DevWeight, Q8Block, q8_0_planes};
-    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels, silu_ik, swiglu_clamp};
     use bloomery_gpu_deepseek41::router::{
@@ -1054,6 +1057,7 @@ mod gate {
 
         let mut tally = Tally::default();
         tally.add(router_ties(&cx, &mut dv)?);
+        tally.add(router_nan(&cx, &mut dv)?);
 
         let mut first_routed = true;
         for l in 0..cx.meta.n_layer {
@@ -1195,6 +1199,7 @@ mod gate {
                 &ly.bias_dev,
                 scale,
                 &mut dv.rout,
+                cx.gpu.unlabelled_sink(),
             )?;
             let lk = dv.rout.logits.to_host_vec(stream)?;
             let pk = dv.rout.probs.to_host_vec(stream)?;
@@ -1208,6 +1213,7 @@ mod gate {
                 &ly.bias_dev,
                 scale,
                 &mut dv.rout,
+                cx.gpu.unlabelled_sink(),
             )?;
             rerun &= bits_equal(&lk, &dv.rout.logits.to_host_vec(stream)?)
                 && bits_equal(&pk, &dv.rout.probs.to_host_vec(stream)?)
@@ -2060,6 +2066,7 @@ mod gate {
             &ly.bias_dev,
             cx.meta.scale,
             &mut dv.rout,
+            cx.gpu.unlabelled_sink(),
         )?;
         cx.gpu.enqueue_quantize_q8_1(&dv.x, &mut dv.act_x)?;
         let args = ExpertGateUp {
@@ -2143,6 +2150,62 @@ mod gate {
         Ok(pass)
     }
 
+    /// Fewer finite candidates than slots: a K = 32 router whose weight rows
+    /// are NaN except those of four experts (`x` finite and one-hot), so
+    /// every other expert's logit, score and selection value is NaN and
+    /// `take` accepts none of them. Rounds five and six have no winner. The
+    /// kernel must raise [`FaultSite::Router`]; before the fault word the
+    /// rounds left `(−inf, 0)` and wrote expert 0 again with its finite
+    /// weight — duplicate ids, every weight finite, nothing any probe sees.
+    /// The line prints what the kernel wrote either way.
+    fn router_nan(cx: &Cx, dv: &mut Dev) -> Result<bool, GateError> {
+        const K: usize = 32;
+        // Expert 0 among the four: rounds five and six fall back to id 0,
+        // whose score is finite, so the old kernel's weights came out finite.
+        const LIVE: [usize; 4] = [0, 42, 100, 300];
+        let stream = cx.gpu.stream();
+        let mut w = vec![f32::NAN; N_EXPERT * K];
+        for (j, &r) in LIVE.iter().enumerate() {
+            w[r * K..(r + 1) * K].fill(0.0);
+            w[r * K] = 5.0 + j as f32;
+        }
+        let mut x = vec![0.0f32; K];
+        x[0] = 1.0;
+        let w_dev = DeviceTensor::upload(stream, &w, N_EXPERT, K)?;
+        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        let b_dev = DeviceBuffer::from_host(stream, &vec![0.0f32; N_EXPERT])?;
+        cx.router.enqueue_router(
+            stream,
+            &w_dev,
+            &x_dev,
+            &b_dev,
+            cx.meta.scale,
+            &mut dv.rout,
+            cx.gpu.unlabelled_sink(),
+        )?;
+        let ids = dv.rout.ids.to_host_vec(stream)?;
+        let wk = dv.rout.weights.to_host_vec(stream)?;
+        let tickets = dv.rout.tickets(stream)?;
+        let got = cx.gpu.take_fault()?;
+        let want = Fault {
+            layer: LAYER_NONE,
+            code: FaultSite::Router as u32,
+        };
+        let mut distinct = ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let pass = got == Some(want) && tickets == 0;
+        println!(
+            "nan_rows case=four_finite_experts ids={ids:?} distinct={} weights_finite={} tickets={tickets} \
+             want=router got={} {}",
+            distinct.len(),
+            wk.iter().all(|v| v.is_finite()),
+            got.map_or("none".to_string(), |f| f.to_string()),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     /// The router's selection on planted ties (a K = 32 router whose logits
     /// are its first weight column against a one-hot input), against the
     /// rule's statement and the host's selection from the kernel's scores;
@@ -2210,8 +2273,15 @@ mod gate {
             }
             let w_dev = DeviceTensor::upload(stream, &w, N_EXPERT, K)?;
             let b_dev = DeviceBuffer::from_host(stream, &bias)?;
-            cx.router
-                .enqueue_router(stream, &w_dev, &x_dev, &b_dev, scale, &mut dv.rout)?;
+            cx.router.enqueue_router(
+                stream,
+                &w_dev,
+                &x_dev,
+                &b_dev,
+                scale,
+                &mut dv.rout,
+                cx.gpu.unlabelled_sink(),
+            )?;
             let pk = dv.rout.probs.to_host_vec(stream)?;
             let ids_k = dv.rout.ids.to_host_vec(stream)?;
             let wk = dv.rout.weights.to_host_vec(stream)?;

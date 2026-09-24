@@ -18,8 +18,8 @@
 //!   moves with the placement and the rounding; this one is fed.
 //!
 //! Red on any of: a position whose streams hold a NaN or an infinity at any
-//! seam (the logits cannot show it: the head's quantizer turns an all-NaN
-//! input into zero codes, every logit comes out 0 and the argmax is id 0); a
+//! seam (the engine's step refuses it too, with the fault word's layer and
+//! site; the probe names the seam and the buffer); a
 //! run of [`COLLAPSE`] or more equal generated tokens; a position whose eager
 //! argmax is not the engine's token; and, on the free arm, a first difference
 //! with ik's greedy ids (`greedy-ik-cpu-64-p0.tsv`, which stops at ik's EOS)

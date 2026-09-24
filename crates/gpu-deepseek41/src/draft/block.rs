@@ -518,6 +518,7 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
                 scale: d.routed_scale,
                 norm: d.weights_norm,
                 tok,
+                fault: cx.gpu.unlabelled_sink(),
             },
             &mut b.router,
         )?;
@@ -537,7 +538,8 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
     };
     let n_slots = N_USED * m;
     let act_x = &mut b.act_x[m - 1];
-    cx.k.dflash.enqueue_quantize(s, &b.normed_f, act_x)?;
+    cx.k.dflash
+        .enqueue_quantize(s, &b.normed_f, act_x, cx.gpu.unlabelled_sink())?;
     cx.k.dflash.enqueue_gate_up(
         s,
         &GateUpArgs {
@@ -552,7 +554,8 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
         &mut b.h,
     )?;
     let act_h = &mut b.act_h[m - 1];
-    cx.k.dflash.enqueue_quantize(s, &b.h, act_h)?;
+    cx.k.dflash
+        .enqueue_quantize(s, &b.h, act_h, cx.gpu.unlabelled_sink())?;
     cx.k.dflash.enqueue_down(
         s,
         &DownArgs {
