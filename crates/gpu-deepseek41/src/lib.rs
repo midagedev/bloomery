@@ -7,7 +7,8 @@
 //! it is `pub` and `#[inline(always)]`, and it inlines into the same
 //! instructions it compiles to in its own crate.
 //!
-//! Every kernel entry in this crate is named `ds41_<op>`: cuda-oxide derives
+//! Every kernel entry in this crate carries a model prefix, `ds41_<op>` for
+//! the V4.1 target and `dflash_<op>` for the DSpark draft: cuda-oxide derives
 //! a kernel's host symbol from the entry name alone, not from its crate or
 //! module, so an entry name another crate also declares fails to link.
 //!
@@ -22,6 +23,7 @@ pub mod chain;
 pub mod compress;
 pub mod engram_gate;
 pub mod experts;
+pub mod experts_mxfp4;
 pub mod hc;
 pub mod hc_f32;
 pub mod index_key;

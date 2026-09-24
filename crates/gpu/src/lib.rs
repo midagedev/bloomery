@@ -39,6 +39,7 @@ pub mod hybrid;
 pub mod join_probe;
 pub mod model;
 pub mod moe_fused;
+pub mod mxfp4;
 pub mod probe;
 pub mod q4k_sel;
 pub mod q5;
