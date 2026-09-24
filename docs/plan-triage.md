@@ -4,7 +4,7 @@
 
 ## 비행 중 (파동 21, 09-25 04:10~)
 
-~~`dspark-q3k`~~(착륙 `f1d1168`: 공개 Q3_K_M 파일에서 드래프트 로드, 임베딩 행 카드 디코드 비트 동일 핀, fault 회수; `gate-gpu-dspark-graph`는 공개 파일에서 ik 세트 탭 61줄만 빨강 — 세트가 혼합 파일에서 뜬 것, 시팅 10) ‖ `ds41hcbranch` ‖ ~~`unionhost`~~(착륙 `e644f5a`: `experts_union_into` 열마다 비트 동일, `gate-union`, ab-decode +0.3 % 잣대 안) → 시차를 두고 `ds41splitk` ‖ `qwen3route` ‖ ~~`fixup3`~~(착륙 `9e72c80`: 16건 중 15 닫음, 11번 절반 — `body.rs:105`의 `PlanInputs` 둘째 읽기는 gpuq1로). 스펙은 세션 밖 사본 `~/.claude/projects/-Users-hckim-repo-bloomery/specs/wave-m5/`. 머지 순서는 비트 불변(hcbranch·q3k·unionhost·qwen3route·fixup3) 먼저, float 순서(splitk) 마지막.
+~~`dspark-q3k`~~(착륙 `f1d1168`: 공개 Q3_K_M 파일에서 드래프트 로드, 임베딩 행 카드 디코드 비트 동일 핀, fault 회수; `gate-gpu-dspark-graph`는 공개 파일에서 ik 세트 탭 61줄만 빨강 — 세트가 혼합 파일에서 뜬 것, 시팅 10) ‖ `ds41hcbranch` ‖ ~~`unionhost`~~(착륙 `e644f5a`: `experts_union_into` 열마다 비트 동일, `gate-union`, ab-decode +0.3 % 잣대 안) → 시차를 두고 `ds41splitk`(보고 받음: 분할 기본값을 1로 낮춰 리드 재실행 중 — 아래 「V4.1 카드 경로」) ‖ ~~`qwen3route`~~(착륙 `be05ad7`: K1 라우터 그리드 128블록 비트 동일, K4 head argmax 커널은 게이트만 — `head.rs` 읽기 전용이라 미배선, `bin:` 팔) ‖ ~~`fixup3`~~(착륙 `9e72c80`: 16건 중 15 닫음, 11번 절반 — `body.rs:105`의 `PlanInputs` 둘째 읽기는 gpuq1로). 스펙은 세션 밖 사본 `~/.claude/projects/-Users-hckim-repo-bloomery/specs/wave-m5/`. 머지 순서는 비트 불변(hcbranch·q3k·unionhost·qwen3route·fixup3) 먼저, float 순서(splitk) 마지막.
 
 ## 열린 라운드 카드
 
@@ -36,7 +36,7 @@
 3. **C** 깊이 1024·4096 merge(hcfin은 세그먼트 수 비례) + m=5 프리필 행(`ds41_attn_merge` blk/SM 3 → 1의 파동 증가).
 4. **D** `just measure-qdot-rate`(v4host 예측: IQ3_XXS 4.0–5.2 GB/s — 4.6 아래면 V4 호스트 레그는 ALU 바운드라 40–54 tok/s 항 재판정; MXFP4 12.8–14.6; ours/ik 0.95–1.05; Q3_K 앵커 10.8) + `just ab-decode <d467767 base>`(F16C + `fuses`, 예상 ≤ 잡음).
 5. dskq A/B(`q4k_gemv` 48 → 40 regs, base `bloomery-dskq-base` 45ed364, V4.1에선 ≈ 0 예상).
-6. qwen3deep 4096 A/B(base `bloomery-qwen3deep-base` 13dd74d; `bin:` 팔은 `qwen3route`가 넣는다) — 예측 176–181 대 base 160.74.
+6. qwen3deep 4096 A/B(base `bloomery-qwen3deep-base` 13dd74d — 09-24 빌드; `just depth-gpu-qwen3moe 6 4096 bin:/root/repo/bloomery-qwen3deep-base/target/release/generate_qwen3moe:6 bin:…:4096`) — 예측 176–181 대 base 160.74; 같은 임대에서 K1의 깊이 6 팔(`bloomery-qwen3route-base` 43d5ba9 `f7a00a8483f7`이 base)도: 208–209 대 base[유도].
 7. `ds41router-a3`(181e2f6 = 옛 base + A3): A3 hunk를 main에 리베이스한 뒤 base/A3 두 팔, 깊이 6·1024·4096; 이기면 `_sel` 스필 8 B를 `PIN`으로 래칫에 적고 머지.
 8. shadowhost A/B(base `~/repo/bloomery-shadowhost-base`): A base 무예산 / B 새 트리 `BLOOMERY_CARD_BUDGET=49610227712` / C 새 트리 무예산, 기대 ≤ 0.5 % — A/A 팔, 바퀴 많이.
 9. 합집합 벤치: `just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms engine:3,engine:3x4,engine:3x4u0.75,engine-sep:3x4u0.75,engine:3x3`(오늘 행별 호출이 둘째 읽기를 L3에서 받는지) + `e644f5a`의 `union:` 팔 — `--arms engine:3x6u0.75,engine-sep:3x6u0.75,union:3x6u0.75`(토큰당 ms ≈ union_bytes / 135 GB/s ± 5 %; 예측 630 슬롯 → 474 distinct, 78.3 → 58.9 ms[유도]; 1.15배 넘게 느리면 defer 몫 먼저). `--time`의 토큰 루프는 아직 한 번도 안 돌았다.
@@ -117,7 +117,8 @@
 
 ### Qwen3-30B-A3B (qwen3fast 지도, `research`; E28 실측 rig-log 09-24#qwen3-30b-a3b-e28)
 
-- 바닥 2.67 ms(1,919.6 MB @ 720 GB/s), 오늘 4.855 ms = 55 %: 바닥 + 큰 커널 적자 0.52 + 작은 커널 ~1.05 + 노드 틈 0.56. 순서 ① `qwen3route`(비행) ② `qwen3fuse` K2 653 → ~410노드(M, 238–250) ③ `qwen3bw` K3 큰 커널 대역(down `_sel` K=768 꼬리 경로 24/32레인 `cores.rs:307-350`, M, 253–270) ④ `qwen3spec` m행 검증 그래프화(`prefill.rs:175` eager) + 합집합 + EAGLE-3(L) ⑤ IQ4_XS ⑥ 메가커널(3.30–3.55 ms). 기각: L2 퍼시스턴스, Q4_0, 0.6B 드래프트(α 0.56–0.62). 공개 비교는 투기 대 투기(mainline에 EAGLE3·DFlash).
+- 바닥 2.67 ms(1,919.6 MB @ 720 GB/s), 오늘 4.855 ms = 55 %: 바닥 + 큰 커널 적자 0.52 + 작은 커널 ~1.05 + 노드 틈 0.56. 순서 ① ~~`qwen3route`~~ be05ad7(K1 착륙, 재유도 −43…−80 µs/스텝 → 208–209 tok/s[유도] — 시팅 6의 `bin:` 팔로 잰다; K4 커널 착륙·미배선; K5 설계만: 문맥 전체 rope 표 16 MiB[유도] + 토큰 반은 `head.rs`·`model.rs` `refresh` 변경, rope 행만으로는 스텝당 H2D 한 번이 남는다) ② `qwen3fuse` K2 653 → ~410노드(M, 238–250) — **K4 배선부터**: `head.rs` 접근자 하나(`scratch_mut() -> (&Q8Act, &mut logits, &mut token_out)`), `model.rs:845` `head.token()`, e2e `logits_to_host()`, `NODES_CHAIN` 653 → 652 ③ `qwen3bw` K3 큰 커널 대역(down `_sel` K=768 꼬리 경로 24/32레인 `cores.rs:307-350`, M, 253–270) ④ `qwen3spec` m행 검증 그래프화(`prefill.rs:175` eager) + 합집합 + EAGLE-3(L) ⑤ IQ4_XS ⑥ 메가커널(3.30–3.55 ms). 기각: L2 퍼시스턴스, Q4_0, 0.6B 드래프트(α 0.56–0.62). 공개 비교는 투기 대 투기(mainline에 EAGLE3·DFlash).
+- qwen3route 남긴 것: `q8f32.rs:230-240` w32 워크 문서 "32청크 비행"이 거짓 — ptxas 40 regs에서 26적재만 선발행(V4.1 `router.rs:148`도 같은 워크, sass-scan 먼저, S); `gate_qwen3moe_router.rs:384-427` 티켓 off-by-one을 못 본다(변이 `+2 == gridDim` 초록 — 재생 루프나 지연 블록으로 핀, S); Q6_K 1열 행 본문 세 벌(`lib.rs:879`, `q6k_sel.rs:55`, `head_argmax.rs`) → `cores::q6k_row_dot_1col`(splitk 뒤, M); `router.rs` `route_warp` NaN 레인 → 중복 id 0, 폴트 없음(V4.1은 `FaultSite::Router`; 조용한 실패, S); `f32_lane_partials` 다열에 적재 선발행 없음 → 프리필 라우터 지연 사슬(S–M); `justfile:920` `ptx-scan` 위치 FEATURES를 조용히 받아 장치 섹션 없는 바이너리를 만든다(거부, S).
 - qwen3perf 남긴 것: `gate_up_swiglu_q4k` regs 40 → 48(blk/SM 6 → 5, `slot / slots_per_col` 나눗셈 추정 — timed A/B 1회, m = 1 분기 복원 가능 `experts.rs:55`); `q4k_gemv` 여러 열 경로가 K 4096에서 1열과 비트 다름(col 0 1037/2048, `cores.rs:384` "bit for bit" 거짓 — 원인 + 누산 통일 + 게이트 한 줄, M); `q6k_gemv` 행 코어 없음(`lib.rs:805`, M); `Q8Act` m ≤ 8이 프리필 막음(S–M); seg 패스가 n_kv·segs 블록 전부(`flash_gqa.rs:227`, ctx 32k −0.1 ms, M); `gate_deepseek41_step.rs:2190,2418` `top2`/`ppl` 중복(S).
 - 비교 대상: local-ai-registry PR #83의 Qwen3.6-35B-A3B EXL3 3.0 bpw + MTP 252/352 tok/s(3090). 박스 파일은 UD-Q4_K_XL(스텝 2,884 MB, 바닥 324 tok/s 3090 / 243 A6000[유도], MTP 층 없음) — **첫 목표: 35B-A3B Q3_K급 파일, 드래프트 없이 3090에서 252 초과**(`research/linear-attn.md` §6). dense 27B는 이용률 + MTP k>1이 있어야.
 
