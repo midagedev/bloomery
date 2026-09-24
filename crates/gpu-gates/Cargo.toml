@@ -34,7 +34,22 @@ cuda-core = { workspace = true, optional = true }
 # `BLOOMERY_STEP_STATS`. Reached only through the `deepseek41` feature.
 bloomery-threads = { path = "../threads", optional = true }
 libc = { workspace = true, optional = true }
+# `bloomery-chat`: text in through the file's own vocabulary, a sampled or greedy
+# choice over the head's logits, text out. Reached only through the `deepseek41` feature.
+bloomery-tokenizer = { path = "../tokenizer", optional = true }
+bloomery-sampler = { path = "../sampler", optional = true }
 
 [features]
 gpu = ["dep:bloomery-gpu", "dep:cuda-core"]
-deepseek41 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-threads", "dep:libc"]
+deepseek41 = [
+    "gpu",
+    "dep:bloomery-gpu-deepseek41",
+    "dep:bloomery-threads",
+    "dep:libc",
+    "dep:bloomery-tokenizer",
+    "dep:bloomery-sampler",
+]
+
+[[bin]]
+name = "bloomery-chat"
+path = "src/bin/bloomery_chat.rs"

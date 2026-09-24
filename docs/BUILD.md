@@ -79,7 +79,7 @@ None of these is needed for a plain run with `--tokens`.
 
 ## Running `generate_ds41`
 
-Today the CLI takes token ids and prints token ids. Decoding is greedy, one token per step. There is no tokenizer in the engine yet.
+`generate_ds41` takes token ids and prints token ids, greedy, one token per step; `bloomery-chat` (below) takes text and streams text through the file's own tokenizer and the sampling chain.
 
 ```sh
 BLOOMERY_REF_MODEL=... target/release/generate_ds41 --place gate --tokens 671,6102,294,8760,344 -n 32
@@ -98,6 +98,8 @@ BLOOMERY_REF_MODEL=... target/release/generate_ds41 --place gate --tokens 671,61
 The placement plans are built from this machine's two cards and its RAM (`crates/model/src/placement/workstation.rs`). The card is found by its CUDA device name, so `--place gate` needs a device whose name contains `3090` and `--place a` one that contains `A6000`.
 
 The default placement is `a`. The output has a `load` line (thread pinning, the indexer's `top_k`) and a `tokens` line with the generated ids.
+
+`bloomery-chat` takes text instead of ids (build it with `--bin bloomery-chat` in the command above): `BLOOMERY_REF_MODEL=... target/release/bloomery-chat --place gate --prompt "The capital of France is" -n 64` streams the continuation to stdout, sampled at the reference defaults (`--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`) or with `--greedy`, and applies no chat template.
 
 ### HTTP server (`bloomery-serve`)
 

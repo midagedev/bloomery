@@ -16,6 +16,8 @@ pub mod block;
 pub mod draft;
 pub mod ds41_meta;
 pub mod engine;
+#[cfg(feature = "deepseek41")]
+pub mod generate;
 pub mod ik_norm;
 pub mod ik_q8_2;
 pub mod kld;
