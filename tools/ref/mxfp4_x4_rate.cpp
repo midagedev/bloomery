@@ -21,7 +21,7 @@ static const int kPasses = 6;
 int main() {
     const size_t rs = 17 * (kK / 32);
 
-    // Same xorshift64* filler as qdot-rate, then every block's E8M0 byte masked into
+    // Same bytes as qdot-rate's xorshift64* filler, then every block's E8M0 byte masked into
     // 112..127 (qdot-rate applies the same mask): raw bytes would give e = 0 or 1, a
     // subnormal f32 scale, in 2 blocks of 256 on average.
     unsigned long long s = 0x9E3779B97F4A7C15ull;
@@ -30,7 +30,7 @@ int main() {
         return s * 0x2545F4914F6CDD1Dull;
     };
     std::vector<uint8_t> w((size_t)kRows * rs);
-    for (size_t i = 0; i + 8 <= w.size(); i += 8) memcpy(&w[i], &s, 8), next();
+    for (size_t i = 0; i + 8 <= w.size(); i += 8) { const unsigned long long v = next(); memcpy(&w[i], &v, 8); }
     for (size_t b = 0; b < w.size(); b += 17) w[b] = 0x70 | (w[b] & 0x0f);
     std::vector<float> col(kK);
     for (int i = 0; i < kK; ++i) col[i] = (((long long)i % 31) - 15.0f) / 16.0f;

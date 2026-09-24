@@ -46,8 +46,8 @@
 
 use crate::GpuError;
 use crate::flash::{
-    MMA_K, MMA_NTILE, MMA_ROWS, dev_exp, f32_to_f16_bits, half_bits_to_f32, mma_row_words,
-    online_fold,
+    MERGE_BATCH, MMA_K, MMA_NTILE, MMA_ROWS, dev_exp, f32_to_f16_bits, half_bits_to_f32,
+    mma_row_words, online_fold,
 };
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -89,9 +89,6 @@ const _: () = assert!(KEY_TILE == 4 * MMA_NTILE && HEAD.is_multiple_of(2 * MMA_K
 
 /// Merge threads per head: one per dim.
 const MERGE_THREADS: u32 = HEAD as u32;
-/// Segments whose partials the merge loads as one batch before it folds
-/// them.
-const MERGE_BATCH: usize = 16;
 
 /// Whether [`FlashGqaKernels::enqueue`] runs the tensor-core segment pass
 /// ([`flash_gqa_kernels::gqa_flash_seg_mma`]) rather than the f32 scalar one

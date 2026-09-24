@@ -65,8 +65,15 @@
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 3),
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_ARM_BOUND
 # (seconds one arm may run, default 900: a hung arm fails the runner with rc 124/137 instead of
-# holding the lease), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree lines and
-# the rotation, then exit 0 before the lease: nothing is loaded and nothing is timed).
+# holding the lease), BLOOMERY_DRY=1 (print each arm's command line, the binaries' tree lines, the
+# CPU guard's settings and reading, and the rotation, then exit 0 before the lease: nothing is loaded
+# and nothing is timed).
+#
+# Contention. Before every arm the runner checks both the other card (guard_other, timing-card.sh:
+# `[other-busy]`) and the CPU (guard_cpu, lease.sh: `[cpu-busy]` when builds or reference engines it
+# did not start — BLOOMERY_CPU_BUSY_COMMS — sum past BLOOMERY_CPU_BUSY_PCT percent of one cpu), and
+# checks the CPU again after the arm; a row that met CPU contention ends in ` [cpu-busy]` and the
+# closing summary counts those rows. BLOOMERY_OTHER_STRICT=1 aborts (rc 75) on either instead.
 set -uo pipefail
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_ENV, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # LCPP_NCMOE); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so the three
@@ -141,12 +148,21 @@ if [ "$ik" = 1 ]; then [ -x "$IKBIN" ] || { echo "depth-ds41.sh: no llama-bench 
 if [ "$lcpp" = 1 ]; then [ -x "$LCPPBIN" ] || { echo "depth-ds41.sh: no llama-bench at $LCPPBIN" >&2; exit 2; }; fi
 CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 # A binary's sha256 and its tree's HEAD and dirty count, once. GIT_OPTIONAL_LOCKS=0 keeps `git
-# status` from rewriting the index of a tree this root process does not own.
+# status` from rewriting the index of a tree this root process does not own. A tree box.sh synced
+# has no .git (the rsync leaves it out): when that tree is the one this runner stands in, its commit
+# is box.sh's BLOOMERY_GIT_COMMIT (`-dirty` when the Mac tree held uncommitted changes), printed as
+# `head=<commit>(box.sh) dirty_files=?`; any other tree without git prints `head=? dirty_files=?`.
 tree_line() {
   local bin=$1 tree=$2 sha head dirty
   sha=$(sha256sum "$bin" | cut -c1-12)
-  head=$(git -c safe.directory="$tree" -C "$tree" rev-parse --short=9 HEAD 2> /dev/null || echo '?')
-  dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
+  if head=$(git -c safe.directory="$tree" -C "$tree" rev-parse --short=9 HEAD 2> /dev/null); then
+    dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
+  else
+    head='?' dirty='?'
+    if [ -n "${BLOOMERY_GIT_COMMIT:-}" ] && [ "$(cd "$tree" 2> /dev/null && pwd -P)" = "$(pwd -P)" ]; then
+      head="$BLOOMERY_GIT_COMMIT(box.sh)"
+    fi
+  fi
   echo "$bin sha256=$sha head=$head dirty_files=$dirty"
 }
 IK_LINE='' LCPP_LINE='' BIN_LINES=()
@@ -206,6 +222,7 @@ ref_arm() {
   rc=$?
   t1=$(date +%s)
   witness "post r$r $eng d=$dep"
+  guard_cpu "post r$r $eng d=$dep"
   val=$(echo "$raw" | grep -F "$REF_LABEL" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
   if [ $rc -ne 0 ] || [ -z "$val" ]; then
     # The whole output goes to a file: the loader's reason for a failed load is many lines
@@ -221,7 +238,8 @@ ref_arm() {
   echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
   build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
   dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
-  echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s"
+  echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG"
+  [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
   sums+=("$eng|$dep|$r|$val|")
 }
 
@@ -243,6 +261,7 @@ ours_arm() {
   rc=$?
   t1=$(date +%s)
   witness "post r$r $label d=$dep n=$N"
+  guard_cpu "post r$r $label d=$dep"
   if [ $rc -ne 0 ]; then
     echo "r$r $label d=$dep FAILED rc=$rc" >&2
     echo "$out" | tail -n 20 >&2
@@ -263,7 +282,8 @@ ours_arm() {
   uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
   tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
   tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-  echo "ROW r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft} | wall $((t1 - t0))s"
+  echo "ROW r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft} | wall $((t1 - t0))s$CPU_BUSY_TAG"
+  [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
   if [ -n "$draft" ]; then tps_mean=${draft##*tok/s(positions)=}; fi
   sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
 }
@@ -271,6 +291,7 @@ ours_arm() {
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   ref_witness | sed 's/^   /[dry]/'
+  echo "[dry] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0} now: $(cpu_busy_reading)"
   for i in "${!ARMS[@]}"; do
     a=${ARMS[$i]}
     dep=${A_DEP[$i]}
@@ -300,15 +321,20 @@ echo "[config] ours: $BIN (placement (a), default ctx)"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 witness pre
 ref_witness
 guard_other
+guard_cpu pre
 
 sums=()
+busy_rows=0
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#ARMS[@]} - 1))); do
     j=$(((i + r - 1) % ${#ARMS[@]}))
+    CPU_BUSY_TAG=
     guard_other
+    guard_cpu "pre r$r ${ARMS[$j]}"
     case ${A_KIND[$j]} in
       ref) ref_arm "${A_ENG[$j]}" "${A_DEP[$j]}" "$r" ;;
       *) ours_arm "$j" "$r" ;;
@@ -316,6 +342,7 @@ for r in $(seq "$ROUNDS"); do
   done
 done
 echo
+echo "cpu-busy rows: $busy_rows of ${#sums[@]} (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
 echo "    llama-bench's own mean over the N steps — the cross-engine ratio reads these. The p50"
 echo "    column is ours only. ==="

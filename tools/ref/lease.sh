@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # The machine-wide lease and what the runners under it share. Sourced, never executed: it defines
-# functions and two variables and exports nothing, and nothing here may exit or fail at top level
+# functions and variables and exports nothing, and nothing here may exit or fail at top level
 # (most runners run under `set -e`).
 #
 #   source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -12,6 +12,7 @@
 # What it owns, so that the runners cannot drift apart:
 #   the lease: its file, its descriptor (9), the 30-minute wait, exit 75 when the wait runs out;
 #   the witness block: its four header forms and every field a runner can list, each spelled once;
+#   the CPU-contention guard between arms (guard_cpu), the CPU side of timing-card.sh's guard_other;
 #   the two arm helpers the depth and A/B runners share: the LCG prompt of a depth and the
 #   bloomery-decode binary of a tree.
 # Which card is timed, and the card's own witness lines, stay in timing-card.sh (the `card` field).
@@ -73,6 +74,48 @@ lease_netdata() {
 }
 
 lease_release() { exec 9>&-; }
+
+# CPU contention between arms. The lease serializes timed runs, not builds: another round's cargo
+# build, or a reference engine this runner did not start, shares the cores a timed arm runs on, and
+# the `busiest` witness field only shows it. guard_cpu sums `ps` %CPU over the processes whose name
+# is in CPU_BUSY_COMMS (BLOOMERY_CPU_BUSY_COMMS); above CPU_BUSY_PCT (BLOOMERY_CPU_BUSY_PCT, percent
+# of one cpu — a chosen threshold, not a measured one) it prints `[cpu-busy]` on stderr and sets
+# CPU_BUSY_TAG to ` [cpu-busy]` for the runner's row; with BLOOMERY_OTHER_STRICT=1 it prints a
+# witness block and exits 75 instead, as guard_other does for a busy other card. `ps` %CPU is cpu
+# time over elapsed time: a build started seconds ago reads its real load, a long-lived process that
+# only now turned busy reads low. Call it only between the runner's own arms, when no matching
+# process is the runner's own; the runner clears CPU_BUSY_TAG when a row starts.
+CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-cargo rustc cc1plus llama-bench generate_ds41}
+CPU_BUSY_PCT=${BLOOMERY_CPU_BUSY_PCT:-50}
+CPU_BUSY_TAG=
+
+# cpu_busy_reading: `<sum of %CPU> <name %CPU;...>` over the processes CPU_BUSY_COMMS names.
+cpu_busy_reading() {
+  ps -eo pcpu=,comm= | awk -v list=" $CPU_BUSY_COMMS " '
+    index(list, " " $2 " ") { s += $1; m = m sprintf("%s %s%%;", $2, $1) }
+    END { printf "%.1f %s\n", s, m }'
+}
+
+guard_cpu() {
+  local tag=$1 reading sum
+  case $CPU_BUSY_PCT in
+    '' | *[!0-9.]* | *.*.*)
+      echo "guard_cpu: BLOOMERY_CPU_BUSY_PCT is a percentage, got '$CPU_BUSY_PCT'" >&2
+      exit 64
+      ;;
+  esac
+  reading=$(cpu_busy_reading)
+  sum=${reading%% *}
+  awk -v s="$sum" -v t="$CPU_BUSY_PCT" 'BEGIN { exit !(s > t) }' || return 0
+  echo "[cpu-busy] $(now) $tag: ${sum}% > ${CPU_BUSY_PCT}% of one cpu over [${reading#* }]" >&2
+  # shellcheck disable=SC2034 # the sourcing runner reads it into its row
+  CPU_BUSY_TAG=' [cpu-busy]'
+  if [ "${BLOOMERY_OTHER_STRICT:-}" = 1 ]; then
+    witness abort-cpu >&2
+    exit 75
+  fi
+  return 0
+}
 
 witness() {
   local tag=$1 field fn

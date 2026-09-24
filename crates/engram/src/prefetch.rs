@@ -153,9 +153,12 @@ impl Prefetcher {
     }
 
     /// [`Prefetcher::new`] with the helper's cpu and classification named.
-    /// Returns once the helper has pinned itself (or failed to: a container
-    /// may refuse, and the helper then floats — [`Prefetcher::pinned_cpu`]
-    /// says which).
+    /// Returns once the helper has placed itself: pinned to the cpu asked
+    /// for, or floating when none is asked or the kernel refuses the pin (a
+    /// container may) — [`Prefetcher::pinned_cpu`] says which. A floating
+    /// helper spawned from a caller pinned to one cpu widens its mask, so it
+    /// does not share that cpu; a mask the kernel will not widen is an
+    /// error.
     pub fn with_options(
         engram: Arc<Engram>,
         max_rows_per_site: &[usize],
@@ -190,20 +193,24 @@ impl Prefetcher {
 
         let (job_tx, job_rx) = channel::<Job>();
         let (done_tx, done_rx) = channel::<Filled>();
-        let (pin_tx, pin_rx) = channel::<Option<usize>>();
+        let (pin_tx, pin_rx) = channel::<Result<Option<usize>, &'static str>>();
         let handle = std::thread::Builder::new()
             .name("engram-prefetch".into())
             .spawn(move || {
-                let pinned = options.cpu.filter(|&c| pin_to(c));
+                let placed = place_helper(options.cpu);
+                let refused = placed.is_err();
                 // The owner waits on this before its first submit; a closed
                 // receiver means it already gave up, and the jobs channel
                 // tells the loop the same.
-                let _ = pin_tx.send(pinned);
-                helper(&engram, options, &job_rx, &done_tx);
+                let _ = pin_tx.send(placed);
+                if !refused {
+                    helper(&engram, options, &job_rx, &done_tx);
+                }
             })?;
         let cpu = pin_rx
             .recv()
-            .map_err(|_| EngramError::Prefetch("helper thread exited at start"))?;
+            .map_err(|_| EngramError::Prefetch("helper thread exited at start"))?
+            .map_err(EngramError::Prefetch)?;
 
         Ok(Prefetcher {
             jobs: Some(job_tx),
@@ -461,29 +468,76 @@ fn helper(engram: &Engram, options: HelperOptions, jobs: &Receiver<Job>, done: &
 /// The SMT sibling of the core the calling thread is pinned to, if the
 /// thread's affinity is exactly one cpu and that core has a sibling
 /// (`/sys/devices/system/cpu/cpu<c>/topology/thread_siblings_list`). `None`
-/// for a floating caller or a core without SMT: the helper then floats too.
+/// for a floating caller or a core without SMT: the helper then floats too,
+/// off the caller's cpu ([`Prefetcher::with_options`]).
 #[must_use]
 pub fn caller_sibling() -> Option<usize> {
-    // SAFETY: `set` is a zeroed cpu_set_t that `sched_getaffinity` fills with
-    // the matching size, and `CPU_ISSET` only reads it.
-    let set = unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-            return None;
-        }
-        set
-    };
-    let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
-    // SAFETY: `c < max`, the set's own bit count.
-    let mut on = (0..max).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) });
-    let (Some(cpu), None) = (on.next(), on.next()) else {
-        return None;
-    };
+    let cpu = sole_cpu().ok()??;
     let list = std::fs::read_to_string(format!(
         "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
     ))
     .ok()?;
     cpu_list(&list).find(|&c| c != cpu)
+}
+
+/// The one cpu the calling thread's affinity holds; `None` for a mask of
+/// more than one cpu, an error when the kernel will not report the mask.
+fn sole_cpu() -> Result<Option<usize>, &'static str> {
+    // SAFETY: `set` is a zeroed cpu_set_t that `sched_getaffinity` fills with
+    // the matching size.
+    let set = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Err("sched_getaffinity refused the engram helper thread its own mask");
+        }
+        set
+    };
+    let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    // SAFETY: `c < max`, the set's own bit count; `CPU_ISSET` only reads.
+    let mut on = (0..max).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) });
+    Ok(match (on.next(), on.next()) {
+        (Some(cpu), None) => Some(cpu),
+        _ => None,
+    })
+}
+
+/// Place the calling thread, the helper: pinned to `cpu` when one is asked
+/// for and the kernel allows it (`Some`), else floating (`None`). A thread
+/// spawned from a caller pinned to one cpu inherits that one-cpu mask, so
+/// floating there widens the mask to every cpu (the kernel keeps it inside
+/// the process's cpuset); a mask of more than one cpu already floats and is
+/// kept, restrictions and all. A mask that cannot be read or widened is an
+/// error: the helper would otherwise run on the caller's cpu while claiming
+/// to float.
+fn place_helper(cpu: Option<usize>) -> Result<Option<usize>, &'static str> {
+    if let Some(c) = cpu
+        && pin_to(c)
+    {
+        return Ok(Some(c));
+    }
+    if sole_cpu()?.is_some() && !float_everywhere() {
+        return Err(
+            "sched_setaffinity refused to widen the engram helper's inherited \
+                    one-cpu mask: it would share its opener's cpu",
+        );
+    }
+    Ok(None)
+}
+
+/// Widen the calling thread's affinity to every cpu the set can name; false
+/// when the kernel refuses.
+fn float_everywhere() -> bool {
+    let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET` with
+    // indices below its own bit count, and `sched_setaffinity` reads it with
+    // the matching size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for c in 0..max {
+            libc::CPU_SET(c, &mut set);
+        }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
 }
 
 /// The cpus of a sysfs cpu list (`0,32`, `0-1`, `0-3,8`); a malformed entry
@@ -511,5 +565,95 @@ fn pin_to(cpu: usize) -> bool {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu, &mut set);
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pin_to, place_helper, sole_cpu};
+
+    /// The cpus of the calling thread's affinity mask.
+    fn mask() -> Vec<usize> {
+        let max = 8 * std::mem::size_of::<libc::cpu_set_t>();
+        // SAFETY: `set` is a zeroed cpu_set_t that `sched_getaffinity` fills
+        // with the matching size.
+        let set = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set),
+                0,
+                "sched_getaffinity of the test thread"
+            );
+            set
+        };
+        // SAFETY: `c < max`, the set's own bit count; `CPU_ISSET` only reads.
+        (0..max)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
+            .collect()
+    }
+
+    /// Set the calling thread's mask to `cpus`.
+    fn set_mask(cpus: &[usize]) {
+        // SAFETY: `set` is a zeroed cpu_set_t only written through `CPU_SET`
+        // with indices the test took from a mask of the same size, and
+        // `sched_setaffinity` reads it with the matching size.
+        let ok = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in cpus {
+                libc::CPU_SET(c, &mut set);
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        };
+        assert!(ok, "sched_setaffinity to {cpus:?}");
+    }
+
+    /// Where the helper lands: on the cpu asked for; floating off a one-cpu
+    /// mask inherited from its opener (the mask widens past that cpu, so the
+    /// helper does not share it); and in a wider inherited mask, which floats
+    /// already, left as it is. A test thread whose own mask holds one cpu
+    /// cannot tell the float from the pin and skips by name.
+    #[test]
+    fn a_floating_helper_leaves_a_one_cpu_mask() {
+        let wide = mask();
+        if wide.len() < 2 {
+            println!(
+                "SKIP a_floating_helper_leaves_a_one_cpu_mask: the test thread's mask is {wide:?}"
+            );
+            return;
+        }
+        let (c, pair) = (wide[0], vec![wide[0], wide[1]]);
+        std::thread::spawn(move || {
+            assert!(pin_to(c), "the opener pins itself to cpu {c}");
+            assert_eq!(sole_cpu(), Ok(Some(c)));
+            assert_eq!(
+                place_helper(None),
+                Ok(None),
+                "no cpu asked: the helper floats"
+            );
+            let now = mask();
+            assert!(
+                now.len() > 1,
+                "a helper floating off cpu {c}'s one-cpu mask still runs on {now:?}"
+            );
+        })
+        .join()
+        .expect("the one-cpu opener");
+        std::thread::spawn(move || {
+            set_mask(&pair);
+            assert_eq!(place_helper(None), Ok(None));
+            assert_eq!(
+                mask(),
+                pair,
+                "a mask of two cpus floats already and is kept"
+            );
+        })
+        .join()
+        .expect("the two-cpu opener");
+        std::thread::spawn(move || {
+            assert_eq!(place_helper(Some(c)), Ok(Some(c)), "cpu {c} asked for");
+            assert_eq!(mask(), vec![c]);
+        })
+        .join()
+        .expect("the pinned helper");
     }
 }

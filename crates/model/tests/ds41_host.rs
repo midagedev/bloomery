@@ -500,7 +500,13 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         for t in 0..n_tokens {
             let x = Tensor2::from_vec(embd, 1, x_all[t * embd..(t + 1) * embd].to_vec());
             let list: Vec<(u32, f32)> = (0..n_used)
-                .map(|s| (ids[t * n_used + s] as u32, ws[t * n_used + s]))
+                .map(|s| {
+                    let id = ids[t * n_used + s];
+                    let e = u32::try_from(id).unwrap_or_else(|_| {
+                        panic!("layer {l} token {t}: routed id {id} is negative")
+                    });
+                    (e, ws[t * n_used + s])
+                })
                 .collect();
             let mut out = vec![0.0f32; embd];
             layer

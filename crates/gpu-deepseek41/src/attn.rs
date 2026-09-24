@@ -33,7 +33,8 @@
 //! logit in the denominator and adds nothing to the value.
 
 use bloomery_gpu::flash::{
-    MMA_BLOCK, MMA_KEYS, MMA_ROWS, MMA_SEG_KEYS, MMA_TILE, mma_dyn_bytes, mma_qwords, online_fold,
+    MERGE_BATCH, MMA_BLOCK, MMA_KEYS, MMA_ROWS, MMA_SEG_KEYS, MMA_TILE, mma_dyn_bytes, mma_qwords,
+    online_fold,
 };
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -58,9 +59,6 @@ const _: () = assert!(BLOCK_U32 as usize == MMA_BLOCK);
 /// Keys one segment block walks — the V2-Lite tensor-core pass's segment,
 /// a multiple of the walk's tile.
 pub const SEG_KEYS: usize = MMA_SEG_KEYS;
-/// Segments whose partials the merge loads as one batch before it folds
-/// them.
-const MERGE_BATCH: usize = 16;
 const _: () = assert!(SEG_KEYS.is_multiple_of(MMA_KEYS));
 // `segment_pass!`'s `check` gives each key of a segment its own thread.
 const _: () = assert!(SEG_KEYS <= MMA_BLOCK);

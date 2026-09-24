@@ -32,6 +32,14 @@
 # Output: $BLOOMERY_DATA/engram/corpus-<name>.ids, one decimal token id per line. Text, not
 # packed u32, so the file greps, diffs and truncates like everything else under $BLOOMERY_DATA.
 #
+# Tokenizer. TOKENIZE (default: the fixed /home/user/ik-tilde tree, as oracle.sh) must read `~` as a symbol,
+# as mainline and HF do, so that `~/` is one word and one id. Before any set it is probed on the
+# V4.1 first shard, the probe crates/tokenizer/tools/oracle.sh runs:
+#   llama-tokenize -m <shard 1> -p '~/' --ids --log-disable     -> [71520]
+# and any other answer (a tree whose `~` is in neither P nor S returns [96, 17]) stops the script
+# (rc 65) before it writes anything: regenerating a corpus with that tree would bake the split back
+# into the .ids. The fixed tree is /home/user/ik-tilde (TOKENIZE=/home/user/ik-tilde/build/bin/llama-tokenize).
+#
 # Usage: bash tools/ref/engram-corpus.sh [code|prose|prose-all|threads|korean]...
 #        (default: the first three)
 set -euo pipefail
@@ -40,7 +48,8 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-TOKENIZE=${TOKENIZE:-$IK/build/bin/llama-tokenize}
+# Default: the fixed tree, as crates/tokenizer/tools/oracle.sh defaults; the profile's $IK tree splits `~/`.
+TOKENIZE=${TOKENIZE:-/home/user/ik-tilde/build/bin/llama-tokenize}
 DATA=$BLOOMERY_DATA
 # The V4.1 file set: the deepseek41 profile's choice, exported by tools/box.sh.
 V41_DIR=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
@@ -51,6 +60,13 @@ V41_DIR=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh,
 # it never opens the others.
 SHARD=$(find "$V41_DIR" -maxdepth 1 -name '*-00001-of-*.gguf' | sort | head -1)
 [ -n "$SHARD" ] || { echo "engram-corpus: no first shard under $V41_DIR" >&2; exit 66; }
+# shellcheck disable=SC2088 # the literal '~/' is the probe's text
+probe=$(CUDA_VISIBLE_DEVICES="" "$TOKENIZE" -m "$SHARD" -p '~/' --ids --log-disable)
+[ "$probe" = '[71520]' ] || {
+  echo "engram-corpus: $TOKENIZE tokenizes '~/' as $probe on $SHARD, not [71520]: its \`~\` is not a symbol" \
+    "— TOKENIZE=/home/user/ik-tilde/build/bin/llama-tokenize is the tree that reads it as one" >&2
+  exit 65
+}
 
 OUT=$DATA/engram
 mkdir -p "$OUT"

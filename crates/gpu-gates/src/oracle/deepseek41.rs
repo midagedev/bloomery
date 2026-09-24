@@ -204,7 +204,8 @@ mod tests {
             };
             failed += usize::from(!pass);
             println!(
-                "hw_ds41_oracle: step set {name}: {what} — {}",
+                "hw_ds41_oracle: step set {}: {what} — {}",
+                gguf::v41::set(name),
                 verdict(pass)
             );
         }

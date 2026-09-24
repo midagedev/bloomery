@@ -23,7 +23,8 @@
 //! run of [`COLLAPSE`] or more equal generated tokens; a position whose eager
 //! argmax is not the engine's token; and, on the free arm, a first difference
 //! with ik's greedy ids (`greedy-ik-cpu-64-p0.tsv`, which stops at ik's EOS)
-//! where our margin is not below [`GREEDY_MARGIN`].
+//! where our margin is not below
+//! [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN), the step gate's rule.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -48,7 +49,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
-    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::placement::workstation;
@@ -63,9 +64,6 @@ mod gate {
     const TRIGGER_N: usize = 16;
     /// A run of this many equal generated tokens is a collapse.
     const COLLAPSE: usize = 8;
-    /// The step gate's `--greedy` rule and value (`gate_deepseek41_step.rs`):
-    /// at the first id that differs from ik's, our margin must be below it.
-    const GREEDY_MARGIN: f32 = 1.5;
 
     /// The free arm's generated ids through position 315 on a gate placement
     /// of 809 card experts, the last of them fed at position 315.

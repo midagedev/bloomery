@@ -25,6 +25,16 @@
 # linked to the V2-Lite profile's tree. A binary that would load libllama or libggml from outside $IK is
 # refused (rc 3), as dump.sh refuses a dumper.
 #
+# The tokenizer is TOKENIZE (default under deepseek41: the fixed /home/user/ik-tilde tree, as oracle.sh;
+# otherwise the profile's tree's llama-tokenize). Under deepseek41 it must read
+# `~` as a symbol, as mainline and HF do, so that `~/` is one word and one id; it is probed on the file
+# first, the probe crates/tokenizer/tools/oracle.sh runs:
+#   llama-tokenize -m $MODEL -p '~/' --ids --log-disable     -> [71520]
+# and any other answer (a tree whose `~` is in neither P nor S returns [96, 17]) stops the run (rc 65)
+# before the lease: a prompt file written by that tree would carry the split. The fixed tree is
+# /home/user/ik-tilde (TOKENIZE=/home/user/ik-tilde/build/bin/llama-tokenize). The qwen3moe profile has no
+# such probe: its vocabulary's `~/` id has not been pinned.
+#
 # Writes $BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv (id, text, the V4.1 ids) and greedy-ik-cpu-<N>-p<P>.tsv
 # (argmax_ref's row: gen_ids and gen_margins), and <N>-p<P>.log with the witness blocks. N is GEN, default 64.
 # Bounded by timeout (IK_GREEDY_BOUND seconds, default 900).
@@ -48,9 +58,24 @@ HERE=$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd)
 OUTDIR=$BLOOMERY_DATA/$OUTDIR_NAME
 BINDIR=$BLOOMERY_DATA/bin/$MODEL_NAME
 BIN=$BINDIR/argmax_ref
-TOK=$IK/build/bin/llama-tokenize
+# Default: under deepseek41 the fixed tree (as crates/tokenizer/tools/oracle.sh), since the profile's $IK
+# tree splits `~/`; the qwen3moe profile keeps its own tree's tokenizer.
+if [ "$MODEL_NAME" = deepseek41 ]; then
+  TOK=${TOKENIZE:-/home/user/ik-tilde/build/bin/llama-tokenize}
+else
+  TOK=${TOKENIZE:-$IK/build/bin/llama-tokenize}
+fi
 mkdir -p "$OUTDIR" "$BINDIR"
 [ -x "$TOK" ] || { echo "ik-greedy.sh: no $TOK — build the tree first" >&2; exit 2; }
+if [ "$MODEL_NAME" = deepseek41 ]; then
+  # shellcheck disable=SC2088 # the literal '~/' is the probe's text
+  probe=$(CUDA_VISIBLE_DEVICES="" "$TOK" -m "$MODEL" -p '~/' --ids --log-disable 2>/dev/null | tail -n 1)
+  [ "$probe" = '[71520]' ] || {
+    echo "ik-greedy.sh: $TOK tokenizes '~/' as $probe on $MODEL, not [71520]: its \`~\` is not a symbol" \
+      "— TOKENIZE=/home/user/ik-tilde/build/bin/llama-tokenize is the tree that reads it as one" >&2
+    exit 65
+  }
+fi
 
 ARGMAX_OUT=$BINDIR bash "$HERE/tools/ref/build-argmax.sh"
 IK_REAL=$(readlink -f "$IK")

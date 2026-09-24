@@ -175,6 +175,19 @@ REF="$BLOOMERY_DATA/$SET"
 STAGE="$BLOOMERY_DATA/$SET.staging"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
+# A staged set without its completion trailer is removed on every exit (a failed dumper under
+# `set -e`, a refusal below, a signal), with a line naming it: an incomplete set is never left
+# behind for a reader to mistake for a set. A complete staged set that the swap refuses stays, as
+# its refusal says. A SIGKILL skips the trap; the next dump of the set clears the directory above.
+drop_incomplete_stage() {
+  [ -d "$STAGE" ] || return 0
+  grep -qs '^# complete' "$STAGE/MANIFEST.tsv" && return 0
+  rm -rf "$STAGE"
+  echo "[staging] removed the incomplete $STAGE" >&2
+}
+trap drop_incomplete_stage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Which ik build this set is the output of — recorded in the manifest, because the
 # reference is that build's answer and nothing else's.

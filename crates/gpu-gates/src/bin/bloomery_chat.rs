@@ -234,7 +234,9 @@ mod drive {
             open,
             body::open,
             |m: &Deepseek41Model| {
-                let top_k = m.body("bloomery-chat")?.indexer_top_k();
+                let body = m.body("bloomery-chat")?;
+                let top_k = body.indexer_top_k();
+                let shadow = body.shadow_host();
                 if top_k != want_top_k {
                     return Err(format!(
                         "the body selects {top_k} rows per stream, the file's top_k is \
@@ -242,7 +244,10 @@ mod drive {
                     )
                     .into());
                 }
-                Ok(format!("layers={} top_k={top_k}", inputs.hp.n_layer))
+                Ok(format!(
+                    "layers={} top_k={top_k} shadow=host {} unified_addressing={}",
+                    inputs.hp.n_layer, shadow.bytes, shadow.unified_addressing
+                ))
             },
             &mut std::io::stderr(),
         )?;
@@ -257,7 +262,7 @@ mod drive {
         let card = &plan.cards[0];
         eprintln!(
             "plan place={} card={} ctx_max={} card_experts={} ({} B) host_experts={} ({} B) \
-             n_l={}..{} on {} layers card_budget={}",
+             host_shadow={} B n_l={}..{} on {} layers card_budget={}",
             place.name(),
             machine.cards[0].name,
             plan.ctx_max,
@@ -265,6 +270,7 @@ mod drive {
             card.expert_bytes,
             plan.host.experts,
             plan.host.expert_bytes,
+            plan.host.shadow_bytes,
             held.iter().min().copied().unwrap_or(0),
             held.iter().max().copied().unwrap_or(0),
             held.len(),

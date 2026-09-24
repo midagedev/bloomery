@@ -21,7 +21,7 @@ static const int kPasses = 6;
 int main() {
     const size_t rs = 98 * (kK / 256);
 
-    // Same xorshift64* filler as qdot-rate: any bytes are valid IQ3_XXS codes (grid
+    // Same bytes as qdot-rate's xorshift64* filler: any bytes are valid IQ3_XXS codes (grid
     // indices are bytes, signs and scales are any word bits), and the kernel's time is
     // data-independent.
     unsigned long long s = 0x9E3779B97F4A7C15ull;
@@ -30,7 +30,7 @@ int main() {
         return s * 0x2545F4914F6CDD1Dull;
     };
     std::vector<uint8_t> w((size_t)kRows * rs);
-    for (size_t i = 0; i + 8 <= w.size(); i += 8) memcpy(&w[i], &s, 8), next();
+    for (size_t i = 0; i + 8 <= w.size(); i += 8) { const unsigned long long v = next(); memcpy(&w[i], &v, 8); }
     std::vector<float> col(kK);
     for (int i = 0; i < kK; ++i) col[i] = (((long long)i % 31) - 15.0f) / 16.0f;
     ggml_type_traits_t q8k = ggml_internal_get_type_traits(GGML_TYPE_Q8_K);

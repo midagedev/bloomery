@@ -58,7 +58,8 @@
 //! - `--greedy PROMPT` (G3): 64 tokens greedy from `tools/ref/prompts.tsv`
 //!   row PROMPT after a reset, on the engine's own step, against ik's
 //!   (`tools/ref/ik-greedy.sh`, which stops at EOS): at the first position
-//!   where the ids differ, our margin must be below [`GREEDY_MARGIN`]. Also
+//!   where the ids differ, our margin must be below
+//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN). Also
 //!   printed: the allocator calls and the calling thread's page faults per
 //!   steady step.
 //! - `--ppl TAG` (G4): ik's KL-divergence base file `$BLOOMERY_DATA/ikppl/
@@ -140,9 +141,9 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, data_dir, ref_ints,
-        ref_tensor_logical_in, ref_tensor_of_in, split_f32, topk_ids_logical_within, verdict,
-        widened_f16_rows_in,
+        GREEDY_MARGIN, GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, data_dir,
+        ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32, topk_ids_logical_within,
+        verdict, widened_f16_rows_in,
     };
     use cuda_core::sys;
     use gguf::quant::half_to_f32;
@@ -225,10 +226,9 @@ mod gate {
     const NAN16: u16 = 0x7e00;
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
-    /// G3: tokens generated, and the margin below which a first difference is
-    /// a near tie [derived, plan.md: ≈ 3 σ_rel].
+    /// G3: tokens generated; a first difference is judged by
+    /// [`GREEDY_MARGIN`].
     const GREEDY: usize = 64;
-    const GREEDY_MARGIN: f32 = 1.5;
     /// G4: red above this Δ_PPL [derived, plan.md].
     const PPL_RED: f64 = 0.015;
     /// Selection-band terms the MoE chain gate's `tie_margin` takes

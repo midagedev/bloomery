@@ -360,10 +360,10 @@ mod drive {
         }
 
         let path = ref_model_path()?;
-        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
+        let t = Instant::now();
+        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&file)?;
         let ctx_max = print_plan(&inputs, a.place, a.ctx)?;
-        drop(split);
         // The caches hold the plan's ctx_max positions, the value the model
         // is loaded with; --ctx only asks for it.
         if fed > ctx_max {
@@ -385,8 +385,6 @@ mod drive {
             .into());
         }
 
-        let t = Instant::now();
-        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let mut m = body::open(file, a.place.machine(), a.ctx)?;
         m.set_mode(a.mode);
         let top_k = m.body("generate_ds41")?.indexer_top_k();

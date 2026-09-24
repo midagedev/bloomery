@@ -86,10 +86,11 @@ const DONE: u32 = 3;
 const FAILED: u32 = 4;
 const EXIT: u32 = 5;
 
-/// How long an armed launcher polls for its post before it parks. It polls
-/// by yielding: the SMT sibling it sits on is the engram helper's too, and
-/// the helper works in the same refresh the launcher is armed across.
-const ARM_SPIN: Duration = Duration::from_millis(2);
+/// How long an armed launcher yields, polling for its post, before it parks.
+/// It yields rather than spins: the SMT sibling it sits on is the engram
+/// helper's too, and the helper works in the same refresh the launcher is
+/// armed across.
+const ARM_YIELD: Duration = Duration::from_millis(2);
 
 /// How long the decode thread waits for a posted launch to be answered.
 const ANSWER_DEADLINE: Duration = Duration::from_secs(10);
@@ -320,8 +321,9 @@ fn cpu_list(text: &str) -> impl Iterator<Item = usize> + '_ {
         .flatten()
 }
 
-/// The launcher's loop: park until armed or posted, yield while armed (at
-/// most [`ARM_SPIN`]), launch what is posted, stop at `EXIT`.
+/// The launcher's loop: park until armed or posted, poll by yielding while
+/// armed (for at most [`ARM_YIELD`], then park), launch what is posted, stop
+/// at `EXIT`.
 fn serve_launches(slot: &Slot, stream: &CudaStream) {
     let hs = stream.cu_stream();
     let mut armed_until: Option<Instant> = None;
@@ -353,7 +355,7 @@ fn serve_launches(slot: &Slot, stream: &CudaStream) {
             }
             EXIT => return,
             ARMED => {
-                let until = *armed_until.get_or_insert_with(|| Instant::now() + ARM_SPIN);
+                let until = *armed_until.get_or_insert_with(|| Instant::now() + ARM_YIELD);
                 if Instant::now() > until {
                     std::thread::park();
                 } else {
@@ -545,9 +547,36 @@ mod tests {
         );
     }
 
+    /// The first cpu of the calling thread's mask whose core has an SMT
+    /// sibling that is in the mask too, with that sibling.
+    fn cpu_with_sibling_in_mask() -> Option<(usize, usize)> {
+        let set_bytes = std::mem::size_of::<libc::cpu_set_t>();
+        // SAFETY: `set` is a zeroed cpu_set_t that `sched_getaffinity` fills
+        // with the matching size.
+        let set = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, set_bytes, &mut set),
+                0,
+                "sched_getaffinity of the test thread"
+            );
+            set
+        };
+        // SAFETY: `c` stays below the set's own bit count; `CPU_ISSET` only reads.
+        let in_mask = |c: usize| c < 8 * set_bytes && unsafe { libc::CPU_ISSET(c, &set) };
+        (0..8 * set_bytes).filter(|&c| in_mask(c)).find_map(|cpu| {
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+            let list = std::fs::read_to_string(&path).ok()?;
+            let sibling = cpu_list(&list).find(|&c| c != cpu && in_mask(c))?;
+            Some((cpu, sibling))
+        })
+    }
+
     /// An opener pinned to one cpu puts the launch thread on that core's SMT
     /// sibling, never on the opener's own cpu, where it could not run while
     /// the opener spins for the first go; a floating opener leaves it floating.
+    /// The opener pins to a cpu of the test thread's mask whose sibling is in
+    /// the mask too; a mask with no such cpu skips the pinned half by name.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_a_pinned_opener_puts_the_launch_thread_on_its_sibling() {
@@ -557,8 +586,13 @@ mod tests {
         assert_eq!(floating.cpu(), None, "the test thread floats");
         drop(floating);
 
+        let Some((cpu, want)) = cpu_with_sibling_in_mask() else {
+            println!(
+                "SKIP pinned opener: no cpu of the test thread's mask has an SMT sibling in the mask"
+            );
+            return;
+        };
         let opener = std::thread::spawn(move || {
-            let cpu = 0;
             // SAFETY: `one` is a zeroed cpu_set_t only written through
             // `CPU_SET` with an index inside it, and `sched_setaffinity` reads
             // it with the matching size.
@@ -568,13 +602,10 @@ mod tests {
                 libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one) == 0
             };
             assert!(pinned, "the opener pins itself to cpu {cpu}");
-            let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
-            let list = std::fs::read_to_string(&path).expect("the core's sibling list");
-            let want = cpu_list(&list).find(|&c| c != cpu).expect("an SMT box");
             let l = Launcher::spawn(stream).expect("a launch thread off the pinned opener");
-            (l.cpu(), want)
+            l.cpu()
         });
-        let (got, want) = opener.join().expect("the opener thread");
+        let got = opener.join().expect("the opener thread");
         assert_eq!(
             got,
             Some(want),

@@ -47,6 +47,11 @@ use std::path::{Path, PathBuf};
 /// sub-block scale defect landing near 1e-3 on a shape with no hash pin.
 pub const KERNEL_BAND: f32 = 1e-5;
 
+/// The V4.1 greedy rule, shared by the step gate's `--greedy` and the long
+/// gate's free arm: at the first generated id that differs from ik's, our
+/// top-1 margin must be below this — a near tie [derived, plan.md: ≈ 3 σ_rel].
+pub const GREEDY_MARGIN: f32 = 1.5;
+
 pub type GateError = Box<dyn std::error::Error>;
 
 /// The exit of every gate binary's `main`: `Ok` is success; an `Err` prints

@@ -1,8 +1,11 @@
-//! qdot gates: fused kernels against matmul_q, exact f64 reference, and scalar mirrors.
+//! qdot gates: every fused dot kernel against its scalar mirror, and against the
+//! current path, the exact f64 dot or ik's dumped dot; the activation encoders
+//! against ggml's round trip, their scalar twins and their edge cases.
 //!
-//! `hw_` prefix: needs the box (the model file and `$BLOOMERY_DATA/ref`),
-//! excluded by default, run by `just gate-qdot`. The one pure gate
-//! (`rejects_unaligned_k`) runs in the default set.
+//! `hw_` tests need the box (AVX2, most of them a model file or harness dumps under
+//! `$BLOOMERY_DATA/ref`) and are `#[ignore]`d; the pure tests (shape refusals,
+//! encoder edge cases, the f32 helpers) run in the default set. `just gate-qdot`
+//! runs both.
 //!
 //! The gates assert with `assert!` (not `debug_assert!`) because they run in release.
 
@@ -2485,5 +2488,134 @@ fn hw_q82_codes_at_bf16_round_down() {
         "q8_2 code range: {} normal-scale blocks (max |code| {max_code}), {} subnormal-scale blocks \
          saturated as ik's, {} overflowing-inverse blocks flushed; AVX2 bytes == scalar bytes",
         checked[0], checked[1], checked[2]
+    );
+}
+
+/// The q8_K encoders (scalar and AVX2) at every scale an activation block can
+/// have, down through the subnormals. Their scale is the f32 `iscale =
+/// -127/max` itself, not a narrowed copy, so where `iscale` is finite every
+/// product `iscale·v` with `|v| <= |max|` stays within `127·(1 + 2^-24)² <
+/// 127.5` and rounds into ±127: the `.min(127)` clamp and the `as i8` wrap
+/// (`v_wrap_i8` on the AVX2 side) are never reached. That is asserted on the
+/// unclamped `nearest_int` of every value, over every exponent from the
+/// largest normal down to the smallest subnormal, with random mantissas and
+/// the values around `127 / f32::MAX`, where `iscale` starts to overflow.
+/// Where it overflows (every subnormal `max` among them) the encoders flush
+/// the block: codes 0, sums 0 — asserted as the flush. AVX2 bytes == scalar
+/// bytes throughout.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_q8k_codes_at_subnormal_scales() {
+    use qdot::nearest_int;
+    assert!(
+        supports(GgmlType::Q3_K),
+        "the gate compares the AVX2 encoder with the scalar one; this CPU has no AVX2"
+    );
+    let mut s = 0x9abc_def1u32;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    // 2^e from its bits, exact for every f32 power of two, normal or
+    // subnormal (`powi` may form 2^-e first, which overflows below 2^-127).
+    let pow2 = |e: i32| -> f32 {
+        if e >= -126 {
+            f32::from_bits(((e + 127) as u32) << 23)
+        } else {
+            f32::from_bits(1u32 << (e + 149))
+        }
+    };
+    // Every binade's bottom, then random mantissas at random exponents,
+    // normal and subnormal (f32's powers of two run 2^-149 .. 2^127).
+    let mut amaxes: Vec<f32> = (-149..=127).map(pow2).collect();
+    for _ in 0..6000 {
+        let e = (next() % 277) as i32 - 149;
+        let m = 1.0 + (next() >> 8) as f32 / (1u32 << 24) as f32;
+        let a = m * pow2(e);
+        assert!(a.is_finite() && a > 0.0, "amax {m} * 2^{e} is {a}");
+        amaxes.push(a);
+    }
+    // Around the edge where -127/max overflows.
+    let edge = 127.0 / f32::MAX;
+    let mut up = edge;
+    let mut down = edge;
+    for _ in 0..64 {
+        amaxes.push(up);
+        amaxes.push(down);
+        up = f32::from_bits(up.to_bits() + 1);
+        down = f32::from_bits(down.to_bits() - 1);
+    }
+
+    // One block per amax: max first (its sign alternates by block), its
+    // negation, a zero, then fractions of it that land on every code.
+    let block = |amax: f32, neg: bool| -> [f32; 256] {
+        let max = if neg { -amax } else { amax };
+        std::array::from_fn(|i| match i {
+            0 => max,
+            1 => -max,
+            2 => 0.0,
+            _ => max * ((i as f32 - 129.0) / 127.5),
+        })
+    };
+    let (mut finite, mut flushed, mut max_code) = (0usize, 0usize, 0i32);
+    for (c, chunk) in amaxes.chunks(4).enumerate() {
+        let x: Vec<f32> = chunk
+            .iter()
+            .enumerate()
+            .flat_map(|(b, &a)| block(a, (c + b) % 2 == 1))
+            .collect();
+        let k = x.len();
+        let mut avx = vec![0u8; col_bytes(GgmlType::Q3_K, k)];
+        let mut sca = vec![0u8; col_bytes(GgmlType::Q3_K, k)];
+        quantize_col(GgmlType::Q3_K, &x, &mut avx);
+        quantize_col_scalar(GgmlType::Q3_K, &x, &mut sca);
+        assert_eq!(avx, sca, "AVX2 and scalar bytes differ at amax {chunk:?}");
+        for (b, &amax) in chunk.iter().enumerate() {
+            let xb = &x[256 * b..256 * (b + 1)];
+            let ob = &avx[296 * b..296 * (b + 1)];
+            let codes = &ob[8..264];
+            let sums: Vec<i16> = ob[264..296]
+                .chunks(2)
+                .map(|p| i16::from_le_bytes([p[0], p[1]]))
+                .collect();
+            let iscale = -127.0f32 / xb[0];
+            if !iscale.is_finite() {
+                assert!(
+                    codes.iter().all(|&q| q == 0) && sums.iter().all(|&v| v == 0),
+                    "amax {amax:e}: an overflowing iscale must flush the block"
+                );
+                flushed += 1;
+                continue;
+            }
+            for (i, &v) in xb.iter().enumerate() {
+                let q = nearest_int(iscale * v);
+                assert!(
+                    (-127..=127).contains(&q),
+                    "amax {amax:e}: value {i} ({v:e}) rounds to {q}, past ±127 before the clamp"
+                );
+                assert_eq!(codes[i] as i8, q as i8, "amax {amax:e}: value {i} code");
+                max_code = max_code.max(q.abs());
+            }
+            for (j, &got) in sums.iter().enumerate() {
+                let want: i32 = codes[16 * j..16 * j + 16]
+                    .iter()
+                    .map(|&q| i32::from(q as i8))
+                    .sum();
+                assert_eq!(i32::from(got), want, "amax {amax:e}: sum {j}");
+            }
+            finite += 1;
+        }
+    }
+    let pass = finite > 0 && flushed > 0 && max_code == 127;
+    println!(
+        "q8_K code range: {finite} finite-iscale blocks (max |code| {max_code}, no value past ±127 \
+         before the clamp), {flushed} overflowing-iscale blocks flushed; AVX2 bytes == scalar bytes"
+    );
+    assert!(
+        pass,
+        "the sweep must reach both regimes and code 127 (finite {finite}, flushed {flushed}, \
+         max |code| {max_code})"
     );
 }

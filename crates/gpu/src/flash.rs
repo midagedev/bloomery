@@ -233,6 +233,11 @@ const _: () = assert!(mma_dyn_bytes(MMA_WIDTH) == MMA_DYN_BYTES);
 /// thirty-two-key segment would.
 pub const MMA_SEG_KEYS: usize = 64;
 
+/// Segments whose partials a split-K merge loads as one batch before it
+/// folds them: every merge kernel (this file's, the GQA flash's, V4.1's
+/// attention merge) walks its segments in batches of this many.
+pub const MERGE_BATCH: usize = 16;
+
 /// Whether the split launch's segment pass is the tensor-core
 /// [`flash_kernels::flash_latent_mma`] rather than the per-head
 /// [`flash_kernels::flash_latent_seg`]. `BLOOMERY_FLASH_MMA=1` (the default)
@@ -2011,9 +2016,6 @@ mod flash_kernels {
         shift: usize,
         jig: f32,
     ) -> f32 {
-        // Segments whose partials the fold loads as one batch before it
-        // folds them.
-        const MERGE_BATCH: usize = 16;
         let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
         let n_seg = limit.div_ceil(seg_keys as usize).min(segs as usize);
         let mut mx = f32::NEG_INFINITY;

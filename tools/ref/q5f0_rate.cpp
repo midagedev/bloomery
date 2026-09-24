@@ -22,7 +22,7 @@ static const int kPasses = 6;
 int main() {
     const size_t rs = 22 * (kK / 32); // 968
 
-    // Same xorshift64* filler as qdot-rate: any bytes are valid Q5_0 codes,
+    // Same bytes as qdot-rate's xorshift64* filler: any bytes are valid Q5_0 codes,
     // and the kernel's time is data-independent.
     unsigned long long s = 0x9E3779B97F4A7C15ull;
     auto next = [&]() {
@@ -30,7 +30,7 @@ int main() {
         return s * 0x2545F4914F6CDD1Dull;
     };
     std::vector<uint8_t> w(kRows * rs);
-    for (size_t i = 0; i + 8 <= w.size(); i += 8) memcpy(&w[i], &s, 8), next();
+    for (size_t i = 0; i + 8 <= w.size(); i += 8) { const unsigned long long v = next(); memcpy(&w[i], &v, 8); }
     std::vector<float> col(kK);
     for (int i = 0; i < kK; ++i) col[i] = (((long long)i % 31) - 15.0f) / 16.0f;
     std::vector<uint8_t> y(144 * (kK / 128));

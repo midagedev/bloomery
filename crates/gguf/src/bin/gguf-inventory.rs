@@ -20,9 +20,10 @@
 //! Per-token active bytes use the metadata's `<arch>.expert_count` and
 //! `<arch>.expert_used_count` (top-k): routed/token = Σ over MoE blocks of
 //! (exps bytes × top-k / expert count), exact integer division. The
-//! roofline reference column quotes the engramQ8 split's hand-computed
-//! numbers (docs/roofline.md) and is printed only for files that carry
-//! engram tensors; other files get the raw numbers.
+//! reference column quotes docs/roofline.md's hand count of one file, the
+//! V4.1 mixed file (`Q3_K_M-engramQ8-tokembdBF16-attnQ8`), whatever file is
+//! inventoried, and is printed only for files that carry engram tensors;
+//! other files get the raw numbers.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
@@ -31,7 +32,7 @@ use std::process::ExitCode;
 
 use gguf::{GgmlType, Inventory, ggml_type_info, inventory_of};
 
-// docs/roofline.md's hand-computed figures for the engramQ8 split.
+// docs/roofline.md's hand count of the V4.1 mixed file (Q3_K_M-engramQ8-tokembdBF16-attnQ8).
 const REF_FILE_GIB: f64 = 444.23;
 const REF_ROUTED_GIB: f64 = 3.7656;
 const REF_DENSE_GIB: f64 = 7.1320;
@@ -681,7 +682,7 @@ fn main() -> ExitCode {
             moe_blocks.len(),
         ));
         m.push_str(
-            "| quantity | bytes/token | GiB/token | roofline (engramQ8 split) | delta GiB |\n",
+            "| quantity | bytes/token | GiB/token | roofline.md hand count, V4.1 mixed file | delta GiB |\n",
         );
         m.push_str("|---|---:|---:|---:|---:|\n");
         if let Some(r) = routed_per_token {
