@@ -46,11 +46,14 @@
 //!      chain:
 //!    - the combine: per slot `pred += w°·D°₆₄ − wᵏ·Dᵏ₆₄`, the down's f64 dot
 //!      at each side's activation rule on its own h (q8_1 per 128 of the
-//!      card's h, q8_2_x4 of the host's h, q8_2_x4 of the dump's h), and
+//!      card's h, q8_2_x4 of the host's h, q8_2_x4 of the dump's h — ik's
+//!      quantizer, `act_rule`, whose q8_2 × Q4_K/Q5_K dot the MoE gate pins
+//!      bit for bit on the dump), and
 //!      `bound += |w°|·n°·u·A° + |wᵏ|·nᵏ·u·Aᵏ` (each side's accumulation bound,
 //!      the K-quant decode's rounding, and the gate's f32 image of our q8_1
-//!      codes); the shared expert's the same way (our f32 h against ik's
-//!      q8_2_x4); then the three sums' roundings — ours
+//!      codes); the shared expert's the same way (our h as its down reads it
+//!      — f32 under q8_0 and Q5_K, q8_1 under Q4_K — against ik's q8_2_x4 of
+//!      the dump's); then the three sums' roundings — ours
 //!      `(Σ_card fma) + hsum + shexp`, the host's weighted sum, ik's six-slot
 //!      sum plus the shared expert — which is where the association change
 //!      the partial sum brings lives;
@@ -71,6 +74,11 @@
 //! slots numbered against the id order, so the translation is not the
 //! identity. Layers whose down stack has no device format (q5_K) are all host,
 //! as in every plan.
+//!
+//! The shared expert runs in the file's format, as the piece runs it: q8_0
+//! gate·up on the f32 activation and a q8_0 down, or Q3_K gate·up on the
+//! norm's q8_1 form and a Q4_K down on the q8_1 of its output (a Q5_K down
+//! on the f32 output).
 //!
 //! Structure, per layer: the piece's launches captured and replayed for each
 //! set with the host serving each replay, every buffer bit-identical to the
@@ -103,11 +111,13 @@ mod gate {
     use bloomery_gpu_deepseek41::chain::ffn::{
         CardStacks, Ds41Host, FfnIo, FfnPiece, combine_elem,
     };
+    use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels};
     use bloomery_gpu_deepseek41::hc::{
         HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
+    use bloomery_gpu_gates::act_rule::{Act, Rule};
     use bloomery_gpu_gates::oracle;
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
     use bloomery_gpu_gates::{
@@ -117,9 +127,7 @@ mod gate {
     };
     use cuda_core::{CudaStream, DeviceBuffer, sys};
     use gguf::Split;
-    use gguf::quant::{
-        GgmlType, dequant_row, quantize_activations, quantize_row_q8_2_x4_roundtrip,
-    };
+    use gguf::quant::{GgmlType, dequant_row};
     use model::Tensor2;
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
@@ -157,8 +165,9 @@ mod gate {
         (4 * (k / 32) + 5) as f64
     }
 
-    /// A K-quant down weight decoded once to f32 against both engines' exact
-    /// use of it (the MoE gate's `Q4K_DECODE`): one rounding a side.
+    /// A K-quant down weight decoded once to f32 against a side's exact use
+    /// of it (the MoE gate's `KQ_DECODE`): one rounding. Our Q5_K shared down
+    /// reads each weight as `dequant_row` decodes it and takes none.
     const KQ_DECODE: f64 = 1.0;
 
     /// The gate's f32 image of our q8_1 activation (`q8_1_dequant`, code
@@ -850,6 +859,7 @@ mod gate {
         fused: FusedKernels,
         router: RouterKernels,
         experts: ExpertKernels,
+        dense: DenseKernels,
         hc: HcKernels,
         x: DeviceBuffer<f32>,
         act_x: Q8Act,
@@ -859,6 +869,8 @@ mod gate {
         act_h: Q8Act,
         down: DeviceBuffer<f32>,
         sh_h: DeviceBuffer<f32>,
+        /// `sh_h` in q8_1, for a K-quant shared down.
+        act_sh: Q8Act,
         sh_y: DeviceBuffer<f32>,
         mixes: DeviceBuffer<f32>,
         hc_out: DeviceBuffer<f32>,
@@ -875,6 +887,7 @@ mod gate {
                 fused: FusedKernels::load(ctx)?,
                 router: RouterKernels::load(ctx)?,
                 experts: ExpertKernels::load(ctx)?,
+                dense: DenseKernels::load(ctx)?,
                 hc: HcKernels::load(ctx)?,
                 x: z(n)?,
                 act_x: Q8Act::with_k(stream, 1, n)?,
@@ -884,6 +897,7 @@ mod gate {
                 act_h: Q8Act::with_k(stream, N_USED, ff)?,
                 down: z(N_USED * n)?,
                 sh_h: z(ff)?,
+                act_sh: Q8Act::with_k(stream, 1, ff)?,
                 sh_y: z(n)?,
                 mixes: z(HC_MIX)?,
                 hc_out: z(HC_MIX)?,
@@ -1068,23 +1082,42 @@ mod gate {
                 &mut op.down,
             )?;
         }
-        let (Some(sg), Some(su), Some(DevWeight::Q8_0 { qs, d, .. })) = (
+        let (Some(sg), Some(su)) = (
             w.get(&names::ffn_gate_shexp(l)),
             w.get(&names::ffn_up_shexp(l)),
-            w.get(&names::ffn_down_shexp(l)),
         ) else {
-            return Err(format!("layer {l}: the shared expert is not resident as q8_0").into());
+            return Err(format!("layer {l}: the shared gate and up are not resident").into());
         };
-        op.experts.enqueue_shexp_gate_up(
-            stream,
-            sg,
-            su,
-            &op.x,
-            kind.swiglu_limit_shared,
-            &mut op.sh_h,
-        )?;
-        gpu.q8f32()
-            .enqueue_q8_0_gemv(stream, qs, d, &op.sh_h, 1, &mut op.sh_y)?;
+        let limit = kind.swiglu_limit_shared;
+        match (sg, su) {
+            (
+                DevWeight::KQuant {
+                    ty: GgmlType::Q3_K,
+                    w: g,
+                    ..
+                },
+                DevWeight::KQuant {
+                    ty: GgmlType::Q3_K,
+                    w: u,
+                    ..
+                },
+            ) => {
+                op.dense
+                    .enqueue_shexp_gate_up_q3k(stream, g, u, &op.act_x, limit, &mut op.sh_h)?
+            }
+            (g, u) => op
+                .experts
+                .enqueue_shexp_gate_up(stream, g, u, &op.x, limit, &mut op.sh_h)?,
+        }
+        let sh_down = Dense::of(w, &names::ffn_down_shexp(l), ff, n)?;
+        let act = if sh_down.reads_q8_1() {
+            gpu.enqueue_quantize_q8_1(&op.sh_h, &mut op.act_sh)?;
+            Some(&op.act_sh)
+        } else {
+            None
+        };
+        op.dense
+            .enqueue(gpu, sh_down, &op.sh_h, act, &mut op.sh_y)?;
         let Some(DevWeight::KQuant { w: hc_w, .. }) = w.get(&names::hc_ffn_fn(l)) else {
             return Err(format!("layer {l}: hc_ffn_fn is not resident as a K-quant").into());
         };
@@ -1318,6 +1351,7 @@ mod gate {
         down_ty: GgmlType,
         /// Expert id to its down rows (`n_embd` rows of `ff`).
         downs: Vec<(u32, Vec<f32>)>,
+        sh_ty: GgmlType,
         sh_down: Vec<f32>,
     }
 
@@ -1335,16 +1369,33 @@ mod gate {
         for &e in experts {
             downs.push((e, rows_f32(down_ty, bytes, e as usize * n, n, ff)?));
         }
-        let sb = tensor(
-            split,
-            &names::ffn_down_shexp(l),
-            GgmlType::Q8_0,
-            &[ff as u64, n as u64],
-        )?;
+        let sh_name = names::ffn_down_shexp(l);
+        let sh_ty = tensor_type(split, &sh_name)?;
+        let sb = tensor(split, &sh_name, sh_ty, &[ff as u64, n as u64])?;
         Ok(BandWeights {
             down_ty,
             downs,
-            sh_down: rows_f32(GgmlType::Q8_0, sb, 0, n, ff)?,
+            sh_ty,
+            sh_down: rows_f32(sh_ty, sb, 0, n, ff)?,
+        })
+    }
+
+    /// Our shared down's activation of `h` under a down weight of type `ty`
+    /// as the values its codes stand for, and the roundings on one term's
+    /// path through our dot and through ik's: q8_0 and Q5_K read f32, Q4_K
+    /// the q8_1 form (its f32 image one rounding more); ik reads q8_2_x4
+    /// under all three, a K-quant's decode one rounding more.
+    fn shared_down_rule(ty: GgmlType, h: &[f32]) -> Result<(Vec<f32>, f64, f64), GateError> {
+        let ff = h.len();
+        Ok(match ty {
+            GgmlType::Q8_0 => (h.to_vec(), n_ours(ff), n_ik_quant(ff)),
+            GgmlType::Q5_K => (h.to_vec(), n_ours(ff), n_ik_quant(ff) + KQ_DECODE),
+            GgmlType::Q4_K => (
+                q8_1_dequant(h, ff, 1),
+                n_ours(ff) + KQ_DECODE + Q8_IMAGE,
+                n_ik_quant(ff) + KQ_DECODE,
+            ),
+            _ => return Err(format!("a shared down of type {ty} has no rule here").into()),
         })
     }
 
@@ -1365,6 +1416,11 @@ mod gate {
             KQ_DECODE
         };
         let ik_n = n_ik_quant(ff) + decode;
+        // ik's format under the routed down; the host tier quantizes as ik
+        // does (qdot's q8_2_x4, the same codes).
+        let down_act = Rule::of(bw.down_ty)
+            .ok_or_else(|| format!("a routed down of type {} has no rule here", bw.down_ty))?
+            .ik;
         let mut pred = vec![0.0f64; n];
         let mut bound = vec![0.0f64; n];
         // Per value: the magnitudes our card chain, the host's sum and ik's
@@ -1382,9 +1438,7 @@ mod gate {
                 .find(|(id, _)| *id == e)
                 .map(|(_, rows)| rows)
                 .ok_or_else(|| format!("expert {e}'s down rows were not read"))?;
-            let hk = &d.h[j * ff..(j + 1) * ff];
-            let mut xi = vec![0.0f32; ff];
-            quantize_activations(bw.down_ty, hk, &mut xi)?;
+            let xi = down_act.reconstruct(&d.h[j * ff..(j + 1) * ff]);
             let (wo, wk) = (f64::from(o.w[j]), f64::from(d.w[j]));
             let dk = &d.down[j * n..(j + 1) * n];
             let card = (o.sel[j] as usize) < n_card;
@@ -1399,9 +1453,11 @@ mod gate {
                     .iter()
                     .find(|s| s.slot == j)
                     .ok_or_else(|| format!("slot {j} is neither the card's nor the host's"))?;
-                let mut xh = vec![0.0f32; ff];
-                quantize_activations(bw.down_ty, &s.h, &mut xh)?;
-                (xh, n_ik_quant(ff) + decode, s.down.clone())
+                (
+                    down_act.reconstruct(&s.h),
+                    n_ik_quant(ff) + decode,
+                    s.down.clone(),
+                )
             };
             let st = row_stats(wd, &xo, &xi)?;
             for (dd, s) in st.iter().enumerate() {
@@ -1417,9 +1473,8 @@ mod gate {
                 sum_k[dd] += (wk * f64::from(dk[dd])).abs();
             }
         }
-        let mut xi = vec![0.0f32; ff];
-        quantize_row_q8_2_x4_roundtrip(&d.sh_h, &mut xi);
-        let st = row_stats(&bw.sh_down, &o.sh_h, &xi)?;
+        let (xo, own_sh, ik_sh) = shared_down_rule(bw.sh_ty, &o.sh_h)?;
+        let st = row_stats(&bw.sh_down, &xo, &Act::Q8_2.reconstruct(&d.sh_h))?;
         let (g_o, g_h, g_k) = (
             gamma(n_card_slots(o, n_card) + 2),
             gamma(2 * n_host.max(1)),
@@ -1428,8 +1483,8 @@ mod gate {
         let slack = (ff + N_USED + 2) as f64 * U64;
         for (dd, s) in st.iter().enumerate() {
             pred[dd] += s.ours - s.ik;
-            bound[dd] += n_ours(ff) * U * s.abs_ours
-                + n_ik_quant(ff) * U * s.abs_ik
+            bound[dd] += own_sh * U * s.abs_ours
+                + ik_sh * U * s.abs_ik
                 + g_o * (sum_o[dd] + f64::from(o.hsum[dd]).abs() + f64::from(o.sh[dd]).abs())
                 + g_h * sum_host[dd]
                 + g_k * (sum_k[dd] + f64::from(d.sh[dd]).abs())

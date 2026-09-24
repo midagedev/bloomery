@@ -10,8 +10,16 @@
 //! - `routed`: `ds41_expert_gate_up` for `ffn_moe_gate_par` and `q4k_sel`'s
 //!   gemv for `ffn_moe_down`, at the layers whose down stack is q4_K — a
 //!   q5_K down (layers 0 and 1) is the host tier's in every plan;
-//! - `shared`: `ds41_shexp_gate_up` for `ffn_up_gate` and `q8_0_gemv` for
-//!   `ffn_shexp`, every layer;
+//! - `shared`: the shared expert's gate·up·SwiGLU for `ffn_up_gate` and its
+//!   down projection for `ffn_shexp`, every layer, in the file's format —
+//!   `ds41_shexp_gate_up` and `q8_0_gemv` on a q8_0 file,
+//!   `ds41_shexp_gate_up_q3k` on the q8_1 form of the input and the
+//!   Q4_K gemv on the q8_1 form of h (`ds41_q5k_gemv_f32` on h for a Q5_K
+//!   down) on a K-quant one;
+//! - `rule`: ik's q8_2 × Q4_K and q8_2 × Q5_K dots (`act_rule::dot_q4k`,
+//!   `dot_q5k`) on the dump's own h give `ffn_moe_down` (every layer) and a
+//!   K-quant `ffn_shexp` bit for bit — the codes the bands read ik's rounding
+//!   from;
 //!
 //! PIN(2026-09-24): removed — the `combine` site and the combine launch of the layer graph pinned `ds41_moe_combine`, which the engine never runs (its combine is `ds41_ffn_post`'s, pinned by the MoE chain gate against `ffn_out`); the kernel is gone.
 //!
@@ -24,8 +32,8 @@
 //! Three comparisons per site (the B4 gate form):
 //! 1. **kernel vs the host transcription of our rule** — bit-identical where
 //!    the host runs the rule itself: the SwiGLU on the op-path kernels' dots
-//!    (`q3k_gemv_sel`, `q8_0_gemv`: the same bodies and warp tree), the
-//!    selection and the weights from the kernel's own scores;
+//!    (`q3k_gemv_sel`, `q3k_gemv`, `q8_0_gemv`: the same bodies and warp
+//!    tree), the selection and the weights from the kernel's own scores;
 //!    each dot within `KERNEL_BAND` of its f64 value; the router's logits
 //!    bit-identical to `f32_gemv`'s; the scores within the distance of the
 //!    device's `expf`/`logf` from the host's (`softplus_err`); every kernel
@@ -39,8 +47,9 @@
 //!
 //! The bands. Each output row of a dot is computed here in f64 twice, from
 //! the dump's input: with our rule's activations (q8_1 per 128 values for
-//! the K-quant stacks, f32 for q8_0 and the router) and with ik's (q8_K per
-//! 256 for q3_K, q8_2 per 32 for q4_K and q8_0, f32 for the router), each
+//! q3_K and q4_K, f32 for q8_0, q5_K and the router) and with ik's (q8_K per
+//! 256 for q3_K, q8_2 per 32 for q4_K, q5_K and q8_0, f32 for the router —
+//! `act_rule`'s table and its transcribed quantizers), each
 //! with its sum of absolute terms `A`. A computed dot lies within `n·u·A` of
 //! its f64 value — the standard summation bound, `u` = 2^-24 and `n` the
 //! roundings on one term's path (`n_ours`, `n_ik_quant`, `n_ik_f32`) —
@@ -60,7 +69,8 @@
 //! on `u > L` and on `u < -L`, and `L = 0` (no clamp), routed and shared,
 //! against the host and against the clamp's statement in f64
 //! (`stated_ratio`); an out-of-range expert id; one layer's seven launches
-//! captured as a graph and replayed.
+//! (eight where the shared down reads q8_1) captured as a graph and
+//! replayed.
 
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
@@ -80,10 +90,12 @@ mod gate {
     use bloomery_gpu::route_core::renorm_divisor;
     use bloomery_gpu::weights::{DevWeight, Q8Block, q8_0_planes};
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels, silu_ik, swiglu_clamp};
     use bloomery_gpu_deepseek41::router::{
         N_EXPERT, N_USED, RouterKernels, RouterOut, sqrt_softplus,
     };
+    use bloomery_gpu_gates::act_rule::{self, Act, Rule};
     use bloomery_gpu_gates::ik_q8_2;
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -94,7 +106,7 @@ mod gate {
         topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
-    use gguf::quant::{GgmlType, dequant_row, quantize_activations};
+    use gguf::quant::{GgmlType, dequant_row};
     use gguf::{Split, Value};
     use model::arch::Arch;
 
@@ -126,12 +138,14 @@ mod gate {
         k as f64
     }
 
-    /// The f64 references decode q4_K weights as `dequant_row` does, rounding
-    /// `d·sc·q - dmin·m` to f32 once; both engines use the exact weight, so
-    /// each side's count gains one rounding against this reference. The
-    /// other types decode exactly: bf16, q8_0, and q3_K, whose `d·(s - 32)·q`
-    /// has at most 20 significant bits.
-    const Q4K_DECODE: f64 = 1.0;
+    /// The f64 references decode q4_K and q5_K weights as `dequant_row` does,
+    /// rounding `fma(q, d·sc, −dmin·m)` to f32 once; a side that uses the
+    /// exact weight — ik's integer dots, our q8_1 gemv — gains one rounding
+    /// against this reference. Our q5_K gemv reads each weight as
+    /// `dequant_row` decodes it (`dense.rs`'s numeric contract) and gains
+    /// none. The other types decode exactly: bf16, q8_0, and q3_K, whose
+    /// `d·(s - 32)·q` has at most 20 significant bits.
+    const KQ_DECODE: f64 = 1.0;
 
     /// silu's steepest slope (1.0998… at x ≈ 2.40), rounded up.
     const SILU_SLOPE: f64 = 1.1;
@@ -663,6 +677,8 @@ mod gate {
         su: DeviceBuffer<f32>,
         sh: DeviceBuffer<f32>,
         shin: DeviceBuffer<f32>,
+        /// The shared down's input in q8_1, where its weight reads one.
+        act_sh: Q8Act,
         sy: DeviceBuffer<f32>,
     }
 
@@ -684,6 +700,7 @@ mod gate {
                 su: z(m.n_ff)?,
                 sh: z(m.n_ff)?,
                 shin: z(m.n_ff)?,
+                act_sh: Q8Act::with_k(stream, 1, m.n_ff)?,
                 sy: z(m.n_embd)?,
             })
         }
@@ -696,6 +713,7 @@ mod gate {
         gpu: Gpu,
         router: RouterKernels,
         experts: ExpertKernels,
+        dense: DenseKernels,
     }
 
     /// One layer's router and shared-expert weights: f32 host copies for the
@@ -706,12 +724,9 @@ mod gate {
         router_dev: DeviceTensor<f32>,
         bias: Vec<f32>,
         bias_dev: DeviceBuffer<f32>,
-        sh_gate: Vec<f32>,
-        sh_up: Vec<f32>,
-        sh_down: Vec<f32>,
-        sh_gate_dev: DevWeight,
-        sh_up_dev: DevWeight,
-        sh_down_dev: DevWeight,
+        sh_gate: ShW,
+        sh_up: ShW,
+        sh_down: ShW,
         /// The down stack's type: q4_K puts the routed experts on the card.
         down_ty: GgmlType,
     }
@@ -735,22 +750,26 @@ mod gate {
                 &[ne64],
             )?;
             let bias = rows_f32(GgmlType::F32, bb, 0, 1, N_EXPERT)?;
-            let q =
-                |name: &str, rows: usize, kk: usize| -> Result<(Vec<f32>, DevWeight), GateError> {
-                    let b = tensor(
-                        &cx.split,
-                        &format!("blk.{l}.{name}.weight"),
-                        GgmlType::Q8_0,
-                        &[kk as u64, rows as u64],
-                    )?;
-                    Ok((
-                        rows_f32(GgmlType::Q8_0, b, 0, rows, kk)?,
-                        q8_0_weight(stream, b, rows, kk)?,
-                    ))
-                };
-            let (sh_gate, sh_gate_dev) = q("ffn_gate_shexp", ff, k)?;
-            let (sh_up, sh_up_dev) = q("ffn_up_shexp", ff, k)?;
-            let (sh_down, sh_down_dev) = q("ffn_down_shexp", k, ff)?;
+            let q = |name: &str, rows: usize, kk: usize, formats: &[GgmlType]| {
+                ShW::load(cx, &format!("blk.{l}.{name}.weight"), rows, kk, formats)
+            };
+            let gate_up = [GgmlType::Q8_0, GgmlType::Q3_K];
+            let sh_gate = q("ffn_gate_shexp", ff, k, &gate_up)?;
+            let sh_up = q("ffn_up_shexp", ff, k, &gate_up)?;
+            if sh_up.ty != sh_gate.ty {
+                return Err(format!(
+                    "layer {l}: ffn_gate_shexp is {} and ffn_up_shexp {}: the fused gate·up \
+                     reads one format",
+                    sh_gate.ty, sh_up.ty
+                )
+                .into());
+            }
+            let sh_down = q(
+                "ffn_down_shexp",
+                k,
+                ff,
+                &[GgmlType::Q8_0, GgmlType::Q4_K, GgmlType::Q5_K],
+            )?;
             let down_name = format!("blk.{l}.ffn_down_exps.weight");
             let down_ty = cx
                 .split
@@ -766,20 +785,220 @@ mod gate {
                 sh_gate,
                 sh_up,
                 sh_down,
-                sh_gate_dev,
-                sh_up_dev,
-                sh_down_dev,
                 down_ty,
             })
         }
     }
 
-    /// The q8_0 planes of a shared-expert weight, for the op-path gemv.
-    fn planes(w: &DevWeight) -> Result<(&DeviceTensor<u32>, &DeviceTensor<u16>), GateError> {
-        match w {
-            DevWeight::Q8_0 { qs, d, .. } => Ok((qs, d)),
-            _ => Err("a shared-expert weight is not q8_0".into()),
+    /// A shared-expert weight: its format, its rows decoded to f32 for the
+    /// f64 references, its file bytes (ik's rule reads a K-quant's codes;
+    /// empty for q8_0) and its device copy in the format its kernel loads.
+    struct ShW {
+        ty: GgmlType,
+        rows: Vec<f32>,
+        bytes: Vec<u8>,
+        dev: DevWeight,
+    }
+
+    impl ShW {
+        /// Weight `name`, `rows` rows of `kk` values, in one of `formats`;
+        /// any other format is refused with the tensor named.
+        fn load(
+            cx: &Cx,
+            name: &str,
+            rows: usize,
+            kk: usize,
+            formats: &[GgmlType],
+        ) -> Result<ShW, GateError> {
+            let ty = cx
+                .split
+                .find(name)
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| format!("tensor {name} is not in the model"))?;
+            if !formats.contains(&ty) {
+                return Err(format!(
+                    "{name} is {ty}, want one of {formats:?}: the gate has no rule for it"
+                )
+                .into());
+            }
+            let b = tensor(&cx.split, name, ty, &[kk as u64, rows as u64])?;
+            let stream = cx.gpu.stream();
+            let (dev, bytes) = if ty == GgmlType::Q8_0 {
+                (q8_0_weight(stream, b, rows, kk)?, Vec::new())
+            } else {
+                if !b.len().is_multiple_of(4 * rows) {
+                    return Err(
+                        format!("{name}: {} bytes are not {rows} word rows", b.len()).into(),
+                    );
+                }
+                let words = bytes_to_words(b);
+                let w = DeviceTensor::upload(stream, &words, rows, words.len() / rows)?;
+                (DevWeight::KQuant { ty, w, k: kk }, b.to_vec())
+            };
+            Ok(ShW {
+                ty,
+                rows: rows_f32(ty, b, 0, rows, kk)?,
+                bytes,
+                dev,
+            })
         }
+
+        /// The weight as `dense`'s projection, for the down's kernel.
+        fn dense(&self) -> Result<Dense<'_>, bloomery_gpu::GpuError> {
+            match (&self.dev, self.ty) {
+                (DevWeight::Q8_0 { qs, d, .. }, _) => Ok(Dense::Q8_0 { qs, d }),
+                (DevWeight::KQuant { w, .. }, GgmlType::Q3_K) => Ok(Dense::Q3K(w)),
+                (DevWeight::KQuant { w, .. }, GgmlType::Q4_K) => Ok(Dense::Q4K(w)),
+                (DevWeight::KQuant { w, .. }, GgmlType::Q5_K) => Ok(Dense::Q5K(w)),
+                _ => Err(bloomery_gpu::GpuError::Shape {
+                    what: "ShW::dense",
+                    detail: format!(
+                        "a shared-expert weight of type {} has no dense kernel",
+                        self.ty
+                    ),
+                }),
+            }
+        }
+
+        /// The q8_0 planes, for the op path's q8_0 gemv.
+        fn planes(
+            &self,
+        ) -> Result<(&DeviceTensor<u32>, &DeviceTensor<u16>), bloomery_gpu::GpuError> {
+            match self.dense()? {
+                Dense::Q8_0 { qs, d } => Ok((qs, d)),
+                _ => Err(bloomery_gpu::GpuError::Shape {
+                    what: "ShW::planes",
+                    detail: format!("a shared-expert weight is {}, not q8_0", self.ty),
+                }),
+            }
+        }
+
+        /// The Q3_K word rows, for the op path's and the fused gate·up's
+        /// Q3_K kernels.
+        fn q3k(&self) -> Result<&DeviceTensor<u32>, bloomery_gpu::GpuError> {
+            match self.dense()? {
+                Dense::Q3K(w) => Ok(w),
+                _ => Err(bloomery_gpu::GpuError::Shape {
+                    what: "ShW::q3k",
+                    detail: format!("a shared-expert weight is {}, not Q3_K", self.ty),
+                }),
+            }
+        }
+    }
+
+    /// Each side's activation under a shared-expert weight of type `ty`, as
+    /// the values its codes stand for — ours, then ik's: a q8_0 weight reads
+    /// f32 against ik's q8_2, a K-quant each side's [`Rule`].
+    fn shared_acts(ty: GgmlType, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        match Rule::of(ty) {
+            Some(r) => (r.ours.reconstruct(x), r.ik.reconstruct(x)),
+            None => (x.to_vec(), ik_q8_2::reconstruct(x)),
+        }
+    }
+
+    /// Roundings on one term's path through each side's shared down dot of
+    /// `ff` values, ours then ik's: [`KQ_DECODE`] on a side that uses the
+    /// exact K-quant weight.
+    fn shared_down_counts(ty: GgmlType, ff: usize) -> (f64, f64) {
+        match ty {
+            GgmlType::Q8_0 => (n_ours(ff), n_ik_quant(ff)),
+            GgmlType::Q5_K => (n_ours(ff), n_ik_quant(ff) + KQ_DECODE),
+            _ => (n_ours(ff) + KQ_DECODE, n_ik_quant(ff) + KQ_DECODE),
+        }
+    }
+
+    /// Enqueue the shared gate·up·SwiGLU of `x` in its weights' format: the
+    /// q8_0 kernel on `x`, the Q3_K one on `act`, `x`'s q8_1 form (the
+    /// caller quantized it).
+    fn enqueue_shared_gate_up(
+        cx: &Cx,
+        ly: &Layer,
+        x: &DeviceBuffer<f32>,
+        act: &Q8Act,
+        limit: f32,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), bloomery_gpu::GpuError> {
+        let stream = cx.gpu.stream();
+        if ly.sh_gate.ty == GgmlType::Q3_K {
+            let (g, u) = (ly.sh_gate.q3k()?, ly.sh_up.q3k()?);
+            cx.dense
+                .enqueue_shexp_gate_up_q3k(stream, g, u, act, limit, h)
+        } else {
+            cx.experts
+                .enqueue_shexp_gate_up(stream, &ly.sh_gate.dev, &ly.sh_up.dev, x, limit, h)
+        }
+    }
+
+    /// Enqueue the op path's shared gate and up dots of `x` (`act` its q8_1
+    /// form, for Q3_K) into `g` and `u`: the gemvs whose bodies the fused
+    /// kernel runs.
+    fn enqueue_shared_dots(
+        cx: &Cx,
+        ly: &Layer,
+        x: &DeviceBuffer<f32>,
+        act: &Q8Act,
+        g: &mut DeviceBuffer<f32>,
+        u: &mut DeviceBuffer<f32>,
+    ) -> Result<(), bloomery_gpu::GpuError> {
+        if ly.sh_gate.ty == GgmlType::Q3_K {
+            cx.gpu.enqueue_gemv_q3k(ly.sh_gate.q3k()?, act, g)?;
+            cx.gpu.enqueue_gemv_q3k(ly.sh_up.q3k()?, act, u)
+        } else {
+            let (stream, q8) = (cx.gpu.stream(), cx.gpu.q8f32());
+            let ((gq, gd), (uq, ud)) = (ly.sh_gate.planes()?, ly.sh_up.planes()?);
+            q8.enqueue_q8_0_gemv(stream, gq, gd, x, 1, g)?;
+            q8.enqueue_q8_0_gemv(stream, uq, ud, x, 1, u)
+        }
+    }
+
+    /// Enqueue the shared down projection of `h` into `y` in its weight's
+    /// format, `h`'s q8_1 form into `act` first where the weight reads one.
+    fn enqueue_shared_down(
+        cx: &Cx,
+        ly: &Layer,
+        h: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), bloomery_gpu::GpuError> {
+        let d = ly.sh_down.dense()?;
+        let act = if d.reads_q8_1() {
+            cx.gpu.enqueue_quantize_q8_1(h, act)?;
+            Some(&*act)
+        } else {
+            None
+        };
+        cx.dense.enqueue(&cx.gpu, d, h, act, y)
+    }
+
+    /// ik's output of every row of a Q4_K or Q5_K weight (`bytes`: whole
+    /// rows of `x.len()` values) on input `x`: `x`'s q8_2 blocks
+    /// ([`act_rule::quantize_q8_2`]), then the row's dot.
+    fn ik_kq_rows(ty: GgmlType, bytes: &[u8], x: &[f32]) -> Result<Vec<f32>, GateError> {
+        let dot: fn(&[u8], &act_rule::Q82, usize) -> f32 = match ty {
+            GgmlType::Q4_K => act_rule::dot_q4k,
+            GgmlType::Q5_K => act_rule::dot_q5k,
+            _ => {
+                return Err(
+                    format!("ik's q8_2 rule is transcribed for Q4_K and Q5_K, not {ty}").into(),
+                );
+            }
+        };
+        let rb = row_bytes(ty, x.len())?;
+        let a = act_rule::quantize_q8_2(x);
+        let mut out = vec![0.0f32; bytes.len() / rb];
+        par_chunks(&mut out, 1, |r, o| {
+            o[0] = dot(&bytes[r * rb..(r + 1) * rb], &a, 0);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// How many of `got` equal `want` bit for bit.
+    fn same_bits(got: &[f32], want: &[f32]) -> usize {
+        got.iter()
+            .zip(want)
+            .filter(|(a, b)| a.to_bits() == b.to_bits())
+            .count()
     }
 
     #[derive(Default)]
@@ -803,6 +1022,7 @@ mod gate {
         let gpu = Gpu::new()?;
         let router = RouterKernels::load(gpu.context())?;
         let experts = ExpertKernels::load(gpu.context())?;
+        let dense = DenseKernels::load(gpu.context())?;
         println!(
             "gate_deepseek41_moe: device {} — layers {} n_embd {} n_ff {} experts {N_EXPERT} used {N_USED} \
              gating_func {} scale {} clamp_exp[0] {} clamp_shexp[0] {}",
@@ -821,6 +1041,7 @@ mod gate {
             gpu,
             router,
             experts,
+            dense,
         };
         let stream = cx.gpu.stream();
         let mut dv = Dev::new(stream, &cx.meta)?;
@@ -839,10 +1060,19 @@ mod gate {
             let ly = Layer::load(&cx, l)?;
             for set in &sets {
                 tally.add(router_site(&cx, &ly, set, &mut dv)?);
-                tally.add(shared_site(&cx, &ly, set, &mut dv)?);
+                let (pass, rule) = shared_site(&cx, &ly, set, &mut dv)?;
+                tally.add(pass);
+                if let Some(r) = rule {
+                    tally.add(r);
+                }
             }
+            let ins: Vec<RoutedIn> = sets
+                .iter()
+                .map(|set| routed_in(&cx, set, l))
+                .collect::<Result<_, _>>()?;
+            tally.add(routed_rule(&cx, l, &sets, &ins)?);
             if ly.down_ty == GgmlType::Q4_K {
-                let (pass, extra) = routed_layer(&cx, &ly, &sets, &mut dv, first_routed)?;
+                let (pass, extra) = routed_layer(&cx, &ly, &sets, &ins, &mut dv, first_routed)?;
                 for p in pass {
                     tally.add(p);
                 }
@@ -1075,8 +1305,14 @@ mod gate {
         Ok(pass)
     }
 
-    /// The shared expert at one layer of one set.
-    fn shared_site(cx: &Cx, ly: &Layer, set: &SetData, dv: &mut Dev) -> Result<bool, GateError> {
+    /// The shared expert at one layer of one set; with a K-quant down, also
+    /// ik's rule on it against the dump (the second verdict).
+    fn shared_site(
+        cx: &Cx,
+        ly: &Layer,
+        set: &SetData,
+        dv: &mut Dev,
+    ) -> Result<(bool, Option<bool>), GateError> {
         let stream = cx.gpu.stream();
         let (k, ff, t, l) = (cx.meta.n_embd, cx.meta.n_ff, set.t, ly.l);
         let limit = cx.meta.clamp_shexp[l];
@@ -1100,10 +1336,10 @@ mod gate {
             "MUL_MAT",
             Some((&format!("blk.{l}.ffn_down_shexp.weight"), &upg)),
         )?;
-        let (gq, gd) = planes(&ly.sh_gate_dev)?;
-        let (uq, ud) = planes(&ly.sh_up_dev)?;
-        let (dq, dd) = planes(&ly.sh_down_dev)?;
-        let (no_k, ni_k, no_f, ni_f) = (n_ours(k), n_ik_quant(k), n_ours(ff), n_ik_quant(ff));
+        let (no_k, ni_k) = (n_ours(k), n_ik_quant(k));
+        let (no_f, ni_f) = shared_down_counts(ly.sh_down.ty, ff);
+        let rule = ly.sh_down.ty != GgmlType::Q8_0;
+        let (mut rule_same, mut rule_n) = (0usize, 0usize);
         let mut h_exact = true;
         let (mut g_rel, mut u_rel, mut y_rel) = (0.0f32, 0.0f32, 0.0f32);
         let (mut h2, mut h3, mut y2, mut y3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -1115,35 +1351,22 @@ mod gate {
             let ht = &h_d[tt * ff..(tt + 1) * ff];
             let yt = &y_d[tt * k..(tt + 1) * k];
             dv.x.copy_from_host(stream, xt)?;
-            let q8 = cx.gpu.q8f32();
-            q8.enqueue_q8_0_gemv(stream, gq, gd, &dv.x, 1, &mut dv.sg)?;
-            q8.enqueue_q8_0_gemv(stream, uq, ud, &dv.x, 1, &mut dv.su)?;
-            cx.experts.enqueue_shexp_gate_up(
-                stream,
-                &ly.sh_gate_dev,
-                &ly.sh_up_dev,
-                &dv.x,
-                limit,
-                &mut dv.sh,
-            )?;
+            if ly.sh_gate.ty == GgmlType::Q3_K {
+                cx.gpu.enqueue_quantize_q8_1(&dv.x, &mut dv.act_x)?;
+            }
+            enqueue_shared_dots(cx, ly, &dv.x, &dv.act_x, &mut dv.sg, &mut dv.su)?;
+            enqueue_shared_gate_up(cx, ly, &dv.x, &dv.act_x, limit, &mut dv.sh)?;
             let (g_op, u_op, hk) = (
                 dv.sg.to_host_vec(stream)?,
                 dv.su.to_host_vec(stream)?,
                 dv.sh.to_host_vec(stream)?,
             );
-            cx.experts.enqueue_shexp_gate_up(
-                stream,
-                &ly.sh_gate_dev,
-                &ly.sh_up_dev,
-                &dv.x,
-                limit,
-                &mut dv.sh,
-            )?;
+            enqueue_shared_gate_up(cx, ly, &dv.x, &dv.act_x, limit, &mut dv.sh)?;
             rerun &= bits_equal(&hk, &dv.sh.to_host_vec(stream)?);
             dv.shin.copy_from_host(stream, ht)?;
-            q8.enqueue_q8_0_gemv(stream, dq, dd, &dv.shin, 1, &mut dv.sy)?;
+            enqueue_shared_down(cx, ly, &dv.shin, &mut dv.act_sh, &mut dv.sy)?;
             let yk = dv.sy.to_host_vec(stream)?;
-            q8.enqueue_q8_0_gemv(stream, dq, dd, &dv.shin, 1, &mut dv.sy)?;
+            enqueue_shared_down(cx, ly, &dv.shin, &mut dv.act_sh, &mut dv.sy)?;
             rerun &= bits_equal(&yk, &dv.sy.to_host_vec(stream)?);
 
             let h_host: Vec<f32> = g_op
@@ -1154,9 +1377,9 @@ mod gate {
             h_exact &= bits_equal(&hk, &h_host);
             let (cs, cu, cl) = crossings(&g_op, &u_op, limit);
             hits = [hits[0] + cs, hits[1] + cu, hits[2] + cl];
-            let xi = ik_q8_2::reconstruct(xt);
-            let gs = row_stats(&ly.sh_gate, xt, &xi)?;
-            let us = row_stats(&ly.sh_up, xt, &xi)?;
+            let (xo, xi) = shared_acts(ly.sh_gate.ty, xt);
+            let gs = row_stats(&ly.sh_gate.rows, &xo, &xi)?;
+            let us = row_stats(&ly.sh_up.rows, &xo, &xi)?;
             let g64: Vec<f32> = gs.iter().map(|s| s.ours as f32).collect();
             let u64_: Vec<f32> = us.iter().map(|s| s.ours as f32).collect();
             g_rel = g_rel.max(max_rel_err(&g_op, &g64)?);
@@ -1166,13 +1389,18 @@ mod gate {
             h3 = h3.max(b);
             h_ik = h_ik.max(rel(&hk, ht));
 
-            let hi = ik_q8_2::reconstruct(ht);
-            let ds = row_stats(&ly.sh_down, ht, &hi)?;
+            let (ho, hi) = shared_acts(ly.sh_down.ty, ht);
+            let ds = row_stats(&ly.sh_down.rows, &ho, &hi)?;
             let (a, b, c) = dot_cmp(&yk, yt, &ds, no_f, ni_f)?;
             y_rel = y_rel.max(a);
             y2 = y2.max(b);
             y3 = y3.max(c);
             y_ik = y_ik.max(rel(&yk, yt));
+            if rule {
+                let got = ik_kq_rows(ly.sh_down.ty, &ly.sh_down.bytes, ht)?;
+                rule_same += same_bits(&got, yt);
+                rule_n += yt.len();
+            }
         }
         let pass = h_exact
             && g_rel <= KERNEL_BAND
@@ -1194,7 +1422,19 @@ mod gate {
             hits[2],
             verdict(pass)
         );
-        Ok(pass)
+        if !rule {
+            return Ok((pass, None));
+        }
+        let rule_pass = rule_same == rule_n;
+        println!(
+            "rule shared set={} layer={l} down={}: ik's q8_2 x {} dot on ik's h, bit-identical \
+             outputs {rule_same}/{rule_n} {}",
+            set.name,
+            ly.sh_down.ty,
+            ly.sh_down.ty,
+            verdict(rule_pass)
+        );
+        Ok((pass, Some(rule_pass)))
     }
 
     /// One set's routed inputs at a layer: per token the activations, our
@@ -1232,10 +1472,10 @@ mod gate {
             Some((&format!("blk.{l}.ffn_down_exps.weight"), &par)),
         )?;
         let xo = q8_1_dequant(&x, k, set.t);
-        let mut xi = vec![0.0f32; x.len()];
-        for (a, b) in x.chunks_exact(k).zip(xi.chunks_exact_mut(k)) {
-            quantize_activations(GgmlType::Q3_K, a, b)?;
-        }
+        let xi: Vec<f32> = x
+            .chunks_exact(k)
+            .flat_map(|a| Act::Q8K.reconstruct(a))
+            .collect();
         Ok(RoutedIn {
             x,
             xo,
@@ -1244,6 +1484,57 @@ mod gate {
             h,
             down,
         })
+    }
+
+    /// ik's rule on the routed down at layer `l` against the dump, bit for
+    /// bit: every slot's output the q8_2 × Q4_K or × Q5_K dot of its expert's
+    /// rows with the q8_2 blocks of the dump's own h ([`ik_kq_rows`]) — every
+    /// set (`ins` their inputs), every token.
+    fn routed_rule(
+        cx: &Cx,
+        l: usize,
+        sets: &[SetData],
+        ins: &[RoutedIn],
+    ) -> Result<bool, GateError> {
+        let (k, ff) = (cx.meta.n_embd, cx.meta.n_ff);
+        let name = format!("blk.{l}.ffn_down_exps.weight");
+        let ty = cx
+            .split
+            .find(&name)
+            .map(|(_, t)| t.ty)
+            .ok_or_else(|| format!("tensor {name} is not in the model"))?;
+        let bytes = tensor(
+            &cx.split,
+            &name,
+            ty,
+            &[ff as u64, k as u64, N_EXPERT as u64],
+        )?;
+        let rows = k * row_bytes(ty, ff)?;
+        let mut parts = Vec::with_capacity(sets.len());
+        let mut pass = true;
+        for (set, inp) in sets.iter().zip(ins) {
+            let (mut same, mut n) = (0usize, 0usize);
+            for (j, &e) in inp.ids.iter().enumerate() {
+                let e = e as usize;
+                let got = ik_kq_rows(
+                    ty,
+                    &bytes[e * rows..(e + 1) * rows],
+                    &inp.h[j * ff..(j + 1) * ff],
+                )?;
+                let want = &inp.down[j * k..(j + 1) * k];
+                same += same_bits(&got, want);
+                n += want.len();
+            }
+            pass &= same == n;
+            parts.push(format!("{} {same}/{n}", set.name));
+        }
+        println!(
+            "rule routed layer={l} down={ty}: ik's q8_2 x {ty} dot on ik's h, bit-identical \
+             outputs {} {}",
+            parts.join(" "),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// A layer's three routed stacks in the file: gate and up q3_K, down q4_K.
@@ -1372,8 +1663,7 @@ mod gate {
                     let (xo, xi) = (&inp.xo[tt * k..(tt + 1) * k], &inp.xi[tt * k..(tt + 1) * k]);
                     let hs = &inp.h[j * ff..(j + 1) * ff];
                     let ho = q8_1_dequant(hs, ff, 1);
-                    let mut hi = vec![0.0f32; ff];
-                    quantize_activations(GgmlType::Q4_K, hs, &mut hi)?;
+                    let hi = Act::Q8_2.reconstruct(hs);
                     st[j] = SlotStats {
                         g: row_stats(&wg, xo, xi)?,
                         u: row_stats(&wu, xo, xi)?,
@@ -1385,29 +1675,27 @@ mod gate {
         Ok(stats)
     }
 
-    /// The routed experts at one layer, every set: the stacks of the experts
-    /// any set's tokens use, compacted and uploaded once. Returns the sites'
-    /// verdicts and, at the first routed layer, the synthetic checks'.
+    /// The routed experts at one layer, every set (`ins` their inputs): the
+    /// stacks of the experts any set's tokens use, compacted and uploaded
+    /// once. Returns the sites' verdicts and, at the first routed layer, the
+    /// synthetic checks'.
     fn routed_layer(
         cx: &Cx,
         ly: &Layer,
         sets: &[SetData],
+        ins: &[RoutedIn],
         dv: &mut Dev,
         synthetic: bool,
     ) -> Result<(Vec<bool>, Vec<bool>), GateError> {
         let l = ly.l;
-        let ins: Vec<RoutedIn> = sets
-            .iter()
-            .map(|set| routed_in(cx, set, l))
-            .collect::<Result<_, _>>()?;
         let mut experts: Vec<u32> = ins.iter().flat_map(|i| i.ids.iter().copied()).collect();
         experts.sort_unstable();
         experts.dedup();
         let file = RoutedFile::open(cx, l)?;
-        let stats = routed_stats(cx, &file, &ins, &experts)?;
+        let stats = routed_stats(cx, &file, ins, &experts)?;
         let stacks = file.upload(cx, experts)?;
         let mut verdicts = Vec::new();
-        for ((set, inp), st) in sets.iter().zip(&ins).zip(&stats) {
+        for ((set, inp), st) in sets.iter().zip(ins).zip(&stats) {
             verdicts.push(routed_set(cx, ly, set, inp, st, &stacks, dv)?);
         }
         let mut extra = Vec::new();
@@ -1445,7 +1733,7 @@ mod gate {
         let (k, ff, l) = (cx.meta.n_embd, cx.meta.n_ff, ly.l);
         let limit = cx.meta.clamp_exp[l];
         let (no_k, ni_k) = (n_ours(k), n_ik_quant(k));
-        let (no_f, ni_f) = (n_ours(ff) + Q4K_DECODE, n_ik_quant(ff) + Q4K_DECODE);
+        let (no_f, ni_f) = (n_ours(ff) + KQ_DECODE, n_ik_quant(ff) + KQ_DECODE);
         let mut h_exact = true;
         let (mut g_rel, mut u_rel, mut d_rel) = (0.0f32, 0.0f32, 0.0f32);
         let (mut h2, mut h3, mut d2, mut d3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -1657,16 +1945,12 @@ mod gate {
     fn clamp_shared(cx: &Cx, dv: &mut Dev, ly: &Layer, x: &[f32]) -> Result<bool, GateError> {
         let stream = cx.gpu.stream();
         let limit = cx.meta.clamp_shexp[ly.l];
-        let (gq, gd) = planes(&ly.sh_gate_dev)?;
-        let (uq, ud) = planes(&ly.sh_up_dev)?;
         let run = |dv: &mut Dev, x: &[f32]| -> Result<(Vec<f32>, Vec<f32>), GateError> {
             dv.x.copy_from_host(stream, x)?;
-            cx.gpu
-                .q8f32()
-                .enqueue_q8_0_gemv(stream, gq, gd, &dv.x, 1, &mut dv.sg)?;
-            cx.gpu
-                .q8f32()
-                .enqueue_q8_0_gemv(stream, uq, ud, &dv.x, 1, &mut dv.su)?;
+            if ly.sh_gate.ty == GgmlType::Q3_K {
+                cx.gpu.enqueue_quantize_q8_1(&dv.x, &mut dv.act_x)?;
+            }
+            enqueue_shared_dots(cx, ly, &dv.x, &dv.act_x, &mut dv.sg, &mut dv.su)?;
             Ok((dv.sg.to_host_vec(stream)?, dv.su.to_host_vec(stream)?))
         };
         let (g1, u1) = run(dv, x)?;
@@ -1679,14 +1963,7 @@ mod gate {
         let (g, u) = run(dv, &xs)?;
         let (mut ok, mut stated) = (true, 0.0f64);
         for lim in [limit, 0.0] {
-            cx.experts.enqueue_shexp_gate_up(
-                stream,
-                &ly.sh_gate_dev,
-                &ly.sh_up_dev,
-                &dv.x,
-                lim,
-                &mut dv.sh,
-            )?;
+            enqueue_shared_gate_up(cx, ly, &dv.x, &dv.act_x, lim, &mut dv.sh)?;
             let hk = dv.sh.to_host_vec(stream)?;
             let host: Vec<f32> = g
                 .iter()
@@ -1762,7 +2039,9 @@ mod gate {
 
     /// Enqueue one layer's seven launches for the token in `dv.x`: the router,
     /// the q8_1 of `x`, the routed gate·up·SwiGLU, the q8_1 of `h`, the
-    /// routed down, the shared gate·up·SwiGLU, the shared down. The routed
+    /// routed down, the shared gate·up·SwiGLU (a Q3_K one on the q8_1 of
+    /// `x`), the shared down — after the q8_1 of its input where the weight
+    /// reads one, the eighth. The routed
     /// slots read `sel` (the dump's ids in the compact stack), not the
     /// router's ids: the gate's stacks hold only the experts the sets use.
     fn layer_chain(
@@ -1798,24 +2077,9 @@ mod gate {
         cx.gpu
             .q4k_sel()
             .enqueue_gemv_q4k_sel(stream, &s.wd, &dv.act_h, sel, N_USED, k, &mut dv.d6)?;
-        cx.experts.enqueue_shexp_gate_up(
-            stream,
-            &ly.sh_gate_dev,
-            &ly.sh_up_dev,
-            &dv.x,
-            cx.meta.clamp_shexp[ly.l],
-            &mut dv.sh,
-        )?;
-        let DevWeight::Q8_0 { qs, d, .. } = &ly.sh_down_dev else {
-            return Err(bloomery_gpu::GpuError::Shape {
-                what: "layer_chain",
-                detail: "the shared down weight is not q8_0".into(),
-            });
-        };
-        cx.gpu
-            .q8f32()
-            .enqueue_q8_0_gemv(stream, qs, d, &dv.sh, 1, &mut dv.sy)?;
-        Ok(())
+        let limit = cx.meta.clamp_shexp[ly.l];
+        enqueue_shared_gate_up(cx, ly, &dv.x, &dv.act_x, limit, &mut dv.sh)?;
+        enqueue_shared_down(cx, ly, &dv.sh, &mut dv.act_sh, &mut dv.sy)
     }
 
     /// Every buffer the layer chain writes, read back.
@@ -1839,9 +2103,10 @@ mod gate {
         ])
     }
 
-    /// One layer's seven launches captured and replayed twice: seven graph
-    /// nodes, each replay's outputs bit-identical to the eager run's, and the
-    /// router's ticket count back at zero after each.
+    /// One layer's launches captured and replayed twice: seven graph nodes
+    /// (eight where the shared down reads q8_1), each replay's outputs
+    /// bit-identical to the eager run's, and the router's ticket count back
+    /// at zero after each.
     fn graph(
         cx: &Cx,
         dv: &mut Dev,
@@ -1852,6 +2117,7 @@ mod gate {
     ) -> Result<bool, GateError> {
         // PIN(2026-09-24): 8 → 7 — the layer chain's combine launch left with `ds41_moe_combine`.
         const NODES: usize = 7;
+        let want = NODES + usize::from(ly.sh_down.dense()?.reads_q8_1());
         let stream = cx.gpu.stream();
         let sel = DeviceBuffer::from_host(stream, sel)?;
         dv.x.copy_from_host(stream, x)?;
@@ -1868,9 +2134,9 @@ mod gate {
             same &= out.iter().zip(&eager).all(|(a, b)| bits_equal(a, b));
             tickets_zero &= dv.rout.tickets(stream)? == 0;
         }
-        let pass = nodes == NODES && same && tickets_zero;
+        let pass = nodes == want && same && tickets_zero;
         println!(
-            "graph layer={} nodes={nodes} (want {NODES}) replays_eq_eager={same} tickets_zero={tickets_zero} {}",
+            "graph layer={} nodes={nodes} (want {want}) replays_eq_eager={same} tickets_zero={tickets_zero} {}",
             ly.l,
             verdict(pass)
         );

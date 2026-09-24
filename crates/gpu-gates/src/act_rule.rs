@@ -562,3 +562,197 @@ mod tests {
         assert!((got - exact).abs() <= 1e-5 * abs, "{got} vs {exact}");
     }
 }
+
+// ---- opg-ffnmoe ----
+
+/// Bytes of one Q4_K super-block: `d`, `dmin`, `scales[12]`, `qs[128]`.
+pub const Q4K_BYTES: usize = 144;
+
+/// Bytes of one Q5_K super-block: `d`, `dmin`, `scales[12]`, `qh[32]`,
+/// `qs[128]`.
+pub const Q5K_BYTES: usize = 176;
+
+/// ik's q8_2 blocks of a row: the codes, one bf16-valued scale per 32
+/// values, and each block's `s` field.
+#[derive(Clone, Debug, Default)]
+pub struct Q82 {
+    pub q: Vec<i8>,
+    pub d: Vec<f32>,
+    pub s: Vec<i16>,
+}
+
+/// ik's q8_2 of `x` on AVX2 (`quantize_row_q8_2_x4` →
+/// `quantize_row_q8_1_x4_T<block_q8_2, block_q8_2_x4>`, `iqk_quantize.cpp`):
+/// the codes and scales of [`crate::ik_q8_2::quantize`], and `s` the sum of
+/// the block's 32 codes as `cvtps_epi32` leaves them, before the packs
+/// saturate, stored as an i16 (`block_q8_2::s`, `ggml-common.h`). The x4
+/// interleave moves bytes only. `x` is whole blocks.
+#[must_use]
+pub fn quantize_q8_2(x: &[f32]) -> Q82 {
+    use crate::ik_q8_2::QK;
+    assert!(x.len().is_multiple_of(QK), "q8_2 blocks are {QK} values");
+    let (q, d) = crate::ik_q8_2::quantize(x);
+    let s = x
+        .as_chunks::<QK>()
+        .0
+        .iter()
+        .zip(&d)
+        .map(|(blk, &db)| {
+            let id = if db > 0.0 { 1.0 / db } else { 0.0 };
+            blk.iter()
+                .map(|&v| (v * id).round_ties_even() as i32)
+                .sum::<i32>() as i16
+        })
+        .collect();
+    Q82 { q, d, s }
+}
+
+/// The eight 6-bit scales and eight 6-bit minimums of a Q4_K or Q5_K
+/// super-block from its twelve scale bytes (`make_q4_scales`,
+/// `iqk_common.h`; `get_scale_min_k4`).
+#[must_use]
+pub fn q4k_scales(b: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
+    let (mut sc, mut mn) = ([0u8; 8], [0u8; 8]);
+    for j in 0..4 {
+        sc[j] = b[j] & 63;
+        mn[j] = b[j + 4] & 63;
+        sc[j + 4] = (b[j + 8] & 0x0f) | ((b[j] >> 6) << 4);
+        mn[j + 4] = (b[j + 8] >> 4) | ((b[j + 4] >> 6) << 4);
+    }
+    (sc, mn)
+}
+
+/// ik's dot of one Q4_K row (`row`: whole super-blocks of [`Q4K_BYTES`])
+/// with q8_2 blocks `b0 ..` of `a` on AVX2: the walk of `dot_kq`.
+#[must_use]
+pub fn dot_q4k(row: &[u8], a: &Q82, b0: usize) -> f32 {
+    assert!(
+        row.len().is_multiple_of(Q4K_BYTES),
+        "Q4_K rows are whole super-blocks"
+    );
+    dot_kq(row.as_chunks::<Q4K_BYTES>().0, a, b0, |blk, sb, m| {
+        (blk[16 + 32 * (sb / 2) + m] >> (4 * (sb % 2))) & 0x0f
+    })
+}
+
+/// ik's dot of one Q5_K row (`row`: whole super-blocks of [`Q5K_BYTES`])
+/// with q8_2 blocks `b0 ..` of `a` on AVX2: the Q4_K walk, each code's
+/// fifth bit bit `sb` of `qh[m]` (`DequantizerQ5K_AVX2::apply_hbits`).
+#[must_use]
+pub fn dot_q5k(row: &[u8], a: &Q82, b0: usize) -> f32 {
+    assert!(
+        row.len().is_multiple_of(Q5K_BYTES),
+        "Q5_K rows are whole super-blocks"
+    );
+    dot_kq(row.as_chunks::<Q5K_BYTES>().0, a, b0, |blk, sb, m| {
+        ((blk[48 + 32 * (sb / 2) + m] >> (4 * (sb % 2))) & 0x0f) | (((blk[16 + m] >> sb) & 1) << 4)
+    })
+}
+
+/// `mul_mat_qX_K_q8_2_X4_T` (`iqk_gemm_kquants.cpp:783`, the AVX2 `#else`
+/// body) over super-blocks `blocks` whose code `m` of sub-block `sb` is
+/// `code(blk, sb, m)`. Eight f32 lanes, zero at the row's start; per
+/// super-block, first the minimum's term — lane `k` fuses
+/// `(d8ₖ·sₖ) · (−(dmin·mₖ))` — then per 128 values `j` the codes' — lane
+/// `L` fuses `((d·sc₄ⱼ₊ₗ)·d8₄ⱼ₊ₗ) · Σ u·q` over values `16·(L/4) .. + 16` of
+/// sub-block `4j + l`, `l = L%4`; every product rounds once, every
+/// integer exact (`maddubs` pairs stay under 2·31·128 and the `epi16`
+/// lane sums of eight products under 2^15). `hsum_float_8` adds lane `t`
+/// to `t + 4`, then `(s₀ + s₂) + (s₁ + s₃)`.
+fn dot_kq<const N: usize>(
+    blocks: &[[u8; N]],
+    a: &Q82,
+    b0: usize,
+    code: impl Fn(&[u8; N], usize, usize) -> u8,
+) -> f32 {
+    let mut acc = [0.0f32; 8];
+    for (i, blk) in blocks.iter().enumerate() {
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let (sc, mn) = q4k_scales(blk[4..16].try_into().expect("twelve scale bytes"));
+        let b = b0 + 8 * i;
+        let d8 = &a.d[b..b + 8];
+        for (k, l) in acc.iter_mut().enumerate() {
+            let my = d8[k] * f32::from(a.s[b + k]);
+            let mins = -(dmin * f32::from(mn[k]));
+            *l = my.mul_add(mins, *l);
+        }
+        let scale: [f32; 8] = std::array::from_fn(|k| d * f32::from(sc[k]));
+        for j in 0..2 {
+            for (lane, l) in acc.iter_mut().enumerate() {
+                let sb = 4 * j + lane % 4;
+                let q = &a.q[(b + sb) * 32..(b + sb + 1) * 32];
+                let h = 16 * (lane / 4);
+                let sumi: i32 = (h..h + 16)
+                    .map(|m| i32::from(code(blk, sb, m)) * i32::from(q[m]))
+                    .sum();
+                let dd = scale[sb] * d8[sb];
+                *l = dd.mul_add(sumi as f32, *l);
+            }
+        }
+    }
+    let s: [f32; 4] = std::array::from_fn(|t| acc[t] + acc[t + 4]);
+    (s[0] + s[2]) + (s[1] + s[3])
+}
+
+#[cfg(test)]
+mod ffnmoe_tests {
+    use super::{Q4K_BYTES, Q5K_BYTES, QK_K, dot_q4k, dot_q5k, quantize_q8_2};
+    use gguf::quant::{GgmlType, dequant_row};
+
+    /// The codes and scales are [`crate::ik_q8_2::quantize`]'s, and `s` their
+    /// sum where no code saturates.
+    #[test]
+    fn q8_2_sums_are_the_codes() {
+        let x = crate::activations(4 * 32, 1, 11);
+        let a = quantize_q8_2(&x);
+        let (q, d) = crate::ik_q8_2::quantize(&x);
+        assert_eq!((a.q.clone(), a.d.clone()), (q, d));
+        for (b, &s) in a.s.iter().enumerate() {
+            let sum: i32 = a.q[32 * b..32 * (b + 1)]
+                .iter()
+                .map(|&c| i32::from(c))
+                .sum();
+            assert_eq!(i32::from(s), sum, "block {b}");
+        }
+    }
+
+    /// Each dot is the dequantized row against the reconstructed codes, to
+    /// f32 accumulation: the minimum's term through `s` included.
+    #[test]
+    fn dots_are_the_dequantized_dots() {
+        for (ty, bytes) in [(GgmlType::Q4_K, Q4K_BYTES), (GgmlType::Q5_K, Q5K_BYTES)] {
+            let mut row = vec![0u8; 2 * bytes];
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = (i as u8).wrapping_mul(73) ^ 0x33;
+            }
+            for sb in 0..2 {
+                row[sb * bytes..sb * bytes + 2].copy_from_slice(&0x2e66u16.to_le_bytes());
+                row[sb * bytes + 2..sb * bytes + 4].copy_from_slice(&0x2a00u16.to_le_bytes());
+            }
+            let x = crate::activations(2 * QK_K, 1, 5);
+            let a = quantize_q8_2(&x);
+            let xh = crate::ik_q8_2::reconstruct(&x);
+            let mut w = vec![0.0f32; 2 * QK_K];
+            dequant_row(ty, &row, &mut w).unwrap();
+            let exact: f64 = w
+                .iter()
+                .zip(&xh)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
+            let abs: f64 = w
+                .iter()
+                .zip(&xh)
+                .map(|(&a, &b)| (f64::from(a) * f64::from(b)).abs())
+                .sum();
+            let got = f64::from(match ty {
+                GgmlType::Q4_K => dot_q4k(&row, &a, 0),
+                _ => dot_q5k(&row, &a, 0),
+            });
+            assert!(
+                (got - exact).abs() <= 1e-5 * abs,
+                "{ty:?}: {got} vs {exact}"
+            );
+        }
+    }
+}
