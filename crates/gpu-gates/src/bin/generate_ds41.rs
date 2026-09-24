@@ -55,10 +55,15 @@
 //! The binary owns its main thread, so it pins it to the dispatcher's cpu
 //! slot (`threads::pool().pin_caller()`), as `bloomery-decode` and
 //! `bench_v41_host` do; `BLOOMERY_PIN_MAIN=0` leaves it floating, for the
-//! A/B. The `load` line prints both the ask and the outcome.
+//! A/B. The `load` line prints both the ask and the outcome, and
+//! `launch_thread=` whether `BLOOMERY_LAUNCH_THREAD=1` gave the replays'
+//! launches their own thread, and `launch_cpu=` where it runs: the SMT
+//! sibling of the pinned main thread's cpu, or `float` beside
+//! `BLOOMERY_PIN_MAIN=0`.
 //!
 //! `BLOOMERY_STEP_STATS=1` reads, after every generated step, the host
-//! tier's counters (`HybridStats`), the process's page faults (`getrusage`)
+//! tier's counters (`HybridStats`), the replays' launch costs
+//! (`LaunchStats`), the process's page faults (`getrusage`)
 //! and the card's free device bytes (`cuMemGetInfo`), and prints one
 //! `stat step` line per step and a `stat summary` over the steps `--warm`
 //! keeps, after the loop, as the `time` lines are. The summary's
@@ -120,7 +125,7 @@ mod drive {
 
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HybridStats;
-    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::model::{LaunchStats, StepMode};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::draft::Lookup;
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
@@ -396,7 +401,8 @@ mod drive {
         }
         println!(
             "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
-             top_k={top_k} mode={} place={} pin_main={} pinned={pinned} in {:.1} s (runtime value)",
+             top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} in {:.1} s \
+             (runtime value)",
             m.resident_bytes(),
             shadow.bytes,
             shadow.unified_addressing,
@@ -405,6 +411,11 @@ mod drive {
             mode_name(a.mode),
             a.place.name(),
             if pin_main { "on" } else { "off" },
+            m.launch_thread()
+                .map_or("off".to_string(), |cpu| match cpu {
+                    Some(c) => format!("on launch_cpu={c}"),
+                    None => "on launch_cpu=float".to_string(),
+                }),
             t.elapsed().as_secs_f64()
         );
         if let Some(h) = m.host_residency() {
@@ -918,6 +929,7 @@ mod drive {
     #[derive(Clone, Copy)]
     struct Probe {
         hybrid: HybridStats,
+        launch: LaunchStats,
         eng: bloomery_gpu_deepseek41::chain::glue::EngramStats,
         eng_helper: Option<Option<usize>>,
         majflt: u64,
@@ -929,6 +941,7 @@ mod drive {
         fn read(m: &Deepseek41Model) -> Result<Probe, GateError> {
             let body = m.body("generate_ds41")?;
             let hybrid = body.hybrid().stats();
+            let launch = m.launch_stats();
             let eng = body.step_rows().engram_stats();
             let eng_helper = body.step_rows().helper_cpu();
             let stage = m
@@ -948,6 +961,7 @@ mod drive {
             }
             Ok(Probe {
                 hybrid,
+                launch,
                 eng,
                 eng_helper,
                 majflt: u64::try_from(ru.ru_majflt)?,
@@ -974,7 +988,13 @@ mod drive {
     /// step's rows per layer, summed (`host_slots − overlap`: a one-row step
     /// prints `overlap=0 union=<host_slots>`). The summary's `phi_mean` is
     /// the pooled row overlap over the kept steps, `Σ overlap / Σ` row 1's
-    /// host slots, 0 when no kept step ran two rows.
+    /// host slots, 0 when no kept step ran two rows. `go_early_first` is the
+    /// step's first service finding its go already landed, `launch_us` the
+    /// step's `cuGraphLaunch` call (on the launch thread under
+    /// `BLOOMERY_LAUNCH_THREAD=1`), `first_serve_lag_us` the time from just
+    /// before the launch was issued to the first service's entry, and
+    /// `launch_wake_us` the launch thread's time from the post to the call
+    /// (0 without it); the summary's `_mean`s are over the kept steps.
     fn print_stats(probes: &[Probe], warm: usize) {
         let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
         let mut waits: Vec<f64> = Vec::with_capacity(probes.len());
@@ -983,6 +1003,8 @@ mod drive {
         let mut vram_free_min = u64::MAX;
         let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
         let (mut overlap_sum, mut row1_sum) = (0_u64, 0_u64);
+        let (mut early_first, mut launch_ns, mut lag_ns, mut wake_ns) =
+            (0_u64, 0_u64, 0_u64, 0_u64);
         for (k, w) in probes.windows(2).enumerate() {
             let i = k + 1;
             let (p, q) = (&w[0].hybrid, &w[1].hybrid);
@@ -1005,21 +1027,33 @@ mod drive {
             let wait_us = (f.wait_ns - e.wait_ns) as f64 / 1e3;
             let helper_ns = f.helper_ns - e.helper_ns;
             let classify_ns = f.classify_ns - e.classify_ns;
+            let early_first_d = q.go_early_first - p.go_early_first;
+            let lag_d = q.first_serve_lag_ns - p.first_serve_lag_ns;
+            let (lp, lq) = (&w[0].launch, &w[1].launch);
+            let (launch_d, wake_d) = (lq.launch_ns - lp.launch_ns, lq.wake_ns - lp.wake_ns);
             let tag = if i <= warm { " warm" } else { "" };
             println!(
                 "stat step {i}{tag} served={served} leg_us={leg_us:.1} straggle_us={straggle_us:.1} \
                  straggle_max_us={:.1} host_slots={host_slots} host_w2={host_w2:.4} \
                  overlap={overlap} union={union} go_early={} parks={} majflt={dmaj} minflt={dmin} \
                  vram_free={} eng_warm={ew} eng_cold={ec} \
-                 eng_direct={ed} eng_wait_us={wait_us:.1} eng_helper_us={:.1} eng_classify_us={:.1}",
+                 eng_direct={ed} eng_wait_us={wait_us:.1} eng_helper_us={:.1} eng_classify_us={:.1} \
+                 go_early_first={early_first_d} launch_us={:.1} first_serve_lag_us={:.1} launch_wake_us={:.1}",
                 q.straggle_max_ns as f64 / 1e3,
                 q.go_early - p.go_early,
                 q.parks_in_service - p.parks_in_service,
                 w[1].vram_free,
                 helper_ns as f64 / 1e3,
-                classify_ns as f64 / 1e3
+                classify_ns as f64 / 1e3,
+                launch_d as f64 / 1e3,
+                lag_d as f64 / 1e3,
+                wake_d as f64 / 1e3
             );
             if i > warm {
+                early_first += early_first_d;
+                launch_ns += launch_d;
+                lag_ns += lag_d;
+                wake_ns += wake_d;
                 waits.push(wait_us);
                 eng_warm += ew;
                 eng_cold += ec;
@@ -1060,14 +1094,19 @@ mod drive {
              vram_free_min={vram_free_min} eng_helper={helper} eng_warm={eng_warm} \
              eng_cold={eng_cold} eng_direct={eng_direct} eng_wait_us_mean={wait_mean:.1} \
              eng_wait_us_p50={:.1} eng_wait_us_max={:.1} eng_helper_us_mean={:.1} \
-             eng_classify_us_mean={:.1}",
+             eng_classify_us_mean={:.1} go_early_first_mean={:.3} launch_us_mean={:.1} \
+             first_serve_lag_us_mean={:.1} launch_wake_us_mean={:.1}",
             legs[n / 2],
             slots as f64 / n as f64,
             probes[0].vram_free,
             waits[n / 2],
             waits[n - 1],
             eng_helper_ns as f64 / 1e3 / n as f64,
-            eng_classify_ns as f64 / 1e3 / n as f64
+            eng_classify_ns as f64 / 1e3 / n as f64,
+            early_first as f64 / n as f64,
+            launch_ns as f64 / 1e3 / n as f64,
+            lag_ns as f64 / 1e3 / n as f64,
+            wake_ns as f64 / 1e3 / n as f64
         );
     }
 }

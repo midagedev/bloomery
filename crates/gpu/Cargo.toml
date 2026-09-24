@@ -20,3 +20,5 @@ bloomery-gguf = { path = "../gguf" }
 # The pinned pool the hybrid host tier waits on and computes with (the CPU
 # engine dispatches its expert matmuls on the same pool).
 bloomery-threads = { path = "../threads" }
+# The launch thread's affinity (`model::launcher`): off the opener's pinned cpu.
+libc.workspace = true

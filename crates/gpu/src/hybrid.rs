@@ -56,10 +56,11 @@ use model::Tensor2;
 use model::moe::EXPERTS_INTO_MAX;
 use model::placement::host_lock::{HostLock, HostSet, Walk};
 use model::placement::{ModelTensor, Plan};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1076,6 +1077,11 @@ pub struct HybridStats {
     pub host_w2: f64,
     /// Host wall time from the go seen to the signal, summed (ns).
     pub leg_ns: u64,
+    /// Of every watched replay ([`serving_replay`]), the time from just before
+    /// its graph launch was issued to the entry of its first service, summed
+    /// (ns). Lever off that holds the whole launch call; with the launch on
+    /// its own thread only the post and the hand-over to the service.
+    pub first_serve_lag_ns: u64,
     /// Pool workers that parked between the start of a service's wait and
     /// its signal, summed.
     pub parks_in_service: u64,
@@ -1131,6 +1137,38 @@ impl Chain {
             Chain::Pair => 2,
         }
     }
+}
+
+/// The replay the decode thread is about to serve: when its graph launch was
+/// issued, and the flag its launch thread raises when that launch fails —
+/// `None` when the decode thread made the call itself and has its result.
+#[derive(Clone, Debug)]
+pub(crate) struct ReplayWatch {
+    pub(crate) issued: Instant,
+    pub(crate) failed: Option<Arc<AtomicBool>>,
+}
+
+thread_local! {
+    /// The watch of the replay this thread serves inside [`serving_replay`].
+    /// A scope, not state: `ChainBody::serve_replay` takes no argument and
+    /// every architecture's body forwards it to [`Hybrid::serve_captured`],
+    /// so the skeleton hands the replay's watch to the tier through the
+    /// thread that serves it.
+    static REPLAY: RefCell<Option<ReplayWatch>> = const { RefCell::new(None) };
+}
+
+/// Run `serve` — the body's share of one replay — with `watch` as the
+/// replay's watch; the previous one is back when it returns or unwinds.
+pub(crate) fn serving_replay<R>(watch: ReplayWatch, serve: impl FnOnce() -> R) -> R {
+    struct Restore(Option<ReplayWatch>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            REPLAY.with(|r| *r.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(REPLAY.with(|r| r.borrow_mut().replace(watch)));
+    serve()
 }
 
 /// The boundary and the host tier that serves it: the architecture's host
@@ -1250,7 +1288,7 @@ impl<H: HostExperts> Hybrid<H> {
             self.captured[self.chain.index()].push((layer, row));
             Ok(())
         } else {
-            self.serve(layer, row, false, self.chain)
+            self.serve(layer, row, false, self.chain, None)
         }
     }
 
@@ -1261,11 +1299,16 @@ impl<H: HostExperts> Hybrid<H> {
     }
 
     /// [`Hybrid::serve_captured`] for a replay of `chain`'s capture.
+    ///
+    /// Inside [`serving_replay`] the first service adds its lag to
+    /// [`HybridStats::first_serve_lag_ns`], and every service stops waiting
+    /// for its go once the watch's launch has failed.
     pub fn serve_captured_of(&mut self, chain: Chain) -> Result<(), GpuError> {
+        let watch = REPLAY.with(|r| r.borrow().clone());
         let c = chain.index();
         for i in 0..self.captured[c].len() {
             let (layer, row) = self.captured[c][i];
-            self.serve(layer, row, i == 0, chain)?;
+            self.serve(layer, row, i == 0, chain, watch.as_ref())?;
         }
         Ok(())
     }
@@ -1289,10 +1332,11 @@ impl<H: HostExperts> Hybrid<H> {
         row: usize,
         opens_replay: bool,
         chain: Chain,
+        watch: Option<&ReplayWatch>,
     ) -> Result<(), GpuError> {
         self.refuse_if_poisoned("Hybrid::serve")?;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.serve_one(layer, row, opens_replay, chain)
+            self.serve_one(layer, row, opens_replay, chain, watch)
         }));
         match r {
             Ok(Ok(())) => Ok(()),
@@ -1315,8 +1359,15 @@ impl<H: HostExperts> Hybrid<H> {
         row: usize,
         opens_replay: bool,
         chain: Chain,
+        watch: Option<&ReplayWatch>,
     ) -> Result<(), GpuError> {
         let what = "Hybrid::serve";
+        let entered = Instant::now();
+        if opens_replay && let Some(w) = watch {
+            let lag = entered.saturating_duration_since(w.issued).as_nanos();
+            self.stats.first_serve_lag_ns += u64::try_from(lag).unwrap_or(u64::MAX);
+        }
+        let failed = watch.and_then(|w| w.failed.as_deref());
         let (image_off, hsum_off) = {
             let p = self.boundary.page_of(row, what)?;
             (p.image_off, p.hsum_off)
@@ -1325,7 +1376,7 @@ impl<H: HostExperts> Hybrid<H> {
         let generation = self.boundary.page.word(Word::Gen);
         let early = !before(generation.load(Ordering::Acquire), want);
         let parks = threads::pool().stats().worker_parks;
-        let (seen, straggle) = wait_go(generation, want, Instant::now() + GO_DEADLINE);
+        let (seen, straggle) = wait_go(generation, want, entered + GO_DEADLINE, failed);
         if early {
             self.stats.go_early += 1;
             self.stats.go_early_first += u64::from(opens_replay);
@@ -1336,6 +1387,12 @@ impl<H: HostExperts> Hybrid<H> {
         // The goes of the rows in flight after this one may have landed too;
         // one past them means a wait is missing.
         let ahead = usize::try_from(seen.wrapping_sub(want)).unwrap_or(usize::MAX);
+        if before(seen, want) && failed.is_some_and(|f| f.load(Ordering::Acquire)) {
+            return Err(GpuError::protocol(
+                what,
+                format!("the replay's graph launch failed: the go of layer {layer} never lands"),
+            ));
+        }
         if before(seen, want) || ahead >= chain.in_flight() {
             let detail = if before(seen, want) {
                 format!(
@@ -1448,13 +1505,19 @@ impl<H: HostExperts> Hybrid<H> {
     }
 }
 
-/// Wait until the generation word has reached `want` or `deadline` has
-/// passed, with every pool thread spinning on it — a pool job, so no worker
+/// Wait until the generation word has reached `want`, `deadline` has passed
+/// or `failed` (the replay's launch, when another thread issued it) is
+/// raised, with every pool thread spinning on it — a pool job, so no worker
 /// is parked when the go lands and the dispatch that follows starts inside
 /// the spin window this job leaves them in. Returns the word as last read,
 /// and the nanoseconds from the calling thread seeing it to the job's end
 /// (the calling thread runs the last chunk and alone writes that stamp).
-fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
+fn wait_go(
+    generation: &AtomicU32,
+    want: u32,
+    deadline: Instant,
+    failed: Option<&AtomicBool>,
+) -> (u32, u64) {
     let pool = threads::pool();
     let caller = pool.threads() - 1;
     let base = Instant::now();
@@ -1463,7 +1526,9 @@ fn wait_go(generation: &AtomicU32, want: u32, deadline: Instant) -> (u32, u64) {
         let mut spins = 0u32;
         while before(generation.load(Ordering::Acquire), want) {
             spins = spins.wrapping_add(1);
-            if spins.is_multiple_of(DEADLINE_POLL) && Instant::now() > deadline {
+            if spins.is_multiple_of(DEADLINE_POLL)
+                && (Instant::now() > deadline || failed.is_some_and(|f| f.load(Ordering::Relaxed)))
+            {
                 break;
             }
             std::hint::spin_loop();

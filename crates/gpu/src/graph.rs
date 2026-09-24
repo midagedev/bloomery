@@ -129,17 +129,28 @@ impl Graph {
             unsafe { sys::cuGraphDestroy(graph) };
             return Err(e);
         }
-        Ok(Graph { graph, exec, nodes })
+        // From here the handles are owned: a failed upload drops them.
+        let captured = Graph { graph, exec, nodes };
+        // The upload the first launch of an exec would otherwise do inside
+        // its own call, done once here on the stream the replays use.
+        // SAFETY: exec is the live instantiation above; hs is the live stream
+        // it was captured on.
+        let rc = unsafe { sys::cuGraphUpload(captured.exec, hs) };
+        cu(rc, "cuGraphUpload")?;
+        Ok(captured)
     }
 
     /// Enqueue one replay on `stream`. Asynchronous; the caller synchronizes.
     pub fn launch(&self, stream: &CudaStream) -> Result<(), GpuError> {
         // SAFETY: exec is a live instantiated graph; the stream belongs to the
         // same context.
-        cu(
-            unsafe { sys::cuGraphLaunch(self.exec, stream.cu_stream()) },
-            "cuGraphLaunch",
-        )
+        unsafe { launch_exec(self.exec, stream.cu_stream()) }
+    }
+
+    /// The instantiated graph, for a launch issued from another thread while
+    /// this graph is kept alive ([`launch_exec`]).
+    pub(crate) fn exec(&self) -> sys::CUgraphExec {
+        self.exec
     }
 
     /// Number of nodes the capture recorded — kernel launches plus any memset
@@ -187,6 +198,21 @@ impl Graph {
             })
             .collect()
     }
+}
+
+/// `cuGraphLaunch` of `exec` on `stream`, mapped to [`GpuError`].
+///
+/// # Safety
+///
+/// `exec` is a live instantiated graph (or null, which the driver refuses with
+/// an error) that stays alive until the call returns, and `stream` a live
+/// stream of the context current on the calling thread.
+pub(crate) unsafe fn launch_exec(
+    exec: sys::CUgraphExec,
+    stream: sys::CUstream,
+) -> Result<(), GpuError> {
+    // SAFETY: the caller's contract above.
+    cu(unsafe { sys::cuGraphLaunch(exec, stream) }, "cuGraphLaunch")
 }
 
 /// One node of a captured graph as the driver reports it.

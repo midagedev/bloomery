@@ -32,6 +32,14 @@
 #   lcpp<K>:<D>  the same with --n-cpu-moe K in place of the profile's LCPP_NCMOE: the sweep arm.
 #            The profile's LCPP_NCMOE_SWEEP names the values that load, e.g.
 #            `lcpp:6 lcpp34:6 lcpp35:6` interleaved with `6`.
+#   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
+#            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
+#            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_LAUNCH_THREAD=1`.
+#   bin:<path>:<D>  a second generate_ds41 (an absolute path on the box, a base tree's build) at depth
+#            D, row label `bin:<basename of its tree>` (the tree is the path above `target/`). It is a
+#            base by construction, so its freshness is not asked; its tree line (sha256, HEAD, dirty
+#            files) is printed with the references'.
+# Every label is its own engine in the per-arm means and in the ratio table (ours / each other label).
 # Our arms run at any depth up to the plan's ctx_max (every indexer layer selects its list at every
 # position); generate_ds41 refuses only D + N - 1 > --ctx, and a refusal stops the runner (rc 1).
 #
@@ -79,19 +87,45 @@ DRY=${BLOOMERY_DRY:-}
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6)
 ours=0 ik=0 lcpp=0
+# Per arm, by its index in ARMS: the kind (ours, ref or bin), the depth, the row label, the
+# reference engine (ref), the binary (ours and bin) and the NAME=VALUE list (comma-separated).
+A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_ENV=()
+arm_usage() {
+  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], ik:<D>, lcpp:<D>, lcpp<K>:<D> or bin:<path>:<D>" >&2
+  exit 64
+}
 for a in "${ARMS[@]}"; do
-  eng=${a%%:*}
-  [ "$eng" != "$a" ] || eng=ours
-  case $eng in
-    ours) ours=1 ;;
-    ik) ik=1 ;;
-    lcpp | lcpp[0-9] | lcpp[0-9][0-9]) lcpp=1 ;;
-    *) eng=bad ;;
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs=''
+  case $a in
+    bin:*)
+      kind=bin eng=bin bin=${a#bin:}
+      dep=${bin##*:} bin=${bin%:*}
+      case $bin in /*) ;; *) arm_usage "$a" ;; esac
+      tree=${bin%/target/*}
+      [ "$tree" != "$bin" ] || tree=${bin%/*}
+      label=bin:${tree##*/}
+      ;;
+    *@*)
+      kind=ours eng=ours dep=${a%%@*} envs=${a#*@} bin=$BIN label=ours@$envs
+      IFS=, read -r -a kv <<< "$envs"
+      [ ${#kv[@]} -gt 0 ] || arm_usage "$a"
+      for e in "${kv[@]}"; do
+        [[ $e =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:],]+$ ]] || arm_usage "$a"
+      done
+      ours=1
+      ;;
+    *:*)
+      case $eng in
+        ik) ik=1 ;;
+        lcpp | lcpp[0-9] | lcpp[0-9][0-9]) lcpp=1 ;;
+        *) arm_usage "$a" ;;
+      esac
+      label=$eng
+      ;;
+    *) kind=ours eng=ours dep=$a bin=$BIN label=ours ours=1 ;;
   esac
-  dep=${a#*:}
-  case $eng:$dep in
-    bad:* | *: | *:*[!0-9]*) echo "depth-ds41.sh: arm '$a' is <D>, ik:<D>, lcpp:<D> or lcpp<K>:<D>" >&2; exit 64 ;;
-  esac
+  case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs")
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness.
 # shellcheck source=tools/ref/timing-card.sh
@@ -103,6 +137,7 @@ source "${BASH_SOURCE[0]%/*}/lease.sh"
 # recipe skips the build) nor reads it, so its freshness is not asked. A dry run asks nothing of
 # our binary: it prints the command line it would run.
 if [ "$ours" = 1 ] && [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?; fi
+# A bin:<path> arm's binary is checked where its tree line is taken, below.
 if [ "$ik" = 1 ]; then [ -x "$IKBIN" ] || { echo "depth-ds41.sh: no llama-bench at $IKBIN" >&2; exit 2; }; fi
 if [ "$lcpp" = 1 ]; then [ -x "$LCPPBIN" ] || { echo "depth-ds41.sh: no llama-bench at $LCPPBIN" >&2; exit 2; }; fi
 CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
@@ -115,13 +150,22 @@ tree_line() {
   dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
   echo "$bin sha256=$sha head=$head dirty_files=$dirty"
 }
-IK_LINE='' LCPP_LINE=''
+IK_LINE='' LCPP_LINE='' BIN_LINES=()
 [ "$ik" = 0 ] || IK_LINE=$(tree_line "$IKBIN" "$IK")
 # shellcheck disable=SC2153 # LCPP is the profile's, which shellcheck does not follow
 [ "$lcpp" = 0 ] || LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP")
+for i in "${!ARMS[@]}"; do
+  [ "${A_KIND[$i]}" = bin ] || continue
+  b=${A_BIN[$i]}
+  [ -x "$b" ] || { echo "depth-ds41.sh: arm '${ARMS[$i]}': no binary at $b" >&2; exit 2; }
+  t=${b%/target/*}
+  [ "$t" != "$b" ] || t=${b%/*}
+  BIN_LINES+=("${A_LABEL[$i]}: $(tree_line "$b" "$t")")
+done
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
   [ -z "$LCPP_LINE" ] || echo "    lcpp: $LCPP_LINE"
+  [ ${#BIN_LINES[@]} -eq 0 ] || printf '    %s\n' "${BIN_LINES[@]}"
 }
 
 # The witness before and after every row: the timing card's lines (with our binary), the busiest
@@ -182,18 +226,66 @@ ref_arm() {
   sums+=("$eng|$dep|$r|$val|")
 }
 
+# One arm of a generate_ds41: ours (our binary, with the arm's variables when it has any) or a
+# second binary. The row and the sum under the arm's label.
+# ours_arm <index> <round>
+ours_arm() {
+  local i=$1 r=$2 dep label bin out rc t0 t1 smoke p50 mean warmcol series draft h10 t10 uniq_tok tps_mean tps_p50
+  local -a envs=()
+  dep=${A_DEP[$i]} label=${A_LABEL[$i]} bin=${A_BIN[$i]}
+  [ -z "${A_ENV[$i]}" ] || IFS=, read -r -a envs <<< "${A_ENV[$i]}"
+  witness "pre r$r $label d=$dep n=$N"
+  t0=$(date +%s)
+  if [ ${#envs[@]} -eq 0 ]; then
+    out=$(timeout --kill-after=10 "$BOUND" "$bin" --depth "$dep" -n "$N" --time ${WARM:+--warm "$WARM"} 2>&1)
+  else
+    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" --depth "$dep" -n "$N" --time ${WARM:+--warm "$WARM"} 2>&1)
+  fi
+  rc=$?
+  t1=$(date +%s)
+  witness "post r$r $label d=$dep n=$N"
+  if [ $rc -ne 0 ]; then
+    echo "r$r $label d=$dep FAILED rc=$rc" >&2
+    echo "$out" | tail -n 20 >&2
+    exit 1
+  fi
+  smoke=$(echo "$out" | grep -E '^SMOKE ')
+  [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
+  echo "$out" | grep -E '^(plan|load|capture|fed|stat summary) '
+  p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
+  mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
+  warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
+  # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
+  # and the `draft summary` line carries the positions-per-second rate the verdict reads.
+  series=$(echo "$out" | awk '/^time (step|pass) /{sub(/.*ms=/,""); sub(/ .*/,""); print}')
+  draft=$(echo "$out" | grep -E '^draft summary ' | sed -n 's/.*proposals=\([0-9]*\) accepts=\([0-9]*\) positions=\([0-9]*\) passes=\([0-9]*\) tok\/s(positions)=\([0-9.]*\).*/p=\1\/\4 q=\2\/\1 positions=\3 tok\/s(positions)=\5/p')
+  h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
+  t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
+  uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
+  tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
+  tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
+  echo "ROW r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft} | wall $((t1 - t0))s"
+  if [ -n "$draft" ]; then tps_mean=${draft##*tok/s(positions)=}; fi
+  sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
+}
+
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   ref_witness | sed 's/^   /[dry]/'
-  for a in "${ARMS[@]}"; do
-    eng=${a%%:*}
-    dep=${a#*:}
-    if [ "$eng" = "$a" ]; then
-      echo "[dry] $a: timeout --kill-after=10 $BOUND $BIN --depth $a -n $N --time${WARM:+ --warm $WARM}"
-    else
-      ref_cmd "$eng" "$dep"
-      echo "[dry] $a: timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'"
-    fi
+  for i in "${!ARMS[@]}"; do
+    a=${ARMS[$i]}
+    dep=${A_DEP[$i]}
+    case ${A_KIND[$i]} in
+      ref)
+        ref_cmd "${A_ENG[$i]}" "$dep"
+        echo "[dry] $a: timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'"
+        ;;
+      *)
+        note=''
+        [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
+        echo "[dry] $a: timeout --kill-after=10 $BOUND ${A_ENV[$i]:+env ${A_ENV[$i]//,/ } }${A_BIN[$i]} --depth $dep -n $N --time${WARM:+ --warm $WARM}$note"
+        ;;
+    esac
   done
   for r in $(seq "$ROUNDS"); do
     order=()
@@ -216,42 +308,11 @@ guard_other
 sums=()
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#ARMS[@]} - 1))); do
-    a=${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}
+    j=$(((i + r - 1) % ${#ARMS[@]}))
     guard_other
-    case $a in
-      *:*) ref_arm "${a%%:*}" "${a#*:}" "$r" ;;
-      *)
-        dep=$a
-        witness "pre r$r ours d=$dep n=$N"
-        t0=$(date +%s)
-        out=$(timeout --kill-after=10 "$BOUND" "$BIN" --depth "$dep" -n "$N" --time ${WARM:+--warm "$WARM"} 2>&1)
-        rc=$?
-        t1=$(date +%s)
-        witness "post r$r ours d=$dep n=$N"
-        if [ $rc -ne 0 ]; then
-          echo "r$r ours d=$dep FAILED rc=$rc" >&2
-          echo "$out" | tail -n 20 >&2
-          exit 1
-        fi
-        smoke=$(echo "$out" | grep -E '^SMOKE ')
-        [ -n "$smoke" ] || { echo "r$r ours d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-        echo "$out" | grep -E '^(plan|load|capture|fed|stat summary) '
-        p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
-        mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
-        warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
-        # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
-        # and the `draft summary` line carries the positions-per-second rate the verdict reads.
-        series=$(echo "$out" | awk '/^time (step|pass) /{sub(/.*ms=/,""); sub(/ .*/,""); print}')
-        draft=$(echo "$out" | grep -E '^draft summary ' | sed -n 's/.*proposals=\([0-9]*\) accepts=\([0-9]*\) positions=\([0-9]*\) passes=\([0-9]*\) tok\/s(positions)=\([0-9.]*\).*/p=\1\/\4 q=\2\/\1 positions=\3 tok\/s(positions)=\5/p')
-        h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
-        t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
-        uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
-        tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
-        tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-        echo "ROW r$r ours d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft} | wall $((t1 - t0))s"
-        if [ -n "$draft" ]; then tps_mean=${draft##*tok/s(positions)=}; fi
-        sums+=("ours|$dep|$r|$tps_mean|$tps_p50")
-        ;;
+    case ${A_KIND[$j]} in
+      ref) ref_arm "${A_ENG[$j]}" "${A_DEP[$j]}" "$r" ;;
+      *) ours_arm "$j" "$r" ;;
     esac
   done
 done
@@ -269,8 +330,8 @@ echo
 echo "=== ours / reference per depth: each round's ratio of the pair measured in that round, their"
 echo "    mean with its 95 % interval (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds),"
 echo "    and the ratio of the arm means ==="
-deps=$(printf '%s\n' "${ARMS[@]}" | sed 's/^[a-z0-9]*://' | sort -un | tr '\n' ' ')
-refs=$(printf '%s\n' "${ARMS[@]}" | sed -n 's/^\([a-z0-9]*\):.*/\1/p' | sort -u | tr '\n' ' ')
+deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | awk -F'|' -v deps="$deps" -v refs="$refs" -v rounds="$ROUNDS" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
