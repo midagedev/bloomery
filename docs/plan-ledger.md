@@ -849,3 +849,775 @@ attn·ffn·moe·head·gemv 다섯을 한 번에 띄웠고 넷이 같은 오후�
 새 세션/새 환경에서 이 파일을 먼저 읽는다. 규칙의 정본은 [AGENTS.md](../AGENTS.md), 작업 대기열의 정본은 이 파일(옛 HANDOFF와 plan.md를 합친 것), 측정 기록의 정본은 [rig-log](https://github.com/midagedev/rig-log)의 log/ + README 로그 표다.
 
 **bloomery** — Rust로 짜는 CPU LLM 추론 엔진. 목표는 같은 기계·같은 ISA에서 ik_llama.cpp를 이기는 것(사용자 지시: "커널을 단순 이식하기보다 더 낫게"). 현재 모델 DeepSeek-V2-Lite-Chat Q3_K_M, 최종 목표 DeepSeek V4.1-Flash. 하드웨어: 박스의 ThreadRipper Pro 5975WX(Zen 3, 32C, AVX2+FMA+F16C+BMI2+VAES+VPCLMULQDQ까지 — **GFNI/AVX-512/VNNI/AMX 없음**), STREAM triad 147.7 GB/s.
+
+## plan-triage.md 2026-09-25 이전 판 (원문 그대로 — 09-25 새벽에 열린 항목만 남기고 다시 쓰면서 옮김; 이 판의 커밋은 `bac2605`)
+
+## bloomery — 트리아지(열린 항목)
+
+`plan.md`에서 2026-09-24에 원문 그대로 옮겼다 — 계획을 읽을 때마다 싣기엔 컸다(당시 plan.md의 43 %). 2026-09-23 정리라 일부 항목은 이미 착륙했다: 라운드 스펙을 쓸 때 여기서 고르고, 착륙한 줄은 장부로 옮긴다. 옮기면서 고친 것은 「GPU 선 트리아지」의 B12 한 줄(선 긋고 정정)뿐이다.
+
+#### 열린 라운드 카드
+
+**백엔드(2026-09-22)**: 표의 "GLM"·"agy"는 전부 **opus 서브에이전트**(Agent 도구, `model:"opus"` 명시)로 읽는다. **리드** = 이 세션.
+크기: S 반나절 이하 / M 하루 / L 하루 넘음(쪼갤 후보).
+
+##### A — GPU 경로
+
+| id | 라운드 | 파일 경계 | 백엔드 | 게이트(끝의 숫자) | 앞 | 크기 |
+|---|---|---|---|---|---|---|
+| A2-2 | 스테이지 분할(2스테이지 = 1스테이지 비트 동일). A2-1은 머지됐고(`c9f5ace`) 전 층 조립은 e2e(`0294d4a`)가 한 그래프로 끝냈으므로, 남은 것은 **여러 스테이지로 나누는 것**뿐이다 — 카드는 두 카드에 걸칠 때 값을 받는다. 단 3090을 expert 전용 층으로만 쓰면(v41-placement (b′), (b)보다 R1에서 3 % 낮음) 스테이지 절단 없이도 3090을 쓴다 — 이 카드는 사용자의 3090 서빙 결정과 B2 뒤로 | `gpu/model.rs` | opus | 2스테이지 = 1스테이지 비트 동일 | e2e | M |
+| A5 | 프리필: m>1 활성값 다리 + IMMA GEMM 커널(m 16~512) | 새 `gpu/gemm.rs`, 새 `gate_gemm.rs`; 조립은 별도 라운드 | GLM(커널) → GLM(조립, model.rs) | 커널 밴드 + 프리필 tok/s | A3m; 커널 부분은 A2와 병렬 가능 | L |
+
+##### B — V4.1
+
+| id | 라운드 | 파일 경계 | 백엔드 | 게이트 | 앞 | 크기 |
+|---|---|---|---|---|---|---|
+| B8 | **`f32_gemv`의 bf16 변형**: 라우터 40텐서를 파일 그대로(bf16 → f32는 `bits << 16`이라 정확). f32 디코드 대비 VRAM 157 MB·토큰당 ~0.27–0.29 ms(유도) — 막는 항목은 아니다. b4moe 유도: `ds41_router`의 grid 48이 A6000 SM 36개를 놀리므로 bf16 상주(층당 7.86 → 3.93 MB)와 블록당 4행(grid 96)을 같이 해야 최대 −0.27 ms/토큰[유도], ~50줄. **kr-moeattn R1(09-24 밤, 공개 파일 nsys)**: 라우터는 지연에 묶여 있다 — lane당 8원소 펼침이라 k=5120에서 직렬 20반복, 21.56 µs = 365 GB/s. bf16만 바꾸고 펼침을 두면 이득 ≈ 0(비트를 지키려면 lane이 `lane+32j`를 계속 맡아 u16 스칼라 적재 20반복이 남는다). 순서: 적재 폭 32 + 4-warp 96블록(비트 동일, −0.4…−0.55 ms[유도])이 먼저, bf16 상주는 그 뒤 별도 라운드 — 「커널 리뷰 넷」 `ds41router` | 새 커널 또는 `q8f32.rs` 옆 | opus | `f32_gemv`(디코드한 f32)와 비트 동일 | — | S |
+| B1c | **카드별 장치 아레나**: 텐서마다 따로 잡는 할당이 2 MiB 단위로 반올림돼 (b)안에서 A6000 285 MB, 3090 264 MB를 버린다(b1b 측정). 한 카드에 큰 할당 하나를 잡고 텐서를 256 B 정렬로 잘라 쓰면 그 몫이 expert 약 17·16개로 돌아온다 [유도: 285 MB ÷ 16,773,120 B/expert]. 디코드 값은 작다 — 토큰당 약 0.05 ms [유도, 접두 규칙]. B12의 뜨거운 집합에서는 슬롯 하나의 값이 커진다. `DeviceTensor`에 행 오프셋 뷰가 없는 것(`tensor.rs:12`)과 같은 자리다 | `crates/gpu/src/tensor.rs`, `weights.rs` 업로드 | opus | 적재 게이트 ②의 반올림 항이 카드당 그래눌 반올림 한 번으로 줄고 n_l이 다시 핀된다, 전 게이트 비트 동일 | ~~B1b~~ | M |
+
+##### C — 서버
+
+| id | 라운드 | 파일 경계 | 백엔드 | 게이트 | 앞 | 크기 |
+|---|---|---|---|---|---|---|
+| C3 | 동시 시퀀스 스케줄러 + 호스트/GPU 2단 파이프라인 | `crates/server`, `crates/model` | GLM | 동시 2·4 스트림 합계 tok/s(도출 1.67배 대조) | C1, C2, B2 | L |
+| C4 | DSpark 드래프트 + 검증 배치. **09-24 새벽 유도([`research/dspark-cost.md`](research/dspark-cost.md))**: ik식 검증 배치(층마다 k+1행)는 우리 엔진에서 손익분기 아래다(k=1 24.7, k=2 22.4 tok/s 대 25.3 — dense 몫이 ik 65 %, 우리 33 %라 상각할 것이 적고, 라우팅 expert 바이트는 위치마다 다시 읽힌다). 이기는 형태는 **한 층 어긋난 파이프라인**(카드가 행 t+1의 l층 attention을 도는 동안 호스트가 행 t의 l층 expert를 읽음): ~~k=1에서 30.3 tok/s [유도, D=3], B12 뒤 49.2~~ k=1 29.0–30.3(D=3)/오늘 H로 2H+D = 49.8+D, B12 뒤 38–46(카드 공동 임계). **파동 13 결과(09-24 03:20)**: ① ktok이 호스트 티어의 k배를 쟀다 — **선형**(행당 최대 −1.35 % ± 0.42, 행마다 따로 불러도 같음; rig-log 09-24#v41-host-tier-k-rows) → ik 규칙이 우리 티어에서도 서고 평범 배치는 진다, 티어는 호출당 한 토큰 그대로 두고 층마다 k번 부른다. ② ktok 설계: 어긋남(a′)은 k토큰 커널이 필요 없고 순차 스텝과 비트 동일, k=1 롤백에 복원할 상태가 0(압축기 상태 스냅샷은 드래프트 ≥2에서만 24 KB), 손익분기 수락률 0.34(평범 배치 0.67). 라운드 넷 제안: `ktok-skew`(M, 2행 패스+r∈{0,1} 롤백 = 순차 비트 동일 게이트) → `ktok-kernels`(M, q8_0 m>1을 m=1 레인 순서로 — dspark `dsm`과 공유) → `ktok-batch`(M, (a)(i) 토큰별 attention 교차) → `prefill8`(M, K_MAX=8 청크 프리필 ~25 ms/토큰[유도], 4096토큰 160→~100 s). ③ dspark 설계([`research/dspark-report.md`](research/dspark-report.md)): 드래프트는 3090에(A6000 여유 1.5 GB), 헤드 Q6_K 543 MB 복사, 특징은 호스트 경유 61 KB; **expert 형식 권고 MXFP4 네이티브 `_sel` 커널**(7.2 GB, 체크포인트와 비트 동일; Q8_0 넓히기는 적재 때 정확하므로 변환기 불필요, 대체 경로); D(k=1) 2.4–2.8 ms[유도, ik 10.3의 1/3–1/4]; ik 결함 넷(target_layers off-by-one, 블록 causal, **과거 창 1+j 결함**, 블록 길이 n_max — 5토큰 학습 블록과 다른 분포)은 따르지 않는다; 오라클 A = ik 패치 트리 덤프(`ik-dsv41-draft.py`는 어느 트리에도 미적용, 새 `dump_draft.cpp`), B = `model.py` 순수 torch(~~박스에 torch 없음~~ 박스 `/home/user/ft/bin/python3`에 torch 2.11.0+cu130이 있다 — visionres 09-24, 3090에 11 GB[유도]); 게이트 G-d1…d4, **G-d3 무손실은 ktok 게이트가 서면 등식**. 라운드 일곱 `dsread`‖`dsref`‖`dsm` → `dsmx`‖`dshc` → `dsgraph` → `dsloop`. 순서: B12 → ktok-skew → ktok-kernels(=dsm) → 드래프트 포트 → 어긋난 스케줄. **E5(09-24 04:05) 뒤 보탬**: 어긋남이 서면 첫 드래프트는 DSpark가 아니라 **n-gram lookup**(D≈0, VRAM 0)이다 — code 0.595·threads 0.477이 손익분기 0.34를 넘고(텍스트 목표 대리 척도), korean 0.29는 못 넘어 DSpark는 한국어·산문용으로 뒤에 온다. ktok-skew의 첫 서빙 팔 = 어긋남 + lookup. ~~사용자 판단 3건은 메모 끝에~~ **사용자 승인(09-24 03:40 "다 해보자 그것뿐 아니라 다양한 실험을 해서 끌어올려보자")**: 셋 다 진행, 실험 큐는 「실험 큐」 절 | `crates/gpu-deepseek41`(k행 스텝·되감기), 새 드래프트 크레이트(3090), `gpu/hybrid.rs`(어긋난 다리) | opus | 수락률, 단일 스트림 tok/s, k행+되감기 = 순차 r+1스텝 비트 동일 | B5, ktok, B12 | L |
+| C5 | systemd 유닛·임대 협약·`llm.service` 교체 | `configs/`, rig-log | 리드 | 교체 전후 같은 러너 tok/s | C3, C4 | S |
+
+#### GPU 선 트리아지 — 열린 항목(2026-09-23 낮, 받을 라운드별로 다시 묶었다)
+
+라운드 보고의 항목 6과 리드의 처분 원문(09-22 밤 ~ 09-23 오전, 라운드별)은 장부 「GPU 선 트리아지 원문」에 있다. 닫은 것과 버린 것은 거기에만 있다. 여기에는 아직 할 일만 받을 라운드별로 적고, 트래커로 옮기기 전까지는 여기가 원본이다. 크기는 XS·S·M으로 적는다.
+
+① **테스트 env 라운드**(b4infra·b4dump 머지 뒤, 한 라운드)
+- V4.1 첫 샤드 경로의 사본 여섯(`gate-1-1` 기본값, `gguf/tests/oracle.rs:17`, `model/tests/placement.rs:23`, `models/deepseek41.sh`, `build-qdot-ref.sh:36`, `qdot.rs`의 `Q5K_MODEL`)과 Rust가 모델·데이터 경로를 다시 적는 12곳을, 테스트 크레이트가 의존할 자리 하나로 모은다(M). 프로필을 `box.sh` 안에서 소스하면 export된 V2-Lite `BLOOMERY_REF_MODEL`이 이긴다.
+- 데이터 디렉터리 이름이 `ref-v41`(디퀀트 덤프)과 `ref_deepseek41`(오라클 세트)로 갈린다. `ref_dir`가 `Arch`를 받게 한다. qdot·dequant 참조 파일을 오라클 세트 디렉터리에서 떼어 낸다(V2-Lite `ref`를 v3로 다시 뜨면 `dump.sh`가 그 17개를 지운다). `topk_ids_logical`이 `.logical.i32` 사본을 읽는다.
+- `common/oracle.rs`에서 `common/model.rs`를 떼어 낸다 — 남은 dead-code 13줄 대부분의 출처다(S). `oracle.rs`의 매니페스트 위치 인덱스 파싱에 헤더 핀이 없다(S, b4infra의 리더를 먼저 본다). 테스트 전용 GGUF 작성기가 세 벌이다(`gguf/tests/inventory.rs:25`, `lib.rs` `split_tests`, `model/tests/ops.rs` `one_tensor_file`; R14, S).
+- `activation_format(F16)`은 `Ok(None)`인데 ggml F16의 `vec_dot_type`은 F16이라 거부가 맞다(XS).
+- harness 뒤 잔여: 하니스 새 경로(`oracle.step_sets`, `open_named`, `man.header`, `man.step()`, `*_in` 리더)로 옮길 사본 — B4 라운드들의 게이트(b4attn f16 리더·마스크 검사, b4engram·b4hc·b4moe의 `STEP_SETS`·`open_set`·`# flags` 손 파싱, 합계 ~130줄)와 아직 선형 스캔(`find_ref_row`)을 쓰는 곳 ~40(p5, p8, p0b, real_x, head_gpu, moe_fused, gate_block, `block.rs`) — B4 파동이 다 머지된 뒤 기계 라운드 하나로. `lib.rs` `route_ref`의 `(64, 6)`은 V2-Lite 라우터 모양이 박힌 것(XS), `ref_tensor_logical_in`의 logical 분기가 읽기·변환·유한성 검사를 한 벌 더 갖는다(R14, S). `Oracle::open`(`# arch` 없어도 받음)과 `open_named`(거절) 규칙이 둘이다 — V2-Lite 세트를 다시 뜨면 하나로. `gate_p4.rs:70`의 `PROMPT`를 `man.header.tokens`와 대조한다(~3줄).
+- b5meta: 모델 시험 크레이트에 매니페스트 파서가 둘이다(`tests/ds41_meta.rs`의 `Manifest`, `tests/common/oracle.rs`의 `Oracle`) — 세트 이름을 받는 읽기 함수 하나를 `tests/common`에(R14, ~60줄). harness가 본 셋째: model 크레이트는 gpu-gates에 의존할 수 없어, 하니스 리더와 합치려면 작은 공용 크레이트가 필요하다(M).
+- `check-arch.sh:66`(②)과 `:102`(④)가 `crates/model/src/bin`을 공유 파일로 본다(S). 신선도 규칙이 둘이다 — `timing-card.sh:75` `assert_fresh_binary`는 트리 전체를 `-newer`로, `host-rate.sh`는 dep-info를 본다(하나로, S).
+- 하니스(`crates/gpu-gates/src/lib.rs`, b4infra 항목 6): `ref_tensor`·`ref_tensor_logical`(`:774`·`:793`)이 부를 때마다 매니페스트를 다시 파싱하고 `gate_p4`가 층 루프 안에서 그것을 부른다(S). `topk_ids_logical`도 같다 — 호출자가 `RefManifest`를 들고 `_in`을 부르게(XS). 조회가 선형 스캔이다 — `(kind, name, occ)` 색인 한 번(S, V4.1 40층 op 게이트와 스텝 세트에서 커진다). `widened_f16_bits`는 파일 전체를 읽는다(XS). `:1167`의 `0..64`는 V2-Lite expert 수라 V4.1(384)에서 못 쓴다 — 상한을 인자로(XS). `:705` 오류 문구에 경로 구분자가 없다(XS). `safe_name` 규칙의 주인이 언어별로 셋이다(`dump_ref.cpp`, `check-int-twins.py`, `dump_stem`; 공유 픽스처 하나로, S). `check-arch` 허용 목록이 줄 철자에 묶여 필드 타입만 바꿔도 빨강이 된다(S). `crates/model/tests/common/oracle.rs:65`가 `# tokens`는 읽고 `# prefill`은 모른다(XS).
+- b5host·b5load·gates3a(09-23 저녁): `model/tests/ds41_host.rs:93` `Set`이 셋째 매니페스트 파서다(위 b5meta 줄과 같은 처분, S–M). `gate_deepseek41_load.rs:416` `step_of`가 MANIFEST를 다시 파싱한다 — `RefHeader`로(S). RopeSpec을 짓는 길이 셋이다(`gate_deepseek41_load.rs:217`, `gate_deepseek41_rope.rs:158`, `params::rope_spec`; S). `gate_p10.rs:90-92`·`gate_moe_fused.rs:66,199`가 모델을 Gguf와 Split으로 두 번 연다(S). FNV-1a 사본 셋(`gate_p1.rs:236`, `gate_p6.rs:579`, `bench_v41`)과 노드 종류 집계 네 벌(`bench_join.rs:1101`, `gate_hybrid.rs:138`, `gate_e2e`, graph.rs 시험)을 하니스 lib 하나로(R14, XS–S). `ptx.rs:95` `modules()`를 `Result`로 — 거부의 주인이 하나가 된다(호출처 여섯, XS).
+
+② ~~**도구 라운드**~~ 닫힘(`tools2`, `9ed73ff` — 임대·witness·LCG·디코드 경로의 주인 `lease.sh`, 락 없는 호스트 bin 러너, 상설 도구 셋, `ptx-scan --features`, box-gc가 하네스 고아까지). 남은 것:
+- ik-ppl(b5ppl): `ik-ppl.sh`의 `KLD_VOCAB` 리터럴과 `TEXT` 경로를 모델 프로필 속성으로(XS). `ik-ppl.sh`의 `witness()`·임대 사본은 tools2가 일부러 남긴 마지막 하나다 — `lease.sh`로(S).
+- 임대의 둘째 주인(tools2): `justfile`의 `exact-ref`·`build-exact-forced`·`exact-taps`가 `flock -w 3600 /root/bloomery-cpu.lock`을 직접 잡고 witness가 없다 — `lease.sh`로(S). `tools/ref/measure.sh`는 임대 없이 3090이 쉬기만 기다린다 — 다른 러너와 규약이 다르다(S).
+- 러너(tools2): `gate.sh`·`gpu-gate.sh`·`host-gate.sh`의 상한·rc 논리가 세 벌이다 — gpu-gate가 락을 잡은 뒤 host-gate를 exec하게(S). `ab-decode` 레시피가 env를 손으로 넘긴다 — `BLOOMERY_BOX_ENV`로(XS). `box.sh`의 `BLOOMERY_BOX_ENV` 검증이 rsync 뒤에 온다(XS). `gate-1-1`의 `dequant_ref`에 상한이 없다(바이너리가 `$BLOOMERY_DATA/bin`이라 host-gate의 인자 모양을 넓혀야 한다, XS). `kvclear_probe`가 `/root/bloomery-scratch/ikclear/bin`에서 돌아 box-gc 밖이다(XS).
+- 도구 안(tools2): `sass_inflight.py:96`의 대기 판정이 레지스터 의존 기준이다 — SASS 제어 비트의 wait mask를 읽으면 정확해진다(M). `ptx-scan.sh`·`sass-scan.sh`의 `.oxart` 추출이 두 벌이다(XS–S). qdot 테스트의 병렬 출력이 한 줄에 섞여 `verdict-diff`가 DIFFERS로 짚는다 — `--test-threads=1`이나 한 번에 쓰기로(S).
+- 사본(tools2): `engram-rate.sh:24`·`engram-corpus.sh:42`의 `BLOOMERY_V41_DIR` 기본값(XS). `prompts.tsv:20`과 `models/deepseek2.sh:37`의 같은 토큰 수열(XS). `gate_e2e.rs:593`의 `lcg_prompt`는 정확한 u64 연산이고 셸의 awk는 배정밀도라 셋째 id부터 갈린다(awk 14808, 정확값 14775 — 박스 실측). 같은 이름이 다른 수열을 뜻한다(S).
+- KLD 도구(ubsplit): `ik-ppl.sh:71`의 `usage()`가 `sed -n '2,19p'`라 `--kld` 설명이 잘린다(XS). `kld.rs:644`의 `BLOOMERY_KLD_FILE`이 파일 하나만 받는다 — 쉼표 목록으로(XS). `kld_diff`를 `| head`로 넘기면 EPIPE로 패닉한다(XS). 위치별 TSV 출력(`--tsv`)이 있으면 위치 맞춤 비교가 요령 없이 된다(S).
+- 덤퍼(b4dump·ikfix 항목 6): 연속 텐서의 logical 사본이 flat 파일과 같은 바이트다 — 세트 바이트의 35–40 %(`dump_ref.cpp:289`, `!contig`로만, S). 스텝 모드가 전체 캐시를 세 벌 쓴다(쓰기 대상 VIEW, SET_ROWS 출력, 상태 입력 — D1의 30 %, S–M). f16·bf16을 f32로 넓혀 쓴다(D1에서 569 MB → 285 MB 가능, 형식을 아는 리더가 필요, S–M). 융합·비융합 두 팔이 적재와 프리필을 두 번 한다(M). `--tokens`가 `atoi`라 검증이 없다(`:485-486`, XS). `ref-build-common.sh:33,39`의 링크가 RUNPATH라 `LD_LIBRARY_PATH`가 다른 ik를 가리키면 조용히 그쪽을 싣는다 — `-Wl,--disable-new-dtags` 한 줄(XS; 덤퍼 쪽은 `dump.sh`의 `[foreign-lib]`가 막는다). 박스 `user`의 ccache `base_dir`이 비어 ik 워크트리마다 콜드 빌드다(적중 1.41 %, 머신 설정이라 사용자 판단, XS).
+- 덤퍼(iksink): `dump.sh:158`은 `-dirty`만 적어 서로 다른 패치를 못 가린다 — diff의 sha256을 남긴다(S). `[foreign-lib]`(`:124-131`)는 라이브러리 경로만 보고 빌드 신선도는 모른다 — lib의 sha256을 매니페스트에(S). `REF_THREADS_BATCH`(`-tb`) 노브가 있으면 프리필을 고정한 스레드 비교가 된다(XS).
+- idxkey2: `ik-ppl.sh:143-157`의 오래된 빌드 검사가 작업 트리 diff만 본다 — 깨끗한 트리를 다른 커밋으로 체크아웃하면 통과한다. 바이너리가 찍는 `build = N (<hash>)`를 HEAD와 대조한다(XS). 위치별 KLD 짝 비교 `kldpos.py`(스크래치, ik 요약과 4자리 일치)를 `tools/ref/`로 — numpy가 박스의 `/home/user/ft/bin/python3`에만 있어 환경 결정이 먼저다(S). `models/deepseek41.sh`에 PPL 채점 깊이의 스텝 변형 `d3`(프리필 ~3000, `-c 4096`, `-unfused-every-node`)를 두면 비율 2 선택도 대조된다(XS).
+
+- `q4k_gemv`와 `q4k_gemv_sel`의 launch contract에 `4 * iters >= n_sb`를 넣는다. 언롤 루프(`cores.rs:334`)는 `iters`와 무관하게 `n_sb/4`까지 돌아, 지금은 호스트 산술만이 창 밖 읽기를 막는다(S).
+- b4attn: `IK_SIM_BAND` 2e-7을 비트 동일로 조일지(generic 경로는 이미 0). `IkPath::Iqk`(T>1 iqk)와 `ik_index_sinks`의 나머지 분기(헤드가 스레드로 나누어떨어지지 않을 때), T>1 선택 행, 링이 한 바퀴 도는 배치를 거치는 세트가 없다(⑥ A5의 스텝 세트와 같이, S). iqk 층에서 모델 sink로 돈 커널을 ik와 대조한 적이 없다 — 고친 ik로 뜬 덤프가 생기면 그것이 된다.
+- b5host: `ds41_host` 밴드가 관측보다 ~2000배 넓다(h_ratio ≤ 5.4e-4) — 커널별 체인 수와 실제 서브블록 scale로 조이면, 클램프 히트 여섯 중 지금 밴드로 안 보이는 둘도 보인다(S).
+- b5load: `gate_hybrid.rs:681`이 결정적 개수와 경쟁 카운터를 한 줄에 찍어 diff에 가림이 필요하다(S). `gate_load_v41.rs:231,372`의 판정 줄에 런타임 free 값이 섞인다(한 번 65,536 B 흔들렸다, S). ds41-plan·ds41-meta 레시피의 줄 순서가 libtest 병렬로 흔들린다 — `--test-threads=1`(XS). `MoeDims::read`의 전 층 검사에 FAIL-first가 없다(XS).
+- gates3a: p4·p5·p6·ds41-attn이 `Counts::calls`를 안 본다 — fma 하한 옆에 `calls == 0`(XS). `gate_hybrid.rs:547`의 호스트 0은 e2e에서 이행적으로만 나온다(XS). `gate_p10.rs:672,712`의 kid 행은 아직 로더의 `pack_q5_*`로 올린다(P10 계약 판단, XS). `ptx-scan.sh`에 카드 없는 정적 스캔 옵트아웃 `PTX_SCAN_JIT=none`(XS). awk의 JIT 열은 엔트리 이름만 키로 써서 두 모듈에 같은 이름이 있으면 충돌한다(XS). `bench_v41.rs:967` `launch()`의 드라이버 오류에 사이트 이름이 없다(R11, XS). oxart_jit에 `.reqntid`가 최대 스레드보다 큰 엔트리를 거부하는 열(XS).
+
+④ ~~**V2-Lite 짧은 행 회복**~~ 닫힘(b11c, `e034536`) — 원문은 장부 「GPU 선 트리아지 원문」.
+
+⑤ **레버 후보**(B11b 감사 — 카드로 올린다): b4hc(유도): 경계마다 [HC_POST + 접기 + 다음 서브층의 RMS·분할 K·HC_PRE]를 한 커널로 묶으면 토큰당 −160 µs(접기가 스트림 넷에 걸쳐 조각 기하와 안 맞아 L). HC_PRE의 f64 `exp`를 f32 `expf`로 −25…−45 µs/토큰 — 성능 우선이면 기본값 쪽이지만 HC_PRE가 ik와 비트 동일하던 것을 밴드로 바꿔야 하므로 두 배 탐침으로 값부터 잰다. post·fold 커널은 T=1에서 20블록이라 지연에 묶인다 — 스레드당 float4(작음). b4engram(유도, 모두 작다 — engram 층이 둘뿐이다): `ds41_engram_gate`의 f64 점곱을 double-f32나 블록 간 분할로 층당 −1.3 µs, T=1 격자 4블록을 행 분할로 넓히는 지연 레버(미측정), 스레드 0의 f64 `exp`를 f32로 −0.3 µs — 셋 다 규칙이 바뀌어 비트 핀을 다시 쓴다. q8_0 스케일 평면을 f16으로(값당 1.125 → 1.0625 B, `cvt.f32.f16`이 정확해 출력 비트 동일, 유도 −0.45 … −0.61 ms/토큰, 로더 `weights.rs`와 커널의 스케일 적재). `attn_kv`와 `attn_q_a`를 한 런치로(x와 K가 같다, −0.08 … −0.14 ms, 노드 −40). shared gate+up(+SwiGLU 에필로그)을 한 런치로(0 … −0.24 ms).
+- **heads 커널과 q8_0 형상 레버**(b11c 감사, [유도]): `model/kernels.rs:112`의 `row / rows_per_head`가 첫 적재 앞에서 21명령짜리 32비트 나눗셈 에뮬레이션이다 — 2-D 격자(`blockIdx.y` = 헤드)나 시프트로 빼면 비트가 같다(S; `wo_a`를 이 커널로 돌리는 b4woa에서도 rows_per_head 1024라 같은 자리다) — **b4woa가 값을 매겼다**: A6000에서 heads − dense가 런치당 +1.64 µs, V4.1 `wo_a`에서 토큰당 약 66 µs(유도). 같은 나눗셈이 q3_K heads 커널 둘(`kernels.rs:182`·`:260`)에도 있다. `q8_0_gemv` 57 레지스터(SM당 4블록) 대 heads 40(6블록): 이번에는 heads가 느렸으니 점유율 가설은 갈리지 않았다 — 레지스터를 줄인 탐침으로 따로 잰다(S). 작은 격자 사이트(attn_kv 0.19파동·attn_output_a 0.38·attn_q_a 0.48)를 그래프 병렬 가지로(attn_q_a ∥ attn_kv, 상한 −0.32 ms, M). 작은 격자 split-K(float 순서 클래스, σ·e2e 핀 검토, M). heads K ≤ 128에서 warp당 4행(float 순서, M). int8 활성 + dp4a(정확도 클래스 — `exact_ref --act` 시뮬과 비트 게이트 재핀, L). b11c가 잰 q8_0 몫: 토큰 그래프 20.873 ms 중 ≈ 13.00 ms(대역 행 8.92 + 바닥 행 4.08)[유도] — 가장 큰 레버는 바이트가 아니라 런치 형상이다.
+- **V4.1 임계 경로 레버**(b5plan 감사, B5 뒤 B13에 넘긴다; 전부 [유도], (a) R1): norm을 앞 커널의 마지막 블록에서 Σx²로 접고 소비 gemv 프롤로그에서 스케일을 적용(−0.4…−0.6 ms, 노드 −80…−120, M). HC_PRE(attn)를 캡처 안 갈래 스트림으로(~~−0.165 ms~~ 공개 파일 nsys 행에서 층당 10.97 µs × 40 = 0.44 ms가 전부 임계 — kr-moeattn A1, −0.3…−0.44 ms, M). combine + HC_POST + 접기를 한 커널로(1·14층은 engram 뒤에서 끊는다; 노드 −40, ~−0.1 ms, S). q_a + kv를 행 연결 한 런치로(b5plan은 −0.22 ms로 본다 — 층당 −5.5 µs; 위 `attn_kv`+`attn_q_a` 항목과 같은 것; **공개 파일 재측정(kr-dense D1)**: kv 런치 6.29 µs는 바이트가 아니라 사슬에 묶여 있어 합치면 −252 µs, 같은 활성을 읽는 compressor kv·gate 7런치·indexer proj·indexer q_b까지 −0.33…−0.37 ms[유도]). 여러 블록 argmax(−50 µs, S; kr-dense D5: 공개 파일 55.09 µs/스텝 — `ARGMAX_THREADS` 256 → 1024만으로 −40 µs, XS, `argmax_take`가 전순서라 비트 동일). engram 조회를 0층 attention과 겹치기(−0.31 ms, 대기 +1, S). 32k에서 top-k를 여러 블록으로(~0.15 ms 중 대부분, M). rope 표를 적재 때 만들기(XS). **rope 융합**(b4rope 감사, [유도]): 원소별 작은 커널은 바이트(스텝당 3.07 MB, 5.3 µs)가 아니라 런치(136개, ~116 µs)에 묶인다 — `q_rope`를 q8_0 gemv 에필로그로(−40런치 ≈ −34 µs, M), ROPE_BACK을 attention merge로(−40, −34 µs, S–M), pooled·index key·indexer_q rope를 이웃 에필로그로(CSA가 완성되는 스텝에서 −16, S), K/V 커널이 kv를 두 번 읽는 것을 레지스터 + `shfl_xor(1)` 한 번으로(층당 왕복 −1, ≈ −18 µs, S), gain 적재를 배리어 앞으로(XS). shared expert·GPU expert 커널은 R1에서 호스트 그늘이라 순위를 내린다. 라우터 bf16은 B8 카드다. ~~가장 큰 레버는 여전히 B12(−7…−10 ms)다.~~ 정정(2026-09-24): 이 순위와 E26의 q8_0 순위는 혼합 파일에서 잰 것이다 — 공개 `Q3_K_M`(밀집 경로 K-quant)에서 `plainfile` 뒤에 다시 잰다.
+- **V4.1 어텐션 레버**(b4attn 감사, [유도]): `SEG_KEYS` 64 → 32면 T=1에서 40 → 80블록(84 SM)이고 층당 ~11.4 µs, 토큰당 −0.4 ms — 측정이 먼저(S). merge를 seg 에필로그로(마지막 블록 카운터, 토큰당 40런치·34 µs와 부분합 왕복, M). `flash.rs:508`의 `$row`를 스테이징 워드마다가 아니라 키 행마다 한 번(sel의 `ld.global` 49 → 33, `min` 18 → 2; `flash_latent_mma`의 PTX가 바뀌므로 ptx-scan과 A/B, S). PV를 텐서코어로(FLOP의 절반이 CUDA 코어 f32 — P를 f16으로 두는 오차 항을 먼저 세운다, 「성능이 먼저」, M). 토큰당 시간 유도는 0.62–0.98 ms(연산 한계 — 블록당 처리율 × 동시 블록 수)로 리드 밴드 0.39–0.57과 어긋난다: B5 첫 스텝 측정에서 층당 attention을 본다.
+- **V4.1 압축기 레버**(b4comp 감사, [유도]): kv·score gemv를 가중치를 이어 붙여 1024행 한 런치로(토큰당 −14…−20 µs). rope 전 행의 q8_1 양자화를 `ds41_comp_pool` 안으로(블록이 이미 q8_1 블록 넷의 기하, 토큰당 −5.8 µs). 인덱스 키의 gemv(28 KB)·norm·rope·Hadamard를 한 블록으로(층당 −3…−4 µs). 압축기 사슬은 attention 직전까지 q 경로와 독립이라 그래프 가지로 겹칠 수 있다(층당 수 µs, 미측정).
+- **호스트 레버**(b2b 감사, [유도]): 호스트 다리의 두 그룹 디스패치(gate/up, down)가 직렬이다 — expert마다 gate/up → down을 한 작업으로 끝내면 디스패치 고정비 하나(≈6.9 µs/층)가 빠진다(`moe.rs` `experts_into`, M; 두 배 탐침으로 값부터).
+- **V2-Lite 레버**(b5plan, nsys 재생 추적 [측정 3090]): 잔차 memcpy 27노드를 핑퐁으로(간격 포함 45.7 µs/스텝, ~0.9 %, S). argmax를 여러 블록으로(42.6 µs, ~0.7 %, S). 블록 하나짜리 `router_topk` 8.39 µs × 26 = 218 µs/스텝(4 %)을 gemv 마지막 블록으로 융합(−0.15…−0.2 ms[유도], S–M). `norm_quant` ×54 = 216 µs/스텝을 위의 norm 접기로(M).
+
+⑥ **카드 몫**(그 카드를 열 때 스펙에 넣는다 — B2의 V4.1 선행 셋과 B5의 Q5_K 게이트는 이미 카드에 있다)
+- B1c: 작은 할당이 적재 순서 탓에 완전 패킹보다 25–52 MB를 더 쓴다. KV와 scratch도 같은 `Heap`에 태운다.
+- B2: ~~V4.1 선행 셋(`moe.rs:150` n_expert > 64, `ops.rs:476` 샤드 동일성, `qdot::swiglu` 클램프).~~ b5host가 닫았다(`292a484`). `build-qdot-ref.sh:40`에 ik Q3_K 짝 하네스가 없어 호스트 바이트의 60 %(q3_K gate/up)에 ik 기준이 없다(S). 4 KiB 페이지 캐시의 TLB 비용 상한 0.8 ms/토큰[유도].
+- B5: 계획(`plan.rs`)은 첫 스텝 뒤 할당이 없다(구조상, 측정 아님) — 엔진에 붙일 때 `gate-alloc`에 넣는다(b5load·b5step).
+- B5(b2b → b5ffn): 호스트 서비스 루프는 `cuGraphLaunch` 앞에서 spin을 시작한다 — V2-Lite 재생의 대부분에서 첫 층 go가 launch 반환 전에 이미 와 있었다(`of_which_first_of_replay` 1,184–1,325/1,355, M). add를 combine에 융합(층당 −1노드), 카드 down 버퍼 memset을 없애고 combine이나 `_sel` down이 호스트 슬롯을 건너뛰게(−1노드), norm·라우터 에필로그가 handoff를 매핑 페이지에도 써서 D2H를 없앤다(−1 memcpy) — V4.1에서는 층 40개라 셋 합쳐 −120노드(S–M). 5·7번(할당 셋, 호스트 다리 내역)은 b5host 스펙, 재열기·`MoeDims::read`·프로토콜 오류 변형·`window` 이사는 b5load 스펙에 넣었다.
+- B5(b4rope): K/V 커널의 f32 `out` 행은 게이트만 읽는다(토큰당 80 KB 쓰기) — B5 attention이 링만 읽으면 뺀다(b5attn, S). 링 칸 충돌은 런처가 `m ≤ window`만 본다 — 위치가 연속이라는 호출자 계약은 이미지 빌더가 단언한다(b5load, XS). rope 표 셋은 호스트 glibc로 지어 스텝 이미지에 싣는다(결정 — ik와 비트 동일이 여기서 나오고, H2D는 이미지 한 번에 들어간다; 디바이스 `sinf`로 바꾸면 노드는 같고 비트 동일만 깨진다).
+- A5(b4engram): `q8f32.rs:512`의 배치 출력 `y[r·m + c]`와 engram 게이트가 받는 토큰 주 kv(`engram_gate.rs:19-21`)가 m > 1에서 맞지 않는다 — kv 스트라이드 인자냐 전치냐를 프리필 전에 정한다(S).
+- A5(프리필): 128행 링으로는 T > 1 프리필을 못 받는다 — 필요한 행 수는 W + T − 1이다[유도]. pos > 0에서 T > 1인 스텝 세트(예: pos0 301, T = 16–64)가 있어야 계획의 다중 토큰 경우(한 스텝에 그룹 여럿, 링과 배치가 섞인 read, 다중 토큰 창 가림)를 비트로 닫는다 — 지금은 단위 걷기만 본다(b4plan2).
+- B5(b4hc → b5glue·b5step): `ds41_hc_pre`를 서브층 본체와 나란한 그래프 가지에서 돌리면 HC_PRE 꼬리 ~2.4 µs를 숨긴다(토큰당 최대 −190 µs[유도]) — 동시에 도는 가지마다 `HcPreScratch`(티켓 카운터 포함)가 따로 있어야 한다. 0층 입력 접기는 one-hot `pre`라 스트림 0 복사와 같다 — 노드를 뺀다(−1). 하이퍼커넥션의 토큰당 비용은 ~0.61 ms[유도](b4plan은 ~0.4 — Sinkhorn 직렬 꼬리 ~2 µs × 80을 안 셌다), 노드는 162(모두 가르면 240).
+- B5(b4moe → b5ffn): combine을 HC_POST로 접으면 임계 노드가 하나 줄고 20블록 바닥이 없어진다(−34 µs/토큰[유도]). 라우터 마지막 블록이 ids·가중치(48 B)를 플래그와 함께 매핑 페이지에 직접 쓰면 go 앞의 D2H 노드가 빠진다(b2b K3와 같은 것). 합류에서 ik와 비트를 맞추려면 호스트가 부분합이 아니라 슬롯별 down 행을 넘겨야 해 wait 뒤 최대 6 × 20 KB H2D가 임계 경로에 붙는다 — 성능 우선이므로 부분합을 넘기고 밴드를 다시 유도한다. 스케줄 (a)에서 그늘 안이라 가치가 ~0인 것: 공유 expert split-K, 라우팅 커널의 압축 슬롯 목록, h 양자화 융합.
+- B5: Q5_K의 모델 수준 게이트. ik와 VRAM을 비교할 때는 ik 포크 KV의 의심 항 넷을 차이로 읽는다(장부, b1a 트리아지).
+- B5(b4attn → b5attn): 선택 행 모으기를 그룹 단위로 — 여러 층이 목록 하나와 상태 하나를 같이 읽는다(2–7, 8–13, 14–19, 20–39층). 그룹당 한 번 모아 접두 엔트리로 읽으면 sel의 목록 간접 참조가 없어진다(S, 엔진 설계). `attn.rs:354` 클램프: 목록을 만드는 쪽이 항목이 `comp_rows` 안이라는 계약을 지면 없앤다. 지금은 스트림 밖 항목을 마지막 행으로 읽어 NaN이 아니라 그럴듯한 틀린 값을 내고, 깊이 케이스가 이 동작을 핀한다(계약 결정, XS–S).
+- A5(b4woa): 프리필 T > 1은 `wo_a`·`wo_b` 층당 80 MB를 T번 다시 읽는다 — m > 1 q8_0 mma 커널이 빠진 알고리즘이다(아래 C3·C4의 m > 1 몸통과 같은 자리).
+- A5(b4comp): `crates/gpu/src/lib.rs:1705` `enqueue_gemv_q3k`의 출력이 `[row·m + t]`라 T > 1 프리필에서 토큰 우선 소비자(압축기 커널들)와 어긋난다 — 게이트는 호스트에서 전치했다. 스트라이드 적재나 토큰 우선 출력 옵션(작음–중간). `ds41_index_key`는 블록당 워프 하나라 프리필에서 블록 슬롯 한도로 점유율 33 %(블록당 4그룹이면 comp_pool과 같은 모양, 작음).
+- 다음에 `weights.rs`를 만지는 라운드: `gate_load_v41.rs`의 `buffers()`를 `DevWeight::buffer_bytes`로(R14, XS).
+- b5ffn(b5host·b5load): `model/tests/ds41_host.rs:368`의 Hparams+names → `HostLayerSpec` 연결을 `arch/deepseek41`로(S). 384 경로 `moe_ffn_with`를 V4.1 파일로 도는 게이트(V4.1 `MoeBlockPlan`과 함께). `bench_v41_host.rs:459`의 bench 엔진 모양을 `SwigluClamp`와 층 한도로(S) — b5host 항목 8(`bench_v41_host.rs`가 `Hparams`·plan을 쓰려면 check-arch ④에 디스패치 항목 하나, ~20줄)과 같이. V2-Lite `experts_into`는 스레드·모양별 첫 호출에서 `HostScratch`를 만든다 — 적재 때로(S).
+- harness3가 남긴 것(보고만): `gate_p4.rs:17-22,698,762,812,832` clippy 10건(lint −12 계산치, S)·`gate_p1.rs:59` type_complexity(−3); `gate_p1.rs:218` `q8_1_dequant`와 `gate_deepseek41_hc.rs:401` `q8_block`이 `lib.rs:148` q8_1 규칙의 사본(S); `gate_deepseek41_moe.rs:1466` 엔진 `quantize_activations(Q4_K)`·`:1327` `(Q3_K)`를 ik 전사로(항목 8과 같은 패턴, hc의 `q8k_ik`와 합쳐 q8_K 모듈 하나, S); **`ik_q8_2.rs:18` `quantize`가 끝의 부분 블록을 조용히 버린다** — 호출자 woa:193·engram:1136에 확인 없음(XS, 다음 하니스 라운드 첫 항목); `lib.rs:1512` `ptx_shapes`가 호출마다 실행 파일을 다시 읽는다(p6 4회, S); `tools/verdict-diff.py:47-51` MASKS에 `host_tier` 스케줄링 수치와 box-gc pid 추가(XS); `graph.rs:250,258` 노드 종류 필터 넷째 사본은 `count_kinds`를 `NodeInfo` 옆으로 옮겨야 합쳐진다(S); FNV 사본 `bench_v41.rs:896`(b4index 뒤)·`engram-reuse.rs:191`.
+- b5ffn이 남긴 것(보고만): `gate_deepseek41_moe.rs:~1082` `ids3 &= idk == idd` — 근접 동률 제외가 없다(chain.md가 인용한 규칙은 없었고 chain_ffn 게이트의 면제는 새로 만든 것, S); `ffn.rs` `store4`는 `hc.rs:337 store_streams` 사본·`combine_post_at`의 hc 24로드는 `hc_post_at`과 중복(R14, S); 융합 커널이 게이트 탭용 y(층당 20 KB)를 계속 씀(S); `justfile:647` `ptx-scan` 둘째 위치 인자가 FEATURES가 아니라 ARGS — V4.1 bin이면 혼란스럽게 실패, 레시피가 거절(S); `Gpu::fused()` pub(crate)라 조각이 `FusedKernels`를 따로 적재(S); `ffn.rs`의 `q8act_bytes`·`hc_pre_scratch_bytes`·`ROUTER_TICKET_BYTES`가 바이트 수를 재계산 — 원본에 accessor(S, b5attn 항목과 같음); 게이트 로컬 `U`·`gamma`→`rounding::*`, `kinds()`→`nodes::count_kinds`, ik q8_2→`ik_q8_2::reconstruct`(다음 하니스 라운드, 후보 `row_stats`/`softplus_err`/`par_chunks`/`post_elem`/`fold_elem`/`Pred`/`gap_ratio`, M); **`hybrid.rs`: V2-Lite도 `handoff_target`+`enqueue_go`로 D2H 제거 가능 — 층당 memcpy −1(M, 504행 항목의 이음매)**; 면제 분기(`x_near=true`)는 세트에 근접 동률이 없어 한 번도 안 돎(시험 안 된 구멍); 남은 ⑥ 항목(공유 expert split-K·압축 슬롯 목록·h 양자화 융합) 미착수.
+- b5step이 남긴 것(보고만): plan.md 「모델」 scratch 항목에 attn part_v(ctx 비례, ~67 MB) 누락(XS); engram_kv를 층 0 그늘에 넣을 hook이 ffn.rs에 없음(노드 1개, S); 조각마다 모듈 적재 — ffn +3.86 MB·attn +1.16 MB, 공유 모듈 캐시(M); `glue.rs:261,627` row bytes 직접 계산 → `engram_row_bytes`(2줄, XS); 스텝 스레드 page fault minor 120–250/스텝 — glue에 `Prefetcher` 연결(M); G3 기본 프롬프트를 7로(1줄); `gate_deepseek41_step.rs`의 `tie_margin`/`softplus_err`/`comp_ring`/`v_q8` 사본 → 하니스 lib(M, 다음 하니스 라운드); verdict-diff의 hybrid telemetry 줄 마스크(XS); 층 39 HC_POST+fold 융합 노드(−1 커널, 스펙이 미룸).
+- cpu2가 남긴 것(보고만): `attn.rs:1386-1396` 프리페치가 한 행 앞만 본다 — 2–4행 앞 레버를 두고 같은 바이너리 팔로(비트 불변 캐시 힌트, 상한 깊이 항의 ~1.7×[유도], S — **다음 CPU 라운드 첫 항목**); head 묶음(스레드 하나가 K 스트림 하나로 head k개) + 키 분할·combine = ik의 모양(float 순서, M–L, 사용자 판단); halves=1 깊이 4096에서 워커 park 12,982/864 디스패치(행 ~365 µs가 스핀 예산을 넘음) — `BLOOMERY_SPIN` 팔로 값 매기기(S); `attn.rs` `#[allow(clippy::too_many_arguments)]`에 R16 `reason` 없음(XS); 레벨 1 표에 청크 평균 열이 없어 단일 호출 site의 skew를 못 잰다(`profile.rs:98-112`, S).
+- cpu1이 남긴 것(보고만): `moe.rs:247-293` `route_inner`가 층마다 `vec!` 9개(603 alloc/스텝의 대부분, malloc/free 메인 1.1 %, M); `moe.rs:643` `Tensor2::zeros`·`:703` `sums.routed.clone()`은 scatter를 첫 기여자로 초기화하면 불필요(S); `arch/deepseek2/attn.rs:155-158` rope sin/cos 캐시를 27층이 같은 위치에 다시 계산 — 스텝당 한 번(S), `:195` `new_rows` 층마다 malloc(S); `ops.rs:878` `group_core`의 `TensorInfo`/`dims` 콜드 미스 — 로드 때 `Weight`로 풀기(0.1–0.2 ms/스텝, moe plan과 얽힘); `forward.rs:233` argmax 스칼라 102,400(0.06 ms/스텝).
+- idxkey3가 남긴 것(보고만): `tools/ref/ik-ppl.sh:146-157` stale-build 검사가 바뀐 파일을 세 바이너리 중 가장 오래된 것과 비교해 `src/`만 고친 증분 빌드에서 거짓 양성 rc 3(이번에 한 번; `ninja -n`으로 묻거나 src→libllama·ggml→libggml 대응, 5줄); `:202-205` `--kld`가 청크 수 다른 베이스를 거부 — 앞 N청크 대조용 헤더 오프셋 `cmp` 보조(15줄); `.log`에 비텍스트 바이트가 섞여 Mac `grep`이 빈 결과(`grep -a`); `:141` root가 user 소유 ik 트리에서 `git diff` — 인덱스 재작성 시 root 소유 위험(가설, 1줄); `compare.py`(두 `--kld` 실행의 청크 짝 비교)와 `kldpos.py`를 `tools/ref/`로.
+- b4index가 남긴 것(보고만): `params.rs:149,282` `n_visible_at`/`table_at` 비공개, `min(n_vis, top_k)` 필드 없음 — b5index에서 필요(XS); top-k 커널에 후보 버퍼를 두면 전체 스캔 3회 중 1회 절약(M); 엔진 연결 시 `n_vis ≤ top_k` 층은 gemv 둘을 건너뛸 수 있다(b5index, XS); **ik `iqk_bucket_topk` 반올림 불일치는 업스트림 후보 — 실측 FAIL-first 먼저(조사)**; ~~`bench-gpu-v41-check`/`time-gpu-v41`이 `--features gpu`라 인덱서 사이트가 빠진다 → `deepseek41`로(1줄 ×2, 리드가 b5time 전에)~~ 닫힘(리드, 09-23 저녁: 두 레시피를 `deepseek41`로, 인덱서 사이트 다섯 PASS); `lib.rs:218` `max_rel_err`가 비유한 값에 `Err` — 보고형 변형(XS); comp·woa 게이트 헬퍼(`rotate`/`fast_ht`/`q8_1_exact`/`q8k_exact`/`q3k_fields`/`load_q8`/`row_ref`)가 index 게이트에 복제, `key_of`/`exact_top`은 index 게이트와 bench_v41에 중복 — 다음 하니스 라운드(M); 인덱서 실측은 `bench_v41 --time --features deepseek41`(A6000, 리드).
+- b5attn이 남긴 것(보고만): `params.rs:288` ImageLayout 오프셋 비공개 → 조각·게이트가 probe 이미지 트릭으로 얻음, `offsets()` 접근자(XS); params.rs가 커널 레이아웃을 직접 배치하면 스텝당 gather 노드 −1(M); `body.rs:569` `engram_row_bytes` pub(XS); `attn.rs:492,503` `q8act_bytes`/`hc_pre_bytes`는 할당 공식 사본 → `Q8Act`/`HcPreScratch::bytes()`(XS); `attn.rs:204` checked window view 사본 → `bloomery_gpu` 공용(XS); `attn.rs:630` 접두 경로 `part_v`가 ctx에 비례 — 2단계에서 stride(b5index); 링 전용 kv append 엔트리 미구현(스크래치 f32 out 행을 한 번 더 씀, b4rope 항목과 같음); **b5index 접점**: `attn.rs:436` `SelectedRows` 목록 버퍼 소유자, 선택 경로에서 vis[1]의 뜻이 '보이는 행 수'→'선택 수'; **b5step 접점**: 별칭 층은 소스 층 rows를 `&`, 소스 층은 `&mut`, 이미지 device copy는 `enqueue_step`에, 링·rows 높이는 ctx_max 기준; AttnKernels 격자가 접두 전 높이까지 돈다(비용 미측정, M); 하니스 후보 `host_q8`/`host_q3k`/`q8_2_err`/`var_q8`/`attn_var`/`hc_pre_rule`와 σ 전파 모델(b5step 게이트가 재사용).
+- b5glue가 남긴 것(보고만): `params.rs:181` `ImageLayout` `embd_at`/`engram_at` 접근자(XS); `lookup.rs:41` `f32_gain`/`f32_tensor` pub(crate)라 glue가 조회를 다시 씀(S); chain_glue 게이트의 헬퍼(`scale_rel`/bands/`project`/`q8_block`/`ffn_pre`/`gamma`/`top2`)는 engram·hc·head 게이트의 사본 — 다음 하니스 라운드(M, ds41 상수는 인자로); port 창 차단 규칙이 `gate_deepseek41_plan.rs:340`과 `glue.rs:731` 둘 — engram crate `Hash`를 owner로(S); `body.rs:562` `engram_row_bytes`와 glue의 `key_len/32·34` 행 크기 owner 둘(XS); `glue.rs:304` piece마다 `HcKernels`/`EngramGateKernels`를 load — bundle 전체가 실리므로 b5step에서 공유(S); **b5step 계약 판단(리드)**: 39층 ffn이 fused HC_POST+fold로 `head.input_mut()`에 바로 쓰면 −1 노드 ~2.1 µs[유도]; `elem.rs:854` 여러 블록 argmax −49.9 µs/토큰[유도](S–M); `glue.rs:680` `StepRows::fill`은 호출 스레드에서 mmap fault — b5step은 `Prefetcher`/`RowCache`(M); `gate_deepseek41_engram.rs:163` hparams 손읽기 → `Hparams::read`(XS); chain_glue의 logits float 한계가 측정 오차의 500–1600배 — lane 부분합 기준으로(S).. Hparams → classify → KvLayout → plan → violations 파이프라인이 세 벌이다(`body.rs:68-88`, `gate_load_v41.rs:145-150`, `gate_deepseek41_load.rs:87-89`) — 주인 하나로(S–M). 돌려 보지 않은 것: `AnyEngine`의 V4.1 팔(컴파일만), `Body::reset`, 다장 카드 계획(`body::open`이 거부한다).
+- B12(b5load): V2-Lite 카드 쪽에 컷을 읽는 둘째 판독자가 남았다 — `_sel` 커널들의 `id >= n_experts`(`q4k_sel.rs:89`, `lib.rs:1323`, `q5.rs:736`, `moe_fused.rs:99`). 슬롯 맵의 카드 사본을 읽게 하면 V2-Lite에서도 B12가 데이터 변경이 된다(M).
+
+⑦ ~~**계기**~~ 닫힘(09-23 낮, ncu 러너 2025.3.1 고정) — 원문은 장부 「GPU 선 트리아지 원문」.
+
+⑧ **코드 모양**(트래커행, 기계 라운드 묶음)
+- R8 호스트 런처 잔여: allow로 가린 여덟(`fused.rs:612`, `moe_fused.rs:201`·`:321`, `q5.rs:1118`·`:1297`, `router.rs:365`·`:423`, `q4k_sel.rs`)과 allow 없는 넷(`q5.rs:1213`, `elem.rs:620`·`:665`·`:776`)을 `*Args`로(ptx-scan 동일이 증명, S–M). kernel-entry allow가 빠진 엔트리 여섯(`lib.rs:425`·`:612`·`:765`·`:1138`, `q5.rs:391`, `flash.rs:424`; lint −6, XS).
+- R14(b2b): `bench_join.rs:194-245`·`:524-600`의 매핑 페이지와 memop 빌더가 `hybrid.rs`와 중복이다(~150줄) — 공용화하고 `bench_join --check`로 증명(S–M).
+- R14(b4rope): block-RMS 1단계 접착(부분합·워프 트리·스케일)의 사본 넷(`elem.rs:285-307`, `fused.rs:125-147`·`:307-329`, `gpu-deepseek41/src/rope.rs:407-429`)을 `#[inline(always)]` 코어 하나로(ptx-scan 동일과 비트 게이트, S–M).
+- R14: sel 프롤로그(row → slot → sel 로드 → 범위 밖 반환 → row_abs)의 사본 넷(`lib.rs:1307`, `q5.rs:731`, `moe_fused.rs:94`, `q4k_sel.rs:84`)을 `#[inline(always)]` 코어 하나로(S). `flash.rs` 런처 8개의 변환 블록 중복. `gate_p1.rs:218`의 비공개 `q8_1_dequant`를 lib 것으로(XS). `gate_p8.rs:728`·`:751`의 burst/replay 타이머를 lib로(XS–S). `gate_p10`의 `kid_*` 꼬리 25줄(M)과 `run()` 360줄(R12, M). `ops.rs`의 융합 판정 4중을 `fused_cb(ty,k)`로(S). qdot 지원 5타입 목록 4중(S).
+- 작은 것: 무검사 곱 넷, `Q8Blocks32::new`의 상한 비대칭, `lib.rs:628` `route_ref`의 `type_complexity`(lint −1), `qdot/src/lib.rs:268`의 도달 불가 `_` 팔, `qdot.rs:501` `parse_ik_dot_dump`가 텐서 이름을 버린다(진단 문구만 틀린다), `threads/src/lib.rs:374`의 스레드 이름이 커널에서 15바이트로 잘린다, `dispatch.rs:81` 96열 — 전부 XS.
+- engram(b4plan2): `crates/engram/src/lib.rs:35-38`의 "엄격한 리더가 이 샤드를 거부한다"는 낡았다(`GgmlType::Q8_0`이 있고 `Split::open`이 V4.1 세트를 연다) — 이 크레이트가 자기 매핑을 갖는 이유를 다시 적는다(XS). ik의 blocked n-gram 규칙이 plan 게이트의 `engram()` 안에만 있다 — `Hash::map_window`로 engram 크레이트가 소유하게(~25줄). `engram.max_ngram_size`를 읽는 곳이 `Hash::from_gguf`와 `Planner::from_file` 둘이다(~~주인은 b5meta가 정한다~~ b5meta가 정했다: 엔진 안은 `Hparams`가 주인이고, `engram::Hash::from_gguf`는 해시 표 길이를 n-gram으로 검증해야 해서 자기 읽기를 남긴다 — engram 크레이트는 model에 의존할 수 없다). 두 값이 같다는 핀은 plan 게이트의 `hash.n_gram() != n` 하나뿐이다 — 겹쳐 읽는 나머지 셋(`layer_ids`·`head_count`·`key_length`)도 거기서 맞춘다(~6줄).
+- b4hc: V4.1 커널의 fma 개수를 gate_p6처럼 커널별로 핀하면 새 수축을 게이트가 잡는다(R29의 보조, 작음). b4comp가 이것이 필요한 이유를 쟀다: FMA 하나를 뺀 변이 둘(norm 제곱합, 풀링)을 게이트가 통과시켰다 — 값이 움직여도 밴드 안이다. 핀 값은 `ds41_comp_pool` 25, `ds41_comp_rows` 5, `ds41_index_key` 5. 같은 라운드에서 gemv 층 2의 ik 시뮬 밴드 모델을 바로잡는다: 항마다가 아니라 슈퍼블록 부분합에 `γ(n_sb+4)`를 매긴다(지금 10–500배 느슨, 몇 줄). `predict_mix`가 `|e_ours|`와 `|e_ik|`를 따로 찍으면 어느 규칙이 정확값에 더 가까운지 σ 진단이 된다(~10줄, 판정에는 안 쓴다). HC_PRE 단독은 우리 규칙과 비트 동일이고 ik 덤프와는 프리필 세 곳에서 1–2 ulp 다르다(glibc `expf`) — 정보 열로만 둔다.
+- b4engram: `gate_deepseek41_engram.rs`의 ik 시그모이드 시뮬(`ik_sigmoid`, `EXP_REL`)은 `49ef19d0`의 스칼라 glibc `expf` 규칙이다. ik main의 4b0afb3e(#2457, 행이 스레드보다 적으면 8개씩 AVX2 `ggml_v_expf`)가 든 트리로 다시 뜨면 T=5 사이트가 빨강이 된다(실측 10/20) — 규칙을 매니페스트의 `# build`로 고르게 한다(~40줄).
+- b4moe: `gate_deepseek41_moe.rs:126`의 `n_ik_f32(k) = k`는 ik의 합 순서를 읽지 않은 값이라 로짓 밴드가 ~1800배 헐겁다(~5줄). 기존 게이트에서 호스트 전사가 커널과 같은 함수를 부르는 곳(그 검사는 공허하다 — b4moe가 클램프를 지워도 초록이었다)을 찾아 규칙을 따로 적는다(게이트마다 ~20줄). 라우터 probs·가중치를 glibc `expf`·`logf`의 디바이스 전사로 덤프와 비트 동일하게 하면 밴드 검사가 비트 검사가 된다(~80줄, 토큰당 384값이라 비용은 무시).
+- b11c: `half_bits_to_f32`(`flash.rs:321`)를 q8f32도 쓰고 `cores.rs:758`은 같은 cvt를 인라인으로 쓴다 — `cores.rs`로 옮겨 주인을 하나로(R14, XS). `tensor.rs:11` 원소 타입 문서에 Q8_0 스케일 평면(u16)이 없다(XS). `probe.rs:50,54`(Q5_1·F32)와 `bench_v41.rs:456`(F32)에 소유자 옆 손 산식이 남았다(R14, XS). `weights.rs:117` `resident_bytes()`가 호출마다 Vec을 할당한다(적재 때만 불려 무해, XS).
+- 커널 본문: Q4_K/Q6_K 커널의 `needless_range_loop` 넷과 Q4_K 에뮬레이터의 `neg_multiply` 하나를 Q5_K 쌍둥이의 비트 동일 형태로(lint −5, 비트 게이트와 같은 임대 A/B, XS–S). mechlint가 핫 패스라 남긴 6줄(커널 본체 4 + roundtrip 2)은 V2-Lite에서 안 도는 폴백이라 지금은 A/B로 잴 수 없다 — V4.1 호스트 티어가 그 경로를 타는 라운드에서 그 라운드의 A/B로 닫는다.
+- b4hc: 레인 기하 상수가 세 벌이다(`cores.rs:840-842`, `:933-935`, `hc.rs`의 `ds41_hc_pre`; R14, ~20줄, ptx-scan 동일).
+- b4moe: sel 프롤로그 다섯 벌(`gpu/lib.rs:1308`, `q5.rs:736`, `moe_fused.rs:99`, `q4k_sel.rs:89`, `gpu-deepseek41/experts.rs:172`)을 `cores::sel_row` 하나로(R14, ~20줄, ptx-scan 동일). R28: 먼저부터 `pub`이던 `cores::q3k_row_dot`(`cores.rs:904`)이 안전한 `pub fn`이다(XS). R29: `elem.rs:177-181`의 "no fused multiply-add"는 PTX와 다르다(`weighted_sum`·`moe_combine`의 fma 3, XS).
+- b5meta: `PlacementError`가 이제 V4.1 파일 읽기 전반의 오류다 — 이름을 바꾸거나 `ModelError`로 합친다(R9, model 크레이트의 오류 열거형이 셋, 기계 라운드). `moe.rs:159` `expert_weights_scale`의 `unwrap_or(1.0)` — ik의 deepseek2 적재기가 이 키를 선택 키로 읽는지 먼저 확인하고, 아니면 기본값을 걷는다(XS).
+- rustdoc 경고 28건에 래칫이 없다(`attn.rs:563`·`:1504`·`forward.rs:62`·`plan.rs:5`의 중복 명시 링크, gguf·qdot 문서의 `[0]`·`[32]` 미해결 링크; S–M). `model::probe`를 `instrument`로 개명, 커널 모듈 `pub` 52개의 가시성, exact_ref 가중치 재역양자화 캐시.
+- b5host: `ops.rs:855` `combine_timed`의 클램프 가지는 `ffn.rs:30` `swiglu_timed`의 사본이다(R14, S). `ops.rs:1465`·`:2294`의 인라인 k/n → `k_of`/`n_of`(XS). `ops.rs:592` `ShardTensor::file`이 Split 지문(샤드 파일 길이 등)을 대조하면 다른 Split에 쓰는 틈이 닫힌다(XS). `moe.rs:680` `Vec<GroupInput>`을 스택 배열로 — 스텝당 할당 26개·1,456 B가 사라진다(호출 수가 바뀌니 할당 래칫 라운드, XS). V2-Lite 경로의 `(Gguf, TensorInfo)` 짝을 `ShardTensor`만으로(M).
+
+⑨ **게이트·측정 공백**(트래커행)
+- x4 커널의 i16 한계가 유도로만 닫혀 있다(Q5_K 8·31·127 = 31,496, Q6_K 8·32·127 = 32,512 — 여유 255). ik와 에뮬레이터가 똑같이 wrap해서 gate A·B는 못 본다. 최대 코드 × ±127 합성 행을 f64와 대조하는 게이트로 고정한다(S).
+- 배치의 `SMALL_ALIGN`과 first-fit은 맞춘 값이지 잰 값이 아니다 — 게이트 ②에서 작은 할당의 디바이스 포인터를 기록하면 직접 잰다(S–M). `research/v41-placement/spread.py`는 선형 비용이라 낡았다(S). `bench_v41`의 +504,534,368 B에는 이 규칙을 적용해 보지 않았다.
+- B2 계측: `join_probe.rs:326` — 블록마다 원시 `%globaltimer`를 원자 연산 없이 자기 칸에 쓰는 탐침으로, C 시작 이상값이 시계 읽기 탓인지 64비트 원자 min 탓인지 가른다(S). `bench_join` 시간 모드가 memop 카운터를 작업자 1과 N 두 셀로 한 실행에서 돌린다(S). `cargo oxide build`마다 나오는 `DynamicSharedArray … shared_mem_bytes` 경고의 출처(XS).
+- b11c: heads 런처의 스트라이드 거부 경로(`kernels.rs:452`)를 밟는 게이트가 없다 — 커버리지 판단(XS).
+- b2b: 하이브리드 재생 하나를 A6000 nsys로 — 층마다 wait 노드 길이가 max(0, RT + H − G_ov)를 바로 주고, 스텝이 유도 밴드보다 0.3–0.55 ms 긴 까닭(합류 왕복·호스트 다리·첫 go)을 가른다(리드, 조용한 틈, S). `gate_hybrid`의 σ 경계 √(3h)가 측정과 모양이 다르다(h 0.5 → 1.0에서 σ 0.294 → 0.282) — 층별 라우팅 뒤집힘률로 판정(S). `TAIL_FACTOR` 9가 측정 꼬리보다 4배 넘게 헐겁다 — 재핀 규칙으로 조인다(S).
+- b4engram: `elem.rs:131` `rms_partial_sq`의 런타임 상한 루프에서 로드와 FMA가 번갈아 나온다 — ptxas가 로드를 앞으로 끌어올리는지 SASS로 본다(`sass_inflight`, XS).
+- b4moe: 라우터 꼬리(마지막 블록의 한 워프가 여섯 라운드, 나머지 일곱 워프는 논다; 1–2 µs[유도])와 combine의 바닥, go/wait 합류 비용은 재지 않았다 — 셋 다 임계 경로 위라 B5의 첫 nsys에서 먼저 본다.
+- ubsplit: 32행 미만 잔차(ub1↔ub16 KLD 0.0068)의 원인 op — `-ub 2`·`-ub 4` 대 `-ub 16`이 (i) 행 수별 커널 변형(`iqk_mul_mat.cpp:121` `funcs[n_left-1]`, `nrc_y == 1` 특수화)과 (ii) 경계마다 걸리는 이월 상태 산술을 가른다(c512×4 1–2분씩[유도]). b4comp: 비용 모델의 미측정 항 둘 — 1블록 커널의 t_floor(0.55–1.1 µs[유도])와 이 노드들의 c_node. 스텝당 ~80 µs 예측이 둘에 기댄다(B5 첫 nsys).
+- b4attn: 키 행 재읽기 — 16헤드 그룹마다 블록이 따로 타일을 스테이징해 층마다 키 행을 네 번 읽는다. 추가 L2 트래픽은 75.5 MB/토큰이고 전부 DRAM으로 가면 +131 µs다[유도]. L2 대역은 재지 않았다(B5 첫 nsys에서, S).
+- b4rope: 「모델」의 `t_floor`에 gemv 형상만 있다 — 원소별 작은 커널의 런치 하한을 B9식 그래프 재생 한 번으로 핀한다(S). ~~`/root/bloomery-data-ikfix`(1.3 G, 헤더 `c10fbbcc`, 내용은 `49ef19d0` 세트와 같다)는 읽는 곳이 없다 — 파동 뒤 지운다(XS).~~ 이미 없다(09-23 16:20 확인).
+- `just fmt`가 맥의 Homebrew rustfmt(1.9.0)를 쓸 수 있다 — 고정 nightly는 1.10.0이다(판정은 박스 fmt-check가 하므로 맥 편의의 문제, 확인 필요, XS). `engram-corpus.sh:48-52`의 정렬이 박스 로케일을 따른다(`LC_ALL=C`로 고정하면 코퍼스 파일이 바뀌어 거기 기댄 수치를 재핀해야 한다, XS).
+- 리드 몫(b5plan 항목 8): ~~`research/v41-placement/measured.py`의 NONGEMV(0.9–1.4)·KV(0.16) 가정을 b5plan 노드 표의 항으로 바꾼다~~ 했다(09-23 낮) — 임계 1.89, attention 0.39–0.57 + merge 0.11, engram 조회 0.31 추가, `engram_wkv` 0.51은 그늘로. (a) R1이 25.2 → 24.6이 됐다[유도]; `v41-placement.md` 「재유도」에 다시 센 표. V2-Lite 재생 추적 `nsys-d6-graph-234345`는 3090(device 0)에서 떴다 — A6000 시간 규칙에 맞춰 `nsys-gpu.sh`로 다시 뜬다(XS).
+- b5host: CPU 디코드 −0.68 % ± 0.40 %(빌드 간 1 % 아래라 판정하지 않았다) — 가르려면 한 바이너리 안의 레버 팔이 필요하다. `group_core`로 합친 뒤 핫 루프의 인라인이 바뀌었는지 `perf annotate`로 한 번 본다(선택, S).
+- harness2: hc 게이트는 d1n을 읽지 않고, moe 게이트는 d1n과 `-unfused` 둘을 읽지 않는다 — 세트를 더하면 판정 줄이 바뀌므로 따로 한 라운드(S).
+
+⑩ **#2455 결함 클래스의 구조적 봉쇄**: 제자리 연산 별칭 검사기(`tools/`, S) — 제자리 op가 덮은 버퍼를 나중에 읽는 노드를 찾는다. 매니페스트 src 열의 occurrence가 선행이다(`dump_ref.cpp:272`).
+  ikfix가 잰 것: 지금 매니페스트로는 이 부류를 기계적으로 못 가린다(이름 기반 sweep이 네 투영 노드를 옛 세트에서도 0개 잡았다 — 투영의 src1 이름이 rope 출력의 이름과 같다). 행마다 데이터 주소(또는 버퍼 오프셋)와 `ggml_nbytes`, src 전부를 `이름#occurrence`로, `view_of`가 있으면 오프라인 검사로 잡힌다(규칙: src의 바이트가 그 src 행 뒤·소비자 행 앞에 다른 행에게 덮였고 루트가 리프가 아니다; 덤퍼 20–30줄 + 파이썬 60–80줄). `fattn`의 src[5]인 `mask_to_idx`도 src2–src5 열이 없어 안 보인다(덤퍼 약 5줄 + 리더 폭, S). MUL_MAT_ID의 ids(src2)도 같은 이유로 매니페스트에 없다(b4moe, `dump_ref.cpp:667`).
+
+⑪ **문서(XS)**: `docs/oracle.md:81`의 파일 순서 규칙에 한 줄 — 상태 입력과 그것을 가리키는 정수 입력이 같은 첫 접촉자를 가질 수 있다(prefill·step4의 `csa_k_state_persist-L`에 `dsv4_csa_persist_dst`와 링 leaf가 함께 붙는다). 통하는 필터는 f32이면서 링 모양인 것이다(`gate_deepseek41_comp.rs:281` `FirstTouch::inputs_of`, b4comp). `docs/oracle.md`에 운영 규칙 한 줄 — ik 규칙을 시뮬할 때의 참조는 매니페스트 `# build`가 가리키는 박스 트리다. 맥 체크아웃이 아니다(b4engram: 맥의 ik main은 이미 #2457을 담아 시그모이드 규칙이 다르고, 맥의 idxkey 사본은 객체가 빠진 부분 클론이라 `git log -S`가 promisor 오류를 낸다). `docs/oracle.md:52`에 한 문장 — 덤퍼의 노드 콜백은 전부 ik의 비융합 CPU 경로이고 `argmax_ref.cpp`는 `cb_eval`이 없어 융합 경로를 타므로, 두 기준이 동점 근처에서 갈릴 수 있다. rig-log `docs/v41-serving.md:174`의 "ik KV 셀에 토큰 id가 없다"는 `c10fbbcc`에서 낡았다(`llama-context.h:55`의 `tok`).
+
+⑫ **업스트림 후보**(제출 전에 FAIL-first): ~~**ubsplit — ik `perplexity.cpp:1946`**: `sqrt(a²+b²−2cov)`가 두 계열이 같으면 음수 근호가 되어 `-nan`을 찍는다(박스의 `kldctl-b512.log` `Mean ln(PPL(Q)/PPL(base)) : 0.000000 ± -nan`으로 **관측** — 이 목록에서 실측 증상이 붙은 첫 항목, 0 하한 클램프 한 줄).~~ **제출 — [ik#2513](https://github.com/ikawrakow/ik_llama.cpp/pull/2513)(09-23 17:36)**: 세 곳(`:1947`·`:1993`·`:2002`)의 분산을 `sqrt` 전에 0에서 자른다(+3/−3). 중복 점검은 ik 이슈·PR 쿼리 열아홉(하나는 괄호 탓에 검색 오류), 디스커션 하나, mainline 셋으로 0건이고, perplexity.cpp를 만지는 열린 PR이 없고, mainline도 같은 코드다(스크래치 `ikppl-nan/dup-queries.txt`). FAIL-first는 upstream main `346cd5a4`를 CPU로 빌드해(`/home/user/ik-pplnan`) V4.1 `-c 512 -b 512 --chunks 4` 자기 KLD로 했다: 패치 전 1청크 줄이 `± -nan`(두 번 돌려 두 번), 패치 뒤 `± 0.00000`이고 나머지 출력은 같다. V2-Lite 자기 KLD는 두 실행이 조금 달라 분산이 양수라 전후 출력이 같다. 박스 트리의 diff와 PR 브랜치의 md5가 같다. 같은 파일 `:1814`(베이스의 n_ctx가 크면 안내만 찍고 계속), `:1826`(n_vocab 불일치에 경고만), `:1954`(rms가 정확히 0이면 inf·0)는 코드 독해뿐. b4comp(가설): ik의 hca 1칸 링(층·스텝마다 CONCAT 2·GET_ROWS 2·SET_ROWS 2)은 읽히지 않는 죽은 상태이고 hca DS4_COMP의 expf는 항등이다 — 이득 작음. **b4attn — ik iqk T=1 인덱스 분기의 sink 오프셋**: `iksink`가 전후를 잰다(중복 점검 끝, 「지금」). b4engram(코드 독해): 우리 V4.1 포트(#2455)의 `ds4_build_engram`이 bf16 게인을 스텝마다 `as_f32` GET_ROWS로 바꾼다(층당 4노드) — 적재 때 한 번이면 된다(ik 쪽 ~10줄, 가치 작음). b5ppl(코드 독해뿐): ik `llama-perplexity`의 작은 결함 넷 — KLD 모드가 n_ctx·n_vocab 불일치에 경고만 하고 계속 돈다(`examples/perplexity/perplexity.cpp:1814-1828`); `kl_divergence()`가 void라 기준 파일을 못 읽어도 rc 0; 기준 파일 스트림의 쓰기 실패를 보지 않아 디스크가 차면 잘린 파일을 쓰고 rc 0(`:314, 595-596, 649-651`); ~~ln 비 불확도의 음수 sqrt가 `-nan`(`:1947, 1993`)~~ — ik#2513으로 냈다. 업스트림 main에서 FAIL-first와 중복 검색을 한 뒤 작은 PR 후보. cuda-oxide는 FP 수축을 함수·식 단위로 끌 수 없고 `{mul,add}_rn_f32`가 호스트에서 `unreachable!()`이다 — 연산마다 반올림하는 디바이스 코어를 호스트 단위 시험에서 못 돌린다(ledger 17, 기능 요청·낮음, b4rope 코드 독해 — 중복 검색과 HEAD 확인 전). Nsight Compute 2026.2.1의 `derived__local_spilling_requests_pct`는 분자와 분모가 같은 합이라, 스필이 하나라도 있으면 100 %로 읽힌다(코드 독해뿐 — 스필하는 커널을 두 판에서 잰다). ~~ik의 `fused_idx_topk` — 확인했다(09-23 낮, 박스의 ik 트리): … 끌 방법이 없다 …~~ **제출 — [ik#2508](https://github.com/ikawrakow/ik_llama.cpp/pull/2508)(09-23 13:00) → 머지(13:54, ikawrakow 승인)**. #2098이 `-fidx`를 옵트인(기본 끔)으로 넣었고 #2165가 기본값을 켬으로 바꾸면서 끄는 플래그와 주석을 남겨 두지 않았다. `-no-fidx`/`--no-fused-indexer-topk`를 형제 플래그(`-no-fmoe`·`-no-fug`)처럼 더하고, "off by default"가 남은 주석 셋(`common.h`, `include/llama.h`, `llama-cparams.h`)과 `docs/parameters.md` 줄을 고쳤다. 기본값은 그대로다. 중복 검색은 쿼리 8개 × PR·이슈로 0건이었다(`fidx`, `fused-indexer-topk`, `fused_idx_topk`, `no-fidx`, `indexer topk`, `fused indexer`, `idx_topk`, `dsa_idx_topk`). FAIL-first는 박스에서 upstream main `c5b5773b`를 CPU로 빌드해 확인했다(`/home/user/ik-nofidx`): 패치 전 `-no-fidx`는 `error: unknown argument`, 패치 뒤 V4.1 `-c 2048`의 그래프 노드가 기본·`-fidx` 3,631, `-no-fidx` 3,671(인덱서 8층 × 5)이다. 박스 트리의 diff는 PR 브랜치와 md5가 같다. 우리 쪽 쓸모도 있다: b5ppl의 대조군(ik 대 ik)에 경로만 바꾸는 스위치가 생긴다 — 오라클 트리(`49ef19d0`)에는 아직 없다. skelectric 포트의 같은 제자리 패턴(`build_deepseek4.cpp:898-906`, 재지 않음 — 알림만).
+- ik 쪽 추가(코드 독해뿐, 제출 전 FAIL-first): `ggml-alloc.c`의 할당 순회에서 "리프가 아닌 중간 텐서에 in-place 쓰기가 일어나는데 루트에 아직 처리 안 된 자식이 있다"를 env로 켜서 경고(약 20줄, 모든 모델에 걸린다 — #2507 부류의 구조적 봉쇄). `build_deepseek4.cpp:113-121` `dsv4_append_zero_row`가 0행을 실제 행 × 0(또는 0배 −inf 바이어스)으로 만든다 — 그 행에 inf·NaN이 있으면 NaN(`ggml_fill`로 약 2줄). `INDEXER_TOPK` op에 이름이 없고 `:1321`이 `:1354`의 이름(`comp_kv_getrows`)을 `csa_k`로 덮는다(XS).
+- iksink: ik `iqk_flash_attn.cpp`의 split-K 두 분기(`:403`/`:409-421`, `:455`/`:466-489`)가 sink를 버린다(`:558-567`처럼 접어야 한다). 지금 sink 모델은 이 분기에 닿지 않는다(DSV4는 `build_deepseek4.cpp:588`에서 IQK를 끄고, gpt-oss는 nek2 > 1). 코드 독해 가설이고 증상이 없다(S).
+- idxkey2: ik의 V4.1은 후보 사전필터(`candidate_source_layer_id` 20)를 구현하지 않았다 — 압축 행 16K 이상에서 레퍼런스와 달라진다[코드 독해]. 긴 문맥 덤프로 실측한 뒤에만 낸다(M). CUDA `rope_norm_inplace`가 flipped 오프셋을 스스로 갖지 않고 호스트가 포인터를 옮긴다(`rope.cu:893`) — 지금은 맞으니 결함이 아니다(버린다).
+
+**cpu4 트리아지(2026-09-24 새벽)**: ㉑ 16블록 이하 행의 플랜을 세그먼트 하나로(체인 오라클·게이트가 같은 소유자 함수를 타게; 깊이 200–500의 −1.3 % 회수, S) ㉒ `attn.rs` prefetch가 L2에 이미 있는 head 2..16에도 키마다 걸린다 — 청크의 첫 head에만(XS, 값 무관) ㉓ `tests/kv.rs:77,:115`·`tests/mt.rs`가 전부 6토큰이라 32키 넘는 깊이의 "프리필 = 증분 디코드"·스레드 불변을 못 잰다(M) ㉔ `attn.rs` `#[doc(hidden)] pub` 레버 접근자들의 R27 위반(S) ㉕ 프로파일 `attn_heads` 한 줄이 디스패치 셋을 합친다 — 디스패치별 span 열(S) ㉖ **(d) head 묶음 타일**(스레드 하나가 여러 head로 키 행을 한 번만 읽는 8head×1key 타일, 메모 §2; 큰 라운드, cpu5).
+
+**cpu3 트리아지(2026-09-24 새벽, 보고만 받은 것)**: ⑱ `measure-profile` 레시피가 레버 env·`BLOOMERY_PROFILE_DEPTH`·`LEVELS`를 못 넘긴다(XS — ab-decode의 `BLOOMERY_AB_DEPTH` 전달은 머지에 넣었다) ⑲ `attn.rs` 거리 d에서 행 0..d−1은 프리페치되지 않는다 — 루프 진입 전 첫 d행을 미리 거는 수 줄(측정 필요, XS) ⑳ `threads/src/lib.rs` 기본 spin 20000은 공유 CPU에서 park·재기상으로 처리량이 반토막(오염 창 관측) — 조용한 창에서 SPIN=160000 6바퀴(~17분) 뒤 재검토(S).
+
+**b5index 트리아지(2026-09-23 밤, 보고만 받은 것)**: ⑬ `Seam::Attn.list`가 `layer_io`와 따로 `lists.get(j)`를 고른다 — 리스트 핀이 커널 인자가 아니라 장부를 검사한다(m4b에서 envelope가 대신 잡았다); `layer_io`가 돌려준 참조를 Seam에도 쓰게 해 소유자를 하나로(S) ⑭ `check_selection` own 핀은 점수가 퇴화하면(전부 0) 헛통과(m2) — 비퇴화 조건이나 ik 점수 거리(S) ⑮ `score_band`의 동률 밴드가 깊은 층에서 행 거의 전부를 덮는다(d1 L14 148/151, d2 L20 1006/1026) — ik 리스트 핀이 사실상 무력, 밴드 모델 재검토(M) ⑯ `place`의 조각 scratch 추정 67 MB 대 실측 2.7 MB(S) ⑰ cuda-oxide 원장 후보: codegen이 PTX를 트리 루트에 쓰고 `box.sh --delete`가 지운다(`*.ptx` 제외, XS); 공유 백엔드 캐시 `.so`를 트랙들이 제자리에서 다시 빌드해 다른 트랙의 rustc가 SIGBUS(가설 — 원자적 rename, 원장에 적을 것). verdict-diff의 hybrid 카운터 마스크(XS)는 머지에 넣었다.
+
+**b5gen 트리아지(2026-09-23 밤, 보고만 받은 것)**: ⑩ `depth-ds41.sh`·`depth-gpu.sh`가 CPU 경합을 거부하지 않는다 — `[other-busy]`와 `BLOOMERY_OTHER_STRICT`는 다른 카드만 본다; `busiest` 증인이 침입자를 찍으면 `[cpu-busy]` 표시·STRICT 확장(S, 러너 라운드) ⑪ `generate_ds41::decode`에 스텝별 major/minor fault 텔레메트리가 없다 — `gate_deepseek41_step`의 것을 옮긴다(S; 깊이 6 표에서 페이징과 계산을 가르는 데 필요) ⑫ ik llama-bench의 `add_cpu_buft_overrides`가 일반 CPU buft를 넣는데 로더 로그는 `CUDA_Host`로 찍힌다 — ik 적재 실패의 원인을 가를 자리(조사 S, MUL-7 후보). ik 실패 로그 절단(XS)은 머지에 넣었다.
+
+㉝ (cpu5) `attn.rs` `flash_segment`: 블록 경계 + 8묶음에서 세그먼트 0만 블록이 하나 더 많을 때의 불균형(4097키 1.24배, 1025키 1.94배 — 1024에서 이득이 0인 원인). 경계를 키 단위(최소 32)로 고르게 자르면 3 %·1.25배[유도]. 계획 변경이라 split-K 밴드 게이트가 다시 판정. M.
+㉞ (cpu5) `heads_split_k`의 `SPLITK_R` 세그먼트 우선 배치 — 병합이 한 헤드의 부분합을 32 KB 간격으로 읽어 bundle 1 팔이 base보다 +0.1 ms. 헤드 우선으로 되돌리는 패치가 `scratchpad/cpu5/headmajor.py`에 있고 적용 전 측정 1회. S.
+㉟ (cpu5) ~~`tools/ref/depth-decode.sh:24`가 경로를 받으면 rc=2 — `basename` 한 줄. XS.~~ 닫힘(리드, 09-24 03:2x). 2단계 KQ0 DRAM 스트림(32스레드 동시)을 두 묶음 교차 + prefetch로 펴기[유도, 미측정]. M.
+㊱ (b5prof) `hybrid.rs:948` 합류 0이 매 스텝 ~1 ms 더 — 스텝 사이 풀 park/첫 go 대기 의심(nsys에 호스트 타임라인이 없어 미확정; NVTX 범위를 `generate_ds41`에 넣으면 갈린다, S). 층당 겹침 70–150 µs 대 다리 690 µs — wait 앞으로 당길 카드 일(다음 층 attention)이 있는지 구조 조사(M). `nsys-gpu.sh`(V2-Lite)는 CPU 샘플링을 안 끄고 ctx d+128 고정(XS).
+
+㊳ (auditload, 원문 [`research/v41-audit-load-report.md`](research/v41-audit-load-report.md), 읽기 전용 감사·박스 0회) 적재·배치·engram 경계. **큰 발견 셋**: ① `glue.rs:680-760` `StepRows::fill`이 engram 48행을 스텝 스레드가 mmap에서 곧바로 읽는다(QD1 팔) — `Prefetcher`·`RowCache`는 engram 크레이트 안에만 있고 엔진 호출 0개(리드 확인). B5 결정의 0.31 ms는 선행 읽기 팔 값이라 코드와 안 맞는다. 콜드 행 몫[측정 팔 유도] 코드 스트림 +0.67–0.82 ms, 산문 +2.06–2.51 ms; 페이지 캐시에 있으나 미매핑 minor fault 120–250/스텝 = 0.30–0.63 ms. 처방: argmax 직후 헬퍼에 제출, `engram_kv` 앞 wait 노드 1–2개(런치 수 클래스, M). ② `HostLock`을 부르는 곳은 `gate_load_v41.rs:645` 하나뿐(리드 확인) — 엔진은 호스트 expert를 잠그지 않아 새 프로세스가 처음 만지는 expert마다 fault. 구조 원인: `HostLock<'a>`가 `&Split` 빌림이라 `Body`가 소유 못 함. 깊이 역전(6이 400·4096보다 0.8–1.0 ms 느림)의 후보 — ㊲의 lcg 퇴화 가설과 **같은 임대에서 갈라야 한다**(C1: 스텝별 `RUSAGE_SELF` major/minor 차 + `--warm 400` 팔 + populate 팔). 잠그면 적재 +31–164 s[유도]. ③ `weights.rs:299-340` 카드 업로드가 mmap 읽기라 48 GB가 페이지 캐시에 남아 ≥4.37 GB를 밀어낸다 — span마다 `fadvise(DONTNEED)` 한 줄(XS). ④ `body.rs:480` engram_kv 그늘 — ㊲와 같은 항, R1 예측이 이 0.48을 그늘로 셌으니 39.4≈39.7 일치는 우연. **B12 범위 좁힘**: V4.1 커널 경로(`chain/ffn.rs:106`, `experts.rs:172`, `SlotMap`)는 이미 목록을 받는다; 접두 가정은 `placement.rs:780-808`·`:339-362`, `weights.rs:196-201`·`:320-324`·`:457-459`, 두 적재 게이트, `host_lock.rs` span, `deepseek2/mod.rs:566-612` `hybrid_row`(가짜 `Plan`, R14). **expert별 세그먼트는 2 MiB 반올림으로 25 %(10.1 GB) 낭비** — 스택마다 gather 버퍼 하나, `Segment.experts`는 목록 타입. 기각(산수): B3c io_uring 스텝 값 ≈0(①이 들어오면 헬퍼 대기 1 µs), rope 표 <0.03 %, 이미지 H2D ≤7 µs, `token_embd` 카드 상주는 −0.16 ms 손해. 3090 둘째 모델(DSpark)의 걸림돌 여섯: `body.rs:84-92` 카드 하나, `MappedHost` `PORTABLE` 없음(`hybrid.rs:333`), peer 없음, 전역 풀, q8_0 `_sel` 없음, 게이트 카드 예산 충돌 — 싼 길은 `PORTABLE|DEVICEMAP` 호스트 경유 + `cuStreamWaitValue32`. 품질 XS 여섯(`quant.rs:448/490` unwrap, `engram lib.rs:77` 오류 문맥, `glue.rs:11-15`·`lib.rs:1378` 문서 불일치, 세 번 여는 Split, 트리아지 ① 경로 정정 `ops.rs:2441`). 처분: ①②③은 **다음 적재 라운드 하나**(engram 헬퍼 + 소유형 HostLock + fadvise, 게이트는 스텝별 fault = 0 텔레메트리 ⑪), C1은 b5time2 교차 측정과 한 임대.
+
+㊴ (auditcpu, 원문 [`research/v41-audit-cpu-report.md`](research/v41-audit-cpu-report.md), 읽기 전용) 호스트 expert 티어. 바이트 3.409 GB는 행렬 모양에서 재검산 일치(가중치 밖 읽기 0, x 양자화는 층당 1회). 128.4 대 147.7 GB/s의 13 % = **3.47 ms/토큰**(㊲ ①과 같은 항)을 가르는 것: 원인 축소 A(mlock mmap 대 익명 THP 순수 읽기, 한 임대) → 같으면 디스패치·단계·꼬리(B·C·D), 다르면 TLB·4 KiB 경계 HW 프리페치. **P1(L, ktok 뒤)**: 카드 구간 0.324 ms/층 동안 32스레드가 `wait_go`에서 돌고 DRAM은 논다 — 층 l+1 라우터를 층 l handoff x에 미리 적용해 예측한 expert의 레인 앞머리를 L3로 끌면 창당 41.6 MB(층 바이트의 절반, CCD당 10.4 MB), 천장 −12.95 ms × 적중률 h. 적중률·L3 보존은 오프라인 E로 먼저(B10 추적 기반). **P3(S–M)**: 층당 풀 디스패치 셋(wait_go, gate/up, down) = 토큰당 120회, 0.19–0.83 ms — go를 본 워커가 handoff에서 바로 행으로 가면 −40회. **P5(XS, 측정 조건)**: `generate_ds41`이 `pin_caller`를 안 부른다(리드 확인) — `BW_host`는 고정 호출자로 교정됐는데 스텝은 안 고정. `BLOOMERY_PIN_MAIN` 넣고 같은 임대 A/A·A/B. **Q1(XS)**: `generate_ds41`이 `HybridStats`(leg_ns 등)를 안 찍어 24.8 tok/s 바이너리에서 호스트 항을 직접 못 읽는다 — `leg_us_mean × 40`이 곧 호스트 항 실측. P2 꼬리(레인 4블록, 상한 2.2 ms — `STEAL_BLOCKS` 4/16/64 A/A 여섯 바퀴), P4 클레임 단계(블록 단위 클레임은 스케일이 블록 안에 닫혀 구성상 비트 동일, 값은 프로파일 레벨 1의 `host_x_quant`). **k토큰 구조(ktok 참고)**: `moe.rs:811` ne1≠1 거부, handoff x 하나, `EXPERTS_INTO_MAX=8`(합집합 최대 12 넘침), `GROUP_INLINE=16`, k>1이면 지연 양자화·인라인 SwiGLU가 꺼져 combine이 호출자 직렬로 돌아온다; 합집합 바이트가 0.37×(Q3_K)/0.28×(Q4_K) 아래로 내려가면 k열 커널(ik nrc_y 모양) 없이는 이득 없음. 기각: go-early 건너뛰기(의존 사슬상 ~0), 예측 없는 SW 프리페치(16스레드 포화), CCD/NUMA, 층별 park, host_sum 접기. 품질 XS: `hmax_ps` Safety 문구, `Sink::Into` 원시 포인터(S), `moe.rs:285` unwrap, (id,f32) 튜플 이름. 처분: P5+Q1은 **다음 측정 라운드 앞에 XS로 먼저**(호스트 항 직접 계측이 없으면 ㊲/㊳/㊴의 3.47 ms 축소가 전부 간접), A는 b5time2와 한 임대, P1은 ktok 설계 뒤 카드.
+
+㊵ (auditgpu, 원문 [`research/v41-audit-gpu-report.md`](research/v41-audit-gpu-report.md), 읽기 전용) V4.1 GPU 스텝. 층 격자를 코드에서 다시 읽어 임계 289.6 µs/층(b5plan 291.7, 차 −2.1은 combine+HC_POST 융합분): BW 묶임 q_b·wo_a·wo_b 셋이 70 %, t_floor gemv(q_a·kv) 21.9, 1블록·c_node 노드 12개+memop 2개 65 µs(22 %). **P1 = ㊲②·㊳④와 같은 항** — 세 감사자가 독립으로 찍었다: 코드 기준 GPU 임계는 12.95가 아니라 ~13.46 ms, engram 6커널을 0층 그늘로 −0.51(B11c 뒤 −0.48). **Q1(S, 게이트)**: G2가 노드·종류 수만 세고 층별 그늘 집합(go–wait 사이 커널)을 핀하지 않아 P1 이탈을 어느 게이트도 못 봤다 — 캡처 순서 또는 `cuGraphGetEdges`로 층별 그늘 집합을 예측표와 대조, FAIL-first는 지금 코드. P1 라운드에 Q1을 같이 넣는다(수정의 3층). P2(S, 측정 먼저): 층당 ~0.56 ms GPU 유휴에 다음 층 t_floor 사이트 가중치(kv 2.79 MB, q_a 앞 1 MB)를 L2 프리페치 −0.15…−0.3(cuda-oxide에 `prefetch.global.L2` 없으면 원장). P3(M) `wait_go` 조인+디스패치 접기 ≤−0.28 = ㊴ P3와 같은 항. P4(S–M) handoff 런치 제거 −0.09…−0.15(norm이 매핑 페이지에도 쓰고 router 마지막 블록이 ids·sel을 씀). P5(XS) 인덱서 8층 q_b 두 런치 연결. Q2(XS) replay=eager가 D2(선택 살아 있고 파일 top_k)에 핀 없음 — structure 루프에 D2 추가. Q3(XS) `BLOOMERY_HYBRID_OVERLAP=0`을 도는 레시피·게이트 0건(리드 확인). Q7 죽은 경로: `ds41_hc_pre_mix`(호출 0), `ds41_hc_post_streams`·`ds41_moe_combine`(게이트만 호출, 리드 확인) — 엔진이 안 도는 경로를 게이트가 핀한다: **지운다**(참조 팔이 필요하면 git에 있다; 게이트 제거는 날짜 사유 달아). Q5 SAFETY "as above" 14곳(XS×14), Q6 층→조각 인덱스 불변식 7곳 반복(S), Q8 런타임 assert(XS). 기각: 0·1층 expert 카드 상주(합 ~0), csa 키 건너뛰기(10 µs), go 분할, 재양자화(KLD 패리티 계약), n=1 층간 겹침(배치 필요 → C3/ktok). 원인 축소: 모델 40.2(P1 포함) 대 실측 39.4의 0.8은 호스트 실효 137 GB/s면 설명(b5prof nsys 층별 wait + `leg_ns`), 합류 왕복 분해(층 번호를 이미지에 넣어 barrier 하나로 / `ffn_post`가 Cnt 직접 스핀 / BAR1 로컬 쓰기), 1블록 커널 5–6개(norm 접기 카드와 같은 항, 하나만), 스텝 사이 유휴(헤드 0.85 ms 동안 위치 의존 일). **다음 GPU 라운드 확정(작고 확실)**: P1+Q1+Q4 문서 정정+Q7 삭제 한 라운드(S), 시간 A/B 1회.
+
+㊶ (ktok, 원문 [`research/ktok-report.md`](research/ktok-report.md), 머지 `77eaf88` — 탐침은 `bench_v41_host` 팔 문법 `<n_host>x<rows>`·`engine-sep`로 남김, 리드 재실행 check·lint 169·fmt·recipes·comments·arch 전부 rc=0) 한 토큰 가정 지도 27행(C4 카드에 요약). 지금 할 것: **`attn.rs:701` gm≠1 거부**(비율 1 스트림 20층이 k=2에서 오늘 거부됨, S), `head.rs` m=1 assert(dspark도 막힘), `hc.rs:83` `HC_MAX_TOKENS=8`·gemv m≤8·`Q8Act` m≤8이 K_MAX 벽(스펙의 `tensor.rs:106`은 K축 한계라 틀림). 스펙 밖: `bench_v41_host.rs:425` `blocks()`가 시간 안에서 할당(XS), `ops.rs:1599` `MAX_DEFER_SLOTS` 16 초과 그룹이 호출자 결합으로(행당 +0.19 ms[유도], XS–S), `cores.rs:817` q3_K 1col = 다열 열 0 비트 핀 없음(XS 게이트).
+㊷ (dspark, 원문 [`research/dspark-report.md`](research/dspark-report.md), 읽기 전용) 스펙 밖: `router.rs:41,44` `N_EXPERT`/`N_USED` 컴파일 상수(128/3 드래프트 불가, const generic S), `experts.rs:49` combine 슬롯 리터럴 6(S), `gguf/quant.rs:33` MXFP4(39) 없음(XS–S), `experts.rs:23` SwiGLU clamp 규칙(ik `min(silu(g),10)` 대 `model.py` `silu(min(g,10))`, g>10에서 ~5e-5) 문서 없음(XS). 3090 BW는 250 W 캡 아래 미확인(D 유도의 전제).
+
+### serve 템플릿·`/props` (propsengine 보고, 2026-09-24 — 받을 라운드: 템플릿 정리 하나로 묶는다)
+
+- `crates/serve/src/template.rs:1334` 필터 인자를 버리고(`_args`) `:1124`는 메서드 kwargs를 버린다 — `tojson(indent=2)`, `split(',', maxsplit=1)`이 조용히 다른 결과를 낸다(S).
+- `template.rs:846` `render_py`가 리스트를 JSON(`["b"]`)으로 찍는다. Python `str()`은 `['b']`(S).
+- `template.rs:16-18` 키를 정렬 순서로 낸다(`preserve_order` 없음) — Qwen3 tools 분기의 `tool | tojson`이 jinja2와 갈릴 수 있다(M).
+- `split()`/`strip()`의 공백 판정이 Rust White_Space라 Python의 U+001C–U+001F와 다르다(XS).
+- `crates/gpu-gates/src/bind.rs` `class_of`가 EngramDense를 `ngram`으로 보낸다 — toktape는 ngram을 "안 읽힘"으로 센다(`internal/bandwidth/split.go:121`). `active_bytes_per_token`을 `Row::read_bytes`(`crates/model/src/placement.rs:592`) 장치별 합으로 보낼 때 같이 고친다(S).
+- `/props` `engine.args`는 argv 그대로다 — 비밀을 싣는 플래그(`--api-key` 류)가 생기면 그 값을 가린다.
+- `gate_ds41_serve.rs:472` `check(ok: &mut bool…)`는 R24 패턴(기존 코드, S).
+- 업스트림 후보(MUL-7, 코드 독해만 — 가설): ik `common/jinja/value.cpp:92-105`·`runtime.cpp:771-773`은 음수 step 슬라이스에서 start/stop을 무시하거나 0/len으로 채워 `a[2::-1]`·`a[4:1:-2]`를 틀리게 렌더한다. mainline `930e2fa59`는 기본값만 고쳤고 `a[-10::-1]`·`a[3:-1:-1]`이 남는다. FAIL-first는 test-jinja 케이스 하나(각 S). ik PR은 하나만 열어 둔다는 사용자 지시(09-24)가 있어 mainline 먼저.
+
+### 두 카드 게이트 (2026-09-24)
+
+- V4.1 `--place gate` 게이트는 배치가 카드 이름 "3090"을 박고 있어 `BLOOMERY_GATE_CARD=any`로도 3090에서만 돈다. A6000에서 `BLOOMERY_CARD_BUDGET`(3090의 usable 바이트)으로 같은 배치를 슬롯 단위로 흉내 내면 이 게이트들도 두 카드로 나뉜다 — 게이트가 핀하는 대상이 바뀌므로 `nanmoe`(그 배치의 결함) 착륙 뒤에 연다(S–M).
+- 레시피별 카드 태그(`any`로 떠도 되는 게이트: V2-Lite e2e·p6·chain-ffn, qwen3moe, vision, kv, dspark-kv)는 파동이 착륙한 뒤 justfile에서 한 번에 단다(지금은 `BLOOMERY_BOX_ENV`로 넘긴다).
+
+### DSpark 드래프트 (dsgraphb 보고, 2026-09-24)
+
+- **`gate_dspark_graph`의 BAND_GAIN 8**: ik 규칙에 routed clamp가 잘못 켜져 있던 동안 ρ/band 최대 0.70으로 그 불일치를 못 잡았다. 올바른 규칙에서 594쌍의 ρ/ρ̂ 최대는 1.04이고, gain 3이었다면 가장 나쁜 clamp 행 다섯 중 넷을 잡았다. 지금 막을 결함은 없으니 재핀하지 않는다 — 블록 3–11도 탭으로 판정하게 될 때, clamp를 다시 켠 빨강을 FAIL-first로 삼아 다시 정한다.
+- **알려진 빈틈**: 엔진이 도는 규칙(기준 규칙, clamp 있음)은 두 ik 결함이 닿지 않는 행에서만 ik와 대조된다. clamp 경로에는 끝에서 끝까지 오라클이 없고 `gate-gpu-dspark-experts`의 호스트 규칙 핀뿐이다. 그 호스트 규칙도 silu(g)를 자르고 model.py는 g를 자른다(`crates/gpu-deepseek41/src/experts.rs:99`, 차이 ≤ 4.5e-5 [유도], XS). "우리 드래프트가 ik보다 낫다"를 수락 수로 말하려면 이 빈틈부터 닫는다.
+- **업스트림 후보(MUL-7, ik — 지금은 PR 안 냄: ik PR은 하나만 열어 둔다)**: ① ik 드래프트에 SwiGLU clamp가 없다 — `src/llama-model.h:665` `swiglu_limit()`가 `llm_arch_is_dsv4(arch)`일 때만 값을 주는데 드래프트 파일 arch는 `dflash`이고, 한계 값은 hparams가 읽는다(`src/llama-hparams.cpp:1940`, `1976–1978`). model.py는 routed·shared 모두 자른다(879, 887행). 코드 독해 가설 — ik 쪽 FAIL-first(읽은 한계 vs 적용된 0)는 S 라운드, 그 뒤 draft PR. ② 블록 인과 마스크 — `src/llama-dflash.cpp:718`, `746`이 `causal_attn`을 따르는데 model.py와 exllamav3(`architecture/dflash.py:305–307`)는 비인과다. ik가 의도했을 수 있어 트리아지에 둔다. 수락 수는 35개 초안에 ik 18, 기준 규칙 20 — n이 작아 차이를 주장하지 않는다.
+- 스펙 밖 개선 지점: `draft/block.rs:569`·`:648` 라우터와 shared gate_up이 행마다 런치한다 — 다행 런치면 w=5에서 112개 중 24개가 준다(dshc·dsmx 커널, S–M). `block.rs:599` concat 플랜이 3m·m 쌍을 계산하고 3m만 쓴다 — `experts_mxfp4.rs:30–33`의 dedup 플랜으로(M). `crates/gpu/src/head.rs:94` `Head::with_m`이 gain과 투영을 한 `Weights`에서 받아 `draft/head.rs`가 세 런치를 다시 쓴다(R14, S). `experts_mxfp4.rs:713` `MxAct`/`Q8Act` 열 수 고정 → 폭별 버퍼 다섯(S). `block.rs:796` `stage`가 f32 네 스트림을 올린다 — bf16 한 행을 올려 카드에서 넓히기(phase C, S). `gate_dspark_graph.rs:1152` tie 밴드가 walk 뒤쪽에서 넓어진다(S), `:1328` `run()` 214줄(R12, S). justfile `ptx-scan`의 `FEATURES`는 `--features` 긴 옵션만 받는다 — 위치 인자면 빈 바이너리를 스캔해 `scan=failed`(XS).
+
+### 링 섀도를 호스트로 (shadowhost 보고, 2026-09-24)
+
+- **리드 A/B 대기**(A6000, 다음 측정 자리): A = base 무예산(섀도 VRAM), B = 새 트리 @ `BLOOMERY_CARD_BUDGET=49610227712`(섀도 위치만 다름), C = 새 트리 무예산(+80 experts). B−A가 append의 호스트 쓰기 비용(40 × 1 KB posted write, 완료 지연 상한 미지), C−A가 순이득. 기대 ≤ ~0.5 % [유도] — A/A 팔 필수, 라운드 많이. base 빌드는 박스 `~/repo/bloomery-shadowhost-base`.
+- pinned 매핑이 카드 메모리 2 MiB를 가져간다(`cuMemGetInfo`, 프로브 `scratchpad/shadowhost/pinprobe2.py`) — 배치의 카드 항에 없다(XS, 여유 안이라 지금은 안 막는다). 프로브는 `tools/`로 올릴 후보(S).
+- `crates/gpu/src/hybrid.rs:681-706`, `798-823` `Boundary` 창을 반납하지 않아 `Arc<CudaContext>` 참조가 샌다 — `DeviceTensor::release`로(S). `crates/model/src/arch/deepseek2/scratch.rs:160-169` `param_view` 같은 누수(S).
+- `bloomery_serve_ds41.rs:182`·`bloomery_chat.rs:266` plan/load 줄에 `host_shadow`/`shadow=host`가 없다(XS). `chain/attn.rs:120-122` `AttnIo.shadow` 문서에 "호스트 메모리"(XS).
+- 링을 k 슬롯 과할당하면 k 이하의 cut은 복원이 필요 없다(exllamav3 `cache/dsa.py:24-27`의 `guaranteed_rollback`; k=768이면 ≈30 MB [유도]) — geometry·커널 변경(M).
+- 리스 대기 헬퍼 스크립트(체인 실수 방지 — 이번 라운드가 `| tail -1 &&`로 잡힌 리스 아래 clippy를 한 번 돌렸다)(S).
+
+### 라우터 NaN (nanmoe 보고, 2026-09-24 — 수정은 `88de92e`)
+
+- `crates/qdot/src/lib.rs:521-540` AVX2 q8_K 인코더가 NaN이 든 블록에서 `x[256]`으로 panic한다(hot list 3090 arm에서 실측). 스칼라 쌍둥이(`:407`)는 NaN을 건너뛰어 두 인코더가 비트 동일하지 않다(S).
+- `crates/gpu/src/lib.rs:347`, `fused.rs:188`, `q5.rs:332` `if amax > 0.0 { amax/127 } else { 1.0 }` 세 벌 — 전부 NaN인 행을 0으로 읽혀 serve의 NaN 검사가 못 본다(로짓이 전부 0 → 토큰 0). 비유한 행은 비유한 값으로 흘려보내 서버가 잡게(S).
+- `crates/gpu-deepseek41/src/router.rs:~200-270`과 `experts_mxfp4.rs:~590-650` 마지막 블록의 선택·가중치 본문이 두 벌(R14, M).
+- `gate_deepseek41_step.rs:220`·`gate_deepseek41_long.rs:68` `GREEDY_MARGIN` 중복(XS). `gate_deepseek41_moe.rs:639-647` f64 참조 `weights64`에 가드가 없다(XS).
+- `tools/ref/dump_ref.cpp:616` `on_tensor`에 탭 필터가 없어 321토큰 배치 하나가 47 GB를 썼다(S). `tools/ref/dump.sh:175-177` 실패한 덤프의 `.staging`이 남고 목록에 안 잡힌다(XS).
+- `chain/ffn.rs:597-613` `FfnTaps`에 라우터 입력(normed x)과 호스트 partial sum 핸들이 없다(S). `generate_ds41.rs:354,380` 모델 파일과 `PlanInputs`를 한 실행에 두 번 연다(XS).
+- 커버리지: shadowhost가 착륙해 gate 배치가 888로 돌아가면 `--free` arm은 pos 315에 닿지 않는다 — 그때부터 이 결함은 `--trigger` arm과 두 planted `all_underflow` 행이 지킨다.
+- 업스트림: ik의 같은 결함은 라운드 `iknan`이 FAIL-first 중(사용자 09-24 "오픈으로 올리자"). ik `logf(1.0f+expf(x))`(`ggml.c:3410`)를 `log1pf`로 바꾸는 제안은 확률 비트를 넓게 움직이므로 PR에 넣지 않는다.
+
+### 닫은 가설 재판정 (revisit 보고, 2026-09-24 — 받을 라운드: 아래 순서)
+
+바뀐 조건 여섯(① 공개 `Q3_K_M` ② 뜨거운 목록 ③ ik 최신 ④ 검증 m ≤ 8 ⑤ A6000·두 카드 ⑥ 새 계측)을 대고 닫힌 가설을 다시 읽었다. 판정 RE-TEST 8, NEW 6. 수치는 전부 [유도]이고 조건은 원 보고(세션 스크래치 `revisit-report.md`)에 있다.
+
+- **R1 6행 합집합 읽기** [지금] — DSpark 45–48 tok/s 유도는 6행 검증 패스의 호스트 슬롯을 합집합(0.85)으로 셌는데, ktok의 "k행은 선형" 판정은 행마다 expert를 겹치지 않게 뽑은 팔에서 나왔다. 차이는 패스당 ~12 ms, DSpark +12–14 %. ① 오프라인: 라우터 추적의 연속 6위치 창에서 호스트 쪽 (층, expert) 합집합 ÷ 합 ② 비 ≤ 0.9면 `bench_v41_host`에 겹침 팔(`engine` 대 `engine-sep`). 겹쳐도 행당 ms가 같으면 합집합 서비스가 필요하다(`moe.rs:811` `ne1 == 1`, `EXPERTS_INTO_MAX`).
+- **R3 E10** [지금, 오프라인] — 층 l+1 적중률 h를 목록 배치의 호스트 몫만으로. h ≥ 0.4면 L3 선행 적재 설계 카드(M).
+- **R2 Q3_K 밀집 m ≤ 8 대역** [plainfile 1단계 뒤] — "~700 GB/s 근처 명령 수 = 0"은 V2-Lite Q4_K m=1에서 나온 규칙이다. m=6이 m=1 GB/s의 90 % 밑이면 m > 1 명령 레버 카드를 연다. DSpark 패스의 +4.7 ms 위험이 여기 걸린다.
+- **R4 스핀·park 깨움** [측정 자리] — 스핀 예산 판정은 락 시절 + SSE2 CPU 전용 측정이었다. `BLOOMERY_SPIN` 20000(×2 A/A)·200000·2000000 팔, 산문 512, 4바퀴. 이득 ≤ 0.9 ms.
+- **R5 0·1층 Q5_K `_sel`을 카드로** [공개 파일 뒤] — 순 −0.15…−0.4 ms.
+- **R6 목록 주장 확인**, **R7 DSpark 재유도**, **R8 rows % 4**(Q3_K K=1280 행 550 B — plainfile이 덮는다).
+- **N1** 공개 파일 뒤 카드 노출 절편 14.5 → 9.5–10.5 ms, (a) 41–45 tok/s — E21b 세 점을 공개 파일로 다시 잰다(~25분).
+- **N2** 그 뒤 카드 노출의 주인은 작은 런치(router·hc_pre·헤드·attn_seg·rms 3.51 ms) — 카드 경로 융합(트리아지 ⑤)을 B12 앞으로. 공개 파일 `nsys-gpu-ds41 512` 한 행으로 확인.
+- **N3** Q3_K engram 표(84.6 GB)는 70–75 %가 페이지 캐시에 남는다 — E1b·E9·E20을 한 자리에서. ~0이면 헬퍼 행 확인 라운드를 닫는다.
+- **N4** 우리 박스 (b′): 3090을 expert 전용 카드로 — +13…+20 %. 설계 카드(T2 열과 같은 라운드).
+- **N5 ik V4.1 최고 플래그를 찾은 적이 없다** — 공개 비교의 공정성. E21 자리에 ik 플래그 세트 3–4개(~20분).
+- **N6 E21 예측**: 3090 gate, 공개 파일, 33–38 tok/s.
+- 보고가 짚은 낡은 곳(XS): plan 「지금」 DSpark 유도의 합집합 가정, E19의 r = 1.21·1.29 채점(목록 뒤 1.52), ktok 판정 문장의 "겹치지 않게" 조건, `dsread-report.md:99` 드래프트의 BF16 token_embd 가정(공개 파일은 Q3_K — dsgraphc·dsloop가 본다), `v41-placement.md:361` 300 W, `gpu-design.md:9·37` "A6000 금지", attention 전부 Q8_0 서술(혼합 기준), 64개 목록은 n_l > 64에서 (a)를 거부.
+
+### 검증 패스의 호스트 합집합 서비스 (union6 보고, 2026-09-24 — `051d51e`; 받을 라운드: dsloop 앞의 설계 카드 M)
+
+- **잰 것**(라우터 추적 네 코퍼스, 혼합 파일, 뜨거운 목록 in-sample): 연속 k위치의 호스트 (층, expert) 합집합 ÷ 행별 슬롯 합 = k 2 0.90 · k 3 0.85 · k 4 0.81 · **k 6 0.753**(pooled; p10–p90 0.68–0.83), leave-one-out 목록 0.63–0.73, id 접두 0.61. 위치마다 독립 라우팅이면 0.93–0.95라 틀린 항은 독립 가정이다 — 연속 위치는 같은 expert로 간다. 플랜 유도의 0.85보다 겹침이 크다.
+- **오늘 경로는 그 겹침에서 얻는 것이 0이다**: (층, 행)마다 `serve_one` → `experts_into` 한 번(`hybrid.rs:1248`, `:1409`), 한 호출 한 열(`moe.rs:811` `ne1 != 1`), `EXPERTS_INTO_MAX = 8`, `MAX_ROWS = 2`. ik(`ggml.c` `mmid_row_mapping` → `iqk_mul_mat_moe`), exllamav3(`moe_mul1.cpp` "group token assignments by expert", K ≤ 8), mistral.rs(candle `repack.rs`, 32쌍 이상은 expert 버킷) 셋 다 expert별로 묶는다.
+- **값 [유도]**: 6행 패스 630슬롯 → 합집합 474, 슬롯당 0.13 ms로 ~20 ms/패스. 플랜 유도(535)보다 +8 ms 싸다. pairsvc의 기각(m = 2, φ 0.15–0.26 대 손익분기 0.72)은 다른 점이다.
+- **먼저 잴 것(리드, 임대 ~8분)**: `just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms engine:3,engine:3x4,engine:3x4u0.75,engine-sep:3x4u0.75,engine:3x3` — 오늘 행별 호출이 두 번째 읽기를 L3에서 받는지(`3x4u0.75` 대 `3x4`), 합집합 서비스의 바이트 대리값(`3x3`).
+- **필요한 것(M)**: handoff에 k 활성 열, `EXPERTS_INTO_MAX` ≥ 합집합(k 6에서 최대 36), distinct expert마다 m = k 열 커널(`ops.rs:410` `quantize_col`은 이미 열별), 행별 가중 scatter, `MAX_ROWS ≥ 6`과 층마다 모든 행의 go를 기다리는 동기화 — 어긋난 2행 설계와 부딪힌다.
+- 곁가지(보고): `bench_v41_host.rs:1612` `dispatches_per_token`이 16쌍 defer spill을 모델링하지 않는다(S); `hotlist-384.txt`는 in-sample이라 LOO에서 행당 호스트 슬롯 +19–56 — 목록 학습·평가 분리(S, E17과 겹침).
+
+### ik의 V4/V4.1 weights_sum 0/0 (iknan 보고, 2026-09-24 — PR 보류, MUL-7 후보)
+
+- **ik의 일반 추론은 안전하다.** SUM_ROWS→DIV가 퓨전되면 CPU `iqk_sumrows_div`(`iqk_cpu_ops.cpp:160`)와 CUDA `k_sum_rows_div_f32`(`sumrows.cu:51`)가 `sum > 0 ? 1/sum : 0`으로 막는다. NaN은 퓨전이 안 돌 때만 난다 — 모든 노드를 부르는 eval 콜백(우리 `dump_ref`), `-cuda fusion=0`[유도], 두 노드 사이 그래프 분할. 무패치 main에서 기본 배치·`-no-fmoe`·prefill+step 넷 다 유한, per-node 콜백만 `ffn_moe_weights_sum-35: found nan for i1 = 315`(rc 134, 혼합·공개 파일 둘 다). 우리 엔진은 퓨전 없이 나누므로 일반 경로에서 밟았다(`88de92e`로 닫음).
+- **패치는 한 줄이 아니다.** guard 분기(`llama-build-context.cpp:1567–1570`, upstream `8699d8aa`)에 DEEPSEEK4/41만 넣으면 SCALE 노드가 CPU 퓨전을 깨 V4 CPU 비트가 전부 바뀐다(316행, max|Δ| 8.3). 그래서 CPU에 SUM_ROWS→SCALE→DIV 퓨전을 더한 판(`fix2`)은 기본 경로 로짓·PPL·KLD base가 바이트 동일이지만, BailingMoE2/3·Step-3.5의 CPU 비트를 바꾼다(모델 없음, 재지 않음).
+- **판단: 지금 올리지 않는다.** 사용자 규칙(메인테이너가 감당할 만큼, 바로 올리는 것은 한두 줄 크래시·정확성뿐)에 비춰 디버그 경로 전용 NaN + 다른 아키 비트 변화 + stock 도구로 재현 불가(`llama-eval-callback`은 316 id를 356토큰으로 쪼갠다)는 즉시 PR 요건 밖이다. 대안: 열린 PR이 줄었을 때 이슈 하나로 알리거나, V4 쪽 다른 수정과 묶는다. 근본 대안 `log1pf(expf(x))`(≈ −87까지 0 아님)는 모든 비트를 바꿔 제안하지 않는다.
+- 증거: 박스 `/home/user/ik-nanfix`(패치, 커밋 없음), `/home/user/ik-nanfix-work`(재현기 `ids_eval2.cpp`, 로그), 세션 스크래치 `iknan/`(`fix2.diff`, PR 초안 112단어). 곁가지: ik `llama-perplexity`가 청크마다 `dsv4_build_raw_mask_view: Oops(KQ_mask_swa). mask is 1024 x 512` 출력(rc 0, 별건 후보).
+
+### DSpark C (dsgraphc 보고, 2026-09-24)
+
+- 노드 73 + 8w(예측 = 캡처, w 1–5: 81–113), append n 1–8은 8노드. 런치 항 [유도] A6000 w 5 ≈ 96–98 µs 재생; eager와의 차이는 `c_launch`가 모델에 없어 유도하지 못한다 — **리드가 잰다**(E-자리 후보: `propose` eager 대 graph, 같은 바이너리 팔).
+- 블록 업로드 6회 동기 514,604 B → 1회 비동기 12,844 B; append는 `(520 + 15360n)·4` B.
+- **공개 파일의 token_embd(Q3_K)**: 드래프트는 로드에서 이름으로 거부한다(조용한 오답 없음, 코드 독해). 고침은 S–M ~50–60줄 — `dspark.rs:455` `card_format`에 Q3_K 행 소스, 행 폭을 타입에 맞추고, 넓히기 런치를 Q3_K 행 디퀀트로(일반 n_sb Q3_K `embed_rows` 커널이 없다, `elem.rs:733`은 k 2048 고정). 타깃도 같은 가정(`chain/glue.rs:847` `want bf16`) — **plainfile과 묶는다.** dsref 세트는 bf16 임베딩으로 떴으니 다시 뜬다.
+- 곁가지: router·shexp gate_up이 행마다 한 런치(`experts_mxfp4.rs:1044`, `experts.rs:353`) — m행 판이면 w 5에서 24노드 → 6, ~15 µs [유도] (M); `ds41_glue_embed` 런처 두 벌(R14, S); `append`가 기다리지 않아 비동기 오류가 다음 `propose`에서 드러난다(디버그 레버 후보); prefill append(n > 8)는 eager.
+- 설계: mistral.rs와 같은 모양(폭별 사전 캡처 + 영구 텐서 복사, `speculative/target.rs:192`). exllamav3는 커널 노드 인자 갱신(`graph.cu:182`), ik는 매번 캡처 + `cudaGraphExecUpdate`.
+
+### Qwen3 성능 (qwen3perf 보고, 2026-09-24 — `3c00e39`)
+
+- 그래프 869 → 653노드(층당 18 → 13·14, exllamav3 ~13), 배치 프리필 m ≤ 8(토큰·마지막 로짓 = 한 토큰 경로 비트 동일), greedy 덤프 64개 md5 = base. Δ는 전부 [유도]: 레버 1–4 스텝당 −0.5…−1.0 ms, 프리필 2.1–3×. **리드가 E28(`just depth-gpu-qwen3moe`, 우리·ik·ikdef·mainline `llama.cpp-mainline` 53ed051ce)로 잰다.**
+- **점유율 변화**: `qwen3moe_gate_up_swiglu_q4k` regs 40 → 48, blk/SM 6 → 5(`slot / slots_per_col` 나눗셈 추정) — 표의 occupancy 부류라 timed A/B 1회가 필요하다. m = 1 분기로 되돌릴 수 있다(`experts.rs:55`, S).
+- **`q4k_gemv` 여러 열 경로는 K = 4096에서 열마다 1열 launch와 비트가 다르다**(col 0 1037/2048, max|d| 4.77e-7; K 2048은 같음) — `cores.rs:384` 문서의 "bit for bit" 주장이 거짓이다. 추정 원인은 누산 모양 차이(FMA 축약, 미확인). V4.1 밀집은 전부 m = 1이라 지금 걸리는 곳은 없다(plainfile 확인). 원인 규명 + 누산 통일 + 게이트 한 줄(M).
+- 곁가지: 3c(combine + 다음 층 norm_quant)는 `fused.rs:88` `norm_quant`에 코어가 없어 막힘(M, −0.1…−0.15 ms); `q6k_gemv` 행 코어 없음(`lib.rs:805`, Q6_K v를 qkv에 못 합침, M); `Q8Act` m ≤ 8이 프리필 패스를 막는다(`tensor.rs:120`, S–M); decode refresh의 동기 `copy_from_host`(`body.rs:372`, S–M); seg 패스가 n_kv·segs 블록을 전부 띄운다(`flash_gqa.rs:227`, ctx 32k에서 −0.1 ms, M); **serve의 `Generator::prefill`이 qwen3moe `prefill`을 안 쓴다**(`bind.rs:292` — 프롬프트 2–3× [유도], S–M); `gate_deepseek41_step.rs:2190, 2418`의 `top2`/`ppl`이 `kld`와 중복(S).
+- `GpuModel::run_rows`(model.rs, 덧붙이기 35줄)는 리드가 받았다.
+
+### 합집합 서비스 설계 카드 (unionsvc 보고, 2026-09-24 — 원문 세션 스크래치 `unionsvc-report.md`)
+
+- **호스트 쪽은 오늘 커널로 충분하다 [유도]**: 합집합은 곱셈 수(Σ m = 630)를 안 바꾸고 바이트만 × 0.753 — 곱셈/바이트 1.33배. 연산 천장 Q3_K 349 GB/s(단일 코어 10.9 × 32), Q4_K 496 GB/s라 DRAM 135 GB/s 대비 1.6–2.8배가 남는다. m열 디코드 1회 커널(ik 모양)은 필요 없다. 슬롯 16.77 MB = 0.124 ms.
+- **모양**: 오늘 행별 6행 630슬롯 78.1 ms / A lockstep 1 × 6열 474슬롯 58.9–63.0 ms / **B 두 그룹 skew 2 × 3열 535슬롯 66.3–66.9 ms**. 6행 패스도 skew가 된다 — 단위가 그룹이다.
+- **그러나 패스 시간은 카드가 정한다**: 오늘 카드는 행마다 한 토큰 런치라 C(6) ≈ 78–97 ms — 호스트 78 ms와 같거나 길다. 합집합의 20 ms는 패스에 안 보인다. **순서가 바뀐다: 검증 패스의 카드 m행 밀집(가중치 1회 읽기, m ≤ 8 K-quant gemv — 열마다 1열과 비트 동일이어야 skew 게이트가 선다, qwen3perf가 찾은 K 4096 여러 열 비트 틈) → 그 뒤 합집합.** 카드가 m행이 되면 B가 A를 이긴다(A는 카드 전·후처리 ~6 ms+를 직렬로 노출).
+- **비트 동일은 가능하다**: 내적은 같은 `dot_row`, 열 양자화는 열별 순함수(`ops.rs:392`), 합은 **열마다 슬롯 순서**(`moe.rs:937-941`) — expert 순서 scatter(`moe.rs:531-574`, 프리필)나 ik의 fma 누적을 그대로 옮기면 깨진다.
+- **라운드 둘(합쳐 L)**: `unionhost`(M — `experts_union_into`, defer를 다열 슬롯으로(`ops.rs:906-911`, `MAX_DEFER_SLOTS`/`GROUP_INLINE` 16), 호스트 hw 게이트(열마다 `experts_into`와 비트 동일, FAIL-first 둘), bench `union` 팔) → `uniongroup`(M — `hybrid.rs` 레인 × 열, `body.rs` `enqueue_groups`, skew 게이트 (lanes, cols) 일반화, (2, 1) = 오늘 Pair). dsloop 첫 팔은 오늘 행별 skew를 6행으로 넓힌 것(합집합 0). `unionhost`는 먼저 해도 손해 없다.
+- 결정 측정: bench `union` 팔(S) — 토큰당 ms ≈ union_bytes / 135 GB/s ± 5 %. 1.15배 넘게 느리면 결합 몫(defer) 먼저.
+- 정정: mistral.rs의 expert 묶음은 aarch64 전용, exllamav3 "K ≤ 8"은 비트 폭이고 행 상한은 `MAX_M = 4`.
+
+### 공개 파일 1단계 뒤 (plainfile·plainpin 보고, 2026-09-24 — `78fbe2a`, `50c6806`, `675e09f`)
+
+- **op 게이트 7개가 공개 파일을 형식에서 거부한다**(chain_glue·chain_attn·chain_ffn·engram·woa·moe·index — 첫 줄은 모두 `… is q3_K/Q3_K/q5_K, want q8_0`). 각자 ik의 Q8_0×Q8_2 규칙 전사와 밴드 유도를 품고 있어, q3_K×q8_K(ik CPU) 대 q3_K×q8_1(우리) 규칙을 새로 전사하고 밴드를 3요건으로 다시 유도해야 한다. 그때까지 새 커널(heads, q5k, shexp_q3k, 홀수 n_sb q_b, q3k 행·임베딩)은 step 게이트의 every-node envelope(비율 최대 1.041, 핀 1.5)와 argmax 일치로만 덮인다. **opgate1**(공유 K-quant 반올림 규칙 + chain_attn을 본보기로) → 나머지 여섯을 한 파동에 3–4개씩. **진행(09-24 밤)**: chain_attn `ed79667`, woa·index `0fb9b37`(index 게이트의 사각 — 심은 q_b 결함이 쿼리 밴드를 통과해 행 단위 핀을 더함), chain_ffn·moe `efb3350`(ik q8_2×Q4_K/Q5_K 점곱 전사, 규칙 핀 비트 동일). ~~남은 것은 chain_glue·engram(`opg-glueeng`)이고~~ chain_glue·engram `793ced2`(opg-glueeng, 09-24 밤: 공개 파일에서는 engram gain 둘도 Q3_K라 opgate1 목록에 없던 텐서가 적재에서 이름을 대며 멈췄다 — 엔진의 `CardFormat::of_role` 규칙을 게이트가 그대로 따르게 해 닫음; 무한대 밴드는 이제 실패; FAIL-first는 `q3k_row_dot_1col`의 마지막 super-block을 버린 결함으로 두 게이트 모두 빨강). **op 게이트 7개가 전부 공개 파일에서 초록** — 다음은 기본값 뒤집기 `pubflip`(스펙 세션 스크래치 `wave-m4/spec-pubflip.md`: `gguf::v41::DEFAULT`와 `deepseek41.sh`의 두 소유자, `gate-ds41-host`의 CLAMP_LAYERS 커버리지 핀을 합성 입력으로, 전체 V4.1 게이트 스윕, ik `--n-cpu-moe`를 파일별로[유도]). opg-glueeng이 남긴 것(보고만): `weights.rs:230` `load_where`가 `of_role`을 안 씀(K-quant gain을 적재하는 게이트가 엔진과 다른 형식을 받음, S); glue 게이트의 `project`·`bands`·`scale_rel` ~150행이 engram 게이트 사본(R14, M); `gate_deepseek41_engram.rs:1487` `Q8Act::with_k`를 토큰마다 할당(XS).
+- ~~**`gate-ds41-host`가 공개 파일에서 빨강**: `CLAMP_LAYERS = [38, 39]` 커버리지 핀, 공개 세트는 40층 전부 `clamp_hits 0`~~ 정정(pubflip): 공개 세트도 39층은 `u>L=1`이고 38층만 0이었다. 핀은 합성 클램프 검사로 교체(「공개 파일이 기본값」).
+- ~~`gate_mcol`이 공개 파일에서 거부될 것[유도]~~ 틀림(pubflip 실측): 모듈 문서대로 사이트를 타입별로 고르고 공개 파일에서 초록(q8_0·q3_K·q4_K·q5_K·q6_K).
+- `gate-qdot`의 q5_K 덤프는 혼합 파일에서 뜬 그대로다(두 파일의 q5_K 라우팅 텐서는 같은 형식, 바이트 동일은 안 쟀다).
+- Q5_K 밀집(0·1층 shexp down 둘)은 f32 활성화 한 열 커널이다. mistral.rs는 q8_1로 읽는다(`mmvq_gguf.cu:409`) — 텐서 둘이라 효과 미미, 약 80줄.
+- 공개 파일 드래프트의 token_embd(Q3_K) — dsgraphc 카드 그대로 남았다(타깃은 plainfile에서 풀렸다). **pubflip 뒤 공개 파일 스윕의 유일한 엔진 빨강**: `gate-gpu-dspark-kv`·`dspark-graph`가 `draft::load: token_embd.weight is not a card format for its use`(`draft/load.rs:266` 빌린 행 원천을 `Bf16Raw`로만 받음) — 카드 `dspark-q3k`(S–M): Q3_K 행 원천 + 그 뒤 `ref-draft/<DSREF_SET>` 재덤프(혼합 타깃의 bf16 임베딩으로 떠 있다면 — 미확인, 리스·승인).
+- 산문·주석 셋: `justfile:652-653` 한국어 주석(공개 파일이면 `ref-v41_plain`), `docs/BUILD.md:48` 혼합 경로 리터럴, `experts.rs` 문서의 "whose weights are q8_0".
+- placement 핀: 공개 파일 핀이 `PUB_*` const와 `PUBLIC` 리터럴로 흩어져 있다(파일별로 한곳에, ~40줄); 카드 예산 38 GiB 행만 정확값이 아니라 "사이" 검사다(정확값 핀 후보, S).
+- shadow 검사가 커널 이름 문자열에 기대는 것 — 이름 소유를 디바이스 크레이트 상수로(약 30줄).
+
+### V4-Flash 포트 (v4port 보고, 2026-09-24 — 조사만, 원문 세션 스크래치 `wave-m4/report-v4port.md`)
+
+- **형태 결정: (a) `arch/deepseek41`과 `gpu-deepseek41` 안의 변형.** V4와 V4.1은 KV 토폴로지·스텝 입력·적재 계획·사슬의 타입이 같고 값만 다르다(원칙 1). ik는 빌더 하나에 플래그 넷(`llama-hparams.h:167-191`), mainline PR은 `llama_model_deepseek41 : llama_model_deepseek4`로 둘 다 "V4 + 차이"다. 차이 여섯(같은 서브층 hc와 학습 헤드 `output_hc_*`, 헤드별 q RMS norm, CSA 겹침 풀링 + APE, 인덱서 전용 압축기 64헤드, 인덱서 없는 HCA 층, 앞 3층 해시 라우팅)은 층 종류 값과 모델 단위 값으로 표현되고 디스패치에 `if arch`가 없다. (b) 새 arch + 크레이트는 V4 코드 전에 이동 라운드 2–3개와 `body.rs`·`chain/` 약 6,700줄 이중 장부가 든다. 치르는 값: arch-split 원칙 3(디렉터리 이름 = 파일 문자열)의 예외 한 줄(v4meta가 `docs/arch-split.md`에 날짜와 함께 쓰고 `models-survey.md:239`의 "둘째 body" 문장도 같이 고친다), V4 전용 커널의 ICE가 V4.1 빌드를 깨뜨릴 수 있는 점(겹침 압축기처럼 V4만 쓰는 모듈은 cargo 피처 뒤로).
+- **파일**: `unsloth/DeepSeek-V4-Flash-0731-GGUF` `UD-Q3_K_M`, 1,328 텐서 128.07 GB. routed gate/up IQ3_XXS(층 26만 MXFP4), down MXFP4, dense Q8_0, hc F32, 라우터 BF16, 해시 표 I32. expert 하나 10,878,976 B(V4.1 공개 16,773,120 B). MTP 층 없음(드래프트는 별도 DSpark 파일). 층별 형식이 다르므로 `HostLayerSpec`·카드 스택은 텐서 이름이 아니라 층별 형식 표를 가진다.
+- **예측[유도]** `tok/s @ prose 512 뒤 n=96, A6000 plan (a), 뜨거운 목록`: 카드 expert ≈ 3,780 / 11,008(34 %), 호스트 다리 6.1–10.3 ms(목록 적중 0.55–0.70은 가정), 카드 전용 12.3–14.5 ms → **40–54 tok/s(중심 약 46)**, 접두 배치면 34–39. 병목이 호스트에서 카드 dense(Q8_0 7.33 GB/스텝)로 옮겨 간다. 가장 크게 빗나갈 수 있는 항: IQ3_XXS AVX2 실효 GB/s(135는 Q3_K/Q4_K 값) — v4host의 첫 산출물이 이 숫자다. 80 GB/s 아래면 밴드가 30대로 내려가므로 나머지 라운드를 계속 갈지 그때 다시 판정한다. 예측 5번의 "V4.1 공개 파일 카드 dense 약 3.9 GB"는 역산이다 — 박스 인벤토리로 닫는다(리드, XS).
+- **라운드**(각 ≤ M): {v4ref ‖ ~~v4host~~ v4host 완료 `55b5249`, 속도 미측정} → v4meta → {v4card ‖ v4comp ‖ v4hc} → v4idx → v4body → v4time. v4ref = `tools/ref/models/deepseek4.sh` + ik 덤프 변형(정본 오라클 ik, mainline은 교차 확인). v4host = qdot IQ3_XXS·MXFP4 AVX2(ik `DequantizerIQ3XXS`·`MXFP4_Unpacker`) + 스칼라 거울 + `host-rate.sh` 측정. R0 ik 덤프(128 GB 페이지인)와 v4time(약 40분)은 30분 초과 → 사용자 승인.
+- **공개 비교의 자리**: V4.1 llama.cpp 행은 lcpprun(PR #28696 arm)이 만든다. V4 포트는 PR 브랜치가 아닌 mainline과의 깨끗한 행을 위한 병렬 트랙이고 블로커가 아니다. mistral.rs에는 V4 지원이 없다(`d5ae0f1`).
+- **스펙 밖 처분**: `check-arch.sh`의 아키텍처 목록 고정(qwen3moe 경로가 새고 있었다) → 리드가 지금(디렉터리에서 목록을 읽고 디스패치 항목 둘 추가). `models-survey.md:48,:168` 낡은 문장 → 리드가 지금 정정. `moe.rs:967,:980` 융합 커널 없는 형식의 조용한 `dequant_row` 폴백 → v4host 스펙(거절 또는 `load` 줄에 형식별 경로; 없으면 첫 타이밍이 느린 경로를 잰다). `hc_f32.rs:6-7` 토큰당 블록 하나 → v4hc 스펙(split-K F32 hc_pre).
+
+### Qwen3 레버 지도 (qwen3fast 보고, 2026-09-24 — 조사만, 원문 세션 스크래치 `wave-m4/report-qwen3fast.md`; 아래 µs·ms는 전부 [유도], nsys 없음)
+
+- **바닥**: 토큰당 1,919.6 MB(expert 1,097 · 밀집 567 · 헤드 255), 720 GB/s에서 2.67 ms(375 tok/s). 오늘 4.855 ms(E28, 깊이 6) = 바닥의 55 %. 분해: 바닥 2.67 + 큰 커널 대역폭 적자 0.52 + 작은 커널 바닥 약 1.05 + 노드 틈 0.56(653노드 × 0.85 µs).
+- **순서**: ⓪ `qwen3prof`(nsys 러너가 배치 프리필 모델의 재생 수를 못 맞춰 rc 3 — SEED 모드, XS; 그 뒤 리드가 6/1024/4096 프로파일과 라우터 추적 u(k)) → ① `qwen3route` K1 라우터 16→128블록 + K4 헤드 argmax 융합(1블록이 608 KB를 읽음, `elem.rs:1055`) + K5 디바이스 상주 루프, S, 209–213 tok/s → ② `qwen3fuse` K2 작은 커널 융합 653→약 410노드, M, 238–250 → ③ `qwen3bw` K3 큰 커널 대역폭(down `_sel`은 K=768이라 full iteration 0, 꼬리 경로만 24/32레인 — `cores.rs:307-350`, V4.1의 짧은 K에도 걸린다), M, 253–270 → ④ `qwen3spec` m행 검증 패스 그래프화(`prefill.rs:175-188`이 eager) + 합집합 expert 커널 + EAGLE-3, L → ⑤ IQ4_XS, ⑥ 메가커널 XL(3.30–3.55 ms).
+- **기각**: L2 퍼시스턴스(6 MB에 들어가는 뜨거운 텐서 없음), Q4_0(발행 바운드 아님), Qwen3-0.6B 드래프트(손익분기 α 0.56–0.62).
+- **투기적 디코딩**: 128/8 MoE는 k토큰 검증 바이트가 k에 거의 비례해 EAGLE-3 이득이 +9–24 %이고 엔진이 빨라질수록 준다. 크게 곱해 주는 것은 수락 길이가 긴 DFlash뿐인데 Instruct-2507용 공개 드래프터가 없다(Coder-30B-A3B용은 있음, 코드 τ 6.4–8.1). mainline에도 EAGLE3·DFlash가 들어와 있으므로 공개 비교는 투기 대 투기로.
+- **사용자 결정 목록**: EAGLE-3 체크포인트(lmsys SpecForge-Nex, 0.2B) 다운로드, IQ4_XS 파일 다운로드, DFlash 타깃을 Coder-30B-A3B로 둘지 드래프터 학습인지.
+- **mistral.rs**: 박스 바이너리(09-17 빌드, cuda, flash-attn 없음)에 qwen3moe GGUF 로더가 있고 `mistralrs bench --depth`가 있다 → `depth-qwen3moe.sh`에 `mrs:<D>` 팔(qwen3prof와 같은 도구 라운드). MoE 디코드는 층당 4런치, down에 topk 가중 + atomicAdd(비결정).
+- **스펙 밖 처분**: qwen3moe 프로필의 `LCPP` 기본값이 V4.1 PR 브랜치였다 → 리드가 mainline으로(`5cdb7a5`). 나머지(`nsys-gpu.sh:78-86`, `elem.rs:1055`, `cores.rs:307-350`, `prefill.rs:175-188`)는 위 라운드로.
+
+### 커널 리뷰 넷 (kr-dense·kr-moeattn·kr-cpu·kr-research 보고, 2026-09-24 밤 — 읽기 전용, 원문 세션 스크래치 `wave-m4/report-kr-*.md`)
+
+기준 행은 `$BLOOMERY_DATA/nsys/nsys-ds41-d6-n8-101249.sqlite`(A6000, 공개 Q3_K_M, 배치 (a), 뜨거운 목록, 깊이 6, n 8, 재생 13회, 프로브 켬)이고 아래 µs는 그 행을 스텝당으로 나눈 실측, ms 이득은 전부 [유도]다. nsys 아래 스텝 31.6 ms = 카드 임계 경로 8.56 + 브리지(handoff 끝 → post 시작) 24.06. rig-log의 "커널 합 13 ms"에는 호스트 그늘 안의 커널 ~4.4 ms가 들어 있다 — handoff 뒤부터 `ffn_post_streams` 앞까지(공유 expert gate·up·down, 카드 `_sel`, Q5_K f32 gemv)는 지금 스텝을 줄이지 못한다. 브리지는 **36.0 + 119.5·k_host µs**(k_host 2..6 다섯 구간 p50이 ±0.3 µs 안에서 직선; 기울기는 expert 16.78 MB 기준 140 GB/s)라 프로토콜 바닥은 21–36 µs × 40층 = 0.8–1.4 ms다.
+
+**밀집 경로의 진단(kr-dense — 앞선 "Q3_K는 명령 수 천장" 판정을 뒤집는다).** m=1 루프(SASS)는 워프 반복당 104명령·LDG 11개로 220 B를 처리해 발행 천장 ≈ 1.28 TB/s[유도]이고, 같은 몸통으로 `engram_wkv`(6144→25600, 3200블록)가 674 GB/s(피크 768의 88 %)를 낸다. 느린 것은 런치 형상이다: 워프 하나가 행 하나를 끝까지 걸어 K가 곧 직렬 사슬(iters = n_sb/2)이라, 작은 격자는 적재 지연에(T ≈ 1.16 + 0.47·iters µs — 32행 70 KB 5.90 µs 대 512행 1.13 MB 6.29 µs, 바이트 16배에 시간 7 %), 큰 런치는 꼬리 파동에 묶인다(T ≈ 꽉 찬 파동 바이트/674 + T(iters); wo_a heads 25.97 예측 대 26.07 실측, wo_b 29.7 대 31.74; 상주 504블록 = regs 40 → SM당 6 × 84). `q3k_gemv` "평균 18 µs"는 여덟 형상의 섬임이다 — 18 MB 런치 80개(q_b·wo_b, 각 31 µs, 시간의 74 %)와 7 µs 107개. `q6k_gemv` 헤드는 700.5 GB/s로 천장이라 헤드 안에서 얻을 것은 없다. `plan-ledger.md:718`의 "Q3_K 클래스 천장 = 디코드 명령 수 598"(3090, V2-Lite 4회 반복 walk)은 이 산수와 맞지 않는다(598이면 발행 47 %) — 3090 형상을 다시 유도하지는 않았으니 **suspect**로 두고 재유도 후보에 올린다. 지우지 않는다.
+
+**순위** — 임계 경로 위이고 비트 동일인 것이 앞. 이득은 겹친다(D1/D3 같은 런치, D2/X1 둘 다 norm의 출력, A1/D6/H1 같은 커널)고 D2·D3·D6·J1·J2의 크기는 suspect라 **더하지 않는다**. 42.9 tok/s = 23.3 ms이고 45는 −1.1 ms, 50은 −3.3 ms다: 45는 유도로 비트 동일 라운드 둘(`ds41router` + `ds41dense`, −0.75…−1.3 ms) 안이고, 50은 미측정인 J1·S1과 suspect인 D2·D3·D6에 달렸다. 라운드마다 예측 파일이 주장이다.
+
+| id | 무엇 (path) | 실측 | 이득[유도] | 클래스 · 증명 | 크기 | 처분 |
+|---|---|---|---|---|---|---|
+| R1 | 라우터 `router.rs:125-143`·`q8f32.rs:170-194` — 행마다 warp 하나, lane당 8원소 펼침 → k=5120 직렬 20반복, f32 상주(bf16의 2배) | 21.56 µs × 40 = 862 µs, 전부 임계, 365 GB/s | 적재 폭 32 + 4-warp 96블록: ~~~8 µs → −0.4…−0.55 ms~~ 정정(ds41router, 09-24 밤): 8 µs는 f32 7.86 MB의 바이트 바닥(10.2 µs @768 GB/s) 아래다; ptxas가 32적재 묶음을 ~24깊이 창으로 바꿔 lane당 동시 ~12청크 → ~15 µs, **−0.26 ms[유도]**. 다음은 bf16 상주(B8) 또는 벡터 적재+셔플 | 비트 동일(bf16→f32 정확, FMA 순서 그대로) · 라우터 게이트 핀, `sass-scan` 첫 대기 전 LDG ≥ 32, A/B 1회. `f32_lane_partial_1col`은 V2-Lite `f32_gemv`와 공유 — 넓은 형제를 두거나 V2-Lite 핀이 서는 것을 증명. 32 w + 32 x는 누산기 전 64 regs — ptxas 점유율을 스펙에 | S | ~~**`ds41router`**~~ 머지(`dd5422b`; M2 `dflash_router` 같이, N1은 분석만 → `loudnan`). A/B는 시팅 4 |
+| D1 | 같은 q8_1 활성을 읽는 투영이 따로 직렬 런치 `chain/attn.rs:1153-1154,1232,1390`(q_a·kv K=5120), `:1573,1576`(compressor kv·gate), `:1530`(proj), `:1414/:1521`(indexer q_b) | kv 6.29 µs(사슬), compressor 7런치, proj 5.90, idx q_b 6.58 | kv −252 µs, compressor −43, proj −47, idx q_b −26 → **−0.33…−0.37 ms**; 합친 q_a+kv 1792행 3.94 MB ≈ 7.5 µs(대역 바닥 5.85) | 런치 수 · 행마다 같은 코어·같은 행이라 비트 동일. 적재 때 행 연결(전부 Q3_K, 행 2200 B 정렬 유지) + y 창. **Q3_K에만** — 혼합 파일의 Q8_0 attention 경로는 그대로(op 게이트 7개가 거기서 돈다); chain_attn의 형식별 런치 수 핀은 날짜 달아 재핀; 노드 수 핀 재핀, e2e 토큰 동일, A/B 1회 | S | **`4953fdb`**(ds41dense, 아래 「밀집 경로 셋」): 네 사이트 전부 접음, 런치 −59(예측 −63 — 게이트 압축기는 7층이 아니라 4 소스층 중 3), ~−0.34 ms[유도], 비트 동일(구성상) |
+| D2 | `norm_quant` 1블록 `fused.rs:125,155-241,577` — phase A L2 왕복 5, phase B 워프당 5 | 층당 셋 × 40 = 746 µs, 전부 handoff 앞(임계); K=5120 7.33 µs 대 K=1280 3.71(바이트 4배에 시간 2배 → 왕복에 묶임) | ① phase A 적재 20개 전부 먼저 ② phase B 5블록 적재 먼저(또는 smem 20 KB) ③ 1024스레드, phase A는 앞 256만 → 7.3 → ~3.5, 3.7 → ~2.3 µs = **−0.36 ms**. 왕복 0.35–0.5 µs는 가정(**suspect**) | 적재 순서만 → 비트 동일 · `rms_norm`↔`norm_quant` 게이트 + A/B. **먼저** `clock64` 도장이나 두 배 탐침으로 왕복 값 | S | **`4953fdb`**: 1024스레드 + phase A 20적재 배치. clock64 왕복 ≈ 190 사이클(~0.11 µs @1.7 GHz 가정)로 스펙 가정 0.35–0.5 µs가 틀린 항 — phase A K=5120 2134–2168 → 1361–1403, phase B는 양자화기 직렬 사슬(시간의 ~80 %)이 지배, 이득 재유도 **~−0.16 ms** |
+| D5 | argmax 256스레드 1블록 `elem.rs:47,641-700,1055` — 스레드당 505개 strided L2 적재 ~109 ns | 55.09 µs/스텝(V2-Lite 42.73 = 400 × 107 ns가 같은 기울기) | 1024스레드 −40 µs(Qwen3 −48); 여러 블록/헤드 융합 −51…−62 | `argmax_take` 전순서 → 비트 동일 · `gate_p4 argmax_geometry` | XS | **`4953fdb`**: 1024스레드(argmax·argmax_rows), 주석도 모델별 어휘로; 이득 −40 µs[유도]는 A/B |
+| A1 | attention 쪽 HC_PRE `chain/attn.rs:1145`가 9단계 HC_POST만 소비하는데 임계에 직렬 | 10.97 × 40 = 439 µs | 캡처 안 갈래 스트림 → −0.3…−0.44 ms(경합 전); 가지마다 `HcPreScratch`(티켓 포함) 따로 | 그래프 토폴로지 · 비트 동일, 노드 수·eager=replay 핀 + A/B | M | **`ds41hcbranch`** (D6·H1 동봉: 마감 블록 40항 직렬 합을 smem 한 번 + 24스레드 같은 오름차순 −60…−80 µs; ss를 warp 7로, Sinkhorn을 한 lane 16 regs로 ~−0.1 ms — 둘 다 사이클 유도라 먼저 `clock64` 분해) |
+| J1 | 재생의 첫 합류가 `cuGraphLaunch` 반환 뒤에야 서비스 시작 `body.rs:1618`, `model.rs:1105`, `hybrid.rs:1312-1345` | 브리지0 2.2–2.9 ms 대 층 1 0.82–1.02(같은 6 호스트 expert); launch 반환 +1.49–1.84 ms — **nsys가 launch를 부풀린다**(V2-Lite 648노드도 0.40 ms) | = t_launch_return − t_go0, 상한 ~1.3 ms, **크기 미측정** | 호스트 디스패치(커널 불변) · 다른 스레드가 launch, 디코드 스레드는 곧장 `wait_go` · `go_early_first` 0/스텝, launch 앞뒤 `Instant`, A/B. B5(b2b) V2-Lite 항목과 같은 항 | S | ~~`ds41join`~~ **`075ceef`**(ds41join, 09-24 밤 — 아래 「첫 합류 launch 스레드」): 크기 = launch 호출 0.33–0.50 ms/스텝(3090 기능 실행, 바쁜 박스 — timing 아님), 레버 on에서 first_serve_lag 0.5 µs. 이득의 판정은 리드 A/B 세 팔 |
+| S1 | 스텝 사이 카드 유휴 350–540 µs(마지막 커널 → 다음 launch 300–490, launch → 첫 커널 45–65); 공급 스텝 사이는 56–75 | phistat `eng_wait_us` 407–460과 크기 일치 | −0.3…−0.45 ms = ㊳ ①(engram 조회를 0층 attention과 겹치기)에 수치만 보탬 | ㊳ ① | M | 적재 라운드(㊳) |
+| D3 | m=1 형상: 행 하나 = warp 하나, K 분할 없음 `lib.rs:1199-1208`→`cores.rs:834-880`, `dense.rs:205-234` — wo_b 1.27파동(136블록이 16반복을 GPU 73 % 빈 채로), wo_a heads 2.03파동 | 꼬리 초과 wo_b 5.0, wo_a 4.7 µs | split-K 2 또는 적재 선행 2로 절반, split-K 4면 ~3/4 → −0.2…−0.3 ms(80런치); D1 뒤 남는 합친 작은 런치에 split-K 4 추가 ~−60 µs. **V4.1 형상에서 재기 전 suspect**(V2-Lite 꽉 찬 점유율에서 "펼침 평평" 원장과 모순 아님) | (i) split-K: float 순서 — σ 진단, e2e 카운트 핀, `q3k_gemv`↔heads/sel/융합의 비트 동일 묶음도 함께 옮기거나 끊는다고 명시, **dskq의 "m열 열 c = 1col" 성질 때문에 m열 몸통도 같이** (ii) 적재 선행 `Q3K_ITER_UNROLL=2`: dskq가 Q4_K 펼침이 FMA 수축을 바꾼 것을 찾았으므로 `fma_rn`/`mul_rn`을 소스에 먼저 박고 `gate_p1` 해시; regs 40 → ~56이면 SM당 4블록 — 점유율 계산 필수 | M | 다음 파동 카드(참조 셋 모두 K를 워프 여럿에 나눈다: llama.cpp 4, ik 4, mistral.rs 8 — 폭은 재서 정한다) |
+| D4 | 홀수 n_sb의 마지막 반복 `cores.rs:864-873` — K=1280(n_sb 5) 셋째 반복은 lane 16–31이 놀아 바이트 5/6(674×5/6 = 562 예측 대 580 실측; Q4_K shexp down K=2304도 505 대 487) | q_b 31.06 µs × 40 | → ~27 µs, −160 µs/스텝 | 홀수 n_sb에서 warp당 2행(16 lane씩) — lane별 누적 순서가 바뀌므로 float 순서 | M | D3와 같은 카드 |
+| A2 | V4.1 flash 과소 채움 `attn.rs:57,84,560-562` — grid가 W(128)·목록 stride(512)로 40블록 고정, 126 regs × 512 → SM당 1블록, 84 SM 중 40 (GQA식 죽은 세그먼트 낭비는 **없다**) | seg_sel 깊이 6 10.9 µs, ~1024 16.2 | V4.1 전용 SEG 32 → 80블록 한 wave → −0.12…−0.16 ms, **깊이 ≥ ~1024에서만**(6은 0) | float 순서(세그먼트 경계) · 오차 모델 + e2e 핀; `flash.rs` 공유 상수와 분리 | S | 깊이 시팅 뒤 카드 |
+| D7 | attention 쪽 양자화 런치 둘이 층마다 노출 — heads 입력(grid 256, 2.15 µs), wo_b 입력(grid 64, 2.24) | 176 µs/스텝 | wo_b 입력을 heads 커널의 128행 묶음별 마지막 블록 티켓으로 −90, heads 입력을 attn_merge 에필로그로 −86 | 같은 양자화기 몸통 → 비트 동일, 런치 수 | M | 카드 |
+| X1 | handoff 별도 런치 `chain/ffn.rs:164-215` | 3.66 × 40 = 146 µs 임계 | norm이 매핑 페이지에도 x를 쓰고 라우터 마지막 블록이 ids·sel·seq를 쓰면 −40런치 ≈ −0.1…−0.15 ms | = ㊵ P4 | S | ㊵ P4(수치 보탬) |
+| A3 | `flash.rs:505-513` `let src_row = $row;`가 단어 루프 안 → `ds41_attn_seg_sel`이 sel을 key 행마다 8번 재적재하고 매번 기다림(sass 첫 대기 전 LDG 1 대 접두 16) | 블록당 ≤ 0.3 µs | ~−10–20 µs/스텝 | 옮기기 · `ptx-scan`·`sass-scan` | XS | ~~`ds41router`에 동봉~~ 구현됐으나 **보류**(브랜치 `ds41router-a3`, `181e2f6`): 루프 LDG 32 → 18, 의존 왕복 16 → 2은 예측대로인데 regs 126 → 128(512스레드 상한)에 ptxas 스필 8 B가 생겼다(STL/LDL 한 쌍, 타일 루프 밖). `spill` 열을 읽는 게이트가 없어 main에 조용한 스필을 올리지 않는다 — 라우터 A/B의 셋째 팔(깊이 1024·4096에서 판정)로, 이기면 `_sel` 스필 래칫(`PIN`)과 함께 머지 |
+| Qm | merge의 load-branch-load 사슬이 두 곳 더: `flash.rs:2013-2030` `merge_row`(V2-Lite), `gpu-deepseek41/src/attn.rs:394-411`(V4.1) — qwen3deep이 GQA에서 고친 것과 같은 패턴 | — | V4.1은 세그먼트 수에 비례(깊이 6에서 작음) | 적재 순서만 → 비트 동일 | S | ~~`ds41hcbranch`에 동봉~~ **`ecaacdd`**(ds41hcfin): 16세그먼트 배치, LDG 3 → 48(첫 대기 전 46). `ds41_attn_merge` regs 18 → 80(blk/SM 3 → 1 — m=5 프리필 merge 320블록이 2 → 4파동[유도]), flash_merge 24 → 64, 프로브 쌍둥이 `flash_merge2_q8`만 스필 40 B |
+| E1 | 카드 `_sel`(gate·up 37 µs, down 28)은 살아 있는 카드 슬롯 k에 비례(k=1.74 평균, 한계 13.6 µs/expert = **745 GB/s**, down 632) — k_card ≤ 4에서 노출 틈 ≥ 98 µs(494 중 490) | 그늘 | ≈ 0 (k ≥ 5인 4/494만) | **손대지 말 것**. 카드 몫이 커지면(3090 DSpark) 슬롯 압축 목록 + live 행 grid-stride −3…−5 µs/런치 | S | 보류 |
+| D8·D9·E2 | shexp gate·up 두 walk 차례로(`dense.rs:274-275`, 556 GB/s), Q5_K f32 gemv 바이트별 u32 적재(344 GB/s), Q4_K 9 SB 셋째 반복(`cores.rs:334-373`) | 그늘 | ≈ 0 지금 (E2는 Qwen3 전 카드 down에서 임계 — 미측정) | — | S | 카드; E2는 Qwen3 `qwen3bw`에 |
+| D6·H1 | hc_pre 마감 블록 `hc.rs:536-567,593` — 40항 직렬 합 8개 묶음(L2 왕복 5), ss와 part 합이 같은 warp 0, Sinkhorn 20회가 `lane_sum4` 39번 사슬 | 11.04 µs × 80(attn 40 임계 = 442) | −60…−80 + ~−100 µs (사이클 유도, suspect) | 비트 동일(같은 순서) · hc 게이트 | S | **`ecaacdd`**(ds41hcfin, 아래 「hc_pre 마감·merge 배치」): 40항 배치 적재 + ss를 warp 7로 — clock64 T=1 finalize −28 %(−2867 사이클 ≈ −1.5…−1.7 µs/발사 × 40 ≈ −60…−67 µs/스텝[유도]). Sinkhorn one-lane은 9× 느려 폐기; 남은 병목은 Sinkhorn 4381 사이클(58 %) — 별도 카드 |
+| V1 | V2-Lite `router_topk` 1 warp 127 regs 8.4 µs + `f32_gemv` 6.95 | 층당 15 µs 임계 | ~−0.25 ms/V2-Lite 스텝 (Qwen3 레버 K1과 같은 모양) | — | S | 디딤돌 — Qwen3 `qwen3route`가 대신 |
+| D10·D11·D12·M1·N1 | q8_1 양자화기가 NaN을 0으로 삼킨다(`cores.rs:76-79` — `CHECK_FINITE`는 f32 스트림을 읽어 지금은 잡힘, 문서 한 줄); 홀수 n_sb `DeviceTensor` cols가 명목값(`lib.rs:1758`, 행 바이트 accessor 하나로); `dense.rs:218` 첫 적재 앞 64비트 나눗셈(= 위 ⑤ heads 항); `hybrid.rs:13-16,690-697` 문서가 V4.1(`handoff_target`, copy 노드 없음)과 `Word::Cnt(row)` 행마다와 모순; 라우터 lane 후보 전부 NaN이면 ids [0×6] 중복(하류가 중복 id를 가정하지 않는지만) | — | — | 문서·XS | XS | 각 라운드에 한 줄씩 |
+
+**좋은 것, 건드리지 말 것**(두 리뷰 합): Q3_K SWAR 디코드 + 정수 스케일 사슬 + 열당 FMA 하나(674 GB/s); q8_1 치환 저장(gemv의 q8 적재 전부 32-lane 연속); funnel 둘째 워드의 술어화 적재; `q6k_gemv` 헤드와 Q4_K/Q6_K의 소프트웨어 `half_to_f32`(천장·그늘); `argmax_take` 전순서; hc_pre 티켓·조각 순서·ctr 복원; `_sel`의 warp 균일 조기 종료와 id 거부; hybrid memop go/wait(행마다 64 B, 순번, `RELEASE`, poisoned); indexer top-k의 결정적 warp 스캔; `renorm_divisor` 하한 재계산 일치. soundness 결함은 두 리뷰 모두 찾지 못했다.
+
+**CPU 티어(kr-cpu)**: critical·high 없음. K5(전부 NaN 블록에서 AVX2 양자화기 인덱스 패닉, 스칼라와 불일치)·K6(소프트웨어 f16 → F16C)·K9(assert 순서)·K10(같은 몸 arm 병합)은 `v4host`에 실려 있다. STREAM 147.7 대 호스트 레그 135의 틈은 대부분 **잣대 문제**(147.7은 best-of-5, 같은 임대에서는 140–144) — `facts.md`의 STREAM 천장 주석 후보(K1). 32스레드에서 커널은 연산에 묶이지 않는다. 남은 것은 측정 시팅: K2 절편/기울기(`bench_v41_host --arms read-mmap:3,read-mmap:6,engine:3,engine:6` 16T·32T), K3 판별(`perf stat`, `THREADS=64`, THP), K8(`generate_ds41` 16 대 32 스레드).
+
+**연구(kr-research)**: 창 채우기 셋 — DSpark + 어긋남(56–63 tok/s[유도]), P1 예측 프리페치, Expert Deferral(손실) — 은 같은 호스트 유휴 창을 채우므로 **대체 관계**다, 더하지 않는다. 비용 인지 k 정책(Cascade·EVICT류) +5–15 %[유도]. V4.1의 hc-lag 겹침 가능성은 참조 `model.py`를 읽어 확인한다.
+
+**dskq가 남긴 것(보고만, `ad38bc0`)**: `arch/qwen3moe/proj.rs:99-101,156-158` m > 1에서 열마다 `q4k_row_dot_1col` 재실행 — 이제 `q4k_row_dot`가 비트 동일이니 되돌릴 수 있다(~20줄 + A/B, S); `q8f32.rs:657,704` `gemv_lane_sums`/`store_sums`가 `dense.rs`의 `col_sums`/`store_cols` 사본(R14, −60줄, S); `ds41_q3k_gemv_heads_mcol` 80 regs 3 blk/SM — `col_stride` const generic(M, 측정 필요); `tensor.rs:157-163` `Q8Act` m ≤ 8 상한이 gemv 제약인데 타입에 묶임(heads 배선 선행, XS); R29 `q4k_row_dot_1col` 합 순서 암묵 수축(cuda-oxide rev가 바뀌면 `gate_mcol`이 잡는다); `q4k_gemv` 48 → 40 regs(5 → 6 blk/SM)는 점유율 클래스라 **A/B 1회**가 남았다 — 박스에 base 트리(`bloomery-dskq-base`, `45ed364`)를 지어 같은 임대에서. 배선 hunk(§7)와 토큰 우선 배치 결정은 검증 패스 라운드로.
+
+**라운드 순서**: ~~`ds41router` ‖ `ds41join`(측정)~~ 둘 다 착륙(`dd5422b`, `075ceef`) → ~~`ds41dense`~~ `4953fdb` → ~~`loudnan`(카드 NaN 폴트 워드 + spill 래칫, 진행 중)~~ `5fe50f6` → `ds41hcbranch`(A1 갈래 스트림만 남음; D6·H1·Qm은 `ecaacdd`) → D3/D4 카드(float 순서) — 둘 다 파동 21(09-25 새벽, `ds41hcbranch` ‖ `ds41splitk`; hcbranch가 먼저 머지, 비트 동일이라 그 뒤 hc 게이트 빨강은 splitk 몫). ~~박스 동시 ≤ 4.~~ 09-25: plan.md 「파동」의 다섯 이상(사용자 09-24)이 정본이고, 빌드는 시차를 두어 띄운다.
+
+**사용자 판단 대기**(깨어나면): ① Expert Deferral — 손실 있는 기법이라 켜는 것은 사용자 결정 ② 다운로드 둘 — EAGLE-3 체크포인트, Qwen3 IQ4_XS 파일 ③ DFlash 대상 — Coder-30B-A3B에 얹기 vs 드래프터 학습 ④ V4 R0 전체 덤프(128 GB 페이지인)와 `v4time`(각 > 30분) 승인.
+
+### 라우터 폭 (ds41router 보고, 2026-09-24 밤 — `dd5422b`; A3는 `181e2f6`, 브랜치 `ds41router-a3`; 예측 파일 사본 세션 스크래치 `wave-m4/ds41router-predict.txt`)
+
+R1을 넣었다: `f32_lane_partial_1col_w32`(32청크 적재를 먼저, 같은 fma 합 같은 순서, 32 → 8 → 1 꼬리)로 `ds41_router`(그리드 48 → 96)와
+`dflash_router`(16 → 32)가 걷고, 블록은 128스레드다. ptx-scan은 두 엔트리만 바뀌었고 라우터·moe·chain_ffn·dspark·step·skew·long·e2e 게이트가
+전부 초록이다(리드 재실행은 아래). **예측이 틀린 항**: 레지스터 74–80 예측 대 실측 38, 첫 대기 전 LDG 64 예측(스펙 하한 32) 대 실측 24 —
+PTX에는 `ld.global` 64개 뒤 `fma` 32개가 그대로인데 ptxas가 ~24깊이 슬라이딩 창으로 재배열했다(24×LDG, 그 뒤 FFMA마다 LDG 1–2). 그래서
+lane당 동시 청크는 32가 아니라 ~12이고, 재유도는 발사당 ~15 µs(gemv 13.3 + 선택 꼬리), **−0.26 ms/스텝[유도]**(스펙 −0.4…−0.55). 스펙의
+8 µs는 f32 가중치 7.86 MB의 바이트 바닥(10.2 µs @768) 아래였다 — 다음 라우터 레버는 bf16 상주(B8)나, 비트를 지키는 벡터 적재 + 셔플
+재분배로 ptxas 창을 넘는 발행 깊이(L). 「커널 리뷰 넷」의 "45 = router + dense" 합은 dense가 착륙하면 다시 더한다.
+
+`sass-scan`의 두 하한(첫 대기 전 ≥ 32, A3 ≥ 8)은 계측기 값이라 게이트로 걸지 않았다; A3의 ≥ 8은 gather라 구조적으로 못 닿는다(워드 적재가
+인덱스 적재를 기다린다 — 실측 2). 남긴 것(보고만): `_w32`의 8폭 꼬리가 `f32_lane_partial_1col` 본체 사본(R14, `#[inline(always)]` 공통
+꼬리로, M); `dflash_router`가 `ds41_router` 본체 사본(R14, const generic 코어, M — nanmoe도 같은 항); `launch_bounds`/`launch_contract` 블록
+리터럴이 다른 커널에서 상수와 안 묶임(S, grep 라운드); **ptx-scan `spill`/`jit_local` 열을 읽는 게이트가 없다**(`gpu-gates lib.rs:1559`
+`no_local_depot`는 PTX만 — 이번 스필을 어느 게이트도 못 봤다, S → `loudnan`에 동봉); `tools/sass-scan.sh` 부분 문자열 필터(`ds41_attn_seg`가
+`_sel`까지, XS); `flash.rs:860` 인자 11/7(R8, 기존).
+
+### 첫 합류 launch 스레드 (ds41join 보고, 2026-09-24 밤 — `075ceef`; 예측 파일 사본 세션 스크래치 `wave-m4/ds41join-predict.txt`; 선임이 세션 종료로 죽고 후임이 마무리)
+
+J1의 측정 라운드. 레버 `BLOOMERY_LAUNCH_THREAD=1`(기본 off, 비트 불변)이 스텝의 `cuGraphLaunch`를 open 때 띄운 `Launcher` 스레드에 넘기고, 디코드 스레드는 곧장 첫 서비스의 `wait_go`로 들어간다. 실패한 launch는 플래그로 모든 대기 중 서비스에 닿아 launch 자신의 오류로 돌아온다(FAIL-first: 플래그 검사를 끄면 서비스가 10 s 데드라인까지 기다린다). `cuGraphUpload`는 instantiate 직후(mistral.rs `cuda_graph.rs:895`와 같은 자리; exllamav3에는 graph도 launch 스레드도 없다 — 자식 프로세스 job ring + `cuStreamWaitValue32`). 계측은 `HybridStats::first_serve_lag_ns`와 `LaunchStats`(launch_ns·wake_ns)이고 `generate_ds41 --stats`의 `stat step`/`summary`에 `go_early_first launch_us first_serve_lag_us launch_wake_us`로 찍힌다. 러너 `depth-ds41.sh`는 `<D>@NAME=VALUE[,…]`(같은 바이너리 레버 팔)과 `bin:<path>:<D>`(base 바이너리 팔)를 받는다; nsys sqlite 판독기 둘(`nsys-table.py`·`nsys-bridge.py`)이 커널별·재생별(launch, call→k0, 임계, 합류, 브리지, 유휴) 표를 낸다.
+
+**측정(3090, gate 배치, 바쁜 박스, n 32 — timing이 아니다; 예측의 조건인 A6000·배치 (a)도 아니다)**: launch 호출 스텝당 307–575 µs(평균 328–502; 예측 0.25–1.0 ms 안) — J1의 "크기 미측정"이 이 값이다. 레버 off는 `first_serve_lag = launch + 0.3…1.5 µs`, on은 0.2–1.6 µs(`go_early_first` 1.000 → 0.000). 세 실행의 토큰 md5 동일. **판별 안 된 것**: 메인 고정 + 레버 on에서 `leg_us p50`이 29.4 → 31.0 ms로 올랐고(spin 판 31.8) 메인 float + on은 29.4 — 가설은 launch 호출 꼬리(~480 µs)가 sibling에서 0층 서비스와 코어를 나눈다는 것. 선임의 첫 판은 launch 스레드가 고정된 메인의 cpu를 물려받아(`launch_cpus=1`, wake 3 ms, `go_early_first` 0.355) 레버가 스스로 느려졌고, 후임이 SMT sibling 이동 + armed spin → yield로 고쳤다(spin 판은 같은 hw thread의 engram helper와 경합해 `eng_wait` p50 454 → 2104 µs).
+
+~~**리드 A/B(시팅 5)**: `just depth-gpu-ds41 6 6@BLOOMERY_LAUNCH_THREAD=1 6@BLOOMERY_LAUNCH_THREAD=1,BLOOMERY_PIN_MAIN=0 lcpp:6` + `bin:/root/repo/bloomery-ds41join-base/target/release/generate_ds41:6`(5712f25 base, upload·계측의 순수 비용). 셋째 팔이 위 `leg_us` 상승을 판별한다.~~ **쟀다(09-25 새벽, A6000, 공개 파일, 목록 없음, lcg 깊이 6, 3바퀴 — rig-log [09-25#launch-thread-lever-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#launch-thread-lever-ab))**: 레버 on +0.96 % ± 2.1 %, on + 메인 float −1.2 % ± 3.4 % — 셋 다 구간이 0을 품고, 3090의 "고정 + on이 느려진다" 방향은 A6000에서 안 나왔다(on이 세 바퀴 모두 위). 기본값 off 유지, 옵트인으로 둔다; 1 % 아래를 가르려면 팔당 ~23바퀴라 지금은 열지 않는다. `bin:` base 팔은 돌리지 않았다(upload·계측의 순수 비용은 미측정). 브리지 분해는 A6000 nsys 행이 필요하다(`nsys-bridge.py`).
+
+**남긴 것(보고만)**: nsys 판독기 이중 소유 — `tools/ref/nsys-ds41.sh --analyze`(52–160행)가 이미 층별 브리지·커널 표를 계산하고 새 도구 둘에만 grid/block 분리·launch 구간·임계·유휴가 있다 → 한 곳으로(S); affinity 코드 세 벌(`threads/src/lib.rs:514,596`, `engram/src/prefetch.rs:491,503`, `gpu/src/model/launcher.rs:254,313`) → `bloomery-threads` 공개 helper 하나(M); `glue.rs:1095`·`prefetch.rs:466`의 `caller_sibling() == None`이 "float"라 적혔지만 실제로는 opener의 한 cpu 마스크를 물려받음 — launcher에서 고친 것과 같은 부류(S); `ChainBody::serve_replay`가 인자를 안 받아 replay watch가 thread-local로 전달됨(`hybrid.rs:1151-1170`, trait 인자로 M); OS 거부용 `GpuError` variant 없음(affinity 오류가 `shape`를 씀, S); cuda-oxide PTX 모듈 머리의 정적 심볼 번호가 host 전용 변경에 움직임(`.oxart` 2481920 → 2482032; 엔트리 md5는 동일) — ledger 후보, `ptx-scan` 머리줄에 정규화 모듈 md5(S); `launcher.rs:92` `ARM_SPIN` 이름(yield로 바뀜, XS); sibling 테스트가 cpu 0에 SMT를 가정(XS); `depth-ds41.sh:149` 박스 트리에 `.git`이 없어 `head=?`(XS); `Instant::now()` 스텝당 2회 무조건(미측정, XS). no-SMT 코어의 opener에서 레버가 이름 붙은 오류로 거부하는 것은 리드가 **채택**(조용한 실패 금지).
+
+### 카드의 조용한 NaN → 폴트 워드, 스필 래칫 (loudnan 보고, 2026-09-25 새벽 — 예측 파일 사본 세션 스크래치 `wave-m4/loudnan-predict.txt`)
+
+카드 커널은 패닉할 수 없으니 `Gpu`가 소유한 u32 하나(`crates/gpu/src/fault.rs`, `FAULT_NONE = u32::MAX`)에 `(layer << 8) | site`를 **atomic min**으로 쓴다 — 여러 스레드가 올려도 스텝 순서상 가장 이른 (층, 사이트)가 남아 결정적이고 게이트가 핀할 수 있다. 사이트: QuantColumn 1(`q8_1_quant_block` 전부), NormQuant 2, Q5Quant 3, HcQuant 4(`ds41_hc_pre` 레지스터 안 q8_1), Router 5(`ds41_router`·`dflash_router`: 라운드 승자가 비유한 = 유한 후보가 슬롯보다 적음, 또는 가중치 비유한), AttnSel 6(`ds41_attn_seg_sel`: 압축 스트림 밖 항목 — 클램프 제거, `segment_pass!`의 `check` 훅이 walk 앞에 키마다 검사하고 행 0을 스테이징해 접근은 정의된 채). 워드는 **끈적**이고(카드가 지우지 않아 여러 토큰 프롬프트의 첫 폴트가 마지막 readback까지 남음) 헤드 argmax의 스레드 0이 토큰 옆(`token_out[m]`)에 복사한다 — 런치·복사 추가 0; 호스트가 `Head::tokens`에서 `GpuError::Fault { layer, site }`로 올리고 `GpuModel`은 poisoned 상태로 다음 `step`을 `GpuError::Poisoned`로 거부, `reset`이 지운다. 하이브리드 핸드오프는 비유한 x를 만나면 호스트 인코더의 패닉 대신 NaN을 전파해 **카드 워드의 이름이 먼저 보인다**(경계 밖 편집, 리드 채택). qdot q8_2 인코더: 스펙의 "감김은 도달 불가" 가정이 **틀렸다** — 정규 bf16 스케일에서는 최악 127.496으로 안 닿지만 subnormal 스케일(`amax/127 ∈ [2⁻¹²⁷, 2⁻¹²⁶)`)에서 가수 비트가 줄어 `v·id`가 128에 닿아 −128로 감겼고 isum도 ik와 달랐다 → ik처럼 [−128, 127] 포화(스칼라 `clamp`, AVX2는 saturating pack 그대로), `q82_inverse`가 1/d 오버플로를 코드 0·합 0으로 flush. 게이트 `hw_q82_codes_at_bf16_round_down`(4247 정규 블록 max|code| 127, 2001 subnormal 블록 포화, AVX2 == 스칼라).
+
+**FAIL-first(전부 stage 1 = raise를 뺀 트리, 또는 base)**: p1 `fault case=nan_lane entry=q3k_quantize_q8_1 … got=none silent_zero=true FAIL`(norm_quant·q5도), moe `nan_rows case=four_finite_experts ids=[300, 100, 42, 0, 0, 0] distinct=4 weights_finite=true … FAIL`(중복 id, 유한 가중치 — 어떤 프로브도 못 보던 것), attn base `past_stream_entries=1 … PASS`(클램프가 마지막 행을 조용히 읽던 옛 핀 — 그 PASS가 증거; 재핀 `PIN(2026-09-24)`), hc `value 777 NaN … got=none FAIL`, step `fault nan_key layer=0: step token 0 … FAIL`(호스트 수정 전에는 qdot 패닉이 먼저), qdot item 4 base `[-128, -128, …]`. 초록: qdot·p1·p4·p0b·p2·p9·p10·moe·chain-ffn·chain-attn·attn·hc·index·woa·step·skew·long·dspark 셋·e2e(648)·qwen3moe-e2e·hybrid·load-v41·load-v41-lock, lint 167(고유 131 = base).
+
+**형태**: 건드린 10 엔트리 + 새 2(`argmax_fault`·`argmax_rows_fault`)만 md5 변화, 104 동일; regs 예측 +1…4 → 실측 **+0…1**(첫 빌드는 norm_quant 48·attn_seg_sel 128 + 모든 raise 커널에 `ld.local`/`st.local` 1–16 — by-value 매개변수 안 포인터의 원자 연산이 generic으로 내려가 `isspacep.local` 분기가 생긴 것; 인라인 `cvta.to.global` + `red.global.min`으로 없앴다 → **장부 #23**); `ds41_attn_seg_sel`은 사전 검사로 옮기며 126 → **121**(a3의 gather-once가 스필 없이 들어갈 여유 5). 첫 `gate-gpu-load-v41` 빨강 `residue -2097152 B`: 4바이트 폴트 워드가 컨텍스트 창의 작은 할당 공유 그래뉼을 먼저 열어 적재 창이 2 MiB 덜 가져갔다 → 워드를 **2 MiB 자기 할당**으로(구조적 대안: `placement.rs:942` `card_heaps`가 `Gpu` 자신의 작은 할당을 먼저 세기 — 반올림 핀 두 카드 −2 MiB, n_l 변동 가능; 카드 S).
+
+**스필 래칫** `just gate-ptx-spill`(`tools/ptx-spill-check.sh` + `tools/ref/ptx-shapes.tsv` 195행): generate_ds41 116·gate_e2e 79 엔트리 전부 핀, 0 아닌 것은 `flash_merge2_q8`(40/8, hcfin 프로브 쌍둥이)과 `flash_latent_seg_v2`(36/16, TWICE_V 프로브)의 PIN 넷; 위·아래·미핀·stale 전부 빨강. a3 트리(181e2f6)에서 `ds41_attn_seg_sel spill=8 jit_local=8 ABOVE`로 빨강(FAIL-first 공짜). `sass-scan --exact`.
+
+**남긴 것(보고만)**: ~~**`gate-ds41-load`가 main에서 빨강**(ds41dense `4953fdb`부터)~~ 리드가 `8dd878f`로 닫음 — `join_groups`(엔진의 단일 소유자)를 게이트 check i가 접어 부품 세그먼트 합 = 결합본 버퍼를 검사(공개 파일은 40층 전부 결합이라 빨강 줄이 수십 개였다; pubflip 스윕은 그 앞 base라 초록); `ptx-shapes.tsv`에 `ld.local`/`st.local` 열도 핀(generic 원자 사본은 spill=0으로 읽혀 통과했을 것; `two_phase`가 이미 2/1)(S); V2-Lite `router_topk`·qwen3moe 라우터에 같은 Router 검출 없음(M); `flash.rs:2121` `quant_row`의 NaN → 코드 0(M); `markov.rs:278` 드래프트 readback이 워드를 안 읽음(끈적이라 본 모델 다음 readback에서 드러남, S); `q8_K`의 `v_wrap_i8` 경로에서 같은 subnormal 감김 가능성 미증명(S); `enqueue_argmax`(평범)는 엔진 호출자 없음 — 정리(S); lint 카운터 `grep -c '^warning:'`가 같은 트리에서 ±2 흔들림 — 고유 (메시지, 위치) 수로(S). 미처리 경로: V2-Lite·qwen3moe 라우터, `quant_row`, 드래프트 readback. 타이밍 A/B(특히 qdot 인코더 CPU 핫 경로 + 카드 양자화기의 4 compare) 리드 몫 — 시팅.
+
+### 공개 파일이 기본값 (pubflip 보고, 2026-09-25 새벽 — 예측 파일 사본 세션 스크래치 `wave-m4/pubflip-predict.txt`; 선임이 세션 종료로 죽고 후임이 항목 2·3을 수행)
+
+`gguf::v41::DEFAULT = PUBLIC`, `deepseek41.sh` `V41_MODEL` 기본 `$V41_PUBLIC`, `IK_NCMOE` 파일별(공개 33·혼합 34 — LCPP_NCMOE와 같은 산술 [유도], ik는 33에서 아직 안 돌렸다; ik `db517b69`는 token_embd·engram_embd를 host 입력 컨텍스트에 두어 카드 밀집 바이트가 mainline과 같고, `MUL_MAT_ID` 오프로드 문턱 32×384 > ubatch 512×6이라 `-nopo` 짝 불필요). `gate-ds41-host`의 `CLAMP_LAYERS` 커버리지 핀은 **합성 클램프 검사**로 바뀌었다: 층마다 토큰 0 라우팅을 두고 입력 행을 2의 거듭제곱으로 키워 최대 g·u·−u가 2L에 닿게 한 뒤 combine이 `qdot::swiglu_clamp`와 비트 동일 + f64 서술(`COMBINE_EVAL`, 반정규수 반 간격) 안 + 세 분기 모두 ≥ 1회 — 파일 무관. FAIL-first 둘: 클램프를 끈 `moe.rs`(40층 전부 `par_eq_swiglu_clamp=false`)와 AVX2 하한을 뺀 qdot(비트는 같은 변이 커널과 비교라 `true`로 남고 **f64 서술 검사만** 잡았다 — 그 검사가 없으면 이 부류가 통과한다). `docs/BUILD.md` 모델 절은 공개 파일 기준.
+
+**스윕(3090 게이트 락, 13:32–15:08 UTC, 1시간 36분, 락 경합·리스 대기 0)**: 48 레시피 중 45 초록 — op 게이트 7, hc·rope·comp·index·mcol, step·skew·long(free 팔 ik 비교 `[11111, 16, 1]` 동일 — EOS까지 3 id뿐이라 얇다), draft·chat·serve, load 셋, hybrid, dspark-hc·experts, host·meta·placement·plan·oracle·kld·tokenizer·engram·prompts, build-ref(q5_K 덤프 세 파일 md5 불변 — 예측대로), qdot·1-1(`ref-v41_plain` 5 타입), dspark-read, bench 체크 둘. **빨강 셋**: ① `gate-gpu-gates-lib`(스펙 목록 밖, 후임이 추가) — `oracle/mod.rs` 단위 테스트의 합성 매니페스트가 `# arch`만 있는데 `78fbe2a`가 `open_named`에 `check_model`을 붙여 `# model`을 요구, 두 파일 모두 rc 101; V4.1 레시피 둘이 `--lib`를 `hw_`로 걸러 지금까지 안 보였다 → **리드가 고침**(테스트 매니페스트에 `# model\t<v41::model()>` + 다른 파일이면 거부하는 케이스, main 40 passed) ② `dspark-kv`·`dspark-graph` — 위 카드. **예측 대 실측**: mcol 초록(트리아지 [유도] 틀림), long 초록(예측 빨강 50 %), dspark 빨강(맞음), host 옛 핀은 38층 0회·39층 `u>L=1`(트리아지의 "40층 0" 틀림), 박스 시간 예측 3–4 h → 1 h 36 m.
+
+**혼합 파일로 뜬 참조가 셋 남았다**(리스·수 시간 → **사용자 승인**; 시팅 10): `greedy-ds41/greedy-ik-cpu-64{,-p0,-p7}.tsv`(`just ik-greedy-ds41 <행>`; 헤더의 `model=`을 읽는 리더가 없다), `ikppl/kldbase-*`(`ik-ppl` 레시피), `ref-draft/<DSREF_SET>`(`build-ref-dump-draft`·`dump-draft.sh` — dspark-q3k 뒤). 혼합 파일·`MIXED`·그 오라클 세트의 삭제는 사용자가 스윕을 본 뒤.
+
+**남긴 것(보고만)**: `ds41_host.rs:503` 라우팅 id `as u32`(음수가 감김 → `try_from` 이름 붙은 panic, 3줄 — 새 코드는 그렇게 함); `oracle/deepseek41.rs:~200` step 세트 출력에 `_plain` 없는 기본 이름을 찍음(1줄); `pow2_reaching`·`silu64`·`HALF_SUBNORMAL`·flush 규칙이 `gate_deepseek41_moe.rs:1836`과 `ds41_host.rs`에 중복(크레이트가 달라 공용 자리 필요, ~40줄); `gguf-inventory.rs:23,34,684` roofline 열 이름 "engramQ8 split"; `docs/v41-inventory.md`는 혼합 파일 인벤토리(`just inventory-v41`로 재생성 — 리드 판단).
+
+### 밀집 경로 셋 (ds41dense 보고, 2026-09-25 새벽 — `4953fdb`; 예측 파일 사본 세션 스크래치 `wave-m4/ds41dense-predict.txt`; 선임이 세션 종료로 죽고 후임이 게이트·비교를 전부 다시 돌려 마무리, 소스는 선임 그대로)
+
+D1·D2·D5. **D1**: `Weights::join_rows`가 같은 타입·폭의 K-quant 행을 적재 때 한 행 스트림으로 옮기고(원본 해제, 상주 바이트 불변) `join_projections`(`Body::derive` — `load`·`load_placed` 둘 다 거침)가 q_a+kv(+indexer proj), q_b+indexer q_b, 게이트 압축기 kv+gate를 전 멤버 Q3_K일 때 접는다; 출력은 `PartedBuffer` 하나의 part들이라 결합 발사가 통째로 쓰고 소비자는 part를 읽는다 — 행마다 같은 커널 같은 비트라 비트 동일이 구성상 성립하고 `q3k_gemv` PTX 불변. 혼합 파일의 Q8_0 attention은 따로 발사 유지(압축기 kv+gate만 접혀 −3). ik `-mqkv`(`llama-load-tensors.cpp:3215`)가 같은 설계(로드 때 행 연결 + view 둘); mistral.rs `mmvq_core_fused_qkv_impl`은 포인터 셋을 받는 전용 커널(복사 없음, 커널 추가), exllamav3는 반대로 fused 가중치를 로드 때 쪼갠다. **D2**: `norm_quant` 1024스레드(제곱합은 앞 RMS_THREADS가 rms_norm과 똑같이, 양자화 블록은 32 warp에 분배) + `rms_partial_sq` 20-stride 배치 적재(rms_norm·norm_quant·kv_norm_rope_append 둘이 공유해 ptx 엔트리 6개가 바뀜). **D5**: argmax 1024스레드. 재핀 셋(chain_attn 층별 런치 수, step 예측 커널 수 공개 1146 → 1087·혼합 1030 → 1027, p4 norm 형상) 모두 `PIN(2026-09-24)` + 옛 식에서 빨강 확인.
+
+**예측 대 실측**: 런치 −63 예측 → −59(스펙의 "게이트 압축기 7층"이 틀림 — 소스 4층 중 ratio 2인 3층; 층 종류별 1×32 + 3×4 + 4×3 + 3×1 = 59). D2의 왕복 가격: clock64(3090, 1024판, 층 1–5)로 phase A K=5120 2134–2168 → 1361–1403 사이클, 왕복 4개 제거로 나누면 **~190 사이클/왕복**(≈0.11 µs @1.7 GHz 가정, 클럭 미측정) — 스펙의 0.35–0.5 µs가 빗나간 항이고 phase B는 적재가 아니라 양자화기 직렬 사슬이 지배(시간의 ~80 %), 이득 −0.36 → **~−0.16 ms[유도]**. norm_quant regs 43 → 44. 시간은 리드 A/B(시팅 9: `bin:` 팔로 base d467767 = 박스 `bloomery-ds41dense-base`).
+
+**남긴 것(보고만)**: `elem.rs` `RMS_BATCH=20`은 K ≥ 5120에서만 발동 — K=1280(q_a norm)·V2-Lite K=2048은 옛 루프, 작은 둘째 묶음으로 덮인다(S); `fused.rs` phase B의 직렬 사슬(블록 amax 셔플·q8_quad·저장)이 다음 레버(M); `weights.rs` `join_rows`는 part와 결합본이 잠깐 같이 상주해 최대 ~20 MB(q_b 그룹) — 배치 예산 margin이 안 세고 빠듯한 `BLOOMERY_CARD_BUDGET`에서만 문제(S); `chain/attn.rs` `Query::of` 오류 문구 어색(XS); **게이트 공백**: `gate_deepseek41_long`의 free 실행이 2296/83358 두 토큰을 300 넘게 번갈아 내도 통과(붕괴 검사가 한 토큰 연속만 봄, base도 같음)(S); 제안 — mistral.rs식 세 포인터 gemv면 로드 복사와 `PartedBuffer`가 사라지나 새 커널+게이트(M); 관측 — 공개 파일 step의 card free가 base보다 56.6 MB 늘었다(할당 수 감소로 반올림이 줄었다는 추정, 기제 미확인).
+
+### hc_pre 마감·merge 배치 (ds41hcfin 보고, 2026-09-24 밤 — `ecaacdd`; 예측 파일 사본 세션 스크래치 `wave-m4/ds41hcfin-predict.txt`; 선임이 세션 종료로 죽고 후임이 마무리)
+
+D6·H1과 Qm. hc_pre 마감 블록의 (토큰, 행) 열 합이 `column_sum`으로 40조각을 한 묶음 적재한 뒤 같은 오름차순으로 더하고, 제곱합 스레드는 warp 7(`HC_SS_THREAD` 224)로 옮겨 부분합 뒤에 줄 서지 않는다. merge 셋(`ds41_attn_merge`, `merge_row`의 flash_merge·_q8·merge2_q8)은 16세그먼트의 (m, s, v)를 먼저 적재하고 같은 `sj != 0` 조건·같은 순서로 fold한다. 전부 비트 동일(hc·attn·chain-attn·chain-ffn·step·skew·long·e2e 초록, lint 167).
+
+**측정(clock64 사이클, 3090, 사이트 중앙값 32회 — 벤치마크가 아니다; 클럭 미측정이라 µs는 유도)**: finalize 총합 T=1 10373 → 7506(−28 %), T=5 11742 → 9044. **예측이 빗나간 항 둘**: ① 스펙의 형태 D1(smem 스테이징)은 T=1 −1395(예측 −1600…−1900)였고 T=5에서 +512로 뒤집혔다 — 5000값을 8개씩 세 라운드로 직렬 스테이징하는 비용; 출하한 것은 배치 적재 D2다(D1 diff는 세션 스크래치 `dead-rounds/ds41hcfin/pnew`, 복원 가능) ② D2의 finalize 구간은 L2 왕복 1회 ~800으로 예측했으나 1702 — SASS가 40적재를 21+19로 나눠 왕복 둘(ptxas 창, ds41router와 같은 기제). ik 모양의 one-lane Sinkhorn(`sinkhorn.cu:66-115`)은 비트 동일하지만 9× 느려 warp 형태 유지. exp 구간은 코드 불변인데 빌드마다 흔들려(clock64가 fence가 아님) 판정은 총합으로. **설계 비교**: exllamav3 `hc_mix.cu`는 두 발사·근사 `__expf`/`__fdividef`라 결합 순서가 달라 못 가져오고, 제곱합을 다른 warp로 빼는 생각(`:182`)만 같다; ik `fattn-common.cuh:670`의 merge는 smem 두 단계 fold로 순서가 다르다; mistral.rs에 mHC 없음. merge의 형태는 `flash_gqa.rs`(qwen3deep)의 배치를 그대로 따른다.
+
+**리드 A/B(시팅 8)**: base 55ceca0 빌드가 박스 `bloomery-ds41hcfin-base`에 있다 — `bin:` 팔로 깊이 6·1024·4096(merge는 세그먼트 수에 비례) + m=5 프리필 행(`ds41_attn_merge` blk/SM 1의 파동 증가 확인). 이득 유도치 −60…−67 µs/스텝은 0.3 %라 A/A 팔을 넣고 같은 임대 비율만 본다.
+
+**남긴 것(보고만)**: `MERGE_BATCH` 사본 셋(`flash_gqa.rs:94`, `flash.rs` merge_row 지역 const, `attn.rs:63`) → crates/gpu `pub const` 하나(S); flash merge 셋이 정확히 64 regs에서 멈추고 `flash_merge2_q8`(프로브 경로, `deepseek2/dispatch.rs:515`)이 40 B 스필 — 소스에 `maxnreg`/`maxrregcount` 없음, ptxas `-v`로 조사(S; loudnan의 spill 열 래칫이 들어오면 이 스필을 `PIN`으로 적거나 프로브 쌍둥이의 배치를 줄인다); `HC_FIN_BATCH = 40`이 `n_embd / HC_PIECE`와 const로 묶이지 않음(S); `flash_merge2_q8` 둘째 fold는 LDG 3 그대로(프로브); **Sinkhorn이 다음 병목**(T=1 4381 사이클, 58 %, IEEE 나눗셈 사슬) — 별도 카드 S. 후임의 경계 사고 한 건: sed가 `flash.rs` 439–732(`mma_segment_walk`)까지 바꿨다가 즉시 base로 복원, 최종 diff는 merge_row 세 hunk뿐(리드가 diff로 확인).
+
+### 토크나이저 `~` (tokfix 보고, 2026-09-24 — `3ef2c8a`; ik PR #2528 열림)
+
+`~`가 S에 들어가 `~/`가 한 id(71520)다. 수정된 토크나이저로 재면 engram 코퍼스 id는 code 778,951 → 778,925, prose 75,268 → 75,249,
+korean 266,143 → 265,648, prose-all 4,670,384 → 4,669,737, threads 4,515,000 → 4,514,374이고 다섯 코퍼스 모두 ik-tilde와 파일 전체가 같다.
+`corpus-*.ids`는 **재생성하지 않았다** — 뜨거운 목록·타이밍이 그 id를 먹는다. 걸려 있는 것: `tools/ref/ik-draft.sh:174-180` check 1은 코퍼스
+첫 512 id를 각 팔의 `llama-tokenize`로 되돌려 재는데, 지금 코퍼스로는 mainline(`lcpp` 팔, 수정된 트리)이 rc 65로 막히고[코드 읽기, 미실행],
+재생성하면 반대로 미수정 `ik-idxkey` 팔이 막힌다. 순서는 리드가 정한다: ① ik-idxkey 옆에 수정 한 줄을 얹은 새 트리(`ik-idxkey-tilde`, 제자리
+재빌드 금지)를 V4.1 프로파일의 IK로 → ② 코퍼스·뜨거운 목록 재생성(한 시팅, 타이밍 기준선이 바뀐다는 것을 rig-log에) → ③ lcpp 프롬프트 쌍둥이.
+남긴 것(XS): `tools/ref/engram-corpus.sh:43` 기본 TOKENIZE가 미수정 트리라 재생성하면 결함이 다시 구워진다 — oracle.sh와 같은 `~/` 가드;
+`tools/ref/ik-greedy.sh:51` 프롬프트를 미수정 ik로 토큰화; oracle.sh MANIFEST에 프로브 결과 한 줄. mistral.rs·exllamav3는 HF tokenizers를
+쓰므로 처음부터 mainline과 같았다(`gguf_tokenizer.rs:49`, `tokenizer.py:50`).
+
+### V4 호스트 티어 커널 (v4host 보고, 2026-09-24 — `55b5249`; 예측 파일 사본 세션 스크래치 `wave-m4/v4host-predict.txt`)
+
+IQ3_XXS×q8_K와 MXFP4×q8_2_x4의 AVX2 융합 점곱이 호스트 티어에 들어갔다(ik 몸체 그대로; 스칼라 거울과 V4-Flash 실제 행 1024개에서 비트 동일,
+ik 자신의 점곱과 64행 0 ULP). 활성 짝은 ik 디스패치에서 읽었다: IQ3_XXS→Q8_K(`ggml.c:1116`, `iqk_gemm_iquants.cpp:2753`), MXFP4→Q8_2_X4
+(`ggml.c:1316`, `iqk_gemm_legacy_quants.cpp:2483`). IQ3_XXS에는 인코더 게이트 0이 없다 — ik의 AVX2 q8_K 인코더는 부호 없는 최댓값으로 코드를
+만들어 스케일이 늘 양수고 우리는 ggml 참조(부호 있는 극값)라 바이트가 다르고 곱만 같다. 적재 줄 `load host_tier type= k= path=fused|dequant_row`가
+`HostLayer::build`에서 (형식, k)마다 한 번 찍힌다(V4.1: q3_K 5120·q5_K 2304·q4_K 2304 모두 fused). kr-cpu K5·K6·K9·K10 닫힘.
+**미측정**: 단일 스레드 속도 예측(IQ3_XXS 4.0–5.2 GB/s — 적재 포트 한계라 4.6 GB/s 선 바로 옆, 호스트 레그 110–135 GB/s[유도]; MXFP4 12.8–14.6;
+ours/ik 0.95–1.05; 기준 Q3_K 10.8 실측)은 `just measure-qdot-rate`(조용한 박스)가 확인한다. IQ3_XXS가 4.6 아래면 V4 호스트 레그는 ALU 바운드라
+40–54 tok/s 항을 다시 판단한다. K6(F16C)와 `fuses`가 dispatch 경로를 건드렸으므로 `ab-decode` 같은 임대 A/B 1회(예상 ≤ 잡음).
+**판단 하나**: K5는 "두 경로가 같은 정의된 출력"으로 닫았다 — 전부 NaN인 블록이 코드 0으로 조용히 양자화된다(전에는 AVX2가 인덱스 패닉).
+`quantize_col`이 `()`를 돌려 오류 반환은 ops.rs 경계 밖이었다. 시끄러운 실패를 원하면 이름 붙은 패닉으로 바꾼다(XS).
+남긴 것: `ops.rs:967,2241,2339` `supports && k_granularity` 세 사본 → `qdot::fuses`(3줄); 우리 Q8_K 인코더는 ggml 참조 규칙이라 ik AVX2와 스케일
+마지막 비트가 다를 수 있다(Q3_K·IQ3_XXS 엔진 대 ik 비교 전부에 걸림; ik 형태 포팅은 작지만 Q3_K roundtrip 게이트 재핀); `*_rate.cpp` 채움 바이트가
+Rust 쪽과 다름(타이밍은 데이터 무관, 1줄); `q_nope2_cells_avx2_inner` 소프트웨어 f16(작음); F16C 스윕에 Q5_0/Q5_1 꼬리 블록 없음(몇 줄);
+`qdot/tests/qdot.rs:1-5` 머리말 낡음. mainline은 IQ3_XXS 부호를 활성에 접어(`quants.c:3260`) 명령이 적지만 ik 비트에서 벗어난다 — 제안으로만.
+
+### 조용한 실패 금지 (사용자, 2026-09-24 21:20 "나는 조용한 실패를 극혐해" — 규칙은 `AGENTS.md` Conventions와 위임 `common.md`)
+
+v4host의 K5 판단(전부 NaN인 활성 블록 → 두 경로가 같은 코드 0)을 뒤집어 리드가 바로 고쳤다: 호스트 q8_K·q8_2 인코더 네 경로(AVX2·스칼라)가
+NaN·inf를 `qdot: non-finite activation value … at offset …`로 거부한다(`non_finite_activation`, cold). FAIL-first: 새 게이트
+`quantize_col_non_finite_panics_on_both_paths`가 수정 전 소스에서 "quantized a non-finite block instead of panicking"으로 빨강, 수정 뒤 초록;
+AVX2 비용은 8값당 `cmp_unord` + `or` 하나씩(최댓값 루프 안), 스칼라 거울은 값마다 `is_finite`. 같은 부류로 남은 것 — **`loudnan` 라운드(S)**:
+① kr-dense D10 카드 q8_1 양자화기(`cores.rs:76-79`, `lib.rs:348-349`, `fused.rs:187-189`)가 NaN을 코드 0으로 삼킨다 — 디바이스는 패닉을 못
+하므로 스텝 이미지의 플래그 워드에 `(layer, site)`를 쓰고 호스트가 다음 동기화(argmax 읽기)에서 이름 붙은 오류로 올린다(`BLOOMERY_CHECK_FINITE`
+프로브는 있지만 옵트인이라 기본 경로는 조용하다); ② kr-moeattn N1 라우터 lane 후보 전부 NaN → ids [0×6] 중복(`router.rs:197-243`) — 같은 플래그;
+③ `gpu-deepseek41/src/attn.rs:354` 클램프(스트림 밖 항목을 마지막 행으로 읽어 그럴듯한 틀린 값, 트리아지 B5의 "계약 결정") — 거부로;
+④ `crates/qdot/src/lib.rs:879,899` `nearest_int … as i8`이 128을 −128로 감는다(ik는 127 포화; 지금은 도달 불가) — 포화 또는 단언. 각각 FAIL-first.
+
+## plan.md 2026-09-25 이전 판 (원문 그대로 — 같은 정리에서 옮김; 「모델」 상수 표의 정정 이력·「목표」·「라운드 운영 원칙」·「공개」 M4 seam 프로그램·「실험 큐」의 답한 행이 여기 있다; 커밋 `bac2605`)
+
+## bloomery — 계획
+
+이 문서는 계획이고, 숫자는 [rig-log](https://github.com/midagedev/rig-log)에 측정된 뒤에만 여기 옮겨 적는다. 통과 기준은 전부 측정으로 쓴다.
+
+이 문서는 계획·현재 상태·라운드 운영을 갖는다. `HANDOFF.md`와 `docs/orchestration.md`는 2026-09-22에 여기로 병합됐고, 두 파일의 마지막 판은 커밋 `5ce25f4`에 있다(`git show 5ce25f4:HANDOFF.md`). 새 세션은 `AGENTS.md`(규칙 정본) → 이 문서의 "지금"까지 읽으면 일을 시작할 수 있다. **열린 항목 목록(트리아지·열린 라운드 카드)은 [`plan-triage.md`](plan-triage.md)에 있다**(2026-09-24). 기계·모델 파일·툴체인 사실은 [`facts.md`](facts.md)에 있다(2026-09-24). **끝난 것은 [`plan-ledger.md`](plan-ledger.md)(장부)에 있다** — 닫힌 라운드 카드, 지난 파동과 인계, 로드맵 A의 행별 기록, 라운드 이력을 2026-09-23에 원문 그대로 옮겼다. 옮기기 전 판은 `git show 8707bf1:docs/plan.md`다.
+
+### 지금
+
+**2026-09-24 오후 — 목표는 "커뮤니티 공개"(사용자 09:35).** 이 절과 아래 「오케스트레이션 플랜」이 현재 상태의 정본이다. 한 줄에 담기지 않는 라운드 원문은 장부로 옮긴다 — 오늘 오전까지의 원문은 장부 「「지금」·「오케스트레이션 플랜」에서 옮긴 것 (2026-09-24 오후)」. main은 머지 파동마다 푸시한다.
+
+- **헤드라인(측정, A6000, 뜨거운 목록, prose/code, n 96, 혼합 파일 `attnQ8`)**: 우리 **34.3 / 34.5 tok/s**, ik plain 17.5 / 18.2, ik + DSpark(n_max 5, `--temp 0`) 32.1 / 29.4(자리 11·13). 패스 하나는 ik의 1.8–1.9배 빠르지만 ik는 DSpark로 거의 따라온다 — **우리 DSpark(dsgraph B → C → dsloop)가 공개 필수 경로다.** 24 GB 흉내(`BLOOMERY_CARD_BUDGET=24G`) 30.35(자리 12). **3090 실측은 아직 없다**(E21, plainfile 뒤 — 공개 파일로 잰다).
+- **DSpark를 붙이면 [유도]**: 48 GB급(A6000, 3090 두 장) ~45–50 tok/s = ik + DSpark의 1.4–1.5배. 3090 한 장은 +7 %(~32)에 그친다 — 8.5 GB 드래프트가 카드 전문가 자리를 먹고, 우리 검증 패스는 행마다 호스트 전문가를 따로 읽는다(행 사이 전문가 겹침 φ 0.15–0.26). 레버 후보: 드래프트 가중치 양자화, 두 장이면 드래프트를 둘째 카드로. 잴 것: ik + DSpark의 3090 값(E21에 넣는다), 온도 > 0의 수락률.
+- **공개를 막는 것**: ~~① `nanmoe`~~ 닫힘(`88de92e`): 선택된 여섯 로짓이 모두 ≈ −16.6 밑이면 sqrt-softplus가 0이 되어 0/0 = NaN — `route_core::renorm_divisor`(합 + 1e-20)가 단일 소유자, `gate-gpu-ds41-long`이 지킨다. ik에도 같은 결함(PR 준비 중, `iknan`) ~~② `shadowhost`~~ 닫힘(`87c8786`): 링 섀도를 고정 호스트 메모리로 — 카드 전문가 3090 gate 888, A6000 (a) 2,414로 복귀, 고정 매핑이 2 MiB 그래뉼 하나를 먹는다 ③ **`plainfile`** — 사용자 결정(09-24 14:30, 아래)으로 V4.1 파일은 공개 `Q3_K_M` 하나다. 우리 카드 밀집 경로가 Q8_0 전용이라 K-quant 밀집 gemv(m ≤ 8)·engram Q3_K 행 읽기가 필요하고, V4.1 오라클 세트가 전부 혼합 파일에서 떠졌으므로 공개 파일로 다시 뜨고 밴드·배치 핀을 다시 잡는다; 스펙 `spec-plainfile.md` ④ E21 3090 실측 — **공개 파일로 잰다**(plainfile 뒤) ⑤ 우리 DSpark ⑥ 사용자 결정(아래).
+- ~~**이 머지부터 배치가 바뀐다**: ctx 32k의 3090 gate 배치는 카드 전문가 809, A6000 (a)는 2,334다(prefix2).~~ shadowhost(`87c8786`)로 888·2,414로 돌아왔다. prefix2와 shadowhost 사이(09-24 오후)의 측정 행만 809·2,334 조건이다.
+- **비행 중**: `plainfile`(공개 파일) ‖ `dsgraphc`(DSpark C — 폭별 캡처 그래프) ‖ `qwen3time` ‖ `qwen3perf` ‖ `union6`(6행 합집합 읽기, revisit R1) ‖ `iknan`(ik NaN 재현·PR) ‖ 브랜딩(`logo`). 오늘 오후 머지: dsgraphb `5dd34cb`, propsengine `631cedc`, nanmoe `88de92e`, shadowhost `87c8786`.
+- **오늘 오후 착륙**: viskern `4abc188`(비전 V2 인코더 — 자유 실행 탭은 참조 자기 민감도의 K=2배로 판정) ‖ prefix2 `5fdfe11`(깊은 prefix 자르기: 두 번째 채팅 턴이 캐시 32 id를 전부 재사용) ‖ qwen3 3단계 `a2ec74b`(전 카드 체인 — 노드 869 = 예측, greedy 8개 중 ik와 갈라짐 0, PPL +0.058 %; `AnyEngine::Qwen3moe` arm은 리드가 붙였다).
+- **사용자 결정 대기**: LICENSE(리드 추천: MIT 유지 — 옮겨 오는 코드가 전부 MIT이고 Apache-2.0은 의존성 cuda-oxide뿐) · 공개 시점(리드 추천: 레포와 숫자를 같이 — nanmoe 수정과 공개 파일 E21 뒤). ~~밀집 가중치 재양자화(attnQ8 → Q6_K/Q4_K)~~ **결정됨(사용자 09-24 14:30 "이거 버리자 그때 명확한 이득 없었어")**: 혼합 파일을 버리고 공개 `Q3_K_M`(324 GB) 그대로 쓴다. 공개 파일의 밀집은 Q3_K라 바이트가 혼합의 약 40 %다 → 카드 −4–5 ms/스텝[유도], 카드 전문가 자리 증가, 다운로드 121 GB 적음; 정확도 차이는 잰 적이 없다(plainfile이 ik와 맞춘다). 혼합 파일은 공개 파일 오라클로 모든 ds41 게이트가 초록이 될 때까지 `/models`에 둔다.
+- **ik PR(사용자 09-24 "가장 유효한 거 하나만")**: 열린 것은 [#2520](https://github.com/ikawrakow/ik_llama.cpp/pull/2520)(tolower) 하나다. [#2522](https://github.com/ikawrakow/ik_llama.cpp/pull/2522)(DSpark 로더)는 V4 드래프트 회귀 실행 전까지, [#2507](https://github.com/ikawrakow/ik_llama.cpp/pull/2507)(idxkey)은 PPL이 오르는 까닭을 알 때까지 드래프트다.
+- **토크나이저 참조**: qwen3moe 어휘의 참조 id는 `/home/user/ik-tokref`(`db517b69` + #2520 커밋 `93191627`, `llama-tokenize`만 빌드)로 뜬다. `gate-tokenizer`의 qwen3moe 빨강(`'RE`)은 참조 쪽 결함이었다.
+
+#### GPU 선
+
+**2026-09-22 저녁부터 기본 flash 패스는 MMA다**(`294d907`). ~~아래 스코어보드와 깊이 표는 전부 스칼라 패스로 잰 것이고, 다음 A6000 표부터는 MMA로 잰다~~ **잤다(2026-09-22 밤, A6000 한 임대·팔 여섯 번갈아·세 바퀴·n=96, 리드 측정)**:
+
+| 깊이 | 우리(MMA 기본) | 산포 | ik | 산포 | 비 |
+|---|---|---|---|---|---|
+| 6 | **229.54** tok/s | 1.13 % | 205.47 | 2.54 % | **1.117배** |
+| 1024 | **222.24** | 1.06 % | 193.96 | 1.85 % | **1.146배** |
+| 4096 | **199.62** | 0.57 % | 179.00 | 0.53 % | **1.115배** |
+
+**깊이 4096의 역전이 사라졌다** — 세 깊이 전부 ik보다 빠르다. 키당 기울기는 파생으로 우리 0.160 µs(6→4096; 구간 0.141·0.166), ik 0.176(0.282·0.140) — 「모델」 `c_key` 행에 **유도로** 적어 둔 0.160 µs와 측정이 맞는다. 카드와 패스가 둘 다 바뀌었으므로 옛 3090 표와 나란히 놓지 않는다: 패스에 대한 귀속은 a4e의 같은 카드 A/B(d4096 6.511 → 5.048 ms, −22.5 %)가 하고, 이 표는 새 기본값의 절대 위치다. 기록 rig-log [09-22-o](https://github.com/midagedev/rig-log/blob/main/log/2026-09-22-o-the-depth-table-on-the-new-default-and-the-reversal-is-gone.md). 옛 스코어보드와 깊이 표(**스칼라 패스·3090**, 계열 비교용)는 장부 「GPU 선 이력」에 있다.
+
+#### CPU 선
+
+- **커널**: Q3_K×q8_K, Q4_K/Q5_0/Q5_1/Q6_K×q8_2_x4 전부 융합(crates/qdot). MUL-38 q_nope2 Q8_0×Q8_0(vpsignb 부호접기 maddubs, 비트 동일). MUL-36 flash SIMD(kq_dot 8레인 합순서 + V j축; 폴백 레버 `BLOOMERY_FLASH_SIMD=0`). MUL-37 직렬 activation quant 풀 이양 + moe gate/up 이중양자화 제거(ptr::eq). 커널률은 ik의 95–99%(Q3_K만 ik 대조 미측정).
+- **디스패치 경로가 느리면 첫 질문은 스레드 스윕이다**(`SWEEP="8 16 24 32" just measure-decode`): 곡선이 평평하면 일이 아니라 기다림. 프로파일이 꺼진 청크는 락을 잡지 않는다(AGENTS.md).
+- **게이트**: 14개 just 레시피(gate-ops/attn/ffn/moe/head/forward/kv/derived/mt/profile/threads/qdot/prompts/1-1). 머지 후에는 영향 게이트 + mt/forward/prompts 재실행이 관례.
+- **핀 상태**: prompts KNOWN_DIVERGENCE = ~~**{24}**(MUL-36 재핀, A/B 입증됨 — 이전 {14})~~ **{}**(2026-09-21 밤 `qdot::swiglu` 재핀, `crates/model/tests/prompts.rs` — 24는 0.151 근타이의 제비가 ik 쪽으로 떨어진 것). forward L_OUT_BANDS = (0,3e-3)(3,2e-3)(24,7e-2) + 날짜 주석. gate-mt는 재핀 불허 항목(스레드 무관 비트 동일).
+- **스코어보드(2026-09-23 저녁, 같은 임대, cpu1)**: N=96 깊이 6→101 **87.87 tok/s 대 ik 85.87(+2.3 % ± 1.0)**; 깊이 1024 71.4 대 79.9, 4096 44.6 대 59.9(키당 우리 2.7 µs 대 ik 1.25[유도]). 스레드 스윕 8/16/24/32 = 58.0/82.5/87.7/88.0 — 24에서 포화, convoy 아님. ~~(2026-09-20 저녁)**: N=96 **61.48 tok/s** 대 ik 82.88 → **잔여 1.35배**~~(아침 39.71/2.10배). 경위는 rig-log -j: 청크 끝의 무조건 수집 Mutex 제거(+44%) → 메인 스레드 고정 → mmap 프리폴트(+3.5%; 프리필 +18%는 6토큰 프롬프트 기준). → rintf libm 호출 제거(+8.3%, 2b2fdb6).
+- **남은 산수**: 레벨2 dot 합/32 = 8.5 ms/step(완전 병렬 내적), ik 스텝 전체 12.1 ms, 우리 16.3 ms → 비내적 7.8 ms를 3.6 아래로. perf상 임계 경로는 메인 스레드 하나(워커는 표본의 51%를 스핀으로 대기): rintf 10% · memset 6.6% · expf 3.2% · 자기 청크+장벽 18%.
+- ~~**스테이지 표(N=96, 레벨1, 24.18 ms/step)**~~ (락 아래서 잰 표 — 새 표는 rig-log -j): batch Q3_K 24.1% · Q3_K 단일 18.4% · batch Q5_0 14.9% · Q4_K 13.5% · Q6_K(lm_head) 5.3% · q_nope2 5.1% · swiglu+F32+접착부 ~10% · **flash 0.40ms(1.6%)**. 전체 54.8 GB/s = STREAM의 37%.
+- 주의: 레벨2 quant 열은 MUL-37 이후 워커 CPU합(벽시간 아님).
+
+세션별 스코어보드(밤 → 아침 4)는 장부(`plan-ledger.md`)에 있다. 가장 최근 값은 그 목록의 첫 항목이다.
+
+#### 어디에 무엇이 있는가
+
+| 위치 | 내용 |
+|---|---|
+| `~/repo/bloomery` (이 리포) | 엔진 본체. AGENTS.md = 규칙 정본. docs/research/ = 조사 문서(CPU 조사 종합표는 `cpu-llm-ideas.md`, 패킹이 1순위), docs/RESULTS-*.md = 라운드 산출, docs/plan.md = 계획(열린 항목은 `plan-triage.md`, 끝난 것은 `plan-ledger.md`) |
+| `~/repo/rig-log` | 측정 기록(한국어 산문). 임대·증인 있는 숫자만. README 로그 표가 전체 인덱스. ~~최근: 2026-09-20-a…-h~~ ~~최근: 2026-09-22-a…-e~~ 최근: `log/2026-09-24.md`(옛 이름은 `log/moved.tsv`). 증상으로 먼저 찾는다 — `tools/recall.sh '<키워드>'` |
+| gadak 트래커 | `GADAK_HOME=$HOME/.gadak gadak --workspace gdk`, 프로젝트 MUL. Done: MUL-1…38 전부 종결(코멘트에 판정). 미완: MUL-30(GPU — ~~착수 대기~~ **진행 중**: ~~A3 종료, A4 측정 완료, A4b 비행 중~~ A 국면은 닫혔다 — 장부 「로드맵」 A), MUL-6(CUDA 13.3 툴킷 — cutile-rs 스파이크의 전제) |
+| 박스 | 접근은 오직 `./tools/box.sh '<cmd>'`(rsync 단방향 → 박스 편집 금지). 원격: /root/repo/bloomery, 데이터: /root/bloomery-data, 임대 락: /root/bloomery-cpu.lock. GPU: 기본은 3090. ~~**A6000(idx 1) 금지**~~ **정정(사용자, 2026-09-21)**: A6000도 개발에 쓸 수 있다 — `BLOOMERY_CARD=a6000\|both`로만 가고, ~~`llm.service`가 살아 있거나~~ 컴퓨트 프로세스가 있으면 rc 75로 거부된다(`llm.service`는 09-21부터 inactive·disabled). ~~**시간 숫자는 3090에만**(기준선이 거기서 나왔다)~~ **정정(2026-09-22 저녁)**: 3090 낙하 두 번 뒤로 **시간 숫자는 A6000에서** 잰다. 3090은 게이트·빌드 카드(~~300 W~~ 250 W 캡, `gpu-power-limit.service`) |
+| 세션 메모리 | ~~`~/.zcode/cli/memories/projects/rig-log-*/memory/`~~ `~/.claude/projects/-Users-hckim-repo-rig-log/memory/`(`MEMORY.md`가 색인) — 이 워크스테이션의 세션에만 유효하고, 규칙이 아니라 **사건 원본**만 산다. 새 곳에서는 이 파일이 대체 |
+
+### 오케스트레이션 플랜 (2026-09-24 개정 — 목표: 커뮤니티 공개)
+
+**목표 개정(사용자 09-24 09:35)**: "이 PC에서 최선의 엔진"에서 **"3090 한두 장과 AVX2 Threadripper를 가진 사람이 받아서 돌리고, 우리 숫자를 재현하는 공개 엔진"**으로. 순서를 정하는 축이 바뀐다 — 성능 항 하나를 더 깎는 라운드보다 ① 타겟 카드의 헤드라인 숫자 ② 받아서 돌리는 경로(빌드·서버·CLI) ③ 차별점(어긋난 드래프트 + DSpark, 뜨거운 목록) ④ 사람들이 쓰는 모델(Qwen3·GLM-4.7-Flash) 순이다. 「목표」 절과 장부 「로드맵」의 원문은 그대로 두고 이 절이 위에 선다. 구현 지도(무엇을 어떻게)는 「공개」의 M1–M4 항목과 「DFlash 마무리」 줄에 있고, 여기는 **언제 무엇을 띄우고 리드가 그 사이 무엇을 하는가**만 적는다.
+
+#### 마일스톤과 남은 것
+
+한 줄씩만 적는다. 라운드의 증거·수치·결정 원문은 커밋 메시지와 장부에 있다.
+
+| M | 된 것 | 다음 | 막는 것 |
+|---|---|---|---|
+| **M1 숫자 공개** | A6000 헤드라인(「지금」), 카드 크기 곡선 24/38/41 GB(자리 12), 카드 쪽 분해(E26) | E21: 3090 실측(공개 `Q3_K_M`) — 우리·ik·ik + DSpark 같은 창, 온도 > 0 수락률; rig-log 글 + 30초 영상(사용자 승인 뒤) | `nanmoe`, `shadowhost`, `plainfile` |
+| **M2 돌려 볼 수 있게** | `bloomery-serve-ds41`·`bloomery-chat`·README·BUILD.md(`4afdd65`) | BUILD.md에 prefix 재사용 두 문장(prefix2 보고의 영문 초안) | LICENSE·공개 시점(사용자) |
+| **DFlash(DSpark)** | 커널 `dshc`·`dsmx`, A 적재·KV `4b963af` | B `dsgraphb`(비행) → C(w마다 그래프, `DraftBody`) → `dsloop`(수락 루프) | — |
+| M3 서버 pain | ① prefix 재사용(`47e36b5` + prefix2), ③ reasoning/DSML(`7f68981`) | `propsengine`(비행), ⑧ 슬롯 save/restore(`slots`) | — |
+| M4 모델 | qwen3 1·2·3단계(Qwen3-30B-A3B 전 카드: 체인·e2e·PPL), IQ 커널(`c765166`·`c55cf13`), 선형 조사(`49ecae5`) | qwen3 같은 창 A/B(우리·ik·llama.cpp, A6000 — 러너 레시피부터), 프롬프트 프리필 커널 → `linear`(GDN/KDA) → `glm53` | — |
+| M5 비전 | V0 오라클 `01bbe07`, V2 인코더 `4abc188` | V3 텍스트 쪽 주입(`visinj`: 행 덮어쓰기·`exp_probs_b_vl`·engram 0) | M1·M2 뒤 |
+
+#### 파동 (빌더 5개 이상 — 사용자 09-24 10:16 "한번에 다섯 개 이상"; 측정은 증인으로 거른다)
+
+측정 자리는 임대(flock)로 빌더를 세우고 돈다. 모든 스펙이 빌드 전에 `flock -n /root/bloomery-cpu.lock`를 폴링하므로 자리 하나(≤ 30분)는 빌더를 기다리게 한다. 측정 행은 증인 블록으로 걸러 cargo/rustc가 없던 행만 쓰고, 자리 둘을 연달아 붙이지 않는다. 지난 파동 표(16–17″)는 장부에 있다.
+
+| 파동 | 병렬 | 리드가 그 사이 | 닫는 조건 |
+|---|---|---|---|
+| **18 (09-24 14:00~)** | `dsgraphb` ‖ `nanmoe` ‖ `shadowhost` ‖ `propsengine` ‖ `qwen3time` ‖ `qwen3perf` ‖ `plantidy`(조사) → `plainfile`(자리가 나면) | prefix2·qwen3 3단계 머지, plan 정리, 토크나이저 참조 트리 | nanmoe·shadowhost 머지 → E21 자리 |
+| 19 | `plainfile`(계속) ‖ `dsgraphc` ‖ `visinj` ‖ `linear` 1단계 | E28 qwen3 같은 창 A/B, E21(공개 파일, plainfile 뒤) | plainfile·dsgraph C 머지 |
+| 20 | `dsloop` ‖ `slots` ‖ `glm53` | DSpark tok/s(A6000 (a)·3090 gate), M1 글 | dsloop 머지 |
+| **21 (09-25 04:10~)** | `dspark-q3k`(공개 파일 Q3_K `token_embd`를 드래프트가 읽음 — dsloop의 선행) ‖ `ds41hcbranch`(A1) ‖ `unionhost`(합집합 호스트 서비스) → 시차 뒤 `ds41splitk`(D3/D4) ‖ `qwen3route`(K1·K4·K5) ‖ `fixup3`(트래커 16건). 19·20의 `visinj`·`linear`·`slots`·`glm53`은 뒤로 — 09-24 밤 커널 리뷰가 임계 경로에서 −1…−3 ms를 찾았고 목표 순서 ①(타겟 카드 숫자)·③(DSpark)이 ④(모델)보다 앞이다; `plainfile`은 `pubflip`(`d771085`)으로, `dsgraphc`는 `11ce715`로 착륙 | 시팅 A 기록(rig-log 09-25), E21(3090·공개 파일·lcpp·ik·ik+DSpark·N5 플래그 세트 — 빌더 틈에, B·C·D보다 먼저), `spec-dsloop`(dspark-q3k 착륙 시 발사), spots-triage 표 갱신 | dspark-q3k·hcbranch 머지 → dsloop 자리 |
+
+#### 리드 직렬 지점과 규칙(이 파동들에 적용)
+
+- 박스 임대는 하나. 측정 자리는 빌더가 없을 때만 — 파동 사이에 넣고, 자리 하나는 30분 안(`sittings.sh` 8·9는 준비돼 있다). 타이밍 숫자는 A6000, 3090은 E21 예외(사용자 승인 09-24).
+- 머지는 보고 → diff → 리드 재실행 → 순서대로 ff → 푸시. 파동마다 푸시.
+- 장기 라운드(`qwen3` 등)는 자기 워크트리·자기 `arch/<이름>/`에서 파동을 넘겨 살고, 게이트 단위로 30분 상한을 지킨다; 리드는 중간 보고를 받아 머지 가능한 조각을 먼저 올린다.
+- 서브에이전트의 배경 대기(Monitor·배경 `until`)는 깨우지 못한다(오늘 4건) — 스펙에 포그라운드 `sleep`을 쓰게 하고, 리드가 rc 파일을 보고 깨운다.
+- 공개 전 스크럽: `192.168`·`100.`·`.ts.net`·`admin`·BMC·호스트명·bug-report 아카이브.
+
+#### 사용자 결정 대기
+
+- **LICENSE**: MIT 유지 vs Apache-2.0(crate `license` 필드 12개도 함께).
+- **공개 시점**: M1 숫자만 먼저(rig-log 글) vs M2와 함께(레포 공개).
+- ~~**밀집 가중치 재양자화**: `attnQ8` 파일의 밀집 Q8_0 → Q6_K/Q4_K~~ **결정됨(사용자 09-24 14:30)**: 혼합 파일을 버리고 공개 `Q3_K_M` 그대로 — 「지금」의 ③.
+- 정해진 것(원문은 장부): 3090 T1 측정 E21 승인 · GLM-5.3-Flash 파일 = UD-Q2_K_XL(받음, sha 확인) · 비전은 M5로 V4.1 먼저.
+
+### 모델 — 먼저 유도하고, 측정은 유도가 빗나갈 때만 (2026-09-22)
+
+여기까지의 라운드는 대부분 "만들고 재 본다"였다. 그런데 닫힌 라운드를 되짚어 보면 결과의 상당수가 이미 가진 상수로
+미리 계산되는 것이었다. 그래서 규칙을 바꾼다. **라운드는 예측을 들고 연다.** 측정은 예측이 밴드를 벗어났는지 보는 두 번째
+행위이고, 벗어나면 그때 모델의 어느 항이 틀렸는지가 그 라운드의 발견이다.
+
+#### 비용 모델 (디코드 스텝)
+
+`step_ms ≈ Σ_k max(bytes_k / BW, instr_k / issue, t_floor_k) + N_node · c_node + N_barrier · c_barrier + depth · c_key`
+
+`t_floor`는 B9에서 들어온 항이다(2026-09-23). 격자가 한 파동이 안 되거나 작으면 런치 시간은 바이트가 아니라 행 하나를 걷는
+적재 사슬로 정해지고, 같은 격자·같은 K에서도 커널마다 다르다(K = 5120·격자 64에서 q8_0 16.8 µs, q3_K 5.8 µs).
+
+| 상수 | 값 | 교정한 측정 | 카드 |
+|---|---|---|---|
+| `c_node` | 0.80 µs | A3d lfold, 독립 계기 둘이 4% 안 | 3090 |
+| `c_barrier` | 0.72 µs + 협동 런치 0.20 | A3g fmerge | 3090 |
+| `BW` | ~700 GB/s. 이 근처의 커널은 발행 바운드가 아니다 | A3f q4kdec: 명령 37% 감소, 스텝 +0.38% | 3090 |
+| `c_key` | 우리 0.46 µs, ik 0.16 µs (캐시된 키 하나당) | A4 depth | 3090 |
+| `c_key` (기본 MMA 패스) | 우리 0.160 µs, 스칼라 패스 0.526, ik 0.160 — **파생, 재교정 전**: 09-22-j 3바퀴의 깊이 6과 4096 스텝 차를 4090키로 나눴다(MMA 4.395→5.048, 스칼라 4.360→6.511, ik 4.929→5.582 ms; ctx는 512·4192라 죽은 세그먼트 런치가 들어 있다). 위 3090 행은 스칼라 패스의 것이다. **재교정됨(2026-09-22 밤)**: 새 기본값의 깊이 표에서 우리 0.160 µs(구간 0.141·0.166), ik 0.176(0.282·0.140) — 유도값과 측정이 맞았고, ik 쪽만 0.160 → 0.176으로 올린다(그 유도는 09-22-j의 두 점에서 나왔고 이번 것은 세 점이다) | A4e 3바퀴(파생) → 09-22-o 깊이 표(측정) | A6000 |
+| 잡음 | 3바퀴 기준 ±1% | A6 잔여 | A6000 |
+| `c_node` | 0.852 µs(784노드), 0.871 µs(504노드) — 빈 `touch` 그래프 | B9 `time-gpu-v41`(09-23 08:07) | A6000 |
+| `BW` (큰 런치) | 567–701 GB/s — 한 런치가 수십 MB면 575 가정이 맞거나 낮다(q8_0 ~~567–598~~ B11 뒤 615–680, `q4k_gemv_sel` 579, `q3k_gemv_sel` 619–639, 헤드 q6_K 701) | B9, B11 | A6000 |
+| `t_floor` | 작은 격자의 런치 하한: K = 5120에서 q8_0 ~~16.8 µs(격자 64)·20.2 µs(160), f32 16.4 µs(48)~~ ~~12.0 µs(64)·16.0 µs(160)~~ **8.0 µs(64)·14.0 µs(160)**, f32 **13.5 µs(48)**, q3_K 5.5–5.8 µs(4–64); K = 4096 q8_0 ~~15.3 µs(128)~~ ~~11.9 µs~~ **10.0 µs**; K = 512 q3_K 1.45 µs(16). 굵은 값은 B11b(레인당 워드, 워프 적재당 코드 128 B) 뒤다. f32는 B11 값 그대로다 | B9, B11 ABAB(09-23 09:03), B11b ABAB(11:08) | A6000 |
+| `BW_host` | V4.1 호스트 expert 다리 128–130 GB/s(16–32스레드 평균, 가장 빠른 라운드 131–137), 8스레드 90. 16스레드에서 포화한다. ~~128–130~~ **재교정 135–137 GB/s**(09-24 03:03 ktok 임대와 05:13 자리 1에서 재현: engine:5 132–136, engine:6 135.8–136.5; rig-log 09-24#v41-host-tier-k-rows, #host-bridge-gap-is-not-the-mapping). 128–130은 09-23 b2h 창의 값. 순수 읽기 상한 140–145, STREAM 147.7. 디스패치 고정비 6.9 µs[유도: 같은 바이트를 엔진 82 대 행렬마다 720디스패치로] | b2h 스윕(09-23 10:24) | 호스트 |
+
+시간 카드가 A6000으로 옮겨졌으므로 3090 상수는 **한 번씩만 A6000에서 다시 교정**한다. 교정은 상수마다 측정 하나다.
+그 다음부터 라운드마다 재는 일은 없다.
+
+점유율은 측정할 값이 아니라 계산할 값이다. 입력은 블록당 레지스터·smem·스레드(ptxas `-v`)와 SM 수이고, 스펙이 이 숫자를
+먼저 적는다.
+
+#### 변경 클래스와 증명 방식
+
+`AGENTS.md` "Derive first, measure the gap"의 표가 정본이다(여기 있던 한국어 원문은 장부).
+
+#### 성능이 먼저, 정확도는 선택
+
+`AGENTS.md` "Performance first, accuracy opt-in"이 정본이다(여기 있던 한국어 원문은 장부).
+
+#### 오차 모델 (진단)
+
+지금 e2e 핀은 이산 개수다(마진 ≥ 0.5인 불일치 수 ≤ 6). 표본이 작아서 6과 7 사이는 동전 던지기에 가깝다. MMA 레버가 핀
+경계 6에 정확히 걸린 것이 그 예다. `exact-forced-32.tsv`가 1023위치 **전부**의 참 마진을 갖고 있으므로 연속량 σ를 진단으로
+함께 찍는다(핀은 아니다 — 위 절). `gate-gpu-e2e`의 `forced_sigma` 줄이고, `--margins PATH`가 위치별 마진을 파일로 남긴다.
+첫 실측(main c5b2b22, 스칼라 팔, 3090): σ 0.3518, 편향 −0.0206, 마진 ≥ 0.5에서 기대 3.58 대 실제 4. MMA 팔은 σ 0.3641,
+기대 4.12 대 실제 6. 우리 규칙 시뮬(0.378)과 같은 자리다.
+
+1. 팔마다 σ 하나를 잰다. 전 위치에서 (우리 마진 − 참 마진)의 RMS이고, 실행 한 번으로 나온다.
+2. 기대 불일치 수는 Σ_i Φ(−m_i / σ)이다(m_i는 참 마진). 핀은 이 값의 분포에서 유도한다. 스칼라 변형을 여러 번 돌려
+   산포를 표집할 필요가 없어진다.
+3. 먼저 확인할 것: 마진 ≥ 0.5 불일치 4곳(8/2, 18/31, 21/24, 29/27)이 매끄러운 오차인지, 라우터 전문가 선택이 뒤집힌
+   불연속인지. 불연속이면 σ는 라우터 마진에 대해 잡아야 한다. **불연속 쪽 증거가 하나 있다**(2026-09-22 저녁): 위치별 차의 꼬리가
+   어느 쌍에서나 가우시안보다 훨씬 두껍다. RMS의 4배를 넘는 위치가 가우시안 기대 0.1개인데, 활성 반올림만 다른 시뮬 대 참값도 11개다
+   (`docs/research/errsrc/engine/cmp-mma-scalar.out`). 라우터 뒤집힘을 직접 본 것은 아니다.
+
+팔 비교(스칼라 대 MMA)는 σ 두 개의 비교가 된다. 개수 비교보다 검정력이 훨씬 크다.
+
+#### 단위는 조건을 달고 다닌다
+
+모든 숫자는 `tok/s @ n=N, 깊이 D, 카드` 형태로 적는다. 조건이 없으면 숫자가 아니다. 중간 비들을 잃은 사건(n=32 대 n=96)은
+단위 오류였다.
+
+**새 환경 체크리스트**: ① 두 리포 클론(bloomery, rig-log — 둘 다 GitHub에 푸시돼 있음) ② 박스 SSH 설정 + `tools/box.sh` 동작 확인 ③ gadak 설치/설정(또는 이슈 상태는 이 문서의 「대기열」로 대체 가능) ④ 맥에서 게이트 금지(arm64) — 모든 게이트는 box.sh 경유.
+
+### 목표
+
+DeepSeek-V4.1-Flash를 이 워크스테이션(RTX A6000 48 GB + RTX 3090 24 GB, 둘 다 sm_86, Threadripper 5975WX 32코어, 256 GB)에서 우리 엔진으로 서빙한다. 호스트는 Rust, GPU 커널은 CUDA Rust(지금은 cuda-oxide, 툴킷 13.3 라운드 뒤 cutile-rs), CPU expert 티어는 Rust SIMD. 기준선은 같은 자리에서 잰 것이다. ~~ik_llama.cpp: 서빙 프로파일 PPL 2.2355, 디코드 25.05 tok/s(2026-09-16).~~ **선 그음 2026-09-19 — 그 한 줄이 엔진 둘을 합쳐 놨다.** PPL 2.2355는 **ik 포트**(ik_llama.cpp #2455)가 plain Q3_K_M 324 GB에서 낸 값이고, 디코드 25.05 tok/s는 **mainline 포크**(vcruz305/llama.cpp — `iqk` 디렉터리가 없다)가 grafted 445 GB 파일에서 낸 값이다. 이 박스의 V4.1 서빙은 처음부터 mainline이었다(rig-log `log/2026-09-12-deepseek-v41-first-run.md`가 "mainline llama.cpp지 ik 아님"이라고 적어 뒀고, 여기 옮겨 적으면서 틀렸다). `llm.service`가 띄우는 것은 또 다른 구성이다 — ik + DeepSeek-V4-Flash-**0731** Q4_K_XL 155 GB, 포트 8000.
+
+같은 배치에서 둘을 나란히 잰 표가 #2455 본문에 있다: PPL 2.2355(ik) 대 2.2556(mainline), 디코드 20.4–20.7(ik) 대 21.2(mainline). **두 엔진이 3 % 안에 있다.** 이것이 이 프로젝트에 주는 것은 둘이다 — (1) 넘어야 할 선은 사실상 하나다, (2) ik의 존재 이유인 `iqk_mul_mat`이 이 배치의 호스트 expert 항에서 값을 못 받고 있다. 아주 다른 두 CPU 커널이 3 % 안에 떨어진다는 것은 그 항이 커널이 아니라 **대역폭**에 묶여 있다는 방증이고, `docs/roofline.md`가 그렇게 예측했다.
+
+왜 직접 만드는가: 이 박스가 실제로 서빙하는 모델은 mistral.rs가 로드하지 못하고, ik의 MoE 디코드는 배치를 못 하며, 어느 쪽이든 고치려면 업스트림 머지를 기다려야 한다(2026-09-19 기준 mistral.rs는 09-08 이후 정지, 외부 PR 40건 대기). 발견은 계속 업스트림에 코멘트로 보내되, 엔진은 머지에 의존하지 않는다.
+
+### 라운드 운영
+
+날짜 2026-09-21. 이 절은 위 로드맵을 **위임 라운드 단위**로 자른 것이다(2026-09-22 병합 전에는 `docs/orchestration.md`였다).
+라운드 하나 = 워크트리 하나 = 파일 경계 하나 = 게이트 하나 = 완료 보고 하나. 리드는 스펙·diff 독해·게이트 재실행·
+임대 측정·머지만 한다. 이 절의 크기 표기(S/M/L)는 추정이고 실측이 아니다 — 라운드가 끝날 때마다 실제 소요를 옆에 적는다.
+
+#### 원칙
+
+**백엔드(2026-09-21 오후 개정)**: 새 위임은 opus 서브에이전트(Agent 도구, `model:"opus"`)다 — 카드의 "GLM"은 그렇게 읽는다. 돌던 GLM 라운드만 끝까지 둔다.
+ (병렬성을 정하는 것은 파일 경계다)
+
+0. **파동마다 빌더 하나는 트래커 소화용이다**(사용자 09-24 "트래커에 붙은 애들은 언제 반영이 될까"). 서브에이전트가 보고한 「스펙 밖 개선 여지」는 [`research/spots-triage-report.md`](research/spots-triage-report.md)의 표로 모으고(리드가 main과 대조해 DO-NOW/TRACKER/DROP), 카드에 붙은 것은 그 카드의 라운드에서, 카드 없는 S 이하 품질·계측 항목은 파동마다 픽스업 라운드 하나로 10–15건씩 닫는다. 결정이 필요한 항목은 파동 보고 끝에 질문으로 올린다. 파동 보고에 「트래커 잔여 n건(이번에 m건 닫음)」 한 줄. 09-24 시점: TRACKER 73+5+4+6(보고들), 닫음 8+7+13=28(fixae `3a69ddb`·fixcd `48c672e`·fixbh `386ea8c`), 보류 7(load2 뒤).
+1. **같은 파일을 두 라운드가 동시에 만지지 않는다.** `crates/gpu/src/model.rs`가 GPU 경로의 병목 파일이다 — 조립 라운드는
+   전부 여기를 지나므로 **model.rs를 만지는 라운드는 한 시점에 하나**. 커널·게이트·도구·다른 크레이트는 자유롭게 병렬.
+2. **오라클이 직렬을 팬아웃으로 바꾼다**(plan.md 1단계에서 실증). 조립 입력이 앞 라운드의 출력이라도, ik 덤프가 그 입력을
+   파일로 갖고 있으면 병렬로 열 수 있다. 그래서 오라클 덤프 라운드(A·B 각각)가 다른 무엇보다 먼저다.
+3. **리드가 직렬 지점이다**: diff 독해·게이트·임대 측정·머지. 임대는 한 번에 하나. ~~그래서 동시 비행은 **3~4 라운드**가 상한이고~~ **개정(2026-09-24)**: 빌더는 다섯 이상을 동시에 띄운다(사용자 09-24 10:16 "한번에 다섯 개 이상") — 측정만 임대 하나로 직렬이고 증인으로 거른다. 아래는 그 전의 글이다:
+   ~~(GLM 쿼터도 같은 상한을 준다 — 주간 창은 09-26 11:54 리셋), 그 이상은 조사(agy) 라운드로 채운다.~~
+   **개정(2026-09-22)**: 위임이 opus라 쿼터가 상한을 주지 않는다. 상한을 정하는 것은 둘뿐이다 — 리드의 검수 대역과 **박스 임대 하나**.
+   박스로 재는 라운드는 한 시점에 하나이고, 코드 읽기·문서 라운드는 그 옆에 몇이든 붙는다.
+4. **조사는 코드보다 먼저 병렬로 간다.** ~~agy~~ 조사 라운드는 파일을 안 만지므로 언제나 병렬이고, 그 결론(B0)이 없으면 B의
+   코드 라운드가 잘못된 형상 위에 선다. 지금 A를 돌리는 동안 B0를 돈다.
+5. ~~**끝의 숫자가 없는 라운드는 열지 않는다.**~~ **예측이 없는 라운드는 열지 않는다**(2026-09-22 개정). 스펙은 「모델」 절에서 유도한 값과 밴드, 그리고 변경 클래스에 따른 증명 방식을 적는다. 측정은 예측을 확인하는 행위이고, 이동 전용 클래스는 PTX 표 동일로 끝난다.
+6. **원인이 측정되지 않은 느림에는 구현 라운드를 열지 않는다**(2026-09-22 신설). 먼저 원인 축소를 병렬로 셋 — 우리 쪽 **배가 프로브**
+   (그 일을 두 번 시켜 늘어난 만큼이 그 일의 값), **참조 독해**, 그리고 **커널 카운터**(`tools/ref/ncu-gpu.sh`). 구현 스펙은 셋이 같은
+   단계를 가리킨 뒤에 쓴다. 첫 사례가 A4b다. 근거는 사고다 — 참조를 안 읽고 세운 가설 셋이 한나절을 먹은 적이 있다.
+7. **계기를 한 번 의심한다**(2026-09-22 신설). 새 계기의 첫 표는 값이 아니라 **그 계기가 무엇을 잡았는지의 증거**와 함께 읽는다.
+   실측: ncu 첫 실행이 깊이 4096에서 `flash_latent_seg` 10.8 µs를 냈는데 깊이 6의 9.15 µs와 거의 같았다 — `--launch-count`가
+   프롬프트 스텝(m=4096)의 첫 층들을 잡은 것이었다. ~~지금 러너는 스텝당 54런치를 건너뛰고 그리드 크기를 찍어 증명한다.~~
+   정정(같은 날 저녁): 그 증명은 거짓이었다. `step(&prompt)`는 토큰마다 그래프를 한 번씩 재생하므로 54런치는 프롬프트 두 토큰이고,
+   그리드는 캐시 높이에서 나와 깊이 0에서도 528이다. 그래서 "깊이 4096에서 flash 11.2 µs, 깊이 비용의 97%가 flash 밖"이라는 결론은
+   깊이 2의 측정이었다 — 두 번째 표도 첫 표와 같은 이유로 틀렸다. 계기의 증거는 계기가 찍는 형상이 아니라 **그 계기와 독립인
+   산술**(건너뛴 런치 = (프롬프트 길이 + 버릴 스텝) × 스텝당 런치)과 지표가 깊이를 따라 움직이는 것이다. 시간이 어느 커널에 가는가는
+   ncu가 아니라 `tools/ref/nsys-gpu.sh`가 답한다(재생마다 한 번 나오는 커널로 스텝 경계를 긋고, 경계 수가 프롬프트 길이와 맞는지 스스로 확인한다).
+   그 답(같은 날 저녁, 재생 621커널, 경계 9/9·4099/4099, 스텝 벽시계 3.90/5.89 ms = 기록과 일치): 깊이 8 → 4098에서 `flash_latent_seg`
+   6.55 → **75.77 µs/층**, `flash_merge_q8` 2.54 → 8.98. 스텝 증가 1.98 ms 가운데 두 커널이 1.98 ms — **깊이 비용은 flash가 전부다.**
+8. **박스를 쓰는 라운드 스펙에는 "카드가 떨어지면 즉시 멈춤"을 넣는다**(2026-09-22 신설). 재시도·재부팅·수정 없이 시각과 마지막
+   출력만 보고한다. `Xid 79` 뒤의 재부팅은 사람이나 BMC를 요구한다(장부 「GPU 선 이력」).
+9. **단계 경계마다 감사 파동을 한 번 돈다**(사용자 제안, 2026-09-23). 시선은 둘이다. 수학자·과학자의 시선은 실측한 토큰
+   예산을 비용 모델의 항으로 나누고, 어느 카드에도 속하지 않은 잔차를 찾는다. 시니어 커널 엔지니어의 시선은 합쳐야 하는데
+   안 합친 것, 비효율적으로 짠 것, 도입할 알고리즘을 안 쓴 것, 비동기·배치로 해야 하는데 안 한 것을 찾는다. 감사는 경계를
+   **지난 뒤**에 한다. 조립된 경로와 실측한 끝 수가 있어야 잔차가 보이기 때문이다. 경계 사이의 설계 시점 감사는 스펙이
+   맡는다. 구현 스펙은 넷을 적는다. ① 이웃 op과의 융합 후보 ② 겹칠 수 있는 비동기 구간 ③ 묶을 배치 ④ 대안 알고리즘이다.
+   넷 모두 유도 Δ(항 이름과 조건)를 달고, 모델이 기각한 것도 한 줄씩 적는다. ~~다음 경계는 B5다(카드 B13).~~ 지금의 경계는 「지금」의 "공개를 막는 것"이다.
+
+#### 열린 라운드 카드
+
+[`plan-triage.md`](plan-triage.md) 「열린 라운드 카드」로 옮겼다(2026-09-24, 원문 그대로). 현행 파동은 「오케스트레이션 플랜」의 표가 정본이다.
+
+#### 파동
+
+현행 파동(16~)은 위 「오케스트레이션 플랜」의 표가 정본이다. 파동 10~13의 원문은 장부 「파동 이력」에 옮겼다(2026-09-24).
+
+#### 갱신 규칙
+
+라운드가 끝나면 이 표의 크기 칸에 실제 소요(발사 → 머지)를 적고, 파동 표의 해당 칸에 머지 커밋을 적는다. 순서를 바꾸면
+바꾼 이유를 그 줄에 날짜와 함께 남기고 옛 줄은 선을 긋는다.
+
+### 대기열
+
+"다음"이라는 말은 전부 그 시점의 다음이다. GPU 선의 다음은 위 「라운드 운영 / 열린 라운드 카드」에 있다.
+
+이슈: MUL-43(스펙 디코딩 타당성 — n-gram 수용률 오프라인 계수가 먼저) · MUL-44(KV q8_0, 조건부) · MUL-30(GPU) · MUL-46(정리 라운드 — Done. 뼈대 분할이 들여온 swiglu 회귀는 d9626c4에서 닫음; 미결 잔여는 MUL-39에서 재측정: 디코드 swiglu 42.6 대 28.3 ms/32스텝, moe_trace·wv_b_heads·moe_expert_io +13 ms, 워커 파킹 64→590) · MUL-45(게이트 종료 코드 사고, 기록).
+
+- Q5_0/Q5_1 커널 쌍과 flash 스칼라/AVX2 쌍은 의도된 쌍둥이다(헬퍼 분리 10–13% 손해 실측). 합치지 말고 TWIN 주석을 따라 양쪽을 같이 고친다. `tools/ref/*_ref.cpp`·`*_rate.cpp` 다섯 쌍의 복제는 하네스라 우선순위 낮음.
+- 소형: KV q8_0(flash 이후 ctx 기울기), kq 부분합 4→8, 발산 {24} 원인(마진 0.151의 근타이 — 우선순위 낮음), THP 1회 A/B 노벨.
+
+#### GPU 선 트리아지 — 열린 항목
+
+[`plan-triage.md`](plan-triage.md)로 옮겼다(2026-09-24, 원문 그대로). 2026-09-23 정리라 일부 항목은 이미 착륙했다 — 다음 plantidy가 닫는다.
+
+### 공개 (사용자 09-24 "빨리 공개 수준으로 올려서 이슈화하고 싶어")
+
+- **M1 숫자 공개(이번 주)**: 실제 텍스트 헤드라인 + 드래프트 켠 값(자리 8·9), 카드 크기 곡선 24/38/41 GB(E21·E21b — E21b는 자리 12로 답했다, 장부), ik 같은 창 비교; rig-log 글(영어 요약 + 한국어 본문) + 30초 영상(드라이브); 공개 전 스크럽(BMC·사설 주소·호스트명·bug-report 아카이브 grep); "우리가 아는 한 V4.1 Flash를 CPU expert 오프로딩으로 돌리는 유일한 Rust 엔진(커널까지 Rust)" 주장은 글 쓰는 날 mistral.rs·candle 등에서 재확인해 "as far as we know"로. 결정 대기: 라이선스(추천 Apache-2.0), M1 시점 레포 공개 여부(추천: 공개, README에 numbers first / CLI in progress).
+- **DFlash 마무리(사용자 09-24 09:20 "deepflash 마무리를 해야 되는 상황") — 남은 라운드 순서**: `dsread`·`dsref`·`dsm`·`skew`·`ngdraft` 착륙 → **09:40 `dshc`**(base `a0444de`: `ds41_hc_pre_f32`(f32 가중치 HC_PRE) + `ds41_markov`(bf16 Markov 헤드 + argmax), 게이트 `gate-gpu-dspark-hc` 호스트 규칙 비트 동일 + dsref 세트 진단, 스펙 `spec-dshc.md`) ‖ `dsmx`(seamb 착륙 뒤: MXFP4 `_sel` gate·up·SwiGLU + down m ≤ 8, `route_core::<SqrtSoftplus,LargerId,128,3>` wrapper, 게이트 호스트 정수 규칙 비트 동일 + f32 참조 밴드, 스펙 `spec-dsmx.md`) → `dsgraph`(드래프트 본체: 링·스테이징·블록 패스·헤드·Markov, w마다 그래프, G-d1 = dsref 세트 블록별 대조) → `dsloop`(target 36–38 탭, 검증·확정, G-d3 무손실 = skew 게이트 등식, G-d4 수락률 0.702/0.570/0.478) → 리드가 D와 tok/s(어긋난 k=1). M4 모델별 라운드는 그 뒤..
+- **M2 돌려 볼 수 있게(~2주)**: **토크나이저**(`tok` 라운드 — GGUF vocab 바이트 BPE 인코드/디코드, 게이트 = `llama-tokenize`와 코퍼스 id 동일), `bloomery-chat` 바이너리(템플릿·샘플링·스트리밍), README(빌드 한 줄·하드웨어·모델 파일; E20으로 변환 절차 삭제 여부), 30분 soak.
+- **참고한 엔진에 대한 예의(사용자 09-24)** — 레포와 숫자를 공개할 때 셋: ① README 크레딧 — ik_llama.cpp는 수치 기준(오라클)이자 설계 참조, exllamav3·mistral.rs도 설계 참조로 밝히고, ik에서 옮긴 코드(토크나이저 정규식·커널 전사 등)가 있으면 공개 전에 훑어 저작권 표기를 남긴다 ② 공정한 비교 — ik는 가장 빠른 플래그(DSpark 포함)로 같은 창에서 재고 재현 스크립트를 같이 낸다 ③ 숫자가 트위터·rig-log에 나가기 전에 ikawrakow에게 두세 줄로 먼저 알린다(무엇을 만들었고, 찾은 결함은 계속 PR로 보내고, 비교 방법을 봐 주면 고맙다). PR 본문에는 bloomery 이야기를 섞지 않는다.
+- **M3 서버/커뮤니티**: OpenAI 호환 엔드포인트 하나, 이슈 템플릿, 기여 안내.
+- **M4 다른 모델 계열 — 대상은 GLM Flash·Qwen·DeepSeek V4 Flash(사용자 09-24; gpt-oss 제외)**: M2 뒤. 조사 `models`(머지 `0d3866d`, `docs/research/models-survey.md`, 출처 커밋 고정, 리드 표본 검증 3건 일치)가 처음 가정 넷을 뒤집었다. ① "GLM Flash"는 오늘 **GLM-5.3-Flash = `glm5next`**(ik만): 45층 중 34층 KDA 선형 어텐션 + 11층 rope 없는 MLA(k-pool 인덱서) + mHC — GQA 포트가 아니라 **새 커널 계열(L)**. ② 가장 싼 GLM은 **GLM-4.7-Flash(`deepseek2` 파일, 캐시 행 576/512 = V2-Lite)**: 우리 flash 커널 그대로, 차이는 q_lora·분리 `attn_k_b/v_b`·sigmoid 64/4·20헤드·공유 expert Q5_K(카드 형식 없음); 지금은 `scratch.rs` `n_used != 6`에서 거부. ③ **V4 Flash는 "V4.1 − engram"이 아니다**: ik 비공유 스트림 분기(층별 압축기 + APE, 인덱서 자기 압축기, 비율 128 층은 인덱서 없이 전체, 앞 3층 `ffn_gate_tid2eid` 해시 라우팅, 인덱스 헤드 64), 공개 파일 expert는 MXFP4. ④ **순서를 정하는 것은 가중치 형식**: 카드가 Q5_K·F16·MXFP4 거부, gguf 리더가 IQ·I32를 Unknown, routed `_sel`은 Q3_K/Q4_K/Q5_0뿐 — Qwen3 파일(Q4_K+Q6_K)만 거의 지금 형식 안(카드 Q6_K `_sel` 하나 부족). 라우터: GLM은 V3식 sigmoid+bias(n_group 1, S 변형), Qwen3 MoE는 softmax 정규화(V2-Lite 규칙, 128/8), V4 Flash는 V4.1 규칙 그대로(256/6 + 해시 3층). **추천 순서**(문서 §7): 1 Qwen3-30B-A3B 전 카드(GQA flash decode·NEOX rope·QK-norm·softmax 라우터·Q6_K `_sel`; ik·mainline 둘 다 기준선 — 사용자 목표 "vram 통짜에서 llama보다 빠름" 증명) → 2 Qwen3 dense 8B/14B/32B(같은 커널 + dense FFN 역할) → 3 GLM-4.7-Flash 전 카드(핀 → hparams, q_lora, sigmoid, Q5_K 카드 형식) → 4 Qwen3-235B-A22B 호스트 티어(새 커널 없음, `HostExperts` + 역할) → 5 V4 Flash 호스트 티어(둘째 body, MXFP4 커널 양 티어 또는 자체 K-quant 파일; Spark 이식(GB10 sm_121·arm64·통합 128 GB)은 컨트리뷰터 — 사용자 09-24 "우리 환경 구현만") → 6 GLM-5.3-Flash + Qwen3.5/3.6/3.8(선형 어텐션 프로그램 하나: delta-rule 커널·상태 캐시, nope MLA + k-pool 인덱서 + mHC, PLE). 경계: 두꺼운 `Arch` 트레이트 없이 `arch/<gguf이름>/` 여섯 파일 + 아키텍처별 `ChainBody` + `HostExperts` 하나(`docs/arch-split.md` 그대로). 미검증(§9): Qwen3.5+ 라우터 규칙, 20 쿼리 행에서 `flash.rs` MMA 경로, 우리 서빙 파일의 pre 값. 공개 순서는 V4.1 헤드라인 먼저.
+  - **실행 방식(사용자 09-24 "공통 사용 가능한 구조 리팩토링 먼저 해두고 실 구현은 큰 단위로 서브에이전트에게 장기 작업")**: ① **seam 프로그램** — 이동 클래스 라운드 셋(ptx-scan 표·게이트 판정 줄 동일이 증명, `seam-common.md`): `seamc`(gguf `GgmlType` 전 id 명명 + 미지원 dequant는 이름 붙은 오류, `Role::DenseFfn`/`Role::Unused`(`nextn.*`) + 분류 불가는 오류, 카드 형식 거부를 이름으로 — ~~08:35 발사~~ **머지 `aff69e7`**, 리드 재실행 check·lint 168·fmt·recipes·placement·ds41-meta·dspark-read·qdot·e2e·load-v41 전부 rc=0: `GgmlType` 16개 추가(이름·블록·타입 크기를 ik `c10fbbcc`·mainline `930e2fa59` 컴파일 라이브러리에 핀), `has_dequant`, `Role::DenseFfn`(카드)·`Role::Unused`(어디에도 안 놓고 stage를 안 물음), `PlacementError::NoCardFormat{name,ty,role}`; 배치 표 md5 동일(2,421줄), e2e ptx-scan 동일, ds41-load 표 행 동일(배너 바이트 1 차이 = 워크트리 경로별 `__shared_mem_N` 순서 — 정규화는 스캔 쪽 S). 전제 정정: 분류 불가·카드 형식 없음은 이미 거부되고 있었고 이번엔 타입으로 승격만. 스펙 밖: **MTP 블록은 이름 규칙이 아니라 arch 규칙**(Qwen3.8 mtp 파일은 블록 48이 nextn 6개 + 보통 이름 — 각 arch 분류기가 마지막 `nextn_predict_layers` 블록을 Unused로, S), V2-Lite `role_of` 조용한 catch-all(`deepseek2/mod.rs:544`, S — seama 범위), `gguf/src/lib.rs:674` 폴백 arm 죽음·`:627` 문서 stale·`:684` q8_K 264 B 오기(XS 셋), Q4_0/Q4_1/Q8_1/Q2_K/Q8_K는 여전히 Unknown(inventory 핀)) ‖ `seamb`(라우터 const-generic 코어 `route_core::<SCORE,TIE,N_EXPERT,N_USED>` + 두 wrapper, PTX 불변, Sigmoid 슬롯 — **09:12 발사**, base `a5f7214`; chat과 파일 겹침이 없어 앞당김) ‖ `seama`(V2-Lite 핀 → 한 번 읽는 hparams + 이름 붙은 거부, GLM-4.7 체크리스트 산출 — **08:50 발사**, base `bad736f`). ② seam 착륙 뒤 **모델별 장기 라운드 하나씩**(큰 단위, 워크트리 하나, 자기 crate/`arch/<이름>/`, 게이트 = ik 하네스 덤프 텐서별 대조 + PPL/KLD + 같은 창 A/B): `qwen3`(30B-A3B 전 카드 → dense 8B/14B/32B — GQA flash decode·NEOX·QK-norm·softmax 라우터·Q6_K `_sel`), ~~`glm47`(GLM-4.7-Flash 전 카드)~~ `glm53`(GLM-5.3-Flash — `linear` 뒤, 「오케스트레이션 플랜」), `qwen3host`(235B 호스트 티어), `ds4`(V4 Flash 둘째 body + MXFP4 또는 자체 K-quant), `linear`(GLM-5.3-Flash + Qwen3.5+ 선형 어텐션). 각 라운드는 30분 박스 상한을 지키며 게이트 단위로 쪼개 돌리고, 타이밍은 리드가 임대로.
+  - **비교 대상 하나 더(사용자 09-24, local-ai-registry PR #83)**: 3090 한 장·EXL3 3.0 bpw·SGLang·MTP(드래프트 4/검증 1)에서 Qwen3.6-35B-A3B **252 산문 / 352 코드 tok/s**, Qwen3.8-27B dense 99 / 143. [유도] 35B-A3B 활성 3B×3 bpw ≈ 1.1 GB/스텝 → 936 GB/s 바닥 1.2 ms인데 MTP 수락 2.5로 잡아도 스텝 ≈ 10 ms — 대역폭의 ~10 %, 나머지는 스케줄러·런치 오버헤드. ~~우리 그래프 스텝은 그 항이 없으므로 드래프트 없이 2–3 ms/스텝 = 400–500 tok/s가 목표 대역.~~ **정정(linearres 12:10, `docs/research/linear-attn.md` §6)**: 박스의 Qwen3.6-35B-A3B 파일은 UD-Q4_K_XL이라 3 bpw 가정이 성립하지 않는다 — 스텝 바이트 2,884 MB(깊이 0; 그중 540 MB가 Q8_0 출력 헤드), 바닥 **324 tok/s(3090) / 243(A6000)**[유도]; 드래프트 없이 PR #83의 252는 바닥의 78 % 이상에서만 이기고 352는 닿지 않는다(이 GGUF에는 MTP 층도 없다). 3 bpw급 파일(IQ3_XXS 등)이면 바닥이 다시 400대로 오른다. dense 27B는 바닥이 같아(10 GB → 92스텝/s; 그들 선형층 13.3 ms = 760 GB/s 81 %, 우리 q8_0 gemv 70 %) 이용률 + MTP 헤드 k>1(두 위치 되감기 L)이 있어야 이긴다. 전제: qwen3 라운드, 3 bpw급 형식(Q3_K 3.44 bpw는 바닥 −13 %; IQ3_XXS 3.06 dequant가 싼 길, EXL3 트렐리스 이식은 L), MTP 드래프트. **첫 측정 목표: 35B-A3B Q3_K 드래프트 없이 3090에서 252 초과.**
+
+### 타겟 프로필 (사용자 09-24 "3090 하나 혹은 두 개에 스레드리퍼 AVX2로 V4.1 Flash를 돌려볼 사람")
+
+공개 글의 헤드라인은 **타겟 독자가 가진 하드웨어의 값**이어야 한다. 지금 표는 전부 A6000(48 GB) plan (a)라 두 군데가 다르다.
+
+| 항 | T1 기본 | T2 확장 | 우리 측정 (참고) |
+|---|---|---|---|
+| GPU | RTX 3090 24 GB ×1 — 배치 = 오늘의 `--place gate`(dense 7.66 GB + expert ~~~10 GB ≈ 600슬롯~~ **14.9 GB = 888슬롯**(budget 라운드 실측 `card_experts=888 (14894530560 B)`); 슬롯 = 카드에 상주하는 routed expert 하나, 16,773,120 B) | 3090 ×2 (48 GB, 두 카드 합류 경로 필요 — ㊳ 걸림돌 여섯) | A6000 48 GB plan (a), ~~888슬롯~~ **2,414슬롯**(40.5 GB; 888은 gate 배치의 값이었다 — budget 라운드 정정) |
+| CPU | AVX2, **8채널 DDR4**(5975WX STREAM 147.7 GB/s) — 4채널이면 호스트 다리 ×2 | 같음 | 같음 |
+| RAM | **256 GB 하한**(호스트 expert 집합 196–244 GB) | 같음 | 264 GB |
+| 저장 | NVMe(engram 테이블 mmap) | 같음 | 같음 |
+
+- T1의 실측이 없다: **E21**(아래) — `--place gate` + 뜨거운 목록을 3090에서 시간 측정(A6000 고정 규칙의 예외, 사용자 승인 필요; 250 W 캡 아래 게이트는 이틀째 안정).
+- T2는 DSpark 드래프트의 3090 상주(8.65 GB)와 자리를 다툰다 — 드래프트가 먼저, 둘째 카드 expert는 그 뒤 카드.
+- 모델 파일: E20이 "공개 GGUF 그대로"로 닫히면 변환 절차가 사라진다.
+
+### 실험 큐 (사용자 09-24 "다양한 실험을 해서 끌어올려보자")
+
+한 임대 자리(≤30분)에 묶을 수 있는 것은 묶는다. 결과는 rig-log에 먼저, 여기는 상태만.
+
+| # | 실험 | 무엇을 정하나 | 비용 | 소유 | 막는 것 |
+|---|---|---|---|---|---|
+| E5 | ~~**n-gram/prompt-lookup 수락률**을 네 코퍼스 토큰 스트림에서 오프라인~~ **답함**(ngram, `db10553` `tools/ref/draft-accept.py`, 원문 [`research/draft-accept-e5-report.md`](research/draft-accept-e5-report.md), rig-log 09-24#free-draft-acceptance-offline): 텍스트 자체를 목표로 한 대리 척도, acc/positions 한 문서 / 2048 청크 — **code 0.595/0.514, threads 0.477/0.403 통과**, prose 0.382/0.310 경계, **korean 0.288/0.180 불통과**; a₂ 0.68–0.75(korean 0.45). 이기는 몫은 n=3 실제 반복. 다섯 코퍼스 중 prose-all은 prose와 같은 측정. 손익분기 표기: 0.34는 D=0, spec-decoding-report의 0.36은 Markov 헤드 D≈0.15 — 둘 다 맞음 | D≈0 드래프트 — 코드·스레드 서빙이면 DSpark 없이 어긋남+n-gram이 먼저(VRAM 0); 한국어는 DSpark 필요 | 오프라인, 1초 | 리드 | **다음**: 같은 스크립트를 우리 엔진의 greedy 출력 토큰열에(E5b, generate_ds41 `-n 2000` 한 팔, 임대 ~3분) |
+| E7 | 3090 250 W 캡 아래 실효 BW (`bench-gpu-kernels` 3090 팔) | dspark D 유도의 전제(700 GB/s) | 게이트 카드, 임대 없음 ~5분 | 리드 | — |
+| E9 | engram 콜드 팔(`Site::evict_rows` 뒤 측정, `read_bytes` 증인) | ㊳ C3: 콜드 행 비용이 표에 없다 | 임대 ~10분 | 리드 | telem |
+| E10 | 층 l+1 라우터를 층 l handoff x에 적용한 예측의 바이트 가중 적중률 | ㊴ P1(L3 끌기, 천장 −12.95 ms × h) 열지 말지 | 엔진 덤프 레버 + 오프라인 | 라운드(S) | — |
+| E16 | ~~뜨거운 목록의 PPL/KLD~~ **답함(자리 6, 06:14)**: c2048×4 목록 — PPL ours 1.9003 / ik 1.8989(Δ +0.070 %), d +0.00070 ± 0.00213, **KLD 0.00601 ± 0.00028**, same top 97.87 % — 접두 창 0.0059와 같음 → **목록 경로 결함 없음, 갈림은 반올림**(rig-log 09-24#hot-list-ppl-kld). 남은 것: 같은 base의 접두 행(다음 접두 PPL은 c2048×4로) | 목록을 기본값으로 올려도 됨 — 다음 라운드에서 `BLOOMERY_HOT_LIST` 기본 경로 결정(레포 밖 파일이라 데이터 경로 규약 필요) | — | — | — |
+| E19 | **lookup 드래프트 게이트, 오프라인**(사용자 09-24 Jev 질문 → [`research/jev-placement.md`](research/jev-placement.md)): `draft-accept.py` 확장 — 일치 길이 n=1/2/3/≥4·출현 횟수별 수락률, 정책 넷(항상 쌍 / n≥k / 로지스틱 / 오라클)을 Σ(1+수락)/Σ(쌍 r, 아니면 1)로 r=1.21·1.29 채점, 네 코퍼스 + E5b greedy 출력 | 오라클−항상쌍 < 2 %면 게이트 버림; n≥k가 오라클 1점 안이면 규칙 채택 → 같은 임대 A/B. 외부 분류기(Jev 계열, 최속 5.3 ms)는 토큰 단위로 못 씀 | 오프라인 수 분 | 라운드(S) | E5b |
+| E21 | **T1 실측: 3090 단일 배치의 tok/s** — `BLOOMERY_TIMING_GPU=<3090>` `--place gate` + `BLOOMERY_HOT_LIST`, 깊이 6/4096, 코드·산문 512토큰 프롬프트, `-n 96`, 2바퀴(A6000 고정 규칙의 예외 — **사용자 승인 09-24**) | 공개 글 헤드라인 = 타겟 카드의 값; ~~예측[유도]: 슬롯 888→~600이면 호스트 슬롯 +30 %, 스텝 ~+7–8 ms → 22–24 tok/s(드래프트 없이)~~ 정정(budget 라운드): 카드 슬롯은 2,414→888(−63 %)이고, 호스트 슬롯/토큰 증가분은 E11의 `host_slots` 실측(목록 배치, plan (a))에서 gate 배치의 카드 적중률로 다시 유도해야 한다 — 유도 전에는 예측 없음 | 임대 ~20분 | 리드 | 사용자 승인 |
+| E17 | **뜨거운 목록의 프롬프트 의존**(사용자 09-24 "빈도순위는 프롬프트마다 많이 달라지는 거 아니니"): 코퍼스별(code·prose·threads·korean, + 혼합) 층별 순위표를 `router-hotlist.py`로 각각 뽑고, A 목록의 앞 n_l개로 B 스트림을 돌렸을 때의 바이트 가중 적중률 행렬(4×4 + 혼합 열) **+ 접두 열: 문서 앞 N=64/256/1024 토큰의 라우터 선택으로 만든 순위가 나머지에서 얻는 적중**(jev-placement: 프리필 통계가 분류기를 대신하는지 — N=256이 in-domain 57.6–73.5에 닿으면 E18은 분류기 없이) — 오프라인, 박스 CPU ~수 분, 임대 없음 | 정적 목록 하나로 충분한지, 아니면 E18을 열지(적중 격차 > 10 %p면 연다) | ~10분 | 리드/라운드(S) | — |
+| E18 | (E17 뒤) **프롬프트 적응 배치**: 프리필의 라우팅 통계로 카드 상주 expert를 요청마다 교체 — 슬롯 맵은 디바이스 표라 같은 개수 교체는 재캡처 없음(`chain/ffn.rs:509`), H2D 26.2 GB/s로 expert 0.64 ms, 층당 4개 97 ms·8개 195 ms[유도], 상한 이득 3.0–9.9 ms/스텝, 프리필에 숨고 ≤189토큰에 회수; 미확인: 호스트 티어 사본 라이브 교체, 디코드와 겹친 H2D가 호스트 다리를 늦추는 몫 — 설계 카드부터 | 요청 단위 서빙에서 목록 이득을 프롬프트 무관하게 | 카드 | — | E17 |
+| E14 | 0층 bridge 2.1–2.7 ms(nsys, 판정 아님) 원인 — 계획 0.85의 2.5–3배; 0층 전부 호스트 Q5_K 6 expert | 스텝 최대 exposed 항 | E1과 한 임대(STEP_STATS leg_us 층별은 없음 → nsys 층별) | 리드 | — |
+| E27 | **3090 한 장의 DSpark 자리**[유도]: 드래프트의 카드 바이트는 8,562,671,616 B(측정, dsgraph A의 할당기 증감)로 타겟 전문가 약 510개분(개당 16.77 MB)이다 → T1 gate 배치 888 → ~378, 그래서 T1 이득이 +7 %에 그친다. 레버 셋: ① 타겟 출력 헤드 사본을 공유(542,976,000 B ≈ 32개분) ② 드래프트 라우팅 전문가(7,219,445,760 B)를 뜨거운 목록으로 카드·호스트에 나눔 ③ T1은 드래프트를 통째로 호스트(AVX2)에서 — DSpark는 블록 하나를 한 패스로 내므로 호스트 패스는 검증 패스마다 한 번이고, 카드 8.5 GB가 전부 타겟 전문가로 돌아간다(패스 비용은 유도 전) | T1 DSpark 배치 | 유도(조사 S) | dsloop 스펙 | dsgraph C |
+| E28 | **Qwen3-30B-A3B 전 카드 같은 창 A/B** — 우리·ik·mainline llama.cpp, A6000, 깊이 6/1024/4096, n 96, 번갈아(사용자 목표 "vram에 통짜로 들어갔을 때 llama보다 빠른 것도 증명"); 예측 180–235 tok/s[유도, qwen3 3단계 보고] | 공개의 두 번째 헤드라인 | 30분 자리 1개 | 리드 | `qwen3time` 러너 |
+| E29 | **DSpark 수락률의 온도 의존**: ik + DSpark n_max 5, `--temp 0 / 0.7 / 1.0`, prose·code(자리 13의 32.1 / 29.4는 `--temp 0`) | 드래프트 이득이 실사용 샘플링에서도 서는가 | 자리 ~15분 | 리드 | `ik-draft.sh`의 온도 인자 확인 |
+
+### 측정 프로토콜 치트시트
+
+```
+just measure-decode                    # N=8 창 + 같은 임대 ik (헤드라인)
+just gate-alloc                        # 정상 상태 스텝의 할당자 호출 수 (내려가기만 하는 래칫)
+just ab-decode bloomery-<track>        # 같은 임대 A/B — 디스패치 경로를 만진 라운드의 완료 조건 (절대값은 창마다 ~5% 움직인다)
+./tools/box.sh 'BLOOMERY_DECODE_N=96 bash tools/ref/decode-measure.sh'   # N=96 창
+./tools/box.sh 'BLOOMERY_DECODE_N=96 bash tools/ref/profile-measure.sh' # 스테이지 표 L1+L2
+cargo build --release -p bloomery-qdot --bin qdot-rate-mt && .../qdot-rate-mt   # 커널 MT 상한(참고)
+```
+비교는 같은 임대 안에서만. 스텝 표의 첫 구간 편향(MUL-28) 주의. 기록 순서: bloomery 커밋 → rig-log 기록 + README 행 → gadak 코멘트+Done → 메모리.
+
+### 규칙
+
+- 시간 숫자를 재는 카드, 조용한 기계, 게이트 완화 금지, 종료 코드로 읽기, 언어, 병렬 트랙은 `AGENTS.md`가 정본이다(여기 있던 사본 여섯 줄은 2026-09-24에 장부로 옮겼다).
+- 첨부 프로토콜(`/props` + 청크별 `timings`)은 1단계부터. toktape가 어느 단계든 녹화할 수 있어야 한다.
+- GGUF 파서·토크나이저는 기존 crate. 이 엔진의 가치는 배치·스케줄러·커널이다.
+- **머지 순서 규율**: 재핀 없는 트랙(비트 불변 주장)을 먼저 머지, 산술 순서를 바꾸는 트랙(재핀 발생)을 마지막에 — 재핀 귀속이 흐려지지 않게.
+
+### 옮긴 절
+
+2026-09-24에 원문 그대로 옮겼다(계획을 읽을 때마다 싣기엔 컸다).
+
+- [`facts.md`](facts.md): 「이 모델에 실제로 들어 있는 것」(공개 V4.1 파일 목록 포함) · 「이 기계에 맞춘다는 것」 · 「툴체인」 · 「라운드 전에 정해 둔 설계 규칙」 · 「법칙과 교훈」
+- [`plan-ledger.md`](plan-ledger.md)(장부): 「디딤돌」 · 「단계」 · 「로드맵」(A·B·C) · 「모델 / 되짚기」 · 「라운드 운영 / 의존 그래프」 · 「변경 클래스와 증명 방식」·「성능이 먼저」의 한국어 원문
+- [`plan-triage.md`](plan-triage.md): 「열린 라운드 카드」 · 「GPU 선 트리아지」
+
