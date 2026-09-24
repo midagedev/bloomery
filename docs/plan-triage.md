@@ -197,3 +197,14 @@
 - `bloomery_serve_ds41.rs:182`·`bloomery_chat.rs:266` plan/load 줄에 `host_shadow`/`shadow=host`가 없다(XS). `chain/attn.rs:120-122` `AttnIo.shadow` 문서에 "호스트 메모리"(XS).
 - 링을 k 슬롯 과할당하면 k 이하의 cut은 복원이 필요 없다(exllamav3 `cache/dsa.py:24-27`의 `guaranteed_rollback`; k=768이면 ≈30 MB [유도]) — geometry·커널 변경(M).
 - 리스 대기 헬퍼 스크립트(체인 실수 방지 — 이번 라운드가 `| tail -1 &&`로 잡힌 리스 아래 clippy를 한 번 돌렸다)(S).
+
+## 라우터 NaN (nanmoe 보고, 2026-09-24 — 수정은 `88de92e`)
+
+- `crates/qdot/src/lib.rs:521-540` AVX2 q8_K 인코더가 NaN이 든 블록에서 `x[256]`으로 panic한다(hot list 3090 arm에서 실측). 스칼라 쌍둥이(`:407`)는 NaN을 건너뛰어 두 인코더가 비트 동일하지 않다(S).
+- `crates/gpu/src/lib.rs:347`, `fused.rs:188`, `q5.rs:332` `if amax > 0.0 { amax/127 } else { 1.0 }` 세 벌 — 전부 NaN인 행을 0으로 읽혀 serve의 NaN 검사가 못 본다(로짓이 전부 0 → 토큰 0). 비유한 행은 비유한 값으로 흘려보내 서버가 잡게(S).
+- `crates/gpu-deepseek41/src/router.rs:~200-270`과 `experts_mxfp4.rs:~590-650` 마지막 블록의 선택·가중치 본문이 두 벌(R14, M).
+- `gate_deepseek41_step.rs:220`·`gate_deepseek41_long.rs:68` `GREEDY_MARGIN` 중복(XS). `gate_deepseek41_moe.rs:639-647` f64 참조 `weights64`에 가드가 없다(XS).
+- `tools/ref/dump_ref.cpp:616` `on_tensor`에 탭 필터가 없어 321토큰 배치 하나가 47 GB를 썼다(S). `tools/ref/dump.sh:175-177` 실패한 덤프의 `.staging`이 남고 목록에 안 잡힌다(XS).
+- `chain/ffn.rs:597-613` `FfnTaps`에 라우터 입력(normed x)과 호스트 partial sum 핸들이 없다(S). `generate_ds41.rs:354,380` 모델 파일과 `PlanInputs`를 한 실행에 두 번 연다(XS).
+- 커버리지: shadowhost가 착륙해 gate 배치가 888로 돌아가면 `--free` arm은 pos 315에 닿지 않는다 — 그때부터 이 결함은 `--trigger` arm과 두 planted `all_underflow` 행이 지킨다.
+- 업스트림: ik의 같은 결함은 라운드 `iknan`이 FAIL-first 중(사용자 09-24 "오픈으로 올리자"). ik `logf(1.0f+expf(x))`(`ggml.c:3410`)를 `log1pf`로 바꾸는 제안은 확률 비트를 넓게 움직이므로 PR에 넣지 않는다.
