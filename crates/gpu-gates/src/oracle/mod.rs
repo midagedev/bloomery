@@ -168,17 +168,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bloomery-open-named-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         let set = dir.to_str().ok_or("temp dir is not UTF-8")?;
-        let open = |arch_line: &str| -> Result<RefManifest, GateError> {
+        // A V4.1 set's `# model` line must name the file the tree runs.
+        let runs = gguf::v41::model();
+        let open = |header: &str| -> Result<RefManifest, GateError> {
             let row = "tensor\tx\t0\tf32\t1\t1\t1\t1\t4\t0\tNONE";
-            std::fs::write(dir.join("MANIFEST.tsv"), format!("{arch_line}{row}\n"))?;
+            std::fs::write(dir.join("MANIFEST.tsv"), format!("{header}{row}\n"))?;
             o.open_named(set)
         };
-        assert!(open("# arch\tdeepseek41\n").is_ok());
-        let err = open("# arch\tdeepseek2\n").unwrap_err().to_string();
+        let ours = format!("# arch\tdeepseek41\n# model\t{runs}\n");
+        assert!(open(&ours).is_ok());
+        let err = open(&format!("# arch\tdeepseek2\n# model\t{runs}\n"))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("deepseek2") && err.contains("deepseek41"),
             "{err}"
         );
+        let err = open("# arch\tdeepseek41\n# model\t/models/other/x.gguf\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/models/other/x.gguf") && err.contains(&runs), "{err}");
+        assert!(open("# arch\tdeepseek41\n").is_err());
         assert!(open("").is_err());
         std::fs::remove_dir_all(&dir)?;
         Ok(())

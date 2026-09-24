@@ -572,7 +572,10 @@ gen-qwen3moe *ARGS:
 
 # V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 5토큰 세트의
 # 모든 층에서 ik의 라우팅을 주입해 호스트 티어가 낸 routed 부분합을 ik의 ffn_moe_out과 도출한 밴드 안에서 대조한다
-# (플립은 따로 세고, 층마다 클램프 히트 수를 찍는다). 세트가 라우팅한 expert만 읽는다. 끝으로 크레이트 doctest —
+# (플립은 따로 세고, 층마다 세트가 닿은 클램프 히트 수를 찍는다 — 어느 층이 닿는지는 파일의 것이다). 클램프 자체는
+# 층마다 합성 입력으로 한계 너머까지 따로 본다: 토큰 0의 라우팅을 그대로 두고 입력 행을 2의 거듭제곱으로 키워
+# silu(g) > L, u > L, u < −L을 모두 넘긴 뒤 combine이 qdot::swiglu_clamp와 비트 동일하고 f64 서술 안인지 확인한다.
+# 세트가 라우팅한 expert만 읽는다. 끝으로 크레이트 doctest —
 # ops::ShardTensor의 compile_fail(다른 샤드를 가리키는 핸들은 만들 수 없다).
 gate-ds41-host:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test ds41_host -- --ignored --nocapture && bash tools/gate.sh --release -p bloomery-model --doc'
@@ -650,8 +653,8 @@ kvclear-probe *ARGS:
 
 # 1단계 1-1 게이트: 디퀀트 오라클을 빌드해 ggml의 to_float 덤프를 만들고, gguf 크레이트의
 # hw 테스트가 그것과 대조한다. hw_ 접두는 박스를 요구한다는 뜻이고 기본 실행에서 빠져 있다.
-# 덤프는 둘이다: V2-Lite의 여섯 타입은 $BLOOMERY_DATA/ref에, V4.1 첫 샤드의 f32·bf16·q8_0은
-# $BLOOMERY_DATA/ref-v41에. --include-ignored라 split 리더와 인벤토리의 평범한 테스트도 같이 돈다.
+# 덤프는 둘이다: V2-Lite의 여섯 타입은 $BLOOMERY_DATA/ref에, V4.1 첫 샤드는 파일의 타입들(공개 Q3_K_M 파일이면
+# f32·q3_K·q4_K·q5_K·q6_K의 다섯)을 $BLOOMERY_DATA/ref-v41<세트 접미>에 — 공개 파일은 ref-v41_plain, 혼합 파일은 ref-v41. --include-ignored라 split 리더와 인벤토리의 평범한 테스트도 같이 돈다.
 # 박스의 모델 파일에 없는 q2_K·iq2_xs·iq3_xxs·iq4_xs는 --synthetic이 ggml로 양자화한 행과 무작위 코드 행을
 # $BLOOMERY_DATA/ref-synth에 덤프하고, i-quant 코드북(iq_tables.rs)은 gen-iq-tables.py --check가 ik 헤더에서
 # 다시 뽑아 커밋된 파일과 바이트로 대조한다.

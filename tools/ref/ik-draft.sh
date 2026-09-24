@@ -29,8 +29,8 @@
 # the model's own (over a million positions), not the prompt's. The dspark arm adds
 # `-md $DSPARK_MODEL --spec-type $STAGE`. ik builds the DSpark draft's parameters from the
 # target's own (common/speculative.cpp: only an MTP stage clears them), so the draft inherits
-# -ngl and --n-cpu-moe, and with its three layers under --n-cpu-moe 34 every draft expert runs
-# on the host; BLOOMERY_IK_DRAFT_PARAMS (passed as ik's --draft-params) changes that.
+# -ngl and --n-cpu-moe, and with its three layers under the profile's --n-cpu-moe (IK_NCMOE)
+# every draft expert runs on the host; BLOOMERY_IK_DRAFT_PARAMS (passed as ik's --draft-params) changes that.
 #
 # The lcpp run: the profile's LCPP tree, $LCPP/build/bin/llama-completion -m MODEL $LCPP_CLI_FLAGS
 # -c CTX -n N -f <prompt> --no-escape --temp 0 --ignore-eos --no-display-prompt --verbose-prompt

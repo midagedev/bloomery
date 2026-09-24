@@ -52,9 +52,8 @@
 # each with the host's share of the probability), the shape is not: ours joins the host once per
 # layer, ik's card layers never wait on the host and its CPU layers never use the card's share.
 # Mainline places by the same rule (--n-cpu-moe), so an lcpp row has ik's shape; the profile sizes
-# its LCPP_NCMOE for the public file (V41_PUBLIC) and gives the arithmetic. IK_GPU_FLAGS was sized
-# for the mixed file's dense bytes, so at equal flags the two references hold the same layers on
-# the card only where the two counts agree.
+# both counts per file from MODEL (IK_NCMOE and LCPP_NCMOE, one arithmetic — the two engines place
+# the same tensors on the card), so the two references hold the same layers on the card.
 #
 # Paging. The two engines' host expert sets differ (ours: experts n_l.. of every layer, ik: all
 # experts of its CPU layers), and together they are about the page cache's size. The witness
