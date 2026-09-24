@@ -286,7 +286,7 @@
 - **형태 결정: (a) `arch/deepseek41`과 `gpu-deepseek41` 안의 변형.** V4와 V4.1은 KV 토폴로지·스텝 입력·적재 계획·사슬의 타입이 같고 값만 다르다(원칙 1). ik는 빌더 하나에 플래그 넷(`llama-hparams.h:167-191`), mainline PR은 `llama_model_deepseek41 : llama_model_deepseek4`로 둘 다 "V4 + 차이"다. 차이 여섯(같은 서브층 hc와 학습 헤드 `output_hc_*`, 헤드별 q RMS norm, CSA 겹침 풀링 + APE, 인덱서 전용 압축기 64헤드, 인덱서 없는 HCA 층, 앞 3층 해시 라우팅)은 층 종류 값과 모델 단위 값으로 표현되고 디스패치에 `if arch`가 없다. (b) 새 arch + 크레이트는 V4 코드 전에 이동 라운드 2–3개와 `body.rs`·`chain/` 약 6,700줄 이중 장부가 든다. 치르는 값: arch-split 원칙 3(디렉터리 이름 = 파일 문자열)의 예외 한 줄(v4meta가 `docs/arch-split.md`에 날짜와 함께 쓰고 `models-survey.md:239`의 "둘째 body" 문장도 같이 고친다), V4 전용 커널의 ICE가 V4.1 빌드를 깨뜨릴 수 있는 점(겹침 압축기처럼 V4만 쓰는 모듈은 cargo 피처 뒤로).
 - **파일**: `unsloth/DeepSeek-V4-Flash-0731-GGUF` `UD-Q3_K_M`, 1,328 텐서 128.07 GB. routed gate/up IQ3_XXS(층 26만 MXFP4), down MXFP4, dense Q8_0, hc F32, 라우터 BF16, 해시 표 I32. expert 하나 10,878,976 B(V4.1 공개 16,773,120 B). MTP 층 없음(드래프트는 별도 DSpark 파일). 층별 형식이 다르므로 `HostLayerSpec`·카드 스택은 텐서 이름이 아니라 층별 형식 표를 가진다.
 - **예측[유도]** `tok/s @ prose 512 뒤 n=96, A6000 plan (a), 뜨거운 목록`: 카드 expert ≈ 3,780 / 11,008(34 %), 호스트 다리 6.1–10.3 ms(목록 적중 0.55–0.70은 가정), 카드 전용 12.3–14.5 ms → **40–54 tok/s(중심 약 46)**, 접두 배치면 34–39. 병목이 호스트에서 카드 dense(Q8_0 7.33 GB/스텝)로 옮겨 간다. 가장 크게 빗나갈 수 있는 항: IQ3_XXS AVX2 실효 GB/s(135는 Q3_K/Q4_K 값) — v4host의 첫 산출물이 이 숫자다. 80 GB/s 아래면 밴드가 30대로 내려가므로 나머지 라운드를 계속 갈지 그때 다시 판정한다. 예측 5번의 "V4.1 공개 파일 카드 dense 약 3.9 GB"는 역산이다 — 박스 인벤토리로 닫는다(리드, XS).
-- **라운드**(각 ≤ M): {v4ref ‖ v4host} → v4meta → {v4card ‖ v4comp ‖ v4hc} → v4idx → v4body → v4time. v4ref = `tools/ref/models/deepseek4.sh` + ik 덤프 변형(정본 오라클 ik, mainline은 교차 확인). v4host = qdot IQ3_XXS·MXFP4 AVX2(ik `DequantizerIQ3XXS`·`MXFP4_Unpacker`) + 스칼라 거울 + `host-rate.sh` 측정. R0 ik 덤프(128 GB 페이지인)와 v4time(약 40분)은 30분 초과 → 사용자 승인.
+- **라운드**(각 ≤ M): {v4ref ‖ ~~v4host~~ v4host 완료 `55b5249`, 속도 미측정} → v4meta → {v4card ‖ v4comp ‖ v4hc} → v4idx → v4body → v4time. v4ref = `tools/ref/models/deepseek4.sh` + ik 덤프 변형(정본 오라클 ik, mainline은 교차 확인). v4host = qdot IQ3_XXS·MXFP4 AVX2(ik `DequantizerIQ3XXS`·`MXFP4_Unpacker`) + 스칼라 거울 + `host-rate.sh` 측정. R0 ik 덤프(128 GB 페이지인)와 v4time(약 40분)은 30분 초과 → 사용자 승인.
 - **공개 비교의 자리**: V4.1 llama.cpp 행은 lcpprun(PR #28696 arm)이 만든다. V4 포트는 PR 브랜치가 아닌 mainline과의 깨끗한 행을 위한 병렬 트랙이고 블로커가 아니다. mistral.rs에는 V4 지원이 없다(`d5ae0f1`).
 - **스펙 밖 처분**: `check-arch.sh`의 아키텍처 목록 고정(qwen3moe 경로가 새고 있었다) → 리드가 지금(디렉터리에서 목록을 읽고 디스패치 항목 둘 추가). `models-survey.md:48,:168` 낡은 문장 → 리드가 지금 정정. `moe.rs:967,:980` 융합 커널 없는 형식의 조용한 `dequant_row` 폴백 → v4host 스펙(거절 또는 `load` 줄에 형식별 경로; 없으면 첫 타이밍이 느린 경로를 잰다). `hc_f32.rs:6-7` 토큰당 블록 하나 → v4hc 스펙(split-K F32 hc_pre).
 
@@ -353,3 +353,20 @@ korean 266,143 → 265,648, prose-all 4,670,384 → 4,669,737, threads 4,515,000
 남긴 것(XS): `tools/ref/engram-corpus.sh:43` 기본 TOKENIZE가 미수정 트리라 재생성하면 결함이 다시 구워진다 — oracle.sh와 같은 `~/` 가드;
 `tools/ref/ik-greedy.sh:51` 프롬프트를 미수정 ik로 토큰화; oracle.sh MANIFEST에 프로브 결과 한 줄. mistral.rs·exllamav3는 HF tokenizers를
 쓰므로 처음부터 mainline과 같았다(`gguf_tokenizer.rs:49`, `tokenizer.py:50`).
+
+## V4 호스트 티어 커널 (v4host 보고, 2026-09-24 — `55b5249`; 예측 파일 사본 세션 스크래치 `wave-m4/v4host-predict.txt`)
+
+IQ3_XXS×q8_K와 MXFP4×q8_2_x4의 AVX2 융합 점곱이 호스트 티어에 들어갔다(ik 몸체 그대로; 스칼라 거울과 V4-Flash 실제 행 1024개에서 비트 동일,
+ik 자신의 점곱과 64행 0 ULP). 활성 짝은 ik 디스패치에서 읽었다: IQ3_XXS→Q8_K(`ggml.c:1116`, `iqk_gemm_iquants.cpp:2753`), MXFP4→Q8_2_X4
+(`ggml.c:1316`, `iqk_gemm_legacy_quants.cpp:2483`). IQ3_XXS에는 인코더 게이트 0이 없다 — ik의 AVX2 q8_K 인코더는 부호 없는 최댓값으로 코드를
+만들어 스케일이 늘 양수고 우리는 ggml 참조(부호 있는 극값)라 바이트가 다르고 곱만 같다. 적재 줄 `load host_tier type= k= path=fused|dequant_row`가
+`HostLayer::build`에서 (형식, k)마다 한 번 찍힌다(V4.1: q3_K 5120·q5_K 2304·q4_K 2304 모두 fused). kr-cpu K5·K6·K9·K10 닫힘.
+**미측정**: 단일 스레드 속도 예측(IQ3_XXS 4.0–5.2 GB/s — 적재 포트 한계라 4.6 GB/s 선 바로 옆, 호스트 레그 110–135 GB/s[유도]; MXFP4 12.8–14.6;
+ours/ik 0.95–1.05; 기준 Q3_K 10.8 실측)은 `just measure-qdot-rate`(조용한 박스)가 확인한다. IQ3_XXS가 4.6 아래면 V4 호스트 레그는 ALU 바운드라
+40–54 tok/s 항을 다시 판단한다. K6(F16C)와 `fuses`가 dispatch 경로를 건드렸으므로 `ab-decode` 같은 임대 A/B 1회(예상 ≤ 잡음).
+**판단 하나**: K5는 "두 경로가 같은 정의된 출력"으로 닫았다 — 전부 NaN인 블록이 코드 0으로 조용히 양자화된다(전에는 AVX2가 인덱스 패닉).
+`quantize_col`이 `()`를 돌려 오류 반환은 ops.rs 경계 밖이었다. 시끄러운 실패를 원하면 이름 붙은 패닉으로 바꾼다(XS).
+남긴 것: `ops.rs:967,2241,2339` `supports && k_granularity` 세 사본 → `qdot::fuses`(3줄); 우리 Q8_K 인코더는 ggml 참조 규칙이라 ik AVX2와 스케일
+마지막 비트가 다를 수 있다(Q3_K·IQ3_XXS 엔진 대 ik 비교 전부에 걸림; ik 형태 포팅은 작지만 Q3_K roundtrip 게이트 재핀); `*_rate.cpp` 채움 바이트가
+Rust 쪽과 다름(타이밍은 데이터 무관, 1줄); `q_nope2_cells_avx2_inner` 소프트웨어 f16(작음); F16C 스윕에 Q5_0/Q5_1 꼬리 블록 없음(몇 줄);
+`qdot/tests/qdot.rs:1-5` 머리말 낡음. mainline은 IQ3_XXS 부호를 활성에 접어(`quants.c:3260`) 명령이 적지만 ik 비트에서 벗어난다 — 제안으로만.
