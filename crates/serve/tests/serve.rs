@@ -654,9 +654,21 @@ fn spawn_failing(
     std::net::SocketAddr,
     std::sync::mpsc::Receiver<String>,
 ) {
+    spawn_mock(&["--port", "0", "--mock-fail-at", &k.to_string()])
+}
+
+/// Starts `bloomery-serve <args>` (which must bind port 0); returns the child,
+/// its address and a channel of its stderr lines.
+fn spawn_mock(
+    args: &[&str],
+) -> (
+    Reaped,
+    std::net::SocketAddr,
+    std::sync::mpsc::Receiver<String>,
+) {
     use std::io::BufRead;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_bloomery-serve"))
-        .args(["--port", "0", "--mock-fail-at", &k.to_string()])
+        .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -735,6 +747,41 @@ fn hw_engine_error_is_500_then_503_then_exit() {
         block.contains("  error: engine: mock: injected failure at next #2"),
         "{block}"
     );
+}
+
+/// `/props`' `engine` object (toktape's shape): the server's name, its version
+/// marked as the mock's, the process argv verbatim and its pid; the mock has no
+/// model file, placement or draft, so those keys are absent, not null.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_props_engine_object() {
+    let args = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--ctx-size",
+        "2048",
+        "--alias",
+        "two words",
+    ];
+    let (served, addr, _stderr) = spawn_mock(&args);
+    let props = get(addr, "/props").json();
+    let e = &props["engine"];
+    assert_eq!(e["name"], "bloomery", "{props}");
+    let version = e["version"].as_str().unwrap_or_default();
+    let commit = version
+        .strip_prefix(concat!(env!("CARGO_PKG_VERSION"), " ("))
+        .and_then(|v| v.strip_suffix(") mock"))
+        .unwrap_or_default();
+    assert!(!commit.is_empty(), "version {version:?}");
+    let mut argv = vec![env!("CARGO_BIN_EXE_bloomery-serve").to_owned()];
+    argv.extend(args.iter().map(|a| (*a).to_owned()));
+    assert_eq!(e["args"], json!(argv), "{e}");
+    assert_eq!(e["server_pid"], served.0.id(), "{e}");
+    for key in ["model", "placement", "draft"] {
+        assert!(e.get(key).is_none(), "the mock reports no {key}: {e}");
+    }
 }
 
 #[test]
@@ -1133,4 +1180,26 @@ fn hw_metrics_n_decode_total() {
         &json!({"prompt": "abcabc", "n_predict": 0, "temperature": 0}),
     );
     assert_eq!(metric(&get(addr, "/metrics").body, "n_decode_total"), 6.0);
+}
+
+/// Qwen3's chat template renders as jinja2 does: every case of the fixture
+/// through `/apply-template` equals its reference render byte for byte. The
+/// cases reach `messages[::-1]`, `split` and `strip('\n')` on a think span, and
+/// `enable_thinking is false`.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_qwen3_template_renders_as_jinja2() {
+    let addr = common::start_templated(
+        Box::new(serve::MockEngine::new(4096)),
+        include_str!("fixtures/qwen3-chat-template.jinja"),
+    );
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/qwen3-renders.json")).expect("fixture JSON");
+    let cases = fixture["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 4, "{fixture}");
+    for case in cases {
+        let r = post(addr, "/apply-template", &case["body"]);
+        assert_eq!(r.status, 200, "{}: {}", case["name"], r.body);
+        assert_eq!(r.json()["prompt"], case["prompt"], "{}", case["name"]);
+    }
 }

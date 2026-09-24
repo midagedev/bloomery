@@ -15,6 +15,7 @@
 //! `/health` answers 503, and [`crate::Server::run`] returns the error so the
 //! process exits instead of serving an engine in an unknown state.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A failure inside the engine (a device error, a context overflow it detected
@@ -85,6 +86,79 @@ pub trait Engine: Send {
     fn ctx_max(&self) -> usize;
     /// What a crash report names besides the error: the device, the position.
     fn describe(&self) -> String;
+    /// What `/props` reports about this engine under `engine`, read once when
+    /// the server binds. The default reports nothing: every key is left out.
+    fn props_engine(&self) -> EngineProps {
+        EngineProps::default()
+    }
+}
+
+/// An engine's part of `/props`' `engine` object (toktape's shape), beside the
+/// `name`, `version`, `args` and `server_pid` the server fills itself. A `None`
+/// leaves its key out, which a reader shows as unknown: nothing is guessed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineProps {
+    /// A word the server appends to its `version` for an engine that runs no
+    /// model (the mock's `mock`), so a recording of it never reads as a model's.
+    pub version_note: Option<String>,
+    /// The model file.
+    pub model: Option<ModelProps>,
+    /// Where the weights live.
+    pub placement: Option<PlacementProps>,
+    /// The speculative drafter, when one runs.
+    pub draft: Option<DraftProps>,
+}
+
+/// The model file (`engine.model`), from its header.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelProps {
+    /// The file format, `gguf`.
+    pub format: Option<String>,
+    /// The file's architecture name.
+    pub arch: Option<String>,
+    /// The type name that holds the most bytes of the weights a step reads.
+    pub quant: Option<String>,
+    /// Bytes on disk, every shard.
+    pub bytes: Option<u64>,
+    /// Shards.
+    pub files: Option<u64>,
+    /// Layers of the decode graph.
+    pub n_layers: Option<u64>,
+    /// Experts in each routed stack.
+    pub n_experts: Option<u64>,
+    /// Experts one token uses.
+    pub n_experts_used: Option<u64>,
+    /// The context the model was trained for.
+    pub ctx_train: Option<u64>,
+}
+
+/// Where the weights live (`engine.placement`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlacementProps {
+    /// The cards, then the host.
+    pub devices: Vec<DeviceProps>,
+    /// The KV cache's bytes on the cards.
+    pub vram_kv_bytes: Option<u64>,
+}
+
+/// One device of a placement.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceProps {
+    /// `GPU<n>` with `n` the nvidia-smi index, or `CPU`.
+    pub device: String,
+    /// Resident bytes by tensor class; the device's `bytes` is their sum.
+    pub class_bytes: BTreeMap<String, u64>,
+    /// The layers the device runs, as `first-last`.
+    pub layers: Option<String>,
+}
+
+/// The speculative drafter (`engine.draft`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DraftProps {
+    /// `lookup`, or the draft model's file name.
+    pub model: String,
+    /// The most tokens it drafts per step.
+    pub n_max: Option<u64>,
 }
 
 /// The sampling knobs a request carries, llama-server names and defaults.

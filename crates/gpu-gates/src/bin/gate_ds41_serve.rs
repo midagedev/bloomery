@@ -6,6 +6,13 @@
 //! Starts the server beside this binary (`--port 0 --place gate`), reads its
 //! address from its stderr, waits for `/health`, then checks:
 //!
+//! - `/props`' `engine` object, printed once, against this gate's own plan of
+//!   the file the server opens (placement gate, the server's default
+//!   context): the server's name, argv and pid; the model's architecture,
+//!   shards, bytes on disk and counts as the header states them; a card
+//!   `GPU<n>` and the host `CPU`, each device's `bytes` the sum of its classes
+//!   and equal to the plan's card (dense + experts) and host (experts +
+//!   tables) bytes; the cards' KV bytes; no draft;
 //! - `/completion` of `--prompt` at temperature 0 with `return_tokens`: its
 //!   ids are `generate_ds41 --tokens <--ids> -n 16`'s `tokens` line — all 16,
 //!   or a prefix ending in the end-of-generation id when the server stopped
@@ -53,14 +60,17 @@ mod gate {
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
-    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::Planner;
     use model::placement::workstation;
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>";
+    /// The server's arguments after its path; `/props` must echo them.
+    const SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
     /// The load takes tens of seconds; the bound is the spec's 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
@@ -355,6 +365,110 @@ mod gate {
         Ok(ok)
     }
 
+    /// `/props`' `engine` object (see the module header) against the plan of
+    /// the file the server opens, made here from its headers the way the
+    /// server makes it; `argv` and `pid` are the process this gate spawned.
+    fn props_engine(
+        url: &dyn Fn(&str) -> String,
+        argv: &[String],
+        pid: u32,
+    ) -> Result<bool, GateError> {
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let e = json_of("/props", st, &body)?["engine"].clone();
+        println!("props engine {e}");
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let plan = inputs.plan(&machine, workstation::CTX_MAX)?;
+        let (Some(card), Some(stage)) = (plan.cards.first(), machine.cards.first()) else {
+            return Err("the gate's plan has no card".into());
+        };
+        let card_bytes = card.dense_bytes + card.expert_bytes;
+        let host_bytes = plan.host.expert_bytes + plan.host.table_bytes;
+        let kv: u64 = plan.cards.iter().map(|c| c.kv_bytes).sum();
+        let mut file_bytes = 0u64;
+        for i in 0..split.shard_count() {
+            let shard = split.shard_path(i).ok_or("a shard without a path")?;
+            file_bytes += std::fs::metadata(shard)?.len();
+        }
+        println!(
+            "plan card bytes {card_bytes} (dense {} + experts {}) host bytes {host_bytes} \
+             (experts {} + tables {}) kv {kv}; file {file_bytes} B in {} shards",
+            card.dense_bytes,
+            card.expert_bytes,
+            plan.host.expert_bytes,
+            plan.host.table_bytes,
+            split.shard_count()
+        );
+        let devices = e["placement"]["devices"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let class_sum = |d: &Value| {
+            d["classes"]
+                .as_object()
+                .map(|c| c.values().filter_map(Value::as_u64).sum::<u64>())
+        };
+        let layers = format!("{}-{}", stage.layers.start, stage.layers.end - 1);
+        let m = &e["model"];
+        let mut ok = true;
+        check(
+            &mut ok,
+            "props_engine_identity",
+            e["name"] == "bloomery"
+                && e["version"]
+                    .as_str()
+                    .is_some_and(|v| !v.is_empty() && !v.ends_with(" mock"))
+                && e["args"] == json!(argv)
+                && e["server_pid"] == json!(pid),
+        );
+        check(
+            &mut ok,
+            "props_engine_model",
+            m["format"] == "gguf"
+                && m["arch"] == json!(split.architecture())
+                && m["files"] == json!(split.shard_count())
+                && m["bytes"] == json!(file_bytes)
+                && m["n_layers"] == json!(inputs.model.layers)
+                && m["n_experts"] == json!(inputs.model.experts)
+                && m["n_experts_used"] == json!(inputs.model.experts_used)
+                && m["ctx_train"] == json!(split.arch_get_u64("context_length"))
+                && m["quant"].as_str().is_some_and(|q| !q.is_empty()),
+        );
+        check(
+            &mut ok,
+            "props_engine_devices",
+            devices.len() == 2
+                && devices[0]["device"]
+                    .as_str()
+                    .and_then(|d| d.strip_prefix("GPU"))
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+                && devices[0]["layers"] == json!(layers)
+                && devices[1]["device"] == "CPU",
+        );
+        check(
+            &mut ok,
+            "props_engine_bytes_are_the_plans",
+            devices
+                .iter()
+                .all(|d| d["bytes"].as_u64().is_some() && d["bytes"].as_u64() == class_sum(d))
+                && devices
+                    .first()
+                    .is_some_and(|d| d["bytes"] == json!(card_bytes))
+                && devices
+                    .get(1)
+                    .is_some_and(|d| d["bytes"] == json!(host_bytes)),
+        );
+        check(
+            &mut ok,
+            "props_engine_vram_kv",
+            e["placement"]["vram_kv_bytes"] == json!(kv),
+        );
+        check(&mut ok, "props_engine_no_draft", e.get("draft").is_none());
+        Ok(ok)
+    }
+
     fn check(ok: &mut bool, name: &str, pass: bool) {
         println!("check {name}: {}", verdict(pass));
         *ok &= pass;
@@ -369,7 +483,7 @@ mod gate {
         let exe = std::env::current_exe()?.with_file_name("bloomery-serve-ds41");
         let err_log = a.dir.join("server.err");
         let child = Command::new(&exe)
-            .args(["--host", "127.0.0.1", "--port", "0", "--place", "gate"])
+            .args(SERVER_ARGS)
             .stdin(Stdio::null())
             .stdout(File::create(a.dir.join("server.out"))?)
             .stderr(File::create(&err_log)?)
@@ -385,6 +499,10 @@ mod gate {
         let (st, body) = curl(&url("/health"), None, false)?;
         println!("health {st} {body}");
         check(&mut ok, "health_ok", st == 200 && body.contains("\"ok\""));
+        let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
+            .chain(SERVER_ARGS.iter().map(|a| (*a).to_owned()))
+            .collect();
+        ok &= props_engine(&url, &argv, served.child.id())?;
 
         let completion = json!({
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,

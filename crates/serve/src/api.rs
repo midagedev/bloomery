@@ -22,7 +22,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value, json};
 
 use crate::dsml::{ChatParser, Message, ToolCall};
-use crate::engine::{Engine, SamplerFactory, SamplingParams, Tokenizer};
+use crate::engine::{
+    DraftProps, Engine, EngineProps, ModelProps, PlacementProps, SamplerFactory, SamplingParams,
+    Tokenizer,
+};
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings};
 use crate::http::{self, EventStream, Request};
 use crate::reasoning::ReasoningFormat;
@@ -102,6 +105,7 @@ impl Server {
         let template = ChatTemplate::parse(&config.chat_template)?;
         let listener = TcpListener::bind(addr)?;
         let tok = engine.tokenizer();
+        let engine_props = engine_object(&engine.props_engine());
         let info = ModelInfo {
             n_vocab: tok.n_vocab(),
             ctx_max: engine.ctx_max(),
@@ -118,6 +122,7 @@ impl Server {
             template,
             alias: config.model_alias,
             model_path: config.model_path,
+            engine_props,
             sampler: config.sampler.unwrap_or_else(sampling::reference_factory),
             info,
             busy: AtomicBool::new(false),
@@ -225,6 +230,8 @@ struct State {
     template: ChatTemplate,
     alias: String,
     model_path: String,
+    /// `/props`' `engine` object, built when the server binds.
+    engine_props: Value,
     sampler: SamplerFactory,
     info: ModelInfo,
     busy: AtomicBool,
@@ -617,8 +624,101 @@ fn props(state: &State) -> Value {
         "eos_token": state.info.eos_text,
         "modalities": { "vision": false, "audio": false },
         "n_ctx": state.info.ctx_max,
-        "build_info": concat!("bloomery-serve ", env!("CARGO_PKG_VERSION")),
+        "build_info": format!("bloomery-serve {VERSION}"),
+        "engine": state.engine_props,
     })
+}
+
+/// `engine.version`: the crate version and the commit the build script found
+/// (`unknown` for a tree without git).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BLOOMERY_SERVE_COMMIT"),
+    ")"
+);
+
+/// Inserts `key` when `v` is `Some`: an unknown is left out, never guessed.
+fn put<T: Into<Value>>(o: &mut Map<String, Value>, key: &str, v: Option<T>) {
+    if let Some(v) = v {
+        o.insert(key.to_owned(), v.into());
+    }
+}
+
+/// `/props`' `engine` object in toktape's shape: the server's own `name`,
+/// `version` (with the engine's note), `args` (this process's argv, verbatim)
+/// and `server_pid`, and the model, placement and draft the engine reports.
+fn engine_object(p: &EngineProps) -> Value {
+    let mut o = Map::new();
+    o.insert("name".into(), json!("bloomery"));
+    let version = match &p.version_note {
+        Some(note) => format!("{VERSION} {note}"),
+        None => VERSION.to_owned(),
+    };
+    o.insert("version".into(), Value::String(version));
+    let args = std::env::args_os()
+        .map(|a| Value::String(a.to_string_lossy().into_owned()))
+        .collect();
+    o.insert("args".into(), Value::Array(args));
+    put(&mut o, "model", p.model.as_ref().map(model_object));
+    put(
+        &mut o,
+        "placement",
+        p.placement.as_ref().map(placement_object),
+    );
+    put(&mut o, "draft", p.draft.as_ref().map(draft_object));
+    o.insert("server_pid".into(), json!(std::process::id()));
+    Value::Object(o)
+}
+
+fn model_object(m: &ModelProps) -> Value {
+    let mut o = Map::new();
+    put(&mut o, "format", m.format.clone());
+    put(&mut o, "arch", m.arch.clone());
+    put(&mut o, "quant", m.quant.clone());
+    put(&mut o, "bytes", m.bytes);
+    put(&mut o, "files", m.files);
+    put(&mut o, "n_layers", m.n_layers);
+    put(&mut o, "n_experts", m.n_experts);
+    put(&mut o, "n_experts_used", m.n_experts_used);
+    put(&mut o, "ctx_train", m.ctx_train);
+    Value::Object(o)
+}
+
+/// Each device's `bytes` is the sum of its classes, here and nowhere else.
+fn placement_object(p: &PlacementProps) -> Value {
+    let devices = p
+        .devices
+        .iter()
+        .map(|d| {
+            let mut o = Map::new();
+            o.insert("device".into(), Value::String(d.device.clone()));
+            let bytes = d
+                .class_bytes
+                .values()
+                .fold(0u64, |sum, &b| sum.saturating_add(b));
+            o.insert("bytes".into(), json!(bytes));
+            let classes = d
+                .class_bytes
+                .iter()
+                .map(|(k, &b)| (k.clone(), json!(b)))
+                .collect();
+            o.insert("classes".into(), Value::Object(classes));
+            put(&mut o, "layers", d.layers.clone());
+            Value::Object(o)
+        })
+        .collect();
+    let mut o = Map::new();
+    o.insert("devices".into(), Value::Array(devices));
+    put(&mut o, "vram_kv_bytes", p.vram_kv_bytes);
+    Value::Object(o)
+}
+
+fn draft_object(d: &DraftProps) -> Value {
+    let mut o = Map::new();
+    o.insert("model".into(), Value::String(d.model.clone()));
+    put(&mut o, "n_max", d.n_max);
+    Value::Object(o)
 }
 
 fn slots(state: &State) -> Value {

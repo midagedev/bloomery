@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use crate::engine::{Decoder, Engine, EngineError, Tokenizer};
+use crate::engine::{Decoder, Engine, EngineError, EngineProps, Tokenizer};
 
 /// Special strings, in id order. Longest-match wins on encode.
 pub const SPECIALS: [&str; 6] = [
@@ -221,6 +221,14 @@ impl Engine for MockEngine {
 
     fn describe(&self) -> String {
         format!("mock position={}", self.ctx.len())
+    }
+
+    /// No model file, placement or draft: only the version's `mock` mark.
+    fn props_engine(&self) -> EngineProps {
+        EngineProps {
+            version_note: Some("mock".to_owned()),
+            ..EngineProps::default()
+        }
     }
 }
 

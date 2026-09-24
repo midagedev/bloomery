@@ -18,7 +18,8 @@ pub mod template;
 
 pub use api::{EngineFailure, FATAL_LINGER, ServeError, Server, ServerConfig};
 pub use engine::{
-    Decoder, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Tokenizer,
+    Decoder, DeviceProps, DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
+    Sampler, SamplerFactory, SamplingParams, Tokenizer,
 };
 pub use mock::{MockEngine, MockTokenizer, ScriptedEngine};
 pub use template::{ChatTemplate, TemplateError};

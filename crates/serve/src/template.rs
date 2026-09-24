@@ -4,11 +4,14 @@
 //! `-` whitespace control, `set` (plain and `ns.attr`), `namespace(...)`, `for`
 //! with tuple unpacking and `loop.*`, `if`/`elif`/`else`, the conditional
 //! expression, `and`/`or`/`not`/`in`, comparisons, `+`/`-`/`~`, subscripts and
-//! slices, `.items()`/`.keys()`/`.values()`/`.get()`/`.strip()`/`.startswith()`/
-//! `.endswith()`, filters `tojson`/`from_json`/`length`/`trim`/`string`/`lower`/
-//! `upper`, tests `defined`/`undefined`/`none`/`string`/`number`/`mapping`/
-//! `sequence`/`iterable`, and `raise_exception`/`range`. Anything else is a parse
-//! or render error, never silent output.
+//! slices `[start:stop:step]` (Python's rules: any part omitted, negative
+//! bounds from the end), `.items()`/`.keys()`/`.values()`/`.get()`/
+//! `.strip()`/`.lstrip()`/`.rstrip()` (whitespace, or the characters given)/
+//! `.split()`/`.startswith()`/`.endswith()`, filters `tojson`/`from_json`/
+//! `length`/`trim`/`string`/`lower`/`upper`, tests `defined`/`undefined`/`none`/
+//! `true`/`false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`,
+//! and `raise_exception`/`range`. Anything else is a parse or render error,
+//! never silent output.
 //!
 //! Values are `serde_json` values plus `Undefined` and mutable namespaces. Object
 //! keys iterate in sorted order (serde_json's map), not insertion order: a
@@ -241,7 +244,13 @@ enum Expr {
     Dict(Vec<(Expr, Expr)>),
     Attr(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
-    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>),
+    /// `obj[start:stop:step]`, each part optional.
+    Slice(
+        Box<Expr>,
+        Option<Box<Expr>>,
+        Option<Box<Expr>>,
+        Option<Box<Expr>>,
+    ),
     Call(Box<Expr>, Vec<Expr>, Vec<(String, Expr)>),
     Filter(Box<Expr>, String, Vec<Expr>),
     Test(Box<Expr>, String, bool),
@@ -677,19 +686,16 @@ impl Lexer {
             if self.eat_op(".") {
                 e = Expr::Attr(Box::new(e), self.name()?);
             } else if self.eat_op("[") {
-                let lo = if matches!(self.peek(), Some(Tok::Op(":"))) {
-                    None
-                } else {
-                    Some(Box::new(self.expr()?))
-                };
+                let lo = self.slice_part()?;
                 if self.eat_op(":") {
-                    let hi = if matches!(self.peek(), Some(Tok::Op("]"))) {
-                        None
+                    let hi = self.slice_part()?;
+                    let step = if self.eat_op(":") {
+                        self.slice_part()?
                     } else {
-                        Some(Box::new(self.expr()?))
+                        None
                     };
                     self.expect_op("]")?;
-                    e = Expr::Slice(Box::new(e), lo, hi);
+                    e = Expr::Slice(Box::new(e), lo, hi, step);
                 } else {
                     self.expect_op("]")?;
                     let Some(lo) = lo else {
@@ -704,6 +710,15 @@ impl Lexer {
                 return Ok(e);
             }
         }
+    }
+
+    /// One part of a subscript: `None` when it is omitted, the next token
+    /// being the `:` or `]` that ends it.
+    fn slice_part(&mut self) -> Result<Option<Box<Expr>>, TemplateError> {
+        if matches!(self.peek(), Some(Tok::Op(":" | "]"))) {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(self.expr()?)))
     }
 
     /// Call arguments after `(`, through `)`.
@@ -1016,11 +1031,14 @@ impl Renderer {
                 let i = self.eval(idx)?;
                 index(&o, &i)
             }
-            Expr::Slice(obj, lo, hi) => {
+            Expr::Slice(obj, lo, hi, step) => {
                 let o = self.eval(obj)?;
-                let lo = lo.as_ref().map(|x| self.eval(x)).transpose()?;
-                let hi = hi.as_ref().map(|x| self.eval(x)).transpose()?;
-                slice(&o, lo.as_ref(), hi.as_ref())?
+                let mut part = |x: &Option<Box<Expr>>| match x {
+                    Some(x) => slice_bound(&self.eval(x)?),
+                    None => Ok(None),
+                };
+                let (lo, hi, step) = (part(lo)?, part(hi)?, part(step)?);
+                slice(&o, lo, hi, step)?
             }
             Expr::Call(callee, args, kwargs) => self.call(callee, args, kwargs)?,
             Expr::Filter(x, name, args) => {
@@ -1147,31 +1165,64 @@ fn index(o: &V, i: &V) -> V {
     }
 }
 
-fn slice(o: &V, lo: Option<&V>, hi: Option<&V>) -> Result<V, TemplateError> {
-    let bound = |b: Option<&V>, len: usize, dflt: usize| -> usize {
-        match b.and_then(as_i64) {
-            None => dflt,
-            Some(i) if i < 0 => len.saturating_sub(usize::try_from(-i).unwrap_or(usize::MAX)),
-            Some(i) => usize::try_from(i).unwrap_or(usize::MAX).min(len),
-        }
+/// A slice part's value: an integer, or `None` for `none` (as omitted).
+fn slice_bound(v: &V) -> Result<Option<i64>, TemplateError> {
+    match v {
+        V::J(Value::Null) => Ok(None),
+        V::J(Value::Number(n)) if n.is_i64() => Ok(n.as_i64()),
+        other => err(format!(
+            "slice indices must be integers or none, not {other:?}"
+        )),
+    }
+}
+
+/// The positions `[start:stop:step]` visits in a sequence of `len` items, in
+/// visiting order: Python's `range(*slice(start, stop, step).indices(len))`.
+/// A negative bound counts from the end; a bound past either end clamps to
+/// it; an omitted one is the end the step walks from, or towards.
+fn slice_positions(len: usize, start: Option<i64>, stop: Option<i64>, step: i64) -> Vec<usize> {
+    let n = i64::try_from(len).unwrap_or(i64::MAX);
+    // What a clamped bound can name: a backward walk stops before position
+    // 0, a forward one after position n - 1.
+    let (lo, hi) = if step > 0 { (0, n) } else { (-1, n - 1) };
+    let bound = |b: Option<i64>, omitted: i64| match b {
+        None => omitted,
+        Some(i) if i < 0 => i.saturating_add(n).max(lo),
+        Some(i) => i.min(hi),
+    };
+    let (first, end) = if step > 0 {
+        (bound(start, lo), bound(stop, hi))
+    } else {
+        (bound(start, hi), bound(stop, lo))
+    };
+    std::iter::successors(Some(first), |i| i.checked_add(step))
+        .take_while(|&i| if step > 0 { i < end } else { i > end })
+        .filter_map(|i| usize::try_from(i).ok())
+        .collect()
+}
+
+/// `o[lo:hi:step]` of a list or a string (by character).
+fn slice(o: &V, lo: Option<i64>, hi: Option<i64>, step: Option<i64>) -> Result<V, TemplateError> {
+    let step = match step {
+        None => 1,
+        Some(0) => return err("slice step cannot be zero"),
+        Some(s) => s,
     };
     match o {
-        V::J(Value::Array(a)) => {
-            let (l, h) = (bound(lo, a.len(), 0), bound(hi, a.len(), a.len()));
-            Ok(V::J(Value::Array(if l < h {
-                a[l..h].to_vec()
-            } else {
-                Vec::new()
-            })))
-        }
+        V::J(Value::Array(a)) => Ok(V::J(Value::Array(
+            slice_positions(a.len(), lo, hi, step)
+                .into_iter()
+                .map(|i| a[i].clone())
+                .collect(),
+        ))),
         V::J(Value::String(s)) => {
             let cs: Vec<char> = s.chars().collect();
-            let (l, h) = (bound(lo, cs.len(), 0), bound(hi, cs.len(), cs.len()));
-            Ok(V::J(Value::String(if l < h {
-                cs[l..h].iter().collect()
-            } else {
-                String::new()
-            })))
+            Ok(V::J(Value::String(
+                slice_positions(cs.len(), lo, hi, step)
+                    .into_iter()
+                    .map(|i| cs[i])
+                    .collect(),
+            )))
         }
         other => err(format!("cannot slice {other:?}")),
     }
@@ -1199,9 +1250,30 @@ fn call_method(o: &V, method: &str, args: &[V]) -> Result<V, TemplateError> {
                 None => args.get(1).cloned().unwrap_or(V::J(Value::Null)),
             }
         }
-        (V::J(Value::String(s)), "strip") => V::J(Value::String(s.trim().to_owned())),
-        (V::J(Value::String(s)), "lstrip") => V::J(Value::String(s.trim_start().to_owned())),
-        (V::J(Value::String(s)), "rstrip") => V::J(Value::String(s.trim_end().to_owned())),
+        (V::J(Value::String(s)), "strip" | "lstrip" | "rstrip") => {
+            // Python's rule: no argument (or `none`) strips whitespace, a string
+            // strips any of its characters.
+            let set: Option<Vec<char>> = match args.first() {
+                None | Some(V::J(Value::Null)) => None,
+                Some(V::J(Value::String(c))) => Some(c.chars().collect()),
+                Some(other) => return err(format!("{method}() takes a string, not {other:?}")),
+            };
+            let strips = |c: char| set.as_ref().map_or(c.is_whitespace(), |s| s.contains(&c));
+            V::J(Value::String(
+                match method {
+                    "strip" => s.trim_matches(strips),
+                    "lstrip" => s.trim_start_matches(strips),
+                    _ => s.trim_end_matches(strips),
+                }
+                .to_owned(),
+            ))
+        }
+        (V::J(Value::String(s)), "split") => V::J(Value::Array(
+            split(s, args.first(), args.get(1))?
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        )),
         (V::J(Value::String(s)), "startswith") => {
             V::J(Value::Bool(str_arg(0).is_some_and(|p| s.starts_with(&p))))
         }
@@ -1210,6 +1282,53 @@ fn call_method(o: &V, method: &str, args: &[V]) -> Result<V, TemplateError> {
         }
         (other, m) => return err(format!("no method {m}() on {other:?}")),
     })
+}
+
+/// Python's `str.split(sep, maxsplit)`: on `sep` (a non-empty string), or on
+/// runs of whitespace with the ends' whitespace dropped when `sep` is absent
+/// or `none`; at most `maxsplit` splits when it is given and not negative.
+fn split(s: &str, sep: Option<&V>, maxsplit: Option<&V>) -> Result<Vec<String>, TemplateError> {
+    let max = match maxsplit {
+        None => None,
+        Some(V::J(Value::Number(n))) if n.is_i64() => {
+            n.as_i64().and_then(|m| usize::try_from(m).ok())
+        }
+        Some(other) => {
+            return err(format!(
+                "split() maxsplit must be an integer, not {other:?}"
+            ));
+        }
+    };
+    match sep {
+        None | Some(V::J(Value::Null)) => Ok(split_whitespace(s, max)),
+        Some(V::J(Value::String(sep))) if sep.is_empty() => err("split(): empty separator"),
+        Some(V::J(Value::String(sep))) => Ok(match max {
+            Some(m) => s
+                .splitn(m.saturating_add(1), sep.as_str())
+                .map(str::to_owned)
+                .collect(),
+            None => s.split(sep.as_str()).map(str::to_owned).collect(),
+        }),
+        Some(other) => err(format!("split() takes a string separator, not {other:?}")),
+    }
+}
+
+/// `str.split()` with no separator: the words between runs of whitespace; past
+/// `max` splits, the rest of the string (its leading whitespace dropped) is
+/// the last word.
+fn split_whitespace(s: &str, max: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        if max.is_some_and(|m| out.len() == m) {
+            out.push(rest.to_owned());
+            break;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        out.push(rest[..end].to_owned());
+        rest = rest[end..].trim_start();
+    }
+    out
 }
 
 fn filter(v: V, name: &str, _args: &[V]) -> Result<V, TemplateError> {
@@ -1246,6 +1365,9 @@ fn test(v: &V, name: &str) -> Result<bool, TemplateError> {
         "defined" => !matches!(v, V::Undef),
         "undefined" => matches!(v, V::Undef),
         "none" => matches!(v, V::J(Value::Null)),
+        // Identity with the boolean, as jinja2's: `0 is false` is false.
+        "true" => matches!(v, V::J(Value::Bool(true))),
+        "false" => matches!(v, V::J(Value::Bool(false))),
         "string" => matches!(v, V::J(Value::String(_))),
         "number" => matches!(v, V::J(Value::Number(_))),
         "boolean" => matches!(v, V::J(Value::Bool(_))),
@@ -1477,5 +1599,87 @@ mod tests {
             render(src, json!({"m": {"c": null}, "s": "t"})),
             "Truedflt[1, 2]2yes"
         );
+    }
+
+    fn render_err(src: &str, vars: Value) -> String {
+        let t = ChatTemplate::parse(src).expect("parses");
+        let Value::Object(m) = vars else {
+            panic!("vars")
+        };
+        t.render(&m).expect_err("a render error").to_string()
+    }
+
+    /// Python's slice rules, each pair as jinja2 renders it: omitted and
+    /// negative bounds, a step either way, bounds clamped past either end,
+    /// `none` as an omitted part, strings by character.
+    #[test]
+    fn slices_follow_python() {
+        let vars = json!({"a": [1, 2, 3, 4, 5], "s": "héllo", "n": null});
+        for (src, want) in [
+            ("{{ a[::-1] | tojson }}", "[5, 4, 3, 2, 1]"),
+            ("{{ a[1:-1] | tojson }}", "[2, 3, 4]"),
+            ("{{ a[::2] | tojson }}", "[1, 3, 5]"),
+            ("{{ a[-2:] | tojson }}", "[4, 5]"),
+            ("{{ a[:-1] | tojson }}", "[1, 2, 3, 4]"),
+            ("{{ a[4:1:-2] | tojson }}", "[5, 3]"),
+            ("{{ a[10:] | tojson }}", "[]"),
+            ("{{ a[-10:2] | tojson }}", "[1, 2]"),
+            ("{{ a[:10:-1] | tojson }}", "[]"),
+            ("{{ a[::-2] | tojson }}", "[5, 3, 1]"),
+            ("{{ a[1:4:2] | tojson }}", "[2, 4]"),
+            ("{{ a[none:2] | tojson }}", "[1, 2]"),
+            ("{{ a[n:n:n] | tojson }}", "[1, 2, 3, 4, 5]"),
+            ("{{ a[-1:-6:-1] | tojson }}", "[5, 4, 3, 2, 1]"),
+            ("{{ a[-1::-3] | tojson }}", "[5, 2]"),
+            ("{{ a[3:-1:-1] | tojson }}", "[]"),
+            ("{{ a[-10::-1] | tojson }}", "[]"),
+            ("{{ a[:-7:-1] | tojson }}", "[5, 4, 3, 2, 1]"),
+            ("{{ a[2::-1] | tojson }}", "[3, 2, 1]"),
+            ("{{ a[1 + 1:] | tojson }}", "[3, 4, 5]"),
+            ("{{ s[::-1] }}", "olléh"),
+            ("{{ s[1:3] }}", "él"),
+            ("{{ s[-3:] }}", "llo"),
+            ("{{ s[:] }}", "héllo"),
+        ] {
+            assert_eq!(render(src, vars.clone()), want, "{src}");
+        }
+        for src in ["{{ a[::0] }}", "{{ s[::0] }}"] {
+            let e = render_err(src, vars.clone());
+            assert!(e.contains("slice step cannot be zero"), "{src}: {e}");
+        }
+    }
+
+    /// `split` and `strip` with a character set, as Python's `str` methods,
+    /// and the `true`/`false` tests (identity with the boolean, not truth),
+    /// each as jinja2 renders it.
+    #[test]
+    fn split_strip_and_boolean_tests_follow_python() {
+        let vars = json!({"t": "\n\n  x \n", "f": false, "z": 0, "n": null, "u": true});
+        for (src, want) in [
+            (
+                "{{ 'a,b,,c'.split(',') | tojson }}",
+                r#"["a", "b", "", "c"]"#,
+            ),
+            ("{{ ' a  b '.split() | tojson }}", r#"["a", "b"]"#),
+            ("{{ 'a,b,c'.split(',', 1) | tojson }}", r#"["a", "b,c"]"#),
+            ("{{ '</think>x'.split('</think>')[-1] }}", "x"),
+            ("{{ 'abc'.split('abc') | tojson }}", r#"["", ""]"#),
+            ("{{ ''.split(',') | tojson }}", r#"[""]"#),
+            ("{{ ''.split() | tojson }}", "[]"),
+            ("[{{ t.lstrip('\\n') }}]", "[  x \n]"),
+            ("[{{ t.rstrip('\\n') }}]", "[\n\n  x ]"),
+            ("[{{ t.strip('\\n') }}]", "[  x ]"),
+            ("[{{ 'xxaxx'.strip('x') }}]", "[a]"),
+            ("[{{ '  a  '.strip() }}]", "[a]"),
+            ("[{{ ' \\ta\\n'.lstrip() }}]", "[a\n]"),
+            (
+                "{{ f is false }}{{ z is false }}{{ n is false }}{{ u is true }}{{ 1 is true }}{{ f is not false }}",
+                "TrueFalseFalseTrueFalseFalse",
+            ),
+        ] {
+            assert_eq!(render(src, vars.clone()), want, "{src}");
+        }
+        let e = render_err("{{ 'a'.split('') }}", vars);
+        assert!(e.contains("empty separator"), "{e}");
     }
 }

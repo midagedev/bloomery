@@ -1,0 +1,82 @@
+{
+  "template": "tokenizer.chat_template of Qwen3-1.7B-Q4_K_M.gguf (ggml-org/Qwen3-1.7B-GGUF), md5 fb4eb61f6cb14fd36fafe18db8cb1e2b: the same bytes as models/templates/Qwen-Qwen3-0.6B.jinja in ik_llama.cpp and llama.cpp",
+  "reference": "jinja2 3.1.2, the HF chat-template environment of ik_llama.cpp tests/test-jinja.cpp; each case rendered with the variables bloomery-serve's /apply-template passes (messages, add_generation_prompt default true, the mock's bos_token and eos_token, chat_template_kwargs merged)",
+  "cases": [
+    {
+      "name": "two turns",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is the capital of France?"
+          },
+          {
+            "role": "assistant",
+            "content": "Paris."
+          },
+          {
+            "role": "user",
+            "content": "And of Italy?"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nParis.<|im_end|>\n<|im_start|>user\nAnd of Italy?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "two turns, system, think span in the answer",
+      "body": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\nThe user greets.\n</think>\n\n  Hello!"
+          },
+          {
+            "role": "user",
+            "content": "Bye"
+          }
+        ]
+      },
+      "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n  Hello!<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "name": "thinking off",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      },
+      "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "answer after the last query, no generation prompt",
+      "body": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hi"
+          },
+          {
+            "role": "assistant",
+            "content": "<think>\n\nshort\n\n</think>\n\nHello"
+          }
+        ],
+        "add_generation_prompt": false
+      },
+      "prompt": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\nshort\n</think>\n\nHello<|im_end|>\n"
+    }
+  ]
+}

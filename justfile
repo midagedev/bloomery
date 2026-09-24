@@ -812,7 +812,8 @@ gate-gpu-ds41-chat:
 # under its own gate-lock hold, then gate_ds41_serve under another: it starts bloomery-serve-ds41 --port 0 --place gate,
 # and checks /completion's ids at temperature 0 against generate_ds41's (all 16, or a prefix ending in the
 # end-of-generation id), a chat turn streamed and not streamed (same content, [DONE] last), /tokenize of the row's text
-# against the row's ids, and the same /completion again after those (reset leaves nothing behind); then kills the
+# against the row's ids, the same /completion again after those (reset leaves nothing behind), and /props' engine
+# object (name and version, the file's header facts, each device's bytes = the plan's, the KV bytes); then kills the
 # server it spawned and waits for it. Two loads; logs and the raw stream in target/serve-gate/.
 gate-gpu-ds41-serve:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D'

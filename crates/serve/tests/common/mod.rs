@@ -21,14 +21,21 @@ pub fn start(ctx: usize) -> SocketAddr {
 
 /// Starts a server on `engine` and the V4.1 template.
 pub fn start_with(engine: Box<dyn Engine>) -> SocketAddr {
+    start_templated(engine, V41_TEMPLATE)
+}
+
+/// Starts a server on `engine` and the chat template `template`; a template
+/// the parser refuses panics with the parser's error.
+pub fn start_templated(engine: Box<dyn Engine>, template: &str) -> SocketAddr {
     let config = ServerConfig {
         model_alias: "mock".to_owned(),
         model_path: "mock.gguf".to_owned(),
-        chat_template: V41_TEMPLATE.to_owned(),
+        chat_template: template.to_owned(),
         sampler: None,
         fatal_linger: FATAL_LINGER,
     };
-    let server = Server::bind("127.0.0.1:0", engine, config).expect("bind");
+    let server =
+        Server::bind("127.0.0.1:0", engine, config).unwrap_or_else(|e| panic!("bind: {e}"));
     server.spawn().expect("spawn")
 }
 

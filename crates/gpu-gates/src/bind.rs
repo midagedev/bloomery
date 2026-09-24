@@ -13,15 +13,27 @@
 //! How long a prefix of the cache can be kept is the body's rule, which the
 //! opener hands in beside the model ([`Ds41Engine::spawn`]'s `keep`) and the
 //! engine thread answers ([`Ds41Engine`]'s `keepable`).
+//!
+//! What `/props` says about the engine ([`model_props`], [`placement_props`])
+//! is read from the file's header and the placement plan the engine loads by,
+//! once, before the load; the engine hands it back unchanged.
 
+use std::collections::BTreeMap;
+use std::ops::Range;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::model::ChainBody;
+use gguf::Split;
+use model::placement::{Device, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
-use serve::{Decoder, Engine, EngineError, SamplerFactory, SamplingParams, Tokenizer};
+use serve::{
+    Decoder, DeviceProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
+    SamplerFactory, SamplingParams, Tokenizer,
+};
 
 use crate::GateError;
 use crate::generate::Generator;
@@ -161,6 +173,168 @@ pub fn sampler_factory() -> SamplerFactory {
     })
 }
 
+/// The class toktape files a placement role's bytes under: the buckets of its
+/// GGUF classifier, which puts the router and the shared expert with the
+/// routed experts and every engram tensor with the n-gram tables.
+fn class_of(role: Role) -> &'static str {
+    match role {
+        Role::Attention => "attention",
+        Role::Router | Role::SharedExpert | Role::RoutedExperts => "experts",
+        Role::FfnNorm | Role::DenseFfn => "ffn",
+        Role::EngramDense | Role::EngramTable => "ngram",
+        Role::TokenEmbedding => "embeddings",
+        Role::Head => "output",
+        Role::HyperConnection | Role::Unread | Role::Unused => "other",
+    }
+}
+
+/// A stage's layers as `first-last`.
+fn layer_range(layers: &Range<usize>) -> String {
+    match layers.end.checked_sub(1) {
+        Some(last) if last >= layers.start => format!("{}-{last}", layers.start),
+        _ => "none".to_owned(),
+    }
+}
+
+/// `/props`' `engine.model` of the file `split`, whose tensors its
+/// architecture classified as `model`: the architecture, the type that holds
+/// the most bytes of the tensors a step reads (the row-gathered tables — the
+/// token embedding and the engram tables — and the never-read tensors left
+/// out), the bytes of every shard on disk, the layer and expert counts, and the
+/// training context. A fact the header does not state is left out.
+pub fn model_props(split: &Split, model: &ModelTensors) -> ModelProps {
+    let mut by_type: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for t in &model.tensors {
+        let gathered_or_unread = matches!(
+            t.role,
+            Role::TokenEmbedding | Role::EngramTable | Role::Unread | Role::Unused
+        );
+        if let (false, Some(name)) = (gathered_or_unread, t.ty.name()) {
+            *by_type.entry(name).or_default() += t.file_bytes;
+        }
+    }
+    let quant = by_type
+        .iter()
+        .max_by_key(|&(_, &bytes)| bytes)
+        .map(|(&name, _)| name.to_owned());
+    let bytes = (0..split.shard_count())
+        .map(|i| {
+            split
+                .shard_path(i)
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+        })
+        .sum();
+    ModelProps {
+        format: Some("gguf".to_owned()),
+        arch: split.architecture().map(str::to_owned),
+        quant,
+        bytes,
+        files: u64::try_from(split.shard_count()).ok(),
+        n_layers: u64::try_from(model.layers).ok(),
+        n_experts: Some(model.experts),
+        n_experts_used: Some(model.experts_used),
+        ctx_train: split.arch_get_u64("context_length"),
+    }
+}
+
+/// `/props`' `engine.placement` of `plan`, the plan the engine loads by: per
+/// card, named `gpus[c]` (`GPU<n>`, see [`nvidia_smi_index`]), the resident
+/// bytes of its segments by class and its stage's layers; then the host's
+/// (`CPU`) the same way; and the cards' KV bytes, cache and shadow. Only the
+/// plan's own rows are summed, so a card's classes add up to its
+/// `dense_bytes + expert_bytes` and the host's to its `expert_bytes +
+/// table_bytes`. The NVMe tier holds no resident bytes and is no device here.
+pub fn placement_props(plan: &Plan<'_>, gpus: &[String]) -> Result<PlacementProps, String> {
+    if gpus.len() != plan.cards.len() {
+        return Err(format!(
+            "{} card names for a plan of {} cards",
+            gpus.len(),
+            plan.cards.len()
+        ));
+    }
+    let mut cards = vec![BTreeMap::<String, u64>::new(); plan.cards.len()];
+    let mut host = BTreeMap::<String, u64>::new();
+    for r in &plan.rows {
+        let t = plan
+            .model
+            .tensors
+            .get(r.tensor)
+            .ok_or_else(|| format!("a plan row names tensor {}, past the model", r.tensor))?;
+        for seg in &r.segments {
+            let device = match seg.device {
+                Device::Card(c) => cards.get_mut(c),
+                Device::Host => Some(&mut host),
+                Device::Nvme | Device::Unused => None,
+            };
+            if let Some(classes) = device {
+                *classes.entry(class_of(t.role).to_owned()).or_default() += seg.resident_bytes;
+            }
+        }
+    }
+    let mut devices: Vec<DeviceProps> = cards
+        .into_iter()
+        .zip(gpus)
+        .zip(&plan.machine.cards)
+        .map(|((class_bytes, gpu), card)| DeviceProps {
+            device: gpu.clone(),
+            class_bytes,
+            layers: Some(layer_range(&card.layers)),
+        })
+        .collect();
+    devices.push(DeviceProps {
+        device: "CPU".to_owned(),
+        class_bytes: host,
+        layers: None,
+    });
+    Ok(PlacementProps {
+        devices,
+        vram_kv_bytes: Some(plan.cards.iter().map(|c| c.kv_bytes).sum()),
+    })
+}
+
+/// The nvidia-smi index of the card this process opens by the placement name
+/// `name` (a device whose name contains it, as the GPU loader finds its
+/// card): among nvidia-smi's devices, those so named, narrowed to
+/// `CUDA_VISIBLE_DEVICES` when it lists UUIDs. Exactly one, or an error that
+/// says what nvidia-smi listed.
+pub fn nvidia_smi_index(name: &str) -> Result<u32, String> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=index,name,uuid", "--format=csv,noheader"])
+        .output()
+        .map_err(|e| format!("nvidia-smi: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("nvidia-smi: {}", out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let visible: Option<Vec<String>> = std::env::var("CUDA_VISIBLE_DEVICES").ok().and_then(|v| {
+        let ids: Vec<String> = v.split(',').map(|s| s.trim().to_owned()).collect();
+        ids.iter().all(|s| s.starts_with("GPU-")).then_some(ids)
+    });
+    let named: Vec<u32> = text
+        .lines()
+        .filter_map(|line| {
+            let (index, rest) = line.split_once(',')?;
+            let (gpu_name, uuid) = rest.rsplit_once(',')?;
+            let uuid = uuid.trim();
+            let shown = visible
+                .as_ref()
+                .is_none_or(|v| v.iter().any(|id| uuid.starts_with(id.as_str())));
+            if !(gpu_name.contains(name) && shown) {
+                return None;
+            }
+            index.trim().parse().ok()
+        })
+        .collect();
+    match named.as_slice() {
+        &[index] => Ok(index),
+        _ => Err(format!(
+            "{} devices named like {name:?} are visible, not one; nvidia-smi listed:\n{text}",
+            named.len()
+        )),
+    }
+}
+
 /// What the engine thread is asked to do.
 enum Cmd {
     Prefill(Vec<u32>),
@@ -191,6 +365,7 @@ pub struct Ds41Engine {
     vocab: Arc<Vocab>,
     ctx_max: usize,
     card: String,
+    props: EngineProps,
     pos: usize,
 }
 
@@ -199,12 +374,14 @@ impl Ds41Engine {
     /// writes the load lines), and wait until it is loaded. `keep` is the
     /// body's rule for `keepable`: the longest prefix of at most `n` positions
     /// the model's rollback keeps, from where it stands. `card` names the
-    /// device in a crash report.
+    /// device in a crash report; `props` is what `/props` reports about the
+    /// engine ([`model_props`], [`placement_props`]).
     pub fn spawn<B, F, K>(
         open: F,
         keep: K,
         vocab: Arc<Vocab>,
         card: String,
+        props: EngineProps,
     ) -> Result<Ds41Engine, GateError>
     where
         B: ChainBody + 'static,
@@ -258,6 +435,7 @@ impl Ds41Engine {
             vocab,
             ctx_max,
             card,
+            props,
             pos: 0,
         })
     }
@@ -389,6 +567,10 @@ impl Engine for Ds41Engine {
 
     fn describe(&self) -> String {
         format!("card={} position={}", self.card, self.pos)
+    }
+
+    fn props_engine(&self) -> EngineProps {
+        self.props.clone()
     }
 }
 
