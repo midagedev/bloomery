@@ -80,10 +80,24 @@ assert_fresh_binary() {
   fi
   BIN_SHA=$(sha256sum "$BIN_PATH" | cut -c1-12)
   BIN_MTIME=$(date -u -r "$BIN_PATH" +%Y-%m-%dT%H:%M:%SZ)
-  newer=$(find crates Cargo.toml Cargo.lock \
-            -path 'crates/oxide-ice-unroll' -prune -o \
-            \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
-            -newer "$BIN_PATH" -print 2>/dev/null | head -n 5 || true)
+  # Cargo writes the binary's dep-info next to it (<bin>.d: every source file of every crate it
+  # links, device crates included). With it, only those files, the manifests and the lock count: an
+  # edit to a crate the binary does not link (a gate bin, for bloomery-tokenize) is not staleness.
+  # Without it, every crates/ source counts.
+  local dep=$BIN_PATH.d scope
+  if [ -f "$dep" ]; then
+    scope=dep-info
+    # shellcheck disable=SC2046 # the dep-info list is space-separated paths without spaces
+    newer=$(find $(sed -e 's/^[^:]*: *//' -e 's/\\$//' "$dep" | tr ' ' '\n' | grep -v '^$' | sort -u) \
+              Cargo.toml Cargo.lock crates/*/Cargo.toml \
+              -newer "$BIN_PATH" -print 2>/dev/null | head -n 5 || true)
+  else
+    scope="every crates/ source"
+    newer=$(find crates Cargo.toml Cargo.lock \
+              -path 'crates/oxide-ice-unroll' -prune -o \
+              \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+              -newer "$BIN_PATH" -print 2>/dev/null | head -n 5 || true)
+  fi
   if [ -n "$newer" ]; then
     echo "[stale-binary] $BIN_PATH (sha256 $BIN_SHA, mtime $BIN_MTIME) is older than its sources:" >&2
     # shellcheck disable=SC2086
@@ -91,6 +105,6 @@ assert_fresh_binary() {
     echo "    rebuild it with the matching just recipe and rerun; measuring this one would be a wrong number, not a missing one." >&2
     return 3
   fi
-  echo "[binary] $BIN_PATH sha256=$BIN_SHA mtime=$BIN_MTIME (newer than every crates/ source)"
+  echo "[binary] $BIN_PATH sha256=$BIN_SHA mtime=$BIN_MTIME (newer than its sources: $scope)"
   return 0
 }
