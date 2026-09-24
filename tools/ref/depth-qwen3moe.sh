@@ -8,6 +8,7 @@
 #   just depth-gpu-qwen3moe 6 ik:6 ikdef:6 lcpp:6 1024 ik:1024 ikdef:1024 lcpp:1024 4096 ik:4096 ikdef:4096 lcpp:4096
 #   just depth-gpu-qwen3moe 6 lcpp:6 mrs:6 4096 lcpp:4096 mrs:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-qwen3moe 6 lcpp:6 mrs:6    # the command lines, no lease, no load
+#   just depth-gpu-qwen3moe 6 bin:/root/repo/bloomery-<track>-base/target/release/generate_qwen3moe:6 lcpp:6
 #
 # depth-ds41.sh's shape, and it blocks the same failure: a ratio read at one depth and quoted as
 # "decode is faster" — a step's attention term grows with the cached keys, so the depth goes into
@@ -26,6 +27,12 @@
 #             caches have one height (mistral.rs: below).
 #             Our flash grid is fixed by C (flash_gqa::segments_for), so C goes into the row.
 #             BLOOMERY_GEN_CTX fixes C for every ours arm instead, e.g. at a serving height.
+#   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
+#             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
+#             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
+#             two builds. It is a base by construction, so its freshness is not asked; its tree line
+#             (sha256, HEAD, dirty files) is printed with the references'. Every label is its own
+#             engine in the per-arm means and in the ratio table (ours / each other label).
 #   ik:<D>    ik: llama-bench -p 0 -n 0 -gp D,N -r 1 $IK_GPU_FLAGS (D = 0: plain tg N). The D-token
 #             prefill runs first and untimed: ik restarts its clock after it.
 #   ikdef:<D> the same at $IK_GPU_DEFAULT_FLAGS: llama-bench's own defaults with every layer on the
@@ -141,27 +148,46 @@ esac
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6 lcpp:6)
 ours=0 ik=0 lcpp=0 mrs=0
+# Per arm, by its index in ARMS: the kind (ours, ref or bin), the depth, the row label and the binary
+# (ours and bin).
+A_KIND=() A_DEP=() A_LABEL=() A_BIN=()
+arm_usage() {
+  echo "depth-qwen3moe.sh: arm '$1' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, mrs:<D>, mrspa0:<D> or bin:<path>:<D>" >&2
+  exit 64
+}
 for a in "${ARMS[@]}"; do
-  eng=${a%%:*}
-  [ "$eng" != "$a" ] || eng=ours
-  case $eng in
-    ours) ours=1 ;;
-    ik | ikdef) ik=1 ;;
-    lcpp) lcpp=1 ;;
-    mrs | mrspa0) mrs=1 ;;
-    *) eng=bad ;;
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin=''
+  case $a in
+    bin:*)
+      kind=bin bin=${a#bin:}
+      dep=${bin##*:} bin=${bin%:*}
+      case $bin in /*) ;; *) arm_usage "$a" ;; esac
+      tree=${bin%/target/*}
+      [ "$tree" != "$bin" ] || tree=${bin%/*}
+      label=bin:${tree##*/}
+      ;;
+    *:*)
+      case $eng in
+        ik | ikdef) ik=1 ;;
+        lcpp) lcpp=1 ;;
+        mrs | mrspa0) mrs=1 ;;
+        *) arm_usage "$a" ;;
+      esac
+      label=$eng
+      ;;
+    *) kind=ours dep=$a bin=$BIN label=ours ours=1 ;;
   esac
-  dep=${a#*:}
-  case $eng:$dep in
-    bad:* | *: | *:*[!0-9]*) echo "depth-qwen3moe.sh: arm '$a' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, mrs:<D> or mrspa0:<D>" >&2; exit 64 ;;
-    mrs:0 | mrspa0:0) echo "depth-qwen3moe.sh: arm '$a': mistral.rs refuses --depth 0 with a decode length" >&2; exit 64 ;;
+  case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+  case $kind:$eng:$dep in
+    ref:mrs:0 | ref:mrspa0:0) echo "depth-qwen3moe.sh: arm '$a': mistral.rs refuses --depth 0 with a decode length" >&2; exit 64 ;;
   esac
   # Our prompt is one argument of D ids of up to six characters each; the kernel caps one
   # argument at 128 KiB.
-  if [ "$a" = "$dep" ] && { [ "$dep" -lt 1 ] || [ "$dep" -gt 20000 ]; }; then
+  if [ "$kind" != ref ] && { [ "$dep" -lt 1 ] || [ "$dep" -gt 20000 ]; }; then
     echo "depth-qwen3moe.sh: our arm '$a' needs 1 <= D <= 20000 (D fed ids in one --tokens argument)" >&2
     exit 64
   fi
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_BIN+=("$bin")
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness.
 # shellcheck source=tools/ref/timing-card.sh
@@ -173,6 +199,7 @@ source "${BASH_SOURCE[0]%/*}/lease.sh"
 # recipe skips the build) nor reads it, so its freshness is not asked. A dry run asks nothing of
 # our binary: it prints the command line it would run.
 if [ "$ours" = 1 ] && [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?; fi
+# A bin:<path> arm's binary is checked where its tree line is taken, below.
 if [ "$ik" = 1 ]; then [ -x "$IKBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $IKBIN" >&2; exit 2; }; fi
 if [ "$lcpp" = 1 ]; then [ -x "$LCPPBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $LCPPBIN" >&2; exit 2; }; fi
 if [ "$mrs" = 1 ]; then [ -x "$MRSBIN" ] || { echo "depth-qwen3moe.sh: no mistralrs at $MRSBIN" >&2; exit 2; }; fi
@@ -186,7 +213,7 @@ tree_line() {
   dirty=$(GIT_OPTIONAL_LOCKS=0 git -c safe.directory="$tree" -C "$tree" status --porcelain --untracked-files=no 2> /dev/null | wc -l | tr -d ' ')
   echo "$bin sha256=$sha head=$head dirty_files=$dirty"
 }
-IK_LINE='' LCPP_LINE='' MRS_LINE='' MRS_VERSION=''
+IK_LINE='' LCPP_LINE='' MRS_LINE='' MRS_VERSION='' BIN_LINES=()
 [ "$ik" = 0 ] || IK_LINE=$(tree_line "$IKBIN" "$IK")
 # shellcheck disable=SC2153 # LCPP is the profile's, which shellcheck does not follow
 [ "$lcpp" = 0 ] || LCPP_LINE=$(tree_line "$LCPPBIN" "$LCPP")
@@ -196,10 +223,19 @@ if [ "$mrs" = 1 ]; then
   MRS_VERSION=$("$MRSBIN" --version 2>&1 | head -n 1)
   MRS_LINE="$MRS_LINE version=${MRS_VERSION:-?}"
 fi
+for i in "${!ARMS[@]}"; do
+  [ "${A_KIND[$i]}" = bin ] || continue
+  b=${A_BIN[$i]}
+  [ -x "$b" ] || { echo "depth-qwen3moe.sh: arm '${ARMS[$i]}': no binary at $b" >&2; exit 2; }
+  t=${b%/target/*}
+  [ "$t" != "$b" ] || t=${b%/*}
+  BIN_LINES+=("${A_LABEL[$i]}: $(tree_line "$b" "$t")")
+done
 ref_witness() {
   [ -z "$IK_LINE" ] || echo "    ik: $IK_LINE"
   [ -z "$LCPP_LINE" ] || echo "    lcpp: $LCPP_LINE"
   [ -z "$MRS_LINE" ] || echo "    mrs: $MRS_LINE"
+  [ ${#BIN_LINES[@]} -eq 0 ] || printf '    %s\n' "${BIN_LINES[@]}"
 }
 
 # The witness before and after every row: the timing card's lines (with our binary), the busiest
@@ -315,18 +351,57 @@ ref_arm() {
   sums+=("$eng|$dep|$r|$val|")
 }
 
+# One arm of a generate_qwen3moe: ours (our binary) or a second binary (bin:). The row and the sum
+# under the arm's label.
+# ours_arm <index> <round>
+ours_arm() {
+  local i=$1 r=$2 dep label bin ctx out rc t0 t1 smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50
+  dep=${A_DEP[$i]} label=${A_LABEL[$i]} bin=${A_BIN[$i]}
+  ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
+  witness "pre r$r $label d=$dep n=$N ctx=$ctx"
+  t0=$(date +%s)
+  out=$(timeout --kill-after=10 "$BOUND" "$bin" --tokens "$(lcg_prompt "$dep")" -n "$N" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
+  rc=$?
+  t1=$(date +%s)
+  witness "post r$r $label d=$dep n=$N ctx=$ctx"
+  if [ $rc -ne 0 ]; then
+    echo "r$r $label d=$dep ctx=$ctx FAILED rc=$rc" >&2
+    echo "$out" | tail -n 20 >&2
+    exit 1
+  fi
+  smoke=$(echo "$out" | grep -E '^SMOKE ')
+  [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
+  # The prompt_ids line is the whole prompt; the load, capture and step-0 lines are the
+  # arm's configuration and the fed steps' time.
+  echo "$out" | grep -E '^(load|capture|step 0) '
+  p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
+  mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
+  warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
+  nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
+  series=$(echo "$out" | awk '/^time step /{sub(/.*ms=/,""); print}')
+  h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
+  t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
+  uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
+  tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
+  tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
+  echo "ROW r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?} | wall $((t1 - t0))s"
+  sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
+}
+
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   ref_witness | sed 's/^   /[dry]/'
-  for a in "${ARMS[@]}"; do
-    eng=${a%%:*}
-    dep=${a#*:}
-    if [ "$eng" = "$a" ]; then
-      ctx=${GEN_CTX:-$(((a + N + 255) / 256 * 256))}
-      echo "[dry] $a: timeout --kill-after=10 $BOUND $BIN --tokens <lcg_prompt $a> -n $N --ctx $ctx --time${WARM:+ --warm $WARM}"
-    else
-      ref_cmd "$eng" "$dep"
+  for i in "${!ARMS[@]}"; do
+    a=${ARMS[$i]}
+    dep=${A_DEP[$i]}
+    if [ "${A_KIND[$i]}" = ref ]; then
+      ref_cmd "${a%%:*}" "$dep"
       echo "[dry] $a: timeout --kill-after=10 $BOUND $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'"
+    else
+      ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
+      note=''
+      [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
+      echo "[dry] $a: timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens <lcg_prompt $dep> -n $N --ctx $ctx --time${WARM:+ --warm $WARM}$note"
     fi
   done
   for r in $(seq "$ROUNDS"); do
@@ -352,43 +427,13 @@ guard_timing
 sums=()
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#ARMS[@]} - 1))); do
-    a=${ARMS[$(((i + r - 1) % ${#ARMS[@]}))]}
+    j=$(((i + r - 1) % ${#ARMS[@]}))
+    a=${ARMS[$j]}
     guard_other
     guard_timing
-    case $a in
-      *:*) ref_arm "${a%%:*}" "${a#*:}" "$r" ;;
-      *)
-        dep=$a
-        ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
-        witness "pre r$r ours d=$dep n=$N ctx=$ctx"
-        t0=$(date +%s)
-        out=$(timeout --kill-after=10 "$BOUND" "$BIN" --tokens "$(lcg_prompt "$dep")" -n "$N" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
-        rc=$?
-        t1=$(date +%s)
-        witness "post r$r ours d=$dep n=$N ctx=$ctx"
-        if [ $rc -ne 0 ]; then
-          echo "r$r ours d=$dep ctx=$ctx FAILED rc=$rc" >&2
-          echo "$out" | tail -n 20 >&2
-          exit 1
-        fi
-        smoke=$(echo "$out" | grep -E '^SMOKE ')
-        [ -n "$smoke" ] || { echo "r$r ours d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-        # The prompt_ids line is the whole prompt; the load, capture and step-0 lines are the
-        # arm's configuration and the fed steps' time.
-        echo "$out" | grep -E '^(load|capture|step 0) '
-        p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
-        mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
-        warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
-        nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
-        series=$(echo "$out" | awk '/^time step /{sub(/.*ms=/,""); print}')
-        h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
-        t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
-        uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
-        tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
-        tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-        echo "ROW r$r ours d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?} | wall $((t1 - t0))s"
-        sums+=("ours|$dep|$r|$tps_mean|$tps_p50")
-        ;;
+    case ${A_KIND[$j]} in
+      ref) ref_arm "${a%%:*}" "${a#*:}" "$r" ;;
+      *) ours_arm "$j" "$r" ;;
     esac
   done
 done
@@ -406,8 +451,8 @@ echo
 echo "=== ours / reference per depth: each round's ratio of the pair measured in that round (arms"
 echo "    that ran more than once in a round are averaged first), their mean with its 95 % interval"
 echo "    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ==="
-deps=$(printf '%s\n' "${ARMS[@]}" | sed 's/^[a-z0-9]*://' | sort -un | tr '\n' ' ')
-refs=$(printf '%s\n' "${ARMS[@]}" | sed -n 's/^\([a-z0-9]*\):.*/\1/p' | sort -u | tr '\n' ' ')
+deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | awk -F'|' -v deps="$deps" -v refs="$refs" -v rounds="$ROUNDS" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++

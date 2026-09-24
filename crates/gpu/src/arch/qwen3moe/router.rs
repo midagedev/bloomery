@@ -7,12 +7,15 @@
 //! routing fused into it, one launch for up to [`MAX_TOKENS`] tokens — and
 //! `qwen3moe_router`, the routing alone over one token's given logits. The
 //! fused gemv is `q8f32::f32_gemv`'s row body — one warp per expert row,
-//! `f32_lane_partials` and one fixed warp tree per column — so every logit is
-//! bit for bit that kernel's. The routing needs all of a token's logits, so
-//! it runs in the block that finishes last: each block publishes its rows (a
-//! fence, then one atomic ticket per block), and the block that draws the
-//! last ticket puts the count back to zero for the next launch or graph
-//! replay and routes token `t` with its warp `t`.
+//! `f32_lane_partials`' sum (at one token the same sum through
+//! `f32_lane_partial_1col_w32`, which keeps 32 chunks' loads in flight) and
+//! one fixed warp tree per column — so every logit is bit for bit that
+//! kernel's. Each block computes one row, with its first warp, so the rows
+//! spread over as many SMs as there are experts. The routing needs all of a
+//! token's logits, so it runs in the block that finishes last: each block
+//! publishes its row (a fence, then one atomic ticket per block), and the
+//! block that draws the last ticket puts the count back to zero for the next
+//! launch or graph replay and routes token `t` with its warp `t`.
 //!
 //! Numeric contract, op for op:
 //! - the max of the 128 logits by `f32::max` (exact, so its order is free);
@@ -25,7 +28,7 @@
 //! - the chosen probabilities summed in f64 in slot order, the sum rounded
 //!   once to f32, each weight the f32 divide of its probability by it.
 
-use crate::q8f32::{f32_lane_partials, gemv_lane_sums};
+use crate::q8f32::{f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums};
 use crate::route_core::take;
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -50,10 +53,11 @@ pub const MAX_TOKENS: usize = 8;
 /// Threads per routing-only launch: one warp.
 const ROUTER_THREADS: u32 = 32;
 
-/// Threads per fused block: eight warps, one expert row each.
+/// Threads per fused block: eight warps — the first computes the block's
+/// expert row, and in the routing block warp `t` routes token `t`.
 const FUSED_THREADS: usize = 256;
 const FUSED_THREADS_U32: u32 = FUSED_THREADS as u32;
-const ROWS_PER_BLOCK: usize = FUSED_THREADS / 32;
+const FUSED_WARPS: usize = FUSED_THREADS / 32;
 
 /// Probabilities each lane of the routing warp owns: experts `lane + 32 j`.
 const PER_LANE: usize = N_EXPERT / 32;
@@ -63,11 +67,10 @@ const P_LEN: usize = MAX_TOKENS * N_EXPERT;
 const SLOT_LEN: usize = MAX_TOKENS * N_USED;
 
 const _: () = assert!(FUSED_THREADS_U32 as usize == FUSED_THREADS);
-const _: () = assert!(N_EXPERT.is_multiple_of(ROWS_PER_BLOCK));
 // The routing warp's lanes hold four logits each, as named scalars.
 const _: () = assert!(PER_LANE == 4);
 // The routing block has a warp for every token.
-const _: () = assert!(MAX_TOKENS <= ROWS_PER_BLOCK);
+const _: () = assert!(MAX_TOKENS <= FUSED_WARPS);
 
 /// One token's routing by one warp, the module doc's contract: lane `L`
 /// brings the token's logits of experts `L + 32 j` in `v`; `p` and `slot_p`
@@ -297,10 +300,11 @@ mod qwen3moe_router_kernels {
     /// `ids[t·8 + s]` and `weights[t·8 + s]`. `done[0]` is the block ticket
     /// count: zero before the launch, zero again after it.
     ///
-    /// Grid `N_EXPERT / 8` blocks of 256; warp `r % 8` of block `r / 8` owns
-    /// row `r` — `f32_gemv`'s geometry and row body. After its rows every
-    /// thread fences and the block meets at a barrier, so the rows are
-    /// visible device-wide before thread 0 draws the block's ticket. The
+    /// Grid [`N_EXPERT`] blocks of 256; warp 0 of block `r` owns row `r`
+    /// with `f32_gemv`'s row body, and the other warps meet the barriers
+    /// only. After its row every thread fences and the block meets at a
+    /// barrier, so the row is visible device-wide before thread 0 draws the
+    /// block's ticket. The
     /// block that draws the last ticket returns the count to zero, and its
     /// warp `t < m_cols` reads token `t`'s logits back (volatile loads: this
     /// block's L1 never held other blocks' rows, and a volatile load does not
@@ -346,10 +350,20 @@ mod qwen3moe_router_kernels {
         let wi = tid / 32;
         let m = m_cols as usize;
         // The row guard is warp-uniform, so the warp tree sees a full warp;
-        // a thread past the rows still meets the barrier and the ticket.
-        let row = thread::blockIdx_x() as usize * ROWS_PER_BLOCK + wi;
-        if row < N_EXPERT {
-            let sums = gemv_lane_sums(f32_lane_partials(w, x, k, row, m_cols, lane), m_cols);
+        // the other warps, and a block past the rows, still meet the barrier
+        // and the ticket.
+        let row = thread::blockIdx_x() as usize;
+        if wi == 0 && row < N_EXPERT {
+            let partials = if m == 1 {
+                // SAFETY: row < N_EXPERT, so w.len() >= 128·k >= (row + 1)·k,
+                // and x.len() >= k, by the launch contract; the launcher
+                // passes k a positive multiple of 32; lane < 32.
+                let f0 = unsafe { f32_lane_partial_1col_w32(w, x, k, row, lane) };
+                [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            } else {
+                f32_lane_partials(w, x, k, row, m_cols, lane)
+            };
+            let sums = gemv_lane_sums(partials, m_cols);
             if lane == 0 {
                 // SAFETY: row < N_EXPERT and 1 <= m <= 8, so the slots c·128 +
                 // row (c < m) lie inside logits (launch contract); lane 0 of
@@ -551,7 +565,7 @@ impl RouterKernels {
         }
         let k = launch_u32(what, "k", k)?;
         let m = launch_u32(what, "m", m)?;
-        let grid = launch_u32(what, "grid", N_EXPERT / ROWS_PER_BLOCK)?;
+        let grid = launch_u32(what, "grid", N_EXPERT)?;
         let prep = self
             .module
             .prepare_qwen3moe_router_fused(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
