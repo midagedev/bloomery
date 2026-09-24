@@ -289,3 +289,13 @@
 - **라운드**(각 ≤ M): {v4ref ‖ v4host} → v4meta → {v4card ‖ v4comp ‖ v4hc} → v4idx → v4body → v4time. v4ref = `tools/ref/models/deepseek4.sh` + ik 덤프 변형(정본 오라클 ik, mainline은 교차 확인). v4host = qdot IQ3_XXS·MXFP4 AVX2(ik `DequantizerIQ3XXS`·`MXFP4_Unpacker`) + 스칼라 거울 + `host-rate.sh` 측정. R0 ik 덤프(128 GB 페이지인)와 v4time(약 40분)은 30분 초과 → 사용자 승인.
 - **공개 비교의 자리**: V4.1 llama.cpp 행은 lcpprun(PR #28696 arm)이 만든다. V4 포트는 PR 브랜치가 아닌 mainline과의 깨끗한 행을 위한 병렬 트랙이고 블로커가 아니다. mistral.rs에는 V4 지원이 없다(`d5ae0f1`).
 - **스펙 밖 처분**: `check-arch.sh`의 아키텍처 목록 고정(qwen3moe 경로가 새고 있었다) → 리드가 지금(디렉터리에서 목록을 읽고 디스패치 항목 둘 추가). `models-survey.md:48,:168` 낡은 문장 → 리드가 지금 정정. `moe.rs:967,:980` 융합 커널 없는 형식의 조용한 `dequant_row` 폴백 → v4host 스펙(거절 또는 `load` 줄에 형식별 경로; 없으면 첫 타이밍이 느린 경로를 잰다). `hc_f32.rs:6-7` 토큰당 블록 하나 → v4hc 스펙(split-K F32 hc_pre).
+
+## Qwen3 레버 지도 (qwen3fast 보고, 2026-09-24 — 조사만, 원문 세션 스크래치 `wave-m4/report-qwen3fast.md`; 아래 µs·ms는 전부 [유도], nsys 없음)
+
+- **바닥**: 토큰당 1,919.6 MB(expert 1,097 · 밀집 567 · 헤드 255), 720 GB/s에서 2.67 ms(375 tok/s). 오늘 4.855 ms(E28, 깊이 6) = 바닥의 55 %. 분해: 바닥 2.67 + 큰 커널 대역폭 적자 0.52 + 작은 커널 바닥 약 1.05 + 노드 틈 0.56(653노드 × 0.85 µs).
+- **순서**: ⓪ `qwen3prof`(nsys 러너가 배치 프리필 모델의 재생 수를 못 맞춰 rc 3 — SEED 모드, XS; 그 뒤 리드가 6/1024/4096 프로파일과 라우터 추적 u(k)) → ① `qwen3route` K1 라우터 16→128블록 + K4 헤드 argmax 융합(1블록이 608 KB를 읽음, `elem.rs:1055`) + K5 디바이스 상주 루프, S, 209–213 tok/s → ② `qwen3fuse` K2 작은 커널 융합 653→약 410노드, M, 238–250 → ③ `qwen3bw` K3 큰 커널 대역폭(down `_sel`은 K=768이라 full iteration 0, 꼬리 경로만 24/32레인 — `cores.rs:307-350`, V4.1의 짧은 K에도 걸린다), M, 253–270 → ④ `qwen3spec` m행 검증 패스 그래프화(`prefill.rs:175-188`이 eager) + 합집합 expert 커널 + EAGLE-3, L → ⑤ IQ4_XS, ⑥ 메가커널 XL(3.30–3.55 ms).
+- **기각**: L2 퍼시스턴스(6 MB에 들어가는 뜨거운 텐서 없음), Q4_0(발행 바운드 아님), Qwen3-0.6B 드래프트(손익분기 α 0.56–0.62).
+- **투기적 디코딩**: 128/8 MoE는 k토큰 검증 바이트가 k에 거의 비례해 EAGLE-3 이득이 +9–24 %이고 엔진이 빨라질수록 준다. 크게 곱해 주는 것은 수락 길이가 긴 DFlash뿐인데 Instruct-2507용 공개 드래프터가 없다(Coder-30B-A3B용은 있음, 코드 τ 6.4–8.1). mainline에도 EAGLE3·DFlash가 들어와 있으므로 공개 비교는 투기 대 투기로.
+- **사용자 결정 목록**: EAGLE-3 체크포인트(lmsys SpecForge-Nex, 0.2B) 다운로드, IQ4_XS 파일 다운로드, DFlash 타깃을 Coder-30B-A3B로 둘지 드래프터 학습인지.
+- **mistral.rs**: 박스 바이너리(09-17 빌드, cuda, flash-attn 없음)에 qwen3moe GGUF 로더가 있고 `mistralrs bench --depth`가 있다 → `depth-qwen3moe.sh`에 `mrs:<D>` 팔(qwen3prof와 같은 도구 라운드). MoE 디코드는 층당 4런치, down에 topk 가중 + atomicAdd(비결정).
+- **스펙 밖 처분**: qwen3moe 프로필의 `LCPP` 기본값이 V4.1 PR 브랜치였다 → 리드가 mainline으로(`5cdb7a5`). 나머지(`nsys-gpu.sh:78-86`, `elem.rs:1055`, `cores.rs:307-350`, `prefill.rs:175-188`)는 위 라운드로.
