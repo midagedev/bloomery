@@ -242,3 +242,11 @@
 - **패치는 한 줄이 아니다.** guard 분기(`llama-build-context.cpp:1567–1570`, upstream `8699d8aa`)에 DEEPSEEK4/41만 넣으면 SCALE 노드가 CPU 퓨전을 깨 V4 CPU 비트가 전부 바뀐다(316행, max|Δ| 8.3). 그래서 CPU에 SUM_ROWS→SCALE→DIV 퓨전을 더한 판(`fix2`)은 기본 경로 로짓·PPL·KLD base가 바이트 동일이지만, BailingMoE2/3·Step-3.5의 CPU 비트를 바꾼다(모델 없음, 재지 않음).
 - **판단: 지금 올리지 않는다.** 사용자 규칙(메인테이너가 감당할 만큼, 바로 올리는 것은 한두 줄 크래시·정확성뿐)에 비춰 디버그 경로 전용 NaN + 다른 아키 비트 변화 + stock 도구로 재현 불가(`llama-eval-callback`은 316 id를 356토큰으로 쪼갠다)는 즉시 PR 요건 밖이다. 대안: 열린 PR이 줄었을 때 이슈 하나로 알리거나, V4 쪽 다른 수정과 묶는다. 근본 대안 `log1pf(expf(x))`(≈ −87까지 0 아님)는 모든 비트를 바꿔 제안하지 않는다.
 - 증거: 박스 `/home/user/ik-nanfix`(패치, 커밋 없음), `/home/user/ik-nanfix-work`(재현기 `ids_eval2.cpp`, 로그), 세션 스크래치 `iknan/`(`fix2.diff`, PR 초안 112단어). 곁가지: ik `llama-perplexity`가 청크마다 `dsv4_build_raw_mask_view: Oops(KQ_mask_swa). mask is 1024 x 512` 출력(rc 0, 별건 후보).
+
+## DSpark C (dsgraphc 보고, 2026-09-24)
+
+- 노드 73 + 8w(예측 = 캡처, w 1–5: 81–113), append n 1–8은 8노드. 런치 항 [유도] A6000 w 5 ≈ 96–98 µs 재생; eager와의 차이는 `c_launch`가 모델에 없어 유도하지 못한다 — **리드가 잰다**(E-자리 후보: `propose` eager 대 graph, 같은 바이너리 팔).
+- 블록 업로드 6회 동기 514,604 B → 1회 비동기 12,844 B; append는 `(520 + 15360n)·4` B.
+- **공개 파일의 token_embd(Q3_K)**: 드래프트는 로드에서 이름으로 거부한다(조용한 오답 없음, 코드 독해). 고침은 S–M ~50–60줄 — `dspark.rs:455` `card_format`에 Q3_K 행 소스, 행 폭을 타입에 맞추고, 넓히기 런치를 Q3_K 행 디퀀트로(일반 n_sb Q3_K `embed_rows` 커널이 없다, `elem.rs:733`은 k 2048 고정). 타깃도 같은 가정(`chain/glue.rs:847` `want bf16`) — **plainfile과 묶는다.** dsref 세트는 bf16 임베딩으로 떴으니 다시 뜬다.
+- 곁가지: router·shexp gate_up이 행마다 한 런치(`experts_mxfp4.rs:1044`, `experts.rs:353`) — m행 판이면 w 5에서 24노드 → 6, ~15 µs [유도] (M); `ds41_glue_embed` 런처 두 벌(R14, S); `append`가 기다리지 않아 비동기 오류가 다음 `propose`에서 드러난다(디버그 레버 후보); prefill append(n > 8)는 eager.
+- 설계: mistral.rs와 같은 모양(폭별 사전 캡처 + 영구 텐서 복사, `speculative/target.rs:192`). exllamav3는 커널 노드 인자 갱신(`graph.cu:182`), ik는 매번 캡처 + `cudaGraphExecUpdate`.
