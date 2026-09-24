@@ -1085,6 +1085,25 @@ pub struct HybridStats {
     /// and worst, over services whose go was not already there (ns).
     pub straggle_ns: u64,
     pub straggle_max_ns: u64,
+    /// Of a two-row pass ([`Chain::Pair`]), the host slot ids of row 1's
+    /// service of a layer that row 0's service of the same layer also
+    /// listed, summed over row 1's services. The one-token step adds nothing.
+    pub overlap_slots: u64,
+    /// Host slots computed by row 1's services of a two-row pass, summed:
+    /// the denominator of the row overlap `overlap_slots / pair_row1_slots`.
+    /// The union of a layer's two host lists is `host_slots − overlap_slots`
+    /// over any span of whole passes.
+    pub pair_row1_slots: u64,
+}
+
+/// Row 0's host slot ids of the layer its two-row pass served last — what
+/// row 1's service of that layer counts its overlap against. Written by
+/// [`Chain::Pair`] services only.
+#[derive(Clone, Copy, Debug)]
+struct PairRow0 {
+    layer: usize,
+    n: usize,
+    ids: [u32; EXPERTS_INTO_MAX],
 }
 
 /// A chain the host tier serves: the one-token step, or the two-row pass
@@ -1134,6 +1153,8 @@ pub struct Hybrid<H> {
     /// A service failed and released the stream; nothing is served again.
     poisoned: bool,
     stats: HybridStats,
+    /// For the row overlap in `stats`; `None` until a pair's row 0 is served.
+    pair_row0: Option<PairRow0>,
 }
 
 impl<H: HostExperts> Hybrid<H> {
@@ -1155,6 +1176,7 @@ impl<H: HostExperts> Hybrid<H> {
             capturing: false,
             poisoned: false,
             stats: HybridStats::default(),
+            pair_row0: None,
         })
     }
 
@@ -1396,7 +1418,33 @@ impl<H: HostExperts> Hybrid<H> {
         s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
         s.leg_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         s.parks_in_service += threads::pool().stats().worker_parks.saturating_sub(parks);
+        if chain == Chain::Pair {
+            self.count_pair_overlap(layer, row, &list[..n]);
+        }
         Ok(())
+    }
+
+    /// The row overlap of a two-row pass: row 0's service keeps its host ids,
+    /// row 1's service of the same layer — the next one served — counts its
+    /// ids found among them. A copy of at most [`EXPERTS_INTO_MAX`] ids and
+    /// that many squared compares, no lock; the one-token step never calls it.
+    fn count_pair_overlap(&mut self, layer: usize, row: usize, list: &[(u32, f32)]) {
+        if row == 0 {
+            let mut ids = [0u32; EXPERTS_INTO_MAX];
+            for (d, &(id, _)) in ids.iter_mut().zip(list) {
+                *d = id;
+            }
+            self.pair_row0 = Some(PairRow0 {
+                layer,
+                n: list.len(),
+                ids,
+            });
+        } else if let Some(r0) = self.pair_row0.take_if(|r0| r0.layer == layer) {
+            let row0 = &r0.ids[..r0.n];
+            let overlap = list.iter().filter(|(id, _)| row0.contains(id)).count();
+            self.stats.overlap_slots += overlap as u64;
+            self.stats.pair_row1_slots += list.len() as u64;
+        }
     }
 }
 

@@ -390,7 +390,8 @@ main thread floating instead of pinning it to the dispatcher's cpu slot — the
 default pins, and the `load` line prints the ask and the outcome),
 `BLOOMERY_STEP_PAIR=1` (`generate_ds41`: every step is one skewed two-row
 pass — `step_pair` with the previous pass's row-A argmax as the draft, accepted
-unconditionally; a timing arm whose `time` rows cover two positions each),
+unconditionally; a timing arm whose `time` rows cover two positions each — its
+text collapses into repetition, so its host-tier routing numbers are timing shape only),
 `BLOOMERY_STEP_STATS=1` (`generate_ds41`: a `stat step` line per generated
 step, host-tier `HybridStats` deltas, `getrusage` page faults and the card's
 `cuMemGetInfo` free bytes (`vram_free`), and a `stat summary` with

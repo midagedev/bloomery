@@ -492,7 +492,10 @@ mod drive {
         }
         // `BLOOMERY_STEP_PAIR=1`: every step is one skewed two-row pass whose
         // draft is the previous pass's row-A argmax, accepted unconditionally —
-        // a timing arm (two positions per `time` row), not a decode.
+        // a timing arm (two positions per `time` row), not a decode. Accepting
+        // every draft collapses the text into repetition, so its routing (host
+        // slots per row, `host_w2`, the row overlap) is not real text's: the
+        // host-tier numbers of this arm are timing shape only.
         let pair = std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1");
         let mut draft = next;
         for _ in 1..a.n_gen {
@@ -764,7 +767,13 @@ mod drive {
     /// `eng_wait_us` the step thread's time in the engram read (the wait on
     /// the helper, or the direct copy), `eng_helper_us` the helper's own and
     /// `eng_classify_us` the time the warm/cold count itself took (inside
-    /// `eng_wait_us` with the helper on, outside it off).
+    /// `eng_wait_us` with the helper on, outside it off). `overlap` is the
+    /// step's host slot ids of a two-row pass's row 1 that row 0 also sent
+    /// to the host at the same layer, `union` the distinct host slots of the
+    /// step's rows per layer, summed (`host_slots − overlap`: a one-row step
+    /// prints `overlap=0 union=<host_slots>`). The summary's `phi_mean` is
+    /// the pooled row overlap over the kept steps, `Σ overlap / Σ` row 1's
+    /// host slots, 0 when no kept step ran two rows.
     fn print_stats(probes: &[Probe], warm: usize) {
         let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
         let mut waits: Vec<f64> = Vec::with_capacity(probes.len());
@@ -772,6 +781,7 @@ mod drive {
         let (mut eng_helper_ns, mut eng_classify_ns) = (0_u64, 0_u64);
         let mut vram_free_min = u64::MAX;
         let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
+        let (mut overlap_sum, mut row1_sum) = (0_u64, 0_u64);
         for (k, w) in probes.windows(2).enumerate() {
             let i = k + 1;
             let (p, q) = (&w[0].hybrid, &w[1].hybrid);
@@ -779,6 +789,9 @@ mod drive {
             let leg_us = (q.leg_ns - p.leg_ns) as f64 / 1e3;
             let straggle_us = (q.straggle_ns - p.straggle_ns) as f64 / 1e3;
             let host_slots = q.host_slots - p.host_slots;
+            let overlap = q.overlap_slots - p.overlap_slots;
+            let row1 = q.pair_row1_slots - p.pair_row1_slots;
+            let union = host_slots - overlap;
             let host_w2 = if served == 0 {
                 0.0
             } else {
@@ -794,8 +807,9 @@ mod drive {
             let tag = if i <= warm { " warm" } else { "" };
             println!(
                 "stat step {i}{tag} served={served} leg_us={leg_us:.1} straggle_us={straggle_us:.1} \
-                 straggle_max_us={:.1} host_slots={host_slots} host_w2={host_w2:.4} go_early={} \
-                 parks={} majflt={dmaj} minflt={dmin} vram_free={} eng_warm={ew} eng_cold={ec} \
+                 straggle_max_us={:.1} host_slots={host_slots} host_w2={host_w2:.4} \
+                 overlap={overlap} union={union} go_early={} parks={} majflt={dmaj} minflt={dmin} \
+                 vram_free={} eng_warm={ew} eng_cold={ec} \
                  eng_direct={ed} eng_wait_us={wait_us:.1} eng_helper_us={:.1} eng_classify_us={:.1}",
                 q.straggle_max_ns as f64 / 1e3,
                 q.go_early - p.go_early,
@@ -815,6 +829,8 @@ mod drive {
                 legs.push(leg_us);
                 straggle_max = straggle_max.max(straggle_us);
                 slots += host_slots;
+                overlap_sum += overlap;
+                row1_sum += row1;
                 majflt += dmaj;
                 minflt += dmin;
             }
@@ -827,6 +843,11 @@ mod drive {
         legs.sort_by(f64::total_cmp);
         let wait_mean = waits.iter().sum::<f64>() / n as f64;
         waits.sort_by(f64::total_cmp);
+        let phi_mean = if row1_sum == 0 {
+            0.0
+        } else {
+            overlap_sum as f64 / row1_sum as f64
+        };
         let helper = match probes[0].eng_helper {
             None => "off".to_string(),
             Some(None) => "floating".to_string(),
@@ -834,7 +855,7 @@ mod drive {
         };
         println!(
             "stat summary steps={n} leg_us_mean={mean:.1} leg_us_p50={:.1} straggle_us_max={straggle_max:.1} \
-             host_slots_mean={:.1} majflt={majflt} minflt={minflt} vram_free_load={} \
+             host_slots_mean={:.1} phi_mean={phi_mean:.4} majflt={majflt} minflt={minflt} vram_free_load={} \
              vram_free_min={vram_free_min} eng_helper={helper} eng_warm={eng_warm} \
              eng_cold={eng_cold} eng_direct={eng_direct} eng_wait_us_mean={wait_mean:.1} \
              eng_wait_us_p50={:.1} eng_wait_us_max={:.1} eng_helper_us_mean={:.1} \
