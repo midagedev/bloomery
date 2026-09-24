@@ -4,7 +4,7 @@
 
 ## 비행 중 (파동 22, 09-25 07:20~)
 
-`dsloop` ‖ `qwen3fuse` ‖ `load3` ‖ `slots` — base `ac250bb`, 스펙 `~/.claude/projects/-Users-hckim-repo-bloomery/specs/wave-m5/spec-{dsloop,qwen3fuse,load3,slots}.md`. 경계: dsloop = `gpu-deepseek41/{body,chain/ffn,hc}.rs`·`gpu/model.rs`·`gpu-gates/draft.rs`·`generate_ds41.rs`; qwen3fuse = `gpu/arch/qwen3moe/**`·`head.rs` 접근자 하나; load3 = `chain/glue.rs`·`body.rs`의 StepRows/lock 헌크만(리드가 dsloop과 맞춘다)·`placement/host_lock.rs`·`gpu/graph.rs` 추가만; slots = `serve/**`. uniongroup·gpuq1은 body.rs·chain/ffn.rs 충돌로 다음 파동.
+`dsloop` ‖ `qwen3fuse` ‖ `load3` ‖ ~~`slots`~~(착륙 `75d2bad`: `POST /slots/0?action=save|restore|erase`, `--slot-save-path`, 파일 = 헤더·id + 엔진 상태, mock 왕복 게이트 셋, 실제 V4.1 엔진은 기본 501 — 스냅샷은 `slotsnap` 카드) — base `ac250bb`, 스펙 `~/.claude/projects/-Users-hckim-repo-bloomery/specs/wave-m5/spec-{dsloop,qwen3fuse,load3,slots}.md`. 경계: dsloop = `gpu-deepseek41/{body,chain/ffn,hc}.rs`·`gpu/model.rs`·`gpu-gates/draft.rs`·`generate_ds41.rs`; qwen3fuse = `gpu/arch/qwen3moe/**`·`head.rs` 접근자 하나; load3 = `chain/glue.rs`·`body.rs`의 StepRows/lock 헌크만(리드가 dsloop과 맞춘다)·`placement/host_lock.rs`·`gpu/graph.rs` 추가만; slots = `serve/**`. uniongroup·gpuq1은 body.rs·chain/ffn.rs 충돌로 다음 파동.
 
 파동 21은 전부 착륙했다(아래 줄은 기록용, 다음 정리 때 장부로):
 
@@ -28,7 +28,7 @@
 | A5 | 프리필 m>1: IMMA GEMM 커널(m 16–512) + 활성값 다리; T > 1 프리필의 링 행 수 W + T − 1, 토큰 우선 출력, `wo_a`·`wo_b` 80 MB를 T번 읽는 문제 | 새 `gpu/gemm.rs` | 커널 밴드 + 프리필 tok/s | — | L |
 | C3 | 동시 시퀀스 스케줄러 + 호스트/GPU 2단 파이프라인 | `serve`, `model` | 동시 2·4 스트림 합계 tok/s | dsloop | L |
 | C5 | systemd 유닛·임대 협약 | `configs/`, rig-log | 같은 러너 tok/s | C3 | S |
-| slots | M3 ⑧ 서버 슬롯 save/restore | `serve` | serve 게이트 | — | M |
+| slotsnap | V4.1 엔진 슬롯 스냅샷: `Ds41Engine`(`gpu-gates/bind.rs:512`)의 `save_state`/`restore_state` — 층별 창 링·압축 행·인덱스 키·압축기 상태·history, 섀도 링까지면 32K에서 1.35 GiB·위치당 ~44 KB, 최소판 110 MB면 복원 뒤 창 밖 cut 거부[유도, slots 보고]; `ChainBody::seed_depth`가 거부하던 일관 채우기와 `Body::rollback`의 압축 쪽 일반화, 엔진 스레드 `Cmd` 한 쌍, `bind.rs:446` `map_err(EngineError)`가 오류를 전부 치명 문자열로 합치는 것 → `StateError` 운반, `bloomery_serve_ds41`의 `--slot-save-path` | `gpu-gates/bind.rs`, `gpu-deepseek41/body.rs` | 저장 → 지우기 → 복원 뒤 greedy id = 캐시 없는 실행, 두 프로세스 | dsloop·load3(body.rs) | M–L |
 | qwen3fuse → qwen3bw → qwen3spec | 「Qwen3」 절 | `arch/qwen3moe` | e2e md5 = base, E28 | `qwen3route` | M·M·L |
 | v4meta → {v4card ‖ v4comp ‖ v4hc} → v4idx → v4body → v4time | 「V4-Flash」 절 | `arch/deepseek41` 변형 | 게이트마다 | 시팅 D(IQ3_XXS 속도) | M each |
 | glm53 · linear · visinj | GLM-5.3-Flash(KDA 선형 + MLA + mHC, 새 커널 계열 L) · 선형 어텐션 1단계(`research/linear-attn.md`) · 비전 V3 텍스트 쪽 주입(`visinj`: 행 덮어쓰기·`exp_probs_b_vl`·engram 0) | 각각 | — | M1·M2 뒤 | L·M·M |
@@ -46,6 +46,8 @@
 9. 합집합 벤치: `just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms engine:3,engine:3x4,engine:3x4u0.75,engine-sep:3x4u0.75,engine:3x3`(오늘 행별 호출이 둘째 읽기를 L3에서 받는지) + `e644f5a`의 `union:` 팔 — `--arms engine:3x6u0.75,engine-sep:3x6u0.75,union:3x6u0.75`(토큰당 ms ≈ union_bytes / 135 GB/s ± 5 %; 예측 630 슬롯 → 474 distinct, 78.3 → 58.9 ms[유도]; 1.15배 넘게 느리면 defer 몫 먼저). `--time`의 토큰 루프는 아직 한 번도 안 돌았다.
 10. **사용자 승인** — 혼합 파일로 뜬 참조 셋의 재생성(수 시간): `greedy-ds41/greedy-ik-cpu-64{,-p0,-p7}.tsv`(`just ik-greedy-ds41`), `ikppl/kldbase-*`(`ik-ppl`), `ref-draft/<DSREF_SET>`(`build-ref-dump-draft`, `f1d1168` 뒤 — 그때까지 `gate-gpu-dspark-graph`는 공개 파일에서 세트 탭 61줄 빨강). 그 뒤 혼합 파일·`MIXED`·그 오라클 세트 삭제(사용자 판단).
 11. 작은 것들: E5b(우리 greedy 출력에 `draft-accept.py`, 3분) → E19(lookup 게이트 정책, 오프라인); E17(뜨거운 목록의 프롬프트 의존, 오프라인 10분) → E18 여부; E29 DSpark 수락률의 온도(`--temp 0/0.7/1.0`, 15분); E9 engram 콜드 팔 + N3(Q3_K engram 표 84.6 GB의 페이지 캐시 잔류: E1b·E9·E20 한 자리); E14 0층 브리지 2.1–2.7 ms + J2 브리지 분해(A6000 nsys 행, `nsys-bridge.py`); E7 3090 250 W 아래 실효 BW(`bench-gpu-kernels`); K2 절편/기울기(`bench_v41_host --arms read-mmap:3,read-mmap:6,engine:3,engine:6` 16T·32T)·K3(`perf stat`, `THREADS=64`, THP)·K8(16 대 32 스레드); R4 `BLOOMERY_SPIN` 20000(×2 A/A)·200000·2000000, 산문 512, 4바퀴; N1 공개 파일 카드 크기 곡선 세 점 다시(~25분); N2 공개 파일 `nsys-gpu-ds41 512` 한 행(작은 런치가 노출의 주인인지); dsgraphc `propose` eager 대 graph(같은 바이너리 팔); qwen3route 뒤 E28 재측정.
+
+- slots 남긴 것(서버, 작음): `genloop.rs:316` `partial_path`가 프로세스 단위라 한 프로세스의 서버 둘이 같은 디렉터리에 동시에 save하면 충돌(원자 카운터, S); restore·erase 뒤 `GET /slots`의 `prompt`·`settings`가 직전 요청 것으로 남음(`n_past`만 갱신, S); `http.rs:33,41` `has_query`·`query_value` 퍼센트 디코딩 없음(S); `model/tests/common/oracle.rs:21-38,142,170`이 `head`·`derived` 타깃에서 dead-code 경고(`just check`, S); 테스트 안 된 경계 셋 — 빈 슬롯 save(40 B), `File::create` 실패 500, 퍼센트 인코딩 `action`. 버림: ik 전용 엔드포인트(`/slots/list`·`/delete_prompt` 등) — 호환 기준은 mainline이다.
 
 ## 사용자 결정 대기
 

@@ -20,7 +20,7 @@
 | **M1 숫자 공개** | A6000 헤드라인(위), 카드 크기 곡선 24/38/41 GB, 카드 쪽 분해(E26), Qwen3 E28 | **E21** 3090 실측 + N5 ik 플래그 + ik + DSpark 같은 창, 온도 > 0 수락률(E29); rig-log 글(영어 요약 + 한국어) + 30초 영상(승인 뒤); 공개 전 스크럽; "우리가 아는 한 유일한 Rust 엔진" 주장은 글 쓰는 날 재확인 | 빌더 틈의 임대 자리 |
 | **M2 돌려 볼 수 있게** | `bloomery-serve-ds41`·`bloomery-chat`·README·BUILD.md·THIRD_PARTY_NOTICES·로고·토크나이저 게이트 | BUILD.md에 prefix 재사용 두 문장, 30분 soak | 공개 시점(사용자; LICENSE는 MIT로 결정) |
 | **DFlash(DSpark)** | 커널 `dshc`·`dsmx`, 적재·KV `4b963af`, 블록 패스 B `5dd34cb`, 폭별 그래프 C `11ce715`, 합집합 설계 | `dspark-q3k`(비행) → `dsloop`(수락 루프; 첫 서빙 팔 = skew + n-gram lookup) → `uniongroup` | `ref-draft` 재덤프(시팅 10, 승인) |
-| **M3 서버** | prefix 재사용(`47e36b5`·`5fdfe11`), reasoning/DSML(`7f68981`), `/props` 엔진 객체(`631cedc`) | 슬롯 save/restore(`slots`), 템플릿 정리 라운드 | — |
+| **M3 서버** | prefix 재사용(`47e36b5`·`5fdfe11`), reasoning/DSML(`7f68981`), `/props` 엔진 객체(`631cedc`) | ~~슬롯 save/restore(`slots`)~~ `75d2bad`(엔진 스냅샷은 `slotsnap`), 템플릿 정리 라운드 | — |
 | **M4 모델** | Qwen3-30B-A3B 전 카드(체인·e2e·PPL·E28), IQ 커널, 선형 조사, V4 호스트 티어 커널 | `qwen3route`(비행) → `qwen3fuse` → `qwen3bw`; V4 `v4meta` → 카드·압축기·hc; `linear` → `glm53` | 시팅 D(IQ3_XXS 속도), 사용자 결정(다운로드·DFlash 대상) |
 | **M5 비전** | V0 오라클 `01bbe07`, V2 인코더 `4abc188` | V3 텍스트 쪽 주입(`visinj`) | M1·M2 뒤 |
 
