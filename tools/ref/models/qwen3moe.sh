@@ -25,8 +25,9 @@
 #                   depth-qwen3moe.sh
 #   IK_GPU_DEFAULT_FLAGS  the same at llama-bench's defaults, the `ikdef:<D>` arms: the two merges
 #                   in IK_GPU_FLAGS are opt-in, and the interleaved pair says which set is faster
-#   LCPP            the mainline llama.cpp tree the `lcpp:<D>` arms run; LCPPBIN moves its llama-bench
-#                   alone, as IKBIN does ik's
+#   LCPP            the mainline llama.cpp tree the `lcpp:<D>` arms run: mainline itself, not the V4.1
+#                   PR branch the deepseek41 profile names (qwen3moe needs no port); LCPPBIN moves its
+#                   llama-bench alone, as IKBIN does ik's
 #   LCPP_GPU_FLAGS  mainline's decode with the whole model on the timing card, the `lcpp:<D>` arms.
 #                   Both flag sets are chosen by reading each tree's CLI and docs; no flag sweep has
 #                   been run, so a row is "at these flags". depth-qwen3moe.sh's header gives each
@@ -53,7 +54,7 @@ REF_TOKENS=785,6722,315,9625,374
 REF_DUMP_LEASE=1
 : "${IK_GPU_FLAGS:=-ngl 99 -fa 1 -fmoe 1 -mqkv 1 -muge 1}"
 : "${IK_GPU_DEFAULT_FLAGS:=-ngl 99}"
-: "${LCPP:=/home/user/llama.cpp-v41}"
+: "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
 : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on}"
 
