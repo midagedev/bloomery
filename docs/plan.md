@@ -64,15 +64,17 @@
 | **DFlash** | 어긋난 k=1 검증 + DSpark 드래프트(3090 상주) | `dshc`(비행 중) → `dsmx`(seamb 뒤) → `dsgraph`(둘 뒤) → `dsloop` | 자리 10: D·tok/s(A6000 (a)와 3090 gate), G-d4 수락률 |
 | seam | 새 모델이 공유할 구조 | `seamb`(비행 중); seamc·seama 착륙 | 머지 |
 | M3 서버/커뮤니티 | pain 쇼트리스트 ①(prefix 재사용, L) ③(reasoning/DSML tool call, M) ⑧(슬롯 save/restore, M), 이슈 템플릿, 기여 안내 | `prefix` → `dsml` → `slots` | 템플릿·안내는 리드 |
-| M4 모델 계열 | Qwen3-30B-A3B 전 카드 → dense → GLM-4.7-Flash → 235B 호스트 → V4 Flash → 선형 | `qwen3`(L, 장기 — 파동을 넘겨 산다) → `glm47` → `qwen3host` → `ds4` → `linear` | 모델별 ik 덤프 세트, PPL/KLD, 같은 창 A/B(ik·llama.cpp·PR #83) |
+| M4 모델 계열 | Qwen3-30B-A3B 전 카드 → dense → GLM-4.7-Flash → 235B 호스트 → V4 Flash → 선형 | `qwen3`(L, 장기 — 파동을 넘겨 산다) → ~~`glm47`~~ **`glm53`**(GLM-5.3-Flash: 사용자 09-24 "할 거면 5.3 Flash" — HF 다운로드 3.8M 대 4.7-Flash 1.8M; 아키텍처 `glm5next`(ik 지원)가 V4.1 계열이다: HC mult 4, 인덱서 top-2048, MLA, sigmoid noaux_tc 288/8+1 공유, MTP 1층, 320B/활성 18B → 우리 V4.1 경로를 거의 그대로 탄다. **파일 결정 대기**: 09-15의 UD-Q4_K_XL 186 GiB는 박스에서 지워졌고 exl3만 남았다) → `qwen3host` → `ds4` → `linear` | 모델별 ik 덤프 세트, PPL/KLD, 같은 창 A/B(ik·llama.cpp·PR #83) |
 
-### 파동 (빌더 ≤ 4, 측정은 파동 사이 조용한 창)
+### 파동 (빌더 5개 이상 — 사용자 지시 09-24 10:16 "한번에 다섯 개 이상"; 측정은 증인으로 거른다)
+
+빌더 상한 4는 폐지. 측정 자리는 파동 사이가 아니라 **임대(flock)로 빌더를 세우고** 돈다 — 모든 스펙이 빌드 전에 `flock -n /root/bloomery-cpu.lock`를 폴링하므로 자리 하나(≤ 30분)는 빌더를 기다리게 한다. 폴링이라 빈틈에 빌드가 끼어들 수 있으니 측정 행은 증인 블록(loadavg·`/proc/pressure/io`·`[other-busy]`)으로 걸러 cargo/rustc가 없던 행만 쓰고, 오염된 행은 다음 자리에서 다시 잰다. 자리 둘을 연달아 붙이지 않는다(빌더의 대기 예산이 30분).
 
 | 파동 | 병렬로 뜨는 것 | 리드가 그 사이 하는 것 | 닫는 조건 |
 |---|---|---|---|
 | **16 (09-24 09:10~09:45)** | ~~`seamb`~~ `faec61d` ‖ `bind`(계속) ‖ ~~`dshc`~~ `25d9237` | seama 머지 `ce492d8`, plan 정리 `5c66b38`, `spec-dsmx` | seamb·dshc 머지(끝), bind는 17로 |
 | **17 (09:50~)** | `dsmx`(발사) ‖ ~~`bind`~~ `4afdd65`(10:10) ‖ **`qwen3`**(10:00 발사, base `3bd2f9c`, 장기 3단계 — ① `arch/qwen3moe/` 여섯 파일·`qwen2` 프리토크나이저·프로필·ik 덤프·meta/placement/tokenizer 게이트 ② NEOX rope·QK-norm·softmax 라우터 128/8·Q6_K `_sel`·GQA flash decode(각각 ik 덤프 대조 + FAIL-first) ③ `ChainBody`·`AnyEngine` arm·e2e greedy 토큰 = ik·generate CLI·PPL/KLD; 단계마다 보고 → 리드 머지 → 리베이스; 스펙 `spec-qwen3.md`. **박스에 `qwen3moe` 파일이 없어 리드가 받는 중**: `/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf`(unsloth, 18.6 GB, 09:46~, ~55 MB/s); 박스의 Qwen 파일 둘은 `qwen3next`(Coder-Next IQ4_XS)·`qwen35moe`(3.6-35B) = 선형 어텐션 프로그램 몫) ‖ `dsgraph`(dsmx 뒤) | 측정 자리 8·9 + E21은 **bind·dsmx 사이 빌더가 비는 창**에 | dsmx·bind 머지 |
-| 17′ | `qwen3`(장기 시작: Qwen3-30B-A3B 전 카드 — 파일 `arch/qwen3/`, 기존 arch는 읽기만) ‖ `fixup`(트래커 S 이하 10–15건) ‖ `dsgraph`(dsmx 착륙 뒤) | **측정 자리 8·9 + E21/E21b + E20** — 조용한 창(빌더 0, ~1시간) | fixup·dsgraph 머지 |
+| **17′ (10:30~)** | `dsmx` ‖ `qwen3`(1단계) ‖ **`prefix`**(pain ①: `Engine::cut(n)` 기본 impl + 슬롯 토큰 이력 + LCP 재사용 + `timings.cache_n`, api.rs XS 넷; 스펙 `spec-prefix.md`) ‖ **`dsml`**(pain ③: `reasoning.rs`·`dsml.rs`·픽스처, api.rs는 `chat_final`/`finish_stream` 영역만 — prefix와 같은 파일이라 리드가 리베이스에서 합친다) ‖ **`fixup`**(보고서 여섯 항목: `ModelError::Metadata`, inventory dequant 열, build-dump 스테일 가드, dump.sh 트리 검사, HC_PRE 호스트 규칙 한 곳, `hybrid_tensors` 재독 제거) ‖ **`ptxmd5`**(seamb §5: 엔트리별 정규화 명령열 md5 블록, 표는 바이트 동일 유지) ‖ `dsgraph`(dsmx 뒤) | 측정 자리 8(10:18 시작, 임대로 빌더 정지) → 증인 검사 → 자리 9는 다음 빈틈; 공통 규칙 `wave17-addendum.md`(게이트 락 대기 보고 기준 30분, 게이트 일괄) | prefix·dsml·fixup·ptxmd5 머지 |
 | 18 | `dsloop` ‖ `prefix`(pain ①) ‖ `qwen3`(계속) ‖ `glm47`(seam 셋 착륙 뒤, 체크리스트 = seama 보고 §4) | 자리 10: D·어긋난 k=1 tok/s; **M1 글·영상 발행**(사용자 승인 뒤) | dsloop 머지, G-d3 등식, G-d4 |
 | 19 | `dsml` ‖ `qwen3host` ‖ `qwen3`(마무리) ‖ `glm47`(계속) | Qwen3 같은 창 A/B(사용자 목표 "vram 통짜에서 llama보다 빠름"; PR #83의 252 tok/s 대조) | qwen3 머지 + 숫자 |
 | 20+ | `ds4` ‖ `linear` ‖ `slots` | M2 레포 공개(사용자 결정) | — |
@@ -90,6 +92,7 @@
 - **LICENSE**: MIT 유지 vs Apache-2.0(crate `license` 필드 12개도 함께).
 - **공개 시점**: M1 숫자만 먼저(rig-log 글) vs M2와 함께(레포 공개).
 - 3090 T1 측정(E21)은 승인됨.
+- **GLM-5.3-Flash 파일**: 다시 받을지(UD-Q4_K_XL 186 GiB ≈ 1시간, 또는 UD-Q3_K_XL 137 GB ≈ 45분 — V4.1 Q3_K_M과 같은 급), 어느 양자화로.
 
 ## 모델 — 먼저 유도하고, 측정은 유도가 빗나갈 때만 (2026-09-22)
 
