@@ -90,6 +90,16 @@
 //! the step's capture is. `BLOOMERY_STEP_STATS` reads once per pass;
 //! `BLOOMERY_STEP_PAIR` is refused with it.
 //!
+//! `BLOOMERY_DRAFT=dspark` serves the DSpark draft at width 1
+//! (`shared/ds41_dspark.rs`): the draft file is `$BLOOMERY_DSPARK_MODEL`, its
+//! card `BLOOMERY_DSPARK_CARD` (the 3090 when unset), and the target carries
+//! the feature tap of the draft's `target_layers`, built before the capture.
+//! The fed ids go one step each, every position's features into the draft;
+//! then every pass proposes (`kind=` on the `draft summary` line names the
+//! draft), runs the pair over `[next, proposal]` and appends the features of
+//! the positions it keeps. The rows and lines are the lookup's; a
+//! `load draft=dspark` line follows the `load` line.
+//!
 //! `BLOOMERY_CHECK_FINITE=1` runs every position the run steps — the fed ids
 //! and each generated token — first through the finite probe
 //! (`shared/ds41_finite.rs`): the position's step eagerly, outside the graph,
@@ -120,7 +130,12 @@ fn main() -> std::process::ExitCode {
 mod finite;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_dspark.rs"]
+mod dspark;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
+    use std::sync::Arc;
     use std::time::Instant;
 
     use bloomery_gpu::head::Head;
@@ -133,6 +148,7 @@ mod drive {
     use model::arch::deepseek41::place::PlanInputs;
     use model::placement::{HotList, Machine, workstation};
 
+    use crate::dspark::{self, Dspark, Verdict};
     use crate::finite;
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
@@ -351,13 +367,18 @@ mod drive {
         // Positions 0 .. depth − 1 are the fed ids; the N − 1 feedback steps
         // take depth .. depth + N − 2.
         let fed = depth + a.n_gen - 1;
-        if draft && a.n_gen < 2 {
-            return Err(
-                "BLOOMERY_DRAFT=lookup with -n 1 has no pass to draft: token 0 comes \
-                        out of the prompt's own step"
-                    .into(),
-            );
+        if draft != Draft::Off && a.n_gen < 2 {
+            return Err(format!(
+                "BLOOMERY_DRAFT={} with -n 1 has no pass to draft: token 0 comes out of the \
+                 prompt's own step",
+                draft.name()
+            )
+            .into());
         }
+        let draft_file = match draft {
+            Draft::Dspark => Some(dspark::draft_hparams()?),
+            _ => None,
+        };
 
         let path = ref_model_path()?;
         let t = Instant::now();
@@ -375,10 +396,11 @@ mod drive {
             )
             .into());
         }
-        if draft && fed + 1 > ctx_max {
+        if draft != Draft::Off && fed + 1 > ctx_max {
             return Err(format!(
-                "BLOOMERY_DRAFT=lookup: depth {depth} + {} fed tokens and the last pair's \
+                "BLOOMERY_DRAFT={}: depth {depth} + {} fed tokens and the last pair's \
                  overshoot exceed the plan's ctx_max {ctx_max} (--ctx {})",
+                draft.name(),
                 a.n_gen - 1,
                 a.ctx
             )
@@ -429,6 +451,32 @@ mod drive {
                 println!("host_lock={} B", l.bytes());
             }
         }
+        // The draft builds the target's feature tap, so it loads before the
+        // capture: the captured step then carries the tap.
+        let mut spark = match &draft_file {
+            Some((draft_split, hp)) => {
+                let t = Instant::now();
+                let card = dspark::draft_card()?;
+                let target = Arc::new(
+                    Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
+                );
+                let mut d = Dspark::open(&mut m, draft_split, hp, target, card)?;
+                let (free, total) = d.mem_info()?;
+                println!(
+                    "load draft=dspark card={} width={} target_layers={:?} feature_width={} \
+                     draft_card_free={free} of {total} in {:.1} s (runtime value)",
+                    d.card(),
+                    dspark::WIDTH,
+                    m.body("generate_ds41")?
+                        .feature_layers()
+                        .unwrap_or_default(),
+                    m.body("generate_ds41")?.feature_width(),
+                    t.elapsed().as_secs_f64()
+                );
+                Some(d)
+            }
+            None => None,
+        };
         if a.mode == StepMode::Graph {
             // Captured before the prompt, so the first timed step is a replay.
             println!("capture graph_nodes={}", m.capture_step()?);
@@ -447,17 +495,17 @@ mod drive {
         } else {
             None
         };
-        if draft {
-            decode_draft(&mut m, &a, &ids, prompt_len)
-        } else {
-            decode(&mut m, &a, &ids, prompt_len, check.as_mut())
+        match draft {
+            Draft::Off => decode(&mut m, &a, &ids, prompt_len, check.as_mut()),
+            Draft::Lookup => decode_draft(&mut m, &a, &ids, prompt_len, None),
+            Draft::Dspark => decode_draft(&mut m, &a, &ids, prompt_len, spark.as_mut()),
         }
     }
 
     /// `BLOOMERY_CHECK_FINITE`: unset or `0` is off, `1` on; any other value
     /// is refused, and so is the lever beside `--time`, the draft, the pair
     /// arm and the step stats.
-    fn finite_lever(a: &Args, draft: bool) -> Result<bool, GateError> {
+    fn finite_lever(a: &Args, draft: Draft) -> Result<bool, GateError> {
         let on = match std::env::var("BLOOMERY_CHECK_FINITE") {
             Err(std::env::VarError::NotPresent) => false,
             Ok(v) if v == "0" => false,
@@ -473,8 +521,8 @@ mod drive {
                 "--time: the probe's eager step would sit between two timed steps",
             ),
             (
-                draft,
-                "BLOOMERY_DRAFT=lookup: the probe reads one-row steps",
+                draft != Draft::Off,
+                "BLOOMERY_DRAFT: the probe reads one-row steps",
             ),
             (
                 std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1"),
@@ -590,21 +638,49 @@ mod drive {
         );
     }
 
-    /// `BLOOMERY_DRAFT`: unset is the plain path, `lookup` the served draft;
-    /// any other value is refused, and so is `BLOOMERY_STEP_PAIR=1` beside it.
-    fn draft_lever() -> Result<bool, GateError> {
-        let on = match std::env::var("BLOOMERY_DRAFT") {
-            Err(std::env::VarError::NotPresent) => false,
-            Ok(v) if v == "lookup" => true,
-            Ok(v) => return Err(format!("BLOOMERY_DRAFT is lookup or unset, not {v:?}").into()),
+    /// Which draft `BLOOMERY_DRAFT` serves.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Draft {
+        /// Unset: the plain path.
+        Off,
+        /// The n-gram lookup.
+        Lookup,
+        /// The DSpark draft (`shared/ds41_dspark.rs`).
+        Dspark,
+    }
+
+    impl Draft {
+        fn name(self) -> &'static str {
+            match self {
+                Draft::Off => "unset",
+                Draft::Lookup => "lookup",
+                Draft::Dspark => "dspark",
+            }
+        }
+    }
+
+    /// `BLOOMERY_DRAFT`: unset is the plain path, `lookup` and `dspark` the
+    /// served drafts; any other value is refused, and so is
+    /// `BLOOMERY_STEP_PAIR=1` beside a draft.
+    fn draft_lever() -> Result<Draft, GateError> {
+        let draft = match std::env::var("BLOOMERY_DRAFT") {
+            Err(std::env::VarError::NotPresent) => Draft::Off,
+            Ok(v) if v == "lookup" => Draft::Lookup,
+            Ok(v) if v == "dspark" => Draft::Dspark,
+            Ok(v) => {
+                return Err(format!("BLOOMERY_DRAFT is lookup, dspark or unset, not {v:?}").into());
+            }
             Err(e) => return Err(format!("BLOOMERY_DRAFT: {e}").into()),
         };
-        if on && std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1") {
-            return Err("BLOOMERY_DRAFT=lookup drafts every pair itself; unset \
-                        BLOOMERY_STEP_PAIR, the unconditional-accept timing arm"
-                .into());
+        if draft != Draft::Off && std::env::var("BLOOMERY_STEP_PAIR").is_ok_and(|v| v == "1") {
+            return Err(format!(
+                "BLOOMERY_DRAFT={} drafts every pair itself; unset BLOOMERY_STEP_PAIR, the \
+                 unconditional-accept timing arm",
+                draft.name()
+            )
+            .into());
         }
-        Ok(on)
+        Ok(draft)
     }
 
     /// The plan the engine is about to load: where the experts sit. Returns
@@ -779,13 +855,17 @@ mod drive {
         }
     }
 
-    /// `decode` under `BLOOMERY_DRAFT=lookup`: passes until `-n` tokens are
-    /// out, each timed around the proposal, the pass and the lookup's update.
+    /// `decode` under `BLOOMERY_DRAFT`: passes until `-n` tokens are out, each
+    /// timed around the proposal, the pass and the draft's update — the
+    /// lookup's push, or with `spark` the DSpark draft's features
+    /// (`dspark::pass`). The fed ids go one step each under `spark`, so the
+    /// draft gets every fed position's features.
     fn decode_draft(
         m: &mut Deepseek41Model,
         a: &Args,
         ids: &[u32],
         prompt_len: usize,
+        mut spark: Option<&mut Dspark>,
     ) -> Result<(), GateError> {
         // The pair pass's second head and, in graph mode, its capture are
         // made by the first pair: one here, then back to the fresh context,
@@ -796,7 +876,10 @@ mod drive {
             println!("capture pair_graph_nodes={}", m.pair_graph_nodes()?.len());
         }
         let depth = ids.len();
-        let first = feed(m, ids, prompt_len, None)?;
+        let first = match spark.as_deref_mut() {
+            None => feed(m, ids, prompt_len, None)?,
+            Some(d) => feed_dspark(m, d, ids, prompt_len)?,
+        };
         let mut next = first;
         let mut look = Lookup::new();
         for &t in ids {
@@ -815,19 +898,23 @@ mod drive {
         while emitted.len() + 1 < a.n_gen {
             let t0 = Instant::now();
             let pos = m.pos();
-            let kind = match look.propose() {
-                Some(d) => {
-                    let [ta, tb] = m.step_pair(next, d)?;
-                    if ta == d {
-                        emitted.extend_from_slice(&[(pos, ta), (pos + 1, tb)]);
-                        next = tb;
-                        PassKind::Accept
-                    } else {
-                        m.rollback(m.pos() - 1)?;
-                        emitted.push((pos, ta));
-                        next = ta;
-                        PassKind::Reject
-                    }
+            let verdict = match spark.as_deref_mut() {
+                Some(d) => Some(dspark::pass(m, d, next)?),
+                None => look
+                    .propose()
+                    .map(|d| lookup_pass(m, next, d))
+                    .transpose()?,
+            };
+            let kind = match verdict {
+                Some(Verdict::Accept([ta, tb])) => {
+                    emitted.extend_from_slice(&[(pos, ta), (pos + 1, tb)]);
+                    next = tb;
+                    PassKind::Accept
+                }
+                Some(Verdict::Reject(ta)) => {
+                    emitted.push((pos, ta));
+                    next = ta;
+                    PassKind::Reject
                 }
                 None => {
                     next = m.step(&[next])?;
@@ -835,14 +922,18 @@ mod drive {
                     PassKind::Plain
                 }
             };
-            let fresh = kind.positions();
-            for &(_, t) in &emitted[emitted.len() - fresh..] {
-                look.push(t);
+            if spark.is_none() {
+                for &(_, t) in &emitted[emitted.len() - kind.positions()..] {
+                    look.push(t);
+                }
             }
             passes.push((kind, t0.elapsed().as_secs_f64() * 1e3));
             if stats_on {
                 probes.push(Probe::read(m)?);
             }
+        }
+        if let Some(d) = spark.as_deref_mut() {
+            d.check_fault()?;
         }
         let warm = a.warm.unwrap_or(0);
         if warm >= passes.len() {
@@ -856,8 +947,44 @@ mod drive {
         if stats_on {
             print_stats(&probes, warm);
         }
-        print_draft_summary(a, &passes, prompt_len, depth);
+        let kind = if spark.is_some() { "dspark" } else { "lookup" };
+        print_draft_summary(a, &passes, prompt_len, depth, kind);
         Ok(())
+    }
+
+    /// The lookup's pass: the pair over `[next, d]`, the second position
+    /// taken back unless row A's argmax is `d`.
+    fn lookup_pass(m: &mut Deepseek41Model, next: u32, d: u32) -> Result<Verdict, GateError> {
+        let [ta, tb] = m.step_pair(next, d)?;
+        if ta == d {
+            Ok(Verdict::Accept([ta, tb]))
+        } else {
+            m.rollback(m.pos() - 1)?;
+            Ok(Verdict::Reject(ta))
+        }
+    }
+
+    /// [`feed`] for the DSpark draft: the fed ids one step each, every
+    /// position's features into the draft (`dspark::feed`), and the same
+    /// `fed` and `step 0` lines.
+    fn feed_dspark(
+        m: &mut Deepseek41Model,
+        d: &mut Dspark,
+        ids: &[u32],
+        prompt_len: usize,
+    ) -> Result<u32, GateError> {
+        let depth = ids.len();
+        let head: Vec<u32> = ids.iter().copied().take(4).collect();
+        let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
+        println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
+        let t = Instant::now();
+        let next = dspark::feed(m, d, ids)?;
+        println!(
+            "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
+            m.pos() - 1,
+            t.elapsed().as_secs_f64()
+        );
+        Ok(next)
     }
 
     /// The `step` lines of the first `-n` tokens, the `time pass` rows when
@@ -888,7 +1015,13 @@ mod drive {
     /// The `draft summary` over every pass (the rate over the passes past
     /// `--warm`), then the `SMOKE` footer when timed: `generate`'s keys over
     /// the kept passes, then `positions=` and `tok/s(positions)=`.
-    fn print_draft_summary(a: &Args, passes: &[(PassKind, f64)], prompt_len: usize, depth: usize) {
+    fn print_draft_summary(
+        a: &Args,
+        passes: &[(PassKind, f64)],
+        prompt_len: usize,
+        depth: usize,
+        kind: &str,
+    ) {
         let warm = a.warm.unwrap_or(0);
         let proposals = passes.iter().filter(|p| p.0 != PassKind::Plain).count();
         let accepts = passes.iter().filter(|p| p.0 == PassKind::Accept).count();
@@ -899,7 +1032,7 @@ mod drive {
         let rate = kept_positions as f64 * 1e3 / kept_ms;
         println!(
             "draft summary proposals={proposals} accepts={accepts} positions={positions} \
-             passes={} tok/s(positions)={rate:.2}",
+             passes={} tok/s(positions)={rate:.2} kind={kind}",
             passes.len()
         );
         if a.timed {

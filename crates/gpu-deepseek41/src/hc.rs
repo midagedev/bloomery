@@ -44,6 +44,10 @@
 //! the fold of the last token is the head's input.
 //!
 //! `ds41_hc_fold` — the fold alone.
+//!
+//! `ds41_hc_mean` — the feature tap a draft reads: the mean of one token's
+//! four streams, `((s_0 + s_1) + s_2) + s_3` then a multiply by 0.25
+//! ([`hc_mean_elem`]).
 
 use bloomery_gpu::cores::{q3k_chain, q3k_sb_decode, q8_quad};
 use bloomery_gpu::fault::quad_finite;
@@ -261,6 +265,15 @@ pub(crate) fn hc_fold_elem(o: [f32; 4], pre: [f32; 4]) -> f32 {
     y = o[1].mul_add(pre[1], y);
     y = o[2].mul_add(pre[2], y);
     o[3].mul_add(pre[3], y)
+}
+
+/// The mean of four stream values: `((o_0 + o_1) + o_2) + o_3`, then a
+/// multiply by 0.25 — a multiply, not a divide; exact, since 0.25 is a power
+/// of two. ggml's `dsv4_hc_mean_for_capture` (a left fold of adds, then
+/// `ggml_scale` by 1/4) has the same order.
+#[inline(always)]
+pub(crate) fn hc_mean_elem(o: [f32; 4]) -> f32 {
+    (((o[0] + o[1]) + o[2]) + o[3]) * 0.25
 }
 
 /// HC_POST at value `i = t * n + d`: the four new stream values at `d` of
@@ -728,6 +741,36 @@ mod hc_kernels {
             *y.get_unchecked_mut(i) = hc_fold_elem(o, pre);
         }
     }
+
+    /// The feature tap: the mean of one token's four streams `s` at value
+    /// `d` ([`hc_mean_elem`]), written to `y[off + d]`, one thread per value.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (s.len() >= 4 * n, y.len() >= off + n)
+    )]
+    pub fn ds41_hc_mean(s: &[f32], n: u32, off: u32, mut y: DisjointSlice<f32>) {
+        let n = n as usize;
+        let d = thread::index_1d().get();
+        if d >= n {
+            return;
+        }
+        // SAFETY: d + 3n < 4n <= s.len() by the launch contract.
+        let o = unsafe {
+            [
+                *s.get_unchecked(d),
+                *s.get_unchecked(d + n),
+                *s.get_unchecked(d + 2 * n),
+                *s.get_unchecked(d + 3 * n),
+            ]
+        };
+        // SAFETY: off + d < off + n <= y.len(); one thread per value.
+        unsafe {
+            *y.get_unchecked_mut(off as usize + d) = hc_mean_elem(o);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- host
@@ -950,6 +993,42 @@ impl HcKernels {
             self.module
                 .prepare_ds41_hc_fold(LaunchConfig1D::new(grid, HC_ELEM_THREADS_U32, 0))?;
         self.module.ds41_hc_fold(stream, &prep, s, hc, n, m, y)?;
+        Ok(())
+    }
+
+    /// Enqueue the feature tap (`ds41_hc_mean`): the mean of one token's
+    /// streams `s` (`4 * n_embd`) into `y[off .. off + n_embd]`.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_mean(
+        &self,
+        stream: &CudaStream,
+        s: &DeviceBuffer<f32>,
+        n_embd: usize,
+        off: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "HcKernels::enqueue_mean";
+        let end = off.checked_add(n_embd);
+        if n_embd == 0 || s.len() < HC_STREAMS * n_embd || end.is_none_or(|e| y.len() < e) {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "n_embd = {n_embd} at {off}: s {} (need {}), y {}",
+                    s.len(),
+                    HC_STREAMS * n_embd,
+                    y.len()
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", n_embd.div_ceil(HC_ELEM_THREADS))?;
+        let (n, off) = (
+            launch_u32(what, "n_embd", n_embd)?,
+            launch_u32(what, "off", off)?,
+        );
+        let prep =
+            self.module
+                .prepare_ds41_hc_mean(LaunchConfig1D::new(grid, HC_ELEM_THREADS_U32, 0))?;
+        self.module.ds41_hc_mean(stream, &prep, s, n, off, y)?;
         Ok(())
     }
 }

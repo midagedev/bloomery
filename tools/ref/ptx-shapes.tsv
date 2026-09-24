@@ -34,6 +34,7 @@ generate_ds41   ds41_glue_embed_q3k                     0          0
 generate_ds41   ds41_glue_engram_rows                   0          0
 generate_ds41   ds41_glue_engram_rows_q3k               0          0
 generate_ds41   ds41_hc_fold                            0          0
+generate_ds41   ds41_hc_mean                            0          0
 generate_ds41   ds41_hc_post                            0          0
 generate_ds41   ds41_hc_pre                             0          0
 generate_ds41   ds41_hc_pre_f32                         0          0

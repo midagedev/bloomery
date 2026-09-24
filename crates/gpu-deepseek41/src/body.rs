@@ -50,6 +50,12 @@
 //! them. [`Body::rollback`] cuts the positions back to any point
 //! [`Body::keep_point`] grants.
 //!
+//! A draft's feature tap ([`attach_features`]) adds, per row, one launch
+//! after the MoE sub-layer of each layer before a tapped layer: the mean of
+//! the four streams that layer leaves, into the row's feature buffer, which
+//! [`Body::read_features`] brings to the host. Without it the step is the
+//! same launches as before, and none of its buffers exist.
+//!
 //! [`ChainBody::seed_depth`] refuses: a synthetic depth would have to fill
 //! the rings, the compressed rows, the index keys and the states
 //! consistently with each other.
@@ -62,7 +68,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, SlotMap, levers};
 use bloomery_gpu::model::{ChainBody, StepProbe};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, window};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, window};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
@@ -77,7 +83,7 @@ use crate::chain::attn::{
 };
 use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps, ShadowWork};
 use crate::chain::glue::{EngramKv, EngramStep, Glue, StepRows};
-use crate::hc::HC_STREAMS;
+use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
 /// The V4.1 engine: the shared skeleton over this body.
@@ -117,6 +123,25 @@ pub fn open(
         .plan(&machine, ctx_max as u64)
         .map_err(|e| GpuError::plan(WHAT, e))?;
     GpuModel::load_placed(file, &plan, 0, &inputs.hp)
+}
+
+/// Build the feature tap a draft reads ([`Body::read_features`]): for every
+/// layer of `layers` — a draft's `target_layers`, strictly increasing, each
+/// at least 1 and at most the layer count — the mean of the four streams
+/// entering it, which the layer before it leaves, per row of the step and of
+/// the pair pass. Before any step and any capture: a graph captured without
+/// the tap would never write the features its readback returns, so a model
+/// that holds one is refused. Load-time only.
+pub fn attach_features(m: &mut Deepseek41Model, layers: &[usize]) -> Result<(), GpuError> {
+    const WHAT: &str = "deepseek41 attach_features";
+    if m.step_graph_nodes().is_ok() || m.pair_graph_nodes().is_ok() {
+        return Err(GpuError::State {
+            what: WHAT,
+            missing: "a model with no captured graph: attach the tap before the first capture",
+        });
+    }
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    body.attach_features(gpu, layers)
 }
 
 /// One layer's cache and compressor state.
@@ -551,6 +576,8 @@ pub struct Body {
     /// mapping the host tier reads and the load populated.
     file: Arc<Split>,
     eps: f32,
+    /// A draft's feature tap, once [`attach_features`] built it.
+    tap: Option<FeatureTap>,
 }
 
 /// `pair[read]` to read and the other to write.
@@ -812,6 +839,89 @@ impl Body {
         self.attn.set_top_k(gpu, top_k)
     }
 
+    /// [`attach_features`] on the body: refused once a step has run, and
+    /// when a tap exists already.
+    fn attach_features(&mut self, gpu: &Gpu, layers: &[usize]) -> Result<(), GpuError> {
+        const WHAT: &str = "deepseek41 Body::attach_features";
+        if self.tap.is_some() || !self.history.is_empty() {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a fresh body: one tap, attached before the first step",
+            });
+        }
+        self.tap = Some(FeatureTap::new(gpu, &self.layers, layers, self.n_embd())?);
+        Ok(())
+    }
+
+    /// The layers the feature tap reads the input of, in its order; `None`
+    /// without a tap.
+    #[must_use]
+    pub fn feature_layers(&self) -> Option<&[usize]> {
+        self.tap.as_ref().map(|t| t.layers.as_slice())
+    }
+
+    /// f32 values of one row's features: tapped layers × `n_embd`; 0 without
+    /// a tap.
+    #[must_use]
+    pub fn feature_width(&self) -> usize {
+        self.tap.as_ref().map_or(0, FeatureTap::width)
+    }
+
+    /// Device bytes of the feature tap's buffer, every row's; 0 without one.
+    #[must_use]
+    pub fn feature_bytes(&self) -> usize {
+        self.tap.as_ref().map_or(0, |t| t.dev.whole().num_bytes())
+    }
+
+    /// Rows `0 .. rows` of the feature tap as the last step or pair pass
+    /// left them, copied to the host in one transfer (a blocking read on the
+    /// engine stream): row `r` holds the features of position `pos + r`.
+    /// Refused without a tap, for a row whose last refresh is not the
+    /// position after the row before it (row 1 after a one-row step), and
+    /// for a position the history no longer holds (taken back).
+    pub fn read_features(&mut self, gpu: &Gpu, rows: usize) -> Result<Features<'_>, GpuError> {
+        const WHAT: &str = "deepseek41 Body::read_features";
+        let len = self.history.len();
+        let tap = self.tap.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a feature tap (attach_features)",
+        })?;
+        let first = match tap.pos.first().copied().flatten() {
+            Some(p) if (1..=PAIR_ROWS).contains(&rows) => p,
+            p => {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("{rows} rows of {PAIR_ROWS}; row 0 holds position {p:?}"),
+                });
+            }
+        };
+        for (r, p) in tap.pos.iter().take(rows).enumerate() {
+            let want = first as usize + r;
+            if *p != u32::try_from(want).ok() || want >= len {
+                return Err(GpuError::Shape {
+                    what: WHAT,
+                    detail: format!(
+                        "row {r} holds position {p:?}, not {want} of a history of {len}: a row \
+                         the last pass did not run, or a position taken back"
+                    ),
+                });
+            }
+        }
+        let w = tap.width();
+        let host = &mut tap.host[..rows * w];
+        let stream = gpu.stream();
+        if rows == 1 {
+            tap.dev.part(0).copy_to_host(stream, host)?;
+        } else {
+            tap.dev.whole().copy_to_host(stream, host)?;
+        }
+        Ok(Features {
+            pos: first,
+            width: w,
+            values: host,
+        })
+    }
+
     /// Enqueue the step as [`ChainBody::enqueue_chain`] does, showing
     /// `observe` each [`Seam`] as its launches are enqueued: a gate reads the
     /// streams there after it synchronizes. Asynchronous apart from what the
@@ -989,6 +1099,11 @@ impl Body {
         k
     }
 
+    /// `n_embd`, as the planner's image holds it.
+    fn n_embd(&self) -> usize {
+        self.image.layout().dims().n_embd
+    }
+
     /// Take back the tokens from position `pos` on: the next step runs at
     /// `pos`, and the step there and every step after it write what they
     /// did before, bit for bit. `pos` must be a point [`Body::keep_point`]
@@ -1052,6 +1167,9 @@ impl Body {
             missing: "the row's buffers",
         })?;
         lane.params.copy_from_host(stream, self.image.words())?;
+        if let Some(tap) = self.tap.as_mut() {
+            tap.pos[row] = Some(input.pos);
+        }
         Ok(())
     }
 
@@ -1069,6 +1187,7 @@ impl Body {
             attn,
             ffn,
             glue,
+            tap,
             ..
         } = self;
         Parts {
@@ -1083,6 +1202,7 @@ impl Body {
             attn,
             ffn,
             glue,
+            tap: tap.as_mut(),
         }
     }
 }
@@ -1108,6 +1228,7 @@ struct Parts<'a> {
     attn: &'a mut AttnChain,
     ffn: &'a mut FfnPiece,
     glue: &'a mut Glue,
+    tap: Option<&'a mut FeatureTap>,
 }
 
 impl Parts<'_> {
@@ -1301,6 +1422,9 @@ impl Parts<'_> {
         if step.folds {
             cur.f ^= 1;
         }
+        if let Some(tap) = self.tap.as_deref_mut() {
+            tap.enqueue(gpu, i, row, lane.hc[cur.s].buf())?;
+        }
         Ok(())
     }
 
@@ -1486,6 +1610,109 @@ struct LayerIo<'a> {
     selection: Selection<'a>,
 }
 
+/// Rows of features [`Body::read_features`] brought to the host: row `r`
+/// is `values[r * width ..][.. width]`, the features of position `pos + r`.
+pub struct Features<'a> {
+    pub pos: u32,
+    pub width: usize,
+    pub values: &'a [f32],
+}
+
+impl Features<'_> {
+    /// Row `r`'s features.
+    #[must_use]
+    pub fn row(&self, r: usize) -> Option<&[f32]> {
+        self.values.get(r * self.width..(r + 1) * self.width)
+    }
+}
+
+/// The feature tap ([`attach_features`]): per row, the stream means of the
+/// tapped layers' inputs, concatenated in the tap's order, on the card and
+/// their host copy.
+struct FeatureTap {
+    hc: HcKernels,
+    /// The tapped layers, in order.
+    layers: Vec<usize>,
+    /// Per layer of the card, by index: the tap slot its streams fill — the
+    /// slot of the layer after it.
+    after: Vec<Option<usize>>,
+    n_embd: usize,
+    /// Row `r`'s features: part `r`.
+    dev: PartedBuffer<f32, PAIR_ROWS>,
+    host: Vec<f32>,
+    /// The position each row's last refresh named: the one its features hold
+    /// once that step has run.
+    pos: [Option<u32>; PAIR_ROWS],
+}
+
+impl FeatureTap {
+    fn new(
+        gpu: &Gpu,
+        card: &Range<usize>,
+        layers: &[usize],
+        n_embd: usize,
+    ) -> Result<FeatureTap, GpuError> {
+        const WHAT: &str = "deepseek41 FeatureTap::new";
+        let increasing = layers.windows(2).all(|w| w[0] < w[1]);
+        let mut after = vec![None; card.len()];
+        for (k, &l) in layers.iter().enumerate() {
+            let i = l
+                .checked_sub(1)
+                .and_then(|b| b.checked_sub(card.start))
+                .filter(|&i| i < card.len() && increasing);
+            match i {
+                Some(i) => after[i] = Some(k),
+                None => {
+                    return Err(GpuError::Shape {
+                        what: WHAT,
+                        detail: format!(
+                            "tapped layers {layers:?}: each strictly after the one before, and the \
+                             layer before each one on this card's {card:?}"
+                        ),
+                    });
+                }
+            }
+        }
+        let width = layers.len() * n_embd;
+        if width == 0 {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("tapped layers {layers:?} of {n_embd} values"),
+            });
+        }
+        Ok(FeatureTap {
+            hc: HcKernels::load(gpu.context())?,
+            layers: layers.to_vec(),
+            after,
+            n_embd,
+            dev: PartedBuffer::zeroed(gpu.stream(), [width; PAIR_ROWS])?,
+            host: vec![0.0; PAIR_ROWS * width],
+            pos: [None; PAIR_ROWS],
+        })
+    }
+
+    fn width(&self) -> usize {
+        self.layers.len() * self.n_embd
+    }
+
+    /// Row `row`'s mean of `streams`, the streams layer index `i` of the card
+    /// left, where the layer after it is tapped. Asynchronous, capturable.
+    fn enqueue(
+        &mut self,
+        gpu: &Gpu,
+        i: usize,
+        row: usize,
+        streams: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let Some(k) = self.after.get(i).copied().flatten() else {
+            return Ok(());
+        };
+        let n = self.n_embd;
+        self.hc
+            .enqueue_mean(gpu.stream(), streams, n, k * n, self.dev.part_mut(row))
+    }
+}
+
 impl ChainBody for Body {
     type Input = StepInput;
     type Meta = Hparams;
@@ -1578,6 +1805,9 @@ impl ChainBody for Body {
         for l in self.lists.iter_mut().flatten() {
             l.zero_async(stream)?;
         }
+        if let Some(tap) = self.tap.as_mut() {
+            tap.pos = [None; PAIR_ROWS];
+        }
         self.history.clear();
         self.holds.known(0);
         self.shadow_from = 0;
@@ -1607,14 +1837,14 @@ impl ChainBody for Body {
     }
 
     /// The ring shadows are page-locked host memory, not counted here
-    /// ([`Body::shadow_host`]).
+    /// ([`Body::shadow_host`]); a feature tap's device buffer is.
     fn resident_bytes(&self) -> usize {
         let caches: usize = self
             .kv
             .iter()
             .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>())
             .sum();
-        caches + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
+        caches + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>() + self.feature_bytes()
     }
 
     /// The host tier's share of the chain a replay just submitted.
@@ -1769,6 +1999,7 @@ impl ChainBody for Body {
             restore: false,
             file,
             eps: hp.rms_eps,
+            tap: None,
         })
     }
 }
