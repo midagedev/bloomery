@@ -2225,15 +2225,15 @@ fn quantize_col_subnormal_tiny_scales() {
     );
 }
 
-/// NaN and inf in a block: the AVX2 encoders give the scalar mirrors' bytes.
-/// The scalar max skips NaN (`>` in q8_K, `f32::max` in q8_2), so a NaN value
-/// never sets a block's scale and codes to what its product extracts to. The
-/// cases are the ones a lane-wise max gets wrong: an all-NaN block, a NaN that
-/// is the last value of its lane (the lane ends NaN), and a NaN between a
-/// lane's block maximum and a later, smaller value of the same lane (the NaN
-/// drops the maximum from that lane). One +inf block rides along.
+/// A NaN or an infinity in an activation block is undefined input, and both
+/// encoder paths refuse it with the same named panic instead of quantizing the
+/// block to a defined value (the AVX2 lane-wise max would otherwise skip a NaN
+/// or drop a lane's maximum behind one, and an infinity would give a zero
+/// scale). The cases are the ones a lane-wise max gets wrong: an all-NaN block,
+/// a NaN that is the last value of its lane, a NaN between a lane's block
+/// maximum and a later, smaller value of the same lane; and one +inf block.
 #[test]
-fn quantize_col_nan_and_inf_bit_identical() {
+fn quantize_col_non_finite_panics_on_both_paths() {
     require_quantizer_avx2();
     let base = |k: usize| -> Vec<f32> { (0..k).map(|i| ((i % 29) as f32 - 14.0) / 16.0).collect() };
     // (type, k, block width the encoder scans for its max)
@@ -2244,22 +2244,47 @@ fn quantize_col_nan_and_inf_bit_identical() {
     ] {
         let mut all_nan = base(k);
         all_nan[..blk].fill(f32::NAN);
-        assert_col_bit_identical(w, &all_nan);
-
         let mut last_in_lane = base(k);
         last_in_lane[blk - 3] = f32::NAN;
-        assert_col_bit_identical(w, &last_in_lane);
-
         // Lane 5 of the block: the maximum at group 0, NaN at group 1, a
         // smaller finite value at every later group.
         let mut dropped_max = base(k);
         dropped_max[5] = 40.0;
         dropped_max[8 + 5] = f32::NAN;
-        assert_col_bit_identical(w, &dropped_max);
-
         let mut inf = base(k);
         inf[blk / 2] = f32::INFINITY;
-        assert_col_bit_identical(w, &inf);
+        for (name, x) in [
+            ("all_nan", &all_nan),
+            ("last_in_lane", &last_in_lane),
+            ("dropped_max", &dropped_max),
+            ("inf", &inf),
+        ] {
+            for (path, f) in [
+                ("avx2", quantize_col as fn(GgmlType, &[f32], &mut [u8])),
+                (
+                    "scalar",
+                    quantize_col_scalar as fn(GgmlType, &[f32], &mut [u8]),
+                ),
+            ] {
+                let mut out = vec![0u8; col_bytes(w, k)];
+                let r =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(w, x, &mut out)));
+                let msg = match r {
+                    Ok(()) => panic!(
+                        "{w:?} {name} {path}: quantized a non-finite block instead of panicking"
+                    ),
+                    Err(e) => e
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                        .unwrap_or_default(),
+                };
+                assert!(
+                    msg.contains("non-finite activation"),
+                    "{w:?} {name} {path}: panicked, but not with the named message: {msg:?}"
+                );
+            }
+        }
     }
 }
 

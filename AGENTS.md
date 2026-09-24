@@ -227,6 +227,14 @@ first suspect is a hung gate on the box, not the agent.
 
 ## Conventions
 
+- **No silent failure** (user, 2026-09-24: "나는 조용한 실패를 극혐해"). Undefined
+  input gets a named panic or error, never a defined output: an activation block
+  with a NaN or an infinity does not quantize to code 0, a NaN router lane does
+  not yield duplicate ids, an out-of-range index is not clamped to a plausible
+  row. When a fix offers "both paths give the same defined output" against "a
+  named error", take the error, even when it costs an API change. A device
+  kernel that cannot panic writes a flag the host checks at the next sync and
+  turns into the same named error.
 - Correctness is defined against ggml, not against intuition: kernels must match
   its output within the relative-error band recorded in each crate's RESULTS file.
 - **GPU-stage toolchain defects and gaps (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go

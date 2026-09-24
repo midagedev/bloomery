@@ -193,8 +193,10 @@ pub fn col_bytes(w: GgmlType, k: usize) -> usize {
 /// Q3_K and IQ3_XXS use `block_q8_K` (296 B/256 values); Q4_K, Q5_K, Q5_0, Q5_1, Q6_K
 /// and MXFP4 use `block_q8_2_x4` (144 B/128 values), with 36-byte `block_q8_2` tails for
 /// Q5_0/Q5_1/MXFP4.
-/// `out.len()` must equal `col_bytes(w, x.len())`; panics otherwise. Uses the
-/// AVX2 encoders when the CPU has AVX2 — byte-identical to the scalar mirrors.
+/// `out.len()` must equal `col_bytes(w, x.len())`; panics otherwise, and by
+/// name on a non-finite activation value (undefined input is refused, never
+/// encoded). Uses the AVX2 encoders when the CPU has AVX2 — byte-identical to
+/// the scalar mirrors.
 pub fn quantize_col(w: GgmlType, x: &[f32], out: &mut [u8]) {
     quantize_col_check(w, x, out);
     let avx2 = std::arch::is_x86_feature_detected!("avx2");
@@ -435,13 +437,35 @@ pub fn nearest_int(fval: f32) -> i32 {
     ((i & 0x007f_ffff) as i32) - 0x0040_0000
 }
 
-/// Quantizes one 256-value block into 296-byte `block_q8_K` layout.
+/// A NaN or an infinity in an activation block is undefined input: every
+/// encoder path refuses it here, by name, instead of quantizing the block to a
+/// defined value (a lane-wise max would skip the NaN; an infinity would give a
+/// zero scale). `x` is the block; the message names the first offending value.
+#[cold]
+#[inline(never)]
+fn non_finite_activation(x: &[f32]) -> ! {
+    let (i, v) = x
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite())
+        .map_or((usize::MAX, f32::NAN), |(i, &v)| (i, v));
+    panic!(
+        "qdot: non-finite activation value {v} at offset {i} of a {}-value block",
+        x.len()
+    );
+}
+
+/// Quantizes one 256-value block into 296-byte `block_q8_K` layout. Refuses a
+/// block with a non-finite value ([`non_finite_activation`]).
 fn quantize_q8k_block(x: &[f32], out: &mut [u8]) {
     debug_assert_eq!(x.len(), 256);
     debug_assert_eq!(out.len(), Q8K_STRIDE);
     let mut max = 0.0f32;
     let mut amax = 0.0f32;
     for &v in x {
+        if !v.is_finite() {
+            non_finite_activation(x);
+        }
         let ax = v.abs();
         if ax > amax {
             amax = ax;
@@ -545,15 +569,20 @@ unsafe fn quantize_q8k_block_avx2(x: &[f32; 256], out: &mut [u8; 296]) {
     unsafe {
         let sgn = _mm256_set1_ps(-0.0);
         let mut m = _mm256_setzero_ps();
+        let mut unord = _mm256_setzero_ps();
         for i in 0..32 {
             // SAFETY: 8-lane load at 8*i <= 248, inside the block.
             let v = _mm256_loadu_ps(x.as_ptr().add(8 * i));
             // `max_ps` returns its second operand when either is NaN, so the
-            // accumulator goes second: a NaN value is skipped, as the scalar's
-            // `>` skips it, and `m` never holds a NaN.
+            // accumulator goes second and `m` never holds a NaN; the NaN
+            // itself is collected in `unord` and refused below.
             m = _mm256_max_ps(_mm256_andnot_ps(sgn, v), m);
+            unord = _mm256_or_ps(unord, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
         }
         let amax = hmax_ps(m);
+        if _mm256_movemask_ps(unord) != 0 || !amax.is_finite() {
+            non_finite_activation(x);
+        }
         if amax == 0.0 {
             *out = [0u8; Q8K_STRIDE];
             return;
@@ -902,6 +931,9 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
             let xb = &blocks[4 * gi + ir];
             let mut amax = 0.0f32;
             for &v in xb {
+                if !v.is_finite() {
+                    non_finite_activation(xb);
+                }
                 amax = amax.max(v.abs());
             }
             let t = fp32_to_bf16_bits(amax / 127.0);
@@ -922,6 +954,9 @@ fn quantize_q82x4_col(x: &[f32], out: &mut [u8]) {
         let tb = &mut out[nb4 / 4 * Q82X4_STRIDE + t * Q82_BLOCK..][..Q82_BLOCK];
         let mut amax = 0.0f32;
         for &v in xb {
+            if !v.is_finite() {
+                non_finite_activation(xb);
+            }
             amax = amax.max(v.abs());
         }
         let b = fp32_to_bf16_bits(amax / 127.0);
@@ -956,13 +991,19 @@ unsafe fn quantize_q82_block_avx2(x: &[f32; 32]) -> ([u8; 32], u16, i16) {
     unsafe {
         let sgn = _mm256_set1_ps(-0.0);
         let mut m = _mm256_setzero_ps();
+        let mut unord = _mm256_setzero_ps();
         for j in 0..4 {
             // SAFETY: 8-lane load at 8*j <= 24, inside the block.
             let v = _mm256_loadu_ps(x.as_ptr().add(8 * j));
-            // Accumulator second: a NaN value is skipped, as `f32::max` skips it.
+            // Accumulator second so `m` never holds a NaN; the NaN itself is
+            // collected in `unord` and refused below.
             m = _mm256_max_ps(_mm256_andnot_ps(sgn, v), m);
+            unord = _mm256_or_ps(unord, _mm256_cmp_ps(v, v, _CMP_UNORD_Q));
         }
         let amax = hmax_ps(m);
+        if _mm256_movemask_ps(unord) != 0 || !amax.is_finite() {
+            non_finite_activation(x);
+        }
         // The bf16 scale round-trip stays scalar: one conversion per block.
         let t = fp32_to_bf16_bits(amax / 127.0);
         let d = bf16_bits_to_f32(t);

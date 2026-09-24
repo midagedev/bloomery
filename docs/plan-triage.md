@@ -370,3 +370,15 @@ ours/ik 0.95–1.05; 기준 Q3_K 10.8 실측)은 `just measure-qdot-rate`(조용
 마지막 비트가 다를 수 있다(Q3_K·IQ3_XXS 엔진 대 ik 비교 전부에 걸림; ik 형태 포팅은 작지만 Q3_K roundtrip 게이트 재핀); `*_rate.cpp` 채움 바이트가
 Rust 쪽과 다름(타이밍은 데이터 무관, 1줄); `q_nope2_cells_avx2_inner` 소프트웨어 f16(작음); F16C 스윕에 Q5_0/Q5_1 꼬리 블록 없음(몇 줄);
 `qdot/tests/qdot.rs:1-5` 머리말 낡음. mainline은 IQ3_XXS 부호를 활성에 접어(`quants.c:3260`) 명령이 적지만 ik 비트에서 벗어난다 — 제안으로만.
+
+## 조용한 실패 금지 (사용자, 2026-09-24 21:20 "나는 조용한 실패를 극혐해" — 규칙은 `AGENTS.md` Conventions와 위임 `common.md`)
+
+v4host의 K5 판단(전부 NaN인 활성 블록 → 두 경로가 같은 코드 0)을 뒤집어 리드가 바로 고쳤다: 호스트 q8_K·q8_2 인코더 네 경로(AVX2·스칼라)가
+NaN·inf를 `qdot: non-finite activation value … at offset …`로 거부한다(`non_finite_activation`, cold). FAIL-first: 새 게이트
+`quantize_col_non_finite_panics_on_both_paths`가 수정 전 소스에서 "quantized a non-finite block instead of panicking"으로 빨강, 수정 뒤 초록;
+AVX2 비용은 8값당 `cmp_unord` + `or` 하나씩(최댓값 루프 안), 스칼라 거울은 값마다 `is_finite`. 같은 부류로 남은 것 — **`loudnan` 라운드(S)**:
+① kr-dense D10 카드 q8_1 양자화기(`cores.rs:76-79`, `lib.rs:348-349`, `fused.rs:187-189`)가 NaN을 코드 0으로 삼킨다 — 디바이스는 패닉을 못
+하므로 스텝 이미지의 플래그 워드에 `(layer, site)`를 쓰고 호스트가 다음 동기화(argmax 읽기)에서 이름 붙은 오류로 올린다(`BLOOMERY_CHECK_FINITE`
+프로브는 있지만 옵트인이라 기본 경로는 조용하다); ② kr-moeattn N1 라우터 lane 후보 전부 NaN → ids [0×6] 중복(`router.rs:197-243`) — 같은 플래그;
+③ `gpu-deepseek41/src/attn.rs:354` 클램프(스트림 밖 항목을 마지막 행으로 읽어 그럴듯한 틀린 값, 트리아지 B5의 "계약 결정") — 거부로;
+④ `crates/qdot/src/lib.rs:879,899` `nearest_int … as i8`이 128을 −128로 감는다(ik는 127 포화; 지금은 도달 불가) — 포화 또는 단언. 각각 FAIL-first.
