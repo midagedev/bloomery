@@ -49,7 +49,7 @@
 
 ## 사용자 결정 대기
 
-- LICENSE(MIT 유지 vs Apache-2.0, crate `license` 12개 함께) · 공개 시점(M1 숫자만 vs M2와 함께).
+- ~~LICENSE(MIT 유지 vs Apache-2.0, crate `license` 12개 함께)~~ MIT 유지로 결정(2026-09-25; 옮겨 온 코드 전부 MIT, Apache-2.0은 의존성 cuda-oxide·cuda-core뿐, notices에 cuda-core 항목 추가) · 공개 시점(M1 숫자만 vs M2와 함께).
 - 시팅 10의 승인(위) · 혼합 파일 삭제 시점.
 - Expert Deferral(손실 기법) 켤지 · 다운로드 둘(EAGLE-3 체크포인트 lmsys SpecForge-Nex 0.2B, Qwen3 IQ4_XS) · DFlash 대상(Coder-30B-A3B에 얹기 vs 드래프터 학습) · V4 R0 전체 덤프(128 GB 페이지인)와 `v4time`(각 > 30분).
 - 3090을 expert 전용 카드로(N4, +13…+20 %[유도], 설계 카드) · CPU head 묶음 타일(㉖, float 순서 M–L).
