@@ -2,16 +2,19 @@
 //! three draft layers and the head, attending each layer's window ring and
 //! the block's own rows.
 //!
-//! Input. Each row's embedding is the target's `token_embd` row (bf16,
-//! widened exactly), copied into all four hyper-connection streams; layer
-//! 0's folded input is stream 0 (the one-hot initial `pre`). Rows `1..` are
-//! the mask token's, the same every block: they are written once, at load.
-//! Row 0 is `id_last`'s: [`BlockPass::stage`] writes its bf16 words, each
-//! row's rope tables, the visible counts and the head's first id into one
-//! pinned image and copies it in one transfer ([`Inbox`]), and the pass's
-//! first launch widens the row on the card (`ds41_glue_embed`, the target
-//! step's own broadcast). The pass itself reads only device memory, so a
-//! captured pass replays against the same image every block.
+//! Input. Each row's embedding is the target's `token_embd` row as its file
+//! stores it ([`EmbdRows`]: bf16, or Q3_K super-blocks), decoded on the card
+//! by the target step's own broadcast entries (`ds41_glue_embed`, bf16
+//! widened exactly; `ds41_glue_embed_q3k`, `elem::q3k_embed_value`) — so a
+//! row is the target's f32 of that id — and copied into all four
+//! hyper-connection streams; layer 0's folded input is stream 0 (the one-hot
+//! initial `pre`). Rows `1..` are the mask token's, the same every block:
+//! decoded once at load by the same entry and written then. Row 0 is
+//! `id_last`'s: [`BlockPass::stage`] writes its file bytes, each row's rope
+//! tables, the visible counts and the head's first id into one pinned image
+//! and copies it in one transfer ([`Inbox`]), and the pass's first launch
+//! decodes the row on the card. The pass itself reads only device memory, so
+//! a captured pass replays against the same image every block.
 //!
 //! Per layer, `m = w` rows per launch:
 //!
@@ -35,7 +38,7 @@
 //! 11. HC_POST and the next fold.
 //!
 //! After the last layer its fold is the head's input ([`DraftHead`]).
-//! Launches per pass: the widening, `(14 + 9 + 2m)` per layer, the head's
+//! Launches per pass: the row's decode, `(14 + 9 + 2m)` per layer, the head's
 //! three and its Markov loop's `2m` ([`BlockPass::launches`]).
 //!
 //! Every buffer is per layer and allocated at load, so a pass leaves each
@@ -51,7 +54,7 @@ use model::arch::dspark::{DraftHparams, names};
 
 use super::head::DraftHead;
 use super::kv::DraftRings;
-use super::load::DraftWeights;
+use super::load::{DraftWeights, EmbdRows, pack_words};
 use super::stage::{Inbox, put_f32, view, view_mut};
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
 use crate::chain::glue::glue_kernels;
@@ -89,7 +92,8 @@ pub enum Rule {
 pub struct BlockInput<'a> {
     /// The block's first id: the last accepted token.
     pub id_last: u32,
-    /// `id_last`'s row of the target's `token_embd`, its bf16 bytes.
+    /// `id_last`'s row of the target's `token_embd`, its file bytes in the
+    /// draft's [`EmbdRows`] format ([`embedding_row`]).
     pub row: &'a [u8],
     /// Rows, `1..=MAX_WIDTH`.
     pub width: usize,
@@ -101,18 +105,10 @@ pub struct BlockInput<'a> {
     pub rule: Rule,
 }
 
-/// The target's `token_embd` row `id`: its bf16 bytes.
+/// The target's `token_embd` row `id`: its file bytes, the stride from the
+/// tensor's type (bf16 or Q3_K, [`EmbdRows`]; any other type is refused).
 pub fn embedding_row(target: &Split, n_embd: usize, id: u32) -> Result<&[u8], GpuError> {
-    super::load::embedding_row(target, &target_names::token_embd(), n_embd as u64, id)
-}
-
-/// bf16 bytes widened to f32, exactly (`bits << 16`).
-fn widen(row: &[u8]) -> Vec<f32> {
-    row.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
-        .collect()
+    Ok(super::load::embedding_row(target, &target_names::token_embd(), n_embd, id)?.0)
 }
 
 /// One layer's buffers, every one for [`MAX_WIDTH`] rows.
@@ -619,15 +615,16 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
 }
 
 /// Where [`enqueue_embed`] reads the row: word `at` of `params`, `n_embd`
-/// bf16.
+/// values in `rows`' format.
 struct Embed<'a> {
     params: &'a DeviceBuffer<u32>,
     at: usize,
     n_embd: usize,
+    rows: EmbdRows,
 }
 
-/// Row 0 of layer 0's streams and fold from the image's bf16 row: one
-/// launch.
+/// Row 0 of layer 0's streams and fold from the row `e` names, decoded by
+/// the target's broadcast entry for its format: one launch.
 fn enqueue_embed(
     gpu: &Gpu,
     module: &glue_kernels::LoadedModule,
@@ -636,27 +633,90 @@ fn enqueue_embed(
     fold0: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let n = e.n_embd;
-    let half = launch_u32(WHAT, "half a row", n / 2)?;
+    if e.params.len() < e.at + e.rows.row_words(n) {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a row at word {} of {} words; a {:?} row of {n} takes {}",
+                e.at,
+                e.params.len(),
+                e.rows,
+                e.rows.row_words(n)
+            ),
+        });
+    }
     let mut streams = view_mut::<f32, _>(streams0, 0, HC_STREAMS * n)?;
     let mut input = view_mut::<f32, _>(fold0, 0, n)?;
-    let prep = module.prepare_ds41_glue_embed(LaunchConfig1D::new(half.div_ceil(256), 256, 0))?;
-    module.ds41_glue_embed(
-        gpu.stream(),
-        &prep,
-        e.params,
+    let (at, hc) = (
         launch_u32(WHAT, "the row's word", e.at)?,
-        half,
         launch_u32(WHAT, "streams", HC_STREAMS)?,
-        &mut streams,
-        &mut input,
-    )?;
+    );
+    match e.rows {
+        EmbdRows::Bf16 => {
+            let half = launch_u32(WHAT, "half a row", n / 2)?;
+            let prep =
+                module.prepare_ds41_glue_embed(LaunchConfig1D::new(half.div_ceil(256), 256, 0))?;
+            module.ds41_glue_embed(
+                gpu.stream(),
+                &prep,
+                e.params,
+                at,
+                half,
+                hc,
+                &mut streams,
+                &mut input,
+            )?;
+        }
+        EmbdRows::Q3K => {
+            // `Glue::enqueue_embed`'s Q3_K launch: one thread a value.
+            let n_sb = launch_u32(WHAT, "super-blocks", n / 256)?;
+            let grid = launch_u32(WHAT, "grid", n.div_ceil(256))?;
+            let prep = module.prepare_ds41_glue_embed_q3k(LaunchConfig1D::new(grid, 256, 0))?;
+            module.ds41_glue_embed_q3k(
+                gpu.stream(),
+                &prep,
+                e.params,
+                at,
+                n_sb,
+                hc,
+                &mut streams,
+                &mut input,
+            )?;
+        }
+    }
     Ok(())
+}
+
+/// The mask row `w` holds, decoded by [`enqueue_embed`] into scratch and read
+/// back: the f32 every mask row of a block starts from. Load-time only.
+fn decode_mask(
+    gpu: &Gpu,
+    module: &glue_kernels::LoadedModule,
+    w: &DraftWeights,
+    n_embd: usize,
+) -> Result<Vec<f32>, GpuError> {
+    let s = gpu.stream();
+    let mut streams = DeviceBuffer::<f32>::zeroed(s, HC_STREAMS * n_embd)?;
+    let mut fold = DeviceBuffer::<f32>::zeroed(s, n_embd)?;
+    enqueue_embed(
+        gpu,
+        module,
+        &Embed {
+            params: w.mask_row().buf(),
+            at: 0,
+            n_embd,
+            rows: w.embd_rows(),
+        },
+        &mut streams,
+        &mut fold,
+    )?;
+    Ok(fold.to_host_vec(s)?)
 }
 
 /// Where each per-block input sits in the pass's [`Inbox`], in words.
 #[derive(Clone, Copy)]
 struct Image {
-    /// `id_last`'s embedding row, two bf16 a word, the low half first.
+    /// `id_last`'s embedding row, its file bytes as words ([`EmbdRows`]).
     row: usize,
     /// Each row's rope table, forward then back, [`MAX_WIDTH`] rows of
     /// `rope_dims` f32 each.
@@ -670,9 +730,9 @@ struct Image {
 }
 
 impl Image {
-    fn of(d: &Dims) -> Image {
+    fn of(d: &Dims, rows: EmbdRows) -> Image {
         let row = 0;
-        let fwd = row + d.n_embd / 2;
+        let fwd = row + rows.row_words(d.n_embd);
         let back = fwd + MAX_WIDTH * d.rope_dims;
         let vis = back + MAX_WIDTH * d.rope_dims;
         let first = vis + 2 * MAX_WIDTH;
@@ -694,13 +754,15 @@ pub struct BlockPass {
     k: Kernels,
     d: Dims,
     table: RopeTable,
-    /// Layer 0's streams and fold: row 0 widened by each pass, the mask
+    /// Layer 0's streams and fold: row 0 decoded by each pass, the mask
     /// token's rows after it written at load.
     streams0: DeviceBuffer<f32>,
     fold0: DeviceBuffer<f32>,
     /// Every per-block input, one copy a block ([`Image`]).
     inbox: Inbox,
     image: Image,
+    /// The format of the rows the image carries.
+    embd: EmbdRows,
     /// Row `t`'s slot in the block buffer: `t`.
     slots: DeviceBuffer<u32>,
     /// The concat plan's route, `0 .. 3 · MAX_WIDTH`; a pass of `m` rows
@@ -724,15 +786,11 @@ impl BlockPass {
         let hp = w.hp();
         let d = Dims::of(hp)?;
         let ctx = gpu.context();
-        let mask_words = w.mask_row().buf().to_host_vec(s)?;
-        let mask_bytes: Vec<u8> = mask_words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let mask = widen(&mask_bytes);
-        if mask.len() != d.n_embd {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("a mask row of {} values; rows of {}", mask.len(), d.n_embd),
-            });
-        }
+        // SAFETY: this crate owns the embedded device bundle produced for
+        // `glue_kernels`; the launcher checks its launch contract.
+        let embed = unsafe { glue_kernels::load(ctx)? };
+        let embd = w.embd_rows();
+        let mask = decode_mask(gpu, &embed, w, d.n_embd)?;
         let b = MAX_WIDTH;
         let n = d.n_embd;
         let mut streams0 = vec![0.0f32; HC_STREAMS * n];
@@ -743,10 +801,7 @@ impl BlockPass {
             }
             fold0.extend_from_slice(&mask);
         }
-        let image = Image::of(&d);
-        // SAFETY: this crate owns the embedded device bundle produced for
-        // `glue_kernels`; the launcher checks its launch contract.
-        let embed = unsafe { glue_kernels::load(ctx)? };
+        let image = Image::of(&d, embd);
         Ok(BlockPass {
             layers: (0..hp.n_layer)
                 .map(|_| LayerBufs::new(s, &d))
@@ -766,6 +821,7 @@ impl BlockPass {
             fold0: DeviceBuffer::from_host(s, &fold0)?,
             inbox: Inbox::new(gpu, image.words)?,
             image,
+            embd,
             slots: DeviceBuffer::from_host(s, &(0u32..).take(b).collect::<Vec<_>>())?,
             route: DeviceBuffer::from_host(s, &concat_route(b))?,
             fwd: Vec::with_capacity(b * d.rope_dims),
@@ -787,10 +843,19 @@ impl BlockPass {
         if !(1..=MAX_WIDTH).contains(&m) {
             return Err(shape(format!("a block of {m} rows; 1..={MAX_WIDTH}")));
         }
-        if input.row.len() != 2 * n {
+        if input.row.len() != self.embd.row_bytes(n) {
             return Err(shape(format!(
-                "an embedding row of {} bytes; rows of {n} bf16",
-                input.row.len()
+                "an embedding row of {} bytes; {:?} rows of {n} are {} bytes",
+                input.row.len(),
+                self.embd,
+                self.embd.row_bytes(n)
+            )));
+        }
+        if input.id_last as usize >= self.head.n_vocab() {
+            return Err(shape(format!(
+                "id_last {} past the vocabulary of {}",
+                input.id_last,
+                self.head.n_vocab()
             )));
         }
         if input.ring_rows == 0 || input.ring_rows > self.d.window {
@@ -813,12 +878,7 @@ impl BlockPass {
         }
         let im = self.image;
         let host = self.inbox.host_mut()?;
-        for (d, b) in host[im.row..im.fwd]
-            .iter_mut()
-            .zip(input.row.as_chunks::<4>().0)
-        {
-            *d = u32::from_le_bytes(*b);
-        }
+        pack_words(input.row, &mut host[im.row..im.fwd]);
         put_f32(&mut host[im.fwd..im.back], &self.fwd);
         put_f32(&mut host[im.back..im.vis], &self.back);
         for (t, v) in (0..MAX_WIDTH).zip(host[im.vis..im.first].as_chunks_mut::<2>().0) {
@@ -839,9 +899,9 @@ impl BlockPass {
         Ok(())
     }
 
-    /// Enqueue the widening of row 0, every layer and the head's logits
-    /// over the staged block, reading `rings`. Asynchronous,
-    /// allocation-free, capturable.
+    /// Enqueue the decode of row 0, every layer and the head's logits over
+    /// the staged block, reading `rings`. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_body(
         &mut self,
         gpu: &Gpu,
@@ -864,6 +924,7 @@ impl BlockPass {
                 params: &params,
                 at: im.row,
                 n_embd: d.n_embd,
+                rows: self.embd,
             },
             &mut self.streams0,
             &mut self.fold0,
@@ -948,7 +1009,7 @@ impl BlockPass {
         gpu.capture(|_| self.enqueue(gpu, w, rings))
     }
 
-    /// Kernel launches one pass of `m` rows makes: the widening, per layer
+    /// Kernel launches one pass of `m` rows makes: the row's decode, per layer
     /// the attention sub-layer's 14 and the ffn's `9 + 2m`, then the head's.
     #[must_use]
     pub fn launches(&self, m: usize) -> usize {
@@ -973,6 +1034,19 @@ impl BlockPass {
     #[must_use]
     pub fn streams0(&self) -> &DeviceBuffer<f32> {
         &self.streams0
+    }
+
+    /// Layer 0's folded input as the last pass left it: row 0 decoded by the
+    /// pass, the mask rows after it.
+    #[must_use]
+    pub fn fold0(&self) -> &DeviceBuffer<f32> {
+        &self.fold0
+    }
+
+    /// The format of the embedding rows [`BlockPass::stage`] takes.
+    #[must_use]
+    pub fn embd_rows(&self) -> EmbdRows {
+        self.embd
     }
 
     /// Layer `l`'s buffers as the last pass left them.

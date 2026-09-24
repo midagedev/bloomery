@@ -87,6 +87,24 @@
 //! `DraftBody` over the whole set through its graphs gives the ids and the
 //! rings of its eager twin after every block.
 //!
+//! Embedding rows. Before the set is read: for the mask token, ids 0 and
+//! `n_vocab − 1` and two ids of the set's prompt, row 0 of layer 0's four
+//! streams and of its fold after a pass — the target's `token_embd` row of
+//! that id, decoded on the card by the target's own broadcast entry — equals
+//! bit for bit `gguf::quant::dequant_row` of the file's row and, for a Q3_K
+//! file, `elem::q3k_embed_value` on the host at the glue kernel's call shape
+//! (super-block at byte `110·(i / 256)`, value `i % 256`); the mask rows
+//! `1..` (decoded at load by the same entry) equal the mask token's. This is
+//! the draft reading the same f32 the target reads, whichever format the
+//! target file stores.
+//!
+//! Fault readback. A row of all-`0xFF` bytes (a bf16 NaN; a Q3_K super-block
+//! whose f16 `d` is NaN) staged into `DraftBody`'s pass, eager and through its
+//! `w = 3` graph: the NaN reaches the routed experts' q8_1 quantizer, which
+//! raises the card's fault word, and the draft's own readback must be
+//! `GpuError::Fault` rather than ids. The word is cleared after each arm.
+//! Run last: the NaN stays in the body's buffers.
+//!
 //! FAIL-first: swapping the attention's two sources in `draft/block.rs` (the
 //! ring as the second source, the block rows as the first) turns this gate
 //! red from layer 0's attention on; a graph replay that does not restage its
@@ -111,18 +129,21 @@ mod gate {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use bloomery_gpu::{Gpu, Graph};
+    use bloomery_gpu::elem::q3k_embed_value;
+    use bloomery_gpu::{Gpu, GpuError, Graph};
     use bloomery_gpu_deepseek41::draft::block::{
         BlockInput, BlockPass, LayerBufs, MAX_WIDTH, Rule, embedding_row,
     };
     use bloomery_gpu_deepseek41::draft::kv::{DraftRings, GROUP};
     use bloomery_gpu_deepseek41::draft::load::DraftWeights;
     use bloomery_gpu_deepseek41::draft::{DraftBody, Submit};
+    use bloomery_gpu_deepseek41::hc::HC_STREAMS;
     use bloomery_gpu_gates::{
         GateError, checks_failed, data_dir, dump_stem, ref_model_path, verdict,
     };
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits};
+    use model::arch::deepseek41::names as target_names;
     use model::arch::dspark::{DraftHparams, names};
 
     const NAME: &str = "gate_dspark_graph";
@@ -1345,6 +1366,189 @@ mod gate {
             .collect()
     }
 
+    // ---------------------------------------------------- embedding rows
+
+    /// Ids the embedding pin reads: the mask token, the first and last ids,
+    /// and two of the set's prompt.
+    fn embed_ids(hp: &DraftHparams, n_vocab: usize) -> Result<Vec<u32>, GateError> {
+        let last = u32::try_from(n_vocab - 1)?;
+        Ok(vec![hp.mask_token, 0, last, 6201, 65020])
+    }
+
+    /// Values of `a` whose bits differ from `b`'s; a length mismatch counts
+    /// every value.
+    fn differ(a: &[f32], b: &[f32]) -> usize {
+        if a.len() != b.len() {
+            return a.len().max(b.len());
+        }
+        a.iter()
+            .zip(b)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count()
+    }
+
+    /// The target's embedding row `row` (file bytes of type `ty`, `n`
+    /// values) by the host rules: `dequant_row`, and for Q3_K
+    /// `q3k_embed_value` over the row's words at the glue kernel's call
+    /// shape.
+    fn host_row(
+        ty: GgmlType,
+        row: &[u8],
+        n: usize,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>), GateError> {
+        let mut deq = vec![0.0f32; n];
+        dequant_row(ty, row, &mut deq)?;
+        if ty != GgmlType::Q3_K {
+            return Ok((deq, None));
+        }
+        let mut words = vec![0u32; row.len().div_ceil(4)];
+        for (d, c) in words.iter_mut().zip(row.chunks(4)) {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            *d = u32::from_le_bytes(b);
+        }
+        if !n.is_multiple_of(256) || row.len() != n / 256 * 110 {
+            return Err(format!("a Q3_K row of {} bytes for {n} values", row.len()).into());
+        }
+        // q3k_embed_value's contract: super-block `i / 256` ends at byte
+        // 110·(i/256 + 1) <= row.len() <= 4·words.len(), and starts 0 or 2
+        // mod 4.
+        let q3k = (0..n)
+            .map(|i| q3k_embed_value(&words, 110 * (i / 256), i % 256))
+            .collect();
+        Ok((deq, Some(q3k)))
+    }
+
+    /// The embedding pin (module doc): row 0 of layer 0's streams and fold
+    /// for each of [`embed_ids`], and the mask rows, against the host rules.
+    fn check_embed_rows(
+        gpu: &Gpu,
+        w: &DraftWeights,
+        pass: &mut BlockPass,
+        rings: &DraftRings,
+        target: &Split,
+        hp: &DraftHparams,
+    ) -> Result<bool, GateError> {
+        let s = gpu.stream();
+        let n = hp.n_embd;
+        let name = target_names::token_embd();
+        let ty = target
+            .find(&name)
+            .ok_or_else(|| format!("{name} is not in the target"))?
+            .1
+            .ty;
+        println!(
+            "{NAME}: embed | target {name} is {ty}, the draft reads it as {:?}, the mask row as {:?}",
+            pass.embd_rows(),
+            w.embd_rows()
+        );
+        let mut ok = true;
+        for id in embed_ids(hp, pass.head().n_vocab())? {
+            let row = embedding_row(target, n, id)?;
+            let (deq, q3k) = host_row(ty, row, n)?;
+            pass.stage(
+                s,
+                &BlockInput {
+                    id_last: id,
+                    row,
+                    width: 1,
+                    first_pos: 0,
+                    ring_rows: 1,
+                    rule: Rule::Reference,
+                },
+            )?;
+            pass.enqueue_body(gpu, w, rings)?;
+            s.synchronize()?;
+            let streams = pass.streams0().to_host_vec(s)?;
+            let fold = pass.fold0().to_host_vec(s)?;
+            let row0: Vec<&[f32]> = (0..HC_STREAMS)
+                .map(|k| &streams[k * n..(k + 1) * n])
+                .chain([&fold[..n]])
+                .collect();
+            let vs_deq: usize = row0.iter().map(|c| differ(c, &deq)).sum();
+            let vs_q3k: Option<usize> = q3k
+                .as_ref()
+                .map(|q| row0.iter().map(|c| differ(c, q)).sum());
+            let host_pair = q3k.as_ref().map(|q| differ(q, &deq));
+            let id_ok = vs_deq == 0 && vs_q3k.unwrap_or(0) == 0 && host_pair.unwrap_or(0) == 0;
+            let fmt = |v: Option<usize>| v.map_or("n/a (bf16)".to_string(), |d| d.to_string());
+            println!(
+                "{NAME}: embed | id {id}: row 0 ({HC_STREAMS} streams + fold, {} values) differing \
+                 from dequant_row {vs_deq}, from host q3k_embed_value {}; host q3k_embed_value vs \
+                 dequant_row {} {}",
+                row0.len() * n,
+                fmt(vs_q3k),
+                fmt(host_pair),
+                verdict(id_ok)
+            );
+            ok &= id_ok;
+            if id == hp.mask_token {
+                let mut d = 0usize;
+                for r in 1..MAX_WIDTH {
+                    for k in 0..HC_STREAMS {
+                        let at = (r * HC_STREAMS + k) * n;
+                        d += differ(&streams[at..at + n], &deq);
+                    }
+                    d += differ(&fold[r * n..(r + 1) * n], &deq);
+                }
+                println!(
+                    "{NAME}: embed | mask rows 1..{MAX_WIDTH} (decoded at load) differing from the \
+                     mask token's dequant_row: {d} of {} values {}",
+                    (MAX_WIDTH - 1) * (HC_STREAMS + 1) * n,
+                    verdict(d == 0)
+                );
+                ok &= d == 0;
+            }
+        }
+        Ok(ok)
+    }
+
+    /// The fault readback (module doc): a NaN row through `body`'s pass,
+    /// eager and through its graph, must read back as `GpuError::Fault`.
+    fn check_fault(
+        gpu: &Gpu,
+        body: &mut DraftBody,
+        target: &Split,
+        hp: &DraftHparams,
+    ) -> Result<bool, GateError> {
+        let width = SET_WIDTH;
+        let len = embedding_row(target, hp.n_embd, 0)?.len();
+        let nan_row = vec![0xFFu8; len];
+        let input = BlockInput {
+            id_last: 0,
+            row: &nan_row,
+            width,
+            first_pos: 0,
+            ring_rows: 1,
+            rule: Rule::Reference,
+        };
+        if let Some(f) = gpu.fault()? {
+            return Err(format!("the fault word is raised before the fault case: {f}").into());
+        }
+        let mut ok = true;
+        for submit in [Submit::Eager, Submit::Graph] {
+            let got = body.block(gpu, &input, submit);
+            let (case_ok, what) = match &got {
+                Err(GpuError::Fault { fault, .. }) => (true, format!("GpuError::Fault at {fault}")),
+                Err(e) => (false, format!("another error: {e}")),
+                Ok(ids) => (false, format!("ids {ids:?} (a silent proposal)")),
+            };
+            println!(
+                "{NAME}: fault | {submit:?} pass over an all-0xFF row ({len} bytes, w={width}): the \
+                 draft's readback is {what} {}",
+                verdict(case_ok)
+            );
+            ok &= case_ok;
+            gpu.clear_fault()?;
+        }
+        let clean = gpu.fault()?.is_none();
+        println!(
+            "{NAME}: fault | word clean after the case: {clean} {}",
+            verdict(clean)
+        );
+        Ok(ok && clean)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let path = std::env::var_os("BLOOMERY_DSPARK_MODEL")
             .filter(|p| !p.is_empty())
@@ -1361,13 +1565,14 @@ mod gate {
             hp.n_layer, hp.block_size
         );
         let mut body = DraftBody::new(&gpu, weights, Arc::clone(&target))?;
-        let set = read_set(&data_dir().join("ref-draft").join(DSREF_SET))?;
         let mut ok = true;
         let s = gpu.stream();
 
         let w = body.weights();
         let mut pass = BlockPass::new(&gpu, w)?;
         let mut rings = DraftRings::new(s, &hp)?;
+        ok &= check_embed_rows(&gpu, w, &mut pass, &rings, &target, &hp)?;
+        let set = read_set(&data_dir().join("ref-draft").join(DSREF_SET))?;
         let cx = Cx {
             set: &set,
             hp: &hp,
@@ -1650,12 +1855,16 @@ mod gate {
         }
         println!("{NAME}: accept | total of {drafted} drafted | {t_ik} | {t_a} | {t_r} | {t_b}");
 
+        // Last: the NaN passes leave NaN in the body's buffers past the rows
+        // a later pass rewrites.
+        ok &= check_fault(&gpu, &mut body, &target, &hp)?;
+
         if ok {
             println!(
                 "PASSED: {NAME} — the block pass and head against the dsref set: every tap of blocks 0-2 within its band under ik's rule, \
                  the rows on ik's path under the reference rule, draft_argmax on every block, launches = the kernel list, w=5 bit-identical where it must be; \
                  the captured passes and appends = their pinned node counts, graph = eager per block and width, blocks 0-2 through the graph = the judged eager passes, \
-                 DraftBody through the graphs = its eager twin"
+                 DraftBody through the graphs = its eager twin; the draft's embedding rows = the host rules bit for bit, a NaN row reads back as GpuError::Fault"
             );
             Ok(())
         } else {

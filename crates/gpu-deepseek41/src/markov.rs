@@ -19,13 +19,15 @@
 //! `((a0 + a4) + (a1 + a5)) + ((a2 + a6) + (a3 + a7))`; the result is added to
 //! the logit once, `logit + delta`. One thread per `v`.
 //!
-//! A step is `ds41_markov` then `bloomery_gpu`'s `argmax_rows` over all `m`
-//! rows ([`MarkovKernels::enqueue_step`]): rows below `c` are unchanged since
-//! their own step and give the same tokens again; rows above `c` write a
-//! token their own step overwrites.
+//! A step is `ds41_markov` then `bloomery_gpu`'s `argmax_rows_fault` over
+//! all `m` rows ([`MarkovKernels::enqueue_step`]): rows below `c` are
+//! unchanged since their own step and give the same tokens again; rows above
+//! `c` write a token their own step overwrites. The argmax copies the card's
+//! fault word to `tok[m]` after the tokens, so the last step's readback of
+//! `tok[..=m]` carries every fault the pass raised.
 
 use bloomery_gpu::elem::ElemKernels;
-use bloomery_gpu::{DeviceTensor, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
@@ -257,11 +259,12 @@ impl MarkovKernels {
     }
 
     /// One Markov step: [`Self::enqueue_add`] for row `row`, then
-    /// `argmax_rows` over the `m` rows into `tok` — `tok[row]` is then row
+    /// `argmax_rows_fault` over the `m` rows into `tok[..m]` and `fault`'s
+    /// word into `tok[m]` (`tok` holds `m + 1`) — `tok[row]` is then row
     /// `row + 1`'s previous token. Asynchronous, allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
-        reason = "one step's buffers and its row, all distinct roles"
+        reason = "one step's buffers, its row and the fault word, all distinct roles"
     )]
     pub fn enqueue_step(
         &self,
@@ -272,9 +275,10 @@ impl MarkovKernels {
         tok: &mut DeviceBuffer<u32>,
         m: usize,
         row: usize,
+        fault: FaultSink,
         logits: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         self.enqueue_add(stream, w, first, tok, m, row, logits)?;
-        elem.enqueue_argmax_rows(stream, logits, w.w2.rows(), m, tok)
+        elem.enqueue_argmax_rows_fault(stream, logits, w.w2.rows(), m, fault, tok)
     }
 }

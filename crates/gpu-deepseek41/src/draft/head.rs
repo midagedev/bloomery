@@ -12,11 +12,14 @@
 //! The Markov loop is `m` serial steps ([`MarkovKernels::enqueue_step`]):
 //! row 0's previous token is the block's first id (`id_last`, read from the
 //! device, where the pass's staging put it), row `c`'s the argmax the step
-//! before wrote. The last step's argmax buffer holds the
-//! block's proposal, so the head adds no argmax of its own.
+//! before wrote. The last step's argmax buffer holds the block's proposal
+//! and, after it, the card's fault word, so the head adds no argmax of its
+//! own and [`DraftHead::tokens`]' one readback turns a fault any launch of
+//! the pass raised into [`GpuError::Fault`], as `bloomery_gpu::head::Head`
+//! does for the target.
 
 use bloomery_gpu::weights::DevWeight;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu::{DeviceTensor, Fault, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::names as target_names;
@@ -33,7 +36,8 @@ pub struct DraftHead {
     /// The quantized rows, one scratch per width (`Q8Act` fixes its rows).
     acts: Vec<Q8Act>,
     logits: DeviceBuffer<f32>,
-    /// Each row's argmax; after the loop, the block's proposal.
+    /// Each row's argmax, then the fault word at `tok[m]`; after the loop,
+    /// the block's proposal. `max_width + 1` words.
     tok: DeviceBuffer<u32>,
     markov: MarkovKernels,
     n_embd: usize,
@@ -71,7 +75,7 @@ impl DraftHead {
             normed: DeviceBuffer::zeroed(s, max_width * hp.n_embd)?,
             acts,
             logits: DeviceBuffer::zeroed(s, max_width * n_vocab)?,
-            tok: DeviceBuffer::zeroed(s, max_width)?,
+            tok: DeviceBuffer::zeroed(s, max_width + 1)?,
             markov: MarkovKernels::load(gpu.context())?,
             n_embd: hp.n_embd,
             n_vocab,
@@ -142,6 +146,7 @@ impl DraftHead {
                 &mut self.tok,
                 m,
                 row,
+                gpu.unlabelled_sink(),
                 &mut self.logits,
             )?;
         }
@@ -168,8 +173,18 @@ impl DraftHead {
         Ok(self.logits.to_host_vec(stream)?[..m * self.n_vocab].to_vec())
     }
 
-    /// The `m` rows' proposal. Blocking.
+    /// The `m` rows' proposal. Blocking. A fault word the last step copied
+    /// is [`GpuError::Fault`], not a proposal; the word stays raised on the
+    /// card until the `Gpu`'s owner clears it.
     pub fn tokens(&self, stream: &CudaStream, m: usize) -> Result<Vec<u32>, GpuError> {
-        Ok(self.tok.to_host_vec(stream)?[..m].to_vec())
+        self.check(m)?;
+        let out = self.tok.to_host_vec(stream)?;
+        if let Some(fault) = Fault::from_word(out[m]) {
+            return Err(GpuError::Fault {
+                what: "draft::head::tokens",
+                fault,
+            });
+        }
+        Ok(out[..m].to_vec())
     }
 }

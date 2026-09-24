@@ -35,7 +35,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::path::{Path, PathBuf};
 
-    use bloomery_gpu::{DeviceTensor, Gpu};
+    use bloomery_gpu::{DeviceTensor, FAULT_NONE, Gpu};
     use bloomery_gpu_deepseek41::hc::HC_MIX;
     use bloomery_gpu_deepseek41::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
     use bloomery_gpu_deepseek41::markov::{
@@ -356,7 +356,8 @@ mod gate {
     ) -> Result<(Vec<u32>, Vec<f32>), GateError> {
         let s = cx.gpu.stream();
         let fd = DeviceBuffer::from_host(s, &[first])?;
-        let mut tok = DeviceBuffer::<u32>::zeroed(s, m)?;
+        // The tokens, then the fault word the step's argmax copies after them.
+        let mut tok = DeviceBuffer::<u32>::zeroed(s, m + 1)?;
         let mut logits = DeviceBuffer::from_host(s, logits0)?;
         for row in 0..m {
             cx.mk.enqueue_step(
@@ -367,11 +368,17 @@ mod gate {
                 &mut tok,
                 m,
                 row,
+                cx.gpu.unlabelled_sink(),
                 &mut logits,
             )?;
         }
         s.synchronize()?;
-        Ok((tok.to_host_vec(s)?, logits.to_host_vec(s)?))
+        let mut toks = tok.to_host_vec(s)?;
+        let word = toks.pop().ok_or("no fault word after the tokens")?;
+        if word != FAULT_NONE {
+            return Err(format!("the Markov chain's fault word is {word:#x}, not clean").into());
+        }
+        Ok((toks, logits.to_host_vec(s)?))
     }
 
     /// The host chain in the same layout: for row c, `logit + delta(prev)`,
