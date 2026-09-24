@@ -857,9 +857,6 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
 // are read at `data_base + offset`. Gates 0, A and B are the triple the other x4 types carry,
 // one test each so that one broken kernel shows every gate it breaks.
 
-/// The V4.1 first shard; `BLOOMERY_Q5K_MODEL` overrides it.
-const Q5K_MODEL: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
-
 /// The first Q5_K tensor with k % 256 == 0 — the scan `tools/ref/q5k_x4_ref.cpp` does.
 struct Q5kCase {
     name: String,
@@ -879,7 +876,8 @@ impl Q5kCase {
 
 fn load_q5k(rows: usize) -> Q5kCase {
     use std::os::unix::fs::FileExt;
-    let path = std::env::var("BLOOMERY_Q5K_MODEL").unwrap_or_else(|_| Q5K_MODEL.into());
+    // The V4.1 first shard ([`gguf::v41::model`]); `BLOOMERY_Q5K_MODEL` overrides it.
+    let path = std::env::var("BLOOMERY_Q5K_MODEL").unwrap_or_else(|_| gguf::v41::model());
     let inv = gguf::inventory_of(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let t = inv
         .tensors

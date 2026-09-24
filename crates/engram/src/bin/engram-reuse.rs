@@ -82,9 +82,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut model_dir = env::var("BLOOMERY_V41_DIR").unwrap_or_else(|_| {
-        "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8".into()
-    });
+    let mut model_dir = gguf::v41::dir().display().to_string();
     let mut ids = String::new();
     let mut name = String::new();
     let mut top_pct = 1.0;

@@ -38,7 +38,8 @@ ROOT=$(cd "$HERE/../../.." && pwd)
 # shellcheck source=tools/ref/ref-paths.sh
 source "$ROOT/tools/ref/ref-paths.sh"
 TOKENIZE=${TOKENIZE:-/home/user/ik-idxkey/build/bin/llama-tokenize}
-V41_DIR=${BLOOMERY_V41_DIR:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8}
+# The V4.1 file set: the deepseek41 profile's choice, exported by tools/box.sh.
+V41_DIR=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
 
 [ -x "$TOKENIZE" ] || { echo "oracle: no llama-tokenize at $TOKENIZE" >&2; exit 66; }
 if [ -n "${TOKENIZER_VOCAB:-}" ]; then

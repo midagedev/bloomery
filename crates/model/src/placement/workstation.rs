@@ -67,13 +67,10 @@ pub const CTX_MAX: u64 = 32_768;
 /// or top-k id crosses the cards.
 pub const CUT: usize = 20;
 
-/// V4.1's first shard, unless `BLOOMERY_V41_MODEL` names another.
-pub const MODEL_V41: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
-
-/// The V4.1 first shard to open: `BLOOMERY_V41_MODEL`, else [`MODEL_V41`].
+/// The V4.1 first shard to open: [`gguf::v41::model`], the path's owner.
 #[must_use]
 pub fn model_v41() -> String {
-    std::env::var("BLOOMERY_V41_MODEL").unwrap_or_else(|_| MODEL_V41.to_string())
+    gguf::v41::model()
 }
 
 /// `spec` running `layers`, with this machine's context, scratch and margin.

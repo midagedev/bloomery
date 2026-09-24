@@ -118,6 +118,121 @@ const BF16_ENGRAM: u64 = 327_680;
 // PIN(2026-09-23): design §3, bytes one token reads in the file's format: all, and dense.
 const READ_TOTAL: u64 = 12_035_196_096;
 const READ_DENSE: u64 = 7_991_939_520;
+// PIN(2026-09-24): the mixed file has no q5_K outside the routed stacks, so none on a card.
+const Q5_K_CARD: (usize, u64) = (0, 0);
+// PIN(2026-09-24): the gate placement (`plan_gate`, the 3090 alone) keeps 809 experts, as plan (a) under the 3090's usable bytes.
+const GATE_EXPERTS: u64 = 809;
+
+// PIN(2026-09-24): the public Q3_K_M file, plan (a)'s A6000 line: attention and the shared experts in q3_K/q4_K instead of q8_0 leave 4,258,054,144 dense bytes fewer, and the card keeps 253 experts more (2,587), n_l 68–69.
+const PUB_A_A6000: CardPin = CardPin {
+    card: "A6000",
+    dense: 3_891_325_376,
+    expert_bytes: 43_392_061_440,
+    experts: 2_587,
+    rounding: 525_387_328,
+    kv: 1_452_302_336,
+    shadow: 1_342_177_280,
+    headroom: 1_087_348_736,
+    eligible: 2..40,
+    n_l: (68, 69),
+};
+// PIN(2026-09-24): the public file, plan (a)'s host line: 253 experts fewer, and token_embd in q3_K (284,416,000 B) instead of bf16.
+const PUB_A_HOST: HostPin = HostPin {
+    expert_bytes: 215_375_523_840,
+    table_bytes: 284_416_000,
+    headroom: 43_421_464_576,
+};
+// PIN(2026-09-24): the public file, plan (b)'s A6000 line: 133 experts more (2,774), n_l 154–155 on layers 2–19.
+const PUB_B_A6000: CardPin = CardPin {
+    card: "A6000",
+    dense: 1_743_902_176,
+    expert_bytes: 46_528_634_880,
+    experts: 2_774,
+    rounding: 263_948_832,
+    kv: 736_649_216,
+    shadow: 671_088_640,
+    headroom: 1_075_290_112,
+    eligible: 2..20,
+    n_l: (154, 155),
+};
+// PIN(2026-09-24): the public file, plan (b)'s 3090 line: 121 experts more (1,225), n_l 61–62 on layers 20–39.
+const PUB_B_3090: CardPin = CardPin {
+    card: "3090",
+    dense: 2_147_423_200,
+    expert_bytes: 20_547_072_000,
+    experts: 1_225,
+    rounding: 258_833_440,
+    kv: 715_653_120,
+    shadow: 671_088_640,
+    headroom: 1_077_411_840,
+    eligible: 20..40,
+    n_l: (61, 62),
+};
+// PIN(2026-09-24): the public file, plan (b)'s host line.
+const PUB_B_HOST: HostPin = HostPin {
+    expert_bytes: 191_691_878_400,
+    table_bytes: 284_416_000,
+    headroom: 67_105_110_016,
+};
+
+/// One file's pins: the mixed file's are the consts above without a prefix,
+/// the public file's those with `PUB_` and the literals in [`PUBLIC`].
+struct FilePins {
+    a_cards: &'static [CardPin],
+    a_host: &'static HostPin,
+    b_cards: &'static [CardPin],
+    b_host: &'static HostPin,
+    nvme: u64,
+    q8_0_card: (usize, u64),
+    q5_k_card: (usize, u64),
+    engram_gain: u64,
+    read_total: u64,
+    read_dense: u64,
+    gate_experts: u64,
+}
+
+const MIXED: FilePins = FilePins {
+    a_cards: &[A_A6000],
+    a_host: &A_HOST,
+    b_cards: &[B_A6000, B_3090],
+    b_host: &B_HOST,
+    nvme: NVME,
+    q8_0_card: Q8_0_CARD,
+    q5_k_card: Q5_K_CARD,
+    engram_gain: BF16_ENGRAM,
+    read_total: READ_TOTAL,
+    read_dense: READ_DENSE,
+    gate_experts: GATE_EXPERTS,
+};
+
+const PUBLIC: FilePins = FilePins {
+    a_cards: &[PUB_A_A6000],
+    a_host: &PUB_A_HOST,
+    b_cards: &[PUB_B_A6000, PUB_B_3090],
+    b_host: &PUB_B_HOST,
+    // PIN(2026-09-24): the public file's engram_embd ×2 in q3_K on NVMe.
+    nvme: 84_482_513_500,
+    // PIN(2026-09-24): the public file has no q8_0 tensor.
+    q8_0_card: (0, 0),
+    // PIN(2026-09-24): ffn_down_shexp of layers 0 and 1, q5_K, on the card for the dense gemv.
+    q5_k_card: (2, 16_220_160),
+    // PIN(2026-09-24): engram_{k,q} in q3_K, decoded to f32 on the cards: the mixed file's bf16 bytes, the same shapes.
+    engram_gain: 327_680,
+    // PIN(2026-09-24): the public file's bytes one token reads: all, and dense.
+    read_total: 7_774_310_520,
+    read_dense: 3_731_061_720,
+    // PIN(2026-09-24): the public file's gate placement keeps 1,065 experts.
+    gate_experts: 1_065,
+};
+
+/// The pins of the file this run opens ([`workstation::model_v41`]).
+fn file_pins() -> &'static FilePins {
+    if workstation::model_v41() == gguf::v41::PUBLIC {
+        &PUBLIC
+    } else {
+        &MIXED
+    }
+}
 
 /// `v` with thousands separators.
 fn n(v: impl Into<i128>) -> String {
@@ -356,7 +471,7 @@ fn on_cards(
     (count, bytes)
 }
 
-fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
+fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin, f: &FilePins) -> Vec<String> {
     let mut bad = Vec::new();
     pin(
         &mut bad,
@@ -417,7 +532,7 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
     );
     pin(&mut bad, "host ring shadows", h.shadow_bytes, host.shadow);
     pin(&mut bad, "host headroom", h.headroom_bytes, host.headroom);
-    pin(&mut bad, "nvme (engram_embd)", plan.nvme_bytes, NVME);
+    pin(&mut bad, "nvme (engram_embd)", plan.nvme_bytes, f.nvme);
 
     let (count, bytes) = on_cards(plan, &mut bad, CardFormat::Q8_0Planes, |role, ty| {
         ty == GgmlType::Q8_0 && role != Role::EngramTable
@@ -426,26 +541,42 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
         &mut bad,
         "q8_0 outside the engram tables: tensors",
         count as u64,
-        Q8_0_CARD.0 as u64,
+        f.q8_0_card.0 as u64,
     );
     pin(
         &mut bad,
         "q8_0 outside the engram tables: planes",
         bytes,
-        Q8_0_CARD.1,
+        f.q8_0_card.1,
     );
+    // q5_K outside the routed stacks, which no card expert kernel reads.
+    let (count, bytes) = on_cards(plan, &mut bad, CardFormat::KQuant, |role, ty| {
+        ty == GgmlType::Q5_K && role != Role::RoutedExperts
+    });
+    pin(
+        &mut bad,
+        "q5_K on cards: tensors",
+        count as u64,
+        f.q5_k_card.0 as u64,
+    );
+    pin(&mut bad, "q5_K on cards: bytes", bytes, f.q5_k_card.1);
     let (_, bytes) = on_cards(plan, &mut bad, CardFormat::Bf16AsF32, |role, ty| {
         ty == GgmlType::BF16 && role == Role::Router
     });
     pin(&mut bad, "bf16 routers as f32", bytes, BF16_ROUTERS);
-    let (_, bytes) = on_cards(plan, &mut bad, CardFormat::Bf16AsF32, |role, ty| {
-        ty == GgmlType::BF16 && role == Role::EngramDense
+    let (_, bytes) = on_cards(plan, &mut bad, CardFormat::Bf16AsF32, |role, _| {
+        role == Role::EngramGain
     });
-    pin(&mut bad, "bf16 engram_{k,q} as f32", bytes, BF16_ENGRAM);
+    pin(&mut bad, "engram_{k,q} as f32", bytes, f.engram_gain);
     for r in &plan.rows {
         let t = &plan.model.tensors[r.tensor];
         let want = match t.ty {
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K => CardFormat::KQuant,
+            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
+                if t.role == Role::EngramGain =>
+            {
+                CardFormat::Bf16AsF32
+            }
+            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => CardFormat::KQuant,
             GgmlType::Q8_0 => CardFormat::Q8_0Planes,
             GgmlType::F32 => CardFormat::F32,
             GgmlType::BF16 => CardFormat::Bf16AsF32,
@@ -473,8 +604,8 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin) -> Vec<String> {
         }
     }
     let (total, dense) = reads(plan);
-    pin(&mut bad, "read/token total", total, READ_TOTAL);
-    pin(&mut bad, "read/token dense", dense, READ_DENSE);
+    pin(&mut bad, "read/token total", total, f.read_total);
+    pin(&mut bad, "read/token dense", dense, f.read_dense);
     bad
 }
 
@@ -494,7 +625,7 @@ fn run(
         table(&mut out, &plan);
     }
     let mut bad: Vec<String> = plan.violations().iter().map(ToString::to_string).collect();
-    bad.extend(pins(&plan, cards, host));
+    bad.extend(pins(&plan, cards, host, file_pins()));
     println!("{out}");
     assert!(
         bad.is_empty(),
@@ -517,8 +648,8 @@ fn hw_placement_a6000_ddr4() {
         &model,
         &machine,
         &kv,
-        &[A_A6000],
-        &A_HOST,
+        file_pins().a_cards,
+        file_pins().a_host,
     );
 }
 
@@ -533,8 +664,8 @@ fn hw_placement_3090_a6000_cut20() {
         &model,
         &machine,
         &kv,
-        &[B_A6000, B_3090],
-        &B_HOST,
+        file_pins().b_cards,
+        file_pins().b_host,
     );
 }
 
@@ -688,6 +819,12 @@ fn hw_placement_card_budget_is_usable_bytes() {
     let mut bad = Vec::new();
 
     let gate_plan = placement::plan_with(&model, &gate, ctx, &kv, None, None).expect("gate plan");
+    pin(
+        &mut bad,
+        "gate placement experts",
+        gate_plan.cards[0].experts,
+        file_pins().gate_experts,
+    );
     let b3090 = workstation::RTX_3090.usable_bytes();
     let as_3090 = with(Some(b3090)).expect("plan (a) under the 3090's budget");
     if as_3090.n_l != gate_plan.n_l {
@@ -861,55 +998,62 @@ fn synthetic_model(mut layer: Vec<ModelTensor>) -> ModelTensors {
     }
 }
 
-/// A required card tensor without a card format is refused with its name,
-/// type and role; a routed stack of the same type is not refused — the plan
-/// keeps every expert of it on the host.
+/// A required card tensor without a card format (q2_K) is refused with its
+/// name, type and role; a routed stack of a type no card expert kernel reads
+/// is not refused — the plan keeps every expert of it on the host — whether
+/// its type has no card format at all (q2_K) or only a dense one (q5_K).
 #[test]
 fn card_tensor_without_card_format_is_refused_by_name() {
     let machine = workstation::plan_a(1);
-    let q5k_attn = synthetic_model(vec![synthetic(
+    let q2k_attn = synthetic_model(vec![synthetic(
         "blk.0.attn_q_b.weight",
         Some(0),
         Role::Attention,
-        GgmlType::Q5_K,
+        GgmlType::Q2_K,
         &[4],
     )]);
-    match placement::plan_with(&q5k_attn, &machine, 4096, &NoKv, None, None) {
+    match placement::plan_with(&q2k_attn, &machine, 4096, &NoKv, None, None) {
         Err(e @ PlacementError::NoCardFormat { .. }) => {
             let PlacementError::NoCardFormat { name, ty, role } = &e else {
                 unreachable!()
             };
             assert_eq!(
                 (name.as_str(), *ty, *role),
-                ("blk.0.attn_q_b.weight", GgmlType::Q5_K, Role::Attention)
+                ("blk.0.attn_q_b.weight", GgmlType::Q2_K, Role::Attention)
             );
             let text = e.to_string();
             assert!(
-                text.contains("blk.0.attn_q_b.weight") && text.contains("q5_K"),
+                text.contains("blk.0.attn_q_b.weight") && text.contains("q2_K"),
                 "{text}"
             );
         }
         Err(e) => panic!("refused with the wrong error: {e}"),
-        Ok(_) => panic!("a q5_K attention tensor was placed on a card"),
+        Ok(_) => panic!("a q2_K attention tensor was placed on a card"),
     }
 
-    let q5k_stack = synthetic_model(vec![synthetic(
-        "blk.0.ffn_down_exps.weight",
-        Some(0),
-        Role::RoutedExperts,
-        GgmlType::Q5_K,
-        &[4, 8],
-    )]);
-    let plan = placement::plan_with(&q5k_stack, &machine, 4096, &NoKv, None, None)
-        .expect("a q5_K routed stack plans, on the host");
-    assert!(plan.violations().is_empty(), "{:?}", plan.violations());
-    assert_eq!(plan.n_l, vec![0]);
-    let row = &plan.rows[1];
-    assert!(
-        matches!(row.segments.as_slice(), [s] if s.device == Device::Host && s.format == Format::HostFile),
-        "{:?}",
-        row.segments
-    );
+    for ty in [GgmlType::Q2_K, GgmlType::Q5_K] {
+        let stack = synthetic_model(vec![synthetic(
+            "blk.0.ffn_down_exps.weight",
+            Some(0),
+            Role::RoutedExperts,
+            ty,
+            &[4, 8],
+        )]);
+        let plan = placement::plan_with(&stack, &machine, 4096, &NoKv, None, None)
+            .unwrap_or_else(|e| panic!("a {ty} routed stack plans, on the host: {e}"));
+        assert!(
+            plan.violations().is_empty(),
+            "{ty}: {:?}",
+            plan.violations()
+        );
+        assert_eq!(plan.n_l, vec![0], "{ty}");
+        let row = &plan.rows[1];
+        assert!(
+            matches!(row.segments.as_slice(), [s] if s.device == Device::Host && s.format == Format::HostFile),
+            "{ty}: {:?}",
+            row.segments
+        );
+    }
 }
 
 /// A dense FFN is placed like attention, whole on its layer's card; a

@@ -73,7 +73,7 @@ pub const ARGMAX_WARPS: usize = ARGMAX_THREADS / 32;
 /// super-block; the scale window funnels the 2-mod-4 case, single bytes load
 /// from their covering words), `v16 < 256`.
 #[inline(always)]
-pub(crate) fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
+pub fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
     let field = (v16 >> 5) & 3;
     let qs_byte = 32 * (v16 >> 7) + 16 * ((v16 >> 4) & 1) + (v16 & 15);
     // Single bytes load directly from their covering word — the value's qs

@@ -58,6 +58,7 @@ impl Oracle {
     pub fn open(&self, which: Set) -> Result<RefManifest, GateError> {
         let man = RefManifest::read(&ref_dir_named(self.set_name(which)?))?;
         self.check_arch(&man)?;
+        self.check_model(&man)?;
         Ok(man)
     }
 
@@ -68,11 +69,35 @@ impl Oracle {
     pub fn open_named(&self, set: &str) -> Result<RefManifest, GateError> {
         let man = RefManifest::read(&ref_dir_named(set))?;
         match man.arch.as_deref() {
-            Some(a) if a == self.arch.name() => Ok(man),
-            a => Err(format!(
-                "oracle: {} has # arch {a:?}, but the {} table names it",
-                man.dir.display(),
-                self.arch.name()
+            Some(a) if a == self.arch.name() => {}
+            a => {
+                return Err(format!(
+                    "oracle: {} has # arch {a:?}, but the {} table names it",
+                    man.dir.display(),
+                    self.arch.name()
+                )
+                .into());
+            }
+        }
+        self.check_model(&man)?;
+        Ok(man)
+    }
+
+    /// A V4.1 set was dumped from the V4.1 file the tree runs
+    /// ([`gguf::v41::model`], the file its name was chosen for): its
+    /// `# model` line names that path. The two V4.1 files share their shards'
+    /// names, so `# model_file` cannot tell them apart. Other architectures
+    /// have one file each and are not checked.
+    fn check_model(&self, man: &RefManifest) -> Result<(), GateError> {
+        if self.arch != Arch::Deepseek41 {
+            return Ok(());
+        }
+        let runs = gguf::v41::model();
+        match man.header.model() {
+            Some(m) if m == runs => Ok(()),
+            m => Err(format!(
+                "oracle: {} was dumped from {m:?}, the tree runs {runs}",
+                man.dir.display()
             )
             .into()),
         }

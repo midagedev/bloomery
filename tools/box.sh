@@ -51,6 +51,15 @@ if [ -n "${BLOOMERY_MODEL:-}" ]; then
   MODEL_PICK="BLOOMERY_MODEL=$(printf %q "$BLOOMERY_MODEL") && "
 fi
 PROFILE="__p=\$(${MODEL_PICK}. tools/ref/ref-paths.sh && printf %s \"\$BLOOMERY_MODEL\") && export BLOOMERY_REF_MODEL_PROFILE=\"\$__p\" && __m=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_REF_MODEL=\"\$__m\" && unset __p __m"
+# The V4.1 file (BLOOMERY_V41_MODEL, and its directory as BLOOMERY_V41_DIR) is exported into every command
+# whatever profile it picked: the deepseek41 profile owns the choice (its V41_MODEL), and the crates and
+# scripts that open V4.1 under another profile (the tokenizer, engram, qdot and placement tests, the
+# tokenizer and engram runners) read the export. A caller's own BLOOMERY_V41_MODEL is carried over and wins.
+V41=
+if [ -n "${BLOOMERY_V41_MODEL:-}" ]; then
+  V41="export BLOOMERY_V41_MODEL=$(printf %q "$BLOOMERY_V41_MODEL") && "
+fi
+V41="${V41}__v=\$(. tools/ref/models/deepseek41.sh && printf %s \"\$V41_MODEL\") && export BLOOMERY_V41_MODEL=\"\$__v\" BLOOMERY_V41_DIR=\"\${__v%/*}\" && unset __v"
 # The data directory (BLOOMERY_DATA) is exported into every command the same way: its default is
 # ref-paths.sh's, read on the box from the synced tree, so no copy of it lives here. A caller's own
 # BLOOMERY_DATA is carried over and wins.
@@ -80,4 +89,4 @@ done
 COMMIT=$(git -C "$HERE" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 [ -z "$(git -C "$HERE" status --porcelain 2>/dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
 ssh "$HOST" "source ~/bloomery-env.sh && { $PICK
-} && cd $REMOTE && $FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT && $ENVS$*"
+} && cd $REMOTE && $V41 && $FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT && $ENVS$*"

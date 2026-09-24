@@ -129,13 +129,13 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, data_dir, ref_ints,
-        ref_tensor_logical_in, ref_tensor_of_in, split_f32, topk_ids_logical_within, verdict,
-        widened_f16_rows_in,
+        GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, data_dir, ds41_meta,
+        ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32, topk_ids_logical_within,
+        verdict, widened_f16_rows_in,
     };
     use cuda_core::sys;
-    use gguf::Split;
     use gguf::quant::half_to_f32;
+    use gguf::{GgmlType, Split};
     use model::Tensor2;
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
@@ -689,11 +689,29 @@ mod gate {
     /// compressor's layer its kv projection, its gate and pool above ratio 1
     /// or its row at ratio 1, and three for index keys; on an indexer layer
     /// its two projections and the score and top-k passes, and without a
-    /// compressor the q8_1 of the normed input its weights read) and the MoE
-    /// sub-layer's (its own count: ten with card experts, seven without); the
-    /// glue's (the broadcast, three and two per engram site, the collapse and
-    /// the head's four) and the gather. Printed as the table G2 pins.
-    fn predicted(hp: &Hparams, body: &Body) -> Result<(usize, usize), GateError> {
+    /// compressor the q8_1 of the normed input its weights read unless q_a
+    /// or kv, being K-quants, already had the norm leave it; one more for the
+    /// q8_1 of the heads when wo_a is a K-quant and one for wo_a's when wo_b
+    /// is a q3_K/q4_K) and the MoE sub-layer's (its own count: ten with card
+    /// experts, seven without, one more for a q8_1 shared down projection);
+    /// the glue's (the broadcast, three and two per engram site and one more
+    /// for the looked-up rows' q8_1 when wkv is a K-quant, the collapse and
+    /// the head's four) and the gather. The types come from `split`. Printed
+    /// as the table G2 pins.
+    fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<(usize, usize), GateError> {
+        let ty = |name: String| {
+            split
+                .find(&name)
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| format!("{name} is not in the file"))
+        };
+        let kquant = |t: GgmlType| {
+            matches!(
+                t,
+                GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
+            )
+        };
+        let q8_1 = |t: GgmlType| matches!(t, GgmlType::Q3_K | GgmlType::Q4_K);
         let mut kinds: Vec<(String, usize, usize, usize)> = Vec::new();
         let mut attn_total = 0;
         let mut ffn_total = 0;
@@ -701,14 +719,18 @@ mod gate {
             let own = k
                 .compressor
                 .filter(|_| k.stream.is_some_and(|s| s.kv_source == l));
+            let normed_q8_1 = q8_1(ty(names::attn_q_a(l))?) || q8_1(ty(names::attn_kv(l))?);
             let attn = 14
                 + own.map_or(0, |c| 1 + if c.gated { 2 } else { 1 })
                 + if k.index_keys { 3 } else { 0 }
                 + match (k.indexer, own) {
                     (false, _) => 0,
                     (true, Some(_)) => 4,
+                    (true, None) if normed_q8_1 => 4,
                     (true, None) => 5,
-                };
+                }
+                + usize::from(kquant(ty(names::attn_output_a(l))?))
+                + usize::from(q8_1(ty(names::attn_output_b(l))?));
             let ffn = body
                 .ffn_launches(l)
                 .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
@@ -731,7 +753,11 @@ mod gate {
             }
         }
         let sites = hp.engram.layer_ids.len();
-        let glue = 1 + 3 * sites + 2 * sites + 1 + 4;
+        let mut wkv_q8_1 = 0;
+        for &l in &hp.engram.layer_ids {
+            wkv_q8_1 += usize::from(q8_1(ty(names::engram_wkv(l))?));
+        }
+        let glue = 1 + 3 * sites + wkv_q8_1 + 2 * sites + 1 + 4;
         for (name, a, f, n) in &kinds {
             println!(
                 "predict kind={name} layers={n} attn_kernels={a} ffn_kernels={f} memops=2 \
@@ -756,7 +782,7 @@ mod gate {
     ) -> Result<bool, GateError> {
         let (want_k, want_m) = {
             let (_, _, body) = m.body_parts("structure")?;
-            predicted(hp, body)?
+            predicted(split, hp, body)?
         };
         let nodes = m.capture_step()?;
         let list = m.step_graph_nodes()?;
@@ -807,7 +833,7 @@ mod gate {
 
         let ok_shadow = {
             let (gpu, w, body) = m.body_parts("structure")?;
-            shadow_sets(gpu, w, body, head, hp)?
+            shadow_sets(gpu, w, body, head, split, hp)?
         };
 
         let (gpu, _, body) = m.body_parts("structure")?;
@@ -816,23 +842,6 @@ mod gate {
     }
 
     // --------------------------------------------------------- shadow sets
-
-    /// The MoE piece's own work in a layer's host-leg shadow, in stream
-    /// order, with card experts: HC_PRE, the routed gate·up, h's q8_1, the
-    /// routed down, the shared expert's gate·up and down.
-    const SHADOW_CARD: [&str; 6] = [
-        "ds41_hc_pre",
-        "ds41_expert_gate_up",
-        "q3k_quantize_q8_1",
-        "q4k_gemv_sel",
-        "ds41_shexp_gate_up",
-        "q8_0_gemv",
-    ];
-    /// The same without card experts.
-    const SHADOW_HOST: [&str; 3] = ["ds41_hc_pre", "ds41_shexp_gate_up", "q8_0_gemv"];
-    /// One engram site's token-only work: its rows dequantized, `engram_wkv`,
-    /// the key norm. It reads the step image and weights alone.
-    const ENGRAM_KV: [&str; 3] = ["ds41_glue_engram_rows", "q8_0_gemv", "ds41_engram_key_norm"];
 
     /// One node of a captured step, as the driver reports it.
     #[derive(Debug)]
@@ -1045,9 +1054,9 @@ mod gate {
 
     /// Q1: the kernels between each layer's go and its wait — the host leg's
     /// shadow — are exactly the table's, in order: the MoE piece's own
-    /// ([`SHADOW_CARD`] with card experts, [`SHADOW_HOST`] without) and, on
+    /// ([`ds41_meta::shadow_kernels`], with card experts or without) and, on
     /// the layer before each engram site, that site's token-only work
-    /// ([`ENGRAM_KV`]), which reads the step image alone and is first read
+    /// ([`ds41_meta::engram_kv_kernels`]), which reads the step image alone and is first read
     /// by the site layer's engram step. Also: no engram site's token-only
     /// work runs outside a shadow. Needs the overlap lever on (the default):
     /// off, each wait sits right after its go and every shadow is empty.
@@ -1056,6 +1065,7 @@ mod gate {
         w: &Weights,
         body: &mut Body,
         head: &mut Head,
+        split: &Split,
         hp: &Hparams,
     ) -> Result<bool, GateError> {
         if !bloomery_gpu::hybrid::levers()?.overlap {
@@ -1105,19 +1115,22 @@ mod gate {
         }
 
         let sites = &hp.engram.layer_ids;
+        let mut kv_lists: Vec<Vec<&str>> = Vec::new();
+        for &site in sites {
+            let k = ds41_meta::engram_kv_kernels(split, site)?;
+            if !kv_lists.contains(&k) {
+                kv_lists.push(k);
+            }
+        }
         let mut table: Vec<(Vec<&str>, Vec<usize>, bool)> = Vec::new();
         let mut ok_table = true;
         for l in layers.clone() {
             let launches = body
                 .ffn_launches(l)
                 .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-            let mut want: Vec<&str> = if launches > 7 {
-                SHADOW_CARD.to_vec()
-            } else {
-                SHADOW_HOST.to_vec()
-            };
+            let mut want = ds41_meta::shadow_kernels(split, l, launches > 7)?;
             if sites.contains(&(l + 1)) {
-                want.extend(ENGRAM_KV);
+                want.extend(ds41_meta::engram_kv_kernels(split, l + 1)?);
             }
             let got: Vec<&str> = nodes
                 .iter()
@@ -1164,13 +1177,17 @@ mod gate {
             })
             .collect();
         let mut found = Vec::new();
-        for i in 0..names.len().saturating_sub(ENGRAM_KV.len() - 1) {
-            if ENGRAM_KV
-                .iter()
-                .zip(&names[i..])
-                .all(|(want, got)| *got == Some(*want))
-            {
-                found.push(at[i]);
+        let mut kv_len = 0;
+        for kv in &kv_lists {
+            kv_len = kv.len();
+            for i in 0..names.len().saturating_sub(kv.len() - 1) {
+                if kv
+                    .iter()
+                    .zip(&names[i..])
+                    .all(|(want, got)| *got == Some(*want))
+                {
+                    found.push(at[i]);
+                }
             }
         }
         let outside = found
@@ -1193,7 +1210,7 @@ mod gate {
                 })
                 .collect::<Vec<_>>()
                 .join("; "),
-            outside * ENGRAM_KV.len(),
+            outside * kv_len,
             verdict(ok_engram)
         );
         Ok(ok_table && ok_engram)

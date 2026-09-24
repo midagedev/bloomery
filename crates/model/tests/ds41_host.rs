@@ -101,7 +101,8 @@ struct Set {
 impl Set {
     fn open(split: &Split) -> Set {
         let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-        let dir = PathBuf::from(base).join(SET);
+        // The set of that name for the V4.1 file the tree runs.
+        let dir = PathBuf::from(base).join(gguf::v41::set(SET));
         let path = dir.join("MANIFEST.tsv");
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!(
@@ -153,6 +154,14 @@ impl Set {
         assert_eq!(
             get("model_file").map(str::to_string),
             ours,
+            "{SET} was dumped from another file"
+        );
+        // Both V4.1 files name their shards alike: the path tells them apart.
+        assert_eq!(
+            get("model").map(str::to_string),
+            split
+                .shard_path(0)
+                .map(|p| p.to_string_lossy().into_owned()),
             "{SET} was dumped from another file"
         );
         Set {

@@ -12,13 +12,15 @@
 //!    `comb` that HC_POST and the ffn's fold take. The body reads the fold
 //!    the previous sub-layer left, never this HC_PRE's (the lag);
 //! 2. the attention norm of that fold, with its q8_1 form on a layer that
-//!    owns a compressor, whose q3_K projections read it;
+//!    owns a compressor, whose q3_K projections read it, or whose q_a and kv
+//!    are K-quants ([`crate::dense`]);
 //! 3. on a compressor's layer: its kv projection (and its gate projection
 //!    above ratio 1), the pooled row — or, at ratio 1, the token's row — with
 //!    its norm, rope and f16 cache row, then the index key of the pre-rope
 //!    row. These run every step; the image's group count decides whether a
 //!    row and a key are written;
-//! 4. the query: q_a, its norm, q_b and the tail rope;
+//! 4. the query: q_a, its norm (with its q8_1 form when q_b is a K-quant),
+//!    q_b and the tail rope;
 //! 5. the latent row: kv, then its norm, tail rope, f16 slot in the ring and
 //!    f16 row in the ring's shadow;
 //! 6. on a layer that runs the indexer: the query's projection of q_a's norm,
@@ -27,7 +29,9 @@
 //!    which write the stream's list;
 //! 7. the attention over the window ⧺ the stream's compressed rows read
 //!    through the list, then the inverse rope of its output;
-//! 8. wo_a, its groups in one `q8_0_gemv_heads` launch, and wo_b;
+//! 8. wo_a, its groups in one launch (`q8_0_gemv_heads`, or the q8_1 form of
+//!    the heads and `dense`'s Q3_K block diagonal), and wo_b (with its
+//!    input's q8_1 form first when it is a K-quant);
 //! 9. HC_POST and the ffn's fold in one launch.
 //!
 //! A layer attends the rows its stream's source layer writes
@@ -69,6 +73,7 @@ use crate::compress::{
     self, CompGeom, CompressKernels, PoolArgs, RowsArgs, W_GROUPS, W_PERSISTS, w_persist, w_read,
     w_row,
 };
+use crate::dense::{Dense, DenseKernels};
 use crate::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs,
     HcPreScratch,
@@ -548,6 +553,7 @@ struct Kernels {
     /// Loaded when a layer of the card runs the indexer.
     index: Option<IndexerKernels>,
     step: StepKernels,
+    dense: DenseKernels,
 }
 
 /// The indexer's scratch, present when a layer of the card runs it.
@@ -594,9 +600,32 @@ struct Scratch {
     y: DeviceBuffer<f32>,
     wo_a: DeviceBuffer<f32>,
     out: DeviceBuffer<f32>,
+    /// The q8_1 forms the K-quant projections read ([`crate::dense`]): the
+    /// normed input on a layer that owns no compressor, q_a's norm, the
+    /// heads after the inverse rope (one column per output group) and wo_a.
+    acts: Acts,
     /// Present when a layer of the card owns a compressor.
     source: Option<SourceScratch>,
     select: Option<SelectScratch>,
+}
+
+/// [`Scratch::acts`].
+struct Acts {
+    normed: Q8Act,
+    q_a: Q8Act,
+    heads: Q8Act,
+    wo_a: Q8Act,
+}
+
+/// Where the normed input's q8_1 form is, for a layer's K-quant projections.
+#[derive(Clone, Copy)]
+enum NormedAct {
+    /// Nowhere: no projection of the layer reads it.
+    None,
+    /// The compressor's ([`SourceScratch::act`]).
+    Source,
+    /// The piece's own ([`Acts::normed`]).
+    Own,
 }
 
 /// The attention piece of a card's layers: see the module comment.
@@ -726,6 +755,7 @@ impl AttnChain {
                 .then(|| IndexerKernels::load(ctx, hp))
                 .transpose()?,
             step: StepKernels::load(ctx)?,
+            dense: DenseKernels::load(ctx)?,
         };
         let pairs = src.len();
         let constant = constant_words(&words_layout, list_len)?;
@@ -809,6 +839,16 @@ impl AttnChain {
             y: DeviceBuffer::zeroed(stream, q_rows * hp.head_dim)?,
             wo_a: DeviceBuffer::zeroed(stream, m * hp.o_groups * hp.o_lora_rank)?,
             out: DeviceBuffer::zeroed(stream, m * hp.n_embd)?,
+            acts: Acts {
+                normed: Q8Act::with_k(stream, m, hp.n_embd)?,
+                q_a: Q8Act::with_k(stream, m, hp.q_lora_rank)?,
+                heads: Q8Act::with_k(
+                    stream,
+                    m * hp.o_groups,
+                    hp.n_head * hp.head_dim / hp.o_groups,
+                )?,
+                wo_a: Q8Act::with_k(stream, m, hp.o_groups * hp.o_lora_rank)?,
+            },
             source,
             select,
         };
@@ -924,9 +964,15 @@ impl AttnChain {
                     .map(IndexerScratch::device_bytes)
                     .sum::<usize>()
         });
+        let a = &s.acts;
+        let acts = q8act_bytes(a.normed.m(), d.n_embd)
+            + q8act_bytes(a.q_a.m(), d.q_lora_rank)
+            + q8act_bytes(a.heads.m(), d.group_k)
+            + q8act_bytes(a.wo_a.m(), a.wo_a.n_sb() * 256);
         plain
             + source
             + select
+            + acts
             + self.words.src.num_bytes()
             + self.words.dst.num_bytes()
             + hc_pre_bytes(s.hc_pre.k())
@@ -1104,7 +1150,10 @@ impl AttnChain {
             Compressed::Source(_) => "a compressor's buffers",
         };
         let gain = vector(w, &n.norm)?;
-        match (&lp.source, &mut compressed, s.source.as_mut()) {
+        let q_a = Dense::of(w, &n.q_a, d.n_embd, d.q_lora_rank)?;
+        let kv = Dense::of(w, &n.kv, d.n_embd, d.head_dim)?;
+        let quantized = q_a.reads_q8_1() || kv.reads_q8_1();
+        let normed_act = match (&lp.source, &mut compressed, s.source.as_mut()) {
             (Some(sp), Compressed::Source(io), Some(src)) => {
                 k.fused.enqueue_norm_quant(
                     stream,
@@ -1115,6 +1164,29 @@ impl AttnChain {
                     &mut s.normed,
                 )?;
                 enqueue_source(&cx, sp, src, io)?;
+                NormedAct::Source
+            }
+            (None, Compressed::Read(_), _) if lp.stream.is_some() && quantized => {
+                k.fused.enqueue_norm_quant(
+                    stream,
+                    fold_in,
+                    gain,
+                    d.eps,
+                    &mut s.acts.normed,
+                    &mut s.normed,
+                )?;
+                NormedAct::Own
+            }
+            (None, Compressed::None, _) if lp.stream.is_none() && quantized => {
+                k.fused.enqueue_norm_quant(
+                    stream,
+                    fold_in,
+                    gain,
+                    d.eps,
+                    &mut s.acts.normed,
+                    &mut s.normed,
+                )?;
+                NormedAct::Own
             }
             (None, Compressed::Read(_), _) if lp.stream.is_some() => {
                 gpu.elem().enqueue_rms_norm(
@@ -1126,6 +1198,7 @@ impl AttnChain {
                     m,
                     &mut s.normed,
                 )?;
+                NormedAct::None
             }
             (None, Compressed::None, _) if lp.stream.is_none() => {
                 gpu.elem().enqueue_rms_norm(
@@ -1137,6 +1210,7 @@ impl AttnChain {
                     m,
                     &mut s.normed,
                 )?;
+                NormedAct::None
             }
             _ => {
                 return Err(GpuError::Shape {
@@ -1149,14 +1223,13 @@ impl AttnChain {
                     ),
                 });
             }
-        }
+        };
 
-        enqueue_query(&cx, lp, s)?;
+        enqueue_query(&cx, lp, s, q_a, normed_act)?;
         let pos = cx.words.view::<u32>(cx.words.layout.pos, m)?;
         let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
-        let (qs, qd) = q8_0(w, &n.kv)?;
-        gpu.q8f32()
-            .enqueue_q8_0_gemv(stream, qs, qd, &s.normed, m, &mut s.kv)?;
+        let act = normed_act_of(&s.source, &s.acts, normed_act);
+        k.dense.enqueue(gpu, kv, &s.normed, act, &mut s.kv)?;
         k.rope.enqueue_kv_norm_rope_append(
             stream,
             KvAppendArgs {
@@ -1202,6 +1275,7 @@ impl AttnChain {
                     lp,
                     ip,
                     &mut *s,
+                    normed_act,
                     IndexerIo {
                         stream: st,
                         keys,
@@ -1272,24 +1346,72 @@ struct Cx<'a> {
     words: RowWords<'a>,
 }
 
-/// The query path: q_a, its norm, q_b and the tail rope of every head.
-fn enqueue_query(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), GpuError> {
+/// The normed input's q8_1 form where `at` says it is: the compressor's
+/// scratch `source` or the piece's `acts`.
+fn normed_act_of<'a>(
+    source: &'a Option<SourceScratch>,
+    acts: &'a Acts,
+    at: NormedAct,
+) -> Option<&'a Q8Act> {
+    match at {
+        NormedAct::None => None,
+        NormedAct::Source => source.as_ref().map(|x| &x.act),
+        NormedAct::Own => Some(&acts.normed),
+    }
+}
+
+/// The query path: q_a, its norm, q_b and the tail rope of every head. q_a's
+/// norm leaves its q8_1 form too when q_b, or the layer's indexer query,
+/// reads one.
+fn enqueue_query(
+    cx: &Cx<'_>,
+    lp: &LayerPlan,
+    s: &mut Scratch,
+    q_a: Dense<'_>,
+    normed_act: NormedAct,
+) -> Result<(), GpuError> {
     let (d, w, n, stream) = (cx.d, cx.w, &lp.names, cx.gpu.stream());
     let m = STEP_TOKENS;
-    let q8 = cx.gpu.q8f32();
-    let (qs, qd) = q8_0(w, &n.q_a)?;
-    q8.enqueue_q8_0_gemv(stream, qs, qd, &s.normed, m, &mut s.q_a)?;
-    cx.gpu.elem().enqueue_rms_norm(
-        stream,
-        &s.q_a,
-        vector(w, &n.q_a_norm)?,
-        d.eps,
-        d.q_lora_rank,
-        m,
-        &mut s.q_a_normed,
-    )?;
-    let (qs, qd) = q8_0(w, &n.q_b)?;
-    q8.enqueue_q8_0_gemv(stream, qs, qd, &s.q_a_normed, m, &mut s.q)?;
+    let q_b = Dense::of(w, &n.q_b, d.q_lora_rank, d.n_head * d.head_dim)?;
+    let index_q = lp
+        .indexer
+        .as_ref()
+        .map(|ip| {
+            Dense::of(
+                w,
+                &ip.q_b,
+                d.q_lora_rank,
+                indexer::HEADS * indexer::HEAD_DIM,
+            )
+        })
+        .transpose()?;
+    let act = normed_act_of(&s.source, &s.acts, normed_act);
+    cx.k.dense
+        .enqueue(cx.gpu, q_a, &s.normed, act, &mut s.q_a)?;
+    let gain = vector(w, &n.q_a_norm)?;
+    if q_b.reads_q8_1() || index_q.is_some_and(|q| q.reads_q8_1()) {
+        cx.k.fused.enqueue_norm_quant(
+            stream,
+            &s.q_a,
+            gain,
+            d.eps,
+            &mut s.acts.q_a,
+            &mut s.q_a_normed,
+        )?;
+    } else {
+        cx.gpu.elem().enqueue_rms_norm(
+            stream,
+            &s.q_a,
+            gain,
+            d.eps,
+            d.q_lora_rank,
+            m,
+            &mut s.q_a_normed,
+        )?;
+    }
+    let act = q_b.reads_q8_1().then_some(&s.acts.q_a);
+    cx.k.dense
+        .enqueue(cx.gpu, q_b, &s.q_a_normed, act, &mut s.q)?;
     let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
     cx.k.rope
         .enqueue_rope_tail(stream, &mut s.q, &table, heads(d))
@@ -1311,24 +1433,44 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
     let table = cx.words.view::<f32>(lp.back, STEP_TOKENS * d.rope_dims)?;
     cx.k.rope
         .enqueue_rope_tail(stream, &mut s.y, &table, heads(d))?;
-    let (qs, qd) = q8_0(w, &n.out_a)?;
-    cx.k.step.enqueue_q8_0_gemv_heads(
-        stream,
-        Q8_0GemvHeadsArgs {
-            qs,
-            d: qd,
-            x: &s.y,
-            rows_per_head: d.o_lora_rank,
-            x_head_stride: d.group_k,
-            y_head_stride: d.o_lora_rank,
-            y_off: 0,
-            y: &mut s.wo_a,
-        },
-    )?;
-    let (qs, qd) = q8_0(w, &n.out_b)?;
-    cx.gpu
-        .q8f32()
-        .enqueue_q8_0_gemv(stream, qs, qd, &s.wo_a, STEP_TOKENS, &mut s.out)
+    let groups = d.n_head * d.head_dim / d.group_k;
+    match Dense::of(w, &n.out_a, d.group_k, groups * d.o_lora_rank)? {
+        Dense::Q8_0 { qs, d: qd } => cx.k.step.enqueue_q8_0_gemv_heads(
+            stream,
+            Q8_0GemvHeadsArgs {
+                qs,
+                d: qd,
+                x: &s.y,
+                rows_per_head: d.o_lora_rank,
+                x_head_stride: d.group_k,
+                y_head_stride: d.o_lora_rank,
+                y_off: 0,
+                y: &mut s.wo_a,
+            },
+        )?,
+        Dense::Q3K(wa) => {
+            // The groups' windows of the heads are the columns of one q8_1
+            // activation of `groups` columns.
+            cx.gpu.enqueue_quantize_q8_1(&s.y, &mut s.acts.heads)?;
+            cx.k.dense
+                .enqueue_q3k_heads(stream, wa, &s.acts.heads, d.o_lora_rank, &mut s.wo_a)?;
+        }
+        _ => {
+            return Err(GpuError::Tensor {
+                what: WHAT,
+                name: n.out_a.clone(),
+                need: "Q8_0 or Q3_K",
+            });
+        }
+    }
+    let out_b = Dense::of(w, &n.out_b, groups * d.o_lora_rank, d.n_embd)?;
+    let act = if out_b.reads_q8_1() {
+        cx.gpu.enqueue_quantize_q8_1(&s.wo_a, &mut s.acts.wo_a)?;
+        Some(&s.acts.wo_a)
+    } else {
+        None
+    };
+    cx.k.dense.enqueue(cx.gpu, out_b, &s.wo_a, act, &mut s.out)
 }
 
 /// What an indexer layer's selection reads and writes besides the scratch.
@@ -1351,6 +1493,7 @@ fn enqueue_indexer(
     lp: &LayerPlan,
     ip: &IndexerPlan,
     s: &mut Scratch,
+    normed_act: NormedAct,
     io: IndexerIo<'_>,
 ) -> Result<(), GpuError> {
     let (d, w, gpu, stream) = (cx.d, cx.w, cx.gpu, cx.gpu.stream());
@@ -1367,11 +1510,18 @@ fn enqueue_indexer(
         .select
         .as_mut()
         .ok_or_else(|| refuse("an indexer layer on a piece with no indexer scratch"))?;
-    let (qs, qd) = q8_0(w, &ip.q_b)?;
-    gpu.q8f32()
-        .enqueue_q8_0_gemv(stream, qs, qd, &s.q_a_normed, m, &mut sel.q)?;
-    let act = match (lp.source.is_some(), s.source.as_ref()) {
-        (true, Some(src)) => &src.act,
+    let q_b = Dense::of(
+        w,
+        &ip.q_b,
+        d.q_lora_rank,
+        indexer::HEADS * indexer::HEAD_DIM,
+    )?;
+    let q_act = q_b.reads_q8_1().then_some(&s.acts.q_a);
+    cx.k.dense
+        .enqueue(gpu, q_b, &s.q_a_normed, q_act, &mut sel.q)?;
+    let act = match (lp.source.is_some(), s.source.as_ref(), normed_act) {
+        (true, Some(src), _) => &src.act,
+        (_, _, NormedAct::Own) => &s.acts.normed,
         _ => {
             gpu.enqueue_quantize_q8_1(&s.normed, &mut sel.act)?;
             &sel.act
@@ -1632,17 +1782,6 @@ fn layer_plan(
     })
 }
 
-/// Q8_0 weight `name`'s code and scale planes.
-fn q8_0<'w>(
-    w: &'w Weights,
-    name: &str,
-) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
-    match w.get(name) {
-        Some(DevWeight::Q8_0 { qs, d, .. }) => Ok((qs, d)),
-        _ => Err(missing(name, "resident as Q8_0")),
-    }
-}
-
 /// Q3_K weight `name`'s row stream.
 fn q3_k<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuError> {
     match w.get(name) {
@@ -1698,6 +1837,7 @@ mod tests {
             stream_ratios: planner.stream_ratios().to_vec(),
             rope_dims: ROPE_DIMS,
             n_embd: 8,
+            embd_bytes: 16,
             engram_bytes: 6,
         })
         .expect("a layout");
@@ -1713,7 +1853,7 @@ mod tests {
                 .plan_into(&history[at..=at], pos, &history[..at], &mut plan)
                 .expect("a plan");
             image
-                .build(&plan, &[0u16; 8], &[0u8; 6])
+                .build(&plan, &[0u8; 16], &[0u8; 6])
                 .expect("an image of the plan");
             let mut got = vec![0u32; words.len];
             for (&s, &d) in src.iter().zip(&dst) {

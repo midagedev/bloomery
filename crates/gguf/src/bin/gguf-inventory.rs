@@ -736,10 +736,12 @@ mod tests {
     use super::{has_decoder, in_engine_type};
     use gguf::quant::{GgmlType, dequant_row};
 
-    /// V4.1's first shard, unless `BLOOMERY_V41_MODEL` names another.
-    const MODEL_V41: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
-    /// The type ids V4.1's first shard carries that the crate decodes.
+    /// The type ids V4.1's first shard carries that the crate decodes: the
+    /// mixed file's (f32, q8_0, q3_K, q5_K, q6_K, bf16) and the public
+    /// file's, which has no q8_0.
     const V41_DECODABLE: usize = 6;
+    // PIN(2026-09-24): the public file's first shard: f32, q3_K, q5_K, q6_K, bf16.
+    const V41_PUBLIC_DECODABLE: usize = 5;
 
     /// The `dequant` column is the dispatch's own answer: every id in ggml's
     /// range reads `yes` exactly when `dequant_row` decodes one block of it.
@@ -766,7 +768,7 @@ mod tests {
     #[test]
     #[ignore = "reads the V4.1 first shard's header on the box"]
     fn hw_v41_shard_decodable_types() {
-        let path = std::env::var("BLOOMERY_V41_MODEL").unwrap_or_else(|_| MODEL_V41.to_string());
+        let path = gguf::v41::model();
         let inv = gguf::inventory_of(std::path::Path::new(&path))
             .unwrap_or_else(|e| panic!("inventory of {path}: {e}"));
         let ids: std::collections::BTreeSet<u32> = inv.tensors.iter().map(|t| t.type_id).collect();
@@ -783,9 +785,14 @@ mod tests {
             .collect();
         println!("v41 shard types: {}", rows.join("; "));
         let decodable = ids.iter().filter(|&&id| has_decoder(id)).count();
+        let want = if path == gguf::v41::PUBLIC {
+            V41_PUBLIC_DECODABLE
+        } else {
+            V41_DECODABLE
+        };
         assert_eq!(
             decodable,
-            V41_DECODABLE,
+            want,
             "decodable type ids on {path} ({} ids)",
             ids.len()
         );

@@ -5,16 +5,19 @@
 //!
 //! The piece, in step order, one token a step:
 //! - [`Glue::enqueue_embed`], one launch at the step's start: the token's
-//!   embedding row, bf16 in the step image, widened to f32 into every stream
-//!   and into layer 0's attention input. The first sub-layer's `pre` is
-//!   one-hot on stream 0, so that fold is the row itself and does not run.
-//! - [`Glue::enqueue_engram_kv_at`], three launches per engram site, none of
-//!   which reads a stream: the site's gathered rows (Q8_0 bytes in the image)
-//!   dequantized, `engram_wkv` over them (`q8_0_gemv`, f32 activations), and
-//!   the key norm. They depend on the token alone and are first read by the
-//!   site layer's engram step, so the step hands them ([`EngramKv`]) to the
-//!   MoE sub-layer of the layer before the site, whose host-leg shadow runs
-//!   them ([`ShadowWork`]).
+//!   embedding row, in the step image as the file stores it (bf16, or Q3_K
+//!   blocks), decoded to f32 into every stream and into layer 0's attention
+//!   input. The first sub-layer's `pre` is one-hot on stream 0, so that fold
+//!   is the row itself and does not run.
+//! - [`Glue::enqueue_engram_kv_at`], three launches per engram site (four
+//!   when `engram_wkv` is a K-quant), none of which reads a stream: the
+//!   site's gathered rows (the table's Q8_0 or Q3_K bytes in the image)
+//!   dequantized, `engram_wkv` over them ([`crate::dense`]: `q8_0_gemv` on
+//!   the f32 rows, or the rows' q8_1 form and the K-quant gemv), and the key
+//!   norm. They depend on the token alone and are first read by the site
+//!   layer's engram step, so the step hands them ([`EngramKv`]) to the MoE
+//!   sub-layer of the layer before the site, whose host-leg shadow runs them
+//!   ([`ShadowWork`]).
 //! - [`Glue::enqueue_engram`], two launches at each engram layer: the gate
 //!   over the streams the previous ffn's HC_POST left (that ffn ends with
 //!   HC_POST alone), then the fold of the gated streams that the layer's
@@ -29,9 +32,10 @@
 //! helper thread ([`RowsLevers::helper`]), so the calling thread never touches
 //! the table's mapping.
 //!
-//! Numbers: the bf16 widening and the rows' dequantization (an f16 scale
-//! times an 8-bit code) are exact; everything else is an op this piece
-//! composes and does not change.
+//! Numbers: the bf16 widening and a Q8_0 row's dequantization (an f16 scale
+//! times an 8-bit code) are exact; a Q3_K value is `gguf::quant::dequant_row`'s
+//! bit for bit (`elem::q3k_embed_value`, its two roundings in its order);
+//! everything else is an op this piece composes and does not change.
 //!
 //! The resident weights come in at each enqueue, not at [`Glue::new`]: the
 //! body owns the pieces and its model owns the weights beside it, so a piece
@@ -42,9 +46,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use bloomery_gpu::elem::q3k_embed_value;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, launch_u32};
+use bloomery_gpu::{Gpu, GpuError, Q8Act, launch_u32};
 use cuda_core::{DeviceBuffer, LaunchConfig1D};
 use cuda_device::convert::{cvt_f32_f16x2_hi, cvt_f32_f16x2_lo, cvt_f32x2_bf16x2};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
@@ -58,6 +63,7 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::StepPlan;
 
 use crate::chain::ffn::ShadowWork;
+use crate::dense::{Dense, DenseKernels};
 use crate::engram_gate::{EngramGateKernels, GateArgs, KeyNormArgs, ROW};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels};
 use crate::params::ImageLayout;
@@ -70,6 +76,45 @@ const THREADS: u32 = 256;
 /// Values of one Q8_0 block, and its bytes: an f16 scale, then the codes.
 const Q8_0_BLOCK: usize = 32;
 const Q8_0_BYTES: usize = 34;
+
+/// Values of one Q3_K super-block, and its bytes.
+const Q3_K_BLOCK: usize = 256;
+const Q3_K_BYTES: usize = 110;
+
+/// How a token's embedding row sits in the image: `token_embd`'s type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbdRows {
+    /// Two bf16 to a word, the low half first.
+    Bf16,
+    /// Q3_K super-blocks, 110 bytes each, from the row's first word.
+    Q3K,
+}
+
+/// How a site's gathered rows sit in the image: the engram tables' type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableRows {
+    /// Q8_0 rows in whole words.
+    Q8_0,
+    /// Q3_K rows of whole super-blocks, packed at 110 bytes each: every
+    /// other row starts on a half word.
+    Q3K,
+}
+
+impl TableRows {
+    /// The format of a table of type `ty` with rows of `key_len` values, and
+    /// the bytes of a row.
+    fn of(ty: GgmlType, key_len: usize) -> Option<(TableRows, usize)> {
+        match ty {
+            GgmlType::Q8_0 if key_len.is_multiple_of(Q8_0_BLOCK) => {
+                Some((TableRows::Q8_0, key_len / Q8_0_BLOCK * Q8_0_BYTES))
+            }
+            GgmlType::Q3_K if key_len.is_multiple_of(Q3_K_BLOCK) => {
+                Some((TableRows::Q3K, key_len / Q3_K_BLOCK * Q3_K_BYTES))
+            }
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------- kernels
 
@@ -180,6 +225,84 @@ pub(crate) mod glue_kernels {
             *y.get_unchecked_mut(i) = d * f32::from(q);
         }
     }
+
+    /// The embedding broadcast of a Q3_K row: thread `i` decodes value `i`
+    /// (super-block `i / 256` of the row at image word `at`, value `i %
+    /// 256`, `q3k_embed_value`) into value `i` of each of the `hc` streams
+    /// (`[s][256·n_sb]`) and of `input`.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * params.len() >= 4 * at + 110 * n_sb,
+            streams.len() >= hc * 256 * n_sb,
+            input.len() >= 256 * n_sb
+        )
+    )]
+    pub fn ds41_glue_embed_q3k(
+        params: &[u32],
+        at: u32,
+        n_sb: u32,
+        hc: u32,
+        mut streams: DisjointSlice<f32>,
+        mut input: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let n = 256 * n_sb as usize;
+        if i >= n {
+            return;
+        }
+        // q3k_embed_value's contract: the super-block at byte 4·at + 110·(i /
+        // 256) ends inside params by the launch contract, and starts 0 or 2
+        // mod 4 (a word, plus an even byte count).
+        let v = q3k_embed_value(params, 4 * at as usize + 110 * (i / 256), i % 256);
+        for s in 0..hc as usize {
+            // SAFETY: s < hc and i < n, so s·n + i < hc·n <= streams.len() by
+            // the launch contract; the value is this thread's alone.
+            unsafe { *streams.get_unchecked_mut(s * n + i) = v };
+        }
+        // SAFETY: i < n <= input.len() by the launch contract; one thread per
+        // value.
+        unsafe { *input.get_unchecked_mut(i) = v };
+    }
+
+    /// One site's gathered Q3_K rows, dequantized: thread `i` is value `v =
+    /// i % (256·n_sb)` of row `r = i / (256·n_sb)`, super-block `v / 256` of
+    /// the rows packed from image byte `at_byte` at `110·n_sb` bytes each
+    /// (`q3k_embed_value`).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * params.len() >= at_byte + rows * 110 * n_sb,
+            y.len() >= rows * 256 * n_sb
+        )
+    )]
+    pub fn ds41_glue_engram_rows_q3k(
+        params: &[u32],
+        at_byte: u32,
+        rows: u32,
+        n_sb: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let n_sb = n_sb as usize;
+        if i >= rows as usize * 256 * n_sb {
+            return;
+        }
+        let sb = i / 256;
+        // q3k_embed_value's contract: super-block sb < rows·n_sb of the packed
+        // rows ends inside params by the launch contract, and starts 0 or 2
+        // mod 4 (`Glue::new` checks at_byte even; 110 is even).
+        let v = q3k_embed_value(params, at_byte as usize + 110 * sb, i % 256);
+        // SAFETY: i < rows·256·n_sb <= y.len() by the launch contract; one
+        // thread per value.
+        unsafe { *y.get_unchecked_mut(i) = v };
+    }
 }
 
 // -------------------------------------------------------------- the piece
@@ -191,8 +314,8 @@ struct EngramSite {
     wkv: String,
     gain_k: String,
     gain_q: String,
-    /// Image word of the site's first row.
-    at: u32,
+    /// Image byte of the site's first row.
+    at_byte: u32,
     /// Per row ([`Glue::with_rows`]): a pass whose rows run one layer apart
     /// enqueues the other row's token-only work between a row's and its
     /// gate.
@@ -203,6 +326,8 @@ struct EngramSite {
 struct SiteRow {
     /// The rows dequantized: the projection's input.
     x: DeviceBuffer<f32>,
+    /// `x` in q8_1, for a K-quant `engram_wkv`.
+    act: Q8Act,
     /// `engram_wkv`'s output: `hc` keys, then the value.
     kv: DeviceBuffer<f32>,
     /// The normalized keys.
@@ -213,8 +338,23 @@ struct SiteRow {
 
 impl SiteRow {
     fn device_bytes(&self) -> usize {
-        self.x.num_bytes() + self.kv.num_bytes() + self.kn.num_bytes() + self.gate.num_bytes()
+        self.x.num_bytes()
+            + q8act_bytes(self.act.m(), self.x.len())
+            + self.kv.num_bytes()
+            + self.kn.num_bytes()
+            + self.gate.num_bytes()
     }
+}
+
+/// Device bytes of a [`Q8Act`] of `m` columns of `k`: its allocation's
+/// formula (`Q8Act::with_k`), which exposes no size of its own.
+fn q8act_bytes(m: usize, k: usize) -> usize {
+    let n_sb = k / 256;
+    m * (64 * n_sb.div_ceil(2) * 8
+        + 256 * n_sb.div_ceil(4) * 4
+        + 128 * n_sb.div_ceil(2) * 4
+        + 8 * n_sb * 4
+        + 2 * n_sb * 4)
 }
 
 /// A site's scratch as the gate reads it back.
@@ -267,15 +407,18 @@ pub struct Glue {
     module: glue_kernels::LoadedModule,
     hc: HcKernels,
     engram: EngramGateKernels,
+    dense: DenseKernels,
     n_embd: usize,
     eps: f32,
-    /// Image word of the embedding row, and the words it takes.
+    /// Image word of the embedding row, the words it takes, and its format.
     embd_at: u32,
-    half: u32,
-    /// Rows a site gathers, their values and their words.
+    embd_words: u32,
+    embd: EmbdRows,
+    /// Rows a site gathers, their values, their bytes and their format.
     rows: u32,
     key_len: u32,
-    row_words: u32,
+    row_bytes: u32,
+    table: TableRows,
     sites: Vec<EngramSite>,
 }
 
@@ -284,7 +427,9 @@ impl Glue {
     /// out by `layout`: its launch geometry, every name its launches read,
     /// and each engram site's scratch. The kernels hold a stream row of
     /// [`ROW`] values and four streams; a step runs one token, and the image
-    /// must carry each site's rows as Q8_0. One row of site scratch.
+    /// carries the embedding row as bf16 or Q3_K and each site's rows as
+    /// Q8_0 or Q3_K (the file's types, [`Hparams::rows`]). One row of site
+    /// scratch.
     pub fn new(gpu: &Gpu, hp: &Hparams, layout: &ImageLayout) -> Result<Glue, GpuError> {
         Glue::with_rows(gpu, hp, layout, 1)
     }
@@ -317,23 +462,33 @@ impl Glue {
         }
         let en = &hp.engram;
         let rows = en.rows_per_token();
-        let row_bytes = en.key_length / Q8_0_BLOCK * Q8_0_BYTES;
-        if en.key_length == 0
-            || !en.key_length.is_multiple_of(Q8_0_BLOCK)
-            || !row_bytes.is_multiple_of(4)
-            || dims.engram_bytes != en.layer_ids.len() * rows * row_bytes
-        {
+        let table = TableRows::of(hp.rows.engram, en.key_length)
+            .filter(|&(t, b)| t != TableRows::Q8_0 || b.is_multiple_of(4));
+        let Some((table, row_bytes)) = table.filter(|&(_, b)| {
+            en.key_length > 0 && dims.engram_bytes == en.layer_ids.len() * rows * b
+        }) else {
             return Err(refuse(format!(
-                "engram rows of {} values, {} bytes a token in the image: not {} sites of {rows} \
-                 Q8_0 rows in whole words",
+                "engram rows of {} values of {}, {} bytes a token in the image: not {} sites of \
+                 {rows} Q8_0 rows in whole words or Q3_K rows of whole super-blocks",
                 en.key_length,
+                hp.rows.engram,
                 dims.engram_bytes,
                 en.layer_ids.len()
             )));
-        }
-        let (embd_at, half, engram_at) = row_offsets(layout)?;
-        let row_words = row_bytes / 4;
-        let site_words = rows * row_words;
+        };
+        let embd = match hp.rows.token_embd {
+            GgmlType::BF16 if dims.embd_bytes == 2 * ROW => EmbdRows::Bf16,
+            GgmlType::Q3_K if dims.embd_bytes == ROW / Q3_K_BLOCK * Q3_K_BYTES => EmbdRows::Q3K,
+            ty => {
+                return Err(refuse(format!(
+                    "an embedding row of {ty}, {} bytes in the image: the broadcast decodes bf16 \
+                     and Q3_K rows of {ROW} values",
+                    dims.embd_bytes
+                )));
+            }
+        };
+        let (embd_at, embd_words, engram_at) = row_offsets(layout)?;
+        let site_bytes = rows * row_bytes;
         let stream = gpu.stream();
         let mut sites = Vec::with_capacity(en.layer_ids.len());
         for (s, &layer) in en.layer_ids.iter().enumerate() {
@@ -342,17 +497,23 @@ impl Glue {
                     "engram site {s} names layer {layer}, whose kind does not name the site"
                 )));
             }
-            let at = launch_u32(WHAT, "site rows", engram_at as usize + s * site_words)?;
+            let at_byte = launch_u32(WHAT, "site rows", 4 * engram_at as usize + s * site_bytes)?;
+            if table == TableRows::Q3K && !at_byte.is_multiple_of(2) {
+                return Err(refuse(format!(
+                    "engram site {s}'s Q3_K rows start at image byte {at_byte}: not on a half word"
+                )));
+            }
             sites.push(EngramSite {
                 layer,
                 wkv: names::engram_wkv(layer),
                 gain_k: names::engram_k(layer),
                 gain_q: names::engram_q(layer),
-                at,
+                at_byte,
                 bufs: (0..n_rows)
                     .map(|_| {
                         Ok(SiteRow {
                             x: DeviceBuffer::zeroed(stream, rows * en.key_length)?,
+                            act: Q8Act::with_k(stream, 1, rows * en.key_length)?,
                             kv: DeviceBuffer::zeroed(stream, (HC_STREAMS + 1) * ROW)?,
                             kn: DeviceBuffer::zeroed(stream, HC_STREAMS * ROW)?,
                             gate: DeviceBuffer::zeroed(stream, HC_STREAMS)?,
@@ -368,13 +529,16 @@ impl Glue {
             module,
             hc: HcKernels::load(gpu.context())?,
             engram: EngramGateKernels::load(gpu.context())?,
+            dense: DenseKernels::load(gpu.context())?,
             n_embd: hp.n_embd,
             eps: hp.rms_eps,
             embd_at,
-            half,
+            embd_words,
+            embd,
             rows: launch_u32(WHAT, "rows", rows)?,
             key_len: launch_u32(WHAT, "key_length", en.key_length)?,
-            row_words: launch_u32(WHAT, "row words", row_words)?,
+            row_bytes: launch_u32(WHAT, "row bytes", row_bytes)?,
+            table,
             sites,
         })
     }
@@ -442,31 +606,54 @@ impl Glue {
             WHAT,
             "params",
             params.len(),
-            self.embd_at as usize + self.half as usize,
+            self.embd_at as usize + self.embd_words as usize,
         )?;
         need(WHAT, "streams", streams.len(), HC_STREAMS * n)?;
         need(WHAT, "input", input.len(), n)?;
-        let grid = self.half.div_ceil(THREADS);
-        let prep = self
-            .module
-            .prepare_ds41_glue_embed(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.ds41_glue_embed(
-            gpu.stream(),
-            &prep,
-            params,
-            self.embd_at,
-            self.half,
-            HC_STREAMS as u32,
-            streams,
-            input,
-        )?;
+        match self.embd {
+            EmbdRows::Bf16 => {
+                let half = self.embd_words;
+                let grid = half.div_ceil(THREADS);
+                let prep = self
+                    .module
+                    .prepare_ds41_glue_embed(LaunchConfig1D::new(grid, THREADS, 0))?;
+                self.module.ds41_glue_embed(
+                    gpu.stream(),
+                    &prep,
+                    params,
+                    self.embd_at,
+                    half,
+                    HC_STREAMS as u32,
+                    streams,
+                    input,
+                )?;
+            }
+            EmbdRows::Q3K => {
+                let n_sb = launch_u32(WHAT, "super-blocks", n / Q3_K_BLOCK)?;
+                let grid = launch_u32(WHAT, "grid", n.div_ceil(THREADS as usize))?;
+                let prep = self
+                    .module
+                    .prepare_ds41_glue_embed_q3k(LaunchConfig1D::new(grid, THREADS, 0))?;
+                self.module.ds41_glue_embed_q3k(
+                    gpu.stream(),
+                    &prep,
+                    params,
+                    self.embd_at,
+                    n_sb,
+                    HC_STREAMS as u32,
+                    streams,
+                    input,
+                )?;
+            }
+        }
         Ok(())
     }
 
     /// Enqueue the token-only work of the engram site at `layer`: its rows
-    /// from the image `params` dequantized, `engram_wkv` over them, and the
-    /// key norm. Three launches, reading no stream. Asynchronous,
-    /// allocation-free, capturable. Row 0's scratch.
+    /// from the image `params` dequantized, `engram_wkv` over them (with the
+    /// rows' q8_1 form first when it is a K-quant), and the key norm. Three
+    /// or four launches, reading no stream. Asynchronous, allocation-free,
+    /// capturable. Row 0's scratch.
     pub fn enqueue_engram_kv_at(
         &mut self,
         gpu: &Gpu,
@@ -492,7 +679,7 @@ impl Glue {
         let values = self.rows * self.key_len;
         let grid = values.div_ceil(THREADS);
         let SiteRef {
-            at,
+            at_byte,
             wkv,
             gain_k,
             row: site,
@@ -501,25 +688,48 @@ impl Glue {
         need(
             WHAT,
             "params",
-            params.len(),
-            at as usize + self.rows as usize * self.row_words as usize,
+            4 * params.len(),
+            at_byte as usize + self.rows as usize * self.row_bytes as usize,
         )?;
-        let prep = self
-            .module
-            .prepare_ds41_glue_engram_rows(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.ds41_glue_engram_rows(
-            stream,
-            &prep,
-            params,
-            at,
-            self.rows,
-            self.row_words,
-            self.key_len,
-            &mut site.x,
-        )?;
-        let (qs, d) = q8_0(w, wkv, site.x.len(), site.kv.len())?;
-        gpu.q8f32()
-            .enqueue_q8_0_gemv(stream, qs, d, &site.x, 1, &mut site.kv)?;
+        match self.table {
+            TableRows::Q8_0 => {
+                let prep = self
+                    .module
+                    .prepare_ds41_glue_engram_rows(LaunchConfig1D::new(grid, THREADS, 0))?;
+                self.module.ds41_glue_engram_rows(
+                    stream,
+                    &prep,
+                    params,
+                    at_byte / 4,
+                    self.rows,
+                    self.row_bytes / 4,
+                    self.key_len,
+                    &mut site.x,
+                )?;
+            }
+            TableRows::Q3K => {
+                let prep = self
+                    .module
+                    .prepare_ds41_glue_engram_rows_q3k(LaunchConfig1D::new(grid, THREADS, 0))?;
+                self.module.ds41_glue_engram_rows_q3k(
+                    stream,
+                    &prep,
+                    params,
+                    at_byte,
+                    self.rows,
+                    self.key_len / Q3_K_BLOCK as u32,
+                    &mut site.x,
+                )?;
+            }
+        }
+        let wkv = Dense::of(w, wkv, site.x.len(), site.kv.len())?;
+        let act = if wkv.reads_q8_1() {
+            gpu.enqueue_quantize_q8_1(&site.x, &mut site.act)?;
+            Some(&site.act)
+        } else {
+            None
+        };
+        self.dense.enqueue(gpu, wkv, &site.x, act, &mut site.kv)?;
         self.engram.enqueue_key_norm(
             stream,
             KeyNormArgs {
@@ -611,10 +821,10 @@ impl Glue {
     }
 }
 
-/// The site at `layer` as one enqueue reads it: its image word, its
+/// The site at `layer` as one enqueue reads it: its image byte, its
 /// weights' names and row `row`'s scratch.
 struct SiteRef<'s> {
-    at: u32,
+    at_byte: u32,
     wkv: &'s str,
     gain_k: &'s str,
     gain_q: &'s str,
@@ -631,7 +841,7 @@ fn site_row<'s>(
     what: &'static str,
 ) -> Result<SiteRef<'s>, GpuError> {
     let EngramSite {
-        at,
+        at_byte,
         wkv,
         gain_k,
         gain_q,
@@ -650,7 +860,7 @@ fn site_row<'s>(
         detail: format!("row {row} of a piece of {n} rows"),
     })?;
     Ok(SiteRef {
-        at: *at,
+        at_byte: *at_byte,
         wkv,
         gain_k,
         gain_q,
@@ -679,31 +889,6 @@ fn row_offsets(layout: &ImageLayout) -> Result<(u32, u32, u32), GpuError> {
                 embd.len(),
                 engram.len()
             ),
-        }),
-    }
-}
-
-/// The resident Q8_0 planes of `name`, refused unless it projects `k`
-/// values onto `rows` rows.
-fn q8_0<'w>(
-    w: &'w Weights,
-    name: &str,
-    k: usize,
-    rows: usize,
-) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
-    match w.get(name) {
-        Some(DevWeight::Q8_0 { qs, d, k: wk }) if *wk == k && d.rows() == rows => Ok((qs, d)),
-        Some(DevWeight::Q8_0 { d, k: wk, .. }) => Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!(
-                "{name} is {} rows of {wk} values, want {rows} of {k}",
-                d.rows()
-            ),
-        }),
-        found => Err(GpuError::Tensor {
-            what: WHAT,
-            name: name.to_string(),
-            need: if found.is_some() { "Q8_0" } else { "resident" },
         }),
     }
 }
@@ -784,7 +969,8 @@ pub struct EngramStats {
 
 /// The rows one step's image carries ([`crate::params::StepImage::build`]'s
 /// `embd` and `engram`), for a step of a fixed token count. A token's
-/// embedding row is the file's `token_embd` row, bf16. A site's rows are the
+/// embedding row is the file's `token_embd` row, its bytes as the file
+/// stores them (bf16 or Q3_K). A site's rows are the
 /// ones the engram crate's hash names for the token's n-gram — the plan's
 /// window mapped as the port maps it: the current token, then each older one
 /// up to the first missing, the pad id from there on — read out of the
@@ -797,9 +983,9 @@ pub struct StepRows {
     helper: Option<Prefetcher>,
     /// Kept when [`RowsLevers::stats`] is on.
     stats: Option<EngramStats>,
-    /// `token_embd`'s shard and header.
+    /// `token_embd`'s shard and header, and the bytes of one of its rows.
     embd: (usize, TensorInfo),
-    n_embd: usize,
+    embd_bytes: usize,
     n_vocab: usize,
     /// Rows a site gathers per token, and bytes a row.
     n_cols: usize,
@@ -808,7 +994,7 @@ pub struct StepRows {
     ctx: Vec<u64>,
     /// `[token][site][n_cols]`.
     ids: Vec<u32>,
-    embd_rows: Vec<u16>,
+    embd_rows: Vec<u8>,
     engram_rows: Vec<u8>,
 }
 
@@ -842,16 +1028,30 @@ impl StepRows {
             name: name.clone(),
             need: "in the file",
         })?;
-        if info.ty != GgmlType::BF16 || info.dims != [hp.n_embd as u64, hp.n_vocab as u64] {
+        let embd_bytes = match info.ty {
+            GgmlType::BF16 => Some(2 * hp.n_embd),
+            GgmlType::Q3_K if hp.n_embd.is_multiple_of(Q3_K_BLOCK) => {
+                Some(hp.n_embd / Q3_K_BLOCK * Q3_K_BYTES)
+            }
+            _ => None,
+        };
+        let Some(embd_bytes) = embd_bytes.filter(|_| {
+            info.dims == [hp.n_embd as u64, hp.n_vocab as u64] && info.ty == hp.rows.token_embd
+        }) else {
             return Err(refuse(format!(
-                "{name} is {} {:?}, want bf16 [{}, {}]",
+                "{name} is {} {:?}, want bf16 or Q3_K [{}, {}]",
                 info.ty, info.dims, hp.n_embd, hp.n_vocab
             )));
-        }
+        };
         let paths = (0..file.shard_count()).filter_map(|i| file.shard_path(i));
         let engram = Engram::open(paths).map_err(|e| GpuError::plan(WHAT, e))?;
         let (hash, en) = (engram.hash(), &hp.engram);
-        let row_bytes = en.key_length / Q8_0_BLOCK * Q8_0_BYTES;
+        let (_, row_bytes) = TableRows::of(hp.rows.engram, en.key_length).ok_or_else(|| {
+            refuse(format!(
+                "engram tables of {} rows of {} values: the card reads Q8_0 and Q3_K rows",
+                hp.rows.engram, en.key_length
+            ))
+        })?;
         let layers_agree = hash.layer_ids().len() == en.layer_ids.len()
             && hash
                 .layer_ids()
@@ -869,7 +1069,7 @@ impl StepRows {
         {
             return Err(refuse(format!(
                 "the engram tables hash sites {:?} of {}-grams into {} rows of {} values; the \
-                 file's hyperparameters say {:?}, {}, {} and {} in Q8_0 rows of {row_bytes} bytes",
+                 file's hyperparameters say {:?}, {}, {} and {} in {} rows of {row_bytes} bytes",
                 hash.layer_ids(),
                 hash.n_gram(),
                 hash.n_cols(),
@@ -877,7 +1077,8 @@ impl StepRows {
                 en.layer_ids,
                 en.max_ngram,
                 en.rows_per_token(),
-                en.key_length
+                en.key_length,
+                hp.rows.engram
             )));
         }
         let n_cols = hash.n_cols();
@@ -902,14 +1103,14 @@ impl StepRows {
             helper,
             stats: levers.stats.then(EngramStats::default),
             embd: (shard, info.clone()),
-            n_embd: hp.n_embd,
+            embd_bytes,
             n_vocab: hp.n_vocab,
             n_cols,
             row_bytes,
             tokens,
             ctx: vec![0; en.max_ngram],
             ids: vec![0; tokens * sites * n_cols],
-            embd_rows: vec![0; tokens * hp.n_embd],
+            embd_rows: vec![0; tokens * embd_bytes],
             engram_rows: vec![0; tokens * sites * n_cols * row_bytes],
             engram,
         })
@@ -937,7 +1138,7 @@ impl StepRows {
         if self.helper.is_none() {
             embd_rows_into(
                 &self.embd,
-                [self.n_embd, self.n_vocab],
+                [self.embd_bytes, self.n_vocab],
                 &mut self.embd_rows,
                 file,
                 plan,
@@ -972,7 +1173,7 @@ impl StepRows {
                     if k == 0 {
                         let embd = embd_rows_into(
                             &self.embd,
-                            [self.n_embd, self.n_vocab],
+                            [self.embd_bytes, self.n_vocab],
                             &mut self.embd_rows,
                             file,
                             plan,
@@ -1053,9 +1254,9 @@ impl StepRows {
         self.helper.as_ref().map(Prefetcher::pinned_cpu)
     }
 
-    /// The step's embedding rows, `tokens · n_embd` bf16 bits.
+    /// The step's embedding rows, `tokens` rows of `token_embd`'s bytes.
     #[must_use]
-    pub fn embd(&self) -> &[u16] {
+    pub fn embd(&self) -> &[u8] {
         &self.embd_rows
     }
 
@@ -1073,13 +1274,13 @@ impl StepRows {
     }
 }
 
-/// Every token's embedding row of `plan` into `out` (`n_embd` bf16 bits a
-/// token), from `file`'s `token_embd` of `[n_embd, n_vocab]` at `embd` (its
-/// shard and header).
+/// Every token's embedding row of `plan` into `out` (`row` bytes a token, as
+/// the file stores them), from `file`'s `token_embd` of `n_vocab` rows at
+/// `embd` (its shard and header).
 fn embd_rows_into(
     embd: &(usize, TensorInfo),
-    [n_embd, n_vocab]: [usize; 2],
-    out: &mut [u16],
+    [row, n_vocab]: [usize; 2],
+    out: &mut [u8],
     file: &Split,
     plan: &StepPlan,
 ) -> Result<(), GpuError> {
@@ -1090,21 +1291,18 @@ fn embd_rows_into(
         .shard(*shard)
         .ok_or_else(|| refuse(format!("the file has no shard {shard}")))?
         .data(info)?;
-    let row = 2 * n_embd;
-    for (&token, dst) in plan.tokens.iter().zip(out.chunks_exact_mut(n_embd)) {
+    for (&token, dst) in plan.tokens.iter().zip(out.chunks_exact_mut(row)) {
         let t = token as usize;
         let bytes = (t < n_vocab)
             .then(|| table.get(t * row..(t + 1) * row))
             .flatten()
             .ok_or_else(|| {
                 refuse(format!(
-                    "token {token}: no row of {n_embd} in a table of {n_vocab} rows, {} bytes",
+                    "token {token}: no row of {row} bytes in a table of {n_vocab} rows, {} bytes",
                     table.len()
                 ))
             })?;
-        for (v, b) in dst.iter_mut().zip(bytes.as_chunks::<2>().0) {
-            *v = u16::from_le_bytes(*b);
-        }
+        dst.copy_from_slice(bytes);
     }
     Ok(())
 }

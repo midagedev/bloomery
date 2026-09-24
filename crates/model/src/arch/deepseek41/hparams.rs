@@ -14,6 +14,7 @@
 //! (`tools/ref/models/deepseek41.sh`'s `IK`).
 
 use gguf::Split;
+use gguf::quant::GgmlType;
 
 use super::names;
 use crate::arch::{
@@ -71,8 +72,59 @@ pub struct Hparams {
     pub experts: Experts,
     /// The engram dimensions.
     pub engram: Engram,
+    /// The types of the rows a step reads out of the file.
+    pub rows: RowTypes,
     /// One entry per layer, in layer order.
     pub layers: Vec<LayerKind>,
+}
+
+/// The types of the rows a step's host half reads out of the file and hands
+/// the card as the file stores them: a token's `token_embd` row and each
+/// engram site's table rows. The step image is laid out by them and the card
+/// decodes them, so they are read once here with the dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowTypes {
+    /// `token_embd`'s type.
+    pub token_embd: GgmlType,
+    /// The engram tables' type, one for every site.
+    pub engram: GgmlType,
+}
+
+impl RowTypes {
+    fn read(split: &Split, engram: &Engram) -> Result<RowTypes, PlacementError> {
+        let ty = |name: String| {
+            split
+                .find(&name)
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| PlacementError::Tensor {
+                    name,
+                    detail: "is not in the file".to_string(),
+                })
+        };
+        let token_embd = ty(names::token_embd())?;
+        let mut tables = engram
+            .layer_ids
+            .iter()
+            .map(|&l| (l, ty(names::engram_embd(l))));
+        let (first, table) = tables.next().ok_or_else(|| PlacementError::Tensor {
+            name: names::engram_embd(0),
+            detail: "no engram site names a table".to_string(),
+        })?;
+        let table = table?;
+        for (l, t) in tables {
+            let t = t?;
+            if t != table {
+                return Err(PlacementError::Tensor {
+                    name: names::engram_embd(l),
+                    detail: format!("is {t}, layer {first}'s table is {table}"),
+                });
+            }
+        }
+        Ok(RowTypes {
+            token_embd,
+            engram: table,
+        })
+    }
 }
 
 /// The lightning indexer that picks the compressed rows a layer attends.
@@ -231,6 +283,9 @@ pub struct LayerKind {
     pub swiglu_limit: f32,
     /// `swiglu_clamp_shexp` at this layer — the shared expert's.
     pub swiglu_limit_shared: f32,
+    /// `ffn_down_shexp`'s type: whether the shared expert's down projection
+    /// reads its input as is or in q8_1 decides a launch of the step.
+    pub shared_down: GgmlType,
 }
 
 impl LayerKind {
@@ -270,6 +325,7 @@ impl Hparams {
             swiglu_shared: per_layer_f32(split, "swiglu_clamp_shexp", n_layer)?,
         };
         let engram = Engram::read(split, n_layer)?;
+        let rows = RowTypes::read(split, &engram)?;
         let carries: Vec<Carries> = (0..n_layer).map(|l| Carries::read(split, l)).collect();
         let walk = walk_streams(
             &split.arch_key("attention.compress_ratios"),
@@ -306,6 +362,7 @@ impl Hparams {
             },
             experts: Experts::read(split, dense_lead)?,
             engram,
+            rows,
             layers,
         })
     }
@@ -619,6 +676,13 @@ fn layer_kinds(
             },
             swiglu_limit: tables.swiglu[l],
             swiglu_limit_shared: tables.swiglu_shared[l],
+            shared_down: split
+                .find(&names::ffn_down_shexp(l))
+                .map(|(_, t)| t.ty)
+                .ok_or_else(|| PlacementError::Tensor {
+                    name: names::ffn_down_shexp(l),
+                    detail: "is not in the file".to_string(),
+                })?,
         });
     }
     Ok(layers)

@@ -565,7 +565,10 @@ struct Manifest {
 impl Manifest {
     fn open(set: &'static str, split: &Split) -> Manifest {
         let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-        let path = PathBuf::from(base).join(set).join("MANIFEST.tsv");
+        // The set of that name for the V4.1 file the tree runs.
+        let path = PathBuf::from(base)
+            .join(gguf::v41::set(set))
+            .join("MANIFEST.tsv");
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!(
                 "no oracle manifest at {} ({e}). The lead produces it (tools/ref/dump.sh). \

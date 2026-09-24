@@ -32,13 +32,16 @@ impl Pattern {
 }
 
 /// The per-layer rules; order matters (the never-loaded heads first, so none
-/// of their tensors takes a decode role; `engram_embd` before `engram_`,
+/// of their tensors takes a decode role; `engram_embd` and the gains
+/// `engram_k.`/`engram_q.` before `engram_`,
 /// `exp_probs_b.` before `exp_probs_b_vl`, the shared expert before `_exps`).
 const LAYER_RULES: &[(Pattern, Role)] = &[
     (Pattern::Prefix("nextn."), Role::Unused),
     (Pattern::Prefix("mtp."), Role::Unused),
     (Pattern::Contains(".mtp."), Role::Unused),
     (Pattern::Prefix("engram_embd"), Role::EngramTable),
+    (Pattern::Prefix("engram_k."), Role::EngramGain),
+    (Pattern::Prefix("engram_q."), Role::EngramGain),
     (Pattern::Prefix("engram_"), Role::EngramDense),
     (Pattern::Prefix("hc_"), Role::HyperConnection),
     (Pattern::Prefix("ffn_gate_inp"), Role::Router),

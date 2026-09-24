@@ -21,7 +21,8 @@ source "${BASH_SOURCE[0]%/*}/lease.sh"
 BIN=${BLOOMERY_ENGRAM_BIN:-target/release/engram-rate}
 [ -x "$BIN" ] || { echo "no engram-rate at $BIN — run: just build-engram" >&2; exit 2; }
 
-DIR=${BLOOMERY_V41_DIR:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8}
+# The V4.1 file set: the deepseek41 profile's choice, exported by tools/box.sh.
+DIR=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
 # 테이블이 어느 블록 디바이스에 있는지는 추측하지 않는다 — 마운트에서 읽는다.
 SRC=$(findmnt -n -o SOURCE --target "$DIR")
 # `|| true` 안에서 받는다: set -e 아래에서는 대입 안의 파이프라인이 실패하면 그 줄에서 죽어,

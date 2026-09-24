@@ -1740,10 +1740,10 @@ impl Gpu {
     }
 
     /// Enqueue `y = w · act` for a Q3_K weight of `w.rows()` rows — 110
-    /// bytes per super-block, the row stream as u32 words with the final
-    /// word zero-padded, `110 * n_sb / 4` words per row (an integer only
-    /// for even n_sb, which every Q3_K site of this model has; an odd n_sb
-    /// leaves rows unaligned and needs load-time repacking, rejected here)
+    /// bytes per super-block, the rows' byte stream as u32 words, zero-padded
+    /// at its end to a whole number of words per row (`CardFormat::KQuant`:
+    /// `110 * n_sb / 4` words a row for even n_sb; an odd n_sb starts every
+    /// other row on a half word, which the row walk's byte addressing reads)
     /// — against the quantized activations in `act`, which supply K. `y`
     /// holds `rows * m` f32, row-major with `m` outputs per row.
     /// Asynchronous, allocation-free, capturable.
@@ -1755,22 +1755,13 @@ impl Gpu {
     ) -> Result<(), GpuError> {
         let (n_rows, m) = (w.rows(), act.m());
         let n_sb = act.n_sb();
-        if !n_sb.is_multiple_of(2) {
+        let words = (n_rows * 110 * n_sb).div_ceil(4).div_ceil(n_rows.max(1));
+        if w.cols() != words {
             return Err(GpuError::shape(
                 "enqueue_gemv_q3k",
                 format!(
-                    "odd super-block count {n_sb} (K={}) leaves rows \
-                 unaligned; repack rows at load time",
-                    act.k()
-                ),
-            ));
-        }
-        if w.cols() != 110 * n_sb / 4 {
-            return Err(GpuError::shape(
-                "enqueue_gemv_q3k",
-                format!(
-                    "Q3_K rows are 110*{n_sb}/4 = {} words at K={}, got {}",
-                    110 * n_sb / 4,
+                    "Q3_K rows are {} words at K={}, got {}",
+                    words,
                     act.k(),
                     w.cols()
                 ),

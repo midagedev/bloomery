@@ -9,6 +9,11 @@
 //!         → (the caller's shadow work) → wait → combine+HC_POST (+ fold)
 //! ```
 //!
+//! The shared expert runs in its file format ([`crate::dense`]): q8_0 gate·up
+//! on the f32 activation and a q8_0 down; or Q3_K gate·up on the norm's q8_1
+//! form, then a Q4_K down on the q8_1 of its output (one launch more) or a
+//! Q5_K down on the f32 output.
+//!
 //! - The norm writes the f32 activation into the boundary's handoff region
 //!   and its q8_1 form into the piece's own scratch; the router and the
 //!   shared expert read the f32 form there.
@@ -37,7 +42,8 @@
 //!   into an engram layer and after the last layer, the next sub-layer's
 //!   fold. The combine's output is written too, for a gate to read.
 //!
-//! Launches per layer: ten kernels with card experts, seven without, and
+//! Launches per layer: ten kernels with card experts, seven without (one more
+//! each for a shared down projection that reads q8_1), and
 //! each layer's two stream memory-operation batches (go, wait); no copy.
 //! A caller's shadow work is its own and is not counted here.
 //!
@@ -69,6 +75,7 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
 use model::moe::{HostLayer, HostScratch};
 
+use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
 use crate::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
@@ -530,6 +537,8 @@ struct LayerCfg {
     row_off: usize,
     limit: f32,
     limit_shared: f32,
+    /// The shared down projection reads its input in q8_1: one launch more.
+    sh_down_q8_1: bool,
     /// HC_POST with the next fold (`false`: HC_POST alone).
     fold: bool,
 }
@@ -541,17 +550,18 @@ struct LayerWeights<'w> {
     bias: &'w DeviceBuffer<f32>,
     sh_gate: &'w DevWeight,
     sh_up: &'w DevWeight,
-    sh_qs: &'w DeviceTensor<u32>,
-    sh_d: &'w DeviceTensor<u16>,
+    sh_down: Dense<'w>,
     hc: HcParams<'w>,
 }
 
 impl<'w> LayerWeights<'w> {
     /// Layer `c`'s tensors in `w`, each in the format its launch reads, with
-    /// the HC_PRE constants.
+    /// the HC_PRE constants; the shared expert's down projection takes `ff`
+    /// values onto `n_embd` rows.
     fn resolve(
         c: &LayerCfg,
         w: &'w Weights,
+        [n_embd, ff]: [usize; 2],
         hc_eps: f32,
         hc_iters: u32,
     ) -> Result<LayerWeights<'w>, GpuError> {
@@ -559,12 +569,7 @@ impl<'w> LayerWeights<'w> {
         let router = f32_tensor(w, &c.router)?;
         let bias = f32_weight(w, &c.bias)?;
         let (sh_gate, sh_up) = (weight(w, &c.sh_gate)?, weight(w, &c.sh_up)?);
-        let DevWeight::Q8_0 {
-            qs: sh_qs, d: sh_d, ..
-        } = weight(w, &c.sh_down)?
-        else {
-            return Err(tensor_err(&c.sh_down, "a q8_0 file tensor"));
-        };
+        let sh_down = Dense::of(w, &c.sh_down, ff, n_embd)?;
         let DevWeight::KQuant {
             ty: GgmlType::Q3_K,
             w: hc_w,
@@ -579,8 +584,7 @@ impl<'w> LayerWeights<'w> {
             bias,
             sh_gate,
             sh_up,
-            sh_qs,
-            sh_d,
+            sh_down,
             hc: HcParams {
                 w: hc_w,
                 scale: f32_weight(w, &c.hc_scale)?,
@@ -624,6 +628,8 @@ struct FfnRow {
     act_h: Q8Act,
     down: DeviceBuffer<f32>,
     sh_h: DeviceBuffer<f32>,
+    /// `sh_h` in q8_1, for a K-quant shared down projection.
+    act_sh: Q8Act,
     sh_y: DeviceBuffer<f32>,
     y: DeviceBuffer<f32>,
     mixes: DeviceBuffer<f32>,
@@ -641,6 +647,7 @@ impl FfnRow {
             act_h: Q8Act::with_k(stream, N_USED, ff)?,
             down: z(N_USED * n_embd)?,
             sh_h: z(ff)?,
+            act_sh: Q8Act::with_k(stream, 1, ff)?,
             sh_y: z(n_embd)?,
             y: z(n_embd)?,
             mixes: z(HC_MIX)?,
@@ -667,6 +674,7 @@ impl FfnRow {
             + ROUTER_TICKET_BYTES
             + q8act_bytes(&self.act_x)
             + q8act_bytes(&self.act_h)
+            + q8act_bytes(&self.act_sh)
     }
 }
 
@@ -675,6 +683,7 @@ pub struct FfnPiece {
     fused: FusedKernels,
     router: RouterKernels,
     experts: ExpertKernels,
+    dense: DenseKernels,
     hc: HcKernels,
     module: ffn_kernels::LoadedModule,
     layers: Range<usize>,
@@ -755,6 +764,7 @@ impl FfnPiece {
                 row_off: i * map.n_expert(),
                 limit: kind.swiglu_limit,
                 limit_shared: kind.swiglu_limit_shared,
+                sh_down_q8_1: matches!(kind.shared_down, GgmlType::Q3_K | GgmlType::Q4_K),
                 fold: hp.layers.get(l + 1).is_some_and(|k| k.engram.is_none()),
             });
         }
@@ -770,6 +780,7 @@ impl FfnPiece {
             fused: FusedKernels::load(ctx)?,
             router: RouterKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
+            dense: DenseKernels::load(ctx)?,
             hc: HcKernels::load(ctx)?,
             module,
             layers,
@@ -805,7 +816,7 @@ impl FfnPiece {
     #[must_use]
     pub fn launches(&self, layer: usize) -> Option<usize> {
         self.cfg_of(layer)
-            .map(|c| if c.n_card > 0 { 10 } else { 7 })
+            .map(|c| if c.n_card > 0 { 10 } else { 7 } + usize::from(c.sh_down_q8_1))
     }
 
     /// Device bytes of the piece's own scratch, every row's.
@@ -923,7 +934,13 @@ impl FfnPiece {
     ) -> Result<(), GpuError> {
         let i = self.check_io(layer, hybrid.boundary().slots(), io, row)?;
         let card = self.check_card(layer, i, card)?;
-        let lw = LayerWeights::resolve(&self.cfg[i], w, self.hc_eps, self.hc_iters)?;
+        let lw = LayerWeights::resolve(
+            &self.cfg[i],
+            w,
+            [self.n_embd, self.ff],
+            self.hc_eps,
+            self.hc_iters,
+        )?;
         self.enqueue_handoff(gpu, i, row, &lw, io, hybrid, layer)?;
         self.enqueue_shadow(gpu, i, row, &lw, card, io, hybrid.boundary())?;
         for work in extra.iter_mut() {
@@ -1198,16 +1215,49 @@ impl FfnPiece {
                 &mut r.down,
             )?;
         }
-        self.experts.enqueue_shexp_gate_up(
-            stream,
-            lw.sh_gate,
-            lw.sh_up,
-            boundary.normed(),
-            c.limit_shared,
-            &mut r.sh_h,
-        )?;
-        gpu.q8f32()
-            .enqueue_q8_0_gemv(stream, lw.sh_qs, lw.sh_d, &r.sh_h, 1, &mut r.sh_y)?;
+        match (lw.sh_gate, lw.sh_up) {
+            (
+                DevWeight::KQuant {
+                    ty: GgmlType::Q3_K,
+                    w: g,
+                    ..
+                },
+                DevWeight::KQuant {
+                    ty: GgmlType::Q3_K,
+                    w: u,
+                    ..
+                },
+            ) => self.dense.enqueue_shexp_gate_up_q3k(
+                stream,
+                g,
+                u,
+                &r.act_x,
+                c.limit_shared,
+                &mut r.sh_h,
+            )?,
+            (gate, up) => self.experts.enqueue_shexp_gate_up(
+                stream,
+                gate,
+                up,
+                boundary.normed(),
+                c.limit_shared,
+                &mut r.sh_h,
+            )?,
+        }
+        if lw.sh_down.reads_q8_1() != c.sh_down_q8_1 {
+            return Err(tensor_err(
+                &c.sh_down,
+                "of the format the file's header names for it",
+            ));
+        }
+        let act = if lw.sh_down.reads_q8_1() {
+            gpu.enqueue_quantize_q8_1(&r.sh_h, &mut r.act_sh)?;
+            Some(&r.act_sh)
+        } else {
+            None
+        };
+        self.dense
+            .enqueue(gpu, lw.sh_down, &r.sh_h, act, &mut r.sh_y)?;
         Ok(())
     }
 

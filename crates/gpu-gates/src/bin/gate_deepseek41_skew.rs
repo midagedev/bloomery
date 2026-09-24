@@ -74,7 +74,8 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, ref_tensor_of_in, verdict, widened_f16_rows_in,
+        GateError, RefManifest, checks_failed, ds41_meta, ref_tensor_of_in, verdict,
+        widened_f16_rows_in,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -100,18 +101,6 @@ mod gate {
     /// Operations in a go batch and in a wait batch (`bloomery_gpu::hybrid`).
     const GO_OPS: u32 = 5;
     const WAIT_OPS: u32 = 2;
-    /// The MoE piece's own shadow work with card experts and without, and
-    /// one engram site's token-only work (the step gate's tables).
-    const SHADOW_CARD: [&str; 6] = [
-        "ds41_hc_pre",
-        "ds41_expert_gate_up",
-        "q3k_quantize_q8_1",
-        "q4k_gemv_sel",
-        "ds41_shexp_gate_up",
-        "q8_0_gemv",
-    ];
-    const SHADOW_HOST: [&str; 3] = ["ds41_hc_pre", "ds41_shexp_gate_up", "q8_0_gemv"];
-    const ENGRAM_KV: [&str; 3] = ["ds41_glue_engram_rows", "q8_0_gemv", "ds41_engram_key_norm"];
     /// A row's own launches before its first layer: the attention piece's
     /// gather of the step words and the embedding broadcast.
     const ROW_START: usize = 2;
@@ -168,7 +157,7 @@ mod gate {
         };
         let mut pass = true;
         if args.structure {
-            pass &= structure(&mut m, &mut heads, &hp)?;
+            pass &= structure(&mut m, &mut heads, &split, &hp)?;
         }
         if args.sets {
             for name in SETS {
@@ -957,9 +946,12 @@ mod gate {
         (kernels, memops, other)
     }
 
+    /// The shadow tables are the step gate's, from the file's types
+    /// ([`ds41_meta::shadow_kernels`], [`ds41_meta::engram_kv_kernels`]).
     fn structure(
         m: &mut Deepseek41Model,
         heads: &mut [Head; PAIR_ROWS],
+        split: &Split,
         hp: &Hparams,
     ) -> Result<bool, GateError> {
         if !bloomery_gpu::hybrid::levers()?.overlap {
@@ -1085,13 +1077,9 @@ mod gate {
             let launches = body
                 .ffn_launches(l)
                 .ok_or_else(|| format!("the ffn piece does not run layer {l}"))?;
-            let mut want: Vec<&str> = if launches > 7 {
-                SHADOW_CARD.to_vec()
-            } else {
-                SHADOW_HOST.to_vec()
-            };
+            let mut want = ds41_meta::shadow_kernels(split, l, launches > 7)?;
             if sites.contains(&(l + 1)) {
-                want.extend(ENGRAM_KV);
+                want.extend(ds41_meta::engram_kv_kernels(split, l + 1)?);
             }
             // Row 0's first go has no wait of row 1 behind it: row 1's layer
             // 0 up to its go runs there too, in the same host leg's shadow.
@@ -1116,22 +1104,32 @@ mod gate {
                 _ => None,
             })
             .collect();
-        let engram_runs = (0..names.len().saturating_sub(ENGRAM_KV.len() - 1))
-            .filter(|&i| {
-                ENGRAM_KV
-                    .iter()
-                    .zip(&names[i..])
-                    .all(|(want, got)| *got == Some(*want))
-            })
-            .count();
-        let in_shadows = shadows
-            .iter()
-            .map(|s| {
-                (0..s.len().saturating_sub(ENGRAM_KV.len() - 1))
-                    .filter(|&i| ENGRAM_KV.iter().zip(&s[i..]).all(|(a, b)| a == b))
-                    .count()
-            })
-            .sum::<usize>();
+        let mut kv_lists: Vec<Vec<&str>> = Vec::new();
+        for &site in sites {
+            let k = ds41_meta::engram_kv_kernels(split, site)?;
+            if !kv_lists.contains(&k) {
+                kv_lists.push(k);
+            }
+        }
+        let mut engram_runs = 0;
+        let mut in_shadows = 0;
+        for kv in &kv_lists {
+            engram_runs += (0..names.len().saturating_sub(kv.len() - 1))
+                .filter(|&i| {
+                    kv.iter()
+                        .zip(&names[i..])
+                        .all(|(want, got)| *got == Some(*want))
+                })
+                .count();
+            in_shadows += shadows
+                .iter()
+                .map(|s| {
+                    (0..s.len().saturating_sub(kv.len() - 1))
+                        .filter(|&i| kv.iter().zip(&s[i..]).all(|(a, b)| a == b))
+                        .count()
+                })
+                .sum::<usize>();
+        }
         let ok_engram = engram_runs == PAIR_ROWS * sites.len() && in_shadows == engram_runs;
         println!(
             "shadow pair: {} goes, row 0 {} and row 1 {} of {} layers match the step's shadow \

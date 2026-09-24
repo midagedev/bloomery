@@ -29,6 +29,7 @@
 
 pub mod iq_tables;
 pub mod quant;
+pub mod v41;
 
 pub use quant::{
     ActivationFormat, GgmlType, QuantError, activation_format, dequant_row, quantize_activations,

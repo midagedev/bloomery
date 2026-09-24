@@ -49,6 +49,10 @@ pub enum Role {
     DenseFfn,
     /// Engram weights every token reads in full: on the layer's card.
     EngramDense,
+    /// An engram gate's gain vectors (`engram_k`, `engram_q`), which the card
+    /// multiplies by and no gemv reads: on the layer's card as f32 values,
+    /// whatever type the file stores them in.
+    EngramGain,
     /// An engram table: on NVMe, a few rows gathered per token.
     EngramTable,
     /// A routed expert stack: split by the expert rule between the layer's card and the host.
@@ -77,6 +81,7 @@ impl fmt::Display for Role {
             Role::SharedExpert => "shexp",
             Role::DenseFfn => "dense_ffn",
             Role::EngramDense => "engram_dense",
+            Role::EngramGain => "engram_gain",
             Role::EngramTable => "engram_table",
             Role::RoutedExperts => "routed",
             Role::TokenEmbedding => "token_embd",
@@ -187,7 +192,7 @@ pub enum Device {
 /// upload by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CardFormat {
-    /// q3_K/q4_K/q6_K: the rows' byte stream as u32 words, zero-padded at
+    /// q3_K/q4_K/q5_K/q6_K: the rows' byte stream as u32 words, zero-padded at
     /// its end to `rows · ceil(words / rows)` words. The kernels address a
     /// row by its byte offset in the stream, so a row need not start on a
     /// word (q6_K at k = 768 is 630 bytes); the padding only makes the
@@ -203,7 +208,8 @@ pub enum CardFormat {
     Q8_0Planes,
     /// f32: the file's values.
     F32,
-    /// bf16 decoded to f32 at load.
+    /// Decoded to f32 at load (`dequant_row`): bf16 by its type, and a
+    /// K-quant that [`CardFormat::of_role`] gives it by its role.
     Bf16AsF32,
     /// bf16 as the file stores it, two values to a little-endian u32 word
     /// (value `2j` in the low half of word `j`), for a kernel that widens on
@@ -223,14 +229,15 @@ impl CardFormat {
     #[must_use]
     pub fn of(ty: GgmlType) -> Option<CardFormat> {
         match ty {
-            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K => Some(CardFormat::KQuant),
+            GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K => {
+                Some(CardFormat::KQuant)
+            }
             GgmlType::Q5_0 => Some(CardFormat::Q5_0),
             GgmlType::Q5_1 => Some(CardFormat::Q5_1),
             GgmlType::Q8_0 => Some(CardFormat::Q8_0Planes),
             GgmlType::F32 => Some(CardFormat::F32),
             GgmlType::BF16 => Some(CardFormat::Bf16AsF32),
             GgmlType::F16
-            | GgmlType::Q5_K
             | GgmlType::MXFP4
             | GgmlType::Q2_K
             | GgmlType::IQ2_XXS
@@ -300,12 +307,36 @@ impl CardFormat {
         })
     }
 
+    /// The format a file tensor of type `ty` in role `role` loads in on a
+    /// card: [`CardFormat::of`], except an engram gain, which the card reads
+    /// as f32 values whatever its type — a K-quant one is decoded at load.
+    #[must_use]
+    pub fn of_role(ty: GgmlType, role: Role) -> Option<CardFormat> {
+        match (role, CardFormat::of(ty)) {
+            (Role::EngramGain, Some(CardFormat::KQuant)) => Some(CardFormat::Bf16AsF32),
+            (_, f) => f,
+        }
+    }
+
+    /// The format an expert stack of type `ty` loads in on a card: the
+    /// formats a card expert kernel reads — [`CardFormat::of`] less q5_K,
+    /// which only a dense gemv reads. A stack of a type with none stays on
+    /// the host.
+    #[must_use]
+    pub fn of_routed(ty: GgmlType) -> Option<CardFormat> {
+        CardFormat::of(ty).filter(|_| ty != GgmlType::Q5_K)
+    }
+
     /// A file tensor of type `ty` can be laid out in this format: the
-    /// format [`CardFormat::of`] names for `ty`, or [`CardFormat::Bf16Raw`]
-    /// for bf16, which only a reader that picks it uses.
+    /// format [`CardFormat::of`] names for `ty`, [`CardFormat::Bf16AsF32`] for
+    /// a K-quant ([`CardFormat::of_role`]'s engram gain), or
+    /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
+    /// uses.
     #[must_use]
     pub fn holds(self, ty: GgmlType) -> bool {
-        CardFormat::of(ty) == Some(self) || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
+        CardFormat::of(ty) == Some(self)
+            || (self == CardFormat::Bf16AsF32 && CardFormat::of(ty) == Some(CardFormat::KQuant))
+            || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
     }
 
     /// Device bytes of `rows` rows of `k` values of file type `ty` in this
@@ -956,7 +987,7 @@ fn card_segment(
     rows: u64,
     experts: Option<ExpertList>,
 ) -> Result<Segment, PlacementError> {
-    let Some(format) = CardFormat::of(t.ty) else {
+    let Some(format) = CardFormat::of_role(t.ty, t.role) else {
         return Err(PlacementError::NoCardFormat {
             name: t.name.clone(),
             ty: t.ty,
@@ -996,7 +1027,8 @@ fn place_whole(
         | Role::FfnNorm
         | Role::SharedExpert
         | Role::DenseFfn
-        | Role::EngramDense => {
+        | Role::EngramDense
+        | Role::EngramGain => {
             layer_of(t, layers)?;
             (card_segment(t, stage, rows_of(t), None)?, t.file_bytes)
         }
@@ -1113,7 +1145,7 @@ fn eligible(card: &Card, routed: &[Vec<usize>], model: &ModelTensors) -> Vec<usi
             !routed[l].is_empty()
                 && routed[l]
                     .iter()
-                    .all(|&i| CardFormat::of(model.tensors[i].ty).is_some())
+                    .all(|&i| CardFormat::of_routed(model.tensors[i].ty).is_some())
         })
         .collect()
 }
@@ -1178,7 +1210,8 @@ fn card_uploads<'m>(
             },
             None => {
                 let layer = layer_of(t, model.layers)?;
-                let Some(f) = CardFormat::of(t.ty).filter(|_| eligible.contains(&layer)) else {
+                let Some(f) = CardFormat::of_routed(t.ty).filter(|_| eligible.contains(&layer))
+                else {
                     continue;
                 };
                 let (rows_per_expert, _) = per_expert(t, model.experts)?;
@@ -1267,7 +1300,7 @@ pub fn plan_with<'a>(
     let mut routed: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
         // A never-loaded tensor's shape is nothing a card must take.
-        if let Some(format) = CardFormat::of(t.ty).filter(|_| t.role != Role::Unused) {
+        if let Some(format) = CardFormat::of_role(t.ty, t.role).filter(|_| t.role != Role::Unused) {
             card_bytes(t, format, rows_of(t))?;
         }
         if t.role == Role::RoutedExperts {

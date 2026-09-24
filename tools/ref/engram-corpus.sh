@@ -42,7 +42,8 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 TOKENIZE=${TOKENIZE:-$IK/build/bin/llama-tokenize}
 DATA=$BLOOMERY_DATA
-V41_DIR=${BLOOMERY_V41_DIR:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8}
+# The V4.1 file set: the deepseek41 profile's choice, exported by tools/box.sh.
+V41_DIR=${BLOOMERY_V41_DIR:?BLOOMERY_V41_DIR unset — run through tools/box.sh, which exports it from the deepseek41 profile}
 
 [ -x "$TOKENIZE" ] || { echo "engram-corpus: no llama-tokenize at $TOKENIZE" >&2; exit 66; }
 

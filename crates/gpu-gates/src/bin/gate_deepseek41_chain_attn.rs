@@ -1777,7 +1777,7 @@ mod gate {
             let mut plan = StepPlan::default();
             planner.plan_into(tokens, pos0, before, &mut plan)?;
             let mut image = StepImage::new(layout.clone(), &window, &yarn)?;
-            let embd = vec![0u16; STEP_TOKENS * hp.n_embd];
+            let embd = vec![0u8; STEP_TOKENS * layout.dims().embd_bytes];
             let engram = vec![0u8; STEP_TOKENS * layout.dims().engram_bytes];
             image.build(&plan, &embd, &engram)?;
             let upload = mutate_image(&layout, image.words(), mutation)?;

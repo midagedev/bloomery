@@ -65,22 +65,9 @@ fn data_dir(v: &Vocabulary) -> PathBuf {
     PathBuf::from(base).join(v.set)
 }
 
+/// V4.1's first shard: [`gguf::v41::model`], the path's owner.
 fn v41_path() -> PathBuf {
-    let dir = std::env::var("BLOOMERY_V41_DIR").unwrap_or_else(|_| {
-        "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8".into()
-    });
-    let mut shards: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{dir}: {e}"))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.to_string_lossy().ends_with(".gguf") && p.to_string_lossy().contains("-00001-of-")
-        })
-        .collect();
-    shards.sort();
-    shards
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("no first shard under {dir}"))
+    PathBuf::from(gguf::v41::model())
 }
 
 fn load(v: &Vocabulary) -> Tokenizer {

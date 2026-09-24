@@ -14,9 +14,6 @@ use gguf::{GgmlType, Gguf, dequant_row};
 
 const MODEL: &str = "/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf";
 
-/// V4.1's first shard, unless `BLOOMERY_V41_MODEL` names another.
-const MODEL_V41: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf";
-
 fn data_dir() -> PathBuf {
     PathBuf::from(
         std::env::var("BLOOMERY_DATA").expect("BLOOMERY_DATA must be set (run via tools/box.sh)"),
@@ -220,22 +217,27 @@ fn read_meta(dir: &Path, tname: &str) -> (String, usize, usize) {
 }
 
 /// V4.1's first shard opens strictly, and each type it holds that this engine
-/// dequantizes on the host side — f32, bf16, q8_0 — reproduces ggml's
-/// `to_float` bit for bit: every one of these conversions is exact, so any
-/// difference is a bug, not rounding. Each requested type must be in the dump
-/// (a type the dump lacks fails here instead of passing with nothing
+/// dequantizes on the host side reproduces ggml's `to_float` bit for bit:
+/// every one of these conversions is exact, so any difference is a bug, not
+/// rounding. The mixed file's are f32, bf16 and q8_0; the public file's are
+/// every type of its first shard (its engram and embedding rows, its gains
+/// and scales are all decoded on the host), from the dump
+/// `ref-v41` + [`gguf::v41::set_suffix_of`]. Each requested type must be in
+/// the dump (a type the dump lacks fails here instead of passing with nothing
 /// compared), with ggml's tensor count for it equal to the loader's.
 #[test]
-#[ignore = "hw: needs V4.1's first shard on the box plus the oracle dump in $BLOOMERY_DATA/ref-v41"]
+#[ignore = "hw: needs V4.1's first shard on the box plus the oracle dump in $BLOOMERY_DATA/ref-v41[_plain]"]
 fn hw_dequant_matches_ggml_v41() {
-    let path = std::env::var("BLOOMERY_V41_MODEL").unwrap_or_else(|_| MODEL_V41.to_string());
+    let path = gguf::v41::model();
     let g = Gguf::open(&path).unwrap_or_else(|e| panic!("strict open of {path}: {e}"));
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for t in g.iter_tensors() {
         *counts.entry(t.ty.name().unwrap()).or_default() += 1;
     }
-    let dir = data_dir().join("ref-v41");
-    let manifest = fs::read_to_string(dir.join("manifest.txt")).expect("read ref-v41/manifest.txt");
+    let set = format!("ref-v41{}", gguf::v41::set_suffix_of(&path));
+    let dir = data_dir().join(&set);
+    let manifest = fs::read_to_string(dir.join("manifest.txt"))
+        .unwrap_or_else(|e| panic!("read {set}/manifest.txt: {e}"));
     let oracle: BTreeMap<&str, (u32, usize)> = manifest
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -248,10 +250,15 @@ fn hw_dequant_matches_ggml_v41() {
         })
         .collect();
 
-    for tname in ["f32", "bf16", "q8_0"] {
+    let want: Vec<&str> = if gguf::v41::set_suffix_of(&path).is_empty() {
+        vec!["f32", "bf16", "q8_0"]
+    } else {
+        counts.keys().copied().collect()
+    };
+    for tname in want {
         let &(type_num, ggml_count) = oracle
             .get(tname)
-            .unwrap_or_else(|| panic!("{tname} is not in ref-v41/manifest.txt"));
+            .unwrap_or_else(|| panic!("{tname} is not in {set}/manifest.txt"));
         let ty = GgmlType::from_u32(type_num);
         assert_eq!(ty.name(), Some(tname), "type {type_num}: name mismatch");
         assert_eq!(

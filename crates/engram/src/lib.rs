@@ -10,10 +10,13 @@
 //! reach the disk; [`reuse::Lru`] is the simulator its hits are held to.
 //!
 //! The tables are the `engram_embd` weights of the blocks the metadata names
-//! (blk.1 and blk.14 in V4.1-Flash): Q8_0 tensors of 256 values per row —
-//! 8 blocks × 34 B = **272 B a row** — and ~384 M rows each, 194.55 GiB
-//! together. They cannot live in RAM beside the weights, and each site is
-//! mapped and read where it lies.
+//! (blk.1 and blk.14 in V4.1-Flash): ~384 M rows of 256 values each, in the
+//! file's block type — one Q3_K block of **110 B a row** in the public
+//! `Q3_K_M` file (84.6 GB together), eight Q8_0 blocks of 272 B in the mixed
+//! one. They cannot live in RAM beside the weights, and each site is mapped
+//! and read where it lies. A row's bytes are the file's; decoding them is the
+//! reader's, so the row type is carried ([`Site::type_id`]) and not
+//! interpreted here.
 //!
 //! Four shapes the caller has to know about:
 //!
@@ -35,14 +38,14 @@
 //! The header comes from [`gguf::inventory_of`], which parses headers only and
 //! never populates a mapping, and this crate maps each shard itself so the
 //! mapping can be `MADV_RANDOM`. The strict reader ([`gguf::Gguf`]) sizes
-//! Q8_0 as well; this crate does not go through it, since the header and its
-//! own mapping are all it needs.
+//! the same types; this crate does not go through it, since the header and
+//! its own mapping are all it needs.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use gguf::{Inventory, LoadError, RawTensorInfo, inventory_of};
+use gguf::{Inventory, LoadError, RawTensorInfo, ggml_type_info, inventory_of};
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 
 pub mod cache;
@@ -51,12 +54,6 @@ pub mod prefetch;
 pub mod reuse;
 
 pub use hash::{Context, Hash};
-
-/// ggml type id of Q8_0, the type both engram tables carry.
-const GGML_TYPE_Q8_0: u32 = 8;
-/// Q8_0 packs 32 values into 34 bytes: one `f16` scale and 32 `i8`.
-const Q8_0_BLOCK: u64 = 32;
-const Q8_0_BLOCK_BYTES: u64 = 34;
 
 /// The tensor one engram site lives in. The block index is metadata, so this is
 /// the only place the name's shape is written down.
@@ -125,12 +122,12 @@ pub enum EngramError {
     WindowSize { want: usize, got: usize },
     #[error("one site's row ids want a {want}-id buffer, got {got}")]
     RowBufferSize { want: usize, got: usize },
-    #[error("{name}: ggml type {ty} is not Q8_0 ({GGML_TYPE_Q8_0})")]
-    NotQ8_0 { name: String, ty: u32 },
+    #[error("{name}: ggml type {ty} has no block size in ggml's size table")]
+    UnsizedType { name: String, ty: u32 },
     #[error("{name}: expected a 2-D tensor, header says dims {dims:?}")]
     NotATable { name: String, dims: Vec<u64> },
-    #[error("{name}: row length {ne0} is not a multiple of the Q8_0 block ({Q8_0_BLOCK})")]
-    UnalignedRow { name: String, ne0: u64 },
+    #[error("{name}: row length {ne0} is not a multiple of its type's block ({block})")]
+    UnalignedRow { name: String, ne0: u64, block: u64 },
     #[error(
         "{name}: {rows} rows x {row_bytes} B = {product} B does not tile the {nbytes} B the header states"
     )]
@@ -184,7 +181,7 @@ fn fadvise_off(n: usize) -> libc::off_t {
     libc::off_t::try_from(n).expect("a span inside a mapping fits an off_t")
 }
 
-/// One engram table: a Q8_0 row store mapped where it lies in its shard.
+/// One engram table: a row store mapped where it lies in its shard.
 pub struct Site {
     name: String,
     path: PathBuf,
@@ -196,6 +193,8 @@ pub struct Site {
     /// the file offset too — which is what makes [`Site::file_offset`] usable
     /// by a reader that never maps the file.
     base: u64,
+    /// The rows' ggml type id.
+    type_id: u32,
     row_bytes: u64,
     rows: u64,
     /// `sysconf(_SC_PAGESIZE)`, read once: the unit `page_span` rounds to.
@@ -209,25 +208,26 @@ impl Site {
         file_len: u64,
         t: &RawTensorInfo,
     ) -> Result<Site, EngramError> {
-        if t.type_id != GGML_TYPE_Q8_0 {
-            return Err(EngramError::NotQ8_0 {
+        let Some((_, block, block_bytes)) = ggml_type_info(t.type_id) else {
+            return Err(EngramError::UnsizedType {
                 name: t.name.clone(),
                 ty: t.type_id,
             });
-        }
+        };
         let [ne0, ne1] = t.dims[..] else {
             return Err(EngramError::NotATable {
                 name: t.name.clone(),
                 dims: t.dims.clone(),
             });
         };
-        if !ne0.is_multiple_of(Q8_0_BLOCK) {
+        if !ne0.is_multiple_of(block) {
             return Err(EngramError::UnalignedRow {
                 name: t.name.clone(),
                 ne0,
+                block,
             });
         }
-        let row_bytes = ne0 / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+        let row_bytes = ne0 / block * block_bytes;
         // The header's own byte count must be exactly `rows` whole rows: this is
         // what says the row stride is the one the ids are multiplied by.
         let nbytes = t.nbytes.unwrap_or(0);
@@ -281,6 +281,7 @@ impl Site {
             file,
             map,
             base,
+            type_id: t.type_id,
             row_bytes,
             rows: ne1,
             page,
@@ -302,7 +303,12 @@ impl Site {
         self.rows
     }
 
-    /// Bytes in one row (272 for a 256-value Q8_0 row).
+    /// The rows' ggml type id, as the header states it.
+    pub fn type_id(&self) -> u32 {
+        self.type_id
+    }
+
+    /// Bytes in one row: 110 for a 256-value Q3_K row, 272 for a Q8_0 one.
     pub fn row_bytes(&self) -> u64 {
         self.row_bytes
     }
@@ -507,9 +513,9 @@ impl Site {
     ///
     /// `posix_fadvise(DONTNEED)` rounds its range **inward** — the start up to
     /// a page, the end down to one — so that it never drops a page the caller
-    /// named only part of. A 272 B row names no whole page, so the un-grown
-    /// call invalidates nothing and the "cold" read that follows is a page-
-    /// cache hit. Growing to whole pages is what makes eviction do anything,
+    /// named only part of. A row of a few hundred bytes names no whole page,
+    /// so the un-grown call invalidates nothing and the "cold" read that
+    /// follows is a page-cache hit. Growing to whole pages is what makes eviction do anything,
     /// and every page in the range holds rows of this table and nothing else,
     /// so the whole page is the right unit. The advice paths round the same way
     /// for the same reason: a row that straddles names both its pages.

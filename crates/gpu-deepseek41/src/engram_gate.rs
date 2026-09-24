@@ -2,9 +2,9 @@
 //! and one shared value, gate the residual update — gate = sigmoid of the
 //! signed square root of the query–key dot, and h += gate ⊗ value.
 //!
-//! `engram_wkv` (the shared `q8_0_gemv`) turns a token's looked-up rows into
-//! `kv`: `hc` keys, one per stream, then the value the streams share, each
-//! [`ROW`] values. Two launches follow it, cut by what they wait for:
+//! `engram_wkv` (the dense gemv of its type, [`crate::dense`]) turns a
+//! token's looked-up rows into `kv`: `hc` keys, one per stream, then the
+//! value the streams share, each [`ROW`] values. Two launches follow it, cut by what they wait for:
 //! - [`EngramGateKernels::enqueue_key_norm`] reads `kv` alone. The rows depend
 //!   on the token id and nothing else, so this launch and the gemv can run
 //!   before the previous layer has finished;

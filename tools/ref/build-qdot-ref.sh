@@ -37,7 +37,9 @@ set -euo pipefail
 # shellcheck source=tools/ref/ref-build-common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
 OUT=${Q3K_OUT:-$REF_BIN}
-Q5K_MODEL=${BLOOMERY_Q5K_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}
+# The V4.1 first shard (the deepseek41 profile's choice, exported by tools/box.sh) unless
+# BLOOMERY_Q5K_MODEL names another.
+Q5K_MODEL=${BLOOMERY_Q5K_MODEL:-${BLOOMERY_V41_MODEL:?BLOOMERY_V41_MODEL unset — run through tools/box.sh, which exports it from the deepseek41 profile}}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 

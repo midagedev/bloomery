@@ -564,6 +564,15 @@ pub struct RefHeader {
     pub other: Vec<String>,
 }
 
+impl RefHeader {
+    /// `# model`: the path of the model file the set was dumped from, one of
+    /// the lines kept verbatim in [`RefHeader::other`].
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.other.iter().find_map(|l| l.strip_prefix("# model\t"))
+    }
+}
+
 /// Where each row sits in its vector, keyed the way readers look rows up:
 /// by name, then `(kind, occurrence)`, and for an `int` row also its layout.
 /// Built once by [`RefManifest::read`] over the rows it parsed; of a
@@ -1071,15 +1080,25 @@ pub fn ref_dir() -> PathBuf {
 
 /// A named dump set's directory: an absolute `set` is the directory
 /// itself, anything else is `<$BLOOMERY_DATA>/<set>` (`ref_cuda_v2`, the
-/// CPU `ref`, ...). Unlike `ref_dir` this consults no `BLOOMERY_REF_*`
-/// variable — only the data directory.
+/// CPU `ref`, ...). A name of the V4.1 family (`ref_deepseek41…`) is the
+/// set of that name for the V4.1 file the tree runs ([`gguf::v41::set`]),
+/// so every reader of a V4.1 set by name follows the file choice. Unlike
+/// `ref_dir` this consults no `BLOOMERY_REF_*` variable — only the data
+/// directory and the V4.1 file.
 pub fn ref_dir_named(set: &str) -> PathBuf {
     let p = PathBuf::from(set);
     if p.is_absolute() {
         return p;
     }
+    if set.starts_with(V41_SET_FAMILY) {
+        return data_dir().join(gguf::v41::set(set));
+    }
     data_dir().join(set)
 }
+
+/// The prefix every V4.1 oracle set name starts with (the profile's
+/// `REF_SET_CPU` and its decode-step sets).
+pub const V41_SET_FAMILY: &str = "ref_deepseek41";
 
 /// The `tensor` rows of the set at `dir` ([`RefManifest::read`]) — the
 /// rows the node readers below look names up in.

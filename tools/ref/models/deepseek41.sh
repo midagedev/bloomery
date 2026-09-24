@@ -8,7 +8,18 @@
 # `grep deepseek41` finds the port's arch, its metadata keys (deepseek41.engram.*), this profile
 # and the oracle set at once.
 #
-#   MODEL           shard 1 of the split set; the loader follows split.count from there.
+#   V41_MODEL       the V4.1 file this tree runs, shard 1 of the split set: BLOOMERY_V41_MODEL, else the
+#                   default below. The one shell owner of the path (gguf::v41 is the Rust one, with the
+#                   same default): tools/box.sh sources this file in every box command, whatever profile
+#                   the command picked, and exports V41_MODEL and V41_DIR as BLOOMERY_V41_MODEL and
+#                   BLOOMERY_V41_DIR, so a script or a test under another profile opens the same file.
+#                   Two files exist: V41_MIXED (attention and shared experts Q8_0, token_embd BF16,
+#                   engram Q8_0) and V41_PUBLIC, the public Q3_K_M set
+#   V41_DIR         the directory of V41_MODEL, where every shard lies
+#   V41_SET_SUFFIX  what the oracle set names below carry for the file V41_MODEL names: _plain for
+#                   V41_PUBLIC, nothing for any other file (the mixed file's sets keep their names). A set
+#                   opened for another file than it was dumped from is caught by its `# model` line
+#   MODEL           shard 1 of the split set, V41_MODEL; the loader follows split.count from there.
 #                   BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored, as in deepseek2.sh
 #   DSPARK_MODEL    the DSpark draft: the copy whose target_layers names the layers whose attention
 #                   input the reference captures. BLOOMERY_DSPARK_MODEL moves it. gate-dspark-read
@@ -18,10 +29,10 @@
 #                   profile's tree; its V4.1 path has only run on the CPU (-ngl 0). The two profiles'
 #                   trees differ, so dump.sh refuses a dump_ref built against the other one ([foreign-lib])
 #   REF_CTX         the one context the reference files are produced at
-#   REF_SET_CPU     ref_deepseek41 under $BLOOMERY_DATA — flat, a sibling of ref, ref_cuda and
-#                   ref_cuda_v2, because every reader resolves a set as $BLOOMERY_DATA/<one name>
-#                   (dump.sh's staging and .old siblings, the gates' BLOOMERY_REF_SET)
-#   REF_SET_CUDA    ref_cuda_deepseek41: a name only — no CUDA set is made for this model
+#   REF_SET_CPU     ref_deepseek41 (+ V41_SET_SUFFIX) under $BLOOMERY_DATA — flat, a sibling of ref,
+#                   ref_cuda and ref_cuda_v2, because every reader resolves a set as $BLOOMERY_DATA/<one
+#                   name> (dump.sh's staging and .old siblings, the gates' BLOOMERY_REF_SET)
+#   REF_SET_CUDA    ref_cuda_deepseek41 (+ V41_SET_SUFFIX): a name only — no CUDA set is made for this model
 #   REF_TOKENS      the oracle's token ids; dump.sh's BLOOMERY_REF_TOKENS overrides them
 #   REF_DUMP_LEASE  1: the dump pages in hundreds of GiB of weights, so dump.sh runs it under the
 #                   machine-wide CPU lease and witnesses it. Not overridable from here.
@@ -64,13 +75,19 @@
 # shellcheck disable=SC2034
 MODEL_NAME=deepseek41
 : "${IK:=/home/user/ik-idxkey}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf}
+V41_MIXED=/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
+V41_PUBLIC=/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
+V41_MODEL=${BLOOMERY_V41_MODEL:-$V41_MIXED}
+V41_DIR=${V41_MODEL%/*}
+V41_SET_SUFFIX=
+[ "$V41_MODEL" != "$V41_PUBLIC" ] || V41_SET_SUFFIX=_plain
+MODEL=${BLOOMERY_REF_MODEL:-$V41_MODEL}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 : "${IK_GPU_FLAGS:=-ngl 999 --n-cpu-moe 34 -t 32 --defer-experts}"
 : "${IK_GPU_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
 : "${REF_CTX:=512}"
-: "${REF_SET_CPU:=ref_deepseek41}"
-: "${REF_SET_CUDA:=ref_cuda_deepseek41}"
+: "${REF_SET_CPU:=ref_deepseek41$V41_SET_SUFFIX}"
+: "${REF_SET_CUDA:=ref_cuda_deepseek41$V41_SET_SUFFIX}"
 # "The capital of France is" under this model's tokenizer: what `$IK/build/bin/llama-tokenize
 # -m $MODEL -p "The capital of France is" --ids --log-disable --no-parse-special` prints for
 # shard 1 (it loads the vocabulary only). Five ids and no BOS: the file sets
@@ -95,6 +112,7 @@ REF_DUMP_ARGS=(--defer-experts)
 # so the indexer's scores and its TOP_K are nodes; `-every-node` runs the prefill under the dumped
 # schedule instead of the fused one (--prefill-every-node), so the caches the step reads carry a
 # dumped prefill's arithmetic — step4-every-node is the variant a batch set's last token can check.
+# Every set name then ends in V41_SET_SUFFIX.
 #   step4  the oracle's five ids: a quiet prefill of 4, the step at position 4, -c 512
 #   d1     the indexer top-k overridden to 64, so the indexer, the row gather and mask_to_idx run at a
 #          short prefix: prefill 301, the step at 301 (a csa group completes there), -c 512
@@ -137,4 +155,5 @@ ref_step_variant() {
     STEP_SET=${STEP_SET}_every_node
     STEP_ARGS+=(--prefill-every-node)
   fi
+  STEP_SET=${STEP_SET}${V41_SET_SUFFIX}
 }

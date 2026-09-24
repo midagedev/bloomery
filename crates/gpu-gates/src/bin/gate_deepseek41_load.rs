@@ -732,12 +732,12 @@ mod gate {
         let dims = body.image().layout().dims().clone();
         println!(
             "check iii: the step image is {} B: {} token(s), streams of ratio {:?}, {} rope values \
-             per table, {} embedding values, {} engram bytes per token",
+             per table, {} embedding bytes, {} engram bytes per token",
             body.image().layout().bytes(),
             dims.tokens,
             dims.stream_ratios,
             dims.rope_dims,
-            dims.n_embd,
+            dims.embd_bytes,
             dims.engram_bytes
         );
         let mut ok = true;
@@ -746,8 +746,8 @@ mod gate {
             let (tokens, pos) = step_of(set)?;
             let at = pos as usize;
             planner.plan_into(&tokens[at..], pos, &tokens[..at], &mut plan)?;
-            let embd: Vec<u16> = (0..dims.n_embd)
-                .map(|i| (i as u16).wrapping_mul(0x9e37) ^ (pos as u16))
+            let embd: Vec<u8> = (0..dims.embd_bytes)
+                .map(|i| (i as u8).wrapping_mul(0x37) ^ (pos as u8))
                 .collect();
             let engram: Vec<u8> = (0..dims.engram_bytes)
                 .map(|i| (i as u8).wrapping_mul(151) ^ (pos as u8))
@@ -880,27 +880,24 @@ mod gate {
         ok
     }
 
-    /// The caller's rows, read back in the layout's packing: two bf16 to a
-    /// word, the first low; four engram bytes to a little-endian word.
-    fn rows_match(set: &str, view: &ImageView<'_>, embd: &[u16], engram: &[u8]) -> bool {
-        let embd_words: Vec<u32> = embd
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&[lo, hi]| u32::from(lo) | (u32::from(hi) << 16))
-            .collect();
-        let engram_words: Vec<u32> = engram
-            .chunks(4)
-            .map(|b| {
-                let mut le = [0u8; 4];
-                le[..b.len()].copy_from_slice(b);
-                u32::from_le_bytes(le)
-            })
-            .collect();
+    /// The caller's rows, read back in the layout's packing: four bytes to a
+    /// little-endian word, the last zero-padded.
+    fn rows_match(set: &str, view: &ImageView<'_>, embd: &[u8], engram: &[u8]) -> bool {
+        let words = |bytes: &[u8]| -> Vec<u32> {
+            bytes
+                .chunks(4)
+                .map(|b| {
+                    let mut le = [0u8; 4];
+                    le[..b.len()].copy_from_slice(b);
+                    u32::from_le_bytes(le)
+                })
+                .collect()
+        };
+        let (embd_words, engram_words) = (words(embd), words(engram));
         line(
             set,
             &format!(
-                "embedding row of {} bf16 and engram rows of {} bytes, back as they went",
+                "embedding row of {} bytes and engram rows of {} bytes, back as they went",
                 embd.len(),
                 engram.len()
             ),

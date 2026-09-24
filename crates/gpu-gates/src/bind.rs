@@ -181,7 +181,7 @@ fn class_of(role: Role) -> &'static str {
         Role::Attention => "attention",
         Role::Router | Role::SharedExpert | Role::RoutedExperts => "experts",
         Role::FfnNorm | Role::DenseFfn => "ffn",
-        Role::EngramDense | Role::EngramTable => "ngram",
+        Role::EngramDense | Role::EngramGain | Role::EngramTable => "ngram",
         Role::TokenEmbedding => "embeddings",
         Role::Head => "output",
         Role::HyperConnection | Role::Unread | Role::Unused => "other",

@@ -27,8 +27,8 @@
 //!    the group's write position, zero in a slot the step does not complete.
 //!    A stream of ratio one pools a token into its own row, so its rows are
 //!    roped at the token's position: that token's YaRN table.
-//! 4. **embedding** — per token, `n_embd` bf16 values, two to a word, the
-//!    first in the low half.
+//! 4. **embedding** — per token, the file's `token_embd` row as the file
+//!    stores it (bf16 values, or Q3_K blocks), four bytes to a word.
 //! 5. **engram** — per token, every site's gathered rows in site order, as the
 //!    table holds them, four bytes to a word.
 
@@ -107,24 +107,35 @@ pub struct ImageDims {
     pub stream_ratios: Vec<u32>,
     /// Values per rope table: `rope.dimension_count`.
     pub rope_dims: usize,
-    /// bf16 values per embedding row.
+    /// Values per embedding row.
     pub n_embd: usize,
+    /// Bytes of one token's embedding row, as the file stores it.
+    pub embd_bytes: usize,
     /// Engram bytes per token: every site's gathered rows.
     pub engram_bytes: usize,
 }
 
 impl ImageDims {
     /// The dims of a step of `tokens` tokens of the model `hp` describes,
-    /// with `planner`'s streams and window, and engram table rows of
-    /// `engram_row_bytes` bytes.
+    /// with `planner`'s streams and window, embedding rows of `token_embd`'s
+    /// type ([`Hparams::rows`]) and engram table rows of `engram_row_bytes`
+    /// bytes. A type with no block size gives an embedding row of 0 bytes,
+    /// which [`ImageLayout::new`] refuses.
     #[must_use]
     pub fn of(hp: &Hparams, planner: &Planner, tokens: usize, engram_row_bytes: usize) -> Self {
+        let ty = hp.rows.token_embd;
+        let embd_bytes = ty
+            .blck_size()
+            .zip(ty.type_size())
+            .filter(|&(b, _)| b > 0 && (hp.n_embd as u64).is_multiple_of(b))
+            .map_or(0, |(b, t)| hp.n_embd / b as usize * t as usize);
         ImageDims {
             tokens,
             window: planner.window(),
             stream_ratios: planner.stream_ratios().to_vec(),
             rope_dims: hp.rope_dims,
             n_embd: hp.n_embd,
+            embd_bytes,
             engram_bytes: hp.engram.layer_ids.len() * hp.engram.rows_per_token() * engram_row_bytes,
         }
     }
@@ -183,6 +194,8 @@ pub struct ImageLayout {
     streams: Vec<StreamLayout>,
     rope_at: usize,
     embd_at: usize,
+    /// Words of one token's embedding row.
+    embd_words: usize,
     engram_at: usize,
     /// Words of one token's engram rows.
     engram_words: usize,
@@ -193,7 +206,7 @@ impl ImageLayout {
     /// The layout of `dims`. A step runs at least one token and no more than
     /// the window has slots — the ring append writes one slot per token, so a
     /// longer step would write a slot twice; the rope tables hold cos/sin
-    /// pairs and the embedding bf16 pairs.
+    /// pairs, and an embedding row is some bytes.
     pub fn new(dims: ImageDims) -> Result<ImageLayout, GpuError> {
         let refuse = |detail: String| GpuError::Shape {
             what: "ImageLayout::new",
@@ -212,9 +225,9 @@ impl ImageLayout {
                 dims.rope_dims
             )));
         }
-        if !dims.n_embd.is_multiple_of(2) {
+        if dims.embd_bytes == 0 {
             return Err(refuse(format!(
-                "an embedding row of {} bf16: two to a word",
+                "an embedding row of {} values in no bytes: its type has no block that tiles it",
                 dims.n_embd
             )));
         }
@@ -241,7 +254,8 @@ impl ImageLayout {
             at += s.group_slots * dims.rope_dims;
         }
         let embd_at = align(at);
-        let engram_at = align(embd_at + m * dims.n_embd / 2);
+        let embd_words = dims.embd_bytes.div_ceil(4);
+        let engram_at = align(embd_at + m * embd_words);
         let engram_words = dims.engram_bytes.div_ceil(4);
         let words = align(engram_at + m * engram_words);
         Ok(ImageLayout {
@@ -249,6 +263,7 @@ impl ImageLayout {
             streams,
             rope_at,
             embd_at,
+            embd_words,
             engram_at,
             engram_words,
             words,
@@ -302,7 +317,13 @@ impl ImageLayout {
     /// Word of token `t`'s embedding row.
     #[must_use]
     pub fn embd_at(&self, t: usize) -> usize {
-        self.embd_at + t * self.dims.n_embd / 2
+        self.embd_at + t * self.embd_words
+    }
+
+    /// Words of one token's embedding row.
+    #[must_use]
+    pub fn embd_words(&self) -> usize {
+        self.embd_words
     }
 
     /// Word of token `t`'s engram rows.
@@ -415,11 +436,11 @@ impl<'a> ImageView<'a> {
             .map(|at| self.span(at + g * dims, dims))
     }
 
-    /// Token `t`'s embedding row, two bf16 to a word.
+    /// Token `t`'s embedding row, four bytes to a word.
     #[must_use]
     pub fn embd(&self, t: usize) -> &'a [u32] {
-        let half = self.layout.dims.n_embd / 2;
-        self.span(self.layout.embd_at + t * half, half)
+        let n = self.layout.embd_words;
+        self.span(self.layout.embd_at + t * n, n)
     }
 
     /// Token `t`'s engram rows, four bytes to a word.
@@ -544,12 +565,12 @@ impl StepImage {
     }
 
     /// Build the image of `plan`'s step, with `embd` (the step's embedding
-    /// rows, `tokens · n_embd` bf16 bits) and `engram` (its engram rows,
+    /// rows, `tokens · embd_bytes` bytes) and `engram` (its engram rows,
     /// `tokens · engram_bytes` bytes). The step's positions must be
     /// consecutive — the window ring's append gives each token its own slot
     /// only then — and every count must fit the layout; a refused build
     /// leaves no step in the image.
-    pub fn build(&mut self, plan: &StepPlan, embd: &[u16], engram: &[u8]) -> Result<(), GpuError> {
+    pub fn build(&mut self, plan: &StepPlan, embd: &[u8], engram: &[u8]) -> Result<(), GpuError> {
         self.pos = None;
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
         let dims = &self.layout.dims;
@@ -584,12 +605,12 @@ impl StepImage {
                 self.layout.streams.len()
             )));
         }
-        if embd.len() != m * dims.n_embd || engram.len() != m * dims.engram_bytes {
+        if embd.len() != m * dims.embd_bytes || engram.len() != m * dims.engram_bytes {
             return Err(refuse(format!(
-                "{} embedding values and {} engram bytes; the step's {m} tokens take {} and {}",
+                "{} embedding bytes and {} engram bytes; the step's {m} tokens take {} and {}",
                 embd.len(),
                 engram.len(),
-                m * dims.n_embd,
+                m * dims.embd_bytes,
                 m * dims.engram_bytes
             )));
         }
@@ -695,23 +716,18 @@ impl StepImage {
         }
     }
 
-    fn rows(&mut self, embd: &[u16], engram: &[u8]) {
+    fn rows(&mut self, embd: &[u8], engram: &[u8]) {
         let dims = &self.layout.dims;
-        let embd_words = &mut self.words[self.layout.embd_at..][..dims.tokens * dims.n_embd / 2];
-        for (w, &[lo, hi]) in embd_words.iter_mut().zip(embd.as_chunks::<2>().0) {
-            *w = u32::from(lo) | (u32::from(hi) << 16);
+        let n = self.layout.embd_words;
+        for (t, row) in embd.chunks_exact(dims.embd_bytes).enumerate() {
+            put_bytes(&mut self.words[self.layout.embd_at + t * n..][..n], row);
         }
         if dims.engram_bytes == 0 {
             return;
         }
         let n = self.layout.engram_words;
         for (t, rows) in engram.chunks_exact(dims.engram_bytes).enumerate() {
-            let dst = &mut self.words[self.layout.engram_at + t * n..][..n];
-            for (w, b) in dst.iter_mut().zip(rows.chunks(4)) {
-                let mut le = [0u8; 4];
-                le[..b.len()].copy_from_slice(b);
-                *w = u32::from_le_bytes(le);
-            }
+            put_bytes(&mut self.words[self.layout.engram_at + t * n..][..n], rows);
         }
     }
 }
@@ -719,6 +735,16 @@ impl StepImage {
 /// `n` as an image word.
 fn count(n: usize, refuse: &impl Fn(String) -> GpuError) -> Result<u32, GpuError> {
     u32::try_from(n).map_err(|_| refuse(format!("{n} passes u32")))
+}
+
+/// `bytes` into `dst`, four to a little-endian word, the last word
+/// zero-padded.
+fn put_bytes(dst: &mut [u32], bytes: &[u8]) {
+    for (w, b) in dst.iter_mut().zip(bytes.chunks(4)) {
+        let mut le = [0u8; 4];
+        le[..b.len()].copy_from_slice(b);
+        *w = u32::from_le_bytes(le);
+    }
 }
 
 /// `values`' bits into the front of `dst`.
@@ -745,6 +771,7 @@ mod tests {
             stream_ratios: vec![2, 1],
             rope_dims: ROPE_DIMS,
             n_embd: N_EMBD,
+            embd_bytes: 2 * N_EMBD,
             engram_bytes: ENGRAM_BYTES,
         })
         .expect("the test dims make a layout");
@@ -795,7 +822,7 @@ mod tests {
         planner
             .plan_into(&[7, 9], 300, &[1, 2, 3], &mut plan)
             .expect("a plan of two tokens");
-        let (embd, engram) = (vec![0u16; 2 * N_EMBD], vec![0u8; 2 * ENGRAM_BYTES]);
+        let (embd, engram) = (vec![0u8; 2 * 2 * N_EMBD], vec![0u8; 2 * ENGRAM_BYTES]);
         let mut img = image(2);
         img.build(&plan, &embd, &engram)
             .expect("consecutive positions build");

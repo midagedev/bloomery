@@ -18,10 +18,9 @@ use engram::prefetch::{FillMode, Prefetcher};
 use engram::reuse::{Lru, read_ids};
 use engram::{Context, Engram, EngramError, Hash, SeededRows, Site};
 
-/// The split set the gates open: `$BLOOMERY_V41_DIR`, or the box's default.
+/// The split set the gates open: the directory of [`gguf::v41::model`].
 fn model_dir() -> String {
-    std::env::var("BLOOMERY_V41_DIR")
-        .unwrap_or_else(|_| "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8".into())
+    gguf::v41::dir().display().to_string()
 }
 
 fn open() -> Engram {
@@ -70,15 +69,17 @@ fn sample(site: &Site, n: usize) -> Vec<u32> {
     const PAGE: u64 = 4096;
     let mut ids = vec![0u32, (site.rows() - 1) as u32];
 
-    // Row starts land on a lattice: gcd(272, 4096) = 16, so the residues repeat
-    // with period 4096/16 = 256 in the id. One of them straddles.
-    let straddler = (0..256u32)
+    // Row starts land on a lattice: with stride s the residues mod the page
+    // repeat with period 4096/gcd(s, 4096) in the id (256 for Q8_0's 272 B,
+    // 2,048 for Q3_K's 110 B). One of them straddles.
+    let straddler = (0..4096u32)
         .find(|&r| site.file_offset(r) % PAGE + site.row_bytes() > PAGE)
         .unwrap_or_else(|| {
             panic!(
-                "{}: no row in the first 256 straddles a page — the row stride is \
-                 not the 272 B lattice this gate assumes",
-                site.name()
+                "{}: no row in the first 4,096 straddles a page — the row stride {} B \
+                 does not lattice the page as this gate assumes",
+                site.name(),
+                site.row_bytes()
             )
         });
     ids.push(straddler);
@@ -94,7 +95,7 @@ fn sample(site: &Site, n: usize) -> Vec<u32> {
 ///
 /// This is the whole claim of the IO half: a row reached through the mmap is
 /// the same bytes a plain `pread` returns **at the offset the GGUF header
-/// gives** — `data_base + tensor.offset + id x 272`, recomputed here from the
+/// gives** — `data_base + tensor.offset + id x stride`, recomputed here from the
 /// header rather than asked of the crate. Asking the crate would compare the
 /// mapping against itself: a stride or base that is wrong on both sides agrees
 /// with itself, and a one-byte shift of `Site::file_offset` passes.
@@ -116,7 +117,7 @@ fn hw_engram_rows_match_pread() {
         let ids = sample(site, 128);
         let fd = File::open(site.path()).unwrap();
         // The reference offset, derived here: header data base + the tensor's
-        // own offset, and a stride of ne[0]/32 Q8_0 blocks of 34 B.
+        // own offset, and a stride of ne[0]/block blocks of ggml's block size.
         let inv = gguf::inventory_of(site.path()).unwrap();
         let t = inv
             .tensors
@@ -124,7 +125,9 @@ fn hw_engram_rows_match_pread() {
             .find(|t| t.name == site.name())
             .expect("the site came from this shard's header");
         let base = inv.data_base + t.offset;
-        let stride = t.dims[0] / 32 * 34;
+        let (_, block, block_bytes) =
+            gguf::ggml_type_info(t.type_id).expect("an engram table type ggml sizes");
+        let stride = t.dims[0] / block * block_bytes;
 
         let mut want = vec![0u8; stride as usize];
         let mut borrowed: Vec<&[u8]> = Vec::new();
@@ -210,15 +213,24 @@ fn hw_engram_row_stride_tiles_the_tensor() {
             .iter()
             .find(|t| t.name == site.name())
             .expect("the site came from this shard's header");
-        let nbytes = t.nbytes.expect("Q8_0 is in ggml's size table");
+        let nbytes = t.nbytes.expect("the table's type is in ggml's size table");
 
         assert_eq!(t.dims.len(), 2, "{}: engram is a 2-D table", site.name());
         assert_eq!(site.rows(), t.dims[1], "{}: row count", site.name());
-        // 256 values a row, Q8_0 = 32 values in 34 B.
+        assert_eq!(site.type_id(), t.type_id, "{}: row type", site.name());
+        // 256 values a row. The two block types the V4.1 files carry, from
+        // ggml-common.h's static_asserts, written here rather than read from
+        // the size table the crate reads: Q8_0 = 32 values in 34 B, Q3_K = 256
+        // values in 110 B.
+        let (block, block_bytes) = match t.type_id {
+            8 => (32, 34),
+            11 => (256, 110),
+            ty => panic!("{}: ggml type {ty} is not a V4.1 table type", site.name()),
+        };
         assert_eq!(
             site.row_bytes(),
-            t.dims[0] / 32 * 34,
-            "{}: row stride from the Q8_0 block",
+            t.dims[0] / block * block_bytes,
+            "{}: row stride from the type's block",
             site.name()
         );
         assert_eq!(

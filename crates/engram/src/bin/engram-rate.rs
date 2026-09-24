@@ -76,7 +76,6 @@ use engram::prefetch::{FillMode, Prefetcher};
 use engram::reuse::read_ids;
 use engram::{Context, Engram, Faults, Hash, SeededRows, Site, faults, faults_thread, read_bytes};
 
-const DEFAULT_DIR: &str = "/models/DeepSeek-V4.1-Flash-Q3_K_M-engramQ8-tokembdBF16-attnQ8";
 /// The arm that needs a real stream; it runs only when `--arms` names it.
 const CACHED: &str = "helper-cached";
 const ARMS: [&str; 9] = [
@@ -112,7 +111,7 @@ fn usage() -> String {
 
 fn parse() -> Result<Args, String> {
     let mut a = Args {
-        dir: DEFAULT_DIR.to_string(),
+        dir: gguf::v41::dir().display().to_string(),
         rows_per_token: 48,
         tokens: 2000,
         seed: 7,
