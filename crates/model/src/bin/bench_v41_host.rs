@@ -66,6 +66,15 @@
 //! later rounds keep that count. Every dispatch is timed on its own too, by
 //! kind and weight bytes: bytes per dispatch is the variable this bench is
 //! for.
+//!
+//! A multi-row arm's rows read disjoint experts unless the arm names a union
+//! ratio (`u<r>` on the arm, or `--union r` for every multi-row arm without
+//! one): then each layer draws `round(r × n_host × rows)` distinct working-set
+//! experts and the rows walk that pool in turn, `n_host` consecutive entries
+//! each, so the rows share experts the way consecutive positions of a verify
+//! pass do and every drawn expert is read by at least one row. The dispatches
+//! still stream every row's slots; `union_bytes_per_token` is the file bytes
+//! a pass that read each distinct expert once would read.
 
 use std::ffi::{c_int, c_void};
 use std::ops::Range;
@@ -116,7 +125,10 @@ const ENGINE_DISPATCHES: usize = 2;
 
 const USAGE: &str = "usage: bench_v41_host --check
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
-  an arm is <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>]; the default is engine:6,engine:5,engine:3,per-matrix:6
+       bench_v41_host --time ... [--union R]
+  an arm is <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]; the default is engine:6,engine:5,engine:3,per-matrix:6
+  u<r> (or --union R for every multi-row arm without its own): the rows share experts, the layer's distinct experts
+  are round(r x n_host x rows), 1/rows <= r <= 1
   the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the deepseek41 profile)";
 
 // The page bookkeeping's libc calls; `std` already links libc on this target.
@@ -1490,61 +1502,109 @@ struct Arm {
     shape: Shape,
     n_host: usize,
     /// Tokens per step (probe): each row reads its own activation column
-    /// and `n_host` experts no other row of the layer reads.
+    /// and `n_host` experts, shared with other rows only under `union`.
     rows: usize,
+    /// The union ratio the arm asked for, `None` for disjoint rows.
+    ratio: Option<f64>,
+    /// Distinct experts per layer and token: `n_host * rows` for disjoint
+    /// rows, else `round(ratio * n_host * rows)`.
+    union: usize,
 }
 
 impl Arm {
-    fn parse(s: &str) -> Result<Arm, String> {
+    /// One arm of `--arms`; `union` is `--union`'s ratio, taken by a
+    /// multi-row arm that names none of its own.
+    fn parse(s: &str, union: Option<f64>) -> Result<Arm, String> {
         let (name, n) = s.split_once(':').ok_or_else(|| {
             format!(
-                "arm {s:?}: want <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>]"
+                "arm {s:?}: want <engine|engine-sep|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]"
             )
         })?;
         let shape = Shape::ALL
             .into_iter()
             .find(|sh| sh.name() == name)
             .ok_or_else(|| format!("arm {s:?}: unknown shape {name:?}"))?;
-        let (n, rows) = match n.split_once('x') {
-            Some((n, r)) => (
-                n,
-                r.parse::<usize>()
-                    .map_err(|_| format!("arm {s:?}: rows {r:?} is not a count"))?,
-            ),
-            None => (n, 1),
+        let (n, rows, own) = match n.split_once('x') {
+            Some((n, r)) => {
+                let (r, own) = match r.split_once('u') {
+                    Some((r, u)) => (
+                        r,
+                        Some(
+                            u.parse::<f64>()
+                                .map_err(|_| format!("arm {s:?}: union {u:?} is not a ratio"))?,
+                        ),
+                    ),
+                    None => (r, None),
+                };
+                let rows = r
+                    .parse::<usize>()
+                    .map_err(|_| format!("arm {s:?}: rows {r:?} is not a count"))?;
+                (n, rows, own)
+            }
+            None => (n, 1, None),
         };
         let n_host: usize = n
             .parse()
             .map_err(|_| format!("arm {s:?}: n_host {n:?} is not a count"))?;
-        if n_host == 0 || rows == 0 || n_host * rows > WORKING_SET {
-            return Err(format!(
-                "arm {s:?}: n_host and rows must be positive, n_host x rows at most {WORKING_SET}"
-            ));
+        if n_host == 0 || rows == 0 {
+            return Err(format!("arm {s:?}: n_host and rows must be positive"));
         }
         if shape.one_row() && rows > 1 {
             return Err(format!("arm {s:?}: the {name} shape runs one row"));
+        }
+        let slots = n_host * rows;
+        let ratio = if rows > 1 { own.or(union) } else { None };
+        let union = match ratio {
+            None => slots,
+            // `1/rows` written as a decimal lands a hair under it; the pool
+            // still holds one row.
+            Some(r) if r.is_finite() && r * rows as f64 >= 1.0 - 1e-6 && r <= 1.0 => {
+                ((r * slots as f64).round() as usize).max(n_host)
+            }
+            Some(r) => {
+                return Err(format!(
+                    "arm {s:?}: union {r} is not in [1/{rows}, 1] — a row reads n_host distinct experts"
+                ));
+            }
+        };
+        if union > WORKING_SET {
+            return Err(format!(
+                "arm {s:?}: {union} distinct experts per layer, the working set holds {WORKING_SET}"
+            ));
         }
         Ok(Arm {
             shape,
             n_host,
             rows,
+            ratio,
+            union,
         })
     }
 
     fn label(self) -> String {
         let shape = self.shape.name();
-        if self.rows == 1 {
-            format!("{shape}:{}", self.n_host)
-        } else {
-            format!("{shape}:{}x{}", self.n_host, self.rows)
+        match (self.rows, self.ratio) {
+            (1, _) => format!("{shape}:{}", self.n_host),
+            (rows, None) => format!("{shape}:{}x{rows}", self.n_host),
+            (rows, Some(r)) => format!("{shape}:{}x{rows}u{r}", self.n_host),
         }
     }
 
-    /// File bytes one token of this arm reads.
+    /// File bytes one token of this arm's dispatches stream: every row's
+    /// slots, a shared expert once per row that reads it.
     fn bytes_per_token(self, layers: &[Layer<'_>]) -> u64 {
         layers
             .iter()
             .map(|l| (self.n_host * self.rows) as u64 * l.expert_bytes())
+            .sum()
+    }
+
+    /// File bytes of one token's distinct experts: what a pass that read
+    /// each once would read.
+    fn union_bytes_per_token(self, layers: &[Layer<'_>]) -> u64 {
+        layers
+            .iter()
+            .map(|l| self.union as u64 * l.expert_bytes())
             .sum()
     }
 
@@ -1588,6 +1648,7 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
                 arms: Vec::new(),
             };
             let mut arms = DEFAULT_ARMS.to_string();
+            let mut union = None;
             while let Some(flag) = it.next() {
                 let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
                 let bad = || format!("{flag} {value:?} is not a valid value");
@@ -1596,6 +1657,7 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
                     "--seconds" => opts.seconds = value.parse().map_err(|_| bad())?,
                     "--warmup" => opts.warmup = value.parse().map_err(|_| bad())?,
                     "--arms" => arms = value.to_string(),
+                    "--union" => union = Some(value.parse::<f64>().map_err(|_| bad())?),
                     other => return Err(format!("unknown option {other:?}")),
                 }
             }
@@ -1603,7 +1665,10 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
             if opts.rounds == 0 || opts.warmup == 0 || !seconds_ok {
                 return Err("--rounds, --warmup and --seconds must be positive".to_string());
             }
-            opts.arms = arms.split(',').map(Arm::parse).collect::<Result<_, _>>()?;
+            opts.arms = arms
+                .split(',')
+                .map(|a| Arm::parse(a, union))
+                .collect::<Result<_, _>>()?;
             Ok(Mode::Time(opts))
         }
         _ => Err("want --check or --time".to_string()),
@@ -1635,12 +1700,16 @@ struct ArmRound {
 }
 
 impl Bench<'_> {
-    /// The working-set slots token `t` of `round` reads, per layer.
-    fn draw(&self, n_host: usize, round: usize, t: usize) -> Vec<Vec<usize>> {
+    /// The working-set slots token `t` of `round` reads, per layer: `arm.rows`
+    /// runs of `arm.n_host`, walking a pool of `arm.union` distinct slots in
+    /// turn — the pool itself, in draw order, when the rows are disjoint.
+    fn draw(&self, arm: Arm, round: usize, t: usize) -> Vec<Vec<usize>> {
+        let slots = arm.n_host * arm.rows;
         (0..self.layers.len())
             .map(|l| {
                 let key = [KEY_TOKEN, round as u64, t as u64, l as u64];
-                distinct(&mut Rng::new(&key), n_host, WORKING_SET)
+                let pool = distinct(&mut Rng::new(&key), arm.union, WORKING_SET);
+                (0..slots).map(|i| pool[i % pool.len()]).collect()
             })
             .collect()
     }
@@ -1696,7 +1765,7 @@ impl Bench<'_> {
         let mut scratch = Tally::default();
         let mut warm_ms = Vec::with_capacity(warmup);
         for t in 0..warmup {
-            let ids = self.draw(arm.n_host * arm.rows, round, t);
+            let ids = self.draw(arm, round, t);
             let t0 = Instant::now();
             self.token(arm, &ids, t, &mut blocks, &mut scratch)?;
             warm_ms.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -1711,7 +1780,7 @@ impl Bench<'_> {
         let (min0, maj0) = faults()?;
         let d0 = threads::pool().stats().dispatches;
         for t in warmup..warmup + tokens {
-            let ids = self.draw(arm.n_host * arm.rows, round, t);
+            let ids = self.draw(arm, round, t);
             let t0 = Instant::now();
             self.token(arm, &ids, t, &mut blocks, &mut tally)?;
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -1754,18 +1823,21 @@ fn time(bench: &Bench<'_>, opts: &TimeOpts, lease: bool) -> Result<(), BenchErro
             let r = bench.round(arm, round, opts.warmup, tokens[a], target_ms)?;
             tokens[a] = Some(r.ms.len());
             let bytes = arm.bytes_per_token(&bench.layers);
+            let union_bytes = arm.union_bytes_per_token(&bench.layers);
             let (min, mean, max) = spread(&r.ms);
             let ok =
                 lease && r.resident_before == total && r.resident_after == total && r.majflt == 0;
             println!(
                 "time threads={threads} round={}/{} arm={} tokens={} warmup={} ms_min={min:.3} ms_mean={mean:.3} ms_max={max:.3} \
-                 host_bytes_per_token={bytes} gbps_mean={:.2} gbps_best={:.2} dispatches_per_token={:.2} expected={} \
+                 host_bytes_per_token={bytes} union_per_layer={} union_bytes_per_token={union_bytes} \
+                 gbps_mean={:.2} gbps_best={:.2} dispatches_per_token={:.2} expected={} \
                  minflt={} majflt={} resident_before={}/{total} resident_after={}/{total} lease={} admissible={}",
                 round + 1,
                 opts.rounds,
                 arm.label(),
                 r.ms.len(),
                 opts.warmup,
+                arm.union,
                 bytes as f64 / mean / 1e6,
                 bytes as f64 / min / 1e6,
                 r.dispatches as f64 / r.ms.len() as f64,
