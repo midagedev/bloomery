@@ -181,3 +181,19 @@
 
 - V4.1 `--place gate` 게이트는 배치가 카드 이름 "3090"을 박고 있어 `BLOOMERY_GATE_CARD=any`로도 3090에서만 돈다. A6000에서 `BLOOMERY_CARD_BUDGET`(3090의 usable 바이트)으로 같은 배치를 슬롯 단위로 흉내 내면 이 게이트들도 두 카드로 나뉜다 — 게이트가 핀하는 대상이 바뀌므로 `nanmoe`(그 배치의 결함) 착륙 뒤에 연다(S–M).
 - 레시피별 카드 태그(`any`로 떠도 되는 게이트: V2-Lite e2e·p6·chain-ffn, qwen3moe, vision, kv, dspark-kv)는 파동이 착륙한 뒤 justfile에서 한 번에 단다(지금은 `BLOOMERY_BOX_ENV`로 넘긴다).
+
+## DSpark 드래프트 (dsgraphb 보고, 2026-09-24)
+
+- **`gate_dspark_graph`의 BAND_GAIN 8**: ik 규칙에 routed clamp가 잘못 켜져 있던 동안 ρ/band 최대 0.70으로 그 불일치를 못 잡았다. 올바른 규칙에서 594쌍의 ρ/ρ̂ 최대는 1.04이고, gain 3이었다면 가장 나쁜 clamp 행 다섯 중 넷을 잡았다. 지금 막을 결함은 없으니 재핀하지 않는다 — 블록 3–11도 탭으로 판정하게 될 때, clamp를 다시 켠 빨강을 FAIL-first로 삼아 다시 정한다.
+- **알려진 빈틈**: 엔진이 도는 규칙(기준 규칙, clamp 있음)은 두 ik 결함이 닿지 않는 행에서만 ik와 대조된다. clamp 경로에는 끝에서 끝까지 오라클이 없고 `gate-gpu-dspark-experts`의 호스트 규칙 핀뿐이다. 그 호스트 규칙도 silu(g)를 자르고 model.py는 g를 자른다(`crates/gpu-deepseek41/src/experts.rs:99`, 차이 ≤ 4.5e-5 [유도], XS). "우리 드래프트가 ik보다 낫다"를 수락 수로 말하려면 이 빈틈부터 닫는다.
+- **업스트림 후보(MUL-7, ik — 지금은 PR 안 냄: ik PR은 하나만 열어 둔다)**: ① ik 드래프트에 SwiGLU clamp가 없다 — `src/llama-model.h:665` `swiglu_limit()`가 `llm_arch_is_dsv4(arch)`일 때만 값을 주는데 드래프트 파일 arch는 `dflash`이고, 한계 값은 hparams가 읽는다(`src/llama-hparams.cpp:1940`, `1976–1978`). model.py는 routed·shared 모두 자른다(879, 887행). 코드 독해 가설 — ik 쪽 FAIL-first(읽은 한계 vs 적용된 0)는 S 라운드, 그 뒤 draft PR. ② 블록 인과 마스크 — `src/llama-dflash.cpp:718`, `746`이 `causal_attn`을 따르는데 model.py와 exllamav3(`architecture/dflash.py:305–307`)는 비인과다. ik가 의도했을 수 있어 트리아지에 둔다. 수락 수는 35개 초안에 ik 18, 기준 규칙 20 — n이 작아 차이를 주장하지 않는다.
+- 스펙 밖 개선 지점: `draft/block.rs:569`·`:648` 라우터와 shared gate_up이 행마다 런치한다 — 다행 런치면 w=5에서 112개 중 24개가 준다(dshc·dsmx 커널, S–M). `block.rs:599` concat 플랜이 3m·m 쌍을 계산하고 3m만 쓴다 — `experts_mxfp4.rs:30–33`의 dedup 플랜으로(M). `crates/gpu/src/head.rs:94` `Head::with_m`이 gain과 투영을 한 `Weights`에서 받아 `draft/head.rs`가 세 런치를 다시 쓴다(R14, S). `experts_mxfp4.rs:713` `MxAct`/`Q8Act` 열 수 고정 → 폭별 버퍼 다섯(S). `block.rs:796` `stage`가 f32 네 스트림을 올린다 — bf16 한 행을 올려 카드에서 넓히기(phase C, S). `gate_dspark_graph.rs:1152` tie 밴드가 walk 뒤쪽에서 넓어진다(S), `:1328` `run()` 214줄(R12, S). justfile `ptx-scan`의 `FEATURES`는 `--features` 긴 옵션만 받는다 — 위치 인자면 빈 바이너리를 스캔해 `scan=failed`(XS).
+
+## 링 섀도를 호스트로 (shadowhost 보고, 2026-09-24)
+
+- **리드 A/B 대기**(A6000, 다음 측정 자리): A = base 무예산(섀도 VRAM), B = 새 트리 @ `BLOOMERY_CARD_BUDGET=49610227712`(섀도 위치만 다름), C = 새 트리 무예산(+80 experts). B−A가 append의 호스트 쓰기 비용(40 × 1 KB posted write, 완료 지연 상한 미지), C−A가 순이득. 기대 ≤ ~0.5 % [유도] — A/A 팔 필수, 라운드 많이. base 빌드는 박스 `~/repo/bloomery-shadowhost-base`.
+- pinned 매핑이 카드 메모리 2 MiB를 가져간다(`cuMemGetInfo`, 프로브 `scratchpad/shadowhost/pinprobe2.py`) — 배치의 카드 항에 없다(XS, 여유 안이라 지금은 안 막는다). 프로브는 `tools/`로 올릴 후보(S).
+- `crates/gpu/src/hybrid.rs:681-706`, `798-823` `Boundary` 창을 반납하지 않아 `Arc<CudaContext>` 참조가 샌다 — `DeviceTensor::release`로(S). `crates/model/src/arch/deepseek2/scratch.rs:160-169` `param_view` 같은 누수(S).
+- `bloomery_serve_ds41.rs:182`·`bloomery_chat.rs:266` plan/load 줄에 `host_shadow`/`shadow=host`가 없다(XS). `chain/attn.rs:120-122` `AttnIo.shadow` 문서에 "호스트 메모리"(XS).
+- 링을 k 슬롯 과할당하면 k 이하의 cut은 복원이 필요 없다(exllamav3 `cache/dsa.py:24-27`의 `guaranteed_rollback`; k=768이면 ≈30 MB [유도]) — geometry·커널 변경(M).
+- 리스 대기 헬퍼 스크립트(체인 실수 방지 — 이번 라운드가 `| tail -1 &&`로 잡힌 리스 아래 clippy를 한 번 돌렸다)(S).
