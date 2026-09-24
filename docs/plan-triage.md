@@ -235,3 +235,10 @@
 - **먼저 잴 것(리드, 임대 ~8분)**: `just time-cpu-v41-host --threads 32 --rounds 3 --seconds 24 --warmup 3 --arms engine:3,engine:3x4,engine:3x4u0.75,engine-sep:3x4u0.75,engine:3x3` — 오늘 행별 호출이 두 번째 읽기를 L3에서 받는지(`3x4u0.75` 대 `3x4`), 합집합 서비스의 바이트 대리값(`3x3`).
 - **필요한 것(M)**: handoff에 k 활성 열, `EXPERTS_INTO_MAX` ≥ 합집합(k 6에서 최대 36), distinct expert마다 m = k 열 커널(`ops.rs:410` `quantize_col`은 이미 열별), 행별 가중 scatter, `MAX_ROWS ≥ 6`과 층마다 모든 행의 go를 기다리는 동기화 — 어긋난 2행 설계와 부딪힌다.
 - 곁가지(보고): `bench_v41_host.rs:1612` `dispatches_per_token`이 16쌍 defer spill을 모델링하지 않는다(S); `hotlist-384.txt`는 in-sample이라 LOO에서 행당 호스트 슬롯 +19–56 — 목록 학습·평가 분리(S, E17과 겹침).
+
+## ik의 V4/V4.1 weights_sum 0/0 (iknan 보고, 2026-09-24 — PR 보류, MUL-7 후보)
+
+- **ik의 일반 추론은 안전하다.** SUM_ROWS→DIV가 퓨전되면 CPU `iqk_sumrows_div`(`iqk_cpu_ops.cpp:160`)와 CUDA `k_sum_rows_div_f32`(`sumrows.cu:51`)가 `sum > 0 ? 1/sum : 0`으로 막는다. NaN은 퓨전이 안 돌 때만 난다 — 모든 노드를 부르는 eval 콜백(우리 `dump_ref`), `-cuda fusion=0`[유도], 두 노드 사이 그래프 분할. 무패치 main에서 기본 배치·`-no-fmoe`·prefill+step 넷 다 유한, per-node 콜백만 `ffn_moe_weights_sum-35: found nan for i1 = 315`(rc 134, 혼합·공개 파일 둘 다). 우리 엔진은 퓨전 없이 나누므로 일반 경로에서 밟았다(`88de92e`로 닫음).
+- **패치는 한 줄이 아니다.** guard 분기(`llama-build-context.cpp:1567–1570`, upstream `8699d8aa`)에 DEEPSEEK4/41만 넣으면 SCALE 노드가 CPU 퓨전을 깨 V4 CPU 비트가 전부 바뀐다(316행, max|Δ| 8.3). 그래서 CPU에 SUM_ROWS→SCALE→DIV 퓨전을 더한 판(`fix2`)은 기본 경로 로짓·PPL·KLD base가 바이트 동일이지만, BailingMoE2/3·Step-3.5의 CPU 비트를 바꾼다(모델 없음, 재지 않음).
+- **판단: 지금 올리지 않는다.** 사용자 규칙(메인테이너가 감당할 만큼, 바로 올리는 것은 한두 줄 크래시·정확성뿐)에 비춰 디버그 경로 전용 NaN + 다른 아키 비트 변화 + stock 도구로 재현 불가(`llama-eval-callback`은 316 id를 356토큰으로 쪼갠다)는 즉시 PR 요건 밖이다. 대안: 열린 PR이 줄었을 때 이슈 하나로 알리거나, V4 쪽 다른 수정과 묶는다. 근본 대안 `log1pf(expf(x))`(≈ −87까지 0 아님)는 모든 비트를 바꿔 제안하지 않는다.
+- 증거: 박스 `/home/user/ik-nanfix`(패치, 커밋 없음), `/home/user/ik-nanfix-work`(재현기 `ids_eval2.cpp`, 로그), 세션 스크래치 `iknan/`(`fix2.diff`, PR 초안 112단어). 곁가지: ik `llama-perplexity`가 청크마다 `dsv4_build_raw_mask_view: Oops(KQ_mask_swa). mask is 1024 x 512` 출력(rc 0, 별건 후보).
