@@ -16,6 +16,11 @@
 //! neutral partial (`m = −inf`, `s = 0`) and reads no key row, and the merge
 //! stops at the row's last live segment.
 //!
+//! A live count of zero or past the cache has no defined attention. The
+//! segment passes and the merge read the count through one rule
+//! ([`live_keys`]): such a row reads no key, and the merge raises
+//! [`FaultSite::KeyCount`] and writes NaN into the row's output.
+//!
 //! Reduction structure, the fixed contract of this kernel (reruns and
 //! replays are bit-identical; bit identity with the reference is not
 //! claimed — its exponential is another function):
@@ -45,6 +50,7 @@
 //! pattern reaches no result.
 
 use crate::GpuError;
+use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{
     MERGE_BATCH, MMA_K, MMA_NTILE, MMA_ROWS, dev_exp, f32_to_f16_bits, half_bits_to_f32,
     mma_row_words, online_fold,
@@ -123,6 +129,15 @@ pub fn partials_v_len(m: usize, n_head: usize, ctx: usize) -> usize {
 #[must_use]
 pub fn partials_ms_len(m: usize, n_head: usize, ctx: usize) -> usize {
     m * n_head * segments_for(ctx) * 2
+}
+
+/// A row's live key count as every kernel here reads it: `count` when it
+/// lies in `1..=ctx`, else 0 — a refused row, whose segments are all
+/// neutral and whose merge raises [`FaultSite::KeyCount`].
+#[inline(always)]
+fn live_keys(count: u32, ctx: usize) -> usize {
+    let c = count as usize;
+    if c > ctx { 0 } else { c }
 }
 
 /// One tile's online-softmax step for warp `w`'s head, lane `lane` holding
@@ -207,9 +222,9 @@ mod flash_gqa_kernels {
     /// `[seg · seg_keys, min((seg + 1)·seg_keys, n_keys))` of key head `kh`
     /// for row `t`'s query heads `kh·GROUP ..`; warp `w` is query head `h =
     /// kh·GROUP + w`, whose partials land at index `(t·n_head + h)·segs +
-    /// seg`. `n_keys` is `n_keys_buf[t]`, clamped to `ctx`. The rows of one
-    /// segment are neighbouring blocks, so they read its key rows while they
-    /// are in L2.
+    /// seg`. `n_keys` is [`live_keys`] of `n_keys_buf[t]`: a refused row's
+    /// segments are all neutral. The rows of one segment are neighbouring
+    /// blocks, so they read its key rows while they are in L2.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -221,6 +236,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
+            segs * seg_keys >= ctx,
             q.len() >= m * n_kv * 8 * 128,
             kc.len() >= n_kv * ctx * 128,
             vc.len() >= n_kv * ctx * 128,
@@ -266,7 +282,7 @@ mod flash_gqa_kernels {
         let idx = (t * n_head + h) * n_seg + seg;
         let ctx = ctx as usize;
         // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
-        let limit = (unsafe { *n_keys_buf.get_unchecked(t) } as usize).min(ctx);
+        let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
         let lo = seg * seg_keys as usize;
         if lo >= limit {
             if lane == 0 {
@@ -418,6 +434,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
+            segs * seg_keys >= ctx,
             q.len() >= m * n_kv * 8 * 128,
             kc.len() >= n_kv * ctx * 128,
             vc.len() >= n_kv * ctx * 128,
@@ -463,7 +480,7 @@ mod flash_gqa_kernels {
         let idx = (t * n_head + h) * n_seg + seg;
         let ctx = ctx as usize;
         // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
-        let limit = (unsafe { *n_keys_buf.get_unchecked(t) } as usize).min(ctx);
+        let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
         let lo = seg * seg_keys as usize;
         if lo >= limit {
             if lane == 0 {
@@ -643,10 +660,12 @@ mod flash_gqa_kernels {
 
     /// The merge: block `b = t·n_head + h` folds row `t`'s query head `h`'s
     /// partials of the segments that hold its keys — the first
-    /// `ceil(n_keys / seg_keys)` of `segs`, with `n_keys = n_keys_buf[t]`
-    /// clamped to `ctx` as the segment pass clamps it — in ascending order
+    /// `ceil(n_keys / seg_keys)` of `segs`, with `n_keys` [`live_keys`] of
+    /// `n_keys_buf[t]` as the segment pass reads it — in ascending order
     /// through `online_fold`, skipping one whose `Σ exp` is zero, and writes
     /// `y[(t·n_head + h)·HEAD + d] = r · (1/s)`, thread `d` owning dim `d`.
+    /// A refused row raises [`FaultSite::KeyCount`] on `fault` and gets NaN
+    /// in every dim.
     /// The partials are loaded [`MERGE_BATCH`] segments at a time ahead of
     /// their folds; the folds and their order are the one-at-a-time walk's.
     /// A segment past the row's last live one holds the neutral partial and
@@ -662,6 +681,7 @@ mod flash_gqa_kernels {
         block = (128, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
+            segs * seg_keys >= ctx,
             part_v.len() >= m * n_head * segs * 128,
             part_ms.len() >= m * n_head * segs * 2,
             y.len() >= m * n_head * 128
@@ -676,6 +696,7 @@ mod flash_gqa_kernels {
         segs: u32,
         seg_keys: u32,
         m: u32,
+        fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
         let b = thread::blockIdx_x() as usize;
@@ -687,9 +708,18 @@ mod flash_gqa_kernels {
         let d = thread::threadIdx_x() as usize;
         let n_seg = segs as usize;
         // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
-        let limit = (unsafe { *n_keys_buf.get_unchecked(t) } as usize).min(ctx as usize);
+        let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx as usize);
+        if limit == 0 {
+            if d == 0 {
+                fault.raise(FaultSite::KeyCount);
+            }
+            // SAFETY: b·HEAD + d < m·n_head·HEAD <= y.len(); thread d owns it.
+            unsafe { *y.get_unchecked_mut(b * HEAD + d) = f32::NAN };
+            return; // block-uniform: the row is the block's
+        }
         let sk = seg_keys as usize;
-        let live = limit.div_ceil(sk).min(n_seg);
+        // limit <= ctx <= segs·seg_keys (launch contract), so live <= segs.
+        let live = limit.div_ceil(sk);
         let mut mx = f32::NEG_INFINITY;
         let mut s = 0.0f32;
         let mut acc = 0.0f32;
@@ -734,7 +764,8 @@ mod flash_gqa_kernels {
 /// query heads (roped, unscaled, token-major), the layer's two planes of
 /// `n_kv · ctx` rows, each row's live key count on the device (`m` of them),
 /// the partials scratch ([`partials_v_len`], [`partials_ms_len`] of `m`
-/// rows) and the output rows, token-major.
+/// rows), the sink a refused count raises on, and the output rows,
+/// token-major.
 pub struct GqaArgs<'a> {
     pub q: &'a DeviceBuffer<f32>,
     pub kc: &'a DeviceBuffer<u16>,
@@ -746,6 +777,7 @@ pub struct GqaArgs<'a> {
     pub m: usize,
     pub part_v: &'a mut DeviceBuffer<f32>,
     pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub fault: FaultSink,
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
@@ -771,33 +803,16 @@ impl FlashGqaKernels {
 
     /// Enqueue `m` rows' attention: the segment pass (`m · n_kv ·
     /// segments_for(ctx)` blocks; the tensor-core one when `mma`) and the
-    /// merge (`m · n_kv · GROUP` blocks). Two launches. Asynchronous,
-    /// allocation-free, capturable.
+    /// merge (`m · n_kv · GROUP` blocks). The segments cover the whole
+    /// cache, so every count the kernels accept is walked in full; a count
+    /// of zero or past `ctx` raises [`FaultSite::KeyCount`] on `args.fault`
+    /// and its row is NaN. Two launches. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_pass(
         &self,
         stream: &CudaStream,
         args: GqaArgs<'_>,
         mma: bool,
-    ) -> Result<(), GpuError> {
-        let ctx = args.ctx;
-        self.enqueue_pass_upto(stream, args, mma, ctx)
-    }
-
-    /// [`FlashGqaKernels::enqueue_pass`] over the first
-    /// `segments_for(max_keys)` segments only: the grid and the partials
-    /// (`m · n_head · segments_for(max_keys)` of each) shrink to the keys the
-    /// rows can see, and a row's arithmetic is the full grid's — its live
-    /// segments are the same, walked and merged in the same order. The
-    /// caller guarantees every row's live count is at most `max_keys`
-    /// (`1..=ctx`): a row that saw more would have the keys past the last
-    /// segment left out, which the kernels cannot tell. For a prefill whose
-    /// positions the host wrote, the deepest row's count.
-    pub fn enqueue_pass_upto(
-        &self,
-        stream: &CudaStream,
-        args: GqaArgs<'_>,
-        mma: bool,
-        max_keys: usize,
     ) -> Result<(), GpuError> {
         let what = "flash_gqa::enqueue";
         let GqaArgs {
@@ -811,6 +826,7 @@ impl FlashGqaKernels {
             m,
             part_v,
             part_ms,
+            fault,
             y,
         } = args;
         if n_kv == 0 || ctx == 0 || m == 0 {
@@ -819,25 +835,15 @@ impl FlashGqaKernels {
                 format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
             ));
         }
-        if max_keys == 0 || max_keys > ctx {
-            return Err(GpuError::shape(
-                what,
-                format!("max_keys must be in 1..=ctx {ctx}, got {max_keys}"),
-            ));
-        }
         let n_head = n_kv * GROUP;
-        let segs = segments_for(max_keys);
+        let segs = segments_for(ctx);
         let lens = [
             ("q", q.len(), m * n_head * HEAD),
             ("kc", kc.len(), n_kv * ctx * HEAD),
             ("vc", vc.len(), n_kv * ctx * HEAD),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len(m, n_head, max_keys)),
-            (
-                "part_ms",
-                part_ms.len(),
-                partials_ms_len(m, n_head, max_keys),
-            ),
+            ("part_v", part_v.len(), partials_v_len(m, n_head, ctx)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
             ("y", y.len(), m * n_head * HEAD),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -874,7 +880,7 @@ impl FlashGqaKernels {
             0,
         ))?;
         self.module.gqa_flash_merge(
-            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, y,
+            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
         )?;
         Ok(())
     }

@@ -20,13 +20,14 @@ use crate::head::Head;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::rope_neox::NeoxArgs;
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
+use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use model::arch::qwen3moe::names::token_embd;
 
 /// What every launch of one layer reads besides the arena and the cache:
-/// the engine, the weights, the layer's names, the kernels, the flash pass
-/// and the norm epsilon.
+/// the engine, the weights, the layer's names, the kernels, the flash pass,
+/// the norm epsilon, and the layer's index with its fault sink — every
+/// launch of the layer that can refuse its input raises with that index.
 struct Ctx<'a> {
     gpu: &'a Gpu,
     w: &'a Weights,
@@ -34,6 +35,31 @@ struct Ctx<'a> {
     k: &'a Kernels,
     mma: bool,
     eps: f32,
+    layer: usize,
+    sink: FaultSink,
+}
+
+impl<'a> Ctx<'a> {
+    /// Layer `layer`'s context, its sink made from its index.
+    fn new(
+        gpu: &'a Gpu,
+        w: &'a Weights,
+        (n, layer): (&'a LayerNames, usize),
+        k: &'a Kernels,
+        mma: bool,
+        eps: f32,
+    ) -> Result<Ctx<'a>, GpuError> {
+        Ok(Ctx {
+            gpu,
+            w,
+            n,
+            k,
+            mma,
+            eps,
+            layer,
+            sink: gpu.layer_sink(layer)?,
+        })
+    }
 }
 
 /// Enqueue the whole decode chain at m = 1: layer 0 with its embedding,
@@ -103,14 +129,7 @@ pub(super) fn enqueue_layer(
         mma,
         ..
     } = b;
-    let c = Ctx {
-        gpu,
-        w,
-        n: &names[slot],
-        k,
-        mma: *mma,
-        eps: hp.rms_eps,
-    };
+    let c = Ctx::new(gpu, w, (&names[slot], slot), k, *mma, hp.rms_eps)?;
     layer(&c, &mut kv[slot], s, &sp.io(), 1, embed, out)
 }
 
@@ -138,14 +157,7 @@ pub(super) fn enqueue_pass(
     m: usize,
 ) -> Result<(), GpuError> {
     for (slot, (n, kv)) in c.names.iter().zip(kv.iter_mut()).enumerate() {
-        let lc = Ctx {
-            gpu: c.gpu,
-            w: c.w,
-            n,
-            k: c.k,
-            mma: c.mma,
-            eps: c.eps,
-        };
+        let lc = Ctx::new(c.gpu, c.w, (n, slot), c.k, c.mma, c.eps)?;
         layer(&lc, kv, s, io, m, slot == 0, None)?;
     }
     Ok(())
@@ -208,14 +220,7 @@ pub(super) fn enqueue_ffn(
         mma,
         ..
     } = b;
-    let c = Ctx {
-        gpu,
-        w,
-        n: &names[slot],
-        k,
-        mma: *mma,
-        eps: hp.rms_eps,
-    };
+    let c = Ctx::new(gpu, w, (&names[slot], slot), k, *mma, hp.rms_eps)?;
     ffn(&c, s, 1, None)
 }
 
@@ -264,7 +269,7 @@ fn attention(
         c.eps,
         &mut s.act_x[i],
         &mut s.normed,
-        gpu.unlabelled_sink(),
+        c.sink,
     )?;
     let wv = kq_weight(w, &n.attn_v)?;
     let (off_k, off_v) = s.qkv_offsets();
@@ -322,12 +327,13 @@ fn attention(
             m,
             part_v: &mut s.part_v,
             part_ms: &mut s.part_ms,
+            fault: c.sink,
             y: &mut s.attn,
         },
         c.mma,
     )?;
     let wo = kq_weight(w, &n.attn_output)?;
-    gpu.enqueue_quantize_q8_1(&s.attn, &mut s.act_attn[i])?;
+    gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
     k.proj.enqueue_o_resid(
         stream,
         OResidArgs {
@@ -367,7 +373,7 @@ fn ffn(
             f32_gain(w, &n.ffn_norm)?,
             c.eps,
             &mut s.act_ffn[i],
-            gpu.unlabelled_sink(),
+            c.sink,
             &mut s.route,
         )?;
     } else {
@@ -378,13 +384,14 @@ fn ffn(
             c.eps,
             &mut s.act_ffn[i],
             &mut s.normed,
-            gpu.unlabelled_sink(),
+            c.sink,
         )?;
         k.router.enqueue_fused(
             stream,
             f32_tensor(w, &n.ffn_gate_inp)?,
             &s.normed,
             m,
+            c.sink,
             &mut s.route,
         )?;
     }
@@ -395,11 +402,12 @@ fn ffn(
         sel: &s.route.ids,
         n_slots: m * N_USED,
         rows_per_expert: d.ff,
+        fault: c.sink,
         h: &mut s.h,
     };
     k.experts.enqueue_gate_up(stream, gate_up)?;
     let wd = kq_weight(w, &n.ffn_down_exps)?;
-    gpu.enqueue_quantize_q8_1(&s.h, &mut s.act_h[i])?;
+    gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
     let act_h = &s.act_h[i];
     match n.down_ty {
         Kq::Q4K => gpu.q4k_sel().enqueue_gemv_q4k_sel(

@@ -501,6 +501,7 @@ fn ffn(
         f32_tensor(w, &n.ffn_gate_inp)?,
         &a.normed,
         t,
+        sink,
         &mut a.route,
     )?;
     k.gemm

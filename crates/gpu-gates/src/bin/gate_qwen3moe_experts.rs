@@ -9,8 +9,12 @@
 //!    the table raises `FaultSite::TokenId`, the other rows unchanged.
 //! 2. Gate·up body: for a sel vector with a repeated id, slot `s` equals
 //!    `q4k_gemv` of expert `sel[s]`'s gate rows and up rows alone, combined
-//!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; an id past
-//!    the stack leaves its slot untouched; a rerun is bit-identical.
+//!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; a rerun is
+//!    bit-identical. Ids past the stack (the expert count, and `u32::MAX`:
+//!    this chain has no host tier), launched with layer 13's sink, raise
+//!    `FaultSite::ExpertId` with that layer and write NaN into exactly their
+//!    slots' rows, every other slot bit for bit the clean run's; the word is
+//!    clean before and after a clean run.
 //! 3. The tap, every token of every set: `ffn_inp_normed-L` in, ik's
 //!    `ffn_moe_topk-L` as `sel`, against `ffn_moe_gate_par-L`. Per output,
 //!    `g` and `u` are the f64 dots of the dequantized rows with each side's
@@ -52,7 +56,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::experts::{ExpertKernels, GateUpArgs};
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
@@ -224,7 +228,7 @@ mod gate {
         let sel = DeviceBuffer::from_host(stream, &sel_h)?;
         let x = bloomery_gpu_gates::activations(k, 1, 4099);
         let act = quantize(gpu, &x, 1, k)?;
-        let launch = |sel: &DeviceBuffer<u32>| -> Result<Vec<f32>, GateError> {
+        let launch = |sel: &DeviceBuffer<u32>, fault: FaultSink| -> Result<Vec<f32>, GateError> {
             let mut h = DeviceBuffer::from_host(stream, &vec![SENT; 8 * rpe])?;
             ex.enqueue_gate_up(
                 stream,
@@ -235,14 +239,16 @@ mod gate {
                     sel,
                     n_slots: 8,
                     rows_per_expert: rpe,
+                    fault,
                     h: &mut h,
                 },
             )?;
             stream.synchronize()?;
             Ok(h.to_host_vec(stream)?)
         };
-        let h = launch(&sel)?;
-        let mut ok = bits_equal(&h, &launch(&sel)?);
+        let unl = gpu.unlabelled_sink();
+        let h = launch(&sel, unl)?;
+        let mut ok = bits_equal(&h, &launch(&sel, unl)?);
         for (s, &id) in sel_h.iter().enumerate() {
             let span = id as usize * rpe * rb..(id as usize + 1) * rpe * rb;
             let g1 = DeviceTensor::upload(stream, &bytes_to_words(&gb[span.clone()]), rpe, rb / 4)?;
@@ -258,19 +264,49 @@ mod gate {
             ok &= same;
             println!("body slot={s} id={id} bit_identical_to_q4k_gemv+swiglu={same}");
         }
+        println!(
+            "body ffn_gate/up_exps.0 K={k} rows={rpe} experts={n_exp}: rerun and slots vs q4k_gemv+swiglu {}",
+            verdict(ok)
+        );
+        // Ids past the stack in slots 1 and 3, against the same launch with
+        // valid ids there.
+        let layer = 13usize;
+        let sink = gpu.layer_sink(layer)?;
+        let want = Some(Fault {
+            layer: u32::try_from(layer)?,
+            code: FaultSite::ExpertId as u32,
+        });
+        let before = gpu.fault()?;
+        let clean_sel = DeviceBuffer::from_host(stream, &[2u32, 9, 7, 11, 0, 0, 0, 0])?;
+        let hc = launch(&clean_sel, sink)?;
+        let after_clean = gpu.fault()?;
         let oor = DeviceBuffer::from_host(stream, &[2u32, n_exp as u32, 7, u32::MAX, 0, 0, 0, 0])?;
-        let ho = launch(&oor)?;
-        let untouched = |s: usize| {
-            ho[s * rpe..(s + 1) * rpe]
-                .iter()
-                .all(|v| v.to_bits() == SENT.to_bits())
-        };
-        let oor_ok = untouched(1) && untouched(3) && !untouched(0) && !untouched(2);
+        let ho = launch(&oor, sink)?;
+        let word = gpu.take_fault()?;
+        let slot = |v: &[f32], s: usize| v[s * rpe..(s + 1) * rpe].to_vec();
+        let bad_nan = [1usize, 3]
+            .iter()
+            .all(|&s| slot(&ho, s).iter().all(|v| v.is_nan()));
+        let others = [0usize, 2, 4, 5, 6, 7]
+            .iter()
+            .all(|&s| bits_equal(&slot(&ho, s), &slot(&hc, s)));
+        let clean_again = bits_equal(&launch(&clean_sel, sink)?, &hc) && gpu.fault()?.is_none();
+        let oor_ok = before.is_none()
+            && after_clean.is_none()
+            && word == want
+            && bad_nan
+            && others
+            && clean_again;
         ok &= oor_ok;
         println!(
-            "body ffn_gate/up_exps.0 K={k} rows={rpe} experts={n_exp}: rerun and slots vs q4k_gemv+swiglu, \
-             ids {n_exp} and u32::MAX untouched={oor_ok} {}",
-            verdict(ok)
+            "body ids {n_exp} and u32::MAX past the stack in slots 1, 3: word \"{}\" (want \"{}\", clean \
+             before {} and after the clean run {}) those slots NaN {bad_nan}, other slots bit-identical \
+             {others}, clean rerun bits and word clean {clean_again} {}",
+            word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            want.map_or_else(String::new, |f| f.to_string()),
+            before.is_none(),
+            after_clean.is_none(),
+            verdict(oor_ok)
         );
         let mut hg = DeviceBuffer::from_host(stream, &vec![SENT; 8 * rpe])?;
         let graph = gpu.capture(|s| {
@@ -283,6 +319,7 @@ mod gate {
                     sel: &sel,
                     n_slots: 8,
                     rows_per_expert: rpe,
+                    fault: unl,
                     h: &mut hg,
                 },
             )
@@ -374,6 +411,7 @@ mod gate {
                             sel: &sel,
                             n_slots: slots,
                             rows_per_expert: rpe,
+                            fault: gpu.unlabelled_sink(),
                             h: &mut h,
                         },
                     )?;

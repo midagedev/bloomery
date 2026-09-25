@@ -63,8 +63,14 @@
 //!   second call's first position off every ubatch boundary) leave the whole
 //!   prefill's K/V rows and last logits bit for bit: a token's GEMM-path
 //!   values do not depend on the ubatch it lands in.
+//! - (x) a fault names its layer: layer [`FAULT_LAYER`]'s FFN half run alone
+//!   on a finite row with one NaN raises inside that layer's launches, and
+//!   the next step returns `GpuError::Fault` with that layer (the site is the
+//!   smallest code among the layer's raises, printed), the model poisoned;
+//!   `reset` leaves the word clean and the next step a token.
 //!
-//! `--gemm-only` runs the load and (u) alone.
+//! `--gemm-only` runs the load and (u) alone, `--fault-only` the load and
+//! (x).
 //!
 //! The flash pass is read once per process (`BLOOMERY_GQA_MMA`), so each
 //! pass is its own run; the `load` line names it.
@@ -94,11 +100,11 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::Qwen3moeModel;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::{PrefillPath, PrefillPlan};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::{GpuError, Qwen3moeModel};
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -302,6 +308,14 @@ mod gate {
             None => None,
         };
         let mut m = open(CTX, StepMode::Graph)?;
+        if args.iter().any(|a| a == "--fault-only") {
+            let ok = fault_layer(&mut m)?;
+            println!("gate_qwen3moe_e2e --fault-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--gemm-only") {
             let ok = gemm_prefill(&mut m)?;
             println!("gate_qwen3moe_e2e --gemm-only: {}", verdict(ok));
@@ -317,11 +331,53 @@ mod gate {
         ok &= forced(&mut m, &man)?;
         ok &= free(&mut m, &man)?;
         ok &= greedy(&mut m, dump.as_deref())?;
+        ok &= fault_layer(&mut m)?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
         }
         Ok(())
+    }
+
+    // ------------------------------------------------- (x) a fault's layer
+
+    /// The layer clause (x) plants its fault in.
+    const FAULT_LAYER: usize = 13;
+
+    /// (x) (module doc).
+    fn fault_layer(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        m.reset()?;
+        let before = m.stages()[0].gpu().fault()?;
+        let hidden = m.body("gate_qwen3moe_e2e")?.hparams().n_embd;
+        let mut x = vec![0.25f32; hidden];
+        x[5] = f32::NAN;
+        m.step_ffn(FAULT_LAYER, &x)?;
+        let raised = m.stages()[0].gpu().fault()?;
+        let step = m.step(&[1]);
+        let poisoned = m.poisoned();
+        m.reset()?;
+        let after = m.stages()[0].gpu().fault()?;
+        let clean_step = m.step(&[1]).is_ok();
+        m.reset()?;
+        let layer = u32::try_from(FAULT_LAYER)?;
+        let named = match &step {
+            Err(GpuError::Fault { fault, .. }) => {
+                Some(*fault) == raised && fault.layer == layer && fault.site().is_some()
+            }
+            _ => false,
+        };
+        let pass = before.is_none() && named && poisoned == raised && after.is_none() && clean_step;
+        println!(
+            "fault layer={FAULT_LAYER} ffn input with a NaN: word before {before:?}, the next step {} (want a \
+             fault at layer {FAULT_LAYER}), poisoned {poisoned:?}, after reset {after:?} and a clean step \
+             {clean_step} {}",
+            match &step {
+                Ok(t) => format!("returned token {t}"),
+                Err(e) => format!("returned \"{e}\""),
+            },
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     // ------------------------------------------------------- (s) structure

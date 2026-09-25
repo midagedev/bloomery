@@ -39,6 +39,17 @@
 //! count zero. A NaN in the input raises the fault word in both, the same
 //! word. As a captured graph: one node, two replays bit-identical to the
 //! eager launch, the count zero after each.
+//!
+//! Refusals, each launch labelled with layer 13: a token with a non-finite
+//! logit raises `FaultSite::Router` with that layer, its probabilities and
+//! weights are NaN and its ids those it held before the launch, and every
+//! other token is bit for bit the clean run's. The routing alone on a NaN, a
+//! +inf and a −inf logit, a clean rerun after each (the word clean, the clean
+//! bits); the fused launch at five tokens with one token's column finite but
+//! overflowing to +inf at one expert (the column is `1e38` with the sign of
+//! that expert's weights); the ubatch pair at nine tokens with the ninth so;
+//! a NaN in the router weight, which refuses every token of the fused launch
+//! and the norm-fused launch's token (its q8_1 bytes unchanged).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -59,7 +70,7 @@ mod gate {
         MAX_TOKENS, N_EXPERT, N_USED, RouterKernels, RouterOut,
     };
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
-    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, Q8Act};
     use bloomery_gpu_gates::qwen3moe::sets;
     use bloomery_gpu_gates::{
         GateError, bits_equal, checks_failed, open_model, open_split, ref_tensor_logical_in,
@@ -86,9 +97,10 @@ mod gate {
         k: &RouterKernels,
         stream: &CudaStream,
         x: &DeviceBuffer<f32>,
+        sink: FaultSink,
         out: &mut RouterOut,
     ) -> Result<Routed, GateError> {
-        k.enqueue(stream, x, out)?;
+        k.enqueue(stream, x, sink, out)?;
         stream.synchronize()?;
         Ok(Routed {
             probs: out.probs.to_host_vec(stream)?,
@@ -172,7 +184,13 @@ mod gate {
         };
         for t in 0..m {
             let col: Vec<f32> = (0..N_EXPERT).map(|e| y[e * m + t]).collect();
-            let r = route(k, stream, &DeviceBuffer::from_host(stream, &col)?, out)?;
+            let r = route(
+                k,
+                stream,
+                &DeviceBuffer::from_host(stream, &col)?,
+                gpu.unlabelled_sink(),
+                out,
+            )?;
             want.logits.extend_from_slice(&col);
             want.routed.probs.extend_from_slice(&r.probs);
             want.routed.ids.extend_from_slice(&r.ids);
@@ -181,12 +199,9 @@ mod gate {
         Ok(want)
     }
 
-    /// Layer `l`'s router weight as f32 on the card.
-    fn router_weight(
-        gpu: &Gpu,
-        gguf: &gguf::Gguf,
-        l: usize,
-    ) -> Result<DeviceTensor<f32>, GateError> {
+    /// Layer `l`'s router weight as f32 on the host ([`N_EXPERT`] rows of
+    /// `k`), and `k`.
+    fn router_weight_host(gguf: &gguf::Gguf, l: usize) -> Result<(Vec<f32>, usize), GateError> {
         let name = names::ffn_gate_inp(l);
         let (info, b) = tensor_bytes_as(gguf, &name, GgmlType::F32, None)?;
         if info.dims.len() != 2 || info.dims[1] as usize != N_EXPERT {
@@ -198,12 +213,17 @@ mod gate {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect();
-        Ok(DeviceTensor::upload(
-            gpu.stream(),
-            &w,
-            N_EXPERT,
-            info.dims[0] as usize,
-        )?)
+        Ok((w, info.dims[0] as usize))
+    }
+
+    /// Layer `l`'s router weight as f32 on the card.
+    fn router_weight(
+        gpu: &Gpu,
+        gguf: &gguf::Gguf,
+        l: usize,
+    ) -> Result<DeviceTensor<f32>, GateError> {
+        let (w, k) = router_weight_host(gguf, l)?;
+        Ok(DeviceTensor::upload(gpu.stream(), &w, N_EXPERT, k)?)
     }
 
     /// Two q8_1 readbacks equal plane for plane, the scales by bits.
@@ -260,7 +280,7 @@ mod gate {
             &mut normed,
             gpu.unlabelled_sink(),
         )?;
-        k.enqueue_fused(stream, nl.w, &normed, 1, out)?;
+        k.enqueue_fused(stream, nl.w, &normed, 1, gpu.unlabelled_sink(), out)?;
         stream.synchronize()?;
         Ok(NormRouted {
             act: readback_q8act(stream, &act)?,
@@ -419,6 +439,263 @@ mod gate {
         Ok(ok && pass)
     }
 
+    /// The model layer the refusal cases label their launches with, so the
+    /// word shows each launcher carried its caller's label.
+    const FAULT_LAYER: usize = 13;
+
+    /// A finite activation whose products with the router weights stay
+    /// finite while one row's dot does not: `Σ_i |w_ei| · BIG` is past
+    /// `f32::MAX` for every row of the file.
+    const BIG: f32 = 1.0e38;
+
+    /// The expert whose logit the overflow column drives to `+inf`.
+    const HOT: usize = 42;
+
+    /// The overflow column for router row `e`: `BIG` with the sign of each of
+    /// the row's weights, so every value is finite and the row's logit is
+    /// `Σ_i |w_ei| · BIG = +inf`.
+    fn overflow_col(wh: &[f32], k: usize, e: usize) -> Vec<f32> {
+        wh[e * k..(e + 1) * k]
+            .iter()
+            .map(|&w| if w < 0.0 { -BIG } else { BIG })
+            .collect()
+    }
+
+    /// Token `t` of `a` and `b` bit for bit: logits, probabilities, ids and
+    /// weights.
+    fn token_equal(a: &Fused, b: &Fused, t: usize) -> bool {
+        let (e, u) = (
+            t * N_EXPERT..(t + 1) * N_EXPERT,
+            t * N_USED..(t + 1) * N_USED,
+        );
+        bits_equal(&a.logits[e.clone()], &b.logits[e.clone()])
+            && bits_equal(&a.routed.probs[e.clone()], &b.routed.probs[e])
+            && a.routed.ids[u.clone()] == b.routed.ids[u.clone()]
+            && bits_equal(&a.routed.weights[u.clone()], &b.routed.weights[u])
+    }
+
+    /// Whether token `t` of `f` is refused: NaN probabilities and weights,
+    /// and the ids `kept` held for it before the launch.
+    fn token_refused(f: &Fused, t: usize, kept: &Fused) -> bool {
+        let (e, u) = (
+            t * N_EXPERT..(t + 1) * N_EXPERT,
+            t * N_USED..(t + 1) * N_USED,
+        );
+        f.routed.probs[e].iter().all(|v| v.is_nan())
+            && f.routed.weights[u.clone()].iter().all(|v| v.is_nan())
+            && f.routed.ids[u.clone()] == kept.routed.ids[u]
+    }
+
+    /// A multi-token refusal's verdict: `got` against the clean run `clean`
+    /// of the same launch into the same buffers, the tokens in `bad` refused
+    /// and every other token bit for bit the clean run's.
+    fn tokens_verdict(got: &Fused, clean: &Fused, m: usize, bad: &[usize]) -> (bool, bool) {
+        let refused = bad.iter().all(|&t| token_refused(got, t, clean));
+        let others = (0..m)
+            .filter(|t| !bad.contains(t))
+            .all(|t| token_equal(got, clean, t));
+        (refused, others)
+    }
+
+    /// The router's refusals (module doc): every entry, each undefined
+    /// input, the word before and after a clean run.
+    fn fault_section(
+        gpu: &Gpu,
+        gguf: &gguf::Gguf,
+        k: &RouterKernels,
+        eps: f32,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let sink = gpu.layer_sink(FAULT_LAYER)?;
+        let want = Some(Fault {
+            layer: u32::try_from(FAULT_LAYER)?,
+            code: FaultSite::Router as u32,
+        });
+        let (wh, kk) = router_weight_host(gguf, FAULT_LAYER)?;
+        let w = DeviceTensor::upload(stream, &wh, N_EXPERT, kk)?;
+        let cpu = &sets()?[0].1;
+        let logits = ref_tensor_logical_in(&cpu.dir, cpu.tensor("ffn_moe_logits-13", 0)?)?;
+        let mut cols = ref_tensor_logical_in(&cpu.dir, cpu.tensor("ffn_inp_normed-13", 0)?)?;
+        cols.extend(ref_tensor_logical_in(
+            &cpu.dir,
+            cpu.tensor("ffn_inp_normed-14", 0)?,
+        )?);
+        let ub_n = MAX_TOKENS + 1;
+        if logits.len() < N_EXPERT || cols.len() < ub_n * kk {
+            return Err(format!(
+                "ffn_moe_logits-13 holds {}, ffn_inp_normed-13/-14 {} values; want {N_EXPERT} and \
+                 {ub_n} x {kk}",
+                logits.len(),
+                cols.len()
+            )
+            .into());
+        }
+        let mut ok = true;
+
+        // The routing alone: a NaN, a +inf and a −inf logit.
+        let before = gpu.fault()?;
+        let mut out = RouterOut::new(stream)?;
+        let x = DeviceBuffer::from_host(stream, &logits[..N_EXPERT])?;
+        let clean = route(k, stream, &x, sink, &mut out)?;
+        let after_clean = gpu.fault()?;
+        let pass = before.is_none() && after_clean.is_none();
+        println!(
+            "fault clean: word before {before:?} and after a clean routing {after_clean:?} (want \
+             None) {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        for (name, v) in [
+            ("nan", f32::NAN),
+            ("+inf", f32::INFINITY),
+            ("-inf", f32::NEG_INFINITY),
+        ] {
+            let mut l = logits[..N_EXPERT].to_vec();
+            l[37] = v;
+            let r = route(
+                k,
+                stream,
+                &DeviceBuffer::from_host(stream, &l)?,
+                sink,
+                &mut out,
+            )?;
+            let word = gpu.take_fault()?;
+            let refused =
+                r.probs.iter().all(|p| p.is_nan()) && r.weights.iter().all(|p| p.is_nan());
+            let ids_kept = r.ids == clean.ids;
+            let again = route(k, stream, &x, sink, &mut out)?;
+            let clean_after = gpu.fault()?.is_none()
+                && bits_equal(&again.probs, &clean.probs)
+                && again.ids == clean.ids
+                && bits_equal(&again.weights, &clean.weights);
+            let pass = word == want && refused && ids_kept && clean_after;
+            println!(
+                "fault op=qwen3moe_router logit[37]={name}: word \"{}\" (want \"{}\") probs_weights_nan={refused} \
+                 ids_kept={ids_kept} clean_rerun_word_none_and_bits={clean_after} {}",
+                word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+                want.map_or_else(String::new, |f| f.to_string()),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // The fused launch: token 2 of 5 overflows to +inf from a finite row.
+        let m = 5usize;
+        let bad_t = 2usize;
+        let mut fout = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let xc = DeviceBuffer::from_host(stream, &cols[..m * kk])?;
+        k.enqueue_fused(stream, &w, &xc, m, sink, &mut fout)?;
+        stream.synchronize()?;
+        let clean_f = read_fused(stream, &fout, m)?;
+        let clean_word = gpu.fault()?;
+        let hot = overflow_col(&wh, kk, HOT);
+        let mut xb = cols[..m * kk].to_vec();
+        xb[bad_t * kk..(bad_t + 1) * kk].copy_from_slice(&hot);
+        let finite_in = xb.iter().all(|v| v.is_finite());
+        k.enqueue_fused(
+            stream,
+            &w,
+            &DeviceBuffer::from_host(stream, &xb)?,
+            m,
+            sink,
+            &mut fout,
+        )?;
+        stream.synchronize()?;
+        let got = read_fused(stream, &fout, m)?;
+        let word = gpu.take_fault()?;
+        let tickets = fout.tickets(stream)?;
+        let hot_logit = got.logits[bad_t * N_EXPERT + HOT];
+        let (refused, others) = tokens_verdict(&got, &clean_f, m, &[bad_t]);
+        let pass = clean_word.is_none()
+            && finite_in
+            && hot_logit == f32::INFINITY
+            && word == want
+            && refused
+            && others
+            && tickets == 0;
+        println!(
+            "fault op=qwen3moe_router_fused m={m} token {bad_t} column finite={finite_in} logit[{HOT}]={hot_logit} \
+             (want inf): word {word:?} (want {want:?}, clean run {clean_word:?}) token refused={refused} \
+             other tokens bit-identical={others} tickets={tickets} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+
+        // The ubatch router: token 8 of 9 (the second chunk) overflows.
+        let mut ub = RouterOut::for_ubatch(stream, ub_n)?;
+        let xu = DeviceBuffer::from_host(stream, &cols[..ub_n * kk])?;
+        k.enqueue_ubatch(stream, &w, &xu, ub_n, sink, &mut ub)?;
+        stream.synchronize()?;
+        let clean_u = read_fused(stream, &ub, ub_n)?;
+        let clean_word = gpu.fault()?;
+        let mut xb = cols[..ub_n * kk].to_vec();
+        xb[(ub_n - 1) * kk..].copy_from_slice(&hot);
+        k.enqueue_ubatch(
+            stream,
+            &w,
+            &DeviceBuffer::from_host(stream, &xb)?,
+            ub_n,
+            sink,
+            &mut ub,
+        )?;
+        stream.synchronize()?;
+        let got = read_fused(stream, &ub, ub_n)?;
+        let word = gpu.take_fault()?;
+        let (refused, others) = tokens_verdict(&got, &clean_u, ub_n, &[ub_n - 1]);
+        let pass = clean_word.is_none() && word == want && refused && others;
+        println!(
+            "fault op=qwen3moe_router_logits+route n={ub_n} token {} overflows: word {word:?} (want {want:?}, \
+             clean run {clean_word:?}) token refused={refused} other tokens bit-identical={others} {}",
+            ub_n - 1,
+            verdict(pass)
+        );
+        ok &= pass;
+
+        // A NaN router weight: every token of the fused launch is refused, and
+        // the norm-fused launch's routing too, its q8_1 bytes the clean run's.
+        let mut wn = wh.clone();
+        wn[17 * kk + 3] = f32::NAN;
+        let wnd = DeviceTensor::upload(stream, &wn, N_EXPERT, kk)?;
+        k.enqueue_fused(stream, &wnd, &xc, m, sink, &mut fout)?;
+        stream.synchronize()?;
+        let got = read_fused(stream, &fout, m)?;
+        let word = gpu.take_fault()?;
+        let all: Vec<usize> = (0..m).collect();
+        let (refused, _) = tokens_verdict(&got, &clean_f, m, &all);
+        let pass = word == want && refused;
+        println!(
+            "fault op=qwen3moe_router_fused m={m} router weight [17][3]=NaN: word {word:?} (want {want:?}) \
+             every token refused={refused} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        let gain = ffn_gain(gpu, gguf, FAULT_LAYER)?;
+        let x0 = DeviceBuffer::from_host(stream, &cols[..kk])?;
+        let mut run_norm =
+            |w: &DeviceTensor<f32>| -> Result<(NormRouted, Option<Fault>), GateError> {
+                let mut act = Q8Act::with_k(stream, 1, kk)?;
+                k.enqueue_norm_fused(stream, w, &x0, &gain, eps, &mut act, sink, &mut out)?;
+                stream.synchronize()?;
+                let r = NormRouted {
+                    act: readback_q8act(stream, &act)?,
+                    routed: read_fused(stream, &out, 1)?,
+                };
+                Ok((r, gpu.take_fault()?))
+            };
+        let (clean_n, clean_word) = run_norm(&w)?;
+        let (got, word) = run_norm(&wnd)?;
+        let q8_same = q8_equal(&got.act, &clean_n.act);
+        let refused = token_refused(&got.routed, 0, &clean_n.routed);
+        let pass = clean_word.is_none() && word == want && refused && q8_same;
+        println!(
+            "fault op=qwen3moe_router_norm router weight [17][3]=NaN: word {word:?} (want {want:?}, clean run \
+             {clean_word:?}) token refused={refused} q8_1 bytes = clean run's {q8_same} {}",
+            verdict(pass)
+        );
+        ok &= pass;
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let split = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-router")?;
         let hp = Hparams::read(&split)?;
@@ -437,6 +714,7 @@ mod gate {
         let gpu = Gpu::new()?;
         let k = RouterKernels::load(gpu.context())?;
         let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
         let mut out = RouterOut::new(stream)?;
         println!("gate_qwen3moe_router: device {}", gpu.device_name()?);
         let mut ok = true;
@@ -469,8 +747,8 @@ mod gate {
                 for t in 0..m {
                     let lt = &logits[t * N_EXPERT..(t + 1) * N_EXPERT];
                     let x = DeviceBuffer::from_host(stream, lt)?;
-                    let a = route(&k, stream, &x, &mut out)?;
-                    let b = route(&k, stream, &x, &mut out)?;
+                    let a = route(&k, stream, &x, sink, &mut out)?;
+                    let b = route(&k, stream, &x, sink, &mut out)?;
                     let h = host(lt)?;
                     let rerun = bits_equal(&a.probs, &b.probs)
                         && a.ids == b.ids
@@ -545,7 +823,7 @@ mod gate {
         ));
         for (name, logits, want) in &cases {
             let x = DeviceBuffer::from_host(stream, logits)?;
-            let a = route(&k, stream, &x, &mut out)?;
+            let a = route(&k, stream, &x, sink, &mut out)?;
             let h = host(logits)?;
             let pass = a.ids == *want && h.ids == *want && max_abs(&a.weights, &h.weights) <= BAND;
             println!(
@@ -562,12 +840,12 @@ mod gate {
         let lrow = man.tensor("ffn_moe_logits-13", 0)?;
         let logits = ref_tensor_logical_in(&man.dir, lrow)?;
         let x = DeviceBuffer::from_host(stream, &logits[..N_EXPERT])?;
-        let eager = route(&k, stream, &x, &mut out)?;
+        let eager = route(&k, stream, &x, sink, &mut out)?;
         out.probs.zero_async(stream)?;
         out.ids.zero_async(stream)?;
         out.weights.zero_async(stream)?;
         stream.synchronize()?;
-        let graph = gpu.capture(|s| k.enqueue(s, &x, &mut out))?;
+        let graph = gpu.capture(|s| k.enqueue(s, &x, sink, &mut out))?;
         graph.launch(stream)?;
         stream.synchronize()?;
         let replay = Routed {
@@ -608,7 +886,7 @@ mod gate {
         for m in [1usize, 5, MAX_TOKENS] {
             let x = DeviceBuffer::from_host(stream, &cols[..m * kk])?;
             let want = split_pair(&gpu, &k, &w, &x, m, &mut out)?;
-            k.enqueue_fused(stream, &w, &x, m, &mut fout)?;
+            k.enqueue_fused(stream, &w, &x, m, sink, &mut fout)?;
             stream.synchronize()?;
             let got = read_fused(stream, &fout, m)?;
             let tickets = fout.tickets(stream)?;
@@ -626,7 +904,7 @@ mod gate {
         }
 
         let x = DeviceBuffer::from_host(stream, &cols[..MAX_TOKENS * kk])?;
-        k.enqueue_fused(stream, &w, &x, MAX_TOKENS, &mut fout)?;
+        k.enqueue_fused(stream, &w, &x, MAX_TOKENS, sink, &mut fout)?;
         stream.synchronize()?;
         let eager = read_fused(stream, &fout, MAX_TOKENS)?;
         fout.logits.zero_async(stream)?;
@@ -634,7 +912,7 @@ mod gate {
         fout.ids.zero_async(stream)?;
         fout.weights.zero_async(stream)?;
         stream.synchronize()?;
-        let graph = gpu.capture(|s| k.enqueue_fused(s, &w, &x, MAX_TOKENS, &mut fout))?;
+        let graph = gpu.capture(|s| k.enqueue_fused(s, &w, &x, MAX_TOKENS, sink, &mut fout))?;
         let mut replays_ok = true;
         let mut tickets_after = Vec::new();
         for _ in 0..2 {
@@ -653,6 +931,7 @@ mod gate {
         ok &= pass;
 
         ok &= norm_section(&gpu, &gguf, &k, hp.rms_eps)?;
+        ok &= fault_section(&gpu, &gguf, &k, hp.rms_eps)?;
 
         println!("gate_qwen3moe_router: {}", verdict(ok));
         if !ok {

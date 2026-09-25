@@ -35,6 +35,18 @@
 //!   expert id;
 //! - the chosen probabilities summed in f64 in slot order, the sum rounded
 //!   once to f32, each weight the f32 divide of its probability by it.
+//!
+//! No silent routing. The softmax is defined on finite logits: then the max
+//! is finite, the winning expert's exp is 1, the sum lies in [1, 128], and
+//! every probability, every round's winner and every weight is finite. A
+//! token with any non-finite logit — NaN, an overflow to ±inf from a finite
+//! row, a non-finite router weight — has no defined routing (a NaN would
+//! turn every probability NaN and the top 8 into eight copies of expert 0; a
+//! −inf would read as a probability of 0). Every entry raises
+//! [`FaultSite::Router`] on its fault sink for such a token, writes its
+//! probabilities and weights NaN, and leaves its ids as they stand, which are
+//! in range: this module writes only ids below [`N_EXPERT`] and allocates
+//! them zeroed.
 
 use super::ubatch::UBATCH;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
@@ -113,6 +125,10 @@ const _: () = assert!(MAX_TOKENS == FUSED_WARPS && N_EXPERT.is_multiple_of(FUSED
 /// strict `>` over ascending ids realizes, seed `(−inf, 0)`), the winning
 /// lane marking its entry taken; lane 0 writes the ids, then the weights.
 ///
+/// A token with a non-finite logit (the module doc) raises
+/// [`FaultSite::Router`] on `fault`, gets NaN probabilities and weights, and
+/// keeps its ids; the warp returns before the softmax.
+///
 /// # Safety
 ///
 /// All 32 lanes of the warp call it, converged, with the same `p`, `slot_p`
@@ -120,6 +136,10 @@ const _: () = assert!(MAX_TOKENS == FUSED_WARPS && N_EXPERT.is_multiple_of(FUSED
 /// the block's shared memory that no other warp touches; `probs.len() >= (t +
 /// 1)·128`, and `ids.len()`, `weights.len() >= (t + 1)·8`, those slots
 /// written by this warp alone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
 #[inline(always)]
 unsafe fn route_warp(
     v: (f32, f32, f32, f32),
@@ -129,9 +149,33 @@ unsafe fn route_warp(
     probs: &mut DisjointSlice<f32>,
     ids: &mut DisjointSlice<u32>,
     weights: &mut DisjointSlice<f32>,
+    fault: FaultSink,
 ) {
     let lane = warp::lane_id() as usize;
     let (v0, v1, v2, v3) = v;
+    let pb = t * N_EXPERT + lane;
+    // Warp-uniform: every lane leaves the ballot with the same mask.
+    if warp::ballot(!quad_finite([v0, v1, v2, v3])) != 0 {
+        // SAFETY: lane + 96 < N_EXPERT — the token's probs slots (this fn's
+        // contract); entries `lane + 32 j` are this lane's own.
+        unsafe {
+            *probs.get_unchecked_mut(pb) = f32::NAN;
+            *probs.get_unchecked_mut(pb + 32) = f32::NAN;
+            *probs.get_unchecked_mut(pb + 64) = f32::NAN;
+            *probs.get_unchecked_mut(pb + 96) = f32::NAN;
+        }
+        if lane == 0 {
+            fault.raise(FaultSite::Router);
+            let mut s = 0usize;
+            while s < N_USED {
+                // SAFETY: s < N_USED, inside the token's weights slots (this
+                // fn's contract); lane 0 is the only writer.
+                unsafe { *weights.get_unchecked_mut(t * N_USED + s) = f32::NAN };
+                s += 1;
+            }
+        }
+        return;
+    }
     let mut mx = f32::NEG_INFINITY.max(v0).max(v1).max(v2).max(v3);
     let mut off = 16u32;
     while off > 0 {
@@ -154,7 +198,6 @@ unsafe fn route_warp(
     }
     let inv = sum as f32;
     let (p0, p1, p2, p3) = (e0 / inv, e1 / inv, e2 / inv, e3 / inv);
-    let pb = t * N_EXPERT + lane;
     // SAFETY: lane + 96 < N_EXPERT — inside the token's shared entries and
     // its probs slots (this fn's contract); entries `lane + 32 j` are this
     // lane's own.
@@ -241,7 +284,7 @@ unsafe fn route_warp(
 /// the last ticket returns the count to zero, and its warp `t < m` reads
 /// token `t`'s logits back (volatile loads: this block's L1 never held other
 /// blocks' rows, and a volatile load does not ask it) and runs
-/// [`route_warp`].
+/// [`route_warp`], which raises a refused token on `fault`.
 ///
 /// # Safety
 ///
@@ -266,6 +309,7 @@ unsafe fn publish_route(
     ids: &mut DisjointSlice<u32>,
     weights: &mut DisjointSlice<f32>,
     done: &mut DisjointSlice<u32>,
+    fault: FaultSink,
 ) {
     threadfence();
     thread::sync_threads();
@@ -320,6 +364,7 @@ unsafe fn publish_route(
             probs,
             ids,
             weights,
+            fault,
         );
     }
 }
@@ -372,7 +417,8 @@ mod qwen3moe_router_kernels {
     /// The routing alone for one token: its [`N_EXPERT`] logits in `x` →
     /// every probability in `probs`, the ids in rank order in `ids` and
     /// their renormalized weights in `weights`. One block of one warp,
-    /// [`route_warp`].
+    /// [`route_warp`]; a non-finite logit raises [`FaultSite::Router`] on
+    /// `fault`.
     #[kernel]
     #[launch_bounds(32)]
     #[launch_contract(
@@ -390,6 +436,7 @@ mod qwen3moe_router_kernels {
         mut probs: DisjointSlice<f32>,
         mut ids: DisjointSlice<u32>,
         mut weights: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         static mut P: SharedArray<f32, N_EXPERT> = SharedArray::UNINIT;
         static mut SLOT_P: SharedArray<f32, N_USED> = SharedArray::UNINIT;
@@ -413,7 +460,7 @@ mod qwen3moe_router_kernels {
         // SAFETY: the block is this one warp, converged here; P and SLOT_P
         // are its own; token 0's slots are inside probs, ids and weights by
         // the launch contract.
-        unsafe { route_warp(v, p, slot_p, 0, &mut probs, &mut ids, &mut weights) };
+        unsafe { route_warp(v, p, slot_p, 0, &mut probs, &mut ids, &mut weights, fault) };
     }
 
     /// The router of `m_cols` tokens: `w` the router weight ([`N_EXPERT`]
@@ -430,7 +477,8 @@ mod qwen3moe_router_kernels {
     /// block that draws the last ticket returns the count to zero, and its
     /// warp `t < m_cols` reads token `t`'s logits back (volatile loads: this
     /// block's L1 never held other blocks' rows, and a volatile load does not
-    /// ask it) and runs [`route_warp`].
+    /// ask it) and runs [`route_warp`]; a token with a non-finite logit
+    /// raises [`FaultSite::Router`] on `fault`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -462,6 +510,7 @@ mod qwen3moe_router_kernels {
         mut ids: DisjointSlice<u32>,
         mut weights: DisjointSlice<f32>,
         mut done: DisjointSlice<u32>,
+        fault: FaultSink,
     ) {
         static mut P: SharedArray<f32, P_LEN> = SharedArray::UNINIT;
         static mut SLOT_P: SharedArray<f32, SLOT_LEN> = SharedArray::UNINIT;
@@ -510,6 +559,7 @@ mod qwen3moe_router_kernels {
                 &mut ids,
                 &mut weights,
                 &mut done,
+                fault,
             );
         }
     }
@@ -534,7 +584,8 @@ mod qwen3moe_router_kernels {
     /// every block holds the normed row `norm_quant` stores in `y`. Then warp
     /// 0 of block `r` computes row `r`'s logit from that shared row with the
     /// fused entry's one-token body, and the ticket and the routing follow
-    /// ([`publish_route`]). `k` a multiple of 128 and at most [`NORM_K`]
+    /// ([`publish_route`]), a non-finite logit raising [`FaultSite::Router`]
+    /// on the same `fault`. `k` a multiple of 128 and at most [`NORM_K`]
     /// (host-checked).
     #[allow(
         clippy::too_many_arguments,
@@ -712,6 +763,7 @@ mod qwen3moe_router_kernels {
                 &mut ids,
                 &mut weights,
                 &mut done,
+                fault,
             );
         }
     }
@@ -776,7 +828,8 @@ mod qwen3moe_router_kernels {
     /// The routing of `n_tok` tokens from their logits (`n_tok · 128`, as
     /// `qwen3moe_router_logits` writes them): warp `w` of block `b` routes
     /// token `8·b + w` with [`route_warp`] and writes its probabilities, ids
-    /// and weights where the fused launch writes a token's.
+    /// and weights where the fused launch writes a token's; a token with a
+    /// non-finite logit raises [`FaultSite::Router`] on `fault`.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -795,6 +848,7 @@ mod qwen3moe_router_kernels {
         mut probs: DisjointSlice<f32>,
         mut ids: DisjointSlice<u32>,
         mut weights: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         static mut P: SharedArray<f32, P_LEN> = SharedArray::UNINIT;
         static mut SLOT_P: SharedArray<f32, SLOT_LEN> = SharedArray::UNINIT;
@@ -831,6 +885,7 @@ mod qwen3moe_router_kernels {
                 &mut probs,
                 &mut ids,
                 &mut weights,
+                fault,
             );
         }
     }
@@ -934,12 +989,14 @@ impl RouterKernels {
     }
 
     /// Enqueue the routing alone of one token over its `x` ([`N_EXPERT`]
-    /// logits) into `out`'s first token. Asynchronous, allocation-free,
+    /// logits) into `out`'s first token; a non-finite logit raises
+    /// [`FaultSite::Router`] on `fault`. Asynchronous, allocation-free,
     /// capturable.
     pub fn enqueue(
         &self,
         stream: &CudaStream,
         x: &DeviceBuffer<f32>,
+        fault: FaultSink,
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         if x.len() < N_EXPERT {
@@ -958,6 +1015,7 @@ impl RouterKernels {
             &mut out.probs,
             &mut out.ids,
             &mut out.weights,
+            fault,
         )?;
         Ok(())
     }
@@ -965,13 +1023,16 @@ impl RouterKernels {
     /// Enqueue the router of `m` (1..=`out.tokens()`) tokens: `w` the
     /// router weight as f32 ([`N_EXPERT`] rows of `k`, `k` a positive
     /// multiple of 32), `x` the tokens' `m` columns of `k` activations;
-    /// results into `out`. Asynchronous, allocation-free, capturable.
+    /// results into `out`, a token with a non-finite logit raising
+    /// [`FaultSite::Router`] on `fault`. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_fused(
         &self,
         stream: &CudaStream,
         w: &DeviceTensor<f32>,
         x: &DeviceBuffer<f32>,
         m: usize,
+        fault: FaultSink,
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         let what = "qwen3moe::router::enqueue_fused";
@@ -1013,6 +1074,7 @@ impl RouterKernels {
             &mut out.ids,
             &mut out.weights,
             &mut out.done,
+            fault,
         )?;
         Ok(())
     }
@@ -1022,14 +1084,15 @@ impl RouterKernels {
     /// `w` the router weight as f32 ([`N_EXPERT`] rows of `k`, `k` a
     /// positive multiple of 32), `x` the tokens' `n` columns of `k` normed
     /// activations; results into `out`, each token's the bits
-    /// [`RouterKernels::enqueue_fused`] leaves for it. Asynchronous,
-    /// allocation-free, capturable.
+    /// [`RouterKernels::enqueue_fused`] leaves for it, its refusal raised on
+    /// `fault` as there. Asynchronous, allocation-free, capturable.
     pub fn enqueue_ubatch(
         &self,
         stream: &CudaStream,
         w: &DeviceTensor<f32>,
         x: &DeviceBuffer<f32>,
         n: usize,
+        fault: FaultSink,
         out: &mut RouterOut,
     ) -> Result<(), GpuError> {
         let what = "qwen3moe::router::enqueue_ubatch";
@@ -1074,6 +1137,7 @@ impl RouterKernels {
             &mut out.probs,
             &mut out.ids,
             &mut out.weights,
+            fault,
         )?;
         Ok(())
     }
@@ -1084,7 +1148,8 @@ impl RouterKernels {
     /// of the normed row into `act` (one column of `w.cols()`) — the bytes
     /// `fused::norm_quant` writes — and the routing into `out`'s first token,
     /// as [`RouterKernels::enqueue_fused`] at one token. `fault` takes the
-    /// norm's raise. Asynchronous, allocation-free, capturable.
+    /// norm's raise and the router's. Asynchronous, allocation-free,
+    /// capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher over the norm's and the router's buffers, the shape of the kernel's arguments"

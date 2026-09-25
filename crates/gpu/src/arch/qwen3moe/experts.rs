@@ -16,6 +16,12 @@
 //! tokens. So slot `s` of `h` is bit for bit `silu(q4k_gemv(gate_e)) ·
 //! q4k_gemv(up_e)` for `e = sel[s]` on that column alone.
 //!
+//! An id at or past the stack's expert count has no rows to read: this chain
+//! has no host tier, so no id past the stack is a contract here (not even
+//! [`crate::hybrid::HOST`]). The slot's warps raise [`FaultSite::ExpertId`]
+//! and write NaN into its rows of `h` before their first weight load, so no
+//! stale row of an earlier launch passes for the slot's output.
+//!
 //! The combine, one thread per output value `d` of token `t`: `y[t · rows +
 //! d] = elem::weighted_expert_sum(down, w, t, d) + resid[t · rows + d]` — the
 //! slot-ascending weighted sum, then one add, the grouping of the
@@ -24,6 +30,7 @@
 use crate::GpuError;
 use crate::cores::q4k_row_dot_1col;
 use crate::elem::{silu_mul, weighted_expert_sum};
+use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -36,7 +43,8 @@ const ROWS_PER_BLOCK: usize = 8;
 
 /// Row `row` of the gate·up·SwiGLU (module doc): slot `row / rows_per_expert`
 /// against column `slot / slots_per_col`, `h[row] = silu(g) · u`. A slot whose
-/// id is past the stack is left untouched: its warp stores nothing.
+/// id is past the stack raises [`FaultSite::ExpertId`] on `fault` and gets
+/// `h[row] = NaN`, with no weight load.
 ///
 /// # Safety
 ///
@@ -64,6 +72,7 @@ unsafe fn gate_up_row(
     iters: u32,
     row: usize,
     lane: usize,
+    fault: FaultSink,
     h: &mut DisjointSlice<f32>,
 ) {
     let slot = row / rows_per_expert as usize;
@@ -72,6 +81,12 @@ unsafe fn gate_up_row(
     // never diverges a warp.
     let id = unsafe { *sel.get_unchecked(slot) } as usize;
     if id >= n_experts as usize {
+        if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+            // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
+            // caller's contract; only lane 0 of the warp writes h[row].
+            unsafe { *h.get_unchecked_mut(row) = f32::NAN };
+        }
         return;
     }
     let row_abs = id * rows_per_expert as usize + row % rows_per_expert as usize;
@@ -100,8 +115,9 @@ mod qwen3moe_expert_kernels {
     /// The routed experts' gate·up·SwiGLU in one launch (module doc): slot
     /// `s` against column `s / slots_per_col` of the `m_cols`-column
     /// activation. An id `>= n_experts` cannot be refused by the host (it
-    /// lives in device memory): the slot's warps return before their first
-    /// weight load — warp-uniform — leaving that slot of `h` untouched.
+    /// lives in device memory): the slot's warps raise
+    /// [`FaultSite::ExpertId`] on `fault`, write NaN into the slot's rows of
+    /// `h` and return before their first weight load — warp-uniform.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -137,6 +153,7 @@ mod qwen3moe_expert_kernels {
         slots_per_col: u32,
         n_sb: u32,
         iters: u32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -166,6 +183,7 @@ mod qwen3moe_expert_kernels {
                 iters,
                 row,
                 warp::lane_id() as usize,
+                fault,
                 &mut h,
             );
         }
@@ -215,7 +233,8 @@ mod qwen3moe_expert_kernels {
 /// [`ExpertKernels::enqueue_gate_up`]'s arguments: both resident Q4_K stacks
 /// (`36 · n_sb` words per row, the same positive multiple of
 /// `rows_per_expert` rows each), the one-column quantized input, the device
-/// ids, the slot count and the slot-major output.
+/// ids, the slot count, the sink an id past the stack raises on, and the
+/// slot-major output.
 pub struct GateUpArgs<'a> {
     pub wg: &'a DeviceTensor<u32>,
     pub wu: &'a DeviceTensor<u32>,
@@ -223,6 +242,7 @@ pub struct GateUpArgs<'a> {
     pub sel: &'a DeviceBuffer<u32>,
     pub n_slots: usize,
     pub rows_per_expert: usize,
+    pub fault: FaultSink,
     pub h: &'a mut DeviceBuffer<f32>,
 }
 
@@ -264,6 +284,7 @@ fn gate_up_shape(what: &'static str, a: &GateUpArgs<'_>) -> Result<GateUpShape, 
         n_slots,
         rows_per_expert,
         h,
+        ..
     } = a;
     let (n_slots, rows_per_expert) = (*n_slots, *rows_per_expert);
     let (n_sb, m) = (act.n_sb(), act.m());
@@ -342,8 +363,9 @@ impl ExpertKernels {
     /// `h[s · rows_per_expert ..][..rows_per_expert]` as `silu(gate row) ·
     /// up row` of expert `sel[s]`, dotting column `s / (n_slots / act.m())`
     /// of `act` — its one column, or at `m` columns each token's
-    /// `n_slots / m` slots its own. Asynchronous, allocation-free,
-    /// capturable.
+    /// `n_slots / m` slots its own. A slot whose id is past the stack
+    /// raises [`FaultSite::ExpertId`] on `a.fault` and its rows of `h` are
+    /// NaN. Asynchronous, allocation-free, capturable.
     pub fn enqueue_gate_up(&self, stream: &CudaStream, a: GateUpArgs<'_>) -> Result<(), GpuError> {
         let what = "qwen3moe::enqueue_gate_up";
         let g = gate_up_shape(what, &a)?;
@@ -352,6 +374,7 @@ impl ExpertKernels {
             wu,
             act,
             sel,
+            fault,
             h,
             ..
         } = a;
@@ -374,6 +397,7 @@ impl ExpertKernels {
             g.slots_per_col,
             g.n_sb,
             g.n_sb.div_ceil(4),
+            fault,
             h,
         )?;
         Ok(())

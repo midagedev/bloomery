@@ -1357,6 +1357,7 @@ mod gate {
         }
         let stream = dev.gpu.stream();
         let rk = RouterKernels::load(dev.gpu.context())?;
+        let sink = dev.gpu.unlabelled_sink();
         let wd = DeviceTensor::upload(stream, w, N_EXPERT, k)?;
         let max = ROUTER_TOKENS[ROUTER_TOKENS.len() - 1];
         let mut ub = RouterOut::for_ubatch(stream, max)?;
@@ -1365,7 +1366,7 @@ mod gate {
         for &t in &ROUTER_TOKENS {
             let x = activations(k, t, 9100 + t as u32);
             let xd = DeviceBuffer::from_host(stream, &x)?;
-            rk.enqueue_ubatch(stream, &wd, &xd, t, &mut ub)?;
+            rk.enqueue_ubatch(stream, &wd, &xd, t, sink, &mut ub)?;
             stream.synchronize()?;
             let (lg, pr, id, wt) = (
                 ub.logits.to_host_vec(stream)?,
@@ -1377,7 +1378,7 @@ mod gate {
             for c0 in (0..t).step_by(MAX_TOKENS) {
                 let m = (t - c0).min(MAX_TOKENS);
                 let xc = DeviceBuffer::from_host(stream, &x[c0 * k..(c0 + m) * k])?;
-                rk.enqueue_fused(stream, &wd, &xc, m, &mut fused)?;
+                rk.enqueue_fused(stream, &wd, &xc, m, sink, &mut fused)?;
                 stream.synchronize()?;
                 let e = N_EXPERT;
                 same &= bits_equal(
@@ -1428,20 +1429,23 @@ mod gate {
         let refusals = [
             (
                 "tokens_past_buffers",
-                rk.enqueue_ubatch(stream, &wd, &x, max + 1, &mut ub)
+                rk.enqueue_ubatch(stream, &wd, &x, max + 1, sink, &mut ub)
                     .is_err(),
             ),
             (
                 "no_tokens",
-                rk.enqueue_ubatch(stream, &wd, &x, 0, &mut ub).is_err(),
+                rk.enqueue_ubatch(stream, &wd, &x, 0, sink, &mut ub)
+                    .is_err(),
             ),
             (
                 "short_input",
-                rk.enqueue_ubatch(stream, &wd, &short, 2, &mut ub).is_err(),
+                rk.enqueue_ubatch(stream, &wd, &short, 2, sink, &mut ub)
+                    .is_err(),
             ),
             (
                 "weight_rows",
-                rk.enqueue_ubatch(stream, &wrong, &x, 8, &mut ub).is_err(),
+                rk.enqueue_ubatch(stream, &wrong, &x, 8, sink, &mut ub)
+                    .is_err(),
             ),
             (
                 "ubatch_over_limit",

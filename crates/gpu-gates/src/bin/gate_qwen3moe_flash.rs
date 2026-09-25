@@ -40,7 +40,10 @@
 //! [`ROWS`] query rows — row `t` the step's query with its heads rotated by
 //! `t`, attending over its own live count, spread from one key to all of
 //! them — bit for bit the [`ROWS`] one-row launches of those rows and
-//! counts.
+//! counts. The same launch with row 3's count one past the cache and row
+//! 5's zero, labelled with layer 13: the `key_count` fault with that layer,
+//! NaN in exactly rows 3 and 5, every other row bit for bit the clean run's,
+//! the word clean before and after a clean run.
 //!
 //! The prefill flash (`flash_gqa_prefill`, the GEMM ubatch's attention) has
 //! its own arithmetic and band. Its scores are the tensor-core pass's (the
@@ -95,7 +98,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::Gpu;
-    use bloomery_gpu::fault::{Fault, FaultSite, LAYER_NONE};
+    use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
         FlashGqaKernels, GROUP, GqaArgs, HEAD, KEY_TILE, SEG_KEYS, partials_ms_len, partials_v_len,
         segments_for,
@@ -152,11 +155,30 @@ mod gate {
         ctx: usize,
     }
 
+    /// Rows of the prefill-shape check (module doc): row `t` is the step's
+    /// query `q` with its `n_head` heads rotated by `t`.
+    fn rotated_rows(q: &[f32], n_head: usize) -> Vec<Vec<f32>> {
+        (0..ROWS)
+            .map(|t| {
+                (0..n_head)
+                    .flat_map(|h| q[((h + t) % n_head) * HEAD..][..HEAD].iter().copied())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Their live counts, spread from one key to `live`.
+    fn spread_counts(live: usize) -> Result<Vec<u32>, GateError> {
+        (0..ROWS)
+            .map(|t| u32::try_from(1 + t * (live - 1) / (ROWS - 1)).map_err(Into::into))
+            .collect()
+    }
+
     /// One launch of `m` query rows (`q` and `n_keys` hold `m` each) over
-    /// the cache planes, into fresh scratch, read back.
+    /// the cache planes, into fresh scratch, raising on `fault`, read back.
     fn run_once(
         k: &FlashGqaKernels,
-        stream: &CudaStream,
+        (stream, fault): (&CudaStream, FaultSink),
         q: &DeviceBuffer<f32>,
         n_keys: &DeviceBuffer<u32>,
         (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
@@ -180,6 +202,7 @@ mod gate {
                 m,
                 part_v: &mut pv,
                 part_ms: &mut pms,
+                fault,
                 y: &mut y,
             },
             mma,
@@ -192,28 +215,22 @@ mod gate {
     /// each row's one-row launch. Returns whether every row matched.
     fn rows_check(
         k: &FlashGqaKernels,
-        stream: &CudaStream,
+        gpu: &Gpu,
         q: &[f32],
         inp: &Inputs,
         live: usize,
         g: &Geom,
         mma: bool,
     ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let run = (stream, gpu.unlabelled_sink());
         let n_head = g.n_kv * GROUP;
-        let rows: Vec<Vec<f32>> = (0..ROWS)
-            .map(|t| {
-                (0..n_head)
-                    .flat_map(|h| q[((h + t) % n_head) * HEAD..][..HEAD].iter().copied())
-                    .collect()
-            })
-            .collect();
-        let limits: Vec<u32> = (0..ROWS)
-            .map(|t| u32::try_from(1 + t * (live - 1) / (ROWS - 1)))
-            .collect::<Result<_, _>>()?;
+        let rows = rotated_rows(q, n_head);
+        let limits = spread_counts(live)?;
         let cache = (&inp.kc, &inp.vc);
         let all = run_once(
             k,
-            stream,
+            run,
             &DeviceBuffer::from_host(stream, &rows.concat())?,
             &DeviceBuffer::from_host(stream, &limits)?,
             cache,
@@ -224,7 +241,7 @@ mod gate {
         for (t, row) in rows.iter().enumerate() {
             let one = run_once(
                 k,
-                stream,
+                run,
                 &DeviceBuffer::from_host(stream, row)?,
                 &DeviceBuffer::from_host(stream, &limits[t..=t])?,
                 cache,
@@ -240,6 +257,97 @@ mod gate {
             verdict(same)
         );
         Ok(same)
+    }
+
+    /// The decode flash's refusal (module doc): the prefill-shape launch with
+    /// row 3's count past the cache and row 5's zero, labelled with layer 13,
+    /// against the same launch clean. Returns whether every check held.
+    fn decode_fault(
+        k: &FlashGqaKernels,
+        gpu: &Gpu,
+        q: &[f32],
+        inp: &Inputs,
+        live: usize,
+        g: &Geom,
+        mma: bool,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let layer = 13usize;
+        let run = (stream, gpu.layer_sink(layer)?);
+        let want = Some(Fault {
+            layer: u32::try_from(layer)?,
+            code: FaultSite::KeyCount as u32,
+        });
+        let n_head = g.n_kv * GROUP;
+        let w = n_head * HEAD;
+        let qd = DeviceBuffer::from_host(stream, &rotated_rows(q, n_head).concat())?;
+        let clean = spread_counts(live)?;
+        let (bad_hi, bad_zero) = (3usize, 5usize);
+        let mut bad = clean.clone();
+        bad[bad_hi] = u32::try_from(g.ctx + 1)?;
+        bad[bad_zero] = 0;
+        let cache = (&inp.kc, &inp.vc);
+        let before = gpu.fault()?;
+        let y = run_once(
+            k,
+            run,
+            &qd,
+            &DeviceBuffer::from_host(stream, &clean)?,
+            cache,
+            g,
+            mma,
+        )?;
+        let after_clean = gpu.fault()?;
+        let yb = run_once(
+            k,
+            run,
+            &qd,
+            &DeviceBuffer::from_host(stream, &bad)?,
+            cache,
+            g,
+            mma,
+        )?;
+        let raised = gpu.take_fault()?;
+        let mut others_same = true;
+        let mut bad_nan = true;
+        for r in 0..ROWS {
+            let (a, b) = (&y[r * w..(r + 1) * w], &yb[r * w..(r + 1) * w]);
+            if r == bad_hi || r == bad_zero {
+                bad_nan &= b.iter().all(|v| v.is_nan());
+            } else {
+                others_same &= bits_equal(a, b);
+            }
+        }
+        let y2 = run_once(
+            k,
+            run,
+            &qd,
+            &DeviceBuffer::from_host(stream, &clean)?,
+            cache,
+            g,
+            mma,
+        )?;
+        let clean_again = bits_equal(&y, &y2) && gpu.fault()?.is_none();
+        let pass = before.is_none()
+            && after_clean.is_none()
+            && raised == want
+            && bad_nan
+            && others_same
+            && clean_again;
+        println!(
+            "decode fault pass={} m={ROWS} counts {} (past ctx {}) and 0 at rows {bad_hi}, {bad_zero}: word \
+             \"{}\" (want \"{}\", clean before {} and after the clean run {}), those rows NaN {bad_nan}, \
+             other rows bit-identical {others_same}, clean rerun bits and word clean {clean_again} {}",
+            if mma { "mma" } else { "scalar" },
+            g.ctx + 1,
+            g.ctx,
+            raised.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            want.map_or_else(String::new, |f| f.to_string()),
+            before.is_none(),
+            after_clean.is_none(),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// The prefill flash's multi-row check on a set (module doc): [`ROWS_PREF`]
@@ -811,8 +919,17 @@ mod gate {
                 let g = Geom { scale, n_kv, ctx };
                 let mut ys = Vec::new();
                 for (pass, mma) in [false, true].into_iter().enumerate() {
-                    let run =
-                        |i: &Inputs| run_once(&k, stream, &i.q, &i.n_keys, (&i.kc, &i.vc), &g, mma);
+                    let run = |i: &Inputs| {
+                        run_once(
+                            &k,
+                            (stream, gpu.unlabelled_sink()),
+                            &i.q,
+                            &i.n_keys,
+                            (&i.kc, &i.vc),
+                            &g,
+                            mma,
+                        )
+                    };
                     let y = run(&inp)?;
                     let y2 = run(&inp)?;
                     let y_nan = run(&inp_nan)?;
@@ -848,7 +965,8 @@ mod gate {
                     }
                     set_ok &= layer_ok;
                     if l == 0 {
-                        set_ok &= rows_check(&k, stream, &q, &inp, live, &g, mma)?;
+                        set_ok &= rows_check(&k, &gpu, &q, &inp, live, &g, mma)?;
+                        set_ok &= decode_fault(&k, &gpu, &q, &inp, live, &g, mma)?;
                     }
                     ys.push(y);
                 }
@@ -907,6 +1025,7 @@ mod gate {
                                     m: 1,
                                     part_v: &mut pv,
                                     part_ms: &mut pms,
+                                    fault: gpu.unlabelled_sink(),
                                     y: &mut yg,
                                 },
                                 mma,
