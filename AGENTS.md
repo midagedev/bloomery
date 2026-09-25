@@ -422,8 +422,9 @@ FMA on. Corrected 2026-09-25 (rustmodern): a `cargo oxide` build does **not** â€
 exports `CARGO_ENCODED_RUSTFLAGS`, which cargo consults first and which masks
 `target.<triple>.rustflags`, so `generate_ds41` and every GPU gate binary compile their host
 code for baseline x86-64 (measured on the box: 1,688 legacy scalar SSE instructions in
-`generate_ds41` against 4 in `bench_v41_host`); the fix is `.cargo/cuda-oxide.toml`
-`extra-rustflags` plus a check that the two files agree (the `oxcpu` fixup in the triage). The attributes
+`generate_ds41` against 4 in `bench_v41_host`). Since the same day `.cargo/cuda-oxide.toml`
+carries the flag for oxide builds through `extra-rustflags`, and `just check-rustflags` (in
+`just gate`) fails when the two files disagree. The attributes
 stay â€” they are what keeps a kernel right in a build without that config
 (another target, a `RUSTFLAGS` override). A helper that touches `_mm*`
 intrinsics is either `#[inline(always)]` (it inherits the caller's features)

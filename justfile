@@ -38,6 +38,10 @@ fmt-check:
 check-recipes:
     ./tools/check-recipes.sh
 
+# 호스트 rustflags의 두 소유자(.cargo/config.toml, .cargo/cuda-oxide.toml)가 같은지 — 맥에서, 빌드 없음.
+check-rustflags:
+    ./tools/check-rustflags.sh
+
 # 아키텍처 축 점검(맥, grep뿐) — docs/arch-split.md 「검사」. 넷 다 엄격하다.
 check-arch:
     bash tools/check-arch.sh
@@ -284,7 +288,7 @@ probe-gpu-real-x:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin real_x && ./target/release/real_x'
 
 build-cpu:
-    ./tools/box.sh 'cd crates/q3k-cpu && RUSTFLAGS="-C target-cpu=znver3" cargo build --release'
+    ./tools/box.sh 'cd crates/q3k-cpu && cargo build --release'
 
 # 빌드는 레시피 의존성이 한다(measure-decode와 같은 모양) — 러너가 재는 것은 방금 빌드된
 # 바이너리여야 하고, 빌드는 임대·유휴 대기 밖에서 끝나야 한다. build-ref-bench는 두 참조 하네스
@@ -676,7 +680,7 @@ gate-1-1:
     ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && S=$(. tools/ref/models/deepseek41.sh && printf %s "$V41_SET_SUFFIX") && T= && { [ -n "$S" ] || T="f32 bf16 q8_0"; } && "$BLOOMERY_DATA/bin/dequant_ref" "$BLOOMERY_V41_MODEL" "$BLOOMERY_DATA/ref-v41$S" $T && "$BLOOMERY_DATA/bin/dequant_ref" --synthetic && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler
+gate: check-recipes check-rustflags check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler
 
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.

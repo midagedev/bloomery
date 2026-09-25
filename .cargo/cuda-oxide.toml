@@ -1,0 +1,5 @@
+# cargo-oxide reads this file from the workspace root. `cargo oxide` exports
+# CARGO_ENCODED_RUSTFLAGS, which cargo consults before `target.<triple>.rustflags`,
+# so the flags in config.toml never reach an oxide build's host code; this list is
+# the oxide side of the same fact, and tools/check-rustflags.sh keeps the two equal.
+extra-rustflags = ["-C", "target-cpu=znver3"]
