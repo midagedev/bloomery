@@ -1,0 +1,27 @@
+# mistral.rs's Qwen3-30B-A3B prompt rows with its recommended build (cuda flash-attn). The public
+# rows so far came from a build without flash-attn, whose prompt attention took the eager P x P
+# path (rig-log 09-26#mrs-noflash; docs/research/mrs-pp4096-report.md). The report's derivation:
+# the mask goes, FA2 causal attention is 1.3-2.2 ms at P = 512 and 71-86 ms at P = 4096 at 50-60 %
+# of peak, so pp512 = 512 / (L + 1.3..2.2) = 3,860..4,470 and pp4096 = 4096 / (L(4096) + 71..86) =
+# 3,630..4,190 with the linear term per token unchanged [derived]; about 6,300 if L(4096) shrinks the
+# way llama.cpp's does.
+kind: baseline
+question: what are mistral.rs's Qwen3 prompt rows on the A6000 when it is built the way its
+  release and install docs build it, with flash-attn?
+term: pp tok/s @ P = 512, mistral.rs (mistralrs bench, the mrspp:512 arm of just
+  depth-gpu-qwen3moe) built with --features "cuda flash-attn", A6000
+unit: tok/s
+predict: 3860..4470
+condition: one lease, three rounds, arms 512 lcpppp:512 mrspp:512 4096 lcpppp:4096
+  lcpppp4096:4096 mrspp:4096 (ours, llama.cpp at the default and -ub 4096, mistral.rs), the order
+  rotated every round; the mrspp arms run the new binary (its sha256 and build features recorded
+  before the lease); the witness shows no other model load and no row carries [cpu-busy] or
+  [other-busy]. The P = 4096 rows are read against 3,630..4,190 by the same three decisions
+reason: sets the mistral.rs columns of the public Qwen3 prefill table, whose rows came from a build
+  without flash-attn; why now: the flash-attn build finished this morning
+decide-in: write the rows into the public table and rig-log, strike the no-flash rows with the
+  build condition kept beside them
+decide-below: confirm the prompt ran the flash kernels (the arm's log, one nsys run of the report's
+  section 5) before any row goes out
+decide-above: write the rows, then find the term: L(4096) shrinking as llama.cpp's does is the
+  report's named case; re-check every ratio line that quotes mistral.rs
