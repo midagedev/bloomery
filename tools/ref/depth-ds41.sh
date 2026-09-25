@@ -35,6 +35,8 @@
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
 #            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
 #            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_LAUNCH_THREAD=1`.
+#            An arm with BLOOMERY_DRAFT=dspark also sees the other card, where the draft runs, and
+#            gets the profile's DSPARK_MODEL unless it names one (timing-card.sh dspark_env).
 #   bin:<path>:<D>  a second generate_ds41 (an absolute path on the box, a base tree's build) at depth
 #            D, row label `bin:<basename of its tree>` (the tree is the path above `target/`). It is a
 #            base by construction, so its freshness is not asked; its tree line (sha256, HEAD, dirty
