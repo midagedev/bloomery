@@ -112,6 +112,112 @@ mod q4k_sel_kernels {
             }
         }
     }
+
+    /// [`q4k_gemv_sel`] with each expert's rows read once for all its
+    /// slots: block `b` is expert `e = b / ⌈rows_per_expert / 8⌉` and warp
+    /// `j` of it row `r = 8 (b mod ⌈rows_per_expert / 8⌉) + j`; the warp
+    /// walks the expert's slots `order[start[e] .. start[e + 1]]` (a run per
+    /// expert, as a bucket pass lays them out) and for slot `s` dots column
+    /// `col0 + s` of the q8_1 scratch (`cols` columns) with
+    /// `cores::q4k_row_dot_1col`, the warp reduction and the lane-0 store
+    /// into `y[s * rows_per_expert + r]` — `q4k_gemv_sel`'s value for that
+    /// slot, bit for bit. The row comes from memory once and from the cache
+    /// for the expert's other slots. An `order` entry not below `n_slots`
+    /// names no slot: it raises [`FaultSite::ExpertId`] and is skipped.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows_per_expert * 36 * n_sb,
+            q.len() >= cols * 256 * iters,
+            s8.len() >= cols * 8 * n_sb,
+            d8.len() >= cols * 2 * n_sb,
+            n_slots + col0 <= cols,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q4k_gemv_grouped(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        order: &[u32],
+        start: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        col0: u32,
+        cols: u32,
+        n_sb: u32,
+        iters: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::threadIdx_x() as usize;
+        let rpe = rows_per_expert as usize;
+        let tiles = rpe.div_ceil(8);
+        let b = thread::blockIdx_x() as usize;
+        let (e, r) = (b / tiles, (b % tiles) * 8 + t / 32);
+        // Warp-uniform: all 32 lanes share e and r.
+        if e >= n_experts as usize || r >= rpe {
+            return;
+        }
+        // SAFETY: e + 1 <= n_experts < start.len() by the launch contract.
+        let (j0, j1) = unsafe {
+            (
+                *start.get_unchecked(e) as usize,
+                *start.get_unchecked(e + 1) as usize,
+            )
+        };
+        let row_abs = e * rpe + r;
+        let lane = warp::lane_id() as usize;
+        let mut j = j0;
+        while j < j1.min(n_slots as usize) {
+            // SAFETY: j < n_slots <= order.len() by the launch contract; the
+            // load is warp-uniform.
+            let slot = unsafe { *order.get_unchecked(j) } as usize;
+            if slot >= n_slots as usize || col0 as usize + slot >= cols as usize {
+                if lane == 0 {
+                    fault.raise(FaultSite::ExpertId);
+                }
+            } else {
+                // The core's caller contract, from the launch contract:
+                // row_abs < n_experts * rows_per_expert rows of `w`, column
+                // col0 + slot < cols of `q`/`s8`/`d8`, iters = ceil(n_sb/4)
+                // from the host, and all 32 lanes of the warp are here.
+                let f0 = q4k_row_dot_1col(
+                    w,
+                    q,
+                    s8,
+                    d8,
+                    n_sb as usize,
+                    iters,
+                    row_abs,
+                    col0 as usize + slot,
+                    lane,
+                );
+                let s0 = warp::reduce_sum_f32(f0);
+                if lane == 0 {
+                    // SAFETY: slot < n_slots and r < rows_per_expert, so the
+                    // value is below n_slots * rows_per_expert <= y.len();
+                    // each slot sits in one expert's run, so lane 0 of this
+                    // warp is its only writer.
+                    unsafe {
+                        *y.get_unchecked_mut(slot * rpe + r) = s0;
+                    }
+                }
+            }
+            j += 1;
+        }
+    }
 }
 
 /// The loaded Q4_K expert-select module and its enqueue API. Owns no
@@ -243,6 +349,86 @@ impl Q4kSelKernels {
             n_sb,
             n_sb.div_ceil(4),
             crate::sink_over(&self.fault, LAYER_NONE),
+            y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`q4k_gemv_grouped`]: the down of `n_slots` slots, each
+    /// expert's rows read once, slot `s` reading column `col0 + s` of `act`
+    /// and writing `y[s * rows_per_expert ..]`; `order` and `start` group the
+    /// slots by expert, one run per expert of `w` (`w.rows() /
+    /// rows_per_expert` of them). Each slot's value is
+    /// [`Q4kSelKernels::enqueue_gemv_q4k_sel`]'s. An `order` entry that names
+    /// no slot raises [`FaultSite::ExpertId`] on `fault`. Asynchronous,
+    /// allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher over the kernel's flat inputs (rust-quality R8)"
+    )]
+    pub fn enqueue_gemv_q4k_grouped(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<u32>,
+        act: &Q8Act,
+        order: &DeviceBuffer<u32>,
+        start: &DeviceBuffer<u32>,
+        n_slots: usize,
+        col0: usize,
+        rows_per_expert: usize,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_gemv_q4k_grouped";
+        let n_sb = act.n_sb();
+        let shape = |detail: String| GpuError::shape(what, detail);
+        if w.cols() != 36 * n_sb
+            || rows_per_expert == 0
+            || !w.rows().is_multiple_of(rows_per_expert)
+        {
+            return Err(shape(format!(
+                "Q4_K rows of 36*{n_sb} words in experts of {rows_per_expert} rows, got {} x {}",
+                w.rows(),
+                w.cols()
+            )));
+        }
+        let n_experts = w.rows() / rows_per_expert;
+        if n_slots == 0
+            || col0 + n_slots > act.m()
+            || order.len() < n_slots
+            || start.len() < n_experts + 1
+            || y.len() < n_slots * rows_per_expert
+        {
+            return Err(shape(format!(
+                "{n_slots} slots from column {col0} of {}: order {}, start {} for {n_experts} \
+                 experts, y {}",
+                act.m(),
+                order.len(),
+                start.len(),
+                y.len()
+            )));
+        }
+        let grid = launch_u32(what, "grid", n_experts * rows_per_expert.div_ceil(8))?;
+        let prep = self
+            .module
+            .prepare_q4k_gemv_grouped(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module.q4k_gemv_grouped(
+            stream,
+            &prep,
+            w.buf(),
+            &act.q4,
+            &act.s8,
+            &act.d8,
+            order,
+            start,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "rows_per_expert", rows_per_expert)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            launch_u32(what, "col0", col0)?,
+            launch_u32(what, "cols", act.m())?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(4))?,
+            fault,
             y,
         )?;
         Ok(())

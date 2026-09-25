@@ -86,7 +86,7 @@ use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use crate::transpose::TransposeKernels;
 
 mod batch;
-pub use batch::{ChunkIo, FfnBatch, JoinIo};
+pub use batch::{BlockIo, CardExperts, ChunkIo, FfnBatch, JoinIo};
 
 /// What the enqueue path's errors name.
 const ENQUEUE: &str = "FfnPiece::enqueue";

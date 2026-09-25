@@ -93,8 +93,8 @@ mod ced;
 mod prefill;
 pub use ced::{CedLayer, CedState, LayerNeed, Need, exact};
 pub use prefill::{
-    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, PrefillMode, T_MAX,
-    batches, prefill, prefill_observed, prefill_with, prepare_prefill,
+    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, PrefillMode,
+    PrefillStats, T_MAX, batches, prefill, prefill_observed, prefill_with, prepare_prefill,
 };
 
 /// The V4.1 engine: the shared skeleton over this body.

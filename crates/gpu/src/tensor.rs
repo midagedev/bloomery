@@ -194,8 +194,11 @@ impl<T: DeviceCopy> DeviceTensor<T> {
 pub(crate) const Q8ACT_MAX_K: usize = 20_480;
 
 /// The most columns a per-slot [`Q8Act`] takes ([`Q8Act::with_slots`]):
-/// eight tokens of eight routed slots, the down input of a prefill pass.
-pub(crate) const Q8ACT_MAX_SLOTS: usize = 64;
+/// every routed slot of a V4.1 prompt batch — the host union's
+/// `UNION_MAX_COLS` tokens, six slots each — the down input of the batch's
+/// grouped experts.
+pub(crate) const Q8ACT_MAX_SLOTS: usize = 3072;
+const _: () = assert!(Q8ACT_MAX_SLOTS == model::moe::UNION_MAX_COLS * 6);
 
 /// q8_1 activation scratch for up to `m` columns of `k` values each. One
 /// set per distinct input site: sites that read the same activation

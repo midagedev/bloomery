@@ -21,6 +21,10 @@
 //!   attention with a visible count past its source's rows — window keys past
 //!   the ring's, compressed rows past the stream's — each raise the fault word
 //!   at `attn_count`; a launch within the rows raises nothing.
+//! - **Router.** On synthetic rows (384 experts of 256 values, 11 tokens):
+//!   the decode shape one token at a time and the batch shape over all
+//!   eleven give the same ids and weights bit for bit, and a −inf bias or a
+//!   NaN in one expert's row raises the fault word at `router` in both.
 //! - **Oracle, one run.** From a reset, the ids decode-stepped one at a time
 //!   through the graph, each position's features read after its step (an md5
 //!   per position). After the step at each case's position `P − 1` the gate
@@ -54,6 +58,12 @@
 //! one's `P + 1`); `--split` / `--no-split` turns the splits on or off, and
 //! `--no-extra` the wide-taps and rollback cases: the FAIL-first runs use a
 //! short subset.
+//!
+//! `BLOOMERY_CARD_EXPERTS=slot|expert` picks the shadow's routed gate·up arm
+//! (the `loaded` line names it); both must pass. `BLOOMERY_STEP_STATS=1`
+//! times each layer's card work with events and prints, after each case, a
+//! `stat prefill split` line (`body::PrefillStats`): runtime values on the
+//! gate card, not measurements, and the events' reads add a wait per batch.
 //!
 //! `--seams P` is the locator, not a verdict: `P` eager steps with every
 //! seam's streams read back (the finite probe's `observed_step`), then a
@@ -101,6 +111,8 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, FaultSite, GpuError};
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT};
     use bloomery_gpu_deepseek41::body::{self, CedState, Deepseek41Model, Need};
+    use bloomery_gpu_deepseek41::chain::ffn::CardExperts;
+    use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
     use cuda_core::{DeviceBuffer, DeviceCopy};
@@ -231,12 +243,18 @@ mod gate {
         body::attach_features(&mut m, &layers)?;
         m.set_mode(StepMode::Graph);
         body::prepare_prefill(&mut m)?;
+        let stats = std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1");
+        if stats {
+            let (gpu, _, b) = m.body_parts(NAME)?;
+            b.set_prefill_card_timing(gpu, true)?;
+        }
         if let Some(p) = args.seams {
             let ids = corpus(p)?;
             return seams(&mut m, &ids);
         }
         let ced = m.body(NAME)?.ced();
         let mut pass = count_cases(&mut m)?;
+        pass &= router_cases(&mut m)?;
         let splits: Vec<(usize, usize)> = if args.split { SPLITS.to_vec() } else { vec![] };
         let top = args
             .cases
@@ -249,10 +267,11 @@ mod gate {
         let steps = (top + 1).min(ORACLE);
         let ids = corpus(ORACLE + 1)?;
         println!(
-            "{NAME}: loaded in {:.1} s; ced={ced}; batch buffers {} B; ids corpus-prose.ids[..{}] \
-             first {:?}; tap layers {layers:?}, draft window {}; oracle {steps} steps; cases {:?} \
-             splits {splits:?} extra {}",
+            "{NAME}: loaded in {:.1} s; ced={ced}; card_experts={}; batch buffers {} B; ids \
+             corpus-prose.ids[..{}] first {:?}; tap layers {layers:?}, draft window {}; oracle \
+             {steps} steps; cases {:?} splits {splits:?} extra {}",
             t.elapsed().as_secs_f64(),
+            CardExperts::from_env()?.name(),
             m.body(NAME)?.batch_bytes(),
             ORACLE + 1,
             &ids[..4],
@@ -297,7 +316,12 @@ mod gate {
         for (what, parts, window) in &runs {
             let t = Instant::now();
             m.reset()?;
+            m.body_parts(NAME)?.2.take_prefill_stats();
             let case = run_case(&mut m, &hp, &ids, parts, *window, &rows)?;
+            if stats {
+                let split = m.body_parts(NAME)?.2.take_prefill_stats();
+                println!("{NAME}: {what} stat prefill split {}", split.describe());
+            }
             let p: usize = parts.iter().sum();
             pass &= compare(what, &case, &oracle[&p], &rows, t);
         }
@@ -373,6 +397,122 @@ mod gate {
                  compressed rows: fault {} (want {}): {}",
                 got.map_or("none".to_string(), |f| f.to_string()),
                 want.map_or("none", FaultSite::name),
+                verdict(pass)
+            );
+        }
+        gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// The router's two shapes (module doc) on synthetic rows: per case, the
+    /// decode shape one token at a time and the batch shape over all of them,
+    /// their fault sites, and — where no value is undefined — their ids and
+    /// weights bit for bit.
+    fn router_cases(m: &mut Deepseek41Model) -> Result<bool, GateError> {
+        const K: usize = 256;
+        const T: usize = 11;
+        let (gpu, _, _) = m.body_parts(NAME)?;
+        let rk = RouterKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let w0: Vec<f32> = (0..N_EXPERT * K).map(|_| rnd()).collect();
+        let x: Vec<f32> = (0..T * K).map(|_| rnd()).collect();
+        let bias0: Vec<f32> = (0..N_EXPERT).map(|_| 0.1 * rnd()).collect();
+        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        let mut out = RouterOut::new(stream)?;
+        let mut probs = DeviceBuffer::<f32>::zeroed(stream, N_EXPERT * T)?;
+        let mut ids = DeviceBuffer::<u32>::zeroed(stream, N_USED * T)?;
+        let mut wts = DeviceBuffer::<f32>::zeroed(stream, N_USED * T)?;
+        let mut ok = true;
+        // (what, expert whose bias is replaced and by what, expert whose row
+        // is poisoned)
+        type RouterCase = (&'static str, Option<(usize, f32)>, Option<usize>);
+        let cases: [RouterCase; 3] = [
+            ("finite", None, None),
+            ("a -inf bias", Some((77, f32::NEG_INFINITY)), None),
+            ("a NaN router row", None, Some(201)),
+        ];
+        for (what, bias_at, nan_row) in cases {
+            let (mut w, mut bias) = (w0.clone(), bias0.clone());
+            if let Some((e, v)) = bias_at {
+                bias[e] = v;
+            }
+            if let Some(e) = nan_row {
+                w[e * K + 3] = f32::NAN;
+            }
+            let w_dev = DeviceTensor::upload(stream, &w, N_EXPERT, K)?;
+            let bias_dev = DeviceBuffer::from_host(stream, &bias)?;
+            let want = (bias_at.is_some() || nan_row.is_some()).then_some(FaultSite::Router);
+            gpu.clear_fault()?;
+            let (mut step_ids, mut step_wts) = (Vec::new(), Vec::new());
+            for t in 0..T {
+                let xt = DeviceBuffer::from_host(stream, &x[t * K..(t + 1) * K])?;
+                let mut it = DeviceBuffer::<u32>::zeroed(stream, N_USED)?;
+                let mut wt = DeviceBuffer::<f32>::zeroed(stream, N_USED)?;
+                rk.enqueue_router_into(
+                    stream,
+                    &w_dev,
+                    &xt,
+                    &bias_dev,
+                    1.5,
+                    &mut out,
+                    &mut it,
+                    &mut wt,
+                    gpu.unlabelled_sink(),
+                )?;
+                step_ids.extend(it.to_host_vec(stream)?);
+                step_wts.extend(wt.to_host_vec(stream)?.iter().map(|v| v.to_bits()));
+            }
+            stream.synchronize()?;
+            let step_fault = gpu.fault()?;
+            gpu.clear_fault()?;
+            rk.enqueue_router_rows(
+                stream,
+                &w_dev,
+                &x_dev,
+                &bias_dev,
+                1.5,
+                T,
+                &mut probs,
+                &mut ids,
+                &mut wts,
+                gpu.unlabelled_sink(),
+            )?;
+            let rows_ids = ids.to_host_vec(stream)?;
+            let rows_wts: Vec<u32> = wts
+                .to_host_vec(stream)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            stream.synchronize()?;
+            let rows_fault = gpu.fault()?;
+            let site = |f: Option<bloomery_gpu::Fault>| f.and_then(|f| f.site());
+            let faults = site(step_fault) == want
+                && site(rows_fault) == want
+                && step_fault.is_some() == want.is_some()
+                && rows_fault.is_some() == want.is_some();
+            let same = want.is_some() || (step_ids == rows_ids && step_wts == rows_wts);
+            let pass = faults && same;
+            ok &= pass;
+            println!(
+                "{NAME}: router {what}, {T} tokens of {K}: step fault {}, rows fault {} (want {}); \
+                 ids and weights {}: {}",
+                step_fault.map_or("none".to_string(), |f| f.to_string()),
+                rows_fault.map_or("none".to_string(), |f| f.to_string()),
+                want.map_or("none", FaultSite::name),
+                if want.is_some() {
+                    "not compared".to_string()
+                } else if same {
+                    "bit-identical".to_string()
+                } else {
+                    let first = (0..N_USED * T)
+                        .find(|&i| step_ids[i] != rows_ids[i] || step_wts[i] != rows_wts[i]);
+                    format!("DIFFER at slot {first:?}")
+                },
                 verdict(pass)
             );
         }

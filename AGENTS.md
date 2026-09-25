@@ -555,6 +555,15 @@ runs every layer at every position, the same-binary A/B arm; the `load` line pri
 `generate_ds41` prints a `stat prefill ced=` line with each layer's block and latent starts; after
 a triangle call `Body::keep_point` grants only the call's boundaries and its last positions and
 `Body::rollback` to any other point is a named error; any other value is refused by name),
+`BLOOMERY_CARD_EXPERTS=expert|slot` (gpu-deepseek41 `FfnBatch`, read once when the batch's buffers are made,
+default `expert`: a prompt batch's shadow reads each card expert once over the layer's whole block —
+`ds41_card_buckets` groups the block's card slots by expert, then `ds41_expert_gate_up_grouped` and
+`q4k_gemv_grouped` walk each expert's run — or, with `slot`, once per slot chunk by chunk through the
+per-slot kernels, the same-binary A/B arm; both write the same bits (`just gate-gpu-ds41-prefill` runs
+the default and `BLOOMERY_BOX_ENV='BLOOMERY_CARD_EXPERTS=slot'` the other); any other value is refused
+by name; the `load` line prints `card_experts=`, and with `BLOOMERY_STEP_STATS=1` `generate_ds41` prints a
+`stat prefill split` line — `prologue/chain/union/wait/enqueue/copy` ms and, per layer-batch, the card's
+`card_out` (first launch to the route's D2H) and `card_in` (the shadow under the union) from event pairs),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).

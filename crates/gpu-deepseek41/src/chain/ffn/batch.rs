@@ -4,20 +4,26 @@
 //! consecutive tokens that hold its block — a suffix of the batch's tokens,
 //! `at .. u`:
 //!
-//! 1. the route ([`FfnPiece::enqueue_batch_route`]), per chunk: the norm with
+//! 1. the route ([`FfnPiece::enqueue_batch_route`]): per chunk the norm with
 //!    its q8_1 form — the step's `norm_quant`, whose f32 output is the
-//!    router's input and the host's activation — the router one token at a
-//!    time into the batch's ids and weights, and each slot's place in the
-//!    card's routed stacks (`ds41_ffn_places`, the handoff's rule);
+//!    router's input and the host's activation — then over the block the
+//!    router (`RouterKernels::enqueue_router_rows`, each token's scores and
+//!    selection the one-token launch's) into the batch's ids and weights, and
+//!    each slot's place in the card's routed stacks (`ds41_ffn_places`, the
+//!    handoff's rule);
 //! 2. the exchange ([`FfnBatch::enqueue_download`], [`FfnBatch::serve`],
 //!    [`FfnBatch::enqueue_upload`]): the block's activations and routing to
 //!    the host, one union call over its tokens for the layer's host experts
 //!    ([`Hybrid::serve_batch`]), the sums back;
-//! 3. the shadow ([`FfnPiece::enqueue_batch_shadow`]), per chunk, enqueued
-//!    before the host computes: HC_PRE, the norm's q8_1 form again, the card's
-//!    routed experts over the chunk's slots (`ds41_expert_gate_up_tok`, the
-//!    step's dot on column `slot / 6`; the q8_1 of `h`; `q4k_sel` over the
-//!    slots) and their sum (`ds41_ffn_card_acc`), the shared expert;
+//! 3. the shadow ([`FfnPiece::enqueue_batch_shadow`]), enqueued before the
+//!    host computes: per chunk HC_PRE, the norm's q8_1 form again, the card's
+//!    routed experts over the chunk's slots (the gate·up, the step's dot on
+//!    column `slot / 6`; the q8_1 of `h`; `q4k_sel` over the slots) and their
+//!    sum (`ds41_ffn_card_acc`), the shared expert. The gate·up reads each
+//!    card expert once over the whole block by default
+//!    (`ds41_card_buckets`, `ds41_expert_gate_up_grouped`, between the
+//!    chunks' parts before and after it), or once per slot chunk by chunk
+//!    (`ds41_expert_gate_up_tok`, [`CardExperts::Slot`]);
 //! 4. the join ([`FfnPiece::enqueue_batch_join`]), one launch over the block:
 //!    the card sum, the host sum and the shared expert combined, then HC_POST
 //!    with the next fold where the layer folds.
@@ -32,10 +38,12 @@
 //! ([`card_sum_elem`], then [`join_elem`]).
 
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 use bloomery_gpu::cores::q3k_row_dot;
+use bloomery_gpu::{FaultSink, FaultSite};
 use cuda_core::{CudaEvent, IntoResult, PinnedHostBuffer, sys};
-use cuda_device::warp;
+use cuda_device::{SharedArray, warp};
 
 use super::*;
 use crate::experts::swiglu_clamp;
@@ -44,8 +52,13 @@ use crate::span::{span, span_mut};
 
 const WHAT: &str = "FfnBatch";
 
-/// Threads per block of every kernel here.
+/// Threads per block of every kernel here but the bucket kernel.
 const THREADS: u32 = 256;
+
+/// Threads of the bucket kernel's one block, and the most card experts a
+/// layer's stack holds for it (its shared start table's width).
+const BUCKET_THREADS: u32 = 1024;
+const BUCKET_EXPERTS: usize = 1024;
 
 #[cuda_module]
 mod ffn_batch_kernels {
@@ -93,7 +106,8 @@ mod ffn_batch_kernels {
     /// rows_per_expert + r` of both stacks, `cores::q3k_row_dot` on that one
     /// column, the warp tree, then `swiglu_clamp` into `h[n]`. A slot whose
     /// place is not below `n_experts` returns before any load and leaves its
-    /// rows of `h` as they were.
+    /// rows of `h` as they were: [`HOST`] is the host's slot, any other such
+    /// place raises [`FaultSite::ExpertId`] on `fault`.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -126,6 +140,7 @@ mod ffn_batch_kernels {
         n_sb: u32,
         iters: u32,
         limit: f32,
+        fault: FaultSink,
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -137,10 +152,14 @@ mod ffn_batch_kernels {
         // SAFETY: slot < n_slots <= sel.len() by the launch contract. All 32
         // lanes of the warp share `row`, hence `slot`, `id` and `col`: the
         // returns below are warp-uniform.
-        let id = unsafe { *sel.get_unchecked(slot) } as usize;
-        if id >= n_experts as usize {
+        let id = unsafe { *sel.get_unchecked(slot) };
+        if id >= n_experts {
+            if id != HOST && t % 32 == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
             return;
         }
+        let id = id as usize;
         let col = slot / N_USED;
         if col >= cols as usize {
             return;
@@ -156,6 +175,193 @@ mod ffn_batch_kernels {
             // SAFETY: row < n_slots * rows_per_expert <= h.len() by the
             // launch contract; lane 0 of the row's warp is its only writer.
             unsafe { *h.get_unchecked_mut(row) = v };
+        }
+    }
+
+    /// The card slots of a block of `n_slots` slots grouped by expert, in one
+    /// block of [`BUCKET_THREADS`]: `start[e] .. start[e + 1]` of `order` are
+    /// the slots whose place `sel[s]` is `e`, in increasing `s`, for every
+    /// place `e < n_experts`; `start[n_experts]` is the count of card slots.
+    /// A place that is neither below `n_experts` nor [`HOST`] raises
+    /// [`FaultSite::ExpertId`] on `fault` and is left out.
+    #[kernel]
+    #[launch_bounds(1024)]
+    #[launch_contract(
+        domain = 1,
+        block = (1024, 1, 1),
+        requires = (
+            sel.len() >= n_slots,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            n_experts <= 1024
+        )
+    )]
+    pub fn ds41_card_buckets(
+        sel: &[u32],
+        n_slots: u32,
+        n_experts: u32,
+        fault: FaultSink,
+        mut order: DisjointSlice<u32>,
+        mut start: DisjointSlice<u32>,
+    ) {
+        static mut COUNT: SharedArray<u32, BUCKET_EXPERTS> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let (n_slots, n_experts) = (n_slots as usize, n_experts as usize);
+        // SAFETY: block-shared; the raw form reaches the `static mut`
+        // without a reference.
+        let count = unsafe { SharedArray::as_raw_mut_ptr(&raw mut COUNT) };
+        let mut s = tid;
+        while s < n_slots {
+            // SAFETY: s < n_slots <= sel.len() by the launch contract.
+            let p = unsafe { *sel.get_unchecked(s) };
+            if p as usize >= n_experts && p != HOST {
+                fault.raise(FaultSite::ExpertId);
+            }
+            s += BUCKET_THREADS as usize;
+        }
+        if tid < n_experts {
+            let mut c = 0u32;
+            let mut s = 0usize;
+            while s < n_slots {
+                // SAFETY: s < n_slots <= sel.len() by the launch contract.
+                c += u32::from(unsafe { *sel.get_unchecked(s) } as usize == tid);
+                s += 1;
+            }
+            // SAFETY: tid < n_experts <= BUCKET_EXPERTS; thread tid is the
+            // entry's only writer before the barrier.
+            unsafe { *count.add(tid) = c };
+        }
+        thread::sync_threads();
+        if tid == 0 {
+            let mut at = 0u32;
+            let mut e = 0usize;
+            while e < n_experts {
+                // SAFETY: e < n_experts <= BUCKET_EXPERTS, published by the
+                // barrier; thread 0 alone rewrites it now, before the next.
+                let c = unsafe { *count.add(e) };
+                // SAFETY: e < n_experts + 1 <= start.len(); thread 0 is the
+                // only writer.
+                unsafe {
+                    *start.get_unchecked_mut(e) = at;
+                    *count.add(e) = at;
+                }
+                at += c;
+                e += 1;
+            }
+            // SAFETY: n_experts < start.len() by the launch contract.
+            unsafe { *start.get_unchecked_mut(n_experts) = at };
+        }
+        thread::sync_threads();
+        if tid < n_experts {
+            // SAFETY: tid < n_experts, the entry thread 0 left before the
+            // barrier.
+            let mut at = unsafe { *count.add(tid) } as usize;
+            let mut s = 0usize;
+            while s < n_slots {
+                // SAFETY: s < n_slots <= sel.len() by the launch contract.
+                if unsafe { *sel.get_unchecked(s) } as usize == tid {
+                    // SAFETY: at < start[tid + 1] <= n_slots <= order.len(); the
+                    // runs of distinct places are disjoint, so thread tid is
+                    // the only writer of its run.
+                    unsafe { *order.get_unchecked_mut(at) = s as u32 };
+                    at += 1;
+                }
+                s += 1;
+            }
+        }
+    }
+
+    /// [`ds41_expert_gate_up_tok`] with each card expert read once: block
+    /// `b` is expert `e = b / ⌈rows_per_expert / 8⌉`, and warp `j` of it
+    /// weight row `r = 8 (b mod ⌈rows_per_expert / 8⌉) + j` of that expert;
+    /// the warp walks the expert's slots `order[start[e] .. start[e + 1]]`
+    /// ([`ds41_card_buckets`]) and for slot `s` dots column `col0 + s / 6`
+    /// of the q8_1 activation (`cols` columns, the block's from `col0`)
+    /// through `cores::q3k_row_dot`, the warp tree and
+    /// `swiglu_clamp` into `h[s · rows_per_expert + r]` — the per-slot
+    /// kernel's value for that slot and row, bit for bit. A slot's weight row
+    /// comes from memory once and from the cache for the expert's other slots.
+    /// An `order` entry that names no slot of the block raises
+    /// [`FaultSite::ExpertId`] and is skipped.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * wg.len() >= n_experts * rows_per_expert * 110 * n_sb,
+            4 * wu.len() >= n_experts * rows_per_expert * 110 * n_sb,
+            q.len() >= 64 * iters * cols,
+            d8.len() >= 2 * n_sb * cols,
+            n_slots + 6 * col0 <= 6 * cols,
+            order.len() >= n_slots,
+            start.len() >= n_experts + 1,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn ds41_expert_gate_up_grouped(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u64],
+        d8: &[f32],
+        order: &[u32],
+        start: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        col0: u32,
+        cols: u32,
+        n_sb: u32,
+        iters: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let rpe = rows_per_expert as usize;
+        let tiles = rpe.div_ceil(8);
+        let b = thread::blockIdx_x() as usize;
+        let (e, r) = (b / tiles, (b % tiles) * 8 + tid / 32);
+        // Warp-uniform: all 32 lanes share e and r.
+        if e >= n_experts as usize || r >= rpe {
+            return;
+        }
+        // SAFETY: e + 1 <= n_experts < start.len() by the launch contract.
+        let (j0, j1) = unsafe {
+            (
+                *start.get_unchecked(e) as usize,
+                *start.get_unchecked(e + 1) as usize,
+            )
+        };
+        let row_abs = e * rpe + r;
+        let lane = warp::lane_id() as usize;
+        let mut j = j0;
+        while j < j1.min(n_slots as usize) {
+            // SAFETY: j < n_slots <= order.len() by the launch contract.
+            let slot = unsafe { *order.get_unchecked(j) } as usize;
+            let col = col0 as usize + slot / N_USED;
+            if slot >= n_slots as usize || col >= cols as usize {
+                if lane == 0 {
+                    fault.raise(FaultSite::ExpertId);
+                }
+            } else {
+                let fg = q3k_row_dot(wg, q, d8, n_sb as usize, iters, row_abs, col, 1, lane);
+                let fu = q3k_row_dot(wu, q, d8, n_sb as usize, iters, row_abs, col, 1, lane);
+                let g = warp::reduce_sum_f32(fg[0]);
+                let u = warp::reduce_sum_f32(fu[0]);
+                if lane == 0 {
+                    // SAFETY: slot < n_slots and r < rows_per_expert, so the
+                    // value is below n_slots * rows_per_expert <= h.len();
+                    // each slot sits in one expert's run, so lane 0 of this
+                    // warp is its only writer.
+                    unsafe { *h.get_unchecked_mut(slot * rpe + r) = swiglu_clamp(g, u, limit) };
+                }
+            }
+            j += 1;
         }
     }
 
@@ -443,13 +649,14 @@ pub struct FfnBatch {
     acc: DeviceBuffer<f32>,
     shexp: DeviceBuffer<f32>,
     hsum: DeviceBuffer<f32>,
-    /// A chunk's scratch: the router's per-expert rows and ticket; the norm's
+    /// Per token, the router's score of every expert.
+    probs: DeviceBuffer<f32>,
+    /// A chunk's scratch: the norm's
     /// f32 output a second time (discarded) and, per token count `m` (index
     /// `m − 1`), its q8_1 form; the HC_PRE mixes; the routed SwiGLU outputs
     /// (six slots a token), their q8_1 form per token count, the routed down
     /// outputs; the shared expert's SwiGLU output (token-major), its q8_1 form
     /// per token count and its down output row-major.
-    rout: RouterOut,
     normed: DeviceBuffer<f32>,
     act_x: Vec<Q8Act>,
     mixes: DeviceBuffer<f32>,
@@ -462,19 +669,97 @@ pub struct FfnBatch {
     /// The exchange: page-locked copies of the activations, the routing and
     /// the host sums; the host's view of the activations the union reads;
     /// the event the route's copies complete at.
+    /// The grouped arm's block buffers ([`CardExperts::Expert`]): per token
+    /// the norm's q8_1 planes the gate·up reads (q3 and d8, as the chunk's
+    /// scratch lays out a column), per slot the SwiGLU output, its q8_1 form
+    /// and the down output, and the block's card slots by expert (`order`,
+    /// runs `start`).
+    experts: CardExperts,
+    q3_all: DeviceBuffer<u64>,
+    d8_all: DeviceBuffer<f32>,
+    h_all: DeviceBuffer<f32>,
+    act_h_all: Q8Act,
+    down_all: DeviceBuffer<f32>,
+    order: DeviceBuffer<u32>,
+    start: DeviceBuffer<u32>,
     host_x: PinnedHostBuffer<f32>,
     host_ids: PinnedHostBuffer<u32>,
     host_w: PinnedHostBuffer<f32>,
     host_sum: PinnedHostBuffer<f32>,
     x_host: Tensor2,
     routed: CudaEvent,
+    /// [`FfnBatch::serve`]'s host time since the last
+    /// [`FfnBatch::take_serve_times`]: the waits on the route's copies and
+    /// the activations' copy into the union's view.
+    wait_ns: u64,
+    copy_ns: u64,
+}
+
+/// How a batch's shadow reads the card's routed experts
+/// ([`CardExperts::from_env`]): once per expert over the layer's block
+/// (`ds41_card_buckets`, then `ds41_expert_gate_up_grouped`), or once per
+/// slot chunk by chunk (`ds41_expert_gate_up_tok`) — the same-binary arm;
+/// both write the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardExperts {
+    Expert,
+    Slot,
+}
+
+impl CardExperts {
+    /// `BLOOMERY_CARD_EXPERTS`: unset or `expert` groups by expert, `slot`
+    /// reads per slot; any other value is refused by name.
+    pub fn from_env() -> Result<CardExperts, GpuError> {
+        match std::env::var("BLOOMERY_CARD_EXPERTS").as_deref() {
+            Err(_) | Ok("expert") => Ok(CardExperts::Expert),
+            Ok("slot") => Ok(CardExperts::Slot),
+            Ok(_) => Err(GpuError::State {
+                what: "BLOOMERY_CARD_EXPERTS",
+                missing: "expert or slot",
+            }),
+        }
+    }
+
+    /// The name a `load` line prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            CardExperts::Expert => "expert",
+            CardExperts::Slot => "slot",
+        }
+    }
+}
+
+/// Which part of a chunk's shadow a call enqueues: all of it (the per-slot
+/// arm), or the part before the block's grouped experts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Whole,
+    /// HC_PRE, the norm's q8_1 form (and its copy into the block's), the
+    /// shared expert; the routed experts and the card sum run over the block.
+    Before,
+}
+
+/// [`FfnBatch::serve`]'s host time outside the union call, in nanoseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServeTimes {
+    /// Waiting on the route's copies to the host.
+    pub wait_ns: u64,
+    /// Copying the activations into the union's view.
+    pub copy_ns: u64,
 }
 
 impl FfnBatch {
     /// The buffers for batches of up to `cap` tokens (at most
     /// [`UNION_MAX_COLS`], the host union's columns) of rows of `n_embd`
     /// through experts of `ff`, on `gpu`.
-    pub fn new(gpu: &Gpu, n_embd: usize, ff: usize, cap: usize) -> Result<FfnBatch, GpuError> {
+    pub fn new(
+        gpu: &Gpu,
+        n_embd: usize,
+        ff: usize,
+        cap: usize,
+        experts: CardExperts,
+    ) -> Result<FfnBatch, GpuError> {
         if cap == 0 || cap > UNION_MAX_COLS {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -491,6 +776,7 @@ impl FfnBatch {
             })
         };
         let counts = 1..=c;
+        let n_sb = n_embd / 256;
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
         let module = unsafe { ffn_batch_kernels::load(ctx)? };
@@ -507,7 +793,7 @@ impl FfnBatch {
             acc: z(cap * n_embd)?,
             shexp: z(cap * n_embd)?,
             hsum: z(cap * n_embd)?,
-            rout: RouterOut::new(stream)?,
+            probs: z(cap * N_EXPERT)?,
             normed: z(c * n_embd)?,
             act_x: counts
                 .clone()
@@ -532,6 +818,14 @@ impl FfnBatch {
                 .map(|m| Q8Act::with_k(stream, m, ff))
                 .collect::<Result<_, _>>()?,
             sh_raw: z(c * n_embd)?,
+            experts,
+            q3_all: DeviceBuffer::zeroed(stream, cap * 64 * n_sb.div_ceil(2))?,
+            d8_all: z(cap * 2 * n_sb)?,
+            h_all: z(cap * N_USED * ff)?,
+            act_h_all: Q8Act::with_slots(stream, cap * N_USED, ff)?,
+            down_all: z(cap * N_USED * n_embd)?,
+            order: DeviceBuffer::zeroed(stream, cap * N_USED)?,
+            start: DeviceBuffer::zeroed(stream, BUCKET_EXPERTS + 1)?,
             host_x: pinned("cuMemAllocHost (the batch's activations)", cap * n_embd)?,
             host_ids: PinnedHostBuffer::<u32>::zeroed(ctx, cap * N_USED).map_err(|source| {
                 GpuError::Driver {
@@ -547,7 +841,26 @@ impl FfnBatch {
                 data: vec![0.0; cap * n_embd],
             },
             routed: ctx.new_event(None)?,
+            wait_ns: 0,
+            copy_ns: 0,
         })
+    }
+
+    /// The serve times since the last call, and zero again.
+    pub fn take_serve_times(&mut self) -> ServeTimes {
+        let t = ServeTimes {
+            wait_ns: self.wait_ns,
+            copy_ns: self.copy_ns,
+        };
+        self.wait_ns = 0;
+        self.copy_ns = 0;
+        t
+    }
+
+    /// How the shadow reads the card's routed experts.
+    #[must_use]
+    pub fn experts(&self) -> CardExperts {
+        self.experts
     }
 
     /// Tokens a batch takes at most.
@@ -575,22 +888,29 @@ impl FfnBatch {
             &self.acc,
             &self.shexp,
             &self.hsum,
-            &self.rout.logits,
-            &self.rout.probs,
-            &self.rout.weights,
+            &self.probs,
             &self.normed,
             &self.mixes,
             &self.h,
             &self.down,
             &self.sh_h,
             &self.sh_raw,
+            &self.d8_all,
+            &self.h_all,
+            &self.down_all,
         ];
-        let acts = self.act_x.iter().chain(&self.act_h).chain(&self.act_sh);
+        let acts = self
+            .act_x
+            .iter()
+            .chain(&self.act_h)
+            .chain(&self.act_sh)
+            .chain(std::iter::once(&self.act_h_all));
         f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.ids.num_bytes()
             + self.sel.num_bytes()
-            + self.rout.ids.num_bytes()
-            + ROUTER_TICKET_BYTES
+            + self.q3_all.num_bytes()
+            + self.order.num_bytes()
+            + self.start.num_bytes()
             + acts.map(q8act_bytes).sum::<usize>()
     }
 
@@ -668,13 +988,17 @@ impl FfnBatch {
         u: usize,
     ) -> Result<(), GpuError> {
         self.check_tokens(at, u)?;
+        let t0 = Instant::now();
         self.routed.synchronize()?;
+        let t1 = Instant::now();
         let n = self.n_embd;
         self.x_host.ne1 = u - at;
         self.x_host.data.clear();
         self.x_host
             .data
             .extend_from_slice(&self.host_x[at * n..u * n]);
+        self.wait_ns += nanos(t1 - t0);
+        self.copy_ns += nanos(t1.elapsed());
         hybrid.serve_batch(
             layer,
             &self.x_host,
@@ -707,6 +1031,46 @@ impl FfnBatch {
         }
         Ok(())
     }
+}
+
+/// Enqueue the copy of `len` values of `src` from its start to `dst` from
+/// value `at`.
+///
+/// SAFETY: neither buffer is written or freed by anything but this stream
+/// until the copy completes.
+unsafe fn dtod<T: cuda_core::DeviceCopy>(
+    stream: &CudaStream,
+    dst: &mut DeviceBuffer<T>,
+    at: usize,
+    src: &DeviceBuffer<T>,
+    len: usize,
+) -> Result<(), GpuError> {
+    if len == 0 || len > src.len() || at + len > dst.len() {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!("{len} values from {} into {} at {at}", src.len(), dst.len()),
+        });
+    }
+    // SAFETY: both ranges are inside their buffers (checked above); the
+    // buffers stay untouched off this stream until the copy completes by
+    // this fn's contract.
+    let rc = unsafe {
+        sys::cuMemcpyDtoDAsync_v2(
+            dst.cu_deviceptr() + (at * size_of::<T>()) as u64,
+            src.cu_deviceptr(),
+            len * size_of::<T>(),
+            stream.cu_stream(),
+        )
+    };
+    rc.result().map_err(|source| GpuError::Driver {
+        op: Some("cuMemcpyDtoDAsync_v2 (the block's q8_1 planes)"),
+        source,
+    })
+}
+
+/// `d` in whole nanoseconds, saturating.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Enqueue the copy of values `at` of `src` to the same values of `dst`.
@@ -783,6 +1147,19 @@ pub struct ChunkIo<'a> {
     pub fold_in: &'a DeviceBuffer<f32>,
 }
 
+/// A layer's block over a batch: its chunks, consecutive runs of at most
+/// [`HC_MAX_TOKENS`] positions (position `p` is the batch's token `p −
+/// base`), and the batch's streams and folds from its token 0 on.
+pub struct BlockIo<'a> {
+    pub chunks: &'a [Range<usize>],
+    /// The batch's first position.
+    pub base: usize,
+    /// The streams the sub-layer reads, `4 · n_embd` a token.
+    pub streams: &'a DeviceBuffer<f32>,
+    /// The norm's input, `n_embd` a token.
+    pub fold_in: &'a DeviceBuffer<f32>,
+}
+
 /// The buffers a batch join shares with the rest of the batch: its streams
 /// and folds, the batch's tokens from 0 on — the join reads and writes the
 /// tokens it is given.
@@ -796,52 +1173,60 @@ pub struct JoinIo<'a> {
 }
 
 impl FfnPiece {
-    /// Layer `layer`'s route for the chunk `io` of a batch: the norm with its
-    /// q8_1 form, the router one token at a time, each slot's place from
-    /// `slots`, the map's card copy. Asynchronous, allocation-free.
+    /// Layer `layer`'s route for the block `io` of a batch: per chunk the
+    /// norm with its q8_1 form; then, over the block's tokens, the router
+    /// ([`RouterKernels::enqueue_router_rows`], two launches) and each slot's
+    /// place from `slots`, the map's card copy (one launch). Asynchronous,
+    /// allocation-free.
     pub fn enqueue_batch_route(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
         b: &mut FfnBatch,
         layer: usize,
-        io: &ChunkIo<'_>,
+        io: &BlockIo<'_>,
         slots: &DeviceTensor<u32>,
     ) -> Result<(), GpuError> {
-        let i = self.batch_layer(layer, b, io)?;
-        let (stream, n, m, at) = (gpu.stream(), self.n_embd, io.m, io.at);
+        let (i, at, u) = self.batch_block(layer, b, io)?;
+        let (stream, n) = (gpu.stream(), self.n_embd);
         let c = &self.cfg[i];
         let lw = LayerWeights::resolve(c, w, [n, self.ff], self.hc_eps, self.hc_iters)?;
         let fault = gpu.layer_sink(layer)?;
-        let mut x = span_mut(WHAT, &mut b.x, at * n, m * n)?;
-        self.fused.enqueue_norm_quant(
-            stream,
-            io.fold_in,
-            lw.gain,
-            self.rms_eps,
-            count_of(&mut b.act_x, m)?,
-            &mut x,
-            fault,
-        )?;
-        drop(x);
-        for t in at..at + m {
-            let x = span(WHAT, &b.x, t * n, n)?;
-            let mut ids = span_mut(WHAT, &mut b.ids, t * N_USED, N_USED)?;
-            let mut wts = span_mut(WHAT, &mut b.weights, t * N_USED, N_USED)?;
-            self.router.enqueue_router_into(
+        for r in io.chunks {
+            let (at, m) = (r.start - io.base, r.len());
+            let streams = span(WHAT, io.streams, at * HC_STREAMS * n, m * HC_STREAMS * n)?;
+            let fold_in = span(WHAT, io.fold_in, at * n, m * n)?;
+            let chunk = ChunkIo {
+                at,
+                m,
+                streams: &streams,
+                fold_in: &fold_in,
+            };
+            self.batch_layer(layer, b, &chunk)?;
+            let mut x = span_mut(WHAT, &mut b.x, chunk.at * n, chunk.m * n)?;
+            self.fused.enqueue_norm_quant(
                 stream,
-                lw.router,
-                &x,
-                lw.bias,
-                self.scale,
-                &mut b.rout,
-                &mut ids,
-                &mut wts,
+                chunk.fold_in,
+                lw.gain,
+                self.rms_eps,
+                count_of(&mut b.act_x, chunk.m)?,
+                &mut x,
+                fault,
+            )?;
+        }
+        let t = u - at;
+        {
+            let x = span(WHAT, &b.x, at * n, t * n)?;
+            let mut probs = span_mut(WHAT, &mut b.probs, 0, t * N_EXPERT)?;
+            let mut ids = span_mut(WHAT, &mut b.ids, at * N_USED, t * N_USED)?;
+            let mut wts = span_mut(WHAT, &mut b.weights, at * N_USED, t * N_USED)?;
+            self.router.enqueue_router_rows(
+                stream, lw.router, &x, lw.bias, self.scale, t, &mut probs, &mut ids, &mut wts,
                 fault,
             )?;
         }
         let what = "ds41_ffn_places";
-        let slots_n = m * N_USED;
+        let slots_n = t * N_USED;
         let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
         let mut sel = span_mut(WHAT, &mut b.sel, at * N_USED, slots_n)?;
         let grid = launch_u32(what, "grid", slots_n.div_ceil(THREADS as usize))?;
@@ -861,10 +1246,13 @@ impl FfnPiece {
         Ok(())
     }
 
-    /// Layer `layer`'s shadow work for the chunk `io`, after the batch's
-    /// route: HC_PRE into the batch's results, the norm's q8_1 form again,
-    /// the card's routed experts over the chunk's slots and their sum, the
-    /// shared expert into the batch's outputs. Asynchronous, allocation-free.
+    /// Layer `layer`'s shadow work for the block `io`, after the batch's
+    /// route, the layer's tensors resolved once. Per slot
+    /// ([`CardExperts::Slot`]): each chunk's whole shadow in turn. Per expert:
+    /// each chunk's HC_PRE, norm and shared expert; then over the block the
+    /// card slots grouped by expert and one gate·up launch that reads each
+    /// card expert once; then each chunk's down and card sum. Asynchronous,
+    /// allocation-free.
     pub fn enqueue_batch_shadow(
         &mut self,
         gpu: &Gpu,
@@ -872,75 +1260,288 @@ impl FfnPiece {
         card: Option<CardStacks<'_>>,
         b: &mut FfnBatch,
         layer: usize,
-        io: &ChunkIo<'_>,
+        io: &BlockIo<'_>,
     ) -> Result<(), GpuError> {
-        let i = self.batch_layer(layer, b, io)?;
+        let (i, at, u) = self.batch_block(layer, b, io)?;
         let card = self.check_card(layer, i, card)?;
-        let (stream, n, ff, m, at) = (gpu.stream(), self.n_embd, self.ff, io.m, io.at);
         let c = &self.cfg[i];
-        let lw = LayerWeights::resolve(c, w, [n, ff], self.hc_eps, self.hc_iters)?;
-        let fault = gpu.layer_sink(layer)?;
-        let pre = HcPreArgs {
-            params: &lw.hc,
-            x: io.streams,
-            tokens: m,
-            rms_eps: self.rms_eps,
-            fault,
+        let lw = LayerWeights::resolve(c, w, [self.n_embd, self.ff], self.hc_eps, self.hc_iters)?;
+        if lw.sh_down.reads_q8_1() != c.sh_down_q8_1 {
+            return Err(tensor_err(
+                &c.sh_down,
+                "of the format the file's header names for it",
+            ));
+        }
+        let phase = match b.experts {
+            CardExperts::Slot => Phase::Whole,
+            CardExperts::Expert => Phase::Before,
         };
-        let mut hc = span_mut(WHAT, &mut b.hc, at * HC_MIX, m * HC_MIX)?;
-        self.hc
-            .enqueue_pre(stream, &pre, &mut self.hc_scratch, &mut b.mixes, &mut hc)?;
-        drop(hc);
-        let act_x = count_of(&mut b.act_x, m)?;
-        self.fused.enqueue_norm_quant(
-            stream,
-            io.fold_in,
-            lw.gain,
-            self.rms_eps,
-            act_x,
-            &mut b.normed,
-            fault,
-        )?;
-        let act_x = &b.act_x[m - 1];
-        let slots_n = m * N_USED;
-        let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
+        let n = self.n_embd;
+        {
+            for r in io.chunks {
+                let (at, m) = (r.start - io.base, r.len());
+                let streams = span(WHAT, io.streams, at * HC_STREAMS * n, m * HC_STREAMS * n)?;
+                let fold_in = span(WHAT, io.fold_in, at * n, m * n)?;
+                let chunk = ChunkIo {
+                    at,
+                    m,
+                    streams: &streams,
+                    fold_in: &fold_in,
+                };
+                self.batch_layer(layer, b, &chunk)?;
+                self.enqueue_batch_shadow_chunk(gpu, &lw, i, card, b, layer, &chunk, phase)?;
+            }
+        }
+        if phase == Phase::Before {
+            self.enqueue_grouped_block(gpu, i, card, b, layer, at, u)?;
+        }
+        Ok(())
+    }
+
+    /// The grouped arm's block launches for tokens `at .. u`, after every
+    /// chunk's part before them: with card experts, the card slots by expert
+    /// ([`ds41_card_buckets`]), the gate·up of every card slot
+    /// ([`ds41_expert_gate_up_grouped`]) into the block's SwiGLU outputs,
+    /// their q8_1 form and the down (`q4k_gemv_grouped`), each card expert
+    /// read once; then the card sum of every token of the block.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's layer, stacks, buffers and tokens (rust-quality R8)"
+    )]
+    fn enqueue_grouped_block(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        card: Option<CardStacks<'_>>,
+        b: &mut FfnBatch,
+        layer: usize,
+        at: usize,
+        u: usize,
+    ) -> Result<(), GpuError> {
+        let (stream, n) = (gpu.stream(), self.n_embd);
+        let c = &self.cfg[i];
+        let slots_n = (u - at) * N_USED;
         if let Some(s) = card {
-            let what = "ds41_expert_gate_up_tok";
-            let n_sb = act_x.n_sb();
-            let grid = launch_u32(what, "grid", (slots_n * ff).div_ceil(8))?;
-            let prep = b
-                .module
-                .prepare_ds41_expert_gate_up_tok(LaunchConfig1D::new(grid, THREADS, 0))?;
-            b.module.ds41_expert_gate_up_tok(
+            self.enqueue_grouped_experts(gpu, i, s, b, layer, at, u)?;
+        }
+        let what = "ds41_ffn_card_acc";
+        let m = u - at;
+        let down = span(WHAT, &b.down_all, at * N_USED * n, slots_n * n)?;
+        let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
+        let wts = span(WHAT, &b.weights, at * N_USED, slots_n)?;
+        let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
+        let grid = launch_u32(what, "grid", (m * n).div_ceil(THREADS as usize))?;
+        let prep = b
+            .module
+            .prepare_ds41_ffn_card_acc(LaunchConfig1D::new(grid, THREADS, 0))?;
+        b.module.ds41_ffn_card_acc(
+            stream,
+            &prep,
+            &down,
+            &wts,
+            &sel,
+            launch_u32(what, "n", n)?,
+            launch_u32(what, "m", m)?,
+            launch_u32(what, "n_card", c.n_card)?,
+            &mut acc,
+        )?;
+        Ok(())
+    }
+
+    /// The card experts of the block `at .. u` ([`FfnPiece::enqueue_grouped_block`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's layer, stacks, buffers and tokens (rust-quality R8)"
+    )]
+    fn enqueue_grouped_experts(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        s: CardStacks<'_>,
+        b: &mut FfnBatch,
+        layer: usize,
+        at: usize,
+        u: usize,
+    ) -> Result<(), GpuError> {
+        let (stream, ff, n) = (gpu.stream(), self.ff, self.n_embd);
+        let c = &self.cfg[i];
+        let fault = gpu.layer_sink(layer)?;
+        let n_experts = s.gate.rows() / ff;
+        if n_experts > BUCKET_EXPERTS {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer}'s card stack of {n_experts} experts; the grouped gate·up \
+                     takes at most {BUCKET_EXPERTS} (BLOOMERY_CARD_EXPERTS=slot runs any)"
+                ),
+            });
+        }
+        let slots_n = (u - at) * N_USED;
+        let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
+        let mut order = span_mut(WHAT, &mut b.order, 0, slots_n)?;
+        {
+            let what = "ds41_card_buckets";
+            let prep =
+                b.module
+                    .prepare_ds41_card_buckets(LaunchConfig1D::new(1, BUCKET_THREADS, 0))?;
+            b.module.ds41_card_buckets(
                 stream,
                 &prep,
-                s.gate.buf(),
-                s.up.buf(),
-                act_x.q3(),
-                act_x.d8(),
                 &sel,
-                launch_u32(what, "n_experts", s.gate.rows() / ff)?,
-                launch_u32(what, "rows_per_expert", ff)?,
                 launch_u32(what, "n_slots", slots_n)?,
-                launch_u32(what, "cols", m)?,
-                launch_u32(what, "n_sb", n_sb)?,
-                launch_u32(what, "iters", n_sb.div_ceil(2))?,
-                c.limit,
-                &mut b.h,
-            )?;
-            let act_h = count_of(&mut b.act_h, m)?;
-            gpu.enqueue_quantize_q8_1_layer(&b.h, act_h, layer)?;
-            gpu.q4k_sel().enqueue_gemv_q4k_sel(
-                stream,
-                s.down,
-                act_h,
-                &sel,
-                slots_n,
-                n,
-                &mut b.down,
+                launch_u32(what, "n_experts", n_experts)?,
+                fault,
+                &mut order,
+                &mut b.start,
             )?;
         }
+        let what = "ds41_expert_gate_up_grouped";
+        let n_sb = self.n_embd / 256;
+        let grid = launch_u32(what, "grid", n_experts * ff.div_ceil(8))?;
+        let mut h = span_mut(WHAT, &mut b.h_all, at * N_USED * ff, slots_n * ff)?;
+        let prep = b
+            .module
+            .prepare_ds41_expert_gate_up_grouped(LaunchConfig1D::new(grid, THREADS, 0))?;
+        b.module.ds41_expert_gate_up_grouped(
+            stream,
+            &prep,
+            s.gate.buf(),
+            s.up.buf(),
+            &b.q3_all,
+            &b.d8_all,
+            &order,
+            &b.start,
+            launch_u32(what, "n_experts", n_experts)?,
+            launch_u32(what, "rows_per_expert", ff)?,
+            launch_u32(what, "n_slots", slots_n)?,
+            launch_u32(what, "col0", at)?,
+            launch_u32(what, "cols", u)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "iters", n_sb.div_ceil(2))?,
+            c.limit,
+            fault,
+            &mut h,
+        )?;
+        drop((h, sel, order));
+        gpu.enqueue_quantize_q8_1_layer(&b.h_all, &mut b.act_h_all, layer)?;
+        let order = span(WHAT, &b.order, 0, slots_n)?;
+        let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
+        gpu.q4k_sel().enqueue_gemv_q4k_grouped(
+            stream,
+            s.down,
+            &b.act_h_all,
+            &order,
+            &b.start,
+            slots_n,
+            at * N_USED,
+            n,
+            fault,
+            &mut down,
+        )?;
+        Ok(())
+    }
+
+    /// Layer `layer`'s shadow work for the chunk `io`, after the batch's
+    /// route — the parts `phase` names: HC_PRE into the batch's results,
+    /// the norm's q8_1 form again, the card's routed experts over the
+    /// chunk's slots (the per-slot gate·up, or the block's grouped outputs)
+    /// and their sum, the shared expert into the batch's outputs. `lw` are
+    /// layer `i`'s tensors.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shadow's inputs, the layer's resolved tensors and the phase (rust-quality R8)"
+    )]
+    fn enqueue_batch_shadow_chunk(
+        &mut self,
+        gpu: &Gpu,
+        lw: &LayerWeights<'_>,
+        i: usize,
+        card: Option<CardStacks<'_>>,
+        b: &mut FfnBatch,
+        layer: usize,
+        io: &ChunkIo<'_>,
+        phase: Phase,
+    ) -> Result<(), GpuError> {
+        let (stream, n, ff, m, at) = (gpu.stream(), self.n_embd, self.ff, io.m, io.at);
+        let c = &self.cfg[i];
+        let fault = gpu.layer_sink(layer)?;
         {
+            let pre = HcPreArgs {
+                params: &lw.hc,
+                x: io.streams,
+                tokens: m,
+                rms_eps: self.rms_eps,
+                fault,
+            };
+            let mut hc = span_mut(WHAT, &mut b.hc, at * HC_MIX, m * HC_MIX)?;
+            self.hc
+                .enqueue_pre(stream, &pre, &mut self.hc_scratch, &mut b.mixes, &mut hc)?;
+            drop(hc);
+            let act_x = count_of(&mut b.act_x, m)?;
+            self.fused.enqueue_norm_quant(
+                stream,
+                io.fold_in,
+                lw.gain,
+                self.rms_eps,
+                act_x,
+                &mut b.normed,
+                fault,
+            )?;
+            if phase == Phase::Before && card.is_some() {
+                let act_x = &b.act_x[m - 1];
+                let (q, d) = (act_x.q3().len() / m, act_x.d8().len() / m);
+                // SAFETY: the copies read the chunk's own scratch and write
+                // its tokens' columns of the block's planes; both are this
+                // piece's buffers on the engine stream, which orders them
+                // before the grouped gate·up that reads them and after any
+                // earlier launch that touched those columns.
+                unsafe {
+                    dtod(stream, &mut b.q3_all, at * q, act_x.q3(), m * q)?;
+                    dtod(stream, &mut b.d8_all, at * d, act_x.d8(), m * d)?;
+                }
+            }
+        }
+        if phase == Phase::Whole {
+            let slots_n = m * N_USED;
+            let sel = span(WHAT, &b.sel, at * N_USED, slots_n)?;
+            if let Some(s) = card {
+                let act_x = &b.act_x[m - 1];
+                let what = "ds41_expert_gate_up_tok";
+                let n_sb = act_x.n_sb();
+                let grid = launch_u32(what, "grid", (slots_n * ff).div_ceil(8))?;
+                let prep = b
+                    .module
+                    .prepare_ds41_expert_gate_up_tok(LaunchConfig1D::new(grid, THREADS, 0))?;
+                b.module.ds41_expert_gate_up_tok(
+                    stream,
+                    &prep,
+                    s.gate.buf(),
+                    s.up.buf(),
+                    act_x.q3(),
+                    act_x.d8(),
+                    &sel,
+                    launch_u32(what, "n_experts", s.gate.rows() / ff)?,
+                    launch_u32(what, "rows_per_expert", ff)?,
+                    launch_u32(what, "n_slots", slots_n)?,
+                    launch_u32(what, "cols", m)?,
+                    launch_u32(what, "n_sb", n_sb)?,
+                    launch_u32(what, "iters", n_sb.div_ceil(2))?,
+                    c.limit,
+                    fault,
+                    &mut b.h,
+                )?;
+                let act_h = count_of(&mut b.act_h, m)?;
+                gpu.enqueue_quantize_q8_1_layer(&b.h, act_h, layer)?;
+                gpu.q4k_sel().enqueue_gemv_q4k_sel(
+                    stream,
+                    s.down,
+                    act_h,
+                    &sel,
+                    slots_n,
+                    n,
+                    &mut b.down,
+                )?;
+            }
             let what = "ds41_ffn_card_acc";
             let wts = span(WHAT, &b.weights, at * N_USED, slots_n)?;
             let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
@@ -960,7 +1561,6 @@ impl FfnPiece {
                 &mut acc,
             )?;
         }
-        drop(sel);
         match (lw.sh_gate, lw.sh_up) {
             (
                 DevWeight::KQuant {
@@ -995,12 +1595,6 @@ impl FfnPiece {
                     )?;
                 }
             }
-        }
-        if lw.sh_down.reads_q8_1() != c.sh_down_q8_1 {
-            return Err(tensor_err(
-                &c.sh_down,
-                "of the format the file's header names for it",
-            ));
         }
         let act = if lw.sh_down.reads_q8_1() {
             let act_sh = count_of(&mut b.act_sh, m)?;
@@ -1095,6 +1689,48 @@ impl FfnPiece {
             }
         }
         Ok(())
+    }
+
+    /// Layer `layer`'s index and the block's tokens `at .. u`, once the block
+    /// `io` is checked: at least one chunk, each non-empty and starting where
+    /// the one before it ends, from the batch's first position on, within
+    /// the batch's cap.
+    fn batch_block(
+        &self,
+        layer: usize,
+        b: &FfnBatch,
+        io: &BlockIo<'_>,
+    ) -> Result<(usize, usize, usize), GpuError> {
+        let i = layer
+            .checked_sub(self.layers.start)
+            .filter(|&i| i < self.cfg.len())
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("layer {layer} is outside {:?}", self.layers),
+            })?;
+        let (Some(first), Some(last)) = (io.chunks.first(), io.chunks.last()) else {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("layer {layer}'s block of no chunks"),
+            });
+        };
+        let joined = io
+            .chunks
+            .windows(2)
+            .all(|p| p[0].end == p[1].start && !p[1].is_empty());
+        if first.is_empty() || !joined || first.start < io.base || last.end - io.base > b.cap {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer}'s block {:?} of a batch from {} of at most {}: chunks must be \
+                     non-empty and consecutive",
+                    first.start..last.end,
+                    io.base,
+                    b.cap
+                ),
+            });
+        }
+        Ok((i, first.start - io.base, last.end - io.base))
     }
 
     /// Layer `layer`'s index, once the chunk `io` is checked against the

@@ -72,6 +72,14 @@
 //! host tier's batch services since load (`union_layers`, `union_cols`,
 //! `union_host_slots`) and the union calls' wall (`union_ms`), the part of
 //! the feed the card waits on the host; a runtime value, as `time prompt` is.
+//! A `stat prefill split` line follows (`body::PrefillStats`): the prologue,
+//! the enqueue with its union calls, waits on the route's copies and
+//! activation copies, and the enqueue time left, summed and per
+//! layer-batch; with `BLOOMERY_STEP_STATS=1` also each layer's card time by
+//! event pairs (`card_out`: its first launch to its route's copies;
+//! `card_in`: its shadow), whose reads add a wait per batch to the feed.
+//! The `load` line's `card_experts=` is `BLOOMERY_CARD_EXPERTS` (`expert`,
+//! the default, or `slot`), the shadow's routed gate·up arm.
 //! A second `stat prefill ced=` line names the triangle's state (the `load`
 //! line's `ced=`: `on`, or `off (reason)`) and the last call's needs: its
 //! positions, the first whose features were kept, the blocks and latent
@@ -168,6 +176,7 @@ mod drive {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{LaunchStats, StepMode};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
+    use bloomery_gpu_deepseek41::chain::ffn::CardExperts;
     use bloomery_gpu_gates::draft::Lookup;
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use gguf::Split;
@@ -449,7 +458,7 @@ mod drive {
         println!(
             "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
              top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} \
-             prefill={} ced={} in {:.1} s (runtime value)",
+             prefill={} ced={} card_experts={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             shadow.bytes,
             shadow.unified_addressing,
@@ -469,6 +478,7 @@ mod drive {
                 prefill_mode.name()
             },
             m.body("generate_ds41")?.ced(),
+            CardExperts::from_env()?.name(),
             t.elapsed().as_secs_f64()
         );
         if let Some(h) = m.host_residency() {
@@ -523,6 +533,10 @@ mod drive {
         };
         if feed_mode == body::PrefillMode::Batch {
             body::prepare_prefill(&mut m)?;
+            if std::env::var("BLOOMERY_STEP_STATS").is_ok_and(|v| v == "1") {
+                let (gpu, _, b) = m.body_parts("generate_ds41")?;
+                b.set_prefill_card_timing(gpu, true)?;
+            }
             println!(
                 "prefill batch_bytes={}",
                 m.body("generate_ds41")?.batch_bytes()
@@ -769,7 +783,8 @@ mod drive {
     /// The host tier's batch services since load, one line: the layers
     /// served, the columns and host slots they carried, and the union calls'
     /// wall — the part of a batched feed the card waits on the host.
-    fn print_union(m: &Deepseek41Model) -> Result<(), GateError> {
+    fn print_union(m: &mut Deepseek41Model) -> Result<(), GateError> {
+        let split = m.body_parts("generate_ds41")?.2.take_prefill_stats();
         let b = m.body("generate_ds41")?;
         let s = b.hybrid().stats();
         println!(
@@ -782,6 +797,7 @@ mod drive {
         if let Some(need) = b.prefill_need() {
             println!("stat prefill ced={} {}", b.ced(), need.describe());
         }
+        println!("stat prefill split {}", split.describe());
         Ok(())
     }
 

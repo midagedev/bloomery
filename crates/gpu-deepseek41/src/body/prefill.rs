@@ -51,13 +51,15 @@
 //! until a reset.
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
+use cuda_core::{CudaEvent, sys};
 use model::moe::UNION_MAX_COLS;
 
 use super::ced::Mode;
 use super::*;
 use crate::chain::attn::{PartIo, StageIo};
-use crate::chain::ffn::{ChunkIo, FfnBatch, JoinIo};
+use crate::chain::ffn::{BlockIo, CardExperts, FfnBatch, JoinIo};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
 use crate::span::{span, span_mut};
@@ -323,6 +325,107 @@ pub(super) struct Batch {
     /// With a feature tap: per token, its row, on the card and the host.
     taps: Option<DeviceBuffer<f32>>,
     taps_host: Vec<f32>,
+    /// The host and card time of the batches since the last
+    /// [`Body::take_prefill_stats`].
+    stats: PrefillStats,
+    /// Whether each layer's card work is timed by events ([`CARD_MARKS`] a
+    /// layer, recorded only while this is on).
+    card_timing: bool,
+    card_marks: Vec<CudaEvent>,
+    /// Per layer: whether the last batch ran its block, so its shadow pair
+    /// was recorded.
+    card_served: Vec<bool>,
+}
+
+/// Events a layer records while [`Body::set_prefill_card_timing`] is on:
+/// before its first launch, where its route's copies to the host complete
+/// (after its attention where it has no block), and after its shadow.
+const CARD_MARKS: usize = 3;
+
+/// Where a batch's time went, summed over the batches since the last
+/// [`Body::take_prefill_stats`]. Host times are wall clock on the calling
+/// thread; the card times are event pairs on the engine stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PrefillStats {
+    /// Batches run, and layer-batches that served the host tier.
+    pub batches: u64,
+    pub layer_batches: u64,
+    /// The batch's host half before the launches ([`Body::plan_batch`]):
+    /// the plans, the rows, the images and their copy, which waits for the
+    /// stream.
+    pub prologue_ns: u64,
+    /// The launches' enqueue with every serve in it.
+    pub chain_ns: u64,
+    /// Of `chain_ns`: the union calls, the waits on the route's copies and
+    /// the activations' copy into the union's view.
+    pub union_ns: u64,
+    pub wait_ns: u64,
+    pub copy_ns: u64,
+    /// Card time, with [`Body::set_prefill_card_timing`] on: from each
+    /// layer's first launch to its route's copies (its attention alone where
+    /// it has no block), and its shadow, which runs under the union.
+    pub card_timed: bool,
+    pub card_out_ms: f64,
+    pub card_in_ms: f64,
+}
+
+impl PrefillStats {
+    /// Of `chain_ns`, the time the thread spent enqueueing: the rest once
+    /// the union calls, the waits and the copies are taken out.
+    #[must_use]
+    pub fn enqueue_ns(&self) -> u64 {
+        self.chain_ns
+            .saturating_sub(self.union_ns + self.wait_ns + self.copy_ns)
+    }
+}
+
+impl PrefillStats {
+    /// One line of `key=value`: every sum in ms, and the host and card
+    /// terms per layer-batch (`_lb`).
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let per = |v: f64| {
+            if self.layer_batches == 0 {
+                0.0
+            } else {
+                v / self.layer_batches as f64
+            }
+        };
+        let card = if self.card_timed {
+            format!(
+                "card_out_ms={:.1} card_in_ms={:.1} card_out_lb={:.2} card_in_lb={:.2}",
+                self.card_out_ms,
+                self.card_in_ms,
+                per(self.card_out_ms),
+                per(self.card_in_ms)
+            )
+        } else {
+            "card=untimed".to_string()
+        };
+        format!(
+            "batches={} layer_batches={} prologue_ms={:.1} chain_ms={:.1} union_ms={:.1} \
+             wait_ms={:.1} enqueue_ms={:.1} copy_ms={:.1} union_lb={:.2} wait_lb={:.2} \
+             enqueue_lb={:.2} copy_lb={:.2} {card}",
+            self.batches,
+            self.layer_batches,
+            ms(self.prologue_ns),
+            ms(self.chain_ns),
+            ms(self.union_ns),
+            ms(self.wait_ns),
+            ms(self.enqueue_ns()),
+            ms(self.copy_ns),
+            per(ms(self.union_ns)),
+            per(ms(self.wait_ns)),
+            per(ms(self.enqueue_ns())),
+            per(ms(self.copy_ns)),
+        )
+    }
+}
+
+/// `d` in whole nanoseconds, saturating.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Batch {
@@ -414,7 +517,7 @@ impl Body {
             images: vec![0; CHUNKS_MAX * words],
             params: DeviceBuffer::zeroed(stream, CHUNKS_MAX * words)?,
             glue: self.glue.batch(gpu, image.layout())?,
-            ffn: FfnBatch::new(gpu, n, hp.experts.ff, T_MAX)?,
+            ffn: FfnBatch::new(gpu, n, hp.experts.ff, T_MAX, CardExperts::from_env()?)?,
             rows: self.rows.prompt_rows(T_MAX),
             hc: [
                 DeviceBuffer::zeroed(stream, T_MAX * HC_STREAMS * n)?,
@@ -436,9 +539,35 @@ impl Body {
                 .then(|| DeviceBuffer::zeroed(stream, T_MAX * tap_width))
                 .transpose()?,
             taps_host: vec![0.0; T_MAX * tap_width],
+            stats: PrefillStats::default(),
+            card_timing: false,
+            card_marks: (0..CARD_MARKS * self.layers.len())
+                .map(|_| {
+                    gpu.context()
+                        .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            card_served: vec![false; self.layers.len()],
             image,
             attn,
         })
+    }
+
+    /// The prompt batches' time since the last call, and zero again; the
+    /// default before the first batch.
+    pub fn take_prefill_stats(&mut self) -> PrefillStats {
+        self.batch
+            .as_deref_mut()
+            .map(|b| std::mem::take(&mut b.stats))
+            .unwrap_or_default()
+    }
+
+    /// Time each layer's card work with events from the next batch on
+    /// ([`PrefillStats`]); off, no event is recorded. Makes the batch's
+    /// buffers.
+    pub fn set_prefill_card_timing(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
+        self.batch_mut(gpu)?.card_timing = on;
+        Ok(())
     }
 
     /// Device bytes of the batch's buffers; 0 before the first batch.
@@ -592,14 +721,21 @@ impl Body {
             self.restore = false;
         }
         let cuts = chunks(b, u);
+        let t0 = Instant::now();
         self.plan_batch(stream, ids, &cuts)?;
+        let prologue = nanos(t0.elapsed());
         for p in b..b + u {
             self.holds.wrote(p);
         }
         if let Some(tap) = self.tap.as_mut() {
             tap.pos = [None; PAIR_ROWS];
         }
+        let union0 = self.hybrid.stats().batch_ns;
+        let t1 = Instant::now();
         self.enqueue_batch_chain(gpu, w, head, &cuts, last, observe)?;
+        let chain = nanos(t1.elapsed());
+        let union = self.hybrid.stats().batch_ns.saturating_sub(union0);
+        self.account_batch(prologue, chain, union)?;
         if last {
             return Ok(true);
         }
@@ -607,6 +743,36 @@ impl Body {
             Some(fault) => Err(GpuError::Fault { what: WHAT, fault }),
             None => Ok(false),
         }
+    }
+
+    /// Add one batch's times to the stats; with card timing on, read its
+    /// layers' event pairs, which waits for the last of them.
+    fn account_batch(&mut self, prologue: u64, chain: u64, union: u64) -> Result<(), GpuError> {
+        let layers = self.layers.len();
+        let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's buffers",
+        })?;
+        let serve = batch.ffn.take_serve_times();
+        let st = &mut batch.stats;
+        st.batches += 1;
+        st.prologue_ns += prologue;
+        st.chain_ns += chain;
+        st.union_ns += union;
+        st.wait_ns += serve.wait_ns;
+        st.copy_ns += serve.copy_ns;
+        if !batch.card_timing {
+            return Ok(());
+        }
+        st.card_timed = true;
+        let (marks, _) = batch.card_marks.as_chunks::<CARD_MARKS>();
+        for ([e0, e1, e2], &served) in marks.iter().zip(&batch.card_served).take(layers) {
+            st.card_out_ms += f64::from(e0.elapsed_ms(e1)?);
+            if served {
+                st.card_in_ms += f64::from(e1.elapsed_ms(e2)?);
+            }
+        }
+        Ok(())
     }
 
     /// The batch's host half: each chunk planned after the tokens before it
@@ -711,8 +877,14 @@ impl Body {
         // The batch's token where the chunk `k` on starts, `u` past the last.
         let token = |k: usize| cuts.get(k).map_or(u, |r| r.start - b);
         let mut cur = Cursor::default();
+        let stream = gpu.stream();
         for (i, l) in layers.clone().enumerate() {
             let step = steps[i];
+            let timed = batch.card_timing;
+            if timed {
+                batch.card_marks[CARD_MARKS * i].record(stream)?;
+            }
+            batch.card_served[i] = false;
             // The layer runs a suffix of the chunks: its latent part from
             // `run`, its block from `full`.
             let run = cuts
@@ -831,32 +1003,33 @@ impl Body {
                     attn: Some(batch.attn.taps()),
                 },
             )?;
+            if full == cuts.len() && timed {
+                batch.card_marks[CARD_MARKS * i + 1].record(stream)?;
+            }
             if full < cuts.len() {
-                for r in &cuts[full..] {
-                    let (at, m) = (r.start - b, r.len());
-                    let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
-                    let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
-                    let io = ChunkIo {
-                        at,
-                        m,
-                        streams: &streams,
-                        fold_in: &fold_in,
-                    };
-                    ffn.enqueue_batch_route(gpu, w, &mut batch.ffn, l, &io, slots)?;
-                }
+                batch.card_served[i] = true;
+                batch.stats.layer_batches += 1;
+                let block = BlockIo {
+                    chunks: &cuts[full..],
+                    base: b,
+                    streams: &batch.hc[cur.s],
+                    fold_in: &batch.folds[cur.f],
+                };
+                ffn.enqueue_batch_route(gpu, w, &mut batch.ffn, l, &block, slots)?;
                 batch.ffn.enqueue_download(gpu, at, u)?;
+                if timed {
+                    batch.card_marks[CARD_MARKS * i + 1].record(stream)?;
+                }
                 let card = CardStacks::of(w, l)?;
-                for r in &cuts[full..] {
-                    let (at, m) = (r.start - b, r.len());
-                    let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
-                    let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
-                    let io = ChunkIo {
-                        at,
-                        m,
-                        streams: &streams,
-                        fold_in: &fold_in,
-                    };
-                    ffn.enqueue_batch_shadow(gpu, w, card, &mut batch.ffn, l, &io)?;
+                let block = BlockIo {
+                    chunks: &cuts[full..],
+                    base: b,
+                    streams: &batch.hc[cur.s],
+                    fold_in: &batch.folds[cur.f],
+                };
+                ffn.enqueue_batch_shadow(gpu, w, card, &mut batch.ffn, l, &block)?;
+                if timed {
+                    batch.card_marks[CARD_MARKS * i + 2].record(stream)?;
                 }
                 batch.ffn.serve(hybrid, l, at, u)?;
                 batch.ffn.enqueue_upload(gpu, at, u)?;

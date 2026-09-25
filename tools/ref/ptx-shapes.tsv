@@ -25,11 +25,13 @@ generate_ds41   ds41_attn_seg_sel                       0          0
 generate_ds41   ds41_attn_seg_sel_stage                 0          0
 # PIN(2026-09-25): ds41_attn_seg_stage is the staged prefix segment pass (prefill only, never on the decode path); its ring ⧺ staging source keeps a few registers more than ds41_attn_seg, which already sits at the 128-register cap of a 512-thread block, and ptxas spills 8 bytes. ds41_attn_seg_sel_stage fits in 112 with none.
 generate_ds41   ds41_attn_seg_stage                     8          8
+generate_ds41   ds41_card_buckets                       0          0
 generate_ds41   ds41_comp_pool                          0          0
 generate_ds41   ds41_comp_rows                          0          0
 generate_ds41   ds41_engram_gate                        0          0
 generate_ds41   ds41_engram_key_norm                    0          0
 generate_ds41   ds41_expert_gate_up                     0          0
+generate_ds41   ds41_expert_gate_up_grouped             0          0
 generate_ds41   ds41_expert_gate_up_tok                 0          0
 generate_ds41   ds41_ffn_card_acc                       0          0
 generate_ds41   ds41_ffn_handoff                        0          0
@@ -59,6 +61,8 @@ generate_ds41   ds41_q5k_gemv_f32_mcol                  0          0
 generate_ds41   ds41_ring_commit                        0          0
 generate_ds41   ds41_rope_tail                          0          0
 generate_ds41   ds41_router                             0          0
+generate_ds41   ds41_router_pick                        0          0
+generate_ds41   ds41_router_scores                      0          0
 generate_ds41   ds41_rows_to_tokens                     0          0
 generate_ds41   ds41_shexp_gate_up                      0          0
 generate_ds41   ds41_shexp_gate_up_q3k                  0          0
@@ -121,6 +125,7 @@ generate_ds41   q3k_gemv_split_mcol                     0          0
 generate_ds41   q3k_quantize_q8_1                       0          0
 generate_ds41   q3k_quantize_q8_1_pair                  0          0
 generate_ds41   q4k_gemv                                0          0
+generate_ds41   q4k_gemv_grouped                        0          0
 generate_ds41   q4k_gemv_mcol                           0          0
 generate_ds41   q4k_gemv_sel                            0          0
 generate_ds41   q5_0_gemv                               0          0
@@ -218,6 +223,7 @@ gate_e2e        q3k_gemv_split_mcol                     0          0
 gate_e2e        q3k_quantize_q8_1                       0          0
 gate_e2e        q3k_quantize_q8_1_pair                  0          0
 gate_e2e        q4k_gemv                                0          0
+gate_e2e        q4k_gemv_grouped                        0          0
 gate_e2e        q4k_gemv_mcol                           0          0
 gate_e2e        q4k_gemv_sel                            0          0
 gate_e2e        q5_0_gemv                               0          0
