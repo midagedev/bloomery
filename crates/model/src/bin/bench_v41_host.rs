@@ -144,7 +144,7 @@ const USAGE: &str = "usage: bench_v41_host --check
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
        bench_v41_host --time ... [--union R]
   an arm is <engine|engine-sep|union|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]; the default is engine:6,engine:5,engine:3,per-matrix:6
-  union: one union call per layer over the rows (rows <= 8, n_host <= 8)
+  union: one union call per layer over the rows (rows <= 512, n_host <= 8)
   u<r> (or --union R for every multi-row arm without its own): the rows share experts, the layer's distinct experts
   are round(r x n_host x rows), 1/rows <= r <= 1
   the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the deepseek41 profile)";
@@ -505,15 +505,17 @@ struct Blocks {
 
 /// The union shape's blocks, made before the round's first token: activation
 /// block `o` holds the `rows` columns `(o + i) % N_X` a token reads at offset
-/// `o`, then the call's scratch and its `embd × rows` output.
+/// `o`, then the call's scratch (made for `rows` columns), its `embd × rows`
+/// output and the rows' list entries.
 struct UnionBlocks {
     xs: Vec<Tensor2>,
     scratch: UnionScratch,
     out: Vec<f32>,
+    lists: Vec<[(u32, f32); EXPERTS_INTO_MAX]>,
 }
 
 impl UnionBlocks {
-    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize) -> UnionBlocks {
+    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize) -> Result<UnionBlocks, ModelError> {
         let xs = (0..N_X)
             .map(|o| {
                 let mut data = Vec::with_capacity(embd * rows);
@@ -523,11 +525,12 @@ impl UnionBlocks {
                 Tensor2::from_vec(embd, rows, data)
             })
             .collect();
-        UnionBlocks {
+        Ok(UnionBlocks {
             xs,
-            scratch: UnionScratch::new(embd, ff),
+            scratch: UnionScratch::new(embd, ff, rows)?,
             out: vec![0.0; embd * rows],
-        }
+            lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
+        })
     }
 }
 
@@ -567,16 +570,14 @@ fn union_layer(
     tally: &mut Tally,
 ) -> Result<(), ModelError> {
     let w = 1.0 / n_host as f32;
-    let mut buf = [[(0u32, 0.0f32); EXPERTS_INTO_MAX]; UNION_MAX_COLS];
-    for (row, run) in buf.iter_mut().zip(slots.chunks_exact(n_host)) {
+    for (row, run) in u.lists.iter_mut().zip(slots.chunks_exact(n_host)) {
         for (entry, &s) in row.iter_mut().zip(run) {
             *entry = (l.experts[s].id as u32, w);
         }
     }
-    let lists: [&[(u32, f32)]; UNION_MAX_COLS] = std::array::from_fn(|i| &buf[i][..n_host]);
-    let rows = slots.len() / n_host;
+    let lists: Vec<&[(u32, f32)]> = u.lists.iter().map(|r| &r[..n_host]).collect();
     let t0 = Instant::now();
-    host.experts_union_into(split, &u.xs[x], &lists[..rows], &mut u.out, &mut u.scratch)?;
+    host.experts_union_into(split, &u.xs[x], &lists, &mut u.out, &mut u.scratch)?;
     tally.add("union", distinct as u64 * l.expert_bytes(), t0);
     Ok(())
 }
@@ -1480,7 +1481,7 @@ fn check_union(
     rows.push(extra);
     let embd = xs[0].ne0;
     let ff = l.weight(0, GATE).n();
-    let mut u = UnionBlocks::new(xs, 2, embd, ff);
+    let mut u = UnionBlocks::new(xs, 2, embd, ff)?;
     let x0 = l.index % N_X;
     let mut tally = Tally::default();
     union_layer(host, split, l, &rows, n, n + 1, &mut u, x0, &mut tally)?;
@@ -1919,7 +1920,7 @@ impl Bench<'_> {
         if arm.shape == Shape::Union {
             let embd = self.xs.first().ok_or("no activation columns")?.ne0;
             let ff = self.layers.first().ok_or("no layers")?.weight(0, GATE).n();
-            blocks.union = Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff));
+            blocks.union = Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff)?);
         }
         let mut scratch = Tally::default();
         let mut warm_ms = Vec::with_capacity(warmup);

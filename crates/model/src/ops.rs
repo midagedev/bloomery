@@ -1500,17 +1500,37 @@ impl<'a> PairWork<'a> {
             // and its writes are ordered before this read — the pre-pass
             // join, or the DONE store the wait above just observed.
             let acol = unsafe { std::slice::from_raw_parts(aptr, self.src_ne1 * cb) };
-            // Fused rows: `qdot::dot_row` dots the weight bytes and the
-            // quantized column directly — no f32 row, ROW_BUF untouched;
-            // `add_dequant_w` stays 0 (the dequant is in the dot timer).
+            // Fused rows: `qdot` dots the weight bytes and the quantized
+            // columns directly — no f32 row, ROW_BUF untouched;
+            // `add_dequant_w` stays 0 (the dequant is in the dot timer). A
+            // lone column takes `qdot::dot_row`; runs of up to
+            // `qdot::TILE_COLS` columns take `qdot::dot_row_cols`, which
+            // unpacks the row's blocks once per run and writes each column's
+            // `dot_row` value bit for bit.
             for r in rows {
                 let src = &self.bytes[r * self.row_bytes..(r + 1) * self.row_bytes];
                 let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
-                for t in 0..self.ne1 {
-                    let c = self.col(t);
-                    let v = qdot::dot_row(ty, src, &acol[c * cb..(c + 1) * cb], k)?;
-                    // SAFETY: cell `t * n + r` is inside this chunk's row range — see the SharedOut construction site.
-                    unsafe { self.out.write(t * n + r, v) };
+                let mut t0 = 0;
+                while t0 < self.ne1 {
+                    let m = (self.ne1 - t0).min(qdot::TILE_COLS);
+                    if m == 1 {
+                        let c = self.col(t0);
+                        let v = qdot::dot_row(ty, src, &acol[c * cb..(c + 1) * cb], k)?;
+                        // SAFETY: cell `t0 * n + r` is inside this chunk's row range — see the SharedOut construction site.
+                        unsafe { self.out.write(t0 * n + r, v) };
+                    } else {
+                        let cols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|i| {
+                            let c = self.col(t0 + i.min(m - 1));
+                            &acol[c * cb..(c + 1) * cb]
+                        });
+                        let mut v = [0.0f32; qdot::TILE_COLS];
+                        qdot::dot_row_cols(ty, src, &cols[..m], k, &mut v[..m])?;
+                        for (i, &v) in v[..m].iter().enumerate() {
+                            // SAFETY: cell `(t0 + i) * n + r` is inside this chunk's row range — see the SharedOut construction site.
+                            unsafe { self.out.write((t0 + i) * n + r, v) };
+                        }
+                    }
+                    t0 += m;
                 }
                 if let Some(t_dot) = t_dot {
                     acc.add_dot(t_dot.elapsed().as_nanos() as u64);

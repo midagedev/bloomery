@@ -2619,3 +2619,318 @@ fn hw_q8k_codes_at_subnormal_scales() {
          max |code| {max_code})"
     );
 }
+
+// ------------------------------------------------- multi-column tiles
+// `dot_row_cols` against `dot_row` per column, bit for bit, for every column
+// count 1..=TILE_COLS and every tile slot a column can sit in, on real rows
+// of the V4.1 host-expert types and on columns that reach the quantizer's
+// ends. The bit contract holds by construction — the same integer products
+// per block, the same float order per column — so any differing value is a
+// bug, not rounding.
+
+/// Rows of the first `ty` tensor of the V4.1 split set whose name contains
+/// `prefer` (the host expert stack of that type), from the first shard on
+/// that carries one — the first shard holds only block 0, whose routed down
+/// is Q5_K — read at `data_base + offset` from the header-only inventory
+/// (the strict `Gguf::open` refuses the first shard's bf16 `token_embd`):
+/// (name, k, row bytes, the first `rows` rows).
+fn v41_rows(ty: GgmlType, prefer: &str, rows: usize) -> (String, usize, usize, Vec<u8>) {
+    use std::os::unix::fs::FileExt;
+    let first = gguf::v41::model();
+    let shards: Vec<String> = match first.find("-00001-of-") {
+        Some(at) => (1..=99)
+            .map(|i| format!("{}-{i:05}-of-{}", &first[..at], &first[at + 10..]))
+            .take_while(|p| std::path::Path::new(p).exists())
+            .collect(),
+        None => vec![first.clone()],
+    };
+    let block = match ty {
+        GgmlType::Q3_K => 110,
+        GgmlType::Q4_K => 144,
+        GgmlType::Q5_K => 176,
+        _ => panic!("no tile row source for {ty:?}"),
+    };
+    for path in &shards {
+        let inv = gguf::inventory_of(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let Some(t) = inv
+            .tensors
+            .iter()
+            .find(|t| t.type_id == ty.as_u32() && t.name.contains(prefer))
+        else {
+            continue;
+        };
+        let k = t.dims[0] as usize;
+        assert!(k.is_multiple_of(256), "{}: k = {k}", t.name);
+        let n = t.dims[1..].iter().product::<u64>() as usize;
+        let row_bytes = block * k / 256;
+        assert_eq!(t.nbytes, Some((n * row_bytes) as u64), "{}: bytes", t.name);
+        assert!(
+            n >= rows,
+            "{}: only {n} rows, the gate needs {rows}",
+            t.name
+        );
+        let mut bytes = vec![0u8; rows * row_bytes];
+        std::fs::File::open(path)
+            .and_then(|f| f.read_exact_at(&mut bytes, inv.data_base + t.offset))
+            .unwrap_or_else(|e| panic!("{path}: read {}: {e}", t.name));
+        return (t.name.clone(), k, row_bytes, bytes);
+    }
+    panic!(
+        "no shard of {first} ({} found) carries a {ty:?} tensor named *{prefer}*",
+        shards.len()
+    );
+}
+
+/// Rows each tile clause dots.
+const TILE_ROWS: usize = 256;
+
+/// The seeded activation columns of a tile clause, `k` values each: seven
+/// random columns over magnitudes 1e-3..1e2 with outliers every 61st value,
+/// a column of zeros, and a column at the quantizer's ends (±3.0
+/// alternating: codes ±127 in both q8_K and q8_2_x4).
+fn tile_columns(k: usize) -> Vec<Vec<f32>> {
+    let mut rng = Lcg(0x7117_c01d);
+    let mut cols: Vec<Vec<f32>> = [1e-3f32, 0.02, 0.3, 1.0, 4.0, 7.5, 1e2]
+        .iter()
+        .map(|&mag| {
+            (0..k)
+                .map(|i| {
+                    let u = rng.unit() * mag;
+                    if i % 61 == 0 { u * 8.0 } else { u }
+                })
+                .collect()
+        })
+        .collect();
+    cols.push(vec![0.0; k]);
+    cols.push(
+        (0..k)
+            .map(|i| if i % 2 == 0 { -3.0 } else { 3.0 })
+            .collect(),
+    );
+    cols
+}
+
+/// Clause of one row set: for c = 1..=TILE_COLS and every starting column
+/// of the cyclic list `acols`, every row's `dot_row_cols` over the c columns
+/// from there equals `dot_row` per column, bit for bit. The outputs start as
+/// NaN, so an unwritten one fails too. Returns the calls made.
+fn assert_tile_matches(
+    ty: GgmlType,
+    label: &str,
+    k: usize,
+    row_bytes: usize,
+    bytes: &[u8],
+    acols: &[Vec<u8>],
+) -> usize {
+    assert!(
+        qdot::has_tile(ty),
+        "{label}: {ty:?} has no tile kernel on this CPU — the clause would compare dot_row with itself"
+    );
+    let rows = bytes.len() / row_bytes;
+    let n = acols.len();
+    assert!(
+        n >= qdot::TILE_COLS,
+        "{label}: {n} columns cannot fill a tile"
+    );
+    let mut want = vec![0.0f32; rows * n];
+    for r in 0..rows {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        for (j, a) in acols.iter().enumerate() {
+            want[r * n + j] = dot_row(ty, src, a, k).unwrap();
+        }
+    }
+    let mut calls = 0;
+    for c in 1..=qdot::TILE_COLS {
+        for s in 0..n {
+            let idx: Vec<usize> = (0..c).map(|i| (s + i) % n).collect();
+            let cols: Vec<&[u8]> = idx.iter().map(|&j| acols[j].as_slice()).collect();
+            for r in 0..rows {
+                let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+                let mut out = vec![f32::NAN; c];
+                qdot::dot_row_cols(ty, src, &cols, k, &mut out).unwrap();
+                for (slot, (&j, &got)) in idx.iter().zip(&out).enumerate() {
+                    let w = want[r * n + j];
+                    assert_eq!(
+                        got.to_bits(),
+                        w.to_bits(),
+                        "{label}: row {r}, c = {c}, slot {slot} (column {j}): tile {got:e} \
+                         (bits {:#x}) vs dot_row {w:e} (bits {:#x})",
+                        got.to_bits(),
+                        w.to_bits()
+                    );
+                }
+                calls += 1;
+            }
+        }
+    }
+    calls
+}
+
+/// The seeded columns of [`tile_columns`] coded for `ty`, after `extra`
+/// already-coded ones.
+fn coded_columns(ty: GgmlType, k: usize, extra: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut cols = extra;
+    for x in tile_columns(k) {
+        let mut a = vec![0u8; col_bytes(ty, k)];
+        quantize_col(ty, &x, &mut a);
+        cols.push(a);
+    }
+    cols
+}
+
+/// Q3_K tile clause: the V4.1 first shard's routed gate stack (k = the model
+/// width), then V2-Lite's `ffn_gate`-1 rows on the oracle's six `ffn_norm-1`
+/// tokens (the rows and columns gate 1's harness reads) — tile = `dot_row`
+/// per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shard, the model file and $BLOOMERY_DATA/ref"]
+fn hw_q3k_tile_matches_dot_row() {
+    let ty = GgmlType::Q3_K;
+    let (name, k, row_bytes, bytes) = v41_rows(ty, "ffn_gate_exps", TILE_ROWS);
+    let calls = assert_tile_matches(
+        ty,
+        &name,
+        k,
+        row_bytes,
+        &bytes,
+        &coded_columns(ty, k, vec![]),
+    );
+    eprintln!("q3k tile: {name} (k = {k}): {calls} row calls, c = 1..=8, bit-identical");
+
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let t = g
+        .find("blk.1.ffn_gate_exps.weight")
+        .or_else(|| g.find("blk.0.ffn_gate.weight"));
+    let t = t.expect("V2-Lite carries a Q3_K ffn_gate");
+    assert_eq!(t.ty, ty, "{}: type", t.name);
+    let k2 = t.dims[0] as usize;
+    let rb2 = k2 / 256 * 110;
+    let rows2 = &g.data(t).unwrap()[..TILE_ROWS * rb2];
+    let toks = oracle_f32("ffn_norm-1", k2 * 6);
+    let real: Vec<Vec<u8>> = toks
+        .chunks_exact(k2)
+        .map(|x| {
+            let mut a = vec![0u8; col_bytes(ty, k2)];
+            quantize_col(ty, x, &mut a);
+            a
+        })
+        .collect();
+    let calls = assert_tile_matches(ty, &t.name, k2, rb2, rows2, &coded_columns(ty, k2, real));
+    eprintln!(
+        "q3k tile: {} (k = {k2}) on six oracle tokens + seeded: {calls} calls, bit-identical",
+        t.name
+    );
+}
+
+/// Q4_K tile clause: the V2-Lite Q4_K tensor the gate-triple harness reads,
+/// on ik's dumped column and the seeded ones, then the V4.1 set's first Q4_K
+/// routed down stack — tile = `dot_row` per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box, the model file, the V4.1 shards and $BLOOMERY_DATA/ref"]
+fn hw_q4k_tile_matches_dot_row() {
+    let ty = GgmlType::Q4_K;
+    let g = gguf::Gguf::open(model_path()).unwrap();
+    let w = g
+        .iter_tensors()
+        .find(|w| w.ty == ty && (w.dims[0] as usize).is_multiple_of(256))
+        .expect("the model must carry at least one aligned Q4_K tensor");
+    let k = w.dims[0] as usize;
+    let row_bytes = 144 * k / 256;
+    let bytes = &g.data(w).unwrap()[..TILE_ROWS * row_bytes];
+    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
+    let dump = std::fs::read_to_string(format!("{base}/ref/q4k-x4-ik-dot.txt"))
+        .expect("run just build-ref first (it builds and runs the x4 reference harnesses)");
+    let (dump_k, ik_acol, _) = parse_ik_dot_dump(&dump);
+    assert_eq!(
+        dump_k, k,
+        "the dump and this scan must land on the same tensor"
+    );
+    let calls = assert_tile_matches(
+        ty,
+        &w.name,
+        k,
+        row_bytes,
+        bytes,
+        &coded_columns(ty, k, vec![ik_acol]),
+    );
+    eprintln!(
+        "q4k tile: {} (k = {k}) on ik's column + seeded: {calls} calls, bit-identical",
+        w.name
+    );
+
+    let (name, k, row_bytes, bytes) = v41_rows(ty, "ffn_down_exps", TILE_ROWS);
+    let calls = assert_tile_matches(
+        ty,
+        &name,
+        k,
+        row_bytes,
+        &bytes,
+        &coded_columns(ty, k, vec![]),
+    );
+    eprintln!("q4k tile: {name} (k = {k}): {calls} calls, bit-identical");
+}
+
+/// Q5_K tile clause: the V4.1 first shard's routed down stack on ik's dumped
+/// column (the Q5_K harness's) and the seeded ones — tile = `dot_row` per
+/// column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shard and $BLOOMERY_DATA/ref"]
+fn hw_q5k_tile_matches_dot_row() {
+    let ty = GgmlType::Q5_K;
+    let (name, k, row_bytes, bytes) = v41_rows(ty, "ffn_down_exps", TILE_ROWS);
+    let c = load_q5k(1);
+    assert_eq!(
+        c.k, k,
+        "the Q5_K harness's tensor and the down stack share k"
+    );
+    let (ik_acol, _) = q5k_ik_dump(&c);
+    let calls = assert_tile_matches(
+        ty,
+        &name,
+        k,
+        row_bytes,
+        &bytes,
+        &coded_columns(ty, k, vec![ik_acol]),
+    );
+    eprintln!("q5k tile: {name} (k = {k}) on ik's column + seeded: {calls} calls, bit-identical");
+}
+
+/// A tile call's column count outside `1..=TILE_COLS`, an `out` of another
+/// length and a short column are named refusals, before any kernel runs.
+#[test]
+fn dot_row_cols_refuses_bad_shapes() {
+    let ty = GgmlType::Q3_K;
+    let k = 256;
+    let wrow = vec![0u8; 110];
+    let a = vec![0u8; col_bytes(ty, k)];
+    let many: Vec<&[u8]> = vec![a.as_slice(); qdot::TILE_COLS + 1];
+    let mut out = vec![0.0f32; qdot::TILE_COLS + 1];
+    assert_eq!(
+        qdot::dot_row_cols(ty, &wrow, &many, k, &mut out),
+        Err(QdotError::TileShape {
+            cols: qdot::TILE_COLS + 1,
+            outs: qdot::TILE_COLS + 1
+        })
+    );
+    assert_eq!(
+        qdot::dot_row_cols(ty, &wrow, &[], k, &mut []),
+        Err(QdotError::TileShape { cols: 0, outs: 0 })
+    );
+    assert_eq!(
+        qdot::dot_row_cols(ty, &wrow, &many[..2], k, &mut out[..3]),
+        Err(QdotError::TileShape { cols: 2, outs: 3 })
+    );
+    let short = &a[..a.len() - 1];
+    assert_eq!(
+        qdot::dot_row_cols(ty, &wrow, &[a.as_slice(), short], k, &mut out[..2]),
+        Err(QdotError::ShortActivationCol {
+            have: a.len() - 1,
+            need: a.len(),
+            k
+        })
+    );
+    let e = qdot::dot_row_cols(ty, &wrow, &many, k, &mut out)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("1..=8 columns"), "{e}");
+}
