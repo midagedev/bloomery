@@ -30,21 +30,10 @@
 //!    relative distance within `γ(8)` of `Σ|w·d|` per value, and the count
 //!    of bit-equal values printed.
 //!
-//! 5. Gate·up with the down's q8_1 folded in
-//!    (`qwen3moe_gate_up_swiglu_quant_q4k`, the chain's at one token) against
-//!    the two launches it replaces — the gate·up of section 2, then
-//!    `enqueue_quantize_q8_1` over its `h` as `n_slots` columns — on layers
-//!    0, 23 and 47 with the section's repeated-id sel over every token of
-//!    `ffn_inp_normed-L` (the prefill set): `h` and all five q8_1 planes
-//!    BIT-EQUAL (the scales by bits), every group's ticket count back at
-//!    zero; a sel with ids past the stack leaves those slots of `h`
-//!    untouched on both paths and the planes still equal; a gate row whose
-//!    super-block scale is NaN (so its SwiGLU value is NaN) raises the fault
-//!    word on both paths, the same word.
+//! PIN(2026-09-25): removed — the engine no longer runs `qwen3moe_gate_up_swiglu_quant_q4k` (gate·up with the down's q8_1 folded in through per-group tickets, section 5): decode was slower with it (rig-log 2026-09-25.md#qwen3fuse-regression-nsys), the step quantizes `h` in its own launch again, and the kernel is gone with its check.
 //!
 //! And each kernel as a captured graph: one node, the replay equal to the
-//! eager launch (the fused gate·up: two replays, the counts zero after
-//! each).
+//! eager launch.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -61,8 +50,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::qwen3moe::experts::{ExpertKernels, GateUpArgs, GroupTickets};
-    use bloomery_gpu::fused::{Q8ActHost, readback_q8act};
+    use bloomery_gpu::arch::qwen3moe::experts::{ExpertKernels, GateUpArgs};
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
@@ -126,7 +114,6 @@ mod gate {
         ok &= gate_up_body(&gpu, &gguf, &ex)?;
         ok &= gate_up_tap(&gpu, &gguf, &ex, &sets)?;
         ok &= combine(&gpu, &ex, &sets, stream)?;
-        ok &= gate_up_quant(&gpu, &gguf, &ex, &sets)?;
         println!("gate_qwen3moe_experts: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
@@ -546,253 +533,6 @@ mod gate {
              worst at {worst:.3} of γ(2·slots)·Σ|w·d| {}",
             verdict(ok)
         );
-        Ok(ok)
-    }
-
-    // ------------------------------------------- 5. gate·up + q8_1 fused
-
-    /// Two q8_1 readbacks equal plane for plane, the scales by bits.
-    fn q8_equal(a: &Q8ActHost, b: &Q8ActHost) -> bool {
-        a.q3 == b.q3 && a.q4 == b.q4 && a.q6 == b.q6 && a.s8 == b.s8 && bits_equal(&a.d8, &b.d8)
-    }
-
-    /// One path's results: `h` and its q8_1.
-    struct HQuant {
-        h: Vec<f32>,
-        act_h: Q8ActHost,
-    }
-
-    /// The stacks and the shape one fused-gate·up check runs over.
-    struct QuantCase<'a> {
-        wg: &'a DeviceTensor<u32>,
-        wu: &'a DeviceTensor<u32>,
-        act: &'a Q8Act,
-        rpe: usize,
-    }
-
-    fn gate_up_args<'a>(
-        c: &QuantCase<'a>,
-        sel: &'a DeviceBuffer<u32>,
-        h: &'a mut DeviceBuffer<f32>,
-    ) -> GateUpArgs<'a> {
-        GateUpArgs {
-            wg: c.wg,
-            wu: c.wu,
-            act: c.act,
-            sel,
-            n_slots: 8,
-            rows_per_expert: c.rpe,
-            h,
-        }
-    }
-
-    /// The two launches the fused entry replaces.
-    fn quant_split(
-        gpu: &Gpu,
-        ex: &ExpertKernels,
-        c: &QuantCase<'_>,
-        sel: &DeviceBuffer<u32>,
-    ) -> Result<HQuant, GateError> {
-        let stream = gpu.stream();
-        let mut h = DeviceBuffer::from_host(stream, &vec![SENT; 8 * c.rpe])?;
-        let mut act_h = Q8Act::with_k(stream, 8, c.rpe)?;
-        ex.enqueue_gate_up(stream, gate_up_args(c, sel, &mut h))?;
-        gpu.enqueue_quantize_q8_1(&h, &mut act_h)?;
-        stream.synchronize()?;
-        Ok(HQuant {
-            h: h.to_host_vec(stream)?,
-            act_h: readback_q8act(stream, &act_h)?,
-        })
-    }
-
-    /// The fused entry, and whether every ticket count stood at zero after it.
-    fn quant_fused(
-        gpu: &Gpu,
-        ex: &ExpertKernels,
-        c: &QuantCase<'_>,
-        sel: &DeviceBuffer<u32>,
-        tickets: &mut GroupTickets,
-    ) -> Result<(HQuant, bool), GateError> {
-        let stream = gpu.stream();
-        let mut h = DeviceBuffer::from_host(stream, &vec![SENT; 8 * c.rpe])?;
-        let mut act_h = Q8Act::with_k(stream, 8, c.rpe)?;
-        ex.enqueue_gate_up_quant(
-            stream,
-            gate_up_args(c, sel, &mut h),
-            &mut act_h,
-            tickets,
-            gpu.unlabelled_sink(),
-        )?;
-        stream.synchronize()?;
-        let run = HQuant {
-            h: h.to_host_vec(stream)?,
-            act_h: readback_q8act(stream, &act_h)?,
-        };
-        Ok((run, tickets.at_zero(stream)?))
-    }
-
-    fn gate_up_quant(
-        gpu: &Gpu,
-        gguf: &gguf::Gguf,
-        ex: &ExpertKernels,
-        sets: &[(&'static str, bloomery_gpu_gates::RefManifest)],
-    ) -> Result<bool, GateError> {
-        let stream = gpu.stream();
-        let man = &sets.first().ok_or("no oracle set")?.1;
-        let sel_h: [u32; 8] = [5, 127, 0, 5, 64, 3, 99, 1];
-        let sel = DeviceBuffer::from_host(stream, &sel_h)?;
-        let mut ok = true;
-        for l in [0usize, 23, 47] {
-            let (gi, gb) = tensor_bytes_as(gguf, &names::ffn_gate_exps(l), GgmlType::Q4_K, None)?;
-            let (_, ub) = tensor_bytes_as(gguf, &names::ffn_up_exps(l), GgmlType::Q4_K, None)?;
-            let (k, rpe, n_exp) = (
-                gi.dims[0] as usize,
-                gi.dims[1] as usize,
-                gi.dims[2] as usize,
-            );
-            let rb = gb.len() / (rpe * n_exp);
-            let wg = upload(gpu, gb, rpe * n_exp)?;
-            let wu = upload(gpu, ub, rpe * n_exp)?;
-            let mut tickets = GroupTickets::new(stream, 8 * rpe / 128)?;
-            let xs =
-                ref_tensor_logical_in(&man.dir, man.tensor(&format!("ffn_inp_normed-{l}"), 0)?)?;
-            if xs.is_empty() || xs.len() % k != 0 {
-                return Err(format!(
-                    "ffn_inp_normed-{l} holds {} values, want rows of {k}",
-                    xs.len()
-                )
-                .into());
-            }
-            let m = xs.len() / k;
-            let (mut same, mut zero) = (0usize, true);
-            let mut last_act = None;
-            for t in 0..m {
-                let act = quantize(gpu, &xs[t * k..(t + 1) * k], 1, k)?;
-                let c = QuantCase {
-                    wg: &wg,
-                    wu: &wu,
-                    act: &act,
-                    rpe,
-                };
-                let want = quant_split(gpu, ex, &c, &sel)?;
-                let (got, z) = quant_fused(gpu, ex, &c, &sel, &mut tickets)?;
-                let eq = bits_equal(&got.h, &want.h) && q8_equal(&got.act_h, &want.act_h);
-                same += usize::from(eq);
-                zero &= z;
-                if !eq {
-                    println!(
-                        "gate_up_quant layer={l} t={t}: h_bits={} q8_1_bits={} FAIL",
-                        bits_equal(&got.h, &want.h),
-                        q8_equal(&got.act_h, &want.act_h)
-                    );
-                }
-                last_act = Some(act);
-            }
-            let pass = same == m && zero;
-            println!(
-                "gate_up_quant layer={l} K={k} rows={rpe} vs gate_up+quantize_q8_1: {same}/{m} tokens \
-                 bit-identical (h, q8_1 planes) tickets_zero={zero} {}",
-                verdict(pass)
-            );
-            ok &= pass;
-            if l != 0 {
-                continue;
-            }
-            let act = last_act.ok_or("no token ran")?;
-            let c = QuantCase {
-                wg: &wg,
-                wu: &wu,
-                act: &act,
-                rpe,
-            };
-
-            // Ids past the stack: those slots untouched on both paths.
-            let oor =
-                DeviceBuffer::from_host(stream, &[2u32, n_exp as u32, 7, u32::MAX, 0, 0, 0, 0])?;
-            let want = quant_split(gpu, ex, &c, &oor)?;
-            let (got, z) = quant_fused(gpu, ex, &c, &oor, &mut tickets)?;
-            let untouched = |h: &[f32], s: usize| {
-                h[s * rpe..(s + 1) * rpe]
-                    .iter()
-                    .all(|v| v.to_bits() == SENT.to_bits())
-            };
-            let pass = bits_equal(&got.h, &want.h)
-                && q8_equal(&got.act_h, &want.act_h)
-                && untouched(&got.h, 1)
-                && untouched(&got.h, 3)
-                && z;
-            println!(
-                "gate_up_quant out-of-range ids {n_exp} and u32::MAX: slots untouched and h, q8_1 \
-                 bit-identical to the split pair, tickets_zero={z} {}",
-                verdict(pass)
-            );
-            ok &= pass;
-
-            // A NaN super-block scale in expert sel[0]'s gate row 5: its
-            // SwiGLU value is NaN and both quantizers raise.
-            let mut nb = gb.to_vec();
-            let at = (sel_h[0] as usize * rpe + 5) * rb;
-            nb[at..at + 2].copy_from_slice(&0x7e00u16.to_le_bytes());
-            let wn = upload(gpu, &nb, rpe * n_exp)?;
-            let cn = QuantCase {
-                wg: &wn,
-                wu: &wu,
-                act: &act,
-                rpe,
-            };
-            gpu.clear_fault()?;
-            let want = quant_split(gpu, ex, &cn, &sel)?;
-            let f_split = gpu.fault()?;
-            gpu.clear_fault()?;
-            let (got, z) = quant_fused(gpu, ex, &cn, &sel, &mut tickets)?;
-            let f_fused = gpu.fault()?;
-            gpu.clear_fault()?;
-            let nan_h = got.h[5].is_nan();
-            let pass = nan_h
-                && f_split.is_some()
-                && f_split == f_fused
-                && bits_equal(&got.h, &want.h)
-                && q8_equal(&got.act_h, &want.act_h)
-                && z;
-            println!(
-                "gate_up_quant nan-scale row: h[5] NaN={nan_h} split fault={f_split:?} fused \
-                 fault={f_fused:?} (want raised, equal) tickets_zero={z} {}",
-                verdict(pass)
-            );
-            ok &= pass;
-            drop(wn);
-
-            // The graph: one node, two replays equal to the eager launch.
-            let (eager, _) = quant_fused(gpu, ex, &c, &sel, &mut tickets)?;
-            let mut hg = DeviceBuffer::from_host(stream, &vec![SENT; 8 * rpe])?;
-            let mut ag = Q8Act::with_k(stream, 8, rpe)?;
-            let graph = gpu.capture(|s| {
-                ex.enqueue_gate_up_quant(
-                    s,
-                    gate_up_args(&c, &sel, &mut hg),
-                    &mut ag,
-                    &mut tickets,
-                    gpu.unlabelled_sink(),
-                )
-            })?;
-            let mut replays_ok = true;
-            for _ in 0..2 {
-                graph.launch(stream)?;
-                stream.synchronize()?;
-                replays_ok &= bits_equal(&hg.to_host_vec(stream)?, &eager.h)
-                    && q8_equal(&readback_q8act(stream, &ag)?, &eager.act_h)
-                    && tickets.at_zero(stream)?;
-            }
-            let nodes = graph.node_count();
-            drop(graph);
-            let pass = replays_ok && nodes == 1;
-            println!(
-                "graph op=qwen3moe_gate_up_swiglu_quant_q4k two_replays_bit_identical_and_zero={replays_ok} \
-                 graph_nodes={nodes} {}",
-                verdict(pass)
-            );
-            ok &= pass;
-        }
         Ok(ok)
     }
 }

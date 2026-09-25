@@ -110,18 +110,18 @@ mod gate {
     const CTX: usize = 256;
 
     /// PIN(2026-09-25): the captured step's node count, derived before the
-    /// chain was built: the embedding row, 10 nodes per layer (attention
+    /// chain was built: the embedding row, 12 nodes per layer (attention
     /// norm+quant, q·k·v, QK-norm+rope+append, flash segment pass, flash
-    /// merge, attn_output with the q8_1 of its input and the residual, the
-    /// FFN norm with the router gemv and the routing, gate·up·SwiGLU with the
-    /// q8_1 of its rows, down, combine into the next layer's input), one more
+    /// merge, q8_1 of the attention rows, attn_output with the residual, the
+    /// FFN norm with the router gemv and the routing, gate·up·SwiGLU, q8_1 of
+    /// the SwiGLU rows, down, combine into the next layer's input), one more
     /// on each of the 24 layers whose value projection is Q6_K (its own
     /// gemv), and the head's three (norm, q8_1, the Q6_K gemv with the argmax
-    /// folded in): 1 + 24·10 + 24·11 + 3. Was 653: the head's gemv and
-    /// argmax were two launches, the attention rows' q8_1 ran in its own
-    /// launch before attn_output, the FFN norm_quant in its own before the
-    /// router, and the SwiGLU rows' q8_1 in its own after gate·up.
-    const NODES_CHAIN: usize = 508;
+    /// folded in): 1 + 24·12 + 24·13 + 3. Was 508: the two q8_1 launches
+    /// were folded into attn_output and gate·up, and decode ran slower —
+    /// every attn_output block re-quantized the attention row, every gate·up
+    /// block fenced and drew a ticket (rig-log `#qwen3fuse-regression-nsys`).
+    const NODES_CHAIN: usize = 604;
 
     /// Memcpy nodes in the captured step: the residual crosses no layer
     /// boundary as a copy.
@@ -129,8 +129,9 @@ mod gate {
 
     /// PIN(2026-09-25): the captured prefill pass's node count at one token,
     /// derived from the pass's launches before the graphs were built: the
-    /// decode step's chain without its head, 1 + 24·10 + 24·11.
-    const NODES_PASS_1: usize = 505;
+    /// decode step's chain without its head, 1 + 24·12 + 24·13. Was 505,
+    /// with the two q8_1 launches of [`NODES_CHAIN`]'s note folded.
+    const NODES_PASS_1: usize = 601;
 
     /// PIN(2026-09-25): the captured prefill pass's node count at every `m`
     /// from two to `MAX_TOKENS`, derived the same way: the embedding rows,

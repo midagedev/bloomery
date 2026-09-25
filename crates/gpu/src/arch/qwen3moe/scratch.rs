@@ -4,7 +4,6 @@
 //! reads, and the per-layer K/V planes. Both arenas are allocated once at
 //! load; nothing here is allocated per step or per prompt.
 
-use super::experts::GroupTickets;
 use super::router::{N_USED, RouterOut};
 use crate::GpuError;
 use crate::flash_gqa::{HEAD, partials_ms_len, partials_v_len};
@@ -95,9 +94,6 @@ pub(super) struct Arena {
     /// q8_1 of `h`, one column per slot: `act_h[m − 1]` holds the `m ·
     /// N_USED` columns of `m` tokens, the down's input.
     pub(super) act_h: Vec<Q8Act>,
-    /// The one-token gate·up's ticket counts, one per 128-value group of a
-    /// token's `h`.
-    pub(super) gate_up_tickets: GroupTickets,
     /// The down outputs, per token slot-major `N_USED · hidden`.
     pub(super) down: DeviceBuffer<f32>,
 }
@@ -249,7 +245,6 @@ impl Arena {
             act_h: (1..=rows)
                 .map(|m| Q8Act::with_slots(stream, m * N_USED, d.ff))
                 .collect::<Result<Vec<_>, _>>()?,
-            gate_up_tickets: GroupTickets::new(stream, (N_USED * d.ff).div_ceil(128))?,
             down: f(rows * N_USED * d.hidden)?,
             dims: d,
             rows,
@@ -285,7 +280,6 @@ impl Arena {
         bufs.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.v_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.route.bytes()
-            + self.gate_up_tickets.bytes()
             + acts.map(act_bytes).sum::<usize>()
     }
 }

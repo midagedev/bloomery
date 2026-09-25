@@ -2,16 +2,17 @@
 //! resident arena. No allocation, no synchronization, no host round trip —
 //! so this is both the eager body and what the capture records. One layer
 //! body serves both passes: the decode step is its one-row instance, the
-//! prompt prefill its `m`-row instance. At one row three launch seams are
-//! folded — the attention rows' q8_1 into the output projection, the FFN
-//! norm into the router, the SwiGLU rows' q8_1 into gate·up — each fused
-//! launch writing the bytes of the pair it replaces, so a one-row prefill
-//! pass and a multi-row one leave the same state.
+//! prompt prefill its `m`-row instance. At one row the FFN norm is folded
+//! into the router's launch, which writes the bytes of the pair it replaces,
+//! so a one-row prefill pass and a multi-row one leave the same state. The
+//! q8_1 of the attention rows and of the SwiGLU rows stay launches of their
+//! own: folded into the projection beside them, the work lands in every
+//! block of a grid that already streams its weights at the card's bandwidth.
 
 use super::body::{Body, Kernels, Kq, LayerNames};
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
-use super::proj::{OResidArgs, OResidQuantArgs, QkvArgs};
+use super::proj::{OResidArgs, QkvArgs};
 use super::router::N_USED;
 use super::scratch::{Arena, Io, KvPlanes};
 use crate::flash_gqa::{GqaArgs, HEAD};
@@ -177,18 +178,16 @@ pub(super) fn enqueue_pass_head(
 /// The launches [`enqueue_pass`] makes at `m` rows over layers `names`,
 /// counted from [`layer`]'s enqueues: the embedding, then per layer the
 /// attention half — norm+quant, q·k·v, QK-norm+rope+append, the flash's
-/// segment pass and merge, and the output projection (at one row with the
-/// q8_1 of its input folded in, at more after its own quantizer), plus a
-/// Q6_K value projection's gemv (and at more than one row its token-major
-/// copy) — and the FFN half: the norm with the router (one launch at one
-/// row, two at more), gate·up (at one row with the down's q8_1 folded in, at
-/// more followed by one quantizer over every token's slots), the down `_sel`
-/// over every token's slots, and the combine. So 10 or 11 per layer at one
-/// row and 13 or 15 at every `m` from two on.
+/// segment pass and merge, the attention rows' quantizer and the output
+/// projection, plus a Q6_K value projection's gemv (and at more than one row
+/// its token-major copy) — and the FFN half: the norm with the router (one
+/// launch at one row, two at more), gate·up, one quantizer over every
+/// token's slots, the down `_sel` over every token's slots, and the combine.
+/// So 12 or 13 per layer at one row and 13 or 15 at every `m` from two on.
 pub(super) fn pass_launches(names: &[LayerNames], m: usize) -> usize {
     let per_layer = |n: &LayerNames| {
         let q6v = usize::from(n.v_ty == Kq::Q6K);
-        if m == 1 { 10 + q6v } else { 13 + 2 * q6v }
+        if m == 1 { 12 + q6v } else { 13 + 2 * q6v }
     };
     1 + names.iter().map(per_layer).sum::<usize>()
 }
@@ -246,8 +245,7 @@ fn layer(
 
 /// The attention half: `x` in, `ffn_inp = x + attn_output(attn(x))` out —
 /// q, k and v in one launch (a Q6_K v in its own), the output projection
-/// with the residual add in its store, at one token with the q8_1 of its
-/// input in the same launch (`enqueue_o_resid_quant`).
+/// with the residual add in its store.
 fn attention(
     c: &Ctx<'_>,
     kv: &mut KvPlanes,
@@ -329,18 +327,6 @@ fn attention(
         c.mma,
     )?;
     let wo = kq_weight(w, &n.attn_output)?;
-    if m == 1 {
-        return k.proj.enqueue_o_resid_quant(
-            stream,
-            OResidQuantArgs {
-                w: wo,
-                attn: &s.attn,
-                x: &s.x,
-                y: &mut s.ffn_inp,
-            },
-            gpu.unlabelled_sink(),
-        );
-    }
     gpu.enqueue_quantize_q8_1(&s.attn, &mut s.act_attn[i])?;
     k.proj.enqueue_o_resid(
         stream,
@@ -358,12 +344,11 @@ fn attention(
 /// `out` (`None`: into `x`). The down `_sel` runs every token's slots in one
 /// launch: slot `t · N_USED + j` is token `t`'s slot `j`, its id, its q8_1
 /// column and its down rows all at that index, so each slot's row is the
-/// row a one-token launch writes. At one token the norm runs inside the
-/// router's launch (`enqueue_norm_fused`, `norm_quant`'s bytes) and the
-/// down's q8_1 input inside the gate·up's (`enqueue_gate_up_quant`); at more,
-/// `norm_quant` and the `m`-token router, and one quantizer launch over
+/// row a one-token launch writes. Its input is one quantizer launch over
 /// every token's slots (each 128-value block is quantized on its own, so a
-/// column's bytes do not depend on the columns beside it).
+/// column's bytes do not depend on the columns beside it). At one token the
+/// norm runs inside the router's launch (`enqueue_norm_fused`,
+/// `norm_quant`'s bytes); at more, `norm_quant` and the `m`-token router.
 fn ffn(
     c: &Ctx<'_>,
     s: &mut Arena,
@@ -412,21 +397,9 @@ fn ffn(
         rows_per_expert: d.ff,
         h: &mut s.h,
     };
-    if m == 1 {
-        k.experts.enqueue_gate_up_quant(
-            stream,
-            gate_up,
-            &mut s.act_h[i],
-            &mut s.gate_up_tickets,
-            gpu.unlabelled_sink(),
-        )?;
-    } else {
-        k.experts.enqueue_gate_up(stream, gate_up)?;
-    }
+    k.experts.enqueue_gate_up(stream, gate_up)?;
     let wd = kq_weight(w, &n.ffn_down_exps)?;
-    if m > 1 {
-        gpu.enqueue_quantize_q8_1(&s.h, &mut s.act_h[i])?;
-    }
+    gpu.enqueue_quantize_q8_1(&s.h, &mut s.act_h[i])?;
     let act_h = &s.act_h[i];
     match n.down_ty {
         Kq::Q4K => gpu.q4k_sel().enqueue_gemv_q4k_sel(

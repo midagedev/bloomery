@@ -1,9 +1,7 @@
 //! A qwen3moe layer's attention projections in two launches beside the
 //! flash: the query, key and value rows in one (`qwen3moe_qkv_q4k`; a Q6_K
 //! value projection keeps its own `q6k_gemv` launch), and the output
-//! projection with the residual add in its store (`qwen3moe_o_resid_q4k`;
-//! at one token `qwen3moe_o_resid_quant_q4k`, which also quantizes its f32
-//! input per block, so the q8_1 launch before it goes).
+//! projection with the residual add in its store (`qwen3moe_o_resid_q4k`).
 //! `q6k_gemv` writes `m > 1` columns row-major; `qwen3moe_token_major`
 //! copies them into the token-major layout the rest of the chain reads.
 //!
@@ -20,30 +18,12 @@
 
 use crate::GpuError;
 use crate::cores::q4k_row_dot_1col;
-use crate::fault::{FaultSink, FaultSite};
+use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
-use crate::{launch_u32, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
-use cuda_device::{
-    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
-};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 use std::sync::Arc;
-
-/// The widest attention row `qwen3moe_o_resid_quant_q4k` quantizes into
-/// shared memory: 32 query heads of 128.
-pub const ATTN_K: usize = 4096;
-/// Super-blocks of an [`ATTN_K`] row, and the q8_1 planes' lengths one
-/// column of it takes (`Q8Act`'s layout: `64·half_it` u64, `256·quad_it` and
-/// `128·half_it` u32, `8·n_sb` group sums, `2·n_sb` scales).
-const ATTN_SB: usize = ATTN_K / 256;
-const ATTN_Q3: usize = 64 * ATTN_SB.div_ceil(2);
-const ATTN_Q4: usize = 256 * ATTN_SB.div_ceil(4);
-const ATTN_Q6: usize = 128 * ATTN_SB.div_ceil(2);
-const ATTN_S8: usize = 8 * ATTN_SB;
-const ATTN_D8: usize = 2 * ATTN_SB;
-// The launch contract spells the bound out.
-const _: () = assert!(ATTN_K == 4096);
 
 #[cuda_module]
 mod qwen3moe_proj_kernels {
@@ -187,132 +167,6 @@ mod qwen3moe_proj_kernels {
         }
     }
 
-    /// The output projection of one token with the q8_1 of its input folded
-    /// in: `y[r] = (w · q8_1(attn))[r] + x[r]`. Every block first quantizes
-    /// the whole `attn` row (`256 · n_sb <= ATTN_K` values) into its own
-    /// shared copy of the q8_1 planes with `q8_1_quant_block` —
-    /// `q3k_quantize_q8_1`'s body, the non-finite raise
-    /// ([`FaultSite::QuantColumn`]) with it — warp `w` taking the 128-value
-    /// blocks `w, w + 8, …` (which warp takes a block moves no bit: the
-    /// block's work is warp-local). Then each warp's row is
-    /// `qwen3moe_o_resid_q4k`'s at one column, reading those planes: the
-    /// same bytes the quantizer launch writes, so the same dot.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(256)]
-    #[launch_contract(
-        domain = 1,
-        block = (256, 1, 1),
-        requires = (
-            n_sb <= 16,
-            w.len() >= rows * 36 * n_sb,
-            attn.len() >= 256 * n_sb,
-            x.len() >= rows,
-            y.len() >= rows
-        )
-    )]
-    pub fn qwen3moe_o_resid_quant_q4k(
-        w: &[u32],
-        attn: &[f32],
-        x: &[f32],
-        rows: u32,
-        n_sb: u32,
-        half_it: u32,
-        quad_it: u32,
-        mut y: DisjointSlice<f32>,
-        fault: FaultSink,
-    ) {
-        static mut SQ3: SharedArray<u64, ATTN_Q3> = SharedArray::UNINIT;
-        static mut SQ4: SharedArray<u32, ATTN_Q4> = SharedArray::UNINIT;
-        static mut SQ6: SharedArray<u32, ATTN_Q6> = SharedArray::UNINIT;
-        static mut SS8: SharedArray<i32, ATTN_S8> = SharedArray::UNINIT;
-        static mut SD8: SharedArray<f32, ATTN_D8> = SharedArray::UNINIT;
-
-        let tid = thread::threadIdx_x() as usize;
-        let wi = tid / 32;
-        let lane = warp::lane_id() as usize;
-        let n_sb = n_sb as usize;
-        // SAFETY: the five arrays are this block's own shared allocations;
-        // the raw form reaches each `static mut` without a reference.
-        let (p3, p4, p6, ps8, pd8) = unsafe {
-            (
-                SharedArray::as_raw_mut_ptr(&raw mut SQ3),
-                SharedArray::as_raw_mut_ptr(&raw mut SQ4),
-                SharedArray::as_raw_mut_ptr(&raw mut SQ6),
-                SharedArray::as_raw_mut_ptr(&raw mut SS8),
-                SharedArray::as_raw_mut_ptr(&raw mut SD8),
-            )
-        };
-        {
-            // SAFETY: each slice spans its array's whole allocation, and
-            // these are the only views of them until the barrier below; the
-            // quantizer's stores are disjoint across the block's lanes (its
-            // contract), as a kernel output's are across a grid.
-            let (mut q3, mut q4, mut q6, mut s8, mut d8) = unsafe {
-                (
-                    DisjointSlice::from_raw_parts(p3, ATTN_Q3),
-                    DisjointSlice::from_raw_parts(p4, ATTN_Q4),
-                    DisjointSlice::from_raw_parts(p6, ATTN_Q6),
-                    DisjointSlice::from_raw_parts(ps8, ATTN_S8),
-                    DisjointSlice::from_raw_parts(pd8, ATTN_D8),
-                )
-            };
-            let mut b = wi;
-            while b < 2 * n_sb {
-                // SAFETY: one column (col 0), b < 2·n_sb, attn holds 256·n_sb
-                // values (launch contract), the planes hold one column of an
-                // n_sb <= 16 row (the arrays' lengths at ATTN_SB = 16, with the
-                // host's half_it = ceil(n_sb/2), quad_it = ceil(n_sb/4)), and
-                // the whole warp is here with the same b.
-                q8_1_quant_block(
-                    attn,
-                    0,
-                    0,
-                    b,
-                    n_sb,
-                    half_it,
-                    quad_it,
-                    lane,
-                    &mut q3,
-                    &mut q4,
-                    &mut q6,
-                    &mut s8,
-                    &mut d8,
-                    fault,
-                    FaultSite::QuantColumn,
-                );
-                b += 8;
-            }
-        }
-        thread::sync_threads();
-
-        let row = thread::blockIdx_x() as usize * 8 + wi;
-        if row >= rows as usize {
-            return;
-        }
-        // SAFETY: the planes were written before the barrier above and
-        // nothing writes them from here on; each slice spans its array.
-        let (q, s8, d8) = unsafe {
-            (
-                core::slice::from_raw_parts(p4.cast_const(), ATTN_Q4),
-                core::slice::from_raw_parts(ps8.cast_const(), ATTN_S8),
-                core::slice::from_raw_parts(pd8.cast_const(), ATTN_D8),
-            )
-        };
-        // The core's caller contract: row < rows rows of `w`, one column of
-        // q/s8/d8 (q holds 256·quad_it words with quad_it = iters), and all
-        // 32 lanes of the warp are here (the return above is warp-uniform).
-        let v = warp::reduce_sum_f32(q4k_row_dot_1col(w, q, s8, d8, n_sb, quad_it, row, 0, lane));
-        if lane == 0 {
-            // SAFETY: row < rows <= x.len(), y.len() by the launch contract;
-            // lane 0 of the row's warp is the slot's only writer.
-            unsafe { *y.get_unchecked_mut(row) = v + *x.get_unchecked(row) };
-        }
-    }
-
     /// A row-major `m`-column output to token-major: `y[c · rows + r] =
     /// x[r · m + c]`, one thread per value — a copy, so exact.
     #[kernel]
@@ -357,16 +211,6 @@ pub struct QkvArgs<'a> {
 pub struct OResidArgs<'a> {
     pub w: &'a DeviceTensor<u32>,
     pub act: &'a Q8Act,
-    pub x: &'a DeviceBuffer<f32>,
-    pub y: &'a mut DeviceBuffer<f32>,
-}
-
-/// [`ProjKernels::enqueue_o_resid_quant`]'s arguments: the Q4_K output
-/// projection, its one token's f32 input `attn` (`256 · n_sb` values, at
-/// most [`ATTN_K`]), the residual and the output (`w.rows()` values each).
-pub struct OResidQuantArgs<'a> {
-    pub w: &'a DeviceTensor<u32>,
-    pub attn: &'a DeviceBuffer<f32>,
     pub x: &'a DeviceBuffer<f32>,
     pub y: &'a mut DeviceBuffer<f32>,
 }
@@ -558,64 +402,6 @@ impl ProjKernels {
             n_sb,
             n_sb.div_ceil(4),
             y,
-        )?;
-        Ok(())
-    }
-
-    /// Enqueue `y = w · q8_1(attn) + x` for one token in one launch
-    /// (`qwen3moe_o_resid_quant_q4k`): the bytes `y` holds after
-    /// `Gpu::enqueue_quantize_q8_1` on `attn` and then
-    /// [`ProjKernels::enqueue_o_resid`], with `fault` taking the quantizer's
-    /// raise. Asynchronous, allocation-free, capturable.
-    pub fn enqueue_o_resid_quant(
-        &self,
-        stream: &CudaStream,
-        a: OResidQuantArgs<'_>,
-        fault: FaultSink,
-    ) -> Result<(), GpuError> {
-        let what = "qwen3moe::enqueue_o_resid_quant";
-        let OResidQuantArgs { w, attn, x, y } = a;
-        let n_sb = w.cols() / 36;
-        let rows = w.rows();
-        if n_sb == 0 || w.cols() != 36 * n_sb || 256 * n_sb > ATTN_K {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "attn_output: Q4_K rows of {} words, want 36 per super-block and at most {ATTN_K} values",
-                    w.cols()
-                ),
-            ));
-        }
-        if attn.len() < 256 * n_sb || x.len() < rows || y.len() < rows {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "attn.len() {} for K={}, residual {} and output {} for {rows} rows",
-                    attn.len(),
-                    256 * n_sb,
-                    x.len(),
-                    y.len()
-                ),
-            ));
-        }
-        let grid = launch_u32(what, "grid", rows.div_ceil(8))?;
-        let rows = launch_u32(what, "rows", rows)?;
-        let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_o_resid_quant_q4k(LaunchConfig1D::new(grid, 256, 0))?;
-        self.module.qwen3moe_o_resid_quant_q4k(
-            stream,
-            &prep,
-            w.buf(),
-            attn,
-            x,
-            rows,
-            n_sb,
-            n_sb.div_ceil(2),
-            n_sb.div_ceil(4),
-            y,
-            fault,
         )?;
         Ok(())
     }
