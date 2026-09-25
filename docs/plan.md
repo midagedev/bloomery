@@ -31,8 +31,8 @@
 | 파동 | 병렬 | 리드가 그 사이 | 닫는 조건 |
 |---|---|---|---|
 | **21 (09-25 04:10~)** | `dspark-q3k` ‖ `ds41hcbranch` ‖ `unionhost` → `ds41splitk` ‖ `qwen3route` ‖ `fixup3` | plan 정리(이 판), E21, `spec-dsloop`, spots-triage 표 | dspark-q3k·hcbranch 머지 → dsloop 자리 |
-| 22 | `dsloop` ‖ `qwen3fuse` ‖ `load3` ‖ `slots` (07:20 발사, base `ac250bb`; uniongroup·gpuq1은 body.rs·chain/ffn.rs 충돌로 23으로) | 시팅 B·C·D, A3 리베이스 A/B, 시팅 10(승인 뒤) | dsloop 머지 → DSpark tok/s |
-| 23 | `uniongroup` ‖ `gpuq1` ‖ `v4meta` ‖ `qwen3bw` ‖ `linear` ‖ `visinj` ‖ `glm53` ‖ 하니스 기계 라운드 (≤ 4씩) | M1 글·영상, E28 재측정 | — |
+| ~~22~~ 닫힘 09-25 10:05 | `dsloop` `c00274c` ‖ `qwen3fuse` `ae046aa` ‖ `load3` `5fef4b4` ‖ `slots` `75d2bad` (07:20 발사, base `ac250bb`; uniongroup·gpuq1은 23으로) | 시팅 B·C·D, A3 리베이스 A/B, 시팅 10(승인 뒤) | dsloop 머지 → DSpark tok/s |
+| 23 (선발 10:00~) | **`prefillbench` ‖ `ds41prefill`**(사용자 09-25: 프리필 우선) → 시팅 E21·DS·L3·Q3F·P 뒤 `uniongroup` ‖ `gpuq1`(load3가 0층 그늘을 바꿨으니 P1 재유도) ‖ N4 설계 ‖ 프리필 구현 첫 라운드(ds41prefill 표가 정한다) (≤ 4씩) | M1 글·영상, E28 재측정 | — |
 
 ### 리드 직렬 지점과 규칙
 
