@@ -32,6 +32,28 @@
 # and the top stall reasons (medians over the collected launches). The profile runs under
 # BLOOMERY_ARM_BOUND seconds (default 900). BLOOMERY_DRY=1 prints the command line and exits before
 # the binary check and the lease; the depth form has no dry path and refuses the variable.
+#
+# The V4.1 prompt form (BLOOMERY_NCU_FORM=ds41pp, `just ncu-gpu-ds41-pp [P]`): one launch of each of the
+# four attention projections (the joined qkv, q_b, wo_a heads, wo_b) at m = 8 in one full chunk of a
+# layer >= 2 of a P-token prompt batch (BLOOMERY_NCU_PROMPT, default 512). The skip is the known trap, so
+# it is not counted here: tools/ref/ds41pp.py ncu-plan derives it from the nsys prefill form's trace of
+# the same command (BLOOMERY_NCU_TRACE, default the newest nsys-ds41-pp<P>-* sqlite in $BLOOMERY_DATA/nsys,
+# with its .meta and run log): the eager q3k_gemv / ds41_q3k_gemv_heads_mcol launches in launch order
+# before the chunk's qkv, and the shapes of the launches it reaches. The profile runs that command with
+# --mode eager — the prompt batch is eager in both modes, and without the capture before it the
+# filter's launch count is the trace's — and refuses a trace made by another binary or hot list.
+# BLOOMERY_NCU_LAYER picks the layer (default: the first >= 2 whose full chunks carry only the four
+# projections and no engram, compressor or indexer launch); the chunk is its middle full chunk. The
+# summary checks every profiled launch's name, grid and block against the plan and each one's column
+# count against its global loads (the m-column walk issues 8 + 3m global loads a warp-iteration; the row
+# count and K come from the file's tensors) and prints nothing else on a mismatch; then, per launch, the
+# block-step cycles (one iteration of a block's 8 warps) and each unit's demand in cycles next to them:
+# issue, alu, fmaheavy (the pipe IDP.4A issues on, with IMAD and IMUL), fmalite, xu, lsu, the L1TEX data
+# pipe, DRAM — from each pipe's instruction count at its peak rate and, for alu, fma, fmaheavy, fmalite
+# and the LSU writeback, from ncu's own active cycles — with ncu's own pipe shares and the top stall
+# reasons. Sections SpeedOfLight, LaunchStats, Occupancy (BLOOMERY_NCU_SECTIONS) and the metrics in
+# DS41PP_METRICS; BLOOMERY_ARM_BOUND bounds the profile. The card is full, so before a profiled launch's
+# first pass ncu saves every device allocation to host memory: this form's prompt runs for minutes.
 set -uo pipefail
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
 # 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
@@ -92,10 +114,10 @@ FORM=${BLOOMERY_NCU_FORM:-generate}
 DRY=${BLOOMERY_DRY:-}
 case $FORM in
   generate)
-    [ -z "$DRY" ] || { echo "ncu-gpu.sh: BLOOMERY_DRY is read by the gemm form only (BLOOMERY_NCU_FORM=gemm); the depth form has no dry path" >&2; exit 64; }
+    [ -z "$DRY" ] || { echo "ncu-gpu.sh: BLOOMERY_DRY is read by the gemm and ds41pp forms only; the depth form has no dry path" >&2; exit 64; }
     ;;
-  gemm) ;;
-  *) echo "ncu-gpu.sh: BLOOMERY_NCU_FORM is generate or gemm, got '$FORM'" >&2; exit 64 ;;
+  gemm | ds41pp) ;;
+  *) echo "ncu-gpu.sh: BLOOMERY_NCU_FORM is generate, gemm or ds41pp, got '$FORM'" >&2; exit 64 ;;
 esac
 
 if [ "$FORM" = gemm ]; then
@@ -230,12 +252,112 @@ PY
   exit $rc
 fi
 
+if [ "$FORM" = ds41pp ]; then
+  [ "$MODEL_NAME" = deepseek41 ] || { echo "ncu-gpu.sh: the ds41pp form profiles generate_ds41; the profile is '$MODEL_NAME' (BLOOMERY_MODEL=deepseek41)" >&2; exit 64; }
+  PP=${BASH_SOURCE[0]%/*}/ds41pp.py
+  GEN=${BLOOMERY_GEN_BIN:-target/release/generate_ds41}
+  P=${BLOOMERY_NCU_PROMPT:-512}
+  case $P in
+    '' | *[!0-9]* | [0-8]) echo "ncu-gpu.sh: BLOOMERY_NCU_PROMPT is a prompt length >= 9, got '$P'" >&2; exit 64 ;;
+  esac
+  TRACE=${BLOOMERY_NCU_TRACE:-$(ls -t "$BLOOMERY_DATA"/nsys/nsys-ds41-pp"$P"-n*-*.sqlite 2> /dev/null | head -n 1)}
+  META=${TRACE%.sqlite}.meta
+  RUNLOG=${TRACE%.sqlite}.txt
+  meta() { [ -f "$META" ] && sed -n "s/^$1=//p" "$META"; }
+  N=$(meta n)
+  N=${N:-2}
+  SECTIONS_PP=${BLOOMERY_NCU_SECTIONS:-SpeedOfLight LaunchStats Occupancy}
+  BOUND=${BLOOMERY_ARM_BOUND:-900}
+  DS41PP_METRICS=sm__cycles_elapsed.avg,sm__cycles_active.avg,smsp__inst_executed.sum
+  DS41PP_METRICS+=,smsp__issue_active.avg.pct_of_peak_sustained_active,sm__warps_active.avg.pct_of_peak_sustained_active
+  DS41PP_METRICS+=,sm__inst_executed_pipe_alu.sum,sm__inst_executed_pipe_fma.sum,sm__inst_executed_pipe_fmaheavy.sum
+  DS41PP_METRICS+=,sm__inst_executed_pipe_fmalite.sum,sm__inst_executed_pipe_xu.sum,sm__inst_executed_pipe_lsu.sum
+  DS41PP_METRICS+=,sm__inst_executed_pipe_cbu.sum,sm__inst_executed_pipe_adu.sum,sm__inst_executed_pipe_uniform.sum
+  DS41PP_METRICS+=,sm__inst_executed_pipe_alu.avg.pct_of_peak_sustained_active
+  DS41PP_METRICS+=,sm__inst_executed_pipe_fmaheavy.avg.pct_of_peak_sustained_active
+  DS41PP_METRICS+=,sm__inst_executed_pipe_fmalite.avg.pct_of_peak_sustained_active
+  DS41PP_METRICS+=,sm__inst_executed_pipe_xu.avg.pct_of_peak_sustained_active
+  DS41PP_METRICS+=,sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active
+  DS41PP_METRICS+=,smsp__pipe_alu_cycles_active.avg,smsp__pipe_fma_cycles_active.avg
+  DS41PP_METRICS+=,smsp__pipe_fmaheavy_cycles_active.avg,smsp__pipe_fmalite_cycles_active.avg
+  DS41PP_METRICS+=,l1tex__lsuin_requests.sum,l1tex__lsu_writeback_active.avg
+  DS41PP_METRICS+=,smsp__inst_executed_op_global_ld.sum,l1tex__data_pipe_lsu_wavefronts.sum
+  DS41PP_METRICS+=,l1tex__throughput.avg.pct_of_peak_sustained_active
+  DS41PP_METRICS+=,dram__bytes_read.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed
+  out="$OUTDIR/ncu-ds41pp-pp${P}-$(date -u +%H%M%S)"
+  mkdir -p "$OUTDIR"
+  sec_args=()
+  for s in $SECTIONS_PP; do sec_args+=(--section "$s"); done
+  list=$DS41PP_METRICS
+  for s in $STALLS; do list="$list,smsp__warp_issue_stalled_${s}_per_warp_active"; done
+  # The command for a skip, a count and a kernel filter, into CMD.
+  pp_cmd() {
+    CMD=(timeout --kill-after=10 "$BOUND" "$NCU" --target-processes application-only --clock-control base
+         --launch-skip "$1" --launch-count "$2"
+         --kernel-name "regex:$3" --kernel-name-base function
+         "${sec_args[@]}" --metrics "$list" --csv --log-file "$out.csv"
+         "$GEN" --depth "$P" -n "$N" --mode eager --time)
+  }
+  if [ -n "$DRY" ]; then
+    pp_cmd '<the plan skip>' '<the plan count>' '<the plan regex>'
+    echo "[dry] form=ds41pp bin=$GEN trace=${TRACE:-<none: run just nsys-gpu-ds41-prefill $P first>} (sha256 $(meta sha256), hot list '$(meta hot_list)') bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+    echo "[dry] ${CMD[*]}"
+    exit 0
+  fi
+  [ -n "$TRACE" ] && [ -f "$TRACE" ] || { echo "ncu-gpu.sh: no nsys prefill trace of P = $P (BLOOMERY_NCU_TRACE, or run just nsys-gpu-ds41-prefill $P first)" >&2; exit 2; }
+  [ -f "$META" ] && [ -f "$RUNLOG" ] || { echo "ncu-gpu.sh: $TRACE has no .meta or run log beside it: the trace's binary and command are unknown" >&2; exit 2; }
+  assert_fresh_binary "$GEN" || exit $?
+  [ "$(meta sha256)" = "$BIN_SHA" ] || { echo "[skip] the trace was made by generate_ds41 sha256 $(meta sha256), this one is $BIN_SHA: its launch order is not this binary's — run just nsys-gpu-ds41-prefill $P again" >&2; exit 3; }
+  [ "$(meta hot_list)" = "${BLOOMERY_HOT_LIST:-}" ] || { echo "[skip] the trace ran with BLOOMERY_HOT_LIST='$(meta hot_list)', this run with '${BLOOMERY_HOT_LIST:-}': another placement" >&2; exit 3; }
+  [ -x "$NCU" ] || { echo "no ncu at $NCU" >&2; exit 2; }
+  [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
+  WITNESS=(head-open indent card model)
+  lease_take
+  plan_args=("$TRACE" "$P" "$RUNLOG" "$out.plan")
+  [ -z "${BLOOMERY_NCU_LAYER:-}" ] || plan_args+=(--layer "$BLOOMERY_NCU_LAYER")
+  echo "[plan] from $TRACE"
+  python3 "$PP" ncu-plan "${plan_args[@]}" || exit $?
+  pp_cmd "$(sed -n 's/^skip=//p' "$out.plan")" "$(sed -n 's/^count=//p' "$out.plan")" "$(sed -n 's/^regex=//p' "$out.plan")"
+  SKIP=$(sed -n 's/^skip=//p' "$out.plan")
+  COUNT=$(sed -n 's/^count=//p' "$out.plan")
+  REGEX=$(sed -n 's/^regex=//p' "$out.plan")
+  echo "[config] ncu=$($NCU --version | sed -n 3p) form=ds41pp P=$P n=$N skip=$SKIP count=$COUNT regex='$REGEX' bound=${BOUND}s"
+  echo "[config] sections='$SECTIONS_PP' out=$out hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+  witness pre
+  guard_other
+  t0=$(date +%s)
+  "${CMD[@]}" > "$out.txt" 2>&1
+  rc=$?
+  witness post
+  echo "[rc] $rc wall $(($(date +%s) - t0))s"
+  [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
+  want=$(sed -n 's/^plan_line=//p' "$out.plan")
+  got=$(grep -m 1 '^plan ' "$out.txt")
+  if [ "$want" != "$got" ]; then
+    echo "[skip] the profiled run's plan line differs from the trace's:"
+    echo "    trace:   $want"
+    echo "    profile: $got"
+    [ $rc -ne 0 ] || rc=3
+  elif [ -s "$out.csv" ]; then
+    echo "--- summary. Raw: $out.csv, the plan $out.plan, the run $out.txt"
+    python3 "$PP" ncu-summary "$out.csv" "$out.plan" "$MODEL"
+    prc=$?
+    [ $prc -eq 0 ] || [ $rc -ne 0 ] || rc=$prc
+  else
+    echo "[summary] no CSV at $out.csv"
+    [ $rc -ne 0 ] || rc=3
+  fi
+  echo "[lease] released at $(now)"
+  exit $rc
+fi
+
 assert_fresh_binary "$BIN" || exit $?
 [ -x "$NCU" ] || { echo "no ncu at $NCU" >&2; exit 2; }
 # 카운터는 admin 전용이다(/proc/driver/nvidia/params의 RmProfilingAdminOnly: 1).
 [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
 mkdir -p "$OUTDIR"
 
+# shellcheck disable=SC2034 # read by lease.sh's witness()
 WITNESS=(head-open indent card model)
 
 lease_take

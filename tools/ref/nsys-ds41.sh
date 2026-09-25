@@ -24,10 +24,19 @@
 #       exposed  = post.start − end of the kernel before it (what the step waited for the host)
 #     and exposed − the replay's median inter-kernel gap is the part the host tier added.
 #
-# Replays: generate_ds41 feeds D ids, one graph replay each, then N − 1 generated steps, one replay
-# each: D + N − 1 replays, the last at depth D + N − 2. Replay D − 1 produces token 0 and is fed
-# untimed; replays D .. D + N − 2 are `time step 1 .. N−1`. The capture before the prompt executes
-# no kernel.
+# Replays: generate_ds41 feeds its D ids as the `load` line's `prefill=` says. `batch` (the default)
+# runs them eagerly through body::prefill — kernels with no graph node, one `time prompt ...
+# kind=batch` row — so the replays are the N − 1 generated steps: replay r is `time step r + 1` at
+# depth D + r. `steps` (BLOOMERY_PREFILL=steps) feeds one graph replay an id: D + N − 1 replays, the
+# last at depth D + N − 2; replay D − 1 produces token 0 and is fed untimed, replays D .. D + N − 2
+# are `time step 1 .. N−1`. The boundary is the replay's first graph kernel among those that run once
+# a replay, searched among the graph's kernels only: the batch's eager kernels carry the same names,
+# and the batch embed launches ds41_glue_embed_q3k once a prompt token, so over all kernels that one
+# name alone counts D + N − 1 under the batch feed and would open each window at the replay's second
+# node. The trace's own eager kernels decide the feed: the run log's `time prompt` row must say the
+# same, or no table. The batch feed is what depth-ds41.sh times and leaves the caches as the steps
+# would; at depth 1024 the step feed would add ≈ 1024 replays of wall and trace. The capture before
+# the prompt executes no kernel.
 #
 # µs here are the trace's. A replay's period (its first kernel's start to the next replay's) holds
 # the host turnaround too (argmax readback, the step's host half, the image copy) and is the value
@@ -35,17 +44,46 @@
 # tracing are off: the host tier spins a whole pool, and sampling it would perturb the bridge this
 # runner measures.
 #
-# Environment: BLOOMERY_NSYS_N (N, default 8), BLOOMERY_NSYS_LAST (replays tabled, default 8),
-# BLOOMERY_NSYS_TOP (kernel rows, default 24), BLOOMERY_NSYS_OUT (default $BLOOMERY_DATA/nsys),
-# BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_ARM_BOUND (seconds one profile
-# may run, default 900).
+# The prefill form (BLOOMERY_NSYS_FORM=prefill, `just nsys-gpu-ds41-prefill [P...]`): the prompt batch
+# instead of a decode step. Each argument is a prompt length P >= 9 (default 512); the profiled command
+# is `generate_ds41 --depth P -n N --mode graph --time` (N = BLOOMERY_NSYS_N, default 2, at least 2 so
+# that a replay closes the window), depth-ds41.sh's `<P>` arm at another N: the fed ids are lease.sh's
+# lcg_prompt P, in batches. The window runs from the prompt's first kernel to the first replay; inside
+# it tools/ref/ds41pp.py cuts the layer-batches at `ds41_ffn_places` and the joins, counted against the
+# run's `stat prefill split` and `stat prefill ced=` lines (no table on a wrong count), and prints per
+# layer-batch the route window (the layer's first kernel to the route's last copy to the host), the
+# union gap (the card holding only the shadow while the host runs the union) and the post, the kernel
+# table of one layer-batch (BLOOMERY_NSYS_LAYER, default 2) and the mean over layers 2-39 grouped into
+# terms, the card's idle time in the route window (the gaps), and the launch queue from the CUDA API
+# trace (per layer-batch the enqueue calls, the most activities in flight when the queue fills, from
+# which activity it is full, the calls longer than BLOOMERY_NSYS_BLOCKED_US µs, default 8, after and
+# before that, and the queue model at those values). ds41pp.py's header has the cut. The profile writes
+# <out>.meta beside the report (the binary's sha256, P, N, the command, the hot list): the ncu ds41pp
+# form reads it and the sqlite to derive its launch skip. `--analyze <sqlite> <P> <n> <run log>` under
+# BLOOMERY_NSYS_FORM=prefill re-prints the tables (the run log is required: the cut reads it).
+#
+# Environment: BLOOMERY_NSYS_N (N, default 8, 2 in the prefill form), BLOOMERY_NSYS_LAST (replays
+# tabled, default 8), BLOOMERY_NSYS_TOP (kernel rows, default 24), BLOOMERY_NSYS_OUT (default
+# $BLOOMERY_DATA/nsys), BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_ARM_BOUND
+# (seconds one profile may run, default 900), BLOOMERY_DRY=1 (the command lines, then exit before the
+# binary check and the lease).
 set -uo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 
-NGEN=${BLOOMERY_NSYS_N:-8}
+FORM=decode
+case ${BLOOMERY_NSYS_FORM:-} in
+  '') ;;
+  prefill) FORM=prefill ;;
+  *) echo "nsys-ds41.sh: BLOOMERY_NSYS_FORM is prefill or unset, got '$BLOOMERY_NSYS_FORM'" >&2; exit 64 ;;
+esac
+if [ "$FORM" = prefill ]; then NGEN=${BLOOMERY_NSYS_N:-2}; else NGEN=${BLOOMERY_NSYS_N:-8}; fi
 LAST=${BLOOMERY_NSYS_LAST:-8}
 TOP=${BLOOMERY_NSYS_TOP:-24}
+LAYER=${BLOOMERY_NSYS_LAYER:-2}
+BLOCKED_US=${BLOOMERY_NSYS_BLOCKED_US:-8}
+DRY=${BLOOMERY_DRY:-}
+PP=${BASH_SOURCE[0]%/*}/ds41pp.py
 
 # The analysis: sqlite, depth, n, the run's own output (for SMOKE and `time step`), last, top.
 analyze() {
@@ -56,45 +94,68 @@ db = sqlite3.connect(sys.argv[1])
 depth, ngen, last, top = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[5]), int(sys.argv[6])
 runlog = sys.argv[4]
 names = dict(db.execute("SELECT id, value FROM StringIds"))
-ks = [(s, e, names.get(n, str(n)).split("(")[0])
-      for s, e, n in db.execute("SELECT start, end, shortName FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start")]
-def rows(table):
+rows = db.execute("SELECT start, end, shortName, graphNodeId FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start").fetchall()
+# The batch feed's kernels run outside the graph; the replays' are its nodes.
+eager = [r for r in rows if r[3] is None]
+ks = [(s, e, names.get(n, str(n)).split("(")[0]) for s, e, n, g in rows if g is not None]
+def rows_of(table):
     try:
         return db.execute(f"SELECT start, end, bytes FROM {table} ORDER BY start").fetchall()
     except sqlite3.OperationalError:
         return []
-copies, sets = rows("CUPTI_ACTIVITY_KIND_MEMCPY"), rows("CUPTI_ACTIVITY_KIND_MEMSET")
-print(f"    kernels {len(ks)}  memcpy {len(copies)}  memset {len(sets)}  (stream memory operations leave no record)")
-replays = depth + ngen - 1
+copies, sets = rows_of("CUPTI_ACTIVITY_KIND_MEMCPY"), rows_of("CUPTI_ACTIVITY_KIND_MEMSET")
+feed = "batch" if eager else "steps"
+kind = None
+try:
+    for line in open(runlog):
+        m = re.match(r"time prompt n=\d+ ms=\S+ tok/s=\S+ passes=\d+ kind=(\w+)", line)
+        if m:
+            kind = m.group(1)
+except OSError:
+    pass
+print(f"    kernels {len(rows)} ({len(eager)} outside the graph: the prompt's feed is {feed})  memcpy "
+      f"{len(copies)}  memset {len(sets)}  (stream memory operations leave no record)")
+if kind is not None and kind != feed:
+    print(f"    NO TABLE: the run log's time prompt row says kind={kind}, the trace's kernels say {feed}")
+    raise SystemExit(3)
+if eager and ks and eager[-1][0] > ks[0][0]:
+    print("    NO TABLE: a graph replay runs before the batch's last eager kernel")
+    raise SystemExit(3)
+fed = depth if feed == "steps" else 0
+replays = fed + ngen - 1
 cnt = defaultdict(int)
 for k in ks:
     cnt[k[2]] += 1
 cands = [n for n, c in cnt.items() if c == replays]
 if not cands:
-    print(f"    NO BOUNDARY: no kernel runs {replays} times. Most frequent names:")
+    print(f"    NO BOUNDARY: no graph kernel runs {replays} times. Most frequent names:")
     for n, c in sorted(cnt.items(), key=lambda x: -x[1])[:12]:
         print(f"      {c:8d}  {n}")
     raise SystemExit(3)
 first = {n: next(i for i, k in enumerate(ks) if k[2] == n) for n in cands}
 marker = min(cands, key=first.get)
 bounds = [i for i, k in enumerate(ks) if k[2] == marker]
-print(f"[boundary] kernel {marker}: {len(bounds)} launches, expected depth + n - 1 = {replays} "
+expect = "depth + n - 1" if feed == "steps" else "n - 1"
+print(f"[boundary] kernel {marker}: {len(bounds)} replay launches, expected {expect} = {replays} "
       f"-> {'OK' if len(bounds) == replays else 'MISMATCH'}; once-per-replay candidates: {', '.join(sorted(cands))}")
 if len(bounds) != replays:
     raise SystemExit(3)
 bounds.append(len(ks))
+if eager:
+    print(f"    the batch: {len(eager)} eager kernels, first to last {(eager[-1][1] - eager[0][0]) / 1e6:.1f} ms")
 
-# The run's own lines: token 0 comes out of replay depth - 1, `time step i` is replay depth - 1 + i.
+# The run's own lines: `time step i` is replay i - 1 under the batch feed; under the step feed
+# token 0 comes out of replay depth - 1 and `time step i` is replay depth - 1 + i.
 timed = {}
 smoke = ""
 try:
     for line in open(runlog):
         m = re.match(r"time step (\d+)( warm)? ms=([0-9.]+)", line)
         if m:
-            timed[depth - 1 + int(m.group(1))] = float(m.group(3))
+            timed[fed - 1 + int(m.group(1))] = float(m.group(3))
         if line.startswith("SMOKE"):
             smoke = line.rstrip()
-        elif line.startswith(("plan ", "load ", "capture ", "fed ")):
+        elif line.startswith(("plan ", "load ", "capture ", "fed ", "time prompt ")):
             print("    " + line.rstrip())
 except OSError:
     pass
@@ -148,7 +209,7 @@ for r, x in R.items():
     cp = sum(c[1] - c[0] for c in x["copies"] + x["sets"]) / 1e3
     ts = f"{timed[r]:.3f}" if r in timed else ("token 0" if r == depth - 1 else "fed")
     g, a, bb, isj = x["big"]
-    print(f"  {r:6d} {r:5d} {ts:>10s} {x['period']:9.1f} {x['wall']:9.1f} {x['ksum']:9.1f} {x['gap']:8.1f} "
+    print(f"  {r:6d} {r + (depth if feed == 'batch' else 0):5d} {ts:>10s} {x['period']:9.1f} {x['wall']:9.1f} {x['ksum']:9.1f} {x['gap']:8.1f} "
           f"{len(j):5d} {b:8.1f} {o:8.1f} {e:8.1f} {xs:8.1f} {x['base']:5.2f} {x['other_gap']:9.1f} {cp:8.1f}  "
           f"{g:.1f} ({a} -> {bb}{', join' if isj else ''})")
 
@@ -212,7 +273,17 @@ if dec:
 PY
 }
 
+# The prefill form's tables: sqlite, P, n, the run log.
+analyze_prefill() {
+  python3 "$PP" tables "$1" "$2" "$3" "$4" --layer "$LAYER" --blocked-us "$BLOCKED_US"
+}
+
 if [ "${1:-}" = --analyze ]; then
+  if [ "$FORM" = prefill ]; then
+    [ $# -ge 5 ] || { echo "usage: BLOOMERY_NSYS_FORM=prefill nsys-ds41.sh --analyze <sqlite> <P> <n> <run log>" >&2; exit 64; }
+    analyze_prefill "$2" "$3" "$4" "$5"
+    exit $?
+  fi
   [ $# -ge 4 ] || { echo "usage: nsys-ds41.sh --analyze <sqlite> <depth> <n> [<run log>]" >&2; exit 64; }
   analyze "$2" "$3" "$4" "${5:-/dev/null}" "$LAST" "$TOP"
   exit $?
@@ -223,13 +294,25 @@ fi
   exit 64
 }
 DEPTHS=("$@")
-[ ${#DEPTHS[@]} -gt 0 ] || DEPTHS=(6)
-for d in "${DEPTHS[@]}"; do
-  case $d in
-    '' | *[!0-9]*) echo "nsys-ds41.sh: depth '$d' is not a number" >&2; exit 64 ;;
+if [ "$FORM" = prefill ]; then
+  [ ${#DEPTHS[@]} -gt 0 ] || DEPTHS=(512)
+  for d in "${DEPTHS[@]}"; do
+    case $d in
+      '' | *[!0-9]* | [0-8]) echo "nsys-ds41.sh: prompt length '$d' is an integer >= 9 in the prefill form" >&2; exit 64 ;;
+    esac
+  done
+  case $NGEN in
+    '' | *[!0-9]* | [01]) echo "nsys-ds41.sh: BLOOMERY_NSYS_N is at least 2 in the prefill form (a replay closes the window), got '$NGEN'" >&2; exit 64 ;;
   esac
-  [ "$d" -ge 1 ] || { echo "nsys-ds41.sh: depth $d: the run feeds at least one id" >&2; exit 64; }
-done
+else
+  [ ${#DEPTHS[@]} -gt 0 ] || DEPTHS=(6)
+  for d in "${DEPTHS[@]}"; do
+    case $d in
+      '' | *[!0-9]*) echo "nsys-ds41.sh: depth '$d' is not a number" >&2; exit 64 ;;
+    esac
+    [ "$d" -ge 1 ] || { echo "nsys-ds41.sh: depth $d: the run feeds at least one id" >&2; exit 64; }
+  done
+fi
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_ds41}
 NSYS=${NSYS:-/usr/local/cuda/bin/nsys}
 OUTDIR=${BLOOMERY_NSYS_OUT:-$BLOOMERY_DATA/nsys}
@@ -241,41 +324,79 @@ source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 
+# The profiled command for depth or prompt length $1, into CMD; the report path is $out.
+profile_cmd() {
+  CMD=(timeout --kill-after=10 "$BOUND"
+       "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
+       --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
+       "$BIN" --depth "$1" -n "$NGEN" --mode graph --time)
+}
+
+if [ -n "$DRY" ]; then
+  echo "[dry] form=$FORM bin=$BIN n=$NGEN args='${DEPTHS[*]}' out=$OUTDIR timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+  for d in "${DEPTHS[@]}"; do
+    out="$OUTDIR/<name>"
+    profile_cmd "$d"
+    echo "[dry] $d: ${CMD[*]}"
+  done
+  exit 0
+fi
+
 assert_fresh_binary "$BIN" || exit $?
 [ -x "$NSYS" ] || { echo "no nsys at $NSYS" >&2; exit 2; }
 mkdir -p "$OUTDIR"
 
+# shellcheck disable=SC2034 # read by lease.sh's witness()
 WITNESS=(head-open indent card busiest model mem pgmajfault)
 
 lease_take
-echo "[config] nsys=$($NSYS --version) n=$NGEN depths='${DEPTHS[*]}' last=$LAST out=$OUTDIR bound=${BOUND}s"
-echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[config] form=$FORM nsys=$($NSYS --version) n=$NGEN args='${DEPTHS[*]}' last=$LAST out=$OUTDIR bound=${BOUND}s"
+echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
 witness pre
 guard_other
 
 rc_all=0
 for d in "${DEPTHS[@]}"; do
-  out="$OUTDIR/nsys-ds41-d${d}-n${NGEN}-$(date -u +%H%M%S)"
-  echo
-  echo "=== depth $d (n $NGEN, $((d + NGEN - 1)) replays expected) -> $out.nsys-rep"
+  if [ "$FORM" = prefill ]; then
+    out="$OUTDIR/nsys-ds41-pp${d}-n${NGEN}-$(date -u +%H%M%S)"
+    echo
+    echo "=== prompt $d (n $NGEN: the prompt's batches, then $((NGEN - 1)) replay(s)) -> $out.nsys-rep"
+  else
+    out="$OUTDIR/nsys-ds41-d${d}-n${NGEN}-$(date -u +%H%M%S)"
+    echo
+    echo "=== depth $d (n $NGEN: $((NGEN - 1)) replays after a batch feed, $((d + NGEN - 1)) after a step feed) -> $out.nsys-rep"
+  fi
+  profile_cmd "$d"
   guard_other
   witness "pre d=$d"
   t0=$(date +%s)
-  timeout --kill-after=10 "$BOUND" \
-    "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false \
-    --sample=none --cpuctxsw=none \
-    -o "$out" --force-overwrite true \
-    "$BIN" --depth "$d" -n "$NGEN" --mode graph --time \
-    > "$out.txt" 2>&1
+  "${CMD[@]}" > "$out.txt" 2>&1
   rc=$?
   t1=$(date +%s)
   witness "post d=$d"
   echo "[rc] $rc wall $((t1 - t0))s"
   [ $rc -eq 0 ] || { rc_all=$rc; echo "--- last 20 lines of $out.txt"; tail -n 20 "$out.txt"; continue; }
+  if [ "$FORM" = prefill ]; then
+    {
+      echo "bin=$BIN_PATH"
+      echo "sha256=$BIN_SHA"
+      echo "P=$d"
+      echo "n=$NGEN"
+      echo "hot_list=${BLOOMERY_HOT_LIST:-}"
+      echo "cmd=${CMD[*]}"
+    } > "$out.meta"
+  fi
+  t0=$(date +%s)
   "$NSYS" export --type sqlite --force-overwrite true -o "$out.sqlite" "$out.nsys-rep" > "$out.export.txt" 2>&1 \
     || { rc_all=1; echo "[export] failed"; tail -n 10 "$out.export.txt"; continue; }
-  analyze "$out.sqlite" "$d" "$NGEN" "$out.txt" "$LAST" "$TOP" || rc_all=$?
-  echo "--- files: $out.nsys-rep, $out.sqlite, $out.txt"
+  echo "[export] $(($(date +%s) - t0))s"
+  if [ "$FORM" = prefill ]; then
+    analyze_prefill "$out.sqlite" "$d" "$NGEN" "$out.txt" || rc_all=$?
+    echo "--- files: $out.nsys-rep, $out.sqlite, $out.txt, $out.meta"
+  else
+    analyze "$out.sqlite" "$d" "$NGEN" "$out.txt" "$LAST" "$TOP" || rc_all=$?
+    echo "--- files: $out.nsys-rep, $out.sqlite, $out.txt"
+  fi
 done
 
 witness post

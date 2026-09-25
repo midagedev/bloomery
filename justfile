@@ -216,6 +216,15 @@ bench-gpu-kernels *ARGS:
 ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
     ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
 
+# The V4.1 prompt projections' counters (ncu, A6000, under the lease, lead-only): one launch each of the joined qkv, q_b,
+# wo_a heads and wo_b at m = 8 in the middle full chunk of a layer >= 2 of a P-token prompt (default 512). The launch skip
+# comes from the newest nsys-gpu-ds41-prefill trace of the same P (run that first; it must be of this binary and hot list),
+# and the profiled launches' names, grids, blocks and column counts are checked before the summary: per launch the
+# block-step cycles and each unit's demand in cycles. The header of tools/ref/ncu-gpu.sh has the form. Under
+# BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
+ncu-gpu-ds41-pp P='512':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NCU_FORM=ds41pp BLOOMERY_NCU_PROMPT={{P}} bash tools/ref/ncu-gpu.sh'
+
 # V4.1 한 토큰이 GPU에서 내는 gemv 사이트 21개의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다. attn_output_a는 값매김 팔
 # 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
 # 사이트마다 첫 사본과 끝 사본에서 여섯 행(heads 팔은 헤드마다 첫 행을 더한다)을 같은 바이트로 계산한 f64 참조와
@@ -976,6 +985,15 @@ nsys-gpu-qwen3moe-prefill *PROMPTS:
 # V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록.
 nsys-gpu-ds41 *DEPTHS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
+
+# V4.1 prompt batch timeline (nsys, A6000, under the lease, lead-only): generate_ds41 --depth P -n 2 --mode graph --time at
+# each prompt length P (default 512), the window from the prompt's first kernel to the first replay, cut into layer-batches
+# at ds41_ffn_places and the joins against the run's stat lines; per layer-batch the route window, the union gap and the
+# post, the kernel terms of one layer-batch (BLOOMERY_NSYS_LAYER, default 2) and of layers 2-39, the card's idle time and the
+# launch queue from the CUDA API trace. Pass the sitting's hot list through BLOOMERY_BOX_ENV (BLOOMERY_HOT_LIST=...). The
+# header of tools/ref/nsys-ds41.sh and tools/ref/ds41pp.py have the cut. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
+nsys-gpu-ds41-prefill *PROMPTS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NSYS_FORM=prefill bash tools/ref/nsys-ds41.sh {{PROMPTS}}'
 
 # ik KLD 기준 파일 둘을 위치마다 비교한다(P = A, Q = B, 태그는 $BLOOMERY_DATA/ikppl 아래, 호스트만).
 # ARGS: --ubatch N(여러 번 줄 수 있다), --ik <ik-ppl --kld 태그>(ik가 찍은 요약과 밴드 안에서 맞는지).
