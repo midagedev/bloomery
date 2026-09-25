@@ -17,8 +17,8 @@
 //! - Q3_K, Q4_K and Q5_K tiles: one weight row against up to [`TILE_COLS`] columns, each
 //!   block unpacked once, every column bit-identical to its one-column kernel ([`dot_row_cols`]).
 //! - Q3_K row-lane tile: [`Q3K_R8_ROWS`] rows repacked into one lane-interleaved layout
-//!   ([`repack_q3k_r8`]) against up to [`TILE_COLS`] columns, every (row, column) value
-//!   bit-identical to [`dot_row`] ([`dot_q3k_r8_cols`]).
+//!   ([`repack_q3k_r8`], undone by [`unpack_q3k_r8`]) against up to [`TILE_COLS`] columns,
+//!   every (row, column) value bit-identical to [`dot_row`] ([`dot_q3k_r8_cols`]).
 //!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108.
@@ -65,8 +65,9 @@ pub enum QdotError {
     RowGroup { rows: usize },
     /// A row-lane buffer is not exactly the bytes its rows and `k` make;
     /// `buf` names which: `"repack source"` or `"repack destination"`
-    /// ([`repack_q3k_r8`]'s `rows` or `out`), or `"tile group"` (the group
-    /// handed to [`dot_q3k_r8_cols`]).
+    /// ([`repack_q3k_r8`]'s `rows` or `out`), `"unpack source"` or
+    /// `"unpack destination"` ([`unpack_q3k_r8`]'s `groups` or `out`), or
+    /// `"tile group"` (the group handed to [`dot_q3k_r8_cols`]).
     RowGroupBytes {
         buf: &'static str,
         have: usize,
@@ -528,6 +529,11 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
 /// Rows one group of the row-lane Q3_K layout interleaves ([`repack_q3k_r8`]).
 pub const Q3K_R8_ROWS: usize = 8;
 
+/// The version of [`repack_q3k_r8`]'s byte order that a file of row-lane
+/// groups stores: a reader refuses any other, and a change to the order is a
+/// new version.
+pub const Q3K_R8_LAYOUT: u32 = 1;
+
 /// Q3_K rows into the row-lane layout [`dot_q3k_r8_cols`] reads: `n_rows`
 /// rows of `k` values (`rows`, row after row) into `out`, which is exactly as
 /// long — the layout holds the same bits, permuted.
@@ -591,6 +597,60 @@ pub fn repack_q3k_r8(
                 &src[at..at + Q3K_BLOCK]
             });
             r8_pack_block(&blocks, blk);
+        }
+    }
+    Ok(())
+}
+
+/// [`repack_q3k_r8`]'s exact inverse: `n_rows` rows of `k` values in the
+/// row-lane layout (`groups`) back to Q3_K rows, row after row, in `out`,
+/// which is exactly as long. Both layouts use every bit once (the layout's
+/// doc lists where each goes), so the pair is a bijection on each 880-byte
+/// group super-block: any bytes unpack, and `repack` of the result gives
+/// them back.
+///
+/// The error contract is `repack_q3k_r8`'s: a `k` off the 256-value grid, a
+/// row count off the group grid ([`QdotError::RowGroup`]) and a `groups` or
+/// `out` of another length ([`QdotError::RowGroupBytes`]) are named errors,
+/// and none writes to `out`. `k = 0` is `Ok` with both buffers empty.
+pub fn unpack_q3k_r8(
+    groups: &[u8],
+    n_rows: usize,
+    k: usize,
+    out: &mut [u8],
+) -> Result<(), QdotError> {
+    if !k.is_multiple_of(256) {
+        return Err(QdotError::UnalignedK { k, gran: 256 });
+    }
+    if !n_rows.is_multiple_of(Q3K_R8_ROWS) {
+        return Err(QdotError::RowGroup { rows: n_rows });
+    }
+    let nb = k / 256;
+    let row_bytes = nb * Q3K_BLOCK;
+    let need = n_rows * row_bytes;
+    for (buf, have) in [
+        ("unpack source", groups.len()),
+        ("unpack destination", out.len()),
+    ] {
+        if have != need {
+            return Err(QdotError::RowGroupBytes { buf, have, need });
+        }
+    }
+    // k = 0: both buffers are empty (need = 0), and `chunks_exact` takes no
+    // zero-byte chunk.
+    if k == 0 {
+        return Ok(());
+    }
+    let group_bytes = Q3K_R8_ROWS * row_bytes;
+    for (src, dst) in groups
+        .chunks_exact(group_bytes)
+        .zip(out.chunks_exact_mut(group_bytes))
+    {
+        for (sb, blk) in src.as_chunks::<Q3K_R8_BLOCK>().0.iter().enumerate() {
+            for r in 0..Q3K_R8_ROWS {
+                let at = r * row_bytes + sb * Q3K_BLOCK;
+                r8_unpack_row(blk, r, &mut dst[at..at + Q3K_BLOCK]);
+            }
         }
     }
     Ok(())
@@ -1168,6 +1228,39 @@ fn q3k_codes(blk: &[u8]) -> [u8; 256] {
     })
 }
 
+/// The inverse of [`q3k_scales6`]: sixteen six-bit scales (`s + 32`, each
+/// below 64) into a Q3_K block's scale bytes 96..108 — the low nibbles of
+/// scales `k` and `8 + k` in byte `96 + k`, of `4 + k` and `12 + k` in
+/// `100 + k`, and the four scales' high pairs in `104 + k` (k in 0..4).
+fn q3k_put_scales6(s: &[u8; 16], blk: &mut [u8]) {
+    for k in 0..4 {
+        blk[96 + k] = (s[k] & 0xF) | ((s[8 + k] & 0xF) << 4);
+        blk[100 + k] = (s[4 + k] & 0xF) | ((s[12 + k] & 0xF) << 4);
+        blk[104 + k] =
+            (s[k] >> 4) | ((s[4 + k] >> 4) << 2) | ((s[8 + k] >> 4) << 4) | ((s[12 + k] >> 4) << 6);
+    }
+}
+
+/// The inverse of [`q3k_codes`]: 256 codes `u` (each below 8) into a Q3_K
+/// block's `hmask` (bytes 0..32) and `qs` (bytes 32..96). Value
+/// `128 h + 32 f + c` keeps its low two bits at bits `2f` of `qs` byte
+/// `32 h + c` and its third bit at bit `4h + f` of `hmask` byte `c`.
+fn q3k_put_codes(u: &[u8; 256], blk: &mut [u8]) {
+    for c in 0..32 {
+        let mut high = 0u8;
+        for h in 0..2 {
+            let mut low = 0u8;
+            for f in 0..4 {
+                let v = u[128 * h + 32 * f + c];
+                low |= (v & 3) << (2 * f);
+                high |= (v >> 2) << (4 * h + f);
+            }
+            blk[32 + 32 * h + c] = low;
+        }
+        blk[c] = high;
+    }
+}
+
 /// Scalar mirror of `dot_q3k_q8k_avx2`, bit-identical by construction: per
 /// super-block the integer `Σ s_(i/16) · (u_i − 4) · q_i` over its 256 values
 /// (exact in i32, so its order is free), then the kernel's float step.
@@ -1473,6 +1566,19 @@ fn r8_pack_block(rows: &[&[u8]; Q3K_R8_ROWS], dst: &mut [u8; Q3K_R8_BLOCK]) {
             dst[at + 64] = w[6] | (w[7] << 3) | ((w[2] >> 2) << 6) | ((w[5] >> 2) << 7);
         }
     }
+}
+
+/// Row `r`'s 110-byte Q3_K block out of a group super-block — the inverse of
+/// [`r8_pack_block`] for that row: its fields read through [`r8_scale`] and
+/// [`r8_code`], written through the inverses of [`q3k_scales6`] and
+/// [`q3k_codes`].
+fn r8_unpack_row(blk: &[u8; Q3K_R8_BLOCK], r: usize, dst: &mut [u8]) {
+    // r8_scale gives s in -32..32; the stored six bits are s + 32.
+    let scales: [u8; 16] = std::array::from_fn(|j| (r8_scale(blk, r, j) + 32) as u8);
+    let codes: [u8; 256] = std::array::from_fn(|i| r8_code(blk, r, i));
+    q3k_put_codes(&codes, dst);
+    q3k_put_scales6(&scales, dst);
+    dst[108..110].copy_from_slice(&blk[2 * r..2 * r + 2]);
 }
 
 /// Scale `s` of sub-block `j` of row `r`, off a group super-block.

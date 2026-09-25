@@ -156,6 +156,7 @@ dependencies = [
  "bloomery-qdot",
  "bloomery-threads",
  "libc",
+ "sha2",
  "thiserror",
 ]
 

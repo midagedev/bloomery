@@ -16,4 +16,5 @@ bloomery-gguf = { path = "../gguf" }
 bloomery-qdot = { path = "../qdot" }
 bloomery-threads = { path = "../threads" }
 libc = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }

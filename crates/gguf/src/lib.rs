@@ -7,11 +7,13 @@
 //! length, the contiguous axis), which every downstream comparison assumes.
 //!
 //! Two entry points share one header parser: `Gguf::open*` (strict — every
-//! tensor must be sized by this engine's `GgmlType` and sit inside the file)
+//! tensor must be sized by this engine's `GgmlType`, or by the caller's
+//! [`PrivateType`] table in [`Gguf::open_private`], and sit inside the file)
 //! and [`inventory_of`] (header-only — unknown type ids are carried as
 //! numbers with ggml's size table, so files with types the engine cannot
 //! dequantize still inventory). A model split across shards opens as a
-//! [`Split`]: one strict reader per shard, validated as one model.
+//! [`Split`]: one strict reader per shard, validated as one model. The
+//! [`write`] module writes the files this reader opens.
 //!
 //! Format facts mirrored from the vendored ik_llama.cpp reader
 //! (`gguf_init_from_file`, ggml.c:31219-31475):
@@ -30,6 +32,7 @@
 pub mod iq_tables;
 pub mod quant;
 pub mod v41;
+pub mod write;
 
 pub use quant::{
     ActivationFormat, GgmlType, QuantError, activation_format, dequant_row, quantize_activations,
@@ -41,6 +44,12 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use memmap2::{Mmap, MmapMut};
+
+/// The metadata key that names a file's architecture ([`Gguf::architecture`]).
+pub const GENERAL_ARCHITECTURE: &str = "general.architecture";
+
+/// The metadata key that sets a file's data alignment: a u32, 32 when absent.
+pub const GENERAL_ALIGNMENT: &str = "general.alignment";
 
 /// One GGUF metadata value. Tags are the on-disk value-type ids:
 /// 0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 f32, 7 bool, 8 string,
@@ -94,6 +103,17 @@ pub struct RawTensorInfo {
     pub nbytes: Option<u64>,
 }
 
+/// A tensor type id this build does not know, sized by the caller for
+/// [`Gguf::open_private`]: `blck` values in `size` bytes, as ggml's
+/// `blck_size` and `type_size` size its own types. It is for layouts of our
+/// own whose id no ggml table holds, so every other reader refuses the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateType {
+    pub id: u32,
+    pub blck: u64,
+    pub size: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("io error: {0}")]
@@ -144,6 +164,13 @@ pub enum LoadError {
         first: String,
         second: String,
     },
+    /// A [`PrivateType`] entry whose id this build already sizes: a file
+    /// tagged with it would open everywhere as that ggml type.
+    #[error("private type id {id} is ggml's {name}: a private id must be unknown to this build")]
+    KnownPrivateType { id: u32, name: &'static str },
+    /// A [`PrivateType`] entry that cannot size a tensor, or one listed twice.
+    #[error("private type id {id}: {detail}")]
+    BadPrivateType { id: u32, detail: &'static str },
 }
 
 /// A parsed, mmap-backed GGUF file.
@@ -205,6 +232,31 @@ impl Gguf {
     /// that is refused costs its header's pages; only then is the mapping
     /// populated or copied.
     pub fn open_backed(path: impl AsRef<Path>, weights: Weights) -> Result<Gguf, LoadError> {
+        Self::open_sized(path.as_ref(), weights, &[])
+    }
+
+    /// `open_backed`, with the tensors whose type id `private` lists sized by
+    /// that entry; they keep `ty = GgmlType::Unknown(id)`. Any other type
+    /// this build cannot size is still [`LoadError::UnsupportedType`]. An
+    /// entry for an id this build sizes is [`LoadError::KnownPrivateType`],
+    /// one that sizes nothing or repeats an id [`LoadError::BadPrivateType`],
+    /// both before the file is opened.
+    pub fn open_private(
+        path: impl AsRef<Path>,
+        weights: Weights,
+        private: &[PrivateType],
+    ) -> Result<Gguf, LoadError> {
+        check_private(private)?;
+        Self::open_sized(path.as_ref(), weights, private)
+    }
+
+    /// The open every entry point shares: `private` is empty except in
+    /// [`Gguf::open_private`].
+    fn open_sized(
+        path: &Path,
+        weights: Weights,
+        private: &[PrivateType],
+    ) -> Result<Gguf, LoadError> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         // SAFETY: the file is opened read-only and nothing maps it writable;
@@ -212,7 +264,7 @@ impl Gguf {
         // ik_llama.cpp's own mmap loader accepts.
         let file_map = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let h = parse_header(&file_map, len)?;
-        let tensors = strict_tensors(h.tensors, h.data_base, len)?;
+        let tensors = strict_tensors(h.tensors, h.data_base, len, private)?;
         let map = match weights {
             Weights::Mapped { populate } => {
                 #[cfg(target_os = "linux")]
@@ -269,7 +321,7 @@ impl Gguf {
 
     /// `general.architecture` (e.g. "deepseek2").
     pub fn architecture(&self) -> Option<&str> {
-        self.value("general.architecture").and_then(Value::as_str)
+        self.value(GENERAL_ARCHITECTURE).and_then(Value::as_str)
     }
 
     /// `<architecture>.<suffix>` as an unsigned integer — the deepseek2
@@ -774,26 +826,58 @@ fn meta_u32(meta: &[(String, Value)], key: &str) -> Option<u32> {
     }
 }
 
+/// A [`PrivateType`] table's own refusals: an id this build sizes (by
+/// [`GgmlType`] or ggml's table in [`ggml_type_info`]), a block of no values
+/// or no bytes, an id listed twice.
+fn check_private(private: &[PrivateType]) -> Result<(), LoadError> {
+    for (i, p) in private.iter().enumerate() {
+        let known = GgmlType::from_u32(p.id)
+            .name()
+            .or_else(|| ggml_type_info(p.id).map(|(name, _, _)| name));
+        if let Some(name) = known {
+            return Err(LoadError::KnownPrivateType { id: p.id, name });
+        }
+        let detail = if p.blck == 0 || p.size == 0 {
+            "a block of 0 values or 0 bytes sizes nothing"
+        } else if private[..i].iter().any(|q| q.id == p.id) {
+            "is listed twice"
+        } else {
+            continue;
+        };
+        return Err(LoadError::BadPrivateType { id: p.id, detail });
+    }
+    Ok(())
+}
+
 /// The strict pass over a parsed header's tensors: every tensor must be sized
-/// by this engine's `GgmlType` and its first dim must be block-aligned; then
-/// every tensor must sit inside the `len`-byte file — the placement invariant
-/// the coverage gate re-checks per tensor.
+/// by this engine's `GgmlType`, or by its entry in `private`, and its first
+/// dim must be block-aligned; then every tensor must sit inside the
+/// `len`-byte file — the placement invariant the coverage gate re-checks per
+/// tensor.
 fn strict_tensors(
     raw: Vec<RawTensorInfo>,
     data_base: u64,
     len: u64,
+    private: &[PrivateType],
 ) -> Result<Vec<TensorInfo>, LoadError> {
     let mut strict = Vec::with_capacity(raw.len());
     for t in raw {
         let ty = GgmlType::from_u32(t.type_id);
-        let blck = ty.blck_size().ok_or_else(|| LoadError::UnsupportedType {
-            name: t.name.clone(),
-            ty,
-        })?;
-        let tsz = ty.type_size().ok_or_else(|| LoadError::UnsupportedType {
-            name: t.name.clone(),
-            ty,
-        })?;
+        let own = private.iter().find(|p| p.id == t.type_id);
+        let blck =
+            ty.blck_size()
+                .or(own.map(|p| p.blck))
+                .ok_or_else(|| LoadError::UnsupportedType {
+                    name: t.name.clone(),
+                    ty,
+                })?;
+        let tsz =
+            ty.type_size()
+                .or(own.map(|p| p.size))
+                .ok_or_else(|| LoadError::UnsupportedType {
+                    name: t.name.clone(),
+                    ty,
+                })?;
         if t.dims[0] % blck != 0 {
             return Err(LoadError::UnalignedRow {
                 name: t.name,
@@ -896,7 +980,7 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
     // Alignment and the data base, mirroring ggml.c:31432-31447:
     // `general.alignment` (u32 KV) or 32, then round the end of the
     // tensor-info section up to it.
-    let alignment = meta_u32(&meta, "general.alignment").unwrap_or(32) as u64;
+    let alignment = meta_u32(&meta, GENERAL_ALIGNMENT).unwrap_or(32) as u64;
     let header_end = rd.pos as u64;
     let data_base = header_end.div_ceil(alignment) * alignment;
     Ok(Header {
@@ -1007,61 +1091,31 @@ fn read_value(rd: &mut Reader<'_>, tag: u32) -> Result<Value, LoadError> {
 
 #[cfg(test)]
 mod split_tests {
-    use super::{Gguf, LoadError, Split};
+    use super::{GENERAL_ARCHITECTURE, Gguf, LoadError, Split, Value};
+    use crate::write::{TensorDecl, write_file};
     use std::path::{Path, PathBuf};
 
-    /// A metadata value as the synthetic shards carry it.
-    enum Kv {
-        U16(u16),
-        I32(i32),
-        Str(&'static str),
+    /// A metadata pair as the synthetic shards carry it.
+    fn kv(key: &str, v: Value) -> (String, Value) {
+        (key.to_string(), v)
     }
 
-    fn put_str(b: &mut Vec<u8>, s: &str) {
-        b.extend_from_slice(&(s.len() as u64).to_le_bytes());
-        b.extend_from_slice(s.as_bytes());
-    }
-
-    /// A GGUF v3 file with `kvs` and one 4-value F32 tensor per name, 32 bytes
-    /// apart over zero data — a few hundred bytes the strict reader opens.
-    fn write_gguf(path: &Path, kvs: &[(&str, Kv)], tensors: &[&str]) {
-        write_gguf_as(path, kvs, tensors, 0, 0);
-    }
-
-    /// [`write_gguf`] with every tensor tagged ggml type id `ty` and `extra`
-    /// more zero bytes after the tensors' data.
-    fn write_gguf_as(path: &Path, kvs: &[(&str, Kv)], tensors: &[&str], ty: u32, extra: usize) {
-        let mut b = Vec::new();
-        b.extend_from_slice(b"GGUF");
-        b.extend_from_slice(&3u32.to_le_bytes());
-        b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
-        for (k, v) in kvs {
-            put_str(&mut b, k);
-            match v {
-                Kv::U16(x) => {
-                    b.extend_from_slice(&2u32.to_le_bytes());
-                    b.extend_from_slice(&x.to_le_bytes());
-                }
-                Kv::I32(x) => {
-                    b.extend_from_slice(&5u32.to_le_bytes());
-                    b.extend_from_slice(&x.to_le_bytes());
-                }
-                Kv::Str(s) => {
-                    b.extend_from_slice(&8u32.to_le_bytes());
-                    put_str(&mut b, s);
-                }
-            }
-        }
-        for (i, name) in tensors.iter().enumerate() {
-            put_str(&mut b, name);
-            b.extend_from_slice(&1u32.to_le_bytes());
-            b.extend_from_slice(&4u64.to_le_bytes());
-            b.extend_from_slice(&ty.to_le_bytes());
-            b.extend_from_slice(&(32 * i as u64).to_le_bytes());
-        }
-        b.resize(b.len().div_ceil(32) * 32 + 32 * tensors.len() + extra, 0);
-        std::fs::write(path, b).unwrap();
+    /// A GGUF v3 file with `kvs` and one 4-value F32 tensor of zeros per name,
+    /// 32 bytes apart — a few hundred bytes the strict reader opens.
+    fn write_gguf(path: &Path, kvs: &[(String, Value)], tensors: &[&str]) {
+        let tensors: Vec<(TensorDecl, Vec<u8>)> = tensors
+            .iter()
+            .map(|name| {
+                let t = TensorDecl {
+                    name: name.to_string(),
+                    dims: vec![4],
+                    type_id: 0,
+                    nbytes: 16,
+                };
+                (t, vec![0; 16])
+            })
+            .collect();
+        write_file(path, kvs, &tensors);
     }
 
     fn set_dir(name: &str) -> PathBuf {
@@ -1079,11 +1133,11 @@ mod split_tests {
     fn write_shard(dir: &Path, i: u16, no: u16, count: u16, total: i32, tensors: &[&str]) {
         let mut kvs = Vec::new();
         if i == 0 {
-            kvs.push(("general.architecture", Kv::Str("test")));
+            kvs.push(kv(GENERAL_ARCHITECTURE, Value::String("test".into())));
         }
-        kvs.push(("split.no", Kv::U16(no)));
-        kvs.push(("split.tensors.count", Kv::I32(total)));
-        kvs.push(("split.count", Kv::U16(count)));
+        kvs.push(kv("split.no", Value::U16(no)));
+        kvs.push(kv("split.tensors.count", Value::I32(total)));
+        kvs.push(kv("split.count", Value::U16(count)));
         write_gguf(&shard_path(dir, i), &kvs, tensors);
     }
 
@@ -1131,7 +1185,7 @@ mod split_tests {
         let p = d.join("plain.gguf");
         write_gguf(
             &p,
-            &[("general.architecture", Kv::Str("test"))],
+            &[kv(GENERAL_ARCHITECTURE, Value::String("test".into()))],
             &["a", "b"],
         );
         let s = Split::open(&p).unwrap();
@@ -1224,9 +1278,16 @@ mod split_tests {
         const DATA: usize = 64 << 20;
         let d = set_dir("populate");
         let p = d.join("refused.gguf");
-        // Type id 99 is no `GgmlType`, so the strict pass refuses the file.
-        let kvs = [("general.architecture", Kv::Str("test"))];
-        write_gguf_as(&p, &kvs, &["a"], 99, DATA);
+        // Type id 99 is no `GgmlType`, so the strict pass refuses the file; no
+        // table sizes it either, so the writer takes the byte count as stated.
+        let kvs = [kv(GENERAL_ARCHITECTURE, Value::String("test".into()))];
+        let big = TensorDecl {
+            name: "a".to_string(),
+            dims: vec![4],
+            type_id: 99,
+            nbytes: u64::try_from(DATA).unwrap(),
+        };
+        write_file(&p, &kvs, &[(big, vec![0; DATA])]);
         let before = thread_faults();
         let r = Gguf::open_with(&p, true);
         let faults = thread_faults() - before;
@@ -1247,5 +1308,129 @@ mod split_tests {
             faults < pages / 256,
             "{faults} faults: the data section ({pages} pages) was populated before the header was refused"
         );
+    }
+}
+
+#[cfg(test)]
+mod private_tests {
+    use super::{GgmlType, Gguf, LoadError, PrivateType, Split, Weights};
+    use crate::write::{TensorDecl, write_file};
+    use std::path::{Path, PathBuf};
+
+    /// The private id the clauses tag with: bloomery's 1000 + Q3_K's 11.
+    const TAG: u32 = 1011;
+    const TABLE: [PrivateType; 1] = [PrivateType {
+        id: TAG,
+        blck: 256,
+        size: 110,
+    }];
+    const LAZY: Weights = Weights::Mapped { populate: false };
+
+    fn set_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gguf-private-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A file of an F32 tensor, then `q` — 8 rows of 512 values, 1,760 bytes
+    /// at Q3_K's 110 per 256 — tagged type id `id`. Returns its bytes of `q`.
+    fn tagged(path: &Path, id: u32) -> Vec<u8> {
+        let q: Vec<u8> = (0..1760u32).map(|i| (i * 7 + 3) as u8).collect();
+        let f = TensorDecl {
+            name: "f".to_string(),
+            dims: vec![4],
+            type_id: 0,
+            nbytes: 16,
+        };
+        let t = TensorDecl {
+            name: "q".to_string(),
+            dims: vec![512, 8],
+            type_id: id,
+            nbytes: 1760,
+        };
+        write_file(path, &[], &[(f, vec![1; 16]), (t, q.clone())]);
+        q
+    }
+
+    /// A file tagged with a private id opens only through a table that lists
+    /// it: the strict opens and the split refuse it by the tensor's name,
+    /// `open_private` sizes it from the entry and keeps the id, an id outside
+    /// the table is still refused, and a table naming an id this build sizes,
+    /// sizing nothing or repeating an id is refused before any file is read.
+    #[test]
+    fn a_private_type_opens_only_through_its_table() {
+        let d = set_dir("tag");
+        let p = d.join("tagged.gguf");
+        let q = tagged(&p, TAG);
+        match Gguf::open(&p) {
+            Err(LoadError::UnsupportedType { name, ty }) => {
+                assert_eq!((name.as_str(), ty), ("q", GgmlType::Unknown(TAG)));
+            }
+            other => panic!(
+                "open must refuse the tag by name, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        match Split::open(&p) {
+            Err(LoadError::Shard { path, source }) => {
+                assert_eq!(path, p.display().to_string());
+                assert!(
+                    matches!(*source, LoadError::UnsupportedType { ref name, .. } if name == "q"),
+                    "{source}"
+                );
+            }
+            other => panic!(
+                "Split::open must refuse the tag, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let g = Gguf::open_private(&p, LAZY, &TABLE).unwrap();
+        let t = g.find("q").unwrap();
+        assert_eq!(
+            (t.ty, t.nbytes, t.dims.as_slice()),
+            (GgmlType::Unknown(TAG), 1760, &[512u64, 8][..])
+        );
+        assert_eq!(g.data(t).unwrap(), q.as_slice());
+        let other = d.join("other.gguf");
+        tagged(&other, TAG + 1);
+        match Gguf::open_private(&other, LAZY, &TABLE) {
+            Err(LoadError::UnsupportedType { name, ty }) => {
+                assert_eq!((name.as_str(), ty), ("q", GgmlType::Unknown(TAG + 1)));
+            }
+            other => panic!(
+                "an id outside the table must be refused, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        let missing = d.join("absent.gguf");
+        for (id, name) in [(11, "q3_K"), (2, "q4_0")] {
+            let table = [PrivateType {
+                id,
+                blck: 256,
+                size: 110,
+            }];
+            match Gguf::open_private(&missing, LAZY, &table) {
+                Err(LoadError::KnownPrivateType { id: got, name: n }) => {
+                    assert_eq!((got, n), (id, name))
+                }
+                other => panic!(
+                    "id {id} must be refused as ggml's {name}, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+        }
+        let empty = [PrivateType {
+            id: TAG,
+            blck: 0,
+            size: 110,
+        }];
+        let twice = [TABLE[0], TABLE[0]];
+        for table in [&empty[..], &twice[..]] {
+            match Gguf::open_private(&missing, LAZY, table) {
+                Err(LoadError::BadPrivateType { id, .. }) => assert_eq!(id, TAG),
+                other => panic!("{table:?} must be refused, got {:?}", other.map(|_| ())),
+            }
+        }
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

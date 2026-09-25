@@ -412,6 +412,12 @@ build-ref:
 build-ref-bench:
     ./tools/box.sh 'bash tools/ref/build.sh && bash tools/ref/build-cpu.sh'
 
+# The V4.1 file's r8 sidecar (model::r8file): builds r8conv, then tools/ref/r8-sidecar.sh converts and
+# verifies it under the CPU lease — 155.7 GB written beside the source on /models. A tool run, not a
+# gate; the user decides when. ARGS: `verify` checks an existing sidecar again without converting.
+r8-sidecar *ARGS:
+    ./tools/box.sh 'cargo build --release -p bloomery-model --bin r8conv && bash tools/ref/r8-sidecar.sh {{ARGS}}'
+
 # 의존성 감사. cuda-oxide가 rev로 고정돼 있는지가 핵심이다.
 deny:
     ./tools/box.sh 'cargo deny check'
@@ -620,6 +626,12 @@ gate-ds41-host:
 # --test-threads=1: 두 테스트가 프로세스 전역 지연 레버(ops::set_defer_quant)를 뒤집는다.
 gate-union:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test union -- --ignored --nocapture --test-threads=1'
+
+# The r8 sidecar (model::r8file) on a synthetic two-shard source written with gguf::write: convert,
+# Sidecar::open and verify pass, every identity difference and conversion refusal is named, and the
+# r8conv binary converts and verifies end to end. Reads no model file.
+gate-r8:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test r8file -- --include-ignored --nocapture'
 
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
 # hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다.

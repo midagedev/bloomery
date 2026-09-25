@@ -3449,3 +3449,152 @@ fn q3k_r8_refuses_bad_shapes() {
         "{e}"
     );
 }
+
+// ------------------------------------------------- Q3_K row-lane unpack
+// `unpack_q3k_r8` against `repack_q3k_r8`, both ways, byte for byte. Both
+// layouts use every bit once, so the pair is a bijection on each 880-byte
+// group super-block: any bytes are an input, NaN and infinite `d` bytes
+// included, and a dropped or moved bit shows as a differing byte.
+
+/// Rows (8, 16, and 2,304 — one V4.1 expert's gate or up) and k (256, 512,
+/// 5,120) of the unpack clauses.
+const UNPACK_ROWS: [usize; 3] = [8, 16, 2304];
+const UNPACK_KS: [usize; 3] = [256, 512, 5120];
+
+/// f16 `d` bytes every clause plants over its random ones: quiet and
+/// signalling NaNs, both infinities, the all-ones NaN, the smallest
+/// subnormal, negative zero.
+const UNPACK_D: [u16; 7] = [0x7E00, 0x7C01, 0x7C00, 0xFC00, 0xFFFF, 0x0001, 0x8000];
+
+fn random_bytes(rng: &mut Rng, n: usize) -> Vec<u8> {
+    (0..n).map(|_| (rng.next() >> 56) as u8).collect()
+}
+
+/// Where two equal-length buffers first differ, for an assertion's message.
+fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter().zip(b).position(|(x, y)| x != y)
+}
+
+/// unpack(repack(x)) = x over random Q3_K rows, every row's first block
+/// carrying one of [`UNPACK_D`] as its `d`, at every shape of
+/// [`UNPACK_ROWS`] × [`UNPACK_KS`]. `out` starts as a canary fill.
+#[test]
+fn q3k_r8_unpack_inverts_repack() {
+    let mut rng = Rng(0x0DD5_EED5_0000_0001);
+    for n_rows in UNPACK_ROWS {
+        for k in UNPACK_KS {
+            let row_bytes = k / 256 * 110;
+            let mut rows = random_bytes(&mut rng, n_rows * row_bytes);
+            for r in 0..n_rows {
+                let at = r * row_bytes + 108;
+                rows[at..at + 2].copy_from_slice(&UNPACK_D[r % UNPACK_D.len()].to_le_bytes());
+            }
+            let mut packed = vec![0u8; rows.len()];
+            qdot::repack_q3k_r8(&rows, n_rows, k, &mut packed).unwrap();
+            let mut back = vec![0xA5u8; rows.len()];
+            qdot::unpack_q3k_r8(&packed, n_rows, k, &mut back).unwrap();
+            assert!(
+                back == rows,
+                "{n_rows} rows, k {k}: unpack(repack(x)) differs from x at byte {:?}",
+                first_diff(&back, &rows)
+            );
+        }
+    }
+}
+
+/// repack(unpack(y)) = y over random row-lane bytes at every shape: no bit
+/// of the row-lane layout is dropped on the way to Q3_K.
+#[test]
+fn q3k_r8_repack_inverts_unpack() {
+    let mut rng = Rng(0x0DD5_EED5_0000_0002);
+    for n_rows in UNPACK_ROWS {
+        for k in UNPACK_KS {
+            let groups = random_bytes(&mut rng, n_rows * (k / 256) * 110);
+            let mut rows = vec![0xA5u8; groups.len()];
+            qdot::unpack_q3k_r8(&groups, n_rows, k, &mut rows).unwrap();
+            let mut again = vec![0x5Au8; groups.len()];
+            qdot::repack_q3k_r8(&rows, n_rows, k, &mut again).unwrap();
+            assert!(
+                again == groups,
+                "{n_rows} rows, k {k}: repack(unpack(y)) differs from y at byte {:?}",
+                first_diff(&again, &groups)
+            );
+        }
+    }
+}
+
+/// The unpack refuses what the repack refuses, by name and with `out` left
+/// bit for bit as it was: a row count off the 8-row grid, a `groups` or `out`
+/// of another length, a `k` off the 256-value grid. `k = 0` is `Ok` on empty
+/// buffers and refused with an `out` of any other length.
+#[test]
+fn q3k_r8_unpack_refuses_bad_shapes() {
+    let k = 256;
+    let group = vec![0u8; 8 * 110];
+    let mut dst = vec![0xA5u8; 8 * 110];
+    let mut refuses = |groups: &[u8], n_rows: usize, k: usize, len: usize, want: QdotError| {
+        assert_eq!(
+            qdot::unpack_q3k_r8(groups, n_rows, k, &mut dst[..len]),
+            Err(want)
+        );
+        assert!(
+            dst.iter().all(|&b| b == 0xA5),
+            "the unpack refusal {want:?} wrote into dst"
+        );
+    };
+    refuses(
+        &group[..7 * 110],
+        7,
+        k,
+        7 * 110,
+        QdotError::RowGroup { rows: 7 },
+    );
+    refuses(
+        &group[..8 * 110 - 1],
+        8,
+        k,
+        8 * 110,
+        QdotError::RowGroupBytes {
+            buf: "unpack source",
+            have: 8 * 110 - 1,
+            need: 8 * 110,
+        },
+    );
+    refuses(
+        &group,
+        8,
+        k,
+        8 * 110 - 1,
+        QdotError::RowGroupBytes {
+            buf: "unpack destination",
+            have: 8 * 110 - 1,
+            need: 8 * 110,
+        },
+    );
+    refuses(
+        &group,
+        8,
+        100,
+        8 * 110,
+        QdotError::UnalignedK { k: 100, gran: 256 },
+    );
+    refuses(
+        &[],
+        8,
+        0,
+        8 * 110,
+        QdotError::RowGroupBytes {
+            buf: "unpack destination",
+            have: 8 * 110,
+            need: 0,
+        },
+    );
+    assert_eq!(qdot::unpack_q3k_r8(&[], 8, 0, &mut []), Ok(()), "k = 0");
+    let e = qdot::unpack_q3k_r8(&group, 8, k, &mut dst[..8 * 110 - 1])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("row-lane unpack destination is 879 bytes"),
+        "{e}"
+    );
+}

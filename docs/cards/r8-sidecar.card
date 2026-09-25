@@ -1,0 +1,11 @@
+# The r8 sidecar's first real conversion (tools/ref/r8-sidecar.sh, round r8conv; the h3tile-b
+# design): r8conv convert then r8conv verify on the public V4.1 file. The round's paper estimate
+# [derived]: convert 167-196 s from a cold source and 63-102 s warm, verify 117 s (source warm) to
+# 234 s (both cold), so 4.7-5.2 min from a cold start and 7.2 min at worst; the runner's bound is
+# 30 min, a guard, not a prediction.
+kind: exclusive
+reason: reads the routed gate and up stacks of the public V4.1 file (80 tensors, 155.7 GB), writes
+  them repacked as the sidecar beside it on /models and reads every byte back against the source;
+  beside a timed run it would evict that run's page cache and share its NVMe, so it holds the lease;
+  why now: r8conv landed and round r8host reads the file
+minutes: 5..8

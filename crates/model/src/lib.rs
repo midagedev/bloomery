@@ -28,6 +28,7 @@ pub mod moe;
 pub mod ops;
 pub mod placement;
 pub mod profile;
+pub mod r8file;
 
 pub use ops::{Tensor2, Tensor2View};
 
@@ -66,6 +67,9 @@ pub enum ModelError {
     /// A refusal of the placement layer that is not a metadata key's.
     #[error(transparent)]
     Placement(placement::PlacementError),
+    /// A refusal of the r8 sidecar format: writing, opening or comparing it.
+    #[error(transparent)]
+    R8(#[from] r8file::R8Error),
 }
 
 /// A hyperparameter reader's metadata refusal stays a metadata error; every
