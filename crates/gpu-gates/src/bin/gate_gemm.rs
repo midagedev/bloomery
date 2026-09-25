@@ -60,14 +60,14 @@
 //!
 //! The ubatch router the GEMM prefill routes with
 //! (`RouterKernels::enqueue_ubatch`: the logits launch, then the routing
-//! launch) runs on the file's layer-0 router weight for T ∈ {1, 7, 8, 9, 63,
-//! 512} tokens: every logit, probability, id and weight bit for bit what the
-//! fused router (`enqueue_fused`, eight tokens a launch) writes for the same
-//! columns, and every logit within `γ(k/32 + 5) · Σ |w·x|` of the f64 dot
-//! (each lane's sequential sum of `k/32` products, then the five-step
-//! butterfly), T = 4096 included. Then its refusals (tokens past the
-//! buffers, none, a short input, a weight of the wrong shape, a ubatch past
-//! `UBATCH` tokens).
+//! launch) runs on the file's layer-0 router weight for T ∈ {1, 7, 8, 9, 15,
+//! 16, 17, 31, 33, 63, 512} tokens: every logit, probability, id and weight
+//! bit for bit what the fused router (`enqueue_fused`, eight tokens a launch)
+//! writes for the same columns, and every logit within `γ(k/32 + 5) · Σ
+//! |w·x|` of the f64 dot (each lane's sequential sum of `k/32` products, then
+//! the five-step butterfly), T = 4096 included. Then its refusals (tokens
+//! past the buffers, none, a short input, a weight of the wrong shape, a
+//! ubatch past `UBATCH` tokens).
 //!
 //! The SwiGLU quantizer between gate·up and down
 //! (`GemmKernels::enqueue_swiglu_quant`, case `swiglu`) at K ∈ {768, 2048}
@@ -1657,8 +1657,9 @@ mod gate {
         Ok(ok && nan_ok && all)
     }
 
-    /// Token counts of the ubatch router case.
-    const ROUTER_TOKENS: [usize; 7] = [1, 7, 8, 9, 63, 512, UBATCH];
+    /// Token counts of the ubatch router case: every edge of the logits
+    /// launch's 32-token block and of its warps' 8-token tiles.
+    const ROUTER_TOKENS: [usize; 12] = [1, 7, 8, 9, 15, 16, 17, 31, 33, 63, 512, UBATCH];
 
     /// The ubatch router against the fused router and the f64 dot (module
     /// doc), then its refusals. `w` is the router weight, [`N_EXPERT`] rows

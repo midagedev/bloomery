@@ -10,10 +10,12 @@
 //! memory for the gemv); `qwen3moe_router`, the routing alone over one
 //! token's given logits; and `qwen3moe_router_route`, the routing alone over
 //! a ubatch's logits, one warp per token. `qwen3moe_router_logits` writes
-//! those: the fused entry's row body over a ubatch of up to [`UBATCH`]
-//! tokens, eight tokens and eight expert rows a block, so the two ubatch
-//! launches leave each token's logits, ids and weights bit for bit what the
-//! fused launch leaves for it. The
+//! those: the fused entry's lane sums over a ubatch of up to [`UBATCH`]
+//! tokens as register tiles — a block of sixteen warps covers 32 tokens and
+//! 32 expert rows, each warp eight rows by eight tokens, the rows' and the
+//! tokens' values staged in shared memory — so the two ubatch launches leave
+//! each token's logits, ids and weights bit for bit what the fused launch
+//! leaves for it. The
 //! fused gemv is `q8f32::f32_gemv`'s row body — one warp per expert row,
 //! `f32_lane_partials`' sum (at one token the same sum through
 //! `f32_lane_partial_1col_w32`, which keeps 32 chunks' loads in flight) and
@@ -52,7 +54,9 @@ use super::ubatch::UBATCH;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::q8_1_quant_vals;
-use crate::q8f32::{f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums};
+use crate::q8f32::{
+    TILE, f32_lane_partial_1col_w32, f32_lane_partials, f32_tile_chunk, gemv_lane_sums,
+};
 use crate::route_core::take;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
@@ -77,9 +81,36 @@ pub const MAX_TOKENS: usize = 8;
 /// Threads per routing-only launch: one warp.
 const ROUTER_THREADS: u32 = 32;
 
-/// Blocks per eight-token chunk of `qwen3moe_router_logits`: one expert row
-/// per warp, so the 128 rows take sixteen blocks.
-const ROW_GROUPS: usize = N_EXPERT / FUSED_WARPS;
+/// Tokens and expert rows one `qwen3moe_router_logits` block covers.
+const LOGITS_TOKENS: usize = 32;
+const LOGITS_ROWS: usize = 32;
+
+/// Threads per logits block: sixteen warps, [`ROW_TILES`] row groups by
+/// [`TOKEN_TILES`] token groups, each warp a [`TILE`]-row × [`TILE`]-token
+/// tile of the block.
+const LOGITS_THREADS: usize = 512;
+const LOGITS_THREADS_U32: u32 = LOGITS_THREADS as u32;
+const LOGITS_WARPS: usize = LOGITS_THREADS / 32;
+const ROW_TILES: usize = LOGITS_ROWS / TILE;
+const TOKEN_TILES: usize = LOGITS_TOKENS / TILE;
+
+/// Logits blocks per token span: the expert rows cut into [`LOGITS_ROWS`].
+const ROW_BLOCKS: usize = N_EXPERT / LOGITS_ROWS;
+
+/// 32-value chunks one logits stage holds of every row and token, and the
+/// values of one such line.
+const STAGE_CHUNKS: usize = 2;
+const LINE: usize = 32 * STAGE_CHUNKS;
+
+/// Logits stages in shared memory: the one the warps read and two being
+/// copied in.
+const STAGES: usize = 3;
+
+/// One logits stage: every row's line, then every token's.
+const STAGE_FLOATS: usize = (LOGITS_ROWS + LOGITS_TOKENS) * LINE;
+
+/// 16-byte copies per line.
+const LINE_COPIES: usize = LINE / 4;
 
 /// Threads per fused block: eight warps — the first computes the block's
 /// expert row, and in the routing block warp `t` routes token `t`.
@@ -111,10 +142,24 @@ const _: () = assert!(NORM_K / 128 <= N_EXPERT);
 const _: () = assert!(PER_LANE == 4);
 // The routing block has a warp for every token.
 const _: () = assert!(MAX_TOKENS <= FUSED_WARPS);
-// A ubatch logits block covers MAX_TOKENS tokens and FUSED_WARPS rows, the
-// rows split evenly over a chunk's blocks, and a ubatch routing block routes
-// one token per warp into the MAX_TOKENS entries of P and SLOT_P.
-const _: () = assert!(MAX_TOKENS == FUSED_WARPS && N_EXPERT.is_multiple_of(FUSED_WARPS));
+// A ubatch routing block routes one token per warp into the MAX_TOKENS
+// entries of P and SLOT_P.
+const _: () = assert!(MAX_TOKENS == FUSED_WARPS);
+// The warp tiles cover a logits block, and a token span's blocks the rows.
+const _: () = assert!(ROW_TILES * TILE == LOGITS_ROWS && TOKEN_TILES * TILE == LOGITS_TOKENS);
+const _: () =
+    assert!(ROW_TILES * TOKEN_TILES == LOGITS_WARPS && LOGITS_WARPS * 32 == LOGITS_THREADS);
+const _: () = assert!(ROW_BLOCKS * LOGITS_ROWS == N_EXPERT);
+// Each logits thread copies one piece of a row line and the same piece of a
+// token line of every stage.
+const _: () = assert!(LOGITS_ROWS * LINE_COPIES == LOGITS_THREADS && LOGITS_TOKENS == LOGITS_ROWS);
+// The kernel reads a stage's chunks as two spelled-out tile steps, and its
+// wait leaves STAGES − 2 = 1 group in flight.
+const _: () = assert!(STAGE_CHUNKS == 2 && STAGES == 3);
+// The stages fit the 48 KiB of static shared memory a block may declare.
+const _: () = assert!(STAGES * STAGE_FLOATS * size_of::<f32>() <= 48 * 1024);
+// `qwen3moe_router_logits`' launch contract spells the block out.
+const _: () = assert!(LOGITS_THREADS == 512);
 
 /// One token's routing by one warp, the module doc's contract: lane `L`
 /// brings the token's logits of experts `L + 32 j` in `v`; `p` and `slot_p`
@@ -410,9 +455,33 @@ unsafe fn store_cols(y: &mut DisjointSlice<f32>, r: usize, rows: usize, m: usize
     }
 }
 
+/// Lane 0's stores of one token's [`TILE`] row sums of a logits tile:
+/// `y[base + i] = sums[i]`, one store per slot with a constant index.
+///
+/// # Safety
+///
+/// `base + TILE <= y.len()`, and no other thread writes those slots.
+#[inline(always)]
+unsafe fn store_rows(y: &mut DisjointSlice<f32>, base: usize, sums: &[f32; TILE]) {
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = *sums;
+    // SAFETY: each slot base + i, i < TILE, lies inside y and belongs to this
+    // thread alone by this fn's contract.
+    unsafe {
+        *y.get_unchecked_mut(base) = s0;
+        *y.get_unchecked_mut(base + 1) = s1;
+        *y.get_unchecked_mut(base + 2) = s2;
+        *y.get_unchecked_mut(base + 3) = s3;
+        *y.get_unchecked_mut(base + 4) = s4;
+        *y.get_unchecked_mut(base + 5) = s5;
+        *y.get_unchecked_mut(base + 6) = s6;
+        *y.get_unchecked_mut(base + 7) = s7;
+    }
+}
+
 #[cuda_module]
 mod qwen3moe_router_kernels {
     use super::*;
+    use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 
     /// The routing alone for one token: its [`N_EXPERT`] logits in `x` →
     /// every probability in `probs`, the ids in rank order in `ids` and
@@ -785,19 +854,27 @@ mod qwen3moe_router_kernels {
 
     /// The router logits of `n_tok` tokens, a ubatch's first router launch:
     /// `w` the router weight ([`N_EXPERT`] rows of `k` f32), `x` the tokens'
-    /// normed activations (`n_tok` columns of `k`). Block `b` takes tokens
-    /// `8·c .. min(8·c + 8, n_tok)` for `c = b / ROW_GROUPS` and warp `w` of
-    /// it expert row `8·(b % ROW_GROUPS) + w` of those tokens, with
-    /// `qwen3moe_router_fused`'s row body at the chunk's width (the
-    /// one-column walk for a chunk of one token, `f32_lane_partials`
-    /// otherwise, then `gemv_lane_sums`), so each logit is bit for bit the
-    /// fused launch's for its column. Writes `logits[t·128 + e]`.
+    /// normed activations (`n_tok` columns of `k`). Block `b` covers tokens
+    /// `32·(b / 4) ..` and expert rows `32·(b % 4) ..`; its warp `v` owns
+    /// eight rows from `8·(v / 4)` and eight tokens from `8·(v % 4)` of
+    /// those. The block stages each of its rows' and tokens' next 64 values
+    /// in shared memory with `cp.async`, three stages deep, and each lane
+    /// advances its 64 sums over the staged 32-value chunks in increasing
+    /// order ([`f32_tile_chunk`]): the sum of lane `l` for a (row, token)
+    /// pair takes the fused entry's terms `w[row·k + 32·it + l] · x[token·k +
+    /// 32·it + l]` in the fused entry's order, and each token's eight sums go
+    /// through [`gemv_lane_sums`], so each logit is bit for bit the fused
+    /// launch's for its column. A token past `n_tok` is staged as token
+    /// `n_tok − 1` and its sums are not stored. Writes `logits[t·128 + e]`.
+    /// `k` a positive multiple of 64, `w` and `x` 16-byte aligned
+    /// (host-checked).
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(512)]
     #[launch_contract(
         domain = 1,
-        block = (256, 1, 1),
+        block = (512, 1, 1),
         requires = (
+            n_tok >= 1,
             w.len() >= 128 * k,
             x.len() >= n_tok * k,
             logits.len() >= 128 * n_tok
@@ -810,36 +887,125 @@ mod qwen3moe_router_kernels {
         n_tok: u32,
         mut logits: DisjointSlice<f32>,
     ) {
+        static mut STAGE: SharedArray<f32, { STAGES * STAGE_FLOATS }, 16> = SharedArray::UNINIT;
+
         let b = thread::blockIdx_x() as usize;
-        let t0 = (b / ROW_GROUPS) * MAX_TOKENS;
+        let t0 = (b / ROW_BLOCKS) * LOGITS_TOKENS;
+        let row0 = (b % ROW_BLOCKS) * LOGITS_ROWS;
         let n = n_tok as usize;
         if t0 >= n {
-            return; // block-uniform
+            return; // block-uniform, before the first barrier
         }
-        let m = (n - t0).min(MAX_TOKENS);
+        let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
-        let row = (b % ROW_GROUPS) * FUSED_WARPS + thread::threadIdx_x() as usize / 32;
+        let (rt, tt) = ((tid / 32) / TOKEN_TILES, (tid / 32) % TOKEN_TILES);
         let kk = k as usize;
-        // SAFETY: (t0 + m)·k <= n_tok·k <= x.len() by the launch contract.
-        let xc = unsafe { x.get_unchecked(t0 * kk..(t0 + m) * kk) };
-        let partials = if m == 1 {
-            // SAFETY: row < ROW_GROUPS·FUSED_WARPS = N_EXPERT, so w.len() >=
-            // 128·k >= (row + 1)·k; xc holds k values; the launcher passes k
-            // a positive multiple of 32; lane < 32.
-            let f0 = unsafe { f32_lane_partial_1col_w32(w, xc, k, row, lane) };
-            [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        } else {
-            // SAFETY: as above, with xc holding m·k values and 1 <= m <=
-            // MAX_TOKENS = 8.
-            unsafe { f32_lane_partials(w, xc, k, row, m as u32, lane) }
-        };
-        let sums = gemv_lane_sums(partials, m as u32);
-        if lane == 0 {
-            // SAFETY: 1 <= m <= 8 and (m − 1)·128 + t0·128 + row < (t0 +
-            // m)·128 <= n_tok·128 <= logits.len() (launch contract); lane 0 of
-            // the row's warp is the only writer of the chunk's slots of row.
-            unsafe { store_cols(&mut logits, t0 * N_EXPERT + row, N_EXPERT, m, &sums) };
+        let stages = kk / LINE;
+        // SAFETY: STAGE is this block's own shared allocation of STAGES ·
+        // STAGE_FLOATS values, 16-byte aligned; the raw form reaches the
+        // `static mut` without a reference.
+        let sh = unsafe { SharedArray::as_raw_mut_ptr(&raw mut STAGE) };
+
+        // This thread's copies of every stage: piece `piece` of row line
+        // `line` and of token line `line`, a token past the last staged as
+        // the last.
+        let line = tid / LINE_COPIES;
+        let piece = 4 * (tid % LINE_COPIES);
+        let w_off = (row0 + line) * kk + piece;
+        let x_off = (t0 + line).min(n - 1) * kk + piece;
+        let w_dst = line * LINE + piece;
+        let x_dst = (LOGITS_ROWS + line) * LINE + piece;
+        macro_rules! stage_copy {
+            ($s:expr, $buf:expr) => {{
+                let (s, buf): (usize, usize) = ($s, $buf);
+                // SAFETY: s < stages, so s·LINE + piece + 4 <= k: the 16
+                // source bytes lie in row row0 + line < N_EXPERT of w
+                // (w.len() >= 128·k) and in a column below n_tok of x
+                // (x.len() >= n_tok·k), 16-byte aligned (k a multiple of 64,
+                // both bases 16-byte aligned: host-checked). The destination
+                // is this thread's own 16 bytes of stage buf < STAGES, 16-byte
+                // aligned (LINE and piece are multiples of four values), read
+                // by no warp until the barrier after the wait that completes
+                // this copy.
+                unsafe {
+                    let dst = sh.add(buf * STAGE_FLOATS);
+                    cp_async_cg_16(
+                        dst.add(w_dst).cast::<u32>(),
+                        w.as_ptr().add(w_off + s * LINE).cast::<u32>(),
+                    );
+                    cp_async_cg_16(
+                        dst.add(x_dst).cast::<u32>(),
+                        x.as_ptr().add(x_off + s * LINE).cast::<u32>(),
+                    );
+                }
+            }};
         }
+
+        stage_copy!(0, 0);
+        // SAFETY: commits this thread's copies above as one group.
+        unsafe { cp_async_commit_group() };
+        if stages > 1 {
+            stage_copy!(1, 1);
+        }
+        // SAFETY: as above; the group is empty for a single stage.
+        unsafe { cp_async_commit_group() };
+
+        let mut acc = [[0.0f32; TILE]; TILE];
+        let mut s = 0usize;
+        let mut buf = 0usize;
+        while s < stages {
+            // SAFETY: one group per stage was committed before this wait (two
+            // ahead of the loop, one per earlier pass), so leaving the newest
+            // pending completes stage s's. The barrier then publishes every
+            // thread's copies of it, and tells that every warp is done
+            // reading stage s − 1, whose buffer the copy below refills.
+            unsafe { cp_async_wait_group(1) };
+            thread::sync_threads();
+            if s + 2 < stages {
+                stage_copy!(s + 2, if buf == 0 { STAGES - 1 } else { buf - 1 });
+            }
+            // SAFETY: one group per pass, empty near the end.
+            unsafe { cp_async_commit_group() };
+            // SAFETY: stage buf's row lines rt·TILE + i and token lines
+            // LOGITS_ROWS + tt·TILE + c (i, c < TILE) hold values 32·j +
+            // lane of chunks j < STAGE_CHUNKS, published by the barrier above
+            // and not refilled before the next pass's barrier.
+            unsafe {
+                let base = sh.add(buf * STAGE_FLOATS).cast_const();
+                let wp = base.add(rt * TILE * LINE + lane);
+                let xp = base.add((LOGITS_ROWS + tt * TILE) * LINE + lane);
+                acc = f32_tile_chunk(acc, wp, xp, LINE);
+                acc = f32_tile_chunk(acc, wp.add(32), xp.add(32), LINE);
+            }
+            s += 1;
+            buf = if buf == STAGES - 1 { 0 } else { buf + 1 };
+        }
+
+        // The warp's first token, how many of its tokens exist, its first row.
+        let tw = t0 + tt * TILE;
+        let live = if tw < n { (n - tw).min(TILE) } else { 0 };
+        let r0 = row0 + rt * TILE;
+        // Every lane runs each column's butterfly; lane 0 stores a live one.
+        macro_rules! column {
+            ($c:literal) => {{
+                let sums = gemv_lane_sums(acc[$c], TILE as u32);
+                if lane == 0 && $c < live {
+                    // SAFETY: token tw + $c < n_tok, so its slots (tw +
+                    // $c)·128 + r0 + i, i < TILE, lie inside logits (launch
+                    // contract); lane 0 of the warp owning rows r0 .. of that
+                    // token is their only writer.
+                    unsafe { store_rows(&mut logits, (tw + $c) * N_EXPERT + r0, &sums) };
+                }
+            }};
+        }
+        column!(0);
+        column!(1);
+        column!(2);
+        column!(3);
+        column!(4);
+        column!(5);
+        column!(6);
+        column!(7);
     }
 
     /// The routing of `n_tok` tokens from their logits (`n_tok · 128`, as
@@ -1099,8 +1265,9 @@ impl RouterKernels {
     /// Enqueue the router of a ubatch of `n` (1..=`out.tokens()`) tokens in
     /// two launches, `qwen3moe_router_logits` then `qwen3moe_router_route`:
     /// `w` the router weight as f32 ([`N_EXPERT`] rows of `k`, `k` a
-    /// positive multiple of 32), `x` the tokens' `n` columns of `k` normed
-    /// activations; results into `out`, each token's the bits
+    /// positive multiple of 64), `x` the tokens' `n` columns of `k` normed
+    /// activations, both 16-byte aligned (the logits launch copies them in
+    /// 16-byte pieces); results into `out`, each token's the bits
     /// [`RouterKernels::enqueue_fused`] leaves for it, its refusal raised on
     /// `fault` as there. Asynchronous, allocation-free, capturable.
     pub fn enqueue_ubatch(
@@ -1114,11 +1281,11 @@ impl RouterKernels {
     ) -> Result<(), GpuError> {
         let what = "qwen3moe::router::enqueue_ubatch";
         let k = w.cols();
-        if w.rows() != N_EXPERT || k == 0 || !k.is_multiple_of(32) {
+        if w.rows() != N_EXPERT || k == 0 || !k.is_multiple_of(LINE) {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "router weight is {} x {k}, want {N_EXPERT} rows of a positive multiple of 32",
+                    "router weight is {} x {k}, want {N_EXPERT} rows of a positive multiple of {LINE}",
                     w.rows()
                 ),
             ));
@@ -1133,13 +1300,21 @@ impl RouterKernels {
                 ),
             ));
         }
-        let chunks = n.div_ceil(MAX_TOKENS);
+        let (w_at, x_at) = (w.buf().cu_deviceptr(), x.cu_deviceptr());
+        if !w_at.is_multiple_of(16) || !x_at.is_multiple_of(16) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "router weight at {w_at:#x}, input at {x_at:#x}: both must be 16-byte aligned"
+                ),
+            ));
+        }
         let k = launch_u32(what, "k", k)?;
         let n_tok = launch_u32(what, "n", n)?;
-        let grid = launch_u32(what, "logits grid", chunks * ROW_GROUPS)?;
+        let grid = launch_u32(what, "logits grid", n.div_ceil(LOGITS_TOKENS) * ROW_BLOCKS)?;
         let prep = self
             .module
-            .prepare_qwen3moe_router_logits(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+            .prepare_qwen3moe_router_logits(LaunchConfig1D::new(grid, LOGITS_THREADS_U32, 0))?;
         self.module
             .qwen3moe_router_logits(stream, &prep, w.buf(), x, k, n_tok, &mut out.logits)?;
         let grid = launch_u32(what, "route grid", n.div_ceil(FUSED_WARPS))?;

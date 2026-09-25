@@ -34,8 +34,9 @@
 //!
 //! Sizes. No kernel of a ubatch needs more of `U` than `1..=UBATCH`: the
 //! route and the GEMM take any slot count up to [`GEMM_MAX_SLOTS`], the
-//! router and the prefill flash cut the tokens into groups of eight and
-//! guard the last, and every other launch works per token or per slot.
+//! router logits cut the tokens into blocks of 32 and the prefill flash into
+//! groups of eight, each guarding the last, and every other launch works per
+//! token or per slot.
 
 use super::body::{Kernels, Kq, LayerNames};
 use super::experts::CombineArgs;

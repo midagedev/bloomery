@@ -2,7 +2,7 @@
 //! two matmul sites whose weights are not K-quants. The attention `q_nope2`
 //! site consumes the load-time Q8_0 requant of `wk_b` (32-value blocks), and
 //! the MoE router `ffn_gate_inp` is F32. Both are precision-sensitive — a
-//! flipped near-tie in the router's top-6 changes the token — so activations
+//! flipped near-tie in the router's top-k changes the token — so activations
 //! stay f32 here: the kernel dequantizes inline and accumulates in f32, and
 //! the gate band is accordingly tighter than the q8_1-activation kernels'.
 //!
@@ -30,6 +30,12 @@
 //! the row index, or the grid geometry. Output layout matches the K-quant
 //! gemvs, `y[r·m + c]`; `q8_0_gemv_mcol` can write token-major instead
 //! ([`GemvOut`]).
+//!
+//! [`f32_tile_chunk`] is the F32 lane share for a warp that owns a
+//! [`TILE`]-row × [`TILE`]-column tile instead of one row (the qwen3moe
+//! ubatch router logits): every (row, column) pair's lane sum takes the row
+//! walk's terms in the row walk's order, and each column's sums go through
+//! the same butterfly, so a tile writes the row walk's bits.
 //!
 //! `q8_0_gemv` takes one column only; the launcher sends a Q8_0 gemv of
 //! `m > 1` columns to `q8_0_gemv_mcol`, where every lane owns the whole code
@@ -468,6 +474,89 @@ pub unsafe fn f32_lane_partial_1col_w32(
         it += 1;
     }
     f
+}
+
+/// Rows and columns of the register tile [`f32_tile_chunk`] advances: a
+/// warp owns `TILE` rows of an F32 weight against `TILE` activation columns,
+/// each lane holding one partial sum per (column, row) pair.
+pub const TILE: usize = 8;
+const _: () = assert!(TILE == 8);
+
+/// `acc[i] + w[i]·x` for each of the tile's rows, one f32 multiply-add per
+/// row: the term [`f32_lane_partials`] adds to row `i`'s sum of column `x`.
+#[inline(always)]
+fn fma_rows(w: [f32; TILE], x: f32, acc: [f32; TILE]) -> [f32; TILE] {
+    [
+        f32::mul_add(w[0], x, acc[0]),
+        f32::mul_add(w[1], x, acc[1]),
+        f32::mul_add(w[2], x, acc[2]),
+        f32::mul_add(w[3], x, acc[3]),
+        f32::mul_add(w[4], x, acc[4]),
+        f32::mul_add(w[5], x, acc[5]),
+        f32::mul_add(w[6], x, acc[6]),
+        f32::mul_add(w[7], x, acc[7]),
+    ]
+}
+
+/// One 32-value chunk of lane `lane`'s [`TILE`]-row × [`TILE`]-column tile
+/// of F32 partial sums, read from values the block has staged: `w` points at
+/// the lane's value of the tile's first row in this chunk and `x` at its
+/// value of the first column, each next row or column `stride` floats on.
+/// Returns `acc` with the chunk's terms added, `acc[c][i] + w_i·x_c` — for
+/// row `i` and column `c` the term [`f32_lane_partials`] adds to that row
+/// and column for this chunk. So a tile advanced over a row's chunks in
+/// increasing order holds, lane for lane, the row walk's partial sums, and
+/// [`gemv_lane_sums`] over column `c`'s [`TILE`] sums gives its logits bit
+/// for bit. Every array slot is a constant index: no loop selects one, so
+/// the 64 sums and 16 values stay in registers.
+///
+/// # Safety
+///
+/// `w.add(i · stride)` and `x.add(c · stride)` for every `i, c < TILE` are
+/// readable f32 values that nothing writes during the call.
+#[inline(always)]
+pub(crate) unsafe fn f32_tile_chunk(
+    acc: [[f32; TILE]; TILE],
+    w: *const f32,
+    x: *const f32,
+    stride: usize,
+) -> [[f32; TILE]; TILE] {
+    // SAFETY: i·stride for i < TILE, readable by this fn's contract.
+    let wv = unsafe {
+        [
+            *w,
+            *w.add(stride),
+            *w.add(2 * stride),
+            *w.add(3 * stride),
+            *w.add(4 * stride),
+            *w.add(5 * stride),
+            *w.add(6 * stride),
+            *w.add(7 * stride),
+        ]
+    };
+    // SAFETY: c·stride for c < TILE, readable by this fn's contract.
+    let xv = unsafe {
+        [
+            *x,
+            *x.add(stride),
+            *x.add(2 * stride),
+            *x.add(3 * stride),
+            *x.add(4 * stride),
+            *x.add(5 * stride),
+            *x.add(6 * stride),
+            *x.add(7 * stride),
+        ]
+    };
+    [
+        fma_rows(wv, xv[0], acc[0]),
+        fma_rows(wv, xv[1], acc[1]),
+        fma_rows(wv, xv[2], acc[2]),
+        fma_rows(wv, xv[3], acc[3]),
+        fma_rows(wv, xv[4], acc[4]),
+        fma_rows(wv, xv[5], acc[5]),
+        fma_rows(wv, xv[6], acc[6]),
+        fma_rows(wv, xv[7], acc[7]),
+    ]
 }
 
 /// Values one step of the single-column Q8_0 body covers: each of the 32
