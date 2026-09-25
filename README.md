@@ -73,7 +73,7 @@ Prompt processing on the same card, arms alternated in one window, three rounds 
 | 512 | **6,402** | 4,318 | — | 3,471 |
 | 4096 | **7,490** | 4,205 | 6,904 | 1,321 |
 
-The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QWEN3_UBATCH`) through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. At 4096 tokens bloomery's default is 1.085× llama.cpp with `-ub 4096 -b 4096`; the routed GEMM and the per-token glue kernels are about equal shares of what remains [derived]. Source: rig-log [2026-09-25, q3ubatch](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3ubatch-ab).
+The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QWEN3_UBATCH`) through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. At 4096 tokens bloomery's default is 1.085× llama.cpp with `-ub 4096 -b 4096`; ~~the routed GEMM and the per-token glue kernels are about equal shares of what remains~~ the GEMMs (routed and dense) are about 62 % of what remains, the per-token glue about 17 % and attention about 15 % [derived; docs/research/q3next-design-report.md]. Source: rig-log [2026-09-25, q3ubatch](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3ubatch-ab).
 
 Read these numbers with their conditions:
 
