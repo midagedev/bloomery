@@ -455,7 +455,7 @@ positions=1|2 kind=…` rows and a `draft summary` line replace the `time step` 
 `gate-gpu-load-v41-lock` runs with it; an `RLIMIT_MEMLOCK` refusal is an error that names the limit),
 `BLOOMERY_CARD_DONTNEED=0` (default 1: keep the file pages of uploaded card segments in the page
 cache; on, each segment's pages are dropped right after its upload, inward-rounded, `token_embd` and
-the engram table excepted — with a 196 GB host set and 48 GB of cards the machine's 264 GB does not
+the engram table excepted — with a ~~196 GB~~ 214.0 GB host set (plan (a) on the public file, 12,692 experts; corrected 2026-09-25) and 48 GB of cards the machine's 264 GB does not
 hold both, measured: populate then failed residency by 846 pages),
 `BLOOMERY_ENGRAM_HELPER=0` (gpu-deepseek41 `StepRows`: the step thread reads the engram rows from
 the mapping itself instead of the helper thread, which advises every row (`WILLNEED`, one batch),
