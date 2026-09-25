@@ -2,7 +2,10 @@
 
 여기는 **아직 할 일만** 있다. 2026-09-25 새벽에 다시 썼다 — 그 전 판(라운드 보고 절 스무 개와 09-23 GPU 선 목록의 원문, 155 KB)은 [`plan-ledger.md`](plan-ledger.md) 「plan-triage.md 2026-09-25 이전 판」에 원문 그대로 있고, 항목의 근거·수치·기제가 필요하면 거기서 찾는다. 항목은 받을 라운드별로 한 줄씩이고 크기는 XS·S·M·L이다. 착륙한 줄은 지운다(원문은 장부, 결과는 커밋 메시지와 rig-log). 수치는 `[유도]`가 아니면 실측이다.
 
-## 비행 중 (파동 22, 09-25 07:20~)
+## 비행 중 (파동 22, 09-25 07:20~ · 파동 23 선발 09-25 10:00~)
+
+파동 23 선발(사용자 09-25 "프리필이 진짜 중요"): `prefillbench`(측정 하니스 — `time prompt` 행, 두 depth 러너의 `ikpp:`/`lcpppp:` 팔, 타이밍 없음; 경계 두 generate bin의 공급 시간 줄·`depth-ds41.sh`·`depth-qwen3moe.sh`) ‖ `ds41prefill`(설계, 파일 편집 없음 — V4.1·Qwen3 프리필 비용 모델과 빌드 순서). 스펙 `specs/wave-m5/spec-{prefillbench,ds41prefill}.md`. 나머지 파동 23(uniongroup·gpuq1·N4 설계·qwen3 다음)은 시팅 E21·DS·Q3F·L3 뒤.
+
 
 ~~`dsloop`~~(착륙 `c00274c`: `BLOOMERY_DRAFT=dspark`, 타깃 탭 `ds41_hc_mean` — 드래프트 없으면 1167 그대로·있으면 1170/pair 2340, 탐욕 토큰 = plain(게이트·prose/code 512·계획 a + 3090 드래프트), 새 게이트 `gate-gpu-ds41-dspark-loop`; tok/s 미측정 — 시팅 DS) ‖ ~~`qwen3fuse`~~(착륙 `ae046aa`: Qwen3 653 → 508노드, 덤프 md5 = base, 시팅 Q3F) ‖ `load3` ‖ ~~`slots`~~(착륙 `75d2bad`: `POST /slots/0?action=save|restore|erase`, `--slot-save-path`, 파일 = 헤더·id + 엔진 상태, mock 왕복 게이트 셋, 실제 V4.1 엔진은 기본 501 — 스냅샷은 `slotsnap` 카드) — base `ac250bb`, 스펙 `~/.claude/projects/-Users-hckim-repo-bloomery/specs/wave-m5/spec-{dsloop,qwen3fuse,load3,slots}.md`. 경계: dsloop = `gpu-deepseek41/{body,chain/ffn,hc}.rs`·`gpu/model.rs`·`gpu-gates/draft.rs`·`generate_ds41.rs`; qwen3fuse = `gpu/arch/qwen3moe/**`·`head.rs` 접근자 하나; load3 = `chain/glue.rs`·`body.rs`의 StepRows/lock 헌크만(리드가 dsloop과 맞춘다)·`placement/host_lock.rs`·`gpu/graph.rs` 추가만; slots = `serve/**`. uniongroup·gpuq1은 body.rs·chain/ffn.rs 충돌로 다음 파동.
 
