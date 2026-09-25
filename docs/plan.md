@@ -23,7 +23,7 @@
 | **M2 돌려 볼 수 있게** | `bloomery-serve-ds41`·`bloomery-chat`·README·BUILD.md·THIRD_PARTY_NOTICES·로고·토크나이저 게이트 | BUILD.md에 prefix 재사용 두 문장, 30분 soak | 공개 시점(사용자; LICENSE는 MIT로 결정) |
 | **DFlash(DSpark)** | 커널 `dshc`·`dsmx`, 적재·KV `4b963af`, 블록 패스 B `5dd34cb`, 폭별 그래프 C `11ce715`, 합집합 설계 | ~~`dspark-q3k`~~ `f1d1168` → ~~`dsloop`~~ `c00274c`(w = 1 수락 루프, 시팅 DS가 tok/s) → `uniongroup`(k > 1) | `ref-draft` 재덤프(시팅 10, 승인) |
 | **M3 서버** | prefix 재사용(`47e36b5`·`5fdfe11`), reasoning/DSML(`7f68981`), `/props` 엔진 객체(`631cedc`) | ~~슬롯 save/restore(`slots`)~~ `75d2bad`(엔진 스냅샷은 `slotsnap`), 템플릿 정리 라운드 | — |
-| **M4 모델** | Qwen3-30B-A3B 전 카드(체인·e2e·PPL·E28), IQ 커널, 선형 조사, V4 호스트 티어 커널 | ~~`qwen3route`~~ `be05ad7` → ~~`qwen3fuse`~~ `ae046aa`(653 → 508노드, 시팅 Q3F) → `qwen3bw`; V4 `v4meta` → 카드·압축기·hc; `linear` → `glm53` | 시팅 D(IQ3_XXS 속도), 사용자 결정(다운로드·DFlash 대상) |
+| **M4 모델** | Qwen3-30B-A3B 전 카드(체인·e2e·PPL·E28), IQ 커널, 선형 조사, V4 호스트 티어 커널 | ~~`qwen3route`~~ `be05ad7` → ~~`qwen3fuse`~~ `ae046aa`(653 → 508노드, 시팅 Q3F) → `qwen3bw`; V4 ~~`v4meta`~~ `8bfa287`(09-25 21:00 착륙) → 카드·압축기·hc; `linear` → `glm53` | 시팅 D(IQ3_XXS 속도), 사용자 결정(다운로드·DFlash 대상) |
 | **M5 비전** | V0 오라클 `01bbe07`, V2 인코더 `4abc188` | V3 텍스트 쪽 주입(`visinj`) | M1·M2 뒤 |
 
 ### 파동 (빌더 다섯 이상 — 사용자 09-24 10:16; 측정은 증인으로 거른다)
