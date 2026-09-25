@@ -538,6 +538,12 @@ gate-gpu-qwen3moe-router:
 gate-gpu-qwen3moe-down:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_down && bash tools/gpu-gate.sh gate_qwen3moe_down'
 
+# 그룹 int8 텐서코어 GEMM(bloomery_gpu::gemm): 실파일 Qwen3 gate(Q4_K)·down(Q4_K, Q6_K) 스택과 V4.1 routed gate(Q3_K)
+# 하나, 같은 형상의 합성 스택(+ Q5_K), T ∈ {1,15,16,17,64,511,512} × 라우팅 넷을 f64 참조의 유도 밴드에 대고 잰다.
+# fault·거부·그래프 재생 포함. ARGS는 `--case <부분문자열>` 필터.
+gate-gpu-gemm *ARGS:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_gemm && bash tools/gpu-gate.sh gate_gemm {{ARGS}}'
+
 gate-gpu-qwen3moe-flash:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && bash tools/gpu-gate.sh gate_qwen3moe_flash'
 

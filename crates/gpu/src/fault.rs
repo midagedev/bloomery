@@ -56,17 +56,20 @@ pub enum FaultSite {
     Router = 5,
     /// A selected-attention list named a row past the compressed stream.
     AttnSel = 6,
+    /// A grouped GEMM's route table met an expert id past its stack.
+    ExpertId = 7,
 }
 
 impl FaultSite {
     /// Every site, in code order.
-    pub const ALL: [FaultSite; 6] = [
+    pub const ALL: [FaultSite; 7] = [
         FaultSite::QuantColumn,
         FaultSite::NormQuant,
         FaultSite::Q5Quant,
         FaultSite::HcQuant,
         FaultSite::Router,
         FaultSite::AttnSel,
+        FaultSite::ExpertId,
     ];
 
     /// The site's name as an error prints it.
@@ -79,6 +82,7 @@ impl FaultSite {
             FaultSite::HcQuant => "hc_quant",
             FaultSite::Router => "router",
             FaultSite::AttnSel => "attn_sel",
+            FaultSite::ExpertId => "expert_id",
         }
     }
 
@@ -94,6 +98,7 @@ impl FaultSite {
                 "fewer finite router candidates than slots, or a non-finite weight"
             }
             FaultSite::AttnSel => "a selected row past the compressed stream",
+            FaultSite::ExpertId => "a routed expert id past the stack's expert count",
         }
     }
 }

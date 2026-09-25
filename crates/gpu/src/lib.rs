@@ -37,6 +37,7 @@ pub mod fault;
 pub mod flash;
 pub mod flash_gqa;
 pub mod fused;
+pub mod gemm;
 pub(crate) mod graph;
 pub mod head;
 pub mod hybrid;
@@ -2077,7 +2078,9 @@ impl Gpu {
         self.quantize_q8_1_at(x, x0, act, self.unlabelled_sink())
     }
 
-    /// The one launcher of `q3k_quantize_q8_1`, raising into `fault`.
+    /// The launcher of `q3k_quantize_q8_1` into a [`Q8Act`], raising into
+    /// `fault`; [`Gpu::enqueue_quantize_gemm`] is its other launcher, into a
+    /// [`gemm::GemmAct`].
     fn quantize_q8_1_at(
         &self,
         x: &DeviceBuffer<f32>,

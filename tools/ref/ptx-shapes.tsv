@@ -80,6 +80,11 @@ generate_ds41   gap_coop_sync                           0          0
 generate_ds41   gap_plain                               0          0
 generate_ds41   gate_up_swiglu_q3k                      0          0
 generate_ds41   gather_pairs                            0          0
+generate_ds41   gemm_q3k                                0          0
+generate_ds41   gemm_q4k                                0          0
+generate_ds41   gemm_q5k                                0          0
+generate_ds41   gemm_q6k                                0          0
+generate_ds41   gemm_route                              0          0
 generate_ds41   gqa_flash_merge                         0          0
 generate_ds41   gqa_flash_seg                           0          0
 generate_ds41   gqa_flash_seg_mma                       0          0
@@ -167,6 +172,11 @@ gate_e2e        gap_coop_sync                           0          0
 gate_e2e        gap_plain                               0          0
 gate_e2e        gate_up_swiglu_q3k                      0          0
 gate_e2e        gather_pairs                            0          0
+gate_e2e        gemm_q3k                                0          0
+gate_e2e        gemm_q4k                                0          0
+gate_e2e        gemm_q5k                                0          0
+gate_e2e        gemm_q6k                                0          0
+gate_e2e        gemm_route                              0          0
 gate_e2e        gqa_flash_merge                         0          0
 gate_e2e        gqa_flash_seg                           0          0
 gate_e2e        gqa_flash_seg_mma                       0          0
