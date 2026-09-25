@@ -53,6 +53,12 @@
 //! by the same tick that names the op; the footer prints their sum, the
 //! effective GB/s of the whole chain and the two references of
 //! docs/roofline.md so a reader sees where each op sits between them.
+//!
+//! `--bench-arm <op>` with `--bench-kernels` runs only the grouped-GEMM arm
+//! whose row is `bench op=<op>` (`gemm_q4k_moe_t4096`, say) and none of the
+//! other arms, so every `gemm_q4k` launch of the process is that arm's — the
+//! shape a counter run (`just ncu-gpu-gemm`) filters by kernel name. A name
+//! no arm carries is a named error.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -785,6 +791,25 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
 
     println!("bench n_per_burst={N} rounds={ROUNDS} graph_launches_per_round={GREPS} m_cols=1");
 
+    // `--bench-arm <op>`: that one grouped-GEMM arm and nothing else.
+    let only = {
+        let mut args = std::env::args().skip_while(|a| a != "--bench-arm");
+        match args.next() {
+            None => None,
+            Some(_) => Some(
+                args.next()
+                    .ok_or("gate_p8: --bench-arm wants an arm name (a `bench op=` value)")?,
+            ),
+        }
+    };
+    if let Some(arm) = only.as_deref() {
+        return if gemm_arms(gpu, Some(arm))? {
+            Ok(())
+        } else {
+            Err(format!("gate_p8: --bench-arm {arm} names no grouped-GEMM arm").into())
+        };
+    }
+
     {
         let mut enq = |s: &CudaStream| probe.enqueue_touch(s, &mut tbuf);
         let e = burst(stream, &mut enq)?;
@@ -918,6 +943,7 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
         print_arm("q6k_gemv_lm_head", rows, bytes, g.node_count(), e, r);
     }
 
+    gemm_arms(gpu, None)?;
     // The grouped int8 GEMM (`bloomery_gpu::gemm`): Qwen3-30B-A3B's routed
     // gate shape — 128 experts of 768 x 2048 Q4_K, top-8, every slot reading
     // its token's column — and the dense 2048 x 2048 Q4_K case, each at T
@@ -925,9 +951,12 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
     // table is built once per T and its launch priced on its own; the GEMM
     // arm is the GEMM alone. Beside the usual row: the
     // arithmetic rate `2 * slots * rows * K` over the graph minimum, and that
-    // rate against the card's int8 dense tensor peak.
-    {
+    // rate against the card's int8 dense tensor peak. `only` keeps the one
+    // arm of that name; the return says whether any arm ran.
+    fn gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
         use bloomery_gpu::gemm::{GemmAct, GemmInput, GemmKernels, GemmRoute, GemmWeight};
+        let stream = gpu.stream();
+        let mut ran = false;
         let gk = GemmKernels::load(gpu.context())?;
         let name = gpu.device_name()?;
         let peak = int8_peak_tops(&name);
@@ -940,11 +969,19 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
             ("moe", 128usize, 8usize, 768usize, 2048usize),
             ("dense", 1, 1, 2048, 2048),
         ] {
+            if only.is_some_and(|o| !o.starts_with(&format!("gemm_q4k_{label}_t"))) {
+                continue;
+            }
             let n_rows = n_exp * rows;
             let cols = 36 * k / 256;
             let w =
                 DeviceTensor::<u32>::upload(stream, &fill_pattern(n_rows * cols), n_rows, cols)?;
             for t in [16usize, 64, 256, 512, 1024, 2048, 4096] {
+                let op = format!("gemm_q4k_{label}_t{t}");
+                if only.is_some_and(|o| o != op) {
+                    continue;
+                }
+                ran = true;
                 let n_slots = t * top_k;
                 let xs = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(t * k))?;
                 let mut act = GemmAct::new(stream, t, k)?;
@@ -989,7 +1026,6 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
                 let bytes = (experts * rows * 144 * n_sb
                     + t * (4 * 128 * n_sb.div_ceil(2) + 4 * 8 * n_sb + 4 * 2 * n_sb)
                     + 4 * n_slots * rows) as u64;
-                let op = format!("gemm_q4k_{label}_t{t}");
                 print_arm(&op, rows, bytes, g.node_count(), e, r);
                 let ops = 2.0 * (n_slots * rows * k) as f64;
                 let tops = ops / r.0 / 1e6;
@@ -1000,6 +1036,7 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
                 );
             }
         }
+        Ok(ran)
     }
 
     // The grid-barrier trio. The grids are the ones the three stopped folds

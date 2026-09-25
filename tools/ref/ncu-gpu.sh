@@ -16,6 +16,22 @@
 # 그래프: 우리 스텝은 캡처된 그래프 하나다. 러너가 --graph-profiling node를 직접 넘기므로(아래,
 # ncu 2025.3.1 고정) 노드별 커널 카운터가 그대로 나온다 — 판의 기본값에 기대지 않는다. eager로도 같은 커널이 뜨므로, 의심스러우면
 # BLOOMERY_NCU_MODE=eager로 한 번 더 돌려 두 표가 같은 말을 하는지 본다.
+#
+# The grouped GEMM form (BLOOMERY_NCU_FORM=gemm, `just ncu-gpu-gemm [ARM]`): the counters of one
+# bench arm of the grouped int8 GEMM instead of a decode step. The profiled command is
+# `gate_p8 --bench-kernels --bench-arm ARM` (BLOOMERY_NCU_GEMM_ARM, default gemm_q4k_moe_t4096:
+# Qwen3's routed gate shape, 128 experts of 768 x 2048 Q4_K, top-8, T = 4096), which runs that one
+# arm and none of the others, so every `gemm_q4k` launch in the process is the arm's and no skip has
+# to be counted across the other arms (the depth form's two wrong skips above are what that saves).
+# The arm launches its GEMM eagerly 64 times (the warm-up burst), then 7 x 64 timed eager launches,
+# then graph replays; the default skip 64 (BLOOMERY_NCU_SKIP) steps over the warm-up and the count
+# (BLOOMERY_NCU_COUNT) takes eager launches of the timed bursts. Sections SpeedOfLight,
+# WarpStateStats and MemoryWorkloadAnalysis (BLOOMERY_NCU_SECTIONS), the stall reasons below, and
+# the pipe metrics in GEMM_METRICS; the summary prints, per kernel, the throughput units with the
+# top one named, the LSU data-pipe wavefronts per launch, issue-active, the IMMA tensor pipe, DRAM
+# and the top stall reasons (medians over the collected launches). The profile runs under
+# BLOOMERY_ARM_BOUND seconds (default 900). BLOOMERY_DRY=1 prints the command line and exits before
+# the binary check and the lease; the depth form has no dry path and refuses the variable.
 set -uo pipefail
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
 # 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
@@ -71,6 +87,148 @@ SECTIONS=${BLOOMERY_NCU_SECTIONS:-SpeedOfLight Occupancy WarpStateStats MemoryWo
 #   not_selected     발행할 수 있었는데 스케줄러가 딴 워프를 골랐다(= 점유가 충분하다는 신호)
 #   no_instruction   명령 캐시 미스
 STALLS=${BLOOMERY_NCU_STALLS:-long_scoreboard barrier short_scoreboard mio_throttle lg_throttle math_pipe_throttle wait not_selected selected no_instruction drain membar misc}
+
+FORM=${BLOOMERY_NCU_FORM:-generate}
+DRY=${BLOOMERY_DRY:-}
+case $FORM in
+  generate)
+    [ -z "$DRY" ] || { echo "ncu-gpu.sh: BLOOMERY_DRY is read by the gemm form only (BLOOMERY_NCU_FORM=gemm); the depth form has no dry path" >&2; exit 64; }
+    ;;
+  gemm) ;;
+  *) echo "ncu-gpu.sh: BLOOMERY_NCU_FORM is generate or gemm, got '$FORM'" >&2; exit 64 ;;
+esac
+
+if [ "$FORM" = gemm ]; then
+  GEMM_BIN=${BLOOMERY_NCU_GEMM_BIN:-target/release/gate_p8}
+  GEMM_ARM=${BLOOMERY_NCU_GEMM_ARM:-gemm_q4k_moe_t4096}
+  GEMM_KERNELS=${BLOOMERY_NCU_KERNELS:-^gemm_q4k}
+  GEMM_SKIP=${BLOOMERY_NCU_SKIP:-64}
+  GEMM_SECTIONS=${BLOOMERY_NCU_SECTIONS:-SpeedOfLight WarpStateStats MemoryWorkloadAnalysis}
+  BOUND=${BLOOMERY_ARM_BOUND:-900}
+  # The pipe metrics the summary names, in its order: the L1TEX unit's throughput; the LSU data-pipe
+  # wavefronts (every global and shared access the unit's data stage serves) and the shared-memory
+  # part of them; that pipe's busy share; shared-memory bank conflicts; issue-active; the IMMA
+  # tensor pipe (int8 mma); the LSU instruction pipe; DRAM.
+  GEMM_METRICS=l1tex__throughput.avg.pct_of_peak_sustained_active
+  GEMM_METRICS+=,l1tex__data_pipe_lsu_wavefronts.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared.sum
+  GEMM_METRICS+=,l1tex__data_pipe_lsu_wavefronts.avg.pct_of_peak_sustained_elapsed
+  GEMM_METRICS+=,l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum
+  GEMM_METRICS+=,smsp__issue_active.avg.pct_of_peak_sustained_active
+  GEMM_METRICS+=,sm__pipe_tensor_op_imma_cycles_active.avg.pct_of_peak_sustained_active
+  GEMM_METRICS+=,sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active
+  GEMM_METRICS+=,dram__throughput.avg.pct_of_peak_sustained_elapsed
+  case $GEMM_ARM in
+    gemm_q4k_*_t*) ;;
+    *) echo "ncu-gpu.sh: BLOOMERY_NCU_GEMM_ARM is a gate_p8 grouped-GEMM arm (gemm_q4k_<label>_t<T>), got '$GEMM_ARM'" >&2; exit 64 ;;
+  esac
+  case "$GEMM_SKIP:$COUNT" in
+    *[!0-9:]* | :* | *:) echo "ncu-gpu.sh: BLOOMERY_NCU_SKIP and BLOOMERY_NCU_COUNT are whole numbers, got '$GEMM_SKIP' and '$COUNT'" >&2; exit 64 ;;
+  esac
+  sec_args=()
+  for s in $GEMM_SECTIONS; do sec_args+=(--section "$s"); done
+  list=$GEMM_METRICS
+  for s in $STALLS; do list="$list,smsp__warp_issue_stalled_${s}_per_warp_active"; done
+  out="$OUTDIR/ncu-gemm-${GEMM_ARM}-$(date -u +%H%M%S)"
+  CMD=(timeout --kill-after=10 "$BOUND" "$NCU" --target-processes application-only --clock-control base
+       --launch-skip "$GEMM_SKIP" --launch-count "$COUNT"
+       --kernel-name "regex:$GEMM_KERNELS" --kernel-name-base function
+       "${sec_args[@]}" --metrics "$list" --csv --log-file "$out.csv"
+       "$GEMM_BIN" --bench-kernels --bench-arm "$GEMM_ARM")
+  if [ -n "$DRY" ]; then
+    echo "[dry] form=gemm bin=$GEMM_BIN arm=$GEMM_ARM kernels='$GEMM_KERNELS' skip=$GEMM_SKIP count=$COUNT bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "[dry] ${CMD[*]}"
+    exit 0
+  fi
+  assert_fresh_binary "$GEMM_BIN" || exit $?
+  [ -x "$NCU" ] || { echo "no ncu at $NCU" >&2; exit 2; }
+  [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
+  mkdir -p "$OUTDIR"
+  WITNESS=(head-open indent card model)
+  lease_take
+  echo "[config] ncu=$($NCU --version | sed -n 3p) form=gemm arm=$GEMM_ARM kernels='$GEMM_KERNELS' skip=$GEMM_SKIP count=$COUNT bound=${BOUND}s"
+  echo "[config] sections='$GEMM_SECTIONS' out=$out"
+  witness pre
+  guard_other
+  "${CMD[@]}" > "$out.txt" 2>&1
+  rc=$?
+  witness post
+  echo "[rc] $rc"
+  [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
+  if [ -s "$out.csv" ]; then
+    echo "--- summary (median over the collected launches; the durations are not numbers of record). Raw: $out.csv"
+    python3 - "$out.csv" <<'PY'
+import csv, statistics, sys
+rows = [r for r in csv.reader(open(sys.argv[1])) if len(r) > 14 and r[0] not in ("ID", "")]
+by, shape, ids = {}, {}, {}
+for r in rows:
+    kernel, metric, unit, val = r[4].split("(")[0], r[12], r[13], r[14]
+    shape.setdefault(kernel, set()).add((r[7], r[8]))
+    ids.setdefault(kernel, set()).add(r[0])
+    try:
+        v = float(val.replace(",", ""))
+    except ValueError:
+        continue
+    # One name can come from two sections in two units (SpeedOfLight's "Memory Throughput" is a percentage,
+    # MemoryWorkloadAnalysis's is byte/s), so the unit is part of the key, as in the generate form's summary.
+    by.setdefault((kernel, metric, unit), []).append(v)
+if not by:
+    print("    the CSV holds no metric rows")
+    raise SystemExit(3)
+SOL = ("Duration", "Elapsed Cycles", "SM Active Cycles", "Compute (SM) Throughput", "Memory Throughput",
+       "L1/TEX Cache Throughput", "L2 Cache Throughput", "DRAM Throughput")
+UNITS = ("Compute (SM) Throughput", "L1/TEX Cache Throughput", "L2 Cache Throughput", "DRAM Throughput")
+PIPE = (
+    ("L1TEX throughput %", "l1tex__throughput.avg.pct_of_peak_sustained_active"),
+    ("LSU data-pipe wavefronts / launch", "l1tex__data_pipe_lsu_wavefronts.sum"),
+    ("  of them shared memory", "l1tex__data_pipe_lsu_wavefronts_mem_shared.sum"),
+    ("LSU data-pipe busy %", "l1tex__data_pipe_lsu_wavefronts.avg.pct_of_peak_sustained_elapsed"),
+    ("shared bank conflicts / launch", "l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum"),
+    ("issue-active %", "smsp__issue_active.avg.pct_of_peak_sustained_active"),
+    ("tensor (IMMA) pipe %", "sm__pipe_tensor_op_imma_cycles_active.avg.pct_of_peak_sustained_active"),
+    ("LSU instruction pipe %", "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_active"),
+    ("DRAM %", "dram__throughput.avg.pct_of_peak_sustained_elapsed"),
+)
+missing = 0
+for kernel in sorted({k for k, _, _ in by}):
+    def variants(m):
+        return sorted((u, statistics.median(s)) for (kk, mm, u), s in by.items() if kk == kernel and mm == m)
+    def med(m, u):
+        vs = [v for uu, v in variants(m) if uu == u]
+        return vs[0] if vs else None
+    sh = " ".join(f"block={b} grid={g}" for b, g in sorted(shape[kernel]))
+    print(f"  [{kernel}]  launches {len(ids[kernel])}  {sh}")
+    for m in SOL:
+        for u, v in variants(m):
+            print(f"    {m:36s} {v:14.3f} {u}")
+    top = max(((med(m, "%"), m) for m in UNITS if med(m, "%") is not None), default=None)
+    if top:
+        print(f"    {'top unit':36s} {top[1]} at {top[0]:.1f} %")
+    for label, m in PIPE:
+        vs = variants(m)
+        if not vs:
+            missing += 1
+            print(f"    {label:36s} {'NOT REPORTED':>14s}   {m}")
+        for u, v in vs:
+            print(f"    {label:36s} {v:14.4g} {u}")
+    st = [(m.replace("smsp__warp_issue_stalled_", "").replace("_per_warp_active", ""), s)
+          for (kk, m, _), s in by.items() if kk == kernel and m.startswith("smsp__warp_issue_stalled_")]
+    if st:
+        tot = sum(statistics.median(s) for _, s in st) or 1.0
+        print("    stall reasons (per active warp, share of their sum):")
+        for name, s in sorted(st, key=lambda x: -statistics.median(x[1]))[:6]:
+            v = statistics.median(s)
+            print(f"      {name:26s} {v:9.4f}  {100 * v / tot:5.1f}%")
+raise SystemExit(3 if missing else 0)
+PY
+    prc=$?
+    [ $prc -eq 0 ] || [ $rc -ne 0 ] || rc=$prc
+  else
+    echo "[summary] no CSV at $out.csv"
+    [ $rc -ne 0 ] || rc=3
+  fi
+  echo "[lease] released at $(now)"
+  exit $rc
+fi
 
 assert_fresh_binary "$BIN" || exit $?
 [ -x "$NCU" ] || { echo "no ncu at $NCU" >&2; exit 2; }

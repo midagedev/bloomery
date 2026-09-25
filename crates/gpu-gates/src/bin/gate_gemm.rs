@@ -8,8 +8,9 @@
 //! (768 → 2048, each slot its own column; 630-byte Q6_K rows, every other
 //! one at 2 mod 4) — and one routed gate stack of DeepSeek-V4.1-Flash (Q3_K,
 //! 5120 → 2304, 384 experts, top-6; `BLOOMERY_V41_MODEL`); then synthetic
-//! stacks from a fixed seed at the same shapes for Q4_K, Q6_K and Q3_K, and
-//! a Q5_K stack at the Qwen3 gate shape. Each case runs T ∈ {1, 15, 16, 17,
+//! stacks from a fixed seed at the same shapes for Q4_K, Q6_K and Q3_K, a
+//! Q5_K stack at the Qwen3 gate shape, and a Q4_K stack whose rows per expert
+//! (400) end in a partial 128-row slab. Each case runs T ∈ {1, 15, 16, 17,
 //! 64, 511, 512, 4096} tokens (4096 the largest ubatch) under four routings:
 //! uniform, every token on the same top-k experts, a quarter of the experts
 //! only, and slots dealt to experts round-robin (one slot per expert while
@@ -26,10 +27,21 @@
 //!    `|y − ref| <= γ(nb + 4) · Σ_b (|D_b| + |M_b|)` with `D_b =
 //!    d8·d·isum`, `M_b = d8·dmin·imin` (`M_b = 0` for Q6_K and Q3_K). The
 //!    decode is checked against ggml's own `dequant_row` on every decoded
-//!    row. All rows are checked up to 136 slots, four rows in sixteen above.
-//! 3. Diagnostic, not a pin: the max relative difference to today's `_sel`
+//!    row.
+//! 3. Every checked output bit for bit the host transcription of the
+//!    module's numeric contract: per 128-value block the exact i32 `isum`
+//!    and `imin`, then `acc = fma(d8, fma(−dmin, f32(imin), d·f32(isum)),
+//!    acc)` (Q6_K, Q3_K: `acc = fma(d8, d·f32(isum), acc)`) from `acc = 0`,
+//!    blocks in increasing k. The band of 2 admits any order or rounding
+//!    inside it; this check admits the contract's alone.
+//! 4. Diagnostic, not a pin: the max relative difference to today's `_sel`
 //!    gemv over the same q8_1 codes (`q4k_gemv_sel`, `q6k_gemv_sel`,
-//!    `q3k_gemv_sel`; Q5_K has none).
+//!    `q3k_gemv_sel`; Q5_K has none), and an FNV-1a digest of every output
+//!    of the run (`y_fnv`), which two builds' logs compare line by line.
+//!
+//! Checked outputs: every row of every slot up to 136 slots; above, every
+//! slot's rows `r` with `(r + s) % 4 == 0`, so each row is checked on a
+//! quarter of its expert's slots.
 //!
 //! `--case <text>` runs only the cases whose name contains `text` (the
 //! dense case is `dense`, the faults and refusals `fault`, the ubatch router
@@ -368,48 +380,79 @@ mod gate {
         (codes, d8)
     }
 
-    /// The f64 reference of one output and its band's magnitude
-    /// `Σ_b (|D_b| + |M_b|)`, summed per 128-value block as the kernel does.
-    fn dot_ref(dec: &Dec, a: &[i8], d8: &[f32]) -> (f64, f64) {
+    /// One output three ways, summed per 128-value block as the kernel groups
+    /// it: the f64 reference, its band's magnitude `Σ_b (|D_b| + |M_b|)`, and
+    /// the module's numeric contract transcribed — per block the exact i32
+    /// `isum` and `imin`, then `acc = fma(d8, fma(−dmin, f32(imin),
+    /// d·f32(isum)), acc)` (`acc = fma(d8, d·f32(isum), acc)` for a type
+    /// without mins) from `acc = 0`, blocks in increasing k. `d` and `dmin`
+    /// are f16 values, exact in f32.
+    fn dot_ref(dec: &Dec, a: &[i8], d8: &[f32]) -> (f64, f64, f32) {
         let (mut y, mut mag) = (0.0f64, 0.0f64);
+        let mut acc = 0.0f32;
         for (b, &db) in d8.iter().enumerate() {
             let sb = b / 2;
-            let mut isum = 0i64;
+            let mut isum = 0i32;
             for g in (128 * b..128 * b + 128).step_by(dec.grp) {
-                let dot: i64 = (g..g + dec.grp)
-                    .map(|v| i64::from(dec.q[v]) * i64::from(a[v]))
+                let dot: i32 = (g..g + dec.grp)
+                    .map(|v| i32::from(dec.q[v]) * i32::from(a[v]))
                     .sum();
-                isum += i64::from(dec.sc[g / dec.grp]) * dot;
+                isum += dec.sc[g / dec.grp] * dot;
             }
-            let mut imin = 0i64;
+            let mut imin = 0i32;
             if !dec.mn.is_empty() {
                 for j in (128 * b..128 * b + 128).step_by(32) {
-                    let s: i64 = a[j..j + 32].iter().map(|&v| i64::from(v)).sum();
-                    imin += i64::from(dec.mn[j / 32]) * s;
+                    let s: i32 = a[j..j + 32].iter().map(|&v| i32::from(v)).sum();
+                    imin += dec.mn[j / 32] * s;
                 }
             }
-            let dd = f64::from(db) * dec.d[sb] * isum as f64;
-            let mm = f64::from(db) * dec.dmin[sb] * imin as f64;
+            let (d, dmin) = (dec.d[sb] as f32, dec.dmin[sb] as f32);
+            let t = d * isum as f32;
+            let t = if dec.mn.is_empty() {
+                t
+            } else {
+                (-dmin).mul_add(imin as f32, t)
+            };
+            acc = db.mul_add(t, acc);
+            let dd = f64::from(db) * dec.d[sb] * f64::from(isum);
+            let mm = f64::from(db) * dec.dmin[sb] * f64::from(imin);
             y += dd - mm;
             mag += dd.abs() + mm.abs();
         }
-        (y, mag)
+        (y, mag, acc)
     }
 
-    /// Whether row `r` of an `n_slots`-slot run is checked against the
-    /// reference.
-    fn row_checked(n_slots: usize, r: usize) -> bool {
-        n_slots <= ALL_ROWS_UP_TO || matches!(r % 16, 0 | 5 | 10 | 15)
+    /// Whether row `r` of slot `s` of an `n_slots`-slot run is checked
+    /// against the reference: every row up to [`ALL_ROWS_UP_TO`] slots, a
+    /// quarter of them above, rotating with the slot.
+    fn row_checked(n_slots: usize, s: usize, r: usize) -> bool {
+        n_slots <= ALL_ROWS_UP_TO || (r + s).is_multiple_of(4)
     }
 
-    /// The worst reference check of one run: the first failing output, the
-    /// largest error-to-band ratio, the count checked; and whether every
-    /// decoded row matched ggml.
+    /// The reference check of one run: the first output outside its band,
+    /// the largest error-to-band ratio, the count checked; the outputs whose
+    /// bits differ from the contract's transcription and the first of them;
+    /// and whether every decoded row matched ggml.
     struct RefOutcome {
         fail: Option<String>,
         worst_ratio: f64,
         checked: usize,
+        bits_differ: usize,
+        bits_fail: Option<String>,
         decode_ok: bool,
+    }
+
+    impl RefOutcome {
+        fn new() -> RefOutcome {
+            RefOutcome {
+                fail: None,
+                worst_ratio: 0.0,
+                checked: 0,
+                bits_differ: 0,
+                bits_fail: None,
+                decode_ok: true,
+            }
+        }
     }
 
     /// Check `y` (slot-major, `rows` per slot) against the f64 reference for
@@ -446,25 +489,19 @@ mod gate {
             let hs: Vec<_> = (0..threads)
                 .map(|_| {
                     sc.spawn(|| {
-                        let mut out = RefOutcome {
-                            fail: None,
-                            worst_ratio: 0.0,
-                            checked: 0,
-                            decode_ok: true,
-                        };
+                        let mut out = RefOutcome::new();
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(&(e, blk)) = work.get(i) else { break };
-                            let rows = 64 * blk..(64 * blk + 64).min(st.rows);
-                            for r in rows.filter(|&r| row_checked(n_slots, r)) {
+                            for r in 64 * blk..(64 * blk + 64).min(st.rows) {
                                 let off = (e * st.rows + r) * rb;
                                 let row = &st.bytes[off..off + rb];
                                 let dec = decode(st.ty, row, st.k);
                                 out.decode_ok &=
                                     decode_matches(ggml_ty, row, &dec).map_err(|x| x.to_string())?;
-                                for &s in &by_exp[e] {
+                                for &s in by_exp[e].iter().filter(|&&s| row_checked(n_slots, s, r)) {
                                     let c = st.input.col_of(s);
-                                    let (want, mag) = dot_ref(&dec, &codes[c], &d8[c]);
+                                    let (want, mag, contract) = dot_ref(&dec, &codes[c], &d8[c]);
                                     let got = y[s * st.rows + r];
                                     let band = gamma(nb + 4) * mag;
                                     let err = (f64::from(got) - want).abs();
@@ -478,6 +515,17 @@ mod gate {
                                         ));
                                     }
                                     out.worst_ratio = out.worst_ratio.max(ratio);
+                                    if got.to_bits() != contract.to_bits() {
+                                        out.bits_differ += 1;
+                                        if out.bits_fail.is_none() {
+                                            out.bits_fail = Some(format!(
+                                                "slot {s} row {r} expert {e}: got {got:e} ({:#010x}) \
+                                                 contract {contract:e} ({:#010x})",
+                                                got.to_bits(),
+                                                contract.to_bits()
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -492,17 +540,14 @@ mod gate {
                 })
                 .collect()
         });
-        let mut all = RefOutcome {
-            fail: None,
-            worst_ratio: 0.0,
-            checked: 0,
-            decode_ok: true,
-        };
+        let mut all = RefOutcome::new();
         for r in results {
             let r = r?;
             all.fail = all.fail.or(r.fail);
             all.worst_ratio = all.worst_ratio.max(r.worst_ratio);
             all.checked += r.checked;
+            all.bits_differ += r.bits_differ;
+            all.bits_fail = all.bits_fail.or(r.bits_fail);
             all.decode_ok &= r.decode_ok;
         }
         Ok(all)
@@ -849,6 +894,17 @@ mod gate {
         p
     }
 
+    /// FNV-1a over the bits of `y`: one run's every output, for comparing
+    /// two builds' logs.
+    fn fnv(y: &[f32]) -> u64 {
+        y.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+            v.to_bits()
+                .to_le_bytes()
+                .iter()
+                .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+        })
+    }
+
     /// `max|a − b| / max|b|`.
     fn rel_diff(a: &[f32], b: &[f32]) -> f64 {
         let num = a.iter().zip(b).fold(0.0f64, |m, (&x, &y)| {
@@ -923,20 +979,33 @@ mod gate {
                     || "none".to_string(),
                     |g| format!("{:.3e}", rel_diff(&y, &g)),
                 );
-                let pass = unwritten == 0 && act_ok && refc.decode_ok && refc.fail.is_none();
+                let pass = unwritten == 0
+                    && act_ok
+                    && refc.decode_ok
+                    && refc.fail.is_none()
+                    && refc.bits_differ == 0;
                 println!(
                     "gemm case={} T={n_tok} routing={r:?} slots={n_slots} unwritten={unwritten} act_codes={} \
-                     decode_vs_ggml={} checked={} worst_err_over_band={:.3} gemv_max_rel_diff={diag} {}",
+                     decode_vs_ggml={} checked={} worst_err_over_band={:.3} contract_bits_differ={} \
+                     gemv_max_rel_diff={diag} y_fnv={:016x} {}",
                     st.name,
                     if act_ok { "same" } else { "DIFFER" },
                     if refc.decode_ok { "same" } else { "DIFFER" },
                     refc.checked,
                     refc.worst_ratio,
+                    refc.bits_differ,
+                    fnv(&y),
                     verdict(pass)
                 );
                 if let Some(f) = &refc.fail {
                     println!(
                         "gemm case={} T={n_tok} routing={r:?} first_failure: {f}",
+                        st.name
+                    );
+                }
+                if let Some(f) = &refc.bits_fail {
+                    println!(
+                        "gemm case={} T={n_tok} routing={r:?} first_contract_bits_failure: {f}",
                         st.name
                     );
                 }
@@ -1276,18 +1345,30 @@ mod gate {
             let (cols, tiles) = route.read_back(stream)?;
             let table_ok = cols.iter().enumerate().all(|(i, &s)| s as usize == i)
                 && tiles.len() == t.div_ceil(64);
-            let pass = unwritten == 0 && refc.decode_ok && refc.fail.is_none() && table_ok;
+            let pass = unwritten == 0
+                && refc.decode_ok
+                && refc.fail.is_none()
+                && refc.bits_differ == 0
+                && table_ok;
             println!(
                 "gemm case={} T={t} tiles={} identity_table={table_ok} unwritten={unwritten} \
-                 checked={} worst_err_over_band={:.3} {}",
+                 checked={} worst_err_over_band={:.3} contract_bits_differ={} y_fnv={:016x} {}",
                 st.name,
                 tiles.len(),
                 refc.checked,
                 refc.worst_ratio,
+                refc.bits_differ,
+                fnv(&got),
                 verdict(pass)
             );
             if let Some(f) = &refc.fail {
                 println!("gemm case={} T={t} first_failure: {f}", st.name);
+            }
+            if let Some(f) = &refc.bits_fail {
+                println!(
+                    "gemm case={} T={t} first_contract_bits_failure: {f}",
+                    st.name
+                );
             }
             ok &= pass;
         }
@@ -1793,6 +1874,22 @@ mod gate {
             };
             ok &= run_case(&dev, &st, 0x71)?;
         }
+        if wanted("q4k_ragged_rows_synth") {
+            // 400 rows an expert: three full 128-row slabs and one of 16, whose
+            // block has one warp over live rows and seven past them.
+            let (n_exp, rows, k) = (16usize, 400usize, 2048usize);
+            let syn = synthetic(GemmWeight::Q4K, n_exp * rows * k / 256, 0x5e6);
+            let st = Stack {
+                name: "q4k_ragged_rows_synth".into(),
+                ty: GemmWeight::Q4K,
+                bytes: syn.into(),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(4),
+            };
+            ok &= run_case(&dev, &st, 0x72)?;
+        }
         if wanted("router") {
             let t = qwen
                 .find("blk.0.ffn_gate_inp.weight")
@@ -1829,10 +1926,10 @@ mod gate {
             println!("gemm filter --case {f}: only the matching cases ran");
         }
         println!(
-            "PASSED: gate_gemm — every run inside its derived band of the f64 reference, every slot \
-             written, rerun and graph replay bit-identical, faults named; the route table the host's \
-             stable grouping bit for bit up to 32,768 slots; the ubatch router and the SwiGLU \
-             quantizer bit for bit their compositions"
+            "PASSED: gate_gemm — every run inside its derived band of the f64 reference and bit for bit \
+             the contract's transcription, every slot written, rerun and graph replay bit-identical, \
+             faults named; the route table the host's stable grouping bit for bit up to 32,768 slots; \
+             the ubatch router and the SwiGLU quantizer bit for bit their compositions"
         );
         Ok(())
     }

@@ -35,6 +35,20 @@
 # N >= 3, so that the control window is a replay. Each profile runs under BLOOMERY_ARM_BOUND
 # (seconds, default 900).
 #
+#
+# qwen3moe prefill (BLOOMERY_NSYS_FORM=prefill, `just nsys-gpu-qwen3moe-prefill 4096`): the timed prompt
+# of depth-qwen3moe.sh's `<P>` arm instead of a decode step. Each entry of BLOOMERY_NSYS_DEPTHS is a
+# prompt length P >= 9 (a GEMM ubatch runs); the profiled command is that arm's,
+# `generate_qwen3moe --tokens <lcg_prompt P> -n N --ctx C --mode M --time`, C as in the seed form. The
+# prompt runs as the plan's K units (at the default ubatch size 4096 and P <= 4096, one ubatch: K = 1),
+# each opening with one `embed_rows_q4k` launch, then the head; the N - 1 feedback steps are graph
+# replays, each opening with one. So the boundary count is K + N - 1, K read from the run's own `time
+# prompt ... passes=K` row, or no table; the prefill window runs from the first boundary to the
+# (K+1)-th — the prompt's launches and its head. Its table is per kernel over that window (launches,
+# total ms, share of the window's kernel sum), with the grouped GEMM entries summed, beside the
+# window's wall and the binary's `time prompt ms=` (that wall also holds the host work before the first
+# launch and the token's readback). N >= 2, so that a replay closes the window.
+#
 #   bash tools/ref/nsys-gpu.sh --analyze <out>.sqlite <depth> <n> [<out>.txt]   # tables again, no profile
 #   BLOOMERY_DRY=1 ...                                                          # command lines, no lease
 set -uo pipefail
@@ -45,14 +59,22 @@ set -uo pipefail
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 FORM=prompt
 [ "$MODEL_NAME" != qwen3moe ] || FORM=seed
-if [ "$FORM" = seed ]; then BIN=${BLOOMERY_GEN_BIN:-target/release/generate_qwen3moe}; else BIN=${BLOOMERY_GEN_BIN:-target/release/generate}; fi
+case ${BLOOMERY_NSYS_FORM:-} in
+  '') ;;
+  prefill)
+    [ "$MODEL_NAME" = qwen3moe ] || { echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM=prefill profiles generate_qwen3moe; the profile is '$MODEL_NAME'" >&2; exit 64; }
+    FORM=prefill
+    ;;
+  *) echo "nsys-gpu.sh: BLOOMERY_NSYS_FORM is prefill or unset, got '$BLOOMERY_NSYS_FORM'" >&2; exit 64 ;;
+esac
+if [ "$FORM" != prompt ]; then BIN=${BLOOMERY_GEN_BIN:-target/release/generate_qwen3moe}; else BIN=${BLOOMERY_GEN_BIN:-target/release/generate}; fi
 MARKER=${BLOOMERY_NSYS_MARKER:-embed_rows_q4k}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 DEPTH_N=${BLOOMERY_DECODE_N:-96}
 GEN_CTX=${BLOOMERY_GEN_CTX:-}
 DRY=${BLOOMERY_DRY:-}
 NSYS=${NSYS:-/usr/local/cuda/bin/nsys}
-DEPTHS=${BLOOMERY_NSYS_DEPTHS:-6 4096}
+if [ "$FORM" = prefill ]; then DEPTHS=${BLOOMERY_NSYS_DEPTHS:-4096}; else DEPTHS=${BLOOMERY_NSYS_DEPTHS:-6 4096}; fi
 MODE=${BLOOMERY_NSYS_MODE:-graph}
 # 디코드 스텝 수. 마지막 재생을 표로 내고, 그 앞 재생을 대조로 낸다.
 NGEN=${BLOOMERY_NSYS_N:-4}
@@ -71,7 +93,37 @@ ks = [(s, e, names.get(n, str(n)).split("(")[0], (gx, gy, gz)) for s, e, n, gx, 
 print(f"    커널 런치 전체 {len(ks)}개")
 from collections import Counter
 cnt = Counter(k[2] for k in ks)
-if form == "seed":
+if form == "prefill":
+    # The prompt's K units (ubatches, a tail pass), each opening with one marker launch, then n - 1
+    # graph replays, each opening with one. K is the run's own `time prompt ... passes=K`.
+    marker = sys.argv[7]
+    units = p_n = p_ms = None
+    try:
+        for line in open(runlog):
+            m = re.match(r"time prompt n=(\d+) ms=([0-9.]+) tok/s=\S+ passes=(\d+) kind=(\w+)", line)
+            if m:
+                p_n, p_ms, units = int(m.group(1)), float(m.group(2)), int(m.group(3))
+                print("    " + line.rstrip())
+            elif line.startswith(("load ", "capture ", "step 0 ")):
+                print("    " + line.rstrip())
+    except OSError:
+        pass
+    if units is None:
+        print(f"[boundary] no `time prompt n= ms= tok/s= passes= kind=` row in {runlog}: the unit count is unknown, no table")
+        raise SystemExit(3)
+    if p_n != depth:
+        print(f"[boundary] the run's prompt is n={p_n}, the profile asked for P={depth}: no table")
+        raise SystemExit(3)
+    replays = units + ngen - 1
+    bounds = [i for i, k in enumerate(ks) if k[2] == marker]
+    print(f"[boundary] kernel {marker}: {len(bounds)} launches, expected {units} prompt unit(s) + n - 1 replays = {replays} "
+          f"-> {'OK' if len(bounds) == replays else 'MISMATCH'}")
+    if len(bounds) != replays:
+        print("    most frequent names:")
+        for n, c in cnt.most_common(12):
+            print(f"      {c:7d}  {n}")
+        raise SystemExit(3)
+elif form == "seed":
     # One eager prefill pass for the seeded prompt's single id, then n - 1 graph replays.
     replays = ngen
     marker = sys.argv[7]
@@ -117,7 +169,28 @@ def report(label, w, per):
     for n, (s, c, g) in sorted(by.items(), key=lambda x: -x[1][0])[:top]:
         gs = " ".join("x".join(map(str, t)) for t in sorted(g)[:3])
         print(f"    {n[:40]:40s} {c:5d} {s:10.1f} {100 * s / (tot or 1):6.1f}% {s / c:9.2f}  {gs}")
-if form == "seed":
+if form == "prefill":
+    w = ks[bounds[0]:bounds[units]]
+    wall = (w[-1][1] - w[0][0]) / 1e6
+    tot = sum(e - s for s, e, _, _ in w) / 1e6
+    print(f"  [prefill window: P = {depth}, {units} unit(s) and the head] kernels {len(w)}  first-to-last {wall:.3f} ms  "
+          f"kernel sum {tot:.3f} ms  gaps {wall - tot:.3f} ms  time prompt ms={p_ms:.3f} (outside the window {p_ms - wall:.3f} ms)")
+    by = {}
+    for s, e, n, g in w:
+        d_ = by.setdefault(n, [0.0, 0, set()])
+        d_[0] += (e - s) / 1e6; d_[1] += 1; d_[2].add(g)
+    gemm = sum(v[0] for n, v in by.items() if re.fullmatch(r"gemm_q\dk", n))
+    print(f"    grouped GEMM (gemm_q*k) {gemm:.3f} ms: {100 * gemm / (tot or 1):.1f} % of the kernel sum, "
+          f"{100 * gemm / (wall or 1):.1f} % of the window, {100 * gemm / p_ms:.1f} % of time prompt")
+    print(f"    {'kernel':40s} {'launches':>8s} {'total ms':>10s} {'% sum':>7s} {'mean ms':>9s}  grids")
+    for n, (s, c, g) in sorted(by.items(), key=lambda x: -x[1][0])[:top]:
+        gs = " ".join("x".join(map(str, t)) for t in sorted(g)[:3])
+        print(f"    {n[:40]:40s} {c:8d} {s:10.3f} {100 * s / (tot or 1):6.1f}% {s / c:9.4f}  {gs}")
+    r = replays - 1
+    last = window(r)
+    print(f"  [control: replay {r - units + 1} of {ngen - 1}, the last decode step] kernels {len(last)}  "
+          f"first-to-last {(last[-1][1] - last[0][0]) / 1e3:.1f} µs  kernel sum {sum(e - s for s, e, _, _ in last) / 1e3:.1f} µs")
+elif form == "seed":
     # The run's own lines: `time step i` is window i; window 0 is the prefill pass.
     timed = {}
     try:
@@ -165,7 +238,20 @@ if [ "$FORM" = seed ]; then
     *[!0-9]* | 0) echo "nsys-gpu.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
   esac
 fi
-# The profiled command for depth $1 (the prompt form's ids: $2), into CMD and CTX.
+if [ "$FORM" = prefill ]; then
+  for d in $DEPTHS; do
+    case $d in
+      '' | *[!0-9]* | [0-8]) echo "nsys-gpu.sh: prompt length '$d' is an integer >= 9 in the prefill form (a GEMM ubatch runs)" >&2; exit 64 ;;
+    esac
+  done
+  case $NGEN in
+    '' | *[!0-9]* | [01]) echo "nsys-gpu.sh: BLOOMERY_NSYS_N is at least 2 in the prefill form (a replay closes the window), got '$NGEN'" >&2; exit 64 ;;
+  esac
+  case $GEN_CTX in
+    *[!0-9]* | 0) echo "nsys-gpu.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
+  esac
+fi
+# The profiled command for depth $1 (the prompt and prefill forms' ids: $2), into CMD and CTX.
 profile_cmd() {
   local d=$1 ids=${2:-}
   if [ "$FORM" = seed ]; then
@@ -173,6 +259,11 @@ profile_cmd() {
     CMD=(timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
          --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
          "$BIN" --seed-depth "$d" -n "$NGEN" --ctx "$CTX" --mode "$MODE" --time)
+  elif [ "$FORM" = prefill ]; then
+    CTX=${GEN_CTX:-$(((d + DEPTH_N + 255) / 256 * 256))}
+    CMD=(timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
+         --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
+         "$BIN" --tokens "$ids" -n "$NGEN" --ctx "$CTX" --mode "$MODE" --time)
   else
     CTX=$((d + 128))
     CMD=("$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
@@ -195,6 +286,9 @@ if [ -n "$DRY" ]; then
     if [ "$FORM" = seed ]; then
       echo "[dry] depth $d: ctx $CTX, windows expected $NGEN (1 prefill pass + $((NGEN - 1)) replays), boundary $MARKER"
       echo "[dry] depth $d: ${CMD[*]}"
+    elif [ "$FORM" = prefill ]; then
+      echo "[dry] prompt $d: ctx $CTX, boundaries expected K + $((NGEN - 1)) (K = the run's time prompt passes=), boundary $MARKER"
+      echo "[dry] prompt $d: ${CMD[*]}"
     else
       echo "[dry] depth $d: ctx $CTX, replays expected $((d + NGEN - 1))"
       echo "[dry] depth $d: ${CMD[*]}"
@@ -212,6 +306,7 @@ WITNESS=(head-open indent card model)
 lease_take
 echo "[config] nsys=$($NSYS --version) mode=$MODE n=$NGEN depths='$DEPTHS' out=$OUTDIR"
 [ "$FORM" != seed ] || echo "[config] form=seed bin=$BIN boundary=$MARKER ctx=${GEN_CTX:-D+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
+[ "$FORM" != prefill ] || echo "[config] form=prefill bin=$BIN boundary=$MARKER ctx=${GEN_CTX:-P+$DEPTH_N rounded up to 256} bound=${BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU"
 witness pre
 
 rc_all=0
@@ -221,6 +316,12 @@ for d in $DEPTHS; do
     profile_cmd "$d"
     echo
     echo "=== depth $d (ctx $CTX, mode $MODE, 1 prefill pass + $((NGEN - 1)) replays expected) -> $out.nsys-rep"
+    guard_other
+  elif [ "$FORM" = prefill ]; then
+    out="$OUTDIR/nsys-qwen3moe-pp${d}-n${NGEN}-${MODE}-$(date -u +%H%M%S)"
+    profile_cmd "$d" "$(lcg_prompt "$d")"
+    echo
+    echo "=== prompt $d (ctx $CTX, mode $MODE, the prompt's units + $((NGEN - 1)) replays expected) -> $out.nsys-rep"
     guard_other
   else
     out="$OUTDIR/nsys-d${d}-${MODE}-$(date -u +%H%M%S)"
