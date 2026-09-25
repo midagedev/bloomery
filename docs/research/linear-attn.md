@@ -33,7 +33,7 @@ Trees read (on the box, read-only):
    (`ggml/src/ggml-cuda/kda.cu:128-130 @ IK` vs `delta-net.cu:128 @ IK`). The survey's open hypothesis
    (`models-survey.md` §6, "that they can share one kernel is a hypothesis") is answered: yes, with the
    gate granularity as a const generic.
-2. **Neither reference has a chunked CUDA kernel.** Mainline's launcher carries
+2. ~~**Neither reference has a chunked CUDA kernel.**~~ Corrected 2026-09-25 (qwennext-lit): mistral.rs has one (`mistralrs-core/src/cuda/gdn.cu:909`), exllamav3 uses FLA's chunked form, and mainline has PRs #26001 and #29353 open. Original text: Mainline's launcher carries
    `//TODO: Add chunked kernel for even faster pre-fill` (`gated_delta_net.cu:180 @ LCF`): prefill runs the
    same recurrent kernel with the token loop inside it (`:63`), or, with the fused op off, a graph of ggml
    ops (`src/models/delta-net-base.cpp:16-287 @ LCF`). IK's kernel also loops tokens (`delta-net.cu:117
@@ -238,7 +238,7 @@ kernel change moves it by that much.
 - **Recurrent-in-kernel** (both references): one launch walks the tokens with S in registers
   (`gated_delta_net.cu:63-158 @ LCF`; `delta-net.cu:117-177 @ IK`). The state is read and written once
   per launch, not per token; the cost is the serial token loop. Per token a warp does two dependent
-  32-lane reductions (`gated_delta_net.cu:93, 107`); at an assumed 0.2–0.4 µs per token that is
+  32-lane reductions (`gated_delta_net.cu:93, 107`); at ~~an assumed 0.2–0.4 µs per token~~ (corrected 2026-09-25, qwennext-lit: the public PR #29353 numbers give a lower bound of 1.44 µs per token per layer on a 3090, 5–7× this assumption, so the recurrence is ≈ 22 ms of a 512-ubatch, not "a few percent") that is
   0.8–1.6 ms per layer for a 4,096-token prompt, 25–50 ms over 30 layers [derived, the per-token latency
   is an assumption — §7 Q4 measures it]. The projections and experts for the same prompt are
   2 · 2.95e9 · 4096 ≈ 24 TFLOP [derived] — hundreds of milliseconds on either card. The recurrent loop is a
