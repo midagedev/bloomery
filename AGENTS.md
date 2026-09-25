@@ -331,8 +331,10 @@ first suspect is a hung gate on the box, not the agent.
   `body/ced.rs`; `BLOOMERY_CED=off` is its same-binary arm — predicted +2…+7 % at P = 512 and
   +35…+54 % at P = 4096 over the `off` arm [derived], ~~measured at the wave boundary~~ measured
   the same evening on `e4d0aae` (h1fold, unionreal, CED, oxcpu): pp512 **109.9**, pp4096 **152.8**
-  (CED off 104.7 / 102.6, so +5.0 % / +49 %; llama.cpp 77.6 / 76.2 in the same lease; rig-log
-  09-25#v41-prefill-resit).
+  (CED off 104.7 / 102.6, so +5.0 % / +49 %; ~~llama.cpp 77.6 / 76.2 in the same lease~~ the same
+  lease's reference rows read the file cold after our arms — llama.cpp's clean values are the
+  morning's 104.6 / 103.8, so ours is 1.05× / 1.47×; host union 76.1 ms/layer at 512 columns,
+  31.5 µs/slot; rig-log 09-25#v41-prefill-resit, #v41-prefill-resit-b).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
