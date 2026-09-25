@@ -5,7 +5,8 @@
 //! 1. Embedding: `embed_rows_q4k` against `gguf::quant::dequant_row` on the
 //!    same rows, bit for bit, for ids 0, 1, the last row and 61 spread
 //!    between them; then every oracle set's `inp_embd` from its `inp_tokens`
-//!    (ik's GET_ROWS through the same dequantizer), bit for bit.
+//!    (ik's GET_ROWS through the same dequantizer), bit for bit; an id past
+//!    the table raises `FaultSite::TokenId`, the other rows unchanged.
 //! 2. Gate·up body: for a sel vector with a repeated id, slot `s` equals
 //!    `q4k_gemv` of expert `sel[s]`'s gate rows and up rows alone, combined
 //!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; an id past
@@ -51,7 +52,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::experts::{ExpertKernels, GateUpArgs};
-    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
@@ -185,7 +186,25 @@ mod gate {
             "graph op=embed_rows_q4k eager_vs_graph_bit_identical={g_same} graph_nodes={nodes} {}",
             verdict(pass)
         );
-        Ok(ok && pass)
+        // An id past the table: the named fault; the other rows unchanged.
+        let clean = gpu.take_fault()?;
+        let bad_ids = [ids[3], n_rows as u32 + 3, ids[4]];
+        let y = run(&bad_ids)?;
+        let fault = gpu.take_fault()?;
+        let want_fault = Fault {
+            layer: LAYER_NONE,
+            code: FaultSite::TokenId as u32,
+        };
+        let others = bits_equal(&y[..k], &got[3 * k..4 * k])
+            && bits_equal(&y[2 * k..3 * k], &got[4 * k..5 * k]);
+        let oor_ok = clean.is_none() && fault == Some(want_fault) && others;
+        println!(
+            "embed Q4_K id past the table ids={bad_ids:?}: word_before={clean:?} fault=\"{}\" \
+             (want \"{want_fault}\") other_rows_bit_identical={others} {}",
+            fault.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            verdict(oor_ok)
+        );
+        Ok(ok && pass && oor_ok)
     }
 
     // ---------------------------------------------------- 2. gate·up body

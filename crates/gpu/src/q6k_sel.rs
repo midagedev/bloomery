@@ -15,10 +15,11 @@
 //! super-block count serves, odd ones included (a 768-value row is 630
 //! bytes and every other row starts at 2 mod 4).
 
-use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q6k_chain, q6k_dequant, q6k_sub_scale};
-use crate::launch_u32;
+use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
+use crate::hybrid::HOST;
 use crate::tensor::{DeviceTensor, Q8Act};
+use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
@@ -34,7 +35,9 @@ mod q6k_sel_kernels {
     /// rows_per_expert + r` (`210 · n_sb` bytes at byte `row · 210 · n_sb` of
     /// the stack) against q8_1 column `slot` in the q6 permutation. An id
     /// `>= n_experts` returns the slot's warps before their first weight
-    /// load (warp-uniform), leaving that slot of `y` untouched.
+    /// load (warp-uniform), leaving that slot of `y` untouched; one that is
+    /// not [`HOST`] (a slot the host tier serves, skipped by contract)
+    /// raises [`FaultSite::ExpertId`] on `fault` first.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -62,6 +65,7 @@ mod q6k_sel_kernels {
         n_slots: u32,
         n_sb: u32,
         iters: u32,
+        fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -72,12 +76,15 @@ mod q6k_sel_kernels {
         let slot = row / rows_per_expert as usize;
         // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
         // load is warp-uniform (all 32 lanes share `row`, hence `slot`).
-        let id = unsafe { *sel.get_unchecked(slot) } as usize;
-        if id >= n_experts as usize {
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
             return;
         }
-        let row_abs = id * rows_per_expert as usize + row % rows_per_expert as usize;
-        let lane = warp::lane_id() as usize;
+        let row_abs = id as usize * rows_per_expert as usize + row % rows_per_expert as usize;
         let n_sb = n_sb as usize;
         let row_bytes = 210 * n_sb;
         let q_col = 128 * iters as usize;
@@ -201,15 +208,23 @@ mod q6k_sel_kernels {
 /// the engine stream.
 pub struct Q6kSelKernels {
     module: q6k_sel_kernels::LoadedModule,
+    /// The fault word of the `Gpu` that owns the context.
+    fault: Arc<DeviceBuffer<u32>>,
 }
 
 impl Q6kSelKernels {
-    /// Load this file's device bundle into `ctx`. Load-time only.
-    pub fn load(ctx: &Arc<CudaContext>) -> Result<Q6kSelKernels, GpuError> {
+    /// Load this file's device bundle into `ctx`, raising into `word`, the
+    /// fault word of the `Gpu` that owns `ctx` ([`crate::Gpu::fault_word`]);
+    /// a word of another context is refused. Load-time only.
+    pub fn load(
+        ctx: &Arc<CudaContext>,
+        word: &Arc<DeviceBuffer<u32>>,
+    ) -> Result<Q6kSelKernels, GpuError> {
+        let fault = crate::module_fault_word(ctx, word, "Q6kSelKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { q6k_sel_kernels::load(ctx)? };
-        Ok(Q6kSelKernels { module })
+        Ok(Q6kSelKernels { module, fault })
     }
 
     /// Enqueue the device-indirect MoE down projection for a Q6_K expert
@@ -218,8 +233,10 @@ impl Q6kSelKernels {
     /// stack as its byte stream in u32 words (`w.rows()` rows, a positive
     /// multiple of `rows_per_expert`, row `r` at byte `r · 210 · n_sb`, the
     /// tail zero-padded); `act` holds exactly `n_slots` columns. An id
-    /// `>= n_experts` leaves its slot of `y` untouched. Asynchronous,
-    /// allocation-free, capturable.
+    /// `>= n_experts` leaves its slot of `y` untouched, and one that is not
+    /// [`HOST`] raises [`FaultSite::ExpertId`] on the owning `Gpu`'s fault
+    /// word as an unlabelled launch ([`LAYER_NONE`]: the launcher knows no
+    /// layer). Asynchronous, allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher, the shape of enqueue_gemv_q4k_sel"
@@ -308,6 +325,7 @@ impl Q6kSelKernels {
             n_slots,
             n_sb,
             n_sb.div_ceil(2),
+            crate::sink_over(&self.fault, LAYER_NONE),
             y,
         )?;
         Ok(())

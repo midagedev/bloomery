@@ -1362,6 +1362,17 @@ fn hw_slot_action_errors() {
         "Invalid action",
     );
     assert_error(&bad(addr, "/slots/0", None), 400, e400, "Invalid action");
+    // The query string is percent-decoded: `er%61se` is `erase`, and a broken
+    // escape is refused by name.
+    let r = bad(addr, "/slots/0?action=er%61se", None);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json(), json!({"id_slot": 0, "n_erased": 0}));
+    assert_error(
+        &bad(addr, "/slots/0?action=%zz", None),
+        400,
+        e400,
+        "percent-encoding",
+    );
     assert_error(
         &bad(addr, "/slots/0?action=save", Some("{}")),
         400,

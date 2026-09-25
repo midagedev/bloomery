@@ -14,7 +14,9 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 pub(crate) struct Request {
     pub method: String,
     pub path: String,
-    pub query: String,
+    /// The query string's `key=value` pairs, percent-decoded (`+` is a
+    /// space), in order; a key with no `=` has the empty value.
+    pub query: Vec<(String, String)>,
     pub http10: bool,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -31,19 +33,57 @@ impl Request {
 
     /// Whether the query string carries `key` (with or without a value).
     pub(crate) fn has_query(&self, key: &str) -> bool {
-        self.query
-            .split('&')
-            .any(|kv| kv.split('=').next() == Some(key))
+        self.query.iter().any(|(k, _)| k == key)
     }
 
-    /// The value of the first `key=value` in the query string, as written
-    /// (no percent-decoding); `key` with no `=` reads as the empty value.
+    /// The decoded value of the first `key=value` in the query string; `key`
+    /// with no `=` reads as the empty value.
     pub(crate) fn query_value(&self, key: &str) -> Option<&str> {
-        self.query.split('&').find_map(|kv| {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (k == key).then_some(v)
-        })
+        self.query
+            .iter()
+            .find_map(|(k, v)| (k == key).then_some(v.as_str()))
     }
+}
+
+/// The pairs of a query string, each side percent-decoded as a form field
+/// (`+` is a space, `%XY` the byte `0xXY`). A `%` not followed by two hex
+/// digits, or bytes that decode to no UTF-8, is refused by name.
+fn parse_query(query: &str) -> io::Result<Vec<(String, String)>> {
+    query
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            Ok((percent_decode(k)?, percent_decode(v)?))
+        })
+        .collect()
+}
+
+/// One side of a query pair, decoded ([`parse_query`]).
+fn percent_decode(s: &str) -> io::Result<String> {
+    let hex = |b: u8| char::from(b).to_digit(16);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let (hi, lo) = match (bytes.get(i + 1), bytes.get(i + 2)) {
+                    (Some(&h), Some(&l)) => (hex(h), hex(l)),
+                    _ => (None, None),
+                };
+                let (Some(hi), Some(lo)) = (hi, lo) else {
+                    return Err(bad("malformed percent-encoding in the query string"));
+                };
+                out.push(u8::try_from(hi * 16 + lo).expect("two hex digits fit a byte"));
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).map_err(|_| bad("the query string decodes to no UTF-8"))
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -108,7 +148,7 @@ pub(crate) fn read_request(
     let mut req = Request {
         method: method.to_owned(),
         path: path.to_owned(),
-        query: query.to_owned(),
+        query: parse_query(query)?,
         http10,
         headers,
         body: Vec::new(),
@@ -273,5 +313,29 @@ impl<'a> EventStream<'a> {
     /// Whether the connection can carry another request afterwards.
     pub(crate) fn reusable(&self) -> bool {
         self.chunked
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_query;
+
+    /// `%2F` decodes to `/`, `+` to a space, in keys and values alike; a key
+    /// with no `=` has the empty value; a broken escape is an error.
+    #[test]
+    fn query_pairs_are_percent_decoded() {
+        let q = parse_query("action=a%2Fb+c&fail%5Fon%5Fno%5Fslot&x=%7e").expect("a valid query");
+        assert_eq!(
+            q,
+            [
+                ("action".to_owned(), "a/b c".to_owned()),
+                ("fail_on_no_slot".to_owned(), String::new()),
+                ("x".to_owned(), "~".to_owned()),
+            ]
+        );
+        assert!(parse_query("").expect("the empty query").is_empty());
+        for broken in ["a=%2", "a=%zz", "a=%", "a=%ff"] {
+            assert!(parse_query(broken).is_err(), "{broken} was accepted");
+        }
     }
 }

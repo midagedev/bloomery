@@ -19,8 +19,9 @@
 # Arms, in lease order (the order rotates by one slot each round — the position bias ab-decode.sh
 # names):
 #   <D>       ours, D >= 1: generate_qwen3moe --tokens <lcg_prompt D> -n N --ctx C --time. The D
-#             fed ids are prefilled untimed, eight positions per pass (Qwen3moeModel::prefill; the
-#             `step 0` line names the passes), from lease.sh's lcg_prompt: 100000, then ids in
+#             fed ids are prefilled untimed (Qwen3moeModel::prefill: D >= 9 in ubatches of up to 512
+#             through the grouped GEMM, a tail of at most 8 and a D <= 8 as one pass; the `step 0`
+#             line's `plan=` names the units), from lease.sh's lcg_prompt: 100000, then ids in
 #             [1000, 91000), all inside this vocabulary; generated token 0 comes out of the last
 #             pass and the N - 1 steps after it are timed. C is D + N rounded up to 256: both
 #             llama-benches size n_ctx to D + N for this test and pad it to 256 under flash
@@ -133,10 +134,10 @@
 #
 # Prefill. pp_tok/s is P over the wall of processing a P-token prompt, in each engine's terms:
 #   ours      generate_qwen3moe's `time prompt` row: the wall of Qwen3moeModel::prefill through the
-#             readback of its token, MAX_TOKENS (8) positions per pass, `passes` the passes. The
-#             first prefill call allocates the prefill arena inside that wall, and every arm is a
-#             fresh process, so each row carries that allocation. The arm's cache height is C
-#             (D + N rounded up to 256), not P.
+#             readback of its token — P >= 9 in ubatches of up to 512 through the grouped GEMM
+#             (`kind=gemm`), a P <= 8 as one pass (`kind=prefill`), `passes` the units. The prefill
+#             buffers are allocated at load, so the wall carries no allocation. The arm's cache
+#             height is C (D + N rounded up to 256), not P.
 #   ik, lcpp  llama-bench's pp test: llama_decode over the P ids in batches of -b and ubatches of
 #             -ub, then one synchronize (test_prompt), one repetition, llama-bench's own value, at
 #             n_ctx = P padded to 256. Both trees default to -ub 512 -b 2048; the row names them.
@@ -448,9 +449,10 @@ count_row() {
 }
 
 # parse_pp: the `time prompt n=<P> ms=<ms> tok/s=<v> passes=<K> kind=<k>` row of a generate_qwen3moe
-# run on stdin, as `<P> <v> <K> <k>`; nothing when the run printed none (a base tree's build).
+# run on stdin, as `<P> <v> <K> <k>`; fields after `kind=` are allowed and dropped; nothing when the
+# run printed none (a base tree's build).
 parse_pp() {
-  sed -nE 's/^time prompt n=([0-9]+) ms=[0-9.]+ tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)$/\1 \2 \3 \4/p' | head -n 1
+  sed -nE 's/^time prompt n=([0-9]+) ms=[0-9.]+ tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)( .*)?$/\1 \2 \3 \4/p' | head -n 1
 }
 
 # pp_col <arm kind> <what> <output>: an ours or bin arm's prefill column from its run's output, into

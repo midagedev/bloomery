@@ -74,7 +74,7 @@ fn run() -> Result<(), GateError> {
     let mut ok = true;
     let gguf = open_model()?;
     let gpu = Gpu::new()?;
-    let elem = ElemKernels::load(gpu.context())?;
+    let elem = ElemKernels::load(gpu.context(), gpu.fault_word())?;
     let stream = gpu.stream();
     let man = RefManifest::read(&ref_dir())?;
 

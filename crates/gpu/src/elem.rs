@@ -18,7 +18,7 @@
 
 use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale, q4k_scale_min};
-use crate::fault::FaultSink;
+use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -321,9 +321,9 @@ mod elem_kernels {
     /// Dequantize `ids.len()` rows of the Q3_K embedding table `w` (220 u32
     /// words per row, 2048 values) into `y`, token-major. Ids live on the
     /// device, so their validity cannot be host-checked: an id past the
-    /// table's `n_rows` rows reads row 0 — deterministic and in-bounds, never
-    /// an out-of-bounds read — and the step's id source is the argmax, below
-    /// the vocabulary by construction.
+    /// table's `n_rows` rows raises [`FaultSite::TokenId`] on `fault` and
+    /// reads row 0 only so the access stays in bounds — that row is no output
+    /// a caller trusts, the step's readback turns the fault into an error.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -331,7 +331,13 @@ mod elem_kernels {
         block = (256, 1, 1),
         requires = (4 * w.len() >= 880 * n_rows, y.len() >= 2048 * ids.len())
     )]
-    pub fn embed_rows(w: &[u32], ids: &[u32], n_rows: u32, mut y: DisjointSlice<f32>) {
+    pub fn embed_rows(
+        w: &[u32],
+        ids: &[u32],
+        n_rows: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
         let i = thread::index_1d().get();
         if i >= ids.len() * 2048 {
             return;
@@ -340,7 +346,14 @@ mod elem_kernels {
         let k = i & 2047;
         // SAFETY: t < ids.len() by the guard.
         let id = unsafe { *ids.get_unchecked(t) };
-        let id = (if id < n_rows { id } else { 0 }) as usize;
+        let id = if id < n_rows {
+            id as usize
+        } else {
+            if k == 0 {
+                fault.raise(FaultSite::TokenId);
+            }
+            0
+        };
         // Row spans are whole 880-byte blocks, so only the super-block offset
         // can sit 2 mod 4; the core funnels both alignments.
         let v = q3k_embed_value(w, id * 880 + ((k >> 8) * 110), k & 255);
@@ -354,7 +367,8 @@ mod elem_kernels {
     /// n_sb` u32 words per row, `256 · n_sb` values) into `y`, token-major,
     /// one thread per value through [`q4k_embed_value`]. Q4_K rows are whole
     /// words, so no funnel is needed. An id past the table's `n_rows` rows
-    /// reads row 0, as `embed_rows` does.
+    /// raises [`FaultSite::TokenId`] and reads row 0 in bounds, as
+    /// `embed_rows` does.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -370,6 +384,7 @@ mod elem_kernels {
         ids: &[u32],
         n_rows: u32,
         n_sb: u32,
+        fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
         let i = thread::index_1d().get();
@@ -381,7 +396,14 @@ mod elem_kernels {
         let k = i % width;
         // SAFETY: t < ids.len() by the guard.
         let id = unsafe { *ids.get_unchecked(t) };
-        let id = (if id < n_rows { id } else { 0 }) as usize;
+        let id = if id < n_rows {
+            id as usize
+        } else {
+            if k == 0 {
+                fault.raise(FaultSite::TokenId);
+            }
+            0
+        };
         let wk = (id * n_sb as usize + (k >> 8)) * 36;
         let v = q4k_embed_value(w, wk, k & 255);
         // SAFETY: i < ids.len() * width <= y.len() by the launch contract.
@@ -840,22 +862,33 @@ mod elem_kernels {
 /// with the rest of the step and are capturable.
 pub struct ElemKernels {
     module: elem_kernels::LoadedModule,
+    /// The fault word of the `Gpu` that owns the context: what an embedding
+    /// id past the table raises into.
+    fault: Arc<DeviceBuffer<u32>>,
 }
 
 impl ElemKernels {
-    /// Load this file's device bundle into `ctx`. Load-time only.
-    pub fn load(ctx: &Arc<CudaContext>) -> Result<ElemKernels, GpuError> {
+    /// Load this file's device bundle into `ctx`, raising into `word`, the
+    /// fault word of the `Gpu` that owns `ctx` ([`crate::Gpu::fault_word`]);
+    /// a word of another context is refused. Load-time only.
+    pub fn load(
+        ctx: &Arc<CudaContext>,
+        word: &Arc<DeviceBuffer<u32>>,
+    ) -> Result<ElemKernels, GpuError> {
+        let fault = crate::module_fault_word(ctx, word, "ElemKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let module = unsafe { elem_kernels::load(ctx)? };
-        Ok(ElemKernels { module })
+        Ok(ElemKernels { module, fault })
     }
 
     /// Enqueue the embedding lookup: `ids` (device-resident token ids, every
     /// id below the table's row count) each select one Q3_K row of `w` (220
     /// u32 words per row), dequantized to 2048 f32. `y` holds `2048 *
     /// ids.len()` f32, token-major. Bit-identical to
-    /// `gguf::quant::dequant_row` on the same row bytes. Asynchronous,
+    /// `gguf::quant::dequant_row` on the same row bytes. An id past the
+    /// table raises [`FaultSite::TokenId`] on the owning `Gpu`'s fault word
+    /// as an unlabelled launch ([`LAYER_NONE`]). Asynchronous,
     /// allocation-free, capturable.
     pub fn enqueue_embed_rows(
         &self,
@@ -889,8 +922,9 @@ impl ElemKernels {
         let prep = self
             .module
             .prepare_embed_rows(LaunchConfig1D::new(grid, 256, 0))?;
+        let fault = crate::sink_over(&self.fault, LAYER_NONE);
         self.module
-            .embed_rows(stream, &prep, w.buf(), ids, n_rows, y)?;
+            .embed_rows(stream, &prep, w.buf(), ids, n_rows, fault, y)?;
         Ok(())
     }
 
@@ -898,7 +932,9 @@ impl ElemKernels {
     /// each select one row of `w` (`36 · n_sb` u32 words per row, `256 ·
     /// n_sb` values, `n_sb = w.cols() / 36`), dequantized into `y`
     /// token-major. Bit-identical to `gguf::quant::dequant_row` on the same
-    /// row bytes. Asynchronous, allocation-free, capturable.
+    /// row bytes. An id past the table raises [`FaultSite::TokenId`] as
+    /// [`Self::enqueue_embed_rows`] does. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_embed_rows_q4k(
         &self,
         stream: &CudaStream,
@@ -933,8 +969,9 @@ impl ElemKernels {
         let prep = self
             .module
             .prepare_embed_rows_q4k(LaunchConfig1D::new(grid, 256, 0))?;
+        let fault = crate::sink_over(&self.fault, LAYER_NONE);
         self.module
-            .embed_rows_q4k(stream, &prep, w.buf(), ids, n_rows, n_sb, y)?;
+            .embed_rows_q4k(stream, &prep, w.buf(), ids, n_rows, n_sb, fault, y)?;
         Ok(())
     }
 

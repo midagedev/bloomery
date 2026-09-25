@@ -324,7 +324,7 @@ fn serve_conn(state: &State, stream: TcpStream) {
                 let req = Request {
                     method: String::new(),
                     path: String::new(),
-                    query: String::new(),
+                    query: Vec::new(),
                     http10: false,
                     headers: Vec::new(),
                     body: Vec::new(),

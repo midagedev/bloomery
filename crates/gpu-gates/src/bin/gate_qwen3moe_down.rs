@@ -63,7 +63,7 @@ mod gate {
     };
     use bloomery_gpu::q4k_sel::Q4kSelKernels;
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
-    use bloomery_gpu::{DeviceTensor, Fault, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::qwen3moe::{q4k_parts, sets};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
@@ -309,8 +309,8 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let gguf = open_model()?;
         let gpu = Gpu::new()?;
-        let q6 = Q6kSelKernels::load(gpu.context())?;
-        let q4 = Q4kSelKernels::load(gpu.context())?;
+        let q6 = Q6kSelKernels::load(gpu.context(), gpu.fault_word())?;
+        let q4 = Q4kSelKernels::load(gpu.context(), gpu.fault_word())?;
         let stream = gpu.stream();
         println!("gate_qwen3moe_down: device {}", gpu.device_name()?);
         let mut ok = true;
@@ -350,15 +350,28 @@ mod gate {
         q6.enqueue_gemv_q6k_sel(stream, &stack, &act, &sel_oor, 4, rpe, &mut y)?;
         stream.synchronize()?;
         let yo = y.to_host_vec(stream)?;
+        // Id 4 is past the stack and raises the named fault; u32::MAX is a
+        // host-served slot and raises nothing. Taking the word here also
+        // leaves it clean for the head's fault-word case below.
+        let fault = gpu.take_fault()?;
+        let want_fault = Fault {
+            layer: LAYER_NONE,
+            code: FaultSite::ExpertId as u32,
+        };
         let untouched = |s: usize| {
             yo[s * rpe..(s + 1) * rpe]
                 .iter()
                 .all(|v| v.to_bits() == SENT.to_bits())
         };
-        let oor_ok = untouched(1) && untouched(3) && !untouched(0) && !untouched(2);
+        let oor_ok = untouched(1)
+            && untouched(3)
+            && !untouched(0)
+            && !untouched(2)
+            && fault == Some(want_fault);
         body_ok &= oor_ok;
         println!(
-            "body output.weight K={k_out} as 4x{rpe}: rerun and slots vs q6k_gemv, ids 4 and u32::MAX untouched={oor_ok} {}",
+            "body output.weight K={k_out} as 4x{rpe}: rerun and slots vs q6k_gemv, ids 4 and u32::MAX untouched, \
+             fault={fault:?} (want expert_id at id 4)={oor_ok} {}",
             verdict(body_ok)
         );
         ok &= body_ok;

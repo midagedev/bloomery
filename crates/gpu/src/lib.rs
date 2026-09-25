@@ -1690,7 +1690,9 @@ mod kernels {
     /// An id >= n_experts cannot be rejected by the host contract (it
     /// lives in device memory): the slot's warps return before their first
     /// load — warp-uniform, no divergent branch — leaving that slot of `y`
-    /// untouched and every other slot unaffected.
+    /// untouched and every other slot unaffected. [`hybrid::HOST`] is a slot
+    /// the host tier serves, skipped by contract; any other id past the stack
+    /// raises [`FaultSite::ExpertId`] on `fault` first.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -1718,6 +1720,7 @@ mod kernels {
         n_slots: u32,
         n_sb: u32,
         iters: u32,
+        fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -1729,12 +1732,16 @@ mod kernels {
         // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
         // load is warp-uniform (all 32 lanes of the warp share `row`, hence
         // `slot`), so the out-of-range return below never diverges a warp.
-        let id = unsafe { *sel.get_unchecked(slot) } as usize;
-        if id >= n_experts as usize {
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != hybrid::HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
             return;
         }
+        let id = id as usize;
         let row_abs = id * rows_per_expert as usize + row % rows_per_expert as usize;
-        let lane = warp::lane_id() as usize;
         // The m = 1 per-row body is `cores::q3k_row_dot`, shared with
         // `q3k_gemv` and the fused block kernels.
         let f = q3k_row_dot(w, q, d8, n_sb as usize, iters, row_abs, 0, 1, lane);
@@ -1786,8 +1793,40 @@ pub struct Gpu {
     moe_fused: moe_fused::MoeFusedKernels,
     /// The fault word (crate::fault): the allocation's first u32,
     /// [`FAULT_NONE`] while clean. Every launch on this context's stream that
-    /// can refuse its input carries a [`FaultSink`] over it.
-    fault: DeviceBuffer<u32>,
+    /// can refuse its input carries a [`FaultSink`] over it. Shared with the
+    /// modules given it at load ([`Gpu::fault_word`]), which keep it alive
+    /// while they can launch.
+    fault: Arc<DeviceBuffer<u32>>,
+}
+
+/// The sink over a `Gpu`'s fault word ([`Gpu::fault_word`]), for launches
+/// of `layer`.
+#[must_use]
+pub(crate) fn sink_over(word: &Arc<DeviceBuffer<u32>>, layer: u32) -> FaultSink {
+    // SAFETY: `word` holds at least one device u32 of the context the
+    // holder's launches run in ([`module_fault_word`] checks both at load);
+    // the holder keeps the Arc, so the word stays allocated while any of its
+    // launches can run (its drop synchronizes the context first), and a
+    // graph drops before the buffers it addresses.
+    unsafe { FaultSink::new(word.cu_deviceptr() as *mut u32, layer) }
+}
+
+/// A kernel module's handle on the fault word it is loaded with: `word`
+/// shared, after checking that it is a buffer of `ctx` (the context the
+/// module's launches run in) holding at least one u32. Anything else is
+/// refused by `what`'s name.
+pub(crate) fn module_fault_word(
+    ctx: &Arc<CudaContext>,
+    word: &Arc<DeviceBuffer<u32>>,
+    what: &'static str,
+) -> Result<Arc<DeviceBuffer<u32>>, GpuError> {
+    if word.is_empty() || !Arc::ptr_eq(word.context(), ctx) {
+        return Err(GpuError::state(
+            what,
+            "the fault word of the Gpu that owns this context (Gpu::fault_word)",
+        ));
+    }
+    Ok(Arc::clone(word))
 }
 
 /// The fault word's allocation, in u32s: one whole 2 MiB allocation granule.
@@ -1809,20 +1848,25 @@ impl Gpu {
     pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
         let ctx = CudaContext::new(device)?;
         let stream = ctx.new_stream()?;
+        // First: the modules below that raise are given it at load.
+        let fault = Arc::new(DeviceBuffer::from_host(
+            &stream,
+            &vec![FAULT_NONE; FAULT_ALLOC_WORDS],
+        )?);
         // SAFETY: this package owns the embedded device bundle produced for
         // the kernels module above; every launcher checks its launch
         // contract before launching.
         let module = unsafe { kernels::load(&ctx)? };
         Ok(Gpu {
-            q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx)?,
+            q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx, &fault)?,
             q5: q5::Q5Kernels::load(&ctx)?,
             q8f32: q8f32::Q8F32Kernels::load(&ctx)?,
-            elem: elem::ElemKernels::load(&ctx)?,
+            elem: elem::ElemKernels::load(&ctx, &fault)?,
             flash: flash::FlashKernels::load(&ctx)?,
             router: router::RouterKernels::load(&ctx)?,
             fused: fused::FusedKernels::load(&ctx)?,
             moe_fused: moe_fused::MoeFusedKernels::load(&ctx)?,
-            fault: DeviceBuffer::from_host(&stream, &vec![FAULT_NONE; FAULT_ALLOC_WORDS])?,
+            fault,
             ctx,
             stream,
             module,
@@ -1835,11 +1879,14 @@ impl Gpu {
     /// checks that the word can carry it.
     #[must_use]
     pub(crate) fn fault_sink(&self, layer: u32) -> FaultSink {
-        // SAFETY: the word is this Gpu's own device allocation, alive as long
-        // as the Gpu — whose stream every launch carrying the sink runs on,
-        // and which outlives every graph captured there (a graph drops
-        // before the buffers it addresses).
-        unsafe { FaultSink::new(self.fault.cu_deviceptr() as *mut u32, layer) }
+        sink_over(&self.fault, layer)
+    }
+
+    /// This `Gpu`'s fault word, for a kernel module loaded outside the `Gpu`
+    /// that raises into it: the module keeps the `Arc` while it can launch.
+    #[must_use]
+    pub fn fault_word(&self) -> &Arc<DeviceBuffer<u32>> {
+        &self.fault
     }
 
     /// The sink of a launch no layer owns — a gate's direct launch: its
@@ -2375,8 +2422,10 @@ impl Gpu {
     /// `enqueue_gemv_q3k` (`110 * n_sb / 4` words, even n_sb). `sel` is a
     /// device buffer of at least `n_slots` ids read by the kernel per launch,
     /// so a captured graph replay picks up new ids written between replays;
-    /// an id >= n_experts leaves that slot of `y` untouched. Asynchronous,
-    /// allocation-free, capturable.
+    /// an id >= n_experts leaves that slot of `y` untouched, and one that is
+    /// not [`hybrid::HOST`] raises [`FaultSite::ExpertId`] on this `Gpu`'s
+    /// fault word as an unlabelled launch ([`LAYER_NONE`]: the launcher
+    /// knows no layer). Asynchronous, allocation-free, capturable.
     pub fn enqueue_gemv_q3k_sel(
         &self,
         w: &DeviceTensor<u32>,
@@ -2468,6 +2517,7 @@ impl Gpu {
             n_slots,
             n_sb,
             n_sb.div_ceil(2),
+            self.unlabelled_sink(),
             y,
         )?;
         Ok(())

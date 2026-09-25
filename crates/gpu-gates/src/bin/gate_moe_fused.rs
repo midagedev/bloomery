@@ -52,7 +52,7 @@ fn run() -> Result<(), GateError> {
     use bloomery_gpu::probe::Probe;
     use bloomery_gpu::q5::Q8Blocks32;
     use bloomery_gpu::weights::{DevWeight, Weights};
-    use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
 
     // Router band against `route_ref` on the same logits: the device `exp`
     // and the host libm differ by a few ulp, everything else in the chain is
@@ -618,7 +618,8 @@ fn run() -> Result<(), GateError> {
     // ---- out-of-range sel id: slot n_used-1 carries n_expert (one past the
     // last expert); the op path's `q3k_gemv_sel` outputs and the fused kernel
     // must both leave that slot's rows at the sentinel and reproduce the
-    // clean run's bits everywhere else.
+    // clean run's bits everywhere else, and `q3k_gemv_sel` raises the named
+    // fault.
     {
         let mut sel_oor = ids_h.clone();
         sel_oor[n_used - 1] = n_expert as u32;
@@ -640,6 +641,12 @@ fn run() -> Result<(), GateError> {
             &mut h_oor,
         )?;
         stream.synchronize()?;
+        let fault = gpu.take_fault()?;
+        let fault_ok = fault
+            == Some(Fault {
+                layer: LAYER_NONE,
+                code: FaultSite::ExpertId as u32,
+            });
         let (g_v, u_v, h_v) = (
             g_oor.to_host_vec(stream)?,
             u_oor.to_host_vec(stream)?,
@@ -656,10 +663,11 @@ fn run() -> Result<(), GateError> {
         let op_untouched = untouched(&g_v) && untouched(&u_v);
         let fu_untouched = untouched(&h_v);
         let good_same = good(&g_v, &gate_y_1) && good(&u_v, &up_y_1) && good(&h_v, &h_op_1);
-        let pass = op_untouched && fu_untouched && good_same;
+        let pass = op_untouched && fu_untouched && good_same && fault_ok;
         println!(
             "oor sel[{}]={n_expert} op_gemv_bad_slot_untouched={op_untouched} \
-             fused_bad_slot_untouched={fu_untouched} good_slots_bit_identical={good_same} {}",
+             fused_bad_slot_untouched={fu_untouched} good_slots_bit_identical={good_same} \
+             fault={fault:?} (want expert_id)={fault_ok} {}",
             n_used - 1,
             verdict(pass)
         );

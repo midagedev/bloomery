@@ -349,7 +349,7 @@ impl ChainBody for Body {
             flash: FlashGqaKernels::load(ctx)?,
             router: RouterKernels::load(ctx)?,
             experts: ExpertKernels::load(ctx)?,
-            q6_sel: Q6kSelKernels::load(ctx)?,
+            q6_sel: Q6kSelKernels::load(ctx, gpu.fault_word())?,
             head: HeadArgmaxKernels::load(ctx)?,
             gemm: GemmKernels::load(ctx)?,
         };

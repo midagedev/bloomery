@@ -886,6 +886,18 @@ time-gpu-ds41 *ARGS:
 time-gpu-h2d *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/time-gate.sh h2d_probe --reps 8 {{ARGS}}'
 
+# (lead: Korean comment to replace)
+# M2b probe (lead-only): cuMemHostRegister on 1 GiB of an anonymous map and of a MAP_PRIVATE RW
+# window of the V4.1 first shard (flags 0), a MAP_SHARED read-only window (flags 0, the engine's own
+# mapping) and a MAP_PRIVATE read-only window (READ_ONLY), with
+# the card's two register attributes — the rc by name, register
+# s/GiB, H2D GB/s best and median of 8, RssAnon/RssFile before, registered and after. Refuses (rc 75)
+# while another run holds the CPU lease; the lease, the A6000 pin and the witness are time-gate.sh's.
+# A functional run: `just probe-host-register --bytes 64M` with
+# BLOOMERY_BOX_ENV="BLOOMERY_TIMING_GPU=<the 3090's UUID>".
+probe-host-register *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_host_register && { flock -n /root/bloomery-cpu.lock true || { echo "probe-host-register: the CPU lease is held by another run" >&2; exit 75; }; } && bash tools/ref/time-gate.sh probe_host_register {{ARGS}}'
+
 # ik's V4.1 decode on the first 512 ids of corpus-<CORPUS>.ids, plain or with the DSpark draft, under the lease on
 # the A6000 (lead-only): the ik twin of `just time-gpu-ds41 --tokens <those ids> -n N`. tools/ref/ik-draft.sh's header
 # has the prompt round-trip checks, ik's command line and the summary line. Example: `just time-ik-draft prose 96 dspark`.

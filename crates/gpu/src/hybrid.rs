@@ -754,6 +754,32 @@ pub struct HandoffTarget<'a> {
     pub layout: HandoffLayout,
 }
 
+impl Drop for RowPage {
+    fn drop(&mut self) {
+        // SAFETY: each window is taken once, here, and never read again; its
+        // raw parts are dropped (the context handle with them) and no memory
+        // is freed — the boundary's page frees its allocation after the rows.
+        unsafe {
+            drop(ManuallyDrop::take(&mut self.image).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.hsum).into_raw_parts());
+        }
+    }
+}
+
+impl Drop for Boundary {
+    fn drop(&mut self) {
+        // SAFETY: each window is taken once, here, and never read again; its
+        // raw parts are dropped (the context handle with them) and no memory
+        // is freed — `region` frees the allocation after this.
+        unsafe {
+            drop(ManuallyDrop::take(&mut self.normed).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.ids).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.weights).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.seq).into_raw_parts());
+        }
+    }
+}
+
 impl Boundary {
     /// Allocate the region, the page and the sum for `shape`; the host
     /// serves the experts `slots` sends to it, and `overlap` places each
@@ -1715,7 +1741,31 @@ fn wait_go(
 
 #[cfg(test)]
 mod tests {
-    use super::{HOST, SlotMap};
+    use super::{Boundary, BoundaryShape, HOST, SlotMap};
+    use cuda_core::CudaContext;
+    use std::sync::Arc;
+
+    /// A boundary gives back every context handle its windows took: the
+    /// context's count after one is dropped is the count before it was made.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_boundary_gives_back_its_context_handles() {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let stream = ctx.new_stream().expect("a stream");
+        let shape = BoundaryShape {
+            hidden: 256,
+            n_used: 6,
+        };
+        let before = Arc::strong_count(&ctx);
+        let slots = SlotMap::prefix(0..2, 16, 8).expect("a prefix of 8 of 16");
+        let b = Boundary::with_rows(&ctx, &stream, shape, slots, true, 2).expect("a boundary");
+        let held = Arc::strong_count(&ctx);
+        drop(b);
+        let after = Arc::strong_count(&ctx);
+        eprintln!("boundary context handles: before {before} held {held} after {after}");
+        assert!(held > before, "the boundary's buffers hold the context");
+        assert_eq!(after, before, "a dropped boundary leaves no context handle");
+    }
 
     /// The prefix map sends to the host exactly the ids at or past `n_l`, on
     /// every layer it has a row for, and knows no other layer.

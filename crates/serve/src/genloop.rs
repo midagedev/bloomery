@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -313,10 +314,14 @@ impl Slot {
     }
 }
 
-/// Where a save to `path` is written before it is renamed there: a name of
-/// this process that no slot file can take (a slot file name has no `:`).
+/// Where a save to `path` is written before it is renamed there: a name no
+/// slot file can take (a slot file name has no `:`), and no other save's —
+/// the process id and a count of the process's saves, so two servers of one
+/// process saving into one directory never write one file.
 fn partial_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!(".bloomery-slot-{}:partial", std::process::id()))
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let n = SAVES.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".bloomery-slot-{}-{n}:partial", std::process::id()))
 }
 
 /// Runs one request on the slot. `ids` is non-empty and shorter than the context.
@@ -428,4 +433,31 @@ pub(crate) fn generate(
         truncated,
         timings: tim.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::partial_path;
+    use crate::slotfile;
+    use std::path::Path;
+
+    /// Two saves to one path write two partial files, neither of which a
+    /// slot file can be named.
+    #[test]
+    fn partial_paths_are_distinct_per_save() {
+        let path = Path::new("/slots/a.bin");
+        let (a, b) = (partial_path(path), partial_path(path));
+        assert_ne!(a, b, "two saves share the partial file {}", a.display());
+        for p in [&a, &b] {
+            assert_eq!(p.parent(), path.parent());
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("a UTF-8 name");
+            assert!(
+                !slotfile::valid_filename(name),
+                "{name} is a valid slot name"
+            );
+        }
+    }
 }

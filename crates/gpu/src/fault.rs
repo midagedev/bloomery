@@ -58,11 +58,14 @@ pub enum FaultSite {
     AttnSel = 6,
     /// A grouped GEMM's route table met an expert id past its stack.
     ExpertId = 7,
+    /// A token id that selects a table row — an embedding row, the DSpark
+    /// Markov head's previous token — lies past the table's rows.
+    TokenId = 9,
 }
 
 impl FaultSite {
     /// Every site, in code order.
-    pub const ALL: [FaultSite; 7] = [
+    pub const ALL: &[FaultSite] = &[
         FaultSite::QuantColumn,
         FaultSite::NormQuant,
         FaultSite::Q5Quant,
@@ -70,6 +73,7 @@ impl FaultSite {
         FaultSite::Router,
         FaultSite::AttnSel,
         FaultSite::ExpertId,
+        FaultSite::TokenId,
     ];
 
     /// The site's name as an error prints it.
@@ -83,6 +87,7 @@ impl FaultSite {
             FaultSite::Router => "router",
             FaultSite::AttnSel => "attn_sel",
             FaultSite::ExpertId => "expert_id",
+            FaultSite::TokenId => "token_id",
         }
     }
 
@@ -99,6 +104,7 @@ impl FaultSite {
             }
             FaultSite::AttnSel => "a selected row past the compressed stream",
             FaultSite::ExpertId => "a routed expert id past the stack's expert count",
+            FaultSite::TokenId => "a token id past the table's rows",
         }
     }
 }
@@ -134,7 +140,10 @@ impl Fault {
     /// The site, when the code is a known one.
     #[must_use]
     pub fn site(self) -> Option<FaultSite> {
-        FaultSite::ALL.into_iter().find(|s| *s as u32 == self.code)
+        FaultSite::ALL
+            .iter()
+            .copied()
+            .find(|s| *s as u32 == self.code)
     }
 }
 

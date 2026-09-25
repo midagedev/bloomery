@@ -239,6 +239,21 @@ pub(super) struct LayerScratch {
     pub(super) probe_cfg: StepProbe,
 }
 
+impl Drop for LayerScratch {
+    fn drop(&mut self) {
+        // SAFETY: each window into `step_params` is taken once, here, and
+        // never read again; its raw parts are dropped (the context handle
+        // with them) and no memory is freed — `step_params` frees the
+        // allocation after this.
+        unsafe {
+            drop(ManuallyDrop::take(&mut self.pos_buf).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.n_keys_buf).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.token_buf).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.cs_buf).into_raw_parts());
+        }
+    }
+}
+
 impl LayerScratch {
     /// Device bytes of the arena and the parameter buffers (weights and KV
     /// are counted by their owners).

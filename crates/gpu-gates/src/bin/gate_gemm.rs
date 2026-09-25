@@ -58,9 +58,11 @@
 //! And once per case: a rerun bit-identical, the route and the GEMM
 //! captured into a graph whose replay equals the eager launch. Then the
 //! faults: a NaN activation and an out-of-range id each end as the named
-//! error `GpuError::Fault`, the refused slot's outputs untouched; and the
-//! host API's refusals (type, K, slot count, row count, unfilled table,
-//! token shape, activation capacity).
+//! error `GpuError::Fault`, the refused slot's outputs untouched; the same
+//! for the three `_sel` gemvs, where an id past the stack raises
+//! `FaultSite::ExpertId` and a host-served slot (`hybrid::HOST`) raises
+//! nothing; and the host API's refusals (type, K, slot count, row count,
+//! unfilled table, token shape, activation capacity).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -82,8 +84,9 @@ mod gate {
     use bloomery_gpu::gemm::{
         GEMM_MAX_SLOTS, GemmAct, GemmInput, GemmKernels, GemmRoute, GemmWeight,
     };
+    use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
-    use bloomery_gpu::{DeviceTensor, FaultSite, Gpu, GpuError, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, bytes_to_words, checks_failed, open_model, verdict,
@@ -632,6 +635,119 @@ mod gate {
             }
             Ok(Some(out))
         }
+    }
+
+    impl Dev<'_> {
+        /// One `_sel` gemv launch of `ids` over `res.w` into a [`SENT`]-filled
+        /// `y`: Q3_K's slots share one column of `x`, Q4_K's and Q6_K's slot
+        /// `s` reads column `s`. Returns `y`.
+        fn sel_once(
+            &self,
+            st: &Stack<'_>,
+            res: &mut Resident,
+            x: &[f32],
+            ids: &[u32],
+        ) -> Result<Vec<f32>, GateError> {
+            let stream = self.gpu.stream();
+            let m = ids.len();
+            let sel = DeviceBuffer::from_host(stream, ids)?;
+            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; m * st.rows])?;
+            let cols = if st.ty == GemmWeight::Q3K { 1 } else { m };
+            let xc = DeviceBuffer::from_host(stream, &x[..cols * st.k])?;
+            let act = &mut res.acts[cols - 1];
+            self.gpu.enqueue_quantize_q8_1(&xc, act)?;
+            match st.ty {
+                GemmWeight::Q3K => self
+                    .gpu
+                    .enqueue_gemv_q3k_sel(&res.w, act, &sel, m, st.rows, &mut y)?,
+                GemmWeight::Q4K => self
+                    .gpu
+                    .q4k_sel()
+                    .enqueue_gemv_q4k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
+                GemmWeight::Q6K => self
+                    .q6s
+                    .enqueue_gemv_q6k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
+                GemmWeight::Q5K => return Err("Q5_K has no _sel gemv".into()),
+            }
+            stream.synchronize()?;
+            Ok(y.to_host_vec(stream)?)
+        }
+    }
+
+    /// The `_sel` gemvs' out-of-range ids, per kernel (Q3_K, Q4_K, Q6_K) on
+    /// a synthetic 16-expert stack: slot 1 at three past the stack raises
+    /// [`FaultSite::ExpertId`] as an unlabelled launch, slot 1 at [`HOST`]
+    /// (a slot the host tier serves) raises nothing; both leave slot 1 at
+    /// [`SENT`], and every other slot bit for bit what the in-range launch
+    /// writes.
+    fn sel_faults(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("fault") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let (k, rows, n_exp) = (2048usize, 256usize, 16usize);
+        let want_id = Fault {
+            layer: LAYER_NONE,
+            code: FaultSite::ExpertId as u32,
+        };
+        let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+        let mut ok = true;
+        for (ty, input, seed) in [
+            (GemmWeight::Q3K, Input::Shared(4), 0x5e13),
+            (GemmWeight::Q4K, Input::PerSlot(4), 0x5e14),
+            (GemmWeight::Q6K, Input::PerSlot(4), 0x5e16),
+        ] {
+            let st = Stack {
+                name: format!("sel_fault_{ty:?}"),
+                ty,
+                bytes: synthetic(ty, n_exp * rows * k / 256, seed).into(),
+                n_exp,
+                rows,
+                k,
+                input,
+            };
+            let mut res = dev.resident(&st)?;
+            let x = activations(k, 4, u32::try_from(seed)?);
+            let clean = gpu.take_fault()?;
+            let good = dev.sel_once(&st, &mut res, &x, &[3, 5, 0, 12])?;
+            let good_fault = gpu.take_fault()?;
+            let mut pass = clean.is_none() && good_fault.is_none();
+            for (case, bad, want) in [
+                ("past_stack", n_exp as u32 + 3, Some(want_id)),
+                ("host", HOST, None),
+            ] {
+                let y = dev.sel_once(&st, &mut res, &x, &[3, bad, 0, 12])?;
+                let fault = gpu.take_fault()?;
+                let untouched = y[rows..2 * rows]
+                    .iter()
+                    .all(|v| v.to_bits() == SENT.to_bits());
+                let others = [0usize, 2, 3].iter().all(|&s| {
+                    bits_equal(
+                        &y[s * rows..(s + 1) * rows],
+                        &good[s * rows..(s + 1) * rows],
+                    )
+                });
+                let case_ok = fault == want && untouched && others;
+                println!(
+                    "sel fault={case} ty={ty:?} sel=[3, {bad}, 0, 12] fault=\"{}\" want=\"{}\" \
+                     slot1_untouched={untouched} other_slots_bit_identical={others} {}",
+                    shown(fault),
+                    shown(want),
+                    verdict(case_ok)
+                );
+                pass &= case_ok;
+            }
+            if clean.is_some() || good_fault.is_some() {
+                println!(
+                    "sel fault=clean ty={ty:?} word_before={} after_in_range={} (want none) {}",
+                    shown(clean),
+                    shown(good_fault),
+                    verdict(false)
+                );
+            }
+            ok &= pass;
+        }
+        Ok(ok)
     }
 
     /// `v` zero-padded to `n` entries.
@@ -1352,7 +1468,7 @@ mod gate {
         let dev = Dev {
             gpu: &gpu,
             gk: GemmKernels::load(gpu.context())?,
-            q6s: Q6kSelKernels::load(gpu.context())?,
+            q6s: Q6kSelKernels::load(gpu.context(), gpu.fault_word())?,
         };
         let mut ok = true;
 
@@ -1467,6 +1583,7 @@ mod gate {
         ok &= dense_case(&dev)?;
         ok &= swiglu_case(&dev)?;
         ok &= faults(&dev)?;
+        ok &= sel_faults(&dev)?;
 
         if !ok {
             return Err(checks_failed());

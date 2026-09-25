@@ -22,6 +22,9 @@
 //!    compared as above in the ring the block pass reads (`graph block`) and in
 //!    the one the next append reads (`graph kv`), and ik's own two views are
 //!    compared with each other (the set's consistency).
+//! 4. **The Markov step's previous token.** One row of the head's Markov step
+//!    with `first` in the vocabulary raises nothing; with `first` past it the
+//!    step raises `FaultSite::TokenId`, and its readback carries the word.
 //!
 //! Band. ik's CUDA matmul of a Q8_0 weight quantizes its f32 activation to
 //! q8_1 (32-value blocks, `d = amax/127`), ours keeps it f32; so a row's gap
@@ -51,12 +54,14 @@ mod gate {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
-    use bloomery_gpu::Gpu;
+    use bloomery_gpu::{Fault, FaultSite, Gpu, LAYER_NONE};
     use bloomery_gpu_deepseek41::draft::kv::{DraftRings, KvAppend, KvReadback};
     use bloomery_gpu_deepseek41::draft::load::DraftWeights;
+    use bloomery_gpu_deepseek41::markov::{MarkovKernels, MarkovWeights};
     use bloomery_gpu_gates::{
         GateError, checks_failed, data_dir, dump_stem, ref_model_path, verdict,
     };
+    use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits, half_to_f32};
     use model::arch::dspark::{self, Borrow, DraftHparams, Group, names};
@@ -674,6 +679,55 @@ mod gate {
         v.iter().map(|x| x.to_bits()).collect()
     }
 
+    /// The Markov step's previous token read on the card: one row, `first`
+    /// in the vocabulary raises nothing; `first` three past it raises
+    /// [`FaultSite::TokenId`] as an unlabelled launch, and the step's own
+    /// readback (`tok[1]`, the argmax's copy of the word) carries it.
+    fn markov_first(gpu: &Gpu, w: &DraftWeights) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mk = MarkovKernels::load(gpu.context())?;
+        let (w1, w2) = w.markov();
+        let mw = MarkovWeights { w1, w2 };
+        let n_vocab = w2.rows();
+        let bad = u32::try_from(n_vocab)? + 3;
+        let want_fault = Fault {
+            layer: LAYER_NONE,
+            code: FaultSite::TokenId as u32,
+        };
+        let mut ok = gpu.take_fault()?.is_none();
+        for (first_id, want) in [(5u32, None), (bad, Some(want_fault))] {
+            let first = DeviceBuffer::from_host(stream, &[first_id])?;
+            let mut tok = DeviceBuffer::from_host(stream, &[u32::MAX; 2])?;
+            let mut logits = DeviceBuffer::<f32>::zeroed(stream, n_vocab)?;
+            mk.enqueue_step(
+                stream,
+                gpu.elem(),
+                &mw,
+                &first,
+                &mut tok,
+                1,
+                0,
+                gpu.unlabelled_sink(),
+                &mut logits,
+            )?;
+            let t = tok.to_host_vec(stream)?;
+            let word = Fault::from_word(t[1]);
+            let fault = gpu.take_fault()?;
+            let pass = fault == want && word == want;
+            let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+            println!(
+                "{NAME}: markov first={first_id} (n_vocab {n_vocab}): fault=\"{}\" readback=\"{}\" \
+                 want=\"{}\" {}",
+                shown(fault),
+                shown(word),
+                shown(want),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let path = std::env::var_os("BLOOMERY_DSPARK_MODEL")
             .filter(|p| !p.is_empty())
@@ -685,6 +739,7 @@ mod gate {
         println!("{NAME}: card {}", gpu.device_name()?);
         let mut ok = true;
         let w = load(&gpu, &draft, &target, &mut ok)?;
+        ok &= markov_first(&gpu, &w)?;
         let hp = w.hp().clone();
 
         let host = Host {

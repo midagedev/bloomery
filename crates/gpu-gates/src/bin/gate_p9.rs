@@ -14,8 +14,10 @@
 //! differs). Layer-1 tensors, real weights, `activations()` inputs, two sel
 //! vectors each (one carrying a duplicate id), a bit-identical rerun, the
 //! in-graph replay proof for both kernels, and out-of-range ids (64,
-//! u32::MAX) in device slots: the run must not fault, the bad slot's output
-//! must stay untouched (sentinel) and every other slot bit-identical.
+//! u32::MAX) in device slots: the bad slot's output must stay untouched
+//! (sentinel) and every other slot bit-identical; `q3k_gemv_sel` raises
+//! `FaultSite::ExpertId` for id 64 and nothing for u32::MAX (`hybrid::HOST`,
+//! a host-served slot), and `q5_0_gemv_sel` raises nothing.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -27,7 +29,7 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::q5::{Q5Kernels, Q8Blocks32, pack_q5_0};
 #[cfg(feature = "gpu")]
-use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
+use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, activations, bits_equal, bytes_to_words, open_model, tensor_bytes_as, verdict,
@@ -176,14 +178,20 @@ fn run() -> Result<(), GateError> {
     }
 
     // Out-of-range ids: the host contract cannot validate a device-side id;
-    // the kernel must not fault, the bad slot's output stays untouched and
-    // every other slot is bit-identical to its reference.
+    // the bad slot's output stays untouched, every other slot is
+    // bit-identical to its reference, and id 64 raises the named fault.
     {
         let sel_dev = DeviceBuffer::from_host(stream, &SEL_OOR)?;
         let mut y_dev = DeviceBuffer::from_host(stream, &vec![SENT; N_SLOTS * rpe3])?;
         gpu.enqueue_gemv_q3k_sel(&w3_dev, &act3, &sel_dev, N_SLOTS, rpe3, &mut y_dev)?;
         stream.synchronize()?;
         let y = y_dev.to_host_vec(stream)?;
+        let fault = gpu.take_fault()?;
+        let fault_ok = fault
+            == Some(Fault {
+                layer: LAYER_NONE,
+                code: FaultSite::ExpertId as u32,
+            });
         let (mut good_same, mut bad_untouched) = (true, true);
         for (s, &id) in SEL_OOR.iter().enumerate() {
             if (id as usize) < nexp3 {
@@ -207,9 +215,10 @@ fn run() -> Result<(), GateError> {
                 );
             }
         }
-        let pass = good_same && bad_untouched;
+        let pass = good_same && bad_untouched && fault_ok;
         println!(
-            "q3k_oor good_slots_bit_identical={good_same} bad_slots_untouched={bad_untouched} {}",
+            "q3k_oor good_slots_bit_identical={good_same} bad_slots_untouched={bad_untouched} \
+             fault={fault:?} (want expert_id)={fault_ok} {}",
             verdict(pass)
         );
         if !pass {
@@ -332,7 +341,8 @@ fn run() -> Result<(), GateError> {
     }
     println!(
         "PASSED: gate_p9 _sel outputs bit-identical to the per-expert kernels slot by slot; \
-         graph replay follows ids overwritten between replays; out-of-range ids fault-free"
+         graph replay follows ids overwritten between replays; out-of-range ids leave their \
+         slots untouched, q3k's id past the stack raising expert_id"
     );
     Ok(())
 }

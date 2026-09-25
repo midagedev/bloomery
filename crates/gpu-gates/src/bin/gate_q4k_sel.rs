@@ -15,8 +15,10 @@
 //! iteration). Checks: two sel vectors per stack, each carrying a duplicate
 //! id whose two slots read different columns and so must differ; a
 //! bit-identical rerun; the in-graph replay following ids overwritten
-//! between replays; out-of-range ids (16, u32::MAX) that must fault nothing
-//! and leave their slots untouched; and the host contract's refusals. A
+//! between replays; an id past the stack that raises the named fault
+//! (`FaultSite::ExpertId`) and a host-served slot (`hybrid::HOST`) that
+//! raises nothing, both leaving their slots untouched; and the host
+//! contract's refusals. A
 //! failing check names its first mismatch — slot, row, both bit patterns.
 
 #[cfg(not(feature = "gpu"))]
@@ -27,7 +29,9 @@ fn main() {
 
 // Module-level because the stack and check helpers below `run` share them.
 #[cfg(feature = "gpu")]
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu::hybrid::HOST;
+#[cfg(feature = "gpu")]
+use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
 #[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{
     GateError, activations, bits_equal, bytes_to_words, open_model, tensor_bytes_as, verdict,
@@ -51,10 +55,13 @@ const SEL_A: [u32; N_SLOTS] = [0, 5, 15, 9, 9, 2];
 /// Expert 15 in slots 0 and 4.
 #[cfg(feature = "gpu")]
 const SEL_B: [u32; N_SLOTS] = [15, 0, 7, 1, 15, 5];
-/// Slot 1 is one past the last expert, slot 3 is u32::MAX; the rest are
-/// ordinary ids.
+/// Slot 1 is three past the last expert; the rest are ordinary ids.
 #[cfg(feature = "gpu")]
-const SEL_OOR: [u32; N_SLOTS] = [3, 16, 0, u32::MAX, 7, 1];
+const SEL_OOR: [u32; N_SLOTS] = [3, N_EXPERTS as u32 + 3, 0, 12, 7, 1];
+/// Slot 3 is [`HOST`], a slot the host tier serves; the rest are ordinary
+/// ids.
+#[cfg(feature = "gpu")]
+const SEL_HOST: [u32; N_SLOTS] = [3, 5, 0, HOST, 7, 1];
 /// What `y` holds before every launch here, so a slot the kernel leaves
 /// alone — or forgets — reads back as these bits.
 #[cfg(feature = "gpu")]
@@ -143,7 +150,8 @@ fn run() -> Result<(), GateError> {
     println!(
         "PASSED: gate_q4k_sel _sel slots bit-identical to q4k_gemv on each expert and column \
          alone (K = 2048, 2816, 2304); graph replay follows ids overwritten between replays; \
-         out-of-range ids fault-free and leave their slots untouched; host contract refuses \
+         an id past the stack raises expert_id, a host slot raises nothing, both leave their \
+         slots untouched; host contract refuses \
          a shared-input act and a non-dividing rows_per_expert"
     );
     Ok(())
@@ -351,28 +359,60 @@ fn check_graph(gpu: &Gpu, st: &Stack, eager_a: &[f32], eager_b: &[f32]) -> Resul
     Ok(pass)
 }
 
-/// Check 3: `SEL_OOR` into a `SENT`-filled `y`. The launch must not fault,
-/// the out-of-range slots must still hold `SENT`'s bits, and every other
-/// slot must be bit-identical to its reference.
+/// Check 3, twice into a `SENT`-filled `y`: [`SEL_OOR`] (an id past the
+/// stack) must raise [`FaultSite::ExpertId`] on the fault word as an
+/// unlabelled launch, and [`SEL_HOST`] (a slot the host tier serves) must
+/// raise nothing. Either way the launch itself succeeds, the out-of-range
+/// slot still holds `SENT`'s bits, and every other slot is bit-identical to
+/// its reference.
 #[cfg(feature = "gpu")]
 fn check_oor(gpu: &Gpu, st: &mut Stack) -> Result<bool, GateError> {
+    let clean = gpu.take_fault()?;
+    if clean.is_some() {
+        println!(
+            "q4k_oor[{}] the fault word held {clean:?} before the case {}",
+            st.tag,
+            verdict(false)
+        );
+        return Ok(false);
+    }
+    let expert_id = Fault {
+        layer: LAYER_NONE,
+        code: FaultSite::ExpertId as u32,
+    };
+    let mut pass = oor_case(gpu, st, "past_stack", &SEL_OOR, Some(expert_id))?;
+    pass &= oor_case(gpu, st, "host", &SEL_HOST, None)?;
+    Ok(pass)
+}
+
+/// One of check 3's launches: `sel` into a `SENT`-filled `y`, then the fault
+/// word read and cleared against `want_fault`.
+#[cfg(feature = "gpu")]
+fn oor_case(
+    gpu: &Gpu,
+    st: &mut Stack,
+    case: &str,
+    sel: &[u32; N_SLOTS],
+    want_fault: Option<Fault>,
+) -> Result<bool, GateError> {
     let stream = gpu.stream();
-    let sel_dev = DeviceBuffer::from_host(stream, &SEL_OOR)?;
+    let sel_dev = DeviceBuffer::from_host(stream, sel)?;
     let mut y = st.sentinel_y(gpu)?;
     if let Err(e) = st.launch(gpu, &sel_dev, &mut y) {
         println!(
-            "q4k_oor[{}] sel={SEL_OOR:?} launch failed: {e} {}",
+            "q4k_oor[{}:{case}] sel={sel:?} launch failed: {e} {}",
             st.tag,
             verdict(false)
         );
         return Err(e);
     }
     let got = y.to_host_vec(stream)?;
-    let want = st.expected(gpu, &SEL_OOR)?;
+    let fault = gpu.take_fault()?;
+    let want = st.expected(gpu, sel)?;
     let rpe = st.rpe;
     let (mut good_same, mut bad_untouched) = (true, true);
     let mut bad = Vec::new();
-    for (s, &id) in SEL_OOR.iter().enumerate() {
+    for (s, &id) in sel.iter().enumerate() {
         let same = bits_equal(&got[s * rpe..(s + 1) * rpe], &want[s * rpe..(s + 1) * rpe]);
         if (id as usize) < N_EXPERTS {
             good_same &= same;
@@ -381,11 +421,15 @@ fn check_oor(gpu: &Gpu, st: &mut Stack) -> Result<bool, GateError> {
             bad.push(s);
         }
     }
-    let pass = good_same && bad_untouched;
+    let fault_ok = fault == want_fault;
+    let pass = good_same && bad_untouched && fault_ok;
+    let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
     println!(
-        "q4k_oor[{}] sel={SEL_OOR:?} oor_slots={bad:?} good_slots_bit_identical={good_same} \
-         bad_slots_untouched={bad_untouched} {}{}",
+        "q4k_oor[{}:{case}] sel={sel:?} oor_slots={bad:?} fault=\"{}\" want=\"{}\" \
+         good_slots_bit_identical={good_same} bad_slots_untouched={bad_untouched} {}{}",
         st.tag,
+        shown(fault),
+        shown(want_fault),
         verdict(pass),
         mismatch("first_mismatch", &got, &want, rpe),
     );

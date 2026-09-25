@@ -10,7 +10,10 @@
 //! `m = 1`). A position's previous token is read on the device: row 0's from
 //! `first[0]` (the block's last accepted token), row `c > 0`'s from `tok[c -
 //! 1]`, the argmax the step wrote for row `c - 1`. An id at or past
-//! `n_vocab` reads row 0 — in bounds, deterministic, and never the argmax's.
+//! `n_vocab` (only `first[0]` can hold one: the argmax's are below the
+//! vocabulary) raises `FaultSite::TokenId` and reads row 0 so the access
+//! stays in bounds — that row's correction is no value the pass trusts, the
+//! pass's readback carries the fault.
 //!
 //! The numeric rule `ds41_markov` holds, and the gate transcribes on the host:
 //! bf16 widens to f32 as `bits << 16` (exact), and the dot for entry `v` is
@@ -27,7 +30,7 @@
 //! `tok[..=m]` carries every fault the pass raised.
 
 use bloomery_gpu::elem::ElemKernels;
-use bloomery_gpu::{DeviceTensor, FaultSink, GpuError, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
@@ -94,7 +97,9 @@ mod markov_kernels {
 
     /// Row `row`'s Markov correction (the module doc's rule): every block
     /// gathers the previous token's `w1` row into shared memory, widened, and
-    /// thread `v` adds `w2[v] · e` into `logits[v * m + row]`.
+    /// thread `v` adds `w2[v] · e` into `logits[v * m + row]`. A previous
+    /// token past the vocabulary raises [`FaultSite::TokenId`] on `fault`
+    /// (thread 0 of the grid) and reads row 0.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -122,6 +127,7 @@ mod markov_kernels {
         n_vocab: u32,
         m: u32,
         row: u32,
+        fault: FaultSink,
         mut logits: DisjointSlice<f32>,
     ) {
         static mut E: SharedArray<f32, MARKOV_RANK> = SharedArray::UNINIT;
@@ -140,7 +146,14 @@ mod markov_kernels {
                     *tok.get_unchecked(row as usize - 1)
                 }
             };
-            let p = if p < n_vocab { p as usize } else { 0 };
+            let p = if p < n_vocab {
+                p as usize
+            } else {
+                if thread::index_1d().get() == 0 {
+                    fault.raise(FaultSite::TokenId);
+                }
+                0
+            };
             // SAFETY: p < n_vocab, so word p*128 + tid < 128*n_vocab <=
             // w1.len(); the two slots are this thread's.
             unsafe {
@@ -190,11 +203,12 @@ impl MarkovKernels {
 
     /// Enqueue row `row`'s correction (`ds41_markov`) into `logits` (`m`
     /// rows, `logits[v * m + c]`), its previous token `first[0]` for row 0
-    /// and `tok[row - 1]` otherwise. Asynchronous, allocation-free,
-    /// capturable.
+    /// and `tok[row - 1]` otherwise; a previous token past the vocabulary
+    /// raises [`FaultSite::TokenId`] on `fault`. Asynchronous,
+    /// allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
-        reason = "one launch's buffers and its row, all distinct roles"
+        reason = "one launch's buffers, its row and the fault word, all distinct roles"
     )]
     pub fn enqueue_add(
         &self,
@@ -204,6 +218,7 @@ impl MarkovKernels {
         tok: &DeviceBuffer<u32>,
         m: usize,
         row: usize,
+        fault: FaultSink,
         logits: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "MarkovKernels::enqueue_add";
@@ -253,6 +268,7 @@ impl MarkovKernels {
             nv,
             mm,
             r,
+            fault,
             logits,
         )?;
         Ok(())
@@ -261,7 +277,9 @@ impl MarkovKernels {
     /// One Markov step: [`Self::enqueue_add`] for row `row`, then
     /// `argmax_rows_fault` over the `m` rows into `tok[..m]` and `fault`'s
     /// word into `tok[m]` (`tok` holds `m + 1`) — `tok[row]` is then row
-    /// `row + 1`'s previous token. Asynchronous, allocation-free, capturable.
+    /// `row + 1`'s previous token. `fault` is also what the correction's
+    /// out-of-vocabulary previous token raises into. Asynchronous,
+    /// allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "one step's buffers, its row and the fault word, all distinct roles"
@@ -278,7 +296,7 @@ impl MarkovKernels {
         fault: FaultSink,
         logits: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        self.enqueue_add(stream, w, first, tok, m, row, logits)?;
+        self.enqueue_add(stream, w, first, tok, m, row, fault, logits)?;
         elem.enqueue_argmax_rows_fault(stream, logits, w.w2.rows(), m, fault, tok)
     }
 }

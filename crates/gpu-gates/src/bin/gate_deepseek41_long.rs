@@ -32,7 +32,8 @@
 //! Red on any of: a position whose streams hold a NaN or an infinity at any
 //! seam (the engine's step refuses it too, with the fault word's layer and
 //! site; the probe names the seam and the buffer); a
-//! run of [`COLLAPSE`] or more equal generated tokens; a position whose eager
+//! run of [`COLLAPSE`] or more generated tokens that repeat with period 1 or
+//! 2 (one token, or two alternating); a position whose eager
 //! argmax is not the engine's token; and, on the free arm, a first difference
 //! with ik's greedy ids (`greedy-ik-cpu-64-p0.tsv`, which stops at ik's EOS)
 //! where our margin is not below
@@ -55,6 +56,70 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/ds41_finite.rs"]
 mod finite;
 
+/// The longest stretch of `tokens` that repeats with one of `periods`
+/// (`tokens[i] == tokens[i - p]` all through it), as `(length, start,
+/// period)`, the smallest period first on a tie; `(0, 0, 0)` for no tokens.
+/// A stretch of period `p` counts its first `p` tokens: period 1 is the
+/// longest run of one token, period 2 an alternation's full length.
+#[cfg(feature = "deepseek41")]
+fn longest_periodic_run(tokens: &[u32], periods: &[usize]) -> (usize, usize, usize) {
+    let mut best = (0, 0, 0);
+    for &p in periods {
+        if p == 0 || tokens.is_empty() {
+            continue;
+        }
+        let (mut len, mut start) = (p.min(tokens.len()), 0);
+        if len > best.0 {
+            best = (len, start, p);
+        }
+        for i in p..tokens.len() {
+            if tokens[i] == tokens[i - p] {
+                len += 1;
+            } else {
+                (len, start) = (p, i + 1 - p);
+            }
+            if len > best.0 {
+                best = (len, start, p);
+            }
+        }
+    }
+    best
+}
+
+/// The collapse check against token lists whose answer is known: a
+/// two-token alternation, one token repeated, and an enumeration of
+/// changing values around a fixed pair — whether each reads as a collapse
+/// of at least `collapse` tokens is the list's expected verdict. The gate
+/// runs it before it loads the model.
+#[cfg(feature = "deepseek41")]
+fn collapse_self_check(periods: &[usize], collapse: usize) -> bool {
+    let alternation: Vec<u32> = (0..12)
+        .map(|i| if i % 2 == 0 { 2296 } else { 83358 })
+        .collect();
+    let repeated = vec![7u32; 9];
+    let counting: Vec<u32> = (0..10).flat_map(|n| [14, 223, 19 + n]).collect();
+    let mut short_alt = vec![1u32, 2, 3];
+    short_alt.extend([5, 6, 5, 6, 5, 6, 5]);
+    let cases: [(&str, &[u32], bool); 4] = [
+        ("alternation 2296/83358 x12", &alternation, true),
+        ("one token x9", &repeated, true),
+        ("enumeration 14,223,N x10", &counting, false),
+        ("alternation of 7", &short_alt, false),
+    ];
+    let mut ok = true;
+    for (name, tokens, want) in cases {
+        let (len, at, period) = longest_periodic_run(tokens, periods);
+        let got = len >= collapse;
+        println!(
+            "collapse self-check {name}: longest periodic run {len} (period {period} from {at}), \
+             collapse={got} want={want}: {}",
+            bloomery_gpu_gates::verdict(got == want)
+        );
+        ok &= got == want;
+    }
+    ok
+}
+
 #[cfg(feature = "deepseek41")]
 mod gate {
     use bloomery_gpu::head::Head;
@@ -74,8 +139,16 @@ mod gate {
     const FREE_N: usize = 330;
     /// Generated tokens after the trigger's fed ids.
     const TRIGGER_N: usize = 16;
-    /// A run of this many equal generated tokens is a collapse.
+    /// A run of this many generated tokens repeating with a short period
+    /// ([`COLLAPSE_PERIODS`]) is a collapse.
     const COLLAPSE: usize = 8;
+    /// The periods the collapse check reads: one token repeated, and two
+    /// alternating. Not three or more: a greedy run past the reference's end
+    /// of text settles into a phrase loop of the model's own, which is text,
+    /// not a collapse; and at [`COLLAPSE`] tokens a longer period is under
+    /// three repetitions, which an enumeration reaches (`14, 223, N` in
+    /// [`TRIGGER`]).
+    const COLLAPSE_PERIODS: [usize; 2] = [1, 2];
     /// Generated tokens of the faults arm.
     const FAULT_STEPS: usize = 32;
     /// The most minor faults a step from the second on may take outside the
@@ -153,6 +226,9 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         let args = parse_args()?;
+        if !crate::collapse_self_check(&COLLAPSE_PERIODS, COLLAPSE) {
+            return Err(checks_failed());
+        }
         let path = workstation::model_v41();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&file)?;
@@ -242,12 +318,14 @@ mod gate {
                     verdict(false)
                 ),
             }
-            let (len, at) = longest_run(&self.tokens);
+            let (len, at, period) = crate::longest_periodic_run(&self.tokens, &COLLAPSE_PERIODS);
             let run_ok = len < COLLAPSE;
             println!(
-                "{name}: longest run of one generated token {len} (token {} from generated step \
-                 {at}), a collapse at {COLLAPSE}: {}",
-                self.tokens.get(at).copied().unwrap_or(0),
+                "{name}: longest periodic run {len} (period {period}, tokens {:?} from generated \
+                 step {at}), a collapse at {COLLAPSE} with periods {COLLAPSE_PERIODS:?}: {}",
+                self.tokens
+                    .get(at..(at + period).min(self.tokens.len()))
+                    .unwrap_or(&[]),
                 verdict(run_ok)
             );
             let eager_ok = self.differs == 0;
@@ -342,22 +420,6 @@ mod gate {
         );
         println!("faults: tokens {tokens:?}");
         Ok(ok)
-    }
-
-    /// The longest run of one value in `tokens` and where it starts.
-    fn longest_run(tokens: &[u32]) -> (usize, usize) {
-        let (mut best, mut at, mut len, mut start) = (0, 0, 0, 0);
-        for (i, &t) in tokens.iter().enumerate() {
-            if i > 0 && tokens[i - 1] == t {
-                len += 1;
-            } else {
-                (len, start) = (1, i);
-            }
-            if len > best {
-                (best, at) = (len, start);
-            }
-        }
-        (best, at)
     }
 
     /// Feed `fed` from a reset, then `n_gen` greedy tokens, every position
