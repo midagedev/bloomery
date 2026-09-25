@@ -73,7 +73,7 @@ Prompt processing on the same card, arms alternated in one window, three rounds 
 | 512 | **5,304** | 4,256 | — | 3,432 |
 | 4096 | 2,615 | 4,170 | **6,864** | 1,320 |
 
-The prompt runs in ubatches of 512 tokens through a grouped int8 tensor-core GEMM, each expert read once per ubatch. At 4096 tokens about half the time is attention, which still reuses the decode kernel in row chunks; a prefill attention kernel is next. Source: rig-log [2026-09-25, qwen3prefill](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab).
+The prompt runs in ubatches of 512 tokens through a grouped int8 tensor-core GEMM, each expert read once per ubatch. At 4096 tokens about half the time is attention [derived: the wall beyond eight 512-token ubatches], which still reuses the decode kernel in row chunks; a prefill attention kernel is next. Source: rig-log [2026-09-25, qwen3prefill](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab).
 
 Read these numbers with their conditions:
 

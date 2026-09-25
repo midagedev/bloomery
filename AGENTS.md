@@ -298,9 +298,13 @@ first suspect is a hung gate on the box, not the agent.
   for V4.1 and Qwen3 alike). Every model's public numbers carry prompt
   processing — `pp tok/s @ P = 512 and 4096, card` — next to decode tok/s, for
   ours and the reference engines in one lease; a round that touches a path the
-  prompt runs through is judged on it. As of this date V4.1 feeds the prompt one
+  prompt runs through is judged on it. ~~As of this date V4.1 feeds the prompt one
   decode step per token (no batched prefill) and Qwen3 prefills eagerly in passes
-  of at most 8 positions, so neither number has been measured yet.
+  of at most 8 positions, so neither number has been measured yet.~~ Since
+  2026-09-25 (`dfa8b5d`) Qwen3 runs a prompt of P ≥ 9 in ubatches of 512 through
+  the grouped int8 GEMM: pp512 5,304 and pp4096 2,615 tok/s on the A6000
+  (llama.cpp 4,256 / 4,170, `-ub 4096` 6,864; rig-log 09-25#qwen3prefill-ab);
+  V4.1 still feeds one decode step per token (batched prefill in flight).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
