@@ -185,6 +185,16 @@ asynchrony, bulk, SIMD, SIMT — before a term is shortened. A term under
 another resource's shadow is worth 0. The V4.1 prefill timeline and its
 ladder are the worked example (`docs/plan.md` 「흐름 모델」).
 
+The busiest unit is not the bound until the step's cycles are its demand.
+Before a round shortens one unit's term (bytes, wavefronts, instructions on
+one pipe), write every unit's demand next to the step's cycles in the same
+unit (cycles an SM or a scheduler). When the largest demand is well under the
+step, the step is latency the resident warps do not hide, and a lever on that
+unit predicts 0 until occupancy or ILP changes. Case (2026-09-26, rig-log
+09-26#q3gemma-ab): `gemm_q4k`'s L1TEX was the top unit at 70.6 %, about 2,450
+of ≈ 3,530 cycles a block-step; lever A cut its wavefronts 39 % and the
+elapsed cycles did not move.
+
 Measurement comes first only for the named residue: hardware faults (Xid 79),
 compiler register allocation, cache effects with no mechanism yet. Anything
 fixed at build time (node count, launch count, per-kernel instructions and
