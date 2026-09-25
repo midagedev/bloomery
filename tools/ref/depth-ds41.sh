@@ -397,7 +397,7 @@ ours_arm() {
   fi
   smoke=$(echo "$out" | grep -E '^SMOKE ')
   [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-  echo "$out" | grep -E '^(plan|load|capture|fed|stat summary|time prompt) '
+  echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt) '
   pp_col "${A_KIND[$i]}" "r$r $label d=$dep" "$out"
   p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
   mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
