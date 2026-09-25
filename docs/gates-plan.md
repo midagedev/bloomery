@@ -67,7 +67,7 @@
 ### 3.2 전체 층의 목록 = `just affected` (착륙 `1ea27fa`, 이미 있음)
 
 묶음은 손으로 고르지 않고 이 목록에서 시작한다. 뺀 것은 변경 클래스 표(`AGENTS.md` 「Derive first」)로 사유를 적는다 —
-오늘 ds41bulk 묶음이 그 첫 사례(59 중 38, 뺀 30의 사유 = 기존 PTX 엔트리 digest 동일). 실측: v4meta 21/84, fixup5
+오늘 ds41bulk 묶음이 그 첫 사례(59 중 38, ~~뺀 30의 사유 = 기존 PTX 엔트리 digest 동일~~). 정정(09-26, `gatesel` — `docs/research/gatesel-design-report.md` §2): 이 사유는 충분한 증명이 아니다. `ptx::normalize`가 번호 붙은 생성 심볼을 줄기로 지워 엔트리 digest가 모듈 범위 선언(전역 초기값·공유 메모리 크기)·피호출 `.func`·모듈 헤더를 보지 않고, 커널을 하나 더하면 `LoadedModule`·`from_module`이 바뀌어 `Gpu::with_device`를 부르는 모든 GPU 바이너리의 호스트 코드가 바뀐다. 손으로 빼는 관행은 멈춘다 — 기계 증명이 생길 때까지 착륙 묶음은 affected 목록 전부를 돈다. 실측: v4meta 21/84, fixup5
 48/76, ds41ced 21/59 — 리드가 빠뜨린 것 14개가 있었다(`gpu-deepseek41`을 링크하는 게이트).
 
 ### 3.3 두 차선 러너 (XS–S, `tools/gate-batch.sh`) — 착륙(09-25 밤, 3.1과 한 커밋)
