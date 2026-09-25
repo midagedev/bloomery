@@ -132,7 +132,7 @@ mod gate {
         }
         let gpu = Gpu::new()?;
         let stream = gpu.stream();
-        let sites = &hp.engram.layer_ids;
+        let sites = &hp.engram()?.layer_ids;
         let mut keep: BTreeSet<String> = [names::output(), names::output_norm()].into();
         for &l in sites {
             keep.extend([names::engram_wkv(l), names::engram_k(l), names::engram_q(l)]);
@@ -395,8 +395,8 @@ mod gate {
     impl Inputs {
         fn read(set: &Set, hp: &Hparams, words: &[u32]) -> Result<Inputs, GateError> {
             let man = &set.man;
-            let mut sites = Vec::with_capacity(hp.engram.layer_ids.len());
-            for &l in &hp.engram.layer_ids {
+            let mut sites = Vec::with_capacity(hp.engram()?.layer_ids.len());
+            for &l in &hp.engram()?.layer_ids {
                 let prev = l.checked_sub(1).ok_or("an engram site at layer 0")?;
                 sites.push((streams_after(man, prev)?, ffn_pre(man, prev)?));
             }
@@ -529,7 +529,7 @@ mod gate {
     /// Each site's host row ids against the set's `engram_rows-L`.
     fn check_ids(set: &Set, hp: &Hparams, rows: &StepRows) -> Result<bool, GateError> {
         let mut all = true;
-        for (s, &l) in hp.engram.layer_ids.iter().enumerate() {
+        for (s, &l) in hp.engram()?.layer_ids.iter().enumerate() {
             let want = ref_ints(
                 &set.man,
                 &format!("engram_rows-{l}"),

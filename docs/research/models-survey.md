@@ -239,8 +239,10 @@ architecture in its own device crate when it brings its own `#[cuda_module]`s. W
   `deepseek4`, `glm5next`).
 - A `ChainBody` impl per arch: `crates/gpu/src/arch/<name>/` when its kernels are shared ones
   (Qwen3, GLM-4.x), its own crate like `gpu-deepseek41` when it adds device code only it uses
-  (V4 Flash could live *in* `gpu-deepseek41` as a second body, since it reuses hc, sink attention,
-  rope, router and indexer kernels there).
+  ~~(V4 Flash could live *in* `gpu-deepseek41` as a second body, since it reuses hc, sink attention,
+  rope, router and indexer kernels there).~~ (Decided 2026-09-25, `v4port`/`v4meta`: V4-Flash is not a second
+  body but the same `deepseek41` reader and chain with per-layer kind values and model values —
+  `Model::Deepseek4` — since every difference is a layer-kind or model value, not a dispatch branch.)
 - **GLM-4.7-Flash is the one case where the file's arch string is an existing variant.** It must
   not become `if` branches in `deepseek2`'s V2-Lite code. The V2-Lite pins move from constants to
   hyperparameters read once (`n_used`, gating function, `q_lora_rank`, `key_length_mla`,

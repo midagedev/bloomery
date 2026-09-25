@@ -1058,3 +1058,9 @@ gate-vision:
 # 참조의 자기 민감도 행(MANIFEST `# sensitivity`)의 K배 안; 블록 0은 crates/gpu-vision의 호스트 규칙과 연산별로 대조. 3090, 게이트 락.
 gate-gpu-vision:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features vision --release --bin gate_vision_encoder && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_vision_encoder'
+
+# V4-Flash 인벤토리 게이트: deepseek41 모듈이 V4-Flash 파일(deepseek4)에서 읽은 모델 값·층 종류(비율 4는 자기 인덱스 키로
+# top-k, 비율 128은 전 행, 0–2층 해시 라우팅), 텐서 수·역할별·타입별 바이트, 설계 §5 (a)·(b)·게이트 배치의 카드·호스트 줄과
+# 카드 예산이 담을 expert 수[유도], 엔진이 거절하는 기능 목록을 tests/common/deepseek4_pins.rs에 대조한다. 헤더만, 초 단위.
+gate-deepseek4-meta:
+    BLOOMERY_MODEL=deepseek4 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::hparams --nocapture && bash tools/gate.sh --release -p bloomery-model --test deepseek4_meta -- --ignored --nocapture'

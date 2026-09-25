@@ -467,7 +467,7 @@ mod gate {
                 stats: false,
             },
         )?;
-        let sites = hp.engram.layer_ids.len();
+        let sites = hp.engram()?.layer_ids.len();
         let mut plan = StepPlan::default();
         let mut history: Vec<u32> = Vec::with_capacity(HELPER_STEPS);
         let mut state = 0x2545_f491_4f6c_dd1d_u64;

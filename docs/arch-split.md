@@ -22,6 +22,12 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
 3. **이름은 파일이 말하는 문자열이다.** 모듈·크레이트·도구 프로필·오라클 디렉터리 전부 `general.architecture`의
    값을 그대로 쓴다: `deepseek2`, `deepseek41`. 줄임말(`ds2`)은 쓰지 않는다 — `grep deepseek41`이 모듈, 메타데이터
    키, 도구 프로필, 게이트를 한 번에 찾는 것이 이 규칙의 값이다.
+   예외 하나(2026-09-25, v4port 결정): DeepSeek-V4-Flash 파일(`general.architecture` = `deepseek4`)은 새 모듈 없이
+   `arch/deepseek41`·`gpu-deepseek41`이 읽는다 — 차이가 층 종류 값과 모델 값뿐이라 디스패치에 `if arch`가 없다.
+   `Arch::from_name`이 두 문자열을 `Arch::Deepseek41`로 접고, 어느 모델인지는 `arch/mod.rs`의 `deepseek41_model`이
+   한 번 읽어 `Hparams.model`(`Model::Deepseek41 | Deepseek4`)로 싣는다. 파일 이름이 가는 곳(도구 프로필
+   `tools/ref/models/deepseek4.sh`, 오라클 디렉터리, 로그·`load` 줄)은 `Model::name()`이나 `Split::architecture()`로
+   파일의 문자열을 그대로 쓴다 — `grep deepseek4`가 그 자리들을 찾는다.
 
 ## 무엇이 어디로
 

@@ -900,7 +900,7 @@ mod gate {
         );
 
         // Each go's shadow: the kernels after it up to the next batch.
-        let sites = &hp.engram.layer_ids;
+        let sites = &hp.engram()?.layer_ids;
         let mut shadows: Vec<Vec<&str>> = Vec::new();
         let mut open: Option<Vec<&str>> = None;
         for n in &pair {

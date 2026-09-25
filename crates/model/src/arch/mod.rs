@@ -23,6 +23,27 @@ pub fn is_dflash(split: &Split) -> bool {
     split.architecture() == Some(DFLASH)
 }
 
+/// The architecture string of a DeepSeek-V4-Flash file, which the
+/// [`deepseek41`] module reads as its [`deepseek41::hparams::Model::Deepseek4`].
+pub const DEEPSEEK4: &str = "deepseek4";
+
+/// Which of the [`deepseek41`] module's models `split` holds, by its
+/// `general.architecture`; any other string is an error naming it.
+pub fn deepseek41_model(split: &Split) -> Result<deepseek41::hparams::Model, PlacementError> {
+    use deepseek41::hparams::Model;
+    match split.architecture() {
+        Some("deepseek41") => Ok(Model::Deepseek41),
+        Some(DEEPSEEK4) => Ok(Model::Deepseek4),
+        other => Err(PlacementError::Metadata {
+            key: "general.architecture".to_string(),
+            detail: format!(
+                "is {:?}; the deepseek41 module reads deepseek41 and {DEEPSEEK4}",
+                other.unwrap_or("<missing>")
+            ),
+        }),
+    }
+}
+
 /// The architectures this engine can run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
@@ -42,16 +63,22 @@ impl Arch {
     }
 
     /// The string → variant step on its own, so it can be tested without a file.
+    /// `deepseek4` (DeepSeek-V4-Flash) is read by the `deepseek41` module as
+    /// one of its two models ([`deepseek41_model`]): the one variant whose
+    /// name is not the only string it stands for.
     pub fn from_name(name: &str) -> Result<Arch, ModelError> {
         match name {
             "deepseek2" => Ok(Arch::Deepseek2),
-            "deepseek41" => Ok(Arch::Deepseek41),
+            "deepseek41" | DEEPSEEK4 => Ok(Arch::Deepseek41),
             "qwen3moe" => Ok(Arch::Qwen3moe),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
 
-    /// The `general.architecture` string this variant stands for.
+    /// The module's name: the `general.architecture` string of its first
+    /// model. A `deepseek4` file detects as [`Arch::Deepseek41`], so what names
+    /// a file (a log line, an oracle directory) takes the file's own string
+    /// (`Split::architecture`, or [`deepseek41::hparams::Model::name`]).
     pub fn name(&self) -> &'static str {
         match self {
             Arch::Deepseek2 => "deepseek2",
@@ -220,6 +247,12 @@ mod tests {
         for a in [Arch::Deepseek2, Arch::Deepseek41, Arch::Qwen3moe] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }
+    }
+
+    /// A V4-Flash file is read by the deepseek41 module.
+    #[test]
+    fn deepseek4_is_read_by_the_deepseek41_module() {
+        assert_eq!(Arch::from_name(super::DEEPSEEK4).unwrap(), Arch::Deepseek41);
     }
 
     #[test]

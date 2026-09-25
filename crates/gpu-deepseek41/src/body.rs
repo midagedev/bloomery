@@ -2476,19 +2476,21 @@ pub fn engram_row_bytes(file: &Split, hp: &Hparams) -> Result<usize, GpuError> {
         detail,
     };
     let mut bytes = None;
-    for &l in &hp.engram.layer_ids {
+    for &l in &hp.engram()?.layer_ids {
         let name = names::engram_embd(l);
         let (_, t) = file
             .find(&name)
             .ok_or_else(|| refuse(format!("{name} is not in the file")))?;
         let rows: u64 = t.dims.iter().skip(1).product();
-        if t.dims.first().copied() != Some(hp.engram.key_length as u64)
+        if t.dims.first().copied() != Some(hp.engram()?.key_length as u64)
             || rows == 0
             || !t.nbytes.is_multiple_of(rows)
         {
             return Err(refuse(format!(
                 "{name} has dims {:?} and {} bytes: not rows of {} values",
-                t.dims, t.nbytes, hp.engram.key_length
+                t.dims,
+                t.nbytes,
+                hp.engram()?.key_length
             )));
         }
         let row = t.nbytes / rows;

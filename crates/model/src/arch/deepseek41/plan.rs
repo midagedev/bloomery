@@ -81,14 +81,21 @@ pub struct Planner {
 
 impl Planner {
     /// The planner of the model `split` holds, for caches of `ctx_max` positions: the window,
-    /// every layer's ratio and the engram n-gram length from `hp`, the file's [`Hparams`].
+    /// every layer's ratio and the engram n-gram length from `hp`, the file's [`Hparams`]; a
+    /// file without engram sites is refused, since the step plan carries their n-grams.
     pub fn from_file(split: &Split, hp: &Hparams, ctx_max: u64) -> Result<Planner, PlanError> {
         let window = u32::try_from(hp.window).map_err(|_| PlacementError::Metadata {
             key: split.arch_key("attention.sliding_window"),
             detail: format!("{} does not fit u32", hp.window),
         })?;
         let ratios: Vec<u32> = hp.layers.iter().map(LayerKind::ratio).collect();
-        Planner::new(window, &ratios, hp.engram.max_ngram, ctx_max)
+        let engram = hp.engram.as_ref().ok_or_else(|| PlacementError::Metadata {
+            key: split.arch_key("engram.max_ngram_size"),
+            detail: "is absent: the file has no engram sites, and the step plan carries their \
+                     n-grams"
+                .to_string(),
+        })?;
+        Planner::new(window, &ratios, engram.max_ngram, ctx_max)
     }
 
     /// The planner of explicit values: a window of `window` positions, `layer_ratios[l]` the

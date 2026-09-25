@@ -550,7 +550,7 @@ mod gate {
     /// there — every site's rows the same size.
     fn engram_row_bytes(split: &Split, hp: &Hparams) -> Result<usize, GateError> {
         let mut bytes = None;
-        for &l in &hp.engram.layer_ids {
+        for &l in &hp.engram()?.layer_ids {
             let name = names::engram_embd(l);
             let (_, t) = split
                 .find(&name)

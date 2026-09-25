@@ -46,7 +46,7 @@ use std::fmt::{Debug, Write as _};
 use std::path::{Path, PathBuf};
 
 use gguf::Split;
-use model::arch::deepseek41::hparams::{Hparams, LayerKind, Rope, Score};
+use model::arch::deepseek41::hparams::{Collapse, Hparams, LayerKind, Model, Rope, Score};
 use model::arch::deepseek41::names;
 use model::placement::workstation;
 
@@ -295,6 +295,22 @@ fn hw_ds41_hparams_match_ik() {
         1e-6,
         "header hyper_connection.epsilon; llama-hparams.cpp:2070",
     );
+    row(
+        o,
+        b,
+        "collapse",
+        hp.collapse,
+        Collapse::Lagged,
+        "no output_hc_* tensor; ik dsv4_hc_lag for deepseek41, llama-hparams.cpp:2191",
+    );
+    row(
+        o,
+        b,
+        "model / q_head_norm",
+        (hp.model, hp.q_head_norm),
+        (Model::Deepseek41, false),
+        "the file's architecture string; ik dsv4_q_head_norm for deepseek41, llama-hparams.cpp:2192",
+    );
 
     let _ = writeln!(o, "experts");
     let e = &hp.experts;
@@ -372,7 +388,7 @@ fn hw_ds41_hparams_match_ik() {
     );
 
     let _ = writeln!(o, "engram");
-    let g = &hp.engram;
+    let g = hp.engram.as_ref().expect("a V4.1 file has engram sites");
     row(
         o,
         b,

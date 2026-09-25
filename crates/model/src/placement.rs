@@ -55,6 +55,9 @@ pub enum Role {
     EngramGain,
     /// An engram table: on NVMe, a few rows gathered per token.
     EngramTable,
+    /// A hash router's token table (`ffn_gate_tid2eid`): on the host, the one
+    /// row of expert ids a token's id selects gathered per token.
+    HashTable,
     /// A routed expert stack: split by the expert rule between the layer's card and the host.
     RoutedExperts,
     /// The token embedding: on the host, one row gathered per token — or
@@ -71,6 +74,42 @@ pub enum Role {
     Unused,
 }
 
+/// A feature of a file the engine does not run yet: what it is, and the layer
+/// it is on (`None` for the whole model).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unimplemented {
+    pub layer: Option<usize>,
+    pub feature: String,
+}
+
+/// `features` grouped by feature in first-seen order, each with its layers:
+/// `hash routing (layers 0, 1, 2); …`.
+fn unimplemented_list(features: &[Unimplemented]) -> String {
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for f in features {
+        let at = match groups.iter().position(|(g, _)| *g == f.feature) {
+            Some(i) => i,
+            None => {
+                groups.push((&f.feature, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        groups[at].1.extend(f.layer);
+    }
+    let parts: Vec<String> = groups
+        .iter()
+        .map(|(feature, layers)| match layers.as_slice() {
+            [] => (*feature).to_string(),
+            [l] => format!("{feature} (layer {l})"),
+            ls => {
+                let list: Vec<String> = ls.iter().map(ToString::to_string).collect();
+                format!("{feature} (layers {})", list.join(", "))
+            }
+        })
+        .collect();
+    parts.join("; ")
+}
+
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -83,6 +122,7 @@ impl fmt::Display for Role {
             Role::EngramDense => "engram_dense",
             Role::EngramGain => "engram_gain",
             Role::EngramTable => "engram_table",
+            Role::HashTable => "hash_table",
             Role::RoutedExperts => "routed",
             Role::TokenEmbedding => "token_embd",
             Role::Head => "head",
@@ -723,6 +763,10 @@ pub enum PlacementError {
     /// A `BLOOMERY_CARD_BUDGET` value that is not a byte count.
     #[error("{} {value:?}: {detail}", card_budget::LEVER)]
     CardBudgetLever { value: String, detail: String },
+    /// Features of the file the engine does not run yet — every one, each with
+    /// the layer it is on, or none for a model-wide one.
+    #[error("{} feature(s) of this file are not implemented: {}", .0.len(), unimplemented_list(.0))]
+    Unimplemented(Vec<Unimplemented>),
     /// A card budget below what the card needs with no expert on it.
     #[error(
         "card {card}: budget {budget} B is below its floor {floor} B = dense {dense} B (the \
@@ -1044,6 +1088,13 @@ fn place_whole(
             layer_of(t, layers)?;
             (
                 in_place(Device::Nvme, Format::NvmeFile, None, t.file_bytes),
+                gathered(t)?,
+            )
+        }
+        Role::HashTable => {
+            layer_of(t, layers)?;
+            (
+                in_place(Device::Host, Format::HostFile, None, t.file_bytes),
                 gathered(t)?,
             )
         }

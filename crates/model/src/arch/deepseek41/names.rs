@@ -1,6 +1,6 @@
-//! Every tensor name the DeepSeek-V4.1 decode step reads, in one place: the
-//! three model-level names, then the `blk.{N}.*` names every layer carries,
-//! then the ones only some layers carry. Which layers carry those is
+//! Every tensor name the DeepSeek-V4.1 and V4 decode steps read, in one place:
+//! the model-level names, then the `blk.{N}.*` names every layer carries, then
+//! the ones only some layers carry. Which layers carry those is
 //! [`LayerKind`](super::hparams::LayerKind)'s answer, decided by probing these
 //! names. Anything that formats a `blk.` literal elsewhere in `crates/model/src`
 //! is a name this table does not yet own.
@@ -18,6 +18,23 @@ pub fn output_norm() -> String {
 /// `output.weight` — the head, one row per vocabulary entry.
 pub fn output() -> String {
     "output.weight".to_string()
+}
+
+/// `output_hc_fn.weight` — the hyper-connection head's mix of the streams
+/// into one before the output norm; a V4 file carries it, a V4.1 file
+/// collapses with the last FFN's lagged mix instead.
+pub fn output_hc_fn() -> String {
+    "output_hc_fn.weight".to_string()
+}
+
+/// `output_hc_base.weight` — the bias of the head's mix.
+pub fn output_hc_base() -> String {
+    "output_hc_base.weight".to_string()
+}
+
+/// `output_hc_scale.weight` — the scale of the head's mix.
+pub fn output_hc_scale() -> String {
+    "output_hc_scale.weight".to_string()
 }
 
 /// `blk.{block}.attn_norm.weight` — the pre-attention RMS gain.
@@ -113,6 +130,13 @@ pub fn ffn_gate_inp(block: usize) -> String {
     format!("blk.{block}.ffn_gate_inp.weight")
 }
 
+/// `blk.{block}.ffn_gate_tid2eid.weight` — the hash router's table: the
+/// experts a token id runs, one row of `expert_used_count` ids per token. Its
+/// presence is what makes a block hash-routed.
+pub fn ffn_gate_tid2eid(block: usize) -> String {
+    format!("blk.{block}.ffn_gate_tid2eid.weight")
+}
+
 /// `blk.{block}.exp_probs_b.bias` — the router's selection bias.
 pub fn exp_probs_b(block: usize) -> String {
     format!("blk.{block}.exp_probs_b.bias")
@@ -163,6 +187,36 @@ pub fn attn_compressor_gate(block: usize) -> String {
 /// `blk.{block}.attn_compressor_norm.weight` — the RMS gain on a pooled row.
 pub fn attn_compressor_norm(block: usize) -> String {
     format!("blk.{block}.attn_compressor_norm.weight")
+}
+
+/// `blk.{block}.attn_compressor_ape.weight` — the compressor's position table:
+/// one score bias row per slot of a pooled group, added before the pooling
+/// softmax.
+pub fn attn_compressor_ape(block: usize) -> String {
+    format!("blk.{block}.attn_compressor_ape.weight")
+}
+
+/// `blk.{block}.indexer_compressor_kv.weight` — the indexer's own compressor,
+/// which pools the index keys from the layer input. Its presence is what
+/// makes a block an index-key owner without `indexer.attn_k`.
+pub fn indexer_compressor_kv(block: usize) -> String {
+    format!("blk.{block}.indexer_compressor_kv.weight")
+}
+
+/// `blk.{block}.indexer_compressor_gate.weight` — its pooling scores.
+pub fn indexer_compressor_gate(block: usize) -> String {
+    format!("blk.{block}.indexer_compressor_gate.weight")
+}
+
+/// `blk.{block}.indexer_compressor_norm.weight` — the RMS gain on a pooled
+/// index key.
+pub fn indexer_compressor_norm(block: usize) -> String {
+    format!("blk.{block}.indexer_compressor_norm.weight")
+}
+
+/// `blk.{block}.indexer_compressor_ape.weight` — its position table.
+pub fn indexer_compressor_ape(block: usize) -> String {
+    format!("blk.{block}.indexer_compressor_ape.weight")
 }
 
 /// `blk.{block}.indexer.attn_k.weight` — the index key projection of a pooled

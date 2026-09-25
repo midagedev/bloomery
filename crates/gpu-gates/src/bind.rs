@@ -179,7 +179,7 @@ pub fn sampler_factory() -> SamplerFactory {
 fn class_of(role: Role) -> &'static str {
     match role {
         Role::Attention => "attention",
-        Role::Router | Role::SharedExpert | Role::RoutedExperts => "experts",
+        Role::Router | Role::HashTable | Role::SharedExpert | Role::RoutedExperts => "experts",
         Role::FfnNorm | Role::DenseFfn => "ffn",
         Role::EngramDense | Role::EngramGain | Role::EngramTable => "ngram",
         Role::TokenEmbedding => "embeddings",

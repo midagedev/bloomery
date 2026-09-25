@@ -832,9 +832,9 @@ mod gate {
                 None => kinds.push((name, attn, ffn, 1)),
             }
         }
-        let sites = hp.engram.layer_ids.len();
+        let sites = hp.engram()?.layer_ids.len();
         let mut wkv_q8_1 = 0;
-        for &l in &hp.engram.layer_ids {
+        for &l in &hp.engram()?.layer_ids {
             wkv_q8_1 += usize::from(q8_1(ty(names::engram_wkv(l))?));
         }
         let glue = 1 + 3 * sites + wkv_q8_1 + 2 * sites + 1 + 4;
@@ -963,7 +963,7 @@ mod gate {
             .filter(|&i| matches!(&g.nodes[i], StepNode::Other(k) if k == "memcpy"))
             .collect();
         let first = *hp
-            .engram
+            .engram()?
             .layer_ids
             .iter()
             .min()
@@ -1223,7 +1223,7 @@ mod gate {
             return Ok(false);
         }
 
-        let sites = &hp.engram.layer_ids;
+        let sites = &hp.engram()?.layer_ids;
         let mut kv_lists: Vec<Vec<&str>> = Vec::new();
         for &site in sites {
             let k = shadow::engram_kv_kernels(split, site)?;
@@ -1496,7 +1496,7 @@ mod gate {
     /// Each engram site's host row ids against the set's `engram_rows-L`.
     fn check_ids(set: &Set, hp: &Hparams, body: &Body) -> Result<bool, GateError> {
         let mut all = true;
-        for (s, &l) in hp.engram.layer_ids.iter().enumerate() {
+        for (s, &l) in hp.engram()?.layer_ids.iter().enumerate() {
             let want = ref_ints(
                 &set.man,
                 &format!("engram_rows-{l}"),
@@ -1712,7 +1712,7 @@ mod gate {
         hp: &Hparams,
         seams: &[SeamOut],
     ) -> Result<(bool, f64, Option<f64>), GateError> {
-        let want = hp.n_layer * 2 + hp.engram.layer_ids.len();
+        let want = hp.n_layer * 2 + hp.engram()?.layer_ids.len();
         let mut pass = seams.len() == want;
         println!(
             "seams set={}: {} seams, want {want}: {}",

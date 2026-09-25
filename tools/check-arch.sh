@@ -32,7 +32,8 @@ ARCHES=$(find crates -mindepth 4 -maxdepth 4 -type d -path 'crates/*/src/arch/*'
   | sed 's|.*/||' | sort -u | tr '\n' ' ')
 [ -n "$ARCHES" ] || { echo "check-arch: no crates/*/src/arch/<name>/ directory found" >&2; exit 2; }
 ALT=$(printf '%s' "$ARCHES" | sed 's/ *$//; s/ /|/g')         # deepseek2|deepseek41|…
-KEYS=$(printf '"%s\\.|' $ARCHES | sed 's/|$//')               # "deepseek2\.|"deepseek41\.|…
+# 모듈 없이 다른 모듈이 읽는 아키텍처 문자열(원칙 3의 예외, docs/arch-split.md)은 규칙 ②의 키 접두에 들어간다.
+KEYS=$(printf '"%s\\.|' $ARCHES deepseek4 | sed 's/|$//')     # "deepseek2\.|"deepseek41\.|"deepseek4\.
 OWN="^crates/([^/]+/src/arch/|gpu-($ALT)/src/)"
 
 fail=0

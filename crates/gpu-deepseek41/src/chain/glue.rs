@@ -621,9 +621,9 @@ impl Glue {
                 dims.tokens
             )));
         }
-        let en = &hp.engram;
+        let (en, table_ty) = (hp.engram()?, hp.rows.engram()?);
         let rows = en.rows_per_token();
-        let table = TableRows::of(hp.rows.engram, en.key_length)
+        let table = TableRows::of(table_ty, en.key_length)
             .filter(|&(t, b)| t != TableRows::Q8_0 || b.is_multiple_of(4));
         let Some((table, row_bytes)) = table.filter(|&(_, b)| {
             en.key_length > 0 && dims.engram_bytes == en.layer_ids.len() * rows * b
@@ -632,7 +632,7 @@ impl Glue {
                 "engram rows of {} values of {}, {} bytes a token in the image: not {} sites of \
                  {rows} Q8_0 rows in whole words or Q3_K rows of whole super-blocks",
                 en.key_length,
-                hp.rows.engram,
+                table_ty,
                 dims.engram_bytes,
                 en.layer_ids.len()
             )));
@@ -1210,11 +1210,11 @@ impl StepRows {
         };
         let paths = (0..file.shard_count()).filter_map(|i| file.shard_path(i));
         let engram = Engram::open(paths).map_err(|e| GpuError::plan(WHAT, e))?;
-        let (hash, en) = (engram.hash(), &hp.engram);
-        let (_, row_bytes) = TableRows::of(hp.rows.engram, en.key_length).ok_or_else(|| {
+        let (hash, en, table_ty) = (engram.hash(), hp.engram()?, hp.rows.engram()?);
+        let (_, row_bytes) = TableRows::of(table_ty, en.key_length).ok_or_else(|| {
             refuse(format!(
                 "engram tables of {} rows of {} values: the card reads Q8_0 and Q3_K rows",
-                hp.rows.engram, en.key_length
+                table_ty, en.key_length
             ))
         })?;
         let layers_agree = hash.layer_ids().len() == en.layer_ids.len()
@@ -1243,7 +1243,7 @@ impl StepRows {
                 en.max_ngram,
                 en.rows_per_token(),
                 en.key_length,
-                hp.rows.engram
+                table_ty
             )));
         }
         let n_cols = hash.n_cols();

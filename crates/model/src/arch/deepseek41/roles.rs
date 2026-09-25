@@ -1,4 +1,4 @@
-//! The role of every tensor in a DeepSeek-V4.1 file, by name: the model-level
+//! The role of every tensor in a DeepSeek-V4.1 or V4 file, by name: the model-level
 //! names first, then the per-layer rules in order, the first match winning —
 //! the rule list of `docs/research/v41-placement/derive.py` `role()`, after
 //! the never-loaded names ([`Role::Unused`]: a multi-token-prediction head's
@@ -45,6 +45,7 @@ const LAYER_RULES: &[(Pattern, Role)] = &[
     (Pattern::Prefix("engram_"), Role::EngramDense),
     (Pattern::Prefix("hc_"), Role::HyperConnection),
     (Pattern::Prefix("ffn_gate_inp"), Role::Router),
+    (Pattern::Prefix("ffn_gate_tid2eid"), Role::HashTable),
     (Pattern::Prefix("exp_probs_b."), Role::Router),
     (Pattern::Prefix("exp_probs_b_vl"), Role::Unread),
     (Pattern::Suffix("_shexp.weight"), Role::SharedExpert),
@@ -112,7 +113,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
 }
 
 /// Rows one token reads from a row-gathered table: one row of the token
-/// embedding; of an engram layer's table, as many rows as its `engram_wkv`
+/// embedding and of a hash router's table; of an engram layer's table, as many rows as its `engram_wkv`
 /// takes in — that tensor's input width over the table's row width.
 fn gathered_rows(split: &Split, t: &ModelTensor) -> Result<Option<u64>, PlacementError> {
     let refuse = |detail: String| PlacementError::Tensor {
@@ -120,7 +121,7 @@ fn gathered_rows(split: &Split, t: &ModelTensor) -> Result<Option<u64>, Placemen
         detail,
     };
     match (t.role, t.layer) {
-        (Role::TokenEmbedding, _) => Ok(Some(1)),
+        (Role::TokenEmbedding | Role::HashTable, _) => Ok(Some(1)),
         (Role::EngramTable, Some(layer)) => {
             let wkv = names::engram_wkv(layer);
             let Some((_, w)) = split.find(&wkv) else {
@@ -164,6 +165,10 @@ mod tests {
         assert_eq!(
             role("blk.0.exp_probs_b.bias"),
             Some((Role::Router, Some(0)))
+        );
+        assert_eq!(
+            role("blk.2.ffn_gate_tid2eid.weight"),
+            Some((Role::HashTable, Some(2)))
         );
         for name in [
             "blk.0.ffn_up.weight",

@@ -136,7 +136,11 @@ impl ImageDims {
             rope_dims: hp.rope_dims,
             n_embd: hp.n_embd,
             embd_bytes,
-            engram_bytes: hp.engram.layer_ids.len() * hp.engram.rows_per_token() * engram_row_bytes,
+            engram_bytes: hp
+                .engram
+                .as_ref()
+                .map_or(0, |e| e.layer_ids.len() * e.rows_per_token())
+                * engram_row_bytes,
         }
     }
 }
