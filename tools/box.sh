@@ -15,8 +15,9 @@ ssh "$HOST" "mkdir -p $REMOTE"
 # 직전 빌드 산출물보다 과거로 찍힌다(변이 바이너리가 두 번 그대로 돌았다).
 # 원격 루트의 *.ptx·*.ll은 cargo oxide가 빌드 중에 쓰는 산출물이다(`bloomery_gpu_deepseek41.ptx`, `….linked.opt.ll`) — 같은
 # 원격 디렉터리에서 빌드가 도는 사이 다른 box.sh 호출의 --delete가 그것을 지우면 빌드가 rc 101로 죽는다(dspark-q3k와
-# ds41splitk 라운드에서 한 번씩). 맥 트리에는 없으니 삭제 대상에서 뺀다.
-rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' "$HERE"/ "$HOST:$REMOTE/"
+# ds41splitk 라운드에서 한 번씩). `.oxide-artifacts/`(`embed.o` 등)도 같은 부류다(q3fix 라운드에서 한 번). 맥 트리에는 없으니
+# 삭제 대상에서 뺀다.
+rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' "$HERE"/ "$HOST:$REMOTE/"
 # 카드 선택. 기본은 env 파일의 3090 핀 그대로. BLOOMERY_CARD=a6000|both는 박스에서 이름으로 UUID를 찾아
 # CUDA_VISIBLE_DEVICES를 덮어쓴다(both = 3090 먼저 → 디바이스 0이 3090). 두 카드 다 우리 것이다(야간 학습은
 # 2026-09-21에 끝났고 llm.service는 꺼져 있다). 그래도 그 카드에 이미 컴퓨트 프로세스가 있으면 — 우리 다른
