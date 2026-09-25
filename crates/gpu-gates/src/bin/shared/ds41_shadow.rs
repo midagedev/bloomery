@@ -27,9 +27,10 @@ fn projection(ty: GgmlType, name: &str) -> Result<&'static [&'static str], GateE
 }
 
 /// The MoE piece's own work in layer `l`'s host-leg shadow, in stream order:
-/// HC_PRE, with card experts the routed gate·up, h's q8_1 and the routed
-/// down, then the shared expert's gate·up (`ds41_shexp_gate_up`, or its
-/// q3_K twin when both weights are q3_K) and down ([`projection`]).
+/// HC_PRE, with card experts the routed gate·up, the q8_1 of h's card-slot
+/// columns and the routed down, then the shared expert's gate·up
+/// (`ds41_shexp_gate_up`, or its q3_K twin when both weights are q3_K) and
+/// down ([`projection`]).
 pub fn shadow_kernels(
     split: &Split,
     l: usize,
@@ -37,7 +38,12 @@ pub fn shadow_kernels(
 ) -> Result<Vec<&'static str>, GateError> {
     let mut k = vec!["ds41_hc_pre"];
     if card_experts {
-        k.extend(["ds41_expert_gate_up", "q3k_quantize_q8_1", "q4k_gemv_sel"]);
+        // PIN(2026-09-26, fixup6): q3k_quantize_q8_1 → q8_1_quantize_sel, same launch count.
+        // h's q8_1 covers the card slots' columns alone: a column the host serves
+        // holds what the last faulted step left there, a reset keeps it, and a
+        // quantizer that read it raised quant_column on a clean step
+        // (gate_deepseek41_prefill, "fault-reset steps").
+        k.extend(["ds41_expert_gate_up", "q8_1_quantize_sel", "q4k_gemv_sel"]);
     }
     let gate = type_of(split, &names::ffn_gate_shexp(l))?;
     let up = type_of(split, &names::ffn_up_shexp(l))?;

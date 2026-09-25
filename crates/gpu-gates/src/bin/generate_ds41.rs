@@ -873,7 +873,7 @@ mod drive {
         let time = FeedTime {
             n: depth,
             passes: if batch {
-                depth.div_ceil(body::T_MAX)
+                body::batch_count(depth)
             } else {
                 depth
             },
@@ -1148,7 +1148,7 @@ mod drive {
         let time = FeedTime {
             n: depth,
             passes: if batch {
-                depth.div_ceil(body::T_MAX)
+                body::batch_count(depth)
             } else {
                 depth
             },

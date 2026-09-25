@@ -15,16 +15,73 @@
 //! Q4_K rows are `36 * n_sb` u32 words, whole words for any `n_sb`, so an
 //! odd super-block count needs no load-time repack (unlike Q3_K): the core's
 //! guarded tail runs the partial last four-super-block iteration.
+//!
+//! [`q4k_gemv_grouped`] reads each expert's rows once for all its slots,
+//! walking a table that groups the slots by expert; [`grouped_run`] is the
+//! one rule of that table's runs, shared with the other grouped kernels.
+//! Their input, the q8_1 form of each slot's own column, comes from
+//! [`Q4kSelKernels::enqueue_quantize_sel`]: it quantizes the columns of the
+//! slots whose place is on the card — the columns a routed gate·up wrote —
+//! and no other, so a column the host serves is never read, even by the
+//! quantizer.
 
 use crate::cores::q4k_row_dot_1col;
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
 use crate::hybrid::HOST;
+use crate::q8_1_quant_block;
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
+use std::ops::Range;
 use std::sync::Arc;
+
+/// Threads per block of the gemv kernels here, one warp per output row.
+const THREADS: u32 = 256;
+// The kernels' launch attributes spell the block as a literal.
+const _: () = assert!(THREADS == 256);
+
+/// Output rows a gemv block computes: one per warp.
+const ROWS_PER_BLOCK: usize = THREADS as usize / 32;
+
+/// The run of expert `e` in a grouped slot table: entries `j0 .. j1` of
+/// `order`, `(j0, j1) = (start[e], start[e + 1])` — the layout a bucket pass
+/// writes, one run per expert, each inside `order[.. n_slots]`. A run that
+/// starts after its end or ends past `n_slots` names entries the table does
+/// not hold: lane 0 raises [`FaultSite::ExpertId`] on `fault` and the answer
+/// is `None`. A caller returns on `None` before it reads `order`, rather than
+/// walk an empty run: joined into the walk's entry, the refusal costs the
+/// kernel registers.
+///
+/// # Safety
+///
+/// `e + 1 < start.len()`, and the 32 lanes of the warp call it with the same
+/// `e`: the run, like the fault, is the warp's.
+#[inline(always)]
+pub unsafe fn grouped_run(
+    start: &[u32],
+    e: usize,
+    n_slots: usize,
+    lane: usize,
+    fault: FaultSink,
+) -> Option<(usize, usize)> {
+    // SAFETY: e + 1 < start.len() by this fn's contract.
+    let (j0, j1) = unsafe {
+        (
+            *start.get_unchecked(e) as usize,
+            *start.get_unchecked(e + 1) as usize,
+        )
+    };
+    if j0 <= j1 && j1 <= n_slots {
+        Some((j0, j1))
+    } else {
+        if lane == 0 {
+            fault.raise(FaultSite::ExpertId);
+        }
+        None
+    }
+}
 
 #[cuda_module]
 mod q4k_sel_kernels {
@@ -80,8 +137,8 @@ mod q4k_sel_kernels {
         fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
-        let t = thread::index_1d().get() % 256;
-        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
         if row >= n_slots as usize * rows_per_expert as usize {
             return;
         }
@@ -122,8 +179,9 @@ mod q4k_sel_kernels {
     /// `cores::q4k_row_dot_1col`, the warp reduction and the lane-0 store
     /// into `y[s * rows_per_expert + r]` — `q4k_gemv_sel`'s value for that
     /// slot, bit for bit. The row comes from memory once and from the cache
-    /// for the expert's other slots. An `order` entry not below `n_slots`
-    /// names no slot: it raises [`FaultSite::ExpertId`] and is skipped.
+    /// for the expert's other slots. A run [`grouped_run`] refuses, and an
+    /// `order` entry not below `n_slots`, name no slot: each raises
+    /// [`FaultSite::ExpertId`] and is skipped.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -163,26 +221,26 @@ mod q4k_sel_kernels {
     ) {
         let t = thread::threadIdx_x() as usize;
         let rpe = rows_per_expert as usize;
-        let tiles = rpe.div_ceil(8);
+        let tiles = rpe.div_ceil(ROWS_PER_BLOCK);
         let b = thread::blockIdx_x() as usize;
-        let (e, r) = (b / tiles, (b % tiles) * 8 + t / 32);
+        let (e, r) = (b / tiles, (b % tiles) * ROWS_PER_BLOCK + t / 32);
         // Warp-uniform: all 32 lanes share e and r.
         if e >= n_experts as usize || r >= rpe {
             return;
         }
-        // SAFETY: e + 1 <= n_experts < start.len() by the launch contract.
-        let (j0, j1) = unsafe {
-            (
-                *start.get_unchecked(e) as usize,
-                *start.get_unchecked(e + 1) as usize,
-            )
-        };
         let row_abs = e * rpe + r;
         let lane = warp::lane_id() as usize;
+        // SAFETY: e + 1 <= n_experts < start.len() by the launch contract, and
+        // the warp's lanes share e.
+        let run = unsafe { grouped_run(start, e, n_slots as usize, lane, fault) };
+        // Block-uniform: the block's warps share e, hence the run.
+        let Some((j0, j1)) = run else {
+            return;
+        };
         let mut j = j0;
-        while j < j1.min(n_slots as usize) {
-            // SAFETY: j < n_slots <= order.len() by the launch contract; the
-            // load is warp-uniform.
+        while j < j1 {
+            // SAFETY: j < j1 <= n_slots <= order.len() by `grouped_run` and the
+            // launch contract; the load is warp-uniform.
             let slot = unsafe { *order.get_unchecked(j) } as usize;
             if slot >= n_slots as usize || col0 as usize + slot >= cols as usize {
                 if lane == 0 {
@@ -218,6 +276,97 @@ mod q4k_sel_kernels {
             j += 1;
         }
     }
+
+    /// The q8_1 form of the activation columns the card's expert slots read:
+    /// one 32-thread block per 128-value block of column `c0 + j` (`j <
+    /// m_cols`), which quantizes it from the same column of `x` into the five
+    /// planes — `q8_1_quant_block`, the body of every q8_1 quantizer, so a
+    /// column's bytes are the plain quantizer's — when its slot's place
+    /// `sel[j]` is below `n_card`, and returns before any load otherwise: a
+    /// slot the host serves has no activation here, and its column keeps
+    /// what it held. A non-finite value raises [`FaultSite::QuantColumn`] on
+    /// `fault`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            x.len() >= (c0 + m_cols) * 256 * n_sb,
+            sel.len() >= m_cols,
+            q3.len() >= (c0 + m_cols) * 64 * half_it,
+            q4.len() >= (c0 + m_cols) * 256 * quad_it,
+            q6.len() >= (c0 + m_cols) * 128 * half_it,
+            s8.len() >= (c0 + m_cols) * 8 * n_sb,
+            d8.len() >= (c0 + m_cols) * 2 * n_sb
+        )
+    )]
+    pub fn q8_1_quantize_sel(
+        x: &[f32],
+        sel: &[u32],
+        c0: u32,
+        m_cols: u32,
+        n_card: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        let blk = thread::index_1d().get() / 32;
+        let n_sb = n_sb as usize;
+        let blocks_per_col = 2 * n_sb;
+        if blk >= m_cols as usize * blocks_per_col {
+            return;
+        }
+        let (j, b) = (blk / blocks_per_col, blk % blocks_per_col);
+        // SAFETY: j < m_cols <= sel.len() by the launch contract. The 32
+        // lanes of the block share `blk`, hence `j`: the return is uniform.
+        if unsafe { *sel.get_unchecked(j) } >= n_card {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // The block body's contract: column c0 + j < c0 + m_cols and b < 2
+        // n_sb by the lines above, the launch contract bounds `x` (at base 0)
+        // and the five planes at c0 + m_cols columns, and the block index is
+        // warp-uniform.
+        q8_1_quant_block(
+            x,
+            0,
+            c0 as usize + j,
+            b,
+            n_sb,
+            half_it,
+            quad_it,
+            lane,
+            &mut q3,
+            &mut q4,
+            &mut q6,
+            &mut s8,
+            &mut d8,
+            fault,
+            FaultSite::QuantColumn,
+        );
+    }
+}
+
+/// What [`Q4kSelKernels::enqueue_quantize_sel`] quantizes: the columns
+/// `cols` of `x` (the activation's `k` values a column) whose slot — column
+/// `c` is slot `c − cols.start` — has its place `sel[c − cols.start]` below
+/// `n_card`, the count of the card's experts.
+pub struct QuantSel<'a> {
+    pub x: &'a DeviceBuffer<f32>,
+    pub cols: Range<usize>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n_card: usize,
 }
 
 /// The loaded Q4_K expert-select module and its enqueue API. Owns no
@@ -327,14 +476,18 @@ impl Q4kSelKernels {
                 ),
             ));
         }
-        let grid = launch_u32(what, "grid", (n_slots * rows_per_expert).div_ceil(8))?;
+        let grid = launch_u32(
+            what,
+            "grid",
+            (n_slots * rows_per_expert).div_ceil(ROWS_PER_BLOCK),
+        )?;
         let n_experts = launch_u32(what, "n_experts", w.rows() / rows_per_expert)?;
         let rows_per_expert = launch_u32(what, "rows_per_expert", rows_per_expert)?;
         let n_slots = launch_u32(what, "n_slots", n_slots)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let prep = self
             .module
-            .prepare_q4k_gemv_sel(LaunchConfig1D::new(grid, 256, 0))?;
+            .prepare_q4k_gemv_sel(LaunchConfig1D::new(grid, THREADS, 0))?;
         self.module.q4k_gemv_sel(
             stream,
             &prep,
@@ -359,8 +512,9 @@ impl Q4kSelKernels {
     /// and writing `y[s * rows_per_expert ..]`; `order` and `start` group the
     /// slots by expert, one run per expert of `w` (`w.rows() /
     /// rows_per_expert` of them). Each slot's value is
-    /// [`Q4kSelKernels::enqueue_gemv_q4k_sel`]'s. An `order` entry that names
-    /// no slot raises [`FaultSite::ExpertId`] on `fault`. Asynchronous,
+    /// [`Q4kSelKernels::enqueue_gemv_q4k_sel`]'s. A run that does not fit
+    /// the table ([`grouped_run`]) and an `order` entry that names no slot
+    /// raise [`FaultSite::ExpertId`] on `fault`. Asynchronous,
     /// allocation-free.
     #[allow(
         clippy::too_many_arguments,
@@ -408,10 +562,14 @@ impl Q4kSelKernels {
                 y.len()
             )));
         }
-        let grid = launch_u32(what, "grid", n_experts * rows_per_expert.div_ceil(8))?;
+        let grid = launch_u32(
+            what,
+            "grid",
+            n_experts * rows_per_expert.div_ceil(ROWS_PER_BLOCK),
+        )?;
         let prep = self
             .module
-            .prepare_q4k_gemv_grouped(LaunchConfig1D::new(grid, 256, 0))?;
+            .prepare_q4k_gemv_grouped(LaunchConfig1D::new(grid, THREADS, 0))?;
         self.module.q4k_gemv_grouped(
             stream,
             &prep,
@@ -430,6 +588,69 @@ impl Q4kSelKernels {
             launch_u32(what, "iters", n_sb.div_ceil(4))?,
             fault,
             y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue [`q8_1_quantize_sel`]: the q8_1 form of the columns `q.cols`
+    /// of `q.x` whose slot's place in `q.sel` is on the card, each into the
+    /// same column of `act` with the bytes [`crate::Gpu::enqueue_quantize_q8_1`]
+    /// writes for it; every other column of `act` keeps what it held. These
+    /// are the columns a routed gate·up wrote and the only ones the `_sel`
+    /// and grouped downs read. A non-finite value raises
+    /// [`FaultSite::QuantColumn`] on `fault`. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_quantize_sel(
+        &self,
+        stream: &CudaStream,
+        q: &QuantSel<'_>,
+        fault: FaultSink,
+        act: &mut Q8Act,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_quantize_sel";
+        let (k, n_sb, m) = (act.k(), act.n_sb(), q.cols.len());
+        if m == 0
+            || q.cols.end > act.m()
+            || q.x.len() < q.cols.end * k
+            || q.sel.len() < m
+            || q.n_card == 0
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "columns {:?} of {} values from {} into {} columns, {} places, a card of {} \
+                     experts: the columns non-empty and inside both, a place a column, at least \
+                     one expert",
+                    q.cols,
+                    k,
+                    q.x.len(),
+                    act.m(),
+                    q.sel.len(),
+                    q.n_card
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * 2 * n_sb)?;
+        let prep = self
+            .module
+            .prepare_q8_1_quantize_sel(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.q8_1_quantize_sel(
+            stream,
+            &prep,
+            q.x,
+            q.sel,
+            launch_u32(what, "c0", q.cols.start)?,
+            launch_u32(what, "m_cols", m)?,
+            launch_u32(what, "n_card", q.n_card)?,
+            launch_u32(what, "n_sb", n_sb)?,
+            launch_u32(what, "half_it", n_sb.div_ceil(2))?,
+            launch_u32(what, "quad_it", n_sb.div_ceil(4))?,
+            &mut act.q3,
+            &mut act.q4,
+            &mut act.q6,
+            &mut act.s8,
+            &mut act.d8,
+            fault,
         )?;
         Ok(())
     }

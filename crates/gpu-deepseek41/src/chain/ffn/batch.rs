@@ -10,7 +10,9 @@
 //!    router (`RouterKernels::enqueue_router_rows`, each token's scores and
 //!    selection the one-token launch's) into the batch's ids and weights, and
 //!    each slot's place in the card's routed stacks (`ds41_ffn_places`, the
-//!    handoff's rule);
+//!    handoff's rule, an id past the expert count raising its fault);
+//!    the layer's tensors are resolved once for the route and the shadow
+//!    ([`FfnPiece::resolve_batch`]);
 //! 2. the exchange ([`FfnBatch::enqueue_download`], [`FfnBatch::serve`],
 //!    [`FfnBatch::enqueue_upload`]): the block's activations and routing to
 //!    the host, one union call over its tokens for the layer's host experts
@@ -18,8 +20,9 @@
 //! 3. the shadow ([`FfnPiece::enqueue_batch_shadow`]), enqueued before the
 //!    host computes: per chunk HC_PRE, the norm's q8_1 form again, the card's
 //!    routed experts over the chunk's slots (the gate·up, the step's dot on
-//!    column `slot / 6`; the q8_1 of `h`; `q4k_sel` over the slots) and their
-//!    sum (`ds41_ffn_card_acc`), the shared expert. The gate·up reads each
+//!    column `slot / 6`; the q8_1 of the card slots' columns of `h`, the only
+//!    columns the gate·up wrote; `q4k_sel` over the slots) and their sum
+//!    (`ds41_ffn_card_acc`), the shared expert. The gate·up reads each
 //!    card expert once over the whole block by default
 //!    (`ds41_card_buckets`, `ds41_expert_gate_up_grouped`, between the
 //!    chunks' parts before and after it), or once per slot chunk by chunk
@@ -31,6 +34,10 @@
 //! The feature tap of a batch's kept tokens is one launch here too
 //! ([`FfnBatch::enqueue_tap_means`], `ds41_tap_means`).
 //!
+//! The launches that raise on input a batch's own route cannot produce — a
+//! place for an id past the stack, a run table that does not fit its slots —
+//! are [`FfnBatchKernels`]'s, which a gate loads alone and drives with it.
+//!
 //! Every token's values are the step's bit for bit: each launch writes, per
 //! token, what its one-token launch writes — the m-column kernels carry that
 //! contract, the routed dot reads its token's column through the step's
@@ -38,14 +45,16 @@
 //! ([`card_sum_elem`], then [`join_elem`]).
 
 use std::mem::size_of;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bloomery_gpu::cores::q3k_row_dot;
+use bloomery_gpu::q4k_sel::{QuantSel, grouped_run};
 use bloomery_gpu::{FaultSink, FaultSite};
-use cuda_core::{CudaEvent, IntoResult, PinnedHostBuffer, sys};
+use cuda_core::{CudaContext, CudaEvent, IntoResult, PinnedHostBuffer, sys};
 use cuda_device::{SharedArray, warp};
 
 use super::*;
+use crate::chain::nanos;
 use crate::experts::swiglu_clamp;
 use crate::hc::hc_mean_elem;
 use crate::span::{span, span_mut};
@@ -54,11 +63,20 @@ const WHAT: &str = "FfnBatch";
 
 /// Threads per block of every kernel here but the bucket kernel.
 const THREADS: u32 = 256;
+// The kernels' launch attributes spell the block as a literal.
+const _: () = assert!(THREADS == 256);
+
+/// Weight rows a gate·up block computes: one per warp.
+const ROWS_PER_BLOCK: usize = THREADS as usize / 32;
 
 /// Threads of the bucket kernel's one block, and the most card experts a
 /// layer's stack holds for it (its shared start table's width).
 const BUCKET_THREADS: u32 = 1024;
 const BUCKET_EXPERTS: usize = 1024;
+// The count pass gives each expert a thread of its own, and the kernel's
+// launch attributes and contract spell both as a literal.
+const _: () = assert!(BUCKET_THREADS as usize >= BUCKET_EXPERTS);
+const _: () = assert!(BUCKET_THREADS == 1024 && BUCKET_EXPERTS == 1024);
 
 #[cuda_module]
 mod ffn_batch_kernels {
@@ -66,7 +84,9 @@ mod ffn_batch_kernels {
 
     /// Each slot's place, the handoff's rule: thread `i < n` writes `sel[i] =
     /// map[row_off + ids[i]]` — the id's slot in the card's routed stacks, or
-    /// [`HOST`] — and [`HOST`] for an id not below `n_expert`.
+    /// [`HOST`]. An id not below `n_expert` has no place: it raises
+    /// [`FaultSite::ExpertId`] on `fault` and its place is [`HOST`], so no
+    /// card kernel reads a row for it.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -80,6 +100,7 @@ mod ffn_batch_kernels {
         row_off: u32,
         n_expert: u32,
         n: u32,
+        fault: FaultSink,
         mut sel: DisjointSlice<u32>,
     ) {
         let i = thread::index_1d().get();
@@ -93,6 +114,7 @@ mod ffn_batch_kernels {
             // contract.
             unsafe { *map.get_unchecked(row_off as usize + id as usize) }
         } else {
+            fault.raise(FaultSite::ExpertId);
             HOST
         };
         // SAFETY: i < n <= sel.len(); thread i is sel[i]'s only writer.
@@ -144,7 +166,7 @@ mod ffn_batch_kernels {
         mut h: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
-        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let row = (thread::index_1d().get() / 256) * ROWS_PER_BLOCK + t / 32;
         if row >= n_slots as usize * rows_per_expert as usize {
             return;
         }
@@ -281,8 +303,9 @@ mod ffn_batch_kernels {
     /// `swiglu_clamp` into `h[s · rows_per_expert + r]` — the per-slot
     /// kernel's value for that slot and row, bit for bit. A slot's weight row
     /// comes from memory once and from the cache for the expert's other slots.
-    /// An `order` entry that names no slot of the block raises
-    /// [`FaultSite::ExpertId`] and is skipped.
+    /// A run that does not fit the block's slots (`q4k_sel::grouped_run`, the
+    /// grouped down's rule too) and an `order` entry that names no slot of the
+    /// block raise [`FaultSite::ExpertId`] and are skipped.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -323,25 +346,26 @@ mod ffn_batch_kernels {
     ) {
         let tid = thread::threadIdx_x() as usize;
         let rpe = rows_per_expert as usize;
-        let tiles = rpe.div_ceil(8);
+        let tiles = rpe.div_ceil(ROWS_PER_BLOCK);
         let b = thread::blockIdx_x() as usize;
-        let (e, r) = (b / tiles, (b % tiles) * 8 + tid / 32);
+        let (e, r) = (b / tiles, (b % tiles) * ROWS_PER_BLOCK + tid / 32);
         // Warp-uniform: all 32 lanes share e and r.
         if e >= n_experts as usize || r >= rpe {
             return;
         }
-        // SAFETY: e + 1 <= n_experts < start.len() by the launch contract.
-        let (j0, j1) = unsafe {
-            (
-                *start.get_unchecked(e) as usize,
-                *start.get_unchecked(e + 1) as usize,
-            )
-        };
         let row_abs = e * rpe + r;
         let lane = warp::lane_id() as usize;
+        // SAFETY: e + 1 <= n_experts < start.len() by the launch contract, and
+        // the warp's lanes share e.
+        let run = unsafe { grouped_run(start, e, n_slots as usize, lane, fault) };
+        // Block-uniform: the block's warps share e, hence the run.
+        let Some((j0, j1)) = run else {
+            return;
+        };
         let mut j = j0;
-        while j < j1.min(n_slots as usize) {
-            // SAFETY: j < n_slots <= order.len() by the launch contract.
+        while j < j1 {
+            // SAFETY: j < j1 <= n_slots <= order.len() by `grouped_run` and the
+            // launch contract.
             let slot = unsafe { *order.get_unchecked(j) } as usize;
             let col = col0 as usize + slot / N_USED;
             if slot >= n_slots as usize || col >= cols as usize {
@@ -574,6 +598,133 @@ mod ffn_batch_kernels {
     }
 }
 
+/// The batch's kernels: loaded once by [`FfnBatch::new`], or alone by a gate
+/// that drives the launches with inputs a batch's route cannot produce.
+pub struct FfnBatchKernels {
+    module: ffn_batch_kernels::LoadedModule,
+}
+
+/// What [`FfnBatchKernels::enqueue_places`] reads: `n` routed ids, and the
+/// slot map's card copy with the layer's row at `row_off` (`n_expert` places
+/// a row).
+pub struct Places<'a> {
+    pub ids: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub map: &'a DeviceBuffer<u32>,
+    pub row_off: usize,
+    pub n_expert: usize,
+}
+
+/// What [`FfnBatchKernels::enqueue_gate_up_grouped`] reads: both Q3_K stacks
+/// of `n_experts` card experts of `rows_per_expert` rows, the q8_1 planes of
+/// `cols` token columns of `n_sb` super-blocks (the block's from `col0`), and
+/// the `n_slots` slots of the block grouped by expert (`order`, runs
+/// `start`); `limit` is the SwiGLU clamp.
+pub struct GroupedGateUp<'a> {
+    pub wg: &'a DeviceBuffer<u32>,
+    pub wu: &'a DeviceBuffer<u32>,
+    pub q3: &'a DeviceBuffer<u64>,
+    pub d8: &'a DeviceBuffer<f32>,
+    pub order: &'a DeviceBuffer<u32>,
+    pub start: &'a DeviceBuffer<u32>,
+    pub n_experts: usize,
+    pub rows_per_expert: usize,
+    pub n_slots: usize,
+    pub col0: usize,
+    pub cols: usize,
+    pub n_sb: usize,
+    pub limit: f32,
+}
+
+impl FfnBatchKernels {
+    /// Load the batch's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<FfnBatchKernels, GpuError> {
+        // SAFETY: this crate owns the embedded device bundle produced for the
+        // module above; each launcher checks its launch contract.
+        let module = unsafe { ffn_batch_kernels::load(ctx)? };
+        Ok(FfnBatchKernels { module })
+    }
+
+    /// Enqueue `ds41_ffn_places`: `sel[i]` the place of `p.ids[i]` for `i <
+    /// p.n`, [`HOST`] and [`FaultSite::ExpertId`] on `fault` for an id past
+    /// the stack. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_places(
+        &self,
+        stream: &CudaStream,
+        p: &Places<'_>,
+        fault: FaultSink,
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_ffn_places";
+        let grid = launch_u32(what, "grid", p.n.div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_ds41_ffn_places(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.ds41_ffn_places(
+            stream,
+            &prep,
+            p.ids,
+            p.map,
+            launch_u32(what, "row_off", p.row_off)?,
+            launch_u32(what, "n_expert", p.n_expert)?,
+            launch_u32(what, "n", p.n)?,
+            fault,
+            sel,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue `ds41_expert_gate_up_grouped`: the SwiGLU outputs of the
+    /// card's slots of `g`, each card expert read once, into `h` (`g.n_slots
+    /// · g.rows_per_expert` values). One launch. Asynchronous,
+    /// allocation-free.
+    pub fn enqueue_gate_up_grouped(
+        &self,
+        stream: &CudaStream,
+        g: &GroupedGateUp<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_expert_gate_up_grouped";
+        let grid = launch_u32(
+            what,
+            "grid",
+            g.n_experts * g.rows_per_expert.div_ceil(ROWS_PER_BLOCK),
+        )?;
+        let prep = self
+            .module
+            .prepare_ds41_expert_gate_up_grouped(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.ds41_expert_gate_up_grouped(
+            stream,
+            &prep,
+            g.wg,
+            g.wu,
+            g.q3,
+            g.d8,
+            g.order,
+            g.start,
+            launch_u32(what, "n_experts", g.n_experts)?,
+            launch_u32(what, "rows_per_expert", g.rows_per_expert)?,
+            launch_u32(what, "n_slots", g.n_slots)?,
+            launch_u32(what, "col0", g.col0)?,
+            launch_u32(what, "cols", g.cols)?,
+            launch_u32(what, "n_sb", g.n_sb)?,
+            launch_u32(what, "iters", g.n_sb.div_ceil(2))?,
+            g.limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+}
+
+/// A layer's tensors, resolved once for a batch's route and shadow of it
+/// ([`FfnPiece::resolve_batch`]).
+pub struct BatchLayer<'w> {
+    layer: usize,
+    lw: LayerWeights<'w>,
+}
+
 /// What the batch join reads, `m` tokens token-major: `acc` the card sums,
 /// `hsum` the host sums and `shexp` the shared expert's outputs (`n` a
 /// token), `res` the streams the sub-layer read (`4n` a token) and `hc` its
@@ -633,7 +784,7 @@ unsafe fn join_post_at(a: &JoinIn<'_>, n: usize, i: usize) -> ([f32; 4], [f32; 4
 /// once, when the first batch runs — a decode that never prefills a batch
 /// never holds them.
 pub struct FfnBatch {
-    module: ffn_batch_kernels::LoadedModule,
+    kernels: FfnBatchKernels,
     cap: usize,
     n_embd: usize,
     ff: usize,
@@ -776,11 +927,9 @@ impl FfnBatch {
         };
         let counts = 1..=c;
         let n_sb = n_embd / 256;
-        // SAFETY: this crate owns the embedded device bundle produced for the
-        // module above; each launcher checks its launch contract.
-        let module = unsafe { ffn_batch_kernels::load(ctx)? };
+        let kernels = FfnBatchKernels::load(ctx)?;
         Ok(FfnBatch {
-            module,
+            kernels,
             cap,
             n_embd,
             ff,
@@ -935,9 +1084,10 @@ impl FfnBatch {
         }
         let grid = launch_u32(what, "grid", (m * n).div_ceil(THREADS as usize))?;
         let prep = self
+            .kernels
             .module
             .prepare_ds41_tap_means(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.ds41_tap_means(
+        self.kernels.module.ds41_tap_means(
             gpu.stream(),
             &prep,
             streams,
@@ -1059,11 +1209,6 @@ unsafe fn dtod<T: cuda_core::DeviceCopy>(
     })
 }
 
-/// `d` in whole nanoseconds, saturating.
-fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
-}
-
 /// Enqueue the copy of values `at` of `src` to the same values of `dst`.
 ///
 /// SAFETY: `dst` is not read, written or freed until the copy completes.
@@ -1164,7 +1309,27 @@ pub struct JoinIo<'a> {
 }
 
 impl FfnPiece {
-    /// Layer `layer`'s route for the block `io` of a batch: per chunk the
+    /// Layer `layer`'s tensors in `w` for a batch's route and shadow of it,
+    /// resolved once: each in the format its launch reads, the shared
+    /// expert's down in the format the file's header names for it.
+    pub fn resolve_batch<'w>(
+        &self,
+        w: &'w Weights,
+        layer: usize,
+    ) -> Result<BatchLayer<'w>, GpuError> {
+        let i = self.layer_index(layer, WHAT)?;
+        let c = &self.cfg[i];
+        let lw = LayerWeights::resolve(c, w, [self.n_embd, self.ff], self.hc_eps, self.hc_iters)?;
+        if lw.sh_down.reads_q8_1() != c.sh_down_q8_1 {
+            return Err(tensor_err(
+                &c.sh_down,
+                "of the format the file's header names for it",
+            ));
+        }
+        Ok(BatchLayer { layer, lw })
+    }
+
+    /// The route of `bl`'s layer for the block `io` of a batch: per chunk the
     /// norm with its q8_1 form; then, over the block's tokens, the router
     /// ([`RouterKernels::enqueue_router_rows`], two launches) and each slot's
     /// place from `slots`, the map's card copy (one launch). Asynchronous,
@@ -1172,16 +1337,15 @@ impl FfnPiece {
     pub fn enqueue_batch_route(
         &mut self,
         gpu: &Gpu,
-        w: &Weights,
+        bl: &BatchLayer<'_>,
         b: &mut FfnBatch,
-        layer: usize,
         io: &BlockIo<'_>,
         slots: &DeviceTensor<u32>,
     ) -> Result<(), GpuError> {
+        let (layer, lw) = (bl.layer, &bl.lw);
         let (i, at, u) = self.batch_block(layer, b, io)?;
         let (stream, n) = (gpu.stream(), self.n_embd);
         let c = &self.cfg[i];
-        let lw = LayerWeights::resolve(c, w, [n, self.ff], self.hc_eps, self.hc_iters)?;
         let fault = gpu.layer_sink(layer)?;
         for r in io.chunks {
             let (at, m) = (r.start - io.base, r.len());
@@ -1216,53 +1380,36 @@ impl FfnPiece {
                 fault,
             )?;
         }
-        let what = "ds41_ffn_places";
         let slots_n = t * N_USED;
         let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
         let mut sel = span_mut(WHAT, &mut b.sel, at * N_USED, slots_n)?;
-        let grid = launch_u32(what, "grid", slots_n.div_ceil(THREADS as usize))?;
-        let prep = b
-            .module
-            .prepare_ds41_ffn_places(LaunchConfig1D::new(grid, THREADS, 0))?;
-        b.module.ds41_ffn_places(
-            stream,
-            &prep,
-            &ids,
-            slots.buf(),
-            launch_u32(what, "row_off", c.row_off)?,
-            launch_u32(what, "n_expert", self.n_expert)?,
-            launch_u32(what, "n", slots_n)?,
-            &mut sel,
-        )?;
-        Ok(())
+        let places = Places {
+            ids: &ids,
+            n: slots_n,
+            map: slots.buf(),
+            row_off: c.row_off,
+            n_expert: self.n_expert,
+        };
+        b.kernels.enqueue_places(stream, &places, fault, &mut sel)
     }
 
-    /// Layer `layer`'s shadow work for the block `io`, after the batch's
-    /// route, the layer's tensors resolved once. Per slot
-    /// ([`CardExperts::Slot`]): each chunk's whole shadow in turn. Per expert:
-    /// each chunk's HC_PRE, norm and shared expert; then over the block the
-    /// card slots grouped by expert and one gate·up launch that reads each
-    /// card expert once; then each chunk's down and card sum. Asynchronous,
-    /// allocation-free.
+    /// The shadow work of `bl`'s layer for the block `io`, after the batch's
+    /// route of it. Per slot ([`CardExperts::Slot`]): each chunk's whole
+    /// shadow in turn. Per expert: each chunk's HC_PRE, norm and shared
+    /// expert; then over the block the card slots grouped by expert and one
+    /// gate·up launch that reads each card expert once; then each chunk's down
+    /// and card sum. Asynchronous, allocation-free.
     pub fn enqueue_batch_shadow(
         &mut self,
         gpu: &Gpu,
-        w: &Weights,
+        bl: &BatchLayer<'_>,
         card: Option<CardStacks<'_>>,
         b: &mut FfnBatch,
-        layer: usize,
         io: &BlockIo<'_>,
     ) -> Result<(), GpuError> {
+        let (layer, lw) = (bl.layer, &bl.lw);
         let (i, at, u) = self.batch_block(layer, b, io)?;
         let card = self.check_card(layer, i, card)?;
-        let c = &self.cfg[i];
-        let lw = LayerWeights::resolve(c, w, [self.n_embd, self.ff], self.hc_eps, self.hc_iters)?;
-        if lw.sh_down.reads_q8_1() != c.sh_down_q8_1 {
-            return Err(tensor_err(
-                &c.sh_down,
-                "of the format the file's header names for it",
-            ));
-        }
         let phase = match b.experts {
             CardExperts::Slot => Phase::Whole,
             CardExperts::Expert => Phase::Before,
@@ -1280,7 +1427,7 @@ impl FfnPiece {
                     fold_in: &fold_in,
                 };
                 self.batch_layer(layer, b, &chunk)?;
-                self.enqueue_batch_shadow_chunk(gpu, &lw, i, card, b, layer, &chunk, phase)?;
+                self.enqueue_batch_shadow_chunk(gpu, lw, i, card, b, layer, &chunk, phase)?;
             }
         }
         if phase == Phase::Before {
@@ -1323,9 +1470,10 @@ impl FfnPiece {
         let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
         let grid = launch_u32(what, "grid", (m * n).div_ceil(THREADS as usize))?;
         let prep = b
+            .kernels
             .module
             .prepare_ds41_ffn_card_acc(LaunchConfig1D::new(grid, THREADS, 0))?;
-        b.module.ds41_ffn_card_acc(
+        b.kernels.module.ds41_ffn_card_acc(
             stream,
             &prep,
             &down,
@@ -1372,10 +1520,11 @@ impl FfnPiece {
         let mut order = span_mut(WHAT, &mut b.order, 0, slots_n)?;
         {
             let what = "ds41_card_buckets";
-            let prep =
-                b.module
-                    .prepare_ds41_card_buckets(LaunchConfig1D::new(1, BUCKET_THREADS, 0))?;
-            b.module.ds41_card_buckets(
+            let prep = b
+                .kernels
+                .module
+                .prepare_ds41_card_buckets(LaunchConfig1D::new(1, BUCKET_THREADS, 0))?;
+            b.kernels.module.ds41_card_buckets(
                 stream,
                 &prep,
                 &sel,
@@ -1386,36 +1535,35 @@ impl FfnPiece {
                 &mut b.start,
             )?;
         }
-        let what = "ds41_expert_gate_up_grouped";
-        let n_sb = self.n_embd / 256;
-        let grid = launch_u32(what, "grid", n_experts * ff.div_ceil(8))?;
-        let mut h = span_mut(WHAT, &mut b.h_all, at * N_USED * ff, slots_n * ff)?;
-        let prep = b
-            .module
-            .prepare_ds41_expert_gate_up_grouped(LaunchConfig1D::new(grid, THREADS, 0))?;
-        b.module.ds41_expert_gate_up_grouped(
-            stream,
-            &prep,
-            s.gate.buf(),
-            s.up.buf(),
-            &b.q3_all,
-            &b.d8_all,
-            &order,
-            &b.start,
-            launch_u32(what, "n_experts", n_experts)?,
-            launch_u32(what, "rows_per_expert", ff)?,
-            launch_u32(what, "n_slots", slots_n)?,
-            launch_u32(what, "col0", at)?,
-            launch_u32(what, "cols", u)?,
-            launch_u32(what, "n_sb", n_sb)?,
-            launch_u32(what, "iters", n_sb.div_ceil(2))?,
-            c.limit,
-            fault,
-            &mut h,
-        )?;
-        drop((h, sel, order));
-        gpu.enqueue_quantize_q8_1_layer(&b.h_all, &mut b.act_h_all, layer)?;
+        drop(order);
         let order = span(WHAT, &b.order, 0, slots_n)?;
+        let mut h = span_mut(WHAT, &mut b.h_all, at * N_USED * ff, slots_n * ff)?;
+        let g = GroupedGateUp {
+            wg: s.gate.buf(),
+            wu: s.up.buf(),
+            q3: &b.q3_all,
+            d8: &b.d8_all,
+            order: &order,
+            start: &b.start,
+            n_experts,
+            rows_per_expert: ff,
+            n_slots: slots_n,
+            col0: at,
+            cols: u,
+            n_sb: self.n_embd / 256,
+            limit: c.limit,
+        };
+        b.kernels
+            .enqueue_gate_up_grouped(stream, &g, fault, &mut h)?;
+        drop(h);
+        let q = QuantSel {
+            x: &b.h_all,
+            cols: at * N_USED..u * N_USED,
+            sel: &sel,
+            n_card: n_experts,
+        };
+        gpu.q4k_sel()
+            .enqueue_quantize_sel(stream, &q, fault, &mut b.act_h_all)?;
         let mut down = span_mut(WHAT, &mut b.down_all, at * N_USED * n, slots_n * n)?;
         gpu.q4k_sel().enqueue_gemv_q4k_grouped(
             stream,
@@ -1499,11 +1647,12 @@ impl FfnPiece {
                 let act_x = &b.act_x[m - 1];
                 let what = "ds41_expert_gate_up_tok";
                 let n_sb = act_x.n_sb();
-                let grid = launch_u32(what, "grid", (slots_n * ff).div_ceil(8))?;
+                let grid = launch_u32(what, "grid", (slots_n * ff).div_ceil(ROWS_PER_BLOCK))?;
                 let prep = b
+                    .kernels
                     .module
                     .prepare_ds41_expert_gate_up_tok(LaunchConfig1D::new(grid, THREADS, 0))?;
-                b.module.ds41_expert_gate_up_tok(
+                b.kernels.module.ds41_expert_gate_up_tok(
                     stream,
                     &prep,
                     s.gate.buf(),
@@ -1522,7 +1671,14 @@ impl FfnPiece {
                     &mut b.h,
                 )?;
                 let act_h = count_of(&mut b.act_h, m)?;
-                gpu.enqueue_quantize_q8_1_layer(&b.h, act_h, layer)?;
+                let q = QuantSel {
+                    x: &b.h,
+                    cols: 0..slots_n,
+                    sel: &sel,
+                    n_card: c.n_card,
+                };
+                gpu.q4k_sel()
+                    .enqueue_quantize_sel(stream, &q, fault, act_h)?;
                 gpu.q4k_sel().enqueue_gemv_q4k_sel(
                     stream,
                     s.down,
@@ -1538,9 +1694,10 @@ impl FfnPiece {
             let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
             let grid = launch_u32(what, "grid", (m * n).div_ceil(THREADS as usize))?;
             let prep = b
+                .kernels
                 .module
                 .prepare_ds41_ffn_card_acc(LaunchConfig1D::new(grid, THREADS, 0))?;
-            b.module.ds41_ffn_card_acc(
+            b.kernels.module.ds41_ffn_card_acc(
                 stream,
                 &prep,
                 &b.down,
@@ -1623,13 +1780,7 @@ impl FfnPiece {
             streams_out,
             fold_out,
         } = io;
-        let i = layer
-            .checked_sub(self.layers.start)
-            .filter(|&i| i < self.cfg.len())
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("layer {layer} is outside {:?}", self.layers),
-            })?;
+        let i = self.layer_index(layer, WHAT)?;
         let n = self.n_embd;
         if at >= u
             || u > b.cap
@@ -1667,14 +1818,14 @@ impl FfnPiece {
         match fold_out {
             Some(fold) => {
                 let mut fold = span_mut(WHAT, fold, at * n, m * n)?;
-                let prep = b.module.prepare_ds41_ffn_post_batch(cfg)?;
-                b.module.ds41_ffn_post_batch(
+                let prep = b.kernels.module.prepare_ds41_ffn_post_batch(cfg)?;
+                b.kernels.module.ds41_ffn_post_batch(
                     stream, &prep, &acc, &hsum, &shexp, &res, &hc, nn, mm, &mut out, &mut fold,
                 )?;
             }
             None => {
-                let prep = b.module.prepare_ds41_ffn_post_batch_streams(cfg)?;
-                b.module.ds41_ffn_post_batch_streams(
+                let prep = b.kernels.module.prepare_ds41_ffn_post_batch_streams(cfg)?;
+                b.kernels.module.ds41_ffn_post_batch_streams(
                     stream, &prep, &acc, &hsum, &shexp, &res, &hc, nn, mm, &mut out,
                 )?;
             }
@@ -1692,13 +1843,7 @@ impl FfnPiece {
         b: &FfnBatch,
         io: &BlockIo<'_>,
     ) -> Result<(usize, usize, usize), GpuError> {
-        let i = layer
-            .checked_sub(self.layers.start)
-            .filter(|&i| i < self.cfg.len())
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("layer {layer} is outside {:?}", self.layers),
-            })?;
+        let i = self.layer_index(layer, WHAT)?;
         let (Some(first), Some(last)) = (io.chunks.first(), io.chunks.last()) else {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -1728,13 +1873,7 @@ impl FfnPiece {
     /// batch's buffers.
     fn batch_layer(&self, layer: usize, b: &FfnBatch, io: &ChunkIo<'_>) -> Result<usize, GpuError> {
         let n = self.n_embd;
-        let i = layer
-            .checked_sub(self.layers.start)
-            .filter(|&i| i < self.cfg.len())
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("layer {layer} is outside {:?}", self.layers),
-            })?;
+        let i = self.layer_index(layer, WHAT)?;
         if !(1..=HC_MAX_TOKENS).contains(&io.m)
             || io.at + io.m > b.cap
             || b.n_embd != n

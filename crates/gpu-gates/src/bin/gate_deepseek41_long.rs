@@ -240,14 +240,7 @@ mod gate {
         let path = workstation::model_v41();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&file)?;
-        let eos = file
-            .value("tokenizer.ggml.eos_token_id")
-            .and_then(|v| match v {
-                gguf::Value::U32(e) => Some(*e),
-                gguf::Value::I32(e) => u32::try_from(*e).ok(),
-                _ => None,
-            })
-            .ok_or("the file names no EOS token")?;
+        let eos = bloomery_gpu_gates::eos_token_id(&file)?;
         let mut m = body::open(file, workstation::plan_gate, usize::try_from(CTX_MAX)?)?;
         m.set_mode(StepMode::Graph);
         let mut head = {

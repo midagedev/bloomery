@@ -20,6 +20,17 @@
 //! raises nothing, both leaving their slots untouched; and the host
 //! contract's refusals. A
 //! failing check names its first mismatch — slot, row, both bit patterns.
+//!
+//! Two more on the grouped side. `q4k_gemv_grouped` over the table a bucket
+//! pass writes for [`SEL_A`] gives each slot its `_sel` reference; a table
+//! whose last run ends past the slots raises `ExpertId` and leaves that
+//! run's slot untouched, and one whose last run starts after its end raises
+//! `ExpertId` too (`q4k_sel::grouped_run`). And the card slots' quantizer
+//! (`enqueue_quantize_sel`) over columns 6..12 of a twelve-column act: a
+//! column whose place is on the card reads back — through the grouped down
+//! — as the plain quantizer's column, every other column as what the act
+//! held before; a NaN in a column the host serves raises nothing, one in a
+//! card column raises `QuantColumn`.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -30,6 +41,8 @@ fn main() {
 // Module-level because the stack and check helpers below `run` share them.
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HOST;
+#[cfg(feature = "gpu")]
+use bloomery_gpu::q4k_sel::QuantSel;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
 #[cfg(feature = "gpu")]
@@ -144,6 +157,12 @@ fn run() -> Result<(), GateError> {
     // 4. The host contract, on a 2048-row stack.
     ok &= check_host_contract(&gpu, &a)?;
 
+    // 5. The grouped down's run tables, on a 2048-row stack.
+    ok &= check_grouped_runs(&gpu, &mut a)?;
+
+    // 6. The card slots' quantizer, read back through the grouped down.
+    ok &= check_quantize_sel(&gpu, &a)?;
+
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());
     }
@@ -152,7 +171,10 @@ fn run() -> Result<(), GateError> {
          alone (K = 2048, 2816, 2304); graph replay follows ids overwritten between replays; \
          an id past the stack raises expert_id, a host slot raises nothing, both leave their \
          slots untouched; host contract refuses \
-         a shared-input act and a non-dividing rows_per_expert"
+         a shared-input act and a non-dividing rows_per_expert; the grouped down gives each \
+         slot its reference over a bucket table and raises expert_id on a run that does not \
+         fit; the card slots' quantizer writes the plain quantizer's bytes into card columns \
+         alone"
     );
     Ok(())
 }
@@ -476,6 +498,206 @@ fn check_host_contract(gpu: &Gpu, st: &Stack) -> Result<bool, GateError> {
             verdict(pass)
         );
         ok &= pass;
+    }
+    Ok(ok)
+}
+
+/// The table a bucket pass writes for `sel`: every slot whose id is below
+/// `experts`, grouped by id in increasing slot order (`order`), and each id's
+/// run (`start`, `experts + 1` entries).
+#[cfg(feature = "gpu")]
+fn bucket_table(sel: &[u32], experts: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut order = Vec::with_capacity(sel.len());
+    let mut start = Vec::with_capacity(experts + 1);
+    for e in 0..experts {
+        start.push(order.len() as u32);
+        order.extend((0..sel.len() as u32).filter(|&s| sel[s as usize] as usize == e));
+    }
+    start.push(order.len() as u32);
+    (order, start)
+}
+
+/// Check 5: `q4k_gemv_grouped` on stack `st`'s six columns over three run
+/// tables for [`SEL_A`], each into a `SENT`-filled `y`: the bucket table
+/// (every slot its reference, no fault); its last run ending past the slots
+/// (`ExpertId`, that run's slot untouched); its last run starting after its
+/// end (`ExpertId`).
+#[cfg(feature = "gpu")]
+fn check_grouped_runs(gpu: &Gpu, st: &mut Stack) -> Result<bool, GateError> {
+    let stream = gpu.stream();
+    let (order, start) = bucket_table(&SEL_A, N_EXPERTS);
+    let order_dev = DeviceBuffer::from_host(stream, &order)?;
+    let want = st.expected(gpu, &SEL_A)?;
+    let rpe = st.rpe;
+    // The last expert's run: slot 2 of SEL_A, one entry from the end.
+    let last = SEL_A
+        .iter()
+        .position(|&id| id as usize == N_EXPERTS - 1)
+        .ok_or("gate_q4k_sel: SEL_A routes no slot to the last expert")?;
+    let mut past = start.clone();
+    past[N_EXPERTS] = N_SLOTS as u32 + 3;
+    let mut after = start.clone();
+    after[N_EXPERTS] = after[N_EXPERTS - 1] - 1;
+    let expert_id = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+    // (case, the run table, the fault it raises, the slot it leaves untouched)
+    type RunCase = (&'static str, Vec<u32>, Option<Fault>, Option<usize>);
+    let cases: [RunCase; 3] = [
+        ("bucket_table", start, None, None),
+        ("last_run_past_the_slots", past, expert_id, Some(last)),
+        (
+            "last_run_starts_after_its_end",
+            after,
+            expert_id,
+            Some(last),
+        ),
+    ];
+    let mut ok = gpu.take_fault()?.is_none();
+    for (case, start, want_fault, untouched) in cases {
+        let start_dev = DeviceBuffer::from_host(stream, &start)?;
+        let mut y = st.sentinel_y(gpu)?;
+        gpu.q4k_sel().enqueue_gemv_q4k_grouped(
+            stream,
+            &st.w,
+            &st.act,
+            &order_dev,
+            &start_dev,
+            N_SLOTS,
+            0,
+            rpe,
+            gpu.unlabelled_sink(),
+            &mut y,
+        )?;
+        stream.synchronize()?;
+        let got = y.to_host_vec(stream)?;
+        let fault = gpu.take_fault()?;
+        let mut expect = want.clone();
+        if let Some(s) = untouched {
+            expect[s * rpe..(s + 1) * rpe].fill(SENT);
+        }
+        let values_ok = bits_equal(&got, &expect);
+        let fault_ok = fault == want_fault;
+        let pass = values_ok && fault_ok;
+        ok &= pass;
+        let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+        println!(
+            "q4k_grouped[{}:{case}] start_last={:?} fault=\"{}\" want=\"{}\" \
+             slots_as_want={values_ok} {}{}",
+            st.tag,
+            &start[N_EXPERTS - 1..],
+            shown(fault),
+            shown(want_fault),
+            verdict(pass),
+            mismatch("first_mismatch", &got, &expect, rpe),
+        );
+    }
+    Ok(ok)
+}
+
+/// Columns of check 6's act, and the first one the card slots' quantizer
+/// writes.
+#[cfg(feature = "gpu")]
+const QS_COLS: usize = 12;
+#[cfg(feature = "gpu")]
+const QS_FROM: usize = 6;
+/// Check 6's places of columns `QS_FROM..QS_COLS`: two card experts, the
+/// host's, a place past the card's experts, two more card experts.
+#[cfg(feature = "gpu")]
+const QS_SEL: [u32; QS_COLS - QS_FROM] = [3, HOST, 0, N_EXPERTS as u32 + 4, 7, 1];
+
+/// Check 6: the card slots' quantizer on stack `st`'s rows, read back
+/// through the grouped down with every slot on expert 0 (module doc).
+#[cfg(feature = "gpu")]
+fn check_quantize_sel(gpu: &Gpu, st: &Stack) -> Result<bool, GateError> {
+    let stream = gpu.stream();
+    let k = st.k;
+    let x = activations(k, QS_COLS, 6421);
+    let x_old = activations(k, QS_COLS, 6529);
+    let sel_dev = DeviceBuffer::from_host(stream, &QS_SEL)?;
+    let quantized = |v: &[f32]| -> Result<Q8Act, GateError> {
+        let v = DeviceBuffer::from_host(stream, v)?;
+        let mut act = Q8Act::with_slots(stream, QS_COLS, k)?;
+        gpu.enqueue_quantize_q8_1(&v, &mut act)?;
+        Ok(act)
+    };
+    // Every slot on expert 0: slot s reads column s.
+    let order: Vec<u32> = (0..QS_COLS as u32).collect();
+    let mut start = vec![QS_COLS as u32; N_EXPERTS + 1];
+    start[0] = 0;
+    let order_dev = DeviceBuffer::from_host(stream, &order)?;
+    let start_dev = DeviceBuffer::from_host(stream, &start)?;
+    let read_back = |act: &Q8Act| -> Result<Vec<f32>, GateError> {
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; QS_COLS * st.rpe])?;
+        gpu.q4k_sel().enqueue_gemv_q4k_grouped(
+            stream,
+            &st.w,
+            act,
+            &order_dev,
+            &start_dev,
+            QS_COLS,
+            0,
+            st.rpe,
+            gpu.unlabelled_sink(),
+            &mut y,
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    };
+    let y_new = read_back(&quantized(&x)?)?;
+    let y_old = read_back(&quantized(&x_old)?)?;
+    let mut ok = gpu.take_fault()?.is_none();
+    let card = |c: usize| c >= QS_FROM && (QS_SEL[c - QS_FROM] as usize) < N_EXPERTS;
+    let rpe = st.rpe;
+    let mut expect = vec![0.0f32; QS_COLS * rpe];
+    for c in 0..QS_COLS {
+        let from = if card(c) { &y_new } else { &y_old };
+        expect[c * rpe..(c + 1) * rpe].copy_from_slice(&from[c * rpe..(c + 1) * rpe]);
+    }
+    // (case, the NaN's column, the fault it raises)
+    let quant_column = Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+    let cases: [(&str, Option<usize>, Option<Fault>); 3] = [
+        ("finite", None, None),
+        ("nan_in_a_host_column", Some(QS_FROM + 1), None),
+        ("nan_in_a_card_column", Some(QS_FROM), quant_column),
+    ];
+    for (case, nan_at, want_fault) in cases {
+        let mut xs = x.clone();
+        if let Some(c) = nan_at {
+            xs[c * k + 5] = f32::NAN;
+        }
+        let x_dev = DeviceBuffer::from_host(stream, &xs)?;
+        let mut act = quantized(&x_old)?;
+        let q = QuantSel {
+            x: &x_dev,
+            cols: QS_FROM..QS_COLS,
+            sel: &sel_dev,
+            n_card: N_EXPERTS,
+        };
+        gpu.q4k_sel()
+            .enqueue_quantize_sel(stream, &q, gpu.unlabelled_sink(), &mut act)?;
+        stream.synchronize()?;
+        let fault = gpu.take_fault()?;
+        let fault_ok = fault == want_fault;
+        let got = read_back(&act)?;
+        let read_clean = gpu.take_fault()?.is_none();
+        // A NaN in a card column: that column's bytes are not compared, only
+        // its fault.
+        let mut want = expect.clone();
+        if let Some(c) = nan_at.filter(|&c| card(c)) {
+            want[c * rpe..(c + 1) * rpe].copy_from_slice(&got[c * rpe..(c + 1) * rpe]);
+        }
+        let values_ok = bits_equal(&got, &want);
+        let pass = fault_ok && read_clean && values_ok;
+        ok &= pass;
+        let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+        println!(
+            "q4k_quantize_sel[{}:{case}] cols={QS_FROM}..{QS_COLS} places={QS_SEL:?} \
+             fault=\"{}\" want=\"{}\" card_columns_plain_bytes_others_untouched={values_ok} {}{}",
+            st.tag,
+            shown(fault),
+            shown(want_fault),
+            verdict(pass),
+            mismatch("first_mismatch", &got, &want, rpe),
+        );
     }
     Ok(ok)
 }

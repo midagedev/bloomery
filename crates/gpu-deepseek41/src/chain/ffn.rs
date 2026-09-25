@@ -25,6 +25,11 @@
 //!   hold. The card's routed launches read those places, so which experts
 //!   the card computes comes from the map alone. An id past the expert count
 //!   has no place: it raises `FaultSite::ExpertId` there.
+//! - The card's routed launches are its slots' gate·up, the q8_1 of those
+//!   slots' columns of `h` alone (`Q4kSelKernels::enqueue_quantize_sel`) and
+//!   the down. A slot the host serves leaves its column of `h` as it was —
+//!   a reset does not clear it, so after a fault it can hold a NaN — and no
+//!   card launch reads that column.
 //! - The go signals the host tier; the wait takes its answer back
 //!   ([`bloomery_gpu::hybrid`]). With the overlap lever off the wait sits
 //!   right after the go.
@@ -64,10 +69,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::fused::FusedKernels;
-use bloomery_gpu::hybrid::{Boundary, HOST, HostExperts, Hybrid, SlotMap};
+use bloomery_gpu::hybrid::{Boundary, HOST, HandoffTarget, HostExperts, Hybrid, SlotMap};
+use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, launch_u32};
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use gguf::{GgmlType, Split};
@@ -86,7 +92,10 @@ use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use crate::transpose::TransposeKernels;
 
 mod batch;
-pub use batch::{BlockIo, CardExperts, ChunkIo, FfnBatch, JoinIo};
+pub use batch::{
+    BatchLayer, BlockIo, CardExperts, ChunkIo, FfnBatch, FfnBatchKernels, GroupedGateUp, JoinIo,
+    Places,
+};
 
 /// What the enqueue path's errors name.
 const ENQUEUE: &str = "FfnPiece::enqueue";
@@ -620,6 +629,85 @@ impl<'w> LayerWeights<'w> {
     }
 }
 
+/// The piece's own kernels, the handoff and the join: loaded once by
+/// [`FfnPiece::new`], or alone by a gate that drives the handoff with ids a
+/// router cannot produce.
+pub struct FfnKernels {
+    module: ffn_kernels::LoadedModule,
+}
+
+/// What [`FfnKernels::enqueue_handoff`] reads: a token's six routed ids and
+/// weights, and the slot map's card copy with the layer's row at `row_off`
+/// (`n_expert` places a row).
+pub struct Handoff<'a> {
+    pub ids: &'a DeviceBuffer<u32>,
+    pub weights: &'a DeviceBuffer<f32>,
+    pub map: &'a DeviceBuffer<u32>,
+    pub row_off: usize,
+    pub n_expert: usize,
+}
+
+impl FfnKernels {
+    /// Load the piece's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<FfnKernels, GpuError> {
+        // SAFETY: this crate owns the embedded device bundle produced for the
+        // module above; each launcher checks its launch contract.
+        let module = unsafe { ffn_kernels::load(ctx)? };
+        Ok(FfnKernels { module })
+    }
+
+    /// Enqueue `ds41_ffn_handoff`: `h`'s routing and `target`'s activation
+    /// into `target`'s image, with the region's sequence word, and each
+    /// slot's place into `sel`. An id past the stack raises
+    /// [`FaultSite::ExpertId`] on `fault` and its place is [`HOST`]. One
+    /// launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_handoff(
+        &self,
+        stream: &CudaStream,
+        h: &Handoff<'_>,
+        target: HandoffTarget<'_>,
+        fault: FaultSink,
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_ffn_handoff";
+        let lay = target.layout;
+        if lay.n_used != N_USED {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "a handoff of {} slots; the kernel hands over {N_USED}",
+                    lay.n_used
+                ),
+            });
+        }
+        let n = lay.hidden;
+        let grid = launch_u32(what, "grid", n.div_ceil(HANDOFF_THREADS as usize))?;
+        let prep =
+            self.module
+                .prepare_ds41_ffn_handoff(LaunchConfig1D::new(grid, HANDOFF_THREADS, 0))?;
+        self.module.ds41_ffn_handoff(
+            stream,
+            &prep,
+            h.ids,
+            h.weights,
+            h.map,
+            launch_u32(what, "row_off", h.row_off)?,
+            launch_u32(what, "n_expert", h.n_expert)?,
+            target.x,
+            target.seq,
+            launch_u32(what, "n", n)?,
+            launch_u32(what, "seq_at", lay.seq)?,
+            launch_u32(what, "ids_at", lay.ids)?,
+            launch_u32(what, "wts_at", lay.weights)?,
+            launch_u32(what, "x_at", lay.x)?,
+            fault,
+            target.image,
+            sel,
+        )?;
+        Ok(())
+    }
+}
+
 /// The piece's own buffers, as the last enqueued layer left them — what a
 /// gate reads back.
 pub struct FfnTaps<'a> {
@@ -712,7 +800,7 @@ pub struct FfnPiece {
     /// The row-major-to-token-major copy of a prompt batch's shared down
     /// projection ([`FfnBatch`]).
     transpose: TransposeKernels,
-    module: ffn_kernels::LoadedModule,
+    kernels: FfnKernels,
     layers: Range<usize>,
     cfg: Vec<LayerCfg>,
     n_embd: usize,
@@ -797,9 +885,6 @@ impl FfnPiece {
         }
         let ctx = gpu.context();
         let stream = gpu.stream();
-        // SAFETY: this crate owns the embedded device bundle produced for the
-        // module above; each launcher checks its launch contract.
-        let module = unsafe { ffn_kernels::load(ctx)? };
         let rows = (0..rows)
             .map(|_| FfnRow::new(stream, n_embd, ff))
             .collect::<Result<Vec<_>, _>>()?;
@@ -810,7 +895,7 @@ impl FfnPiece {
             dense: DenseKernels::load(ctx)?,
             hc: HcKernels::load(ctx)?,
             transpose: TransposeKernels::load(ctx)?,
-            module,
+            kernels: FfnKernels::load(ctx)?,
             layers,
             cfg,
             n_embd,
@@ -895,7 +980,23 @@ impl FfnPiece {
     }
 
     fn cfg_of(&self, layer: usize) -> Option<&LayerCfg> {
-        self.cfg.get(layer.checked_sub(self.layers.start)?)
+        self.index_of(layer).map(|i| &self.cfg[i])
+    }
+
+    /// Layer `layer`'s index in the piece, where the piece holds it.
+    fn index_of(&self, layer: usize) -> Option<usize> {
+        layer
+            .checked_sub(self.layers.start)
+            .filter(|&i| i < self.cfg.len())
+    }
+
+    /// [`FfnPiece::index_of`], or `what`'s shape error naming the piece's
+    /// layers.
+    fn layer_index(&self, layer: usize, what: &'static str) -> Result<usize, GpuError> {
+        self.index_of(layer).ok_or_else(|| GpuError::Shape {
+            what,
+            detail: format!("layer {layer} is outside {:?}", self.layers),
+        })
     }
 
     /// Enqueue layer `layer`'s MoE sub-layer (the module comment's order):
@@ -1011,10 +1112,7 @@ impl FfnPiece {
             detail,
         };
         let n = self.n_embd;
-        let i = layer
-            .checked_sub(self.layers.start)
-            .filter(|&i| i < self.cfg.len())
-            .ok_or_else(|| refuse(format!("layer {layer} is outside {:?}", self.layers)))?;
+        let i = self.layer_index(layer, ENQUEUE)?;
         let c = &self.cfg[i];
         if row >= self.rows.len() {
             return Err(refuse(format!(
@@ -1146,7 +1244,6 @@ impl FfnPiece {
             &mut r.rout,
             fault,
         )?;
-        let what = "ds41_ffn_handoff";
         let target = hybrid.boundary_mut().handoff_target_of(row)?;
         let lay = target.layout;
         if lay.n_used != N_USED || lay.hidden != n {
@@ -1158,29 +1255,15 @@ impl FfnPiece {
                 ),
             });
         }
-        let grid = launch_u32(what, "grid", n.div_ceil(HANDOFF_THREADS as usize))?;
-        let prep =
-            self.module
-                .prepare_ds41_ffn_handoff(LaunchConfig1D::new(grid, HANDOFF_THREADS, 0))?;
-        self.module.ds41_ffn_handoff(
-            stream,
-            &prep,
-            &r.rout.ids,
-            &r.rout.weights,
-            io.slots.buf(),
-            launch_u32(what, "row_off", c.row_off)?,
-            launch_u32(what, "n_expert", self.n_expert)?,
-            target.x,
-            target.seq,
-            launch_u32(what, "n", n)?,
-            launch_u32(what, "seq_at", lay.seq)?,
-            launch_u32(what, "ids_at", lay.ids)?,
-            launch_u32(what, "wts_at", lay.weights)?,
-            launch_u32(what, "x_at", lay.x)?,
-            fault,
-            target.image,
-            &mut r.sel,
-        )?;
+        let h = Handoff {
+            ids: &r.rout.ids,
+            weights: &r.rout.weights,
+            map: io.slots.buf(),
+            row_off: c.row_off,
+            n_expert: self.n_expert,
+        };
+        self.kernels
+            .enqueue_handoff(stream, &h, target, fault, &mut r.sel)?;
         let boundary = hybrid.boundary();
         boundary.enqueue_go_of(stream, layer, row)?;
         if !boundary.overlap() {
@@ -1238,7 +1321,14 @@ impl FfnPiece {
             };
             self.experts
                 .enqueue_expert_gate_up(stream, &args, &mut r.h)?;
-            gpu.enqueue_quantize_q8_1_layer(&r.h, &mut r.act_h, layer)?;
+            let q = QuantSel {
+                x: &r.h,
+                cols: 0..N_USED,
+                sel: &r.sel,
+                n_card: c.n_card,
+            };
+            gpu.q4k_sel()
+                .enqueue_quantize_sel(stream, &q, gpu.layer_sink(layer)?, &mut r.act_h)?;
             gpu.q4k_sel().enqueue_gemv_q4k_sel(
                 stream,
                 s.down,
@@ -1315,8 +1405,8 @@ impl FfnPiece {
         let n_card = launch_u32("ds41_ffn_post", "n_card", self.cfg[i].n_card)?;
         match io.fold_out {
             Some(fold) => {
-                let prep = self.module.prepare_ds41_ffn_post(cfg)?;
-                self.module.ds41_ffn_post(
+                let prep = self.kernels.module.prepare_ds41_ffn_post(cfg)?;
+                self.kernels.module.ds41_ffn_post(
                     stream,
                     &prep,
                     &r.down,
@@ -1334,8 +1424,8 @@ impl FfnPiece {
                 )?;
             }
             None => {
-                let prep = self.module.prepare_ds41_ffn_post_streams(cfg)?;
-                self.module.ds41_ffn_post_streams(
+                let prep = self.kernels.module.prepare_ds41_ffn_post_streams(cfg)?;
+                self.kernels.module.ds41_ffn_post_streams(
                     stream,
                     &prep,
                     &r.down,

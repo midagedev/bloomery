@@ -25,6 +25,22 @@
 //!   the decode shape one token at a time and the batch shape over all
 //!   eleven give the same ids and weights bit for bit, and a −inf bias or a
 //!   NaN in one expert's row raises the fault word at `router` in both.
+//! - **Raise sites.** Launched alone on synthetic inputs, where no route can
+//!   send them: `ds41_ffn_places` and `ds41_ffn_handoff` with ids at and
+//!   past the stack raise `expert_id` and give those slots HOST (the handoff
+//!   still carries the ids as they came), with ids inside it raise nothing;
+//!   `ds41_expert_gate_up_grouped` over the table the bucket rule writes
+//!   raises nothing and writes each card slot, and over a table whose last
+//!   run ends past the slots, or starts after its end, raises `expert_id` —
+//!   the run past the slots writes none of its rows.
+//! - **Fault, reset, clean.** A NaN in the scale of every card expert's
+//!   first gate row makes a prefill of [`FAULT_P`] ids fault; with the
+//!   scales put back and the model reset, a prefill of the smallest case's
+//!   `P` must raise nothing and give the oracle's numbers (the cases'
+//!   comparison). Then the same for steps: a poisoned step faults, and after
+//!   a reset `P` clean steps give the oracle's logits. A quantizer that
+//!   reads a column its call did not write — a slot the host serves, or one
+//!   outside the batch's block — finds the faulted call's NaN there.
 //! - **Oracle, one run.** From a reset, the ids decode-stepped one at a time
 //!   through the graph, each position's features read after its step (an md5
 //!   per position). After the step at each case's position `P − 1` the gate
@@ -107,15 +123,18 @@ mod gate {
     use std::ops::Range;
     use std::time::Instant;
 
+    use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget};
     use bloomery_gpu::model::{ChainBody, StepMode};
-    use bloomery_gpu::{DeviceTensor, FaultSite, GpuError};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT};
     use bloomery_gpu_deepseek41::body::{self, CedState, Deepseek41Model, Need};
-    use bloomery_gpu_deepseek41::chain::ffn::CardExperts;
+    use bloomery_gpu_deepseek41::chain::ffn::{
+        CardExperts, CardStacks, FfnBatchKernels, FfnKernels, GroupedGateUp, Handoff, Places,
+    };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
-    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
-    use cuda_core::{DeviceBuffer, DeviceCopy};
+    use bloomery_gpu_gates::{GateError, activations, checks_failed, data_dir, verdict};
+    use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, sys};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::placement::workstation;
@@ -136,6 +155,13 @@ mod gate {
     const WIDE: (usize, usize) = (1100, 300);
     /// The rollback case's `P` and the refused cut inside it.
     const CUT: (usize, usize) = (1100, 600);
+    /// The fault-reset case's poisoned prefill: one whole batch, every column
+    /// of the batch's scratch.
+    const FAULT_P: usize = body::T_MAX;
+    /// What a raise case's outputs hold before the launch, so an output the
+    /// kernel leaves alone reads back as these bits.
+    const SENT: f32 = 1.0e30;
+    const SENT_U32: u32 = 0xdead_beef;
 
     struct Args {
         cases: Vec<usize>,
@@ -255,6 +281,7 @@ mod gate {
         let ced = m.body(NAME)?.ced();
         let mut pass = count_cases(&mut m)?;
         pass &= router_cases(&mut m)?;
+        pass &= raise_cases(&mut m)?;
         let splits: Vec<(usize, usize)> = if args.split { SPLITS.to_vec() } else { vec![] };
         let top = args
             .cases
@@ -325,6 +352,8 @@ mod gate {
             let p: usize = parts.iter().sum();
             pass &= compare(what, &case, &oracle[&p], &rows, t);
         }
+        let p_clean = args.cases.iter().copied().min().unwrap_or(1);
+        pass &= fault_reset_case(&mut m, &hp, &ids, &oracle, &rows, p_clean, dhp.window)?;
         if args.extra {
             pass &= rollback_case(&mut m, &ids, &oracle)?;
             pass &= take_back_case(&mut m, &ids, &oracle)?;
@@ -517,6 +546,410 @@ mod gate {
             );
         }
         gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// The raise sites (module doc), each launched alone on synthetic inputs;
+    /// the fault word cleared after each.
+    fn raise_cases(m: &mut Deepseek41Model) -> Result<bool, GateError> {
+        let (gpu, _, _) = m.body_parts(NAME)?;
+        let mut ok = places_cases(gpu)?;
+        ok &= handoff_cases(gpu)?;
+        ok &= grouped_cases(gpu)?;
+        gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// Whether the fault a direct launch left is `want` (an unlabelled
+    /// launch's site, or none), and the two as text.
+    fn fault_is(got: Option<Fault>, want: Option<FaultSite>) -> (bool, String) {
+        let want = want.map(|s| Fault::at(LAYER_NONE, s));
+        let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_string(), |f| f.to_string());
+        (
+            got == want,
+            format!("fault {} (want {})", shown(got), shown(want)),
+        )
+    }
+
+    /// A synthetic slot map's card copy of two layers' rows: every third
+    /// expert on the card, in order, the rest [`HOST`].
+    fn synthetic_map() -> Vec<u32> {
+        let n = N_EXPERT as u32;
+        (0..2 * n)
+            .map(|i| {
+                let e = i % n;
+                if e.is_multiple_of(3) { e / 3 } else { HOST }
+            })
+            .collect()
+    }
+
+    /// The places a map row gives `ids`: [`HOST`] for an id past the stack.
+    fn places_of(map: &[u32], row_off: usize, ids: &[u32]) -> Vec<u32> {
+        ids.iter()
+            .map(|&id| {
+                let id = id as usize;
+                if id < N_EXPERT {
+                    map[row_off + id]
+                } else {
+                    HOST
+                }
+            })
+            .collect()
+    }
+
+    /// `ds41_ffn_places` over twelve ids against the second row of
+    /// [`synthetic_map`].
+    fn places_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        const N: usize = 12;
+        let kernels = FfnBatchKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let map = synthetic_map();
+        let map_dev = DeviceBuffer::from_host(stream, &map)?;
+        let row_off = N_EXPERT;
+        let past = N_EXPERT as u32;
+        let cases: [(&str, [u32; N], Option<FaultSite>); 2] = [
+            (
+                "ids inside the stack",
+                [0, 3, 5, 6, 383, 381, 9, 12, 1, 2, 300, 303],
+                None,
+            ),
+            (
+                "ids at and past the stack",
+                [0, 3, past, 6, 383, past + 616, 9, 12, 1, 2, 300, 303],
+                Some(FaultSite::ExpertId),
+            ),
+        ];
+        let mut ok = true;
+        for (what, ids, want) in cases {
+            gpu.clear_fault()?;
+            let ids_dev = DeviceBuffer::from_host(stream, &ids)?;
+            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; N])?;
+            let p = Places {
+                ids: &ids_dev,
+                n: N,
+                map: &map_dev,
+                row_off,
+                n_expert: N_EXPERT,
+            };
+            kernels.enqueue_places(stream, &p, gpu.unlabelled_sink(), &mut sel)?;
+            let got = sel.to_host_vec(stream)?;
+            stream.synchronize()?;
+            let (fault_ok, fault) = fault_is(gpu.fault()?, want);
+            let places_ok = got == places_of(&map, row_off, &ids);
+            let pass = fault_ok && places_ok;
+            ok &= pass;
+            println!(
+                "{NAME}: places {what} {ids:?}: {fault}; places {} {got:?}: {}",
+                verdict(places_ok),
+                verdict(pass)
+            );
+        }
+        gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// `ds41_ffn_handoff` of one token's six ids against the second row of
+    /// [`synthetic_map`], into an image in card memory.
+    fn handoff_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        const N: usize = 256;
+        let kernels = FfnKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let map = synthetic_map();
+        let map_dev = DeviceBuffer::from_host(stream, &map)?;
+        let row_off = N_EXPERT;
+        let layout = HandoffLayout {
+            seq: 0,
+            ids: 1,
+            weights: 1 + N_USED,
+            x: 1 + 2 * N_USED,
+            n_used: N_USED,
+            hidden: N,
+        };
+        let x: Vec<f32> = (0..N).map(|d| d as f32 * 0.25 - 3.0).collect();
+        let x_dev = DeviceBuffer::from_host(stream, &x)?;
+        let seq_dev = DeviceBuffer::from_host(stream, &[41u32])?;
+        let wts = [0.25f32, 0.125, 0.25, 0.125, 0.125, 0.125];
+        let wts_dev = DeviceBuffer::from_host(stream, &wts)?;
+        let past = N_EXPERT as u32;
+        let cases: [(&str, [u32; N_USED], Option<FaultSite>); 2] = [
+            ("ids inside the stack", [0, 3, 5, 383, 9, 12], None),
+            (
+                "ids at and past the stack",
+                [0, past, 5, 383, past + 616, 12],
+                Some(FaultSite::ExpertId),
+            ),
+        ];
+        let mut ok = true;
+        for (what, ids, want) in cases {
+            gpu.clear_fault()?;
+            let ids_dev = DeviceBuffer::from_host(stream, &ids)?;
+            let mut image = DeviceBuffer::from_host(stream, &vec![SENT_U32; layout.x + N])?;
+            let mut sel = DeviceBuffer::from_host(stream, &[SENT_U32; N_USED])?;
+            let h = Handoff {
+                ids: &ids_dev,
+                weights: &wts_dev,
+                map: &map_dev,
+                row_off,
+                n_expert: N_EXPERT,
+            };
+            let target = HandoffTarget {
+                x: &x_dev,
+                seq: &seq_dev,
+                image: &mut image,
+                layout,
+            };
+            kernels.enqueue_handoff(stream, &h, target, gpu.unlabelled_sink(), &mut sel)?;
+            let got_sel = sel.to_host_vec(stream)?;
+            let got_image = image.to_host_vec(stream)?;
+            stream.synchronize()?;
+            let (fault_ok, fault) = fault_is(gpu.fault()?, want);
+            let places_ok = got_sel == places_of(&map, row_off, &ids);
+            let mut want_image = vec![41u32];
+            want_image.extend(ids);
+            want_image.extend(wts.iter().map(|w| w.to_bits()));
+            want_image.extend(x.iter().map(|v| v.to_bits()));
+            let image_ok = got_image == want_image;
+            let pass = fault_ok && places_ok && image_ok;
+            ok &= pass;
+            println!(
+                "{NAME}: handoff {what} {ids:?}: {fault}; places {} {got_sel:?}; image (seq, ids \
+                 as they came, weights, activation) {}: {}",
+                verdict(places_ok),
+                verdict(image_ok),
+                verdict(pass)
+            );
+        }
+        gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// `ds41_expert_gate_up_grouped` over a stack of zeros (every row it
+    /// writes is 0) for two token columns: eight card slots, two per expert,
+    /// then four the host serves, whose indices pad the table.
+    fn grouped_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        const E: usize = 4;
+        const RPE: usize = 16;
+        const K: usize = 512;
+        const COLS: usize = 2;
+        const SLOTS: usize = N_USED * COLS;
+        let kernels = FfnBatchKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let n_sb = K / 256;
+        let w = DeviceBuffer::from_host(stream, &vec![0u32; E * RPE * 110 * n_sb / 4])?;
+        let x = DeviceBuffer::from_host(stream, &activations(K, COLS, 4101))?;
+        let mut act = Q8Act::with_k(stream, COLS, K)?;
+        gpu.enqueue_quantize_q8_1(&x, &mut act)?;
+        // Slot s < 8 is expert s / 2's; slots 8.. are the host's.
+        let order: Vec<u32> = (0..SLOTS as u32).collect();
+        let order_dev = DeviceBuffer::from_host(stream, &order)?;
+        let card_slots = 2 * E;
+        // (what, start, fault, the slots whose rows are written)
+        type GroupedCase = (&'static str, [u32; E + 1], Option<FaultSite>, Range<usize>);
+        let cases: [GroupedCase; 3] = [
+            ("the bucket table", [0, 2, 4, 6, 8], None, 0..card_slots),
+            (
+                "a last run that ends past the slots",
+                [0, 2, 4, 6, SLOTS as u32 + 3],
+                Some(FaultSite::ExpertId),
+                0..card_slots - 2,
+            ),
+            (
+                "a last run that starts after its end",
+                [0, 2, 4, 8, 6],
+                Some(FaultSite::ExpertId),
+                0..card_slots,
+            ),
+        ];
+        let mut ok = true;
+        for (what, start, want, written) in cases {
+            gpu.clear_fault()?;
+            let start_dev = DeviceBuffer::from_host(stream, &start)?;
+            let mut h = DeviceBuffer::from_host(stream, &vec![SENT; SLOTS * RPE])?;
+            let g = GroupedGateUp {
+                wg: &w,
+                wu: &w,
+                q3: act.q3(),
+                d8: act.d8(),
+                order: &order_dev,
+                start: &start_dev,
+                n_experts: E,
+                rows_per_expert: RPE,
+                n_slots: SLOTS,
+                col0: 0,
+                cols: COLS,
+                n_sb,
+                limit: 0.0,
+            };
+            kernels.enqueue_gate_up_grouped(stream, &g, gpu.unlabelled_sink(), &mut h)?;
+            let got = h.to_host_vec(stream)?;
+            stream.synchronize()?;
+            let (fault_ok, fault) = fault_is(gpu.fault()?, want);
+            let rows_of = |s: usize| &got[s * RPE..(s + 1) * RPE];
+            let rows_ok = (0..SLOTS).all(|s| {
+                let v = if written.contains(&s) { 0.0f32 } else { SENT };
+                rows_of(s).iter().all(|r| r.to_bits() == v.to_bits())
+            });
+            let pass = fault_ok && rows_ok;
+            ok &= pass;
+            println!(
+                "{NAME}: grouped gate·up, {what} {start:?} over {SLOTS} slots: {fault}; rows of \
+                 slots {written:?} written, the rest untouched {}: {}",
+                verdict(rows_ok),
+                verdict(pass)
+            );
+        }
+        gpu.clear_fault()?;
+        Ok(ok)
+    }
+
+    /// A f16 NaN, as the Q3_K super-block scale's two bytes.
+    const NAN_F16: [u8; 2] = 0x7e00u16.to_le_bytes();
+
+    /// Byte offset of a Q3_K super-block's scale `d` in the block.
+    const Q3K_D_AT: usize = 108;
+
+    /// Q3_K bytes per super-block.
+    const Q3K_BLOCK: usize = 110;
+
+    /// NaN into the scale of the first super-block of each card expert's
+    /// first gate row, on every layer with card experts, so the gate·up of
+    /// any card slot is NaN; the bytes it replaced, by device address, to put
+    /// back with [`put_back`].
+    fn poison_card(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+    ) -> Result<Vec<(u64, [u8; 2])>, GateError> {
+        let (gpu, w, b) = m.body_parts(NAME)?;
+        let stream = gpu.stream();
+        let (ff, row_bytes) = (hp.experts.ff, Q3K_BLOCK * hp.n_embd / 256);
+        let mut saved = Vec::new();
+        for l in b.layers() {
+            let Some(s) = CardStacks::of(w, l)? else {
+                continue;
+            };
+            let base = s.gate.buf().cu_deviceptr();
+            for e in 0..s.gate.rows() / ff {
+                let at = base + u64::try_from(e * ff * row_bytes + Q3K_D_AT)?;
+                let mut old = [0u8; 2];
+                // SAFETY: `at` is two bytes inside the gate stack's allocation
+                // (row e·ff's first super-block); `old` outlives the copy,
+                // which completes at the synchronize.
+                let rc = unsafe {
+                    sys::cuMemcpyDtoHAsync_v2(old.as_mut_ptr().cast(), at, 2, stream.cu_stream())
+                };
+                rc.result()?;
+                stream.synchronize()?;
+                let nan = NAN_F16;
+                // SAFETY: as above, with `nan` outliving the copy; the stream
+                // is idle and nothing else runs on the card, so no launch
+                // reads the scale while it changes.
+                let rc = unsafe {
+                    sys::cuMemcpyHtoDAsync_v2(at, nan.as_ptr().cast(), 2, stream.cu_stream())
+                };
+                rc.result()?;
+                stream.synchronize()?;
+                saved.push((at, old));
+            }
+        }
+        Ok(saved)
+    }
+
+    /// The bytes [`poison_card`] replaced, put back.
+    fn put_back(m: &mut Deepseek41Model, saved: &[(u64, [u8; 2])]) -> Result<(), GateError> {
+        let (gpu, _, _) = m.body_parts(NAME)?;
+        let stream = gpu.stream();
+        for (at, old) in saved {
+            // SAFETY: `at` came from `poison_card`, two bytes inside a gate
+            // stack the model still holds; `old` outlives the copy, which
+            // completes at the synchronize.
+            let rc = unsafe {
+                sys::cuMemcpyHtoDAsync_v2(*at, old.as_ptr().cast(), 2, stream.cu_stream())
+            };
+            rc.result()?;
+            stream.synchronize()?;
+        }
+        Ok(())
+    }
+
+    /// The fault-reset case (module doc) at `p`, the smallest case.
+    fn fault_reset_case(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        ids: &[u32],
+        oracle: &BTreeMap<usize, Snap>,
+        rows: &Rows,
+        p: usize,
+        window: usize,
+    ) -> Result<bool, GateError> {
+        let t = Instant::now();
+        let shown = |r: &Result<u32, GpuError>| match r {
+            Ok(tok) => format!("no fault (token {tok})"),
+            Err(e) => e.to_string(),
+        };
+        m.reset()?;
+        let saved = poison_card(m, hp)?;
+        let faulted = body::prefill(m, &ids[..FAULT_P]);
+        put_back(m, &saved)?;
+        let prefill_faulted = matches!(faulted, Err(GpuError::Fault { .. }));
+        println!(
+            "{NAME}: fault-reset: NaN in {} card experts' gate scale, a prefill of {FAULT_P}: {} {}",
+            saved.len(),
+            shown(&faulted),
+            verdict(prefill_faulted)
+        );
+        m.reset()?;
+        let prefill_clean = match run_case(m, hp, ids, &[p], window, rows) {
+            Ok(case) => compare(
+                &format!("fault-reset prefill P={p}"),
+                &case,
+                &oracle[&p],
+                rows,
+                t,
+            ),
+            Err(e) => {
+                println!(
+                    "{NAME}: case fault-reset prefill P={p}: the clean call after the reset \
+                     failed: {e}: {}",
+                    verdict(false)
+                );
+                false
+            }
+        };
+        m.reset()?;
+        let saved = poison_card(m, hp)?;
+        let faulted = m.step(&[ids[0]]);
+        put_back(m, &saved)?;
+        let step_faulted = matches!(faulted, Err(GpuError::Fault { .. }));
+        println!(
+            "{NAME}: fault-reset: the same NaN, a step of ids[0]: {} {}",
+            shown(&faulted),
+            verdict(step_faulted)
+        );
+        m.reset()?;
+        let mut stepped = Ok(0);
+        for &id in &ids[..p] {
+            stepped = m.step(&[id]);
+            if stepped.is_err() {
+                break;
+            }
+        }
+        let steps_clean = match &stepped {
+            Ok(_) => bits(&m.logits()?) == oracle[&p].logits,
+            Err(_) => false,
+        };
+        let ok = prefill_faulted && prefill_clean && step_faulted && steps_clean;
+        println!(
+            "{NAME}: case fault-reset steps P={p}: {} clean steps after the reset: {} | \
+             logits[P-1] {} | {:.1} s: {}",
+            p,
+            match &stepped {
+                Ok(_) => "no fault".to_string(),
+                Err(e) => e.to_string(),
+            },
+            verdict(steps_clean),
+            t.elapsed().as_secs_f64(),
+            verdict(ok)
+        );
         Ok(ok)
     }
 

@@ -51,7 +51,7 @@
 //! until a reset.
 
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use cuda_core::{CudaEvent, sys};
 use model::moe::UNION_MAX_COLS;
@@ -61,6 +61,7 @@ use super::*;
 use crate::chain::attn::{PartIo, StageIo};
 use crate::chain::ffn::{BlockIo, CardExperts, FfnBatch, JoinIo};
 use crate::chain::glue::{GlueBatch, PromptRows};
+use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
 use crate::span::{span, span_mut};
 
@@ -122,13 +123,19 @@ pub fn prefill(m: &mut Deepseek41Model, ids: &[u32]) -> Result<u32, GpuError> {
     feed(m, ids, None, &mut |_, _| Ok(()))
 }
 
-/// The batches a call of `n` positions from `first` runs: `⌈n / T_MAX⌉` of
-/// them, the first `n mod k` one position longer than the rest. Each layer
-/// reads every host expert its batch's tokens route to once, so a short
-/// last batch would pay that read for few tokens.
+/// How many batches a call of `n` positions runs: `⌈n / T_MAX⌉`.
+#[must_use]
+pub fn batch_count(n: usize) -> usize {
+    n.div_ceil(T_MAX)
+}
+
+/// The batches a call of `n` positions from `first` runs: [`batch_count`]
+/// of them, the first `n mod k` one position longer than the rest. Each
+/// layer reads every host expert its batch's tokens route to once, so a
+/// short last batch would pay that read for few tokens.
 #[must_use]
 pub fn batches(first: usize, n: usize) -> Vec<Range<usize>> {
-    let k = n.div_ceil(T_MAX);
+    let k = batch_count(n);
     let mut out = Vec::with_capacity(k);
     let mut p = first;
     for j in 0..k {
@@ -421,11 +428,6 @@ impl PrefillStats {
             per(ms(self.copy_ns)),
         )
     }
-}
-
-/// `d` in whole nanoseconds, saturating.
-fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl Batch {
@@ -1015,7 +1017,8 @@ impl Body {
                     streams: &batch.hc[cur.s],
                     fold_in: &batch.folds[cur.f],
                 };
-                ffn.enqueue_batch_route(gpu, w, &mut batch.ffn, l, &block, slots)?;
+                let bl = ffn.resolve_batch(w, l)?;
+                ffn.enqueue_batch_route(gpu, &bl, &mut batch.ffn, &block, slots)?;
                 batch.ffn.enqueue_download(gpu, at, u)?;
                 if timed {
                     batch.card_marks[CARD_MARKS * i + 1].record(stream)?;
@@ -1027,7 +1030,7 @@ impl Body {
                     streams: &batch.hc[cur.s],
                     fold_in: &batch.folds[cur.f],
                 };
-                ffn.enqueue_batch_shadow(gpu, w, card, &mut batch.ffn, l, &block)?;
+                ffn.enqueue_batch_shadow(gpu, &bl, card, &mut batch.ffn, &block)?;
                 if timed {
                     batch.card_marks[CARD_MARKS * i + 2].record(stream)?;
                 }

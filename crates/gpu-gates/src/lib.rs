@@ -122,6 +122,19 @@ pub fn open_split(arch: Arch, recipe: &str) -> Result<Split, GateError> {
     Ok(split)
 }
 
+/// The file's end-of-sequence token, `tokenizer.ggml.eos_token_id` (stored
+/// as a u32 or a non-negative i32); a file that names none is an error.
+pub fn eos_token_id(split: &Split) -> Result<u32, GateError> {
+    split
+        .value("tokenizer.ggml.eos_token_id")
+        .and_then(|v| match v {
+            gguf::Value::U32(e) => Some(*e),
+            gguf::Value::I32(e) => u32::try_from(*e).ok(),
+            _ => None,
+        })
+        .ok_or_else(|| "the file names no EOS token".into())
+}
+
 /// Err unless `split` is a model file of architecture `arch`. The error names
 /// `recipe`, the `just` recipe that picks `arch`'s model profile.
 pub fn expect_arch(split: &Split, arch: Arch, recipe: &str) -> Result<(), GateError> {

@@ -2444,14 +2444,7 @@ mod gate {
 
     fn greedy(m: &mut Deepseek41Model, split: &Split, p: u32) -> Result<bool, GateError> {
         let ik = read_ik_greedy(p)?;
-        let eos = split
-            .value("tokenizer.ggml.eos_token_id")
-            .and_then(|v| match v {
-                gguf::Value::U32(e) => Some(*e),
-                gguf::Value::I32(e) => u32::try_from(*e).ok(),
-                _ => None,
-            })
-            .ok_or("the file names no EOS token")?;
+        let eos = bloomery_gpu_gates::eos_token_id(split)?;
         let vocab = vocab(split);
         m.reset()?;
         let t = Instant::now();
