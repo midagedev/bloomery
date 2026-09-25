@@ -76,16 +76,18 @@ lease_netdata() {
 lease_release() { exec 9>&-; }
 
 # CPU contention between arms. The lease serializes timed runs, not builds: another round's cargo
-# build, or a reference engine this runner did not start, shares the cores a timed arm runs on, and
-# the `busiest` witness field only shows it. guard_cpu sums `ps` %CPU over the processes whose name
-# is in CPU_BUSY_COMMS (BLOOMERY_CPU_BUSY_COMMS); above CPU_BUSY_PCT (BLOOMERY_CPU_BUSY_PCT, percent
-# of one cpu — a chosen threshold, not a measured one) it prints `[cpu-busy]` on stderr and sets
-# CPU_BUSY_TAG to ` [cpu-busy]` for the runner's row; with BLOOMERY_OTHER_STRICT=1 it prints a
-# witness block and exits 75 instead, as guard_other does for a busy other card. `ps` %CPU is cpu
-# time over elapsed time: a build started seconds ago reads its real load, a long-lived process that
-# only now turned busy reads low. Call it only between the runner's own arms, when no matching
-# process is the runner's own; the runner clears CPU_BUSY_TAG when a row starts.
-CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-cargo rustc cc1plus llama-bench generate_ds41}
+# build, a CUDA C++ build (nvcc drives cicc and ptxas, which carry its long passes — build-ref, the
+# mistral.rs build), or a reference engine this runner did not start, shares the cores a timed arm
+# runs on, and the `busiest` witness field only shows it. guard_cpu sums `ps` %CPU over the
+# processes whose name is in CPU_BUSY_COMMS (BLOOMERY_CPU_BUSY_COMMS); above CPU_BUSY_PCT
+# (BLOOMERY_CPU_BUSY_PCT, percent of one cpu — a chosen threshold, not a measured one) it prints
+# `[cpu-busy]` on stderr and sets CPU_BUSY_TAG to ` [cpu-busy]` for the runner's row; with
+# BLOOMERY_OTHER_STRICT=1 it prints a witness block and exits 75 instead, as guard_other does for a
+# busy other card. `ps` %CPU is cpu time over elapsed time: a build started seconds ago reads its
+# real load, a long-lived process that only now turned busy reads low. Call it only between the
+# runner's own arms, when no matching process is the runner's own; the runner clears CPU_BUSY_TAG
+# when a row starts.
+CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-cargo rustc cc1plus nvcc cicc ptxas llama-bench generate_ds41}
 CPU_BUSY_PCT=${BLOOMERY_CPU_BUSY_PCT:-50}
 CPU_BUSY_TAG=
 
