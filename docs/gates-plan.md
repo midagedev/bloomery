@@ -84,10 +84,14 @@
 갖고, 타이밍 임대가 잡혀 있으면(`flock -n`) 시작하지 않는다(시팅 오염 방지). 오늘 리드가 손으로 쓴 `gates.sh` 셋이
 그 원형이다.
 
-### 3.4 원장 층 `just gates-affected` (M, `spec-gatesaffected.md` 2층)
+### 3.4 원장 층 `just gates-affected` (M, `spec-gatesaffected.md` 2층) — 착륙(09-26 새벽, `gate-batch.sh --ledger`)
+
+착륙한 모양은 아래 원안과 두 곳이 다르다. 원장은 박스의 `gate.sh`가 아니라 **맥의 리드 러너 `gate-batch.sh --ledger`가 쓴다**(리드 묶음이 두 차선 러너로 돌게 된 뒤라서): `~/.cache/bloomery/gate-ledger.tsv`, 트리 밖, 두 리드의 트리가 공유, 줄마다 O_APPEND + flock 한 번. 키(`tools/recipes.py key`)는 타깃이 읽는 파일의 내용 해시(`affected`의 닫힘; 맥에서 도는 명령·모르는 cargo 서브커맨드·트리를 훑는 스크립트는 트리 전체), 레시피와 의존 레시피의 텍스트, cargo 전역·cuda-oxide 핀, 항목의 ARGS·환경·차선 카드, 박스 매니페스트 전체(`recipes.py box-manifest`, 묶음마다 box.sh 한 번, 임대 중 거부: env 파일, 커널, 카드·드라이버·VBIOS, rustc·llc·ptxas·cargo-oxide·백엔드, `$BLOOMERY_DATA`의 **내용** 해시(stat 캐시), 모델 파일 stat)다. 데이터를 stat 대신 내용으로 보는 것은 `gate-1-1`이 매번 데이터 파일 38개를 같은 바이트로 다시 쓰기 때문이다. 실측: 매니페스트 첫 가져오기 41.6 s(96,121개, 34.6 GB 해시), 이후 0.9–1.0 s; 항목 100개의 키 0.69 s. 영구 실행: 참조 트리를 읽는 레시피(`gate-1-1`·`gate-tokenizer`), `smoke`, 절대경로 인자, `--lanes 1`의 `any` 레시피. 리드 확인: 같은 세 항목을 두 번 — 첫 번째 셋 다 기록, 두 번째 셋 다 `rc=skip`.
+
+원안(그대로 둔다):
 
 입력 내용 해시(타깃의 소스 닫힘 + 스크립트 + 레시피 텍스트 + 툴체인 핀 + 카드)를 키로, 러너가 **rc 0일 때만** 쓰는
-원장 `/root/bloomery-gate-ledger.tsv`. 해시가 같은 게이트는 `skip <recipe> (green at <commit>)`로 찍고 건너뛴다.
+원장 ~~`/root/bloomery-gate-ledger.tsv`~~(착륙은 맥, 위). 해시가 같은 게이트는 `skip <recipe> (green at <commit>)`로 찍고 건너뛴다.
 효과가 큰 곳은 리베이스 뒤 재실행이다: 오늘 fixup5는 리베이스 뒤 14개를 다시 돌렸는데(ee의 q3ubatch 델타), 입력이
 안 바뀐 것은 원장이 건너뛴다. 라운드의 게이트 실행은 원장에 쓰지 않는다(리드 묶음만, `BLOOMERY_GATE_LEDGER=1`).
 

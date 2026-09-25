@@ -9,6 +9,8 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes]
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
+    python3 tools/recipes.py key --manifest F [--ledger L] ITEM...  # the green ledger's key per item
+    python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py --self-test
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
@@ -47,16 +49,23 @@ on it, and the notes say which targets had one and how old it is.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import difflib
+import fcntl
+import glob
+import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1280,8 +1289,1008 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------------------------------
+# the green ledger's input key (tools/gate-batch.sh --ledger)
+# ----------------------------------------------------------------------------------------------
+#
+# An item's key is the sha256 of labelled parts, one per line, in a fixed order:
+#   v         the key format
+#   recipe    the text of the recipe and of every recipe it depends on (just's own parse: a comment
+#             edit in the justfile does not move it), and the justfile's settings and assignments
+#   scope     `closure` — the files below come from the walk `affected` uses (crate graph, module
+#             trees, the scripts the recipe names and what they name; cfg-ignoring, so a superset) —
+#             or `tree`, every file tools/box.sh ships, with the reason: a command run on the Mac, a
+#             cargo subcommand the parser does not model (`cargo fmt`), a script that walks the tree
+#   file      path relative to the tree, content sha256 (a link: its target)
+#   global    Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/*, the cuda-oxide pin rev
+#   item      ARGS, the item's full BLOOMERY_BOX_ENV (the caller's, then the item's, then the lane's
+#             card), the card that env forces
+#   mac-env   the Mac-side variables tools/box.sh carries or reads (BLOOMERY_REMOTE is not one: it
+#             names a track's directory, not an input), and the versions of just and python3
+#   box       every line of the box manifest (`box-manifest`, fetched once per batch)
+# Not in it: the binary (its paths are per track) and the commit.
+
+KEY_VERSION = "bloomery-gate-key 1"
+MANIFEST_VERSION = "box-manifest 1"
+MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_V41_MODEL")
+KEY_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".cargo/cuda-oxide.toml"]
+# tools/box.sh's rsync excludes (target/ and .git/ at any depth; *.ptx, *.ll, .oxide-artifacts/ at the
+# root), plus per-checkout noise no gate reads that would split the key by checkout: a worktree's .git
+# file, .DS_Store, __pycache__/.
+TREE_SKIP_DIRS = frozenset({"target", ".git", "__pycache__"})
+TREE_SKIP_FILES = frozenset({".git", ".DS_Store"})
+SCRIPT_EXTS = (".sh", ".py", ".bash")
+# $BLOOMERY_DATA entries left out of the manifest: only the timing runners write them
+# (tools/ref/nsys-gpu.sh, nsys-ds41.sh, ncu-gpu.sh), and no gate reads them — the self-test fails when
+# a gate-* recipe's inputs name one.
+DATA_UNREAD = {
+    "nsys": "profiler reports of the timing runners (tools/ref/nsys-gpu.sh, nsys-ds41.sh); no gate reads them",
+    "ncu": "profiler reports of a timing runner (tools/ref/ncu-gpu.sh); no gate reads them",
+}
+DATA_UNREAD_NAMED = re.compile(r"BLOOMERY_DATA\}?\"?/(?:nsys|ncu)\b|join\(\"(?:nsys|ncu)\"\)|\"(?:nsys|ncu)/")
+# A reference tree (ik, llama.cpp, mistral.rs) is outside the manifest: a recipe that reads one is
+# never skipped. The profiles and ref-paths.sh only define these names for every box command. The home
+# path is spelled with a class so that this file, which check-recipes runs, does not match itself.
+IK_READ = re.compile(r"\$\{?(?:IK|IKBIN|LCPP|LCPPBIN|MRS|MRSBIN)\b|/home/[u]ser/")
+IK_DEFINERS = ("tools/ref/ref-paths.sh", "tools/ref/models/")
+HOME_LITERAL = re.compile(r"\"/home/")
+# A walk of the tree, which no closure bounds: the recipe is keyed on the whole tree.
+TREE_WALK = re.compile(
+    r"\bfind\s+\"?(?:\$\{?(?:ROOT|HERE)\}?\"?(?:/\S*)?|\.|crates|tools|docs)(?=[\s\"/]|$)"
+    r"|\bgrep\s+(?:-[A-Za-z]*r[A-Za-z]*|--recursive)\b"
+    r"|\bgit\s+(?:ls-files|grep)\b"
+    r"|\bos\.walk\(|\bglob\.glob\(|\.rglob\("
+    r"|(?:\$\{?(?:ROOT|HERE)\}?\"?/|(?<![\w./$-])(?:crates|tools|docs)/)[^\s'\"]*[*?{\[]"
+)
+ITEM_RE = re.compile(r"^([A-Za-z0-9_-]+)(?:@([^:]*))?(?::(.*))?$")
+ANY_CARD = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+MODEL_LITERAL = re.compile(r"/models/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def shipped_files(root: str) -> list[str]:
+    """Every file (or link) tools/box.sh ships from `root`, relative and sorted, minus TREE_SKIP_*."""
+    out: list[str] = []
+    for dp, dns, fns in os.walk(root):
+        rel = os.path.relpath(dp, root)
+        keep = []
+        for d in sorted(dns):
+            if d in TREE_SKIP_DIRS or (rel == "." and d == ".oxide-artifacts"):
+                continue
+            if os.path.islink(os.path.join(dp, d)):
+                out.append(os.path.normpath(os.path.join(rel, d)))  # shipped as a link, not walked
+                continue
+            keep.append(d)
+        dns[:] = keep
+        for f in fns:
+            if f in TREE_SKIP_FILES or (rel == "." and f.endswith((".ptx", ".ll"))):
+                continue
+            out.append(os.path.normpath(os.path.join(rel, f)))
+    return sorted(out)
+
+
+def command_shape(recipe: Recipe) -> tuple[list[str], list[str]]:
+    """(commands the recipe runs on the Mac other than tools/box.sh, box cargo subcommands the parser
+    does not model). Either one means the recipe's reads are not bounded by its closure."""
+    mac: list[str] = []
+    unmodeled: list[str] = []
+    for line in recipe.lines:
+        stripped = line.lstrip("@-").strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        for cmd in simple_commands(shell_words(stripped)):
+            _, rest = strip_wrappers(cmd)
+            if not rest:
+                continue
+            if _norm(rest[0]) != "tools/box.sh":
+                mac.append(" ".join(rest[:2]))
+                continue
+            for rcmd in simple_commands(shell_words(" ".join(rest[1:]))):
+                _, r = strip_wrappers(rcmd)
+                if r and r[0] == "cargo":
+                    try:
+                        inv = parse_cargo(r[1:], " ".join(r))
+                    except RecipeError:
+                        inv = None
+                    if inv is None:
+                        unmodeled.append(" ".join(r[:2]))
+    return mac, unmodeled
+
+
+def exec_closure(tree: Tree, start: list[str]) -> list[str]:
+    """The scripts a recipe runs: `start` (what its text runs or sources) and, transitively, the scripts
+    a shell script among them names. A python script is a leaf: the paths it names are data it reads
+    (recipes.py names every runner as a string), not scripts it runs."""
+    seen: list[str] = []
+    stack = [s for s in start if tree.exists(s)]
+    while stack:
+        s = stack.pop()
+        if s in seen:
+            continue
+        seen.append(s)
+        if not s.endswith((".sh", ".bash")):
+            continue
+        sdir = os.path.dirname(s)
+        for line in tree.read(s).split("\n"):
+            st = line.strip()
+            if not st or st.startswith("#"):
+                continue
+            for q in _SCRIPT_PATH.findall(line):
+                q = _norm(q)
+                if q.endswith(SCRIPT_EXTS) and tree.exists(q):
+                    stack.append(q)
+            for b in re.findall(r"([A-Za-z0-9_.-]+\.(?:sh|py|bash))\b", line):
+                q = os.path.normpath(os.path.join(sdir, b))
+                if tree.exists(q):
+                    stack.append(q)
+    return sorted(seen)
+
+
+def recipe_closure(recipes: dict[str, Recipe], name: str) -> list[str]:
+    seen: list[str] = []
+    stack = [name]
+    while stack:
+        n = stack.pop()
+        if n in seen or n not in recipes:
+            continue
+        seen.append(n)
+        stack.extend(recipes[n].deps)
+    return sorted(seen)
+
+
+def scan_lines(text: str, pat: re.Pattern, where: str, numbered: bool = True) -> str | None:
+    """The first non-comment line of `text` that `pat` matches, as `where[:line] (match)`."""
+    if not pat.search(text):
+        return None
+    for i, line in enumerate(text.split("\n"), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = pat.search(line)
+        if m:
+            return f"{where}:{i} ({m.group(0).strip()})" if numbered else f"{where} ({m.group(0).strip()})"
+    return None
+
+
+_SCAN_MEMO: dict[tuple, str | None] = {}
+_JUST_VERSION: list[str] = []
+
+
+def scan_file(root: str, rel: str, pat: re.Pattern) -> str | None:
+    """scan_lines over a tree file, memoized on its stat (the self-test keys many copies of one tree)."""
+    p = os.path.join(root, rel)
+    st = os.stat(p)
+    k = (p, st.st_size, st.st_mtime_ns, pat.pattern)
+    if k not in _SCAN_MEMO:
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            _SCAN_MEMO[k] = scan_lines(fh.read(), pat, rel)
+    return _SCAN_MEMO[k]
+
+
+def just_version() -> str:
+    if not _JUST_VERSION:
+        _JUST_VERSION.append(subprocess.run(["just", "--version"], capture_output=True, text=True).stdout.strip() or "unknown")
+    return _JUST_VERSION[0]
+
+
+def oxide_rev(text: str) -> str:
+    """The cuda-oxide rev tools/box.sh reads: the [patch] section's cuda-device rev, else the first one."""
+    sec = re.search(r'^\[patch\."https://github\.com/NVlabs/cuda-oxide\.git"\]\s*$(.*?)(?=^\[workspace|\Z)', text, re.M | re.S)
+    for body in ([sec.group(1)] if sec else []) + [text]:
+        m = re.search(r'^cuda-device = .*rev = "([0-9a-f]+)"', body, re.M)
+        if m:
+            return m.group(1)
+    return "absent"
+
+
+def load_manifest(path: str | None) -> tuple[list[str], dict[str, str], str | None]:
+    """(content lines, header fields, error) of a box manifest file."""
+    if not path:
+        return [], {}, "no box manifest was given (--manifest)"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = [ln for ln in fh.read().split("\n") if ln.strip()]
+    except OSError as err:
+        return [], {}, f"cannot read {path}: {err.strerror}"
+    if not lines or not lines[0].startswith("# " + MANIFEST_VERSION):
+        return [], {}, f"{path} is not a {MANIFEST_VERSION} file (first line {(lines[:1] or [''])[0][:60]!r})"
+    if lines[-1] != "# end":
+        return [], {}, f"{path} has no `# end` line: the box manifest is truncated"
+    head = dict(kv.split("=", 1) for kv in lines[0].split()[3:] if "=" in kv)
+    return [ln for ln in lines if not ln.startswith("#")], head, None
+
+
+def part_id(line: str) -> tuple[str, ...]:
+    """A part's identity for a diff: label and name (label, kind and name for a manifest line)."""
+    f = line.split("\t")
+    return tuple(f[:3]) if f[0] == "box" else tuple(f[:2])
+
+
+class KeyContext:
+    """Keys for the items of one batch: one tree, one box manifest, one caller environment."""
+
+    def __init__(self, side: Side, manifest_path: str | None, box_env: str = "", environ: dict[str, str] | None = None, manifest_error: str | None = None, settings: dict | None = None):
+        self.side = side
+        self.box_env = box_env
+        env = dict(os.environ) if environ is None else environ
+        self.env = env
+        self.mac = [f"mac-env\t{v}\t{env[v] if v in env else '<unset>'}" for v in MAC_ENV]
+        self.mac += [f"mac-tool\tjust\t{just_version()}", f"mac-tool\tpython3\t{platform.python_version()}"]
+        self.manifest, self.manifest_head, self.manifest_error = load_manifest(manifest_path)
+        if manifest_error:
+            self.manifest_error = f"the box manifest failed: {manifest_error}"
+        self.settings = settings if settings is not None else justfile_settings(os.path.join(side.tree.root, "justfile"))
+        self._sha: dict[str, str] = {}
+        self._tree: list[str] | None = None
+
+    def tree_files(self) -> list[str]:
+        if self._tree is None:
+            self._tree = shipped_files(self.side.tree.root)
+        return self._tree
+
+    def file_part(self, rel: str) -> str:
+        p = os.path.join(self.side.tree.root, rel)
+        if os.path.islink(p):
+            return f"link\t{rel}\t{os.readlink(p)}"
+        if rel not in self._sha:
+            self._sha[rel] = sha256_file(p)
+        return f"file\t{rel}\t{self._sha[rel]}"
+
+    def globals(self) -> list[str]:
+        root = self.side.tree.root
+        names = list(KEY_GLOBALS)
+        cdir = os.path.join(root, ".cargo")
+        if os.path.isdir(cdir):
+            names += sorted(f".cargo/{f}" for f in os.listdir(cdir) if f".cargo/{f}" not in names)
+        out = []
+        for g in names:
+            p = os.path.join(root, g)
+            out.append(f"global\t{g}\t{sha256_file(p) if os.path.isfile(p) else 'absent'}")
+        toml = os.path.join(root, "Cargo.toml")
+        out.append(f"global\toxide-rev\t{oxide_rev(self.side.tree.read('Cargo.toml')) if os.path.isfile(toml) else 'absent'}")
+        return out
+
+    def scope(self, names: list[str], ri: RecipeInputs) -> tuple[str, str]:
+        st = self.settings.get("settings", {})
+        if st.get("dotenv_load") or st.get("dotenv_filename") or st.get("dotenv_path"):
+            return "tree", "the justfile loads a dotenv file"
+        recipes = self.side.recipes
+        for n in names:
+            mac, unmodeled = command_shape(recipes[n])
+            if mac:
+                return "tree", f"{n} runs `{mac[0]}` on the Mac; its reads are not modeled"
+            if unmodeled:
+                return "tree", f"{n} runs `{unmodeled[0]}`, a cargo subcommand the parser does not model"
+            hit = scan_lines("\n".join(recipes[n].lines), TREE_WALK, f"justfile:{recipes[n].line} {n}", numbered=False)
+            if hit:
+                return "tree", f"{hit} walks the tree"
+        for f in self.run_scripts(names):
+            hit = scan_file(self.side.tree.root, f, TREE_WALK)
+            if hit:
+                return "tree", f"{hit} walks the tree"
+        return "closure", f"{len(ri.files)} files, {len(ri.prefixes)} directories"
+
+    def run_scripts(self, names: list[str]) -> list[str]:
+        """The scripts the recipes `names` run on the box or the Mac (exec_closure), box.sh's own
+        sourced files included for a box recipe."""
+        start: list[str] = []
+        for n in names:
+            rc = self.side.graph.inputs(n).commands
+            start += rc.scripts
+            if rc.box:
+                start += BOX_GLOBALS + [f"tools/ref/models/{rc.env.get('BLOOMERY_MODEL', DEFAULT_PROFILE)}.sh"]
+        return exec_closure(self.side.tree, start)
+
+    def never(self, names: list[str], ri: RecipeInputs, envs: list[str]) -> str | None:
+        recipes = self.side.recipes
+        for n in names:
+            if "tools/gate-batch.sh" in self.side.graph.inputs(n).commands.scripts:
+                return f"{n} runs tools/gate-batch.sh: a batch inside a batch, whose items' inputs are not this item's"
+        for n in names:
+            hit = scan_lines("\n".join(recipes[n].lines), IK_READ, f"justfile:{recipes[n].line} {n}", numbered=False)
+            if hit:
+                return f"{hit} reads a reference tree, which is outside the key"
+        for f in self.run_scripts(names):
+            if f.startswith(IK_DEFINERS):
+                continue
+            hit = scan_file(self.side.tree.root, f, IK_READ)
+            if hit:
+                return f"{hit} reads a reference tree, which is outside the key"
+        for f in sorted(ri.files):
+            if f.endswith(".rs") and self.side.tree.exists(f):
+                hit = scan_file(self.side.tree.root, f, HOME_LITERAL)
+                if hit:
+                    return f"{hit} reads a reference tree, which is outside the key"
+        # tools/gpu-gate.sh's `any` picks a card at run time (the idle A6000, else the 3090): with no card
+        # forced (--lanes 1) the key cannot name the card a green ran on.
+        forced = any(e.partition("=")[0] == "BLOOMERY_GATE_CARD" for e in self.box_env.split() + envs)
+        if not forced:
+            for n in names:
+                if any(ANY_CARD in ln for ln in recipes[n].lines):
+                    return f"{n} calls tools/gpu-gate.sh with the `any` card and no card is forced (--lanes 1): the card is picked at run time"
+        # A path in an env entry is read by the gate but not by the box manifest: the manifest walks
+        # $BLOOMERY_DATA and the model directories as the caller's env names them, never an item's.
+        for e in envs:
+            k, _, v = e.partition("=")
+            if v.startswith("/"):
+                return f"the item's env {k}={v} names a path the box manifest does not read"
+        data = self.manifest_head.get("data", "")
+        for e in self.box_env.split():
+            k, _, v = e.partition("=")
+            if v.startswith("/") and not v.startswith("/models/") and not (data and (v == data or v.startswith(data.rstrip("/") + "/"))):
+                return f"BLOOMERY_BOX_ENV's {k}={v} names a path the box manifest does not read"
+        return None
+
+    def parts(self, item: str) -> tuple[list[str], str | None, str | None, str]:
+        """(parts, error, never-skip reason, scope summary) of one item."""
+        m = ITEM_RE.match(item)
+        if not m:
+            return [], f"malformed item {item!r} (NAME[@K=V,…][:ARGS])", None, ""
+        name, env, args = m.groups()
+        recipes, graph, tree = self.side.recipes, self.side.graph, self.side.tree
+        if name not in recipes:
+            return [], f"{name!r} is not a recipe in the justfile", None, ""
+        envs = [e for e in (env or "").split(",") if e]
+        bad = [e for e in envs if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", e)]
+        if bad:
+            return [], f"env entry {bad[0]!r} is not K=V", None, ""
+        try:
+            argv = shlex.split(args) if args else []
+        except ValueError as err:
+            return [], f"ARGS {args!r}: {err}", None, ""
+        if self.manifest_error:
+            return [], self.manifest_error, None, ""
+        try:
+            ri = graph.inputs(name)
+        except (OSError, RecipeError) as err:
+            return [], f"{name}: its inputs cannot be read: {err}", None, ""
+        if ri.errors:
+            return [], f"{name}: {ri.errors[0]}", None, ""
+        names = recipe_closure(recipes, name)
+        try:
+            return self._parts(name, names, ri, envs, argv)
+        except OSError as err:
+            return [], f"{name}: an input cannot be read: {err}", None, ""
+
+    def _parts(self, name: str, names: list[str], ri: RecipeInputs, envs: list[str], argv: list[str]) -> tuple[list[str], str | None, str | None, str]:
+        recipes, tree = self.side.recipes, self.side.tree
+        scope, why = self.scope(names, ri)
+        never = self.never(names, ri, envs)
+        eff = self.box_env.split() + envs
+        # A path in ARGS is read by the gate: an absolute one is outside the manifest (never-skip), a tree
+        # path joins the key's files. The same for a tree path in an env value.
+        named: set[str] = set()
+        for w in argv + [e.partition("=")[2] for e in eff]:
+            for v in w.split(","):
+                v = v.split("=", 1)[-1]
+                if v.startswith("/") and w in argv and never is None:
+                    never = f"ARGS {v} names a path the box manifest does not read"
+                elif "/" in v and not v.startswith("/"):
+                    rel = _norm(v)
+                    if tree.exists(rel):
+                        named.add(rel)
+                    elif tree.isdir(rel):
+                        named |= {f for f in self.tree_files() if f.startswith(rel.rstrip("/") + "/")}
+        parts = [f"v\t{KEY_VERSION}"]
+        parts += [f"recipe\t{n}\t{sha256_text(recipes[n].text)}" for n in names]
+        parts.append(f"recipe\t<justfile>\t{sha256_text(json.dumps(self.settings, sort_keys=True))}")
+        parts.append(f"scope\t{scope}\t{why if scope == 'tree' else 'closure'}")
+        if scope == "tree":
+            files = set(self.tree_files())
+        else:
+            files = set(ri.files)
+            for p in ri.prefixes:
+                files |= {f for f in self.tree_files() if f.startswith(p)}
+        files |= named
+        files -= set(KEY_GLOBALS)
+        if scope == "closure":
+            for u in tree.unresolved:
+                if u.split(": ", 1)[0] in files:
+                    return [], f"source walk: {u}", None, ""
+        for rel in sorted(files):
+            try:
+                parts.append(self.file_part(rel))
+            except OSError as err:
+                return [], f"cannot read {rel}: {err.strerror}", None, ""
+        parts += self.globals()
+        card = "none"
+        for e in eff:
+            k, _, v = e.partition("=")
+            if k == "BLOOMERY_GATE_CARD":
+                card = v
+        parts += [f"item\targs\t{json.dumps(argv)}", f"item\tboxenv\t{' '.join(eff)}", f"item\tcard\t{card}"]
+        parts += self.mac
+        parts += [f"box\t{ln}" for ln in self.manifest]
+        summary = f"scope=tree ({why})" if scope == "tree" else f"scope=closure ({why})"
+        return parts, None, never, summary
+
+
+def justfile_settings(path: str) -> dict:
+    """The justfile's settings, assignments and unexports (just's own parse), for the key."""
+    proc = subprocess.run(["just", "--justfile", path, "--working-directory", os.path.dirname(path) or ".", "--dump", "--dump-format", "json"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RecipeError(f"`just --dump` failed on {path} (exit {proc.returncode}): {proc.stderr.strip()}")
+    dump = json.loads(proc.stdout)
+    return {k: dump.get(k) for k in ("settings", "assignments", "unexports")}
+
+
+def item_key(parts: list[str]) -> str:
+    return sha256_text("\n".join(parts) + "\n")
+
+
+@dataclass
+class LedgerRecord:
+    key: str
+    recipe: str
+    item: str
+    commit: str
+    date: str
+    tree: str
+
+
+class Ledger:
+    """The green ledger, read-only here: `key recipe item commit date tree`, appended by gate-batch.sh."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.by_key: dict[str, LedgerRecord] = {}
+        self.by_item: dict[tuple[str, str], LedgerRecord] = {}
+        self.by_recipe: dict[str, LedgerRecord] = {}
+        self.bad = 0
+        if not os.path.exists(path):
+            return
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                f = ln.rstrip("\n").split("\t")
+                if len(f) != 6 or not HEX64.match(f[0]):
+                    self.bad += 1
+                    continue
+                rec = LedgerRecord(*f)
+                self.by_key[rec.key] = rec
+                self.by_item[(rec.recipe, rec.item)] = rec
+                self.by_recipe[rec.recipe] = rec
+
+    def parts_of(self, key: str) -> list[str] | None:
+        p = os.path.join(self.path + ".parts", key + ".parts")
+        try:
+            with open(p, encoding="utf-8") as fh:
+                return [ln for ln in fh.read().split("\n") if ln]
+        except OSError:
+            return None
+
+    def why(self, name: str, item: str, parts: list[str]) -> str:
+        """Why an item that has no green record at its key runs: what moved since its last green."""
+        rec = self.by_item.get((name, item))
+        which = "this item"
+        if rec is None:
+            rec = self.by_recipe.get(name)
+            which = f"{name} as {rec.item}" if rec else ""
+        if rec is None:
+            return f"no green record of {name}"
+        head = f"no green record at this key; {which} was green at {rec.commit} {rec.date}"
+        old = self.parts_of(rec.key)
+        if old is None:
+            return head + " (its parts were not kept)"
+        cur = {part_id(p): p for p in parts}
+        was = {part_id(p): p for p in old}
+        moved = [k for k in cur if k in was and was[k] != cur[k]] + [k for k in cur if k not in was] + [k for k in was if k not in cur]
+        shown = "; ".join(" ".join(k) for k in moved[:4])
+        return head + f"; moved since: {shown}" + (f" (+{len(moved) - 4})" if len(moved) > 4 else "")
+
+
+def cmd_key(args: argparse.Namespace) -> int:
+    side = make_side(ROOT)
+    ctx = KeyContext(side, args.manifest, args.box_env or "", manifest_error=args.manifest_error)
+    ledger = Ledger(args.ledger) if args.ledger else None
+    if ledger is not None and ledger.bad:
+        print(f"recipes.py key: {args.ledger}: {ledger.bad} malformed line(s) ignored (they cannot skip an item)", file=sys.stderr)
+    if args.parts_dir:
+        os.makedirs(args.parts_dir, exist_ok=True)
+    for i, item in enumerate(args.items):
+        parts, err, never, summary = ctx.parts(item)
+        if err is not None:
+            print(f"-\t{item}\terror\t{err}".replace("\n", " "))
+            continue
+        key = item_key(parts)
+        if args.parts_dir:
+            with open(os.path.join(args.parts_dir, f"{i}.parts"), "w", encoding="utf-8") as fh:
+                fh.write("\n".join(parts) + "\n")
+        name = ITEM_RE.match(item).group(1)
+        if never is not None:
+            status, detail = "never", never
+        elif ledger is None:
+            status, detail = "key", summary
+        elif args.rerun:
+            status, detail = "rerun", "--rerun: runs whatever the ledger holds"
+        elif key in ledger.by_key:
+            r = ledger.by_key[key]
+            status, detail = "skip", f"green-at={r.commit} {r.date} tree={r.tree}"
+        else:
+            status, detail = "run", ledger.why(name, item, parts)
+        print(f"{key}\t{item}\t{status}\t{detail}".replace("\n", " "))
+        if args.show_parts:
+            for p in parts:
+                print(f"  {p}")
+    return 0
+
+
+# ---------------- the box manifest (runs on the box, through tools/box.sh) ----------------
+
+
+class HashCache:
+    """sha256 of files keyed by (size, mtime, ctime, inode, device), kept between batches on the box:
+    a file rewritten with the same bytes (gate-1-1 and gate-tokenizer rewrite theirs on every run) keeps
+    its hash, and only files whose stat moved are read again. A file changed within the last 2 s is
+    hashed but not cached (its next write may land inside the same timestamp)."""
+
+    RACY_NS = 2_000_000_000
+
+    def __init__(self, path: str):
+        self.path = path
+        self.entries: dict[str, tuple] = {}
+        self.dirty = False
+        self.hashed = 0
+        self.hashed_bytes = 0
+        self.t0_ns = time.time_ns()
+        self._fd = -1
+
+    def __enter__(self) -> HashCache:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._fd = os.open(self.path + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        if os.path.exists(self.path):
+            with open(self.path, encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    f = ln.rstrip("\n").split("\t")
+                    if len(f) == 7 and HEX64.match(f[0]):
+                        self.entries[f[6]] = (f[0], int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5]))
+        return self
+
+    def __exit__(self, et, ev, tb) -> None:
+        try:
+            if et is None and self.dirty:
+                tmp = f"{self.path}.tmp.{os.getpid()}"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    for p, e in sorted(self.entries.items()):
+                        if "\t" not in p and "\n" not in p:
+                            fh.write("\t".join(map(str, e)) + "\t" + p + "\n")
+                os.replace(tmp, self.path)
+        finally:
+            os.close(self._fd)
+
+    @staticmethod
+    def ident(st: os.stat_result) -> tuple:
+        return (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev)
+
+    def cached(self, path: str, st: os.stat_result) -> str | None:
+        e = self.entries.get(path)
+        return e[0] if e is not None and e[1:] == self.ident(st) else None
+
+    def store(self, path: str, st: os.stat_result, digest: str) -> None:
+        self.dirty = True
+        self.hashed += 1
+        self.hashed_bytes += st.st_size
+        if max(st.st_mtime_ns, st.st_ctime_ns) > self.t0_ns - self.RACY_NS:
+            self.entries.pop(path, None)
+        else:
+            self.entries[path] = (digest, *self.ident(st))
+
+    def forget_under(self, root: str, seen: set[str]) -> None:
+        pre = root.rstrip("/") + "/"
+        for p in [p for p in self.entries if p.startswith(pre) and p not in seen]:
+            del self.entries[p]
+            self.dirty = True
+
+    def sha(self, path: str) -> str:
+        st = os.stat(path)
+        got = self.cached(path, st)
+        if got is None:
+            got, st = hash_stable(path, st)
+            self.store(path, st, got)
+        return got
+
+
+def hash_stable(path: str, st: os.stat_result) -> tuple[str, os.stat_result]:
+    """sha256 of a file whose stat did not move while it was read (retried twice), and that stat."""
+    for _ in range(3):
+        h = hashlib.sha256()
+        with open(path, "rb", buffering=0) as fh:
+            try:
+                os.posix_fadvise(fh.fileno(), 0, 0, os.POSIX_FADV_NOREUSE)
+            except (AttributeError, OSError):
+                pass
+            buf = bytearray(8 << 20)
+            view = memoryview(buf)
+            while True:
+                n = fh.readinto(buf)
+                if not n:
+                    break
+                h.update(view[:n])
+            after = os.fstat(fh.fileno())
+        if HashCache.ident(after) == HashCache.ident(st):
+            return h.hexdigest(), st
+        st = os.stat(path)
+    raise RecipeError(f"box-manifest: {path} kept changing while it was hashed — something writes $BLOOMERY_DATA now; retry")
+
+
+def _run(cmd: list[str], **kw) -> str:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, **kw)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise RecipeError(f"box-manifest: {cmd[0]} could not run: {err}") from err
+    if proc.returncode != 0:
+        raise RecipeError(f"box-manifest: {' '.join(cmd[:3])} failed (exit {proc.returncode}): {proc.stderr.strip()[-300:]}")
+    return proc.stdout
+
+
+def data_manifest(root: str, cache: HashCache, workers: int) -> tuple[list[tuple], int]:
+    """One line per top-level entry of $BLOOMERY_DATA: a digest over (path, size, content sha256) of every
+    file under it — a link by its target text, and its target's content when that is a file. The
+    DATA_UNREAD entries are named, not read."""
+    lines: list[tuple] = []
+    rows: dict[str, list[tuple[str, str]]] = {}  # top -> [(sort key, digest line)]
+    files: dict[str, int] = {}
+    size: dict[str, int] = {}
+    todo: list[tuple[str, str, str, os.stat_result]] = []  # (top, rel, abspath, stat) not in the cache
+    seen: set[str] = set()
+
+    def add_file(top: str, rel: str, st: os.stat_result, digest: str) -> None:
+        rows[top].append((rel, f"{rel}\t{st.st_size}\t{digest}"))
+        files[top] += 1
+        size[top] += st.st_size
+
+    for top in sorted(os.listdir(root)):
+        if top in DATA_UNREAD:
+            lines.append(("data-skip", top + "/", DATA_UNREAD[top]))
+            continue
+        tp = os.path.join(root, top)
+        rows[top], files[top], size[top] = [], 0, 0
+        is_dir = os.path.isdir(tp) and not os.path.islink(tp)
+        walk = os.walk(tp) if is_dir else [(root, [], [top])]
+        for dp, dns, fns in walk:
+            dns.sort()
+            for d in [d for d in dns if os.path.islink(os.path.join(dp, d))]:
+                rel = os.path.relpath(os.path.join(dp, d), root)
+                rows[top].append((rel + "\0", f"{rel}\t->\t{os.readlink(os.path.join(dp, d))}"))
+            for f in sorted(fns):
+                ap = os.path.join(dp, f)
+                rel = os.path.relpath(ap, root)
+                lst = os.lstat(ap)
+                st = lst
+                if stat.S_ISLNK(lst.st_mode):
+                    rows[top].append((rel + "\0", f"{rel}\t->\t{os.readlink(ap)}"))
+                    try:
+                        st = os.stat(ap)
+                    except FileNotFoundError:
+                        continue  # a dangling link: its target text is the record
+                if not stat.S_ISREG(st.st_mode):
+                    if not stat.S_ISLNK(lst.st_mode):
+                        rows[top].append((rel, f"{rel}\t{stat.filemode(lst.st_mode)}"))
+                    continue
+                seen.add(ap)
+                got = cache.cached(ap, st)
+                if got is None:
+                    todo.append((top, rel, ap, st))
+                else:
+                    add_file(top, rel, st, got)
+    if todo:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            for (top, rel, ap, _), (digest, st) in zip(todo, ex.map(lambda t: hash_stable(t[2], t[3]), todo)):
+                cache.store(ap, st, digest)
+                add_file(top, rel, st, digest)
+    cache.forget_under(root, seen)
+    for top in rows:
+        rows[top].sort()
+        tp = os.path.join(root, top)
+        name = top + ("/" if os.path.isdir(tp) and not os.path.islink(tp) else "")
+        lines.append(("data", name, sha256_text("\n".join(ln for _, ln in rows[top]) + "\n"), files[top], size[top]))
+    lines.sort(key=lambda t: (t[0], t[1]))
+    return lines, sum(files.values())
+
+
+PROFILE_PATHS = 'unset BLOOMERY_REF_MODEL; source "$1" > /dev/null || exit 3; for v in $(compgen -v); do case "${!v}" in /models/*) printf "%s\\n" "${!v}" ;; esac; done'
+
+
+def model_dirs() -> set[str]:
+    """The model directories a gate can open: every /models path the profiles define (under their own
+    defaults), the box command's environment names, or the tree names literally — the directory of each,
+    so a split set's shards all count."""
+    paths: set[str] = set()
+    env = {k: v for k, v in os.environ.items() if k != "BLOOMERY_REF_MODEL"}
+    for prof in sorted(glob.glob(os.path.join(ROOT, "tools/ref/models/*.sh"))):
+        out = _run(["bash", "-c", PROFILE_PATHS, "bash", prof], env=env)
+        paths |= {ln for ln in out.splitlines() if ln.startswith("/models/")}
+    paths |= {v for v in os.environ.values() if v.startswith("/models/")}
+    for rel in shipped_files(ROOT):
+        if rel == "justfile" or rel.endswith((".rs", ".sh", ".py", ".toml", ".tsv")):
+            with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as fh:
+                paths |= set(MODEL_LITERAL.findall(fh.read()))
+    # A model directory is /models/<name>: never /models itself, whose listing moves whenever any
+    # model is fetched (a literal naming a file right under /models is its own entry).
+    return {"/".join(p.split("/")[:3]) for p in paths if p.count("/") >= 2}
+
+
+def cmd_box_manifest(args: argparse.Namespace) -> int:
+    t0 = time.time()
+    for lock in args.lease or []:
+        r = subprocess.run(["flock", "-n", "-E", "75", lock, "true"])
+        if r.returncode == 75:
+            print(f"box-manifest: the timing lease {lock} is held — a sitting must not see the manifest's reads", file=sys.stderr)
+            return 75
+        if r.returncode != 0:
+            raise RecipeError(f"box-manifest: cannot test the lease {lock} (flock exit {r.returncode})")
+    data = os.environ.get("BLOOMERY_DATA", "")
+    if not data or not os.path.isdir(data):
+        raise RecipeError(f"box-manifest: BLOOMERY_DATA={data!r} is not a directory (run it through tools/box.sh, which exports it)")
+    rows: list[tuple] = []
+    with HashCache(os.path.expanduser(args.cache)) as cache:
+        env_file = os.path.expanduser("~/bloomery-env.sh")
+        rows.append(("env", "bloomery-env.sh", sha256_file(env_file) if os.path.isfile(env_file) else "absent"))
+        rows.append(("os", "kernel", platform.release()))
+        for ln in _run(["nvidia-smi", "--query-gpu=index,name,uuid,driver_version,vbios_version", "--format=csv,noheader"]).splitlines():
+            if ln.strip():
+                rows.append(("gpu", *[x.strip() for x in ln.split(",")]))
+        rows.append(("tool", "rustc", "; ".join(_run(["rustc", "-vV"], cwd=ROOT).split("\n")).strip("; ")))
+        llc = os.environ.get("CUDA_OXIDE_LLC", "")
+        rows.append(("tool", "llc", "; ".join(ln.strip() for ln in _run([llc, "--version"]).splitlines() if "version" in ln.lower()) if llc else "unset"))
+        ptxas = os.path.join(os.environ.get("CUDA_TOOLKIT_PATH", "/usr/local/cuda"), "bin", "ptxas")
+        rows.append(("tool", "ptxas", "; ".join(_run([ptxas, "--version"]).strip().splitlines()[-2:])))
+        co = shutil.which("cargo-oxide")
+        rows.append(("tool", "cargo-oxide", cache.sha(co) if co else "absent"))
+        be = os.environ.get("CUDA_OXIDE_BACKEND", "")
+        if be and os.path.isfile(be):
+            srev = os.path.join(os.path.dirname(be), "source-rev.txt")
+            rev_text = "absent"
+            if os.path.isfile(srev):
+                with open(srev, encoding="utf-8", errors="replace") as fh:
+                    rev_text = fh.read().strip() or "empty"
+            rows.append(("backend", os.path.basename(os.path.dirname(be)), cache.sha(be), rev_text))
+        else:
+            rows.append(("backend", "absent", be or "unset"))
+        drows, nfiles = data_manifest(data, cache, args.workers)
+        rows += drows
+        for d in sorted(model_dirs()):
+            if os.path.isfile(d):
+                st = os.stat(d)
+                rows.append(("model", d, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino))
+                continue
+            if not os.path.isdir(d):
+                rows.append(("model-dir", d, "absent"))
+                continue
+            for f in sorted(os.listdir(d)):
+                p = os.path.join(d, f)
+                lst = os.lstat(p)
+                if stat.S_ISDIR(lst.st_mode):
+                    rows.append(("model", p, "dir"))
+                    continue
+                link = os.readlink(p) if stat.S_ISLNK(lst.st_mode) else ""
+                try:
+                    st = os.stat(p)
+                except FileNotFoundError:
+                    rows.append(("model", p, "->", link, "dangling"))
+                    continue
+                rows.append(("model", p, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino) + (("->", link) if link else ()))
+        took = time.time() - t0
+        head = (
+            f"# {MANIFEST_VERSION} host={platform.node()} remote={ROOT} data={data} took={took:.2f}s "
+            f"data_files={nfiles} hashed={cache.hashed} hashed_bytes={cache.hashed_bytes} cache={cache.path}"
+        )
+    print(head)
+    for r in rows:
+        print("\t".join(str(x).replace("\t", " ").replace("\n", " ") for x in r))
+    print("# end")
+    return 0
+
+
+# ----------------------------------------------------------------------------------------------
 # self-test
 # ----------------------------------------------------------------------------------------------
+
+
+def side_at(root: str, meta: dict) -> Side:
+    tree = Tree(root, meta)
+    recipes = load_justfile(os.path.join(tree.root, "justfile"))
+    return Side(tree, recipes, Graph(tree, recipes))
+
+
+def key_self_test(expect, real: Side) -> None:
+    """The ledger key: the detectors on the real tree, then a scratch copy where each input class is
+    changed in turn — the same inputs give the same key, each change moves exactly the keys that read it."""
+    meta = cargo_metadata(ROOT)
+    settings = justfile_settings(os.path.join(ROOT, "justfile"))
+    ctx = KeyContext(real, None, settings=settings)
+    gates = [n for n in real.recipes if n.startswith(GATE_PREFIX)]
+    never, tree_scoped = set(), set()
+    for n in gates:
+        ri = real.graph.inputs(n)
+        names = recipe_closure(real.recipes, n)
+        if ctx.never(names, ri, ["BLOOMERY_GATE_CARD=3090"]):  # a lane's card forced: the card rule is not asked here
+            never.add(n)
+        if ctx.scope(names, ri)[0] == "tree":
+            tree_scoped.add(n)
+        for f in sorted(ri.files):
+            if real.tree.exists(f) and not f.startswith("tools/ref/models/"):
+                hit = scan_file(real.tree.root, f, DATA_UNREAD_NAMED)
+                expect(hit is None, f"{n} reads {hit}: an entry the box manifest leaves out (DATA_UNREAD) — take it out of DATA_UNREAD")
+    expect(never == {"gate-1-1", "gate-tokenizer"}, f"never-skip gate recipes: {sorted(never)}")
+    expect(
+        tree_scoped <= never,
+        f"skippable gate-* recipes keyed on the whole tree: {sorted(tree_scoped - never)} — a script in the closure walks the tree",
+    )
+    for n in ("check", "fmt-check", "check-recipes", "check-comments", "check-arch", "check-rustflags"):
+        expect(ctx.scope(recipe_closure(real.recipes, n), real.graph.inputs(n))[0] == "tree", f"{n} is not keyed on the whole tree")
+    expect(ctx.scope(["lint"], real.graph.inputs("lint"))[0] == "closure", "lint (clippy, modeled) is keyed on the whole tree")
+    for s in ("tools/check-comments.sh", "tools/check-arch.sh", "crates/tokenizer/tools/oracle.sh"):
+        expect(scan_lines(real.tree.read(s), TREE_WALK, s) is not None, f"the walk detector misses {s}")
+    quiet = ["tools/box.sh", "tools/gate.sh", "tools/gpu-gate.sh", "tools/host-gate.sh", "tools/ref/ref-paths.sh", "tools/ptx-spill-check.sh", "tools/ptx-scan.sh"]
+    quiet += sorted(os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, "tools/ref/models/*.sh")))
+    for s in quiet:
+        hit = scan_lines(real.tree.read(s), TREE_WALK, s)
+        expect(hit is None, f"the walk detector flags {hit}: every gate that runs it would be keyed on the whole tree")
+
+    with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp:
+        roots = []
+        for sub in ("a", "b"):
+            r = os.path.join(tmp, sub)
+            for rel in shipped_files(ROOT):
+                src, dst = os.path.join(ROOT, rel), os.path.join(r, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.islink(src):
+                    os.symlink(os.readlink(src), dst)
+                else:
+                    shutil.copyfile(src, dst)
+            roots.append(r)
+        mf = os.path.join(tmp, "manifest.txt")
+        manifest = [
+            f"# {MANIFEST_VERSION} host=selftest data=/root/bloomery-data",
+            "env\tbloomery-env.sh\t" + "a" * 64,
+            "os\tkernel\t6.8.0",
+            "gpu\t0\tNVIDIA GeForce RTX 3090\tGPU-0\t615.71.09\t94.02",
+            "tool\trustc\trustc 1.95.0-nightly",
+            "backend\tb9847e95\t" + "b" * 64 + "\tb9847e95",
+            "data\tref/\t" + "c" * 64 + "\t10\t100",
+            "model\t/models/small/x.gguf\t1\t2\t3\t4",
+            "# end",
+        ]
+
+        def write_manifest(lines: list[str]) -> None:
+            with open(mf, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+
+        write_manifest(manifest)
+        items = {
+            "gpu": "gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090",
+            "cpu": "gate-sampler",
+            "mac": "check-comments",
+            "fmt": "fmt-check",
+            "args": "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--x",
+        }
+        sa, sb = side_at(roots[0], meta), side_at(roots[1], meta)
+
+        def keys(side: Side, box_env: str = "", environ: dict | None = None, manifest_path: str | None = mf, only: dict | None = None, fresh: bool = False) -> dict[str, str]:
+            st = justfile_settings(os.path.join(side.tree.root, "justfile")) if fresh else settings
+            c = KeyContext(side, manifest_path, box_env, {} if environ is None else environ, settings=st)
+            out = {}
+            for k, it in (only or items).items():
+                parts, err, _, _ = c.parts(it)
+                out[k] = item_key(parts) if err is None else "error: " + err
+            return out
+
+        base = keys(sa)
+        expect(not any(v.startswith("error") for v in base.values()), f"base keys: {base}")
+        expect(keys(sa) == base, "the same inputs gave another key")
+        expect(keys(sb) == base, "a second checkout at another path gives other keys (a path is not relative)")
+
+        def moved(after: dict[str, str]) -> set[str]:
+            return {k for k in after if after[k] != base[k]}
+
+        def edit(rel: str, fn, side_fresh: bool = False) -> set[str]:
+            p = os.path.join(roots[0], rel)
+            with open(p, encoding="utf-8") as fh:
+                old = fh.read()
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(fn(old))
+            try:
+                return moved(keys(side_at(roots[0], meta) if side_fresh else sa, fresh=side_fresh))
+            finally:
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(old)
+
+        def append(text: str):
+            return lambda s: s + text
+
+        m = edit("crates/gpu-gates/src/bin/gate_q4k_sel.rs", append("\n// key probe\n"))
+        expect(m == {"gpu", "mac", "fmt"}, f"gate_q4k_sel.rs moves {sorted(m)}, not gpu mac fmt")
+        m = edit("tools/gpu-gate.sh", append("\n# key probe\n"))
+        expect(m == {"gpu", "args", "mac", "fmt"}, f"tools/gpu-gate.sh moves {sorted(m)}")
+        m = edit("docs/plan.md", append("\nkey probe\n"))
+        expect(m == {"mac", "fmt"}, f"docs/plan.md moves {sorted(m)}, not only the whole-tree keys")
+        cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
+        m = edit(cpu_lib[0], append("\n// key probe\n"))
+        expect({"cpu", "mac", "fmt"} <= m and "gpu" not in m, f"{cpu_lib[0]} moves {sorted(m)}")
+        for g in KEY_GLOBALS:
+            m = edit(g, append("\n# key probe\n"))
+            expect(m == set(items), f"{g} moves {sorted(m)}, not every key")
+        two = {k: items[k] for k in ("gpu", "mac")}
+        m = edit("justfile", append("\n# key probe\n"), side_fresh=True)
+        expect(m == {"mac", "fmt"}, f"a justfile comment moves {sorted(m)}")
+        m = edit("justfile", lambda s: s.replace("bash tools/gpu-gate.sh gate_q4k_sel'", "bash tools/gpu-gate.sh gate_q4k_sel '", 1), side_fresh=True)
+        expect("gpu" in m and "cpu" not in m and "args" not in m, f"gate-gpu-q4k-sel's recipe text moves {sorted(m)}")
+
+        one = lambda it: keys(sa, only={"x": it})["x"]  # noqa: E731
+        expect(one("gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090,X=1") != base["gpu"], "an item env entry does not move the key")
+        expect(one("gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=a6000") != base["gpu"], "the lane's card does not move the key")
+        expect(one("gate-gpu-q4k-sel") != base["gpu"], "no card (--lanes 1) gives the 3090 lane's key")
+        expect(one("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--y") != base["args"], "ARGS do not move the key")
+        expect(moved(keys(sa, box_env="BLOOMERY_X=1")) == set(items), "the caller's BLOOMERY_BOX_ENV does not move every key")
+        expect(moved(keys(sa, environ={"BLOOMERY_DATA": "/x"})) == set(items), "the Mac's BLOOMERY_DATA does not move every key")
+        for i in range(1, len(manifest) - 1):
+            mut = list(manifest)
+            mut[i] = mut[i] + "x"
+            write_manifest(mut)
+            m = moved(keys(sa, only=two))
+            expect(m == set(two), f"manifest line {manifest[i].split(chr(9))[0]} moves {sorted(m)}")
+        mut = list(manifest)
+        mut[0] = mut[0] + " took=9s"
+        write_manifest(mut)
+        expect(not moved(keys(sa, only=two)), "the manifest's comment line moves a key")
+        write_manifest(manifest[:-1])
+        expect(all(v.startswith("error") for v in keys(sa).values()), "a truncated manifest (no `# end`) keyed an item")
+        write_manifest(manifest)
+        expect(all(v.startswith("error") for v in keys(sa, manifest_path=os.path.join(tmp, "absent")).values()), "a missing manifest keyed an item")
+        c = KeyContext(sa, mf, "", {}, manifest_error="ssh failed", settings=settings)
+        expect(c.parts(items["gpu"])[1] is not None, "a failed manifest fetch keyed an item")
+        c = KeyContext(sa, mf, "", {}, settings=settings)
+        expect(c.parts("gate gpu")[1] is not None and c.parts("gate-nope")[1] is not None, "a malformed or unknown item was keyed")
+        expect(c.parts("gate-sampler@BLOOMERY_REF_MODEL=/models/small/x.gguf")[2] is not None, "an item env naming a path was skippable")
+        c2 = KeyContext(sa, mf, "BLOOMERY_KLD_FILE=/root/x.kld", {}, settings=settings)
+        expect(c2.parts(items["cpu"])[2] is not None, "a caller env path outside data and /models was skippable")
+        c3 = KeyContext(sa, mf, "BLOOMERY_DATA=/root/bloomery-data", {}, settings=settings)
+        expect(c3.parts(items["cpu"])[2] is None, "the data directory itself made an item never-skip")
+        expect(c.parts("gate-1-1")[2] is not None and c.parts("gate-tokenizer")[2] is not None, "an ik-reading gate was skippable")
+        expect(c.parts("smoke")[2] is not None and c.parts("check-recipes")[2] is None, "smoke (a batch in a batch) or check-recipes has the wrong never-skip")
+        expect(c.parts("gate-gpu-e2e")[2] is not None, "an `any`-card recipe with no card forced was skippable")
+        expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in /root/x.bin")[2] is not None, "an absolute path in ARGS was skippable")
+        argpath = "gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--in docs/plan.md"
+        plan = os.path.join(roots[0], "docs/plan.md")
+        with open(plan, encoding="utf-8") as fh:
+            plan_text = fh.read()
+        before = one(argpath)
+        with open(plan, "w", encoding="utf-8") as fh:
+            fh.write(plan_text + "\nkey probe\n")
+        after = one(argpath)
+        with open(plan, "w", encoding="utf-8") as fh:
+            fh.write(plan_text)
+        expect(not before.startswith("error") and before != after, "a tree file named in ARGS is not in the key")
+        expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000")[2] is None and c.parts("gate-gpu-q4k-sel")[2] is None, "a card-determined item was never-skip")
+        # a module file the walk reaches through `mod` (not a target root): gone, the item is an error
+        roots_src = {t.src for pkg in sa.tree.packages.values() for t in pkg.targets}
+        for which in ("cpu", "gpu"):
+            name = items[which].split("@")[0]
+            mods = sorted(f for f in sa.graph.inputs(name).files if f.endswith(".rs") and f not in roots_src and f.startswith("crates/"))
+            if mods:
+                break
+        victim = os.path.join(roots[0], mods[0])
+        hold = victim + ".held"
+        os.rename(victim, hold)
+        try:
+            gone = keys(side_at(roots[0], meta), only={which: items[which]})
+            expect(gone[which].startswith("error"), f"with {mods[0]} missing, {items[which]} was keyed: {gone[which]}")
+        finally:
+            os.rename(hold, victim)
+
+
 
 
 def self_test() -> int:
@@ -1395,6 +2404,9 @@ def self_test() -> int:
     t, deps, root = parse_depinfo("/r/b/target/release/g: /r/b/crates/a\\ b.rs /r/b/crates/c.rs\n")
     expect(t.endswith("/g") and root == "/r/b" and "/r/b/crates/a b.rs" in deps, "dep-info parse")
 
+    # the green ledger's key
+    key_self_test(expect, side)
+
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
     print(f"self-test: {'FAIL' if fails else 'ok'} ({len(gates)} gate recipes, {len(fails)} failures)")
@@ -1418,6 +2430,19 @@ def main(argv: list[str]) -> int:
     w = sub.add_parser("why")
     w.add_argument("files", nargs="+")
     w.add_argument("--all-recipes", action="store_true")
+    k = sub.add_parser("key", help="each ITEM's ledger key: key<TAB>item<TAB>status<TAB>detail")
+    k.add_argument("items", nargs="+", metavar="ITEM", help="NAME[@K=V,…][:ARGS], as tools/gate-batch.sh runs it (its lane's card in the env)")
+    k.add_argument("--manifest", help="the box manifest (box-manifest's output)")
+    k.add_argument("--manifest-error", help="the manifest fetch failed with this message: every item is an error")
+    k.add_argument("--box-env", default=os.environ.get("BLOOMERY_BOX_ENV", ""), help="the caller's BLOOMERY_BOX_ENV")
+    k.add_argument("--ledger", help="the ledger file: status skip | run | rerun | never | error instead of key")
+    k.add_argument("--rerun", action="store_true", help="with --ledger: no item skips")
+    k.add_argument("--parts-dir", help="write each item's labelled parts to DIR/<index>.parts")
+    k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
+    b = sub.add_parser("box-manifest", help="on the box, through tools/box.sh: the key's box part")
+    b.add_argument("--lease", action="append", help="a timing lease lock; held, the manifest refuses (exit 75)")
+    b.add_argument("--cache", default="~/.cache/bloomery/sha256-cache.tsv", help="the stat-keyed sha256 cache")
+    b.add_argument("--workers", type=int, default=8)
     args = ap.parse_args(argv)
     try:
         if args.self_test:
@@ -1430,6 +2455,10 @@ def main(argv: list[str]) -> int:
             return cmd_affected(args)
         if args.cmd == "why":
             return cmd_why(args)
+        if args.cmd == "key":
+            return cmd_key(args)
+        if args.cmd == "box-manifest":
+            return cmd_box_manifest(args)
         ap.print_help()
         return 64
     except RecipeError as err:

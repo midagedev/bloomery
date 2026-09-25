@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--rerun]]
 #
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
@@ -43,7 +43,57 @@
 #
 # Refuses to start while the timing lease (/root/bloomery-cpu.lock or /root/bloomery-lease.lock) is
 # held, naming the lock (exit 75); no override. --dry-run validates, prints the lanes and commands, and
-# touches neither the box nor DIR.
+# touches neither the box nor DIR (with --ledger it reads the box once, for the manifest below).
+#
+# Ledger (--ledger: the lead's batches; a round never passes it — a round's green is not the lead's).
+# Each item's input key is `tools/recipes.py key` (its section header lists the parts): the files its
+# targets read (the walk `just affected` uses; the whole tree for a command run on the Mac, a cargo
+# subcommand the parser does not model, or a script that walks the tree), the text of its recipe and
+# of every recipe it depends on, the scripts those name, the cargo globals and the cuda-oxide pin, its
+# ARGS, its full BLOOMERY_BOX_ENV (the caller's, the item's, its lane's card), the Mac-side variables
+# box.sh carries, and a box manifest read once per batch through one box.sh call (`recipes.py
+# box-manifest`, refused while the timing lease is held): ~/bloomery-env.sh, the kernel, each card's
+# name, UUID, driver and VBIOS, rustc, llc, ptxas and cargo-oxide, the cuda-oxide backend, the content
+# of $BLOOMERY_DATA (sha256 per file, cached by stat on the box in ~/.cache/bloomery/sha256-cache.tsv,
+# so a file rewritten with the same bytes keeps its hash; the first fetch hashes everything, later ones
+# only what moved), and the stat of every file in each /models/<name> directory the profiles, the box
+# env or the tree name. The whole manifest is in every key: the data a gate reads is not bounded by
+# its recipe text, so a data change reruns every item — the safe side.
+#   Keys are computed before the lease check. An item whose key is in the ledger does not run: run.log
+# gets `<stem> rc=skip green-at=<commit> <date> lane=<L>`. Every other item runs as without --ledger;
+# one whose final rc is 0 is recorded after its key is computed again (against the same pre-batch box
+# manifest) and found unchanged, so a tree-side input that moved while the batch ran is never recorded
+# as green. Item lines gain `ledger=<state>`: recorded, changed (an input moved during the batch), red,
+# never, unkeyed, append-failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
+# that ran. --rerun runs every item and still records. --dry-run --ledger prints each item's status and
+# why: `skip` with the green run's commit, date and tree; `run` with what moved since the item's last
+# green (the parts of each green key are kept in <ledger>.parts/<key>.parts).
+#   Never skipped: a recipe that runs a reference tree's files (ik, llama.cpp, mistral.rs — today
+# gate-1-1 and gate-tokenizer), a batch runner inside a batch (smoke), an item whose env or ARGS name an
+# absolute path the manifest does not read, and — with --lanes 1, where no card is forced — a recipe
+# whose gpu-gate.sh call takes the `any` card, which it picks at run time. A key that cannot be computed
+# (a missing file, a failed manifest) is a named error: the item runs and is not recorded.
+#   The ledger: ${BLOOMERY_GATE_LEDGER:-~/.cache/bloomery/gate-ledger.tsv}, on the Mac, outside every
+# tree and shared by the leads' trees, `key<TAB>recipe<TAB>item<TAB>commit<TAB>date<TAB>tree`, one line
+# per green item. Only this script appends to it, each line with one write(2) on an O_APPEND descriptor
+# while holding an exclusive flock on it: two leads' batches cannot interleave a line.
+# Honest limits — what the key cannot see:
+#   - a box file or process outside the manifest: the reference trees (hence never-skip), the box's own
+#     tools the gates run (curl, crates/gpu-gates/src/bin/gate_ds41_serve.rs:200; sha256sum,
+#     gate_e2e.rs:579 and gate_qwen3moe_e2e.rs:1029; nvidia-smi, crates/gpu-gates/src/bind.rs:302;
+#     coreutils, python3), the page cache;
+#   - hardware and kernel state: the 3090's bus (Xid 79), thermal and power events, and the topology
+#     and memory state the gates read from /proc and /sys (crates/threads/src/lib.rs:542,
+#     crates/gpu/src/model/launcher.rs:278, crates/engram/src/prefetch.rs:477 and lib.rs:700,
+#     crates/gpu-gates/src/bin/gate_load_v41.rs:701 and :712, gate_deepseek41_step.rs:2436);
+#   - a model file's content: model files are keyed by size, mtime, ctime and inode;
+#   - a box file that changes during the batch (the manifest is read once, before it): the next batch's
+#     key differs, so the item reruns then;
+#   - a stale binary: the key trusts cargo's freshness check, so a green run of a binary cargo failed
+#     to rebuild would be recorded;
+#   - a directory symlink inside $BLOOMERY_DATA, keyed by its target path, not walked (none today).
+# $BLOOMERY_DATA/nsys/ and ncu/ are left out of the manifest: only the timing runners write them and no
+# gate reads them (recipes.py's self-test fails when a gate names one).
 #
 # Stopping a batch (INT/TERM): the trap signals only the pids written at spawn under DIR (lane-*.pid,
 # lane-*.child). A box process a killed item left behind is `just box-gc`'s to clear.
@@ -61,10 +111,10 @@ TRIES_MAX=11
 RETRY_WAIT=30
 LEASES="/root/bloomery-cpu.lock /root/bloomery-lease.lock"
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2]"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--rerun]]"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
-OUT='' SRC='' LIST='' DRY=0 LANES=2
+OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -73,6 +123,8 @@ while [ $# -gt 0 ]; do
     --list) [ $# -ge 2 ] || die "--list needs a file; $USAGE"
       [ -z "$SRC" ] || die "--smoke, --list and items are exclusive; $USAGE"; SRC=list; LIST=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --ledger) LEDGER=1; shift ;;
+    --rerun) RERUN=1; shift ;;
     --lanes) [ $# -ge 2 ] || die "--lanes needs 1 or 2; $USAGE"
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
@@ -86,6 +138,7 @@ if [ "$SRC" = list ]; then
   [ -f "$LIST" ] && [ -r "$LIST" ] || die "--list $LIST: not a readable file"
 fi
 [ "$SRC" = smoke ] && ITEMS=("${SMOKE[@]}")
+[ "$RERUN" = 0 ] || [ "$LEDGER" = 1 ] || die "--rerun needs --ledger; $USAGE"
 command -v just > /dev/null || die "just is not on PATH"
 command -v python3 > /dev/null || die "python3 is not on PATH"
 
@@ -261,9 +314,11 @@ PLAN=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:
   || RC=$? die "the list did not validate (above)"
 
 P_LANE=() P_STEM=() P_NAME=() P_ENV=() P_ARGS=() P_ITEM=() P_WHY=()
+P_KEY=() P_LST=() P_LDET=() # the ledger's key, status and detail per item (--ledger)
 while IFS=$'\x1f' read -r lane stem name env args item why; do
   P_LANE+=("$lane"); P_STEM+=("$stem"); P_NAME+=("$name"); P_ENV+=("$env")
   P_ARGS+=("$args"); P_ITEM+=("$item"); P_WHY+=("$why")
+  P_KEY+=(""); P_LST+=(""); P_LDET+=("")
 done <<< "$PLAN"
 N=${#P_NAME[@]}
 
@@ -276,6 +331,91 @@ cmd_of() {
   local e; e=$(box_env_of "$1")
   printf '%sjust %s%s' "${e:+BLOOMERY_BOX_ENV='$e' }" "${P_NAME[$1]}" "${P_ARGS[$1]:+ ${P_ARGS[$1]}}"
 }
+item_of() { # the item as it runs, for the key: NAME[@its env and its lane's card][:ARGS]
+  local s=${P_NAME[$1]}
+  [ -z "${P_ENV[$1]}" ] || s="$s@${P_ENV[$1]// /,}"
+  [ -z "${P_ARGS[$1]}" ] || s="$s:${P_ARGS[$1]}"
+  printf '%s' "$s"
+}
+
+LEDGER_FILE=${BLOOMERY_GATE_LEDGER:-$HOME/.cache/bloomery/gate-ledger.tsv}
+LEDGER_PARTS=$LEDGER_FILE.parts
+LEASE_ARGS=''
+for l in $LEASES; do LEASE_ARGS="$LEASE_ARGS --lease $l"; done
+# The append: the parts file first (a record's parts exist once the record does), then the line, one
+# write(2) on an O_APPEND descriptor under an exclusive flock.
+IFS= read -r -d '' PYAPPEND << 'PY' || true
+import fcntl, os, shutil, sys
+
+path, line, parts_src, parts_dst = sys.argv[1:5]
+if not os.path.exists(parts_dst):
+    os.makedirs(os.path.dirname(parts_dst), exist_ok=True)
+    tmp = f"{parts_dst}.{os.getpid()}.tmp"
+    shutil.copyfile(parts_src, tmp)
+    os.replace(tmp, parts_dst)
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+data = (line.replace("\n", " ") + "\n").encode()
+fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    if os.write(fd, data) != len(data):
+        sys.exit(f"gate-batch: a short write to {path}")
+finally:
+    os.close(fd)
+PY
+
+ledger_plan() { # the box manifest, then every item's key and status, before the lease check
+  local m=$1/box-manifest.txt merr='' rc=0 try i key item status detail items=() kargs=()
+  for try in 1 2; do
+    rc=0
+    "$ROOT/tools/box.sh" "python3 tools/recipes.py box-manifest$LEASE_ARGS" > "$m" 2> "$1/box-manifest.err" || rc=$?
+    if [ "$rc" = 0 ] || [ "$rc" = 75 ]; then break; fi
+    [ "$try" = 2 ] || sleep 10
+  done
+  if [ "$rc" = 75 ]; then
+    [ "$DRY" = 1 ] || RC=75 die "the timing lease is held ($(tail -1 "$1/box-manifest.err")) — a batch's builds contaminate a sitting; not starting"
+    merr="the timing lease is held, so the manifest was not read"
+  elif [ "$rc" != 0 ]; then
+    merr="box.sh rc=$rc: $(tail -1 "$1/box-manifest.err")"
+    echo "gate-batch: ledger: the box manifest failed ($merr) — every item runs and none is recorded" >&2
+  fi
+  for ((i = 0; i < N; i++)); do items+=("$(item_of "$i")"); done
+  kargs=(key --manifest "$m" --box-env "${BLOOMERY_BOX_ENV:-}" --ledger "$LEDGER_FILE" --parts-dir "$1/parts")
+  [ -z "$merr" ] || kargs+=(--manifest-error "$merr")
+  [ "$RERUN" = 0 ] || kargs+=(--rerun)
+  rc=0
+  python3 "$ROOT/tools/recipes.py" "${kargs[@]}" "${items[@]}" > "$1/keys.tsv" 2> "$1/keys.err" || rc=$?
+  [ ! -s "$1/keys.err" ] || sed 's/^/gate-batch: ledger: /' "$1/keys.err" >&2
+  i=0
+  if [ "$rc" = 0 ]; then
+    while IFS=$'\t' read -r key item status detail; do
+      if [ "$i" -ge "$N" ] || [ "$item" != "${items[$i]}" ]; then i=-1; break; fi
+      P_KEY[$i]=$key P_LST[$i]=$status P_LDET[$i]=$detail
+      i=$((i + 1))
+    done < "$1/keys.tsv"
+  fi
+  if [ "$i" != "$N" ]; then
+    echo "gate-batch: ledger: tools/recipes.py key failed (rc=$rc, $i of $N lines in order) — every item runs and none is recorded" >&2
+    for ((i = 0; i < N; i++)); do P_KEY[$i]=- P_LST[$i]=error P_LDET[$i]="the key tool failed (rc=$rc)"; done
+  fi
+}
+
+ledger_record() { # $1 = plan index, $2 = final rc: record a green item whose key did not move; print its state
+  local i=$1 k2 rec
+  case "${P_LST[$i]}" in
+    never) echo never; return ;;
+    error) echo unkeyed; return ;;
+  esac
+  if [ "$2" != 0 ]; then echo red; return; fi
+  k2=$(python3 "$ROOT/tools/recipes.py" key --manifest "$LWORK/box-manifest.txt" --box-env "${BLOOMERY_BOX_ENV:-}" "$(item_of "$i")" 2> /dev/null | cut -f1) || k2=''
+  if [ "$k2" != "${P_KEY[$i]}" ]; then echo changed; return; fi
+  rec=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "${P_KEY[$i]}" "${P_NAME[$i]}" "$(item_of "$i")" "$COMMIT" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$ROOT")
+  if python3 -c "$PYAPPEND" "$LEDGER_FILE" "$rec" "$LWORK/parts/$i.parts" "$LEDGER_PARTS/${P_KEY[$i]}.parts"; then
+    echo recorded
+  else
+    echo append-failed
+  fi
+}
 
 if [ -z "$OUT" ]; then
   OUT="$ROOT/target/gate-batch/$(date +%Y%m%d-%H%M%S)"
@@ -286,30 +426,53 @@ case "$OUT/" in
   "$ROOT"/*) die "--out $OUT is inside the tree but not under target/: box.sh would ship the logs and mark the tree dirty" ;;
 esac
 
+if [ "$DRY" = 0 ]; then
+  mkdir -p "$OUT" || RC=73 die "cannot create the log directory $OUT"
+  [ -d "$OUT" ] && [ -w "$OUT" ] || RC=73 die "the log directory $OUT is not a writable directory"
+  [ ! -e "$OUT/run.log" ] || RC=73 die "$OUT already holds a batch (run.log) — give --out a new directory"
+fi
+RUNLOG=$OUT/run.log
+
+SKIP_N=0
+if [ "$LEDGER" = 1 ]; then
+  if [ "$DRY" = 1 ]; then
+    LWORK=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-ledger.XXXXXX") || RC=73 die "cannot make a scratch directory for the ledger"
+    trap 'rm -rf "$LWORK"' EXIT
+  else
+    LWORK=$OUT/ledger
+    mkdir -p "$LWORK" || RC=73 die "cannot create $LWORK"
+    COMMIT=$(git -C "$ROOT" rev-parse --short=12 HEAD 2> /dev/null || echo unknown)
+    [ -z "$(git -C "$ROOT" status --porcelain 2> /dev/null | head -1)" ] || COMMIT="$COMMIT-dirty"
+  fi
+  ledger_plan "$LWORK"
+  for ((i = 0; i < N; i++)); do [ "${P_LST[$i]}" != skip ] || SKIP_N=$((SKIP_N + 1)); done
+  echo "gate-batch: ledger $LEDGER_FILE: $SKIP_N of $N items skip"
+fi
+
 if [ "$DRY" = 1 ]; then
   echo "gate-batch: dry run — $N items, lanes $LANES, logs would go to $OUT"
   for ((i = 0; i < N; i++)); do
     printf 'lane %s  %-28s %s\n        %s\n' "${P_LANE[$i]}" "${P_STEM[$i]}" "$(cmd_of "$i")" "${P_WHY[$i]}"
+    [ "$LEDGER" = 0 ] || printf '        ledger: %s — %s\n' "${P_LST[$i]}" "${P_LDET[$i]}"
   done
   exit 0
 fi
 
-mkdir -p "$OUT" || RC=73 die "cannot create the log directory $OUT"
-[ -d "$OUT" ] && [ -w "$OUT" ] || RC=73 die "the log directory $OUT is not a writable directory"
-[ ! -e "$OUT/run.log" ] || RC=73 die "$OUT already holds a batch (run.log) — give --out a new directory"
-RUNLOG=$OUT/run.log
-
 # The timing lease, each lock tested on its own so the refusal names it. flock -E 75 separates "held"
 # from "could not test".
-lease=$("$ROOT/tools/box.sh" 'for l in '"$LEASES"'; do flock -n -E 75 "$l" true; r=$?; if [ "$r" = 0 ]; then echo "free $l"; elif [ "$r" = 75 ]; then echo "held $l"; else echo "error $l rc=$r"; fi; done' 2>&1) \
-  || RC=70 die "the lease check through box.sh failed: $lease"
-for l in $LEASES; do
-  case "$lease" in
-    *"held $l"*) RC=75 die "the timing lease $l is held — a batch's builds contaminate a sitting; not starting" ;;
-    *"free $l"*) ;;
-    *) RC=70 die "the lease $l could not be tested: $lease" ;;
-  esac
-done
+if [ "$SKIP_N" -lt "$N" ]; then
+  lease=$("$ROOT/tools/box.sh" 'for l in '"$LEASES"'; do flock -n -E 75 "$l" true; r=$?; if [ "$r" = 0 ]; then echo "free $l"; elif [ "$r" = 75 ]; then echo "held $l"; else echo "error $l rc=$r"; fi; done' 2>&1) \
+    || RC=70 die "the lease check through box.sh failed: $lease"
+  for l in $LEASES; do
+    case "$lease" in
+      *"held $l"*) RC=75 die "the timing lease $l is held — a batch's builds contaminate a sitting; not starting" ;;
+      *"free $l"*) ;;
+      *) RC=70 die "the lease $l could not be tested: $lease" ;;
+    esac
+  done
+else
+  echo "gate-batch: every item skips — nothing runs on the box, so no lease check"
+fi
 
 # run.log exists from here on (a refused start leaves none, so the same --out can be retried).
 : > "$RUNLOG"
@@ -338,6 +501,15 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   done
   s=$(($(date +%s) - t0))
   line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane"
+  [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_record "$i" "$rc")"
+  [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
+  echo "$line" >> "$RUNLOG"
+  echo "$line"
+}
+
+skip_item() { # $1 = plan index, $2 = lane label: the ledger holds a green run of these inputs
+  local i=$1 line
+  line="${P_STEM[$i]} rc=skip ${P_LDET[$i]% tree=*} lane=$2"
   [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
   echo "$line"
@@ -347,7 +519,8 @@ run_lane() { # $1 = lane label; runs its items in plan order, then writes lane-<
   local lane=$1 t0 i
   t0=$(date +%s)
   for ((i = 0; i < N; i++)); do
-    [ "${P_LANE[$i]}" = "$lane" ] && run_item "$i" "$lane"
+    [ "${P_LANE[$i]}" = "$lane" ] || continue
+    if [ "${P_LST[$i]}" = skip ]; then skip_item "$i" "$lane"; else run_item "$i" "$lane"; fi
   done
   echo $(($(date +%s) - t0)) > "$OUT/lane-$lane.s"
 }
@@ -386,19 +559,26 @@ trap - INT TERM
 recorded=$(grep -c ' rc=' "$RUNLOG" || true)
 [ "$recorded" -eq "$N" ] || RC=70 die "$N items planned, $recorded recorded in $RUNLOG"
 green=$(grep -c ' rc=0 ' "$RUNLOG" || true)
-red=$((N - green))
+skipped=$(grep -c ' rc=skip ' "$RUNLOG" || true)
+red=$((N - green - skipped))
 lane_s() { if [ -f "$OUT/lane-$1.s" ]; then cat "$OUT/lane-$1.s"; else echo 0; fi; }
-done_line="DONE total=$N red=$red wall=$(($(date +%s) - T0))s laneA=$(lane_s A)s laneB=$(lane_s B)s"
+done_line="DONE total=$N red=$red"
+[ "$LEDGER" = 0 ] || done_line="$done_line skipped=$skipped"
+done_line="$done_line wall=$(($(date +%s) - T0))s laneA=$(lane_s A)s laneB=$(lane_s B)s"
 if has_lane X; then done_line="$done_line laneX=$(lane_s X)s"; fi
 for ((i = 0; i < N; i++)); do
   if [ "${P_NAME[$i]}" = lint ]; then
-    done_line="$done_line lint_warnings=$(grep -c '^warning:' "$OUT/g-${P_STEM[$i]}.log" || true)"
+    if [ "${P_LST[$i]}" = skip ]; then
+      done_line="$done_line lint_warnings=skip"
+    else
+      done_line="$done_line lint_warnings=$(grep -c '^warning:' "$OUT/g-${P_STEM[$i]}.log" || true)"
+    fi
     break
   fi
 done
 echo "$done_line" >> "$RUNLOG"
 echo "$done_line"
 if [ "$red" -ne 0 ]; then
-  grep -v ' rc=0 ' "$RUNLOG" | grep ' rc=' | while read -r stem _; do echo "red: $stem  $OUT/g-$stem.log"; done
+  grep -v ' rc=0 ' "$RUNLOG" | grep ' rc=' | grep -v ' rc=skip ' | while read -r stem _; do echo "red: $stem  $OUT/g-$stem.log"; done
   exit 1
 fi

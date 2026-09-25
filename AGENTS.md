@@ -100,7 +100,14 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # run with no gate lock), lane B = the `any` recipes forced to the A6000 plus every
                       # recipe with no device code, X = BLOOMERY_CARD=both after both lanes; rc 75 retries;
                       # one log per item and a run.log ending in `DONE total= red= wall=`; refuses to
-                      # start while the timing lease is held and refuses a recipe that names a timing runner
+                      # start while the timing lease is held and refuses a recipe that names a timing runner.
+                      # `--ledger` (the lead's batches only, never a round's): an item whose input key
+                      # (`tools/recipes.py key` — its source closure, recipe text, cargo globals, ARGS, env and
+                      # card, and a box manifest read once per batch) is in the green ledger
+                      # ~/.cache/bloomery/gate-ledger.tsv is not run and prints `rc=skip green-at=<commit>`;
+                      # an item whose final rc is 0 is recorded; `--rerun` runs every item and still records;
+                      # `--dry-run --ledger` prints what would skip and what moved; the header lists what
+                      # the key cannot see
     just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
                       # ops attn ffn moe head forward kv derived mt profile
                       # alloc threads qdot engram prompts placement 1-1
