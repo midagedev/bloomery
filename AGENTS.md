@@ -347,7 +347,12 @@ first suspect is a hung gate on the box, not the agent.
   (CED off 104.7 / 102.6, so +5.0 % / +49 %; ~~llama.cpp 77.6 / 76.2 in the same lease~~ the same
   lease's reference rows read the file cold after our arms — llama.cpp's clean values are the
   morning's 104.6 / 103.8, so ours is 1.05× / 1.47×; host union 76.1 ms/layer at 512 columns,
-  31.5 µs/slot; rig-log 09-25#v41-prefill-resit, #v41-prefill-resit-b).
+  31.5 µs/slot; rig-log 09-25#v41-prefill-resit, #v41-prefill-resit-b). Since `9d61a13` (ds41bulk: the T-row router,
+  one places launch per layer-batch, each card expert read once per layer-batch) pp512 **121.4** and pp4096
+  **169.4** (the pre-landing binary 111.3 / 155.8 in the same lease, +9.1 % / +8.7 %; the `slot` arm does not
+  separate; rig-log 09-25#v41-prefill-s14); all of the gain is outside the host union, and what remains
+  outside it is the card route before the union, 30.4 ms per layer-batch (per-chunk attention and projection
+  launches).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
