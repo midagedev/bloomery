@@ -74,6 +74,8 @@
 
 차선은 레시피 본문에서 읽는다: A = 3090(`gpu-gate.sh`를 `any` 없이 부르는 V4.1 `--place gate`·V2-Lite p-게이트, 그리고 게이트 락 없이 디바이스 코드를 도는 lib 테스트 `tools/gate.sh --oxide`), B = `any` 레시피(`BLOOMERY_GATE_CARD=a6000`으로 강제)와 디바이스 코드 없는 레시피, X = `BLOOMERY_CARD=both|a6000`(`gate-gpu-load-v41*`, 두 카드를 쥐되 A6000 게이트 락을 안 잡는다)는 두 차선이 끝난 뒤 혼자. 92개의 배정은 A 42, B 48, X 2. 타이밍 러너·임대를 부르는 레시피는 이름으로 거부. `--list FILE`은 `just affected` 출력을 그대로 받는다.
 
+첫 실전 묶음(ee의 q3fix2, 09-26 00:02–00:16, 21항목): **870 s**(3090 차선 720 s, A6000 차선 870 s), 빨강 1. 그 빨강은 코드가 아니라 차선 간섭으로 보인다: `gate-gpu-ds41-faults`(호스트 셋을 `mlock`한 채 스텝당 minor fault ≤ 2를 고정, `gate_deepseek41_long.rs:441`)가 반대 차선이 A6000에서 모델을 올리는 동안 스텝 21에서 33을 읽었고, 조용한 박스 단독 재실행은 0이었다. 박스는 `vm.compact_unevictable_allowed=1`(컴팩션이 잠긴 페이지도 옮긴다)이라 동시 적재가 스텝 중 잠긴 페이지를 옮긴다는 것이 가설이다 — 빨강 묶음 때 vmstat 이동 카운터는 안 쟀다(단독 실행 전후에도 게이트 자신의 적재 동안 `pgmigrate_success` +727,910). 그래서 호스트 메모리 동작을 고정하는 게이트는 **solo 등급**(X 차선, 혼자)이어야 한다 — 다음 러너 변경(XS).
+
 카드별 락이 둘이므로 목록을 두 차선으로 나눠 병렬로 돈다. V4.1 `--place gate` 게이트는 3090 전용이고, 나머지(`any`
 카드 레시피: qwen3moe·gemm·e2e·p6·chain-ffn·vision·dspark-kv)는 A6000으로 보낸다.
 
