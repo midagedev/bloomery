@@ -11,11 +11,12 @@
 //! 2. Gate·up body: for a sel vector with a repeated id, slot `s` equals
 //!    `q4k_gemv` of expert `sel[s]`'s gate rows and up rows alone, combined
 //!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; a rerun is
-//!    bit-identical. Ids past the stack (the expert count, and `u32::MAX`:
-//!    this chain has no host tier), launched with layer 13's sink, raise
-//!    `FaultSite::ExpertId` with that layer and write NaN into exactly their
-//!    slots' rows, every other slot bit for bit the clean run's; the word is
-//!    clean before and after a clean run.
+//!    bit-identical. An id past the stack, each in a launch of its own (the
+//!    expert count in slot 1, then `u32::MAX` in slot 3: this chain has no
+//!    host tier, so `hybrid::HOST` is no exemption here), launched with
+//!    layer 13's sink, raises `FaultSite::ExpertId` with that layer and
+//!    writes NaN into exactly its slot's rows, every other slot bit for bit
+//!    the clean run's; the word is clean before and after a clean run.
 //! 3. The tap, every token of every set: `ffn_inp_normed-L` in, ik's
 //!    `ffn_moe_topk-L` as `sel`, against `ffn_moe_gate_par-L`. Per output,
 //!    `g` and `u` are the f64 dots of the dequantized rows with each side's
@@ -268,43 +269,45 @@ mod gate {
             "body ffn_gate/up_exps.0 K={k} rows={rpe} experts={n_exp}: rerun and slots vs q4k_gemv+swiglu {}",
             verdict(ok)
         );
-        // Ids past the stack in slots 1 and 3, against the same launch with
-        // valid ids there.
+        // An id past the stack in one slot per launch, against the same
+        // launch with a valid id there.
         let layer = 13usize;
         let sink = gpu.layer_sink(layer)?;
         let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::ExpertId));
-        let before = gpu.fault()?;
-        let clean_sel = DeviceBuffer::from_host(stream, &[2u32, 9, 7, 11, 0, 0, 0, 0])?;
-        let hc = launch(&clean_sel, sink)?;
-        let after_clean = gpu.fault()?;
-        let oor = DeviceBuffer::from_host(stream, &[2u32, n_exp as u32, 7, u32::MAX, 0, 0, 0, 0])?;
-        let ho = launch(&oor, sink)?;
-        let word = gpu.take_fault()?;
+        let clean_ids = [2u32, 9, 7, 11, 0, 0, 0, 0];
+        let clean_sel = DeviceBuffer::from_host(stream, &clean_ids)?;
         let slot = |v: &[f32], s: usize| v[s * rpe..(s + 1) * rpe].to_vec();
-        let bad_nan = [1usize, 3]
-            .iter()
-            .all(|&s| slot(&ho, s).iter().all(|v| v.is_nan()));
-        let others = [0usize, 2, 4, 5, 6, 7]
-            .iter()
-            .all(|&s| bits_equal(&slot(&ho, s), &slot(&hc, s)));
-        let clean_again = bits_equal(&launch(&clean_sel, sink)?, &hc) && gpu.fault()?.is_none();
-        let oor_ok = before.is_none()
-            && after_clean.is_none()
-            && word == want
-            && bad_nan
-            && others
-            && clean_again;
-        ok &= oor_ok;
-        println!(
-            "body ids {n_exp} and u32::MAX past the stack in slots 1, 3: word \"{}\" (want \"{}\", clean \
-             before {} and after the clean run {}) those slots NaN {bad_nan}, other slots bit-identical \
-             {others}, clean rerun bits and word clean {clean_again} {}",
-            word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
-            want.map_or_else(String::new, |f| f.to_string()),
-            before.is_none(),
-            after_clean.is_none(),
-            verdict(oor_ok)
-        );
+        for (bad, id) in [(1usize, n_exp as u32), (3, u32::MAX)] {
+            let before = gpu.fault()?;
+            let hc = launch(&clean_sel, sink)?;
+            let after_clean = gpu.fault()?;
+            let mut ids = clean_ids;
+            ids[bad] = id;
+            let ho = launch(&DeviceBuffer::from_host(stream, &ids)?, sink)?;
+            let word = gpu.take_fault()?;
+            let bad_nan = slot(&ho, bad).iter().all(|v| v.is_nan());
+            let others = (0..8)
+                .filter(|&s| s != bad)
+                .all(|s| bits_equal(&slot(&ho, s), &slot(&hc, s)));
+            let clean_again = bits_equal(&launch(&clean_sel, sink)?, &hc) && gpu.fault()?.is_none();
+            let oor_ok = before.is_none()
+                && after_clean.is_none()
+                && word == want
+                && bad_nan
+                && others
+                && clean_again;
+            ok &= oor_ok;
+            println!(
+                "body id {id} past the stack of {n_exp} in slot {bad}: word \"{}\" (want \"{}\", clean \
+                 before {} and after the clean run {}) that slot NaN {bad_nan}, other slots bit-identical \
+                 {others}, clean rerun bits and word clean {clean_again} {}",
+                word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+                want.map_or_else(String::new, |f| f.to_string()),
+                before.is_none(),
+                after_clean.is_none(),
+                verdict(oor_ok)
+            );
+        }
         let mut hg = DeviceBuffer::from_host(stream, &vec![SENT; 8 * rpe])?;
         let graph = gpu.capture(|s| {
             ex.enqueue_gate_up(

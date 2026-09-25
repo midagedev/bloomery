@@ -59,10 +59,13 @@ use std::sync::Arc;
 /// lane], x[c·k + 32·it + lane])`, accumulated sequentially in `it`.
 /// Columns past `m_cols` stay 0.0.
 ///
-/// Caller contract: `w.len() >= (row + 1) * k`, `x.len() >= m_cols * k`,
-/// `k` a positive multiple of 32, `m_cols` in 1..=8, `lane < 32`.
+/// # Safety
+///
+/// `w.len() >= (row + 1) * k`, `x.len() >= m_cols * k`, `k` a positive
+/// multiple of 32, `m_cols` in 1..=8, `lane < 32`. The body reads `w` and
+/// `x` unchecked within those bounds.
 #[inline(always)]
-pub(crate) fn f32_lane_partials(
+pub(crate) unsafe fn f32_lane_partials(
     w: &[f32],
     x: &[f32],
     k: u32,
@@ -75,8 +78,8 @@ pub(crate) fn f32_lane_partials(
     // multiply-add sits behind its own branch and the lane can have only
     // that chunk's load in flight. See `f32_lane_partial_1col`.
     if m_cols == 1 {
-        // SAFETY: with m_cols 1 this function's caller contract is the
-        // callee's safety contract.
+        // SAFETY: with m_cols 1 this function's safety contract is the
+        // callee's.
         let f0 = unsafe { f32_lane_partial_1col(w, x, k, row, lane) };
         return [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     }
@@ -93,10 +96,10 @@ pub(crate) fn f32_lane_partials(
     let mut it = 0usize;
     while it < k >> 5 {
         let kk = it * 32 + lane;
-        // SAFETY: kk < k <= w.len() - w_row by the caller contract.
+        // SAFETY: kk < k <= w.len() - w_row by the safety contract.
         let wv = unsafe { *w.get_unchecked(w_row + kk) };
         // Column 0 (always active).
-        // SAFETY: kk < k <= x.len() by the caller contract (m_cols >= 1).
+        // SAFETY: kk < k <= x.len() by the safety contract (m_cols >= 1).
         f0 = f32::mul_add(wv, unsafe { *x.get_unchecked(kk) }, f0);
         // Columns 1..7: one launch-uniform guard per column so the work
         // scales with m_cols; each guard makes the column's span live.
@@ -154,7 +157,7 @@ const _: () = assert!(LANE_UNROLL == 8);
 ///
 /// # Safety
 ///
-/// The caller contract of [`f32_lane_partials`] with `m_cols` 1: `w.len() >=
+/// The safety contract of [`f32_lane_partials`] with `m_cols` 1: `w.len() >=
 /// (row + 1) * k`, `x.len() >= k`, `k` a positive multiple of 32, `lane <
 /// 32`. The body reads `w` and `x` unchecked within those bounds.
 #[inline(always)]
@@ -1029,7 +1032,12 @@ mod q8f32_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        let sums = gemv_lane_sums(f32_lane_partials(w, x, k, row, m_cols, lane), m_cols);
+        // SAFETY: row < n_rows, so w.len() >= n_rows·k >= (row + 1)·k, and
+        // x.len() >= m_cols·k, by the launch contract; the launcher passes k
+        // a positive multiple of 32 and m_cols in 1..=8
+        // (`check_gemv_geometry`); lane < 32.
+        let partials = unsafe { f32_lane_partials(w, x, k, row, m_cols, lane) };
+        let sums = gemv_lane_sums(partials, m_cols);
         if lane == 0 {
             // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
             // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the

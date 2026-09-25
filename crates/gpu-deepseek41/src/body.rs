@@ -68,7 +68,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, SlotMap, levers};
+use bloomery_gpu::hybrid::{
+    Boundary, BoundaryShape, Chain, HOST, Hybrid, Refusal, SlotMap, levers,
+};
 use bloomery_gpu::model::{ChainBody, StepProbe};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
@@ -2029,6 +2031,12 @@ impl ChainBody for Body {
         self.hybrid.serve_captured().and(rows)
     }
 
+    /// The host tier's refusal that failed the step's service, once
+    /// ([`Hybrid::take_step_refusal`]).
+    fn take_host_refusal(&mut self) -> Option<Refusal> {
+        self.hybrid.take_step_refusal()
+    }
+
     fn decode_pair(
         &mut self,
         stream: &CudaStream,
@@ -2151,7 +2159,8 @@ impl ChainBody for Body {
         )?;
         let file = Arc::new(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone())?;
-        let hybrid = Hybrid::new(boundary, host, layers.len())?;
+        let mut hybrid = Hybrid::new(boundary, host, layers.len())?;
+        hybrid.watch_fault(gpu.fault_word())?;
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
         let ced = ced::Ced::new(&hp.layers, ring_rows, ced::from_env()?);

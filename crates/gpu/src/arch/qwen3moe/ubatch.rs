@@ -502,6 +502,7 @@ fn attention(
             n_kv: d.n_kv,
             ctx: d.ctx,
             m: t,
+            fault: sink,
             cache_k: &mut kv.k,
             cache_v: &mut kv.v,
         },

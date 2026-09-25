@@ -29,6 +29,25 @@
 //! And once: `n_l` = 32 with the overlap lever off captures the same node
 //! count and kinds and gives the same logits, bit for bit, as with it on.
 //!
+//! And the host tier's refusals, on a boundary of its own over host experts
+//! that scale each column by its listed weights (no model file): a handoff
+//! the card should already have refused — a routed id the slot map does not
+//! know, a non-finite activation — runs no host expert, its sum is NaN and
+//! the tier records it once. The caller sees the card's fault when the card
+//! raised one at or before the layer, or unlabelled (planted by a
+//! `norm_quant` launch over a NaN column: `Fault::at(layer, NormQuant)`), and
+//! the host's own error — "host saw undefined input the card did not refuse"
+//! — when the word is clean or names a later layer. The step service (eager,
+//! one row, unwatched) fails with a named host error, never the host
+//! experts' own, and the word read after the stream drains names it through
+//! `hybrid::name_refusal`, as `GpuModel::name_host_refusal` does; the batch
+//! service (three columns: the refused column NaN, the others the clean
+//! run's bit for bit) names it itself when it watches the word and returns
+//! when it does not. The word is clean before and after a clean service.
+//! Last, on the engine itself (`n_l` = 32): a NaN in a hybrid layer's input
+//! residual through `step_layer_hybrid` returns the card's fault at that
+//! layer, with one refusal recorded by the host tier.
+//!
 //! Printed and not judged: the host tier's counters (services, the host's
 //! share of the routed weight², the host leg, pool parks inside a service,
 //! services whose go was already there) and the allocations per steady
@@ -64,15 +83,21 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::hybrid::{HybridConfig, levers};
+    use bloomery_gpu::fused::FusedKernels;
+    use bloomery_gpu::hybrid::{
+        Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, SlotMap, levers, name_refusal,
+    };
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Deepseek2Model, NodeInfo};
+    use bloomery_gpu::{
+        Deepseek2Model, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, NodeInfo, Q8Act,
+    };
     use bloomery_gpu_gates::nodes::{count_kinds, kind_name};
     use bloomery_gpu_gates::prompts::{GreedyRow, PromptRow, read_greedy, read_prompts};
     use bloomery_gpu_gates::{
         GateError, bits_equal, checks_failed, data_dir, open_model, q8_1_dequant, ref_model_path,
         verdict,
     };
+    use cuda_core::DeviceBuffer;
     use cuda_core::sys;
     use gguf::{GgmlType, Gguf, Split};
     use model::Tensor2;
@@ -694,7 +719,450 @@ mod gate {
         })
     }
 
+    /// The refusal arm's boundary: its width, slots, layers, experts and the
+    /// card's prefix of them.
+    const R_HIDDEN: usize = 256;
+    const R_USED: usize = 6;
+    const R_LAYERS: usize = 4;
+    const R_EXPERTS: usize = 16;
+    const R_CARD: usize = 8;
+    /// The layer the refusal arm serves.
+    const R_LAYER: usize = 2;
+
+    /// Host experts for the refusal arm: a column's sum is its activation
+    /// times the sum of its listed weights, so it depends on its own input
+    /// and list alone; `experts` counts the experts run. An id past the
+    /// file is refused as the engine's host tier refuses it, by name.
+    #[derive(Default)]
+    struct Stub {
+        experts: usize,
+    }
+
+    impl HostExperts for Stub {
+        fn experts_into(
+            &mut self,
+            _layer: usize,
+            x: &Tensor2,
+            experts: &[(u32, f32)],
+            out: &mut [f32],
+        ) -> Result<(), GpuError> {
+            if let Some(&(id, _)) = experts.iter().find(|e| e.0 as usize >= R_EXPERTS) {
+                return Err(GpuError::Shape {
+                    what: "refusal arm host",
+                    detail: format!("expert {id} is not in the file"),
+                });
+            }
+            self.experts += experts.len();
+            let w: f32 = experts.iter().map(|e| e.1).sum();
+            for (o, &v) in out.iter_mut().zip(&x.data) {
+                *o = v * w;
+            }
+            Ok(())
+        }
+
+        fn experts_union_into(
+            &mut self,
+            layer: usize,
+            x: &Tensor2,
+            lists: &[&[(u32, f32)]],
+            out: &mut [f32],
+        ) -> Result<(), GpuError> {
+            for (j, list) in lists.iter().enumerate() {
+                let col = Tensor2::from_vec(x.ne0, 1, x.col(j).to_vec());
+                self.experts_into(layer, &col, list, &mut out[j * x.ne0..][..x.ne0])?;
+            }
+            Ok(())
+        }
+    }
+
+    /// A fresh tier over its own boundary, watching `gpu`'s fault word when
+    /// `watch`.
+    fn refusal_tier(gpu: &Gpu, watch: bool) -> Result<Hybrid<Stub>, GateError> {
+        let shape = BoundaryShape {
+            hidden: R_HIDDEN,
+            n_used: R_USED,
+        };
+        let slots = SlotMap::prefix(0..R_LAYERS, R_EXPERTS, R_CARD)?;
+        let b = Boundary::new(gpu.context(), gpu.stream(), shape, slots, true)?;
+        let mut h = Hybrid::new(b, Stub::default(), R_LAYERS)?;
+        if watch {
+            h.watch_fault(gpu.fault_word())?;
+        }
+        gpu.stream().synchronize()?;
+        Ok(h)
+    }
+
+    /// One eager step service of layer [`R_LAYER`] over the handoff (`ids`,
+    /// `w`, `x`) written into row 0's image, then the go and the wait: the
+    /// tier's answer, and the host sum as the page holds it after the stream
+    /// drained.
+    fn serve_step(
+        gpu: &Gpu,
+        h: &mut Hybrid<Stub>,
+        ids: &[u32],
+        w: &[f32],
+        x: &[f32],
+    ) -> Result<(Result<(), GpuError>, Vec<f32>), GateError> {
+        let stream = gpu.stream();
+        let seq = u32::try_from(h.stats().served)?;
+        h.begin_chain(stream)?;
+        {
+            let t = h.boundary_mut().handoff_target();
+            let l = t.layout;
+            let mut img = vec![0u32; l.x + l.hidden];
+            img[l.seq] = seq;
+            img[l.ids..l.ids + l.n_used].copy_from_slice(ids);
+            for (d, v) in img[l.weights..l.weights + l.n_used].iter_mut().zip(w) {
+                *d = v.to_bits();
+            }
+            for (d, v) in img[l.x..].iter_mut().zip(x) {
+                *d = v.to_bits();
+            }
+            t.image.copy_from_host(stream, &img)?;
+        }
+        h.boundary().enqueue_go(stream, R_LAYER)?;
+        h.boundary().enqueue_back(stream)?;
+        let r = h.layer_enqueued(R_LAYER);
+        stream.synchronize()?;
+        Ok((r, h.hsum_copy()?))
+    }
+
+    /// A `norm_quant` launch over a NaN column raising into layer `layer`
+    /// ([`LAYER_NONE`]: the unlabelled sink), then a synchronize: the card
+    /// refusing an input at that layer, finished before the host looks.
+    fn plant(gpu: &Gpu, fused: &FusedKernels, layer: u32) -> Result<(), GateError> {
+        let stream = gpu.stream();
+        let mut act = Q8Act::with_k(stream, 1, R_HIDDEN)?;
+        let x = DeviceBuffer::from_host(stream, &[f32::NAN; R_HIDDEN])?;
+        let g = DeviceBuffer::from_host(stream, &[1.0f32; R_HIDDEN])?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, R_HIDDEN)?;
+        let sink = if layer == LAYER_NONE {
+            gpu.unlabelled_sink()
+        } else {
+            gpu.layer_sink(usize::try_from(layer)?)?
+        };
+        fused.enqueue_norm_quant(stream, &x, &g, 1e-6, &mut act, &mut y, sink)?;
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// What a refused service's answer must be: the card's fault, or the
+    /// host's own error (a `Protocol` saying so, and naming a later fault
+    /// when the card holds one), or — an unwatched batch — a return.
+    #[derive(Clone, Copy)]
+    enum Want {
+        Card(Fault),
+        Host { later: bool },
+        Returns,
+    }
+
+    /// One refused handoff: its name, the routing and activation handed
+    /// over, the layer the card refused at beforehand, whether the tier
+    /// watches the word, and the answer the caller must see.
+    struct Case<'a> {
+        name: &'a str,
+        ids: &'a [u32],
+        x: &'a [f32],
+        planted: Option<u32>,
+        watch: bool,
+        want: Want,
+    }
+
+    impl<'a> Case<'a> {
+        fn new(
+            name: &'a str,
+            ids: &'a [u32],
+            x: &'a [f32],
+            planted: Option<u32>,
+            watch: bool,
+            want: Want,
+        ) -> Case<'a> {
+            Case {
+                name,
+                ids,
+                x,
+                planted,
+                watch,
+                want,
+            }
+        }
+    }
+
+    fn answer_ok(r: &Result<(), GpuError>, want: Want) -> bool {
+        match (r, want) {
+            (Err(GpuError::Fault { fault, .. }), Want::Card(f)) => *fault == f,
+            (Err(e @ GpuError::Protocol { .. }), Want::Host { later }) => {
+                let t = e.to_string();
+                t.contains("host saw undefined input the card did not refuse")
+                    && t.contains(if later {
+                        "later than this layer"
+                    } else {
+                        "is clean"
+                    })
+            }
+            (Ok(()), Want::Returns) => true,
+            _ => false,
+        }
+    }
+
+    fn show(r: &Result<(), GpuError>) -> String {
+        match r {
+            Ok(()) => "Ok".to_string(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The tier recorded exactly one refusal, at [`R_LAYER`], whose detail
+    /// starts with `at`.
+    fn recorded_once(h: &Hybrid<Stub>, at: &str) -> bool {
+        h.stats().refusals == 1
+            && h.refusal()
+                .is_some_and(|r| r.layer == R_LAYER && r.detail.starts_with(at))
+    }
+
+    /// The host tier's refusals (module doc): whether every case held.
+    fn refusal_arm() -> Result<bool, GateError> {
+        let gpu = Gpu::new()?;
+        let fused = FusedKernels::load(gpu.context())?;
+        let stream = gpu.stream();
+        let x = bloomery_gpu_gates::activations(R_HIDDEN, 3, 91);
+        let w = [0.30f32, 0.20, 0.15, 0.15, 0.10, 0.10];
+        // Slots 2, 3 and 5 go to the host.
+        let ids = [0u32, 1, 9, 10, 3, 12];
+        let host_w = w[2] + w[3] + w[5];
+        let at = |l: u32| Fault::at(l, FaultSite::NormQuant);
+        let layer = u32::try_from(R_LAYER)?;
+        let mut ok = true;
+        gpu.clear_fault()?;
+
+        // The step service: the tier fails by name and releases the stream;
+        // the step's caller (`GpuModel::name_host_refusal`) reads the word on
+        // the engine stream once the step has drained and names the refusal.
+        let x0 = &x[..R_HIDDEN];
+        let before = gpu.fault()?;
+        let mut h = refusal_tier(&gpu, false)?;
+        let (r, sum) = serve_step(&gpu, &mut h, &ids, &w, x0)?;
+        let want_sum: Vec<f32> = x0.iter().map(|&v| v * host_w).collect();
+        let clean = r.is_ok()
+            && bits_equal(&sum, &want_sum)
+            && h.host_mut().experts == 3
+            && h.stats().refusals == 0
+            && h.take_step_refusal().is_none();
+        let pass = clean && before.is_none() && gpu.fault()?.is_none();
+        println!(
+            "refusal step clean: answer {} host sum = the stub's and nothing recorded {clean} word \
+             clean before {} and after {} {}",
+            show(&r),
+            before.is_none(),
+            gpu.fault()?.is_none(),
+            verdict(pass)
+        );
+        ok &= pass;
+        let mut unknown = ids;
+        unknown[4] = 99;
+        let mut nan_x = x0.to_vec();
+        nan_x[5] = f32::NAN;
+        let cases = [
+            Case::new(
+                "unknown id, word clean",
+                &unknown,
+                x0,
+                None,
+                false,
+                Want::Host { later: false },
+            ),
+            Case::new(
+                "unknown id, card raised at the layer",
+                &unknown,
+                x0,
+                Some(layer),
+                false,
+                Want::Card(at(layer)),
+            ),
+            Case::new(
+                "non-finite x, card raised at the layer",
+                &ids,
+                &nan_x,
+                Some(layer),
+                false,
+                Want::Card(at(layer)),
+            ),
+            Case::new(
+                "non-finite x, card raised earlier",
+                &ids,
+                &nan_x,
+                Some(layer - 1),
+                false,
+                Want::Card(at(layer - 1)),
+            ),
+            Case::new(
+                "non-finite x, card raised unlabelled",
+                &ids,
+                &nan_x,
+                Some(LAYER_NONE),
+                false,
+                Want::Card(at(LAYER_NONE)),
+            ),
+            Case::new(
+                "non-finite x, card raised later",
+                &ids,
+                &nan_x,
+                Some(layer + 1),
+                false,
+                Want::Host { later: true },
+            ),
+        ];
+        for c in cases {
+            let mut h = refusal_tier(&gpu, c.watch)?;
+            if let Some(l) = c.planted {
+                plant(&gpu, &fused, l)?;
+            }
+            // `serve_step` synchronizes the stream: the drain.
+            let (r, sum) = serve_step(&gpu, &mut h, c.ids, &w, c.x)?;
+            let raw = match &r {
+                Err(e @ GpuError::Protocol { .. }) => {
+                    let t = e.to_string();
+                    t.contains("host saw undefined input: layer 2, row 0")
+                }
+                _ => false,
+            };
+            let recorded = recorded_once(&h, "row 0: ");
+            // What `name_host_refusal` hands the caller; with no refusal
+            // taken, the service's own answer passes through.
+            let named = match h.take_step_refusal() {
+                Some(refusal) if r.is_err() => Some(Err(name_refusal(&refusal, gpu.fault()?))),
+                _ => None,
+            };
+            let answer = answer_ok(named.as_ref().unwrap_or(&r), c.want);
+            let once = h.take_step_refusal().is_none();
+            let sum_nan = sum.iter().all(|v| v.is_nan());
+            let no_expert = h.host_mut().experts == 0;
+            let word = gpu.take_fault()?;
+            let word_ok = word == c.planted.map(at);
+            let pass = raw && recorded && answer && once && sum_nan && no_expert && word_ok;
+            println!(
+                "refusal step {}: service \"{}\" a named host error {raw}, recorded once {recorded}; \
+                 named \"{}\" as wanted {answer}, taken once {once}, host sum NaN {sum_nan}, no host \
+                 expert ran {no_expert}, word as planted {word_ok} {}",
+                c.name,
+                show(&r),
+                show(named.as_ref().unwrap_or(&r)),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // The batch service: three columns, column 1 or 2 refused. It runs
+        // after the card's work has finished (`plant` synchronizes, as the
+        // engine's caller waits on the event its handoffs came down at), so
+        // a watched tier reads the word itself.
+        let cols = 3usize;
+        let bids: Vec<u32> = (0..cols).flat_map(|_| ids).collect();
+        let bw: Vec<f32> = (0..cols).flat_map(|_| w).collect();
+        let batch = |h: &mut Hybrid<Stub>, bx: &[f32], bi: &[u32]| {
+            let mut out = vec![0.0f32; cols * R_HIDDEN];
+            let t = Tensor2::from_vec(R_HIDDEN, cols, bx.to_vec());
+            let r = h.serve_batch(R_LAYER, &t, bi, &bw, &mut out);
+            (r, out)
+        };
+        let mut h = refusal_tier(&gpu, true)?;
+        let before = gpu.fault()?;
+        let (r, clean_out) = batch(&mut h, &x, &bids);
+        let want_out: Vec<f32> = x.iter().map(|&v| v * host_w).collect();
+        let clean = r.is_ok() && bits_equal(&clean_out, &want_out) && h.stats().refusals == 0;
+        let pass = clean && before.is_none() && gpu.fault()?.is_none();
+        println!(
+            "refusal batch clean: answer {} sums = the stub's and nothing recorded {clean} word clean \
+             before {} and after {} {}",
+            show(&r),
+            before.is_none(),
+            gpu.fault()?.is_none(),
+            verdict(pass)
+        );
+        ok &= pass;
+        let mut bunk = bids.clone();
+        bunk[R_USED + 4] = 99;
+        let mut bnan = x.clone();
+        bnan[2 * R_HIDDEN + 5] = f32::NAN;
+        let bcases = [
+            (
+                1,
+                Case::new(
+                    "column 1 unknown id, word clean",
+                    &bunk,
+                    &x,
+                    None,
+                    true,
+                    Want::Host { later: false },
+                ),
+            ),
+            (
+                2,
+                Case::new(
+                    "column 2 non-finite, card raised at the layer",
+                    &bids,
+                    &bnan,
+                    Some(layer),
+                    true,
+                    Want::Card(at(layer)),
+                ),
+            ),
+            (
+                2,
+                Case::new(
+                    "column 2 non-finite, card raised later",
+                    &bids,
+                    &bnan,
+                    Some(layer + 1),
+                    true,
+                    Want::Host { later: true },
+                ),
+            ),
+            (
+                2,
+                Case::new(
+                    "column 2 non-finite, unwatched",
+                    &bids,
+                    &bnan,
+                    Some(layer),
+                    false,
+                    Want::Returns,
+                ),
+            ),
+        ];
+        for (bad, c) in bcases {
+            let mut h = refusal_tier(&gpu, c.watch)?;
+            if let Some(l) = c.planted {
+                plant(&gpu, &fused, l)?;
+            }
+            let (r, out) = batch(&mut h, c.x, c.ids);
+            let answer = answer_ok(&r, c.want);
+            let recorded = recorded_once(&h, &format!("column {bad} of {cols}: "));
+            let col = |v: &[f32], j: usize| v[j * R_HIDDEN..(j + 1) * R_HIDDEN].to_vec();
+            let bad_nan = col(&out, bad).iter().all(|v| v.is_nan());
+            let others = (0..cols)
+                .filter(|&j| j != bad)
+                .all(|j| bits_equal(&col(&out, j), &col(&clean_out, j)));
+            let word = gpu.take_fault()?;
+            let word_ok = word == c.planted.map(at);
+            let pass = answer && recorded && bad_nan && others && word_ok;
+            println!(
+                "refusal batch {}: answer \"{}\" as wanted {answer}, recorded once {recorded}, that \
+                 column NaN {bad_nan}, other columns bit-identical {others}, word as planted \
+                 {word_ok} {}",
+                c.name,
+                show(&r),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        stream.synchronize()?;
+        println!("refusal verdict {}", verdict(ok));
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let refusals = refusal_arm()?;
         let lv = levers()?;
         if lv.n_l.is_some() {
             return Err("gate_hybrid: BLOOMERY_HYBRID_NL is set — the all-card reference must load all-card; unset it".into());
@@ -745,7 +1213,7 @@ mod gate {
             let token = *p.tokens.last().ok_or("gate_hybrid: empty prompt")?;
             chains.push(all_card_chain(&mut a, token, n_layers)?);
         }
-        let mut ok = true;
+        let mut ok = refusals;
         match steady(&mut a, prompts[0].tokens[0]) {
             Ok(allocs) => println!("all_card steady allocs_per_step={allocs:.2} (graph mode)"),
             Err(e) => {
@@ -793,6 +1261,38 @@ mod gate {
                 fmt_kinds(&k.0, k.1),
                 verdict(s_ok && same)
             );
+
+            // The engine's own naming on a real layer: a NaN in a hybrid
+            // layer's input residual is refused by the card's norm at that
+            // layer and met by the host service in its handoff, and the
+            // caller sees the card's fault (`GpuModel::name_host_refusal`),
+            // never the host's error. It poisons the tier, so it runs last.
+            let (l, x_in, _) = chains
+                .first()
+                .and_then(|c| c.layers.first())
+                .ok_or("gate_hybrid: no routed layer")?;
+            let mut x_nan = x_in.clone();
+            x_nan[0] = f32::NAN;
+            let r = h.step_layer_hybrid(*l, &x_nan, 0);
+            let refused = h.hybrid_stats().is_some_and(|s| s.refusals == 1);
+            let named = match &r {
+                Err(GpuError::Fault { fault, .. }) => {
+                    usize::try_from(fault.layer).is_ok_and(|fl| fl == *l)
+                        && fault.sites & (1 << FaultSite::NormQuant as u32) != 0
+                }
+                _ => false,
+            };
+            let pass = named && refused;
+            ok &= pass;
+            println!(
+                "n_l=32 engine refusal layer={l} input NaN at value 0: answer \"{}\" names the card's \
+                 fault at the layer {named}, the host recorded one refusal {refused} {}",
+                match &r {
+                    Ok(_) => "Ok".to_string(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(pass)
+            );
         }
 
         if ok {
@@ -801,7 +1301,8 @@ mod gate {
                  replays its eager body bit for bit, runs every routed layer on the all-card routing with the \
                  card's slots unchanged, the host's slots zero and the host sum inside the error model's band, \
                  and leaves the all-card argmax only inside the flip band; the overlap lever changes the order \
-                 and nothing else."
+                 and nothing else; a handoff the card should have refused names the card's fault, or says the \
+                 card raised nothing."
             );
             Ok(())
         } else {

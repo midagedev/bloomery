@@ -32,7 +32,7 @@ pub use probe::{OpTime, StepProbe};
 
 use crate::fault::Fault;
 use crate::head::Head;
-use crate::hybrid::{Chain, HostResidency, HybridConfig, host_levers};
+use crate::hybrid::{Chain, HostResidency, HybridConfig, Refusal, host_levers, name_refusal};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use cuda_core::CudaStream;
@@ -217,6 +217,14 @@ pub trait ChainBody: Sized {
             "ChainBody::enqueue_pair",
             "this architecture has no pair pass",
         ))
+    }
+
+    /// The refusal that failed the step's host service, once
+    /// ([`crate::hybrid::Hybrid::take_step_refusal`]): what the step's
+    /// failure is named from after the stream has drained. A body without a
+    /// host tier has none, which is the default.
+    fn take_host_refusal(&mut self) -> Option<Refusal> {
+        None
     }
 
     /// [`ChainBody::serve_replay`] for a replay of the captured pair pass.
@@ -837,10 +845,12 @@ impl<B: ChainBody> GpuModel<B> {
             self.check_pos(pos, "GpuModel::step")?;
             self.arm_launcher();
             self.refresh_params(token, pos)?;
-            match self.mode {
-                StepMode::Eager => self.enqueue_chain_step()?,
-                StepMode::Graph => self.replay_graph(Chain::Step)?,
-            }
+            let r = match self.mode {
+                StepMode::Eager => self.enqueue_chain_step(),
+                StepMode::Graph => self.replay_graph(Chain::Step),
+            };
+            let r = self.name_host_refusal(r);
+            self.note_fault(r)?;
             self.pos = pos + 1;
         }
         let gpu = &self.stages[0].gpu;
@@ -850,6 +860,26 @@ impl<B: ChainBody> GpuModel<B> {
             .ok_or(GpuError::state("GpuModel::step", "no output head"))?
             .token(gpu);
         self.note_fault(token)
+    }
+
+    /// A step's enqueue or replay result, with a host refusal named: when the
+    /// body's host service refused input the card should already have
+    /// refused, it released every wait of the step, so the step drains, and
+    /// the fault word read on the engine stream behind it names the refusal
+    /// ([`name_refusal`]) — the card's fault when the card raised one at or
+    /// before that layer, else the host's error. Any other result passes
+    /// through.
+    pub(crate) fn name_host_refusal(&mut self, r: Result<(), GpuError>) -> Result<(), GpuError> {
+        let Err(e) = r else {
+            return Ok(());
+        };
+        let Ok((gpu, _, body)) = self.body_parts("GpuModel::name_host_refusal") else {
+            return Err(e);
+        };
+        let Some(refusal) = body.take_host_refusal() else {
+            return Err(e);
+        };
+        Err(name_refusal(&refusal, gpu.fault()?))
     }
 
     /// A step on a poisoned model is refused, naming the fault.
@@ -914,10 +944,12 @@ impl<B: ChainBody> GpuModel<B> {
             let (gpu, _, body) = self.body_parts(WHAT)?;
             body.decode_pair(gpu.stream(), [t, t1], pos)?;
         }
-        match self.mode {
-            StepMode::Eager => self.enqueue_pair_step()?,
-            StepMode::Graph => self.replay_graph(Chain::Pair)?,
-        }
+        let r = match self.mode {
+            StepMode::Eager => self.enqueue_pair_step(),
+            StepMode::Graph => self.replay_graph(Chain::Pair),
+        };
+        let r = self.name_host_refusal(r);
+        self.note_fault(r)?;
         self.pos = pos + 2;
         let gpu = &self.stages[0].gpu;
         let [a, b] = self.pair_heads()?;

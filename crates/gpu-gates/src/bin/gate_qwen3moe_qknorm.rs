@@ -58,6 +58,7 @@ mod gate {
         let gpu = Gpu::new()?;
         let k = RopeNeoxKernels::load(gpu.context())?;
         let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
         println!(
             "gate_qwen3moe_qknorm: device {} — {} layers, {} q / {} kv heads of {}, eps {:e}",
             gpu.device_name()?,
@@ -80,8 +81,8 @@ mod gate {
                 let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
 
                 // Layer 1: the kernel against our rule, and a rerun.
-                let a = run_neox(&k, stream, &rows, &gq, &gk, &identity, hp.rms_eps, ctx)?;
-                let b = run_neox(&k, stream, &rows, &gq, &gk, &identity, hp.rms_eps, ctx)?;
+                let a = run_neox(&k, stream, unl, &rows, &gq, &gk, &identity, hp.rms_eps, ctx)?;
+                let b = run_neox(&k, stream, unl, &rows, &gq, &gk, &identity, hp.rms_eps, ctx)?;
                 let host = |x: &[f32], g: &[f32]| -> Vec<f32> {
                     x.chunks(HEAD)
                         .flat_map(|h| head_norm(h, g, hp.rms_eps))

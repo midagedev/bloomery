@@ -30,6 +30,7 @@
 //! f32 rounding boundary. The gates print how many values agree bit for bit.
 
 use crate::GpuError;
+use crate::fault::{FaultSink, FaultSite};
 use crate::flash::f32_to_f16_bits;
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -73,9 +74,10 @@ mod rope_neox_kernels {
     /// at the same row. The table of token `t` is `cs[t·HEAD ..]`, `[cos_0,
     /// sin_0, …]` for the 64 pairs. The branch is on the block index, so no
     /// warp splits across it; `pos[t] < ctx` is host-checked where the host
-    /// can see it and bounds-checked here where it cannot (a position read
-    /// from device memory past the planes skips the append, never writes
-    /// outside them).
+    /// can see it and bounds-checked here where it cannot: a position read
+    /// from device memory at or past the planes has no row, so the block
+    /// raises [`FaultSite::CachePos`] on `fault` and appends nothing — no
+    /// write outside the planes, and no stale row passes for the token's.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -108,6 +110,7 @@ mod rope_neox_kernels {
         n_kv: u32,
         ctx: u32,
         m: u32,
+        fault: FaultSink,
         mut q: DisjointSlice<f32>,
         mut k: DisjointSlice<f32>,
         mut cache_k: DisjointSlice<u16>,
@@ -198,6 +201,9 @@ mod rope_neox_kernels {
         // SAFETY: t < m <= pos.len() by the launch contract.
         let p = unsafe { *pos.get_unchecked(t) } as usize;
         if p >= ctx as usize {
+            if tid == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
             return;
         }
         let row = (kh * ctx as usize + p) * HEAD;
@@ -219,8 +225,8 @@ mod rope_neox_kernels {
 /// tokens of `n_head` query heads in `q` and `n_kv` key and value heads in
 /// `k` and `v` (token-major, head after head, [`HEAD`] values each), the
 /// gains, the `m` tables (`RopeTable::push` over a [`HEAD`]-wide spec) and
-/// positions on the device, and the layer's two cache planes of
-/// `n_kv · ctx` rows of [`HEAD`] f16.
+/// positions on the device, the sink a position past the planes raises on,
+/// and the layer's two cache planes of `n_kv · ctx` rows of [`HEAD`] f16.
 pub struct NeoxArgs<'a> {
     pub q: &'a mut DeviceBuffer<f32>,
     pub k: &'a mut DeviceBuffer<f32>,
@@ -234,6 +240,7 @@ pub struct NeoxArgs<'a> {
     pub n_kv: usize,
     pub ctx: usize,
     pub m: usize,
+    pub fault: FaultSink,
     pub cache_k: &'a mut DeviceBuffer<u16>,
     pub cache_v: &'a mut DeviceBuffer<u16>,
 }
@@ -255,7 +262,8 @@ impl RopeNeoxKernels {
     /// Enqueue the norm, turn and append of `args.m` tokens: one block per
     /// (token, head), `m·(n_head + n_kv)` blocks of 64 threads. The tokens
     /// of one launch must hold distinct positions below `ctx` (the caller's
-    /// positions are consecutive; the kernel skips a position `>= ctx`).
+    /// positions are consecutive); a position `>= ctx` raises
+    /// [`FaultSite::CachePos`] on `args.fault` and is not appended.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_head_norm_neox_append(
         &self,
@@ -276,6 +284,7 @@ impl RopeNeoxKernels {
             n_kv,
             ctx,
             m,
+            fault,
             cache_k,
             cache_v,
         } = args;
@@ -315,7 +324,8 @@ impl RopeNeoxKernels {
             .module
             .prepare_head_norm_neox_append(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
         self.module.head_norm_neox_append(
-            stream, &prep, gq, gk, cs, pos, v, eps, n_head, n_kv, ctx, m, q, k, cache_k, cache_v,
+            stream, &prep, gq, gk, cs, pos, v, eps, n_head, n_kv, ctx, m, fault, q, k, cache_k,
+            cache_v,
         )?;
         Ok(())
     }

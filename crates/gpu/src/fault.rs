@@ -86,10 +86,12 @@ pub enum FaultSite {
     TokenId = 9,
     /// A prefill flash row's live key count was zero or past the cache.
     KeyCount = 10,
+    /// A cache append was handed a position at or past the cache's rows.
+    CachePos = 11,
 }
 
 // A site is one bit of a u32 mask.
-const _: () = assert!((FaultSite::KeyCount as u32) < 32);
+const _: () = assert!((FaultSite::CachePos as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -104,6 +106,7 @@ impl FaultSite {
         FaultSite::AttnCount,
         FaultSite::TokenId,
         FaultSite::KeyCount,
+        FaultSite::CachePos,
     ];
 
     /// The site's name as an error prints it.
@@ -120,6 +123,7 @@ impl FaultSite {
             FaultSite::AttnCount => "attn_count",
             FaultSite::TokenId => "token_id",
             FaultSite::KeyCount => "key_count",
+            FaultSite::CachePos => "cache_pos",
         }
     }
 
@@ -139,6 +143,7 @@ impl FaultSite {
             FaultSite::AttnCount => "a visible key count past the rows of its source",
             FaultSite::TokenId => "a token id past the table's rows",
             FaultSite::KeyCount => "a flash row's live key count of zero or past the cache",
+            FaultSite::CachePos => "a cache append position at or past the cache's rows",
         }
     }
 }
@@ -154,8 +159,8 @@ impl FaultSite {
 pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
-        AttnCount, AttnSel, ExpertId, HcQuant, KeyCount, NormQuant, Q5Quant, QuantColumn, Router,
-        TokenId,
+        AttnCount, AttnSel, CachePos, ExpertId, HcQuant, KeyCount, NormQuant, Q5Quant, QuantColumn,
+        Router, TokenId,
     };
 
     /// DeepSeek-V2-Lite (`arch::deepseek2`): the fused norm and quantizer at
@@ -173,6 +178,7 @@ pub mod step_order {
         AttnSel,
         KeyCount,
         HcQuant,
+        CachePos,
     ];
     /// DeepSeek-V4.1 (`gpu-deepseek41`): HC_PRE's in-register quantizer, the
     /// attention norm, the projections' quantizer, the attention's visible
@@ -189,15 +195,17 @@ pub mod step_order {
         ExpertId,
         KeyCount,
         Q5Quant,
+        CachePos,
     ];
     /// Qwen3-MoE (`arch::qwen3moe`): the fused norm and quantizer at the
-    /// layer's entry, the prefill flash's key count, the attention output's
-    /// quantizer, the router's fused norm, the routed experts. On the ubatch
-    /// path the grouped GEMM's route (`ExpertId`) is enqueued before the
-    /// router's norm; the table follows the decode path.
+    /// layer's entry, the cache append's position, the flash's key count,
+    /// the attention output's quantizer, the router's fused norm, the routed
+    /// experts. On the ubatch path the grouped GEMM's route (`ExpertId`) is
+    /// enqueued before the router's norm; the table follows the decode path.
     pub const QWEN3MOE: &[FaultSite] = &[
         TokenId,
         NormQuant,
+        CachePos,
         KeyCount,
         QuantColumn,
         Router,

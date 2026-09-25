@@ -282,10 +282,11 @@ fn route_inner(
         counts[e as usize] += 1;
     }
     let mut offsets = Vec::with_capacity(n_expert + 1);
-    offsets.push(0);
+    let mut end = 0u32;
+    offsets.push(end);
     for &c in &counts {
-        let last = *offsets.last().unwrap();
-        offsets.push(last + c);
+        end += c;
+        offsets.push(end);
     }
     let mut order = vec![0u32; n_used * n_tokens];
     let mut weight = vec![0.0f32; n_used * n_tokens];

@@ -86,7 +86,10 @@ mod fused_kernels {
     /// A column whose normalized values are not all finite, or whose scale
     /// is not positive (a sum of squares that overflowed), has no q8_1 form:
     /// a lane that sees it raises [`FaultSite::NormQuant`] on `fault`, and
-    /// the stores go ahead unchanged.
+    /// the whole 128-value block holding it is refused — every value of the
+    /// block lands in `y` as NaN and the block's scale in `d8` as NaN (zero
+    /// codes), so every consumer's dot over it is NaN. A finite block is
+    /// stored as always.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -205,6 +208,17 @@ mod fused_kernels {
             let nv1 = (scale * gn1) * v1;
             let nv2 = (scale * gn2) * v2;
             let nv3 = (scale * gn3) * v3;
+            let bad = !(quad_finite([nv0, nv1, nv2, nv3]) & (scale > 0.0));
+            if bad {
+                fault.raise(FaultSite::NormQuant);
+            }
+            // One warp owns the block, so the ballot refuses all of it.
+            let refused = warp::ballot(bad) != 0;
+            let (nv0, nv1, nv2, nv3) = if refused {
+                (f32::NAN, f32::NAN, f32::NAN, f32::NAN)
+            } else {
+                (nv0, nv1, nv2, nv3)
+            };
             // SAFETY: vb + 3 < base + k <= k*m <= y.len() by the launch
             // contract; each value of the column is written by exactly one
             // lane of exactly one warp.
@@ -214,11 +228,14 @@ mod fused_kernels {
                 *y.get_unchecked_mut(vb + 2) = nv2;
                 *y.get_unchecked_mut(vb + 3) = nv3;
             }
-            if !(quad_finite([nv0, nv1, nv2, nv3]) & (scale > 0.0)) {
-                fault.raise(FaultSite::NormQuant);
-            }
             let amax = warp::reduce_max_f32(nv0.abs().max(nv1.abs()).max(nv2.abs()).max(nv3.abs()));
-            let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let d = if refused {
+                f32::NAN
+            } else if amax > 0.0 {
+                amax / 127.0
+            } else {
+                1.0
+            };
             let (word, quad) = q8_quad([nv0, nv1, nv2, nv3], d);
 
             // v4 = this word's index in value order within the column (the
@@ -568,8 +585,9 @@ impl FusedKernels {
     /// `act.m() * act.k()` f32; a caller with no f32 consumer passes a
     /// buffer of that width it overwrites later in the chain. `act.k()`
     /// must be a multiple of 128 (every `Q8Act` k is a multiple of 256).
-    /// A non-finite normalized value raises `fault` (the launch's layer).
-    /// Asynchronous, allocation-free, capturable.
+    /// A non-finite normalized value raises `fault` (the launch's layer) and
+    /// its 128-value block is written as NaN: its values in `y`, its scale
+    /// in `act`. Asynchronous, allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "the launcher's inputs are the kernel's; a fault sink joined the six"

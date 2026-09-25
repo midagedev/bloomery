@@ -96,7 +96,8 @@ const _: () = assert!(KEY_TILE == 4 * MMA_NTILE && HEAD.is_multiple_of(2 * MMA_K
 /// Merge threads per head: one per dim.
 const MERGE_THREADS: u32 = HEAD as u32;
 
-/// Whether [`FlashGqaKernels::enqueue`] runs the tensor-core segment pass
+/// Whether the qwen3moe chain has [`FlashGqaKernels::enqueue_pass`] run the
+/// tensor-core segment pass
 /// ([`flash_gqa_kernels::gqa_flash_seg_mma`]) rather than the f32 scalar one
 /// ([`flash_gqa_kernels::gqa_flash_seg`]): `BLOOMERY_GQA_MMA=1` (the default)
 /// picks it, `0` the scalar pass. Read once, at first use, so a captured
@@ -760,7 +761,7 @@ mod flash_gqa_kernels {
     }
 }
 
-/// [`FlashGqaKernels::enqueue`]'s arguments: `m` rows of `n_kv · GROUP`
+/// [`FlashGqaKernels::enqueue_pass`]'s arguments: `m` rows of `n_kv · GROUP`
 /// query heads (roped, unscaled, token-major), the layer's two planes of
 /// `n_kv · ctx` rows, each row's live key count on the device (`m` of them),
 /// the partials scratch ([`partials_v_len`], [`partials_ms_len`] of `m`
@@ -793,12 +794,6 @@ impl FlashGqaKernels {
         // the module above; the launchers check its launch contracts.
         let module = unsafe { flash_gqa_kernels::load(ctx)? };
         Ok(FlashGqaKernels { module })
-    }
-
-    /// Enqueue `m` rows' attention through the pass [`gqa_mma`] names. Two
-    /// launches. Asynchronous, allocation-free, capturable.
-    pub fn enqueue(&self, stream: &CudaStream, args: GqaArgs<'_>) -> Result<(), GpuError> {
-        self.enqueue_pass(stream, args, gqa_mma())
     }
 
     /// Enqueue `m` rows' attention: the segment pass (`m · n_kv ·

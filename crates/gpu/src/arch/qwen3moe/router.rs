@@ -532,7 +532,9 @@ mod qwen3moe_router_kernels {
                 let f0 = unsafe { f32_lane_partial_1col_w32(w, x, k, row, lane) };
                 [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             } else {
-                f32_lane_partials(w, x, k, row, m_cols, lane)
+                // SAFETY: as above, with x.len() >= m_cols·k and m_cols in
+                // 1..=8 by the launch contract.
+                unsafe { f32_lane_partials(w, x, k, row, m_cols, lane) }
             };
             let sums = gemv_lane_sums(partials, m_cols);
             if lane == 0 {
@@ -579,9 +581,11 @@ mod qwen3moe_router_kernels {
     /// memory, and in block `g` for group `g` also quantized with
     /// `q8_1_quant_vals` (`norm_quant`'s tail, factored) and checked as
     /// `norm_quant` checks it: a non-finite normalized value or a scale that
-    /// is not positive raises [`FaultSite::NormQuant`] on `fault`. So the
-    /// q8_1 bytes are `norm_quant`'s, each group written by one block, and
-    /// every block holds the normed row `norm_quant` stores in `y`. Then warp
+    /// is not positive raises [`FaultSite::NormQuant`] on `fault`, and its
+    /// group is refused as `norm_quant` refuses it — NaN values in the shared
+    /// row, a NaN scale in `d8`. So the q8_1 bytes are `norm_quant`'s, each
+    /// group written by one block, and every block holds the normed row
+    /// `norm_quant` stores in `y`. Then warp
     /// 0 of block `r` computes row `r`'s logit from that shared row with the
     /// fused entry's one-token body, and the ticket and the routing follow
     /// ([`publish_route`]), a non-finite logit raising [`FaultSite::Router`]
@@ -707,6 +711,11 @@ mod qwen3moe_router_kernels {
                 (scale * gn2) * v2,
                 (scale * gn3) * v3,
             ];
+            // `norm_quant`'s refusal: one warp owns the group, so the ballot
+            // refuses all of it.
+            let bad = !(quad_finite(nv) & (scale > 0.0));
+            let refused = warp::ballot(bad) != 0;
+            let nv = if refused { [f32::NAN; 4] } else { nv };
             // SAFETY: vb + 3 < k <= NORM_K; this lane owns the four entries.
             unsafe {
                 *nr.add(vb) = nv[0];
@@ -715,7 +724,7 @@ mod qwen3moe_router_kernels {
                 *nr.add(vb + 3) = nv[3];
             }
             if b == row {
-                if !(quad_finite(nv) & (scale > 0.0)) {
+                if bad {
                     fault.raise(FaultSite::NormQuant);
                 }
                 // SAFETY: one column (col 0 < 1), b < k/128 = 2·n_sb (the
@@ -727,6 +736,12 @@ mod qwen3moe_router_kernels {
                         nv, 0, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
                         &mut d8,
                     );
+                }
+                if refused && lane == 0 {
+                    // SAFETY: the group's d8 slot b < 2·n_sb <= d8.len() (launch
+                    // contract), which lane 0 of this warp just wrote; nothing
+                    // else writes it.
+                    unsafe { *d8.get_unchecked_mut(b) = f32::NAN };
                 }
             }
             b += FUSED_WARPS;
@@ -814,7 +829,9 @@ mod qwen3moe_router_kernels {
             let f0 = unsafe { f32_lane_partial_1col_w32(w, xc, k, row, lane) };
             [f0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         } else {
-            f32_lane_partials(w, xc, k, row, m as u32, lane)
+            // SAFETY: as above, with xc holding m·k values and 1 <= m <=
+            // MAX_TOKENS = 8.
+            unsafe { f32_lane_partials(w, xc, k, row, m as u32, lane) }
         };
         let sums = gemv_lane_sums(partials, m as u32);
         if lane == 0 {

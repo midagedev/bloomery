@@ -471,8 +471,9 @@ pub fn half_to_f32(bits: u16) -> f32 {
 }
 
 /// f32 → f16 bits, round-to-nearest-even — `vcvtps2ph $0x0` on the reference build (AVX2 +
-/// F16C, not AVX-512). Subnormals and ties follow IEEE; NaN/inf collapse to inf (no NaN
-/// reaches the gated graph).
+/// F16C, not AVX-512). Subnormals, ties and infinities follow IEEE; a NaN stays a NaN of
+/// its sign (quiet, payload dropped), so a cache row or query staged from a refused value
+/// is never a plausible number.
 ///
 /// The inverse of [`half_to_f32`]: every f16 but NaN comes back as its own bits. The
 /// engine's one f32 → f16 rounding: the CPU and GPU KV caches, the GPU tensor-core query
@@ -481,13 +482,13 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let a = b & 0x7fff_ffff;
-    if a >= 0x7f80_0000 {
-        return sign | 0x7c00;
+    if a > 0x7f80_0000 {
+        return sign | 0x7e00;
     }
     let exp = ((a >> 23) as i32) - 127;
     let frac = a & 0x007f_ffff;
     if exp > 15 {
-        // Past f16's finite range; unreachable in the gated graph.
+        // Past f16's finite range, infinity included.
         return sign | 0x7c00;
     }
     if exp >= -14 {

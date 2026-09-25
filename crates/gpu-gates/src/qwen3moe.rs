@@ -247,8 +247,8 @@ impl AttnRows {
 pub mod dev {
     use super::{AttnRows, HEAD};
     use crate::GateError;
-    use bloomery_gpu::Gpu;
     use bloomery_gpu::rope_neox::{NeoxArgs, RopeNeoxKernels};
+    use bloomery_gpu::{FaultSink, Gpu};
     use cuda_core::{CudaStream, DeviceBuffer};
 
     /// What the gate fills the planes with before an append: an f16 NaN,
@@ -267,11 +267,12 @@ pub mod dev {
 
     /// Run the kernel on `rows` with gains `gq`/`gk`, tables `cs` (`m ·
     /// HEAD`), into planes of `ctx` rows per key head filled with
-    /// [`SENTINEL`].
+    /// [`SENTINEL`], raising on `fault`.
     #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
     pub fn run(
         k: &RopeNeoxKernels,
         stream: &CudaStream,
+        fault: FaultSink,
         rows: &AttnRows,
         gq: &[f32],
         gk: &[f32],
@@ -279,7 +280,7 @@ pub mod dev {
         eps: f32,
         ctx: usize,
     ) -> Result<NeoxOut, GateError> {
-        Ok(launch(k, stream, None, rows, gq, gk, cs, eps, ctx)?.0)
+        Ok(launch(k, stream, None, fault, rows, gq, gk, cs, eps, ctx)?.0)
     }
 
     /// [`run`] with the launch captured on `gpu`'s stream as a graph and
@@ -288,6 +289,7 @@ pub mod dev {
     pub fn run_graph(
         gpu: &Gpu,
         k: &RopeNeoxKernels,
+        fault: FaultSink,
         rows: &AttnRows,
         gq: &[f32],
         gk: &[f32],
@@ -295,7 +297,18 @@ pub mod dev {
         eps: f32,
         ctx: usize,
     ) -> Result<(NeoxOut, usize), GateError> {
-        launch(k, gpu.stream(), Some(gpu), rows, gq, gk, cs, eps, ctx)
+        launch(
+            k,
+            gpu.stream(),
+            Some(gpu),
+            fault,
+            rows,
+            gq,
+            gk,
+            cs,
+            eps,
+            ctx,
+        )
     }
 
     #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
@@ -303,6 +316,7 @@ pub mod dev {
         k: &RopeNeoxKernels,
         stream: &CudaStream,
         graph: Option<&Gpu>,
+        fault: FaultSink,
         rows: &AttnRows,
         gq: &[f32],
         gk: &[f32],
@@ -336,6 +350,7 @@ pub mod dev {
                     n_kv: rows.n_kv,
                     ctx,
                     m: rows.m,
+                    fault,
                     cache_k: &mut cache_k,
                     cache_v: &mut cache_v,
                 },

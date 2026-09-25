@@ -53,8 +53,22 @@
 //! the batch in one union call ([`HostExperts::experts_union_into`]). It moves
 //! no flag word and no sequence number, so the next step's handoff finds the
 //! host where the last step left it.
+//!
+//! A handoff the card should already have refused — a non-finite activation,
+//! a routed id the slot map does not know — is never computed: its host sum
+//! is NaN and the tier records it ([`Hybrid::refusal`]). A step service then
+//! fails with a [`GpuError::Protocol`] naming the layer, the row and what the
+//! host saw, and releases the stream; it never reads the card's fault word,
+//! because the card goes on to the next layer's wait, which this thread
+//! serves. The step's caller reads the word once the stream has drained and
+//! names the refusal with [`name_refusal`]: the card's fault when the card
+//! raised one at or before the layer, the host's error when it did not —
+//! never the host's own failure in place of the card's. A batch service
+//! runs after the card's event, so with the word watched
+//! ([`Hybrid::watch_fault`]) it reads the word itself.
 
 use crate::GpuError;
+use crate::fault::{FAULT_NONE, Fault, LAYER_NONE, mask_index};
 use crate::graph::cu;
 use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
@@ -1158,6 +1172,20 @@ pub struct HybridStats {
     pub batch_cols: u64,
     pub batch_host_slots: u64,
     pub batch_ns: u64,
+    /// Services, step or batch, that met input the card should already have
+    /// refused ([`Hybrid::refusal`] names the first).
+    pub refusals: u64,
+}
+
+/// Input a host service met that the card should already have refused: a
+/// routed id the slot map does not know, or a non-finite activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The service: `Hybrid::serve` or `Hybrid::serve_batch`.
+    pub what: &'static str,
+    pub layer: usize,
+    /// Where and what: `row r: …` of a step, `column j of n: …` of a batch.
+    pub detail: String,
 }
 
 /// Row 0's host slot ids of the layer its two-row pass served last — what
@@ -1255,6 +1283,14 @@ pub struct Hybrid<H> {
     /// and each column's length; grown to the widest batch served, once.
     batch_lists: Vec<(u32, f32)>,
     batch_lens: Vec<usize>,
+    /// The card's fault word once [`Hybrid::watch_fault`] has given it: what
+    /// a batch service that meets refused input reads to name the card's
+    /// fault.
+    fault: Option<Arc<DeviceBuffer<u32>>>,
+    /// The refusal that failed a service, else the first one recorded.
+    refusal: Option<Refusal>,
+    /// A step service's refusal its step's caller has not yet named.
+    step_refusal: Option<Refusal>,
 }
 
 impl<H: HostExperts> Hybrid<H> {
@@ -1279,7 +1315,49 @@ impl<H: HostExperts> Hybrid<H> {
             pair_row0: None,
             batch_lists: Vec::new(),
             batch_lens: Vec::new(),
+            fault: None,
+            refusal: None,
+            step_refusal: None,
         })
+    }
+
+    /// Watch `word`, the fault word of the `Gpu` the chain launches on
+    /// ([`crate::Gpu::fault_word`]); a word of another context is refused. A
+    /// batch service ([`Hybrid::serve_batch`]) that meets input the card
+    /// should already have refused then reads the word and fails as
+    /// [`name_refusal`] names it; unwatched, it returns with NaN in the
+    /// refused columns' sums and the refusal recorded. Step services never
+    /// read it. Load-time only.
+    pub fn watch_fault(&mut self, word: &Arc<DeviceBuffer<u32>>) -> Result<(), GpuError> {
+        let ctx = self.boundary.region.context();
+        self.fault = Some(crate::module_fault_word(ctx, word, "Hybrid::watch_fault")?);
+        Ok(())
+    }
+
+    /// The refusal that failed a service and so poisoned the tier, else the
+    /// first one a returning (unwatched batch) service recorded — what the
+    /// caller of a failed step names with [`name_refusal`] once the stream
+    /// has drained.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&Refusal> {
+        self.refusal.as_ref()
+    }
+
+    /// The refusal that failed the last step service, once: what the step's
+    /// caller names with [`name_refusal`] after the stream has drained. `None`
+    /// when the step failed for another reason, or was already named.
+    pub fn take_step_refusal(&mut self) -> Option<Refusal> {
+        self.step_refusal.take()
+    }
+
+    /// Count `r` and keep it: a service that `fails` on it poisons the tier,
+    /// so its refusal replaces any earlier one; one that returns keeps the
+    /// first.
+    fn record_refusal(&mut self, r: Refusal, fails: bool) {
+        self.stats.refusals += 1;
+        if fails || self.refusal.is_none() {
+            self.refusal = Some(r);
+        }
     }
 
     /// The boundary the chain enqueues its handoffs and waits on.
@@ -1388,13 +1466,17 @@ impl<H: HostExperts> Hybrid<H> {
     /// batch's handoffs to the host — `x`, one normed activation per column,
     /// and `ids` and `weights`, the routing, `n_used` per column in slot
     /// order — and reads the host sums back from `out`, `hidden` per column.
-    /// Column `j`'s list is its slots the slot map sends to the host or does
-    /// not know, in slot order: the list a step's service builds for that
-    /// token. A non-finite activation is undefined input the card's norm has
-    /// already raised as a fault, which the batch's readback turns into the
-    /// named error: every sum is NaN then and no host expert runs. Refused
-    /// on a poisoned tier; a failure, or a panic inside the host experts,
-    /// poisons it.
+    /// Column `j`'s list is its slots the slot map sends to the host, in slot
+    /// order: the list a step's service builds for that token. A column whose
+    /// activation is not finite, or whose routing names an id the slot map
+    /// does not know, is input the card should already have refused: its sum
+    /// is NaN and no host expert runs for it, the other columns are served
+    /// as always, the refusal is recorded, and the call fails as
+    /// [`Hybrid::watch_fault`] describes — unwatched it returns. The caller
+    /// brought the handoffs down behind the card's event, so the kernels that
+    /// wrote them have finished and a watched read of the fault word sees
+    /// what they raised. Refused on a poisoned tier; a failure, or a panic
+    /// inside the host experts, poisons it.
     pub fn serve_batch(
         &mut self,
         layer: usize,
@@ -1451,12 +1533,6 @@ impl<H: HostExperts> Hybrid<H> {
             ));
         }
         let t0 = Instant::now();
-        // A fold, not `all`: no early exit, so the test vectorizes.
-        let finite = x.data.iter().fold(true, |ok, v| ok & v.is_finite());
-        if !finite {
-            out.fill(f32::NAN);
-            return Ok(());
-        }
         let map_row = self.boundary.slots.row(layer).ok_or(GpuError::state(
             WHAT,
             "a hybrid layer without a slot map row",
@@ -1467,16 +1543,30 @@ impl<H: HostExperts> Hybrid<H> {
                 .resize(cols * EXPERTS_INTO_MAX, (0, 0.0f32));
         }
         let mut host_slots = 0u64;
+        // The first refused column and what the host saw in it.
+        let mut refused: Option<(usize, String)> = None;
         for j in 0..cols {
             let list = &mut self.batch_lists[j * EXPERTS_INTO_MAX..][..EXPERTS_INTO_MAX];
             let mut n = 0usize;
+            let mut unknown = None;
             for s in 0..n_used {
                 let (id, w) = (ids[j * n_used + s], weights[j * n_used + s]);
-                let slot = usize::try_from(id).ok().and_then(|id| map_row.get(id));
-                if slot.is_none_or(|&slot| slot == HOST) {
-                    list[n] = (id, w);
-                    n += 1;
+                match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
+                    Some(&HOST) => {
+                        list[n] = (id, w);
+                        n += 1;
+                    }
+                    Some(_) => {}
+                    None => unknown = unknown.or(Some((s, id))),
                 }
+            }
+            let saw = match unknown {
+                Some((s, id)) => Some(unknown_id(s, id, map_row.len())),
+                None => non_finite(x.col(j)),
+            };
+            if let Some(saw) = saw {
+                n = 0;
+                refused = refused.or(Some((j, saw)));
             }
             self.batch_lens[j] = n;
             host_slots += n as u64;
@@ -1486,13 +1576,50 @@ impl<H: HostExperts> Hybrid<H> {
             .enumerate()
             .map(|(j, &n)| &self.batch_lists[j * EXPERTS_INTO_MAX..][..n])
             .collect();
-        self.host.experts_union_into(layer, x, &lists, out)?;
+        let Some((first, saw)) = refused else {
+            self.host.experts_union_into(layer, x, &lists, out)?;
+            self.count_batch(cols, host_slots, t0);
+            return Ok(());
+        };
+        // The refused columns reach the host experts as zeros with an empty
+        // list, so no refused value is quantized, and come back as NaN.
+        let bad: Vec<bool> = (0..cols)
+            .map(|j| column_refusal(x.col(j), &ids[j * n_used..][..n_used], map_row).is_some())
+            .collect();
+        let mut clean = Tensor2::from_vec(hidden, cols, x.data.clone());
+        for (j, &b) in bad.iter().enumerate() {
+            if b {
+                clean.col_mut(j).fill(0.0);
+            }
+        }
+        self.host.experts_union_into(layer, &clean, &lists, out)?;
+        for (j, &b) in bad.iter().enumerate() {
+            if b {
+                out[j * hidden..][..hidden].fill(f32::NAN);
+            }
+        }
+        self.count_batch(cols, host_slots, t0);
+        let r = Refusal {
+            what: WHAT,
+            layer,
+            detail: format!("column {first} of {cols}: {saw}"),
+        };
+        let Some(word) = self.fault.clone() else {
+            self.record_refusal(r, false);
+            return Ok(());
+        };
+        self.record_refusal(r.clone(), true);
+        Err(name_refusal(&r, read_fault(&word)?))
+    }
+
+    /// A batch service's counters: `cols` columns, `host_slots` host slots,
+    /// the union call's wall time since `t0`.
+    fn count_batch(&mut self, cols: usize, host_slots: u64, t0: Instant) {
         let s = &mut self.stats;
         s.batch_served += 1;
         s.batch_cols += cols as u64;
         s.batch_host_slots += host_slots;
         s.batch_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        Ok(())
     }
 
     fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
@@ -1614,9 +1741,10 @@ impl<H: HostExperts> Hybrid<H> {
             "a hybrid layer without a slot map row",
         ))?;
         // The host's slots, in slot order: every routed id the slot map sends
-        // to the host or does not know, with its weight.
+        // to the host, with its weight.
         let mut list = [(0u32, 0.0f32); EXPERTS_INTO_MAX];
         let (mut n, mut w2_host, mut w2_all) = (0usize, 0.0f64, 0.0f64);
+        let mut unknown = None;
         for s in 0..self.boundary.shape.n_used {
             let (Some(id), Some(wb)) = (
                 page.payload_word(image_off, IDS_W + s, words),
@@ -1626,11 +1754,14 @@ impl<H: HostExperts> Hybrid<H> {
             };
             let w = f32::from_bits(wb);
             w2_all += f64::from(w) * f64::from(w);
-            let slot = usize::try_from(id).ok().and_then(|id| map_row.get(id));
-            if slot.is_none_or(|&slot| slot == HOST) {
-                list[n] = (id, w);
-                n += 1;
-                w2_host += f64::from(w) * f64::from(w);
+            match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
+                Some(&HOST) => {
+                    list[n] = (id, w);
+                    n += 1;
+                    w2_host += f64::from(w) * f64::from(w);
+                }
+                Some(_) => {}
+                None => unknown = unknown.or(Some((s, id))),
             }
         }
         if !page.payload_f32_into(image_off, X_W, words, &mut self.x.data) {
@@ -1639,25 +1770,40 @@ impl<H: HostExperts> Hybrid<H> {
                 "the activation is outside the handoff",
             ));
         }
+        // A handoff the card should already have refused — an id no slot
+        // knows, a non-finite activation (the norm that wrote it tests every
+        // value it writes) — runs no host expert: its sum is NaN, and the
+        // service fails by name; `serve` then releases the stream.
+        let saw = match unknown {
+            Some((s, id)) => Some(unknown_id(s, id, map_row.len())),
+            None => non_finite(&self.x.data),
+        };
         let hidden = self.boundary.shape.hidden;
         let out = self
             .boundary
             .page
             .f32_mut(hsum_off, hidden)
             .ok_or(GpuError::state(what, "the sum is outside the page"))?;
-        // A non-finite handoff activation is undefined input the card has
-        // already refused: the norm that wrote it tests every value it
-        // writes and raised its fault, which the step's readback turns into
-        // the named error. The host sum carries the NaN on instead of the
-        // host encoders panicking first, so that error, with its layer and
-        // site, is the one the caller sees.
-        // A fold, not `all`: no early exit, so the test vectorizes.
-        let finite = self.x.data.iter().fold(true, |ok, v| ok & v.is_finite());
-        if finite {
-            self.host.experts_into(layer, &self.x, &list[..n], out)?;
-        } else {
+        if let Some(saw) = saw {
             out.fill(f32::NAN);
+            let r = Refusal {
+                what,
+                layer,
+                detail: format!("row {row}: {saw}"),
+            };
+            let e = GpuError::protocol(
+                what,
+                format!(
+                    "host saw undefined input: layer {layer}, {}; the card's fault word is \
+                     read once the step drains",
+                    r.detail
+                ),
+            );
+            self.step_refusal = Some(r.clone());
+            self.record_refusal(r, true);
+            return Err(e);
         }
+        self.host.experts_into(layer, &self.x, &list[..n], out)?;
         self.boundary
             .page
             .word(Word::Cnt(row))
@@ -1737,6 +1883,110 @@ fn wait_go(
         generation.load(Ordering::Acquire),
         end.saturating_sub(seen_at.load(Ordering::Relaxed)),
     )
+}
+
+/// What the host saw in activation values that are not all finite: the first
+/// such value and its index. `None` when all are finite.
+fn non_finite(x: &[f32]) -> Option<String> {
+    // A fold, not `all`: no early exit, so the test vectorizes.
+    if x.iter().fold(true, |ok, v| ok & v.is_finite()) {
+        return None;
+    }
+    let (i, v) = x.iter().enumerate().find(|(_, v)| !v.is_finite())?;
+    Some(format!(
+        "the activation holds {v} at value {i} of {}",
+        x.len()
+    ))
+}
+
+/// What the host saw in a routing whose slot `slot` names `id`, an expert
+/// the slot map's `n_expert` do not include.
+fn unknown_id(slot: usize, id: u32, n_expert: usize) -> String {
+    format!("routed slot {slot} names expert {id}, past the slot map's {n_expert} experts")
+}
+
+/// What the host saw in one column — its routing `ids`, then its activation
+/// `x` — that the card should already have refused, if anything.
+fn column_refusal(x: &[f32], ids: &[u32], map_row: &[u32]) -> Option<String> {
+    ids.iter()
+        .enumerate()
+        .find(|&(_, &id)| {
+            usize::try_from(id)
+                .ok()
+                .and_then(|id| map_row.get(id))
+                .is_none()
+        })
+        .map(|(s, &id)| unknown_id(s, id, map_row.len()))
+        .or_else(|| non_finite(x))
+}
+
+/// The error the caller sees for refusal `r`, given `fault`, what the card's
+/// fault word held once every launch before the refusal had finished: the
+/// card's fault when it names `r`'s layer or an earlier one — or no layer
+/// (an unlabelled launch), which cannot be ruled out — else the host's own
+/// error, saying what the word holds. The one rule for both the step's
+/// caller and a watched batch service.
+#[must_use]
+pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
+    let word = match fault {
+        Some(fault)
+            if fault.layer == LAYER_NONE
+                || usize::try_from(fault.layer).is_ok_and(|l| l <= r.layer) =>
+        {
+            return GpuError::Fault {
+                what: r.what,
+                fault,
+            };
+        }
+        Some(f) => format!("first names {f} — later than this layer"),
+        None => "is clean".to_owned(),
+    };
+    GpuError::protocol(
+        r.what,
+        format!(
+            "host saw undefined input the card did not refuse: layer {}, {}; the card's fault \
+             word {word}",
+            r.layer, r.detail
+        ),
+    )
+}
+
+/// What the fault `word` (a `Gpu`'s fault allocation, [`FAULT_WORDS`] u32s
+/// or more) holds now: the first-layer word and that layer's site mask, each
+/// read by a synchronous copy that waits on no stream. The caller orders it —
+/// a batch service runs after the event its handoffs came down at, so every
+/// kernel that wrote them has finished.
+///
+/// [`FAULT_WORDS`]: crate::fault::FAULT_WORDS
+fn read_fault(word: &DeviceBuffer<u32>) -> Result<Option<Fault>, GpuError> {
+    word.context().bind_to_thread()?;
+    let at = |i: usize| -> Result<u32, GpuError> {
+        let mut v = FAULT_NONE;
+        // SAFETY: word `i` lies inside the allocation (`i` is 0 or a mask
+        // index of a layer at most LAYER_NONE, below FAULT_WORDS, which
+        // `module_fault_word` checked the length against); the destination
+        // is `v`, four bytes that outlive the synchronous copy; the context
+        // is current on this thread (bound above).
+        let rc = unsafe {
+            sys::cuMemcpyDtoH_v2(
+                (&raw mut v).cast(),
+                word.cu_deviceptr() + 4 * i as u64,
+                std::mem::size_of::<u32>(),
+            )
+        };
+        cu(rc, "cuMemcpyDtoH_v2 (hybrid fault word)")?;
+        Ok(v)
+    };
+    let first = at(0)?;
+    if first == FAULT_NONE {
+        return Ok(None);
+    }
+    let sites = if first >> 8 <= LAYER_NONE {
+        at(mask_index(first >> 8))?
+    } else {
+        0
+    };
+    Ok(Fault::from_words(first, sites))
 }
 
 #[cfg(test)]

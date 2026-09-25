@@ -32,7 +32,7 @@ pub use names::derived_name;
 pub use taps::{Block0Taps, LayerTaps};
 
 use crate::hybrid::{
-    Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, HybridStats, SlotMap,
+    Boundary, BoundaryShape, HostExperts, Hybrid, HybridConfig, HybridStats, Refusal, SlotMap,
 };
 use crate::model::probe::Observer;
 use crate::model::{ChainBody, GpuModel, StepKernels, StepProbe, one_shard};
@@ -435,6 +435,10 @@ impl ChainBody for Body {
             None => Ok(()),
         }
     }
+
+    fn take_host_refusal(&mut self) -> Option<Refusal> {
+        self.hybrid.as_mut().and_then(Hybrid::take_step_refusal)
+    }
 }
 
 /// The derived q_nope2 weights of every block in `layers`, from `derived`,
@@ -609,7 +613,9 @@ impl GpuModel<Body> {
         self.refresh_params(0, pos)?;
         let slot = self.layer_slot(l, what)?;
         let (gpu, w, body) = self.body_parts(what)?;
-        body.enqueue_hybrid_layer(gpu, w, slot)?;
+        let r = body.enqueue_hybrid_layer(gpu, w, slot);
+        self.name_host_refusal(r)?;
+        let (gpu, _, body) = self.body_parts(what)?;
         let stream = gpu.stream();
         let h = body
             .hybrid

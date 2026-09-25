@@ -36,9 +36,17 @@
 //! token of `l_out-12` through layer 13's `ffn_norm` and router weight and of
 //! `l_out-46` through layer 47's: the q8_1 bytes (all five planes, the scales
 //! by bits), logits, probabilities, ids and weights BIT-EQUAL, the ticket
-//! count zero. A NaN in the input raises the fault word in both, the same
-//! word. As a captured graph: one node, two replays bit-identical to the
-//! eager launch, the count zero after each.
+//! count zero. A refused input — a NaN, and a finite value whose square
+//! overflows the sum of squares — raises `NormQuant` and `Router` in both,
+//! every block's q8_1 scale NaN in both (the same bytes), and the token's
+//! routing NaN. `norm_quant` alone, labelled with layer 13, over three
+//! columns (a NaN in column 1, the overflow in column 2): `NormQuant` with
+//! that layer, the refused columns' normed values and scales NaN, column 0
+//! the clean run's bit for bit, the word clean before and after a clean
+//! run; then one column whose gain is `+inf` at value 200: only its block 1
+//! (values 128..256) is refused, every other block the clean run's. As a
+//! captured graph: one node, two replays bit-identical to the eager launch,
+//! the count zero after each.
 //!
 //! Refusals, each launch labelled with layer 13: a token with a non-finite
 //! logit raises `FaultSite::Router` with that layer, its probabilities and
@@ -70,7 +78,7 @@ mod gate {
         MAX_TOKENS, N_EXPERT, N_USED, RouterKernels, RouterOut,
     };
     use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
-    use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, Q8Act};
+    use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::qwen3moe::sets;
     use bloomery_gpu_gates::{
         GateError, bits_equal, checks_failed, open_model, open_split, ref_tensor_logical_in,
@@ -231,16 +239,22 @@ mod gate {
         a.q3 == b.q3 && a.q4 == b.q4 && a.q6 == b.q6 && a.s8 == b.s8 && bits_equal(&a.d8, &b.d8)
     }
 
-    /// Layer `l`'s FFN norm gain on the card.
-    fn ffn_gain(gpu: &Gpu, gguf: &gguf::Gguf, l: usize) -> Result<DeviceBuffer<f32>, GateError> {
+    /// Layer `l`'s FFN norm gain on the host.
+    fn ffn_gain_host(gguf: &gguf::Gguf, l: usize) -> Result<Vec<f32>, GateError> {
         let (_, b) = tensor_bytes_as(gguf, &names::ffn_norm(l), GgmlType::F32, None)?;
-        let g: Vec<f32> = b
-            .as_chunks::<4>()
+        Ok(b.as_chunks::<4>()
             .0
             .iter()
             .map(|c| f32::from_le_bytes(*c))
-            .collect();
-        Ok(DeviceBuffer::from_host(gpu.stream(), &g)?)
+            .collect())
+    }
+
+    /// Layer `l`'s FFN norm gain on the card.
+    fn ffn_gain(gpu: &Gpu, gguf: &gguf::Gguf, l: usize) -> Result<DeviceBuffer<f32>, GateError> {
+        Ok(DeviceBuffer::from_host(
+            gpu.stream(),
+            &ffn_gain_host(gguf, l)?,
+        )?)
     }
 
     /// One path's results for one token: the q8_1 of the normed row and the
@@ -316,6 +330,148 @@ mod gate {
         Ok((run, out.tickets(stream)?))
     }
 
+    /// Whether token 0's routing in `f` is refused: NaN probabilities and
+    /// weights.
+    fn routing_nan(f: &Fused) -> bool {
+        f.routed.probs[..N_EXPERT].iter().all(|v| v.is_nan())
+            && f.routed.weights[..N_USED].iter().all(|v| v.is_nan())
+    }
+
+    /// `norm_quant` over the `x.len() / gain.len()` columns `x`, raising on
+    /// `sink`: the normed values and the q8_1 planes, read back.
+    fn norm_quant_run(
+        gpu: &Gpu,
+        norm: &FusedKernels,
+        x: &[f32],
+        gain: &[f32],
+        eps: f32,
+        sink: FaultSink,
+    ) -> Result<(Vec<f32>, Q8ActHost), GateError> {
+        let stream = gpu.stream();
+        let kk = gain.len();
+        let m = x.len() / kk;
+        let mut act = Q8Act::with_k(stream, m, kk)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, m * kk)?;
+        norm.enqueue_norm_quant(
+            stream,
+            &DeviceBuffer::from_host(stream, x)?,
+            &DeviceBuffer::from_host(stream, gain)?,
+            eps,
+            &mut act,
+            &mut y,
+            sink,
+        )?;
+        stream.synchronize()?;
+        Ok((y.to_host_vec(stream)?, readback_q8act(stream, &act)?))
+    }
+
+    /// Column `c` of `m` of a plane sized for `m` columns.
+    fn col<T>(plane: &[T], m: usize, c: usize) -> &[T] {
+        let n = plane.len() / m;
+        &plane[c * n..(c + 1) * n]
+    }
+
+    /// Column `c` of `m` of two q8_1 readbacks equal plane for plane, the
+    /// scales by bits.
+    fn q8_col_equal(a: &Q8ActHost, b: &Q8ActHost, m: usize, c: usize) -> bool {
+        col(&a.q3, m, c) == col(&b.q3, m, c)
+            && col(&a.q4, m, c) == col(&b.q4, m, c)
+            && col(&a.q6, m, c) == col(&b.q6, m, c)
+            && col(&a.s8, m, c) == col(&b.s8, m, c)
+            && bits_equal(col(&a.d8, m, c), col(&b.d8, m, c))
+    }
+
+    /// `norm_quant`'s refusals (module doc), each launch labelled with
+    /// layer 13: whether they held.
+    fn norm_quant_refusals(
+        gpu: &Gpu,
+        norm: &FusedKernels,
+        rows: &[f32],
+        gain: &[f32],
+        eps: f32,
+    ) -> Result<bool, GateError> {
+        let kk = gain.len();
+        let m = 3usize;
+        if rows.len() < m * kk {
+            return Err(format!(
+                "the refusal columns want {m} tokens of {kk}, got {}",
+                rows.len()
+            )
+            .into());
+        }
+        let layer = 13usize;
+        let sink = gpu.layer_sink(layer)?;
+        let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::NormQuant));
+        let show = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+        let mut ok = true;
+
+        let x = &rows[..m * kk];
+        let before = gpu.fault()?;
+        let (yc, qc) = norm_quant_run(gpu, norm, x, gain, eps, sink)?;
+        let after_clean = gpu.fault()?;
+        let mut xb = x.to_vec();
+        xb[kk + 77] = f32::NAN;
+        xb[2 * kk + 77] = 1.0e30;
+        let finite_overflow = xb[2 * kk..].iter().all(|v| v.is_finite());
+        let (yb, qb) = norm_quant_run(gpu, norm, &xb, gain, eps, sink)?;
+        let word = gpu.take_fault()?;
+        let refused = [1usize, 2].iter().all(|&c| {
+            col(&yb, m, c).iter().all(|v| v.is_nan())
+                && col(&qb.d8, m, c).iter().all(|d| d.is_nan())
+        });
+        let clean_col = bits_equal(col(&yb, m, 0), col(&yc, m, 0)) && q8_col_equal(&qb, &qc, m, 0);
+        let (ya, qa) = norm_quant_run(gpu, norm, x, gain, eps, sink)?;
+        let clean_again =
+            bits_equal(&ya, &yc) && q8_col_equal(&qa, &qc, 1, 0) && gpu.fault()?.is_none();
+        let pass = before.is_none()
+            && after_clean.is_none()
+            && finite_overflow
+            && word == want
+            && refused
+            && clean_col
+            && clean_again;
+        println!(
+            "fault op=norm_quant m={m} column 1 NaN, column 2 finite={finite_overflow} with a square \
+             that overflows: word \"{}\" (want \"{}\", clean before {} and after the clean run {}) \
+             refused columns' normed values and scales NaN {refused}, column 0 bit-identical \
+             {clean_col}, clean rerun bits and word clean {clean_again} {}",
+            show(word),
+            show(want),
+            before.is_none(),
+            after_clean.is_none(),
+            verdict(pass)
+        );
+        ok &= pass;
+
+        // One column, its gain +inf at value 200: block 1 alone is refused.
+        let x = &rows[..kk];
+        let (yc, qc) = norm_quant_run(gpu, norm, x, gain, eps, sink)?;
+        let mut gb = gain.to_vec();
+        gb[200] = f32::INFINITY;
+        let (yb, qb) = norm_quant_run(gpu, norm, x, &gb, eps, sink)?;
+        let word = gpu.take_fault()?;
+        let block = 128..256;
+        let block_nan = yb[block.clone()].iter().all(|v| v.is_nan()) && qb.d8[1].is_nan();
+        let rest_y = bits_equal(&yb[..block.start], &yc[..block.start])
+            && bits_equal(&yb[block.end..], &yc[block.end..]);
+        let rest_q = bits_equal(&qb.d8[..1], &qc.d8[..1])
+            && bits_equal(&qb.d8[2..], &qc.d8[2..])
+            && qb.s8[..4] == qc.s8[..4]
+            && qb.s8[8..] == qc.s8[8..];
+        let clean_after = gpu.fault()?.is_none();
+        let pass = word == want && block_nan && rest_y && rest_q && clean_after;
+        println!(
+            "fault op=norm_quant gain[200]=inf: word \"{}\" (want \"{}\") block 1's normed values and \
+             scale NaN {block_nan}, other blocks' normed values {rest_y} and scales and group sums \
+             {rest_q} bit-identical, word clean after {clean_after} {}",
+            show(word),
+            show(want),
+            verdict(pass)
+        );
+        ok &= pass;
+        Ok(ok)
+    }
+
     /// The norm-fused section (module doc).
     fn norm_section(
         gpu: &Gpu,
@@ -371,9 +527,11 @@ mod gate {
                 verdict(pass)
             );
             ok &= pass;
-            last = Some((w, gain, rows[..kk].to_vec()));
+            last = Some((l, w, gain, rows));
         }
-        let (w, gain, x0) = last.ok_or("no layer ran")?;
+        let (last_l, w, gain, rows) = last.ok_or("no layer ran")?;
+        let kk = w.cols();
+        let x0 = rows[..kk].to_vec();
         let nl = NormLayer {
             w: &w,
             gain: &gain,
@@ -381,24 +539,42 @@ mod gate {
             norm: &norm,
         };
 
-        // A NaN in the input: both paths raise, the same word.
-        let mut xn = x0.clone();
-        xn[77] = f32::NAN;
-        let xn = DeviceBuffer::from_host(stream, &xn)?;
-        gpu.clear_fault()?;
-        norm_split(gpu, k, &nl, &xn, &mut out_s)?;
-        let f_split = gpu.fault()?;
-        gpu.clear_fault()?;
-        let (_, tickets) = norm_fused(gpu, k, &nl, &xn, &mut out_f)?;
-        let f_fused = gpu.fault()?;
-        gpu.clear_fault()?;
-        let pass = f_split.is_some() && f_split == f_fused && tickets == 0;
-        println!(
-            "norm nan-input: split fault={f_split:?} fused fault={f_fused:?} (want raised, equal) \
-             tickets={tickets} {}",
-            verdict(pass)
-        );
-        ok &= pass;
+        // A refused input: both paths raise the norm's site and the router's,
+        // refuse every block's scale, write the same bytes and refuse the
+        // routing.
+        let want = Some(Fault::of_sites(
+            LAYER_NONE,
+            &[FaultSite::NormQuant, FaultSite::Router],
+        ));
+        for (name, v) in [("nan", f32::NAN), ("overflow", 1.0e30f32)] {
+            let mut xn = x0.clone();
+            xn[77] = v;
+            let xn = DeviceBuffer::from_host(stream, &xn)?;
+            gpu.clear_fault()?;
+            let split = norm_split(gpu, k, &nl, &xn, &mut out_s)?;
+            let f_split = gpu.take_fault()?;
+            let (fused, tickets) = norm_fused(gpu, k, &nl, &xn, &mut out_f)?;
+            let f_fused = gpu.take_fault()?;
+            let scales_nan =
+                split.act.d8.iter().all(|d| d.is_nan()) && fused.act.d8.iter().all(|d| d.is_nan());
+            let q8_same = q8_equal(&split.act, &fused.act);
+            let refused = routing_nan(&split.routed) && routing_nan(&fused.routed);
+            let pass = f_split == want
+                && f_fused == want
+                && scales_nan
+                && q8_same
+                && refused
+                && tickets == 0;
+            println!(
+                "norm {name}-input: split fault={f_split:?} fused fault={f_fused:?} (want {want:?}) \
+                 every scale NaN {scales_nan}, q8_1 bytes equal {q8_same}, routing refused {refused}, \
+                 tickets={tickets} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let gain_host = ffn_gain_host(gguf, last_l)?;
+        ok &= norm_quant_refusals(gpu, &norm, &rows, &gain_host, eps)?;
 
         // The graph: one node, two replays equal to the eager launch.
         let x = DeviceBuffer::from_host(stream, &x0)?;
