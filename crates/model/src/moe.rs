@@ -30,7 +30,7 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Weight, matmul_q,
+    DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Tensor2View, Weight, matmul_q,
     matmul_q_group, matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
     matmul_q_group_swiglu_into,
 };
@@ -948,11 +948,26 @@ fn serve(
     Ok(())
 }
 
-/// The most token columns a union scratch can be made for
+/// The most token columns a batch's union scratch can be made for
 /// ([`UnionScratch::new`]): one prefill ubatch. A call takes at most the
 /// columns its scratch was made for ([`experts_union_into`],
-/// [`HostLayer::experts_union_into`]).
+/// [`HostLayer::experts_union_into`]); a group tail's scratch is the one
+/// exception ([`UnionScratch::new_tail`]).
 pub const UNION_MAX_COLS: usize = 512;
+
+/// The most batches of [`UNION_MAX_COLS`] a group tail's scratch spans
+/// ([`UnionScratch::new_tail`]): the batches that pass one layer together
+/// before its tail experts run once over all their columns.
+pub const UNION_TAIL_MAX_GROUPS: usize = 8;
+
+/// The most columns a group tail's scratch can be made for.
+pub const UNION_TAIL_MAX_COLS: usize = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
+
+/// The listed slots — (expert, column) pairs, a column once per expert — of
+/// one batch at its worst, every column listing [`EXPERTS_INTO_MAX`] experts:
+/// the least slot budget a group tail's scratch takes, so any batch's columns
+/// fit it.
+pub const UNION_BATCH_SLOTS: usize = UNION_MAX_COLS * EXPERTS_INTO_MAX;
 
 /// Distinct experts per dispatch pair of a union call: their gate and up
 /// fill the group bookkeeping's inline block and their downs fit the claim
@@ -1041,6 +1056,13 @@ impl UnionPlan {
     fn cols(&self, d: usize) -> &[usize] {
         &self.cols[self.off[d]..self.off[d + 1]]
     }
+
+    /// Whether the plan runs through blocks of `blk_cols` columns and a store
+    /// of `slots` down columns: no expert carries more columns, and the plan
+    /// holds no more slots.
+    fn fits(&self, blk_cols: usize, slots: usize) -> bool {
+        self.cols.len() <= slots && self.off.windows(2).all(|w| w[1] - w[0] <= blk_cols)
+    }
 }
 
 /// The blocks a union call writes, made once for a layer shape and a column
@@ -1056,10 +1078,28 @@ impl UnionPlan {
 /// `4 · embd · EXPERTS_INTO_MAX · cols` of store, a few words per slot and,
 /// from the first call wider than [`DEFER_MAX_COLS`], `cols` quantized
 /// columns of `embd` values (`qdot::col_bytes` each, about `embd` bytes).
+///
+/// A batch's scratch ([`UnionScratch::new`]) takes up to [`UNION_MAX_COLS`]
+/// columns and is sized for their worst: blocks of `cols` columns, a store of
+/// `EXPERTS_INTO_MAX · cols` slots. A group tail's ([`UnionScratch::new_tail`])
+/// takes up to [`UNION_TAIL_MAX_COLS`] and is sized by a slot budget instead:
+/// blocks of one batch's width, a store of the budget's slots. A tail call
+/// whose plan fits both — no expert past a block, no more slots than the
+/// store — runs as one call; one that does not runs as consecutive calls of
+/// [`UNION_MAX_COLS`] columns, each of which fits, and is counted
+/// ([`UnionScratch::cut_calls`]). Either way a column's bits are the ones any
+/// call that lists it the same way writes.
 pub struct UnionScratch {
     embd: usize,
     ff: usize,
     max_cols: usize,
+    /// The most columns one expert's blocks take.
+    blk_cols: usize,
+    /// The store's down columns: the most slots one call's plan may hold.
+    max_slots: usize,
+    /// Calls that did not fit the blocks or the store and ran cut into
+    /// calls of [`UNION_MAX_COLS`] columns.
+    cut_calls: u64,
     /// `[gate_0, up_0, gate_1, up_1, ..]` of the chunk, `{ff, m}` each.
     gate_up: [Tensor2; 2 * UNION_CHUNK],
     /// The chunk's combines, `{ff, m}` each.
@@ -1076,9 +1116,9 @@ pub struct UnionScratch {
 }
 
 impl UnionScratch {
-    /// Blocks for calls of up to `cols` columns over experts that map
-    /// `embd -> ff -> embd`; `cols` outside `1..=UNION_MAX_COLS` is a named
-    /// error.
+    /// Blocks for a batch's calls, up to `cols` columns over experts that
+    /// map `embd -> ff -> embd`; `cols` outside `1..=UNION_MAX_COLS` is a
+    /// named error.
     pub fn new(embd: usize, ff: usize, cols: usize) -> Result<UnionScratch, ModelError> {
         if cols == 0 || cols > UNION_MAX_COLS {
             return Err(ModelError::Shape {
@@ -1089,22 +1129,96 @@ impl UnionScratch {
                 got_ne1: cols,
             });
         }
-        Ok(UnionScratch {
+        Ok(UnionScratch::with_caps(
+            embd,
+            ff,
+            cols,
+            cols,
+            cols * EXPERTS_INTO_MAX,
+        ))
+    }
+
+    /// Blocks for a group tail's call: the columns of `groups` batches of
+    /// [`UNION_MAX_COLS`] in one call, so each expert it lists is read once
+    /// for all of them, over a store of `slots` down columns — the budget,
+    /// from [`UNION_BATCH_SLOTS`] (so a batch's columns always fit) to every
+    /// slot of the columns. `groups` outside `1..=UNION_TAIL_MAX_GROUPS` or a
+    /// budget outside that range is a named error. A call through it may take
+    /// fewer columns (a short last batch), and batch calls fit it too.
+    pub fn new_tail(
+        embd: usize,
+        ff: usize,
+        groups: usize,
+        slots: usize,
+    ) -> Result<UnionScratch, ModelError> {
+        if groups == 0 || groups > UNION_TAIL_MAX_GROUPS {
+            return Err(ModelError::Shape {
+                what: "host union tail scratch: 1..=UNION_TAIL_MAX_GROUPS batches",
+                want_ne0: embd,
+                want_ne1: UNION_TAIL_MAX_GROUPS,
+                got_ne0: embd,
+                got_ne1: groups,
+            });
+        }
+        let cols = groups * UNION_MAX_COLS;
+        if !(UNION_BATCH_SLOTS..=cols * EXPERTS_INTO_MAX).contains(&slots) {
+            return Err(ModelError::Shape {
+                what: "host union tail scratch: UNION_BATCH_SLOTS..=EXPERTS_INTO_MAX · columns slots",
+                want_ne0: UNION_BATCH_SLOTS,
+                want_ne1: cols * EXPERTS_INTO_MAX,
+                got_ne0: slots,
+                got_ne1: groups,
+            });
+        }
+        Ok(UnionScratch::with_caps(
+            embd,
+            ff,
+            cols,
+            UNION_MAX_COLS,
+            slots,
+        ))
+    }
+
+    /// `cols` columns a call, blocks of `blk_cols`, a store of `slots`.
+    fn with_caps(
+        embd: usize,
+        ff: usize,
+        cols: usize,
+        blk_cols: usize,
+        slots: usize,
+    ) -> UnionScratch {
+        UnionScratch {
             embd,
             ff,
             max_cols: cols,
-            gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, cols)),
-            pars: std::array::from_fn(|_| Tensor2::zeros(ff, cols)),
-            downs: std::array::from_fn(|_| Tensor2::zeros(embd, cols)),
-            store: vec![0.0; embd * cols * EXPERTS_INTO_MAX],
+            blk_cols,
+            max_slots: slots,
+            cut_calls: 0,
+            gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, blk_cols)),
+            pars: std::array::from_fn(|_| Tensor2::zeros(ff, blk_cols)),
+            downs: std::array::from_fn(|_| Tensor2::zeros(embd, blk_cols)),
+            store: vec![0.0; embd * slots],
             xq: QuantizedCols::new(),
             plan: UnionPlan::with_room(cols),
-        })
+        }
     }
 
     /// The most columns a call through this scratch takes.
     pub fn max_cols(&self) -> usize {
         self.max_cols
+    }
+
+    /// The most slots one call runs as a whole: a batch's scratch holds its
+    /// columns' every slot, a tail's its budget.
+    pub fn max_slots(&self) -> usize {
+        self.max_slots
+    }
+
+    /// Calls through this scratch that did not fit it and ran as calls of
+    /// [`UNION_MAX_COLS`] columns, since it was made. A batch's scratch never
+    /// cuts one.
+    pub fn cut_calls(&self) -> u64 {
+        self.cut_calls
     }
 }
 
@@ -1112,43 +1226,44 @@ impl UnionScratch {
 /// scratch's columns, one list per column of `x`, `out` holding every
 /// column's width, and the scratch made for the block's widths.
 fn check_union_call(
-    x: &Tensor2,
+    x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &[f32],
     ff: usize,
     scratch: &UnionScratch,
 ) -> Result<(), ModelError> {
-    if x.ne1 > scratch.max_cols {
+    let (embd, cols) = (x.ne0(), x.ne1());
+    if cols > scratch.max_cols {
         return Err(ModelError::Shape {
             what: "host union: at most the columns the scratch was made for",
-            want_ne0: x.ne0,
+            want_ne0: embd,
             want_ne1: scratch.max_cols,
-            got_ne0: x.ne0,
-            got_ne1: x.ne1,
+            got_ne0: embd,
+            got_ne1: cols,
         });
     }
-    if x.ne1 != lists.len() {
+    if cols != lists.len() {
         return Err(ModelError::Shape {
             what: "host union: x must have one column per list",
-            want_ne0: x.ne0,
+            want_ne0: embd,
             want_ne1: lists.len(),
-            got_ne0: x.ne0,
-            got_ne1: x.ne1,
+            got_ne0: embd,
+            got_ne1: cols,
         });
     }
-    if out.len() != x.ne0 * x.ne1 {
+    if out.len() != embd * cols {
         return Err(ModelError::Shape {
             what: "host union: out must hold every column's width",
-            want_ne0: x.ne0,
-            want_ne1: x.ne1,
+            want_ne0: embd,
+            want_ne1: cols,
             got_ne0: out.len(),
             got_ne1: 1,
         });
     }
-    if (scratch.embd, scratch.ff) != (x.ne0, ff) {
+    if (scratch.embd, scratch.ff) != (embd, ff) {
         return Err(ModelError::Shape {
             what: "host union: the scratch must be made for the block's widths",
-            want_ne0: x.ne0,
+            want_ne0: embd,
             want_ne1: ff,
             got_ne0: scratch.embd,
             got_ne1: scratch.ff,
@@ -1180,12 +1295,57 @@ thread_local! {
 /// [`GroupInput::Cols`]) — the same bytes either way. A chunk's downs are copied to the
 /// store before the next chunk reuses their blocks, and each column's sum
 /// runs last, in that column's list order from zero — the order its
-/// one-column call adds in. `resolve` gives an expert's `[gate, up, down]`;
-/// `lists` has been checked against `x`, `out` and the scratch.
+/// one-column call adds in. Nothing here depends on the call's width but
+/// which experts share a chunk and a dispatch, so a column's bits are the
+/// same in a call of any width that lists it the same way (a group tail's
+/// included). A plan past the scratch's blocks or store — a tail call over
+/// its slot budget — runs as consecutive calls of [`UNION_MAX_COLS`]
+/// columns, each within both, and counts in [`UnionScratch::cut_calls`].
+/// `resolve` gives an expert's `[gate, up, down]`; `lists` has been checked
+/// against `x`, `out` and the scratch.
 fn serve_union<'w>(
     resolve: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
     limit: Option<f32>,
-    x: &Tensor2,
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    s: &mut UnionScratch,
+) -> Result<(), ModelError> {
+    s.plan.build(lists)?;
+    if s.plan.fits(s.blk_cols, s.max_slots) {
+        return serve_planned(&resolve, limit, x, lists, out, s);
+    }
+    s.cut_calls += 1;
+    let embd = x.ne0();
+    let mut c0 = 0;
+    while c0 < lists.len() {
+        let c1 = (c0 + UNION_MAX_COLS).min(lists.len());
+        let part = Tensor2View::new(&x.data()[c0 * embd..c1 * embd], embd, c1 - c0)?;
+        s.plan.build(&lists[c0..c1])?;
+        assert!(
+            s.plan.fits(s.blk_cols, s.max_slots),
+            "host union: a batch's columns fit every scratch (blocks of UNION_MAX_COLS or more, \
+             a store of UNION_BATCH_SLOTS or more)"
+        );
+        serve_planned(
+            &resolve,
+            limit,
+            part,
+            &lists[c0..c1],
+            &mut out[c0 * embd..c1 * embd],
+            s,
+        )?;
+        c0 = c1;
+    }
+    Ok(())
+}
+
+/// [`serve_union`] for a plan already built into `s.plan` from `lists`,
+/// which fits its blocks and store.
+fn serve_planned<'w>(
+    resolve: &impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+    limit: Option<f32>,
+    x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
     s: &mut UnionScratch,
@@ -1200,14 +1360,13 @@ fn serve_union<'w>(
         plan,
         ..
     } = s;
-    plan.build(lists)?;
     let lvl = profile::level();
     let (mut x_ns, mut h_ns) = (0u64, 0u64);
-    let embd = x.ne0;
+    let embd = x.ne0();
     // Only a call wider than any claim takes: the decode and verify shapes
     // keep their claimed, per-dispatch quantization untouched.
     let mut filled = false;
-    if x.ne1 > DEFER_MAX_COLS && plan.n() > 0 {
+    if x.ne1() > DEFER_MAX_COLS && plan.n() > 0 {
         let t_x = if lvl > 0 { Some(Instant::now()) } else { None };
         let gate = resolve(plan.ids[0])?[0];
         filled = xq.fill(gate.ty(), x, *max_cols);
@@ -1259,7 +1418,7 @@ fn serve_union<'w>(
         )?;
         let combines: [GroupInput<'_>; UNION_CHUNK] = std::array::from_fn(|i| {
             if i >= n {
-                return GroupInput::Ready(x);
+                return GroupInput::Cols(x, &[]);
             }
             let (gate, up) = (&gate_up[2 * i], &gate_up[2 * i + 1]);
             match limit {
@@ -1393,24 +1552,27 @@ fn stash_downs(blocks: &[Tensor2], off: &[usize], embd: usize, store: &mut [f32]
 }
 
 /// [`experts_into`] for many tokens at once — up to the columns `scratch` was
-/// made for, at most [`UNION_MAX_COLS`]: column `j` of `x` with its routed
-/// list `lists[j]` into `out[j·embd..(j+1)·embd]`, equal to
+/// made for, at most [`UNION_MAX_COLS`] (a group tail's scratch,
+/// [`UNION_TAIL_MAX_COLS`]): column `j` of `x` with its routed list
+/// `lists[j]` into `out[j·embd..(j+1)·embd]`, equal to
 /// `experts_into(x_j, lists[j])` bit for bit, while each distinct expert's
 /// matrices are read once for every column that lists it (see
-/// [`serve_union`]). A list holds at most [`EXPERTS_INTO_MAX`] experts; that
-/// bound, the column bound, a list count other than `x`'s columns, an `out`
-/// of another length and an expert id past the block's are named errors. The
-/// dispatches write into the caller's `scratch`, made at load for the block's
-/// widths and a column count ([`UnionScratch::new`]), so a call allocates
-/// nothing.
-pub fn experts_union_into(
+/// [`serve_union`]). `x` is a block ([`Tensor2`]) or any view of `k` columns
+/// ([`Tensor2View`]), read in place. A list holds at most
+/// [`EXPERTS_INTO_MAX`] experts; that bound, the column bound, a list count
+/// other than `x`'s columns, an `out` of another length and an expert id past
+/// the block's are named errors. The dispatches write into the caller's
+/// `scratch`, made at load for the block's widths and a column count
+/// ([`UnionScratch::new`]), so a call allocates nothing.
+pub fn experts_union_into<'x>(
     gguf: &Gguf,
     plan: &MoeBlockPlan,
-    x: &Tensor2,
+    x: impl Into<Tensor2View<'x>>,
     lists: &[&[(u32, f32)]],
     out: &mut [f32],
     scratch: &mut UnionScratch,
 ) -> Result<(), ModelError> {
+    let x = x.into();
     check_union_call(x, lists, out, plan.meta.ff, scratch)?;
     let view = |views: &[TensorInfo], e: u32| -> Result<Weight<'_>, ModelError> {
         Weight::in_file(gguf, expert_of(views, e, plan.block)?)
@@ -1571,15 +1733,16 @@ impl HostLayer {
     /// was made for, column `j` of `out` equal to
     /// [`HostLayer::experts_into`] of column `j` of `x` and `lists[j]` bit
     /// for bit, each distinct expert's matrices read once per call from the
-    /// shard that holds them.
-    pub fn experts_union_into(
+    /// shard that holds them. `x` is read in place, a block or a view.
+    pub fn experts_union_into<'x>(
         &self,
         split: &Split,
-        x: &Tensor2,
+        x: impl Into<Tensor2View<'x>>,
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
+        let x = x.into();
         check_union_call(x, lists, out, self.gate.info().dims[1] as usize, scratch)?;
         serve_union(
             |e| {

@@ -667,8 +667,8 @@ pub struct FfnBatch {
     act_sh: Vec<Q8Act>,
     sh_raw: DeviceBuffer<f32>,
     /// The exchange: page-locked copies of the activations, the routing and
-    /// the host sums; the host's view of the activations the union reads;
-    /// the event the route's copies complete at.
+    /// the host sums, the union reading the activations in place; the event
+    /// the route's copies complete at.
     /// The grouped arm's block buffers ([`CardExperts::Expert`]): per token
     /// the norm's q8_1 planes the gate·up reads (q3 and d8, as the chunk's
     /// scratch lays out a column), per slot the SwiGLU output, its q8_1 form
@@ -686,7 +686,6 @@ pub struct FfnBatch {
     host_ids: PinnedHostBuffer<u32>,
     host_w: PinnedHostBuffer<f32>,
     host_sum: PinnedHostBuffer<f32>,
-    x_host: Tensor2,
     routed: CudaEvent,
     /// [`FfnBatch::serve`]'s host time since the last
     /// [`FfnBatch::take_serve_times`]: the waits on the route's copies and
@@ -835,11 +834,6 @@ impl FfnBatch {
             })?,
             host_w: pinned("cuMemAllocHost (the batch's routing)", cap * N_USED)?,
             host_sum: pinned("cuMemAllocHost (the batch's host sums)", cap * n_embd)?,
-            x_host: Tensor2 {
-                ne0: n_embd,
-                ne1: cap,
-                data: vec![0.0; cap * n_embd],
-            },
             routed: ctx.new_event(None)?,
             wait_ns: 0,
             copy_ns: 0,
@@ -992,18 +986,15 @@ impl FfnBatch {
         self.routed.synchronize()?;
         let t1 = Instant::now();
         let n = self.n_embd;
-        self.x_host.ne1 = u - at;
-        self.x_host.data.clear();
-        self.x_host
-            .data
-            .extend_from_slice(&self.host_x[at * n..u * n]);
+        let x = Tensor2View::new(&self.host_x[at * n..u * n], n, u - at)?;
         self.wait_ns += nanos(t1 - t0);
         self.copy_ns += nanos(t1.elapsed());
         hybrid.serve_batch(
             layer,
-            &self.x_host,
+            x,
             &self.host_ids[at * N_USED..u * N_USED],
             &self.host_w[at * N_USED..u * N_USED],
+            &[],
             &mut self.host_sum[at * n..u * n],
         )
     }

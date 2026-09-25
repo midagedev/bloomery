@@ -50,7 +50,11 @@
 //! An eager batch of prompt tokens is served outside that protocol
 //! ([`Hybrid::serve_batch`]): the chain brings the batch's handoffs to the host
 //! itself, and one service computes a layer's host experts for every token of
-//! the batch in one union call ([`HostExperts::experts_union_into`]). It moves
+//! the batch in one union call ([`HostExperts::experts_union_into`]), reading
+//! the activations where the chain landed them. A service takes a set of
+//! host experts to leave out — those the card computes from a stream, or
+//! those a group's tail call computes once over several batches' columns —
+//! and its columns may span more than one batch (that tail call). It moves
 //! no flag word and no sequence number, so the next step's handoff finds the
 //! host where the last step left it.
 //!
@@ -73,10 +77,10 @@ use crate::graph::cu;
 use crate::tensor::window;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use gguf::Split;
-use model::Tensor2;
 use model::moe::EXPERTS_INTO_MAX;
 use model::placement::host_lock::{HostLock, HostSet, Walk};
 use model::placement::{ModelTensor, Plan};
+use model::{Tensor2, Tensor2View};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -1106,12 +1110,16 @@ pub trait HostExperts {
 
     /// The batch form: `lists[j]` for column `j` of `x`, its sum over
     /// `out[j · width ..][.. width]`, each column bit for bit what
-    /// [`HostExperts::experts_into`] writes for that column and list alone. An
-    /// architecture without a batched host path refuses, by name.
+    /// [`HostExperts::experts_into`] writes for that column and list alone —
+    /// whatever the call's width, so a call over several batches' columns
+    /// writes what their calls one batch at a time would. `x` is a view of
+    /// the columns where they already are. A width past what the
+    /// architecture's scratch holds is refused by name, and so is any call
+    /// by an architecture without a batched host path.
     fn experts_union_into(
         &mut self,
         layer: usize,
-        x: &Tensor2,
+        x: Tensor2View<'_>,
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
@@ -1166,12 +1174,17 @@ pub struct HybridStats {
     /// over any span of whole passes.
     pub pair_row1_slots: u64,
     /// Batch services ([`Hybrid::serve_batch`]): layers served, the columns
-    /// they carried, the host slots those columns listed, and the host wall
-    /// time of the union calls (ns), summed. None of them counts above.
+    /// they carried, the host slots those columns listed and the service
+    /// computed, and the host wall time of the union calls (ns), summed. None
+    /// of them counts above.
     pub batch_served: u64,
     pub batch_cols: u64,
     pub batch_host_slots: u64,
     pub batch_ns: u64,
+    /// Of the host slots batch services' columns listed, those whose expert
+    /// was in the service's exclusion set and so not computed, summed. A
+    /// refused column counts in neither this nor `batch_host_slots`.
+    pub batch_excluded_slots: u64,
     /// Services, step or batch, that met input the card should already have
     /// refused ([`Hybrid::refusal`] names the first).
     pub refusals: u64,
@@ -1461,34 +1474,39 @@ impl<H: HostExperts> Hybrid<H> {
         Ok(())
     }
 
-    /// Serve layer `layer` for an eager batch of `x.ne1` tokens in one union
-    /// call, outside the go/wait protocol: the caller has brought the
+    /// Serve layer `layer` for an eager batch of `x.ne1()` tokens in one
+    /// union call, outside the go/wait protocol: the caller has brought the
     /// batch's handoffs to the host — `x`, one normed activation per column,
-    /// and `ids` and `weights`, the routing, `n_used` per column in slot
-    /// order — and reads the host sums back from `out`, `hidden` per column.
-    /// Column `j`'s list is its slots the slot map sends to the host, in slot
-    /// order: the list a step's service builds for that token. A column whose
-    /// activation is not finite, or whose routing names an id the slot map
-    /// does not know, is input the card should already have refused: its sum
-    /// is NaN and no host expert runs for it, the other columns are served
-    /// as always, the refusal is recorded, and the call fails as
-    /// [`Hybrid::watch_fault`] describes — unwatched it returns. The caller
-    /// brought the handoffs down behind the card's event, so the kernels that
-    /// wrote them have finished and a watched read of the fault word sees
-    /// what they raised. Refused on a poisoned tier; a failure, or a panic
-    /// inside the host experts, poisons it.
+    /// read where they landed, and `ids` and `weights`, the routing, `n_used`
+    /// per column in slot order — and reads the host sums back from `out`,
+    /// `hidden` per column. Column `j`'s list is its slots the slot map sends
+    /// to the host, in slot order, less those whose expert is in `exclude`:
+    /// the list a step's service builds for that token when `exclude` is
+    /// empty. `exclude` names experts of the layer's stack the slot map sends
+    /// to the host, strictly ascending; an unsorted set, an id twice, an id
+    /// past the stack or one of the card's is refused by name before anything
+    /// runs. A column whose activation is not finite, or whose routing names
+    /// an id the slot map does not know, is input the card should already
+    /// have refused: its sum is NaN and no host expert runs for it, the other
+    /// columns are served as always, the refusal is recorded, and the call
+    /// fails as [`Hybrid::watch_fault`] describes — unwatched it returns. The
+    /// caller brought the handoffs down behind the card's event, so the
+    /// kernels that wrote them have finished and a watched read of the fault
+    /// word sees what they raised. Refused on a poisoned tier; a failure, or a
+    /// panic inside the host experts, poisons it.
     pub fn serve_batch(
         &mut self,
         layer: usize,
-        x: &Tensor2,
+        x: Tensor2View<'_>,
         ids: &[u32],
         weights: &[f32],
+        exclude: &[u32],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Hybrid::serve_batch";
         self.refuse_if_poisoned(WHAT)?;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.serve_batch_one(layer, x, ids, weights, out)
+            self.serve_batch_one(layer, x, ids, weights, exclude, out)
         }));
         match r {
             Ok(Ok(())) => Ok(()),
@@ -1506,15 +1524,16 @@ impl<H: HostExperts> Hybrid<H> {
     fn serve_batch_one(
         &mut self,
         layer: usize,
-        x: &Tensor2,
+        x: Tensor2View<'_>,
         ids: &[u32],
         weights: &[f32],
+        exclude: &[u32],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Hybrid::serve_batch";
         let (hidden, n_used) = (self.boundary.shape.hidden, self.boundary.shape.n_used);
-        let cols = x.ne1;
-        if x.ne0 != hidden
+        let cols = x.ne1();
+        if x.ne0() != hidden
             || cols == 0
             || ids.len() != cols * n_used
             || weights.len() != cols * n_used
@@ -1525,7 +1544,7 @@ impl<H: HostExperts> Hybrid<H> {
                 format!(
                     "{cols} columns of {} values with {} ids, {} weights and {} sums; the \
                      boundary carries {n_used} slots of {hidden} values a column",
-                    x.ne0,
+                    x.ne0(),
                     ids.len(),
                     weights.len(),
                     out.len()
@@ -1537,21 +1556,23 @@ impl<H: HostExperts> Hybrid<H> {
             WHAT,
             "a hybrid layer without a slot map row",
         ))?;
+        check_exclude(exclude, map_row, layer)?;
         if self.batch_lens.len() < cols {
             self.batch_lens.resize(cols, 0);
             self.batch_lists
                 .resize(cols * EXPERTS_INTO_MAX, (0, 0.0f32));
         }
-        let mut host_slots = 0u64;
+        let (mut host_slots, mut excluded) = (0u64, 0u64);
         // The first refused column and what the host saw in it.
         let mut refused: Option<(usize, String)> = None;
         for j in 0..cols {
             let list = &mut self.batch_lists[j * EXPERTS_INTO_MAX..][..EXPERTS_INTO_MAX];
-            let mut n = 0usize;
+            let (mut n, mut out_of_set) = (0usize, 0u64);
             let mut unknown = None;
             for s in 0..n_used {
                 let (id, w) = (ids[j * n_used + s], weights[j * n_used + s]);
                 match usize::try_from(id).ok().and_then(|id| map_row.get(id)) {
+                    Some(&HOST) if exclude.binary_search(&id).is_ok() => out_of_set += 1,
                     Some(&HOST) => {
                         list[n] = (id, w);
                         n += 1;
@@ -1565,11 +1586,12 @@ impl<H: HostExperts> Hybrid<H> {
                 None => non_finite(x.col(j)),
             };
             if let Some(saw) = saw {
-                n = 0;
+                (n, out_of_set) = (0, 0);
                 refused = refused.or(Some((j, saw)));
             }
             self.batch_lens[j] = n;
             host_slots += n as u64;
+            excluded += out_of_set;
         }
         let lists: Vec<&[(u32, f32)]> = self.batch_lens[..cols]
             .iter()
@@ -1578,7 +1600,7 @@ impl<H: HostExperts> Hybrid<H> {
             .collect();
         let Some((first, saw)) = refused else {
             self.host.experts_union_into(layer, x, &lists, out)?;
-            self.count_batch(cols, host_slots, t0);
+            self.count_batch(cols, host_slots, excluded, t0);
             return Ok(());
         };
         // The refused columns reach the host experts as zeros with an empty
@@ -1586,19 +1608,20 @@ impl<H: HostExperts> Hybrid<H> {
         let bad: Vec<bool> = (0..cols)
             .map(|j| column_refusal(x.col(j), &ids[j * n_used..][..n_used], map_row).is_some())
             .collect();
-        let mut clean = Tensor2::from_vec(hidden, cols, x.data.clone());
+        let mut clean = Tensor2::from_vec(hidden, cols, x.data().to_vec());
         for (j, &b) in bad.iter().enumerate() {
             if b {
                 clean.col_mut(j).fill(0.0);
             }
         }
-        self.host.experts_union_into(layer, &clean, &lists, out)?;
+        self.host
+            .experts_union_into(layer, clean.view(), &lists, out)?;
         for (j, &b) in bad.iter().enumerate() {
             if b {
                 out[j * hidden..][..hidden].fill(f32::NAN);
             }
         }
-        self.count_batch(cols, host_slots, t0);
+        self.count_batch(cols, host_slots, excluded, t0);
         let r = Refusal {
             what: WHAT,
             layer,
@@ -1612,13 +1635,15 @@ impl<H: HostExperts> Hybrid<H> {
         Err(name_refusal(&r, read_fault(&word)?))
     }
 
-    /// A batch service's counters: `cols` columns, `host_slots` host slots,
-    /// the union call's wall time since `t0`.
-    fn count_batch(&mut self, cols: usize, host_slots: u64, t0: Instant) {
+    /// A batch service's counters: `cols` columns, `host_slots` host slots
+    /// computed and `excluded` left out by the call's set, the union call's
+    /// wall time since `t0`.
+    fn count_batch(&mut self, cols: usize, host_slots: u64, excluded: u64, t0: Instant) {
         let s = &mut self.stats;
         s.batch_served += 1;
         s.batch_cols += cols as u64;
         s.batch_host_slots += host_slots;
+        s.batch_excluded_slots += excluded;
         s.batch_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
     }
 
@@ -1897,6 +1922,47 @@ fn non_finite(x: &[f32]) -> Option<String> {
         "the activation holds {v} at value {i} of {}",
         x.len()
     ))
+}
+
+/// A batch service's exclusion set against layer `layer`'s slot map row
+/// `map_row`: strictly ascending, so no id twice, and every id one of the
+/// layer's experts that the map sends to the host. A set that breaks any of
+/// these is a caller's bug — an expert it names would be computed twice or
+/// never — and is refused by name.
+fn check_exclude(exclude: &[u32], map_row: &[u32], layer: usize) -> Result<(), GpuError> {
+    let what = "Hybrid::serve_batch";
+    if let Some(p) = exclude.windows(2).find(|p| p[0] >= p[1]) {
+        let why = if p[0] == p[1] {
+            format!("expert {} twice", p[0])
+        } else {
+            format!("expert {} after {}: the set must ascend", p[1], p[0])
+        };
+        return Err(GpuError::shape(
+            what,
+            format!("exclusion set of layer {layer}: {why}"),
+        ));
+    }
+    for &e in exclude {
+        match usize::try_from(e).ok().and_then(|i| map_row.get(i)) {
+            Some(&HOST) => {}
+            Some(_) => {
+                return Err(GpuError::shape(
+                    what,
+                    format!("exclusion set of layer {layer}: expert {e} is on the card"),
+                ));
+            }
+            None => {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "exclusion set of layer {layer}: expert {e} past the layer's {} experts",
+                        map_row.len()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What the host saw in a routing whose slot `slot` names `id`, an expert

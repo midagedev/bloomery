@@ -29,7 +29,7 @@ pub mod ops;
 pub mod placement;
 pub mod profile;
 
-pub use ops::Tensor2;
+pub use ops::{Tensor2, Tensor2View};
 
 /// Which sequence and which position a token occupies. See decision 2 above — this pair is
 /// the KV key, and it exists from the first line so a speculative branch has somewhere to go.

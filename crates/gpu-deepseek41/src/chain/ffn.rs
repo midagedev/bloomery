@@ -71,10 +71,10 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use gguf::{GgmlType, Split};
-use model::Tensor2;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
 use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
+use model::{Tensor2, Tensor2View};
 
 use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
@@ -1497,7 +1497,7 @@ impl HostExperts for Ds41Host {
     fn experts_union_into(
         &mut self,
         layer: usize,
-        x: &Tensor2,
+        x: Tensor2View<'_>,
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {

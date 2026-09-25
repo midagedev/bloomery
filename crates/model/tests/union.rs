@@ -39,6 +39,23 @@
 //! other than `x`'s columns, a list past `EXPERTS_INTO_MAX`, an `out` of
 //! another length and a scratch made for other widths.
 //!
+//! The group tail — one call over up to `UNION_TAIL_MAX_GROUPS` batches'
+//! columns through a scratch sized by a slot budget (`UnionScratch::new_tail`)
+//! — is held to the calls one batch at a time (`UNION_MAX_COLS` columns each,
+//! views at their offsets into the same columns), column for column and bit
+//! for bit, on the same two layers under both deferral arms: eight full
+//! batches, and three with the last one 300 columns short. Its lists are a
+//! group tail's — each column's experts drawn from a skewed curve over the
+//! layer's, cut to the cold half in list order — so most experts carry a few
+//! columns spread over several batches and the one call chunks its experts
+//! unlike any batch call. Both run whole; a uniform routing of every column
+//! over the layer's experts, past the budget, and a routing of every column
+//! to one of four experts, under the budget but each expert past a batch's
+//! columns, run cut into batch calls and are counted
+//! (`UnionScratch::cut_calls`). The tail scratch's refusals (no
+//! batch or too many, a budget under one batch's worst or past its columns')
+//! join the refusals below.
+//!
 //! PIN(2026-09-25): removed — the "union past UNION_MAX" refusal: the scratch
 //! keeps down columns per listed slot, so no distinct-expert bound exists and
 //! the per-list and column bounds are the only ones a call can reach.
@@ -52,8 +69,11 @@ mod v41set;
 use gguf::Split;
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
-use model::moe::{EXPERTS_INTO_MAX, HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
-use model::ops::{self, Tensor2};
+use model::moe::{
+    EXPERTS_INTO_MAX, HostLayer, HostScratch, UNION_BATCH_SLOTS, UNION_CHUNK, UNION_MAX_COLS,
+    UNION_TAIL_MAX_GROUPS, UnionScratch,
+};
+use model::ops::{self, Tensor2, Tensor2View};
 use model::placement::workstation;
 
 /// The oracle set and the ik tree it was dumped from.
@@ -76,6 +96,13 @@ const ROUTED_K: usize = UNION_MAX_COLS;
 
 /// The deferral arms: the claim inside the row dispatch, then the pre-pass.
 const ARMS: [(&str, bool); 2] = [("defer", true), ("prepass", false)];
+
+/// The group tails the gate runs: batches of `UNION_MAX_COLS`, and the
+/// columns the last one lacks.
+const TAILS: [(usize, usize); 2] = [(UNION_TAIL_MAX_GROUPS, 0), (3, 300)];
+
+/// The tail scratch's slot budget here: two batches at their worst.
+const TAIL_SLOTS: usize = 2 * UNION_BATCH_SLOTS;
 
 /// One case: `k` columns and their lists.
 struct Case {
@@ -202,6 +229,24 @@ fn refusals(layer: &HostLayer, split: &Split, embd: usize, ff: usize, us: &mut U
                 "scratch columns outside 1..=UNION_MAX_COLS",
             ),
             "1..=UNION_MAX_COLS columns",
+        );
+    }
+    for groups in [0, UNION_TAIL_MAX_GROUPS + 1] {
+        check(
+            refusal(
+                UnionScratch::new_tail(embd, ff, groups, UNION_BATCH_SLOTS).map(|_| ()),
+                "tail scratch batches outside 1..=UNION_TAIL_MAX_GROUPS",
+            ),
+            "1..=UNION_TAIL_MAX_GROUPS batches",
+        );
+    }
+    for slots in [UNION_BATCH_SLOTS - 1, 2 * UNION_BATCH_SLOTS + 1] {
+        check(
+            refusal(
+                UnionScratch::new_tail(embd, ff, 2, slots).map(|_| ()),
+                "tail scratch slots outside UNION_BATCH_SLOTS..=EXPERTS_INTO_MAX · columns",
+            ),
+            "UNION_BATCH_SLOTS..=EXPERTS_INTO_MAX · columns slots",
         );
     }
 
@@ -614,6 +659,211 @@ fn hw_union_wide_matches_per_column_v41() {
         "PASSED: union wide — experts_union_into equals experts_into column for column, bit for \
          bit, at k = 16, 64, 512 (the last over every expert of the layer) and a routed k = 512 \
          on a Q5_K-down and a Q4_K-down layer under both deferral arms"
+    );
+}
+
+/// A group tail's case of `cols` columns on one layer: column `j` is token
+/// `j % n_tokens` of `x_all` scaled by `1 + j/(4k)`; its `n_used` distinct
+/// experts are drawn by rank from weights `1/(rank + 1)` over a shuffled order
+/// of the layer's `n_expert`, at weights in [0.05, 0.3), and the list keeps
+/// those of the cold half's ranks in draw order; every 13th list (from column
+/// 2) that kept one and has room repeats its first at a negative weight.
+fn tail_case(x_all: &[f32], embd: usize, cols: usize, n_expert: usize, n_used: usize) -> Case {
+    let n_tokens = x_all.len() / embd;
+    let mut rng = Stream(0x7a11_0000 ^ cols as u64);
+    let mut order: Vec<u32> = (0..n_expert as u32).collect();
+    for i in (1..order.len()).rev() {
+        let j = (rng.next() % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    let mut cdf = Vec::with_capacity(n_expert);
+    let mut acc = 0.0f64;
+    for r in 0..n_expert {
+        acc += 1.0 / (r as f64 + 1.0);
+        cdf.push(acc);
+    }
+    let cold = n_expert / 2;
+    let mut data = Vec::with_capacity(cols * embd);
+    let mut lists = Vec::with_capacity(cols);
+    for j in 0..cols {
+        let scale = 1.0 + j as f32 / (4 * cols) as f32;
+        let t = j % n_tokens;
+        data.extend(x_all[t * embd..(t + 1) * embd].iter().map(|&v| v * scale));
+        let mut ranks: Vec<usize> = Vec::with_capacity(n_used);
+        let mut l: Vec<(u32, f32)> = Vec::with_capacity(EXPERTS_INTO_MAX);
+        while ranks.len() < n_used {
+            let u = f64::from(rng.unit()) * acc;
+            let r = cdf.partition_point(|&c| c <= u).min(n_expert - 1);
+            if ranks.contains(&r) {
+                continue;
+            }
+            ranks.push(r);
+            let w = 0.05 + 0.25 * rng.unit();
+            if r >= cold {
+                l.push((order[r], w));
+            }
+        }
+        if j % 13 == 2 && !l.is_empty() && l.len() < EXPERTS_INTO_MAX {
+            l.push((l[0].0, -0.5));
+        }
+        lists.push(l);
+    }
+    Case {
+        x: Tensor2::from_vec(embd, cols, data),
+        lists,
+    }
+}
+
+/// `case` through the calls one batch at a time: `UNION_MAX_COLS` columns a
+/// call, each a view of `case.x` at its offset, through `us`, concatenated.
+fn batch_calls(layer: &HostLayer, split: &Split, case: &Case, us: &mut UnionScratch) -> Vec<f32> {
+    let (embd, k) = (case.x.ne0, case.x.ne1);
+    let lists = case.slices();
+    let mut want = vec![f32::NAN; embd * k];
+    for c0 in (0..k).step_by(UNION_MAX_COLS) {
+        let c1 = (c0 + UNION_MAX_COLS).min(k);
+        let x = Tensor2View::new(&case.x.data[c0 * embd..c1 * embd], embd, c1 - c0)
+            .unwrap_or_else(|e| panic!("view of columns {c0}..{c1}: {e}"));
+        layer
+            .experts_union_into(
+                split,
+                x,
+                &lists[c0..c1],
+                &mut want[c0 * embd..c1 * embd],
+                us,
+            )
+            .unwrap_or_else(|e| panic!("batch call of columns {c0}..{c1}: {e}"));
+    }
+    want
+}
+
+/// Experts of `case` whose columns fall in more than one batch of
+/// `UNION_MAX_COLS`.
+fn experts_across_batches(case: &Case) -> usize {
+    let mut batches: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+    for (j, l) in case.lists.iter().enumerate() {
+        for &(e, _) in l {
+            let b = batches.entry(e).or_default();
+            if !b.contains(&(j / UNION_MAX_COLS)) {
+                b.push(j / UNION_MAX_COLS);
+            }
+        }
+    }
+    batches.values().filter(|b| b.len() > 1).count()
+}
+
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shards and $BLOOMERY_DATA/ref_deepseek41"]
+fn hw_union_tail_matches_batches_v41() {
+    let path = workstation::model_v41();
+    let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
+    let set = v41set::Set::open(&split, SET, BUILD);
+    let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
+    let n_tokens = set
+        .shapes
+        .get("ffn_norm-0")
+        .expect("the set has ffn_norm-0")[1];
+    let mut us = UnionScratch::new(embd, ff, UNION_MAX_COLS).expect("a scratch of UNION_MAX_COLS");
+    let mut tail = UnionScratch::new_tail(embd, ff, UNION_TAIL_MAX_GROUPS, TAIL_SLOTS)
+        .expect("a tail scratch of UNION_TAIL_MAX_GROUPS batches");
+    let mut picked: Vec<(usize, HostLayer)> = Vec::new();
+    for l in 0..hp.n_layer {
+        let Some(layer) = host::layer(&split, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
+        else {
+            continue;
+        };
+        let ty = layer.stacks()[2].info().ty;
+        if picked.iter().all(|(_, p)| p.stacks()[2].info().ty != ty) {
+            picked.push((l, layer));
+        }
+    }
+    assert!(
+        picked.len() >= 2,
+        "the gate wants a Q5_K-down and a Q4_K-down routed layer, the file gives {}",
+        picked.len()
+    );
+    let t0 = std::time::Instant::now();
+    let mut failed: Vec<(usize, usize, &str)> = Vec::new();
+    let mut spread = true;
+    let mut whole_and_cut = true;
+    for (l, layer) in &picked {
+        let n_expert = layer.n_expert();
+        let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
+        let mut cases: Vec<(Case, bool)> = TAILS
+            .iter()
+            .map(|&(g, short)| {
+                let cols = g * UNION_MAX_COLS - short;
+                (tail_case(&x_all, embd, cols, n_expert, n_used), false)
+            })
+            .collect();
+        let wide = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
+        // Past the store: every slot of every column.
+        cases.push((routed_case(&x_all, embd, wide, n_expert, n_used), true));
+        // Past the blocks: one slot a column, each of four experts listed by
+        // about a quarter of the columns.
+        cases.push((routed_case(&x_all, embd, wide, 4, 1), true));
+        for (case, cut) in &cases {
+            let k = case.x.ne1;
+            let lists = case.slices();
+            let across = experts_across_batches(case);
+            let mut line = format!(
+                "layer={l} down={:?} k={k} slots={} union={} max_cols_per_expert={} \
+                 experts_across_batches={across}",
+                layer.stacks()[2].info().ty,
+                case.slots(),
+                case.union(),
+                max_cols_per_expert(case)
+            );
+            if !cut {
+                spread &= across > 0 && case.union() > UNION_CHUNK;
+            }
+            let mut diff = 0;
+            for (arm, on) in ARMS {
+                ops::set_defer_quant(Some(on));
+                let want = batch_calls(layer, &split, case, &mut us);
+                let cuts = tail.cut_calls();
+                let mut got = vec![f32::NAN; embd * k];
+                let r = layer.experts_union_into(&split, &case.x, &lists, &mut got, &mut tail);
+                ops::set_defer_quant(None);
+                r.unwrap_or_else(|e| panic!("layer {l} tail k {k} {arm}: {e}"));
+                let ran_cut = tail.cut_calls() == cuts + 1;
+                whole_and_cut &= ran_cut == *cut && tail.cut_calls() <= cuts + 1;
+                let d = diff_cells(&got, &want);
+                line += &format!(
+                    " {arm}: {} diff_cells={d}",
+                    if ran_cut { "cut" } else { "whole" }
+                );
+                if d != 0 {
+                    failed.push((*l, k, arm));
+                }
+                diff += d;
+            }
+            println!("{line} {}", if diff == 0 { "PASS" } else { "FAIL" });
+        }
+    }
+    println!("union tail: wall {:.1} s", t0.elapsed().as_secs_f64());
+    assert!(
+        spread,
+        "a tail case must spread experts over several batches and chunk more than UNION_CHUNK"
+    );
+    assert!(
+        whole_and_cut,
+        "the tail cases must run whole and the routings past the store or the blocks cut, once a \
+         call"
+    );
+    assert!(
+        failed.is_empty(),
+        "{} (layer, k, arm) tail calls differ from their batch calls: {failed:?}",
+        failed.len()
+    );
+    println!(
+        "PASSED: union tail — one call over {} and {} columns through a tail scratch of {TAIL_SLOTS} \
+         slots equals the calls one batch at a time, column for column, bit for bit, on a Q5_K-down \
+         and a Q4_K-down layer under both deferral arms; a routing past the budget, or with an \
+         expert past a batch's columns, runs cut into batch calls, counted",
+        TAILS[0].0 * UNION_MAX_COLS - TAILS[0].1,
+        TAILS[1].0 * UNION_MAX_COLS - TAILS[1].1
     );
 }
 

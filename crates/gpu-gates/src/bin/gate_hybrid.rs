@@ -48,6 +48,16 @@
 //! residual through `step_layer_hybrid` returns the card's fault at that
 //! layer, with one refusal recorded by the host tier.
 //!
+//! And the batch service's exclusion set, on the same stub boundary: a
+//! service given a set of host experts computes, for every column, what the
+//! stub writes for that column's host list less the set, bit for bit; the
+//! excluded slots it counts, the host slots it counts and the experts the
+//! stub ran are exactly the set's and its complement's — for the empty set
+//! (today's service), a few ids, most of the host's and all of them, and for
+//! the few ids again over more columns than one batch (a group tail's
+//! width). A set out of order, naming an id twice, past the layer's experts
+//! or one on the card is refused by name before any expert runs.
+//!
 //! Printed and not judged: the host tier's counters (services, the host's
 //! share of the routed weight², the host leg, pool parks inside a service,
 //! services whose go was already there) and the allocations per steady
@@ -100,8 +110,8 @@ mod gate {
     use cuda_core::DeviceBuffer;
     use cuda_core::sys;
     use gguf::{GgmlType, Gguf, Split};
-    use model::Tensor2;
     use model::arch::deepseek2::derived::Derived;
+    use model::{Tensor2, Tensor2View};
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -763,13 +773,14 @@ mod gate {
         fn experts_union_into(
             &mut self,
             layer: usize,
-            x: &Tensor2,
+            x: Tensor2View<'_>,
             lists: &[&[(u32, f32)]],
             out: &mut [f32],
         ) -> Result<(), GpuError> {
+            let n = x.ne0();
             for (j, list) in lists.iter().enumerate() {
-                let col = Tensor2::from_vec(x.ne0, 1, x.col(j).to_vec());
-                self.experts_into(layer, &col, list, &mut out[j * x.ne0..][..x.ne0])?;
+                let col = Tensor2::from_vec(n, 1, x.col(j).to_vec());
+                self.experts_into(layer, &col, list, &mut out[j * n..][..n])?;
             }
             Ok(())
         }
@@ -1061,8 +1072,9 @@ mod gate {
         let bw: Vec<f32> = (0..cols).flat_map(|_| w).collect();
         let batch = |h: &mut Hybrid<Stub>, bx: &[f32], bi: &[u32]| {
             let mut out = vec![0.0f32; cols * R_HIDDEN];
-            let t = Tensor2::from_vec(R_HIDDEN, cols, bx.to_vec());
-            let r = h.serve_batch(R_LAYER, &t, bi, &bw, &mut out);
+            let r = Tensor2View::new(bx, R_HIDDEN, cols)
+                .map_err(GpuError::from)
+                .and_then(|t| h.serve_batch(R_LAYER, t, bi, &bw, &[], &mut out));
             (r, out)
         };
         let mut h = refusal_tier(&gpu, true)?;
@@ -1161,8 +1173,128 @@ mod gate {
         Ok(ok)
     }
 
+    /// The exclusion arm's column counts: a few, and past one batch — a
+    /// group tail's width.
+    const X_COLS: usize = 40;
+    const X_WIDE: usize = model::moe::UNION_MAX_COLS + 188;
+
+    /// Column `j`'s routing on the stub boundary: six distinct ids, card and
+    /// host mixed in an order that moves with `j`; every seventh column from
+    /// the fourth all card (an empty host list), every seventh from the sixth
+    /// all host (a full one).
+    fn x_ids(j: usize) -> [u32; R_USED] {
+        let id = |v: usize| u32::try_from(v).expect("ids below R_EXPERTS fit u32");
+        match j % 7 {
+            3 => std::array::from_fn(|s| id((j + s) % R_CARD)),
+            5 => std::array::from_fn(|s| id(R_CARD + (j + s) % (R_EXPERTS - R_CARD))),
+            _ => std::array::from_fn(|s| id((5 * j + 3 * s) % R_EXPERTS)),
+        }
+    }
+
+    /// Column `j`'s routing weights, one per slot, spread so a list's sum
+    /// depends on its order.
+    fn x_weights(j: usize) -> [f32; R_USED] {
+        std::array::from_fn(|s| 0.05 + 0.04 * ((j + s) % 7) as f32)
+    }
+
+    /// One exclusion case: the served sums against the stub's own over each
+    /// column's host list less `set`, and the three counts. `cols` columns.
+    fn exclusion_case(gpu: &Gpu, cols: usize, set: &[u32]) -> Result<bool, GateError> {
+        let x = bloomery_gpu_gates::activations(R_HIDDEN, cols, 57);
+        let ids: Vec<u32> = (0..cols).flat_map(x_ids).collect();
+        let w: Vec<f32> = (0..cols).flat_map(x_weights).collect();
+        let mut want = vec![0.0f32; cols * R_HIDDEN];
+        let (mut kept, mut left) = (0usize, 0usize);
+        let mut stub = Stub::default();
+        for j in 0..cols {
+            let host: Vec<(u32, f32)> = (0..R_USED)
+                .map(|s| (ids[j * R_USED + s], w[j * R_USED + s]))
+                .filter(|&(e, _)| e as usize >= R_CARD)
+                .collect();
+            left += host.iter().filter(|(e, _)| set.contains(e)).count();
+            let list: Vec<(u32, f32)> =
+                host.into_iter().filter(|(e, _)| !set.contains(e)).collect();
+            kept += list.len();
+            let col = Tensor2::from_vec(R_HIDDEN, 1, x[j * R_HIDDEN..][..R_HIDDEN].to_vec());
+            stub.experts_into(R_LAYER, &col, &list, &mut want[j * R_HIDDEN..][..R_HIDDEN])?;
+        }
+        let mut h = refusal_tier(gpu, false)?;
+        let mut out = vec![f32::NAN; cols * R_HIDDEN];
+        let r = h.serve_batch(
+            R_LAYER,
+            Tensor2View::new(&x, R_HIDDEN, cols)?,
+            &ids,
+            &w,
+            set,
+            &mut out,
+        );
+        let st = h.stats();
+        let sums = r.is_ok() && bits_equal(&out, &want);
+        let counts = st.batch_served == 1
+            && st.batch_excluded_slots == left as u64
+            && st.batch_host_slots == kept as u64
+            && h.host_mut().experts == kept;
+        let pass = sums && counts;
+        println!(
+            "exclusion cols={cols} set={set:?}: answer {} sums = the stub's over each host list less \
+             the set {sums}; excluded {} (want {left}) host {} (want {kept}) stub experts {} {}",
+            show(&r),
+            st.batch_excluded_slots,
+            st.batch_host_slots,
+            h.host_mut().experts,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The batch service's exclusion set (module doc): whether every case held.
+    fn exclusion_arm() -> Result<bool, GateError> {
+        let gpu = Gpu::new()?;
+        let host: Vec<u32> = (R_CARD..R_EXPERTS)
+            .map(|e| u32::try_from(e).expect("ids below R_EXPERTS fit u32"))
+            .collect();
+        let mut ok = true;
+        for set in [&[][..], &[9, 12], &[8, 10, 11, 13, 14, 15], &host[..]] {
+            ok &= exclusion_case(&gpu, X_COLS, set)?;
+        }
+        ok &= exclusion_case(&gpu, X_WIDE, &[9, 12])?;
+        let past = u32::try_from(R_EXPERTS)?;
+        let refused = [
+            (&[12u32, 9][..], "expert 9 after 12: the set must ascend"),
+            (&[9, 9], "expert 9 twice"),
+            (&[9, past], "past the layer's 16 experts"),
+            (&[3, 9], "expert 3 is on the card"),
+        ];
+        let x = bloomery_gpu_gates::activations(R_HIDDEN, X_COLS, 57);
+        let ids: Vec<u32> = (0..X_COLS).flat_map(x_ids).collect();
+        let w: Vec<f32> = (0..X_COLS).flat_map(x_weights).collect();
+        for (set, want) in refused {
+            let mut h = refusal_tier(&gpu, false)?;
+            let mut out = vec![0.0f32; X_COLS * R_HIDDEN];
+            let view = Tensor2View::new(&x, R_HIDDEN, X_COLS)?;
+            let r = h.serve_batch(R_LAYER, view, &ids, &w, set, &mut out);
+            let named =
+                matches!(&r, Err(e @ GpuError::Shape { .. }) if e.to_string().contains(want));
+            let none_ran = h.host_mut().experts == 0 && h.stats().batch_served == 0;
+            let poisoned = h
+                .serve_batch(R_LAYER, view, &ids, &w, &[], &mut out)
+                .is_err_and(|e| e.to_string().contains("an earlier hybrid service failed"));
+            let pass = named && none_ran && poisoned;
+            println!(
+                "exclusion refused set={set:?}: answer \"{}\" names \"{want}\" {named}, no expert ran \
+                 {none_ran}, the tier refuses the next service {poisoned} {}",
+                show(&r),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        println!("exclusion verdict {}", verdict(ok));
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let refusals = refusal_arm()?;
+        let exclusion = exclusion_arm()?;
         let lv = levers()?;
         if lv.n_l.is_some() {
             return Err("gate_hybrid: BLOOMERY_HYBRID_NL is set — the all-card reference must load all-card; unset it".into());
@@ -1213,7 +1345,7 @@ mod gate {
             let token = *p.tokens.last().ok_or("gate_hybrid: empty prompt")?;
             chains.push(all_card_chain(&mut a, token, n_layers)?);
         }
-        let mut ok = refusals;
+        let mut ok = refusals & exclusion;
         match steady(&mut a, prompts[0].tokens[0]) {
             Ok(allocs) => println!("all_card steady allocs_per_step={allocs:.2} (graph mode)"),
             Err(e) => {
@@ -1302,7 +1434,8 @@ mod gate {
                  card's slots unchanged, the host's slots zero and the host sum inside the error model's band, \
                  and leaves the all-card argmax only inside the flip band; the overlap lever changes the order \
                  and nothing else; a handoff the card should have refused names the card's fault, or says the \
-                 card raised nothing."
+                 card raised nothing; a batch service leaves exactly its exclusion set's slots off the host, \
+                 over one batch or more, and refuses a malformed set by name."
             );
             Ok(())
         } else {

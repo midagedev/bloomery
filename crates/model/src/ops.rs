@@ -228,6 +228,90 @@ impl Tensor2 {
         self.data.resize(n, if poison() { f32::NAN } else { 0.0 });
         self.ne1 = ne1;
     }
+
+    /// The whole block as a [`Tensor2View`]. A block whose `data` does not
+    /// hold `ne0 · ne1` values (the fields are public) panics by name.
+    pub fn view(&self) -> Tensor2View<'_> {
+        assert!(
+            self.ne0.checked_mul(self.ne1) == Some(self.data.len()),
+            "Tensor2::view: {} values for [{}, {}]",
+            self.data.len(),
+            self.ne0,
+            self.ne1
+        );
+        Tensor2View {
+            ne0: self.ne0,
+            ne1: self.ne1,
+            data: &self.data,
+        }
+    }
+}
+
+/// A borrowed block in [`Tensor2`]'s layout: `ne1` columns of `ne0`
+/// contiguous values, column `t` at `data[t·ne0..(t + 1)·ne0]`. Made over any
+/// slice of exactly `ne0 · ne1` values ([`Tensor2View::new`]) — a window of a
+/// page-locked buffer, say — or lent by a block ([`Tensor2::view`]). Every
+/// read through it is a read of that slice, so a view of a block reads what
+/// the block holds, value for value.
+#[derive(Clone, Copy, Debug)]
+pub struct Tensor2View<'a> {
+    ne0: usize,
+    ne1: usize,
+    data: &'a [f32],
+}
+
+impl<'a> Tensor2View<'a> {
+    /// `ne1` columns of `ne0` values over `data`; a `data` of any other
+    /// length is refused by name.
+    pub fn new(
+        data: &'a [f32],
+        ne0: usize,
+        ne1: usize,
+    ) -> Result<Tensor2View<'a>, crate::ModelError> {
+        if ne0.checked_mul(ne1) != Some(data.len()) {
+            return Err(crate::ModelError::Shape {
+                what: "Tensor2View: data must hold ne0 · ne1 values",
+                want_ne0: ne0,
+                want_ne1: ne1,
+                got_ne0: data.len(),
+                got_ne1: 1,
+            });
+        }
+        Ok(Tensor2View { ne0, ne1, data })
+    }
+
+    /// Values per column.
+    pub fn ne0(self) -> usize {
+        self.ne0
+    }
+
+    /// Columns.
+    pub fn ne1(self) -> usize {
+        self.ne1
+    }
+
+    /// Every value, column after column.
+    pub fn data(self) -> &'a [f32] {
+        self.data
+    }
+
+    /// Column `i`, i.e. token `i`'s `ne0` contiguous values.
+    pub fn col(self, i: usize) -> &'a [f32] {
+        &self.data[i * self.ne0..(i + 1) * self.ne0]
+    }
+
+    /// The same block: the same first value's address and the same shape —
+    /// the identity a group's quantization sharing keys on.
+    pub(crate) fn same_block(self, other: Tensor2View<'_>) -> bool {
+        std::ptr::eq(self.data.as_ptr(), other.data.as_ptr())
+            && (self.ne0, self.ne1) == (other.ne0, other.ne1)
+    }
+}
+
+impl<'a> From<&'a Tensor2> for Tensor2View<'a> {
+    fn from(t: &'a Tensor2) -> Tensor2View<'a> {
+        t.view()
+    }
 }
 
 /// An f32 tensor straight from the file — norm gains, router biases, anything the quantizer left alone; the crate's one little-endian byte walk.
@@ -326,19 +410,19 @@ enum QuantCols {
 
 impl QuantCols {
     /// A buffer for one distinct input of `ne1` columns, off the pool.
-    fn new(cb: Option<usize>, x: &Tensor2) -> QuantCols {
+    fn new(cb: Option<usize>, x: SlotBlock<'_>) -> QuantCols {
         // Stale contents, like `Tensor2::scratch`; poisoned the same way, so a
         // quantizer that leaves a byte of its column unwritten shows in the gates.
         match cb {
             Some(cb) => {
-                let mut buf = take_u8(x.ne1 * cb);
+                let mut buf = take_u8(x.ne1() * cb);
                 if poison() {
                     buf.fill(0xA5);
                 }
                 QuantCols::Bytes { cb, buf }
             }
             None => {
-                let mut buf = take_f32(x.data.len());
+                let mut buf = take_f32(x.len());
                 if poison() {
                     buf.fill(f32::NAN);
                 }
@@ -514,13 +598,15 @@ pub enum GroupInput<'a> {
     /// block, and every pair that reads it shares that one quantization; a
     /// column past `x` is refused by name. The row loop dots each weight row
     /// against the listed columns only, so pairs of one expert over
-    /// different token subsets read the weight once each.
-    Cols(&'a Tensor2, &'a [usize]),
+    /// different token subsets read the weight once each. `x` is a view:
+    /// the caller's own storage, a window of it, or a block's
+    /// ([`Tensor2::view`]).
+    Cols(Tensor2View<'a>, &'a [usize]),
     /// (`x`, `xq`, `cols`) — [`GroupInput::Cols`] of `x` whose columns `xq`
     /// already holds quantized (filled from this `x`, in the encoding the
     /// pair's weight type reads): the pair reads `xq`'s bytes and no dispatch
     /// quantizes `x`. Any other block or encoding is refused by name.
-    Quantized(&'a Tensor2, &'a QuantizedCols, &'a [usize]),
+    Quantized(Tensor2View<'a>, &'a QuantizedCols, &'a [usize]),
     /// (`gate`, `up`) — `silu(gate) · up` feeds the pair's weight.
     Swiglu(&'a Tensor2, &'a Tensor2),
     /// (`gate`, `up`, `limit`) — `clamp(up, ±limit) · min(silu(gate), limit)`
@@ -532,10 +618,11 @@ pub enum GroupInput<'a> {
 impl<'a> GroupInput<'a> {
     /// The block whose shape is the pair's input shape: the ready block, or
     /// the gate the combine is made from.
-    fn shape_of(self) -> &'a Tensor2 {
+    fn shape_of(self) -> Tensor2View<'a> {
         match self {
-            GroupInput::Ready(x) | GroupInput::Cols(x, _) | GroupInput::Quantized(x, _, _) => x,
-            GroupInput::Swiglu(gate, _) | GroupInput::SwigluClamp(gate, _, _) => gate,
+            GroupInput::Cols(x, _) | GroupInput::Quantized(x, _, _) => x,
+            GroupInput::Ready(x) => x.view(),
+            GroupInput::Swiglu(gate, _) | GroupInput::SwigluClamp(gate, _, _) => gate.view(),
         }
     }
 
@@ -550,7 +637,7 @@ impl<'a> GroupInput<'a> {
 
     /// The columns the pair's output has.
     fn out_cols(self) -> usize {
-        self.cols().map_or(self.shape_of().ne1, <[usize]>::len)
+        self.cols().map_or(self.shape_of().ne1(), <[usize]>::len)
     }
 
     /// The combine this input stands for — gate, up and the clamp limit — or
@@ -602,16 +689,16 @@ impl QuantizedCols {
     /// columns is reserved the first time, so a later fill of up to that many
     /// allocates nothing. `false` (and nothing held): `ty` has no fused
     /// kernel at `x`'s width, or `x` has no column.
-    pub(crate) fn fill(&mut self, ty: GgmlType, x: &Tensor2, room: usize) -> bool {
+    pub(crate) fn fill(&mut self, ty: GgmlType, x: Tensor2View<'_>, room: usize) -> bool {
         self.key = None;
-        let k = x.ne0;
-        if x.ne1 == 0 || !qdot::fuses(ty, k) {
+        let (k, ne1) = (x.ne0(), x.ne1());
+        if ne1 == 0 || !qdot::fuses(ty, k) {
             return false;
         }
         let cb = qdot::col_bytes(ty, k);
         self.buf
-            .reserve_exact((room.max(x.ne1) * cb).saturating_sub(self.buf.len()));
-        self.buf.resize(x.ne1 * cb, 0);
+            .reserve_exact((room.max(ne1) * cb).saturating_sub(self.buf.len()));
+        self.buf.resize(ne1 * cb, 0);
         // Poisoned like a dispatch's own buffer, so an unwritten byte shows.
         if poison() {
             self.buf.fill(0xA5);
@@ -620,11 +707,11 @@ impl QuantizedCols {
             cb,
             ptr: self.buf.as_mut_ptr(),
         };
-        // SAFETY (construction site): `buf` holds `x.ne1 · cb` bytes, borrowed
+        // SAFETY (construction site): `buf` holds `ne1 · cb` bytes, borrowed
         // for the whole dispatch; each participant writes only the columns of
-        // its own chunk of `0..x.ne1`, the chunks partition them, and the join
+        // its own chunk of `0..ne1`, the chunks partition them, and the join
         // publishes the writes.
-        threads::pool().for_each_chunk(x.ne1, |cols| {
+        threads::pool().for_each_chunk(ne1, |cols| {
             for t in cols {
                 // SAFETY: column `t` is in this participant's chunk — see the construction site.
                 unsafe { shared.quantize_into(ty, k, x.col(t), t) };
@@ -633,9 +720,9 @@ impl QuantizedCols {
         self.key = Some(QuantKey {
             ty,
             k,
-            ne1: x.ne1,
+            ne1,
             cb,
-            src: x.data.as_ptr() as usize,
+            src: x.data().as_ptr() as usize,
         });
         true
     }
@@ -653,9 +740,9 @@ impl QuantizedCols {
     }
 
     /// Whether the bytes were filled from `x`.
-    fn is_of(&self, x: &Tensor2) -> bool {
+    fn is_of(&self, x: Tensor2View<'_>) -> bool {
         self.key
-            .is_some_and(|q| (q.src, q.k, q.ne1) == (x.data.as_ptr() as usize, x.ne0, x.ne1))
+            .is_some_and(|q| (q.src, q.k, q.ne1) == (x.data().as_ptr() as usize, x.ne0(), x.ne1()))
     }
 
     /// The read view a pair's rows take; nothing writes through it — a slot
@@ -1119,14 +1206,16 @@ fn group_core(
         Inputs::Mixed(srcs) => {
             defer_quant()
                 && n_pairs <= MAX_DEFER_SLOTS
-                && srcs.iter().all(|s| s.shape_of().ne1 <= entry.defer_cols())
+                && srcs
+                    .iter()
+                    .all(|s| s.shape_of().ne1() <= entry.defer_cols())
         }
     };
     // A union chunk of a prefill ubatch: an input wider than any claim takes,
     // so the group is on the pre-pass arm whatever the lever says. Narrower
     // groups — every decode and verify call — never set it.
-    let wide =
-        entry == Entry::Cols && (0..n_pairs).any(|i| inputs.get(i).shape_of().ne1 > DEFER_MAX_COLS);
+    let wide = entry == Entry::Cols
+        && (0..n_pairs).any(|i| inputs.get(i).shape_of().ne1() > DEFER_MAX_COLS);
     // Who writes a combine's par: the claimant (deferred), the pre-pass
     // column by column (wide), or the caller before the dispatch.
     let caller_combines = !defer && !wide;
@@ -1171,23 +1260,23 @@ fn group_core(
         let (ty, k, n) = ws.shape(i);
         let src = inputs.get(i);
         let xin = src.shape_of();
-        if xin.ne0 != k {
+        if xin.ne0() != k {
             return Err(crate::ModelError::Shape {
                 what: "matmul_q input",
                 want_ne0: k,
-                want_ne1: xin.ne1,
-                got_ne0: xin.ne0,
-                got_ne1: xin.ne1,
+                want_ne1: xin.ne1(),
+                got_ne0: xin.ne0(),
+                got_ne1: xin.ne1(),
             });
         }
         if let Some(&c) = src
             .cols()
-            .and_then(|cols| cols.iter().find(|&&c| c >= xin.ne1))
+            .and_then(|cols| cols.iter().find(|&&c| c >= xin.ne1()))
         {
             return Err(crate::ModelError::Shape {
                 what: "group cols: a listed column past the block",
                 want_ne0: k,
-                want_ne1: xin.ne1,
+                want_ne1: xin.ne1(),
                 got_ne0: k,
                 got_ne1: c,
             });
@@ -1211,7 +1300,7 @@ fn group_core(
         // pre-pass (wide) or here on the caller — the same call either way,
         // into the pair's par.
         let (x, swiglu) = match src.combine() {
-            None => (xin, None),
+            None => (SlotBlock::Input(xin), None),
             Some((gate, up, limit)) => {
                 if (up.ne0, up.ne1) != (gate.ne0, gate.ne1) {
                     return Err(crate::ModelError::Shape {
@@ -1229,7 +1318,7 @@ fn group_core(
                             caller_combine_ns += ns;
                             par
                         } else {
-                            Tensor2::scratch(k, xin.ne1)
+                            Tensor2::scratch(k, xin.ne1())
                         };
                         pars.push(par);
                         pars.last_mut().expect("just pushed")
@@ -1243,11 +1332,11 @@ fn group_core(
                         // below are its only accesses.
                         let (ne0, ne1, len) =
                             unsafe { ((*blk).ne0, (*blk).ne1, (*blk).data.len()) };
-                        if (ne0, ne1, len) != (k, xin.ne1, k * xin.ne1) {
+                        if (ne0, ne1, len) != (k, xin.ne1(), k * xin.ne1()) {
                             return Err(crate::ModelError::Shape {
                                 what: "group into par",
                                 want_ne0: k,
-                                want_ne1: xin.ne1,
+                                want_ne1: xin.ne1(),
                                 got_ne0: ne0,
                                 got_ne1: ne1,
                             });
@@ -1276,7 +1365,7 @@ fn group_core(
                 // the slot table (metadata reads).
                 let par: &Tensor2 = unsafe { &*blk };
                 (
-                    par,
+                    SlotBlock::Par(par),
                     Some(Combine {
                         gate,
                         up,
@@ -1302,11 +1391,11 @@ fn group_core(
         // the same rule decided they are this pair's bytes.
         let pre = match src {
             GroupInput::Quantized(_, xq, _) => {
-                if !xq.is_of(x) || !xq.serves(ty, k) {
+                if !xq.is_of(xin) || !xq.serves(ty, k) {
                     return Err(crate::ModelError::Shape {
                         what: "group quantized cols: filled from another block or for another encoding",
-                        want_ne0: x.ne0,
-                        want_ne1: x.ne1,
+                        want_ne0: xin.ne0(),
+                        want_ne1: xin.ne1(),
                         got_ne0: xq.key.map_or(0, |q| q.k),
                         got_ne1: xq.key.map_or(0, |q| q.ne1),
                     });
@@ -1347,7 +1436,7 @@ fn group_core(
                     let q = slots.get(s);
                     q.swiglu.is_none()
                         && q.pre.is_none()
-                        && std::ptr::eq(q.x, x)
+                        && q.x.is_input(xin)
                         && q.cb == cb
                         && gguf::activation_format(q.ty) == gguf::activation_format(ty)
                 })
@@ -1850,7 +1939,7 @@ fn batch_shape(
 struct QuantSlot<'a> {
     /// The block whose columns are quantized — a ready input, or the par
     /// block the slot's SwiGLU source produces (see `swiglu`).
-    x: &'a Tensor2,
+    x: SlotBlock<'a>,
     ty: GgmlType,
     k: usize,
     /// `qdot::col_bytes(ty, k)` on the fused path, `None` on the scalar one.
@@ -1872,7 +1961,48 @@ impl QuantSlot<'_> {
     /// Columns the pre-pass quantizes for this slot: none for bytes the
     /// caller quantized.
     fn todo_cols(&self) -> usize {
-        if self.pre.is_some() { 0 } else { self.x.ne1 }
+        if self.pre.is_some() { 0 } else { self.x.ne1() }
+    }
+}
+
+/// A slot's block: a ready input, read through its view, or the par block
+/// its combine writes. A par is named by its header alone: its cells are
+/// written through the slot's producer (`QuantSlot::swiglu`) and read as
+/// columns only once written — by the caller before the dispatch
+/// (`QuantSlot::produced`), or by the producer that reads them back.
+#[derive(Clone, Copy)]
+enum SlotBlock<'a> {
+    Input(Tensor2View<'a>),
+    Par(&'a Tensor2),
+}
+
+impl<'a> SlotBlock<'a> {
+    fn ne1(self) -> usize {
+        match self {
+            SlotBlock::Input(x) => x.ne1(),
+            SlotBlock::Par(p) => p.ne1,
+        }
+    }
+
+    /// The values the block holds, `k · ne1`.
+    fn len(self) -> usize {
+        match self {
+            SlotBlock::Input(x) => x.data().len(),
+            SlotBlock::Par(p) => p.data.len(),
+        }
+    }
+
+    /// Column `t`: an input's, or a par's once it is written.
+    fn col(self, t: usize) -> &'a [f32] {
+        match self {
+            SlotBlock::Input(x) => x.col(t),
+            SlotBlock::Par(p) => p.col(t),
+        }
+    }
+
+    /// Whether this is the ready input `x` — a par never is.
+    fn is_input(self, x: Tensor2View<'_>) -> bool {
+        matches!(self, SlotBlock::Input(v) if v.same_block(x))
     }
 }
 
@@ -2090,7 +2220,7 @@ impl<'a> DeferredSlots<'a> {
     /// those call sites: the combine at level 1, the encoder at level 2.
     fn produce(&self, s: usize, lvl: u8, acc: &mut profile::CallAcc) {
         let q = self.slots.get(s);
-        let ne1 = q.x.ne1;
+        let ne1 = q.x.ne1();
         if let Some(c) = q.swiglu {
             let t_s = if lvl >= 1 { Some(Instant::now()) } else { None };
             // SAFETY: `c.par` aliases this slot's `x`, the par block the entry
@@ -2274,7 +2404,7 @@ fn run_group(
         .filter(|&w| {
             n_slots > 0
                 && n_slots <= MAX_DEFER_SLOTS
-                && (0..n_slots).all(|s| slots.get(s).x.ne1 <= w)
+                && (0..n_slots).all(|s| slots.get(s).x.ne1() <= w)
         })
         .map(|_| DeferredSlots::new(slots, &shared));
     let mut prepass_ns = 0u64;
@@ -2304,7 +2434,7 @@ fn run_group(
         pairs.push(PairWork::new(
             out,
             bytes.get(i),
-            (*shared.get(s), slots.get(s).x.ne1, *map.cols_of.get(i)),
+            (*shared.get(s), slots.get(s).x.ne1(), *map.cols_of.get(i)),
             *meta.get(i),
             s,
             deferred.as_ref(),
@@ -2720,7 +2850,7 @@ fn matmul_q_one(
 
     let mut slots: Flex<QuantSlot> = Flex::new();
     slots.push(QuantSlot {
-        x,
+        x: SlotBlock::Input(x.view()),
         ty,
         k,
         cb,
@@ -2986,7 +3116,7 @@ mod tests {
         let w = g.find("w").unwrap();
         let x = Tensor2::zeros(32, 2);
         let (outs, pars) =
-            matmul_q_group_swiglu(&g, &[w], &[GroupInput::Cols(&x, &[1, 0, 1])]).unwrap();
+            matmul_q_group_swiglu(&g, &[w], &[GroupInput::Cols(x.view(), &[1, 0, 1])]).unwrap();
         assert_eq!(
             (outs[0].ne0, outs[0].ne1),
             (2, 3),
@@ -2999,7 +3129,7 @@ mod tests {
         let e = refusal(matmul_q_group_swiglu(
             &g,
             &[w],
-            &[GroupInput::Cols(&x, &[0, 2])],
+            &[GroupInput::Cols(x.view(), &[0, 2])],
         ));
         assert!(
             e.contains("past the block") && e.contains("got [32, 2]"),
