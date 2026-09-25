@@ -37,10 +37,12 @@
 #   lcpp<K>:<D>  the same with --n-cpu-moe K in place of the profile's LCPP_NCMOE: the sweep arm.
 #            The profile's LCPP_NCMOE_SWEEP names the values that load, e.g.
 #            `lcpp:6 lcpp34:6 lcpp35:6` interleaved with `6`.
-#   ikpp:<P> ik's prefill: llama-bench -p P -n 0 -r 1 with the ik:<D> arm's binary, flags
-#            ($IK_GPU_FLAGS) and environment ($IK_GPU_ENV); the row reads llama-bench's `ppP` row
-#            as `tok/s(pp) … @ n=0, prompt P`.
-#   lcpppp:<P>  mainline's prefill: llama-bench -p P -n 0 -r 1 $LCPP_GPU_FLAGS, the lcpp:<D> arm's.
+#   ikpp:<P> ik's prefill: llama-bench -p P -n 0 -r 2 -o json with the ik:<D> arm's binary, flags
+#            ($IK_GPU_FLAGS) and environment ($IK_GPU_ENV); the row is the second repetition,
+#            P / samples_ns[1], as `tok/s(pp) … @ n=0, prompt P`, and names the first as `cold`.
+#            The file is larger than RAM, so an arm that follows another engine refaults its own
+#            pages during its first repetition; one load, two samples, the warm one counts.
+#   lcpppp:<P>  mainline's prefill, the same at $LCPP_GPU_FLAGS, the lcpp:<D> arm's.
 #   ikpp<U>:<P>, lcpppp<U>:<P>  the same with -ub U -b max(U, 2048): the ubatch lever, not a default
 #            (Prefill below). Refused when the profile's flags already name -ub or -b.
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
@@ -254,7 +256,7 @@ WITNESS=(head-open indent card busiest model mem pgmajfault)
 # lcpp<K> engine is LCPP_GPU_FLAGS with its --n-cpu-moe value replaced by K. A prefill arm is its
 # decode twin's binary, flags and environment with -p P -n 0 in place of the decode test.
 ref_cmd() {
-  local eng=$1 dep=$2 flags ub
+  local eng=$1 dep=$2 flags ub reps=(-r 1)
   REF_ENV=() REF_BATCH=
   case $eng in
     ik | ikpp*)
@@ -276,6 +278,7 @@ ref_cmd() {
     ikpp* | lcpppp*)
       ub=$(pp_ub "$eng")
       REF_ARGS=(-p "$dep" -n 0) REF_LABEL="pp$dep |" REF_BATCH="ub 512 b 2048 (llama-bench defaults)"
+      reps=(-r 2 -o json)
       if [ -n "$ub" ]; then
         REF_ARGS+=(-ub "$ub" -b "$((ub > 2048 ? ub : 2048))")
         REF_BATCH="ub $ub b $((ub > 2048 ? ub : 2048)) (the arm's lever)"
@@ -285,23 +288,38 @@ ref_cmd() {
     *) if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n "$N" -d "$dep"); REF_LABEL="tg$N @ d$dep |"; fi ;;
   esac
   # shellcheck disable=SC2206
-  REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
+  REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" "${reps[@]}" $flags)
 }
 
 # One reference arm: its llama-bench on its flags, the row, and the sum.
 # ref_arm <engine> <depth> <round>
 ref_arm() {
-  local eng=$1 dep=$2 r=$3 raw rc val build dev t0 t1 fail
+  local eng=$1 dep=$2 r=$3 raw rc val build dev t0 t1 fail cold errf
   ref_cmd "$eng" "$dep"
   witness "pre r$r $eng d=$dep"
   ref_witness
   t0=$(date +%s)
-  raw=$(timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>&1)
+  if pp_eng "$eng"; then
+    # The json goes to stdout alone; the loader's log goes to a file, shown on a failure.
+    errf=${TMPDIR:-/tmp}/depth-ds41-$eng-d$dep-r$r.err
+    raw=$(timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>"$errf")
+  else
+    raw=$(timeout --kill-after=10 "$BOUND" env "${REF_ENV[@]}" "$REF_BIN" "${REF_ARGS[@]}" 2>&1)
+  fi
   rc=$?
   t1=$(date +%s)
   witness "post r$r $eng d=$dep"
   guard_cpu "post r$r $eng d=$dep"
-  val=$(echo "$raw" | grep -F "$REF_LABEL" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
+  if pp_eng "$eng"; then
+    # Exactly one test and two samples, or no value: a missing field is a failed arm, not a 0.
+    val=$(echo "$raw" | jq -r 'if length == 1 and (.[0].samples_ns | length) == 2
+      then .[0] | (.n_prompt * 1e9 / .samples_ns[1] * 100 | round / 100) else empty end' 2>/dev/null)
+    cold=$(echo "$raw" | jq -r '.[0] | (.n_prompt * 1e9 / .samples_ns[0] * 100 | round / 100)' 2>/dev/null)
+    [ -z "$val" ] && raw="$raw
+$(tail -n 40 "$errf" 2>/dev/null)"
+  else
+    val=$(echo "$raw" | grep -F "$REF_LABEL" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
+  fi
   if [ $rc -ne 0 ] || [ -z "$val" ]; then
     # The whole output goes to a file: the loader's reason for a failed load is many lines
     # above the tail.
@@ -313,11 +331,18 @@ ref_arm() {
   fi
   # The reference's own table, header and row: its columns name every setting it ran with that
   # differs from its defaults, so the log shows which flags took.
-  echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
-  build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
-  dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
   if pp_eng "$eng"; then
-    echo "ROW r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+    # The json's settings, samples dropped: the same "which flags took" as the md table.
+    echo "$raw" | jq -c '.[0] | del(.samples_ns, .samples_ts)' | sed "s/^/    $eng params /"
+    build=$(echo "$raw" | jq -r '.[0] | "\(.build_commit) (\(.build_number))"')
+    dev=$(echo "$raw" | jq -r '.[0].gpu_info')
+  else
+    echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
+    build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
+    dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
+  fi
+  if pp_eng "$eng"; then
+    echo "ROW r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | cold ${cold:-?} (repetition 1 of 2) | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
     pp_sums+=("$eng|$dep|$r|$val|$CPU_BUSY_TAG$OTHER_BUSY_TAG")
   else
     echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
@@ -486,7 +511,7 @@ echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME 
 echo "[config] ours: $BIN (placement (a), default ctx)"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
-echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
+echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 2 -o json at the flags above, the row is repetition 2 (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 witness pre
