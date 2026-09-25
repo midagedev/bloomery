@@ -342,7 +342,15 @@ first suspect is a hung gate on the box, not the agent.
   assuming SIMD opens a gate.
 - `rust-toolchain.toml` at the root pins the nightly; it moves only when the
   cuda-oxide pin moves. `cuda-oxide` itself is pinned by `rev` in
-  `[workspace.dependencies]`; `just deny` fails if that ever floats.
+  `[workspace.dependencies]` (declared against NVlabs) and taken from our fork's
+  `bloomery` branch through `[patch]` — that rev plus patches bound for upstream,
+  listed in `THIRD_PARTY_NOTICES.md`; `just deny` fails if either ever floats. The
+  box never rebuilds the backend in place: `tools/box.sh` exports
+  `CUDA_OXIDE_BACKEND=~/.cargo/cuda-oxide-bloomery/<rev>/librustc_codegen_cuda.so`
+  and a `cargo oxide` command stops (rc 70) when that rev's backend is missing.
+  A fork patch that changes codegen is a pin move (every gate); one that must not
+  proves it with the `just ptx-scan` tables of `generate_ds41` and `gate_e2e`
+  identical.
 - Issues live in the self-hosted tracker, project MUL. Measurements are written
   up in the rig-log repository first and linked from the issue.
 

@@ -2,6 +2,8 @@
 
 GPU 단계에서 만나는 이슈·PR 후보를 발견 즉시 여기 적는다(사용자 지시 2026-09-21: "cuda oxide에 이슈나 PR 만들 거리 있으면 캐치해 놔줘"). 한 줄이면 된다 — 정식 초안은 `docs/upstream/<slug>.md`, 제출 파이프라인은 rig-log `docs/upstream-contributions.md`(중복 검색 → FAIL-first 실측 → 최소 패치 → 적대적 리뷰). 여기 적힌 것은 **후보**다. 코드 독해로 확정한 결함은 가설이고, 실측 재현이 붙은 것만 상태 열이 `재현`으로 오른다.
 
+**포크 경로(2026-09-25, 사용자 결정).** cuda-oxide는 `Cargo.toml`에서 NVlabs rev로 선언하고 `[patch]`로 우리 포크 [midagedev/cuda-oxide](https://github.com/midagedev/cuda-oxide) `bloomery` 브랜치에서 받는다. 순서는 그대로다: 결함은 먼저 이 장부에 한 줄(우회 코드보다 먼저), 고칠 가치가 있으면 포크 브랜치에 커밋 하나(재현·FAIL-first·기존 엔트리 PTX md5 동일 또는 핀 이동 절차), 업스트림 PR은 그 커밋을 메인테이너 속도대로(한 레포에 열린 PR 1–2개). 업스트림이 받으면 포크에서 뺀다. 목록은 `THIRD_PARTY_NOTICES.md`.
+
 | # | 대상 | 무엇 | 상태 | 근거 |
 |---|---|---|---|---|
 | 1 | cuda-oxide | `#[unroll]`이 `usize` 카운터 `while` 루프에서 `APInt::shl: bitwidth mismatch`로 컴파일러 패닉(전체·부분 언롤 모두) | **제출 — [#1314](https://github.com/NVlabs/cuda-oxide/pull/1314)(2026-09-21 저녁, 열림)**; 재현·원인·수정·FAIL-first·스모크 A/B가 §1에. 2026-09-23 메인테이너가 넘겨받아 리베이스·서명하고 테스트 커밋을 더했다, 머지 대기(§1 끝) | MUL-7, 재현기 `crates/oxide-ice-unroll` |

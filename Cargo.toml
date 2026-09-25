@@ -16,6 +16,13 @@ libc = "0.2"
 memmap2 = "0.9"
 thiserror = "2"
 
+# cuda-oxide는 위 선언 그대로 NVlabs 저장소의 rev에 의존하고, 실제 소스는 우리 포크(midagedev/cuda-oxide)의 `bloomery`
+# 브랜치에서 받는다. 포크 = 위 rev + 업스트림에 낼 패치들이다(THIRD_PARTY_NOTICES.md에 목록). 패치가 0개가 되면 이 절을
+# 지운다. rev를 옮기면 박스의 백엔드도 그 rev로 새로 지어야 한다(tools/box.sh의 CUDA_OXIDE_BACKEND 참조).
+[patch."https://github.com/NVlabs/cuda-oxide.git"]
+cuda-device = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+cuda-host = { git = "https://github.com/midagedev/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c" }
+
 # 값은 2026-09-19에 박스에서 실측한 적중 수를 근거로 정했다. 0건인 것만 deny로 올린다.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"     # 적중 0

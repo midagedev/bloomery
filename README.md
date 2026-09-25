@@ -98,7 +98,7 @@ Timing runs only on a quiet machine, under a machine-wide lease, with a witness 
 
 - **The public `Q3_K_M` file is not the default yet**: seven per-op reference gates still check only Q8_0 weights (see Status).
 - **sm_86 only.** Every kernel is built and gated for Ampere (`--arch sm_86`). Other architectures are not tested.
-- **A pinned nightly.** The toolchain is `nightly-2026-08-28`, pinned together with a cuda-oxide git revision.
+- **A pinned nightly.** The toolchain is `nightly-2026-08-28`, pinned together with a cuda-oxide git revision. The source comes from our fork of that revision, where fixes wait until upstream takes them (`THIRD_PARTY_NOTICES.md` lists them).
 - **One machine.** Timed numbers come from one A6000 in one workstation. The tooling (`tools/box.sh`) assumes a Mac editor and that workstation; [`docs/BUILD.md`](docs/BUILD.md) says what to run on your own host.
 - **No batched prefill.** A prompt is fed one step per token, so a 4096-token prompt takes about 2.4–2.9 minutes before the first new token [derived: 4096 × 35–43 ms]. The server reuses a cached prompt prefix, so a follow-up turn pays only for its new tokens.
 

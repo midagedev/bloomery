@@ -24,6 +24,10 @@ skip = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/NVlabs/cuda-oxide.git"]
+allow-git = [
+  "https://github.com/NVlabs/cuda-oxide.git",
+  # Cargo.toml [patch]: 위 rev + 업스트림에 낼 패치.
+  "https://github.com/midagedev/cuda-oxide.git",
+]
 # git 의존은 rev로만 받는다. branch나 tag로 떠 있으면 rc가 0이 아니다(git-source-underspecified).
 required-git-spec = "rev"

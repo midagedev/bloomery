@@ -37,6 +37,15 @@ SOFTWARE.
 `crates/oxide-ice-unroll` (a compiler-bug reproducer, excluded from the workspace) carries NVIDIA's
 Apache-2.0 headers from cuda-oxide. The GPU crates depend on cuda-oxide (Apache-2.0) as a pinned git revision.
 
+`Cargo.toml` declares the dependency on NVlabs/cuda-oxide at revision `b9847e9515ed3a23096f22567d3eaf0a6e3e440c`
+and a `[patch]` section takes the source from our fork, [midagedev/cuda-oxide](https://github.com/midagedev/cuda-oxide),
+branch `bloomery`: that revision plus the patches below. Every patch is meant for upstream and leaves the fork once
+upstream has it; with none left, the `[patch]` section goes away.
+
+| Patch | Upstream |
+|---|---|
+| (none yet — the branch is the pinned revision itself) | |
+
 ## cuda-core (cutile-rs)
 
 The GPU crates depend on `cuda-core` (crates.io, Apache-2.0), cutile-rs's host crate, for streams, events and the module loader. Its `.oxart` container parser is the copy the module loader links.
