@@ -360,7 +360,7 @@ first suspect is a hung gate on the box, not the agent.
   pp4096 5,557 (llama.cpp 4,320 / 4,204 in the same lease; rig-log
   09-25#q3pflash-ab), and since `ded6c51` (q3ubatch, ubatches of up to 4096
   tokens, a load-time size) pp512 6,402 and pp4096 7,490 (llama.cpp 4,318 /
-  4,205, `-ub 4096 -b 4096` 6,904 in the same lease; rig-log 09-25#q3ubatch-ab);
+  4,205, `-ub 4096 -b 4096` 6,904 in the same lease; rig-log 09-25#q3ubatch-ab), and since `ef00f78` (q3router, the ubatch router logits as register tiles, 1.19 → 0.281 ms a launch) pp512 6,815 and pp4096 8,024 (llama.cpp 4,267 / 4,191, `-ub 4096 -b 4096` 6,872 in the same lease; rig-log 09-26#q3router-ab);
   ~~V4.1 still feeds one decode step per token (batched prefill in flight).~~ Since
   2026-09-25 (`43cd107`) V4.1 runs a prompt in batches of up to 512 positions, bit for bit the
   decode steps' state: pp512 91.2 and pp4096 89.2 tok/s on the A6000 plan (a), 2.97x the step

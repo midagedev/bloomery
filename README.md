@@ -70,10 +70,10 @@ Prompt processing on the same card, arms alternated in one window, three rounds 
 
 | Prompt | bloomery pp tok/s | llama.cpp | llama.cpp `-ub 4096` | mistral.rs |
 |---:|---:|---:|---:|---:|
-| 512 | **6,402** | 4,318 | — | 3,471 |
-| 4096 | **7,490** | 4,205 | 6,904 | 1,321 |
+| 512 | **6,815** | 4,267 | — | 3,460 |
+| 4096 | **8,024** | 4,191 | 6,872 | 1,317 |
 
-The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QWEN3_UBATCH`) through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. At 4096 tokens bloomery's default is 1.085× llama.cpp with `-ub 4096 -b 4096`; ~~the routed GEMM and the per-token glue kernels are about equal shares of what remains~~ the GEMMs (routed and dense) are about 62 % of what remains, the per-token glue about 17 % and attention about 15 % [derived; docs/research/q3next-design-report.md]. Source: rig-log [2026-09-25, q3ubatch](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3ubatch-ab).
+The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QWEN3_UBATCH`) through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. The router's logits for a ubatch run as register tiles, 32 tokens by 32 experts a block. At 4096 tokens bloomery's default is 1.168× llama.cpp with `-ub 4096 -b 4096`; ~~the routed GEMM and the per-token glue kernels are about equal shares of what remains~~ ~~the GEMMs (routed and dense) are about 62 % of what remains, the per-token glue about 17 % and attention about 15 % [derived; docs/research/q3next-design-report.md]~~ measured at 4096 tokens (nsys, 510 ms of kernels): the GEMMs are 59 %, prefill attention 17 % and the per-token kernels the remaining 23 %. Source: rig-log [2026-09-26, q3router](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#q3router-ab).
 
 Read these numbers with their conditions:
 
