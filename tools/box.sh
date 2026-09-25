@@ -87,6 +87,11 @@ for kv in ${box_env[@]+"${box_env[@]}"}; do
   esac
   ENVS="${ENVS}export $name=$(printf %q "${kv#*=}") && "
 done
+# 트랙 원격 디렉터리(BLOOMERY_REMOTE)의 빌드는 CARGO_BUILD_JOBS 기본 12: 파동의 4중 빌드가 32코어를 스래싱하지 않게.
+# BLOOMERY_BOX_ENV로 주면 그 값이고, 메인 트리(BLOOMERY_REMOTE 없음)는 그대로다.
+if [ -n "${BLOOMERY_REMOTE:-}" ] && [[ " ${box_env[*]+${box_env[*]}} " != *" CARGO_BUILD_JOBS="* ]]; then
+  ENVS="${ENVS}export CARGO_BUILD_JOBS=12 && "
+fi
 # cuda-oxide 백엔드(librustc_codegen_cuda.so)는 핀 rev마다 제 디렉터리에 둔다: ~/.cargo/cuda-oxide-bloomery/<rev>/.
 # cargo-oxide의 기본 캐시(~/.cargo/cuda-oxide/)는 소스가 새로워 보이면 그 자리에서 다시 빌드하고, 그동안 다른 트랙의
 # rustc가 그 .so를 mmap한 채 SIGBUS를 맞는다(nvlabs-ledger 19). rev로 고정한 경로의 파일은 한 번 놓이면 바뀌지 않는다.

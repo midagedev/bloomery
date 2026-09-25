@@ -117,7 +117,10 @@ binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`), and
 returns the binary's exit code (124/137 timed out, 75 lock contention).
 There is one lock per card: `/root/bloomery-gate.lock` (the 3090) and
 `/root/bloomery-gate-a6000.lock`. `BLOOMERY_GATE_CARD=3090|a6000|any`
-picks (default `3090`); `any` takes an idle A6000 when no timing lease is
+picks (the runner's default is `3090`; since 2026-09-25 the recipes that do
+not need the V4.1 gate placement — the qwen3moe gates, `gate-gpu-gemm`,
+`gate-gpu-e2e`, `gate-gpu-p6`, `gate-gpu-ds41-chain-ffn`, `gate-gpu-vision`,
+`gate-gpu-dspark-kv` — default to `any`); `any` takes an idle A6000 when no timing lease is
 held, else the 3090, so a gate that names no card does not queue behind a
 V4.1 `--place gate` gate, which can only run on the 3090. Pass it through
 `BLOOMERY_BOX_ENV`. One hung GPU gate used to stall every track through the
