@@ -63,9 +63,15 @@ pub enum QdotError {
     TileShape { cols: usize, outs: usize },
     /// A row-lane repack's row count is not a multiple of [`Q3K_R8_ROWS`].
     RowGroup { rows: usize },
-    /// A row-lane buffer — a repack's rows or output, or one group handed to
-    /// [`dot_q3k_r8_cols`] — is not exactly the bytes its rows and `k` make.
-    RowGroupBytes { have: usize, need: usize },
+    /// A row-lane buffer is not exactly the bytes its rows and `k` make;
+    /// `buf` names which: `"repack source"` or `"repack destination"`
+    /// ([`repack_q3k_r8`]'s `rows` or `out`), or `"tile group"` (the group
+    /// handed to [`dot_q3k_r8_cols`]).
+    RowGroupBytes {
+        buf: &'static str,
+        have: usize,
+        need: usize,
+    },
 }
 
 impl fmt::Display for QdotError {
@@ -109,10 +115,10 @@ impl fmt::Display for QdotError {
                     "{rows} rows: the row-lane layout takes rows in groups of {Q3K_R8_ROWS}"
                 )
             }
-            QdotError::RowGroupBytes { have, need } => {
+            QdotError::RowGroupBytes { buf, have, need } => {
                 write!(
                     f,
-                    "row-lane buffer is {have} bytes, its rows and k make {need}"
+                    "row-lane {buf} is {have} bytes, its rows and k make {need}"
                 )
             }
         }
@@ -543,7 +549,9 @@ pub const Q3K_R8_ROWS: usize = 8;
 ///
 /// A `k` off the 256-value grid, a row count off the group grid
 /// ([`QdotError::RowGroup`]; rows are not padded) and a `rows` or `out` of
-/// another length ([`QdotError::RowGroupBytes`]) are named errors.
+/// another length ([`QdotError::RowGroupBytes`]) are named errors, and none
+/// writes to `out`. `k = 0` is an empty product: `Ok` with both buffers
+/// empty, nothing written.
 pub fn repack_q3k_r8(
     rows: &[u8],
     n_rows: usize,
@@ -559,10 +567,18 @@ pub fn repack_q3k_r8(
     let nb = k / 256;
     let row_bytes = nb * Q3K_BLOCK;
     let need = n_rows * row_bytes;
-    for have in [rows.len(), out.len()] {
+    for (buf, have) in [
+        ("repack source", rows.len()),
+        ("repack destination", out.len()),
+    ] {
         if have != need {
-            return Err(QdotError::RowGroupBytes { have, need });
+            return Err(QdotError::RowGroupBytes { buf, have, need });
         }
+    }
+    // k = 0: both buffers are empty (need = 0), and `chunks_exact` takes no
+    // zero-byte chunk.
+    if k == 0 {
+        return Ok(());
     }
     let group_bytes = Q3K_R8_ROWS * row_bytes;
     for (src, dst) in rows
@@ -645,6 +661,7 @@ fn check_r8(group_len: usize, acols: &[&[u8]], k: usize, outs: usize) -> Result<
     let need = nb * Q3K_R8_BLOCK;
     if group_len != need {
         return Err(QdotError::RowGroupBytes {
+            buf: "tile group",
             have: group_len,
             need,
         });
@@ -1123,27 +1140,43 @@ unsafe fn dot_q3k_q8k_avx2(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     }
 }
 
-/// Scalar mirror of `dot_q3k_q8k_avx2`, bit-identical by construction.
-fn dot_q3k_q8k_scalar(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
+/// A Q3_K super-block's 16 scales as stored: six bits, `s + 32`. With
+/// [`q3k_codes`], the one scalar unpack of a Q3_K block: the scalar mirror
+/// and the row-lane repack read a block through these two.
+fn q3k_scales6(blk: &[u8]) -> [u8; 16] {
     const KMASK1: u32 = 0x0303_0303;
     const KMASK2: u32 = 0x0f0f_0f0f;
+    let aux: [u32; 3] =
+        std::array::from_fn(|i| u32::from_le_bytes([0, 1, 2, 3].map(|b| blk[96 + 4 * i + b])));
+    let words = [
+        (aux[0] & KMASK2) | ((aux[2] & KMASK1) << 4),
+        (aux[1] & KMASK2) | (((aux[2] >> 2) & KMASK1) << 4),
+        ((aux[0] >> 4) & KMASK2) | (((aux[2] >> 4) & KMASK1) << 4),
+        ((aux[1] >> 4) & KMASK2) | (((aux[2] >> 6) & KMASK1) << 4),
+    ];
+    std::array::from_fn(|j| words[j / 4].to_le_bytes()[j % 4])
+}
+
+/// A Q3_K super-block's 256 codes `u = value + 4` in 0..7: the two low bits
+/// from `qs`, bit 2 the high bit of `hmask` (set = no −4).
+fn q3k_codes(blk: &[u8]) -> [u8; 256] {
+    std::array::from_fn(|i| {
+        let (half, field, cell) = (i / 128, (i / 32) % 4, i % 32);
+        let low = (blk[32 + 32 * half + cell] >> (2 * field)) & 3;
+        let high = (blk[cell] >> (4 * half + field)) & 1;
+        low | (high << 2)
+    })
+}
+
+/// Scalar mirror of `dot_q3k_q8k_avx2`, bit-identical by construction: per
+/// super-block the integer `Σ s_(i/16) · (u_i − 4) · q_i` over its 256 values
+/// (exact in i32, so its order is free), then the kernel's float step.
+fn dot_q3k_q8k_scalar(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     let mut acc = 0.0f32;
     for sb in 0..nb {
         let blk = &wrow[sb * Q3K_BLOCK..sb * Q3K_BLOCK + Q3K_BLOCK];
-        let hmask = &blk[0..32];
-        let qs = &blk[32..96];
-        let mut aux = [0u32; 3];
-        for i in 0..3 {
-            aux[i] = u32::from_le_bytes(blk[96 + 4 * i..96 + 4 * i + 4].try_into().unwrap());
-        }
-        let word = |i: usize| match i {
-            0 => (aux[0] & KMASK2) | ((aux[2] & KMASK1) << 4),
-            1 => (aux[1] & KMASK2) | (((aux[2] >> 2) & KMASK1) << 4),
-            2 => ((aux[0] >> 4) & KMASK2) | (((aux[2] >> 4) & KMASK1) << 4),
-            _ => ((aux[1] >> 4) & KMASK2) | (((aux[2] >> 6) & KMASK1) << 4),
-        };
-        let scale = |idx: usize| (word(idx / 4).to_le_bytes()[idx % 4] as i8 - 32) as i32;
-
+        let scales = q3k_scales6(blk);
+        let codes = q3k_codes(blk);
         let d = half_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
         let q8 = &acol[sb * Q8K_STRIDE + 8..sb * Q8K_STRIDE + 8 + 256];
         let dcol = f32::from_le_bytes(
@@ -1152,22 +1185,9 @@ fn dot_q3k_q8k_scalar(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
                 .unwrap(),
         );
         let mut sumi = 0i32;
-        let mut m = 1u8;
-        for half in 0..2 {
-            let mut shift = 0u32;
-            for field in 0..4 {
-                for h16 in 0..2 {
-                    let sc = scale(8 * half + 2 * field + h16);
-                    for l in 0..16 {
-                        let qv = ((qs[32 * half + 16 * h16 + l] >> shift) & 3) as i32;
-                        let hv = if hmask[16 * h16 + l] & m != 0 { 0 } else { 4 };
-                        let a8 = q8[128 * half + 32 * field + 16 * h16 + l] as i8 as i32;
-                        sumi += sc * (qv - hv) * a8;
-                    }
-                }
-                shift += 2;
-                m <<= 1;
-            }
+        for (i, (&u, &a8)) in codes.iter().zip(q8).enumerate() {
+            let sc = i32::from(scales[i / 16]) - 32;
+            sumi += sc * (i32::from(u) - 4) * i32::from(a8 as i8);
         }
         acc += dcol * d * sumi as f32;
     }
@@ -1411,6 +1431,11 @@ const Q3K_R8_BLOCK: usize = Q3K_R8_ROWS * Q3K_BLOCK;
 const R8_SCALES: usize = 16;
 const R8_CODES: usize = R8_SCALES + 96;
 const R8_PAIR: usize = 96;
+// The tile's bounds rest on these: the eight f16 `d` fill bytes 0..16 (one
+// 16-byte load, a lane per row), and the eighth code pair ends on the
+// super-block's last byte.
+const _: () = assert!(R8_SCALES == 2 * Q3K_R8_ROWS);
+const _: () = assert!(R8_CODES + 8 * R8_PAIR == Q3K_R8_BLOCK);
 
 /// Scale-pair shuffles of the row-lane tile, per 128-bit half: from a vector
 /// whose dword `r` is the i16 pair `[s_r,2p, s_r,2p+1]`, the first 32 bytes
@@ -1422,36 +1447,9 @@ static R8_DUP: [u8; 64] = [
     2, 3, 2, 3, 6, 7, 6, 7, 10, 11, 10, 11, 14, 15, 14, 15, //
 ];
 
-/// A Q3_K super-block's 16 scales as stored: six bits, `s + 32` — the
-/// scalar mirror's unpack.
-fn q3k_scales6(blk: &[u8]) -> [u8; 16] {
-    const KMASK1: u32 = 0x0303_0303;
-    const KMASK2: u32 = 0x0f0f_0f0f;
-    let aux: [u32; 3] =
-        std::array::from_fn(|i| u32::from_le_bytes([0, 1, 2, 3].map(|b| blk[96 + 4 * i + b])));
-    let words = [
-        (aux[0] & KMASK2) | ((aux[2] & KMASK1) << 4),
-        (aux[1] & KMASK2) | (((aux[2] >> 2) & KMASK1) << 4),
-        ((aux[0] >> 4) & KMASK2) | (((aux[2] >> 4) & KMASK1) << 4),
-        ((aux[1] >> 4) & KMASK2) | (((aux[2] >> 6) & KMASK1) << 4),
-    ];
-    std::array::from_fn(|j| words[j / 4].to_le_bytes()[j % 4])
-}
-
-/// A Q3_K super-block's 256 codes `u = value + 4` in 0..7: the two low bits
-/// from `qs`, bit 2 the high bit of `hmask` (set = no −4).
-fn q3k_codes(blk: &[u8]) -> [u8; 256] {
-    std::array::from_fn(|i| {
-        let (half, field, cell) = (i / 128, (i / 32) % 4, i % 32);
-        let low = (blk[32 + 32 * half + cell] >> (2 * field)) & 3;
-        let high = (blk[cell] >> (4 * half + field)) & 1;
-        low | (high << 2)
-    })
-}
-
 /// One group super-block of [`repack_q3k_r8`]'s layout from the eight rows'
 /// 110-byte blocks.
-fn r8_pack_block(rows: &[&[u8]; Q3K_R8_ROWS], dst: &mut [u8]) {
+fn r8_pack_block(rows: &[&[u8]; Q3K_R8_ROWS], dst: &mut [u8; Q3K_R8_BLOCK]) {
     let scales = rows.map(q3k_scales6);
     let codes = rows.map(q3k_codes);
     for (r, blk) in rows.iter().enumerate() {
@@ -1611,6 +1609,8 @@ unsafe fn dot_q3k_r8_tile_avx2<const C: usize>(
         let zero = _mm256_setzero_si256();
         let mut acc = [_mm256_setzero_ps(); C];
         for sb in 0..nb {
+            // SAFETY: sb < nb, and check_r8 sized `group` to exactly nb group
+            // super-blocks: base .. base + Q3K_R8_BLOCK lies inside it.
             let base = group.as_ptr().add(Q3K_R8_BLOCK * sb);
             // SAFETY: three 32-byte loads inside the super-block's scale bytes.
             let l0 = _mm256_loadu_si256(base.add(R8_SCALES) as *const __m256i);
@@ -1645,7 +1645,8 @@ unsafe fn dot_q3k_r8_tile_avx2<const C: usize>(
                 ),
             ];
             let sc = scales.as_ptr() as *const u8;
-            // SAFETY: column c's super-block sb starts at sb * Q8K_STRIDE.
+            // SAFETY: sb < nb, and check_r8 saw every column hold nb Q8_K
+            // blocks: column c's block sb starts at sb * Q8K_STRIDE, inside it.
             let blk: [*const u8; C] = std::array::from_fn(|c| acols[c].add(sb * Q8K_STRIDE));
             let mut sumi = [zero; C];
             for p in 0..8 {
@@ -1657,6 +1658,9 @@ unsafe fn dot_q3k_r8_tile_avx2<const C: usize>(
                     let bs = _mm256_set1_epi32((b.add(264 + 4 * p) as *const i32).read_unaligned());
                     *s = _mm256_sub_epi32(*s, _mm256_madd_epi16(v4, bs));
                 }
+                // SAFETY: p < 8, and the eighth pair ends at R8_CODES + 8 *
+                // R8_PAIR == Q3K_R8_BLOCK (const-asserted): inside the
+                // super-block at base.
                 let codes = base.add(R8_CODES + R8_PAIR * p);
                 // SAFETY: 32-byte loads inside the pair's 96 bytes.
                 let a = _mm256_loadu_si256(codes as *const __m256i);

@@ -2829,22 +2829,18 @@ fn q8k_col(k: usize, q: impl Fn(usize) -> i8, d: f32) -> Vec<u8> {
     a
 }
 
-/// Q3_K tile clause: rows and columns at the ends of the tile's folded
-/// terms first — codes u = 0 and u = 7 (values −4 and 3), scales −32 and 31
-/// (uniform, alternating by 16-code block, and a ramp), q8_K columns of every
-/// code −127 (block sums −2032), +127, −128 (outside the encoder's range,
-/// still exact) and ±127 alternating by block — then the V4.1 first shard's
-/// routed gate stack (k = the model width), then V2-Lite's `ffn_gate`-1 rows
-/// on the oracle's six `ffn_norm-1` tokens (the rows and columns gate 1's
-/// harness reads) — tile = `dot_row` per column, bit for bit.
-#[test]
-#[ignore = "hw: needs the box, the V4.1 shard, the model file and $BLOOMERY_DATA/ref"]
-fn hw_q3k_tile_matches_dot_row() {
-    let ty = GgmlType::Q3_K;
-    // Rows of two super-blocks, d = 1.0 then 0.5.
-    let k = 512;
-    type Kind = (fn(usize) -> u8, fn(usize) -> i8);
-    let kinds: [Kind; 7] = [
+/// A synthetic Q3_K super-block's codes `u(i)` and scales `s(j)`, as
+/// [`q3k_block`] takes them.
+type Q3kKind = (fn(usize) -> u8, fn(usize) -> i8);
+
+/// The synthetic ends both Q3_K tile clauses start from, at the ends of the
+/// tiles' folded terms: seven block kinds — codes u = 0 and u = 7 (values −4
+/// and 3), scales −32 and 31 (uniform, alternating by 16-code block, and a
+/// ramp) — and four q8_K columns of `k` values: every code −127 (block sums
+/// −2032), +127, −128 (outside the encoder's range, still exact) and ±127
+/// alternating by block.
+fn q3k_ends(k: usize) -> ([Q3kKind; 7], Vec<Vec<u8>>) {
+    let kinds: [Q3kKind; 7] = [
         (|_| 0, |_| -32),
         (|_| 0, |_| 31),
         (|_| 7, |_| -32),
@@ -2853,18 +2849,33 @@ fn hw_q3k_tile_matches_dot_row() {
         (|_| 7, |j| if j % 2 == 0 { 31 } else { -32 }),
         (|i| (i % 8) as u8, |j| 4 * j as i8 - 32),
     ];
+    let cols = vec![
+        q8k_col(k, |_| -127, 0.01),
+        q8k_col(k, |_| 127, 0.01),
+        q8k_col(k, |_| -128, 0.01),
+        q8k_col(k, |i| if (i / 16) % 2 == 0 { -127 } else { 127 }, 0.02),
+    ];
+    (kinds, cols)
+}
+
+/// Q3_K tile clause: rows and columns at the ends of the tile's folded
+/// terms first ([`q3k_ends`]), then the V4.1 first shard's routed gate stack
+/// (k = the model width), then V2-Lite's `ffn_gate`-1 rows on the oracle's
+/// six `ffn_norm-1` tokens (the rows and columns gate 1's harness reads) —
+/// tile = `dot_row` per column, bit for bit.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 shard, the model file and $BLOOMERY_DATA/ref"]
+fn hw_q3k_tile_matches_dot_row() {
+    let ty = GgmlType::Q3_K;
+    // Rows of two super-blocks, d = 1.0 then 0.5.
+    let k = 512;
+    let (kinds, ends) = q3k_ends(k);
     let mut rows = Vec::new();
     for (u, s) in kinds {
         for d in [0x3C00u16, 0x3800] {
             rows.extend_from_slice(&q3k_block(u, s, d));
         }
     }
-    let ends = vec![
-        q8k_col(k, |_| -127, 0.01),
-        q8k_col(k, |_| 127, 0.01),
-        q8k_col(k, |_| -128, 0.01),
-        q8k_col(k, |i| if (i / 16) % 2 == 0 { -127 } else { 127 }, 0.02),
-    ];
     let calls = assert_tile_matches(
         ty,
         "synthetic ends",
@@ -3038,13 +3049,39 @@ const R8_PATHS: [(&str, R8Path); 2] = [
     ("scalar", qdot::dot_q3k_r8_cols_scalar),
 ];
 
+/// Eight distinct, finite, normal f16 `d` values, none a power of two (so
+/// `dcol · d` rounds): each row of a synthetic row-lane group takes its own,
+/// so a permutation of the kernel's `d` lanes changes the permuted rows'
+/// values.
+const R8_D: [u16; 8] = [
+    0x3C01, 0x3555, 0x3E66, 0x3A3D, 0x4049, 0x3801, 0x3CCD, 0x2E66,
+];
+
+/// How far past a 16-byte boundary the row-lane clause copies every group
+/// and column once more: odd, so no load in the kernel may assume any
+/// alignment.
+const MISALIGN: usize = 7;
+
+/// `src` copied to `MISALIGN` bytes past a 16-byte boundary: the buffer and
+/// where the copy starts in it.
+fn misaligned_copy(src: &[u8]) -> (Vec<u8>, usize) {
+    let mut buf = vec![0u8; src.len() + 16 + MISALIGN];
+    let at = (16 - buf.as_ptr().addr() % 16) % 16 + MISALIGN;
+    buf[at..at + src.len()].copy_from_slice(src);
+    assert_eq!(buf[at..].as_ptr().addr() % 16, MISALIGN);
+    (buf, at)
+}
+
 /// Clause of one row set (a whole number of 8-row groups): repacked, then for
 /// c = 1..=TILE_COLS and every starting column of the cyclic list `acols`,
 /// every group's tile over the c columns from there equals `dot_row` per
-/// (row, column), bit for bit — the kernel on every group, the scalar mirror
-/// on the first `mirror_groups`. The outputs start as a NaN canary and the
-/// call's slice is followed by one more canary column, so an unwritten value
-/// and a write past the c columns both fail. Returns the calls made.
+/// (row, column), bit for bit — the kernel on every group, first on a copy
+/// of the packed groups and of the columns at [`MISALIGN`] bytes past a
+/// 16-byte boundary (so an aligned load faults on the first call), then in
+/// place; the scalar mirror on the first `mirror_groups`. The outputs start
+/// as a NaN canary and the call's slice is followed by one more canary
+/// column, so an unwritten value and a write past the c columns both fail.
+/// Returns the calls made and the time the scalar mirror took.
 fn assert_r8_matches(
     label: &str,
     k: usize,
@@ -3052,7 +3089,7 @@ fn assert_r8_matches(
     bytes: &[u8],
     acols: &[Vec<u8>],
     mirror_groups: usize,
-) -> usize {
+) -> (usize, std::time::Duration) {
     let ty = GgmlType::Q3_K;
     const R8: usize = qdot::Q3K_R8_ROWS;
     assert!(
@@ -3078,19 +3115,50 @@ fn assert_r8_matches(
     }
     let mut packed = vec![0u8; bytes.len()];
     qdot::repack_q3k_r8(bytes, rows, k, &mut packed).unwrap();
+    let (moved, at) = misaligned_copy(&packed);
+    let moved = &moved[at..at + packed.len()];
+    let moved_cols: Vec<(Vec<u8>, usize)> = acols
+        .iter()
+        .map(|a| misaligned_copy(a.as_slice()))
+        .collect();
+    let moved_cols: Vec<&[u8]> = moved_cols
+        .iter()
+        .zip(acols)
+        .map(|((b, at), a)| &b[*at..*at + a.len()])
+        .collect();
+    let [(_, kernel), (_, scalar)] = R8_PATHS;
+    let group_bytes = R8 * row_bytes;
     let canary = f32::from_bits(0x7fc0_dead);
     let mut calls = 0;
+    let mut mirror = std::time::Duration::ZERO;
     for c in 1..=qdot::TILE_COLS {
         for s in 0..n {
             let idx: Vec<usize> = (0..c).map(|i| (s + i) % n).collect();
             let cols: Vec<&[u8]> = idx.iter().map(|&j| acols[j].as_slice()).collect();
-            for (g, grp) in packed.chunks_exact(R8 * row_bytes).enumerate() {
-                for (path, f) in R8_PATHS {
+            let moved_c: Vec<&[u8]> = idx.iter().map(|&j| moved_cols[j]).collect();
+            for g in 0..rows / R8 {
+                let at = g * group_bytes;
+                let grp = &packed[at..at + group_bytes];
+                let runs = [
+                    (
+                        "kernel, misaligned",
+                        kernel,
+                        &moved[at..at + group_bytes],
+                        &moved_c,
+                    ),
+                    ("kernel", kernel, grp, &cols),
+                    ("scalar", scalar, grp, &cols),
+                ];
+                for (path, f, grp, cs) in runs {
                     if path == "scalar" && g >= mirror_groups {
                         continue;
                     }
                     let mut buf = vec![[canary; R8]; qdot::TILE_COLS + 1];
-                    f(grp, &cols, k, &mut buf[..c]).unwrap();
+                    let t0 = std::time::Instant::now();
+                    f(grp, cs, k, &mut buf[..c]).unwrap();
+                    if path == "scalar" {
+                        mirror += t0.elapsed();
+                    }
                     for (slot, &j) in idx.iter().enumerate() {
                         for r in 0..R8 {
                             let (got, w) = (buf[slot][r], want[(R8 * g + r) * n + j]);
@@ -3117,60 +3185,46 @@ fn assert_r8_matches(
             }
         }
     }
-    calls
+    (calls, mirror)
 }
 
 /// Row-lane tile clause: two synthetic 8-row groups at the ends of the
-/// folded terms — codes u = 0 and u = 7, scales −32 and 31 (uniform,
-/// alternating by 16-code block, a ramp), and a group of u = 7 in every lane,
-/// which on the all-(−128) column drives each lane's i16 sum of four maddubs
-/// to its bound (8 · 7 · 128 = 7168) — against q8_K columns of every code
-/// −127 (block sums −2032), +127, −128 and ±127 alternating by block; then
-/// the V4.1 set's routed gate stack (k = the model width) and V2-Lite's
-/// `ffn_gate`-1 rows on the oracle's six `ffn_norm-1` tokens — tile =
-/// `dot_row` per (row, column), bit for bit.
+/// folded terms — the kinds of [`q3k_ends`], and a group of u = 7 in every
+/// lane, which on the all-(−128) column drives each lane's i16 sum of four
+/// maddubs to its bound (8 · 7 · 128 = 7168), each row of a group with its
+/// own `d` ([`R8_D`]) — against the ends' q8_K columns; then the V4.1 set's
+/// routed gate stack (k = the model width; the scalar mirror on every group)
+/// and V2-Lite's `ffn_gate`-1 rows on the oracle's six `ffn_norm-1` tokens —
+/// tile = `dot_row` per (row, column), bit for bit, on the packed bytes and
+/// on a misaligned copy ([`assert_r8_matches`]).
 #[test]
 #[ignore = "hw: needs the box, the V4.1 shard, the model file and $BLOOMERY_DATA/ref"]
 fn hw_q3k_r8_tile_matches_dot_row() {
     let ty = GgmlType::Q3_K;
-    // Rows of two super-blocks, d = 1.0 then 0.5.
+    // Rows of two super-blocks; in each, the eight rows of a group carry
+    // eight different d.
     let k = 512;
-    type Kind = (fn(usize) -> u8, fn(usize) -> i8);
-    let kinds: [Kind; 7] = [
-        (|_| 0, |_| -32),
-        (|_| 0, |_| 31),
-        (|_| 7, |_| -32),
-        (|_| 7, |_| 31),
-        (|_| 0, |j| if j % 2 == 0 { -32 } else { 31 }),
-        (|_| 7, |j| if j % 2 == 0 { 31 } else { -32 }),
-        (|i| (i % 8) as u8, |j| 4 * j as i8 - 32),
-    ];
-    let bound: [Kind; 4] = [
+    let (kinds, ends) = q3k_ends(k);
+    let bound: [Q3kKind; 4] = [
         (|_| 7, |_| -32),
         (|_| 7, |_| 31),
         (|_| 7, |j| if j % 2 == 0 { -32 } else { 31 }),
         (|_| 7, |j| if j % 2 == 0 { 31 } else { -32 }),
     ];
     let mut rows = Vec::new();
-    for r in 0..8 {
+    for (r, d) in R8_D.into_iter().enumerate() {
         let (u0, s0) = kinds[r % 7];
         let (u1, s1) = kinds[(r + 3) % 7];
-        rows.extend_from_slice(&q3k_block(u0, s0, 0x3C00));
-        rows.extend_from_slice(&q3k_block(u1, s1, 0x3800));
+        rows.extend_from_slice(&q3k_block(u0, s0, d));
+        rows.extend_from_slice(&q3k_block(u1, s1, R8_D[(r + 3) % 8]));
     }
     for r in 0..8 {
         let (u0, s0) = bound[r % 4];
         let (u1, s1) = bound[(r + 1) % 4];
-        rows.extend_from_slice(&q3k_block(u0, s0, 0x3C00));
-        rows.extend_from_slice(&q3k_block(u1, s1, 0x3800));
+        rows.extend_from_slice(&q3k_block(u0, s0, R8_D[(r + 5) % 8]));
+        rows.extend_from_slice(&q3k_block(u1, s1, R8_D[(r + 1) % 8]));
     }
-    let ends = vec![
-        q8k_col(k, |_| -127, 0.01),
-        q8k_col(k, |_| 127, 0.01),
-        q8k_col(k, |_| -128, 0.01),
-        q8k_col(k, |i| if (i / 16) % 2 == 0 { -127 } else { 127 }, 0.02),
-    ];
-    let calls = assert_r8_matches(
+    let (calls, _) = assert_r8_matches(
         "synthetic ends",
         k,
         k / 256 * 110,
@@ -3183,16 +3237,18 @@ fn hw_q3k_r8_tile_matches_dot_row() {
     );
 
     let (name, k, row_bytes, bytes) = v41_rows(ty, "ffn_gate_exps", TILE_ROWS);
-    let calls = assert_r8_matches(
+    let groups = TILE_ROWS / qdot::Q3K_R8_ROWS;
+    let (calls, mirror) = assert_r8_matches(
         &name,
         k,
         row_bytes,
         &bytes,
         &coded_columns(ty, k, vec![]),
-        2,
+        groups,
     );
     eprintln!(
-        "q3k r8 tile: {name} (k = {k}, {} rows): {calls} group calls, c = 1..=8, bit-identical",
+        "q3k r8 tile: {name} (k = {k}, {} rows): {calls} group calls, c = 1..=8, bit-identical; \
+         scalar mirror on all {groups} groups: {mirror:.2?}",
         bytes.len() / row_bytes
     );
 
@@ -3214,95 +3270,182 @@ fn hw_q3k_r8_tile_matches_dot_row() {
             a
         })
         .collect();
-    let calls = assert_r8_matches(&t.name, k2, rb2, rows2, &coded_columns(ty, k2, real), 2);
+    let (calls, _) = assert_r8_matches(&t.name, k2, rb2, rows2, &coded_columns(ty, k2, real), 2);
     eprintln!(
         "q3k r8 tile: {} (k = {k2}) on six oracle tokens + seeded: {calls} group calls, bit-identical",
         t.name
     );
 }
 
-/// The row-lane repack and tile refuse, by name and before any kernel runs:
-/// a column count outside `1..=TILE_COLS`, an `out` of another length, a `k`
-/// off the 256-value grid, a group of another length, a short column, a row
-/// count off the 8-row grid and repack buffers of another length.
+/// The row-lane repack and tile refuse, by name and with `out` left bit for
+/// bit as it was: a column count outside `1..=TILE_COLS`, an `out` of another
+/// length, a `k` off the 256-value grid, a group of another length, a short
+/// column, a row count off the 8-row grid and repack buffers of another
+/// length. `k = 0` is an empty product: `Ok` on empty buffers (the tile's
+/// values 0), refused with a buffer of any other length.
 #[test]
 fn q3k_r8_refuses_bad_shapes() {
     let ty = GgmlType::Q3_K;
     let k = 256;
     let group = vec![0u8; 8 * 110];
+    let two = vec![0u8; 2 * 880];
     let a = vec![0u8; col_bytes(ty, k)];
-    let many: Vec<&[u8]> = vec![a.as_slice(); qdot::TILE_COLS + 1];
-    let mut out = vec![[0.0f32; qdot::Q3K_R8_ROWS]; qdot::TILE_COLS + 1];
-    for (_, f) in R8_PATHS {
-        assert_eq!(
-            f(&group, &many, k, &mut out),
-            Err(QdotError::TileShape {
-                cols: qdot::TILE_COLS + 1,
-                outs: qdot::TILE_COLS + 1
-            })
+    let short = &a[..a.len() - 1];
+    let n = qdot::TILE_COLS + 1;
+    let many: Vec<&[u8]> = vec![a.as_slice(); n];
+    let canary = f32::from_bits(0x7fc0_dead);
+    for (path, f) in R8_PATHS {
+        let mut out = vec![[canary; qdot::Q3K_R8_ROWS]; n];
+        let mut refuses = |group: &[u8], cols: &[&[u8]], k: usize, outs: usize, want: QdotError| {
+            assert_eq!(f(group, cols, k, &mut out[..outs]), Err(want), "{path}");
+            assert!(
+                out.iter()
+                    .flatten()
+                    .all(|v| v.to_bits() == canary.to_bits()),
+                "{path}: the refusal {want:?} wrote into out"
+            );
+        };
+        refuses(
+            &group,
+            &many,
+            k,
+            n,
+            QdotError::TileShape { cols: n, outs: n },
         );
-        assert_eq!(
-            f(&group, &[], k, &mut []),
-            Err(QdotError::TileShape { cols: 0, outs: 0 })
+        refuses(&group, &[], k, 0, QdotError::TileShape { cols: 0, outs: 0 });
+        refuses(
+            &group,
+            &many[..2],
+            k,
+            3,
+            QdotError::TileShape { cols: 2, outs: 3 },
         );
-        assert_eq!(
-            f(&group, &many[..2], k, &mut out[..3]),
-            Err(QdotError::TileShape { cols: 2, outs: 3 })
+        refuses(
+            &group,
+            &many[..1],
+            100,
+            1,
+            QdotError::UnalignedK { k: 100, gran: 256 },
         );
-        assert_eq!(
-            f(&group, &many[..1], 100, &mut out[..1]),
-            Err(QdotError::UnalignedK { k: 100, gran: 256 })
-        );
-        assert_eq!(
-            f(&group[..879], &many[..1], k, &mut out[..1]),
-            Err(QdotError::RowGroupBytes {
+        refuses(
+            &group[..879],
+            &many[..1],
+            k,
+            1,
+            QdotError::RowGroupBytes {
+                buf: "tile group",
                 have: 879,
-                need: 880
-            })
+                need: 880,
+            },
         );
-        let two = vec![0u8; 2 * 880];
-        assert_eq!(
-            f(&two, &many[..1], k, &mut out[..1]),
-            Err(QdotError::RowGroupBytes {
+        refuses(
+            &two,
+            &many[..1],
+            k,
+            1,
+            QdotError::RowGroupBytes {
+                buf: "tile group",
                 have: 1760,
-                need: 880
-            })
+                need: 880,
+            },
         );
-        let short = &a[..a.len() - 1];
-        assert_eq!(
-            f(&group, &[a.as_slice(), short], k, &mut out[..2]),
-            Err(QdotError::ShortActivationCol {
+        refuses(
+            &group,
+            &many[..1],
+            0,
+            1,
+            QdotError::RowGroupBytes {
+                buf: "tile group",
+                have: 880,
+                need: 0,
+            },
+        );
+        refuses(
+            &group,
+            &[a.as_slice(), short],
+            k,
+            2,
+            QdotError::ShortActivationCol {
                 have: a.len() - 1,
                 need: a.len(),
-                k
-            })
+                k,
+            },
+        );
+        let mut zero = [[canary; qdot::Q3K_R8_ROWS]];
+        assert_eq!(f(&[], &many[..1], 0, &mut zero), Ok(()), "{path}: k = 0");
+        assert!(
+            zero[0].iter().all(|v| v.to_bits() == 0),
+            "{path}: k = 0 gave {zero:?}"
         );
     }
-    let mut dst = vec![0u8; 8 * 110];
-    assert_eq!(
-        qdot::repack_q3k_r8(&group[..7 * 110], 7, k, &mut dst[..7 * 110]),
-        Err(QdotError::RowGroup { rows: 7 })
+    let mut dst = vec![0xA5u8; 8 * 110];
+    let mut refuses = |rows: &[u8], n_rows: usize, k: usize, len: usize, want: QdotError| {
+        assert_eq!(
+            qdot::repack_q3k_r8(rows, n_rows, k, &mut dst[..len]),
+            Err(want)
+        );
+        assert!(
+            dst.iter().all(|&b| b == 0xA5),
+            "the repack refusal {want:?} wrote into dst"
+        );
+    };
+    refuses(
+        &group[..7 * 110],
+        7,
+        k,
+        7 * 110,
+        QdotError::RowGroup { rows: 7 },
     );
-    assert_eq!(
-        qdot::repack_q3k_r8(&group[..8 * 110 - 1], 8, k, &mut dst),
-        Err(QdotError::RowGroupBytes {
+    refuses(
+        &group[..8 * 110 - 1],
+        8,
+        k,
+        8 * 110,
+        QdotError::RowGroupBytes {
+            buf: "repack source",
             have: 8 * 110 - 1,
-            need: 8 * 110
-        })
+            need: 8 * 110,
+        },
     );
-    assert_eq!(
-        qdot::repack_q3k_r8(&group, 8, k, &mut dst[..8 * 110 - 1]),
-        Err(QdotError::RowGroupBytes {
+    refuses(
+        &group,
+        8,
+        k,
+        8 * 110 - 1,
+        QdotError::RowGroupBytes {
+            buf: "repack destination",
             have: 8 * 110 - 1,
-            need: 8 * 110
-        })
+            need: 8 * 110,
+        },
     );
-    assert_eq!(
-        qdot::repack_q3k_r8(&group, 8, 100, &mut dst),
-        Err(QdotError::UnalignedK { k: 100, gran: 256 })
+    refuses(
+        &group,
+        8,
+        100,
+        8 * 110,
+        QdotError::UnalignedK { k: 100, gran: 256 },
     );
+    refuses(
+        &[],
+        8,
+        0,
+        8 * 110,
+        QdotError::RowGroupBytes {
+            buf: "repack destination",
+            have: 8 * 110,
+            need: 0,
+        },
+    );
+    assert_eq!(qdot::repack_q3k_r8(&[], 8, 0, &mut []), Ok(()), "k = 0");
     let e = qdot::repack_q3k_r8(&group[..7 * 110], 7, k, &mut dst[..7 * 110])
         .unwrap_err()
         .to_string();
     assert!(e.contains("groups of 8"), "{e}");
+    let e = qdot::repack_q3k_r8(&group, 8, k, &mut dst[..8 * 110 - 1])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("row-lane repack destination is 879 bytes"),
+        "{e}"
+    );
 }
