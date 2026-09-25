@@ -1,5 +1,8 @@
 # 박스(5975WX, Zen 3)가 유일한 실행 기계다. 기준 x86-64 타깃으로는 스칼라 루프가 SSE2로만
 # 컴파일되고 round_ties_even 같은 것이 libm 호출이 된다. rustc는 mul+add를 FMA로 합치지
-# 않으므로 값은 그대로다 — 비트 게이트 전부가 이 플래그 아래서 돈다.
+# 않으므로 값은 그대로다 — plain cargo 빌드(CPU 게이트·벤치·bloomery-decode)가 이 플래그 아래서
+# 돈다. cargo oxide 빌드는 이 표를 보지 못한다: cargo-oxide가 내보내는 CARGO_ENCODED_RUSTFLAGS가
+# target.<triple>.rustflags를 가려 호스트 코드가 기준 x86-64로 컴파일된다(그쪽 소유자는
+# .cargo/cuda-oxide.toml의 extra-rustflags다 — 아직 없다, oxcpu fixup).
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=znver3"]

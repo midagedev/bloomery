@@ -413,7 +413,14 @@ MUL-10 ratchets it to `deny`. New engine code should not add to that count.
 ~~No `RUSTFLAGS`/`.cargo/config` enables AVX2 globally: every kernel's
 `#[target_feature]` is load-bearing.~~ Corrected 2026-09-23: `.cargo/config.toml`
 has set `-C target-cpu=znver3` for `x86_64-unknown-linux-gnu` since `48fc38c`
-(2026-09-20), so every box build compiles with AVX2 and FMA on. The attributes
+(2026-09-20), ~~so every box build compiles with AVX2 and FMA on~~ so every
+plain `cargo` build (the CPU gates, `bench_v41_host`, `bloomery-decode`) compiles with AVX2 and
+FMA on. Corrected 2026-09-25 (rustmodern): a `cargo oxide` build does **not** — cargo-oxide
+exports `CARGO_ENCODED_RUSTFLAGS`, which cargo consults first and which masks
+`target.<triple>.rustflags`, so `generate_ds41` and every GPU gate binary compile their host
+code for baseline x86-64 (measured on the box: 1,688 legacy scalar SSE instructions in
+`generate_ds41` against 4 in `bench_v41_host`); the fix is `.cargo/cuda-oxide.toml`
+`extra-rustflags` plus a check that the two files agree (the `oxcpu` fixup in the triage). The attributes
 stay — they are what keeps a kernel right in a build without that config
 (another target, a `RUSTFLAGS` override). A helper that touches `_mm*`
 intrinsics is either `#[inline(always)]` (it inherits the caller's features)
