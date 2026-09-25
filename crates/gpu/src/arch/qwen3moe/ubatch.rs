@@ -1,12 +1,13 @@
-//! qwen3moe's GEMM prefill: a prompt fed in ubatches of up to [`UBATCH`]
-//! tokens, every weight read once per ubatch. The dense projections run
-//! through the grouped int8 GEMM over a one-expert table built once per
-//! ubatch; the routed experts through one route table per layer, gate and up
-//! reading each token's column (`GemmInput::Shared`), down each slot's own.
-//! The glue between them is the chain's own kernels at `T` rows: the
-//! embedding rows, `rms_norm` then the q8_1 quantizer (the bytes
-//! `norm_quant` writes), the per-head norm with the rope and the cache
-//! append, the prefill flash (`flash_gqa_prefill`: each row over its own
+//! qwen3moe's GEMM prefill: a prompt fed in ubatches of up to `U` tokens,
+//! every weight read once per ubatch, `U` the model's ubatch size — set at
+//! load ([`ubatch_size`]: `BLOOMERY_QWEN3_UBATCH`, else [`UBATCH`]), at most
+//! [`UBATCH`]. The dense projections run through the grouped int8 GEMM over
+//! a one-expert table built once per ubatch; the routed experts through one
+//! route table per layer, gate and up reading each token's column
+//! (`GemmInput::Shared`), down each slot's own. The glue between them is the
+//! chain's own kernels at `T` rows: the embedding rows, `rms_norm` then the
+//! q8_1 quantizer (the bytes `norm_quant` writes), the per-head norm with
+//! the rope and the cache append, the prefill flash (`flash_gqa_prefill`: each row over its own
 //! live key count, the cache's key tiles staged once per block), the
 //! residual add, the router in two launches, SwiGLU with the down's
 //! quantizer in one launch (`GemmKernels::enqueue_swiglu_quant`), and the
@@ -23,12 +24,18 @@
 //! the values with f16 weights on the tensor cores, so the two paths agree to
 //! the error of those sums and roundings and are not bit-equal.
 //!
-//! Buffers. The arena holds `min(UBATCH, ctx)` rows of every intermediate
-//! and the prompt image room for a prompt as long as the cache: token ids,
+//! Buffers. The arena holds `min(U, ctx)` rows of every intermediate and
+//! the prompt image room for a prompt as long as the cache: token ids,
 //! positions, live key counts and rope rows, each an array over the prompt,
 //! written and copied to the card once per prompt; a ubatch reads windows of
-//! it. Nothing is allocated per prompt or per ubatch. The ubatches run eager
-//! in both step modes.
+//! it. Nothing is allocated per prompt or per ubatch; a new `U`
+//! ([`Ubatch::resize`]) reallocates the arena alone. The ubatches run eager
+//! in both step modes, so no captured graph holds an arena address.
+//!
+//! Sizes. No kernel of a ubatch needs more of `U` than `1..=UBATCH`: the
+//! route and the GEMM take any slot count up to [`GEMM_MAX_SLOTS`], the
+//! router and the prefill flash cut the tokens into groups of eight and
+//! guard the last, and every other launch works per token or per slot.
 
 use super::body::{Kernels, Kq, LayerNames};
 use super::experts::CombineArgs;
@@ -45,11 +52,43 @@ use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::qwen3moe::names::token_embd;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroUsize;
 
-/// Tokens one ubatch takes: the grouped GEMM's slot cap at top-8.
+/// The most tokens one ubatch takes: the grouped GEMM's slot cap at top-8.
+/// Also the default ubatch size: the one that reads each weight the fewest
+/// times per prompt and gives each expert's GEMM the most columns.
 pub const UBATCH: usize = GEMM_MAX_SLOTS / N_USED;
 
+/// The environment variable a load reads the ubatch size from.
+pub const UBATCH_ENV: &str = "BLOOMERY_QWEN3_UBATCH";
+
 const WHAT: &str = "qwen3moe::ubatch";
+
+/// `u` as a ubatch size, or an error unless it is in `1..=UBATCH`.
+fn ubatch_of(u: usize) -> Result<NonZeroUsize, GpuError> {
+    NonZeroUsize::new(u)
+        .filter(|u| u.get() <= UBATCH)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("a ubatch of {u} tokens (1..={UBATCH})")))
+}
+
+/// The ubatch size a load takes: [`UBATCH_ENV`] if set, else [`UBATCH`].
+/// Read once per process; a value that is set but not a size in
+/// `1..=UBATCH` is an error that names it, at every load.
+pub fn ubatch_size() -> Result<usize, GpuError> {
+    static SIZE: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+    SIZE.get_or_init(|| match std::env::var(UBATCH_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(UBATCH),
+        Err(e) => Err(format!("{UBATCH_ENV}: {e}")),
+        Ok(v) => match v.parse::<usize>() {
+            Ok(u) if (1..=UBATCH).contains(&u) => Ok(u),
+            _ => Err(format!(
+                "{UBATCH_ENV}={v} is not a ubatch size in 1..={UBATCH}"
+            )),
+        },
+    })
+    .clone()
+    .map_err(|e| GpuError::shape(WHAT, e))
+}
 
 /// The GEMM's type for a qwen3moe projection.
 fn gemm_ty(kq: Kq) -> GemmWeight {
@@ -266,18 +305,44 @@ pub(super) struct Ubatch {
     a: UbArena,
     img: UbImage,
     flash: FlashGqaPrefill,
+    /// The ubatch size `U`; the arena holds `min(U, ctx)` rows.
+    size: NonZeroUsize,
 }
 
 impl Ubatch {
-    /// The arena for `min(UBATCH, ctx_max)` rows of `d`, an image for a
-    /// prompt of `ctx_max` tokens and the prefill flash's module. Load-time
-    /// only.
-    pub(super) fn new(stream: &CudaStream, d: Dims, ctx_max: usize) -> Result<Ubatch, GpuError> {
+    /// The arena for `min(u, ctx_max)` rows of `d`, an image for a prompt
+    /// of `ctx_max` tokens and the prefill flash's module; `u` in
+    /// `1..=UBATCH`, else refused. Load-time only.
+    pub(super) fn new(
+        stream: &CudaStream,
+        d: Dims,
+        ctx_max: usize,
+        u: usize,
+    ) -> Result<Ubatch, GpuError> {
+        let size = ubatch_of(u)?;
         Ok(Ubatch {
-            a: UbArena::new(stream, d, UBATCH.min(ctx_max))?,
+            a: UbArena::new(stream, d, u.min(ctx_max))?,
             img: UbImage::new(stream, ctx_max)?,
             flash: FlashGqaPrefill::load(stream.context())?,
+            size,
         })
+    }
+
+    /// The ubatch size.
+    pub(super) fn size(&self) -> NonZeroUsize {
+        self.size
+    }
+
+    /// Reallocate the arena for ubatches of up to `u` (`1..=UBATCH`, else
+    /// refused) tokens. The new arena is allocated before the old one is
+    /// freed, so a refusal or a failed allocation leaves the old size in
+    /// place. Load-time allocation.
+    pub(super) fn resize(&mut self, stream: &CudaStream, u: usize) -> Result<(), GpuError> {
+        let size = ubatch_of(u)?;
+        let d = self.a.dims;
+        self.a = UbArena::new(stream, d, u.min(d.ctx))?;
+        self.size = size;
+        Ok(())
     }
 
     /// Write the image of the tokens the ubatches of a prompt take, from

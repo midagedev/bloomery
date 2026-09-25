@@ -921,8 +921,9 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
     // The grouped int8 GEMM (`bloomery_gpu::gemm`): Qwen3-30B-A3B's routed
     // gate shape — 128 experts of 768 x 2048 Q4_K, top-8, every slot reading
     // its token's column — and the dense 2048 x 2048 Q4_K case, each at T
-    // tokens. The route table is built once per T and its launch priced on
-    // its own; the GEMM arm is the GEMM alone. Beside the usual row: the
+    // tokens up to the largest ubatch (4096: 32,768 routed slots). The route
+    // table is built once per T and its launch priced on its own; the GEMM
+    // arm is the GEMM alone. Beside the usual row: the
     // arithmetic rate `2 * slots * rows * K` over the graph minimum, and that
     // rate against the card's int8 dense tensor peak.
     {
@@ -943,7 +944,7 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
             let cols = 36 * k / 256;
             let w =
                 DeviceTensor::<u32>::upload(stream, &fill_pattern(n_rows * cols), n_rows, cols)?;
-            for t in [16usize, 64, 256, 512] {
+            for t in [16usize, 64, 256, 512, 1024, 2048, 4096] {
                 let n_slots = t * top_k;
                 let xs = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(t * k))?;
                 let mut act = GemmAct::new(stream, t, k)?;

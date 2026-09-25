@@ -1,9 +1,11 @@
 //! qwen3moe's prompt prefill: a prompt fed several positions per launch
 //! instead of one decode step per token, by one of two paths
 //! ([`PrefillPlan`]). A prompt that fits one pass takes the pass path; a
-//! longer one runs as GEMM ubatches of up to [`UBATCH`] tokens
-//! (`super::ubatch`), every weight read once per ubatch, and a tail of at
-//! most one pass after them takes the pass path again. At nine tokens a
+//! longer one runs as GEMM ubatches of up to the model's ubatch size
+//! (`super::ubatch`: at most [`UBATCH`](super::ubatch::UBATCH), set at
+//! load, changed by [`GpuModel::set_ubatch`]), every weight read once per
+//! ubatch, and a tail of at most one pass after them takes the pass path
+//! again. At nine tokens a
 //! ubatch reads fewer expert bytes than two passes and its dense GEMMs cost
 //! less than a pass's launches, so the cut sits there. The GEMM path sums
 //! its products in another order than the one-token path and is gated by a
@@ -39,7 +41,7 @@ use super::body::Body;
 use super::dispatch::{self, PassCtx};
 use super::router::MAX_TOKENS;
 use super::scratch::{Arena, Dims, Io, param_view};
-use super::ubatch::{UBATCH, UbCtx};
+use super::ubatch::UbCtx;
 use crate::flash_gqa::HEAD;
 use crate::model::{GpuModel, StepMode};
 use crate::rope_table::{Direction, RopeTable};
@@ -47,6 +49,7 @@ use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
 use std::mem::ManuallyDrop;
+use std::num::NonZeroUsize;
 
 /// Element offsets into one pass's block, image and slot alike:
 /// [`MAX_TOKENS`] ids, positions and live key counts (u32 each), then
@@ -367,13 +370,13 @@ impl Body {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillPath {
     /// The cut in the module doc: a prompt of at most [`MAX_TOKENS`] tokens
-    /// takes one pass; a longer one GEMM ubatches of up to [`UBATCH`], and a
-    /// tail of at most [`MAX_TOKENS`] after them one pass.
+    /// takes one pass; a longer one GEMM ubatches of up to the ubatch size,
+    /// and a tail of at most [`MAX_TOKENS`] after them one pass.
     Auto,
     /// Passes of up to [`MAX_TOKENS`] positions, the whole prompt: the path
     /// that is bit-equal to one step per token.
     Pass,
-    /// GEMM ubatches of up to [`UBATCH`] tokens, the whole prompt.
+    /// GEMM ubatches of up to the ubatch size, the whole prompt.
     Gemm,
 }
 
@@ -391,22 +394,25 @@ pub struct PrefillPlan {
 }
 
 impl PrefillPlan {
-    /// The plan of a prompt of `tokens` ids by `path`.
+    /// The plan of a prompt of `tokens` ids by `path` on a model whose
+    /// ubatch size is `ubatch` ([`GpuModel::prefill_plan`] passes the
+    /// model's).
     #[must_use]
-    pub fn new(tokens: usize, path: PrefillPath) -> PrefillPlan {
+    pub fn new(tokens: usize, path: PrefillPath, ubatch: NonZeroUsize) -> PrefillPlan {
+        let ub = ubatch.get();
         let chunked = |n: usize, w: usize, f: fn(usize) -> PrefillStep| {
             (0..n.div_ceil(w)).map(move |i| f(w.min(n - i * w)))
         };
         let steps = match path {
             PrefillPath::Pass => chunked(tokens, MAX_TOKENS, PrefillStep::Pass).collect(),
-            PrefillPath::Gemm => chunked(tokens, UBATCH, PrefillStep::Ubatch).collect(),
+            PrefillPath::Gemm => chunked(tokens, ub, PrefillStep::Ubatch).collect(),
             PrefillPath::Auto if tokens <= MAX_TOKENS => {
                 chunked(tokens, MAX_TOKENS, PrefillStep::Pass).collect()
             }
             PrefillPath::Auto => {
-                let tail = tokens % UBATCH;
+                let tail = tokens % ub;
                 let mut v: Vec<PrefillStep> =
-                    chunked(tokens - tail, UBATCH, PrefillStep::Ubatch).collect();
+                    chunked(tokens - tail, ub, PrefillStep::Ubatch).collect();
                 match tail {
                     0 => {}
                     t if t <= MAX_TOKENS => v.push(PrefillStep::Pass(t)),
@@ -513,6 +519,29 @@ impl GpuModel<Body> {
         self.prefill_with(tokens, PrefillPath::Auto)
     }
 
+    /// The GEMM prefill's ubatch size: the most tokens one ubatch takes.
+    pub fn ubatch(&self) -> Result<usize, GpuError> {
+        Ok(self.body("qwen3moe::ubatch")?.ub.size().get())
+    }
+
+    /// Run the GEMM prefill in ubatches of up to `u` tokens from here on:
+    /// `u` in `1..=UBATCH`, else refused with the old size kept. The
+    /// ubatch arena is reallocated for `min(u, ctx)` rows (load-time
+    /// allocation); nothing captured refers to it, and a token's values do
+    /// not depend on the ubatch it lands in, so the prompt's K/V rows and
+    /// logits are the same bits at every size.
+    pub fn set_ubatch(&mut self, u: usize) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen3moe::set_ubatch")?;
+        body.ub.resize(gpu.stream(), u)
+    }
+
+    /// The units [`GpuModel::prefill_with`] runs a prompt of `tokens` ids
+    /// as by `path`, at this model's ubatch size.
+    pub fn prefill_plan(&self, tokens: usize, path: PrefillPath) -> Result<PrefillPlan, GpuError> {
+        let ub = self.body("qwen3moe::prefill_plan")?.ub.size();
+        Ok(PrefillPlan::new(tokens, path, ub))
+    }
+
     /// Feed `tokens` through the chain by the plan of `path` (module doc)
     /// and return the greedy next token after the last one. Positions
     /// continue from wherever the model stands. On the pass path this is
@@ -529,7 +558,7 @@ impl GpuModel<Body> {
         let pos0 = self.pos();
         self.check_pos(pos0 + launch_u32(WHAT, "tokens", tokens.len())? - 1, WHAT)?;
         let graph = self.mode() == StepMode::Graph;
-        let plan = PrefillPlan::new(tokens.len(), path);
+        let plan = self.prefill_plan(tokens.len(), path)?;
         let n_ub = plan.ubatch_tokens();
         let passes: Vec<usize> = plan
             .steps

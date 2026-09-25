@@ -10,7 +10,7 @@ use super::prefill::Prefill;
 use super::proj::ProjKernels;
 use super::router::{N_EXPERT, N_USED, RouterKernels};
 use super::scratch::{Arena, Dims, KvPlanes, SP_CS, SP_N_KEYS, SP_POS, SP_TOKEN, StepParams};
-use super::ubatch::Ubatch;
+use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, gqa_mma};
 use crate::gemm::GemmKernels;
 use crate::head::Head;
@@ -356,7 +356,7 @@ impl ChainBody for Body {
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
             prefill: Prefill::new(stream, dims, ctx_max)?,
-            ub: Ubatch::new(stream, dims, ctx_max)?,
+            ub: Ubatch::new(stream, dims, ctx_max, ubatch_size()?)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream)?,
             hp,

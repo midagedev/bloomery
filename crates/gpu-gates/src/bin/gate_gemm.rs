@@ -10,10 +10,10 @@
 //! 5120 → 2304, 384 experts, top-6; `BLOOMERY_V41_MODEL`); then synthetic
 //! stacks from a fixed seed at the same shapes for Q4_K, Q6_K and Q3_K, and
 //! a Q5_K stack at the Qwen3 gate shape. Each case runs T ∈ {1, 15, 16, 17,
-//! 64, 511, 512} tokens under four routings: uniform, every token on the
-//! same top-k experts, a quarter of the experts only, and slots dealt to
-//! experts round-robin (one slot per expert while there are fewer slots than
-//! experts).
+//! 64, 511, 512, 4096} tokens (4096 the largest ubatch) under four routings:
+//! uniform, every token on the same top-k experts, a quarter of the experts
+//! only, and slots dealt to experts round-robin (one slot per expert while
+//! there are fewer slots than experts).
 //!
 //! Checks per run:
 //! 1. Every output of every slot written (`y` starts at a sentinel).
@@ -33,7 +33,18 @@
 //!
 //! `--case <text>` runs only the cases whose name contains `text` (the
 //! dense case is `dense`, the faults and refusals `fault`, the ubatch router
-//! `router`).
+//! `router`, the route table `route_table`).
+//!
+//! The route table (`GemmKernels::enqueue_route`, case `route_table`) for T
+//! ∈ {1, 17, 512, 1000, 4095, 4096} tokens under the four routings, on a
+//! Qwen3 stack's shape (128 experts, top-8: up to 32,768 slots) and a V4.1
+//! one's (384 experts, top-6), and the dense table (`enqueue_route_dense`)
+//! at the same counts: the slot list and the tiles bit for bit the host's
+//! stable grouping — experts ascending, each expert's slots ascending, runs
+//! cut into tiles of at most `GEMM_BN`. Then at 32,768 slots: three ids past
+//! the stack in three different chunks end as the named fault with the
+//! table the host builds without them, and a captured route's replay writes
+//! the eager table.
 //!
 //! The ubatch router the GEMM prefill routes with
 //! (`RouterKernels::enqueue_ubatch`: the logits launch, then the routing
@@ -42,8 +53,9 @@
 //! fused router (`enqueue_fused`, eight tokens a launch) writes for the same
 //! columns, and every logit within `γ(k/32 + 5) · Σ |w·x|` of the f64 dot
 //! (each lane's sequential sum of `k/32` products, then the five-step
-//! butterfly). Then its refusals (tokens past the buffers, none, a short
-//! input, a weight of the wrong shape, a ubatch past 512 tokens).
+//! butterfly), T = 4096 included. Then its refusals (tokens past the
+//! buffers, none, a short input, a weight of the wrong shape, a ubatch past
+//! `UBATCH` tokens).
 //!
 //! The SwiGLU quantizer between gate·up and down
 //! (`GemmKernels::enqueue_swiglu_quant`, case `swiglu`) at K ∈ {768, 2048}
@@ -82,7 +94,7 @@ mod gate {
     };
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::gemm::{
-        GEMM_MAX_SLOTS, GemmAct, GemmInput, GemmKernels, GemmRoute, GemmWeight,
+        GEMM_BN, GEMM_MAX_SLOTS, GemmAct, GemmInput, GemmKernels, GemmRoute, GemmTile, GemmWeight,
     };
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
@@ -99,7 +111,7 @@ mod gate {
     /// reads back as these bits.
     const SENT: f32 = 1.0e30;
     /// Token counts per case.
-    const TOKENS: [usize; 7] = [1, 15, 16, 17, 64, 511, 512];
+    const TOKENS: [usize; 8] = [1, 15, 16, 17, 64, 511, 512, UBATCH];
     /// Slot counts up to which every row of every slot is checked.
     const ALL_ROWS_UP_TO: usize = 136;
 
@@ -1202,6 +1214,145 @@ mod gate {
         Ok(ok)
     }
 
+    /// Token counts of the route table case: one token, a ragged pass, the
+    /// old ubatch, an odd size, the largest ubatch and one token below it.
+    const ROUTE_TOKENS: [usize; 6] = [1, 17, 512, 1000, UBATCH - 1, UBATCH];
+
+    /// The route table the host builds: the slots with an id below `n_exp`
+    /// grouped by expert, experts ascending, each expert's slots ascending
+    /// (the stable grouping), and each expert's run cut into tiles of at
+    /// most `GEMM_BN` slots.
+    fn route_ref(ids: &[u32], n_exp: usize) -> (Vec<u32>, Vec<GemmTile>) {
+        let mut by_exp: Vec<Vec<u32>> = vec![Vec::new(); n_exp];
+        for (s, &e) in ids.iter().enumerate() {
+            if (e as usize) < n_exp {
+                by_exp[e as usize].push(s as u32);
+            }
+        }
+        let mut cols = Vec::with_capacity(ids.len());
+        let mut tiles = Vec::new();
+        for (e, slots) in by_exp.iter().enumerate() {
+            for run in slots.chunks(GEMM_BN) {
+                tiles.push(GemmTile {
+                    expert: e as u32,
+                    start: cols.len() as u32,
+                    len: run.len() as u32,
+                });
+                cols.extend_from_slice(run);
+            }
+        }
+        (cols, tiles)
+    }
+
+    /// Whether the table `route` holds is the host's for `ids`: the tiles
+    /// equal, and the slot list's first entries (as many as the tiles list)
+    /// equal. Prints one line under `label`.
+    fn route_matches(
+        dev: &Dev<'_>,
+        route: &GemmRoute,
+        ids: &[u32],
+        n_exp: usize,
+        label: &str,
+    ) -> Result<bool, GateError> {
+        let (want_cols, want_tiles) = route_ref(ids, n_exp);
+        let (cols, tiles) = route.read_back(dev.gpu.stream())?;
+        let tiles_eq = tiles == want_tiles;
+        let cols_eq = cols.len() >= want_cols.len() && cols[..want_cols.len()] == want_cols[..];
+        let pass = tiles_eq && cols_eq;
+        println!(
+            "gemm case=route_table {label} slots={} listed={} tiles={} (host {}) \
+             tiles_eq_host={tiles_eq} cols_eq_host={cols_eq} {}",
+            ids.len(),
+            want_cols.len(),
+            tiles.len(),
+            want_tiles.len(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The route table against the host's (module doc), its faults at the
+    /// largest slot count and its graph replay.
+    fn route_table_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("route_table") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        let max_tok = ROUTE_TOKENS[ROUTE_TOKENS.len() - 1];
+        let mut ok = true;
+        gpu.clear_fault()?;
+        for (stack, n_exp, top_k) in [("qwen3", N_EXPERT, N_USED), ("v41", 384usize, 6usize)] {
+            let max_slots = max_tok * top_k;
+            let mut route = GemmRoute::new(stream, max_slots, n_exp)?;
+            let mut ids_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
+            for &t in &ROUTE_TOKENS {
+                for (ri, &r) in ROUTINGS.iter().enumerate() {
+                    let ids = route_ids(r, t, top_k, n_exp, 0x7a61e ^ (t as u64) << 8 ^ ri as u64);
+                    ids_d.copy_from_host(stream, &pad(&ids, max_slots))?;
+                    dev.gk
+                        .enqueue_route(stream, &ids_d, ids.len(), &mut route, sink)?;
+                    let label = format!("stack={stack} T={t} routing={r:?}");
+                    ok &= route_matches(dev, &route, &ids, n_exp, &label)?;
+                }
+            }
+            if gpu.take_fault()?.is_some() {
+                println!("gemm case=route_table stack={stack}: a fault on valid ids FAIL");
+                ok = false;
+            }
+            if stack != "qwen3" {
+                continue;
+            }
+            // Ids past the stack in three chunks of the largest table: the
+            // named fault, and the table without their slots.
+            let mut ids = route_ids(Routing::Uniform, max_tok, top_k, n_exp, 0xbad1d);
+            let bad = [0usize, max_slots / 2 + 1, max_slots - 1];
+            ids[bad[0]] = n_exp as u32;
+            ids[bad[1]] = u32::MAX;
+            ids[bad[2]] = n_exp as u32 + 7;
+            ids_d.copy_from_host(stream, &ids)?;
+            dev.gk
+                .enqueue_route(stream, &ids_d, ids.len(), &mut route, sink)?;
+            let fault = gpu.take_fault()?;
+            let site_ok = fault.is_some_and(|f| f.site() == Some(FaultSite::ExpertId));
+            println!(
+                "gemm case=route_table fault=ids_past_stack slots={max_slots} at {bad:?}: fault=\"{}\" \
+                 (want ExpertId) {}",
+                fault.map_or_else(|| "none".to_string(), |f| f.to_string()),
+                verdict(site_ok)
+            );
+            ok &= site_ok;
+            ok &= route_matches(dev, &route, &ids, n_exp, "fault=ids_past_stack")?;
+            // A captured route's replay writes the eager table.
+            let ids = route_ids(Routing::Uniform, max_tok, top_k, n_exp, 0x9a9f);
+            ids_d.copy_from_host(stream, &ids)?;
+            let n_slots = ids.len();
+            let (gk, route_m, ids_ref) = (&dev.gk, &mut route, &ids_d);
+            let graph = gpu.capture(|s| gk.enqueue_route(s, ids_ref, n_slots, route_m, sink))?;
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            ok &= route_matches(dev, &route, &ids, n_exp, "graph_replay")?;
+        }
+        // The dense table: every slot on expert 0, the identity list.
+        let mut dense = GemmRoute::new(stream, max_tok, 1)?;
+        for &t in &ROUTE_TOKENS {
+            dev.gk.enqueue_route_dense(stream, t, &mut dense, sink)?;
+            ok &= route_matches(
+                dev,
+                &dense,
+                &vec![0u32; t],
+                1,
+                &format!("stack=dense T={t}"),
+            )?;
+        }
+        if gpu.take_fault()?.is_some() {
+            println!("gemm case=route_table stack=dense: a fault on the dense table FAIL");
+            ok = false;
+        }
+        Ok(ok)
+    }
+
     /// Column counts of the SwiGLU quantizer case.
     const SWIGLU_COLS: [usize; 4] = [1, 8, 64, 4096];
 
@@ -1346,7 +1497,7 @@ mod gate {
     }
 
     /// Token counts of the ubatch router case.
-    const ROUTER_TOKENS: [usize; 6] = [1, 7, 8, 9, 63, 512];
+    const ROUTER_TOKENS: [usize; 7] = [1, 7, 8, 9, 63, 512, UBATCH];
 
     /// The ubatch router against the fused router and the f64 dot (module
     /// doc), then its refusals. `w` is the router weight, [`N_EXPERT`] rows
@@ -1585,6 +1736,7 @@ mod gate {
             ok &= v41_cases(&dev, dims)?;
         }
         ok &= dense_case(&dev)?;
+        ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
         ok &= faults(&dev)?;
         ok &= sel_faults(&dev)?;
@@ -1597,8 +1749,9 @@ mod gate {
         }
         println!(
             "PASSED: gate_gemm — every run inside its derived band of the f64 reference, every slot \
-             written, rerun and graph replay bit-identical, faults named; the ubatch router and the \
-             SwiGLU quantizer bit for bit their compositions"
+             written, rerun and graph replay bit-identical, faults named; the route table the host's \
+             stable grouping bit for bit up to 32,768 slots; the ubatch router and the SwiGLU \
+             quantizer bit for bit their compositions"
         );
         Ok(())
     }

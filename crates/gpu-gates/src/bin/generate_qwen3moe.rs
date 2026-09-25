@@ -13,14 +13,17 @@
 //!
 //! The prompt is prefilled (`Qwen3moeModel::prefill_with` by the `--prefill`
 //! path: `auto` takes one pass for a prompt of up to eight ids and GEMM
-//! ubatches of up to 512 for a longer one, a tail of up to eight after them
-//! one pass; `pass` passes of up to eight positions, the same cache rows and
-//! answer as one step per token, in graph mode each a replay of the pass of
-//! its size; `gemm` ubatches only); the argmax after its last token is
-//! generated token 0, and `N − 1` feedback steps follow.
-//! Lines: `prompt_ids`, `load` (with the decode flash pass: `flash_mma=`; and
-//! the ubatches' attention, `ubatch_attn=gqa_prefill_flash`, on the `load`
-//! line because the `time prompt` row's shape is parsed to its end), in graph
+//! ubatches of up to the load's ubatch size for a longer one, a tail of up
+//! to eight after them one pass; `pass` passes of up to eight positions, the
+//! same cache rows and answer as one step per token, in graph mode each a
+//! replay of the pass of its size; `gemm` ubatches only); the argmax after
+//! its last token is generated token 0, and `N − 1` feedback steps follow.
+//! The ubatch size is `BLOOMERY_QWEN3_UBATCH` (1..=4096, default 4096), read
+//! at load.
+//! Lines: `prompt_ids`, `load` (with the decode flash pass: `flash_mma=`; the
+//! ubatches' attention, `ubatch_attn=gqa_prefill_flash`; and their size,
+//! `ubatch=`, on the `load` line because the `time prompt` row's shape is
+//! parsed to its end), in graph
 //! mode `capture graph_nodes=` and `capture prefill_graphs=<n> nodes=<m=1>,…
 //! ms= vram_bytes=` (every pass size captured before the prompt: its wall
 //! and the card's free bytes it took, runtime values), `step 0 pos tok`
@@ -64,7 +67,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod cli {
     use bloomery_gpu::Qwen3moeModel;
-    use bloomery_gpu::arch::qwen3moe::{PrefillPath, PrefillPlan};
+    use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::{GateError, open_split, ref_model_path};
     use model::arch::Arch;
@@ -142,7 +145,7 @@ mod cli {
         m.set_mode(mode);
         println!(
             "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
-             ubatch_attn=gqa_prefill_flash in {:.1} s (runtime value)",
+             ubatch_attn=gqa_prefill_flash ubatch={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             m.stages()[0].layers().len(),
             if mode == StepMode::Graph {
@@ -151,6 +154,7 @@ mod cli {
                 "eager"
             },
             m.body("generate_qwen3moe")?.flash_mma(),
+            m.ubatch()?,
             t.elapsed().as_secs_f64()
         );
         if mode == StepMode::Graph {
@@ -173,7 +177,7 @@ mod cli {
             m.seed_depth(d - 1)?;
             println!("seed rows={} pos={}", d - 1, m.pos());
         }
-        let plan = PrefillPlan::new(ids.len(), path);
+        let plan = m.prefill_plan(ids.len(), path)?;
         let t = Instant::now();
         let mut next = m.prefill_with(&ids, path)?;
         let prefill_wall = t.elapsed();

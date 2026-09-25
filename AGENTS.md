@@ -464,7 +464,11 @@ tensor-core default; `just gate-gpu-e2e` runs both, and the timing binary
 prints which one it ran on its `load` line), `BLOOMERY_GQA_MMA=0` (qwen3moe
 GQA flash: the scalar segment pass instead of the tensor-core default, its
 banded twin; `just gate-gpu-qwen3moe-e2e` runs both and the `load` line
-prints which one ran), `BLOOMERY_HYBRID_NL` (gpu hybrid
+prints which one ran), `BLOOMERY_QWEN3_UBATCH=<n>` (qwen3moe GEMM prefill, read once at load:
+tokens per ubatch, 1–4096, default 4096; the arena holds `min(n, ctx)` rows;
+a token's bits do not depend on it — `just gate-gpu-qwen3moe-e2e` holds 512,
+1000 and 4096 to one another; an unusable value is refused by name; the
+`load` line prints `ubatch=`), `BLOOMERY_HYBRID_NL` (gpu hybrid
 MoE: experts `[0, n_l)` of every routed stack stay on the card and the rest
 run on the host tier inside the captured step; unset or equal to the expert
 count is the all-card path; `just gate-gpu-hybrid` refuses to run with it

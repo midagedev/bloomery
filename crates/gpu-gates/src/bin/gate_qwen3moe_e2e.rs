@@ -50,9 +50,9 @@
 //!   leave the same K/V rows bit for bit, none of them still the pattern, and
 //!   the same last logits bit for bit.
 //! - (u) the GEMM prefill against the one-token path, on the first
-//!   [`LONG`] ids of the prose file `corpus-prose.ids` (its digest checked):
-//!   1,025 ids run as ubatches of 512 and 512 and a one-id pass, 1,300 as
-//!   512, 512 and 276. Layer 0's K and V rows within [`GEMM_L0_REL`] of the
+//!   [`LONG`] ids of the prose file `corpus-prose.ids` (its digest checked),
+//!   at the load's ubatch size (the default, 4096, clipped to the cache: each
+//!   prompt one ubatch). Layer 0's K and V rows within [`GEMM_L0_REL`] of the
 //!   one-token path's; each later layer's distance within
 //!   [`GEMM_SPREAD_RATIO`] times the one-token path's own distance between
 //!   its two flash arithmetics (the same prompt stepped eagerly on the other
@@ -63,14 +63,22 @@
 //!   second call's first position off every ubatch boundary) leave the whole
 //!   prefill's K/V rows and last logits bit for bit: a token's GEMM-path
 //!   values do not depend on the ubatch it lands in.
+//! - (w) the ubatch size moves no bit: a model opened with [`CTX_W`] cache
+//!   rows prefills the prose's first [`W_LONG`] ids at each size of
+//!   [`W_SIZES`] (ubatches of 512 x 8; 1,000 x 4 and 96; one of 4,096 —
+//!   32,768 routed slots in one table) and every run leaves the K/V rows,
+//!   the last logits and the token of the 4,096 run bit for bit; so do one
+//!   id more at 512 and at 4,096 (each ending in a one-id pass), and the
+//!   4,096 ids at 4,096 prefilled in two calls cut at [`W_SPLIT`]. Sizes
+//!   outside `1..=UBATCH` are refused with the size kept.
 //! - (x) a fault names its layer: layer [`FAULT_LAYER`]'s FFN half run alone
 //!   on a finite row with one NaN raises inside that layer's launches, and
 //!   the next step returns `GpuError::Fault` with that layer (the site is the
 //!   smallest code among the layer's raises, printed), the model poisoned;
 //!   `reset` leaves the word clean and the next step a token.
 //!
-//! `--gemm-only` runs the load and (u) alone, `--fault-only` the load and
-//! (x).
+//! `--gemm-only` runs the load, (u) and (w), `--ubatch-only` (w) alone,
+//! `--fault-only` the load and (x).
 //!
 //! The flash pass is read once per process (`BLOOMERY_GQA_MMA`), so each
 //! pass is its own run; the `load` line names it.
@@ -100,8 +108,9 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-    use bloomery_gpu::arch::qwen3moe::{PrefillPath, PrefillPlan};
+    use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{GpuError, Qwen3moeModel};
@@ -190,7 +199,7 @@ mod gate {
     /// also carries that arithmetic's against the arm's decode flash. A
     /// correct GEMM path's K/V rows read below 1.9 on these prompts under
     /// either flash pass, highest on layers 34-37, and its logits ratio below
-    /// 2.2 (highest in the scalar arm, where the prefill flash's f16
+    /// 2.8 (highest in the scalar arm, where the prefill flash's f16
     /// arithmetic stands against the scalar decode flash); a wiring fault — a table built from another layer's or token's
     /// ids, weights one slot off, positions off by one — reads an error of
     /// order one against a spread of 1e-3 to 2.5e-1, a K/V ratio above 3.7
@@ -287,9 +296,11 @@ mod gate {
         m.set_mode(mode);
         let mma = m.body("gate_qwen3moe_e2e")?.flash_mma();
         println!(
-            "load resident_bytes={} ctx={ctx} layers={} flash_mma={mma} in {:.1} s (runtime value)",
+            "load resident_bytes={} ctx={ctx} layers={} flash_mma={mma} ubatch={} in {:.1} s \
+             (runtime value)",
             m.resident_bytes(),
             m.stages()[0].layers().len(),
+            m.ubatch()?,
             t.elapsed().as_secs_f64()
         );
         Ok(m)
@@ -307,6 +318,14 @@ mod gate {
             )),
             None => None,
         };
+        if args.iter().any(|a| a == "--ubatch-only") {
+            let ok = ubatch_sizes()?;
+            println!("gate_qwen3moe_e2e --ubatch-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         let mut m = open(CTX, StepMode::Graph)?;
         if args.iter().any(|a| a == "--fault-only") {
             let ok = fault_layer(&mut m)?;
@@ -317,7 +336,9 @@ mod gate {
             return Ok(());
         }
         if args.iter().any(|a| a == "--gemm-only") {
-            let ok = gemm_prefill(&mut m)?;
+            let mut ok = gemm_prefill(&mut m)?;
+            drop(m);
+            ok &= ubatch_sizes()?;
             println!("gate_qwen3moe_e2e --gemm-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
@@ -332,6 +353,8 @@ mod gate {
         ok &= free(&mut m, &man)?;
         ok &= greedy(&mut m, dump.as_deref())?;
         ok &= fault_layer(&mut m)?;
+        drop(m);
+        ok &= ubatch_sizes()?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
@@ -837,7 +860,7 @@ mod gate {
                     .all(|(a, b)| a.to_bits() == b.to_bits())
         };
         for (i, p) in prompts.iter().enumerate() {
-            let plan = PrefillPlan::new(p.tokens.len(), PrefillPath::Auto);
+            let plan = m.prefill_plan(p.tokens.len(), PrefillPath::Auto)?;
             if plan.kind() != "prefill" {
                 return Err(format!(
                     "prompt {} ({} ids) plans {plan}; this clause is the pass path's",
@@ -937,6 +960,19 @@ mod gate {
             .sum()
     }
 
+    /// Rows of `a` (per layer, [`HEAD`]-value rows) equal to `b`'s.
+    fn rows_same(a: &[Vec<u16>], b: &[Vec<u16>]) -> usize {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                x.chunks(HEAD)
+                    .zip(y.chunks(HEAD))
+                    .filter(|(r, s)| r == s)
+                    .count()
+            })
+            .sum()
+    }
+
     fn prefill_replay(m: &mut Qwen3moeModel, prompts: &[PromptRow]) -> Result<bool, GateError> {
         let long: Vec<u32> = prompts
             .iter()
@@ -958,16 +994,7 @@ mod gate {
             let g = prefill_run(m, ids, StepMode::Graph)?;
             let e = prefill_run(m, ids, StepMode::Eager)?;
             let kv_diff = rows_differing(&g.kv, &e.kv);
-            let stale =
-                g.kv.iter()
-                    .zip(&seeded)
-                    .map(|(x, y)| {
-                        x.chunks(HEAD)
-                            .zip(y.chunks(HEAD))
-                            .filter(|(r, s)| r == s)
-                            .count()
-                    })
-                    .sum::<usize>();
+            let stale = rows_same(&g.kv, &seeded);
             let logits_same = g.logits.len() == e.logits.len()
                 && g.logits
                     .iter()
@@ -1110,7 +1137,7 @@ mod gate {
         let mut whole_1300 = None;
         for &n in &LONG {
             let ids = &prose[..n];
-            let plan = PrefillPlan::new(n, PrefillPath::Auto);
+            let plan = m.prefill_plan(n, PrefillPath::Auto)?;
             let one = long_run(m, ids, None, None)?;
             let t0 = Instant::now();
             let gemm = long_run(m, ids, Some(PrefillPath::Auto), None)?;
@@ -1206,8 +1233,8 @@ mod gate {
         let n = LONG[1];
         let ids = &prose[..n];
         let cut_plans = (
-            PrefillPlan::new(LONG_SPLIT, PrefillPath::Auto),
-            PrefillPlan::new(n - LONG_SPLIT, PrefillPath::Auto),
+            m.prefill_plan(LONG_SPLIT, PrefillPath::Auto)?,
+            m.prefill_plan(n - LONG_SPLIT, PrefillPath::Auto)?,
         );
         let split = long_run(m, ids, Some(PrefillPath::Auto), Some(LONG_SPLIT))?;
         let kv_diff = rows_differing(&split.kv, &whole.kv);
@@ -1227,6 +1254,146 @@ mod gate {
             "gemm prefill: {LONG:?} prose ids against the one-token path, K/V in band (layer 0 \
              {GEMM_L0_REL:e}, later layers and the logits {GEMM_SPREAD_RATIO} x the flash \
              arithmetics' spread), greedy not diverged, split = whole {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    // ------------------------------------------ (w) ubatch-size invariance
+
+    /// Cache rows of the model (w) opens: its longest prompt, with room
+    /// past it (`seed_depth` keeps a row free for a step).
+    const CTX_W: usize = W_LONG + 64;
+
+    /// (w)'s prompt: a whole number of the largest ubatch.
+    const W_LONG: usize = UBATCH;
+
+    /// The ubatch sizes (w) compares: the size before the load-time lever,
+    /// an odd one that cuts the prompt with a ragged last ubatch, the largest.
+    const W_SIZES: [usize; 3] = [512, 1000, UBATCH];
+
+    /// Where (w)'s split prefill at the largest size cuts the prompt: off
+    /// every boundary of [`W_SIZES`].
+    const W_SPLIT: usize = 2500;
+
+    /// `ids` prefilled by the default path from a reset over cache rows
+    /// seeded with the pattern (in two calls cut at `cut`), at the model's
+    /// ubatch size: the K/V rows, the last logits, the token.
+    fn ub_run(
+        m: &mut Qwen3moeModel,
+        ids: &[u32],
+        cut: Option<usize>,
+    ) -> Result<PrefillRun, GateError> {
+        m.seed_depth(ids.len())?;
+        m.reset()?;
+        let token = match cut {
+            Some(c) => {
+                m.prefill_with(&ids[..c], PrefillPath::Auto)?;
+                m.prefill_with(&ids[c..], PrefillPath::Auto)?
+            }
+            None => m.prefill_with(ids, PrefillPath::Auto)?,
+        };
+        Ok(PrefillRun {
+            kv: m.kv_rows(ids.len())?,
+            logits: m.logits()?,
+            token,
+        })
+    }
+
+    /// Whether `run` left what `want` did, bit for bit; one line under `label`.
+    fn same_run(label: &str, run: &PrefillRun, want: &PrefillRun) -> bool {
+        let kv_diff = rows_differing(&run.kv, &want.kv);
+        let logits_same = bits_equal(&run.logits, &want.logits);
+        let pass = kv_diff == 0 && logits_same && run.token == want.token;
+        println!(
+            "ubatch {label}: K/V rows differing from the {UBATCH}-token ubatch {kv_diff} (want 0), \
+             last logits bit-equal {logits_same}, token {} (want {}) {}",
+            run.token,
+            want.token,
+            verdict(pass)
+        );
+        pass
+    }
+
+    /// (w) (module doc), on its own model: the caller drops any other first,
+    /// so the two never share the card.
+    fn ubatch_sizes() -> Result<bool, GateError> {
+        let mut m = open(CTX_W, StepMode::Graph)?;
+        let prose = prose(W_LONG + 1)?;
+        let (ids, ids1) = (&prose[..W_LONG], &prose[..=W_LONG]);
+        let mut ok = true;
+        m.set_ubatch(UBATCH)?;
+        let plan = |m: &Qwen3moeModel, n: usize| m.prefill_plan(n, PrefillPath::Auto);
+        // The references, each checked to have written every row it covers
+        // (none still the seeded pattern), so an equal run is not two runs
+        // that wrote nothing.
+        let mut refs = Vec::with_capacity(2);
+        for x in [ids, ids1] {
+            m.seed_depth(x.len())?;
+            let seeded = m.kv_rows(x.len())?;
+            let run = ub_run(&mut m, x, None)?;
+            let stale = rows_same(&run.kv, &seeded);
+            let pass = stale == 0;
+            println!(
+                "ubatch size={UBATCH} n={} plan={} resident_bytes={} (a reference): K/V rows still \
+                 the seeded pattern {stale} (want 0) {}",
+                x.len(),
+                plan(&m, x.len())?,
+                m.resident_bytes(),
+                verdict(pass)
+            );
+            ok &= pass;
+            refs.push(run);
+        }
+        let (whole, whole1) = (&refs[0], &refs[1]);
+        let split = ub_run(&mut m, ids, Some(W_SPLIT))?;
+        ok &= same_run(
+            &format!(
+                "size={UBATCH} n={W_LONG} split as {W_SPLIT} ({}) + {} ({})",
+                plan(&m, W_SPLIT)?,
+                W_LONG - W_SPLIT,
+                plan(&m, W_LONG - W_SPLIT)?
+            ),
+            &split,
+            whole,
+        );
+        drop(split);
+        for &u in &W_SIZES[..W_SIZES.len() - 1] {
+            m.set_ubatch(u)?;
+            let run = ub_run(&mut m, ids, None)?;
+            ok &= same_run(
+                &format!(
+                    "size={u} n={W_LONG} plan={} resident_bytes={}",
+                    plan(&m, W_LONG)?,
+                    m.resident_bytes()
+                ),
+                &run,
+                whole,
+            );
+            drop(run);
+            if u == W_SIZES[0] {
+                let run = ub_run(&mut m, ids1, None)?;
+                ok &= same_run(
+                    &format!("size={u} n={} plan={}", W_LONG + 1, plan(&m, W_LONG + 1)?),
+                    &run,
+                    whole1,
+                );
+            }
+        }
+        // Sizes past the range: refused, the size kept.
+        let kept = m.ubatch()?;
+        let refused = [0, UBATCH + 1].iter().all(|&u| m.set_ubatch(u).is_err());
+        let still = m.ubatch()? == kept;
+        let pass = refused && still;
+        println!(
+            "ubatch refusals: sizes 0 and {} refused {refused}, size kept at {kept} {still} {}",
+            UBATCH + 1,
+            verdict(pass)
+        );
+        ok &= pass;
+        println!(
+            "ubatch: the prompt's K/V rows, last logits and token at sizes {W_SIZES:?} and split = \
+             whole at {UBATCH}, bit for bit {}",
             verdict(ok)
         );
         Ok(ok)

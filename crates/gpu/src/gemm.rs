@@ -63,10 +63,10 @@ use cuda_device::{
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-/// Slots one route and one GEMM take: a 512-token ubatch at top-8.
-pub const GEMM_MAX_SLOTS: usize = 4096;
+/// Slots one route and one GEMM take: a 4096-token ubatch at top-8.
+pub const GEMM_MAX_SLOTS: usize = 32_768;
 /// Experts one stack may have — the route kernel's counters live in shared
-/// memory, one per expert.
+/// memory, one per (chunk, expert), at least one chunk's.
 pub const GEMM_MAX_EXPERTS: usize = 1024;
 /// Rows one GEMM block covers: eight warps of sixteen.
 pub const GEMM_BM: usize = 128;
@@ -84,6 +84,12 @@ const GEMM_NT: usize = GEMM_BN / 8;
 const ROUTE_THREADS: usize = 1024;
 /// [`ROUTE_THREADS`] as the block width a launch takes.
 const ROUTE_THREADS_U32: u32 = ROUTE_THREADS as u32;
+/// Warps of the route kernel: the most chunks the slots are cut into.
+const ROUTE_WARPS: usize = ROUTE_THREADS / 32;
+/// u32 words of the route kernel's per-chunk counts, one per (chunk,
+/// expert): a stack of `e` experts is cut into `min(ROUTE_WARPS,
+/// ROUTE_HIST / e)` chunks.
+const ROUTE_HIST: usize = 8192;
 /// A staged id the route refused (past the stack) or a lane past the slots.
 const NO_EXPERT: u32 = u32::MAX;
 /// u32 words one staged column of one 128-value block takes: four runs of
@@ -101,6 +107,9 @@ const _: () = assert!(GEMM_BN.is_multiple_of(8) && GEMM_BN <= 64);
 const _: () = assert!(GEMM_THREADS_U32 as usize == GEMM_THREADS);
 const _: () = assert!(ROUTE_THREADS_U32 as usize == ROUTE_THREADS);
 const _: () = assert!(GEMM_MAX_EXPERTS <= ROUTE_THREADS);
+// At the expert cap the counts still hold one chunk; at the chunk cap one
+// warp per chunk.
+const _: () = assert!(ROUTE_HIST >= GEMM_MAX_EXPERTS && ROUTE_WARPS * 32 == ROUTE_THREADS);
 const _: () = assert!((B_COL_W / 4) % 8 == 1 && B_COL_W >= 32 && B_COL_W.is_multiple_of(4));
 // The route packs a count and a tile count into one scanned u32, 16 bits
 // each, and a tile's start and length into another.
@@ -798,6 +807,28 @@ unsafe fn win(w: &[u32], byte: usize) -> u32 {
     (((u64::from(hi) << 32u64) | u64::from(lo)) >> (8 * (byte & 3))) as u32
 }
 
+/// Slot `s`'s expert in the route's walks over a chunk that ends at `hi`:
+/// [`NO_EXPERT`] for a lane past the chunk, and for an id with no expert in
+/// the stack's first `e_n` — then with `true`, the slot the count walk
+/// raises.
+///
+/// # Safety
+///
+/// `hi <= ids.len()`.
+#[inline(always)]
+unsafe fn route_id(ids: &[u32], s: usize, hi: usize, n_experts: u32, e_n: usize) -> (u32, bool) {
+    if s >= hi {
+        return (NO_EXPERT, false);
+    }
+    // SAFETY: s < hi <= ids.len() by this fn's contract.
+    let id = unsafe { *ids.get_unchecked(s) };
+    if id < n_experts && (id as usize) < e_n {
+        (id, false)
+    } else {
+        (NO_EXPERT, true)
+    }
+}
+
 /// Byte `b` of `w`, sign-extended.
 #[inline(always)]
 fn sbyte(w: u32, b: u32) -> i32 {
@@ -866,10 +897,17 @@ mod gemm_kernels {
     /// [`FaultSite::ExpertId`] on `fault` and its slot is left out of the
     /// table, so no GEMM writes its outputs.
     ///
-    /// One block. Every thread stages ids; warp 0 alone counts and fills, in
-    /// slot order, 32 slots a pass: the lanes of one pass that share an id
-    /// find each other with `match.any`, so the fill needs no atomics and
-    /// the table is the same bits on every run.
+    /// One block, a stable counting sort over chunks. The slots are cut into
+    /// `chunks = min(ROUTE_WARPS, ROUTE_HIST / n_experts)` consecutive
+    /// ranges, warp `w` owning range `w`, 32 slots a pass in slot order: the
+    /// lanes of one pass that share an id find each other with `match.any`,
+    /// so a warp counts its range per expert, and later fills it, with no
+    /// atomics. Between the two walks, thread `e` turns expert `e`'s counts
+    /// into each chunk's first index — the expert's first index plus the
+    /// counts of the chunks before — so chunk `w`'s slots of an expert land
+    /// after every lower chunk's and before every higher one's, and the
+    /// table is the one a single walk over all slots in order builds, the
+    /// same bits on every run.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -896,62 +934,59 @@ mod gemm_kernels {
         mut n_tiles: DisjointSlice<u32>,
         fault: FaultSink,
     ) {
-        static mut IDS: SharedArray<u32, GEMM_MAX_SLOTS> = SharedArray::UNINIT;
-        static mut CNT: SharedArray<u32, GEMM_MAX_EXPERTS> = SharedArray::UNINIT;
+        static mut HIST: SharedArray<u32, ROUTE_HIST> = SharedArray::UNINIT;
         static mut WT: SharedArray<u32, 32> = SharedArray::UNINIT;
 
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
         let wid = tid / 32;
         let s_n = (n_slots as usize).min(GEMM_MAX_SLOTS);
-        let e_n = (n_experts as usize).min(GEMM_MAX_EXPERTS);
+        let e_n = (n_experts as usize).clamp(1, GEMM_MAX_EXPERTS);
+        let chunks = (ROUTE_HIST / e_n).min(ROUTE_WARPS);
+        // Each chunk a whole number of passes; the last ones may be short or
+        // empty.
+        let per = s_n.div_ceil(chunks).div_ceil(32) * 32;
+        let lo = wid * per;
+        let hi = (lo + per).min(s_n);
         // SAFETY: each `static mut` is this block's own shared allocation,
         // reached raw; every index below is inside its array and every
         // cross-thread read follows a block or warp barrier.
-        let (ids_sh, cnt, wt) = unsafe {
+        let (hist, wt) = unsafe {
             (
-                SharedArray::as_raw_mut_ptr(&raw mut IDS),
-                SharedArray::as_raw_mut_ptr(&raw mut CNT),
+                SharedArray::as_raw_mut_ptr(&raw mut HIST),
                 SharedArray::as_raw_mut_ptr(&raw mut WT),
             )
         };
+        // Warp `wid`'s counts, one per expert: row `wid` of the `chunks`
+        // rows of `e_n` words; only warps below `chunks` use it.
+        // SAFETY: wid.min(chunks − 1) < chunks and chunks · e_n <=
+        // ROUTE_HIST, so the row lies inside HIST.
+        let row = unsafe { hist.add(wid.min(chunks - 1) * e_n) };
 
-        let mut s = tid;
-        while s < s_n {
-            // SAFETY: s < n_slots <= ids.len().
-            let id = unsafe { *ids.get_unchecked(s) };
-            let keep = if id < n_experts && (id as usize) < e_n {
-                id
-            } else {
-                fault.raise(FaultSite::ExpertId);
-                NO_EXPERT
-            };
-            // SAFETY: s < GEMM_MAX_SLOTS.
-            unsafe { *ids_sh.add(s) = keep };
-            s += ROUTE_THREADS;
-        }
-        if tid < e_n {
-            // SAFETY: tid < GEMM_MAX_EXPERTS.
-            unsafe { *cnt.add(tid) = 0 };
+        let mut i = tid;
+        while i < chunks * e_n {
+            // SAFETY: i < chunks · e_n <= ROUTE_HIST.
+            unsafe { *hist.add(i) = 0 };
+            i += ROUTE_THREADS;
         }
         thread::sync_threads();
 
-        // Counts, in slot order: per pass, the lowest lane of each group of
-        // equal ids adds the group's size.
-        if wid == 0 {
-            let mut base = 0usize;
-            while base < s_n {
-                let s = base + lane;
-                let id = if s < s_n {
-                    // SAFETY: s < s_n <= GEMM_MAX_SLOTS.
-                    unsafe { *ids_sh.add(s) }
-                } else {
-                    NO_EXPERT
-                };
+        // Counts, per chunk in slot order: per pass, the lowest lane of each
+        // group of equal ids adds the group's size to its warp's row.
+        if wid < chunks {
+            let mut base = lo;
+            while base < hi {
+                // SAFETY: hi <= n_slots <= ids.len().
+                let (id, bad) = unsafe { route_id(ids, base + lane, hi, n_experts, e_n) };
+                if bad {
+                    // Raised here only: the fill walk reads each slot again.
+                    fault.raise(FaultSite::ExpertId);
+                }
                 let peers = warp::match_any_sync(u32::MAX, id);
                 if id != NO_EXPERT && peers.trailing_zeros() as usize == lane {
-                    // SAFETY: id < e_n <= GEMM_MAX_EXPERTS; one lane per id.
-                    unsafe { *cnt.add(id as usize) += peers.count_ones() };
+                    // SAFETY: id < e_n, inside this warp's row; one lane per
+                    // id, and no other warp touches the row.
+                    unsafe { *row.add(id as usize) += peers.count_ones() };
                 }
                 warp::sync_mask(u32::MAX);
                 base += 32;
@@ -959,16 +994,31 @@ mod gemm_kernels {
         }
         thread::sync_threads();
 
+        // Expert `tid`'s count, and each chunk's count of it replaced by the
+        // chunks before it: the chunk's first index within the expert.
+        let c = if tid < e_n {
+            let mut run = 0u32;
+            let mut w = 0usize;
+            while w < chunks {
+                // SAFETY: w < chunks and tid < e_n, inside HIST; column tid
+                // is this thread's alone until the barrier below.
+                unsafe {
+                    let p = hist.add(w * e_n + tid);
+                    let n = *p;
+                    *p = run;
+                    run += n;
+                }
+                w += 1;
+            }
+            run
+        } else {
+            0
+        };
+
         // Exclusive scan over experts of (count | tiles << 16): the low half
         // is the expert's first index into `cols`, the high half its first
         // tile. Neither half's sum reaches 1 << 16 (GEMM_MAX_SLOTS, and
         // gemm_max_tiles's bound), so no carry crosses.
-        let c = if tid < e_n {
-            // SAFETY: tid < GEMM_MAX_EXPERTS.
-            unsafe { *cnt.add(tid) }
-        } else {
-            0
-        };
         let tc = c.div_ceil(GEMM_BN as u32);
         let v = c | (tc << 16);
         let mut incl = v;
@@ -1029,32 +1079,35 @@ mod gemm_kernels {
                 }
                 i += 1;
             }
-            // SAFETY: tid < GEMM_MAX_EXPERTS; the count is consumed above.
-            unsafe { *cnt.add(tid) = off };
+            // Each chunk's first index into `cols` for expert tid.
+            let mut w = 0usize;
+            while w < chunks {
+                // SAFETY: as in the prefix walk above; column tid is still
+                // this thread's alone.
+                unsafe { *hist.add(w * e_n + tid) += off };
+                w += 1;
+            }
         }
         thread::sync_threads();
 
-        // The stable fill: slot s goes to its expert's next free index; the
-        // lanes of one pass that share an id take consecutive indices in
-        // lane (= slot) order.
-        if wid == 0 {
-            let mut base = 0usize;
-            while base < s_n {
+        // The stable fill: each chunk in slot order, slot s to its expert's
+        // next free index in the warp's row; the lanes of one pass that share
+        // an id take consecutive indices in lane (= slot) order.
+        if wid < chunks {
+            let mut base = lo;
+            while base < hi {
                 let s = base + lane;
-                let id = if s < s_n {
-                    // SAFETY: s < s_n <= GEMM_MAX_SLOTS.
-                    unsafe { *ids_sh.add(s) }
-                } else {
-                    NO_EXPERT
-                };
+                // SAFETY: hi <= n_slots <= ids.len().
+                let (id, _) = unsafe { route_id(ids, s, hi, n_experts, e_n) };
                 let peers = warp::match_any_sync(u32::MAX, id);
                 let rank = (peers & warp::lanemask_lt()).count_ones();
                 if id != NO_EXPERT {
-                    // SAFETY: id < GEMM_MAX_EXPERTS; the index is below the
-                    // expert's first index plus its count, so below n_slots
-                    // <= cols.len(), and each slot writes its own index.
+                    // SAFETY: id < e_n, inside this warp's row; the index is
+                    // below the expert's first index plus its count, so below
+                    // n_slots <= cols.len(), and each slot writes its own
+                    // index.
                     unsafe {
-                        let pos = *cnt.add(id as usize) + rank;
+                        let pos = *row.add(id as usize) + rank;
                         *cols.get_unchecked_mut(pos as usize) = s as u32;
                     }
                 }
@@ -1062,7 +1115,7 @@ mod gemm_kernels {
                 if id != NO_EXPERT && peers.trailing_zeros() as usize == lane {
                     // SAFETY: as above; one lane per id, after every lane of
                     // the pass has read the old index.
-                    unsafe { *cnt.add(id as usize) += peers.count_ones() };
+                    unsafe { *row.add(id as usize) += peers.count_ones() };
                 }
                 warp::sync_mask(u32::MAX);
                 base += 32;
