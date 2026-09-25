@@ -16,6 +16,9 @@
 //! - Q8_0 x act cells: fused cell kernel for `q_nope2_absorbed` (model::arch::deepseek2::attn).
 //! - Q3_K, Q4_K and Q5_K tiles: one weight row against up to [`TILE_COLS`] columns, each
 //!   block unpacked once, every column bit-identical to its one-column kernel ([`dot_row_cols`]).
+//! - Q3_K row-lane tile: [`Q3K_R8_ROWS`] rows repacked into one lane-interleaved layout
+//!   ([`repack_q3k_r8`]) against up to [`TILE_COLS`] columns, every (row, column) value
+//!   bit-identical to [`dot_row`] ([`dot_q3k_r8_cols`]).
 //!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108.
@@ -58,6 +61,11 @@ pub enum QdotError {
     /// A [`dot_row_cols`] call's column count is outside `1..=TILE_COLS`, or
     /// its output slice does not hold one value per column.
     TileShape { cols: usize, outs: usize },
+    /// A row-lane repack's row count is not a multiple of [`Q3K_R8_ROWS`].
+    RowGroup { rows: usize },
+    /// A row-lane buffer — a repack's rows or output, or one group handed to
+    /// [`dot_q3k_r8_cols`] — is not exactly the bytes its rows and `k` make.
+    RowGroupBytes { have: usize, need: usize },
 }
 
 impl fmt::Display for QdotError {
@@ -93,6 +101,18 @@ impl fmt::Display for QdotError {
                     f,
                     "tile call with {cols} activation columns and {outs} outputs: \
                      a call takes 1..={TILE_COLS} columns and one output per column"
+                )
+            }
+            QdotError::RowGroup { rows } => {
+                write!(
+                    f,
+                    "{rows} rows: the row-lane layout takes rows in groups of {Q3K_R8_ROWS}"
+                )
+            }
+            QdotError::RowGroupBytes { have, need } => {
+                write!(
+                    f,
+                    "row-lane buffer is {have} bytes, its rows and k make {need}"
                 )
             }
         }
@@ -496,6 +516,163 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         // SAFETY: as the Q4_K arm.
         TileKind::Q5K => unsafe { dot_q45k_q82x4_tile_avx2::<C, true>(wrow, &cols, nb) },
     };
+    out.copy_from_slice(&v);
+}
+
+/// Rows one group of the row-lane Q3_K layout interleaves ([`repack_q3k_r8`]).
+pub const Q3K_R8_ROWS: usize = 8;
+
+/// Q3_K rows into the row-lane layout [`dot_q3k_r8_cols`] reads: `n_rows`
+/// rows of `k` values (`rows`, row after row) into `out`, which is exactly as
+/// long — the layout holds the same bits, permuted.
+///
+/// Rows go in groups of [`Q3K_R8_ROWS`], each group's super-blocks in order,
+/// 880 bytes per group super-block:
+/// - bytes 0..16: row `r`'s f16 `d` at `2r`;
+/// - bytes 16..112: the 128 six-bit scales (`s + 32`) as four 32-byte vectors
+///   `X_q` — byte `b` of `X_q` is the scale of sub-block `2p + b % 2` of row
+///   `(b % 16) / 2`, `p = 2q + b / 16` — stored as the low nibbles
+///   `X_0 | X_1 << 4`, then `X_2 | X_3 << 4`, then the high two bits
+///   `X_q >> 4` at bits `2q`;
+/// - bytes 112..880: eight sub-block pairs `p` of 96 bytes. Code vector `W_f`
+///   (`f` in 0..8: sub-block `2p + f / 4`, its values `4 (f % 4)` onward)
+///   holds at byte `b` the code `u = value + 4` (0..7) of row `b / 4`, value
+///   `b % 4`; the pair stores `A = W0 | W1 << 3 | (W2 & 3) << 6`,
+///   `B = W3 | W4 << 3 | (W5 & 3) << 6` and
+///   `C = W6 | W7 << 3 | (W2 >> 2) << 6 | (W5 >> 2) << 7`.
+///
+/// A `k` off the 256-value grid, a row count off the group grid
+/// ([`QdotError::RowGroup`]; rows are not padded) and a `rows` or `out` of
+/// another length ([`QdotError::RowGroupBytes`]) are named errors.
+pub fn repack_q3k_r8(
+    rows: &[u8],
+    n_rows: usize,
+    k: usize,
+    out: &mut [u8],
+) -> Result<(), QdotError> {
+    if !k.is_multiple_of(256) {
+        return Err(QdotError::UnalignedK { k, gran: 256 });
+    }
+    if !n_rows.is_multiple_of(Q3K_R8_ROWS) {
+        return Err(QdotError::RowGroup { rows: n_rows });
+    }
+    let nb = k / 256;
+    let row_bytes = nb * Q3K_BLOCK;
+    let need = n_rows * row_bytes;
+    for have in [rows.len(), out.len()] {
+        if have != need {
+            return Err(QdotError::RowGroupBytes { have, need });
+        }
+    }
+    let group_bytes = Q3K_R8_ROWS * row_bytes;
+    for (src, dst) in rows
+        .chunks_exact(group_bytes)
+        .zip(out.chunks_exact_mut(group_bytes))
+    {
+        for (sb, blk) in dst.as_chunks_mut::<Q3K_R8_BLOCK>().0.iter_mut().enumerate() {
+            let blocks: [&[u8]; Q3K_R8_ROWS] = std::array::from_fn(|r| {
+                let at = r * row_bytes + sb * Q3K_BLOCK;
+                &src[at..at + Q3K_BLOCK]
+            });
+            r8_pack_block(&blocks, blk);
+        }
+    }
+    Ok(())
+}
+
+/// One Q3_K 8-row group of [`repack_q3k_r8`]'s layout against up to
+/// [`TILE_COLS`] Q8_K columns: `out[c][r]` is `dot_row(Q3_K, row r,
+/// acols[c], k)` bit for bit.
+///
+/// `group` is one group's `k / 256` super-blocks, exactly. Every (row,
+/// column) keeps the one-column kernel's integer sum per super-block and its
+/// float step, so only the order in which the values are formed moves. As
+/// the Q3_K tile of [`dot_row_cols`], the kernel reads a q8_K block's 16 code
+/// sums (bytes 264..296) for its −4 fold, so a column must come from
+/// [`quantize_col`]. A CPU without AVX2+F16C runs the scalar mirror
+/// ([`dot_q3k_r8_cols_scalar`]). A column count outside `1..=TILE_COLS` or
+/// an `out` of another length ([`QdotError::TileShape`]), a `k` off the
+/// 256-value grid, a group of another length ([`QdotError::RowGroupBytes`])
+/// and a short column are named errors.
+pub fn dot_q3k_r8_cols(
+    group: &[u8],
+    acols: &[&[u8]],
+    k: usize,
+    out: &mut [[f32; Q3K_R8_ROWS]],
+) -> Result<(), QdotError> {
+    let nb = check_r8(group.len(), acols, k, out.len())?;
+    if !has_features(GgmlType::Q3_K) {
+        r8_scalar(group, acols, nb, out);
+        return Ok(());
+    }
+    match acols.len() {
+        1 => r8_tile::<1>(group, acols, nb, out),
+        2 => r8_tile::<2>(group, acols, nb, out),
+        3 => r8_tile::<3>(group, acols, nb, out),
+        4 => r8_tile::<4>(group, acols, nb, out),
+        5 => r8_tile::<5>(group, acols, nb, out),
+        6 => r8_tile::<6>(group, acols, nb, out),
+        7 => r8_tile::<7>(group, acols, nb, out),
+        _ => r8_tile::<8>(group, acols, nb, out),
+    }
+    Ok(())
+}
+
+/// The scalar mirror behind [`dot_q3k_r8_cols`], read straight off the
+/// repacked layout: the fallback without AVX2+F16C, and the gate's second
+/// path.
+pub fn dot_q3k_r8_cols_scalar(
+    group: &[u8],
+    acols: &[&[u8]],
+    k: usize,
+    out: &mut [[f32; Q3K_R8_ROWS]],
+) -> Result<(), QdotError> {
+    let nb = check_r8(group.len(), acols, k, out.len())?;
+    r8_scalar(group, acols, nb, out);
+    Ok(())
+}
+
+/// The row-lane tile's shape contract; the super-block count on success.
+fn check_r8(group_len: usize, acols: &[&[u8]], k: usize, outs: usize) -> Result<usize, QdotError> {
+    let c = acols.len();
+    if c == 0 || c > TILE_COLS || outs != c {
+        return Err(QdotError::TileShape { cols: c, outs });
+    }
+    if !k.is_multiple_of(256) {
+        return Err(QdotError::UnalignedK { k, gran: 256 });
+    }
+    let nb = k / 256;
+    let need = nb * Q3K_R8_BLOCK;
+    if group_len != need {
+        return Err(QdotError::RowGroupBytes {
+            have: group_len,
+            need,
+        });
+    }
+    let need_a = nb * Q8K_STRIDE;
+    if let Some(a) = acols.iter().find(|a| a.len() < need_a) {
+        return Err(QdotError::ShortActivationCol {
+            have: a.len(),
+            need: need_a,
+            k,
+        });
+    }
+    Ok(nb)
+}
+
+/// The `C`-column row-lane tile over validated inputs: `group` holds `nb`
+/// group super-blocks, `acols` `C` columns of at least `nb` Q8_K blocks, `out`
+/// `C` values.
+fn r8_tile<const C: usize>(
+    group: &[u8],
+    acols: &[&[u8]],
+    nb: usize,
+    out: &mut [[f32; Q3K_R8_ROWS]],
+) {
+    let cols: [*const u8; C] = std::array::from_fn(|j| acols[j].as_ptr());
+    // SAFETY: the caller saw AVX2+F16C (has_features(Q3_K)); check_r8 sized
+    // the group for nb super-blocks and every column for nb Q8_K blocks.
+    let v = unsafe { dot_q3k_r8_tile_avx2::<C>(group, &cols, nb) };
     out.copy_from_slice(&v);
 }
 
@@ -1222,6 +1399,310 @@ unsafe fn hsum8_i32(s: &[__m256i; 8]) -> __m256i {
             _mm256_permute2x128_si256::<0x20>(q0, q1),
             _mm256_permute2x128_si256::<0x31>(q0, q1),
         )
+    }
+}
+
+// ------------------------------------------------- Q3_K row-lane tile
+
+/// One super-block of an 8-row group: the eight rows' 110 bytes, permuted.
+const Q3K_R8_BLOCK: usize = Q3K_R8_ROWS * Q3K_BLOCK;
+/// Where a group super-block's scales and code pairs start, and a pair's
+/// bytes ([`repack_q3k_r8`] has the layout).
+const R8_SCALES: usize = 16;
+const R8_CODES: usize = R8_SCALES + 96;
+const R8_PAIR: usize = 96;
+
+/// Scale-pair shuffles of the row-lane tile, per 128-bit half: from a vector
+/// whose dword `r` is the i16 pair `[s_r,2p, s_r,2p+1]`, the first 32 bytes
+/// make `[s_r,2p, s_r,2p]` and the last 32 `[s_r,2p+1, s_r,2p+1]`.
+static R8_DUP: [u8; 64] = [
+    0, 1, 0, 1, 4, 5, 4, 5, 8, 9, 8, 9, 12, 13, 12, 13, //
+    0, 1, 0, 1, 4, 5, 4, 5, 8, 9, 8, 9, 12, 13, 12, 13, //
+    2, 3, 2, 3, 6, 7, 6, 7, 10, 11, 10, 11, 14, 15, 14, 15, //
+    2, 3, 2, 3, 6, 7, 6, 7, 10, 11, 10, 11, 14, 15, 14, 15, //
+];
+
+/// A Q3_K super-block's 16 scales as stored: six bits, `s + 32` — the
+/// scalar mirror's unpack.
+fn q3k_scales6(blk: &[u8]) -> [u8; 16] {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let aux: [u32; 3] =
+        std::array::from_fn(|i| u32::from_le_bytes([0, 1, 2, 3].map(|b| blk[96 + 4 * i + b])));
+    let words = [
+        (aux[0] & KMASK2) | ((aux[2] & KMASK1) << 4),
+        (aux[1] & KMASK2) | (((aux[2] >> 2) & KMASK1) << 4),
+        ((aux[0] >> 4) & KMASK2) | (((aux[2] >> 4) & KMASK1) << 4),
+        ((aux[1] >> 4) & KMASK2) | (((aux[2] >> 6) & KMASK1) << 4),
+    ];
+    std::array::from_fn(|j| words[j / 4].to_le_bytes()[j % 4])
+}
+
+/// A Q3_K super-block's 256 codes `u = value + 4` in 0..7: the two low bits
+/// from `qs`, bit 2 the high bit of `hmask` (set = no −4).
+fn q3k_codes(blk: &[u8]) -> [u8; 256] {
+    std::array::from_fn(|i| {
+        let (half, field, cell) = (i / 128, (i / 32) % 4, i % 32);
+        let low = (blk[32 + 32 * half + cell] >> (2 * field)) & 3;
+        let high = (blk[cell] >> (4 * half + field)) & 1;
+        low | (high << 2)
+    })
+}
+
+/// One group super-block of [`repack_q3k_r8`]'s layout from the eight rows'
+/// 110-byte blocks.
+fn r8_pack_block(rows: &[&[u8]; Q3K_R8_ROWS], dst: &mut [u8]) {
+    let scales = rows.map(q3k_scales6);
+    let codes = rows.map(q3k_codes);
+    for (r, blk) in rows.iter().enumerate() {
+        dst[2 * r..2 * r + 2].copy_from_slice(&blk[108..110]);
+    }
+    for b in 0..32 {
+        let x: [u8; 4] =
+            std::array::from_fn(|q| scales[(b % 16) / 2][2 * (2 * q + b / 16) + b % 2]);
+        dst[R8_SCALES + b] = (x[0] & 0xF) | ((x[1] & 0xF) << 4);
+        dst[R8_SCALES + 32 + b] = (x[2] & 0xF) | ((x[3] & 0xF) << 4);
+        dst[R8_SCALES + 64 + b] =
+            (x[0] >> 4) | ((x[1] >> 4) << 2) | ((x[2] >> 4) << 4) | ((x[3] >> 4) << 6);
+    }
+    for p in 0..8 {
+        for b in 0..32 {
+            let w: [u8; 8] =
+                std::array::from_fn(|f| codes[b / 4][16 * (2 * p + f / 4) + 4 * (f % 4) + b % 4]);
+            let at = R8_CODES + R8_PAIR * p + b;
+            dst[at] = w[0] | (w[1] << 3) | ((w[2] & 3) << 6);
+            dst[at + 32] = w[3] | (w[4] << 3) | ((w[5] & 3) << 6);
+            dst[at + 64] = w[6] | (w[7] << 3) | ((w[2] >> 2) << 6) | ((w[5] >> 2) << 7);
+        }
+    }
+}
+
+/// Scale `s` of sub-block `j` of row `r`, off a group super-block.
+fn r8_scale(blk: &[u8], r: usize, j: usize) -> i32 {
+    let p = j / 2;
+    let (q, b) = (p / 2, 16 * (p % 2) + 2 * r + j % 2);
+    let low = (blk[R8_SCALES + 32 * (q / 2) + b] >> (4 * (q % 2))) & 0xF;
+    let high = (blk[R8_SCALES + 64 + b] >> (2 * q)) & 3;
+    i32::from(low | (high << 4)) - 32
+}
+
+/// Code `u` of value `i` of row `r`, off a group super-block.
+fn r8_code(blk: &[u8], r: usize, i: usize) -> u8 {
+    let (j, t) = (i / 16, i % 16);
+    let (p, f) = (j / 2, 4 * (j % 2) + t / 4);
+    let at = R8_CODES + R8_PAIR * p + 4 * r + t % 4;
+    let (a, b, c) = (blk[at], blk[at + 32], blk[at + 64]);
+    match f {
+        0 => a & 7,
+        1 => (a >> 3) & 7,
+        2 => (a >> 6) | (((c >> 6) & 1) << 2),
+        3 => b & 7,
+        4 => (b >> 3) & 7,
+        5 => (b >> 6) | (((c >> 7) & 1) << 2),
+        6 => c & 7,
+        _ => (c >> 3) & 7,
+    }
+}
+
+/// Scalar mirror of `dot_q3k_r8_tile_avx2` over validated inputs: each
+/// (row, column) the one-column scalar mirror's integer sum and float step,
+/// read off the repacked layout.
+fn r8_scalar(group: &[u8], acols: &[&[u8]], nb: usize, out: &mut [[f32; Q3K_R8_ROWS]]) {
+    for (acol, o) in acols.iter().zip(out.iter_mut()) {
+        for (r, v) in o.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for sb in 0..nb {
+                let blk = &group[sb * Q3K_R8_BLOCK..(sb + 1) * Q3K_R8_BLOCK];
+                let d = half_to_f32(u16::from_le_bytes([blk[2 * r], blk[2 * r + 1]]));
+                let col = &acol[sb * Q8K_STRIDE..(sb + 1) * Q8K_STRIDE];
+                let dcol = f32::from_le_bytes([col[0], col[1], col[2], col[3]]);
+                let mut sumi = 0i32;
+                for j in 0..16 {
+                    let s = r8_scale(blk, r, j);
+                    for l in 0..16 {
+                        let u = i32::from(r8_code(blk, r, 16 * j + l));
+                        sumi += s * (u - 4) * i32::from(col[8 + 16 * j + l] as i8);
+                    }
+                }
+                acc += dcol * d * sumi as f32;
+            }
+            *v = acc;
+        }
+    }
+}
+
+/// One sub-block of the row-lane tile for every column: `w` its four code
+/// vectors, `s` its scale pairs `[s_rj, s_rj]`, `off` the offset of its first
+/// code in a Q8_K block. Per column, the four maddubs against four-byte
+/// broadcasts are summed in i16 (each lane 8 products of `u` ≤ 7 and
+/// |q| ≤ 128: at most 7168), then one madd with `s` adds `s_rj · Σ u·q` to
+/// the lane's i32.
+///
+/// # Safety
+/// Each `blk[c] + off .. + 16` must be readable; AVX2 must be present.
+#[inline(always)]
+unsafe fn r8_sub_block<const C: usize>(
+    w: &[__m256i; 4],
+    s: __m256i,
+    blk: &[*const u8; C],
+    off: usize,
+    sumi: &mut [__m256i; C],
+) {
+    // SAFETY: AVX2 present and each column's 16 codes at `off` readable per contract.
+    unsafe {
+        for (acc, b) in sumi.iter_mut().zip(blk) {
+            let q = b.add(off) as *const i32;
+            // SAFETY: four 4-byte reads inside the sub-block's 16 codes.
+            let x0 = _mm256_set1_epi32(q.read_unaligned());
+            let x1 = _mm256_set1_epi32(q.add(1).read_unaligned());
+            let x2 = _mm256_set1_epi32(q.add(2).read_unaligned());
+            let x3 = _mm256_set1_epi32(q.add(3).read_unaligned());
+            let t = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(w[0], x0),
+                    _mm256_maddubs_epi16(w[1], x1),
+                ),
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(w[2], x2),
+                    _mm256_maddubs_epi16(w[3], x3),
+                ),
+            );
+            *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(s, t));
+        }
+    }
+}
+
+/// AVX2 row-lane tile: one 8-row group of [`repack_q3k_r8`]'s layout against
+/// `C` Q8_K columns; lane `r` of value `c` equals
+/// `dot_q3k_q8k_avx2(row r, column c, nb)` bit for bit.
+///
+/// A ymm lane is a row. Per sub-block pair the eight code vectors and the
+/// scale pairs are unpacked once for every column ([`r8_sub_block`] does the
+/// columns). The fold's `−4 · Σ_j s_rj · bsum_j` opens each pair: one madd
+/// of `4 · [s_r,2p, s_r,2p+1]` against the column's block sums `2p, 2p+1`
+/// (bytes 264..296, which `quantize_col` writes), subtracted. The super-block's
+/// integer `Σ_j s_rj Σ (u − 4)·q` is the one-column body's for any i8 codes
+/// (every partial within ±2^23, exact), and lane `r` takes the one-column
+/// float step `acc + (dcol · d_r) · sumi` in super-block order: the same
+/// operations in the same order, (row, column) by (row, column).
+///
+/// # Safety
+/// CPU must support AVX2+F16C; `group` must hold `nb` group super-blocks and
+/// each `acols[c]` point at `nb` readable Q8_K blocks.
+#[target_feature(enable = "avx2", enable = "f16c")]
+unsafe fn dot_q3k_r8_tile_avx2<const C: usize>(
+    group: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [[f32; Q3K_R8_ROWS]; C] {
+    const { assert!(C != 0 && C <= TILE_COLS) };
+    // SAFETY: AVX2+F16C present, `group` holds nb group super-blocks and every
+    // column nb Q8_K blocks per contract.
+    unsafe {
+        let m7 = _mm256_set1_epi8(7);
+        let m3 = _mm256_set1_epi8(3);
+        let m4 = _mm256_set1_epi8(4);
+        let m0f = _mm256_set1_epi8(0x0F);
+        let m30 = _mm256_set1_epi8(0x30);
+        let m32 = _mm256_set1_epi8(32);
+        // SAFETY: two 32-byte loads inside the 64-byte static table.
+        let dup_lo = _mm256_loadu_si256(R8_DUP.as_ptr() as *const __m256i);
+        let dup_hi = _mm256_loadu_si256(R8_DUP.as_ptr().add(32) as *const __m256i);
+        let zero = _mm256_setzero_si256();
+        let mut acc = [_mm256_setzero_ps(); C];
+        for sb in 0..nb {
+            let base = group.as_ptr().add(Q3K_R8_BLOCK * sb);
+            // SAFETY: three 32-byte loads inside the super-block's scale bytes.
+            let l0 = _mm256_loadu_si256(base.add(R8_SCALES) as *const __m256i);
+            let l1 = _mm256_loadu_si256(base.add(R8_SCALES + 32) as *const __m256i);
+            let hb = _mm256_loadu_si256(base.add(R8_SCALES + 64) as *const __m256i);
+            // The 128 scales as signed bytes, pair p at bytes 16p..16p + 16.
+            let scales = [
+                _mm256_sub_epi8(
+                    _mm256_or_si256(
+                        _mm256_and_si256(l0, m0f),
+                        _mm256_and_si256(_mm256_slli_epi16::<4>(hb), m30),
+                    ),
+                    m32,
+                ),
+                _mm256_sub_epi8(
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(l0), m0f),
+                        _mm256_and_si256(_mm256_slli_epi16::<2>(hb), m30),
+                    ),
+                    m32,
+                ),
+                _mm256_sub_epi8(
+                    _mm256_or_si256(_mm256_and_si256(l1, m0f), _mm256_and_si256(hb, m30)),
+                    m32,
+                ),
+                _mm256_sub_epi8(
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(l1), m0f),
+                        _mm256_and_si256(_mm256_srli_epi16::<2>(hb), m30),
+                    ),
+                    m32,
+                ),
+            ];
+            let sc = scales.as_ptr() as *const u8;
+            // SAFETY: column c's super-block sb starts at sb * Q8K_STRIDE.
+            let blk: [*const u8; C] = std::array::from_fn(|c| acols[c].add(sb * Q8K_STRIDE));
+            let mut sumi = [zero; C];
+            for p in 0..8 {
+                // SAFETY: 16-byte load inside the local 128-byte scale array.
+                let v = _mm256_cvtepi8_epi16(_mm_loadu_si128(sc.add(16 * p) as *const __m128i));
+                let v4 = _mm256_slli_epi16::<2>(v);
+                for (s, b) in sumi.iter_mut().zip(&blk) {
+                    // SAFETY: 4-byte read of block sums 2p, 2p + 1 at 264 + 4p.
+                    let bs = _mm256_set1_epi32((b.add(264 + 4 * p) as *const i32).read_unaligned());
+                    *s = _mm256_sub_epi32(*s, _mm256_madd_epi16(v4, bs));
+                }
+                let codes = base.add(R8_CODES + R8_PAIR * p);
+                // SAFETY: 32-byte loads inside the pair's 96 bytes.
+                let a = _mm256_loadu_si256(codes as *const __m256i);
+                let b = _mm256_loadu_si256(codes.add(32) as *const __m256i);
+                let c = _mm256_loadu_si256(codes.add(64) as *const __m256i);
+                let w = [
+                    _mm256_and_si256(a, m7),
+                    _mm256_and_si256(_mm256_srli_epi16::<3>(a), m7),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<6>(a), m3),
+                        _mm256_and_si256(_mm256_srli_epi16::<4>(c), m4),
+                    ),
+                    _mm256_and_si256(b, m7),
+                ];
+                let s = _mm256_shuffle_epi8(v, dup_lo);
+                r8_sub_block::<C>(&w, s, &blk, 8 + 32 * p, &mut sumi);
+                // SAFETY: 32-byte loads inside the pair's 96 bytes.
+                let b = _mm256_loadu_si256(codes.add(32) as *const __m256i);
+                let c = _mm256_loadu_si256(codes.add(64) as *const __m256i);
+                let w = [
+                    _mm256_and_si256(_mm256_srli_epi16::<3>(b), m7),
+                    _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16::<6>(b), m3),
+                        _mm256_and_si256(_mm256_srli_epi16::<5>(c), m4),
+                    ),
+                    _mm256_and_si256(c, m7),
+                    _mm256_and_si256(_mm256_srli_epi16::<3>(c), m7),
+                ];
+                let s = _mm256_shuffle_epi8(v, dup_hi);
+                r8_sub_block::<C>(&w, s, &blk, 8 + 32 * p + 16, &mut sumi);
+            }
+            // SAFETY: 16-byte load of the eight f16 `d` at the super-block's head.
+            let d = _mm256_cvtph_ps(_mm_loadu_si128(base as *const __m128i));
+            for ((a, s), b) in acc.iter_mut().zip(&sumi).zip(&blk) {
+                // SAFETY: f32 read at the head of the column's block.
+                let dcol = _mm256_set1_ps((*b as *const f32).read_unaligned());
+                let t = _mm256_mul_ps(dcol, d);
+                *a = _mm256_add_ps(*a, _mm256_mul_ps(t, _mm256_cvtepi32_ps(*s)));
+            }
+        }
+        let mut out = [[0.0f32; Q3K_R8_ROWS]; C];
+        for (o, a) in out.iter_mut().zip(&acc) {
+            // SAFETY: 32-byte store into the column's eight lanes.
+            _mm256_storeu_ps(o.as_mut_ptr(), *a);
+        }
+        out
     }
 }
 
