@@ -72,6 +72,10 @@
 //! host tier's batch services since load (`union_layers`, `union_cols`,
 //! `union_host_slots`) and the union calls' wall (`union_ms`), the part of
 //! the feed the card waits on the host; a runtime value, as `time prompt` is.
+//! A second `stat prefill ced=` line names the triangle's state (the `load`
+//! line's `ced=`: `on`, or `off (reason)`) and the last call's needs: its
+//! positions, the first whose features were kept, the blocks and latent
+//! parts it ran over every layer, and each layer's block and latent starts.
 //!
 //! The binary owns its main thread, so it pins it to the dispatcher's cpu
 //! slot (`threads::pool().pin_caller()`), as `bloomery-decode` and
@@ -445,7 +449,7 @@ mod drive {
         println!(
             "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
              top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} \
-             prefill={} in {:.1} s (runtime value)",
+             prefill={} ced={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             shadow.bytes,
             shadow.unified_addressing,
@@ -464,6 +468,7 @@ mod drive {
             } else {
                 prefill_mode.name()
             },
+            m.body("generate_ds41")?.ced(),
             t.elapsed().as_secs_f64()
         );
         if let Some(h) = m.host_residency() {
@@ -765,7 +770,8 @@ mod drive {
     /// served, the columns and host slots they carried, and the union calls'
     /// wall — the part of a batched feed the card waits on the host.
     fn print_union(m: &Deepseek41Model) -> Result<(), GateError> {
-        let s = m.body("generate_ds41")?.hybrid().stats();
+        let b = m.body("generate_ds41")?;
+        let s = b.hybrid().stats();
         println!(
             "stat prefill union_layers={} union_cols={} union_host_slots={} union_ms={:.1}",
             s.batch_served,
@@ -773,6 +779,9 @@ mod drive {
             s.batch_host_slots,
             s.batch_ns as f64 / 1e6
         );
+        if let Some(need) = b.prefill_need() {
+            println!("stat prefill ced={} {}", b.ced(), need.describe());
+        }
         Ok(())
     }
 
@@ -1096,10 +1105,16 @@ mod drive {
             // Each position's features into the draft as the step feed hands
             // them over, one row at a time, whole groups through its graph.
             d.reset()?;
-            let mut append = |_: u32, rows: &[f32]| -> Result<(), GpuError> {
+            let window = d.window();
+            let mut append = |first: u32, rows: &[f32]| -> Result<(), GpuError> {
+                d.skip_to(first)?;
                 rows.chunks_exact(width).try_for_each(|row| d.feed(row))
             };
-            let next = body::prefill_with(m, ids, Some(&mut append))?;
+            let rows = body::FeatureRows {
+                window,
+                sink: &mut append,
+            };
+            let next = body::prefill_with(m, ids, Some(rows))?;
             d.flush()?;
             next
         } else {

@@ -3,8 +3,9 @@
 //! target's features (`body::attach_features`, `Body::read_features`), in the
 //! order the draft module's contract fixes:
 //!
-//! 1. [`Dspark::reset`], then [`Dspark::append`] of every fed position's
-//!    features, positions `0 .. P` in order;
+//! 1. [`Dspark::reset`], then [`Dspark::append`] of the fed positions'
+//!    features in order: every position's when fed step by step, the last
+//!    [`Dspark::window`]'s when batched ([`Dspark::skip_to`] past the rest);
 //! 2. per pass ([`pass`]): `d = propose(next)`, the target's pair pass over
 //!    `[next, d]`; row A's argmax equal to `d` accepts both positions and
 //!    appends both rows' features, otherwise the second position is taken
@@ -145,6 +146,24 @@ impl Dspark {
     #[must_use]
     pub fn committed(&self) -> u32 {
         self.body.committed()
+    }
+
+    /// The draft's window, from its file: the trailing positions of a prompt
+    /// whose features it keeps.
+    #[must_use]
+    pub fn window(&self) -> usize {
+        self.body.weights().hp().window
+    }
+
+    /// Commit the positions before `to` without their features, the queued
+    /// ones appended first: a batched prompt hands over only the rows the
+    /// draft's window keeps.
+    pub fn skip_to(&mut self, to: u32) -> Result<(), GpuError> {
+        if to > self.body.committed() + (self.pending.len() / self.width) as u32 {
+            self.flush()?;
+            self.body.skip(to)?;
+        }
+        Ok(())
     }
 
     /// `f` under the draft's context, the target's bound again after it.

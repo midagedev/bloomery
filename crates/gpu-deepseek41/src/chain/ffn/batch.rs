@@ -1,7 +1,8 @@
 //! The MoE sub-layer over a prompt batch: [`FfnBatch`], the buffers a batch
 //! of up to its column count keeps between a layer's phases, and the piece's
-//! batch enqueues. A layer runs, over the batch's chunks of at most
-//! [`HC_MAX_TOKENS`] consecutive tokens:
+//! batch enqueues. A layer runs, over the chunks of at most [`HC_MAX_TOKENS`]
+//! consecutive tokens that hold its block — a suffix of the batch's tokens,
+//! `at .. u`:
 //!
 //! 1. the route ([`FfnPiece::enqueue_batch_route`]), per chunk: the norm with
 //!    its q8_1 form — the step's `norm_quant`, whose f32 output is the
@@ -9,17 +10,20 @@
 //!    time into the batch's ids and weights, and each slot's place in the
 //!    card's routed stacks (`ds41_ffn_places`, the handoff's rule);
 //! 2. the exchange ([`FfnBatch::enqueue_download`], [`FfnBatch::serve`],
-//!    [`FfnBatch::enqueue_upload`]): the batch's activations and routing to
-//!    the host, one union call over every token for the layer's host experts
+//!    [`FfnBatch::enqueue_upload`]): the block's activations and routing to
+//!    the host, one union call over its tokens for the layer's host experts
 //!    ([`Hybrid::serve_batch`]), the sums back;
 //! 3. the shadow ([`FfnPiece::enqueue_batch_shadow`]), per chunk, enqueued
 //!    before the host computes: HC_PRE, the norm's q8_1 form again, the card's
 //!    routed experts over the chunk's slots (`ds41_expert_gate_up_tok`, the
 //!    step's dot on column `slot / 6`; the q8_1 of `h`; `q4k_sel` over the
 //!    slots) and their sum (`ds41_ffn_card_acc`), the shared expert;
-//! 4. the join ([`FfnPiece::enqueue_batch_join`]), one launch over the batch:
+//! 4. the join ([`FfnPiece::enqueue_batch_join`]), one launch over the block:
 //!    the card sum, the host sum and the shared expert combined, then HC_POST
 //!    with the next fold where the layer folds.
+//!
+//! The feature tap of a batch's kept tokens is one launch here too
+//! ([`FfnBatch::enqueue_tap_means`], `ds41_tap_means`).
 //!
 //! Every token's values are the step's bit for bit: each launch writes, per
 //! token, what its one-token launch writes — the m-column kernels carry that
@@ -35,6 +39,7 @@ use cuda_device::warp;
 
 use super::*;
 use crate::experts::swiglu_clamp;
+use crate::hc::hc_mean_elem;
 use crate::span::{span, span_mut};
 
 const WHAT: &str = "FfnBatch";
@@ -320,6 +325,47 @@ mod ffn_batch_kernels {
         // is the only writer of the four stream values at b.
         unsafe { store4(&mut out, n, b, o) };
     }
+
+    /// The feature tap over `m` tokens: thread `i < m·n` is token `t = i /
+    /// n`, value `d = i % n`, and writes the mean of token `t`'s four streams
+    /// at `d` ([`hc_mean_elem`], the one-token tap's value) to `y[t · width +
+    /// off + d]`.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (s.len() >= 4 * n * m, width >= off + n, y.len() >= width * m)
+    )]
+    pub fn ds41_tap_means(
+        s: &[f32],
+        n: u32,
+        m: u32,
+        width: u32,
+        off: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let (t, d) = (i / n, i % n);
+        let b = 4 * t * n + d;
+        // SAFETY: b + 3n < 4n(t + 1) <= 4nm <= s.len() by the launch contract.
+        let o = unsafe {
+            [
+                *s.get_unchecked(b),
+                *s.get_unchecked(b + n),
+                *s.get_unchecked(b + 2 * n),
+                *s.get_unchecked(b + 3 * n),
+            ]
+        };
+        let at = t * width as usize + off as usize + d;
+        // SAFETY: at < t·width + width <= m·width <= y.len() (off + n <=
+        // width, launch contract); thread i is at's only writer.
+        unsafe { *y.get_unchecked_mut(at) = hc_mean_elem(o) };
+    }
 }
 
 /// What the batch join reads, `m` tokens token-major: `acc` the card sums,
@@ -548,10 +594,52 @@ impl FfnBatch {
             + acts.map(q8act_bytes).sum::<usize>()
     }
 
-    /// Enqueue the copies of the first `u` tokens' activations and routing
-    /// to the host, and the event they complete at. Asynchronous.
-    pub fn enqueue_download(&mut self, gpu: &Gpu, u: usize) -> Result<(), GpuError> {
-        self.check_tokens(u)?;
+    /// Enqueue the feature tap of `m` tokens: the mean of each one's four
+    /// streams (`streams`, `4 · n_embd` a token) into its row of `rows`
+    /// (`width` values a row, the mean at `off`), the value the step's tap
+    /// writes. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_tap_means(
+        &self,
+        gpu: &Gpu,
+        streams: &DeviceBuffer<f32>,
+        m: usize,
+        width: usize,
+        off: usize,
+        rows: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (n, what) = (self.n_embd, "ds41_tap_means");
+        if m == 0 || off + n > width || streams.len() < HC_STREAMS * n * m || rows.len() < width * m
+        {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a tap of {m} tokens at {off} of rows of {width}: streams {}, rows {}",
+                    streams.len(),
+                    rows.len()
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", (m * n).div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_ds41_tap_means(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.ds41_tap_means(
+            gpu.stream(),
+            &prep,
+            streams,
+            launch_u32(what, "n", n)?,
+            launch_u32(what, "m", m)?,
+            launch_u32(what, "width", width)?,
+            launch_u32(what, "off", off)?,
+            rows,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the copies of tokens `at .. u`'s activations and routing to
+    /// the host, and the event they complete at. Asynchronous.
+    pub fn enqueue_download(&mut self, gpu: &Gpu, at: usize, u: usize) -> Result<(), GpuError> {
+        self.check_tokens(at, u)?;
         let stream = gpu.stream();
         let (n, s) = (self.n_embd, N_USED);
         // SAFETY: each copy reads the first values of a device buffer this
@@ -561,90 +649,88 @@ impl FfnBatch {
         // copy still writes (the previous batch layer's serve waited on its
         // own event).
         unsafe {
-            dtoh(stream, &mut self.host_x, &self.x, u * n)?;
-            dtoh(stream, &mut self.host_ids, &self.ids, u * s)?;
-            dtoh(stream, &mut self.host_w, &self.weights, u * s)?;
+            dtoh(stream, &mut self.host_x, &self.x, at * n..u * n)?;
+            dtoh(stream, &mut self.host_ids, &self.ids, at * s..u * s)?;
+            dtoh(stream, &mut self.host_w, &self.weights, at * s..u * s)?;
         }
         self.routed.record(stream)?;
         Ok(())
     }
 
     /// Wait for the route's copies, then serve layer `layer`'s host experts
-    /// for the first `u` tokens in one union call: the sums into the host
-    /// copy [`FfnBatch::enqueue_upload`] sends back.
+    /// for tokens `at .. u` in one union call: the sums into the host copy
+    /// [`FfnBatch::enqueue_upload`] sends back.
     pub fn serve<H: HostExperts>(
         &mut self,
         hybrid: &mut Hybrid<H>,
         layer: usize,
+        at: usize,
         u: usize,
     ) -> Result<(), GpuError> {
-        self.check_tokens(u)?;
+        self.check_tokens(at, u)?;
         self.routed.synchronize()?;
         let n = self.n_embd;
-        self.x_host.ne1 = u;
+        self.x_host.ne1 = u - at;
         self.x_host.data.clear();
-        self.x_host.data.extend_from_slice(&self.host_x[..u * n]);
+        self.x_host
+            .data
+            .extend_from_slice(&self.host_x[at * n..u * n]);
         hybrid.serve_batch(
             layer,
             &self.x_host,
-            &self.host_ids[..u * N_USED],
-            &self.host_w[..u * N_USED],
-            &mut self.host_sum[..u * n],
+            &self.host_ids[at * N_USED..u * N_USED],
+            &self.host_w[at * N_USED..u * N_USED],
+            &mut self.host_sum[at * n..u * n],
         )
     }
 
-    /// Enqueue the copy of the first `u` tokens' host sums to the card.
+    /// Enqueue the copy of tokens `at .. u`'s host sums to the card.
     /// Asynchronous: the host writes them again only after the next layer's
     /// route event, which this copy precedes on the stream.
-    pub fn enqueue_upload(&mut self, gpu: &Gpu, u: usize) -> Result<(), GpuError> {
-        self.check_tokens(u)?;
-        // SAFETY: the copy writes the first u·n values of a device buffer this
+    pub fn enqueue_upload(&mut self, gpu: &Gpu, at: usize, u: usize) -> Result<(), GpuError> {
+        self.check_tokens(at, u)?;
+        let n = self.n_embd;
+        // SAFETY: the copy writes values at·n .. u·n of a device buffer this
         // value owns from a page-locked buffer it owns, which the host writes
         // again only in the next serve, after a wait on an event recorded
         // behind this copy.
-        unsafe {
-            htod(
-                gpu.stream(),
-                &mut self.hsum,
-                &self.host_sum,
-                u * self.n_embd,
-            )
-        }
+        unsafe { htod(gpu.stream(), &mut self.hsum, &self.host_sum, at * n..u * n) }
     }
 
-    fn check_tokens(&self, u: usize) -> Result<(), GpuError> {
-        if u == 0 || u > self.cap {
+    /// Tokens `at .. u` of a batch: at least one, at most the cap.
+    fn check_tokens(&self, at: usize, u: usize) -> Result<(), GpuError> {
+        if at >= u || u > self.cap {
             return Err(GpuError::Shape {
                 what: WHAT,
-                detail: format!("{u} tokens in a batch of at most {}", self.cap),
+                detail: format!("tokens {at}..{u} of a batch of at most {}", self.cap),
             });
         }
         Ok(())
     }
 }
 
-/// Enqueue the copy of `len` values of `src` to the start of `dst`.
+/// Enqueue the copy of values `at` of `src` to the same values of `dst`.
 ///
 /// SAFETY: `dst` is not read, written or freed until the copy completes.
 unsafe fn dtoh<T: cuda_core::DeviceCopy>(
     stream: &CudaStream,
     dst: &mut PinnedHostBuffer<T>,
     src: &DeviceBuffer<T>,
-    len: usize,
+    at: Range<usize>,
 ) -> Result<(), GpuError> {
-    if len > src.len() || len > dst.len() {
+    if at.is_empty() || at.end > src.len() || at.end > dst.len() {
         return Err(GpuError::Shape {
             what: WHAT,
-            detail: format!("{len} values from {} into {}", src.len(), dst.len()),
+            detail: format!("values {at:?} from {} into {}", src.len(), dst.len()),
         });
     }
-    // SAFETY: both ranges hold `len` values (checked above); `dst` stays
-    // untouched until the copy completes by this fn's contract.
+    // SAFETY: both buffers hold the values of `at` (checked above); `dst`
+    // stays untouched until the copy completes by this fn's contract.
     let rc = unsafe {
         sys::cuMemcpyDtoHAsync_v2(
-            dst.as_mut_ptr().cast(),
-            src.cu_deviceptr(),
-            len * size_of::<T>(),
+            dst.as_mut_ptr().add(at.start).cast(),
+            src.cu_deviceptr() + (at.start * size_of::<T>()) as u64,
+            at.len() * size_of::<T>(),
             stream.cu_stream(),
         )
     };
@@ -654,28 +740,28 @@ unsafe fn dtoh<T: cuda_core::DeviceCopy>(
     })
 }
 
-/// Enqueue the copy of the first `len` values of `src` to the start of `dst`.
+/// Enqueue the copy of values `at` of `src` to the same values of `dst`.
 ///
 /// SAFETY: `src` is not written or freed until the copy completes.
 unsafe fn htod<T: cuda_core::DeviceCopy>(
     stream: &CudaStream,
     dst: &mut DeviceBuffer<T>,
     src: &PinnedHostBuffer<T>,
-    len: usize,
+    at: Range<usize>,
 ) -> Result<(), GpuError> {
-    if len > src.len() || len > dst.len() {
+    if at.is_empty() || at.end > src.len() || at.end > dst.len() {
         return Err(GpuError::Shape {
             what: WHAT,
-            detail: format!("{len} values from {} into {}", src.len(), dst.len()),
+            detail: format!("values {at:?} from {} into {}", src.len(), dst.len()),
         });
     }
-    // SAFETY: both ranges hold `len` values (checked above); `src` stays
-    // unwritten until the copy completes by this fn's contract.
+    // SAFETY: both buffers hold the values of `at` (checked above); `src`
+    // stays unwritten until the copy completes by this fn's contract.
     let rc = unsafe {
         sys::cuMemcpyHtoDAsync_v2(
-            dst.cu_deviceptr(),
-            src.as_ptr().cast(),
-            len * size_of::<T>(),
+            dst.cu_deviceptr() + (at.start * size_of::<T>()) as u64,
+            src.as_ptr().add(at.start).cast(),
+            at.len() * size_of::<T>(),
             stream.cu_stream(),
         )
     };
@@ -697,8 +783,9 @@ pub struct ChunkIo<'a> {
     pub fold_in: &'a DeviceBuffer<f32>,
 }
 
-/// The buffers a batch join shares with the rest of the batch, its first
-/// `u` tokens of each.
+/// The buffers a batch join shares with the rest of the batch: its streams
+/// and folds, the batch's tokens from 0 on — the join reads and writes the
+/// tokens it is given.
 pub struct JoinIo<'a> {
     /// The streams the sub-layer read, `4 · n_embd` a token.
     pub streams: &'a DeviceBuffer<f32>,
@@ -935,13 +1022,14 @@ impl FfnPiece {
         Ok(())
     }
 
-    /// Layer `layer`'s join over the batch's first `u` tokens, after the host
+    /// Layer `layer`'s join over the batch's tokens `at .. u`, after the host
     /// sums' upload ([`JoinIo`]). One launch. Asynchronous, allocation-free.
     pub fn enqueue_batch_join(
         &mut self,
         gpu: &Gpu,
         b: &FfnBatch,
         layer: usize,
+        at: usize,
         u: usize,
         io: JoinIo<'_>,
     ) -> Result<(), GpuError> {
@@ -958,7 +1046,7 @@ impl FfnPiece {
                 detail: format!("layer {layer} is outside {:?}", self.layers),
             })?;
         let n = self.n_embd;
-        if u == 0
+        if at >= u
             || u > b.cap
             || fold_out.is_some() != self.cfg[i].fold
             || streams.len() < HC_STREAMS * n * u
@@ -968,8 +1056,8 @@ impl FfnPiece {
             return Err(GpuError::Shape {
                 what: WHAT,
                 detail: format!(
-                    "layer {layer}'s join of {u} tokens (batches of {}): streams {} and {}, a fold \
-                     out {:?} (the layer folds: {})",
+                    "layer {layer}'s join of tokens {at}..{u} (batches of {}): streams {} and {}, \
+                     a fold out {:?} (the layer folds: {})",
                     b.cap,
                     streams.len(),
                     streams_out.len(),
@@ -979,40 +1067,30 @@ impl FfnPiece {
             });
         }
         let what = "ds41_ffn_post_batch";
-        let grid = launch_u32(what, "grid", (u * n).div_ceil(THREADS as usize))?;
+        let m = u - at;
+        let s4 = HC_STREAMS * n;
+        let grid = launch_u32(what, "grid", (m * n).div_ceil(THREADS as usize))?;
         let cfg = LaunchConfig1D::new(grid, THREADS, 0);
-        let (nn, mm) = (launch_u32(what, "n", n)?, launch_u32(what, "m", u)?);
+        let (nn, mm) = (launch_u32(what, "n", n)?, launch_u32(what, "m", m)?);
         let stream = gpu.stream();
+        let acc = span(WHAT, &b.acc, at * n, m * n)?;
+        let hsum = span(WHAT, &b.hsum, at * n, m * n)?;
+        let shexp = span(WHAT, &b.shexp, at * n, m * n)?;
+        let hc = span(WHAT, &b.hc, at * HC_MIX, m * HC_MIX)?;
+        let res = span(WHAT, streams, at * s4, m * s4)?;
+        let mut out = span_mut(WHAT, streams_out, at * s4, m * s4)?;
         match fold_out {
             Some(fold) => {
+                let mut fold = span_mut(WHAT, fold, at * n, m * n)?;
                 let prep = b.module.prepare_ds41_ffn_post_batch(cfg)?;
                 b.module.ds41_ffn_post_batch(
-                    stream,
-                    &prep,
-                    &b.acc,
-                    &b.hsum,
-                    &b.shexp,
-                    streams,
-                    &b.hc,
-                    nn,
-                    mm,
-                    streams_out,
-                    fold,
+                    stream, &prep, &acc, &hsum, &shexp, &res, &hc, nn, mm, &mut out, &mut fold,
                 )?;
             }
             None => {
                 let prep = b.module.prepare_ds41_ffn_post_batch_streams(cfg)?;
                 b.module.ds41_ffn_post_batch_streams(
-                    stream,
-                    &prep,
-                    &b.acc,
-                    &b.hsum,
-                    &b.shexp,
-                    streams,
-                    &b.hc,
-                    nn,
-                    mm,
-                    streams_out,
+                    stream, &prep, &acc, &hsum, &shexp, &res, &hc, nn, mm, &mut out,
                 )?;
             }
         }

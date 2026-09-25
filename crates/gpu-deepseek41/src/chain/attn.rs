@@ -159,6 +159,16 @@ pub enum Selection<'a> {
     },
 }
 
+/// The buffers [`AttnChain::enqueue_layer_part`] reads and writes: the
+/// folded input the previous sub-layer left, the layer's ring and its
+/// shadow, and its compressed rows as [`AttnIo::compressed`] names them.
+pub struct PartIo<'a> {
+    pub fold_in: &'a DeviceBuffer<f32>,
+    pub ring: &'a mut DeviceTensor<u16>,
+    pub shadow: &'a mut DeviceTensor<u16>,
+    pub compressed: Compressed<'a>,
+}
+
 /// Where a chunk of a prompt batch stages its latent rows
 /// ([`AttnChain::enqueue_layer_staged`]): a ring of `rows.rows()` rows — the
 /// batch's chunk size — position `p` in row `p % rows.rows()`, which the
@@ -1311,6 +1321,106 @@ impl AttnChain {
         self.enqueue_layer_at(gpu, w, layer, row, m, io, Some(stage))
     }
 
+    /// Layer `layer`'s latent rows alone, for a chunk of a prompt batch whose
+    /// positions only later positions' windows read — the first `m` tokens
+    /// (`1 ..=` [`AttnChain::tokens`]) of row `row`'s words: the attention
+    /// norm of `io.fold_in`, on a compressor's layer the compressor and its
+    /// index key, the latent projection and each token's row into its slot
+    /// of `io.ring` and its row of `io.shadow`. Nothing else runs — no query,
+    /// indexer, attention, output or HC_POST — so the chunk leaves no streams
+    /// and no fold. Each launch is one [`AttnChain::enqueue_layer_staged`]
+    /// makes over the same tokens (the append into the ring instead of the
+    /// staging, the rows its commit would copy there), so the ring, the
+    /// shadow, the compressed rows and keys and the compressor's state are
+    /// its bits. Asynchronous, allocation-free.
+    pub fn enqueue_layer_part(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        layer: usize,
+        row: usize,
+        m: usize,
+        io: PartIo<'_>,
+    ) -> Result<(), GpuError> {
+        let lp = layer
+            .checked_sub(self.layers.start)
+            .and_then(|i| self.plans.get(i))
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("layer {layer} is not one of {:?}", self.layers),
+            })?;
+        if !(1..=self.tokens).contains(&m) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a pass of {m} tokens; the piece runs 1..={}", self.tokens),
+            });
+        }
+        let PartIo {
+            fold_in,
+            ring,
+            shadow,
+            mut compressed,
+        } = io;
+        let cx = Cx {
+            gpu,
+            w,
+            k: &self.kernels,
+            d: &self.dims,
+            words: self.words.of(row)?,
+            layer,
+            fault: gpu.layer_sink(layer)?,
+            m,
+        };
+        let s = &mut self.scratch;
+        let (d, k, stream) = (cx.d, cx.k, gpu.stream());
+        let qkv = Qkv::of(w, lp, d)?;
+        let normed_act = enqueue_norm(&cx, lp, s, fold_in, &mut compressed, qkv.reads_q8_1())?;
+        let act = normed_act_of(&s.source, &s.acts, normed_act, m)?;
+        match qkv {
+            Qkv::Joint(t) => {
+                let act = act.ok_or_else(|| GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("layer {layer}: a joined q_a·kv without the normed q8_1"),
+                })?;
+                match s.raw.as_mut() {
+                    None => gpu.enqueue_gemv_q3k(t, act, s.qkv.whole_mut())?,
+                    Some(raw) => {
+                        gpu.enqueue_gemv_q3k(t, act, &mut raw.qkv)?;
+                        let src = rows_of(&raw.qkv, d.q_lora_rank, d.head_dim, m)?;
+                        k.transpose
+                            .enqueue(stream, &src, d.head_dim, m, s.qkv.part_mut(KV))?;
+                    }
+                }
+            }
+            Qkv::Parts { kv, .. } => project(
+                &cx,
+                kv,
+                &s.normed,
+                act,
+                d.head_dim,
+                s.raw.as_mut().map(|r| &mut r.qkv),
+                s.qkv.part_mut(KV),
+            )?,
+        }
+        let pos = cx.words.view::<u32>(cx.words.layout.pos, m)?;
+        let table = cx.words.view::<f32>(lp.forward, m * d.rope_dims)?;
+        k.rope.enqueue_kv_norm_rope_append(
+            stream,
+            KvAppendArgs {
+                kv: s.qkv.part(KV),
+                gain: vector(w, &lp.names.kv_norm)?,
+                cs: &table,
+                pos: &pos,
+                eps: d.eps,
+                n_dims: d.rope_dims,
+                m,
+                out: &mut s.kv_row,
+                cache: ring,
+                shadow,
+            },
+        )
+    }
+
     /// The layer's launches over `m` tokens: into the ring (`stage` `None`,
     /// the decode step's, one token) or through a chunk's staging.
     #[allow(
@@ -1383,89 +1493,8 @@ impl AttnChain {
         let fork = branch.fork(stream)?;
         k.hc.enqueue_pre(fork.stream(), &pre, &mut s.hc_pre, &mut s.mixes, &mut s.hc)?;
 
-        let passed = match &compressed {
-            Compressed::None => "no compressed rows",
-            Compressed::Read(_) => "rows to read",
-            Compressed::Source(_) => "a compressor's buffers",
-        };
-        let gain = vector(w, &n.norm)?;
         let qkv = Qkv::of(w, lp, d)?;
-        let quantized = qkv.reads_q8_1();
-        let normed_act = match (&lp.source, &mut compressed, s.source.as_mut()) {
-            (Some(sp), Compressed::Source(io), Some(src)) => {
-                let act = count_of(&mut src.act, m)?;
-                k.fused.enqueue_norm_quant(
-                    stream,
-                    fold_in,
-                    gain,
-                    d.eps,
-                    act,
-                    &mut s.normed,
-                    cx.fault,
-                )?;
-                enqueue_source(&cx, sp, src, &mut s.raw, io)?;
-                NormedAct::Source
-            }
-            (None, Compressed::Read(_), _) if lp.stream.is_some() && quantized => {
-                k.fused.enqueue_norm_quant(
-                    stream,
-                    fold_in,
-                    gain,
-                    d.eps,
-                    &mut count_of(&mut s.acts, m)?.normed,
-                    &mut s.normed,
-                    cx.fault,
-                )?;
-                NormedAct::Own
-            }
-            (None, Compressed::None, _) if lp.stream.is_none() && quantized => {
-                k.fused.enqueue_norm_quant(
-                    stream,
-                    fold_in,
-                    gain,
-                    d.eps,
-                    &mut count_of(&mut s.acts, m)?.normed,
-                    &mut s.normed,
-                    cx.fault,
-                )?;
-                NormedAct::Own
-            }
-            (None, Compressed::Read(_), _) if lp.stream.is_some() => {
-                gpu.elem().enqueue_rms_norm(
-                    stream,
-                    fold_in,
-                    gain,
-                    d.eps,
-                    d.n_embd,
-                    m,
-                    &mut s.normed,
-                )?;
-                NormedAct::None
-            }
-            (None, Compressed::None, _) if lp.stream.is_none() => {
-                gpu.elem().enqueue_rms_norm(
-                    stream,
-                    fold_in,
-                    gain,
-                    d.eps,
-                    d.n_embd,
-                    m,
-                    &mut s.normed,
-                )?;
-                NormedAct::None
-            }
-            _ => {
-                return Err(GpuError::Shape {
-                    what: WHAT,
-                    detail: format!(
-                        "layer {layer} attends stream {:?} and owns a compressor: {}; the caller \
-                         passed {passed}",
-                        lp.stream,
-                        lp.source.is_some(),
-                    ),
-                });
-            }
-        };
+        let normed_act = enqueue_norm(&cx, lp, s, fold_in, &mut compressed, qkv.reads_q8_1())?;
 
         let q_a = match qkv {
             Qkv::Joint(t) => {
@@ -1599,7 +1628,6 @@ impl AttnChain {
             selected: list.map(|rows| SelectedRows {
                 rows,
                 stride: top_k,
-                fault: cx.fault,
             }),
             vis: &vis,
             sinks: vector(w, &n.sinks)?,
@@ -1609,6 +1637,7 @@ impl AttnChain {
             part_v: &mut s.part_v,
             part_ms: &mut s.part_ms,
             y: &mut s.y,
+            fault: cx.fault,
         };
         match stage.as_ref() {
             None => k.attn.enqueue(stream, args)?,
@@ -1650,6 +1679,103 @@ impl AttnChain {
         };
         k.hc.enqueue_post(stream, &post, streams_out, fold_out)
     }
+}
+
+/// The attention norm of `fold_in` over the pass's tokens, with the q8_1
+/// form the layer's projections read when `quantized`: on a compressor's
+/// layer into the compressor's scratch, then the compressor and its index
+/// key; else into the piece's own. Returns where the q8_1 form sits.
+fn enqueue_norm(
+    cx: &Cx<'_>,
+    lp: &LayerPlan,
+    s: &mut Scratch,
+    fold_in: &DeviceBuffer<f32>,
+    compressed: &mut Compressed<'_>,
+    quantized: bool,
+) -> Result<NormedAct, GpuError> {
+    let (d, k, stream, w, gpu, layer) = (cx.d, cx.k, cx.gpu.stream(), cx.w, cx.gpu, cx.layer);
+    let m = cx.m;
+    let passed = match &*compressed {
+        Compressed::None => "no compressed rows",
+        Compressed::Read(_) => "rows to read",
+        Compressed::Source(_) => "a compressor's buffers",
+    };
+    let gain = vector(w, &lp.names.norm)?;
+    Ok(match (&lp.source, compressed, s.source.as_mut()) {
+        (Some(sp), Compressed::Source(io), Some(src)) => {
+            let act = count_of(&mut src.act, m)?;
+            k.fused.enqueue_norm_quant(
+                stream,
+                fold_in,
+                gain,
+                d.eps,
+                act,
+                &mut s.normed,
+                cx.fault,
+            )?;
+            enqueue_source(cx, sp, src, &mut s.raw, io)?;
+            NormedAct::Source
+        }
+        (None, Compressed::Read(_), _) if lp.stream.is_some() && quantized => {
+            k.fused.enqueue_norm_quant(
+                stream,
+                fold_in,
+                gain,
+                d.eps,
+                &mut count_of(&mut s.acts, m)?.normed,
+                &mut s.normed,
+                cx.fault,
+            )?;
+            NormedAct::Own
+        }
+        (None, Compressed::None, _) if lp.stream.is_none() && quantized => {
+            k.fused.enqueue_norm_quant(
+                stream,
+                fold_in,
+                gain,
+                d.eps,
+                &mut count_of(&mut s.acts, m)?.normed,
+                &mut s.normed,
+                cx.fault,
+            )?;
+            NormedAct::Own
+        }
+        (None, Compressed::Read(_), _) if lp.stream.is_some() => {
+            gpu.elem().enqueue_rms_norm(
+                stream,
+                fold_in,
+                gain,
+                d.eps,
+                d.n_embd,
+                m,
+                &mut s.normed,
+            )?;
+            NormedAct::None
+        }
+        (None, Compressed::None, _) if lp.stream.is_none() => {
+            gpu.elem().enqueue_rms_norm(
+                stream,
+                fold_in,
+                gain,
+                d.eps,
+                d.n_embd,
+                m,
+                &mut s.normed,
+            )?;
+            NormedAct::None
+        }
+        _ => {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer} attends stream {:?} and owns a compressor: {}; the caller \
+                     passed {passed}",
+                    lp.stream,
+                    lp.source.is_some(),
+                ),
+            });
+        }
+    })
 }
 
 /// The rows of `st`'s staging a chunk of `m` tokens from `st.first` fills:

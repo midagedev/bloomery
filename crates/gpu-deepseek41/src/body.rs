@@ -89,10 +89,12 @@ use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, StepRows};
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
+mod ced;
 mod prefill;
+pub use ced::{CedLayer, CedState, LayerNeed, Need, exact};
 pub use prefill::{
-    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureSink, PrefillMode, T_MAX, prefill,
-    prefill_observed, prefill_with, prepare_prefill,
+    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, PrefillMode, T_MAX,
+    batches, prefill, prefill_observed, prefill_with, prepare_prefill,
 };
 
 /// The V4.1 engine: the shared skeleton over this body.
@@ -589,6 +591,14 @@ pub struct Body {
     /// wrote: rows below it hold nothing a cut may restore (a caller wrote
     /// the caches itself, [`Body::set_history`]).
     shadow_from: usize,
+    /// Positions of the history whose shadow rows some layer never wrote:
+    /// each prompt call's [`Need::hole`], in position order. A cut whose
+    /// restore reads one is not granted.
+    holes: Vec<Range<usize>>,
+    /// Which positions each layer of a prompt call runs ([`ced`]), and the
+    /// last call's needs.
+    ced: ced::Ced,
+    need: Option<Need>,
     /// A cut left ring slots the next step reads holding other positions'
     /// rows: the next refresh restores them before the step runs.
     restore: bool,
@@ -848,8 +858,23 @@ impl Body {
         self.history.extend_from_slice(history);
         self.holds.known(history.len());
         self.shadow_from = history.len();
+        self.holes.clear();
+        self.need = None;
         self.restore = false;
         Ok(())
+    }
+
+    /// Whether a prompt call runs the CED triangle ([`prefill`]), and why
+    /// not when it does not: the load's decision.
+    #[must_use]
+    pub fn ced(&self) -> CedState {
+        self.ced.state()
+    }
+
+    /// The last prompt call's needs: which positions each layer ran.
+    #[must_use]
+    pub fn prefill_need(&self) -> Option<&Need> {
+        self.need.as_ref()
     }
 
     /// The indexer's `top_k` the step selects with.
@@ -1126,7 +1151,14 @@ impl Body {
     ///   slots ..= n − 1`; the slots of those that hold another position's
     ///   row ([`Holds::stale`]) are restored from the shadow, which holds the
     ///   rows of positions from `shadow_from` on. A cut that needs a row below
-    ///   that keeps nothing.
+    ///   that keeps nothing. A prompt call leaves some layers' shadow rows
+    ///   unwritten ([`Need::hole`]: the CED triangle writes a layer's rows
+    ///   only where a later position reads them): a cut that would restore
+    ///   one is moved down to the hole's start, the call's first position,
+    ///   whose window reads only rows before it. After one call of `P`
+    ///   positions that leaves `0` and the call's last few positions: `P`,
+    ///   and those whose window starts at or past the last layer's first
+    ///   latent row.
     /// - Compressed rows, index keys and lists are indexed by position and
     ///   written by the step that completes them, and a step reads only the
     ///   ones below its own position, so whatever stands at or past the cut
@@ -1139,13 +1171,26 @@ impl Body {
             return len;
         }
         let mut k = n;
-        while k > 0 && !self.holds.state_keeps(k) {
-            k -= 1;
+        loop {
+            while k > 0 && !self.holds.state_keeps(k) {
+                k -= 1;
+            }
+            let unwritten = self.holds.stale(k).find_map(|q| {
+                if q < self.shadow_from {
+                    Some(None)
+                } else {
+                    self.holes
+                        .iter()
+                        .find(|h| h.contains(&q))
+                        .map(|h| Some(h.start))
+                }
+            });
+            match unwritten {
+                None => return k,
+                Some(None) => return 0,
+                Some(Some(start)) => k = start,
+            }
         }
-        if self.holds.stale(k).any(|q| q < self.shadow_from) {
-            return 0;
-        }
-        k
     }
 
     /// `n_embd`, as the planner's image holds it.
@@ -1175,6 +1220,10 @@ impl Body {
         if to < len {
             self.history.truncate(to);
             self.shadow_from = self.shadow_from.min(to);
+            self.holes.retain_mut(|h| {
+                h.end = h.end.min(to);
+                h.start < h.end
+            });
             self.restore = self.holds.stale(to).next().is_some();
         }
         Ok(())
@@ -1931,6 +1980,8 @@ impl ChainBody for Body {
         self.history.clear();
         self.holds.known(0);
         self.shadow_from = 0;
+        self.holes.clear();
+        self.need = None;
         self.restore = false;
         Ok(())
     }
@@ -2101,10 +2152,9 @@ impl ChainBody for Body {
         let file = Arc::new(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone())?;
         let hybrid = Hybrid::new(boundary, host, layers.len())?;
-        let holds = Holds::new(
-            kv.first().map_or(0, |k| k.ring.rows()),
-            planner.stream_ratios(),
-        );
+        let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
+        let holds = Holds::new(ring_rows, planner.stream_ratios());
+        let ced = ced::Ced::new(&hp.layers, ring_rows, ced::from_env()?);
 
         Ok(Body {
             layers,
@@ -2128,6 +2178,9 @@ impl ChainBody for Body {
             history: Vec::with_capacity(ctx_max),
             holds,
             shadow_from: 0,
+            holes: Vec::new(),
+            ced,
+            need: None,
             restore: false,
             file,
             eps: hp.rms_eps,

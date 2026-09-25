@@ -30,9 +30,12 @@
 //! One sequence, in this order:
 //!
 //! 1. [`DraftBody::reset`] — zeroed rings, no committed position.
-//! 2. [`DraftBody::append`] of the prompt's features, positions `0 .. P`
-//!    in order (at most a window a call; more than [`kv::GROUP`] rows in one
-//!    call run eager, once a sequence).
+//! 2. [`DraftBody::append`] of the prompt's features in order, positions
+//!    `max(0, P − window) .. P` — the rows the window-only layers keep; a
+//!    batched prompt ([`crate::body::prefill_with`]) hands over only those,
+//!    and [`DraftBody::skip`] moves the committed position past the rest (at
+//!    most a window a call; more than [`kv::GROUP`] rows in one call run
+//!    eager, once a sequence).
 //! 3. [`DraftBody::propose`]`(id_last, w)`: `id_last` is the token at
 //!    position [`DraftBody::committed`] — after the prompt, the token the
 //!    target sampled from its last row, which the target has not run yet —
@@ -116,6 +119,9 @@ pub struct DraftBody {
     target: Arc<Split>,
     /// Positions appended so far: the next committed position.
     committed: u32,
+    /// The latest positions [`DraftBody::skip`] passed without a row: a
+    /// block that would read one of their slots is refused.
+    skipped: Option<std::ops::Range<u32>>,
 }
 
 impl DraftBody {
@@ -155,7 +161,30 @@ impl DraftBody {
             pass,
             target,
             committed: 0,
+            skipped: None,
         })
+    }
+
+    /// Commit positions `committed .. to` without their rows: a reader that
+    /// keeps only a window's rows skips the older ones. Their ring slots
+    /// hold nothing of theirs; a block that would read one before appended
+    /// rows overwrite it is refused ([`DraftBody::propose`]). Refused for a
+    /// `to` below the committed position.
+    pub fn skip(&mut self, to: u32) -> Result<(), GpuError> {
+        if to < self.committed {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a skip to position {to} after {} committed positions",
+                    self.committed
+                ),
+            });
+        }
+        if to > self.committed {
+            self.skipped = Some(self.committed..to);
+            self.committed = to;
+        }
+        Ok(())
     }
 
     /// Append the features of the next committed positions (`feats.len()`
@@ -218,6 +247,17 @@ impl DraftBody {
             });
         }
         let hp = self.w.hp();
+        let seen = self.committed as usize - (self.committed as usize).min(hp.window);
+        if let Some(gap) = self.skipped.as_ref().filter(|g| g.end as usize > seen) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a block after position {} reads the ring rows of positions {seen}.., and \
+                     positions {gap:?} were skipped without their rows",
+                    self.committed
+                ),
+            });
+        }
         let row = embedding_row(&self.target, hp.n_embd, id_last)?;
         let input = BlockInput {
             id_last,
@@ -264,6 +304,7 @@ impl DraftBody {
         self.rings.reset(gpu.stream())?;
         gpu.stream().synchronize()?;
         self.committed = 0;
+        self.skipped = None;
         Ok(())
     }
 

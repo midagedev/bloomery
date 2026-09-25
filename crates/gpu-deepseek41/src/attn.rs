@@ -39,7 +39,10 @@
 //!   their slots, which leaves the ring as `T` decode steps would.
 //!
 //! The counts, the lists and `b` live in device memory, so a captured graph
-//! reads them per replay; the grid comes from the buffers' heights.
+//! reads them per replay; the grid comes from the buffers' heights. A count
+//! past its source's rows — window keys past the ring's, compressed rows
+//! past the stream's — is refused on the device: the launch raises
+//! [`FaultSite::AttnCount`] and reads no row past the source.
 //!
 //! A block serves one token: sixteen of its heads, the `mma.sync` `M` axis,
 //! over one segment — a launch of T tokens is T one-token launches' blocks
@@ -130,9 +133,13 @@ pub fn partials_ms_len(q_rows: usize, segs: usize) -> usize {
 /// compressed key `key` row `comp` — `key` itself for a window read from the
 /// ring alone and for a compressed prefix. `comp_keys` is the compressed
 /// source's key capacity — the grid's share and the bound on every count.
-/// The row expressions are evaluated only for a key below the token's
-/// limit, `min(count, keys)`. `check` runs once per compressed key of the
-/// block's segment, one key per thread, before the walk and with no barrier:
+/// A count past its source's rows (`win_rows`, or `comp_rows` for the
+/// compressed source) raises [`FaultSite::AttnCount`] on `fault`: a selected
+/// list's capacity may cut a count below the stream's rows, nothing may name
+/// keys past them. The row expressions are evaluated only for a key below
+/// the token's limit, `min(count, keys)`. `check` runs once per compressed
+/// key of the block's segment, one key per thread, before the walk and with
+/// no barrier:
 /// the refusals of the compressed row's inputs live there, so nothing they
 /// hold is live across the walk.
 macro_rules! segment_pass {
@@ -145,11 +152,13 @@ macro_rules! segment_pass {
         tokens: $tokens:ident,
         n_heads: $n_heads:ident,
         win_rows: $win_rows:ident,
+        comp_rows: $comp_rows:ident,
         comp_keys: $comp_keys:expr,
         segs_w: $segs_w:ident,
         segs: $segs:ident,
         part_v: $part_v:ident,
         part_ms: $part_ms:ident,
+        fault: $fault:ident,
         source: |$window:ident, $src:ident| $kvw:expr,
         key_rows: |$t:ident, $key:ident| window: $win_row:expr, comp: $comp_row:expr,
         check: |$ckey:ident| $check:block $(,)?
@@ -185,6 +194,16 @@ macro_rules! segment_pass {
         // SAFETY: t < tokens, so both of its counts are inside vis (launch
         // contract).
         let count = unsafe { *$vis.get_unchecked(2 * $t + usize::from(!$window)) } as usize;
+        // A count past the rows its source holds names keys that do not
+        // exist: one thread raises, and the walk stays inside the source.
+        let height = if $window {
+            $win_rows as usize
+        } else {
+            $comp_rows as usize
+        };
+        if count > height && tid == 0 {
+            $fault.raise(FaultSite::AttnCount);
+        }
         let limit = count.min(src_keys);
         let lo = (seg - first_seg) * SEG_KEYS;
         if lo >= limit {
@@ -342,7 +361,8 @@ mod attn_kernels {
     /// Segments `0..segs_w` are the window ring's, `segs_w..segs` the
     /// stream's. A segment past its token's count writes the neutral
     /// partial `(−inf, 0)` and reads no key row, which is what keeps a row
-    /// the token does not see out of every result.
+    /// the token does not see out of every result. A count past its
+    /// source's rows raises [`FaultSite::AttnCount`] on `fault`.
     #[kernel]
     #[launch_bounds(512)]
     #[launch_contract(
@@ -376,6 +396,7 @@ mod attn_kernels {
         segs: u32,
         mut part_v: DisjointSlice<f32>,
         mut part_ms: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         segment_pass! {
             q: q,
@@ -386,11 +407,13 @@ mod attn_kernels {
             tokens: tokens,
             n_heads: n_heads,
             win_rows: win_rows,
+            comp_rows: comp_rows,
             comp_keys: comp_rows as usize,
             segs_w: segs_w,
             segs: segs,
             part_v: part_v,
             part_ms: part_ms,
+            fault: fault,
             source: |window, src| src.as_ptr().cast::<u32>(),
             key_rows: |t, key| window: key, comp: key,
             check: |_key| {},
@@ -454,11 +477,13 @@ mod attn_kernels {
             tokens: tokens,
             n_heads: n_heads,
             win_rows: win_rows,
+            comp_rows: comp_rows,
             comp_keys: sel_stride as usize,
             segs_w: segs_w,
             segs: segs,
             part_v: part_v,
             part_ms: part_ms,
+            fault: fault,
             source: |window, src| src.as_ptr().cast::<u32>(),
             key_rows: |t, key| window: key, comp: {
                 // SAFETY: t < tokens and key < min(count, sel_stride) put
@@ -520,6 +545,7 @@ mod attn_kernels {
         segs: u32,
         mut part_v: DisjointSlice<f32>,
         mut part_ms: DisjointSlice<f32>,
+        fault: FaultSink,
     ) {
         // SAFETY: base.len() >= 1 (launch contract).
         let b = unsafe { *base.get_unchecked(0) };
@@ -532,11 +558,13 @@ mod attn_kernels {
             tokens: tokens,
             n_heads: n_heads,
             win_rows: win_rows,
+            comp_rows: comp_rows,
             comp_keys: comp_rows as usize,
             segs_w: segs_w,
             segs: segs,
             part_v: part_v,
             part_ms: part_ms,
+            fault: fault,
             source: |window, src| if window {
                 RingStage::split(src, stage, win_rows)
             } else {
@@ -604,11 +632,13 @@ mod attn_kernels {
             tokens: tokens,
             n_heads: n_heads,
             win_rows: win_rows,
+            comp_rows: comp_rows,
             comp_keys: sel_stride as usize,
             segs_w: segs_w,
             segs: segs,
             part_v: part_v,
             part_ms: part_ms,
+            fault: fault,
             source: |window, src| if window {
                 RingStage::split(src, stage, win_rows)
             } else {
@@ -776,8 +806,6 @@ pub struct SelectedRows<'a> {
     /// Entries per token: each token's list capacity, and the compressed
     /// source's share of the grid.
     pub stride: usize,
-    /// Where an entry past the stream is raised (the launch's layer).
-    pub fault: FaultSink,
 }
 
 /// A batch's own latent rows, staged beside the window ring until the batch
@@ -823,6 +851,9 @@ pub struct AttnArgs<'a> {
     /// [`partials_ms_len`] f32 for the same.
     pub part_ms: &'a mut DeviceBuffer<f32>,
     pub y: &'a mut DeviceBuffer<f32>,
+    /// Where the launch refuses its input, the launch's layer's: a count
+    /// past its source's rows, a list entry past the stream.
+    pub fault: FaultSink,
 }
 
 /// [`AttnKernels::enqueue_commit`]'s arguments.
@@ -850,6 +881,7 @@ struct Segments<'a> {
     comp_rows: u32,
     segs_w: u32,
     segs: u32,
+    fault: FaultSink,
 }
 
 impl AttnKernels {
@@ -976,6 +1008,7 @@ impl AttnKernels {
             part_v,
             part_ms,
             y,
+            fault,
         } = a;
         let shape = |detail: String| GpuError::Shape { what, detail };
         if tokens == 0 || heads == 0 || !heads.is_multiple_of(MMA_ROWS) {
@@ -1072,6 +1105,7 @@ impl AttnKernels {
             comp_rows: launch_u32(what, "compressed rows", comp_rows)?,
             segs_w: launch_u32(what, "window segments", segs_w)?,
             segs: launch_u32(what, "segments", segs)?,
+            fault,
         };
         self.enqueue_segments(stream, &g, &mut *part_v, &mut *part_ms, selected, staged)?;
         let q_rows = launch_u32(what, "q_rows", q_rows)?;
@@ -1116,6 +1150,7 @@ impl AttnKernels {
                     g.segs,
                     part_v,
                     part_ms,
+                    g.fault,
                 )?;
             }
             (Some((stride, s)), None) => {
@@ -1138,7 +1173,7 @@ impl AttnKernels {
                     g.segs,
                     part_v,
                     part_ms,
-                    s.fault,
+                    g.fault,
                 )?;
             }
             (None, Some(st)) => {
@@ -1161,6 +1196,7 @@ impl AttnKernels {
                     g.segs,
                     part_v,
                     part_ms,
+                    g.fault,
                 )?;
             }
             (Some((stride, s)), Some(st)) => {
@@ -1185,7 +1221,7 @@ impl AttnKernels {
                     g.segs,
                     part_v,
                     part_ms,
-                    s.fault,
+                    g.fault,
                 )?;
             }
         }

@@ -1398,7 +1398,6 @@ mod gate {
                         selected: selected.then_some(SelectedRows {
                             rows: &launch.list,
                             stride,
-                            fault: cx.gpu.unlabelled_sink(),
                         }),
                         vis: &vis,
                         sinks: &sinks_dev,
@@ -1408,6 +1407,7 @@ mod gate {
                         part_v: &mut part_v,
                         part_ms: &mut part_ms,
                         y: &mut y,
+                        fault: cx.gpu.unlabelled_sink(),
                     },
                 )?;
                 stream.synchronize()?;

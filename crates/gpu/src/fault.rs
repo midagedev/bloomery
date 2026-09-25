@@ -58,6 +58,9 @@ pub enum FaultSite {
     AttnSel = 6,
     /// A grouped GEMM's route table met an expert id past its stack.
     ExpertId = 7,
+    /// An attention launch was handed a visible count past the rows of its
+    /// key source: the window ring's, or the compressed stream's.
+    AttnCount = 8,
     /// A token id that selects a table row — an embedding row, the DSpark
     /// Markov head's previous token — lies past the table's rows.
     TokenId = 9,
@@ -75,6 +78,7 @@ impl FaultSite {
         FaultSite::Router,
         FaultSite::AttnSel,
         FaultSite::ExpertId,
+        FaultSite::AttnCount,
         FaultSite::TokenId,
         FaultSite::KeyCount,
     ];
@@ -90,6 +94,7 @@ impl FaultSite {
             FaultSite::Router => "router",
             FaultSite::AttnSel => "attn_sel",
             FaultSite::ExpertId => "expert_id",
+            FaultSite::AttnCount => "attn_count",
             FaultSite::TokenId => "token_id",
             FaultSite::KeyCount => "key_count",
         }
@@ -108,6 +113,7 @@ impl FaultSite {
             }
             FaultSite::AttnSel => "a selected row past the compressed stream",
             FaultSite::ExpertId => "a routed expert id past the stack's expert count",
+            FaultSite::AttnCount => "a visible key count past the rows of its source",
             FaultSite::TokenId => "a token id past the table's rows",
             FaultSite::KeyCount => "a flash row's live key count of zero or past the cache",
         }

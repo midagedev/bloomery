@@ -62,6 +62,7 @@ generate_ds41   ds41_rows_to_tokens                     0          0
 generate_ds41   ds41_shexp_gate_up                      0          0
 generate_ds41   ds41_shexp_gate_up_q3k                  0          0
 generate_ds41   ds41_shexp_gate_up_q3k_mcol             0          0
+generate_ds41   ds41_tap_means                          0          0
 generate_ds41   embed_rows                              0          0
 generate_ds41   embed_rows_q4k                          0          0
 generate_ds41   expert_gate_up_swiglu_q3k               0          0

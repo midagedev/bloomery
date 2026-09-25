@@ -442,6 +442,7 @@ fn enqueue_attn(
             part_v: &mut b.part_v,
             part_ms: &mut b.part_ms,
             y: &mut b.y,
+            fault: cx.gpu.unlabelled_sink(),
         },
     )?;
     cx.k.rope

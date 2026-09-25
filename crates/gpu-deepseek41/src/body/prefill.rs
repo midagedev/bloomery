@@ -1,14 +1,22 @@
-//! The prompt batch: a prompt of `P` ids fed as batches of up to [`T_MAX`]
-//! consecutive positions ([`prefill`]), which leaves the model in the state
-//! `P` decode steps over the same ids leave it, bit for bit — every layer's
-//! window ring and shadow rows, compressed rows, compressor state, index
-//! keys, the feature tap's rows, the host tier, and the last position's
-//! logits.
+//! The prompt batch: a prompt of `P` ids fed as `⌈P / T_MAX⌉` batches of
+//! near-equal size ([`prefill`], [`batches`]), which leaves the model where
+//! `P` decode steps over the same ids leave it, bit for bit, in everything
+//! a later step reads: every layer's window ring, the compressed rows,
+//! compressor states and index keys, the host tier, the last position's
+//! logits, and the feature rows a reader keeps.
+//!
+//! Each layer runs only the positions a later reader needs — the CED
+//! triangle ([`super::ced`]): the layers up to the last one that owns a
+//! compressor or index keys run every position, and above it a layer runs
+//! its block over the call's last positions and its latent rows over those
+//! its window reaches. The shadow rows a layer skips are recorded as the
+//! call's hole, and [`Body::keep_point`] grants no cut that would restore
+//! one.
 //!
 //! A batch runs its layers in order, and each layer over the batch's chunks —
 //! runs of at most [`CHUNK`] positions, cut at multiples of [`CHUNK`] so a
 //! chunk's latent rows fill one staging buffer from the row of its first
-//! position on:
+//! position on — from the first chunk the layer needs:
 //!
 //! 1. before the first layer, once per batch: each chunk planned in order
 //!    (the host step plan, after the tokens before it), every token's rows
@@ -16,14 +24,17 @@
 //!    copied to the card in one transfer, the attention piece's gather of
 //!    each chunk's words into its own row, the embedding broadcast;
 //! 2. per layer: the engram step where the layer carries a site, chunk by
-//!    chunk; the attention sub-layer chunk by chunk in position order, each
-//!    chunk's latent rows staged and committed to the ring before the next
-//!    chunk attends ([`AttnChain::enqueue_layer_staged`]); the MoE sub-layer
-//!    in its batch phases ([`crate::chain::ffn::FfnBatch`]) — the route of
-//!    every chunk, the batch's handoffs to the host, the card's shadow work
+//!    chunk; the attention sub-layer chunk by chunk in position order — a
+//!    chunk of the block's staged and committed to the ring before the next
+//!    chunk attends ([`AttnChain::enqueue_layer_staged`]), a chunk before the
+//!    block's first its latent rows alone
+//!    ([`AttnChain::enqueue_layer_part`]); the MoE sub-layer over the block's
+//!    chunks in its batch phases ([`crate::chain::ffn::FfnBatch`]) — the
+//!    route of every chunk, the handoffs to the host, the card's shadow work
 //!    of every chunk while one union call serves the layer's host experts for
-//!    every token, the sums back and one join; the feature tap of every
-//!    token where the next layer is tapped;
+//!    every token of the block, the sums back and one join; where the next
+//!    layer is tapped and the call hands features over, the tap of the
+//!    tokens whose rows are kept, one launch;
 //! 3. after the last layer, only in the batch that holds the prompt's last
 //!    position: the head, for that position alone.
 //!
@@ -35,17 +46,17 @@
 //! [`prepare_prefill`], never per batch; the decode step's buffers and
 //! launches do not change.
 //!
-//! The loop is shaped per layer and chunk so that a later round can cut the
-//! positions a layer runs (the decoder layers whose global rows come from
-//! layer 20 need only the prompt's last positions); today every layer runs
-//! the whole batch.
+//! A call that fails is taken back ([`GpuModel::rollback`]) to where it
+//! found the model, unless a fault poisoned it: the fault is the model's
+//! until a reset.
 
 use std::ops::Range;
 
 use model::moe::UNION_MAX_COLS;
 
+use super::ced::Mode;
 use super::*;
-use crate::chain::attn::StageIo;
+use crate::chain::attn::{PartIo, StageIo};
 use crate::chain::ffn::{ChunkIo, FfnBatch, JoinIo};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
@@ -102,11 +113,28 @@ pub fn prepare_prefill(m: &mut Deepseek41Model) -> Result<(), GpuError> {
     body.batch_mut(gpu).map(|_| ())
 }
 
-/// Feed `ids` from the model's position on as batches of up to [`T_MAX`]
-/// positions and return the greedy token after the last of them; the model
-/// stands `ids.len()` positions on. See the module comment.
+/// Feed `ids` from the model's position on as [`batches`] and return the
+/// greedy token after the last of them; the model stands `ids.len()`
+/// positions on. See the module comment.
 pub fn prefill(m: &mut Deepseek41Model, ids: &[u32]) -> Result<u32, GpuError> {
     feed(m, ids, None, &mut |_, _| Ok(()))
+}
+
+/// The batches a call of `n` positions from `first` runs: `⌈n / T_MAX⌉` of
+/// them, the first `n mod k` one position longer than the rest. Each layer
+/// reads every host expert its batch's tokens route to once, so a short
+/// last batch would pay that read for few tokens.
+#[must_use]
+pub fn batches(first: usize, n: usize) -> Vec<Range<usize>> {
+    let k = n.div_ceil(T_MAX);
+    let mut out = Vec::with_capacity(k);
+    let mut p = first;
+    for j in 0..k {
+        let len = n / k + usize::from(j < n % k);
+        out.push(p..p + len);
+        p += len;
+    }
+    out
 }
 
 /// Which sub-layer a [`BatchSeam`] follows.
@@ -118,14 +146,16 @@ pub enum BatchSeamKind {
 }
 
 /// A point of a batch, shown to the observer of [`prefill_observed`] once
-/// the launches before it are enqueued: the streams every token of the batch
-/// holds after layer `layer`'s sub-layer `kind`, `4 · n_embd` a token from
-/// the batch's first position `first`, and the fold the next sub-layer reads
+/// the launches before it are enqueued: the streams the sub-layer `kind` of
+/// layer `layer` left for the tokens it ran, `tokens` of them from the
+/// batch's token `at`, position `first` — `4 · n_embd` a token, the batch's
+/// token `t` at `t · 4 · n_embd` — and the fold the next sub-layer reads
 /// where there is one.
 pub struct BatchSeam<'a> {
     pub kind: BatchSeamKind,
     pub layer: usize,
     pub first: u32,
+    pub at: usize,
     pub tokens: usize,
     pub streams: &'a DeviceBuffer<f32>,
     pub fold: Option<&'a DeviceBuffer<f32>>,
@@ -148,16 +178,26 @@ pub fn prefill_observed(
     feed(m, ids, None, observe)
 }
 
-/// Where [`prefill_with`] hands each batch's feature rows: the batch's first
-/// position, then one row of the tap's width per position, in order.
+/// Where [`prefill_with`] hands the feature rows: the first position they
+/// hold, then one row of the tap's width per position, in order.
 pub type FeatureSink<'a> = &'a mut dyn FnMut(u32, &[f32]) -> Result<(), GpuError>;
 
-/// [`prefill`], handing `features` each batch's feature rows once it has run.
-/// Refused with `features` and no tap.
+/// The feature rows a reader of a prompt call keeps: those of the call's
+/// last `window` positions (all of them in a shorter call) — a draft's
+/// `attention.sliding_window`, whose window-only layers hold no older row —
+/// handed to `sink` in position order, one call per batch that holds any.
+pub struct FeatureRows<'a> {
+    pub window: usize,
+    pub sink: FeatureSink<'a>,
+}
+
+/// [`prefill`], handing `features` the rows it keeps once each batch has
+/// run; the tapped layers run their blocks over those positions. Refused
+/// with `features` and no tap.
 pub fn prefill_with(
     m: &mut Deepseek41Model,
     ids: &[u32],
-    features: Option<FeatureSink<'_>>,
+    features: Option<FeatureRows<'_>>,
 ) -> Result<u32, GpuError> {
     feed(m, ids, features, &mut |_, _| Ok(()))
 }
@@ -165,7 +205,7 @@ pub fn prefill_with(
 fn feed(
     m: &mut Deepseek41Model,
     ids: &[u32],
-    mut features: Option<FeatureSink<'_>>,
+    features: Option<FeatureRows<'_>>,
     observe: &mut BatchObserver<'_>,
 ) -> Result<u32, GpuError> {
     if ids.is_empty() {
@@ -174,36 +214,88 @@ fn feed(
             detail: "a prompt of no ids".to_string(),
         });
     }
+    let first = m.pos() as usize;
+    let runs = batches(first, ids.len());
+    let starts: Vec<usize> = runs.iter().map(|r| r.start).collect();
+    let (window, mut sink) = match features {
+        Some(f) => (Some(f.window), Some(f.sink)),
+        None => (None, None),
+    };
+    {
+        let (_, _, body) = m.body_parts(WHAT)?;
+        body.begin_call(first, first + ids.len(), &starts, window)?;
+    }
     let mut token = None;
-    let mut done = 0;
-    while done < ids.len() {
-        let u = (ids.len() - done).min(T_MAX);
-        let last = done + u == ids.len();
-        let run = &ids[done..done + u];
-        let first = m.pos();
-        token = m.run_rows(u, WHAT, |gpu, w, body, head, pos| {
-            body.enqueue_batch(
-                gpu,
-                w,
-                head,
-                BatchRun {
-                    ids: run,
-                    pos,
-                    last,
-                },
-                observe,
-            )
-        })?;
-        if let Some(f) = features.as_mut() {
-            let (gpu, _, body) = m.body_parts(WHAT)?;
-            f(first, body.batch_features(gpu, u)?)?;
+    for r in runs {
+        let run = &ids[r.start - first..r.end - first];
+        let last = r.end == first + ids.len();
+        let ran = m
+            .run_rows(run.len(), WHAT, |gpu, w, body, head, pos| {
+                body.enqueue_batch(
+                    gpu,
+                    w,
+                    head,
+                    BatchRun {
+                        ids: run,
+                        pos,
+                        last,
+                    },
+                    observe,
+                )
+            })
+            .and_then(|t| {
+                if let Some(f) = sink.as_mut() {
+                    let (gpu, _, body) = m.body_parts(WHAT)?;
+                    if let Some((at, rows)) = body.batch_features(gpu, r.clone())? {
+                        f(at, rows)?;
+                    }
+                }
+                Ok(t)
+            });
+        match ran {
+            Ok(t) => token = t,
+            Err(e) => return Err(take_back(m, first, e)),
         }
-        done += u;
     }
     token.ok_or(GpuError::State {
         what: WHAT,
         missing: "the head of the batch that holds the prompt's last position",
     })
+}
+
+/// A call that failed with `e`: its positions taken back, so the model
+/// stands where the call found it at `first` — or, when the compressor
+/// state no longer holds `first`'s group, at the cut [`Body::keep_point`]
+/// grants below it, which the error then names. A fault poisons the model
+/// and is returned as it came: nothing runs on it until a reset.
+fn take_back(m: &mut Deepseek41Model, first: usize, e: GpuError) -> GpuError {
+    if matches!(e, GpuError::Fault { .. }) || m.poisoned().is_some() {
+        return e;
+    }
+    let kept = match m.body(WHAT) {
+        Ok(body) => body.keep_point(first),
+        Err(b) => return b,
+    };
+    let Ok(to) = u32::try_from(kept) else {
+        return e;
+    };
+    match m.rollback(to) {
+        Ok(()) if kept == first => e,
+        Ok(()) => GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a prompt call from position {first} failed ({e}); its positions are taken back \
+                 and the model stands at {kept}, the cut the caches grant"
+            ),
+        },
+        Err(r) => GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a prompt call from position {first} failed ({e}), and taking it back failed \
+                 too ({r})"
+            ),
+        },
+    }
 }
 
 /// The batch's buffers: see the module comment. Made once.
@@ -355,11 +447,60 @@ impl Body {
         self.batch.as_ref().map_or(0, |b| b.device_bytes())
     }
 
-    /// The last batch's feature rows, `u` of them, copied to the host in one
+    /// A prompt call of positions `first .. end`, fed as batches from
+    /// `starts`, whose reader keeps the features of its last `window`
+    /// positions when `window` is given: its needs ([`super::ced`]), kept for
+    /// the batches and [`Body::prefill_need`], and its hole. Refused with a
+    /// window and no tap, and on a card that does not run every layer.
+    fn begin_call(
+        &mut self,
+        first: usize,
+        end: usize,
+        starts: &[usize],
+        window: Option<usize>,
+    ) -> Result<(), GpuError> {
+        if self.layers.start != 0 || self.layers.end != self.hp.n_layer {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a card that runs every layer",
+            });
+        }
+        let after: Option<Vec<bool>> = match (window, self.tap.as_ref()) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(GpuError::State {
+                    what: WHAT,
+                    missing: "a feature tap (attach_features)",
+                });
+            }
+            (Some(_), Some(tap)) => Some(tap.after.iter().map(Option::is_some).collect()),
+        };
+        let taps = after.as_deref().zip(window);
+        let need = self.ced.need(first, end, starts, taps);
+        let hole = need.hole();
+        if !hole.is_empty() {
+            self.holes.push(hole);
+        }
+        self.need = Some(need);
+        Ok(())
+    }
+
+    /// The feature rows the batch of positions `run` kept — those of its
+    /// positions from the call's first kept one on, `None` when it holds
+    /// none — and the first position they hold, copied to the host in one
     /// transfer (a blocking read on the engine stream). Refused without a
-    /// tap, and for more rows than the batch ran.
-    fn batch_features(&mut self, gpu: &Gpu, u: usize) -> Result<&[f32], GpuError> {
+    /// tap.
+    fn batch_features(
+        &mut self,
+        gpu: &Gpu,
+        run: Range<usize>,
+    ) -> Result<Option<(u32, &[f32])>, GpuError> {
         let width = self.tap.as_ref().map_or(0, FeatureTap::width);
+        let from = self
+            .need
+            .as_ref()
+            .map_or(run.end, |n| n.features)
+            .max(run.start);
         let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
             what: WHAT,
             missing: "a batch that ran",
@@ -368,16 +509,24 @@ impl Body {
             what: WHAT,
             missing: "a feature tap (attach_features)",
         })?;
-        if u == 0 || u > T_MAX {
+        if run.is_empty() || run.len() > T_MAX {
             return Err(GpuError::Shape {
                 what: WHAT,
-                detail: format!("{u} feature rows of a batch of at most {T_MAX}"),
+                detail: format!("feature rows of a batch {run:?} of at most {T_MAX}"),
             });
         }
-        let rows = span(WHAT, dev, 0, u * width)?;
-        let host = &mut batch.taps_host[..u * width];
+        if from >= run.end {
+            return Ok(None);
+        }
+        let (at, u) = (from - run.start, run.len());
+        let rows = span(WHAT, dev, at * width, (u - at) * width)?;
+        let host = &mut batch.taps_host[at * width..u * width];
         rows.copy_to_host(gpu.stream(), host)?;
-        Ok(host)
+        let pos = u32::try_from(from).map_err(|_| GpuError::Shape {
+            what: WHAT,
+            detail: format!("position {from} passes u32"),
+        })?;
+        Ok(Some((pos, host)))
     }
 
     /// One batch: the prompt's ids `ids` at positions `pos ..`, the head only
@@ -419,6 +568,16 @@ impl Body {
                     self.history.len(),
                     self.positions()
                 ),
+            });
+        }
+        if self
+            .need
+            .as_ref()
+            .is_none_or(|n| b < n.first || b + u > n.end)
+        {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a call's needs that cover the batch (begin_call)",
             });
         }
         let _ = self.batch_mut(gpu)?;
@@ -497,7 +656,8 @@ impl Body {
     }
 
     /// The batch's launches (the module comment's steps 1 to 3 on the card),
-    /// the host tier served layer by layer while they are enqueued.
+    /// each layer over the chunks the call's needs give it, the host tier
+    /// served layer by layer while they are enqueued.
     fn enqueue_batch_chain(
         &mut self,
         gpu: &Gpu,
@@ -519,13 +679,17 @@ impl Body {
             tap,
             batch,
             hp,
+            need,
             ..
         } = self;
         let batch = batch.as_deref_mut().ok_or(GpuError::State {
             what: WHAT,
             missing: "the batch's buffers",
         })?;
-        let stream = gpu.stream();
+        let need = need.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the call's needs",
+        })?;
         let n = hp.n_embd;
         let words = batch.image.layout().words();
         let b = cuts.first().map_or(0, |r| r.start);
@@ -544,11 +708,23 @@ impl Body {
             let mut f = span_mut(WHAT, f0, at * n, m * n)?;
             glue.enqueue_batch_embed(gpu, &batch.glue, &p, m, &mut s, &mut f)?;
         }
+        // The batch's token where the chunk `k` on starts, `u` past the last.
+        let token = |k: usize| cuts.get(k).map_or(u, |r| r.start - b);
         let mut cur = Cursor::default();
         for (i, l) in layers.clone().enumerate() {
             let step = steps[i];
+            // The layer runs a suffix of the chunks: its latent part from
+            // `run`, its block from `full`.
+            let run = cuts
+                .iter()
+                .position(|r| need.mode(i, r.start) != Mode::None)
+                .unwrap_or(cuts.len());
+            let full = cuts
+                .iter()
+                .position(|r| need.mode(i, r.start) == Mode::Full)
+                .unwrap_or(cuts.len());
             if step.engram {
-                for (k, r) in cuts.iter().enumerate() {
+                for (k, r) in cuts.iter().enumerate().skip(run) {
                     let (at, m) = (r.start - b, r.len());
                     let p = span(WHAT, &batch.params, k * words, words)?;
                     let (hin, hout) = ping(&mut batch.hc, cur.s);
@@ -577,28 +753,46 @@ impl Body {
                     BatchSeam {
                         kind: BatchSeamKind::Engram,
                         layer: l,
-                        first: b as u32,
-                        tokens: u,
+                        first: (b + token(run)) as u32,
+                        at: token(run),
+                        tokens: u - token(run),
                         streams: &batch.hc[cur.s],
                         fold: Some(&batch.folds[cur.f]),
                         attn: None,
                     },
                 )?;
             }
-            for (k, r) in cuts.iter().enumerate() {
+            for (k, r) in cuts.iter().enumerate().skip(run) {
                 let (at, m) = (r.start - b, r.len());
-                let (sin, sout) = ping(&mut batch.hc, cur.s);
-                let (fin, fout) = ping(&mut batch.folds, cur.f);
-                let streams_in = span(WHAT, sin, at * s4, m * s4)?;
-                let mut streams_out = span_mut(WHAT, sout, at * s4, m * s4)?;
-                let fold_in = span(WHAT, fin, at * n, m * n)?;
-                let mut fold_out = span_mut(WHAT, fout, at * n, m * n)?;
                 let LayerIo {
                     ring,
                     shadow,
                     compressed,
                     selection,
                 } = layer_io(kv, shadows, &mut batch.lists[k], i, &step)?;
+                if k < full {
+                    let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
+                    batch.attn.enqueue_layer_part(
+                        gpu,
+                        w,
+                        l,
+                        k,
+                        m,
+                        PartIo {
+                            fold_in: &fold_in,
+                            ring,
+                            shadow,
+                            compressed,
+                        },
+                    )?;
+                    continue;
+                }
+                let (sin, sout) = ping(&mut batch.hc, cur.s);
+                let (fin, fout) = ping(&mut batch.folds, cur.f);
+                let streams_in = span(WHAT, sin, at * s4, m * s4)?;
+                let mut streams_out = span_mut(WHAT, sout, at * s4, m * s4)?;
+                let fold_in = span(WHAT, fin, at * n, m * n)?;
+                let mut fold_out = span_mut(WHAT, fout, at * n, m * n)?;
                 batch.attn.enqueue_layer_staged(
                     gpu,
                     w,
@@ -623,53 +817,56 @@ impl Body {
             }
             cur.s ^= 1;
             cur.f ^= 1;
+            let at = token(full);
             observe(
                 gpu,
                 BatchSeam {
                     kind: BatchSeamKind::Attn,
                     layer: l,
-                    first: b as u32,
-                    tokens: u,
+                    first: (b + at) as u32,
+                    at,
+                    tokens: u - at,
                     streams: &batch.hc[cur.s],
                     fold: Some(&batch.folds[cur.f]),
                     attn: Some(batch.attn.taps()),
                 },
             )?;
-            for r in cuts {
-                let (at, m) = (r.start - b, r.len());
-                let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
-                let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
-                let io = ChunkIo {
-                    at,
-                    m,
-                    streams: &streams,
-                    fold_in: &fold_in,
-                };
-                ffn.enqueue_batch_route(gpu, w, &mut batch.ffn, l, &io, slots)?;
-            }
-            batch.ffn.enqueue_download(gpu, u)?;
-            let card = CardStacks::of(w, l)?;
-            for r in cuts {
-                let (at, m) = (r.start - b, r.len());
-                let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
-                let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
-                let io = ChunkIo {
-                    at,
-                    m,
-                    streams: &streams,
-                    fold_in: &fold_in,
-                };
-                ffn.enqueue_batch_shadow(gpu, w, card, &mut batch.ffn, l, &io)?;
-            }
-            batch.ffn.serve(hybrid, l, u)?;
-            batch.ffn.enqueue_upload(gpu, u)?;
-            {
+            if full < cuts.len() {
+                for r in &cuts[full..] {
+                    let (at, m) = (r.start - b, r.len());
+                    let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
+                    let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
+                    let io = ChunkIo {
+                        at,
+                        m,
+                        streams: &streams,
+                        fold_in: &fold_in,
+                    };
+                    ffn.enqueue_batch_route(gpu, w, &mut batch.ffn, l, &io, slots)?;
+                }
+                batch.ffn.enqueue_download(gpu, at, u)?;
+                let card = CardStacks::of(w, l)?;
+                for r in &cuts[full..] {
+                    let (at, m) = (r.start - b, r.len());
+                    let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
+                    let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
+                    let io = ChunkIo {
+                        at,
+                        m,
+                        streams: &streams,
+                        fold_in: &fold_in,
+                    };
+                    ffn.enqueue_batch_shadow(gpu, w, card, &mut batch.ffn, l, &io)?;
+                }
+                batch.ffn.serve(hybrid, l, at, u)?;
+                batch.ffn.enqueue_upload(gpu, at, u)?;
                 let (sin, sout) = ping(&mut batch.hc, cur.s);
                 let (_, fout) = ping(&mut batch.folds, cur.f);
                 ffn.enqueue_batch_join(
                     gpu,
                     &batch.ffn,
                     l,
+                    at,
                     u,
                     JoinIo {
                         streams: sin,
@@ -687,22 +884,27 @@ impl Body {
                 BatchSeam {
                     kind: BatchSeamKind::Ffn,
                     layer: l,
-                    first: b as u32,
-                    tokens: u,
+                    first: (b + at) as u32,
+                    at,
+                    tokens: u - at,
                     streams: &batch.hc[cur.s],
                     fold: step.folds.then_some(&batch.folds[cur.f]),
                     attn: None,
                 },
             )?;
-            if let (Some(tap), Some(dev)) = (tap.as_ref(), batch.taps.as_mut())
+            // The tap of the kept rows: every one of them is in the block.
+            let kept = need.features.max(b) - b;
+            if kept < u
+                && let (Some(tap), Some(dev)) = (tap.as_ref(), batch.taps.as_mut())
                 && let Some(slot) = tap.after.get(i).copied().flatten()
             {
                 let width = tap.width();
-                for t in 0..u {
-                    let s = span(WHAT, &batch.hc[cur.s], t * s4, s4)?;
-                    tap.hc
-                        .enqueue_mean(stream, &s, n, t * width + slot * n, dev)?;
-                }
+                let m = u - kept;
+                let s = span(WHAT, &batch.hc[cur.s], kept * s4, m * s4)?;
+                let mut rows = span_mut(WHAT, dev, kept * width, m * width)?;
+                batch
+                    .ffn
+                    .enqueue_tap_means(gpu, &s, m, width, slot * n, &mut rows)?;
             }
         }
         if last {

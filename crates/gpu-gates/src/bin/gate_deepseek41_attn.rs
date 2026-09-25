@@ -1376,7 +1376,6 @@ mod gate {
                 selected: self.sel.as_ref().map(|(rows, stride)| SelectedRows {
                     rows,
                     stride: *stride,
-                    fault: self.fault,
                 }),
                 vis: &self.vis,
                 sinks: &self.sinks,
@@ -1386,6 +1385,7 @@ mod gate {
                 part_v: &mut self.part_v,
                 part_ms: &mut self.part_ms,
                 y: &mut self.y,
+                fault: self.fault,
             }
         }
 

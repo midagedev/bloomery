@@ -323,7 +323,10 @@ first suspect is a hung gate on the box, not the agent.
   2026-09-25 (`43cd107`) V4.1 runs a prompt in batches of up to 512 positions, bit for bit the
   decode steps' state: pp512 91.2 and pp4096 89.2 tok/s on the A6000 plan (a), 2.97x the step
   feed; the host union is two thirds of the wall (rig-log 09-25#ds41batch-pp; that lease's
-  reference rows were void, re-sat at the next wave boundary).
+  reference rows were void, re-sat at the next wave boundary). Since 2026-09-25 (round `ds41ced`) the
+  prompt call runs each layer only at the positions a later reader needs — the CED triangle,
+  `body/ced.rs`; `BLOOMERY_CED=off` is its same-binary arm — predicted +2…+7 % at P = 512 and
+  +35…+54 % at P = 4096 over the `off` arm [derived], measured at the wave boundary.
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
@@ -519,6 +522,13 @@ m-column pass write the same bits; the default is unsplit and bit-identical to t
 and 2 is the same-binary A/B arm — the split's fold order moves the greedy trajectory, so it is
 not a default until a lease A/B resolves its predicted −60…−150 µs per step; an unusable value
 panics by name),
+`BLOOMERY_CED=on|off` (gpu-deepseek41 `Body`, read once at open, default on: a prompt call runs
+each layer only at the positions a later reader needs — the CED triangle, `body/ced.rs`; `off`
+runs every layer at every position, the same-binary A/B arm; the `load` line prints `ced=on` or
+`ced=off (<reason>)`, the reason being the lever or the file breaking a fact the walk rests on, and
+`generate_ds41` prints a `stat prefill ced=` line with each layer's block and latent starts; after
+a triangle call `Body::keep_point` grants only the call's boundaries and its last positions and
+`Body::rollback` to any other point is a named error; any other value is refused by name),
 `BLOOMERY_HOT_LIST=<path>` (placement: a hot list file from `tools/ref/router-hotlist.py`;
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
