@@ -360,8 +360,9 @@ first suspect is a hung gate on the box, not the agent.
   one places launch per layer-batch, each card expert read once per layer-batch) pp512 **121.4** and pp4096
   **169.4** (the pre-landing binary 111.3 / 155.8 in the same lease, +9.1 % / +8.7 %; the `slot` arm does not
   separate; rig-log 09-25#v41-prefill-s14); all of the gain is outside the host union, and what remains
-  outside it is the card route before the union, 30.4 ms per layer-batch (per-chunk attention and projection
-  launches).
+  outside it is the card route before the union, 30.4 ms per layer-batch (~~per-chunk attention and projection
+  launches~~ the per-chunk kernels themselves — every 8-token chunk re-reads the four projections at m = 8; the
+  launch gaps are 1.4–3.6 ms of it [derived, docs/research/cardroute-design-report.md]).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via

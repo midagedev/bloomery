@@ -51,4 +51,6 @@ GPU 단계에서 만나는 이슈·PR 후보를 발견 즉시 여기 적는다(�
 
 **§7 MIR importer가 `NonDivergingIntrinsic::Assume`을 버린다(2026-09-25, rustmodern).** `mir-importer/src/translator/statement.rs:860-861`. 그래서 `std::hint::assert_unchecked`가 디바이스 코드에서 무효다 — 범위 검사를 걷는 레버가 아니다. 우회는 R2(검사한 부분 슬라이스를 배열로 한 번 보기, 검사 1회 → trap). 이슈 후보는 낮은 우선순위(성능 힌트일 뿐, 정확성 영향 없음).
 
+**§8 런치마다 드라이버 속성 질의와 인자 `Vec` 할당(2026-09-26, cardroute-design → 리드가 레지스트리·체크아웃 소스로 대조).** cuda-core 0.3.1 `src/simt/launch.rs:899-911`의 `__prepare`가 런치마다 `context.launch_limits()`(장치 속성 여럿, `src/simt/context.rs:555`)와 함수 속성 셋(`src/simt/module.rs:468-486`)을 묻는다 — 장치·함수마다 한 번이면 되는 값이다. cuda-macros(핀 `b9847e95`) `crates/cuda-macros/src/cuda_module/launchers.rs:269`가 런치마다 `Vec<*mut c_void>`를 새로 만든다(고정 배열 후보). V4.1 프롬프트 배치의 호스트 발행 ≈ 3.2 µs/항목[유도] 중 이 둘의 몫은 따로 재지 않았고, 카드 route가 실행 바운드라 벽시계에는 지금 작다. 우회 없음. 이슈 후보(S): 속성 캐시, 인자 배열.
+
 발견 규칙: 우회로를 쓰기로 했더라도 여기 먼저 한 줄 적고 우회한다. 우회가 증거를 지운다.
