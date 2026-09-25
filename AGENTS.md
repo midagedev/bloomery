@@ -92,6 +92,15 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # selects every GPU gate: the graph's true answer. A gate left out
                       # of a batch is then a printed record, not a judgment
     just gate         # check-recipes + fmt-check + lint + both builds + gate-1-1
+    just smoke        # the smoke tier: the static checks, gate-gpu-ds41-step, gate-gpu-ds41-prefill at
+                      # P = 512 alone, gate-gpu-e2e, in two lanes through tools/gate-batch.sh — a subset
+                      # run for a round's loop and the lead's first look, never a landing batch.
+                      # tools/gate-batch.sh is also the landing-batch runner: `--list FILE` takes `just
+                      # affected` output; lane A = the 3090 (gpu-gate.sh without `any`, and device code
+                      # run with no gate lock), lane B = the `any` recipes forced to the A6000 plus every
+                      # recipe with no device code, X = BLOOMERY_CARD=both after both lanes; rc 75 retries;
+                      # one log per item and a run.log ending in `DONE total= red= wall=`; refuses to
+                      # start while the timing lease is held and refuses a recipe that names a timing runner
     just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
                       # ops attn ffn moe head forward kv derived mt profile
                       # alloc threads qdot engram prompts placement 1-1

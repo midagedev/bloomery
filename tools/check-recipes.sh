@@ -42,4 +42,5 @@ fi
 # this check runs.
 python3 "$(dirname "$0")/recipes.py" check
 python3 "$(dirname "$0")/recipes.py" --self-test
+"$(dirname "$0")/gate-batch.sh" --smoke --dry-run > /dev/null
 echo "check-recipes: ok"

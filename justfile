@@ -686,6 +686,13 @@ gate-1-1:
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
 gate: check-recipes check-rustflags check-arch check-comments fmt-check lint build-gpu build-cpu gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler
 
+# The smoke tier (docs/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
+# P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
+# through tools/gate-batch.sh (its header: the list, lanes, logs, DONE line); ARGS go to it (--dry-run, --out DIR,
+# --lanes 1). It refuses to start while the timing lease is held.
+smoke *ARGS:
+    ./tools/gate-batch.sh --smoke {{ARGS}}
+
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.
 inventory-v41:
