@@ -25,6 +25,9 @@
 | B8 | 라우터 bf16 상주(`f32_gemv` bf16 변형, `bits << 16` 정확): 폭 32 뒤 남은 레버, 또는 벡터 적재 + 셔플로 ptxas 창 넘기 | `router.rs`, `q8f32.rs` | 라우터 게이트 비트 동일 | `dd5422b` 뒤 | S–L |
 | B1c | 카드별 장치 아레나: 텐서마다 2 MiB 반올림이 카드당 264–285 MB(expert 16–17개분); 작은 할당 적재 순서 탓 +25–52 MB; KV·scratch도 같은 `Heap`에 | `tensor.rs`, `weights.rs` | 적재 게이트 반올림 항 재핀, 전 게이트 비트 동일 | — | M |
 | A2-2 | 여러 스테이지 분할(두 카드) — 3090을 expert 전용 층으로 쓰는 (b′)면 절단 없이도 3090을 쓴다(N4 설계 카드와 같은 라운드) | `gpu/model.rs` | 2스테이지 = 1스테이지 비트 동일 | 사용자 결정 | M |
+| **prefillbench** | 프리필 측정 하니스: `generate_ds41`·`generate_qwen3moe`에 `time prompt n=P ms= tok/s=` 행(DSpark 공급 경로 포함), `depth-ds41.sh`·`depth-qwen3moe.sh`에 우리 pp 팔과 ik·llama.cpp `pp:<P>` 팔(`llama-bench -p P -n 0`, 프로파일 최적 플래그), 드라이런 검증, 타이밍 없음 | `tools/ref`, 두 generate bin | 드라이런 + 기능 1회 | — | S |
+| **ds41prefill** (설계, 코드 없음) | V4.1 배치 프리필의 비용 모델과 설계: 카드 m행 GEMM(A5), 호스트 티어가 m토큰의 expert 합집합을 한 번 읽어 계산하는 배치 MoE(계산 바운드로 바뀌는 지점, 32코어 AVX2) 대 ubatch마다 expert를 카드로 옮기는 ik·llama.cpp식(PCIe 4.0 ×16), 압축기·KV의 토큰 순서 채움과 m행 attention; ik·llama.cpp·exllamav3·mistral.rs의 MoE 오프로드 프리필 독해; 설계마다 pp512·pp4096 예측과 구현 라운드 순서 | 문서 | 예측표 | — | M |
+| **qwen3prefill** | Qwen3 전 카드 프리필: 8위치 eager 패스(`prefill.rs:175`) → m행 GEMM(A5 커널 공유) + 그래프, pp 예측은 ds41prefill 표와 같은 모델로 | `arch/qwen3moe`, `gpu/gemm.rs` | e2e 프리필 비트/밴드 + pp tok/s | A5 | L |
 | A5 | 프리필 m>1: IMMA GEMM 커널(m 16–512) + 활성값 다리; T > 1 프리필의 링 행 수 W + T − 1, 토큰 우선 출력, `wo_a`·`wo_b` 80 MB를 T번 읽는 문제 | 새 `gpu/gemm.rs` | 커널 밴드 + 프리필 tok/s | — | L |
 | C3 | 동시 시퀀스 스케줄러 + 호스트/GPU 2단 파이프라인 | `serve`, `model` | 동시 2·4 스트림 합계 tok/s | dsloop | L |
 | C5 | systemd 유닛·임대 협약 | `configs/`, rig-log | 같은 러너 tok/s | C3 | S |
@@ -39,7 +42,8 @@
 2. **DS** 우리 DSpark tok/s — ~~먼저 리드 픽스업 둘~~ 닫음 `204ce45`·`161b682`(드라이런: dspark 팔이 `CUDA_VISIBLE_DEVICES=<A6000>,<3090>`과 tl37 경로를 받는다)(`tools/ref/timing-card.sh:23`이 `CUDA_VISIBLE_DEVICES=$TIMING_GPU`만 내보내 dspark 팔에서 3090이 안 보인다 → dspark 팔에만 두 카드; `depth-ds41.sh`가 `BLOOMERY_DSPARK_MODEL`을 안 넘긴다), 기능 실행 1회로 드래프트 카드 확인 뒤: A6000 계획 (a) + 3090 드래프트, 뜨거운 목록, prose·code 512, n 96, `plain` 대 `@BLOOMERY_DRAFT=dspark`, 3바퀴. 예측 44.9–52.1 tok/s(수락 0.70) = 42.9의 1.05–1.21배[유도, dsloop 예측 파일]; 패스 비용·D·두 D2H를 `time pass` 행으로.
 3. **Q3F** qwen3fuse A/B(착륙 뒤): `just depth-gpu-qwen3moe 6 bin:/root/repo/bloomery-qwen3fuse-base/target/release/generate_qwen3moe:6`, 예측 −0.21…−0.38 ms/스텝, 208.7 → 223 tok/s[유도].
 4. **B** 파동 귀속: base 바이너리 셋(`bloomery-ds41hcfin-base` 55ceca0 · `-ds41dense-base` d467767 · `-ds41join-base` 5712f25)의 `bin:` 팔 + A/A, 깊이 6 — hcfin −60…−67 µs[유도]·dense ~−0.16 + −0.34 ms[유도]·join(upload·계측 비용)을 한 자리에서.
-5. **C** 깊이 1024·4096 merge(hcfin은 세그먼트 수 비례) + m=5 프리필 행(`ds41_attn_merge` blk/SM 3 → 1의 파동 증가).
+5. **P** 프리필 기준선(사용자 09-25, 하니스 라운드 `prefillbench` 뒤): A6000 한 임대, V4.1 계획 (a) + 뜨거운 목록과 Qwen3 전 카드, 우리 `time prompt` 행 대 ik·llama.cpp `llama-bench -p P -n 0`(각자 최적 플래그), P = 512·4096, 2바퀴. 우리 V4.1은 ≈ 디코드 속도[유도]라 차이가 클 것 — 숫자 자체가 파동 24의 프리필 구현 순서를 정한다.
+6. **C** 깊이 1024·4096 merge(hcfin은 세그먼트 수 비례) + m=5 프리필 행(`ds41_attn_merge` blk/SM 3 → 1의 파동 증가).
 4. **D** `just measure-qdot-rate`(v4host 예측: IQ3_XXS 4.0–5.2 GB/s — 4.6 아래면 V4 호스트 레그는 ALU 바운드라 40–54 tok/s 항 재판정; MXFP4 12.8–14.6; ours/ik 0.95–1.05; Q3_K 앵커 10.8) + `just ab-decode <d467767 base>`(F16C + `fuses`, 예상 ≤ 잡음).
 5. dskq A/B(`q4k_gemv` 48 → 40 regs, base `bloomery-dskq-base` 45ed364, V4.1에선 ≈ 0 예상).
 6. qwen3deep 4096 A/B(base `bloomery-qwen3deep-base` 13dd74d — 09-24 빌드; `just depth-gpu-qwen3moe 6 4096 bin:/root/repo/bloomery-qwen3deep-base/target/release/generate_qwen3moe:6 bin:…:4096`) — 예측 176–181 대 base 160.74; 같은 임대에서 K1의 깊이 6 팔(`bloomery-qwen3route-base` 43d5ba9 `f7a00a8483f7`이 base)도: 208–209 대 base[유도].

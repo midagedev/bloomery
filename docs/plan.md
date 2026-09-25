@@ -9,7 +9,7 @@
 - **파일은 공개 `DeepSeek-V4.1-Flash-Q3_K_M` 하나다**(사용자 09-24 14:30 결정, `d771085`로 기본값). 혼합 파일 `attnQ8`은 시팅 10(참조 재생성) 뒤 지운다.
 - **헤드라인(측정, A6000, plan (a) 카드 expert 2,668, 뜨거운 목록, prose/code 512 프롬프트 뒤 n 96)**: 우리 **42.9 / 42.4 tok/s**, ik plain 20.0(같은 임대, 혼합 파일 플래그 — 공개 파일 최적 플래그는 N5 미탐색), 예산 38G 40.3, 24G(3090 흉내) 35.8(rig-log 09-24#public-q3km-prose-code-and-budget). lcg 깊이 6·목록 없음은 29.7(09-25#launch-thread-lever-ab), llama.cpp PR 브랜치 21.5. Qwen3-30B-A3B 전 카드: mainline llama.cpp 대비 깊이 6 +6 %, 4096 −7 %(09-24#qwen3-30b-a3b-e28).
 - **DSpark를 붙이면 [유도]** 48 GB급 ~45–50 tok/s = ik + DSpark의 1.4–1.5배; 3090 한 장은 +7 %(8.5 GB 드래프트가 expert 자리를 먹는다 — E27 레버 셋).
-- **공개를 막는 것**: ① E21 3090 실측(공개 파일, 승인됨 — 시팅 큐 1) ② 우리 DSpark tok/s(`dsloop` `c00274c` 착륙 — 무손실 루프 동작, 측정은 시팅 DS) ③ 사용자 결정(공개 시점 — LICENSE는 MIT로 결정, 09-25).
+- **공개를 막는 것**: ① E21 3090 실측(공개 파일, 승인됨 — 시팅 큐 1) ② 우리 DSpark tok/s(`dsloop` `c00274c` 착륙 — 무손실 루프 동작, 측정은 시팅 DS) ③ 사용자 결정(공개 시점 — LICENSE는 MIT로 결정, 09-25) ④ **프리필 숫자**(사용자 09-25: 디코드만큼 중요, V4.1·Qwen3 둘 다) — V4.1은 배치 프리필이 없어 토큰마다 디코드 스텝(≈ 43 tok/s, 512토큰 ≈ 12 s[유도]), Qwen3는 eager 8위치 패스; 우리·ik·llama.cpp 어느 쪽도 pp를 잰 적이 없다.
 - **비행 중(파동 21)**: `dspark-q3k` ‖ `ds41hcbranch` ‖ `unionhost` → `ds41splitk` ‖ `qwen3route` ‖ `fixup3`. 09-24 밤 ~ 09-25 새벽 착륙: `ds41router` `dd5422b` · `ds41join` `075ceef` · `ds41hcfin` `ecaacdd` · `ds41dense` `4953fdb` · `pubflip` `d771085` · `loudnan` `5fe50f6`(카드의 조용한 NaN → 폴트 워드) · `tokfix` `3ef2c8a` · `v4host` `55b5249` · `qwen3deep` `5712f25` · `gate-ds41-load` 닫음 `8dd878f`. 리드 재실행 lint **167**(main `43d5ba9`).
 - **ik PR**: 열린 것 [#2520](https://github.com/ikawrakow/ik_llama.cpp/pull/2520)(tolower), [#2528](https://github.com/ikawrakow/ik_llama.cpp/pull/2528)(`~`); 드래프트 [#2522](https://github.com/ikawrakow/ik_llama.cpp/pull/2522)·[#2507](https://github.com/ikawrakow/ik_llama.cpp/pull/2507). 한 레포에 비드래프트 1–2개까지.
 
@@ -17,7 +17,7 @@
 
 | M | 된 것 | 다음 | 막는 것 |
 |---|---|---|---|
-| **M1 숫자 공개** | A6000 헤드라인(위), 카드 크기 곡선 24/38/41 GB, 카드 쪽 분해(E26), Qwen3 E28 | **E21** 3090 실측 + N5 ik 플래그 + ik + DSpark 같은 창, 온도 > 0 수락률(E29); rig-log 글(영어 요약 + 한국어) + 30초 영상(승인 뒤); 공개 전 스크럽; "우리가 아는 한 유일한 Rust 엔진" 주장은 글 쓰는 날 재확인 | 빌더 틈의 임대 자리 |
+| **M1 숫자 공개** | A6000 헤드라인(위 — 디코드 축만; **pp512·pp4096 축이 비어 있다**), 카드 크기 곡선 24/38/41 GB, 카드 쪽 분해(E26), Qwen3 E28 | **E21** 3090 실측 + N5 ik 플래그 + ik + DSpark 같은 창, 온도 > 0 수락률(E29); rig-log 글(영어 요약 + 한국어) + 30초 영상(승인 뒤); 공개 전 스크럽; "우리가 아는 한 유일한 Rust 엔진" 주장은 글 쓰는 날 재확인 | 빌더 틈의 임대 자리 |
 | **M2 돌려 볼 수 있게** | `bloomery-serve-ds41`·`bloomery-chat`·README·BUILD.md·THIRD_PARTY_NOTICES·로고·토크나이저 게이트 | BUILD.md에 prefix 재사용 두 문장, 30분 soak | 공개 시점(사용자; LICENSE는 MIT로 결정) |
 | **DFlash(DSpark)** | 커널 `dshc`·`dsmx`, 적재·KV `4b963af`, 블록 패스 B `5dd34cb`, 폭별 그래프 C `11ce715`, 합집합 설계 | ~~`dspark-q3k`~~ `f1d1168` → ~~`dsloop`~~ `c00274c`(w = 1 수락 루프, 시팅 DS가 tok/s) → `uniongroup`(k > 1) | `ref-draft` 재덤프(시팅 10, 승인) |
 | **M3 서버** | prefix 재사용(`47e36b5`·`5fdfe11`), reasoning/DSML(`7f68981`), `/props` 엔진 객체(`631cedc`) | ~~슬롯 save/restore(`slots`)~~ `75d2bad`(엔진 스냅샷은 `slotsnap`), 템플릿 정리 라운드 | — |

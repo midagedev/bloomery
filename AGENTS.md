@@ -293,6 +293,13 @@ first suspect is a hung gate on the box, not the agent.
   rounds per arm, ±0.3 % about 63. Report the effect and its interval, not a
   win count — 4/4 is p = 0.06 by the sign test. Under 1 %, judge only between
   same-binary lever arms: two builds differ by link layout alone.
+- **Prefill is a headline metric beside decode** (user, 2026-09-25: "특히 프리필이 진짜 중요한데";
+  for V4.1 and Qwen3 alike). Every model's public numbers carry prompt
+  processing — `pp tok/s @ P = 512 and 4096, card` — next to decode tok/s, for
+  ours and the reference engines in one lease; a round that touches a path the
+  prompt runs through is judged on it. As of this date V4.1 feeds the prompt one
+  decode step per token (no batched prefill) and Qwen3 prefills eagerly in passes
+  of at most 8 positions, so neither number has been measured yet.
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
