@@ -207,6 +207,15 @@ prof-gpu-p8:
 bench-gpu-kernels *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --bench-kernels {{ARGS}}'
 
+# The grouped GEMM's counters (ncu, A6000, under the lease, lead-only): gate_p8 --bench-kernels --bench-arm ARM (default
+# gemm_q4k_moe_t4096: 128 experts of 768 x 2048 Q4_K, top-8, T = 4096) runs that one arm, and ncu takes 16 of its eager
+# gemm_q4k launches after the 64-launch warm-up burst; the form and its levers are in the header of tools/ref/ncu-gpu.sh.
+# Expected on main [derived, docs/research/q3next-design-report.md sections 3 and 6; not numbers of record]: L1TEX
+# 55-65 % and the top unit, about 1.29e8 LSU data-pipe wavefronts a launch, issue-active 35-40 %, tensor 22-26 %, DRAM
+# 10-15 %. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
+ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
+    ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
+
 # V4.1 한 토큰이 GPU에서 내는 gemv 사이트 21개의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다. attn_output_a는 값매김 팔
 # 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
 # 사이트마다 첫 사본과 끝 사본에서 여섯 행(heads 팔은 헤드마다 첫 행을 더한다)을 같은 바이트로 계산한 f64 참조와
@@ -951,6 +960,15 @@ depth-gpu-qwen3moe *ARMS:
 # header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-qwen3moe *DEPTHS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
+
+# Qwen3-30B-A3B prefill kernel table (nsys, A6000, under the lease, lead-only): generate_qwen3moe's timed prompt (the
+# depth runner's `<P>` arm) at each length P (default 4096, one ubatch at the default ubatch size), then
+# BLOOMERY_NSYS_N - 1 replays; the table is the prompt's window, its units and the head, per kernel, with the grouped
+# GEMM summed. The header of tools/ref/nsys-gpu.sh has the boundary. Expected at P = 4096 on main [derived,
+# docs/research/q3next-design-report.md; not numbers of record]: gemm_q4k + gemm_q6k about 62 % of the prompt,
+# qwen3moe_router_logits 0.36-0.54 ms a launch. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
+nsys-gpu-qwen3moe-prefill *PROMPTS:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'
 
 # V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록.
 nsys-gpu-ds41 *DEPTHS:
