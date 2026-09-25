@@ -18,7 +18,9 @@
 //! answer as one step per token, in graph mode each a replay of the pass of
 //! its size; `gemm` ubatches only); the argmax after its last token is
 //! generated token 0, and `N − 1` feedback steps follow.
-//! Lines: `prompt_ids`, `load` (with the flash pass: `flash_mma=`), in graph
+//! Lines: `prompt_ids`, `load` (with the decode flash pass: `flash_mma=`; and
+//! the ubatches' attention, `ubatch_attn=gqa_prefill_flash`, on the `load`
+//! line because the `time prompt` row's shape is parsed to its end), in graph
 //! mode `capture graph_nodes=` and `capture prefill_graphs=<n> nodes=<m=1>,…
 //! ms= vram_bytes=` (every pass size captured before the prompt: its wall
 //! and the card's free bytes it took, runtime values), `step 0 pos tok`
@@ -139,7 +141,8 @@ mod cli {
         let mut m = Qwen3moeModel::load_full(file, ctx)?;
         m.set_mode(mode);
         println!(
-            "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} in {:.1} s (runtime value)",
+            "load resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
+             ubatch_attn=gqa_prefill_flash in {:.1} s (runtime value)",
             m.resident_bytes(),
             m.stages()[0].layers().len(),
             if mode == StepMode::Graph {

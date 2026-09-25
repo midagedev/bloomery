@@ -95,6 +95,7 @@ generate_ds41   gemm_swiglu_quant                       0          0
 generate_ds41   gqa_flash_merge                         0          0
 generate_ds41   gqa_flash_seg                           0          0
 generate_ds41   gqa_flash_seg_mma                       0          0
+generate_ds41   gqa_prefill_flash                       0          0
 generate_ds41   half_decode                             0          0
 generate_ds41   head_norm_neox_append                   0          0
 generate_ds41   iq2_xs_rows                             0          0
@@ -190,6 +191,7 @@ gate_e2e        gemm_swiglu_quant                       0          0
 gate_e2e        gqa_flash_merge                         0          0
 gate_e2e        gqa_flash_seg                           0          0
 gate_e2e        gqa_flash_seg_mma                       0          0
+gate_e2e        gqa_prefill_flash                       0          0
 gate_e2e        half_decode                             0          0
 gate_e2e        head_norm_neox_append                   0          0
 gate_e2e        iq2_xs_rows                             0          0

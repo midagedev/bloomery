@@ -178,9 +178,14 @@ mod gate {
     /// is a ratio against a same-class perturbation measured in the same
     /// process, the teacher-forced arm's method: the flash arithmetics'
     /// distance starts later (the scores are first rounded in layer 0's
-    /// attention) and smaller per layer, so a correct GEMM path reads below
-    /// 1.9 on these prompts under either flash pass, highest on layers
-    /// 34-37; a wiring fault — a table built from another layer's or token's
+    /// attention) and smaller per layer. The GEMM path's attention is the
+    /// prefill flash in either arm (`flash_gqa_prefill`: the tensor-core
+    /// scores, f16 weights), so from layer 0's attention on its difference
+    /// also carries that arithmetic's against the arm's decode flash. A
+    /// correct GEMM path's K/V rows read below 1.9 on these prompts under
+    /// either flash pass, highest on layers 34-37, and its logits ratio below
+    /// 2.2 (highest in the scalar arm, where the prefill flash's f16
+    /// arithmetic stands against the scalar decode flash); a wiring fault — a table built from another layer's or token's
     /// ids, weights one slot off, positions off by one — reads an error of
     /// order one against a spread of 1e-3 to 2.5e-1, a K/V ratio above 3.7
     /// on every layer it reaches. The logits ratio alone does not separate

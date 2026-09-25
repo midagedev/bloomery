@@ -493,7 +493,6 @@ impl Body {
             names,
             kv,
             k,
-            mma,
             ub,
             ..
         } = self;
@@ -502,7 +501,6 @@ impl Body {
             w,
             names,
             k,
-            mma: *mma,
             eps: hp.rms_eps,
         };
         ub.enqueue(&c, kv, s, t, pos)

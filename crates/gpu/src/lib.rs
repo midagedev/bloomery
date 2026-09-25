@@ -36,6 +36,7 @@ pub mod elem;
 pub mod fault;
 pub mod flash;
 pub mod flash_gqa;
+pub mod flash_gqa_prefill;
 pub mod fused;
 pub mod gemm;
 pub(crate) mod graph;

@@ -61,6 +61,8 @@ pub enum FaultSite {
     /// A token id that selects a table row — an embedding row, the DSpark
     /// Markov head's previous token — lies past the table's rows.
     TokenId = 9,
+    /// A prefill flash row's live key count was zero or past the cache.
+    KeyCount = 10,
 }
 
 impl FaultSite {
@@ -74,6 +76,7 @@ impl FaultSite {
         FaultSite::AttnSel,
         FaultSite::ExpertId,
         FaultSite::TokenId,
+        FaultSite::KeyCount,
     ];
 
     /// The site's name as an error prints it.
@@ -88,6 +91,7 @@ impl FaultSite {
             FaultSite::AttnSel => "attn_sel",
             FaultSite::ExpertId => "expert_id",
             FaultSite::TokenId => "token_id",
+            FaultSite::KeyCount => "key_count",
         }
     }
 
@@ -105,6 +109,7 @@ impl FaultSite {
             FaultSite::AttnSel => "a selected row past the compressed stream",
             FaultSite::ExpertId => "a routed expert id past the stack's expert count",
             FaultSite::TokenId => "a token id past the table's rows",
+            FaultSite::KeyCount => "a flash row's live key count of zero or past the cache",
         }
     }
 }

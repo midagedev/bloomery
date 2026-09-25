@@ -6,7 +6,8 @@
 //! The glue between them is the chain's own kernels at `T` rows: the
 //! embedding rows, `rms_norm` then the q8_1 quantizer (the bytes
 //! `norm_quant` writes), the per-head norm with the rope and the cache
-//! append, the grouped-query flash with each row's own live key count, the
+//! append, the prefill flash (`flash_gqa_prefill`: each row over its own
+//! live key count, the cache's key tiles staged once per block), the
 //! residual add, the router in two launches, SwiGLU with the down's
 //! quantizer in one launch (`GemmKernels::enqueue_swiglu_quant`), and the
 //! combine of the down rows with the router weights and the residual.
@@ -15,11 +16,12 @@
 //! inputs alone, so a token's bits do not depend on the ubatch it lands in or
 //! the tokens beside it — the GEMM accumulates each (slot, row) on its own,
 //! the norm, quantizer, router and combine work per column, and the flash
-//! walks and merges a row's live segments in one order whatever the grid.
-//! Against the one-token path the dense and expert products sum in another
-//! order (128-value integer blocks into one f32 accumulator, where the gemv
-//! sums lane partials through a warp tree), so the two paths agree to the
-//! error of those sums and are not bit-equal.
+//! walks a row's keys in fixed 64-key tiles whatever the grid or the rows
+//! beside it. Against the one-token path the dense and expert products sum
+//! in another order (128-value integer blocks into one f32 accumulator, where
+//! the gemv sums lane partials through a warp tree) and the attention weighs
+//! the values with f16 weights on the tensor cores, so the two paths agree to
+//! the error of those sums and roundings and are not bit-equal.
 //!
 //! Buffers. The arena holds `min(UBATCH, ctx)` rows of every intermediate
 //! and the prompt image room for a prompt as long as the cache: token ids,
@@ -32,7 +34,8 @@ use super::body::{Kernels, Kq, LayerNames};
 use super::experts::CombineArgs;
 use super::router::{N_EXPERT, N_USED, RouterOut};
 use super::scratch::{Dims, KvPlanes, f32_view, param_view};
-use crate::flash_gqa::{GqaArgs, HEAD, segments_for};
+use crate::flash_gqa::HEAD;
+use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs};
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmInput, GemmRoute, GemmWeight};
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::rope_neox::NeoxArgs;
@@ -45,12 +48,6 @@ use std::mem::ManuallyDrop;
 
 /// Tokens one ubatch takes: the grouped GEMM's slot cap at top-8.
 pub const UBATCH: usize = GEMM_MAX_SLOTS / N_USED;
-
-/// Row-segment pairs one flash launch of a ubatch covers at most, the size
-/// its partials are cut for: a ubatch's rows are walked in chunks whose row
-/// count times the segments of their deepest row stays within it (or a
-/// single row, when one row's segments pass it).
-const FLASH_ROW_SEGS: usize = 2048;
 
 const WHAT: &str = "qwen3moe::ubatch";
 
@@ -79,10 +76,6 @@ pub(super) struct UbArena {
     q: DeviceBuffer<f32>,
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
-    part_v: DeviceBuffer<f32>,
-    part_ms: DeviceBuffer<f32>,
-    /// Row-segment pairs the partials hold.
-    row_segs: usize,
     /// The attention rows, `n_head · HEAD` per token.
     attn: DeviceBuffer<f32>,
     act_attn: GemmAct,
@@ -111,7 +104,6 @@ impl UbArena {
         let q_len = d.n_head * HEAD;
         let kv_len = d.n_kv * HEAD;
         let slots = rows * N_USED;
-        let row_segs = FLASH_ROW_SEGS.max(segments_for(d.ctx));
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(UbArena {
             x: f(rows * d.hidden)?,
@@ -120,9 +112,6 @@ impl UbArena {
             q: f(rows * q_len)?,
             k: f(rows * kv_len)?,
             v: f(rows * kv_len)?,
-            part_v: f(row_segs * d.n_head * HEAD)?,
-            part_ms: f(row_segs * d.n_head * 2)?,
-            row_segs,
             attn: f(rows * q_len)?,
             act_attn: GemmAct::new(stream, rows, q_len)?,
             attn_o: f(rows * d.hidden)?,
@@ -147,8 +136,6 @@ impl UbArena {
             &self.q,
             &self.k,
             &self.v,
-            &self.part_v,
-            &self.part_ms,
             &self.attn,
             &self.attn_o,
             &self.ffn_inp,
@@ -187,7 +174,7 @@ struct UbImage {
     pos0: u32,
 }
 
-/// One ubatch's (or one flash chunk's) windows onto the image.
+/// One ubatch's windows onto the image.
 struct UbIo {
     tokens: ManuallyDrop<DeviceBuffer<u32>>,
     pos: ManuallyDrop<DeviceBuffer<u32>>,
@@ -273,19 +260,23 @@ impl UbImage {
     }
 }
 
-/// The GEMM prefill's resident state: the arena and the prompt image.
+/// The GEMM prefill's resident state: the arena, the prompt image and the
+/// prefill flash.
 pub(super) struct Ubatch {
     a: UbArena,
     img: UbImage,
+    flash: FlashGqaPrefill,
 }
 
 impl Ubatch {
-    /// The arena for `min(UBATCH, ctx_max)` rows of `d` and an image for a
-    /// prompt of `ctx_max` tokens. Load-time only.
+    /// The arena for `min(UBATCH, ctx_max)` rows of `d`, an image for a
+    /// prompt of `ctx_max` tokens and the prefill flash's module. Load-time
+    /// only.
     pub(super) fn new(stream: &CudaStream, d: Dims, ctx_max: usize) -> Result<Ubatch, GpuError> {
         Ok(Ubatch {
             a: UbArena::new(stream, d, UBATCH.min(ctx_max))?,
             img: UbImage::new(stream, ctx_max)?,
+            flash: FlashGqaPrefill::load(stream.context())?,
         })
     }
 
@@ -346,7 +337,7 @@ impl Ubatch {
             .enqueue_route_dense(stream, t, &mut a.dense, gpu.unlabelled_sink())?;
         for (slot, (n, kv)) in c.names.iter().zip(kv.iter_mut()).enumerate() {
             let sink = gpu.layer_sink(slot)?;
-            attention(c, n, kv, a, &self.img, &io, s, t, pos as usize, sink)?;
+            attention(c, n, kv, a, &self.flash, &io, t, pos as usize, sink)?;
             ffn(c, n, a, t, sink)?;
         }
         Ok(())
@@ -375,60 +366,22 @@ pub(super) struct UbCtx<'a> {
     pub(super) w: &'a Weights,
     pub(super) names: &'a [LayerNames],
     pub(super) k: &'a Kernels,
-    pub(super) mma: bool,
     pub(super) eps: f32,
-}
-
-/// The flash's row chunks of a ubatch of `t` rows whose row `i` sees `p0 +
-/// i + 1` keys: `(c0, c1, max_keys)` in row order, the widest chunks whose
-/// row count times `segments_for(max_keys)` stays within `row_segs`. The
-/// arena's `row_segs` covers one row at the cache's height, so every chunk
-/// holds a row; one that did not fit would be refused by the flash's own
-/// partials check.
-struct FlashChunks {
-    p0: usize,
-    t: usize,
-    row_segs: usize,
-    c0: usize,
-}
-
-impl Iterator for FlashChunks {
-    type Item = (usize, usize, usize);
-
-    fn next(&mut self) -> Option<(usize, usize, usize)> {
-        if self.c0 >= self.t {
-            return None;
-        }
-        let fits = |c1: usize| (c1 - self.c0) * segments_for(self.p0 + c1) <= self.row_segs;
-        // The cost grows with c1, so the widest chunk is the last c1 that fits.
-        let (mut lo, mut hi) = (self.c0 + 1, self.t);
-        if fits(hi) {
-            lo = hi;
-        }
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if fits(mid) { lo = mid } else { hi = mid - 1 }
-        }
-        let c = (self.c0, lo, self.p0 + lo);
-        self.c0 = lo;
-        Some(c)
-    }
 }
 
 /// The attention half at `t` rows: `x` in, `ffn_inp = x + attn_output(attn(x))`
 /// out; the ubatch's K/V rows appended to the layer's planes.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the chain's context, the layer, its arena, image and windows, the ubatch's shape"
+    reason = "the chain's context, the layer, its arena, the flash, the windows, the ubatch's shape"
 )]
 fn attention(
     c: &UbCtx<'_>,
     n: &LayerNames,
     kv: &mut KvPlanes,
     a: &mut UbArena,
-    img: &UbImage,
+    flash: &FlashGqaPrefill,
     io: &UbIo,
-    s: usize,
     t: usize,
     p0: usize,
     sink: FaultSink,
@@ -436,6 +389,12 @@ fn attention(
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = a.dims;
+    if p0 + t > d.ctx {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("rows {p0}..{} past the {}-row cache", p0 + t, d.ctx),
+        ));
+    }
     let (q_len, kv_len) = (d.n_head * HEAD, d.n_kv * HEAD);
     gpu.elem().enqueue_rms_norm(
         stream,
@@ -482,43 +441,22 @@ fn attention(
             cache_v: &mut kv.v,
         },
     )?;
-    let chunks = FlashChunks {
-        p0,
-        t,
-        row_segs: a.row_segs,
-        c0: 0,
-    };
-    for (c0, c1, max_keys) in chunks {
-        let m = c1 - c0;
-        let rows = img.io(s + c0, m)?;
-        // SAFETY: rows c0 .. c1 <= t <= rows of the arena lie inside `q` and
-        // `attn` (rows · q_len each), which stay in place while the windows
-        // live (this launch's enqueue).
-        let (qw, mut yw) = unsafe {
-            (
-                f32_view(&a.q, c0 * q_len, m * q_len),
-                f32_view(&a.attn, c0 * q_len, m * q_len),
-            )
-        };
-        k.flash.enqueue_pass_upto(
-            stream,
-            GqaArgs {
-                q: &qw,
-                kc: &kv.k,
-                vc: &kv.v,
-                n_keys: &rows.n_keys,
-                scale: 1.0 / (HEAD as f32).sqrt(),
-                n_kv: d.n_kv,
-                ctx: d.ctx,
-                m,
-                part_v: &mut a.part_v,
-                part_ms: &mut a.part_ms,
-                y: &mut yw,
-            },
-            c.mma,
-            max_keys,
-        )?;
-    }
+    flash.enqueue(
+        stream,
+        GqaPrefillArgs {
+            q: &a.q,
+            kc: &kv.k,
+            vc: &kv.v,
+            n_keys: &io.n_keys,
+            scale: 1.0 / (HEAD as f32).sqrt(),
+            n_head: d.n_head,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            t,
+            fault: sink,
+            y: &mut a.attn,
+        },
+    )?;
     gpu.enqueue_quantize_gemm(&a.attn, t, &mut a.act_attn, sink)?;
     k.gemm.enqueue_gemm(
         stream,
