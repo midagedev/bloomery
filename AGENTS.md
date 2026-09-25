@@ -146,6 +146,18 @@ could not win on a kernel already at ~700 GB/s.
 | occupancy / geometry | occupancy computed from regs, smem, threads, SM count (ptxas `-v`) and written in the spec | the owning gate | once, to confirm |
 | float sum order or precision | the error model (σ against `exact-forced-32.tsv`, a diagnostic — see the next section) | `gate-gpu-e2e` count pin | once, to confirm |
 
+Two habits precede every round's code (user, 2026-09-25). First, decompose on
+paper: the terms come from the code (byte, instruction, launch and loop
+counts) and from numbers already measured; a box run is for the one term the
+derivation cannot fix, named with its expected value before it runs — tests
+are expensive, and what arithmetic settles is not resolved by experiment.
+Second, draw the resource timeline: per unit of work, how long the host CPU,
+the card SMs, PCIe, host DRAM and NVMe are each busy, and whether the wall is
+their sum or one resource's max; then ask whether the flow should change —
+asynchrony, bulk, SIMD, SIMT — before a term is shortened. A term under
+another resource's shadow is worth 0. The V4.1 prefill timeline and its
+ladder are the worked example (`docs/plan.md` 「흐름 모델」).
+
 Measurement comes first only for the named residue: hardware faults (Xid 79),
 compiler register allocation, cache effects with no mechanism yet. Anything
 fixed at build time (node count, launch count, per-kernel instructions and
