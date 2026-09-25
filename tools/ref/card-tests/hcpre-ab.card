@@ -1,0 +1,15 @@
+# Fixture: the HC_PRE A/B card at 5 rounds (the band +0.9..+1.3): passes at 5, refused at 3 and 4.
+kind: ab
+question: does moving the attention sub-layer's ds41_hc_pre onto a branch stream inside the
+  captured step shorten the V4.1 decode step?
+term: decode tok/s @ n=96, lcg depth 6, A6000, plan (a) — (branch − base) / base, paired by round
+unit: %
+predict: +0.9..+1.3
+rounds: 5
+condition: the base and branch generate_ds41 binaries alternate in one lease
+  (BLOOMERY_AB_ROUNDS=5 just depth-gpu-ds41 6 bin:<base tree>/target/release/generate_ds41:6),
+  the order rotated every round; no row carries [cpu-busy] or [other-busy]
+decide-in: land ds41hcbranch as it is
+decide-below: keep the change out of the default and find the wrong term (contention, the join's
+  cost) in an nsys timeline before another A/B
+decide-above: land it and re-derive the join and contention terms the model overstated

@@ -1,0 +1,10 @@
+# Fixture: a valid profile card.
+kind: profile
+question: where does the fixture step's time go?
+term: the flash kernel's share of the step, nsys, depth 4096, A6000
+unit: %
+predict: 35..45
+condition: the timeline covers steps 2 to 63 of one process under the lease; no other process on either card
+decide-in: aim the next round at the flash kernel
+decide-below: rank the other kernels before choosing a round
+decide-above: price the split-K lever first

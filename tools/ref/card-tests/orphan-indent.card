@@ -1,0 +1,4 @@
+# Fixture: an indented line with no key line right above it: a comment ends the value before it.
+kind: profile
+# the comment
+  this line continues nothing

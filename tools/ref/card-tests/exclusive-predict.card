@@ -1,0 +1,5 @@
+# Fixture: an exclusive card that carries a prediction, which it does not take.
+kind: exclusive
+reason: a conversion that reads the model file and writes a large sidecar; beside a timed run it would evict that run's page cache
+minutes: 5..15
+predict: 1..2

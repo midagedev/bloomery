@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""A stand-in for util-linux flock(1) where there is none (the Mac), for tools/ref/card-tests/run.sh.
+
+It takes the two forms lease.sh and the tests use, `flock [-n | -w SECS] FD` and
+`flock [-n | -w SECS] FILE COMMAND...`, and locks with flock(2) through fcntl.flock, as util-linux
+does: the lock belongs to the open file description, so one taken on an inherited FD outlives this
+process for as long as the caller keeps FD open. A lock it cannot get exits 1, as util-linux; any
+other form is refused with 64, never run as something else.
+"""
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+
+def refuse(why):
+    print(f'flock (test stand-in): {why}; forms: [-n | -w SECS] FD, [-n | -w SECS] FILE COMMAND...',
+          file=sys.stderr)
+    sys.exit(64)
+
+
+def main(argv):
+    nonblock, wait = False, None
+    while argv and argv[0].startswith('-'):
+        opt = argv.pop(0)
+        if opt == '-n':
+            nonblock = True
+        elif opt == '-w' and argv:
+            try:
+                wait = float(argv.pop(0))
+            except ValueError:
+                refuse('-w takes seconds')
+        else:
+            refuse(f'option {opt!r}')
+    if not argv:
+        refuse('no FD or FILE')
+    target, command = argv[0], argv[1:]
+    if target.isdigit() and not command:
+        fd = int(target)
+    elif not target.isdigit() and command:
+        fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o644)
+    else:
+        refuse('an FD takes no command, a FILE needs one')
+    if nonblock or wait is not None:
+        deadline = time.monotonic() + (0 if nonblock else wait)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return 1
+                time.sleep(0.05)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    return subprocess.call(command) if command else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

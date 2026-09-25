@@ -1,0 +1,6 @@
+# The card of lease-hold.sh's box self-test (`tools/ref/lease-hold.sh --card
+# docs/cards/selftest-lease-hold.card -- true`): it takes the real lease for about a second to show
+# the card, both witness blocks and the release.
+kind: exclusive
+reason: the lease-hold self-test: take the machine lease, print the card and both witnesses, release it
+minutes: 1

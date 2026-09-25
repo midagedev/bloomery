@@ -43,4 +43,12 @@ fi
 python3 "$(dirname "$0")/recipes.py" check
 python3 "$(dirname "$0")/recipes.py" --self-test
 "$(dirname "$0")/gate-batch.sh" --smoke --dry-run > /dev/null
+# The card and lease stub tests (tools/ref/card-tests/run.sh): card.py, lease_take's refusals,
+# lease-hold.sh and gpu-ab.py's card check, against a copy of that code and a lock file of their own.
+if ! cards=$("$(dirname "$0")/ref/card-tests/run.sh" 2>&1); then
+  echo "$cards" >&2
+  echo "check-recipes: the card tests failed" >&2
+  exit 1
+fi
+echo "${cards##*$'\n'}"
 echo "check-recipes: ok"

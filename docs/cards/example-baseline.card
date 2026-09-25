@@ -1,0 +1,17 @@
+# Example (kind baseline). Mainline llama.cpp's V4.1 prompt row for the public table. The band is
+# the morning's clean value, 104.6 tok/s at P = 512 (AGENTS.md, the prefill headline convention),
+# widened by 5 % [derived].
+kind: baseline
+question: what is mainline llama.cpp's V4.1 pp512 on the A6000 when its arm reads a warm file?
+term: pp tok/s @ P = 512, llama.cpp (llama-bench -p 512 -n 0 at the profile's LCPP_GPU_FLAGS),
+  A6000, the warm second repetition
+unit: tok/s
+predict: 99..110
+condition: the lcpppp:512 arm of just depth-gpu-ds41 in its own lease: one load, two repetitions,
+  the second counts; the witness around the arm (mem, pgmajfault) shows no other model load
+reason: sets the llama.cpp row of the public V4.1 prefill table; why now: the evening lease's
+  reference rows read the file cold after our arms and are void
+decide-in: write the row into the public table with its lease and witness
+decide-below: read the arm's cold repetition and the pgmajfault difference; re-sit if another
+  load overlapped it
+decide-above: re-derive our ratio against the new row before the table goes out

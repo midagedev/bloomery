@@ -183,6 +183,12 @@ paper: the terms come from the code (byte, instruction, launch and loop
 counts) and from numbers already measured; a box run is for the one term the
 derivation cannot fix, named with its expected value before it runs — tests
 are expensive, and what arithmetic settles is not resolved by experiment.
+`lease_take` enforces it (user, 2026-09-26): a run without a prediction card
+(`BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/<slug>.card'`; the format,
+the kinds and the exit codes are in `tools/ref/card.py`) gets no lease, an A/B
+whose predicted effect sits inside the ruler at its round count is refused
+before it starts, and a job that holds the lease without a runner goes through
+`tools/ref/lease-hold.sh` — a raw `flock` on the lease file is not a lease.
 Second, draw the resource timeline: per unit of work, how long the host CPU,
 the card SMs, PCIe, host DRAM and NVMe are each busy, and whether the wall is
 their sum or one resource's max; then ask whether the flow should change —
@@ -347,8 +353,12 @@ first suspect is a hung gate on the box, not the agent.
   only by a lever — put an A/A arm in whenever the claim is under 1 %.
 - **Know the ruler before reading it.** Same-binary runs scatter with SD
   0.6 % (18 runs, 2026-09-21), so the 95 % interval on a difference of two arm
-  means is ±1.0 % at four rounds and ±0.8 % at six; ±0.5 % takes about 23
-  rounds per arm, ±0.3 % about 63. Report the effect and its interval, not a
+  means is ±1.0 % at four rounds and ±0.8 % at six; ~~±0.5 % takes about 23
+  rounds per arm, ±0.3 % about 63~~ ±0.5 % takes 13 rounds per arm and ±0.3 %
+  takes 32 (corrected 2026-09-26: 23 and 63 used √(4/N); the difference of two
+  arm means has SD sd·√(2/N), and with t(0.975, 2N−2), the form that gives
+  ±1.0 % and ±0.8 %, the counts are 13 and 32 [derived]; `tools/ref/card.py`
+  computes it for a card). Report the effect and its interval, not a
   win count — 4/4 is p = 0.06 by the sign test. Under 1 %, judge only between
   same-binary lever arms: two builds differ by link layout alone.
 - **Prefill is a headline metric beside decode** (user, 2026-09-25: "특히 프리필이 진짜 중요한데";

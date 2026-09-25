@@ -1,0 +1,4 @@
+# Fixture: an exclusive card past 30 minutes: it passes, with the approval note.
+kind: exclusive
+reason: a conversion that reads the model file and writes a large sidecar; beside a timed run it would evict that run's page cache
+minutes: 45 min

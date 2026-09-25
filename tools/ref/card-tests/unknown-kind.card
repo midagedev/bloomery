@@ -1,0 +1,11 @@
+# Fixture: a kind the format does not have.
+kind: benchmark
+question: does the fixture lever shorten the decode step?
+term: decode tok/s @ n=96, depth 6, A6000 — (changed − base) / base, paired by round
+unit: %
+predict: +1.5..+2.5
+rounds: 4
+condition: both arms alternate in one lease, the order rotated every round; no row carries [cpu-busy] or [other-busy]
+decide-in: land the lever
+decide-below: keep it off and find the wrong term before another A/B
+decide-above: land it and re-derive the term the model overstated

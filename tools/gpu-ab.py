@@ -15,10 +15,17 @@ same-window numbers are compared, and only as each arm's difference from the fir
 run      one --arm per arm, the first is the reference. TREE is a path or a directory name beside this
          repository's own; its box directory is ~/repo/<tree name>. K=V pairs reach the timed binary
          through tools/box.sh's BLOOMERY_BOX_ENV (a lever read once at load needs its own process,
-         which every arm is); a tree whose box.sh predates BLOOMERY_BOX_ENV is refused for an env arm,
-         since it would drop the lever silently. Logs go to DIR/<recipe>-<arm>-r<round>.log, one row
-         per arm run to DIR/runs.tsv. A failed arm (a red check, a lease that timed out, rc 75) or a
-         card that stops answering ends the run there, no retry; the summary covers what finished.
+         which every arm is), after the caller's own BLOOMERY_BOX_ENV and before
+         BLOOMERY_AB_ROUNDS=<rounds>, which every arm gets; a tree whose box.sh predates
+         BLOOMERY_BOX_ENV is refused for an env arm, since it would drop the lever silently. The run's
+         card (BLOOMERY_LEASE_CARD, in the caller's BLOOMERY_BOX_ENV, relative to this tree) is checked
+         here at --rounds by tools/ref/card.py before any arm starts, with card.py's exit code on a
+         refusal: an arm whose tree predates the card check takes its lease unchecked, and the rotation
+         can start with it. Every arm tree that checks cards must hold the same card bytes at that path;
+         an arm may not set BLOOMERY_LEASE_CARD or BLOOMERY_AB_ROUNDS. Logs go to
+         DIR/<recipe>-<arm>-r<round>.log, one row per arm run to DIR/runs.tsv. A failed arm (a red
+         check, a lease that timed out, rc 75) or a card that stops answering ends the run there, no
+         retry; the summary covers what finished.
          --dry-run prints the arm order and the exact commands, and runs nothing.
 summary  per recipe it knows: each arm's rounds, mean, SD, and difference from the first arm with
          its 95 % interval (two-sample t, pooled SD, df = n1 + n2 - 2 — the ruler of AGENTS.md
@@ -186,6 +193,39 @@ def tree_path(t):
     return os.path.join(os.path.dirname(here), t)
 
 
+def lease_card(rounds, trees):
+    """0 when the run's card passes card.py's lease check at `rounds` and every card-checking arm tree
+    holds it; else card.py's exit code (2 for a BOX_ENV that names more than one card)."""
+    cards = [e.split('=', 1)[1] for e in os.environ.get('BLOOMERY_BOX_ENV', '').split()
+             if e.startswith('BLOOMERY_LEASE_CARD=')]
+    if len(cards) > 1:
+        print(f'gpu-ab: BLOOMERY_BOX_ENV names {len(cards)} cards: {" ".join(cards)}', file=sys.stderr)
+        return 2
+    card = cards[0] if cards else ''
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    print(f'gpu-ab: the card, checked here at {rounds} rounds before any arm:')
+    rc = subprocess.run([sys.executable, os.path.join(here, 'tools', 'ref', 'card.py'), 'lease', card,
+                         '--rounds', str(rounds)]).returncode
+    if rc != 0:
+        return rc
+    with open(os.path.join(here, card), 'rb') as f:
+        body = f.read()
+    for tree in trees:
+        if not os.path.isfile(os.path.join(tree, 'tools', 'ref', 'card.py')):
+            print(f'gpu-ab: {tree} predates the card check: its arms take the lease unchecked, on the check above')
+            continue
+        try:
+            with open(os.path.join(tree, card), 'rb') as f:
+                held = f.read()
+        except OSError:
+            held = None
+        if held != body:
+            print(f'gpu-ab: {tree} checks cards and {"has no" if held is None else "holds another"} {card}: '
+                  'copy this tree\'s card there before the run', file=sys.stderr)
+            return 66
+    return 0
+
+
 def healthy(host):
     probe = "nvidia-smi --query-gpu=index,name,pstate --format=csv,noheader 2>&1; echo n=$(nvidia-smi -L 2>/dev/null | grep -c GPU)"
     got = subprocess.run(['ssh', host, probe], capture_output=True, text=True).stdout
@@ -230,6 +270,19 @@ def run(args):
         if kvs and 'BLOOMERY_BOX_ENV' not in open(box).read():
             print(f'gpu-ab: arm {name}: {box} predates BLOOMERY_BOX_ENV and would drop {kvs} — refused', file=sys.stderr)
             return 2
+        owned = [kv for kv in kvs if kv.split('=', 1)[0] in ('BLOOMERY_LEASE_CARD', 'BLOOMERY_AB_ROUNDS')]
+        if owned:
+            print(f'gpu-ab: arm {name}: {" ".join(owned)} belongs to the run, not an arm — refused', file=sys.stderr)
+            return 2
+    caller = os.environ.get('BLOOMERY_BOX_ENV', '').split()
+    clash = [e for e in caller if e.startswith('BLOOMERY_AB_ROUNDS=') and e != f'BLOOMERY_AB_ROUNDS={rounds}']
+    if clash:
+        print(f'gpu-ab: BLOOMERY_BOX_ENV has {" ".join(clash)} and --rounds is {rounds} — refused', file=sys.stderr)
+        return 2
+    rc = lease_card(rounds, sorted({tree for _, tree, _ in arms}))
+    if rc != 0:
+        return rc
+    caller = [e for e in caller if not e.startswith('BLOOMERY_AB_ROUNDS=')]
     plan = []
     for recipe in recipes:
         for r in range(1, rounds + 1):
@@ -244,9 +297,7 @@ def run(args):
     cmds = []
     for recipe, r, slot, name, tree, kvs in plan:
         remote = f'~/repo/{os.path.basename(tree)}'
-        env = {'BLOOMERY_REMOTE': remote}
-        if kvs:
-            env['BLOOMERY_BOX_ENV'] = ' '.join(kvs)
+        env = {'BLOOMERY_REMOTE': remote, 'BLOOMERY_BOX_ENV': ' '.join(caller + kvs + [f'BLOOMERY_AB_ROUNDS={rounds}'])}
         log = f'{recipe}-{name}-r{r}.log'
         shown = ' '.join(f"{k}='{v}'" for k, v in env.items())
         print(f'  r{r}.{slot} {name}: (cd {tree} && {shown} just {recipe}) > {out}/{log}')

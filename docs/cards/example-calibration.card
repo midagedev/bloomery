@@ -1,0 +1,16 @@
+# Example (kind calibration). Re-measuring the per-node cost of a captured graph, c_node in
+# docs/plan.md 「모델」: 0.852 µs at 784 nodes and 0.871 µs at 504, empty touch graphs timed by
+# time-gpu-v41 on the A6000. The band is those two values widened by 5 % and rounded [derived].
+kind: calibration
+question: what does one node of a captured graph cost on the A6000 now?
+term: c_node, µs per node of time-gpu-v41's node-matched empty touch graph, A6000
+unit: µs
+predict: 0.81..0.91
+condition: just time-gpu-v41 in one lease on the A6000; the witness shows no other process on
+  either card
+reason: sets c_node in docs/plan.md 「모델」, which every launch-count prediction
+  (Δt = ΔN × c_node) multiplies; why now: a driver or toolkit update since the last
+  measurement moves the launch path
+decide-in: keep c_node and add this lease to its row
+decide-below: lower c_node and re-derive the launch-count predictions that used it
+decide-above: raise c_node and re-derive the launch-count predictions that used it

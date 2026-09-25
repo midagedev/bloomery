@@ -1,0 +1,8 @@
+# Example (kind exclusive). A job that takes the lease to have the box to itself and measures
+# nothing: the r8 sidecar conversion (tools/ref/r8-sidecar.sh; the h3tile-b design, the h3tile row
+# of docs/plan-triage.md).
+kind: exclusive
+reason: the conversion reads the routed gate and up experts of the public V4.1 file and writes
+  them repacked as a 155.7 GB sidecar on /models; beside a timed run it would evict that run's page
+  cache and share its NVMe, so it holds the lease; why now: the converter's first run
+minutes: 5..15

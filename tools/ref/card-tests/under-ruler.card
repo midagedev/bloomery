@@ -1,0 +1,11 @@
+# Fixture: the HC_PRE band at three rounds: h 1.360 % >= 0.9 %, resolved at 5.
+kind: ab
+question: does the fixture lever shorten the decode step?
+term: decode tok/s @ n=96, depth 6, A6000 — (changed − base) / base, paired by round
+unit: %
+predict: +0.9..+1.3
+rounds: 3
+condition: both arms alternate in one lease, the order rotated every round; no row carries [cpu-busy] or [other-busy]
+decide-in: land the lever
+decide-below: keep it off and find the wrong term before another A/B
+decide-above: land it and re-derive the term the model overstated

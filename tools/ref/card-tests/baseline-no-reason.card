@@ -1,0 +1,10 @@
+# Fixture: a baseline card with no reason.
+kind: baseline
+question: what is the reference engine's pp512 on the A6000?
+term: pp tok/s @ P = 512, the reference engine, A6000
+unit: tok/s
+predict: 99..110
+condition: its own lease; the witness shows no other model load
+decide-in: write the row into the table
+decide-below: read the witness before using it
+decide-above: re-derive our ratio against it

@@ -14,9 +14,10 @@ G=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
 ORIG=$(cat "$G")
 setgov() { for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo "$1" > "$f"; done; }
 trap 'setgov "$ORIG"; echo "governor restored: $(cat $G)"' EXIT
+ROUNDS=3
 lease_take
 echo "orig governor=$ORIG load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2)"
-for r in 1 2 3; do for gov in "$ORIG" performance; do
+for r in $(seq "$ROUNDS"); do for gov in "$ORIG" performance; do
   setgov "$gov"; sleep 2
   b=$("$BIN" -m "$MODEL" --tokens "$TOKENS" -n 96 2>&1 | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
   i=$(CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n 32 -r 2 2>/dev/null | grep 'tg32' | awk -F'|' '{print $(NF-1)}')

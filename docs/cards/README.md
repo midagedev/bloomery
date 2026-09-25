@@ -1,0 +1,1 @@
+`lease_take`(`tools/ref/lease.sh`)와 `tools/ref/lease-hold.sh`가 박스 임대를 내주기 전에 요구하는 예측 카드를 둔다. 형식과 검사, 종료 코드는 `tools/ref/card.py` 머리말에 있다. `example-<kind>.card`는 kind마다 하나씩 보여 주는 예시이고, 예시는 예측이 아니라서 임대 모드에서는 거부된다. `selftest-lease-hold.card`는 `lease-hold.sh`의 박스 자체 시험에 쓴다. 카드는 러너가 도는 트리에 두고 그 라운드와 함께 커밋한다. 그래서 실행 전에 적은 예측이 로그의 `[lease] card |` 줄과 커밋 양쪽에 남는다.

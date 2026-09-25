@@ -1,0 +1,17 @@
+# Example (kind profile). The grouped GEMM's counters before a lever on it. The band is the
+# expectation written beside the recipe ncu-gpu-gemm in the justfile [derived,
+# docs/research/q3next-design-report.md sections 3 and 6].
+kind: profile
+question: which unit carries gemm_q4k's block-step in the Qwen3 ubatch GEMM (128 experts of
+  768 x 2048 Q4_K, top-8, T = 4096)?
+term: L1TEX throughput in percent of peak (ncu), and whether it is the top unit
+unit: %
+predict: 55..65
+condition: ncu takes 16 eager gemm_q4k launches after the 64-launch warm-up burst on the A6000
+  (just ncu-gpu-gemm), under the lease; guard_other records any process on the 3090
+decide-in: write every unit's demand beside the block-step's cycles before a lever on L1TEX
+  wavefronts: the top unit is the bound only when its demand is the step (AGENTS.md)
+decide-below: another unit is on top: rank the units by demand against the step's cycles and aim
+  at the one whose demand is the step
+decide-above: L1TEX is near saturation: price a wavefront cut on the same demand-against-cycles
+  table before a round

@@ -6,11 +6,12 @@
 #
 #   source "${BASH_SOURCE[0]%/*}/lease.sh"
 #   WITNESS=(head loadavg pressure-io lock-holder model)   # this runner's witness fields, in order
-#   lease_take                                              # wait up to 30 min, or exit 75
+#   lease_take                                              # check the card, wait up to 30 min, or exit
 #   witness pre; <the measured run>; witness post
 #
 # What it owns, so that the runners cannot drift apart:
 #   the lease: its file, its descriptor (9), the 30-minute wait, exit 75 when the wait runs out;
+#   the card every lease needs (tools/ref/card.py, at lease_take below): no card, no lease;
 #   the witness block: its four header forms and every field a runner can list, each spelled once;
 #   the CPU-contention guard between arms (guard_cpu), the CPU side of timing-card.sh's guard_other;
 #   the two arm helpers the depth and A/B runners share: the LCG prompt of a depth and the
@@ -42,13 +43,45 @@
 #   table blockstat the engram table's mount and block device, and that device's completed read I/Os
 #                   and sectors — the difference between two blocks is what the drive did [DIR SRC DEV STAT]
 #   binary          the measured binary and its short sha256 [BIN BIN_SHA]
-LEASE_LOCK=/root/bloomery-cpu.lock
+LEASE_LOCK=${BLOOMERY_LEASE_LOCK:-/root/bloomery-cpu.lock}
+# The tree this file is in, resolved when it is sourced (a runner may change directory later): the
+# root BLOOMERY_LEASE_CARD is relative to, and where card.py lives.
+__lease_dir=${BASH_SOURCE[0]%/*}
+[ "$__lease_dir" != "${BASH_SOURCE[0]}" ] || __lease_dir=.
+LEASE_TREE=$(cd "$__lease_dir/../.." 2> /dev/null && pwd) || LEASE_TREE=
+unset __lease_dir
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # The lease is descriptor 9 on LEASE_LOCK, held until the runner exits or calls lease_release.
 # A wait that runs out is contention, not a failed measurement: exit 75.
+#
+# No card, no lease. BLOOMERY_LEASE_CARD names the run's card, docs/cards/<slug>.card relative to
+# this tree (tools/ref/card.py has the format and the exit codes). It reaches the box only through
+# BLOOMERY_BOX_ENV: tools/box.sh does not carry it otherwise. card.py checks it before the lease file
+# is opened and prints its path, sha256 and body as [lease] lines, so the log carries the card ahead
+# of the run; a missing or refused card exits with card.py's code (card.py lists them; never 75).
+# A runner that runs its arms in rounds sets ROUNDS before lease_take, and an ab card is checked at
+# that count; with no ROUNDS, at BLOOMERY_AB_ROUNDS (the count of a caller that starts this runner
+# once per arm, like tools/gpu-ab.py); else at the card's own `rounds`. ROUND_MINUTES, a runner's box
+# minutes per round, prices a ruler refusal.
+# BLOOMERY_LEASE_LOCK names another lock file, for the Mac stub tests (tools/ref/card-tests/run.sh).
+# A run under any other file holds no machine lease, so where /root/bloomery-cpu.lock exists (the box)
+# lease_take refuses the override (exit 64): a fake lock during a real sitting would contaminate it.
+# A command that tools/ref/lease-hold.sh runs carries BLOOMERY_LEASE_HELD (that script's pid): a lease
+# taken inside it would wait on the one already held and end as contention, so it exits 64 at once.
 lease_take() {
+  if [ -n "${BLOOMERY_LEASE_HELD:-}" ]; then
+    echo "[lease] refused: this run is inside tools/ref/lease-hold.sh (pid $BLOOMERY_LEASE_HELD), which holds the lease; a second lease would wait on it" >&2
+    exit 64
+  fi
+  if [ "$LEASE_LOCK" != /root/bloomery-cpu.lock ] && [ -e /root/bloomery-cpu.lock ]; then
+    echo "[lease] refused: BLOOMERY_LEASE_LOCK=$LEASE_LOCK on the machine whose lease is /root/bloomery-cpu.lock: a run under another lock would share the box with a real sitting" >&2
+    exit 64
+  fi
+  lease_card || exit $?
+  [ "$LEASE_LOCK" = /root/bloomery-cpu.lock ] ||
+    echo "[lease] BLOOMERY_LEASE_LOCK=$LEASE_LOCK is not the machine lease: nothing measured under it is admissible"
   exec 9>"$LEASE_LOCK"
   echo "[lease] waiting for $LEASE_LOCK ..."
   flock -w 1800 9 || { echo "[lease] timed out after 30 min" >&2; exit 75; }
@@ -74,6 +107,17 @@ lease_netdata() {
 }
 
 lease_release() { exec 9>&-; }
+
+# lease_card: card.py's check of BLOOMERY_LEASE_CARD and its [lease] lines; returns card.py's code.
+lease_card() {
+  local rounds=${ROUNDS:-${BLOOMERY_AB_ROUNDS:-}}
+  if [ -z "$LEASE_TREE" ]; then
+    echo "[lease] refused: the tree of tools/ref/lease.sh is not found, so neither is its card" >&2
+    return 66
+  fi
+  python3 "$LEASE_TREE/tools/ref/card.py" lease "${BLOOMERY_LEASE_CARD:-}" \
+    ${rounds:+--rounds "$rounds"} ${ROUND_MINUTES:+--round-minutes "$ROUND_MINUTES"}
+}
 
 # CPU contention between arms. The lease serializes timed runs, not builds: another round's cargo
 # build, a CUDA C++ build (nvcc drives cicc and ptxas, which carry its long passes — build-ref, the
