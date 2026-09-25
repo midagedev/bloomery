@@ -15,6 +15,14 @@
 //!   `sort[0][0..36]`: a valid top-6 only for token 0. It is used as an independent
 //!   cross-check of token 0, never for the other tokens.
 
+#[path = "common/asserts.rs"]
+mod asserts;
+#[path = "common/exact.rs"]
+mod exact;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
 
@@ -32,7 +40,7 @@ fn moe_input(o: &oracle::Oracle) -> Tensor2 {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_router_exact() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let x = moe_input(&o);
     moe::set_trace_enabled(true);
 
@@ -56,12 +64,12 @@ fn hw_moe_router_exact() {
     for t in 0..n_tokens {
         want_ids.extend_from_slice(&sort_vals[t * n_expert..t * n_expert + n_used]);
     }
-    oracle::assert_exact_i32(&tr.ids, &want_ids, "top-6 ids vs (sort) prefix");
+    exact::assert_exact_i32(&tr.ids, &want_ids, "top-6 ids vs (sort) prefix");
 
     // Token 0 only: the topk VIEW dump carries token 0's row; the rest is the artifact.
     let (topk_vals, _) = o.load("ffn_moe_topk-1", 0);
     assert_eq!(topk_vals.len(), n_used * n_tokens, "topk view must be 6x6");
-    oracle::assert_exact_i32(
+    exact::assert_exact_i32(
         &tr.ids[..n_used],
         &topk_vals[..n_used],
         "top-6 ids token 0 vs topk view",
@@ -73,16 +81,16 @@ fn hw_moe_router_exact() {
     // PIN(2026-09-21): 1e-4 -> exact. The router is F32 x F32 and `qdot::dot_f32`
     // sums in the reference's lane order, so the logits are the reference's bits;
     // the scalar left-to-right sum it replaced sat 3.8e-6 away and fails this line.
-    oracle::assert_close(&tr.logits, &logits, 0.0, "route -> ffn_moe_logits-1");
+    asserts::assert_close(&tr.logits, &logits, 0.0, "route -> ffn_moe_logits-1");
 
     let (probs, pinf) = o.load("ffn_moe_probs-1", 0);
     assert_eq!(pinf.op, "SOFT_MAX");
-    oracle::assert_close(&tr.probs, &probs, 1e-4, "route -> ffn_moe_probs-1");
+    asserts::assert_close(&tr.probs, &probs, 1e-4, "route -> ffn_moe_probs-1");
 
     let (weights, winf) = o.load("ffn_moe_weights-1", 0);
     assert_eq!(winf.op, "GET_ROWS");
     // Raw softmax probabilities, no renormalization — that is what the reference holds.
-    oracle::assert_close(&tr.weights, &weights, 1e-4, "route -> ffn_moe_weights-1");
+    asserts::assert_close(&tr.weights, &weights, 1e-4, "route -> ffn_moe_weights-1");
 
     // Routing reads the router; it must not have touched any expert stack.
     assert!(
@@ -117,7 +125,7 @@ fn hw_moe_router_exact() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_forward_matches_ggml() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let x = moe_input(&o);
     moe::set_trace_enabled(true);
 
@@ -127,7 +135,7 @@ fn hw_moe_forward_matches_ggml() {
 
     let (par, parinf) = o.load("ffn_moe_gate_par-1", 0);
     assert_eq!(parinf.op, "MOE_FUSED_UP_GATE");
-    oracle::assert_close(&tr.gate_par, &par, 1e-4, "moe_ffn -> ffn_moe_gate_par-1");
+    asserts::assert_close(&tr.gate_par, &par, 1e-4, "moe_ffn -> ffn_moe_gate_par-1");
 
     let (down, dinf) = o.load("ffn_moe_down-1", 0);
     assert_eq!(dinf.op, "MUL_MAT_ID");
@@ -150,21 +158,21 @@ fn hw_moe_forward_matches_ggml() {
     // noise flips ~1-2 down-quantizer codes per batch; 4e-4 is 1.4x the
     // observed maximum and still fails an f16-scale-in-place-of-bf16 bug at
     // 70x the gate.
-    oracle::assert_close(&tr.down, &down, 4e-4, "moe_ffn -> ffn_moe_down-1");
+    asserts::assert_close(&tr.down, &down, 4e-4, "moe_ffn -> ffn_moe_down-1");
 
     // The weighted sum and the shared-expert sum are gated separately: they are two
     // different bugs in the same output tensor (wrong weights vs wrong dense FFN).
     let (routed, rinf) = o.load("ffn_moe_out-1", 0);
     assert_eq!(rinf.op, "MUL_MULTI_ADD");
-    oracle::assert_close(&tr.routed_out, &routed, 1e-4, "moe_ffn -> ffn_moe_out-1");
+    asserts::assert_close(&tr.routed_out, &routed, 1e-4, "moe_ffn -> ffn_moe_out-1");
 
     let (shexp, sinf) = o.load("ffn_shexp-1", 0);
     assert_eq!([sinf.ne[0], sinf.ne[1]], [2048, 6]);
-    oracle::assert_close(&tr.shexp_out, &shexp, 1e-4, "moe_ffn -> ffn_shexp-1");
+    asserts::assert_close(&tr.shexp_out, &shexp, 1e-4, "moe_ffn -> ffn_shexp-1");
 
     let (want, winf) = o.load("ffn_out-1", 0);
     assert_eq!(winf.op, "ADD");
-    oracle::assert_close(&out.data, &want, 1e-4, "moe_ffn -> ffn_out-1");
+    asserts::assert_close(&out.data, &want, 1e-4, "moe_ffn -> ffn_out-1");
 }
 
 /// Structure, not numbers: the engine may only dequantize experts some token actually
@@ -177,7 +185,7 @@ fn hw_moe_forward_matches_ggml() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_moe_touches_only_routed_experts() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let x = moe_input(&o);
     moe::set_trace_enabled(true);
 
@@ -220,7 +228,7 @@ fn hw_experts_into_matches_group_composition() {
     use model::ops::{GroupInput, matmul_q_group, matmul_q_group_swiglu};
 
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let derived = model::arch::deepseek2::derived::Derived::new(&g).unwrap();
     let plan = derived.block_plan(1).unwrap().moe().unwrap();
     let x = moe_input(&o);

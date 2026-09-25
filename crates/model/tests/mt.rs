@@ -25,8 +25,12 @@
 //! `hw_` prefix: needs the box and the model file. Public API only (`forward`)
 //! — a parallel round is changing `forward.rs` internals right now, and a gate
 //! that reaches into them breaks on merge.
-#[path = "common/oracle.rs"]
-mod oracle;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
+#[path = "common/prompt.rs"]
+mod prompt;
 
 use model::arch::deepseek2::forward::forward;
 
@@ -40,9 +44,8 @@ fn hw_mt_child_logits() {
         eprintln!("child helper: no BLOOMERY_MT_CHILD_DUMP, nothing to do");
         return;
     };
-    let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
     let logits = forward(&g, &tokens).unwrap();
     let bytes: Vec<u8> = logits.data.iter().flat_map(|v| v.to_le_bytes()).collect();
     std::fs::write(&dump, bytes).unwrap();

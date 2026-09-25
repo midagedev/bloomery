@@ -47,6 +47,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), GateError> {
     use bloomery_gpu::arch::deepseek2::Body;
+    use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::moe_fused::MoeFusedKernels;
     use bloomery_gpu::probe::Probe;
@@ -65,7 +66,7 @@ fn run() -> Result<(), GateError> {
     let mut ok = true;
     let gguf = open_model()?;
     let gpu = Gpu::new()?;
-    let moe = MoeFusedKernels::load(gpu.context())?;
+    let moe = MoeFusedKernels::load(gpu.context(), gpu.fault_word())?;
     let stream = gpu.stream();
     let man = ref_manifest()?;
 
@@ -618,8 +619,9 @@ fn run() -> Result<(), GateError> {
     // ---- out-of-range sel id: slot n_used-1 carries n_expert (one past the
     // last expert); the op path's `q3k_gemv_sel` outputs and the fused kernel
     // must both leave that slot's rows at the sentinel and reproduce the
-    // clean run's bits everywhere else, and `q3k_gemv_sel` raises the named
-    // fault.
+    // clean run's bits everywhere else, and each raises the named fault on
+    // its own; the same slot at `HOST` (a host-served slot) raises nothing in
+    // the fused kernel.
     {
         let mut sel_oor = ids_h.clone();
         sel_oor[n_used - 1] = n_expert as u32;
@@ -630,6 +632,7 @@ fn run() -> Result<(), GateError> {
         let mut h_oor = DeviceBuffer::from_host(stream, &vec![SENT; span])?;
         gpu.enqueue_gemv_q3k_sel(wg, &act, &sel_oor_dev, n_used, ff, &mut g_oor)?;
         gpu.enqueue_gemv_q3k_sel(wu, &act, &sel_oor_dev, n_used, ff, &mut u_oor)?;
+        let fault_op = gpu.take_fault()?;
         moe.enqueue_expert_gate_up_swiglu(
             stream,
             wg,
@@ -642,11 +645,23 @@ fn run() -> Result<(), GateError> {
         )?;
         stream.synchronize()?;
         let fault = gpu.take_fault()?;
-        let fault_ok = fault
-            == Some(Fault {
-                layer: LAYER_NONE,
-                code: FaultSite::ExpertId as u32,
-            });
+        let mut sel_host = ids_h.clone();
+        sel_host[n_used - 1] = HOST;
+        let sel_host_dev = DeviceBuffer::from_host(stream, &sel_host)?;
+        let mut h_host = DeviceBuffer::from_host(stream, &vec![SENT; span])?;
+        moe.enqueue_expert_gate_up_swiglu(
+            stream,
+            wg,
+            wu,
+            &act,
+            &sel_host_dev,
+            n_used,
+            ff,
+            &mut h_host,
+        )?;
+        let fault_host = gpu.take_fault()?;
+        let want = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+        let fault_ok = fault_op == want && fault == want && fault_host.is_none();
         let (g_v, u_v, h_v) = (
             g_oor.to_host_vec(stream)?,
             u_oor.to_host_vec(stream)?,
@@ -667,7 +682,8 @@ fn run() -> Result<(), GateError> {
         println!(
             "oor sel[{}]={n_expert} op_gemv_bad_slot_untouched={op_untouched} \
              fused_bad_slot_untouched={fu_untouched} good_slots_bit_identical={good_same} \
-             fault={fault:?} (want expert_id)={fault_ok} {}",
+             op_fault={fault_op:?} fused_fault={fault:?} (want expert_id each) \
+             fused_host_slot_fault={fault_host:?} (want none): {fault_ok} {}",
             n_used - 1,
             verdict(pass)
         );

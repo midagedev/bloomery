@@ -507,10 +507,7 @@ mod gate {
     ) -> Result<bool, GateError> {
         let stream = gpu.stream();
         let sink = gpu.layer_sink(FAULT_LAYER)?;
-        let want = Some(Fault {
-            layer: u32::try_from(FAULT_LAYER)?,
-            code: FaultSite::Router as u32,
-        });
+        let want = Some(Fault::at(u32::try_from(FAULT_LAYER)?, FaultSite::Router));
         let (wh, kk) = router_weight_host(gguf, FAULT_LAYER)?;
         let w = DeviceTensor::upload(stream, &wh, N_EXPERT, kk)?;
         let cpu = &sets()?[0].1;

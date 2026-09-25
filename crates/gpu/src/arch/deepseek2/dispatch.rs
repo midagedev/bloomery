@@ -916,9 +916,12 @@ fn enqueue_ffn_moe(
 /// arena, and the handoff goes out right behind them, so the host experts
 /// start while the card runs its own experts and the shared expert; the
 /// wait sits just before the join (right after the go with the overlap
-/// lever off). The card's expert outputs are zeroed first: a host slot's id
-/// is past the resident stack, which the `_sel` kernels leave untouched, so
-/// the combine reads zero there and never an earlier layer's output. The
+/// lever off). The card's expert outputs are zeroed first, and the card's
+/// slot list (`card_sel`) writes a host slot — an id past the resident
+/// prefix — as [`crate::hybrid::HOST`], which the `_sel` kernels leave
+/// untouched without a fault, so the combine reads zero there and never an
+/// earlier layer's output. The host reads the router's raw ids from the
+/// handoff. The
 /// host's sum joins the shared expert's output in one add, and the combine
 /// keeps its grouping — `(Σ_card w·down + (shexp + hsum)) + resid`. With no
 /// expert on the card the `_sel` launches and the zeroing drop out, and the
@@ -970,11 +973,15 @@ fn enqueue_ffn_moe_hybrid(
     // With no expert on the card nothing writes `m.down` on a hybrid load: it
     // keeps the zeros it was allocated with, so every slot the combine reads
     // is zero without the memset.
-    let card = b.slots.on_card(names.layer) > 0;
+    let n_card = b.slots.on_card(names.layer);
+    let card = n_card > 0;
     if card {
         m.down.zero_async(stream)?;
         tick(i, obs, "hybrid_zero_down", bsum(&[Some(4 * m.down.len())]))?;
-        moe_expert_gate_up(gpu, w, names, act_ffn, &b.ids, &mut m.h_exp, dims, i, obs)?;
+        gpu.elem()
+            .enqueue_card_sel(stream, &b.ids, dims.n_used, n_card, &mut m.ids)?;
+        tick(i, obs, "hybrid_card_sel", bsum(&[Some(8 * dims.n_used)]))?;
+        moe_expert_gate_up(gpu, w, names, act_ffn, &m.ids, &mut m.h_exp, dims, i, obs)?;
     }
     moe_shexp_gate_up(gpu, w, names, act_ffn, m, dims, i, obs)?;
     if card {
@@ -984,7 +991,7 @@ fn enqueue_ffn_moe_hybrid(
             w,
             names,
             &m.act32_exp,
-            &b.ids,
+            &m.ids,
             &mut m.down,
             dims,
             hidden,

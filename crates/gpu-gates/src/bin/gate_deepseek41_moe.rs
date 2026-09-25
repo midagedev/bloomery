@@ -2187,10 +2187,7 @@ mod gate {
         let wk = dv.rout.weights.to_host_vec(stream)?;
         let tickets = dv.rout.tickets(stream)?;
         let got = cx.gpu.take_fault()?;
-        let want = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::Router as u32,
-        };
+        let want = Fault::at(LAYER_NONE, FaultSite::Router);
         let mut distinct = ids.clone();
         distinct.sort_unstable();
         distinct.dedup();

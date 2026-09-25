@@ -47,7 +47,7 @@ fn run() -> Result<(), GateError> {
     let mut ok = true;
     let gguf = open_model()?;
     let gpu = Gpu::new()?;
-    let q5 = Q5Kernels::load(gpu.context())?;
+    let q5 = Q5Kernels::load(gpu.context(), gpu.fault_word())?;
     let stream = gpu.stream();
 
     // ---- Q5_0: the expert stack, experts 0/5/63 by row0 (flat-stack

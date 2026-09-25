@@ -24,7 +24,8 @@
 //!    compared with each other (the set's consistency).
 //! 4. **The Markov step's previous token.** One row of the head's Markov step
 //!    with `first` in the vocabulary raises nothing; with `first` past it the
-//!    step raises `FaultSite::TokenId`, and its readback carries the word.
+//!    step raises `FaultSite::TokenId`, its readback carries the word and the
+//!    site mask, and every logit of the row is NaN (finite in the vocabulary).
 //!
 //! Band. ik's CUDA matmul of a Q8_0 weight quantizes its f32 activation to
 //! q8_1 (32-value blocks, `d = amax/127`), ours keeps it f32; so a row's gap
@@ -681,8 +682,10 @@ mod gate {
 
     /// The Markov step's previous token read on the card: one row, `first`
     /// in the vocabulary raises nothing; `first` three past it raises
-    /// [`FaultSite::TokenId`] as an unlabelled launch, and the step's own
-    /// readback (`tok[1]`, the argmax's copy of the word) carries it.
+    /// [`FaultSite::TokenId`] as an unlabelled launch, the step's own
+    /// readback (`tok[1..3]`, the argmax's copy of the word and the mask)
+    /// carries it, and the row's logits are NaN, every one — no correction a
+    /// draft could be read from (finite, every one, in the vocabulary).
     fn markov_first(gpu: &Gpu, w: &DraftWeights) -> Result<bool, GateError> {
         let stream = gpu.stream();
         let mk = MarkovKernels::load(gpu.context())?;
@@ -690,14 +693,11 @@ mod gate {
         let mw = MarkovWeights { w1, w2 };
         let n_vocab = w2.rows();
         let bad = u32::try_from(n_vocab)? + 3;
-        let want_fault = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::TokenId as u32,
-        };
+        let want_fault = Fault::at(LAYER_NONE, FaultSite::TokenId);
         let mut ok = gpu.take_fault()?.is_none();
         for (first_id, want) in [(5u32, None), (bad, Some(want_fault))] {
             let first = DeviceBuffer::from_host(stream, &[first_id])?;
-            let mut tok = DeviceBuffer::from_host(stream, &[u32::MAX; 2])?;
+            let mut tok = DeviceBuffer::from_host(stream, &[u32::MAX; 3])?;
             let mut logits = DeviceBuffer::<f32>::zeroed(stream, n_vocab)?;
             mk.enqueue_step(
                 stream,
@@ -711,16 +711,26 @@ mod gate {
                 &mut logits,
             )?;
             let t = tok.to_host_vec(stream)?;
-            let word = Fault::from_word(t[1]);
+            let word = Fault::from_words(t[1], t[2]);
             let fault = gpu.take_fault()?;
-            let pass = fault == want && word == want;
+            let l = logits.to_host_vec(stream)?;
+            let nan = l.iter().filter(|v| v.is_nan()).count();
+            let finite = l.iter().filter(|v| v.is_finite()).count();
+            let logits_ok = if want.is_some() {
+                nan == l.len()
+            } else {
+                finite == l.len()
+            };
+            let pass = fault == want && word == want && logits_ok;
             let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
             println!(
                 "{NAME}: markov first={first_id} (n_vocab {n_vocab}): fault=\"{}\" readback=\"{}\" \
-                 want=\"{}\" {}",
+                 want=\"{}\"; logits nan={nan} finite={finite} of {} (want all {}) {}",
                 shown(fault),
                 shown(word),
                 shown(want),
+                l.len(),
+                if want.is_some() { "NaN" } else { "finite" },
                 verdict(pass)
             );
             ok &= pass;

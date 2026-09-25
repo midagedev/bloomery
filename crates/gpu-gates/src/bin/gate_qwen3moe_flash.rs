@@ -274,10 +274,7 @@ mod gate {
         let stream = gpu.stream();
         let layer = 13usize;
         let run = (stream, gpu.layer_sink(layer)?);
-        let want = Some(Fault {
-            layer: u32::try_from(layer)?,
-            code: FaultSite::KeyCount as u32,
-        });
+        let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::KeyCount));
         let n_head = g.n_kv * GROUP;
         let w = n_head * HEAD;
         let qd = DeviceBuffer::from_host(stream, &rotated_rows(q, n_head).concat())?;
@@ -734,10 +731,7 @@ mod gate {
                 others_same &= bits_equal(a, b);
             }
         }
-        let want = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::KeyCount as u32,
-        };
+        let want = Fault::at(LAYER_NONE, FaultSite::KeyCount);
         let fault_ok = before.is_none()
             && after_clean.is_none()
             && raised == Some(want)

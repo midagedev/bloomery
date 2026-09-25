@@ -7,8 +7,8 @@
 //! worker closure that allocates per chunk shows up here too.
 //!
 //! `hw_` prefix: needs the box and the model file, not the oracle.
-#[path = "common/oracle.rs"]
-mod oracle;
+#[path = "common/model_path.rs"]
+mod model_path;
 
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{new_cache, step};
@@ -96,7 +96,7 @@ const LIMIT: u64 = 660;
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_steady_step_allocations_bounded() {
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let mut cache = new_cache(&g).unwrap();
     let derived = Derived::new(&g).unwrap();
     step(

@@ -12,8 +12,16 @@
 //! below carry the derivation.
 //!
 //! `hw_` prefix: needs the box, the model file and `$BLOOMERY_DATA/ref`.
+#[path = "common/asserts.rs"]
+mod asserts;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "common/prompt.rs"]
+mod prompt;
 
 use model::head::head;
 use model::ops::{Tensor2, f32_tensor, rms_norm};
@@ -108,11 +116,11 @@ fn top5(v: &[f32]) -> Vec<(usize, f32)> {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_head_matches_oracle() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     // The manifest pins the sequence; any other token set invalidates every number below.
     assert_eq!(
-        o.tokens,
+        prompt::tokens(),
         [100_000, 549, 6077, 280, 7239, 317],
         "reference values are for the fixed six-token sequence"
     );
@@ -155,7 +163,7 @@ fn hw_head_matches_oracle() {
         [normed.ne0 as i64, normed.ne1 as i64],
         [ninf.ne[0], ninf.ne[1]]
     );
-    oracle::assert_close(
+    asserts::assert_close(
         &normed.data,
         &norm_want,
         1e-4,
@@ -181,7 +189,7 @@ fn hw_head_matches_oracle() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_head_batch_is_column_independent() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     let (xs, xinf) = o.load("l_out-26", 0);
     let ne0 = xinf.ne[0] as usize;

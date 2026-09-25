@@ -19,6 +19,7 @@
 use crate::GpuError;
 use crate::cores::{funnel16, half_to_f32, q3k_aux_scales, q3k_sub_scale, q4k_scale_min};
 use crate::fault::{FaultSink, FaultSite, LAYER_NONE};
+use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -321,9 +322,10 @@ mod elem_kernels {
     /// Dequantize `ids.len()` rows of the Q3_K embedding table `w` (220 u32
     /// words per row, 2048 values) into `y`, token-major. Ids live on the
     /// device, so their validity cannot be host-checked: an id past the
-    /// table's `n_rows` rows raises [`FaultSite::TokenId`] on `fault` and
-    /// reads row 0 only so the access stays in bounds — that row is no output
-    /// a caller trusts, the step's readback turns the fault into an error.
+    /// table's `n_rows` rows raises [`FaultSite::TokenId`] on `fault`, reads
+    /// no table word, and writes NaN to every value of its row — no value a
+    /// later kernel could take for an embedding; the step's readback turns
+    /// the fault into an error.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -346,17 +348,16 @@ mod elem_kernels {
         let k = i & 2047;
         // SAFETY: t < ids.len() by the guard.
         let id = unsafe { *ids.get_unchecked(t) };
-        let id = if id < n_rows {
-            id as usize
+        let v = if id < n_rows {
+            // Row spans are whole 880-byte blocks, so only the super-block
+            // offset can sit 2 mod 4; the core funnels both alignments.
+            q3k_embed_value(w, id as usize * 880 + ((k >> 8) * 110), k & 255)
         } else {
             if k == 0 {
                 fault.raise(FaultSite::TokenId);
             }
-            0
+            f32::NAN
         };
-        // Row spans are whole 880-byte blocks, so only the super-block offset
-        // can sit 2 mod 4; the core funnels both alignments.
-        let v = q3k_embed_value(w, id * 880 + ((k >> 8) * 110), k & 255);
         // SAFETY: i < ids.len() * 2048 <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = v;
@@ -367,8 +368,8 @@ mod elem_kernels {
     /// n_sb` u32 words per row, `256 · n_sb` values) into `y`, token-major,
     /// one thread per value through [`q4k_embed_value`]. Q4_K rows are whole
     /// words, so no funnel is needed. An id past the table's `n_rows` rows
-    /// raises [`FaultSite::TokenId`] and reads row 0 in bounds, as
-    /// `embed_rows` does.
+    /// raises [`FaultSite::TokenId`] and writes a NaN row, as `embed_rows`
+    /// does.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -396,16 +397,14 @@ mod elem_kernels {
         let k = i % width;
         // SAFETY: t < ids.len() by the guard.
         let id = unsafe { *ids.get_unchecked(t) };
-        let id = if id < n_rows {
-            id as usize
+        let v = if id < n_rows {
+            q4k_embed_value(w, (id as usize * n_sb as usize + (k >> 8)) * 36, k & 255)
         } else {
             if k == 0 {
                 fault.raise(FaultSite::TokenId);
             }
-            0
+            f32::NAN
         };
-        let wk = (id * n_sb as usize + (k >> 8)) * 36;
-        let v = q4k_embed_value(w, wk, k & 255);
         // SAFETY: i < ids.len() * width <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = v;
@@ -517,6 +516,31 @@ mod elem_kernels {
         unsafe {
             *dst.get_unchecked_mut(col * nd + d) = y0;
             *dst.get_unchecked_mut(col * nd + d + 1) = y1;
+        }
+    }
+
+    /// The card's slot list of a hybrid layer whose card holds the id
+    /// prefix `[0, n_card)`: `sel[i] = ids[i]` for an id below `n_card`,
+    /// [`HOST`] otherwise — the one value the `_sel` kernels skip without a
+    /// fault. One thread per slot.
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (ids.len() >= n, sel.len() >= n)
+    )]
+    pub fn card_sel(ids: &[u32], n: u32, n_card: u32, mut sel: DisjointSlice<u32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: i < n <= ids.len() by the launch contract.
+        let id = unsafe { *ids.get_unchecked(i) };
+        // SAFETY: i < n <= sel.len() by the launch contract; thread i alone
+        // writes it.
+        unsafe {
+            *sel.get_unchecked_mut(i) = if id < n_card { id } else { HOST };
         }
     }
 
@@ -703,13 +727,14 @@ mod elem_kernels {
         }
     }
 
-    /// [`argmax`], and the fault word next to the token: thread 0 writes the
-    /// index to `out[0]` and the word as it stands to `out[1]`, so the head's
-    /// one readback carries both. Every launch before this one on the stream
-    /// has finished raising, so the copy is the step's whole fault.
+    /// [`argmax`], and the fault next to the token: thread 0 writes the
+    /// index to `out[0]`, the first-layer word as it stands to `out[1]` and
+    /// that layer's site mask to `out[2]`, so the head's one readback carries
+    /// all three. Every launch before this one on the stream has finished
+    /// raising, so the copy is the step's whole fault.
     #[kernel]
     #[launch_bounds(1024)]
-    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n, out.len() >= 2))]
+    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n, out.len() >= 3))]
     pub fn argmax_fault(x: &[f32], n: u32, fault: FaultSink, mut out: DisjointSlice<u32>) {
         static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
         static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
@@ -729,20 +754,23 @@ mod elem_kernels {
         let fi = unsafe { argmax_block(x, n, 1, 0, bv, bi) };
         if thread::threadIdx_x() == 0 {
             let word = fault.read();
-            // SAFETY: out.len() >= 2 by the launch contract; only thread 0
+            let sites = fault.read_sites(word);
+            // SAFETY: out.len() >= 3 by the launch contract; only thread 0
             // writes.
             unsafe {
                 *out.get_unchecked_mut(0) = fi;
                 *out.get_unchecked_mut(1) = word;
+                *out.get_unchecked_mut(2) = sites;
             }
         }
     }
 
-    /// [`argmax_rows`], and the fault word after the tokens: block 0's
-    /// thread 0 also writes the word to `out[m]`, as [`argmax_fault`] does.
+    /// [`argmax_rows`], and the fault after the tokens: block 0's thread 0
+    /// also writes the first-layer word to `out[m]` and its layer's site mask
+    /// to `out[m + 1]`, as [`argmax_fault`] does.
     #[kernel]
     #[launch_bounds(1024)]
-    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n * m, out.len() >= m + 1))]
+    #[launch_contract(domain = 1, block = (1024, 1, 1), requires = (x.len() >= n * m, out.len() >= m + 2))]
     pub fn argmax_rows_fault(
         x: &[f32],
         n: u32,
@@ -776,10 +804,12 @@ mod elem_kernels {
             }
             if c == 0 {
                 let word = fault.read();
-                // SAFETY: m < out.len() by the launch contract; block 0's
-                // thread 0 alone writes it.
+                let sites = fault.read_sites(word);
+                // SAFETY: m + 1 < out.len() by the launch contract; block 0's
+                // thread 0 alone writes both.
                 unsafe {
                     *out.get_unchecked_mut(m as usize) = word;
+                    *out.get_unchecked_mut(m as usize + 1) = sites;
                 }
             }
         }
@@ -888,8 +918,8 @@ impl ElemKernels {
     /// ids.len()` f32, token-major. Bit-identical to
     /// `gguf::quant::dequant_row` on the same row bytes. An id past the
     /// table raises [`FaultSite::TokenId`] on the owning `Gpu`'s fault word
-    /// as an unlabelled launch ([`LAYER_NONE`]). Asynchronous,
-    /// allocation-free, capturable.
+    /// as an unlabelled launch ([`LAYER_NONE`]) and its row of `y` is NaN.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_embed_rows(
         &self,
         stream: &CudaStream,
@@ -1068,6 +1098,33 @@ impl ElemKernels {
             .prepare_rope(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
             .rope(stream, &prep, src, cs, n_dims, n_vec, m, dst)?;
+        Ok(())
+    }
+
+    /// Enqueue the card's slot list (`card_sel`) of the first `n` ids: an
+    /// id below `n_card` as it is, any other as [`HOST`]. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_card_sel(
+        &self,
+        stream: &CudaStream,
+        ids: &DeviceBuffer<u32>,
+        n: usize,
+        n_card: usize,
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_card_sel";
+        if n == 0 || ids.len() < n || sel.len() < n {
+            return Err(GpuError::shape(
+                what,
+                format!("n={n}, ids.len() {}, sel.len() {}", ids.len(), sel.len()),
+            ));
+        }
+        let n = launch_u32(what, "n", n)?;
+        let n_card = launch_u32(what, "n_card", n_card)?;
+        let prep = self
+            .module
+            .prepare_card_sel(LaunchConfig1D::new(n.div_ceil(32), 32, 0))?;
+        self.module.card_sel(stream, &prep, ids, n, n_card, sel)?;
         Ok(())
     }
 
@@ -1259,9 +1316,9 @@ impl ElemKernels {
         Ok(())
     }
 
-    /// [`Self::enqueue_argmax`] into `out[0]` with the fault word `fault`
-    /// addresses copied to `out[1]` — the head's readback of token and fault
-    /// in one copy. Asynchronous, allocation-free, capturable.
+    /// [`Self::enqueue_argmax`] into `out[0]` with the first-layer word
+    /// `fault` addresses copied to `out[1]` and its layer's site mask to
+    /// `out[2]` — the head's readback of token and fault in one copy. Asynchronous, allocation-free, capturable.
     pub fn enqueue_argmax_fault(
         &self,
         stream: &CudaStream,
@@ -1270,11 +1327,11 @@ impl ElemKernels {
         fault: FaultSink,
         out: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        if n == 0 || x.len() < n || out.len() < 2 {
+        if n == 0 || x.len() < n || out.len() < 3 {
             return Err(GpuError::shape(
                 "enqueue_argmax_fault",
                 format!(
-                    "n={n}, x.len() {}, out.len() {} (need 2)",
+                    "n={n}, x.len() {}, out.len() {} (need 3)",
                     x.len(),
                     out.len()
                 ),
@@ -1288,8 +1345,8 @@ impl ElemKernels {
         Ok(())
     }
 
-    /// [`Self::enqueue_argmax_rows`] into `out[..m]` with the fault word
-    /// copied to `out[m]`. Asynchronous, allocation-free, capturable.
+    /// [`Self::enqueue_argmax_rows`] into `out[..m]` with the first-layer
+    /// word copied to `out[m]` and its layer's site mask to `out[m + 1]`. Asynchronous, allocation-free, capturable.
     pub fn enqueue_argmax_rows_fault(
         &self,
         stream: &CudaStream,
@@ -1300,11 +1357,11 @@ impl ElemKernels {
         out: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         let what = "enqueue_argmax_rows_fault";
-        if n == 0 || m == 0 || x.len() < n * m || out.len() < m + 1 {
+        if n == 0 || m == 0 || x.len() < n * m || out.len() < m + 2 {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "n={n} m={m}, x.len() {}, out.len() {} (need m+1)",
+                    "n={n} m={m}, x.len() {}, out.len() {} (need m+2)",
                     x.len(),
                     out.len()
                 ),

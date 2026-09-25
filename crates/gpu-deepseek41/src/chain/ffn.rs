@@ -23,7 +23,8 @@
 //!   each slot's place in the card's routed stacks: the layer's row of the
 //!   slot map's card copy at the id, [`HOST`] for an expert the card does not
 //!   hold. The card's routed launches read those places, so which experts
-//!   the card computes comes from the map alone.
+//!   the card computes comes from the map alone. An id past the expert count
+//!   has no place: it raises `FaultSite::ExpertId` there.
 //! - The go signals the host tier; the wait takes its answer back
 //!   ([`bloomery_gpu::hybrid`]). With the overlap lever off the wait sits
 //!   right after the go.
@@ -65,7 +66,7 @@ use std::sync::Arc;
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::hybrid::{Boundary, HOST, HostExperts, Hybrid, SlotMap};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, launch_u32};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
@@ -153,8 +154,11 @@ mod ffn_kernels {
     /// which copies `x[d]` to the image's word `x_at + d`. Threads `s < 6`
     /// also copy slot `s`'s id and weight to words `ids_at + s` and `wts_at +
     /// s` and write `sel[s] = map[row_off + id]` — the id's slot in the card's
-    /// routed stacks, or [`HOST`] — or [`HOST`] for an id not below
-    /// `n_expert`; thread 0 copies the region's sequence word to `seq_at`.
+    /// routed stacks, or [`HOST`]. An id not below `n_expert` has no place:
+    /// it raises [`FaultSite::ExpertId`] on `fault` and its `sel` is
+    /// [`HOST`], so no card kernel reads a row for it; the id itself goes to
+    /// the image as it came. Thread 0 copies the region's sequence word to
+    /// `seq_at`.
     /// The go that follows orders every write here before its generation.
     #[allow(
         clippy::too_many_arguments,
@@ -192,6 +196,7 @@ mod ffn_kernels {
         ids_at: u32,
         wts_at: u32,
         x_at: u32,
+        fault: FaultSink,
         mut image: DisjointSlice<u32>,
         mut sel: DisjointSlice<u32>,
     ) {
@@ -214,6 +219,7 @@ mod ffn_kernels {
                 // launch contract.
                 unsafe { *map.get_unchecked(row_off as usize + id as usize) }
             } else {
+                fault.raise(FaultSite::ExpertId);
                 HOST
             };
             // SAFETY: d < 6 <= sel.len(); ids_at + d and wts_at + d lie in the
@@ -1171,6 +1177,7 @@ impl FfnPiece {
             launch_u32(what, "ids_at", lay.ids)?,
             launch_u32(what, "wts_at", lay.weights)?,
             launch_u32(what, "x_at", lay.x)?,
+            fault,
             target.image,
             &mut r.sel,
         )?;

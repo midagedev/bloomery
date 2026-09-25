@@ -59,7 +59,7 @@ pub mod router;
 pub(crate) mod tensor;
 pub mod weights;
 
-pub use fault::{FAULT_NONE, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
+pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
 pub use graph::{Branch, FLAG_WAIT_OPS, Graph, HostFlags, NodeInfo, capturing};
 pub use model::GpuModel;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
@@ -1800,28 +1800,37 @@ pub struct Gpu {
     fault: Arc<DeviceBuffer<u32>>,
 }
 
-/// The sink over a `Gpu`'s fault word ([`Gpu::fault_word`]), for launches
-/// of `layer`.
+/// The sink over a `Gpu`'s fault allocation ([`Gpu::fault_word`]), for
+/// launches of `layer`. A layer past [`LAYER_NONE`] has no site mask and is
+/// refused by panic: every caller passes a constant or a
+/// [`Gpu::layer_sink`]-checked layer.
 #[must_use]
 pub(crate) fn sink_over(word: &Arc<DeviceBuffer<u32>>, layer: u32) -> FaultSink {
-    // SAFETY: `word` holds at least one device u32 of the context the
-    // holder's launches run in ([`module_fault_word`] checks both at load);
-    // the holder keeps the Arc, so the word stays allocated while any of its
+    assert!(
+        layer <= LAYER_NONE && word.len() >= FAULT_WORDS,
+        "sink_over: layer {layer} over a fault allocation of {} words (want layer <= {LAYER_NONE}, \
+         {FAULT_WORDS} words)",
+        word.len()
+    );
+    // SAFETY: `word` holds FAULT_WORDS device u32s of the context the
+    // holder's launches run in ([`module_fault_word`] checks both at load,
+    // the assert above the length again) and `layer <= LAYER_NONE`; the
+    // holder keeps the Arc, so the allocation stays alive while any of its
     // launches can run (its drop synchronizes the context first), and a
     // graph drops before the buffers it addresses.
     unsafe { FaultSink::new(word.cu_deviceptr() as *mut u32, layer) }
 }
 
-/// A kernel module's handle on the fault word it is loaded with: `word`
-/// shared, after checking that it is a buffer of `ctx` (the context the
-/// module's launches run in) holding at least one u32. Anything else is
-/// refused by `what`'s name.
+/// A kernel module's handle on the fault allocation it is loaded with:
+/// `word` shared, after checking that it is a buffer of `ctx` (the context
+/// the module's launches run in) holding the first-layer word and every site
+/// mask ([`FAULT_WORDS`]). Anything else is refused by `what`'s name.
 pub(crate) fn module_fault_word(
     ctx: &Arc<CudaContext>,
     word: &Arc<DeviceBuffer<u32>>,
     what: &'static str,
 ) -> Result<Arc<DeviceBuffer<u32>>, GpuError> {
-    if word.is_empty() || !Arc::ptr_eq(word.context(), ctx) {
+    if word.len() < FAULT_WORDS || !Arc::ptr_eq(word.context(), ctx) {
         return Err(GpuError::state(
             what,
             "the fault word of the Gpu that owns this context (Gpu::fault_word)",
@@ -1837,6 +1846,17 @@ pub(crate) fn module_fault_word(
 /// load then takes.
 const FAULT_ALLOC_WORDS: usize = (2 << 20) / 4;
 
+// The first-layer word and every layer's site mask fit the granule.
+const _: () = assert!(fault::FAULT_WORDS <= FAULT_ALLOC_WORDS);
+
+/// The fault allocation's clean contents: the first-layer word at
+/// [`FAULT_NONE`], every site mask (and the unused tail) at 0.
+fn clean_fault_words() -> Vec<u32> {
+    let mut v = vec![0u32; FAULT_ALLOC_WORDS];
+    v[0] = FAULT_NONE;
+    v
+}
+
 impl Gpu {
     /// `with_device(0)`: under the box environment device 0 is the dev card.
     pub fn new() -> Result<Gpu, GpuError> {
@@ -1850,23 +1870,20 @@ impl Gpu {
         let ctx = CudaContext::new(device)?;
         let stream = ctx.new_stream()?;
         // First: the modules below that raise are given it at load.
-        let fault = Arc::new(DeviceBuffer::from_host(
-            &stream,
-            &vec![FAULT_NONE; FAULT_ALLOC_WORDS],
-        )?);
+        let fault = Arc::new(DeviceBuffer::from_host(&stream, &clean_fault_words())?);
         // SAFETY: this package owns the embedded device bundle produced for
         // the kernels module above; every launcher checks its launch
         // contract before launching.
         let module = unsafe { kernels::load(&ctx)? };
         Ok(Gpu {
             q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx, &fault)?,
-            q5: q5::Q5Kernels::load(&ctx)?,
+            q5: q5::Q5Kernels::load(&ctx, &fault)?,
             q8f32: q8f32::Q8F32Kernels::load(&ctx)?,
             elem: elem::ElemKernels::load(&ctx, &fault)?,
             flash: flash::FlashKernels::load(&ctx)?,
             router: router::RouterKernels::load(&ctx)?,
             fused: fused::FusedKernels::load(&ctx)?,
-            moe_fused: moe_fused::MoeFusedKernels::load(&ctx)?,
+            moe_fused: moe_fused::MoeFusedKernels::load(&ctx, &fault)?,
             fault,
             ctx,
             stream,
@@ -1910,37 +1927,60 @@ impl Gpu {
         }
     }
 
-    /// The fault the word holds, if any: a blocking read on the engine
-    /// stream, so it sees every launch enqueued before it.
+    /// The fault the allocation holds, if any — the first-layer word and
+    /// that layer's site mask: blocking reads on the engine stream, so they
+    /// see every launch enqueued before them.
     pub fn fault(&self) -> Result<Option<Fault>, GpuError> {
+        let word = self.fault_u32(0)?;
+        if word == FAULT_NONE {
+            return Ok(None);
+        }
+        let sites = match usize::try_from(word >> 8) {
+            Ok(l) if l <= LAYER_NONE as usize => self.fault_u32(fault::mask_index(word >> 8))?,
+            _ => 0,
+        };
+        Ok(Fault::from_words(word, sites))
+    }
+
+    /// Word `at` of the fault allocation, read on the engine stream.
+    fn fault_u32(&self, at: usize) -> Result<u32, GpuError> {
+        if at >= FAULT_WORDS {
+            return Err(GpuError::shape(
+                "Gpu::fault_u32",
+                format!("word {at} of a fault allocation of {FAULT_WORDS}"),
+            ));
+        }
         self.ctx.bind_to_thread()?;
         let mut word = FAULT_NONE;
-        // SAFETY: the source is the word, the first u32 of this Gpu's own
-        // live allocation; the destination is `word`, four bytes that outlive
-        // the copy because the stream is synchronized before it goes out of
-        // scope; this context is current on the calling thread (bound above).
+        // SAFETY: the source is word `at < FAULT_WORDS` of this Gpu's own
+        // live allocation of FAULT_ALLOC_WORDS; the destination is `word`,
+        // four bytes that outlive the copy because the stream is synchronized
+        // before it goes out of scope; this context is current on the
+        // calling thread (bound above).
         let rc = unsafe {
             cuda_core::sys::cuMemcpyDtoHAsync_v2(
                 (&raw mut word).cast(),
-                self.fault.cu_deviceptr(),
+                self.fault.cu_deviceptr() + 4 * at as u64,
                 std::mem::size_of::<u32>(),
                 self.stream.cu_stream(),
             )
         };
         graph::cu(rc, "cuMemcpyDtoHAsync_v2 (fault word)")?;
         self.stream.synchronize()?;
-        Ok(Fault::from_word(word))
+        Ok(word)
     }
 
-    /// Put the word back to [`FAULT_NONE`], in stream order: every launch
-    /// enqueued before this may still raise into the word it clears, every
-    /// launch after it starts clean. Never inside a capture.
+    /// Put the first-layer word back to [`FAULT_NONE`] and every site mask
+    /// to 0, in stream order: every launch enqueued before this may still
+    /// raise into what it clears, every launch after it starts clean. Never
+    /// inside a capture.
     pub fn clear_fault(&self) -> Result<(), GpuError> {
         self.ctx.bind_to_thread()?;
-        // SAFETY: the word is one u32 of this Gpu's own live allocation, the
-        // stream handle is this Gpu's engine stream, and this context is
-        // current on the calling thread (bound above); the memset is ordered
-        // on that stream like every launch that touches the word.
+        // SAFETY: both ranges lie inside this Gpu's own live allocation of
+        // FAULT_ALLOC_WORDS >= FAULT_WORDS u32s, the stream handle is this
+        // Gpu's engine stream, and this context is current on the calling
+        // thread (bound above); the memsets are ordered on that stream like
+        // every launch that touches the allocation.
         let rc = unsafe {
             cuda_core::sys::cuMemsetD32Async(
                 self.fault.cu_deviceptr(),
@@ -1949,7 +1989,17 @@ impl Gpu {
                 self.stream.cu_stream(),
             )
         };
-        graph::cu(rc, "cuMemsetD32Async")?;
+        graph::cu(rc, "cuMemsetD32Async (fault word)")?;
+        // SAFETY: as above; the masks are words 1..FAULT_WORDS.
+        let rc = unsafe {
+            cuda_core::sys::cuMemsetD32Async(
+                self.fault.cu_deviceptr() + 4,
+                0,
+                FAULT_WORDS - 1,
+                self.stream.cu_stream(),
+            )
+        };
+        graph::cu(rc, "cuMemsetD32Async (fault site masks)")?;
         Ok(())
     }
 

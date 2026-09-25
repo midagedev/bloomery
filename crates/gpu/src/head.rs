@@ -13,10 +13,10 @@
 //! residual store write straight into it, and `set_input` is the gate's way
 //! in.
 //!
-//! The argmax also carries the card's fault word (crate::fault) out: the
-//! readback buffer holds the `m` tokens and then the word, one copy, and a
-//! raised word turns the readback into [`GpuError::Fault`] instead of a
-//! token.
+//! The argmax also carries the card's fault (crate::fault) out: the readback
+//! buffer holds the `m` tokens, then the first-layer word and that layer's
+//! site mask, one copy, and a raised word turns the readback into
+//! [`GpuError::Fault`] instead of a token.
 
 use crate::GpuError;
 use crate::fault::{Fault, FaultSink, LAYER_HEAD};
@@ -86,7 +86,8 @@ pub struct Head {
     normed: DeviceBuffer<f32>,
     act: Q8Act,
     logits: DeviceBuffer<f32>,
-    /// The `m` argmax tokens, then the fault word as the argmax found it.
+    /// The `m` argmax tokens, then the fault's first-layer word and that
+    /// layer's site mask as the argmax found them.
     token_out: DeviceBuffer<u32>,
 }
 
@@ -130,7 +131,7 @@ impl Head {
             normed: DeviceBuffer::zeroed(stream, m * hidden)?,
             act: Q8Act::with_k(stream, m, hidden)?,
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
-            token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 1])?,
+            token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
             graph: None,
         })
     }
@@ -208,9 +209,10 @@ impl Head {
     /// rms_norm and q8_1 quantization [`Head::enqueue`] runs, then `tail(act,
     /// out_w, fault, logits, token_out)` over the quantized rows, the Q6_K
     /// lm_head, the head's fault sink and the two outputs the readbacks read
-    /// (`logits` as `logits_to_host` takes them, `token_out` as the `m` tokens
-    /// then the fault word). `tail` must write both as `enqueue`'s gemv and
-    /// argmax do; [`Head::token`] and [`Head::logits_to_host`] are unchanged.
+    /// (`logits` as `logits_to_host` takes them, `token_out` as the `m`
+    /// tokens then the fault's two words). `tail` must write both as
+    /// `enqueue`'s gemv and argmax do; [`Head::token`] and
+    /// [`Head::logits_to_host`] are unchanged.
     /// Pure enqueues, so the same body is what a capture records.
     pub(crate) fn enqueue_with_tail<F>(
         &mut self,
@@ -310,14 +312,16 @@ impl Head {
     }
 
     /// The argmax tokens of the last run, one per row. Blocking read; a
-    /// raised fault word is [`GpuError::Fault`], as [`Head::token`].
+    /// raised fault is [`GpuError::Fault`], as [`Head::token`].
     pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
         let mut out = self.token_out.to_host_vec(gpu.stream())?;
-        let word = out.pop().ok_or(GpuError::state(
-            "Head::tokens",
-            "the readback buffer holds no fault word",
-        ))?;
-        if let Some(fault) = Fault::from_word(word) {
+        let (Some(sites), Some(word)) = (out.pop(), out.pop()) else {
+            return Err(GpuError::state(
+                "Head::tokens",
+                "the readback buffer holds no fault words",
+            ));
+        };
+        if let Some(fault) = Fault::from_words(word, sites) {
             return Err(GpuError::Fault {
                 what: "Head::tokens",
                 fault,

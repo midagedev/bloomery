@@ -6,8 +6,14 @@
 //! chain's own drift becomes visible.
 //!
 //! `hw_` prefix: needs the box, the model file and `$BLOOMERY_DATA/ref`.
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "common/prompt.rs"]
+mod prompt;
 
 use model::arch::deepseek2::forward::{argmax, embed, forward_trace};
 
@@ -38,8 +44,8 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> (f32, usize) {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_forward_embed_is_exact() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
 
     let got = embed(&g, &tokens).unwrap();
     let (want, inf) = o.load("inp_embd", 0);
@@ -102,8 +108,8 @@ const LOGIT_REL_TOL: f32 = 5e-2;
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_forward_chain_matches_oracle() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
 
     let t0 = std::time::Instant::now();
     let tr = forward_trace(&g, &tokens).unwrap();

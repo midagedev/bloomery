@@ -14,8 +14,12 @@
 //! `hw_` prefix: needs the box and the model file. It does NOT need the oracle — this
 //! compares our two paths against each other, and `tests/forward.rs` is what ties the
 //! uncached one to ik.
-#[path = "common/oracle.rs"]
-mod oracle;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
+#[path = "common/prompt.rs"]
+mod prompt;
 
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{forward, new_cache, step};
@@ -44,9 +48,8 @@ fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_one_shot_equals_uncached() {
-    let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
 
     let plain = forward(&g, &tokens).unwrap();
     let mut cache = new_cache(&g).unwrap();
@@ -75,9 +78,8 @@ fn hw_kv_one_shot_equals_uncached() {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_incremental_is_bit_exact() {
-    let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
     let split = tokens.len() - 1;
 
     let one_shot = forward(&g, &tokens).unwrap();
@@ -113,9 +115,8 @@ fn hw_kv_incremental_is_bit_exact() {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_kv_every_split_is_bit_exact() {
-    let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
 
     // One reference per prefix length, from the uncached path.
     let refs: Vec<Vec<f32>> = (1..=tokens.len())

@@ -6,7 +6,8 @@
 //!    same rows, bit for bit, for ids 0, 1, the last row and 61 spread
 //!    between them; then every oracle set's `inp_embd` from its `inp_tokens`
 //!    (ik's GET_ROWS through the same dequantizer), bit for bit; an id past
-//!    the table raises `FaultSite::TokenId`, the other rows unchanged.
+//!    the table raises `FaultSite::TokenId` and its row is NaN, every value,
+//!    the other rows unchanged.
 //! 2. Gate·up body: for a sel vector with a repeated id, slot `s` equals
 //!    `q4k_gemv` of expert `sel[s]`'s gate rows and up rows alone, combined
 //!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; a rerun is
@@ -195,16 +196,15 @@ mod gate {
         let bad_ids = [ids[3], n_rows as u32 + 3, ids[4]];
         let y = run(&bad_ids)?;
         let fault = gpu.take_fault()?;
-        let want_fault = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::TokenId as u32,
-        };
+        let want_fault = Fault::at(LAYER_NONE, FaultSite::TokenId);
         let others = bits_equal(&y[..k], &got[3 * k..4 * k])
             && bits_equal(&y[2 * k..3 * k], &got[4 * k..5 * k]);
-        let oor_ok = clean.is_none() && fault == Some(want_fault) && others;
+        let nan = y[k..2 * k].iter().filter(|v| v.is_nan()).count();
+        let oor_ok = clean.is_none() && fault == Some(want_fault) && others && nan == k;
         println!(
             "embed Q4_K id past the table ids={bad_ids:?}: word_before={clean:?} fault=\"{}\" \
-             (want \"{want_fault}\") other_rows_bit_identical={others} {}",
+             (want \"{want_fault}\") other_rows_bit_identical={others} bad_row_nan={nan}/{k} \
+             (want all) {}",
             fault.map_or_else(|| "none".to_owned(), |f| f.to_string()),
             verdict(oor_ok)
         );
@@ -272,10 +272,7 @@ mod gate {
         // valid ids there.
         let layer = 13usize;
         let sink = gpu.layer_sink(layer)?;
-        let want = Some(Fault {
-            layer: u32::try_from(layer)?,
-            code: FaultSite::ExpertId as u32,
-        });
+        let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::ExpertId));
         let before = gpu.fault()?;
         let clean_sel = DeviceBuffer::from_host(stream, &[2u32, 9, 7, 11, 0, 0, 0, 0])?;
         let hc = launch(&clean_sel, sink)?;

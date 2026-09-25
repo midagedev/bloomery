@@ -356,8 +356,9 @@ mod gate {
     ) -> Result<(Vec<u32>, Vec<f32>), GateError> {
         let s = cx.gpu.stream();
         let fd = DeviceBuffer::from_host(s, &[first])?;
-        // The tokens, then the fault word the step's argmax copies after them.
-        let mut tok = DeviceBuffer::<u32>::zeroed(s, m + 1)?;
+        // The tokens, then the fault's word and site mask the step's argmax
+        // copies after them.
+        let mut tok = DeviceBuffer::<u32>::zeroed(s, m + 2)?;
         let mut logits = DeviceBuffer::from_host(s, logits0)?;
         for row in 0..m {
             cx.mk.enqueue_step(
@@ -374,9 +375,14 @@ mod gate {
         }
         s.synchronize()?;
         let mut toks = tok.to_host_vec(s)?;
-        let word = toks.pop().ok_or("no fault word after the tokens")?;
-        if word != FAULT_NONE {
-            return Err(format!("the Markov chain's fault word is {word:#x}, not clean").into());
+        let (Some(sites), Some(word)) = (toks.pop(), toks.pop()) else {
+            return Err("no fault words after the tokens".into());
+        };
+        if word != FAULT_NONE || sites != 0 {
+            return Err(format!(
+                "the Markov chain's fault word is {word:#x} with site mask {sites:#x}, not clean"
+            )
+            .into());
         }
         Ok((toks, logits.to_host_vec(s)?))
     }

@@ -5,7 +5,8 @@
 //! the load-time weight repack, the activation scratch and the enqueue API.
 
 use crate::GpuError;
-use crate::fault::{FaultSink, FaultSite, quad_finite};
+use crate::fault::{FaultSink, FaultSite, LAYER_NONE, quad_finite};
+use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::q8_1_quant_block;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -712,7 +713,9 @@ mod q5_kernels {
     /// An id >= n_experts cannot be rejected by the host contract (it
     /// lives in device memory): the slot's warps return before their first
     /// load — warp-uniform, no divergent branch — leaving that slot of `y`
-    /// untouched and every other slot unaffected.
+    /// untouched and every other slot unaffected. [`HOST`] is a slot the
+    /// host tier serves and raises nothing; any other id past the stack
+    /// raises [`FaultSite::ExpertId`] on `fault` first.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -742,6 +745,7 @@ mod q5_kernels {
         n_experts: u32,
         rows_per_expert: u32,
         n_slots: u32,
+        fault: FaultSink,
         mut y: DisjointSlice<f32>,
     ) {
         let t = thread::index_1d().get() % 256;
@@ -753,11 +757,15 @@ mod q5_kernels {
         // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
         // load is warp-uniform (all 32 lanes of the warp share `row`, hence
         // `slot`), so the out-of-range return below never diverges a warp.
-        let id = unsafe { *sel.get_unchecked(slot) } as usize;
-        if id >= n_experts as usize {
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
             return;
         }
-        let lane = warp::lane_id() as usize;
+        let id = id as usize;
         let f = q5_row_dot(
             w,
             q,
@@ -1001,15 +1009,24 @@ fn pack_q5(bytes: &[u8], k: usize, rows: usize, q5_1: bool) -> Result<Vec<u32>, 
 /// null stream).
 pub struct Q5Kernels {
     module: q5_kernels::LoadedModule,
+    /// The fault word of the `Gpu` that owns the context: what the `_sel`
+    /// gemv's id past the stack raises into.
+    fault: Arc<DeviceBuffer<u32>>,
 }
 
 impl Q5Kernels {
-    /// Load this file's device bundle into `ctx`. Load-time only.
-    pub fn load(ctx: &Arc<CudaContext>) -> Result<Q5Kernels, GpuError> {
+    /// Load this file's device bundle into `ctx`, raising into `word`, the
+    /// fault word of the `Gpu` that owns `ctx` ([`crate::Gpu::fault_word`]);
+    /// a word of another context is refused. Load-time only.
+    pub fn load(
+        ctx: &Arc<CudaContext>,
+        word: &Arc<DeviceBuffer<u32>>,
+    ) -> Result<Q5Kernels, GpuError> {
+        let fault = crate::module_fault_word(ctx, word, "Q5Kernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
         let module = unsafe { q5_kernels::load(ctx)? };
-        Ok(Q5Kernels { module })
+        Ok(Q5Kernels { module, fault })
     }
 
     /// Enqueue the q8 quantization of `x` — `act.m()` columns of `act.k()`
@@ -1235,7 +1252,9 @@ impl Q5Kernels {
     /// `rows_per_expert` (`n_experts = rows/rows_per_expert`). `sel` is a
     /// device buffer of at least `n_slots` ids read by the kernel per
     /// launch, so a captured graph replay picks up new ids written between
-    /// replays; an id >= n_experts leaves that slot of `y` untouched.
+    /// replays; an id >= n_experts leaves that slot of `y` untouched, and
+    /// one that is not [`HOST`] raises [`FaultSite::ExpertId`] on the owning
+    /// `Gpu`'s fault word as an unlabelled launch ([`LAYER_NONE`]).
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_gemv_q5_0_sel(
         &self,
@@ -1312,6 +1331,7 @@ impl Q5Kernels {
             n_experts,
             rows_per_expert,
             n_slots,
+            crate::sink_over(&self.fault, LAYER_NONE),
             y,
         )?;
         Ok(())

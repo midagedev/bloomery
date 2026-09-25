@@ -17,7 +17,8 @@
 //! Real inputs come from the CUDA oracle dump wherever it holds the op's
 //! input; synthetic `activations()` only for shapes the dump cannot supply
 //! (swiglu). Every chain is proven from MANIFEST.tsv (dims + op) before use;
-//! the residual-add operand pairs are proven by element sums. One captured
+//! the residual-add operand pairs are proven by element sums. An embedding id
+//! past the table raises `FaultSite::TokenId` and writes a NaN row. One captured
 //! graph (embed -> rms_norm -> argmax) must replay byte-identically to the
 //! eager sequence.
 //!
@@ -148,6 +149,31 @@ fn run() -> Result<(), GateError> {
         let pass = exact && rel == 0.0 && rerun;
         println!(
             "shape op=embed ty=q3_K K=2048 vocab={vocab} m={m} max_rel_err={rel:.3e} bit_exact_host={exact} bit_identical_rerun={rerun} ik_rel={ik_rel:.3e} {}",
+            verdict(pass)
+        );
+        if !pass {
+            ok = false;
+        }
+
+        // An id past the table: the named fault, a NaN row, the other rows
+        // unchanged.
+        let clean = gpu.take_fault()?;
+        let bad = [PROMPT[1], u32::try_from(vocab)? + 3, PROMPT[2]];
+        let bad_dev = DeviceBuffer::from_host(stream, &bad)?;
+        let mut yb = DeviceBuffer::<f32>::zeroed(stream, bad.len() * 2048)?;
+        elem.enqueue_embed_rows(stream, &emb_dev, &bad_dev, &mut yb)?;
+        let yb = yb.to_host_vec(stream)?;
+        let fault = gpu.take_fault()?;
+        let want =
+            bloomery_gpu::Fault::at(bloomery_gpu::LAYER_NONE, bloomery_gpu::FaultSite::TokenId);
+        let nan = yb[2048..4096].iter().filter(|v| v.is_nan()).count();
+        let others =
+            bits_equal(&yb[..2048], &y[2048..4096]) && bits_equal(&yb[4096..], &y[4096..6144]);
+        let pass = clean.is_none() && fault == Some(want) && nan == 2048 && others;
+        println!(
+            "shape op=embed ty=q3_K id past the table ids={bad:?}: word_before={clean:?} fault=\"{}\" \
+             (want \"{want}\") bad_row_nan={nan}/2048 (want all) other_rows_bit_identical={others} {}",
+            fault.map_or_else(|| "none".to_owned(), |f| f.to_string()),
             verdict(pass)
         );
         if !pass {

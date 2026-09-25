@@ -92,7 +92,7 @@ fn run() -> Result<(), GateError> {
     // The same file as the one split the architecture's derive reads.
     let file = Split::open(ref_model_path()?)?;
     let gpu = Gpu::new()?;
-    let q5 = Q5Kernels::load(gpu.context())?;
+    let q5 = Q5Kernels::load(gpu.context(), gpu.fault_word())?;
     let q8f32 = Q8F32Kernels::load(gpu.context())?;
     let stream = gpu.stream();
     let mut ok = true;

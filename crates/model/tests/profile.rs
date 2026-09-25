@@ -24,8 +24,12 @@
 //! hold anything specific — the oracle is used only as the shared prompt, the same
 //! one every other gate runs, so the bit-identity claim is about the prompt that
 //! matters.
-#[path = "common/oracle.rs"]
-mod oracle;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
+#[path = "common/prompt.rs"]
+mod prompt;
 
 use model::arch::deepseek2::derived::Derived;
 use model::arch::deepseek2::forward::{argmax, forward, new_cache, step};
@@ -42,9 +46,8 @@ fn hw_profile_child_logits() {
         eprintln!("child helper: no BLOOMERY_PROFILE_CHILD_DUMP, nothing to do");
         return;
     };
-    let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
     let logits = forward(&g, &tokens).unwrap();
     let bytes: Vec<u8> = logits.data.iter().flat_map(|v| v.to_le_bytes()).collect();
     std::fs::write(&dump, bytes).unwrap();
@@ -136,9 +139,8 @@ fn hw_profile_gate() {
     // so no thread can read the environment while this writes it.
     unsafe { std::env::set_var("BLOOMERY_PROFILE", "2") };
 
-    let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let tokens: Vec<u32> = o.tokens.iter().map(|&t| t as u32).collect();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let tokens: Vec<u32> = prompt::tokens();
 
     // The prefill fills the cache; its profile lands in the accumulators too, so it
     // is dropped — the coverage claim is about one decode step, not a mixture.

@@ -24,6 +24,10 @@
 //! `hw_` prefix: needs the box and the model file. Like `tests/kv.rs`, this
 //! compares our paths against each other — `tests/attn.rs` and
 //! `tests/forward.rs` are what tie them to ik.
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
 
@@ -72,7 +76,7 @@ fn reference_wblocks(
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_derived_wblocks_bit_identical() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let d = Derived::new(&g).unwrap();
     let n_block = g.block_count().unwrap() as usize;
 
@@ -134,7 +138,7 @@ fn hw_derived_wblocks_bit_identical() {
 #[test]
 #[ignore = "hw: needs the box and the model file"]
 fn hw_derived_all_blocks_all_heads_filled() {
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let d = Derived::new(&g).unwrap();
     let n_block = g.block_count().unwrap() as usize;
     let p0 = MlaParams::read(&g, 0).unwrap();

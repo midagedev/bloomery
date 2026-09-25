@@ -481,12 +481,7 @@ fn serve_cmd<B: ChainBody>(
         Cmd::Prefill(ids) => {
             let refuse =
                 |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
-            if ids.is_empty() || at + ids.len() > g.ctx_max() {
-                return Err(refuse(format!(
-                    "the ids must be at least one and fit the context {}",
-                    g.ctx_max()
-                )));
-            }
+            g.check_feed(ids.len()).map_err(refuse)?;
             prefill(g.model_mut(), &ids)
                 .map(|a| (a, None))
                 .map_err(|e| refuse(e.to_string()))

@@ -11,9 +11,9 @@
 //! `first[0]` (the block's last accepted token), row `c > 0`'s from `tok[c -
 //! 1]`, the argmax the step wrote for row `c - 1`. An id at or past
 //! `n_vocab` (only `first[0]` can hold one: the argmax's are below the
-//! vocabulary) raises `FaultSite::TokenId` and reads row 0 so the access
-//! stays in bounds — that row's correction is no value the pass trusts, the
-//! pass's readback carries the fault.
+//! vocabulary) raises `FaultSite::TokenId`, reads no `w1` word, and makes
+//! the row's correction NaN, so every logit of that row is NaN — no value the
+//! pass could take for a draft; the pass's readback carries the fault.
 //!
 //! The numeric rule `ds41_markov` holds, and the gate transcribes on the host:
 //! bf16 widens to f32 as `bits << 16` (exact), and the dot for entry `v` is
@@ -26,8 +26,9 @@
 //! all `m` rows ([`MarkovKernels::enqueue_step`]): rows below `c` are
 //! unchanged since their own step and give the same tokens again; rows above
 //! `c` write a token their own step overwrites. The argmax copies the card's
-//! fault word to `tok[m]` after the tokens, so the last step's readback of
-//! `tok[..=m]` carries every fault the pass raised.
+//! fault to `tok[m]` (the first-layer word) and `tok[m + 1]` (its layer's
+//! site mask) after the tokens, so the last step's readback of `tok[..m +
+//! 2]` carries every fault the pass raised.
 
 use bloomery_gpu::elem::ElemKernels;
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
@@ -99,7 +100,7 @@ mod markov_kernels {
     /// gathers the previous token's `w1` row into shared memory, widened, and
     /// thread `v` adds `w2[v] · e` into `logits[v * m + row]`. A previous
     /// token past the vocabulary raises [`FaultSite::TokenId`] on `fault`
-    /// (thread 0 of the grid) and reads row 0.
+    /// (thread 0 of the grid) and gathers NaN instead of a row.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -146,18 +147,18 @@ mod markov_kernels {
                     *tok.get_unchecked(row as usize - 1)
                 }
             };
-            let p = if p < n_vocab {
-                p as usize
+            let (lo, hi) = if p < n_vocab {
+                // SAFETY: p < n_vocab, so word p*128 + tid < 128*n_vocab <=
+                // w1.len().
+                bf16_pair(unsafe { *w1.get_unchecked(p as usize * MARKOV_ROW_WORDS + tid) })
             } else {
                 if thread::index_1d().get() == 0 {
                     fault.raise(FaultSite::TokenId);
                 }
-                0
+                (f32::NAN, f32::NAN)
             };
-            // SAFETY: p < n_vocab, so word p*128 + tid < 128*n_vocab <=
-            // w1.len(); the two slots are this thread's.
+            // SAFETY: the two slots are this thread's.
             unsafe {
-                let (lo, hi) = bf16_pair(*w1.get_unchecked(p * MARKOV_ROW_WORDS + tid));
                 *e.add(2 * tid) = lo;
                 *e.add(2 * tid + 1) = hi;
             }
@@ -276,8 +277,8 @@ impl MarkovKernels {
 
     /// One Markov step: [`Self::enqueue_add`] for row `row`, then
     /// `argmax_rows_fault` over the `m` rows into `tok[..m]` and `fault`'s
-    /// word into `tok[m]` (`tok` holds `m + 1`) — `tok[row]` is then row
-    /// `row + 1`'s previous token. `fault` is also what the correction's
+    /// two words into `tok[m..m + 2]` (`tok` holds `m + 2`) — `tok[row]` is
+    /// then row `row + 1`'s previous token. `fault` is also what the correction's
     /// out-of-vocabulary previous token raises into. Asynchronous,
     /// allocation-free, capturable.
     #[allow(

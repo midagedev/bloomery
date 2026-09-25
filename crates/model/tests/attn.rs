@@ -23,6 +23,12 @@
 //! two-partial chain — ULP-scale off ik's bits, banded against the scalar path by
 //! `hw_flash_simd_bands_against_scalar` and by the dispatch leg of the exact-input
 //! test.
+#[path = "common/asserts.rs"]
+mod asserts;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
 
@@ -53,7 +59,7 @@ fn check(o: &oracle::Oracle, got: &Tensor2, name: &str, occ: u32, what: &str, to
         folded(&winf.ne),
         "{what}: shape must match the reference before the values can mean anything"
     );
-    oracle::assert_close(&got.data, &want, tol, what);
+    asserts::assert_close(&got.data, &want, tol, what);
 }
 
 /// The bound [`check_confined`] enforces, one field per term of its contract.
@@ -122,7 +128,7 @@ fn check_confined(
 }
 
 fn check_block(o: &oracle::Oracle, n: usize) {
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let tr = run_block(o, &g, n);
 
     // The eight contract tensors, in computation order. Occurrences verified against
@@ -240,7 +246,7 @@ fn hw_attn_exact_input_stages() {
     };
 
     for blk in [0usize, 1usize] {
-        let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+        let g = gguf::Gguf::open(model_path::model_path()).unwrap();
         let p = attn::MlaParams::read(&g, blk).unwrap();
         let wkb = g.find(&format!("blk.{blk}.attn_kv_b.weight")).unwrap();
         let n_tok = 6usize;
@@ -315,7 +321,7 @@ fn hw_attn_exact_input_stages() {
             [want.ne0, want.ne1],
             "stage B shape"
         );
-        oracle::assert_close(
+        asserts::assert_close(
             &kqv_scalar.data,
             &want.data,
             0.0,
@@ -351,7 +357,7 @@ fn hw_attn_exact_input_stages() {
             }
         }
         let band = 2.0 * p.kq_scale * delta * n_tok as f32 * (v_hi - v_lo);
-        oracle::assert_close(&kqv.data, &want.data, band, "stage B simd: banded");
+        asserts::assert_close(&kqv.data, &want.data, band, "stage B simd: banded");
 
         // C: wv_b (Q3_K view) + output projection — generic `matmul_q` order slack.
         let kqv_exact = load2(&format!("kqv_compressed-{blk}"), 0);
@@ -377,7 +383,7 @@ fn hw_attn_exact_input_stages() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_heads_fused_bit_identical() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let blk = 0usize;
     let p = attn::MlaParams::read(&g, blk).unwrap();
     let derived = Derived::new(&g).unwrap();
@@ -477,7 +483,7 @@ fn hw_attn_heads_fused_bit_identical() {
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_attn_heads_split_bit_identical() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let blk = 0usize;
     let p = attn::MlaParams::read(&g, blk).unwrap();
     let derived = Derived::new(&g).unwrap();
@@ -1490,7 +1496,7 @@ fn hw_attn_split_k_threads_child() {
         return;
     };
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let blk = 0usize;
     let p = attn::MlaParams::read(&g, blk).unwrap();
     let derived = Derived::new(&g).unwrap();
@@ -1593,7 +1599,7 @@ const BUNDLE_CASES: [(usize, u64); 3] =
 /// `max |kq_dot_simd − kq_dot_fa4|` (`kq_dot_simd` follows the lever).
 /// Also `max|V|` over every case's cache.
 fn bundle_outputs(o: &oracle::Oracle) -> (Vec<Tensor2>, f32, f32) {
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let blk = 0usize;
     let p = attn::MlaParams::read(&g, blk).unwrap();
     let derived = Derived::new(&g).unwrap();
@@ -1715,7 +1721,7 @@ fn hw_attn_bundle_bands_against_per_head() {
     assert_eq!(vals.len(), total + 1, "child output length");
     let delta1 = vals[total];
 
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let p = attn::MlaParams::read(&g, 0).unwrap();
     let u = 2.0f32.powi(-24);
     let eps = p.kq_scale * (delta8 + delta1);

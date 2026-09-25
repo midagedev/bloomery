@@ -13,6 +13,7 @@ generate_ds41   argmax                                  0          0
 generate_ds41   argmax_fault                            0          0
 generate_ds41   argmax_rows                             0          0
 generate_ds41   argmax_rows_fault                       0          0
+generate_ds41   card_sel                                0          0
 generate_ds41   dflash_expert_down                      0          0
 generate_ds41   dflash_expert_gate_up                   0          0
 generate_ds41   dflash_quantize_q8_1                    0          0
@@ -158,6 +159,7 @@ gate_e2e        argmax                                  0          0
 gate_e2e        argmax_fault                            0          0
 gate_e2e        argmax_rows                             0          0
 gate_e2e        argmax_rows_fault                       0          0
+gate_e2e        card_sel                                0          0
 gate_e2e        down_add_q5_1                           0          0
 gate_e2e        embed_rows                              0          0
 gate_e2e        embed_rows_q4k                          0          0

@@ -260,10 +260,7 @@ fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, Gate
         gpu.enqueue_gemv_q3k(&w, act, &mut y)?;
         Ok(y.to_host_vec(stream)?)
     };
-    let want = |site: FaultSite| Fault {
-        layer: LAYER_NONE,
-        code: site as u32,
-    };
+    let want = |site: FaultSite| Fault::at(LAYER_NONE, site);
     let base = activations(K, 1, 1);
     let planted = |lanes: std::ops::Range<usize>, v: f32| {
         let mut x = base.clone();
@@ -327,7 +324,7 @@ fn quant_faults(gpu: &bloomery_gpu::Gpu, gguf: &gguf::Gguf) -> Result<bool, Gate
     ok &= pass;
 
     // The Q5 path's 32-value quantizer, the same planted lane.
-    let q5 = Q5Kernels::load(gpu.context())?;
+    let q5 = Q5Kernels::load(gpu.context(), gpu.fault_word())?;
     let mut act32 = Q8Blocks32::new(stream, K, 1)?;
     q5.enqueue_quantize_q8(stream, &x_dev, &mut act32, gpu.unlabelled_sink())?;
     let got = gpu.take_fault()?;

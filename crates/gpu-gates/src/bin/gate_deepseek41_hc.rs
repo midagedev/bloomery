@@ -1249,10 +1249,7 @@ mod gate {
         cx.hck
             .enqueue_pre(stream, &a, &mut cx.scratch, &mut mixes, &mut hc)?;
         let got = cx.gpu.take_fault()?;
-        let want = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::HcQuant as u32,
-        };
+        let want = Fault::at(LAYER_NONE, FaultSite::HcQuant);
         let pass = clean.is_none() && got == Some(want);
         println!(
             "fault site=L{}{} T={t} value 777 NaN: before={} want=hc_quant got={} {}",

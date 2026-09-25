@@ -104,7 +104,7 @@ mod gate {
         Ok(act)
     }
 
-    /// One head readback: the logits and the (token, fault word) pair.
+    /// One head readback: the logits and the (token, fault word, site mask) triple.
     struct HeadRun {
         logits: Vec<f32>,
         out: Vec<u32>,
@@ -116,7 +116,7 @@ mod gate {
         let stream = gpu.stream();
         let n = w.rows();
         let mut y = DeviceBuffer::from_host(stream, &vec![SENT; n])?;
-        let mut out = DeviceBuffer::from_host(stream, &[7u32, 7])?;
+        let mut out = DeviceBuffer::from_host(stream, &[7u32, 7, 7])?;
         gpu.enqueue_gemv_q6k(w, act, &mut y)?;
         gpu.elem()
             .enqueue_argmax_fault(stream, &y, n, gpu.unlabelled_sink(), &mut out)?;
@@ -139,7 +139,7 @@ mod gate {
         let stream = gpu.stream();
         let n = w.rows();
         let mut y = DeviceBuffer::from_host(stream, &vec![SENT; n])?;
-        let mut out = DeviceBuffer::from_host(stream, &[7u32, 7])?;
+        let mut out = DeviceBuffer::from_host(stream, &[7u32, 7, 7])?;
         hk.enqueue(stream, w, act, gpu.unlabelled_sink(), &mut y, st, &mut out)?;
         stream.synchronize()?;
         let run = HeadRun {
@@ -255,7 +255,7 @@ mod gate {
         // The graph: one node, two replays equal to the eager launch.
         let eager = head_ref(gpu, &w, &act)?;
         let mut yg = DeviceBuffer::from_host(stream, &vec![SENT; n])?;
-        let mut og = DeviceBuffer::from_host(stream, &[7u32, 7])?;
+        let mut og = DeviceBuffer::from_host(stream, &[7u32, 7, 7])?;
         let graph = gpu.capture(|s| {
             hk.enqueue(
                 s,
@@ -292,7 +292,7 @@ mod gate {
         let r = head_ref(gpu, &w, &act_f)?;
         let (f, seed) = head_fused(gpu, &hk, &mut st, &w, &act_f)?;
         gpu.clear_fault()?;
-        let raised = Fault::from_word(r.out[1]).is_some();
+        let raised = Fault::from_words(r.out[1], r.out[2]).is_some();
         let pass = raised && f.out == r.out && seed;
         println!(
             "head_argmax case=fault-word fused={:?} shared={:?} raised={raised} (want raised, equal) \
@@ -354,10 +354,7 @@ mod gate {
         // host-served slot and raises nothing. Taking the word here also
         // leaves it clean for the head's fault-word case below.
         let fault = gpu.take_fault()?;
-        let want_fault = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::ExpertId as u32,
-        };
+        let want_fault = Fault::at(LAYER_NONE, FaultSite::ExpertId);
         let untouched = |s: usize| {
             yo[s * rpe..(s + 1) * rpe]
                 .iter()

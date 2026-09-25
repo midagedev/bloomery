@@ -2,6 +2,12 @@
 //! four rounds fail for a reason that is not theirs.
 //!
 //! `hw_` prefix: needs the box (the model file and the oracle set), excluded by default.
+#[path = "common/asserts.rs"]
+mod asserts;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
 
@@ -19,7 +25,7 @@ static SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_rms_norm_matches_ggml() {
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     let (inp, inf) = o.load("inp_embd", 0);
     let x = Tensor2::from_vec(inf.ne[0] as usize, inf.ne[1] as usize, inp);
@@ -42,7 +48,7 @@ fn hw_rms_norm_matches_ggml() {
     // PIN(2026-09-21): 1e-4 -> exact. The norm now sums f32 squares in f64 and
     // multiplies `(scale · gain) · x`, the reference's fused norm; the f32 sum
     // with `(x · scale) · gain` it replaced sat 3.4e-5 away and fails this line.
-    oracle::assert_close(&got.data, &want, 0.0, "rms_norm -> attn_norm-0");
+    asserts::assert_close(&got.data, &want, 0.0, "rms_norm -> attn_norm-0");
 }
 
 #[test]
@@ -50,7 +56,7 @@ fn hw_rms_norm_matches_ggml() {
 fn hw_matmul_q_matches_ggml() {
     let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     let (xs, xinf) = o.load("attn_norm-0", 0);
     let x = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
@@ -68,7 +74,7 @@ fn hw_matmul_q_matches_ggml() {
     );
     // 1e-4 on values that reach 18: the residual is f32 accumulation order
     // against ggml's integer sum.
-    oracle::assert_close(&got.data, &want, 1e-4, "matmul_q -> q-0");
+    asserts::assert_close(&got.data, &want, 1e-4, "matmul_q -> q-0");
 }
 
 /// The dispatch proof for the qdot wiring: `matmul_q` must route Q3_K with k
@@ -86,7 +92,7 @@ fn hw_matmul_q_matches_ggml() {
 fn hw_matmul_q_q3k_fused_dispatch() {
     let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     // Same input as hw_matmul_q_matches_ggml: attn_norm-0 through blk.0.attn_q.
     let (xs, xinf) = o.load("attn_norm-0", 0);
@@ -231,7 +237,7 @@ fn hw_matmul_q_batch_matches_sequential() {
     // stacks) with the shapes that actually differ between pairs (bucket
     // sizes — here 2 and 5 columns, mixed on purpose so a pair that read its
     // neighbor's activations fails on length alone).
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     // Slice the expert stack exactly the way moe.rs's expert_view does; the
     // test rebuilds it because the batch must equal the sequential view, not
@@ -330,7 +336,7 @@ fn hw_matmul_q_batch_matches_sequential() {
 fn hw_matmul_q_group_matches_sequential() {
     let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     let (xs, xinf) = o.load("attn_norm-0", 0);
     let x6 = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
@@ -516,7 +522,7 @@ fn hw_matmul_q_group_matches_sequential() {
 fn hw_group_defer_matches_inline() {
     let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let (xs, xinf) = o.load("attn_norm-0", 0);
     let x6 = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
     let colset = |idx: &[usize]| {
@@ -608,7 +614,7 @@ fn hw_group_defer_matches_inline() {
 fn hw_group_swiglu_matches_caller_composition() {
     let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
     let (xs, xinf) = o.load("ffn_norm-1", 0);
     let xall = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
     let colset = |idx: &[usize]| {
@@ -724,8 +730,8 @@ fn hw_group_into_matches_allocating_entries() {
 
     let _slots = SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let o = oracle::Oracle::open();
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
-    let split = gguf::Split::open(oracle::model_path()).unwrap();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
+    let split = gguf::Split::open(model_path::model_path()).unwrap();
     let (xs, xinf) = o.load("ffn_norm-1", 0);
     let xall = Tensor2::from_vec(xinf.ne[0] as usize, xinf.ne[1] as usize, xs);
     let x1 = Tensor2::from_vec(xall.ne0, 1, xall.col(0).to_vec());

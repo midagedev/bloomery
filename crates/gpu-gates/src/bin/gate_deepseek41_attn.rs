@@ -1904,10 +1904,7 @@ mod gate {
         let y =
             Launch::new(stream, &inputs, gpu.unlabelled_sink())?.run(kernels, stream, set.scale)?;
         let got = gpu.take_fault()?;
-        let want = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::AttnSel as u32,
-        };
+        let want = Fault::at(LAYER_NONE, FaultSite::AttnSel);
         let pass = got == Some(want);
         println!(
             "depth keys=sel/{DEPTH_SEL_STRIDE} past_stream_entry={rows} (comp_rows {rows}) \

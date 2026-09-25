@@ -6,8 +6,10 @@
 //! - structure: the captured step's node count and node kinds are the
 //!   all-card step's plus the boundary's per routed layer — the handoff copy
 //!   (memcpy), the go and the wait (two batch memops), the join (one kernel),
-//!   and, with experts on the card, the zeroing of their outputs (memset);
-//!   with none on the card the two `_sel` launches drop out.
+//!   and, with experts on the card, the zeroing of their outputs (memset) and
+//!   the card's slot list (one kernel: a host slot written as `HOST`, which
+//!   the `_sel` kernels skip without a fault); with none on the card the two
+//!   `_sel` launches drop out.
 //! - eager = replay: the same tokens stepped eagerly and by graph replay give
 //!   bit-identical logits at every step of two prompts plus `GEN_STEPS`
 //!   generated tokens. A stale host sum or a missing wait breaks it.
@@ -510,9 +512,11 @@ mod gate {
         let nodes = h.capture_step()?;
         let (hk, ho) = kinds(&h.step_graph_nodes()?);
         let r = routed as i64;
+        // With experts on the card each routed layer adds two kernels (the
+        // join and the card's slot list, host slots as HOST).
         let want = if n_l > 0 {
             [
-                a_kinds.0[0] + r,
+                a_kinds.0[0] + 2 * r,
                 a_kinds.0[1] + r,
                 a_kinds.0[2] + r,
                 a_kinds.0[3] + 2 * r,

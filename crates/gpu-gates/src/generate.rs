@@ -137,22 +137,28 @@ impl<B: ChainBody> Generator<B> {
 
     /// Feed `ids` from the current position, one real step per id, and
     /// return the argmax after the last. Refused before any step when the
-    /// ids do not fit the context.
+    /// ids do not fit the context ([`Generator::check_feed`]).
     pub fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        if ids.is_empty() {
+        self.check_feed(ids.len())?;
+        Ok(self.model.step(ids)?)
+    }
+
+    /// Whether a feed of `n` ids may start at the current position: at
+    /// least one, and all inside the context. The one owner of that check
+    /// for every feed of this generator, [`Generator::prefill`] and a
+    /// body's own prompt feed alike.
+    pub fn check_feed(&self, n: usize) -> Result<(), String> {
+        if n == 0 {
             return Err("prefill: no ids to feed".into());
         }
-        let end = usize::try_from(self.model.pos())? + ids.len();
-        if end > self.ctx {
+        if self.pos() + n > self.ctx {
             return Err(format!(
-                "prefill: position {} + {} ids exceed the context {}",
-                self.model.pos(),
-                ids.len(),
+                "prefill: position {} + {n} ids exceed the context {}",
+                self.pos(),
                 self.ctx
-            )
-            .into());
+            ));
         }
-        Ok(self.model.step(ids)?)
+        Ok(())
     }
 
     /// One step on `tok` at the current position; the argmax after it.

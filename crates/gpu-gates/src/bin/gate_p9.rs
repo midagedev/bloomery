@@ -17,7 +17,7 @@
 //! u32::MAX) in device slots: the bad slot's output must stay untouched
 //! (sentinel) and every other slot bit-identical; `q3k_gemv_sel` raises
 //! `FaultSite::ExpertId` for id 64 and nothing for u32::MAX (`hybrid::HOST`,
-//! a host-served slot), and `q5_0_gemv_sel` raises nothing.
+//! a host-served slot), and so does `q5_0_gemv_sel`.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -64,7 +64,7 @@ fn run() -> Result<(), GateError> {
     let mut ok = true;
     let gguf = open_model()?;
     let gpu = Gpu::new()?;
-    let q5 = Q5Kernels::load(gpu.context())?;
+    let q5 = Q5Kernels::load(gpu.context(), gpu.fault_word())?;
     let stream = gpu.stream();
 
     // ------------------------------------------------ Q3_K: ffn_gate_exps
@@ -187,11 +187,7 @@ fn run() -> Result<(), GateError> {
         stream.synchronize()?;
         let y = y_dev.to_host_vec(stream)?;
         let fault = gpu.take_fault()?;
-        let fault_ok = fault
-            == Some(Fault {
-                layer: LAYER_NONE,
-                code: FaultSite::ExpertId as u32,
-            });
+        let fault_ok = fault == Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
         let (mut good_same, mut bad_untouched) = (true, true);
         for (s, &id) in SEL_OOR.iter().enumerate() {
             if (id as usize) < nexp3 {
@@ -308,9 +304,12 @@ fn run() -> Result<(), GateError> {
     {
         let sel_dev = DeviceBuffer::from_host(stream, &SEL_OOR)?;
         let mut y_dev = DeviceBuffer::from_host(stream, &vec![SENT; N_SLOTS * rpe5])?;
+        let clean = gpu.take_fault()?;
         q5.enqueue_gemv_q5_0_sel(stream, &w5_dev, &act5, &sel_dev, N_SLOTS, rpe5, &mut y_dev)?;
         stream.synchronize()?;
         let y = y_dev.to_host_vec(stream)?;
+        let fault = gpu.take_fault()?;
+        let fault_ok = clean.is_none() && fault == Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
         let (mut good_same, mut bad_untouched) = (true, true);
         for (s, &id) in SEL_OOR.iter().enumerate() {
             if (id as usize) < nexp5 {
@@ -326,9 +325,10 @@ fn run() -> Result<(), GateError> {
                 );
             }
         }
-        let pass = good_same && bad_untouched;
+        let pass = good_same && bad_untouched && fault_ok;
         println!(
-            "q5_oor good_slots_bit_identical={good_same} bad_slots_untouched={bad_untouched} {}",
+            "q5_oor good_slots_bit_identical={good_same} bad_slots_untouched={bad_untouched} \
+             word_before={clean:?} fault={fault:?} (want expert_id)={fault_ok} {}",
             verdict(pass)
         );
         if !pass {
@@ -342,7 +342,7 @@ fn run() -> Result<(), GateError> {
     println!(
         "PASSED: gate_p9 _sel outputs bit-identical to the per-expert kernels slot by slot; \
          graph replay follows ids overwritten between replays; out-of-range ids leave their \
-         slots untouched, q3k's id past the stack raising expert_id"
+         slots untouched, q3k's and q5_0's id past the stack raising expert_id"
     );
     Ok(())
 }

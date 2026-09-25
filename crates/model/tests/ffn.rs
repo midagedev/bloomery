@@ -2,8 +2,16 @@
 //! against the oracle's staged tensors.
 //!
 //! `hw_` prefix: needs the box (the model file and the oracle set), excluded by default.
+#[path = "common/asserts.rs"]
+mod asserts;
+#[path = "common/manifest.rs"]
+mod manifest;
+#[path = "common/model_path.rs"]
+mod model_path;
 #[path = "common/oracle.rs"]
 mod oracle;
+#[path = "common/prompt.rs"]
+mod prompt;
 
 use model::arch::deepseek2::plan::{dense_ffn, dense_ffn_up_gate};
 use model::ops::Tensor2;
@@ -16,21 +24,24 @@ fn load_input(o: &oracle::Oracle, name: &str) -> Tensor2 {
 /// The manifest's token line is what distinguishes the 6-token graph (1155
 /// tensors) from the 1-token graph (1101) — a gate that skips this can compare
 /// the right names from the wrong graph while staying green (`docs/oracle.md`).
-fn check_tokens(o: &oracle::Oracle) {
+fn check_tokens() {
     assert_eq!(
-        o.tokens,
+        prompt::tokens(),
         vec![100000, 549, 6077, 280, 7239, 317],
         "oracle token sequence must be the fixed six-token run"
     );
-    eprintln!("oracle model: {}", o.model);
+    eprintln!(
+        "oracle model: {} (the file the gates open)",
+        model_path::model_path()
+    );
 }
 
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_dense_ffn_block0_matches_ggml() {
     let o = oracle::Oracle::open();
-    check_tokens(&o);
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    check_tokens();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     // The intermediate width is the file's, not a literal (cf. the ops gate,
     // where eps comes from the file and never from a literal).
@@ -53,7 +64,7 @@ fn hw_dense_ffn_block0_matches_ggml() {
         "ffn_up_gate-0 must be the fused gate/up product"
     );
     assert_eq!(up.ne0 as u64, ff_len);
-    oracle::assert_close(
+    asserts::assert_close(
         &up.data,
         &want_up,
         1e-4,
@@ -71,15 +82,15 @@ fn hw_dense_ffn_block0_matches_ggml() {
         out_inf.op, "MUL_MAT",
         "ffn_out-0 must be the down projection"
     );
-    oracle::assert_close(&out.data, &want_out, 1e-4, "dense_ffn -> ffn_out-0");
+    asserts::assert_close(&out.data, &want_out, 1e-4, "dense_ffn -> ffn_out-0");
 }
 
 #[test]
 #[ignore = "hw: needs the box, the model file and $BLOOMERY_DATA/ref"]
 fn hw_dense_ffn_shexp_block1_matches_ggml() {
     let o = oracle::Oracle::open();
-    check_tokens(&o);
-    let g = gguf::Gguf::open(oracle::model_path()).unwrap();
+    check_tokens();
+    let g = gguf::Gguf::open(model_path::model_path()).unwrap();
 
     // 2 shared experts × 1408, from the file's own keys.
     let shared = g
@@ -109,7 +120,7 @@ fn hw_dense_ffn_shexp_block1_matches_ggml() {
         "ffn_up_gate-1 must be the fused gate/up product"
     );
     assert_eq!(up.ne0 as u64, shared * expert_ff);
-    oracle::assert_close(
+    asserts::assert_close(
         &up.data,
         &want_up,
         1e-4,
@@ -127,5 +138,5 @@ fn hw_dense_ffn_shexp_block1_matches_ggml() {
         out_inf.op, "MUL_MAT",
         "ffn_shexp-1 must be the down projection"
     );
-    oracle::assert_close(&out.data, &want_out, 1e-4, "dense_ffn shexp -> ffn_shexp-1");
+    asserts::assert_close(&out.data, &want_out, 1e-4, "dense_ffn shexp -> ffn_shexp-1");
 }

@@ -36,8 +36,9 @@ pub struct DraftHead {
     /// The quantized rows, one scratch per width (`Q8Act` fixes its rows).
     acts: Vec<Q8Act>,
     logits: DeviceBuffer<f32>,
-    /// Each row's argmax, then the fault word at `tok[m]`; after the loop,
-    /// the block's proposal. `max_width + 1` words.
+    /// Each row's argmax, then the fault's first-layer word at `tok[m]` and
+    /// its layer's site mask at `tok[m + 1]`; after the loop, the block's
+    /// proposal. `max_width + 2` words.
     tok: DeviceBuffer<u32>,
     markov: MarkovKernels,
     n_embd: usize,
@@ -75,7 +76,7 @@ impl DraftHead {
             normed: DeviceBuffer::zeroed(s, max_width * hp.n_embd)?,
             acts,
             logits: DeviceBuffer::zeroed(s, max_width * n_vocab)?,
-            tok: DeviceBuffer::zeroed(s, max_width + 1)?,
+            tok: DeviceBuffer::zeroed(s, max_width + 2)?,
             markov: MarkovKernels::load(gpu.context())?,
             n_embd: hp.n_embd,
             n_vocab,
@@ -173,13 +174,13 @@ impl DraftHead {
         Ok(self.logits.to_host_vec(stream)?[..m * self.n_vocab].to_vec())
     }
 
-    /// The `m` rows' proposal. Blocking. A fault word the last step copied
-    /// is [`GpuError::Fault`], not a proposal; the word stays raised on the
-    /// card until the `Gpu`'s owner clears it.
+    /// The `m` rows' proposal. Blocking. A fault the last step copied is
+    /// [`GpuError::Fault`], not a proposal; it stays raised on the card until
+    /// the `Gpu`'s owner clears it.
     pub fn tokens(&self, stream: &CudaStream, m: usize) -> Result<Vec<u32>, GpuError> {
         self.check(m)?;
         let out = self.tok.to_host_vec(stream)?;
-        if let Some(fault) = Fault::from_word(out[m]) {
+        if let Some(fault) = Fault::from_words(out[m], out[m + 1]) {
             return Err(GpuError::Fault {
                 what: "draft::head::tokens",
                 fault,

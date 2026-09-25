@@ -74,7 +74,9 @@
 //! for the three `_sel` gemvs, where an id past the stack raises
 //! `FaultSite::ExpertId` and a host-served slot (`hybrid::HOST`) raises
 //! nothing; and the host API's refusals (type, K, slot count, row count,
-//! unfilled table, token shape, activation capacity).
+//! unfilled table, token shape, activation capacity). Last, the fault's site
+//! mask: two sites raised in one layer after a third in a later layer are
+//! all the first layer's mask holds, on the card and in the argmax's copy.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -698,10 +700,7 @@ mod gate {
         }
         let gpu = dev.gpu;
         let (k, rows, n_exp) = (2048usize, 256usize, 16usize);
-        let want_id = Fault {
-            layer: LAYER_NONE,
-            code: FaultSite::ExpertId as u32,
-        };
+        let want_id = Fault::at(LAYER_NONE, FaultSite::ExpertId);
         let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
         let mut ok = true;
         for (ty, input, seed) in [
@@ -760,6 +759,87 @@ mod gate {
             ok &= pass;
         }
         Ok(ok)
+    }
+
+    /// The fault's site mask: three launches raise, the first in time on
+    /// layer 9 (`norm_quant` over a NaN column: [`FaultSite::NormQuant`]),
+    /// then two on layer 3 (the GEMM quantizer over a NaN column,
+    /// [`FaultSite::QuantColumn`], and the route over an id past the stack,
+    /// [`FaultSite::ExpertId`]). The fault names layer 3, the smaller code
+    /// there and a mask of exactly those two sites — layer 9's site is not in
+    /// it — both read from the card's words and through the argmax copy the
+    /// head's readback makes (token, word, mask).
+    fn site_mask(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("fault") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let (k, rows, n_exp, top_k) = (2048usize, 256usize, 16usize, 4usize);
+        let st = Stack {
+            name: "site_mask".into(),
+            ty: GemmWeight::Q4K,
+            bytes: synthetic(GemmWeight::Q4K, n_exp * rows * k / 256, 0x0fa3).into(),
+            n_exp,
+            rows,
+            k,
+            input: Input::Shared(top_k),
+        };
+        let mut res = dev.resident(&st)?;
+        let clean = gpu.take_fault()?;
+        // Layer 9 first: a later layer raised earlier in time.
+        let mut xn = activations(k, 1, 997);
+        xn[11] = f32::NAN;
+        let xn = DeviceBuffer::from_host(stream, &xn)?;
+        let gain = DeviceBuffer::from_host(stream, &vec![1.0f32; k])?;
+        let mut normed = DeviceBuffer::<f32>::zeroed(stream, k)?;
+        let fused = bloomery_gpu::fused::FusedKernels::load(gpu.context())?;
+        fused.enqueue_norm_quant(
+            stream,
+            &xn,
+            &gain,
+            1e-6,
+            &mut res.acts[0],
+            &mut normed,
+            gpu.layer_sink(9)?,
+        )?;
+        // Then layer 3, twice.
+        let n_tok = 2;
+        let mut ids = route_ids(Routing::Uniform, n_tok, top_k, n_exp, 29);
+        ids[2] = n_exp as u32 + 1;
+        let mut x = activations(k, n_tok, 999);
+        x[k + 5] = f32::NAN;
+        let xd = DeviceBuffer::from_host(stream, &x)?;
+        res.ids.copy_from_host(stream, &pad(&ids, res.ids.len()))?;
+        let l3 = gpu.layer_sink(3)?;
+        gpu.enqueue_quantize_gemm(&xd, st.input.cols(ids.len()), &mut res.act, l3)?;
+        dev.gk
+            .enqueue_route(stream, &res.ids, ids.len(), &mut res.route, l3)?;
+        // The head's copy of the pair.
+        let logits = DeviceBuffer::from_host(stream, &activations(64, 1, 1001))?;
+        let mut out = DeviceBuffer::from_host(stream, &[7u32; 3])?;
+        gpu.elem()
+            .enqueue_argmax_fault(stream, &logits, 64, gpu.unlabelled_sink(), &mut out)?;
+        let out = out.to_host_vec(stream)?;
+        let copied = Fault::from_words(out[1], out[2]);
+        let fault = gpu.take_fault()?;
+        let want = Fault::of_sites(3, &[FaultSite::ExpertId, FaultSite::QuantColumn]);
+        let shown = |f: Option<Fault>| f.map_or_else(|| "none".to_owned(), |f| f.to_string());
+        let masks = |f: Option<Fault>| f.map_or(0, |f| f.sites);
+        let pass = clean.is_none() && fault == Some(want) && copied == Some(want);
+        println!(
+            "gemm fault=site_mask layer9=[norm_quant] then layer3=[quant_column, expert_id]: \
+             word=\"{}\" mask={:#06x} copy=\"{}\" mask={:#06x} want=\"{want}\" mask={:#06x} \
+             word_before={} {}",
+            shown(fault),
+            masks(fault),
+            shown(copied),
+            masks(copied),
+            want.sites,
+            shown(clean),
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// `v` zero-padded to `n` entries.
@@ -1740,6 +1820,7 @@ mod gate {
         ok &= swiglu_case(&dev)?;
         ok &= faults(&dev)?;
         ok &= sel_faults(&dev)?;
+        ok &= site_mask(&dev)?;
 
         if !ok {
             return Err(checks_failed());

@@ -8,9 +8,9 @@
 //! logits are bit for bit that kernel's. Then each block takes the best of
 //! its eight rows and publishes it as one packed key ([`argmax_key`]) by a
 //! device-wide atomic max, then draws one ticket; the block that draws the
-//! last ticket writes the winner's index and the fault word into the
-//! readback pair — `argmax_fault`'s layout, `out[0]` the token, `out[1]` the
-//! word — and puts the key and the ticket count back to their seeds for the
+//! last ticket writes the winner's index and the fault into the readback —
+//! `argmax_fault`'s layout, `out[0]` the token, `out[1]` the first-layer
+//! word, `out[2]` its layer's site mask — and puts the key and the ticket count back to their seeds for the
 //! next launch or graph replay.
 //!
 //! The token is `argmax_fault`'s bit for bit whatever order the blocks
@@ -86,7 +86,7 @@ mod qwen3moe_head_kernels {
             y.len() >= n_rows,
             key.len() >= 1,
             done.len() >= 1,
-            out.len() >= 2
+            out.len() >= 3
         )
     )]
     pub fn qwen3moe_head_q6k_argmax(
@@ -278,11 +278,13 @@ mod qwen3moe_head_kernels {
         k.store(KEY_SEED, AtomicOrdering::Relaxed);
         count.store(0, AtomicOrdering::Relaxed);
         let word = fault.read();
-        // SAFETY: out.len() >= 2 by the launch contract; the last block's
+        let sites = fault.read_sites(word);
+        // SAFETY: out.len() >= 3 by the launch contract; the last block's
         // thread 0 alone writes it.
         unsafe {
             *out.get_unchecked_mut(0) = !(best as u32);
             *out.get_unchecked_mut(1) = word;
+            *out.get_unchecked_mut(2) = sites;
         }
     }
 }
@@ -334,8 +336,9 @@ impl HeadArgmaxKernels {
     /// Enqueue `logits = w · act` for the Q6_K head weight `w` (the word
     /// plane `enqueue_gemv_q6k` takes: `210 · n_sb / 4` words per row, `n_sb`
     /// even) against one q8_1 column, and the argmax of the logits (ties to
-    /// the lower index) into `out[0]` with the fault word `fault` reads into
-    /// `out[1]` — `enqueue_argmax_fault`'s readback. Asynchronous,
+    /// the lower index) into `out[0]` with the first-layer word `fault` reads
+    /// into `out[1]` and its layer's site mask into `out[2]` —
+    /// `enqueue_argmax_fault`'s readback. Asynchronous,
     /// allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
@@ -369,11 +372,11 @@ impl HeadArgmaxKernels {
                 ),
             ));
         }
-        if n_rows == 0 || logits.len() < n_rows || out.len() < 2 {
+        if n_rows == 0 || logits.len() < n_rows || out.len() < 3 {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "{n_rows} rows into {} logits and a readback of {}, want >= 1 rows, {n_rows} logits and 2",
+                    "{n_rows} rows into {} logits and a readback of {}, want >= 1 rows, {n_rows} logits and 3",
                     logits.len(),
                     out.len()
                 ),

@@ -376,10 +376,7 @@ fn check_oor(gpu: &Gpu, st: &mut Stack) -> Result<bool, GateError> {
         );
         return Ok(false);
     }
-    let expert_id = Fault {
-        layer: LAYER_NONE,
-        code: FaultSite::ExpertId as u32,
-    };
+    let expert_id = Fault::at(LAYER_NONE, FaultSite::ExpertId);
     let mut pass = oor_case(gpu, st, "past_stack", &SEL_OOR, Some(expert_id))?;
     pass &= oor_case(gpu, st, "host", &SEL_HOST, None)?;
     Ok(pass)

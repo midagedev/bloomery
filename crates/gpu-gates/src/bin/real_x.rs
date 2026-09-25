@@ -60,7 +60,7 @@ fn run() -> Result<(), GateError> {
 
     let gguf = open_model()?;
     let gpu = Gpu::new()?;
-    let q5 = Q5Kernels::load(gpu.context())?;
+    let q5 = Q5Kernels::load(gpu.context(), gpu.fault_word())?;
     let stream = gpu.stream();
     let man = ref_manifest()?;
     println!(

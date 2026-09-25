@@ -861,9 +861,11 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// Pass a readback through, remembering a fault it carries: the state
-    /// the faulted step wrote poisons every later step.
-    fn note_fault<T>(&mut self, r: Result<T, GpuError>) -> Result<T, GpuError> {
-        if let Err(GpuError::Fault { fault, .. }) = &r {
+    /// the faulted step wrote poisons every later step. The fault prints its
+    /// site mask in this body's step order.
+    fn note_fault<T>(&mut self, mut r: Result<T, GpuError>) -> Result<T, GpuError> {
+        if let Err(GpuError::Fault { fault, .. }) = &mut r {
+            *fault = fault.in_arch(B::arch());
             self.poisoned = Some(*fault);
         }
         r
