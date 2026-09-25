@@ -138,6 +138,7 @@ could not win on a kernel already at ~700 GB/s.
 | move, split, rename (semantics kept) | `just ptx-scan` table identical — that proves the kernels only; host dispatch code also needs its structural lines unchanged (graph node count, eager = replay, e2e set identical) | none beyond those structural lines | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
 | launch count only | Δt = ΔN × c_node, predicted | the owning gate | once, only if occupancy moves too |
+| fold a launch's work into a neighbour kernel | Δt = −ΔN × c_node − the removed kernel's time + the work every block of the host grid now repeats or waits on × its blocks; a grid already near ~700 GB/s pays that last term in full | the owning gate | once (qwen3fuse set that term to 0: two folds predicted faster, each measured +0.13 ms) |
 | instruction count on a kernel near ~700 GB/s | model says 0 — do not open the round | — | — |
 | occupancy / geometry | occupancy computed from regs, smem, threads, SM count (ptxas `-v`) and written in the spec | the owning gate | once, to confirm |
 | float sum order or precision | the error model (σ against `exact-forced-32.tsv`, a diagnostic — see the next section) | `gate-gpu-e2e` count pin | once, to confirm |
