@@ -34,4 +34,12 @@ if [ -n "$bare" ]; then
   echo "$bare" >&2
   exit 1
 fi
+# Every recipe's cargo targets, features and runner binaries against the workspace (cargo metadata, no
+# build): a `--bin`, `--test` or `-p` that names nothing, a feature the package lacks, a gpu-gate.sh or
+# host-gate.sh name the recipe does not build, a named script that is not in the tree, a gate-* recipe
+# with no cargo target. The parser is tools/recipes.py, the one tools/affected-gates.sh uses; its own
+# tests (--self-test) run here too, so the parser the lead's batch lists come from is tested wherever
+# this check runs.
+python3 "$(dirname "$0")/recipes.py" check
+python3 "$(dirname "$0")/recipes.py" --self-test
 echo "check-recipes: ok"

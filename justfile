@@ -38,6 +38,10 @@ fmt-check:
 check-recipes:
     ./tools/check-recipes.sh
 
+# BASE(기본 main)나 A..B 사이에 바뀐 파일을 입력으로 읽는 gate-* 레시피 목록 — 맥에서, 빌드 없이, 아무것도 돌리지 않는다(tools/affected-gates.sh).
+affected BASE='main' *ARGS:
+    ./tools/affected-gates.sh {{BASE}} {{ARGS}}
+
 # 호스트 rustflags의 두 소유자(.cargo/config.toml, .cargo/cuda-oxide.toml)가 같은지 — 맥에서, 빌드 없음.
 check-rustflags:
     ./tools/check-rustflags.sh

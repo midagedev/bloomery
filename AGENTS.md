@@ -82,6 +82,15 @@ The plan lives in `docs/plan.md`. This file is the working contract.
     just deny         # cargo deny check; fails if the cuda-oxide pin ever floats
     just measure-gpu  # quiet-machine GPU measurement, witnesses included
     just measure-cpu  # same for the CPU tier, serialized by a file lock
+    just affected [BASE|A..B]  # the gate-* recipes a change touches, from the crate graph,
+                      # each target's module tree, the scripts a recipe names and the
+                      # cargo globals (tools/recipes.py, the parser check-recipes shares);
+                      # Mac-only, builds nothing, runs nothing — it prints the list a
+                      # landing batch runs, the `unmapped:` files no gate reads, and how
+                      # old the box's dep-info of each selected bin is (read-only ssh;
+                      # `--no-box` skips it). A change in crates/gpu or crates/model
+                      # selects every GPU gate: the graph's true answer. A gate left out
+                      # of a batch is then a printed record, not a judgment
     just gate         # check-recipes + fmt-check + lint + both builds + gate-1-1
     just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
                       # ops attn ffn moe head forward kv derived mt profile
@@ -111,7 +120,9 @@ which made every gate exit 0 whether it passed, failed or timed out; it was
 caught in review the same evening, and a 13-gate rerun found no red hidden in
 that window. The exit code now has one owner, `tools/gate.sh`, and
 `just check-recipes` fails on a test recipe that carries `||` or a bare
-`cargo test`.) GPU gate binaries have the same bound through their own
+`cargo test`, and (through `tools/recipes.py check`, `cargo metadata` on the Mac, no build) on a
+`--bin`, `--test`, `-p` or feature that names nothing, a runner name the recipe does not build, a
+script not in the tree, or a `gate-*` recipe with no cargo target.) GPU gate binaries have the same bound through their own
 runner, `tools/gpu-gate.sh`: it takes a card's gate lock, runs the
 binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`), and
 returns the binary's exit code (124/137 timed out, 75 lock contention).
