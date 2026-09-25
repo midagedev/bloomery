@@ -96,11 +96,16 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # P = 512 alone, gate-gpu-e2e, in two lanes through tools/gate-batch.sh — a subset
                       # run for a round's loop and the lead's first look, never a landing batch.
                       # tools/gate-batch.sh is also the landing-batch runner: `--list FILE` takes `just
-                      # affected` output; lane A = the 3090 (gpu-gate.sh without `any`, and device code
-                      # run with no gate lock), lane B = the `any` recipes forced to the A6000 plus every
-                      # recipe with no device code, X = BLOOMERY_CARD=both after both lanes; rc 75 retries;
+                      # affected` output; lane A = the 3090, fixed (gpu-gate.sh without `any`, and device
+                      # code run with no gate lock); the `any` recipes and those with no device code are
+                      # balanced, longest first to the lane expected to end first (the median of their last
+                      # five rows in ~/.cache/bloomery/gate-times.tsv, 45 s without one), lane A forcing the
+                      # 3090, lane B the A6000; X = alone after both lanes: a `[group('solo')]` recipe (a
+                      # host-memory pin another lane's model load moves — gate-gpu-ds41-faults, the load
+                      # gates) or BLOOMERY_CARD=both; any other group value is an error; rc 75 retries;
                       # one log per item and a run.log ending in `DONE total= red= wall=`; refuses to
-                      # start while the timing lease is held and refuses a recipe that names a timing runner.
+                      # start while the timing lease is held and refuses a recipe that names a timing runner
+                      # or whose script takes the lease.
                       # `--ledger` (the lead's batches only, never a round's): an item whose input key
                       # (`tools/recipes.py key` — its source closure, recipe text, cargo globals, ARGS, env and
                       # card, and a box manifest read once per batch) is in the green ledger
