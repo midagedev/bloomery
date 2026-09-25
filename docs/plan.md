@@ -127,7 +127,7 @@ e2e 핀은 이산 개수(마진 ≥ 0.5 불일치 ≤ 6)라 경계에서 동전 
 ## 공개
 
 - **참고한 엔진에 대한 예의(사용자 09-24)**: README 크레딧(ik_llama.cpp는 오라클이자 설계 참조, exllamav3·mistral.rs도 설계 참조; ik에서 옮긴 코드는 저작권 표기), 공정한 비교(ik는 가장 빠른 플래그 + DSpark로 같은 창, 재현 스크립트 동봉), 숫자가 나가기 전에 ikawrakow에게 두세 줄. PR 본문에는 bloomery 이야기를 섞지 않는다.
-- **M4 모델 순서(조사 `models`, `research/models-survey.md`)**: Qwen3-30B-A3B 전 카드(됨) → Qwen3 dense → GLM-4.7-Flash(`deepseek2` 파일, V2-Lite 커널; `scratch.rs` `n_used != 6` 거부부터) → V4-Flash(`v4port` 결정: `arch/deepseek41` 안의 변형) → GLM-5.3-Flash(`glm5next`, KDA 선형 34층 + MLA 11층 + mHC — 새 커널 계열 L). seam 프로그램(`seamc` `aff69e7` 등, 이동 클래스 리팩터)은 끝났다.
+- **M4 모델 순서(조사 `models`, `research/models-survey.md`)**: Qwen3-30B-A3B 전 카드(됨) → Qwen3 dense ~~→ GLM-4.7-Flash(`deepseek2` 파일, V2-Lite 커널; `scratch.rs` `n_used != 6` 거부부터) → V4-Flash(`v4port` 결정: `arch/deepseek41` 안의 변형) → GLM-5.3-Flash(`glm5next`, KDA 선형 34층 + MLA 11층 + mHC — 새 커널 계열 L).~~ 사용자 결정 09-25: **V4.1 → V4-Flash(`v4port`) → Qwen 최신**에 집중, GLM-4.7-Flash·GLM-5.3-Flash는 보류(카드만 남긴다). seam 프로그램(`seamc` `aff69e7` 등, 이동 클래스 리팩터)은 끝났다.
 - **비교 대상(사용자 09-24, local-ai-registry PR #83)**: Qwen3.6-35B-A3B EXL3 3.0 bpw + MTP로 3090에서 252/352 tok/s. 우리 첫 목표는 35B-A3B Q3_K급 파일, 드래프트 없이 3090에서 252 초과(`research/linear-attn.md` §6).
 
 ## 타겟 프로필 (사용자 09-24 "3090 하나 혹은 두 개에 스레드리퍼 AVX2로 V4.1 Flash를 돌려볼 사람")
