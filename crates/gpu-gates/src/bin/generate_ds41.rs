@@ -45,9 +45,19 @@
 //! (`tools/ref/time-gate.sh generate_ds41 … --time`,
 //! `tools/ref/depth-ds41.sh`). It times each generated step host-side around
 //! `step(&[tok])`; the argmax readback synchronizes inside, and the host
-//! tier's share runs inside it, so the wall time is the whole step. The
-//! prompt and the depth ids are fed untimed. Nothing is printed between two
-//! timed steps. `--warm W` drops the first W generated steps from the
+//! tier's share runs inside it, so the wall time is the whole step. The fed
+//! ids (the prompt, then the depth ids) are timed as one wall, not step by
+//! step: the `time prompt n=<P> ms= tok/s= passes=<K> kind=` row runs from
+//! before the first fed step to after the readback of generated token 0.
+//! `passes` is the steps the feed took, one per id, so V4.1's prompt rate is
+//! its step rate by construction — at or above it, since the plain feed runs
+//! one body per id and reads back once at the end, where a generated step
+//! reads back every time. `kind` is `steps`, `dspark` (the DSpark feed: one
+//! readback per id, its feature reads and draft appends) or `checked` (the
+//! finite probe's eager steps run inside the wall). The row prints on every run,
+//! after the loop, as a runtime value like the `load` line; it is a
+//! measurement only under the lease, as `time step` is. Nothing is printed
+//! between two timed steps. `--warm W` drops the first W generated steps from the
 //! statistics and still prints them, marked. The `SMOKE` footer carries the
 //! keys `generate`'s does (`p50_ms=`, `mean_ms=`, `warm=`), so the runners
 //! that read one read the other.
@@ -136,7 +146,7 @@ mod dspark;
 #[cfg(feature = "deepseek41")]
 mod drive {
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HybridStats;
@@ -719,19 +729,47 @@ mod drive {
         }
     }
 
-    /// Feed `ids` untimed, one real step per id — each through the finite
-    /// probe first under `check` — print the `fed` and `step 0` lines, and
-    /// return the first generated token.
+    /// The prompt feed's wall and shape, the `time prompt` row.
+    struct FeedTime {
+        /// The fed ids.
+        n: usize,
+        /// The steps the feed took.
+        passes: usize,
+        /// Before the first fed step to after the readback of generated
+        /// token 0.
+        wall: Duration,
+        /// `steps`, `dspark`, or `checked` under the finite probe.
+        kind: &'static str,
+    }
+
+    impl FeedTime {
+        /// `time prompt n= ms= tok/s= passes= kind=`, written after the loop.
+        fn print(&self) {
+            let ms = self.wall.as_secs_f64() * 1e3;
+            println!(
+                "time prompt n={} ms={ms:.4} tok/s={:.2} passes={} kind={}",
+                self.n,
+                self.n as f64 * 1e3 / ms,
+                self.passes,
+                self.kind
+            );
+        }
+    }
+
+    /// Feed `ids`, one real step per id — each through the finite probe
+    /// first under `check` — print the `fed` and `step 0` lines, and return
+    /// the first generated token and the feed's wall.
     fn feed(
         m: &mut Deepseek41Model,
         ids: &[u32],
         prompt_len: usize,
         check: Option<&mut FiniteCheck>,
-    ) -> Result<u32, GateError> {
+    ) -> Result<(u32, FeedTime), GateError> {
         let depth = ids.len();
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
         println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
+        let kind = if check.is_some() { "checked" } else { "steps" };
         let t = Instant::now();
         let next = match check {
             None => m.step(ids)?,
@@ -743,16 +781,23 @@ mod drive {
                 next
             }
         };
+        let wall = t.elapsed();
         println!(
             "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
             m.pos() - 1,
-            t.elapsed().as_secs_f64()
+            wall.as_secs_f64()
         );
-        Ok(next)
+        let time = FeedTime {
+            n: depth,
+            passes: depth,
+            wall,
+            kind,
+        };
+        Ok((next, time))
     }
 
-    /// Feed `ids` untimed, then the N − 1 feedback steps, timed when asked;
-    /// every line after the loop.
+    /// Feed `ids`, then the N − 1 feedback steps, timed when asked; every
+    /// line after the loop.
     fn decode(
         m: &mut Deepseek41Model,
         a: &Args,
@@ -761,7 +806,7 @@ mod drive {
         mut check: Option<&mut FiniteCheck>,
     ) -> Result<(), GateError> {
         let depth = ids.len();
-        let mut next = feed(m, ids, prompt_len, check.as_deref_mut())?;
+        let (mut next, feed_time) = feed(m, ids, prompt_len, check.as_deref_mut())?;
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(a.n_gen - 1);
         let mut tokens: Vec<u32> = Vec::with_capacity(a.n_gen);
         tokens.push(next);
@@ -795,6 +840,7 @@ mod drive {
             }
         }
         let warm = a.warm.unwrap_or(0);
+        feed_time.print();
         for (k, (pos, tok, ms)) in rows.iter().enumerate() {
             let i = k + 1;
             tokens.push(*tok);
@@ -876,7 +922,7 @@ mod drive {
             println!("capture pair_graph_nodes={}", m.pair_graph_nodes()?.len());
         }
         let depth = ids.len();
-        let first = match spark.as_deref_mut() {
+        let (first, feed_time) = match spark.as_deref_mut() {
             None => feed(m, ids, prompt_len, None)?,
             Some(d) => feed_dspark(m, d, ids, prompt_len)?,
         };
@@ -943,6 +989,7 @@ mod drive {
             )
             .into());
         }
+        feed_time.print();
         print_draft_rows(a, first, &emitted, &passes);
         if stats_on {
             print_stats(&probes, warm);
@@ -965,26 +1012,33 @@ mod drive {
     }
 
     /// [`feed`] for the DSpark draft: the fed ids one step each, every
-    /// position's features into the draft (`dspark::feed`), and the same
-    /// `fed` and `step 0` lines.
+    /// position's features into the draft (`dspark::feed`), the same `fed`
+    /// and `step 0` lines, and the wall as `kind=dspark`.
     fn feed_dspark(
         m: &mut Deepseek41Model,
         d: &mut Dspark,
         ids: &[u32],
         prompt_len: usize,
-    ) -> Result<u32, GateError> {
+    ) -> Result<(u32, FeedTime), GateError> {
         let depth = ids.len();
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
         println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
         let t = Instant::now();
         let next = dspark::feed(m, d, ids)?;
+        let wall = t.elapsed();
         println!(
             "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
             m.pos() - 1,
-            t.elapsed().as_secs_f64()
+            wall.as_secs_f64()
         );
-        Ok(next)
+        let time = FeedTime {
+            n: depth,
+            passes: depth,
+            wall,
+            kind: "dspark",
+        };
+        Ok((next, time))
     }
 
     /// The `step` lines of the first `-n` tokens, the `time pass` rows when

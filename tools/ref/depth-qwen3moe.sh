@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Qwen3-30B-A3B decode by depth with the whole model on the timing card, four engines in one lease
-# (run on the box, lead-only): our engine (generate_qwen3moe --time), ik (llama-bench -gp D,N),
-# mainline llama.cpp (llama-bench -d D) and mistral.rs (mistralrs bench --depth D), alternated arm
+# Qwen3-30B-A3B decode by depth and prefill by prompt length with the whole model on the timing
+# card, four engines in one lease (run on the box, lead-only): our engine (generate_qwen3moe
+# --time), ik (llama-bench -gp D,N; -p P -n 0 for prefill), mainline llama.cpp (llama-bench -d D;
+# -p P -n 0) and mistral.rs (mistralrs bench --depth D; --prompt-len P for prefill), alternated arm
 # by arm.
 #
 #   BLOOMERY_MODEL=qwen3moe tools/box.sh 'bash tools/ref/depth-qwen3moe.sh 6 ik:6 lcpp:6'
 #   just depth-gpu-qwen3moe 6 ik:6 ikdef:6 lcpp:6 1024 ik:1024 ikdef:1024 lcpp:1024 4096 ik:4096 ikdef:4096 lcpp:4096
 #   just depth-gpu-qwen3moe 6 lcpp:6 mrs:6 4096 lcpp:4096 mrs:4096
+#   just depth-gpu-qwen3moe 512 ikpp:512 lcpppp:512 mrspp:512 4096 ikpp:4096 lcpppp:4096 mrspp:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-qwen3moe 6 lcpp:6 mrs:6    # the command lines, no lease, no load
 #   just depth-gpu-qwen3moe 6 bin:/root/repo/bloomery-<track>-base/target/release/generate_qwen3moe:6 lcpp:6
 #
@@ -27,6 +29,9 @@
 #             caches have one height (mistral.rs: below).
 #             Our flash grid is fixed by C (flash_gqa::segments_for), so C goes into the row.
 #             BLOOMERY_GEN_CTX fixes C for every ours arm instead, e.g. at a serving height.
+#             The row also carries `pp_tok/s <v> (n=D, passes=K)` from the binary's `time prompt`
+#             row, the wall of that prefill (Prefill below): one arm reports both the prefill of
+#             D ids and the decode at depth D.
 #   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
 #             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
@@ -59,6 +64,17 @@
 #             cache and attention path, interleaved with mrs:<D>, says which is its faster set.
 #             That cache is sized by mistral.rs, not by C: this arm is outside the one-height
 #             statement above.
+#   ikpp:<P>  ik's prefill: llama-bench -p P -n 0 -r 1 $IK_GPU_FLAGS, the ik:<D> arm's binary and
+#             flags; the row reads llama-bench's `ppP` row as `tok/s(pp) … @ n=0, prompt P`.
+#   lcpppp:<P> mainline's prefill: llama-bench -p P -n 0 -r 1 $LCPP_GPU_FLAGS, the lcpp:<D> arm's.
+#   ikpp<U>:<P>, lcpppp<U>:<P>  the same with -ub U -b max(U, 2048): the ubatch lever, not a default
+#             (Prefill below). Refused when the profile's flags already name -ub or -b.
+#   mrspp:<P> mistral.rs's prefill: mistralrs bench -f <MODEL> --prompt-len P --gen-len 1
+#             --iterations 1 --warmup 1 --max-seq-len C --pa-context-len C+32 $MRS_FLAGS, C = P + 1
+#             rounded up to 256 (or BLOOMERY_GEN_CTX): a gen length below 2 skips the decode case,
+#             and the one request of P ids plus its first token must fit --max-seq-len
+#             (bench.rs run_bench). Its row reads the `TTFT (P input tokens)` row of the bench's
+#             table: T/s = P / TTFT.
 # ik and mainline feed std::rand() ids, prefill and steps alike; mistral.rs feeds prompt ids 1000 +
 # (start + i) mod 2048 and then its greedy continuation; ours feeds its greedy continuation, which
 # is why our row carries distinct_tokens. Every arm is one process — a model load, the prefill, N
@@ -115,9 +131,35 @@
 # Paging. The witness prints the page cache and the major fault count before and after every arm:
 # the file is 18.6 GB, and another round's host set can evict it between two arms.
 #
-# Co-tenants. A compute process on the other card is recorded ([other-busy], timing-card.sh); one
-# on the timing card as an arm starts holds the arm until it is gone, and after 10 minutes stops the
-# runner with rc 75 and no summary (guard_timing below).
+# Prefill. pp_tok/s is P over the wall of processing a P-token prompt, in each engine's terms:
+#   ours      generate_qwen3moe's `time prompt` row: the wall of Qwen3moeModel::prefill through the
+#             readback of its token, MAX_TOKENS (8) positions per pass, `passes` the passes. The
+#             first prefill call allocates the prefill arena inside that wall, and every arm is a
+#             fresh process, so each row carries that allocation. The arm's cache height is C
+#             (D + N rounded up to 256), not P.
+#   ik, lcpp  llama-bench's pp test: llama_decode over the P ids in batches of -b and ubatches of
+#             -ub, then one synchronize (test_prompt), one repetition, llama-bench's own value, at
+#             n_ctx = P padded to 256. Both trees default to -ub 512 -b 2048; the row names them.
+#   mrs       the TTFT case: from sending the request to its first streamed token
+#             (run_single_bench, recv_measurement), so it also holds the request's scheduling and
+#             the first sample, as ours holds the readback of token 0. mistral.rs batches by its
+#             scheduler's defaults, max_num_batched_tokens 4096 per step and
+#             max_prefill_chunk_tokens 512 while a decode is resident (mistralrs-cli
+#             src/args/mod.rs); bench sets neither, so mrspp has no ubatch lever.
+# The arms do not start alike. The warmup before the timed run is a 1-token prompt in ik
+# (examples/llama-bench/llama-bench.cpp:2230), the whole prompt in mainline
+# (tools/llama-bench/llama-bench.cpp:2382) and one whole request in mistral.rs (--warmup 1); ours
+# has none. So ik's and our rows carry first-touch costs the other two do not.
+# The ubatch lever: every expert sits on the card here, and a ubatch reads each routed expert's
+# weights once whatever its row count, so a larger ubatch shares that read among more tokens
+# [derived]. ikpp<U> / lcpppp<U> interleaved with the default arm find the references' faster
+# setting; the line to beat is a reference at its fastest flags.
+#
+# Co-tenants. A compute process on the other card is recorded ([other-busy], timing-card.sh), and
+# the arm's row ends in ` [other-busy]`; the closing summary counts those rows. This runner has no
+# CPU guard, so no row carries [cpu-busy]. A compute process on the timing card as an arm starts
+# holds the arm until it is gone, and after 10 minutes stops the runner with rc 75 and no summary
+# (guard_timing below).
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 4),
 # BLOOMERY_GEN_WARM (generate_qwen3moe --warm), BLOOMERY_GEN_CTX (above; mrs arms take the same C),
@@ -152,9 +194,12 @@ ours=0 ik=0 lcpp=0 mrs=0
 # (ours and bin).
 A_KIND=() A_DEP=() A_LABEL=() A_BIN=()
 arm_usage() {
-  echo "depth-qwen3moe.sh: arm '$1' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, mrs:<D>, mrspa0:<D> or bin:<path>:<D>" >&2
+  echo "depth-qwen3moe.sh: arm '$1' is <D>, ik:<D>, ikdef:<D>, lcpp:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, mrspp:<P> or bin:<path>:<D>" >&2
   exit 64
 }
+# A prefill arm's engine (ikpp[<U>], lcpppp[<U>], mrspp), and its ubatch lever U (empty: the default).
+pp_eng() { case $1 in ikpp* | lcpppp* | mrspp) return 0 ;; *) return 1 ;; esac; }
+pp_ub() { local u=${1#ikpp}; u=${u#lcpppp}; echo "${u#mrspp}"; }
 for a in "${ARMS[@]}"; do
   kind=ref eng=${a%%:*} dep=${a#*:} label='' bin=''
   case $a in
@@ -168,9 +213,9 @@ for a in "${ARMS[@]}"; do
       ;;
     *:*)
       case $eng in
-        ik | ikdef) ik=1 ;;
-        lcpp) lcpp=1 ;;
-        mrs | mrspa0) mrs=1 ;;
+        ik | ikdef | ikpp | ikpp[1-9]*) ik=1 ;;
+        lcpp | lcpppp | lcpppp[1-9]*) lcpp=1 ;;
+        mrs | mrspa0 | mrspp) mrs=1 ;;
         *) arm_usage "$a" ;;
       esac
       label=$eng
@@ -181,6 +226,20 @@ for a in "${ARMS[@]}"; do
   case $kind:$eng:$dep in
     ref:mrs:0 | ref:mrspa0:0) echo "depth-qwen3moe.sh: arm '$a': mistral.rs refuses --depth 0 with a decode length" >&2; exit 64 ;;
   esac
+  if [ "$kind" = ref ] && pp_eng "$eng"; then
+    ub=$(pp_ub "$eng")
+    case $ub in *[!0-9]*) arm_usage "$a" ;; esac
+    [ "$dep" -ge 1 ] || { echo "depth-qwen3moe.sh: arm '$a': a prompt of 0 ids has no prefill to time" >&2; exit 64; }
+    if [ -n "$ub" ]; then
+      case $eng in ikpp*) flags=$IK_GPU_FLAGS ;; *) flags=$LCPP_GPU_FLAGS ;; esac
+      case " $flags " in
+        *" -ub "* | *" --ubatch-size "* | *" -b "* | *" --batch-size "*)
+          echo "depth-qwen3moe.sh: arm '$a': the profile's flags already set the batch sizes ($flags); the ubatch lever would add a second value" >&2
+          exit 64
+          ;;
+      esac
+    fi
+  fi
   # Our prompt is one argument of D ids of up to six characters each; the kernel caps one
   # argument at 128 KiB.
   if [ "$kind" != ref ] && { [ "$dep" -lt 1 ] || [ "$dep" -gt 20000 ]; }; then
@@ -266,10 +325,13 @@ guard_timing() {
   exit 75
 }
 
-# ref_cmd <engine> <depth>: the reference arm's binary, arguments and row label, into REF_BIN,
-# REF_ARGS and REF_LABEL. The flags are word-split on purpose: the profile keeps them as one string.
+# ref_cmd <engine> <depth or prompt length>: the reference arm's binary, arguments and row label,
+# into REF_BIN, REF_ARGS and REF_LABEL, and for a prefill arm the batch sizes its row names into
+# REF_BATCH. The flags are word-split on purpose: the profile keeps them as one string. A prefill
+# arm is its decode twin's binary and flags with the prompt test in place of the decode test.
 ref_cmd() {
-  local eng=$1 dep=$2 flags ctx
+  local eng=$1 dep=$2 flags ctx ub
+  REF_BATCH=
   case $eng in
     ik | ikdef)
       REF_BIN=$IKBIN flags=$IK_GPU_FLAGS
@@ -283,6 +345,28 @@ ref_cmd() {
       if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n "$N" -d "$dep"); REF_LABEL="tg$N @ d$dep |"; fi
       # shellcheck disable=SC2206
       REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
+      ;;
+    ikpp* | lcpppp*)
+      case $eng in
+        ikpp*) REF_BIN=$IKBIN flags=$IK_GPU_FLAGS ;;
+        *) REF_BIN=$LCPPBIN flags=$LCPP_GPU_FLAGS ;;
+      esac
+      ub=$(pp_ub "$eng")
+      REF_ARGS=(-p "$dep" -n 0) REF_LABEL="pp$dep |" REF_BATCH="ub 512 b 2048 (llama-bench defaults)"
+      if [ -n "$ub" ]; then
+        REF_ARGS+=(-ub "$ub" -b "$((ub > 2048 ? ub : 2048))")
+        REF_BATCH="ub $ub b $((ub > 2048 ? ub : 2048)) (the arm's lever)"
+      fi
+      # shellcheck disable=SC2206
+      REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
+      ;;
+    mrspp)
+      REF_BIN=$MRSBIN flags=$MRS_FLAGS
+      ctx=${GEN_CTX:-$(((dep + 1 + 255) / 256 * 256))}
+      # shellcheck disable=SC2206
+      REF_ARGS=(bench $flags -f "$MODEL" --prompt-len "$dep" --gen-len 1 --iterations 1 --warmup 1 --max-seq-len "$ctx" --pa-context-len "$((ctx + 32))")
+      REF_LABEL="TTFT ($dep input tokens)"
+      REF_BATCH="scheduler defaults: max_num_batched_tokens 4096, max_prefill_chunk_tokens 512 (bench sets neither)"
       ;;
     mrs | mrspa0)
       REF_BIN=$MRSBIN flags=$MRS_FLAGS
@@ -302,7 +386,7 @@ ref_cmd() {
 # ┆ … ms TPOT │`) whose first `<number> ± ` is the T/s cell. Its log lines carry ANSI colour codes.
 ref_val() {
   case $1 in
-    mrs | mrspa0) sed 's/\x1b\[[0-9;]*m//g' | grep -F "$2" | grep -oE '[0-9][0-9.]* ± ' | head -n 1 | sed 's/ ± //' ;;
+    mrs | mrspa0 | mrspp) sed 's/\x1b\[[0-9;]*m//g' | grep -F "$2" | grep -oE '[0-9][0-9.]* ± ' | head -n 1 | sed 's/ ± //' ;;
     *) grep -F "$2" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g' ;;
   esac
 }
@@ -330,7 +414,7 @@ ref_arm() {
     exit 1
   fi
   case $eng in
-    mrs | mrspa0)
+    mrs | mrspa0 | mrspp)
       # The load lines that say what ran (weight dtype, layer placement, the KV cache and its
       # length, the decode graphs, the tree), then the bench's own table.
       echo "$raw" | sed 's/\x1b\[[0-9;]*m//g' | grep -E 'DType selected|Layers [0-9]+-[0-9]+: |PagedAttention (KV cache type|with block)|CUDA decode graphs|git revision' \
@@ -347,8 +431,45 @@ ref_arm() {
       dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
       ;;
   esac
-  echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s"
-  sums+=("$eng|$dep|$r|$val|")
+  if pp_eng "$eng"; then
+    echo "ROW r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG"
+    pp_sums+=("$eng|$dep|$r|$val|$OTHER_BUSY_TAG")
+  else
+    echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG"
+    sums+=("$eng|$dep|$r|$val|")
+  fi
+  count_row
+}
+
+# The closing summary's row counts: every ROW line, and those that carried [other-busy].
+count_row() {
+  n_rows=$((n_rows + 1))
+  [ -z "$OTHER_BUSY_TAG" ] || other_rows=$((other_rows + 1))
+}
+
+# parse_pp: the `time prompt n=<P> ms=<ms> tok/s=<v> passes=<K> kind=<k>` row of a generate_qwen3moe
+# run on stdin, as `<P> <v> <K> <k>`; nothing when the run printed none (a base tree's build).
+parse_pp() {
+  sed -nE 's/^time prompt n=([0-9]+) ms=[0-9.]+ tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)$/\1 \2 \3 \4/p' | head -n 1
+}
+
+# pp_col <arm kind> <what> <output>: an ours or bin arm's prefill column from its run's output, into
+# PP_COL, with the parsed P and tok/s in PP_N and PP_TPS for the closing tables. A bin arm's base
+# build may print no time prompt row (PP_N empty, the column says so); an ours arm's binary is this
+# tree's, so a missing row stops the runner.
+pp_col() {
+  local passes kind
+  read -r PP_N PP_TPS passes kind <<< "$(echo "$3" | parse_pp)"
+  if [ -n "$PP_N" ]; then
+    PP_COL=" | pp_tok/s $PP_TPS (n=$PP_N, passes=$passes)"
+    [ "$kind" = prefill ] || PP_COL="${PP_COL%)}, kind=$kind)"
+  elif [ "$1" = bin ]; then
+    PP_COL=" | pp_tok/s ? (the binary prints no time prompt row)"
+  else
+    echo "$2 produced no time prompt row" >&2
+    echo "$3" | tail -n 20 >&2
+    exit 1
+  fi
 }
 
 # One arm of a generate_qwen3moe: ours (our binary) or a second binary (bin:). The row and the sum
@@ -371,9 +492,10 @@ ours_arm() {
   fi
   smoke=$(echo "$out" | grep -E '^SMOKE ')
   [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-  # The prompt_ids line is the whole prompt; the load, capture and step-0 lines are the
-  # arm's configuration and the fed steps' time.
-  echo "$out" | grep -E '^(load|capture|step 0) '
+  # The prompt_ids line is the whole prompt; the load, capture, step-0 and time prompt lines are
+  # the arm's configuration and the prefill's time.
+  echo "$out" | grep -E '^(load|capture|step 0|time prompt) '
+  pp_col "${A_KIND[$i]}" "r$r $label d=$dep" "$out"
   p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
   mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
   warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
@@ -384,8 +506,45 @@ ours_arm() {
   uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
   tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
   tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-  echo "ROW r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?} | wall $((t1 - t0))s"
+  echo "ROW r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL | wall $((t1 - t0))s$OTHER_BUSY_TAG"
+  count_row
   sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
+  [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$OTHER_BUSY_TAG")
+}
+
+# ratio_table <prefix> <keys> <labels> <tagged>: records `label|key|round|value|extra` on stdin; for
+# every key and every label but ours, each round's ours / label ratio (arms that ran more than once
+# in a round averaged first), their mean with its 95 % interval (Student t, rounds - 1 degrees of
+# freedom; 2.0 past 21 rounds) and the ratio of the arm means. With tagged = 1 the extra field is
+# the row's contention tag, and the line ends with each side's count of it.
+ratio_table() {
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v rounds="$ROUNDS" '{
+  k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
+  a = $1 SUBSEP $2; as[a] += $4; an[a]++
+  if (tagged && $5 ~ /other-busy/) bo[a]++
+} END {
+  split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086", t, " ")
+  nd = split(deps, d, " ")
+  nr = split(refs, rf, " ")
+  for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
+    ref = rf[j]
+    if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
+    c = 0; m = 0; list = ""
+    for (r = 1; r <= rounds; r++) {
+      ko = "ours" SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
+      if (!(ko in rn) || !(kr in rn)) continue
+      q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
+      list = list sprintf(" r%d %.4f", r, q)
+    }
+    if (c == 0) continue
+    m /= c; ss = 0
+    for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
+    ci = (c > 1) ? sprintf("± %.4f", ((c - 1 <= 20) ? t[c - 1] : 2.0) * sqrt(ss / (c - 1)) / sqrt(c)) : "(one round: no interval)"
+    ao = "ours" SUBSEP d[i]; ar = ref SUBSEP d[i]
+    busy = tagged ? sprintf("  busy: ours [other-busy %d/%d], %s [other-busy %d/%d]", bo[ao], an[ao], ref, bo[ar], an[ar]) : ""
+    printf "%s%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s\n", prefix, d[i], ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy
+  }
+}'
 }
 
 if [ -n "$DRY" ]; then
@@ -396,7 +555,7 @@ if [ -n "$DRY" ]; then
     dep=${A_DEP[$i]}
     if [ "${A_KIND[$i]}" = ref ]; then
       ref_cmd "${a%%:*}" "$dep"
-      echo "[dry] $a: timeout --kill-after=10 $BOUND $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'"
+      echo "[dry] $a: timeout --kill-after=10 $BOUND $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}"
     else
       ctx=${GEN_CTX:-$(((dep + N + 255) / 256 * 256))}
       note=''
@@ -418,13 +577,15 @@ echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS ikdef flags=$IK_GPU_DEFAULT_FLAGS"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS"
 echo "[config] mrs: $MRSBIN flags=$MRS_FLAGS (mrs: --pa-context-len C, mrspa0: --paged-attn off)"
+echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)), mrspp mistralrs bench --prompt-len P --gen-len 1; ours from its time prompt row"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 witness pre
 ref_witness
 guard_other
 guard_timing
 
-sums=()
+sums=() pp_sums=()
+n_rows=0 other_rows=0
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#ARMS[@]} - 1))); do
     j=$(((i + r - 1) % ${#ARMS[@]}))
@@ -438,6 +599,7 @@ for r in $(seq "$ROUNDS"); do
   done
 done
 echo
+echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
 echo "    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)"
 echo "    — the cross-engine ratio reads these. The p50 column is ours only. ==="
@@ -453,29 +615,25 @@ echo "    that ran more than once in a round are averaged first), their mean wit
 echo "    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
 refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | sort -u | tr '\n' ' ')
-printf '%s\n' "${sums[@]}" | awk -F'|' -v deps="$deps" -v refs="$refs" -v rounds="$ROUNDS" '{
-  k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
-  a = $1 SUBSEP $2; as[a] += $4; an[a]++
-} END {
-  split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086", t, " ")
-  nd = split(deps, d, " ")
-  nr = split(refs, rf, " ")
-  for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
-    ref = rf[j]
-    if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
-    c = 0; m = 0; list = ""
-    for (r = 1; r <= rounds; r++) {
-      ko = "ours" SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
-      if (!(ko in rn) || !(kr in rn)) continue
-      q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
-      list = list sprintf(" r%d %.4f", r, q)
-    }
-    if (c == 0) continue
-    m /= c; ss = 0
-    for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
-    ci = (c > 1) ? sprintf("± %.4f", ((c - 1 <= 20) ? t[c - 1] : 2.0) * sqrt(ss / (c - 1)) / sqrt(c)) : "(one round: no interval)"
-    printf "ratio d=%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s\n", d[i], ref, m, ci, c, (as["ours" SUBSEP d[i]] / an["ours" SUBSEP d[i]]) / (as[ref SUBSEP d[i]] / an[ref SUBSEP d[i]]), list
-  }
-}'
+printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0
+if [ ${#pp_sums[@]} -gt 0 ]; then
+  echo
+  echo "=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, $CARD_NAME). Ours: its time prompt"
+  echo "    row (prefill through its token's readback); llama-bench's pp value over one repetition;"
+  echo "    mistral.rs P / TTFT over one request. The tag counts the rows that met contention. ==="
+  printf '%s\n' "${pp_sums[@]}" | awk -F'|' '{
+    k = $1 " p=" $2; s[k] += $4; n[k]++
+    if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
+    if ($5 ~ /other-busy/) o[k]++
+  } END { for (k in s) {
+    spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
+    printf "mean pp %-14s %8.2f tok/s(pp)  [%s..%s, spread %.2f%%]  (n=%d)  [other-busy %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, n[k], o[k], n[k] } }' | sort
+  echo
+  echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
+  echo "    values, then how many of each side's rows carried [other-busy] ==="
+  pp_keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
+  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | sort -u | tr '\n' ' ')
+  printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 1
+fi
 witness post
 ref_witness

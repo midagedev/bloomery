@@ -882,6 +882,8 @@ time-lcpp-prompt CORPUS N:
 # placement (a)), ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS) and mainline's `lcpp:<D>`
 # (llama-bench -d D at LCPP_GPU_FLAGS; `lcpp<K>:<D>` sweeps --n-cpu-moe K), alternated, rounds rotated, with per-depth
 # ours/reference ratios. tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
+# Prefill: every `<D>` row also carries pp_tok/s from generate_ds41's `time prompt` row (the D fed steps), and
+# `ikpp:<P>`/`lcpppp:<P>` run llama-bench -p P -n 0 at the same flags (`ikpp<U>`/`lcpppp<U>`: -ub U), with a per-P table.
 # With no ours arm generate_ds41 is not built, nor under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 (the command lines, no lease);
 # no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:
@@ -891,6 +893,8 @@ depth-gpu-ds41 *ARMS:
 # 플래그)·`ikdef:<D>`(llama-bench 기본값), mainline `lcpp:<D>`(-d D)를 바퀴마다 순서를 돌려 번갈아 재고, 깊이마다 ours/각 참조 비율을 찍는다.
 # 팔·플래그 근거·뺀 플래그는 tools/ref/depth-qwen3moe.sh 머리에. 우리 팔이 없으면 generate_qwen3moe를 빌드하지 않는다; 인자 없으면 6 ik:6 lcpp:6.
 # mistral.rs arms: `mrs:<D>` (mistralrs bench --depth D, PagedAttention pool at the cache height) and `mrspa0:<D>` (--paged-attn off).
+# Prefill: every `<D>` row also carries pp_tok/s from generate_qwen3moe's `time prompt` row, and `ikpp:<P>`/`lcpppp:<P>`
+# (llama-bench -p P -n 0; `ikpp<U>`/`lcpppp<U>`: -ub U) and `mrspp:<P>` (mistralrs bench --prompt-len P) with a per-P table.
 # Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 the runner prints the command lines and exits before the lease, and nothing is built.
 depth-gpu-qwen3moe *ARMS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# V4.1 decode by depth, three engines in one lease on the timing card (run on the box, lead-only):
-# our engine (generate_ds41 --depth D --time, placement (a)), ik (llama-bench -gp D,N at the
-# profile's IK_GPU_FLAGS, under its IK_GPU_ENV) and mainline llama.cpp (llama-bench -d D at the
-# profile's LCPP_GPU_FLAGS), alternated arm by arm.
+# V4.1 decode by depth and prefill by prompt length, three engines in one lease on the timing card
+# (run on the box, lead-only): our engine (generate_ds41 --depth D --time, placement (a)), ik
+# (llama-bench -gp D,N, or -p P -n 0 for prefill, at the profile's IK_GPU_FLAGS, under its
+# IK_GPU_ENV) and mainline llama.cpp (llama-bench -d D, or -p P -n 0, at the profile's
+# LCPP_GPU_FLAGS), alternated arm by arm.
 #
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/depth-ds41.sh 6 ik:6 lcpp:6'
 #   just depth-gpu-ds41 6 lcpp:6 4096 lcpp:4096
+#   just depth-gpu-ds41 512 ikpp:512 lcpppp:512 4096 ikpp:4096 lcpppp:4096
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-ds41 6 lcpp:6    # the command lines, no lease, no load
 #
 # The V4.1 sibling of depth-gpu.sh, and it blocks the same failure: a ratio read at one depth and
@@ -19,6 +21,9 @@
 #            the N - 1 steps after it are timed. The context is the binary's default, the serving
 #            ctx_max the plan (a) is made for, at every depth: the plan's card expert prefix depends
 #            on ctx_max, so a per-depth ctx would move experts between the card and the host.
+#            The row also carries `pp_tok/s <v> (n=D, passes=K)` from the binary's `time prompt`
+#            row, the wall of those D fed steps (Prefill below): one arm reports both the prefill
+#            of D ids and the decode at depth D.
 #   ik:<D>   ik: llama-bench -p 0 -n 0 -gp D,N -r 1 (D = 0: plain tg N). llama-bench sizes its
 #            context to D + N itself and feeds its own prompt ids, not lcg_prompt's. It runs as
 #            `env $IK_GPU_ENV`: without GGML_CUDA_NO_PINNED_WEIGHTS the CPU expert overrides turn
@@ -32,6 +37,12 @@
 #   lcpp<K>:<D>  the same with --n-cpu-moe K in place of the profile's LCPP_NCMOE: the sweep arm.
 #            The profile's LCPP_NCMOE_SWEEP names the values that load, e.g.
 #            `lcpp:6 lcpp34:6 lcpp35:6` interleaved with `6`.
+#   ikpp:<P> ik's prefill: llama-bench -p P -n 0 -r 1 with the ik:<D> arm's binary, flags
+#            ($IK_GPU_FLAGS) and environment ($IK_GPU_ENV); the row reads llama-bench's `ppP` row
+#            as `tok/s(pp) … @ n=0, prompt P`.
+#   lcpppp:<P>  mainline's prefill: llama-bench -p P -n 0 -r 1 $LCPP_GPU_FLAGS, the lcpp:<D> arm's.
+#   ikpp<U>:<P>, lcpppp<U>:<P>  the same with -ub U -b max(U, 2048): the ubatch lever, not a default
+#            (Prefill below). Refused when the profile's flags already name -ub or -b.
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
 #            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
 #            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_LAUNCH_THREAD=1`.
@@ -42,6 +53,8 @@
 #            base by construction, so its freshness is not asked; its tree line (sha256, HEAD, dirty
 #            files) is printed with the references'.
 # Every label is its own engine in the per-arm means and in the ratio table (ours / each other label).
+# Prefill values (ours' `time prompt`, the pp arms) have their own means and ratio table per prompt
+# length P, never the decode ones'.
 # Our arms run at any depth up to the plan's ctx_max (every indexer layer selects its list at every
 # position); generate_ds41 refuses only D + N - 1 > --ctx, and a refusal stops the runner (rc 1).
 #
@@ -64,6 +77,31 @@
 # With BLOOMERY_STEP_STATS=1 (BLOOMERY_BOX_ENV on the Mac side) our arm's `stat summary` line is
 # echoed with its load lines; the per-step `stat step` lines stay in the arm's output only.
 #
+# Prefill. pp_tok/s is P over the wall of processing a P-token prompt, in each engine's terms:
+#   ours     generate_ds41's `time prompt` row: before the first fed step to after the readback of
+#            generated token 0, `passes` the steps it took. V4.1's ours is one decode step per
+#            token today, so its pp equals its step rate at the fed depths by construction — at or
+#            above it: the plain feed is one body per id and one readback at the end, a timed step
+#            one body and one readback. A DSpark arm's feed reads back per id and also reads each
+#            position's features into the draft (`kind=dspark`).
+#   ik, lcpp llama-bench's pp test: llama_decode over the P ids in batches of -b and ubatches of
+#            -ub, then one synchronize (test_prompt), one repetition, llama-bench's own value.
+#            Both trees default to -ub 512 -b 2048; the row names the batch sizes that ran.
+# The arms do not start alike. The warmup before llama-bench's timed repetition is a 1-token prompt
+# in ik (examples/llama-bench/llama-bench.cpp:2230) and the whole prompt in mainline
+# (tools/llama-bench/llama-bench.cpp:2378 on the V4.1 branch); ours has none: the prompt is the
+# process's first work after the capture. So ik's and our rows carry first-touch costs mainline's
+# does not; the witness's page cache and pgmajfault lines show the paging part of them.
+# Where the host experts run in prefill: at -ub 512 ik's CUDA backend copies no host MUL_MAT_ID
+# weight to the card (it does at ubatch × 6 used experts >= 32 × 384, -ub >= 2048 [derived, from the
+# profile's IK_NCMOE comment and ggml/src/ggml-cuda.cu:5226 at the default offload batch size]), and
+# mainline runs -nopo 1, so both prefill the host layers' experts on the host threads, as ours does
+# at every position. The ubatch lever:
+# ikpp<U> at U >= 2048 crosses ik's offload line, whose compute buffer holds a layer's expert
+# tensors, more than the profile's placement leaves free on the card [derived, the profile's
+# LCPP_GPU_FLAGS comment] — pair it with an IK_GPU_FLAGS override of --n-cpu-moe inside the box
+# command; lcpppp<U> keeps -nopo 1.
+#
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 3),
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_ARM_BOUND
 # (seconds one arm may run, default 900: a hung arm fails the runner with rc 124/137 instead of
@@ -74,8 +112,10 @@
 # Contention. Before every arm the runner checks both the other card (guard_other, timing-card.sh:
 # `[other-busy]`) and the CPU (guard_cpu, lease.sh: `[cpu-busy]` when builds or reference engines it
 # did not start — BLOOMERY_CPU_BUSY_COMMS — sum past BLOOMERY_CPU_BUSY_PCT percent of one cpu), and
-# checks the CPU again after the arm; a row that met CPU contention ends in ` [cpu-busy]` and the
-# closing summary counts those rows. BLOOMERY_OTHER_STRICT=1 aborts (rc 75) on either instead.
+# checks the CPU again after the arm; a row that met CPU contention ends in ` [cpu-busy]`, one whose
+# arm started beside a compute process on the other card in ` [other-busy]` (guard_other's
+# OTHER_BUSY_TAG), and the closing summary counts both. BLOOMERY_OTHER_STRICT=1 aborts (rc 75) on
+# either instead.
 set -uo pipefail
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_ENV, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # LCPP_NCMOE); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so the three
@@ -98,8 +138,11 @@ ours=0 ik=0 lcpp=0
 # Per arm, by its index in ARMS: the kind (ours, ref or bin), the depth, the row label, the
 # reference engine (ref), the binary (ours and bin) and the NAME=VALUE list (comma-separated).
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_ENV=()
+# A prefill arm's engine (ikpp[<U>], lcpppp[<U>]), and its ubatch lever U (empty: the default).
+pp_eng() { case $1 in ikpp* | lcpppp*) return 0 ;; *) return 1 ;; esac; }
+pp_ub() { local u=${1#ikpp}; echo "${u#lcpppp}"; }
 arm_usage() {
-  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], ik:<D>, lcpp:<D>, lcpp<K>:<D> or bin:<path>:<D>" >&2
+  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P> or bin:<path>:<D>" >&2
   exit 64
 }
 for a in "${ARMS[@]}"; do
@@ -126,6 +169,8 @@ for a in "${ARMS[@]}"; do
       case $eng in
         ik) ik=1 ;;
         lcpp | lcpp[0-9] | lcpp[0-9][0-9]) lcpp=1 ;;
+        ikpp | ikpp[1-9]*) ik=1 ;;
+        lcpppp | lcpppp[1-9]*) lcpp=1 ;;
         *) arm_usage "$a" ;;
       esac
       label=$eng
@@ -133,6 +178,20 @@ for a in "${ARMS[@]}"; do
     *) kind=ours eng=ours dep=$a bin=$BIN label=ours ours=1 ;;
   esac
   case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+  if pp_eng "$eng"; then
+    ub=$(pp_ub "$eng")
+    case $ub in *[!0-9]*) arm_usage "$a" ;; esac
+    [ "$dep" -ge 1 ] || { echo "depth-ds41.sh: arm '$a': a prompt of 0 ids has no prefill to time" >&2; exit 64; }
+    if [ -n "$ub" ]; then
+      case $eng in ikpp*) flags=$IK_GPU_FLAGS ;; *) flags=$LCPP_GPU_FLAGS ;; esac
+      case " $flags " in
+        *" -ub "* | *" --ubatch-size "* | *" -b "* | *" --batch-size "*)
+          echo "depth-ds41.sh: arm '$a': the profile's flags already set the batch sizes ($flags); the ubatch lever would add a second value" >&2
+          exit 64
+          ;;
+      esac
+    fi
+  fi
   A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs")
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness.
@@ -189,25 +248,42 @@ ref_witness() {
 # processes, the page cache and the major fault count.
 WITNESS=(head-open indent card busiest model mem pgmajfault)
 
-# ref_cmd <engine> <depth>: the reference arm's binary, arguments and row label, into REF_ENV,
-# REF_BIN, REF_ARGS and REF_LABEL. The flags are word-split on purpose: the profile keeps them as
-# one string. An lcpp<K> engine is LCPP_GPU_FLAGS with its --n-cpu-moe value replaced by K.
+# ref_cmd <engine> <depth or prompt length>: the reference arm's binary, arguments and row label,
+# into REF_ENV, REF_BIN, REF_ARGS and REF_LABEL, and for a prefill arm the batch sizes its row names
+# into REF_BATCH. The flags are word-split on purpose: the profile keeps them as one string. An
+# lcpp<K> engine is LCPP_GPU_FLAGS with its --n-cpu-moe value replaced by K. A prefill arm is its
+# decode twin's binary, flags and environment with -p P -n 0 in place of the decode test.
 ref_cmd() {
-  local eng=$1 dep=$2 flags
-  REF_ENV=()
-  if [ "$eng" = ik ]; then
-    # shellcheck disable=SC2206
-    REF_ENV=($IK_GPU_ENV)
-    REF_BIN=$IKBIN flags=$IK_GPU_FLAGS
-    if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n 0 -gp "$dep,$N"); REF_LABEL="tg$N@pp$dep |"; fi
-  else
-    REF_BIN=$LCPPBIN flags=$LCPP_GPU_FLAGS
-    if [ "$eng" != lcpp ]; then
-      flags=$(echo " $flags " | sed -E "s/ (--n-cpu-moe|-ncmoe) [0-9]+ / /")
-      flags="${flags# }--n-cpu-moe ${eng#lcpp}"
-    fi
-    if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n "$N" -d "$dep"); REF_LABEL="tg$N @ d$dep |"; fi
-  fi
+  local eng=$1 dep=$2 flags ub
+  REF_ENV=() REF_BATCH=
+  case $eng in
+    ik | ikpp*)
+      # shellcheck disable=SC2206
+      REF_ENV=($IK_GPU_ENV)
+      REF_BIN=$IKBIN flags=$IK_GPU_FLAGS
+      ;;
+    *)
+      REF_BIN=$LCPPBIN flags=$LCPP_GPU_FLAGS
+      case $eng in
+        lcpp[0-9]*)
+          flags=$(echo " $flags " | sed -E "s/ (--n-cpu-moe|-ncmoe) [0-9]+ / /")
+          flags="${flags# }--n-cpu-moe ${eng#lcpp}"
+          ;;
+      esac
+      ;;
+  esac
+  case $eng in
+    ikpp* | lcpppp*)
+      ub=$(pp_ub "$eng")
+      REF_ARGS=(-p "$dep" -n 0) REF_LABEL="pp$dep |" REF_BATCH="ub 512 b 2048 (llama-bench defaults)"
+      if [ -n "$ub" ]; then
+        REF_ARGS+=(-ub "$ub" -b "$((ub > 2048 ? ub : 2048))")
+        REF_BATCH="ub $ub b $((ub > 2048 ? ub : 2048)) (the arm's lever)"
+      fi
+      ;;
+    ik) if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n 0 -gp "$dep,$N"); REF_LABEL="tg$N@pp$dep |"; fi ;;
+    *) if [ "$dep" = 0 ]; then REF_ARGS=(-p 0 -n "$N"); REF_LABEL="tg$N |"; else REF_ARGS=(-p 0 -n "$N" -d "$dep"); REF_LABEL="tg$N @ d$dep |"; fi ;;
+  esac
   # shellcheck disable=SC2206
   REF_ARGS=(-m "$MODEL" "${REF_ARGS[@]}" -r 1 $flags)
 }
@@ -240,9 +316,46 @@ ref_arm() {
   echo "$raw" | grep -E '^\| ' | grep -vE '^\| *-' | sed "s/^/    $eng table /"
   build=$(echo "$raw" | sed -n 's/^build: //p' | head -n 1)
   dev=$(echo "$raw" | sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' | head -n 1)
-  echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG"
+  if pp_eng "$eng"; then
+    echo "ROW r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+    pp_sums+=("$eng|$dep|$r|$val|$CPU_BUSY_TAG$OTHER_BUSY_TAG")
+  else
+    echo "ROW r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+    sums+=("$eng|$dep|$r|$val|")
+  fi
+  count_row
+}
+
+# The closing summary's row counts: every ROW line, and those that carried each contention tag.
+count_row() {
+  n_rows=$((n_rows + 1))
   [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
-  sums+=("$eng|$dep|$r|$val|")
+  [ -z "$OTHER_BUSY_TAG" ] || other_rows=$((other_rows + 1))
+}
+
+# parse_pp: the `time prompt n=<P> ms=<ms> tok/s=<v> passes=<K> kind=<k>` row of a generate_ds41
+# run on stdin, as `<P> <v> <K> <k>`; nothing when the run printed none (a base tree's build).
+parse_pp() {
+  sed -nE 's/^time prompt n=([0-9]+) ms=[0-9.]+ tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)$/\1 \2 \3 \4/p' | head -n 1
+}
+
+# pp_col <arm kind> <what> <output>: an ours or bin arm's prefill column from its run's output, into
+# PP_COL, with the parsed P and tok/s in PP_N and PP_TPS for the closing tables. A bin arm's base
+# build may print no time prompt row (PP_N empty, the column says so); an ours arm's binary is this
+# tree's, so a missing row stops the runner.
+pp_col() {
+  local passes kind
+  read -r PP_N PP_TPS passes kind <<< "$(echo "$3" | parse_pp)"
+  if [ -n "$PP_N" ]; then
+    PP_COL=" | pp_tok/s $PP_TPS (n=$PP_N, passes=$passes)"
+    [ "$kind" = steps ] || PP_COL="${PP_COL%)}, kind=$kind)"
+  elif [ "$1" = bin ]; then
+    PP_COL=" | pp_tok/s ? (the binary prints no time prompt row)"
+  else
+    echo "$2 produced no time prompt row" >&2
+    echo "$3" | tail -n 20 >&2
+    exit 1
+  fi
 }
 
 # The variables arm <i> of ours runs with, into ARM_ENVS: its own, and for a DSpark arm
@@ -284,7 +397,8 @@ ours_arm() {
   fi
   smoke=$(echo "$out" | grep -E '^SMOKE ')
   [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
-  echo "$out" | grep -E '^(plan|load|capture|fed|stat summary) '
+  echo "$out" | grep -E '^(plan|load|capture|fed|stat summary|time prompt) '
+  pp_col "${A_KIND[$i]}" "r$r $label d=$dep" "$out"
   p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
   mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
   warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
@@ -297,10 +411,46 @@ ours_arm() {
   uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
   tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
   tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-  echo "ROW r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft} | wall $((t1 - t0))s$CPU_BUSY_TAG"
-  [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
+  echo "ROW r$r $label d=$dep n=$N | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${draft:+ | draft $draft}$PP_COL | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG"
+  count_row
   if [ -n "$draft" ]; then tps_mean=${draft##*tok/s(positions)=}; fi
   sums+=("$label|$dep|$r|$tps_mean|$tps_p50")
+  [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG")
+}
+
+# ratio_table <prefix> <keys> <labels> <tagged>: records `label|key|round|value|extra` on stdin; for
+# every key and every label but ours, each round's ours / label ratio (arms that ran more than once
+# in a round averaged first), their mean with its 95 % interval (Student t, rounds - 1 degrees of
+# freedom; 2.0 past 21 rounds) and the ratio of the arm means. With tagged = 1 the extra field is
+# the row's contention tags, and the line ends with each side's count of them.
+ratio_table() {
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v rounds="$ROUNDS" '{
+  k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
+  a = $1 SUBSEP $2; as[a] += $4; an[a]++
+  if (tagged) { if ($5 ~ /cpu-busy/) bc[a]++; if ($5 ~ /other-busy/) bo[a]++ }
+} END {
+  split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086", t, " ")
+  nd = split(deps, d, " ")
+  nr = split(refs, rf, " ")
+  for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
+    ref = rf[j]
+    if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
+    c = 0; m = 0; list = ""
+    for (r = 1; r <= rounds; r++) {
+      ko = "ours" SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
+      if (!(ko in rn) || !(kr in rn)) continue
+      q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
+      list = list sprintf(" r%d %.4f", r, q)
+    }
+    if (c == 0) continue
+    m /= c; ss = 0
+    for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
+    ci = (c > 1) ? sprintf("± %.4f", ((c - 1 <= 20) ? t[c - 1] : 2.0) * sqrt(ss / (c - 1)) / sqrt(c)) : "(one round: no interval)"
+    ao = "ours" SUBSEP d[i]; ar = ref SUBSEP d[i]
+    busy = tagged ? sprintf("  busy: ours [cpu-busy %d/%d] [other-busy %d/%d], %s [cpu-busy %d/%d] [other-busy %d/%d]", bc[ao], an[ao], bo[ao], an[ao], ref, bc[ar], an[ar], bo[ar], an[ar]) : ""
+    printf "%s%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s\n", prefix, d[i], ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy
+  }
+}'
 }
 
 if [ -n "$DRY" ]; then
@@ -313,7 +463,7 @@ if [ -n "$DRY" ]; then
     case ${A_KIND[$i]} in
       ref)
         ref_cmd "${A_ENG[$i]}" "$dep"
-        echo "[dry] $a: timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'"
+        echo "[dry] $a: timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}"
         ;;
       *)
         note=''
@@ -336,6 +486,7 @@ echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME 
 echo "[config] ours: $BIN (placement (a), default ctx)"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
+echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 1 at the flags above (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 witness pre
@@ -343,8 +494,8 @@ ref_witness
 guard_other
 guard_cpu pre
 
-sums=()
-busy_rows=0
+sums=() pp_sums=()
+n_rows=0 busy_rows=0 other_rows=0
 for r in $(seq "$ROUNDS"); do
   for i in $(seq 0 $((${#ARMS[@]} - 1))); do
     j=$(((i + r - 1) % ${#ARMS[@]}))
@@ -358,7 +509,8 @@ for r in $(seq "$ROUNDS"); do
   done
 done
 echo
-echo "cpu-busy rows: $busy_rows of ${#sums[@]} (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
+echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
+echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
 echo "    llama-bench's own mean over the N steps — the cross-engine ratio reads these. The p50"
 echo "    column is ours only. ==="
@@ -374,29 +526,25 @@ echo "    mean with its 95 % interval (Student t, rounds - 1 degrees of freedom;
 echo "    and the ratio of the arm means ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
 refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | sort -u | tr '\n' ' ')
-printf '%s\n' "${sums[@]}" | awk -F'|' -v deps="$deps" -v refs="$refs" -v rounds="$ROUNDS" '{
-  k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
-  a = $1 SUBSEP $2; as[a] += $4; an[a]++
-} END {
-  split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086", t, " ")
-  nd = split(deps, d, " ")
-  nr = split(refs, rf, " ")
-  for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
-    ref = rf[j]
-    if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
-    c = 0; m = 0; list = ""
-    for (r = 1; r <= rounds; r++) {
-      ko = "ours" SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
-      if (!(ko in rn) || !(kr in rn)) continue
-      q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
-      list = list sprintf(" r%d %.4f", r, q)
-    }
-    if (c == 0) continue
-    m /= c; ss = 0
-    for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
-    ci = (c > 1) ? sprintf("± %.4f", ((c - 1 <= 20) ? t[c - 1] : 2.0) * sqrt(ss / (c - 1)) / sqrt(c)) : "(one round: no interval)"
-    printf "ratio d=%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s\n", d[i], ref, m, ci, c, (as["ours" SUBSEP d[i]] / an["ours" SUBSEP d[i]]) / (as[ref SUBSEP d[i]] / an[ref SUBSEP d[i]]), list
-  }
-}'
+printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0
+if [ ${#pp_sums[@]} -gt 0 ]; then
+  echo
+  echo "=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, $CARD_NAME). Ours: its time prompt"
+  echo "    row (the P fed steps through token 0's readback); the references: llama-bench's pp value"
+  echo "    over one repetition. The tags count the rows that met contention. ==="
+  printf '%s\n' "${pp_sums[@]}" | awk -F'|' '{
+    k = $1 " p=" $2; s[k] += $4; n[k]++
+    if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
+    if ($5 ~ /cpu-busy/) c[k]++; if ($5 ~ /other-busy/) o[k]++
+  } END { for (k in s) {
+    spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
+    printf "mean pp %-14s %8.2f tok/s(pp)  [%s..%s, spread %.2f%%]  (n=%d)  [cpu-busy %d/%d] [other-busy %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, n[k], c[k], n[k], o[k], n[k] } }' | sort
+  echo
+  echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
+  echo "    values, then how many of each side's rows carried [cpu-busy] and [other-busy] ==="
+  pp_keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
+  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | sort -u | tr '\n' ' ')
+  printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 1
+fi
 witness post
 ref_witness

@@ -55,9 +55,16 @@ witness_card() {
 # so — an abort path that prints no witness loses the record where it matters most.
 WITNESS=(head-open indent card model)
 
+# guard_other's verdict for the caller's row: ' [other-busy]' after a call that found a compute
+# process on the other card, empty after one that did not. The depth runners append it to the
+# arm's ROW line as they append guard_cpu's CPU_BUSY_TAG, so a closing table can carry it.
+# shellcheck disable=SC2034 # read by the runners that source this file
+OTHER_BUSY_TAG=
 guard_other() {
   local apps
   apps=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$OTHER_GPU")
+  # shellcheck disable=SC2034 # read by the runners that source this file
+  OTHER_BUSY_TAG=${apps:+ [other-busy]}
   [ -n "$apps" ] || return 0
   echo "[other-busy] $(now) compute apps on the other card ($OTHER_GPU): [$(echo "$apps" | tr '\n' ';')]" >&2
   if [ "${BLOOMERY_OTHER_STRICT:-}" = 1 ]; then
