@@ -32,7 +32,7 @@
 |---|---|---|---|
 | **21 (09-25 04:10~)** | `dspark-q3k` ‖ `ds41hcbranch` ‖ `unionhost` → `ds41splitk` ‖ `qwen3route` ‖ `fixup3` | plan 정리(이 판), E21, `spec-dsloop`, spots-triage 표 | dspark-q3k·hcbranch 머지 → dsloop 자리 |
 | ~~22~~ 닫힘 09-25 10:05 | `dsloop` `c00274c` ‖ `qwen3fuse` `ae046aa` ‖ `load3` `5fef4b4` ‖ `slots` `75d2bad` (07:20 발사, base `ac250bb`; uniongroup·gpuq1은 23으로) | 시팅 B·C·D, A3 리베이스 A/B, 시팅 10(승인 뒤) | dsloop 머지 → DSpark tok/s |
-| 23 (선발 10:00~) | **`prefillbench` ‖ `ds41prefill`**(사용자 09-25: 프리필 우선) → 시팅 E21·DS·L3·Q3F·P 뒤 `uniongroup` ‖ `gpuq1`(load3가 0층 그늘을 바꿨으니 P1 재유도) ‖ N4 설계 ‖ 프리필 구현 첫 라운드(ds41prefill 표가 정한다) (≤ 4씩) | M1 글·영상, E28 재측정 | — |
+| 23 (선발 10:00~) | ~~`prefillbench`~~ `ed3d6f3` ‖ ~~`ds41prefill`~~ 보고(백본 B 배치 호스트 티어, P ≳ 2,000에 D 스트리밍) ‖ `prefilllit`(사용자 09-25: 프리필 우선) → 시팅 L3·DS·Q3F·P(a·b·c)·M1·E21 뒤 프리필 첫 라운드 `ringstage` ‖ `q3serve` ‖ `uniongroup` ‖ `gpuq1`(load3가 0층 그늘을 바꿨으니 P1 재유도), 이어 `ds41batch`·`hosttile`(M1이 정한다)·N4 설계 (≤ 4씩) | M1 글·영상, E28 재측정 | — |
 
 ### 리드 직렬 지점과 규칙
 
