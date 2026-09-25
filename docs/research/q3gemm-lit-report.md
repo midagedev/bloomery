@@ -6,7 +6,7 @@ mistral.rs 쪽 리서치"를 물어 연 라운드이고, `q3next-design`의 레�
 (`FUSED_DET` 기본 "1"), `mistralrs-core/src/moe/experts/backends.rs:1506`(`grouped_moe_mmq_pair_packed`) — 넷 다 일치.
 결론: A는 2단·2 블록/SM·20워드 피치 그대로(3–4단·swizzle·`ldmatrix`는 우리 커널에서 0[유도]), B′는 A 뒤 go(512스레드,
 `q8_1_quant_vals` 재사용으로 비트 동일 구성). 공개 비교에 닿는 사실: mistral.rs의 GGUF MoE 프리필은 llama.cpp MMQ 포트
-(int8 텐서코어)이고, 어떤 플래그로도 GGUF 전문가를 Marlin·CUTLASS로 보낼 수 없다 — 우리 표의 mrspp 행은 그 엔진의 최선 경로다.
+(int8 텐서코어)이고, 어떤 플래그로도 GGUF 전문가를 Marlin·CUTLASS로 보낼 수 없다 — ~~우리 표의 mrspp 행은 그 엔진의 최선 경로다.~~ 정정(리드, 09-26): GEMM 경로에만 맞다 — 우리 mistral.rs 바이너리는 flash-attn 없이 빌드돼 프롬프트 attention이 eager 경로였다(`mrs-pp4096-report.md`, rig-log 09-26#mrs-noflash).
 아래는 라운드의 보고 원문이다.
 
 **q3gemm-lit 보고** (리드 `bloomery-ee`에게)

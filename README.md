@@ -66,7 +66,7 @@ Source: rig-log [2026-09-24, public file on the headline prompts](https://github
 
 bloomery is ahead at short context and behind at 4096 keys, where its attention is slower; that is being worked on. Source: rig-log [2026-09-24, Qwen3-30B-A3B](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#qwen3-30b-a3b-e28). A mistral.rs row is next.
 
-Prompt processing on the same card, arms alternated in one window, three rounds (`llama-bench -p P -n 0`; mistral.rs `d5ae0f18f`, `bench --prompt-len P --gen-len 1`):
+Prompt processing on the same card, arms alternated in one window, three rounds (`llama-bench -p P -n 0`; mistral.rs `d5ae0f18f`, `bench --prompt-len P --gen-len 1`, built with `--features cuda` only — without `flash-attn`, see the conditions below):
 
 | Prompt | bloomery pp tok/s | llama.cpp | llama.cpp `-ub 4096` | mistral.rs |
 |---:|---:|---:|---:|---:|
@@ -78,6 +78,7 @@ The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QW
 Read these numbers with their conditions:
 
 - **No speculative decoding** in any row. A draft for V4.1 (DSpark) is being built.
+- **The mistral.rs prefill column is not its recommended build.** Our binary was built without `flash-attn`, so its prompt attention takes the eager path, which materializes every P × P score (upstream's release builds and install script enable `flash-attn` on Ampere). That path is why its tokens get 2.6× slower from 512 to 4096 [derived, rig-log [2026-09-26, mrs-noflash](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#mrs-noflash)]; a flash-attn build is measured next.
 - **The card is an A6000.** The 24 GB row emulates a 3090's budget on the A6000; a run on a real 3090 has not been timed.
 - **The V4.1 hot list was built from routing traces of the same corpora** the prompts come from, so the prose and code rows are its favorable case. With the synthetic depth prompt, whose output collapses into a few repeating tokens, the same placement ran at 34.7 tok/s at depth 6 and 32.3 at depth 4096.
 
