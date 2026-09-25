@@ -70,12 +70,10 @@ Prompt processing on the same card, arms alternated in one window, three rounds 
 
 | Prompt | bloomery pp tok/s | llama.cpp | llama.cpp `-ub 4096` | mistral.rs |
 |---:|---:|---:|---:|---:|
-| 512 | **6,236** | 4,320 | — | 3,469 |
-| 4096 | 5,557 | 4,204 | **6,864**¹ | 1,327 |
+| 512 | **6,402** | 4,318 | — | 3,471 |
+| 4096 | **7,490** | 4,205 | 6,904 | 1,321 |
 
-¹ From an earlier window the same day (rig-log [qwen3prefill](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab)); the other columns share one window.
-
-The prompt runs in ubatches of 512 tokens through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. At 4096 tokens the remaining gap to llama.cpp at `-ub 4096` is the ubatch size: eight 512-token ubatches read every expert eight times; a load-time ubatch size is next. Source: rig-log [2026-09-25, q3pflash](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3pflash-ab).
+The prompt runs in ubatches of up to 4096 tokens (a load-time size, `BLOOMERY_QWEN3_UBATCH`) through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. At 4096 tokens bloomery's default is 1.085× llama.cpp with `-ub 4096 -b 4096`; the routed GEMM and the per-token glue kernels are about equal shares of what remains [derived]. Source: rig-log [2026-09-25, q3ubatch](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3ubatch-ab).
 
 Read these numbers with their conditions:
 
@@ -111,7 +109,7 @@ Timing runs only on a quiet machine, under a machine-wide lease, with a witness 
 - **sm_86 only.** Every kernel is built and gated for Ampere (`--arch sm_86`). Other architectures are not tested.
 - **A pinned nightly.** The toolchain is `nightly-2026-08-28`, pinned together with a cuda-oxide git revision. The source comes from our fork of that revision, where fixes wait until upstream takes them (`THIRD_PARTY_NOTICES.md` lists them).
 - **One machine.** Timed numbers come from one A6000 in one workstation. The tooling (`tools/box.sh`) assumes a Mac editor and that workstation; [`docs/BUILD.md`](docs/BUILD.md) says what to run on your own host.
-- ~~**No batched prefill for V4.1.** A V4.1 prompt is fed one step per token, so a 4096-token prompt takes about 2.4–2.9 minutes before the first new token [derived: 4096 × 35–43 ms]; batched prefill is in progress.~~ **V4.1 prefill is slow.** Since 2026-09-25 a V4.1 prompt runs in batches of up to 512 positions: ~~91.2 tok/s at 512 tokens and 89.2 at 4096 on the A6000 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#ds41batch-pp)), so a 4096-token prompt takes about 46 s~~ 109.9 tok/s at 512 tokens and 152.8 at 4096 on the A6000 by the evening of the same day (llama.cpp 104.6 / 103.8 in the morning's clean lease; ~~77.6 / 76.2 in the same lease~~ the evening lease read the reference's file pages cold after our arms — [rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#v41-prefill-resit-b)), so a 4096-token prompt takes about 27 s — each layer runs only at the positions a later reader needs, so long prompts gain most. Most of the rest is the CPU expert tier; the next steps are in progress. Qwen3 prefills in ubatches of 512 (the table above). The server reuses a cached prompt prefix, so a follow-up turn pays only for its new tokens.
+- ~~**No batched prefill for V4.1.** A V4.1 prompt is fed one step per token, so a 4096-token prompt takes about 2.4–2.9 minutes before the first new token [derived: 4096 × 35–43 ms]; batched prefill is in progress.~~ **V4.1 prefill is slow.** Since 2026-09-25 a V4.1 prompt runs in batches of up to 512 positions: ~~91.2 tok/s at 512 tokens and 89.2 at 4096 on the A6000 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#ds41batch-pp)), so a 4096-token prompt takes about 46 s~~ 109.9 tok/s at 512 tokens and 152.8 at 4096 on the A6000 by the evening of the same day (llama.cpp 104.6 / 103.8 in the morning's clean lease; ~~77.6 / 76.2 in the same lease~~ the evening lease read the reference's file pages cold after our arms — [rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#v41-prefill-resit-b)), so a 4096-token prompt takes about 27 s — each layer runs only at the positions a later reader needs, so long prompts gain most. Most of the rest is the CPU expert tier; the next steps are in progress. ~~Qwen3 prefills in ubatches of 512~~ Qwen3 prefills in ubatches of up to 4096 since 2026-09-25 (the table above). The server reuses a cached prompt prefix, so a follow-up turn pays only for its new tokens.
 
 ## Build
 

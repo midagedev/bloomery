@@ -321,7 +321,9 @@ first suspect is a hung gate on the box, not the agent.
   (llama.cpp 4,256 / 4,170, `-ub 4096` 6,864; rig-log 09-25#qwen3prefill-ab),
   and since `54ef56e` (q3pflash, a prefill attention kernel) pp512 6,236 and
   pp4096 5,557 (llama.cpp 4,320 / 4,204 in the same lease; rig-log
-  09-25#q3pflash-ab);
+  09-25#q3pflash-ab), and since `ded6c51` (q3ubatch, ubatches of up to 4096
+  tokens, a load-time size) pp512 6,402 and pp4096 7,490 (llama.cpp 4,318 /
+  4,205, `-ub 4096 -b 4096` 6,904 in the same lease; rig-log 09-25#q3ubatch-ab);
   ~~V4.1 still feeds one decode step per token (batched prefill in flight).~~ Since
   2026-09-25 (`43cd107`) V4.1 runs a prompt in batches of up to 512 positions, bit for bit the
   decode steps' state: pp512 91.2 and pp4096 89.2 tok/s on the A6000 plan (a), 2.97x the step
