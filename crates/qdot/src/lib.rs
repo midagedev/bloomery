@@ -434,8 +434,10 @@ pub fn has_tile(w: GgmlType) -> bool {
 ///
 /// With a tile kernel ([`has_tile`]) and two or more columns, each block of
 /// the row is unpacked once and dotted with every column; each column keeps
-/// the one-column kernel's integer products and its float accumulation order,
-/// so only the loop over columns moves inside the block loop. One column, or
+/// the one-column kernel's integer sums and its float accumulation order,
+/// so only the loop over columns moves inside the block loop. The Q3_K tile
+/// reads a q8_K block's 16 code sums (bytes 264..296) for its −4 fold, so a
+/// column must come from [`quantize_col`], which writes them. One column, or
 /// a type or CPU without a tile kernel, dots each column through
 /// [`dot_row`] — the scalar mirror on a CPU without AVX2. A column count
 /// outside `1..=TILE_COLS` or an `out` of another length is
@@ -995,9 +997,12 @@ fn dot_q3k_q8k_scalar(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     acc
 }
 
-/// [`field_dot`] for `C` columns: the field's weight codes and scales are
-/// unpacked once, then each column takes the one-column body's load, two
-/// maddubs, sub, madd and add into its own `sumi`.
+/// [`field_dot`] for `C` columns, the high bit folded into the code: the
+/// field is unpacked once as `u = q3l | h << 2` in 0..7 — the stored value
+/// plus 4 (the high bit set is the value without its −4) — and its scales
+/// shuffled once, then each column takes one load, one maddubs, one madd
+/// and one add into its own `sumi`. The −4 is not this field's: the tile
+/// opens each column's `sumi` with it.
 ///
 /// # Safety
 /// Each `q8[c] + off` must point at 32 readable bytes inside column `c`'s
@@ -1020,18 +1025,13 @@ unsafe fn field_dot_cols<const SHIFT: i32, const BIT: i32, const C: usize>(
     // SAFETY: AVX2 present and each `q8[c] + off` points at 32 readable bytes per contract.
     unsafe {
         let q3l = _mm256_and_si256(_mm256_srli_epi16::<SHIFT>(q3bits), masks.m3);
-        let q3h = _mm256_slli_epi16::<2>(_mm256_srli_epi16::<BIT>(_mm256_andnot_si256(
-            hbits,
-            _mm256_slli_epi16::<BIT>(masks.mone),
-        )));
+        let h = _mm256_and_si256(_mm256_srli_epi16::<BIT>(hbits), masks.mone);
+        let u = _mm256_or_si256(q3l, _mm256_slli_epi16::<2>(h));
         let sc = _mm256_shuffle_epi8(scales_j, shuf_f);
         for (q, s) in q8.iter().zip(sumi.iter_mut()) {
             // SAFETY: unaligned 32-byte load at q + off, inside column c's buffer.
             let q8f = _mm256_loadu_si256(q.add(off) as *const __m256i);
-            let q8s = _mm256_maddubs_epi16(q3h, q8f);
-            let p = _mm256_maddubs_epi16(q3l, q8f);
-            let p = _mm256_sub_epi16(p, q8s);
-            let p = _mm256_madd_epi16(sc, p);
+            let p = _mm256_madd_epi16(sc, _mm256_maddubs_epi16(u, q8f));
             *s = _mm256_add_epi32(*s, p);
         }
     }
@@ -1041,12 +1041,20 @@ unsafe fn field_dot_cols<const SHIFT: i32, const BIT: i32, const C: usize>(
 /// to `dot_q3k_q8k_avx2(wrow, column c, nb)` bit for bit.
 ///
 /// Per super-block the weight's scales, `d`, high-bit mask and code words are
-/// read once, and each field is unpacked once for every column
-/// ([`field_dot_cols`]). Column `c`'s integer sum runs the one-column body's
-/// instructions over the same fields in the same order (exact either way:
-/// |sumi| <= 4.2e6 < 2^24), and its float step is the one-column body's
-/// `acc += dcol * d * sumi`, in super-block order — so the order is the
-/// one-column kernel's, column by column.
+/// read once, and each field is unpacked once for every column as codes
+/// `u = value + 4` ([`field_dot_cols`]). The fold's `−4 · Σ_j s_j · bsum_j`
+/// opens each column's integer sum: one madd of `−4 · s` against the 16 code
+/// sums of the column's block (bytes 264..296, which `quantize_col` writes),
+/// so the value holds for blocks whose sums are those of their codes. The
+/// integer equals the one-column body's, `Σ s·(u − 4)·q = Σ s·u·q −
+/// 4·Σ s·bsum`, and every step is exact for any i8 codes: maddubs pairs of
+/// `u` in 0..7 stay within ±1792 (no saturation), madd pairs within ±524288,
+/// i32 partials within ±1.2e7, and the super-block's |sumi| <= 4.2e6 < 2^24.
+/// The `C` sums are then reduced together by one 8×8 transpose-add
+/// ([`hsum8_i32`]) — an i32 add tree, the sum `hsum_i32` forms — and lane `c`
+/// takes the one-column float step `acc + (dcol · d) · sumi`, in super-block
+/// order: the same operations in the same order, column by column. Lanes
+/// past `C` hold zeros and are never returned.
 ///
 /// # Safety
 /// CPU must support AVX2+F16C; `wrow` must hold `nb` super-blocks and each
@@ -1057,6 +1065,7 @@ unsafe fn dot_q3k_q8k_tile_avx2<const C: usize>(
     acols: &[*const u8; C],
     nb: usize,
 ) -> [f32; C] {
+    const { assert!(C != 0 && C <= TILE_COLS) };
     // SAFETY: AVX2+F16C present, `wrow` holds nb super-blocks and every column
     // nb Q8_K blocks per contract.
     unsafe {
@@ -1072,7 +1081,9 @@ unsafe fn dot_q3k_q8k_tile_avx2<const C: usize>(
         let kmask1 = 0x0303_0303u32;
         let kmask2 = 0x0f0f_0f0fu32;
 
-        let mut acc = [0.0f32; C];
+        let zero = _mm256_setzero_si256();
+        // Lane c is column c's accumulator; lanes past C stay unused.
+        let mut acc = _mm256_setzero_ps();
         for sb in 0..nb {
             let base = wrow.as_ptr().add(Q3K_BLOCK * sb);
             // SAFETY: unaligned load inside the super-block.
@@ -1094,13 +1105,25 @@ unsafe fn dot_q3k_q8k_tile_avx2<const C: usize>(
             let l = _mm256_extracti128_si256(all_scales, 0);
             let h = _mm256_extracti128_si256(all_scales, 1);
             let scales = [_mm256_set_m128i(l, l), _mm256_set_m128i(h, h)];
+            // −4·s_j per 16-code block, lane j against the column's block sum
+            // j (both in block order); −4·s is within −124..128.
+            let neg4 = _mm256_slli_epi16::<2>(_mm256_sub_epi16(zero, all_scales));
 
             // SAFETY: one unaligned u16 read inside the super-block.
             let d = f16c_to_f32((base.add(108) as *const u16).read_unaligned());
 
-            // SAFETY: column c's super-block sb codes start 8 bytes into its block.
-            let q8: [*const u8; C] = std::array::from_fn(|c| acols[c].add(sb * Q8K_STRIDE + 8));
-            let mut sumi = [_mm256_setzero_si256(); C];
+            // SAFETY: column c's super-block sb starts at sb * Q8K_STRIDE.
+            let blk: [*const u8; C] = std::array::from_fn(|c| acols[c].add(sb * Q8K_STRIDE));
+            // SAFETY: the codes start 8 bytes into the block.
+            let q8: [*const u8; C] = std::array::from_fn(|c| blk[c].add(8));
+            // Each column's sum opens with the fold's −4 · Σ s_j · bsum_j.
+            let mut sumi = [zero; C];
+            for (s, b) in sumi.iter_mut().zip(&blk) {
+                // SAFETY: 32-byte load of the 16 i16 code sums at 264..296 of
+                // the column's block.
+                let bsums = _mm256_loadu_si256(b.add(264) as *const __m256i);
+                *s = _mm256_madd_epi16(neg4, bsums);
+            }
             for (j, scj) in scales.iter().enumerate() {
                 // SAFETY: unaligned load inside the super-block.
                 let q3bits = _mm256_loadu_si256(base.add(32 + 32 * j) as *const __m256i);
@@ -1133,13 +1156,72 @@ unsafe fn dot_q3k_q8k_tile_avx2<const C: usize>(
                     );
                 }
             }
-            for ((a, s), col) in acc.iter_mut().zip(&sumi).zip(acols) {
-                // SAFETY: unaligned f32 read at the head of the column's super-block sb.
-                let dcol = (col.add(sb * Q8K_STRIDE) as *const f32).read_unaligned();
-                *a += dcol * d * hsum_i32(*s) as f32;
+            // Zero registers past C: those lanes sum to 0.
+            let mut s8 = [zero; TILE_COLS];
+            s8[..C].copy_from_slice(&sumi);
+            let tot = hsum8_i32(&s8);
+            let mut dcol = [0.0f32; TILE_COLS];
+            for (dc, b) in dcol.iter_mut().zip(&blk) {
+                // SAFETY: unaligned f32 read at the head of the column's block.
+                *dc = (*b as *const f32).read_unaligned();
             }
+            let dcol = _mm256_setr_ps(
+                dcol[0], dcol[1], dcol[2], dcol[3], dcol[4], dcol[5], dcol[6], dcol[7],
+            );
+            let t = _mm256_mul_ps(dcol, _mm256_set1_ps(d));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(t, _mm256_cvtepi32_ps(tot)));
         }
-        acc
+        let mut lanes = [0.0f32; TILE_COLS];
+        // SAFETY: 32-byte store into the local 8-lane array.
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        let mut out = [0.0f32; C];
+        out.copy_from_slice(&lanes[..C]);
+        out
+    }
+}
+
+/// Eight horizontal i32 sums at once: lane `c` of the result is the sum of
+/// `s[c]`'s eight lanes (an 8×8 transpose-add; exact, as integer adds are in
+/// any order).
+///
+/// # Safety
+/// AVX2 must be available on the target.
+#[inline(always)]
+unsafe fn hsum8_i32(s: &[__m256i; 8]) -> __m256i {
+    // SAFETY: register-only intrinsics, no memory access.
+    unsafe {
+        // Per 128-bit half of a pair (a, b) = (s[i], s[i + 1]):
+        // [a0 + a2, b0 + b2, a1 + a3, b1 + b3].
+        let p01 = _mm256_add_epi32(
+            _mm256_unpacklo_epi32(s[0], s[1]),
+            _mm256_unpackhi_epi32(s[0], s[1]),
+        );
+        let p23 = _mm256_add_epi32(
+            _mm256_unpacklo_epi32(s[2], s[3]),
+            _mm256_unpackhi_epi32(s[2], s[3]),
+        );
+        let p45 = _mm256_add_epi32(
+            _mm256_unpacklo_epi32(s[4], s[5]),
+            _mm256_unpackhi_epi32(s[4], s[5]),
+        );
+        let p67 = _mm256_add_epi32(
+            _mm256_unpacklo_epi32(s[6], s[7]),
+            _mm256_unpackhi_epi32(s[6], s[7]),
+        );
+        // Per 128-bit half, lane i of q0 (q1): the four lanes of s[i]
+        // (s[4 + i]) in that half, summed.
+        let q0 = _mm256_add_epi32(
+            _mm256_unpacklo_epi64(p01, p23),
+            _mm256_unpackhi_epi64(p01, p23),
+        );
+        let q1 = _mm256_add_epi32(
+            _mm256_unpacklo_epi64(p45, p67),
+            _mm256_unpackhi_epi64(p45, p67),
+        );
+        _mm256_add_epi32(
+            _mm256_permute2x128_si256::<0x20>(q0, q1),
+            _mm256_permute2x128_si256::<0x31>(q0, q1),
+        )
     }
 }
 

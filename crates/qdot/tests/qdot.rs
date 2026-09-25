@@ -2778,14 +2778,103 @@ fn coded_columns(ty: GgmlType, k: usize, extra: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     cols
 }
 
-/// Q3_K tile clause: the V4.1 first shard's routed gate stack (k = the model
-/// width), then V2-Lite's `ffn_gate`-1 rows on the oracle's six `ffn_norm-1`
-/// tokens (the rows and columns gate 1's harness reads) — tile = `dot_row`
-/// per column, bit for bit.
+/// A synthetic Q3_K super-block: code `i` stores `u(i)` in 0..7 (its value
+/// plus 4 — bit 2 is the high bit), 16-code block `j` the scale `s(j)` in
+/// −32..31, and the f16 bits `d`; packed as the scalar mirror reads a block.
+fn q3k_block(u: impl Fn(usize) -> u8, s: impl Fn(usize) -> i8, d: u16) -> [u8; 110] {
+    let mut b = [0u8; 110];
+    for i in 0..256 {
+        let v = u(i);
+        assert!(v < 8, "code {i}: u = {v}");
+        let (half, field, cell) = (i / 128, (i / 32) % 4, i % 32);
+        if v & 4 != 0 {
+            b[cell] |= 1 << (4 * half + field);
+        }
+        b[32 + 32 * half + cell] |= (v & 3) << (2 * field);
+    }
+    for j in 0..16 {
+        let sv = u8::try_from(i32::from(s(j)) + 32)
+            .ok()
+            .filter(|&v| v < 64)
+            .unwrap_or_else(|| panic!("block {j}: scale {} outside -32..31", s(j)));
+        if j < 8 {
+            b[96 + j] |= sv & 0xF;
+        } else {
+            b[96 + j - 8] |= (sv & 0xF) << 4;
+        }
+        b[104 + j % 4] |= (sv >> 4) << (2 * (j / 4));
+    }
+    b[108..110].copy_from_slice(&d.to_le_bytes());
+    b
+}
+
+/// A synthetic q8_K column of `k` values in `quantize_col`'s block layout:
+/// code `i` is `q(i)`, every block's scale `d`, and each block's 16 sums of
+/// 16 codes at bytes 264..296.
+fn q8k_col(k: usize, q: impl Fn(usize) -> i8, d: f32) -> Vec<u8> {
+    let mut a = vec![0u8; col_bytes(GgmlType::Q3_K, k)];
+    for (sb, blk) in a.as_chunks_mut::<296>().0.iter_mut().enumerate() {
+        blk[0..4].copy_from_slice(&d.to_le_bytes());
+        for j in 0..16 {
+            let mut sum = 0i32;
+            for l in 0..16 {
+                let v = q(256 * sb + 16 * j + l);
+                blk[8 + 16 * j + l] = v as u8;
+                sum += i32::from(v);
+            }
+            let sum = i16::try_from(sum).expect("16 i8 codes sum within i16");
+            blk[264 + 2 * j..266 + 2 * j].copy_from_slice(&sum.to_le_bytes());
+        }
+    }
+    a
+}
+
+/// Q3_K tile clause: rows and columns at the ends of the tile's folded
+/// terms first — codes u = 0 and u = 7 (values −4 and 3), scales −32 and 31
+/// (uniform, alternating by 16-code block, and a ramp), q8_K columns of every
+/// code −127 (block sums −2032), +127, −128 (outside the encoder's range,
+/// still exact) and ±127 alternating by block — then the V4.1 first shard's
+/// routed gate stack (k = the model width), then V2-Lite's `ffn_gate`-1 rows
+/// on the oracle's six `ffn_norm-1` tokens (the rows and columns gate 1's
+/// harness reads) — tile = `dot_row` per column, bit for bit.
 #[test]
 #[ignore = "hw: needs the box, the V4.1 shard, the model file and $BLOOMERY_DATA/ref"]
 fn hw_q3k_tile_matches_dot_row() {
     let ty = GgmlType::Q3_K;
+    // Rows of two super-blocks, d = 1.0 then 0.5.
+    let k = 512;
+    type Kind = (fn(usize) -> u8, fn(usize) -> i8);
+    let kinds: [Kind; 7] = [
+        (|_| 0, |_| -32),
+        (|_| 0, |_| 31),
+        (|_| 7, |_| -32),
+        (|_| 7, |_| 31),
+        (|_| 0, |j| if j % 2 == 0 { -32 } else { 31 }),
+        (|_| 7, |j| if j % 2 == 0 { 31 } else { -32 }),
+        (|i| (i % 8) as u8, |j| 4 * j as i8 - 32),
+    ];
+    let mut rows = Vec::new();
+    for (u, s) in kinds {
+        for d in [0x3C00u16, 0x3800] {
+            rows.extend_from_slice(&q3k_block(u, s, d));
+        }
+    }
+    let ends = vec![
+        q8k_col(k, |_| -127, 0.01),
+        q8k_col(k, |_| 127, 0.01),
+        q8k_col(k, |_| -128, 0.01),
+        q8k_col(k, |i| if (i / 16) % 2 == 0 { -127 } else { 127 }, 0.02),
+    ];
+    let calls = assert_tile_matches(
+        ty,
+        "synthetic ends",
+        k,
+        k / 256 * 110,
+        &rows,
+        &coded_columns(ty, k, ends),
+    );
+    eprintln!("q3k tile: synthetic ends (k = {k}): {calls} row calls, c = 1..=8, bit-identical");
+
     let (name, k, row_bytes, bytes) = v41_rows(ty, "ffn_gate_exps", TILE_ROWS);
     let calls = assert_tile_matches(
         ty,
