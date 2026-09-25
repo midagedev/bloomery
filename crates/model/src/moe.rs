@@ -30,8 +30,9 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    GroupInput, ShardTensor, Tensor2, Weight, matmul_q, matmul_q_group, matmul_q_group_cols_into,
-    matmul_q_group_into, matmul_q_group_swiglu, matmul_q_group_swiglu_into,
+    DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Weight, matmul_q,
+    matmul_q_group, matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
+    matmul_q_group_swiglu_into,
 };
 use crate::profile;
 
@@ -1046,11 +1047,14 @@ impl UnionPlan {
 /// combine and down blocks of one chunk of [`UNION_CHUNK`] experts, reused
 /// chunk after chunk, each narrowed in place to the columns that list its
 /// expert; the down columns of every chunk but the last, kept in `store`
-/// until the list-order sums at the end; and the plan's buffers.
+/// until the list-order sums at the end; `x` quantized once for every chunk
+/// of a wide call; and the plan's buffers.
 ///
 /// For `cols` columns, `embd` and `ff` wide experts, it holds
 /// `4 · (3 · ff + embd) · UNION_CHUNK · cols` bytes of chunk blocks,
-/// `4 · embd · EXPERTS_INTO_MAX · cols` of store and a few words per slot.
+/// `4 · embd · EXPERTS_INTO_MAX · cols` of store, a few words per slot and,
+/// from the first call wider than [`DEFER_MAX_COLS`], `cols` quantized
+/// columns of `embd` values (`qdot::col_bytes` each, about `embd` bytes).
 pub struct UnionScratch {
     embd: usize,
     ff: usize,
@@ -1065,6 +1069,8 @@ pub struct UnionScratch {
     /// `d`) at `store[q·embd..(q + 1)·embd]`, for experts outside the last
     /// chunk.
     store: Vec<f32>,
+    /// A wide call's `x`, quantized once in the gate's encoding.
+    xq: QuantizedCols,
     plan: UnionPlan,
 }
 
@@ -1090,6 +1096,7 @@ impl UnionScratch {
             pars: std::array::from_fn(|_| Tensor2::zeros(ff, cols)),
             downs: std::array::from_fn(|_| Tensor2::zeros(embd, cols)),
             store: vec![0.0; embd * cols * EXPERTS_INTO_MAX],
+            xq: QuantizedCols::new(),
             plan: UnionPlan::with_room(cols),
         })
     }
@@ -1165,9 +1172,11 @@ thread_local! {
 /// their downs over those columns' combines. Each weight row is read once
 /// per call; its runs of up to [`qdot::TILE_COLS`] listed columns go to the
 /// tile kernel, which writes each column's `dot_row` value. A call of at
-/// most [`DEFER_MAX_COLS`](crate::ops::DEFER_MAX_COLS) columns has its
-/// quantization claimed inside each row dispatch; a wider one takes the
-/// pre-pass — the same bytes either way. A chunk's downs are copied to the
+/// most [`DEFER_MAX_COLS`] columns has its quantization claimed inside each
+/// row dispatch; a wider one quantizes `x` once, over the pool, before the
+/// first chunk, and every chunk's gate and up read those bytes
+/// ([`GroupInput::Quantized`]; a pair of another encoding keeps
+/// [`GroupInput::Cols`]) — the same bytes either way. A chunk's downs are copied to the
 /// store before the next chunk reuses their blocks, and each column's sum
 /// runs last, in that column's list order from zero — the order its
 /// one-column call adds in. `resolve` gives an expert's `[gate, up, down]`;
@@ -1181,10 +1190,12 @@ fn serve_union<'w>(
     s: &mut UnionScratch,
 ) -> Result<(), ModelError> {
     let UnionScratch {
+        max_cols,
         gate_up,
         pars,
         downs,
         store,
+        xq,
         plan,
         ..
     } = s;
@@ -1192,6 +1203,18 @@ fn serve_union<'w>(
     let lvl = profile::level();
     let (mut x_ns, mut h_ns) = (0u64, 0u64);
     let embd = x.ne0;
+    // Only a call wider than any claim takes: the decode and verify shapes
+    // keep their claimed, per-dispatch quantization untouched.
+    let mut filled = false;
+    if x.ne1 > DEFER_MAX_COLS && plan.n() > 0 {
+        let t_x = if lvl > 0 { Some(Instant::now()) } else { None };
+        let gate = resolve(plan.ids[0])?[0];
+        filled = xq.fill(gate.ty(), x, *max_cols);
+        if let Some(t_x) = t_x {
+            x_ns += t_x.elapsed().as_nanos() as u64;
+        }
+    }
+    let xq: Option<&QuantizedCols> = filled.then_some(&*xq);
     let n_chunks = plan.n().div_ceil(UNION_CHUNK);
     let per = if n_chunks == 0 {
         0
@@ -1215,8 +1238,12 @@ fn serve_union<'w>(
             gu[2 * i + 1] = u;
             down[i] = dw;
             let cols = plan.cols(d);
-            srcs[2 * i] = GroupInput::Cols(x, cols);
-            srcs[2 * i + 1] = GroupInput::Cols(x, cols);
+            let src = |w: &Weight<'_>| match xq {
+                Some(q) if q.serves(w.ty(), w.k()) => GroupInput::Quantized(x, q, cols),
+                _ => GroupInput::Cols(x, cols),
+            };
+            srcs[2 * i] = src(&g);
+            srcs[2 * i + 1] = src(&u);
             gate_up[2 * i].set_cols(cols.len());
             gate_up[2 * i + 1].set_cols(cols.len());
             pars[i].set_cols(cols.len());

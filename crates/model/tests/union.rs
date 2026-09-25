@@ -22,7 +22,14 @@
 //! per column so some experts carry many columns (runs of the tile kernel,
 //! chunks whose downs are kept in the store), every list length from empty
 //! to `EXPERTS_INTO_MAX`, a repeat at a negative weight, and activation
-//! columns that are the set's tokens rescaled.
+//! columns that are the set's tokens rescaled. A routed case at k = 512 draws
+//! each column's `n_used` experts uniformly from the layer's: the binomial
+//! spread of columns per expert a prefill ubatch has, so one chunk mixes
+//! experts of one tile run with experts of two or three, and most chunks'
+//! downs carry a combine wider than a claim takes. Every wide call quantizes
+//! `x` once for all its chunks, produces its wide chunks' combines in the
+//! pre-pass and cuts those chunks' lanes by the tile's cost; the k <= 8 cases
+//! above never do.
 //!
 //! The free entry `moe::experts_union_into` (one file, a `MoeBlockPlan`) is
 //! held to its own `experts_into` on V2-Lite's block 1 at k = 6, over seeded
@@ -63,6 +70,9 @@ const SMALL_COLS: usize = 8;
 /// The wide column counts, each with the expert pool its lists draw from
 /// (`None`: every expert of the layer).
 const WIDE: [(usize, Option<usize>); 3] = [(16, Some(32)), (64, Some(128)), (512, None)];
+
+/// The routed case's columns: one prefill ubatch.
+const ROUTED_K: usize = UNION_MAX_COLS;
 
 /// The deferral arms: the claim inside the row dispatch, then the pre-pass.
 const ARMS: [(&str, bool); 2] = [("defer", true), ("prepass", false)];
@@ -432,8 +442,36 @@ fn wide_case(x_all: &[f32], embd: usize, k: usize, pool: usize, n_expert: usize)
     }
 }
 
-/// The columns the most-listed expert of `case` carries.
-fn max_cols_per_expert(case: &Case) -> usize {
+/// The routed case of `k` columns on one layer: column `j` is token
+/// `j % n_tokens` of `x_all` scaled by `1 - j/(2k)`, routed to `n_used`
+/// distinct experts drawn uniformly from the layer's `n_expert` at weights in
+/// [0.05, 0.3).
+fn routed_case(x_all: &[f32], embd: usize, k: usize, n_expert: usize, n_used: usize) -> Case {
+    let n_tokens = x_all.len() / embd;
+    let mut rng = Stream(0x0b17_ba5e_0000 ^ k as u64);
+    let mut data = Vec::with_capacity(k * embd);
+    let mut lists = Vec::with_capacity(k);
+    for j in 0..k {
+        let scale = 1.0 - j as f32 / (2 * k) as f32;
+        let t = j % n_tokens;
+        data.extend(x_all[t * embd..(t + 1) * embd].iter().map(|&v| v * scale));
+        let mut l: Vec<(u32, f32)> = Vec::with_capacity(n_used);
+        while l.len() < n_used {
+            let e = (rng.next() % n_expert as u64) as u32;
+            if l.iter().all(|&(f, _)| f != e) {
+                l.push((e, 0.05 + 0.25 * rng.unit()));
+            }
+        }
+        lists.push(l);
+    }
+    Case {
+        x: Tensor2::from_vec(embd, k, data),
+        lists,
+    }
+}
+
+/// The columns each distinct expert of `case` carries.
+fn cols_by_expert(case: &Case) -> std::collections::HashMap<u32, usize> {
     let mut n = std::collections::HashMap::new();
     for l in &case.lists {
         let mut seen: Vec<u32> = l.iter().map(|&(e, _)| e).collect();
@@ -443,7 +481,22 @@ fn max_cols_per_expert(case: &Case) -> usize {
             *n.entry(e).or_insert(0usize) += 1;
         }
     }
-    n.into_values().max().unwrap_or(0)
+    n
+}
+
+/// Columns per distinct expert of `case`: (fewest, most, experts past one
+/// tile run of `qdot::TILE_COLS`).
+fn cols_per_expert(case: &Case) -> (usize, usize, usize) {
+    let n = cols_by_expert(case);
+    let lo = n.values().copied().min().unwrap_or(0);
+    let hi = n.values().copied().max().unwrap_or(0);
+    let past = n.values().filter(|&&m| m > qdot::TILE_COLS).count();
+    (lo, hi, past)
+}
+
+/// The columns the most-listed expert of `case` carries.
+fn max_cols_per_expert(case: &Case) -> usize {
+    cols_by_expert(case).into_values().max().unwrap_or(0)
 }
 
 #[test]
@@ -453,7 +506,7 @@ fn hw_union_wide_matches_per_column_v41() {
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
     let set = v41set::Set::open(&split, SET, BUILD);
-    let (embd, ff) = (hp.n_embd, hp.experts.ff);
+    let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
     let n_tokens = set
         .shapes
         .get("ffn_norm-0")
@@ -480,6 +533,7 @@ fn hw_union_wide_matches_per_column_v41() {
     let t0 = std::time::Instant::now();
     let mut failed: Vec<(usize, usize, &str)> = Vec::new();
     let mut every_expert = true;
+    let mut routed_spread = true;
     for (l, layer) in &picked {
         let n_expert = layer.n_expert();
         let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
@@ -514,8 +568,39 @@ fn hw_union_wide_matches_per_column_v41() {
             }
             println!("{line} {}", if diff == 0 { "PASS" } else { "FAIL" });
         }
+        let case = routed_case(&x_all, embd, ROUTED_K, n_expert, n_used);
+        let want = per_column(layer, &split, &case, &mut host);
+        let lists = case.slices();
+        let (lo, hi, past) = cols_per_expert(&case);
+        let mut line = format!(
+            "layer={l} down={:?} k={ROUTED_K} routed slots={} union={} cols_per_expert={lo}..{hi} \
+             past_one_run={past}",
+            layer.stacks()[2].info().ty,
+            case.slots(),
+            case.union(),
+        );
+        routed_spread &= lo < hi && past > 0 && past < case.union();
+        let mut diff = 0;
+        for (arm, on) in ARMS {
+            ops::set_defer_quant(Some(on));
+            let mut got = vec![f32::NAN; embd * ROUTED_K];
+            let r = layer.experts_union_into(&split, &case.x, &lists, &mut got, &mut us);
+            ops::set_defer_quant(None);
+            r.unwrap_or_else(|e| panic!("layer {l} routed {arm}: {e}"));
+            let d = diff_cells(&got, &want);
+            line += &format!(" {arm}: diff_cells={d}");
+            if d != 0 {
+                failed.push((*l, ROUTED_K, arm));
+            }
+            diff += d;
+        }
+        println!("{line} {}", if diff == 0 { "PASS" } else { "FAIL" });
     }
     println!("union wide: wall {:.1} s", t0.elapsed().as_secs_f64());
+    assert!(
+        routed_spread,
+        "the routed case must mix experts of one tile run with experts of more"
+    );
     assert!(
         every_expert,
         "the k = 512 case must serve every expert of its layer in one call"
@@ -527,8 +612,8 @@ fn hw_union_wide_matches_per_column_v41() {
     );
     println!(
         "PASSED: union wide — experts_union_into equals experts_into column for column, bit for \
-         bit, at k = 16, 64, 512 (the last over every expert of the layer) on a Q5_K-down and a \
-         Q4_K-down layer under both deferral arms"
+         bit, at k = 16, 64, 512 (the last over every expert of the layer) and a routed k = 512 \
+         on a Q5_K-down and a Q4_K-down layer under both deferral arms"
     );
 }
 
