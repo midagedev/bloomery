@@ -7,21 +7,39 @@
 //! `flash_latent_mma` expands — at the latent width, and a merge that folds
 //! a row's segments in order and then its head's sink.
 //!
-//! Keys come from two sources: the window ring (the layer's last `W` latent
-//! rows) and the layer stream's compressed rows (none on a layer without a
-//! stream). A launch's segments are the window's first, then the compressed
-//! rows', and the merge folds them in that order — fixed, so reruns are
-//! bit-identical. Token `t` sees `vis[2t]` window rows, `min(pos + 1, W)`,
-//! the ring's first rows (its first rows while `pos < W`, all of it once
-//! full, since the ring then holds exactly the window), and `vis[2t + 1]`
-//! compressed rows, read one of two ways: a prefix of the stream,
-//! `(pos + 1) / ratio` rows (`ds41_attn_seg`), or the rows the indexer
-//! selects, read in place through its list — the first `vis[2t + 1]` entries
-//! of the token's row of the list, in list order (`ds41_attn_seg_sel`). The
-//! counts and the lists live in device memory, so a captured step reads them
-//! per replay; the grid comes from the ring's and the stream's (or the
-//! list's) heights. A batch whose window wraps the ring is outside this
-//! contract.
+//! Keys come from two sources: the window and the layer stream's compressed
+//! rows (none on a layer without a stream). A launch's segments are the
+//! window's first, then the compressed rows', and the merge folds them in
+//! that order — fixed, so reruns are bit-identical. Token `t` at position
+//! `pos` sees `vis[2t]` window keys, `min(pos + 1, W)`: slots `0 .. vis[2t]`
+//! of the layer's window ring, which keeps position `p` at slot `p % W` (`W`
+//! its rows), walked in slot order — its first slots while `pos < W`, all of
+//! them once it is full. It sees `vis[2t + 1]` compressed rows, read one of
+//! two ways: a prefix of the stream, `(pos + 1) / ratio` rows, or the rows
+//! the indexer selects, read in place through its list — the first
+//! `vis[2t + 1]` entries of the token's row of the list, in list order.
+//!
+//! Where a window key's row is read from is the enqueue's choice:
+//! - [`AttnKernels::enqueue`] (`ds41_attn_seg`, `ds41_attn_seg_sel`): slot
+//!   `s` reads the ring's row `s`, the ring as it stands at launch. That is
+//!   the window when the ring holds every row the tokens see and none they
+//!   must not: the decode step, which writes its own row first (over
+//!   position `pos − W`, outside its window), or a batch whose own rows are
+//!   not window keys.
+//! - [`AttnKernels::enqueue_staged`] (`ds41_attn_seg_stage`,
+//!   `ds41_attn_seg_sel_stage`): a batch of `T` tokens at positions `b ..
+//!   b + T` whose own rows sit in a staging buffer, row `j` position `b + j`,
+//!   while the ring still holds the positions below `b`. Slot `s` of token
+//!   `t` holds position `pos − d`, `d = (pos − s) mod W`: it reads staging
+//!   row `t − d` when `d <= t`, else ring row `s`. The walk keeps the slot
+//!   order, so every token's output is the one-token launch's at its
+//!   position bit for bit, wherever the batch starts against the wrap and
+//!   however long it is. [`AttnKernels::enqueue_commit`]
+//!   (`ds41_ring_commit`) then copies the last `min(T, W)` staged rows into
+//!   their slots, which leaves the ring as `T` decode steps would.
+//!
+//! The counts, the lists and `b` live in device memory, so a captured graph
+//! reads them per replay; the grid comes from the buffers' heights.
 //!
 //! A block serves one token: sixteen of its heads, the `mma.sync` `M` axis,
 //! over one segment — a launch of T tokens is T one-token launches' blocks
@@ -103,16 +121,20 @@ pub fn partials_ms_len(q_rows: usize, segs: usize) -> usize {
     q_rows * segs * 2
 }
 
-/// A segment block's body, the one both segment entries expand: the grid
+/// A segment block's body, the one every segment entry expands: the grid
 /// decomposition, the token's counts and limit, the neutral partial past a
-/// count, the block's shared memory and the walk. A window key is its own
-/// ring row; compressed key `key` of token `t` reads row `comp_row` of
-/// `comp`. `comp_keys` is the compressed source's key capacity — the grid's
-/// share and the bound on every count. `comp_row` is evaluated only for a
-/// key below the token's limit, `min(count, comp_keys)`. `check` runs once
-/// per compressed key of the block's segment, one key per thread, before the
-/// walk and with no barrier: the refusals of `comp_row`'s inputs live there,
-/// so nothing they hold is live across the walk.
+/// count, the block's shared memory and the walk. `source` is the walk's
+/// source (`kvw`) for the block's segment, from the names it binds: whether
+/// the segment is the window's and the slice it reads (`win` or `comp`).
+/// Window key `key` of token `t` reads row `window` of that source and
+/// compressed key `key` row `comp` — `key` itself for a window read from the
+/// ring alone and for a compressed prefix. `comp_keys` is the compressed
+/// source's key capacity — the grid's share and the bound on every count.
+/// The row expressions are evaluated only for a key below the token's
+/// limit, `min(count, keys)`. `check` runs once per compressed key of the
+/// block's segment, one key per thread, before the walk and with no barrier:
+/// the refusals of the compressed row's inputs live there, so nothing they
+/// hold is live across the walk.
 macro_rules! segment_pass {
     (
         q: $q:ident,
@@ -128,7 +150,8 @@ macro_rules! segment_pass {
         segs: $segs:ident,
         part_v: $part_v:ident,
         part_ms: $part_ms:ident,
-        comp_row: |$t:ident, $key:ident| $comp_row:expr,
+        source: |$window:ident, $src:ident| $kvw:expr,
+        key_rows: |$t:ident, $key:ident| window: $win_row:expr, comp: $comp_row:expr,
         check: |$ckey:ident| $check:block $(,)?
     ) => {{
         // Per head, the tile's scaled logits and then its weights.
@@ -153,15 +176,15 @@ macro_rules! segment_pass {
         let grp = b - seg * groups;
         let base_row = grp * MMA_ROWS;
         let $t = base_row / heads;
-        let window = seg < $segs_w as usize;
-        let (src, src_keys, first_seg) = if window {
+        let $window = seg < $segs_w as usize;
+        let ($src, src_keys, first_seg) = if $window {
             ($win, $win_rows as usize, 0)
         } else {
             ($comp, $comp_keys, $segs_w as usize)
         };
         // SAFETY: t < tokens, so both of its counts are inside vis (launch
         // contract).
-        let count = unsafe { *$vis.get_unchecked(2 * $t + usize::from(!window)) } as usize;
+        let count = unsafe { *$vis.get_unchecked(2 * $t + usize::from(!$window)) } as usize;
         let limit = count.min(src_keys);
         let lo = (seg - first_seg) * SEG_KEYS;
         if lo >= limit {
@@ -178,7 +201,7 @@ macro_rules! segment_pass {
         }
         let hi_max = (lo + SEG_KEYS).min(limit);
         // SEG_KEYS <= the block's threads, so one pass covers the segment.
-        if !window && lo + tid < hi_max {
+        if !$window && lo + tid < hi_max {
             let $ckey = lo + tid;
             $check
         }
@@ -201,7 +224,7 @@ macro_rules! segment_pass {
         };
         // The source rows pair-wise: 512 f16 per row, device-allocated, so
         // every u32 read of the walk is aligned.
-        let kvw = src.as_ptr().cast::<u32>();
+        let kvw = $kvw;
         // Every head of the group is one token's, so all share its limit.
         if tid < MMA_ROWS {
             // SAFETY: tid < MMA_ROWS bounds the store.
@@ -217,7 +240,7 @@ macro_rules! segment_pass {
             width: LATENT,
             q: $q,
             kvw: kvw,
-            key: $key => if window { $key } else { $comp_row },
+            key: $key => if $window { $win_row } else { $comp_row },
             scratch: (qs, kt, klog, kw, vms_sh, lim_sh),
             rows: rows,
             base_row: base_row,
@@ -234,6 +257,77 @@ macro_rules! segment_pass {
             part_ms: $part_ms,
         }
     }};
+}
+
+/// The window's key rows as one row space, ring ⧺ staging: row `r` below
+/// the ring's rows is the ring's row `r`, and the row `j` past them is
+/// staging row `j`. The segment walk reads its source only as
+/// `kvw.add(word)`, the source's word `word`, so this type is what lets one
+/// walk read the two buffers in slot order without copying either.
+#[derive(Clone, Copy)]
+struct RingStage {
+    ring: *const u32,
+    stage: *const u32,
+    /// Words of the ring: the first word past it is staging word 0.
+    ring_words: u32,
+}
+
+impl RingStage {
+    /// The ring's `ring_rows` rows, then the staging rows.
+    fn split(ring: &[u16], stage: &[u16], ring_rows: u32) -> RingStage {
+        RingStage {
+            ring: ring.as_ptr().cast(),
+            stage: stage.as_ptr().cast(),
+            ring_words: ring_rows * const { (LATENT / 2) as u32 },
+        }
+    }
+
+    /// One buffer's rows alone: a ring of no words, so every word is the
+    /// buffer's own.
+    fn whole(rows: &[u16]) -> RingStage {
+        RingStage {
+            ring: rows.as_ptr().cast(),
+            stage: rows.as_ptr().cast(),
+            ring_words: 0,
+        }
+    }
+
+    /// Word `word` of the row space.
+    ///
+    /// # Safety
+    ///
+    /// `word` is inside the row space: below the ring's words a word of the
+    /// ring, else `word − ring_words` a word of the staging rows.
+    unsafe fn add(self, word: usize) -> *const u32 {
+        let ring_words = self.ring_words as usize;
+        if word < ring_words {
+            // SAFETY: a word of the ring (the caller's contract).
+            unsafe { self.ring.add(word) }
+        } else {
+            // SAFETY: word − ring_words is a word of the staging rows (the
+            // caller's contract).
+            unsafe { self.stage.add(word - ring_words) }
+        }
+    }
+}
+
+/// The row of ring ⧺ staging ([`RingStage`]) that window key `slot` of batch
+/// token `t` reads, for a batch whose first position is `b`, over a ring of
+/// `ring_rows` rows. The slot holds position `pos − d`, `pos = b + t` and
+/// `d = (pos − slot) mod ring_rows`: staging row `t − d` — row `ring_rows +
+/// t − d` of the row space — when `d <= t`, a position of the batch; else
+/// the ring's own row `slot`. `slot < min(pos + 1, ring_rows)`, and `b + t`
+/// and `ring_rows + t` are positions, so they fit u32.
+#[inline(always)]
+fn window_row(b: u32, t: usize, slot: usize, ring_rows: u32) -> usize {
+    let (t, slot) = (t as u32, slot as u32);
+    let ps = (b + t) % ring_rows;
+    let d = if slot <= ps {
+        ps - slot
+    } else {
+        ps + ring_rows - slot
+    };
+    (if d <= t { ring_rows + t - d } else { slot }) as usize
 }
 
 #[cuda_module]
@@ -297,7 +391,8 @@ mod attn_kernels {
             segs: segs,
             part_v: part_v,
             part_ms: part_ms,
-            comp_row: |t, key| key,
+            source: |window, src| src.as_ptr().cast::<u32>(),
+            key_rows: |t, key| window: key, comp: key,
             check: |_key| {},
         }
     }
@@ -364,7 +459,8 @@ mod attn_kernels {
             segs: segs,
             part_v: part_v,
             part_ms: part_ms,
-            comp_row: |t, key| {
+            source: |window, src| src.as_ptr().cast::<u32>(),
+            key_rows: |t, key| window: key, comp: {
                 // SAFETY: t < tokens and key < min(count, sel_stride) put
                 // the load inside sel (launch contract).
                 let r = unsafe { *sel.get_unchecked(t * sel_stride as usize + key) } as usize;
@@ -374,6 +470,160 @@ mod attn_kernels {
             },
             check: |key| {
                 // SAFETY: as `comp_row`'s load, for the same (t, key).
+                let r = unsafe { *sel.get_unchecked(t * sel_stride as usize + key) };
+                if r >= comp_rows {
+                    fault.raise(FaultSite::AttnSel);
+                }
+            },
+        }
+    }
+
+    /// `ds41_attn_seg` for a batch whose own rows are staged: window key
+    /// `key` of token `t` reads row [`window_row`]`(b, t, key, win_rows)` of
+    /// ring ⧺ staging, `b = base[0]` the batch's first position and `stage`
+    /// its rows, row `j` position `b + j`.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        dynamic_shared = 49920,
+        requires = (
+            vis.len() >= 2 * tokens,
+            q.len() >= tokens * n_heads * 512,
+            win.len() >= win_rows * 512,
+            win_rows >= 1,
+            stage.len() >= tokens * 512,
+            base.len() >= 1,
+            comp.len() >= comp_rows * 512,
+            part_v.len() >= tokens * n_heads * segs * 512,
+            part_ms.len() >= tokens * n_heads * segs * 2
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a kernel entry takes its launch arguments as the device ABI does"
+    )]
+    pub fn ds41_attn_seg_stage(
+        q: &[f32],
+        win: &[u16],
+        stage: &[u16],
+        base: &[u32],
+        comp: &[u16],
+        vis: &[u32],
+        scale: f32,
+        tokens: u32,
+        n_heads: u32,
+        win_rows: u32,
+        comp_rows: u32,
+        segs_w: u32,
+        segs: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+    ) {
+        // SAFETY: base.len() >= 1 (launch contract).
+        let b = unsafe { *base.get_unchecked(0) };
+        segment_pass! {
+            q: q,
+            win: win,
+            comp: comp,
+            vis: vis,
+            scale: scale,
+            tokens: tokens,
+            n_heads: n_heads,
+            win_rows: win_rows,
+            comp_keys: comp_rows as usize,
+            segs_w: segs_w,
+            segs: segs,
+            part_v: part_v,
+            part_ms: part_ms,
+            source: |window, src| if window {
+                RingStage::split(src, stage, win_rows)
+            } else {
+                RingStage::whole(src)
+            },
+            key_rows: |t, key| window: window_row(b, t, key, win_rows), comp: key,
+            check: |_key| {},
+        }
+    }
+
+    /// `ds41_attn_seg_sel` for a batch whose own rows are staged, window
+    /// keys read as in `ds41_attn_seg_stage`.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        dynamic_shared = 49920,
+        requires = (
+            vis.len() >= 2 * tokens,
+            q.len() >= tokens * n_heads * 512,
+            win.len() >= win_rows * 512,
+            win_rows >= 1,
+            stage.len() >= tokens * 512,
+            base.len() >= 1,
+            comp.len() >= comp_rows * 512,
+            comp_rows >= 1,
+            sel.len() >= tokens * sel_stride,
+            part_v.len() >= tokens * n_heads * segs * 512,
+            part_ms.len() >= tokens * n_heads * segs * 2
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a kernel entry takes its launch arguments as the device ABI does"
+    )]
+    pub fn ds41_attn_seg_sel_stage(
+        q: &[f32],
+        win: &[u16],
+        stage: &[u16],
+        base: &[u32],
+        comp: &[u16],
+        sel: &[u32],
+        vis: &[u32],
+        scale: f32,
+        tokens: u32,
+        n_heads: u32,
+        win_rows: u32,
+        comp_rows: u32,
+        sel_stride: u32,
+        segs_w: u32,
+        segs: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        // SAFETY: base.len() >= 1 (launch contract).
+        let b = unsafe { *base.get_unchecked(0) };
+        segment_pass! {
+            q: q,
+            win: win,
+            comp: comp,
+            vis: vis,
+            scale: scale,
+            tokens: tokens,
+            n_heads: n_heads,
+            win_rows: win_rows,
+            comp_keys: sel_stride as usize,
+            segs_w: segs_w,
+            segs: segs,
+            part_v: part_v,
+            part_ms: part_ms,
+            source: |window, src| if window {
+                RingStage::split(src, stage, win_rows)
+            } else {
+                RingStage::whole(src)
+            },
+            key_rows: |t, key| window: window_row(b, t, key, win_rows), comp: {
+                // SAFETY: t < tokens and key < min(count, sel_stride) put
+                // the load inside sel (launch contract).
+                let r = unsafe { *sel.get_unchecked(t * sel_stride as usize + key) } as usize;
+                // `check` has raised for an entry past the stream; row 0
+                // keeps the access inside it.
+                if r < comp_rows as usize { r } else { 0 }
+            },
+            check: |key| {
+                // SAFETY: as `comp`'s load, for the same (t, key).
                 let r = unsafe { *sel.get_unchecked(t * sel_stride as usize + key) };
                 if r >= comp_rows {
                     fault.raise(FaultSite::AttnSel);
@@ -462,12 +712,58 @@ mod attn_kernels {
             *y.get_unchecked_mut(row * LATENT + tid) = s_inv * acc;
         }
     }
+
+    /// The commit after a staged batch: block `j` copies staging row
+    /// `tokens − n + j` into ring slot `(b + tokens − n + j) % ring_rows`,
+    /// `n = min(tokens, ring_rows)` the rows the ring keeps and `b = base[0]`
+    /// the batch's first position, one thread per latent dim. The `n`
+    /// positions are consecutive, so their slots are distinct.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            stage.len() >= tokens * 512,
+            base.len() >= 1,
+            ring_rows >= 1,
+            ring.len() >= ring_rows * 512
+        )
+    )]
+    pub fn ds41_ring_commit(
+        stage: &[u16],
+        base: &[u32],
+        ring_rows: u32,
+        tokens: u32,
+        mut ring: DisjointSlice<u16>,
+    ) {
+        let j = thread::blockIdx_x() as usize;
+        let n = tokens.min(ring_rows) as usize;
+        if j >= n {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let row = tokens as usize - n + j;
+        // SAFETY: base.len() >= 1 (launch contract).
+        let b = unsafe { *base.get_unchecked(0) };
+        let slot = ((b + row as u32) % ring_rows) as usize;
+        // SAFETY: row < tokens and tid < LATENT put the load inside stage
+        // (launch contract).
+        let v = unsafe { *stage.get_unchecked(row * LATENT + tid) };
+        // SAFETY: slot < ring_rows and tid < LATENT put the store inside ring
+        // (launch contract); each (slot, dim) has one writer, the slots being
+        // distinct.
+        unsafe {
+            *ring.get_unchecked_mut(slot * LATENT + tid) = v;
+        }
+    }
 }
 
-/// The loaded V4.1 attention module: `ds41_attn_seg`, `ds41_attn_seg_sel`
-/// and `ds41_attn_merge`. Owns no context and no stream — every enqueue
-/// takes the caller's stream, so the launches order with the rest of the
-/// step and are capturable.
+/// The loaded V4.1 attention module: the segment entries `ds41_attn_seg`,
+/// `ds41_attn_seg_sel` and their staged twins, `ds41_attn_merge` and
+/// `ds41_ring_commit`. Owns no context and no stream — every enqueue takes
+/// the caller's stream, so the launches order with the rest of the step and
+/// are capturable.
 pub struct AttnKernels {
     module: attn_kernels::LoadedModule,
 }
@@ -484,13 +780,27 @@ pub struct SelectedRows<'a> {
     pub fault: FaultSink,
 }
 
+/// A batch's own latent rows, staged beside the window ring until the batch
+/// has attended ([`AttnKernels::enqueue_staged`]) and they are committed
+/// ([`AttnKernels::enqueue_commit`]).
+#[derive(Clone, Copy)]
+pub struct Staged<'a> {
+    /// `[rows x LATENT]` f16 bits: row `j` is position `b + j`, one row per
+    /// token of the batch.
+    pub rows: &'a DeviceTensor<u16>,
+    /// Word 0 is `b`, the batch's first position. Every launch reads it, so
+    /// a captured graph replays at any position.
+    pub base: &'a DeviceBuffer<u32>,
+}
+
 /// One attention launch's inputs and outputs. Rows are `tokens * heads`
 /// query rows of [`LATENT`] f32, row `t * heads + h`, and `y` comes back in
 /// the same order.
 pub struct AttnArgs<'a> {
     /// The query rows.
     pub q: &'a DeviceBuffer<f32>,
-    /// The window ring, `[rows x LATENT]` f16 bits.
+    /// The window ring, `[rows x LATENT]` f16 bits, position `p` at slot
+    /// `p % rows`.
     pub window: &'a DeviceTensor<u16>,
     /// The layer stream's compressed rows, `[rows x LATENT]` f16 bits;
     /// `None` on a layer without a stream.
@@ -498,9 +808,9 @@ pub struct AttnArgs<'a> {
     /// The indexer's lists, when the compressed rows are read through them;
     /// `None` reads a prefix of the stream. Needs `compressed`.
     pub selected: Option<SelectedRows<'a>>,
-    /// Per token `t`: `vis[2t]` window rows (a prefix of the ring) and
-    /// `vis[2t + 1]` compressed rows (a prefix of the stream, or of the
-    /// token's list).
+    /// Per token `t`: `vis[2t]` window keys (slots `0 .. vis[2t]` of the
+    /// ring, in slot order) and `vis[2t + 1]` compressed rows (a prefix of
+    /// the stream, or of the token's list).
     pub vis: &'a DeviceBuffer<u32>,
     /// Each head's sink logit.
     pub sinks: &'a DeviceBuffer<f32>,
@@ -515,6 +825,33 @@ pub struct AttnArgs<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
+/// [`AttnKernels::enqueue_commit`]'s arguments.
+pub struct CommitArgs<'a> {
+    /// The batch: its staged rows and its first position.
+    pub staged: Staged<'a>,
+    /// The batch's tokens, one staged row each.
+    pub tokens: usize,
+    /// The window ring the batch attended.
+    pub ring: &'a mut DeviceTensor<u16>,
+}
+
+/// What every segment entry takes once the launch's shapes have passed,
+/// narrowed to the launch's integers.
+struct Segments<'a> {
+    config: LaunchConfig1D,
+    q: &'a DeviceBuffer<f32>,
+    win: &'a DeviceBuffer<u16>,
+    comp: &'a DeviceBuffer<u16>,
+    vis: &'a DeviceBuffer<u32>,
+    scale: f32,
+    tokens: u32,
+    heads: u32,
+    win_rows: u32,
+    comp_rows: u32,
+    segs_w: u32,
+    segs: u32,
+}
+
 impl AttnKernels {
     /// Load this file's device bundle into `ctx`. Load-time only.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<AttnKernels, GpuError> {
@@ -524,15 +861,108 @@ impl AttnKernels {
         Ok(AttnKernels { module })
     }
 
-    /// Enqueue the attention: the segment pass over [`segments`]`(window
-    /// rows, compressed keys)` segments per query row — the prefix entry, or
-    /// the selected-row entry when `selected` is given — then the merge into
+    /// Enqueue the attention with every window key read from the ring as it
+    /// stands: the segment pass over [`segments`]`(window rows, compressed
+    /// keys)` segments per query row — the prefix entry, or the
+    /// selected-row entry when `selected` is given — then the merge into
     /// `y`. Two launches whose grids come from the buffers' heights, not
     /// from `vis` or the lists, so a captured graph replays them at any
     /// visible count and any selection. Asynchronous, allocation-free,
     /// capturable.
     pub fn enqueue(&self, stream: &CudaStream, a: AttnArgs<'_>) -> Result<(), GpuError> {
-        let what = "ds41 AttnKernels::enqueue";
+        self.enqueue_with(stream, a, None)
+    }
+
+    /// Enqueue the attention of a batch whose own rows are `staged` and not
+    /// yet in the ring, which holds the last `min(b, W)` positions below
+    /// `b`: token `t` is at position `b + t`, and each window key reads the
+    /// staging row of its position when the position is the batch's, else
+    /// its ring slot ([`window_row`]). Launches, grids and the rest as
+    /// [`AttnKernels::enqueue`]'s. The ring is not written;
+    /// [`AttnKernels::enqueue_commit`] does that once every launch that
+    /// reads the batch this way is enqueued. Refused before any launch: a
+    /// ring of no rows, staging rows that are not [`LATENT`] wide or fewer
+    /// than `tokens`, and a base buffer of no word.
+    pub fn enqueue_staged(
+        &self,
+        stream: &CudaStream,
+        a: AttnArgs<'_>,
+        staged: Staged<'_>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_with(stream, a, Some(staged))
+    }
+
+    /// Commit a staged batch of `tokens` rows to its ring: the last `min(tokens,
+    /// W)` staged rows into their slots, one launch whose grid comes from
+    /// `tokens` and the ring's height and which reads `b` on the device.
+    /// After it the ring holds what `tokens` decode steps from `b` would
+    /// have left. The ring's shadow is not this call's: it keeps a row per
+    /// position, every staged one included (a cut may restore a staged
+    /// position the ring never held), so whoever fills the staging writes
+    /// it. Refused before the launch: no token, a ring of no rows, rows that
+    /// are not [`LATENT`] wide, staging rows fewer than `tokens` and a base
+    /// buffer of no word. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_commit(&self, stream: &CudaStream, c: CommitArgs<'_>) -> Result<(), GpuError> {
+        let what = "ds41 AttnKernels::enqueue_commit";
+        let CommitArgs {
+            staged,
+            tokens,
+            ring,
+        } = c;
+        let shape = |detail: String| GpuError::Shape { what, detail };
+        if tokens == 0 || ring.rows() == 0 {
+            return Err(shape(format!(
+                "a batch of {tokens} tokens into a ring of {} rows: both at least one",
+                ring.rows()
+            )));
+        }
+        for (name, cols) in [("ring", ring.cols()), ("staging", staged.rows.cols())] {
+            if cols != LATENT {
+                return Err(shape(format!("{name} rows are {cols} wide, want {LATENT}")));
+            }
+        }
+        if staged.rows.rows() < tokens {
+            return Err(shape(format!(
+                "staging holds {} rows, the batch's {tokens} tokens stage one each",
+                staged.rows.rows()
+            )));
+        }
+        if staged.base.is_empty() {
+            return Err(shape(
+                "the base buffer holds no word: word 0 is the batch's first position".to_string(),
+            ));
+        }
+        let grid = launch_u32(what, "commit grid", tokens.min(ring.rows()))?;
+        let ring_rows = launch_u32(what, "ring rows", ring.rows())?;
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let prep = self
+            .module
+            .prepare_ds41_ring_commit(LaunchConfig1D::new(grid, BLOCK_U32, 0))?;
+        self.module.ds41_ring_commit(
+            stream,
+            &prep,
+            staged.rows.buf(),
+            staged.base,
+            ring_rows,
+            tokens,
+            ring.buf_mut(),
+        )?;
+        Ok(())
+    }
+
+    /// [`AttnKernels::enqueue`] with the ring alone, or
+    /// [`AttnKernels::enqueue_staged`] with `staged`.
+    fn enqueue_with(
+        &self,
+        stream: &CudaStream,
+        a: AttnArgs<'_>,
+        staged: Option<Staged<'_>>,
+    ) -> Result<(), GpuError> {
+        let what = if staged.is_some() {
+            "ds41 AttnKernels::enqueue_staged"
+        } else {
+            "ds41 AttnKernels::enqueue"
+        };
         let AttnArgs {
             q,
             window,
@@ -558,11 +988,33 @@ impl AttnKernels {
         for (name, cols) in [
             ("window", Some(window.cols())),
             ("compressed", compressed.map(DeviceTensor::cols)),
+            ("staging", staged.map(|s| s.rows.cols())),
         ] {
             if let Some(c) = cols
                 && c != LATENT
             {
                 return Err(shape(format!("{name} rows are {c} wide, want {LATENT}")));
+            }
+        }
+        if let Some(s) = staged {
+            if window.rows() == 0 {
+                return Err(shape(
+                    "a staged batch over a ring of no rows: a key's slot is its position \
+                     modulo the ring's rows"
+                        .to_string(),
+                ));
+            }
+            if s.rows.rows() < tokens {
+                return Err(shape(format!(
+                    "staging holds {} rows, the batch's {tokens} tokens stage one each",
+                    s.rows.rows()
+                )));
+            }
+            if s.base.is_empty() {
+                return Err(shape(
+                    "the base buffer holds no word: word 0 is the batch's first position"
+                        .to_string(),
+                ));
             }
         }
         let comp_keys = match &selected {
@@ -603,66 +1055,140 @@ impl AttnKernels {
         let comp = compressed.unwrap_or(window);
         let seg_grid = launch_u32(what, "segment grid", q_rows / MMA_ROWS * segs)?;
         let merge_grid = launch_u32(what, "merge grid", q_rows)?;
-        let tokens = launch_u32(what, "tokens", tokens)?;
-        let heads = launch_u32(what, "heads", heads)?;
+        let selected = match selected {
+            None => None,
+            Some(s) => Some((launch_u32(what, "selected stride", s.stride)?, s)),
+        };
+        let g = Segments {
+            config: LaunchConfig1D::new(seg_grid, BLOCK_U32, DYN_BYTES_U32),
+            q,
+            win: window.buf(),
+            comp: comp.buf(),
+            vis,
+            scale,
+            tokens: launch_u32(what, "tokens", tokens)?,
+            heads: launch_u32(what, "heads", heads)?,
+            win_rows: launch_u32(what, "window rows", window.rows())?,
+            comp_rows: launch_u32(what, "compressed rows", comp_rows)?,
+            segs_w: launch_u32(what, "window segments", segs_w)?,
+            segs: launch_u32(what, "segments", segs)?,
+        };
+        self.enqueue_segments(stream, &g, &mut *part_v, &mut *part_ms, selected, staged)?;
         let q_rows = launch_u32(what, "q_rows", q_rows)?;
-        let win_rows = launch_u32(what, "window rows", window.rows())?;
-        let comp_rows = launch_u32(what, "compressed rows", comp_rows)?;
-        let segs_w = launch_u32(what, "window segments", segs_w)?;
-        let segs = launch_u32(what, "segments", segs)?;
-        let seg_config = LaunchConfig1D::new(seg_grid, BLOCK_U32, DYN_BYTES_U32);
-        match selected {
-            None => {
-                let prep = self.module.prepare_ds41_attn_seg(seg_config)?;
-                self.module.ds41_attn_seg(
-                    stream,
-                    &prep,
-                    q,
-                    window.buf(),
-                    comp.buf(),
-                    vis,
-                    scale,
-                    tokens,
-                    heads,
-                    win_rows,
-                    comp_rows,
-                    segs_w,
-                    segs,
-                    &mut *part_v,
-                    &mut *part_ms,
-                )?;
-            }
-            Some(s) => {
-                let sel_stride = launch_u32(what, "selected stride", s.stride)?;
-                let prep = self.module.prepare_ds41_attn_seg_sel(seg_config)?;
-                self.module.ds41_attn_seg_sel(
-                    stream,
-                    &prep,
-                    q,
-                    window.buf(),
-                    comp.buf(),
-                    s.rows,
-                    vis,
-                    scale,
-                    tokens,
-                    heads,
-                    win_rows,
-                    comp_rows,
-                    sel_stride,
-                    segs_w,
-                    segs,
-                    &mut *part_v,
-                    &mut *part_ms,
-                    s.fault,
-                )?;
-            }
-        }
         let prep = self
             .module
             .prepare_ds41_attn_merge(LaunchConfig1D::new(merge_grid, BLOCK_U32, 0))?;
         self.module.ds41_attn_merge(
-            stream, &prep, q_rows, heads, segs, part_v, part_ms, sinks, y,
+            stream, &prep, q_rows, g.heads, g.segs, part_v, part_ms, sinks, y,
         )?;
+        Ok(())
+    }
+
+    /// The segment pass: the entry the compressed source (a prefix or the
+    /// selected rows, with the list's stride) and the window's (the ring,
+    /// or ring ⧺ staging) pick.
+    fn enqueue_segments(
+        &self,
+        stream: &CudaStream,
+        g: &Segments<'_>,
+        part_v: &mut DeviceBuffer<f32>,
+        part_ms: &mut DeviceBuffer<f32>,
+        selected: Option<(u32, SelectedRows<'_>)>,
+        staged: Option<Staged<'_>>,
+    ) -> Result<(), GpuError> {
+        let m = &self.module;
+        match (selected, staged) {
+            (None, None) => {
+                let prep = m.prepare_ds41_attn_seg(g.config)?;
+                m.ds41_attn_seg(
+                    stream,
+                    &prep,
+                    g.q,
+                    g.win,
+                    g.comp,
+                    g.vis,
+                    g.scale,
+                    g.tokens,
+                    g.heads,
+                    g.win_rows,
+                    g.comp_rows,
+                    g.segs_w,
+                    g.segs,
+                    part_v,
+                    part_ms,
+                )?;
+            }
+            (Some((stride, s)), None) => {
+                let prep = m.prepare_ds41_attn_seg_sel(g.config)?;
+                m.ds41_attn_seg_sel(
+                    stream,
+                    &prep,
+                    g.q,
+                    g.win,
+                    g.comp,
+                    s.rows,
+                    g.vis,
+                    g.scale,
+                    g.tokens,
+                    g.heads,
+                    g.win_rows,
+                    g.comp_rows,
+                    stride,
+                    g.segs_w,
+                    g.segs,
+                    part_v,
+                    part_ms,
+                    s.fault,
+                )?;
+            }
+            (None, Some(st)) => {
+                let prep = m.prepare_ds41_attn_seg_stage(g.config)?;
+                m.ds41_attn_seg_stage(
+                    stream,
+                    &prep,
+                    g.q,
+                    g.win,
+                    st.rows.buf(),
+                    st.base,
+                    g.comp,
+                    g.vis,
+                    g.scale,
+                    g.tokens,
+                    g.heads,
+                    g.win_rows,
+                    g.comp_rows,
+                    g.segs_w,
+                    g.segs,
+                    part_v,
+                    part_ms,
+                )?;
+            }
+            (Some((stride, s)), Some(st)) => {
+                let prep = m.prepare_ds41_attn_seg_sel_stage(g.config)?;
+                m.ds41_attn_seg_sel_stage(
+                    stream,
+                    &prep,
+                    g.q,
+                    g.win,
+                    st.rows.buf(),
+                    st.base,
+                    g.comp,
+                    s.rows,
+                    g.vis,
+                    g.scale,
+                    g.tokens,
+                    g.heads,
+                    g.win_rows,
+                    g.comp_rows,
+                    stride,
+                    g.segs_w,
+                    g.segs,
+                    part_v,
+                    part_ms,
+                    s.fault,
+                )?;
+            }
+        }
         Ok(())
     }
 }

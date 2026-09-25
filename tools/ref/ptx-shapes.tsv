@@ -21,6 +21,9 @@ generate_ds41   down_add_q5_1                           0          0
 generate_ds41   ds41_attn_merge                         0          0
 generate_ds41   ds41_attn_seg                           0          0
 generate_ds41   ds41_attn_seg_sel                       0          0
+generate_ds41   ds41_attn_seg_sel_stage                 0          0
+# PIN(2026-09-25): ds41_attn_seg_stage is the staged prefix segment pass (prefill only, never on the decode path); its ring ⧺ staging source keeps a few registers more than ds41_attn_seg, which already sits at the 128-register cap of a 512-thread block, and ptxas spills 8 bytes. ds41_attn_seg_sel_stage fits in 112 with none.
+generate_ds41   ds41_attn_seg_stage                     8          8
 generate_ds41   ds41_comp_pool                          0          0
 generate_ds41   ds41_comp_rows                          0          0
 generate_ds41   ds41_engram_gate                        0          0
@@ -47,6 +50,7 @@ generate_ds41   ds41_q3k_gemv_heads                     0          0
 generate_ds41   ds41_q3k_gemv_heads_mcol                0          0
 generate_ds41   ds41_q5k_gemv_f32                       0          0
 generate_ds41   ds41_q5k_gemv_f32_mcol                  0          0
+generate_ds41   ds41_ring_commit                        0          0
 generate_ds41   ds41_rope_tail                          0          0
 generate_ds41   ds41_router                             0          0
 generate_ds41   ds41_shexp_gate_up                      0          0

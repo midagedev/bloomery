@@ -866,6 +866,13 @@ gate-gpu-ds41-serve:
 time-gpu-ds41 *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
 
+# 호스트 → 카드 전송 탐침(리드 전용): A6000에서 1 GiB를 세 경로로 보낸다 — 페이지 잠금 메모리, V4.1 첫 샤드의 따뜻한
+# 읽기 전용 mmap(pageable), 그 매핑을 cuMemHostRegister(READ_ONLY)로 등록한 것(등록·해제 시간 포함). 머신 전역 임대
+# 안에서, 증인 블록을 두르고 돈다(tools/ref/time-gate.sh). 등록을 지원하지 않는 카드면 앞의 두 줄을 찍고 rc 1.
+# 예: `just time-gpu-h2d --reps 10`.
+time-gpu-h2d *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/time-gate.sh h2d_probe --reps 8 {{ARGS}}'
+
 # ik's V4.1 decode on the first 512 ids of corpus-<CORPUS>.ids, plain or with the DSpark draft, under the lease on
 # the A6000 (lead-only): the ik twin of `just time-gpu-ds41 --tokens <those ids> -n N`. tools/ref/ik-draft.sh's header
 # has the prompt round-trip checks, ik's command line and the summary line. Example: `just time-ik-draft prose 96 dspark`.
