@@ -1,5 +1,15 @@
-//! qwen3moe's prompt prefill: a prompt fed [`MAX_TOKENS`] positions per pass
-//! instead of one decode step per token. A pass is the decode chain's own
+//! qwen3moe's prompt prefill: a prompt fed several positions per launch
+//! instead of one decode step per token, by one of two paths
+//! ([`PrefillPlan`]). A prompt that fits one pass takes the pass path; a
+//! longer one runs as GEMM ubatches of up to [`UBATCH`] tokens
+//! (`super::ubatch`), every weight read once per ubatch, and a tail of at
+//! most one pass after them takes the pass path again. At nine tokens a
+//! ubatch reads fewer expert bytes than two passes and its dense GEMMs cost
+//! less than a pass's launches, so the cut sits there. The GEMM path sums
+//! its products in another order than the one-token path and is gated by a
+//! band; the pass path is bit-equal to it.
+//!
+//! The pass path feeds [`MAX_TOKENS`] positions per pass. A pass is the decode chain's own
 //! layer body at `m` rows (`dispatch::enqueue_pass`), and every launch in it
 //! computes each token's values the way the one-row launch does: the gemv,
 //! norm and quantizer bodies take a column index; the flash runs each query
@@ -29,6 +39,7 @@ use super::body::Body;
 use super::dispatch::{self, PassCtx};
 use super::router::MAX_TOKENS;
 use super::scratch::{Arena, Dims, Io, param_view};
+use super::ubatch::{UBATCH, UbCtx};
 use crate::flash_gqa::HEAD;
 use crate::model::{GpuModel, StepMode};
 use crate::rope_table::{Direction, RopeTable};
@@ -352,56 +363,260 @@ impl Body {
     }
 }
 
+/// Which path a prompt's positions take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillPath {
+    /// The cut in the module doc: a prompt of at most [`MAX_TOKENS`] tokens
+    /// takes one pass; a longer one GEMM ubatches of up to [`UBATCH`], and a
+    /// tail of at most [`MAX_TOKENS`] after them one pass.
+    Auto,
+    /// Passes of up to [`MAX_TOKENS`] positions, the whole prompt: the path
+    /// that is bit-equal to one step per token.
+    Pass,
+    /// GEMM ubatches of up to [`UBATCH`] tokens, the whole prompt.
+    Gemm,
+}
+
+/// One launch unit of a prompt: a GEMM ubatch or a pass, and its tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillStep {
+    Ubatch(usize),
+    Pass(usize),
+}
+
+/// The units a prompt runs as, in order: the ubatches, then the passes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefillPlan {
+    pub steps: Vec<PrefillStep>,
+}
+
+impl PrefillPlan {
+    /// The plan of a prompt of `tokens` ids by `path`.
+    #[must_use]
+    pub fn new(tokens: usize, path: PrefillPath) -> PrefillPlan {
+        let chunked = |n: usize, w: usize, f: fn(usize) -> PrefillStep| {
+            (0..n.div_ceil(w)).map(move |i| f(w.min(n - i * w)))
+        };
+        let steps = match path {
+            PrefillPath::Pass => chunked(tokens, MAX_TOKENS, PrefillStep::Pass).collect(),
+            PrefillPath::Gemm => chunked(tokens, UBATCH, PrefillStep::Ubatch).collect(),
+            PrefillPath::Auto if tokens <= MAX_TOKENS => {
+                chunked(tokens, MAX_TOKENS, PrefillStep::Pass).collect()
+            }
+            PrefillPath::Auto => {
+                let tail = tokens % UBATCH;
+                let mut v: Vec<PrefillStep> =
+                    chunked(tokens - tail, UBATCH, PrefillStep::Ubatch).collect();
+                match tail {
+                    0 => {}
+                    t if t <= MAX_TOKENS => v.push(PrefillStep::Pass(t)),
+                    t => v.push(PrefillStep::Ubatch(t)),
+                }
+                v
+            }
+        };
+        PrefillPlan { steps }
+    }
+
+    /// Tokens the ubatches take: a prefix of the prompt.
+    #[must_use]
+    pub fn ubatch_tokens(&self) -> usize {
+        self.steps
+            .iter()
+            .map(|s| match s {
+                PrefillStep::Ubatch(t) => *t,
+                PrefillStep::Pass(_) => 0,
+            })
+            .sum()
+    }
+
+    /// `gemm` when a ubatch runs, else `prefill` (the pass path's name).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        if self.ubatch_tokens() > 0 {
+            "gemm"
+        } else {
+            "prefill"
+        }
+    }
+}
+
+impl std::fmt::Display for PrefillPlan {
+    /// `ubatch:512x2,276 pass:1` — each path's unit sizes in order, a run of
+    /// `k > 1` equal sizes as `<size>x<k>`, a path with none left out.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list = |ub: bool| {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for s in &self.steps {
+                let t = match (s, ub) {
+                    (PrefillStep::Ubatch(t), true) | (PrefillStep::Pass(t), false) => *t,
+                    _ => continue,
+                };
+                match runs.last_mut() {
+                    Some((size, k)) if *size == t => *k += 1,
+                    _ => runs.push((t, 1)),
+                }
+            }
+            runs.iter()
+                .map(|&(size, k)| {
+                    if k == 1 {
+                        size.to_string()
+                    } else {
+                        format!("{size}x{k}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let parts: Vec<String> = [("ubatch", list(true)), ("pass", list(false))]
+            .into_iter()
+            .filter(|(_, l)| !l.is_empty())
+            .map(|(n, l)| format!("{n}:{l}"))
+            .collect();
+        write!(f, "{}", parts.join(" "))
+    }
+}
+
+impl Body {
+    /// Enqueue the ubatch of the ubatch image's tokens `s .. s + t` at
+    /// position `pos`.
+    fn run_ubatch(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        s: usize,
+        t: usize,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        let Body {
+            hp,
+            names,
+            kv,
+            k,
+            mma,
+            ub,
+            ..
+        } = self;
+        let c = UbCtx {
+            gpu,
+            w,
+            names,
+            k,
+            mma: *mma,
+            eps: hp.rms_eps,
+        };
+        ub.enqueue(&c, kv, s, t, pos)
+    }
+}
+
 impl GpuModel<Body> {
-    /// Feed `tokens` through the chain [`MAX_TOKENS`] positions per pass
-    /// (module doc) and return the greedy next token after the last one —
-    /// what [`GpuModel::step`] returns for the same tokens from the same
-    /// position, and the same cache rows behind it. Positions continue from
-    /// wherever the model stands. In graph mode a pass size not captured yet
-    /// is captured here, inside the call; the layer taps must be off.
+    /// [`GpuModel::prefill_with`] by [`PrefillPath::Auto`].
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
+        self.prefill_with(tokens, PrefillPath::Auto)
+    }
+
+    /// Feed `tokens` through the chain by the plan of `path` (module doc)
+    /// and return the greedy next token after the last one. Positions
+    /// continue from wherever the model stands. On the pass path this is
+    /// what [`GpuModel::step`] returns for the same tokens from the same
+    /// position, with the same cache rows behind it, bit for bit; the GEMM
+    /// ubatches agree with it to their band. In graph mode a pass size not
+    /// captured yet is captured here, inside the call; the ubatches run
+    /// eager in either mode. The layer taps must be off, and every id must
+    /// be below the vocabulary (the embedding would read another row).
+    pub fn prefill_with(&mut self, tokens: &[u32], path: PrefillPath) -> Result<u32, GpuError> {
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT, "empty token slice"));
         }
         let pos0 = self.pos();
         self.check_pos(pos0 + launch_u32(WHAT, "tokens", tokens.len())? - 1, WHAT)?;
         let graph = self.mode() == StepMode::Graph;
-        let passes = tokens.len().div_ceil(MAX_TOKENS);
+        let plan = PrefillPlan::new(tokens.len(), path);
+        let n_ub = plan.ubatch_tokens();
+        let passes: Vec<usize> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                PrefillStep::Pass(m) => Some(*m),
+                PrefillStep::Ubatch(_) => None,
+            })
+            .collect();
         {
             let (gpu, w, body) = self.body_parts(WHAT)?;
             if body.taps.is_some() {
                 return Err(GpuError::state(WHAT, "layer taps off (a pass writes none)"));
             }
-            let Body { prefill, rope, .. } = body;
-            prefill.write(gpu.stream(), rope, tokens, pos0)?;
-            if graph {
-                let last = tokens.len() - (passes - 1) * MAX_TOKENS;
-                let full = (passes > 1).then_some(MAX_TOKENS);
-                for m in full.into_iter().chain([last]) {
-                    if body.prefill.graphs[m - 1].is_none() {
-                        body.capture_pass(gpu, w, m)?;
+            let n_vocab = body.hp.n_vocab;
+            if let Some((i, &id)) = tokens
+                .iter()
+                .enumerate()
+                .find(|&(_, &id)| id as usize >= n_vocab)
+            {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("token {i} is id {id}, past the vocabulary of {n_vocab}"),
+                ));
+            }
+            let Body {
+                prefill, ub, rope, ..
+            } = body;
+            if n_ub > 0 {
+                ub.write(gpu.stream(), rope, &tokens[..n_ub], pos0)?;
+            }
+            if !passes.is_empty() {
+                let pos_p = pos0 + launch_u32(WHAT, "ubatch tokens", n_ub)?;
+                prefill.write(gpu.stream(), rope, &tokens[n_ub..], pos_p)?;
+                if graph {
+                    for &m in &passes {
+                        if body.prefill.graphs[m - 1].is_none() {
+                            body.capture_pass(gpu, w, m)?;
+                        }
                     }
                 }
             }
         }
+        let n_steps = plan.steps.len();
+        let (mut s, mut chunk) = (0usize, 0usize);
         let mut next = None;
-        for (chunk, run) in tokens.chunks(MAX_TOKENS).enumerate() {
-            let (m, last) = (run.len(), chunk + 1 == passes);
-            next = self.run_rows(m, WHAT, |gpu, w, body, head, _| {
-                body.run_pass(gpu, w, chunk, m, graph)?;
-                if last {
-                    let Body {
-                        k,
-                        head_state,
-                        prefill,
-                        ..
-                    } = body;
-                    dispatch::enqueue_pass_head(gpu, w, k, head_state, &prefill.a, m, head)?;
+        for (i, &step) in plan.steps.iter().enumerate() {
+            let last = i + 1 == n_steps;
+            next = match step {
+                PrefillStep::Ubatch(t) => {
+                    let s0 = s;
+                    s += t;
+                    self.run_rows(t, WHAT, |gpu, w, body, head, pos| {
+                        body.run_ubatch(gpu, w, s0, t, pos)?;
+                        if last {
+                            let row = body.ub.last_row(t)?;
+                            head.input_mut()
+                                .copy_from_device_async(&row, gpu.stream())?;
+                            dispatch::enqueue_head(gpu, w, &body.k, &mut body.head_state, head)?;
+                        }
+                        Ok(last)
+                    })?
                 }
-                Ok(last)
-            })?;
+                PrefillStep::Pass(m) => {
+                    let c = chunk;
+                    chunk += 1;
+                    self.run_rows(m, WHAT, |gpu, w, body, head, _| {
+                        body.run_pass(gpu, w, c, m, graph)?;
+                        if last {
+                            let Body {
+                                k,
+                                head_state,
+                                prefill,
+                                ..
+                            } = body;
+                            dispatch::enqueue_pass_head(
+                                gpu, w, k, head_state, &prefill.a, m, head,
+                            )?;
+                        }
+                        Ok(last)
+                    })?
+                }
+            };
         }
-        next.ok_or(GpuError::state(WHAT, "a token read after the last pass"))
+        next.ok_or(GpuError::state(WHAT, "a token read after the last unit"))
     }
 
     /// Capture the prefill pass of every token count in `1..=MAX_TOKENS` not
@@ -437,7 +652,8 @@ impl GpuModel<Body> {
             .nodes()
     }
 
-    /// The passes [`GpuModel::prefill`] takes for a prompt of `tokens` ids.
+    /// The passes the pass path ([`PrefillPath::Pass`]) takes for a prompt
+    /// of `tokens` ids.
     #[must_use]
     pub fn prefill_passes(tokens: usize) -> usize {
         tokens.div_ceil(MAX_TOKENS)

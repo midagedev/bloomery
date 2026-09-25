@@ -4,8 +4,9 @@
 //! Every prompt runs from position 0 (`GpuModel::reset`), its tokens fed one
 //! position at a time through the decode path — the greedy reference was
 //! written the same way (`argmax_ref --step-prefill`) — and then again
-//! through the prompt prefill (`Qwen3moeModel::prefill`), which must leave
-//! the same answer bit for bit.
+//! through the prompt prefill (`Qwen3moeModel::prefill`): on the pass path,
+//! which must leave the same answer bit for bit, and on the GEMM ubatches,
+//! which must stay inside a derived band.
 //!
 //! What is asserted:
 //! - (s) structure: the captured step holds [`NODES_CHAIN`] nodes, none of
@@ -36,17 +37,34 @@
 //! - (r) graph replay equals the eager body: the same prompts in eager mode
 //!   give the same tokens, and the last step's logits are bit-identical.
 //! - (p) prefill equals the one-token path: the same prompts prefilled
-//!   (up to `MAX_TOKENS` positions per pass), then the same greedy steps,
-//!   give the same tokens and bit-identical last logits; so do the prompts'
-//!   concatenation (several passes) against its own one-token run, whole
-//!   and in two calls split at [`SPLIT`], the second starting at a position
-//!   that is not a pass boundary. These run through the captured passes.
+//!   (each fits one pass, so the default path takes the pass), then the same
+//!   greedy steps, give the same tokens and bit-identical last logits; so do
+//!   the prompts' concatenation on the pass path (several passes) against its
+//!   own one-token run, whole and in two calls split at [`SPLIT`], the second
+//!   starting at a position that is not a pass boundary. These run through
+//!   the captured passes.
 //! - (q) a replayed prefill pass equals the eager one: for every pass size
 //!   `m`, the concatenation's first `MAX_TOKENS + m` ids (a full pass, then
-//!   one of `m`) prefilled in graph mode and in eager mode, each from a
-//!   reset over cache rows seeded with a pattern (`seed_depth`), leave the
-//!   same K/V rows bit for bit, none of them still the pattern, and the same
-//!   last logits bit for bit.
+//!   one of `m`) prefilled on the pass path in graph mode and in eager mode,
+//!   each from a reset over cache rows seeded with a pattern (`seed_depth`),
+//!   leave the same K/V rows bit for bit, none of them still the pattern, and
+//!   the same last logits bit for bit.
+//! - (u) the GEMM prefill against the one-token path, on the first
+//!   [`LONG`] ids of the prose file `corpus-prose.ids` (its digest checked):
+//!   1,025 ids run as ubatches of 512 and 512 and a one-id pass, 1,300 as
+//!   512, 512 and 276. Layer 0's K and V rows within [`GEMM_L0_REL`] of the
+//!   one-token path's; each later layer's distance within
+//!   [`GEMM_SPREAD_RATIO`] times the one-token path's own distance between
+//!   its two flash arithmetics (the same prompt stepped eagerly on the other
+//!   flash pass, `set_flash_mma`); the last logits within the same ratio of
+//!   that run's; the greedy continuation after the prefill judged as (g)
+//!   against the one-token path's own continuation and margins. And the 1,300 ids
+//!   prefilled in two calls cut at [`LONG_SPLIT`] (every unit a ubatch, the
+//!   second call's first position off every ubatch boundary) leave the whole
+//!   prefill's K/V rows and last logits bit for bit: a token's GEMM-path
+//!   values do not depend on the ubatch it lands in.
+//!
+//! `--gemm-only` runs the load and (u) alone.
 //!
 //! The flash pass is read once per process (`BLOOMERY_GQA_MMA`), so each
 //! pass is its own run; the `load` line names it.
@@ -78,17 +96,19 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::Qwen3moeModel;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
+    use bloomery_gpu::arch::qwen3moe::{PrefillPath, PrefillPlan};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::prompts::{
-        GreedyClass, PromptRow, compare_greedy, read_greedy, read_prompts,
+        GreedyClass, GreedyRow, PromptRow, compare_greedy, read_greedy, read_prompts,
     };
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RowKind, checks_failed, data_dir, ik_q8_2, open_split,
-        q8_1_dequant, ref_ints, ref_tensor_logical_in, topk_ids_logical_within, verdict,
+        GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir, ik_q8_2,
+        open_split, q8_1_dequant, ref_ints, ref_tensor_logical_in, topk_ids_logical_within,
+        verdict,
     };
     use cuda_core::sys;
     use model::arch::Arch;
@@ -105,9 +125,67 @@ mod gate {
     /// Prompts of the greedy arm: rows `0..PROMPTS` of `tools/ref/prompts.tsv`.
     const PROMPTS: usize = 8;
 
-    /// Cache rows: the oracle's five tokens, and the prompts' concatenation
-    /// (`PROMPTS` prompts of at most `MAX_TOKENS` ids) plus `GEN` with room.
-    const CTX: usize = 256;
+    /// Cache rows: the longest of [`LONG`] plus `GEN`, with room (the
+    /// oracle's five tokens and the prompts' concatenation fit far below).
+    const CTX: usize = 1344;
+
+    /// The GEMM clause's prompt lengths: three ubatch-sized units each, the
+    /// last a one-id pass and a 276-id ubatch.
+    const LONG: [usize; 2] = [1025, 1300];
+
+    /// Where the split GEMM prefill of the longer prompt cuts it: off every
+    /// ubatch boundary, so both calls end in a partial ubatch.
+    const LONG_SPLIT: usize = 700;
+
+    /// The prose the GEMM clause reads, and its digest as
+    /// `tools/ref/models/qwen3moe.sh` pins it.
+    const PROSE: &str = "corpus-prose.ids";
+    const PROSE_SHA256: &str = "9444bc5b4e2a7c5f4caac4f1aa7b6ef8e945b114fdecac52aca36a1de4e76cf6";
+
+    /// PIN(2026-09-25): the GEMM prefill's band on layer 0's K and V rows
+    /// against the one-token path's (`‖ours − one-token‖ / ‖one-token‖`).
+    /// Layer 0's input is the same bits on both paths (the embedding rows;
+    /// `rms_norm` then the quantizer, the bytes `norm_quant` writes), so only
+    /// the k and v projections differ, each within its own sum's rounding of
+    /// the exact dot of the same codes: the GEMM's `γ(nb + 4) · Σ_b (|D_b| +
+    /// |M_b|)` (gate_gemm), the gemv's lane partials and warp tree the same
+    /// order, about 1.2e-6 of `Σ_b |terms|` each at K = 2048, which is about
+    /// √16 = 4 times a value's size for blocks of either sign: Δ ≤ 1e-5 of the
+    /// row. The head norm and the rope carry that relative distance; the f16
+    /// rounding then moves a value by one ulp (at most 2^-10 of it) with
+    /// probability Δ/ulp, so the rows' distance is at most √(Δ · ulp) ≈
+    /// √(1e-5 · 1e-3) = 1e-4. A value much smaller than its row can move by
+    /// several of its own ulps under the same absolute Δ, so the count of
+    /// moved values and their largest move in ulp are printed, not judged.
+    const GEMM_L0_REL: f64 = 1e-4;
+
+    /// PIN(2026-09-25): the GEMM prefill's K/V distance from the one-token
+    /// path at every layer past 0, over the one-token path's own distance
+    /// between its two gated flash arithmetics on the same prompt (the
+    /// tensor-core pass's f16 scores against the scalar pass's f32), each
+    /// layer's `max(K, V)` over `max(K, V)`; and the same ratio of the last
+    /// logits' relative distances. Derivation: past layer 0 the two
+    /// paths' first difference (the products' sum order, about 1e-6 of the
+    /// terms, [`GEMM_L0_REL`]'s note) grows at every q8_1 re-quantization by
+    /// code flips — a value crosses a rounding boundary with probability
+    /// δ/d8 and then moves by d8, so δ' ≈ √(δ · d8/σ) with d8/σ ≈ 2.3e-2 —
+    /// until, within two or three layers, the two paths round like two
+    /// independent roundings of one rule. From there the distance is the
+    /// model's own amplification of rounding-sized differences, which no
+    /// isotropic model gives (an isotropic `√(l + 1) · 4e-2`, the forced
+    /// arm's per-layer term composed as [`FREE_BAND`] is, undercounts layers
+    /// 34-37, whose V moves 0.2-0.3 under either perturbation). So the band
+    /// is a ratio against a same-class perturbation measured in the same
+    /// process, the teacher-forced arm's method: the flash arithmetics'
+    /// distance starts later (the scores are first rounded in layer 0's
+    /// attention) and smaller per layer, so a correct GEMM path reads below
+    /// 1.9 on these prompts under either flash pass, highest on layers
+    /// 34-37; a wiring fault — a table built from another layer's or token's
+    /// ids, weights one slot off, positions off by one — reads an error of
+    /// order one against a spread of 1e-3 to 2.5e-1, a K/V ratio above 3.7
+    /// on every layer it reaches. The logits ratio alone does not separate
+    /// every fault (positions off by one leave it near 1); the K/V rows do.
+    const GEMM_SPREAD_RATIO: f64 = 3.0;
 
     /// PIN(2026-09-25): the captured step's node count, derived before the
     /// chain was built: the embedding row, 12 nodes per layer (attention
@@ -219,6 +297,14 @@ mod gate {
             None => None,
         };
         let mut m = open(CTX, StepMode::Graph)?;
+        if args.iter().any(|a| a == "--gemm-only") {
+            let ok = gemm_prefill(&mut m)?;
+            println!("gate_qwen3moe_e2e --gemm-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         let mut ok = true;
         ok &= structure(&mut m)?;
         let o = oracle::for_arch(Arch::Qwen3moe)?;
@@ -639,26 +725,29 @@ mod gate {
         );
         let prefill_ok = prefilled(m, &prompts, &graph, &graph_logits, dump_dir)?;
         let passes_ok = prefill_replay(m, &prompts)?;
-        Ok(replay_ok && greedy_ok && prefill_ok && passes_ok)
+        let gemm_ok = gemm_prefill(m)?;
+        Ok(replay_ok && greedy_ok && prefill_ok && passes_ok && gemm_ok)
     }
 
     // ------------------------------------------------------------ (p) prefill
 
-    /// Our greedy continuation of `ids` prefilled — whole, or in two calls
-    /// cut at `cut` — then stepped: `GEN` tokens and the last step's logits.
+    /// Our greedy continuation of `ids` prefilled by `path` — whole, or in
+    /// two calls cut at `cut` — then stepped: `GEN` tokens and the last
+    /// step's logits.
     fn continue_prefilled(
         m: &mut Qwen3moeModel,
         ids: &[u32],
         cut: Option<usize>,
+        path: PrefillPath,
     ) -> Result<(Vec<u32>, Vec<f32>), GateError> {
         m.reset()?;
         let mut out = Vec::with_capacity(GEN);
         let mut next = match cut {
             Some(c) => {
-                m.prefill(&ids[..c])?;
-                m.prefill(&ids[c..])?
+                m.prefill_with(&ids[..c], path)?;
+                m.prefill_with(&ids[c..], path)?
             }
-            None => m.prefill(ids)?,
+            None => m.prefill_with(ids, path)?,
         };
         out.push(next);
         for _ in 1..GEN {
@@ -687,7 +776,16 @@ mod gate {
                     .all(|(a, b)| a.to_bits() == b.to_bits())
         };
         for (i, p) in prompts.iter().enumerate() {
-            let (toks, logits) = continue_prefilled(m, &p.tokens, None)?;
+            let plan = PrefillPlan::new(p.tokens.len(), PrefillPath::Auto);
+            if plan.kind() != "prefill" {
+                return Err(format!(
+                    "prompt {} ({} ids) plans {plan}; this clause is the pass path's",
+                    p.id,
+                    p.tokens.len()
+                )
+                .into());
+            }
+            let (toks, logits) = continue_prefilled(m, &p.tokens, None, PrefillPath::Auto)?;
             if let Some(dir) = dump_dir {
                 dump(dir, "prefill", i, &toks, &logits)?;
             }
@@ -716,8 +814,13 @@ mod gate {
                     .zip(&step_logits)
                     .all(|(a, b)| a.to_bits() == b.to_bits())
         };
-        let whole_ok = same_long(&continue_prefilled(m, &long, None)?);
-        let split_ok = same_long(&continue_prefilled(m, &long, Some(SPLIT))?);
+        let whole_ok = same_long(&continue_prefilled(m, &long, None, PrefillPath::Pass)?);
+        let split_ok = same_long(&continue_prefilled(
+            m,
+            &long,
+            Some(SPLIT),
+            PrefillPath::Pass,
+        )?);
         println!(
             "prefill: {PROMPTS} prompts in {passes} passes of up to {MAX_TOKENS} positions, then \
              {GEN}-token greedy steps: tokens and last logits = the one-token path's bit for bit \
@@ -752,7 +855,7 @@ mod gate {
         m.set_mode(mode);
         m.seed_depth(ids.len())?;
         m.reset()?;
-        let token = m.prefill(ids)?;
+        let token = m.prefill_with(ids, PrefillPath::Pass)?;
         Ok(PrefillRun {
             kv: m.kv_rows(ids.len())?,
             logits: m.logits()?,
@@ -825,6 +928,244 @@ mod gate {
         println!(
             "prefill replay: every pass size's replay = its eager twin (K/V rows and last logits bit \
              for bit) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    // --------------------------------------------- (u) GEMM prefill band
+
+    /// The first `n` ids of the prose file, after its digest is checked.
+    fn prose(n: usize) -> Result<Vec<u32>, GateError> {
+        let path = data_dir().join("qwen3moe").join(PROSE);
+        let out = std::process::Command::new("sha256sum")
+            .arg(&path)
+            .output()?;
+        let digest = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || digest.split_whitespace().next() != Some(PROSE_SHA256) {
+            return Err(format!(
+                "{}: sha256 {:?}, want {PROSE_SHA256}",
+                path.display(),
+                digest.trim()
+            )
+            .into());
+        }
+        let ids: Vec<u32> = std::fs::read_to_string(&path)?
+            .lines()
+            .take(n)
+            .map(|l| l.trim().parse::<u32>())
+            .collect::<Result<_, _>>()?;
+        if ids.len() < n {
+            return Err(format!("{} holds {} ids, want {n}", path.display(), ids.len()).into());
+        }
+        Ok(ids)
+    }
+
+    /// Top-1 minus top-2 of `v`.
+    fn margin(v: &[f32]) -> f32 {
+        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &x in v {
+            if x > a {
+                b = a;
+                a = x;
+            } else if x > b {
+                b = x;
+            }
+        }
+        a - b
+    }
+
+    /// What one prefill of a long prompt leaves: every layer's K/V rows, the
+    /// last logits, and the greedy continuation after it with each
+    /// generated position's top1-top2 margin.
+    struct LongRun {
+        kv: Vec<Vec<u16>>,
+        logits: Vec<f32>,
+        tokens: Vec<u32>,
+        margins: Vec<f32>,
+    }
+
+    /// `ids` from a reset, fed one step per token (`None`) or prefilled by
+    /// the path (`Some`; cut into two calls at `cut`), then `GEN − 1`
+    /// greedy steps.
+    fn long_run(
+        m: &mut Qwen3moeModel,
+        ids: &[u32],
+        path: Option<PrefillPath>,
+        cut: Option<usize>,
+    ) -> Result<LongRun, GateError> {
+        m.reset()?;
+        let first = match (path, cut) {
+            (None, _) => m.step(ids)?,
+            (Some(p), Some(c)) => {
+                m.prefill_with(&ids[..c], p)?;
+                m.prefill_with(&ids[c..], p)?
+            }
+            (Some(p), None) => m.prefill_with(ids, p)?,
+        };
+        let kv = m.kv_rows(ids.len())?;
+        let logits = m.logits()?;
+        let mut tokens = vec![first];
+        let mut margins = vec![margin(&logits)];
+        for _ in 1..GEN {
+            let t = m.step(&[*tokens.last().ok_or("no token")?])?;
+            tokens.push(t);
+            margins.push(margin(&m.logits()?));
+        }
+        Ok(LongRun {
+            kv,
+            logits,
+            tokens,
+            margins,
+        })
+    }
+
+    /// An f16's bits as a monotone integer, so two values' distance in ulp
+    /// is the difference (both zeros at 0).
+    fn f16_ord(b: u16) -> i32 {
+        let mag = i32::from(b & 0x7fff);
+        if b & 0x8000 != 0 { -mag } else { mag }
+    }
+
+    /// `‖a − b‖ / ‖b‖` over f16 bits.
+    fn rel16(a: &[u16], b: &[u16]) -> f64 {
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            let (x, y) = (
+                f64::from(gguf::quant::half_to_f32(x)),
+                f64::from(gguf::quant::half_to_f32(y)),
+            );
+            num += (x - y).powi(2);
+            den += y.powi(2);
+        }
+        (num / den.max(f64::MIN_POSITIVE)).sqrt()
+    }
+
+    fn gemm_prefill(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        m.set_mode(StepMode::Graph);
+        let longest = LONG.iter().copied().max().ok_or("no long prompt")?;
+        let prose = prose(longest)?;
+        let mut ok = true;
+        let mut whole_1300 = None;
+        for &n in &LONG {
+            let ids = &prose[..n];
+            let plan = PrefillPlan::new(n, PrefillPath::Auto);
+            let one = long_run(m, ids, None, None)?;
+            let t0 = Instant::now();
+            let gemm = long_run(m, ids, Some(PrefillPath::Auto), None)?;
+            let wall = t0.elapsed().as_secs_f64();
+            // The ruler: the same prompt on the other flash pass, eager.
+            let mma = m.body("gemm_prefill")?.flash_mma();
+            m.set_mode(StepMode::Eager);
+            m.set_flash_mma(!mma)?;
+            let alt = long_run(m, ids, None, None)?;
+            m.set_flash_mma(mma)?;
+            m.set_mode(StepMode::Graph);
+            // Layer 0's moves in ulp, printed.
+            let (mut l0_max, mut l0_moved) = (0u32, 0usize);
+            for (&x, &y) in gemm.kv[0].iter().zip(&one.kv[0]) {
+                let d = (f16_ord(x) - f16_ord(y)).unsigned_abs();
+                l0_max = l0_max.max(d);
+                l0_moved += usize::from(d != 0);
+            }
+            println!(
+                "gemm n={n} plan={plan} layer=0 kv_values={} moved={l0_moved} max_ulp={l0_max} \
+                 (printed)",
+                one.kv[0].len()
+            );
+            let mut kv_ok = true;
+            // (layer, distance over its band) of the layer closest to its band.
+            let mut worst = (0usize, 0.0f64);
+            for (l, ((g, o), a)) in gemm.kv.iter().zip(&one.kv).zip(&alt.kv).enumerate() {
+                let half = o.len() / 2;
+                let (rk, rv) = (rel16(&g[..half], &o[..half]), rel16(&g[half..], &o[half..]));
+                let (sk, sv) = (rel16(&a[..half], &o[..half]), rel16(&a[half..], &o[half..]));
+                let (d, band) = if l == 0 {
+                    (rk.max(rv), GEMM_L0_REL)
+                } else {
+                    (
+                        rk.max(rv) / sk.max(sv).max(f64::MIN_POSITIVE),
+                        GEMM_SPREAD_RATIO,
+                    )
+                };
+                let pass = d <= band;
+                if d / band > worst.1 {
+                    worst = (l, d / band);
+                }
+                if l % 8 == 0 || l == gemm.kv.len() - 1 || (32..40).contains(&l) || !pass {
+                    let judged = if l == 0 { "rel" } else { "ratio" };
+                    println!(
+                        "gemm n={n} layer={l} k_rel={rk:.3e} v_rel={rv:.3e} spread k={sk:.3e} \
+                         v={sv:.3e} {judged}={d:.3e} band={band:.3e} {}",
+                        verdict(pass)
+                    );
+                }
+                kv_ok &= pass;
+            }
+            let lrel = rel(&gemm.logits, &one.logits, |i| f64::from(one.logits[i]));
+            let lspread = rel(&alt.logits, &one.logits, |i| f64::from(one.logits[i]));
+            let lratio = lrel / lspread.max(f64::MIN_POSITIVE);
+            let logits_ok = lratio <= GEMM_SPREAD_RATIO;
+            let reference = GreedyRow {
+                id: n,
+                n_tokens: n,
+                argmax: one.tokens[0],
+                top5: Vec::new(),
+                gen_ids: one.tokens.clone(),
+                gen_margins: one.margins.clone(),
+            };
+            let rep = compare_greedy(
+                std::slice::from_ref(&gemm.tokens),
+                &[reference],
+                MARGIN_FLOOR,
+            );
+            let r = &rep.rows[0];
+            let greedy_ok = r.class != GreedyClass::Diverged;
+            println!(
+                "gemm n={n}: K/V rows within their bands {} (closest: layer {} at {:.2} of its \
+                 band); last logits rel {lrel:.3e} against the flash arithmetics' own \
+                 {lspread:.3e}, ratio {lratio:.3} (band {GEMM_SPREAD_RATIO}) {}; greedy {:?} \
+                 first_diff={:?} one_token_margin={:?} {}; the GEMM prefill and its {GEN} tokens \
+                 {wall:.2} s (runtime value)",
+                verdict(kv_ok),
+                worst.0,
+                worst.1,
+                verdict(logits_ok),
+                r.class,
+                r.first_diff,
+                r.ref_margin,
+                verdict(greedy_ok)
+            );
+            ok &= kv_ok && logits_ok && greedy_ok;
+            if n == LONG[1] {
+                whole_1300 = Some(gemm);
+            }
+        }
+        let whole = whole_1300.ok_or("the 1,300-id run is missing")?;
+        let n = LONG[1];
+        let ids = &prose[..n];
+        let cut_plans = (
+            PrefillPlan::new(LONG_SPLIT, PrefillPath::Auto),
+            PrefillPlan::new(n - LONG_SPLIT, PrefillPath::Auto),
+        );
+        let split = long_run(m, ids, Some(PrefillPath::Auto), Some(LONG_SPLIT))?;
+        let kv_diff = rows_differing(&split.kv, &whole.kv);
+        let logits_same = bits_equal(&split.logits, &whole.logits);
+        let pass = kv_diff == 0 && logits_same && split.tokens == whole.tokens;
+        println!(
+            "gemm split n={n} as {LONG_SPLIT} ({}) + {} ({}): K/V rows differing from the whole \
+             prefill {kv_diff} (want 0), last logits bit-equal {logits_same}, continuation equal {} {}",
+            cut_plans.0,
+            n - LONG_SPLIT,
+            cut_plans.1,
+            split.tokens == whole.tokens,
+            verdict(pass)
+        );
+        ok &= pass;
+        println!(
+            "gemm prefill: {LONG:?} prose ids against the one-token path, K/V in band (layer 0 \
+             {GEMM_L0_REL:e}, later layers and the logits {GEMM_SPREAD_RATIO} x the flash \
+             arithmetics' spread), greedy not diverged, split = whole {}",
             verdict(ok)
         );
         Ok(ok)

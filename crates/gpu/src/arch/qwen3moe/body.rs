@@ -10,7 +10,9 @@ use super::prefill::Prefill;
 use super::proj::ProjKernels;
 use super::router::{N_EXPERT, N_USED, RouterKernels};
 use super::scratch::{Arena, Dims, KvPlanes, SP_CS, SP_N_KEYS, SP_POS, SP_TOKEN, StepParams};
+use super::ubatch::Ubatch;
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD, gqa_mma};
+use crate::gemm::GemmKernels;
 use crate::head::Head;
 use crate::model::{ChainBody, StepProbe};
 use crate::q6k_sel::Q6kSelKernels;
@@ -66,6 +68,8 @@ pub(super) struct Kernels {
     pub(super) q6_sel: Q6kSelKernels,
     /// The head's Q6_K projection with the argmax folded in.
     pub(super) head: HeadArgmaxKernels,
+    /// The grouped GEMM of the ubatch prefill.
+    pub(super) gemm: GemmKernels,
 }
 
 /// qwen3moe's per-replay host values: the token the chain embeds and the
@@ -81,6 +85,8 @@ pub struct Body {
     /// first: fields drop in declaration order, and its graphs address the
     /// cache planes below.
     pub(super) prefill: Prefill,
+    /// The GEMM prefill's arena and prompt image.
+    pub(super) ub: Ubatch,
     pub(super) hp: Hparams,
     pub(super) names: Vec<LayerNames>,
     pub(super) kv: Vec<KvPlanes>,
@@ -345,10 +351,12 @@ impl ChainBody for Body {
             experts: ExpertKernels::load(ctx)?,
             q6_sel: Q6kSelKernels::load(ctx)?,
             head: HeadArgmaxKernels::load(ctx)?,
+            gemm: GemmKernels::load(ctx)?,
         };
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
             prefill: Prefill::new(stream, dims, ctx_max)?,
+            ub: Ubatch::new(stream, dims, ctx_max)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream)?,
             hp,
@@ -440,6 +448,7 @@ impl ChainBody for Body {
             + self.sp.buf.num_bytes()
             + self.head_state.bytes()
             + self.prefill.bytes()
+            + self.ub.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
     }
 }

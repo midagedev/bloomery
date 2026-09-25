@@ -7,6 +7,11 @@
 //! slot of a token reads the token's input ([`GemmInput::Shared`], gate and
 //! up), `s` when each slot has its own ([`GemmInput::PerSlot`], down).
 //!
+//! Between a gate·up pair and its down, [`GemmKernels::enqueue_swiglu_quant`]
+//! writes the down's activations straight from the two GEMMs' rows:
+//! `silu(g)·u` per slot column, quantized in the same launch
+//! (`gemm_swiglu_quant`), the bytes SwiGLU followed by the quantizer write.
+//!
 //! Three launches and no host synchronisation between them. The q8_1
 //! quantizer every gemv reads ([`Gpu::enqueue_quantize_gemm`] launches the
 //! same `q3k_quantize_q8_1` into a [`GemmAct`], which holds more columns
@@ -839,7 +844,10 @@ fn q3k_scale_word(a0: u32, a1: u32, a2: u32, hh: usize, pp: usize) -> u32 {
 mod gemm_kernels {
     use super::*;
     use crate::cores::{q4k_scale_min, q6k_dequant};
+    use crate::elem::silu_mul;
+    use crate::fault::quad_finite;
     use crate::flash::half_bits_to_f32;
+    use crate::q8_1_quant_vals;
     use cuda_device::async_copy::{
         cp_async_ca_4, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
     };
@@ -1339,6 +1347,96 @@ mod gemm_kernels {
             scratch: (bt, s8t, d8t, slot_sh, acol_sh),
         );
     }
+
+    /// SwiGLU of `n_cols` slot columns of `256 · n_sb` values quantized to
+    /// q8_1 in one launch, one 32-thread block per 128-value block: lane `l`
+    /// of block `(col, b)` takes values `128·b + 4·l .. +3` of column `col` of
+    /// `g` and `u`, forms `elem::silu_mul` of each pair, and hands the four
+    /// to `q8_1_quant_vals` — the values `elem::swiglu` stores and the bytes
+    /// `q3k_quantize_q8_1` writes from them, since both run the same bodies
+    /// on the same geometry. A non-finite value raises
+    /// [`FaultSite::QuantColumn`], as the quantizer does, and the block is
+    /// still stored.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            g.len() >= n_cols * 256 * n_sb,
+            u.len() >= n_cols * 256 * n_sb,
+            q3.len() >= n_cols * 64 * half_it,
+            q4.len() >= n_cols * 256 * quad_it,
+            q6.len() >= n_cols * 128 * half_it,
+            s8.len() >= n_cols * 8 * n_sb,
+            d8.len() >= n_cols * 2 * n_sb
+        )
+    )]
+    pub fn gemm_swiglu_quant(
+        g: &[f32],
+        u: &[f32],
+        n_cols: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        let blk = thread::index_1d().get() / 32;
+        let n_sb = n_sb as usize;
+        let per_col = 2 * n_sb;
+        if blk >= n_cols as usize * per_col {
+            return; // warp-uniform: one warp per block
+        }
+        let col = blk / per_col;
+        let b = blk - col * per_col;
+        let lane = warp::lane_id() as usize;
+        let base = col * 256 * n_sb + 128 * b + 4 * lane;
+        // SAFETY: base + 3 < (col + 1)·256·n_sb <= n_cols·256·n_sb, inside g
+        // and u by the launch contract.
+        let (gv, uv) = unsafe {
+            (
+                [
+                    *g.get_unchecked(base),
+                    *g.get_unchecked(base + 1),
+                    *g.get_unchecked(base + 2),
+                    *g.get_unchecked(base + 3),
+                ],
+                [
+                    *u.get_unchecked(base),
+                    *u.get_unchecked(base + 1),
+                    *u.get_unchecked(base + 2),
+                    *u.get_unchecked(base + 3),
+                ],
+            )
+        };
+        let v = [
+            silu_mul(gv[0], uv[0]),
+            silu_mul(gv[1], uv[1]),
+            silu_mul(gv[2], uv[2]),
+            silu_mul(gv[3], uv[3]),
+        ];
+        if !quad_finite(v) {
+            fault.raise(FaultSite::QuantColumn);
+        }
+        // SAFETY: col < n_cols and b < 2·n_sb by the lines above, the output
+        // bounds are the launch contract's, the block is one warp with one
+        // `(col, b)`, and `v` holds values 128·b + 4·lane .. +3 of column col.
+        unsafe {
+            q8_1_quant_vals(
+                v, col, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
+                &mut d8,
+            );
+        }
+    }
 }
 
 /// q8_1 activations for up to `cols` columns of `k` values each, in the
@@ -1412,6 +1510,36 @@ impl GemmAct {
     #[must_use]
     pub fn s8(&self) -> &DeviceBuffer<i32> {
         &self.s8
+    }
+
+    /// The codes in the q3 pair permutation: `64 * ceil(n_sb/2)` u64 per
+    /// column.
+    #[must_use]
+    pub fn q3(&self) -> &DeviceBuffer<u64> {
+        &self.q3
+    }
+
+    /// The codes in the q4 permutation: `256 * ceil(n_sb/4)` u32 per column.
+    #[must_use]
+    pub fn q4(&self) -> &DeviceBuffer<u32> {
+        &self.q4
+    }
+
+    /// The codes in the q6 permutation the GEMM stages: `128 * ceil(n_sb/2)`
+    /// u32 per column.
+    #[must_use]
+    pub fn q6(&self) -> &DeviceBuffer<u32> {
+        &self.q6
+    }
+
+    /// Device bytes of the five planes.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.q3.num_bytes()
+            + self.q4.num_bytes()
+            + self.q6.num_bytes()
+            + self.s8.num_bytes()
+            + self.d8.num_bytes()
     }
 }
 
@@ -1542,6 +1670,15 @@ impl GemmRoute {
         self.n_experts
     }
 
+    /// Device bytes of the table.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.cols.num_bytes()
+            + self.tiles.num_bytes()
+            + self.n_tiles.num_bytes()
+            + self.zeros.as_ref().map_or(0, DeviceBuffer::num_bytes)
+    }
+
     /// The table as it stands on the card: the slot list and the tiles. A
     /// blocking read on `stream`, for gates and diagnostics.
     pub fn read_back(&self, stream: &CudaStream) -> Result<(Vec<u32>, Vec<GemmTile>), GpuError> {
@@ -1647,6 +1784,65 @@ impl GemmKernels {
         let r = self.route_launch(stream, &zeros, n_cols, route, fault);
         route.zeros = Some(zeros);
         r
+    }
+
+    /// Enqueue `act = q8_1(silu(g) · u)` over the first `n_cols` slot
+    /// columns (`act.k()` values each, slot-major as the gate and up GEMMs
+    /// write them): one launch, the bytes `ElemKernels::enqueue_swiglu` then
+    /// [`Gpu::enqueue_quantize_gemm`] leave, a non-finite value raised on
+    /// `fault` as [`FaultSite::QuantColumn`]. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_swiglu_quant(
+        &self,
+        stream: &CudaStream,
+        g: &DeviceBuffer<f32>,
+        u: &DeviceBuffer<f32>,
+        n_cols: usize,
+        act: &mut GemmAct,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "GemmKernels::enqueue_swiglu_quant";
+        if n_cols == 0 || n_cols > act.cols {
+            return Err(GpuError::shape(
+                what,
+                format!("1 <= n_cols <= act.cols() = {}, got {n_cols}", act.cols),
+            ));
+        }
+        if g.len() < n_cols * act.k || u.len() < n_cols * act.k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "g.len() {} and u.len() {} need n_cols*k = {n_cols}*{}",
+                    g.len(),
+                    u.len(),
+                    act.k
+                ),
+            ));
+        }
+        let n_sb = act.n_sb();
+        let grid = launch_u32(what, "grid", n_cols * n_sb * 2)?;
+        let n_cols = launch_u32(what, "n_cols", n_cols)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let prep = self
+            .module
+            .prepare_gemm_swiglu_quant(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.gemm_swiglu_quant(
+            stream,
+            &prep,
+            g,
+            u,
+            n_cols,
+            n_sb,
+            n_sb.div_ceil(2),
+            n_sb.div_ceil(4),
+            &mut act.q3,
+            &mut act.q4,
+            &mut act.q6,
+            &mut act.s8,
+            &mut act.d8,
+            fault,
+        )?;
+        Ok(())
     }
 
     /// The one launcher of `gemm_route`.

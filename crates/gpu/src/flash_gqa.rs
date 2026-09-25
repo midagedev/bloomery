@@ -779,6 +779,26 @@ impl FlashGqaKernels {
         args: GqaArgs<'_>,
         mma: bool,
     ) -> Result<(), GpuError> {
+        let ctx = args.ctx;
+        self.enqueue_pass_upto(stream, args, mma, ctx)
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass`] over the first
+    /// `segments_for(max_keys)` segments only: the grid and the partials
+    /// (`m · n_head · segments_for(max_keys)` of each) shrink to the keys the
+    /// rows can see, and a row's arithmetic is the full grid's — its live
+    /// segments are the same, walked and merged in the same order. The
+    /// caller guarantees every row's live count is at most `max_keys`
+    /// (`1..=ctx`): a row that saw more would have the keys past the last
+    /// segment left out, which the kernels cannot tell. For a prefill whose
+    /// positions the host wrote, the deepest row's count.
+    pub fn enqueue_pass_upto(
+        &self,
+        stream: &CudaStream,
+        args: GqaArgs<'_>,
+        mma: bool,
+        max_keys: usize,
+    ) -> Result<(), GpuError> {
         let what = "flash_gqa::enqueue";
         let GqaArgs {
             q,
@@ -799,15 +819,25 @@ impl FlashGqaKernels {
                 format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
             ));
         }
+        if max_keys == 0 || max_keys > ctx {
+            return Err(GpuError::shape(
+                what,
+                format!("max_keys must be in 1..=ctx {ctx}, got {max_keys}"),
+            ));
+        }
         let n_head = n_kv * GROUP;
-        let segs = segments_for(ctx);
+        let segs = segments_for(max_keys);
         let lens = [
             ("q", q.len(), m * n_head * HEAD),
             ("kc", kc.len(), n_kv * ctx * HEAD),
             ("vc", vc.len(), n_kv * ctx * HEAD),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len(m, n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("part_v", part_v.len(), partials_v_len(m, n_head, max_keys)),
+            (
+                "part_ms",
+                part_ms.len(),
+                partials_ms_len(m, n_head, max_keys),
+            ),
             ("y", y.len(), m * n_head * HEAD),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {

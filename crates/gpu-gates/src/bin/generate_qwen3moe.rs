@@ -3,23 +3,30 @@
 //! ruler.
 //!
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
-//!                       [-n N] [--ctx C] [--mode eager|graph] [--time [--warm W]]
+//!                       [-n N] [--ctx C] [--mode eager|graph] [--prefill auto|pass|gemm]
+//!                       [--time [--warm W]]
 //!
-//! Defaults: N 32, C 4096, mode graph, W 0. A flag given twice takes its
-//! last value. `--prompt` tokenizes the text with the file's own vocabulary
+//! Defaults: N 32, C 4096, mode graph, prefill auto, W 0. A flag given twice
+//! takes its last value. `--prompt` tokenizes the text with the file's own vocabulary
 //! (`tokenizer`, no BOS: the file sets `add_bos_token` false; no
 //! chat template) and prints the generated text after the ids.
 //!
-//! The prompt is prefilled (`Qwen3moeModel::prefill`: up to eight positions
-//! per pass, the same cache rows and answer as one step per token; in graph
-//! mode each pass a replay of the pass of its size); the argmax after its
-//! last token is generated token 0, and `N − 1` feedback steps follow.
+//! The prompt is prefilled (`Qwen3moeModel::prefill_with` by the `--prefill`
+//! path: `auto` takes one pass for a prompt of up to eight ids and GEMM
+//! ubatches of up to 512 for a longer one, a tail of up to eight after them
+//! one pass; `pass` passes of up to eight positions, the same cache rows and
+//! answer as one step per token, in graph mode each a replay of the pass of
+//! its size; `gemm` ubatches only); the argmax after its last token is
+//! generated token 0, and `N − 1` feedback steps follow.
 //! Lines: `prompt_ids`, `load` (with the flash pass: `flash_mma=`), in graph
 //! mode `capture graph_nodes=` and `capture prefill_graphs=<n> nodes=<m=1>,…
 //! ms= vram_bytes=` (every pass size captured before the prompt: its wall
 //! and the card's free bytes it took, runtime values), `step 0 pos tok`
-//! (with the passes the prompt took: `prefill_steps=`), then, all written
-//! after the loop, `time prompt n=<P> ms= tok/s= passes=<K> kind=prefill`
+//! (with the units the prompt took: `prefill_steps=`, and their shapes:
+//! `plan=ubatch:512x2 pass:1`, a run of equal sizes as `<size>x<k>`), then,
+//! all written after the loop,
+//! `time prompt n=<P> ms= tok/s= passes=<K> kind=<gemm|prefill>` (`K` the
+//! ubatches and passes; `gemm` when a ubatch ran)
 //! (the wall of `prefill` through its token's readback, on every run: a
 //! runtime value like the `load` line, a measurement only under the lease;
 //! the prefill arena is allocated at load and the passes captured before
@@ -55,6 +62,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod cli {
     use bloomery_gpu::Qwen3moeModel;
+    use bloomery_gpu::arch::qwen3moe::{PrefillPath, PrefillPlan};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::{GateError, open_split, ref_model_path};
     use model::arch::Arch;
@@ -86,6 +94,12 @@ mod cli {
             None | Some("graph") => StepMode::Graph,
             Some("eager") => StepMode::Eager,
             Some(o) => return Err(format!("--mode is eager or graph, not {o}").into()),
+        };
+        let path = match flag("--prefill")?.as_deref() {
+            None | Some("auto") => PrefillPath::Auto,
+            Some("pass") => PrefillPath::Pass,
+            Some("gemm") => PrefillPath::Gemm,
+            Some(o) => return Err(format!("--prefill is auto, pass or gemm, not {o}").into()),
         };
         let seed_depth: Option<usize> = flag("--seed-depth")?.map(|s| s.parse()).transpose()?;
         let text = flag("--prompt")?;
@@ -156,14 +170,16 @@ mod cli {
             m.seed_depth(d - 1)?;
             println!("seed rows={} pos={}", d - 1, m.pos());
         }
+        let plan = PrefillPlan::new(ids.len(), path);
         let t = Instant::now();
-        let mut next = m.prefill(&ids)?;
+        let mut next = m.prefill_with(&ids, path)?;
         let prefill_wall = t.elapsed();
         println!(
-            "step 0 {} {next} (the {} prompt ids in prefill_steps={} passes, {:.2} s, runtime value)",
+            "step 0 {} {next} (the {} prompt ids in prefill_steps={} units, plan={plan}, {:.2} s, \
+             runtime value)",
             m.pos() - 1,
             ids.len(),
-            Qwen3moeModel::prefill_passes(ids.len()),
+            plan.steps.len(),
             prefill_wall.as_secs_f64()
         );
         let mut tokens_out = Vec::with_capacity(n_gen);
@@ -178,10 +194,11 @@ mod cli {
         }
         let prefill_ms = prefill_wall.as_secs_f64() * 1e3;
         println!(
-            "time prompt n={} ms={prefill_ms:.4} tok/s={:.2} passes={} kind=prefill",
+            "time prompt n={} ms={prefill_ms:.4} tok/s={:.2} passes={} kind={}",
             ids.len(),
             ids.len() as f64 * 1e3 / prefill_ms,
-            Qwen3moeModel::prefill_passes(ids.len())
+            plan.steps.len(),
+            plan.kind()
         );
         for (k, &(pos, tok, ms)) in rows.iter().enumerate() {
             let i = k + 1;

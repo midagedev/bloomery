@@ -32,7 +32,28 @@
 //!    `q3k_gemv_sel`; Q5_K has none).
 //!
 //! `--case <text>` runs only the cases whose name contains `text` (the
-//! dense case is `dense`, the faults and refusals `fault`).
+//! dense case is `dense`, the faults and refusals `fault`, the ubatch router
+//! `router`).
+//!
+//! The ubatch router the GEMM prefill routes with
+//! (`RouterKernels::enqueue_ubatch`: the logits launch, then the routing
+//! launch) runs on the file's layer-0 router weight for T ∈ {1, 7, 8, 9, 63,
+//! 512} tokens: every logit, probability, id and weight bit for bit what the
+//! fused router (`enqueue_fused`, eight tokens a launch) writes for the same
+//! columns, and every logit within `γ(k/32 + 5) · Σ |w·x|` of the f64 dot
+//! (each lane's sequential sum of `k/32` products, then the five-step
+//! butterfly). Then its refusals (tokens past the buffers, none, a short
+//! input, a weight of the wrong shape, a ubatch past 512 tokens).
+//!
+//! The SwiGLU quantizer between gate·up and down
+//! (`GemmKernels::enqueue_swiglu_quant`, case `swiglu`) at K ∈ {768, 2048}
+//! for 1, 8, 64 and 4096 columns: its five planes bit for bit what
+//! `ElemKernels::enqueue_swiglu` then `Gpu::enqueue_quantize_gemm` write;
+//! the scales and code sums the host transcription of the quantizer gives
+//! from those SwiGLU rows; every SwiGLU value within four f32 ulps (and
+//! 2^-126) of the f64 `g / (1 + e^-g) · u`. A NaN in a gate row ends as the
+//! named `QuantColumn` fault; its refusals (no columns, more than the
+//! activation holds, a short input).
 //!
 //! And once per case: a rerun bit-identical, the route and the GEMM
 //! captured into a graph whose replay equals the eager launch. Then the
@@ -54,6 +75,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::arch::qwen3moe::router::{
+        MAX_TOKENS, N_EXPERT, N_USED, RouterKernels, RouterOut,
+    };
+    use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::gemm::{
         GEMM_MAX_SLOTS, GemmAct, GemmInput, GemmKernels, GemmRoute, GemmWeight,
     };
@@ -1061,6 +1086,266 @@ mod gate {
         Ok(ok)
     }
 
+    /// Column counts of the SwiGLU quantizer case.
+    const SWIGLU_COLS: [usize; 4] = [1, 8, 64, 4096];
+
+    /// The SwiGLU quantizer against the two-launch composition, the host
+    /// transcription and the f64 SwiGLU (module doc), its fault and its
+    /// refusals.
+    fn swiglu_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("swiglu") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let mut ok = true;
+        for k in [768usize, 2048] {
+            let max = SWIGLU_COLS[SWIGLU_COLS.len() - 1];
+            let mut fused = GemmAct::new(stream, max, k)?;
+            let mut split = GemmAct::new(stream, max, k)?;
+            let mut h = DeviceBuffer::<f32>::zeroed(stream, max * k)?;
+            for &n in &SWIGLU_COLS {
+                let gh = activations(k, n, 4400 + n as u32 + k as u32);
+                let uh = activations(k, n, 5500 + n as u32 + k as u32);
+                let (g, u) = (
+                    DeviceBuffer::from_host(stream, &gh)?,
+                    DeviceBuffer::from_host(stream, &uh)?,
+                );
+                dev.gk.enqueue_swiglu_quant(
+                    stream,
+                    &g,
+                    &u,
+                    n,
+                    &mut fused,
+                    gpu.unlabelled_sink(),
+                )?;
+                gpu.elem().enqueue_swiglu(stream, &g, &u, n * k, &mut h)?;
+                gpu.enqueue_quantize_gemm(&h, n, &mut split, gpu.unlabelled_sink())?;
+                stream.synchronize()?;
+                let planes_same = fused.q3().to_host_vec(stream)?
+                    == split.q3().to_host_vec(stream)?
+                    && fused.q4().to_host_vec(stream)? == split.q4().to_host_vec(stream)?
+                    && fused.q6().to_host_vec(stream)? == split.q6().to_host_vec(stream)?
+                    && fused.s8().to_host_vec(stream)? == split.s8().to_host_vec(stream)?
+                    && bits_equal(
+                        &fused.d8().to_host_vec(stream)?,
+                        &split.d8().to_host_vec(stream)?,
+                    );
+                let hd = h.to_host_vec(stream)?;
+                let (dev_d8, dev_s8) = (
+                    fused.d8().to_host_vec(stream)?,
+                    fused.s8().to_host_vec(stream)?,
+                );
+                let nb = k / 128;
+                let host_ok = (0..n).all(|c| {
+                    let (codes, d8) = q8_column(&hd[c * k..(c + 1) * k]);
+                    (0..nb).all(|b| dev_d8[c * nb + b].to_bits() == d8[b].to_bits())
+                        && (0..k / 32).all(|j| {
+                            let s: i32 = codes[32 * j..32 * j + 32]
+                                .iter()
+                                .map(|&v| i32::from(v))
+                                .sum();
+                            dev_s8[c * (k / 32) + j] == s
+                        })
+                });
+                let mut worst = 0.0f64;
+                let mut silu_ok = true;
+                for i in 0..n * k {
+                    let (gv, uv) = (f64::from(gh[i]), f64::from(uh[i]));
+                    let want = gv / (1.0 + (-gv).exp()) * uv;
+                    let tol =
+                        4.0 * f64::from(f32::EPSILON) * want.abs() + f64::from(f32::MIN_POSITIVE);
+                    let err = (f64::from(hd[i]) - want).abs();
+                    silu_ok &= err <= tol;
+                    worst = worst.max(err / tol);
+                }
+                let pass = planes_same && host_ok && silu_ok;
+                println!(
+                    "gemm case=swiglu K={k} cols={n} planes_eq_split_bits={planes_same} \
+                     host_scales_and_sums={host_ok} silu_within_4ulp={silu_ok} \
+                     worst_err_over_tol={worst:.3} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+        // A NaN in one gate row: the named fault.
+        let k = 768;
+        let mut act = GemmAct::new(stream, 8, k)?;
+        let mut gh = activations(k, 8, 77);
+        gh[5 * k + 300] = f32::NAN;
+        let uh = activations(k, 8, 78);
+        let (g, u) = (
+            DeviceBuffer::from_host(stream, &gh)?,
+            DeviceBuffer::from_host(stream, &uh)?,
+        );
+        gpu.clear_fault()?;
+        dev.gk
+            .enqueue_swiglu_quant(stream, &g, &u, 8, &mut act, gpu.unlabelled_sink())?;
+        let err = gpu.take_fault()?.map(|fault| GpuError::Fault {
+            what: "gate_gemm",
+            fault,
+        });
+        let nan_ok = matches!(&err, Some(GpuError::Fault { fault, .. })
+            if fault.site() == Some(FaultSite::QuantColumn));
+        println!(
+            "gemm case=swiglu fault=nan_gate error=\"{}\" {}",
+            err.as_ref()
+                .map_or_else(|| "none".to_string(), ToString::to_string),
+            verdict(nan_ok)
+        );
+        let short = DeviceBuffer::<f32>::zeroed(stream, k)?;
+        let sink = gpu.unlabelled_sink();
+        let refusals = [
+            (
+                "no_columns",
+                dev.gk
+                    .enqueue_swiglu_quant(stream, &g, &u, 0, &mut act, sink)
+                    .is_err(),
+            ),
+            (
+                "past_act",
+                dev.gk
+                    .enqueue_swiglu_quant(stream, &g, &u, 9, &mut act, sink)
+                    .is_err(),
+            ),
+            (
+                "short_input",
+                dev.gk
+                    .enqueue_swiglu_quant(stream, &short, &u, 2, &mut act, sink)
+                    .is_err(),
+            ),
+        ];
+        let all = refusals.iter().all(|(_, r)| *r);
+        println!(
+            "gemm case=swiglu refusals {} {}",
+            refusals
+                .iter()
+                .map(|(n, r)| format!("{n}={}", if *r { "refused" } else { "ACCEPTED" }))
+                .collect::<Vec<_>>()
+                .join(" "),
+            verdict(all)
+        );
+        Ok(ok && nan_ok && all)
+    }
+
+    /// Token counts of the ubatch router case.
+    const ROUTER_TOKENS: [usize; 6] = [1, 7, 8, 9, 63, 512];
+
+    /// The ubatch router against the fused router and the f64 dot (module
+    /// doc), then its refusals. `w` is the router weight, [`N_EXPERT`] rows
+    /// of `k` f32.
+    fn router_case(dev: &Dev<'_>, w: &[f32], k: usize) -> Result<bool, GateError> {
+        if !wanted("router") {
+            return Ok(true);
+        }
+        let stream = dev.gpu.stream();
+        let rk = RouterKernels::load(dev.gpu.context())?;
+        let wd = DeviceTensor::upload(stream, w, N_EXPERT, k)?;
+        let max = ROUTER_TOKENS[ROUTER_TOKENS.len() - 1];
+        let mut ub = RouterOut::for_ubatch(stream, max)?;
+        let mut fused = RouterOut::with_tokens(stream, MAX_TOKENS)?;
+        let mut ok = true;
+        for &t in &ROUTER_TOKENS {
+            let x = activations(k, t, 9100 + t as u32);
+            let xd = DeviceBuffer::from_host(stream, &x)?;
+            rk.enqueue_ubatch(stream, &wd, &xd, t, &mut ub)?;
+            stream.synchronize()?;
+            let (lg, pr, id, wt) = (
+                ub.logits.to_host_vec(stream)?,
+                ub.probs.to_host_vec(stream)?,
+                ub.ids.to_host_vec(stream)?,
+                ub.weights.to_host_vec(stream)?,
+            );
+            let mut same = true;
+            for c0 in (0..t).step_by(MAX_TOKENS) {
+                let m = (t - c0).min(MAX_TOKENS);
+                let xc = DeviceBuffer::from_host(stream, &x[c0 * k..(c0 + m) * k])?;
+                rk.enqueue_fused(stream, &wd, &xc, m, &mut fused)?;
+                stream.synchronize()?;
+                let e = N_EXPERT;
+                same &= bits_equal(
+                    &fused.logits.to_host_vec(stream)?[..m * e],
+                    &lg[c0 * e..(c0 + m) * e],
+                );
+                same &= bits_equal(
+                    &fused.probs.to_host_vec(stream)?[..m * e],
+                    &pr[c0 * e..(c0 + m) * e],
+                );
+                same &= fused.ids.to_host_vec(stream)?[..m * N_USED]
+                    == id[c0 * N_USED..(c0 + m) * N_USED];
+                same &= bits_equal(
+                    &fused.weights.to_host_vec(stream)?[..m * N_USED],
+                    &wt[c0 * N_USED..(c0 + m) * N_USED],
+                );
+            }
+            let band_n = k / 32 + 5;
+            let mut worst = 0.0f64;
+            let mut in_band = true;
+            for tok in 0..t {
+                for e in 0..N_EXPERT {
+                    let (mut dot, mut mag) = (0.0f64, 0.0f64);
+                    for i in 0..k {
+                        let p = f64::from(w[e * k + i]) * f64::from(x[tok * k + i]);
+                        dot += p;
+                        mag += p.abs();
+                    }
+                    let band = gamma(band_n) * mag;
+                    let err = (f64::from(lg[tok * N_EXPERT + e]) - dot).abs();
+                    in_band &= err <= band;
+                    if band > 0.0 {
+                        worst = worst.max(err / band);
+                    }
+                }
+            }
+            let pass = same && in_band;
+            println!(
+                "gemm case=router T={t} ubatch_eq_fused_bits={same} logits_in_band={in_band} \
+                 worst_err_over_band={worst:.3} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        let x = DeviceBuffer::<f32>::zeroed(stream, max * k)?;
+        let short = DeviceBuffer::<f32>::zeroed(stream, k)?;
+        let wrong = DeviceTensor::upload(stream, &w[..64 * k], 64, k)?;
+        let refusals = [
+            (
+                "tokens_past_buffers",
+                rk.enqueue_ubatch(stream, &wd, &x, max + 1, &mut ub)
+                    .is_err(),
+            ),
+            (
+                "no_tokens",
+                rk.enqueue_ubatch(stream, &wd, &x, 0, &mut ub).is_err(),
+            ),
+            (
+                "short_input",
+                rk.enqueue_ubatch(stream, &wd, &short, 2, &mut ub).is_err(),
+            ),
+            (
+                "weight_rows",
+                rk.enqueue_ubatch(stream, &wrong, &x, 8, &mut ub).is_err(),
+            ),
+            (
+                "ubatch_over_limit",
+                RouterOut::for_ubatch(stream, UBATCH + 1).is_err(),
+            ),
+            ("ubatch_empty", RouterOut::for_ubatch(stream, 0).is_err()),
+        ];
+        let all = refusals.iter().all(|(_, r)| *r);
+        println!(
+            "gemm case=router refusals {} {}",
+            refusals
+                .iter()
+                .map(|(n, r)| format!("{n}={}", if *r { "refused" } else { "ACCEPTED" }))
+                .collect::<Vec<_>>()
+                .join(" "),
+            verdict(all)
+        );
+        Ok(ok && all)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         println!("gemm device={}", gpu.device_name()?);
@@ -1157,12 +1442,30 @@ mod gate {
             };
             ok &= run_case(&dev, &st, 0x71)?;
         }
+        if wanted("router") {
+            let t = qwen
+                .find("blk.0.ffn_gate_inp.weight")
+                .ok_or("no blk.0.ffn_gate_inp.weight in the qwen3moe file")?;
+            if t.ty != GgmlType::F32 || t.dims.len() != 2 || t.dims[1] as usize != N_EXPERT {
+                return Err(format!("blk.0.ffn_gate_inp.weight is {:?} {:?}", t.ty, t.dims).into());
+            }
+            let k = t.dims[0] as usize;
+            let w: Vec<f32> = qwen
+                .data(t)?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| f32::from_le_bytes(b))
+                .collect();
+            ok &= router_case(&dev, &w, k)?;
+        }
         drop(qwen);
 
         if wanted("v41_gate_q3k") {
             ok &= v41_cases(&dev, dims)?;
         }
         ok &= dense_case(&dev)?;
+        ok &= swiglu_case(&dev)?;
         ok &= faults(&dev)?;
 
         if !ok {
@@ -1173,7 +1476,8 @@ mod gate {
         }
         println!(
             "PASSED: gate_gemm — every run inside its derived band of the f64 reference, every slot \
-             written, rerun and graph replay bit-identical, faults named"
+             written, rerun and graph replay bit-identical, faults named; the ubatch router and the \
+             SwiGLU quantizer bit for bit their compositions"
         );
         Ok(())
     }

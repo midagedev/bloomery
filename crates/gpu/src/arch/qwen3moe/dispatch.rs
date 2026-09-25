@@ -68,7 +68,7 @@ pub(super) fn enqueue_chain(
 /// projection with the argmax folded in (`head_argmax`) in place of the
 /// shared head's gemv and `argmax_fault` — the same logits and the same
 /// (token, fault word) readback.
-fn enqueue_head(
+pub(super) fn enqueue_head(
     gpu: &Gpu,
     w: &Weights,
     k: &Kernels,
