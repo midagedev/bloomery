@@ -6,6 +6,7 @@
 `gemm_q4k` T 4096, P 4096 프리필 nsys)이 그 대조다 — 둘 다 러너가 아직 그 모양을 못 돈다(`nsys-gpu.sh`는 한 행 eager 프리필 +
 재생 모양, `ncu-gpu.sh`는 `generate` 인자 모양). 이 보고로 q3ubatch 보고의 "routed GEMM 37 % / 글루 37 %"는 dense GEMM(약 18 %)을
 빠뜨린 값으로 정정된다.
+정정(같은 밤, `q3gemm-lit`, `docs/research/q3gemm-lit-report.md`): ① mistral.rs의 프리필 MoE는 `indexed_moe` dp4a가 아니라 llama.cpp MMQ 포트(int8 `m16n8k32`)이고 dp4a는 토큰 32개 미만의 디코드 경로뿐이다 ② 부분 타일은 11 %·약 3 %가 아니라 타일의 21.7 %, 비용 5.8 %(A 뒤 3.7 %)[유도] ③ exl3 coop은 bsz ≤ 32 한 커널이 아니라 bsz 1..8, 런치 둘 ④ exl3의 결정적 합산은 이 트리에서 기본값(`EXL3_MOE_FUSED_DET` 기본 "1"). 원문은 그대로 두었다.
 아래는 라운드의 보고 원문이다.
 
 **q3next-design 보고.** 저는 opus(Opus 5.5)로 스폰되었습니다. 편집한 파일, 빌드, 게이트, 시간 재는 실행은 없고, 다른 에이전트에게 메시지도 보내지 않았습니다.
