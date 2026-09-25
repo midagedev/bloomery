@@ -347,7 +347,9 @@ first suspect is a hung gate on the box, not the agent.
   listed in `THIRD_PARTY_NOTICES.md`; `just deny` fails if either ever floats. The
   box never rebuilds the backend in place: `tools/box.sh` exports
   `CUDA_OXIDE_BACKEND=~/.cargo/cuda-oxide-bloomery/<rev>/librustc_codegen_cuda.so`
-  and a `cargo oxide` command stops (rc 70) when that rev's backend is missing.
+  and a `cargo oxide` command stops (rc 70) when that rev's backend is missing or
+  its `source-rev.txt` names another commit (pinned this way, cargo-oxide no
+  longer compares the backend with the dependency's commit).
   A fork patch that changes codegen is a pin move (every gate); one that must not
   proves it with the `just ptx-scan` tables of `generate_ds41` and `gate_e2e`
   identical.
