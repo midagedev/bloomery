@@ -243,6 +243,18 @@ ref_arm() {
   sums+=("$eng|$dep|$r|$val|")
 }
 
+# The variables arm <i> of ours runs with, into ARM_ENVS: its own, and for a DSpark arm
+# (BLOOMERY_DRAFT=dspark) the other card's visibility and the draft file (timing-card.sh dspark_env).
+# The dry run prints the same list.
+arm_envs() {
+  ARM_ENVS=()
+  [ -z "${A_ENV[$1]}" ] || IFS=, read -r -a ARM_ENVS <<< "${A_ENV[$1]}"
+  if [[ ",${A_ENV[$1]}," == *",BLOOMERY_DRAFT=dspark,"* ]]; then
+    local -a extra=()
+    mapfile -t extra < <(dspark_env)
+    ARM_ENVS=("${extra[@]}" "${ARM_ENVS[@]}")
+  fi
+}
 # One arm of a generate_ds41: ours (our binary, with the arm's variables when it has any) or a
 # second binary. The row and the sum under the arm's label.
 # ours_arm <index> <round>
@@ -250,7 +262,8 @@ ours_arm() {
   local i=$1 r=$2 dep label bin out rc t0 t1 smoke p50 mean warmcol series draft h10 t10 uniq_tok tps_mean tps_p50
   local -a envs=()
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} bin=${A_BIN[$i]}
-  [ -z "${A_ENV[$i]}" ] || IFS=, read -r -a envs <<< "${A_ENV[$i]}"
+  arm_envs "$i"
+  envs=("${ARM_ENVS[@]}")
   witness "pre r$r $label d=$dep n=$N"
   t0=$(date +%s)
   if [ ${#envs[@]} -eq 0 ]; then
@@ -303,7 +316,8 @@ if [ -n "$DRY" ]; then
       *)
         note=''
         [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
-        echo "[dry] $a: timeout --kill-after=10 $BOUND ${A_ENV[$i]:+env ${A_ENV[$i]//,/ } }${A_BIN[$i]} --depth $dep -n $N --time${WARM:+ --warm $WARM}$note"
+        arm_envs "$i"
+        echo "[dry] $a: timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --depth $dep -n $N --time${WARM:+ --warm $WARM}$note"
         ;;
     esac
   done
