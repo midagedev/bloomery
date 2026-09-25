@@ -1,0 +1,716 @@
+//! The prompt batch: a prompt of `P` ids fed as batches of up to [`T_MAX`]
+//! consecutive positions ([`prefill`]), which leaves the model in the state
+//! `P` decode steps over the same ids leave it, bit for bit — every layer's
+//! window ring and shadow rows, compressed rows, compressor state, index
+//! keys, the feature tap's rows, the host tier, and the last position's
+//! logits.
+//!
+//! A batch runs its layers in order, and each layer over the batch's chunks —
+//! runs of at most [`CHUNK`] positions, cut at multiples of [`CHUNK`] so a
+//! chunk's latent rows fill one staging buffer from the row of its first
+//! position on:
+//!
+//! 1. before the first layer, once per batch: each chunk planned in order
+//!    (the host step plan, after the tokens before it), every token's rows
+//!    read at once ([`PromptRows`]), each chunk's image built and every image
+//!    copied to the card in one transfer, the attention piece's gather of
+//!    each chunk's words into its own row, the embedding broadcast;
+//! 2. per layer: the engram step where the layer carries a site, chunk by
+//!    chunk; the attention sub-layer chunk by chunk in position order, each
+//!    chunk's latent rows staged and committed to the ring before the next
+//!    chunk attends ([`AttnChain::enqueue_layer_staged`]); the MoE sub-layer
+//!    in its batch phases ([`crate::chain::ffn::FfnBatch`]) — the route of
+//!    every chunk, the batch's handoffs to the host, the card's shadow work
+//!    of every chunk while one union call serves the layer's host experts for
+//!    every token, the sums back and one join; the feature tap of every
+//!    token where the next layer is tapped;
+//! 3. after the last layer, only in the batch that holds the prompt's last
+//!    position: the head, for that position alone.
+//!
+//! Every launch writes, per token, what its one-token launch writes, and the
+//! ops that carry state from a position to the next (the ring, the
+//! compressor's pooling, each token's visible counts) run in position order,
+//! so the batch is the steps' numbers, not an approximation of them. The
+//! batch's buffers ([`Batch`]) are made by the first batch, or before it by
+//! [`prepare_prefill`], never per batch; the decode step's buffers and
+//! launches do not change.
+//!
+//! The loop is shaped per layer and chunk so that a later round can cut the
+//! positions a layer runs (the decoder layers whose global rows come from
+//! layer 20 need only the prompt's last positions); today every layer runs
+//! the whole batch.
+
+use std::ops::Range;
+
+use model::moe::UNION_MAX_COLS;
+
+use super::*;
+use crate::chain::attn::StageIo;
+use crate::chain::ffn::{ChunkIo, FfnBatch, JoinIo};
+use crate::chain::glue::{GlueBatch, PromptRows};
+use crate::hc::{HC_MAX_TOKENS, HC_MIX};
+use crate::span::{span, span_mut};
+
+/// Positions one batch runs at most: the host union's columns.
+pub const T_MAX: usize = UNION_MAX_COLS;
+
+/// Positions one chunk runs at most: the m-column kernels' and HC_PRE's.
+pub const CHUNK: usize = HC_MAX_TOKENS;
+
+/// Chunks a batch cuts into at most: an unaligned first position adds one.
+const CHUNKS_MAX: usize = T_MAX / CHUNK + 1;
+
+const WHAT: &str = "deepseek41 prefill";
+
+/// How a prompt is fed ([`PrefillMode::from_env`]): in batches ([`prefill`])
+/// or one decode step per id — the same-binary timing arm, which is the
+/// decode step and not a second implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillMode {
+    Batch,
+    Steps,
+}
+
+impl PrefillMode {
+    /// `BLOOMERY_PREFILL`: unset or `batch` batches, `steps` steps; any other
+    /// value is refused by name.
+    pub fn from_env() -> Result<PrefillMode, GpuError> {
+        match std::env::var("BLOOMERY_PREFILL").as_deref() {
+            Err(_) | Ok("batch") => Ok(PrefillMode::Batch),
+            Ok("steps") => Ok(PrefillMode::Steps),
+            Ok(_) => Err(GpuError::State {
+                what: "BLOOMERY_PREFILL",
+                missing: "batch or steps",
+            }),
+        }
+    }
+
+    /// The name a `load` line prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            PrefillMode::Batch => "batch",
+            PrefillMode::Steps => "steps",
+        }
+    }
+}
+
+/// Make the batch's buffers now, so the first [`prefill`] allocates nothing:
+/// a timed prompt then times the batch alone. Idempotent.
+pub fn prepare_prefill(m: &mut Deepseek41Model) -> Result<(), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    body.batch_mut(gpu).map(|_| ())
+}
+
+/// Feed `ids` from the model's position on as batches of up to [`T_MAX`]
+/// positions and return the greedy token after the last of them; the model
+/// stands `ids.len()` positions on. See the module comment.
+pub fn prefill(m: &mut Deepseek41Model, ids: &[u32]) -> Result<u32, GpuError> {
+    feed(m, ids, None, &mut |_, _| Ok(()))
+}
+
+/// Which sub-layer a [`BatchSeam`] follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchSeamKind {
+    Engram,
+    Attn,
+    Ffn,
+}
+
+/// A point of a batch, shown to the observer of [`prefill_observed`] once
+/// the launches before it are enqueued: the streams every token of the batch
+/// holds after layer `layer`'s sub-layer `kind`, `4 · n_embd` a token from
+/// the batch's first position `first`, and the fold the next sub-layer reads
+/// where there is one.
+pub struct BatchSeam<'a> {
+    pub kind: BatchSeamKind,
+    pub layer: usize,
+    pub first: u32,
+    pub tokens: usize,
+    pub streams: &'a DeviceBuffer<f32>,
+    pub fold: Option<&'a DeviceBuffer<f32>>,
+    /// After an attention sub-layer: the piece's buffers as its last chunk
+    /// left them.
+    pub attn: Option<AttnTaps<'a>>,
+}
+
+/// [`prefill_observed`]'s observer.
+pub type BatchObserver<'a> = dyn FnMut(&Gpu, BatchSeam<'_>) -> Result<(), GpuError> + 'a;
+
+/// [`prefill`], showing `observe` each [`BatchSeam`] of every batch as its
+/// launches are enqueued: a gate reads the streams there after it
+/// synchronizes, and names the first seam where a batch leaves the steps.
+pub fn prefill_observed(
+    m: &mut Deepseek41Model,
+    ids: &[u32],
+    observe: &mut BatchObserver<'_>,
+) -> Result<u32, GpuError> {
+    feed(m, ids, None, observe)
+}
+
+/// Where [`prefill_with`] hands each batch's feature rows: the batch's first
+/// position, then one row of the tap's width per position, in order.
+pub type FeatureSink<'a> = &'a mut dyn FnMut(u32, &[f32]) -> Result<(), GpuError>;
+
+/// [`prefill`], handing `features` each batch's feature rows once it has run.
+/// Refused with `features` and no tap.
+pub fn prefill_with(
+    m: &mut Deepseek41Model,
+    ids: &[u32],
+    features: Option<FeatureSink<'_>>,
+) -> Result<u32, GpuError> {
+    feed(m, ids, features, &mut |_, _| Ok(()))
+}
+
+fn feed(
+    m: &mut Deepseek41Model,
+    ids: &[u32],
+    mut features: Option<FeatureSink<'_>>,
+    observe: &mut BatchObserver<'_>,
+) -> Result<u32, GpuError> {
+    if ids.is_empty() {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: "a prompt of no ids".to_string(),
+        });
+    }
+    let mut token = None;
+    let mut done = 0;
+    while done < ids.len() {
+        let u = (ids.len() - done).min(T_MAX);
+        let last = done + u == ids.len();
+        let run = &ids[done..done + u];
+        let first = m.pos();
+        token = m.run_rows(u, WHAT, |gpu, w, body, head, pos| {
+            body.enqueue_batch(
+                gpu,
+                w,
+                head,
+                BatchRun {
+                    ids: run,
+                    pos,
+                    last,
+                },
+                observe,
+            )
+        })?;
+        if let Some(f) = features.as_mut() {
+            let (gpu, _, body) = m.body_parts(WHAT)?;
+            f(first, body.batch_features(gpu, u)?)?;
+        }
+        done += u;
+    }
+    token.ok_or(GpuError::State {
+        what: WHAT,
+        missing: "the head of the batch that holds the prompt's last position",
+    })
+}
+
+/// The batch's buffers: see the module comment. Made once.
+pub(super) struct Batch {
+    /// The chunk images' host builder, the chunks' plans, every chunk's image
+    /// laid end to end on the host and its card copy.
+    image: StepImage,
+    plans: Vec<StepPlan>,
+    images: Vec<u32>,
+    params: DeviceBuffer<u32>,
+    /// The attention piece over images of [`CHUNK`] tokens, a row of words
+    /// per chunk.
+    attn: AttnChain,
+    glue: GlueBatch,
+    ffn: FfnBatch,
+    rows: PromptRows,
+    /// Per token of the batch: the streams and the folds, ping and pong.
+    hc: [DeviceBuffer<f32>; 2],
+    folds: [DeviceBuffer<f32>; 2],
+    /// Per chunk, per indexer layer: its list, [`CHUNK`] tokens of it.
+    lists: Vec<Vec<DeviceBuffer<u32>>>,
+    /// A chunk's latent rows before its commit, row `p % CHUNK` for position
+    /// `p`.
+    staging: DeviceTensor<u16>,
+    /// With a feature tap: per token, its row, on the card and the host.
+    taps: Option<DeviceBuffer<f32>>,
+    taps_host: Vec<f32>,
+}
+
+impl Batch {
+    pub(super) fn set_top_k(&mut self, gpu: &Gpu, top_k: usize) -> Result<(), GpuError> {
+        self.attn.set_top_k(gpu, top_k)
+    }
+
+    fn device_bytes(&self) -> usize {
+        self.params.num_bytes()
+            + self.attn.device_bytes()
+            + self.glue.device_bytes()
+            + self.ffn.device_bytes()
+            + self.hc.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + self.folds.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + self
+                .lists
+                .iter()
+                .flatten()
+                .map(|b| b.num_bytes())
+                .sum::<usize>()
+            + self.staging.buf().num_bytes()
+            + self.taps.as_ref().map_or(0, |t| t.num_bytes())
+    }
+}
+
+/// One batch of a prompt: its ids, its first position, and whether it holds
+/// the prompt's last position (the head's).
+struct BatchRun<'a> {
+    ids: &'a [u32],
+    pos: u32,
+    last: bool,
+}
+
+/// The positions `b .. b + u` cut into chunks: at every multiple of
+/// [`CHUNK`], so a chunk never passes the staging's last row.
+fn chunks(b: usize, u: usize) -> Vec<Range<usize>> {
+    let mut out = Vec::with_capacity(u / CHUNK + 2);
+    let (mut p, end) = (b, b + u);
+    while p < end {
+        let next = ((p / CHUNK + 1) * CHUNK).min(end);
+        out.push(p..next);
+        p = next;
+    }
+    out
+}
+
+impl Body {
+    /// The batch's buffers, made by the first call: the attention piece over
+    /// the batch layout, the glue's and the MoE sub-layer's scratch, the
+    /// batch's streams, folds, lists, staging and images, the host union's
+    /// scratch.
+    fn batch_mut(&mut self, gpu: &Gpu) -> Result<&mut Batch, GpuError> {
+        if self.batch.is_none() {
+            let b = self.make_batch(gpu)?;
+            self.hybrid.host_mut().prepare_union()?;
+            self.batch = Some(Box::new(b));
+        }
+        self.batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's buffers",
+        })
+    }
+
+    fn make_batch(&self, gpu: &Gpu) -> Result<Batch, GpuError> {
+        let hp = &self.hp;
+        let stream = gpu.stream();
+        let row_bytes = engram_row_bytes(&self.file, hp)?;
+        let dims = ImageDims::of(hp, &self.planner, CHUNK, row_bytes);
+        let (window, yarn) = rope_specs(hp)?;
+        let image = StepImage::new(ImageLayout::new(dims)?, &window, &yarn)?;
+        let words = image.layout().words();
+        let mut attn = AttnChain::with_rows(
+            gpu,
+            hp,
+            self.layers.clone(),
+            image.layout(),
+            &self.planner,
+            CHUNKS_MAX,
+        )?;
+        if attn.top_k() != self.attn.top_k() {
+            attn.set_top_k(gpu, self.attn.top_k())?;
+        }
+        let writers = self.lists.first().map_or(0, Vec::len);
+        let list_len = attn.list_len();
+        let n = hp.n_embd;
+        let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
+        Ok(Batch {
+            plans: vec![StepPlan::default(); CHUNKS_MAX],
+            images: vec![0; CHUNKS_MAX * words],
+            params: DeviceBuffer::zeroed(stream, CHUNKS_MAX * words)?,
+            glue: self.glue.batch(gpu, image.layout())?,
+            ffn: FfnBatch::new(gpu, n, hp.experts.ff, T_MAX)?,
+            rows: self.rows.prompt_rows(T_MAX),
+            hc: [
+                DeviceBuffer::zeroed(stream, T_MAX * HC_STREAMS * n)?,
+                DeviceBuffer::zeroed(stream, T_MAX * HC_STREAMS * n)?,
+            ],
+            folds: [
+                DeviceBuffer::zeroed(stream, T_MAX * n)?,
+                DeviceBuffer::zeroed(stream, T_MAX * n)?,
+            ],
+            lists: (0..CHUNKS_MAX)
+                .map(|_| {
+                    (0..writers)
+                        .map(|_| DeviceBuffer::zeroed(stream, CHUNK * list_len))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            staging: DeviceTensor::zeroed(stream, CHUNK, hp.head_dim)?,
+            taps: (tap_width > 0)
+                .then(|| DeviceBuffer::zeroed(stream, T_MAX * tap_width))
+                .transpose()?,
+            taps_host: vec![0.0; T_MAX * tap_width],
+            image,
+            attn,
+        })
+    }
+
+    /// Device bytes of the batch's buffers; 0 before the first batch.
+    #[must_use]
+    pub fn batch_bytes(&self) -> usize {
+        self.batch.as_ref().map_or(0, |b| b.device_bytes())
+    }
+
+    /// The last batch's feature rows, `u` of them, copied to the host in one
+    /// transfer (a blocking read on the engine stream). Refused without a
+    /// tap, and for more rows than the batch ran.
+    fn batch_features(&mut self, gpu: &Gpu, u: usize) -> Result<&[f32], GpuError> {
+        let width = self.tap.as_ref().map_or(0, FeatureTap::width);
+        let batch = self.batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a batch that ran",
+        })?;
+        let dev = batch.taps.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a feature tap (attach_features)",
+        })?;
+        if u == 0 || u > T_MAX {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("{u} feature rows of a batch of at most {T_MAX}"),
+            });
+        }
+        let rows = span(WHAT, dev, 0, u * width)?;
+        let host = &mut batch.taps_host[..u * width];
+        rows.copy_to_host(gpu.stream(), host)?;
+        Ok(host)
+    }
+
+    /// One batch: the prompt's ids `ids` at positions `pos ..`, the head only
+    /// when `last`. Returns whether it enqueued the head. See the module
+    /// comment. A batch that is not the last reads the fault word back at its
+    /// end (a blocking read) and returns the fault as the named error.
+    fn enqueue_batch(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        run: BatchRun<'_>,
+        observe: &mut BatchObserver<'_>,
+    ) -> Result<bool, GpuError> {
+        let BatchRun { ids, pos, last } = run;
+        let stream = gpu.stream();
+        if capturing(stream)? {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "an eager stream: a batch is served while it is enqueued",
+            });
+        }
+        if self.rows_failed {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a reset: an earlier step's engram rows failed after its launch, and \
+                          the card ran that step on stale rows",
+            });
+        }
+        self.arrive()?;
+        self.rows.finish()?;
+        let (b, u) = (pos as usize, ids.len());
+        if self.history.len() != b || u == 0 || u > T_MAX || b + u > self.positions() {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a batch of {u} positions (1..={T_MAX}) at {pos} after {} tokens, in caches \
+                     of {} positions",
+                    self.history.len(),
+                    self.positions()
+                ),
+            });
+        }
+        let _ = self.batch_mut(gpu)?;
+        if self.restore {
+            for run in self.holds.stale_runs(b) {
+                for (i, layer) in self.kv.iter_mut().enumerate() {
+                    self.shadows
+                        .restore(i, &mut layer.ring, stream, run.clone())?;
+                }
+                run.for_each(|q| self.holds.ring_wrote(q));
+            }
+            self.restore = false;
+        }
+        let cuts = chunks(b, u);
+        self.plan_batch(stream, ids, &cuts)?;
+        for p in b..b + u {
+            self.holds.wrote(p);
+        }
+        if let Some(tap) = self.tap.as_mut() {
+            tap.pos = [None; PAIR_ROWS];
+        }
+        self.enqueue_batch_chain(gpu, w, head, &cuts, last, observe)?;
+        if last {
+            return Ok(true);
+        }
+        match gpu.fault()? {
+            Some(fault) => Err(GpuError::Fault { what: WHAT, fault }),
+            None => Ok(false),
+        }
+    }
+
+    /// The batch's host half: each chunk planned after the tokens before it
+    /// (the ids joining the history), every token's rows read, each chunk's
+    /// image built, and every image copied to the card in one transfer, which
+    /// synchronizes the stream.
+    fn plan_batch(
+        &mut self,
+        stream: &CudaStream,
+        ids: &[u32],
+        cuts: &[Range<usize>],
+    ) -> Result<(), GpuError> {
+        let Body {
+            batch,
+            planner,
+            history,
+            file,
+            ..
+        } = self;
+        let batch = batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's buffers",
+        })?;
+        let b = cuts.first().map_or(0, |r| r.start);
+        let n = cuts.len();
+        for (plan, r) in batch.plans.iter_mut().zip(cuts) {
+            let toks = &ids[r.start - b..r.end - b];
+            planner
+                .plan_into(toks, r.start as u32, history, plan)
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+            history.extend_from_slice(toks);
+        }
+        batch.rows.fill(file, &batch.plans[..n])?;
+        let words = batch.image.layout().words();
+        for (k, r) in cuts.iter().enumerate() {
+            let at = r.start - b..r.end - b;
+            batch.image.build(
+                &batch.plans[k],
+                batch.rows.embd(at.clone())?,
+                batch.rows.engram(at)?,
+            )?;
+            batch.images[k * words..(k + 1) * words].copy_from_slice(batch.image.words());
+        }
+        let mut dst = span_mut(WHAT, &mut batch.params, 0, n * words)?;
+        dst.copy_from_host(stream, &batch.images[..n * words])?;
+        Ok(())
+    }
+
+    /// The batch's launches (the module comment's steps 1 to 3 on the card),
+    /// the host tier served layer by layer while they are enqueued.
+    fn enqueue_batch_chain(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        cuts: &[Range<usize>],
+        last: bool,
+        observe: &mut BatchObserver<'_>,
+    ) -> Result<(), GpuError> {
+        let Body {
+            layers,
+            kv,
+            shadows,
+            steps,
+            slots,
+            hybrid,
+            ffn,
+            glue,
+            tap,
+            batch,
+            hp,
+            ..
+        } = self;
+        let batch = batch.as_deref_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch's buffers",
+        })?;
+        let stream = gpu.stream();
+        let n = hp.n_embd;
+        let words = batch.image.layout().words();
+        let b = cuts.first().map_or(0, |r| r.start);
+        let u: usize = cuts.iter().map(Range::len).sum();
+        let s4 = HC_STREAMS * n;
+        for k in 0..cuts.len() {
+            let p = span(WHAT, &batch.params, k * words, words)?;
+            batch.attn.enqueue_step_of(gpu, &p, k)?;
+        }
+        for (k, r) in cuts.iter().enumerate() {
+            let (at, m) = (r.start - b, r.len());
+            let p = span(WHAT, &batch.params, k * words, words)?;
+            let [h0, _] = &mut batch.hc;
+            let [f0, _] = &mut batch.folds;
+            let mut s = span_mut(WHAT, h0, at * s4, m * s4)?;
+            let mut f = span_mut(WHAT, f0, at * n, m * n)?;
+            glue.enqueue_batch_embed(gpu, &batch.glue, &p, m, &mut s, &mut f)?;
+        }
+        let mut cur = Cursor::default();
+        for (i, l) in layers.clone().enumerate() {
+            let step = steps[i];
+            if step.engram {
+                for (k, r) in cuts.iter().enumerate() {
+                    let (at, m) = (r.start - b, r.len());
+                    let p = span(WHAT, &batch.params, k * words, words)?;
+                    let (hin, hout) = ping(&mut batch.hc, cur.s);
+                    let streams = span(WHAT, hin, at * s4, m * s4)?;
+                    let mut out = span_mut(WHAT, hout, at * s4, m * s4)?;
+                    let pre = span(WHAT, batch.ffn.hc(), at * HC_MIX, m * HC_MIX)?;
+                    let mut input = span_mut(WHAT, &mut batch.folds[cur.f], at * n, m * n)?;
+                    glue.enqueue_batch_engram(
+                        gpu,
+                        w,
+                        &mut batch.glue,
+                        l,
+                        &p,
+                        m,
+                        EngramStep {
+                            streams: &streams,
+                            pre: &pre,
+                            out: &mut out,
+                            input: &mut input,
+                        },
+                    )?;
+                }
+                cur.s ^= 1;
+                observe(
+                    gpu,
+                    BatchSeam {
+                        kind: BatchSeamKind::Engram,
+                        layer: l,
+                        first: b as u32,
+                        tokens: u,
+                        streams: &batch.hc[cur.s],
+                        fold: Some(&batch.folds[cur.f]),
+                        attn: None,
+                    },
+                )?;
+            }
+            for (k, r) in cuts.iter().enumerate() {
+                let (at, m) = (r.start - b, r.len());
+                let (sin, sout) = ping(&mut batch.hc, cur.s);
+                let (fin, fout) = ping(&mut batch.folds, cur.f);
+                let streams_in = span(WHAT, sin, at * s4, m * s4)?;
+                let mut streams_out = span_mut(WHAT, sout, at * s4, m * s4)?;
+                let fold_in = span(WHAT, fin, at * n, m * n)?;
+                let mut fold_out = span_mut(WHAT, fout, at * n, m * n)?;
+                let LayerIo {
+                    ring,
+                    shadow,
+                    compressed,
+                    selection,
+                } = layer_io(kv, shadows, &mut batch.lists[k], i, &step)?;
+                batch.attn.enqueue_layer_staged(
+                    gpu,
+                    w,
+                    l,
+                    k,
+                    m,
+                    AttnIo {
+                        streams_in: &streams_in,
+                        fold_in: &fold_in,
+                        streams_out: &mut streams_out,
+                        fold_out: &mut fold_out,
+                        ring,
+                        shadow,
+                        compressed,
+                        selection,
+                    },
+                    StageIo {
+                        rows: &mut batch.staging,
+                        first: r.start,
+                    },
+                )?;
+            }
+            cur.s ^= 1;
+            cur.f ^= 1;
+            observe(
+                gpu,
+                BatchSeam {
+                    kind: BatchSeamKind::Attn,
+                    layer: l,
+                    first: b as u32,
+                    tokens: u,
+                    streams: &batch.hc[cur.s],
+                    fold: Some(&batch.folds[cur.f]),
+                    attn: Some(batch.attn.taps()),
+                },
+            )?;
+            for r in cuts {
+                let (at, m) = (r.start - b, r.len());
+                let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
+                let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
+                let io = ChunkIo {
+                    at,
+                    m,
+                    streams: &streams,
+                    fold_in: &fold_in,
+                };
+                ffn.enqueue_batch_route(gpu, w, &mut batch.ffn, l, &io, slots)?;
+            }
+            batch.ffn.enqueue_download(gpu, u)?;
+            let card = CardStacks::of(w, l)?;
+            for r in cuts {
+                let (at, m) = (r.start - b, r.len());
+                let streams = span(WHAT, &batch.hc[cur.s], at * s4, m * s4)?;
+                let fold_in = span(WHAT, &batch.folds[cur.f], at * n, m * n)?;
+                let io = ChunkIo {
+                    at,
+                    m,
+                    streams: &streams,
+                    fold_in: &fold_in,
+                };
+                ffn.enqueue_batch_shadow(gpu, w, card, &mut batch.ffn, l, &io)?;
+            }
+            batch.ffn.serve(hybrid, l, u)?;
+            batch.ffn.enqueue_upload(gpu, u)?;
+            {
+                let (sin, sout) = ping(&mut batch.hc, cur.s);
+                let (_, fout) = ping(&mut batch.folds, cur.f);
+                ffn.enqueue_batch_join(
+                    gpu,
+                    &batch.ffn,
+                    l,
+                    u,
+                    JoinIo {
+                        streams: sin,
+                        streams_out: sout,
+                        fold_out: step.folds.then_some(fout),
+                    },
+                )?;
+            }
+            cur.s ^= 1;
+            if step.folds {
+                cur.f ^= 1;
+            }
+            observe(
+                gpu,
+                BatchSeam {
+                    kind: BatchSeamKind::Ffn,
+                    layer: l,
+                    first: b as u32,
+                    tokens: u,
+                    streams: &batch.hc[cur.s],
+                    fold: step.folds.then_some(&batch.folds[cur.f]),
+                    attn: None,
+                },
+            )?;
+            if let (Some(tap), Some(dev)) = (tap.as_ref(), batch.taps.as_mut())
+                && let Some(slot) = tap.after.get(i).copied().flatten()
+            {
+                let width = tap.width();
+                for t in 0..u {
+                    let s = span(WHAT, &batch.hc[cur.s], t * s4, s4)?;
+                    tap.hc
+                        .enqueue_mean(stream, &s, n, t * width + slot * n, dev)?;
+                }
+            }
+        }
+        if last {
+            let t = u - 1;
+            let s = span(WHAT, &batch.hc[cur.s], t * s4, s4)?;
+            let pre = span(WHAT, batch.ffn.hc(), t * HC_MIX, HC_MIX)?;
+            glue.enqueue_head(gpu, w, &s, &pre, head)?;
+        }
+        Ok(())
+    }
+}

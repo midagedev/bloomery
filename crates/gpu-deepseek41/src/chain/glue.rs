@@ -70,6 +70,9 @@ use crate::engram_gate::{EngramGateKernels, GateArgs, KeyNormArgs, ROW};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels};
 use crate::params::ImageLayout;
 
+mod batch;
+pub use batch::{GlueBatch, PromptRows};
+
 const WHAT: &str = "deepseek41 Glue";
 
 /// Threads of every glue launch.
@@ -1329,19 +1332,7 @@ impl StepRows {
         let token_ids = self.engram.sites().len() * self.n_cols;
         for (k, window) in plan.engram_window.chunks_exact(n_gram).enumerate() {
             let ids = &mut self.ids[k * token_ids..][..token_ids];
-            let hash = self.engram.hash();
-            let mut blocked = false;
-            for (slot, &token) in self.ctx.iter_mut().zip(window) {
-                blocked |= token.is_none();
-                *slot = match token {
-                    Some(t) if !blocked => hash.map_token(t),
-                    _ => hash.pad_id(),
-                };
-            }
-            for (s, site_ids) in ids.chunks_exact_mut(self.n_cols).enumerate() {
-                hash.rows_into(s, &self.ctx, site_ids)
-                    .map_err(|e| GpuError::plan(WHAT, e))?;
-            }
+            token_rows(&self.engram, &mut self.ctx, window, ids, self.n_cols)?;
             let ids = &self.ids[k * token_ids..][..token_ids];
             match self.helper.as_mut() {
                 Some(helper) => {
@@ -1494,6 +1485,34 @@ impl StepRows {
         let sites = self.engram.sites().len();
         &self.ids[(token * sites + site) * self.n_cols..][..self.n_cols]
     }
+}
+
+/// The row ids every site gathers for the token whose n-gram `window` holds,
+/// newest first (a plan's [`StepPlan::engram_window`] run of one token), into
+/// `ids`, `n_cols` per site in site order: the window mapped as the port
+/// maps it — the token, then each older one up to the first missing, the pad
+/// id from there on — into `ctx`, then hashed per site.
+fn token_rows(
+    engram: &Engram,
+    ctx: &mut [u64],
+    window: &[Option<u32>],
+    ids: &mut [u32],
+    n_cols: usize,
+) -> Result<(), GpuError> {
+    let hash = engram.hash();
+    let mut blocked = false;
+    for (slot, &token) in ctx.iter_mut().zip(window) {
+        blocked |= token.is_none();
+        *slot = match token {
+            Some(t) if !blocked => hash.map_token(t),
+            _ => hash.pad_id(),
+        };
+    }
+    for (s, site_ids) in ids.chunks_exact_mut(n_cols).enumerate() {
+        hash.rows_into(s, ctx, site_ids)
+            .map_err(|e| GpuError::plan("StepRows::begin", e))?;
+    }
+    Ok(())
 }
 
 /// Every token's embedding row of `plan` into `out` (`row` bytes a token, as

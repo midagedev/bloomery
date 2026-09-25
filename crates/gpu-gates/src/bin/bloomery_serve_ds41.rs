@@ -130,6 +130,7 @@ mod drive {
         let want_top_k = inputs.hp.indexer.top_k;
         let n_layer = inputs.hp.n_layer;
         let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
+        let prefill_mode = body::PrefillMode::from_env()?;
         let open = OpenArgs {
             place: a.place,
             ctx: a.ctx,
@@ -138,7 +139,7 @@ mod drive {
         };
         let engine = Ds41Engine::spawn(
             move || {
-                Generator::open(
+                let mut g = Generator::open(
                     open,
                     body::open,
                     |m: &Deepseek41Model| {
@@ -154,14 +155,25 @@ mod drive {
                             .into());
                         }
                         Ok(format!(
-                            "layers={n_layer} top_k={top_k} shadow=host {} unified_addressing={}",
-                            shadow.bytes, shadow.unified_addressing
+                            "layers={n_layer} top_k={top_k} shadow=host {} unified_addressing={} \
+                             prefill={}",
+                            shadow.bytes,
+                            shadow.unified_addressing,
+                            prefill_mode.name()
                         ))
                     },
                     &mut std::io::stderr(),
-                )
+                )?;
+                if prefill_mode == body::PrefillMode::Batch {
+                    body::prepare_prefill(g.model_mut())?;
+                }
+                Ok(g)
             },
             |m: &Deepseek41Model, n| m.body("bloomery-serve-ds41").map_or(0, |b| b.keep_point(n)),
+            move |m: &mut Deepseek41Model, ids: &[u32]| match prefill_mode {
+                body::PrefillMode::Batch => body::prefill(m, ids),
+                body::PrefillMode::Steps => m.step(ids),
+            },
             vocab,
             card,
             props,

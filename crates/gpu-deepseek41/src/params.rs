@@ -566,26 +566,30 @@ impl StepImage {
 
     /// Build the image of `plan`'s step, with `embd` (the step's embedding
     /// rows, `tokens · embd_bytes` bytes) and `engram` (its engram rows,
-    /// `tokens · engram_bytes` bytes). The step's positions must be
-    /// consecutive — the window ring's append gives each token its own slot
-    /// only then — and every count must fit the layout; a refused build
-    /// leaves no step in the image.
+    /// `tokens · engram_bytes` bytes). The step runs `1 ..=` the layout's
+    /// tokens: a prompt batch's last chunk may be short, and the words past
+    /// its tokens stay zero — its launches run its own token count. The
+    /// step's positions must be consecutive — the window ring's append gives
+    /// each token its own slot only then — and every count must fit the
+    /// layout; a refused build leaves no step in the image.
     pub fn build(&mut self, plan: &StepPlan, embd: &[u8], engram: &[u8]) -> Result<(), GpuError> {
         self.pos = None;
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
         let dims = &self.layout.dims;
-        let m = dims.tokens;
-        if plan.len() != m
+        let m = plan.len();
+        if !(1..=dims.tokens).contains(&m)
             || plan.tokens.len() != m
             || plan.raw_write.len() != m
             || plan.raw_first.len() != m
         {
             return Err(refuse(format!(
-                "a plan of {} positions, {} tokens, {} cells and {} window starts; the layout runs {m} tokens",
+                "a plan of {} positions, {} tokens, {} cells and {} window starts; the layout runs \
+                 1..={} tokens",
                 plan.len(),
                 plan.tokens.len(),
                 plan.raw_write.len(),
-                plan.raw_first.len()
+                plan.raw_first.len(),
+                dims.tokens
             )));
         }
         let pos0 = plan.pos[0];
@@ -646,7 +650,8 @@ impl StepImage {
     }
 
     fn streams(&mut self, plan: &StepPlan) -> Result<(), GpuError> {
-        let m = self.layout.dims.tokens;
+        // Offsets are the layout's, at its capacity; the counts are the plan's.
+        let (cap, m) = (self.layout.dims.tokens, plan.len());
         for (s, (l, st)) in self.layout.streams.iter().zip(&plan.streams).enumerate() {
             let refuse = |detail: String| GpuError::Shape {
                 what: WHAT,
@@ -664,7 +669,8 @@ impl StepImage {
             {
                 return Err(refuse(format!(
                     "ratio {} with {} visible counts, {groups} groups, {} reads, {} write positions \
-                     and {kept}/{} kept slots; the layout holds ratio {} for {m} tokens",
+                     and {kept}/{} kept slots; the layout holds ratio {} for {cap} tokens, the \
+                     plan runs {m}",
                     st.ratio,
                     st.n_visible.len(),
                     st.state_read.len(),
@@ -677,13 +683,13 @@ impl StepImage {
             w[l.at] = count(groups, &refuse)?;
             w[l.at + 1] = count(kept, &refuse)?;
             w[l.n_visible_at()..][..m].copy_from_slice(&st.n_visible);
-            w[l.state_read_at(m)..][..st.state_read.len()].copy_from_slice(&st.state_read);
-            for (dst, &row) in w[l.state_write_at(m)..].iter_mut().zip(&st.state_write) {
+            w[l.state_read_at(cap)..][..st.state_read.len()].copy_from_slice(&st.state_read);
+            for (dst, &row) in w[l.state_write_at(cap)..].iter_mut().zip(&st.state_write) {
                 *dst = u32::try_from(row).map_err(|_| refuse(format!("row {row} passes u32")))?;
             }
-            w[l.write_pos_at(m)..][..groups].copy_from_slice(&st.write_pos);
-            w[l.persist_src_at(m)..][..kept].copy_from_slice(&st.persist_src);
-            w[l.persist_dst_at(m)..][..kept].copy_from_slice(&st.persist_dst);
+            w[l.write_pos_at(cap)..][..groups].copy_from_slice(&st.write_pos);
+            w[l.persist_src_at(cap)..][..kept].copy_from_slice(&st.persist_src);
+            w[l.persist_dst_at(cap)..][..kept].copy_from_slice(&st.persist_dst);
         }
         Ok(())
     }

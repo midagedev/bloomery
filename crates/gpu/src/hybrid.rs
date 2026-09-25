@@ -46,6 +46,13 @@
 //! counter. The combine reads that sum in place through the mapping. The
 //! protocol — the words, the sequence, the service loop — is this file's
 //! alone; an architecture supplies only what one service computes.
+//!
+//! An eager batch of prompt tokens is served outside that protocol
+//! ([`Hybrid::serve_batch`]): the chain brings the batch's handoffs to the host
+//! itself, and one service computes a layer's host experts for every token of
+//! the batch in one union call ([`HostExperts::experts_union_into`]). It moves
+//! no flag word and no sequence number, so the next step's handoff finds the
+//! host where the last step left it.
 
 use crate::GpuError;
 use crate::graph::cu;
@@ -1056,6 +1063,24 @@ pub trait HostExperts {
         experts: &[(u32, f32)],
         out: &mut [f32],
     ) -> Result<(), GpuError>;
+
+    /// The batch form: `lists[j]` for column `j` of `x`, its sum over
+    /// `out[j · width ..][.. width]`, each column bit for bit what
+    /// [`HostExperts::experts_into`] writes for that column and list alone. An
+    /// architecture without a batched host path refuses, by name.
+    fn experts_union_into(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let _ = (layer, x, lists, out);
+        Err(GpuError::state(
+            "HostExperts::experts_union_into",
+            "a batched host path: this architecture's host tier serves one column a call",
+        ))
+    }
 }
 
 /// What the host side has done since load. Counted by the decode thread
@@ -1100,6 +1125,13 @@ pub struct HybridStats {
     /// The union of a layer's two host lists is `host_slots − overlap_slots`
     /// over any span of whole passes.
     pub pair_row1_slots: u64,
+    /// Batch services ([`Hybrid::serve_batch`]): layers served, the columns
+    /// they carried, the host slots those columns listed, and the host wall
+    /// time of the union calls (ns), summed. None of them counts above.
+    pub batch_served: u64,
+    pub batch_cols: u64,
+    pub batch_host_slots: u64,
+    pub batch_ns: u64,
 }
 
 /// Row 0's host slot ids of the layer its two-row pass served last — what
@@ -1193,6 +1225,10 @@ pub struct Hybrid<H> {
     stats: HybridStats,
     /// For the row overlap in `stats`; `None` until a pair's row 0 is served.
     pair_row0: Option<PairRow0>,
+    /// A batch service's host lists, [`EXPERTS_INTO_MAX`] entries a column
+    /// and each column's length; grown to the widest batch served, once.
+    batch_lists: Vec<(u32, f32)>,
+    batch_lens: Vec<usize>,
 }
 
 impl<H: HostExperts> Hybrid<H> {
@@ -1215,6 +1251,8 @@ impl<H: HostExperts> Hybrid<H> {
             poisoned: false,
             stats: HybridStats::default(),
             pair_row0: None,
+            batch_lists: Vec::new(),
+            batch_lens: Vec::new(),
         })
     }
 
@@ -1233,6 +1271,12 @@ impl<H: HostExperts> Hybrid<H> {
     #[must_use]
     pub fn stats(&self) -> HybridStats {
         self.stats
+    }
+
+    /// The host experts, for a caller that prepares their scratch ahead of a
+    /// service.
+    pub fn host_mut(&mut self) -> &mut H {
+        &mut self.host
     }
 
     /// Row 0's host sum as the page holds it now: the last layer served
@@ -1310,6 +1354,118 @@ impl<H: HostExperts> Hybrid<H> {
             let (layer, row) = self.captured[c][i];
             self.serve(layer, row, i == 0, chain, watch.as_ref())?;
         }
+        Ok(())
+    }
+
+    /// Serve layer `layer` for an eager batch of `x.ne1` tokens in one union
+    /// call, outside the go/wait protocol: the caller has brought the
+    /// batch's handoffs to the host — `x`, one normed activation per column,
+    /// and `ids` and `weights`, the routing, `n_used` per column in slot
+    /// order — and reads the host sums back from `out`, `hidden` per column.
+    /// Column `j`'s list is its slots the slot map sends to the host or does
+    /// not know, in slot order: the list a step's service builds for that
+    /// token. A non-finite activation is undefined input the card's norm has
+    /// already raised as a fault, which the batch's readback turns into the
+    /// named error: every sum is NaN then and no host expert runs. Refused
+    /// on a poisoned tier; a failure, or a panic inside the host experts,
+    /// poisons it.
+    pub fn serve_batch(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        ids: &[u32],
+        weights: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Hybrid::serve_batch";
+        self.refuse_if_poisoned(WHAT)?;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.serve_batch_one(layer, x, ids, weights, out)
+        }));
+        match r {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.poisoned = true;
+                Err(e)
+            }
+            Err(p) => {
+                self.poisoned = true;
+                std::panic::resume_unwind(p)
+            }
+        }
+    }
+
+    fn serve_batch_one(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        ids: &[u32],
+        weights: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Hybrid::serve_batch";
+        let (hidden, n_used) = (self.boundary.shape.hidden, self.boundary.shape.n_used);
+        let cols = x.ne1;
+        if x.ne0 != hidden
+            || cols == 0
+            || ids.len() != cols * n_used
+            || weights.len() != cols * n_used
+            || out.len() != cols * hidden
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{cols} columns of {} values with {} ids, {} weights and {} sums; the \
+                     boundary carries {n_used} slots of {hidden} values a column",
+                    x.ne0,
+                    ids.len(),
+                    weights.len(),
+                    out.len()
+                ),
+            ));
+        }
+        let t0 = Instant::now();
+        // A fold, not `all`: no early exit, so the test vectorizes.
+        let finite = x.data.iter().fold(true, |ok, v| ok & v.is_finite());
+        if !finite {
+            out.fill(f32::NAN);
+            return Ok(());
+        }
+        let map_row = self.boundary.slots.row(layer).ok_or(GpuError::state(
+            WHAT,
+            "a hybrid layer without a slot map row",
+        ))?;
+        if self.batch_lens.len() < cols {
+            self.batch_lens.resize(cols, 0);
+            self.batch_lists
+                .resize(cols * EXPERTS_INTO_MAX, (0, 0.0f32));
+        }
+        let mut host_slots = 0u64;
+        for j in 0..cols {
+            let list = &mut self.batch_lists[j * EXPERTS_INTO_MAX..][..EXPERTS_INTO_MAX];
+            let mut n = 0usize;
+            for s in 0..n_used {
+                let (id, w) = (ids[j * n_used + s], weights[j * n_used + s]);
+                let slot = usize::try_from(id).ok().and_then(|id| map_row.get(id));
+                if slot.is_none_or(|&slot| slot == HOST) {
+                    list[n] = (id, w);
+                    n += 1;
+                }
+            }
+            self.batch_lens[j] = n;
+            host_slots += n as u64;
+        }
+        let lists: Vec<&[(u32, f32)]> = self.batch_lens[..cols]
+            .iter()
+            .enumerate()
+            .map(|(j, &n)| &self.batch_lists[j * EXPERTS_INTO_MAX..][..n])
+            .collect();
+        self.host.experts_union_into(layer, x, &lists, out)?;
+        let s = &mut self.stats;
+        s.batch_served += 1;
+        s.batch_cols += cols as u64;
+        s.batch_host_slots += host_slots;
+        s.batch_ns += u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         Ok(())
     }
 

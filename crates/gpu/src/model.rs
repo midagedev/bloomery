@@ -1248,8 +1248,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// Run `n` positions as one eager pass the body enqueues itself — `pass`
     /// gets the stage's parts, the output head and the first position — and
     /// stand `n` positions on. When `pass` reports that it enqueued the
-    /// head, return the head's token (a blocking read).
-    pub(crate) fn run_rows(
+    /// head, return the head's token (a blocking read). A fault the pass
+    /// returns, or the head's readback carries, poisons the model.
+    pub fn run_rows(
         &mut self,
         n: usize,
         what: &'static str,
@@ -1272,12 +1273,11 @@ impl<B: ChainBody> GpuModel<B> {
         let Some(Residency { weights, body }) = residency.as_mut() else {
             return Err(GpuError::state(what, "stage carries no residency"));
         };
-        let token = if pass(gpu, weights, body, head, pos)? {
-            Some(head.token(gpu))
-        } else {
-            None
-        }
-        .transpose();
+        let token = match pass(gpu, weights, body, head, pos) {
+            Ok(true) => head.token(gpu).map(Some),
+            Ok(false) => Ok(None),
+            Err(e) => Err(e),
+        };
         let token = self.note_fault(token)?;
         self.pos = pos + n;
         Ok(token)

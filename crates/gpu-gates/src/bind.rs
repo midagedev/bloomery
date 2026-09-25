@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use bloomery_gpu::GpuModel;
 use bloomery_gpu::model::ChainBody;
+use bloomery_gpu::{GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Device, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
@@ -373,12 +373,16 @@ impl Ds41Engine {
     /// Start the engine thread, open the model on it with `open` (which
     /// writes the load lines), and wait until it is loaded. `keep` is the
     /// body's rule for `keepable`: the longest prefix of at most `n` positions
-    /// the model's rollback keeps, from where it stands. `card` names the
-    /// device in a crash report; `props` is what `/props` reports about the
-    /// engine ([`model_props`], [`placement_props`]).
-    pub fn spawn<B, F, K>(
+    /// the model's rollback keeps, from where it stands. `prefill` is the
+    /// body's prompt feed: it feeds the ids from where the model stands and
+    /// returns the argmax after the last (a batched body's batch, or
+    /// `GpuModel::step`). `card` names the device in a crash report; `props`
+    /// is what `/props` reports about the engine ([`model_props`],
+    /// [`placement_props`]).
+    pub fn spawn<B, F, K, P>(
         open: F,
         keep: K,
+        prefill: P,
         vocab: Arc<Vocab>,
         card: String,
         props: EngineProps,
@@ -387,6 +391,7 @@ impl Ds41Engine {
         B: ChainBody + 'static,
         F: FnOnce() -> Result<Generator<B>, GateError> + Send + 'static,
         K: Fn(&GpuModel<B>, usize) -> usize + Send + 'static,
+        P: Fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError> + Send + 'static,
     {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
@@ -410,7 +415,7 @@ impl Ds41Engine {
                         Cmd::Keep(n) => u32::try_from(keep(g.model(), n))
                             .map(|k| (k, None))
                             .map_err(|_| format!("a kept prefix of at most {n} passes u32")),
-                        cmd => serve_cmd(&mut g, cmd, n_vocab),
+                        cmd => serve_cmd(&mut g, cmd, n_vocab, &prefill),
                     };
                     if replies
                         .send(Reply {
@@ -458,6 +463,10 @@ impl Ds41Engine {
     }
 }
 
+/// A body's prompt feed ([`Ds41Engine::spawn`]'s `prefill`): the ids from
+/// where the model stands, the argmax after the last.
+type PrefillFn<B> = dyn Fn(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>;
+
 /// One command on the engine thread. A logits read is checked here: a row of
 /// the wrong length or one holding a NaN is the step's error, not the
 /// sampler's to absorb.
@@ -465,13 +474,23 @@ fn serve_cmd<B: ChainBody>(
     g: &mut Generator<B>,
     cmd: Cmd,
     n_vocab: usize,
+    prefill: &PrefillFn<B>,
 ) -> Result<(u32, Option<Vec<f32>>), String> {
     let at = g.pos();
     match cmd {
-        Cmd::Prefill(ids) => g
-            .prefill(&ids)
-            .map(|a| (a, None))
-            .map_err(|e| format!("prefill of {} ids from position {at}: {e}", ids.len())),
+        Cmd::Prefill(ids) => {
+            let refuse =
+                |e: String| format!("prefill of {} ids from position {at}: {e}", ids.len());
+            if ids.is_empty() || at + ids.len() > g.ctx_max() {
+                return Err(refuse(format!(
+                    "the ids must be at least one and fit the context {}",
+                    g.ctx_max()
+                )));
+            }
+            prefill(g.model_mut(), &ids)
+                .map(|a| (a, None))
+                .map_err(|e| refuse(e.to_string()))
+        }
         Cmd::Next { last, logits } => {
             let arg = g
                 .step(last)

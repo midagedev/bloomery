@@ -246,7 +246,7 @@ impl Q8Act {
     /// tokens' slots, which reads column `s` for slot `s`, and of the
     /// quantizer that writes it. The multi-column gemvs refuse more than
     /// eight columns by their own check. Load-time only.
-    pub(crate) fn with_slots(stream: &CudaStream, cols: usize, k: usize) -> Result<Self, GpuError> {
+    pub fn with_slots(stream: &CudaStream, cols: usize, k: usize) -> Result<Self, GpuError> {
         if !(1..=Q8ACT_MAX_SLOTS).contains(&cols) {
             return Err(GpuError::shape(
                 "Q8Act::with_slots",

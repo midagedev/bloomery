@@ -89,6 +89,12 @@ use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, StepRows};
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
+mod prefill;
+pub use prefill::{
+    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureSink, PrefillMode, T_MAX, prefill,
+    prefill_observed, prefill_with, prepare_prefill,
+};
+
 /// The V4.1 engine: the shared skeleton over this body.
 pub type Deepseek41Model = GpuModel<Body>;
 
@@ -592,6 +598,11 @@ pub struct Body {
     eps: f32,
     /// A draft's feature tap, once [`attach_features`] built it.
     tap: Option<FeatureTap>,
+    /// The hyperparameters the body was loaded from, for the prompt batch's
+    /// buffers.
+    hp: Hparams,
+    /// The prompt batch's buffers ([`prefill`]), made by the first batch.
+    batch: Option<Box<prefill::Batch>>,
 }
 
 /// `pair[read]` to read and the other to write.
@@ -852,7 +863,27 @@ impl Body {
     /// 1, at most the file's. Load-time only; a step captured before it must
     /// be captured again ([`AttnChain::set_top_k`]).
     pub fn set_indexer_top_k(&mut self, gpu: &Gpu, top_k: usize) -> Result<(), GpuError> {
-        self.attn.set_top_k(gpu, top_k)
+        self.attn.set_top_k(gpu, top_k)?;
+        match self.batch.as_deref_mut() {
+            Some(b) => b.set_top_k(gpu, top_k),
+            None => Ok(()),
+        }
+    }
+
+    /// Layer `layer`'s ring shadow as the host holds it, once the engine
+    /// stream has finished every append enqueued before this call (a
+    /// synchronize): the row of position `p` at `p · width`. `None` for a
+    /// layer this card does not run.
+    pub fn shadow_rows(&self, gpu: &Gpu, layer: usize) -> Result<Option<&[u16]>, GpuError> {
+        gpu.stream().synchronize()?;
+        let Some(i) = layer
+            .checked_sub(self.layers.start)
+            .filter(|&i| i < self.layers.len())
+        else {
+            return Ok(None);
+        };
+        let n = self.shadows.rows * self.shadows.width;
+        Ok(self.shadows.host.get(i * n..(i + 1) * n))
     }
 
     /// [`attach_features`] on the body: refused once a step has run, and
@@ -1933,7 +1964,10 @@ impl ChainBody for Body {
             .iter()
             .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>())
             .sum();
-        caches + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>() + self.feature_bytes()
+        caches
+            + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
+            + self.feature_bytes()
+            + self.batch_bytes()
     }
 
     /// The replay's engram rows delivered ([`Body::arrive`]), then the host
@@ -2098,6 +2132,8 @@ impl ChainBody for Body {
             file,
             eps: hp.rms_eps,
             tap: None,
+            hp: hp.clone(),
+            batch: None,
         })
     }
 }

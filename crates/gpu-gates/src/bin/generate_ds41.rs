@@ -10,8 +10,11 @@
 //! twice takes its last value, so a recipe's default can be overridden by
 //! the arguments after it.
 //!
-//! Greedy only, one token per step: V4.1 has no batched prefill in the
-//! chain, so the prompt is fed one real step per token too. Prompt ids are
+//! Greedy only, one token per generated step. The fed ids go in batches of
+//! up to `body::T_MAX` positions (`body::prefill`, bit for bit the steps'
+//! state); `BLOOMERY_PREFILL=steps` feeds them one real step per id instead,
+//! the same binary's timing arm, and the `load` line prints which one ran
+//! (`prefill=`). Prompt ids are
 //! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
 //! `tools/ref/ik-greedy.sh` tokenized it into
 //! `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv` — the ids the step gate's
@@ -49,18 +52,26 @@
 //! ids (the prompt, then the depth ids) are timed as one wall, not step by
 //! step: the `time prompt n=<P> ms= tok/s= passes=<K> kind=` row runs from
 //! before the first fed step to after the readback of generated token 0.
-//! `passes` is the steps the feed took, one per id, so V4.1's prompt rate is
-//! its step rate by construction — at or above it, since the plain feed runs
-//! one body per id and reads back once at the end, where a generated step
-//! reads back every time. `kind` is `steps`, `dspark` (the DSpark feed: one
-//! readback per id, its feature reads and draft appends) or `checked` (the
-//! finite probe's eager steps run inside the wall). The row prints on every run,
+//! `passes` is the passes the feed took: the batches under `kind=batch`
+//! (with the DSpark draft, each batch's feature rows are read and appended
+//! to the draft inside the wall), one step per id under `kind=steps` — the
+//! step rate by construction, at or above it, since that feed runs one body
+//! per id and reads back once at the end — or `dspark` (the step feed with
+//! the draft: one readback per id, its feature reads and draft appends) or
+//! `checked` (the finite probe's eager steps run inside the wall; the probe
+//! always feeds step by step). The row prints on every run,
 //! after the loop, as a runtime value like the `load` line; it is a
 //! measurement only under the lease, as `time step` is. Nothing is printed
 //! between two timed steps. `--warm W` drops the first W generated steps from the
 //! statistics and still prints them, marked. The `SMOKE` footer carries the
 //! keys `generate`'s does (`p50_ms=`, `mean_ms=`, `warm=`), so the runners
 //! that read one read the other.
+//!
+//! A batched feed prints the batch's device bytes (`prefill batch_bytes=`)
+//! before the prompt and a `stat prefill` line after its `step 0` line: the
+//! host tier's batch services since load (`union_layers`, `union_cols`,
+//! `union_host_slots`) and the union calls' wall (`union_ms`), the part of
+//! the feed the card waits on the host; a runtime value, as `time prompt` is.
 //!
 //! The binary owns its main thread, so it pins it to the dispatcher's cpu
 //! slot (`threads::pool().pin_caller()`), as `bloomery-decode` and
@@ -148,6 +159,7 @@ mod drive {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use bloomery_gpu::GpuError;
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{LaunchStats, StepMode};
@@ -370,6 +382,7 @@ mod drive {
         let a = parse_args()?;
         let draft = draft_lever()?;
         let check_finite = finite_lever(&a, draft)?;
+        let prefill_mode = body::PrefillMode::from_env()?;
         let pin_main = !std::env::var("BLOOMERY_PIN_MAIN").is_ok_and(|v| v == "0");
         let pinned = pin_main && threads::pool().pin_caller();
         let (ids, prompt_len) = fed_ids(&a)?;
@@ -431,8 +444,8 @@ mod drive {
         }
         println!(
             "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
-             top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} in {:.1} s \
-             (runtime value)",
+             top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} \
+             prefill={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             shadow.bytes,
             shadow.unified_addressing,
@@ -446,6 +459,11 @@ mod drive {
                     Some(c) => format!("on launch_cpu={c}"),
                     None => "on launch_cpu=float".to_string(),
                 }),
+            if check_finite {
+                "steps"
+            } else {
+                prefill_mode.name()
+            },
             t.elapsed().as_secs_f64()
         );
         if let Some(h) = m.host_residency() {
@@ -491,6 +509,20 @@ mod drive {
             // Captured before the prompt, so the first timed step is a replay.
             println!("capture graph_nodes={}", m.capture_step()?);
         }
+        // The batch's buffers made before the prompt, so the timed feed
+        // allocates nothing.
+        let feed_mode = if check_finite {
+            body::PrefillMode::Steps
+        } else {
+            prefill_mode
+        };
+        if feed_mode == body::PrefillMode::Batch {
+            body::prepare_prefill(&mut m)?;
+            println!(
+                "prefill batch_bytes={}",
+                m.body("generate_ds41")?.batch_bytes()
+            );
+        }
         let mut check = if check_finite {
             let (gpu, w, _) = m.body_parts("generate_ds41")?;
             let head = Head::new(gpu, w, inputs.hp.rms_eps)?;
@@ -506,9 +538,9 @@ mod drive {
             None
         };
         match draft {
-            Draft::Off => decode(&mut m, &a, &ids, prompt_len, check.as_mut()),
-            Draft::Lookup => decode_draft(&mut m, &a, &ids, prompt_len, None),
-            Draft::Dspark => decode_draft(&mut m, &a, &ids, prompt_len, spark.as_mut()),
+            Draft::Off => decode(&mut m, &a, &ids, prompt_len, feed_mode, check.as_mut()),
+            Draft::Lookup => decode_draft(&mut m, &a, &ids, prompt_len, feed_mode, None),
+            Draft::Dspark => decode_draft(&mut m, &a, &ids, prompt_len, feed_mode, spark.as_mut()),
         }
     }
 
@@ -729,6 +761,21 @@ mod drive {
         }
     }
 
+    /// The host tier's batch services since load, one line: the layers
+    /// served, the columns and host slots they carried, and the union calls'
+    /// wall — the part of a batched feed the card waits on the host.
+    fn print_union(m: &Deepseek41Model) -> Result<(), GateError> {
+        let s = m.body("generate_ds41")?.hybrid().stats();
+        println!(
+            "stat prefill union_layers={} union_cols={} union_host_slots={} union_ms={:.1}",
+            s.batch_served,
+            s.batch_cols,
+            s.batch_host_slots,
+            s.batch_ns as f64 / 1e6
+        );
+        Ok(())
+    }
+
     /// The prompt feed's wall and shape, the `time prompt` row.
     struct FeedTime {
         /// The fed ids.
@@ -756,22 +803,30 @@ mod drive {
         }
     }
 
-    /// Feed `ids`, one real step per id — each through the finite probe
-    /// first under `check` — print the `fed` and `step 0` lines, and return
-    /// the first generated token and the feed's wall.
+    /// Feed `ids` — in batches under `mode` `Batch`, else one real step per
+    /// id, each through the finite probe first under `check` — print the
+    /// `fed` and `step 0` lines, and return the first generated token and the
+    /// feed's wall.
     fn feed(
         m: &mut Deepseek41Model,
         ids: &[u32],
         prompt_len: usize,
+        mode: body::PrefillMode,
         check: Option<&mut FiniteCheck>,
     ) -> Result<(u32, FeedTime), GateError> {
         let depth = ids.len();
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
         println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
-        let kind = if check.is_some() { "checked" } else { "steps" };
+        let batch = check.is_none() && mode == body::PrefillMode::Batch;
+        let kind = match (&check, batch) {
+            (Some(_), _) => "checked",
+            (None, true) => "batch",
+            (None, false) => "steps",
+        };
         let t = Instant::now();
         let next = match check {
+            None if batch => body::prefill(m, ids)?,
             None => m.step(ids)?,
             Some(c) => {
                 let mut next = 0;
@@ -787,9 +842,16 @@ mod drive {
             m.pos() - 1,
             wall.as_secs_f64()
         );
+        if batch {
+            print_union(m)?;
+        }
         let time = FeedTime {
             n: depth,
-            passes: depth,
+            passes: if batch {
+                depth.div_ceil(body::T_MAX)
+            } else {
+                depth
+            },
             wall,
             kind,
         };
@@ -803,10 +865,11 @@ mod drive {
         a: &Args,
         ids: &[u32],
         prompt_len: usize,
+        mode: body::PrefillMode,
         mut check: Option<&mut FiniteCheck>,
     ) -> Result<(), GateError> {
         let depth = ids.len();
-        let (mut next, feed_time) = feed(m, ids, prompt_len, check.as_deref_mut())?;
+        let (mut next, feed_time) = feed(m, ids, prompt_len, mode, check.as_deref_mut())?;
         let mut rows: Vec<(u32, u32, f64)> = Vec::with_capacity(a.n_gen - 1);
         let mut tokens: Vec<u32> = Vec::with_capacity(a.n_gen);
         tokens.push(next);
@@ -904,13 +967,14 @@ mod drive {
     /// `decode` under `BLOOMERY_DRAFT`: passes until `-n` tokens are out, each
     /// timed around the proposal, the pass and the draft's update — the
     /// lookup's push, or with `spark` the DSpark draft's features
-    /// (`dspark::pass`). The fed ids go one step each under `spark`, so the
-    /// draft gets every fed position's features.
+    /// (`dspark::pass`). Under `spark` the draft gets every fed position's
+    /// features, from the batches' feature rows or one step per id.
     fn decode_draft(
         m: &mut Deepseek41Model,
         a: &Args,
         ids: &[u32],
         prompt_len: usize,
+        mode: body::PrefillMode,
         mut spark: Option<&mut Dspark>,
     ) -> Result<(), GateError> {
         // The pair pass's second head and, in graph mode, its capture are
@@ -923,8 +987,8 @@ mod drive {
         }
         let depth = ids.len();
         let (first, feed_time) = match spark.as_deref_mut() {
-            None => feed(m, ids, prompt_len, None)?,
-            Some(d) => feed_dspark(m, d, ids, prompt_len)?,
+            None => feed(m, ids, prompt_len, mode, None)?,
+            Some(d) => feed_dspark(m, d, ids, prompt_len, mode)?,
         };
         let mut next = first;
         let mut look = Lookup::new();
@@ -1019,24 +1083,46 @@ mod drive {
         d: &mut Dspark,
         ids: &[u32],
         prompt_len: usize,
+        mode: body::PrefillMode,
     ) -> Result<(u32, FeedTime), GateError> {
         let depth = ids.len();
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids.iter().copied().skip(depth.saturating_sub(4)).collect();
         println!("fed ids={depth} first={head:?} last={tail:?} depth_sequence_from={prompt_len}");
+        let batch = mode == body::PrefillMode::Batch;
+        let width = m.body("generate_ds41")?.feature_width();
         let t = Instant::now();
-        let next = dspark::feed(m, d, ids)?;
+        let next = if batch {
+            // Each position's features into the draft as the step feed hands
+            // them over, one row at a time, whole groups through its graph.
+            d.reset()?;
+            let mut append = |_: u32, rows: &[f32]| -> Result<(), GpuError> {
+                rows.chunks_exact(width).try_for_each(|row| d.feed(row))
+            };
+            let next = body::prefill_with(m, ids, Some(&mut append))?;
+            d.flush()?;
+            next
+        } else {
+            dspark::feed(m, d, ids)?
+        };
         let wall = t.elapsed();
         println!(
             "step 0 {} {next} (the {depth} fed steps in {:.1} s, runtime value)",
             m.pos() - 1,
             wall.as_secs_f64()
         );
+        if batch {
+            print_union(m)?;
+        }
         let time = FeedTime {
             n: depth,
-            passes: depth,
+            passes: if batch {
+                depth.div_ceil(body::T_MAX)
+            } else {
+                depth
+            },
             wall,
-            kind: "dspark",
+            kind: if batch { "batch" } else { "dspark" },
         };
         Ok((next, time))
     }

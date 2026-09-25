@@ -325,6 +325,14 @@ impl RouterOut {
     }
 }
 
+/// A launch's per-expert rows and ticket count: [`RouterOut`]'s, lent apart
+/// from its routing.
+struct Rows<'a> {
+    logits: &'a mut DeviceBuffer<f32>,
+    probs: &'a mut DeviceBuffer<f32>,
+    done: &'a mut DeviceBuffer<u32>,
+}
+
 /// The loaded router module. Owns no context and no stream — every enqueue
 /// takes the engine stream, so launches order with the rest of the step and
 /// are capturable.
@@ -361,6 +369,65 @@ impl RouterKernels {
         out: &mut RouterOut,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
+        let RouterOut {
+            logits,
+            probs,
+            ids,
+            weights,
+            done,
+        } = out;
+        let rows = Rows {
+            logits,
+            probs,
+            done,
+        };
+        self.launch(stream, w, x, bias, scale, rows, ids, weights, fault)
+    }
+
+    /// [`RouterKernels::enqueue_router`] with the routing — the six ids and
+    /// weights — written to `ids` and `weights` instead of `out`'s: a prompt
+    /// batch keeps each token's routing in its own run of one buffer. The
+    /// per-expert rows and the ticket are `out`'s.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue_router's inputs and the two routing outputs (rust-quality R8)"
+    )]
+    pub fn enqueue_router_into(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        scale: f32,
+        out: &mut RouterOut,
+        ids: &mut DeviceBuffer<u32>,
+        weights: &mut DeviceBuffer<f32>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let rows = Rows {
+            logits: &mut out.logits,
+            probs: &mut out.probs,
+            done: &mut out.done,
+        };
+        self.launch(stream, w, x, bias, scale, rows, ids, weights, fault)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the launcher's inputs are the kernel's (rust-quality R8)"
+    )]
+    fn launch(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        scale: f32,
+        rows: Rows<'_>,
+        ids: &mut DeviceBuffer<u32>,
+        weights: &mut DeviceBuffer<f32>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
         let what = "enqueue_router";
         let shape = |detail: String| GpuError::Shape { what, detail };
         let k = w.cols();
@@ -375,6 +442,13 @@ impl RouterKernels {
                 "x.len() {} < k {k} or bias.len() {} < {N_EXPERT}",
                 x.len(),
                 bias.len()
+            )));
+        }
+        if ids.len() < N_USED || weights.len() < N_USED {
+            return Err(shape(format!(
+                "ids.len() {} and weights.len() {}: the routing takes {N_USED} each",
+                ids.len(),
+                weights.len()
             )));
         }
         let k = launch_u32(what, "k", k)?;
@@ -392,11 +466,11 @@ impl RouterKernels {
             n_expert,
             k,
             scale,
-            &mut out.logits,
-            &mut out.probs,
-            &mut out.ids,
-            &mut out.weights,
-            &mut out.done,
+            rows.logits,
+            rows.probs,
+            ids,
+            weights,
+            rows.done,
             fault,
         )?;
         Ok(())

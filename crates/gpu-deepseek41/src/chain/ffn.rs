@@ -73,7 +73,7 @@ use gguf::{GgmlType, Split};
 use model::Tensor2;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
-use model::moe::{HostLayer, HostScratch};
+use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
 
 use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
@@ -82,6 +82,10 @@ use crate::hc::{
     hc_fold_elem, hc_post_elem,
 };
 use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
+use crate::transpose::TransposeKernels;
+
+mod batch;
+pub use batch::{ChunkIo, FfnBatch, JoinIo};
 
 /// What the enqueue path's errors name.
 const ENQUEUE: &str = "FfnPiece::enqueue";
@@ -104,9 +108,9 @@ const POST_THREADS: u32 = 256;
 const _: () = assert!(N_USED == 6);
 
 /// The combine of one output value: the card's slots in slot order by
-/// fused multiply-adds from zero, `acc = fma(down_j, w_j, acc)` for each slot
-/// `j` whose place is on the card, then `(acc + hsum) + shexp`. The one rule
-/// the device and a gate's host side both run.
+/// fused multiply-adds from zero ([`card_sum_elem`]), then `(acc + hsum) +
+/// shexp` ([`join_elem`]). The one rule the device and a gate's host side
+/// both run; a prompt batch runs its two halves in two launches.
 #[inline(always)]
 pub fn combine_elem(
     down: [f32; N_USED],
@@ -115,6 +119,13 @@ pub fn combine_elem(
     hsum: f32,
     shexp: f32,
 ) -> f32 {
+    join_elem(card_sum_elem(down, w, card), hsum, shexp)
+}
+
+/// The combine's card half: `acc = fma(down_j, w_j, acc)` from zero for each
+/// slot `j` whose place is on the card, in slot order.
+#[inline(always)]
+pub fn card_sum_elem(down: [f32; N_USED], w: [f32; N_USED], card: [bool; N_USED]) -> f32 {
     let mut acc = 0.0f32;
     let mut j = 0usize;
     while j < N_USED {
@@ -123,6 +134,13 @@ pub fn combine_elem(
         }
         j += 1;
     }
+    acc
+}
+
+/// The combine's join: the card sum, then the host's, then the shared
+/// expert's, `(acc + hsum) + shexp`.
+#[inline(always)]
+pub fn join_elem(acc: f32, hsum: f32, shexp: f32) -> f32 {
     (acc + hsum) + shexp
 }
 
@@ -685,6 +703,9 @@ pub struct FfnPiece {
     experts: ExpertKernels,
     dense: DenseKernels,
     hc: HcKernels,
+    /// The row-major-to-token-major copy of a prompt batch's shared down
+    /// projection ([`FfnBatch`]).
+    transpose: TransposeKernels,
     module: ffn_kernels::LoadedModule,
     layers: Range<usize>,
     cfg: Vec<LayerCfg>,
@@ -782,6 +803,7 @@ impl FfnPiece {
             experts: ExpertKernels::load(ctx)?,
             dense: DenseKernels::load(ctx)?,
             hc: HcKernels::load(ctx)?,
+            transpose: TransposeKernels::load(ctx)?,
             module,
             layers,
             cfg,
@@ -1379,7 +1401,8 @@ fn q8act_bytes(a: &Q8Act) -> usize {
 
 /// The V4.1 host tier's computation ([`HostExperts`]): each layer's routed
 /// stacks as [`HostLayer`] reads them from the file, and the scratch every
-/// call writes, made at load.
+/// call writes, made at load — the union's for a prompt batch at its first
+/// call.
 pub struct Ds41Host {
     file: Arc<Split>,
     /// Per layer of `layers`, its host view; `None` for a layer that does
@@ -1387,6 +1410,11 @@ pub struct Ds41Host {
     layers: Vec<Option<HostLayer>>,
     first: usize,
     scratch: HostScratch,
+    /// The union's blocks for [`UNION_MAX_COLS`] columns, made by the first
+    /// batch service: a decode that never prefills a batch never holds them.
+    union: Option<UnionScratch>,
+    embd: usize,
+    ff: usize,
 }
 
 impl Ds41Host {
@@ -1409,7 +1437,40 @@ impl Ds41Host {
             layers: views,
             first,
             scratch: HostScratch::new(hp.n_embd, hp.experts.ff),
+            union: None,
+            embd: hp.n_embd,
+            ff: hp.experts.ff,
         })
+    }
+}
+
+/// Layer `layer`'s view in `layers`, the tier's views from layer `first` on;
+/// refused for a layer outside them or one that does not route.
+fn host_view<'a>(
+    layers: &'a [Option<HostLayer>],
+    first: usize,
+    layer: usize,
+    what: &'static str,
+) -> Result<&'a HostLayer, GpuError> {
+    layer
+        .checked_sub(first)
+        .and_then(|i| layers.get(i))
+        .and_then(Option::as_ref)
+        .ok_or(GpuError::State {
+            what,
+            missing: "the layer's routed stacks: it is outside the tier or does not route",
+        })
+}
+
+impl Ds41Host {
+    /// The union's scratch for [`UNION_MAX_COLS`] columns, made now if no
+    /// batch service has made it: a prompt timed after this allocates
+    /// nothing.
+    pub fn prepare_union(&mut self) -> Result<(), GpuError> {
+        if self.union.is_none() {
+            self.union = Some(UnionScratch::new(self.embd, self.ff, UNION_MAX_COLS)?);
+        }
+        Ok(())
     }
 }
 
@@ -1421,15 +1482,33 @@ impl HostExperts for Ds41Host {
         experts: &[(u32, f32)],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        let view = layer
-            .checked_sub(self.first)
-            .and_then(|i| self.layers.get(i))
-            .and_then(Option::as_ref)
-            .ok_or(GpuError::State {
-                what: "Ds41Host::experts_into",
-                missing: "the layer's routed stacks: it is outside the tier or does not route",
-            })?;
+        let view = host_view(&self.layers, self.first, layer, "Ds41Host::experts_into")?;
         view.experts_into(&self.file, x, experts, out, &mut self.scratch)?;
+        Ok(())
+    }
+
+    fn experts_union_into(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let Ds41Host {
+            file,
+            layers,
+            first,
+            union,
+            embd,
+            ff,
+            ..
+        } = self;
+        let view = host_view(layers, *first, layer, "Ds41Host::experts_union_into")?;
+        let scratch = match union {
+            Some(s) => s,
+            None => union.insert(UnionScratch::new(*embd, *ff, UNION_MAX_COLS)?),
+        };
+        view.experts_union_into(file, x, lists, out, scratch)?;
         Ok(())
     }
 }
