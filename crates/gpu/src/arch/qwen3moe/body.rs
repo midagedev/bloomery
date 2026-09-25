@@ -77,14 +77,16 @@ pub struct DecodeInput {
 
 /// Everything qwen3moe's chain owns on the device.
 pub struct Body {
+    /// The prompt prefill's arena, image, slot and captured passes. Declared
+    /// first: fields drop in declaration order, and its graphs address the
+    /// cache planes below.
+    pub(super) prefill: Prefill,
     pub(super) hp: Hparams,
     pub(super) names: Vec<LayerNames>,
     pub(super) kv: Vec<KvPlanes>,
     /// The decode step's one-row arena and its parameter image.
     pub(super) s: Arena,
     pub(super) sp: StepParams,
-    /// The prompt prefill's arena, made at the first prefill.
-    pub(super) prefill: Option<Prefill>,
     pub(super) k: Kernels,
     /// The fused head argmax's key and ticket, back at their seeds after
     /// every launch.
@@ -346,9 +348,9 @@ impl ChainBody for Body {
         };
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
         Ok(Body {
+            prefill: Prefill::new(stream, dims, ctx_max)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream)?,
-            prefill: None,
             hp,
             names,
             kv,
@@ -437,7 +439,7 @@ impl ChainBody for Body {
             + self.s.bytes()
             + self.sp.buf.num_bytes()
             + self.head_state.bytes()
-            + self.prefill.as_ref().map_or(0, Prefill::bytes)
+            + self.prefill.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
     }
 }

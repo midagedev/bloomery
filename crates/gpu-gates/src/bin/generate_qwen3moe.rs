@@ -11,15 +11,19 @@
 //! chat template) and prints the generated text after the ids.
 //!
 //! The prompt is prefilled (`Qwen3moeModel::prefill`: up to eight positions
-//! per pass, the same cache rows and answer as one step per token); the
-//! argmax after its last token is generated token 0, and `N − 1` feedback
-//! steps follow. Lines: `prompt_ids`, `load` (with the flash pass:
-//! `flash_mma=`), `capture graph_nodes=` in graph mode, `step 0 pos tok`
+//! per pass, the same cache rows and answer as one step per token; in graph
+//! mode each pass a replay of the pass of its size); the argmax after its
+//! last token is generated token 0, and `N − 1` feedback steps follow.
+//! Lines: `prompt_ids`, `load` (with the flash pass: `flash_mma=`), in graph
+//! mode `capture graph_nodes=` and `capture prefill_graphs=<n> nodes=<m=1>,…
+//! ms= vram_bytes=` (every pass size captured before the prompt: its wall
+//! and the card's free bytes it took, runtime values), `step 0 pos tok`
 //! (with the passes the prompt took: `prefill_steps=`), then, all written
 //! after the loop, `time prompt n=<P> ms= tok/s= passes=<K> kind=prefill`
 //! (the wall of `prefill` through its token's readback, on every run: a
 //! runtime value like the `load` line, a measurement only under the lease;
-//! the first `prefill` call allocates the prefill arena inside that wall),
+//! the prefill arena is allocated at load and the passes captured before
+//! it, so that wall carries neither),
 //! per feedback step `step i pos tok` (and `time step i ms=` under
 //! `--time`); then
 //! `tokens [..]`, `text` for a `--prompt` run, and under `--time` the
@@ -134,6 +138,19 @@ mod cli {
         );
         if mode == StepMode::Graph {
             println!("capture graph_nodes={}", m.capture_step()?);
+            let gpu = m.stages()[0].gpu();
+            let (free0, _) = gpu.mem_info()?;
+            let t = Instant::now();
+            let nodes = m.capture_prefill()?;
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            let (free1, _) = m.stages()[0].gpu().mem_info()?;
+            let list: Vec<String> = nodes.iter().map(usize::to_string).collect();
+            println!(
+                "capture prefill_graphs={} nodes={} ms={ms:.1} vram_bytes={} (runtime values)",
+                nodes.len(),
+                list.join(","),
+                free0.saturating_sub(free1)
+            );
         }
         if let Some(d) = seed_depth.filter(|&d| d > 1) {
             m.seed_depth(d - 1)?;

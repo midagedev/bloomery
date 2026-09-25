@@ -10,7 +10,9 @@
 //! What is asserted:
 //! - (s) structure: the captured step holds [`NODES_CHAIN`] nodes, none of
 //!   them a memcpy (the combine writes the next layer's input in place) or
-//!   a host node.
+//!   a host node; the captured prefill pass holds [`NODES_PASS_1`] nodes at
+//!   one token and [`NODES_PASS_M`] at every count from two to `MAX_TOKENS`,
+//!   all of them kernels.
 //! - (f) teacher-forced, per layer: each layer run alone on ik's own input
 //!   row (`inp_embd` for layer 0, `l_out-(L−1)` after) at each of the
 //!   oracle's five positions. The attention half against ik's `attn_out-L`
@@ -38,7 +40,13 @@
 //!   give the same tokens and bit-identical last logits; so do the prompts'
 //!   concatenation (several passes) against its own one-token run, whole
 //!   and in two calls split at [`SPLIT`], the second starting at a position
-//!   that is not a pass boundary.
+//!   that is not a pass boundary. These run through the captured passes.
+//! - (q) a replayed prefill pass equals the eager one: for every pass size
+//!   `m`, the concatenation's first `MAX_TOKENS + m` ids (a full pass, then
+//!   one of `m`) prefilled in graph mode and in eager mode, each from a
+//!   reset over cache rows seeded with a pattern (`seed_depth`), leave the
+//!   same K/V rows bit for bit, none of them still the pattern, and the same
+//!   last logits bit for bit.
 //!
 //! The flash pass is read once per process (`BLOOMERY_GQA_MMA`), so each
 //! pass is its own run; the `load` line names it.
@@ -70,6 +78,7 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::Qwen3moeModel;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
+    use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -117,6 +126,24 @@ mod gate {
     /// Memcpy nodes in the captured step: the residual crosses no layer
     /// boundary as a copy.
     const MEMCPY_CHAIN: usize = 0;
+
+    /// PIN(2026-09-25): the captured prefill pass's node count at one token,
+    /// derived from the pass's launches before the graphs were built: the
+    /// decode step's chain without its head, 1 + 24·10 + 24·11.
+    const NODES_PASS_1: usize = 505;
+
+    /// PIN(2026-09-25): the captured prefill pass's node count at every `m`
+    /// from two to `MAX_TOKENS`, derived the same way: the embedding rows,
+    /// then per layer the attention half's 7 (norm+quant, q·k·v,
+    /// QK-norm+rope+append, flash segment pass, flash merge, the attention
+    /// rows' q8_1, attn_output with the residual) plus 2 on each of the 24
+    /// layers whose value projection is Q6_K (its gemv, the token-major
+    /// copy), and the FFN half's 6 (norm+quant, the m-token router,
+    /// gate·up·SwiGLU, one q8_1 over every token's slots, one down `_sel`
+    /// over every token's slots, the combine): 1 + 24·13 + 24·15. Every
+    /// launch covers all of the pass's tokens, so the count does not grow
+    /// with m. The head after the last pass runs eager.
+    const NODES_PASS_M: usize = 673;
 
     /// PIN(2026-09-24): the teacher-forced bound on each half's error ratio
     /// — its relative error over the relative distance between the two
@@ -218,12 +245,38 @@ mod gate {
                 sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_HOST,
             ],
         );
-        let pass = nodes == NODES_CHAIN && memcpy == MEMCPY_CHAIN && host == 0;
+        let mut pass = nodes == NODES_CHAIN && memcpy == MEMCPY_CHAIN && host == 0;
         println!(
             "structure graph_nodes={nodes} (want {NODES_CHAIN}) kernel={kernel} memcpy={memcpy} \
              (want {MEMCPY_CHAIN}) memset={memset} host={host} (want 0) other={other} {}",
             verdict(pass)
         );
+        let t = Instant::now();
+        let counts = m.capture_prefill()?;
+        println!(
+            "structure prefill: {} passes captured in {:.1} ms (runtime value)",
+            counts.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        for (i, &nodes) in counts.iter().enumerate() {
+            let rows = i + 1;
+            let want = if rows == 1 {
+                NODES_PASS_1
+            } else {
+                NODES_PASS_M
+            };
+            let ([kernel], other) = count_kinds(
+                &m.prefill_graph_nodes(rows)?,
+                [sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL],
+            );
+            let ok = nodes == want && kernel == nodes;
+            println!(
+                "structure prefill m={rows} graph_nodes={nodes} (want {want}) kernel={kernel} \
+                 other={other} (want 0) {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
         Ok(pass)
     }
 
@@ -584,7 +637,8 @@ mod gate {
             verdict(greedy_ok)
         );
         let prefill_ok = prefilled(m, &prompts, &graph, &graph_logits, dump_dir)?;
-        Ok(replay_ok && greedy_ok && prefill_ok)
+        let passes_ok = prefill_replay(m, &prompts)?;
+        Ok(replay_ok && greedy_ok && prefill_ok && passes_ok)
     }
 
     // ------------------------------------------------------------ (p) prefill
@@ -675,6 +729,104 @@ mod gate {
             verdict(split_ok)
         );
         Ok(ok && whole_ok && split_ok)
+    }
+
+    // ------------------------------------------- (q) prefill replay = eager
+
+    /// What one prefill leaves: every layer's K/V rows over its positions,
+    /// the last logits and the token.
+    struct PrefillRun {
+        kv: Vec<Vec<u16>>,
+        logits: Vec<f32>,
+        token: u32,
+    }
+
+    /// One prefill of `ids` in `mode`, from a reset over cache rows seeded
+    /// with the pattern.
+    fn prefill_run(
+        m: &mut Qwen3moeModel,
+        ids: &[u32],
+        mode: StepMode,
+    ) -> Result<PrefillRun, GateError> {
+        m.set_mode(mode);
+        m.seed_depth(ids.len())?;
+        m.reset()?;
+        let token = m.prefill(ids)?;
+        Ok(PrefillRun {
+            kv: m.kv_rows(ids.len())?,
+            logits: m.logits()?,
+            token,
+        })
+    }
+
+    /// Rows of `a` (per layer, [`HEAD`]-value rows) that differ from `b`'s.
+    fn rows_differing(a: &[Vec<u16>], b: &[Vec<u16>]) -> usize {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                x.chunks(HEAD)
+                    .zip(y.chunks(HEAD))
+                    .filter(|(r, s)| r != s)
+                    .count()
+            })
+            .sum()
+    }
+
+    fn prefill_replay(m: &mut Qwen3moeModel, prompts: &[PromptRow]) -> Result<bool, GateError> {
+        let long: Vec<u32> = prompts
+            .iter()
+            .flat_map(|p| p.tokens.iter().copied())
+            .collect();
+        if long.len() < 2 * MAX_TOKENS {
+            return Err(format!(
+                "the prompts' concatenation has {} ids; the replay clause takes {}",
+                long.len(),
+                2 * MAX_TOKENS
+            )
+            .into());
+        }
+        let mut ok = true;
+        for rows in 1..=MAX_TOKENS {
+            let ids = &long[..MAX_TOKENS + rows];
+            m.seed_depth(ids.len())?;
+            let seeded = m.kv_rows(ids.len())?;
+            let g = prefill_run(m, ids, StepMode::Graph)?;
+            let e = prefill_run(m, ids, StepMode::Eager)?;
+            let kv_diff = rows_differing(&g.kv, &e.kv);
+            let stale =
+                g.kv.iter()
+                    .zip(&seeded)
+                    .map(|(x, y)| {
+                        x.chunks(HEAD)
+                            .zip(y.chunks(HEAD))
+                            .filter(|(r, s)| r == s)
+                            .count()
+                    })
+                    .sum::<usize>();
+            let logits_same = g.logits.len() == e.logits.len()
+                && g.logits
+                    .iter()
+                    .zip(&e.logits)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+            let pass = kv_diff == 0 && stale == 0 && logits_same && g.token == e.token;
+            println!(
+                "prefill replay m={rows}: {} ids in passes of {MAX_TOKENS} + {rows}: K/V rows \
+                 differing graph vs eager {kv_diff} (want 0), still the seeded pattern {stale} \
+                 (want 0), last logits bit-equal {logits_same}, token graph={} eager={} {}",
+                ids.len(),
+                g.token,
+                e.token,
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        m.set_mode(StepMode::Graph);
+        println!(
+            "prefill replay: every pass size's replay = its eager twin (K/V rows and last logits bit \
+             for bit) {}",
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     // ------------------------------------------------------------- ppl

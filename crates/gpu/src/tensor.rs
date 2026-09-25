@@ -193,6 +193,10 @@ impl<T: DeviceCopy> DeviceTensor<T> {
 /// residual streams, 4 × 5120 values.
 pub(crate) const Q8ACT_MAX_K: usize = 20_480;
 
+/// The most columns a per-slot [`Q8Act`] takes ([`Q8Act::with_slots`]):
+/// eight tokens of eight routed slots, the down input of a prefill pass.
+pub(crate) const Q8ACT_MAX_SLOTS: usize = 64;
+
 /// q8_1 activation scratch for up to `m` columns of `k` values each. One
 /// set per distinct input site: sites that read the same activation
 /// (gate·up, q·kv_a) share one (decision 2, as the CPU engine does).
@@ -234,9 +238,34 @@ impl Q8Act {
                 format!("1 <= m <= 8, got {m}"),
             ));
         }
+        Q8Act::alloc("Q8Act::with_k", stream, m, k)
+    }
+
+    /// Allocate scratch for `cols` (1..=[`Q8ACT_MAX_SLOTS`]) columns of `k`
+    /// values, one per expert slot: the input of a `_sel` down over several
+    /// tokens' slots, which reads column `s` for slot `s`, and of the
+    /// quantizer that writes it. The multi-column gemvs refuse more than
+    /// eight columns by their own check. Load-time only.
+    pub(crate) fn with_slots(stream: &CudaStream, cols: usize, k: usize) -> Result<Self, GpuError> {
+        if !(1..=Q8ACT_MAX_SLOTS).contains(&cols) {
+            return Err(GpuError::shape(
+                "Q8Act::with_slots",
+                format!("1 <= cols <= {Q8ACT_MAX_SLOTS}, got {cols}"),
+            ));
+        }
+        Q8Act::alloc("Q8Act::with_slots", stream, cols, k)
+    }
+
+    /// The planes for `m` columns of `k` values, `k` checked here.
+    fn alloc(
+        what: &'static str,
+        stream: &CudaStream,
+        m: usize,
+        k: usize,
+    ) -> Result<Self, GpuError> {
         if !k.is_multiple_of(256) || !(256..=Q8ACT_MAX_K).contains(&k) {
             return Err(GpuError::shape(
-                "Q8Act::with_k",
+                what,
                 format!("k must be a multiple of 256 in 256..={Q8ACT_MAX_K}, got {k}"),
             ));
         }

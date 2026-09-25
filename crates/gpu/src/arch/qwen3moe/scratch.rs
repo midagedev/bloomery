@@ -1,9 +1,8 @@
 //! The qwen3moe chain's resident arenas: every intermediate of one layer for
 //! the decode step's one row or the prefill's several, shared by all layers
 //! (they run in turn), the per-step parameter image the captured graph
-//! reads, and the per-layer K/V planes. The step's arena is allocated once at
-//! load, the prefill's at the first prefill; nothing here is allocated per
-//! step.
+//! reads, and the per-layer K/V planes. Both arenas are allocated once at
+//! load; nothing here is allocated per step or per prompt.
 
 use super::experts::GroupTickets;
 use super::router::{N_USED, RouterOut};
@@ -88,20 +87,19 @@ pub(super) struct Arena {
     /// than one row the router reads their f32 twin `normed`; at one row the
     /// router's launch writes these and keeps the normed row to itself.
     pub(super) act_ffn: Vec<Q8Act>,
+    /// The router's ids, token-major `N_USED` per token, are the down's
+    /// selector: slot `t · N_USED + j` of a pass is token `t`'s slot `j`.
     pub(super) route: RouterOut,
-    /// Token `t`'s eight ids, `route.ids[t · N_USED ..]`: its down's selector.
-    pub(super) ids: Vec<ManuallyDrop<DeviceBuffer<u32>>>,
     /// The selected experts' SwiGLU rows, per token slot-major `N_USED · ff`.
     pub(super) h: DeviceBuffer<f32>,
-    /// q8_1 of one token's `h`, one column per slot.
-    pub(super) act_h: Q8Act,
+    /// q8_1 of `h`, one column per slot: `act_h[m − 1]` holds the `m ·
+    /// N_USED` columns of `m` tokens, the down's input.
+    pub(super) act_h: Vec<Q8Act>,
     /// The one-token gate·up's ticket counts, one per 128-value group of a
     /// token's `h`.
     pub(super) gate_up_tickets: GroupTickets,
     /// The down outputs, per token slot-major `N_USED · hidden`.
     pub(super) down: DeviceBuffer<f32>,
-    /// Token `t`'s down rows.
-    pub(super) down_rows: Vec<ManuallyDrop<DeviceBuffer<f32>>>,
 }
 
 /// The decode step's parameters in one allocation, laid out by the `SP_*`
@@ -215,23 +213,15 @@ impl Arena {
         let x = f(rows * d.hidden)?;
         let qkv = f(rows * (q_len + 2 * kv_len))?;
         let route = RouterOut::with_tokens(stream, rows)?;
-        let down = f(rows * N_USED * d.hidden)?;
         // SAFETY: every window below lies inside its parent — row `t < rows`
-        // of `x` (`hidden` values) and of `down` (`N_USED · hidden`), token
-        // `t`'s `N_USED` ids of `route.ids` (`rows · N_USED`), and the three
-        // blocks that tile `qkv` (`rows · (q_len + 2·kv_len)`) — and each
-        // parent moves into the arena beside its windows (a move of the
-        // handle, not of the allocation), where it outlives them.
-        let (x_rows, down_rows, ids, q, k, v) = unsafe {
+        // of `x` (`hidden` values), and the three blocks that tile `qkv`
+        // (`rows · (q_len + 2·kv_len)`) — and each parent moves into the
+        // arena beside its windows (a move of the handle, not of the
+        // allocation), where it outlives them.
+        let (x_rows, q, k, v) = unsafe {
             (
                 (0..rows)
                     .map(|t| f32_view(&x, t * d.hidden, d.hidden))
-                    .collect(),
-                (0..rows)
-                    .map(|t| f32_view(&down, t * N_USED * d.hidden, N_USED * d.hidden))
-                    .collect(),
-                (0..rows)
-                    .map(|t| param_view::<u32>(&route.ids, t * N_USED, N_USED))
                     .collect(),
                 f32_view(&qkv, 0, rows * q_len),
                 f32_view(&qkv, rows * q_len, rows * kv_len),
@@ -255,12 +245,12 @@ impl Arena {
             ffn_inp: f(rows * d.hidden)?,
             act_ffn: acts(d.hidden)?,
             route,
-            ids,
             h: f(rows * N_USED * d.ff)?,
-            act_h: Q8Act::with_k(stream, N_USED, d.ff)?,
+            act_h: (1..=rows)
+                .map(|m| Q8Act::with_slots(stream, m * N_USED, d.ff))
+                .collect::<Result<Vec<_>, _>>()?,
             gate_up_tickets: GroupTickets::new(stream, (N_USED * d.ff).div_ceil(128))?,
-            down,
-            down_rows,
+            down: f(rows * N_USED * d.hidden)?,
             dims: d,
             rows,
         })
@@ -291,7 +281,7 @@ impl Arena {
             .iter()
             .chain(&self.act_attn)
             .chain(&self.act_ffn)
-            .chain([&self.act_h]);
+            .chain(&self.act_h);
         bufs.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.v_cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.route.bytes()

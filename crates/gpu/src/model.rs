@@ -651,6 +651,12 @@ impl<B: ChainBody> GpuModel<B> {
         self.pos
     }
 
+    /// How the chain submits ([`GpuModel::set_mode`]).
+    #[must_use]
+    pub fn mode(&self) -> StepMode {
+        self.mode
+    }
+
     /// Choose how the chain submits. Changing the mode drops any captured
     /// chain: the graph is a recording of this body over these buffers, and
     /// a later `Graph` run recaptures rather than replay a stale one.

@@ -1,10 +1,12 @@
 //! The instruments a gate drives on the qwen3moe chain: one layer run on its
-//! own from a given input (the teacher-forced arm), and the per-layer copies
-//! of the output residual the whole chain leaves when asked.
+//! own from a given input (the teacher-forced arm), the per-layer copies of
+//! the output residual the whole chain leaves when asked, and the cache rows
+//! a run wrote.
 
 use super::body::Body;
 use super::dispatch;
 use crate::GpuError;
+use crate::flash_gqa::HEAD;
 use crate::model::{GpuModel, StepMode};
 
 /// What one layer's run leaves, read back.
@@ -83,6 +85,35 @@ impl GpuModel<Body> {
         self.set_mode(StepMode::Eager);
         let (gpu, _, body) = self.body_parts("qwen3moe::set_layer_taps")?;
         body.set_taps(gpu.stream(), on)
+    }
+
+    /// Rows `0..rows` of every layer's K and V planes as f16 bits: per
+    /// layer, K then V, each head's `rows` rows of [`HEAD`] values in turn.
+    /// Synchronizes; gate use.
+    pub fn kv_rows(&mut self, rows: usize) -> Result<Vec<Vec<u16>>, GpuError> {
+        let what = "qwen3moe::kv_rows";
+        let (gpu, _, body) = self.body_parts(what)?;
+        let d = body.s.dims;
+        if rows > d.ctx {
+            return Err(GpuError::shape(
+                what,
+                format!("{rows} rows of a {}-row cache", d.ctx),
+            ));
+        }
+        let stream = gpu.stream();
+        body.kv
+            .iter()
+            .map(|p| {
+                let mut out = Vec::with_capacity(2 * d.n_kv * rows * HEAD);
+                for plane in [&p.k, &p.v] {
+                    let all = plane.to_host_vec(stream)?;
+                    for h in 0..d.n_kv {
+                        out.extend_from_slice(&all[h * d.ctx * HEAD..][..rows * HEAD]);
+                    }
+                }
+                Ok(out)
+            })
+            .collect()
     }
 
     /// Every layer's output residual from the last step, layer by layer.

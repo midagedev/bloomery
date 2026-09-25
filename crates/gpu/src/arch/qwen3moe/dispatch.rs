@@ -113,54 +113,84 @@ pub(super) fn enqueue_layer(
     layer(&c, &mut kv[slot], s, &sp.io(), 1, embed, out)
 }
 
-/// Enqueue prefill pass `chunk` of `m` tokens (the prompt's tokens `chunk ·
-/// MAX_TOKENS ..`) over the prefill arena: every layer at `m` rows, the
-/// combine leaving each layer's output in `x`, and with `head`, the last
-/// token's row copied into the head's input and the head after it.
-pub(super) fn enqueue_prefill_pass(
+/// What every launch of a prefill pass reads besides its arena, its inputs
+/// and the cache: the engine, the weights, every layer's names, the kernels,
+/// the flash pass and the norm epsilon.
+pub(super) struct PassCtx<'a> {
+    pub(super) gpu: &'a Gpu,
+    pub(super) w: &'a Weights,
+    pub(super) names: &'a [LayerNames],
+    pub(super) k: &'a Kernels,
+    pub(super) mma: bool,
+    pub(super) eps: f32,
+}
+
+/// Enqueue one prefill pass of `m` tokens over arena `s`, reading the
+/// tokens, positions, live key counts and rope rows in `io`: every layer at
+/// `m` rows, the combine leaving each layer's output in `x`. The same
+/// enqueues run eager and under a capture.
+pub(super) fn enqueue_pass(
+    c: &PassCtx<'_>,
+    kv: &mut [KvPlanes],
+    s: &mut Arena,
+    io: &Io<'_>,
+    m: usize,
+) -> Result<(), GpuError> {
+    for (slot, (n, kv)) in c.names.iter().zip(kv.iter_mut()).enumerate() {
+        let lc = Ctx {
+            gpu: c.gpu,
+            w: c.w,
+            n,
+            k: c.k,
+            mma: c.mma,
+            eps: c.eps,
+        };
+        layer(&lc, kv, s, io, m, slot == 0, None)?;
+    }
+    Ok(())
+}
+
+/// Enqueue the head after the last prefill pass of `m` tokens: that pass's
+/// last row of `x` into the head's input, then the one-row head.
+pub(super) fn enqueue_pass_head(
     gpu: &Gpu,
     w: &Weights,
-    b: &mut Body,
-    chunk: usize,
+    k: &Kernels,
+    state: &mut HeadArgmaxState,
+    s: &Arena,
     m: usize,
-    head: Option<&mut Head>,
+    head: &mut Head,
 ) -> Result<(), GpuError> {
-    let Body {
-        hp,
-        names,
-        kv,
-        k,
-        head_state,
-        mma,
-        prefill,
-        ..
-    } = b;
-    let pf = prefill.as_mut().ok_or(GpuError::state(
-        "qwen3moe::enqueue_prefill_pass",
-        "no prefill arena",
-    ))?;
-    let win = pf.windows(chunk, m)?;
-    let io = win.io();
-    let s = &mut pf.a;
-    for (slot, (n, kv)) in names.iter().zip(kv.iter_mut()).enumerate() {
-        let c = Ctx {
-            gpu,
-            w,
-            n,
-            k,
-            mma: *mma,
-            eps: hp.rms_eps,
-        };
-        layer(&c, kv, s, &io, m, slot == 0, None)?;
-    }
-    match head {
-        Some(head) => {
-            head.input_mut()
-                .copy_from_device_async(&s.x_rows[m - 1], gpu.stream())?;
-            enqueue_head(gpu, w, k, head_state, head)
-        }
-        None => Ok(()),
-    }
+    let row = m
+        .checked_sub(1)
+        .and_then(|i| s.x_rows.get(i))
+        .ok_or_else(|| {
+            GpuError::shape(
+                "qwen3moe::enqueue_pass_head",
+                format!("a pass of {m} rows on a {}-row arena", s.rows),
+            )
+        })?;
+    head.input_mut().copy_from_device_async(row, gpu.stream())?;
+    enqueue_head(gpu, w, k, state, head)
+}
+
+/// The launches [`enqueue_pass`] makes at `m` rows over layers `names`,
+/// counted from [`layer`]'s enqueues: the embedding, then per layer the
+/// attention half — norm+quant, q·k·v, QK-norm+rope+append, the flash's
+/// segment pass and merge, and the output projection (at one row with the
+/// q8_1 of its input folded in, at more after its own quantizer), plus a
+/// Q6_K value projection's gemv (and at more than one row its token-major
+/// copy) — and the FFN half: the norm with the router (one launch at one
+/// row, two at more), gate·up (at one row with the down's q8_1 folded in, at
+/// more followed by one quantizer over every token's slots), the down `_sel`
+/// over every token's slots, and the combine. So 10 or 11 per layer at one
+/// row and 13 or 15 at every `m` from two on.
+pub(super) fn pass_launches(names: &[LayerNames], m: usize) -> usize {
+    let per_layer = |n: &LayerNames| {
+        let q6v = usize::from(n.v_ty == Kq::Q6K);
+        if m == 1 { 10 + q6v } else { 13 + 2 * q6v }
+    };
+    1 + names.iter().map(per_layer).sum::<usize>()
 }
 
 /// Enqueue layer `slot`'s FFN half alone: `ffn_inp` in, the output residual
@@ -325,11 +355,15 @@ fn attention(
 
 /// The routed FFN half: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
 /// down_s(swiglu(gate_s, up_s))` over each token's eight experts out, into
-/// `out` (`None`: into `x`). The down `_sel` takes one token's slots per
-/// launch. At one token the norm runs inside the router's launch
-/// (`enqueue_norm_fused`, `norm_quant`'s bytes) and the down's q8_1 input
-/// inside the gate·up's (`enqueue_gate_up_quant`); at more, `norm_quant` and
-/// the `m`-token router, and a quantizer launch per token.
+/// `out` (`None`: into `x`). The down `_sel` runs every token's slots in one
+/// launch: slot `t · N_USED + j` is token `t`'s slot `j`, its id, its q8_1
+/// column and its down rows all at that index, so each slot's row is the
+/// row a one-token launch writes. At one token the norm runs inside the
+/// router's launch (`enqueue_norm_fused`, `norm_quant`'s bytes) and the
+/// down's q8_1 input inside the gate·up's (`enqueue_gate_up_quant`); at more,
+/// `norm_quant` and the `m`-token router, and one quantizer launch over
+/// every token's slots (each 128-value block is quantized on its own, so a
+/// column's bytes do not depend on the columns beside it).
 fn ffn(
     c: &Ctx<'_>,
     s: &mut Arena,
@@ -382,7 +416,7 @@ fn ffn(
         k.experts.enqueue_gate_up_quant(
             stream,
             gate_up,
-            &mut s.act_h,
+            &mut s.act_h[i],
             &mut s.gate_up_tickets,
             gpu.unlabelled_sink(),
         )?;
@@ -390,30 +424,29 @@ fn ffn(
         k.experts.enqueue_gate_up(stream, gate_up)?;
     }
     let wd = kq_weight(w, &n.ffn_down_exps)?;
-    for t in 0..m {
-        if m > 1 {
-            gpu.enqueue_quantize_q8_1_at(&s.h, t * N_USED * d.ff, &mut s.act_h)?;
-        }
-        match n.down_ty {
-            Kq::Q4K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
-                stream,
-                wd,
-                &s.act_h,
-                &s.ids[t],
-                N_USED,
-                d.hidden,
-                &mut s.down_rows[t],
-            )?,
-            Kq::Q6K => k.q6_sel.enqueue_gemv_q6k_sel(
-                stream,
-                wd,
-                &s.act_h,
-                &s.ids[t],
-                N_USED,
-                d.hidden,
-                &mut s.down_rows[t],
-            )?,
-        }
+    if m > 1 {
+        gpu.enqueue_quantize_q8_1(&s.h, &mut s.act_h[i])?;
+    }
+    let act_h = &s.act_h[i];
+    match n.down_ty {
+        Kq::Q4K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
+            stream,
+            wd,
+            act_h,
+            &s.route.ids,
+            m * N_USED,
+            d.hidden,
+            &mut s.down,
+        )?,
+        Kq::Q6K => k.q6_sel.enqueue_gemv_q6k_sel(
+            stream,
+            wd,
+            act_h,
+            &s.route.ids,
+            m * N_USED,
+            d.hidden,
+            &mut s.down,
+        )?,
     }
     let y = match out {
         Some(y) => y,
