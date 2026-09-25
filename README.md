@@ -66,6 +66,15 @@ Source: rig-log [2026-09-24, public file on the headline prompts](https://github
 
 bloomery is ahead at short context and behind at 4096 keys, where its attention is slower; that is being worked on. Source: rig-log [2026-09-24, Qwen3-30B-A3B](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#qwen3-30b-a3b-e28). A mistral.rs row is next.
 
+Prompt processing on the same card, arms alternated in one window, three rounds (`llama-bench -p P -n 0`; mistral.rs `d5ae0f18f`, `bench --prompt-len P --gen-len 1`):
+
+| Prompt | bloomery pp tok/s | llama.cpp | llama.cpp `-ub 4096` | mistral.rs |
+|---:|---:|---:|---:|---:|
+| 512 | **5,304** | 4,256 | — | 3,432 |
+| 4096 | 2,615 | 4,170 | **6,864** | 1,320 |
+
+The prompt runs in ubatches of 512 tokens through a grouped int8 tensor-core GEMM, each expert read once per ubatch. At 4096 tokens about half the time is attention, which still reuses the decode kernel in row chunks; a prefill attention kernel is next. Source: rig-log [2026-09-25, qwen3prefill](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab).
+
 Read these numbers with their conditions:
 
 - **No speculative decoding** in any row. A draft for V4.1 (DSpark) is being built.
@@ -100,7 +109,7 @@ Timing runs only on a quiet machine, under a machine-wide lease, with a witness 
 - **sm_86 only.** Every kernel is built and gated for Ampere (`--arch sm_86`). Other architectures are not tested.
 - **A pinned nightly.** The toolchain is `nightly-2026-08-28`, pinned together with a cuda-oxide git revision. The source comes from our fork of that revision, where fixes wait until upstream takes them (`THIRD_PARTY_NOTICES.md` lists them).
 - **One machine.** Timed numbers come from one A6000 in one workstation. The tooling (`tools/box.sh`) assumes a Mac editor and that workstation; [`docs/BUILD.md`](docs/BUILD.md) says what to run on your own host.
-- **No batched prefill.** A prompt is fed one step per token, so a 4096-token prompt takes about 2.4–2.9 minutes before the first new token [derived: 4096 × 35–43 ms]. The server reuses a cached prompt prefix, so a follow-up turn pays only for its new tokens.
+- **No batched prefill for V4.1.** A V4.1 prompt is fed one step per token, so a 4096-token prompt takes about 2.4–2.9 minutes before the first new token [derived: 4096 × 35–43 ms]; batched prefill is in progress. Qwen3 prefills in ubatches of 512 (the table above). The server reuses a cached prompt prefix, so a follow-up turn pays only for its new tokens.
 
 ## Build
 
