@@ -47,9 +47,9 @@ AMX·AVX-512·VNNI에 기대는 커널(KTransformers의 AMX 타일링 포함), F
 
 | 측정 | 무엇을 가르나 | 어디서 |
 |---|---|---|
-| M1 호스트 f (합집합 벤치 m_e 1·2·4·8) | hosttile을 ds41batch와 나란히 열지(t(8) > 43 ms), 뒤로 미룰지(< 30 ms); 두 모델의 P4096 차 | 시팅 M1, 약 8분 |
+| M1 호스트 f (합집합 벤치 m_e 1·2·4·8) | hosttile을 ds41batch와 나란히 열지(t(8) > 43 ms), 뒤로 미룰지(< 30 ms); 두 모델의 P4096 차 | ~~시팅 M1~~ 답함: f = 0.98(rig-log `16e874f`), hosttile을 나란히 연다 |
 | M2 A6000 H2D 세 경로 | hoststream의 P512 이득 여부, pinned 링 대 등록 매핑 | `ringstage`의 프로브, 리드 시팅 |
-| P 기준선 (우리·ik·llama.cpp, pp512·4096, 각자 최적 플래그) | 넘을 선; ik ub512 실측이 f_ik ≈ (1000/pp − 0.45)/8.65를 준다 = hosttile의 목표 | 시팅 P-a·P-b·P-c |
+| P 기준선 (우리·ik·llama.cpp, pp512·4096, 각자 최적 플래그) | 넘을 선; ik ub512 실측이 f_ik ≈ (1000/pp − 0.45)/8.65를 준다 = hosttile의 목표 | ~~시팅 P-a·P-b·P-c~~ 답함: V4.1 pp512 우리 30.7·ik 165.8·llama.cpp 104.6, pp4096 28.5·167.4·103.8(1바퀴); Qwen3는 rig-log `d2b1e8c` 표; f_ik ≈ 0.65 |
 | 프롬프트 라우팅 편중과 뜨거운 목록의 카드 적중 몫 | 설계의 S_h 130–200, 문헌의 호스트 몫 0.75 가정 | `tools/ref/router-hotlist.py`로 512·4096 프롬프트 |
 | 전문가당 m ≥ 16의 호스트 GEMM 실효 | 벤치 문법이 m_e ≤ 8까지라 지금은 못 잰다 | hosttile이 문법 상한을 올린 뒤 |
 | DMA 동시 진행 아래 CPU GEMM 감속 | D의 DRAM 경합 | hoststream |
