@@ -1296,6 +1296,9 @@ pub struct Hybrid<H> {
     /// and each column's length; grown to the widest batch served, once.
     batch_lists: Vec<(u32, f32)>,
     batch_lens: Vec<usize>,
+    /// The storage of a batch service's per-column list slices, empty between
+    /// services ([`reuse_slices`]).
+    batch_slices: Vec<&'static [(u32, f32)]>,
     /// The card's fault word once [`Hybrid::watch_fault`] has given it: what
     /// a batch service that meets refused input reads to name the card's
     /// fault.
@@ -1328,6 +1331,7 @@ impl<H: HostExperts> Hybrid<H> {
             pair_row0: None,
             batch_lists: Vec::new(),
             batch_lens: Vec::new(),
+            batch_slices: Vec::new(),
             fault: None,
             refusal: None,
             step_refusal: None,
@@ -1563,6 +1567,10 @@ impl<H: HostExperts> Hybrid<H> {
                 .resize(cols * EXPERTS_INTO_MAX, (0, 0.0f32));
         }
         let (mut host_slots, mut excluded) = (0u64, 0u64);
+        // One pool pass over x finds the first column whose activation is not
+        // finite; the columns before it are, and only the ones from it on are
+        // scanned here, one by one, for what the host saw.
+        let first_non_finite = model::ops::first_non_finite_col(x);
         // The first refused column and what the host saw in it.
         let mut refused: Option<(usize, String)> = None;
         for j in 0..cols {
@@ -1583,7 +1591,8 @@ impl<H: HostExperts> Hybrid<H> {
             }
             let saw = match unknown {
                 Some((s, id)) => Some(unknown_id(s, id, map_row.len())),
-                None => non_finite(x.col(j)),
+                None if first_non_finite.is_some_and(|f| j >= f) => non_finite(x.col(j)),
+                None => None,
             };
             if let Some(saw) = saw {
                 (n, out_of_set) = (0, 0);
@@ -1593,13 +1602,17 @@ impl<H: HostExperts> Hybrid<H> {
             host_slots += n as u64;
             excluded += out_of_set;
         }
-        let lists: Vec<&[(u32, f32)]> = self.batch_lens[..cols]
-            .iter()
-            .enumerate()
-            .map(|(j, &n)| &self.batch_lists[j * EXPERTS_INTO_MAX..][..n])
-            .collect();
+        let mut lists = reuse_slices(std::mem::take(&mut self.batch_slices));
+        lists.extend(
+            self.batch_lens[..cols]
+                .iter()
+                .enumerate()
+                .map(|(j, &n)| &self.batch_lists[j * EXPERTS_INTO_MAX..][..n]),
+        );
         let Some((first, saw)) = refused else {
-            self.host.experts_union_into(layer, x, &lists, out)?;
+            let r = self.host.experts_union_into(layer, x, &lists, out);
+            self.batch_slices = reuse_slices(lists);
+            r?;
             self.count_batch(cols, host_slots, excluded, t0);
             return Ok(());
         };
@@ -1614,8 +1627,11 @@ impl<H: HostExperts> Hybrid<H> {
                 clean.col_mut(j).fill(0.0);
             }
         }
-        self.host
-            .experts_union_into(layer, clean.view(), &lists, out)?;
+        let r = self
+            .host
+            .experts_union_into(layer, clean.view(), &lists, out);
+        self.batch_slices = reuse_slices(lists);
+        r?;
         for (j, &b) in bad.iter().enumerate() {
             if b {
                 out[j * hidden..][..hidden].fill(f32::NAN);
@@ -1908,6 +1924,16 @@ fn wait_go(
         generation.load(Ordering::Acquire),
         end.saturating_sub(seen_at.load(Ordering::Relaxed)),
     )
+}
+
+/// `v`'s storage as an empty `Vec` of slices of another lifetime: the
+/// in-place collect of an empty iterator keeps the allocation, so a buffer of
+/// borrowed lists outlives the borrow it held without a copy.
+fn reuse_slices<'a, 'b, T>(mut v: Vec<&'a [T]>) -> Vec<&'b [T]> {
+    v.clear();
+    v.into_iter()
+        .map(|_| -> &'b [T] { unreachable!("the vector was cleared") })
+        .collect()
 }
 
 /// What the host saw in activation values that are not all finite: the first

@@ -1,0 +1,30 @@
+# Round uniondispatch (R1), the engine-level A/B: the host union as five dispatches per layer-batch
+# against the chunk flow's 161 at P = 512. The round's paper decomposition: it removes waits only
+# (156 wakes, 78 of 80 row-dispatch join tails, the 48.2 MB stash, the calling thread's 24 MB zero
+# fill and its non-finite scan), no bytes and no expert compute, so
+# delta = -(1.8..5.0) - 15.7 f ms a layer-batch, f = 0.1..0.5 the join-tail fraction of a block,
+# capped by the ~12 ms residual off the union's per-expert curve [derived]. On sitting 14's walls
+# (rig-log 09-25#v41-prefill-s14): P = 512, 512 / (4.2175 s - 40 delta) = 125.3..137.0 tok/s
+# against 121.4, +3.2..+12.9 %; P = 4096 (205-225 union calls through the CED triangle)
+# 174..191 against 169.4, +2.7..+12.8 %. The base is main, whose crate code is this round's base.
+kind: ab
+question: does the five-dispatch host union shorten the V4.1 prompt call by the join tails and
+  serial fills the round removes?
+term: pp tok/s @ P = 512, lcg prompt, A6000, plan (a) - (uniondispatch - base) / base, paired by
+  round
+unit: %
+predict: +3.2..+12.9
+rounds: 3
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios 1.0845/1.0966 (P = 512)
+  and 1.0756/1.0988 (P = 4096), one run's SD about 0.55 and 1.1 %; the larger
+condition: this tree's generate_ds41 and main's (the base tree bloomery-ee-sit, built before the
+  lease, a bin: arm) alternate in one lease, BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 512
+  bin:<base>:512 4096 bin:<base>:4096, the order rotated every round; no row carries [cpu-busy]
+  or [other-busy]. The P = 4096 rows are read against their own band, +2.7..+12.8 %, by the same
+  three decisions. The same arms' decode rows (tg96 at depth 512 and 4096) are a screen for the
+  decode derivation, 0 (the decode group dispatch is the same loop with the same blocks)
+decide-in: land uniondispatch; back f out of the measured delta and write it in the rig-log entry
+decide-below: hold the landing and read f with the bench arms union5 - union (just
+  time-cpu-v41-host, 3-5 min, its own card) to find the term the model overstated
+decide-above: land it, then find the term that beat the ~12 ms residual cap before the next union
+  round is specified

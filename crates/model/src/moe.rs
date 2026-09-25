@@ -30,9 +30,9 @@ use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
 use crate::ops::{
-    DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Tensor2View, Weight, matmul_q,
-    matmul_q_group, matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
-    matmul_q_group_swiglu_into,
+    self, DEFER_MAX_COLS, GroupInput, Resolve, ShardTensor, Tensor2, Tensor2View, UnionCall,
+    UnionPlanView, UnionStack, Weight, matmul_q, matmul_q_group, matmul_q_group_into,
+    matmul_q_group_swiglu, matmul_q_group_swiglu_into,
 };
 use crate::profile;
 
@@ -969,21 +969,18 @@ pub const UNION_TAIL_MAX_COLS: usize = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
 /// fit it.
 pub const UNION_BATCH_SLOTS: usize = UNION_MAX_COLS * EXPERTS_INTO_MAX;
 
-/// Distinct experts per dispatch pair of a union call: their gate and up
-/// fill the group bookkeeping's inline block and their downs fit the claim
-/// table, so a chunk allocates nothing. A call over `u` distinct experts
-/// issues `2 · ceil(u / UNION_CHUNK)` dispatches.
-pub const UNION_CHUNK: usize = EXPERTS_INTO_MAX;
-
-/// Columns up to which a union call sums on the caller and keeps its downs
-/// there: the decode and verify shapes, whose sums are shorter than a pool
-/// dispatch pays back. A wider call splits both by column across the pool.
+/// Columns up to which a union call sums on the caller: the decode and verify
+/// shapes, whose sums are shorter than a pool dispatch pays back. A wider
+/// call splits its sums by column across the pool.
 const UNION_INLINE_COLS: usize = 8;
+
+// A narrow call's claim states hold every expert its columns can list.
+const _: () = assert!(DEFER_MAX_COLS * EXPERTS_INTO_MAX <= ops::UNION_CLAIM_EXPERTS);
 
 /// A union call's plan, in storage its scratch made at load: the distinct
 /// experts in ascending id, and per expert the columns that list it,
 /// ascending, each once. Expert `d`'s columns are `cols[off[d]..off[d + 1]]`,
-/// and the same range names its down columns in the scratch's `store`.
+/// and the same range names its slots in the scratch's slabs.
 struct UnionPlan {
     ids: Vec<u32>,
     off: Vec<usize>,
@@ -1057,68 +1054,76 @@ impl UnionPlan {
         &self.cols[self.off[d]..self.off[d + 1]]
     }
 
-    /// Whether the plan runs through blocks of `blk_cols` columns and a store
-    /// of `slots` down columns: no expert carries more columns, and the plan
-    /// holds no more slots.
-    fn fits(&self, blk_cols: usize, slots: usize) -> bool {
-        self.cols.len() <= slots && self.off.windows(2).all(|w| w[1] - w[0] <= blk_cols)
+    /// Whether the plan runs through slabs of `slots` slots.
+    fn fits(&self, slots: usize) -> bool {
+        self.cols.len() <= slots
+    }
+
+    /// The plan as the passes read it.
+    fn view(&self) -> UnionPlanView<'_> {
+        UnionPlanView {
+            ids: &self.ids,
+            off: &self.off,
+            cols: &self.cols,
+        }
     }
 }
 
-/// The blocks a union call writes, made once for a layer shape and a column
-/// count and held across calls, so a call allocates nothing: the gate, up,
-/// combine and down blocks of one chunk of [`UNION_CHUNK`] experts, reused
-/// chunk after chunk, each narrowed in place to the columns that list its
-/// expert; the down columns of every chunk but the last, kept in `store`
-/// until the list-order sums at the end; `x` quantized once for every chunk
-/// of a wide call; and the plan's buffers.
+/// The slabs a union call writes, made once for a layer shape and a column
+/// count and held across calls, so a call allocates nothing: `x` quantized,
+/// and per slot — a listed (expert, column) pair, expert `d`'s slots at the
+/// plan's `off[d]..off[d + 1]` — its gate and up outputs, its combine
+/// quantized in the down's encoding and its down output, kept until the
+/// list-order sums at the end; and the plan's buffers.
 ///
-/// For `cols` columns, `embd` and `ff` wide experts, it holds
-/// `4 · (3 · ff + embd) · UNION_CHUNK · cols` bytes of chunk blocks,
-/// `4 · embd · EXPERTS_INTO_MAX · cols` of store, a few words per slot and,
-/// from the first call wider than [`DEFER_MAX_COLS`], `cols` quantized
-/// columns of `embd` values (`qdot::col_bytes` each, about `embd` bytes).
+/// For `cols` columns, `slots` slots and `embd` and `ff` wide experts, it
+/// holds `4 · (2 · ff + embd) · slots` bytes of gate/up and down slabs,
+/// `slots` combine columns and `cols` columns of `x` of `ops::col_bytes_max`
+/// bytes each (a little over `ff` and `embd` bytes), and a few words per slot
+/// of plan.
 ///
 /// A batch's scratch ([`UnionScratch::new`]) takes up to [`UNION_MAX_COLS`]
-/// columns and is sized for their worst: blocks of `cols` columns, a store of
-/// `EXPERTS_INTO_MAX · cols` slots. A group tail's ([`UnionScratch::new_tail`])
-/// takes up to [`UNION_TAIL_MAX_COLS`] and is sized by a slot budget instead:
-/// blocks of one batch's width, a store of the budget's slots. A tail call
-/// whose plan fits both — no expert past a block, no more slots than the
-/// store — runs as one call; one that does not runs as consecutive calls of
-/// [`UNION_MAX_COLS`] columns, each of which fits, and is counted
-/// ([`UnionScratch::cut_calls`]). Either way a column's bits are the ones any
-/// call that lists it the same way writes.
+/// columns and holds their every slot, `EXPERTS_INTO_MAX · cols`. A group
+/// tail's ([`UnionScratch::new_tail`]) takes up to [`UNION_TAIL_MAX_COLS`]
+/// and holds a slot budget instead. A call whose plan holds no more slots
+/// than the scratch runs as one call; one that holds more runs as
+/// consecutive calls of [`UNION_MAX_COLS`] columns, each of which fits, and
+/// is counted ([`UnionScratch::cut_calls`]). Either way a column's bits are
+/// the ones any call that lists it the same way writes.
 pub struct UnionScratch {
     embd: usize,
     ff: usize,
     max_cols: usize,
-    /// The most columns one expert's blocks take.
-    blk_cols: usize,
-    /// The store's down columns: the most slots one call's plan may hold.
+    /// The most slots one call's plan may hold.
     max_slots: usize,
-    /// Calls that did not fit the blocks or the store and ran cut into
-    /// calls of [`UNION_MAX_COLS`] columns.
+    /// Calls that did not fit the slabs and ran cut into calls of
+    /// [`UNION_MAX_COLS`] columns.
     cut_calls: u64,
-    /// `[gate_0, up_0, gate_1, up_1, ..]` of the chunk, `{ff, m}` each.
-    gate_up: [Tensor2; 2 * UNION_CHUNK],
-    /// The chunk's combines, `{ff, m}` each.
-    pars: [Tensor2; UNION_CHUNK],
-    /// The chunk's down outputs, `{embd, m}` each.
-    downs: [Tensor2; UNION_CHUNK],
-    /// Down column `q` of the plan (`q` in `off[d]..off[d + 1]` for expert
-    /// `d`) at `store[q·embd..(q + 1)·embd]`, for experts outside the last
-    /// chunk.
+    /// Pool dispatches the calls issued.
+    dispatches: u64,
+    /// Bytes a column of `x` and a combine may take: `ops::col_bytes_max` of
+    /// `embd` and of `ff`.
+    x_col: usize,
+    c_col: usize,
+    /// `x` in the gate's encoding, `x_col` bytes a column.
+    xq: Vec<u8>,
+    /// `x` in the up's encoding, for an up whose rows read other bytes than
+    /// the gate's; empty until a call needs it.
+    xq_up: Vec<u8>,
+    /// Slot columns of `ff`: expert `d`'s gate at slots `2·off[d]` on, its up
+    /// at the `m` after them (`m` its columns).
+    gu: Vec<f32>,
+    /// Slot `q`'s combine in the down's encoding at `c_col · q`.
+    qc: Vec<u8>,
+    /// Slot `q`'s down output at `store[q·embd..(q + 1)·embd]`.
     store: Vec<f32>,
-    /// A wide call's `x`, quantized once in the gate's encoding.
-    xq: QuantizedCols,
     plan: UnionPlan,
 }
 
 impl UnionScratch {
-    /// Blocks for a batch's calls, up to `cols` columns over experts that
-    /// map `embd -> ff -> embd`; `cols` outside `1..=UNION_MAX_COLS` is a
-    /// named error.
+    /// Slabs for a batch's calls, up to `cols` columns over experts that map
+    /// `embd -> ff -> embd`; `cols` outside `1..=UNION_MAX_COLS` is a named
+    /// error.
     pub fn new(embd: usize, ff: usize, cols: usize) -> Result<UnionScratch, ModelError> {
         if cols == 0 || cols > UNION_MAX_COLS {
             return Err(ModelError::Shape {
@@ -1133,16 +1138,15 @@ impl UnionScratch {
             embd,
             ff,
             cols,
-            cols,
             cols * EXPERTS_INTO_MAX,
         ))
     }
 
-    /// Blocks for a group tail's call: the columns of `groups` batches of
+    /// Slabs for a group tail's call: the columns of `groups` batches of
     /// [`UNION_MAX_COLS`] in one call, so each expert it lists is read once
-    /// for all of them, over a store of `slots` down columns — the budget,
-    /// from [`UNION_BATCH_SLOTS`] (so a batch's columns always fit) to every
-    /// slot of the columns. `groups` outside `1..=UNION_TAIL_MAX_GROUPS` or a
+    /// for all of them, over `slots` slots — the budget, from
+    /// [`UNION_BATCH_SLOTS`] (so a batch's columns always fit) to every slot
+    /// of the columns. `groups` outside `1..=UNION_TAIL_MAX_GROUPS` or a
     /// budget outside that range is a named error. A call through it may take
     /// fewer columns (a short last batch), and batch calls fit it too.
     pub fn new_tail(
@@ -1170,35 +1174,26 @@ impl UnionScratch {
                 got_ne1: groups,
             });
         }
-        Ok(UnionScratch::with_caps(
-            embd,
-            ff,
-            cols,
-            UNION_MAX_COLS,
-            slots,
-        ))
+        Ok(UnionScratch::with_caps(embd, ff, cols, slots))
     }
 
-    /// `cols` columns a call, blocks of `blk_cols`, a store of `slots`.
-    fn with_caps(
-        embd: usize,
-        ff: usize,
-        cols: usize,
-        blk_cols: usize,
-        slots: usize,
-    ) -> UnionScratch {
+    /// `cols` columns a call over `slots` slots.
+    fn with_caps(embd: usize, ff: usize, cols: usize, slots: usize) -> UnionScratch {
+        let (x_col, c_col) = (ops::col_bytes_max(embd), ops::col_bytes_max(ff));
         UnionScratch {
             embd,
             ff,
             max_cols: cols,
-            blk_cols,
             max_slots: slots,
             cut_calls: 0,
-            gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, blk_cols)),
-            pars: std::array::from_fn(|_| Tensor2::zeros(ff, blk_cols)),
-            downs: std::array::from_fn(|_| Tensor2::zeros(embd, blk_cols)),
-            store: vec![0.0; embd * slots],
-            xq: QuantizedCols::new(),
+            dispatches: 0,
+            x_col,
+            c_col,
+            xq: vec![0; cols * x_col],
+            xq_up: Vec::new(),
+            gu: vec![0.0; 2 * slots * ff],
+            qc: vec![0; slots * c_col],
+            store: vec![0.0; slots * embd],
             plan: UnionPlan::with_room(cols),
         }
     }
@@ -1219,6 +1214,17 @@ impl UnionScratch {
     /// cuts one.
     pub fn cut_calls(&self) -> u64 {
         self.cut_calls
+    }
+
+    /// Pool dispatches the calls through this scratch issued, since it was
+    /// made. A call wider than [`DEFER_MAX_COLS`] columns issues five: `x`
+    /// quantized, every expert's gate and up, every combine quantized, every
+    /// expert's down, the sums. A narrower one issues two — its gate/up and
+    /// down row dispatches, which claim the quantizations — or, with the
+    /// deferral lever off, four; it sums on the caller. A call that lists no
+    /// expert issues none, and a cut call issues its calls'.
+    pub fn dispatches(&self) -> u64 {
+        self.dispatches
     }
 }
 
@@ -1280,31 +1286,28 @@ thread_local! {
 
 /// The host leg of `k` tokens over the union of their experts: column `j`
 /// of `out` (`out[j·embd..(j+1)·embd]`) is exactly what [`serve`] writes for
-/// column `j` of `x` and `lists[j]`, bit for bit. The distinct experts, in
-/// ascending id, run in chunks of [`UNION_CHUNK`]: one group dispatch for the
-/// chunk's gates and ups, each pair over the columns that list its expert
-/// ([`GroupInput::Cols`] of the one `x`: every column quantized alone, by the
-/// weight type's rule, as the one-column call quantizes it), then one for
-/// their downs over those columns' combines. Each weight row is read once
-/// per call; its runs of up to [`qdot::TILE_COLS`] listed columns go to the
-/// tile kernel, which writes each column's `dot_row` value. A call of at
-/// most [`DEFER_MAX_COLS`] columns has its quantization claimed inside each
-/// row dispatch; a wider one quantizes `x` once, over the pool, before the
-/// first chunk, and every chunk's gate and up read those bytes
-/// ([`GroupInput::Quantized`]; a pair of another encoding keeps
-/// [`GroupInput::Cols`]) — the same bytes either way. A chunk's downs are copied to the
-/// store before the next chunk reuses their blocks, and each column's sum
-/// runs last, in that column's list order from zero — the order its
-/// one-column call adds in. Nothing here depends on the call's width but
-/// which experts share a chunk and a dispatch, so a column's bits are the
-/// same in a call of any width that lists it the same way (a group tail's
-/// included). A plan past the scratch's blocks or store — a tail call over
-/// its slot budget — runs as consecutive calls of [`UNION_MAX_COLS`]
-/// columns, each within both, and counts in [`UnionScratch::cut_calls`].
-/// `resolve` gives an expert's `[gate, up, down]`; `lists` has been checked
+/// column `j` of `x` and `lists[j]`, bit for bit, in five pool dispatches
+/// ([`UnionScratch::dispatches`]): `x` quantized once, by the gate's and the
+/// up's activation rule; every distinct expert's gate and up over the columns
+/// that list it, one row dispatch in expert order — each weight row read once
+/// per call, its runs of up to [`qdot::TILE_COLS`] listed columns through the
+/// tile kernel, which writes each column's `dot_row` value; every slot's
+/// combine, quantized in the down's encoding; every expert's down over its
+/// combines, one row dispatch; and each column's sum, in that column's list
+/// order from zero — the order its one-column call adds in. A call of at most
+/// [`DEFER_MAX_COLS`] columns claims its quantizations inside its two row
+/// dispatches instead (`x` column by column, each expert's combines at once),
+/// unless the deferral lever is off, and sums on the caller. Nothing here
+/// depends on the call's width, on the order of the work or on who runs it,
+/// so a column's bits are the same in a call of any width that lists it the
+/// same way (a group tail's included). A plan past the scratch's slots — a
+/// tail call over its budget — runs as consecutive calls of
+/// [`UNION_MAX_COLS`] columns, each within them, and counts in
+/// [`UnionScratch::cut_calls`]. `resolve` gives an expert's `[gate, up,
+/// down]`, on the participant that reads it; `lists` has been checked
 /// against `x`, `out` and the scratch.
-fn serve_union<'w>(
-    resolve: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+fn serve_union(
+    resolve: &Resolve<'_, '_>,
     limit: Option<f32>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
@@ -1312,8 +1315,8 @@ fn serve_union<'w>(
     s: &mut UnionScratch,
 ) -> Result<(), ModelError> {
     s.plan.build(lists)?;
-    if s.plan.fits(s.blk_cols, s.max_slots) {
-        return serve_planned(&resolve, limit, x, lists, out, s);
+    if s.plan.fits(s.max_slots) {
+        return serve_planned(resolve, limit, x, lists, out, s);
     }
     s.cut_calls += 1;
     let embd = x.ne0();
@@ -1323,12 +1326,11 @@ fn serve_union<'w>(
         let part = Tensor2View::new(&x.data()[c0 * embd..c1 * embd], embd, c1 - c0)?;
         s.plan.build(&lists[c0..c1])?;
         assert!(
-            s.plan.fits(s.blk_cols, s.max_slots),
-            "host union: a batch's columns fit every scratch (blocks of UNION_MAX_COLS or more, \
-             a store of UNION_BATCH_SLOTS or more)"
+            s.plan.fits(s.max_slots),
+            "host union: a batch's columns fit every scratch (UNION_BATCH_SLOTS slots or more)"
         );
         serve_planned(
-            &resolve,
+            resolve,
             limit,
             part,
             &lists[c0..c1],
@@ -1341,9 +1343,9 @@ fn serve_union<'w>(
 }
 
 /// [`serve_union`] for a plan already built into `s.plan` from `lists`,
-/// which fits its blocks and store.
-fn serve_planned<'w>(
-    resolve: &impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+/// which fits its slabs.
+fn serve_planned(
+    resolve: &Resolve<'_, '_>,
     limit: Option<f32>,
     x: Tensor2View<'_>,
     lists: &[&[(u32, f32)]],
@@ -1351,103 +1353,107 @@ fn serve_planned<'w>(
     s: &mut UnionScratch,
 ) -> Result<(), ModelError> {
     let UnionScratch {
+        embd,
+        ff,
         max_cols,
-        gate_up,
-        pars,
-        downs,
-        store,
+        dispatches,
+        x_col,
+        c_col,
         xq,
+        xq_up,
+        gu,
+        qc,
+        store,
         plan,
         ..
     } = s;
+    let (embd, ff, k) = (*embd, *ff, x.ne1());
+    if plan.n() == 0 {
+        out.fill(0.0);
+        return Ok(());
+    }
     let lvl = profile::level();
+    let first = resolve(plan.ids[0])?;
+    let call = UnionCall {
+        plan: plan.view(),
+        resolve,
+        x,
+        limit,
+        gate: UnionStack::of(
+            &first[0],
+            "host union: the gate must map embd -> ff",
+            embd,
+            ff,
+        )?,
+        up: UnionStack::of(
+            &first[1],
+            "host union: the up must map embd -> ff",
+            embd,
+            ff,
+        )?,
+        down: UnionStack::of(
+            &first[2],
+            "host union: the down must map ff -> embd",
+            ff,
+            embd,
+        )?,
+    };
+    let cb_up = call.up.cb();
+    assert!(
+        call.gate.cb().max(cb_up) <= *x_col && call.down.cb() <= *c_col,
+        "host union: an encoding wider than ops::col_bytes_max, the scratch's column room"
+    );
+    let slots = plan.cols.len();
+    let xq = &mut xq[..k * call.gate.cb()];
+    let xq_up: &mut [u8] = if call.gate.shares_input(&call.up) {
+        &mut []
+    } else {
+        if xq_up.len() < *max_cols * cb_up {
+            xq_up.resize(*max_cols * cb_up, 0);
+        }
+        &mut xq_up[..k * cb_up]
+    };
+    let gu = &mut gu[..2 * slots * ff];
+    let qc = &mut qc[..slots * call.down.cb()];
+    let store = &mut store[..slots * embd];
+    // Poisoned like a dispatch's own buffers, so an unwritten cell shows.
+    if ops::poison() {
+        xq.fill(0xA5);
+        xq_up.fill(0xA5);
+        gu.fill(f32::NAN);
+        qc.fill(0xA5);
+        store.fill(f32::NAN);
+    }
+    // The decode and verify shapes claim their quantizations inside the two
+    // row dispatches.
+    let claim = k <= DEFER_MAX_COLS && ops::defer_quant();
     let (mut x_ns, mut h_ns) = (0u64, 0u64);
-    let embd = x.ne0();
-    // Only a call wider than any claim takes: the decode and verify shapes
-    // keep their claimed, per-dispatch quantization untouched.
-    let mut filled = false;
-    if x.ne1() > DEFER_MAX_COLS && plan.n() > 0 {
+    if !claim {
         let t_x = if lvl > 0 { Some(Instant::now()) } else { None };
-        let gate = resolve(plan.ids[0])?[0];
-        filled = xq.fill(gate.ty(), x, *max_cols);
+        call.quantize_x(xq, xq_up);
+        *dispatches += 1;
         if let Some(t_x) = t_x {
             x_ns += t_x.elapsed().as_nanos() as u64;
         }
     }
-    let xq: Option<&QuantizedCols> = filled.then_some(&*xq);
-    let n_chunks = plan.n().div_ceil(UNION_CHUNK);
-    let per = if n_chunks == 0 {
-        0
-    } else {
-        plan.n().div_ceil(n_chunks)
-    };
-    for c in 0..n_chunks {
-        let (a, b) = (c * per, ((c + 1) * per).min(plan.n()));
-        let n = b - a;
-        // The unused tails keep the chunk's first expert's gate; only the
-        // first n (2n) are passed.
-        let first = resolve(plan.ids[a])?[0];
-        let mut gu = [first; 2 * UNION_CHUNK];
-        let mut down = [first; UNION_CHUNK];
-        let mut srcs: [GroupInput<'_>; 2 * UNION_CHUNK] =
-            [GroupInput::Cols(x, &[]); 2 * UNION_CHUNK];
-        for i in 0..n {
-            let d = a + i;
-            let [g, u, dw] = resolve(plan.ids[d])?;
-            gu[2 * i] = g;
-            gu[2 * i + 1] = u;
-            down[i] = dw;
-            let cols = plan.cols(d);
-            let src = |w: &Weight<'_>| match xq {
-                Some(q) if q.serves(w.ty(), w.k()) => GroupInput::Quantized(x, q, cols),
-                _ => GroupInput::Cols(x, cols),
-            };
-            srcs[2 * i] = src(&g);
-            srcs[2 * i + 1] = src(&u);
-            gate_up[2 * i].set_cols(cols.len());
-            gate_up[2 * i + 1].set_cols(cols.len());
-            pars[i].set_cols(cols.len());
-            downs[i].set_cols(cols.len());
-        }
-        let gt = matmul_q_group_cols_into(
-            "host_gate_up",
-            &gu[..2 * n],
-            &srcs[..2 * n],
-            &mut gate_up[..2 * n],
-            &mut [],
-        )?;
-        let combines: [GroupInput<'_>; UNION_CHUNK] = std::array::from_fn(|i| {
-            if i >= n {
-                return GroupInput::Cols(x, &[]);
-            }
-            let (gate, up) = (&gate_up[2 * i], &gate_up[2 * i + 1]);
-            match limit {
-                Some(limit) => GroupInput::SwigluClamp(gate, up, limit),
-                None => GroupInput::Swiglu(gate, up),
-            }
-        });
-        let dt = matmul_q_group_cols_into(
-            "host_down",
-            &down[..n],
-            &combines[..n],
-            &mut downs[..n],
-            &mut pars[..n],
-        )?;
-        x_ns += gt.stage_ns;
-        h_ns += dt.stage_ns;
-        if c + 1 < n_chunks {
-            stash_downs(&downs[..n], &plan.off[a..=b], embd, store);
+    x_ns += call.gate_up(xq, xq_up, gu, claim, lvl)?;
+    *dispatches += 1;
+    if !claim {
+        let t_h = if lvl > 0 { Some(Instant::now()) } else { None };
+        call.combine(gu, qc);
+        *dispatches += 1;
+        if let Some(t_h) = t_h {
+            h_ns += t_h.elapsed().as_nanos() as u64;
         }
     }
+    h_ns += call.down(gu, qc, store, claim, lvl)?;
+    *dispatches += 1;
     let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
     let found = UnionDowns {
-        blocks: &downs[..],
         store: &store[..],
         plan: &*plan,
-        last: n_chunks.saturating_sub(1) * per,
         embd,
     };
-    let k = lists.len();
     if k <= UNION_INLINE_COLS {
         for (j, o) in out.chunks_exact_mut(embd).enumerate() {
             found.sum_col(lists[j], j, o);
@@ -1473,6 +1479,7 @@ fn serve_planned<'w>(
                 }
             });
         });
+        *dispatches += 1;
     }
     if let Some(t_sum) = t_sum {
         profile::record_time("host_x_quant", x_ns);
@@ -1482,27 +1489,15 @@ fn serve_planned<'w>(
     Ok(())
 }
 
-/// Where a finished union call's down columns are: distinct experts from
-/// `last` on (the last chunk) still in their blocks, the rest in the store.
+/// Where a finished union call's down columns are: slot `q`'s at
+/// `store[q·embd..(q + 1)·embd]`.
 struct UnionDowns<'a> {
-    blocks: &'a [Tensor2],
     store: &'a [f32],
     plan: &'a UnionPlan,
-    last: usize,
     embd: usize,
 }
 
-impl<'a> UnionDowns<'a> {
-    /// Distinct expert `d`'s down column `t`.
-    fn col(&self, d: usize, t: usize) -> &'a [f32] {
-        if d >= self.last {
-            self.blocks[d - self.last].col(t)
-        } else {
-            let q = self.plan.off[d] + t;
-            &self.store[q * self.embd..(q + 1) * self.embd]
-        }
-    }
-
+impl UnionDowns<'_> {
     /// Column `j`'s weighted sum into `o`, from zero in the order of its
     /// list `list` — the one-column call's order.
     fn sum_col(&self, list: &[(u32, f32)], j: usize, o: &mut [f32]) {
@@ -1514,41 +1509,15 @@ impl<'a> UnionDowns<'a> {
                 .cols(d)
                 .binary_search(&j)
                 .expect("a listing column is in its expert's columns");
-            for (o, &dv) in o.iter_mut().zip(self.col(d, t)) {
+            let q = self.plan.off[d] + t;
+            for (o, &dv) in o
+                .iter_mut()
+                .zip(&self.store[q * self.embd..(q + 1) * self.embd])
+            {
                 *o += w * dv;
             }
         }
     }
-}
-
-/// A chunk's down columns into the store before the next chunk reuses their
-/// blocks: block `i`'s columns land at store columns `off[i]..off[i + 1]`
-/// (`off` is the plan's offsets of the chunk's experts, one past its last).
-/// Columns up to [`UNION_INLINE_COLS`] copy on the caller, more split across
-/// the pool.
-fn stash_downs(blocks: &[Tensor2], off: &[usize], embd: usize, store: &mut [f32]) {
-    let (q0, q1) = (off[0], off[off.len() - 1]);
-    if q1 - q0 <= UNION_INLINE_COLS {
-        for (blk, w) in blocks.iter().zip(off.windows(2)) {
-            store[w[0] * embd..w[1] * embd].copy_from_slice(&blk.data[..(w[1] - w[0]) * embd]);
-        }
-        return;
-    }
-    // SAFETY (construction site): each participant writes only store columns
-    // in its own chunk of `q0..q1`; the chunks partition them, and the join
-    // publishes the writes.
-    let store_ptr = crate::ops::SharedOut(store.as_mut_ptr());
-    threads::pool().for_each_chunk(q1 - q0, |qs| {
-        for q in q0 + qs.start..q0 + qs.end {
-            // The block whose range holds `q`: `off` ascends.
-            let i = off.partition_point(|&o| o <= q) - 1;
-            let col = blocks[i].col(q - off[i]);
-            for (x, &v) in col.iter().enumerate() {
-                // SAFETY: store column `q` is in this participant's chunk — see the construction site.
-                unsafe { store_ptr.write(q * embd + x, v) };
-            }
-        }
-    });
 }
 
 /// [`experts_into`] for many tokens at once — up to the columns `scratch` was
@@ -1577,20 +1546,14 @@ pub fn experts_union_into<'x>(
     let view = |views: &[TensorInfo], e: u32| -> Result<Weight<'_>, ModelError> {
         Weight::in_file(gguf, expert_of(views, e, plan.block)?)
     };
-    serve_union(
-        |e| {
-            Ok([
-                view(&plan.gate_views, e)?,
-                view(&plan.up_views, e)?,
-                view(&plan.down_views, e)?,
-            ])
-        },
-        None,
-        x,
-        lists,
-        out,
-        scratch,
-    )
+    let resolve = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
+        Ok([
+            view(&plan.gate_views, e)?,
+            view(&plan.up_views, e)?,
+            view(&plan.down_views, e)?,
+        ])
+    };
+    serve_union(&resolve, None, x, lists, out, scratch)
 }
 
 /// What a host tier needs to serve one layer's routed experts, in the
@@ -1744,21 +1707,15 @@ impl HostLayer {
     ) -> Result<(), ModelError> {
         let x = x.into();
         check_union_call(x, lists, out, self.gate.info().dims[1] as usize, scratch)?;
-        serve_union(
-            |e| {
-                let e = e as usize;
-                Ok([
-                    self.gate.expert(split, e)?,
-                    self.up.expert(split, e)?,
-                    self.down.expert(split, e)?,
-                ])
-            },
-            Some(self.limit),
-            x,
-            lists,
-            out,
-            scratch,
-        )
+        let resolve = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
+            let e = e as usize;
+            Ok([
+                self.gate.expert(split, e)?,
+                self.up.expert(split, e)?,
+                self.down.expert(split, e)?,
+            ])
+        };
+        serve_union(&resolve, Some(self.limit), x, lists, out, scratch)
     }
 }
 

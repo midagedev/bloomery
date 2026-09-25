@@ -45,7 +45,7 @@
 //! counters are recorded: a page read from NVMe makes the number a disk
 //! measurement, and such an arm prints `admissible=no`.
 //!
-//! `--check`: for layers 0, 1, 2, the last layer and every layer whose
+//! `--check [--arms A,B,...]`: for layers 0, 1, 2, the last layer and every layer whose
 //! stacks span more than one shard, one token and every one of its
 //! `expert_used_count` experts. Six output rows of gate, up and down are
 //! compared with an f64 reference over the same bytes: `gguf::dequant_row`
@@ -62,11 +62,12 @@
 //! must equal, bit for bit, the list-order sum of the engine shape's downs
 //! for that row at the union shape's weights. Where the working set was
 //! repacked for the `unionr8` shape (every checked layer under `--check`,
-//! every layer when a `--time` arm is `unionr8`), the checked layers also run
-//! one token of each of [`R8_CHECKS`] through the `union`, `unionr8` and
+//! every layer when an arm is `unionr8`), the checked layers also run one
+//! token of each of [`R8_CHECKS`] through the `union`, `union5`, `unionr8` and
 //! `unionq` shapes, whose outputs must be equal bit for bit, and `--check`
 //! runs the pre-timing arm check below for the arms of [`R8_CHECK_ARMS`] on
-//! the checked layers.
+//! the checked layers — or, given `--arms`, for those arms on every layer,
+//! the check a `--time` run makes before it times them, without the timing.
 //!
 //! `--time` (lead-only, under `tools/ref/host-rate.sh`, which owns the lease,
 //! the witnesses and the thread sweep): the check first, refusing to time if
@@ -86,31 +87,41 @@
 //! still stream every row's slots; `union_bytes_per_token` is the file bytes
 //! a pass that read each distinct expert once would read.
 //!
-//! The `union` shape is that pass: per layer one
+//! The `union5` shape is that pass: per layer one
 //! `moe::HostLayer::experts_union_into` over the `rows` columns and their
 //! lists (each row's `n_host` working-set experts at weight `1 / n_host`),
 //! which reads each distinct expert once and ends in every column's weighted
-//! sum. Its layers are built with a SwiGLU limit of 0, which clamps nothing,
-//! so its combine is the plain one the other shapes run. The call is timed
-//! whole, as one `union` dispatch entry whose bytes are the layer's distinct
-//! experts; its pool dispatches are `2 · ceil(union / moe::UNION_CHUNK)` per
-//! layer.
+//! sum, in five pool dispatches a layer (two at or under
+//! `ops::DEFER_MAX_COLS` rows). Its layers are built with a SwiGLU limit of
+//! 0, which clamps nothing, so its combine is the plain one the other shapes
+//! run. The call is timed whole, as one `union5` dispatch entry whose bytes
+//! are the layer's distinct experts.
+//!
+//! The `union` shape is the same pass in the chunked flow the host tier ran
+//! before (see [`union_chunks_call`]): the distinct experts in chunks of
+//! [`UNION_CHUNK`], a gate/up and a down group dispatch per chunk
+//! (`ops::matmul_q_group_cols_into`), each chunk's downs but the last's
+//! copied aside, then the sums — at least `2 · ceil(union / UNION_CHUNK)`
+//! pool dispatches a layer. `union5` against `union` is the dispatch flow;
+//! their outputs are equal bit for bit.
 //!
 //! The `unionr8` shape is the same call with gate and up through the
 //! row-lane Q3_K tile (`qdot::dot_q3k_r8_cols`): the working set's gates and
 //! ups are repacked once at start-up (`qdot::repack_q3k_r8`, into anonymous
-//! memory, before the working set is paged in), and per layer the union's
-//! plan, chunks and down dispatch run unchanged. Its gate and up dispatch
-//! hands out (expert, 8-row group) units off one counter, and a call of at
-//! most `ops::DEFER_MAX_COLS` columns quantizes `x` as claims inside that
-//! dispatch; a wider one quantizes it over the pool first, as the union call
-//! does. Each distinct expert keeps its own down block, so no chunk copies
-//! its downs aside. The `unionq` shape is that call with the column tile on
-//! the file's rows (`qdot::dot_row_cols` row by row, as the union call's row
-//! dispatch runs it): `unionr8` against `unionq` is the kernel alone,
-//! `unionq` against `union` the dispatch. Before timing, one token of every
-//! `unionr8` and `unionq` arm runs through its shape and the union shape on
-//! every layer, and their outputs must be equal bit for bit.
+//! memory, before the working set is paged in), and per layer the `union`
+//! shape's plan, chunks and down dispatch run unchanged. Its gate and up
+//! dispatch hands out (expert, 8-row group) units off one counter, `b<B>` on
+//! the arm (default 1) at a time, and a call of at most `ops::DEFER_MAX_COLS`
+//! columns quantizes `x` as claims inside that dispatch; a wider one
+//! quantizes it over the pool first, as the `union` shape does. Each
+//! distinct expert keeps its own down block, so no chunk copies its downs
+//! aside. The `unionq` shape is that call with the column tile on the file's
+//! rows (`qdot::dot_row_cols` row by row, as the union call's row dispatch
+//! runs it): `unionr8` against `unionq` is the kernel alone, `unionq` against
+//! `union` the gate/up dispatch and the narrow call's quantization. Before
+//! timing, one token of every `union5`, `unionr8` and `unionq` arm runs
+//! through its shape and the `union` shape on every layer, and their outputs
+//! must be equal bit for bit.
 
 use std::ffi::{c_int, c_void};
 use std::ops::Range;
@@ -122,19 +133,19 @@ use std::time::Instant;
 use gguf::{GgmlType, Gguf, Split, TensorInfo, dequant_row};
 use model::ModelError;
 use model::moe::{
-    EXPERTS_INTO_MAX, HostLayer, HostLayerSpec, UNION_CHUNK, UNION_MAX_COLS, UnionScratch,
-    expert_view,
+    EXPERTS_INTO_MAX, HostLayer, HostLayerSpec, UNION_MAX_COLS, UnionScratch, expert_view,
 };
 use model::ops::{
-    DEFER_MAX_COLS, GroupInput, ShardTensor, Tensor2, Weight, matmul_q, matmul_q_group_cols_into,
-    matmul_q_group_into, matmul_q_group_swiglu, matmul_q_group_swiglu_into,
+    DEFER_MAX_COLS, GroupInput, QuantizedCols, ShardTensor, Tensor2, Weight, matmul_q,
+    matmul_q_group_cols_into, matmul_q_group_into, matmul_q_group_swiglu,
+    matmul_q_group_swiglu_into,
 };
 
 type BenchError = Box<dyn std::error::Error>;
 
 /// Experts per layer in the working set: forty layers of them are far above
-/// the L3 and far below free RAM.
-const WORKING_SET: usize = 24;
+/// the L3 and far below free RAM, and a union arm's 32 distinct experts fit.
+const WORKING_SET: usize = 32;
 /// Relative band of a checked value against its f64 reference, the GPU
 /// bench's `KERNEL_BAND`: accumulation rounding sits orders of magnitude
 /// under it, a wrong row, scale or activation orders of magnitude above.
@@ -162,10 +173,14 @@ const MATRIX: [&str; 3] = ["gate", "up", "down"];
 /// Columns up to which the union call sums on the caller (moe's own bound,
 /// private there); the `unionr8` shape splits a wider sum as it does.
 const UNION_INLINE_COLS: usize = 8;
+/// Distinct experts per chunk of the chunked union flow (the `union`,
+/// `unionr8` and `unionq` shapes): a chunk's gate and up fill the group
+/// bookkeeping's inline block and its downs fit the claim table.
+const UNION_CHUNK: usize = EXPERTS_INTO_MAX;
 /// The arms `--check` runs the pre-timing arm check for, on the checked
 /// layers: the union sitting's shapes.
-const R8_CHECK_ARMS: &str =
-    "unionr8:4x8u0.125,unionq:4x8u0.125,unionr8:4x16u0.0625,unionq:4x16u0.0625";
+const R8_CHECK_ARMS: &str = "union5:4x8u0.125,unionr8:4x8u0.125,unionq:4x8u0.125,\
+                             union5:4x16u0.0625,unionr8:4x16u0.0625,unionq:4x16u0.0625";
 /// The `(rows, n_host, distinct)` tokens the `unionr8` check runs on every
 /// checked layer: columns per expert 1–2, 3, 3–4 over three chunks, 6, 7–8,
 /// 8, 10 (a run of 8 and one of 2) and 16 (two runs of 8).
@@ -183,15 +198,18 @@ const R8_CHECKS: [(usize, usize, usize); 8] = [
 /// down group.
 const ENGINE_DISPATCHES: usize = 2;
 
-const USAGE: &str = "usage: bench_v41_host --check
+const USAGE: &str = "usage: bench_v41_host --check [--arms A,B,...]
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
        bench_v41_host --time ... [--union R]
-  an arm is <engine|engine-sep|union|unionr8|unionq|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]; the default is engine:6,engine:5,engine:3,per-matrix:6
-  union: one union call per layer over the rows (rows <= 512, n_host <= 8)
+  an arm is <engine|engine-sep|union|union5|unionr8|unionq|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]][b<B>]; the default is engine:6,engine:5,engine:3,per-matrix:6
+  union: one union call per layer over the rows in the chunked flow (rows <= 512, n_host <= 8)
+  union5: the engine's union call, five pool dispatches a layer (same bounds)
   unionr8: the union call with gate and up through the row-lane Q3_K tile (same bounds)
   unionq: the unionr8 call with the union call's column tile (its control: same dispatch)
   u<r> (or --union R for every multi-row arm without its own): the rows share experts, the layer's distinct experts
   are round(r x n_host x rows), 1/rows <= r <= 1
+  b<B> (unionr8 and unionq only): the gate/up dispatch hands out B units a claim, default 1
+  --check --arms: the pre-timing check of those arms on every layer, no timing
   the model is $BLOOMERY_REF_MODEL (tools/box.sh exports it from the deepseek41 profile)";
 
 // The page bookkeeping's libc calls; `std` already links libc on this target.
@@ -544,16 +562,31 @@ struct Blocks {
     gu: Vec<Tensor2>,
     down: Vec<Tensor2>,
     par: Vec<Tensor2>,
-    /// The union shape's, `None` for the others.
+    /// The `union` shape's, `None` for the others.
+    chunks: Option<ChunkBlocks>,
+    /// The `union5` shape's, `None` for the others.
     union: Option<UnionBlocks>,
     /// The `unionr8` shape's, `None` for the others.
     r8: Option<R8Blocks>,
 }
 
-/// The union shape's blocks, made before the round's first token: activation
-/// block `o` holds the `rows` columns `(o + i) % N_X` a token reads at offset
-/// `o`, then the call's scratch (made for `rows` columns), its `embd × rows`
-/// output and the rows' list entries.
+/// The rows' activation blocks of a union shape: block `o` holds the `rows`
+/// columns `(o + i) % N_X` a token reads at offset `o`.
+fn union_xs(xs: &[Tensor2], rows: usize, embd: usize) -> Vec<Tensor2> {
+    (0..N_X)
+        .map(|o| {
+            let mut data = Vec::with_capacity(embd * rows);
+            for i in 0..rows {
+                data.extend_from_slice(&xs[(o + i) % N_X].data);
+            }
+            Tensor2::from_vec(embd, rows, data)
+        })
+        .collect()
+}
+
+/// The `union5` shape's blocks, made before the round's first token: the
+/// rows' activation blocks ([`union_xs`]), then the call's scratch (made for
+/// `rows` columns), its `embd × rows` output and the rows' list entries.
 struct UnionBlocks {
     xs: Vec<Tensor2>,
     scratch: UnionScratch,
@@ -563,17 +596,8 @@ struct UnionBlocks {
 
 impl UnionBlocks {
     fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize) -> Result<UnionBlocks, ModelError> {
-        let xs = (0..N_X)
-            .map(|o| {
-                let mut data = Vec::with_capacity(embd * rows);
-                for i in 0..rows {
-                    data.extend_from_slice(&xs[(o + i) % N_X].data);
-                }
-                Tensor2::from_vec(embd, rows, data)
-            })
-            .collect();
         Ok(UnionBlocks {
-            xs,
+            xs: union_xs(xs, rows, embd),
             scratch: UnionScratch::new(embd, ff, rows)?,
             out: vec![0.0; embd * rows],
             lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
@@ -596,17 +620,37 @@ impl Blocks {
             gu: take(n_gate, 2 * slots),
             down: take(n_down, slots),
             par: take(n_gate, slots),
+            chunks: None,
             union: None,
             r8: None,
         })
     }
 }
 
-/// The union shape: one `HostLayer::experts_union_into` over the token's
+/// Row `i` of `lists` listing its `n_host` slots of `slots` at weight
+/// `1 / n_host`, as every union shape lists them.
+fn fill_lists(
+    lists: &mut [[(u32, f32); EXPERTS_INTO_MAX]],
+    l: &Layer<'_>,
+    slots: &[usize],
+    n_host: usize,
+) -> Result<(), BenchError> {
+    let w = 1.0 / n_host as f32;
+    for (row, run) in lists.iter_mut().zip(slots.chunks_exact(n_host)) {
+        for (entry, &s) in row.iter_mut().zip(run) {
+            let id = u32::try_from(l.experts[s].id)
+                .map_err(|_| format!("expert {} past u32", l.experts[s].id))?;
+            *entry = (id, w);
+        }
+    }
+    Ok(())
+}
+
+/// The `union5` shape: one `HostLayer::experts_union_into` over the token's
 /// rows, row `i` listing its `n_host` slots' experts at weight `1 / n_host`.
 /// Tallied whole, under the bytes of the layer's distinct experts.
-#[allow(clippy::too_many_arguments)]
-fn union_layer(
+#[allow(clippy::too_many_arguments)] // one call's whole input: the layer three ways, its lists' parts, the blocks and the tally
+fn union5_layer(
     host: &HostLayer,
     split: &Split,
     l: &Layer<'_>,
@@ -616,16 +660,33 @@ fn union_layer(
     u: &mut UnionBlocks,
     x: usize,
     tally: &mut Tally,
-) -> Result<(), ModelError> {
-    let w = 1.0 / n_host as f32;
-    for (row, run) in u.lists.iter_mut().zip(slots.chunks_exact(n_host)) {
-        for (entry, &s) in row.iter_mut().zip(run) {
-            *entry = (l.experts[s].id as u32, w);
-        }
-    }
+) -> Result<(), BenchError> {
+    fill_lists(&mut u.lists, l, slots, n_host)?;
     let lists: Vec<&[(u32, f32)]> = u.lists.iter().map(|r| &r[..n_host]).collect();
     let t0 = Instant::now();
     host.experts_union_into(split, &u.xs[x], &lists, &mut u.out, &mut u.scratch)?;
+    tally.add("union5", distinct as u64 * l.expert_bytes(), t0);
+    Ok(())
+}
+
+/// The `union` shape: [`union_chunks_call`] over the token's rows, row `i`
+/// listing its `n_host` slots' experts at weight `1 / n_host`. Tallied whole,
+/// under the bytes of the layer's distinct experts.
+#[allow(clippy::too_many_arguments)] // one call's whole input: the layer three ways, its lists' parts, the blocks and the tally
+fn union_layer(
+    host: &HostLayer,
+    split: &Split,
+    l: &Layer<'_>,
+    slots: &[usize],
+    n_host: usize,
+    distinct: usize,
+    u: &mut ChunkBlocks,
+    x: usize,
+    tally: &mut Tally,
+) -> Result<(), BenchError> {
+    fill_lists(&mut u.lists, l, slots, n_host)?;
+    let t0 = Instant::now();
+    union_chunks_call(host, split, l, x, n_host, u)?;
     tally.add("union", distinct as u64 * l.expert_bytes(), t0);
     Ok(())
 }
@@ -702,24 +763,11 @@ impl<T> Cells<T> {
 
 // SAFETY: the pointer crosses into one pool dispatch only, which ends before
 // its owner is touched again, and the construction sites partition the cells
-// among the participants.
-unsafe impl<T> Send for Cells<T> {}
+// among the participants; a `T` written on one thread and read on another
+// must be `Send`.
+unsafe impl<T: Send> Send for Cells<T> {}
 // SAFETY: as for `Send` — no cell is written by two participants.
-unsafe impl<T> Sync for Cells<T> {}
-
-/// `Tensor2::set_cols`, private to `model`: `ne1` columns inside the block's
-/// capacity, without a take; a narrower block keeps its storage.
-fn narrow(t: &mut Tensor2, ne1: usize) {
-    let n = t.ne0 * ne1;
-    assert!(
-        n <= t.data.capacity(),
-        "narrow: {ne1} columns of {} past the block's capacity {}",
-        t.ne0,
-        t.data.capacity()
-    );
-    t.data.resize(n, 0.0);
-    t.ne1 = ne1;
-}
+unsafe impl<T: Send> Sync for Cells<T> {}
 
 /// A `unionr8` call's plan, the union call's: the distinct experts in
 /// ascending id with their working-set slots, and per expert the columns that
@@ -807,7 +855,8 @@ impl R8Plan {
 /// The `unionr8` shape's blocks, made before the round's first token: the
 /// union shape's activation blocks, the call's quantized columns, one
 /// chunk's gate, up and combine blocks, a down block per distinct expert,
-/// the output and the rows' lists.
+/// the output and the rows' lists, and the units the gate/up dispatch hands
+/// out a claim (the arm's `b<B>`).
 struct R8Blocks {
     xs: Vec<Tensor2>,
     xq: Vec<u8>,
@@ -817,21 +866,21 @@ struct R8Blocks {
     out: Vec<f32>,
     plan: R8Plan,
     lists: Vec<[(u32, f32); EXPERTS_INTO_MAX]>,
+    claim_block: usize,
 }
 
 impl R8Blocks {
-    /// Blocks for calls over `rows` columns and at most `distinct` experts.
-    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize, distinct: usize) -> R8Blocks {
+    /// Blocks for calls over `rows` columns and at most `distinct` experts,
+    /// `claim_block` units a claim.
+    fn new(
+        xs: &[Tensor2],
+        (rows, embd, ff): (usize, usize, usize),
+        distinct: usize,
+        claim_block: usize,
+    ) -> R8Blocks {
         R8Blocks {
-            xs: (0..N_X)
-                .map(|o| {
-                    let mut data = Vec::with_capacity(embd * rows);
-                    for i in 0..rows {
-                        data.extend_from_slice(&xs[(o + i) % N_X].data);
-                    }
-                    Tensor2::from_vec(embd, rows, data)
-                })
-                .collect(),
+            claim_block,
+            xs: union_xs(xs, rows, embd),
             xq: vec![0u8; rows * qdot::col_bytes(GgmlType::Q3_K, embd)],
             gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, rows)),
             pars: std::array::from_fn(|_| Tensor2::zeros(ff, rows)),
@@ -841,6 +890,217 @@ impl R8Blocks {
             lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
         }
     }
+}
+
+/// The `union` shape's blocks, made before the round's first token: the rows'
+/// activation blocks ([`union_xs`]), one chunk's gate, up, combine and down
+/// blocks of `rows` columns, the store of every chunk's downs but the last,
+/// `x` quantized, the plan, the output and the rows' lists.
+struct ChunkBlocks {
+    xs: Vec<Tensor2>,
+    gate_up: [Tensor2; 2 * UNION_CHUNK],
+    pars: [Tensor2; UNION_CHUNK],
+    downs: [Tensor2; UNION_CHUNK],
+    store: Vec<f32>,
+    xq: QuantizedCols,
+    plan: R8Plan,
+    out: Vec<f32>,
+    lists: Vec<[(u32, f32); EXPERTS_INTO_MAX]>,
+}
+
+impl ChunkBlocks {
+    /// Blocks for calls over `rows` columns.
+    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize) -> ChunkBlocks {
+        ChunkBlocks {
+            xs: union_xs(xs, rows, embd),
+            gate_up: std::array::from_fn(|_| Tensor2::zeros(ff, rows)),
+            pars: std::array::from_fn(|_| Tensor2::zeros(ff, rows)),
+            downs: std::array::from_fn(|_| Tensor2::zeros(embd, rows)),
+            store: vec![0.0; embd * EXPERTS_INTO_MAX * rows],
+            xq: QuantizedCols::new(),
+            plan: R8Plan::with_room(rows),
+            out: vec![0.0; embd * rows],
+            lists: vec![[(0, 0.0); EXPERTS_INTO_MAX]; rows],
+        }
+    }
+}
+
+/// The chunked union flow over activation block `xi` and the blocks' lists
+/// (their first `n_host` entries): the distinct experts in ascending id in
+/// chunks of [`UNION_CHUNK`], per chunk one `ops::matmul_q_group_cols_into`
+/// for its gates and ups over the columns that list each (reading `x`
+/// quantized once, over the pool, when the call is wider than
+/// `ops::DEFER_MAX_COLS` columns) and one for its downs over the combines
+/// (the layer's clamp), each chunk's downs but the last's copied to the store
+/// ([`stash_downs`]), then each column's sum from zero in its list order. The
+/// flow the host tier ran before its five-dispatch union, rebuilt from the
+/// group entry: its output is `HostLayer::experts_union_into`'s, bit for
+/// bit. Allocates nothing.
+fn union_chunks_call(
+    host: &HostLayer,
+    split: &Split,
+    l: &Layer<'_>,
+    xi: usize,
+    n_host: usize,
+    u: &mut ChunkBlocks,
+) -> Result<(), BenchError> {
+    let ChunkBlocks {
+        xs,
+        gate_up,
+        pars,
+        downs,
+        store,
+        xq,
+        plan,
+        out,
+        lists,
+    } = u;
+    let x = xs[xi].view();
+    let (embd, k) = (x.ne0(), x.ne1());
+    plan.build(lists, n_host, l)?;
+    let plan = &*plan;
+    let stacks = host.stacks();
+    let limit = host.swiglu_limit();
+    let resolve = |d: usize| -> Result<[Weight<'_>; 3], ModelError> {
+        let e = plan.ids[d] as usize;
+        Ok([
+            stacks[GATE].expert(split, e)?,
+            stacks[UP].expert(split, e)?,
+            stacks[DOWN].expert(split, e)?,
+        ])
+    };
+    let mut filled = false;
+    if k > DEFER_MAX_COLS && plan.n() > 0 {
+        filled = xq.fill(resolve(0)?[GATE].ty(), x, k);
+    }
+    let xq: Option<&QuantizedCols> = filled.then_some(&*xq);
+    let n_chunks = plan.n().div_ceil(UNION_CHUNK);
+    let per = if n_chunks == 0 {
+        0
+    } else {
+        plan.n().div_ceil(n_chunks)
+    };
+    for c in 0..n_chunks {
+        let (a, b) = (c * per, ((c + 1) * per).min(plan.n()));
+        let n = b - a;
+        // The unused tails keep the chunk's first expert's gate; only the
+        // first n (2n) are passed.
+        let first = resolve(a)?[GATE];
+        let mut gu = [first; 2 * UNION_CHUNK];
+        let mut down = [first; UNION_CHUNK];
+        let mut srcs: [GroupInput<'_>; 2 * UNION_CHUNK] =
+            [GroupInput::Cols(x, &[]); 2 * UNION_CHUNK];
+        for i in 0..n {
+            let [g, up, dw] = resolve(a + i)?;
+            (gu[2 * i], gu[2 * i + 1], down[i]) = (g, up, dw);
+            let cols = plan.cols(a + i);
+            let src = |w: &Weight<'_>| match xq {
+                Some(q) if q.serves(w.ty(), w.k()) => GroupInput::Quantized(x, q, cols),
+                _ => GroupInput::Cols(x, cols),
+            };
+            srcs[2 * i] = src(&g);
+            srcs[2 * i + 1] = src(&up);
+            gate_up[2 * i].set_cols(cols.len());
+            gate_up[2 * i + 1].set_cols(cols.len());
+            pars[i].set_cols(cols.len());
+            downs[i].set_cols(cols.len());
+        }
+        matmul_q_group_cols_into(
+            "host_gate_up",
+            &gu[..2 * n],
+            &srcs[..2 * n],
+            &mut gate_up[..2 * n],
+            &mut [],
+        )?;
+        let combines: [GroupInput<'_>; UNION_CHUNK] = std::array::from_fn(|i| {
+            if i < n {
+                GroupInput::SwigluClamp(&gate_up[2 * i], &gate_up[2 * i + 1], limit)
+            } else {
+                GroupInput::Cols(x, &[])
+            }
+        });
+        matmul_q_group_cols_into(
+            "host_down",
+            &down[..n],
+            &combines[..n],
+            &mut downs[..n],
+            &mut pars[..n],
+        )?;
+        if c + 1 < n_chunks {
+            stash_downs(&downs[..n], &plan.off[a..=b], embd, store);
+        }
+    }
+    let (downs, store, lists) = (&*downs, &*store, &*lists);
+    let last = n_chunks.saturating_sub(1) * per;
+    // Column `j`'s weighted sum into `o`, from zero in the order of its list:
+    // the last chunk's downs from their blocks, the others' from the store.
+    let sum_col = |j: usize, o: &mut [f32]| {
+        o.fill(0.0);
+        for &(e, w) in &lists[j][..n_host] {
+            let d = plan.index_of(e);
+            let t = plan
+                .cols(d)
+                .binary_search(&j)
+                .expect("a listing column is in its expert's columns");
+            let col = if d >= last {
+                downs[d - last].col(t)
+            } else {
+                let q = plan.off[d] + t;
+                &store[q * embd..(q + 1) * embd]
+            };
+            for (o, &dv) in o.iter_mut().zip(col) {
+                *o += w * dv;
+            }
+        }
+    };
+    if k <= UNION_INLINE_COLS {
+        for (j, o) in out.chunks_exact_mut(embd).enumerate() {
+            sum_col(j, o);
+        }
+    } else {
+        let dst = Cells(out.as_mut_ptr());
+        // SAFETY (construction site): `out` holds `k · embd` values, borrowed
+        // for the whole dispatch; each participant writes only the columns of
+        // its own chunk of `0..k`, the chunks partition them, and the join
+        // publishes the writes.
+        threads::pool().for_each_chunk(k, |cols| {
+            for j in cols {
+                // SAFETY: column `j` is in this participant's chunk — see the construction site.
+                let o = unsafe { std::slice::from_raw_parts_mut(dst.ptr().add(j * embd), embd) };
+                sum_col(j, o);
+            }
+        });
+    }
+    Ok(())
+}
+
+/// A chunk's down columns into the store before the next chunk reuses their
+/// blocks: block `i`'s columns land at store columns `off[i]..off[i + 1]`
+/// (`off` is the plan's offsets of the chunk's experts, one past its last).
+/// Columns up to [`UNION_INLINE_COLS`] copy on the caller, more split across
+/// the pool.
+fn stash_downs(blocks: &[Tensor2], off: &[usize], embd: usize, store: &mut [f32]) {
+    let (q0, q1) = (off[0], off[off.len() - 1]);
+    if q1 - q0 <= UNION_INLINE_COLS {
+        for (blk, w) in blocks.iter().zip(off.windows(2)) {
+            store[w[0] * embd..w[1] * embd].copy_from_slice(&blk.data[..(w[1] - w[0]) * embd]);
+        }
+        return;
+    }
+    let dst = Cells(store.as_mut_ptr());
+    // SAFETY (construction site): each participant writes only store columns
+    // in its own chunk of `q0..q1`; the chunks partition them, and the join
+    // publishes the writes.
+    threads::pool().for_each_chunk(q1 - q0, |qs| {
+        for q in q0 + qs.start..q0 + qs.end {
+            // The block whose range holds `q`: `off` ascends.
+            let i = off.partition_point(|&o| o <= q) - 1;
+            let col = blocks[i].col(q - off[i]);
+            // SAFETY: store column `q` is in this participant's chunk — see the construction site.
+            let cell = unsafe { std::slice::from_raw_parts_mut(dst.ptr().add(q * embd), embd) };
+            cell.copy_from_slice(col);
+        }
+    });
 }
 
 /// A call's activation columns quantized as claims on the first gate-and-up
@@ -918,7 +1178,7 @@ enum GateUpTile<'a> {
 /// rows, row `i` listing its `n_host` slots' experts at weight `1 / n_host`
 /// (see [`union_r8_call`]). Tallied whole, under the bytes of the layer's
 /// distinct experts.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // one call's whole input: the layer three ways, its tile, its lists' parts, the blocks and the tally
 fn union_r8_layer(
     host: &HostLayer,
     split: &Split,
@@ -931,12 +1191,7 @@ fn union_r8_layer(
     x: usize,
     tally: &mut Tally,
 ) -> Result<(), BenchError> {
-    let w = 1.0 / n_host as f32;
-    for (row, run) in u.lists.iter_mut().zip(slots.chunks_exact(n_host)) {
-        for (entry, &s) in row.iter_mut().zip(run) {
-            *entry = (l.experts[s].id as u32, w);
-        }
-    }
+    fill_lists(&mut u.lists, l, slots, n_host)?;
     let t0 = Instant::now();
     union_r8_call(host, split, l, tile, x, n_host, u)?;
     let kind = match tile {
@@ -973,6 +1228,7 @@ fn union_r8_call(
         out,
         plan,
         lists,
+        claim_block,
     } = u;
     let x = &xs[xi];
     let (embd, k) = (x.ne0, x.ne1);
@@ -1015,10 +1271,10 @@ fn union_r8_call(
         let n = b - a;
         for i in 0..n {
             let m = plan.cols(a + i).len();
-            narrow(&mut gate_up[2 * i], m);
-            narrow(&mut gate_up[2 * i + 1], m);
-            narrow(&mut pars[i], m);
-            narrow(&mut downs[a + i], m);
+            gate_up[2 * i].set_cols(m);
+            gate_up[2 * i + 1].set_cols(m);
+            pars[i].set_cols(m);
+            downs[a + i].set_cols(m);
         }
         let claim = (narrow_call && ch == 0).then_some(&claims);
         let empty: &[u8] = &[];
@@ -1027,7 +1283,24 @@ fn union_r8_call(
             let s = plan.slots[a + i];
             *m = match tile {
                 GateUpTile::RowLane(r8) => [r8[s][0].as_slice(), r8[s][1].as_slice()],
-                GateUpTile::Column => [l.weight(s, GATE).bytes(), l.weight(s, UP).bytes()],
+                GateUpTile::Column => {
+                    let [g, up] = [GATE, UP].map(|m| l.weight(s, m));
+                    for (w, m) in [(g, GATE), (up, UP)] {
+                        if w.ty() != GgmlType::Q3_K || w.k() != embd {
+                            return Err(format!(
+                                "unionq: layer {} expert {} {} is {:?} over {} values; the column \
+                                 tile takes Q3_K over {embd}",
+                                l.index,
+                                plan.ids[a + i],
+                                MATRIX[m],
+                                w.ty(),
+                                w.k()
+                            )
+                            .into());
+                        }
+                    }
+                    [g.bytes(), up.bytes()]
+                }
             };
         }
         let row_lane = matches!(tile, GateUpTile::RowLane(_));
@@ -1038,7 +1311,7 @@ fn union_r8_call(
             x,
             xq,
             cb,
-            claim,
+            (claim, *claim_block),
             a,
             &mut gate_up[..2 * n],
         )?;
@@ -1101,16 +1374,18 @@ fn union_r8_call(
 
 /// One chunk's gates and ups over the pool: unit `u` is distinct expert
 /// `a + u / groups`'s 8-row group `u % groups`, gate then up, claimed in
-/// order off one counter; `mats[i]` holds the chunk's expert `i`'s gate and
-/// up, in the row-lane layout (`row_lane`: each run of up to
-/// `qdot::TILE_COLS` of the expert's columns goes to `qdot::dot_q3k_r8_cols`
-/// once for the eight rows) or as the file's rows (each of the eight rows
-/// through `qdot::dot_row_cols` per run, as the union call's row dispatch
-/// does). The values land in `outs[2i]` (gate) and `outs[2i + 1]` (up),
-/// already narrowed to the expert's columns. With `claims`, the participants
-/// first quantize `x` into `xq`; without, `xq` already holds it. A kernel
-/// error stops the unit walk and is returned.
-#[allow(clippy::too_many_arguments)]
+/// order off one counter `block` units at a time; `mats[i]` holds the
+/// chunk's expert `i`'s gate and up, in the row-lane layout (`row_lane`: each
+/// run of up to `qdot::TILE_COLS` of the expert's columns goes to
+/// `qdot::dot_q3k_r8_cols` once for the eight rows) or as the file's Q3_K
+/// rows over `x`'s width (each of the eight rows through `qdot::dot_row_cols`
+/// per run, as the union call's row dispatch does). The values land in
+/// `outs[2i]` (gate) and `outs[2i + 1]` (up), already narrowed to the
+/// expert's columns. With `claims`, the participants first quantize `x` into
+/// `xq`; without, `xq` already holds it. A chunk of no expert, rows that are
+/// not whole groups of eight and a matrix of other bytes than its rows are
+/// named errors; a kernel error stops the unit walk and is returned.
+#[allow(clippy::too_many_arguments)] // one chunk's whole dispatch: plan and offset, the weights and their layout, x and its bytes, the claims and their block, the outputs
 fn r8_gate_up(
     plan: &R8Plan,
     mats: &[[&[u8]; 2]],
@@ -1118,15 +1393,47 @@ fn r8_gate_up(
     x: &Tensor2,
     xq: &mut [u8],
     cb: usize,
-    claims: Option<&QuantClaims>,
+    (claims, block): (Option<&QuantClaims>, usize),
     a: usize,
     outs: &mut [Tensor2],
 ) -> Result<(), BenchError> {
     const R8: usize = qdot::Q3K_R8_ROWS;
     let embd = x.ne0;
-    let Some(ff) = outs.first().map(|t| t.ne0) else {
-        return Ok(());
-    };
+    let ff = outs
+        .first()
+        .map(|t| t.ne0)
+        .ok_or("r8_gate_up: a chunk of no expert")?;
+    if !ff.is_multiple_of(R8) {
+        return Err(format!("r8_gate_up: {ff} rows are not whole groups of {R8}").into());
+    }
+    let rb = mats[0][0].len() / ff;
+    if let Some((i, m)) = (0..mats.len())
+        .flat_map(|i| [(i, 0), (i, 1)])
+        .find(|&(i, m)| mats[i][m].len() != ff * rb)
+    {
+        return Err(format!(
+            "r8_gate_up: expert {i}'s {} is {} bytes, not {ff} rows of {rb}",
+            MATRIX[m],
+            mats[i][m].len()
+        )
+        .into());
+    }
+    // The raw writes below rest on these two: a gate and an up block per
+    // expert, each narrowed to its expert's columns.
+    assert_eq!(
+        outs.len(),
+        2 * mats.len(),
+        "r8_gate_up: a gate and an up block per expert"
+    );
+    for (p, t) in outs.iter().enumerate() {
+        let m = plan.cols(a + p / 2).len();
+        assert_eq!(
+            (t.ne0, t.ne1, t.data.len()),
+            (ff, m, ff * m),
+            "r8_gate_up: block {p} holds its expert's columns"
+        );
+    }
+    assert!(block > 0, "r8_gate_up: a claim takes at least one unit");
     let groups = ff / R8;
     let units = mats.len() * groups;
     let next = AtomicUsize::new(0);
@@ -1161,50 +1468,29 @@ fn r8_gate_up(
         // SAFETY: every column is written and published — see the construction site.
         let xq = unsafe { std::slice::from_raw_parts(xqp.ptr().cast_const(), xq_len) };
         while !stop.load(Ordering::Relaxed) {
-            let u = next.fetch_add(1, Ordering::Relaxed);
-            if u >= units {
+            let u0 = next.fetch_add(block, Ordering::Relaxed);
+            if u0 >= units {
                 return;
             }
-            let (i, g) = (u / groups, u % groups);
-            let cols = plan.cols(a + i);
-            for (m, w) in mats[i].iter().enumerate() {
-                let out = dst[2 * i + m];
-                for (t0, run) in (0..)
-                    .step_by(qdot::TILE_COLS)
-                    .zip(cols.chunks(qdot::TILE_COLS))
-                {
-                    let acols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|t| {
-                        let c = run[t.min(run.len() - 1)];
-                        &xq[c * cb..(c + 1) * cb]
-                    });
-                    let acols = &acols[..run.len()];
-                    if row_lane {
-                        let gb = w.len() / groups;
-                        let mut v = [[0.0f32; R8]; qdot::TILE_COLS];
-                        let r = qdot::dot_q3k_r8_cols(
-                            &w[g * gb..(g + 1) * gb],
-                            acols,
-                            embd,
-                            &mut v[..run.len()],
-                        );
-                        if let Err(e) = r {
-                            return failed(e);
-                        }
-                        for (t, vals) in v[..run.len()].iter().enumerate() {
-                            let at = (t0 + t) * ff + R8 * g;
-                            // SAFETY: rows 8g..8g + 8 of this column belong to unit `u` alone — see the construction site.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(vals.as_ptr(), out.ptr().add(at), R8);
-                            }
-                        }
-                    } else {
-                        let rb = w.len() / ff;
-                        for row in R8 * g..R8 * (g + 1) {
-                            let mut v = [0.0f32; qdot::TILE_COLS];
-                            let src = &w[row * rb..(row + 1) * rb];
-                            let r = qdot::dot_row_cols(
-                                GgmlType::Q3_K,
-                                src,
+            for u in u0..units.min(u0 + block) {
+                let (i, g) = (u / groups, u % groups);
+                let cols = plan.cols(a + i);
+                for (m, w) in mats[i].iter().enumerate() {
+                    let out = dst[2 * i + m];
+                    for (t0, run) in (0..)
+                        .step_by(qdot::TILE_COLS)
+                        .zip(cols.chunks(qdot::TILE_COLS))
+                    {
+                        let acols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|t| {
+                            let c = run[t.min(run.len() - 1)];
+                            &xq[c * cb..(c + 1) * cb]
+                        });
+                        let acols = &acols[..run.len()];
+                        if row_lane {
+                            let gb = w.len() / groups;
+                            let mut v = [[0.0f32; R8]; qdot::TILE_COLS];
+                            let r = qdot::dot_q3k_r8_cols(
+                                &w[g * gb..(g + 1) * gb],
                                 acols,
                                 embd,
                                 &mut v[..run.len()],
@@ -1212,9 +1498,35 @@ fn r8_gate_up(
                             if let Err(e) = r {
                                 return failed(e);
                             }
-                            for (t, &val) in v[..run.len()].iter().enumerate() {
-                                // SAFETY: row `row` of this column belongs to unit `u` alone — see the construction site.
-                                unsafe { out.ptr().add((t0 + t) * ff + row).write(val) };
+                            for (t, vals) in v[..run.len()].iter().enumerate() {
+                                let at = (t0 + t) * ff + R8 * g;
+                                // SAFETY: rows 8g..8g + 8 of this column belong to unit `u` alone — see the construction site.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        vals.as_ptr(),
+                                        out.ptr().add(at),
+                                        R8,
+                                    );
+                                }
+                            }
+                        } else {
+                            for row in R8 * g..R8 * (g + 1) {
+                                let mut v = [0.0f32; qdot::TILE_COLS];
+                                let src = &w[row * rb..(row + 1) * rb];
+                                let r = qdot::dot_row_cols(
+                                    GgmlType::Q3_K,
+                                    src,
+                                    acols,
+                                    embd,
+                                    &mut v[..run.len()],
+                                );
+                                if let Err(e) = r {
+                                    return failed(e);
+                                }
+                                for (t, &val) in v[..run.len()].iter().enumerate() {
+                                    // SAFETY: row `row` of this column belongs to unit `u` alone — see the construction site.
+                                    unsafe { out.ptr().add((t0 + t) * ff + row).write(val) };
+                                }
                             }
                         }
                     }
@@ -2103,13 +2415,12 @@ fn check_swiglu(
     c.record(site, &line, same && close);
 }
 
-/// The check of one layer for one token: both shapes' outputs bit-equal,
-/// then every expert's gate, up, combine and down.
-/// The union shape against the engine shape on layer `l`: two rows over
+/// The union shapes against the engine shape on layer `l`: two rows over
 /// `xs[li % N_X]` and the next column, row 0 listing `slots`, row 1 the same
 /// set shifted by one with one working-set expert neither lists. Each row's
-/// output must equal the list-order sum from zero of the engine shape's downs
-/// for that row, at weight `1 / n`, bit for bit.
+/// output of the `union` and the `union5` call must equal the list-order sum
+/// from zero of the engine shape's downs for that row, at weight `1 / n`, bit
+/// for bit.
 fn check_union(
     c: &mut Checks,
     l: &Layer<'_>,
@@ -2127,12 +2438,14 @@ fn check_union(
     rows.push(extra);
     let embd = xs[0].ne0;
     let ff = l.weight(0, GATE).n();
-    let mut u = UnionBlocks::new(xs, 2, embd, ff)?;
+    let mut u = ChunkBlocks::new(xs, 2, embd, ff);
+    let mut u5 = UnionBlocks::new(xs, 2, embd, ff)?;
     let x0 = l.index % N_X;
     let mut tally = Tally::default();
     union_layer(host, split, l, &rows, n, n + 1, &mut u, x0, &mut tally)?;
+    union5_layer(host, split, l, &rows, n, n + 1, &mut u5, x0, &mut tally)?;
     let w = 1.0 / n as f32;
-    let mut same = true;
+    let (mut same, mut same5) = (true, true);
     for (i, run) in rows.chunks_exact(n).enumerate() {
         let mut b = Blocks::new(std::slice::from_ref(l), n)?;
         engine_layer(l, run, &xs[(x0 + i) % N_X], &mut b, &mut tally)?;
@@ -2143,16 +2456,21 @@ fn check_union(
             }
         }
         same &= bits_equal(&u.out[i * embd..(i + 1) * embd], &want);
+        same5 &= bits_equal(&u5.out[i * embd..(i + 1) * embd], &want);
     }
-    let line = format!(
-        "check layer={} shape=union rows=2 experts={n} distinct={} outputs_bits_equal_engine_sum={same}",
-        l.index,
-        n + 1
-    );
-    c.record(format!("layer {} union", l.index), &line, same);
+    for (shape, same) in [("union", same), ("union5", same5)] {
+        let line = format!(
+            "check layer={} shape={shape} rows=2 experts={n} distinct={} outputs_bits_equal_engine_sum={same}",
+            l.index,
+            n + 1
+        );
+        c.record(format!("layer {} {shape}", l.index), &line, same);
+    }
     Ok(())
 }
 
+/// The check of one layer for one token: both shapes' outputs bit-equal,
+/// then every expert's gate, up, combine and down.
 fn check_layer(
     c: &mut Checks,
     l: &Layer<'_>,
@@ -2193,9 +2511,9 @@ fn check_layer(
     Ok(())
 }
 
-/// The `unionr8` and `unionq` shapes against the union shape on layer `li`,
-/// bit for bit, for one token of `rows` rows walking a pool of `distinct`
-/// working-set slots, `n_host` each, as an arm's rows do.
+/// The `union5`, `unionr8` and `unionq` shapes against the union shape on
+/// layer `li`, bit for bit, for one token of `rows` rows walking a pool of
+/// `distinct` working-set slots, `n_host` each, as an arm's rows do.
 fn check_union_r8(
     c: &mut Checks,
     bench: &Bench<'_>,
@@ -2219,7 +2537,7 @@ fn check_union_r8(
     let slots: Vec<usize> = (0..rows * n_host).map(|i| pool[i % distinct_n]).collect();
     let x0 = li % N_X;
     let mut tally = Tally::default();
-    let mut u = UnionBlocks::new(&bench.xs, rows, embd, ff)?;
+    let mut u = ChunkBlocks::new(&bench.xs, rows, embd, ff);
     union_layer(
         host,
         bench.split,
@@ -2231,11 +2549,24 @@ fn check_union_r8(
         x0,
         &mut tally,
     )?;
+    let mut u5 = UnionBlocks::new(&bench.xs, rows, embd, ff)?;
+    union5_layer(
+        host,
+        bench.split,
+        l,
+        &slots,
+        n_host,
+        distinct_n,
+        &mut u5,
+        x0,
+        &mut tally,
+    )?;
+    let mut outs = vec![("union5", u5.out)];
     for (shape, tile) in [
         ("unionr8", GateUpTile::RowLane(r8)),
         ("unionq", GateUpTile::Column),
     ] {
-        let mut v = R8Blocks::new(&bench.xs, rows, embd, ff, distinct_n);
+        let mut v = R8Blocks::new(&bench.xs, (rows, embd, ff), distinct_n, 1);
         union_r8_layer(
             host,
             bench.split,
@@ -2248,7 +2579,10 @@ fn check_union_r8(
             x0,
             &mut tally,
         )?;
-        let same = bits_equal(&u.out, &v.out);
+        outs.push((shape, v.out));
+    }
+    for (shape, out) in outs {
+        let same = bits_equal(&u.out, &out);
         let line = format!(
             "check layer={} shape={shape} rows={rows} experts={n_host} distinct={distinct_n} \
              outputs_bits_equal_union={same}",
@@ -2263,15 +2597,16 @@ fn check_union_r8(
     Ok(())
 }
 
-/// Before any timing (every layer), and under `--check` (the checked
-/// layers): one token of every `unionr8` and `unionq` arm through its shape
-/// and the union shape, layer by layer over `layers`, whose outputs must be
-/// equal bit for bit; a mismatch is the named error.
+/// Before any timing (every layer), and under `--check` (the checked layers,
+/// or every layer for `--arms`): one token of every `union5`, `unionr8` and
+/// `unionq` arm through its shape and the union shape, layer by layer over
+/// `layers`, whose outputs must be equal bit for bit; a mismatch is the named
+/// error.
 fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<(), BenchError> {
     let embd = bench.xs.first().ok_or("no activation columns")?.ne0;
     for arm in arms
         .iter()
-        .filter(|a| matches!(a.shape, Shape::UnionR8 | Shape::UnionQ))
+        .filter(|a| matches!(a.shape, Shape::Union5 | Shape::UnionR8 | Shape::UnionQ))
     {
         let ids = bench.draw(*arm, 0, 0);
         let mut differ = Vec::new();
@@ -2280,12 +2615,11 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
             let host = bench
                 .hosts
                 .get(l)
-                .ok_or("no host layer for the unionr8 arm")?;
-            let tile = bench.gate_up_tile(arm.shape, l)?;
+                .ok_or("no host layer for the union arm")?;
             let ff = layer.weight(0, GATE).n();
             let x = l % N_X;
             let mut tally = Tally::default();
-            let mut u = UnionBlocks::new(&bench.xs, arm.rows, embd, ff)?;
+            let mut u = ChunkBlocks::new(&bench.xs, arm.rows, embd, ff);
             union_layer(
                 host,
                 bench.split,
@@ -2297,20 +2631,39 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
                 x,
                 &mut tally,
             )?;
-            let mut v = R8Blocks::new(&bench.xs, arm.rows, embd, ff, arm.union);
-            union_r8_layer(
-                host,
-                bench.split,
-                layer,
-                tile,
-                &ids[l],
-                arm.n_host,
-                arm.union,
-                &mut v,
-                x,
-                &mut tally,
-            )?;
-            if !bits_equal(&u.out, &v.out) {
+            let out = if arm.shape == Shape::Union5 {
+                let mut v = UnionBlocks::new(&bench.xs, arm.rows, embd, ff)?;
+                union5_layer(
+                    host,
+                    bench.split,
+                    layer,
+                    &ids[l],
+                    arm.n_host,
+                    arm.union,
+                    &mut v,
+                    x,
+                    &mut tally,
+                )?;
+                v.out
+            } else {
+                let tile = bench.gate_up_tile(arm.shape, l)?;
+                let mut v =
+                    R8Blocks::new(&bench.xs, (arm.rows, embd, ff), arm.union, arm.claim_block);
+                union_r8_layer(
+                    host,
+                    bench.split,
+                    layer,
+                    tile,
+                    &ids[l],
+                    arm.n_host,
+                    arm.union,
+                    &mut v,
+                    x,
+                    &mut tally,
+                )?;
+                v.out
+            };
+            if !bits_equal(&u.out, &out) {
                 differ.push(layer.index);
             }
         }
@@ -2387,9 +2740,13 @@ enum Shape {
     /// With `rows > 1`: one engine-shape call per row instead of one group
     /// over every row.
     EngineSep,
-    /// One union call per layer over every row: each distinct expert read
-    /// once, every column's weighted sum at the end.
+    /// One union call per layer over every row in the chunked flow
+    /// ([`union_chunks_call`]): each distinct expert read once, every
+    /// column's weighted sum at the end.
     Union,
+    /// The engine's union call ([`HostLayer::experts_union_into`]): the same
+    /// pass in five pool dispatches a layer.
+    Union5,
     /// The union call with gate and up through the row-lane Q3_K tile on
     /// the repacked working set.
     UnionR8,
@@ -2405,10 +2762,11 @@ enum Shape {
 }
 
 impl Shape {
-    const ALL: [Shape; 8] = [
+    const ALL: [Shape; 9] = [
         Shape::Engine,
         Shape::EngineSep,
         Shape::Union,
+        Shape::Union5,
         Shape::UnionR8,
         Shape::UnionQ,
         Shape::PerMatrix,
@@ -2421,6 +2779,7 @@ impl Shape {
             Shape::Engine => "engine",
             Shape::EngineSep => "engine-sep",
             Shape::Union => "union",
+            Shape::Union5 => "union5",
             Shape::UnionR8 => "unionr8",
             Shape::UnionQ => "unionq",
             Shape::PerMatrix => "per-matrix",
@@ -2436,7 +2795,15 @@ impl Shape {
 
     /// One union call per layer: each distinct expert read once.
     fn is_union(self) -> bool {
-        matches!(self, Shape::Union | Shape::UnionR8 | Shape::UnionQ)
+        matches!(
+            self,
+            Shape::Union | Shape::Union5 | Shape::UnionR8 | Shape::UnionQ
+        )
+    }
+
+    /// The gate/up dispatch hands out claimed units: the `b<B>` lever.
+    fn claims_units(self) -> bool {
+        matches!(self, Shape::UnionR8 | Shape::UnionQ)
     }
 }
 
@@ -2453,6 +2820,9 @@ struct Arm {
     /// Distinct experts per layer and token: `n_host * rows` for disjoint
     /// rows, else `round(ratio * n_host * rows)`.
     union: usize,
+    /// Units a claim of the gate/up dispatch takes (`b<B>`, the `unionr8` and
+    /// `unionq` shapes; 1 otherwise).
+    claim_block: usize,
 }
 
 impl Arm {
@@ -2461,13 +2831,27 @@ impl Arm {
     fn parse(s: &str, union: Option<f64>) -> Result<Arm, String> {
         let (name, n) = s.split_once(':').ok_or_else(|| {
             format!(
-                "arm {s:?}: want <engine|engine-sep|union|unionr8|unionq|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]]"
+                "arm {s:?}: want <engine|engine-sep|union|union5|unionr8|unionq|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]][b<B>]"
             )
         })?;
         let shape = Shape::ALL
             .into_iter()
             .find(|sh| sh.name() == name)
             .ok_or_else(|| format!("arm {s:?}: unknown shape {name:?}"))?;
+        let (n, claim_block) = match n.split_once('b') {
+            Some((n, b)) => {
+                let b = b.parse::<usize>().ok().filter(|&b| b > 0).ok_or_else(|| {
+                    format!("arm {s:?}: claim block {b:?} is not a positive count")
+                })?;
+                if !shape.claims_units() {
+                    return Err(format!(
+                        "arm {s:?}: b<B> is the unionr8 and unionq gate/up claim block"
+                    ));
+                }
+                (n, b)
+            }
+            None => (n, 1),
+        };
         let (n, rows, own) = match n.split_once('x') {
             Some((n, r)) => {
                 let (r, own) = match r.split_once('u') {
@@ -2527,15 +2911,21 @@ impl Arm {
             rows,
             ratio,
             union,
+            claim_block,
         })
     }
 
     fn label(self) -> String {
         let shape = self.shape.name();
+        let block = if self.claim_block == 1 {
+            String::new()
+        } else {
+            format!("b{}", self.claim_block)
+        };
         match (self.rows, self.ratio) {
-            (1, _) => format!("{shape}:{}", self.n_host),
-            (rows, None) => format!("{shape}:{}x{rows}", self.n_host),
-            (rows, Some(r)) => format!("{shape}:{}x{rows}u{r}", self.n_host),
+            (1, _) => format!("{shape}:{}{block}", self.n_host),
+            (rows, None) => format!("{shape}:{}x{rows}{block}", self.n_host),
+            (rows, Some(r)) => format!("{shape}:{}x{rows}u{r}{block}", self.n_host),
         }
     }
 
@@ -2561,11 +2951,15 @@ impl Arm {
             .sum()
     }
 
-    /// Pool dispatches one token of this arm issues, by construction.
+    /// Pool dispatches one token of this arm issues, by construction — for
+    /// the chunked union shapes their gate/up and down dispatches, a floor
+    /// (their fill, pre-pass, copy-aside and sum dispatches follow the plan).
     fn dispatches_per_token(self, layers: &[Layer<'_>]) -> usize {
         match self.shape {
             Shape::PerMatrix => 3 * self.n_host * layers.len(),
             Shape::EngineSep => ENGINE_DISPATCHES * self.rows * layers.len(),
+            Shape::Union5 if self.rows > DEFER_MAX_COLS => 5 * layers.len(),
+            Shape::Union5 => ENGINE_DISPATCHES * layers.len(),
             Shape::Union | Shape::UnionR8 | Shape::UnionQ => {
                 ENGINE_DISPATCHES * self.union.div_ceil(UNION_CHUNK) * layers.len()
             }
@@ -2583,19 +2977,25 @@ struct TimeOpts {
 }
 
 enum Mode {
-    Check,
+    /// `--check`, and the arms whose pre-timing check runs on every layer.
+    Check(Vec<Arm>),
     Time(TimeOpts),
 }
 
 fn parse_args(args: &[String]) -> Result<Mode, String> {
     let mut it = args.iter().map(String::as_str);
     match it.next() {
-        Some("--check") => {
-            if let Some(extra) = it.next() {
-                return Err(format!("--check takes no options, got {extra:?}"));
-            }
-            Ok(Mode::Check)
-        }
+        Some("--check") => match (it.next(), it.next(), it.next()) {
+            (None, _, _) => Ok(Mode::Check(Vec::new())),
+            (Some("--arms"), Some(arms), None) => Ok(Mode::Check(
+                arms.split(',')
+                    .map(|a| Arm::parse(a, None))
+                    .collect::<Result<_, _>>()?,
+            )),
+            (Some(extra), ..) => Err(format!(
+                "--check takes nothing or --arms A,B,..., got {extra:?}"
+            )),
+        },
         Some("--time") => {
             let mut opts = TimeOpts {
                 rounds: 3,
@@ -2671,7 +3071,8 @@ impl Bench<'_> {
                 .and_then(Option::as_ref)
                 .map(|r8| GateUpTile::RowLane(r8))
                 .ok_or_else(|| "unionr8 arm without the repacked working set".into()),
-            _ => Ok(GateUpTile::Column),
+            Shape::UnionQ => Ok(GateUpTile::Column),
+            other => Err(format!("the {} shape has no gate-and-up tile", other.name()).into()),
         }
     }
 
@@ -2723,10 +3124,18 @@ impl Bench<'_> {
                 }
                 Shape::Engine => engine_rows_layer(layer, slots, &xs(), b, tally)?,
                 Shape::Union => {
-                    let u = b.union.as_mut().ok_or("union arm without its blocks")?;
+                    let u = b.chunks.as_mut().ok_or("union arm without its blocks")?;
                     let host = self.hosts.get(l).ok_or("union arm without host layers")?;
                     let x = (t + l) % N_X;
                     union_layer(
+                        host, self.split, layer, slots, arm.n_host, arm.union, u, x, tally,
+                    )?;
+                }
+                Shape::Union5 => {
+                    let u = b.union.as_mut().ok_or("union5 arm without its blocks")?;
+                    let host = self.hosts.get(l).ok_or("union5 arm without host layers")?;
+                    let x = (t + l) % N_X;
+                    union5_layer(
                         host, self.split, layer, slots, arm.n_host, arm.union, u, x, tally,
                     )?;
                 }
@@ -2759,11 +3168,22 @@ impl Bench<'_> {
         if arm.shape.is_union() {
             let embd = self.xs.first().ok_or("no activation columns")?.ne0;
             let ff = self.layers.first().ok_or("no layers")?.weight(0, GATE).n();
-            if arm.shape == Shape::Union {
-                blocks.union = Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff)?);
-            } else {
+            match arm.shape {
+                Shape::Union => {
+                    blocks.chunks = Some(ChunkBlocks::new(&self.xs, arm.rows, embd, ff))
+                }
+                Shape::Union5 => {
+                    blocks.union = Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff)?);
+                }
                 // `unionr8` and `unionq` share the blocks.
-                blocks.r8 = Some(R8Blocks::new(&self.xs, arm.rows, embd, ff, arm.union));
+                _ => {
+                    blocks.r8 = Some(R8Blocks::new(
+                        &self.xs,
+                        (arm.rows, embd, ff),
+                        arm.union,
+                        arm.claim_block,
+                    ));
+                }
             }
         }
         let mut scratch = Tally::default();
@@ -2958,10 +3378,11 @@ fn run(mode: Mode) -> Result<(), BenchError> {
     let meta = Meta::read(&split)?;
     let layers = build_layers(&split, &meta)?;
     print_table(&path, &split, &meta, &layers);
-    let past_used = match &mode {
-        Mode::Time(opts) => opts.arms.iter().find(|a| a.n_host > meta.n_used).copied(),
-        Mode::Check => None,
+    let arms: &[Arm] = match &mode {
+        Mode::Time(opts) => &opts.arms,
+        Mode::Check(arms) => arms,
     };
+    let past_used = arms.iter().find(|a| a.n_host > meta.n_used).copied();
     if let Some(a) = past_used {
         return Err(format!(
             "arm {}: the file routes {} experts per token",
@@ -2992,12 +3413,12 @@ fn run(mode: Mode) -> Result<(), BenchError> {
     };
     // Repacked before the working set is paged in, as the copy above: the
     // anonymous memory it fills can evict page-cache pages.
-    let r8_layers = match &mode {
-        Mode::Check => covered_layers(&layers),
-        Mode::Time(o) if o.arms.iter().any(|a| a.shape == Shape::UnionR8) => {
-            (0..layers.len()).collect()
-        }
-        Mode::Time(_) => Vec::new(),
+    let r8_layers = if arms.iter().any(|a| a.shape == Shape::UnionR8) {
+        (0..layers.len()).collect()
+    } else if matches!(mode, Mode::Check(_)) {
+        covered_layers(&layers)
+    } else {
+        Vec::new()
     };
     let t0 = Instant::now();
     let r8 = repack_r8(&layers, &r8_layers)?;
@@ -3041,13 +3462,18 @@ fn run(mode: Mode) -> Result<(), BenchError> {
         sink: AtomicU64::new(0),
     };
     match mode {
-        Mode::Check => {
+        Mode::Check(arms) if arms.is_empty() => {
             check(&bench, meta.n_used, true)?;
             let arms = R8_CHECK_ARMS
                 .split(',')
                 .map(|a| Arm::parse(a, None))
                 .collect::<Result<Vec<_>, _>>()?;
             check_r8_arms(&bench, &arms, &covered_layers(&bench.layers))
+        }
+        Mode::Check(arms) => {
+            check(&bench, meta.n_used, true)?;
+            let every: Vec<usize> = (0..bench.layers.len()).collect();
+            check_r8_arms(&bench, &arms, &every)
         }
         Mode::Time(opts) => {
             let lease = std::env::var("BLOOMERY_HOST_LEASE").is_ok_and(|v| v == "1");

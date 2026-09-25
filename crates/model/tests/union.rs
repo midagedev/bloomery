@@ -16,6 +16,12 @@
 //! at a negative weight, so the case also carries a list whose order is
 //! neither the router's nor the union's, and an expert a list names twice.
 //!
+//! Every union call is also held to its pool dispatches, by the scratch's
+//! count (`UnionScratch::dispatches`) and by the pool's: five a call past
+//! `ops::DEFER_MAX_COLS` columns, two at or under it with the claims, four
+//! with the pre-pass, and a cut call its calls' — so a pass split back into
+//! dispatches of its own turns the gate red.
+//!
 //! The wide shape — a prefill ubatch — is held to the same contract at
 //! k = 16, 64 and 512 on two routed layers (one Q5_K down, one Q4_K down):
 //! synthetic lists over 32, 128 and all of the layer's experts, a hot expert
@@ -27,9 +33,9 @@
 //! spread of columns per expert a prefill ubatch has, so one chunk mixes
 //! experts of one tile run with experts of two or three, and most chunks'
 //! downs carry a combine wider than a claim takes. Every wide call quantizes
-//! `x` once for all its chunks, produces its wide chunks' combines in the
-//! pre-pass and cuts those chunks' lanes by the tile's cost; the k <= 8 cases
-//! above never do.
+//! `x` once, runs every expert's gate and up in one row dispatch, every
+//! combine in one pass and every down in one row dispatch, lanes cut by the
+//! tile's cost; the k <= 8 cases above claim their quantizations instead.
 //!
 //! The free entry `moe::experts_union_into` (one file, a `MoeBlockPlan`) is
 //! held to its own `experts_into` on V2-Lite's block 1 at k = 6, over seeded
@@ -47,14 +53,16 @@
 //! batches, and three with the last one 300 columns short. Its lists are a
 //! group tail's — each column's experts drawn from a skewed curve over the
 //! layer's, cut to the cold half in list order — so most experts carry a few
-//! columns spread over several batches and the one call chunks its experts
-//! unlike any batch call. Both run whole; a uniform routing of every column
-//! over the layer's experts, past the budget, and a routing of every column
-//! to one of four experts, under the budget but each expert past a batch's
-//! columns, run cut into batch calls and are counted
-//! (`UnionScratch::cut_calls`). The tail scratch's refusals (no
-//! batch or too many, a budget under one batch's worst or past its columns')
-//! join the refusals below.
+//! columns spread over several batches and the one call plans its experts
+//! unlike any batch call. Both run whole, and so does a routing of every
+//! column to one of four experts, each past a batch's columns; a uniform
+//! routing of every column over the layer's experts, past the budget, runs
+//! cut into batch calls and is counted (`UnionScratch::cut_calls`). The tail
+//! scratch's refusals (no batch or too many, a budget under one batch's
+//! worst or past its columns') join the refusals below.
+//!
+//! PIN(2026-09-26): the four-expert routing runs whole — the scratch's slabs
+//! are indexed by slot, so no expert's column count bounds a call.
 //!
 //! PIN(2026-09-25): removed — the "union past UNION_MAX" refusal: the scratch
 //! keeps down columns per listed slot, so no distinct-expert bound exists and
@@ -70,7 +78,7 @@ use gguf::Split;
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
 use model::moe::{
-    EXPERTS_INTO_MAX, HostLayer, HostScratch, UNION_BATCH_SLOTS, UNION_CHUNK, UNION_MAX_COLS,
+    EXPERTS_INTO_MAX, HostLayer, HostScratch, UNION_BATCH_SLOTS, UNION_MAX_COLS,
     UNION_TAIL_MAX_GROUPS, UnionScratch,
 };
 use model::ops::{self, Tensor2, Tensor2View};
@@ -126,6 +134,45 @@ impl Case {
     fn slots(&self) -> usize {
         self.lists.iter().map(Vec::len).sum()
     }
+}
+
+/// The pool dispatches one union call of `k` columns over `slots` listed
+/// slots issues under deferral arm `defer`: five past `ops::DEFER_MAX_COLS`
+/// columns, two at or under it with the quantizations claimed, four with the
+/// pre-pass, none when no slot is listed.
+fn call_dispatches(k: usize, slots: usize, defer: bool) -> u64 {
+    match (slots, k > ops::DEFER_MAX_COLS, defer) {
+        (0, _, _) => 0,
+        (_, true, _) => 5,
+        (_, false, true) => 2,
+        (_, false, false) => 4,
+    }
+}
+
+/// `call` through `us`, and the pool dispatches it issued by the scratch's
+/// count and by the pool's (`None` with one pool thread, which dispatches
+/// nothing).
+fn dispatched<R>(
+    us: &mut UnionScratch,
+    call: impl FnOnce(&mut UnionScratch) -> R,
+) -> (R, u64, Option<u64>) {
+    let (s0, p0) = (us.dispatches(), threads::pool().stats().dispatches);
+    let r = call(us);
+    let pool = (threads::pool().threads() > 1).then(|| threads::pool().stats().dispatches - p0);
+    (r, us.dispatches() - s0, pool)
+}
+
+/// Whether a call's dispatches, by the scratch's count and the pool's, are
+/// `want`.
+fn dispatches_ok(scratch: u64, pool: Option<u64>, want: u64) -> bool {
+    scratch == want && pool.is_none_or(|p| p == want)
+}
+
+/// A call's dispatch counts for its line: the scratch's, the pool's, the
+/// contract's.
+fn dispatch_note(scratch: u64, pool: Option<u64>, want: u64) -> String {
+    let pool = pool.map_or_else(|| "-".to_string(), |p| p.to_string());
+    format!("dispatches={scratch} pool={pool} want={want}")
 }
 
 /// Cells of `got` whose bits differ from `want`, a length mismatch counting
@@ -323,6 +370,7 @@ fn hw_union_matches_per_column_v41() {
     // Per k: layers, columns, slots, distinct experts, differing cells.
     let mut tally = [[0usize; 5]; KS.len()];
     let mut failed: Vec<(usize, usize, &str)> = Vec::new();
+    let mut miscounted: Vec<(usize, usize, &str)> = Vec::new();
     let mut first_layer = None;
     for l in 0..hp.n_layer {
         let Some(layer) = host::layer(&split, &hp, l).unwrap_or_else(|e| panic!("layer {l}: {e}"))
@@ -358,10 +406,13 @@ fn hw_union_matches_per_column_v41() {
                 case.union()
             );
             let mut layer_diff = 0;
+            let mut counted = true;
             for (arm, on) in ARMS {
                 ops::set_defer_quant(Some(on));
                 let mut got = vec![f32::NAN; embd * k];
-                let r = layer.experts_union_into(&split, &case.x, &lists, &mut got, &mut us);
+                let (r, ds, dp) = dispatched(&mut us, |us| {
+                    layer.experts_union_into(&split, &case.x, &lists, &mut got, us)
+                });
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|e| panic!("layer {l} k {k} {arm}: {e}"));
                 let d = diff_cells(&got, &want);
@@ -373,13 +424,22 @@ fn hw_union_matches_per_column_v41() {
                         ) == 0
                     })
                     .count();
-                line += &format!(" {arm}: cols_bits_equal={cols_equal}/{k} diff_cells={d}");
+                let want_d = call_dispatches(k, case.slots(), on);
+                line += &format!(
+                    " {arm}: cols_bits_equal={cols_equal}/{k} diff_cells={d} {}",
+                    dispatch_note(ds, dp, want_d)
+                );
                 if d != 0 {
                     failed.push((l, k, arm));
                 }
+                if !dispatches_ok(ds, dp, want_d) {
+                    miscounted.push((l, k, arm));
+                    counted = false;
+                }
                 layer_diff += d;
             }
-            println!("{line} {}", if layer_diff == 0 { "PASS" } else { "FAIL" });
+            let pass = layer_diff == 0 && counted;
+            println!("{line} {}", if pass { "PASS" } else { "FAIL" });
             let t = &mut tally[ki];
             t[0] += 1;
             t[1] += k;
@@ -408,9 +468,16 @@ fn hw_union_matches_per_column_v41() {
         failed.len(),
         &failed[..failed.len().min(8)]
     );
+    assert!(
+        miscounted.is_empty(),
+        "{} (layer, k, arm) calls issued other than their dispatches, the first {:?}",
+        miscounted.len(),
+        &miscounted[..miscounted.len().min(8)]
+    );
     println!(
         "PASSED: union — experts_union_into equals experts_into column for column, bit for bit, \
-         on every routed layer at k = 1, 2, 3, 6 under both deferral arms; every refusal named"
+         on every routed layer at k = 1, 2, 3, 6 under both deferral arms, in 2 (claims) and 4 \
+         (pre-pass) pool dispatches a call; every refusal named"
     );
 }
 
@@ -577,6 +644,7 @@ fn hw_union_wide_matches_per_column_v41() {
     );
     let t0 = std::time::Instant::now();
     let mut failed: Vec<(usize, usize, &str)> = Vec::new();
+    let mut miscounted: Vec<(usize, usize, &str)> = Vec::new();
     let mut every_expert = true;
     let mut routed_spread = true;
     for (l, layer) in &picked {
@@ -598,20 +666,31 @@ fn hw_union_wide_matches_per_column_v41() {
                 every_expert &= case.union() == n_expert;
             }
             let mut diff = 0;
+            let mut counted = true;
             for (arm, on) in ARMS {
                 ops::set_defer_quant(Some(on));
                 let mut got = vec![f32::NAN; embd * k];
-                let r = layer.experts_union_into(&split, &case.x, &lists, &mut got, &mut us);
+                let (r, ds, dp) = dispatched(&mut us, |us| {
+                    layer.experts_union_into(&split, &case.x, &lists, &mut got, us)
+                });
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|e| panic!("layer {l} k {k} {arm}: {e}"));
                 let d = diff_cells(&got, &want);
-                line += &format!(" {arm}: diff_cells={d}");
+                let want_d = call_dispatches(k, case.slots(), on);
+                line += &format!(" {arm}: diff_cells={d} {}", dispatch_note(ds, dp, want_d));
                 if d != 0 {
                     failed.push((*l, k, arm));
                 }
+                if !dispatches_ok(ds, dp, want_d) {
+                    miscounted.push((*l, k, arm));
+                    counted = false;
+                }
                 diff += d;
             }
-            println!("{line} {}", if diff == 0 { "PASS" } else { "FAIL" });
+            println!(
+                "{line} {}",
+                if diff == 0 && counted { "PASS" } else { "FAIL" }
+            );
         }
         let case = routed_case(&x_all, embd, ROUTED_K, n_expert, n_used);
         let want = per_column(layer, &split, &case, &mut host);
@@ -626,20 +705,31 @@ fn hw_union_wide_matches_per_column_v41() {
         );
         routed_spread &= lo < hi && past > 0 && past < case.union();
         let mut diff = 0;
+        let mut counted = true;
         for (arm, on) in ARMS {
             ops::set_defer_quant(Some(on));
             let mut got = vec![f32::NAN; embd * ROUTED_K];
-            let r = layer.experts_union_into(&split, &case.x, &lists, &mut got, &mut us);
+            let (r, ds, dp) = dispatched(&mut us, |us| {
+                layer.experts_union_into(&split, &case.x, &lists, &mut got, us)
+            });
             ops::set_defer_quant(None);
             r.unwrap_or_else(|e| panic!("layer {l} routed {arm}: {e}"));
             let d = diff_cells(&got, &want);
-            line += &format!(" {arm}: diff_cells={d}");
+            let want_d = call_dispatches(ROUTED_K, case.slots(), on);
+            line += &format!(" {arm}: diff_cells={d} {}", dispatch_note(ds, dp, want_d));
             if d != 0 {
                 failed.push((*l, ROUTED_K, arm));
             }
+            if !dispatches_ok(ds, dp, want_d) {
+                miscounted.push((*l, ROUTED_K, arm));
+                counted = false;
+            }
             diff += d;
         }
-        println!("{line} {}", if diff == 0 { "PASS" } else { "FAIL" });
+        println!(
+            "{line} {}",
+            if diff == 0 && counted { "PASS" } else { "FAIL" }
+        );
     }
     println!("union wide: wall {:.1} s", t0.elapsed().as_secs_f64());
     assert!(
@@ -655,10 +745,15 @@ fn hw_union_wide_matches_per_column_v41() {
         "{} (layer, k, arm) wide cases differ from their one-column calls: {failed:?}",
         failed.len()
     );
+    assert!(
+        miscounted.is_empty(),
+        "{} (layer, k, arm) wide calls issued other than five dispatches: {miscounted:?}",
+        miscounted.len()
+    );
     println!(
         "PASSED: union wide — experts_union_into equals experts_into column for column, bit for \
          bit, at k = 16, 64, 512 (the last over every expert of the layer) and a routed k = 512 \
-         on a Q5_K-down and a Q4_K-down layer under both deferral arms"
+         on a Q5_K-down and a Q4_K-down layer under both deferral arms, five pool dispatches a call"
     );
 }
 
@@ -785,25 +880,32 @@ fn hw_union_tail_matches_batches_v41() {
     );
     let t0 = std::time::Instant::now();
     let mut failed: Vec<(usize, usize, &str)> = Vec::new();
+    let mut miscounted: Vec<(usize, usize, &str)> = Vec::new();
     let mut spread = true;
     let mut whole_and_cut = true;
     for (l, layer) in &picked {
         let n_expert = layer.n_expert();
         let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
-        let mut cases: Vec<(Case, bool)> = TAILS
+        // Each case with whether it runs cut and whether it is a tail's lists.
+        let mut cases: Vec<(Case, bool, bool)> = TAILS
             .iter()
             .map(|&(g, short)| {
                 let cols = g * UNION_MAX_COLS - short;
-                (tail_case(&x_all, embd, cols, n_expert, n_used), false)
+                (tail_case(&x_all, embd, cols, n_expert, n_used), false, true)
             })
             .collect();
         let wide = UNION_TAIL_MAX_GROUPS * UNION_MAX_COLS;
-        // Past the store: every slot of every column.
-        cases.push((routed_case(&x_all, embd, wide, n_expert, n_used), true));
-        // Past the blocks: one slot a column, each of four experts listed by
-        // about a quarter of the columns.
-        cases.push((routed_case(&x_all, embd, wide, 4, 1), true));
-        for (case, cut) in &cases {
+        // Past the budget: every slot of every column.
+        cases.push((
+            routed_case(&x_all, embd, wide, n_expert, n_used),
+            true,
+            false,
+        ));
+        // One slot a column, each of four experts listed by about a quarter
+        // of the columns: under the budget, each expert past a batch's
+        // columns.
+        cases.push((routed_case(&x_all, embd, wide, 4, 1), false, false));
+        for (case, cut, tail_lists) in &cases {
             let k = case.x.ne1;
             let lists = case.slices();
             let across = experts_across_batches(case);
@@ -815,53 +917,81 @@ fn hw_union_tail_matches_batches_v41() {
                 case.union(),
                 max_cols_per_expert(case)
             );
-            if !cut {
-                spread &= across > 0 && case.union() > UNION_CHUNK;
+            if *tail_lists {
+                spread &= across > 0 && case.union() > EXPERTS_INTO_MAX;
             }
             let mut diff = 0;
+            let mut counted = true;
             for (arm, on) in ARMS {
                 ops::set_defer_quant(Some(on));
                 let want = batch_calls(layer, &split, case, &mut us);
                 let cuts = tail.cut_calls();
                 let mut got = vec![f32::NAN; embd * k];
-                let r = layer.experts_union_into(&split, &case.x, &lists, &mut got, &mut tail);
+                let (r, ds, dp) = dispatched(&mut tail, |tail| {
+                    layer.experts_union_into(&split, &case.x, &lists, &mut got, tail)
+                });
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|e| panic!("layer {l} tail k {k} {arm}: {e}"));
                 let ran_cut = tail.cut_calls() == cuts + 1;
                 whole_and_cut &= ran_cut == *cut && tail.cut_calls() <= cuts + 1;
+                let want_d = if *cut {
+                    (0..k)
+                        .step_by(UNION_MAX_COLS)
+                        .map(|c0| {
+                            let part = &case.lists[c0..(c0 + UNION_MAX_COLS).min(k)];
+                            call_dispatches(part.len(), part.iter().map(Vec::len).sum(), on)
+                        })
+                        .sum()
+                } else {
+                    call_dispatches(k, case.slots(), on)
+                };
                 let d = diff_cells(&got, &want);
                 line += &format!(
-                    " {arm}: {} diff_cells={d}",
-                    if ran_cut { "cut" } else { "whole" }
+                    " {arm}: {} diff_cells={d} {}",
+                    if ran_cut { "cut" } else { "whole" },
+                    dispatch_note(ds, dp, want_d)
                 );
                 if d != 0 {
                     failed.push((*l, k, arm));
                 }
+                if !dispatches_ok(ds, dp, want_d) {
+                    miscounted.push((*l, k, arm));
+                    counted = false;
+                }
                 diff += d;
             }
-            println!("{line} {}", if diff == 0 { "PASS" } else { "FAIL" });
+            println!(
+                "{line} {}",
+                if diff == 0 && counted { "PASS" } else { "FAIL" }
+            );
         }
     }
     println!("union tail: wall {:.1} s", t0.elapsed().as_secs_f64());
     assert!(
         spread,
-        "a tail case must spread experts over several batches and chunk more than UNION_CHUNK"
+        "a tail case must spread experts over several batches and plan more than one list's experts"
     );
     assert!(
         whole_and_cut,
-        "the tail cases must run whole and the routings past the store or the blocks cut, once a \
-         call"
+        "the tail cases and the four-expert routing must run whole and the routing past the budget \
+         cut, once a call"
     );
     assert!(
         failed.is_empty(),
         "{} (layer, k, arm) tail calls differ from their batch calls: {failed:?}",
         failed.len()
     );
+    assert!(
+        miscounted.is_empty(),
+        "{} (layer, k, arm) tail calls issued other than their dispatches: {miscounted:?}",
+        miscounted.len()
+    );
     println!(
         "PASSED: union tail — one call over {} and {} columns through a tail scratch of {TAIL_SLOTS} \
          slots equals the calls one batch at a time, column for column, bit for bit, on a Q5_K-down \
-         and a Q4_K-down layer under both deferral arms; a routing past the budget, or with an \
-         expert past a batch's columns, runs cut into batch calls, counted",
+         and a Q4_K-down layer under both deferral arms, and so does a routing with experts past a \
+         batch's columns; a routing past the budget runs cut into batch calls, counted; five pool \
+         dispatches a call",
         TAILS[0].0 * UNION_MAX_COLS - TAILS[0].1,
         TAILS[1].0 * UNION_MAX_COLS - TAILS[1].1
     );
@@ -932,19 +1062,31 @@ fn hw_union_file_matches_per_column_v2lite() {
     let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
     let mut us = UnionScratch::new(embd, plan.meta.ff, SMALL_COLS).expect("a scratch of 8 columns");
     let mut total = 0;
+    let mut counted = true;
     for (arm, on) in ARMS {
         ops::set_defer_quant(Some(on));
         let mut got = vec![f32::NAN; embd * k];
-        let r = model::moe::experts_union_into(&g, plan, &x, &slices, &mut got, &mut us);
+        let (r, ds, dp) = dispatched(&mut us, |us| {
+            model::moe::experts_union_into(&g, plan, &x, &slices, &mut got, us)
+        });
         ops::set_defer_quant(None);
         r.unwrap_or_else(|e| panic!("v2lite union {arm}: {e}"));
         let d = diff_cells(&got, &want);
-        println!("v2lite block=1 k={k} {arm}: diff_cells={d}");
+        let want_d = call_dispatches(k, slices.iter().map(|l| l.len()).sum(), on);
+        println!(
+            "v2lite block=1 k={k} {arm}: diff_cells={d} {}",
+            dispatch_note(ds, dp, want_d)
+        );
+        counted &= dispatches_ok(ds, dp, want_d);
         total += d;
     }
     assert_eq!(
         total, 0,
         "the one-file union entry must equal experts_into column for column, bit for bit"
+    );
+    assert!(
+        counted,
+        "the one-file union entry issues its calls' dispatches"
     );
     println!("PASSED: union v2lite — experts_union_into (one file) equals experts_into per column");
 }

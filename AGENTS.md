@@ -395,6 +395,11 @@ first suspect is a hung gate on the box, not the agent.
   outside it is the card route before the union, 30.4 ms per layer-batch (~~per-chunk attention and projection
   launches~~ the per-chunk kernels themselves — every 8-token chunk re-reads the four projections at m = 8; the
   launch gaps are 1.4–3.6 ms of it [derived, docs/research/cardroute-design-report.md]).
+  Since round `uniondispatch` (the host union in five dispatches a layer-batch instead of 161)
+  pp512 **129.6** and pp4096 **180.0** with no hot list (main's binary 118.0 / 166.3 in the same
+  lease, 1.098 ± 0.030 / 1.083 ± 0.035, the union 77.1 → 66.7 ms per layer-batch; sitting 14's
+  121.4 / 169.4 ran with the hot list, so the two pairs do not share a table; rig-log
+  09-26#uniondispatch-ab).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
@@ -502,7 +507,10 @@ any build without the config — on the box the config now hides that mistake.
 Compile-time levers in `q3k-cpu` are `const` values with dead branches behind
 them; MUL-11 converts them to `#[cfg(feature)]` so the on-side also compiles.
 Runtime levers: `BLOOMERY_THREADS`, `BLOOMERY_SPIN` (threads), `BLOOMERY_STEAL_BLOCKS`
-(model::ops: blocks a lane is cut into for stealing, default 4 — 2/8/16 measured no better),
+(model::ops: blocks a lane is cut into for stealing, default 4 — 2/8/16 measured no better; a
+host-union block is at most 144 rows; an unusable value panics by name), `BLOOMERY_STEAL=0`
+(model::ops: whole-lane blocks, home lanes only — the steal lever's A/B arm; a value other than
+0 or 1 panics by name),
 `BLOOMERY_PROFILE` (model::profile; `BLOOMERY_PROFILE_DEPTH=d` makes
 `profile-measure.sh` prefill depth-decode's prompt of depth d first),
 `BLOOMERY_FLASH_SIMD=0` (attn, scalar rollback), `BLOOMERY_KV_PREFETCH_ROWS=d` (attn: how many

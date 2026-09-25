@@ -43,7 +43,9 @@
 //! `hybrid::name_refusal`, as `GpuModel::name_host_refusal` does; the batch
 //! service (three columns: the refused column NaN, the others the clean
 //! run's bit for bit) names it itself when it watches the word and returns
-//! when it does not. The word is clean before and after a clean service.
+//! when it does not. With two columns not finite it records the first, with
+//! what it saw there, and both come back NaN. The word is clean before and
+//! after a clean service.
 //! Last, on the engine itself (`n_l` = 32): a NaN in a hybrid layer's input
 //! residual through `step_layer_hybrid` returns the card's fault at that
 //! layer, with one refusal recorded by the host tier.
@@ -1168,6 +1170,30 @@ mod gate {
             );
             ok &= pass;
         }
+        // Columns 1 and 2 not finite: the refusal names the first, and what
+        // the host saw in it.
+        let mut bnan2 = bnan.clone();
+        bnan2[R_HIDDEN + 7] = f32::INFINITY;
+        let mut h = refusal_tier(&gpu, false)?;
+        let (r, out) = batch(&mut h, &bnan2, &bids);
+        let answer = answer_ok(&r, Want::Returns);
+        let first =
+            format!("column 1 of {cols}: the activation holds inf at value 7 of {R_HIDDEN}");
+        let recorded = recorded_once(&h, &first);
+        let col = |v: &[f32], j: usize| v[j * R_HIDDEN..(j + 1) * R_HIDDEN].to_vec();
+        let both_nan = [1, 2]
+            .iter()
+            .all(|&j| col(&out, j).iter().all(|v| v.is_nan()));
+        let other = bits_equal(&col(&out, 0), &col(&clean_out, 0));
+        let pass = answer && recorded && both_nan && other && gpu.take_fault()?.is_none();
+        println!(
+            "refusal batch columns 1 and 2 non-finite, unwatched: answer \"{}\" as wanted {answer}, \
+             \"{first}\" recorded once {recorded}, both columns NaN {both_nan}, column 0 \
+             bit-identical {other} {}",
+            show(&r),
+            verdict(pass)
+        );
+        ok &= pass;
         stream.synchronize()?;
         println!("refusal verdict {}", verdict(ok));
         Ok(ok)
