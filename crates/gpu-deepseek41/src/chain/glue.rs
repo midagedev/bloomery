@@ -49,13 +49,15 @@ use std::time::Instant;
 use bloomery_gpu::elem::q3k_embed_value;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{Gpu, GpuError, Q8Act, launch_u32};
-use cuda_core::{DeviceBuffer, LaunchConfig1D};
+use bloomery_gpu::{Gpu, GpuError, HostFlags, Q8Act, launch_u32};
+use cuda_core::{
+    CudaContext, CudaStream, DeviceBuffer, IntoResult, LaunchConfig1D, PinnedHostBuffer, sys,
+};
 use cuda_device::convert::{cvt_f32_f16x2_hi, cvt_f32_f16x2_lo, cvt_f32x2_bf16x2};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
-use engram::Engram;
 use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
+use engram::{Engram, Faults};
 use gguf::quant::GgmlType;
 use gguf::{Split, TensorInfo};
 use model::arch::deepseek41::hparams::Hparams;
@@ -382,23 +384,179 @@ pub struct EngramStep<'a> {
 
 /// The token-only work of the engram site at `layer`
 /// ([`Glue::enqueue_engram_kv_at`]) as shadow work: what the step hands the
-/// MoE sub-layer of the layer before the site.
+/// MoE sub-layer of the layer before the site. On the step's first engram
+/// site it carries the rows' arrival, which it enqueues first.
 pub struct EngramKv<'a> {
     pub glue: &'a mut Glue,
     /// The resident weights.
     pub w: &'a Weights,
-    /// The step image's device copy.
-    pub params: &'a DeviceBuffer<u32>,
+    /// The step image's device copy, whose rows section the arrival writes.
+    pub params: &'a mut DeviceBuffer<u32>,
     /// The site's layer.
     pub layer: usize,
     /// The row whose scratch it writes.
     pub row: usize,
+    /// The row's engram rows arrive here: the first reader of any of them.
+    pub arrive: Option<&'a RowsArrival>,
 }
 
 impl ShadowWork for EngramKv<'_> {
     fn enqueue(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        if let Some(arrive) = self.arrive {
+            arrive.enqueue(gpu.stream(), self.row, self.params)?;
+        }
         self.glue
             .enqueue_engram_kv_of(gpu, self.w, self.params, self.layer, self.row)
+    }
+}
+
+/// How a step's engram rows reach the card after its launch: per row of
+/// the pass, a page-locked staging copy of the rows section of that row's
+/// image and a host flag ([`HostFlags`]).
+///
+/// The host clears row `r`'s flag before the launch ([`RowsArrival::clear`]),
+/// writes the rows into the staging once they are read and raises the flag
+/// ([`RowsArrival::deliver`]). The chain's first reader of the rows
+/// ([`EngramKv`] of the step's first site) first enqueues the arrival
+/// ([`RowsArrival::enqueue`]): the wait on the flag, then one host-to-device
+/// copy of the staging over the rows section of the row's image copy. So
+/// the card computes up to the first site's token-only work while the host
+/// reads the rows, and never reads a row before the host wrote it.
+///
+/// Contract: a launched arrival waits until its flag is raised, so the host
+/// raises it on every path after the launch, an error included — then the
+/// card runs that step on the rows the staging held before, and the caller
+/// condemns the step (the body refuses the next one until a reset). A
+/// row's staging is written only while its flag is lowered, after the
+/// refresh that lowered it synchronized the stream: no copy of it is in
+/// flight then, and the launched one waits.
+pub struct RowsArrival {
+    flags: HostFlags,
+    staging: PinnedHostBuffer<u32>,
+    /// Words of one row's rows section, the section's first word in the
+    /// image, and the bytes of rows it carries.
+    words: usize,
+    at: usize,
+    bytes: usize,
+}
+
+impl RowsArrival {
+    /// The arrival of `rows` rows of images laid out as `layout`, in `ctx`.
+    /// Load-time only.
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        rows: usize,
+        layout: &ImageLayout,
+    ) -> Result<RowsArrival, GpuError> {
+        let dims = layout.dims();
+        let at = layout.engram_at(0);
+        let words = layout.words() - at;
+        let bytes = dims.tokens * dims.engram_bytes;
+        if words * 4 < bytes {
+            return Err(GpuError::Shape {
+                what: "RowsArrival::new",
+                detail: format!(
+                    "a rows section of {words} words from word {at} for {} tokens of {} engram bytes",
+                    dims.tokens, dims.engram_bytes
+                ),
+            });
+        }
+        let staging = PinnedHostBuffer::<u32>::zeroed(ctx, rows * words).map_err(|source| {
+            GpuError::Driver {
+                op: Some("cuMemAllocHost (the engram rows' staging)"),
+                source,
+            }
+        })?;
+        Ok(RowsArrival {
+            flags: HostFlags::new(ctx, rows)?,
+            staging,
+            words,
+            at,
+            bytes,
+        })
+    }
+
+    /// Lower row `row`'s flag, before the launch whose arrival it gates.
+    pub fn clear(&self, row: usize) -> Result<(), GpuError> {
+        self.flags.clear(row)
+    }
+
+    /// Write `rows` — the rows section's bytes, as [`StepRows::engram`] holds
+    /// them — into row `row`'s staging, four bytes to a little-endian word,
+    /// then raise its flag. The flag is raised on every path: a `rows` of
+    /// the wrong length leaves the staging as it was and returns the error.
+    pub fn deliver(&mut self, row: usize, rows: &[u8]) -> Result<(), GpuError> {
+        let staged = self.stage(row, rows);
+        let raised = self.flags.raise(row);
+        staged.and(raised)
+    }
+
+    /// Raise row `row`'s flag with the staging as it is.
+    pub fn raise(&self, row: usize) -> Result<(), GpuError> {
+        self.flags.raise(row)
+    }
+
+    fn stage(&mut self, row: usize, rows: &[u8]) -> Result<(), GpuError> {
+        let (words, bytes) = (self.words, self.bytes);
+        let staged = self.staging.len() / words.max(1);
+        let dst = self
+            .staging
+            .get_mut(row * words..(row + 1) * words)
+            .filter(|_| rows.len() == bytes)
+            .ok_or_else(|| GpuError::Shape {
+                what: "RowsArrival::deliver",
+                detail: format!(
+                    "{} bytes into row {row}'s staging: a row carries {bytes}, {staged} rows staged",
+                    rows.len()
+                ),
+            })?;
+        for (w, b) in dst.iter_mut().zip(rows.chunks(4)) {
+            let mut le = [0u8; 4];
+            le[..b.len()].copy_from_slice(b);
+            *w = u32::from_le_bytes(le);
+        }
+        Ok(())
+    }
+
+    /// Enqueue row `row`'s arrival on `stream`: the wait on its flag, then the
+    /// staging copied over the rows section of `params`, the row's image
+    /// copy. Two nodes when captured (a batch memory operation, a copy).
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        params: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "RowsArrival::enqueue";
+        let words = self.words;
+        let src = self
+            .staging
+            .get(row * words..(row + 1) * words)
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("row {row} of {} staged", self.staging.len() / words.max(1)),
+            })?;
+        need(WHAT, "params", params.len(), self.at + words)?;
+        self.flags.enqueue_wait(stream, row)?;
+        // SAFETY: the destination is words `at .. at + words` of `params`
+        // (checked above), borrowed mutably for the enqueue; the source is
+        // page-locked memory this value owns — the engine drops its graphs
+        // before its body, so no graph that captured the copy outlives it —
+        // and the host writes it only while the copy waits on the lowered
+        // flag or none is in flight (the type's contract).
+        let rc = unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                params.cu_deviceptr() + (4 * self.at) as u64,
+                src.as_ptr().cast(),
+                4 * words,
+                stream.cu_stream(),
+            )
+        };
+        rc.result().map_err(|source| GpuError::Driver {
+            op: Some("cuMemcpyHtoDAsync_v2 (the engram rows' arrival)"),
+            source,
+        })
     }
 }
 
@@ -956,8 +1114,9 @@ pub struct EngramStats {
     pub cold: u64,
     /// Rows the calling thread read itself: the direct path's.
     pub direct: u64,
-    /// The calling thread's time in the engram read: the wait on the helper,
-    /// or the direct path's copy.
+    /// The calling thread's time in the engram read: the wait on the helper
+    /// in [`StepRows::finish`] — in the engine, after the step's launch — or
+    /// the direct path's copy, before it.
     pub wait_ns: u64,
     /// The helper's own time on the rows it served: advise, fill and copy.
     pub helper_ns: u64,
@@ -996,6 +1155,9 @@ pub struct StepRows {
     ids: Vec<u32>,
     embd_rows: Vec<u8>,
     engram_rows: Vec<u8>,
+    /// The token whose engram rows are on the helper, begun and not
+    /// finished.
+    in_flight: Option<usize>,
 }
 
 impl StepRows {
@@ -1112,6 +1274,7 @@ impl StepRows {
             ids: vec![0; tokens * sites * n_cols],
             embd_rows: vec![0; tokens * embd_bytes],
             engram_rows: vec![0; tokens * sites * n_cols * row_bytes],
+            in_flight: None,
             engram,
         })
     }
@@ -1122,9 +1285,21 @@ impl StepRows {
         self.row_bytes
     }
 
-    /// Fill the rows of `plan`'s step from `file`, the file `open` read.
+    /// Fill the rows of `plan`'s step from `file`, the file `open` read:
+    /// [`StepRows::begin`], then [`StepRows::finish`].
     pub fn fill(&mut self, file: &Split, plan: &StepPlan) -> Result<(), GpuError> {
-        const WHAT: &str = "StepRows::fill";
+        self.begin(file, plan)?;
+        self.finish()
+    }
+
+    /// Start the rows of `plan`'s step: every token's ids hashed and its
+    /// embedding row read from `file`; with the helper on, the last token's
+    /// engram rows handed to the helper and left in flight — the embedding
+    /// rows are read meanwhile — until [`StepRows::finish`] takes them back
+    /// (every earlier token's are taken back here); with it off, every row
+    /// read on this thread. A begin while a token is in flight is refused.
+    pub fn begin(&mut self, file: &Split, plan: &StepPlan) -> Result<(), GpuError> {
+        const WHAT: &str = "StepRows::begin";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
         let n_gram = self.ctx.len();
         if plan.tokens.len() != self.tokens || plan.engram_window.len() != self.tokens * n_gram {
@@ -1134,6 +1309,12 @@ impl StepRows {
                 plan.engram_window.len(),
                 self.tokens
             )));
+        }
+        if self.in_flight.is_some() {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "the finish of the rows in flight (StepRows::finish) before the next begin",
+            });
         }
         if self.helper.is_none() {
             embd_rows_into(
@@ -1148,8 +1329,6 @@ impl StepRows {
         let token_ids = self.engram.sites().len() * self.n_cols;
         for (k, window) in plan.engram_window.chunks_exact(n_gram).enumerate() {
             let ids = &mut self.ids[k * token_ids..][..token_ids];
-            let bytes = &mut self.engram_rows[k * token_ids * self.row_bytes..]
-                [..token_ids * self.row_bytes];
             let hash = self.engram.hash();
             let mut blocked = false;
             for (slot, &token) in self.ctx.iter_mut().zip(window) {
@@ -1163,11 +1342,13 @@ impl StepRows {
                 hash.rows_into(s, &self.ctx, site_ids)
                     .map_err(|e| GpuError::plan(WHAT, e))?;
             }
+            let ids = &self.ids[k * token_ids..][..token_ids];
             match self.helper.as_mut() {
                 Some(helper) => {
                     helper
                         .submit(ids.chunks_exact(self.n_cols))
                         .map_err(|e| GpuError::plan(WHAT, e))?;
+                    self.in_flight = Some(k);
                     // Only the first token overlaps the embedding rows; a
                     // step of one token, the engine's, is all of it.
                     if k == 0 {
@@ -1179,34 +1360,19 @@ impl StepRows {
                             plan,
                         );
                         // The helper holds a job: take it back before an
-                        // error leaves, or the next fill's submit is refused.
+                        // error leaves, or the next begin's submit is refused.
                         if let Err(e) = embd {
-                            let _ = helper.wait();
+                            let _ = self.finish();
                             return Err(e);
                         }
                     }
-                    let t0 = self.stats.map(|_| Instant::now());
-                    helper.wait().map_err(|e| GpuError::plan(WHAT, e))?;
-                    let wait_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
-                    let filled = helper.filled();
-                    if filled.len() != bytes.len() {
-                        return Err(refuse(format!(
-                            "the helper filled {} bytes of a token's {}",
-                            filled.len(),
-                            bytes.len()
-                        )));
-                    }
-                    bytes.copy_from_slice(filled);
-                    if let Some(st) = self.stats.as_mut() {
-                        let t = helper.last();
-                        st.warm += t.resident_rows;
-                        st.cold += t.rows - t.resident_rows;
-                        st.wait_ns += wait_ns;
-                        st.helper_ns += t.submit_ns + t.fill_ns + t.copy_ns;
-                        st.classify_ns += t.classify_ns;
+                    if k + 1 < self.tokens {
+                        self.finish()?;
                     }
                 }
                 None => {
+                    let bytes = &mut self.engram_rows[k * token_ids * self.row_bytes..]
+                        [..token_ids * self.row_bytes];
                     for ((site, site_ids), out) in self
                         .engram
                         .sites()
@@ -1238,6 +1404,62 @@ impl StepRows {
             }
         }
         Ok(())
+    }
+
+    /// Whether a token's engram rows are in flight on the helper: begun and
+    /// not finished.
+    #[must_use]
+    pub fn in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// Take the rows in flight back from the helper into
+    /// [`StepRows::engram`]; nothing to do when none are. A helper that
+    /// failed leaves that token's rows as the previous fill left them and
+    /// returns its error; either way nothing is in flight after.
+    pub fn finish(&mut self) -> Result<(), GpuError> {
+        const WHAT: &str = "StepRows::finish";
+        let (Some(k), Some(helper)) = (self.in_flight.take(), self.helper.as_mut()) else {
+            return Ok(());
+        };
+        let token_bytes = self.engram.sites().len() * self.n_cols * self.row_bytes;
+        let t0 = self.stats.map(|_| Instant::now());
+        helper.wait().map_err(|e| GpuError::plan(WHAT, e))?;
+        let wait_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
+        let filled = helper.filled();
+        if filled.len() != token_bytes {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "the helper filled {} bytes of a token's {token_bytes}",
+                    filled.len()
+                ),
+            });
+        }
+        self.engram_rows[k * token_bytes..][..token_bytes].copy_from_slice(filled);
+        if let Some(st) = self.stats.as_mut() {
+            let t = helper.last();
+            st.warm += t.resident_rows;
+            st.cold += t.rows - t.resident_rows;
+            st.wait_ns += wait_ns;
+            st.helper_ns += t.submit_ns + t.fill_ns + t.copy_ns;
+            st.classify_ns += t.classify_ns;
+        }
+        Ok(())
+    }
+
+    /// The page faults the helper thread has taken since it started (its own
+    /// `getrusage(RUSAGE_THREAD)`, as of the last token it finished); `None`
+    /// with the helper off, when the calling thread reads the rows itself.
+    #[must_use]
+    pub fn helper_faults(&self) -> Option<Faults> {
+        self.helper.as_ref().map(|h| {
+            let t = h.last();
+            Faults {
+                major: t.major_faults,
+                minor: t.minor_faults,
+            }
+        })
     }
 
     /// What the fills since open read; all zero unless the rows keep stats

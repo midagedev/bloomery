@@ -13,8 +13,10 @@
 
 use crate::GpuError;
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DriverError, sys};
+use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Map a driver result to `GpuError::Driver`, tagged with the driver entry
 /// point we called. `DriverError` carries the code and asks the driver for
@@ -295,6 +297,172 @@ impl Drop for Forked<'_> {
     }
 }
 
+/// Whether `stream` is recording a capture right now.
+pub fn capturing(stream: &CudaStream) -> Result<bool, GpuError> {
+    let mut status: sys::CUstreamCaptureStatus = 0;
+    // SAFETY: the stream is live and `status` is a local the call writes.
+    let rc = unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut status) };
+    cu(rc, "cuStreamIsCapturing")?;
+    Ok(status != sys::CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE)
+}
+
+/// Bytes between two flags of a [`HostFlags`]: each has a cache line of its
+/// own, so a host store to one never shares a line with another.
+const FLAG_STRIDE: usize = 64;
+
+/// Operations in the batch [`HostFlags::enqueue_wait`] enqueues: the one
+/// wait. A gate tells this batch from the host tier's go and wait by it.
+pub const FLAG_WAIT_OPS: u32 = 1;
+
+/// Flag words the host raises and a stream waits on: page-locked host memory
+/// mapped into the device's address space (`cuMemHostAlloc` with `PORTABLE
+/// | DEVICEMAP`), one word per flag on its own line, zero at allocation.
+///
+/// [`HostFlags::enqueue_wait`] holds a stream until the host raises a flag —
+/// one batch memory-operation node when captured, a wait until the word is
+/// non-zero. A captured wait carries its value fixed, so the host, not the
+/// graph, rearms the flag: [`HostFlags::clear`] before the launch whose wait
+/// it gates, [`HostFlags::raise`] once what the wait guards is in place.
+/// A launched wait on a flag the host never raises waits forever: whoever
+/// launches a gated wait raises its flag on every path, errors included.
+pub struct HostFlags {
+    host: *mut u8,
+    dev: sys::CUdeviceptr,
+    len: usize,
+}
+
+// SAFETY: the allocation is owned by this value alone and freed once, in its
+// drop; the host touches the words only through atomics, from any thread.
+unsafe impl Send for HostFlags {}
+// SAFETY: as above — every host access is an atomic load or store.
+unsafe impl Sync for HostFlags {}
+
+impl HostFlags {
+    /// `len` cleared flags of `ctx`. Load-time only.
+    pub fn new(ctx: &Arc<CudaContext>, len: usize) -> Result<HostFlags, GpuError> {
+        const WHAT: &str = "HostFlags::new";
+        if len == 0 {
+            return Err(GpuError::shape(WHAT, "no flags"));
+        }
+        let bytes = len
+            .checked_mul(FLAG_STRIDE)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{len} flags pass usize bytes")))?;
+        ctx.bind_to_thread()?;
+        let mut host: *mut c_void = ptr::null_mut();
+        // SAFETY: the context is current on this thread (bound above) and
+        // `host` is a live local the call writes.
+        let rc = unsafe {
+            sys::cuMemHostAlloc(
+                &mut host,
+                bytes,
+                sys::CU_MEMHOSTALLOC_PORTABLE | sys::CU_MEMHOSTALLOC_DEVICEMAP,
+            )
+        };
+        cu(rc, "cuMemHostAlloc (host flags)")?;
+        let mut dev: sys::CUdeviceptr = 0;
+        // SAFETY: `host` is the mapped allocation just made; the flags must be 0.
+        let rc = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0) };
+        if let Err(e) = cu(rc, "cuMemHostGetDevicePointer_v2 (host flags)") {
+            // SAFETY: `host` came from cuMemHostAlloc and is freed once, here.
+            unsafe { sys::cuMemFreeHost(host) };
+            return Err(e);
+        }
+        // SAFETY: the allocation holds `bytes` writable bytes and nothing else
+        // references it yet.
+        unsafe { ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
+        Ok(HostFlags {
+            host: host.cast(),
+            dev,
+            len,
+        })
+    }
+
+    /// Flags held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Never: [`HostFlags::new`] refuses zero flags.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Flag `i`'s host word, or the refusal of an index past the flags.
+    fn word(&self, i: usize, what: &'static str) -> Result<&AtomicU32, GpuError> {
+        if i >= self.len {
+            return Err(GpuError::shape(
+                what,
+                format!("flag {i} of {} flags", self.len),
+            ));
+        }
+        // SAFETY: i < len, so the word at i·FLAG_STRIDE lies inside the
+        // allocation of len·FLAG_STRIDE bytes, 4-aligned (the allocation is
+        // page-aligned); `AtomicU32` has `u32`'s layout, and the host reaches
+        // a flag only through this view.
+        Ok(unsafe { &*self.host.add(i * FLAG_STRIDE).cast::<AtomicU32>() })
+    }
+
+    /// Lower flag `i`: a wait on it enqueued from here on holds its stream.
+    /// Call it only while no launched wait on the flag is pending.
+    pub fn clear(&self, i: usize) -> Result<(), GpuError> {
+        self.word(i, "HostFlags::clear")?
+            .store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Raise flag `i`, after every host store the wait guards (release
+    /// order): a stream held on it goes on.
+    pub fn raise(&self, i: usize) -> Result<(), GpuError> {
+        self.word(i, "HostFlags::raise")?
+            .store(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether flag `i` is raised.
+    pub fn raised(&self, i: usize) -> Result<bool, GpuError> {
+        Ok(self.word(i, "HostFlags::raised")?.load(Ordering::Acquire) != 0)
+    }
+
+    /// Enqueue on `stream` a wait until flag `i` is raised: one batch of
+    /// [`FLAG_WAIT_OPS`] stream memory operation, one graph node when
+    /// captured. Capturable, allocation-free.
+    pub fn enqueue_wait(&self, stream: &CudaStream, i: usize) -> Result<(), GpuError> {
+        self.word(i, "HostFlags::enqueue_wait")?;
+        // SAFETY: every member of the union is a plain C struct of integers,
+        // so all-zero bytes are a valid value.
+        let mut op: sys::CUstreamBatchMemOpParams = unsafe { std::mem::zeroed() };
+        op.waitValue = sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st {
+            operation: sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_WAIT_VALUE_32,
+            address: self.dev + (i * FLAG_STRIDE) as u64,
+            __bindgen_anon_1:
+                sys::CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st__bindgen_ty_1 {
+                    value: 1,
+                },
+            flags: sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
+            alias: 0,
+        };
+        let mut ops = [op];
+        // SAFETY: `ops` is a live array of FLAG_WAIT_OPS initialized
+        // operations the driver reads during the call (a capture copies them
+        // into the node); the word it names lives as long as this value, and
+        // the flags must be 0.
+        let rc = unsafe {
+            sys::cuStreamBatchMemOp_v2(stream.cu_stream(), FLAG_WAIT_OPS, ops.as_mut_ptr(), 0)
+        };
+        cu(rc, "cuStreamBatchMemOp_v2 (host flag wait)")
+    }
+}
+
+impl Drop for HostFlags {
+    fn drop(&mut self) {
+        // SAFETY: `host` came from cuMemHostAlloc and is freed once, here. A
+        // failure on the drop path is unreportable and ignored.
+        unsafe { sys::cuMemFreeHost(self.host.cast()) };
+    }
+}
+
 /// One node of a captured graph as the driver reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeInfo {
@@ -318,9 +486,73 @@ impl Drop for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{Graph, cu};
-    use cuda_core::{CudaContext, DeviceBuffer, sys};
+    use super::{FLAG_WAIT_OPS, Graph, HostFlags, cu};
+    use cuda_core::{CudaContext, DeviceBuffer, PinnedHostBuffer, sys};
     use std::ffi::c_void;
+    use std::time::Duration;
+
+    /// A captured wait on a flag holds the copy behind it until the host
+    /// raises the flag: the graph is launched before the host writes the
+    /// staging, the host sleeps, writes it and raises, and the copy lands
+    /// what the host wrote after the launch. A replay after a clear waits
+    /// again. Without the wait the copy reads the staging as it was at the
+    /// launch.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_host_flag_holds_a_copy_until_raised() {
+        const N: usize = 1024;
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let stream = ctx.new_stream().expect("a stream");
+        let flags = HostFlags::new(&ctx, 2).expect("two host flags");
+        let mut staging = PinnedHostBuffer::<u32>::zeroed(&ctx, N).expect("pinned staging");
+        let dst = DeviceBuffer::<u32>::zeroed(&stream, N).expect("a device buffer");
+        stream
+            .synchronize()
+            .expect("the allocation lands before capture");
+        let src = staging.as_ptr();
+        let graph = Graph::capture(&stream, |s| {
+            flags.enqueue_wait(s, 1)?;
+            // SAFETY: `src` is the pinned staging of N words, `dst` a device
+            // buffer of N words; both outlive every launch below.
+            let rc = unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    dst.cu_deviceptr(),
+                    src.cast(),
+                    N * size_of::<u32>(),
+                    s.cu_stream(),
+                )
+            };
+            cu(rc, "cuMemcpyHtoDAsync_v2")
+        })
+        .expect("the capture");
+        let nodes = graph.nodes().expect("the node list");
+        assert_eq!(nodes.len(), 2, "{nodes:?}");
+        assert_eq!(
+            nodes[0].kind,
+            sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP,
+            "{nodes:?}"
+        );
+        for round in 1..=2u32 {
+            flags.clear(1).expect("clear");
+            graph.launch(&stream).expect("a launch");
+            std::thread::sleep(Duration::from_millis(20));
+            for (i, w) in staging.as_mut_slice().iter_mut().enumerate() {
+                *w = round * 0x1000_0000 + i as u32;
+            }
+            flags.raise(1).expect("raise");
+            stream.synchronize().expect("the replay");
+            let got = dst.to_host_vec(&stream).expect("readback");
+            let want: Vec<u32> = (0..N as u32).map(|i| round * 0x1000_0000 + i).collect();
+            let stale = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+            assert_eq!(
+                stale, 0,
+                "round {round}: {stale} of {N} words are not what the host wrote after the \
+                 launch — the copy ran before the flag was raised"
+            );
+        }
+        assert!(!flags.raised(0).expect("flag 0"), "flag 0 was never raised");
+        assert_eq!(FLAG_WAIT_OPS, 1);
+    }
 
     /// The host function the test graph records. The graph is never
     /// launched, so it never runs.

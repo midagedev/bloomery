@@ -63,11 +63,12 @@ mod gate {
 
     const NAME: &str = "gate_deepseek41_dsloop";
     /// PIN(2026-09-25): the step captured with the tl37 draft's tap: the
-    /// plain step's 1167 nodes and one `ds41_hc_mean` per tapped layer.
-    const TAP_STEP_NODES: usize = 1170;
+    /// plain step's 1169 nodes (1167 before the engram rows' wait and copy
+    /// nodes) and one `ds41_hc_mean` per tapped layer.
+    const TAP_STEP_NODES: usize = 1172;
     /// PIN(2026-09-25): the pair pass with the same tap: twice the plain
     /// step's nodes and one `ds41_hc_mean` per tapped layer and row.
-    const TAP_PAIR_NODES: usize = 2340;
+    const TAP_PAIR_NODES: usize = 2344;
     /// Positions the greedy run stands at before the checks.
     const RUN: u32 = 144;
     /// The positions checked: even, so a rollback to them is granted

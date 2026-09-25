@@ -17,6 +17,18 @@
 //!   CPU build divides the same zeros by their zero sum. The free arm's path
 //!   moves with the placement and the rounding; this one is fed.
 //!
+//! - `--faults` (its own recipe, `just gate-gpu-ds41-faults`, alone in its
+//!   process so no earlier arm has touched the host tier's pages): the same
+//!   prompt from a reset, then [`FAULT_STEPS`] greedy tokens through the
+//!   engine's captured graph alone, each step's page faults read around it
+//!   (`getrusage(RUSAGE_SELF)`, less the engram helper thread's own, which
+//!   reads the engram table the load does not populate). Red when a step
+//!   from the second on takes a major fault, or more than [`FAULT_MINOR_PIN`]
+//!   minor ones: with the host set populated and locked at load
+//!   (`BLOOMERY_HOST_LOCK=1`, which the recipe sets) a step touches no host
+//!   page the load did not map and keep. Populated but not locked, another
+//!   process's reads reclaim pages between the load and the step.
+//!
 //! Red on any of: a position whose streams hold a NaN or an infinity at any
 //! seam (the engine's step refuses it too, with the fault word's layer and
 //! site; the probe names the seam and the buffer); a
@@ -64,6 +76,15 @@ mod gate {
     const TRIGGER_N: usize = 16;
     /// A run of this many equal generated tokens is a collapse.
     const COLLAPSE: usize = 8;
+    /// Generated tokens of the faults arm.
+    const FAULT_STEPS: usize = 32;
+    /// The most minor faults a step from the second on may take outside the
+    /// engram helper.
+    /// PIN(2026-09-25): measured 2 at generated step 26 and 0 at every other
+    /// step, with the host set populated and locked (and on a populated run
+    /// no other process reclaimed from); populate and lock off read 3,955 to
+    /// 53,198 per step.
+    const FAULT_MINOR_PIN: u64 = 2;
 
     /// The free arm's generated ids through position 315 on a gate placement
     /// of 809 card experts, the last of them fed at position 315.
@@ -95,20 +116,23 @@ mod gate {
         n_gen: usize,
         free: bool,
         trigger: bool,
+        faults: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_deepseek41_long [--free] [--trigger] [-n N]";
+        const USAGE: &str = "usage: gate_deepseek41_long [--free] [--trigger] [--faults] [-n N]";
         let mut a = Args {
             n_gen: FREE_N,
             free: false,
             trigger: false,
+            faults: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--free" => a.free = true,
                 "--trigger" => a.trigger = true,
+                "--faults" => a.faults = true,
                 "-n" => {
                     a.n_gen = it
                         .next()
@@ -118,7 +142,7 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.free || a.trigger) {
+        if !(a.free || a.trigger || a.faults) {
             (a.free, a.trigger) = (true, true);
         }
         if a.n_gen < 2 {
@@ -157,6 +181,9 @@ mod gate {
             .ok_or("prompt0.tsv holds no row")?
             .tokens;
         let mut pass = true;
+        if args.faults {
+            pass &= faults_arm(&mut m, &prompt)?;
+        }
         if args.free {
             let ik = read_greedy(&dir.join("greedy-ik-cpu-64-p0.tsv"))?
                 .into_iter()
@@ -239,6 +266,82 @@ mod gate {
             println!("{name}: tokens {:?}", self.tokens);
             finite && run_ok && eager_ok
         }
+    }
+
+    /// This process's page faults so far, major and minor.
+    fn process_faults() -> Result<[u64; 2], GateError> {
+        // SAFETY: `rusage` is integers only, so all-zero is a valid value,
+        // and `getrusage` writes only through the pointer it is given.
+        let (rc, ru) = unsafe {
+            let mut ru: libc::rusage = std::mem::zeroed();
+            let rc = libc::getrusage(libc::RUSAGE_SELF, &raw mut ru);
+            (rc, ru)
+        };
+        if rc != 0 {
+            return Err(format!("getrusage: {}", std::io::Error::last_os_error()).into());
+        }
+        Ok([u64::try_from(ru.ru_majflt)?, u64::try_from(ru.ru_minflt)?])
+    }
+
+    /// The engram helper thread's page faults so far, major and minor; zero
+    /// with the helper off (`BLOOMERY_ENGRAM_HELPER=0`), whose rows the
+    /// step thread reads and which then count.
+    fn helper_faults(m: &Deepseek41Model) -> Result<[u64; 2], GateError> {
+        Ok(m.body("faults")?
+            .step_rows()
+            .helper_faults()
+            .map_or([0, 0], |f| [f.major, f.minor]))
+    }
+
+    /// The faults arm: `prompt` from a reset, then [`FAULT_STEPS`] greedy
+    /// steps of the engine's graph, each step's faults outside the engram
+    /// helper against the pins from the second step on.
+    fn faults_arm(m: &mut Deepseek41Model, prompt: &[u32]) -> Result<bool, GateError> {
+        let host = bloomery_gpu::hybrid::host_levers()?;
+        m.reset()?;
+        let mut next = m.step(prompt)?;
+        let (mut tokens, mut rows) = (
+            Vec::with_capacity(FAULT_STEPS),
+            Vec::with_capacity(FAULT_STEPS),
+        );
+        for _ in 0..FAULT_STEPS {
+            let (p0, h0) = (process_faults()?, helper_faults(m)?);
+            let tok = m.step(&[next])?;
+            let (p1, h1) = (process_faults()?, helper_faults(m)?);
+            let own = |i: usize| (p1[i] - p0[i]).saturating_sub(h1[i] - h0[i]);
+            rows.push([own(0), own(1), h1[0] - h0[0], h1[1] - h0[1]]);
+            tokens.push(tok);
+            next = tok;
+        }
+        let mut ok = true;
+        for (i, [maj, min, hmaj, hmin]) in rows.iter().enumerate() {
+            let step = i + 1;
+            let judged = step >= 2;
+            let good = !judged || (*maj == 0 && *min <= FAULT_MINOR_PIN);
+            ok &= good;
+            println!(
+                "faults step={step} majflt={maj} minflt={min} (engram helper majflt={hmaj} \
+                 minflt={hmin}){}",
+                if judged {
+                    format!(": {}", verdict(good))
+                } else {
+                    " (first step: not judged)".to_string()
+                }
+            );
+        }
+        let judged = &rows[1..];
+        let max_min = judged.iter().map(|r| r[1]).max().unwrap_or(0);
+        let sum_maj: u64 = judged.iter().map(|r| r[0]).sum();
+        println!(
+            "faults: populate={} lock={}, steps 2..={FAULT_STEPS} outside the engram helper: \
+             majflt total {sum_maj} (pin 0), minflt max {max_min} per step (pin \
+             {FAULT_MINOR_PIN}): {}",
+            host.populate,
+            host.lock,
+            verdict(ok)
+        );
+        println!("faults: tokens {tokens:?}");
+        Ok(ok)
     }
 
     /// The longest run of one value in `tokens` and where it starts.

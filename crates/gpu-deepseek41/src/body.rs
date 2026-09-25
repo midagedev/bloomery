@@ -38,9 +38,12 @@
 //! head. Each engram site's token-only work runs in the host-leg shadow of the
 //! MoE sub-layer before the site's layer: it reads the step image alone, and
 //! the site's engram step is its first reader. The host half of a
-//! step ([`ChainBody::decode_input`]) plans it, reads its embedding and
-//! engram rows from the file (the engram rows on a helper thread,
-//! [`StepRows`]) and builds its image.
+//! step ([`ChainBody::decode_input`]) plans it, reads its embedding row from
+//! the file while a helper thread reads its engram rows ([`StepRows`]), and
+//! builds its image; the rows reach the card after the launch
+//! ([`RowsArrival`]): the first site's token-only work waits on a host flag
+//! and copies them in, and the host delivers them before it serves the
+//! replay's host tier ([`ChainBody::serve_replay`]).
 //!
 //! The pair pass ([`Body::enqueue_pair`]) runs two tokens as rows one layer
 //! apart on the same launches, so the host tier serves one row's layer while
@@ -68,7 +71,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::hybrid::{Boundary, BoundaryShape, Chain, HOST, Hybrid, SlotMap, levers};
 use bloomery_gpu::model::{ChainBody, StepProbe};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, window};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
@@ -82,7 +85,7 @@ use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
 };
 use crate::chain::ffn::{CardStacks, Ds41Host, FfnIo, FfnPiece, FfnTaps, ShadowWork};
-use crate::chain::glue::{EngramKv, EngramStep, Glue, StepRows};
+use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, StepRows};
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 
@@ -453,6 +456,9 @@ struct LayerStep {
     /// The engram site whose token-only work the layer's MoE sub-layer runs
     /// in its host-leg shadow: the site at the next layer.
     shadow_site: Option<usize>,
+    /// That work is the step's first reader of the engram rows: the rows'
+    /// arrival ([`RowsArrival`]) precedes it.
+    arrive: bool,
     /// Its MoE sub-layer folds the next sub-layer's input.
     folds: bool,
 }
@@ -560,6 +566,14 @@ pub struct Body {
     planner: Planner,
     plan: StepPlan,
     rows: StepRows,
+    /// How the rows reach each row's image copy after the launch.
+    arrival: RowsArrival,
+    /// The row whose image copy waits for the rows in flight: refreshed, not
+    /// delivered yet ([`Body::arrive`]).
+    due: Option<usize>,
+    /// A step's rows failed after its launch: the card ran it on the rows
+    /// the staging held before, and every step is refused until a reset.
+    rows_failed: bool,
     /// The tokens decoded so far, one per position: `ctx_max` reserved.
     history: Vec<u32>,
     /// Which position's row each ring slot and each compressor state slot
@@ -755,7 +769,9 @@ impl Body {
         &self.hybrid
     }
 
-    /// The rows the last [`ChainBody::decode_input`] read for its step.
+    /// The rows the last [`ChainBody::decode_input`] read for its step: its
+    /// ids at once, its engram rows once they are delivered (by the replay's
+    /// service, an eager chain, or the next step's host half).
     #[must_use]
     pub fn step_rows(&self) -> &StepRows {
         &self.rows
@@ -933,6 +949,7 @@ impl Body {
         head: &mut Head,
         observe: &mut dyn FnMut(&Gpu, Seam<'_>) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
+        self.arrive_eager(gpu.stream())?;
         let mut p = self.parts();
         p.hybrid.begin_chain(gpu.stream())?;
         let mut cur = Cursor::default();
@@ -1002,6 +1019,7 @@ impl Body {
         w: &Weights,
         heads: [&mut Head; PAIR_ROWS],
     ) -> Result<(), GpuError> {
+        self.arrive_eager(gpu.stream())?;
         let mut p = self.parts();
         if p.lanes.len() < PAIR_ROWS {
             return Err(GpuError::State {
@@ -1132,7 +1150,10 @@ impl Body {
     }
 
     /// One host-to-device copy of the whole image into row `row`'s copy,
-    /// which must hold the step `input` names.
+    /// which must hold the step `input` names; its rows section is then the
+    /// arrival's: the row's flag is lowered, and rows already read (the
+    /// helper off, or none in flight) are delivered at once, else once the
+    /// helper finishes ([`Body::arrive`]).
     fn refresh_row(
         &mut self,
         stream: &CudaStream,
@@ -1166,11 +1187,54 @@ impl Body {
             what: WHAT,
             missing: "the row's buffers",
         })?;
+        // Synchronizes the stream: no launched copy of the staging is
+        // pending from here on.
         lane.params.copy_from_host(stream, self.image.words())?;
         if let Some(tap) = self.tap.as_mut() {
             tap.pos[row] = Some(input.pos);
         }
+        self.arrival.clear(row)?;
+        self.due = Some(row);
+        if !self.rows.in_flight() {
+            self.arrive()?;
+        }
         Ok(())
+    }
+
+    /// Deliver the due row's engram rows: take them back from the helper,
+    /// write them into the row's staging and raise its flag. The flag is
+    /// raised on every path — a launched arrival waits for it — so a helper
+    /// that failed leaves the card on the rows the staging held before, and
+    /// the failure is returned and refuses every later step until a reset.
+    fn arrive(&mut self) -> Result<(), GpuError> {
+        let Some(row) = self.due.take() else {
+            return Ok(());
+        };
+        let rows = &mut self.rows;
+        let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rows.finish()));
+        let delivered = self.arrival.deliver(row, self.rows.engram());
+        let result = match taken {
+            Ok(taken) => taken.and(delivered),
+            Err(p) => {
+                self.rows_failed = true;
+                std::panic::resume_unwind(p)
+            }
+        };
+        if result.is_err() {
+            self.rows_failed = true;
+        }
+        result
+    }
+
+    /// Before an eager chain (not a capture): the due rows delivered, so the
+    /// arrival the chain enqueues passes at once. An eager chain's host tier
+    /// is served while it is enqueued, and would otherwise wait for a card
+    /// held on the flag.
+    fn arrive_eager(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if capturing(stream)? {
+            return Ok(());
+        }
+        self.arrive()
     }
 
     /// The body's buffers a row's launches borrow, apart from the host half.
@@ -1188,6 +1252,7 @@ impl Body {
             ffn,
             glue,
             tap,
+            arrival,
             ..
         } = self;
         Parts {
@@ -1203,6 +1268,7 @@ impl Body {
             ffn,
             glue,
             tap: tap.as_mut(),
+            arrival,
         }
     }
 }
@@ -1229,6 +1295,7 @@ struct Parts<'a> {
     ffn: &'a mut FfnPiece,
     glue: &'a mut Glue,
     tap: Option<&'a mut FeatureTap>,
+    arrival: &'a RowsArrival,
 }
 
 impl Parts<'_> {
@@ -1358,9 +1425,10 @@ impl Parts<'_> {
         let mut engram_kv = step.shadow_site.map(|layer| EngramKv {
             glue: &mut *self.glue,
             w,
-            params: &*params,
+            params: &mut *params,
             layer,
             row,
+            arrive: step.arrive.then_some(self.arrival),
         });
         let mut one: [&mut dyn ShadowWork; 1];
         let shadow: &mut [&mut dyn ShadowWork] = match engram_kv.as_mut() {
@@ -1750,11 +1818,24 @@ impl ChainBody for Body {
     }
 
     /// The step at `pos` after the tokens decoded so far: its plan, its
-    /// embedding row read from the file on this thread and its engram rows by
-    /// the rows' helper meanwhile ([`StepRows::fill`]), and its image built.
-    /// A position other than the next one is refused.
+    /// embedding row read from the file on this thread while the rows'
+    /// helper reads its engram rows ([`StepRows::begin`]), and its image built
+    /// without them — they reach the card after the launch
+    /// ([`RowsArrival`]). Rows still due from before (a pair's first row, or
+    /// a step whose chain never ran) are delivered first. A position other
+    /// than the next one is refused, and so is every step after one whose
+    /// rows failed, until a reset.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
         const WHAT: &str = "deepseek41 Body::decode_input";
+        if self.rows_failed {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a reset: an earlier step's engram rows failed after its launch, and \
+                          the card ran that step on stale rows",
+            });
+        }
+        self.arrive()?;
+        self.rows.finish()?;
         if self.history.len() != pos as usize || self.history.len() >= self.positions() {
             return Err(GpuError::Shape {
                 what: WHAT,
@@ -1768,7 +1849,9 @@ impl ChainBody for Body {
         self.planner
             .plan_into(&[token], pos, &self.history, &mut self.plan)
             .map_err(|e| GpuError::plan(WHAT, e))?;
-        self.rows.fill(&self.file, &self.plan)?;
+        self.rows.begin(&self.file, &self.plan)?;
+        // The rows section is written again by the arrival; what it holds
+        // here is never read.
         self.image
             .build(&self.plan, self.rows.embd(), self.rows.engram())?;
         self.history.push(token);
@@ -1789,7 +1872,13 @@ impl ChainBody for Body {
     /// row's streams, folds and lists are zeroed in place — a captured chain
     /// keeps their addresses — and the token history is emptied. The ring
     /// shadows are not: a cut reads only shadow rows a step since wrote.
+    /// Rows due or in flight are taken back first; a failure there is
+    /// returned before anything is zeroed, and a second reset finds nothing
+    /// in flight. A reset lifts the refusal a failed step's rows left.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.arrive()?;
+        self.rows.finish()?;
+        self.rows_failed = false;
         let stream = gpu.stream();
         for layer in &mut self.kv {
             layer.zero(stream)?;
@@ -1847,9 +1936,12 @@ impl ChainBody for Body {
         caches + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>() + self.feature_bytes()
     }
 
-    /// The host tier's share of the chain a replay just submitted.
+    /// The replay's engram rows delivered ([`Body::arrive`]), then the host
+    /// tier's share of the chain it submitted — served even when the rows
+    /// failed, whose error comes back after it.
     fn serve_replay(&mut self) -> Result<(), GpuError> {
-        self.hybrid.serve_captured()
+        let rows = self.arrive();
+        self.hybrid.serve_captured().and(rows)
     }
 
     fn decode_pair(
@@ -1870,9 +1962,11 @@ impl ChainBody for Body {
         Body::enqueue_pair(self, gpu, w, heads)
     }
 
-    /// The host tier's share of the pair pass a replay just submitted.
+    /// [`ChainBody::serve_replay`] of the pair pass: row 1's rows (row 0's
+    /// were delivered before the launch), then the host tier's share.
     fn serve_replay_pair(&mut self) -> Result<(), GpuError> {
-        self.hybrid.serve_captured_of(Chain::Pair)
+        let rows = self.arrive();
+        self.hybrid.serve_captured_of(Chain::Pair).and(rows)
     }
 
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
@@ -1932,6 +2026,7 @@ impl ChainBody for Body {
         let lanes = (0..PAIR_ROWS)
             .map(|_| Lane::new(stream, hp, image.layout().words()))
             .collect::<Result<Vec<_>, _>>()?;
+        let arrival = RowsArrival::new(gpu.context(), PAIR_ROWS, image.layout())?;
 
         let n_expert = hp.experts.n_expert;
         let map = SlotMap::from_rows(
@@ -1993,6 +2088,9 @@ impl ChainBody for Body {
             planner,
             plan: StepPlan::default(),
             rows,
+            arrival,
+            due: None,
+            rows_failed: false,
             history: Vec::with_capacity(ctx_max),
             holds,
             shadow_from: 0,
@@ -2132,8 +2230,12 @@ fn layer_steps(
             list,
             engram,
             shadow_site: (l + 1 < layers.end && sites.contains(&(l + 1))).then_some(l + 1),
+            arrive: false,
             folds,
         });
+    }
+    if let Some(first) = steps.iter_mut().find(|s| s.shadow_site.is_some()) {
+        first.arrive = true;
     }
     if hp.hc.streams != HC_STREAMS {
         return Err(GpuError::Shape {

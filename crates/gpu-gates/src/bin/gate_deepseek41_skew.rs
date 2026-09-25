@@ -74,7 +74,7 @@ mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::weights::Weights;
-    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu::{FLAG_WAIT_OPS, Gpu, GpuError};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, Seam};
     use bloomery_gpu_gates::nodes::{StepNode, capture_order};
     use bloomery_gpu_gates::oracle::deepseek41::{D1, STEP4};
@@ -810,23 +810,27 @@ mod gate {
         let (k1, m1, o1) = census(&one);
         let (k2, m2, o2) = census(&pair);
         let (n1, n2) = (k1.values().sum::<usize>(), k2.values().sum::<usize>());
+        // PIN(2026-09-25): each row's engram rows arrive after the launch — one flag wait and one
+        // copy per row (`RowsArrival`); the pass had no copy.
         println!(
             "predict pair: every launch of the one-token step once per row — nodes {} = kernels \
-             {} + memops {}, other 0 (twice the step's {} = {} + {})",
+             {} + memops {} + memcpy {} (twice the step's {} = {} + {} + {})",
             2 * one.len(),
             2 * n1,
             2 * m1,
+            2 * o1.len(),
             one.len(),
             n1,
-            m1
+            m1,
+            o1.len()
         );
         let names_twice =
             k1.len() == k2.len() && k1.iter().all(|(k, &c)| k2.get(k) == Some(&(2 * c)));
         let ok_nodes = pair.len() == 2 * one.len()
             && n2 == 2 * n1
             && m2 == 2 * m1
-            && o1.is_empty()
-            && o2.is_empty()
+            && o1 == ["memcpy"]
+            && o2 == ["memcpy"; PAIR_ROWS]
             && names_twice;
         println!(
             "graph pair: nodes={} kernels={n2} memops={m2} other={} [{}]; {} kernel names, each \
@@ -846,8 +850,9 @@ mod gate {
             }
         }
 
-        // The batches in the pass's order: go A0, go B0; per later layer
-        // wait A, go A, wait B, go B; then wait A, wait B.
+        // The batches in the pass's order: go A0, A's rows wait, go B0, B's
+        // rows wait (each in its row's layer-0 shadow); per later layer wait
+        // A, go A, wait B, go B; then wait A, wait B.
         let ops: Vec<u32> = pair
             .iter()
             .filter_map(|n| match n {
@@ -855,14 +860,15 @@ mod gate {
                 _ => None,
             })
             .collect();
-        let mut want_ops = vec![GO_OPS, GO_OPS];
+        let mut want_ops = vec![GO_OPS, FLAG_WAIT_OPS, GO_OPS, FLAG_WAIT_OPS];
         for _ in 1..layers.len() {
             want_ops.extend([WAIT_OPS, GO_OPS, WAIT_OPS, GO_OPS]);
         }
         want_ops.extend([WAIT_OPS, WAIT_OPS]);
         let ok_order = ops == want_ops;
         println!(
-            "graph pair batches: {} in the pass's order (go {GO_OPS} ops, wait {WAIT_OPS}): {}",
+            "graph pair batches: {} in the pass's order (go {GO_OPS} ops, wait {WAIT_OPS}, rows \
+             wait {FLAG_WAIT_OPS}): {}",
             ops.len(),
             verdict(ok_order)
         );
@@ -899,6 +905,8 @@ mod gate {
         let mut open: Option<Vec<&str>> = None;
         for n in &pair {
             match n {
+                // A row's rows wait sits inside its layer-0 shadow.
+                StepNode::Memop(c) if *c == FLAG_WAIT_OPS => {}
                 StepNode::Memop(c) => {
                     if let Some(s) = open.take() {
                         shadows.push(s);

@@ -795,6 +795,15 @@ gate-gpu-ds41-skew *ARGS='--structure --sets --api':
 gate-gpu-ds41-long *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && bash tools/gpu-gate.sh gate_deepseek41_long {{ARGS}}'
 
+# Step-level page faults of the V4.1 engine on the gate placement, host set populated and locked
+# (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are
+# reclaimed under another process's reads): 32 greedy graph steps after a reset, alone in their
+# process, each step's faults outside the engram helper read around it; from step 2 on no major
+# fault and at most the pinned minor ones (the long gate's `--faults` arm). FAIL-first:
+# BLOOMERY_BOX_ENV="BLOOMERY_HOST_POPULATE=0 BLOOMERY_HOST_LOCK=0". 3090, gate lock.
+gate-gpu-ds41-faults:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} bash tools/gpu-gate.sh gate_deepseek41_long --faults'
+
 # ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — step 게이트
 # --greedy의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
 ik-greedy-ds41 PROMPT='0':

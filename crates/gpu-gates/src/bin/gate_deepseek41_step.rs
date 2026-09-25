@@ -8,8 +8,11 @@
 //! - `--structure` (G2): the step captured by the engine (`capture_step`)
 //!   holds, as kernels, the launches the pieces report — per layer the
 //!   attention's by its kind and the MoE sub-layer's by its card experts, the
-//!   glue's per step and the attention's gather — and two memory-operation
-//!   batches per layer, nothing else; a replay of the captured step on the
+//!   glue's per step and the attention's gather — two memory-operation
+//!   batches per layer, and the engram rows' arrival: one flag wait and the
+//!   one copy after it, in the shadow of the layer before the first engram
+//!   site, ahead of every reader of the rows; nothing else. A replay of the
+//!   captured step on the
 //!   step4 set's injected state, and on the d1 and d2 sets' (every indexer
 //!   layer selecting; d2 at the file's own `top_k`), is bit-identical to an
 //!   eager run of it (the logits and every cache, compressed row, index key
@@ -128,7 +131,7 @@ mod gate {
     use bloomery_gpu::hybrid::HostExperts;
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu::weights::Weights;
-    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu::{FLAG_WAIT_OPS, Gpu, GpuError};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, Seam};
     use bloomery_gpu_deepseek41::chain::attn::AttnChain;
     use bloomery_gpu_deepseek41::chain::ffn::{Ds41Host, FfnPiece};
@@ -843,12 +846,16 @@ mod gate {
             );
         }
         let kernels = 1 + attn_total + ffn_total + glue;
+        // PIN(2026-09-25): the engram rows reach the card after the launch — one flag wait and
+        // one copy before the first site's token-only work (`RowsArrival`), where the step had
+        // two batches per layer and no copy.
+        let memops = 2 * hp.n_layer + ARRIVALS;
         println!(
             "predict step: gather 1 + attn {attn_total} + ffn {ffn_total} + glue {glue} = {kernels} \
-             kernels, {} memops, 0 other",
-            2 * hp.n_layer
+             kernels, {memops} memops (go and wait per layer, {ARRIVALS} rows wait), {ARRIVALS} \
+             memcpy (the rows' arrival), 0 other"
         );
-        Ok((kernels, 2 * hp.n_layer))
+        Ok((kernels, memops))
     }
 
     fn structure(
@@ -863,17 +870,18 @@ mod gate {
         };
         let nodes = m.capture_step()?;
         let list = m.step_graph_nodes()?;
-        let ([kernels, memops], other) = count_kinds(
+        let ([kernels, memops, memcpy], other) = count_kinds(
             &list,
             [
                 sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL,
                 sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP,
+                sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY,
             ],
         );
-        let ok_nodes = kernels == want_k && memops == want_m && other == 0;
+        let ok_nodes = kernels == want_k && memops == want_m && memcpy == ARRIVALS && other == 0;
         println!(
-            "graph: nodes={nodes} kernels={kernels} memops={memops} other={other} predicted \
-             kernels={want_k} memops={want_m}: {}",
+            "graph: nodes={nodes} kernels={kernels} memops={memops} memcpy={memcpy} other={other} \
+             predicted kernels={want_k} memops={want_m} memcpy={ARRIVALS}: {}",
             verdict(ok_nodes)
         );
 
@@ -908,16 +916,103 @@ mod gate {
             all_same &= same;
         }
 
-        let (ok_topo, ok_shadow) = {
+        let (ok_topo, ok_shadow, ok_arrival) = {
             let (gpu, w, body) = m.body_parts("structure")?;
             let graph = step_graph(gpu, w, body, head)?;
             let ok_topo = hc_branch(&graph, &body.layers());
-            (ok_topo, shadow_sets(&graph.nodes, body, split, hp)?)
+            let ok_arrival = rows_arrival(&graph, body, split, hp)?;
+            (
+                ok_topo,
+                shadow_sets(&graph.nodes, body, split, hp)?,
+                ok_arrival,
+            )
         };
 
         let (gpu, _, body) = m.body_parts("structure")?;
         piece_modules(gpu, body, hp, split)?;
-        Ok(ok_nodes && all_same && ok_topo && ok_shadow)
+        Ok(ok_nodes && all_same && ok_topo && ok_shadow && ok_arrival)
+    }
+
+    /// Flag waits a step holds: the engram rows' arrival, one per step.
+    const ARRIVALS: usize = 1;
+
+    /// Whether node `n` is a go or a wait batch of the host tier — a memop
+    /// batch other than the rows' flag wait.
+    fn host_batch(n: &StepNode) -> bool {
+        matches!(n, StepNode::Memop(c) if *c != FLAG_WAIT_OPS)
+    }
+
+    /// The engram rows reach the card after the launch, and before anything
+    /// reads them: the step holds one flag wait ([`FLAG_WAIT_OPS`] ops), the
+    /// one copy depends on it alone, and the first site's token-only work
+    /// (its rows' decode first) depends on the copy — all in the host-leg
+    /// shadow of the layer before that site, off the critical path; no rows
+    /// decode runs before the copy.
+    fn rows_arrival(
+        g: &Captured,
+        body: &Body,
+        split: &Split,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        let layers = body.layers();
+        let at = regions(&g.nodes, &layers);
+        let waits: Vec<usize> = (0..g.nodes.len())
+            .filter(|&i| g.nodes[i] == StepNode::Memop(FLAG_WAIT_OPS))
+            .collect();
+        let copies: Vec<usize> = (0..g.nodes.len())
+            .filter(|&i| matches!(&g.nodes[i], StepNode::Other(k) if k == "memcpy"))
+            .collect();
+        let first = *hp
+            .engram
+            .layer_ids
+            .iter()
+            .min()
+            .ok_or("the file has no engram site")?;
+        let decode = shadow::engram_kv_kernels(split, first)?[0];
+        let decodes: Vec<usize> = (0..g.nodes.len())
+            .filter(|&i| {
+                g.kernel(i)
+                    .is_some_and(|k| k.starts_with("ds41_glue_engram_rows"))
+            })
+            .collect();
+        let (ok, how) = match (waits.as_slice(), copies.as_slice()) {
+            (&[w], &[c]) => {
+                let next = c + 1;
+                let ok_edges = g.deps[c] == [w] && g.deps[next] == [c];
+                let ok_next = g.kernel(next) == Some(decode);
+                let ok_where = at[w] == Region::Batch
+                    && at[c] == Region::Shadow(first - 1)
+                    && at[next] == Region::Shadow(first - 1);
+                let ok_before = decodes.first().is_some_and(|&d| d > c);
+                let how = format!(
+                    "wait node {w} (depends on [{}]), copy node {c} (depends on [{}]), then node \
+                     {next} [{}] (depends on [{}]); copy in {:?}, want the shadow of layer {} (the \
+                     layer before site {first}); first rows decode at node {}",
+                    labels(g, &g.deps[w]),
+                    labels(g, &g.deps[c]),
+                    label(g, next),
+                    labels(g, &g.deps[next]),
+                    at[c],
+                    first - 1,
+                    decodes
+                        .first()
+                        .map_or_else(|| "none".to_string(), ToString::to_string),
+                );
+                (ok_edges && ok_next && ok_where && ok_before, how)
+            }
+            _ => (
+                false,
+                format!(
+                    "{} flag waits at [{}], {} copies at [{}], want one of each",
+                    waits.len(),
+                    bloomery_gpu_gates::comma_list(&waits),
+                    copies.len(),
+                    bloomery_gpu_gates::comma_list(&copies)
+                ),
+            ),
+        };
+        println!("arrival: engram rows {how}: {}", verdict(ok));
+        Ok(ok)
     }
 
     // --------------------------------------------------------- shadow sets
@@ -977,7 +1072,7 @@ mod gate {
         const PRE: &str = "ds41_hc_pre";
         const POST: &str = "ds41_hc_post";
         let mem: Vec<usize> = (0..g.nodes.len())
-            .filter(|&i| matches!(g.nodes[i], StepNode::Memop(_)))
+            .filter(|&i| host_batch(&g.nodes[i]))
             .collect();
         if mem.len() != 2 * layers.len() {
             println!(
@@ -1047,15 +1142,16 @@ mod gate {
         ok && ok_count
     }
 
-    /// Each node's region: memory-operation batch `2i` is layer `layers[i]`'s
-    /// go and `2i + 1` its wait.
+    /// Each node's region: the host tier's batch `2i` is layer `layers[i]`'s
+    /// go and `2i + 1` its wait; the rows' flag wait is a batch that opens no
+    /// region.
     fn regions(nodes: &[StepNode], layers: &std::ops::Range<usize>) -> Vec<Region> {
         let mut seen = 0usize;
         nodes
             .iter()
             .map(|n| {
                 if matches!(n, StepNode::Memop(_)) {
-                    seen += 1;
+                    seen += usize::from(host_batch(n));
                     return Region::Batch;
                 }
                 match seen {
@@ -1093,7 +1189,7 @@ mod gate {
         let memops: Vec<u32> = nodes
             .iter()
             .filter_map(|n| match n {
-                StepNode::Memop(c) => Some(*c),
+                StepNode::Memop(c) if host_batch(n) => Some(*c),
                 _ => None,
             })
             .collect();
@@ -1104,7 +1200,8 @@ mod gate {
                 _ => None,
             })
             .collect();
-        let ok_shape = memops.len() == 2 * layers.len() && others.is_empty();
+        // The rows' arrival copy is the one other node ([`rows_arrival`]).
+        let ok_shape = memops.len() == 2 * layers.len() && others == ["memcpy"; ARRIVALS];
         println!(
             "shadow: {} nodes in enqueue order, {} memop batches (ops: go {:?}, wait {:?}), \
              other [{}]: {}",

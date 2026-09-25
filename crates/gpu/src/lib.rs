@@ -58,7 +58,7 @@ pub(crate) mod tensor;
 pub mod weights;
 
 pub use fault::{FAULT_NONE, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
-pub use graph::{Branch, Graph, NodeInfo};
+pub use graph::{Branch, FLAG_WAIT_OPS, Graph, HostFlags, NodeInfo, capturing};
 pub use model::GpuModel;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.
