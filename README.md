@@ -70,10 +70,12 @@ Prompt processing on the same card, arms alternated in one window, three rounds 
 
 | Prompt | bloomery pp tok/s | llama.cpp | llama.cpp `-ub 4096` | mistral.rs |
 |---:|---:|---:|---:|---:|
-| 512 | **5,304** | 4,256 | — | 3,432 |
-| 4096 | 2,615 | 4,170 | **6,864** | 1,320 |
+| 512 | **6,236** | 4,320 | — | 3,469 |
+| 4096 | 5,557 | 4,204 | **6,864**¹ | 1,327 |
 
-The prompt runs in ubatches of 512 tokens through a grouped int8 tensor-core GEMM, each expert read once per ubatch. At 4096 tokens about half the time is attention [derived: the wall beyond eight 512-token ubatches], which still reuses the decode kernel in row chunks; a prefill attention kernel is next. Source: rig-log [2026-09-25, qwen3prefill](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab).
+¹ From an earlier window the same day (rig-log [qwen3prefill](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab)); the other columns share one window.
+
+The prompt runs in ubatches of 512 tokens through a grouped int8 tensor-core GEMM, each expert read once per ubatch, and a prefill attention kernel that stages each 64-key tile once for 64 query rows and runs both products on the tensor cores. At 4096 tokens the remaining gap to llama.cpp at `-ub 4096` is the ubatch size: eight 512-token ubatches read every expert eight times; a load-time ubatch size is next. Source: rig-log [2026-09-25, q3pflash](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3pflash-ab).
 
 Read these numbers with their conditions:
 

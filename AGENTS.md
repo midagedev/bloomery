@@ -318,7 +318,10 @@ first suspect is a hung gate on the box, not the agent.
   of at most 8 positions, so neither number has been measured yet.~~ Since
   2026-09-25 (`dfa8b5d`) Qwen3 runs a prompt of P ≥ 9 in ubatches of 512 through
   the grouped int8 GEMM: pp512 5,304 and pp4096 2,615 tok/s on the A6000
-  (llama.cpp 4,256 / 4,170, `-ub 4096` 6,864; rig-log 09-25#qwen3prefill-ab);
+  (llama.cpp 4,256 / 4,170, `-ub 4096` 6,864; rig-log 09-25#qwen3prefill-ab),
+  and since `54ef56e` (q3pflash, a prefill attention kernel) pp512 6,236 and
+  pp4096 5,557 (llama.cpp 4,320 / 4,204 in the same lease; rig-log
+  09-25#q3pflash-ab);
   ~~V4.1 still feeds one decode step per token (batched prefill in flight).~~ Since
   2026-09-25 (`43cd107`) V4.1 runs a prompt in batches of up to 512 positions, bit for bit the
   decode steps' state: pp512 91.2 and pp4096 89.2 tok/s on the A6000 plan (a), 2.97x the step
