@@ -45,7 +45,7 @@ use gguf::write::{Layout, TensorDecl, WriteError, Writer};
 use gguf::{GENERAL_ALIGNMENT, GgmlType, LoadError, Split, Value, dequant_row};
 use sha2::{Digest, Sha256};
 
-use crate::arch::deepseek41::hparams::{DenseStream, Hparams, LayerKind, Stream};
+use super::hparams::{DenseStream, Hparams, LayerKind, Stream};
 use crate::arch::dspark::{self, DraftHparams};
 use crate::placement::PlacementError;
 

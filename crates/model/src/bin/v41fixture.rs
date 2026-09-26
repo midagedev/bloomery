@@ -1,4 +1,4 @@
-//! v41fixture — the V4.1 gate fixture (`model::fixture`): print its layout,
+//! v41fixture — the V4.1 gate fixture (`model::arch::deepseek41::fixture`): print its layout,
 //! write it, or check a written one against its source.
 //!
 //!     v41fixture plan <real first shard> [--draft <real draft>] [flags]
@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gguf::Split;
-use model::fixture::{self, FilePlan, Options, PlannedTensor, Sample, TensorStat};
+use model::arch::deepseek41::fixture::{
+    self, FilePlan, Options, PlannedTensor, Sample, TensorStat,
+};
 use model::placement::card_budget;
 
 const USAGE: &str = "usage: v41fixture plan <real first shard> [--draft <real draft>] [flags]

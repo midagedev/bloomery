@@ -1,4 +1,4 @@
-//! The V4.1 gate fixture's generator (`model::fixture`, bin `v41fixture`),
+//! The V4.1 gate fixture's generator (`model::arch::deepseek41::fixture`, bin `v41fixture`),
 //! against the real file's header (`gguf::v41::model`) and the real DSpark
 //! draft's (`$BLOOMERY_DSPARK_MODEL`). Four contracts:
 //!
@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use gguf::write::Writer;
 use gguf::{GgmlType, Split, Value};
-use model::fixture::{
+use model::arch::deepseek41::fixture::{
     self, FilePlan, KEY_CARD_BUDGET, KEY_SEED, KEY_SOURCE_LAYERS, KEY_SOURCE_SHA256, KEY_VERSION,
     LAYER_MAP, Options, Plan, PlannedTensor, Rule, Sample,
 };

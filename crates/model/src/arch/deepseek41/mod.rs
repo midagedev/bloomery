@@ -5,6 +5,7 @@
 //! host tier's layer spec (`host`) and the integers each step's graph reads
 //! (`plan`).
 
+pub mod fixture;
 pub mod host;
 pub mod hparams;
 pub mod kv;

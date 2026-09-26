@@ -637,7 +637,7 @@ gate-union:
 gate-r8:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test r8file -- --include-ignored --nocapture'
 
-# The V4.1 gate fixture's generator (model::fixture, bin v41fixture) against the real file's header and
+# The V4.1 gate fixture's generator (model::arch::deepseek41::fixture, bin v41fixture) against the real file's header and
 # the real DSpark draft's: the plan (the map's nine layers, the metadata overrides, the engine reading the
 # header-only files as the source's layer kinds), determinism, every sampled block's scales and RMS, and
 # small subset files written, opened and verified end to end (under 1 GB each, removed). Reads headers
