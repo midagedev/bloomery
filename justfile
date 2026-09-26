@@ -603,13 +603,16 @@ gate-ds41-host:
 # 호스트 합집합 호출 게이트: moe::HostLayer::experts_union_into가 토큰 열 k = 1·2·3·6에서 열마다
 # experts_into(그 열, 그 열의 목록)와 비트까지 같은지를 V4.1 라우팅 층 40개 전부(ref_deepseek41의 라우팅)에서
 # 지연 팔 둘로 재고, 파일 하나를 받는 진입은 V2-Lite 블록 1에서, 이름 붙은 거부 여섯은 각각 확인한다.
+# r8 배치: gate·up을 r8 사이드카에서 행-레인 타일로 읽는 층이 파일 행을 읽는 층과 열마다 비트까지 같다
+# (합성 층 하나, 모델 파일 없이 박스 CPU의 AVX2에서).
 # --test-threads=1: 두 테스트가 프로세스 전역 지연 레버(ops::set_defer_quant)를 뒤집는다.
 gate-union:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test union -- --ignored --nocapture --test-threads=1'
 
-# The r8 sidecar (model::r8file) on a synthetic two-shard source written with gguf::write: convert,
-# Sidecar::open and verify pass, every identity difference and conversion refusal is named, and the
-# r8conv binary converts and verifies end to end. Reads no model file.
+# r8 사이드카(model::r8file) 게이트: gguf::write로 쓴 합성 두 샤드 원본에서 변환, Sidecar::open, verify가
+# 통과하고, 원본과의 식별 차이와 변환 거부는 모두 이름으로 거부된다. r8conv 바이너리는 변환부터 검증까지
+# 끝까지 돈다. 호스트 티어 적재는 원본이 달라진 사이드카를, 호스트 층은 down까지 담은 사이드카를 이름으로
+# 거부한다. 모델 파일은 읽지 않는다.
 gate-r8:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test r8file -- --include-ignored --nocapture'
 
