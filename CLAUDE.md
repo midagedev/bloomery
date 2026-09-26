@@ -7,11 +7,13 @@
 
 ## 추적
 
-이슈는 셀프호스트 트래커 **MUL** 프로젝트. `GADAK_HOME=$HOME/.gadak gadak --workspace gdk`이고
+열린 일의 주인은 `docs/plan-triage.md` 하나다(사용자 결정 2026-09-27, `docs/rebuild.md` §7 결정 2).
+트리아지 항목을 MUL로 옮기거나 베끼지 않는다. 셀프호스트 트래커 **MUL** 프로젝트에는 단계 이정표,
+기계 변경, 업스트림만 둔다. `GADAK_HOME=$HOME/.gadak gadak --workspace gdk`이고
 Mac에서는 `/opt/homebrew/bin/gadak`을 쓴다(PATH의 dev 빌드는 미러 스키마를 못 읽는다).
 댓글은 `gadak --workspace gdk comment <KEY> "<본문>"`이다 — `issue comment`가 아니다.
 단계마다 이슈 하나(MUL-1 ~ MUL-5), 기계 변경은 MUL-6, 업스트림은 MUL-7.
-측정 수치는 [rig-log](https://github.com/midagedev/rig-log)의 `log/`에 먼저 쓰고 이슈에서 링크한다.
+측정 수치는 [rig-log](https://github.com/midagedev/rig-log)의 `log/`에 먼저 쓰고 트리아지 항목이나 이슈에서 링크한다.
 `TODO.md`를 열지 않는다.
 
 ## 위임

@@ -46,7 +46,11 @@ The plan lives in `docs/plan.md`. This file is the working contract.
   one says so and names the estimate; the round waits for the lead, and the
   lead asks the user. Gates and builds that finish inside 30 minutes need no
   approval. (Context: the error-source round queued ~2 h of CPU simulation,
-  50 min of it a duplicate arm, without anyone asking.)
+  50 min of it a duplicate arm, without anyone asking.) One exception (user,
+  2026-09-27, `docs/rebuild.md` §7 decision 3): during the rebuild waves, the
+  lead's landing batch of gates through `tools/gate-batch.sh` needs no approval
+  past 30 minutes; its predicted wall is still printed before it starts. Timing
+  sittings and every other long job still ask.
 - **Never relax a gate or a lint to make it pass.** Raise it with a dated
   comment and a reason, or file an issue. The lint levels in the root
   `Cargo.toml` carry the hit counts they were chosen from.
@@ -525,8 +529,11 @@ first suspect is a hung gate on the box, not the agent.
   A fork patch that changes codegen is a pin move (every gate); one that must not
   proves it with the `just ptx-scan` tables of `generate_ds41` and `gate_e2e`
   identical.
-- Issues live in the self-hosted tracker, project MUL. Measurements are written
-  up in the rig-log repository first and linked from the issue.
+- Open items have one owner, `docs/plan-triage.md` (user, 2026-09-27, `docs/rebuild.md`
+  §7 decision 2); the self-hosted tracker's MUL project keeps the stage milestones,
+  the machine changes and the upstream work, and never a copy of a triage item.
+  Measurements are written up in the rig-log repository first and linked from
+  the item or the issue.
 
 ## Known state, 2026-09-20
 
