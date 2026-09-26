@@ -264,7 +264,7 @@ extras   = Engram | Ple | Deepstack
 
 - **GD1**: 참조 세트 다섯 계열 중 파일 신원을 확인하는 것은 ik 노드 덤프 하나뿐이다. greedy·KLD·dsref 셋은 혼합 파일에서 떴다.
 - 그래서 `gate-gpu-dspark-graph`는 `f1d1168`(09-25) 뒤로 모든 착륙 묶음에서 FAIL 61–63줄의 **표준 빨강**이고, 리드가 md5를 손으로 비교한다. long `--free`와 step `--ppl`은 다른 파일의 참조와 조용히 비교한다.
-- 재생성 시팅(시팅 10)은 승인됐지만 열리지 않았다. → `crates/refset`과 `RefError::Stale`, 그리고 시팅 10.
+- ~~재생성 시팅(시팅 10)은 승인됐지만 열리지 않았다.~~ 시팅 10은 09-27에 돌았다(4분 42초). 세 계열을 공개 파일로 다시 떴고, 옛 세트는 `mixed`로 옮겨 두었다. `gate-gpu-dspark-graph`는 초록이 됐다. → 남은 것은 `crates/refset`과 `RefError::Stale`이다.
 
 ## 4. 삭제 목록
 

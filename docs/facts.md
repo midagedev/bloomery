@@ -15,7 +15,7 @@
 | BF16 (30) | 40 | 157,286,400 | 층마다 `ffn_gate_inp` |
 | F32 (0) | 449 | 2,097,600 | norm, sink, HC base/scale, `exp_probs_b(_vl)` |
 
-밀집(토큰마다 읽는 것, `token_embd`·engram 제외) 3,595,917,760 B = 3.35 GiB. 버린 혼합 파일(`…-engramQ8-tokembdBF16-attnQ8`, 445 GB)은 같은 텐서가 attention·공유 전문가 Q8_0, `token_embd` BF16(1.32 GB), engram Q8_0(209 GB)이었다 — 09-13~16에 품질을 보려고 만든 것이고(rig-log `docs/v41-experiment-plan.md`), 형식상 필요해서가 아니었다.
+밀집(토큰마다 읽는 것, `token_embd`·engram 제외) 3,595,917,760 B = 3.35 GiB. 버린 혼합 파일(`…-engramQ8-tokembdBF16-attnQ8`, ~~445 GB~~ 476,991,454,912 B = 477.0 GB = 444.2 GiB, 09-27 `du -sb`로 정정)은 같은 텐서가 attention·공유 전문가 Q8_0, `token_embd` BF16(1.32 GB), engram Q8_0(209 GB)이었다 — 09-13~16에 품질을 보려고 만든 것이고(rig-log `docs/v41-experiment-plan.md`), 형식상 필요해서가 아니었다.
 
 DeepSeek-V2-Lite-Chat Q3_K_M, GGUF v3, 텐서 377개, 블록 27개(블록 0은 dense, 1~26이 MoE),
 expert 64개 중 6개 사용, 임베딩 2048, 헤드 16.

@@ -63,6 +63,11 @@ MASKS = [
     (re.compile(r'(failed on line )\d+'), r'\1<n>'),
     (re.compile(r'\b\d+(\.\d+)?\s?(ns|us|µs|ms|s)\b(?!=)'), r'<t>\2'),
     (re.compile(r'\b(pid|PID|lock-holder-pid)([ =:]+)\d+'), r'\1\2<pid>'),
+    # The serve gate's server: its pid and version (the tree's commit, `-dirty` or not) in the props JSON, and the
+    # port it was given (`--port 0`).
+    (re.compile(r'"server_pid":\d+'), '"server_pid":<pid>'),
+    (re.compile(r'"version":"([^"(]*)\([0-9a-f]+(?:-dirty)?\)"'), r'"version":"\1(<commit>)"'),
+    (re.compile(r'\b(listening on [0-9.]+):\d+'), r'\1:<port>'),
     (re.compile(r'ThreadId\(\d+\)'), 'ThreadId(<n>)'),
     (re.compile(r"thread '[^']*' \(\d+\)"), "thread '<thread>' (<tid>)"),
     (re.compile(r"thread '[^']*'"), "thread '<thread>'"),

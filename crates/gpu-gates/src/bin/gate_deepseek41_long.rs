@@ -8,7 +8,7 @@
 //!
 //! Two arms on one load, each from a reset:
 //! - `--free`: prompt row 7 of `$BLOOMERY_DATA/greedy-ds41` (four ids; ik's
-//!   greedy run on it reaches 64 ids without an EOS, so the long run is
+//!   greedy run on it is tens of ids long before its EOS, so the long run is
 //!   compared over all of them — prompt 0's stops at its third token), then
 //!   greedy tokens until the file's EOS, at most `-n` (330). The EOS is where
 //!   generation ends: nothing after it is generated or judged.
@@ -277,7 +277,7 @@ mod gate {
             pass &= faults_arm(&mut m, &prompt)?;
         }
         if args.free {
-            // Prompt 7: ik's greedy ids for it run the full 64 without an
+            // Prompt 7: ik's greedy ids for it run tens of ids before its
             // EOS, so the free arm's long run is compared and judged; prompt
             // 0's stop at its third token.
             let free_prompt = read_prompts(&dir.join("prompt7.tsv"))?
