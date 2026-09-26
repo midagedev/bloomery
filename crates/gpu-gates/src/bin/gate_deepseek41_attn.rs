@@ -104,8 +104,8 @@ mod gate {
     };
     use bloomery_gpu_gates::oracle::{Set, for_arch};
     use bloomery_gpu_gates::{
-        GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, activations, bits_equal,
-        checks_failed, mask_bits_in, max_rel_err, no_local_depot, open_split, ref_ints,
+        GateError, KERNEL_BAND, Layout, NAN_F16, RefManifest, RefRow, RowKind, activations,
+        bits_equal, checks_failed, mask_bits_in, max_rel_err, no_local_depot, open_split, ref_ints,
         ref_model_path, ref_tensor_logical_in, same_bits, verdict, widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -147,8 +147,6 @@ mod gate {
     // PIN(2026-09-23): the largest rule distance was 3.87e-4 (d2_unfused
     // layer 14) over the 190 iqk layers.
     const IQK_BAND: f32 = 9.675e-4;
-    /// The f16 NaN every cache row we did not fill holds.
-    const NAN_F16: u16 = 0x7E00;
     /// The f16 bits of a mask cell the query sees, `0.0` ([`mask_bits_in`]).
     const SEEN: u16 = 0x0000;
     /// The depth cases: compressed keys visible, and the compressed source's

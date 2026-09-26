@@ -104,7 +104,7 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, RefRow, checks_failed, max_rel_err, ref_model_path,
+        GateError, NAN_F16, RefManifest, RefRow, checks_failed, max_rel_err, ref_model_path,
         ref_tensor_logical_in, ref_tensor_of_in, split_f32, verdict, widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -122,9 +122,6 @@ mod gate {
     /// factor 1.5 on top is the model's slack — first order, independent
     /// roundings, the attention band read as a spread.
     const Z: f64 = 9.0;
-    /// f16 NaN: what the gate fills every cache row and slot it does not
-    /// inject, so a read of one shows.
-    const NAN16: u16 = 0x7e00;
     /// The B4 attention gate's bands (`gate_deepseek41_attn`'s `IK_BAND`,
     /// `IQK_BAND`): our attention against ik's on the same queries and keys,
     /// the largest distance over a set relative to its largest value, on
@@ -841,7 +838,7 @@ mod gate {
         let (pos, len) = (set.pos(), set.window_len());
         let ring_rows = hp.window.min(before.len() / width);
         let first = pos + 1 - len;
-        let mut ring = vec![NAN16; ring_rows * width];
+        let mut ring = vec![NAN_F16; ring_rows * width];
         for c in first..pos {
             let slot = c % ring_rows;
             ring[slot * width..(slot + 1) * width]
@@ -861,7 +858,7 @@ mod gate {
                 let attended = f16s(man, view)?;
                 let n_vis = st.n_visible[0] as usize;
                 keys_lin.extend(widen(&attended[..n_vis * width]));
-                let mut rows = vec![NAN16; rows_of(set, st.ratio as usize) * width];
+                let mut rows = vec![NAN_F16; rows_of(set, st.ratio as usize) * width];
                 match kind.source {
                     None => {
                         let shift = usize::from(mutation == Some(Mutation::WrongRows));
@@ -904,7 +901,7 @@ mod gate {
             Some((_, true)) => {
                 let s = kind.stream.ok_or("a compressor without a stream")?;
                 let n = rows_of(set, set.plan.streams[s].ratio as usize);
-                Some(vec![NAN16; n * hp.indexer.head_dim])
+                Some(vec![NAN_F16; n * hp.indexer.head_dim])
             }
             _ => None,
         };

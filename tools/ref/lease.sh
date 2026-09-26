@@ -38,6 +38,9 @@
 #   threads         BLOOMERY_THREADS and BLOOMERY_SPIN as the run reads them; empty means the default
 #   core core-mhz   the core the run is pinned to and its clock [CORE]
 #   cpu cpu-mhz-range   the CPU model and the lowest and highest core clock
+#   cpu-freq        every cpu's cpufreq scaling_cur_freq as MHz mean, min and max, and cpu0's governor:
+#                   one awk over /sys, no process per core; a reading at the block's instant, not over
+#                   the run (timing-card.sh's `card` field prints it too, so every GPU runner has it)
 #   meminfo         page cache and free memory, kB
 #   mem pgmajfault  available memory and page cache, and the major-fault count
 #   read-sectors    sectors read from the model file's block device [MODEL]; the count is machine-wide,
@@ -378,6 +381,7 @@ __witness_smi() {
     __witness_out=$(nvidia-smi "$@") || __witness_rc=$?
   fi
 }
+# shellcheck disable=SC2001 # a prefix on every line of a multi-line value: sed, not ${var//}
 __witness_lines() { [ -z "$__witness_out" ] || sed "s/^/${__witness_indent}/" <<< "$__witness_out"; }
 __witness_joined() { [ -z "$__witness_out" ] || printf '%s\n' "$__witness_out" | tr '\n' "$1"; }
 __witness_head_load() {
@@ -434,6 +438,20 @@ __witness_cpu() { echo "${__witness_indent}cpu: $(grep -m1 'model name' /proc/cp
 __witness_cpu_mhz_range() {
   echo "${__witness_indent}cpu-mhz min/max: $(awk '$1 == "cpu" && $2 == "MHz" { if (lo == "" || $4 < lo) lo = $4; if ($4 > hi) hi = $4 } END { print lo, hi }' /proc/cpuinfo)"
 }
+# cpu_freq_summary: `MHz mean <m> min <lo> max <hi> over <n> cpus governor=<g>` from every cpu's
+# cpufreq scaling_cur_freq (kHz), read by one awk; `unavailable (…)` where the files are missing.
+cpu_freq_summary() {
+  local gov='?' g=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+  local -a files=(/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq)
+  if [ ! -r "${files[0]}" ]; then
+    echo "unavailable (no cpufreq scaling_cur_freq under /sys/devices/system/cpu)"
+    return 0
+  fi
+  [ -r "$g" ] && gov=$(< "$g")
+  awk -v gov="$gov" '{ s += $1; n++; if (n == 1 || $1 < lo) lo = $1; if ($1 > hi) hi = $1 }
+    END { printf "MHz mean %.0f min %.0f max %.0f over %d cpus governor=%s\n", s / n / 1000, lo / 1000, hi / 1000, n, gov }' "${files[@]}"
+}
+__witness_cpu_freq() { echo "${__witness_indent}cpu-freq: $(cpu_freq_summary)"; }
 __witness_meminfo() {
   echo "${__witness_indent}meminfo cached/free kB: $(awk '/^Cached:/{c=$2} /^MemFree:/{f=$2} END{print c, f}' /proc/meminfo)"
 }

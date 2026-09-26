@@ -50,11 +50,21 @@
 #            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_LAUNCH_THREAD=1`.
 #            An arm with BLOOMERY_DRAFT=dspark also sees the other card, where the draft runs, and
 #            gets the profile's DSPARK_MODEL unless it names one (timing-card.sh dspark_env).
+#   prose:<P>[@NAME=VALUE[,NAME=VALUE...]]  ours fed the first P ids of
+#            $BLOOMERY_DATA/engram/corpus-prose.ids (one id per line) instead of the LCG prompt:
+#            generate_ds41 --tokens <those ids> -n N --time, with the variables set as in <D>@…. Row label
+#            `prose`, or `prose@NAME=VALUE[,...]`; the depth column is P. The prompt's routing, and so
+#            its card and host work, is prose's, not the LCG walk's: a prose arm is compared only with
+#            prose arms of the same P — `prose:512 prose:512@BLOOMERY_CARD_EXPERTS=expert` is the
+#            same-binary A/B on the prose prompt — in its own decode and prefill tables (prose / each
+#            prose@ label), never with ours or the references. A P the file cannot supply (P < 1, or
+#            past its line count) is refused before anything runs.
 #   bin:<path>:<D>  a second generate_ds41 (an absolute path on the box, a base tree's build) at depth
 #            D, row label `bin:<basename of its tree>` (the tree is the path above `target/`). It is a
 #            base by construction, so its freshness is not asked; its tree line (sha256, HEAD, dirty
 #            files) is printed with the references'.
-# Every label is its own engine in the per-arm means and in the ratio table (ours / each other label).
+# Every label is its own engine in the per-arm means and in the ratio table (ours / each other label,
+# the prose labels excepted; prose / each prose@ label in the prose tables).
 # Prefill values (ours' `time prompt`, the pp arms) have their own means and ratio table per prompt
 # length P, never the decode ones'.
 # Our arms run at any depth up to the plan's ctx_max (every indexer layer selects its list at every
@@ -137,19 +147,51 @@ DRY=${BLOOMERY_DRY:-}
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(6 ik:6)
 ours=0 ik=0 lcpp=0
-# Per arm, by its index in ARMS: the kind (ours, ref or bin), the depth, the row label, the
+# Per arm, by its index in ARMS: the kind (ours, prose, ref or bin), the depth, the row label, the
 # reference engine (ref), the binary (ours and bin) and the NAME=VALUE list (comma-separated).
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_ENV=()
+# A prose arm's prompt, the ids as generate_ds41 --tokens takes them (empty for every other arm).
+A_TOK=()
+# The prose prompts' file and its id count, read once when an arm names it.
+PROSE=${BLOOMERY_DATA:-}/engram/corpus-prose.ids PROSE_N=
 # A prefill arm's engine (ikpp[<U>], lcpppp[<U>]), and its ubatch lever U (empty: the default).
 pp_eng() { case $1 in ikpp* | lcpppp*) return 0 ;; *) return 1 ;; esac; }
 pp_ub() { local u=${1#ikpp}; echo "${u#lcpppp}"; }
 arm_usage() {
-  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P> or bin:<path>:<D>" >&2
+  echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P> or bin:<path>:<D>" >&2
   exit 64
 }
+# arm_envs_ok <arm> <NAME=VALUE list>: the list is one or more NAME=VALUE, no spaces or commas in a value.
+arm_envs_ok() {
+  local -a kv
+  IFS=, read -r -a kv <<< "$2"
+  [ ${#kv[@]} -gt 0 ] || arm_usage "$1"
+  for e in "${kv[@]}"; do
+    [[ $e =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:],]+$ ]] || arm_usage "$1"
+  done
+}
+# prose_check <arm> <P>: PROSE_N read once; P outside 1..PROSE_N is refused.
+prose_check() {
+  if [ -z "$PROSE_N" ]; then
+    [ -r "$PROSE" ] || { echo "depth-ds41.sh: arm '$1': no prose prompt file at $PROSE (BLOOMERY_DATA)" >&2; exit 2; }
+    PROSE_N=$(($(wc -l < "$PROSE")))
+  fi
+  if [ "$2" -lt 1 ] || [ "$2" -gt "$PROSE_N" ]; then
+    echo "depth-ds41.sh: arm '$1': a prose prompt of $2 ids; $PROSE holds $PROSE_N (1..$PROSE_N)" >&2
+    exit 64
+  fi
+}
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok=''
   case $a in
+    prose:*)
+      kind=prose eng=prose dep=${a#prose:} bin=$BIN label=prose
+      case $dep in *@*) envs=${dep#*@} dep=${dep%%@*} label=prose@$envs && arm_envs_ok "$a" "$envs" ;; esac
+      case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+      prose_check "$a" "$dep"
+      tok=$(head -n "$dep" "$PROSE" | paste -sd, -)
+      ours=1
+      ;;
     bin:*)
       kind=bin eng=bin bin=${a#bin:}
       dep=${bin##*:} bin=${bin%:*}
@@ -160,11 +202,7 @@ for a in "${ARMS[@]}"; do
       ;;
     *@*)
       kind=ours eng=ours dep=${a%%@*} envs=${a#*@} bin=$BIN label=ours@$envs
-      IFS=, read -r -a kv <<< "$envs"
-      [ ${#kv[@]} -gt 0 ] || arm_usage "$a"
-      for e in "${kv[@]}"; do
-        [[ $e =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:],]+$ ]] || arm_usage "$a"
-      done
+      arm_envs_ok "$a" "$envs"
       ours=1
       ;;
     *:*)
@@ -194,7 +232,7 @@ for a in "${ARMS[@]}"; do
       esac
     fi
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs")
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs") A_TOK+=("$tok")
 done
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness.
 # shellcheck source=tools/ref/timing-card.sh
@@ -402,21 +440,28 @@ arm_envs() {
     ARM_ENVS=("${extra[@]}" "${ARM_ENVS[@]}")
   fi
 }
+# The prompt arm <i> of ours feeds, into ARM_FEED: --tokens <the prose ids> for a prose arm, else
+# --depth <D> (the binary's LCG prompt).
+arm_feed() {
+  if [ "${A_KIND[$1]}" = prose ]; then ARM_FEED=(--tokens "${A_TOK[$1]}"); else ARM_FEED=(--depth "${A_DEP[$1]}"); fi
+}
 # One arm of a generate_ds41: ours (our binary, with the arm's variables when it has any) or a
 # second binary. The row and the sum under the arm's label.
 # ours_arm <index> <round>
 ours_arm() {
   local i=$1 r=$2 dep label bin out rc t0 t1 smoke p50 mean warmcol series draft h10 t10 uniq_tok tps_mean tps_p50
-  local -a envs=()
+  local -a envs=() feed=()
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} bin=${A_BIN[$i]}
   arm_envs "$i"
   envs=("${ARM_ENVS[@]}")
+  arm_feed "$i"
+  feed=("${ARM_FEED[@]}")
   witness "pre r$r $label d=$dep n=$N"
   t0=$(date +%s)
   if [ ${#envs[@]} -eq 0 ]; then
-    out=$(timeout --kill-after=10 "$BOUND" "$bin" --depth "$dep" -n "$N" --time ${WARM:+--warm "$WARM"} 2>&1)
+    out=$(timeout --kill-after=10 "$BOUND" "$bin" "${feed[@]}" -n "$N" --time ${WARM:+--warm "$WARM"} 2>&1)
   else
-    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" --depth "$dep" -n "$N" --time ${WARM:+--warm "$WARM"} 2>&1)
+    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" "${feed[@]}" -n "$N" --time ${WARM:+--warm "$WARM"} 2>&1)
   fi
   rc=$?
   t1=$(date +%s)
@@ -431,7 +476,9 @@ ours_arm() {
   [ -n "$smoke" ] || { echo "r$r $label d=$dep produced no SMOKE line" >&2; echo "$out" | tail -n 20 >&2; exit 1; }
   echo "$out" | grep -E '^(plan|load|capture|fed|prefill|stat prefill|stat summary|time prompt) '
   pp_col "${A_KIND[$i]}" "r$r $label d=$dep" "$out"
+  # shellcheck disable=SC2001 # a regex capture, which ${var//} does not have
   p50=$(echo "$smoke" | sed 's/.*p50_ms=\([0-9.]*\).*/\1/')
+  # shellcheck disable=SC2001 # the same
   mean=$(echo "$smoke" | sed 's/.*mean_ms=\([0-9.]*\).*/\1/')
   warmcol=$(echo "$smoke" | sed -n 's/.*warm=\([0-9]*\).*/\1/p')
   # `time step` rows are one position each; under BLOOMERY_DRAFT the rows are `time pass … positions=1|2`
@@ -450,13 +497,15 @@ ours_arm() {
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG")
 }
 
-# ratio_table <prefix> <keys> <labels> <tagged>: records `label|key|round|value|extra` on stdin; for
-# every key and every label but ours, each round's ours / label ratio (arms that ran more than once
-# in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1 degrees of
-# freedom, T975) and the ratio of the arm means. With tagged = 1 the extra field is
-# the row's contention tags, and the line ends with each side's count of them.
+# ratio_table <prefix> <keys> <labels> <tagged> [base]: records `label|key|round|value|extra` on stdin;
+# for every key and every label of <labels>, each round's base / label ratio (arms that ran more than
+# once in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1 degrees
+# of freedom, T975) and the ratio of the arm means. The base is ours (the default), or prose for the
+# prose tables.
+# With tagged = 1 the extra field is the row's contention tags, and the line ends with each side's
+# count of them.
 ratio_table() {
-  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v rounds="$ROUNDS" -v t975="$T975" '{
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v base="${5:-ours}" -v rounds="$ROUNDS" -v t975="$T975" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
   if (tagged) { if ($5 ~ /cpu-busy/) bc[a]++; if ($5 ~ /other-busy/) bo[a]++ }
@@ -466,10 +515,10 @@ ratio_table() {
   nr = split(refs, rf, " ")
   for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
     ref = rf[j]
-    if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
+    if (!((base SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
     c = 0; m = 0; list = ""
     for (r = 1; r <= rounds; r++) {
-      ko = "ours" SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
+      ko = base SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
       if (!(ko in rn) || !(kr in rn)) continue
       q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
       list = list sprintf(" r%d %.4f", r, q)
@@ -480,9 +529,9 @@ ratio_table() {
     if (c < 2) ci = "(one round: no interval)"
     else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
     else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
-    ao = "ours" SUBSEP d[i]; ar = ref SUBSEP d[i]
-    busy = tagged ? sprintf("  busy: ours [cpu-busy %d/%d] [other-busy %d/%d], %s [cpu-busy %d/%d] [other-busy %d/%d]", bc[ao], an[ao], bo[ao], an[ao], ref, bc[ar], an[ar], bo[ar], an[ar]) : ""
-    printf "%s%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s\n", prefix, d[i], ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy
+    ao = base SUBSEP d[i]; ar = ref SUBSEP d[i]
+    busy = tagged ? sprintf("  busy: %s [cpu-busy %d/%d] [other-busy %d/%d], %s [cpu-busy %d/%d] [other-busy %d/%d]", base, bc[ao], an[ao], bo[ao], an[ao], ref, bc[ar], an[ar], bo[ar], an[ar]) : ""
+    printf "%s%-5s %s/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s\n", prefix, d[i], base, ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy
   }
 }'
 }
@@ -500,10 +549,14 @@ if [ -n "$DRY" ]; then
         echo "[dry] $a: timeout --kill-after=10 $BOUND env ${REF_ENV[*]} $REF_BIN ${REF_ARGS[*]}   # row label '${REF_LABEL% |}'${REF_BATCH:+, $REF_BATCH}"
         ;;
       *)
-        note=''
+        note='' feedline="--depth $dep"
         [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
+        if [ "${A_KIND[$i]}" = prose ]; then
+          feedline="--tokens \"\$(head -n $dep $PROSE | paste -sd, -)\""
+          note="$note, $dep of the file's $PROSE_N ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
+        fi
         arm_envs "$i"
-        echo "[dry] $a: timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --depth $dep -n $N --time${WARM:+ --warm $WARM}$note"
+        echo "[dry] $a: timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} $feedline -n $N --time${WARM:+ --warm $WARM}$note"
         ;;
     esac
   done
@@ -518,6 +571,7 @@ fi
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN (placement (a), default ctx)"
+[ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $PROSE ($PROSE_N ids)"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 2 -o json at the flags above, the row is repetition 2 (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
@@ -559,8 +613,15 @@ echo "=== ours / reference per depth: each round's ratio of the pair measured in
 echo "    mean with its 95 % interval (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds),"
 echo "    and the ratio of the arm means ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
-refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | sort -u | tr '\n' ' ')
-printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0
+# The prose labels have their own tables: their prompt is not the one ours and the references ran.
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -v '^prose' | sort -u | tr '\n' ' ')
+printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0 ours
+prose_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep '^prose@' | sort -u | tr '\n' ' ')
+if [ -n "$prose_refs" ]; then
+  echo
+  echo "=== the prose prompt: prose / each prose@ arm per P, the same statistics ==="
+  printf '%s\n' "${sums[@]}" | ratio_table "ratio prose d=" "$deps" "$prose_refs" 0 prose
+fi
 if [ ${#pp_sums[@]} -gt 0 ]; then
   echo
   echo "=== prefill per prompt length (tok/s(pp) @ n=0, prompt P, $CARD_NAME). Ours: its time prompt"
@@ -577,8 +638,14 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
   echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
   echo "    values, then how many of each side's rows carried [cpu-busy] and [other-busy] ==="
   pp_keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
-  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | sort -u | tr '\n' ' ')
-  printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 1
+  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -v '^prose' | sort -u | tr '\n' ' ')
+  printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 1 ours
+  pp_prose_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep '^prose@' | sort -u | tr '\n' ' ')
+  if [ -n "$pp_prose_refs" ]; then
+    echo
+    echo "=== the prose prompt's prefill: prose / each prose@ arm per P, the same statistics ==="
+    printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp prose p=" "$pp_keys" "$pp_prose_refs" 1 prose
+  fi
 fi
 witness post
 ref_witness

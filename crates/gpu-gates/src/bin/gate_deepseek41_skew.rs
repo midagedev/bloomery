@@ -80,7 +80,8 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, RefManifest, checks_failed, ref_tensor_of_in, verdict, widened_f16_rows_in,
+        GateError, NAN_F16, RefManifest, checks_failed, ref_tensor_of_in, verdict,
+        widened_f16_rows_in,
     };
     use gguf::Split;
     use model::arch::Arch;
@@ -98,8 +99,6 @@ mod gate {
     const ORACLE_BUILD: &str = "db517b69";
     /// The serving context: the gate placement's, and the body's caches'.
     const CTX_MAX: u64 = workstation::CTX_MAX;
-    /// f16 NaN: every ring slot and compressed row the gate does not inject.
-    const NAN16: u16 = 0x7e00;
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
     /// Operations in a go batch and in a wait batch (`bloomery_gpu::hybrid`).
@@ -306,7 +305,7 @@ mod gate {
         n_vis: usize,
         written: Option<usize>,
     ) -> Vec<u16> {
-        let mut rows = vec![NAN16; cap * width];
+        let mut rows = vec![NAN_F16; cap * width];
         for r in (0..n_vis).filter(|&r| Some(r) != written) {
             rows[r * width..(r + 1) * width].copy_from_slice(&from[r * width..(r + 1) * width]);
         }
@@ -325,7 +324,7 @@ mod gate {
         let mut out = Vec::with_capacity(hp.n_layer);
         for (l, kind) in hp.layers.iter().enumerate() {
             let before = widened_f16_rows_in(&man.dir, man.input(&format!("cache_k_l{l}"), 0)?)?;
-            let mut ring = vec![NAN16; ring_rows * width];
+            let mut ring = vec![NAN_F16; ring_rows * width];
             for c in first..pos {
                 let slot = c % ring_rows;
                 ring[slot * width..(slot + 1) * width]

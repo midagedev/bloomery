@@ -87,8 +87,8 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1_UNFUSED, D1N, D2, D2_UNFUSED};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, KERNEL_BAND, Layout, RefManifest, RefRow, RowKind, activations, bits_equal,
-        checks_failed, max_rel_err, no_local_depot, ref_ints, ref_model_path,
+        GateError, KERNEL_BAND, Layout, NAN_F16, RefManifest, RefRow, RowKind, activations,
+        bits_equal, checks_failed, max_rel_err, no_local_depot, ref_ints, ref_model_path,
         ref_tensor_logical_in, verdict, widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -119,8 +119,6 @@ mod gate {
     const LIST_POISON: u32 = u32::MAX;
     /// List entries past top_k in every token's row: they must stay poisoned.
     const LIST_SLACK: usize = 16;
-    /// The f16 NaN every cache row past `n_vis` holds.
-    const NAN_F16: u16 = 0x7e00;
     /// Where the counts and the table start in the gate's buffers: not at
     /// zero, so an offset the kernels drop shows.
     const N_VIS_AT: usize = 3;

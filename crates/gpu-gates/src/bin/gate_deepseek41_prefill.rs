@@ -161,8 +161,11 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
-    use bloomery_gpu_gates::{GateError, activations, checks_failed, data_dir, verdict};
-    use cuda_core::{DeviceBuffer, DeviceCopy, IntoResult, sys};
+    use bloomery_gpu_gates::{
+        GateError, NAN_F16, activations, checks_failed, data_dir, kquant_d_at, patch_bytes,
+        row_bytes, verdict,
+    };
+    use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
     use gguf::quant::GgmlType;
     use model::arch::deepseek41::hparams::Hparams;
@@ -1243,71 +1246,58 @@ mod gate {
         Ok(ok && fault_ok)
     }
 
-    /// A f16 NaN, as the Q3_K super-block scale's two bytes.
-    const NAN_F16: [u8; 2] = 0x7e00u16.to_le_bytes();
-
-    /// Byte offset of a Q3_K super-block's scale `d` in the block.
-    const Q3K_D_AT: usize = 108;
-
-    /// Q3_K bytes per super-block.
-    const Q3K_BLOCK: usize = 110;
-
     /// NaN into the scale of the first super-block of each card expert's
     /// first gate row, on every layer with card experts, so the gate·up of
-    /// any card slot is NaN; the bytes it replaced, by device address, to put
-    /// back with [`put_back`].
+    /// any card slot is NaN; the bytes it replaced, by layer and byte offset
+    /// in that layer's gate stack, to put back with [`put_back`]. The row
+    /// width and the scale's place come from the stack's own type and K, and
+    /// every write goes through `patch_bytes`, which refuses a span past the
+    /// stack's allocation.
     fn poison_card(
         m: &mut Deepseek41Model,
         hp: &Hparams,
-    ) -> Result<Vec<(u64, [u8; 2])>, GateError> {
+    ) -> Result<Vec<(usize, usize, [u8; 2])>, GateError> {
         let (gpu, w, b) = m.body_parts(NAME)?;
         let stream = gpu.stream();
-        let (ff, row_bytes) = (hp.experts.ff, Q3K_BLOCK * hp.n_embd / 256);
+        let ff = hp.experts.ff;
         let mut saved = Vec::new();
         for l in b.layers() {
             let Some(s) = CardStacks::of(w, l)? else {
                 continue;
             };
-            let base = s.gate.buf().cu_deviceptr();
+            let name = names::ffn_gate_exps(l);
+            let Some(DevWeight::KQuant { ty, k, .. }) = w.get(&name) else {
+                return Err(format!("{NAME}: poison_card: {name} is not a K-quant stack").into());
+            };
+            let (row, d_at) = (row_bytes(*ty, *k)?, kquant_d_at(*ty)?);
+            if !s.gate.rows().is_multiple_of(ff) {
+                return Err(format!(
+                    "{NAME}: poison_card: {name} holds {} rows, not whole experts of {ff}",
+                    s.gate.rows()
+                )
+                .into());
+            }
             for e in 0..s.gate.rows() / ff {
-                let at = base + u64::try_from(e * ff * row_bytes + Q3K_D_AT)?;
-                let mut old = [0u8; 2];
-                // SAFETY: `at` is two bytes inside the gate stack's allocation
-                // (row e·ff's first super-block); `old` outlives the copy,
-                // which completes at the synchronize.
-                let rc = unsafe {
-                    sys::cuMemcpyDtoHAsync_v2(old.as_mut_ptr().cast(), at, 2, stream.cu_stream())
-                };
-                rc.result()?;
-                stream.synchronize()?;
-                let nan = NAN_F16;
-                // SAFETY: as above, with `nan` outliving the copy; the stream
-                // is idle and nothing else runs on the card, so no launch
-                // reads the scale while it changes.
-                let rc = unsafe {
-                    sys::cuMemcpyHtoDAsync_v2(at, nan.as_ptr().cast(), 2, stream.cu_stream())
-                };
-                rc.result()?;
-                stream.synchronize()?;
-                saved.push((at, old));
+                let at = e * ff * row + d_at;
+                let old = patch_bytes(stream, s.gate.buf(), at, NAN_F16.to_le_bytes())?;
+                saved.push((l, at, old));
             }
         }
         Ok(saved)
     }
 
-    /// The bytes [`poison_card`] replaced, put back.
-    fn put_back(m: &mut Deepseek41Model, saved: &[(u64, [u8; 2])]) -> Result<(), GateError> {
-        let (gpu, _, _) = m.body_parts(NAME)?;
+    /// The bytes [`poison_card`] replaced, put back through the same checked
+    /// writer.
+    fn put_back(
+        m: &mut Deepseek41Model,
+        saved: &[(usize, usize, [u8; 2])],
+    ) -> Result<(), GateError> {
+        let (gpu, w, _) = m.body_parts(NAME)?;
         let stream = gpu.stream();
-        for (at, old) in saved {
-            // SAFETY: `at` came from `poison_card`, two bytes inside a gate
-            // stack the model still holds; `old` outlives the copy, which
-            // completes at the synchronize.
-            let rc = unsafe {
-                sys::cuMemcpyHtoDAsync_v2(*at, old.as_ptr().cast(), 2, stream.cu_stream())
-            };
-            rc.result()?;
-            stream.synchronize()?;
+        for &(l, at, old) in saved {
+            let s = CardStacks::of(w, l)?
+                .ok_or_else(|| format!("{NAME}: put_back: layer {l} lost its card stacks"))?;
+            patch_bytes(stream, s.gate.buf(), at, old)?;
         }
         Ok(())
     }
@@ -1707,7 +1697,9 @@ mod gate {
     }
 
     /// The rows below position `p` every layer writes once: its compressed
-    /// rows and its index keys (`⌊p / ratio⌋` rows).
+    /// rows and its index keys (`⌊p / ratio⌋` rows). A layer that holds
+    /// either and has no layer entry, or reads ratio 0, is an error: both
+    /// would hash zero rows on each side and pass on an unwritten cache.
     fn written_rows(
         m: &mut Deepseek41Model,
         hp: &Hparams,
@@ -1718,11 +1710,29 @@ mod gate {
         let stream = gpu.stream();
         let (mut rows, mut keys) = (Vec::new(), Vec::new());
         for l in b.layers() {
-            let ratio = hp.layers.get(l).map_or(0, |k| k.ratio() as usize);
             let st = b
                 .state_mut(l)
                 .ok_or_else(|| format!("{NAME}: no state for layer {l}"))?;
-            let n = p.checked_div(ratio).unwrap_or(0);
+            let n = if st.rows.is_some() || st.keys.is_some() {
+                let kind = hp.layers.get(l).ok_or_else(|| {
+                    format!(
+                        "{NAME}: written_rows: layer {l} holds compressed rows or index keys and \
+                         has no layer entry ({} entries)",
+                        hp.layers.len()
+                    )
+                })?;
+                let ratio = usize::try_from(kind.ratio())?;
+                if ratio == 0 {
+                    return Err(format!(
+                        "{NAME}: written_rows: layer {l} holds compressed rows or index keys and \
+                         reads ratio 0"
+                    )
+                    .into());
+                }
+                p / ratio
+            } else {
+                0
+            };
             rows.push(match st.rows {
                 Some(t) if n > 0 => Some(md5_of(stream, t, Some(n))?),
                 Some(_) => Some(Md5::new().finish()),

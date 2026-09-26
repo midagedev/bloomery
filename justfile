@@ -928,6 +928,14 @@ gate-gpu-ds41-dspark-loop:
 gate-gpu-ds41-prefill *ARGS='':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_prefill && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_prefill {{ARGS}}'
 
+# The same gate under BLOOMERY_Q3K_SPLIT=2, the split-K lever arm: wo_b (K = 8192, the only V4.1 Q3_K row the rule
+# splits) runs q3k_gemv_split in every decode step and q3k_gemv_split_groups in every prompt batch, so this is the only
+# gate that runs those kernels. The gate compares the prompt with the steps of one process under one setting, so the
+# split is on both sides and the contract stays bit for bit; the split moves the bits against the unsplit arm, and
+# nothing here compares the two. ARGS as above.
+gate-gpu-ds41-prefill-q3ksplit *ARGS='':
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_prefill && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_Q3K_SPLIT=2 bash tools/gpu-gate.sh gate_deepseek41_prefill {{ARGS}}'
+
 # Text in, text out (3090, placement gate). Prompt rows 0 and 7: bloomery-chat --greedy on the row's text must
 # tokenize to the row's ids (llama-tokenize's) and its ids must be the start of generate_ds41 --tokens <those ids> -n 16
 # (all 16 unless chat stopped at the end-of-generation id, which generate_ds41 does not know; row 7 must run to
@@ -989,10 +997,11 @@ time-lcpp-prompt CORPUS N:
 # ours/reference ratios. tools/ref/depth-ds41.sh's header has the arms, the placement difference and the environment levers.
 # Prefill: every `<D>` row also carries pp_tok/s from generate_ds41's `time prompt` row (the D fed steps), and
 # `ikpp:<P>`/`lcpppp:<P>` run llama-bench -p P -n 0 at the same flags (`ikpp<U>`/`lcpppp<U>`: -ub U), with a per-P table.
+# `prose:<P>[@NAME=VALUE,...]` is ours on the first P ids of corpus-prose.ids (--tokens), in prose-only tables.
 # With no ours arm generate_ds41 is not built, nor under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 (the command lines, no lease);
 # no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
 
 # Qwen3-30B-A3B 전 카드 디코드를 깊이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(프롬프트를 실제 D스텝으로 먹임), ik `ik:<D>`(-gp D,96, 프로필
 # 플래그)·`ikdef:<D>`(llama-bench 기본값), mainline `lcpp:<D>`(-d D)를 바퀴마다 순서를 돌려 번갈아 재고, 깊이마다 ours/각 참조 비율을 찍는다.

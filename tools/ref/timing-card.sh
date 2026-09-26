@@ -37,8 +37,17 @@ fi
 # The timing card's witness lines: the `card` field of lease.sh's witness block. loadavg is not the
 # quiet-machine signal (see docs/quiet-machine.md in rig-log): IO pressure and the actual process
 # list are.
+# The clocks line is read at the block's instant: at `pre` the card is idle and its SM clock is the idle
+# clock, not the run's. The counters (clocks_event_reasons_counters.*, cumulative µs per reason) are
+# the run's side: post − pre bounds the time whatever ran on the card in the window spent power-capped
+# (sw_power_cap) or thermally slowed, with no sampler inside it. When the driver updates them is not
+# characterized, so read the difference over a whole arm, not a short one. event_reasons is the active
+# reason bitmask at the instant (nvml.h: 0x1 idle, 0x4 sw power cap, 0x20 sw thermal, 0x40 hw thermal).
+# cpu-freq is lease.sh's field of that name.
 witness_card() {
   echo "    timing-card: $(nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv,noheader -i "$TIMING_GPU")"
+  echo "    timing-card clocks: $(nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,clocks_event_reasons.active,clocks_event_reasons_counters.sw_power_cap,clocks_event_reasons_counters.sw_thermal_slowdown,clocks_event_reasons_counters.hw_thermal_slowdown,temperature.gpu,power.draw --format=csv,noheader,nounits -i "$TIMING_GPU" | awk -F', ' '{ printf "sm=%s max=%s MHz event_reasons=%s capped_us sw_power=%s sw_thermal=%s hw_thermal=%s temp=%s C power=%s W", $1, $2, $3, $4, $5, $6, $7, $8 }')"
+  echo "    cpu-freq: $(cpu_freq_summary)"
   [ -z "${BIN_SHA:-}" ] || echo "    binary: ${BIN_PATH:-?} sha256=$BIN_SHA mtime=${BIN_MTIME:-?}"
   echo "    3090-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_3090" | tr '\n' ';')]"
   echo "    a6000-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$GPU_A6000" | tr '\n' ';')]"
@@ -105,7 +114,7 @@ assert_fresh_binary() {
   # Without it, every crates/ source counts.
   local dep=$BIN_PATH.d scope
   if [ -f "$dep" ]; then
-    scope=dep-info
+    scope='dep-info'
     # shellcheck disable=SC2046 # the dep-info list is space-separated paths without spaces
     newer=$(find $(sed -e 's/^[^:]*: *//' -e 's/\\$//' "$dep" | tr ' ' '\n' | grep -v '^$' | sort -u) \
               Cargo.toml Cargo.lock crates/*/Cargo.toml \

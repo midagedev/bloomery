@@ -154,9 +154,9 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GREEDY_MARGIN, GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, data_dir,
-        ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32, topk_ids_logical_within,
-        verdict, widened_f16_rows_in,
+        GREEDY_MARGIN, GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, checks_failed,
+        data_dir, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
+        topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use cuda_core::sys;
     use gguf::quant::half_to_f32;
@@ -234,9 +234,6 @@ mod gate {
     const ATTN_BAND_GENERIC: f64 = 4.9e-3;
     const ATTN_BAND_IQK: f64 = 9.675e-4;
     const BAND_SIGMAS: f64 = 4.5;
-    /// f16 NaN: every ring slot and compressed row the gate does not inject,
-    /// so a read of one shows.
-    const NAN16: u16 = 0x7e00;
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
     /// G3: tokens generated; a first difference is judged by
@@ -432,7 +429,7 @@ mod gate {
                 .ring;
             let width = ring.cols();
             let mut host = ring.buf().to_host_vec(stream)?;
-            host[..width].fill(NAN16);
+            host[..width].fill(NAN_F16);
             ring.buf_mut().copy_from_host(stream, &host)?;
         }
         let first = m.step(&[tok]);
@@ -646,7 +643,7 @@ mod gate {
         n_vis: usize,
         written: Option<usize>,
     ) -> Vec<u16> {
-        let mut rows = vec![NAN16; cap * width];
+        let mut rows = vec![NAN_F16; cap * width];
         for r in (0..n_vis).filter(|&r| Some(r) != written) {
             rows[r * width..(r + 1) * width].copy_from_slice(&from[r * width..(r + 1) * width]);
         }
@@ -667,7 +664,7 @@ mod gate {
         let mut out = Vec::with_capacity(hp.n_layer);
         for (l, kind) in hp.layers.iter().enumerate() {
             let before = widened_f16_rows_in(&man.dir, man.input(&format!("cache_k_l{l}"), 0)?)?;
-            let mut ring = vec![NAN16; ring_rows * width];
+            let mut ring = vec![NAN_F16; ring_rows * width];
             for c in first..pos {
                 let slot = c % ring_rows;
                 ring[slot * width..(slot + 1) * width]

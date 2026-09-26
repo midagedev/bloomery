@@ -197,6 +197,27 @@ pub fn row_bytes(ty: GgmlType, k: usize) -> Result<usize, GateError> {
     Ok(k / blck * tsz)
 }
 
+/// A quiet f16 NaN, as the gates write it into f16 rows, rings and scales a
+/// kernel must not read (or must read and raise the fault word on).
+pub const NAN_F16: u16 = 0x7e00;
+
+/// Byte offset of the f16 super-block scale `d` inside one super-block of
+/// the K-quant `ty`, as ggml lays the block out (`block_q3_K` ends with it,
+/// `block_q4_K` opens with it, `block_q6_K` ends with it). Any other type is
+/// refused by name: a gate that poisons a scale must not poison a guess.
+pub fn kquant_d_at(ty: GgmlType) -> Result<usize, GateError> {
+    match ty {
+        GgmlType::Q3_K => Ok(108),
+        GgmlType::Q4_K => Ok(0),
+        GgmlType::Q6_K => Ok(208),
+        other => Err(format!(
+            "kquant_d_at: {other:?} is not a K-quant this helper knows the scale of \
+             (Q3_K, Q4_K, Q6_K)"
+        )
+        .into()),
+    }
+}
+
 /// Reference `y = W[row0 .. row0 + n_rows] · x` for raw rows of type `ty`
 /// with `k` values each: `n_rows * m` f32, row-major with `m` outputs per
 /// row (the kernels' output layout). `w` starts at row 0 of the span.
@@ -1605,6 +1626,44 @@ pub fn us_per_replay(
     Ok(t0.elapsed().as_secs_f64() * 1e6 / f64::from(n))
 }
 
+/// Replace the `N` bytes at byte `at_bytes` of `buf` with `new` and return
+/// the bytes that were there: a read, then a write, each finished on
+/// `stream` before the next. Refused by name, before any copy, when the span
+/// passes the allocation (`buf.num_bytes()`). The span is device memory, not
+/// Rust memory; the caller keeps `stream` the only work touching `buf` while
+/// it runs (a gate's model between calls).
+#[cfg(feature = "gpu")]
+pub fn patch_bytes<T, const N: usize>(
+    stream: &cuda_core::CudaStream,
+    buf: &cuda_core::DeviceBuffer<T>,
+    at_bytes: usize,
+    new: [u8; N],
+) -> Result<[u8; N], GateError> {
+    use cuda_core::{IntoResult, sys};
+    let total = buf.num_bytes();
+    if at_bytes.checked_add(N).is_none_or(|end| end > total) {
+        return Err(format!(
+            "patch_bytes: bytes {at_bytes}..{at_bytes}+{N} pass the allocation's {total} bytes"
+        )
+        .into());
+    }
+    let at = buf.cu_deviceptr() + u64::try_from(at_bytes)?;
+    let mut old = [0u8; N];
+    stream.synchronize()?;
+    // SAFETY: `at .. at + N` lies inside `buf`'s allocation (checked above);
+    // `old` outlives the copy, which completes at the synchronize.
+    let rc =
+        unsafe { sys::cuMemcpyDtoHAsync_v2(old.as_mut_ptr().cast(), at, N, stream.cu_stream()) };
+    rc.result()?;
+    stream.synchronize()?;
+    // SAFETY: the same span; `new` outlives the copy, which completes at the
+    // synchronize.
+    let rc = unsafe { sys::cuMemcpyHtoDAsync_v2(at, new.as_ptr().cast(), N, stream.cu_stream()) };
+    rc.result()?;
+    stream.synchronize()?;
+    Ok(old)
+}
+
 /// Prove the dump's VIEW convention for one view read as a PLAIN file:
 /// `view` must equal `base` from `off` — flat memory from the view's base
 /// pointer, not the materialized gather a consumer of the logical tensor
@@ -1984,9 +2043,9 @@ pub fn topk_ids_logical_within(
 #[cfg(test)]
 mod tests {
     use super::{
-        GateError, Layout, RefManifest, RowKind, find_int_row, find_ref_row_in, mask_bits_in,
-        max_rel_err, topk_ids_logical_in, topk_ids_logical_within, widened_f16_bits_in,
-        widened_f16_rows_in,
+        GateError, GgmlType, Layout, NAN_F16, RefManifest, RowKind, dequant_row, find_int_row,
+        find_ref_row_in, kquant_d_at, mask_bits_in, max_rel_err, topk_ids_logical_in,
+        topk_ids_logical_within, widened_f16_bits_in, widened_f16_rows_in,
     };
     use std::path::{Path, PathBuf};
 
@@ -2315,5 +2374,33 @@ mod tests {
         assert!(max_rel_err(&[1.0, f32::INFINITY, 3.0], &y_ref).is_err());
         assert!(max_rel_err(&[1.0, -2.0, 3.0], &[1.0, f32::NAN, 3.0]).is_err());
         assert_eq!(max_rel_err(&[1.0, -2.0, 3.0], &y_ref).unwrap(), 0.0);
+    }
+
+    /// The bytes `kquant_d_at` names are the super-block scale `d` the
+    /// dequant reads: a finite block dequantizes finite, and [`NAN_F16`]
+    /// there makes every one of its 256 values NaN — a byte of the quants or
+    /// the sub-block scales would leave most of them finite. A type the
+    /// helper does not know is refused by name.
+    #[test]
+    fn kquant_d_at_is_the_scale_every_value_reads() -> Result<(), GateError> {
+        for ty in [GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q6_K] {
+            let size = usize::try_from(ty.type_size().ok_or("no type size")?)?;
+            let at = kquant_d_at(ty)?;
+            let mut block: Vec<u8> = (0..size).map(|i| (i * 37 % 251) as u8).collect();
+            // d = 1.0 and, for Q4_K, dmin = 0.0 right after it.
+            block[at..at + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+            if ty == GgmlType::Q4_K {
+                block[2..4].fill(0);
+            }
+            let mut y = [0f32; 256];
+            dequant_row(ty, &block, &mut y)?;
+            assert!(y.iter().all(|v| v.is_finite()), "{ty:?}: the clean block");
+            block[at..at + 2].copy_from_slice(&NAN_F16.to_le_bytes());
+            dequant_row(ty, &block, &mut y)?;
+            assert!(y.iter().all(|v| v.is_nan()), "{ty:?}: NaN at byte {at}");
+        }
+        let refused = kquant_d_at(GgmlType::Q8_0).map_err(|e| e.to_string());
+        assert!(refused.is_err_and(|e| e.starts_with("kquant_d_at: Q8_0")));
+        Ok(())
     }
 }
