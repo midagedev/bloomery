@@ -362,7 +362,8 @@ V2-Lite CPU 전용 엔진(`bloomery-decode`)은 이 표의 어느 자원에도 �
 - 참조: ik의 CPU MoE도 토큰 수와 무관하게 op 하나다(`ggml/src/ggml.c:18389` `ggml_compute_forward_mul_mat_id`, `:18708` `…_up_gate`).
 
 **얻는 것**
-- 빠지는 것: `serve`, `HostScratch`, 자유 함수 `experts_into`, `Entry` 행렬, `DeferredSlots`, `BLOOMERY_DEFER_QUANT`(`grep -c BLOOMERY_DEFER_QUANT AGENTS.md` → 0), `set_defer_quant`.
+- 빠지는 것: `serve`, `HostScratch`, 자유 함수 `experts_into`, `Entry` 행렬~~, `DeferredSlots`, `BLOOMERY_DEFER_QUANT`(`grep -c BLOOMERY_DEFER_QUANT AGENTS.md` → 0), `set_defer_quant`~~.
+  - 09-27 정정(hosttier 메모 §2.6): 뒤의 셋은 V2-Lite CPU 엔진의 그룹 경로(`ffn.rs:71`, `moe.rs:535` → `run_group`)가 쓰므로 CPU6으로는 빠지지 않는다. `group_core`·`run_group`과 함께 CPU1(a)에서 빠진다.
 - CPU1(a)까지 가면 `group_core`, `run_group`, `matmul_q_group*` 전부가 빠진다.
 - `HostExperts` 트레이트(`hybrid.rs:1117-1146`, gpucore 파일)의 메서드도 하나가 된다.
 
