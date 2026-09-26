@@ -213,7 +213,7 @@ extras   = Engram | Ple | Deepstack
 | launch 구조 | attention(enqueue에서 셈) / `queue` 식 / Python 흐름 모형·ds41pp | DS5 → 세는 스트림 래퍼 + `--plan` 덤프 |
 | 출력 줄 스키마 | `SMOKE` 쓰는 곳 4·읽는 곳 8, `time prompt` 2·6 | TL-3 → `record.rs` 하나 |
 | 컴파일 모양 | gate_p4·p5·p6의 런타임 단언 / `ptx-shapes.tsv` | GG2 → 래칫 표 하나 |
-| 참조 매니페스트 | 판독기 13곳(세 크레이트) + Python 4 | GD1·GG5 → `crates/refset` |
+| 참조 매니페스트 | 판독기 13곳(세 크레이트) + Python 4 | GD1·GG5 → `crates/refset`(착륙 `30b25fc`) |
 | 타입 → 활성값 형식 규칙 | gguf 1 + qdot match 11(`_ =>` 팔이 조용히 Q3_K 규칙) | CPU7 → 기술자 하나, 망라형 match |
 | 샘플러·생성 루프·UTF-8 디코더 | 2 · 2 · 3 | CPU5 |
 | 친화성 코드, `PIN_MAIN` 파싱 | 4 · 5 | CPU §4 |
@@ -264,7 +264,7 @@ extras   = Engram | Ple | Deepstack
 
 - **GD1**: 참조 세트 다섯 계열 중 파일 신원을 확인하는 것은 ik 노드 덤프 하나뿐이다. greedy·KLD·dsref 셋은 혼합 파일에서 떴다.
 - 그래서 `gate-gpu-dspark-graph`는 `f1d1168`(09-25) 뒤로 모든 착륙 묶음에서 FAIL 61–63줄의 **표준 빨강**이고, 리드가 md5를 손으로 비교한다. long `--free`와 step `--ppl`은 다른 파일의 참조와 조용히 비교한다.
-- ~~재생성 시팅(시팅 10)은 승인됐지만 열리지 않았다.~~ 시팅 10은 09-27에 돌았다(4분 42초). 세 계열을 공개 파일로 다시 떴고, 옛 세트는 `mixed`로 옮겨 두었다. `gate-gpu-dspark-graph`는 초록이 됐다. → 남은 것은 `crates/refset`과 `RefError::Stale`이다.
+- ~~재생성 시팅(시팅 10)은 승인됐지만 열리지 않았다.~~ 시팅 10은 09-27에 돌았다(4분 42초). 세 계열을 공개 파일로 다시 떴고, 옛 세트는 `mixed`로 옮겨 두었다. `gate-gpu-dspark-graph`는 초록이 됐다. → ~~남은 것은 `crates/refset`과 `RefError::Stale`이다.~~ `refset`(`30b25fc`)이 닫았다. 혼합 파일에서 뜬 사본 13개는 이제 경로로 읽혀도 이름 붙은 `Stale`이다.
 
 ## 4. 삭제 목록
 
@@ -285,7 +285,7 @@ extras   = Engram | Ple | Deepstack
 | ~~step `--greedy`, `run-ds41-greedy`~~ | long `--free`가 같은 규칙을 더 길게 판정 | 없음 | aa · 착륙 `35c95ec` |
 | ~~`AnyEngine::Deepseek41` 팔~~ | 두 호출자가 적재 뒤 거부 | 없음 | aa · 착륙 `284645b` |
 | ~~`T1_SINK_DEFECT_BUILDS` 경로(약 50줄)~~ | 오라클이 `db517b69`로 다시 떴다(`527d84c`) — 박스 세트 목록 확인 필요 | 없음 | aa · 착륙 `35c95ec` |
-| ~~lib.rs 죽은 pub 함수 셋~~(착륙 `35c95ec` — 넷이었다: `ref_tensor`·`ref_tensor_logical`·`topk_ids_logical`·`us_per_replay`), `ds41_host.rs`의 `Set` 사본(→ 2파동 `refset`) | 외부 호출 0 / `v41set.rs`와 같음 | 없음 | aa / [03] 인접 |
+| ~~lib.rs 죽은 pub 함수 셋~~(착륙 `35c95ec` — 넷이었다: `ref_tensor`·`ref_tensor_logical`·`topk_ids_logical`·`us_per_replay`), ~~`ds41_host.rs`의 `Set` 사본(→ 2파동 `refset`)~~(`30b25fc`에서 공용 `v41set::Set`으로) | 외부 호출 0 / `v41set.rs`와 같음 | 없음 | aa / [03] 인접 |
 | ~~p0b·moe_fused의 `--time` 팔과 레시피 둘~~ | 판정이 `gpu-design.md:79, :94`에 | 없음 | aa · 착륙 `35c95ec` |
 | ~~`gate_load_v41`의 plan (b) 기본값~~ | 엔진이 두 카드 배치를 거부(`body.rs:127-135`, 리드 확인) | solo 적재 두 번(약 329 s[유도])을 opt-in으로 | aa · 착륙 `35c95ec` |
 | ~~engram 실험실(cache.rs, reuse.rs, `SeededRows`, `Context`, bin 둘; 1,877줄)~~ | 엔진 import 0 | ~~실험실 시험과 `measure-engram`이 bench로~~ bench 크레이트가 아니라 `crates/engram-lab`과 `lab-engram`으로 | aa · 착륙 `9d15dae` |
@@ -333,7 +333,7 @@ extras   = Engram | Ple | Deepstack
 | 파동 | aa 라운드 | 증명 | 선행 |
 |---|---|---|---|
 | **1 삭제** — 착륙(09-26, `35c95ec`..`d665eb5`) | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `gpudel`(스칼라 flash 세그먼트 패스와 탐침, `StepProbe` split 팔 넷, 호출자 없는 엔트리, `Head::graph`, `AnyEngine` V4.1 팔) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사; 03과 빌더 수를 맞춘 뒤) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
-| **2 한 주인** | ~~`levers`~~(TL-1, aa 레버 — 착륙 `64aaab8`: `crates/levers` 등록부, `at_main`, 은퇴 이름 거절, `check-levers`) · ~~`records`~~(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼 — 착륙 `8fc1832`·`d2e42d3`: `record.rs`의 `Kind`·`Record`와 `--records-schema`, `records.py`, `generate_ds41 --plan`과 `tools/flow/plans/`, enqueue 자리에서 세는 `Entries`·`Tally`, 흐름 모형의 `--counts`) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · `refset`(GD1·GG5, 시팅 10과 짝) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
+| **2 한 주인** | ~~`levers`~~(TL-1, aa 레버 — 착륙 `64aaab8`: `crates/levers` 등록부, `at_main`, 은퇴 이름 거절, `check-levers`) · ~~`records`~~(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼 — 착륙 `8fc1832`·`d2e42d3`: `record.rs`의 `Kind`·`Record`와 `--records-schema`, `records.py`, `generate_ds41 --plan`과 `tools/flow/plans/`, enqueue 자리에서 세는 `Entries`·`Tally`, 흐름 모형의 `--counts`) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · ~~`refset`~~(GD1·GG5, 시팅 10과 짝 — 착륙 `30b25fc`: `crates/refset`의 판독기 다섯과 아키텍처별 계열 표, `RefError::{Stale,Foreign,Unfinished,Malformed}`, `tools/bloomery/manifest.py`) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
 | **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나; 설계는 `docs/research/modelspec-design.md`, 헤더만 읽는 `qwen35moe` 팔 포함) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로); V4.1 후보 마스크 커널 계열과 그 비트 단위 단위 게이트(candmask R1, `docs/research/candmask-design.md`) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
 | **4 층 프로그램 하나** | `layerprog`(DS6: 층 종류마다 층 프로그램 + decode/verify/prompt 스케줄, CED·소스 공유는 `LayerSpec`에서 유도, Q3-3 `step_rows`; 후보 마스크 배선과 16,384 거절 걷기 — candmask R2) · `batchwide`(DS2: 토큰별 연산을 배치 폭으로) · `gatesproc`(GD3: 배치마다 프로세스 하나) · `gatestoml`(TL-4·TL-6) | 디코드 move(노드 목록 동일), 프롬프트 launch 목록 동일은 `--plan` 덤프로, DS2는 산문 A/B 1회 | 3파동, r8host |
 | **5 새 모델** | 결정 6의 첫 모델을 리더 하나와 새 연산으로 올린다 — 재구성이 맞았는지의 시험대. 첫 새 연산은 delta rule이다: GDN과 KDA를 const bool 하나로 가른다(메인라인 `gated_delta_net.cu`의 `template<int S_v, bool KDA, …>`, exllamav3 `gated_delta_net.py`의 KDA mode가 선례). 순환 상태 스냅숏, pre-tokenizer, 도구 파서가 함께 온다 | 인스턴스별 연산 게이트 + 새 모델 e2e + 참조 세트 | 4파동, 결정 6 |
