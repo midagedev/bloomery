@@ -272,23 +272,23 @@ extras   = Engram | Ple | Deepstack
 
 | 대상 | 근거 | 커버리지 변화 | 주인 |
 |---|---|---|---|
-| `CARD_EXPERTS=expert\|slot`, `Phase`, `CardExperts`, `act_h`, 1024 탈출구, shadow 행렬, `ds41_expert_gate_up_tok` | #cardtile-ab(tile/expert 1.245 ± 0.060 / 1.167 ± 0.011), #v41-prefill-s14(slot 갈리지 않음) | prefill 게이트의 두 팔 실행. grouped 커널은 게이트 기준이면 게이트 쪽으로 | aa |
-| `Body::step_plan`, `Body::engram_layers` | grep: 정의뿐 | 없음 | aa |
-| `STEP_PAIR=1` 팔(`generate_ds41`) | E12 답함(rig-log 09-24, 09-25) | 없음(`step_pair`는 DRAFT가 씀) | aa |
-| `GpuModel::load`·`load_staged` | 호출자 0(grep rc 1) | 없음 | aa |
-| `argmax_rows`, 비폴트 `argmax` | 엔진 호출 0 | gate_p4 절을 `_fault` 판으로 | aa |
-| 스칼라 flash 세그먼트 패스·탐침 8·`TWICE`·`flash_merge2_q8`·`BLOOMERY_FLASH_MMA=0` | 09-22-n "두 번째 경로, 지울지는 다음 결정" | gate-gpu-e2e의 둘째 프로세스, keyaxis 팔 | aa |
-| `StepProbe` split 팔 넷 | 09-22-b 판정(−31.9, −35.9 µs) | gate_e2e 중첩 팔 검사 | aa |
-| `Head::graph`·`capture`·`launch` | 게이트만 씀 | 헤드 단독 eager=replay(스텝 그래프가 지킴) | aa |
-| `join_probe.rs`, probe.rs `gap_*`·`two_phase`, bench_join(+cstate-ab 빌드), h2d_probe, real_x, rawx_floor | 결과는 rig-log에 있음 | 없음(게이트 아님) | aa |
-| `bench_v41`(1,746줄) — `c_node` 프로브만 작게 남김 | 마지막 사용 09-23, 옛 배치 상수 | 없음 | aa |
-| step `--greedy`, `run-ds41-greedy` | long `--free`가 같은 규칙을 더 길게 판정 | 없음 | aa |
-| `AnyEngine::Deepseek41` 팔 | 두 호출자가 적재 뒤 거부 | 없음 | aa |
-| `T1_SINK_DEFECT_BUILDS` 경로(약 50줄) | 오라클이 `db517b69`로 다시 떴다(`527d84c`) — 박스 세트 목록 확인 필요 | 없음 | aa |
-| lib.rs 죽은 pub 함수 셋, `ds41_host.rs`의 `Set` 사본 | 외부 호출 0 / `v41set.rs`와 같음 | 없음 | aa / [03] 인접 |
-| p0b·moe_fused의 `--time` 팔과 레시피 둘 | 판정이 `gpu-design.md:79, :94`에 | 없음 | aa |
-| `gate_load_v41`의 plan (b) 기본값 | 엔진이 두 카드 배치를 거부(`body.rs:127-135`, 리드 확인) | solo 적재 두 번(약 329 s[유도])을 opt-in으로 | aa |
-| engram 실험실(cache.rs, reuse.rs, `SeededRows`, `Context`, bin 둘; 1,877줄) | 엔진 import 0 | 실험실 시험과 `measure-engram`이 bench로 | aa |
+| ~~`CARD_EXPERTS=expert\|slot`, `Phase`, `CardExperts`, `act_h`, 1024 탈출구, shadow 행렬, `ds41_expert_gate_up_tok`~~ | #cardtile-ab(tile/expert 1.245 ± 0.060 / 1.167 ± 0.011), #v41-prefill-s14(slot 갈리지 않음) | prefill 게이트의 두 팔 실행. grouped 커널은 게이트 기준이면 게이트 쪽으로 | aa · 착륙 `d665eb5` |
+| ~~`Body::step_plan`, `Body::engram_layers`~~ | grep: 정의뿐 | 없음 | aa · 착륙 `d665eb5` |
+| ~~`STEP_PAIR=1` 팔(`generate_ds41`)~~ | E12 답함(rig-log 09-24, 09-25) | 없음(`step_pair`는 DRAFT가 씀) | aa · 착륙 `d665eb5` |
+| ~~`GpuModel::load`·`load_staged`~~ | 호출자 0(grep rc 1) | 없음 | aa · 착륙 `284645b` |
+| ~~`argmax_rows`, 비폴트 `argmax`~~ | 엔진 호출 0 | gate_p4 절을 `_fault` 판으로 | aa · 착륙 `284645b` |
+| ~~스칼라 flash 세그먼트 패스·탐침 8·`TWICE`·`flash_merge2_q8`·`BLOOMERY_FLASH_MMA=0`~~ | 09-22-n "두 번째 경로, 지울지는 다음 결정" | gate-gpu-e2e의 둘째 프로세스, keyaxis 팔 | aa · 착륙 `284645b` |
+| ~~`StepProbe` split 팔 넷~~ | 09-22-b 판정(−31.9, −35.9 µs) | gate_e2e 중첩 팔 검사 | aa · 착륙 `284645b` |
+| ~~`Head::graph`·`capture`·`launch`~~ | 게이트만 씀 | 헤드 단독 eager=replay(스텝 그래프가 지킴) | aa · 착륙 `284645b` |
+| ~~`join_probe.rs`, probe.rs `gap_*`·`two_phase`, bench_join(+cstate-ab 빌드), h2d_probe, real_x, rawx_floor~~ | 결과는 rig-log에 있음 | 없음(게이트 아님) | aa · 착륙 `35c95ec`·`2f0dc6a`·`284645b` |
+| ~~`bench_v41`(1,746줄) — `c_node` 프로브만 작게 남김~~ | 마지막 사용 09-23, 옛 배치 상수 | 없음 | aa · 착륙 `35c95ec` |
+| ~~step `--greedy`, `run-ds41-greedy`~~ | long `--free`가 같은 규칙을 더 길게 판정 | 없음 | aa · 착륙 `35c95ec` |
+| ~~`AnyEngine::Deepseek41` 팔~~ | 두 호출자가 적재 뒤 거부 | 없음 | aa · 착륙 `284645b` |
+| ~~`T1_SINK_DEFECT_BUILDS` 경로(약 50줄)~~ | 오라클이 `db517b69`로 다시 떴다(`527d84c`) — 박스 세트 목록 확인 필요 | 없음 | aa · 착륙 `35c95ec` |
+| ~~lib.rs 죽은 pub 함수 셋~~(착륙 `35c95ec` — 넷이었다: `ref_tensor`·`ref_tensor_logical`·`topk_ids_logical`·`us_per_replay`), `ds41_host.rs`의 `Set` 사본(→ 2파동 `refset`) | 외부 호출 0 / `v41set.rs`와 같음 | 없음 | aa / [03] 인접 |
+| ~~p0b·moe_fused의 `--time` 팔과 레시피 둘~~ | 판정이 `gpu-design.md:79, :94`에 | 없음 | aa · 착륙 `35c95ec` |
+| ~~`gate_load_v41`의 plan (b) 기본값~~ | 엔진이 두 카드 배치를 거부(`body.rs:127-135`, 리드 확인) | solo 적재 두 번(약 329 s[유도])을 opt-in으로 | aa · 착륙 `35c95ec` |
+| ~~engram 실험실(cache.rs, reuse.rs, `SeededRows`, `Context`, bin 둘; 1,877줄)~~ | 엔진 import 0 | ~~실험실 시험과 `measure-engram`이 bench로~~ bench 크레이트가 아니라 `crates/engram-lab`과 `lab-engram`으로 | aa · 착륙 `9d15dae` |
 | `markov-accept`, `qdot-rate-mt`, `pool-rate`, `governor-ab.sh`, `window-union.py` | 답함 / 러너 없음 / 이름 없음 | 없음 | aa |
 | `ATTN_HALVES=2`, `WEIGHTS=anon\|huge`, `POPULATE=0` | 판정 끝(느림 / 무차이) | halves 2 시험 케이스 | aa(CPU 엔진) |
 | tokenizer `hunyuan-dense` 별칭, `Sampler::params()` | 시험 없는 지원 주장 / 호출 0 | 없음 | aa |
@@ -332,7 +332,7 @@ extras   = Engram | Ple | Deepstack
 
 | 파동 | aa 라운드 | 증명 | 선행 |
 |---|---|---|---|
-| **1 삭제** | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `gpudel`(스칼라 flash 세그먼트 패스와 탐침, `StepProbe` split 팔 넷, 호출자 없는 엔트리, `Head::graph`, `AnyEngine` V4.1 팔) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사; 03과 빌더 수를 맞춘 뒤) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
+| **1 삭제** — 착륙(09-26, `35c95ec`..`d665eb5`) | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `gpudel`(스칼라 flash 세그먼트 패스와 탐침, `StepProbe` split 팔 넷, 호출자 없는 엔트리, `Head::graph`, `AnyEngine` V4.1 팔) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사; 03과 빌더 수를 맞춘 뒤) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
 | **2 한 주인** | `levers`(TL-1, aa 레버) · `records`(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · `refset`(GD1·GG5, 시팅 10과 짝) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
 | **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
 | **4 층 프로그램 하나** | `layerprog`(DS6: 층 종류마다 층 프로그램 + decode/verify/prompt 스케줄, CED·소스 공유는 `LayerSpec`에서 유도, Q3-3 `step_rows`) · `batchwide`(DS2: 토큰별 연산을 배치 폭으로) · `gatesproc`(GD3: 배치마다 프로세스 하나) · `gatestoml`(TL-4·TL-6) | 디코드 move(노드 목록 동일), 프롬프트 launch 목록 동일은 `--plan` 덤프로, DS2는 산문 A/B 1회 | 3파동, r8host |

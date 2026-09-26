@@ -55,6 +55,7 @@ GPU 경로의 결정 1~7은 [`gpu-design.md`](gpu-design.md)다. 이 문서는 �
     crates/gguf                 공유. GgmlType에 q8_0(가중치)·bf16 팔, arch_get_f32
     crates/qdot, threads        공유
     crates/engram               공유 서비스(부르는 것은 deepseek41만) — B3, 비행 중
+    crates/engram-lab           engram IO 실험실(행 캐시·재사용 모의·bin 둘, 엔진 사용처 없음), `just lab-engram`
     crates/model                호스트 쪽 모델 코드
       src/{ops,profile,head,ffn,moe,kv}.rs    공유 — kv.rs는 SlotTable·KvRows(행 폭은 계획이 준다)
       src/arch/mod.rs                         `Arch` 열거형 + `Arch::detect(&Gguf)` — general.architecture를 읽는 유일한 자리

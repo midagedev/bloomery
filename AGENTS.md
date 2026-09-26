@@ -129,6 +129,14 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # against tools/ref/ptx-shapes.tsv (a new kernel must be pinned)
     just box-gc       # kill orphan processes under this track's remote dir
     just box-tracks   # remote track dirs vs local worktrees; --remove deletes stale ones
+    just stage-gpu-load-v41 [--plan a]  # opt-in, not a gate-* recipe: `just affected` never
+                      # selects it. Plan (b) — the tree's only two-card load — staged on both
+                      # cards and checked byte for byte against the plan; solo. `-lock` also
+                      # mlocks the host set. A change to crates/model/src/placement.rs,
+                      # placement/{workstation,host_lock}.rs, crates/gpu/src/{hybrid,weights}.rs
+                      # or gate_load_v41.rs runs both by name in its landing batch
+    just lab-engram   # the engram IO lab's tests (crates/engram-lab, no engine user);
+                      # lab-, not gate-, so no engine landing selects it
 
 `just gate` excludes the measure targets on purpose: they need a quiet machine
 and take a lock, so running them is a separate, deliberate act. It also excludes
@@ -180,6 +188,7 @@ could not win on a kernel already at ~700 GB/s.
 | Change class | Proof | Runtime gate | Timed A/B |
 |---|---|---|---|
 | move, split, rename (semantics kept) | `just ptx-scan` table identical — that proves the kernels only; host dispatch code also needs its structural lines unchanged (graph node count, eager = replay, e2e set identical) | none beyond those structural lines | none |
+| delete (a settled arm, a dead entry, a museum bin; rebuild wave 1, 2026-09-26) | `just ptx-scan` of `generate_ds41` and `gate_e2e` equals the base minus exactly the deleted entries — every remaining row and md5 identical — and `just gate-ptx-spill` is red on exactly those rows before `ptx-shapes.tsv` loses them and green after; per deleted entry, the grep that shows no caller left. A remaining entry whose md5 moves makes the change more than a deletion: it lands only when `tools/ref/ptx-canon.py` prints `reordered-only` for it (the same canonical lines, independent instructions in another order) and its resource columns are equal (wave 1: `flash_latent`, `flash_latent_q8` after the `TWICE` scaffolding left `latent_range` — one loop-counter init moved above two constants) | the owning gates of what the deletion touched — for an entry whose md5 moved, its owning gates bit-identical to the base; a removed gate, case or arm is a coverage change and its commit carries the dated reason (the verdict or the grep that retires it) | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
 | launch count only | Δt = ΔN × c_node, predicted | the owning gate | once, only if occupancy moves too |
 | fold a launch's work into a neighbour kernel | Δt = −ΔN × c_node − the removed kernel's time + the work every block of the host grid now repeats or waits on × its blocks; a grid already near ~700 GB/s pays that last term in full | the owning gate | once (qwen3fuse set that term to 0: two folds predicted faster, each measured +0.13 ms) |
@@ -575,9 +584,9 @@ accumulating half the latent — bit-identical, gated, and slower: both threads
 still stream every whole key row for the scores, so the default is 1; a
 decode row takes the split-K path and ignores it), `BLOOMERY_GATE_BOUND` (tools/gate.sh), `BLOOMERY_FLASH_SEG` (gpu flash: keys per
 segment, a multiple of 32; an unusable value panics instead of falling back),
-`BLOOMERY_FLASH_MMA=0` (gpu flash: the scalar segment pass instead of the
-tensor-core default; `just gate-gpu-e2e` runs both, and the timing binary
-prints which one it ran on its `load` line), `BLOOMERY_GQA_MMA=0` (qwen3moe
+`BLOOMERY_FLASH_MMA` (gpu flash: not a lever — refused by name at first use,
+whatever its value; the tensor-core segment pass is the only V2-Lite segment
+pass), `BLOOMERY_GQA_MMA=0` (qwen3moe
 GQA flash: the scalar segment pass instead of the tensor-core default, its
 banded twin; `just gate-gpu-qwen3moe-e2e` runs both and the `load` line
 prints which one ran), `BLOOMERY_QWEN3_UBATCH=<n>` (qwen3moe GEMM prefill, read once at load:
@@ -601,31 +610,30 @@ arm is its same-binary A/B),
 `BLOOMERY_PIN_MAIN=0` (`bloomery-decode`, `bench_v41_host`, `generate_ds41`: leave the
 main thread floating instead of pinning it to the dispatcher's cpu slot — the
 default pins, and the `load` line prints the ask and the outcome),
-`BLOOMERY_STEP_PAIR=1` (`generate_ds41`: every step is one skewed two-row
-pass — `step_pair` with the previous pass's row-A argmax as the draft, accepted
-unconditionally; a timing arm whose `time` rows cover two positions each — its
-text collapses into repetition, so its host-tier routing numbers are timing shape only),
 `BLOOMERY_STEP_STATS=1` (`generate_ds41`: a `stat step` line per generated
 step, host-tier `HybridStats` deltas, `getrusage` page faults and the card's
 `cuMemGetInfo` free bytes (`vram_free`), and a `stat summary` with
-`vram_free_load` and `vram_free_min`; unset, nothing is read),
+`vram_free_load` and `vram_free_min`; after a batched prompt the `stat prefill split` line,
+which prints either way (`prologue/chain/union/wait/enqueue/copy` ms), adds per layer-batch the
+card's `card_out` (first launch to the route's D2H), `card_in` (the shadow under the union) and
+`card_proj` from event pairs; unset, nothing is read),
 `BLOOMERY_CHECK_FINITE=1` (`generate_ds41`: every position is first stepped eagerly outside the
 graph with each sub-layer's streams read back (`shared/ds41_finite.rs`, the probe
 `gate-gpu-ds41-long` runs), then taken back and stepped through the engine, and a `stat finite` line
 per generated step names the first non-finite `(layer, site)` — at a MoE seam its routing and first
 non-finite buffer — or `ok`, then a `stat finite summary`; refused beside `--time`,
-`BLOOMERY_DRAFT`, `BLOOMERY_STEP_PAIR=1` and `BLOOMERY_STEP_STATS=1`; unset, nothing is read),
+`BLOOMERY_DRAFT` and `BLOOMERY_STEP_STATS=1`; unset, nothing is read),
 `BLOOMERY_DRAFT=lookup` (`generate_ds41`: an n-gram lookup draft — `gpu-gates::draft::Lookup`,
 the n = 3→2→1 most-recent follower of `draft-accept.py`'s lookup-recent, fed the fed ids and every
 emitted token — served through `step_pair`: row A's argmax equal to the draft accepts two positions,
 else the second position is taken back and row A's token stands; a step with no proposal is a plain
 `step`; the `tokens` line is the plain run's and `just gate-gpu-ds41-draft` pins that; `time pass …
 positions=1|2 kind=…` rows and a `draft summary` line replace the `time step` rows, which
-`tools/ref/depth-ds41.sh` reads; refused together with `BLOOMERY_STEP_PAIR=1`),
+`tools/ref/depth-ds41.sh` reads),
 `BLOOMERY_HOST_POPULATE=0` (gpu placed load, default 1: do not read the plan's host set in with
 `MADV_POPULATE_READ` at load — the fresh-fault arm; the gate prints `host_populate=` and `generate_ds41` prints `host_populate=`/`host_lock=` after its `load` line; the host tier reads the body's own mapping (one `Split` shared by `Arc`), so the populate reaches the step threads' page tables — measured on the 3090 gate placement, steps 2–63 minor faults 590,664 → 1,719 in total, the remainder engram rows),
 `BLOOMERY_HOST_LOCK=1` (default 0: after populating, `mlock` the host set for the model's life;
-`gate-gpu-load-v41-lock` runs with it; an `RLIMIT_MEMLOCK` refusal is an error that names the limit),
+`stage-gpu-load-v41-lock` runs with it; an `RLIMIT_MEMLOCK` refusal is an error that names the limit),
 `BLOOMERY_CARD_DONTNEED=0` (default 1: keep the file pages of uploaded card segments in the page
 cache; on, each segment's pages are dropped right after its upload, inward-rounded, `token_embd` and
 the engram table excepted — with a ~~196 GB~~ 214.0 GB host set (plan (a) on the public file, 12,692 experts; corrected 2026-09-25) and 48 GB of cards the machine's 264 GB does not
@@ -658,19 +666,6 @@ runs every layer at every position, the same-binary A/B arm; the `load` line pri
 `generate_ds41` prints a `stat prefill ced=` line with each layer's block and latent starts; after
 a triangle call `Body::keep_point` grants only the call's boundaries and its last positions and
 `Body::rollback` to any other point is a named error; any other value is refused by name),
-`BLOOMERY_CARD_EXPERTS=tile|expert|slot` (gpu-deepseek41 `FfnBatch`, read once when the batch's buffers are
-made, default `tile`: a prompt batch's shadow runs the card's routed experts over the layer's whole block
-by tiles — `ds41_card_buckets` groups the block's card slots by expert, `grouped_tiles` cuts each
-expert's run into tiles of up to 8 slots, `ds41_card_gather` copies each slot's q8_1 column into run
-order, and `ds41_expert_gate_up_tiles` and `q4k_gemv_tiles` run a block per (tile, 8 weight rows) with
-the m-column cores, reading each weight row once for up to 8 slots, the down scattering each column back
-to its slot; with `expert`, each expert's rows walk its slots one at a time (`ds41_expert_gate_up_grouped`,
-`q4k_gemv_grouped`); with `slot`, once per slot chunk by chunk through the per-slot kernels — `expert`
-and `slot` are the same-binary A/B arms; all three write the same bits (`just gate-gpu-ds41-prefill` runs
-the default and `BLOOMERY_BOX_ENV='BLOOMERY_CARD_EXPERTS=expert'` and `=slot`); any other value is
-refused by name; the `load` line prints `card_experts=`, and with `BLOOMERY_STEP_STATS=1` `generate_ds41` prints a
-`stat prefill split` line — `prologue/chain/union/wait/enqueue/copy` ms and, per layer-batch, the card's
-`card_out` (first launch to the route's D2H) and `card_in` (the shadow under the union) from event pairs),
 `BLOOMERY_PREFILL_GROUP=<n>` (gpu-deepseek41 prompt batch, read once when the batch's buffers are
 made, default 2, 1–8: a prompt call's batches run in groups of n, layer by layer over the group, each
 layer-batch's route enqueued after the previous one's shadow and ahead of that one's host serve — across a
@@ -684,3 +679,11 @@ the wait of each group's first batch — near the route there means the wrap is 
 each routed layer's card keeps the file's first `n_l` ranked ids instead of the id prefix `[0, n_l)`,
 same counts and bytes; unset is the prefix; a layer listing fewer than the plan's `n_l` is refused).
 Each is read once, at first use.
+
+A V4.1 prompt batch's shadow runs the card's routed experts over the layer's whole block by
+tiles, one path with no lever: `ds41_card_buckets` groups the block's card slots by expert,
+`grouped_tiles` cuts each expert's run into tiles of up to 8 slots, `ds41_card_gather` copies
+each slot's q8_1 column into run order, and `ds41_expert_gate_up_tiles` and `q4k_gemv_tiles`
+run a block per (tile, 8 weight rows) with the m-column cores, reading each weight row once for
+up to 8 slots, the down scattering each column back to its slot; it writes the step's bits
+(`just gate-gpu-ds41-prefill`).

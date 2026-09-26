@@ -34,7 +34,7 @@
 #   X  alone, after both lanes end: a recipe (or a dependency) that carries the just attribute
 #      `[group('solo')]`, whose gate pins a host-memory count (page faults, page-cache residency) that
 #      another lane's model loads move; and a recipe that uses box.sh's own card pick
-#      BLOOMERY_CARD=both|a6000 (gate-gpu-load-v41*, which carry the attribute too), which holds both
+#      BLOOMERY_CARD=both|a6000 (stage-gpu-load-v41*, which carry the attribute too), which holds both
 #      cards without the A6000 gate lock. A solo gpu-gate.sh item keeps a card (3090 for a 3090 gate,
 #      a6000 for an `any` one); a BLOOMERY_CARD recipe gets none (box.sh picks). Alone means within
 #      this batch: another track's box jobs still run. The attribute is read from `just --dump --dump-format json`, where a recipe's
@@ -128,7 +128,7 @@
 #   - hardware and kernel state: the 3090's bus (Xid 79), thermal and power events, and the topology
 #     and memory state the gates read from /proc and /sys (crates/threads/src/lib.rs:542,
 #     crates/gpu/src/model/launcher.rs:278, crates/engram/src/prefetch.rs:477 and lib.rs:700,
-#     crates/gpu-gates/src/bin/gate_load_v41.rs:701 and :712, gate_deepseek41_step.rs:2436);
+#     crates/gpu-gates/src/bin/gate_load_v41.rs:701 and :712);
 #   - a model file's content: model files are keyed by size, mtime, ctime and inode;
 #   - a box file that changes during the batch (the manifest is read once, before it): the next batch's
 #     key differs, so the item reruns then;

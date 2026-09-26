@@ -17,8 +17,8 @@
 //! (`prefill=`). Prompt ids are
 //! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
 //! `tools/ref/ik-greedy.sh` tokenized it into
-//! `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv` — the ids the step gate's
-//! `--greedy` and ik's continuation read.
+//! `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv` — the ids the long gate's
+//! `--free`, the dsloop gate and ik's continuation read.
 //!
 //! `--place` is the placement the engine loads by: `a` is the serving plan
 //! (`workstation::plan_a`, every layer and the head on the A6000, each routed

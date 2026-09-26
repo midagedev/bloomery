@@ -58,7 +58,7 @@ const FENCE: f32 = 0.25;
 /// distance, rounded up to one digit. `result_norm` is exact arithmetic on an
 /// identical input, so its band is 1e-6. The logits' 1.2e-2 is the q8_1
 /// activation noise of one Q6_K gemv over 102400 rows (the lm_head's raw-x
-/// rel measured 1.27e-2 in `probe-gpu-real-x`).
+/// rel measured 1.27e-2; the table is in `docs/gpu-design.md`).
 #[cfg(feature = "gpu")]
 const BANDS: [(TapKind, usize, f32); 2] = [
     (TapKind::ResultNorm, 27, 1e-6),
