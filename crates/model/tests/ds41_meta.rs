@@ -41,19 +41,21 @@
 //! (`just gate-ds41-meta`); `BLOOMERY_V41_MODEL` names another first shard.
 //! Headers and manifests only: seconds.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use gguf::Split;
 use model::arch::deepseek41::hparams::{Collapse, Hparams, LayerKind, Model, Rope, Score};
 use model::arch::deepseek41::names;
 use model::placement::workstation;
+use refset::arch::deepseek41::IK;
+use refset::ik::RefManifest;
 
 /// The oracle set of the shared prefill and the decode-step set with the
 /// indexer built.
-const SHARED_SET: &str = "ref_deepseek41";
-const STEP_SET: &str = "ref_deepseek41_d1_every_node";
+const SHARED_SET: &str = refset::arch::deepseek41::BATCH;
+const STEP_SET: &str = refset::arch::deepseek41::D1;
 
 /// The one tensor family the file carries and the text step does not read:
 /// the router bias ik swaps in for image tokens (build_deepseek4.cpp:1584-1588).
@@ -570,57 +572,42 @@ struct Node {
     layer: usize,
 }
 
-/// One oracle set's manifest: its header lines and its tensor rows, in graph
+/// One oracle set's manifest: its dumper's flags and its tensor rows, in graph
 /// order.
 struct Manifest {
     set: &'static str,
-    header: HashMap<String, String>,
+    flags: Option<String>,
     nodes: Vec<Node>,
 }
 
 impl Manifest {
+    /// The set `set` of the V4.1 file the tree runs, through the node dumps'
+    /// family check (`refset::ik`: complete, of the file the tree runs, the
+    /// family's architecture and ik tree), and its `# model_file` the name of
+    /// the file `split` opens.
     fn open(set: &'static str, split: &Split) -> Manifest {
-        let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-        // The set of that name for the V4.1 file the tree runs.
-        let path = PathBuf::from(base)
-            .join(gguf::v41::set(set))
-            .join("MANIFEST.tsv");
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        let man = RefManifest::open(&IK.path(set), &IK).unwrap_or_else(|e| {
             panic!(
-                "no oracle manifest at {} ({e}). The lead produces it (tools/ref/dump.sh). \
-                 Do not run it yourself and do not skip this test.",
-                path.display()
+                "{e}. The lead produces it (tools/ref/dump.sh). \
+                 Do not run it yourself and do not skip this test."
             )
         });
-        let mut header = HashMap::new();
         let mut nodes = Vec::new();
         let mut layer = 0;
-        for line in text.lines() {
-            if let Some(h) = line.strip_prefix("# ") {
-                if let Some((k, v)) = h.split_once('\t') {
-                    header.insert(k.to_string(), v.to_string());
-                }
-                continue;
-            }
-            let f: Vec<&str> = line.split('\t').collect();
-            if f[0] != "tensor" {
-                continue;
-            }
-            assert_eq!(
-                f.len(),
-                15,
-                "{set}: a tensor row of {} columns: {line}",
-                f.len()
-            );
+        for r in &man.tensors {
+            let src = |s: &Option<String>| {
+                s.clone().unwrap_or_else(|| {
+                    panic!(
+                        "{set}: tensor row {}#{} has no source columns (a v1 row)",
+                        r.name, r.occurrence
+                    )
+                })
+            };
             let node = Node {
-                name: f[1].to_string(),
-                occurrence: f[2]
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{set}: {line}: {e}")),
-                ne0: f[4]
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{set}: {line}: {e}")),
-                src: [f[13].to_string(), f[14].to_string()],
+                name: r.name.clone(),
+                occurrence: r.occurrence,
+                ne0: r.ne[0],
+                src: [src(&r.src0), src(&r.src1)],
                 layer,
             };
             if node.occurrence == 0
@@ -633,20 +620,19 @@ impl Manifest {
             }
             nodes.push(node);
         }
-        assert!(
-            header.contains_key("complete"),
-            "{set}: the manifest has no completion trailer — the dump that wrote it did not finish"
-        );
         let ours = split
             .shard_path(0)
             .and_then(Path::file_name)
             .map(|n| n.to_string_lossy().into_owned());
         assert_eq!(
-            header.get("model_file").cloned(),
-            ours,
+            man.header.model_file, ours,
             "{set} was dumped from another file"
         );
-        Manifest { set, header, nodes }
+        Manifest {
+            set,
+            flags: man.header.flags,
+            nodes,
+        }
     }
 
     /// The node `<stem>-<layer>` (its first occurrence), if ik built it.
@@ -703,7 +689,7 @@ impl Manifest {
 
     /// The top-k this set's ik run used, if its flags override the file's.
     fn top_k_override(&self, split: &Split) -> Option<usize> {
-        let flags = self.header.get("flags")?;
+        let flags = self.flags.as_deref()?;
         let mut words = flags.split_whitespace();
         let key = split.arch_key("attention.indexer.top_k");
         while let Some(w) = words.next() {

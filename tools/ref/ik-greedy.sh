@@ -37,6 +37,10 @@
 #
 # Writes $BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv (id, text, the V4.1 ids) and greedy-ik-cpu-<N>-p<P>.tsv
 # (argmax_ref's row: gen_ids and gen_margins), and <N>-p<P>.log with the witness blocks. N is GEN, default 64.
+# Both .tsv files name the model file by its full path — the prompt file in its `#` line, the greedy file in
+# argmax_ref's `# argmax_ref ... model=<path>` line, the one the reference-set reader checks (`refset::greedy`):
+# the two V4.1 files' shards share their names. Both are written as .partial and renamed only when the run
+# succeeds, so a failed run leaves the last good run's pair in place.
 # Bounded by timeout (IK_GREEDY_BOUND seconds, default 900). The lease is lease_take's (tools/ref/lease.sh):
 # the run needs a card, BLOOMERY_LEASE_CARD=docs/cards/<slug>.card through BLOOMERY_BOX_ENV, written
 # for that run; a loop over prompts takes the lease once per prompt, with the one card.
@@ -101,7 +105,7 @@ if [ "$PROMPT" = 0 ] && [ "$IDS" != "$REF_TOKENS" ]; then
   exit 1
 fi
 PROMPTS=$OUTDIR/prompt$PROMPT.tsv
-printf '# prompt %s of tools/ref/prompts.tsv, read by %s on %s\n%s\t%s\t%s\n' "$PROMPT" "$TOK" "$(basename "$MODEL")" "$PROMPT" "$TEXT" "$IDS" > "$PROMPTS"
+printf '# prompt %s of tools/ref/prompts.tsv, read by %s on %s\n%s\t%s\t%s\n' "$PROMPT" "$TOK" "$MODEL" "$PROMPT" "$TEXT" "$IDS" > "$PROMPTS.partial"
 
 OUT=$OUTDIR/greedy-ik-cpu-$GEN-p$PROMPT.tsv
 LOG=$OUTDIR/$GEN-p$PROMPT.log
@@ -125,7 +129,7 @@ greedy_witness pre-greedy
 t0=$(date +%s)
 rc=0
 CUDA_VISIBLE_DEVICES="" timeout --kill-after=10 "$BOUND" \
-  "$BIN" -m "$MODEL" --prompts "$PROMPTS" --gen "$GEN" --step-prefill -ngl 0 -c "$REF_CTX" -t 32 \
+  "$BIN" -m "$MODEL" --prompts "$PROMPTS.partial" --gen "$GEN" --step-prefill -ngl 0 -c "$REF_CTX" -t 32 \
   "${REF_DUMP_ARGS[@]}" > "$OUT.partial" 2>> "$LOG" &
 pid=$!
 say "ik-greedy.sh: argmax_ref under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null || echo gone))"
@@ -136,8 +140,9 @@ lease_release
 if [ "$rc" != 0 ]; then
   say "ik-greedy.sh: argmax_ref exited $rc after $((t1 - t0)) s; the log's tail:"
   tail -n 15 "$LOG" >&2
-  rm -f "$OUT.partial"
+  rm -f "$OUT.partial" "$PROMPTS.partial"
   exit "$rc"
 fi
+mv "$PROMPTS.partial" "$PROMPTS"
 mv "$OUT.partial" "$OUT"
 say "greedy tag=greedy-ik-cpu-$GEN-p$PROMPT tree=$IK head=$HEAD_REV model=$(basename "$MODEL") prompt=$IDS gen=$GEN wall_s=$((t1 - t0)) out=$OUT"

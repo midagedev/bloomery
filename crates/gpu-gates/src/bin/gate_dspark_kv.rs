@@ -53,24 +53,23 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use bloomery_gpu::{Fault, FaultSite, Gpu, LAYER_NONE};
     use bloomery_gpu_deepseek41::draft::kv::{DraftRings, KvAppend, KvReadback};
     use bloomery_gpu_deepseek41::draft::load::DraftWeights;
     use bloomery_gpu_deepseek41::markov::{MarkovKernels, MarkovWeights};
-    use bloomery_gpu_gates::{
-        GateError, checks_failed, data_dir, dump_stem, ref_model_path, verdict,
-    };
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits, half_to_f32};
     use model::arch::dspark::{self, Borrow, DraftHparams, Group, names};
+    use refset::RefError;
+    use refset::arch::deepseek41::{DSREF, DSREF_SET, dspark_model};
+    use refset::dsref::{Dsref, Graph};
+    use refset::ik::Layout;
 
     const NAME: &str = "gate_dspark_kv";
-    const DSREF_SET: &str = "code64_n32_w3";
-    /// The ik tree every V4.1 oracle set must name in its `# build` line.
-    const IK_BUILD: &str = "db517b69";
     /// Blocks whose feature-to-KV graph is checked.
     const BLOCKS: [i32; 4] = [0, 1, 2, 3];
     const U: f64 = 1.0 / (1u64 << 24) as f64;
@@ -82,108 +81,8 @@ mod gate {
 
     // ------------------------------------------------------------- the set
 
-    struct Row {
-        kind: String,
-        name: String,
-        occ: u32,
-        ne: [usize; 4],
-        block: i32,
-        graph: String,
-    }
-
-    struct Set {
-        dir: PathBuf,
-        rows: Vec<Row>,
-    }
-
-    fn read_set(dir: &Path) -> Result<Set, GateError> {
-        let text = std::fs::read_to_string(dir.join("MANIFEST.tsv"))
-            .map_err(|e| format!("{}/MANIFEST.tsv: {e}", dir.display()))?;
-        let build = text
-            .lines()
-            .find_map(|l| l.strip_prefix("# build\t"))
-            .unwrap_or("");
-        if !build.contains(IK_BUILD) {
-            return Err(format!(
-                "{}: # build {build:?} does not name {IK_BUILD} — stale set",
-                dir.display()
-            )
-            .into());
-        }
-        let mut rows = Vec::new();
-        for l in text.lines().filter(|l| !l.starts_with('#')) {
-            let f: Vec<&str> = l.split('\t').collect();
-            if matches!(f[0], "tensor" | "input") && f.len() == 19 {
-                let u = |i: usize| f[i].parse::<usize>().unwrap_or(0);
-                rows.push(Row {
-                    kind: f[0].to_string(),
-                    name: f[1].to_string(),
-                    occ: f[2].parse()?,
-                    ne: [u(4), u(5), u(6), u(7)],
-                    block: f[15].parse()?,
-                    graph: f[18].to_string(),
-                });
-            }
-        }
-        Ok(Set {
-            dir: dir.to_path_buf(),
-            rows,
-        })
-    }
-
-    impl Set {
-        fn find(&self, block: i32, graph: &str, name: &str) -> Result<&Row, GateError> {
-            self.rows
-                .iter()
-                .find(|r| r.block == block && r.graph == graph && r.name == name && r.occ == 0)
-                .ok_or_else(|| {
-                    format!("the set has no {graph} row {name:?} in block {block}").into()
-                })
-        }
-
-        fn path(&self, r: &Row, ext: &str) -> PathBuf {
-            let kv = if r.graph == "kv" { "kv." } else { "" };
-            let input = if r.kind == "input" { ".input" } else { "" };
-            self.dir.join(format!(
-                "b{}.{kv}{}.{}{input}.{ext}",
-                r.block,
-                dump_stem(&r.name),
-                r.occ
-            ))
-        }
-
-        fn f32s(&self, r: &Row) -> Result<Vec<f32>, GateError> {
-            let p = self.path(r, "f32");
-            let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let v: Vec<f32> = b
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect();
-            let want: usize = r.ne.iter().product();
-            if v.len() != want {
-                return Err(format!(
-                    "{}: {} values, manifest ne {:?}",
-                    p.display(),
-                    v.len(),
-                    r.ne
-                )
-                .into());
-            }
-            Ok(v)
-        }
-
-        fn i32s(&self, r: &Row) -> Result<Vec<i32>, GateError> {
-            let p = self.path(r, "i32");
-            let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            Ok(b.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| i32::from_le_bytes(*c))
-                .collect())
-        }
-    }
+    // The draft set is `refset::dsref`'s: read by its column lines and
+    // refused by name when it is not of the files the tree runs.
 
     // ------------------------------------------------------------ the load
 
@@ -510,7 +409,7 @@ mod gate {
         w: &'a DraftWeights,
         hp: &'a DraftHparams,
         host: &'a Host,
-        set: &'a Set,
+        set: &'a Dsref,
         ok: bool,
     }
 
@@ -524,10 +423,17 @@ mod gate {
         iso: &mut DraftRings,
     ) -> Result<Vec<(usize, i32)>, GateError> {
         let (set, hp, s) = (cx.set, cx.hp, cx.gpu.stream());
-        let feats = set.f32s(set.find(b, "kv", "CUDA0#dflash_kv_input_target_features#0")?)?;
-        let pos = set.i32s(set.find(b, "kv", "CUDA0#dflash_kv_input_pos_ctx#0")?)?;
-        let rows = set.i32s(set.find(b, "kv", "CUDA0#dflash_kv_input_rows#0")?)?;
-        let fused = set.f32s(set.find(b, "kv", "dflash_kv_fused_target")?)?;
+        let feats =
+            set.f32s(set.find(b, Graph::Kv, "CUDA0#dflash_kv_input_target_features#0", 0)?)?;
+        let pos = set.i32s(
+            set.find(b, Graph::Kv, "CUDA0#dflash_kv_input_pos_ctx#0", 0)?,
+            Layout::Flat,
+        )?;
+        let rows = set.i32s(
+            set.find(b, Graph::Kv, "CUDA0#dflash_kv_input_rows#0", 0)?,
+            Layout::Flat,
+        )?;
+        let fused = set.f32s(set.find(b, Graph::Kv, "dflash_kv_fused_target", 0)?)?;
         let n = pos.len();
         let consecutive = |v: &[i32]| v.windows(2).all(|w| w[1] == w[0] + 1);
         if rows.len() != n || !consecutive(&pos) || !consecutive(&rows) || rows[0] < 0 || pos[0] < 0
@@ -572,8 +478,8 @@ mod gate {
 
         // ik's f16 ring rows as the block pass reads them.
         let ik_rows: Vec<Vec<f32>> = (0..hp.n_layer)
-            .map(|l| set.f32s(set.find(b, "block", &format!("dflash_k_ctx_cache_{l}"))?))
-            .collect::<Result<_, GateError>>()?;
+            .map(|l| set.f32s(set.find(b, Graph::Block, &format!("dflash_k_ctx_cache_{l}"), 0)?))
+            .collect::<Result<_, RefError>>()?;
         let hd = hp.head_dim;
         let pick = |v: &[f32]| -> Vec<f32> {
             rows.iter()
@@ -645,10 +551,12 @@ mod gate {
                 let slot = r % hp.window;
                 own += usize::from(ours[slot * hd..(slot + 1) * hd] == rows[l][..]);
             }
-            let block_k = set.f32s(set.find(b, "block", &format!("dflash_k_ctx_cache_{l}"))?)?;
-            let block_v = set.f32s(set.find(b, "block", &format!("dflash_v_ctx_cache_{l}"))?)?;
+            let block_k =
+                set.f32s(set.find(b, Graph::Block, &format!("dflash_k_ctx_cache_{l}"), 0)?)?;
+            let block_v =
+                set.f32s(set.find(b, Graph::Block, &format!("dflash_v_ctx_cache_{l}"), 0)?)?;
             let next = set
-                .find(b + 1, "kv", &format!("dflash_k_ctx_cache_{l}"))
+                .find(b + 1, Graph::Kv, &format!("dflash_k_ctx_cache_{l}"), 0)
                 .and_then(|r| set.f32s(r));
             let (mut kv_same, mut next_same, mut ours_ik) = (0usize, 0usize, 0usize);
             for &r in written.keys() {
@@ -739,10 +647,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let path = std::env::var_os("BLOOMERY_DSPARK_MODEL")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .ok_or("BLOOMERY_DSPARK_MODEL unset — run through `just gate-gpu-dspark-kv`")?;
+        let path = PathBuf::from(dspark_model()?);
         let draft = Split::open(&path)?;
         let target = Split::open(ref_model_path()?)?;
         let gpu = Gpu::new()?;
@@ -762,7 +667,7 @@ mod gate {
                 .map(|l| f32_tensor(&draft, &names::attn_kv_a_norm(l)))
                 .collect::<Result<_, _>>()?,
         };
-        let set = read_set(&data_dir().join("ref-draft").join(DSREF_SET))?;
+        let set = Dsref::open(&DSREF.path(DSREF_SET), &DSREF)?;
         let mut kv = KvAppend::new(&gpu, &hp)?;
         let mut rings = DraftRings::new(gpu.stream(), &hp)?;
         let mut iso = DraftRings::new(gpu.stream(), &hp)?;

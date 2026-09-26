@@ -760,12 +760,9 @@ fn le_f32(b: &[u8], at: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{data_dir, ref_model_path, verdict};
-
-    /// The base files the gate reads by default, as `ik-ppl.sh --kld-base`
-    /// tags: the c2048 × 4 run the PR's PPL is quoted at, and the c512 × 16 run
-    /// the early comparison reads.
-    const BASES: [&str; 2] = ["kldbase-c2048x4", "kldbase-c512x16"];
+    use crate::{open_model, ref_model_path, verdict};
+    use model::arch::Arch;
+    use refset::family::{Family, Identity};
 
     /// ik prints a base run's PPL with four decimals (`%.4lf`): within 5e-5 of
     /// exp(mean NLL), which moves ln PPL by at most 5e-5 / PPL ≤ 5e-5.
@@ -781,15 +778,19 @@ mod tests {
     const PPL_BAND_LN: f64 = MAX_STEP / 2.0 + F32_SLACK + PRINT_HALF;
 
     /// A base file is the run that wrote it (`just gate-ds41-kld`): for each
-    /// of [`BASES`] — or the one file `$BLOOMERY_KLD_FILE` names, judged
-    /// against the run its file stem names — the header states the run's ctx
-    /// and chunks, the file has the bytes the run recorded, the vocabulary is
-    /// the model file's, every record is one ik's quantizer can write, and
-    /// exp(mean NLL) over the file is the PPL the run printed, within
-    /// [`PPL_BAND_LN`].
+    /// base in place of the model file's KLD family ([`kld_family`]) — or the
+    /// one file `$BLOOMERY_KLD_FILE` names, judged against the run its file
+    /// stem names, whose log lies beside it — the run read the model file the
+    /// tree runs and ran the family's ik tree (`refset::kld::check`), the
+    /// header states the run's ctx and chunks, the file has the bytes the run
+    /// recorded, the vocabulary is the model file's, every record is one ik's
+    /// quantizer can write, and exp(mean NLL) over the file is the PPL the run
+    /// printed, within [`PPL_BAND_LN`].
     #[test]
     #[ignore = "hw: needs the ik base files in $BLOOMERY_DATA/ikppl and the V4.1 model file on the box"]
     fn hw_ds41_kld_base_matches_its_run() {
+        let (model, vocab) = model_vocab().unwrap_or_else(|e| panic!("hw_ds41_kld: {e}"));
+        let family = kld_family().unwrap_or_else(|e| panic!("hw_ds41_kld: {e}"));
         let files: Vec<(PathBuf, String)> = match std::env::var_os("BLOOMERY_KLD_FILE") {
             Some(p) if !p.is_empty() => {
                 let p = PathBuf::from(p);
@@ -800,20 +801,22 @@ mod tests {
                     .to_string();
                 vec![(p, tag)]
             }
-            _ => BASES
-                .iter()
-                .map(|t| {
-                    (
-                        data_dir().join("ikppl").join(format!("{t}.kld")),
-                        t.to_string(),
-                    )
+            _ => family
+                .in_place()
+                .into_iter()
+                .map(|run| {
+                    let tag = run
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_else(|| panic!("hw_ds41_kld: {} has no tag", run.display()))
+                        .to_string();
+                    (run.with_file_name(format!("{tag}.kld")), tag)
                 })
                 .collect(),
         };
-        let (model, vocab) = model_vocab().unwrap_or_else(|e| panic!("hw_ds41_kld: {e}"));
         let mut pass = true;
         for (file, tag) in &files {
-            match judge(file, tag, &model, vocab) {
+            match judge(file, tag, &model, vocab, family) {
                 Ok(ok) => pass &= ok,
                 Err(e) => {
                     println!("hw_ds41_kld: {} — {e} — FAIL", file.display());
@@ -827,21 +830,21 @@ mod tests {
         );
     }
 
-    /// One base file against its run's result line. Prints the file's verdict
-    /// line; `Ok(false)` is a check that failed, `Err` a file that cannot be
-    /// judged.
-    fn judge(file: &Path, tag: &str, model: &Path, vocab: usize) -> Result<bool, GateError> {
-        let log = data_dir().join("ikppl").join(format!("{tag}.log"));
+    /// One base file against its run: the run's log first, refused by name
+    /// when the run read another model file or ran another ik tree
+    /// (`refset::kld::check`), then its result line. Prints the file's
+    /// verdict line; `Ok(false)` is a check that failed, `Err` a file that
+    /// cannot be judged.
+    fn judge(
+        file: &Path,
+        tag: &str,
+        model: &Path,
+        vocab: usize,
+        family: &Family,
+    ) -> Result<bool, GateError> {
+        let log = refset::kld::check(file, tag, family)?.log;
         let run = RunLine::read(&log, tag)?;
         let model_name = model.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if run.model != model_name {
-            return Err(format!(
-                "the run read {}, but the gate's model file is {}",
-                run.model,
-                model.display()
-            )
-            .into());
-        }
         let base = KldBase::open(file, vocab)?;
         if (base.n_ctx(), base.n_chunk()) != (run.ctx, run.chunks) {
             return Err(format!(
@@ -903,6 +906,26 @@ mod tests {
         Ok(pass)
     }
 
+    /// The KLD family of the model file the gate opens: the one family of its
+    /// architecture whose sets are ik's KL-divergence base runs.
+    fn kld_family() -> Result<&'static Family, GateError> {
+        let arch = Arch::detect(&open_model()?)?;
+        let runs: Vec<&'static Family> = refset::arch::families(arch.name())
+            .iter()
+            .copied()
+            .filter(|f| f.identity == Identity::RunLog)
+            .collect();
+        match runs[..] {
+            [f] => Ok(f),
+            _ => Err(format!(
+                "{} KLD families of {} in the reference-set table, want one",
+                runs.len(),
+                arch.name()
+            )
+            .into()),
+        }
+    }
+
     /// The gate's model file and its vocabulary, read from the file: the
     /// length of `tokenizer.ggml.tokens`, which is ik's `n_vocab`.
     fn model_vocab() -> Result<(PathBuf, usize), GateError> {
@@ -922,7 +945,6 @@ mod tests {
         ctx: usize,
         chunks: usize,
         kld_bytes: u64,
-        model: String,
     }
 
     impl RunLine {
@@ -934,7 +956,6 @@ mod tests {
                 ctx: line.parse("ctx")?,
                 chunks: line.parse("chunks")?,
                 kld_bytes: line.parse("kld_bytes")?,
-                model: line.text("model")?.to_string(),
             })
         }
     }

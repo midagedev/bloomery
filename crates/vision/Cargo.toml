@@ -17,3 +17,7 @@ bloomery-gguf = { path = "../gguf" }
 # decoded pixels, so the decoder is part of what it proves.
 png = "=0.18.1"
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The gates read the oracle set through the reference-set reader, which checks its provenance.
+bloomery-refset = { path = "../refset" }

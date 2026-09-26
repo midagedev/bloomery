@@ -108,7 +108,9 @@ witness post-dump
 
 grep -q '^# complete' "$STAGE/MANIFEST.tsv" ||
   { echo "dump-draft.sh: the staged set has no completion trailer — not installing it" >&2; exit 1; }
-model_of() { awk -F'\t' '$1 == "# model_file" || $1 == "# draft_model_file" { printf "%s ", $2 }' "$1"; }
+# A set names its target and draft files by full path (`# model`, `# draft_model`): the two V4.1 files'
+# shards share their names, so the `_file` basenames cannot tell a set of one from a set of the other.
+model_of() { awk -F'\t' '$1 == "# model" || $1 == "# draft_model" { printf "%s ", $2 }' "$1"; }
 if [ -f "$REF/MANIFEST.tsv" ] && [ "$(model_of "$REF/MANIFEST.tsv")" != "$(model_of "$STAGE/MANIFEST.tsv")" ]; then
   echo "dump-draft.sh: $REF holds a set of [$(model_of "$REF/MANIFEST.tsv")], this dump is of" \
     "[$(model_of "$STAGE/MANIFEST.tsv")] — not replacing it (the staged set stays in $STAGE)" >&2

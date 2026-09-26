@@ -1,15 +1,20 @@
-//! The oracle set of `tools/ref/vision/dump-vision.sh`, read for the gates.
+//! The oracle set of `tools/ref/vision/dump-vision.sh`, read for the gates through the reference-set
+//! reader (`refset::vision`), which refuses a set without its trailer or of another checkpoint
+//! revision by name.
 
+use refset::arch::deepseek41v::{VISION, VISION_SET};
+use refset::vision::VisionSet;
 use std::path::{Path, PathBuf};
 
-/// The revision every set must name; a set of another is stale.
-pub const REVISION: &str = "dba1be0a40aa45a94ad051997016db3960a90277";
+/// One `image` row of the manifest.
+pub use refset::vision::Image as ImageRow;
 
-/// `$BLOOMERY_DATA/ref-vision/<set>`, the set `BLOOMERY_VISION_SET` names (default `deepseek41v`).
+/// The vision family's set, or the one under `ref-vision` that `BLOOMERY_VISION_SET` names.
 pub fn set_dir() -> PathBuf {
-    let data = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-    let set = std::env::var("BLOOMERY_VISION_SET").unwrap_or_else(|_| "deepseek41v".into());
-    Path::new(&data).join("ref-vision").join(set)
+    match std::env::var("BLOOMERY_VISION_SET") {
+        Ok(set) => refset::data_dir().join("ref-vision").join(set),
+        Err(_) => VISION.path(VISION_SET),
+    }
 }
 
 /// The committed test image `name`.
@@ -17,28 +22,6 @@ pub fn image_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tools/ref/vision/images")
         .join(name)
-}
-
-/// One `image` row of the manifest.
-#[derive(Debug)]
-pub struct ImageRow {
-    pub name: String,
-    pub sha256: String,
-    pub w: usize,
-    pub h: usize,
-    pub best_w: usize,
-    pub best_h: usize,
-    pub n_vit_h: usize,
-    pub n_vit_w: usize,
-    pub n_llm_h: usize,
-    pub n_llm_w: usize,
-    pub n_tokens: usize,
-}
-
-impl ImageRow {
-    pub fn stem(&self) -> &str {
-        self.name.strip_suffix(".png").unwrap_or(&self.name)
-    }
 }
 
 /// One row of `plans.tsv`: an input size, the reference's plan and its pad geometry.
@@ -57,74 +40,20 @@ pub struct Manifest {
     pub mmproj_sha256: String,
     pub image_token_id: u32,
     pub images: Vec<ImageRow>,
-}
-
-fn nums<const N: usize>(fields: &[&str], line: &str) -> [usize; N] {
-    let v: Vec<usize> = fields
-        .iter()
-        .map(|f| {
-            f.parse()
-                .unwrap_or_else(|_| panic!("not a count: {f:?} in {line:?}"))
-        })
-        .collect();
-    v.try_into()
-        .unwrap_or_else(|_| panic!("{N} counts expected in {line:?}"))
+    set: VisionSet,
 }
 
 impl Manifest {
     /// Read `MANIFEST.tsv`, refusing a set without its trailer or of another revision.
     pub fn load() -> Manifest {
-        let dir = set_dir();
-        let text = std::fs::read_to_string(dir.join("MANIFEST.tsv"))
-            .unwrap_or_else(|e| panic!("{}: {e} — run: just dump-ref-vision", dir.display()));
-        assert!(
-            text.lines().any(|l| l.starts_with("# complete\t")),
-            "{}: no # complete trailer",
-            dir.display()
-        );
-        let checkpoint = text
-            .lines()
-            .find(|l| l.starts_with("# checkpoint\t"))
-            .expect("# checkpoint line");
-        assert!(
-            checkpoint.contains(REVISION),
-            "stale set, {checkpoint:?} is not revision {REVISION}"
-        );
-        let (mut mmproj, mut sha, mut id, mut images) = (None, None, None, Vec::new());
-        for line in text.lines() {
-            let f: Vec<&str> = line.split('\t').collect();
-            match f[0] {
-                "# mmproj" => {
-                    mmproj = Some(PathBuf::from(f[1]));
-                    sha = Some(f[3].to_string());
-                }
-                "# image_token_id" => id = Some(f[1].parse().expect("image_token_id")),
-                "image" => {
-                    let n: [usize; 9] = nums(&f[3..12], line);
-                    images.push(ImageRow {
-                        name: f[1].to_string(),
-                        sha256: f[2].to_string(),
-                        w: n[0],
-                        h: n[1],
-                        best_w: n[2],
-                        best_h: n[3],
-                        n_vit_h: n[4],
-                        n_vit_w: n[5],
-                        n_llm_h: n[6],
-                        n_llm_w: n[7],
-                        n_tokens: n[8],
-                    });
-                }
-                _ => {}
-            }
-        }
-        assert!(!images.is_empty(), "{}: no image rows", dir.display());
+        let set = VisionSet::open(&set_dir(), &VISION).unwrap_or_else(|e| panic!("{e}"));
         Manifest {
-            dir,
-            mmproj: mmproj.expect("# mmproj line"),
-            mmproj_sha256: sha.expect("# mmproj sha256"),
-            image_token_id: id.expect("# image_token_id line"),
-            images,
+            dir: set.dir.clone(),
+            mmproj: set.mmproj.clone(),
+            mmproj_sha256: set.mmproj_sha256.clone(),
+            image_token_id: set.image_token_id,
+            images: set.images.clone(),
+            set,
         }
     }
 
@@ -136,18 +65,25 @@ impl Manifest {
 
     /// `plans.tsv`.
     pub fn plans(&self) -> Vec<PlanRow> {
-        let text = String::from_utf8(self.read("plans.tsv")).expect("plans.tsv is text");
-        text.lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(|line| {
-                let f: Vec<&str> = line.split('\t').collect();
-                let [w, h]: [usize; 2] = nums(&f[1..3], line);
-                PlanRow {
-                    kind: f[0].to_string(),
-                    w,
-                    h,
-                    want: nums(&f[3..12], line),
-                }
+        self.set
+            .plans()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .map(|p| PlanRow {
+                kind: p.kind,
+                w: p.w,
+                h: p.h,
+                want: [
+                    p.n_llm_h,
+                    p.n_llm_w,
+                    p.best_h,
+                    p.best_w,
+                    p.n_tokens,
+                    p.resized_w,
+                    p.resized_h,
+                    p.off_x,
+                    p.off_y,
+                ],
             })
             .collect()
     }

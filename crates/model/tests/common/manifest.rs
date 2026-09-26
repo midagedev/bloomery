@@ -1,19 +1,19 @@
 //! The stage-1 oracle set's manifest, `$BLOOMERY_DATA/ref/MANIFEST.tsv`, which
-//! `tools/ref/dump.sh` wrote: found, complete, and made for the model the gates open. The
-//! one reader of the file itself; `oracle` and `prompt` read their parts from it.
+//! `tools/ref/dump.sh` wrote: found, complete, and made for the model the gates open. Read
+//! through the reference-set reader (`refset::ik`); `oracle` and `prompt` read their parts
+//! from it.
 //!
 //! The reference set is produced by the lead and only read here. If it is absent this
 //! stops with an error naming the command — it never falls back to computing something,
 //! because a gate that quietly measures nothing stays green.
 
-use std::path::PathBuf;
+use refset::ik::RefManifest;
 
-/// The manifest's directory and text, after the checks every reader needs.
-pub fn read() -> (PathBuf, String) {
-    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-    let dir = PathBuf::from(base).join("ref");
+/// The manifest, after the checks every reader needs.
+pub fn read() -> RefManifest {
+    let dir = refset::data_dir().join("ref");
     let manifest = dir.join("MANIFEST.tsv");
-    let text = std::fs::read_to_string(&manifest).unwrap_or_else(|e| {
+    let man = RefManifest::read(&dir).unwrap_or_else(|e| {
         panic!(
             "no oracle at {} ({e}). The lead produces it: `just dump-ref`. \
              Do not run it yourself and do not skip this test.",
@@ -23,7 +23,7 @@ pub fn read() -> (PathBuf, String) {
     // The dumper's last line is its completion proof. A manifest without it is from a
     // run that died, and the .f32 files beside it are then a mixture of two runs.
     // File count cannot detect that; the trailer can.
-    if !text.lines().any(|l| l.starts_with("# complete\t")) {
+    if man.complete.is_none() {
         panic!(
             "the oracle at {} has no completion trailer — the dump that wrote it did \
              not finish, so the tensors beside it may be from two different runs. \
@@ -33,9 +33,9 @@ pub fn read() -> (PathBuf, String) {
         );
     }
     // The gates must open the file the oracle came from.
-    let model = text
-        .lines()
-        .find_map(|l| l.strip_prefix("# model\t"))
+    let model = man
+        .header
+        .model()
         .map(str::trim)
         .unwrap_or_else(|| panic!("the oracle at {} names no model", manifest.display()));
     let gated = super::model_path::model_path();
@@ -50,5 +50,5 @@ pub fn read() -> (PathBuf, String) {
             manifest.display()
         );
     }
-    (dir, text)
+    man
 }

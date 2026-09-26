@@ -78,10 +78,12 @@
 //!   are conditioned on the measured distance of the fold the layer reads,
 //!   not on a distance carried along ik's path.
 //! - `--ppl TAG` (G4): ik's KL-divergence base file `$BLOOMERY_DATA/ikppl/
-//!   TAG.kld`, chunk by chunk from a reset, one step per id; at every scored
-//!   position the paired difference `d = NLL_ours − NLL_ik`, KL(ik‖ours), the
-//!   top-1 agreement and both margins. Red is Δ_PPL = e^mean(d) − 1 above
-//!   [`PPL_RED`].
+//!   TAG.kld` — refused by name unless its run (`TAG.log` beside it) read
+//!   the model file the tree runs with the family's ik tree
+//!   (`refset::kld::check`) — chunk by chunk from a reset, one step per id;
+//!   at every scored position the paired difference `d = NLL_ours − NLL_ik`,
+//!   KL(ik‖ours), the top-1 agreement and both margins. Red is
+//!   Δ_PPL = e^mean(d) − 1 above [`PPL_RED`].
 //!
 //! The envelope (G1). Each sub-layer adds to the streams its own rule
 //! difference from ik's, and carries on the one it read. A rule difference is
@@ -602,7 +604,7 @@ mod gate {
     }
 
     fn f32s(man: &RefManifest, row: &RefRow) -> Result<Vec<f32>, GateError> {
-        ref_tensor_logical_in(&man.dir, row)
+        Ok(ref_tensor_logical_in(&man.dir, row)?)
     }
 
     fn named(man: &RefManifest, name: &str) -> Result<Vec<f32>, GateError> {
@@ -2496,6 +2498,7 @@ mod gate {
 
     fn ppl(m: &mut Deepseek41Model, hp: &Hparams, tag: &str) -> Result<bool, GateError> {
         let path: PathBuf = data_dir().join("ikppl").join(format!("{tag}.kld"));
+        refset::kld::check(&path, tag, &refset::arch::deepseek41::KLD)?;
         let base = KldBase::open(&path, hp.n_vocab)?;
         println!(
             "ppl base {}: ctx {} chunks {} scored per chunk {} from {}",

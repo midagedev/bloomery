@@ -751,6 +751,17 @@ gate-gpu-gates-lib:
 gate-ds41-oracle:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_oracle --nocapture --test-threads=1'
 
+# Reference sets (crates/refset, host only): the readers' unit tests, then every family's sets in place
+# against the family table — each complete, dumped from the file the tree runs, of the family's ik build.
+# The draft set's family needs the profile's DSPARK_MODEL, exported as the dspark recipes do.
+gate-refset:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-refset --lib -- --include-ignored --nocapture'
+
+# Which reference sets are stale, one line each: with no arguments every family's sets in place, else
+# `<family> <path>...` reads the sets at the paths as sets of that family (host only, reads only).
+refset-check *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && cargo build --release -p bloomery-refset --bin refset-check && bash tools/host-gate.sh refset-check {{ARGS}}'
+
 # V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, V4.1 오라클 세트(배치 세트와 디코드 스텝 세트)의
 # 그래프 입력 전부를 계획과 비트 단위로 대조한다. 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
 gate-ds41-plan:

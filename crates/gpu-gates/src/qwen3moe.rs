@@ -78,7 +78,7 @@ pub fn f16_logical_bits(dir: &Path, row: &RefRow) -> Result<Vec<u16>, GateError>
         return Err(format!("{}/{} is {}, want f16", row.name, row.occurrence, row.ty).into());
     }
     if row.logical != Some(1) {
-        return widened_f16_rows_in(dir, row);
+        return Ok(widened_f16_rows_in(dir, row)?);
     }
     let path = dir.join(row.logical_file_name());
     let raw = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -200,7 +200,7 @@ impl AttnRows {
         let vw = man.tensor(&format!("v_cache_view-{layer} (copy of Vcur-{layer})"), 0)?;
         let src = |row: &RefRow| -> Result<&RefRow, GateError> {
             let name = row.src0.as_deref().ok_or("a norm row has no src0")?;
-            man.tensor(name, 0)
+            Ok(man.tensor(name, 0)?)
         };
         let (n_head, n_kv, m) = (qn.ne[1] as usize, kn.ne[1] as usize, qn.ne[2] as usize);
         if qn.ne[0] as usize != HEAD || kn.ne[0] as usize != HEAD || kn.ne[2] as usize != m {

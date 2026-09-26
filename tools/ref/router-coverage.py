@@ -33,11 +33,17 @@ oracle    Per layer, the set's ids against the oracle set's integer twin of ffn_
           token's top-k), else the flat one. The set's tokens, model file and ik build must be the
           oracle's. Exit 1 on any difference.
 """
+import importlib.util
 import os
 import struct
 import sys
 import tempfile
 from array import array
+
+_spec = importlib.util.spec_from_file_location(
+    "manifest", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery", "manifest.py"))
+manifest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(manifest)
 
 N_LIST = (16, 32, 48, 64, 96, 128, 192)
 
@@ -47,30 +53,24 @@ class SetError(Exception):
 
 
 def read_manifest(set_dir):
+    """A router set's header and layers, its rows read by their column lines' names
+    (tools/bloomery/manifest.py)."""
     path = os.path.join(set_dir, "MANIFEST.tsv")
-    header, layers, complete = {}, [], False
+    if not os.path.isfile(path):
+        raise SetError(f"no manifest at {path}")
     try:
-        with open(path, encoding="utf-8") as f:
-            first = f.readline()
-            if not first.startswith("# router_trace"):
-                raise SetError(f"{path} is not a router set manifest")
-            for line in f:
-                line = line.rstrip("\n")
-                if line.startswith("# complete"):
-                    complete = True
-                elif line.startswith("# "):
-                    key, _, val = line[2:].partition("\t")
-                    header.setdefault(key, val)
-                elif line.startswith("layer\t"):
-                    layers.append(int(line.split("\t")[1]))
-    except FileNotFoundError:
-        raise SetError(f"no manifest at {path}") from None
-    if not complete:
+        m = manifest.read(path)
+    except manifest.ManifestError as e:
+        raise SetError(str(e)) from None
+    if not (m.title or "").startswith("# router_trace"):
+        raise SetError(f"{path} is not a router set manifest")
+    if m.complete is None:
         raise SetError(f"{path} has no `# complete` trailer: the run that wrote it did not finish")
+    header = m.header
     return {
         "dir": set_dir,
         "header": header,
-        "layers": layers,
+        "layers": [r.int("layer") for r in m.rows("layer")],
         "tokens": int(header["tokens"]),
         "n_expert": int(header["n_expert"]),
         "n_used": int(header["n_expert_used"]),
@@ -232,24 +232,17 @@ def compare(dir_a, dir_b):
 
 
 def read_oracle(oracle_dir):
-    path = os.path.join(oracle_dir, "MANIFEST.tsv")
-    header, tensors, ints, complete = {}, {}, {}, False
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if line.startswith("#"):
-                key, _, val = line[2:].partition("\t")
-                complete |= key == "complete"
-                header.setdefault(key, val)
-                continue
-            p = line.split("\t")
-            if p[0] == "tensor":
-                tensors[(p[1], int(p[2]))] = p
-            elif p[0] == "int" and p[3] == "tensor":
-                ints[(p[1], int(p[2]), p[6])] = p
-    if not complete:
-        raise SetError(f"{path} has no `# complete` trailer")
-    return header, tensors, ints
+    """An oracle set's header, its `tensor` rows by (name, occurrence) and its integer twins of
+    tensors by (name, occurrence, layout), read by their column lines' names."""
+    try:
+        m = manifest.read(os.path.join(oracle_dir, "MANIFEST.tsv"))
+    except manifest.ManifestError as e:
+        raise SetError(str(e)) from None
+    if m.complete is None:
+        raise SetError(f"{m.path} has no `# complete` trailer")
+    tensors = {(r["name"], r.int("occurrence")): r for r in m.rows("tensor")}
+    ints = {(r["name"], r.int("occurrence"), r["layout"]): r for r in m.rows("int") if r["of"] == "tensor"}
+    return m.header, tensors, ints
 
 
 def oracle(set_dir, oracle_dir):
@@ -284,16 +277,14 @@ def oracle(set_dir, oracle_dir):
             print(f"layer {l:2d}: the oracle has no {name}")
             bad_layers.append(l)
             continue
-        # tensor row: kind name occurrence type ne0 ne1 ne2 ne3 bytes sum op contig logical src0 src1
-        # int row:    int name occurrence of type twin layout count bytes sum absmax file
-        ne0, ne1 = int(row[4]), int(row[5])
-        layout = "logical" if row[12] == "1" else "flat"
+        ne0, ne1 = row.int("ne0"), row.int("ne1")
+        layout = "logical" if row["logical"] == "1" else "flat"
         twin = ints.get((name, 0, layout))
         if twin is None or (ne0, ne1) != (K, T):
             print(f"layer {l:2d}: oracle {name} is [{ne0}, {ne1}] with no {layout} twin; the set is [{K}, {T}]")
             bad_layers.append(l)
             continue
-        with open(os.path.join(oracle_dir, twin[11]), "rb") as f:
+        with open(os.path.join(oracle_dir, twin["file"]), "rb") as f:
             ref = list(struct.unpack(f"<{ne0 * ne1}i", f.read()))
         ours = list(read_topk(s, l))
         diff = [t for t in range(T) if ours[t * K:(t + 1) * K] != ref[t * K:(t + 1) * K]]
@@ -301,7 +292,7 @@ def oracle(set_dir, oracle_dir):
         total += len(ref)
         equal += n_eq
         line = f"layer {l:2d}: {n_eq}/{len(ref)} ids equal, {n_shared}/{len(ref)} shared as sets  " \
-               f"(oracle: {row[10]} of {row[13]}, contig {row[11]}, {twin[11]})"
+               f"(oracle: {row['op']} of {row['src0']}, contig {row['contig']}, {twin['file']})"
         if diff:
             t = diff[0]
             line += f"  DIFF at token {t}: ours {ours[t * K:(t + 1) * K]} oracle {ref[t * K:(t + 1) * K]}"
@@ -335,6 +326,7 @@ def self_test():
             with open(os.path.join(d, "MANIFEST.tsv"), "w") as f:
                 f.write("# router_trace — self-test\n# tokens\t%d\n# n_expert\t%d\n# n_expert_used\t%d\n" % (T, E, K))
                 f.write("# model_file\tm.gguf\n# build\tb\n# ids\t%s\n" % os.path.join(d, "ids"))
+                f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
                 for l in rows_by_layer:
                     f.write(f"layer\t{l}\tVIEW-of-ARGSORT\tp\t{T}\t0\t0\ttopk-{l}.u16\n")
                 if complete:
@@ -371,6 +363,9 @@ def self_test():
             f.write(struct.pack(f"<{T * K}i", *flat))
         with open(os.path.join(o, "MANIFEST.tsv"), "w") as f:
             f.write("# model_file\tm.gguf\n# build\tb\n# tokens\t0,1,2\n")
+            f.write("# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical"
+                    "\tsrc0\tsrc1\n")
+            f.write("# int\tname\toccurrence\tof\ttype\ttwin\tlayout\tcount\tbytes\tsum\tabsmax\tfile\n")
             f.write(f"tensor\tffn_moe_topk-0\t0\ti32\t{K}\t{T}\t1\t1\t24\t0\tVIEW\t0\t1\tp (sort)\t-\n")
             f.write("int\tffn_moe_topk-0\t0\ttensor\ti32\ti32\tflat\t6\t24\t0\t6\tffn_moe_topk-0.0.i32\n")
             f.write("int\tffn_moe_topk-0\t0\ttensor\ti32\ti32\tlogical\t6\t24\t0\t7\tffn_moe_topk-0.0.logical.i32\n")

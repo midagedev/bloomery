@@ -61,15 +61,13 @@ mod gate {
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
+    use refset::arch::deepseek41::IK;
 
     /// Column counts a launch takes.
     const MS: std::ops::RangeInclusive<usize> = 1..=8;
     /// Rows kept of a site: enough warps for every block of a launch to be
     /// full and one to be short, without uploading a whole expert stack.
     const ROW_CAP: usize = 4099;
-    /// The ik build every V4.1 oracle set is dumped from; a set without it
-    /// is stale.
-    const SET_BUILD: &str = "db517b69";
 
     /// The gate's shared handles.
     struct Cx<'a> {
@@ -845,8 +843,11 @@ mod gate {
             q8: gpu.q8f32(),
             dense: &dense,
         };
+        // The set is the V4.1 node dumps' (complete, of the file the tree
+        // runs, the family's ik build), and of the file this gate opened.
         let man = RefManifest::read(&ref_dir_named(V41_SET_FAMILY))?;
-        let set_ok = man.build.as_deref() == Some(SET_BUILD) && man.header.model() == path.to_str();
+        let family = man.check_family(&IK);
+        let set_ok = family.is_ok() && man.header.model() == path.to_str();
         println!(
             "gate_mcol: device {} — {} — n_embd {} layers {} vocab {}; oracle set {} build {:?} \
              model {:?} {}",
@@ -860,6 +861,9 @@ mod gate {
             man.header.model(),
             verdict(set_ok)
         );
+        if let Err(e) = family {
+            println!("gate_mcol: {e}");
+        }
         let mut ok = set_ok;
 
         // Every plain projection of the chain, at the first layer of each type

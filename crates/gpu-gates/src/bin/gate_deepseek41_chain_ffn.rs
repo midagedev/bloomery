@@ -244,7 +244,7 @@ mod gate {
     }
 
     fn values(set: &SetData, r: &RefRow) -> Result<Vec<f32>, GateError> {
-        ref_tensor_of_in(&set.man.dir, r)
+        Ok(ref_tensor_of_in(&set.man.dir, r)?)
     }
 
     /// What one layer of one set holds for the piece: its inputs, ik's

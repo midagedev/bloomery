@@ -59,7 +59,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use bloomery_gpu::mxfp4::{BLOCK_BYTES, BLOCK_VALUES, lane_partial_host};
     use bloomery_gpu::route_core::renorm_divisor;
@@ -70,17 +70,16 @@ mod gate {
         RouterArgs, concat_route, sqrt_softplus,
     };
     use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, data_dir, dump_stem, verdict};
+    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row};
     use model::arch::dspark::{DraftHparams, names};
+    use refset::arch::deepseek41::{DSREF, DSREF_SET, dspark_model};
+    use refset::dsref::{Dsref, Graph};
+    use refset::ik::{Layout, RowKind};
 
     const NAME: &str = "gate_dspark_experts";
-    /// The dsref set this gate reads its diagnostics from.
-    const DSREF_SET: &str = "code64_n32_w3";
-    /// The ik tree every V4.1 oracle set must name in its `# build` line.
-    const IK_BUILD: &str = "db517b69";
     /// The expert ids of the host-rule checks: both ends and the middle.
     const SLOTS: [u32; 3] = [0, 64, 127];
     /// Token counts of the host-rule checks.
@@ -804,118 +803,55 @@ mod gate {
 
     // ------------------------------------------------- oracle diagnostics
 
-    /// A block-0 block-graph row of the draft set's manifest: `tensor`,
-    /// `input` and `int` rows (`tools/ref/dump_draft.cpp`).
-    struct DRow {
-        kind: String,
-        name: String,
-        occ: u32,
-        ne: [usize; 4],
-        logical: bool,
-        file: String,
+    /// The draft set's block 0 block pass (`refset::dsref`).
+    struct DSet<'a> {
+        set: &'a Dsref,
+        /// Its `tensor`, `input` and `int` rows.
+        rows: usize,
     }
 
-    struct DSet {
-        dir: PathBuf,
-        rows: Vec<DRow>,
-    }
-
-    fn read_set(dir: &Path) -> Result<DSet, GateError> {
-        let text = std::fs::read_to_string(dir.join("MANIFEST.tsv"))
-            .map_err(|e| format!("{}/MANIFEST.tsv: {e}", dir.display()))?;
-        let build = text
-            .lines()
-            .find_map(|l| l.strip_prefix("# build\t"))
-            .unwrap_or("");
-        if !build.contains(IK_BUILD) {
-            return Err(format!(
-                "{}: # build {build:?} does not name {IK_BUILD} — stale set",
-                dir.display()
-            )
-            .into());
-        }
-        let mut rows = Vec::new();
-        for l in text.lines().filter(|l| !l.starts_with('#')) {
-            let f: Vec<&str> = l.split('\t').collect();
-            let u = |i: usize| f[i].parse::<usize>().unwrap_or(0);
-            match f[0] {
-                "tensor" | "input" if f.len() == 19 && f[15] == "0" && f[18] == "block" => {
-                    rows.push(DRow {
-                        kind: f[0].to_string(),
-                        name: f[1].to_string(),
-                        occ: f[2].parse()?,
-                        ne: [u(4), u(5), u(6), u(7)],
-                        logical: f[12] == "1",
-                        file: String::new(),
-                    });
-                }
-                "int" if f.len() == 16 && f[12] == "0" && f[15] == "block" => rows.push(DRow {
-                    kind: "int".to_string(),
-                    name: f[1].to_string(),
-                    occ: f[2].parse()?,
-                    ne: [u(7), 1, 1, 1],
-                    logical: f[6] == "logical",
-                    file: f[11].to_string(),
-                }),
-                _ => {}
+    impl<'a> DSet<'a> {
+        fn block0(set: &'a Dsref) -> DSet<'a> {
+            let ints = set
+                .ints
+                .iter()
+                .filter(|r| r.block == 0 && r.graph == Graph::Block)
+                .count();
+            DSet {
+                set,
+                rows: set.in_block(0, Graph::Block).len() + ints,
             }
         }
-        Ok(DSet {
-            dir: dir.to_path_buf(),
-            rows,
-        })
-    }
 
-    impl DSet {
         fn f32_row(&self, name: &str) -> Result<(Vec<f32>, [usize; 4]), GateError> {
             let r = self
-                .rows
-                .iter()
-                .find(|r| r.kind == "tensor" && r.name == name && r.occ == 0)
+                .set
+                .in_block(0, Graph::Block)
+                .into_iter()
+                .find(|r| r.kind == RowKind::Tensor && r.name == name && r.occurrence == 0)
                 .ok_or_else(|| format!("the set has no tensor row {name}"))?;
-            let logical = if r.logical { ".logical" } else { "" };
-            let path = self
-                .dir
-                .join(format!("b0.{}.{}{logical}.f32", dump_stem(&r.name), r.occ));
-            let v = f32s(&std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?);
-            if v.len() != r.ne.iter().product::<usize>() {
-                return Err(format!(
-                    "{}: {} values, manifest ne {:?}",
-                    path.display(),
-                    v.len(),
-                    r.ne
-                )
-                .into());
+            let mut ne = [0usize; 4];
+            for (n, &d) in ne.iter_mut().zip(&r.ne) {
+                *n = usize::try_from(d)?;
             }
-            Ok((v, r.ne))
+            Ok((self.set.logical_f32s(r)?, ne))
         }
 
         fn i32_logical(&self, name: &str) -> Result<Vec<u32>, GateError> {
-            let r = self
-                .rows
-                .iter()
-                .find(|r| r.kind == "int" && r.name == name && r.occ == 0 && r.logical)
-                .ok_or_else(|| format!("the set has no logical int row {name}"))?;
-            let path = self.dir.join(&r.file);
-            let b = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let v: Vec<u32> = b
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| i32::from_le_bytes(*c) as u32)
-                .collect();
-            if v.len() != r.ne[0] {
-                return Err(
-                    format!("{}: {} ids, manifest {}", path.display(), v.len(), r.ne[0]).into(),
-                );
-            }
-            Ok(v)
+            let r = self.set.int(0, Graph::Block, name, 0, Layout::Logical)?;
+            Ok(self
+                .set
+                .int_values(r)?
+                .into_iter()
+                .map(|v| v as u32)
+                .collect())
         }
     }
 
     fn oracle(cx: &Ctx<'_>, r: &Router) -> Result<(), GateError> {
-        let dir = data_dir().join("ref-draft").join(DSREF_SET);
-        let set = read_set(&dir)?;
+        let dir = DSREF.path(DSREF_SET);
+        let full = Dsref::open(&dir, &DSREF)?;
+        let set = DSet::block0(&full);
         let (x, ne) = set.f32_row("node_44")?;
         let t = ne[1];
         println!(
@@ -923,7 +859,7 @@ mod gate {
              ffn_moe_logits/probs/topk/weights_scaled, ffn_moe_gate_par (h), ffn_moe_down (per slot), \
              ffn_moe_weighted (combine) — diagnostic, not pinned",
             dir.display(),
-            set.rows.len(),
+            set.rows,
             ne[0]
         );
         let (ik_l, _) = set.f32_row("ffn_moe_logits-0")?;
@@ -1048,13 +984,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let path = std::env::var_os("BLOOMERY_DSPARK_MODEL")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .ok_or(
-                "BLOOMERY_DSPARK_MODEL unset — run through `just gate-gpu-dspark-experts`, which exports \
-                 it from the V4.1 profile's DSPARK_MODEL",
-            )?;
+        let path = PathBuf::from(dspark_model()?);
         let split = Split::open(&path)?;
         let hp = DraftHparams::read(&split)?;
         let ex = hp.experts;

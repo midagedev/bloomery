@@ -146,6 +146,12 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # 512/4096, CED on and off) into tools/flow/plans/; loads nothing onto a
                       # card. Run it after changing a record kind (the gpu-gates lib test
                       # checked_in_schemas_are_current is red until then) or the prompt call's plan
+    just gate-refset  # crates/refset: the reference-set readers' unit tests, then every family's
+                      # sets in place against the family table (crates/refset/src/arch) — each
+                      # complete, dumped from the model file the tree runs (the first shard's full
+                      # path, as the set states it), of the family's ik build; host only
+    just refset-check [FAMILY PATH...]  # which reference sets are stale, one line a set; with
+                      # no arguments every family's sets in place; reads only
 
 `just gate` excludes the measure targets on purpose: they need a quiet machine
 and take a lock, so running them is a separate, deliberate act. It also excludes
@@ -324,11 +330,17 @@ first suspect is a hung gate on the box, not the agent.
     crates/sampler/        the sampling chain in the reference's order (gate-sampler)
     crates/serve/          llama-server-compatible HTTP API over an Engine trait
                            (gate-serve on a mock engine); bin bloomery-serve
+    crates/refset/         the reference sets the gates compare against: one reader per kind
+                           (ik node dumps, DSpark draft sets, greedy files, KLD bases, the vision
+                           set), each set refused by name unless it was dumped from the file the
+                           tree runs; the family table per architecture under src/arch
     crates/q3k-gemv/       stage 0: Q3_K gemv, CUDA-Rust device code (cargo oxide only)
     crates/q3k-cpu/        stage 0: Q3_K x Q8_K gemv, AVX2 intrinsics, pinned threads
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile;
                                excluded from the workspace on purpose
     tools/ref/             C++ harnesses linking ggml: ground truth and baseline
+    tools/bloomery/        the Python side's one reader per fact: records.py (record lines),
+                           manifest.py (reference-set manifests, by column name)
     tools/box.sh           the only way code reaches the workstation
     tools/gate.sh          the gate runner: 900 s bound, cargo's own exit code
     tools/gpu-gate.sh      the GPU gate runner: gate lock, 900 s bound, the binary's exit code
@@ -390,6 +402,14 @@ first suspect is a hung gate on the box, not the agent.
   had other needs than its printed plan. Under `BLOOMERY_STEP_STATS=1`,
   `tools/flow/ds41_prefill.py --counts <log>` holds the flow model's queue-entry
   counts to the engine's `stat prefill front` and `stat prefill lb` records.
+- **Reference sets have one reader.** A gate, a test or a tool reads an oracle set only
+  through `crates/refset` (Rust) or `tools/bloomery/manifest.py` (Python), by the column
+  names its header lines give, never by position. Every set opens through its family's
+  check (`crates/refset/src/arch`), which refuses by name a set dumped from another model
+  file (the first shard's full path is the identity: two quantizations of one model can
+  share their shard names), of another ik build or architecture, or without its completion
+  trailer. A new kind
+  of set is a new family row with its writer's recipe, not a parser in the gate.
 - **Do not split a `#[target_feature]` kernel body into helpers** (measured:
   10-13 % loss). Orchestration code is ordinary Rust: a function that no longer
   fits on two screens gets split.

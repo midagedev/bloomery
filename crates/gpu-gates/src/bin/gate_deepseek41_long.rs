@@ -11,7 +11,9 @@
 //!   greedy run on it is tens of ids long before its EOS, so the long run is
 //!   compared over all of them — prompt 0's stops at its third token), then
 //!   greedy tokens until the file's EOS, at most `-n` (330). The EOS is where
-//!   generation ends: nothing after it is generated or judged.
+//!   generation ends: nothing after it is generated or judged. ik's run is
+//!   refused by name unless it was dumped from the model file the tree runs
+//!   (`refset::greedy::check`).
 //! - `--trigger`: prompt row 0 ("The capital of France is", the oracle's five
 //!   ids) and [`TRIGGER`] fed, then 16 greedy tokens.
 //!   [`TRIGGER`] is the 311 ids the free arm generated on a plan of 809 card
@@ -137,6 +139,7 @@ mod gate {
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::placement::workstation;
+    use refset::arch::deepseek41::{GREEDY, GREEDY_P7};
 
     use crate::finite;
 
@@ -239,6 +242,9 @@ mod gate {
         if !crate::collapse_self_check(&COLLAPSE_PERIODS, COLLAPSE) {
             return Err(checks_failed());
         }
+        if args.free {
+            refset::greedy::check(&GREEDY.path(GREEDY_P7), &GREEDY)?;
+        }
         let path = workstation::model_v41();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&file)?;
@@ -285,7 +291,7 @@ mod gate {
                 .next()
                 .ok_or("prompt7.tsv holds no row")?
                 .tokens;
-            let ik = read_greedy(&dir.join("greedy-ik-cpu-64-p7.tsv"))?
+            let ik = read_greedy(&GREEDY.path(GREEDY_P7))?
                 .into_iter()
                 .next()
                 .ok_or("greedy-ik-cpu-64-p7.tsv holds no row")?;

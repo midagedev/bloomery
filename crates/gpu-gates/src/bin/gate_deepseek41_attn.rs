@@ -681,7 +681,7 @@ mod gate {
         if let Some(r) = man.find(RowKind::Tensor, &cropped, 0) {
             return Ok(r);
         }
-        man.only_with_prefix(RowKind::Input, "dsv4_raw_mask_padded")
+        Ok(man.only_with_prefix(RowKind::Input, "dsv4_raw_mask_padded")?)
     }
 
     /// Our window ring and where its rows came from.

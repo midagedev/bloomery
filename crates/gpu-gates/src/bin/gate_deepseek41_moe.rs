@@ -289,7 +289,10 @@ mod gate {
         op: &str,
         srcs: Option<(&str, &str)>,
     ) -> Result<Vec<f32>, GateError> {
-        ref_tensor_of_in(&set.man.dir, row(set, name, ne, op, srcs)?)
+        Ok(ref_tensor_of_in(
+            &set.man.dir,
+            row(set, name, ne, op, srcs)?,
+        )?)
     }
 
     /// The expert ids of `set` at layer `l`: the logical twin of

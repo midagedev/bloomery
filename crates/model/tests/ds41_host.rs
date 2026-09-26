@@ -53,8 +53,8 @@
 //! γ_{2·n_used}·(Σ|w·d_ours| + Σ|w·d_ik|)`: each engine's weighted sum rounds
 //! at most twice per term.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+#[path = "common/v41set.rs"]
+mod v41set;
 
 use gguf::quant::half_to_f32;
 use gguf::{GgmlType, Split};
@@ -64,11 +64,8 @@ use model::moe::{HostLayer, HostScratch};
 use model::ops::{Tensor2, Weight, matmul_q_group_into};
 use model::placement::workstation;
 
-/// The oracle set and the ik tree it was dumped from.
-const SET: &str = "ref_deepseek41";
-// PIN(2026-09-23): the sink-fixed oracle tree; this set's bytes are those
-// 49ef19d0 dumped, since the fixed branch does not run in a 5-token prefill.
-const BUILD: &str = "db517b69";
+/// The oracle set: the V4.1 node dumps' 5-token batch set.
+const SET: &str = refset::arch::deepseek41::BATCH;
 
 /// f32's unit roundoff.
 const U: f64 = 1.0 / 16_777_216.0;
@@ -99,128 +96,6 @@ fn gamma(n: f64) -> f64 {
 /// Roundings on the longest leaf path of a `k`-long dot (module doc, 1.).
 fn n_dot(k: usize) -> f64 {
     4.0 * (k / 256) as f64 + 8.0
-}
-
-/// One oracle set: its header, its tensor rows' shapes and the files of its
-/// logical integer twins.
-struct Set {
-    dir: PathBuf,
-    shapes: HashMap<String, [usize; 3]>,
-    logical: HashMap<String, String>,
-}
-
-impl Set {
-    fn open(split: &Split) -> Set {
-        let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-        // The set of that name for the V4.1 file the tree runs.
-        let dir = PathBuf::from(base).join(gguf::v41::set(SET));
-        let path = dir.join("MANIFEST.tsv");
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "no oracle manifest at {} ({e}). The lead produces it (tools/ref/dump.sh). \
-                 Do not run it yourself and do not skip this test.",
-                path.display()
-            )
-        });
-        let mut header = HashMap::new();
-        let mut shapes = HashMap::new();
-        let mut logical = HashMap::new();
-        for line in text.lines() {
-            if let Some(h) = line.strip_prefix("# ") {
-                if let Some((k, v)) = h.split_once('\t') {
-                    header.insert(k.to_string(), v.to_string());
-                }
-                continue;
-            }
-            let f: Vec<&str> = line.split('\t').collect();
-            match f[0] {
-                "tensor" if f[2] == "0" && f[11] == "1" => {
-                    let ne = |i: usize| {
-                        f[i].parse::<usize>()
-                            .unwrap_or_else(|e| panic!("{line}: {e}"))
-                    };
-                    shapes.insert(f[1].to_string(), [ne(4), ne(5), ne(6)]);
-                }
-                "int" if f[2] == "0" && f[6] == "logical" => {
-                    logical.insert(f[1].to_string(), f[11].to_string());
-                }
-                _ => {}
-            }
-        }
-        let get = |k: &str| header.get(k).map(String::as_str);
-        assert_eq!(
-            get("build"),
-            Some(BUILD),
-            "{SET} was dumped from another ik tree"
-        );
-        assert_eq!(get("arch"), Some("deepseek41"), "{SET} is not a V4.1 set");
-        assert!(
-            header.contains_key("complete"),
-            "{SET}: the manifest has no completion trailer — the dump that wrote it did not finish"
-        );
-        let ours = split
-            .shard_path(0)
-            .and_then(std::path::Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned());
-        assert_eq!(
-            get("model_file").map(str::to_string),
-            ours,
-            "{SET} was dumped from another file"
-        );
-        // Both V4.1 files name their shards alike: the path tells them apart.
-        assert_eq!(
-            get("model").map(str::to_string),
-            split
-                .shard_path(0)
-                .map(|p| p.to_string_lossy().into_owned()),
-            "{SET} was dumped from another file"
-        );
-        Set {
-            dir,
-            shapes,
-            logical,
-        }
-    }
-
-    fn bytes(&self, file: &str) -> Vec<u8> {
-        let path = self.dir.join(file);
-        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-    }
-
-    /// A contiguous f32 node of shape `ne` (`[ne0, ne1, ne2]`).
-    fn f32s(&self, name: &str, ne: [usize; 3]) -> Vec<f32> {
-        let got = self
-            .shapes
-            .get(name)
-            .unwrap_or_else(|| panic!("{SET}: no contiguous node {name}"));
-        assert_eq!(*got, ne, "{SET}: {name}'s shape");
-        let b = self.bytes(&format!("{name}.0.f32"));
-        assert_eq!(
-            b.len(),
-            4 * ne.iter().product::<usize>(),
-            "{name}: file length"
-        );
-        b.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect()
-    }
-
-    /// The logical twin of an integer node: `count` values in logical order.
-    fn i32s_logical(&self, name: &str, count: usize) -> Vec<i32> {
-        let file = self
-            .logical
-            .get(name)
-            .unwrap_or_else(|| panic!("{SET}: no logical twin of {name}"));
-        let b = self.bytes(file);
-        assert_eq!(b.len(), 4 * count, "{name}: logical twin length");
-        b.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| i32::from_le_bytes(*c))
-            .collect()
-    }
 }
 
 /// `A_b = Σ|a|` per 256-value block of `x`'s q8_K activation (ours).
@@ -463,7 +338,7 @@ fn hw_ds41_host_matches_ik_routed_sum() {
         "moe::Meta n_expert={} n_used={} ff={} (as Hparams)",
         meta.n_expert, meta.n_used, meta.ff
     );
-    let set = Set::open(&split);
+    let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
     let n_tokens = set
         .shapes

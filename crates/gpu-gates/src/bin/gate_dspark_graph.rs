@@ -126,7 +126,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use bloomery_gpu::elem::q3k_embed_value;
@@ -138,18 +138,16 @@ mod gate {
     use bloomery_gpu_deepseek41::draft::load::DraftWeights;
     use bloomery_gpu_deepseek41::draft::{DraftBody, Submit};
     use bloomery_gpu_deepseek41::hc::HC_STREAMS;
-    use bloomery_gpu_gates::{
-        GateError, checks_failed, data_dir, dump_stem, ref_model_path, verdict,
-    };
+    use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row, f32_to_f16_bits};
     use model::arch::deepseek41::names as target_names;
     use model::arch::dspark::{DraftHparams, names};
+    use refset::arch::deepseek41::{DSREF, DSREF_SET, dspark_model};
+    use refset::dsref::{DsRow, Dsref, Graph as DsGraph};
+    use refset::ik::Layout;
 
     const NAME: &str = "gate_dspark_graph";
-    const DSREF_SET: &str = "code64_n32_w3";
-    /// The ik tree every V4.1 oracle set must name in its `# build` line.
-    const IK_BUILD: &str = "db517b69";
     /// Blocks whose every tap is judged.
     const TAP_BLOCKS: [i32; 3] = [0, 1, 2];
     /// The set's block width (its manifest's `n_max`).
@@ -176,188 +174,8 @@ mod gate {
 
     // ------------------------------------------------------------- the set
 
-    struct Row {
-        kind: String,
-        name: String,
-        occ: u32,
-        ne: [usize; 4],
-        op: String,
-        src0: String,
-        src1: String,
-        block: i32,
-        graph: String,
-    }
-
-    /// One `verify` line: what the target made of a block.
-    struct Verify {
-        block: i32,
-        id_last: u32,
-        carry: u32,
-        accepted: usize,
-        target: Vec<u32>,
-    }
-
-    impl Verify {
-        /// The target's token for each draft row, in order.
-        fn targets(&self) -> &[u32] {
-            let skip = usize::from(self.carry == 0).min(self.target.len());
-            &self.target[skip..]
-        }
-    }
-
-    struct Set {
-        dir: PathBuf,
-        rows: Vec<Row>,
-        verify: Vec<Verify>,
-        drafts: Vec<(i32, usize, u32)>,
-    }
-
-    fn read_set(dir: &Path) -> Result<Set, GateError> {
-        let text = std::fs::read_to_string(dir.join("MANIFEST.tsv"))
-            .map_err(|e| format!("{}/MANIFEST.tsv: {e}", dir.display()))?;
-        let build = text
-            .lines()
-            .find_map(|l| l.strip_prefix("# build\t"))
-            .unwrap_or("");
-        if !build.contains(IK_BUILD) {
-            return Err(format!(
-                "{}: # build {build:?} does not name {IK_BUILD} — stale set",
-                dir.display()
-            )
-            .into());
-        }
-        let (mut rows, mut verify, mut drafts) = (Vec::new(), Vec::new(), Vec::new());
-        for l in text.lines().filter(|l| !l.starts_with('#')) {
-            let f: Vec<&str> = l.split('\t').collect();
-            match f[0] {
-                "tensor" | "input" if f.len() == 19 => {
-                    let u = |i: usize| f[i].parse::<usize>().unwrap_or(0);
-                    rows.push(Row {
-                        kind: f[0].to_string(),
-                        name: f[1].to_string(),
-                        occ: f[2].parse()?,
-                        ne: [u(4), u(5), u(6), u(7)],
-                        op: f[10].to_string(),
-                        src0: f[13].to_string(),
-                        src1: f[14].to_string(),
-                        block: f[15].parse()?,
-                        graph: f[18].to_string(),
-                    });
-                }
-                "verify" if f.len() == 8 => verify.push(Verify {
-                    block: f[1].parse()?,
-                    id_last: f[3].parse()?,
-                    carry: f[4].parse()?,
-                    accepted: f[6].parse()?,
-                    target: f[7].split(',').map(str::parse).collect::<Result<_, _>>()?,
-                }),
-                "draft" if f.len() == 4 => {
-                    drafts.push((f[1].parse()?, f[2].parse()?, f[3].parse()?))
-                }
-                _ => {}
-            }
-        }
-        Ok(Set {
-            dir: dir.to_path_buf(),
-            rows,
-            verify,
-            drafts,
-        })
-    }
-
-    impl Set {
-        fn in_block(&self, b: i32, graph: &str) -> Vec<&Row> {
-            self.rows
-                .iter()
-                .filter(|r| r.block == b && r.graph == graph)
-                .collect()
-        }
-
-        fn find(&self, b: i32, graph: &str, name: &str, occ: u32) -> Result<&Row, GateError> {
-            self.in_block(b, graph)
-                .into_iter()
-                .find(|r| r.name == name && r.occ == occ)
-                .ok_or_else(|| {
-                    format!("the set has no {graph} row {name:?}#{occ} in block {b}").into()
-                })
-        }
-
-        /// The block graph's node of `op` whose sources match (`""` matches any).
-        fn find_op(&self, b: i32, op: &str, src0: &str, src1: &str) -> Result<&Row, GateError> {
-            self.in_block(b, "block")
-                .into_iter()
-                .find(|r| {
-                    r.kind == "tensor"
-                        && r.op == op
-                        && (src0.is_empty() || r.src0 == src0)
-                        && (src1.is_empty() || r.src1 == src1)
-                })
-                .ok_or_else(|| format!("block {b} has no {op} node over {src0:?}, {src1:?}").into())
-        }
-
-        /// The `i`-th block-graph node of `op`, in graph order.
-        fn nth_op(&self, b: i32, op: &str, i: usize) -> Result<&Row, GateError> {
-            self.in_block(b, "block")
-                .into_iter()
-                .filter(|r| r.kind == "tensor" && r.op == op)
-                .nth(i)
-                .ok_or_else(|| format!("block {b} has fewer than {} {op} nodes", i + 1).into())
-        }
-
-        fn path(&self, r: &Row, twin: &str, ext: &str) -> PathBuf {
-            let kv = if r.graph == "kv" { "kv." } else { "" };
-            let input = if r.kind == "input" { ".input" } else { "" };
-            self.dir.join(format!(
-                "b{}.{kv}{}.{}{input}{twin}.{ext}",
-                r.block,
-                dump_stem(&r.name),
-                r.occ
-            ))
-        }
-
-        fn f32s(&self, r: &Row) -> Result<Vec<f32>, GateError> {
-            let p = self.path(r, "", "f32");
-            let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let v: Vec<f32> = b
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect();
-            let want: usize = r.ne.iter().product();
-            if v.len() != want {
-                return Err(format!(
-                    "{}: {} values, manifest ne {:?}",
-                    p.display(),
-                    v.len(),
-                    r.ne
-                )
-                .into());
-            }
-            Ok(v)
-        }
-
-        fn i32s(&self, r: &Row, twin: &str) -> Result<Vec<i32>, GateError> {
-            let p = self.path(r, twin, "i32");
-            let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            Ok(b.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| i32::from_le_bytes(*c))
-                .collect())
-        }
-
-        fn verify_of(&self, b: i32) -> Result<&Verify, GateError> {
-            self.verify
-                .iter()
-                .find(|v| v.block == b)
-                .ok_or_else(|| format!("the set has no verify line for block {b}").into())
-        }
-
-        fn blocks(&self) -> Vec<i32> {
-            self.verify.iter().map(|v| v.block).collect()
-        }
-    }
+    // The draft set is `refset::dsref`'s: read by its column lines and
+    // refused by name when it is not of the files the tree runs.
 
     // ------------------------------------------------------ one block's inputs
 
@@ -375,15 +193,22 @@ mod gate {
         feats: Vec<f32>,
     }
 
-    fn block_set(set: &Set, hp: &DraftHparams, b: i32) -> Result<BlockSet, GateError> {
-        let tokens = set.i32s(set.find(b, "block", "inp_tokens", 0)?, "")?;
-        let pos = set.i32s(set.find(b, "block", "CUDA0#inp_pos#0", 0)?, "")?;
-        let tail = set.i32s(
-            set.find(b, "block", "CUDA0#dflash_draft_tail_rows#0", 0)?,
-            "",
+    fn block_set(set: &Dsref, hp: &DraftHparams, b: i32) -> Result<BlockSet, GateError> {
+        let tokens = set.i32s(set.find(b, DsGraph::Block, "inp_tokens", 0)?, Layout::Flat)?;
+        let pos = set.i32s(
+            set.find(b, DsGraph::Block, "CUDA0#inp_pos#0", 0)?,
+            Layout::Flat,
         )?;
-        let kv_rows = set.i32s(set.find(b, "kv", "CUDA0#dflash_kv_input_rows#0", 0)?, "")?;
-        let feats = set.f32s(set.find(b, "kv", "CUDA0#dflash_kv_input_target_features#0", 0)?)?;
+        let tail = set.i32s(
+            set.find(b, DsGraph::Block, "CUDA0#dflash_draft_tail_rows#0", 0)?,
+            Layout::Flat,
+        )?;
+        let kv_rows = set.i32s(
+            set.find(b, DsGraph::Kv, "CUDA0#dflash_kv_input_rows#0", 0)?,
+            Layout::Flat,
+        )?;
+        let feats =
+            set.f32s(set.find(b, DsGraph::Kv, "CUDA0#dflash_kv_input_target_features#0", 0)?)?;
         let w = tokens.len();
         if w == 0 || w > SET_WIDTH || pos.len() != w || tail.len() != w {
             return Err(format!(
@@ -404,9 +229,9 @@ mod gate {
         }
 
         // The mask must name exactly the keys the ik arm feeds.
-        let mrow = set.find(b, "block", "CUDA0#dsv4_dflash_kq_mask_swa#0", 0)?;
+        let mrow = set.find(b, DsGraph::Block, "CUDA0#dsv4_dflash_kq_mask_swa#0", 0)?;
         let mask = set.f32s(mrow)?;
-        let n_keys = mrow.ne[0];
+        let n_keys = usize::try_from(mrow.ne[0])?;
         for t in 0..w {
             let seen: Vec<usize> = (0..n_keys)
                 .filter(|&k| mask[t * n_keys + k] == 0.0)
@@ -427,7 +252,12 @@ mod gate {
         let hd = hp.head_dim;
         let rings = (0..hp.n_layer)
             .map(|l| {
-                let r = set.f32s(set.find(b, "block", &format!("dflash_k_ctx_cache_{l}"), 0)?)?;
+                let r = set.f32s(set.find(
+                    b,
+                    DsGraph::Block,
+                    &format!("dflash_k_ctx_cache_{l}"),
+                    0,
+                )?)?;
                 Ok(r[..ring_rows * hd]
                     .iter()
                     .map(|&x| f32_to_f16_bits(x))
@@ -846,7 +676,7 @@ mod gate {
     }
 
     struct Cx<'a> {
-        set: &'a Set,
+        set: &'a Dsref,
         hp: &'a DraftHparams,
         n_vocab: usize,
         /// Per layer, the shared expert's gate and up rows, dequantized.
@@ -931,14 +761,14 @@ mod gate {
     fn layer_taps(cx: &Cx<'_>, j: &mut Judge, l: usize, o: &LayerTaps) -> Result<(), GateError> {
         let (set, hp, b, m) = (cx.set, cx.hp, j.b, j.m);
         let n = hp.n_embd;
-        let ik = |r: &Row| set.f32s(r);
+        let ik = |r: &DsRow| set.f32s(r);
         let pre = Stage::Layer(l, Phase::PreAttn);
         let post = Stage::Layer(l, Phase::PostAttn);
         let route = Stage::Layer(l, Phase::PostRoute);
         let hd = hp.head_dim;
         let blk = |s: &str| format!("blk.{l}.{s}.weight");
 
-        let mix = ik(set.find(b, "block", &format!("hc_pre_mixes-{l}"), 0)?)?;
+        let mix = ik(set.find(b, DsGraph::Block, &format!("hc_pre_mixes-{l}"), 0)?)?;
         j.tap(
             "hc_attn mixes",
             pre,
@@ -958,7 +788,7 @@ mod gate {
         j.site(q8_site(&an, n, 32));
         let kv = ik(set.find_op(b, "MUL_MAT", &blk("attn_kv"), "")?)?;
         j.tap("attn_kv", pre, &split(&o.kv, hd, m), &split(&kv, hd, m));
-        let kvr = ik(set.find(b, "block", &format!("dsv4_dflash_kv-{l}"), 0)?)?;
+        let kvr = ik(set.find(b, DsGraph::Block, &format!("dsv4_dflash_kv-{l}"), 0)?)?;
         j.tap(
             "dsv4_dflash_kv (turned)",
             pre,
@@ -981,7 +811,7 @@ mod gate {
         );
         j.site(q8_site(&qan, hp.q_lora_rank, 32));
         let hl = hp.n_head * hd;
-        let q = ik(set.find(b, "block", &format!("dsv4_dflash_q-{l}"), 0)?)?;
+        let q = ik(set.find(b, DsGraph::Block, &format!("dsv4_dflash_q-{l}"), 0)?)?;
         j.tap(
             "dsv4_dflash_q (turned)",
             pre,
@@ -992,7 +822,7 @@ mod gate {
         j.site(ATTN_SITE * ATTN_SITE);
         let y = ik(set.find(
             b,
-            "block",
+            DsGraph::Block,
             &format!("dsv4_dflash_attn-{l} (reshaped) (view)"),
             0,
         )?)?;
@@ -1024,7 +854,7 @@ mod gate {
         let fa = ik(set.find_op(b, "MUL_MULTI_ADD", &hpa.name, "")?)?;
         j.tap("ffn fold", post, &split(&o.fold_a, n, m), &split(&fa, n, m));
 
-        let mixf = ik(set.find(b, "block", &format!("hc_pre_mixes-{l}"), 1)?)?;
+        let mixf = ik(set.find(b, DsGraph::Block, &format!("hc_pre_mixes-{l}"), 1)?)?;
         j.tap(
             "hc_ffn mixes",
             post,
@@ -1050,7 +880,7 @@ mod gate {
 
         j.site(q8_site(&fnrm, n, 32) + q8_site(&fnrm, n, 128));
         let ff = hp.experts.ff;
-        let gp = ik(set.find(b, "block", &format!("ffn_moe_gate_par-{l}"), 0)?)?;
+        let gp = ik(set.find(b, DsGraph::Block, &format!("ffn_moe_gate_par-{l}"), 0)?)?;
         let ours_h: Vec<Vec<f32>> = (0..m)
             .map(|c| {
                 (0..3)
@@ -1068,7 +898,7 @@ mod gate {
             &split(&gp, 3 * ff, m),
         );
         j.site(q8_site(&gp, ff, 32) + q8_site(&gp, ff, 128));
-        let mw = ik(set.find(b, "block", &format!("ffn_moe_weighted-{l}"), 0)?)?;
+        let mw = ik(set.find(b, DsGraph::Block, &format!("ffn_moe_weighted-{l}"), 0)?)?;
         j.tap(
             "ffn_moe_weighted",
             route,
@@ -1076,7 +906,7 @@ mod gate {
             &split(&mw, n, m),
         );
         let ffs = ff * hp.experts.n_shared;
-        let shh = ik(set.find(b, "block", &format!("ffn_up_gate-{l}"), 0)?)?;
+        let shh = ik(set.find(b, DsGraph::Block, &format!("ffn_up_gate-{l}"), 0)?)?;
         j.tap(
             "shexp h",
             post,
@@ -1087,7 +917,7 @@ mod gate {
             shexp_rules(cx, b, l, m, &fnrm, &shh);
         }
         j.site(q8_site(&shh, ffs, 32));
-        let shy = ik(set.find(b, "block", &format!("ffn_down-{l}"), 0)?)?;
+        let shy = ik(set.find(b, DsGraph::Block, &format!("ffn_down-{l}"), 0)?)?;
         j.tap(
             "shexp down",
             post,
@@ -1132,24 +962,26 @@ mod gate {
         let route = Stage::Layer(l, Phase::PostRoute);
         let ne = 128;
         j.site(BF16_SITE * BF16_SITE);
-        let lg = set.f32s(set.find(b, "block", &format!("ffn_moe_logits-{l}"), 0)?)?;
+        let lg = set.f32s(set.find(b, DsGraph::Block, &format!("ffn_moe_logits-{l}"), 0)?)?;
         j.tap(
             "router logits",
             post,
             &split(&o.logits, ne, m),
             &split(&lg, ne, m),
         );
-        let pr = set.f32s(set.find(b, "block", &format!("ffn_moe_probs-{l}"), 0)?)?;
+        let pr = set.f32s(set.find(b, DsGraph::Block, &format!("ffn_moe_probs-{l}"), 0)?)?;
         let (ours_scores, ik_scores) = (split(&o.probs, ne, m), split(&pr, ne, m));
         j.tap("router scores", post, &ours_scores, &ik_scores);
         // A flip is a tie only on a row whose scores are within their band.
         let scores_rho = rho_rows(&ours_scores, &ik_scores);
-        let biased = set.f32s(set.find(b, "block", &format!("ffn_moe_probs_biased-{l}"), 0)?)?;
+        let biased =
+            set.f32s(set.find(b, DsGraph::Block, &format!("ffn_moe_probs_biased-{l}"), 0)?)?;
         let topk = set.i32s(
-            set.find(b, "block", &format!("ffn_moe_topk-{l}"), 0)?,
-            ".logical",
+            set.find(b, DsGraph::Block, &format!("ffn_moe_topk-{l}"), 0)?,
+            Layout::Logical,
         )?;
-        let ws = set.f32s(set.find(b, "block", &format!("ffn_moe_weights_scaled-{l}"), 0)?)?;
+        let ws =
+            set.f32s(set.find(b, DsGraph::Block, &format!("ffn_moe_weights_scaled-{l}"), 0)?)?;
         let mut w_ours = Vec::new();
         let mut w_ik = Vec::new();
         for c in 0..m {
@@ -1226,7 +1058,7 @@ mod gate {
             &split(&hn, n, m),
         );
         j.site(q8_site(&hn, n, 32) + q8_site(&hn, n, 128));
-        let base = set.f32s(set.find(b, "block", "dflash_base_result_output", 0)?)?;
+        let base = set.f32s(set.find(b, DsGraph::Block, "dflash_base_result_output", 0)?)?;
         let base_rows = split(&base, cx.n_vocab, m);
         j.tap(
             "dflash_base_result_output",
@@ -1234,10 +1066,13 @@ mod gate {
             &o.base,
             &base_rows,
         );
-        let result = set.f32s(set.find(b, "block", "result_output", 0)?)?;
+        let result = set.f32s(set.find(b, DsGraph::Block, "result_output", 0)?)?;
         let res_rows = split(&result, cx.n_vocab, m);
         j.site(markov_site(&base, &result, cx.n_vocab));
-        let ik_tok = set.i32s(set.find(b, "block", "draft_argmax", 0)?, "")?;
+        let ik_tok = set.i32s(
+            set.find(b, DsGraph::Block, "draft_argmax", 0)?,
+            Layout::Flat,
+        )?;
         j.ids_differ(&o.tokens, &ik_tok);
         j.tap("result_output", Stage::Markov, &o.result, &res_rows);
         argmax_check(j, &o.tokens, &ik_tok, &res_rows);
@@ -1310,7 +1145,7 @@ mod gate {
         let (set, hp) = (cx.set, cx.hp);
         let m = bs.width;
         let mut j = Judge::new(arm, bs.b, m, hp.n_layer);
-        let init = set.f32s(set.find(bs.b, "block", "dsv4_dflash_hc_init", 0)?)?;
+        let init = set.f32s(set.find(bs.b, DsGraph::Block, "dsv4_dflash_hc_init", 0)?)?;
         let n4 = 4 * hp.n_embd;
         let same = o.streams0[..m * n4]
             .iter()
@@ -1550,10 +1385,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let path = std::env::var_os("BLOOMERY_DSPARK_MODEL")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .ok_or("BLOOMERY_DSPARK_MODEL unset — run through `just gate-gpu-dspark-graph`")?;
+        let path = PathBuf::from(dspark_model()?);
         let draft = Split::open(&path)?;
         let target = Arc::new(Split::open(ref_model_path()?)?);
         let gpu = Gpu::new()?;
@@ -1572,7 +1404,7 @@ mod gate {
         let mut pass = BlockPass::new(&gpu, w)?;
         let mut rings = DraftRings::new(s, &hp)?;
         ok &= check_embed_rows(&gpu, w, &mut pass, &rings, &target, &hp)?;
-        let set = read_set(&data_dir().join("ref-draft").join(DSREF_SET))?;
+        let set = Dsref::open(&DSREF.path(DSREF_SET), &DSREF)?;
         let cx = Cx {
             set: &set,
             hp: &hp,
@@ -1659,8 +1491,11 @@ mod gate {
                         eager_ref.push((b, after_of(&o, hp.n_layer, bs.width)));
                     }
                 } else if arm == Arm::IkMask {
-                    let ik_tok = set.i32s(set.find(b, "block", "draft_argmax", 0)?, "")?;
-                    let res = set.f32s(set.find(b, "block", "result_output", 0)?)?;
+                    let ik_tok = set.i32s(
+                        set.find(b, DsGraph::Block, "draft_argmax", 0)?,
+                        Layout::Flat,
+                    )?;
+                    let res = set.f32s(set.find(b, DsGraph::Block, "result_output", 0)?)?;
                     let mut j = Judge::new(arm, b, bs.width, hp.n_layer);
                     // The band carried to the logits, from this block's own
                     // tensors, as the tap blocks carry it.
@@ -1674,12 +1509,7 @@ mod gate {
                     );
                     ok &= j.ok;
                 }
-                let drafted: Vec<u32> = set
-                    .drafts
-                    .iter()
-                    .filter(|d| d.0 == b)
-                    .map(|d| d.2)
-                    .collect();
+                let drafted = set.drafts_of(b);
                 println!(
                     "{NAME}: {} b{b} ids {:?} (ik drafted {drafted:?}, target {:?}): accept {a}, ik {}",
                     arm.label(),
@@ -1851,7 +1681,7 @@ mod gate {
             t_a += a;
             t_r += r;
             t_b += body_accept[i];
-            drafted += set.drafts.iter().filter(|d| d.0 == *b).count();
+            drafted += set.drafts_of(*b).len();
         }
         println!("{NAME}: accept | total of {drafted} drafted | {t_ik} | {t_a} | {t_r} | {t_b}");
 
@@ -2047,7 +1877,7 @@ mod gate {
             let hl = hp.n_head * hp.head_dim;
             let y = set.f32s(set.find(
                 b,
-                "block",
+                DsGraph::Block,
                 &format!("dsv4_dflash_attn-{l} (reshaped) (view)"),
                 0,
             )?)?;
@@ -2058,15 +1888,16 @@ mod gate {
             let fnrm = set.f32s(set.find_op(b, "FUSED_RMS_NORM", "", &blk(l, "ffn_norm"))?)?;
             j.site(q8_site(&fnrm, n, 32) + q8_site(&fnrm, n, 128));
             let ff = hp.experts.ff;
-            let gp = set.f32s(set.find(b, "block", &format!("ffn_moe_gate_par-{l}"), 0)?)?;
+            let gp =
+                set.f32s(set.find(b, DsGraph::Block, &format!("ffn_moe_gate_par-{l}"), 0)?)?;
             j.site(q8_site(&gp, ff, 32) + q8_site(&gp, ff, 128));
-            let shh = set.f32s(set.find(b, "block", &format!("ffn_up_gate-{l}"), 0)?)?;
+            let shh = set.f32s(set.find(b, DsGraph::Block, &format!("ffn_up_gate-{l}"), 0)?)?;
             j.site(q8_site(&shh, ff * hp.experts.n_shared, 32));
         }
         let hn = set.f32s(set.find_op(b, "FUSED_RMS_NORM", "", "output_norm.weight")?)?;
         j.site(q8_site(&hn, n, 32) + q8_site(&hn, n, 128));
-        let base = set.f32s(set.find(b, "block", "dflash_base_result_output", 0)?)?;
-        let result = set.f32s(set.find(b, "block", "result_output", 0)?)?;
+        let base = set.f32s(set.find(b, DsGraph::Block, "dflash_base_result_output", 0)?)?;
+        let result = set.f32s(set.find(b, DsGraph::Block, "result_output", 0)?)?;
         j.site(markov_site(&base, &result, cx.n_vocab));
         Ok(())
     }

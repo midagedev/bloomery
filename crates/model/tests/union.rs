@@ -88,10 +88,8 @@ use model::moe::{
 use model::ops::{self, Tensor2, Tensor2View};
 use model::placement::workstation;
 
-/// The oracle set and the ik tree it was dumped from.
-const SET: &str = "ref_deepseek41";
-// PIN(2026-09-23): the sink-fixed oracle tree the V4.1 sets carry.
-const BUILD: &str = "db517b69";
+/// The oracle set: the V4.1 node dumps' 5-token batch set.
+const SET: &str = refset::arch::deepseek41::BATCH;
 
 /// Column counts the gate runs.
 const KS: [usize; 6] = [1, 2, 3, 6, 8, 9];
@@ -363,7 +361,7 @@ fn hw_union_matches_per_column_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
-    let set = v41set::Set::open(&split, SET, BUILD);
+    let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
     let n_tokens = set
         .shapes
@@ -625,7 +623,7 @@ fn hw_union_wide_matches_per_column_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
-    let set = v41set::Set::open(&split, SET, BUILD);
+    let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
     let n_tokens = set
         .shapes
@@ -861,7 +859,7 @@ fn hw_union_tail_matches_batches_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
-    let set = v41set::Set::open(&split, SET, BUILD);
+    let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
     let n_tokens = set
         .shapes

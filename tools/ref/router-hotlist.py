@@ -115,6 +115,7 @@ def _fake_set(root, name, layers, rows, n_expert=8, n_used=2, complete=True):
     with open(os.path.join(d, "MANIFEST.tsv"), "w", encoding="utf-8") as f:
         f.write("# router_trace — test\n# model_file\tm.gguf\n# build\tb0\n")
         f.write(f"# tokens\t{len(rows)}\n# n_expert\t{n_expert}\n# n_expert_used\t{n_used}\n")
+        f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
         for l in layers:
             f.write(f"layer\t{l}\tx\tx\t{len(rows)}\t0\t0\ttopk-{l}.u16\n")
         if complete:

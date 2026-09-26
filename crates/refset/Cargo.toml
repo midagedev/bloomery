@@ -1,0 +1,20 @@
+[package]
+name = "bloomery-refset"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+name = "refset"
+
+[[bin]]
+name = "refset-check"
+path = "src/bin/refset_check.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+thiserror = { workspace = true }

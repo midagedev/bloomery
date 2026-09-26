@@ -44,18 +44,16 @@ mod gate {
     use bloomery_gpu_gates::hc_host::{self, exp_ours, hc_pre_f32};
     use bloomery_gpu_gates::rounding::butterfly;
     use bloomery_gpu_gates::{
-        GateError, bits_equal, bytes_to_words, checks_failed, data_dir, dump_stem, verdict,
+        GateError, bits_equal, bytes_to_words, checks_failed, data_dir, verdict,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use gguf::quant::GgmlType;
     use model::arch::dspark::{DraftHparams, names};
+    use refset::arch::deepseek41::{DSREF, DSREF_SET};
+    use refset::dsref::{DsRow, Dsref, Graph};
 
     const NAME: &str = "gate_dspark_hc";
-    /// The dsref set this gate reads its diagnostics from.
-    const DSREF_SET: &str = "code64_n32_w3";
-    /// The ik tree every V4.1 oracle set must name in its `# build` line.
-    const IK_BUILD: &str = "db517b69";
     /// Corpus ids the Markov checks take, then the three edge ids.
     const CORPUS_IDS: usize = 64;
     /// Rows of the chained Markov check (the dsref set's block width).
@@ -477,92 +475,31 @@ mod gate {
 
     // ------------------------------------------------- oracle diagnostics
 
-    /// A block-0 row of the draft set's manifest (`tools/ref/dump_draft.cpp`).
-    struct DRow {
-        kind: String,
-        name: String,
-        occ: u32,
-        ne: [usize; 4],
-        op: String,
-        logical: bool,
-        src0: String,
-    }
-
-    struct DSet {
-        dir: PathBuf,
-        rows: Vec<DRow>,
+    /// The draft set's block 0 (`refset::dsref`): its block-pass rows, the
+    /// block's proposals and the token it starts from.
+    struct DSet<'a> {
+        rows: Vec<&'a DsRow>,
+        set: &'a Dsref,
         drafts: Vec<u32>,
         id_last: u32,
     }
 
-    fn read_set(dir: &Path) -> Result<DSet, GateError> {
-        let text = std::fs::read_to_string(dir.join("MANIFEST.tsv"))
-            .map_err(|e| format!("{}/MANIFEST.tsv: {e}", dir.display()))?;
-        let build = text
-            .lines()
-            .find_map(|l| l.strip_prefix("# build\t"))
-            .unwrap_or("");
-        if !build.contains(IK_BUILD) {
-            return Err(format!(
-                "{}: # build {build:?} does not name {IK_BUILD} — stale set",
-                dir.display()
-            )
-            .into());
-        }
-        let (mut rows, mut drafts, mut id_last) = (Vec::new(), Vec::new(), None);
-        for l in text.lines().filter(|l| !l.starts_with('#')) {
-            let f: Vec<&str> = l.split('\t').collect();
-            match f[0] {
-                "tensor" | "input" if f.len() == 19 && f[15] == "0" && f[18] == "block" => {
-                    let u = |i: usize| f[i].parse::<usize>().unwrap_or(0);
-                    rows.push(DRow {
-                        kind: f[0].to_string(),
-                        name: f[1].to_string(),
-                        occ: f[2].parse()?,
-                        ne: [u(4), u(5), u(6), u(7)],
-                        op: f[10].to_string(),
-                        logical: f[12] == "1",
-                        src0: f[13].to_string(),
-                    });
-                }
-                "draft" if f.len() == 4 && f[1] == "0" => drafts.push(f[3].parse()?),
-                "verify" if f.len() >= 4 && f[1] == "0" => id_last = Some(f[3].parse()?),
-                _ => {}
-            }
-        }
-        Ok(DSet {
-            dir: dir.to_path_buf(),
-            rows,
-            drafts,
-            id_last: id_last.ok_or("the set has no verify row for block 0")?,
-        })
-    }
-
-    impl DSet {
-        fn find(&self, pred: impl Fn(&DRow) -> bool) -> Vec<&DRow> {
-            self.rows.iter().filter(|r| pred(r)).collect()
+    impl<'a> DSet<'a> {
+        fn block0(set: &'a Dsref) -> Result<DSet<'a>, GateError> {
+            Ok(DSet {
+                rows: set.in_block(0, Graph::Block),
+                set,
+                drafts: set.drafts_of(0),
+                id_last: set.verify_of(0)?.id_last,
+            })
         }
 
-        fn load(&self, r: &DRow) -> Result<Vec<f32>, GateError> {
-            let input = if r.kind == "input" { ".input" } else { "" };
-            let logical = if r.logical { ".logical" } else { "" };
-            let path = self.dir.join(format!(
-                "b0.{}.{}{input}{logical}.f32",
-                dump_stem(&r.name),
-                r.occ
-            ));
-            let v = f32s(&std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?);
-            let want: usize = r.ne.iter().product();
-            if v.len() != want {
-                return Err(format!(
-                    "{}: {} values, manifest ne {:?}",
-                    path.display(),
-                    v.len(),
-                    r.ne
-                )
-                .into());
-            }
-            Ok(v)
+        fn find(&self, pred: impl Fn(&DsRow) -> bool) -> Vec<&'a DsRow> {
+            self.rows.iter().copied().filter(|r| pred(r)).collect()
+        }
+
+        fn load(&self, r: &DsRow) -> Result<Vec<f32>, GateError> {
+            Ok(self.set.logical_f32s(r)?)
         }
     }
 
@@ -578,8 +515,9 @@ mod gate {
     }
 
     fn oracle(cx: &Ctx<'_>, attn: &Hc, mk: &Markov) -> Result<(), GateError> {
-        let dir = data_dir().join("ref-draft").join(DSREF_SET);
-        let set = read_set(&dir)?;
+        let dir = DSREF.path(DSREF_SET);
+        let full = Dsref::open(&dir, &DSREF)?;
+        let set = DSet::block0(&full)?;
         println!(
             "oracle set {} block 0: {} block-graph rows, drafts {:?}, id_last {}",
             dir.display(),
@@ -589,13 +527,13 @@ mod gate {
         );
 
         // HC_PRE: layer 0 attention.
-        let input = set.find(|r| r.name == "dsv4_dflash_hc_init (reshaped)" && r.occ == 0);
-        let mixes = set.find(|r| r.name == "hc_pre_mixes-0" && r.occ == 0);
-        let node = set.find(|r| r.op == "HC_PRE" && r.src0 == "hc_pre_mixes-0");
+        let input = set.find(|r| r.name == "dsv4_dflash_hc_init (reshaped)" && r.occurrence == 0);
+        let mixes = set.find(|r| r.name == "hc_pre_mixes-0" && r.occurrence == 0);
+        let node = set.find(|r| r.op == "HC_PRE" && r.src0.as_deref() == Some("hc_pre_mixes-0"));
         match (input.first(), mixes.first(), node.first()) {
             (Some(i), Some(mx), Some(nd)) => {
                 let x = set.load(i)?;
-                let t = i.ne[1];
+                let t = usize::try_from(i.ne[1])?;
                 let (om, oh) = run_hc_kernel(cx, attn, &x, t)?;
                 let im = set.load(mx)?;
                 let ih = node_to_hc(&set.load(nd)?, t);
@@ -646,10 +584,13 @@ mod gate {
         }
 
         // Markov: from ik's pre-Markov logits.
-        let base = set.find(|r| r.name == "dflash_base_result_output" && r.occ == 0);
-        let deltas = set.find(|r| r.op == "MUL_MAT" && r.src0 == "markov_w2.weight");
-        let adds = set.find(|r| r.op == "ADD" && r.src0 == "dflash_base_result_output (view)");
-        let result = set.find(|r| r.name == "result_output" && r.occ == 0);
+        let base = set.find(|r| r.name == "dflash_base_result_output" && r.occurrence == 0);
+        let deltas =
+            set.find(|r| r.op == "MUL_MAT" && r.src0.as_deref() == Some("markov_w2.weight"));
+        let adds = set.find(|r| {
+            r.op == "ADD" && r.src0.as_deref() == Some("dflash_base_result_output (view)")
+        });
+        let result = set.find(|r| r.name == "result_output" && r.occurrence == 0);
         let (Some(b), Some(res)) = (base.first(), result.first()) else {
             println!(
                 "oracle markov: the set lacks dflash_base_result_output ({}) or result_output ({})",
@@ -660,7 +601,7 @@ mod gate {
         };
         let n = mk.n_vocab;
         let tm = set.load(b)?; // token-major [t][v]
-        let t = b.ne[1];
+        let t = usize::try_from(b.ne[1])?;
         let mut vm = vec![0.0f32; n * t];
         for c in 0..t {
             for v in 0..n {

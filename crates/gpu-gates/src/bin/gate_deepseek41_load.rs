@@ -71,12 +71,13 @@ mod gate {
     use bloomery_gpu_deepseek41::chain::attn::join_groups;
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
-    use bloomery_gpu_gates::{
-        GateError, bits_equal, bytes_to_words, checks_failed, ref_dir_named, verdict,
-    };
+    use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
+    use bloomery_gpu_gates::oracle::for_arch;
+    use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::GgmlType;
+    use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::kv::KvLayout;
     use model::arch::deepseek41::place::PlanInputs;
@@ -86,11 +87,7 @@ mod gate {
     /// The decode-step sets whose positions check (iii) builds: 4, where no
     /// csa group completes, and 301 and 1,025, where one does and the window
     /// ring has wrapped.
-    const STEP_SETS: [&str; 3] = [
-        "ref_deepseek41_step4_every_node",
-        "ref_deepseek41_d1_every_node",
-        "ref_deepseek41_d2_every_node",
-    ];
+    const STEP_SETS: [&str; 3] = [STEP4, D1, D2];
 
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
@@ -729,32 +726,20 @@ mod gate {
     }
 
     /// The step a decode-step set holds: its sequence (`# tokens`) and the
-    /// step's position (`# decode_pos`, its last token's).
+    /// step's position (`# decode_pos`, its last token's). The set opens
+    /// through the V4.1 oracle's family check, so a set of another model
+    /// file is refused by name.
     fn step_of(set: &str) -> Result<(Vec<u32>, u32), GateError> {
-        let path = ref_dir_named(set).join("MANIFEST.tsv");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let (mut tokens, mut pos) = (None, None);
-        for line in text.lines().take_while(|l| l.starts_with('#')) {
-            if let Some(v) = line.strip_prefix("# tokens\t") {
-                tokens = Some(
-                    v.split(',')
-                        .map(str::parse)
-                        .collect::<Result<Vec<u32>, _>>()?,
-                );
-            } else if let Some(v) = line.strip_prefix("# decode_pos\t") {
-                pos = Some(v.parse::<u32>()?);
-            }
-        }
-        match (tokens, pos) {
-            (Some(t), Some(p)) if p as usize + 1 == t.len() => Ok((t, p)),
-            (t, p) => Err(format!(
-                "{}: {} tokens and decode_pos {p:?}: the step is the last token",
-                path.display(),
-                t.map_or(0, |t| t.len())
+        let man = for_arch(Arch::Deepseek41)?.open_named(set)?;
+        if man.header.decode_pos.is_none() {
+            return Err(format!(
+                "{}: no # decode_pos, not a decode-step set",
+                man.dir.display()
             )
-            .into()),
+            .into());
         }
+        let (pos, step, before) = man.step()?;
+        Ok(([before, step].concat(), pos))
     }
 
     /// One verdict line of check (iii).

@@ -127,6 +127,7 @@ dependencies = [
  "bloomery-gpu-vision",
  "bloomery-levers",
  "bloomery-model",
+ "bloomery-refset",
  "bloomery-sampler",
  "bloomery-serve",
  "bloomery-threads",
@@ -170,6 +171,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-qdot",
+ "bloomery-refset",
  "bloomery-threads",
  "libc",
  "sha2",
@@ -198,6 +200,14 @@ version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
  "bloomery-threads",
+]
+
+[[package]]
+name = "bloomery-refset"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "thiserror",
 ]
 
 [[package]]
@@ -235,6 +245,7 @@ name = "bloomery-vision"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-refset",
  "png",
  "thiserror",
 ]

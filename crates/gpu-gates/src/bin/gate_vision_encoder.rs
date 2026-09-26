@@ -57,12 +57,12 @@ mod gate {
     use bloomery_gpu_vision::{bf16_f32, f32_bf16};
     use cuda_core::CudaContext;
     use gguf::Gguf;
+    use refset::arch::deepseek41v::{VISION, VISION_SET};
+    use refset::vision::{Image, VisionSet};
     use vision::arch::deepseek41v::names;
     use vision::{Rgb8, preprocess};
 
     const NAME: &str = "gate_vision_encoder";
-    /// The checkpoint revision every set must name.
-    const REVISION: &str = "dba1be0a40aa45a94ad051997016db3960a90277";
     /// The image whose every block and block-0 ops the set holds.
     const FULL: &str = "grad-448";
     /// Threads the host rules run on.
@@ -380,79 +380,45 @@ mod gate {
 
     // ------------------------------------------------------------ the set
 
-    struct Img {
-        name: String,
-        n_vit_h: usize,
-        n_vit_w: usize,
-    }
-
-    impl Img {
-        fn stem(&self) -> &str {
-            self.name.strip_suffix(".png").unwrap_or(&self.name)
-        }
-    }
-
     struct Set {
         dir: PathBuf,
         mmproj: PathBuf,
-        images: Vec<Img>,
+        images: Vec<Image>,
         /// file name -> (rows, cols) for every bf16 file.
         files: HashMap<String, (usize, usize)>,
         /// tap -> `rms_rel` of its `# sensitivity` row.
         sensitivity: HashMap<String, f64>,
     }
 
+    /// The vision family's set (`refset::vision`), or the one under
+    /// `ref-vision` that `$BLOOMERY_VISION_SET` names: complete, of the
+    /// family's checkpoint revision.
     fn read_set() -> Result<Set, GateError> {
-        let set = std::env::var("BLOOMERY_VISION_SET").unwrap_or_else(|_| "deepseek41v".into());
-        let dir = data_dir().join("ref-vision").join(set);
-        let text = std::fs::read_to_string(dir.join("MANIFEST.tsv"))
-            .map_err(|e| format!("{}: {e} — run: just dump-ref-vision", dir.display()))?;
-        if !text.lines().any(|l| l.starts_with("# complete\t")) {
-            return Err(format!("{}: no # complete trailer", dir.display()).into());
-        }
-        let ckpt = text
-            .lines()
-            .find(|l| l.starts_with("# checkpoint\t"))
-            .ok_or("MANIFEST has no # checkpoint line")?;
-        if !ckpt.contains(REVISION) {
-            return Err(format!("stale set: {ckpt:?} is not revision {REVISION}").into());
-        }
-        let columns = text
-            .lines()
-            .find(|l| l.starts_with("# sensitivity columns\t"))
-            .ok_or("MANIFEST has no # sensitivity columns line — run: just dump-ref-vision")?;
-        if !columns.starts_with("# sensitivity columns\ttap max_rel rms_rel differ\t") {
-            return Err(format!("unknown sensitivity columns: {columns:?}").into());
-        }
-        let (mut mmproj, mut images, mut files) = (None, Vec::new(), HashMap::new());
-        let mut sensitivity = HashMap::new();
-        for line in text.lines() {
-            let f: Vec<&str> = line.split('\t').collect();
-            match f[0] {
-                "# mmproj" => mmproj = Some(PathBuf::from(f[1])),
-                "# sensitivity" => {
-                    sensitivity.insert(f[1].to_string(), f[3].parse::<f64>()?);
-                }
-                "image" => images.push(Img {
-                    name: f[1].to_string(),
-                    n_vit_h: f[7].parse()?,
-                    n_vit_w: f[8].parse()?,
-                }),
-                "file" if f[3] == "bf16" => {
-                    let dims: Vec<usize> =
-                        f[4].split('x').map(str::parse).collect::<Result<_, _>>()?;
-                    if let [r, c] = dims[..] {
-                        files.insert(f[1].to_string(), (r, c));
-                    }
-                }
-                _ => {}
-            }
-        }
+        let dir = match std::env::var("BLOOMERY_VISION_SET") {
+            Ok(set) => data_dir().join("ref-vision").join(set),
+            Err(_) => VISION.path(VISION_SET),
+        };
+        let set = VisionSet::open(&dir, &VISION)?;
+        let files = set
+            .files
+            .iter()
+            .filter(|f| f.dtype == "bf16")
+            .filter_map(|f| match f.shape[..] {
+                [r, c] => Some((f.name.clone(), (r, c))),
+                _ => None,
+            })
+            .collect();
+        let sensitivity = set
+            .sensitivity
+            .iter()
+            .map(|s| (s.tap.clone(), s.rms_rel))
+            .collect();
+        let mut images = set.images;
         // The full-tap image first: its op-level checks name a defect before any block does.
         images.sort_by_key(|i| (i.stem() != FULL, i.name.clone()));
         Ok(Set {
             dir,
-            mmproj: mmproj.ok_or("MANIFEST has no # mmproj line")?,
+            mmproj: set.mmproj,
             images,
             files,
             sensitivity,
@@ -938,7 +904,7 @@ mod gate {
         w: &HostW,
         t: &HashMap<String, Vec<u16>>,
         patches: &[u16],
-        img: &Img,
+        img: &Image,
         out: &[u16],
     ) -> Result<bool, GateError> {
         let hp = enc.hparams();

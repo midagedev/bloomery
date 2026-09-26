@@ -19,3 +19,8 @@ bloomery-threads = { path = "../threads" }
 libc = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The gates read the oracle sets through the reference-set reader, which checks each set's
+# provenance. It depends on the GGUF reader only, so the edge makes no cycle.
+bloomery-refset = { path = "../refset" }

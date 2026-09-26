@@ -19,23 +19,22 @@ crates/gpu/src/lib.rs	BLOOMERY_Q3K_SPLIT,BLOOMERY_Q3K_SPLIT_ITERS	decision 4
 crates/gpu/src/model/launcher.rs	BLOOMERY_LAUNCH_THREAD	decision 4
 # Paths and profile facts (audit TL-6).
 crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL	gatestoml
-crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL,BLOOMERY_DATA	gatestoml
+crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
+crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml
 crates/model/src/bin/bloomery-decode.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/model/src/bin/v41fixture.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/gate_dspark_read.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/gate_dspark_hc.rs	BLOOMERY_DSPARK_MODEL	gatestoml
-crates/gpu-gates/src/bin/gate_dspark_kv.rs	BLOOMERY_DSPARK_MODEL	gatestoml
-crates/gpu-gates/src/bin/gate_dspark_experts.rs	BLOOMERY_DSPARK_MODEL	gatestoml
-crates/gpu-gates/src/bin/gate_dspark_graph.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_MODEL	gatestoml
+crates/refset/src/arch/deepseek41/mod.rs	BLOOMERY_DSPARK_MODEL	gatestoml
 # The DSpark draft's card: a setting no registry row holds yet.
 crates/gpu-gates/src/bin/shared/ds41_dspark.rs	BLOOMERY_DSPARK_CARD	session
 # Reference sets.
-crates/gpu-gates/src/lib.rs	BLOOMERY_REF_CUDA,BLOOMERY_REF_SET	refset
-crates/gpu-gates/src/kld.rs	BLOOMERY_KLD_FILE	refset
-crates/gpu-gates/src/bin/gate_block.rs	BLOOMERY_REF_CPU_SET	refset
-crates/gpu-gates/src/bin/gate_vision_encoder.rs	BLOOMERY_VISION_SET	refset
+crates/gpu-gates/src/lib.rs	BLOOMERY_REF_CUDA,BLOOMERY_REF_SET	gatestoml
+crates/gpu-gates/src/kld.rs	BLOOMERY_KLD_FILE	gatestoml
+crates/gpu-gates/src/bin/gate_block.rs	BLOOMERY_REF_CPU_SET	gatestoml
+crates/gpu-gates/src/bin/gate_vision_encoder.rs	BLOOMERY_VISION_SET	gatestoml
 # Runner handshakes (audit TL-7).
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_HOST_LEASE	TL-7
 crates/engram-lab/src/bin/engram-rate.rs	BLOOMERY_ENGRAM_LEASE	TL-7

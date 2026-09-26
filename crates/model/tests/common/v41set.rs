@@ -1,13 +1,17 @@
 //! Read a V4.1 oracle set that `tools/ref/dump.sh` wrote for the file the tree
-//! runs: its header checked (the ik tree, the architecture, the completion
-//! trailer, the model file), its contiguous f32 nodes and the logical twins
-//! of its integer nodes. The set is produced by the lead and only read here;
-//! an absent or stale set stops the gate by name.
+//! runs, through the reference-set reader (`refset::ik`): the node dumps'
+//! family check (the completion trailer, the model file, the architecture, the
+//! ik tree), then the file a split opens — the set's `# model` path and its
+//! `# model_file` name — and its contiguous f32 nodes and the logical twins of
+//! its integer nodes. The set is produced by the lead and only read here; an
+//! absent or stale set stops the gate by name.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gguf::Split;
+use refset::arch::deepseek41::IK;
+use refset::ik::{FileElem, Layout, RefManifest, RowKind, dump_file_name};
 
 pub struct Set {
     name: &'static str,
@@ -17,65 +21,50 @@ pub struct Set {
 }
 
 impl Set {
-    /// The set `name` of the V4.1 file `split` opens, dumped by ik tree `build`.
-    pub fn open(split: &Split, name: &'static str, build: &str) -> Set {
-        let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-        let dir = PathBuf::from(base).join(gguf::v41::set(name));
-        let path = dir.join("MANIFEST.tsv");
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+    /// The set `name` of the V4.1 file `split` opens.
+    pub fn open(split: &Split, name: &'static str) -> Set {
+        let man = RefManifest::open(&IK.path(name), &IK).unwrap_or_else(|e| {
             panic!(
-                "no oracle manifest at {} ({e}). The lead produces it (tools/ref/dump.sh). \
-                 Do not run it yourself and do not skip this test.",
-                path.display()
+                "{e}. The lead produces the set (tools/ref/dump.sh). \
+                 Do not run it yourself and do not skip this test."
             )
         });
-        let mut header = HashMap::new();
-        let mut shapes = HashMap::new();
-        let mut logical = HashMap::new();
-        for line in text.lines() {
-            if let Some(h) = line.strip_prefix("# ") {
-                if let Some((k, v)) = h.split_once('\t') {
-                    header.insert(k.to_string(), v.to_string());
-                }
-                continue;
-            }
-            let f: Vec<&str> = line.split('\t').collect();
-            match f[0] {
-                "tensor" if f[2] == "0" && f[11] == "1" => {
-                    let ne = |i: usize| {
-                        f[i].parse::<usize>()
-                            .unwrap_or_else(|e| panic!("{line}: {e}"))
-                    };
-                    shapes.insert(f[1].to_string(), [ne(4), ne(5), ne(6)]);
-                }
-                "int" if f[2] == "0" && f[6] == "logical" => {
-                    logical.insert(f[1].to_string(), f[11].to_string());
-                }
-                _ => {}
-            }
-        }
-        let get = |k: &str| header.get(k).map(String::as_str);
-        assert_eq!(
-            get("build"),
-            Some(build),
-            "{name} was dumped from another ik tree"
-        );
-        assert_eq!(get("arch"), Some("deepseek41"), "{name} is not a V4.1 set");
-        assert!(
-            header.contains_key("complete"),
-            "{name}: the manifest has no completion trailer — the dump that wrote it did not finish"
-        );
         // Both V4.1 files name their shards alike: the path tells them apart.
+        let shard = split.shard_path(0);
         assert_eq!(
-            get("model").map(str::to_string),
-            split
-                .shard_path(0)
-                .map(|p| p.to_string_lossy().into_owned()),
+            man.header.model().map(str::to_string),
+            shard.map(|p| p.to_string_lossy().into_owned()),
             "{name} was dumped from another file"
         );
+        assert_eq!(
+            man.header.model_file,
+            shard
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned()),
+            "{name} was dumped from another file"
+        );
+        let mut shapes = HashMap::new();
+        for r in man
+            .tensors
+            .iter()
+            .filter(|r| r.occurrence == 0 && r.contig == Some(1))
+        {
+            let ne = |i: usize| {
+                usize::try_from(r.ne[i]).unwrap_or_else(|e| panic!("{name}: {}: {e}", r.name))
+            };
+            shapes.insert(r.name.clone(), [ne(0), ne(1), ne(2)]);
+        }
+        let mut logical = HashMap::new();
+        for r in man
+            .ints
+            .iter()
+            .filter(|r| r.occurrence == 0 && r.layout == Layout::Logical)
+        {
+            logical.insert(r.name.clone(), r.file.clone());
+        }
         Set {
             name,
-            dir,
+            dir: man.dir,
             shapes,
             logical,
         }
@@ -93,7 +82,13 @@ impl Set {
             .get(node)
             .unwrap_or_else(|| panic!("{}: no contiguous node {node}", self.name));
         assert_eq!(*got, ne, "{}: {node}'s shape", self.name);
-        let b = self.bytes(&format!("{node}.0.f32"));
+        let b = self.bytes(&dump_file_name(
+            node,
+            0,
+            RowKind::Tensor,
+            Layout::Flat,
+            FileElem::F32,
+        ));
         assert_eq!(
             b.len(),
             4 * ne.iter().product::<usize>(),

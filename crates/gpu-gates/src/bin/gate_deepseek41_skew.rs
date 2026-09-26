@@ -95,8 +95,6 @@ mod gate {
     /// The sets the pair pass runs on: one whose lists are the identity and
     /// one whose indexer layers select.
     const SETS: [&str; 2] = [STEP4, D1];
-    /// The build every V4.1 oracle set must name: the sink-fixed ik tree.
-    const ORACLE_BUILD: &str = "db517b69";
     /// The serving context: the gate placement's, and the body's caches'.
     const CTX_MAX: u64 = workstation::CTX_MAX;
     /// The port's names of the compressed streams, in the planner's order.
@@ -212,18 +210,9 @@ mod gate {
     }
 
     fn open_set(split: &Split, hp: &Hparams, name: &'static str) -> Result<Set, GateError> {
+        // The family's check names the sink-fixed tree: a set of another
+        // build or another model file does not open.
         let man = for_arch(Arch::Deepseek41)?.open_named(name)?;
-        if !man
-            .build
-            .as_deref()
-            .is_some_and(|b| b.starts_with(ORACLE_BUILD))
-        {
-            return Err(format!(
-                "{name}: build {:?}, not the sink-fixed tree {ORACLE_BUILD}: a stale set",
-                man.build
-            )
-            .into());
-        }
         let (pos, tokens, before) = man.step()?;
         let (tokens, before) = (tokens.to_vec(), before.to_vec());
         if tokens.len() != 1 {

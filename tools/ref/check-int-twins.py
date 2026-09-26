@@ -27,11 +27,17 @@ a temp directory around 2^24 and 384,006,168 (V4.1's largest engram row id) and 
 on the good one and red on each broken variant — the branch the V2-Lite set, whose ids are all
 below 64, can never reach.
 """
+import importlib.util
 import os
 import random
 import struct
 import sys
 import tempfile
+
+_spec = importlib.util.spec_from_file_location(
+    "manifest", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery", "manifest.py"))
+manifest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(manifest)
 
 WIDTH = {"i32": 4, "i64": 8}
 INT_TYPES = {"i8", "i16", "i32", "i64"}
@@ -67,32 +73,25 @@ def safe_name(name: str) -> str:
 
 
 def read_manifest(path):
-    header, rows, ints, complete = {}, {}, [], False
-    with open(path, encoding="utf-8") as f:
-        for n, line in enumerate(f, 1):
-            line = line.rstrip("\n")
-            if line.startswith("#"):
-                key, _, val = line[2:].partition("\t")
-                complete |= key == "complete"
-                header.setdefault(key, val)
-                continue
-            f_ = line.split("\t")
-            if f_[0] in ("tensor", "input"):
-                rows[(f_[0], f_[1], int(f_[2]))] = {
-                    "type": f_[3],
-                    "count": int(f_[4]) * int(f_[5]) * int(f_[6]) * int(f_[7]),
-                    "logical": int(f_[12]) if len(f_) >= 13 else 0,
-                    "line": n,
-                }
-            elif f_[0] == "int":
-                if len(f_) != 12:
-                    raise ValueError(f"{path}:{n}: int row has {len(f_)} fields, want 12")
-                ints.append({
-                    "key": (f_[3], f_[1], int(f_[2])), "type": f_[4], "twin": f_[5], "layout": f_[6],
-                    "count": int(f_[7]), "bytes": int(f_[8]), "sum": int(f_[9]), "absmax": int(f_[10]),
-                    "file": f_[11], "line": n,
-                })
-    return header, rows, ints, complete
+    """The set's header, its integer-typed rows' shapes, its `int` rows and whether it is
+    complete, every row read by its column line's names (tools/bloomery/manifest.py)."""
+    m = manifest.read(path)
+    rows, ints = {}, []
+    for kind in ("tensor", "input"):
+        for r in m.rows(kind):
+            rows[(kind, r["name"], r.int("occurrence"))] = {
+                "type": r["type"],
+                "count": r.int("ne0") * r.int("ne1") * r.int("ne2") * r.int("ne3"),
+                "logical": r.int("logical") if r.has("logical") else 0,
+                "line": r.line,
+            }
+    for r in m.rows("int"):
+        ints.append({
+            "key": (r["of"], r["name"], r.int("occurrence")), "type": r["type"], "twin": r["twin"],
+            "layout": r["layout"], "count": r.int("count"), "bytes": r.int("bytes"), "sum": r.int("sum"),
+            "absmax": r.int("absmax"), "file": r["file"], "line": r.line,
+        })
+    return m.header, rows, ints, m.complete is not None
 
 
 def check_set(d: str):
@@ -201,6 +200,11 @@ def write_set(d, tensors, tokens, drop_int=(), f32_patch=None, prefill=None):
              "# tokens\t" + ",".join(map(str, tokens))]
     if prefill is not None:
         lines.append(f"# prefill\t{prefill}")
+    lines += [
+        "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1",
+        "# int\tname\toccurrence\tof\ttype\ttwin\tlayout\tcount\tbytes\tsum\tabsmax\tfile",
+        "# input\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1",
+    ]
     for kind, name, ty, flat, logical in tensors:
         stem = f"{safe_name(name)}.0" + (".input" if kind == "input" else "")
         twin = "i64" if ty == "i64" else "i32"

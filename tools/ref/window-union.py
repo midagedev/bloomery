@@ -270,6 +270,7 @@ def _fake_set(root, name, rows_by_layer, n_expert, n_used, chunk=None):
         f.write(f"# tokens\t{T}\n# n_expert\t{n_expert}\n# n_expert_used\t{n_used}\n")
         if chunk:
             f.write(f"# chunk\t{chunk}\n")
+        f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
         for l in rows_by_layer:
             f.write(f"layer\t{l}\tx\tx\t{T}\t0\t0\ttopk-{l}.u16\n")
         f.write(f"# complete\t{T}\t{len(rows_by_layer)}\n")

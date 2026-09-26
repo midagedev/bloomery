@@ -437,7 +437,7 @@ mod gate {
             [ROW as u64, HC_STREAMS as u64, 1, 1],
             "HC_POST",
         )?;
-        ref_tensor_of_in(&man.dir, r)
+        Ok(ref_tensor_of_in(&man.dir, r)?)
     }
 
     /// Layer `l`'s ffn HC_PRE result, found by the mixes and the scale it
@@ -454,7 +454,7 @@ mod gate {
             })
             .ok_or_else(|| format!("no HC_PRE node reads {mixes} with {scale}"))?;
         node.expect(&node.name, "f32", [HC_MIX as u64, 1, 1, 1], "HC_PRE")?;
-        ref_tensor_of_in(&man.dir, node)
+        Ok(ref_tensor_of_in(&man.dir, node)?)
     }
 
     // ------------------------------------------------------ the step's outputs
@@ -561,7 +561,7 @@ mod gate {
         let load = |name: &str, ne: [u64; 4], op: &str| -> Result<Vec<f32>, GateError> {
             let r = man.tensor(name, 0)?;
             r.expect(name, "f32", ne, op)?;
-            ref_tensor_of_in(&man.dir, r)
+            Ok(ref_tensor_of_in(&man.dir, r)?)
         };
         let init = load("hc_init", [n, HC_STREAMS as u64, 1, 1], "REPEAT")?;
         let embd = load("inp_embd", [n, 1, 1, 1], "GET_ROWS")?;
@@ -1138,7 +1138,7 @@ mod gate {
         let load = |name: &str, ne: [u64; 4], op: &str| -> Result<Vec<f32>, GateError> {
             let r = man.tensor(name, 0)?;
             r.expect(name, "f32", ne, op)?;
-            ref_tensor_of_in(&man.dir, r)
+            Ok(ref_tensor_of_in(&man.dir, r)?)
         };
         let hc_out = load("hc_out", [n, 1, 1, 1], "MUL_MULTI_ADD")?;
         let norm = load("result_norm", [n, 1, 1, 1], "in")?;

@@ -9,7 +9,9 @@
 #
 #   <tree>       an ik tree with build/bin/llama-perplexity built in it, e.g. /home/user/ik-idxkey
 #   <tag>        names the run: $BLOOMERY_DATA/ikppl/<tag>.log (everything) and <tag>.out (the tool's
-#                stdout), and the result line carries it
+#                stdout), and the result line carries it. The log is written as <tag>.log.part and
+#                renamed to <tag>.log only when the run succeeds, after its base: a failed run leaves
+#                the last good run's log beside that run's base, and its own log as the .part
 #   --chunks N   chunks to score (default 4, the PR's); 1 is a smoke run
 #   --ctx N      ids per chunk (default 2048, the PR's); ik scores the second half of each chunk
 #   --batch N    logical batch, at most --ctx (default: --ctx)
@@ -216,7 +218,9 @@ elif [ -n "$KLD_OF" ]; then
   fi
 fi
 
-LOG=$LOGDIR/$TAG.log
+# The run writes <tag>.log.part; its last step renames it to <tag>.log, so <tag>.log is always a
+# finished run's — the model line and the result line a base's reader checks (`refset::kld`).
+LOG=$LOGDIR/$TAG.log.part
 OUT=$LOGDIR/$TAG.out
 PIDFILE=$LOGDIR/$TAG.pid
 : > "$LOG"
@@ -326,3 +330,4 @@ fi
 # "llama_init_from_model: n_ubatch      = 512": the physical batch ik ran, whether or not --ubatch set it.
 ubatch=$(grep -a -m1 'n_ubatch' "$LOG" | awk '{ print $NF }' || true)
 say "ppl tag=$TAG tree=$TREE head=$HEAD_REV dirty_files=$NDIRTY model=$(basename "$MODEL") ctx=$CTX batch=$BATCH ubatch=${ubatch:-?} chunks=$CHUNKS ppl=$ppl err=$err per_chunk=[$per_chunk]$extra wall_s=$((t1 - t0))"
+mv -f -- "$LOG" "$LOGDIR/$TAG.log"

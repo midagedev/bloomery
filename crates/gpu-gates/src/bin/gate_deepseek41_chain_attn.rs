@@ -707,11 +707,11 @@ mod gate {
     }
 
     fn f32s(man: &RefManifest, row: &RefRow) -> Result<Vec<f32>, GateError> {
-        ref_tensor_logical_in(&man.dir, row)
+        Ok(ref_tensor_logical_in(&man.dir, row)?)
     }
 
     fn f16s(man: &RefManifest, row: &RefRow) -> Result<Vec<u16>, GateError> {
-        widened_f16_rows_in(&man.dir, row)
+        Ok(widened_f16_rows_in(&man.dir, row)?)
     }
 
     fn widen(bits: &[u16]) -> Vec<f32> {

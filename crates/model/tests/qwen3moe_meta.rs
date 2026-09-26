@@ -22,12 +22,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Write as _};
-use std::path::PathBuf;
 
 use gguf::{GgmlType, Split};
 use model::arch::qwen3moe::hparams::{Hparams, RopeMode, Score};
 use model::arch::qwen3moe::{names, roles};
 use model::placement::Role;
+use refset::ik::RefManifest;
 
 /// The oracle set of the 5-token prefill.
 const SET: &str = "ref_qwen3moe";
@@ -54,40 +54,34 @@ struct Node {
     src0: String,
 }
 
-/// The `tensor` rows of `set`'s manifest, occurrence 0, by name; the
-/// manifest must carry its completion trailer and name qwen3moe.
+/// The `tensor` rows of `set`'s manifest (`refset::ik`) that carry the v2
+/// columns, occurrence 0, by name; the manifest must carry its completion
+/// trailer and name qwen3moe.
 fn nodes(set: &str) -> HashMap<String, Node> {
-    let base = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-    let path = PathBuf::from(base).join(set).join("MANIFEST.tsv");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "no oracle at {} ({e}); the lead dumps it with `just dump-ref-qwen3moe`",
-            path.display()
-        )
-    });
+    let dir = refset::data_dir().join(set);
+    let man = RefManifest::read(&dir)
+        .unwrap_or_else(|e| panic!("{e}; the lead dumps the oracle with `just dump-ref-qwen3moe`"));
     assert!(
-        text.lines().any(|l| l.starts_with("# complete\t")),
+        man.complete.is_some(),
         "{} has no completion trailer",
-        path.display()
+        dir.display()
     );
     assert!(
-        text.lines().any(|l| l == "# arch\tqwen3moe"),
+        man.arch.as_deref() == Some("qwen3moe"),
         "{} is not a qwen3moe set",
-        path.display()
+        dir.display()
     );
     let mut out = HashMap::new();
-    for line in text.lines().filter(|l| l.starts_with("tensor\t")) {
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.get(2) != Some(&"0") || f.len() < 15 {
+    for r in man.tensors.into_iter().filter(|r| r.occurrence == 0) {
+        let Some(src0) = r.src0 else {
             continue;
-        }
-        let ne = |i: usize| f[i].parse().unwrap_or_else(|e| panic!("{line}: {e}"));
+        };
         out.insert(
-            f[1].to_string(),
+            r.name,
             Node {
-                ne: [ne(4), ne(5), ne(6), ne(7)],
-                op: f[10].to_string(),
-                src0: f[13].to_string(),
+                ne: r.ne,
+                op: r.op,
+                src0,
             },
         );
     }
