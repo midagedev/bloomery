@@ -333,14 +333,14 @@ extras   = Engram | Ple | Deepstack
 | 파동 | aa 라운드 | 증명 | 선행 |
 |---|---|---|---|
 | **1 삭제** — 착륙(09-26, `35c95ec`..`d665eb5`) | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `gpudel`(스칼라 flash 세그먼트 패스와 탐침, `StepProbe` split 팔 넷, 호출자 없는 엔트리, `Head::graph`, `AnyEngine` V4.1 팔) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사; 03과 빌더 수를 맞춘 뒤) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
-| **2 한 주인** | `levers`(TL-1, aa 레버) · `records`(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · `refset`(GD1·GG5, 시팅 10과 짝) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
+| **2 한 주인** | ~~`levers`~~(TL-1, aa 레버 — 착륙 `64aaab8`: `crates/levers` 등록부, `at_main`, 은퇴 이름 거절, `check-levers`) · `records`(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · `refset`(GD1·GG5, 시팅 10과 짝) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
 | **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나; 설계는 `docs/research/modelspec-design.md`, 헤더만 읽는 `qwen35moe` 팔 포함) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
 | **4 층 프로그램 하나** | `layerprog`(DS6: 층 종류마다 층 프로그램 + decode/verify/prompt 스케줄, CED·소스 공유는 `LayerSpec`에서 유도, Q3-3 `step_rows`) · `batchwide`(DS2: 토큰별 연산을 배치 폭으로) · `gatesproc`(GD3: 배치마다 프로세스 하나) · `gatestoml`(TL-4·TL-6) | 디코드 move(노드 목록 동일), 프롬프트 launch 목록 동일은 `--plan` 덤프로, DS2는 산문 A/B 1회 | 3파동, r8host |
 | **5 새 모델** | 결정 6의 첫 모델을 리더 하나와 새 연산으로 올린다 — 재구성이 맞았는지의 시험대. 첫 새 연산은 delta rule이다: GDN과 KDA를 const bool 하나로 가른다(메인라인 `gated_delta_net.cu`의 `template<int S_v, bool KDA, …>`, exllamav3 `gated_delta_net.py`의 KDA mode가 선례). 순환 상태 스냅숏, pre-tokenizer, 도구 파서가 함께 온다 | 인스턴스별 연산 게이트 + 새 모델 e2e + 참조 세트 | 4파동, 결정 6 |
 
 03 파동은 03의 계획을 따른다: `q3prune` → `q3input`·`q3gates` → `gemmsplit`·`q3act` → Q3-3 → 호스트 티어(`hostcfg` → `benchprune` → `hostone` → `hybridgate`) → `q3plan`, 그리고 `kernelshape` 설계 라운드. 공유 타입은 설계자와 서명자를 나눈다: `Act`(03 설계, aa 서명), `step_rows`(aa 설계, 03 서명), `HostTier`(03 설계, aa 서명).
 
-리드 몫(라운드 밖): 원장 키 픽스업, AGENTS·CLAUDE를 규칙만으로(TL-2; 레버 절은 `levers` 뒤), 열린 일의 주인 정리(결정 2 뒤).
+리드 몫(라운드 밖): 원장 키 픽스업, AGENTS·CLAUDE를 규칙만으로(TL-2; ~~레버 절은 `levers` 뒤~~ 레버 절은 `levers` 착륙 때 등록부를 가리키는 한 문단이 됐다), 열린 일의 주인 정리(결정 2 뒤).
 
 ## 7. 사용자가 정할 것
 

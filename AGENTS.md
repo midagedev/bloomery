@@ -572,8 +572,9 @@ parsed. An `in place` row is still read where it is used, each a line of
 check-levers`). A retired name that is set is refused by name in the binaries
 that parse at `main`. The table — lever, class, what it takes, what unset
 means, who reads it, what it does — is `bloomery_levers::markdown()`, and `just
-gate-levers` prints it. The measurements behind the defaults are in rig-log;
-the prose the registry replaced is this file at `382bde6`, lines 566–681.
+gate-levers` prints it. The prose the registry replaced, with the
+measurements some of its entries cited, is this file at `382bde6`, lines
+566–681.
 
 A V4.1 prompt batch's shadow runs the card's routed experts over the layer's whole block by
 tiles, one path with no lever: `ds41_card_buckets` groups the block's card slots by expert,

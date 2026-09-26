@@ -117,6 +117,19 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### 재구성 파동 2가 남긴 것 (09-27, `levers` `64aaab8`)
+
+- **착륙 기록.** `levers`는 호스트 전용 이동이다. 두 ptx-scan 표(generate_ds41, gate_e2e)가 행과 md5까지 베이스와 같다(라운드가 보이고 리드가 다시 스캔했다: `generate_ds41` 284줄과 `gate_e2e` 174줄이 `cmp`로 같다). 번들 바이트만 움직였다(nvlabs-ledger §11 부류: `bloomery-gpu` 2,507,392 → 2,507,363 B, `bloomery-gpu-deepseek41` 1,567,413 → 1,567,435 B). 리드 묶음 34항목이 모두 rc 0이고 wall은 1,729 s다. 예측은 1,781 s였다[유도]. 러너가 찍은 1,609 s는 기록이 없는 `stage-gpu-load-v41`에 기본값 45 s를 넣은 값이다(실제 162 s). lint는 133 그대로다. 돌린 것은 정적 검사 여덟과 ptx-spill·levers, 풀을 짓는 게이트(threads·ds41-host·hybrid·e2e·qwen3moe-e2e·gates-lib), 배치 계획(placement·qwen3moe-placement·ds41-plan), V4.1을 여는 게이트(ds41-lib·step·prefill 기본 팔과 `PREFILL_GROUP=1` 팔(P = 512만)·long·faults·skew·dspark-loop·ds41-load·chain-glue·ds41-engram·draft·ds41-serve·chat), `stage-gpu-load-v41`(계획 b)이다. 뺀 것은 넷이다. 커널만 도는 게이트는 PTX가 같다. V2-Lite CPU 게이트는 바뀐 경로가 풀을 짓는 한 곳뿐이고, 그 경로는 threads·ds41-host가 본다. prefill-q3ksplit은 `main`의 파싱만 바뀌었고 Q3K_SPLIT를 읽는 자리는 그대로다. `stage-gpu-load-v41-lock`은 같은 바이너리에 `HOST_LOCK=1`만 켠 팔이다. 잠금 경로(`gpu/hybrid.rs`)는 바뀌지 않았고, 넣으면 묶음이 30분을 넘는다[유도]. 이것은 다음 착륙 묶음에 넣는다. `CED=off` 팔은 설계상 빨강이다(게이트가 삼각형 켜짐을 고정한다). 라운드 묶음에서 그 팔의 판정 줄은 베이스와 같았다. 베이스 로그가 있는 게이트 열둘(prefill·step·e2e·hybrid·qwen3moe-e2e·placement·threads·ds41-lib·gates-lib·ds41-plan·draft·ds41-engram)은 `verdict-diff`로 모두 같고, `PREFILL_GROUP=1` 팔은 P = 512 케이스 줄이 베이스 팔의 그 줄과 같다(`group=1`, 배치 버퍼 457,177,792 B).
+- **AGENTS의 레버 산문은 레지스트리로 갔다.** 116줄이 `crates/levers/src/registry.rs`를 가리키는 한 문단이 됐다. 표는 `just gate-levers`가 찍는다. 옛 산문의 원문은 행마다 인용하던 측정값과 함께 `382bde6`의 AGENTS.md 566–681행에 있다.
+- **조용한 실패 둘(다음 레버 라운드, S).** 오타 난 `BLOOMERY_*` 이름(`BLOOMERY_PREFIL=steps`)이 아무 말 없이 통과한다. 레지스트리에 없는 이름을 거절하려면 러너·경로 변수(`BLOOMERY_BOX_ENV`, `BLOOMERY_REMOTE`, `BLOOMERY_DATA` 등)도 행이 있어야 한다. 은퇴 이름 거절도 `at_main`을 부르는 bin 12개에만 닿는다. gate_e2e와 V2-Lite·Qwen3 GPU bin, CPU 게이트, bloomery-decode, bench_v41_host는 `CARD_EXPERTS`·`STEP_PAIR`를 여전히 조용히 무시한다.
+- **값을 삼키는 읽기(XS씩).** `model/src/ops.rs:150`(POISON)과 `:2284`(DEFER_QUANT)는 "0"이 아니면 전부 켬으로 읽는다([03] 소유라 03에 넘긴다). `model/src/profile.rs:84-86`은 쓰레기 값을 0으로, 7을 2로 바꾼다(v2fence). `gpu/src/flash_gqa.rs:108-109`, `flash.rs:250-251`, `lib.rs:264-265, 271-272`의 `Err(_) =>`는 UTF-8이 아닌 값을 기본값으로 삼킨다. `flash.rs:244`의 FLASH_MMA 거절도 그 값은 놓친다.
+- **레버 도구(XS).** 값이 잘못되면 `--levers`가 표 대신 오류를 찍는다. Direct 행은 설정돼 있어도 `-`로 나온다(`set <raw> (read in place)`가 디버깅에 낫다). `check-levers`는 "목록은 줄기만 한다"를 강제하지 않는다. 베이스의 목록과 대조하면 된다.
+- **은퇴 이름을 부르는 카드·도구(XS).** `docs/cards/cardtile-pp.card:2, 21`, `docs/cards/prose-cardin.card:10`, `tools/flow/ds41_prefill.py:1699, 2471`이 `CARD_EXPERTS`를 부른다. 그 카드를 다시 돌리면 이름으로 거절된다. `tools/ref/timing-card.sh:32`와 `depth-ds41.sh:458`은 `BLOOMERY_DRAFT`를 문자열로 비교하는 두 번째 파서다.
+- **2파동 `gpumodel`으로.** `gpu/src/model.rs:61-65`의 `type Meta` 문서는 아직 "deepseek41's hyperparameters"라고 한다(이제 `BodyMeta{hp, levers}`). FLASH_SEG를 경로 인자로 옮기려면 `ChainBody::load`와 V2-Lite의 `seg_keys` 호출자(`arch/deepseek2/{dispatch,scratch}.rs`)를 함께 고쳐야 한다(v2fence와 같이).
+- **3파동 `session`으로.** `BLOOMERY_DSPARK_CARD`(`gpu-gates/src/bin/shared/ds41_dspark.rs:74`)는 레지스트리 행이 없고 허용 목록에만 있다. `generate_ds41`은 계획을 두 번 짠다(`print_plan`과 `body::open`; 적재 때의 호스트 산술이다).
+- **이번에 고쳤다.** `tools/recipes.py`의 `ALWAYS`와 `gate-batch.sh`의 스모크 목록에 `check-levers`를 넣었다. `verdict-diff.py`에 잡음 마스크를 더했다: 층-배치 시간 `*_lb`, `ms=`, `tok/s…=`, engram의 warm/cold 분할, just가 찍는 레시피 줄 번호. 지속 시간 마스크는 이제 `n=512 ms=`의 `512 ms`를 먹지 않는다. B 파일이 없으면 트레이스백 대신 이름 붙은 오류로 끝난다.
+- 버림: `body.rs`의 `hp: inputs.hp.clone()`(적재 때 한 번).
+
 ### 재구성 파동 1과 specdesign이 남긴 것 (09-27, `35c95ec`..`ef80083`)
 
 조용한 실패 쪽이 먼저다. 커널을 건드리는 항목은 다음 V4.1 커널 라운드의 첫 항목으로 묶는다(GPU 착륙 목록 전체가 따라온다).

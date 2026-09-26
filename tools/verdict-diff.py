@@ -54,7 +54,14 @@ MASKS = [
     # The hybrid gate's load counters, which it labels a load and not a timing: they move run to run.
     (re.compile(r'\b(\w*_us_(?:mean|max|p\d+)|go_early|of_which_first_of_replay|parks_in_service)=[0-9.]+'),
      r'\1=<n>'),
-    (re.compile(r'\b\d+(\.\d+)?\s?(ns|us|µs|ms|s)\b'), r'<t>\2'),
+    # generate_ds41's per-layer-batch times in `stat prefill split`, and its rates.
+    (re.compile(r'\b((?:union|wait|wait_first|enqueue|copy|card_out|card_in|card_proj)_lb)=[0-9.]+'), r'\1=<t>'),
+    (re.compile(r'\b(ms|tok/s(?:\([a-z0-9]+\))?)=[0-9.]+'), r'\1=<t>'),
+    # The engram gate's page-cache split of the same rows: which are resident depends on the run before.
+    (re.compile(r'\bwarm \d+ cold \d+'), 'warm <n> cold <n>'),
+    # just names the recipe's line in the justfile, which moves when a recipe above it is added.
+    (re.compile(r'(failed on line )\d+'), r'\1<n>'),
+    (re.compile(r'\b\d+(\.\d+)?\s?(ns|us|µs|ms|s)\b(?!=)'), r'<t>\2'),
     (re.compile(r'\b(pid|PID|lock-holder-pid)([ =:]+)\d+'), r'\1\2<pid>'),
     (re.compile(r'ThreadId\(\d+\)'), 'ThreadId(<n>)'),
     (re.compile(r"thread '[^']*' \(\d+\)"), "thread '<thread>' (<tid>)"),
@@ -112,6 +119,14 @@ def compare(args):
         print(__doc__, file=sys.stderr)
         return 2
     a, b, steps = args[0], args[1], args[2:]
+    for p in (a, b):
+        if not os.path.exists(p):
+            print(f'verdict-diff: {p}: no such file or directory', file=sys.stderr)
+            return 2
+    if os.path.isfile(a) != os.path.isfile(b):
+        print(f'verdict-diff: {a} and {b}: compare two log files or two run directories, not one of each',
+              file=sys.stderr)
+        return 2
     if os.path.isfile(a) and os.path.isfile(b):
         name = os.path.basename(b)
         ok = compare_pair(name, read(a), read(b), '-', '-', os.path.join(os.path.dirname(b), '_compare'), ordered)
