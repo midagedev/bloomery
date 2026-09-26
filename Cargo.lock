@@ -313,7 +313,7 @@ dependencies = [
 [[package]]
 name = "cuda-artifact-finalizer"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
@@ -363,7 +363,7 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 dependencies = [
  "cuda-macros",
 ]
@@ -371,7 +371,7 @@ dependencies = [
 [[package]]
 name = "cuda-host"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 dependencies = [
  "cuda-artifact-finalizer",
  "cuda-core",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -396,7 +396,7 @@ dependencies = [
 [[package]]
 name = "cuda-target-spec"
 version = "0.1.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 
 [[package]]
 name = "digest"
@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "libnvvm-sys"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 dependencies = [
  "cuda-target-spec",
  "libloading",
@@ -636,7 +636,7 @@ dependencies = [
 [[package]]
 name = "nvjitlink-sys"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 dependencies = [
  "libloading",
  "thiserror",
@@ -704,7 +704,7 @@ dependencies = [
 [[package]]
 name = "ptx-parse"
 version = "0.1.0"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 
 [[package]]
 name = "quote"
@@ -747,7 +747,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.2.1"
-source = "git+https://github.com/midagedev/cuda-oxide.git?rev=b9847e9515ed3a23096f22567d3eaf0a6e3e440c#b9847e9515ed3a23096f22567d3eaf0a6e3e440c"
+source = "git+https://github.com/midagedev/cuda-oxide.git?rev=e589793a031b7f704b1f2647b429c91579e89834#e589793a031b7f704b1f2647b429c91579e89834"
 
 [[package]]
 name = "rustc-hash"

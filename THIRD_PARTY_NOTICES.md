@@ -44,7 +44,8 @@ upstream has it; with none left, the `[patch]` section goes away.
 
 | Patch | Upstream |
 |---|---|
-| (none yet — the branch is the pinned revision itself) | |
+| [`b4408823`](https://github.com/midagedev/cuda-oxide/commit/b440882339c58be3cb889497ff32c788a4cefd05) feat(cuda-macros): let `requires` name unsigned integer constants | not yet proposed |
+| [`e589793a`](https://github.com/midagedev/cuda-oxide/commit/e589793a031b7f704b1f2647b429c91579e89834) fix(cuda-macros): name the macro call when a cuda_module finds no kernels | not yet proposed |
 
 ## cuda-core (cutile-rs)
 

@@ -393,7 +393,12 @@ first suspect is a hung gate on the box, not the agent.
 - **GPU-stage toolchain defects and gaps (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go
   into `docs/upstream/nvlabs-ledger.md` the moment they are met** — one line, before any
   workaround is written; a workaround erases the evidence. The user wants these as upstream
-  issues/PRs; the ledger is where the lead triages them.
+  issues/PRs; the ledger is where the lead triages them. A cuda-oxide defect that shapes our
+  code is then fixed in our fork as it is met (user, 2026-09-27: "oxide는 패치해가면서 쓰고
+  있으니 결함은 패치해가면서 써"): one fork commit on the `bloomery` branch with its reproducer
+  and FAIL-first, the pin moved as the cuda-oxide bullet below says, and a workaround kept only
+  until that commit lands, and the round that moves the pin removes it; the upstream PR follows
+  at the maintainers' pace.
 - **Code shape is judged by `docs/rust-quality.md`** (numbered rules R1–R29: unsafe scope,
   unit-carrying types, error enums per crate, clippy ratchet, refactor = bit-identical gates +
   same-lease A/B). Review reports cite rule numbers; the warning baseline in Known state only
@@ -573,7 +578,10 @@ first suspect is a hung gate on the box, not the agent.
   `CUDA_OXIDE_BACKEND=~/.cargo/cuda-oxide-bloomery/<rev>/librustc_codegen_cuda.so`
   and a `cargo oxide` command stops (rc 70) when that rev's backend is missing or
   its `source-rev.txt` names another commit (pinned this way, cargo-oxide no
-  longer compares the backend with the dependency's commit).
+  longer compares the backend with the dependency's commit). A pin move whose fork commits
+  leave the backend crate's dependency closure untouched may reuse the previous rev's backend:
+  the copy's md5 and the reason go in that directory's `PROVENANCE`, and `source-rev.txt` then
+  names the rev it serves.
   A fork patch that changes codegen is a pin move (every gate); one that must not
   proves it with the `just ptx-scan` tables of `generate_ds41` and `gate_e2e`
   identical.
