@@ -116,7 +116,8 @@ mod gate {
     };
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::gemm::{
-        GEMM_BN, GEMM_MAX_SLOTS, GemmAct, GemmInput, GemmKernels, GemmRoute, GemmTile, GemmWeight,
+        GEMM_BN, GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmTile,
+        GemmWeight,
     };
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
@@ -630,13 +631,15 @@ mod gate {
             )?;
             self.gk.enqueue_gemm(
                 stream,
-                st.ty,
-                &res.w,
-                st.rows,
-                &res.act,
-                &res.route,
-                st.input.gemm(),
-                &mut res.y,
+                GemmArgs {
+                    ty: st.ty,
+                    w: &res.w,
+                    rows_per_expert: st.rows,
+                    act: &res.act,
+                    route: &res.route,
+                    input: st.input.gemm(),
+                    y: &mut res.y,
+                },
             )?;
             stream.synchronize()?;
             let mut y = res.y.to_host_vec(stream)?;
@@ -1044,7 +1047,18 @@ mod gate {
         let sink = dev.gpu.unlabelled_sink();
         let graph = dev.gpu.capture(|s| {
             gk.enqueue_route(s, ids_d, n_slots, route, sink)?;
-            gk.enqueue_gemm(s, ty, w, rows, act, route, input, y)
+            gk.enqueue_gemm(
+                s,
+                GemmArgs {
+                    ty,
+                    w,
+                    rows_per_expert: rows,
+                    act,
+                    route,
+                    input,
+                    y,
+                },
+            )
         })?;
         graph.launch(stream)?;
         stream.synchronize()?;
@@ -1256,13 +1270,15 @@ mod gate {
                 dev.gk
                     .enqueue_gemm(
                         stream,
-                        st.ty,
-                        &res.w,
-                        rows,
-                        &res.act,
-                        &unfilled,
-                        st.input.gemm(),
-                        &mut y,
+                        GemmArgs {
+                            ty: st.ty,
+                            w: &res.w,
+                            rows_per_expert: rows,
+                            act: &res.act,
+                            route: &unfilled,
+                            input: st.input.gemm(),
+                            y: &mut y,
+                        },
                     )
                     .is_err(),
             ),
@@ -1271,13 +1287,15 @@ mod gate {
                 dev.gk
                     .enqueue_gemm(
                         stream,
-                        st.ty,
-                        &res.w,
-                        250,
-                        &res.act,
-                        &res.route,
-                        st.input.gemm(),
-                        &mut y,
+                        GemmArgs {
+                            ty: st.ty,
+                            w: &res.w,
+                            rows_per_expert: 250,
+                            act: &res.act,
+                            route: &res.route,
+                            input: st.input.gemm(),
+                            y: &mut y,
+                        },
                     )
                     .is_err(),
             ),
@@ -1286,13 +1304,15 @@ mod gate {
                 dev.gk
                     .enqueue_gemm(
                         stream,
-                        GemmWeight::Q6K,
-                        &res.w,
-                        rows,
-                        &res.act,
-                        &res.route,
-                        st.input.gemm(),
-                        &mut y,
+                        GemmArgs {
+                            ty: GemmWeight::Q6K,
+                            w: &res.w,
+                            rows_per_expert: rows,
+                            act: &res.act,
+                            route: &res.route,
+                            input: st.input.gemm(),
+                            y: &mut y,
+                        },
                     )
                     .is_err(),
             ),
@@ -1301,13 +1321,15 @@ mod gate {
                 dev.gk
                     .enqueue_gemm(
                         stream,
-                        st.ty,
-                        &res.w,
-                        rows,
-                        &res.act,
-                        &res.route,
-                        GemmInput::Shared { top_k: 3 },
-                        &mut y,
+                        GemmArgs {
+                            ty: st.ty,
+                            w: &res.w,
+                            rows_per_expert: rows,
+                            act: &res.act,
+                            route: &res.route,
+                            input: GemmInput::Shared { top_k: 3 },
+                            y: &mut y,
+                        },
                     )
                     .is_err(),
             ),
@@ -1318,13 +1340,15 @@ mod gate {
             dev.gk
                 .enqueue_gemm(
                     stream,
-                    st.ty,
-                    &res.w,
-                    rows,
-                    &small,
-                    &res.route,
-                    st.input.gemm(),
-                    &mut y,
+                    GemmArgs {
+                        ty: st.ty,
+                        w: &res.w,
+                        rows_per_expert: rows,
+                        act: &small,
+                        route: &res.route,
+                        input: st.input.gemm(),
+                        y: &mut y,
+                    },
                 )
                 .is_err(),
         ));
@@ -1346,13 +1370,15 @@ mod gate {
         };
         let misaligned = dev.gk.enqueue_gemm(
             stream,
-            GemmWeight::Q4K,
-            &w_off,
-            rows,
-            &res.act,
-            &res.route,
-            st.input.gemm(),
-            &mut y,
+            GemmArgs {
+                ty: GemmWeight::Q4K,
+                w: &w_off,
+                rows_per_expert: rows,
+                act: &res.act,
+                route: &res.route,
+                input: st.input.gemm(),
+                y: &mut y,
+            },
         );
         DeviceTensor::release(w_off);
         refusals.push((
@@ -1421,13 +1447,15 @@ mod gate {
                 .enqueue_route_dense(stream, t, &mut route, dev.gpu.unlabelled_sink())?;
             dev.gk.enqueue_gemm(
                 stream,
-                st.ty,
-                &w,
-                rows,
-                &act,
-                &route,
-                GemmInput::PerSlot,
-                &mut y,
+                GemmArgs {
+                    ty: st.ty,
+                    w: &w,
+                    rows_per_expert: rows,
+                    act: &act,
+                    route: &route,
+                    input: GemmInput::PerSlot,
+                    y: &mut y,
+                },
             )?;
             stream.synchronize()?;
             let mut got = y.to_host_vec(stream)?;

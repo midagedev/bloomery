@@ -924,7 +924,9 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
     // rate against the card's int8 dense tensor peak. `only` keeps the one
     // arm of that name; the return says whether any arm ran.
     fn gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
-        use bloomery_gpu::gemm::{GemmAct, GemmInput, GemmKernels, GemmRoute, GemmWeight};
+        use bloomery_gpu::gemm::{
+            GemmAct, GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmWeight,
+        };
         let stream = gpu.stream();
         let mut ran = false;
         let gk = GemmKernels::load(gpu.context())?;
@@ -980,7 +982,18 @@ fn bench_kernels(model: &Deepseek2Model) -> Result<(), GateError> {
                 };
                 let mut y = DeviceBuffer::<f32>::zeroed(stream, n_slots * rows)?;
                 let mut enq = |s: &CudaStream| {
-                    gk.enqueue_gemm(s, GemmWeight::Q4K, &w, rows, &act, &route, input, &mut y)
+                    gk.enqueue_gemm(
+                        s,
+                        GemmArgs {
+                            ty: GemmWeight::Q4K,
+                            w: &w,
+                            rows_per_expert: rows,
+                            act: &act,
+                            route: &route,
+                            input,
+                            y: &mut y,
+                        },
+                    )
                 };
                 let e = burst(stream, &mut enq)?;
                 let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;

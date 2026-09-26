@@ -127,7 +127,7 @@ def flash_consts(tree):
                              r"^pub const MAX_TOKENS: usize = ([\d_]+);", "MAX_TOKENS"),
         n_used=src_const(tree, "crates/gpu/src/arch/qwen3moe/router.rs",
                          r"^pub const N_USED: usize = ([\d_]+);", "N_USED"),
-        gemm_max_slots=src_const(tree, "crates/gpu/src/gemm.rs",
+        gemm_max_slots=src_const(tree, "crates/gpu/src/gemm/mod.rs",
                                  r"^pub const GEMM_MAX_SLOTS: usize = ([\d_]+);", "GEMM_MAX_SLOTS"),
     )
     # The shapes the grid, the block, the tile walk and the order are written in.

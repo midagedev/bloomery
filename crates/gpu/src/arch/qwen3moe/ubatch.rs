@@ -47,7 +47,7 @@ use super::router::{N_EXPERT, N_USED, RouterOut};
 use super::scratch::{Dims, KvPlanes, f32_view, param_view};
 use crate::flash_gqa::HEAD;
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs};
-use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmInput, GemmRoute, GemmWeight};
+use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::rope_neox::NeoxArgs;
@@ -607,13 +607,15 @@ fn attention(
     ] {
         k.gemm.enqueue_gemm(
             stream,
-            gemm_ty(ty),
-            kq_weight(w, name)?,
-            rows,
-            &a.act_hid,
-            &a.dense,
-            GemmInput::PerSlot,
-            y,
+            GemmArgs {
+                ty: gemm_ty(ty),
+                w: kq_weight(w, name)?,
+                rows_per_expert: rows,
+                act: &a.act_hid,
+                route: &a.dense,
+                input: GemmInput::PerSlot,
+                y,
+            },
         )?;
     }
     k.neox.enqueue_head_norm_neox_append(
@@ -655,13 +657,15 @@ fn attention(
     gpu.enqueue_quantize_gemm(&a.attn, t, &mut a.act_attn, sink)?;
     k.gemm.enqueue_gemm(
         stream,
-        GemmWeight::Q4K,
-        kq_weight(w, &n.attn_output)?,
-        d.hidden,
-        &a.act_attn,
-        &a.dense,
-        GemmInput::PerSlot,
-        &mut a.attn_o,
+        GemmArgs {
+            ty: GemmWeight::Q4K,
+            w: kq_weight(w, &n.attn_output)?,
+            rows_per_expert: d.hidden,
+            act: &a.act_attn,
+            route: &a.dense,
+            input: GemmInput::PerSlot,
+            y: &mut a.attn_o,
+        },
     )?;
     gpu.elem()
         .enqueue_add(stream, &a.x, &a.attn_o, t * d.hidden, &mut a.ffn_inp)
@@ -704,26 +708,30 @@ fn ffn(
     for (name, y) in [(&n.ffn_gate_exps, &mut a.gate), (&n.ffn_up_exps, &mut a.up)] {
         k.gemm.enqueue_gemm(
             stream,
-            GemmWeight::Q4K,
-            kq_weight(w, name)?,
-            d.ff,
-            &a.act_hid,
-            &a.moe,
-            GemmInput::Shared { top_k: N_USED },
-            y,
+            GemmArgs {
+                ty: GemmWeight::Q4K,
+                w: kq_weight(w, name)?,
+                rows_per_expert: d.ff,
+                act: &a.act_hid,
+                route: &a.moe,
+                input: GemmInput::Shared { top_k: N_USED },
+                y,
+            },
         )?;
     }
     k.gemm
         .enqueue_swiglu_quant(stream, &a.gate, &a.up, slots, &mut a.act_h, sink)?;
     k.gemm.enqueue_gemm(
         stream,
-        gemm_ty(n.down_ty),
-        kq_weight(w, &n.ffn_down_exps)?,
-        d.hidden,
-        &a.act_h,
-        &a.moe,
-        GemmInput::PerSlot,
-        &mut a.down,
+        GemmArgs {
+            ty: gemm_ty(n.down_ty),
+            w: kq_weight(w, &n.ffn_down_exps)?,
+            rows_per_expert: d.hidden,
+            act: &a.act_h,
+            route: &a.moe,
+            input: GemmInput::PerSlot,
+            y: &mut a.down,
+        },
     )?;
     k.experts.enqueue_combine_tokens(
         stream,
