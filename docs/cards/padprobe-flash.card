@@ -1,0 +1,20 @@
+# Mechanism probe for sitting 16's extra L2 -> SM sectors (rig-log 09-26#q3ncu-s16): gqa_prefill_flash
+# reads 102,959,024 sectors a P = 4096 launch where its K, V, Q and counts need 69,339,136; the count fits
+# 1.5 x (K+V) + Q + counts to 80 sectors [derived]. Hypothesis: the 272-B smem row (16 mod 32) splits each
+# 32-B global sector of a cp.async on the odd rows. This tree pads the row to 288 B (32-B aligned) and
+# changes nothing else: same kernel, same bits (smem addressing only), ldmatrix 2-way conflicts.
+kind: profile
+question: does a 32-B aligned smem row bring gqa_prefill_flash's L2 -> SM read sectors from 1.5x to
+  1.0x of its K and V bytes?
+term: lts__t_sectors_srcunit_tex_op_read.sum of one gqa_prefill_flash launch (layer 24, P = 4096) under
+  the q3pp form, A6000, --clock-control none
+unit: M sectors
+predict: 69.2..69.5
+condition: just ncu-gpu-qwen3-pp 4096 24 from the padprobe tree (e6364f2 + ROW_W + 4 words) under the
+  lease; the summary's proof passes (grid 2,048 x 128, 34,078,720 HMMA), else void
+decide-in: the padded-row split is the mechanism: open the XOR-swizzled layout for the flash K/V tiles
+  (bits kept) and the same for gemm_q4k's WT/B tiles; read this run's cycles beside main's 2,911,224 as
+  a first bound on what the bytes cost (the 2-way ldmatrix conflict makes it a lower bound)
+decide-below: fewer than the K+V+Q floor is impossible: a counting or proof error, void the row
+decide-above: at ~103 M the pad is not the mechanism: take the flash source page (BLOOMERY_NCU_SOURCE=1,
+  per-instruction L2 Theoretical Sectors) before any layout round

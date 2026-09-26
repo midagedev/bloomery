@@ -1,0 +1,25 @@
+# No build: q3fa's generate_qwen3moe (BLOOMERY_NCU_BIN) under the q3pp form with the source page. Sitting 16
+# read 1.5 x (K+V) L2->SM sectors (102,959,116 against 69,337,088 of bytes). Candidate mechanism: an
+# LDGSTS costs one L2 sector per (source 32-byte sector, destination 32-byte smem sector) pair; the
+# 272-byte padded row puts odd key rows 16 bytes off a 32-byte boundary. q3fa's SASS stages to
+# key*272 + 16*(tid%16) (0xe410-0xe540: R5 = (tid>>4)*0x44 + (tid*4 & 0x3c) words), so lanes 0-15 of
+# every copy land aligned (even key) and lanes 16-31 straddle (odd key): 24 sectors for 16 [derived].
+# gemm_q4k's page (082817) already reads 1.75 / 1.5 / 1.625 on its qs copies, the pure and mixed cases
+# of the same pair rule, which a source-only rule cannot reach (at most 1.5).
+kind: profile
+question: does ncu's per-instruction L2 accounting see the flash K/V LDGSTS at 1.5 x ideal, as the
+  destination-pair rule predicts, with the global side perfectly coalesced?
+term: L2 Theoretical Sectors Global / L2 Theoretical Sectors Global Ideal of each of the 16
+  LDGSTS.E.BYPASS.128 in gqa_prefill_flash's loop and the prologue's 8, source page of one launch
+  (layer 24, P = 4096), A6000
+unit: ratio
+predict: 1.49..1.51
+condition: just ncu-gpu-qwen3-pp 4096 24 with BLOOMERY_NCU_BIN=<q3fa tree>/target/release/generate_qwen3moe,
+  BLOOMERY_NCU_SOURCE=1 and BLOOMERY_NCU_COUNT=1 under the lease; the summary's proof passes (grid 2,048 x
+  128, 34,078,720 HMMA); the LDG.E.64 query loads read 1.00 in the same page, else the page is not
+  comparable
+decide-in: the mechanism holds: open the swizzle round (q3swz) without the ROW_W 72 build probe
+decide-below: ncu's theoretical metric sees only the global side here: run the ROW_W 72 build probe
+  (q3row72-ncu) before the swizzle round
+decide-above: another term inflates the copies: read the page's per-instruction L1 wavefronts before
+  any layout change
