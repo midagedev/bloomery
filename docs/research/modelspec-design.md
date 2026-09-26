@@ -17,7 +17,8 @@ principle 3 and §2-2 are its frame.
   `docs/rebuild.md` §2-2 is corrected.
 - **L4 landed as a refusal, not a cap** (`ef80083`): every entry that advances V4.1 positions
   refuses past 16,384 by name (`Hparams::candidate_free_positions`, `Body::check_defined`); the
-  serving plan keeps its 32,768-position caches. Building the candidate mask is a triage item.
+  serving plan keeps its 32,768-position caches. ~~Building the candidate mask is a triage item.~~ The
+  mask is designed in `docs/research/candmask-design.md`: kernels in wave 3 `opslib`, wiring in wave 4 `layerprog`.
 - **L1, L2, L3, L5, L6, L7, L8: accepted as recommended.** K1–K6 go to 03's `kernelshape`.
 - **§8** is disposed in `docs/plan-triage.md`.
 
