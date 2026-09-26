@@ -403,7 +403,10 @@ first suspect is a hung gate on the box, not the agent.
   pp512 **129.6** and pp4096 **180.0** with no hot list (main's binary 118.0 / 166.3 in the same
   lease, 1.098 ± 0.030 / 1.083 ± 0.035, the union 77.1 → 66.7 ms per layer-batch; sitting 14's
   121.4 / 169.4 ran with the hot list, so the two pairs do not share a table; rig-log
-  09-26#uniondispatch-ab).
+  09-26#uniondispatch-ab). Since `2f45a79` (B1: the prompt batch's attention projections once per
+  128-token sub-block instead of per 8-token chunk) pp512 **144.6** and pp4096 **201.0** with no hot
+  list (the tree before it 130.6 / 182.4 in the same leases, 1.108 ± 0.011 / 1.102 ± 0.011 over four
+  clean rounds; the card route 29.7 → 19.6 ms per layer-batch; rig-log 09-26#b1-pp-ab).
 - **A decode headline names its depth.** tg96 after a 6-token prompt measures
   the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
   each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via

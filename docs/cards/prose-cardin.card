@@ -1,0 +1,20 @@
+# The prose prompt's grouped shadow, traced once (round cardnext's calibration,
+# docs/research/cardnext-design-report.md section 5 item 2). The flow model's prose shadow (53.0 ms a
+# layer-batch) is lcg's per-slot cost transferred to prose's slot counts, never traced; the tile lever T
+# (cardtile) and the IMMA alternative (prefilllit2) are both sized on it. One prompt of 512 prose ids
+# (`corpus-prose.ids`, the first 512), main's generate_ds41 with B1, hot list 384, BLOOMERY_STEP_STATS=1
+# so the `stat prefill split` line prints card_in per layer-batch from event pairs.
+kind: calibration
+question: is the prose prompt's shadow the per-slot reading (R) that sizes the tile lever
+term: card_in ms a layer-batch @ prose prompt P 512, main (B1) binary, A6000 plan (a), hot list 384,
+  CED on, CARD_EXPERTS expert
+unit: ms
+predict: 45..53
+condition: one prompt under BLOOMERY_STEP_STATS=1 (card event pairs), lease held through time-gate.sh,
+  no other card work, no [cpu-busy] or [other-busy] on the row
+decide-in: build cardtile as designed (prose +27..+31 % at G1), and put the IMMA shadow question to the
+  user with this value
+decide-below: below the union 34.9 the shadow already hides at G1: G first, then cardtile
+decide-above: the hot experts' serial walks add a tail the per-slot model misses: cardtile first,
+  re-derive its gain upward
+reason: the flow model's prose shadow is lcg's per-slot cost transferred, never traced
