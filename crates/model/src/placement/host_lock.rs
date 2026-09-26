@@ -552,9 +552,16 @@ impl<'s> PageDrop<'s> {
     }
 
     /// Release every whole page of the r8 sidecar `side`, as
-    /// [`PageDrop::release`] does a shard's.
+    /// [`PageDrop::release`] does a shard's. A resident sidecar is refused by
+    /// name: its bytes are an anonymous copy, which `MADV_DONTNEED` would
+    /// zero.
     pub fn release_sidecar(&mut self, side: &Sidecar) -> Result<(), PlacementError> {
         let name = HostFile::Sidecar(side.path().to_path_buf());
+        if !side.is_mapped() {
+            return Err(PlacementError::Host(format!(
+                "{name} is a resident copy, not its file's mapping: it has no file pages to release"
+            )));
+        }
         let file = File::open(side.path())
             .map_err(|e| PlacementError::Host(format!("open {name} to release pages: {e}")))?;
         let map = side.gguf().mapping();
@@ -614,9 +621,10 @@ fn drop_pages(
             ))
         })?;
     // SAFETY: `span` is a live sub-slice of a read-only MAP_SHARED file
-    // mapping. MADV_DONTNEED on it drops this process's page-table entries
-    // only; the next touch re-faults the same file bytes, so no borrow of the
-    // mapping ever sees other contents.
+    // mapping (a split's shards always are; `release_sidecar` refuses a
+    // resident sidecar). MADV_DONTNEED on it drops this process's page-table
+    // entries only; the next touch re-faults the same file bytes, so no
+    // borrow of the mapping ever sees other contents.
     if unsafe {
         libc::madvise(
             span.as_ptr().cast_mut().cast(),

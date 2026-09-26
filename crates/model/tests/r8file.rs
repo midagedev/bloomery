@@ -9,7 +9,8 @@
 //! builds the layer's gate and up from it, hands a held sidecar back to
 //! another open of the same bytes, and refuses by name a sidecar whose
 //! source's header or stack head differs, also while an earlier load holds
-//! it open. No clause reads a model file.
+//! it open. Releasing a resident sidecar's pages is refused by name and leaves
+//! its bytes as they were. No clause reads a model file.
 
 #[path = "common/r8layer.rs"]
 mod r8layer;
@@ -24,6 +25,8 @@ use gguf::{GgmlType, Gguf, LoadError, PrivateType, Split, Value, Weights};
 use model::ModelError;
 use model::moe::HostLayer;
 use model::ops::RowLayout;
+use model::placement::PlacementError;
+use model::placement::host_lock::PageDrop;
 use model::r8file::{self, HostR8, Progress, R8Error, Sidecar};
 
 const G0: &str = "blk.0.ffn_gate_exps.weight";
@@ -846,4 +849,41 @@ fn a_host_layer_refuses_a_sidecar_that_holds_its_down() {
         Ok(_) => panic!("a sidecar holding the down must be refused"),
     }
     println!("host layer: a sidecar holding {} is refused", r8layer::DOWN);
+}
+
+/// A resident sidecar is an anonymous copy of its file: `PageDrop` refuses to
+/// release its pages by name, releases nothing, and the copy keeps its bytes;
+/// the mapped sidecar of the same file is released as a shard is.
+#[test]
+fn a_resident_sidecar_is_not_released() {
+    let layer = r8layer::Layer::write("resident", 512, 256, 4, GgmlType::Q4_K);
+    let split = Split::open(&layer.source).unwrap();
+    let mapped = Sidecar::open(&layer.sidecar, &split, LAZY).unwrap();
+    let resident =
+        Sidecar::open(&layer.sidecar, &split, Weights::Resident { huge: false }).unwrap();
+    let want = mapped.data(r8layer::GATE).unwrap().to_vec();
+    assert!(
+        want.iter().any(|&b| b != 0),
+        "the gate's sidecar bytes are not all zero"
+    );
+    let mut drop = PageDrop::new(&split);
+    match drop.release_sidecar(&resident) {
+        Err(PlacementError::Host(msg)) => assert!(msg.contains("resident"), "{msg}"),
+        other => panic!("a resident sidecar must be refused by name, got {other:?}"),
+    }
+    assert_eq!(drop.bytes(), 0, "nothing is released");
+    assert!(
+        resident.data(r8layer::GATE).unwrap() == want.as_slice(),
+        "the resident copy keeps its bytes"
+    );
+    drop.release_sidecar(&mapped).unwrap();
+    assert!(drop.bytes() > 0, "the mapped sidecar's pages are released");
+    assert!(
+        mapped.data(r8layer::GATE).unwrap() == want.as_slice(),
+        "a released mapping reads its file's bytes again"
+    );
+    println!(
+        "page drop: a resident sidecar is refused; the mapped one releases {} B",
+        drop.bytes()
+    );
 }

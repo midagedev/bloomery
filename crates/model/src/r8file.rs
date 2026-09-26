@@ -724,6 +724,12 @@ impl Sidecar {
         &self.path
     }
 
+    /// Whether the sidecar's bytes are its file's own mapping: `false` for a
+    /// resident copy, whose pages are anonymous.
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.mapped
+    }
+
     /// Tensor `name`'s header entry, `None` for a name the sidecar lacks.
     pub(crate) fn find(&self, name: &str) -> Option<&TensorInfo> {
         self.gguf.find(name)
