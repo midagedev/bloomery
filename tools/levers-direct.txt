@@ -15,8 +15,6 @@ crates/model/src/arch/deepseek2/attn.rs	BLOOMERY_FLASH_SIMD,BLOOMERY_KV_PREFETCH
 crates/model/src/profile.rs	BLOOMERY_PROFILE	v2fence
 crates/model/src/bin/bloomery-decode.rs	BLOOMERY_PROFILE,BLOOMERY_PIN_MAIN,BLOOMERY_POPULATE,BLOOMERY_WEIGHTS	v2fence
 crates/gpu/src/flash.rs	BLOOMERY_FLASH_SEG,BLOOMERY_FLASH_MMA	v2fence
-crates/gpu/src/lib.rs	BLOOMERY_Q3K_SPLIT,BLOOMERY_Q3K_SPLIT_ITERS	decision 4
-crates/gpu/src/model/launcher.rs	BLOOMERY_LAUNCH_THREAD	decision 4
 # Paths and profile facts (audit TL-6).
 crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL	gatestoml
 crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
@@ -38,10 +36,6 @@ crates/gpu-gates/src/bin/gate_vision_encoder.rs	BLOOMERY_VISION_SET	gatestoml
 # Runner handshakes (audit TL-7).
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_HOST_LEASE	TL-7
 crates/engram-lab/src/bin/engram-rate.rs	BLOOMERY_ENGRAM_LEASE	TL-7
-# The stage-0 crates, removed whole.
-crates/gpu-spike/src/main.rs	BLOOMERY_DATA	stage0
-crates/q3k-cpu/src/main.rs	BLOOMERY_DATA	stage0
-crates/q3k-gemv/src/main.rs	BLOOMERY_DATA	stage0
 # Not levers, and they stay.
 crates/gpu-gates/src/bind.rs	CUDA_VISIBLE_DEVICES	stays: the driver's card list
 crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs	BLOOMERY_CHAIN_ATTN_MUTATE,BLOOMERY_CHAIN_ATTN_LAYERS	stays: the gate's FAIL-first tool

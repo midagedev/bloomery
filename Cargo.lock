@@ -99,7 +99,6 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
- "libc",
 ]
 
 [[package]]
@@ -141,14 +140,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloomery-gpu-spike"
-version = "0.1.0"
-dependencies = [
- "bloomery-gpu",
- "cuda-core",
-]
-
-[[package]]
 name = "bloomery-gpu-vision"
 version = "0.1.0"
 dependencies = [
@@ -176,22 +167,6 @@ dependencies = [
  "libc",
  "sha2",
  "thiserror",
-]
-
-[[package]]
-name = "bloomery-q3k-cpu"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "bloomery-q3k-gemv"
-version = "0.1.0"
-dependencies = [
- "cuda-core",
- "cuda-device",
- "cuda-host",
 ]
 
 [[package]]

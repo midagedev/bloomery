@@ -11,9 +11,9 @@
 //! The tables are the `engram_embd` weights of the blocks the metadata names
 //! (blk.1 and blk.14 in V4.1-Flash): ~384 M rows of 256 values each, in the
 //! file's block type — one Q3_K block of **110 B a row** in the public
-//! `Q3_K_M` file (84.6 GB together), eight Q8_0 blocks of 272 B in the mixed
-//! one. They cannot live in RAM beside the weights, and each site is mapped
-//! and read where it lies. A row's bytes are the file's; decoding them is the
+//! `Q3_K_M` file (84.6 GB together). They cannot live in RAM beside the
+//! weights, and each site is mapped and read where it lies. A row's bytes are
+//! the file's; decoding them is the
 //! reader's, so the row type is carried ([`Site::type_id`]) and not
 //! interpreted here.
 //!

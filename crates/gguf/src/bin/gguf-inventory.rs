@@ -19,11 +19,7 @@
 //!
 //! Per-token active bytes use the metadata's `<arch>.expert_count` and
 //! `<arch>.expert_used_count` (top-k): routed/token = Σ over MoE blocks of
-//! (exps bytes × top-k / expert count), exact integer division. The
-//! reference column quotes docs/roofline.md's hand count of one file, the
-//! V4.1 mixed file (`Q3_K_M-engramQ8-tokembdBF16-attnQ8`), whatever file is
-//! inventoried, and is printed only for files that carry engram tensors;
-//! other files get the raw numbers.
+//! (exps bytes × top-k / expert count), exact integer division.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
@@ -31,12 +27,6 @@ use std::fs;
 use std::process::ExitCode;
 
 use gguf::{GgmlType, Inventory, ggml_type_info, inventory_of};
-
-// docs/roofline.md's hand count of the V4.1 mixed file (Q3_K_M-engramQ8-tokembdBF16-attnQ8).
-const REF_FILE_GIB: f64 = 444.23;
-const REF_ROUTED_GIB: f64 = 3.7656;
-const REF_DENSE_GIB: f64 = 7.1320;
-const REF_ENGRAM_GIB: f64 = 194.867;
 
 struct Shard {
     ordinal: usize,
@@ -475,43 +465,22 @@ fn main() -> ExitCode {
         first_k_dense,
         moe_blocks.len(),
     ));
-    let has_engram = group_count.contains_key(&Group::Engram);
     out.push_str("per-token active bytes:\n");
     if let Some(r) = routed_per_token {
-        let extra = if has_engram {
-            format!(
-                "  [roofline {} GiB, delta {:+.4}]",
-                REF_ROUTED_GIB,
-                r as f64 / (1u64 << 30) as f64 - REF_ROUTED_GIB
-            )
-        } else {
-            String::new()
-        };
         out.push_str(&format!(
-            "  routed experts/token = {} bytes = {} GiB{}\n",
+            "  routed experts/token = {} bytes = {} GiB\n",
             commas(r as u64),
             gib(r as u64),
-            extra
         ));
     } else {
         out.push_str(
             "  routed experts/token = n/a (expert_count/top-k missing or inexact division)\n",
         );
     }
-    let extra = if has_engram {
-        format!(
-            "  [roofline {} GiB, delta {:+.4}]",
-            REF_DENSE_GIB,
-            dense_total as f64 / (1u64 << 30) as f64 - REF_DENSE_GIB
-        )
-    } else {
-        String::new()
-    };
     out.push_str(&format!(
-        "  dense/token         = {} bytes = {} GiB{}\n",
+        "  dense/token         = {} bytes = {} GiB\n",
         commas(dense_total),
         gib(dense_total),
-        extra
     ));
     let embd = group_bytes.get(&Group::TokenEmbd).copied().unwrap_or(0);
     out.push_str(&format!(
@@ -520,14 +489,9 @@ fn main() -> ExitCode {
         gib(dense_total.saturating_sub(embd)),
     ));
     out.push_str(&format!(
-        "totals: file={} bytes = {} GiB{}, tensor bytes known={}{}, engram table={} GiB{}\n",
+        "totals: file={} bytes = {} GiB, tensor bytes known={}{}, engram table={} GiB\n",
         commas(total_file),
         gib(total_file),
-        if has_engram {
-            format!("  [roofline {REF_FILE_GIB} GiB]")
-        } else {
-            String::new()
-        },
         commas(total_known),
         if total_unknown > 0 {
             format!(", {total_unknown} tensors of unknown size (sums are lower bounds)")
@@ -535,11 +499,6 @@ fn main() -> ExitCode {
             String::new()
         },
         gib(engram_total),
-        if has_engram {
-            format!("  [roofline {REF_ENGRAM_GIB} GiB]")
-        } else {
-            String::new()
-        },
     ));
     print!("{out}");
 
@@ -681,44 +640,34 @@ fn main() -> ExitCode {
             first_k_dense,
             moe_blocks.len(),
         ));
-        m.push_str(
-            "| quantity | bytes/token | GiB/token | roofline.md hand count, V4.1 mixed file | delta GiB |\n",
-        );
-        m.push_str("|---|---:|---:|---:|---:|\n");
+        m.push_str("| quantity | bytes/token | GiB/token |\n");
+        m.push_str("|---|---:|---:|\n");
         if let Some(r) = routed_per_token {
             m.push_str(&format!(
-                "| routed experts | {} | {} | {} | {:+.4} |\n",
+                "| routed experts | {} | {} |\n",
                 commas(r as u64),
                 gib(r as u64),
-                REF_ROUTED_GIB,
-                r as f64 / (1u64 << 30) as f64 - REF_ROUTED_GIB
             ));
         }
         m.push_str(&format!(
-            "| dense | {} | {} | {} | {:+.4} |\n",
+            "| dense | {} | {} |\n",
             commas(dense_total),
             gib(dense_total),
-            REF_DENSE_GIB,
-            dense_total as f64 / (1u64 << 30) as f64 - REF_DENSE_GIB
         ));
         m.push_str(&format!(
-            "| dense excl token_embd | {} | {} | {} | {:+.4} |\n",
+            "| dense excl token_embd | {} | {} |\n",
             commas(dense_total.saturating_sub(embd)),
             gib(dense_total.saturating_sub(embd)),
-            REF_DENSE_GIB,
-            (dense_total.saturating_sub(embd)) as f64 / (1u64 << 30) as f64 - REF_DENSE_GIB
         ));
         m.push_str(&format!(
-            "| totals: file | {} | {} | {} | — |\n",
+            "| totals: file | {} | {} |\n",
             commas(total_file),
             gib(total_file),
-            REF_FILE_GIB,
         ));
         m.push_str(&format!(
-            "| totals: engram table | {} | {} | {} | — |\n",
+            "| totals: engram table | {} | {} |\n",
             commas(engram_total),
             gib(engram_total),
-            REF_ENGRAM_GIB,
         ));
         if total_unknown > 0 {
             m.push_str(&format!(
@@ -737,10 +686,7 @@ mod tests {
     use super::{has_decoder, in_engine_type};
     use gguf::quant::{GgmlType, dequant_row};
 
-    /// The type ids V4.1's first shard carries that the crate decodes: the
-    /// mixed file's (f32, q8_0, q3_K, q5_K, q6_K, bf16) and the public
-    /// file's, which has no q8_0.
-    const V41_DECODABLE: usize = 6;
+    /// The type ids V4.1's first shard carries that the crate decodes.
     // PIN(2026-09-24): the public file's first shard: f32, q3_K, q5_K, q6_K, bf16.
     const V41_PUBLIC_DECODABLE: usize = 5;
 
@@ -786,14 +732,14 @@ mod tests {
             .collect();
         println!("v41 shard types: {}", rows.join("; "));
         let decodable = ids.iter().filter(|&&id| has_decoder(id)).count();
-        let want = if path == gguf::v41::PUBLIC {
-            V41_PUBLIC_DECODABLE
-        } else {
-            V41_DECODABLE
-        };
+        assert!(
+            path == gguf::v41::PUBLIC,
+            "{path}: the decodable-type count is pinned for {} only",
+            gguf::v41::PUBLIC
+        );
         assert_eq!(
             decodable,
-            want,
+            V41_PUBLIC_DECODABLE,
             "decodable type ids on {path} ({} ids)",
             ids.len()
         );

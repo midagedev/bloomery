@@ -56,72 +56,10 @@ struct HostPin {
     headroom: i128,
 }
 
-// PIN(2026-09-24): design §5 (a)'s A6000 line with the window ring's shadow in page-locked host memory: the card's KV term is the cache alone again, so the line is the one before the shadow — 2,414 experts, n_l 63–64 on layers 2–39.
-const A_A6000: CardPin = CardPin {
-    card: "A6000",
-    dense: 8_149_379_520,
-    expert_bytes: 40_490_311_680,
-    experts: 2_414,
-    rounding: 515_454_528,
-    kv: 110_125_056,
-    headroom: 1_083_154_432,
-    eligible: 2..40,
-    n_l: (63, 64),
-};
-// PIN(2026-09-24): design §5 (a)'s host line: every expert the A6000 does not keep, and the 40 layers' ring shadows page-locked (40 × 32,768 positions × 1,024 B = 1,342,177,280 B), the headroom that much below the line before the shadow.
-const A_HOST: HostPin = HostPin {
-    expert_bytes: 218_277_273_600,
-    table_bytes: 1_323_827_200,
-    shadow: 1_342_177_280,
-    headroom: 38_138_126_336,
-};
-// PIN(2026-09-24): design §5 (b)'s A6000 line with the ring shadows on the host: the line before the shadow — 2,680 experts, n_l 148–149 on layers 2–19.
-const B_A6000: CardPin = CardPin {
-    card: "A6000",
-    dense: 3_967_677_920,
-    expert_bytes: 44_951_961_600,
-    experts: 2_680,
-    rounding: 277_449_248,
-    kv: 65_560_576,
-    headroom: 1_085_775_872,
-    eligible: 2..20,
-    n_l: (148, 149),
-};
-// PIN(2026-09-24): design §5 (b)'s 3090 line with the ring shadows on the host: the line before the shadow — 1,144 experts, n_l 57–58 on layers 20–39.
-const B_3090: CardPin = CardPin {
-    card: "3090",
-    dense: 4_181_701_600,
-    expert_bytes: 19_188_449_280,
-    experts: 1_144,
-    rounding: 250_072_096,
-    kv: 44_564_480,
-    headroom: 1_081_606_144,
-    eligible: 20..40,
-    n_l: (57, 58),
-};
-// PIN(2026-09-24): design §5 (b)'s host line (token_embd as in (a)): every expert the cards do not keep, and both cards' ring shadows page-locked (2 × 20 layers × 32,768 × 1,024 B), the headroom that much below the line before the shadow.
-const B_HOST: HostPin = HostPin {
-    expert_bytes: 194_627_174_400,
-    table_bytes: 1_323_827_200,
-    shadow: 1_342_177_280,
-    headroom: 61_788_225_536,
-};
-// PIN(2026-09-23): design §5 (a), `engram_embd` ×2 on NVMe — the same in (b).
-const NVME: u64 = 208_902_215_200;
 // PIN(2026-09-23): design §3, the whole model placed once.
 const TENSORS: usize = 1_046;
-// PIN(2026-09-23): design §1, q8_0 outside the engram tables: tensors and plane bytes, all on cards — the file's bytes, since the scale plane keeps each block's f16 bits.
-const Q8_0_CARD: (usize, u64) = (330, 7_264_010_240);
-// PIN(2026-09-23): design §1, bf16 decoded to f32 on the cards: the routers, and engram_{k,q}.
+// PIN(2026-09-23): design §1, bf16 decoded to f32 on the cards: the routers.
 const BF16_ROUTERS: u64 = 314_572_800;
-const BF16_ENGRAM: u64 = 327_680;
-// PIN(2026-09-23): design §3, bytes one token reads in the file's format: all, and dense.
-const READ_TOTAL: u64 = 12_035_196_096;
-const READ_DENSE: u64 = 7_991_939_520;
-// PIN(2026-09-24): the mixed file has no q5_K outside the routed stacks, so none on a card.
-const Q5_K_CARD: (usize, u64) = (0, 0);
-// PIN(2026-09-24): the gate placement (`plan_gate`, the 3090 alone) keeps 888 experts, as plan (a) under the 3090's usable bytes; re-taken on top of the host ring shadow.
-const GATE_EXPERTS: u64 = 888;
 
 // PIN(2026-09-24): the public Q3_K_M file, plan (a)'s A6000 line, re-taken on top of the host ring shadow: attention and the shared experts in q3_K/q4_K instead of q8_0 leave 4,258,054,144 dense bytes fewer, and the card keeps 254 experts more (2,668), n_l 70–71.
 const PUB_A_A6000: CardPin = CardPin {
@@ -174,8 +112,8 @@ const PUB_B_HOST: HostPin = HostPin {
     headroom: 67_104_782_336,
 };
 
-/// One file's pins: the mixed file's are the consts above without a prefix,
-/// the public file's those with `PUB_` and the literals in [`PUBLIC`].
+/// One file's pins: the public file's are the consts above with `PUB_` and
+/// the literals in [`PUBLIC`].
 struct FilePins {
     a_cards: &'static [CardPin],
     a_host: &'static HostPin,
@@ -189,20 +127,6 @@ struct FilePins {
     read_dense: u64,
     gate_experts: u64,
 }
-
-const MIXED: FilePins = FilePins {
-    a_cards: &[A_A6000],
-    a_host: &A_HOST,
-    b_cards: &[B_A6000, B_3090],
-    b_host: &B_HOST,
-    nvme: NVME,
-    q8_0_card: Q8_0_CARD,
-    q5_k_card: Q5_K_CARD,
-    engram_gain: BF16_ENGRAM,
-    read_total: READ_TOTAL,
-    read_dense: READ_DENSE,
-    gate_experts: GATE_EXPERTS,
-};
 
 const PUBLIC: FilePins = FilePins {
     a_cards: &[PUB_A_A6000],
@@ -224,13 +148,17 @@ const PUBLIC: FilePins = FilePins {
     gate_experts: 1_146,
 };
 
-/// The pins of the file this run opens ([`workstation::model_v41`]).
+/// The pins of the file this run opens ([`workstation::model_v41`]): the
+/// public file's. Any other file has none, and is refused by name rather
+/// than held to another file's numbers.
 fn file_pins() -> &'static FilePins {
-    if workstation::model_v41() == gguf::v41::PUBLIC {
-        &PUBLIC
-    } else {
-        &MIXED
-    }
+    let path = workstation::model_v41();
+    assert!(
+        path == gguf::v41::PUBLIC,
+        "{path}: the placement gate pins {} only",
+        gguf::v41::PUBLIC
+    );
+    &PUBLIC
 }
 
 /// `v` with thousands separators.

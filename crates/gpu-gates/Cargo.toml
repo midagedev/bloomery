@@ -27,9 +27,9 @@ oxide-artifacts = { workspace = true, features = ["object-read"] }
 # The KLD base reader (`kld.rs`) maps ik's base file, a gigabyte at the stock size, instead of
 # reading it into memory: the workspace's memmap2, the copy gguf maps the model file with.
 memmap2.workspace = true
-# Optional for the same reason as gpu-spike: with the feature off this package
-# has no edge to the device crate, so plain cargo never resolves the
-# embedded-bundle anchor symbol.
+# Optional on purpose: with the feature off this package has no edge to the
+# device crate at all, so plain `cargo build`/`cargo test` never resolve the
+# embedded-bundle anchor symbol (which only the cargo-oxide backend defines).
 bloomery-gpu = { path = "../gpu", optional = true }
 # The V4.1 device crate, reached only through the `deepseek41` feature (the V4.1 op gates): a
 # compiler failure in V4.1 device code then breaks those gates' builds and no other.

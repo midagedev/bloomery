@@ -116,15 +116,10 @@
 //! The binary owns its main thread, so it pins it to the dispatcher's cpu
 //! slot (`threads::pool().pin_caller()`), as `bloomery-decode` and
 //! `bench_v41_host` do; `BLOOMERY_PIN_MAIN=0` leaves it floating, for the
-//! A/B. The `load` line prints both the ask and the outcome, and
-//! `launch_thread=` whether `BLOOMERY_LAUNCH_THREAD=1` gave the replays'
-//! launches their own thread, and `launch_cpu=` where it runs: the SMT
-//! sibling of the pinned main thread's cpu, or `float` beside
-//! `BLOOMERY_PIN_MAIN=0`.
+//! A/B. The `load` line prints both the ask and the outcome.
 //!
 //! `BLOOMERY_STEP_STATS=1` reads, after every generated step, the host
-//! tier's counters (`HybridStats`), the replays' launch costs
-//! (`LaunchStats`), the process's page faults (`getrusage`)
+//! tier's counters (`HybridStats`), the process's page faults (`getrusage`)
 //! and the card's free device bytes (`cuMemGetInfo`), and prints one
 //! `stat step` line per step and a `stat summary` over the steps `--warm`
 //! keeps, after the loop, as the `time` lines are. The summary's
@@ -206,7 +201,7 @@ mod drive {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::head::Head;
     use bloomery_gpu::hybrid::HybridStats;
-    use bloomery_gpu::model::{LaunchStats, StepMode};
+    use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_gates::draft::Lookup;
@@ -517,7 +512,7 @@ mod drive {
             )
             .into());
         }
-        let load = Record::new(&record::LOAD)
+        Record::new(&record::LOAD)
             .u("resident_bytes", m.resident_bytes())
             .w("shadow", "host")
             .u("shadow_bytes", shadow.bytes)
@@ -528,26 +523,19 @@ mod drive {
             .w("mode", mode_name(a.mode))
             .w("place", a.place.name())
             .w("pin_main", if pin_main { "on" } else { "off" })
-            .w("pinned", pinned);
-        let load = match m.launch_thread() {
-            None => load.w("launch_thread", "off"),
-            Some(cpu) => load.w("launch_thread", "on").w(
-                "launch_cpu",
-                cpu.map_or_else(|| "float".to_string(), |c| c.to_string()),
-            ),
-        };
-        load.w(
-            "prefill",
-            if check_finite {
-                "steps"
-            } else {
-                prefill_mode.name()
-            },
-        )
-        .w("ced", m.body("generate_ds41")?.ced())
-        .u("group", m.body("generate_ds41")?.prefill_group_lever())
-        .f("load_s", t.elapsed().as_secs_f64())
-        .print();
+            .w("pinned", pinned)
+            .w(
+                "prefill",
+                if check_finite {
+                    "steps"
+                } else {
+                    prefill_mode.name()
+                },
+            )
+            .w("ced", m.body("generate_ds41")?.ced())
+            .u("group", m.body("generate_ds41")?.prefill_group_lever())
+            .f("load_s", t.elapsed().as_secs_f64())
+            .print();
         if let Some(h) = m.host_residency() {
             for r in record::host_residency(h) {
                 r.print();
@@ -1532,7 +1520,6 @@ mod drive {
     #[derive(Clone, Copy)]
     struct Probe {
         hybrid: HybridStats,
-        launch: LaunchStats,
         eng: bloomery_gpu_deepseek41::chain::glue::EngramStats,
         eng_helper: Option<Option<usize>>,
         majflt: u64,
@@ -1544,7 +1531,6 @@ mod drive {
         fn read(m: &Deepseek41Model) -> Result<Probe, GateError> {
             let body = m.body("generate_ds41")?;
             let hybrid = body.hybrid().stats();
-            let launch = m.launch_stats();
             let eng = body.step_rows().engram_stats();
             let eng_helper = body.step_rows().helper_cpu();
             let stage = m
@@ -1564,7 +1550,6 @@ mod drive {
             }
             Ok(Probe {
                 hybrid,
-                launch,
                 eng,
                 eng_helper,
                 majflt: u64::try_from(ru.ru_majflt)?,
@@ -1591,13 +1576,8 @@ mod drive {
     /// step's rows per layer, summed (`host_slots − overlap`: a one-row step
     /// prints `overlap=0 union=<host_slots>`). The summary's `phi_mean` is
     /// the pooled row overlap over the kept steps, `Σ overlap / Σ` row 1's
-    /// host slots, 0 when no kept step ran two rows. `go_early_first` is the
-    /// step's first service finding its go already landed, `launch_us` the
-    /// step's `cuGraphLaunch` call (on the launch thread under
-    /// `BLOOMERY_LAUNCH_THREAD=1`), `first_serve_lag_us` the time from just
-    /// before the launch was issued to the first service's entry, and
-    /// `launch_wake_us` the launch thread's time from the post to the call
-    /// (0 without it); the summary's `_mean`s are over the kept steps.
+    /// host slots, 0 when no kept step ran two rows; the summary's `_mean`s
+    /// are over the kept steps.
     fn print_stats(probes: &[Probe], warm: usize) {
         let mut legs: Vec<f64> = Vec::with_capacity(probes.len());
         let mut waits: Vec<f64> = Vec::with_capacity(probes.len());
@@ -1606,8 +1586,6 @@ mod drive {
         let mut vram_free_min = u64::MAX;
         let (mut straggle_max, mut slots, mut majflt, mut minflt) = (0.0_f64, 0_u64, 0_u64, 0_u64);
         let (mut overlap_sum, mut row1_sum) = (0_u64, 0_u64);
-        let (mut early_first, mut launch_ns, mut lag_ns, mut wake_ns) =
-            (0_u64, 0_u64, 0_u64, 0_u64);
         for (k, w) in probes.windows(2).enumerate() {
             let i = k + 1;
             let (p, q) = (&w[0].hybrid, &w[1].hybrid);
@@ -1630,10 +1608,6 @@ mod drive {
             let wait_us = (f.wait_ns - e.wait_ns) as f64 / 1e3;
             let helper_ns = f.helper_ns - e.helper_ns;
             let classify_ns = f.classify_ns - e.classify_ns;
-            let early_first_d = q.go_early_first - p.go_early_first;
-            let lag_d = q.first_serve_lag_ns - p.first_serve_lag_ns;
-            let (lp, lq) = (&w[0].launch, &w[1].launch);
-            let (launch_d, wake_d) = (lq.launch_ns - lp.launch_ns, lq.wake_ns - lp.wake_ns);
             Record::new(&record::STAT_STEP)
                 .u("i", i)
                 .flag("warm", i <= warm)
@@ -1656,16 +1630,8 @@ mod drive {
                 .f("eng_wait_us", wait_us)
                 .f("eng_helper_us", helper_ns as f64 / 1e3)
                 .f("eng_classify_us", classify_ns as f64 / 1e3)
-                .u("go_early_first", early_first_d)
-                .f("launch_us", launch_d as f64 / 1e3)
-                .f("first_serve_lag_us", lag_d as f64 / 1e3)
-                .f("launch_wake_us", wake_d as f64 / 1e3)
                 .print();
             if i > warm {
-                early_first += early_first_d;
-                launch_ns += launch_d;
-                lag_ns += lag_d;
-                wake_ns += wake_d;
                 waits.push(wait_us);
                 eng_warm += ew;
                 eng_cold += ec;
@@ -1723,10 +1689,6 @@ mod drive {
                 "eng_classify_us_mean",
                 eng_classify_ns as f64 / 1e3 / n as f64,
             )
-            .f("go_early_first_mean", early_first as f64 / n as f64)
-            .f("launch_us_mean", launch_ns as f64 / 1e3 / n as f64)
-            .f("first_serve_lag_us_mean", lag_ns as f64 / 1e3 / n as f64)
-            .f("launch_wake_us_mean", wake_ns as f64 / 1e3 / n as f64)
             .print();
     }
 }

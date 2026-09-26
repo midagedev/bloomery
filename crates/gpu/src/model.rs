@@ -21,18 +21,19 @@
 //! readback synchronizes.
 
 pub(crate) mod kernels;
-pub(crate) mod launcher;
 pub(crate) mod lookup;
 pub(crate) mod probe;
 
 pub use kernels::{Q8_0GemvHeadsArgs, StepKernels};
-pub use launcher::LaunchStats;
 pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 
 use crate::fault::Fault;
 use crate::head::Head;
-use crate::hybrid::{Chain, HostResidency, HybridConfig, Refusal, host_levers, name_refusal};
+use crate::hybrid::{
+    Chain, HostResidency, HybridConfig, Refusal, ReplayWatch, host_levers, name_refusal,
+    serving_replay,
+};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use cuda_core::CudaStream;
@@ -40,6 +41,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::placement::Plan;
 use std::ops::Range;
+use std::time::Instant;
 
 // -------------------------------------------------------------- chain body
 
@@ -350,12 +352,6 @@ pub struct GpuModel<B: ChainBody> {
     /// first: the lock's spans are pages of the file mappings a stage's body
     /// keeps.
     host: Option<HostResidency>,
-    /// `BLOOMERY_LAUNCH_THREAD=1`'s launch thread for stage 0's stream, from
-    /// open ([`launcher`]); `None` launches on the decode thread. Idle at
-    /// drop: every launch it took was answered before its step returned.
-    launcher: Option<launcher::Launcher>,
-    /// What the replays' launches have cost since load.
-    launch_stats: LaunchStats,
     stages: Vec<Stage<B>>,
     /// KV rows the resident caches were sized for; `step` refuses to grow them.
     ctx_max: usize,
@@ -397,7 +393,6 @@ impl<B: ChainBody> GpuModel<B> {
         let mut weights = Weights::load(gpu.stream(), file, layers.clone(), true)?;
         B::derive(gpu.stream(), file, layers.clone(), &mut weights)?;
         let body = B::load(&gpu, file, &weights, layers.clone(), ctx_max)?;
-        let launcher = launcher::at_open(&gpu.stream)?;
         Ok(GpuModel {
             stages: vec![Stage {
                 gpu,
@@ -412,8 +407,6 @@ impl<B: ChainBody> GpuModel<B> {
             pair_graph: None,
             pair_head: None,
             host: None,
-            launcher,
-            launch_stats: LaunchStats::default(),
             mode: StepMode::Graph,
             pos: 0,
             poisoned: None,
@@ -465,7 +458,6 @@ impl<B: ChainBody> GpuModel<B> {
         let mut weights = B::hybrid_weights(gpu.stream(), &file, 0..n_layers, cfg.n_l)?;
         let body = B::load_hybrid(&gpu, file, &mut weights, 0..n_layers, ctx_max, cfg)?;
         let head = Head::new(&gpu, &weights, body.head_eps())?;
-        let launcher = launcher::at_open(&gpu.stream)?;
         Ok(GpuModel {
             stages: vec![Stage {
                 gpu,
@@ -480,8 +472,6 @@ impl<B: ChainBody> GpuModel<B> {
             pair_graph: None,
             pair_head: None,
             host: None,
-            launcher,
-            launch_stats: LaunchStats::default(),
             mode: StepMode::Graph,
             pos: 0,
             poisoned: None,
@@ -532,7 +522,6 @@ impl<B: ChainBody> GpuModel<B> {
         } else {
             None
         };
-        let launcher = launcher::at_open(&gpu.stream)?;
         Ok(GpuModel {
             stages: vec![Stage {
                 gpu,
@@ -547,28 +536,10 @@ impl<B: ChainBody> GpuModel<B> {
             pair_graph: None,
             pair_head: None,
             host: Some(host),
-            launcher,
-            launch_stats: LaunchStats::default(),
             mode: StepMode::Graph,
             pos: 0,
             poisoned: None,
         })
-    }
-
-    /// With the replays' launches on their own thread
-    /// (`BLOOMERY_LAUNCH_THREAD=1`, read at open), `Some` of where that thread
-    /// runs: the SMT sibling of the opening thread's cpu when that thread was
-    /// pinned to one, `None` when it floats. `None` launches on the decode
-    /// thread.
-    #[must_use]
-    pub fn launch_thread(&self) -> Option<Option<usize>> {
-        self.launcher.as_ref().map(launcher::Launcher::cpu)
-    }
-
-    /// What the replays' launches have cost since load.
-    #[must_use]
-    pub fn launch_stats(&self) -> LaunchStats {
-        self.launch_stats
     }
 
     /// What the load did to the plan's host set — populated, locked — on a
@@ -790,7 +761,6 @@ impl<B: ChainBody> GpuModel<B> {
         for &token in tokens {
             let pos = self.pos;
             self.check_pos(pos, "GpuModel::step")?;
-            self.arm_launcher();
             self.refresh_params(token, pos)?;
             let r = match self.mode {
                 StepMode::Eager => self.enqueue_chain_step(),
@@ -939,7 +909,6 @@ impl<B: ChainBody> GpuModel<B> {
         if self.mode == StepMode::Graph && self.pair_graph.is_none() {
             self.capture_pair()?;
         }
-        self.arm_launcher();
         {
             let (gpu, _, body) = self.body_parts(WHAT)?;
             body.decode_pair(gpu.stream(), [t, t1], pos)?;
@@ -964,25 +933,15 @@ impl<B: ChainBody> GpuModel<B> {
         Ok([a.token(gpu)?, b.token(gpu)?])
     }
 
-    /// Wake the launch thread, if any, ahead of a graph replay's refresh.
-    fn arm_launcher(&self) {
-        if self.mode == StepMode::Graph
-            && let Some(l) = &self.launcher
-        {
-            l.arm();
-        }
-    }
-
     /// Launch the captured `chain` — the one-token step's or the pair's — and
-    /// serve the host's share of the replay ([`launcher::replay`]: the only
-    /// place a replay of either is launched).
+    /// serve the host's share of the replay inside [`serving_replay`], with
+    /// the time the launch was issued as the replay's watch: the only place a
+    /// replay of either is launched.
     fn replay_graph(&mut self, chain: Chain) -> Result<(), GpuError> {
         const WHAT: &str = "GpuModel::replay_graph";
         let GpuModel {
             step_graph,
             pair_graph,
-            launcher,
-            launch_stats,
             stages,
             ..
         } = self;
@@ -997,11 +956,13 @@ impl<B: ChainBody> GpuModel<B> {
         let Some(Residency { body, .. }) = residency.as_mut() else {
             return Err(GpuError::state(WHAT, "stage carries no residency"));
         };
-        launcher::replay(
-            launcher.as_ref(),
-            launch_stats,
-            graph,
-            gpu.stream(),
+        let issued = Instant::now();
+        graph.launch(gpu.stream())?;
+        serving_replay(
+            ReplayWatch {
+                issued,
+                failed: None,
+            },
             || match chain {
                 Chain::Step => body.serve_replay(),
                 Chain::Pair => body.serve_replay_pair(),

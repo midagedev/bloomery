@@ -2,13 +2,13 @@
 # 주석 규약 점검(맥, grep뿐). AGENTS.md Conventions: 주석에 이슈 번호·날짜를 쓰지 않는다 —
 # 이력은 rig-log와 커밋 메시지의 것이다. 예외는 재핀 귀속 한 줄 `PIN(YYYY-MM-DD):`.
 # 대상은 crates/*/src 전부다. 목록이 아니라 제외로 적어서 새 크레이트가 조용히 빠지지 않게 한다. 제외는
-# 스테이지 0 크레이트 q3k-gemv·q3k-cpu·gpu-spike(MUL-10/11의 몫)와 워크스페이스 밖의 재현기 oxide-ice-unroll뿐이다.
+# 워크스페이스 밖의 재현기 oxide-ice-unroll뿐이다.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 dirs=()
 for d in "$ROOT"/crates/*/src; do
   case "$(basename "$(dirname "$d")")" in
-    q3k-gemv | q3k-cpu | gpu-spike | oxide-ice-unroll) ;;
+    oxide-ice-unroll) ;;
     *) dirs+=("$d") ;;
   esac
 done
