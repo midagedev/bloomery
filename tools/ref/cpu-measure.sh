@@ -19,8 +19,8 @@ RUST=${BLOOMERY_CPU_RUST:-target/release/q3k-cpu}
 WITNESS=(head loadavg pressure-cpu pressure-io gpus lock-holder model)
 lease_take
 witness pre-ref
-"$BLOOMERY_DATA/bin/q3k_cpu_ref"
+lease_bounded "$LEASE_ARM_BOUND" "$BLOOMERY_DATA/bin/q3k_cpu_ref"
 witness post-ref
 witness pre-rust
-"$RUST"
+lease_bounded "$LEASE_ARM_BOUND" "$RUST"
 witness post-rust

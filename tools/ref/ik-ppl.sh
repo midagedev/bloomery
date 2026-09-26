@@ -47,8 +47,11 @@
 # a file its working diff touches (`git diff --name-only HEAD`) — a stale build is a wrong number, not a
 # missing one — and a binary that would load either library from outside the tree.
 #
-# The run takes the machine-wide CPU lease, prints a witness block before and after (the idiom of
-# dump.sh and host-rate.sh), and is bounded by `timeout`: IK_PPL_BOUND seconds, default 1500. While it
+# The run takes the machine-wide CPU lease through lease_take (tools/ref/lease.sh), so it needs a card:
+# BLOOMERY_LEASE_CARD=docs/cards/<slug>.card through BLOOMERY_BOX_ENV, written for that run (two trees
+# compared is a `baseline` or `calibration` card with a band). It prints a witness block before and
+# after (lease.sh's fields, then this run's tree, binary and model), and is bounded by `timeout`:
+# IK_PPL_BOUND seconds, default 1500. While it
 # runs, the pid it runs under is in $BLOOMERY_DATA/ikppl/<tag>.pid (`timeout` passes a signal on);
 # nothing here signals a pid found by a pattern. The last line is the result:
 #
@@ -66,6 +69,8 @@ set -euo pipefail
 CALLER_MODEL=${MODEL:-}
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 MODEL=${CALLER_MODEL:-$MODEL}
 
 usage() { sed -n '2,19p' "${BASH_SOURCE[0]}" >&2; exit 64; }
@@ -221,36 +226,22 @@ say "ik-ppl.sh: tag $TAG, tree $TREE at $HEAD_REV, $NDIRTY changed file(s)${dirt
 say "  $BUILD_ID"
 say "  model $MODEL"
 
-# witness <tag>: the machine state the lease is supposed to guarantee. The device is the one the model
-# file lives on; its sector count is machine-wide, so under the lease the difference between the two
-# blocks is what this run paged in.
-witness() {
-  local dev sectors
-  dev=$(df --output=source "$MODEL" 2>/dev/null | tail -n 1) || true
-  sectors=$(awk '{print $3}' "/sys/class/block/${dev#/dev/}/stat" 2>/dev/null || echo '?')
+# ppl_witness <tag>: the machine state the lease is supposed to guarantee — lease.sh's fields (the model
+# file's device read-sectors are machine-wide, so under the lease the difference between the two blocks is
+# what this run paged in) — then this run's tree, binary and model, into the log as well.
+WITNESS=(head-epoch loadavg pressure-cpu pressure-io mem pgmajfault read-sectors cpu-mhz-range gpu-apps lock-holder)
+ppl_witness() {
   {
-    echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) epoch $(date +%s) ---"
-    echo "loadavg: $(cat /proc/loadavg)"
-    echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
-    echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-    echo "mem: $(grep -E '^(MemAvailable|Cached):' /proc/meminfo | tr -s ' ' | tr '\n' ' ')"
-    echo "pgmajfault: $(awk '$1 == "pgmajfault" {print $2}' /proc/vmstat)"
-    echo "read-sectors: $sectors ($dev, 512 B each)"
-    echo "cpu-mhz min/max: $(awk '$1 == "cpu" && $2 == "MHz" { if (lo == "" || $4 < lo) lo = $4; if ($4 > hi) hi = $4 } END { print lo, hi }' /proc/cpuinfo)"
-    echo "gpu-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null | tr '\n' ';')]"
-    echo "lock-holder-pid: $$"
+    witness "$1"
     echo "tree: $TREE head=$HEAD_REV dirty_files=$NDIRTY"
     echo "binary: $BUILD_ID"
     echo "model: $MODEL"
   } | tee -a "$LOG"
 }
 
-LOCK=/root/bloomery-cpu.lock
-exec 9>"$LOCK"
-say "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { say "[lease] timed out after 30 min"; exit 75; }
-say "[lease] acquired $(date -u +%H:%M:%SZ)"
-witness pre-ppl
+lease_take
+echo "[lease] held by pid $$ at $(now), card $BLOOMERY_LEASE_CARD sha256=$(sha256sum "$LEASE_TREE/$BLOOMERY_LEASE_CARD" | cut -c1-64)" >> "$LOG"
+ppl_witness pre-ppl
 
 MODE_ARGS=()
 if [ -n "$UBATCH" ]; then
@@ -275,8 +266,8 @@ say "ik-ppl.sh: llama-perplexity under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/
 wait "$pid" || rc=$?
 t1=$(date +%s)
 rm -f "$PIDFILE"
-witness post-ppl
-exec 9>&-
+ppl_witness post-ppl
+lease_release
 cat "$OUT" >> "$LOG"
 
 if [ "$rc" != 0 ]; then

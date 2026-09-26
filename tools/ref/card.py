@@ -62,12 +62,12 @@ half-width of a difference of two arm means at N rounds per arm,
 
     h = t(0.975, 2N - 2) * sd * sqrt(2 / N)
 
-the pooled two-sample interval tools/gpu-ab.py reports (its t table is the one used here), which is
-the form that gives AGENTS.md's ±1.0 % at four rounds and ±0.8 % at six with sd 0.6 % — the normal
-quantile 1.96 in place of t gives 0.83 % and 0.68 %. The card is refused (CARD_UNDER_RULER) when the
-band's edge nearest zero is inside h, |edge| <= h; a band that contains 0 has its nearest edge at 0,
-and no round count resolves it. The refusal names the smallest N that resolves the band and, given
---round-minutes, the box minutes those rounds cost.
+the pooled two-sample interval tools/gpu-ab.py reports (both read the t table in
+tools/ref/tdist.py), which is the form that gives AGENTS.md's ±1.0 % at four rounds and ±0.8 % at
+six with sd 0.6 % — the normal quantile 1.96 in place of t gives 0.83 % and 0.68 %. The card is
+refused (CARD_UNDER_RULER) when the band's edge nearest zero is inside h, |edge| <= h; a band that
+contains 0 has its nearest edge at 0, and no round count resolves it. The refusal names the smallest
+N that resolves the band and, given --round-minutes, the box minutes those rounds cost.
 
 Exit codes (never 75, which is lease contention):
    0  the card passes
@@ -77,7 +77,7 @@ Exit codes (never 75, which is lease contention):
                         tree, an example card, or no such file; (check) no such file
   67  CARD_UNDECIDABLE  the three decisions are one action
   68  CARD_UNDER_RULER  an ab card's predicted effect is inside the ruler at its rounds
-  70  the t table in tools/gpu-ab.py does not load
+  70  the t table in tools/ref/tdist.py does not load
 """
 import hashlib
 import importlib.util
@@ -230,13 +230,13 @@ def fold(text):
 
 
 def t_table():
-    path = os.path.join(TREE, 'tools', 'gpu-ab.py')
+    path = os.path.join(TREE, 'tools', 'ref', 'tdist.py')
     try:
-        spec = importlib.util.spec_from_file_location('gpu_ab', path)
+        spec = importlib.util.spec_from_file_location('tdist', path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module.t975
-    except Exception as e:  # a missing or broken gpu-ab.py must stop the check, never skip it
+    except Exception as e:  # a missing or broken tdist.py must stop the check, never skip it
         print(f'card.py: the t table ({path}, t975) does not load: {e}', file=sys.stderr)
         sys.exit(SOFTWARE)
 

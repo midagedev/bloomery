@@ -178,7 +178,7 @@ if [ "$FORM" = gemm ]; then
   [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
   if [ -s "$out.csv" ]; then
     echo "--- summary (median over the collected launches; the durations are not numbers of record). Raw: $out.csv"
-    python3 - "$out.csv" <<'PY'
+    lease_bounded "$LEASE_ARM_BOUND" python3 - "$out.csv" <<'PY'
 import csv, statistics, sys
 rows = [r for r in csv.reader(open(sys.argv[1])) if len(r) > 14 and r[0] not in ("ID", "")]
 by, shape, ids = {}, {}, {}
@@ -316,7 +316,7 @@ if [ "$FORM" = ds41pp ]; then
   plan_args=("$TRACE" "$P" "$RUNLOG" "$out.plan")
   [ -z "${BLOOMERY_NCU_LAYER:-}" ] || plan_args+=(--layer "$BLOOMERY_NCU_LAYER")
   echo "[plan] from $TRACE"
-  python3 "$PP" ncu-plan "${plan_args[@]}" || exit $?
+  lease_bounded "$LEASE_ARM_BOUND" python3 "$PP" ncu-plan "${plan_args[@]}" || exit $?
   pp_cmd "$(sed -n 's/^skip=//p' "$out.plan")" "$(sed -n 's/^count=//p' "$out.plan")" "$(sed -n 's/^regex=//p' "$out.plan")"
   SKIP=$(sed -n 's/^skip=//p' "$out.plan")
   COUNT=$(sed -n 's/^count=//p' "$out.plan")
@@ -340,7 +340,7 @@ if [ "$FORM" = ds41pp ]; then
     [ $rc -ne 0 ] || rc=3
   elif [ -s "$out.csv" ]; then
     echo "--- summary. Raw: $out.csv, the plan $out.plan, the run $out.txt"
-    python3 "$PP" ncu-summary "$out.csv" "$out.plan" "$MODEL"
+    lease_bounded "$LEASE_ARM_BOUND" python3 "$PP" ncu-summary "$out.csv" "$out.plan" "$MODEL"
     prc=$?
     [ $prc -eq 0 ] || [ $rc -ne 0 ] || rc=$prc
   else
@@ -391,7 +391,7 @@ for d in $DEPTHS; do
   echo "=== 깊이 $d (ctx $ctx, mode $MODE, launch-skip $skip = ($d + $SKIP_STEPS) × $PER_STEP) → $out.txt"
   witness "pre d=$d"
   # -n 3: 프롬프트로 캐시를 채운 뒤 피드백 스텝 둘. 런치 수집은 --launch-count가 끊는다.
-  "$NCU" --target-processes application-only --clock-control base \
+  lease_bounded "$LEASE_ARM_BOUND" "$NCU" --target-processes application-only --clock-control base \
          --graph-profiling node --launch-skip "$skip" --launch-count "$COUNT" \
          "${kern_args[@]}" "${sec_args[@]}" "${met_args[@]}" \
          --csv --log-file "$out.csv" \
@@ -404,7 +404,7 @@ for d in $DEPTHS; do
   # 사람이 읽는 요약. 원본 CSV는 런치마다 한 줄씩이라 커널별로 중앙값을 낸다 —
   # 평균이 아니라 중앙값인 이유는 첫 런치가 콜드 캐시를 지고 오기 때문이다.
   echo "--- 요약(커널별 런치 중앙값). 원본은 $out.csv"
-  python3 - "$out.csv" "${BLOOMERY_NCU_TOTALS:-}" <<'PY'
+  lease_bounded "$LEASE_ARM_BOUND" python3 - "$out.csv" "${BLOOMERY_NCU_TOTALS:-}" <<'PY'
 import csv, statistics, sys
 KEEP = ("Duration", "gpu__time_duration.sum", "Compute (SM) Throughput", "Memory Throughput", "DRAM Throughput",
         "Achieved Occupancy", "Theoretical Occupancy", "Block Limit Registers",

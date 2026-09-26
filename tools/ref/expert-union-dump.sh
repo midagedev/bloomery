@@ -15,7 +15,7 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 lease_take
 grep -v '^#' "$REF_PROMPTS" | while IFS=$'\t' read -r id _text toks; do
   [ -n "$toks" ] || continue
-  BLOOMERY_EXPERT_LOG="$OUT/$id.experts" "$BIN" -m "$MODEL" --tokens "$toks" -n "$N" > "$OUT/$id.out" 2>&1 \
+  lease_bounded "$LEASE_ARM_BOUND" env BLOOMERY_EXPERT_LOG="$OUT/$id.experts" "$BIN" -m "$MODEL" --tokens "$toks" -n "$N" > "$OUT/$id.out" 2>&1 \
     || { echo "prompt $id failed" >&2; exit 1; }
   echo "$toks" > "$OUT/$id.prompt"
   grep '^generated' "$OUT/$id.out" > "$OUT/$id.gen"

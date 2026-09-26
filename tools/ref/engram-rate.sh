@@ -36,5 +36,5 @@ WITNESS=(head table loadavg pressure-io blockstat meminfo lock-holder model)
 lease_take
 witness pre
 # 임대 안이라고 바이너리에 말해 준다 — 없으면 줄마다 [not under lease]가 찍힌다.
-BLOOMERY_ENGRAM_LEASE=1 "$BIN" --model-dir "$DIR" "$@"
+lease_bounded "$LEASE_ARM_BOUND" env BLOOMERY_ENGRAM_LEASE=1 "$BIN" --model-dir "$DIR" "$@"
 witness post

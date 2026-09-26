@@ -42,16 +42,12 @@ import subprocess
 import sys
 import time
 
+# The t table: tools/ref/tdist.py, the one card.py and the depth runners read too.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'ref'))
+from tdist import t975  # noqa: E402
+
 INSTRUMENTS = {'time-gpu-v41': 'v41', 'time-gpu-generate': 'generate'}
-# Two-sided 95 % t quantiles, df 1..30; past 30, 1.96 + 2.4/df is within 0.003 of the table.
-T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
-        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
-        2.052, 2.048, 2.045, 2.042]
 KV = re.compile(r'(\S+?)=(\S+)')
-
-
-def t975(df):
-    return T975[df - 1] if df <= 30 else 1.96 + 2.4 / df
 
 
 def describe(xs):

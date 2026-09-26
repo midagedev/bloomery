@@ -202,6 +202,13 @@ source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
+# The t quantiles of the ratio intervals, df 1..ROUNDS: tools/ref/tdist.py, the table gpu-ab.py and
+# card.py read.
+T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
+  rc=$?
+  echo "depth-ds41.sh: tools/ref/tdist.py gave no t quantiles for ROUNDS=$ROUNDS (rc $rc; ROUNDS is a positive integer)" >&2
+  exit "$rc"
+}
 # Each engine's binary matters only to its own arms: a reference-only run neither builds ours (the
 # recipe skips the build) nor reads it, so its freshness is not asked. A dry run asks nothing of
 # our binary: it prints the command line it would run.
@@ -445,16 +452,16 @@ ours_arm() {
 
 # ratio_table <prefix> <keys> <labels> <tagged>: records `label|key|round|value|extra` on stdin; for
 # every key and every label but ours, each round's ours / label ratio (arms that ran more than once
-# in a round averaged first), their mean with its 95 % interval (Student t, rounds - 1 degrees of
-# freedom; 2.0 past 21 rounds) and the ratio of the arm means. With tagged = 1 the extra field is
+# in a round averaged first), their mean with its 95 % interval (Student t at rounds - 1 degrees of
+# freedom, T975) and the ratio of the arm means. With tagged = 1 the extra field is
 # the row's contention tags, and the line ends with each side's count of them.
 ratio_table() {
-  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v rounds="$ROUNDS" '{
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v tagged="$4" -v rounds="$ROUNDS" -v t975="$T975" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
   if (tagged) { if ($5 ~ /cpu-busy/) bc[a]++; if ($5 ~ /other-busy/) bo[a]++ }
 } END {
-  split("12.706 4.303 3.182 2.776 2.571 2.447 2.365 2.306 2.262 2.228 2.201 2.179 2.160 2.145 2.131 2.120 2.110 2.101 2.093 2.086", t, " ")
+  nt = split(t975, t, " ")
   nd = split(deps, d, " ")
   nr = split(refs, rf, " ")
   for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
@@ -470,7 +477,9 @@ ratio_table() {
     if (c == 0) continue
     m /= c; ss = 0
     for (x = 1; x <= c; x++) ss += (v[x] - m) ^ 2
-    ci = (c > 1) ? sprintf("± %.4f", ((c - 1 <= 20) ? t[c - 1] : 2.0) * sqrt(ss / (c - 1)) / sqrt(c)) : "(one round: no interval)"
+    if (c < 2) ci = "(one round: no interval)"
+    else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
+    else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
     ao = "ours" SUBSEP d[i]; ar = ref SUBSEP d[i]
     busy = tagged ? sprintf("  busy: ours [cpu-busy %d/%d] [other-busy %d/%d], %s [cpu-busy %d/%d] [other-busy %d/%d]", bc[ao], an[ao], bo[ao], an[ao], ref, bc[ar], an[ar], bo[ar], an[ar]) : ""
     printf "%s%-5s ours/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s\n", prefix, d[i], ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy

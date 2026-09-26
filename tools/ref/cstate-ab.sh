@@ -23,6 +23,10 @@ source "${BASH_SOURCE[0]%/*}/lease.sh"
 ROUNDS=${1:?usage: cstate-ab.sh <rounds> <command...>}
 shift
 [ $# -gt 0 ] || { echo "usage: cstate-ab.sh <rounds> <command...>" >&2; exit 64; }
+# A leading zero is refused with the rest: bash arithmetic would read 08 as octal.
+case $ROUNDS in
+  '' | *[!0-9]* | 0*) echo "cstate-ab: ROUNDS is a positive integer, got '$ROUNDS'" >&2; exit 64 ;;
+esac
 KEEP=${CSTATE_AB_KEEP:-'^SMOKE|^time |mech='}
 STATE=${CSTATE_AB_STATE:-state2}
 FILES=(/sys/devices/system/cpu/cpu[0-9]*/cpuidle/"$STATE"/disable)

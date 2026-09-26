@@ -55,7 +55,7 @@ for r in $(seq "$ROUNDS"); do
     esac
     # env 팔의 "K=V K2=V2"를 단어로 나눠 넘긴다 — depth-gpu.sh의 arm_env와 같은 철자(글롭 전개 없음).
     read -r -a e_args <<< "$e"
-    out=$(env ${e_args[@]+"${e_args[@]}"} "$(decode_bin "$d")" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; exit 1; }
+    out=$(lease_bounded "$LEASE_ARM_BOUND" env ${e_args[@]+"${e_args[@]}"} "$(decode_bin "$d")" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1) || { echo "r$r $label FAILED" >&2; echo "$out" | tail -n 5 >&2; exit 1; }
     toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
     pre=$(echo "$out" | grep -E '^prefill' | sed 's/.*= //')
     med=$(echo "$out" | awk '/^ +[0-9]+ +[0-9]+ +[0-9.]+ /{print $3}' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')
@@ -69,7 +69,7 @@ for r in $(seq "$ROUNDS"); do
   if [ "${BLOOMERY_AB_IK:-0}" = 1 ]; then
     # 분할이 의도다: IK_BEST_FLAGS는 플래그 여럿을 담은 한 문자열이고 호출자가 그 모양으로 덮어쓴다.
     # shellcheck disable=SC2086
-    ik=$(CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 1 $IK_BEST_FLAGS 2>&1 | grep -E "tg$N" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
+    ik=$(lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 1 $IK_BEST_FLAGS 2>&1 | grep -E "tg$N" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
     [ -n "$ik" ] || { echo "r$r ik produced no tg$N line" >&2; exit 1; }
     echo "r$r ik[$IK_BEST_FLAGS] | decode $ik tok/s"
   fi

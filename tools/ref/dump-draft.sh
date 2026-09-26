@@ -96,7 +96,9 @@ mkdir -p "$ROOT"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 t0=$(date +%s)
-env GGML_CUDA_NO_PINNED_WEIGHTS=1 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" \
+# Bounded like dump.sh's dumper (BLOOMERY_DUMP_BOUND, default 1800 s — five times the V4.1 CPU dump on
+# record, rig-log 2026-09-23): a hung dumper must end rather than hold the lease.
+lease_bounded "${BLOOMERY_DUMP_BOUND:-1800}" env GGML_CUDA_NO_PINNED_WEIGHTS=1 BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" \
   BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
   "$BIN" -m "$MODEL" -md "$DRAFT_MODEL" --expect-arch deepseek41 --expect-draft-arch dflash \
     --tokens-file "$TOKENS_FILE" --tokens-count "$N_PROMPT" -n "$N_PREDICT" --spec-type "$SPEC" \

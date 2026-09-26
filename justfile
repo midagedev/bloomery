@@ -6,6 +6,9 @@
 # (2026-09-19 ffn 라운드가 보고: "gate-ffn은 ~/repo/bloomery로 가는데 이 워크트리는
 # ~/repo/bloomery-ffn으로 rsync된다. 둘 다 박스에 있어서 엉뚱한 트리를 시험한다").
 
+# The card check a timed recipe runs first in its box command, before any build (tools/ref/card-precheck.sh).
+precheck := 'bash tools/ref/card-precheck.sh'
+
 default:
     @just --list
 
@@ -126,7 +129,7 @@ forced-probe ID STEP *ARGS:
 # 한 프롬프트를 푼다: 스텝마다 정확 top1·마진·ik 토큰 격차. 두 엔진(우리, ik)이 갈리는 자리의 심판이다.
 # CPU 64스레드를 쓰므로 기계 전역 임대를 잡는다. 예: `just exact-ref 12 --steps 23`, `--kv f16`은 캐시 f16 반올림 팔.
 exact-ref ID *ARGS:
-    ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin exact_ref && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} {{ARGS}}'
+    ./tools/box.sh '{{precheck}} docs/cards/exact-ref.card && cargo build --release -p bloomery-gpu-gates --bin exact_ref && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} {{ARGS}}'
 
 # gate-gpu-e2e 교사 강제 팔의 참값 파일: prompts.tsv의 프롬프트마다 exact_ref --emit(32스텝 전부)을 돌려
 # $BLOOMERY_DATA/exact-forced-32.tsv 하나로 모은다. 머리 주석에 모델 경로, 강제 토큰 파일(greedy-ik-cuda-32.tsv)의
@@ -140,6 +143,7 @@ build-exact-forced:
     commit=$(git describe --always --dirty --abbrev=12)
     script=$(cat <<'EOF'
     set -euo pipefail
+    {{precheck}} docs/cards/exact-ref.card
     cargo build --release -p bloomery-gpu-gates --bin exact_ref
     out="$BLOOMERY_DATA/exact-forced-32.tsv"
     forced="$BLOOMERY_DATA/greedy-ik-cuda-32.tsv"
@@ -148,7 +152,7 @@ build-exact-forced:
     mkdir -p "$parts"
     cp target/release/exact_ref "$parts/exact_ref"
     for id in $ids; do
-      flock -w 3600 /root/bloomery-cpu.lock "$parts/exact_ref" --prompt-id "$id" --emit "$parts/p$id.tsv" > "$parts/p$id.log"
+      bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- "$parts/exact_ref" --prompt-id "$id" --emit "$parts/p$id.tsv" > "$parts/p$id.log"
       echo "exact-forced p$id rows=$(grep -vc '^#' "$parts/p$id.tsv")"
     done
     heads=$(for id in $ids; do head -n 1 "$parts/p$id.tsv"; done | sort -u)
@@ -171,7 +175,7 @@ build-exact-forced:
 # exact_ref가 세 팔을 CPU 임대 아래 차례로 덤프하고(프롬프트당 팔 하나 약 1.5분), forced_probe가 그 셋과 대조한다.
 # 덤프와 exact_ref 로그는 박스 target/exact-taps/ID-STEP/. 예: `just exact-taps 12 23`.
 exact-taps ID STEP:
-    ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin exact_ref && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && D=target/exact-taps/{{ID}}-{{STEP}} && mkdir -p $D && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act f64 --dump $D/f64 > $D/f64.log && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ours --dump $D/ours > $D/ours.log && flock -w 3600 /root/bloomery-cpu.lock ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ik --dump $D/ik > $D/ik.log && grep -H "top5" $D/f64.log $D/ours.log $D/ik.log && BLOOMERY_FLASH_MMA=0 bash tools/gpu-gate.sh forced_probe --prompt-id {{ID}} --step {{STEP}} --dump $D/scalar --against $D/f64,$D/ours,$D/ik'
+    ./tools/box.sh '{{precheck}} docs/cards/exact-ref.card && cargo build --release -p bloomery-gpu-gates --bin exact_ref && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin forced_probe && D=target/exact-taps/{{ID}}-{{STEP}} && mkdir -p $D && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act f64 --dump $D/f64 > $D/f64.log && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ours --dump $D/ours > $D/ours.log && bash tools/ref/lease-hold.sh --card docs/cards/exact-ref.card -- ./target/release/exact_ref --prompt-id {{ID}} --steps {{STEP}} --act ik --dump $D/ik > $D/ik.log && grep -H "top5" $D/f64.log $D/ours.log $D/ik.log && BLOOMERY_FLASH_MMA=0 bash tools/gpu-gate.sh forced_probe --prompt-id {{ID}} --step {{STEP}} --dump $D/scalar --against $D/f64,$D/ours,$D/ik'
 
 # 얇은 끝-끝 디코드 CLI(greedy, 토큰 하나씩, 프리필 커널 없음). `--time` 없이 토큰만 찍는 것은
 # 평범한 실행이고, `--time`은 측정이라 임대가 필요하다 — time-gpu-generate가 그쪽이다.
@@ -181,7 +185,7 @@ generate *ARGS:
 # generate의 스텝당 ms(리드 전용): 기계 전역 임대 아래, 증인 블록 전후. 기록이 되는 것은 graph 모드의
 # 푸터이고 eager 모드는 호스트 제출 경로의 값이다.
 time-gpu-generate *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/time-gate.sh generate {{ARGS}} --time'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate && bash tools/ref/time-gate.sh generate {{ARGS}} --time'
 
 # P0b: 블록 0 FFN 융합 스파이크 — 융합 4런치가 op 8런치와 비트 동일한지(정확성 실행). 시간은 리드가 임대 안에서 `--time`으로 잰다.
 gate-gpu-p0b *ARGS:
@@ -189,23 +193,23 @@ gate-gpu-p0b *ARGS:
 
 # P0b 시간(리드 전용): 기계 전역 임대 아래 op 8노드 대 융합 4노드 그래프의 재생 µs, 빈 커널 4/8노드 참조 포함, 증인 블록 전후.
 time-gpu-p0b:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/ref/time-gate.sh gate_p0b'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p0b && bash tools/ref/time-gate.sh gate_p0b'
 
 # P8a 블록 0 스텝(ctx_max 64에서 21노드 — fuse1 뒤; 한 구간보다 큰 캐시에서는 flash_merge가 붙어 22)의 재생 µs — 임대·증인, 리드 전용.
 time-gpu-p8:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8'
 
 # P8 op별 프로파일(리드 전용): 스텝을 op 단위로 동기 분해한 µs 표(ops=그래프 노드 수와 동일) + sync_floor
 # 보정 + refresh_params 호스트 시간 + 같은 프로세스의 그래프 재생 µs + 어텐션/FFN 분할. 임대·증인은 time-gate.sh 소유.
 prof-gpu-p8:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --profile'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --profile'
 
 # 커널 런치당 실제 비용(리드 전용): op별 표가 답할 수 없는 것 — 한 행의 net_us가 디바이스 시간인지
 # 프로파일 자신의 제출 경로인지 — 를 두 갈래로 가른다. eager는 N런치 뒤 동기화 하나(호스트 제출과
 # 디바이스 시간 중 큰 쪽), graph는 같은 N런치를 그래프 하나로 캡처해 재생(스텝의 그래프 노드가 실제로
 # 무는 값). 빈 커널 touch가 둘의 바닥이고, f32 gemv는 행 수 셋에서 같은 프로세스로 잰다. 임대·증인은 time-gate.sh 소유.
 bench-gpu-kernels *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --bench-kernels {{ARGS}}'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 && bash tools/ref/time-gate.sh gate_p8 --bench-kernels {{ARGS}}'
 
 # The grouped GEMM's counters (ncu, A6000, under the lease, lead-only): gate_p8 --bench-kernels --bench-arm ARM (default
 # gemm_q4k_moe_t4096: 128 experts of 768 x 2048 Q4_K, top-8, T = 4096) runs that one arm, and ncu takes 16 of its eager
@@ -214,7 +218,7 @@ bench-gpu-kernels *ARGS:
 # 55-65 % and the top unit, about 1.29e8 LSU data-pipe wavefronts a launch, issue-active 35-40 %, tensor 22-26 %, DRAM
 # 10-15 %. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
 ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
-    ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
+    ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8; fi && BLOOMERY_NCU_FORM=gemm BLOOMERY_NCU_GEMM_ARM={{ARM}} bash tools/ref/ncu-gpu.sh'
 
 # The V4.1 prompt projections' counters (ncu, A6000, under the lease, lead-only): one launch each of the joined qkv, q_b,
 # wo_a heads and wo_b at m = 8 in the middle full chunk of a layer >= 2 of a P-token prompt (default 512). The launch skip
@@ -223,7 +227,7 @@ ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
 # block-step cycles and each unit's demand in cycles. The header of tools/ref/ncu-gpu.sh has the form. Under
 # BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
 ncu-gpu-ds41-pp P='512':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NCU_FORM=ds41pp BLOOMERY_NCU_PROMPT={{P}} bash tools/ref/ncu-gpu.sh'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NCU_FORM=ds41pp BLOOMERY_NCU_PROMPT={{P}} bash tools/ref/ncu-gpu.sh'
 
 # V4.1 한 토큰이 GPU에서 내는 gemv 사이트 21개의 벤치(bench_v41) — 정확성 실행이고 시간은 재지 않는다. attn_output_a는 값매김 팔
 # 셋으로 들어 있다(그룹마다 한 번씩, 밀집 등가 한 번, q8_0_gemv_heads 한 번).
@@ -238,7 +242,7 @@ bench-gpu-v41-check:
 # 묶음 attn_output_a, 밀집 등가, heads 한 번)과 노드 수가 같은 빈 그래프. 대조가 빨강이면 재지 않는다. 임대·증인·A6000 고정은
 # time-gate.sh가 쥔다.
 time-gpu-v41:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bench_v41 && bash tools/ref/time-gate.sh bench_v41'
 
 # 캡처된 그래프가 호스트 스레드에 일을 넘기고 기다리는 방식 다섯 × 결과를 받는 팔 둘의 벤치(bench_join) — 정확성 실행이다.
 # 방식은 블로킹 호스트 노드(넘기는 노드와 기다리는 노드 한 쌍, 그리고 일을 통째로 하는 노드 하나), 스핀 호스트 노드,
@@ -250,18 +254,18 @@ bench-gpu-join-check *ARGS:
 # 같은 벤치의 시간(리드 전용): 방식·팔마다 일이 없는 왕복(P 끝 → C 시작, `%globaltimer`), 호스트 일·GPU 일 격자에서 겹친
 # 몫, 스핀하는 쪽이 태우는 CPU. 임대·증인·A6000 고정은 time-gate.sh가 쥔다.
 time-gpu-join *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/ref/time-gate.sh bench_join --time {{ARGS}}'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin bench_join && bash tools/ref/time-gate.sh bench_join --time {{ARGS}}'
 
 # 유휴 상태 A/B(리드 전용): 가장 깊은 cpuidle 상태(이 박스의 C2, 깨는 데 18 µs)를 모든 CPU에서 켠 팔과 끈 팔을
 # 한 임대 안에서 번갈아 잰다. 명령은 A6000에 고정돼 라운드마다 팔 순서를 바꿔 돌고, 원래 값은 모든 종료 경로에서
 # 되돌린다. 예: `just cstate-ab 6 env BLOOMERY_HYBRID_NL=32 target/release/generate -n 64 --time`,
 # `just cstate-ab 3 target/release/bench_join --time`.
 cstate-ab ROUNDS *CMD:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate --bin bench_join && bash tools/ref/cstate-ab.sh {{ROUNDS}} {{CMD}}'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate --bin bench_join && bash tools/ref/cstate-ab.sh {{ROUNDS}} {{CMD}}'
 
 # MoE 융합 op 8노드 대 융합 4노드의 재생 µs — 임대·증인, 리드 전용.
 time-gpu-moe:
-    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/ref/time-gate.sh gate_moe_fused'
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && bash tools/ref/time-gate.sh gate_moe_fused'
 
 # P8: 조립된 디코드 스텝(블록 0부터)을 덤프와 대조 — 엔진 자신의 탭.
 gate-gpu-p8 *ARGS:
@@ -330,7 +334,7 @@ measure-cpu: build-ref-bench build-cpu
 # qdot 커널률(리드 전용): ik 자신의 x4 커널과 Rust qdot-rate를 같은 CPU 임대 안에서 한 코어에 고정해 번갈아 돈다.
 # ik 하네스는 build-ref가 짓는다. 인자는 라운드 수(기본 3).
 measure-qdot-rate *ARGS:
-    ./tools/box.sh 'cargo build --release -p bloomery-qdot --bin qdot-rate && bash tools/ref/qdot-rate.sh {{ARGS}}'
+    ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-qdot --bin qdot-rate && bash tools/ref/qdot-rate.sh {{ARGS}}'
 
 # V4.1 호스트 expert 다리의 벤치(bench_v41_host) — 정확성 실행이다. 실제 V4.1 파일을 mmap해 층마다 엔진의 디스패치
 # (gate+up 묶음 하나, swiglu를 품은 down 하나)를 돌리고, 층 여덟의 expert마다 gate·up·swiglu·down 여섯 행을 같은 바이트의
@@ -342,7 +346,7 @@ bench-cpu-v41-host-check:
 # 디스패치 수, 상주율. CPU 임대·증인·낡은 바이너리 거부는 host-rate.sh가 쥔다. 조용한 틈에 돈다 — 빌드가 도는 동안 잰
 # 수는 증인이 받지 않는다.
 time-cpu-v41-host *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/ref/host-rate.sh {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin bench_v41_host && bash tools/ref/host-rate.sh {{ARGS}}'
 
 # 2026-09-20 사고(q_nope2 무한루크가 gate-mt를 매달아 병렬 에이전트 둘을 '무활동'으로 죽임)의
 # 보강. 이 트랙 원격 디렉터리 아래 실행 파일을 물고 있는 고아 프로세스를 찾아 죽인다.
@@ -416,7 +420,7 @@ build-ref-bench:
 # verifies it under the CPU lease — 155.7 GB written beside the source on /models. A tool run, not a
 # gate; the user decides when. ARGS: `verify` checks an existing sidecar again without converting.
 r8-sidecar *ARGS:
-    ./tools/box.sh 'cargo build --release -p bloomery-model --bin r8conv && bash tools/ref/r8-sidecar.sh {{ARGS}}'
+    ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-model --bin r8conv && bash tools/ref/r8-sidecar.sh {{ARGS}}'
 
 # 의존성 감사. cuda-oxide가 rev로 고정돼 있는지가 핵심이다.
 deny:
@@ -925,14 +929,14 @@ gate-gpu-ds41-serve:
 # The same CLI's per-step ms (lead-only): placement (a) on the A6000 under the machine-wide lease, witness blocks
 # around it (tools/ref/time-gate.sh). Example: `just time-gpu-ds41 --depth 6 -n 96`.
 time-gpu-ds41 *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/time-gate.sh generate_ds41 {{ARGS}} --time'
 
 # 호스트 → 카드 전송 탐침(리드 전용): A6000에서 1 GiB를 세 경로로 보낸다 — 페이지 잠금 메모리, V4.1 첫 샤드의 따뜻한
 # 읽기 전용 mmap(pageable), 그 매핑을 cuMemHostRegister(READ_ONLY)로 등록한 것(등록·해제 시간 포함). 머신 전역 임대
 # 안에서, 증인 블록을 두르고 돈다(tools/ref/time-gate.sh). 등록을 지원하지 않는 카드면 앞의 두 줄을 찍고 rc 1.
 # 예: `just time-gpu-h2d --reps 10`.
 time-gpu-h2d *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/time-gate.sh h2d_probe --reps 8 {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin h2d_probe && bash tools/ref/time-gate.sh h2d_probe --reps 8 {{ARGS}}'
 
 # (lead: Korean comment to replace)
 # M2b probe (lead-only): cuMemHostRegister on 1 GiB of an anonymous map and of a MAP_PRIVATE RW
@@ -944,19 +948,19 @@ time-gpu-h2d *ARGS:
 # A functional run: `just probe-host-register --bytes 64M` with
 # BLOOMERY_BOX_ENV="BLOOMERY_TIMING_GPU=<the 3090's UUID>".
 probe-host-register *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_host_register && { flock -n /root/bloomery-cpu.lock true || { echo "probe-host-register: the CPU lease is held by another run" >&2; exit 75; }; } && bash tools/ref/time-gate.sh probe_host_register {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin probe_host_register && { flock -n /root/bloomery-cpu.lock true || { echo "probe-host-register: the CPU lease is held by another run" >&2; exit 75; }; } && bash tools/ref/time-gate.sh probe_host_register {{ARGS}}'
 
 # ik's V4.1 decode on the first 512 ids of corpus-<CORPUS>.ids, plain or with the DSpark draft, under the lease on
 # the A6000 (lead-only): the ik twin of `just time-gpu-ds41 --tokens <those ids> -n N`. tools/ref/ik-draft.sh's header
 # has the prompt round-trip checks, ik's command line and the summary line. Example: `just time-ik-draft prose 96 dspark`.
 time-ik-draft CORPUS N ARM="dspark":
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} {{ARM}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} {{ARM}}'
 
 # mainline llama.cpp(V4.1 포트, 프로필의 LCPP)로 같은 corpus-<CORPUS>.ids 첫 512 id 프롬프트를 A6000에서 임대 안에 디코드한다(리드 전용):
 # `just time-gpu-ds41 --tokens <그 id> -n N`의 mainline 쌍둥이, llama-completion에 LCPP_CLI_FLAGS. 프롬프트 왕복 검사 둘과 요약 줄은
 # tools/ref/ik-draft.sh의 lcpp 팔 그대로다. 예: `just time-lcpp-prompt prose 96`.
 time-lcpp-prompt CORPUS N:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} lcpp'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize && bash tools/ref/ik-draft.sh {{CORPUS}} {{N}} lcpp'
 
 # V4.1 decode by depth, three engines in one lease on the A6000 (lead-only): our arms `<D>` (generate_ds41 --depth D,
 # placement (a)), ik's `ik:<D>` (llama-bench -gp D,96 at the profile's IK_GPU_FLAGS) and mainline's `lcpp:<D>`
@@ -967,7 +971,7 @@ time-lcpp-prompt CORPUS N:
 # With no ours arm generate_ds41 is not built, nor under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 (the command lines, no lease);
 # no arms means the runner's default (6 ik:6), which builds.
 depth-gpu-ds41 *ARMS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi; } && bash tools/ref/depth-ds41.sh {{ARMS}}'
 
 # Qwen3-30B-A3B 전 카드 디코드를 깊이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(프롬프트를 실제 D스텝으로 먹임), ik `ik:<D>`(-gp D,96, 프로필
 # 플래그)·`ikdef:<D>`(llama-bench 기본값), mainline `lcpp:<D>`(-d D)를 바퀴마다 순서를 돌려 번갈아 재고, 깊이마다 ours/각 참조 비율을 찍는다.
@@ -977,13 +981,13 @@ depth-gpu-ds41 *ARMS:
 # (llama-bench -p P -n 0; `ikpp<U>`/`lcpppp<U>`: -ub U) and `mrspp:<P>` (mistralrs bench --prompt-len P) with a per-P table.
 # Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 the runner prints the command lines and exits before the lease, and nothing is built.
 depth-gpu-qwen3moe *ARMS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{ ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
 # header of tools/ref/nsys-gpu.sh has the boundary and the windows. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-qwen3moe *DEPTHS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_DEPTHS="{{DEPTHS}}" bash tools/ref/nsys-gpu.sh'
 
 # Qwen3-30B-A3B prefill kernel table (nsys, A6000, under the lease, lead-only): generate_qwen3moe's timed prompt (the
 # depth runner's `<P>` arm) at each length P (default 4096, one ubatch at the default ubatch size), then
@@ -992,11 +996,11 @@ nsys-gpu-qwen3moe *DEPTHS:
 # docs/research/q3next-design-report.md; not numbers of record]: gemm_q4k + gemm_q6k about 62 % of the prompt,
 # qwen3moe_router_logits 0.36-0.54 ms a launch. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-qwen3moe-prefill *PROMPTS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi && BLOOMERY_NSYS_FORM=prefill BLOOMERY_NSYS_DEPTHS="{{PROMPTS}}" bash tools/ref/nsys-gpu.sh'
 
 # V4.1 디코드 스텝의 커널 타임라인(nsys, A6000, 임대 안, 리드 전용): 깊이마다 커널 합 대 호스트 합류 빈틈. 인자는 깊이 목록.
 nsys-gpu-ds41 *DEPTHS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
 
 # V4.1 prompt batch timeline (nsys, A6000, under the lease, lead-only): generate_ds41 --depth P -n 2 --mode graph --time at
 # each prompt length P (default 512), the window from the prompt's first kernel to the first replay, cut into layer-batches
@@ -1005,7 +1009,7 @@ nsys-gpu-ds41 *DEPTHS:
 # launch queue from the CUDA API trace. Pass the sitting's hot list through BLOOMERY_BOX_ENV (BLOOMERY_HOT_LIST=...). The
 # header of tools/ref/nsys-ds41.sh and tools/ref/ds41pp.py have the cut. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-ds41-prefill *PROMPTS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NSYS_FORM=prefill bash tools/ref/nsys-ds41.sh {{PROMPTS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NSYS_FORM=prefill bash tools/ref/nsys-ds41.sh {{PROMPTS}}'
 
 # ik KLD 기준 파일 둘을 위치마다 비교한다(P = A, Q = B, 태그는 $BLOOMERY_DATA/ikppl 아래, 호스트만).
 # ARGS: --ubatch N(여러 번 줄 수 있다), --ik <ik-ppl --kld 태그>(ik가 찍은 요약과 밴드 안에서 맞는지).

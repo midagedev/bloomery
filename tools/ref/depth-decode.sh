@@ -47,7 +47,7 @@ for r in $(seq "$ROUNDS"); do
         rest=${a#tree:}; dir=${rest%:*}; dep=${rest##*:}
         # The prompt of depth d is lcg_prompt's. Its values do not reach the time: a decode step
         # reads six experts per layer and every cached key whatever the token is.
-        out=$("$(decode_bin "$dir")" -m "$MODEL" --tokens "$(lcg_prompt "$dep")" -n "$N" 2>&1) || { echo "r$r $dir d=$dep FAILED" >&2; echo "$out" | tail -n 5 >&2; exit 1; }
+        out=$(lease_bounded "$LEASE_ARM_BOUND" "$(decode_bin "$dir")" -m "$MODEL" --tokens "$(lcg_prompt "$dep")" -n "$N" 2>&1) || { echo "r$r $dir d=$dep FAILED" >&2; echo "$out" | tail -n 5 >&2; exit 1; }
         toks=$(echo "$out" | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
         pre=$(echo "$out" | grep -E '^prefill' | sed 's/.*= //')
         [ -n "$toks" ] || { echo "r$r $dir d=$dep produced no decode line" >&2; exit 1; }
@@ -58,7 +58,7 @@ for r in $(seq "$ROUNDS"); do
         dep=${a##*:}
         # 분할이 의도다: IK_BEST_FLAGS는 플래그 여럿을 담은 한 문자열이다(ab-decode.sh와 같다).
         # shellcheck disable=SC2086
-        raw=$(CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_BEST_FLAGS 2>&1)
+        raw=$(lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_BEST_FLAGS 2>&1)
         ik=$(echo "$raw" | grep -E "tg$N@pp$dep" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
         [ -n "$ik" ] || { echo "r$r $a produced no tg$N@pp$dep line" >&2; echo "$raw" | tail -n 8 >&2; exit 1; }
         echo "r$r ik d=$dep [$IK_BEST_FLAGS] | decode $ik tok/s"

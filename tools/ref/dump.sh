@@ -115,6 +115,10 @@ if [ -n "$VARIANT" ]; then
     "into $SET; ${TOKEN_ARGS[*]}${TOKENS_SHA256:+ (sha256 $TOKENS_SHA256)} ${STEP_ARGS[*]}"
 fi
 LEASE=${REF_DUMP_LEASE:-0}
+# The dump's bound, seconds: a hung dumper must end, under the lease or the gate lock alike. 1800 is
+# five times the one V4.1 CPU dump on record, 356 s with the whole file set read cold (rig-log
+# 2026-09-23); BLOOMERY_DUMP_BOUND overrides it for a longer set.
+DUMP_BOUND=${BLOOMERY_DUMP_BOUND:-1800}
 BIN="$BLOOMERY_DATA/bin/dump_ref"
 [ -x "$BIN" ] || { echo "no dump_ref at $BIN — run: just build-ref-dump" >&2; exit 2; }
 # One dump_ref serves every profile, and the manifest's `# build` names $IK: a binary linked against
@@ -200,7 +204,7 @@ BUILD=$(ikgit rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
 if [ "$BUILD" != unknown ] && ! ikgit diff --quiet HEAD 2>/dev/null; then BUILD="$BUILD-dirty"; fi
 
 if [ "$HIDE_CUDA" = 1 ]; then export CUDA_VISIBLE_DEVICES=""; fi
-BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
+lease_bounded "$DUMP_BOUND" env BLOOMERY_REF_WRITE=1 BLOOMERY_REF_DIR="$STAGE" BLOOMERY_REF_BUILD="$BUILD" BLOOMERY_REF_TOKENS_SHA256="$TOKENS_SHA256" \
   "$BIN" -m "$MODEL" --expect-arch "$MODEL_NAME" "${TOKEN_ARGS[@]}" -ngl "$NGL" -c "$CTX" -t "$THREADS" \
     "${REF_DUMP_ARGS[@]}" "${STEP_ARGS[@]}"
 if [ "$LEASE" = 1 ]; then witness post-dump; fi

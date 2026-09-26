@@ -89,11 +89,11 @@ for r in $(seq "$ROUNDS"); do
         witness "pre r$r ik d=$dep"
         if [ "$dep" = 0 ]; then
           # shellcheck disable=SC2086
-          raw=$("$IKBIN" -m "$MODEL" -p 0 -n "$N" -r 1 $IK_GPU_FLAGS 2>&1)
+          raw=$(lease_bounded "$LEASE_ARM_BOUND" "$IKBIN" -m "$MODEL" -p 0 -n "$N" -r 1 $IK_GPU_FLAGS 2>&1)
           val=$(echo "$raw" | grep -E "tg$N" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
         else
           # shellcheck disable=SC2086
-          raw=$("$IKBIN" -m "$MODEL" -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_GPU_FLAGS 2>&1)
+          raw=$(lease_bounded "$LEASE_ARM_BOUND" "$IKBIN" -m "$MODEL" -p 0 -n 0 -gp "$dep,$N" -r 1 $IK_GPU_FLAGS 2>&1)
           val=$(echo "$raw" | grep -E "tg$N@pp$dep" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
         fi
         witness "post r$r ik d=$dep"
@@ -133,11 +133,11 @@ for r in $(seq "$ROUNDS"); do
         witness "pre r$r ours($label,$inst) d=$dep ctx=$ctx n=$n"
         t0=$(date +%s)
         if [ "$use_ab" = 1 ]; then
-          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
+          out=$(lease_bounded "$LEASE_ARM_BOUND" env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --ab "${BLOOMERY_AB_INNER:-3}" ${BLOOMERY_AB_SET:+--ab-set "$BLOOMERY_AB_SET"} 2>&1)
         elif [[ "$label" == seed* ]]; then
-          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
+          out=$(lease_bounded "$LEASE_ARM_BOUND" env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --seed-depth "$dep" -n "$n" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
         else
-          out=$(env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
+          out=$(lease_bounded "$LEASE_ARM_BOUND" env ${arm_env[@]+"${arm_env[@]}"} "$BIN" --tokens "$toks" -n "$n" --ctx "$ctx" --time ${WARM:+--warm "$WARM"} 2>&1)
         fi
         rc=$?
         t1=$(date +%s)

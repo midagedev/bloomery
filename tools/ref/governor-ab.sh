@@ -19,7 +19,7 @@ lease_take
 echo "orig governor=$ORIG load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2)"
 for r in $(seq "$ROUNDS"); do for gov in "$ORIG" performance; do
   setgov "$gov"; sleep 2
-  b=$("$BIN" -m "$MODEL" --tokens "$TOKENS" -n 96 2>&1 | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
-  i=$(CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n 32 -r 2 2>/dev/null | grep 'tg32' | awk -F'|' '{print $(NF-1)}')
+  b=$(lease_bounded "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n 96 2>&1 | grep -E 'decode steps' | sed 's/.*= //;s/ (.*//')
+  i=$(lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n 32 -r 2 2>/dev/null | grep 'tg32' | awk -F'|' '{print $(NF-1)}')
   echo "r$r $gov | bloomery $b | ik $i | mhz $(awk '/MHz/{s+=$4;n++} END{printf "%.0f", s/n}' /proc/cpuinfo)"
 done; done

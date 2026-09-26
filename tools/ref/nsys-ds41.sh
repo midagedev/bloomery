@@ -87,7 +87,7 @@ PP=${BASH_SOURCE[0]%/*}/ds41pp.py
 
 # The analysis: sqlite, depth, n, the run's own output (for SMOKE and `time step`), last, top.
 analyze() {
-  python3 - "$@" << 'PY'
+  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 - "$@" << 'PY'
 import sqlite3, statistics, sys, re
 from collections import defaultdict
 db = sqlite3.connect(sys.argv[1])
@@ -275,7 +275,7 @@ PY
 
 # The prefill form's tables: sqlite, P, n, the run log.
 analyze_prefill() {
-  python3 "$PP" tables "$1" "$2" "$3" "$4" --layer "$LAYER" --blocked-us "$BLOCKED_US"
+  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 "$PP" tables "$1" "$2" "$3" "$4" --layer "$LAYER" --blocked-us "$BLOCKED_US"
 }
 
 if [ "${1:-}" = --analyze ]; then
@@ -387,7 +387,7 @@ for d in "${DEPTHS[@]}"; do
     } > "$out.meta"
   fi
   t0=$(date +%s)
-  "$NSYS" export --type sqlite --force-overwrite true -o "$out.sqlite" "$out.nsys-rep" > "$out.export.txt" 2>&1 \
+  lease_bounded "$LEASE_ARM_BOUND" "$NSYS" export --type sqlite --force-overwrite true -o "$out.sqlite" "$out.nsys-rep" > "$out.export.txt" 2>&1 \
     || { rc_all=1; echo "[export] failed"; tail -n 10 "$out.export.txt"; continue; }
   echo "[export] $(($(date +%s) - t0))s"
   if [ "$FORM" = prefill ]; then

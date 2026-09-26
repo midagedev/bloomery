@@ -37,10 +37,14 @@
 #
 # Writes $BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv (id, text, the V4.1 ids) and greedy-ik-cpu-<N>-p<P>.tsv
 # (argmax_ref's row: gen_ids and gen_margins), and <N>-p<P>.log with the witness blocks. N is GEN, default 64.
-# Bounded by timeout (IK_GREEDY_BOUND seconds, default 900).
+# Bounded by timeout (IK_GREEDY_BOUND seconds, default 900). The lease is lease_take's (tools/ref/lease.sh):
+# the run needs a card, BLOOMERY_LEASE_CARD=docs/cards/<slug>.card through BLOOMERY_BOX_ENV, written
+# for that run; a loop over prompts takes the lease once per prompt, with the one card.
 set -euo pipefail
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
+# shellcheck source=tools/ref/lease.sh
+source "${BASH_SOURCE[0]%/*}/lease.sh"
 case $MODEL_NAME in
   deepseek41) OUTDIR_NAME=greedy-ds41 ;;
   qwen3moe)   OUTDIR_NAME=qwen3moe/greedy ;;
@@ -106,30 +110,18 @@ say() { printf '%s\n' "$*" | tee -a "$LOG"; }
 HEAD_REV=$(git -c safe.directory="$IK" -C "$IK" rev-parse --short HEAD)
 say "ik-greedy.sh: tree $IK at $HEAD_REV, model $MODEL, prompt $PROMPT ids $IDS, $GEN greedy steps, bound ${BOUND}s"
 
-witness() {
-  local dev sectors
-  dev=$(df --output=source "$MODEL" 2>/dev/null | tail -n 1) || true
-  sectors=$(awk '{print $3}' "/sys/class/block/${dev#/dev/}/stat" 2>/dev/null || echo '?')
+# greedy_witness <tag>: lease.sh's fields, then this run's tree and binary, into the log as well.
+WITNESS=(head-epoch loadavg pressure-cpu pressure-io mem pgmajfault read-sectors gpu-apps lock-holder)
+greedy_witness() {
   {
-    echo "--- witness $1 $(date -u +%Y-%m-%dT%H:%M:%SZ) epoch $(date +%s) ---"
-    echo "loadavg: $(cat /proc/loadavg)"
-    echo "pressure-cpu: $(grep '^some' /proc/pressure/cpu | head -n1)"
-    echo "pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"
-    echo "mem: $(grep -E '^(MemAvailable|Cached):' /proc/meminfo | tr -s ' ' | tr '\n' ' ')"
-    echo "pgmajfault: $(awk '$1 == "pgmajfault" {print $2}' /proc/vmstat)"
-    echo "read-sectors: $sectors ($dev, 512 B each)"
-    echo "gpu-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null | tr '\n' ';')]"
-    echo "lock-holder-pid: $$"
+    witness "$1"
     echo "tree: $IK head=$HEAD_REV binary: $BIN sha256=$(sha256sum "$BIN" | cut -c1-12)"
   } | tee -a "$LOG"
 }
 
-LOCK=/root/bloomery-cpu.lock
-exec 9>"$LOCK"
-say "[lease] waiting for $LOCK ..."
-flock -w 1800 9 || { say "[lease] timed out after 30 min"; exit 75; }
-say "[lease] acquired $(date -u +%H:%M:%SZ)"
-witness pre-greedy
+lease_take
+echo "[lease] held by pid $$ at $(now), card $BLOOMERY_LEASE_CARD sha256=$(sha256sum "$LEASE_TREE/$BLOOMERY_LEASE_CARD" | cut -c1-64)" >> "$LOG"
+greedy_witness pre-greedy
 t0=$(date +%s)
 rc=0
 CUDA_VISIBLE_DEVICES="" timeout --kill-after=10 "$BOUND" \
@@ -139,8 +131,8 @@ pid=$!
 say "ik-greedy.sh: argmax_ref under pid $pid ($(cat "/proc/$pid/comm" 2>/dev/null || echo gone))"
 wait "$pid" || rc=$?
 t1=$(date +%s)
-witness post-greedy
-exec 9>&-
+greedy_witness post-greedy
+lease_release
 if [ "$rc" != 0 ]; then
   say "ik-greedy.sh: argmax_ref exited $rc after $((t1 - t0)) s; the log's tail:"
   tail -n 15 "$LOG" >&2

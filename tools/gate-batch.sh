@@ -4,6 +4,7 @@
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
 #   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--rerun]]
+#   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #
 # Items. `NAME[@K=V[,K=V…]][:ARGS]` — NAME a recipe in `just --dump`; `@K=V,…` added to
 # BLOOMERY_BOX_ENV for that item (values without spaces, commas or colons); `:ARGS` passed to the
@@ -17,14 +18,15 @@
 # runs.
 #
 # Lanes (--lanes 2, the default), read from each recipe's text and attributes in `just --dump` (and
-# its dependencies'):
-#   A  fixed, the 3090: a tools/gpu-gate.sh call without BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}
-#      (V4.1 `--place gate` gates, the V2-Lite p-gates), or device code run with no gate lock at all
+# its dependencies'), and from the scripts that text runs, followed transitively (walk() below):
+#   A  fixed, the 3090: a tools/gpu-gate.sh call, in the recipe or a script it runs, without
+#      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} (V4.1 `--place gate` gates, the V2-Lite p-gates), or device code run with no gate lock at all
 #      (`tools/gate.sh --oxide`, `cargo oxide test|run`, a `target/release/` binary of a recipe that
 #      runs `cargo oxide`: it lands on the box env's 3090 pin). A gpu-gate.sh recipe here runs with
 #      BLOOMERY_GATE_CARD=3090 in BLOOMERY_BOX_ENV, so a mixed recipe's `any` calls stay on the 3090.
-#   A|B  balanced: a recipe whose every gpu-gate.sh call carries the `any` form, or that runs no device
-#      code (CPU gates, check, lint, fmt-check, check-*, gate-ptx-spill). It goes to the lane expected
+#   A|B  balanced: a recipe whose every gpu-gate.sh call carries the `any` form (gate-ptx-spill, whose
+#      scan JITs through one in tools/ptx-scan.sh), or that runs no device code (CPU gates, check, lint,
+#      fmt-check, check-*). It goes to the lane expected
 #      to finish first: the fixed items' expected times are summed first, then the balanced items go
 #      longest first (ties in list order), each to the lane with the smaller running sum (lane B on a
 #      tie). Its card is its lane's, never `any`: BLOOMERY_GATE_CARD=3090 in lane A, a6000 in lane B
@@ -41,8 +43,8 @@
 #      out of its class.
 # A recipe that runs a timing runner or takes the timing lease is refused, because a batch's builds
 # contaminate a timed run. Two tests: the runner names in TIMED below, and what a script the recipe
-# names does — a tools/…sh that calls lease_take (tools/ref/lease.sh), or that opens the lease lock for
-# a descriptor and waits on it with flock -w. Each lane runs its items in list order; A and B run
+# runs does, followed transitively — a tools/…sh that calls lease_take (tools/ref/lease.sh), or that
+# opens the lease lock for a descriptor and waits on it with flock -w. Each lane runs its items in list order; A and B run
 # concurrently (cargo serializes their builds by its own lock). --lanes 1 runs every item in the
 # list's order in one lane (labelled A), with no card forced — the recipes' own defaults, as a hand
 # batch runs them.
@@ -147,7 +149,7 @@ LEASES="/root/bloomery-cpu.lock /root/bloomery-lease.lock"
 DEFAULT_S=45 # the expected seconds of an item with no row in the times file (the header says why 45)
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--rerun]]"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--rerun]] | --classes"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 OUT='' SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0
@@ -156,6 +158,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --out) [ $# -ge 2 ] || die "--out needs a directory; $USAGE"; OUT=$2; shift 2 ;;
     --smoke) [ -z "$SRC" ] || die "--smoke, --list and items are exclusive; $USAGE"; SRC=smoke; shift ;;
+    --classes) [ -z "$SRC" ] || die "--classes takes no items; $USAGE"; SRC=classes; shift ;;
     --list) [ $# -ge 2 ] || die "--list needs a file; $USAGE"
       [ -z "$SRC" ] || die "--smoke, --list and items are exclusive; $USAGE"; SRC=list; LIST=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
@@ -165,7 +168,7 @@ while [ $# -gt 0 ]; do
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     --*) die "unknown option '$1'; $USAGE" ;;
-    *) [ -z "$SRC" ] || [ "$SRC" = items ] || die "--smoke, --list and items are exclusive; $USAGE"
+    *) [ -z "$SRC" ] || [ "$SRC" = items ] || die "--smoke, --list, --classes and items are exclusive; $USAGE"
       SRC=items; ITEMS+=("$1"); shift ;;
   esac
 done
@@ -215,7 +218,7 @@ if src == "list":
                 where.append(f"{listfile}:{i}")
 else:
     where = [src] * len(raw_items)
-if not raw_items:
+if not raw_items and src != "classes":
     fail(f"the {src} input names no item — nothing to run is not a green batch")
 
 proc = subprocess.run(just + ["--dump", "--dump-format", "json"], capture_output=True, text=True)
@@ -285,18 +288,125 @@ def takes_lease(path):
     return TAKES[path]
 
 
+# The scripts a recipe runs, followed transitively: a tools/…sh path on a script's non-comment line,
+# or a relative `[dir/]name.sh` there resolved against that script's directory (ptx-spill-check.sh
+# names "${BASH_SOURCE[0]%/*}/ptx-scan.sh"). Each file is read once (a cycle ends there), at most
+# WALK_DEPTH hops from the recipe's text; a chain that would go deeper is a named refusal, never a
+# walk cut short. Two questions are asked of every file it reaches, by this one walker: does it take
+# the timing lease (takes_lease), and does it call tools/gpu-gate.sh — in command position, with the
+# call's card form: `BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}` (balanced), none (the 3090), or
+# any other BLOOMERY_GATE_CARD on the call (a form this runner does not read: refused). A mention in
+# a message (echo, printf, die, fail, say) is not a script the file runs.
+# tools/gpu-gate.sh itself is the runner a call reaches, and its text is not followed. A stub-test
+# harness (a directory named *-tests, tools/ref/card-tests) is named in the reason and not read: it
+# runs the lease and runner code against a lock of its own, and its fixtures hold both on purpose.
+WALK_DEPTH = 6
+BARE = re.compile(r"([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:sh|bash))\b")
+GATE_CALL = re.compile(CMD + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b", re.M)
+RUNNER_SELF = {GPU_GATE}
+MESSAGE = re.compile(r"^[\s{(!]*(?:echo|printf|die|fail|say)\b")
+
+
+def is_harness(path):
+    return any(part.endswith("-tests") for part in path.split("/")[:-1])
+
+
+def script_refs(path, text):
+    """The tree scripts path's non-comment lines name, in order — outside a message: a segment whose
+    command is echo, printf or a message function (die, fail, say) names a script it does not run."""
+    out, sdir = [], os.path.dirname(path)
+    for line in text.split("\n"):
+        st = line.strip()
+        if not st or st.startswith("#"):
+            continue
+        for seg in SEGMENT.split(line):
+            if MESSAGE.match(seg):
+                continue
+            for q in SCRIPT.findall(seg) + [os.path.join(sdir, b) for b in BARE.findall(seg)]:
+                q = os.path.normpath(q)
+                if q.endswith((".sh", ".bash")) and os.path.isfile(os.path.join(root, q)):
+                    out.append(q)
+    return list(dict.fromkeys(out))
+
+
+def walk(start):
+    """{calls: [(form, where)], take: (chain, hit) or None, harness: [paths], error: str or None} for the
+    scripts named in start, breadth first."""
+    res = {"calls": [], "take": None, "harness": [], "error": None}
+    parent, depth, queue = {}, {}, []
+    for s in dict.fromkeys(os.path.normpath(q) for q in start):
+        if os.path.isfile(os.path.join(root, s)) and s not in depth:
+            depth[s] = 1
+            queue.append(s)
+
+    def chain(s):
+        out = [s]
+        while out[-1] in parent:
+            out.append(parent[out[-1]])
+        return " <- ".join(out)
+
+    while queue:
+        s = queue.pop(0)
+        if s in RUNNER_SELF or not s.endswith((".sh", ".bash")):
+            continue
+        if is_harness(s):
+            res["harness"].append(s)
+            continue
+        with open(os.path.join(root, s), encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        hit = takes_lease(s)
+        if hit and res["take"] is None:
+            res["take"] = (chain(s), hit)
+        for m in GATE_CALL.finditer(text):
+            where = f"{s}:{text.count(chr(10), 0, m.start()) + 1}"
+            call = m.group(0)
+            if ANY in call:
+                res["calls"].append(("any", where))
+            elif "BLOOMERY_GATE_CARD" in call:
+                res["calls"].append(("unread", f"{where}: {call.strip()}"))
+            else:
+                res["calls"].append(("3090", where))
+        for q in script_refs(s, text):
+            if q in depth:
+                continue
+            if depth[s] >= WALK_DEPTH:
+                res["error"] = (f"the scripts it runs go deeper than WALK_DEPTH = {WALK_DEPTH} hops "
+                                f"({q} <- {chain(s)}): raise WALK_DEPTH in tools/gate-batch.sh")
+                return res
+            depth[q], parent[q] = depth[s] + 1, s
+            queue.append(q)
+    return res
+
+
+GATE_FORMS = {}
+
+
 def classify(name):
-    """(lane, reason) for a recipe and its dependencies; None for lane means refused."""
-    lanes_seen, reasons = set(), []
+    """(lane, reason) for a recipe and its dependencies: lane A, B or X, or T (a timed recipe) or R
+    (refused for another reason), which do not run in a batch."""
+    lanes_seen, reasons, forms = set(), [], set()
     for n in closure(name, set()):
         text = body(n)
         m = TIMED.search(text)
         if m:
-            return None, f"{n} names {m.group(0)}: a timed recipe does not run in a gate batch"
-        for path in dict.fromkeys(SCRIPT.findall(text)):
-            hit = takes_lease(path)
-            if hit:
-                return None, f"{n} runs {path}, which takes the timing lease ({hit}): a timed recipe does not run in a gate batch"
+            return "T", f"{n} names {m.group(0)}: a timed recipe does not run in a gate batch"
+        w = walk(SCRIPT.findall(text))
+        if w["error"]:
+            return "R", f"{n}: {w['error']}"
+        if w["take"]:
+            path, hit = w["take"]
+            return "T", f"{n} runs {path}, which takes the timing lease ({hit}): a timed recipe does not run in a gate batch"
+        for form, where in w["calls"]:
+            if form == "unread":
+                return "R", f"{n}: a script sets BLOOMERY_GATE_CARD in a form this runner does not read: {where}"
+            forms.add(form)
+            if form == "any":
+                lanes_seen.add("B")
+                reasons.append(f"{n}: gpu-gate.sh any ({where})")
+            else:
+                lanes_seen.add("A")
+                reasons.append(f"{n}: gpu-gate.sh 3090 ({where})")
+        reasons += [f"{n}: {h} not read (a stub-test harness)" for h in w["harness"]]
         m = BOX_CARD.search(text)
         if m:
             lanes_seen.add("X")
@@ -307,11 +417,13 @@ def classify(name):
             if GPU_GATE in seg:
                 if ANY in seg:
                     lanes_seen.add("B")
+                    forms.add("any")
                     reasons.append(f"{n}: gpu-gate.sh any")
                 elif "BLOOMERY_GATE_CARD" in seg:
-                    return None, f"{n}: a gpu-gate.sh call sets BLOOMERY_GATE_CARD in a form this runner does not read: {seg.strip()}"
+                    return "R", f"{n}: a gpu-gate.sh call sets BLOOMERY_GATE_CARD in a form this runner does not read: {seg.strip()}"
                 else:
                     lanes_seen.add("A")
+                    forms.add("3090")
                     reasons.append(f"{n}: gpu-gate.sh 3090")
             elif UNLOCKED.search(seg):
                 lanes_seen.add("A")
@@ -319,10 +431,12 @@ def classify(name):
             elif oxide and "target/release/" in seg and "host-gate.sh" not in seg:
                 lanes_seen.add("A")
                 reasons.append(f"{n}: direct target/release run (box env 3090 pin, no gate lock)")
+    GATE_FORMS[name] = forms
+    why = "; ".join(dict.fromkeys(r for r in reasons))
     for lane in ("X", "A", "B"):
         if lane in lanes_seen:
-            return lane, "; ".join(dict.fromkeys(r for r in reasons))
-    return "B", "no device code"
+            return lane, why
+    return "B", "no device code" + (f" ({why})" if why else "")
 
 
 # The groups this runner reads from the just attribute `[group('…')]`. A value it does not know is a
@@ -419,6 +533,47 @@ for kv in caller_env.split():
     if lanes == "2" and kv.split("=", 1)[0] == "BLOOMERY_GATE_CARD":
         fail("BLOOMERY_BOX_ENV sets BLOOMERY_GATE_CARD; with two lanes the card is the runner's (use --lanes 1)")
 
+def placement(name, lane, lanes):
+    """(class, kind, card candidates, their times-file labels) of a recipe that runs in a batch."""
+    names = closure(name, set())
+    uses_gpu_gate = bool(GATE_FORMS[name])
+    box = next((m.group(1) for m in (BOX_CARD.search(body(n)) for n in names) if m), None)
+    if lanes == "1":
+        if box:
+            labels = [box]
+        elif uses_gpu_gate:
+            labels = ["any" if "any" in GATE_FORMS[name] else "3090"]
+        else:
+            labels = ["3090" if lane == "A" else "none"]
+        return "A", "one-lane", ["-"], labels
+    if solo_of(name) or lane == "X":
+        kind = "solo" if solo_of(name) else "both-cards"
+        if box:
+            return "X", kind, ["-"], [box]
+        if uses_gpu_gate:
+            return "X", kind, ["3090" if lane == "A" else "a6000"], ["3090" if lane == "A" else "a6000"]
+        return "X", kind, ["-"], ["3090" if lane == "A" else "none"]
+    if lane == "A":
+        return "A", "fixed", (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
+    if uses_gpu_gate:
+        return "F", "balanced", ["3090", "a6000"], ["3090", "a6000"]
+    return "F", "balanced", ["-"], ["none"]
+
+
+# --classes: every recipe of the justfile, one line each, and nothing else runs:
+#   <recipe>\t<class>\t<kind>\t<cards>\t<reason>
+# class A (fixed, the 3090), F (balanced), X (alone), T (timed: refused in a batch) or R (refused for
+# another reason); cards the candidates, `-` for none forced. tools/check-recipes.sh reads the T lines.
+if src == "classes":
+    for name in sorted(recipes):
+        lane, reason = classify(name)
+        if lane in ("T", "R"):
+            print("\t".join([name, lane, "timed" if lane == "T" else "refused", "-", reason]))
+        else:
+            cls, kind, cards, _ = placement(name, lane, "2")
+            print("\t".join([name, cls, kind, ",".join(cards), reason]))
+    sys.exit(0)
+
 counts, errors, out = {}, [], []
 for item, at in zip(raw_items, where):
     m = ITEM.match(item)
@@ -459,12 +614,9 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: just rejects {item!r}: {' '.join(msg)}")
         continue
     lane, reason = classify(name)
-    if lane is None:
+    if lane in ("T", "R"):
         errors.append(f"{at}: {reason}")
         continue
-    names = closure(name, set())
-    uses_gpu_gate = any(GPU_GATE in body(n) for n in names)
-    box = next((m.group(1) for m in (BOX_CARD.search(body(n)) for n in names) if m), None)
     solo = solo_of(name)
     if solo:
         reason = "; ".join([f"{n}: [group('solo')]" for n in solo] + [reason])
@@ -474,29 +626,7 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {item!r} holds a tab or a newline in its env or ARGS: the times file is one tab-separated row per item")
         continue
     exp, esrc = expected(tkey)
-    # The card candidates and each one's label for the times file.
-    if lanes == "1":
-        cls, kind, cards = "A", "one-lane", ["-"]
-        if box:
-            labels = [box]
-        elif uses_gpu_gate:
-            labels = ["any" if any(ANY in body(n) for n in names) else "3090"]
-        else:
-            labels = ["3090" if lane == "A" else "none"]
-    elif solo or lane == "X":
-        cls, kind = "X", "solo" if solo else "both-cards"
-        if box:
-            cards, labels = ["-"], [box]
-        elif uses_gpu_gate:
-            cards = labels = ["3090" if lane == "A" else "a6000"]
-        else:
-            cards, labels = ["-"], ["3090" if lane == "A" else "none"]
-    elif lane == "A":
-        cls, kind = "A", "fixed"
-        cards, labels = (["3090"] if uses_gpu_gate else ["-"]), ["3090"]
-    else:
-        cls, kind = "F", "balanced"
-        cards, labels = (["3090", "a6000"], ["3090", "a6000"]) if uses_gpu_gate else (["-"], ["none"])
+    cls, kind, cards, labels = placement(name, lane, lanes)
     counts[name] = counts.get(name, 0) + 1
     stem = name if counts[name] == 1 else f"{name}-{counts[name]}"
     shown = item if (env is not None or args is not None) else ""
@@ -509,6 +639,10 @@ print("\n".join(out))
 PY
 PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" ${ITEMS[@]+"${ITEMS[@]}"}) \
   || RC=$? die "the list did not validate (above)"
+if [ "$SRC" = classes ]; then
+  printf '%s\n' "$PLAN0"
+  exit 0
+fi
 
 item_str() { # NAME ENV ARGS: the item as it runs, for the key — NAME[@ENV with commas for spaces][:ARGS]
   local s=$1
@@ -791,13 +925,14 @@ if [ "$DRY" = 1 ]; then
 fi
 
 # The timing lease, each lock tested on its own so the refusal names it. flock -E 75 separates "held"
-# from "could not test".
+# from "could not test"; a held lock's holder is named by lease_holders (tools/ref/lease.sh), the lines
+# a runner waiting on the lease prints.
 if [ "$SKIP_N" -lt "$N" ]; then
-  lease=$("$ROOT/tools/box.sh" 'for l in '"$LEASES"'; do flock -n -E 75 "$l" true; r=$?; if [ "$r" = 0 ]; then echo "free $l"; elif [ "$r" = 75 ]; then echo "held $l"; else echo "error $l rc=$r"; fi; done' 2>&1) \
+  lease=$("$ROOT/tools/box.sh" 'for l in '"$LEASES"'; do flock -n -E 75 "$l" true; r=$?; if [ "$r" = 0 ]; then echo "free $l"; elif [ "$r" = 75 ]; then echo "held $l"; (. tools/ref/lease.sh && lease_holders "$l"); else echo "error $l rc=$r"; fi; done' 2>&1) \
     || RC=70 die "the lease check through box.sh failed: $lease"
   for l in $LEASES; do
     case "$lease" in
-      *"held $l"*) RC=75 die "the timing lease $l is held — a batch's builds contaminate a sitting; not starting" ;;
+      *"held $l"*) echo "$lease" >&2; RC=75 die "the timing lease $l is held — a batch's builds contaminate a sitting; not starting" ;;
       *"free $l"*) ;;
       *) RC=70 die "the lease $l could not be tested: $lease" ;;
     esac

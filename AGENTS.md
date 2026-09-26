@@ -97,7 +97,8 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # run for a round's loop and the lead's first look, never a landing batch.
                       # tools/gate-batch.sh is also the landing-batch runner: `--list FILE` takes `just
                       # affected` output; lane A = the 3090, fixed (gpu-gate.sh without `any`, and device
-                      # code run with no gate lock); the `any` recipes and those with no device code are
+                      # code run with no gate lock); the `any` recipes (read through the scripts a recipe names,
+                      # transitively: gate-ptx-spill's JIT is one) and those with no device code are
                       # balanced, longest first to the lane expected to end first (the median of their last
                       # five rows in ~/.cache/bloomery/gate-times.tsv, 45 s without one), lane A forcing the
                       # 3090, lane B the A6000; X = alone after both lanes: a `[group('solo')]` recipe (a
@@ -188,7 +189,10 @@ are expensive, and what arithmetic settles is not resolved by experiment.
 the kinds and the exit codes are in `tools/ref/card.py`) gets no lease, an A/B
 whose predicted effect sits inside the ruler at its round count is refused
 before it starts, and a job that holds the lease without a runner goes through
-`tools/ref/lease-hold.sh` — a raw `flock` on the lease file is not a lease.
+`tools/ref/lease-hold.sh` — a raw `flock` on the lease file is not a lease. A child a runner starts keeps
+the lease (descriptor 9 is inherited) until it exits, so a heavy orphan stalls the next runner instead
+of sharing the box with it; the waiter names every holder (pid, exe, cwd, age, its card) within seconds
+and once a minute, and every child under the lease runs under a `timeout` bound.
 Second, draw the resource timeline: per unit of work, how long the host CPU,
 the card SMs, PCIe, host DRAM and NVMe are each busy, and whether the wall is
 their sum or one resource's max; then ask whether the flow should change —

@@ -43,6 +43,78 @@ fi
 python3 "$(dirname "$0")/recipes.py" check
 python3 "$(dirname "$0")/recipes.py" --self-test
 "$(dirname "$0")/gate-batch.sh" --smoke --dry-run > /dev/null
+# A timed recipe checks its card before it builds: tools/ref/card-precheck.sh (the `precheck` variable)
+# comes before the first cargo build of its box command, so a missing or refused card costs no build.
+# Timed is gate-batch.sh's class T (--classes: the classifier the batch runs, not a copy of its
+# regexes). A recipe whose build is a just dependency cannot run the precheck first from its own box
+# command; those are named on one line and do not fail here.
+classes=$(mktemp)
+trap 'rm -f "$classes"' EXIT
+"$(dirname "$0")/gate-batch.sh" --classes > "$classes"
+python3 - "$JF" "$classes" << 'PY'
+import json, re, subprocess, sys
+
+jf, classes = sys.argv[1], sys.argv[2]
+dump = json.loads(subprocess.run(["just", "--justfile", jf, "--dump", "--dump-format", "json"],
+                                 check=True, capture_output=True, text=True).stdout)
+recipes, assigns = dump["recipes"], dump["assignments"]
+PRECHECK = "tools/ref/card-precheck.sh"
+BUILD = re.compile(r"\bcargo (?:oxide )?(?:build|run|test)\b|\bjust build-[A-Za-z0-9_-]+")
+
+
+def body(name):
+    """The recipe's text with the justfile's variables in place; a parameter stays {{}}."""
+    out = []
+    for frags in recipes[name]["body"]:
+        line = ""
+        for f in frags:
+            if isinstance(f, str):
+                line += f
+            elif len(f) == 1 and f[0][0] == "variable" and f[0][1] in assigns:
+                line += assigns[f[0][1]]["value"]
+            else:
+                line += "{{}}"
+        out.append(line)
+    return "\n".join(out)
+
+
+def dep_builds(name, seen):
+    for d in recipes[name]["dependencies"]:
+        if d["recipe"] not in seen:
+            seen.add(d["recipe"])
+            if BUILD.search(body(d["recipe"])):
+                yield d["recipe"]
+            yield from dep_builds(d["recipe"], seen)
+
+
+bad, via_dep, n_timed, n_pre = [], [], 0, 0
+with open(classes, encoding="utf-8") as fh:
+    for row in fh:
+        f = row.rstrip("\n").split("\t")
+        if len(f) != 5 or f[0] not in recipes:
+            sys.exit(f"check-recipes: gate-batch.sh --classes printed a row it should not: {row!r}")
+        if f[1] != "T":
+            continue
+        n_timed += 1
+        text = body(f[0])
+        build, pre = BUILD.search(text), text.find(PRECHECK)
+        if build and (pre < 0 or pre > build.start()):
+            bad.append(f"  {f[0]}: `{build.group(0)}` runs before {PRECHECK} ({'after it' if pre >= 0 else 'absent'})")
+        elif build:
+            n_pre += 1
+        deps = list(dep_builds(f[0], set()))
+        if deps:
+            via_dep.append(f"{f[0]} ({', '.join(deps)})")
+if bad:
+    print("check-recipes: a timed recipe builds before its card check — put {{precheck}} first in its box "
+          "command (a forgotten card then costs no build):", file=sys.stderr)
+    print("\n".join(bad), file=sys.stderr)
+    sys.exit(1)
+print(f"check-recipes: {n_timed} timed recipes, {n_pre} build in their box command after the card precheck")
+if via_dep:
+    print(f"check-recipes: {len(via_dep)} timed recipes build in a just dependency before their box command, "
+          f"where the precheck cannot come first: {'; '.join(via_dep)}")
+PY
 # The card and lease stub tests (tools/ref/card-tests/run.sh): card.py, lease_take's refusals,
 # lease-hold.sh and gpu-ab.py's card check, against a copy of that code and a lock file of their own.
 if ! cards=$("$(dirname "$0")/ref/card-tests/run.sh" 2>&1); then

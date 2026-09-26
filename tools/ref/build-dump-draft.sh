@@ -95,7 +95,10 @@ fi
 
 lease_take
 t0=$(date +%s)
-as_user cmake --build "$IK/build" -j "$(nproc)" --target llama common llama-spec-bench
+# Bounded (BLOOMERY_BUILD_BOUND, default 1800 s, two gate bounds): the build holds every core under
+# the lease, and a hung one must end rather than hold the machine. The bound runs as the tree's user,
+# inside as_user, so it signals the build it started.
+as_user timeout --kill-after=10 "${BLOOMERY_BUILD_BOUND:-1800}" cmake --build "$IK/build" -j "$(nproc)" --target llama common llama-spec-bench
 echo "build-dump-draft: ik build in $(($(date +%s) - t0)) s"
 mkdir -p "$OUT"
 # A failed compile must not leave the previous binary for dump-draft.sh to run under this build's name.

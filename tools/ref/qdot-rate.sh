@@ -22,8 +22,8 @@ for n in $IK_RATES; do
   [ -x "$BLOOMERY_DATA/bin/$n" ] || { echo "no $BLOOMERY_DATA/bin/$n — run: just build-ref" >&2; exit 2; }
 done
 WITNESS=(head loadavg pressure-cpu pressure-io gpus lock-holder core core-mhz)
-ik_arm() { for n in $IK_RATES; do taskset -c "$CORE" "$BLOOMERY_DATA/bin/$n"; done; }
-rust_arm() { taskset -c "$CORE" "$RUST"; }
+ik_arm() { for n in $IK_RATES; do lease_bounded "$LEASE_ARM_BOUND" taskset -c "$CORE" "$BLOOMERY_DATA/bin/$n"; done; }
+rust_arm() { lease_bounded "$LEASE_ARM_BOUND" taskset -c "$CORE" "$RUST"; }
 lease_take
 witness pre
 for r in $(seq 1 "$ROUNDS"); do

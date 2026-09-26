@@ -188,9 +188,11 @@ for MOD in "${MODFILES[@]}"; do
 done
 [ -z "$FAILED" ] || fail "$SEC $TOOLS modules=$NMOD ptxas-failed=$FAILED"
 # The driver's JIT on the box's card, the same section: one `# card=… cuda_driver=…` line, then
-# `<entry>\t<regs>\t<local>\t<shared>\t<max_threads>` per entry.
+# `<entry>\t<regs>\t<local>\t<shared>\t<max_threads>` per entry. Either card, the `any` form: both
+# are GA102 (sm_86) under one driver, so the table does not depend on which one JITs it — only the
+# `# card=` line does — and the scan does not queue behind the 3090's gate lock.
 JITTBL=$MODS/jit
-if ! bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err"; then
+if ! BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err"; then
   echo "ptx-scan: the driver JIT ($JIT) failed: $(tail -1 "$MODS/jit.err")" >&2
   fail "$SEC $TOOLS modules=$NMOD jit=failed"
 fi

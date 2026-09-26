@@ -11,6 +11,8 @@
 #
 # What it owns, so that the runners cannot drift apart:
 #   the lease: its file, its descriptor (9), the 30-minute wait, exit 75 when the wait runs out;
+#   naming the lease's holder to a waiter (lease_holders);
+#   the bound on every process a runner starts under the lease (lease_bounded);
 #   the card every lease needs (tools/ref/card.py, at lease_take below): no card, no lease;
 #   the witness block: its four header forms and every field a runner can list, each spelled once;
 #   the CPU-contention guard between arms (guard_cpu), the CPU side of timing-card.sh's guard_other;
@@ -53,8 +55,12 @@ unset __lease_dir
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# The lease is descriptor 9 on LEASE_LOCK, held until the runner exits or calls lease_release.
-# A wait that runs out is contention, not a failed measurement: exit 75.
+# The lease is descriptor 9 on LEASE_LOCK, held until the runner exits or calls lease_release — and
+# by every process that inherited the descriptor, for as long as it lives: a child that outlives its
+# runner is still heavy work beside the next sitting, so it keeps the lease and the next runner waits
+# rather than records rows beside it. That wait is never anonymous: when the lease is busy the waiter
+# names its holder at once (lease_holders), again once a minute, and again when the 30-minute wait
+# runs out. A wait that runs out is contention, not a failed measurement: exit 75.
 #
 # No card, no lease. BLOOMERY_LEASE_CARD names the run's card, docs/cards/<slug>.card relative to
 # this tree (tools/ref/card.py has the format and the exit codes). It reaches the box only through
@@ -83,10 +89,180 @@ lease_take() {
   [ "$LEASE_LOCK" = /root/bloomery-cpu.lock ] ||
     echo "[lease] BLOOMERY_LEASE_LOCK=$LEASE_LOCK is not the machine lease: nothing measured under it is admissible"
   exec 9>"$LEASE_LOCK"
-  echo "[lease] waiting for $LEASE_LOCK ..."
-  flock -w 1800 9 || { echo "[lease] timed out after 30 min" >&2; exit 75; }
+  if ! flock -n 9; then
+    local waited=0
+    echo "[lease] $LEASE_LOCK is held; waiting up to 30 min. Its holder:"
+    lease_holders "$LEASE_LOCK"
+    until flock -w 60 9; do
+      waited=$((waited + 1))
+      if [ "$waited" -ge 30 ]; then
+        {
+          echo "[lease] timed out after 30 min; the holder at the timeout:"
+          lease_holders "$LEASE_LOCK"
+        } >&2
+        exit 75
+      fi
+      echo "[lease] still held after $waited min by:"
+      lease_holders "$LEASE_LOCK"
+    done
+  fi
   echo "[lease] held by pid $$ at $(now)"
   lease_netdata
+}
+
+# lease_holders <lock file>: who holds the lock, as lines a waiter prints. One line per process with
+# a descriptor on the file (/proc/<pid>/fd, matched by device and inode): pid, comm, exe, cwd, time
+# since it started, the BLOOMERY_LEASE_CARD of its environment, its argv, and whether that descriptor
+# carries the lock (/proc/<pid>/fdinfo) or is only open — another waiter, or a `flock -n … true`
+# test. Then the lock as /proc/locks has it: the pid that took it, which can be dead while the lock
+# lives on in the descriptor — flock(1) takes it on a runner's descriptor 9 and exits, and a runner's
+# child keeps it after the runner dies — so both are printed. The caller's own descriptor (a
+# waiter's) is left out. A lock whose holder cannot be found is said to be so, never passed over.
+# BLOOMERY_LEASE_PROC names another /proc tree, for the Mac stub tests (tools/ref/card-tests).
+lease_holders() {
+  python3 - "$1" "${BLOOMERY_LEASE_PROC:-/proc}" << 'PY'
+import os
+import sys
+
+lock, proc = sys.argv[1], sys.argv[2]
+say = lambda text: print(f'[lease]   {text}')
+try:
+    want = os.stat(lock)
+except OSError as e:
+    say(f'the holder of {lock} cannot be named: the file cannot be read ({e.strerror})')
+    sys.exit(0)
+key = (want.st_dev, want.st_ino)
+
+
+def read(path, mode='r'):
+    try:
+        with open(path, mode) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def link(path):
+    try:
+        return os.readlink(path)
+    except OSError:
+        return '?'
+
+
+def elapsed(pid):
+    stat, up = read(f'{proc}/{pid}/stat'), read(f'{proc}/uptime')
+    try:
+        start = int(stat[stat.rindex(')') + 2:].split()[19]) / os.sysconf('SC_CLK_TCK')
+        s = int(float(up.split()[0]) - start)
+    except (AttributeError, ValueError, IndexError):
+        return '?'
+    return f'{s // 3600}h{s % 3600 // 60:02d}m{s % 60:02d}s'
+
+
+def describe(pid):
+    env = read(f'{proc}/{pid}/environ', 'rb') or b''
+    card = next((v[20:].decode(errors='replace') for v in env.split(b'\0') if v.startswith(b'BLOOMERY_LEASE_CARD=')), '')
+    argv = (read(f'{proc}/{pid}/cmdline', 'rb') or b'').replace(b'\0', b' ').decode(errors='replace').strip()
+    comm = (read(f'{proc}/{pid}/comm') or '?').strip()
+    return (f'comm={comm} exe={link(f"{proc}/{pid}/exe")} cwd={link(f"{proc}/{pid}/cwd")} '
+            f'elapsed={elapsed(pid)} card={card or "-"} args=[{argv[:160]}]')
+
+
+def locked(pid, fd):
+    info = read(f'{proc}/{pid}/fdinfo/{fd}') or ''
+    return any(ln.startswith('lock:') and '->' not in ln for ln in info.split('\n'))
+
+
+caller, me = os.getppid(), os.getpid()
+found = []
+try:
+    names = os.listdir(proc)
+except OSError as e:
+    say(f'the holder of {lock} cannot be named: {proc} cannot be listed ({e.strerror})')
+    sys.exit(0)
+for name in sorted(names, key=lambda n: int(n) if n.isdigit() else -1):
+    if not name.isdigit() or int(name) == me:
+        continue
+    pid = int(name)
+    try:
+        fds = os.listdir(f'{proc}/{pid}/fd')
+    except OSError:
+        continue
+    held = opened = False
+    for fd in fds:
+        try:
+            st = os.stat(f'{proc}/{pid}/fd/{fd}')
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == key:
+            if locked(pid, fd):
+                held = True
+            else:
+                opened = True
+    if held or (opened and pid != caller):
+        found.append((pid, held))
+for pid, held in found:
+    what = 'holds it' if held else 'has it open without the lock (another waiter, or a test)'
+    say(f'pid {pid} {what}{" (this process)" if pid == caller else ""}: {describe(pid)}')
+locks = read(f'{proc}/locks')
+takers, waiting = [], 0
+for ln in (locks or '').split('\n'):
+    f = ln.split()
+    blocked = len(f) > 1 and f[1] == '->'
+    if blocked:
+        f = f[:1] + f[2:]
+    if len(f) < 6:
+        continue
+    try:
+        maj, mnr, ino = f[5].split(':')
+        same = (int(maj, 16), int(mnr, 16), int(ino)) == (os.major(want.st_dev), os.minor(want.st_dev), want.st_ino)
+    except ValueError:
+        continue
+    if same and blocked:
+        waiting += 1
+    elif same:
+        takers.append((f[1], f[3], f[4]))
+if locks is None:
+    say(f'{proc}/locks cannot be read, so the pid that took the lock is not named')
+for kind, mode, pid in takers:
+    alive = os.path.isdir(f'{proc}/{pid}')
+    state = 'alive' if alive else ('not running — a lock outlives the process that took it (for a runner, flock(1) '
+                                   'itself, on the runner\'s descriptor 9); the holders are the processes above')
+    say(f'{proc}/locks: {kind} {mode} taken by pid {pid} ({state})')
+if waiting:
+    say(f'{proc}/locks: {waiting} more blocked on it')
+if not any(held for _, held in found) and not takers:
+    say(f'no holder found: no process has {lock} locked in {proc} (released while this looked, or held from '
+        'another pid namespace)')
+PY
+}
+
+# lease_bounded <seconds> <command…>: the command under `timeout --kill-after=10 <seconds>`, its exit
+# code returned. Every process a runner starts under the lease goes through it or its own `timeout`:
+# the lease stays held while any process that inherited descriptor 9 lives, so a hung child must end
+# at a bound instead of holding the machine. A command cut off there prints `[bound]` on stderr: a
+# child that hangs is a failed run, not a slow one. The command is an executable, not a shell
+# function or an assignment: `lease_bounded "$LEASE_ARM_BOUND" env K=V "$BIN" …`. LEASE_ARM_BOUND is
+# BLOOMERY_ARM_BOUND, default 900 s — the arm bound the depth, nsys and ncu runners read too; a
+# runner whose children run longer names its own. A bound that is not a positive integer is refused
+# (rc 64) before anything runs.
+# shellcheck disable=SC2034 # read by the runners that source this file
+LEASE_ARM_BOUND=${BLOOMERY_ARM_BOUND:-900}
+lease_bounded() {
+  local bound=${1:-} rc=0
+  case $bound in
+    '' | *[!0-9]* | 0*)
+      echo "[bound] lease_bounded: the bound is a positive number of seconds, got '$bound' (BLOOMERY_ARM_BOUND?)" >&2
+      return 64
+      ;;
+  esac
+  shift
+  timeout --kill-after=10 "$bound" "$@" || rc=$?
+  case $rc in
+    124) echo "[bound] $1 cut off at its ${bound} s bound (rc 124)" >&2 ;;
+    137) echo "[bound] $1 killed (rc 137: the bound's KILL ${bound} s + 10 s in, or another SIGKILL)" >&2 ;;
+  esac
+  return "$rc"
 }
 
 # netdata-lease-gate.service (rig-log configs/) freezes netdata while this lease is held; it polls,
@@ -187,8 +363,28 @@ witness() {
 __witness_head() { echo "--- witness $1 $(now) ---"; }
 __witness_head_open() { echo "--- witness $1 $(now)"; }
 __witness_head_epoch() { echo "--- witness $1 $(now) epoch $(date +%s) ---"; }
+# The fields that ask the cards. nvidia-smi fails when a card falls off the bus (Xid 79), and a field
+# must then say so — `<field>: unavailable (rc N)` — rather than print nothing, print an empty list
+# that reads as "no process", or end a runner under `set -e -o pipefail` before its witness is out.
+# __witness_smi <nvidia-smi arguments…> puts the output in __witness_out and the exit code in
+# __witness_rc.
+# A card that falls off the bus can also hang nvidia-smi: where `timeout` exists (the box) the query is
+# cut off after 30 s and the field reads `unavailable (rc 124)`.
+__witness_smi() {
+  __witness_rc=0
+  if command -v timeout > /dev/null; then
+    __witness_out=$(timeout --kill-after=5 30 nvidia-smi "$@") || __witness_rc=$?
+  else
+    __witness_out=$(nvidia-smi "$@") || __witness_rc=$?
+  fi
+}
+__witness_lines() { [ -z "$__witness_out" ] || sed "s/^/${__witness_indent}/" <<< "$__witness_out"; }
+__witness_joined() { [ -z "$__witness_out" ] || printf '%s\n' "$__witness_out" | tr '\n' "$1"; }
 __witness_head_load() {
-  echo "--- witness $1 $(now) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr '\n' ' ')"
+  local gpu
+  __witness_smi --query-gpu=utilization.gpu --format=csv,noheader
+  if [ "$__witness_rc" = 0 ]; then gpu=$(__witness_joined ' '); else gpu="unavailable (rc $__witness_rc)"; fi
+  echo "--- witness $1 $(now) load=$(cut -d' ' -f1-3 /proc/loadavg) io=$(grep '^some' /proc/pressure/io | cut -d' ' -f2) gpu=$gpu"
 }
 __witness_card() { witness_card; }
 __witness_loadavg() { echo "${__witness_indent}loadavg: $(cat /proc/loadavg)"; }
@@ -196,17 +392,29 @@ __witness_pressure_cpu() { echo "${__witness_indent}pressure-cpu: $(grep '^some'
 __witness_pressure_io() { echo "${__witness_indent}pressure-io: $(grep '^some' /proc/pressure/io | head -n1)"; }
 __witness_pressure_io_avg10() { echo "${__witness_indent}pressure-io avg10: $(grep '^some' /proc/pressure/io | head -n 1)"; }
 __witness_gpus() {
-  nvidia-smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader | sed "s/^/${__witness_indent}/"
+  __witness_smi --query-gpu=index,name,utilization.gpu,power.draw --format=csv,noheader
+  if [ "$__witness_rc" = 0 ]; then __witness_lines; else echo "${__witness_indent}gpus: unavailable (rc $__witness_rc)"; fi
 }
 __witness_gpu_apps() {
-  echo "${__witness_indent}gpu-apps: [$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader | tr '\n' ';')]"
+  __witness_smi --query-compute-apps=pid,used_memory --format=csv,noheader
+  if [ "$__witness_rc" = 0 ]; then
+    echo "${__witness_indent}gpu-apps: [$(__witness_joined ';')]"
+  else
+    echo "${__witness_indent}gpu-apps: unavailable (rc $__witness_rc)"
+  fi
 }
 __witness_stage0_gpus() {
-  nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,power.draw --format=csv | sed "s/^/${__witness_indent}/"
+  __witness_smi --query-gpu=index,name,memory.used,utilization.gpu,power.draw --format=csv
+  if [ "$__witness_rc" = 0 ]; then __witness_lines; else echo "${__witness_indent}stage0-gpus: unavailable (rc $__witness_rc)"; fi
 }
 __witness_stage0_apps() {
-  echo "${__witness_indent}compute-apps-3090:"
-  nvidia-smi --query-compute-apps=pid,used_memory --format=csv -i "$GPU_3090" | sed "s/^/${__witness_indent}/"
+  __witness_smi --query-compute-apps=pid,used_memory --format=csv -i "$GPU_3090"
+  if [ "$__witness_rc" = 0 ]; then
+    echo "${__witness_indent}compute-apps-3090:"
+    __witness_lines
+  else
+    echo "${__witness_indent}compute-apps-3090: unavailable (rc $__witness_rc)"
+  fi
 }
 __witness_lock_holder() { echo "${__witness_indent}lock-holder-pid: $$"; }
 __witness_model() { echo "${__witness_indent}model: ${MODEL_NAME:-?}"; }

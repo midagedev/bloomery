@@ -1,0 +1,10 @@
+# The card of the exact_ref referee's holds: `just exact-ref`, `just exact-taps` (one hold per arm) and
+# `just build-exact-forced` (one hold per prompt, so other rounds can interleave between prompts). Each
+# hold is one exact_ref run through tools/ref/lease-hold.sh. The minutes are per hold [derived from the
+# recipe comments: about 1.5 min per arm per prompt at the row's full 32 steps, and about 50 min for
+# build-exact-forced's 33 prompts]. `--steps S` ends the run at step S, so a hold with S below 31 is
+# shorter, roughly in proportion to the steps run; `--emit` runs every step whatever `--steps` says.
+kind: exclusive
+reason: exact_ref runs the teacher-forced row in f64 on 64 CPU threads; beside a timed run it would
+  take that run's cores, and a timed run beside it would slow the referee
+minutes: 1..3

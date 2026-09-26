@@ -29,7 +29,7 @@ WITNESS=(head loadavg pressure-cpu pressure-io threads model gpus lock-holder bu
 lease_take
 
 witness pre-bloomery
-"$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N"
+lease_bounded "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N"
 witness post-bloomery
 
 # 캐시 없는 옛 경로를 같은 임대 안에서 한 번 더 잰다. 다른 날 다른 조건의 숫자와
@@ -40,7 +40,7 @@ if [ "${NOCACHE:-1}" != 0 ]; then
   echo
   echo "=== 같은 프롬프트, 캐시 없는 경로 ==="
   witness pre-nocache
-  "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" --no-cache
+  lease_bounded "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" --no-cache
   witness post-nocache
 fi
 
@@ -58,7 +58,7 @@ if [ -n "${SWEEP:-}" ]; then
   for th in $SWEEP; do
     export BLOOMERY_THREADS=$th
     witness "pre-threads$th"
-    "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
+    lease_bounded "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
       | grep -E "^derived|decode steps in|per step"
     witness "post-threads$th"
     unset BLOOMERY_THREADS
@@ -75,7 +75,7 @@ if [ -n "${SPINS:-}" ]; then
   for sp in $SPINS; do
     export BLOOMERY_SPIN=$sp
     witness "pre-spin$sp"
-    "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
+    lease_bounded "$LEASE_ARM_BOUND" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N" 2>&1 \
       | grep -E "^derived|decode steps in|per step"
     witness "post-spin$sp"
     unset BLOOMERY_SPIN
@@ -85,7 +85,7 @@ fi
 echo
 echo "=== ik_llama.cpp, same file, same lease, CPU only ==="
 witness pre-ik
-CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2
+lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2
 witness post-ik
 
 # 기본 플래그의 ik는 ik의 천장이 아니다. 2026-09-21에 같은 임대에서 다섯 조합을 쟀고
@@ -95,5 +95,5 @@ echo
 echo "=== ik_llama.cpp, fastest measured flags ($IK_BEST_FLAGS) ==="
 witness pre-ik-best
 # shellcheck disable=SC2086
-CUDA_VISIBLE_DEVICES="" "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2 $IK_BEST_FLAGS
+lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2 $IK_BEST_FLAGS
 witness post-ik-best

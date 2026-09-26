@@ -40,6 +40,6 @@ for lvl in ${BLOOMERY_PROFILE_LEVELS:-1 2}; do
   echo
   echo "=== BLOOMERY_PROFILE=$lvl ==="
   witness "pre-level$lvl"
-  BLOOMERY_PROFILE=$lvl "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N"
+  lease_bounded "$LEASE_ARM_BOUND" env BLOOMERY_PROFILE="$lvl" "$BIN" -m "$MODEL" --tokens "$TOKENS" -n "$N"
   witness "post-level$lvl"
 done

@@ -83,7 +83,7 @@ TOP=${BLOOMERY_NSYS_TOP:-24}
 
 # The tables: sqlite, depth, n, top, form, the run's own output, the seed form's marker.
 analyze() {
-  python3 - "$@" <<'PY'
+  timeout --kill-after=10 "${BLOOMERY_ARM_BOUND:-900}" python3 - "$@" <<'PY'
 import re, sqlite3, sys
 db, depth, ngen, top = sqlite3.connect(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 form, runlog = sys.argv[5], sys.argv[6]
@@ -266,7 +266,7 @@ profile_cmd() {
          "$BIN" --tokens "$ids" -n "$NGEN" --ctx "$CTX" --mode "$MODE" --time)
   else
     CTX=$((d + 128))
-    CMD=("$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
+    CMD=(timeout --kill-after=10 "$BOUND" "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false
          --sample=none --cpuctxsw=none -o "$out" --force-overwrite true
          "$BIN" --tokens "$ids" -n "$NGEN" --ctx "$CTX" --mode "$MODE")
   fi
@@ -335,7 +335,7 @@ for d in $DEPTHS; do
   witness "post d=$d"
   echo "[rc] $rc"
   [ $rc -eq 0 ] || { rc_all=$rc; echo "--- 마지막 20줄"; tail -n 20 "$out.txt"; continue; }
-  "$NSYS" export --type sqlite --force-overwrite true -o "$out.sqlite" "$out.nsys-rep" > "$out.export.txt" 2>&1 \
+  lease_bounded "$BOUND" "$NSYS" export --type sqlite --force-overwrite true -o "$out.sqlite" "$out.nsys-rep" > "$out.export.txt" 2>&1 \
     || { rc_all=$?; echo "[export] 실패"; tail -n 10 "$out.export.txt"; continue; }
   analyze "$out.sqlite" "$d" "$NGEN" "$TOP" "$FORM" "$out.txt" "$MARKER" || rc_all=$?
   echo "--- 원본: $out.nsys-rep, $out.sqlite"
