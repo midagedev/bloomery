@@ -85,7 +85,7 @@ BLOOMERY_REF_MODEL=... target/release/generate_ds41 --place gate --tokens 671,61
 | `-n N` | tokens to generate (default 32) |
 | `--place a` | plan (a): all layers and the head on a card named `A6000`, each routed layer's expert prefix the budget allows, the rest on the host |
 | `--place gate` | the same shape on a card named `3090` |
-| `--ctx C` | context length (default 32,768) |
+| `--ctx C` | context length (default 32,768); a call past position 16,384 is refused by name — from there the V4.1 reference picks each index top-k inside a two-level candidate mask, which bloomery does not build |
 | `--depth D` | feed a fixed synthetic id sequence to depth D before generating; used by the timing tables |
 | `--time` | per-step timing; a measurement, which the maintainers only run under the machine-wide lease |
 

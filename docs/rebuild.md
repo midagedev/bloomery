@@ -153,10 +153,10 @@ extras   = Engram | Ple | Deepstack
 3. **SwiGLU limit에는 규칙이 둘이다.** ik와 우리는 SiLU 뒤에서 자른다(`min(silu(g), L)`; ik `ggml-cuda/unary.cu`, dsv4 계열과 GLM5NEXT 공통, `src/llama-model.h:671-675`). transformers `Glm5NextTextMLP`는 SiLU 앞에서 자른다. 원소당 차이는 최대 L·σ(−L) = 4.5e-4다[유도]. 엔진은 ik 규칙 하나만 싣는다(오라클이 ik). transformers와 비교하는 검사를 둔다면 이 차이를 밴드에 넣는다.
 4. **초안 원천은 셋이다.**
    - `NGram`: 있다(`gpu-gates/src/draft.rs`의 `Lookup`).
-   - `Mtp{layers}`: 모델 자신의 nextn 층이다. GLM 1층, Qwen3.5 이후 1층, V4.1 3층인데, V4.1의 셋은 오늘 `Role::Unused`다(`roles.rs:39-41`). MTP 층도 `LayerSpec`이다.
+   - `Mtp{layers}`: 모델 자신의 nextn 층이다. GLM 1층, Qwen3.5 이후 1층, V4.1 3층이다. ~~V4.1의 셋은 오늘 `Role::Unused`다(`roles.rs:39-41`).~~ V4.1의 셋은 우리 Q3_K_M 파일에 없다: 헤더에 `nextn.*`·`mtp.*` 텐서가 0개이고, `compress_ratios` 43개 중 `block_count` 40 뒤의 3개만 남아 있다. `roles.rs:39-41`의 규칙은 아무것도 잡지 않는다(specdesign, 09-27). MTP 층도 `LayerSpec`이다.
    - `Block{file}`: DSpark·DFlash 외부 초안. GLM-5.3-Flash·Qwen3.6·MiniMax-M3용이 이미 공개돼 있다.
 
-**커버리지 검사의 첫 출력.** 오늘 GLM-5.3-Flash 파일을 열면, 검사는 다음을 이름 붙은 거부 하나로 모아 낼 것이다(보고 §5(d)): `DeltaRule{Kda}` ×34, `Pool{SoftmaxApe, 4}` ×11, 라우터 `(Sigmoid, 288, 8)`, 카드의 routed Q5_K, pre `glm4`, GLM 도구 파서.
+**커버리지 검사의 첫 출력.** 오늘 GLM-5.3-Flash 파일을 열면, 검사는 다음을 이름 붙은 거부 하나로 모아 낼 것이다(보고 §5(d)): `DeltaRule{Kda}` ×34, `Pool{SoftmaxApe, 4}` ×11, 라우터 `(Sigmoid, 288, 8)`, 카드의 routed Q5_K, pre `glm4`, GLM 도구 파서. routed Q5_K는 UD-Q4_K_XL 이야기이고 그 헤더는 아직 읽지 않았다. 박스에 있는 UD-Q2_K_XL은 routed가 IQ2_XS·IQ3_XXS·IQ4_XS라 형식 항목이 그 셋이 된다. Qwen3.6 UD-Q4_K_XL의 routed Q5_K는 헤더로 확인했다. 두 파일의 헤더에서 계산한 항목별 목록은 `docs/research/modelspec-design.md` §5에 있다.
 
 **게이트.**
 - 연산 게이트는 인스턴스마다 모델 파일 없이 돈다. 대상은 모든 (E, K), HEAD × PACK, LATENT × ROPE, D × KDA다.
@@ -334,7 +334,7 @@ extras   = Engram | Ple | Deepstack
 |---|---|---|---|
 | **1 삭제** — 착륙(09-26, `35c95ec`..`d665eb5`) | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `gpudel`(스칼라 flash 세그먼트 패스와 탐침, `StepProbe` split 팔 넷, 호출자 없는 엔트리, `Head::graph`, `AnyEngine` V4.1 팔) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사; 03과 빌더 수를 맞춘 뒤) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
 | **2 한 주인** | `levers`(TL-1, aa 레버) · `records`(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · `refset`(GD1·GG5, 시팅 10과 짝) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
-| **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
+| **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나; 설계는 `docs/research/modelspec-design.md`, 헤더만 읽는 `qwen35moe` 팔 포함) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
 | **4 층 프로그램 하나** | `layerprog`(DS6: 층 종류마다 층 프로그램 + decode/verify/prompt 스케줄, CED·소스 공유는 `LayerSpec`에서 유도, Q3-3 `step_rows`) · `batchwide`(DS2: 토큰별 연산을 배치 폭으로) · `gatesproc`(GD3: 배치마다 프로세스 하나) · `gatestoml`(TL-4·TL-6) | 디코드 move(노드 목록 동일), 프롬프트 launch 목록 동일은 `--plan` 덤프로, DS2는 산문 A/B 1회 | 3파동, r8host |
 | **5 새 모델** | 결정 6의 첫 모델을 리더 하나와 새 연산으로 올린다 — 재구성이 맞았는지의 시험대. 첫 새 연산은 delta rule이다: GDN과 KDA를 const bool 하나로 가른다(메인라인 `gated_delta_net.cu`의 `template<int S_v, bool KDA, …>`, exllamav3 `gated_delta_net.py`의 KDA mode가 선례). 순환 상태 스냅숏, pre-tokenizer, 도구 파서가 함께 온다 | 인스턴스별 연산 게이트 + 새 모델 e2e + 참조 세트 | 4파동, 결정 6 |
 
@@ -387,5 +387,7 @@ modelvocab 뒤에 `kernelshape`의 입력으로 넘긴 것(09-26 메시지):
 - 라우터 (E, K) 14조합과 qwen3moe 라우터의 `PER_LANE == 4`(:142)
 - GQA HEAD {64, 128, 256, 512} × PACK(GROUP 2·4·5·6·8·12·16), `rope_neox`의 HEAD 128 전면 회전 → partial·IMROPE, `head_norm_neox_append`의 HEAD 128
 - 어텐션 출력 sigmoid 게이트, sigmoid 게이트 공유 expert(Qwen3-Next 이후)
+
+specdesign(09-27)이 `kernelshape`에 물은 것: 컴파일 시간 키와 실행 인자의 경계(K1), 평범한 cargo가 읽는 인스턴스 표(K2), 텍스트에서 IMROPE와 partial NeoX가 같은가(K3), `hc_pre`의 형식 인자(K4), GLM 붕괴 평균의 합 순서(K5), GLM k-pool과 V4 인덱서 압축기의 연산 하나(K6). 권고와 근거는 `docs/research/modelspec-design.md` §7이다.
 
 형상 커널을 크레이트 루트로 옮기고 상수를 인자·단형 표로 바꾸는 일은 사용자 요구(§2-1)에 맞춰 미루지 않기로 했다. 03의 `kernelshape` 설계 라운드가 커널마다 컴파일 시간 크기가 필요한지를 가린다.
