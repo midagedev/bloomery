@@ -310,7 +310,7 @@ extras   = Engram | Ple | Deepstack
 - **계획된 대상.** `iq.rs`와 `gate_iq`(IQ 모델), `models/deepseek4.sh`와 V4 메타(V4-Flash가 다음), V4.1 fixture(작은 게이트용 방향), qdot IQ3_XXS·MXFP4.
 - **판정이 아니라 설계.**
   - 디코드 flash(split-K)와 프리필 flash 둘: llama.cpp의 vec/mma 분업과 같은 이유다.
-  - 8이라는 컷 자체(참조 셋 모두 8), `gemm.rs` 매크로 뼈대.
+  - 8이라는 컷 자체(참조 셋 모두 8), `gemm/` 매크로 뼈대.
   - 단형 `GpuModel<B>`(토큰 경로에 `dyn` 없음), `Seam`(llama.cpp `cb_eval` 모양), `take_host_refusal`.
   - `ENGRAM_HELPER`, `RowsArrival`(구조 정정으로 남기기로 함), 호스트 rope 표(ik와 비트 정확).
 - **오늘은 V2-Lite만 줄 수 있는 커버리지.** `gate-gpu-hybrid`(호스트 티어 = 전부 카드 비트 동일)와 `gate-gpu-e2e`(ik CUDA 토큰 대조). 대체가 생길 때까지 남는다.
