@@ -18,6 +18,8 @@
 | 도구·문서 | TL | `docs/research/audit/tools.md` |
 | Qwen3 [03] | Q3 | `docs/research/audit/qwen3.md` |
 
+다음 모델들의 연산 어휘는 같은 날 조사 라운드 `modelvocab`이 채웠다(`docs/research/modelvocab-report.md`, §2-2).
+
 이 문서는 설계 문서다. 항목마다 근거 줄과 수치는 보고서에 있고, 여기에는 판단과 순서만 적는다. 숫자는 보고서가 읽은 값이고, 계산한 값에는 [유도]를 붙였다. 리드는 핵심 주장 일곱을 소스와 rig-log에서 직접 다시 확인했다(§8).
 
 ## 1. 지금 스펙 — 무엇을 위해 짓는가
@@ -46,14 +48,20 @@ crates/model       GPU 엔진이 싣는 것만: arch 메타, placement(본체가
                    host/(HostLayer, 호출 하나 = UnionCall — 디코드는 한 열)
 crates/gpu         ctx(카드 하나) · error(거부/오염/드라이버/OS/복구) · fault(판독 주인 하나)
                    · graph(Graphs<K> 캐시, HostFlags 할당기 하나) · weights(KqRows<F>, 입구 하나)
-                   · launch(가족별 모양 선택기) · kernels · host(HostTier + StepPort + BatchPort)
+                   · launch(가족별 모양 선택기) · host(HostTier + StepPort + BatchPort)
                    · model(GpuModel: 카드 하나·상주·Option<HostTier>, 작은 ChainBody + 능력 트레이트)
-crates/ops         모델을 모르는 연산 라이브러리: 어텐션 계열(MLA·GQA·슬라이딩·선형/GDN·희소 인덱서),
-                   norm·rope 변형, MoE 라우터·결합, 양자화 형식별 gemv/GEMM — 상수는 인자, 타일 크기는 단형 표
-crates/runtime     seq/(SeqState: 위치·롤백 주인) · sched/(decode m=1 캡처, verify m≤8 캡처,
-                   prompt m≤512 eager + CED + G — 겹침 부품 하나) · exchange/ · 추측 디코딩 원천(MTP·초안·n-gram)
-crates/models      ModelSpec(층마다 층 종류) + 계열마다 짧은 층 프로그램: deepseek(V2 … V4.1 변형),
-                   qwen(dense·MoE·Next·3.5/3.6 변형), glm, …; 역할 이름표; 적재 때 커버리지 검사
+crates/ops         모델을 모르는 연산 라이브러리: 어텐션 계열(MLA·GQA·슬라이딩·delta rule·희소 선택기),
+                   norm·rope 변형, MoE 라우터·결합, 양자화 형식별 gemv/GEMM. 이름에는 연산과 변형만 넣는다
+                   (route<Score,E,K>, gqa_flash<HEAD,PACK>, latent_attn<LATENT,ROPE>, delta_rule<D,KDA>,
+                   index_score<HEADS,D,Pool>, hc_pre<STREAMS,Fmt>). 컴파일 시간 크기는 레지스터·smem·전개를
+                   정하는 곳에만 쓰고 나머지는 인자다. 인스턴스 표(매크로)를 적재 때 조회한다
+crates/runtime     seq/(SeqState: 위치·롤백 주인, 순환 상태 슬롯과 verify 스냅숏) · state/(층 종류별 저장소:
+                   GQA 평면, latent 행, 압축 스트림, 순환 상태) · sched/(decode m=1 캡처, verify m≤8 캡처,
+                   prompt m≤512 eager + CED + G — 겹침 부품 하나. CED와 소스 공유는 LayerSpec에서 유도)
+                   · exchange/ · 초안 원천(NGram·Mtp·Block)
+crates/models      ModelSpec(층마다 mixer·ffn·residual·extras) · 계열 리더(GGUF 방언 → ModelSpec: deepseek, qwen,
+                   glm, …; 리더마다 약 300줄 이하가 목표) · 역할 이름표 · 층 종류마다 층 프로그램 하나
+                   (계열마다가 아니다) · 적재 때 커버리지 검사
 crates/app         Session(open·prompt·step·rows·rollback·draft·stats) + bin bloomery {run|chat|serve|bench}
 crates/serve       HTTP + 생성 루프 하나 + sampler 하나; 모의 엔진은 게이트 픽스처
 crates/refset      참조 세트 판독기 하나, 계열 표(생성 레시피·파일 신원·ik 빌드), RefError::Stale
@@ -71,7 +79,7 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
 
 **V2-Lite의 자리.** 전용 코드를 `arch/deepseek2`(GPU)와 잎 크레이트 `crates/cpu`(CPU 엔진)에 가둔다. 은퇴는 대체 게이트가 생긴 뒤 디렉터리 하나의 결정이다(§7 결정 1).
 
-`crates/gpu`와 `ops`·`runtime`·`models`의 경계, 크레이트 이름은 modelvocab 표를 받은 뒤 확정한다. 위 목록은 주인과 흐름을 정하는 초안이다.
+경계는 modelvocab 뒤에 이렇게 둔다(§2-2). `gpu`는 카드 자원(ctx·error·fault·graph·weights·호스트 티어)을, `ops`는 커널과 그 enqueue를, `runtime`은 스케줄·상태·초안 원천을, `models`는 서술·리더·층 프로그램을 맡는다. 어느 커널이 인스턴스 표에 들어가고 어느 커널이 인자만으로 되는지는 03의 `kernelshape`가 가린다.
 
 ### 2-1. 다음 모델이 들어올 자리 (사용자, 09-26)
 
@@ -85,13 +93,80 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
 - 모델마다 층 오케스트레이션을 처음부터 짓는다. V4.1만 1.5만 줄이다(DS6).
 - `ChainBody`는 모델마다 거부 기본값을 더했다(GC2).
 
-오늘이라면 다섯 원칙으로 짓는다. 연산 어휘와 대상 목록은 조사 라운드 `modelvocab`의 표로 확정한다.
+오늘이라면 다섯 원칙으로 짓는다. 연산 어휘와 대상 목록은 조사 라운드 `modelvocab`이 채웠다(§2-2). 원칙 3은 그 결과로 고쳤다.
 
 1. **연산 라이브러리는 모델을 모른다.** 커널은 연산과 모양 계열로 부른다. 모델 상수(헤드 차원, GQA 그룹, expert 수, top-k, hidden)는 인자로 넘기고, 레지스터 타일처럼 컴파일 시간 크기가 필요한 것만 단형 변형 표에서 적재 때 고른다. 어느 커널이 어느 쪽인지는 03의 `kernelshape`가 가린다.
-2. **모델은 서술이다.** 타입 있는 `ModelSpec`이 층마다 층 종류(full/sliding/linear 어텐션, MLA·GQA, dense/MoE, MTP)와 변형 매개변수를 갖고, 역할 이름표가 GGUF 텐서를 역할에 잇는다. 한 계열의 변형(Qwen의 dense·MoE 크기·Next/GDN·3.5/3.6)은 모델 타입 하나의 매개변수와 층 종류로 나타낸다. 변형마다 크레이트를 두지 않는다.
-3. **층 프로그램은 짧고 하나다.** 새 모델이 쓰는 코드는 연산을 조합한 층 프로그램 하나다(llama.cpp `src/models/<arch>.cpp`의 자리). 디코드·검증·프롬프트 스케줄, 호스트 티어 교환, 배치(placement), 그래프 캡처, 추측 디코딩(MTP 층, 별도 초안, n-gram)은 런타임이 모든 모델에 준다.
+2. **모델은 서술이다.** 타입 있는 `ModelSpec`이 층마다 층 종류(full/sliding/linear 어텐션, MLA·GQA, dense/MoE, MTP)와 변형 매개변수를 갖고, 역할 이름표가 GGUF 텐서를 역할에 잇는다. 층 종류는 계열 리더가 메타데이터와 텐서 존재로 정한다(`docs/arch-split.md:38`: `LayerKind`는 층 번호가 아니라 텐서 존재로). 한 계열의 변형은 모델 타입 하나의 매개변수와 층 종류로 나타낸다. Qwen이라면 llama.cpp arch 이름 여덟(`qwen3`, `qwen3moe`, `qwen3vl`, `qwen3vlmoe`, `qwen3next`, `qwen35`, `qwen35moe`, `qwen4exp`)을 리더 하나가 받는다. 변형마다 크레이트를 두지 않는다.
+3. **층 프로그램은 층 종류마다 하나이고, 모델마다 새로 쓰지 않는다.** (modelvocab 뒤 고침. 첫 초안은 "계열마다 짧은 층 프로그램 하나"였다.)
+   - 층 종류는 벤더를 가로질러 공유된다. MLA+DSA는 V3.2·GLM-5.x·Hy4가, delta rule은 Qwen3-Next 이후·GLM-5.3-Flash·Kimi가, mHC는 V4.x·GLM-5.3-Flash가, 해시 n-gram 임베딩은 V4.1 engram·Qwen PLE가, 블록 선택은 V4.1 candidate·GLM k-pool·Qwen QSA·MiniMax MSA가 쓴다.
+   - 그래서 계열이 쓰는 것은 GGUF 방언을 `ModelSpec`으로 옮기는 리더와 역할 표뿐이다. 정말 새 연산 종류일 때만 그 연산을 더한다. exllamav3의 아키텍처 파일이 이 모양이다. `glm5_next.py` 469줄이 모듈을 조립하고, `qwen3_5.py` 575줄 한 파일에 dense·MoE·VL·VL-MoE 네 클래스가 있다.
+   - 디코드·검증·프롬프트 스케줄, 호스트 티어 교환, 배치(placement), 그래프 캡처, 추측 디코딩(MTP 층, 별도 초안, n-gram)은 런타임이 모든 모델에 준다.
+   - V4.1의 CED 삼각형, `kv_source`/`index_source` 공유, 압축 스트림도 계열 훅이 아니다. `LayerSpec`의 `sources`·`compress`·`window` 칸에서 유도되는 스케줄이다. 이것이 빠지면 V4.1 프롬프트 최적화가 계열 훅으로 다시 샌다.
 4. **적재 때 커버리지를 검사한다.** 파일이 요구하는 연산·양자화 타입·층 종류 가운데 모르는 것이 있으면 이름 붙은 거부로 끝낸다(조용한 실패 없음).
 5. **게이트는 연산 단위다.** 연산 계열 게이트는 모델 파일 없이 여러 모양(각 모델의 차원 집합)을 돈다. 모델마다 필요한 것은 e2e와 참조 세트(`refset`) 하나다.
+
+### 2-2. modelvocab이 확정한 것
+
+보고는 `docs/research/modelvocab-report.md`다. 리드가 표본 인용을 원본과 대조했다(§8). 적합성 숫자는 파일 크기(HF API 합)만 읽은 값이고 나머지는 [유도]다.
+
+**대상 사실.**
+- **GLM-5.3-Flash**(`zai-org/GLM-5.3-Flash`, 2026-08-25)는 실재한다. 카드 L25: "With 320B total parameters and just 18B active parameters".
+  - 45층은 KDA 선형 어텐션 34층과, k-pool DSA 인덱서가 붙은 NoPE MLA 11층이다(`layer_types`가 linear ×3 + sparse ×1을 되풀이). 모든 블록이 mHC(4 스트림, Sinkhorn 20)로 싸여 있고, expert 288개 중 8개를 sigmoid 라우터로 고른다(`swiglu_limit 10.0`).
+  - ik(`glm5next`)와 exllamav3(`glm5_next.py`)는 지원한다. llama.cpp 메인라인에는 머지된 지원이 없다(PR #27752·#27754·#27773 열림, MTP 드래프트 #27917). 공개 비교는 사용자 규칙대로 PR 브랜치로 하고 번호를 적는다. unsloth GGUF가 나온 #27754가 첫 후보다.
+  - 적합성[유도]: UD-Q4_K_XL 파일이 199.7 GB다. 비-expert를 Q8_0(8.5 bpw, `models-survey.md` 표 C)로 보면 10.3 GB, expert는 189.4 GB다. expert는 호스트 예산 214 GB 안에, 비-expert는 A6000에 들어간다. 토큰당 routed 바이트는 V4.1의 1.27배(Q4_XL), 0.92배(Q3_XL)다.
+  - 이 파일의 routed down은 Q5_K라서, 오늘 배치는 hot list를 카드로 보내지 못한다(아래 설계 사실 2).
+- **Qwen은 프로그램 모양 셋이다.**
+  - Qwen3: 전 층 GQA.
+  - Qwen3-Next·3.5·3.6·3.8: GDN 3층마다 게이트 GQA 1층. plan의 `qwen35moe: GQA 16/2 × 256, GDN 30층`은 config로 확인했다.
+  - `qwen4exp`(Qwen3.8-Flash-Next): 여기에 QSA 블록 인덱서, gated-residual HC, PLE n-gram이 더해진다.
+  - GQA GROUP이 2·4·5·6·8·12·16으로 퍼지는데, 오늘 커널은 8만 받는다(`flash_gqa.rs:69`, `flash_gqa_prefill.rs:178`). rope는 HEAD 128 전면 회전만 있다(`rope_neox.rs:46`).
+
+**연산 어휘, 오늘 트리 기준.**
+
+| 상태 | 연산 |
+|---|---|
+| 있음(재사용) | RMSNorm, SwiGLU와 limit(`experts.rs:19`, ik 규칙과 같음), NORM tail rope + YaRN, NoPE, mHC Sinkhorn(`hc.rs`), K=V latent 512 어텐션과 sinks(V4.1), 히스토그램 정확 top-k, 호스트 티어, n-gram lookup 초안 |
+| 고정(상수만 풀면 됨) | 라우터 (E, K): V4.1 코어의 단언(`gpu-deepseek41/src/router.rs:88,90`)은 필요한 14개 조합(288/8, 512/10 포함)을 모두 받지만, qwen3moe 라우터는 `PER_LANE == 4`(`arch/qwen3moe/router.rs:142`)로 128에 고정이다. GQA flash HEAD 128·GROUP 8, `rope_neox` HEAD 128, engram `ROW 5120`(`engram_gate.rs:57`), Q3_K gemv와 융합된 `hc_pre`(`hc.rs:66-71`; GLM의 hc fn은 Q8_0), 인덱서 `HEADS 32` |
+| 없음 | delta rule(GDN·KDA, conv1d, gated RMSNorm, L2), k-pool·QSA·MSA 선택기, LayerNorm, 어텐션 출력 게이트, sigmoid 게이트 공유 expert, partial·IMROPE rope, GQA 위 SWA와 sinks, swigluoai, MTP 층, FP8·NVFP4, pre-tokenizer `glm4`·`qwen35`, GLM·Qwen 도구 파서 |
+
+**`ModelSpec` 모양(초안, 보고 §5(b)에서).**
+
+```
+ModelSpec { vocab, hidden, eps, embed, head, pre, template,
+            layers: Vec<LayerSpec>, mtp: Vec<LayerSpec>, drafts: Vec<DraftSpec> }
+LayerSpec { mixer, ffn, residual, extras, sources{kv_from, topk_from, index_key_from} }
+mixer    = Gqa{…, qk_norm, rope, out_gate, window, sinks, select} | Latent{…, o, window, sinks, compress, select}
+         | DeltaRule{Gdn{khead_map} | Kda{lower_bound}, …} | Mamba2{…}
+ffn      = Dense{ff, act} | Moe{experts, top_k, act, router{score, bias, groups, norm, scale, hash}, shared{gate}, …}
+residual = Plain | Hc{streams, Mhc{sinkhorn, collapse} | GatedResidual{rank}}
+extras   = Engram | Ple | Deepstack
+```
+
+- HF config가 이미 층별 목록을 들고 있다: `layer_types`, `mlp_layer_types`, `indexer_types`, `compress_ratios`, `kv_source_layer_ids`, `engram_layer_ids` 등.
+- llama.cpp hparams도 층별 배열이지만, 공용 구조체에 모델 전용 필드가 쌓였다(`dsv4_compress_ratios`, `dsv41_*_source`, `swiglu_clamp_*`). 층별 열거형으로 가면 이것을 피한다.
+
+**재구성에 새로 들어오는 설계 사실 넷.**
+1. **순환 상태는 제자리에서 덮어쓴다.** delta rule 층은 상태를 위치별로 쓰지 않는다. 그래서 오늘 V4.1의 "위치 색인 쓰기 → 되감기" 규칙이 서지 않는다(`docs/research/linear-attn.md` §0 항목 4).
+   - `SeqState`는 순환 상태 슬롯을 갖고, verify는 위치별 스냅숏을 쓴다. k = 4에서 GLM-5.3-Flash 570 MB, Qwen3.6-35B-A3B 252 MB이고, GLM 스냅숏을 verify마다 쓰는 값은 약 0.8 ms다(약 700 GB/s로 나눔)[유도].
+   - 3파동 `session`과 4파동 `layerprog`가 이 자리를 만든다.
+2. **"카드가 무엇을 돌리나"의 주인이 둘이다.** 카드 커널은 MXFP4·Q2_K·IQ를 읽는데(`mxfp4.rs`, `iq.rs`), 배치의 `CardFormat::of`는 그 형식들을 거부하고 `of_routed`는 routed Q5_K도 거부한다(`placement.rs:270-299`, `:363-368`). §3-D의 새 행이고, 적재 때 커버리지 검사가 읽을 형식 주인을 하나로 모은다.
+3. **SwiGLU limit에는 규칙이 둘이다.** ik와 우리는 SiLU 뒤에서 자른다(`min(silu(g), L)`; ik `ggml-cuda/unary.cu`, dsv4 계열과 GLM5NEXT 공통, `src/llama-model.h:671-675`). transformers `Glm5NextTextMLP`는 SiLU 앞에서 자른다. 원소당 차이는 최대 L·σ(−L) = 4.5e-4다[유도]. 엔진은 ik 규칙 하나만 싣는다(오라클이 ik). transformers와 비교하는 검사를 둔다면 이 차이를 밴드에 넣는다.
+4. **초안 원천은 셋이다.**
+   - `NGram`: 있다(`gpu-gates/src/draft.rs`의 `Lookup`).
+   - `Mtp{layers}`: 모델 자신의 nextn 층이다. GLM 1층, Qwen3.5 이후 1층, V4.1 3층인데, V4.1의 셋은 오늘 `Role::Unused`다(`roles.rs:39-41`). MTP 층도 `LayerSpec`이다.
+   - `Block{file}`: DSpark·DFlash 외부 초안. GLM-5.3-Flash·Qwen3.6·MiniMax-M3용이 이미 공개돼 있다.
+
+**커버리지 검사의 첫 출력.** 오늘 GLM-5.3-Flash 파일을 열면, 검사는 다음을 이름 붙은 거부 하나로 모아 낼 것이다(보고 §5(d)): `DeltaRule{Kda}` ×34, `Pool{SoftmaxApe, 4}` ×11, 라우터 `(Sigmoid, 288, 8)`, 카드의 routed Q5_K, pre `glm4`, GLM 도구 파서.
+
+**게이트.**
+- 연산 게이트는 인스턴스마다 모델 파일 없이 돈다. 대상은 모든 (E, K), HEAD × PACK, LATENT × ROPE, D × KDA다.
+  - PACK은 GROUP을 나누는 가장 큰 2의 거듭제곱이다(llama.cpp의 `gqa_ratio % k` 선례).
+  - LATENT 256은 Mistral-Small-4가 요구한다.
+- 모델 e2e는 조립만 본다. 오라클은 GLM이 ik `glm5next`, Qwen3.5/3.6이 메인라인 `qwen35moe`다.
+
+**대상 순위(보고).** ① GLM-5.3-Flash ② Qwen3.6-35B-A3B ③ Qwen3.8-Flash-Next ④ gpt-oss-120b.
+- ②는 Qwen3.5 계열의 운반체다. 같은 프로그램으로 27B dense, 122B, 397B, Qwen3-Next까지 간다.
+- 제작 순서는 사용자가 정한다(§7 결정 6).
 
 ## 3. 지금 모양이 오늘 설계와 갈라진 곳 — 부류별
 
@@ -113,7 +188,7 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
 
 | 발견 | 지금 | 오늘 |
 |---|---|---|
-| DS6 | V4.1 디코드 체인(8,274줄)과 프롬프트 체인(6,738줄)이 같은 층을 따로 짓는다. 이미 갈라진 곳: joined Q3_K만 받는 배치, 교환 둘, observer 둘 | 층 프로그램 하나를 m토큰 블록 위에서. 스케줄 셋: decode(m=1 캡처), verify(m≤8 캡처), prompt(m≤512 eager + CED + G). pair와 G는 같은 겹침 부품의 두 매개변수 |
+| DS6 | V4.1 디코드 체인(8,274줄)과 프롬프트 체인(6,738줄)이 같은 층을 따로 짓는다. 이미 갈라진 곳: joined Q3_K만 받는 배치, 교환 둘, observer 둘 | 층 종류마다 층 프로그램 하나를 m토큰 블록 위에서(§2-1 원칙 3). 스케줄 셋: decode(m=1 캡처), verify(m≤8 캡처), prompt(m≤512 eager + CED + G). pair와 G는 같은 겹침 부품의 두 매개변수 |
 | DS2 | `HC_MAX_TOKENS = 8`, `Q8Act::with_k` 1..=8, dense m 1..=8, 8토큰 이미지 거부 — 넷이 API 상한이 되어 프롬프트가 "청크마다 도는 디코드 스텝"으로 남았다. 청크별 카드 작업은 층-배치당 ≤ 6.9 ms[유도, 상한]이고 산문에서는 임계 경로에 있다 | 단위는 배치 T, 8은 커널 안의 타일 폭. 토큰별 연산은 T 위 launch 하나 |
 | Q3-3 | m행 디코드 패스의 주인이 둘이다: Qwen3 `Prefill` 패스와 골격의 `step_pair`(m = 2 고정). `Head::with_m`은 셋째 조각이다 | 골격의 `step_rows(m)`, m마다 그래프 하나. V4.1 pair = m 2 |
 | Q3-5·GC6 | `Q8Act`가 m ≤ 8을 할당에 굳히고 세 순열을 다 쓴다(P 4096 Qwen3에서 읽지 않는 쓰기 약 5.6 GB[유도]). 가중치 형식을 적재 때 타입으로 굳히지 않아 행 바이트 식이 64곳이다 | 활성값 `Act{planes, cap, k}`, 가중치 `KqRows<F>`, 가족별 모양 선택기(exllamav3 `select_gemm_shape`) |
@@ -142,6 +217,7 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
 | 타입 → 활성값 형식 규칙 | gguf 1 + qdot match 11(`_ =>` 팔이 조용히 Q3_K 규칙) | CPU7 → 기술자 하나, 망라형 match |
 | 샘플러·생성 루프·UTF-8 디코더 | 2 · 2 · 3 | CPU5 |
 | 친화성 코드, `PIN_MAIN` 파싱 | 4 · 5 | CPU §4 |
+| 카드가 돌리는 가중치 형식 | 카드 커널(`mxfp4.rs`, `iq.rs`) / 배치의 `CardFormat::of`·`of_routed`(MXFP4·Q2_K·IQ 거부, routed Q5_K 거부) | modelvocab §7-2 → 적재 때 커버리지 검사가 읽는 형식 주인 하나(§2-2) |
 | 배치·청크 분할 규칙 | Rust 1 + Python 2 | TL §1 |
 
 ### E. 레버가 프로세스 env라서, 팔 하나가 곧 프로세스 하나다
@@ -252,15 +328,15 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
 
 ### 6-1. 파동
 
-모델 확장성(§2-1, modelvocab 결과로 확정)을 기준으로 순서를 잡는다. 한 파동은 aa 라운드 넷 이하, 파일 경계는 겹치지 않게 하고, 착륙은 03과 직렬로 한다.
+모델 확장성(§2-1, §2-2)을 기준으로 순서를 잡는다. 한 파동은 aa 라운드 넷 이하, 파일 경계는 겹치지 않게 하고, 착륙은 03과 직렬로 한다.
 
 | 파동 | aa 라운드 | 증명 | 선행 |
 |---|---|---|---|
-| **1 삭제** | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, `AnyEngine` V4.1 팔, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사) · `shapefacts`(GG2: 컴파일 모양 단언 → ptx-shapes 래칫 열) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
+| **1 삭제** | `ds41del`(DS1, 죽은 `Body` 메서드, `STEP_PAIR=1`) · `gatesdel`(박물관 bin, step `--greedy`, `T1_SINK`, dead lib fn, `--time` 팔, load-v41 plan b opt-in) · `gpudel`(스칼라 flash 세그먼트 패스와 탐침, `StepProbe` split 팔 넷, 호출자 없는 엔트리, `Head::graph`, `AnyEngine` V4.1 팔) · `engramlab`(DS4 + `map_token` 이름 붙은 오류 + 적재 때 `token_map` 검사; 03과 빌더 수를 맞춘 뒤) | 삭제 클래스(6-0 ①), 커버리지 변경마다 날짜 사유 | boxlease, 원장 키 픽스업 |
 | **2 한 주인** | `levers`(TL-1, aa 레버) · `records`(TL-3·DS5: 기록 모듈, 엔진의 `--plan`, 세는 스트림 래퍼) · `gpumodel`(GC1 + GC2: 카드 하나 `GpuModel`, 작은 `ChainBody` + 능력 트레이트) · `refset`(GD1·GG5, 시팅 10과 짝) | move: ptx-scan 동일 + 구조 줄 / 호스트 전용 | 1파동 |
-| **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`, 층마다 층 종류, 적재 때 커버리지 검사) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
-| **4 층 프로그램 하나** | `layerprog`(DS6: 층 프로그램 + decode/verify/prompt 스케줄, Q3-3 `step_rows`) · `batchwide`(DS2: 토큰별 연산을 배치 폭으로) · `gatesproc`(GD3: 배치마다 프로세스 하나) · `gatestoml`(TL-4·TL-6) | 디코드 move(노드 목록 동일), 프롬프트 launch 목록 동일은 `--plan` 덤프로, DS2는 산문 A/B 1회 | 3파동, r8host |
-| **5 새 모델** | modelvocab 추천 대상 첫 모델을 층 프로그램 하나로 올린다 — 재구성이 맞았는지의 시험대 | 새 모델 e2e + 참조 세트 | 4파동 |
+| **3 모델 서술과 연산 라이브러리** | `modelspec`(`ModelSpec`·`LayerSpec`, 계열 리더 deepseek·qwen, 역할 표, 적재 때 커버리지 검사와 형식 주인 하나) · `opslib`(모델 이름 없는 커널 계열, 상수는 const 표 — 03 `kernelshape`와 짝. 라우터 (E, K) 코어, GQA HEAD × PACK, latent LATENT × ROPE, engram `ROW` 인자화, `hc_pre`의 형식 분리; GG2: 컴파일 모양 단언을 ptx-shapes 래칫 열로 옮겨 인스턴스 표의 핀으로) · `session`(GD4·GC2: `Session` + `bloomery` CLI, chat 배치 프리필·드래프트, `SeqState`의 순환 상태 슬롯 자리) · `v2fence`(GC7 2단계, CPU1 b: V2-Lite를 `arch/deepseek2`와 `crates/cpu`로) | move, 커버리지 검사는 FAIL-first | 2파동, modelvocab |
+| **4 층 프로그램 하나** | `layerprog`(DS6: 층 종류마다 층 프로그램 + decode/verify/prompt 스케줄, CED·소스 공유는 `LayerSpec`에서 유도, Q3-3 `step_rows`) · `batchwide`(DS2: 토큰별 연산을 배치 폭으로) · `gatesproc`(GD3: 배치마다 프로세스 하나) · `gatestoml`(TL-4·TL-6) | 디코드 move(노드 목록 동일), 프롬프트 launch 목록 동일은 `--plan` 덤프로, DS2는 산문 A/B 1회 | 3파동, r8host |
+| **5 새 모델** | 결정 6의 첫 모델을 리더 하나와 새 연산으로 올린다 — 재구성이 맞았는지의 시험대. 첫 새 연산은 delta rule이다: GDN과 KDA를 const bool 하나로 가른다(메인라인 `gated_delta_net.cu`의 `template<int S_v, bool KDA, …>`, exllamav3 `gated_delta_net.py`의 KDA mode가 선례). 순환 상태 스냅숏, pre-tokenizer, 도구 파서가 함께 온다 | 인스턴스별 연산 게이트 + 새 모델 e2e + 참조 세트 | 4파동, 결정 6 |
 
 03 파동은 03의 계획을 따른다: `q3prune` → `q3input`·`q3gates` → `gemmsplit`·`q3act` → Q3-3 → 호스트 티어(`hostcfg` → `benchprune` → `hostone` → `hybridgate`) → `q3plan`, 그리고 `kernelshape` 설계 라운드. 공유 타입은 설계자와 서명자를 나눈다: `Act`(03 설계, aa 서명), `step_rows`(aa 설계, 03 서명), `HostTier`(03 설계, aa 서명).
 
@@ -280,6 +356,10 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
    - `LAUNCH_THREAD`: 판정하려면 13바퀴가 필요하다.
    - 추천은 둘 다 지우고 아이디어는 트리아지에 남기는 것이다.
 5. **프리필 계약(GC8).** 모델 공통 계약을 "프롬프트는 스텝과 밴드, 비트는 배치 크기와 무관"으로 둘지 정한다. 지금 V4.1은 비트 동일, Qwen3는 밴드다. 층 프로그램 하나(DS6)와 연산 라이브러리의 GEMM 분기가 이 결정에 닿는다. 값은 호스트 항이 줄어든 뒤에 생긴다.
+6. **새 모델의 제작 순서.** 대상 순위는 ① GLM-5.3-Flash ② Qwen3.6-35B-A3B다(§2-2). 어느 쪽이든 앞에 공통 단계가 있다: 2–4파동에서 `ModelSpec`과 연산 라이브러리를 만들고 오늘의 두 모델을 그 위로 옮긴다.
+   - GLM 먼저: 사용자가 이름으로 지명한 모델이다. 새 연산이 가장 많다(KDA, k-pool 인덱서, LayerNorm, 288/8 sigmoid 라우터, 카드의 routed Q5_K, Q8_0 hc fn). KDA의 오라클은 ik `llama-kda.cpp` 하나뿐이다(메인라인 지원 없음). 메인라인 대조가 필요하면 Kimi-Linear-48B-A3B(메인라인 #18755, Q4_K_M 30.1 GB, A6000 한 장)를 KDA 확인 수단으로 쓴다.
+   - Qwen3.6 먼저: delta rule 커널을 메인라인 `qwen35moe` 오라클과 카드 한 장의 빠른 게이트로 세운다. 그 뒤 GLM의 KDA는 같은 커널의 const 변형이 되고(메인라인 커널도 GDN과 KDA를 bool 하나로 가른다), 호스트 티어와 mHC는 V4.1 것을 쓴다. Qwen 변형 요구도 이 길에서 함께 닫힌다.
+   - 추천은 Qwen3.6을 먼저 하고 바로 GLM으로 가는 것이다(보고와 같음).
 
 ## 8. 리드가 원본에서 다시 확인한 것
 
@@ -291,6 +371,7 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
 - `gate_p8`이 Qwen3 GEMM 벤치(`gemm_arms`)를 품고 있고, `ncu-gpu.sh`의 `GEMM_BIN` 기본값이 `gate_p8`이다.
 - 할당 래칫은 V2-Lite CPU forward에만 걸려 있다(`tests/alloc.rs:13-14`, `LIMIT = 660`, PIN 다섯).
 - **엇갈린 주장 하나를 가렸다.** `HYBRID_OVERLAP=0`을 ds41·gates-core 감사는 "판정 기록 없음"으로 적었다. 실제로는 rig-log 2026-09-23.md:353-354에 판정이 있다(n = 32, 켬 6.921 대 끔 8.288 ms). 두 감사의 grep이 한국어 "겹침"을 못 잡았다. 끔 팔은 `gate_hybrid.rs:1561`이 설정(`overlap: false`)으로 돈다. 지우면 커버리지 변경이고, 03이 판단한다.
+- **modelvocab 인용 표본.** GLM-5.3-Flash 카드 L25와 config 값(층 45, `layer_types`, 288/8, `swiglu_limit 10.0`, `qk_rope_head_dim 0`, `index_kpool 4`, `hc_mult 4`, vocab 154880), llama.cpp PR #27754(open), V4.1 라우터 단언 `router.rs:88,90`과 qwen3moe의 `PER_LANE == 4`(:142), `flash_gqa.rs`의 HEAD/GROUP과 `flash_gqa_prefill.rs:178`, `route_core.rs`의 `Sigmoid` 문장, ik `unary.cu`의 SwiGLU limit과 `experts.rs:19`, `CardFormat::of`·`of_routed`, `roles.rs:39-41`. 모두 보고와 맞았다. `models-survey.md`의 "unverified" 칸 셋(V4.1 활성 파라미터, Qwen3.6·Flash-Next 라우터)은 같은 날 채웠다.
 - **감사 중에 새로 난 결함 하나.** faultstep 착륙 배치에서, 원장 키가 레시피 매개변수로 받은 cargo 피처를 버렸다(`recipes.py:748`). 그래서 코드가 바뀐 트리의 ptx-scan이 초록으로 skip됐다. G 부류의 실측 사례다(§6-0 ③).
 
 ## 9. 03에게 넘긴 것 [03]
@@ -301,5 +382,10 @@ Q3-1 … Q3-8 전부, 그리고 다음을 넘겼다(09-26 메시지).
 - `DEFER_QUANT`는 시험 전용 오라클로, `STEAL_BLOCKS`는 상수로, `HYBRID_OVERLAP=0`은 판정 있음(§8)
 - CPU6(디코드 호스트 호출을 `UnionCall` 한 열로), CPU8(`bench_v41_host`의 판정 끝난 팔)
 - `fault.rs` `Q5Quant`(V2-Lite 전용)
+
+modelvocab 뒤에 `kernelshape`의 입력으로 넘긴 것(09-26 메시지):
+- 라우터 (E, K) 14조합과 qwen3moe 라우터의 `PER_LANE == 4`(:142)
+- GQA HEAD {64, 128, 256, 512} × PACK(GROUP 2·4·5·6·8·12·16), `rope_neox`의 HEAD 128 전면 회전 → partial·IMROPE, `head_norm_neox_append`의 HEAD 128
+- 어텐션 출력 sigmoid 게이트, sigmoid 게이트 공유 expert(Qwen3-Next 이후)
 
 형상 커널을 크레이트 루트로 옮기고 상수를 인자·단형 표로 바꾸는 일은 사용자 요구(§2-1)에 맞춰 미루지 않기로 했다. 03의 `kernelshape` 설계 라운드가 커널마다 컴파일 시간 크기가 필요한지를 가린다.
