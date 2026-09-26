@@ -1,8 +1,8 @@
 # Activation planes: one type for every model's quantized activations (round `actdesign`)
 
 **Status.** Design memo from the read-only round `actdesign` (2026-09-27). 03 designs it and aa signs it before any
-code (`docs/rebuild.md:341`). **aa's signature: pending.** The items to sign are §7; the implementation rounds are §6
-(`q3act` is steps B and C).
+code (`docs/rebuild.md:341`). **aa signed §7 items 1–10 on 2026-09-27, with four conditions** (the end of §7). The
+implementation rounds are §6 (`q3act` is steps B and C).
 
 **What was read.**
 - The tree at main `e5cc69a` (clean). Every line below is at that commit.
@@ -453,5 +453,21 @@ decide-above: the GEMM's reads got faster too (L2): an nsys of both arms, re-fit
 8. B32 stays a plane. `v2fence` moves its writers and readers, and V2-Lite's retirement deletes it.
 9. B edits aa's files mechanically at a wave boundary (fallback: a shim).
 10. The host tier keeps its own storage (`quantize_col`), and the handoff stays f32.
+
+**aa's conditions (2026-09-27).**
+- On 1: `with_k`'s refusal of a count outside 1..=8 does not disappear. It moves to the view's launcher check and stays
+  a named error (no silent truncation), and every V4.1 launcher that takes m states the m it accepts the way
+  `gpumodel`'s `Rows` (m ≤ 8) does.
+- On 3: step C's proof adds the DSpark gates (`gate-gpu-dspark-graph`, `-kv`, `-hc`, `-experts`, and
+  `ds41-dspark-loop`): `dflash_quantize_q8_1` is the draft's quantizer. Its `ptx-scan` diff shows that only the
+  writer rows moved.
+- On 9: B lands after `gpumodel` and not while `v2fence` runs, rebased onto aa's `del2` (whose D1 deletes engine APIs
+  only `gpu-spike` called, possibly `Q8Act::new`). Before B lands, 03 sends aa the list of hunks in aa's files
+  (`gpu-deepseek41`'s 11 and the V4.1 gates) for review. The proof is §6's (`ptx-scan` identical for `generate_ds41`
+  and `gate_e2e`, the V4.1 `--plan` launch list, the node counts).
+- On 6: aa's `modelspec` spec takes the three columns (Dense, Experts, Gemm) and the host column. If step A lands
+  before `modelspec`, `modelspec` moves `act_reads.rs` inside the format owner, so there is one table.
+- Also: item 5 can close aa's triage item on `body/prefill.rs`'s `reads_q8` and `shadow_entries`, which look a weight
+  up by its name as a `String` every layer-batch: `card_reads` resolved at open into per-layer constants.
 
 **Lead decision** (decided by the user on 2026-09-27: `gemm_q5k` stays). Deleting `gemm_q5k` is on hold "until the IMMA decision" (`docs/rebuild.md:302`). Deleting it would empty the (Q5_K, Gemm) cell of the table. Qwen3.6 routes down through Q5_K on 36 of its 40 layers, and GLM UD-Q4_K_XL on 40 of its 43 (`modelspec-design.md:9-15`). Without `gemm_q5k`, neither next model has a down GEMM on its prompt path.
