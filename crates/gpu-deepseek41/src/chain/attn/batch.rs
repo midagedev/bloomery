@@ -150,10 +150,15 @@ pub trait ChunkSource {
 
 /// What a layer of a prompt batch reads and writes besides its caches.
 pub struct BatchIo<'a> {
+    /// The batch's place in its group: the set of rope tables it reads
+    /// ([`AttnBatch::stage_tables`]).
+    pub set: usize,
     /// The batch's chunks, positions cut at multiples of [`HC_MAX_TOKENS`],
-    /// chunk `k` reading row `k` of the piece's words: the layer runs its
-    /// latent rows from chunk `run` on and its block from chunk `full` on.
+    /// chunk `k` reading row `row + k` of the piece's words: the layer runs
+    /// its latent rows from chunk `run` on and its block from chunk `full`
+    /// on.
     pub cuts: &'a [Range<usize>],
+    pub row: usize,
     pub run: usize,
     pub full: usize,
     /// Per token of the batch: the streams and the fold the sub-layer reads,
@@ -250,14 +255,16 @@ impl<'w> LayerTensors<'w> {
     }
 }
 
-/// The buffers of [`AttnChain::enqueue_batch_layer`] for batches of up to
-/// `tokens` positions ([`AttnChain::batch`]): the launches before a
-/// sub-block's chunks write them, the chunks and the launches after them
-/// read them. Per token of the batch: HC_PRE's result, the sub-layer's
-/// output and the rope tables; per token of a sub-block
-/// ([`SUB_TOKENS`] at most): everything else.
+/// The buffers of [`AttnChain::enqueue_batch_layer`] for groups of up to
+/// `sets` batches of up to `tokens` positions ([`AttnChain::batch`]): the
+/// launches before a sub-block's chunks write them, the chunks and the
+/// launches after them read them. Per token of a batch of the group: the
+/// rope tables, which the group's prologue stages for every batch at once;
+/// per token of the batch: HC_PRE's result and the sub-layer's output; per
+/// token of a sub-block ([`SUB_TOKENS`] at most): everything else.
 pub struct AttnBatch {
     tokens: usize,
+    sets: usize,
     /// Tokens a sub-block's buffers hold.
     sub: usize,
     rope_dims: usize,
@@ -297,8 +304,9 @@ pub struct AttnBatch {
     raw_out: DeviceBuffer<f32>,
     /// The sub-layer's output, per token of the batch: HC_POST's input.
     out: DeviceBuffer<f32>,
-    /// Per table of [`Table::ALL`], per token of the batch, its rope table
-    /// ([`AttnBatch::stage_tables`]), and the host copy it is uploaded from.
+    /// Per batch of the group, per table of [`Table::ALL`], per token of the
+    /// batch, its rope table ([`AttnBatch::stage_tables`]), and the host copy
+    /// it is uploaded from.
     tables: DeviceBuffer<f32>,
     tables_host: Vec<f32>,
     /// Queue entries enqueued since the last [`AttnBatch::take_entries`].
@@ -381,34 +389,47 @@ impl AttnBatch {
         f32s + acts + self.hc_pre.device_bytes()
     }
 
-    /// Chunk `m` tokens' rope tables into the host copy from token `at` on:
-    /// token `t`'s tables of the chunk image `words` (of `layout`) as
+    /// Of [`AttnBatch::device_bytes`], the rope tables of every batch of a
+    /// group.
+    #[must_use]
+    pub fn tables_bytes(&self) -> usize {
+        self.tables.num_bytes()
+    }
+
+    /// Chunk `m` tokens' rope tables into the host copy of the group's
+    /// batch `set` from token `at` on: token `t`'s tables of the chunk image
+    /// `words` (of `layout`) as
     /// [`ImageView::table`](crate::params::ImageView::table) reads them.
-    /// Refused past the batch's tokens or the image's.
+    /// Refused past the group's batches, the batch's tokens or the image's.
     pub fn stage_tables(
         &mut self,
         layout: &ImageLayout,
         words: &[u32],
-        at: usize,
-        m: usize,
+        [set, at, m]: [usize; 3],
     ) -> Result<(), GpuError> {
         let img = layout.view(words)?;
         let nd = self.rope_dims;
-        if at + m > self.tokens || m > layout.dims().tokens || layout.dims().rope_dims != nd {
+        if set >= self.sets
+            || at + m > self.tokens
+            || m > layout.dims().tokens
+            || layout.dims().rope_dims != nd
+        {
             return Err(GpuError::Shape {
                 what: WHAT_BATCH,
                 detail: format!(
-                    "{m} tokens' tables from token {at} of a batch of {}, from an image of {} \
-                     tokens of {} rope values (the batch's {nd})",
+                    "{m} tokens' tables from token {at} of batch {set} of a group of {} batches \
+                     of {}, from an image of {} tokens of {} rope values (the batch's {nd})",
+                    self.sets,
                     self.tokens,
                     layout.dims().tokens,
                     layout.dims().rope_dims
                 ),
             });
         }
+        let base = set * Table::ALL.len();
         for (i, table) in Table::ALL.into_iter().enumerate() {
             for t in 0..m {
-                let dst = (i * self.tokens + at + t) * nd;
+                let dst = ((base + i) * self.tokens + at + t) * nd;
                 for (d, &w) in self.tables_host[dst..dst + nd]
                     .iter_mut()
                     .zip(img.table(t, table))
@@ -420,10 +441,18 @@ impl AttnBatch {
         Ok(())
     }
 
-    /// The host copy of the tables to the card, one transfer; it waits for
-    /// the stream.
-    pub fn upload_tables(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.tables.copy_from_host(stream, &self.tables_host)?;
+    /// The host copy of the first `sets` batches' tables to the card, one
+    /// transfer; it waits for the stream.
+    pub fn upload_tables(&mut self, stream: &CudaStream, sets: usize) -> Result<(), GpuError> {
+        let len = sets * Table::ALL.len() * self.tokens * self.rope_dims;
+        if sets == 0 || sets > self.sets {
+            return Err(GpuError::Shape {
+                what: WHAT_BATCH,
+                detail: format!("the tables of {sets} batches of a group of {}", self.sets),
+            });
+        }
+        let mut dst = span_mut(WHAT_BATCH, &mut self.tables, 0, len)?;
+        dst.copy_from_host(stream, &self.tables_host[..len])?;
         Ok(())
     }
 
@@ -436,9 +465,15 @@ impl AttnBatch {
     /// Time each layer's projection phases with events from the next layer
     /// on: an event pair around each ([`AttnBatch::take_card_ms`]). The
     /// events are made the first time it is turned on, for batches of the
-    /// piece's rows of chunks over `layers` layers.
-    pub fn set_card_timing(&mut self, gpu: &Gpu, on: bool, layers: usize) -> Result<(), GpuError> {
-        let want = layers * phase_events(self.tokens.div_ceil(HC_MAX_TOKENS) + 1);
+    /// piece's rows of chunks over `layer_batches` layer-batches — a group's
+    /// layers times its batches, all read at the group's end.
+    pub fn set_card_timing(
+        &mut self,
+        gpu: &Gpu,
+        on: bool,
+        layer_batches: usize,
+    ) -> Result<(), GpuError> {
+        let want = layer_batches * phase_events(self.tokens.div_ceil(HC_MAX_TOKENS) + 1);
         while on && self.marks.len() < want {
             self.marks.push(
                 gpu.context()
@@ -492,8 +527,11 @@ struct BatchCx<'a> {
     layer: usize,
     fault: FaultSink,
     cuts: &'a [Range<usize>],
-    /// The batch's first position.
+    /// The batch's first position, its place in its group and its chunk 0's
+    /// row of words.
     base: usize,
+    set: usize,
+    row: usize,
     top_k: usize,
 }
 
@@ -513,7 +551,7 @@ impl BatchCx<'_> {
             w: self.w,
             k: self.k,
             d: self.d,
-            words: self.words.of(k)?,
+            words: self.words.of(self.row + k)?,
             layer: self.layer,
             fault: self.fault,
             m: self.cuts[k].len(),
@@ -540,10 +578,10 @@ impl BatchCx<'_> {
 }
 
 impl AttnChain {
-    /// The buffers of [`AttnChain::enqueue_batch_layer`] for batches of up to
-    /// `tokens` positions, refused by name when they do not fit the card's
-    /// free memory. Load-time only.
-    pub fn batch(&self, gpu: &Gpu, tokens: usize) -> Result<AttnBatch, GpuError> {
+    /// The buffers of [`AttnChain::enqueue_batch_layer`] for groups of up to
+    /// `sets` batches of up to `tokens` positions, refused by name when they
+    /// do not fit the card's free memory. Load-time only.
+    pub fn batch(&self, gpu: &Gpu, tokens: usize, sets: usize) -> Result<AttnBatch, GpuError> {
         let d = &self.dims;
         let stream = gpu.stream();
         let s = SUB_TOKENS.min(tokens.next_multiple_of(HC_MAX_TOKENS));
@@ -583,7 +621,7 @@ impl AttnChain {
                 s * groups * d.o_lora_rank,
                 s * d.n_embd,
                 tokens * d.n_embd,
-                Table::ALL.len() * tokens * nd,
+                sets * Table::ALL.len() * tokens * nd,
             ],
             acts: counts
                 .iter()
@@ -595,18 +633,20 @@ impl AttnChain {
         };
         let need = lens.bytes();
         let (free, _) = gpu.mem_info()?;
-        if tokens == 0 || need > free {
+        if tokens == 0 || sets == 0 || need > free {
             return Err(GpuError::Shape {
                 what: WHAT_BATCH,
                 detail: format!(
-                    "the batch-wide attention buffers for {tokens} positions in sub-blocks of \
-                     {s} take {need} B; the card budget left after the load is {free} B free"
+                    "the batch-wide attention buffers for groups of {sets} batches of {tokens} \
+                     positions in sub-blocks of {s} take {need} B; the card budget left after \
+                     the load is {free} B free"
                 ),
             });
         }
         let zeroed = |i: usize| DeviceBuffer::zeroed(stream, lens.f32s[i]);
         Ok(AttnBatch {
             tokens,
+            sets,
             sub: s,
             rope_dims: nd,
             hc_pre: HcPreScratch::with_groups(stream, lens.hc_k, lens.hc_groups)?,
@@ -704,7 +744,9 @@ impl AttnChain {
                 detail: format!("layer {layer} is not one of {layers:?}"),
             })?;
         let BatchIo {
+            set,
             cuts,
+            row,
             run,
             full,
             streams_in,
@@ -720,12 +762,20 @@ impl AttnChain {
             .iter()
             .all(|r| !r.is_empty() && r.end.div_ceil(HC_MAX_TOKENS) - r.start / HC_MAX_TOKENS == 1)
             && cuts.windows(2).all(|p| p[0].end == p[1].start);
-        if run > full || full > n || n > words.bufs.len() || tokens > b.tokens || !chunked {
+        if run > full
+            || full > n
+            || row + n > words.bufs.len()
+            || tokens > b.tokens
+            || set >= b.sets
+            || !chunked
+        {
             return Err(GpuError::Shape {
                 what: WHAT_BATCH,
                 detail: format!(
-                    "chunks {cuts:?} from {run} (block from {full}) over {} rows of words and \
-                     {} batch tokens: consecutive, cut at multiples of {HC_MAX_TOKENS}",
+                    "chunks {cuts:?} from {run} (block from {full}) of batch {set} (of {}) over \
+                     rows {row}.. of {} rows of words and {} batch tokens: consecutive, cut at \
+                     multiples of {HC_MAX_TOKENS}",
+                    b.sets,
                     words.bufs.len(),
                     b.tokens
                 ),
@@ -744,6 +794,8 @@ impl AttnChain {
             fault: gpu.layer_sink(layer)?,
             cuts,
             base,
+            set,
+            row,
             top_k: *top_k,
         };
         let stream = gpu.stream();
@@ -948,24 +1000,33 @@ fn sub_pre(
     };
     cx.k.dense
         .enqueue_groups_to_tokens(stream, &b.raw_q, heads_part, groups, &mut b.q)?;
-    let table = batch_table(&b.tables, b.tokens, cx.lp.tables.0, ts, n)?;
+    let table = batch_table(
+        &b.tables,
+        [b.tokens, b.rope_dims],
+        cx.set,
+        cx.lp.tables.0,
+        ts,
+        n,
+    )?;
     cx.k.rope
         .enqueue_rope_tail(stream, &mut b.q, &table, heads(d, n))?;
     *entries += 5;
     Ok(())
 }
 
-/// The `n` tokens from batch token `at` of table `table` in `tables`, the
-/// tables of a batch of `tokens` positions ([`AttnBatch::tables`]).
+/// The `n` tokens from batch token `at` of table `table` of the group's
+/// batch `set` in `tables`, the tables of batches of `tokens` positions of
+/// `nd` values ([`AttnBatch::tables`]).
 fn batch_table(
     tables: &DeviceBuffer<f32>,
-    tokens: usize,
+    [tokens, nd]: [usize; 2],
+    set: usize,
     table: Table,
     at: usize,
     n: usize,
 ) -> Result<View<'_, f32>, GpuError> {
-    let nd = tables.len() / (Table::ALL.len() * tokens.max(1));
-    view::<f32, f32>(tables, (table_index(table) * tokens + at) * nd, n * nd)
+    let t = set * Table::ALL.len() + table_index(table);
+    view::<f32, f32>(tables, (t * tokens + at) * nd, n * nd)
 }
 
 /// Chunk `k`'s launches in position order (module doc, step 3), its tokens
@@ -1228,7 +1289,14 @@ fn sub_post(
     let (ts, te) = (cx.token(sb.start), cx.token(sb.end));
     let n = te - ts;
     let tokens = cx.groups(sb)?;
-    let table = batch_table(&b.tables, b.tokens, cx.lp.tables.1, ts, n)?;
+    let table = batch_table(
+        &b.tables,
+        [b.tokens, b.rope_dims],
+        cx.set,
+        cx.lp.tables.1,
+        ts,
+        n,
+    )?;
     cx.k.rope
         .enqueue_rope_tail(stream, &mut b.y, &table, heads(d, n))?;
     drop(table);

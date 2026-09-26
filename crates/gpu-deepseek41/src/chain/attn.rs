@@ -782,8 +782,9 @@ impl AttnChain {
     }
 
     /// [`AttnChain::new`] with `rows` copies of the step words, for a pass
-    /// whose rows run one layer apart. The scratch is shared: a layer's
-    /// launches consume it before the next layer of either row runs.
+    /// whose rows run one layer apart, or for a prompt group's chunks, a row
+    /// each. The scratch is shared: a layer's launches consume it before the
+    /// next layer of any row runs.
     pub fn with_rows(
         gpu: &Gpu,
         hp: &Hparams,
@@ -1056,6 +1057,13 @@ impl AttnChain {
         }
         self.top_k = top_k;
         Ok(())
+    }
+
+    /// Of [`AttnChain::device_bytes`], the rows of step words: one row a
+    /// pass row, or a chunk of each batch a prompt group holds.
+    #[must_use]
+    pub fn words_bytes(&self) -> usize {
+        self.words.bufs.iter().map(DeviceBuffer::num_bytes).sum()
     }
 
     /// Device bytes the piece holds besides the weights and the buffers it

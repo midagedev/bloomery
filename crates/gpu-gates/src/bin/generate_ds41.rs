@@ -68,15 +68,18 @@
 //! that read one read the other.
 //!
 //! A batched feed prints the batch's device bytes (`prefill batch_bytes=`,
-//! of them the batch-wide attention projections' `proj_bytes=`)
-//! before the prompt and a `stat prefill` line after its `step 0` line: the
+//! of them the batch-wide attention projections' `proj_bytes=` and what the
+//! batches past a group's first hold for themselves, `group_bytes=`, for
+//! groups of `group=` batches) before the prompt and a `stat prefill` line after its `step 0` line: the
 //! host tier's batch services since load (`union_layers`, `union_cols`,
 //! `union_host_slots`) and the union calls' wall (`union_ms`), the part of
 //! the feed the card waits on the host; a runtime value, as `time prompt` is.
-//! A `stat prefill split` line follows (`body::PrefillStats`): the prologue,
-//! the enqueue with its union calls, waits on the route's copies and
-//! activation copies, and the enqueue time left, summed and per
-//! layer-batch; the queue entries — launches, event records, stream waits —
+//! A `stat prefill split` line follows (`body::PrefillStats`): the group
+//! lever (`group=`), the prologue, the enqueue with its union calls, waits
+//! on the route's copies and activation copies, and the enqueue time left,
+//! summed and per layer-batch — the waits also per layer-batch of a group's
+//! first batch (`wait_first_lb=`: in a group of two or more, the route the
+//! previous layer's last batch enqueued ahead); the queue entries — launches, event records, stream waits —
 //! the route and the shadow put in a layer-batch (`entries_route=`,
 //! `entries_shadow=`, the launch-queue model's N_r and N_s) and the host
 //! tier's batch-excluded slots a layer-batch (`excluded_lb=`); with
@@ -85,7 +88,9 @@
 //! shadow; `card_proj`: the batch-wide attention projections, inside
 //! `card_out`), whose reads add a wait per batch to the feed.
 //! The `load` line's `card_experts=` is `BLOOMERY_CARD_EXPERTS` (`tile`,
-//! the default, `expert` or `slot`), the shadow's routed gate·up arm.
+//! the default, `expert` or `slot`), the shadow's routed gate·up arm, and its
+//! `group=` is `BLOOMERY_PREFILL_GROUP` (default 2; 1 runs each batch alone),
+//! the batches whose layers a batched feed runs in turn.
 //! A second `stat prefill ced=` line names the triangle's state (the `load`
 //! line's `ced=`: `on`, or `off (reason)`) and the last call's needs: its
 //! positions, the first whose features were kept, the blocks and latent
@@ -464,7 +469,7 @@ mod drive {
         println!(
             "load resident_bytes={} shadow=host {} unified_addressing={} ctx={} layers={} \
              top_k={top_k} mode={} place={} pin_main={} pinned={pinned} launch_thread={} \
-             prefill={} ced={} card_experts={} in {:.1} s (runtime value)",
+             prefill={} ced={} card_experts={} group={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             shadow.bytes,
             shadow.unified_addressing,
@@ -485,6 +490,7 @@ mod drive {
             },
             m.body("generate_ds41")?.ced(),
             CardExperts::from_env()?.name(),
+            body::Body::prefill_group_lever()?,
             t.elapsed().as_secs_f64()
         );
         if let Some(h) = m.host_residency() {
@@ -544,8 +550,9 @@ mod drive {
                 b.set_prefill_card_timing(gpu, true)?;
             }
             let body = m.body("generate_ds41")?;
+            let (group, group_bytes) = body.prefill_group().unwrap_or_default();
             println!(
-                "prefill batch_bytes={} proj_bytes={}",
+                "prefill batch_bytes={} proj_bytes={} group={group} group_bytes={group_bytes}",
                 body.batch_bytes(),
                 body.batch_proj_bytes()
             );

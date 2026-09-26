@@ -55,6 +55,13 @@
 //!   a reset `P` clean steps give the oracle's logits. A quantizer that
 //!   reads a column its call did not write — a slot the host serves, or one
 //!   outside the batch's block — finds the faulted call's NaN there.
+//! - **Group fault.** A clean prefill of [`GROUP_FAULT_P`] ids (four
+//!   batches) names, through its needs, a layer with card experts whose
+//!   block starts inside the second batch; with that layer's card experts
+//!   poisoned alone, the same prefill returns the fault at that layer as the
+//!   named error — through the host tier's check at a later serve of the
+//!   group, or the group's own read at its end — and the model is poisoned
+//!   and refuses the next call.
 //! - **Oracle, one run.** From a reset, the ids decode-stepped one at a time
 //!   through the graph, each position's features read after its step (an md5
 //!   per position). After the step at each case's position `P − 1` the gate
@@ -90,7 +97,12 @@
 //! short subset.
 //!
 //! `BLOOMERY_CARD_EXPERTS=tile|expert|slot` picks the shadow's routed experts'
-//! arm (the `loaded` line names it); all three must pass. `BLOOMERY_STEP_STATS=1`
+//! arm (the `loaded` line names it); all three must pass.
+//! `BLOOMERY_PREFILL_GROUP=n` picks how many batches a group runs layer by
+//! layer (default 2; the `loaded` line names it, with the bytes the batches
+//! past a group's first hold); 1 and 2 must pass. The cases hold calls of
+//! one batch, two, three (one group of three under 2), five (a pair, then
+//! three), six and eight. `BLOOMERY_STEP_STATS=1`
 //! times each layer's card work with events and prints, after each case, a
 //! `stat prefill split` line (`body::PrefillStats`) — with the queue entries
 //! the route and the shadow put in a layer-batch (`entries_route=`,
@@ -180,8 +192,12 @@ mod gate {
     /// The longest case.
     const P_MAX: usize = ORACLE - 1;
     /// The prompt lengths: one chunk, one ubatch's chunk seams, the ring's
-    /// wrap, the ubatch seam, and several ubatches.
-    const CASES: [usize; 12] = [1, 2, 5, 127, 128, 129, 511, 512, 513, 1100, 2600, 4096];
+    /// wrap, the ubatch seam, and several ubatches — three (a group of three
+    /// under the default group of two), five (a pair, then three), six and
+    /// eight.
+    const CASES: [usize; 13] = [
+        1, 2, 5, 127, 128, 129, 511, 512, 513, 1100, 2300, 2600, 4096,
+    ];
     /// The splits: `ids[.. a + b]` as two prefill calls (module doc).
     const SPLITS: [(usize, usize); 3] = [(700, 400), (1800, 1000), (300, 2700)];
     /// The wide-taps case: `P` and the features it keeps.
@@ -191,6 +207,9 @@ mod gate {
     /// The fault-reset case's poisoned prefill: one whole batch, every column
     /// of the batch's scratch.
     const FAULT_P: usize = body::T_MAX;
+    /// The group-fault case's prefill: four whole batches, two groups of two
+    /// under the default group.
+    const GROUP_FAULT_P: usize = 4 * body::T_MAX;
     /// What a raise case's outputs hold before the launch, so an output the
     /// kernel leaves alone reads back as these bits.
     const SENT: f32 = 1.0e30;
@@ -312,6 +331,7 @@ mod gate {
             return seams(&mut m, &ids);
         }
         let ced = m.body(NAME)?.ced();
+        let (group, group_bytes) = m.body(NAME)?.prefill_group().unwrap_or_default();
         let mut pass = count_cases(&mut m)?;
         pass &= router_cases(&mut m)?;
         pass &= raise_cases(&mut m)?;
@@ -328,8 +348,9 @@ mod gate {
         let steps = (top + 1).min(ORACLE);
         let ids = corpus(ORACLE + 1)?;
         println!(
-            "{NAME}: loaded in {:.1} s; ced={ced}; card_experts={}; batch buffers {} B \
-             (attention projections {} B); ids \
+            "{NAME}: loaded in {:.1} s; ced={ced}; card_experts={}; group={group}; batch \
+             buffers {} B (attention projections {} B, batches past a group's first \
+             {group_bytes} B); ids \
              corpus-prose.ids[..{}] first {:?}; tap layers {layers:?}, draft window {}; oracle \
              {steps} steps; cases {:?} splits {splits:?} extra {}",
             t.elapsed().as_secs_f64(),
@@ -390,6 +411,7 @@ mod gate {
         }
         let p_clean = args.cases.iter().copied().min().unwrap_or(1);
         pass &= fault_reset_case(&mut m, &hp, &ids, &oracle, &rows, p_clean, dhp.window)?;
+        pass &= group_fault_case(&mut m, &hp, &ids)?;
         if args.extra {
             pass &= rollback_case(&mut m, &ids, &oracle)?;
             pass &= take_back_case(&mut m, &ids, &oracle)?;
@@ -1257,11 +1279,20 @@ mod gate {
         m: &mut Deepseek41Model,
         hp: &Hparams,
     ) -> Result<Vec<(usize, usize, [u8; 2])>, GateError> {
-        let (gpu, w, b) = m.body_parts(NAME)?;
+        let layers = m.body(NAME)?.layers();
+        poison_layers(m, hp.experts.ff, layers)
+    }
+
+    /// [`poison_card`] over `layers`, experts of `ff` rows.
+    fn poison_layers(
+        m: &mut Deepseek41Model,
+        ff: usize,
+        layers: Range<usize>,
+    ) -> Result<Vec<(usize, usize, [u8; 2])>, GateError> {
+        let (gpu, w, _) = m.body_parts(NAME)?;
         let stream = gpu.stream();
-        let ff = hp.experts.ff;
         let mut saved = Vec::new();
-        for l in b.layers() {
+        for l in layers {
             let Some(s) = CardStacks::of(w, l)? else {
                 continue;
             };
@@ -1378,6 +1409,73 @@ mod gate {
                 Err(e) => e.to_string(),
             },
             verdict(steps_clean),
+            t.elapsed().as_secs_f64(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The group-fault case (module doc): a fault planted in the second batch
+    /// of a call's first group ends the call with the named error at the
+    /// planted layer and a poisoned model.
+    fn group_fault_case(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        ids: &[u32],
+    ) -> Result<bool, GateError> {
+        let t = Instant::now();
+        let p = GROUP_FAULT_P;
+        let runs = body::batches(0, p);
+        let (Some(b1), Some(b2)) = (runs.get(1).cloned(), runs.get(2)) else {
+            return Err(format!("{NAME}: group fault: {p} ids cut into {runs:?}").into());
+        };
+        m.reset()?;
+        body::prefill(m, &ids[..p])?;
+        let need =
+            m.body(NAME)?.prefill_need().cloned().ok_or_else(|| {
+                format!("{NAME}: group fault: a clean prefill of {p} left no needs")
+            })?;
+        let layer = {
+            let (_, w, b) = m.body_parts(NAME)?;
+            let mut found = None;
+            for (i, l) in b.layers().enumerate() {
+                let full = need.layers.get(i).map_or(p, |n| n.full);
+                if b1.contains(&full) && full < b2.start && CardStacks::of(w, l)?.is_some() {
+                    found = Some(l);
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                format!(
+                    "{NAME}: group fault: no layer with card experts runs its block from batch \
+                     {b1:?} of a prefill of {p}"
+                )
+            })?
+        };
+        m.reset()?;
+        let saved = poison_layers(m, hp.experts.ff, layer..layer + 1)?;
+        let faulted = body::prefill(m, &ids[..p]);
+        let poisoned = m.poisoned();
+        put_back(m, &saved)?;
+        let named = matches!(
+            &faulted,
+            Err(GpuError::Fault { fault, .. }) if fault.layer as usize == layer
+        );
+        let refused = matches!(body::prefill(m, &ids[..1]), Err(GpuError::Poisoned { .. }));
+        m.reset()?;
+        let ok = named && poisoned.is_some() && refused;
+        println!(
+            "{NAME}: case group fault P={p}: NaN in layer {layer}'s card experts' gate scale, \
+             whose block starts at {} in batch {b1:?}: {} {} | poisoned {} | the next call \
+             refused {} | {:.1} s: {}",
+            need.layers.get(layer).map_or(p, |n| n.full),
+            match &faulted {
+                Ok(tok) => format!("no fault (token {tok})"),
+                Err(e) => e.to_string(),
+            },
+            verdict(named),
+            verdict(poisoned.is_some()),
+            verdict(refused),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -1864,20 +1962,21 @@ mod gate {
             })?;
         }
         m.reset()?;
-        let mut i = 0;
         let mut off = 0usize;
+        // A seam is looked up by its sub-layer and layer: a group shows its
+        // batches' seams layer by layer, each batch's own streams.
         body::prefill_observed(m, ids, &mut |gpu, seam| {
             gpu.stream().synchronize()?;
             let n4 = seam.streams.len() / crate::gate::T_MAX_TOKENS;
             let mut host = vec![0.0f32; seam.streams.len()];
             seam.streams.copy_to_host(gpu.stream(), &mut host)?;
-            let Some((key, want)) = rec.get(i) else {
+            let Some(i) = rec.iter().position(|(k, _)| *k == (seam.kind, seam.layer)) else {
                 return Err(GpuError::State {
                     what: NAME,
                     missing: "a recorded seam for every batch seam",
                 });
             };
-            i += 1;
+            let (key, want) = &rec[i];
             let mut bad = Vec::new();
             let mut worst = 0.0f32;
             for t in 0..seam.tokens {
@@ -1906,8 +2005,7 @@ mod gate {
                 let layer_i = rec[..i]
                     .iter()
                     .filter(|(k, _)| k.0 == body::BatchSeamKind::Attn)
-                    .count()
-                    - 1;
+                    .count();
                 for ((name, got), (_, want)) in taps_host(gpu, t)?.iter().zip(&taps0[layer_i]) {
                     let diff = got
                         .iter()
